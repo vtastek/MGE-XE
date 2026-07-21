@@ -2,6 +2,7 @@
 
 #include "proxydx/d3d9header.h"
 #include "mge/dlmath.h"
+#include "ipc/hostframetimings.h"   // IPC::HostFrameTimings (RenderFrameParameters OUT block)
 
 #include <cstddef>
 #include <cstdint>
@@ -437,6 +438,13 @@ namespace IPC {
 
         OUT std::uint32_t bytesWritten;
         OUT double renderMs;             // host-side render+readback time
+
+        // Host frame CPU/GPU split, forwarded every frame so the client can PLOT it in Tracy
+        // (tasks/forge-host-gpu-lane.md, Tier 1). Definition + the full rationale live in
+        // ipc/hostframetimings.h, which the x64 host includes WITHOUT this header's d3d9 baggage.
+        // Appended at the end so every existing field offset is unchanged — but the struct is
+        // shared by LAYOUT across x86/x64, so rebuild and deploy both binaries together.
+        OUT HostFrameTimings hostTimings;
     };
 
     // M1b geometry upload. blob = a byte VecId holding partCount packed parts

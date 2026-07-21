@@ -17,6 +17,7 @@
 #include <windows.h>
 #include <algorithm>
 #include <cmath>
+#include <chrono>
 #include <condition_variable>
 #include <mutex>
 #include <atomic>
@@ -101,6 +102,11 @@ namespace {
     // DevInput each kickoff (bridge.h DevInput frame-ahead fields). Set at the collect
     // (wait) and the mwstart close; read at the next kickoff — 1-frame skew, panel only.
     double g_lastWaitMsStat = 0.0;     // last residual collect wait (pipeline success metric)
+    // Last host phase split received over the wire (Tier 1, tasks/forge-host-gpu-lane.md). Feeds
+    // the Tracy plots at the finish site and the [hb] echo below — the echo is the CHECK that the
+    // x86/x64 struct actually arrived intact: its numbers must match mgeHost64.log's own
+    // `host split` / `gpu split` for the same frames. Garbage or zeros here = layout mismatch.
+    IPC::HostFrameTimings g_lastHostTimings{};
     double g_lastMwStartStat = 0.0;    // last Present-return → BeginScene(0) gap
 
     // --- Feeding-side spike logging --------------------------------------------------
@@ -165,6 +171,9 @@ namespace {
         bool rpcEarlyFinished;
         bool earlyOk;
         double earlyHostMs;
+        // Host phase split captured by that early finish — the composite path must plot THESE,
+        // not a fresh read, or early-finish frames would plot the previous frame's numbers.
+        IPC::HostFrameTimings earlyHostTimings;
         double tEarlyFinish;
         unsigned frame;
         std::uint32_t drawCount, skinnedCount, multiMapCount, lightCount, skyCount, alphaCount;
@@ -210,7 +219,7 @@ namespace {
     // there would self-deadlock (flushGeometry has main-thread callers on the non-async paths).
     std::atomic<std::thread::id> g_produceThreadId{};
 
-    double waitFinishGate() {
+    double waitFinishGate(const char* who) {
         if (std::this_thread::get_id() != g_produceThreadId.load(std::memory_order_relaxed)) {
             return 0.0;
         }
@@ -218,14 +227,28 @@ namespace {
         if (g_finishGateOpen) return 0.0;
         MGE_ZoneScopedN("Forge kickoff gate (prev finish)");
         const double t0 = nowMs();
-        g_finishGateCv.wait(l, [] { return g_finishGateOpen; });
+        // BOUNDED wait — this is the ONLY unbounded wait left in the pipeline (every IPC wait caps
+        // at MaxWait=60s and fails loud). The gate is normally opened by main's doDeferredFinish
+        // within a few ms of the kick; an unbounded wait here turned any missed open — a circular
+        // main<->worker wait, or a frame whose EndScene(0) gate-open never runs — into a PERMANENT,
+        // silent freeze. Every prior "doesn't recover, no log" freeze was this. Cap it, break the
+        // deadlock by proceeding, and log LOUD with the caller. Proceeding early can at worst tear
+        // ONE host frame (host begins N before main copied N-1's shared RT), which self-corrects the
+        // next frame — infinitely better than a hang, and now observable.
+        constexpr auto kGateDeadline = std::chrono::milliseconds(500);
+        if (!g_finishGateCv.wait_for(l, kGateDeadline, [] { return g_finishGateOpen; })) {
+            const double waited = nowMs() - t0;
+            LOG::logline("!! [gate] finish-gate WEDGED %.0fms in '%s' — breaking deadlock, proceeding "
+                         "(one frame may tear)", waited, who ? who : "?");
+            return waited;
+        }
         return nowMs() - t0;
     }
 
     // Gate + probe. Called at every point where the produce crosses from client-private memory
     // into shared memory the host may still be reading for the previous frame.
-    void gateOnPrevFinish() {
-        const double gateMs = waitFinishGate();
+    void gateOnPrevFinish(const char* who) {
+        const double gateMs = waitFinishGate(who);
         if (gateMs > 0.05) {
             MGE_TracyPlot("Forge kickoff gate ms", gateMs);   // compiles out in Release
             (void)gateMs;
@@ -236,6 +259,91 @@ namespace {
         static LARGE_INTEGER freq = [] { LARGE_INTEGER f; QueryPerformanceFrequency(&f); return f; }();
         LARGE_INTEGER c; QueryPerformanceCounter(&c);
         return 1000.0 * (double)c.QuadPart / (double)freq.QuadPart;
+    }
+
+    // --- Main-thread wedge watchdog (freeze diagnostic) ------------------------------
+    // Every prior freeze this session left MW's main thread wedged with NO log naming WHERE.
+    // All internal waits are now bounded (finish-gate 500ms, IPC 60s) yet a freeze still
+    // reproduces (user suspects alt-tab / focus loss), so a bounded-wait audit is blind. This
+    // breadcrumbs the whole main-thread present pipeline into an atomic phase id + a monotonically
+    // bumped tick; a detached watchdog thread notices when the tick stops advancing and logs the
+    // last phase plus the focus state — the wedge names itself on the next freeze. Observe-only,
+    // zero behaviour change. markMainPhase MUST be called from the MAIN thread only (never the
+    // produce worker) or the breadcrumb would report the wrong thread's location.
+    enum MainPhase : std::uint32_t {
+        MP_MW_FRAME = 0,        // between our frames — MW input/sim/AI/anim (or paused on focus loss)
+        MP_FRAME_COLLECT,       // onFrameAheadCollect entry
+        MP_WAIT_PRODUCE,        // blocked on the produce worker
+        MP_DEFERRED_FINISH,     // doDeferredFinish (host wait + RT copy of N-1)
+        MP_FINISH_COPY,         // finishAndCopy — the host renderSceneFinish IPC wait
+        MP_KICKOFF,             // onStage0CompositeKickoff (main-thread dispatch)
+        MP_COMPOSITE_FINISH,    // onStage0CompositeFinish
+        MP_BLIT,                // onFrameAheadBlit
+        MP_COUNT
+    };
+    const char* const kMainPhaseName[MP_COUNT] = {
+        "MW-frame(input/sim)", "frame-collect", "wait-produce", "deferred-finish",
+        "finish-copy(IPC)", "kickoff", "composite-finish", "blit"
+    };
+    std::atomic<std::uint32_t> g_mainPhase{MP_MW_FRAME};
+    std::atomic<std::uint64_t> g_mainPhaseTick{0};
+    inline void markMainPhase(std::uint32_t p) {
+        g_mainPhase.store(p, std::memory_order_relaxed);
+        g_mainPhaseTick.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    std::atomic<bool> g_watchdogStarted{false};
+    void startWedgeWatchdog() {
+        bool expected = false;
+        if (!g_watchdogStarted.compare_exchange_strong(expected, true)) return;
+        std::thread([] {
+            using namespace std::chrono;
+            // A real freeze is indefinite; a legit cell-load / interior transition can pause the
+            // main thread ~1-2s. 4s clears the noise and still names a true wedge fast.
+            constexpr double kStallMs = 4000.0;
+            std::uint64_t lastTick = g_mainPhaseTick.load(std::memory_order_relaxed);
+            double lastMoveMs = nowMs();
+            bool reported = false;
+            for (;;) {
+                std::this_thread::sleep_for(milliseconds(500));
+                const std::uint64_t t = g_mainPhaseTick.load(std::memory_order_relaxed);
+                const double now = nowMs();
+                if (t != lastTick) {
+                    if (reported) {
+                        LOG::logline(">> [watchdog] main thread RECOVERED after %.1fs stall",
+                                     (now - lastMoveMs) / 1000.0);
+                    }
+                    lastTick = t;
+                    lastMoveMs = now;
+                    reported = false;
+                    continue;
+                }
+                if (!reported && now - lastMoveMs > kStallMs) {
+                    const std::uint32_t ph =
+                        std::min<std::uint32_t>(g_mainPhase.load(std::memory_order_relaxed), MP_COUNT - 1);
+                    const HWND fg = GetForegroundWindow();
+                    LOG::logline("!! [watchdog] MAIN STALLED %.1fs at phase '%s' — foreground=%s "
+                                 "(MW hwnd=%p fg=%p) frame=%u",
+                                 (now - lastMoveMs) / 1000.0, kMainPhaseName[ph],
+                                 (fg == g_devHwnd) ? "MW" : "OTHER", (void*)g_devHwnd, (void*)fg, g_frame);
+                    reported = true;
+                }
+            }
+        }).detach();
+    }
+
+    // Focus-transition probe: log when MW gains/loses foreground so a freeze can be correlated
+    // with an alt-tab. Main thread only (called from onFrameAheadCollect).
+    void probeFocusTransition() {
+        static int s_lastFg = -1;
+        const int fg = (GetForegroundWindow() == g_devHwnd) ? 1 : 0;
+        if (fg != s_lastFg) {
+            if (s_lastFg != -1) {
+                LOG::logline("-- [focus] MW %s (frame=%u)",
+                             fg ? "GAINED foreground" : "LOST foreground", g_frame);
+            }
+            s_lastFg = fg;
+        }
     }
 
     // --- M1b: opaque-geometry capture + upload -----------------------------------
@@ -296,6 +404,15 @@ namespace {
     struct UploadSig { std::uint32_t id; std::uint32_t vc; std::uint16_t rev; };
     std::unordered_map<std::uint32_t, UploadSig> g_uploadedRev;    // cache key -> last sent identity
     std::uint32_t                             g_nextSlot = 0;
+    // Deferred host-slot release queue. Evicted keys resolve to their (old, monotonic, never-reused)
+    // host slot immediately in drainReleasedSlots, but the release SENTINEL is shipped a bounded
+    // number per flush (appendBoundedReleaseRecords) so a mass eviction can't flood the blocking
+    // geometry RPC at present time. Same produce-thread context as g_keySlot/g_pendingBlob → no lock.
+    std::vector<std::uint32_t>                g_pendingReleaseSlots;
+    // Per-flush release cap. Freeze evidence: 517 release parts in one flush cost 5.49ms host-side
+    // (~10us each) and the backlog blew the 32MB staging cap. 64/flush ~ 0.7ms, backlog drains over
+    // frames. Slots are monotonic so deferral is always safe (a late release only frees a dead mesh).
+    constexpr std::uint32_t                   kMaxReleasesPerFlush = 64;
     std::vector<std::uint8_t>                 g_drawScratch;        // packed DrawItemWire[] this frame
     std::vector<std::uint8_t>                 g_skinnedScratch;     // packed [SkinnedDrawWire][palette]* this frame
     std::vector<std::uint8_t>                 g_fpDrawScratch;      // packed FP rigid DrawItemWire[] this frame (FP1a)
@@ -388,6 +505,16 @@ namespace {
     std::unordered_map<IDirect3DTexture9*, std::uint32_t> g_capTexMemo;
     // Drop counters (one-shot logged): lock fail / cap overflow / INDEX32 rebase / no-name-white.
     std::uint32_t g_capDropLock = 0, g_capDropCap = 0, g_capDropIdx32 = 0, g_capNoName = 0;
+    // [alpha-dedup] Is the (texture, vertexCount) dedup key eating LIVE particle draws?
+    // World particles are never cached shapes ("not NiTriShapes, not captured by the cache walk"),
+    // so the dedup must never drop one — but its key is a coarse alias, and a particle system whose
+    // count momentarily makes vertCount match a cached blend on the SAME texture hashes identically
+    // (a 1-particle flame and a cached flame billboard are both a 4-vert 2-tri quad). Particle counts
+    // vary per frame, so such a draw would drop and undrop = flicker. Count drops and the distinct
+    // keys they hit; a nonzero, FLUCTUATING count is the flicker's signature.
+    std::uint32_t g_capDedupDrops = 0;        // this frame
+    std::uint32_t g_capDedupDropsMin = ~0u, g_capDedupDropsMax = 0;   // over the log window
+    std::uint32_t g_capDedupWindow = 0;
     // Captured blended DIPs merged into the alpha list this frame (heartbeat cap=N). Set in
     // buildGeometryDrawLists before the records are cleared; read into KickState at kickoff.
     std::uint32_t g_capturedEmitted = 0;
@@ -398,6 +525,15 @@ namespace {
     // gTextures[slot]). Misses/oversize map to slot 0 (host default white) and are cached so
     // we don't retry. Rides the geometry channel's chunked vec (g_texVec).
     std::optional<IPC::VecView<IPC::GeomChunk>> g_texVec;           // persistent texture upload vec
+    // Texture residency (g_texSlot + g_slotName/g_slotLastUsed + g_nextTexSlot/g_texEpoch +
+    // g_texPendingBlob/Count) is mutated from TWO threads: the produce worker's build
+    // (buildGeometryDrawLists -> resolveTextureSlot) AND the MAIN thread's captured-alpha proxy
+    // interception (captureAlphaDraw -> resolveTextureSlot). produce-off-main OVERLAPS them by
+    // design, so a concurrent emplace/rehash on g_texSlot corrupted the heap (crash walking a torn
+    // std::string key in _Forced_rehash, 2026-07-20). This mutex serialises the whole subsystem.
+    // NEVER held across a blocking IPC RPC — flushTextures swaps the blob out under the lock and
+    // RPCs on the local copy (holding it across texUploadBlocking would be a new 60s-freeze class).
+    std::mutex                                g_texResidencyMx;
     std::unordered_map<std::string, std::uint32_t> g_texSlot;       // normalized name -> bindless slot
     std::uint32_t                             g_nextTexSlot = 1;    // 0 = host default white
     std::vector<std::uint8_t>                 g_texPendingBlob;     // [TexUploadWire][dds]* awaiting flush
@@ -998,6 +1134,9 @@ namespace {
         if (name.empty()) {
             return 0;
         }
+        // Serialise the whole residency mutation against the other thread (see g_texResidencyMx).
+        // The BSA disk load below runs under the lock — bounded (first-sight only), no IPC involved.
+        std::lock_guard<std::mutex> lk(g_texResidencyMx);
         const std::uint32_t cap = IPC::kMaxTextures - IPC::kDlReserve;   // client range [1, cap)
         if (g_slotName.size() != IPC::kMaxTextures) {
             g_slotName.assign(IPC::kMaxTextures, std::string());
@@ -1064,16 +1203,28 @@ namespace {
     // Ship queued texture uploads to the host in window-sized batches on whole-entry
     // boundaries (each entry is guaranteed <= window by resolveTextureSlot). Blocking RPCs.
     void flushTextures() {
-        if (!g_texVec || g_texPendingBlob.empty() || g_texPendingCount == 0) {
-            return;
+        // Take ownership of the pending blob under the lock, then batch + RPC on the LOCAL copy
+        // UNLOCKED — main's captureAlphaDraw keeps appending to a fresh g_texPendingBlob, and we
+        // never hold g_texResidencyMx across a blocking RPC (that would be a new 60s-freeze class).
+        std::vector<std::uint8_t> blob;
+        std::uint32_t pendingCount = 0;
+        {
+            std::lock_guard<std::mutex> lk(g_texResidencyMx);
+            if (!g_texVec || g_texPendingBlob.empty() || g_texPendingCount == 0) {
+                return;
+            }
+            blob.swap(g_texPendingBlob);      // main now appends to an empty vector, race-free
+            pendingCount = g_texPendingCount;
+            g_texPendingCount = 0;            // fresh count for whatever main appends from here
         }
         // A0 sub-buckets (see flushGeometry): assign vs RPC wait, one line per >=1ms flush.
         const double tFlush0 = nowMs();
         double assignMs = 0.0, rpcMs = 0.0;
         const std::size_t windowBytes = (std::size_t)IPC::kTexWindowBytes;
-        const std::uint8_t* base = g_texPendingBlob.data();
-        const std::size_t total = g_texPendingBlob.size();
+        const std::uint8_t* base = blob.data();
+        const std::size_t total = blob.size();
         std::size_t off = 0;
+        std::uint32_t entriesFlushed = 0;
         while (off < total) {
             std::size_t batchEnd = off;
             std::uint32_t batchCount = 0;
@@ -1098,20 +1249,24 @@ namespace {
                 rpcMs += nowMs() - tRpc0;
             }
             if (uploaded == 0xFFFFFFFFu) {
-                // Host opaque path not built yet (first scene frame) — keep the whole queue and
-                // retry next frame (slots are already assigned; draws show white until then).
+                // Host opaque path not built yet (first scene frame) — keep the UNFLUSHED remainder
+                // for next frame. Put it BACK at the FRONT of g_texPendingBlob (main may have
+                // appended after the swap) and restore its share of the count. Slots are already
+                // assigned; draws show white until then.
+                std::lock_guard<std::mutex> lk(g_texResidencyMx);
+                g_texPendingBlob.insert(g_texPendingBlob.begin(), blob.begin() + off, blob.end());
+                g_texPendingCount += (pendingCount - entriesFlushed);
                 return;
             }
+            entriesFlushed += batchCount;
             off = batchEnd;
         }
-        const std::uint32_t flushedTexCount = g_texPendingCount;
-        g_texPendingBlob.clear();
-        g_texPendingCount = 0;
-
+        // Fully consumed the local blob. Do NOT touch g_texPendingBlob/Count here — they now hold
+        // only what main appended during the unlocked RPC, which must be kept for the next flush.
         const double flushMs = nowMs() - tFlush0;
         if (flushMs >= 1.0) {
             LOG::logline("-- [texflush] %.2fms tex=%u bytes=%uKB assign=%.2f rpc=%.2f",
-                         flushMs, flushedTexCount, (unsigned)(total >> 10), assignMs, rpcMs);
+                         flushMs, entriesFlushed, (unsigned)(total >> 10), assignMs, rpcMs);
         }
     }
 
@@ -1122,6 +1277,16 @@ namespace {
     // kGeomFlagRelease for each evicted key that owns a host slot, then prune the slot/upload maps
     // (a re-drop is a new NiTriShape → new key → fresh slot; a recycled key must re-upload, not
     // dedup-skip). Cross-cell removals are handled separately by the cell-epoch eviction (C1).
+    // Resolve evicted keys to their (old) host slots and QUEUE them for release. Key->slot MUST be
+    // resolved HERE, not at ship time: on a cell purge the caller runs this BEFORE
+    // buildGeometryDrawLists re-captures the same recycled addresses into NEW slots, so a late
+    // resolve would read the new slot and free the freshly-uploaded object (see the 3257 call site).
+    // The queue is drained a bounded number per flush (appendBoundedReleaseRecords) so a mass
+    // eviction — orphaned far cells under the walk-free rule, or a whole-cache purgeAll — can't flood
+    // the blocking geometry RPC at present time (measured: 517 release parts = 5.5ms, backlog blew
+    // the 32MB staging cap → the client freeze). Erasing g_keySlot here is what lets a returning
+    // object re-capture into a fresh slot immediately; the old slot's release drains independently
+    // and safely (monotonic slots, never reused).
     void drainReleasedSlots() {
         static std::vector<std::uint32_t> evicted;
         MGE::GeometryCache::takeEvictedKeys(evicted);
@@ -1130,15 +1295,35 @@ namespace {
             if (ks == g_keySlot.end()) {
                 continue;   // never had a host slot (culled-only / never shipped)
             }
+            g_pendingReleaseSlots.push_back(ks->second.slot);
+            g_keySlot.erase(ks);
+            g_uploadedRev.erase(key);
+        }
+    }
+
+    // Append up to kMaxReleasesPerFlush queued slot-releases to g_pendingBlob as header-only
+    // sentinels. Called by flushGeometry each present; bounding the per-flush count keeps the release
+    // contribution to any one blocking RPC small while the backlog drains over subsequent frames.
+    // Queue order is irrelevant (monotonic slots, no reuse), so a plain front-drain is fine.
+    void appendBoundedReleaseRecords() {
+        if (g_pendingReleaseSlots.empty()) return;
+        const std::size_t n = std::min<std::size_t>(g_pendingReleaseSlots.size(), kMaxReleasesPerFlush);
+        for (std::size_t i = 0; i < n; ++i) {
             IPC::GeomPartWire hdr = {};
-            hdr.slot  = ks->second.slot;
+            hdr.slot  = g_pendingReleaseSlots[i];
             hdr.flags = IPC::kGeomFlagRelease;   // vertexCount = indexCount = 0 → header-only sentinel
             const std::size_t at = g_pendingBlob.size();
             g_pendingBlob.resize(at + sizeof(hdr));
             memcpy(g_pendingBlob.data() + at, &hdr, sizeof(hdr));
             ++g_pendingParts;
-            g_keySlot.erase(ks);
-            g_uploadedRev.erase(key);
+        }
+        g_pendingReleaseSlots.erase(g_pendingReleaseSlots.begin(),
+                                    g_pendingReleaseSlots.begin() + n);
+        // Backlog observability, throttled: watch a mass eviction drain instead of freeze.
+        static std::uint32_t s_relLogThrottle = 0;
+        if (!g_pendingReleaseSlots.empty() && (++s_relLogThrottle % 30) == 0) {
+            LOG::logline("-- [release] draining: shipped %zu this flush, %zu still queued",
+                         n, g_pendingReleaseSlots.size());
         }
     }
 
@@ -1156,7 +1341,8 @@ namespace {
         std::uint32_t chunkCount = 0;
         {
             const double t0 = nowMs();
-            drainReleasedSlots();   // append host slot-release records before the empty check
+            drainReleasedSlots();          // resolve evictions → release queue (cheap, unbounded)
+            appendBoundedReleaseRecords(); // ship <=kMaxReleasesPerFlush sentinels before the empty check
             drainMs = nowMs() - t0;
         }
         if (!g_geomVec || g_pendingBlob.empty() || g_pendingParts == 0) {
@@ -1296,12 +1482,14 @@ namespace {
         }
         // Load-burst escape hatch out of the client-private half: this drains to shared memory
         // mid-build, so it needs the same release as the flush below (see gateOnPrevFinish).
-        gateOnPrevFinish();
+        gateOnPrevFinish("drain");
         if (g_kick.rpcPending) {
             g_kick.rpcPending       = false;
             g_kick.rpcEarlyFinished = true;
             g_kick.earlyHostMs      = 0.0;
-            g_kick.earlyOk          = g_client->renderSceneFinish(&g_kick.earlyHostMs);
+            g_kick.earlyHostTimings = {};
+            g_kick.earlyOk          = g_client->renderSceneFinish(&g_kick.earlyHostMs,
+                                                                  &g_kick.earlyHostTimings);
             g_kick.tEarlyFinish     = nowMs();
         }
         LOG::logline("-- [seam] geometry staging at %u KB mid-walk — draining to host",
@@ -2823,12 +3011,15 @@ namespace RenderProcess {
         r.tWait0 = nowMs();
         r.overlap = (earlyFinished ? ks.tEarlyFinish : r.tWait0) - ks.tKick;
 
+        IPC::HostFrameTimings hostT{};
         if (earlyFinished) {
             r.ok     = ks.earlyOk;
             r.hostMs = ks.earlyHostMs;
+            hostT    = ks.earlyHostTimings;   // captured at the mid-walk drain, not re-read here
         } else {
             MGE_ZoneScopedN("Forge renderSceneFinish (host wait)");
-            r.ok = g_client->renderSceneFinish(&r.hostMs);
+            markMainPhase(MP_FINISH_COPY);   // main is now blocked on the host IPC finish
+            r.ok = g_client->renderSceneFinish(&r.hostMs, &hostT);
         }
         r.tRender = nowMs();
         // Split the wait: hostMs = host self-timed cost; (residual wait + kickoff cost - hostMs)
@@ -2840,9 +3031,32 @@ namespace RenderProcess {
         // Host-inflight lane: the paired 1.0 is set when the kickoff RPC is issued — the
         // step plot spans the host's whole render window across the frame boundary, the
         // thing per-thread zones can't show (the host is another process). The fiber zone
-        // below turns that same window into a box on the "Forge Host GPU" lane.
+        // below turns that same window into a box on the "Forge Host Frame (inflight)" lane.
         if (g_hostZoneOpen) { MGE_TracyHostFrameEnd(g_hostZoneCtx); g_hostZoneOpen = false; }
         MGE_TracyPlot("Forge host inflight", 0.0);
+        // Tier 1 host CPU/GPU split (tasks/forge-host-gpu-lane.md). The inflight box above is the
+        // whole RPC round trip, NOT GPU time — these plots are what tell you which half of it you
+        // are actually looking at. "host GPU frame ms" is whole-command-buffer GPU execution: if
+        // it sits far below the box width, the frame is host-CPU/serial-bound and shrinking shader
+        // work buys little. Names carry (N-1) because under ForgeFrameAhead the drained frame is
+        // one behind MW's current frame — the plot point lands on the frame that CONSUMED it.
+        g_lastHostTimings = hostT;
+        MGE_TracyPlot("host GPU frame ms (N-1)",  (double)hostT.gpuFrameMs);
+        MGE_TracyPlot("host CPU setup ms (N-1)",  (double)hostT.cpuSetupMs);
+        MGE_TracyPlot("host CPU cull ms (N-1)",   (double)hostT.cpuCullMs);
+        MGE_TracyPlot("host CPU record ms (N-1)", (double)hostT.cpuRecordMs);
+        MGE_TracyPlot("host CPU post ms (N-1)",   (double)hostT.cpuPostMs);
+        MGE_TracyPlot("host GPU wait ms (N-1)",   (double)hostT.gpuWaitMs);
+        MGE_TracyPlot("host total ms (N-1)",      (double)hostT.totalMs);
+        // Per-pass GPU, for locating cost once the frame total says the GPU is worth attacking.
+        MGE_TracyPlot("host GPU: cull ms",      (double)hostT.gpuCullMs);
+        MGE_TracyPlot("host GPU: prepass ms",   (double)hostT.gpuPrepassMs);
+        MGE_TracyPlot("host GPU: shadow ms",    (double)hostT.gpuShadowMs);
+        MGE_TracyPlot("host GPU: postdepth ms", (double)hostT.gpuPostDepthMs);
+        MGE_TracyPlot("host GPU: reflect ms",   (double)hostT.gpuReflectMs);
+        MGE_TracyPlot("host GPU: color ms",     (double)hostT.gpuColorMs);
+        MGE_TracyPlot("host GPU: water ms",     (double)hostT.gpuWaterMs);
+        MGE_TracyPlot("host GPU: resolve ms",   (double)hostT.gpuResolveMs);
         g_lastWaitMsStat = r.tRender - r.tWait0;   // → host Stats panel next kickoff
         if (!r.ok) {
             g_mainTexValid = false;
@@ -2969,6 +3183,13 @@ namespace RenderProcess {
         g_hb.copy += (fr.tCopy - fr.tRender); g_hb.blit += blitMs; g_hb.dt += ks.dtPresent;
         g_hb.mwstart += g_pendingMwStart; g_pendingMwStart = 0.0;   // A0 Cut-4 probe (1-frame skew on deferred frames)
         g_hb.captured += ks.capturedCount;
+        // [alpha-dedup] window min/max. A steady count is a real duplicate being suppressed every
+        // frame (working as designed); a count that swings frame to frame is the dedup aliasing
+        // live particle draws — exactly the smoke/flame flicker signature.
+        if (g_capDedupDrops < g_capDedupDropsMin) g_capDedupDropsMin = g_capDedupDrops;
+        if (g_capDedupDrops > g_capDedupDropsMax) g_capDedupDropsMax = g_capDedupDrops;
+        g_capDedupWindow += g_capDedupDrops;
+        g_capDedupDrops = 0;
         g_hb.bEnsure += ks.bEnsure; g_hb.bEmit += ks.bEmit; g_hb.bTail += ks.bTail;   // Phase 0 build-split
         g_hb.bTailEnsure += ks.bTailEnsure; g_hb.bKeys += ks.bKeys;
         g_hb.bTailScan += ks.bTailScan; g_hb.bTailAlpha += ks.bTailAlpha;
@@ -2990,6 +3211,12 @@ namespace RenderProcess {
                          g_hb.captured / g_hb.n,
                          g_hb.maxFeed, g_hb.maxDt,
                          g_hb.dt > 0.0 ? 1000.0 * g_hb.n / g_hb.dt : 0.0);
+            LOG::logline(">> [alpha-dedup] %u frames: drops/frame avg=%.2f min=%u max=%u "
+                         "(captured/frame=%.1f) -- fluctuating min!=max => dedup is eating live particle draws",
+                         g_hb.n, (double)g_capDedupWindow / g_hb.n,
+                         g_capDedupDropsMin == ~0u ? 0u : g_capDedupDropsMin, g_capDedupDropsMax,
+                         g_hb.captured / g_hb.n);
+            g_capDedupWindow = 0; g_capDedupDropsMin = ~0u; g_capDedupDropsMax = 0;
             // Phase 0 build sub-probe: how much of build= is ensureLive (immovable live read)
             // vs emit (worker-offload candidate) vs tail. Gate: emit ≥ ~2ms ⇒ emit→worker worth it.
             // movable = emit + (tail - tailEnsure); immovable = ensureLive + tailEnsure (live reads).
@@ -3006,6 +3233,18 @@ namespace RenderProcess {
                          g_hb.bTailScan / g_hb.n, g_hb.bTailAlpha / g_hb.n,
                          g_hb.bTailEnsure / g_hb.n,
                          (g_hb.bTailScan - g_hb.bTailEnsure) / g_hb.n);
+            // Host phase split as the CLIENT received it (Tier 1 wire echo). Cross-check against
+            // mgeHost64.log's `host split`/`gpu split`: matching numbers prove the x86/x64
+            // HostFrameTimings layout agrees. gpuFrame is whole-command-buffer GPU EXECUTION —
+            // compare it to the "Forge Host Frame (inflight)" Tracy box, which is the whole RPC
+            // round trip and typically ~2x this. Instantaneous (last frame), not averaged.
+            {
+                const auto& h = g_lastHostTimings;
+                LOG::logline(">> [hb] host recv: gpuFrame=%.2f | cpu setup=%.2f cull=%.2f record=%.2f post=%.2f"
+                             " | gpuWait=%.2f total=%.2f ms",
+                             h.gpuFrameMs, h.cpuSetupMs, h.cpuCullMs, h.cpuRecordMs, h.cpuPostMs,
+                             h.gpuWaitMs, h.totalMs);
+            }
             // Part A: per-frame host-geom upload cost, broken down by cause over the same window.
             // parts/frame + KB/frame per category; skin=NPC/creature, morph=pos rewrite (morphing
             // statics + particle regen), uvleak should stay ~0 after the UVController takeover.
@@ -3196,7 +3435,7 @@ namespace RenderProcess {
         // RT copy have released frame N-1. Expected wait ≈ 0 — the finish is ~1.7ms under a ~3.5ms
         // build. If "Forge kickoff gate ms" starts showing real time, the build got cheaper than
         // the finish and double-buffering the shared vectors is the next move.
-        gateOnPrevFinish();
+        gateOnPrevFinish("kickoff");
 
         {
             MGE_ZoneScopedN("Forge geom flush");
@@ -3599,7 +3838,7 @@ namespace RenderProcess {
         // Host-inflight lane start (paired 0.0 in finishAndCopy): from here until the
         // collect/finish drains the completion, the host owns the frame.
         MGE_TracyPlot("Forge host inflight", 1.0);
-        // Open the host-frame fiber zone (box on the "Forge Host GPU" lane) — spans until the
+        // Open the host-frame fiber zone (box on the "Forge Host Frame (inflight)" lane) — spans until the
         // finish drains the completion. Begins here on whichever thread issued the kickoff (the
         // produce worker in OVERLAP/FENCED mode, else the main thread).
         MGE_TracyHostFrameBegin(g_hostZoneCtx);
@@ -3731,6 +3970,7 @@ namespace RenderProcess {
         // finish is precisely what the worker is waiting for, and it has to happen before the
         // frame can advance anyway. No-op once the dispatcher has already run it.
         doDeferredFinish();
+        markMainPhase(MP_WAIT_PRODUCE);
         const double t0 = nowMs();
         g_produceWorker.wait();
         g_produceBlockedMs = nowMs() - t0;
@@ -3751,6 +3991,7 @@ namespace RenderProcess {
     // frames — there the kick fires at BeginScene(0) and the paired waitProduce() runs at
     // EndScene(0); every other frame fences here so g_kick is complete on return exactly as inline.
     void onStage0CompositeKickoff(IDirect3DDevice9* device) {
+        markMainPhase(MP_KICKOFF);
         // Frame-start kick already dispatched this frame's produce: the ONLY thing left here is the
         // N-1 finish, which runs under the worker's build. Returning early is essential, not an
         // optimisation — the waitProduce() below would drain the produce we just kicked (blocking
@@ -3834,6 +4075,7 @@ namespace RenderProcess {
     }
 
     void onStage0CompositeFinish(IDirect3DDevice9* device) {
+        markMainPhase(MP_COMPOSITE_FINISH);
         // Dev-key poll: once per display frame, at a stable point BEFORE the finish
         // consumers — normally the BeginScene(0) collect already polled (it runs first
         // in frame order and pollDevKeys dedups on the Present serial); this call only
@@ -3890,6 +4132,10 @@ namespace RenderProcess {
 
     void noteEnginePresentReturn() {
         g_presentReturnMs = nowMs();
+        // Main now leaves our code and runs MW's un-zoned between-frame work (input/sim/AI/anim)
+        // until the next BeginScene(0). A stall breadcrumbed here == wedged in MW itself (or MW
+        // paused on focus loss), NOT in our pipeline — the key alt-tab discriminator.
+        markMainPhase(MP_MW_FRAME);
     }
 
     void onFrameAheadCollect(IDirect3DDevice9* /*device*/) {
@@ -3903,6 +4149,9 @@ namespace RenderProcess {
         //
         // A0 Cut-4 probe: close the Present→BeginScene(0) span (MW's un-zoned frame
         // start — input/sim/AI/animation) before anything else this frame runs.
+        startWedgeWatchdog();       // idempotent; arms the main-thread freeze watchdog once
+        probeFocusTransition();     // log alt-tab focus changes for freeze correlation
+        markMainPhase(MP_FRAME_COLLECT);
         if (g_presentReturnMs > 0.0) {
             g_pendingMwStart = nowMs() - g_presentReturnMs;
             g_presentReturnMs = 0.0;
@@ -3934,6 +4183,7 @@ namespace RenderProcess {
     // a deferred finish is pending; consumes g_kick's N-1 state, so it MUST run before kickoffBody
     // resets g_kick for the new frame.
     void doDeferredFinish() {
+        markMainPhase(MP_DEFERRED_FINISH);
         if (!finishDeferred()) {
             // Nothing to release, but the worker may be parked on the gate (armed unconditionally
             // at the kick) — open it or the host RPC never goes out.
@@ -3973,6 +4223,7 @@ namespace RenderProcess {
     }
 
     void onFrameAheadBlit(IDirect3DDevice9* device) {
+        markMainPhase(MP_BLIT);
         // EndScene(0) composite point on a deferred frame: no finish, no IPC, no wait —
         // just lay the PREVIOUS host frame (still valid in g_mainTex; the composite
         // never reads the shared RT directly) over MW's backbuffer. Skipped while
@@ -4082,7 +4333,20 @@ namespace RenderProcess {
         // in buildGeometryDrawLists while pushing the cached alphaCands.
         const std::uint64_t dedupKey =
             ((std::uint64_t)(std::uintptr_t)rs->texture << 32) | (std::uint64_t)rs->vertCount;
-        if (g_alphaDedup.find(dedupKey) != g_alphaDedup.end()) return;
+        if (g_alphaDedup.find(dedupKey) != g_alphaDedup.end()) {
+            // [alpha-dedup] probe: log the first few victims with enough identity to tell a real
+            // cached-blend duplicate from an aliased particle draw (a particle's vertCount moves
+            // frame to frame; a cached blend's does not).
+            static std::uint32_t s_logged = 0;
+            if (s_logged < 12) {
+                ++s_logged;
+                const char* nm = MGE::GeometryCache::resolveTextureName(rs->texture);
+                LOG::logline("!! [alpha-dedup] dropped DIP tex=%s vc=%u tri=%u (key collision)",
+                             nm ? nm : "(unnamed)", rs->vertCount, rs->primCount);
+            }
+            ++g_capDedupDrops;
+            return;
+        }
 
         // Caps: keep the shared captured buffers within their single-chunk budget. Drop WHOLE
         // (never partial) on overflow so an index range can't dangle past the shipped vertex window.

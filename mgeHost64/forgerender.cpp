@@ -18,6 +18,7 @@
 
 #include "forgerender.h"
 #include "ipc/geomwire.h"
+#include "ipc/hostframetimings.h"   // IPC::HostFrameTimings (fillFrameTimings)
 #include "mge/configuration.h"   // Configuration.DL.* for the host-owned live distant-land cull
 #include "support/log.h"   // LOG::logline -> mgeHost64.log (LOGF goes to uncaptured stdout)
 
@@ -11517,6 +11518,28 @@ namespace ForgeRender {
             LOG::logline(">> [forge] gtao dxil changed on disk — auto hot-reload"); LOG::flush();
             reloadComputeShaders();
         }
+    }
+
+    // Tier 1 host-timing forward (tasks/forge-host-gpu-lane.md). Pure reads of values this frame's
+    // renderScene already computed — the data existed all along, it was just logged 1-in-300.
+    // gpuFrameMs (kGpuPhaseFrame) is whole-command-buffer GPU EXECUTION: the one number that
+    // answers "are we actually GPU bound?" without being inflated by IPC, host CPU or drain.
+    void fillFrameTimings(IPC::HostFrameTimings& out) {
+        out.gpuFrameMs     = (float)g_lastGpuPhaseMs[kGpuPhaseFrame];
+        out.gpuCullMs      = (float)g_lastGpuPhaseMs[kGpuPhaseCull];
+        out.gpuPrepassMs   = (float)g_lastGpuPhaseMs[kGpuPhasePrepass];
+        out.gpuShadowMs    = (float)g_lastGpuPhaseMs[kGpuPhaseShadow];
+        out.gpuPostDepthMs = (float)g_lastGpuPhaseMs[kGpuPhasePostDepth];
+        out.gpuReflectMs   = (float)g_lastGpuPhaseMs[kGpuPhaseReflect];
+        out.gpuColorMs     = (float)g_lastGpuPhaseMs[kGpuPhaseColor];
+        out.gpuWaterMs     = (float)g_lastGpuPhaseMs[kGpuPhaseWater];
+        out.gpuResolveMs   = (float)g_lastGpuPhaseMs[kGpuPhaseResolve];
+        out.cpuSetupMs     = (float)g_lastSetupMs;
+        out.cpuCullMs      = (float)g_lastCullMs;
+        out.cpuRecordMs    = (float)g_lastRecMs;
+        out.cpuPostMs      = (float)g_lastPostMs;
+        out.gpuWaitMs      = (float)g_lastGpuMs;
+        out.totalMs        = (float)g_lastTotalMs;
     }
 
     unsigned lastDrawn() { return g_lastDrawn; }

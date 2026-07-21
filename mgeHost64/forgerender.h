@@ -8,6 +8,10 @@
 // STL ODR mismatches across the link.
 #pragma once
 
+// Forward-declared, not included: ipc/hostframetimings.h pulls <cstdint>, and this header is
+// deliberately dependency-free (see above). forgerender.cpp includes the real definition.
+namespace IPC { struct HostFrameTimings; }
+
 namespace ForgeRender {
     // D1 probe: bring the full Forge stack up (mem/filesystem/log → GPU config →
     // Renderer → graphics queue → resource loader), log the selected GPU, then
@@ -160,6 +164,11 @@ namespace ForgeRender {
     // Perf A/B (numpad -): flip the baked distant point-light loop on/off live. Same host bool the
     // dev panel "Dist lights: enable" checkbox drives — diff the gpu-split `dl=` bracket with it.
     void toggleDistLights();
+
+    // Last frame's CPU/GPU phase split, copied into the RenderFrame completion so the client can
+    // plot it in Tracy (tasks/forge-host-gpu-lane.md, Tier 1). Pure reads of values renderScene
+    // already computed. See ipc/hostframetimings.h for what each field means and why it exists.
+    void fillFrameTimings(IPC::HostFrameTimings& out);
 
     // Parts actually drawn (slot valid) in the last renderScene — for diagnostics.
     unsigned lastDrawn();
