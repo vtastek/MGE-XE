@@ -94,6 +94,10 @@
 #include "multimap.frag.fsl"
 #end
 
+#frag multimap_alpha.frag
+#include "multimap_alpha.frag.fsl"
+#end
+
 // SK1 sky takeover: alpha-blended sky shapes (SK1 = the gradient dome). Reuses opaque.srt.h /
 // DefaultRootSignature + the opaque GeomVertexWire layout; the host's FIRST blend pipeline
 // (SRCALPHA/INVSRCALPHA, depth off). sky.frag outputs real RGBA for the premultiplied composite.
