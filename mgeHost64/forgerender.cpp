@@ -1266,6 +1266,18 @@ namespace {
         // one entry per drawn part (indexed by multiMapDrawn via firstInstance). CPU-mapped, per frame.
         Buffer*        pInstanceBufMM = nullptr;
 
+        // --- Route C: alpha-BLEND multi-map (glow-window base x dark) -----------------
+        // Same multimap.vert + wide VB, but multimap_alpha.frag (outputs vertex alpha) drawn in the
+        // ALPHA stage with a blend PSO (SRCALPHA/INVSRCALPHA, GEQUAL depth-test no-write, CULL_NONE —
+        // thin glass, winding-irrelevant). OWN small worlds/instance window (does NOT steal from the
+        // kMaxMultiMap budget that glow-nights already pin). MultiMapDrawWire.drawFlags bit0 routes
+        // items here; the opaque MM color/prepass/shadow loops skip them.
+        Shader*        pMultiMapAlphaShader = nullptr;
+        Pipeline*      pMultiMapAlphaPipeline = nullptr;   // blend, depth no-write, CULL_NONE
+        Buffer*        pMMAlphaWorldsBuf = nullptr;        // gBatch: kMaxMMAlpha world window
+        DescriptorSet* pPerBatchSetMMAlpha = nullptr;      // gBatch bound to pMMAlphaWorldsBuf
+        Buffer*        pInstanceBufMMAlpha = nullptr;      // per-draw instance VB (kMaxMMAlpha entries)
+
         // --- SK1: sky pass (alpha-blended, depth off) --------------------------------
         // The host's FIRST blend pipeline. Reuses the SAME GeomVertexWire layout (vl) + SrtData/
         // default.rootsig + bindless gTextures as the static opaque path; sky.vert reads gBatch.worlds
@@ -1578,6 +1590,9 @@ namespace {
     // 14 * 4 = 56 bytes.
     constexpr uint32_t kMaxMultiMap = 1024;
     constexpr uint32_t kMMInstU32   = 14;
+    // Route C blended multi-map (glow windows): own alpha-stage budget, separate from kMaxMultiMap
+    // (glow-nights already pin the opaque MM cap). Same kMMInstU32 instance layout.
+    constexpr uint32_t kMaxMMAlpha  = 512;
 
     // NiUVController takeover: per-frame UV-animation table capacity (gUVAnim = float4[kMaxUVAnim];
     // MUST match MAX_UV_ANIM in opaque.srt.h). Id 0 is reserved = "no animation", so up to
@@ -3735,6 +3750,95 @@ namespace {
             mp.mIndex = SRT_RES_IDX(SrtData, PerBatch, gBatch);
             mp.ppBuffers = &g_live.pMMWorldsBuf;
             updateDescriptorSet(R, 0, g_live.pPerBatchSetMM, 1, &mp);
+
+            // --- Route C: alpha-BLEND multi-map PSO (multimap.vert + multimap_alpha.frag) ---
+            // Reuses the SAME wide vertex layout (mvl) + instance format (kMMInstU32). Only the frag
+            // (outputs vertex alpha, not forced 1.0), blend state, depth-no-write and CULL_NONE differ.
+            // Drawn in the ALPHA stage. Its own worlds/instance window (kMaxMMAlpha) so it never steals
+            // the opaque MM budget. Built unconditionally (zero-cost when no blended MM item ships).
+            {
+                ShaderLoadDesc mmaDesc = {};
+                mmaDesc.mVert.pFileName = "multimap.vert";
+                mmaDesc.mFrag.pFileName = "multimap_alpha.frag";
+                addShader(R, &mmaDesc, &g_live.pMultiMapAlphaShader);
+                if (!g_live.pMultiMapAlphaShader) {
+                    std::printf("[forge] addShader(multimap_alpha) FAILED\n");
+                    return false;
+                }
+                DepthStateDesc mmaDepth = {};
+                mmaDepth.mDepthTest  = true;
+                mmaDepth.mDepthWrite = false;
+                mmaDepth.mDepthFunc  = CMP_GEQUAL;   // reverse-Z, test-only (glass never occludes)
+                // Same coverage convention as the sorted-alpha pass: colour SRCALPHA/INVSRCALPHA,
+                // alpha ONE/INVSRCALPHA so the present-seam ONE/INVSRCALPHA composite accumulates it.
+                BlendStateDesc mmaBlend = {};
+                mmaBlend.mSrcFactors[0]      = BC_SRC_ALPHA;
+                mmaBlend.mDstFactors[0]      = BC_ONE_MINUS_SRC_ALPHA;
+                mmaBlend.mSrcAlphaFactors[0] = BC_ONE;
+                mmaBlend.mDstAlphaFactors[0] = BC_ONE_MINUS_SRC_ALPHA;
+                mmaBlend.mBlendModes[0]      = BM_ADD;
+                mmaBlend.mBlendAlphaModes[0] = BM_ADD;
+                mmaBlend.mColorWriteMasks[0] = COLOR_MASK_ALL;
+                mmaBlend.mRenderTargetMask   = BLEND_STATE_TARGET_0;
+                mmaBlend.mIndependentBlend   = false;
+                RasterizerStateDesc mmaRaster = {};
+                mmaRaster.mCullMode  = CULL_MODE_NONE;   // thin glass, winding-irrelevant
+                mmaRaster.mFrontFace = FRONT_FACE_CCW;
+
+                PipelineDesc mmaPd = {};
+                mmaPd.mType = PIPELINE_TYPE_GRAPHICS;
+                GraphicsPipelineDesc& mmag = mmaPd.mGraphicsDesc;
+                mmag.mPrimitiveTopo     = PRIMITIVE_TOPO_TRI_LIST;
+                mmag.mRenderTargetCount = 1;
+                mmag.pColorFormats      = &g_live.pRT->mFormat;
+                mmag.mSampleCount       = (SampleCount)g_live.sampleCount;
+                mmag.mSampleQuality     = 0;
+                mmag.mDepthStencilFormat = TinyImageFormat_D32_SFLOAT;
+                mmag.pDepthState        = &mmaDepth;
+                mmag.pBlendState        = &mmaBlend;
+                mmag.pVertexLayout      = &mvl;
+                mmag.pRasterizerState   = &mmaRaster;
+                mmag.pShaderProgram     = g_live.pMultiMapAlphaShader;
+                addPipeline(R, &mmaPd, &g_live.pMultiMapAlphaPipeline);
+                if (!g_live.pMultiMapAlphaPipeline) {
+                    std::printf("[forge] addPipeline(multimap_alpha) FAILED\n");
+                    return false;
+                }
+
+                BufferLoadDesc maw = {};
+                maw.mDesc.mDescriptors = DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+                maw.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_CPU_TO_GPU;
+                maw.mDesc.mFlags       = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
+                maw.mDesc.mSize        = (uint64_t)kMaxMMAlpha * 64u;   // one matrix per draw
+                maw.mDesc.pName        = "mmAlphaWorldsCbv";
+                maw.pData              = nullptr;
+                maw.ppBuffer           = &g_live.pMMAlphaWorldsBuf;
+                addResource(&maw, nullptr);
+
+                BufferLoadDesc mai = {};
+                mai.mDesc.mDescriptors = DESCRIPTOR_TYPE_VERTEX_BUFFER;
+                mai.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_CPU_TO_GPU;
+                mai.mDesc.mFlags       = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
+                mai.mDesc.mSize        = (uint64_t)kMaxMMAlpha * kMMInstU32 * sizeof(uint32_t);
+                mai.mDesc.pName        = "instanceVBMMAlpha";
+                mai.pData              = nullptr;
+                mai.ppBuffer           = &g_live.pInstanceBufMMAlpha;
+                addResource(&mai, nullptr);
+
+                waitForAllResourceLoads();
+                if (!g_live.pMMAlphaWorldsBuf || !g_live.pInstanceBufMMAlpha) {
+                    return false;
+                }
+                DescriptorSetDesc maDesc = SRT_SET_DESC(SrtData, PerBatch, 1, 0);
+                addDescriptorSet(R, &maDesc, &g_live.pPerBatchSetMMAlpha);
+                if (!g_live.pPerBatchSetMMAlpha) {
+                    return false;
+                }
+                DescriptorData map = {};
+                map.mIndex     = SRT_RES_IDX(SrtData, PerBatch, gBatch);
+                map.ppBuffers  = &g_live.pMMAlphaWorldsBuf;
+                updateDescriptorSet(R, 0, g_live.pPerBatchSetMMAlpha, 1, &map);
+            }
         }
 
         // --- SK1: sky shader + pipeline (FIRST blend PSO, depth off) + world window + instance VB ---
@@ -7311,6 +7415,7 @@ namespace ForgeRender {
                 for (uint32_t k = 0; k < nMM; ++k) {
                     if (idxMM >= kMaxMultiMap) { break; }   // matches the prepass cap → idx alignment
                     const IPC::MultiMapDrawWire& it = mmItems[k];
+                    if (it.drawFlags & IPC::kMMDrawFlagBlended) { continue; }   // Route C: blended glow glass never casts
                     const uint32_t mslot = it.slot;
                     if (mslot >= g_meshHigh || !g_meshes[mslot].valid || !g_meshes[mslot].multimap) { continue; }
                     const HostMesh& hm = g_meshes[mslot];
@@ -8787,6 +8892,7 @@ namespace ForgeRender {
                 for (uint32_t k = 0; k < nMM; ++k) {
                     if (preDrawnMM >= kMaxMultiMap) { break; }   // no fallback (PD1); matches colour cap
                     const IPC::MultiMapDrawWire& it = mmItems[k];
+                    if (it.drawFlags & IPC::kMMDrawFlagBlended) { continue; }   // Route C: blended glass has no Z-prepass (no depth write)
                     const uint32_t slot = it.slot;
                     if (slot >= g_meshHigh || !g_meshes[slot].valid || !g_meshes[slot].multimap) { continue; }
                     const uint32_t idx = preDrawnMM;
@@ -9903,6 +10009,7 @@ namespace ForgeRender {
                     break;   // no fallback (PD1)
                 }
                 const IPC::MultiMapDrawWire& it = mmItems[k];
+                if (it.drawFlags & IPC::kMMDrawFlagBlended) { continue; }   // Route C: drawn in the alpha stage, not here
                 const uint32_t slot = it.slot;
                 if (slot >= g_meshHigh || !g_meshes[slot].valid || !g_meshes[slot].multimap) {
                     continue;   // mesh not uploaded yet / not a multi-map mesh
@@ -10328,6 +10435,62 @@ namespace ForgeRender {
         // Phase 4: distant hero statics (ghostfence/lava) blend FIRST — they're the farthest
         // translucent geometry, so drawing them before the near sorted-alpha keeps back-to-front.
         dlDrawHeroBlend();
+
+        // Route C: alpha-BLEND multi-map (Glow-in-the-Dahrk night windows). Same multimap.vert +
+        // wide VB + instance format as the opaque MM pass, but multimap_alpha.frag (real vertex
+        // alpha) with a blend PSO here in the alpha stage, so the dark map's modulate shows (else
+        // base-map-only white via AT3). Own worlds/instance window (kMaxMMAlpha), CULL_NONE (one PSO,
+        // winding-irrelevant). Depth GEQUAL test / no-write: occluded by walls, never occludes. Drawn
+        // wall-flush and early (before the near sorted-alpha) so foreground alpha blends over it.
+        uint32_t mmAlphaDrawn = 0;
+        if (multiMapBlob && multiMapCount && multiMapBytes && g_live.pMultiMapAlphaPipeline) {
+            const uint32_t haveMM = multiMapBytes / (uint32_t)sizeof(IPC::MultiMapDrawWire);
+            const uint32_t nMM = (multiMapCount < haveMM) ? multiMapCount : haveMM;
+            const IPC::MultiMapDrawWire* mmItems = (const IPC::MultiMapDrawWire*)multiMapBlob;
+            bool bound = false;
+            for (uint32_t k = 0; k < nMM; ++k) {
+                const IPC::MultiMapDrawWire& it = mmItems[k];
+                if (!(it.drawFlags & IPC::kMMDrawFlagBlended)) { continue; }   // opaque MM drawn in the color pass
+                if (mmAlphaDrawn >= kMaxMMAlpha) { break; }
+                const uint32_t slot = it.slot;
+                if (slot >= g_meshHigh || !g_meshes[slot].valid || !g_meshes[slot].multimap) { continue; }
+                const uint32_t idx = mmAlphaDrawn;
+
+                uint8_t* dst = (uint8_t*)g_live.pMMAlphaWorldsBuf->pCpuMappedAddress;
+                std::memcpy(dst + (size_t)idx * 64, it.world, 64);
+
+                uint32_t* inst = (uint32_t*)g_live.pInstanceBufMMAlpha->pCpuMappedAddress;
+                uint32_t* e = inst + (size_t)idx * kMMInstU32;
+                const uint32_t sc  = (it.stageCount > 4u) ? 4u : it.stageCount;
+                float ar = it.alphaRef < 0.0f ? 0.0f : (it.alphaRef > 1.0f ? 1.0f : it.alphaRef);
+                const uint32_t aref = (uint32_t)(ar * 255.0f + 0.5f) & 0xFFu;
+                const uint32_t vcs  = it.vColSource & 0x3u;
+                const uint32_t uvId = g_meshes[slot].uvKeys ? uvAnimIdFor(g_meshes[slot]) : 0u;
+                e[0] = (idx & 0x3FFu) | (sc << 10u) | (vcs << 13u) | (aref << 16u) | (uvId << 24u);
+                e[1] = it.stages[0]; e[2] = it.stages[1]; e[3] = it.stages[2]; e[4] = it.stages[3];
+                float* fe = (float*)e;
+                fe[5]  = it.matDiffuse[0];  fe[6]  = it.matDiffuse[1];  fe[7]  = it.matDiffuse[2];
+                fe[8]  = it.matAmbient[0];  fe[9]  = it.matAmbient[1];  fe[10] = it.matAmbient[2];
+                fe[11] = it.matEmissive[0]; fe[12] = it.matEmissive[1]; fe[13] = it.matEmissive[2];
+
+                if (!bound) {
+                    cmdBindPipeline(g_live.pCmd, g_live.pMultiMapAlphaPipeline);
+                    cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSet);
+                    cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerLightsSet);
+                    cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
+                    cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerBatchSetMMAlpha);
+                    bound = true;
+                }
+
+                HostMesh& mm = g_meshes[slot];
+                Buffer*  vbs[2]     = { mm.vb, g_live.pInstanceBufMMAlpha };
+                uint32_t strides[2] = { (uint32_t)sizeof(IPC::GeomVertexWireMM), (uint32_t)(kMMInstU32 * sizeof(uint32_t)) };
+                cmdBindVertexBuffer(g_live.pCmd, 2, vbs, strides, nullptr);
+                cmdBindIndexBuffer(g_live.pCmd, mm.ib, INDEX_TYPE_UINT16, 0);
+                cmdDrawIndexedInstanced(g_live.pCmd, mm.indexCount, 0, 1, 0, idx);   // firstInstance=idx
+                ++mmAlphaDrawn;
+            }
+        }
 
         // AT3: refill the captured VB/IB from this frame's blob ([verts][indices], indices at
         // capturedVertBytes) BEFORE the alpha loop draws the sentinel-slot items. Clamp element

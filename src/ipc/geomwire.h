@@ -230,7 +230,15 @@ namespace IPC {
         // clampMode is PER STAGE (each NiTexturingProperty::Map carries its own) — a glow map can
         // clamp while the base map wraps, so it cannot live once per draw like the other paths.
         std::uint32_t stages[4];
+        // Route C (glow-window multimap-blend): bit0 = BLENDED. An alpha-BLEND multi-map shape
+        // (e.g. Glow-in-the-Dahrk night windows: base orange x dark shape) rides THIS same list but
+        // the host skips it in the opaque MM color/Z-prepass/shadow loops and draws it in the alpha
+        // stage with a blend PSO (SRCALPHA/INVSRCALPHA, depth no-write) using multimap_alpha.frag,
+        // which outputs vertex alpha instead of forced 1.0. matAlpha is 1.0 on all such windows
+        // (measured) so no material-alpha field is needed. 0 for every opaque multi-map draw.
+        std::uint32_t drawFlags;
     };
+    constexpr std::uint32_t kMMDrawFlagBlended = 1u;   // MultiMapDrawWire::drawFlags bit0
 
     // Per-stage word packers (client builds, host/shader unpack).
     constexpr std::uint32_t kMMOpBase  = 0u;

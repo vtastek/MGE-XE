@@ -521,16 +521,55 @@ namespace {
         std::uint32_t vColSource;
         float matDiffuse[3], matAmbient[3], matEmissive[3], matAlpha;
     };
-    std::vector<IPC::GeomVertexWire> g_capVertScratch;   // pending captured verts (frame N)
-    std::vector<std::uint16_t>       g_capIdxScratch;    // pending captured indices (frame N)
-    std::vector<CapturedAlphaRec>    g_capRecs;          // pending captured records (frame N)
+    // CONSUME/SHIP side (produce WORKER only): buildGeometryDrawLists reads g_capRecs, appends FP
+    // particles to g_capVertScratch/g_capIdxScratch, and the kickoff ships them. Filled by the swap
+    // below from the main-thread INCOMING buffers — never written by captureAlphaDraw directly.
+    std::vector<IPC::GeomVertexWire> g_capVertScratch;   // consumed/shipped verts (frame N-1)
+    std::vector<std::uint16_t>       g_capIdxScratch;    // consumed/shipped indices (frame N-1)
+    std::vector<CapturedAlphaRec>    g_capRecs;          // consumed records (frame N-1)
     std::optional<IPC::VecView<IPC::GeomChunk>> g_capturedVec;   // shipped at kickoff ([verts][indices])
     // Old-msoc double-draw guard: (d3dTexture<<32 | vertCount) of every cached blended shape the
-    // host already draws this frame; a captured DIP that matches one is a duplicate and is skipped
-    // (built in buildGeometryDrawLists while pushing alphaCands; consumed at the gate this frame).
-    std::unordered_set<std::uint64_t> g_alphaDedup;
-    // Per-frame texture-slot memo for captureAlphaDraw (cleared at consume): rs.texture ptr -> slot.
+    // host already draws; a captured DIP that matches one is a duplicate and is skipped.
+    // DOUBLE-BUFFERED (2026-07-21): the WORKER clears+builds g_alphaDedup in buildGeometryDrawLists
+    // while MAIN's captureAlphaDraw reads it — the same worker-build/main-read race as the capture
+    // scratch. Reading it directly made the glow-window blended-MM draw flicker white/orange (main
+    // read the set before the worker inserted the window's key → dedup miss → MW's AT3 white drew
+    // too; worse at distance = later insert order). swapCaptureBuffers() swaps the worker's freshly
+    // built set into g_alphaDedupActive at the drained dispatch, and MAIN reads ONLY g_alphaDedupActive
+    // (the PREVIOUS frame's completed set — 1 frame late, fine since the visible set changes slowly).
+    std::unordered_set<std::uint64_t> g_alphaDedup;         // WORKER builds (clear + insert)
+    std::unordered_set<std::uint64_t> g_alphaDedupActive;   // MAIN reads (stable prev-frame snapshot)
+    // Per-frame texture-slot memo for the CONSUME side (FP-particle append): rs.texture ptr -> slot.
     std::unordered_map<IDirect3DTexture9*, std::uint32_t> g_capTexMemo;
+
+    // CAPTURE/INCOMING side (MAIN thread only): captureAlphaDraw appends here during MW's scene
+    // render. swapCaptureBuffers() (main, at the per-frame produce dispatch, AFTER waitProduce drains
+    // the previous worker) std::swaps these into the consume-side buffers above and clears these, so
+    // MAIN's fill and the WORKER's consume/ship always touch DIFFERENT vectors under produce OVERLAP.
+    // Single-buffered before (2026-07-21): main's push_back realloc raced the worker's iterate/clear,
+    // handing torn CapturedAlphaRec.world[16] (90°/stretch) and torn vertex ranges (vanish) — the
+    // "wrong geometry frames" on flames/smoke + the glow-window alpha quad. The swap point is drained
+    // by waitProduce and re-kicked, both full barriers, so no atomics are needed (as with g_drawScratch).
+    std::vector<IPC::GeomVertexWire> g_capInVerts;       // captured verts, filling for frame N
+    std::vector<std::uint16_t>       g_capInIdx;         // captured indices, filling for frame N
+    std::vector<CapturedAlphaRec>    g_capInRecs;        // captured records, filling for frame N
+    std::unordered_map<IDirect3DTexture9*, std::uint32_t> g_capInTexMemo;   // main's per-frame slot memo
+    // Swap the just-filled INCOMING captures onto the consume/ship side and reset incoming for the new
+    // frame. Call on the MAIN thread at the produce dispatch, AFTER waitProduce (previous worker done)
+    // and BEFORE the kick / inline kickoffBody + this frame's captureAlphaDraw appends.
+    void swapCaptureBuffers() {
+        std::swap(g_capVertScratch, g_capInVerts);
+        std::swap(g_capIdxScratch,  g_capInIdx);
+        std::swap(g_capRecs,        g_capInRecs);
+        std::swap(g_capTexMemo,     g_capInTexMemo);
+        g_capInVerts.clear();
+        g_capInIdx.clear();
+        g_capInRecs.clear();
+        g_capInTexMemo.clear();
+        // Hand the worker's just-built alpha-dedup set to MAIN (captureAlphaDraw reads Active only).
+        // The worker refills g_alphaDedup next frame (it clears at buildGeometryDrawLists start).
+        std::swap(g_alphaDedup, g_alphaDedupActive);
+    }
     // Drop counters (one-shot logged): lock fail / cap overflow / INDEX32 rebase / no-name-white.
     std::uint32_t g_capDropLock = 0, g_capDropCap = 0, g_capDropIdx32 = 0, g_capNoName = 0;
     // [alpha-dedup] Is the (texture, vertexCount) dedup key eating LIVE particle draws?
@@ -1692,7 +1731,7 @@ namespace {
     // Stage textures resolve through resolveTextureSlot directly (multi-map items
     // are rare — a handful per frame — not worth SlotInfo fields for 4 maps).
     void emitMultiMapDraw(SlotInfo& si, const MGE::GeometryCache::CachedGeometry& e,
-                          std::uint32_t& count) {
+                          std::uint32_t& count, bool blended = false) {
             // Build the ordered stage list, replicating buildCacheStages. A present map is usable
             // only if the wide VB carries the UV set it samples (uv < uvSetCount) — cacheMapActive.
             // Base is pushed unconditionally (e.d3dTexture); the others gated by cacheMapActive.
@@ -1726,6 +1765,7 @@ namespace {
             item.vColSource = (e.hasVertexColor && e.vColSource != 0) ? e.vColSource : 0u;
             item.alphaRef   = e.alphaTest ? e.alphaRef : 0.0f;   // base-stage alpha test
             item.stageCount = (std::uint32_t)ns;
+            item.drawFlags  = blended ? IPC::kMMDrawFlagBlended : 0u;   // Route C: alpha-stage blend draw
             for (int s = 0; s < ns; ++s) {
                 const std::uint32_t tex = resolveTextureSlot(st[s].name);   // bindless slot (0 = white)
                 item.stages[s] = IPC::packMMStage(tex, st[s].uv, st[s].op, st[s].clamp);
@@ -1943,23 +1983,30 @@ namespace {
                 return;
             }
             if (!e.isLandscape && e.blendEnable) {
-                // AT1: non-landscape blended shapes ride the host alpha pass (v1 = static
-                // single-map tri shapes only; multi-map blends keep today's behavior — skipped —
-                // and skinned blends were already routed to the skinned path above).
-                if (wantAlpha && !(e.d3dDark || e.d3dDetail || e.d3dGlow)) {
+                // AT1: non-landscape blended shapes ride the host alpha pass. Single-map tri shapes
+                // go to the sorted-alpha list; MULTI-map blends (Glow-in-the-Dahrk night windows =
+                // base orange x dark shape) ride the multimap vec tagged BLENDED (Route C) — the
+                // host draws them in the alpha stage with multimap_alpha.frag so the dark modulate
+                // shows (else base-map-only white via AT3). Skinned blends went to the skinned path.
+                const bool multiMap = (e.d3dDark || e.d3dDetail || e.d3dGlow);
+                if (wantAlpha && !multiMap) {
                     const float* w = e.worldTransformD3D;
                     const float cx = e.boundsCenter[0], cy = e.boundsCenter[1], cz = e.boundsCenter[2];
                     const float wx = cx * w[0] + cy * w[4] + cz * w[8]  + w[12] - DistantLand::eyePos.x;
                     const float wy = cx * w[1] + cy * w[5] + cz * w[9]  + w[13] - DistantLand::eyePos.y;
                     const float wz = cx * w[2] + cy * w[6] + cz * w[10] + w[14] - DistantLand::eyePos.z;
                     alphaCands.push_back({ wx * fwdX + wy * fwdY + wz * fwdZ, &slot, &e, nullptr });
-                    // AT3: record (GPU texture, vertexCount) so captureAlphaDraw skips this exact
-                    // blend if MW's own DIP for it still reaches the reject gate (old-msoc dll:
-                    // opaque-only skip → cached single-map blends both DIP AND ride the host).
-                    if (e.d3dTexture) {
-                        g_alphaDedup.insert(((std::uint64_t)(std::uintptr_t)e.d3dTexture << 32)
-                                            | (std::uint64_t)e.vertexCount);
-                    }
+                } else if (wantMM && multiMap) {
+                    emitMultiMapDraw(slot, e, multiMapCount, /*blended=*/true);
+                } else {
+                    return;   // feature off — leave MW's DIP (AT3 white) as the fallback, no dedup
+                }
+                // AT3: record (GPU texture, vertexCount) so captureAlphaDraw skips this exact blend
+                // if MW's own DIP for it still reaches the reject gate (old-msoc dll: opaque-only
+                // skip → cached blends both DIP AND ride the host). Both host paths above suppress it.
+                if (e.d3dTexture) {
+                    g_alphaDedup.insert(((std::uint64_t)(std::uintptr_t)e.d3dTexture << 32)
+                                        | (std::uint64_t)e.vertexCount);
                 }
                 return;
             }
@@ -4044,6 +4091,10 @@ namespace RenderProcess {
         // Never kick while a previous async produce is still in flight (would race m_device); the
         // normal EndScene waitProduce already drained it, this is a belt-and-braces no-op there.
         waitProduce();
+        // Non-early dispatch (mode 0 inline / mode 1 fenced / mode 2 non-early): hand main's captured
+        // alpha to the consume side now, worker drained. (The g_earlyKicked path returned above already
+        // swapped in kickProduceEarly — never swap twice in one frame.)
+        swapCaptureBuffers();
 
         // Phase 0 deferred wait: finish the PREVIOUS deferred frame HERE (main thread, late) — on
         // early-kickoff frames the BeginScene collect skipped it, so the host had the whole
@@ -4103,6 +4154,7 @@ namespace RenderProcess {
             return;   // every other path is main-thread-serial and kicks from the dispatcher
         }
         waitProduce();          // belt-and-braces: never kick over an in-flight produce
+        swapCaptureBuffers();   // hand main's captured alpha to the consume side; fresh incoming for this frame
         g_earlyKicked = true;   // tells the dispatcher this frame is already dispatched
         g_produceWorker.ensure();
         stashDeferredFinish();  // hand N-1's finish state over before the worker resets g_kick
@@ -4367,11 +4419,12 @@ namespace RenderProcess {
         // Old-msoc double-draw guard: this DIP is a duplicate iff the host already draws a cached
         // blended shape with the same (GPU texture, vertexCount) — the cache draws from its own VB
         // copies so rs->vb never matches, but (tex, vertCount) does (the vertCount term kills the
-        // shared-texture false positive — particle counts vary). g_alphaDedup is built this frame
-        // in buildGeometryDrawLists while pushing the cached alphaCands.
+        // shared-texture false positive — particle counts vary). Read the ACTIVE (prev-frame) set,
+        // NOT g_alphaDedup — the worker is concurrently rebuilding g_alphaDedup and reading it here
+        // raced (glow-window white/orange flicker). swapCaptureBuffers hands over a stable snapshot.
         const std::uint64_t dedupKey =
             ((std::uint64_t)(std::uintptr_t)rs->texture << 32) | (std::uint64_t)rs->vertCount;
-        if (g_alphaDedup.find(dedupKey) != g_alphaDedup.end()) {
+        if (g_alphaDedupActive.find(dedupKey) != g_alphaDedupActive.end()) {
             // [alpha-dedup] probe: log the first few victims with enough identity to tell a real
             // cached-blend duplicate from an aliased particle draw (a particle's vertCount moves
             // frame to frame; a cached blend's does not).
@@ -4389,9 +4442,9 @@ namespace RenderProcess {
         // Caps: keep the shared captured buffers within their single-chunk budget. Drop WHOLE
         // (never partial) on overflow so an index range can't dangle past the shipped vertex window.
         const std::uint32_t idxCount = rs->primCount * 3;
-        if (g_capRecs.size() >= IPC::kMaxCapturedAlphaDraws
-            || g_capVertScratch.size() + rs->vertCount > IPC::kMaxCapturedAlphaVerts
-            || g_capIdxScratch.size() + idxCount > IPC::kMaxCapturedAlphaIndices) {
+        if (g_capInRecs.size() >= IPC::kMaxCapturedAlphaDraws
+            || g_capInVerts.size() + rs->vertCount > IPC::kMaxCapturedAlphaVerts
+            || g_capInIdx.size() + idxCount > IPC::kMaxCapturedAlphaIndices) {
             if (g_capDropCap++ == 0) {
                 LOG::logline("!! [alpha-cap] captured-alpha cap hit (draws/verts/indices) — dropping rest this session-window");
             }
@@ -4403,8 +4456,8 @@ namespace RenderProcess {
         // memo). No name -> slot 0 (host default white): a visible white particle beats an invisible
         // one, and NiFlipController textures self-correct after the first walk registers them.
         std::uint32_t texIndex;
-        auto mit = g_capTexMemo.find(rs->texture);
-        if (mit != g_capTexMemo.end()) {
+        auto mit = g_capInTexMemo.find(rs->texture);
+        if (mit != g_capInTexMemo.end()) {
             texIndex = mit->second;
         } else {
             const char* name = MGE::GeometryCache::resolveTextureName(rs->texture);
@@ -4412,7 +4465,7 @@ namespace RenderProcess {
             if (!name && g_capNoName++ < 20) {
                 LOG::logline("!! [alpha-cap] no source name for tex=%p (white)", (void*)rs->texture);
             }
-            g_capTexMemo.emplace(rs->texture, texIndex);
+            g_capInTexMemo.emplace(rs->texture, texIndex);
         }
 
         // FVF offsets within the source stride (XYZ at 0; then NORMAL, PSIZE, DIFFUSE, SPECULAR,
@@ -4473,7 +4526,7 @@ namespace RenderProcess {
         // Copy the vertex window [baseIndex+minIndex, +vertCount) → captured VB, building the
         // model-space bbox for the centroid. (The host adds vertexBase to each index, so indices
         // are rebased to 0 within this window below.)
-        const std::uint32_t vBase = (std::uint32_t)g_capVertScratch.size();
+        const std::uint32_t vBase = (std::uint32_t)g_capInVerts.size();
         const UINT srcVBase = rs->baseIndex + rs->minIndex;
         float mn[3] = { 1e30f, 1e30f, 1e30f }, mx[3] = { -1e30f, -1e30f, -1e30f };
         for (UINT j = 0; j < rs->vertCount; ++j) {
@@ -4486,31 +4539,31 @@ namespace RenderProcess {
             out.color = (vColSource != 0) ? *(const std::uint32_t*)(v + colOff) : 0xFFFFFFFFu;
             if (hasUV) { const float* t = (const float*)(v + uvOff); out.u = t[0]; out.v = t[1]; }
             else { out.u = 0.0f; out.v = 0.0f; }
-            g_capVertScratch.push_back(out);
+            g_capInVerts.push_back(out);
             for (int c = 0; c < 3; ++c) { mn[c] = std::min(mn[c], p[c]); mx[c] = std::max(mx[c], p[c]); }
         }
 
         // Copy primCount*3 indices from startIndex, rebased by -minIndex → [0, vertCount). Any
         // rebased value out of uint16 → drop the whole record (roll back the pushed verts+indices).
-        const std::uint32_t iBase = (std::uint32_t)g_capIdxScratch.size();
+        const std::uint32_t iBase = (std::uint32_t)g_capInIdx.size();
         bool idxDrop = false;
         for (UINT i = 0; i < idxCount; ++i) {
             const UINT raw = is16 ? ((const WORD*)pIdx)[rs->startIndex + i]
                                   : ((const DWORD*)pIdx)[rs->startIndex + i];
             const long rebased = (long)raw - (long)rs->minIndex;
             if (rebased < 0 || rebased > 0xFFFF) { idxDrop = true; break; }
-            g_capIdxScratch.push_back((std::uint16_t)rebased);
+            g_capInIdx.push_back((std::uint16_t)rebased);
         }
         rs->ib->Unlock();
         rs->vb->Unlock();
 
         if (idxDrop) {
-            g_capVertScratch.resize(vBase);
-            g_capIdxScratch.resize(iBase);
+            g_capInVerts.resize(vBase);
+            g_capInIdx.resize(iBase);
             if (g_capDropIdx32++ == 0) LOG::logline("!! [alpha-cap] index rebase out of uint16 — dropping");
             return;
         }
-        if (mn[0] > mx[0]) { g_capVertScratch.resize(vBase); g_capIdxScratch.resize(iBase); return; }
+        if (mn[0] > mx[0]) { g_capInVerts.resize(vBase); g_capInIdx.resize(iBase); return; }
 
         // World-space centroid via worldTransforms[0] (model-space bbox center → world). The
         // camera-relative subtraction is applied at emit with the CURRENT eyePos (no swim).
@@ -4541,7 +4594,7 @@ namespace RenderProcess {
             rec.matEmissive[0] = frs->material.emissive.r; rec.matEmissive[1] = frs->material.emissive.g; rec.matEmissive[2] = frs->material.emissive.b;
         }
         rec.matAlpha = frs->material.diffuse.a;
-        g_capRecs.push_back(rec);
+        g_capInRecs.push_back(rec);
     }
 
     // Part A upload accounting: the geometry cache tags each host geom reship by cause.
