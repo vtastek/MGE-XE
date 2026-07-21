@@ -99,10 +99,15 @@ namespace MGE::GeometryCache {
         std::unordered_map<uint32_t, CachedGeometry>      g_cache;
         // Offscreen shadow-caster candidate keys — the subset of g_cache whose entry passes the
         // pre-distance mover filter (skinned / multimap head / rigid LIVE). Maintained incrementally
-        // (updateMoverMembership at capture/reclassify; erased at every g_cache erase/clear) so the
+        // (updateDerivedMembership at capture/reclassify; erased at every g_cache erase/clear) so the
         // Forge feed's offscreen re-emit loop iterates this instead of scanning the whole cache each
         // frame. Exposed via moverCandidates(). Invariant: g_moverCandidates ⊆ keys(g_cache).
         std::unordered_set<uint32_t>                      g_moverCandidates;
+        // Sky / FP membership sets (same pattern as g_moverCandidates): buildSkyDrawList and
+        // buildFPFrame iterate these instead of scanning the whole cache each frame. Maintained
+        // by updateDerivedMembership + the same erase sites as the mover set. ⊆ keys(g_cache).
+        std::unordered_set<uint32_t>                      g_skyKeys;
+        std::unordered_set<uint32_t>                      g_fpKeys;
         // STRONG reference to every cached NiTriShape, keyed exactly like g_cache.
         //
         // The cache KEY IS THE RAW ADDRESS of the shape, and ensureLive() dereferences that address
@@ -260,10 +265,17 @@ namespace MGE::GeometryCache {
         NI::Node* g_landRoot = nullptr;
         uint32_t  g_liveRefreshThisFrame = 0;
         uint32_t  g_liveCaptureThisFrame = 0;
+        // First-sight capture budget (see setCaptureBudget in the header). -1 = unlimited;
+        // >= 0 = remaining first-sight lazy captures ensureLive may still do before deferring.
+        int       g_captureBudget   = -1;
+        uint32_t  g_captureDeferred = 0;   // first-sight keys deferred since last setCaptureBudget
+        // Frame stamp of the last eviction sweep, for framesSinceEvictSweep() (build-spike
+        // vs sweep-cadence alignment test).
+        uint64_t  g_lastSweepFrame  = 0;
         // Per-phase walk timing (QPC), logged every kGcHeartbeatFrames frames as
         // ">> [gc] ..." — the walk is on the dense-city serial chain, so its cost is
         // tracked with the same always-on heartbeat discipline as [hb]/[forge-hb].
-        struct GcAccum { double obj, pick, land, sky, evict, visited, gateSkip, live, cap; uint64_t n; };
+        struct GcAccum { double obj, pick, land, sky, evict, visited, gateSkip, live, cap, kept; uint64_t n; };
         GcAccum           g_gcAccum = {};
         constexpr uint64_t kGcHeartbeatFrames = 300;
         // Per-frame gate observability, accumulated into the [gc] heartbeat:
@@ -1665,11 +1677,17 @@ namespace MGE::GeometryCache {
             return false;
         }
 
-        // Add/drop the key from the candidate set to match the entry's current classification.
-        // Called wherever an entry's classification fields are (re)computed.
-        void updateMoverMembership(uint32_t key, const CachedGeometry& e) {
+        // Add/drop the key from every derived membership set (mover / sky / FP) to match the
+        // entry's current classification. Called wherever classification fields are (re)computed.
+        // The mover rule is unchanged from updateMoverMembership; sky/FP membership is the raw
+        // classification bit — the consumers keep their own per-frame filters (freshness, slot).
+        void updateDerivedMembership(uint32_t key, const CachedGeometry& e) {
             if (isMoverCandidate(e)) g_moverCandidates.insert(key);
             else                     g_moverCandidates.erase(key);
+            if (e.isSky) g_skyKeys.insert(key);
+            else         g_skyKeys.erase(key);
+            if (e.isFP)  g_fpKeys.insert(key);
+            else         g_fpKeys.erase(key);
         }
 
         void visitGeometry(NI::TriBasedGeometry* geom, bool inCharacter) {
@@ -1862,11 +1880,12 @@ namespace MGE::GeometryCache {
                     e.mirrored = computeMirrored(e);
                 }
             }
-            // Mover-candidate membership: the entry (new or refreshed) is now fully classified.
-            // Covers full-walk capture/refresh AND ensureLive's first-sight lazy capture (which
-            // routes through here). The ensureLive REFRESH path re-checks separately on reclassify.
+            // Derived membership (mover / sky / FP sets): the entry (new or refreshed) is now
+            // fully classified. Covers full-walk capture/refresh AND ensureLive's first-sight
+            // lazy capture (which routes through here). The ensureLive REFRESH path re-checks
+            // separately on reclassify.
             auto mit = g_cache.find(key);
-            if (mit != g_cache.end()) updateMoverMembership(key, mit->second);
+            if (mit != g_cache.end()) updateDerivedMembership(key, mit->second);
         }
 
         // bypassCull skips the entry's own app-cull check. Used for a NiSwitchNode's
@@ -2673,6 +2692,7 @@ namespace MGE::GeometryCache {
             const bool walkedThisFrame = (g_walkRanFrame == g_frame);
             const float evictR2 = g_gateRadius * g_gateRadius;
             ++g_evictSweepNo;
+            g_lastSweepFrame = g_frame;   // framesSinceEvictSweep() (spike-alignment probe)
 
             // --- Cell-grid eviction (engine-authoritative; OWNS eviction when on) ---------------
             // Read MW's live grid ONCE per sweep. Verdict per entry:
@@ -2760,6 +2780,12 @@ namespace MGE::GeometryCache {
                     case VA::NiSwitchNode:      case VA::NiBSAnimationNode: case VA::NiBSParticleNode:
                     case VA::NiBSPNode:         case VA::NiFltAnimationNode: case VA::NiLODNode:
                     case VA::NiSortAdjustNode:  case VA::AvoidNode:        case VA::RootCollisionNode:
+                    // MW parents the INTERIOR cell scene under a node carrying the
+                    // NiBSAnimationManager vtable (every interior chain's 2nd hop — [rescue-diag]
+                    // 2026-07-21). Rejecting it read the whole interior as freed → mass age-evict
+                    // → the interior 360° re-capture trickle. NiCollisionSwitch is a common
+                    // in-mesh node with the same silent-miss failure mode.
+                    case VA::NiBSAnimationManager: case VA::NiCollisionSwitch:
                         return true;
                     default:
                         return false;   // dangling/freed parent, or a node type outside the family
@@ -2796,6 +2822,9 @@ namespace MGE::GeometryCache {
             };
             unsigned nEvicted = 0, nByGraph = 0, nByAge = 0, nUnknown = 0, nDeferred = 0;
             unsigned nLogWalkGone = 0, nLogGraphGone = 0;
+            unsigned nKeptByParent = 0, nRescueChecked = 0;
+            unsigned nRescueGone = 0, nRescueUnknown = 0, nRescueDumped = 0;
+            bool     rescueRunaway = false;
             constexpr unsigned kEvictCmpLogCap = 12;
             // CIRCUIT BREAKER. A correct sweep retires a handful of entries (an object left the
             // world). A verdict condemning a large FRACTION of the cache is not a world event, it
@@ -2853,12 +2882,62 @@ namespace MGE::GeometryCache {
                 bool evict;
                 if (cellGrid) {
                     // Cell departure is the authoritative bulk signal (kills the leak). The age
-                    // rule stays ONLY as the within-cell despawn backstop — a dropped/picked-up
-                    // item whose cell is still loaded, so cellGridGone can't see it; its stale
-                    // shadow-caster record ages out within kFarKeepFrames (the old drop/pickup
-                    // behaviour). It can never leak: cellGridGone already bounds the set to <=25 cells.
+                    // rule was meant as the within-cell despawn backstop, but it assumed the walk
+                    // stamps every reachable entry — with world-traversal suppression the walk
+                    // never visits off-screen entries, so in-grid "aged" mostly means BEHIND THE
+                    // CAMERA, not despawned. Evicting those shrank the cache to the current view
+                    // and made every 360° turn a mass re-capture (the capture-budget pop-in).
+                    // Reachability disambiguates: an aged in-grid entry still parented under a
+                    // live root is just off-screen — keep it. A DETACHED chain (verdict 1: the
+                    // drop/pickup/despawn case the age rule existed for) still ages out; unknown
+                    // verdicts (no stored ref, depth cap) keep the plain age behaviour so nothing
+                    // can linger unbounded. Retention is the safe direction: on climb runaway the
+                    // rest of the aged set is kept this sweep and re-evaluated next sweep.
                     const bool gone = cellGridGone(e);
-                    const bool aged = (g_frame - e.lastFrame > kFarKeepFrames);
+                    bool aged = (g_frame - e.lastFrame > kFarKeepFrames);
+                    if (!gone && aged && rootsValid) {
+                        if (rescueRunaway) {
+                            aged = false;
+                        } else if ((++nRescueChecked & 2047) == 0 && gcNowMs() - tClimb0 > kClimbWatchdogMs) {
+                            rescueRunaway = true;
+                            LOG::logline("!! [evict-climb] RUNAWAY in cell-grid rescue: %.0fms at %u aged checks"
+                                         " — keeping remaining aged in-grid entries this sweep",
+                                         gcNowMs() - tClimb0, nRescueChecked);
+                            aged = false;
+                        } else {
+                            const int v = parentVerdict(it->first, e);
+                            if (v == 0) {
+                                aged = false;
+                                ++nKeptByParent;
+                            } else {
+                                if (v == 1) ++nRescueGone; else ++nRescueUnknown;
+                                // Diagnose WHY the rescue failed (first few per sweep): re-climb the
+                                // same chain and print every hop's node + vtable against the known
+                                // roots. An unrecognized-but-consistent TOP pointer = a root missing
+                                // from the known set; a mid-chain vtable miss = a node type missing
+                                // from isLiveNode's accept list. (Interiors mass-aged with kept=29
+                                // while exteriors rescued fine — this names the differing hop.)
+                                if (nRescueDumped < 4) {
+                                    ++nRescueDumped;
+                                    char chain[640]; int off = 0; chain[0] = '\0';
+                                    auto rit2 = g_geomRefs.find(it->first);
+                                    NI::Node* p = (rit2 != g_geomRefs.end() && rit2->second.get())
+                                                  ? rit2->second.get()->parentNode : nullptr;
+                                    for (int d = 0; p && d < kMaxParentDepth && off < (int)sizeof(chain) - 48; ++d) {
+                                        off += snprintf(chain + off, sizeof(chain) - off, " %p(vt=%p)",
+                                                        (void*)p, (void*)p->vTable.asNode);
+                                        if (!isLiveNode(p)) { off += snprintf(chain + off, sizeof(chain) - off, "!VT"); break; }
+                                        p = p->parentNode;
+                                    }
+                                    LOG::logline("!! [rescue-diag] key=%08x v=%d live=%d skinned=%d homeInt=%p age=%llu chain=%s | roots obj=%p pick=%p land=%p arm=%p",
+                                                 it->first, v, (int)e.isLive, (int)e.isSkinned,
+                                                 (void*)e.homeInteriorCell,
+                                                 (unsigned long long)(g_frame - e.lastFrame), chain,
+                                                 (void*)g_objRoot, (void*)g_pickRoot, (void*)g_landRoot, (void*)armRoot);
+                                }
+                            }
+                        }
+                    }
                     evict = gone || aged;
                     if (gone) ++nByCell; else if (aged) ++nByAge;
                 } else if (walkedThisFrame) {
@@ -2934,7 +3013,9 @@ namespace MGE::GeometryCache {
                     g_evictedKeys.push_back(it->first);   // tell the Forge feed to release the host slot
                     releaseEntry(e);
                     g_geomRefs.erase(it->first);          // key leaving the cache → drop the engine ref
-                    g_moverCandidates.erase(it->first);   // key leaving the cache → drop the candidate
+                    g_moverCandidates.erase(it->first);   // key leaving the cache → drop from every
+                    g_skyKeys.erase(it->first);           //   derived membership set
+                    g_fpKeys.erase(it->first);
                     it = g_cache.erase(it);
                 } else {
                     ++it;
@@ -2945,13 +3026,18 @@ namespace MGE::GeometryCache {
             // eviction path is where the freeze/ghosting bugs live, so a non-zero sweep must never
             // be silent (it was, between sweep 20 and the mass-evict investigation).
             if (validating || nEvicted > 0) {
-                LOG::logline(">> [evict] sweeps=%u mode=%s walk-forced=%u entries=%zu evicted=%u byCell=%u grid=(%d,%d)r%d int=%d byGraph=%u byAge=%u unknown=%u deferred=%u disagree(walkGone/parentGone)=%u/%u",
+                LOG::logline(">> [evict] sweeps=%u mode=%s walk-forced=%u entries=%zu evicted=%u byCell=%u grid=(%d,%d)r%d int=%d byGraph=%u byAge=%u unknown=%u deferred=%u kept=%u disagree(walkGone/parentGone)=%u/%u",
                              g_evictSweepNo, cellGrid ? "cell" : (g_evictByParentChain ? "parent" : "walk"),
                              walkedThisFrame ? 1u : 0u, g_cache.size(),
                              nEvicted, nByCell, cgX, cgY, kCellGridRadius, (int)(curInterior != nullptr),
-                             nByGraph, nByAge, nUnknown, nDeferred,
+                             nByGraph, nByAge, nUnknown, nDeferred, nKeptByParent,
                              g_evictDisagreeWalkGone, g_evictDisagreeGraphGone);
+            if (nRescueGone + nRescueUnknown > 0) {
+                LOG::logline(">> [rescue] sweep=%u kept=%u failGone=%u failUnknown=%u",
+                             g_evictSweepNo, nKeptByParent, nRescueGone, nRescueUnknown);
             }
+            }
+            g_gcAccum.kept += (double)nKeptByParent;
             // Parent-climb probe (every sweep while the graph verdict is active). countMs = wall time
             // of the full-cache climb; if it ever spikes this IS the freeze. vtBad = dangling/freed
             // parents the vtable guard rejected (the health of the whole premise — a large number
@@ -2973,13 +3059,14 @@ namespace MGE::GeometryCache {
         g_gcAccum.evict += tEvict - tSky;
         if (++g_gcAccum.n >= kGcHeartbeatFrames) {
             const double n = (double)g_gcAccum.n;
-            LOG::logline(">> [gc] %llu frames avg: walk=%.2f (obj=%.2f pick=%.2f land=%.2f sky=%.2f evict=%.2f) entries=%zu visited=%.0f gateSkip=%.0f live=%.0f cap=%.1f%s gateR=%.0f",
+            LOG::logline(">> [gc] %llu frames avg: walk=%.2f (obj=%.2f pick=%.2f land=%.2f sky=%.2f evict=%.2f) entries=%zu visited=%.0f gateSkip=%.0f live=%.0f cap=%.1f kept/sweep=%.0f%s gateR=%.0f",
                          (unsigned long long)g_gcAccum.n,
                          (g_gcAccum.obj + g_gcAccum.pick + g_gcAccum.land + g_gcAccum.sky + g_gcAccum.evict) / n,
                          g_gcAccum.obj / n, g_gcAccum.pick / n, g_gcAccum.land / n,
                          g_gcAccum.sky / n, g_gcAccum.evict / n, g_cache.size(),
                          g_gcAccum.visited / n, g_gcAccum.gateSkip / n,
                          g_gcAccum.live / n, g_gcAccum.cap / n,
+                         g_gcAccum.kept * kEvictSweepInterval / n,
                          g_gateThisFrame ? " gate=ON" : "", g_gateRadius);
             g_gcAccum = GcAccum{};
         }
@@ -3042,6 +3129,31 @@ namespace MGE::GeometryCache {
         return g_moverCandidates;
     }
 
+    const std::unordered_set<uint32_t>& skyKeys() {
+        return g_skyKeys;
+    }
+
+    const std::unordered_set<uint32_t>& fpKeys() {
+        return g_fpKeys;
+    }
+
+    uint32_t framesSinceEvictSweep() {
+        return (uint32_t)(g_frame - g_lastSweepFrame);
+    }
+
+    void setCaptureBudget(int budget) {
+        g_captureBudget   = budget;
+        g_captureDeferred = 0;
+    }
+
+    uint32_t captureDeferredLastBuild() {
+        return g_captureDeferred;
+    }
+
+    uint32_t liveCaptureCount() {
+        return g_liveCaptureThisFrame;
+    }
+
     const void* fpParticleVerts(uint32_t& countOut) {
         countOut = (uint32_t)g_fpPartVerts.size();
         return g_fpPartVerts.data();
@@ -3095,7 +3207,9 @@ namespace MGE::GeometryCache {
             releaseEntry(kv.second);
         }
         g_cache.clear();
-        g_moverCandidates.clear();   // whole cache dropped → no candidates survive
+        g_moverCandidates.clear();   // whole cache dropped → no derived membership survives
+        g_skyKeys.clear();
+        g_fpKeys.clear();
         g_geomRefs.clear();   // NI::Pointer dtors → DecRef every shape we were pinning
     }
 
@@ -3126,6 +3240,8 @@ namespace MGE::GeometryCache {
             g_cache.erase(it);
             g_geomRefs.erase(key);   // key leaving the cache → drop the engine ref
             g_moverCandidates.erase(key);   // stale entry gone; re-capture below re-adds if applicable
+            g_skyKeys.erase(key);
+            g_fpKeys.erase(key);
             it = g_cache.end();
         }
 
@@ -3143,6 +3259,17 @@ namespace MGE::GeometryCache {
                 if (a == g_objRoot)  { inDomain = true; break; }
             }
             if (!inDomain) return nullptr;
+            // First-sight capture budget: bound how many lazy captures one build loop may do —
+            // a reveal burst of new keys otherwise lands whole in a single frame's build.
+            // Deferred keys are NOT lost: the classify visible set regenerates every frame, so
+            // the key re-arrives and captures next frame (natural carry-over). Placed AFTER the
+            // domain climb so out-of-domain keys never consume budget, and only on this
+            // first-sight branch — the refresh path below is correctness and is never gated.
+            if (g_captureBudget == 0) {
+                ++g_captureDeferred;
+                return nullptr;
+            }
+            if (g_captureBudget > 0) --g_captureBudget;
             g_walkingLandscape = isLand;
             g_walkingPick = isPick;
             visitGeometry(geom, false);
@@ -3195,7 +3322,7 @@ namespace MGE::GeometryCache {
                 --e.dynamicHint;
             }
         }
-        if (reclassified) updateMoverMembership(key, e);
+        if (reclassified) updateDerivedMembership(key, e);
         return &e;
     }
 

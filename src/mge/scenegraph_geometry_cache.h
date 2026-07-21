@@ -323,6 +323,33 @@ namespace MGE::GeometryCache {
     // per-frame distance / visible-set / suppressedFrame / want-flag checks unchanged.
     const std::unordered_set<uint32_t>& moverCandidates();
 
+    // Sky / first-person membership sets — the same incremental-maintenance pattern as
+    // moverCandidates, for the OTHER two full-cache scans the Forge feed used to pay every
+    // frame (buildSkyDrawList's main + [sk-diag] loops, buildFPFrame's gather). Maintained
+    // at capture / reclassify / evict alongside the mover set; every per-frame filter
+    // (lastFrame freshness, host slot, classification re-check) stays with the consumer.
+    // Invariant: both sets ⊆ keys(cache()).
+    const std::unordered_set<uint32_t>& skyKeys();
+    const std::unordered_set<uint32_t>& fpKeys();
+
+    // Frames elapsed since the eviction sweep last ran (0 on a sweep frame). Build-spike
+    // observability: tests whether build spikes align with the ~30-frame sweep cadence.
+    uint32_t framesSinceEvictSweep();
+
+    // First-sight capture budget. setCaptureBudget(-1) = unlimited (the default);
+    // setCaptureBudget(n >= 0) lets ensureLive() do at most n first-sight lazy captures
+    // before deferring the rest (returns null — the classify set regenerates every frame,
+    // so a deferred key re-arrives and captures next frame; a 1-frame delay, never a loss).
+    // NEVER gates the refresh path — pose/palette freshness of cached entries is
+    // correctness. Each call also resets the deferred counter; captureDeferredLastBuild()
+    // reads how many first-sight keys were deferred since the last setCaptureBudget call.
+    void setCaptureBudget(int budget);
+    uint32_t captureDeferredLastBuild();
+
+    // Running first-sight lazy-capture count for the current cache frame (reset by
+    // onFrameReady). Snapshot before/after a build loop to count captures-this-build.
+    uint32_t liveCaptureCount();
+
     // Drain the keys the eviction sweep dropped since the last call (objects that left the world
     // within a cell — picked up, despawned, disabled). The Forge feed maps each to its host mesh
     // slot and ships a release sentinel so the host forgets the slot's shadow-caster record.
