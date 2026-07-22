@@ -74,7 +74,7 @@ namespace {
     //               is quiescent during the scene-0 draw but mutated by mwstart(N+1) — deferring the
     //               wait past EndScene would race that. Non-early frames (interior/menu/warm-up)
     //               fence like mode 1 (the finish follows immediately, no window to overlap).
-    int    g_produceMode = 2;          // 0 OFF / 1 FENCED / 2 OVERLAP; NUMPAD8 cycles. DEFAULT OVERLAP
+    int    g_produceMode = 2;          // 0 OFF / 1 FENCED / 2 OVERLAP / 3 PARK; NUMPAD8/panel cycles. DEFAULT OVERLAP
                                        // (user 2026-07-18: keep overlap always on) — degrades to a
                                        // fence on non-early frames, so it's safe as the boot default.
     bool   g_produceInFlight = false;  // an async (mode 2) produce is running / not yet waited
@@ -192,6 +192,10 @@ namespace {
         // closed it early: renderSceneFinish already ran; the composite finish must consume
         // these stored results instead of finishing again. Load-burst frames only.
         bool rpcEarlyFinished;
+        // Mode 3 (PARK): this kickoff was a frame-start fire of a parked payload
+        // (fireParked). The collect keys its window-close on THIS state, not on the
+        // current g_produceMode, so a NUMPAD8 switch mid-flight can never orphan it.
+        bool parkFired;
         bool earlyOk;
         double earlyHostMs;
         // Host phase split captured by that early finish — the composite path must plot THESE,
@@ -522,6 +526,31 @@ namespace {
     // so every new-cell light takes a fresh id. Continuous exterior walking never trips it.
     std::uint32_t                               g_cellEpoch = 0;
     constexpr float         kCellTeleportDist = 8192.0f;   // one MW cell moved in ONE frame = teleport
+
+    // --- Produce mode 3 "PARK-AND-FIRE" ---------------------------------------------------
+    // The worker builds frame N's payload into the client-private scratch vectors and PARKS it
+    // (no flush/assign/RPC); at the START of frame N+1 (frameSetupEarly, camera fresh, window
+    // closed) the main thread fires it with a restamped camera (fireParked). The payload parks
+    // IN PLACE: the scratch vectors are cleared only at the start of the next build, and the
+    // fire (main, frame start) always precedes the next worker kick in the same frameSetupEarly
+    // — zero copy. Only counts + the FP bundle + the build-time eye need holding here.
+    // Invalidated (a) at every kickoffBody entry (a serial/inline kickoff supersedes it),
+    // (b) at fire on a cell-epoch mismatch (teleport between build and fire → drop, one
+    // repeated composite frame), (c) on fire (consumed).
+    struct ParkedPayload {
+        bool valid = false;
+        std::uint32_t epoch = 0;              // g_cellEpoch at build → fire-time invalidation
+        float bakeEye[3] = {};                // DistantLand::eyePos at build (payload's relative space)
+        std::uint32_t drawCount = 0, skinnedCount = 0, multiMapCount = 0,
+                      lightCount = 0, skyCount = 0, alphaCount = 0;
+        IPC::FPFrame fpFrame;                 // shipped VERBATIM at fire — self-consistent
+        std::uint32_t fpDraws = 0, fpSkinnedDraws = 0, fpAlphaDraws = 0;   // (pose N, arm-cam N) bundle
+        bool fpHave = false;
+        std::uint32_t capturedEmitted = 0;    // AT3 captured count at build (g_capturedEmitted snapshot)
+        double tBuildEnd = 0.0, buildMs = 0.0;   // telemetry (parkAge at fire)
+    };
+    ParkedPayload g_park;
+
     std::vector<std::uint8_t>                 g_skyScratch;         // packed SkyDrawWire[] this frame (SK1)
     std::vector<std::uint8_t>                 g_alphaScratch;       // packed AlphaDrawWire[] this frame (AT1, back-to-front)
 
@@ -1031,8 +1060,18 @@ namespace {
     // Copy the imported host RT -> the DXVK D3D9 texture's VkImage, on DXVK's own queue.
     // Blocking: CPU-waits the copy so the subsequent StretchRect reads finished pixels.
     bool copyHostRtToDst() {
-        // Flush any DXVK rendering that touches the dst image before we use its queue.
-        g_vki->FlushRenderingCommands();
+        // Spike attribution (rare 12ms "Forge RT copy" with host already finished): the outer
+        // zone can't say WHICH of the three main-thread blockers stalled — the DXVK flush (drains
+        // MW's whole pending D3D9 batch), the submit-queue lock (contends DXVK's submit thread),
+        // or the fence wait (our copy drains BEHIND MW's already-queued GPU work). Wall-time each
+        // phase; on a spike, log the split so the next occurrence names its own cause.
+        const double tc0 = nowMs();
+        {
+            // Flush any DXVK rendering that touches the dst image before we use its queue.
+            MGE_ZoneScopedN("RTcopy: DXVK flush");
+            g_vki->FlushRenderingCommands();
+        }
+        const double tcFlush = nowMs();
 
         vk.ResetCommandBuffer(g_cmd, 0);
         VkCommandBufferBeginInfo bi = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
@@ -1076,13 +1115,30 @@ namespace {
         si.commandBufferCount = 1;
         si.pCommandBuffers    = &g_cmd;
 
+        const double tcRecord = nowMs();
+        double tcLocked = tcRecord, tcSubmit = tcRecord;
         g_vki->LockSubmissionQueue();
+        tcLocked = nowMs();                       // time spent waiting on DXVK's submit lock
         VkResult r = vk.QueueSubmit(g_queue, 1, &si, g_fence);
+        tcSubmit = nowMs();
         if (r == VK_SUCCESS) {
+            MGE_ZoneScopedN("RTcopy: fence wait");   // our copy draining behind MW's queued GPU work
             vk.WaitForFences(g_dev, 1, &g_fence, VK_TRUE, UINT64_MAX);
             vk.ResetFences(g_dev, 1, &g_fence);
         }
         g_vki->ReleaseSubmissionQueue();
+        const double tcEnd = nowMs();
+
+        const double total = tcEnd - tc0;
+        MGE_TracyPlot("Forge RTcopy flush ms", tcFlush - tc0);
+        MGE_TracyPlot("Forge RTcopy wait ms",  tcEnd - tcSubmit);
+        // Only rare spikes log — the steady RT copy is ~0.2ms, so >3ms means a real stall to
+        // attribute (flush / lock / submit / fence-wait). Rare by construction ⇒ no hot-path spam.
+        if (total > 3.0) {
+            LOG::logline(">> [rtcopy] spike total=%.2fms | flush=%.2f record=%.2f lock=%.2f submit=%.2f wait=%.2f",
+                         total, tcFlush - tc0, tcRecord - tcFlush, tcLocked - tcRecord,
+                         tcSubmit - tcLocked, tcEnd - tcSubmit);
+        }
         return r == VK_SUCCESS;
     }
 
@@ -3175,14 +3231,18 @@ namespace RenderProcess {
             g_frameAheadLive = !g_frameAheadLive;
             LOG::logline(">> [seam] frame-ahead pipelining %s", g_frameAheadLive ? "ON" : "OFF");
         }
-        // NUMPAD8: produce-worker mode cycle OFF -> FENCED (Tier 1b) -> OVERLAP (Tier 2) -> OFF.
-        // FENCED runs the produce on the worker but waits immediately (serial A/B); OVERLAP defers
-        // the wait to EndScene(0) so it overlaps scene-0 draw. Inert on the legacy UseRenderThread
-        // path (dispatcher gates it out). Takes effect at the next kickoff.
+        // NUMPAD8: produce-worker mode cycle OFF -> FENCED (Tier 1b) -> OVERLAP (Tier 2) ->
+        // PARK (mode 3, fire-at-frame-start) -> OFF. FENCED runs the produce on the worker but
+        // waits immediately (serial A/B); OVERLAP defers the wait to EndScene(0) so it overlaps
+        // scene-0 draw; PARK builds frame N on the worker without firing and the main thread
+        // fires it at the START of frame N+1 with a restamped camera (frame = max, not sum).
+        // Inert on the legacy UseRenderThread path (dispatcher gates it out). Takes effect at
+        // the next kickoff.
         if (GetAsyncKeyState(VK_NUMPAD8) & 0x0001) {
-            g_produceMode = (g_produceMode + 1) % 3;
+            g_produceMode = (g_produceMode + 1) % 4;
             const char* name = (g_produceMode == 1) ? "FENCED (Tier 1b)"
-                             : (g_produceMode == 2) ? "OVERLAP (Tier 2)" : "OFF (inline)";
+                             : (g_produceMode == 2) ? "OVERLAP (Tier 2)"
+                             : (g_produceMode == 3) ? "PARK (fire-at-frame-start)" : "OFF (inline)";
             LOG::logline(">> [seam] produce worker: %s%s", name,
                          (g_produceMode != 0 && Configuration.UseRenderThread) ? " (inert — UseRenderThread owns the worker)" : "");
         }
@@ -3518,6 +3578,67 @@ namespace RenderProcess {
         }
     }
 
+    // Cell-change shadow eviction (see g_cellEpoch): bump the epoch on any load-door
+    // transition BEFORE buildLightList so the cleared identity map hands every new-cell light a
+    // fresh id. Signal = the engine's authoritative interior-cell pointer (covers
+    // interior<->interior and interior<->exterior) OR a single-frame eye teleport (covers
+    // exterior<->exterior load doors / fast travel, which keep the interior pointer null).
+    // Runs once per produced frame: from kickoffBody on the serial/inline paths, from
+    // fireParked (main, frame start) in produce mode 3 — never both in one frame.
+    void checkCellEpochAndPurge(unsigned frame) {
+        void* dh = MGE::SceneGraph::getDataHandler();
+        const void* interiorCell = dh ? MGE::DataHandlerView::currentInteriorCell(dh) : nullptr;
+        const float eye[3] = { DistantLand::eyePos.x, DistantLand::eyePos.y, DistantLand::eyePos.z };
+        static const void* s_lastInteriorCell = nullptr;
+        static float       s_lastEye[3] = { 1e30f, 1e30f, 1e30f };
+        static bool        s_haveEye = false;
+        const float ex = eye[0] - s_lastEye[0], ey = eye[1] - s_lastEye[1], ez = eye[2] - s_lastEye[2];
+        const bool teleport = s_haveEye && (ex*ex + ey*ey + ez*ez > kCellTeleportDist * kCellTeleportDist);
+        if (interiorCell != s_lastInteriorCell || teleport) {
+            ++g_cellEpoch;
+            g_lightTracks.clear();   // new-cell lights all take fresh ids (no address-reuse inheritance)
+            // The scene graph was torn down with the old cell, but the geometry cache keys on
+            // shape ADDRESSES and cannot see that — so the old cell's entries survive and get
+            // emitted below for a frame (the one-frame flash of the previous cell's objects/NPCs
+            // on a transition). Purge them here, BEFORE buildGeometryDrawLists runs.
+            //
+            // NOT on the very first evaluation: s_lastInteriorCell starts null, so frame 0 always
+            // looks like a "transition" — and purging there would throw away the 1524 entries the
+            // startup walk just captured, for nothing. There is no old cell to leave yet. (s_haveEye
+            // is false exactly once, which is the same condition the teleport test already uses.)
+            const bool firstEval = !s_haveEye;
+            LOG::logline(">> [cell-purge] epoch=%u frame=%u interiorChanged=%d teleport=%d first=%d cached=%u",
+                         g_cellEpoch, frame, (int)(interiorCell != s_lastInteriorCell), (int)teleport,
+                         (int)firstEval, (unsigned)MGE::GeometryCache::cache().size());
+            if (!firstEval) {
+                MGE::GeometryCache::purgeAll();
+                // Then resolve those keys to host slots IMMEDIATELY — do not leave them for the
+                // deferred drain in flushGeometry(). The purge just released our engine refs, so
+                // the old shapes are freed and the allocator will hand the SAME ADDRESSES to the
+                // new cell's shapes; buildGeometryDrawLists (below) then re-captures them under
+                // the very same keys and assigns them fresh host slots. A drain running after
+                // that would look each evicted key up in g_keySlot, find the NEW slot, and
+                // release the object we just uploaded — losing every part of the new cell that
+                // landed on a recycled address (measured: ~half a cell, every save load).
+                // Draining here resolves the keys to the OLD slots, while they still mean what
+                // they meant at purge time.
+                drainReleasedSlots();
+            }
+        }
+        s_lastInteriorCell = interiorCell;
+        s_lastEye[0] = eye[0]; s_lastEye[1] = eye[1]; s_lastEye[2] = eye[2];
+        s_haveEye = true;
+    }
+
+    void flushAssignAndKick(IDirect3DDevice9* device, unsigned frame,
+                            std::uint32_t drawCount, std::uint32_t skinnedCount,
+                            std::uint32_t multiMapCount, std::uint32_t lightCount,
+                            std::uint32_t skyCount, std::uint32_t alphaCount,
+                            IPC::FPFrame& fpFrame, std::uint32_t fpDraws,
+                            std::uint32_t fpSkinnedDraws, std::uint32_t fpAlphaDraws, bool fpHave,
+                            const float bakeEye[3], bool parkFired,
+                            double dtPresent, double tStart, double tBuild);   // fwd (defined below)
+
     // The produce+RPC-start body (Tier 1a made it D3D9-free). Runs either inline on the MW
     // main thread or, when g_produceOffMain, on the fresh ProduceWorker below. onStage0Composite-
     // Kickoff is the dispatcher that chooses.
@@ -3530,6 +3651,7 @@ namespace RenderProcess {
         // would be a dispatcher bug, not something to paper over with a worker-side D3D9 finish.
         // Whole-frame no-op guarantee: rpcPending stays false on every early-out below, so
         // the paired Finish returns immediately.
+        g_park.valid = false;   // mode 3: a serial/inline kickoff supersedes any parked payload
         g_kick = KickState{};
         if (!device || !g_initOk) {
             return;
@@ -3566,61 +3688,8 @@ namespace RenderProcess {
 
         const unsigned frame = g_frame++;
 
-        // Cell-change shadow eviction (see g_cellEpoch): bump the epoch on any load-door
-        // transition BEFORE buildLightList so the cleared identity map hands every new-cell light a
-        // fresh id. Signal = the engine's authoritative interior-cell pointer (covers
-        // interior<->interior and interior<->exterior) OR a single-frame eye teleport (covers
-        // exterior<->exterior load doors / fast travel, which keep the interior pointer null).
-        {
-            void* dh = MGE::SceneGraph::getDataHandler();
-            const void* interiorCell = dh ? MGE::DataHandlerView::currentInteriorCell(dh) : nullptr;
-            const float eye[3] = { DistantLand::eyePos.x, DistantLand::eyePos.y, DistantLand::eyePos.z };
-            static const void* s_lastInteriorCell = nullptr;
-            static float       s_lastEye[3] = { 1e30f, 1e30f, 1e30f };
-            static bool        s_haveEye = false;
-            const float ex = eye[0] - s_lastEye[0], ey = eye[1] - s_lastEye[1], ez = eye[2] - s_lastEye[2];
-            const bool teleport = s_haveEye && (ex*ex + ey*ey + ez*ez > kCellTeleportDist * kCellTeleportDist);
-            if (interiorCell != s_lastInteriorCell || teleport) {
-                ++g_cellEpoch;
-                g_lightTracks.clear();   // new-cell lights all take fresh ids (no address-reuse inheritance)
-                // The scene graph was torn down with the old cell, but the geometry cache keys on
-                // shape ADDRESSES and cannot see that — so the old cell's entries survive and get
-                // emitted below for a frame (the one-frame flash of the previous cell's objects/NPCs
-                // on a transition). Purge them here, BEFORE buildGeometryDrawLists runs.
-                //
-                // NOT on the very first evaluation: s_lastInteriorCell starts null, so frame 0 always
-                // looks like a "transition" — and purging there would throw away the 1524 entries the
-                // startup walk just captured, for nothing. There is no old cell to leave yet. (s_haveEye
-                // is false exactly once, which is the same condition the teleport test already uses.)
-                const bool firstEval = !s_haveEye;
-                LOG::logline(">> [cell-purge] epoch=%u frame=%u interiorChanged=%d teleport=%d first=%d cached=%u",
-                             g_cellEpoch, frame, (int)(interiorCell != s_lastInteriorCell), (int)teleport,
-                             (int)firstEval, (unsigned)MGE::GeometryCache::cache().size());
-                if (!firstEval) {
-                    MGE::GeometryCache::purgeAll();
-                    // Then resolve those keys to host slots IMMEDIATELY — do not leave them for the
-                    // deferred drain in flushGeometry(). The purge just released our engine refs, so
-                    // the old shapes are freed and the allocator will hand the SAME ADDRESSES to the
-                    // new cell's shapes; buildGeometryDrawLists (below) then re-captures them under
-                    // the very same keys and assigns them fresh host slots. A drain running after
-                    // that would look each evicted key up in g_keySlot, find the NEW slot, and
-                    // release the object we just uploaded — losing every part of the new cell that
-                    // landed on a recycled address (measured: ~half a cell, every save load).
-                    // Draining here resolves the keys to the OLD slots, while they still mean what
-                    // they meant at purge time.
-                    drainReleasedSlots();
-                }
-            }
-            s_lastInteriorCell = interiorCell;
-            s_lastEye[0] = eye[0]; s_lastEye[1] = eye[1]; s_lastEye[2] = eye[2];
-            s_haveEye = true;
-        }
+        checkCellEpochAndPurge(frame);
 
-        // Drive the host renderer into the shared RT. Async — the host fence-waits before
-        // signalling completion, so at renderSceneFinish the draw is GPU-complete and the
-        // resource quiescent before our copy. M1c: build this frame's visible draw list
-        // (camera + slots + world transforms) and render the cached opaque SCENE.
-        bool ok = false;
         // Re-walk the geometry cache to build the host's draw lists (the MGE→Forge feeding cost —
         // Phase 2 makes this GPU-resident so it goes to 0).
         std::uint32_t drawCount, skinnedCount, multiMapCount, lightCount, skyCount, alphaCount;
@@ -3641,6 +3710,37 @@ namespace RenderProcess {
             fpHave = buildFPFrame(fpFrame, fpDraws, fpSkinnedDraws, fpAlphaDraws);
         }
         const double tBuild = nowMs();
+
+        // Everything above wrote only client-private scratch; the shared-memory half
+        // (gate → flushes → assigns → constants → renderSceneKickoff) is the extracted
+        // flushAssignAndKick, shared verbatim with the mode-3 park fire. bakeEye == eyePos
+        // here ⇒ the camera restamp inside is the exact identity (byte-identical constants).
+        const float bakeEye[3] = { DistantLand::eyePos.x, DistantLand::eyePos.y, DistantLand::eyePos.z };
+        flushAssignAndKick(device, frame, drawCount, skinnedCount, multiMapCount, lightCount,
+                           skyCount, alphaCount, fpFrame, fpDraws, fpSkinnedDraws, fpAlphaDraws,
+                           fpHave, bakeEye, /*parkFired=*/false, dtPresent, tStart, tBuild);
+    }
+
+    // The shared-memory half of the produce: gate → flushGeometry → flushTextures → vec
+    // assigns (incl. captured-alpha) → frame constants → renderSceneKickoff → populate
+    // g_kick. Extracted from kickoffBody so the mode-3 park fire (fireParked, main thread,
+    // frame start) can ship a payload the worker built LAST frame. `bakeEye` = the eye the
+    // payload was emitted relative to (build-time DistantLand::eyePos); the view restamp
+    // below re-aims it with the CURRENT camera. On the serial paths bakeEye == eyePos and
+    // every byte matches the pre-extraction code. `parkFired` marks g_kick so the collect
+    // keys the finish on state, not the current produce mode.
+    void flushAssignAndKick(IDirect3DDevice9* device, unsigned frame,
+                            std::uint32_t drawCount, std::uint32_t skinnedCount,
+                            std::uint32_t multiMapCount, std::uint32_t lightCount,
+                            std::uint32_t skyCount, std::uint32_t alphaCount,
+                            IPC::FPFrame& fpFrame, std::uint32_t fpDraws,
+                            std::uint32_t fpSkinnedDraws, std::uint32_t fpAlphaDraws, bool fpHave,
+                            const float bakeEye[3], bool parkFired,
+                            double dtPresent, double tStart, double tBuild) {
+        // Drive the host renderer into the shared RT. Async — the host fence-waits before
+        // signalling completion, so at renderSceneFinish the draw is GPU-complete and the
+        // resource quiescent before our copy.
+        bool ok = false;
 
         // Ship this frame's captured geometry AFTER the build (Cut 2B): on fold frames
         // first-sight parts are captured DURING buildGeometryDrawLists (ensureLive lazy
@@ -3802,12 +3902,24 @@ namespace RenderProcess {
             return;
         }
 
-        // CAMERA-RELATIVE viewProj: zero the view matrix's translation row so the camera sits at
-        // the origin (the world translations above are pre-shifted by -eye, so this cancels exactly:
-        // eyePos == inverse(mwView)·origin, hence mwView's translation row == -eye·R). This keeps the
-        // whole vertex pipeline near the origin and eliminates the float32 large-world stretching.
+        // CAMERA-RELATIVE viewProj: the payload's world translations are pre-shifted by -bakeEye
+        // (the eye at BUILD time), so the view translation row must be (bakeEye - eyeNow)·R_now:
+        // v_view = (v_rel + bakeEye - eyeNow)·R_now. On the serial paths bakeEye == eyePos, the
+        // delta is 0 and this reduces to the original "zero the translation row" (eyePos ==
+        // inverse(mwView)·origin, hence mwView's translation row == -eye·R — the cancellation is
+        // exact). Mode-3 park fires re-aim last frame's payload with THIS frame's rotation +
+        // position — one adjusted matrix covers the whole payload, which is emitted relative to
+        // bakeEye throughout (statics/multimap/alpha/lights/captures). Keeps the vertex pipeline
+        // near the origin (no float32 large-world stretching) in every mode.
         D3DXMATRIX viewRel = DistantLand::mwView;
-        viewRel._41 = viewRel._42 = viewRel._43 = 0.0f;
+        {
+            const float dx = bakeEye[0] - DistantLand::eyePos.x;
+            const float dy = bakeEye[1] - DistantLand::eyePos.y;
+            const float dz = bakeEye[2] - DistantLand::eyePos.z;
+            viewRel._41 = dx * viewRel._11 + dy * viewRel._21 + dz * viewRel._31;
+            viewRel._42 = dx * viewRel._12 + dy * viewRel._22 + dz * viewRel._32;
+            viewRel._43 = dx * viewRel._13 + dy * viewRel._23 + dz * viewRel._33;
+        }
 
         // UNIFIED FAR PROJECTION (Phase 1a/1b): push the far plane out to the distant-land draw
         // distance so near opaque + host-owned DL share ONE reverse-Z depth mapping (statics get
@@ -3942,9 +4054,11 @@ namespace RenderProcess {
             // CAMERA-RELATIVE: WorldPos reaches the shader already relative to the eye, so the
             // eyePos used for the per-vertex fog distance |worldPos - eyePos| is the origin (0).
             0.0f,                      0.0f,                      0.0f,                      0.0f,
-            // Phase 1a/1b: the REAL absolute camera eye (host shifts resident DL by -realEye to
-            // match the camera-relative near scene) + isExterior gate (1 = feed host-owned DL).
-            DistantLand::eyePos.x,     DistantLand::eyePos.y,     DistantLand::eyePos.z,     isExterior ? 1.0f : 0.0f,
+            // Phase 1a/1b: the absolute camera eye the payload is RELATIVE to (host shifts
+            // resident DL by -this eye — it must match the payload's relative space, so on a
+            // mode-3 park fire this is the BUILD-time eye, not the current one; serial paths
+            // pass bakeEye == eyePos) + isExterior gate (1 = feed host-owned DL).
+            bakeEye[0],                bakeEye[1],                bakeEye[2],                isExterior ? 1.0f : 0.0f,
             // C2 skyZenith (float4 28..31): zenith sky colour for the host dome gradient. Host reads
             // it into FrameData.skyZenith; only sky.frag (dome branch) consumes it.
             skyZenithR,                skyZenithG,                skyZenithB,                0.0f,
@@ -4081,7 +4195,8 @@ namespace RenderProcess {
         MGE_TracyHostFrameBegin(g_hostZoneCtx);
         g_hostZoneOpen = true;
         g_kick.rpcPending    = true;
-        g_kick.early         = DistantLand::earlyForgeKickoff;  // BeginScene(0) site vs late (EndScene)
+        g_kick.parkFired     = parkFired;   // mode 3: collect closes this window keyed on state
+        g_kick.early         = DistantLand::earlyForgeKickoff || parkFired;  // BeginScene(0)/frame-start site vs late (EndScene)
         // Frame-ahead pipelining: defer the finish to the NEXT frame's BeginScene(0)
         // collect — but ONLY on early-kickoff frames. The earlyForgeKickoff latch is
         // exactly the "whole MW frame is IPC-free on both channels" predicate (statics
@@ -4090,7 +4205,7 @@ namespace RenderProcess {
         // safe precisely there. Late/warm-up/menu frames keep the same-frame finish —
         // which also primes g_mainTex before the first deferred blit (the latch needs
         // two consecutive eligible frames, so a serial frame always runs first).
-        g_kick.deferFinish   = g_frameAheadLive && DistantLand::earlyForgeKickoff;
+        g_kick.deferFinish   = (g_frameAheadLive && DistantLand::earlyForgeKickoff) || parkFired;
         g_kick.frame         = frame;
         g_kick.drawCount     = drawCount;
         g_kick.skinnedCount  = skinnedCount;
@@ -4120,6 +4235,65 @@ namespace RenderProcess {
         g_kick.bCaptures     = g_lastBuildCaptures;
     }
 
+    // Mode 3 worker body: build frame N's payload into the client-private scratch and PARK it —
+    // no gate, no flush, no assign, no RPC, and NEVER a g_kick touch (g_kick belongs to the
+    // main thread's in-flight fire in this mode). The main thread fires the park at the START
+    // of frame N+1 (fireParked) with a restamped camera. g_frame is NOT minted here — the fire
+    // mints it; the build's LRU/light-track uses of g_frame tolerate the ±1. The worker never
+    // enters WK_GATE/WK_GEOM/... in this mode, so no watchdog variant is needed.
+    void buildOnlyBody(IDirect3DDevice9* device) {
+        g_park.valid = false;   // stale park never survives a new build attempt
+        if (!device || !g_initOk || !g_enabled) {
+            return;             // park stays invalid; the fire drops cleanly
+        }
+        MGE_ZoneScopedN("Forge produce build-only (park)");
+        const double t0 = nowMs();
+        std::uint32_t drawCount, skinnedCount, multiMapCount, lightCount, skyCount, alphaCount;
+        IPC::FPFrame fpFrame;
+        std::uint32_t fpDraws = 0, fpSkinnedDraws = 0, fpAlphaDraws = 0;
+        bool fpHave = false;
+        {
+            MGE_ZoneScopedN("Forge build draw lists");
+            markWorkerPhase(WK_BUILD_DRAW);   // ensureLive reads g_cache + LIVE scene graph
+            buildGeometryDrawLists(drawCount, skinnedCount, multiMapCount, alphaCount);
+            markWorkerPhase(WK_BUILD_LIGHT);
+            lightCount = buildLightList();
+            markWorkerPhase(WK_BUILD_SKY);
+            skyCount = buildSkyDrawList();
+            markWorkerPhase(WK_BUILD_FP);
+            fpHave = buildFPFrame(fpFrame, fpDraws, fpSkinnedDraws, fpAlphaDraws);
+        }
+        g_park.epoch           = g_cellEpoch;
+        g_park.bakeEye[0]      = DistantLand::eyePos.x;
+        g_park.bakeEye[1]      = DistantLand::eyePos.y;
+        g_park.bakeEye[2]      = DistantLand::eyePos.z;
+        g_park.drawCount       = drawCount;
+        g_park.skinnedCount    = skinnedCount;
+        g_park.multiMapCount   = multiMapCount;
+        g_park.lightCount      = lightCount;
+        g_park.skyCount        = skyCount;
+        g_park.alphaCount      = alphaCount;
+        g_park.fpFrame         = fpFrame;      // shipped verbatim at fire (pose N + arm-cam N bundle)
+        g_park.fpDraws         = fpDraws;
+        g_park.fpSkinnedDraws  = fpSkinnedDraws;
+        g_park.fpAlphaDraws    = fpAlphaDraws;
+        g_park.fpHave          = fpHave;
+        g_park.capturedEmitted = g_capturedEmitted;
+        g_park.tBuildEnd       = nowMs();
+        g_park.buildMs         = g_park.tBuildEnd - t0;
+        g_park.valid           = true;
+    }
+
+    // Mode-3 park telemetry, logged every ~300 fires alongside [produce]: the fire's own
+    // main-thread cost split + park age + drop causes. Fire ≤ ~1ms and parkAge ≈ one frame
+    // are the design targets; drops should appear only at cell transitions.
+    struct ParkStats {
+        unsigned fires = 0, dropEpoch = 0, dropInvalid = 0;
+        double fireMs = 0.0, geomF = 0.0, texF = 0.0, assign = 0.0, kick = 0.0;
+        double parkAge = 0.0, buildMs = 0.0;
+    };
+    ParkStats g_parkStats;
+
     // ---- Tier 1b: fresh produce worker ------------------------------------------------------
     // A single dedicated std::thread that runs kickoffBody() off the MW main thread. Deliberately
     // NOT MGE::RenderThread — that worker owns a D3D9 device lock + a D3DCREATE_MULTITHREADED
@@ -4135,10 +4309,12 @@ namespace RenderProcess {
             m_stop = false;
             m_thread = std::thread([this] { run(); });
         }
-        void kick(IDirect3DDevice9* device) {
+        // buildOnly (mode 3): run buildOnlyBody (park, no RPC) instead of kickoffBody.
+        void kick(IDirect3DDevice9* device, bool buildOnly = false) {
             {
                 std::lock_guard<std::mutex> lk(m_mx);
                 m_device = device;
+                m_buildOnly = buildOnly;
                 m_hasJob = true;
             }
             m_cvJob.notify_one();
@@ -4163,15 +4339,21 @@ namespace RenderProcess {
             g_produceThreadId.store(std::this_thread::get_id(), std::memory_order_relaxed);
             for (;;) {
                 IDirect3DDevice9* device;
+                bool buildOnly;
                 {
                     std::unique_lock<std::mutex> lk(m_mx);
                     m_cvJob.wait(lk, [this] { return m_hasJob || m_stop; });
                     if (m_stop) return;
                     device = m_device;
+                    buildOnly = m_buildOnly;
                 }
                 const double t0 = nowMs();
-                kickoffBody(device);
-                markWorkerPhase(WK_IDLE);            // body returned (covers every kickoffBody exit path)
+                if (buildOnly) {
+                    buildOnlyBody(device);           // mode 3: park only, no shared memory, no g_kick
+                } else {
+                    kickoffBody(device);
+                }
+                markWorkerPhase(WK_IDLE);            // body returned (covers every body exit path)
                 g_produceWorkerMs = nowMs() - t0;   // published under the lock below (happens-before)
                 {
                     std::lock_guard<std::mutex> lk(m_mx);
@@ -4185,6 +4367,7 @@ namespace RenderProcess {
         std::condition_variable  m_cvJob, m_cvDone;
         IDirect3DDevice9*        m_device = nullptr;
         bool                     m_hasJob = false;
+        bool                     m_buildOnly = false;   // mode 3: this job parks, doesn't fire
         bool                     m_stop   = false;
     };
     ProduceWorker g_produceWorker;
@@ -4286,7 +4469,11 @@ namespace RenderProcess {
             return;
         }
         doDeferredFinish();
-        // Mode 1 (FENCED) or mode 2 on a non-early frame: kick + wait immediately (serial).
+        // Mode 1 (FENCED) or mode 2/3 on a non-early frame: kick + wait immediately (serial).
+        // For mode 3 this IS the priming/fallback path (menus, transitions, warm-up latch):
+        // kickoffBody drops any parked payload at entry and finishes same-frame, exactly like
+        // mode 2 non-early — the latch needs 2 eligible frames, so a serial frame always
+        // precedes the first park fire and primes g_mainTex for the deferred blit.
         g_produceWorker.kick(device);
         g_produceWorker.wait();
     }
@@ -4304,18 +4491,102 @@ namespace RenderProcess {
     // frame ever does NOT end in time, it shows up as "Forge kickoff gate ms" in Tracy instead of
     // as corruption.
     void kickProduceEarly(IDirect3DDevice9* device) {
-        if (g_produceMode != 2 || Configuration.UseRenderThread || !DistantLand::earlyForgeKickoff) {
+        // Mode 3 (PARK) requires frame-ahead: with it off nothing would ever fire the park
+        // (fireParked guards on it), so decline here and let the dispatcher run the serial
+        // fenced path — the same degradation mode 2 has on non-early frames.
+        const bool mode3 = (g_produceMode == 3 && g_frameAheadLive);
+        if ((g_produceMode != 2 && !mode3)
+            || Configuration.UseRenderThread || !DistantLand::earlyForgeKickoff) {
             return;   // every other path is main-thread-serial and kicks from the dispatcher
         }
         waitProduce();          // belt-and-braces: never kick over an in-flight produce
+        // Capture swap point is the same in both modes: in mode 3 the fire (frame start, before
+        // this) already shipped + cleared the previous consume-side captures, so the swap hands
+        // the worker exactly one frame of main-thread captures — invariants unchanged.
         swapCaptureBuffers();   // hand main's captured alpha to the consume side; fresh incoming for this frame
         g_earlyKicked = true;   // tells the dispatcher this frame is already dispatched
         g_produceWorker.ensure();
+        if (mode3) {
+            // PARK build: the worker never touches shared memory or g_kick, so there is no
+            // finish state to stash (the frame-start fire owns g_kick; the collect already
+            // consumed N-1's) and no gate to arm (it stays trivially open).
+            g_produceKickMs   = nowMs();
+            g_produceInFlight = true;
+            g_produceWorker.kick(device, /*buildOnly=*/true);
+            return;
+        }
         stashDeferredFinish();  // hand N-1's finish state over before the worker resets g_kick
         armFinishGate();
         g_produceKickMs   = nowMs();
         g_produceInFlight = true;
         g_produceWorker.kick(device);
+    }
+
+    // Mode 3 PARK-AND-FIRE: fire the payload the worker parked LAST frame, at the START of
+    // this frame (frameSetupEarly — camera fresh, latch decided, window closed by the collect,
+    // channel free after the grass cull, classify/walk/build all still ahead). The host then
+    // owns essentially the whole client frame: frame time = max(client CPU, host wall), not
+    // the sum. The restamp inside flushAssignAndKick pairs frame-N geometry with the frame-N+1
+    // camera, so there is no added camera/input latency — only 1-frame pose/frustum staleness.
+    void fireParked(IDirect3DDevice9* device) {
+        if (g_produceMode != 3 || !g_frameAheadLive || Configuration.UseRenderThread
+            || !g_initOk || !g_enabled || !DistantLand::earlyForgeKickoff || !device) {
+            return;
+        }
+        MGE_ZoneScopedN("Forge park fire");
+        const double tStart = nowMs();
+        const double dtPresent = (g_lastPresentMs > 0.0) ? (tStart - g_lastPresentMs) : 0.0;
+        g_lastPresentMs = tStart;
+        // The collect already consumed the previous fire (window closed, state stashed), so
+        // g_kick is main-owned and stale here — reset it exactly as kickoffBody would, so a
+        // dropped park below leaves a clean whole-frame no-op (rpcPending false).
+        g_kick = KickState{};
+        const unsigned frame = g_frame++;
+        checkCellEpochAndPurge(frame);
+        if (!g_park.valid) {
+            ++g_parkStats.dropInvalid;   // build declined / already consumed / serial superseded
+            return;
+        }
+        if (g_park.epoch != g_cellEpoch) {
+            // Teleport / load door between build and fire: the parked payload is the OLD cell.
+            // Drop it — one repeated composite frame, masked by the transition itself.
+            g_park.valid = false;
+            ++g_parkStats.dropEpoch;
+            LOG::logline(">> [park] drop: epoch %u -> %u at frame %u (transition between build and fire)",
+                         g_park.epoch, g_cellEpoch, frame);
+            return;
+        }
+        const double parkAge = tStart - g_park.tBuildEnd;
+        g_capturedEmitted = g_park.capturedEmitted;   // restore the build-time AT3 count for g_kick
+        // tBuild == tStart: the build cost lives in the park ([park] build=), not this frame's
+        // [hb] build bucket — the fire's own cost is exactly the geomF/texF/assign/kick split.
+        flushAssignAndKick(device, frame, g_park.drawCount, g_park.skinnedCount,
+                           g_park.multiMapCount, g_park.lightCount, g_park.skyCount,
+                           g_park.alphaCount, g_park.fpFrame, g_park.fpDraws,
+                           g_park.fpSkinnedDraws, g_park.fpAlphaDraws, g_park.fpHave,
+                           g_park.bakeEye, /*parkFired=*/true, dtPresent, tStart, tStart);
+        g_park.valid = false;   // consumed (fired, or skipped as empty — rebuilt this frame either way)
+        // [park] telemetry from the stamps flushAssignAndKick just wrote (0 on an empty-payload
+        // skip — those frames ship nothing and cost ~nothing, so folding them in is honest).
+        g_parkStats.fireMs  += nowMs() - tStart;
+        g_parkStats.parkAge += parkAge;
+        g_parkStats.buildMs += g_park.buildMs;
+        if (g_kick.rpcPending) {
+            g_parkStats.geomF  += g_kick.tGeomFlush - g_kick.tBuild;
+            g_parkStats.texF   += g_kick.tTexFlush - g_kick.tGeomFlush;
+            g_parkStats.assign += g_kick.tAssign - g_kick.tTexFlush;
+            g_parkStats.kick   += g_kick.tKick - g_kick.tAssign;
+        }
+        if (++g_parkStats.fires >= 300) {
+            const double inv = 1.0 / g_parkStats.fires;
+            LOG::logline(">> [park] %u fires avg: fire=%.2f (geomF=%.2f texF=%.2f assign=%.2f kick=%.2f) "
+                         "parkAge=%.2f build=%.2f ms | drops epoch=%u invalid=%u",
+                         g_parkStats.fires, g_parkStats.fireMs * inv, g_parkStats.geomF * inv,
+                         g_parkStats.texF * inv, g_parkStats.assign * inv, g_parkStats.kick * inv,
+                         g_parkStats.parkAge * inv, g_parkStats.buildMs * inv,
+                         g_parkStats.dropEpoch, g_parkStats.dropInvalid);
+            g_parkStats = ParkStats{};
+        }
     }
 
     void onStage0CompositeFinish(IDirect3DDevice9* device) {
@@ -4420,6 +4691,28 @@ namespace RenderProcess {
         // Phase 0: the previous frame's deferred finish NO LONGER runs here. It moves to
         // collectDeferredFinish (non-early / not-ready frames, after frameSetupEarly latches the
         // gate) or to onStage0CompositeKickoff (early frames, run late). See collectDeferredFinish.
+        //
+        // EXCEPT mode-3 park fires: their window MUST close HERE, before frameSetupEarly's RPCs
+        // (setWorldSpace, grass) need the channel — the next fire happens right after those, at
+        // the frame start. The host had fire → collect ≈ a whole frame + present + mwstart to
+        // render, so the residual wait here is ~0 (the [hb] render= bucket). stash moves the
+        // fire's g_kick state to the holder first (waitProduce above re-published g_kick if a
+        // drain-side early finish touched it on the worker).
+        //
+        // Guard on `mode == 3` OR the parkFired state — NOT parkFired alone. The mode==3 arm is
+        // the FREEZE FIX for a live 2->3 switch (panel/NUMPAD8): the just-drained frame carries a
+        // mode-2 kickoff's deferred finish in g_kick with parkFired=FALSE. Keyed on parkFired only,
+        // this block skipped it, then fireParked's `g_kick = KickState{}` DISCARDED that finish —
+        // orphaning the host's open IPC window forever (host frame vanishes, client keeps running).
+        // Draining any stranded deferred finish here closes the window before fireParked resets
+        // g_kick. The parkFired arm still covers the reverse 3->2 switch (a mode-3 fire's finish
+        // stranded in g_kick after the mode flips away). stash/finish are no-ops when g_kick holds
+        // nothing deferred (priming frames), so the mode==3 arm is harmless in steady state.
+        if (g_produceMode == 3 || g_kick.parkFired || g_pendingFinish.parkFired) {
+            stashDeferredFinish();
+            doDeferredFinish();
+            g_kick.parkFired = g_pendingFinish.parkFired = false;   // consumed — reset the keyed state
+        }
     }
 
     // Finish + copy the previous deferred host frame (frame-ahead). Main thread ONLY — finishAndCopy
@@ -5035,9 +5328,10 @@ void DrawForgeDevPanel() {
 
     ImGui::Separator();
     ImGui::Text("Produce worker (NUMPAD8)");
-    const char* modes[] = { "OFF (inline)", "FENCED (Tier 1b)", "OVERLAP (Tier 2)" };
+    const char* modes[] = { "OFF (inline)", "FENCED (Tier 1b)", "OVERLAP (Tier 2)",
+                            "PARK (fire-at-frame-start)" };
     int mode = g_produceMode;
-    if (ImGui::Combo("produce mode", &mode, modes, 3)) {
+    if (ImGui::Combo("produce mode", &mode, modes, 4)) {
         g_produceMode = mode;
         LOG::logline(">> [seam] produce worker: %s", modes[mode]);
     }

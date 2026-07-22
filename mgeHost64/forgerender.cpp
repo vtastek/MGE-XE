@@ -997,6 +997,7 @@ namespace {
         Pipeline*       pPipeline = nullptr;
         CmdPool*        pCmdPool = nullptr;
         Cmd*            pCmd = nullptr;
+        Cmd*            pCmdB = nullptr;   // O1 split-submit chunk B (same pool; A closes before B opens)
         Fence*          pFence = nullptr;
         QueryPool*      pGpuQueryPool = nullptr;   // GPU timestamp pool (per-phase 4ms breakdown)
         double          gpuTickFreq = 0.0;         // timestamp ticks/sec (getTimestampFrequency)
@@ -5421,6 +5422,11 @@ namespace {
     double    g_lastCullMs  = 0.0;
     double    g_lastPostMs  = 0.0;
     double    g_lastTotalMs = 0.0;
+    // O1 intra-frame split-submit: chunk A (cull→postdepth) is submitted without a fence wait so
+    // the GPU executes it while the CPU records chunk B (reflect→resolve) into pCmdB. gpuOverlap
+    // = submit-A → record-end-of-B: the window where CPU record and GPU execution ran concurrently.
+    bool      g_splitSubmit = true;
+    double    g_lastGpuOverlapMs = 0.0;
     // GPU-side per-phase ms (breaks down the ~4ms gpu via timestamp queries). kGpuPhase* enum
     // is defined up near kMaxDraws (used in buildOpaquePath, earlier in the TU than this block).
     double    g_lastGpuPhaseMs[kGpuPhaseCount] = {};
@@ -6751,6 +6757,7 @@ namespace ForgeRender {
         CmdDesc cmdDesc = {};
         cmdDesc.pPool = g_live.pCmdPool;
         initCmd(R, &cmdDesc, &g_live.pCmd);
+        initCmd(R, &cmdDesc, &g_live.pCmdB);   // O1: chunk-B cmd for the intra-frame split-submit
         initFence(R, &g_live.pFence);
 
         // M1c opaque scene path (depth RT + opaque pipeline + scene CBVs) is built
@@ -9468,6 +9475,35 @@ namespace ForgeRender {
         }
 
         gpuPhaseEnd(kGpuPhasePostDepth);
+
+        // ===================== O1: intra-frame split-submit =====================
+        // Everything recorded so far (cull → froxel → prepass → shadow → postdepth) goes to the
+        // GPU NOW as chunk A — submitted without a fence wait — so it executes while the CPU
+        // records the rest of the frame (reflect → color → water → glow → alpha → resolve) into
+        // pCmdB. Same queue, in-order execution: GPU order is identical to the single-cmd frame,
+        // and the final submit's pFence covers both cmds (B done ⇒ A done), so next frame's
+        // resetCmdPool stays safe. Same pool is legal: A is closed before B opens, so the shared
+        // allocator never has two open lists. beginCmd re-binds heaps + root signatures, and every
+        // phase below binds its own pipeline/sets/viewport — no state leaks across the seam.
+        // kGpuPhaseFrame stays open across it (begin in A, end in B — same query heap, resolved
+        // in B: valid in D3D12). Audit (2026-07-21): nothing after this point CPU-writes a
+        // persistent-mapped buffer chunk A's GPU reads — chunk-B code fills only reflect/sky/
+        // bones/MM/water/alpha/FP buffers; pFrameCbv/pLightCbv are only READ below.
+        Cmd*   pCmdChunkA = g_live.pCmd;
+        double tSubmitA   = 0.0;
+        const bool splitSubmit = g_splitSubmit && g_live.pCmdB != nullptr;
+        if (splitSubmit) {
+            endCmd(g_live.pCmd);
+            QueueSubmitDesc submitA = {};
+            submitA.mCmdCount = 1;
+            submitA.ppCmds = &pCmdChunkA;
+            submitA.mSubmitDone = true;   // no signal fence — chunk B's fence covers both
+            queueSubmit(g_live.pQueue, &submitA);
+            tSubmitA = hostNowMs();
+            g_live.pCmd = g_live.pCmdB;   // everything below (incl. drawDevUI) records into B
+            beginCmd(g_live.pCmd);
+        }
+
         gpuPhaseBegin(kGpuPhaseReflect);
         // ===================== WT2: REFLECTION PASS (sky-only, Stage 1) =====================
         // Render the mirrored scene into pReflectColor (1024²) BEFORE the main colour pass, so the
@@ -11222,11 +11258,14 @@ namespace ForgeRender {
 
         QueueSubmitDesc submitDesc = {};
         submitDesc.mCmdCount = 1;
-        submitDesc.ppCmds = &g_live.pCmd;
+        submitDesc.ppCmds = &g_live.pCmd;   // chunk B when split; the whole frame otherwise
         submitDesc.pSignalFence = g_live.pFence;
         submitDesc.mSubmitDone = true;
         queueSubmit(g_live.pQueue, &submitDesc);
         waitForFences(R, 1, &g_live.pFence);
+        g_live.pCmd = pCmdChunkA;   // O1: restore the primary cmd for next frame / other paths
+        // O1 win metric: how long CPU record (of B) ran while the GPU was already executing A.
+        g_lastGpuOverlapMs = splitSubmit ? (tRec1 - tSubmitA) : 0.0;
         const double gpuMs = hostNowMs() - tRec1;
         g_recAccum += (tRec1 - tRec0);            // CPU per-draw bind+draw recording
         g_gpuAccum += gpuMs;                       // GPU execute (submit→fence)
@@ -11393,9 +11432,9 @@ namespace ForgeRender {
             // Host-frame split (this frame's instantaneous values) so the ~2ms "unaccounted inside the
             // host" the client saw is localized: setup (per-draw memcpy) + cull (DL CPU cull + lazy
             // loads) + record + gpu + post = total. cull is the prime pre-record suspect.
-            LOG::logline(">> [forge-hb] host split: setup=%.2f cull=%.2f record=%.2f gpu=%.2f post=%.2f total=%.2fms"
+            LOG::logline(">> [forge-hb] host split: setup=%.2f cull=%.2f record=%.2f gpu=%.2f gpuOverlap=%.2f post=%.2f total=%.2fms"
                          " | cull examined=%u survivors=%u (%.3f us/1k examined) | gpuCull=%u %s hizOccl=%u",
-                         g_lastSetupMs, g_lastCullMs, g_lastRecMs, g_lastGpuMs, g_lastPostMs, g_lastTotalMs,
+                         g_lastSetupMs, g_lastCullMs, g_lastRecMs, g_lastGpuMs, g_lastGpuOverlapMs, g_lastPostMs, g_lastTotalMs,
                          g_lastCullExamined, g_liveLastInst,
                          g_lastCullExamined ? (g_lastCullMs * 1000.0 / (g_lastCullExamined / 1000.0)) : 0.0,
                          g_lastGpuCullCount, (g_lastGpuCullCount == g_liveLastInst) ? "MATCH" : "MISMATCH",
@@ -16111,6 +16150,15 @@ namespace ForgeRender {
 
             HostMesh& m = g_meshes[hdr.slot];
 
+            // A re-upload at the SAME shape (vertex/index count + skinned flag) MIGHT be an
+            // animated morph. But only a CONSECUTIVE-frame streak proves it — promote those to
+            // the upload-heap ring (fence-free memcpy). Non-consecutive re-uploads (cell churn /
+            // recycled slots) reset the streak and stay GPU_ONLY: an upload-heap VB has
+            // high-latency uncached GPU vertex fetch, so mass-promoting churn tanks render.
+            const bool sameShape = m.valid && m.vertexCount == hdr.vertexCount
+                                && m.indexCount == hdr.indexCount && m.skinned == isSkinned
+                                && m.multimap == isMultiMap;
+
             // P1 shadows: model-space bounding sphere (AABB centre + max distance). Every wire
             // vertex format starts with float3 pos, so one stride-walk covers all three. Runs on
             // every upload (morph re-uploads refresh it too — cheap next to the memcpy itself).
@@ -16138,22 +16186,20 @@ namespace ForgeRender {
                     if (d2 > r2) { r2 = d2; }
                 }
                 m.localRadius = std::sqrt(r2);
-                // Any upload invalidates the last-seen world record (recycled slots must not
-                // cast at the OLD object's transform); it refreshes the next frame the part is
-                // drawn. Morph re-uploads refresh the same frame (upload precedes renderScene).
-                m.lastWorldFrame = 0;
-                m.everMoved = false;   // a recycled slot starts as a fresh static until proven a mover
-                m.lastMoveFrame = 0;
+                // A shape-CHANGING upload invalidates the last-seen world record (recycled slots
+                // must not cast at the OLD object's transform); it refreshes the next frame the
+                // part is drawn, and refreshCasterRecord's move detection scatter-dirties both the
+                // old and new locations if the transform jumped. A same-shape re-upload is the
+                // same object morphing in place (flames/candles every frame) — resetting its
+                // record here made every morph look like a first sighting and re-dirtied every
+                // shadow slot near a light fixture every frame (the gather=3-4ms churn).
+                if (!sameShape) {
+                    m.lastWorldFrame = 0;
+                    m.everMoved = false;   // a recycled slot starts as a fresh static until proven a mover
+                    m.lastMoveFrame = 0;
+                }
             }
 
-            // A re-upload at the SAME shape (vertex/index count + skinned flag) MIGHT be an
-            // animated morph. But only a CONSECUTIVE-frame streak proves it — promote those to
-            // the upload-heap ring (fence-free memcpy). Non-consecutive re-uploads (cell churn /
-            // recycled slots) reset the streak and stay GPU_ONLY: an upload-heap VB has
-            // high-latency uncached GPU vertex fetch, so mass-promoting churn tanks render.
-            const bool sameShape = m.valid && m.vertexCount == hdr.vertexCount
-                                && m.indexCount == hdr.indexCount && m.skinned == isSkinned
-                                && m.multimap == isMultiMap;
             const bool consecutive = m.valid && (g_renderFrame == m.lastUploadFrame + 1);
 
             if (m.valid && !sameShape) {
@@ -16700,6 +16746,7 @@ namespace ForgeRender {
         if (g_live.pDepth)          { removeRenderTarget(R, g_live.pDepth); }
         if (g_live.pFence)    { exitFence(R, g_live.pFence); }
         if (g_live.pCmd)      { exitCmd(R, g_live.pCmd); }
+        if (g_live.pCmdB)     { exitCmd(R, g_live.pCmdB); }
         if (g_live.pCmdPool)  { exitCmdPool(R, g_live.pCmdPool); }
         if (g_live.pPipeline) { removePipeline(R, g_live.pPipeline); }
         if (g_live.ntHandle)  { CloseHandle(g_live.ntHandle); }

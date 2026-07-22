@@ -46,7 +46,17 @@ namespace RenderProcess {
     // instant frameSetupEarly has built its inputs, instead of after frameSetupEarly returns. The
     // paired finish still runs from onStage0CompositeKickoff moments later, under the build.
     // No-op on every other path — those kick from the dispatcher as before.
+    // In produce mode 3 (PARK) the dispatched job is BUILD-ONLY: it parks the payload
+    // client-private and the next frame's fireParked ships it.
     void kickProduceEarly(IDirect3DDevice9* device);
+
+    // Produce mode 3 "PARK-AND-FIRE" fire point. Called from frameSetupEarly at the START of the
+    // frame — right after the camera read + grass cull, before classify/walk/build — to ship the
+    // payload the worker parked LAST frame, restamped with THIS frame's camera. The host then
+    // owns essentially the whole client frame (frame = max(client CPU, host wall), not the sum).
+    // No-op outside mode 3 / frame-ahead / early-kickoff frames; drops the park (one repeated
+    // composite frame) on a cell-epoch change between build and fire.
+    void fireParked(IDirect3DDevice9* device);
 
     // Produce-worker OVERLAP mode (NUMPAD8 -> 2): drains the async produce kicked at BeginScene(0)
     // so it completes within the quiescent scene-0 window (before the finish reads g_kick and before
