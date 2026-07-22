@@ -205,6 +205,33 @@ void DistantLand::frameSetupEarly() {
     earlyForgeKickoff = forgeEligibleNow && s_forgePrevEligible;
     s_forgePrevEligible = forgeEligibleNow;
 
+    // Early Forge kickoff frames: run the grass cull NOW, before the async window opens.
+    // Grass is the one scene-0 RPC with a live consumer in Forge mode (MGE still draws grass
+    // color — the host has no grass), so it can't be gated off like the statics cull; it moves
+    // ahead of the kickoff instead. HOISTED above the fire point (2026-07-21): it needs only
+    // mwView/mwProj (read above), and in produce mode 3 the park fire below opens the async
+    // window for the WHOLE frame — a grass RPC after it would be REFUSED. (This also closes
+    // the latent mode-2 hazard of the grass RPC landing inside frame N-1's still-open window.)
+    // renderDepth skips its own cullGrass via earlyCulledGrass.
+    if (earlyForgeKickoff && (Configuration.MGEFlags & USE_GRASS) && mwBridge->IsExterior()
+        && isDistantCell()) {
+        const double tGrass0 = fseNowMs();
+        cullGrass(&mwView, &mwProj);
+        earlyCulledGrass = true;
+        dGrass = fseNowMs() - tGrass0;
+    }
+
+    // PRODUCE MODE 3 FIRE POINT: ship the payload the worker parked last frame, restamped
+    // with this frame's camera. Everything is in place exactly here — camera fresh (read
+    // above), latch decided, IPC window closed (the BeginScene(0) collect), channel free
+    // (grass done above), and the classify/walk/build/render-thread work all still ahead —
+    // so the host gets essentially the whole client frame to render. Before the
+    // isDistantCell split so exteriors and eligible interiors share it. No-op outside
+    // mode 3 / frame-ahead / early-kickoff frames.
+    const double tFire0 = fseNowMs();
+    RenderProcess::fireParked(device);
+    dKick = fseNowMs() - tFire0;   // folded with the produce kick below into [fse] kick=
+
     // W1.5 active-cell gate for the GeomCache walk: when Forge owns the opaque world,
     // every cache consumer (near draw lists, classify-driven visible set) is bounded
     // by MW's own view distance — subtrees beyond it can never be drawn, so the walk
@@ -317,27 +344,15 @@ void DistantLand::frameSetupEarly() {
         buildFrustumVisibleSet(&mwView, &mwProj);
         dVis = fseNowMs() - tVis0;
 
-        // Early Forge kickoff frames: run the grass cull NOW, before the async window
-        // opens. Grass is the one scene-0 RPC with a live consumer in Forge mode (MGE
-        // still draws grass color — the host has no grass), so it can't be gated off
-        // like the statics cull; it moves ahead of the kickoff instead. The channel is
-        // free here — the statics cull kickoff/worker above is gated off on exactly
-        // these frames. renderDepth skips its own cullGrass via earlyCulledGrass.
-        if (earlyForgeKickoff && (Configuration.MGEFlags & USE_GRASS) && mwBridge->IsExterior()) {
-            const double tGrass0 = fseNowMs();
-            cullGrass(&mwView, &mwProj);
-            earlyCulledGrass = true;
-            dGrass = fseNowMs() - tGrass0;
-        }
-
         // FRAME-START KICK. Everything the produce consumes now exists (camera, cache walk,
-        // classify, visible set) and the last scene-0 RPC (the grass cull above) has vacated the
-        // channel — so dispatch the worker HERE rather than after frameSetupEarly returns. The
-        // render-thread kick below and the rest of the frame then overlap the ~3.5ms build instead
-        // of sitting in front of it. No-op outside async OVERLAP mode / early-kickoff frames.
+        // classify, visible set) and the last scene-0 RPC (the grass cull, hoisted above the
+        // fire point pre-latch) has vacated the channel — so dispatch the worker HERE rather
+        // than after frameSetupEarly returns. The render-thread kick below and the rest of the
+        // frame then overlap the ~3.5ms build instead of sitting in front of it. No-op outside
+        // async OVERLAP/PARK modes / early-kickoff frames.
         const double tKick0 = fseNowMs();
         RenderProcess::kickProduceEarly(device);
-        dKick = fseNowMs() - tKick0;
+        dKick += fseNowMs() - tKick0;
 
         // Kick the render-thread depth-cache job now — after the geometry-cache
         // walk (so the cache + VBs it consumes are stable) and before the engine's
@@ -390,7 +405,7 @@ void DistantLand::frameSetupEarly() {
             const double tKick0 = fseNowMs();
             dVis = tKick0 - tVis0;
             RenderProcess::kickProduceEarly(device);
-            dKick = fseNowMs() - tKick0;
+            dKick += fseNowMs() - tKick0;
         }
     }
 
