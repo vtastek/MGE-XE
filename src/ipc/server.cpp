@@ -658,6 +658,10 @@ namespace IPC {
 			if (params.devDistLightsToggle) {
 				ForgeRender::toggleDistLights();
 			}
+			// Live render-scale: set this frame's internal render resolution (clamped to the
+			// allocation size host-side). 0,0 ⇒ render at the full allocation. Per-frame viewport
+			// move only — no RT reallocation.
+			ForgeRender::setRenderSize(params.renderWidth, params.renderHeight);
 			ok = ForgeRender::renderScene(params.viewProj, params.lighting, drawPtr, params.drawCount, bytes,
 				skinnedPtr, params.skinnedCount, skinnedBytes,
 				multiMapPtr, params.multiMapCount, multiMapBytes,

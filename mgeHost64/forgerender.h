@@ -52,6 +52,13 @@ namespace ForgeRender {
     // it parameterises the texture sampler built in the Phase 2 texturing path.
     bool init(unsigned width, unsigned height, unsigned sampleCount, unsigned anisoLevel);
 
+    // Live render-scale (supersampling): set the CURRENT internal render resolution for the
+    // next renderScene, clamped to the allocation size passed at init() (ceiling scale x
+    // backbuffer). The scene viewports/dispatches to this size while every size-dependent RT
+    // stays allocated at the ceiling — so a scale change is a per-frame viewport move, no
+    // reallocation. w==0 || h==0 ⇒ render at the full allocation size (the default).
+    void setRenderSize(unsigned w, unsigned h);
+
     // The exported NT shared-RT handle — valid in the HOST process. Null until a
     // successful init(). The IPC server DuplicateHandles this into MW's process.
     void* sharedHandle();

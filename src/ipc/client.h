@@ -63,6 +63,12 @@ namespace IPC {
 		// the window spans the whole MW frame).
 		unsigned m_windowRefusals;
 
+		// Live render-scale: the current internal render resolution stamped into every render
+		// RPC (kickoff / blocking). 0 ⇒ render at the host allocation size (default). Set by the
+		// seam whenever the panel render-scale slider changes; persists across frames.
+		std::uint32_t m_renderWidth = 0;
+		std::uint32_t m_renderHeight = 0;
+
 		// Dev FSL hot-reload watcher: a Windows-python child (watch_shaders.py) launched alongside
 		// the host in a dev tree, killed with it. INVALID when not spawned (shipped tree / no python).
 		HANDLE m_watcherProcess;
@@ -378,6 +384,10 @@ namespace IPC {
 		// completion — e.g. the geometry flush defers a frame rather than clobber
 		// the shared Parameters union mid-pairing.
 		bool isRpcPending() const { return m_isRpcPending; }
+
+		// Live render-scale: stamp the current internal render resolution into every subsequent
+		// render RPC. Persists until changed. 0,0 ⇒ host renders at its full allocation size.
+		void setNextRenderSize(std::uint32_t w, std::uint32_t h) { m_renderWidth = w; m_renderHeight = h; }
 
 		WakeReason waitForCompletion(DWORD ms = MaxWait);
 

@@ -499,6 +499,8 @@ namespace IPC {
 		params.capturedAlpha = InvalidVector;
 		params.capturedVertBytes = 0;
 		params.capturedIdxBytes = 0;
+		params.renderWidth = m_renderWidth;
+		params.renderHeight = m_renderHeight;
 		params.bytesWritten = 0;
 		params.renderMs = 0.0;
 		if (!beginRpc(Command::RenderFrame)) {
@@ -596,6 +598,9 @@ namespace IPC {
 		params.devClientWaitMs = di.clientWaitMs;
 		params.devClientDtMs = di.clientDtMs;
 		params.devClientMwStartMs = di.clientMwStartMs;
+		// Live render-scale: the current internal render resolution (0 ⇒ full allocation size).
+		params.renderWidth = m_renderWidth;
+		params.renderHeight = m_renderHeight;
 		params.bytesWritten = 0;
 		params.renderMs = 0.0;
 		if (!beginRpc(Command::RenderFrame)) {
