@@ -436,6 +436,16 @@ namespace IPC {
         IN float devClientDtMs;
         IN float devClientMwStartMs;
 
+        // Live render-scale (supersampling): the CURRENT internal render resolution the host
+        // should draw this frame, always <= the allocation size passed at RenderInit (ceiling
+        // scale x backbuffer). The host viewports/dispatches to renderWidth x renderHeight while
+        // all size-dependent RTs stay allocated at the ceiling — so a scale change is a per-frame
+        // viewport move, no reallocation. 0 ⇒ render at the full allocation size (default 1x path
+        // before any scale is set). Appended after the dev fields so every existing IN offset is
+        // unchanged. See tasks/forge-seam-resize.md (render-scale, per-frame viewport).
+        IN std::uint32_t renderWidth;
+        IN std::uint32_t renderHeight;
+
         OUT std::uint32_t bytesWritten;
         OUT double renderMs;             // host-side render+readback time
 

@@ -1003,7 +1003,8 @@ namespace {
         double          gpuTickFreq = 0.0;         // timestamp ticks/sec (getTimestampFrequency)
         ID3D12Resource* pSharedRes = nullptr;   // owned by pRT (released on removeRenderTarget)
         HANDLE          ntHandle = nullptr;     // host-process NT shared handle
-        uint32_t        width = 0, height = 0;
+        uint32_t        width = 0, height = 0;         // CURRENT render size (<= alloc); per-frame viewport
+        uint32_t        allocWidth = 0, allocHeight = 0; // fixed RT allocation size (ceiling scale x backbuffer)
         bool            firstFrame = true;
 
         // MSAA: requested sample count (1 = off, validated against the device in init).
@@ -6525,10 +6526,12 @@ namespace {
     bool createFroxelResources(Renderer* R) {
         if (g_live.pFroxelAssignPipeline) { return g_live.froxelReady; }
 
-        // Size the mask from the ACTUAL render resolution (floored so a not-yet-sized 0 never
-        // under-allocates). init() re-inits on a resolution change, so this re-runs and re-sizes.
-        const uint32_t resW = g_live.width  ? g_live.width  : 1920u;
-        const uint32_t resH = g_live.height ? g_live.height : 1080u;
+        // Size the mask from the ALLOCATION resolution (ceiling), not the current render size —
+        // live render-scale narrows g_live.width/height per frame, and the froxel tile count at
+        // any smaller render size fits inside this ceiling-sized buffer (the per-frame numWords is
+        // clamped to froxelBufWords). Floored so a not-yet-sized 0 never under-allocates.
+        const uint32_t resW = g_live.allocWidth  ? g_live.allocWidth  : 1920u;
+        const uint32_t resH = g_live.allocHeight ? g_live.allocHeight : 1080u;
         g_live.froxelBufWords = froxelWordsFor(resW, resH);
 
         // (1) Froxel mask: GPU_ONLY, both UAV (froxelassign writes) and SRV (frags read). uint[bufWords].
@@ -6766,6 +6769,11 @@ namespace ForgeRender {
         // the first uploadGeometry. Deferring it lets geometry upload run on a clean
         // loader, and isolates any opaque-path issue to the F11 scene path.
 
+        // The size passed to init() is the ALLOCATION size (ceiling render-scale x backbuffer).
+        // All size-dependent RTs are built at this size; the current render size (g_live.width/
+        // height) starts equal and is narrowed per-frame by setRenderSize for live supersampling.
+        g_live.allocWidth = width;
+        g_live.allocHeight = height;
         g_live.width = width;
         g_live.height = height;
         g_live.firstFrame = true;
@@ -6776,6 +6784,23 @@ namespace ForgeRender {
 
         std::printf("[forge] live init OK\n");
         return true;
+    }
+
+    // Live render-scale: set the current render resolution for the next renderScene, clamped to
+    // the allocation size. 0 ⇒ full allocation. Cheap (two clamps); everything size-derived in
+    // renderScene reads g_live.width/height, so a change takes effect on the very next frame with
+    // no reallocation. The depth/color RTs are cleared full-alloc each frame and the scene only
+    // draws the sub-viewport, so the out-of-viewport border stays at the clear value (transparent
+    // color, reverse-Z far depth) — the client copies only the sub-rect and Hi-Z of the far border
+    // is conservative (never over-occludes).
+    void setRenderSize(unsigned w, unsigned h) {
+        if (w == 0 || h == 0) {
+            g_live.width = g_live.allocWidth;
+            g_live.height = g_live.allocHeight;
+            return;
+        }
+        g_live.width  = (w < g_live.allocWidth)  ? (uint32_t)w : g_live.allocWidth;
+        g_live.height = (h < g_live.allocHeight) ? (uint32_t)h : g_live.allocHeight;
     }
 
     void* sharedHandle() {
@@ -6922,7 +6947,9 @@ namespace ForgeRender {
         // deferred out of init so geometry upload runs first on a clean resource loader.
         if (!g_live.pOpaquePipeline) {
             std::printf("[forge] renderScene: lazy buildOpaquePath...\n");
-            if (!buildOpaquePath(R, g_live.width, g_live.height)) {
+            // Allocate every size-dependent RT at the ALLOCATION size (ceiling), never the current
+            // render size — the per-frame viewport (g_live.width/height) draws a sub-rect of these.
+            if (!buildOpaquePath(R, g_live.allocWidth, g_live.allocHeight)) {
                 std::printf("[forge] lazy buildOpaquePath FAILED — scene path disabled\n");
                 return false;   // caller falls back to triangle
             }
@@ -10265,7 +10292,12 @@ namespace ForgeRender {
             cmdBeginDebugMarker(g_live.pCmd, 0.3f, 0.8f, 0.8f, "HI-Z MIP0 (scene depth -> pHiz mip 0)");
             cmdBindPipeline(g_live.pCmd, g_live.pHizPipelineFirst);
             cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pHizSet);
-            cmdDispatch(g_live.pCmd, (g_live.width + 7u) / 8u, (g_live.height + 7u) / 8u, 1);
+            // Build the pyramid over the FULL allocation, not the current render sub-rect: pDepth's
+            // out-of-viewport border is cleared to far (0.0) each frame, so the border pyramid
+            // texels reduce to far = conservative no-occlude. The occlusion test (hizParams.xy =
+            // current render size) still addresses only the [0..render] sub-rect, but its edge taps
+            // now read a fully-built pyramid instead of a stale border. Correct at every scale.
+            cmdDispatch(g_live.pCmd, (g_live.allocWidth + 7u) / 8u, (g_live.allocHeight + 7u) / 8u, 1);
             cmdEndDebugMarker(g_live.pCmd);
             {
                 RenderTargetBarrier rtb = {};
@@ -11352,7 +11384,10 @@ namespace ForgeRender {
                 cmdResourceBarrier(g_live.pHizCmd, 0, nullptr, 1, &tb, 0, nullptr);
             }
             cmdBindPipeline(g_live.pHizCmd, g_live.pHizPipeline);
-            uint32_t mw = g_live.width, mh = g_live.height;
+            // Reduce over the FULL allocation (matches the alloc-covering mip-0 fill above) so the
+            // whole pyramid — including the far-cleared border — is conservatively valid at any
+            // render scale. hizMips was computed from the allocation size, so the loop bound fits.
+            uint32_t mw = g_live.allocWidth, mh = g_live.allocHeight;
             for (uint32_t m = 1; m < g_live.hizMips; ++m) {
                 TextureBarrier tb = {};
                 tb.pTexture = g_live.pHiz;

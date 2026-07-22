@@ -33,11 +33,21 @@
 #include <vector>
 
 namespace {
-    // Seam target size. Set at bring-up to the live backbuffer resolution (the host's
-    // Forge render target is created at the same size via RenderInit), so the composite
-    // is a 1:1 full-screen blit. Falls back to 640x360 if the backbuffer can't be queried.
+    // Seam ALLOCATION size. Set at bring-up to ceiling render-scale x backbuffer (the host's
+    // Forge render target + the imported VkImage + g_mainTex are all created at THIS size).
+    // Falls back to 640x360 if the backbuffer can't be queried.
     UINT g_w = 640;
     UINT g_h = 360;
+
+    // Live render-scale (supersampling). The host renders into a g_rw x g_rh sub-rect of the
+    // g_w x g_h allocation; the composite samples that sub-rect and stretches it to the g_bbW x
+    // g_bbH backbuffer. Changing g_renderScale (panel slider) just re-derives g_rw/g_rh and
+    // restamps the host render size — no reallocation, no host re-init.
+    constexpr float kMaxRenderScale = 2.0f;   // allocation ceiling (SSAA up to 2x)
+    constexpr float kMinRenderScale = 1.0f;   // supersampling-only (no downscale)
+    float g_renderScale = 1.0f;               // live, panel-driven; [kMin..kMax]
+    UINT  g_bbW = 640, g_bbH = 360;           // backbuffer (composite destination)
+    UINT  g_rw = 640, g_rh = 360;             // current internal render size (<= g_w/g_h)
 
     IPC::Client* g_client = nullptr;
     bool   g_initOk  = false;
@@ -972,6 +982,22 @@ namespace {
         g_inst = VK_NULL_HANDLE; g_phys = VK_NULL_HANDLE; g_dev = VK_NULL_HANDLE; g_queue = VK_NULL_HANDLE;
     }
 
+    // Re-derive the current internal render size from g_renderScale + the backbuffer, clamp it to
+    // the allocation (g_w/g_h), and restamp it into every subsequent host render RPC. Cheap — call
+    // on any scale change (panel slider). Takes effect on the next kickoff with no reallocation.
+    void recomputeRenderSize() {
+        float s = g_renderScale;
+        if (s < kMinRenderScale) s = kMinRenderScale;
+        if (s > kMaxRenderScale) s = kMaxRenderScale;
+        UINT rw = (UINT)(g_bbW * s + 0.5f);
+        UINT rh = (UINT)(g_bbH * s + 0.5f);
+        if (rw > g_w) rw = g_w;   if (rw < 1) rw = 1;
+        if (rh > g_h) rh = g_h;   if (rh < 1) rh = 1;
+        g_rw = rw;
+        g_rh = rh;
+        if (g_client) g_client->setNextRenderSize(g_rw, g_rh);
+    }
+
     // Seam bring-up (called from RenderProcess::init, under the loading bar / live by menu).
     void lazyInit(IDirect3DDevice9* device) {
         if (FAILED(device->QueryInterface(__uuidof(ID3D9VkInteropDevice), (void**)&g_vki)) || !g_vki) {
@@ -991,18 +1017,25 @@ namespace {
             return;
         }
 
-        // Size the seam to the live backbuffer so the composite is a 1:1 full-screen blit.
+        // Size the ALLOCATION to ceiling render-scale x backbuffer (the shared RT + imported
+        // VkImage + g_mainTex are all created at this size). The scene renders into a g_rw x g_rh
+        // sub-rect for live supersampling; the composite stretches it to the g_bbW x g_bbH
+        // backbuffer. At the default scale 1.0 the render size equals the backbuffer.
         {
             IDirect3DSurface9* bb = nullptr;
             if (SUCCEEDED(device->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &bb)) && bb) {
                 D3DSURFACE_DESC sd = {};
                 if (SUCCEEDED(bb->GetDesc(&sd)) && sd.Width && sd.Height) {
-                    g_w = sd.Width;
-                    g_h = sd.Height;
+                    g_bbW = sd.Width;
+                    g_bbH = sd.Height;
                 }
                 bb->Release();
             }
-            LOG::logline(">> [seam] backbuffer %ux%u — shared RT sized to match", g_w, g_h);
+            g_w = (UINT)(g_bbW * kMaxRenderScale + 0.5f);
+            g_h = (UINT)(g_bbH * kMaxRenderScale + 0.5f);
+            recomputeRenderSize();   // sets g_rw/g_rh + stamps the host render size (g_client is live here)
+            LOG::logline(">> [seam] backbuffer %ux%u — alloc %ux%u (ceiling %.2fx), render %ux%u (scale %.2fx)",
+                         g_bbW, g_bbH, g_w, g_h, kMaxRenderScale, g_rw, g_rh, g_renderScale);
         }
 
         // Host brings up Forge + creates the shared RT; returns the NT handle already
@@ -1096,7 +1129,10 @@ namespace {
         VkImageCopy region = {};
         region.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
         region.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
-        region.extent         = { g_w, g_h, 1 };
+        // Copy only the current render sub-rect (top-left g_rw x g_rh of the g_w x g_h allocation);
+        // the composite samples exactly this region. Outside it the host RT is the (transparent)
+        // clear and is never sampled.
+        region.extent         = { g_rw, g_rh, 1 };
         vk.CmdCopyImage(g_cmd, g_importImg, VK_IMAGE_LAYOUT_GENERAL,
                         g_dstImg, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
 
@@ -3425,18 +3461,25 @@ namespace RenderProcess {
             D3DMATRIX ident = { 1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1 };
             device->SetTransform(D3DTS_TEXTURE0, &ident);
         }
-        device->SetSamplerState(0, D3DSAMP_MINFILTER, D3DTEXF_POINT);
-        device->SetSamplerState(0, D3DSAMP_MAGFILTER, D3DTEXF_POINT);
+        // Render-scale: the host draws a g_rw x g_rh sub-rect of the g_w x g_h allocation, which we
+        // stretch to the g_bbW x g_bbH backbuffer. At scale 1.0 the sub-rect is a 1:1 aligned map so
+        // LINEAR == POINT; at >1.0 LINEAR is the supersample downfilter. Sample the sub-rect only.
+        const bool superSample = (g_rw != g_bbW) || (g_rh != g_bbH);
+        const D3DTEXTUREFILTERTYPE filt = superSample ? D3DTEXF_LINEAR : D3DTEXF_POINT;
+        device->SetSamplerState(0, D3DSAMP_MINFILTER, filt);
+        device->SetSamplerState(0, D3DSAMP_MAGFILTER, filt);
         device->SetSamplerState(0, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
         device->SetSamplerState(0, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
 
-        const float fw = (float)g_w, fh = (float)g_h;
+        const float fw = (float)g_bbW, fh = (float)g_bbH;         // destination: the backbuffer
+        const float umax = (float)g_rw / (float)g_w;              // source: current render sub-rect
+        const float vmax = (float)g_rh / (float)g_h;
         struct CV { float x, y, z, rhw, u, v; };
         const CV quad[4] = {
             { -0.5f,      -0.5f,      0.0f, 1.0f, 0.0f, 0.0f },
-            { fw - 0.5f,  -0.5f,      0.0f, 1.0f, 1.0f, 0.0f },
-            { -0.5f,      fh - 0.5f,  0.0f, 1.0f, 0.0f, 1.0f },
-            { fw - 0.5f,  fh - 0.5f,  0.0f, 1.0f, 1.0f, 1.0f },
+            { fw - 0.5f,  -0.5f,      0.0f, 1.0f, umax, 0.0f },
+            { -0.5f,      fh - 0.5f,  0.0f, 1.0f, 0.0f, vmax },
+            { fw - 0.5f,  fh - 0.5f,  0.0f, 1.0f, umax, vmax },
         };
         device->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, quad, sizeof(CV));
 
@@ -5342,6 +5385,27 @@ void DrawForgeDevPanel() {
     logCheck("Forge water (F7)", g_waterEnabled, "Forge water (WT1)");
     logCheck("Frame-ahead pipelining (numpad *)", g_frameAheadLive, "frame-ahead pipelining");
     logCheck("FP arm suppression (numpad /)", g_fpSuppressLive, "FP suppression (FP1b)");
+
+    // Live render-scale (supersampling). The host renders into a g_rw x g_rh sub-rect of the fixed
+    // g_w x g_h allocation (ceiling x backbuffer); the slider just restamps the render size — no
+    // reallocation, no host re-init. 1.0 = native (identical to the pre-feature path).
+    {
+        float s = g_renderScale;
+        if (ImGui::SliderFloat("Render scale (SSAA)", &s, kMinRenderScale, kMaxRenderScale, "%.2fx")) {
+            g_renderScale = s;
+            recomputeRenderSize();
+            LOG::logline(">> [seam] render scale %.2fx -> render %ux%u (alloc %ux%u, bb %ux%u)",
+                         g_renderScale, g_rw, g_rh, g_w, g_h, g_bbW, g_bbH);
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip(
+                "Supersampling: host renders the world at scale x backbuffer, downfiltered on\n"
+                "composite. VRAM is fixed at the ceiling (%.2fx); this only moves the per-frame\n"
+                "viewport. UI stays at native res. 1.0x is byte-identical to the native path.",
+                kMaxRenderScale);
+        ImGui::SameLine();
+        ImGui::Text("(%ux%u)", g_rw, g_rh);
+    }
 
     // Build-shrink toggles (Stages 0-2a). Panel-only, no keys: the free numpad keys collide
     // with the water-flow handlers' edge-triggered polls when UseWaterFlowMap is on.
