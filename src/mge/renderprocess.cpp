@@ -74,7 +74,7 @@ namespace {
     //               is quiescent during the scene-0 draw but mutated by mwstart(N+1) — deferring the
     //               wait past EndScene would race that. Non-early frames (interior/menu/warm-up)
     //               fence like mode 1 (the finish follows immediately, no window to overlap).
-    int    g_produceMode = 2;          // 0 OFF / 1 FENCED / 2 OVERLAP / 3 PARK; NUMPAD8/panel cycles. DEFAULT OVERLAP
+    int    g_produceMode = 3;          // 0 OFF / 1 FENCED / 2 OVERLAP / 3 PARK; NUMPAD8/panel cycles. DEFAULT PARK
                                        // (user 2026-07-18: keep overlap always on) — degrades to a
                                        // fence on non-early frames, so it's safe as the boot default.
     bool   g_produceInFlight = false;  // an async (mode 2) produce is running / not yet waited
