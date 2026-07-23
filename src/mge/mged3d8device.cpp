@@ -409,6 +409,14 @@ HRESULT _stdcall MGEProxyDevice::Present(const RECT* a, const RECT* b, HWND c, c
     }
 
     if (mwBridge->IsLoaded()) {
+        // Arm the cache's save-reload purge (see RenderProcess::noteLoadingBar). Present is the
+        // only hook that is guaranteed to run while a load screen is up: frameSetupEarly sits
+        // inside `sceneCount == 0` and behind DistantLand::ready, and checkCellEpochAndPurge runs
+        // only on PRODUCED frames — a load produces none. MW presents the loading screen like any
+        // other frame, so this sees every load, including the reload-in-place that changes neither
+        // the cell pointer nor the eye position.
+        RenderProcess::noteLoadingBar(mwBridge->isLoadingBar());
+
         if (Configuration.Force3rdPerson && DistantLand::ready) {
             // Set 3rd person camera
             D3DXVECTOR3* camera = mwBridge->PCam3Offset();
