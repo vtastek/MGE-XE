@@ -94,20 +94,20 @@
   </ImportGroup>
   <PropertyGroup Label="UserMacros" />
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
-    <IncludePath>$(ProjectDir);$(SolutionDir)src;$(SolutionDir)3rdparty\msoc;$(SolutionDir)3rdparty\The-Forge\Common_3;C:\VulkanSDK\1.4.313.2\Include;$(IncludePath);C:\Program Files (x86)\Microsoft DirectX SDK (June 2010)\include</IncludePath>
-    <LibraryPath>C:\VulkanSDK\1.4.313.2\Lib;$(LibraryPath);C:\Program Files (x86)\Microsoft DirectX SDK (June 2010)\Lib\x64</LibraryPath>
+    <IncludePath>$(ProjectDir);$(SolutionDir)src;$(SolutionDir)3rdparty\msoc;$(SolutionDir)3rdparty\The-Forge\Common_3;$(VULKAN_SDK)\Include;$(IncludePath);C:\Program Files (x86)\Microsoft DirectX SDK (June 2010)\include</IncludePath>
+    <LibraryPath>$(VULKAN_SDK)\Lib;$(LibraryPath);C:\Program Files (x86)\Microsoft DirectX SDK (June 2010)\Lib\x64</LibraryPath>
     <OutDir>$(SolutionDir)bin\MSVC-$(Configuration)\</OutDir>
     <IntDir>$(SolutionDir)bin\MSVC-$(Configuration)\mgeHost64\</IntDir>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
-    <LibraryPath>C:\VulkanSDK\1.4.313.2\Lib;$(LibraryPath);C:\Program Files (x86)\Microsoft DirectX SDK (June 2010)\Lib\x64</LibraryPath>
-    <IncludePath>$(ProjectDir);$(SolutionDir)src;$(SolutionDir)3rdparty\msoc;$(SolutionDir)3rdparty\The-Forge\Common_3;C:\VulkanSDK\1.4.313.2\Include;$(IncludePath);C:\Program Files (x86)\Microsoft DirectX SDK (June 2010)\include</IncludePath>
+    <LibraryPath>$(VULKAN_SDK)\Lib;$(LibraryPath);C:\Program Files (x86)\Microsoft DirectX SDK (June 2010)\Lib\x64</LibraryPath>
+    <IncludePath>$(ProjectDir);$(SolutionDir)src;$(SolutionDir)3rdparty\msoc;$(SolutionDir)3rdparty\The-Forge\Common_3;$(VULKAN_SDK)\Include;$(IncludePath);C:\Program Files (x86)\Microsoft DirectX SDK (June 2010)\include</IncludePath>
     <OutDir>$(SolutionDir)bin\MSVC-$(Configuration)\</OutDir>
     <IntDir>$(SolutionDir)bin\MSVC-$(Configuration)\mgeHost64\</IntDir>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release-Fast|x64'">
-    <LibraryPath>C:\VulkanSDK\1.4.313.2\Lib;$(LibraryPath);C:\Program Files (x86)\Microsoft DirectX SDK (June 2010)\Lib\x64</LibraryPath>
-    <IncludePath>$(ProjectDir);$(SolutionDir)src;$(SolutionDir)3rdparty\msoc;$(SolutionDir)3rdparty\The-Forge\Common_3;C:\VulkanSDK\1.4.313.2\Include;$(IncludePath);C:\Program Files (x86)\Microsoft DirectX SDK (June 2010)\include</IncludePath>
+    <LibraryPath>$(VULKAN_SDK)\Lib;$(LibraryPath);C:\Program Files (x86)\Microsoft DirectX SDK (June 2010)\Lib\x64</LibraryPath>
+    <IncludePath>$(ProjectDir);$(SolutionDir)src;$(SolutionDir)3rdparty\msoc;$(SolutionDir)3rdparty\The-Forge\Common_3;$(VULKAN_SDK)\Include;$(IncludePath);C:\Program Files (x86)\Microsoft DirectX SDK (June 2010)\include</IncludePath>
     <OutDir>$(SolutionDir)bin\MSVC-$(Configuration)\</OutDir>
     <IntDir>$(SolutionDir)bin\MSVC-$(Configuration)\mgeHost64\</IntDir>
   </PropertyGroup>
