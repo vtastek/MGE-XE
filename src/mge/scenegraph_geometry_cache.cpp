@@ -249,6 +249,17 @@ namespace MGE::GeometryCache {
         // entries untouched this long are evicted anyway (frees VBs of genuinely
         // unloaded far cells; they re-capture only if the area is ever revisited).
         constexpr uint64_t kFarKeepFrames = 600;
+        // NEAR-DETACH despawn signal (the ghost-shadow fix). kFarKeepFrames is a FAR-entry
+        // hysteresis, but under cell-grid eviction it became the only within-cell despawn rule
+        // too — so a picked-up object kept its host shadow-caster record for the full 600 frames
+        // (~3.6s at 165fps), and repeated drop/pickup stacked one ghost shadow per cycle.
+        // parentVerdict already answers "despawned?" unambiguously and immediately (a removed
+        // object's shape is left with a detached parent chain), it was just gated behind the age
+        // rule. A stale entry INSIDE the gate radius is never gate-skipped, so stale+near really
+        // does mean gone — climb those every sweep and evict on the spot. Far entries keep the
+        // age+rescue behaviour unchanged (that is what stops 360deg-turn re-capture churn), which
+        // also bounds the climb to the near set.
+        constexpr uint64_t kDetachStaleFrames = kEvictSweepInterval;
         // W3 live-read at build: on Forge-owned frames the per-frame refresh walk is
         // SKIPPED entirely — buildFrustumVisibleSet freshens exactly the classify-
         // visible keys via ensureLive() (live NiTriShape reads + lazy capture on first
@@ -2832,6 +2843,12 @@ namespace MGE::GeometryCache {
                 return 2;   // depth cap: refuse to guess
             };
             unsigned nEvicted = 0, nByGraph = 0, nByAge = 0, nUnknown = 0, nDeferred = 0;
+            unsigned nByDetach = 0, nDetachChecked = 0;
+            // Menu mode: the world walk is skipped on cached menu frames, so g_frame barely
+            // advances and a frame-count staleness threshold would never mature — check every
+            // entry that missed this frame's stamp instead. Menu sweeps already run per-frame by
+            // design (see sweepNow) and the near set is small, so this is the cheap direction.
+            const uint64_t detachStale = MWBridge::get()->IsMenu() ? 0 : kDetachStaleFrames;
             unsigned nLogWalkGone = 0, nLogGraphGone = 0;
             unsigned nKeptByParent = 0, nRescueChecked = 0;
             unsigned nRescueGone = 0, nRescueUnknown = 0, nRescueDumped = 0;
@@ -2949,8 +2966,34 @@ namespace MGE::GeometryCache {
                             }
                         }
                     }
-                    evict = gone || aged;
-                    if (gone) ++nByCell; else if (aged) ++nByAge;
+                    // NEAR-DETACH (see kDetachStaleFrames): the prompt despawn signal the age rule
+                    // was standing in for. Only entries that (a) are still in-grid, (b) missed the
+                    // last stamp and (c) sit inside the gate radius are climbed — the gate never
+                    // skips that region, so stale+near is a real removal, not an off-screen entry.
+                    // Uses the PERSISTED eye deliberately: on ungated frames (menus, the renderDepth
+                    // fallback) the player cannot move, so the last gated eye is still current, and
+                    // that is precisely when the menu drop/pickup ghost is reported. A cell/interior
+                    // transition can leave the eye stale, but those entries are condemned by
+                    // cellGridGone above, so this rule never sees them.
+                    bool detached = false;
+                    if (!gone && !aged && rootsValid && !rescueRunaway && g_gateRadius > 0.0f
+                            && (g_frame - e.lastFrame) > detachStale) {
+                        const float dx = e.worldTransformD3D[12] - g_gateEye[0];
+                        const float dy = e.worldTransformD3D[13] - g_gateEye[1];
+                        const float dz = e.worldTransformD3D[14] - g_gateEye[2];
+                        if (dx * dx + dy * dy + dz * dz <= evictR2) {
+                            if ((++nDetachChecked & 2047) == 0 && gcNowMs() - tClimb0 > kClimbWatchdogMs) {
+                                rescueRunaway = true;   // shares the rescue's watchdog latch
+                                LOG::logline("!! [evict-climb] RUNAWAY in near-detach: %.0fms at %u checks"
+                                             " — near-detach off this sweep, age rule still applies",
+                                             gcNowMs() - tClimb0, nDetachChecked);
+                            } else {
+                                detached = (parentVerdict(it->first, e) == 1);
+                            }
+                        }
+                    }
+                    evict = gone || aged || detached;
+                    if (gone) ++nByCell; else if (aged) ++nByAge; else if (detached) ++nByDetach;
                 } else if (walkedThisFrame) {
                     evict = (e.lastFrame != g_frame);
                     // Far-keep hysteresis: a stale entry BEYOND the gate radius was gate-SKIPPED by
@@ -3037,11 +3080,11 @@ namespace MGE::GeometryCache {
             // eviction path is where the freeze/ghosting bugs live, so a non-zero sweep must never
             // be silent (it was, between sweep 20 and the mass-evict investigation).
             if (validating || nEvicted > 0) {
-                LOG::logline(">> [evict] sweeps=%u mode=%s walk-forced=%u entries=%zu evicted=%u byCell=%u grid=(%d,%d)r%d int=%d byGraph=%u byAge=%u unknown=%u deferred=%u kept=%u disagree(walkGone/parentGone)=%u/%u",
+                LOG::logline(">> [evict] sweeps=%u mode=%s walk-forced=%u entries=%zu evicted=%u byCell=%u grid=(%d,%d)r%d int=%d byGraph=%u byAge=%u byDetach=%u/%u unknown=%u deferred=%u kept=%u disagree(walkGone/parentGone)=%u/%u",
                              g_evictSweepNo, cellGrid ? "cell" : (g_evictByParentChain ? "parent" : "walk"),
                              walkedThisFrame ? 1u : 0u, g_cache.size(),
                              nEvicted, nByCell, cgX, cgY, kCellGridRadius, (int)(curInterior != nullptr),
-                             nByGraph, nByAge, nUnknown, nDeferred, nKeptByParent,
+                             nByGraph, nByAge, nByDetach, nDetachChecked, nUnknown, nDeferred, nKeptByParent,
                              g_evictDisagreeWalkGone, g_evictDisagreeGraphGone);
             if (nRescueGone + nRescueUnknown > 0) {
                 LOG::logline(">> [rescue] sweep=%u kept=%u failGone=%u failUnknown=%u",
