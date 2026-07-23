@@ -1,4 +1,4 @@
-#include "imgui_water.h"
+#include "imgui_panels.h"
 
 #include "imgui.h"
 #include "imgui_impl_dx9.h"
@@ -8,10 +8,11 @@
 
 #include <windows.h>
 
-// The panel body — defined in renderexterior.cpp, where all flow/foam settings are in scope.
-extern void DrawFlowFoamPanel();
-// Forge seam / Phase-1 dev toggles — defined in renderprocess.cpp (reaches the seam state).
-// Shares the F10 overlay; clickable replacement for the hardware-key A/B toggles.
+// Forge seam / dev toggles — defined in renderprocess.cpp (reaches the seam state).
+// Clickable replacement for the hardware-key A/B toggles. This was imgui_water.cpp and
+// carried DrawFlowFoamPanel too, until S3 deleted MGE's water renderer under it; the
+// ImGui bring-up itself was never water-specific, so the module was renamed rather
+// than deleted.
 extern void DrawForgeDevPanel();
 
 namespace {
@@ -20,7 +21,7 @@ namespace {
     HWND g_hwnd    = nullptr;
 }
 
-namespace ImGuiWater {
+namespace ImGuiPanels {
 
 void onPresent(IDirect3DDevice9* device) {
     if (!device)
@@ -43,7 +44,7 @@ void onPresent(IDirect3DDevice9* device) {
             return;
         }
         g_init = true;
-        LOG::logline(">> [imgui] Water/Foam panel ready (F10 toggles)");
+        LOG::logline(">> [imgui] dev panels ready (F10 toggles)");
     }
 
     // F10 toggles the panel.
@@ -63,7 +64,6 @@ void onPresent(IDirect3DDevice9* device) {
     ImGui::NewFrame();
 
     if (g_visible) {
-        DrawFlowFoamPanel();
         DrawForgeDevPanel();
     }
 
@@ -77,4 +77,4 @@ bool wantMouse() {
     return g_init && g_visible && ImGui::GetIO().WantCaptureMouse;
 }
 
-} // namespace ImGuiWater
+} // namespace ImGuiPanels

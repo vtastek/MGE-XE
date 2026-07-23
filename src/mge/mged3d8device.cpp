@@ -16,7 +16,7 @@
 #include "ffeshader.h"
 #include "userhud.h"
 #include "videobackground.h"
-#include "imgui_water.h"
+#include "imgui_panels.h"
 #include "renderprocess.h"
 #include "scenegraph_geometry_cache.h"   // restoreWorldSuppression (MW-ONLY-UI)
 #include "mge_tracy.h"
@@ -598,9 +598,9 @@ HRESULT _stdcall MGEProxyDevice::Present(const RECT* a, const RECT* b, HWND c, c
     }
 #endif
 
-    // Dear ImGui Water/Foam tuning panel (F10). Drawn onto the backbuffer after the scene,
-    // before pacing/present. Lazily inits on the first call.
-    ImGuiWater::onPresent(realDevice);
+    // Dear ImGui dev panels (F10). Drawn onto the backbuffer after the scene, before
+    // pacing/present. Lazily inits on the first call.
+    ImGuiPanels::onPresent(realDevice);
 
     // Present-seam: the Forge composite now runs at the end of scene 0 (EndScene), not here —
     // so Forge's opaque world lands behind scene 1's sorted-alpha + first-person. See
@@ -908,13 +908,9 @@ HRESULT _stdcall MGEProxyDevice::EndScene() {
         } else if (!isFrameComplete) {
             // Everything else except UI
             DistantLand::renderStage2();
-
-            // Draw water if the Morrowind water plane doesn't appear in view
-            // it may be too distant or stencil scene order is non-normative
-            if (distantWater && !waterDrawn && !isStencilScene) {
-                DistantLand::renderStageWater();
-                waterDrawn = true;
-            }
+            // S3: the "MW's water plane never came into view, draw ours anyway" fallback
+            // went with MGE's water renderer. The host's water is not tied to MW's grid
+            // appearing, so it needs no such catch-up draw.
         }
     }
 
@@ -1121,12 +1117,13 @@ HRESULT _stdcall MGEProxyDevice::DrawIndexedPrimitive(D3DPRIMITIVETYPE a, UINT b
         }
 
         if (isWaterMaterial) {
-            if (distantWater) {
-                // Call distant land instead of drawing water grid
-                if (!waterDrawn) {
-                    DistantLand::renderStageWater();
-                    waterDrawn = true;
-                }
+            // S3: MGE's replacement water plane is gone, so the ONLY reason to swallow MW's
+            // own water grid is that the Forge host draws that surface itself (WT1-WT3).
+            // The gate moved from distantWater (an MGE-feature flag) to forgeOwnsFrame for
+            // that reason: with the seam off there is no replacement to draw, so letting MW's
+            // grid through is what keeps the F11-off side a true vanilla frame instead of a
+            // waterless one.
+            if (RenderProcess::forgeOwnsFrame()) {
                 return D3D_OK;
             }
         } else {

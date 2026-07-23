@@ -51,21 +51,6 @@ public:
         RecordedState(RecordedState&&) noexcept;
     };
 
-    static constexpr DWORD fvfWave = D3DFVF_XYZRHW | D3DFVF_TEX2;
-    static constexpr int waveTexResolution = 512;
-    static constexpr float waveTexWorldRes = 2.5f;
-    // World-anchored hybrid particle foam sim (WATER_FOAM). Two cascades, each a full
-    // world-anchored 1024 sim at a different world-scale: cascade 0 (fine/near) and
-    // cascade 1 (coarse/far). The water shader samples the fine cascade near the camera
-    // and blends to the coarse one at cascade 0's window edge. Resolution is shared by
-    // all cascades (the foam passes reuse one fullscreen triangle, vbFoamSim).
-    // Single low-res CARRIER buffer (the cascades collapsed to one — Phase 2 of the indirection
-    // redesign). The carrier marks WHERE foam is (vorticity); the procedural detail in the water
-    // shader supplies the up-close crispness, so the sim itself can stay cheap and coarse.
-    // foamCascades kept = 1 so the world-anchor loop/arrays carry over unchanged (one iteration).
-    static constexpr int foamCascades = 1;
-    static constexpr int foamTexResolution = 512;     // half-size sim: ~2MB/RT × 6 RTs ≈ 12MB VRAM (¼ the fill of 1024)
-    static constexpr float foamCascadeWorldRes[foamCascades] = { 25.0f };    // 512 * 25 = 12800u window (kept; texel doubled)
     static constexpr int GrassInstStride = 48;
     static constexpr int MaxGrassElements = 8192;
     static constexpr float kCellSize = 8192.0f;
@@ -142,16 +127,16 @@ public:
     // level cannot attribute a missing effect to a root. Set from the Forge Dev imgui panel; no
     // key, the keyspace is full and the state needs to be readable.
     static int  mwWorldSuppress;
-    static int numWaterVerts, numWaterTris;
 
     static IDirect3DDevice9* device;
     static ID3DXEffect* effect;
-    static ID3DXEffect* effectShadow;
     static ID3DXEffect* effectDepth;
     static ID3DXEffectPool* effectPool;
     static IDirect3DVertexDeclaration9* LandDecl;
     static IDirect3DVertexDeclaration9* StaticDecl;
-    static IDirect3DVertexDeclaration9* WaterDecl;
+    // Position-only decl for the fullscreen quad (vbFullFrame). Was WaterDecl:
+    // the water plane shared it, and outlived the name by nothing.
+    static IDirect3DVertexDeclaration9* PosOnlyDecl;
     static IDirect3DVertexDeclaration9* GrassDecl;
 
     static VendorSpecificRendering vsr;
@@ -177,7 +162,6 @@ public:
     static VisibleSet<IpcClientVector> visLandShared;
     static VisibleSet<IpcClientVector> visDistantShared;
     static VisibleSet<IpcClientVector> visGrassShared;
-    static VisibleSet<IpcClientVector> visExtraShared;
     static IPC::VecView<IPC::DynVisFlag> dynVisFlagsShared;
     // Single-window chunk vec carrying the occlusion-mask blob shipped to the
     // host each frame (host-side cull). Empty/InvalidVector when disabled.
@@ -186,7 +170,6 @@ public:
     static IPC::VecId visLandSharedId;
     static IPC::VecId visDistantSharedId;
     static IPC::VecId visGrassSharedId;
-    static IPC::VecId visExtraSharedId;
     static IPC::VecId dynVisFlagsSharedId;
     static IPC::VecId maskBlobSharedId;
 
@@ -218,98 +201,20 @@ public:
     static IDirect3DTexture9* texDepthFrame;
     static IDirect3DSurface9* surfDepthDepth;
     static IDirect3DTexture9* texDistantBlend;
-    static IDirect3DTexture9* texReflection;
-    static IDirect3DSurface9* surfReflectionZ;
-    static IDirect3DVolumeTexture9* texWater;
-    static IDirect3DVertexBuffer9* vbWater;
-    static IDirect3DIndexBuffer9* ibWater;
+    // S3: texReflection / surfReflectionZ (water reflection RT), texWater (the animated
+    // volume normal map), vbWater / ibWater (the radial water mesh) went with
+    // renderwater.cpp -- the Forge host owns the water surface.
     static IDirect3DVertexBuffer9* vbGrassInstances;
 
-    // World-snapped nested-grid (geo-clipmap) water mesh. Built once when
-    // UseWaterFlowMap is on (initWaterLodMesh); drawn per-level in
-    // renderWaterPlane with a per-level snapped world matrix so vertices land on
-    // a stable world lattice every frame (kills the radial mesh's swimming).
-    // Vertices are stored in local integer grid units (cell size supplied by the
-    // per-frame world matrix); each level records its index range and cell size.
-    struct WaterLodLevel {
-        float cellSize;     // world units per grid cell at this level
-        int   vertBase;     // first vertex of this level's block in vbWaterLod
-        int   vertCount;    // vertices owned by this level
-        int   numVariants;  // flexible-trim hole variants (1 for solid level 0, else 4)
-        int   ibStart[4];   // first index of each trim variant's triangle list
-        int   triCount[4];  // triangles in each trim variant
-    };
-    static IDirect3DVertexBuffer9* vbWaterLod;
-    static IDirect3DIndexBuffer9* ibWaterLod;
-    static int numWaterLodVerts;
-    static std::vector<WaterLodLevel> waterLodLevels;
-    static bool waterLodMeshOn;        // runtime A/B (VK_NUMPAD0): true = clipmap, false = radial
-    static float waterWaveAmp;         // live shader uniform: Gerstner crest amplitude (world units)
-    static float waterWaveLen;         // live shader uniform: base wavelength along the flow (world units)
-    static float waterWaveSpeed;       // live shader uniform: crest travel speed scale
-    static float waterCrestSpread;     // live shader uniform: directional fan (small = longer crest lines)
+    // S3: the geo-clipmap water LOD mesh, dynamic-ripple/wave sim targets, the baked
+    // water flow map and the whole two-cascade Voronoi foam simulation lived here.
+    // None of it ever reached the host -- the Forge water shader carries its own
+    // wave and foam model -- so the entire stack died with MGE's water renderer.
 
-    static IDirect3DTexture9* texRain, *texRipples, *texRippleBuffer;
-    static IDirect3DSurface9* surfRain, *surfRipples, *surfRippleBuffer;
-    static IDirect3DVertexBuffer9* vbWaveSim;
-    static IDirect3DVertexBuffer9* vbFoamSim;   // fullscreen triangle sized to foamTexResolution
-
-    // Water flow map (UseWaterFlowMap): low-res baked RGBA8 covering the exterior
-    // island. R,G = downstream flow dir (encoded), B = wave intensity, A =
-    // directionality. Built once on the cull worker (buildWaterFlowMap), lazily
-    // uploaded on the main thread (updateFlowMapTexture). VK_NUMPAD9 A/B.
-    static IDirect3DTexture9* texFlow;
-    static bool waterFlowDebugOn;
-    static int  waterFlowDebugView; // 0 none; >0 = debug overlay id passed to the shader (2..11)
-    static float waterFlowScroll;   // live shader uniform: river directional advection rate (NUMPAD8/6/3 tuning)
-    static float waterFlowSeaSpeed; // live shader uniform: base wave animation rate scale (1 = stock)
-    static float waterFlowCycleUV;  // live shader uniform: bounded per-cycle UV displacement (Valve flow map)
-    static float waterFlowSeaRefract; // live shader uniform: sea far-wave (refraction) strength multiplier
-    static float waterFlowWarp;       // live shader uniform: domain-warp amount (world u) to break the 512u flow grid
-
-    // World-anchored hybrid Voronoi particle foam (WATER_FOAM, gated by UseWaterFlowMap).
-    // texFoamP_A/B: ping-pong particle buffer (xy = window texel pos, zw = velocity).
-    // texFoamField: smoothed velocity + density field (the vorticity source).
-    // texFoam: extracted foam intensity sampled by the water shader. fp16 throughout.
-    // Per-cascade arrays (foamCascades): cascade 0 = fine/near, cascade 1 = coarse/far.
-    static IDirect3DTexture9* texFoamP_A[foamCascades], *texFoamP_B[foamCascades], *texFoamField[foamCascades], *texFoam[foamCascades];
-    static IDirect3DSurface9* surfFoamP_A[foamCascades], *surfFoamP_B[foamCascades], *surfFoamField[foamCascades], *surfFoam[foamCascades];
-    // Advected detail-UV offset field (River Editor): per-texel world-space offset transported
-    // through the velocity field so the consume's foam texture follows curved river flow. Ping-pong.
-    static IDirect3DTexture9* texFoamUV_A[foamCascades], *texFoamUV_B[foamCascades];
-    static IDirect3DSurface9* surfFoamUV_A[foamCascades], *surfFoamUV_B[foamCascades];
-    static int   foamLastXpos[foamCascades], foamLastYpos[foamCascades];   // per-cascade world-anchor window tracking (texels)
-    static float foamOriginC[foamCascades][2];   // per-cascade window world min-corner (saved for the consume bind)
-    static bool foamSimReset;          // clear/seed the particle buffers on the next sim step
-    static bool waterFoamOn;           // runtime A/B: true = foam sim + render, false = legacy water
-    static bool foamDebugView;         // NUMPAD2: blit raw foam particle/field buffers to screen corner
-    // Per-cascade live tuning (fine/near = [0], coarse/far = [1]). The two cascades have
-    // very different texel sizes, so vorticity/density respond differently to the same
-    // values — they are tuned independently to match the two foam looks.
-    static float foamFlowForce[foamCascades];   // live: river advection force (texels/substep)
-    static float foamDecay[foamCascades];       // live: velocity decay toward the flow current
-    static float foamPressure[foamCascades];    // live: density pile-up coefficient (narrows)
-    static float foamScale[foamCascades];       // live: vorticity → foam intensity scale
-    // Two-layer foam (Phase 2): erosion + ridged-fbm shared by the far (flow-map) and near
-    // (sim carrier) layers. Live-tuned via the NUMPAD8 cycle.
-    static float foamDetailTile;       // world units per fbm cell (smaller = crisper)
-    static float foamDetailSpeed;      // far-layer flow advect rate (also the sim UV-advect rate)
-    static float foamErodeThreshold;   // erosion cut: higher = tighter foam streaks [0,1]
-    static float foamFarAmount;        // far flow-map layer strength (0 = near-only)
-    static float foamMix;              // near/sim → far modulation in the carrier window (foamDetail.w); 0 = far only
-    static float foamGaussRadius;      // sim particle splat radius → foam blob size (FoamGauss)
-    static float foamMinDensity;       // sim particle respawn density (FoamDens)
-    static float foamUVDecay;          // sim UV-offset decay → bounds detail stretch (FoamUVDcy)
-    static float foamSimSpeed;         // scales sim particle advance rate → sim-foam visual speed (SimSpeed)
-    static float foamVortGain;         // static vorticity (curl) concentration for the far foam (VortGain)
-    static float foamFineScale;        // multi-scale erosion: perforating octave scale ratio (FineScale)
-    static float foamFineAmt;          // multi-scale erosion: fine-perforation strength (FineAmt)
-    static float foamCoarseScale;      // multi-scale erosion: clumping octave scale ratio (CoarseScale)
-    static float foamCoarseAmt;        // multi-scale erosion: coarse-clumping strength (CoarseAmt)
-
-    static IDirect3DTexture9* texShadow, *texSoftShadow;
-    static IDirect3DSurface9* surfShadowZ;
-    static IDirect3DVertexBuffer9* vbFullFrame, *vbClipCube;
+    // S3: the cascaded shadow atlas (texShadow / texSoftShadow / surfShadowZ) and the
+    // frustum clip cube it projected went with rendershadow.cpp. vbFullFrame stays --
+    // it is the generic fullscreen quad the DEPTH pass still draws with.
+    static IDirect3DVertexBuffer9* vbFullFrame;
 
     static D3DXMATRIX mwView, mwProj;
     static D3DXMATRIX smView[2], smProj[2], smViewproj[2];
@@ -343,27 +248,13 @@ public:
     static D3DXHANDLE ehFogNearStart, ehFogNearRange;
     static D3DXHANDLE ehNearViewRange;
     static D3DXHANDLE ehStaticNearCull;
-    static D3DXHANDLE ehShadowReflMult;
     static D3DXHANDLE ehLandNearCull;
-    static D3DXHANDLE ehReflWaterClip;
     // Texture-light path handles on the distant-land effect (cache terrain point
     // lights). Bound per-patch from selectTextureLights output in renderCachedTerrain.
     static D3DXHANDLE ehLightData, ehLightDataParams, ehLightIndices, ehTexLightView;
     static D3DXHANDLE ehWindVec;
     static D3DXHANDLE ehNiceWeather;
     static D3DXHANDLE ehTime;
-    static D3DXHANDLE ehRippleOrigin;
-    static D3DXHANDLE ehWaveHeight;
-    static D3DXHANDLE ehFlow, ehFlowTransform, ehFlowWeight, ehFlowScroll, ehFlowSeaSpeed, ehFlowCycleUV, ehFlowSeaRefract, ehFlowDebugView, ehFlowWarp;
-    static D3DXHANDLE ehWaveAmp, ehWaveLen, ehWaveSpeed, ehCrestSpread;
-    static D3DXHANDLE ehFoamParticles, ehFoamFieldIn, ehFoamOrigin, ehFoamShift, ehFoamFieldShift, ehFoamPlayer, ehFoamParams, ehFoamWorldRes, ehFoamAdvance;
-    static D3DXHANDLE ehFoam0, ehFoamOrigin0, ehFoamWeight, ehFoamDetail, ehFoamFarAmount;   // ehFoam0/Origin0 = the single carrier
-    static D3DXHANDLE ehFoamUVIn, ehFoamUVRate, ehFoamUVDecay;   // UV-advection sim uniforms
-    static D3DXHANDLE ehFoamGaussRadius, ehFoamMinDensity;       // sim look knobs (blob size, particle density)
-    static D3DXHANDLE ehFoamVortGain;                            // static vorticity concentration (far foam)
-    static D3DXHANDLE ehFoamFineScale, ehFoamFineAmt;            // multi-scale foam erosion
-    static D3DXHANDLE ehFoamCoarseScale, ehFoamCoarseAmt;       // multi-scale foam erosion (coarse clumping)
-    static D3DXHANDLE ehFoamUVTex;                               // consume: advected UV offset field
 
     static std::function<void(IDirect3DSurface9*)> captureScreenHandler;
     static bool captureScreenWithUI;
@@ -372,14 +263,9 @@ public:
     static bool initIpc();
     static bool initShader();
     static bool initDepth();
-    static bool initWater();
-    static bool initWaterLodMesh();
-    static bool initDynamicWaves();
-    static bool initFoamSim();
     static bool initLandscapeClient();
     static bool initLandscape();
     static bool initDistantStaticsClient();
-    static bool initShadow();
     static bool initGrass();
     static void loadVisGroupsClient(HANDLE h);
     template<class T, class U>
@@ -416,7 +302,6 @@ public:
     static void renderStage1();
     static void renderStage2();
     static void renderStageBlend();
-    static void renderStageWater();
 
     static void setupCommonEffect(const D3DXMATRIX* view,const  D3DXMATRIX* proj);
 
@@ -445,20 +330,8 @@ public:
     // them). 0=off 1=water-proxy 2=box-occluders 3=basin-watershed 4=msoc-basin
     // 5=reflection-frustum+cache. Advanced by updateMSOCCutoffInput.
     static int debugOverlayCycle;
-    // Cycle state 5: draw the reflection cull frustum + the GeometryCache
-    // reflection draw set as boxes, RED = drawn now, GREEN = its mirrored sphere
-    // lands on a visible water rect (would survive a water-rect cull — the fix
-    // preview). debugReflFrustum gates capture in renderReflectionsFromCache.
-    static bool debugReflFrustum;
-    struct ReflCacheDbgBox { D3DXVECTOR3 center; float radius; bool keep; };
-    static std::vector<ReflCacheDbgBox> reflCacheDbg;
-    // The reflection render view*proj, stashed by renderReflectionsFromCache when
-    // the overlay is active, so renderReflectionFrustumDebug (drawn in the MAIN
-    // view) can invert it to wireframe the reflection camera frustum. reflDbgValid
-    // is false when no water reflection ran this frame (overlay then draws nothing).
-    static D3DXMATRIX reflDbgViewProj;
-    static bool reflDbgValid;
-    static void renderReflectionFrustumDebug(const D3DXMATRIX* view, const D3DXMATRIX* proj);
+    // S3: overlay cycle state 5 (reflection cull frustum + cache reflection draw set)
+    // went with the water reflection it visualised.
 
     // Free the horizon-curtain workspace (the lazily-allocated state in
     // renderexterior.cpp). Called from release() so the malloc'd buffers
@@ -498,10 +371,6 @@ public:
     static void updateMSOCCutoffInput();
     static void signalCullFinish();
     static void waitCullChannelFree();
-    //   waitCullReflReady      — block until the worker has finished the
-    //                            reflection gate + survivor cull (late fence,
-    //                            joined just before renderWaterReflection).
-    static void waitCullReflReady();
     static void joinCullWorker();
     static void renderDistantStatics();
     static void renderMSOCBasinBoundsDebug(const D3DXMATRIX* view, const D3DXMATRIX* proj);
@@ -509,7 +378,6 @@ public:
     static void renderCurtainDebug();  // Numpad3 cycle: in-world curtain overlay
     static void renderBoxOccluderDebug(const D3DXMATRIX* view, const D3DXMATRIX* proj);
     static void renderBasinDebug(const D3DXMATRIX* view, const D3DXMATRIX* proj);
-    static void renderWaterProxyBoundsDebug(const D3DXMATRIX* view, const D3DXMATRIX* proj);
 
     // MSOC occlusion verdict pass — walks the visible set, runs the
     // batched sphere query, applies far/handoff gates and temporal
@@ -548,14 +416,8 @@ public:
     static void renderGrassInstZ();
     static void renderGrassCommon(ID3DXEffect* e);
 
-    static void renderWaterReflection(const D3DXMATRIX* view, const D3DXMATRIX* proj);
-    static void renderReflectedSky();
-    static void renderReflectedStatics(const D3DXMATRIX* view, const D3DXMATRIX* proj);
-    // Phase 0.5: inject the GeometryCache dynamic set (NPCs + dynamic statics)
-    // into the water reflection with full color via FixedFunctionShader::
-    // renderMorrowind, driven from the cache walk (not engine draws). Additive —
-    // no engine suppression. Non-skinned opaque parts only in 0.5-B.
-    static void renderReflectionsFromCache(const D3DXMATRIX* view, const D3DXMATRIX* proj, float nearDist);
+    // S3: the water-reflection render (mirrored sky / statics / cache objects / cache
+    // terrain, plus their sun-shadow re-draws) went with renderwater.cpp.
     // Phase 1 Milestone 1: draw the simple-opaque subset of the GeometryCache
     // (NPCs + dynamic + near statics, excluding terrain) into the MAIN view with
     // full FFE color, driven authoritatively from the cache walk instead of the
@@ -563,93 +425,16 @@ public:
     // the main view/proj, documented CW base winding, no water clip plane, and its
     // own z (ZWRITE on, ZFUNC LESSEQUAL). Run from renderStage0 in CACHE mode.
     static void renderCachedOpaque(const D3DXMATRIX* view, const D3DXMATRIX* proj);
-    // Phase 0.5: apply sun shadows to the cache reflection objects by re-drawing
-    // them with the shadow-receiver shader. The sun shadow map is world-space, so
-    // reflected geometry samples it correctly via shadowViewProj = inverse(reflView)
-    // * smViewproj. Non-skinned only for now (skinned receiver needs skinIndexed).
-    static void renderReflectionShadowsFromCache(const D3DXMATRIX* view, const D3DXMATRIX* proj, float nearDist);
-    // Phase 0.5: draw the real near terrain from the cache into the reflection
-    // (two-texture AlphaGrid splat), replacing the coarse distant-land LOD inside
-    // nearDist. The DL land pass is near-clipped (landNearCull) to hand off.
-    static void renderReflectionTerrainFromCache(const D3DXMATRIX* view, const D3DXMATRIX* proj, float nearDist);
-    // Phase 1 Milestone 2.1: main-view sibling of renderReflectionTerrainFromCache.
+    // Phase 1 Milestone 2.1 (the reflection sibling is gone; see S3).
     // Draws the real near terrain (the engine's submitted landscape, two-texture
     // AlphaGrid splat) from the cache into the MAIN view, so MGE owns ALL opaque
     // (objects + terrain) in CACHE mode. No near-dist handover (the cache IS the
     // engine's near terrain; DL LOD owns beyond via the distant projection), no
     // water clip, main-view CW winding. Run from renderStage0 after renderCachedOpaque.
     static void renderCachedTerrain(const D3DXMATRIX* view, const D3DXMATRIX* proj);
-    static void clearReflection();
-    // Water-reflection occlusion gate: true if any water surface is actually
-    // visible in the main view (terrain height + MSOC), so the ~1ms reflection
-    // pass can be skipped when water is fully occluded / out of frame. See
-    // tasks/todo.md Phase A. Side effect: fills reflectionWaterRects with the
-    // surviving water tiles' main-view NDC screen rects, consumed by
-    // renderReflectedStatics to cull reflection statics (Phase B).
-    static bool isReflectionWaterVisible();
-
-    // Water flow map. buildWaterFlowMap bakes the per-body flow field on the cull
-    // worker (CPU only). updateFlowMapTexture (main thread) lazily (re)creates and
-    // uploads texFlow when the worker marks it dirty; returns true if texFlow is
-    // valid to bind. getFlowMapTransform fills {origin.x, origin.y, invSizeX, invSizeY}.
-    static void buildWaterFlowMap(float waterZ);
-    static bool updateFlowMapTexture();
-    static void getFlowMapTransform(float out[4]);
-
-    // Surviving water tile screen rects (main-view NDC AABBs: x=minX, y=minY,
-    // z=maxX, w=maxY). Where visible water samples texReflection on screen.
-    static std::vector<D3DXVECTOR4> reflectionWaterRects;
-    // Whether the screen-space water cull (rects + silhouette mask) is reliable this
-    // frame. FALSE → both consumers (cullReflectionSurvivors, renderReflectionsFromCache)
-    // keep ALL reflection candidates. Set false on interior / no terrain data, and while
-    // SWIMMING (eye on the water plane → water projects edge-on → rects AND mask collapse
-    // to slivers and over-cull). Written by isReflectionWaterVisible.
-    static bool reflWaterCullActive;
-
-    // --- Reflection-statics cull dispatched to the MSOC cull worker ---
-    // The gate (isReflectionWaterVisible), the reflection IPC query and the
-    // per-static skipMask are all pure-CPU/IPC and frame-stable, so they run on
-    // the cull worker during the sky window, leaving only the reflection draw on
-    // the main thread. See tasks/todo.md.
-    static bool reflGateWanted;     // worker runs the water-visible gate this frame
-    static bool reflStaticsWanted;  // worker issues the reflection RPC + culls
-    static bool reflVisible;        // gate result: any water visible (worker-written)
-    static D3DXMATRIX  reflCullViewProj;   // reflection view*proj (RPC frustum + cull projection)
-    static D3DXMATRIX  reflCullProj;       // reflection proj (NDC radius scale)
-    static D3DXVECTOR4 reflCullViewSphere; // reflection cull sphere (eye + range)
-    // Compacted reflection-static survivors: pointers into a stable copy of the
-    // IPC visible set, so the MAIN thread draws without traversing the live IPC
-    // window (which the worker + main RPCs would race). Mirrors visDistantSurvivors.
-    static VisibleSet<StlVector> reflectionSurvivors;
-    // Main (frameSetupEarly): stash the reflection cull inputs for the worker.
-    // The reflection RPC is folded into the batched statics RPC (kickoff), so
-    // there is no separate worker RPC step — the worker materializes the folded
-    // result after the single drain, then runs the gate + cull to survivors.
-    static void prepareReflectionCullForWorker();
-    static void workerReflectionGateAndMask();
-    // Materialize visExtraShared into stable storage (one IPC-window traversal).
-    static void materializeReflectionMeshes();
-    // Cull the materialized reflection meshes into reflectionSurvivors using
-    // reflectionWaterRects. Shared by the worker and the non-worker fallback.
-    static void cullReflectionSurvivors(const D3DXMATRIX& viewProj, const D3DXMATRIX& proj);
-    // Stage-2 reflection cull: fine water-silhouette mask test. Given a footprint's
-    // main-view NDC AABB (centre nx,ny ± half-extents rx,ry), returns true (keep) if
-    // it overlaps any rasterized visible-water bit. Returns true unconditionally when
-    // the mask is invalid (interior / no terrain data — mirrors the empty-rects keep).
-    // Water lies on the mirror plane, so a reflection-projected footprint shares the
-    // main-cam NDC the mask was built in. Built by isReflectionWaterVisible, consumed
-    // by cullReflectionSurvivors (statics) and renderReflectionsFromCache (cache).
-    static bool reflWaterMaskTestNDC(float nx, float ny, float rx, float ry);
-    // Debug: number of set bits in the current water-silhouette mask (0 if invalid).
-    static int reflWaterMaskSetBits();
-    static void simulateDynamicWaves();
-    // World-anchored hybrid particle foam sim (WATER_FOAM). Runs in the same effect
-    // Begin bracket as simulateDynamicWaves (reuses vbWaveSim + WaveVS), gated by
-    // UseWaterFlowMap && waterFoamOn. Tracks the player with a texel-aligned StretchRect
-    // shift (world-locked foam), advects Voronoi particles along the flow map, and
-    // writes foam intensity into texFoam for the water shader.
-    static void simulateFoam();
-    static void renderWaterPlane();
+    // S3: clearReflection, the water-visibility gate, the flow-map bake, the reflection
+    // screen-rect / silhouette-mask cull, the reflection-statics worker cull, the dynamic
+    // wave + foam simulations and renderWaterPlane were all declared here.
 
     static void renderDepth();
     static void renderDepthAdditional();
@@ -705,32 +490,9 @@ public:
     // MSOC occlusion refinement (0 when disarmed). For the LogDistantPipeline line.
     static unsigned lastRefineCulled();
 
-    // Diagnostic: the reflection-statics pipeline stage counts from the last
-    // isReflectionWaterVisible + cullReflectionSurvivors run, surfaced so the main
-    // thread (logReflStaticNearFar) can show WHERE the count diverges on a jump.
-    static void getReflPipeDiag(int& tilesTested, int& waterPresent, int& waterOccluded,
-                                int& rects, int& queried, int& survivors, bool& msocUsable);
-    static void getReflPipeFlip(int& flips, float& distMinCells, float& distMaxCells,
-                                float& elevMinDeg, float& elevMaxDeg);
-
-    static void renderShadowMap();
-    static void renderShadowFromCache(int layer, const D3DXMATRIX* viewproj);
-    // Clears one cascade's region of the shadow atlas (depth + stencil
-    // + the float-encoded "far depth" sentinel). Viewport-clipped so it
-    // touches only [layer*res, 0, res, res] of the atlas — the other
-    // cascade's region is preserved. Used by the adaptive shadow
-    // scheduler to refresh only the cascade(s) being re-rendered.
-    static void clearShadowCascade(int layer);
-    template<class T>
-    static void renderShadowLayerGeneric(MWBridge* mwBridge, int layer, const D3DXMATRIX* inverseCameraProj, D3DXMATRIX* view, D3DXMATRIX* proj, VisibleSet<T>& visible_set);
-    static void renderShadowLayer(int layer, float radius, const D3DXMATRIX* inverseCameraProj);
-    // skipCacheCovered: in CACHE mode (scene 0), skip the recordMW entries the cache
-    // owns (textured opaque) — their shadow receiver is folded into the cache color
-    // passes (applyCacheShadow in renderCachedOpaque, cacheTerrainSunShadow in
-    // renderCachedTerrain) at the snapshot pose, so the async-stale snapshot doesn't
-    // flicker against a live-pose receiver on animated geometry.
-    static void renderShadow(bool skipCacheCovered = false);
-    static void renderShadowDebug();
+    // S3: the whole cascaded sun-shadow renderer (build, per-cascade clear/layer, the
+    // recordMW receiver overlay, the cache caster pass and the debug view) went with
+    // rendershadow.cpp, along with the reflection-statics pipeline diagnostics.
 
     static void postProcess();
     static void updatePostShader(MGEShader* shader);

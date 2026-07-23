@@ -5437,9 +5437,9 @@ namespace RenderProcess {
 // Client-side Dear ImGui dev panel — drawn by ImGuiWater::onPresent under the F10
 // overlay, alongside the Water/Foam panel. Replaces the hardware-key seam A/B
 // toggles with clickable controls (some keys, e.g. Scroll Lock for host-cull, are
-// missing on compact keyboards). Defined here (not imgui_water.cpp) so it can reach
+// missing on compact keyboards). Defined here (not imgui_panels.cpp) so it can reach
 // the file-static seam state + DistantLand::hostCullOnly directly; declared extern
-// in imgui_water.cpp. Each control mirrors the equivalent [seam] key in pollDevKeys,
+// in imgui_panels.cpp. Each control mirrors the equivalent [seam] key in pollDevKeys,
 // logging on change so the log reads the same whether toggled by key or click.
 // ---------------------------------------------------------------------------
 void DrawForgeDevPanel() {

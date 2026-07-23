@@ -122,10 +122,6 @@ void DistantLand::frameSetupEarly() {
     renderThreadJobKicked = false;
     earlyForgeKickoff = false;
     earlyCulledGrass = false;
-    // Reset reflection-worker flags: only set true when the cull worker is
-    // dispatched below, so a non-worker frame can't read stale worker results.
-    reflGateWanted = false;
-    reflStaticsWanted = false;
 
     // Drive the scene-graph lights snapshot here (moved from renderStage0, which
     // runs *after* the engine's ~1.6ms sky pass). On the async path onFrameReady
@@ -396,12 +392,6 @@ void DistantLand::frameSetupEarly() {
         const double tStatics0 = fseNowMs();
         if ((Configuration.MGEFlags & USE_DISTANT_STATICS) && !earlyForgeKickoff
                 && !mwBridge->IsMenu()) {
-            // Stash the reflection cull inputs FIRST — before the kickoff — so the
-            // batched statics RPC can fold in the reflection query (4th query →
-            // visExtraShared). Its server-cull then overlaps the kickoff→drain
-            // head-start window (GeomCache walk + sky) instead of being a separate
-            // sequential worker RPC sitting in front of the statics verdict.
-            prepareReflectionCullForWorker();
 
             D3DXMATRIX distProj = mwProj;
             editProjectionZ(&distProj, kDistantNearPlane - 1e-2, Configuration.DL.DrawDist * kCellSize);
@@ -730,34 +720,9 @@ void DistantLand::renderStage0() {
             renderDepth();
             effectDepth->End();
 
-            // Shadow map runs after the depth pre-pass so renderShadowFromCache
-            // sees the freshly updated geometry cache from renderDepth's overlap.
-            //
-            // Forge color has no shadows and its composite overwrites every MGE opaque/DL
-            // pixel, so the shadow map's only surviving consumer whose output ISN'T overwritten
-            // is the water reflection (texReflection → MGE water, which Forge also owns). While
-            // Forge owns the frame the receiver is gated in renderStage1/2 and the reflection is
-            // suppressed below, so nothing samples the map — skip the whole BUILD. F11-off keeps
-            // it so MW/MGE water still gets reflected shadows.
-            const bool shadowBuildEligible = (Configuration.MGEFlags & USE_SHADOWS) && !RenderProcess::forgeOwnsFrame();
-            if (shadowBuildEligible) {
-                if (mwBridge->CellHasWeather() && !mwBridge->IsMenu()) {
-                    effectShadow->Begin(&passes, D3DXFX_DONOTSAVESTATE);
-                    renderShadowMap();
-                    effectShadow->End();
-                }
-            }
-            // Baseline-thinning verify (2026-07-02): confirm the shadow-map BUILD is actually skipped
-            // in the default F11-on baseline. Throttled so it doesn't spam. If this logs eligible=1
-            // there, frame ownership isn't engaging — see the shadow gate above.
-            {
-                static unsigned s_shadowGateLog = 0;
-                if ((s_shadowGateLog++ % 300) == 0) {
-                    LOG::logline(">> [baseline][shadow] build eligible=%d (USE_SHADOWS=%d forgeOwnsFrame=%d)",
-                                 (int)shadowBuildEligible, (int)((Configuration.MGEFlags & USE_SHADOWS) != 0),
-                                 (int)RenderProcess::forgeOwnsFrame());
-                }
-            }
+            // S3: MGE's cascaded sun-shadow map was built here. The Forge host owns sun +
+            // point-light shadows, and its composite overwrites every MGE opaque/DL pixel, so
+            // the map's last consumer was the water reflection — which went with the water.
 
             // Distant everything; the projection bias above keeps distant
             // land drawn behind anything Morrowind would draw.
@@ -881,45 +846,9 @@ void DistantLand::renderStage0() {
                 effect->SetMatrix(ehProj, &distProj);
             }
 
-            // Update reflection. CellHasWater() is cell-level ("this cell has
-            // water"), so a city cell with a river ran the full ~1ms reflection
-            // every frame even facing into the streets. Gate on whether water is
-            // actually visible (frustum + MSOC); when it isn't, clearReflection()
-            // keeps a valid flat-fog target for the distant-water sampler and the
-            // transition frame without paying the reflection pass.
-            if (mwBridge->CellHasWater() && !RenderProcess::forgeOwnsFrame()) {
-                // Join the worker's late reflection fence before reading its
-                // results. The reflection gate/cull was split off the early
-                // staticsDone fence so renderDepth's statics join didn't wait on
-                // it; consume it here, ~10 passes later, where it's typically
-                // already done (~0 join). Only on the worker path (reflGateWanted).
-                if (reflGateWanted) {
-                    waitCullReflReady();
-                }
-                // Gate result comes from the cull worker when it ran the gate this
-                // frame (reflGateWanted); otherwise compute it inline on main.
-                const bool waterVisible = reflGateWanted ? reflVisible
-                                                         : isReflectionWaterVisible();
-                if (waterVisible) {
-                    renderWaterReflection(&mwView, &distProj);
-                } else {
-                    clearReflection();
-                }
-            } else if (mwBridge->CellHasWater()) {
-                // Forge owns the water surface: MGE water is suppressed, so its reflection RT
-                // has no visible consumer. The cull was already skipped (prepareReflectionCullForWorker
-                // returned early → reflGateWanted false). Keep a valid flat-fog target for the
-                // distant-water sampler without paying the reflection cull/draw.
-                clearReflection();
-            }
-
-            // Update water simulation
-            if (Configuration.MGEFlags & DYNAMIC_RIPPLES) {
-                simulateDynamicWaves();
-                if (Configuration.UseWaterFlowMap && waterFoamOn) {
-                    simulateFoam();
-                }
-            }
+            // S3: MGE's water reflection / wave / foam simulation lived here. The Forge host
+            // owns the water surface outright (WT1-WT3), so nothing sampled texReflection any
+            // more and the whole reflect-cull-simulate chain was pure cost.
 
             effect->End();
             renderMSOCBasinBoundsDebug(&mwView, &distProj);
@@ -929,8 +858,6 @@ void DistantLand::renderStage0() {
             // no-ops. Disabled here but kept defined/parked alongside the basin code.
             // renderCurtainDebug();
             renderBoxOccluderDebug(&mwView, &distProj);
-            renderWaterProxyBoundsDebug(&mwView, &distProj);
-            renderReflectionFrustumDebug(&mwView, &distProj);
 
             // Reset matrices
             effect->SetMatrix(ehView, &mwView);
@@ -979,45 +906,9 @@ void DistantLand::renderStage0() {
                 stateSaved->Release();
             }
 
-            // Water reflection. Exteriors update it inside the distant-cell branch
-            // above; interiors have no distant land, so render the GeometryCache
-            // near-field (NPCs + objects) reflection here when the cell has water
-            // and the user enabled interior reflections ("Water Reflects Interiors").
-            // renderWaterReflection self-gates its exterior-only parts (LOD land,
-            // distant statics, sky), so this draws just the cache color + shadow
-            // reflection. Otherwise clear, so the distant-water sampler reads a valid
-            // flat-fog target and we don't reflect the previous cell. Cleared every
-            // frame regardless to react to lighting changes.
-            if ((Configuration.MGEFlags & REFLECT_INTERIOR) && mwBridge->CellHasWater()
-                && !RenderProcess::forgeOwnsFrame()) {
-                device->CreateStateBlock(D3DSBT_ALL, &stateSaved);
-                effect->Begin(&passes, D3DXFX_DONOTSAVESTATE);
-                renderWaterReflection(&mwView, &mwProj);
-                effect->End();
-                stateSaved->Apply();
-                stateSaved->Release();
-            } else {
-                // Forge owns interior water too → fall through to clearReflection (keeps a valid
-                // flat target for the distant-water sampler), same as the no-reflection-enabled case.
-                clearReflection();
-            }
-
-            // Update water simulation
-            if (Configuration.MGEFlags & DYNAMIC_RIPPLES) {
-                // Save state block manually since we can change FVF/decl
-                device->CreateStateBlock(D3DSBT_ALL, &stateSaved);
-
-                effect->Begin(&passes, D3DXFX_DONOTSAVESTATE);
-                simulateDynamicWaves();
-                if (Configuration.UseWaterFlowMap && waterFoamOn) {
-                    simulateFoam();
-                }
-                effect->End();
-
-                // Restore render state
-                stateSaved->Apply();
-                stateSaved->Release();
-            }
+            // S3: the interior water reflection + wave/foam sim were here (see the exterior
+            // branch above). Both went with MGE's water renderer — the Forge host owns
+            // interior water surfaces too, so REFLECT_INTERIOR had no consumer left.
         }
     }
 
@@ -1072,21 +963,9 @@ void DistantLand::renderStage1() {
                 effect->EndPass();
             }
 
-            // Overlay shadow onto Morrowind objects. Skipped when the Forge seam owns the
-            // opaque world: the receiver re-draws recordMW geometry to darken the backbuffer,
-            // but the Forge composite (end of scene 0) overwrites exactly those covered pixels
-            // — pure waste. Shadows return host-side once Forge owns more of the pipeline.
-            if ((Configuration.MGEFlags & USE_SHADOWS) && mwBridge->CellHasWeather()
-                && !RenderProcess::forgeOwnsFrame()) {
-                // CACHE mode: the cache owns scene-0 textured-opaque color/depth at the
-                // snapshot pose. renderShadow() skips that set (skipCacheCovered); its sun
-                // shadow is folded into the cache color passes (renderCachedOpaque /
-                // renderCachedTerrain) instead of a separate receiver re-draw, so it rides
-                // the color draws at the snapshot pose and tracks the occlusion-culled set.
-                effect->BeginPass(isPPLActive ? PASS_RENDERSHADOWFFE : PASS_RENDERSHADOW);
-                renderShadow(cacheOpaqueMode);
-                effect->EndPass();
-            }
+            // S3: the sun-shadow receiver overlay was here. It re-drew recordMW geometry to
+            // darken the backbuffer, which the Forge composite then overwrote; shadows are
+            // host-side now (sun + point-light, with a screen-space mask).
 
             effect->End();
         }
@@ -1121,16 +1000,7 @@ void DistantLand::renderStage2() {
         // Save state block manually since we can change FVF/decl
         device->CreateStateBlock(D3DSBT_ALL, &stateSaved);
 
-        if (isDistantCell()) {
-            // Shadowing onto recorded renders
-            if ((Configuration.MGEFlags & USE_SHADOWS) && mwBridge->CellHasWeather()) {
-                effect->Begin(&passes, D3DXFX_DONOTSAVESTATE);
-                effect->BeginPass(isPPLActive ? PASS_RENDERSHADOWFFE : PASS_RENDERSHADOW);
-                renderShadow();
-                effect->EndPass();
-                effect->End();
-            }
-        }
+        // S3: shadowing onto recorded renders was here (same receiver as renderStage1).
 
         // Depth texture from recorded renders
         effectDepth->Begin(&passes, D3DXFX_DONOTSAVESTATE);
@@ -1168,23 +1038,7 @@ void DistantLand::renderStageBlend() {
     device->CreateStateBlock(D3DSBT_ALL, &stateSaved);
     effect->Begin(&passes, D3DXFX_DONOTSAVESTATE);
 
-    // Render caustics
-    if (mwBridge->IsExterior() && Configuration.DL.WaterCaustics > 0) {
-        D3DXMATRIX m;
-        IDirect3DTexture9* tex = PostShaders::borrowBuffer(0);
-        D3DXMatrixTranslation(&m, eyePos.x, eyePos.y, mwBridge->WaterLevel());
-
-        effect->SetTexture(ehTex0, tex);
-        effect->SetTexture(ehTex1, texWater);
-        effect->SetTexture(ehTex3, texDepthFrame);
-        effect->SetMatrix(ehWorld, &m);
-        effect->SetFloat(ehAlphaRef, Configuration.DL.WaterCaustics);
-        effect->CommitChanges();
-
-        effect->BeginPass(PASS_RENDERCAUSTICS);
-        PostShaders::applyBlend();
-        effect->EndPass();
-    }
+    // S3: water caustics were projected here, onto the MW water surface the host now owns.
 
     // Blend MW/MGE
     if (isDistantCell() && (~Configuration.MGEFlags & NO_MW_MGE_BLEND)) {
@@ -1200,52 +1054,6 @@ void DistantLand::renderStageBlend() {
     effect->End();
     stateSaved->Apply();
     stateSaved->Release();
-}
-
-// renderStageWater - Render replacement water plane
-void DistantLand::renderStageWater() {
-    auto mwBridge = MWBridge::get();
-    IDirect3DStateBlock9* stateSaved;
-    UINT passes;
-
-    if (isRenderCached) {
-        return;
-    }
-
-    // WT3: Forge owns the water → skip MGE's replacement water plane entirely (analogous to the SK3
-    // sky gate). Both call sites still suppress MW's own raw water grid (the d3d8device water-material
-    // path returns D3D_OK after this no-op), so with Forge water ON exactly ONE surface draws: Forge's.
-    // F11-off → MW/MGE water draws unchanged (the vanilla A/B). Gated on forgeOwnsFrame.
-    if (RenderProcess::forgeOwnsFrame()) {
-        return;
-    }
-
-    if (mwBridge->CellHasWater()) {
-        // Save state block manually since we can change FVF/decl
-        device->CreateStateBlock(D3DSBT_ALL, &stateSaved);
-        effect->Begin(&passes, D3DXFX_DONOTSAVESTATE);
-
-        // Draw water plane
-        bool u = mwBridge->IsUnderwater(eyePos.z);
-        bool i = !mwBridge->IsExterior();
-
-        if (u || i) {
-            // Set up clip plane at fog end for certain environments to save fillrate
-            float clipAt = Configuration.DL.InteriorFogEnd * kCellSize;
-            D3DXPLANE clipPlane(0, 0, -clipAt, mwProj._33 * clipAt + mwProj._43);
-            device->SetClipPlane(0, clipPlane);
-            device->SetRenderState(D3DRS_CLIPPLANEENABLE, 1);
-        }
-
-        // Switch to appropriate shader and render
-        effect->BeginPass(u ? PASS_RENDERUNDERWATER : PASS_RENDERWATER);
-        renderWaterPlane();
-        effect->EndPass();
-
-        effect->End();
-        stateSaved->Apply();
-        stateSaved->Release();
-    }
 }
 
 // setupCommonEffect - Set shared shader variables for this frame
@@ -1309,10 +1117,6 @@ void DistantLand::setupCommonEffect(const D3DXMATRIX* view, const D3DXMATRIX* pr
     effect->SetFloatArray(ehFootPos, (float*)mwBridge->PlayerPositionPointer(), 3);
     effect->SetFloat(ehTime, mwBridge->simulationTime());
 
-    // Cache reflection below-water clip plane: pass-all by default (no clip). The
-    // water reflection pass overrides this around the cache passes and restores it.
-    const D3DXVECTOR4 reflClipPassAll(0, 0, 0, 1);
-    effect->SetVector(ehReflWaterClip, &reflClipPassAll);
 }
 
 // setScattering - Set scattering coefficients for atmospheric scattering shader
@@ -1560,33 +1364,6 @@ void DistantLand::postProcess() {
             PostShaders::shaderTime(&updatePostShader, envFlags, mwBridge->frameTime());
         }
 
-        // === FOAM DEBUG VIEW (temporary): blit the raw foam sim surfaces to screen
-        // corners, unmodulated and full-RGB, so the particle/field/output buffers can
-        // be inspected directly instead of through the water shader's masked .r tap
-        // (edge-fade * shoreMask * fog.a makes every diagnostic look like "white,
-        // offset"). surfFoam carries the FoamExtractPS diagnostic; surfFoamField .z is
-        // density. Gated on the foam toggle (NUMPAD2). ===
-        if (Configuration.UseWaterFlowMap && waterFoamOn && foamDebugView && surfFoam[0]) {
-            IDirect3DSurface9* backbuffer = nullptr;
-            device->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &backbuffer);
-            if (backbuffer) {
-                D3DSURFACE_DESC bd;
-                backbuffer->GetDesc(&bd);
-                const LONG sz = 300, pad = 8;
-                LONG y0 = (LONG)bd.Height - sz - pad;
-                // Left = carrier foam output, right = carrier field (.z = density).
-                RECT rFoam  = { pad,            y0, pad + sz,        y0 + sz };
-                RECT rField = { 2*pad + sz,     y0, 2*pad + 2*sz,    y0 + sz };
-                HRESULT h0 = device->StretchRect(surfFoam[0], 0, backbuffer, &rFoam,  D3DTEXF_POINT);
-                HRESULT h1 = surfFoamField[0] ? device->StretchRect(surfFoamField[0], 0, backbuffer, &rField, D3DTEXF_POINT) : 0;
-                if (h0 != D3D_OK || h1 != D3D_OK) {
-                    static bool logged = false;
-                    if (!logged) { LOG::logline("!! Foam debug blit StretchRect failed: 0x%x 0x%x", h0, h1); logged = true; }
-                }
-                backbuffer->Release();
-            }
-        }
-
         // Capture pre-UI screenshots here
         checkCaptureScreenshot(false);
 
@@ -1631,7 +1408,9 @@ void DistantLand::updatePostShader(MGEShader* shader) {
     // Internal textures
     // TODO: Should be set once at init time
     shader->SetTexture(EV_depthframe, texDepthFrame);
-    shader->SetTexture(EV_watertexture, texWater);
+    // S3: EV_watertexture fed MGE's animated water volume map, deleted with the water
+    // renderer. Post shaders that declare it now see whatever they default to; the
+    // input is retired for real when post-processing moves to the host (S7).
 
     // View position
     float zoom = (Configuration.MGEFlags & ZOOM_ASPECT) ? Configuration.CameraEffects.zoom : 1.0f;

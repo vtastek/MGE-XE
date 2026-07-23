@@ -162,12 +162,6 @@
     <ClCompile Include="src\mge\rendergrass.cpp">
       <Filter>Source Files\mge</Filter>
     </ClCompile>
-    <ClCompile Include="src\mge\rendershadow.cpp">
-      <Filter>Source Files\mge</Filter>
-    </ClCompile>
-    <ClCompile Include="src\mge\renderwater.cpp">
-      <Filter>Source Files\mge</Filter>
-    </ClCompile>
     <ClCompile Include="src\mge\specificrender.cpp">
       <Filter>Source Files\mge</Filter>
     </ClCompile>
