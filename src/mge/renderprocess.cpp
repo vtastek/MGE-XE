@@ -1937,6 +1937,7 @@ namespace {
             item.alphaRef   = e.alphaTest ? e.alphaRef : 0.0f;   // base-stage alpha test
             item.stageCount = (std::uint32_t)ns;
             item.drawFlags  = blended ? IPC::kMMDrawFlagBlended : 0u;   // Route C: alpha-stage blend draw
+            item.matAlpha   = e.matDiffuse[3];   // FFE per-draw fade (same source as emitAlphaDraw)
             for (int s = 0; s < ns; ++s) {
                 const std::uint32_t tex = resolveTextureSlot(st[s].name);   // bindless slot (0 = white)
                 item.stages[s] = IPC::packMMStage(tex, st[s].uv, st[s].op, st[s].clamp);

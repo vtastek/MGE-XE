@@ -233,10 +233,19 @@ namespace IPC {
         // Route C (glow-window multimap-blend): bit0 = BLENDED. An alpha-BLEND multi-map shape
         // (e.g. Glow-in-the-Dahrk night windows: base orange x dark shape) rides THIS same list but
         // the host skips it in the opaque MM color/Z-prepass/shadow loops and draws it in the alpha
-        // stage with a blend PSO (SRCALPHA/INVSRCALPHA, depth no-write) using multimap_alpha.frag,
-        // which outputs vertex alpha instead of forced 1.0. matAlpha is 1.0 on all such windows
-        // (measured) so no material-alpha field is needed. 0 for every opaque multi-map draw.
+        // stage with a blend PSO (SRCALPHA/INVSRCALPHA, depth no-write) using multimap_alpha.frag.
+        // 0 for every opaque multi-map draw.
         std::uint32_t drawFlags;
+        // MaterialProperty::alpha — the FFE per-draw fade, identical in meaning to
+        // AlphaDrawWire::matAlpha. Route C originally shipped no such field because the SEVEN
+        // Glow-in-the-Dahrk window meshes it was measured on all had matAlpha 1.0 AND fully opaque
+        // base maps, which made outA collapse to the vertex alpha. That sample was not the Route C
+        // SET: any blended shape whose glow map is its own base map lands here too — e.g. the light
+        // rays in in_c_rich_r_swin_bay_01.nif (base = glow = textures\glow\ray_alpha.dds, the old
+        // MODULATE-then-ADD double-brightness trick), whose transparency lives ENTIRELY in the base
+        // map's alpha channel. Route C must therefore reproduce MW's full FFE alpha,
+        // texA * vcolA * matAlpha, exactly as alpha.frag does. Read only for BLENDED draws.
+        float         matAlpha;
     };
     constexpr std::uint32_t kMMDrawFlagBlended = 1u;   // MultiMapDrawWire::drawFlags bit0
 

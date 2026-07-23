@@ -1264,8 +1264,9 @@ namespace {
         Pipeline*      pMultiMapShadowPipelineFrontMirror = nullptr; // CULL_FRONT CW
         Buffer*        pMMWorldsBuf = nullptr;             // gBatch: one 64KB world window, persistent-mapped
         DescriptorSet* pPerBatchSetMM = nullptr;           // gBatch bound to pMMWorldsBuf, 1 instance
-        // Per-draw instance VB (kMMInstU32 uint32 slots): { Meta, stages[4], matDiff3, matAmb3, matEmis3 },
-        // one entry per drawn part (indexed by multiMapDrawn via firstInstance). CPU-mapped, per frame.
+        // Per-draw instance VB (kMMInstU32 uint32 slots): { Meta, stages[4], matDiff3, matAmb3,
+        // matEmis3, matAlpha }, one entry per drawn part (indexed by multiMapDrawn via
+        // firstInstance). CPU-mapped, per frame.
         Buffer*        pInstanceBufMM = nullptr;
 
         // --- Route C: alpha-BLEND multi-map (glow-window base x dark) -----------------
@@ -1589,9 +1590,15 @@ namespace {
     // Per-instance VB stride (uint32 slots):
     //   [0] Meta (idx 0-9 | stageCount 10-12 | vColSource 13-14 | alphaRef*255 16-23 | uvAnimId 24-31)
     //   [1..4] stages[4]  [5..7] matDiffuse.rgb  [8..10] matAmbient.rgb  [11..13] matEmissive.rgb
-    // 14 * 4 = 56 bytes.
+    //   [14] matAlpha (float) — MaterialProperty::alpha. Meta was full (every bit spoken for), and
+    //        widening it would have cost a bit-field renumber across both fill loops AND the vert;
+    //        one more float lane is the cheaper edit. multimap.vert folds it into Out.Color.a, so
+    //        no new interpolator and no VSOutput change (multimap.frag / depthonly_mm.frag read
+    //        only In.Color.rgb — verified — and stay byte-for-byte unchanged; see the pairing
+    //        hazard in [[project_forge_shared_frag_vsoutput]]).
+    // 15 * 4 = 60 bytes.
     constexpr uint32_t kMaxMultiMap = 1024;
-    constexpr uint32_t kMMInstU32   = 14;
+    constexpr uint32_t kMMInstU32   = 15;
     // Route C blended multi-map (glow windows): own alpha-stage budget, separate from kMaxMultiMap
     // (glow-nights already pin the opaque MM cap). Same kMMInstU32 instance layout.
     constexpr uint32_t kMaxMMAlpha  = 512;
@@ -3563,14 +3570,16 @@ namespace {
 
             // Multi-map vertex layout: binding 0 = mesh (IPC::GeomVertexWireMM, stride 60:
             // pos@0, normal@12, color@24, uv0@28, uv1@36, uv2@44, uv3@52); binding 1 = per-INSTANCE
-            // { Meta @0, Stages uint4 @4, matDiffuse @20, matAmbient @32, matEmissive @44 } (stride 56).
+            // { Meta @0, Stages uint4 @4, matDiffuse @20, matAmbient @32, matEmissive @44,
+            // matAlpha @56 } (stride 60). Shared by all three multimap.vert pipelines (opaque
+            // colour, Z-prepass, Route C alpha) — every one of them must fill lane 14.
             VertexLayout mvl = {};
             mvl.mBindingCount = 2;
             mvl.mBindings[0].mStride = sizeof(IPC::GeomVertexWireMM);
             mvl.mBindings[0].mRate = VERTEX_BINDING_RATE_VERTEX;
             mvl.mBindings[1].mStride = kMMInstU32 * sizeof(uint32_t);
             mvl.mBindings[1].mRate = VERTEX_BINDING_RATE_INSTANCE;
-            mvl.mAttribCount = 12;
+            mvl.mAttribCount = 13;
             mvl.mAttribs[0].mSemantic = SEMANTIC_POSITION;
             mvl.mAttribs[0].mFormat = TinyImageFormat_R32G32B32_SFLOAT;
             mvl.mAttribs[0].mBinding = 0; mvl.mAttribs[0].mLocation = 0; mvl.mAttribs[0].mOffset = 0;
@@ -3607,6 +3616,9 @@ namespace {
             mvl.mAttribs[11].mSemantic = SEMANTIC_TEXCOORD8;      // MatEmissive (per-instance)
             mvl.mAttribs[11].mFormat = TinyImageFormat_R32G32B32_SFLOAT;
             mvl.mAttribs[11].mBinding = 1; mvl.mAttribs[11].mLocation = 11; mvl.mAttribs[11].mOffset = 11 * sizeof(uint32_t);
+            mvl.mAttribs[12].mSemantic = SEMANTIC_TEXCOORD9;      // MatAlpha (per-instance, Route C)
+            mvl.mAttribs[12].mFormat = TinyImageFormat_R32_SFLOAT;
+            mvl.mAttribs[12].mBinding = 1; mvl.mAttribs[12].mLocation = 12; mvl.mAttribs[12].mOffset = 14 * sizeof(uint32_t);
 
             DepthStateDesc mmDepth = {};
             mmDepth.mDepthTest = true;
@@ -8968,6 +8980,7 @@ namespace ForgeRender {
                     fe[5]  = it.matDiffuse[0];  fe[6]  = it.matDiffuse[1];  fe[7]  = it.matDiffuse[2];
                     fe[8]  = it.matAmbient[0];  fe[9]  = it.matAmbient[1];  fe[10] = it.matAmbient[2];
                     fe[11] = it.matEmissive[0]; fe[12] = it.matEmissive[1]; fe[13] = it.matEmissive[2];
+                    fe[14] = it.matAlpha;   // unused by depthonly_mm.frag; lane must not be stale
 
                     const int mirror = worldMirrored(it.world) ? 1 : 0;
                     if (mirror != boundMMMirror) {
@@ -10115,6 +10128,7 @@ namespace ForgeRender {
                 fe[5]  = it.matDiffuse[0];  fe[6]  = it.matDiffuse[1];  fe[7]  = it.matDiffuse[2];
                 fe[8]  = it.matAmbient[0];  fe[9]  = it.matAmbient[1];  fe[10] = it.matAmbient[2];
                 fe[11] = it.matEmissive[0]; fe[12] = it.matEmissive[1]; fe[13] = it.matEmissive[2];
+                fe[14] = it.matAlpha;   // unused by multimap.frag (opaque forces 1.0); kept in sync
 
                 const int mirror = worldMirrored(it.world) ? 1 : 0;
                 if (mirror != boundMMMirror) {
@@ -10558,6 +10572,7 @@ namespace ForgeRender {
                 fe[5]  = it.matDiffuse[0];  fe[6]  = it.matDiffuse[1];  fe[7]  = it.matDiffuse[2];
                 fe[8]  = it.matAmbient[0];  fe[9]  = it.matAmbient[1];  fe[10] = it.matAmbient[2];
                 fe[11] = it.matEmissive[0]; fe[12] = it.matEmissive[1]; fe[13] = it.matEmissive[2];
+                fe[14] = it.matAlpha;   // Route C: the ONE loop whose frag actually reads it
 
                 if (!bound) {
                     cmdBindPipeline(g_live.pCmd, g_live.pMultiMapAlphaPipeline);

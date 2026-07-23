@@ -2,12 +2,12 @@
 //
 // A byte-for-byte copy of multimap.frag EXCEPT the final output alpha: this frag is paired with
 // the UNCHANGED multimap.vert and drawn in the alpha stage with a blend PSO (SRCALPHA/INVSRCALPHA,
-// depth GEQUAL no-write) for alpha-BLEND multi-map shapes — the Glow-in-the-Dahrk night windows
-// (base orange x dark shape). multimap.frag forces alpha = 1.0 (opaque coverage); here the blend
-// needs REAL alpha. Measured on all 7 such window meshes: base+dark maps are fully opaque and
-// MaterialProperty alpha = 1.0, so outA = baseA(1)·vcolA·matAlpha(1) = vcolA = the vertex alpha
-// (In.Color.a when a VertexColorProperty drives the shape, else 1.0). No material-alpha field is
-// needed, so this reuses multimap.vert's VSOutput verbatim (no pairing-hazard ripple).
+// depth GEQUAL no-write) for alpha-BLEND multi-map shapes — Glow-in-the-Dahrk night windows (base
+// orange x dark shape), and any other blended shape carrying a dark/detail/glow sibling map.
+// multimap.frag forces alpha = 1.0 (opaque coverage); here the blend needs MW's REAL FFE alpha,
+// texA * vcolA * matAlpha (see the RETURN at the bottom for why all three factors matter).
+// VSOutput is still multimap.vert's verbatim — matAlpha rides In.Color.a — so no pairing-hazard
+// ripple onto the other frags paired with that vert.
 //
 // The lit + point-light + stage-combine blocks below are IDENTICAL to multimap.frag — keep them in
 // lockstep with multimap.frag / opaque.frag (Tier 1/2b/3a). Only the last RETURN differs.
@@ -192,8 +192,19 @@ float4 PS_MAIN( VSOutput In )
         RETURN(float4(g, g, g, 1.0f));
     }
 
-    // Route C output: REAL blend alpha = vertex alpha (matAlpha and baseA are both 1.0 on these
-    // windows, measured). vColSource 0 (const material, no VertexColorProperty) → fully opaque.
-    float outA = (vColSource != 0u) ? In.Color.a : 1.0f;
+    // Route C output: MW's full FFE alpha, texA * vcolA * matAlpha — the same expression
+    // alpha.frag uses for single-map blends. `baseA` is the BASE stage's texture alpha, recorded
+    // by the stage loop above; vcolA * matAlpha arrives folded into In.Color.a by multimap.vert
+    // (white = 1 when the shape carries no VertexColorProperty).
+    //
+    // This used to be `(vColSource != 0) ? In.Color.a : 1.0`, dropping baseA on the floor. It read
+    // correctly on the Glow-in-the-Dahrk windows it was measured against — their base maps are
+    // fully opaque, so baseA really was 1 — but Route C claims EVERY blended multi-map shape, and
+    // a shape whose glow map IS its own base map (in_c_rich_r_swin_bay_01.nif's light rays: base =
+    // glow = textures\glow\ray_alpha.dds, MODULATE then ADD for double brightness) keeps all of its
+    // transparency in that base alpha channel and has no vertex colours at all. Result: outA = 1,
+    // a hard opaque quad where MW draws soft rays. Before Route C existed those rays fell through
+    // to the AT3 captured path and got alpha.frag's correct alpha — hence "we used to render it".
+    float outA = baseA * In.Color.a;
     RETURN(float4(c, outA));
 }
