@@ -148,6 +148,17 @@ namespace RenderProcess {
     // failed seam falls back to (g_initOk false), and it is the ONLY fallback.
     bool forgeOwnsFrame();
 
+    // True when g_mainTex holds a host frame the composite can re-show. The menu freeze
+    // (DistantLand::menuFreeze) requires it: with no valid frame there is nothing to re-blit and
+    // freezing would leave the world blank. Also false after a host death / failed finish, which is
+    // what releases the freeze back to normal rendering.
+    bool hasCompositeFrame();
+
+    // Drop the captured-alpha buffers filling for a frame that will never be built. Only the menu
+    // freeze needs this: it skips the produce, and swapCaptureBuffers() (the sole clear point) goes
+    // with it, so captureAlphaDraw would otherwise accumulate for the life of the menu.
+    void discardPendingCaptures();
+
     // FP1a first-person takeover: true when the seam is live AND compositing AND the Forge FP
     // pass is enabled (ForgeFPPass ini) AND the player is in FIRST person. Gates the cache's
     // armCamera-root walk + the per-frame FP draw lists + the FP camera crossing. Default off

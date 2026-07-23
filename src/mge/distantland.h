@@ -112,6 +112,20 @@ public:
     // renderDepth (skip cullDistantStatics_finish). Stable for the frame: the seam's
     // The F11 toggle is polled at composite-finish time, after every consumer.
     static bool earlyForgeKickoff;
+    // MENU FREEZE (USE_MENU_CACHING, "pause world during menus"). While latched, the world is not
+    // re-rendered at all: frameSetupEarly returns before the grass cull / park fire / statics cull /
+    // cache walk / classify / visible set / produce kick, mged3d8device skips the host kickoff, and
+    // the composite blit re-shows the LAST host frame from g_mainTex. MW's own UI/HUD still draws
+    // over it, so menus stay fully interactive on a frozen world — which is free, because menu mode
+    // pauses simulation.
+    //
+    // Implies earlyForgeKickoff (never latches on warm-up / late-kickoff frames, where EndScene
+    // would kick anyway). Releases for one frame on every mouse-button RELEASE
+    // (MGEProxyDirectInput::mouseClick) so anything the player changes from a menu — dropping an
+    // item, equipping in 3rd person — is picked up by a fresh frame; that is the same expiry MGE's
+    // DX9 menu cache used, for the same reason. Requires a valid composited frame to re-show
+    // (RenderProcess::hasCompositeFrame).
+    static bool menuFreeze;
     // Set when frameSetupEarly already ran the grass cull (pre-kickoff, channel free);
     // renderDepth skips its own cullGrass then (grass depth/color consume the same VB).
     static bool earlyCulledGrass;

@@ -254,6 +254,38 @@ void DistantLand::frameSetupEarly() {
         }
     }
 
+    // MENU FREEZE ("pause world during menus", USE_MENU_CACHING). Menu mode pauses MW's
+    // simulation, so re-rendering the world every frame is pure waste — re-show the last host
+    // frame instead. Everything below this point is world work (grass cull, park fire, statics
+    // cull, cache walk, classify, visible set, produce kick) and the caller then skips the host
+    // kickoff, so the whole client+host world pipeline drops out; only MW's UI still draws, over
+    // the composite blit of g_mainTex. See the header for the full contract.
+    //
+    // Released for one frame on mouse-button release so anything the player changes from a menu
+    // (dropping an item, equipping in 3rd person) lands in a fresh frame — MGE's DX9 menu cache
+    // used exactly this expiry. Requires a valid composited frame to re-show, so a host death
+    // falls straight back to normal rendering.
+    //
+    // Not gated on isLoadingBar: load screens ARE menus, but earlyForgeKickoff is already false
+    // there (forgeEligibleNow), and menuFreeze implies it.
+    menuFreeze = earlyForgeKickoff
+              && (Configuration.MGEFlags & USE_MENU_CACHING)
+              && mwBridge->IsMenu()
+              && RenderProcess::hasCompositeFrame()
+              && !MGEProxyDirectInput::mouseClick;
+    if (menuFreeze) {
+        // The IPC channel is left exactly as onFrameAheadCollect (which ran at BeginScene(0),
+        // before this) left it: produce drained, any deferred/parked finish stashed and closed.
+        // Nothing is issued while frozen, so there is no pairing to maintain — the next unfrozen
+        // frame kicks from a clean slate.
+        //
+        // But captureAlphaDraw keeps appending for the blended world DIPs MW still issues behind
+        // the menu, and its only clear point (swapCaptureBuffers) rides the produce we just
+        // skipped. Drop the pending captures or they grow for the life of the menu.
+        RenderProcess::discardPendingCaptures();
+        return;
+    }
+
     // Early Forge kickoff frames: run the grass cull NOW, before the async window opens.
     // Grass is the one scene-0 RPC with a live consumer in Forge mode (MGE still draws grass
     // color — the host has no grass), so it can't be gated off like the statics cull; it moves
@@ -1527,8 +1559,16 @@ void DistantLand::postProcess() {
         // Capture pre-UI screenshots here
         checkCaptureScreenshot(false);
 
-        // Cache render for first frame of menu mode
-        if ((Configuration.MGEFlags & USE_MENU_CACHING) && mwBridge->IsMenu()) {
+        // Cache render for first frame of menu mode.
+        //
+        // DX9 path only. Under Forge the same flag drives DistantLand::menuFreeze instead, which
+        // pauses the world at the source (no host frame is rendered at all) rather than hiding a
+        // fully-rendered one behind a stale blit — this capture saved nothing there and cost a
+        // borrowBuffer + a full-screen StretchRect over the composite every menu frame. Not
+        // latching under Forge also removes the menu consumer of PostShaders::borrowBuffer, which
+        // S6 has to retire regardless.
+        if ((Configuration.MGEFlags & USE_MENU_CACHING) && mwBridge->IsMenu()
+                && !RenderProcess::forgeOwnsFrame()) {
             texDistantBlend = PostShaders::borrowBuffer(0);
             isRenderCached = true;
         }

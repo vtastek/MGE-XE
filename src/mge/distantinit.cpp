@@ -34,6 +34,7 @@ bool DistantLand::cacheOnlyMode = false;
 bool DistantLand::earlyWalkedCache = false;
 bool DistantLand::renderThreadJobKicked = false;
 bool DistantLand::earlyForgeKickoff = false;
+bool DistantLand::menuFreeze = false;
 bool DistantLand::earlyCulledGrass = false;
 // Branch A (lead-in shrink): boot HOST-CULL-ONLY. The host's two-phase Hi-Z GPU cull owns
 // occlusion, which lets frameSetupEarly skip the ~1.4ms main-thread MSOC classify entirely —
