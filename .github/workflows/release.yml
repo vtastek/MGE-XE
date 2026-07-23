@@ -25,7 +25,7 @@ permissions:
 
 env:
   MWSE_REF_DEFAULT: '5bfc121ad3e56745792c70895931edf88aaf5ce7'
-  VULKAN_VERSION: '1.4.313.2'
+  VULKAN_VERSION: '1.4.350.0'
   D3DX_NUGET_VERSION: '9.29.952.8'
 
 jobs:
@@ -81,11 +81,15 @@ jobs:
           Invoke-WebRequest -Uri $url -OutFile vulkan-sdk-installer.exe
 
       # mgecore (x86) needs the Vulkan headers (dxvk_interop.h); mgeHost64 links
-      # vulkan-1.lib. Projects pin C:\VulkanSDK\<version>, the installer default.
+      # vulkan-1.lib. The projects read $(VULKAN_SDK) (not a hardcoded version), so
+      # export it for the build steps: GitHub Actions snapshots the environment at job
+      # start, so the VULKAN_SDK the installer writes to the registry is NOT visible to
+      # later steps. The install path is the installer default C:\VulkanSDK\<version>.
       - name: Install Vulkan SDK
         run: |
           Start-Process -Wait -FilePath .\vulkan-sdk-installer.exe -ArgumentList '--accept-licenses','--default-answer','--confirm-command','install'
           if (-not (Test-Path "C:\VulkanSDK\$env:VULKAN_VERSION\Include\vulkan\vulkan.h")) { throw "Vulkan SDK install failed" }
+          Add-Content -Path $env:GITHUB_ENV -Value "VULKAN_SDK=C:\VulkanSDK\$env:VULKAN_VERSION"
 
       - name: Add MSBuild to PATH
         uses: microsoft/setup-msbuild@v2
