@@ -52,6 +52,9 @@ namespace {
     IPC::Client* g_client = nullptr;
     bool   g_initOk  = false;
     bool   g_enabled = true;           // composite ON by default; F11 toggles it OFF/ON
+    IDirect3DTexture9* g_sunDX9Texture = nullptr;  // real tex MW binds for the sun disc; set by the
+                                                   // sky-list build, read by inspectIndexedPrimitive
+                                                   // to suppress MW's double-drawn sun (see header)
     int    g_debugMode = 0;            // F12 diagnostic cycle: 0=normal, 1=depth (world-distance), 2=scatter, 3=AO, 4=bent normal
     unsigned g_frame = 0;
 
@@ -2826,6 +2829,9 @@ namespace {
             // WT2: tell the Forge reflection pass which shape is the sun, so it can re-face the disc
             // for the mirrored view (the world above faces the MAIN camera → squashed once mirrored).
             item.isSunDisc = isSunDisc ? 1u : 0u;
+            // Publish the sun's real D3D9 texture so inspectIndexedPrimitive can reject MW's own
+            // sun draw (the double-sun seam). e.d3dTexture is non-null here — isSunDisc requires it.
+            if (isSunDisc) { g_sunDX9Texture = e.d3dTexture; }
             // CAMERA-RELATIVE: the sky is camera-attached; shift by -eye to match the host's
             // translation-free viewProj (see buildDrawList) and keep vertex math near the origin.
             item.world[12] -= DistantLand::eyePos.x;
@@ -4967,6 +4973,10 @@ namespace RenderProcess {
         // overwritten by the composite, so MGE suppresses them. F11 off (or a dead host / failed
         // seam → g_initOk false) releases every suppression and MW renders vanilla.
         return g_initOk && g_enabled;
+    }
+
+    IDirect3DTexture9* sunDX9Texture() {
+        return g_sunDX9Texture;
     }
 
     bool hasCompositeFrame() {

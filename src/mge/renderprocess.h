@@ -148,6 +148,16 @@ namespace RenderProcess {
     // failed seam falls back to (g_initOk false), and it is the ONLY fallback.
     bool forgeOwnsFrame();
 
+    // The real IDirect3DTexture9* MW binds for the sun disc (tx_sun_05), recorded by the sky-list
+    // build. MW's sky passthrough (inspectIndexedPrimitive) draws the sun AND the host draws it too;
+    // where the host's semi-transparent lower dome band lets MW bleed through the composite, the two
+    // suns ADD — a bright horizontal seam across the disc at the fog line ("double sun", reported
+    // 2026-07-23). inspectIndexedPrimitive matches rs->texture against this and rejects MW's copy so
+    // the host's sun is the only one. Pointer identity (not a name) targets tx_sun_05 exactly and
+    // never a fade quad / loading bar. null until the first sky build records it (one frame of double
+    // at cell load — negligible).
+    IDirect3DTexture9* sunDX9Texture();
+
     // True when g_mainTex holds a host frame the composite can re-show. The menu freeze
     // (DistantLand::menuFreeze) requires it: with no valid frame there is nothing to re-blit and
     // freezing would leave the world blank. Also false after a host death / failed finish, which is
