@@ -53,31 +53,16 @@ bool DistantLand::hostCullOnly = false;
 // sorted alpha (tasks/forge-world-particles.md) — not enough to justify shipping an engine-state
 // change by default. Opt in per root from the Forge Dev imgui panel.
 int  DistantLand::mwWorldSuppress = 0;
-std::vector<D3DXVECTOR4> DistantLand::reflectionWaterRects;
-bool DistantLand::reflWaterCullActive = true;
-bool DistantLand::reflGateWanted = false;
-bool DistantLand::reflStaticsWanted = false;
 bool DistantLand::boxOccluderDebug = false;
 int  DistantLand::debugOverlayCycle = 0;
-bool DistantLand::debugReflFrustum = false;
-std::vector<DistantLand::ReflCacheDbgBox> DistantLand::reflCacheDbg;
-D3DXMATRIX DistantLand::reflDbgViewProj;
-bool DistantLand::reflDbgValid = false;
-bool DistantLand::reflVisible = false;
-D3DXMATRIX  DistantLand::reflCullViewProj;
-D3DXMATRIX  DistantLand::reflCullProj;
-D3DXVECTOR4 DistantLand::reflCullViewSphere;
-VisibleSet<StlVector> DistantLand::reflectionSurvivors;
-int DistantLand::numWaterVerts, DistantLand::numWaterTris;
 
 IDirect3DDevice9* DistantLand::device;
 ID3DXEffect* DistantLand::effect;
-ID3DXEffect* DistantLand::effectShadow;
 ID3DXEffect* DistantLand::effectDepth;
 ID3DXEffectPool* DistantLand::effectPool;
 IDirect3DVertexDeclaration9* DistantLand::LandDecl;
 IDirect3DVertexDeclaration9* DistantLand::StaticDecl;
-IDirect3DVertexDeclaration9* DistantLand::WaterDecl;
+IDirect3DVertexDeclaration9* DistantLand::PosOnlyDecl;
 IDirect3DVertexDeclaration9* DistantLand::GrassDecl;
 
 VendorSpecificRendering DistantLand::vsr;
@@ -95,14 +80,12 @@ VisibleSet<StlVector> DistantLand::visDistantSurvivors;
 VisibleSet<IpcClientVector> DistantLand::visLandShared;
 VisibleSet<IpcClientVector> DistantLand::visDistantShared;
 VisibleSet<IpcClientVector> DistantLand::visGrassShared;
-VisibleSet<IpcClientVector> DistantLand::visExtraShared;
 IPC::VecView<IPC::DynVisFlag> DistantLand::dynVisFlagsShared;
 IPC::VecView<OcclusionMask::MaskChunk> DistantLand::maskBlobShared;
 
 IPC::VecId DistantLand::visLandSharedId = IPC::InvalidVector;
 IPC::VecId DistantLand::visDistantSharedId = IPC::InvalidVector;
 IPC::VecId DistantLand::visGrassSharedId = IPC::InvalidVector;
-IPC::VecId DistantLand::visExtraSharedId = IPC::InvalidVector;
 IPC::VecId DistantLand::dynVisFlagsSharedId = IPC::InvalidVector;
 IPC::VecId DistantLand::maskBlobSharedId = IPC::InvalidVector;
 
@@ -116,86 +99,9 @@ IDirect3DTexture9* DistantLand::texWorldColour, *DistantLand::texWorldNormals, *
 IDirect3DTexture9* DistantLand::texDepthFrame;
 IDirect3DSurface9* DistantLand::surfDepthDepth;
 IDirect3DTexture9* DistantLand::texDistantBlend;
-IDirect3DTexture9* DistantLand::texReflection;
-IDirect3DSurface9* DistantLand::surfReflectionZ;
-IDirect3DVolumeTexture9* DistantLand::texWater;
-IDirect3DVertexBuffer9* DistantLand::vbWater;
-IDirect3DIndexBuffer9* DistantLand::ibWater;
 IDirect3DVertexBuffer9* DistantLand::vbGrassInstances;
 
-IDirect3DVertexBuffer9* DistantLand::vbWaterLod;
-IDirect3DIndexBuffer9* DistantLand::ibWaterLod;
-int DistantLand::numWaterLodVerts;
-std::vector<DistantLand::WaterLodLevel> DistantLand::waterLodLevels;
-bool DistantLand::waterLodMeshOn = true;
-float DistantLand::waterWaveAmp = 32.0f;
-float DistantLand::waterWaveLen = 3000.0f;
-float DistantLand::waterWaveSpeed = 1.0f;
-float DistantLand::waterCrestSpread = 0.5f;
-
-IDirect3DTexture9* DistantLand::texRain;
-IDirect3DTexture9* DistantLand::texRipples;
-IDirect3DTexture9* DistantLand::texRippleBuffer;
-IDirect3DSurface9* DistantLand::surfRain;
-IDirect3DSurface9* DistantLand::surfRipples;
-IDirect3DSurface9* DistantLand::surfRippleBuffer;
-IDirect3DVertexBuffer9* DistantLand::vbWaveSim;
-IDirect3DVertexBuffer9* DistantLand::vbFoamSim;
-
-IDirect3DTexture9* DistantLand::texFlow;
-bool DistantLand::waterFlowDebugOn = true;
-int  DistantLand::waterFlowDebugView = 0;
-float DistantLand::waterFlowScroll = 0.4f;
-float DistantLand::waterFlowSeaSpeed = 1.0f;
-float DistantLand::waterFlowCycleUV = 4.0f;
-float DistantLand::waterFlowSeaRefract = 1.0f;
-float DistantLand::waterFlowWarp = 64.0f;
-
-IDirect3DTexture9* DistantLand::texFoamP_A[DistantLand::foamCascades];
-IDirect3DTexture9* DistantLand::texFoamP_B[DistantLand::foamCascades];
-IDirect3DTexture9* DistantLand::texFoamField[DistantLand::foamCascades];
-IDirect3DTexture9* DistantLand::texFoam[DistantLand::foamCascades];
-IDirect3DSurface9* DistantLand::surfFoamP_A[DistantLand::foamCascades];
-IDirect3DSurface9* DistantLand::surfFoamP_B[DistantLand::foamCascades];
-IDirect3DSurface9* DistantLand::surfFoamField[DistantLand::foamCascades];
-IDirect3DSurface9* DistantLand::surfFoam[DistantLand::foamCascades];
-IDirect3DTexture9* DistantLand::texFoamUV_A[DistantLand::foamCascades];
-IDirect3DTexture9* DistantLand::texFoamUV_B[DistantLand::foamCascades];
-IDirect3DSurface9* DistantLand::surfFoamUV_A[DistantLand::foamCascades];
-IDirect3DSurface9* DistantLand::surfFoamUV_B[DistantLand::foamCascades];
-int   DistantLand::foamLastXpos[DistantLand::foamCascades];
-int   DistantLand::foamLastYpos[DistantLand::foamCascades];
-float DistantLand::foamOriginC[DistantLand::foamCascades][2];
-bool DistantLand::foamSimReset = true;
-bool DistantLand::waterFoamOn = true;
-bool DistantLand::foamDebugView = false;
-// Single-carrier foam tuning (cascades collapsed to one). Tune live via the NUMPAD8 cycle.
-float DistantLand::foamFlowForce[foamCascades] = { 1.5f };
-float DistantLand::foamDecay[foamCascades]     = { 0.94f };
-float DistantLand::foamPressure[foamCascades]  = { 0.1f };
-float DistantLand::foamScale[foamCascades]     = { 6.7f };
-// Two-layer foam defaults: 32u fbm cells (fine streaks), FoamSpeed 1.0 (far-layer advect rate
-// = ×river flow), erode threshold 0.35 (crisp edge), far-layer strength 1.0.
-float DistantLand::foamDetailTile     = 160.0f;
-float DistantLand::foamDetailSpeed    = 0.6f;
-float DistantLand::foamErodeThreshold = 0.98f;
-float DistantLand::foamFarAmount      = 1.0f;
-float DistantLand::foamMix            = 0.5f;
-float DistantLand::foamGaussRadius    = 4.0f;
-float DistantLand::foamMinDensity     = 0.4f;
-float DistantLand::foamUVDecay        = 0.97f;
-float DistantLand::foamSimSpeed       = 1.0f;
-float DistantLand::foamVortGain        = 4.0f;
-float DistantLand::foamFineScale       = 5.0f;
-float DistantLand::foamFineAmt         = 0.6f;
-float DistantLand::foamCoarseScale     = 3.0f;
-float DistantLand::foamCoarseAmt       = 0.5f;
-
-IDirect3DTexture9* DistantLand::texShadow;
-IDirect3DTexture9* DistantLand::texSoftShadow;
-IDirect3DSurface9* DistantLand::surfShadowZ;
 IDirect3DVertexBuffer9* DistantLand::vbFullFrame;
-IDirect3DVertexBuffer9* DistantLand::vbClipCube;
 
 D3DXMATRIX DistantLand::mwView, DistantLand::mwProj;
 D3DXMATRIX DistantLand::smView[2], DistantLand::smProj[2];
@@ -255,54 +161,11 @@ D3DXHANDLE DistantLand::ehFogNearStart;
 D3DXHANDLE DistantLand::ehFogNearRange;
 D3DXHANDLE DistantLand::ehNearViewRange;
 D3DXHANDLE DistantLand::ehStaticNearCull;
-D3DXHANDLE DistantLand::ehShadowReflMult;
 D3DXHANDLE DistantLand::ehLandNearCull;
-D3DXHANDLE DistantLand::ehReflWaterClip;
 D3DXHANDLE DistantLand::ehLightData, DistantLand::ehLightDataParams, DistantLand::ehLightIndices, DistantLand::ehTexLightView;
 D3DXHANDLE DistantLand::ehWindVec;
 D3DXHANDLE DistantLand::ehNiceWeather;
 D3DXHANDLE DistantLand::ehTime;
-D3DXHANDLE DistantLand::ehRippleOrigin;
-D3DXHANDLE DistantLand::ehWaveHeight;
-D3DXHANDLE DistantLand::ehFlow;
-D3DXHANDLE DistantLand::ehFlowTransform;
-D3DXHANDLE DistantLand::ehFlowWeight;
-D3DXHANDLE DistantLand::ehFlowScroll;
-D3DXHANDLE DistantLand::ehFlowSeaSpeed;
-D3DXHANDLE DistantLand::ehFlowCycleUV;
-D3DXHANDLE DistantLand::ehFlowSeaRefract;
-D3DXHANDLE DistantLand::ehFlowDebugView;
-D3DXHANDLE DistantLand::ehFlowWarp;
-D3DXHANDLE DistantLand::ehWaveAmp;
-D3DXHANDLE DistantLand::ehWaveLen;
-D3DXHANDLE DistantLand::ehWaveSpeed;
-D3DXHANDLE DistantLand::ehCrestSpread;
-D3DXHANDLE DistantLand::ehFoamParticles;
-D3DXHANDLE DistantLand::ehFoamFieldIn;
-D3DXHANDLE DistantLand::ehFoamOrigin;
-D3DXHANDLE DistantLand::ehFoamShift;
-D3DXHANDLE DistantLand::ehFoamFieldShift;
-D3DXHANDLE DistantLand::ehFoamPlayer;
-D3DXHANDLE DistantLand::ehFoamParams;
-D3DXHANDLE DistantLand::ehFoamWorldRes;
-D3DXHANDLE DistantLand::ehFoamAdvance;
-D3DXHANDLE DistantLand::ehFoam0;
-D3DXHANDLE DistantLand::ehFoamOrigin0;
-D3DXHANDLE DistantLand::ehFoamWeight;
-D3DXHANDLE DistantLand::ehFoamDetail;
-D3DXHANDLE DistantLand::ehFoamFarAmount;
-D3DXHANDLE DistantLand::ehFoamUVIn;
-D3DXHANDLE DistantLand::ehFoamUVRate;
-D3DXHANDLE DistantLand::ehFoamUVDecay;
-D3DXHANDLE DistantLand::ehFoamUVTex;
-D3DXHANDLE DistantLand::ehFoamGaussRadius;
-D3DXHANDLE DistantLand::ehFoamMinDensity;
-D3DXHANDLE DistantLand::ehFoamVortGain;
-D3DXHANDLE DistantLand::ehFoamFineScale;
-D3DXHANDLE DistantLand::ehFoamFineAmt;
-D3DXHANDLE DistantLand::ehFoamCoarseScale;
-D3DXHANDLE DistantLand::ehFoamCoarseAmt;
-
 std::function<void(IDirect3DSurface9*)> DistantLand::captureScreenHandler = nullptr;
 bool DistantLand::captureScreenWithUI;
 
@@ -383,7 +246,7 @@ static void captureLandMesh(
 
 
 // Water plane vertex declaration
-const D3DVERTEXELEMENT9 WaterElem[] = {
+const D3DVERTEXELEMENT9 PosOnlyElem[] = {
     {0, 0,  D3DDECLTYPE_FLOAT3, D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_POSITION, 0},
     D3DDECL_END()
 };
@@ -457,14 +320,6 @@ bool DistantLand::init() {
         return false;
     }
 
-    if (!initShadow()) {
-        return false;
-    }
-
-    if (!initWater()) {
-        return false;
-    }
-
     if (!initLandscape()) {
         return false;
     }
@@ -535,13 +390,8 @@ bool DistantLand::initIpc() {
     visGrassSharedId = grassVec.id();
     visGrassShared.SetVector((IpcClientVector(grassVec)));
 
-    auto maybeExtraVec = ipcClient.allocVecBlocking<RenderMesh>(1, 200000, 1);
-    if (!maybeExtraVec.has_value()) {
-        return false;
-    }
-    auto& extraVec = maybeExtraVec.value();
-    visExtraSharedId = extraVec.id();
-    visExtraShared.SetVector((IpcClientVector(extraVec)));
+    // S3: a 4th 200k-RenderMesh shared vector (visExtraShared) was allocated here for
+    // the water-reflection statics query. Nothing fills or reads it now.
 
     auto maybeDynVisVec = ipcClient.allocVecBlocking<IPC::DynVisFlag>(1, 1000, 1);
     if (!maybeDynVisVec.has_value()) {
@@ -806,9 +656,7 @@ bool DistantLand::initShader() {
     ehFogNearRange = effect->GetParameterByName(0, "nearFogRange");
     ehNearViewRange = effect->GetParameterByName(0, "nearViewRange");
     ehStaticNearCull = effect->GetParameterByName(0, "staticNearCull");
-    ehShadowReflMult = effect->GetParameterByName(0, "shadowReflMult");
     ehLandNearCull = effect->GetParameterByName(0, "landNearCull");
-    ehReflWaterClip = effect->GetParameterByName(0, "reflWaterClipPlane");
     ehLightData = effect->GetParameterByName(0, "texLightData");
     ehLightDataParams = effect->GetParameterByName(0, "lightDataParams");
     ehLightIndices = effect->GetParameterByName(0, "lightIndices");
@@ -821,11 +669,7 @@ bool DistantLand::initShader() {
     device->GetViewport(&vp);
     float rcpres[2] = { 1.0f / vp.Width, 1.0f / vp.Height };
     effect->SetFloatArray(ehRcpRes, rcpres, 2);
-    effect->SetFloat(ehShadowRcpRes, 1.0f / Configuration.DL.ShadowResolution);
 
-    if (!createCoreEffectWithMods("XE Shadowmap.fx", device, features, effectPool, &effectShadow, false)) {
-        return false;
-    }
     if (!createCoreEffectWithMods("XE Depth.fx", device, features, effectPool, &effectDepth, false)) {
         return false;
     }
@@ -846,58 +690,8 @@ bool DistantLand::initShader() {
         ehSkyScatterFar = 0;
     }
 
-    // Dynamic ripples specific parameters
-    if (Configuration.MGEFlags & DYNAMIC_RIPPLES) {
-        ehTex4 = effect->GetParameterByName(0, "tex4");
-        ehTex5 = effect->GetParameterByName(0, "tex5");
-        ehRippleOrigin = effect->GetParameterByName(0, "rippleOrigin");
-        ehWaveHeight = effect->GetParameterByName(0, "waveHeight");
-    }
-
-    // Water flow map parameters
-    if (Configuration.UseWaterFlowMap) {
-        ehFlow = effect->GetParameterByName(0, "texFlow");
-        ehFlowTransform = effect->GetParameterByName(0, "flowMapTransform");
-        ehFlowWeight = effect->GetParameterByName(0, "flowMapWeight");
-        ehFlowScroll = effect->GetParameterByName(0, "flowScrollSpeed");
-        ehFlowSeaSpeed = effect->GetParameterByName(0, "flowSeaSpeed");
-        ehFlowCycleUV = effect->GetParameterByName(0, "flowCycleUV");
-        ehFlowSeaRefract = effect->GetParameterByName(0, "flowSeaRefract");
-        ehFlowDebugView = effect->GetParameterByName(0, "flowDebugView");
-        ehFlowWarp = effect->GetParameterByName(0, "flowMapWarp");
-        // Flow-steered crest displacement uniforms (WATER_LOD_MESH).
-        ehWaveAmp = effect->GetParameterByName(0, "waveAmp");
-        ehWaveLen = effect->GetParameterByName(0, "waveLen");
-        ehWaveSpeed = effect->GetParameterByName(0, "waveSpeed");
-        ehCrestSpread = effect->GetParameterByName(0, "crestSpread");
-        // World-anchored particle foam sim uniforms (WATER_FOAM).
-        ehFoamParticles = effect->GetParameterByName(0, "texFoamParticles");
-        ehFoamFieldIn = effect->GetParameterByName(0, "texFoamFieldIn");
-        ehFoamOrigin = effect->GetParameterByName(0, "foamOrigin");
-        ehFoamShift = effect->GetParameterByName(0, "foamShiftPx");
-        ehFoamFieldShift = effect->GetParameterByName(0, "foamFieldShift");
-        ehFoamPlayer = effect->GetParameterByName(0, "foamPlayer");
-        ehFoamParams = effect->GetParameterByName(0, "foamParams");
-        ehFoamWorldRes = effect->GetParameterByName(0, "foamWorldRes");   // sim-side, set per cascade
-        ehFoamAdvance = effect->GetParameterByName(0, "foamAdvance");      // per-microstep texel advance (≤1)
-        // Consume side: both cascades bound at once (fine + coarse).
-        ehFoam0 = effect->GetParameterByName(0, "texFoam0");          // single carrier
-        ehFoamOrigin0 = effect->GetParameterByName(0, "foamOrigin0");
-        ehFoamWeight = effect->GetParameterByName(0, "foamWeight");
-        ehFoamDetail = effect->GetParameterByName(0, "foamDetail");
-        ehFoamFarAmount = effect->GetParameterByName(0, "foamFarAmount");
-        ehFoamUVIn = effect->GetParameterByName(0, "texFoamUVIn");    // sim ping-pong source
-        ehFoamUVRate = effect->GetParameterByName(0, "foamUVRate");
-        ehFoamUVDecay = effect->GetParameterByName(0, "foamUVDecay");
-        ehFoamUVTex = effect->GetParameterByName(0, "texFoamUV");     // consume: advected offset field
-        ehFoamGaussRadius = effect->GetParameterByName(0, "foamGaussRadius");
-        ehFoamMinDensity = effect->GetParameterByName(0, "foamMinDensity");
-        ehFoamVortGain = effect->GetParameterByName(0, "foamVortGain");
-        ehFoamFineScale = effect->GetParameterByName(0, "foamFineScale");
-        ehFoamFineAmt = effect->GetParameterByName(0, "foamFineAmt");
-        ehFoamCoarseScale = effect->GetParameterByName(0, "foamCoarseScale");
-        ehFoamCoarseAmt = effect->GetParameterByName(0, "foamCoarseAmt");
-    }
+    // S3: dynamic-ripple, water-flow-map and foam-sim uniforms were resolved here.
+    // Their whole subsystem went with MGE's water renderer.
 
     return true;
 }
@@ -921,491 +715,26 @@ bool DistantLand::initDepth() {
         return false;
     }
 
-    return true;
-}
-
-bool DistantLand::initWater() {
-    HRESULT hr;
-    const UINT reflRes = 1024;
-
-    // Reflection render target
-    hr = device->CreateTexture(reflRes, reflRes, 1, D3DUSAGE_RENDERTARGET, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT, &texReflection, NULL);
-    if (hr != D3D_OK) {
-        LOG::logline("!! Failed to create reflection render target");
+    if (FAILED(device->CreateVertexDeclaration(PosOnlyElem, &PosOnlyDecl))) {
+        LOG::logline("!! Failed to create position-only vertex declaration");
         return false;
     }
 
-    // Reflection Z-buffer
-    hr = device->CreateDepthStencilSurface(reflRes, reflRes, D3DFMT_D24X8, D3DMULTISAMPLE_NONE, 0, TRUE, &surfReflectionZ, NULL);
-    if (hr != D3D_OK) {
-        LOG::logline("!! Failed to create reflection Z buffer");
-        return false;
-    }
-
-    // Water normals and geometry
-    const int resS = (Configuration.MGEFlags & DYNAMIC_RIPPLES) ? 150 : 16;
-    const int resT = (Configuration.MGEFlags & DYNAMIC_RIPPLES) ? 120 : 15;
-    numWaterVerts = resS * resT + 1;
-    numWaterTris = 2 * resS * resT - resS;
-
-    hr = D3DXCreateVolumeTextureFromFile(device, "Data Files\\textures\\MGE\\water_NRM.dds", &texWater);
-    if (hr != D3D_OK) {
-        LOG::logline("!! Failed to load water texture");
-        return false;
-    }
-    hr = device->CreateVertexDeclaration(WaterElem, &WaterDecl);
-    if (hr != D3D_OK) {
-        LOG::logline("!! Failed to create water decl");
-        return false;
-    }
-    hr = device->CreateVertexBuffer(numWaterVerts * 12, 0, 0, g_spikeForceDefaultPool ? D3DPOOL_DEFAULT : D3DPOOL_MANAGED, &vbWater, 0);
-    if (hr != D3D_OK) {
-        LOG::logline("!! Failed to create water verts");
-        return false;
-    }
-    hr = device->CreateIndexBuffer(numWaterTris * 6, 0, D3DFMT_INDEX16, g_spikeForceDefaultPool ? D3DPOOL_DEFAULT : D3DPOOL_MANAGED, &ibWater, 0);
-    if (hr != D3D_OK) {
-        LOG::logline("!! Failed to create water indices");
-        return false;
-    }
-
-    // Build radial water mesh
-    D3DXVECTOR3* v;
-    vbWater->Lock(0, 0, (void**)&v, 0);
-
-    // Water plane lies at water level - 1.0 (not -4.0, which is the fog transition)
-    const float dS = float(6.28318530717958647692 / resS);
-    int s, t;
-    float r, w = -1.0f;
-
-    *v++ = D3DXVECTOR3(0, 0, w);
-    for (t = 0; t < resT; ++t) {
-        if (Configuration.MGEFlags & DYNAMIC_RIPPLES) {
-            // Higher mesh density near player
-            // The mesh requires density past 8192 units to cover the z discontinuity at distant land
-            r = float(t) / float(resT);
-            r = 9600.0f * (0.9f * powf(r, 3) + 0.1f * r);
-            // Extend last ring past horizon
-            if ((t+1) == resT) {
-                r = 500000.0f;
-            }
-        } else {
-            r = 4096.0f * (1.0f + t * t);
-        }
-
-        for (s = 0; s < resS; ++s) {
-            *v++ = D3DXVECTOR3(r * cos(dS * s), r * sin(dS * s), w);
-        }
-    }
-
-    vbWater->Unlock();
-
-    USHORT* i;
-    ibWater->Lock(0, 0, (void**)&i, 0);
-
-    // Centre triangles
-    for (s = 0; s < resS; ++s) {
-        *i++ = 0;
-        *i++ = 1 + s;
-        *i++ = 1 + (s+1) % resS;
-    }
-    // Rings
-    for (t = 1; t < resT; ++t) {
-        for (s = 0; s < resS; ++s) {
-            USHORT tbase = 1 + resS*(t-1), s2 = (s+1) % resS;
-            *i++ = tbase + s;
-            *i++ = resS + tbase + s;
-            *i++ = tbase + s2;
-            *i++ = resS + tbase+ s;
-            *i++ = resS + tbase + s2;
-            *i++ = tbase + s2;
-        }
-    }
-
-    ibWater->Unlock();
-
-    // World-snapped LOD water mesh (gated by the flow map; A/B vs radial at runtime).
-    if (Configuration.UseWaterFlowMap) {
-        if (!initWaterLodMesh()) {
-            return false;
-        }
-        // World-anchored hybrid particle foam sim RTs (WATER_FOAM).
-        if (!initFoamSim()) {
-            return false;
-        }
-    }
-
-    if (Configuration.MGEFlags & DYNAMIC_RIPPLES) {
-        // Setup water simulation
-        if (!initDynamicWaves()) {
-            return false;
-        }
-
-        // Disable Morrowind generated ripples
-        MWBridge::get()->toggleRipples(false);
-    }
-
-    return true;
-}
-
-// Build the world-snapped nested-grid (geo-clipmap) water mesh. L concentric LOD
-// levels: level 0 is a solid m x m patch of the finest cells; levels 1..L-1 are
-// square annulus rings whose central hole is the footprint of the next-finer level.
-// Vertices are stored in LOCAL integer grid units (centred on 0); renderWaterPlane
-// supplies cell size + world snap per level, so one static VB/IB serves every frame.
-//
-// Two crack fixes vs the naive nested rings:
-//  A. Flexible interior trim. Each finer level snaps in finer steps than the coarse
-//     hole, so the hole must shift by e=(ex,ey) in {0,1} coarse cells to nest exactly.
-//     We bake 4 hole variants per ring level; the draw picks one from the eye parity.
-//  B. Stitched transition row. A level's outer edge is retriangulated at the coarser
-//     neighbour's spacing (2*cellSize) so the shared boundary carries no un-shared
-//     midpoint vertex -> no T-junction. The outer ring is hole-independent, so the
-//     stitched annulus is emitted into every trim variant (one draw per level).
-// Heights come from WaterVS (continuous in world XY), so coincident boundary verts
-// evaluate the same height -> watertight. Geometry-only; the shader is untouched.
-bool DistantLand::initWaterLodMesh() {
-    const int   L  = 6;        // LOD levels
-    const float c0 = 128.0f;   // finest cell size (world units) — ~4 verts across a 512u flow cell
-    const int   m  = 64;       // grid cells per side per level (even)
-    const int   verts1D = m + 1;
-    const int   half = m / 2;
-
-    HRESULT hr;
-    waterLodLevels.clear();
-    waterLodLevels.reserve(L);
-
-    // Full grid per level; hole/ring verts kept for trivial indexing (16-bit safe).
-    numWaterLodVerts = L * verts1D * verts1D;
-
-    hr = device->CreateVertexBuffer(numWaterLodVerts * 12, 0, 0, g_spikeForceDefaultPool ? D3DPOOL_DEFAULT : D3DPOOL_MANAGED, &vbWaterLod, 0);
-    if (hr != D3D_OK) {
-        LOG::logline("!! Failed to create LOD water verts");
-        return false;
-    }
-
-    // Vertices: local integer lattice in [-half, half] on both axes, plane at z=-1.
-    D3DXVECTOR3* v;
-    vbWaterLod->Lock(0, 0, (void**)&v, 0);
-    for (int k = 0; k < L; ++k) {
-        for (int gy = 0; gy <= m; ++gy) {
-            for (int gx = 0; gx <= m; ++gx) {
-                *v++ = D3DXVECTOR3(float(gx - half), float(gy - half), -1.0f);
-            }
-        }
-    }
-    vbWaterLod->Unlock();
-
-    // Indices grow with the stitch + 4 trim variants, so build into a list then size
-    // the IB exactly. ~0.8 MB managed; built once, static thereafter.
-    std::vector<USHORT> indices;
-    indices.reserve(400000);
-
-    int vertBase = 0;
-    auto vidx = [&](int gx, int gy) -> USHORT {
-        return USHORT(vertBase + gy * verts1D + gx);
-    };
-    // Emit one triangle, forcing CCW winding in local XY. Height is added by the VS,
-    // so signed area on the z=-1 plane is constant and decides orientation; this lets
-    // the corner/edge helpers ignore reflection-induced winding flips.
-    auto addTri = [&](int ax, int ay, int bx, int by, int cx, int cy) {
-        long cross = long(bx - ax) * (cy - ay) - long(by - ay) * (cx - ax);
-        USHORT ia = vidx(ax, ay), ib = vidx(bx, by), ic = vidx(cx, cy);
-        if (cross < 0) std::swap(ib, ic);
-        indices.push_back(ia); indices.push_back(ib); indices.push_back(ic);
-    };
-    // Regular fine cell: two triangles.
-    auto addCell = [&](int cx, int cy) {
-        addTri(cx, cy, cx + 1, cy, cx + 1, cy + 1);
-        addTri(cx, cy, cx + 1, cy + 1, cx, cy + 1);
-    };
-    // Transition edge block: two outer cells collapsed so the outer boundary spans
-    // one coarse edge A-C (odd outer vertex B dropped). (ax,ay)=outer-left vertex,
-    // (tx,ty)=+1 tangent step along the edge, (nx,ny)=+1 inward normal.
-    auto addEdgeBlock = [&](int ax, int ay, int tx, int ty, int nx, int ny) {
-        int Ax = ax,                Ay = ay;
-        int Cx = ax + 2 * tx,       Cy = ay + 2 * ty;
-        int Apx = ax + nx,          Apy = ay + ny;
-        int Bpx = ax + tx + nx,     Bpy = ay + ty + ny;
-        int Cpx = ax + 2 * tx + nx, Cpy = ay + 2 * ty + ny;
-        addTri(Ax, Ay, Cx, Cy, Bpx, Bpy);
-        addTri(Ax, Ay, Bpx, Bpy, Apx, Apy);
-        addTri(Cx, Cy, Cpx, Cpy, Bpx, Bpy);
-    };
-    // Transition corner: 2x2 block whose two grid-boundary edges are coarse.
-    // (cgx,cgy)=outer corner vertex, (dx,dy)=inward signs. Six triangles tile the
-    // block; the two odd boundary midpoints are never referenced on the outer edges.
-    auto addCorner = [&](int cgx, int cgy, int dx, int dy) {
-        int Ox = cgx,          Oy = cgy;            // outer corner
-        int Bx = cgx + 2 * dx, By = cgy;            // coarse edge 1 far end
-        int Tx = cgx,          Ty = cgy + 2 * dy;   // coarse edge 2 far end
-        int Mx = cgx + dx,     My = cgy + dy;       // centre
-        int Rx = cgx + 2 * dx, Ry = cgy + dy;
-        int Sx = cgx + 2 * dx, Sy = cgy + 2 * dy;   // inner corner
-        int Ux = cgx + dx,     Uy = cgy + 2 * dy;
-        addTri(Ox, Oy, Bx, By, Mx, My);
-        addTri(Ox, Oy, Mx, My, Tx, Ty);
-        addTri(Bx, By, Rx, Ry, Mx, My);
-        addTri(Rx, Ry, Sx, Sy, Mx, My);
-        addTri(Mx, My, Sx, Sy, Ux, Uy);
-        addTri(Mx, My, Ux, Uy, Tx, Ty);
-    };
-    // Stitched outer annulus: 4 corners + 4 transition edges between them. Hole-
-    // independent, so identical in every trim variant.
-    auto addOuterStitch = [&]() {
-        addCorner(0, 0, +1, +1);
-        addCorner(m, 0, -1, +1);
-        addCorner(0, m, +1, -1);
-        addCorner(m, m, -1, -1);
-        for (int c = 2; c <= m - 4; c += 2) {
-            addEdgeBlock(c, 0, 1, 0,  0,  1);   // bottom
-            addEdgeBlock(c, m, 1, 0,  0, -1);   // top
-            addEdgeBlock(0, c, 0, 1,  1,  0);   // left
-            addEdgeBlock(m, c, 0, 1, -1,  0);   // right
-        }
-    };
-
-    for (int k = 0; k < L; ++k) {
-        const bool stitch = (k < L - 1);          // every level but the outermost
-        const int  numVar = (k == 0) ? 1 : 4;     // level 0 is solid (no hole)
-
-        WaterLodLevel lvl;
-        lvl.cellSize    = c0 * float(1 << k);
-        lvl.vertBase    = vertBase;
-        lvl.vertCount   = verts1D * verts1D;
-        lvl.numVariants = numVar;
-        for (int i = 0; i < 4; ++i) { lvl.ibStart[i] = 0; lvl.triCount[i] = 0; }
-
-        for (int vrt = 0; vrt < numVar; ++vrt) {
-            const int ex = vrt & 1;
-            const int ey = (vrt >> 1) & 1;
-            // Flexible-trim hole = next-finer level's footprint, shifted by parity so
-            // it nests exactly. Always inside [2, m-2), away from the stitched ring.
-            const int holeLoX = (m / 4) + ex, holeHiX = (3 * m / 4) + ex;
-            const int holeLoY = (m / 4) + ey, holeHiY = (3 * m / 4) + ey;
-
-            const size_t startIdx = indices.size();
-            lvl.ibStart[vrt] = int(startIdx);
-
-            // Interior fine cells. Skip the outer ring on stitched levels (emitted by
-            // addOuterStitch) and the central hole on ring levels.
-            for (int cy = 0; cy < m; ++cy) {
-                for (int cx = 0; cx < m; ++cx) {
-                    if (stitch) {
-                        const bool corner = (cx <= 1 || cx >= m - 2) && (cy <= 1 || cy >= m - 2);
-                        const bool bedge  = (cy == 0 || cy == m - 1) && (cx >= 2 && cx <= m - 3);
-                        const bool vedge  = (cx == 0 || cx == m - 1) && (cy >= 2 && cy <= m - 3);
-                        if (corner || bedge || vedge) continue;   // stitched ring
-                    }
-                    if (k > 0 && cx >= holeLoX && cx < holeHiX && cy >= holeLoY && cy < holeHiY) {
-                        continue;   // hole = next-finer level's footprint
-                    }
-                    addCell(cx, cy);
-                }
-            }
-
-            if (stitch) {
-                addOuterStitch();
-            }
-
-            lvl.triCount[vrt] = int((indices.size() - startIdx) / 3);
-        }
-
-        waterLodLevels.push_back(lvl);
-        vertBase += verts1D * verts1D;
-    }
-
-    const int totalTris = int(indices.size() / 3);
-    hr = device->CreateIndexBuffer(int(indices.size()) * 2, 0, D3DFMT_INDEX16, g_spikeForceDefaultPool ? D3DPOOL_DEFAULT : D3DPOOL_MANAGED, &ibWaterLod, 0);
-    if (hr != D3D_OK) {
-        LOG::logline("!! Failed to create LOD water indices");
-        return false;
-    }
-    USHORT* idx;
-    ibWaterLod->Lock(0, 0, (void**)&idx, 0);
-    std::copy(indices.begin(), indices.end(), idx);
-    ibWaterLod->Unlock();
-
-    LOG::logline("-- Water LOD mesh: %d levels, %d verts, %d tris (finest cell %.0fu, reach %.0fu)",
-                 L, numWaterLodVerts, totalTris, c0, m * c0 * float(1 << (L - 1)));
-    return true;
-}
-
-bool DistantLand::initDynamicWaves() {
-    HRESULT hr;
-
-    hr = device->CreateTexture(waveTexResolution, waveTexResolution, 1, D3DUSAGE_RENDERTARGET, D3DFMT_A16B16G16R16F, D3DPOOL_DEFAULT, &texRain, NULL);
-    if (hr != D3D_OK) {
-        LOG::logline("!! Failed to create rain simulation texture");
-        return false;
-    }
-    texRain->GetSurfaceLevel(0, &surfRain);
-    device->ColorFill(surfRain, 0, 0);
-
-    hr = device->CreateTexture(waveTexResolution, waveTexResolution, 1, D3DUSAGE_RENDERTARGET, D3DFMT_A16B16G16R16F, D3DPOOL_DEFAULT, &texRipples, NULL);
-    if (hr != D3D_OK) {
-        LOG::logline("!! Failed to create ripple simulation texture");
-        return false;
-    }
-    texRipples->GetSurfaceLevel(0, &surfRipples);
-    device->ColorFill(surfRipples, 0, 0);
-
-    hr = device->CreateTexture(waveTexResolution, waveTexResolution, 1, D3DUSAGE_RENDERTARGET, D3DFMT_A16B16G16R16F, D3DPOOL_DEFAULT, &texRippleBuffer, NULL);
-    if (hr != D3D_OK) {
-        LOG::logline("!! Failed to create ripple simulation texture");
-        return false;
-    }
-    texRippleBuffer->GetSurfaceLevel(0, &surfRippleBuffer);
-    device->ColorFill(surfRippleBuffer, 0, 0);
-
-    // Vertex buffer for wave texture
-    static float waveVertices[] = {
-        /*     -0.5f,                    -0.5f,                                               0,1,   0,0,0,0,
-                -0.5f,                    waveTexResolution-0.5f,                 0,1,   0,1,0,1,
-                waveTexResolution-0.5f,    -0.5f,                                  0,1,   1,0,1,0,
-                waveTexResolution-0.5f,    waveTexResolution-0.5f,    0,1,   1,1,1,1 */
-
-        // Use only one tri over the whole texture to prevent simulation seams at tri edges
-        // Rendering to a surface that is bound as a source texture updates the texture after
-        // each primitive, causing artifacts to appear at primitive boundaries
-        -waveTexResolution/2  -0.5f,    waveTexResolution/2  -0.5f,  0,  1,     -0.5, 0.5,     0,0,
-        waveTexResolution        -0.5f,    2*waveTexResolution  -0.5f,  0,  1,      1.0, 2.0,      0,1,
-        waveTexResolution        -0.5f,    -waveTexResolution    -0.5f,  0,  1,     1.0, -1.0,     1,1
-    };
-
-    void* vp;
-    hr = device->CreateVertexBuffer(3 * 32, D3DUSAGE_WRITEONLY, fvfWave, D3DPOOL_DEFAULT, &vbWaveSim, 0);
-    if (hr != D3D_OK) {
-        LOG::logline("!! Failed to create wave simulation vb");
-        return false;
-    }
-    if (vbWaveSim->Lock(0, 0, (void**)&vp, 0) != D3D_OK) {
-        LOG::logline("!! Failed to lock wave simulation vb");
-        return false;
-    }
-    memcpy(vp, waveVertices, sizeof(waveVertices));
-    vbWaveSim->Unlock();
-
-    return true;
-}
-
-// World-anchored hybrid particle foam sim resources (WATER_FOAM). Four fp16 RGBA RTs
-// at foamTexResolution: two ping-pong particle buffers, one velocity/density field
-// buffer, one foam-output buffer sampled by the water shader. The sim itself reuses
-// the wave-sim fullscreen quad (vbWaveSim) + WaveVS, so no VB is created here.
-bool DistantLand::initFoamSim() {
-    HRESULT hr;
-    const int res = foamTexResolution;
-
-    // One full set of 4 RTs per cascade (fine + coarse); the resolution is shared.
-    for (int c = 0; c < foamCascades; ++c) {
-        struct { IDirect3DTexture9** tex; IDirect3DSurface9** surf; const char* name; } targets[] = {
-            { &texFoamP_A[c],   &surfFoamP_A[c],   "foam particle A" },
-            { &texFoamP_B[c],   &surfFoamP_B[c],   "foam particle B" },
-            { &texFoamField[c], &surfFoamField[c], "foam field" },
-            { &texFoam[c],      &surfFoam[c],      "foam output" },
-            { &texFoamUV_A[c],  &surfFoamUV_A[c],  "foam UV A" },
-            { &texFoamUV_B[c],  &surfFoamUV_B[c],  "foam UV B" },
-        };
-
-        for (auto& t : targets) {
-            hr = device->CreateTexture(res, res, 1, D3DUSAGE_RENDERTARGET, D3DFMT_A16B16G16R16F, D3DPOOL_DEFAULT, t.tex, NULL);
-            if (hr != D3D_OK) {
-                LOG::logline("!! Failed to create %s texture (cascade %d)", t.name, c);
-                return false;
-            }
-            (*t.tex)->GetSurfaceLevel(0, t.surf);
-            device->ColorFill(*t.surf, 0, 0);
-        }
-    }
-
-    // Foam's own fullscreen triangle, scaled to foamTexResolution (mirrors the wave-sim
-    // vbWaveSim triangle but at the foam RT size). The WaveVS geometry behaves in pixel
-    // space, so a 512-sized triangle covers only a cropped corner of a larger foam RT;
-    // sizing the triangle to the RT fills it exactly (see simulateFoam).
-    const float r = (float)foamTexResolution;
-    float foamVertices[] = {
-        -r/2 - 0.5f,    r/2 - 0.5f,   0, 1,   -0.5f,  0.5f,   0, 0,
-         r   - 0.5f,  2*r   - 0.5f,   0, 1,    1.0f,  2.0f,   0, 1,
-         r   - 0.5f,   -r    - 0.5f,  0, 1,    1.0f, -1.0f,   1, 1
-    };
-    hr = device->CreateVertexBuffer(3 * 32, D3DUSAGE_WRITEONLY, fvfWave, D3DPOOL_DEFAULT, &vbFoamSim, 0);
-    if (hr != D3D_OK) {
-        LOG::logline("!! Failed to create foam simulation vb");
-        return false;
-    }
-    void* fvp;
-    if (vbFoamSim->Lock(0, 0, &fvp, 0) != D3D_OK) {
-        LOG::logline("!! Failed to lock foam simulation vb");
-        return false;
-    }
-    memcpy(fvp, foamVertices, sizeof(foamVertices));
-    vbFoamSim->Unlock();
-
-    foamSimReset = true;
-    return true;
-}
-
-bool DistantLand::initShadow() {
-    const D3DFORMAT shadowFormat = D3DFMT_R16F, shadowZFormat = D3DFMT_D24S8;
-    const UINT shadowSize = Configuration.DL.ShadowResolution, cascades = 2;
-    HRESULT hr;
-
-    // The shadow texture holds a horizontal-packed shadow atlas
-    hr = device->CreateTexture(cascades * shadowSize, shadowSize, 1, D3DUSAGE_RENDERTARGET, shadowFormat, D3DPOOL_DEFAULT, &texShadow, NULL);
-    if (hr != D3D_OK) {
-        LOG::logline("!! Failed to create shadow render target");
-        return false;
-    }
-    hr = device->CreateTexture(cascades * shadowSize, shadowSize, 1, D3DUSAGE_RENDERTARGET, shadowFormat, D3DPOOL_DEFAULT, &texSoftShadow, NULL);
-    if (hr != D3D_OK) {
-        LOG::logline("!! Failed to create shadow render target");
-        return false;
-    }
-    hr = device->CreateDepthStencilSurface(cascades * shadowSize, shadowSize, shadowZFormat, D3DMULTISAMPLE_NONE, 0, TRUE, &surfShadowZ, NULL);
-    if (hr != D3D_OK) {
-        LOG::logline("!! Failed to create shadow Z buffer");
-        return false;
-    }
+    // Fullscreen quad covering a render target of any dimension. Created by initShadow until
+    // S3 deleted it; the DEPTH pass is its only remaining user (renderdepth.cpp clears and
+    // resolves through it), so ownership follows the consumer.
     hr = device->CreateVertexBuffer(4 * 12, D3DUSAGE_WRITEONLY, 0, D3DPOOL_DEFAULT, &vbFullFrame, 0);
     if (hr != D3D_OK) {
-        LOG::logline("!! Failed to create shadow processing verts");
+        LOG::logline("!! Failed to create fullscreen quad verts");
         return false;
     }
-    hr = device->CreateVertexBuffer(14 * 12, D3DUSAGE_WRITEONLY, 0, D3DPOOL_DEFAULT, &vbClipCube, 0);
-    if (hr != D3D_OK) {
-        LOG::logline("!! Failed to create shadow processing verts");
-        return false;
-    }
-
-    // Used to cover an entire render target of any dimension
     D3DXVECTOR3* v;
     vbFullFrame->Lock(0, 0, (void**)&v, 0);
-    v[0] = D3DXVECTOR3( -1.0f, 1.0f,  1.0f);
-    v[1] = D3DXVECTOR3(-1.0f, -1.0f,  1.0f);
-    v[2] = D3DXVECTOR3( 1.0f,  1.0f,  1.0f);
-    v[3] = D3DXVECTOR3( 1.0f, -1.0f,  1.0f);
+    v[0] = D3DXVECTOR3(-1.0f,  1.0f, 1.0f);
+    v[1] = D3DXVECTOR3(-1.0f, -1.0f, 1.0f);
+    v[2] = D3DXVECTOR3( 1.0f,  1.0f, 1.0f);
+    v[3] = D3DXVECTOR3( 1.0f, -1.0f, 1.0f);
     vbFullFrame->Unlock();
-
-    // Used to project the view frustum in world space
-    // Slightly expanded from the canonical cube to allow for rasterization and filtering
-    const float u = 1.01f;
-    vbClipCube->Lock(0, 0, (void**)&v, 0);
-    v[0] = D3DXVECTOR3(-u,  u, 0.0f);
-    v[1] = D3DXVECTOR3(-u, -u, 0.0f);
-    v[2] = D3DXVECTOR3( u,  u, 0.0f);
-    v[3] = D3DXVECTOR3( u, -u, 0.0f);
-    v[4] = D3DXVECTOR3( u, -u, 1.0f);
-    v[5] = D3DXVECTOR3(-u, -u, 0.0f);
-    v[6] = D3DXVECTOR3(-u, -u, 1.0f);
-    v[7] = D3DXVECTOR3(-u,  u, 0.0f);
-    v[8] = D3DXVECTOR3(-u,  u, 1.0f);
-    v[9] = D3DXVECTOR3( u,  u, 0.0f);
-    v[10] = D3DXVECTOR3( u,  u, 1.0f);
-    v[11] = D3DXVECTOR3( u, -u, 1.0f);
-    v[12] = D3DXVECTOR3(-u,  u, 1.0f);
-    v[13] = D3DXVECTOR3(-u, -u, 1.0f);
-    vbClipCube->Unlock();
 
     return true;
 }
@@ -1945,86 +1274,19 @@ void DistantLand::release() {
 
     BSA::clearTextureCache();
 
-    if (Configuration.MGEFlags & DYNAMIC_RIPPLES) {
-        surfRain->Release();
-        surfRain = nullptr;
-        texRain->Release();
-        texRain = nullptr;
-        surfRipples->Release();
-        surfRipples = nullptr;
-        texRipples->Release();
-        texRipples = nullptr;
-        surfRippleBuffer->Release();
-        surfRippleBuffer = nullptr;
-        texRippleBuffer->Release();
-        texRippleBuffer = nullptr;
-        vbWaveSim->Release();
-        vbWaveSim = nullptr;
-    }
-
     LandDecl->Release();
     LandDecl = nullptr;
     StaticDecl->Release();
     StaticDecl = nullptr;
-    WaterDecl->Release();
-    WaterDecl = nullptr;
+    PosOnlyDecl->Release();
+    PosOnlyDecl = nullptr;
     GrassDecl->Release();
     GrassDecl = nullptr;
 
-    texShadow->Release();
-    texShadow = nullptr;
-    texSoftShadow->Release();
-    texSoftShadow = nullptr;
-    surfShadowZ->Release();
-    surfShadowZ = nullptr;
-
-    if (texFlow) {
-        texFlow->Release();
-        texFlow = nullptr;
-    }
-
-    if (texFoam[0]) {
-        for (int c = 0; c < foamCascades; ++c) {
-            surfFoamP_A[c]->Release();   surfFoamP_A[c] = nullptr;
-            texFoamP_A[c]->Release();    texFoamP_A[c] = nullptr;
-            surfFoamP_B[c]->Release();   surfFoamP_B[c] = nullptr;
-            texFoamP_B[c]->Release();    texFoamP_B[c] = nullptr;
-            surfFoamField[c]->Release(); surfFoamField[c] = nullptr;
-            texFoamField[c]->Release();  texFoamField[c] = nullptr;
-            surfFoam[c]->Release();      surfFoam[c] = nullptr;
-            texFoam[c]->Release();       texFoam[c] = nullptr;
-            surfFoamUV_A[c]->Release();  surfFoamUV_A[c] = nullptr;
-            texFoamUV_A[c]->Release();   texFoamUV_A[c] = nullptr;
-            surfFoamUV_B[c]->Release();  surfFoamUV_B[c] = nullptr;
-            texFoamUV_B[c]->Release();   texFoamUV_B[c] = nullptr;
-        }
-        if (vbFoamSim) { vbFoamSim->Release(); vbFoamSim = nullptr; }
-    }
-
-    texWater->Release();
-    texWater = nullptr;
-    texReflection->Release();
-    texReflection = nullptr;
-    surfReflectionZ->Release();
-    surfReflectionZ = nullptr;
-    vbWater->Release();
-    vbWater = nullptr;
-    ibWater->Release();
-    ibWater = nullptr;
-    if (vbWaterLod) {
-        vbWaterLod->Release();
-        vbWaterLod = nullptr;
-    }
-    if (ibWaterLod) {
-        ibWaterLod->Release();
-        ibWaterLod = nullptr;
-    }
     vbGrassInstances->Release();
     vbGrassInstances = nullptr;
     vbFullFrame->Release();
     vbFullFrame = nullptr;
-    vbClipCube->Release();
-    vbClipCube = nullptr;
 
     texDepthFrame->Release();
     texDepthFrame = nullptr;
@@ -2033,8 +1295,6 @@ void DistantLand::release() {
 
     effectPool->Release();
     effectPool = nullptr;
-    effectShadow->Release();
-    effectShadow = nullptr;
     effectDepth->Release();
     effectDepth = nullptr;
     effect->Release();

@@ -357,7 +357,7 @@ void DistantLand::renderDepth() {
         // Clear floating point buffer to far depth (skipped when Forge owns depth — no consumer).
         if (!forgeOwnsDepth) {
             effectDepth->BeginPass(PASS_CLEARDEPTH);
-            device->SetVertexDeclaration(WaterDecl);
+            device->SetVertexDeclaration(PosOnlyDecl);
             device->SetStreamSource(0, vbFullFrame, 0, 12);
             DrawStats::count(2);
             device->DrawPrimitive(D3DPT_TRIANGLESTRIP, 0, 2);
@@ -734,7 +734,7 @@ void DistantLand::renderThreadDepthCacheJob() {
 
         // Clear floating point buffer to far depth
         effectDepth->BeginPass(PASS_CLEARDEPTH);
-        device->SetVertexDeclaration(WaterDecl);
+        device->SetVertexDeclaration(PosOnlyDecl);
         device->SetStreamSource(0, vbFullFrame, 0, 12);
         DrawStats::count(2);
         device->DrawPrimitive(D3DPT_TRIANGLESTRIP, 0, 2);

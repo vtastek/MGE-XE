@@ -144,8 +144,9 @@ void DistantLand::renderGrassInst() {
         return;
     }
 
-    effect->SetMatrixArray(ehShadowViewproj, smViewproj, 2);
-    effect->SetTexture(ehTex3, texSoftShadow);
+    // S3: grass sampled MGE's cascaded shadow atlas here (shadowViewProj + texSoftShadow).
+    // The atlas went with rendershadow.cpp, so grass draws unshadowed until it returns
+    // host-side; the pass is Forge-gated off in the default frame anyway.
     device->SetVertexDeclaration(GrassDecl);
 
     renderGrassCommon(effect);

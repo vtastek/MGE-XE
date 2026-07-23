@@ -187,7 +187,6 @@
     <ClCompile Include="src\mge\quadtree.cpp" />
     <ClCompile Include="src\mge\renderdepth.cpp" />
     <ClCompile Include="src\mge\renderexterior.cpp" />
-    <ClCompile Include="src\mge\imgui_water.cpp" />
     <ClCompile Include="src\mge\renderprocess.cpp" />
     <ClCompile Include="src\imgui\imgui.cpp" />
     <ClCompile Include="src\imgui\imgui_draw.cpp" />
@@ -195,12 +194,11 @@
     <ClCompile Include="src\imgui\imgui_widgets.cpp" />
     <ClCompile Include="src\imgui\backends\imgui_impl_dx9.cpp" />
     <ClCompile Include="src\imgui\backends\imgui_impl_win32.cpp" />
+    <ClCompile Include="src\mge\imgui_panels.cpp" />
     <ClCompile Include="src\mge\rendergrass.cpp" />
-    <ClCompile Include="src\mge\rendershadow.cpp" />
     <ClCompile Include="src\mge\renderthread.cpp" />
     <ClCompile Include="src\mge\scenegraph.cpp" />
     <ClCompile Include="src\mge\scenegraph_geometry_cache.cpp" />
-    <ClCompile Include="src\mge\renderwater.cpp" />
     <ClCompile Include="src\mge\rendercachedcolor.cpp" />
     <ClCompile Include="src\mge\specificrender.cpp" />
     <ClCompile Include="src\mge\statusoverlay.cpp" />
