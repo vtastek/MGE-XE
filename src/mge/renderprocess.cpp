@@ -4924,6 +4924,26 @@ namespace RenderProcess {
         return g_initOk && g_enabled;
     }
 
+    bool hasCompositeFrame() {
+        return g_mainTexValid;
+    }
+
+    void discardPendingCaptures() {
+        // Menu freeze: no produce runs, so swapCaptureBuffers() — the ONLY place the incoming
+        // capture buffers are cleared — never fires, while captureAlphaDraw keeps appending for
+        // every blended world DIP MW still issues behind the menu. Left alone these grow for as
+        // long as the menu is open. Nothing will consume them (the frame they belong to is never
+        // built), so drop them. Called once per freeze frame, before that frame's appends, which
+        // bounds the capture side to a single frame's worth.
+        //
+        // Deliberately NOT swapCaptureBuffers(): that would also rotate the alpha-dedup sets, and
+        // the worker is not running to rebuild them.
+        g_capInVerts.clear();
+        g_capInIdx.clear();
+        g_capInRecs.clear();
+        g_capInTexMemo.clear();
+    }
+
     bool wantsFPCapture() {
         // FP1a: seam live + geometry capture up + composite ON (F11) + ini flag + FIRST person.
         // Gates the cache's armCamera-root walk, the FP draw-list build and the fp wire crossing.

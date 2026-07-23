@@ -729,7 +729,17 @@ HRESULT _stdcall MGEProxyDevice::BeginScene() {
                     // Latch false (F11-off / seam down / fused mode) → the late kickoff at
                     // EndScene(0) runs instead. Menus and warm-up frames are NO LONGER excluded
                     // (S2): they are ordinary Forge frames and take this same early path.
-                    if (DistantLand::earlyForgeKickoff) {
+                    //
+                    // menuFreeze ("pause world during menus"): render NO host frame at all — the
+                    // world is paused, so the composite below simply re-blits the last one from
+                    // g_mainTex. frameSetupEarly already returned before every world step, so
+                    // there is nothing here to feed a kickoff anyway. Falls to
+                    // collectDeferredFinish, which is a no-op once the collect has drained
+                    // (it keeps the not-ready/backstop paths correct if a finish is ever pending).
+                    // Note this is the EARLY site only: the EndScene(0) late kickoff self-gates on
+                    // earlyForgeKickoff, which stays TRUE on freeze frames, so it stays skipped and
+                    // onFrameAheadBlit keeps running — the blit is what shows the frozen world.
+                    if (DistantLand::earlyForgeKickoff && !DistantLand::menuFreeze) {
                         // Phase 0: the kickoff dispatcher finishes the PREVIOUS deferred frame
                         // late (host had the whole BeginScene window → exposed wait → ~0), then
                         // kicks this one. The IPC-free early window guarantees the deferral is safe.
