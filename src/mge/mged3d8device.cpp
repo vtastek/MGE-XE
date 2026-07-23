@@ -9,7 +9,6 @@
 #include <tlhelp32.h>
 #include "mgeversion.h"
 #include "configuration.h"
-#include "renderthread.h"
 #include "distantland.h"
 #include "mwbridge.h"
 #include "statusoverlay.h"
@@ -841,28 +840,24 @@ HRESULT _stdcall MGEProxyDevice::EndScene() {
             // Close the scene-0 draw window (timing + record-list drain)
             DistantLand::renderStage1();
 
-            // Forge present-seam composite (end of scene 0, before scene 1). Two parts, both
-            // gated on the live seam owning the opaque world:
-            //   1. renderCacheDepthToMainZ — write the cache opaque/terrain depth into the main
-            //      depthstencil (game projection) so scene 1's sorted-alpha occludes correctly
-            //      against the Forge-rendered opaques (first-person gets its own Z-clear).
-            //      NEAR-SCENE NO-OP (2026-07-02): additionally gated on ForgeNearDepthReplay
-            //      (ini, default OFF) — the replay is ~3.5k depth draws/frame, the last near-
-            //      scene submission cost on the client. Skipped, sorted-alpha can show through
-            //      Forge walls (accepted until the Forge alpha pass); flag ON restores it.
-            //   2. onStage0Composite — drive the host + alpha-blend the Forge colour over the
-            //      sky/distant-land already on the backbuffer (self-gates on F11; also flushes
-            //      geometry independent of the toggle).
+            // Forge present-seam composite (end of scene 0, before scene 1):
+            // onStage0Composite drives the host + alpha-blends the Forge colour over the
+            // sky/distant-land already on the backbuffer (self-gates on F11; also flushes
+            // geometry independent of the toggle).
+            //
+            // S5a: a second part ran first — renderCacheDepthToMainZ, which re-drew the cache
+            // set depth-only into MW's main depthstencil so scene 1's sorted-alpha occluded
+            // against the Forge opaques. It cost ~3.5k depth draws/frame and had been gated
+            // OFF by default (ForgeNearDepthReplay) since 2026-07-02, superseded by the host's
+            // own sorted-alpha pass. It went with the rest of the DX9 depth layer.
             //
             // Async split (UseAsyncHostFrame): kick the host off FIRST so its D3D12 frame
             // overlaps client work, then wait+composite. Phase 2: when the early kickoff
             // already fired at BeginScene(0) (DistantLand::earlyForgeKickoff — the host has
             // been rendering under ALL of scene 0), skip the late kickoff and only Finish
             // here. Otherwise (F11-off / seam down) kick late — Phase 1
-            // behaviour, window = the cache-depth replay below. The window between Kickoff
-            // and Finish must stay IPC-free on both channels — renderCacheDepthToMainZ is
-            // pure client-side D3D9 (verified: no ipcClient traffic). Fused mode keeps the
-            // exact pre-split order for a deterministic A/B.
+            // behaviour. The window between Kickoff and Finish must stay IPC-free on both
+            // channels. Fused mode keeps the exact pre-split order for a deterministic A/B.
             //
             // Frame-ahead (ForgeFrameAhead, early-kickoff frames only): the Finish moves
             // to the NEXT frame's BeginScene(0) collect and this composite point only
@@ -887,28 +882,17 @@ HRESULT _stdcall MGEProxyDevice::EndScene() {
                     if (!RenderProcess::kickoffPending()) {
                         RenderProcess::onStage0CompositeKickoff(realDevice);
                     }
-                    if (RenderProcess::forgeOwnsFrame() && Configuration.ForgeNearDepthReplay) {
-                        DistantLand::renderCacheDepthToMainZ();
-                    }
                     RenderProcess::onStage0CompositeFinish(realDevice);
-                } else if (RenderProcess::forgeOwnsFrame() && Configuration.ForgeNearDepthReplay) {
-                    // Near-depth replay (if enabled) must still precede scene-1 alpha even on
-                    // early frames — only the produce wait + blit relocate, not this.
-                    DistantLand::renderCacheDepthToMainZ();
                 }
             } else {
-                if (RenderProcess::forgeOwnsFrame() && Configuration.ForgeNearDepthReplay) {
-                    DistantLand::renderCacheDepthToMainZ();
-                }
                 RenderProcess::onStage0Composite(realDevice);
             }
-        } else if (!isFrameComplete) {
-            // Everything else except UI
-            DistantLand::renderStage2();
-            // S3: the "MW's water plane never came into view, draw ours anyway" fallback
-            // went with MGE's water renderer. The host's water is not tied to MW's grid
-            // appearing, so it needs no such catch-up draw.
         }
+        // S5a: scenes 1+ used to call renderStage2 here, which replayed the recorded scene
+        // draws into the depth texture (first-person / sorted alpha, for SSAO+DOF). Gone with
+        // the depth texture. S3: the "MW's water plane never came into view, draw ours anyway"
+        // fallback went with MGE's water renderer — the host's water is not tied to MW's grid
+        // appearing, so it needs no such catch-up draw.
     }
 
     if (isFrameComplete && isHUDready && !isHUDComplete) {
@@ -1143,14 +1127,9 @@ HRESULT _stdcall MGEProxyDevice::DrawIndexedPrimitive(D3DPRIMITIVETYPE a, UINT b
 
 // Release - Free all resources when refcount hits 0
 ULONG _stdcall MGEProxyDevice::Release() {
-    // Join the render thread BEFORE ProxyDevice::Release frees the real device
-    // (it releases realDevice at refcount 0). refcount==1 here means this call
-    // drops it to 0. The worker may still be mid-pass touching the device /
-    // depth RT, so drain + join it while everything is still alive.
-    if (refcount == 1) {
-        MGE::RenderThread::stop();
-    }
-
+    // S5a: the MGE render thread was drained + joined here at refcount==1, before
+    // ProxyDevice::Release freed the real device out from under a worker that could still
+    // be mid-pass on the depth RT. Both the worker and that pass are gone.
     ULONG r = ProxyDevice::Release();
 
     if (r == 0) {

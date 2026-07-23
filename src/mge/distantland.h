@@ -43,13 +43,6 @@ public:
         }
     };
 
-    struct RecordedState : RenderedState {
-        RecordedState(const RenderedState&);
-        ~RecordedState();
-        RecordedState(const RecordedState&) = delete;
-        RecordedState(RecordedState&&) noexcept;
-    };
-
     static constexpr float kCellSize = 8192.0f;
     static constexpr float kDistantZBias = 5e-6f;
     static constexpr float kDistantNearPlane = 4.0f;
@@ -62,13 +55,8 @@ public:
     // S4: cacheOpaqueMode / cacheOnlyMode (the NUMPAD7 opaque-source cycle) went with
     // rendercachedcolor.cpp — the Forge host is the opaque takeover CACHE mode reached for.
     // Set by frameSetupEarly() when the GeometryCache walk ran at BeginScene(0);
-    // read by renderDepth (different TU) to skip its own redundant walk.
+    // read by renderStage0 to skip its own redundant fallback walk.
     static bool earlyWalkedCache;
-    // Set by frameSetupEarly() when it kicked the render-thread depth-cache job
-    // this frame; read by renderStage0() to fence (RenderThread::wait) before any
-    // main-thread device/effect work, and by renderDepth() to skip the Clear /
-    // float-depth clear / cache pass the worker already wrote into texDepthFrame.
-    static bool renderThreadJobKicked;
     // Async full-frame overlap (Phase 2): latched by frameSetupEarly() when THIS frame
     // runs the early Forge kickoff at BeginScene(0) — UseAsyncHostFrame + the Forge
     // baseline (seam compositing + Forge water), one warm-up frame after any transition.
@@ -113,13 +101,11 @@ public:
 
     static IDirect3DDevice9* device;
     static ID3DXEffect* effect;
-    static ID3DXEffect* effectDepth;
     static ID3DXEffectPool* effectPool;
     static IDirect3DVertexDeclaration9* LandDecl;
     static IDirect3DVertexDeclaration9* StaticDecl;
-    // Position-only decl for the fullscreen quad (vbFullFrame). Was WaterDecl:
-    // the water plane shared it, and outlived the name by nothing.
-    static IDirect3DVertexDeclaration9* PosOnlyDecl;
+    // S5a: PosOnlyDecl (the position-only decl for the fullscreen quad) went with the
+    // depth pre-pass's float-depth clear, its last user.
 
 
     static IPC::Client ipcClient;
@@ -138,7 +124,13 @@ public:
     static IPC::VecId dynVisFlagsSharedId;
     static IPC::VecId maskBlobSharedId;
 
-    static std::vector<RecordedState> recordMW;
+    // Number of z-writing draws MW has issued in the current scene. Bumped in
+    // inspectIndexedPrimitive, reset at scene 0 (renderStage0 / renderStage1). Its one
+    // consumer is the sky predicate there: MW's sky is the first blended geometry of a
+    // weather cell's scene 0, i.e. the one drawn while this is still 0.
+    // (S5a: was recordMW, a vector<RecordedState> that AddRef'd VB/IB/texture per DIP so
+    // the draws could be replayed into the depth texture. Nothing replays them now.)
+    static unsigned recordMWCount;
 
     // CPU-side copy of each distant-land tile's triangle mesh, captured
     // during initLandscape before the VB/IB Unlocks. Used by
@@ -161,8 +153,6 @@ public:
     static std::unordered_map<IDirect3DVertexBuffer9*, LandMeshCache> landMeshes;
 
     static IDirect3DTexture9* texWorldColour, *texWorldNormals, *texWorldDetail;
-    static IDirect3DTexture9* texDepthFrame;
-    static IDirect3DSurface9* surfDepthDepth;
     static IDirect3DTexture9* texMenuCache;
     // S3: texReflection / surfReflectionZ (water reflection RT), texWater (the animated
     // volume normal map), vbWater / ibWater (the radial water mesh) went with
@@ -174,9 +164,8 @@ public:
     // wave and foam model -- so the entire stack died with MGE's water renderer.
 
     // S3: the cascaded shadow atlas (texShadow / texSoftShadow / surfShadowZ) and the
-    // frustum clip cube it projected went with rendershadow.cpp. vbFullFrame stays --
-    // it is the generic fullscreen quad the DEPTH pass still draws with.
-    static IDirect3DVertexBuffer9* vbFullFrame;
+    // frustum clip cube it projected went with rendershadow.cpp. S5a: vbFullFrame, the
+    // generic fullscreen quad, went with the depth pre-pass that was its last user.
 
     static D3DXMATRIX mwView, mwProj;
     static D3DXMATRIX smView[2], smProj[2], smViewproj[2];
@@ -224,7 +213,6 @@ public:
     static bool init();
     static bool initIpc();
     static bool initShader();
-    static bool initDepth();
     static bool initLandscapeClient();
     static bool initLandscape();
     static bool initDistantStaticsClient();
@@ -260,7 +248,6 @@ public:
     static void renderStage0();
     static void beginDrawsZone();
     static void renderStage1();
-    static void renderStage2();
 
     static void setupCommonEffect(const D3DXMATRIX* view,const  D3DXMATRIX* proj);
 
@@ -296,36 +283,17 @@ public:
     // screen-rect / silhouette-mask cull, the reflection-statics worker cull, the dynamic
     // wave + foam simulations and renderWaterPlane were all declared here.
 
-    static void renderDepth();
-    static void renderDepthAdditional();
-    static void renderDepthRecorded();
-    // visibleOverride: when non-null, iterate this key list instead of the live
-    // s_prevVisibleKeys set. Used by the render-thread job, which reads a
-    // main-thread snapshot (snapshotVisibleKeysForThread) so it never touches the
-    // set concurrently with updateVisibleSet.
-    static void renderDepthFromCache(const D3DXMATRIX* gameView,
-                                     const std::vector<uint32_t>* visibleOverride = nullptr);
-    // Forge composite: re-draw the cache set DEPTH-ONLY into MW's MAIN depthstencil in the
-    // GAME projection (not the extended depth proj), colour-masked, so s1 sorted-alpha and
-    // first-person occlude against the Forge-rendered opaques. Called from EndScene(s0) when
-    // the Forge seam owns the opaque world. Relies on the main backbuffer/depthstencil being
-    // bound (it is, between EndScene s0 and BeginScene s1).
-    static void renderCacheDepthToMainZ();
+    // S5a: MGE's depth pre-pass was declared here — renderDepth, renderDepthAdditional,
+    // renderDepthRecorded, renderDepthFromCache, renderCacheDepthToMainZ and the
+    // render-thread pair (snapshotVisibleKeysForThread / renderThreadDepthCacheJob).
+    // The depth texture they produced had exactly one consumer, the DX9 post chain's
+    // SSAO/DOF, which is skipped whenever the Forge seam owns the frame.
+
     // Build the deterministic current-frame frustum-visible set (s_frustumVisibleKeys)
     // over the full GeometryCache, from the game view*proj. Called early
-    // (frameSetupEarly, after the cache walk) on the IPC path and at the renderDepth
-    // walk site on the non-IPC path. The cache depth + opaque color passes drive off
-    // this set instead of the frame-lagged engine-MSOC verdict. Frustum-only (Phase 1).
+    // (frameSetupEarly, after the cache walk), or from renderStage0's fallback on frames
+    // where frameSetupEarly did not walk. Consumed by the Forge kickoff's draw-list build.
     static void buildFrustumVisibleSet(const D3DXMATRIX* view, const D3DXMATRIX* proj);
-    // Copy s_frustumVisibleKeys into the render-thread snapshot. Main-thread only,
-    // called at kick (frameSetupEarly) before the job can read it.
-    static void snapshotVisibleKeysForThread();
-    // Render-thread depth-cache job: under the device lock, save full device
-    // state (engine is mid-sky), bind texDepthFrame/surfDepthDepth, Clear +
-    // float-depth clear pass + renderDepthFromCache (its own effectDepth
-    // bracket), restore RT + device state. Produces the same depth content
-    // renderDepth's serial cache path would, just during the sky window.
-    static void renderThreadDepthCacheJob();
     static void updateVisibleSet(void* const* shapes, int count);
     // Stage 2 early classify (main thread, BeginScene(0) via frameSetupEarly, before
     // buildFrustumVisibleSet). Asks the plugin to run the world-camera occlusion
@@ -335,12 +303,10 @@ public:
     // plugin resolves it). No-op if the plugin lacks the export or self-declines.
     static void earlyClassifyMainScene(void* worldCamera);
     // The deterministic current-frame frustum-visible set (s_frustumVisibleKeys),
-    // built by buildFrustumVisibleSet. The cache opaque color pass consumes it so it
-    // stays in lockstep with the depth pre-pass (same set). Keys = GeometryCache keys.
+    // built by buildFrustumVisibleSet. Keys = GeometryCache keys.
     static const std::vector<uint32_t>& frustumVisibleKeys();
     // Cut 2B fold: when this frame's buildFrustumVisibleSet DEFERRED its ensureLive
-    // loop into the kickoff draw-list build (Forge owns depth, no other consumer of
-    // s_frustumVisibleKeys), returns the raw classify-visible keys (s_visibleKeys) for
+    // loop into the kickoff draw-list build, returns the raw classify-visible keys (s_visibleKeys) for
     // buildGeometryDrawLists to iterate directly — ensureLive + emit in ONE pass.
     // nullptr on non-fold frames (iterate frustumVisibleKeys() as before).
     // CONSUME-ONCE: returns non-null at most once per latched frame (the classify
@@ -351,7 +317,7 @@ public:
     static unsigned lastRefineCulled();
 
     // S3: the whole cascaded sun-shadow renderer (build, per-cascade clear/layer, the
-    // recordMW receiver overlay, the cache caster pass and the debug view) went with
+    // recorded-draw receiver overlay, the cache caster pass and the debug view) went with
     // rendershadow.cpp, along with the reflection-statics pipeline diagnostics.
 
     static void postProcess();
@@ -362,12 +328,6 @@ public:
     static IDirect3DSurface9* captureScreenshot();
 };
 
-class RenderTargetSwitcher {
-    IDirect3DSurface9* savedTarget, *savedDepthStencil;
-    void init(IDirect3DSurface9* target, IDirect3DSurface9* targetDepthStencil);
-
-public:
-    RenderTargetSwitcher(IDirect3DSurface9* target, IDirect3DSurface9* targetDepthStencil);
-    RenderTargetSwitcher(IDirect3DTexture9* targetTex, IDirect3DSurface9* targetDepthStencil);
-    ~RenderTargetSwitcher();
-};
+// S5a: RenderTargetSwitcher (scoped SetRenderTarget/SetDepthStencilSurface with restore)
+// lived here. Every remaining user was a pass that rendered into one of MGE's own render
+// targets; the depth pre-pass was the last of them.

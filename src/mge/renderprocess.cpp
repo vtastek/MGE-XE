@@ -71,8 +71,9 @@ namespace {
     // input by one frame (UI stays current).
     bool   g_frameAheadLive = false;   // seeded from ForgeFrameAhead at init; numpad-* flips live (A/B)
     // Client produce (buildGeometryDrawLists + flush + RPC-start, D3D9-free after Tier 1a) on a
-    // fresh dedicated worker. NUMPAD8 cycles 3 modes; gated on !UseRenderThread (that path owns the
-    // legacy device-lock worker + a MULTITHREADED device — don't mix the two):
+    // fresh dedicated worker. NUMPAD8 cycles 3 modes. (S5a: every mode was additionally gated on
+    // !UseRenderThread — the legacy MGE render thread owned the device lock and forced a
+    // MULTITHREADED device, and the two workers could not be mixed. It is gone.)
     //   0 OFF     — run inline on the MW main thread (pre-worker behaviour).
     //   1 FENCED  — Tier 1b: run on the worker, wait() immediately (serial, behaviour-identical;
     //               a correctness checkpoint that the produce runs correctly off-main).
@@ -3372,15 +3373,13 @@ namespace RenderProcess {
         // waits immediately (serial A/B); OVERLAP defers the wait to EndScene(0) so it overlaps
         // scene-0 draw; PARK builds frame N on the worker without firing and the main thread
         // fires it at the START of frame N+1 with a restamped camera (frame = max, not sum).
-        // Inert on the legacy UseRenderThread path (dispatcher gates it out). Takes effect at
-        // the next kickoff.
+        // Takes effect at the next kickoff.
         if (GetAsyncKeyState(VK_NUMPAD8) & 0x0001) {
             g_produceMode = (g_produceMode + 1) % 4;
             const char* name = (g_produceMode == 1) ? "FENCED (Tier 1b)"
                              : (g_produceMode == 2) ? "OVERLAP (Tier 2)"
                              : (g_produceMode == 3) ? "PARK (fire-at-frame-start)" : "OFF (inline)";
-            LOG::logline(">> [seam] produce worker: %s%s", name,
-                         (g_produceMode != 0 && Configuration.UseRenderThread) ? " (inert — UseRenderThread owns the worker)" : "");
+            LOG::logline(">> [seam] produce worker: %s", name);
         }
         // VK_SCROLL (Scroll Lock): Phase 1 host-cull-only A/B. ON routes the Forge produce
         // off the engine MSOC classify onto the self-contained frustum-only visible set
@@ -4453,9 +4452,9 @@ namespace RenderProcess {
 
     // ---- Tier 1b: fresh produce worker ------------------------------------------------------
     // A single dedicated std::thread that runs kickoffBody() off the MW main thread. Deliberately
-    // NOT MGE::RenderThread — that worker owns a D3D9 device lock + a D3DCREATE_MULTITHREADED
-    // device and proved crashy; this one touches NO D3D9 (the produce path is D3D9-free after
-    // Tier 1a), so it needs no device lock. For Tier 1b the caller kicks then wait()s immediately
+    // NOT the old MGE::RenderThread (deleted in S5a) — that worker owned a D3D9 device lock +
+    // a D3DCREATE_MULTITHREADED device and proved crashy; this one touches NO D3D9 (the produce
+    // path is D3D9-free after Tier 1a), so it needs no device lock. For Tier 1b the caller kicks then wait()s immediately
     // (fully serial, zero race); Tier 2 will drop that fence to overlap MW's frame. The mutex the
     // kick/wait handshake takes also publishes every write the worker made to g_kick + the cache
     // globals back to the main thread (happens-before) before the finish half reads them.
@@ -4565,8 +4564,8 @@ namespace RenderProcess {
     }
 
 
-    // Dispatcher: route the produce onto the fresh worker per g_produceMode (unless the legacy
-    // UseRenderThread path owns threading). Mode 2 (OVERLAP) only defers the wait on early-kickoff
+    // Dispatcher: route the produce onto the fresh worker per g_produceMode.
+    // Mode 2 (OVERLAP) only defers the wait on early-kickoff
     // frames — there the kick fires at BeginScene(0) and the paired waitProduce() runs at
     // EndScene(0); every other frame fences here so g_kick is complete on return exactly as inline.
     void onStage0CompositeKickoff(IDirect3DDevice9* device) {
@@ -4595,7 +4594,7 @@ namespace RenderProcess {
         // BeginScene window to finish and this wait collapses to ~0. MUST precede kickoffBody's
         // g_kick reset (it consumes N-1's g_kick state) AND the worker dispatch (finishAndCopy is
         // D3D9, main-only). On non-early frames this is a no-op — collectDeferredFinish already ran.
-        if (g_produceMode == 0 || Configuration.UseRenderThread) {
+        if (g_produceMode == 0) {
             doDeferredFinish();
             kickoffBody(device);
             return;
@@ -4652,8 +4651,7 @@ namespace RenderProcess {
         // (fireParked guards on it), so decline here and let the dispatcher run the serial
         // fenced path — the same degradation mode 2 has on non-early frames.
         const bool mode3 = (g_produceMode == 3 && g_frameAheadLive);
-        if ((g_produceMode != 2 && !mode3)
-            || Configuration.UseRenderThread || !DistantLand::earlyForgeKickoff) {
+        if ((g_produceMode != 2 && !mode3) || !DistantLand::earlyForgeKickoff) {
             return;   // every other path is main-thread-serial and kicks from the dispatcher
         }
         waitProduce();          // belt-and-braces: never kick over an in-flight produce
@@ -4686,7 +4684,7 @@ namespace RenderProcess {
     // the sum. The restamp inside flushAssignAndKick pairs frame-N geometry with the frame-N+1
     // camera, so there is no added camera/input latency — only 1-frame pose/frustum staleness.
     void fireParked(IDirect3DDevice9* device) {
-        if (g_produceMode != 3 || !g_frameAheadLive || Configuration.UseRenderThread
+        if (g_produceMode != 3 || !g_frameAheadLive
             || !g_initOk || !g_enabled || !DistantLand::earlyForgeKickoff || !device) {
             return;
         }

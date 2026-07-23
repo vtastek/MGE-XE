@@ -1,13 +1,10 @@
 
 #include "configuration.h"
 #include "distantland.h"
-#include "drawstats.h"
-#include "distantshader.h"
 #include "mwbridge.h"
 #include "renderprocess.h"
 #include "phasetimers.h"
 #include "proxydx/d3d8header.h"
-#include "proxydx/devicelock.h"
 #include "scenegraph.h"
 #include "scenegraph_geometry_cache.h"
 #include "cachebounds.h"
@@ -42,11 +39,6 @@ static std::vector<uint32_t> s_visibleKeys;
 // longer collapses the depth pass to an unculled full-cache draw. Frustum-only
 // (no occlusion yet — Phase 3 adds the early MGE-driven MSOC mask).
 static std::vector<uint32_t> s_frustumVisibleKeys;
-
-// Render-thread snapshot of s_frustumVisibleKeys, populated on the main thread at
-// kick (snapshotVisibleKeysForThread) and read by the worker job. Decouples the
-// job from any later main-thread mutation of the set.
-static std::vector<uint32_t> s_threadVisibleKeys;
 
 // Count of cache entries the last buildFrustumVisibleSet dropped (in MSOC-culled mode:
 // entries the engine did not draw — occluded / LOD-deselected / out of the engine
@@ -171,8 +163,9 @@ unsigned DistantLand::lastRefineCulled() {
 }
 
 // buildFrustumVisibleSet - produces the current-frame visible cache set
-// (s_frustumVisibleKeys) that the cache depth pre-pass AND the cache opaque/terrain
-// colour passes all consume, so depth and colour always replay the SAME set.
+// (s_frustumVisibleKeys) the Forge kickoff's draw-list build consumes. (Before S5a it also
+// fed MGE's own DX9 depth pre-pass and cache colour passes, which is why depth and colour
+// were required to replay the SAME set; the host is the only consumer now.)
 //
 // Two modes, picked per frame:
 //  - MSOC-culled (preferred): the early classify ran this frame
@@ -211,20 +204,20 @@ void DistantLand::buildFrustumVisibleSet(const D3DXMATRIX* view, const D3DXMATRI
     if (Configuration.UseOcclusionCulling && s_earlyClassifyRan && !hostCullOnly) {
         s_earlyClassifyRan = false;   // one frame only
 
-        // Cut 2B fold: in the Forge baseline (F11 composite, no render
-        // thread, near-depth replay off) NOTHING else consumes s_frustumVisibleKeys —
-        // the near depth draws are skipped (forgeOwnsDepth), the render-thread
-        // snapshot is off, and the legacy cache color/shadow paths only run without
-        // Forge ownership. So don't run the ensureLive loop here and copy survivors,
+        // Cut 2B fold: under the Forge seam NOTHING else consumes s_frustumVisibleKeys —
+        // the Forge kickoff's draw-list build is the set's only reader.
+        // So don't run the ensureLive loop here and copy survivors,
         // only for buildGeometryDrawLists to re-hash the same keys at kickoff: DEFER —
         // hand the raw classify set across (foldVisibleKeys) and let the kickoff build
         // do ensureLive + emit in ONE pass. s_frustumVisibleKeys stays EMPTY on fold
         // frames (cleared above; nothing may consume it stale). The VISKEYS /
         // refineCulled diagnostics simply don't update on fold frames.
+        // S5a: the gate also required !UseRenderThread && !ForgeNearDepthReplay — the two
+        // flags that could still put a DX9 depth consumer on s_frustumVisibleKeys. Both the
+        // render thread and the near-depth replay are gone, so nothing outside the kickoff
+        // reads the set at all and only the live-draw-build + seam conditions remain.
         const bool fold = Configuration.ForgeLiveDrawBuild
-            && RenderProcess::forgeOwnsFrame()   // == forgeOwnsDepth
-            && !Configuration.UseRenderThread
-            && !Configuration.ForgeNearDepthReplay;
+            && RenderProcess::forgeOwnsFrame();
         if (fold) {
             s_foldDeferred = true;
             return;
@@ -314,376 +307,19 @@ void DistantLand::buildFrustumVisibleSet(const D3DXMATRIX* view, const D3DXMATRI
 }
 
 
-
-void DistantLand::renderDepth() {
-    MGE_ZoneScopedN("renderDepth");
-    MGE_SCOPED_TIMER("renderDepth");
-    DrawStats::ScopedStage _ds(DrawStats::Depth);
-    auto mwBridge = MWBridge::get();
-
-    // Switch to render target
-    RenderTargetSwitcher rtsw(texDepthFrame, surfDepthDepth);
-
-    // When the render thread produced the cleared depth + MW cache depth during
-    // the sky window, it already wrote them into texDepthFrame/surfDepthDepth
-    // (fenced in renderStage0 before this runs). Skip the Clear, the float-depth
-    // clear pass, and the cache pass here; land/statics/grass below render on top
-    // of the worker's buffer, byte-identical to the serial path.
-    const bool depthCacheOnThread = renderThreadJobKicked;
-
-    // Forge owns the composited frame (F11): nothing samples texDepthFrame this frame — post-process
-    // (SSAO/DOF), the MW↔MGE blend, caustics, and MGE water are all suppressed. So skip PRODUCING
-    // the depth texture: the float-depth clear + the cache / land / statics (renderdepth.cpp:310) /
-    // grass DEPTH draws. The cache WALK, the frustum-visible set, the IPC channel drain
-    // (waitCullChannelFree), and the statics + grass CULLS still run — Forge's draw lists + MGE grass
-    // color depend on them, and the statics RPC MUST be drained to keep the one-at-a-time IPC channel
-    // paired. F11-off (vanilla MW) restores the full depth pass.
-    const bool forgeOwnsDepth = RenderProcess::forgeOwnsFrame();
-
-    if (!depthCacheOnThread && !forgeOwnsDepth) {
-        device->Clear(0, 0, D3DCLEAR_ZBUFFER, 0, 1.0, 0);
-    }
-
-    // Unbind depth sampler
-    effect->SetTexture(ehTex3, NULL);
-
-    // Projection should cover whole scene (also used by the land/statics depth
-    // passes below, so set it on both paths)
-    D3DXMATRIX distProj = mwProj;
-    editProjectionZ(&distProj, 4.0f, Configuration.DL.DrawDist * kCellSize);
-    effect->SetMatrix(ehProj, &distProj);
-
-    if (!depthCacheOnThread) {
-        // Clear floating point buffer to far depth (skipped when Forge owns depth — no consumer).
-        if (!forgeOwnsDepth) {
-            effectDepth->BeginPass(PASS_CLEARDEPTH);
-            device->SetVertexDeclaration(PosOnlyDecl);
-            device->SetStreamSource(0, vbFullFrame, 0, 12);
-            DrawStats::count(2);
-            device->DrawPrimitive(D3DPT_TRIANGLESTRIP, 0, 2);
-            effectDepth->EndPass();
-        }
-
-        // Rebuild the geometry cache (walk + per-frame bone palettes) BEFORE the
-        // depth draw so depth uses this frame's skinned poses — otherwise depth
-        // lags a frame behind the shadow pass and SSAO detaches from moving NPCs.
-        // Cheap now that VS palette skinning replaced per-frame CPU skinning, and
-        // the VBs are static so there's no depth/shadow aliasing to overlap around.
-        //
-        // Skipped when frameSetupEarly() already walked it at BeginScene(0) (IPC
-        // path) so the ~2ms walk overlaps the sky pass. This call is the fallback
-        // for the non-IPC / menu / not-ready paths where earlyWalkedCache is false.
-        // (depthCacheOnThread implies earlyWalkedCache, so this whole block is
-        // skipped on the threaded path — the worker did the cache pass.)
-        if (!earlyWalkedCache) {
-            MGE::GeometryCache::onFrameReady(MGE::SceneGraph::getDataHandler());
-            // Non-IPC / menu / not-ready fallback: frameSetupEarly didn't run the
-            // early walk, so it didn't build the frustum-visible set either. Build
-            // it here (after the walk, before the consume) so this path drives off
-            // the same deterministic current-frame set as the IPC/threaded paths.
-            // (The early classify itself must run at BeginScene(0) in frameSetupEarly,
-            // before the engine's CullShow — running it here is too late: the engine's
-            // MSOC is already active and declines with rc=1. frameSetupEarly runs it
-            // for interiors too, so s_earlyClassifyRan may already be latched here.)
-            buildFrustumVisibleSet(&mwView, &mwProj);
-        }
-        // Cache near-depth draw (skipped when Forge owns depth — no consumer). The WALK above still
-        // ran (feeds Forge's draw lists); only the texDepthFrame draw is elided.
-        if (!forgeOwnsDepth) {
-            MGE_SCOPED_TIMER("renderDepth:cache");
-            renderDepthFromCache(&mwView);   // owns its non-skinned + skinned passes
-        }
-    }
-
-    // S4b: a channel-free gate sat here, blocking until the MSOC cull worker had drained
-    // the distant-statics RPC off the single-channel ipcClient. Both the worker and the
-    // RPC are gone.
-
-    // S4b: distant-land depth (renderDistantLandZ), the statics cull join and the distant-
-    // statics depth replay were here, all inside an isDistantCell() branch. The Forge host
-    // owns distant land and statics end to end; visLand was in fact never populated at all
-    // (nothing ever requested VIS_LAND), so the land depth pass had been drawing an empty
-    // set well before this.
-
-    // Reset projection matrix
-    effect->SetMatrix(ehProj, &mwProj);
-}
-
-void DistantLand::renderDepthAdditional() {
-    MGE_ZoneScopedN("renderDepthAdditional");
-    DrawStats::ScopedStage _ds(DrawStats::Depth);
-    // Switch to render target
-    RenderTargetSwitcher rtsw(texDepthFrame, surfDepthDepth);
-
-    // Unbind depth sampler
-    effect->SetTexture(ehTex3, NULL);
-
-    // Projection should cover whole scene
-    D3DXMATRIX distProj = mwProj;
-    editProjectionZ(&distProj, 4.0f, Configuration.DL.DrawDist * kCellSize);
-    effect->SetMatrix(ehProj, &distProj);
-
-    // Recorded draw calls
-    effectDepth->BeginPass(PASS_RENDERMWDEPTH);
-    renderDepthRecorded();
-    effectDepth->EndPass();
-
-    // Reset projection matrix
-    effect->SetMatrix(ehProj, &mwProj);
-}
-
-void DistantLand::renderDepthRecorded() {
-    MGE_ZoneScopedN("renderDepthRecorded");
-    // Use an alpha threshold for solidity that isn't precisely equal to a commonly used value (such as 0.5).
-    // Vertex interpolators can be slightly inaccurate and cause a value that should be constant across a triangle
-    // to have interpolated fragment values that vary either side of the threshold and cause noise.
-    const float solidThreshold = 0.499f;
-
-    // Recorded renders
-    const auto& recordMW_const = recordMW;
-    for (const auto& i : recordMW_const) {
-        // Set variables in main effect; variables are shared via effect pool
-
-        // Fragment colour routing
-        bool alphaDependent = i.alphaTest || i.blendEnable;
-        effect->SetBool(ehHasVCol, alphaDependent && (i.fvf & D3DFVF_DIFFUSE) != 0);
-        effect->SetFloat(ehMaterialAlpha, alphaDependent ? i.diffuseMaterial.a : 1.0f);
-
-        // Only bind texture for alphas
-        if (alphaDependent && i.texture) {
-            effect->SetTexture(ehTex0, i.texture);
-            effect->SetBool(ehHasAlpha, true);
-            effect->SetFloat(ehAlphaRef, i.alphaTest ? (i.alphaRef / 255.0f) : solidThreshold);
-        } else {
-            effect->SetTexture(ehTex0, 0);
-            effect->SetBool(ehHasAlpha, false);
-            effect->SetFloat(ehAlphaRef, -1.0f);
-        }
-
-        // Skin using worldview matrices for numerical accuracy
-        effect->SetBool(ehHasBones, i.vertexBlendState != 0);
-        effect->SetInt(ehVertexBlendState, i.vertexBlendState);
-        effect->SetMatrixArray(ehVertexBlendPalette, i.worldViewTransforms, 4);
-        effectDepth->CommitChanges();
-
-        device->SetRenderState(D3DRS_CULLMODE, i.cullMode);
-        device->SetStreamSource(0, i.vb, i.vbOffset, i.vbStride);
-        device->SetIndices(i.ib);
-        device->SetFVF(i.fvf);
-        DrawStats::count(i.primCount);
-        device->DrawIndexedPrimitive(i.primType, i.baseIndex, i.minIndex, i.vertCount, i.startIndex, i.primCount);
-    }
-}
-
-void DistantLand::renderDepthFromCache(const D3DXMATRIX* gameView,
-                                       const std::vector<uint32_t>* visibleOverride) {
-    MGE_ZoneScopedN("renderDepthFromCache");
-    // Cache-geometry depth draws bucket separately from the distant-land depth
-    // replays so cache-depth (frustum-only post-Phase-1) can be compared directly
-    // against the MSOC-culled scene0. Counter is thread_local-stage safe (render
-    // thread vs main both push their own g_stage; the shared array tolerates it).
-    DrawStats::ScopedStage _dsCache(DrawStats::DepthCache);
-
-    const float solidThreshold = 0.499f;
-    const auto& cacheMap = MGE::GeometryCache::cache();
-
-    auto bindMaterial = [&](const MGE::GeometryCache::CachedGeometry& e) {
-        bool alphaDependent = e.alphaTest || e.blendEnable;
-        if (alphaDependent && e.d3dTexture) {
-            effect->SetTexture(ehTex0, e.d3dTexture);
-            effect->SetBool(ehHasAlpha, true);
-            effect->SetFloat(ehAlphaRef, e.alphaTest ? e.alphaRef : solidThreshold);
-        } else {
-            effect->SetTexture(ehTex0, nullptr);
-            effect->SetBool(ehHasAlpha, false);
-            effect->SetFloat(ehAlphaRef, -1.0f);
-        }
-        // Mirrored (negative-determinant) parts flip clip-space winding, so cull the
-        // opposite face — else depth records the inner surface and SSAO shows
-        // "inside-out" left limbs. Matches the engine's per-draw mirror swap.
-        const DWORD cull = e.blendEnable ? D3DCULL_NONE
-                                         : (e.mirrored ? D3DCULL_CCW : D3DCULL_CW);
-        device->SetRenderState(D3DRS_CULLMODE, cull);
-        device->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
-        device->SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);
-    };
-
-    // Iterate the deterministic current-frame frustum-visible set (built early by
-    // buildFrustumVisibleSet): s_frustumVisibleKeys for the serial path, or the
-    // render-thread snapshot of it (visibleOverride) for the threaded job. No
-    // full-cache fallback — an empty set means nothing is in frustum, which is the
-    // correct verdict (replaces the old s_prevVisibleKeys / unculled-cache branch).
-    const std::vector<uint32_t>& keys = visibleOverride ? *visibleOverride : s_frustumVisibleKeys;
-    auto forEach = [&](auto&& fn) {
-        for (uint32_t key : keys) {
-            auto it = cacheMap.find(key);
-            if (it != cacheMap.end()) fn(it->second);
-        }
-    };
-
-    // ---- Non-skinned: model-space VB, per-draw palette[0] = worldTransform*view ----
-    effect->SetBool(ehHasVCol, false);
-    effect->SetFloat(ehMaterialAlpha, 1.0f);
-    effect->SetBool(ehHasBones, false);
-    effect->SetInt(ehVertexBlendState, 0);
-
-    effectDepth->BeginPass(PASS_RENDERMWDEPTH);
-    forEach([&](const MGE::GeometryCache::CachedGeometry& e) {
-        if (e.isSkinned) return;
-        IDirect3DVertexBuffer9* vb = e.readVB();
-        if (!vb || !e.ib) return;
-
-        D3DXMATRIX wvMat;
-        D3DXMatrixMultiply(&wvMat, reinterpret_cast<const D3DXMATRIX*>(e.worldTransformD3D), gameView);
-        D3DXMATRIX wvPalette[4] = { wvMat, wvMat, wvMat, wvMat };
-        effect->SetMatrixArray(ehVertexBlendPalette, wvPalette, 4);
-
-        bindMaterial(e);
-        effectDepth->CommitChanges();
-        // Per-entry stride/FVF: multi-map objects carry extra UV sets. The depth VS
-        // reads only TEXCOORD0, but the stream stride MUST match the VB layout or every
-        // vertex past the first is misaligned.
-        device->SetStreamSource(0, vb, 0, e.vbStride);
-        device->SetIndices(e.ib);
-        device->SetFVF(e.vbFVF);
-        DrawStats::count(e.triangleCount);
-        device->DrawIndexedPrimitive(D3DPT_TRIANGLELIST, 0, 0, e.vertexCount, 0, e.triangleCount);
-    });
-    effectDepth->EndPass();
-
-    // ---- Skinned: static bind-pose VB + per-frame bone palette (VS skinning) ----
-    // skinIndexed -> view -> proj; view must be the game view, proj is the depth proj.
-    effect->SetMatrix(ehView, gameView);
-
-    effectDepth->BeginPass(PASS_RENDERMWDEPTH_SKINNED);
-    device->SetVertexDeclaration(MGE::GeometryCache::skinnedDecl());
-    forEach([&](const MGE::GeometryCache::CachedGeometry& e) {
-        if (!e.isSkinned || e.skinnedUnsupported) return;
-        IDirect3DVertexBuffer9* vb = e.readVB();
-        if (!vb || !e.ib || e.numBones == 0) return;
-
-        effect->SetMatrixArray(ehBoneMatrices,
-            reinterpret_cast<const D3DXMATRIX*>(e.bonePalette.data()), e.numBones);
-        bindMaterial(e);
-        effectDepth->CommitChanges();
-        device->SetStreamSource(0, vb, 0, MGE::GeometryCache::kSkinnedVBStride);
-        device->SetIndices(e.ib);
-        DrawStats::count(e.triangleCount);
-        device->DrawIndexedPrimitive(D3DPT_TRIANGLELIST, 0, 0, e.vertexCount, 0, e.triangleCount);
-    });
-    effectDepth->EndPass();
-
-    effect->SetTexture(ehTex0, nullptr);
-    effect->SetBool(ehHasAlpha, false);
-    effect->SetFloat(ehAlphaRef, -1.0f);
-}
-
-// renderCacheDepthToMainZ - Forge composite depth seam. In Forge mode the engine's scene-0
-// opaque draw is suppressed (inspectIndexedPrimitive), so MW's MAIN depthstencil holds only
-// sky + distant land — the near-opaque depth is missing, and s1's sorted-alpha / first-person
-// would draw over the Forge walls. Re-draw the SAME cache set Forge renders, DEPTH-ONLY, into
-// the main depthstencil using the GAME projection (mwProj — NOT the extended depth proj the
-// depth-texture pre-pass uses) so the values match the engine's own s1 depth test. Colour is
-// masked off (Forge owns colour via the composite). Reuses renderDepthFromCache's complete
-// objects+terrain+skinned iteration and the lean depth effect (no shading). Mirrors the
-// interior depth pattern (state block + effectDepth DONOTSAVESTATE). Relies on the main
-// backbuffer/depthstencil being the bound RT (true between EndScene s0 and BeginScene s1).
-void DistantLand::renderCacheDepthToMainZ() {
-    MGE_ZoneScopedN("renderCacheDepthToMainZ");
-    UINT passes = 0;
-    IDirect3DStateBlock9* sb = nullptr;
-    device->CreateStateBlock(D3DSBT_ALL, &sb);
-
-    device->SetRenderState(D3DRS_COLORWRITEENABLE, 0);   // depth only — Forge provides colour
-    device->SetRenderState(D3DRS_ZENABLE, TRUE);
-    device->SetRenderState(D3DRS_ZWRITEENABLE, TRUE);
-    device->SetRenderState(D3DRS_ZFUNC, D3DCMP_LESSEQUAL);
-
-    // GAME projection (not the editProjectionZ-extended distProj) so the hardware Z matches
-    // what the engine's s1 pass tests against. renderDepthFromCache reads ehProj for the
-    // final projection (ehVertexBlendPalette / ehView carry only world*view).
-    effect->SetMatrix(ehView, &mwView);
-    effect->SetMatrix(ehProj, &mwProj);
-    effect->SetTexture(ehTex3, NULL);
-
-    effectDepth->Begin(&passes, D3DXFX_DONOTSAVESTATE);
-    renderDepthFromCache(&mwView);
-    effectDepth->End();
-
-    if (sb) { sb->Apply(); sb->Release(); }
-}
-
-// snapshotVisibleKeysForThread - copy the early frustum-visible set into the
-// render-thread snapshot. MAIN THREAD ONLY, called at kick (frameSetupEarly, right
-// after buildFrustumVisibleSet) before the worker reads it. s_frustumVisibleKeys is
-// only rewritten by the next frame's buildFrustumVisibleSet, which runs after the
-// job is fenced (renderStage0), so the snapshot also decouples the job from that.
-void DistantLand::snapshotVisibleKeysForThread() {
-    s_threadVisibleKeys.assign(s_frustumVisibleKeys.begin(), s_frustumVisibleKeys.end());
-}
-
-// renderThreadDepthCacheJob - Phase 1 render-thread payload.
+// S5a: everything below this point was MGE's DX9 depth pre-pass and its render-thread
+// twin. renderDepth() cleared texDepthFrame and replayed the geometry cache into it;
+// renderDepthFromCache did the per-entry non-skinned + skinned draws; renderDepthAdditional
+// / renderDepthRecorded replayed the recorded scene draws for scenes 1+;
+// renderCacheDepthToMainZ re-drew the same set into MW's MAIN depthstencil (the
+// ForgeNearDepthReplay seam, off by default); and renderThreadDepthCacheJob /
+// snapshotVisibleKeysForThread ran the first two on the MGE render thread during the sky
+// window. The only thing that ever sampled the result was the DX9 post chain's depth
+// effects (SSAO/DOF), which postProcess() already skipped under the Forge seam — the host
+// applies its own GTAO. So the whole stack was producing a texture nobody read.
 //
-// Runs on the MGE render thread, kicked from frameSetupEarly() during the
-// engine's sky window, fenced at the top of renderStage0() before any main-thread
-// device/effect work. Holds the device-submission lock for its entire body so it
-// is atomic against the engine's proxy forwarders. Produces exactly what the
-// serial renderDepth cache path produces — cleared depth + the MW geometry-cache
-// depth — into texDepthFrame/surfDepthDepth, just earlier (overlapping sky).
-//
-// Reads only frame-stable, kick-time-fixed data: mwView/mwProj (set by
-// frameSetupEarly before the kick, not rewritten until renderStage0 after the
-// fence), the GeometryCache (built by the walk before the kick), and the
-// s_threadVisibleKeys snapshot. Uses its OWN effectDepth Begin/End bracket — the
-// fence guarantees the main thread is not inside an effect bracket concurrently.
-void DistantLand::renderThreadDepthCacheJob() {
-    MGE_ZoneScopedN("RenderThread:job");
-    MGE_DEVLOCK();   // hold the device lock for the whole pass
-    DrawStats::ScopedStage _ds(DrawStats::Depth);  // render-thread stage (thread_local)
-
-    if (!device) {
-        return;
-    }
-
-    // Save the full device state the engine left mid-sky; restore it before
-    // releasing the lock so the engine resumes intact. The render target is not
-    // captured by state blocks — RenderTargetSwitcher restores it separately.
-    IDirect3DStateBlock9* sb = nullptr;
-    if (device->CreateStateBlock(D3DSBT_ALL, &sb) != D3D_OK) {
-        sb = nullptr;
-    }
-
-    UINT passes;
-    {
-        RenderTargetSwitcher rtsw(texDepthFrame, surfDepthDepth);
-        device->Clear(0, 0, D3DCLEAR_ZBUFFER, 0, 1.0f, 0);
-
-        // Unbind depth sampler
-        effect->SetTexture(ehTex3, NULL);
-
-        // Projection should cover whole scene
-        D3DXMATRIX distProj = mwProj;
-        editProjectionZ(&distProj, 4.0f, Configuration.DL.DrawDist * kCellSize);
-        effect->SetMatrix(ehProj, &distProj);
-
-        // Own effect bracket — main is not in one yet (fenced before renderStage0).
-        effectDepth->Begin(&passes, D3DXFX_DONOTSAVESTATE);
-
-        // Clear floating point buffer to far depth
-        effectDepth->BeginPass(PASS_CLEARDEPTH);
-        device->SetVertexDeclaration(PosOnlyDecl);
-        device->SetStreamSource(0, vbFullFrame, 0, 12);
-        DrawStats::count(2);
-        device->DrawPrimitive(D3DPT_TRIANGLESTRIP, 0, 2);
-        effectDepth->EndPass();
-
-        renderDepthFromCache(&mwView, &s_threadVisibleKeys);
-
-        effectDepth->End();
-    }
-
-    if (sb) {
-        sb->Apply();
-        sb->Release();
-    }
-}
+// What survives in this file is the part that was never about drawing: the classify feed
+// (updateVisibleSet / earlyClassifyMainScene), the current-frame visible set
+// (buildFrustumVisibleSet) and the fold handoff (foldVisibleKeys) — the Forge host's
+// draw-list inputs. renderStage0 carries the non-early cache-walk fallback that used to
+// sit at the top of renderDepth().
