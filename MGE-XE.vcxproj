@@ -186,7 +186,6 @@
     <ClCompile Include="src\mge\postshaders.cpp" />
     <ClCompile Include="src\mge\quadtree.cpp" />
     <ClCompile Include="src\mge\renderdepth.cpp" />
-    <ClCompile Include="src\mge\renderexterior.cpp" />
     <ClCompile Include="src\mge\renderprocess.cpp" />
     <ClCompile Include="src\imgui\imgui.cpp" />
     <ClCompile Include="src\imgui\imgui_draw.cpp" />
@@ -199,7 +198,6 @@
     <ClCompile Include="src\mge\scenegraph.cpp" />
     <ClCompile Include="src\mge\scenegraph_geometry_cache.cpp" />
     <ClCompile Include="src\mge\statusoverlay.cpp" />
-    <ClCompile Include="src\mge\terrain_horizon_occluder.cpp" />
     <ClCompile Include="src\mge\userhud.cpp" />
     <ClCompile Include="src\mge\videobackground.cpp" />
     <ClCompile Include="src\mwse\funccamera.cpp" />
@@ -270,7 +268,6 @@
     <ClInclude Include="src\mge\datahandler_view.h" />
     <ClInclude Include="src\mge\mge_se_prelude.h" />
     <ClInclude Include="src\mge\statusoverlay.h" />
-    <ClInclude Include="src\mge\terrain_horizon_occluder.h" />
     <ClInclude Include="src\mge\userhud.h" />
     <ClInclude Include="src\mge\videobackground.h" />
     <ClInclude Include="src\mwse\funccamera.h" />

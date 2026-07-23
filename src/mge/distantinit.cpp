@@ -50,7 +50,6 @@ bool DistantLand::hostCullOnly = false;
 // sorted alpha (tasks/forge-world-particles.md) — not enough to justify shipping an engine-state
 // change by default. Opt in per root from the Forge Dev imgui panel.
 int  DistantLand::mwWorldSuppress = 0;
-bool DistantLand::boxOccluderDebug = false;
 int  DistantLand::debugOverlayCycle = 0;
 
 IDirect3DDevice9* DistantLand::device;
@@ -67,23 +66,15 @@ std::vector<DistantLand::DynamicVisGroup> DistantLand::dynamicVisGroups;
 void* DistantLand::lastDistantVisCell;
 bool DistantLand::isDistantLandLoaded = false;
 
-VisibleSet<StlVector> DistantLand::visLand;
-VisibleSet<StlVector> DistantLand::visDistant;
-VisibleSet<StlVector> DistantLand::visDistantSurvivors;
 
-VisibleSet<IpcClientVector> DistantLand::visLandShared;
-VisibleSet<IpcClientVector> DistantLand::visDistantShared;
 IPC::VecView<IPC::DynVisFlag> DistantLand::dynVisFlagsShared;
 IPC::VecView<OcclusionMask::MaskChunk> DistantLand::maskBlobShared;
 
-IPC::VecId DistantLand::visLandSharedId = IPC::InvalidVector;
-IPC::VecId DistantLand::visDistantSharedId = IPC::InvalidVector;
 IPC::VecId DistantLand::dynVisFlagsSharedId = IPC::InvalidVector;
 IPC::VecId DistantLand::maskBlobSharedId = IPC::InvalidVector;
 
 vector<DistantLand::RecordedState> DistantLand::recordMW;
 std::unordered_map<IDirect3DVertexBuffer9*, DistantLand::LandMeshCache> DistantLand::landMeshes;
-std::vector<std::uint8_t> DistantLand::msocOccluded;
 
 IDirect3DTexture9* DistantLand::texWorldColour, *DistantLand::texWorldNormals, *DistantLand::texWorldDetail;
 IDirect3DTexture9* DistantLand::texDepthFrame;
@@ -337,21 +328,9 @@ bool DistantLand::initIpc() {
     }
 
     // allocate shared vectors that will be reused for the duration of the program
-    auto maybeLandVec = ipcClient.allocVecBlocking<RenderMesh>(1, 200000, 1);
-    if (!maybeLandVec.has_value()) {
-        return false;
-    }
-    auto& landVec = maybeLandVec.value();
-    visLandSharedId = landVec.id();
-    visLandShared.SetVector((IpcClientVector(landVec)));
-
-    auto maybeDistantVec = ipcClient.allocVecBlocking<RenderMesh>(1, 200000, 1);
-    if (!maybeDistantVec.has_value()) {
-        return false;
-    }
-    auto& distantVec = maybeDistantVec.value();
-    visDistantSharedId = distantVec.id();
-    visDistantShared.SetVector((IpcClientVector(distantVec)));
+    // S4b: two 200k-RenderMesh shared vectors were allocated here, for the distant-land
+    // and distant-statics visible sets. Both consumers are gone (the host owns distant
+    // land and statics); the land one was never even filled — nothing requested VIS_LAND.
 
     // S4: a MaxGrassElements RenderMesh vector was allocated here, kept fully resident so
     // the grass instance VB could be built without copying. MGE no longer renders grass.
@@ -1197,18 +1176,12 @@ void DistantLand::release() {
     }
     meshCollectionLand.clear();
 
-    // Drop the per-tile mesh cache so its position + index buffers
-    // don't leak across release/init cycles. Map keys are the now-
-    // released VB pointers, so any survivor would also be a dangling-
-    // pointer hazard. Paired with the horizon-curtain workspace
-    // teardown below.
+    // Drop the per-tile mesh cache so its position + index buffers don't leak across
+    // release/init cycles. Map keys are the now-released VB pointers, so any survivor
+    // would also be a dangling-pointer hazard.
+    // (S4b: the horizon-curtain workspace teardown and the MSOC cull-worker join were
+    // paired with this; both subsystems are gone.)
     landMeshes.clear();
-    shutdownHorizonWorkspace();
-
-    // Tear down the dedicated MSOC cull worker so the thread doesn't outlive
-    // the renderer across init/release cycles (mirrors the SceneGraph worker
-    // shutdown). Safe to call when the worker was never spawned.
-    joinCullWorker();
 
     if (texWorldColour) {
         texWorldColour->Release();

@@ -395,55 +395,15 @@ void DistantLand::renderDepth() {
         }
     }
 
-    // Channel-free gate: when frameSetupEarly dispatched the statics verdict to
-    // the cull worker, the worker holds the single-channel ipcClient until it
-    // has drained the statics RPC. Block here — after the cache-only depth pass
-    // above (which touches no ipcClient and overlaps the drain), and before any
-    // main-thread ipcClient touch downstream (distant statics consume / grass /
-    // shadow / land / water RPCs) — so none of them race the worker's drain.
-    // No-op when the worker path is inactive. Now that the kickoff fires before
-    // the GeometryCache walk, the drain typically completes during sky + walk
-    // and this reads ~0.
-    waitCullChannelFree();
+    // S4b: a channel-free gate sat here, blocking until the MSOC cull worker had drained
+    // the distant-statics RPC off the single-channel ipcClient. Both the worker and the
+    // RPC are gone.
 
-    if (isDistantCell()) {
-        if (!mwBridge->IsUnderwater(eyePos.z)) {
-            // Distant land depth (skipped when Forge owns depth — no consumer).
-            if (mwBridge->IsExterior() && !forgeOwnsDepth) {
-                MGE_ZoneScopedN("renderDepth:land");
-                MGE_SCOPED_TIMER("renderDepth:land");
-                effectDepth->BeginPass(PASS_RENDERLANDDEPTH);
-                renderDistantLandZ();
-                effectDepth->EndPass();
-            }
-
-            // Finish the async statics cull here so depth and color both
-            // consume the same msocOccluded mask. Moved from Stage0's
-            // color pass so it overlaps with land depth on the GPU.
-            // SURVIVES forgeOwnsDepth: the statics RPC must be drained to keep the IPC channel paired.
-            // Skipped on early-Forge-kickoff frames: the cull kickoff was gated off in
-            // frameSetupEarly (no RPC to drain), keeping the kickoff/finish pairing symmetric.
-            if ((Configuration.MGEFlags & USE_DISTANT_STATICS) && !earlyForgeKickoff) {
-                cullDistantStatics_finish();
-            }
-
-            // Distant statics depth (renderdepth.cpp:310 — skipped when Forge owns depth, no consumer).
-            if (!forgeOwnsDepth) {
-                MGE_ZoneScopedN("renderDepth:statics");
-                MGE_SCOPED_TIMER("renderDepth:statics");
-                DrawStats::ScopedStage _ds(DrawStats::DepthStatics);
-                effectDepth->BeginPass(PASS_RENDERSTATICSDEPTH);
-                device->SetVertexDeclaration(StaticDecl);
-                // Cull-then-sort: iterate the compacted survivor set (occluded
-                // instances already removed by applyMSOCToDistantStatics).
-                visDistantSurvivors.Render(device, effectDepth, effect, &ehTex0, &ehHasAlpha, &ehHasVCol, &ehWorld, SIZEOFSTATICVERT, false);
-                effectDepth->EndPass();
-            }
-        }
-
-        // S4: the grass cull + grass depth pass were here. MGE's grass renderer is gone
-        // (rendergrass.cpp); the Forge host reimplements grass from distant-land data.
-    }
+    // S4b: distant-land depth (renderDistantLandZ), the statics cull join and the distant-
+    // statics depth replay were here, all inside an isDistantCell() branch. The Forge host
+    // owns distant land and statics end to end; visLand was in fact never populated at all
+    // (nothing ever requested VIS_LAND), so the land depth pass had been drawing an empty
+    // set well before this.
 
     // Reset projection matrix
     effect->SetMatrix(ehProj, &mwProj);
