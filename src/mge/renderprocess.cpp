@@ -534,6 +534,10 @@ namespace {
     // so every new-cell light takes a fresh id. Continuous exterior walking never trips it.
     std::uint32_t                               g_cellEpoch = 0;
     constexpr float         kCellTeleportDist = 8192.0f;   // one MW cell moved in ONE frame = teleport
+    // MW's loading bar was up since the last cell-epoch check ⇒ the scene graph was rebuilt under
+    // the cache. Set by noteLoadingBar from the per-frame path, consumed by checkCellEpochAndPurge.
+    // STICKY on purpose: the two run on different cadences (every frame vs produced frames only).
+    bool                                        g_sawLoadingBar = false;
 
     // --- Produce mode 3 "PARK-AND-FIRE" ---------------------------------------------------
     // The worker builds frame N's payload into the client-private scratch vectors and PARKS it
@@ -3736,16 +3740,15 @@ namespace RenderProcess {
         // are: the interior-cell pointer is unchanged and the eye lands back on the same spot — yet
         // MW tore the scene graph down and rebuilt it, so every cached entry is keyed on a dead
         // shape address while the new scene captures alongside it. That is the reported "reload →
-        // frozen duplicate NPCs" (measured live: 68,400 frames across several reloads with not one
-        // [cell-purge] line). The loading bar is the engine's own authoritative "the world is being
-        // rebuilt" flag and covers every rebuild MW does, including the two above. Purge on its
-        // FALLING edge — during the load there is nothing to purge to yet, and the first frame
-        // after it clears is exactly when the stale entries would otherwise be emitted.
-        static bool s_sawLoadingBar = false;
-        const bool  loadingNow = MWBridge::get()->isLoadingBar();
-        const bool  reloaded   = s_sawLoadingBar && !loadingNow;
-        s_sawLoadingBar = loadingNow;
-        if (loadingNow) { return; }   // mid-load: the roots are in flux, decide on the way out
+        // frozen duplicate NPCs", and the stale skinned entries (dead bone palettes) are the
+        // "broken skinning" in the same report — one root cause, two symptoms.
+        //
+        // The signal is MW's loading bar, latched for us by frameSetupEarly (see noteLoadingBar):
+        // this function runs only on PRODUCED frames and a load produces none, so reading the flag
+        // here would never catch it up. g_sawLoadingBar is sticky — consumed, not sampled — so the
+        // purge fires on the first produced frame after the load however long that takes.
+        const bool reloaded = g_sawLoadingBar;
+        g_sawLoadingBar = false;
         if (interiorCell != s_lastInteriorCell || teleport || reloaded) {
             ++g_cellEpoch;
             g_lightTracks.clear();   // new-cell lights all take fresh ids (no address-reuse inheritance)
@@ -4940,6 +4943,22 @@ namespace RenderProcess {
 
     bool hasCompositeFrame() {
         return g_mainTexValid;
+    }
+
+    void noteLoadingBar(bool loading) {
+        // Set only — cleared by checkCellEpochAndPurge when it acts on it. A load spans many
+        // frames and the purge may not get a produced frame until well after the bar drops, so
+        // sampling the edge here and hoping the consumer is listening would lose it.
+        // Rising-edge log: this arming step is invisible in [cell-purge] when it fails (the purge
+        // simply reports reloaded=0, which is also what a working latch prints when there was no
+        // load), and two fixes have already been shipped blind on exactly that ambiguity. One line
+        // per load says whether the flag was ever seen at all.
+        static bool s_prev = false;
+        if (loading && !s_prev) {
+            LOG::logline(">> [loadbar] up — reload purge ARMED");
+        }
+        s_prev = loading;
+        if (loading) { g_sawLoadingBar = true; }
     }
 
     void discardPendingCaptures() {

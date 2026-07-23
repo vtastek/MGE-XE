@@ -214,9 +214,10 @@ void DistantLand::frameSetupEarly() {
     // (getSceneSunlight, interiors and exteriors both), so only the exterior D3DRS_AMBIENT global
     // (ambCol) is still captured state across a transition.
     static bool s_forgePrevEligible = false;
+    const bool loadingBar = mwBridge->isLoadingBar();
     const bool forgeEligibleNow = Configuration.UseAsyncHostFrame
         && RenderProcess::forgeOwnsFrame()
-        && !mwBridge->isLoadingBar();
+        && !loadingBar;
     earlyForgeKickoff = forgeEligibleNow && s_forgePrevEligible;
     s_forgePrevEligible = forgeEligibleNow;
 

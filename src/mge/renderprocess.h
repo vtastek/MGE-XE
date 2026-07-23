@@ -159,6 +159,13 @@ namespace RenderProcess {
     // with it, so captureAlphaDraw would otherwise accumulate for the life of the menu.
     void discardPendingCaptures();
 
+    // Latch MW's loading-bar flag from the per-frame path. The cache's save-reload purge
+    // (checkCellEpochAndPurge) needs the bar's FALLING edge to know the scene graph was rebuilt
+    // under it, but it runs only on PRODUCED frames and no frame is produced during a load — so it
+    // can never see the bar up on its own. frameSetupEarly reads the flag every frame regardless;
+    // this hands it over. Sticky until the purge consumes it.
+    void noteLoadingBar(bool loading);
+
     // FP1a first-person takeover: true when the seam is live AND compositing AND the Forge FP
     // pass is enabled (ForgeFPPass ini) AND the player is in FIRST person. Gates the cache's
     // armCamera-root walk + the per-frame FP draw lists + the FP camera crossing. Default off
