@@ -24,6 +24,7 @@ STRUCT(VSInput)
     DATA(float3, MatDiffuse, TEXCOORD6);   // per-instance: material diffuse rgb
     DATA(float3, MatAmbient, TEXCOORD7);   // per-instance: material ambient rgb
     DATA(float3, MatEmissive,TEXCOORD8);   // per-instance: material emissive rgb
+    DATA(float,  MatAlpha,   TEXCOORD9);   // per-instance: MaterialProperty::alpha (FFE per-draw fade)
 };
 
 STRUCT(VSOutput)
@@ -78,7 +79,12 @@ VSOutput VS_MAIN( VSInput In )
         else if (setIdx == 2u) { Out.Uv2 += anim.xy; }
         else                   { Out.Uv3 += anim.xy; }
     }
-    Out.Color = In.Color;
+    // MaterialProperty::alpha rides the interpolated vertex alpha rather than its own interpolator:
+    // Out.Color.a is read ONLY by multimap_alpha.frag (multimap.frag and depthonly_mm.frag take
+    // In.Color.rgb and nothing else), and adding a VSOutput field would ripple through every frag
+    // paired with this vert — the GPU-hang pairing hazard. The wide VB ships white (a = 1) whenever
+    // no VertexColorProperty drives the shape, so this reduces to matAlpha in that case.
+    Out.Color = float4(In.Color.rgb, In.Color.a * In.MatAlpha);
     Out.MatDiffuse  = In.MatDiffuse;
     Out.MatAmbient  = In.MatAmbient;
     Out.MatEmissive = In.MatEmissive;

@@ -1394,10 +1394,8 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
         float g = float(mw.x & 0xFu) * (1.0f / 15.0f);
         return (float4(g, g, g, 1.0f));
     }
-
-
-
-    float outA = (vColSource != 0u) ? In.Color.a : 1.0f;
+#line 208 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/multimap_alpha.frag.fsl"
+    float outA = baseA * In.Color.a;
     return (float4(c, outA));
 }
 #line 99 "FSL/shaders.list"
