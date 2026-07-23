@@ -127,27 +127,14 @@ public:
     static void* lastDistantVisCell;
     static bool isDistantLandLoaded;
 
-    static VisibleSet<StlVector> visLand;
-    static VisibleSet<StlVector> visDistant;
-
-    // Cull-then-sort survivor set for distant statics. The server no longer
-    // sorts the full visible set; instead applyMSOCToDistantStatics compacts
-    // the MSOC survivors (msocOccluded[idx]==0) into a contiguous owned buffer
-    // (g_survivorStorage in renderexterior.cpp) and sorts only those (~500 vs
-    // ~13k). Both the depth and color static passes iterate this set. Kept
-    // separate from visDistant (the non-IPC raw cull output) to avoid
-    // overloading its meaning.
-    static VisibleSet<StlVector> visDistantSurvivors;
-
-    static VisibleSet<IpcClientVector> visLandShared;
-    static VisibleSet<IpcClientVector> visDistantShared;
+    // S4b: visLand / visDistant / visDistantSurvivors and their IPC twins are gone with
+    // MGE's distant-land renderer. The Forge host owns distant land and statics.
+    // visLand was never populated at all — nothing ever requested VIS_LAND.
     static IPC::VecView<IPC::DynVisFlag> dynVisFlagsShared;
     // Single-window chunk vec carrying the occlusion-mask blob shipped to the
     // host each frame (host-side cull). Empty/InvalidVector when disabled.
     static IPC::VecView<OcclusionMask::MaskChunk> maskBlobShared;
 
-    static IPC::VecId visLandSharedId;
-    static IPC::VecId visDistantSharedId;
     static IPC::VecId dynVisFlagsSharedId;
     static IPC::VecId maskBlobSharedId;
 
@@ -277,21 +264,6 @@ public:
 
     static void setupCommonEffect(const D3DXMATRIX* view,const  D3DXMATRIX* proj);
 
-    static void renderDistantLandZ();
-    // Build a horizon-curtain occluder from the visible distant-land
-    // tiles and feed it to the plugin's MSOC mask via the pre-
-    // transformed occluder ABI. Without this, the upper half of the
-    // mask is empty and giants at the skyline never cull. Called from
-    // renderStage0 after visLand is materialized; submissions land in
-    // the next frame's mask (one-frame latency by design).
-    static void contributeDistantLandOccluders(bool captureDebug = false);
-    // Voxelize the min-height terrain into merged boxes and feed them to MSOC as
-    // real 3D occluders. Runs on the cull worker every frame (off the main thread)
-    // using a frame-stable view-proj. captureDebug stashes the AABBs for the
-    // Numpad3 in-world overlay.
-    static void contributeTerrainBoxOccluders(const D3DXMATRIX& viewProj, bool captureDebug = false);
-    // Numpad3: draw the terrain-box occluder overlay (capture is otherwise off).
-    static bool boxOccluderDebug;
 
     // In-world debug overlays are compacted onto ONE cycling key (numpad +,
     // VK_ADD). debugOverlayCycle selects which single overlay is active; the
@@ -304,80 +276,13 @@ public:
     // S3: overlay cycle state 5 (reflection cull frustum + cache reflection draw set)
     // went with the water reflection it visualised.
 
-    // Free the horizon-curtain workspace (the lazily-allocated state in
-    // renderexterior.cpp). Called from release() so the malloc'd buffers
-    // don't leak across renderer init/release cycles.
-    static void shutdownHorizonWorkspace();
-    // Two-phase culling so the IPC server's quadtree work overlaps with
-    // the rest of the frame instead of blocking the main thread.
-    //
-    //   _kickoff issues the batched 3-range visibility RPC (or the
-    //   equivalent synchronous quadtree query in the non-IPC path) and
-    //   returns immediately. Must be called once mwView is finalized.
-    //
-    //   _finish blocks until the visible set is populated and then runs
-    //   applyMSOCToDistantStatics over it. Must be called before any
-    //   consumer of the visible set (renderDepth:statics,
-    //   renderDistantStatics, water-reflection statics).
-    static void cullDistantStatics_kickoff(const D3DXMATRIX* view, const D3DXMATRIX* proj);
-    static void cullDistantStatics_finish();
 
-    // --- Dedicated MSOC cull worker -------------------------------------
-    // The distant-statics verdict pass (drain the statics RPC + the
-    // partition/OBB/sphere/propagate core in applyMSOCToDistantStatics) is
-    // pure compute that depends only on an already-ready IPC result. On the
-    // IPC + early-kickoff path it is dispatched to a dedicated worker by
-    // frameSetupEarly so it overlaps the engine's sky pass instead of
-    // stalling cullDistantStatics_finish on the main critical path.
-    //
-    //   updateMSOCCutoffInput  — read the Numpad8/2 live cutoff (main thread)
-    //                            so g_msocCutoffHeight is final before the
-    //                            worker reads it.
-    //   signalCullFinish       — dispatch the verdict pass to the worker.
-    //   waitCullChannelFree    — block until the worker has drained the
-    //                            statics RPC off the single IPC channel;
-    //                            called at renderStage0 entry so no main-
-    //                            thread ipcClient call races the drain.
-    //   joinCullWorker         — tear the worker thread down (release()).
-    static void updateMSOCCutoffInput();
-    static void signalCullFinish();
-    static void waitCullChannelFree();
-    static void joinCullWorker();
-    static void renderMSOCBasinBoundsDebug(const D3DXMATRIX* view, const D3DXMATRIX* proj);
-    static void debugDumpMSOCMask();   // Numpad5 mask dump, post-curtain
-    static void renderCurtainDebug();  // Numpad3 cycle: in-world curtain overlay
-    static void renderBoxOccluderDebug(const D3DXMATRIX* view, const D3DXMATRIX* proj);
-    static void renderBasinDebug(const D3DXMATRIX* view, const D3DXMATRIX* proj);
 
-    // MSOC occlusion verdict pass — walks the visible set, runs the
-    // batched sphere query, applies far/handoff gates and temporal
-    // hysteresis, fills msocOccluded with a per-instance cull mask
-    // (1 = cull, 0 = render). Both the instanced and non-instanced
-    // render paths consume this mask, so MSOC works the same way
-    // regardless of which rendering path is active.
-    template<class T>
-    static void applyMSOCToDistantStatics(VisibleSet<T>& staticSet);
 
-    // Per-instance MSOC verdict, indexed in lockstep with the visible
-    // set's iteration order. Sized = visible set size, filled by
-    // applyMSOCToDistantStatics. 1 = cull this instance, 0 = render.
-    // Empty when MSOC is unavailable / occlusion disabled.
-    static std::vector<std::uint8_t> msocOccluded;
-
-    // --- Basin (watershed) occlusion pre-cull for distant statics ---
-    // View-direction-independent terrain pre-cull run ahead of MSOC on the
-    // cull worker. buildBasinRequiredHeight floods a minimax (watershed)
-    // spill-height surface out from the camera's coarse cell — the lowest
-    // full-cell wall (per-cell terrain MIN, so it's a provable barrier) that
-    // must be cleared to reach each cell. The MSOC pass's middle stage then marks
-    // any static whose OBB top sits below that wall (dense O(1) per static).
-    // The provably conservative test is req > max(eyeZ, top): a low camera
-    // collapses to the static top (aggressive discard), an elevated camera
-    // tightens (ridge must clear the eye), so a visible static is never hidden.
-    // See tasks/todo.md (basin pre-cull). The per-static verdict runs inside the
-    // MSOC pass (group cheap-reject → basin → sphere), so only the flood builder
-    // is exposed here.
-    static void buildBasinRequiredHeight();
+    // S4b: the basin (watershed) pre-cull, the MSOC verdict pass, the cull worker, the
+    // horizon curtain and the terrain-box occluders all fed one consumer — the distant-
+    // statics visible set — and it is gone. The worker had in fact stopped being signalled
+    // when the early-Forge-kickoff gate landed, so none of it had run in Forge play since.
 
     // S3: the water-reflection render (mirrored sky / statics / cache objects / cache
     // terrain, plus their sun-shadow re-draws) went with renderwater.cpp.

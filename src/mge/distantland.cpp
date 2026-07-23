@@ -377,22 +377,10 @@ void DistantLand::frameSetupEarly() {
         // the RPC would go unpaired. That is safe in itself — the next frame's WAIT_FOR_PREVIOUS
         // drains it — but it is work nobody consumes. This is the ONLY part of the early stage that
         // menus genuinely change; everything else below runs in menus exactly as in play.
+        // S4b: the distant-statics cull RPC + MSOC verdict dispatch were here. The whole
+        // chain is gone — the Forge host loads, culls (two-phase Hi-Z on the GPU) and
+        // draws distant statics itself. s_earlyKickedStatics stays false forever now.
         const double tStatics0 = fseNowMs();
-        if ((Configuration.MGEFlags & USE_DISTANT_STATICS) && !earlyForgeKickoff
-                && !mwBridge->IsMenu()) {
-
-            D3DXMATRIX distProj = mwProj;
-            editProjectionZ(&distProj, kDistantNearPlane - 1e-2, Configuration.DL.DrawDist * kCellSize);
-            cullDistantStatics_kickoff(&mwView, &distProj);
-            s_earlyKickedStatics = true;
-
-            // Read the live cutoff input now (main thread) so g_msocCutoffHeight
-            // is final before the worker reads it; then dispatch the verdict
-            // pass to the cull worker. cullDistantStatics_finish joins it.
-            updateMSOCCutoffInput();
-
-            signalCullFinish();
-        }
         dStatics = fseNowMs() - tStatics0;
 
         // Build the geometry cache (walk + VB uploads). The ~1.46ms main-thread
@@ -640,62 +628,21 @@ void DistantLand::renderStage0() {
     }
 
     if (!isRenderCached) {
-        // Save state block manually since we can change FVF/decl, and because the
-        // depth pass runs with D3DXFX_DONOTSAVESTATE.
+        // Save state block manually since we can change FVF/decl, and because the depth
+        // pass runs with D3DXFX_DONOTSAVESTATE.
+        //
+        // S4b: this used to fork on isDistantCell() — the exterior branch ran the statics
+        // cull, the distant land/statics colour passes and the MSOC overlays around the
+        // depth call, the interior branch just ran depth. With all of that deleted the two
+        // branches were character-for-character identical, so there is one path now.
+        // renderDepth still self-gates its own distant parts on isDistantCell().
         device->CreateStateBlock(D3DSBT_ALL, &stateSaved);
         effect->BeginPass(PASS_SETUP);
         effect->EndPass();
 
-        if (isDistantCell()) {
-            // Distant projection matrix. No longer used to DRAW anything here (S4 took the
-            // distant land/statics colour passes); it survives as the projection the statics
-            // cull is issued with, and the one the MSOC debug overlays draw with. NOT pushed
-            // to ehProj: renderDepth expects the near projection on entry and resets ehProj
-            // itself on exit.
-            D3DXMATRIX distProj = mwProj;
-            editProjectionZ(&distProj, kDistantNearPlane - 1e-2, Configuration.DL.DrawDist * kCellSize);
-
-            // Early-Forge-kickoff frames gate the whole statics cull off (frameSetupEarly):
-            // the async RenderFrame owns the IPC channel for all of scene 0, and every MGE
-            // consumer of the cull is suppressed in that mode. kickedOffDistantStatics=false
-            // then routes to visDistant.RemoveAll() below and renderDepth skips
-            // cullDistantStatics_finish — the kickoff/finish pairing stays symmetric.
-            const bool kickedOffDistantStatics =
-                (Configuration.MGEFlags & USE_DISTANT_STATICS) != 0 && !earlyForgeKickoff;
-            // Fallback kickoff: only if frameSetupEarly() didn't already issue it at
-            // BeginScene (non-IPC path, menus, or not-ready early frames).
-            if (kickedOffDistantStatics && !s_earlyKickedStatics) {
-                cullDistantStatics_kickoff(&mwView, &distProj);
-            }
-            if (!mwBridge->IsUnderwater(eyePos.z) && !kickedOffDistantStatics) {
-                visDistant.RemoveAll();
-            }
-
-            // Depth pre-pass: near scene, then distant land and statics. The only DX9
-            // rendering stage 0 still performs. (S5 retires it.)
-            effectDepth->Begin(&passes, D3DXFX_DONOTSAVESTATE);
-            renderDepth();
-            effectDepth->End();
-
-            // Numpad5 MSOC mask dump — reflects the cull worker's box submission.
-            debugDumpMSOCMask();
-
-            // MSOC / terrain-box occluder overlays. These visualise the cull worker, which
-            // outlives every stage of the DX9 retirement, so they stay; they manage their
-            // own device state and run outside any effect Begin/End.
-            renderMSOCBasinBoundsDebug(&mwView, &distProj);
-            renderBasinDebug(&mwView, &distProj);
-            renderBoxOccluderDebug(&mwView, &distProj);
-        } else {
-            // Interior / non-distant cell: no distant land, but the scene-graph cache still
-            // must be rebuilt (evicting stale exterior geometry) and the depth texture
-            // cleared + repopulated — otherwise SSAO/DOF read the last exterior frame.
-            // renderDepth() self-gates its distant land/statics parts off when
-            // !isDistantCell(), leaving the depth clear, the MW cache depth and the walk.
-            effectDepth->Begin(&passes, D3DXFX_DONOTSAVESTATE);
-            renderDepth();
-            effectDepth->End();
-        }
+        effectDepth->Begin(&passes, D3DXFX_DONOTSAVESTATE);
+        renderDepth();
+        effectDepth->End();
 
         // Restore render state
         stateSaved->Apply();
