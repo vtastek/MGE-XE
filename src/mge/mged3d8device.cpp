@@ -838,11 +838,8 @@ HRESULT _stdcall MGEProxyDevice::EndScene() {
                 stage0Complete = true;
             }
 
-            // Opaque features
+            // Close the scene-0 draw window (timing + record-list drain)
             DistantLand::renderStage1();
-
-            // Blend close objects over distant land
-            DistantLand::renderStageBlend();
 
             // Forge present-seam composite (end of scene 0, before scene 1). Two parts, both
             // gated on the live seam owning the opaque world:
