@@ -7565,14 +7565,29 @@ namespace ForgeRender {
                 return -1;
             };
 
-            // Wall-clock frame delta — the whole flicker system (classifier hysteresis, EWMAs, flame phase)
-            // runs on TIME, not frames, so it behaves identically at 60 and 165 fps. Clamped: a hitch, an
-            // alt-tab or a breakpoint must not fast-forward the flame or spike the classifier.
-            static double s_flickPrevMs = 0.0;
-            const double  flickNowMs = hostNowMs();
-            float flickDt = (s_flickPrevMs > 0.0) ? (float)((flickNowMs - s_flickPrevMs) * 0.001) : (1.0f / 60.0f);
-            s_flickPrevMs = flickNowMs;
-            flickDt = std::min(std::max(flickDt, 0.001f), 0.1f);
+            // Frame delta on MW's SIMULATION clock (lighting[32], same source as g_uvAnimSimT) — the
+            // whole flicker system (classifier hysteresis, EWMAs, flame phase) runs on TIME, not
+            // frames, so it behaves identically at 60 and 165 fps. Clamped: a hitch, an alt-tab or a
+            // breakpoint must not fast-forward the flame or spike the classifier.
+            //
+            // SIM, not wall clock, for the same reason the UV-anim takeover uses it: sim time does not
+            // advance in menus. On wall clock the flame kept burning behind an open menu, so a shadow
+            // visibly moved between menu refresh frames while the world was paused — and the menu
+            // cadence made it a jump rather than a drift, since 8 frames of flame land in one refresh.
+            // Sim time freezes there, so dt is exactly 0 and the shadows hold. It also freezes on a
+            // save-load pause and cannot run backwards past the clamp.
+            static double s_flickPrevSim = -1.0;
+            const double  flickNowSim = g_uvAnimSimT;
+            float flickDt = (s_flickPrevSim >= 0.0) ? (float)(flickNowSim - s_flickPrevSim) : (1.0f / 60.0f);
+            s_flickPrevSim = flickNowSim;
+            // Floor is 0, NOT 0.001: a floor would creep the flame forward every frozen menu frame,
+            // which is the bug. Zero is a first-class value here — see flickAdvance.
+            flickDt = std::min(std::max(flickDt, 0.0f), 0.1f);
+            // Frozen frame. The two consumers below that DIVIDE by dt (the motion-speed EWMA and the
+            // classifier's rate normalisation) must be skipped, not fed 0 — an inf/NaN would poison
+            // fErratic permanently and misclassify the light for the rest of the session. The phase
+            // integrators are safe (they add 0) and are left unguarded.
+            const bool flickAdvance = (flickDt > 0.0f);
             // Global flame phase at the BASE rate. Slots integrate their own (motion/wind speed them up);
             // this is the base a newly-assigned slot inherits so its wobble starts mid-flame, not from 0.
             static double s_flickPhaseGlobal = 0.0;
@@ -7626,7 +7641,7 @@ namespace ForgeRender {
                 {
                     constexpr float kMotionTau = 0.15f;    // speed EWMA time constant (s)
                     constexpr float kMotionMax = 3000.0f;  // above this it's a teleport, not a walk (u/s)
-                    if (sl.lastSeenFrame + 1 == frame) {
+                    if (flickAdvance && sl.lastSeenFrame + 1 == frame) {
                         const float spd = std::sqrt(dx*dx + dy*dy + dz*dz) / flickDt;
                         if (spd < kMotionMax) {
                             const float aM = 1.0f - std::exp(-flickDt / kMotionTau);
@@ -7637,7 +7652,10 @@ namespace ForgeRender {
                 sl.absPos[0] = ax; sl.absPos[1] = ay; sl.absPos[2] = az;
                 sl.radius = L.radius; sl.importance = L.imp;
                 sl.lastSeenFrame = frame; sl.activeThisFrame = true; sl.curLightIdx = L.idx;
-                classifyFlickerSlot(sl, L.intensity, flickDt);   // Path A: steady / pulse / flicker from the diffuse signal
+                // Path A: steady / pulse / flicker from the diffuse signal. Skipped on a frozen frame
+                // (see flickAdvance) — the classifier divides by dt, and with the world paused there is
+                // no new intensity information to read anyway.
+                if (flickAdvance) { classifyFlickerSlot(sl, L.intensity, flickDt); }
                 // Advance this slot's own flame phase. Motion and wind push the RATE (a carried torch in a
                 // gale runs fastest); integrating rather than scaling a global clock means a changing rate
                 // never discontinuously jumps the waveform — and dt-driven means it's fps-independent.
