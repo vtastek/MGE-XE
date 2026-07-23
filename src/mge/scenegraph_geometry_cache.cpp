@@ -2922,6 +2922,12 @@ namespace MGE::GeometryCache {
                     // rest of the aged set is kept this sweep and re-evaluated next sweep.
                     const bool gone = cellGridGone(e);
                     bool aged = (g_frame - e.lastFrame > kFarKeepFrames);
+                    // Latch the PRE-rescue value: a successful rescue clears `aged`, which would
+                    // otherwise let the entry fall straight into the detach scan below and be
+                    // climbed a SECOND time in the same sweep. That showed up as [gc] reporting
+                    // kept/sweep and detach/sweep as the same number, and it is what actually
+                    // doubled the sweep cost (0.15 -> 0.25ms/frame) — not the detach scan itself.
+                    const bool wasAged = aged;
                     if (!gone && aged && rootsValid) {
                         if (rescueRunaway) {
                             aged = false;
@@ -2986,7 +2992,7 @@ namespace MGE::GeometryCache {
                     // per-sweep total stays <= cache size — the rescue alone already climbs ~85% of
                     // it. Shares the rescue's runaway watchdog on top of that.
                     bool detached = false;
-                    if (!gone && !aged && rootsValid && !rescueRunaway
+                    if (!gone && !wasAged && rootsValid && !rescueRunaway
                             && (g_frame - e.lastFrame) > detachStale) {
                         if ((++nDetachChecked & 2047) == 0 && gcNowMs() - tClimb0 > kClimbWatchdogMs) {
                             rescueRunaway = true;   // shares the rescue's watchdog latch
