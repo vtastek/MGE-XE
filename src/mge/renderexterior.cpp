@@ -250,165 +250,13 @@ static bool s_cullOnWorker = false;
 
 
 
-// renderSky - Render atmosphere scattering sky layer and other recorded draw calls on top
-void DistantLand::renderSky() {
-    MGE_ZoneScopedN("renderSky");
-    DrawStats::ScopedStage _ds(DrawStats::Sky);
-    // Recorded renders
-    const auto& recordSky_const = recordSky;
-    const int standardCloudVerts = 65, standardCloudTris = 112;
-    const int standardMoonVerts = 4, standardMoonTris = 2;
+// S4: renderSky() lived here — MGE's atmosphere-scattering sky, replayed from the
+// recordSky list captured in inspectIndexedPrimitive. The Forge host owns the sky
+// (SK3/SK4), so both the pass and the record list are gone.
 
-    // Render sky without clouds first
-    effect->BeginPass(PASS_RENDERSKY);
-    for (const auto& i : recordSky_const) {
-        // Skip clouds
-        if (i.texture && i.vertCount == standardCloudVerts && i.primCount == standardCloudTris) {
-            continue;
-        }
+// S4: renderDistantLand() — the DX9 LOD-landscape colour pass — is gone; the Forge host
+// draws LOD land itself. renderDistantLandZ (the depth twin) survives to S5.
 
-        // Set variables in main effect; variables are shared via effect pool
-        effect->SetTexture(ehTex0, i.texture);
-        if (i.texture) {
-            // Textured object; draw as normal in shader, with exceptions:
-            // - Sun/moon billboards do not use mipmaps
-            // - Moon shadow cutout (prevents stars shining through moons)
-            //   which requires colour to be replaced with atmosphere scattering colour
-            bool isBillboard = (i.vertCount == standardMoonVerts && i.primCount == standardMoonTris);
-            bool isMoonShadow = i.destBlend == D3DBLEND_INVSRCALPHA && !i.useLighting;
-
-            effect->SetBool(ehHasAlpha, true);
-            effect->SetBool(ehHasBones, isBillboard);
-            effect->SetBool(ehHasVCol, isMoonShadow);
-            device->SetRenderState(D3DRS_ALPHABLENDENABLE, 1);
-            device->SetRenderState(D3DRS_SRCBLEND, i.srcBlend);
-            device->SetRenderState(D3DRS_DESTBLEND, i.destBlend);
-            device->SetRenderState(D3DRS_ALPHATESTENABLE, 1);
-        } else {
-            // Sky; perform atmosphere scattering in shader
-            effect->SetBool(ehHasAlpha, false);
-            effect->SetBool(ehHasVCol, true);
-            device->SetRenderState(D3DRS_ALPHABLENDENABLE, 0);
-            device->SetRenderState(D3DRS_ALPHATESTENABLE, 0);
-        }
-
-        effect->SetMatrix(ehWorld, &i.worldTransforms[0]);
-        effect->CommitChanges();
-
-        device->SetStreamSource(0, i.vb, i.vbOffset, i.vbStride);
-        device->SetIndices(i.ib);
-        device->SetFVF(i.fvf);
-        DrawStats::count(i.primCount);
-        device->DrawIndexedPrimitive(i.primType, i.baseIndex, i.minIndex, i.vertCount, i.startIndex, i.primCount);
-    }
-    effect->EndPass();
-
-    // Render clouds with a separate shader
-    effect->BeginPass(PASS_RENDERCLOUDS);
-    for (const auto& i : recordSky_const) {
-        // Clouds only
-        if (!(i.texture && i.vertCount == standardCloudVerts && i.primCount == standardCloudTris)) {
-            continue;
-        }
-
-        effect->SetTexture(ehTex0, i.texture);
-        effect->SetBool(ehHasAlpha, true);
-        device->SetRenderState(D3DRS_ALPHABLENDENABLE, 1);
-        device->SetRenderState(D3DRS_SRCBLEND, i.srcBlend);
-        device->SetRenderState(D3DRS_DESTBLEND, i.destBlend);
-        device->SetRenderState(D3DRS_ALPHATESTENABLE, 1);
-        effect->SetMatrix(ehWorld, &i.worldTransforms[0]);
-        effect->CommitChanges();
-
-        device->SetStreamSource(0, i.vb, i.vbOffset, i.vbStride);
-        device->SetIndices(i.ib);
-        device->SetFVF(i.fvf);
-        DrawStats::count(i.primCount);
-        device->DrawIndexedPrimitive(i.primType, i.baseIndex, i.minIndex, i.vertCount, i.startIndex, i.primCount);
-    }
-    effect->EndPass();
-}
-
-void DistantLand::renderDistantLand(ID3DXEffect* e, const D3DXMATRIX* view, const D3DXMATRIX* proj) {
-    MGE_SCOPED_TIMER("renderDistantLand");
-    DrawStats::ScopedStage _ds(DrawStats::Land);
-    D3DXMATRIX world, viewproj = (*view) * (*proj);
-    D3DXVECTOR4 viewsphere(eyePos.x, eyePos.y, eyePos.z, Configuration.DL.DrawDist * kCellSize);
-
-    // Cull and draw
-    ViewFrustum frustum(&viewproj);
-
-    if (Configuration.UseSharedMemory) {
-        // kick the operation off early so we can do some additional work while it runs
-        visLandShared.RemoveAll();
-        ipcClient.getVisibleMeshes(visLandSharedId, frustum, viewsphere, VIS_LAND);
-    }
-
-    D3DXMatrixIdentity(&world);
-    effect->SetMatrix(ehWorld, &world);
-
-    effect->SetTexture(ehTex0, texWorldColour);
-    effect->SetTexture(ehTex1, texWorldNormals);
-    effect->SetTexture(ehTex2, texWorldDetail);
-    e->CommitChanges();
-
-    if (!Configuration.UseSharedMemory) {
-        visLand.RemoveAll();
-        DistantLandShare::LandQuadTree.GetVisibleMeshes(frustum, viewsphere, visLand);
-    }
-
-    device->SetVertexDeclaration(LandDecl);
-
-    if (Configuration.UseSharedMemory) {
-        visLandShared.Render(device, SIZEOFLANDVERT, true);
-    } else {
-        visLand.Render(device, SIZEOFLANDVERT);
-    }
-
-    // Visible land-tile count diagnostic.
-    // Visible land-tile count diagnostic. Gated by LogDistantPipeline.
-    // Logged AFTER Render, because in IPC mode getVisibleMeshes is
-    // async and the size isn't unpacked until the parallel-read pass
-    // inside Render. Sampling before that returns 0 regardless of
-    // how many tiles are actually visible.
-    if (Configuration.LogDistantPipeline) {
-        static int diagFrameCounter = 0;
-        if ((diagFrameCounter++ % 60) == 0) {
-            const unsigned tiles = Configuration.UseSharedMemory
-                ? (unsigned)visLandShared.Size()
-                : (unsigned)visLand.Size();
-            LOG::logline("-- DL land: tiles=%u", tiles);
-        }
-    }
-
-    // Horizon-curtain occluder contribution lives in renderStage0 (the
-    // main exterior render path), NOT here, because renderDistantLand
-    // also fires for the water-reflection and shadow-cast passes with
-    // different view matrices. The contribution always projects through
-    // mwView, so running it once per frame from the main path is enough
-    // — running it from here too would submit duplicate curtains.
-}
-
-// Horizon-curtain terrain occluder.
-//
-// Instead of rasterizing raw terrain triangles (which over-culls statics
-// sitting ON the hill surface, because MOC's min-depth test on a filled
-// hill-top volume buries anything with a nearer center), we build a 1D
-// screen-space silhouette and emit a ~120-triangle "curtain" that hangs
-// from the silhouette to the screen bottom at the terrain's FAR depth.
-//
-// Why this is conservative in the right direction: a static on top of a
-// hill projects ABOVE the silhouette (y > h[c]) so is never tested
-// against the curtain. A static behind the hill projects BELOW the
-// silhouette and has center depth < terrain-far, so it's correctly
-// reported OCCLUDED.
-//
-// Algorithm: reference impl in terrain_horizon_occluder.{h,cpp} (dropped
-// from D:/Modding/horizon/). We drive the "horizon build" phase ourselves
-// by projecting each cached tile's triangles through the current view-
-// projection and feeding `thc_horizon_test_and_update` once per triangle,
-// then call the reference's simplify + emit, fix up the vertex layout for
-// MOC's consumption, and submit via mwse_addPreTransformedOccluder.
 void DistantLand::contributeDistantLandOccluders(bool captureDebug) {
     MGE_ZoneScopedN("contributeOccluders");
     MGE_SCOPED_TIMER("contributeDistantLandOccluders");
@@ -1199,22 +1047,8 @@ void DistantLand::cullDistantStatics_finish() {
     // which always runs before this finish; no reset needed here.)
 }
 
-void DistantLand::renderDistantStatics() {
-    MGE_ZoneScopedN("renderDistantStatics");
-    MGE_SCOPED_TIMER("renderDistantStatics");
-    DrawStats::ScopedStage _ds(DrawStats::Statics);
-    // Handover band near-cut clip plane is set by the caller (renderStage0), bracketed
-    // with the distant projection these statics are drawn with so the view-z slab cuts
-    // at the intended band start. (Was an interior-only mwProj clip here — moved out so
-    // the plane matches distProj and covers exteriors too.)
-
-    device->SetVertexDeclaration(StaticDecl);
-
-    // Cull-then-sort: iterate the compacted, state-sorted survivor set built
-    // by applyMSOCToDistantStatics (IPC and non-IPC paths alike). The old
-    // skipMask plumbing is gone — occluded instances are already absent.
-    visDistantSurvivors.Render(device, effect, effect, &ehTex0, nullptr, &ehHasVCol, &ehWorld, SIZEOFSTATICVERT, false);
-}
+// S4: renderDistantStatics() — the DX9 LOD-statics colour pass — is gone; the Forge host
+// draws LOD statics itself.
 
 void DistantLand::renderMSOCBasinBoundsDebug(const D3DXMATRIX* view, const D3DXMATRIX* proj) {
     DrawStats::ScopedStage _ds(DrawStats::Debug);

@@ -44,7 +44,7 @@ inline double fseNowMs() {
 
 constexpr unsigned kFseWindow = 300;
 struct FseAccum {
-    double lights, cell, view, statics, walk, classify, vis, grass, kick, rt, total;
+    double lights, cell, view, statics, walk, classify, vis, kick, rt, total;
     double maxTotal;
     unsigned n, extN;
 };
@@ -70,11 +70,11 @@ void mwDrawsAccum(double ms) {
 
 // One call at the end of frameSetupEarly; logs the averaged breakdown every window.
 void fseAccum(double lights, double cell, double view, double statics, double walk,
-              double classify, double vis, double grass, double kick, double rt,
+              double classify, double vis, double kick, double rt,
               double total, bool exterior) {
     s_fse.lights += lights; s_fse.cell += cell; s_fse.view += view;
     s_fse.statics += statics; s_fse.walk += walk; s_fse.classify += classify;
-    s_fse.vis += vis; s_fse.grass += grass; s_fse.kick += kick; s_fse.rt += rt;
+    s_fse.vis += vis; s_fse.kick += kick; s_fse.rt += rt;
     s_fse.total += total;
     if (total > s_fse.maxTotal) s_fse.maxTotal = total;
     if (exterior) ++s_fse.extN;
@@ -84,14 +84,14 @@ void fseAccum(double lights, double cell, double view, double statics, double wa
     // accounted = the sum of the named steps; total - accounted is frameSetupEarly's own
     // residue (branch/gate work). A large residue means the split is missing a step.
     const double accounted = (s_fse.lights + s_fse.cell + s_fse.view + s_fse.statics
-                            + s_fse.walk + s_fse.classify + s_fse.vis + s_fse.grass
+                            + s_fse.walk + s_fse.classify + s_fse.vis
                             + s_fse.kick + s_fse.rt) * inv;
     LOG::logline(">> [fse] %u frames avg: total=%.2f | lights=%.2f cell=%.2f view=%.2f "
-                 "statics=%.2f walk=%.2f classify=%.2f vis=%.2f grass=%.2f kick=%.2f rt=%.2f "
+                 "statics=%.2f walk=%.2f classify=%.2f vis=%.2f kick=%.2f rt=%.2f "
                  "=> accounted=%.2f residue=%.2f | max total=%.2f ext=%u",
                  s_fse.n, s_fse.total * inv, s_fse.lights * inv, s_fse.cell * inv,
                  s_fse.view * inv, s_fse.statics * inv, s_fse.walk * inv,
-                 s_fse.classify * inv, s_fse.vis * inv, s_fse.grass * inv,
+                 s_fse.classify * inv, s_fse.vis * inv,
                  s_fse.kick * inv, s_fse.rt * inv,
                  accounted, s_fse.total * inv - accounted,
                  s_fse.maxTotal, s_fse.extN);
@@ -114,14 +114,13 @@ void DistantLand::frameSetupEarly() {
     MGE_ZoneScopedN("frameSetupEarly");
     // [fse] step stamps (see fseAccum above). Deltas stay 0 for steps this frame skipped.
     const double tFse0 = fseNowMs();
-    double dStatics = 0, dWalk = 0, dClassify = 0, dVis = 0, dGrass = 0, dKick = 0, dRt = 0;
+    double dStatics = 0, dWalk = 0, dClassify = 0, dVis = 0, dKick = 0, dRt = 0;
 
     s_frameSetupEarly = false;
     s_earlyKickedStatics = false;
     earlyWalkedCache = false;
     renderThreadJobKicked = false;
     earlyForgeKickoff = false;
-    earlyCulledGrass = false;
 
     // Drive the scene-graph lights snapshot here (moved from renderStage0, which
     // runs *after* the engine's ~1.6ms sky pass). On the async path onFrameReady
@@ -313,21 +312,10 @@ void DistantLand::frameSetupEarly() {
         return;
     }
 
-    // Early Forge kickoff frames: run the grass cull NOW, before the async window opens.
-    // Grass is the one scene-0 RPC with a live consumer in Forge mode (MGE still draws grass
-    // color — the host has no grass), so it can't be gated off like the statics cull; it moves
-    // ahead of the kickoff instead. HOISTED above the fire point (2026-07-21): it needs only
-    // mwView/mwProj (read above), and in produce mode 3 the park fire below opens the async
-    // window for the WHOLE frame — a grass RPC after it would be REFUSED. (This also closes
-    // the latent mode-2 hazard of the grass RPC landing inside frame N-1's still-open window.)
-    // renderDepth skips its own cullGrass via earlyCulledGrass.
-    if (earlyForgeKickoff && (Configuration.MGEFlags & USE_GRASS) && mwBridge->IsExterior()
-        && isDistantCell()) {
-        const double tGrass0 = fseNowMs();
-        cullGrass(&mwView, &mwProj);
-        earlyCulledGrass = true;
-        dGrass = fseNowMs() - tGrass0;
-    }
+    // S4: the early grass cull sat here. Grass was the one scene-0 RPC with a live
+    // consumer in Forge mode (MGE drew grass colour; the host has no grass yet), so it
+    // had to run ahead of the park fire rather than be gated off. MGE's grass renderer
+    // is gone now; the host reimplements it from distant-land data.
 
     // PRODUCE MODE 3 FIRE POINT: ship the payload the worker parked last frame, restamped
     // with this frame's camera. Everything is in place exactly here — camera fresh (read
@@ -520,7 +508,7 @@ void DistantLand::frameSetupEarly() {
 
     const double tEnd = fseNowMs();
     fseAccum(tLights - tFse0, tCell - tLights, tView - tCell, dStatics, dWalk,
-             dClassify, dVis, dGrass, dKick, dRt, tEnd - tFse0,
+             dClassify, dVis, dKick, dRt, tEnd - tFse0,
              isDistantCell() && !mwBridge->IsMenu());
 }
 
@@ -594,14 +582,13 @@ void DistantLand::renderStage0() {
     // built in frameSetupEarly, the distant-statics cull RPC is gated off there, and
     // every DX9 pass below would be overwritten by the present composite), skip the
     // entire DX9 scene layer. Preserve only the per-frame state this stage OWNS: the
-    // record-list drain (recordMW/recordSky are still captured in inspectIndexedPrimitive but have
+    // record-list drain (recordMW is still captured in inspectIndexedPrimitive but has
     // no Forge consumer, so they grow across frames if not cleared) and the menu-cache latch above.
     // The render-thread fence above still ran and the Tracy sky zone was closed at the top.
     // Warm-up / F11-off frames (!earlyForgeKickoff) fall through to the full path
     // — that's where the cache-walk fallback and the statics-RPC drain still live.
     if (earlyForgeKickoff) {
         recordMW.clear();
-        recordSky.clear();
         return;
     }
 
@@ -638,29 +625,10 @@ void DistantLand::renderStage0() {
     // (isRenderCached maintenance hoisted above the earlyForgeKickoff early return — see there.)
     isPPLActive = (Configuration.MGEFlags & USE_FFESHADER) && !(Configuration.PerPixelLightFlags == 1 && !mwBridge->IntCurCellAddr());
 
-    // Phase 1 Milestone 1 A/B toggle. Read NUMPAD7 once per frame here (before the
-    // engine's near-scene inspectIndexedPrimitive calls) so the mode is stable for
-    // the whole frame. CACHE mode draws the simple-opaque subset from the cache in
-    // renderStage0 and suppresses the engine's covered opaque draws.
-    if (GetAsyncKeyState(VK_NUMPAD7) & 0x0001) {
-        // 3-state cycle: ENGINE -> CACHE -> CACHE-ONLY -> ENGINE.
-        // ENGINE     : cacheOpaqueMode=0, cacheOnlyMode=0 (untouched reactive path)
-        // CACHE      : cacheOpaqueMode=1, cacheOnlyMode=0 (cache owns opaque; rest reactive)
-        // CACHE-ONLY : cacheOpaqueMode=1, cacheOnlyMode=1 (only cache draws scene 0; rest black)
-        if (!cacheOpaqueMode) {
-            cacheOpaqueMode = true;  cacheOnlyMode = false;
-            // NOTE: CACHE mode is the obsolete pre-DX12 opaque-cache attempt, superseded by the
-            // Forge takeover. The DX9 mirror VB it drew is no longer built (needMirror() excludes
-            // cacheOpaqueMode), so this now renders empty — kept only as an inert legacy toggle.
-            StatusOverlay::setStatus("Opaque source: CACHE (legacy/empty — superseded by Forge)");
-        } else if (!cacheOnlyMode) {
-            cacheOnlyMode = true;
-            StatusOverlay::setStatus("Opaque source: CACHE-ONLY (cache coverage; rest suppressed)");
-        } else {
-            cacheOpaqueMode = false; cacheOnlyMode = false;
-            StatusOverlay::setStatus("Opaque source: ENGINE (reactive)");
-        }
-    }
+    // S4: the NUMPAD7 opaque-source cycle (ENGINE / CACHE / CACHE-ONLY) went with
+    // rendercachedcolor.cpp. CACHE mode was the pre-DX12 opaque-cache attempt; its DX9
+    // mirror VB stopped being built long ago (needMirror() excluded it), so it had been
+    // drawing nothing for some time. The Forge takeover is what CACHE mode was reaching for.
 
     // VK_DECIMAL: A/B toggle tiled vs per-mesh point lighting (numpad digits are all
     // taken — Numpad4=heatmap, Numpad7=cache, Numpad1=water proxy). Master config flag
@@ -672,252 +640,79 @@ void DistantLand::renderStage0() {
     }
 
     if (!isRenderCached) {
-        ///LOG::logline("Sky prims: %d", recordSky.size());
+        // Save state block manually since we can change FVF/decl, and because the
+        // depth pass runs with D3DXFX_DONOTSAVESTATE.
+        device->CreateStateBlock(D3DSBT_ALL, &stateSaved);
+        effect->BeginPass(PASS_SETUP);
+        effect->EndPass();
 
         if (isDistantCell()) {
-            {
-                MGE_ZoneScopedN("Stage0:setup");
-                // Save state block manually since we can change FVF/decl
-                device->CreateStateBlock(D3DSBT_ALL, &stateSaved);
-                effect->BeginPass(PASS_SETUP);
-                effect->EndPass();
-            }
-
-            // Distant projection matrix — pulled forward so the IPC
-            // server can start the distant-statics quadtree fetch
-            // immediately, in parallel with renderShadowMap /
-            // renderDistantLand / contributeDistantLandOccluders. The
-            // matched cullDistantStatics_finish() call below picks up
-            // the result.
+            // Distant projection matrix. No longer used to DRAW anything here (S4 took the
+            // distant land/statics colour passes); it survives as the projection the statics
+            // cull is issued with, and the one the MSOC debug overlays draw with. NOT pushed
+            // to ehProj: renderDepth expects the near projection on entry and resets ehProj
+            // itself on exit.
             D3DXMATRIX distProj = mwProj;
             editProjectionZ(&distProj, kDistantNearPlane - 1e-2, Configuration.DL.DrawDist * kCellSize);
 
             // Early-Forge-kickoff frames gate the whole statics cull off (frameSetupEarly):
             // the async RenderFrame owns the IPC channel for all of scene 0, and every MGE
             // consumer of the cull is suppressed in that mode. kickedOffDistantStatics=false
-            // then routes the color path to visDistant.RemoveAll() below and renderDepth
-            // skips cullDistantStatics_finish — the kickoff/finish pairing stays symmetric.
+            // then routes to visDistant.RemoveAll() below and renderDepth skips
+            // cullDistantStatics_finish — the kickoff/finish pairing stays symmetric.
             const bool kickedOffDistantStatics =
                 (Configuration.MGEFlags & USE_DISTANT_STATICS) != 0 && !earlyForgeKickoff;
-            // Fallback kickoff: only if frameSetupEarly() didn't already issue it
-            // at BeginScene (non-IPC path, menus, or not-ready early frames).
-            // When it did, the cull has been overlapping the sky window already.
+            // Fallback kickoff: only if frameSetupEarly() didn't already issue it at
+            // BeginScene (non-IPC path, menus, or not-ready early frames).
             if (kickedOffDistantStatics && !s_earlyKickedStatics) {
                 cullDistantStatics_kickoff(&mwView, &distProj);
             }
+            if (!mwBridge->IsUnderwater(eyePos.z) && !kickedOffDistantStatics) {
+                visDistant.RemoveAll();
+            }
 
-            // (Grass culling moved into renderDepth, just before the grass depth
-            // pass — see renderdepth.cpp. Culling it here, right after the statics
-            // kickoff, drained the distant-statics RPC on the one-at-a-time IPC
-            // channel before the GeometryCache walk could overlap that ~2.3ms
-            // server-cull.)
-
-            // Full depth pre-pass: near scene (CPU/GPU overlap with GeomCache
-            // walk) then distant land, statics, grass. Depth buffer is complete
-            // before any color pass runs, enabling early-z across DL, reflections,
-            // and the Morrowind scene.
+            // Depth pre-pass: near scene, then distant land and statics. The only DX9
+            // rendering stage 0 still performs. (S5 retires it.)
             effectDepth->Begin(&passes, D3DXFX_DONOTSAVESTATE);
             renderDepth();
             effectDepth->End();
 
-            // S3: MGE's cascaded sun-shadow map was built here. The Forge host owns sun +
-            // point-light shadows, and its composite overwrites every MGE opaque/DL pixel, so
-            // the map's last consumer was the water reflection — which went with the water.
+            // Numpad5 MSOC mask dump — reflects the cull worker's box submission.
+            debugDumpMSOCMask();
 
-            // Distant everything; the projection bias above keeps distant
-            // land drawn behind anything Morrowind would draw.
-            effect->SetMatrix(ehProj, &distProj);
-
-            effect->Begin(&passes, D3DXFX_DONOTSAVESTATE);
-
-            // Forge owns exterior distant-land COLOR: the host draws LOD land + statics into the
-            // Forge frame and the present composite lays it over MW, so MW's own exterior DL color
-            // here is pure overdraw the composite overwrites. Skip it when Forge owns the frame (F11) in
-            // exteriors. Interiors keep drawing (Forge DL is exterior-only). renderDepth's DL depth +
-            // statics CULL are untouched (separate pass) so SSAO/blend/grass still have their inputs.
-            const bool forgeOwnsExteriorDL =
-                RenderProcess::forgeOwnsFrame() && mwBridge->IsExterior();
-            if (!mwBridge->IsUnderwater(eyePos.z)) {
-                // Draw distant landscape
-                if (mwBridge->IsExterior() && !forgeOwnsExteriorDL) {
-                    effect->BeginPass(PASS_RENDERLAND);
-                    // Handover band near-cut: bound LOD land to the band START so it
-                    // doesn't draw into the near field the cache/engine owns. Plane built
-                    // from distProj (the projection the land is drawn with). Set after
-                    // BeginPass (shader bound) to avoid the FF->shader SetClipPlane bug.
-                    {
-                        D3DXPLANE p = makeBandClipPlane(distProj, nearViewRange - 1152.0f, true);
-                        device->SetClipPlane(0, p);
-                        device->SetRenderState(D3DRS_CLIPPLANEENABLE, 1);
-                    }
-                    renderDistantLand(effect, &mwView, &distProj);
-                    device->SetRenderState(D3DRS_CLIPPLANEENABLE, 0);
-                    effect->EndPass();
-
-                    // The terrain-box occluders are now contributed to MSOC on the
-                    // cull worker every frame (see cullWorkerLoop). The in-world
-                    // overlay of those boxes is now overlay-cycle state 2
-                    // (boxOccluderDebug derived in updateMSOCCutoffInput).
-
-                    // Numpad5 mask dump — reflects the worker's box submission.
-                    debugDumpMSOCMask();
-                }
-
-                // Draw distant statics. cullDistantStatics_finish was called
-                // inside renderDepth (depth pre-pass) so msocOccluded is ready.
-                if (kickedOffDistantStatics) {
-                    if (!forgeOwnsExteriorDL) {
-                        DWORD p = mwBridge->CellHasWeather() ? PASS_RENDERSTATICSEXTERIOR : PASS_RENDERSTATICSINTERIOR;
-                        effect->BeginPass(p);
-                        // Handover band near-cut: bound LOD statics to the band START so big
-                        // architectural meshes don't overshoot into the near field (slices
-                        // the whole object at the slab — no per-origin test that gaps on
-                        // objects spanning the band). distProj-built; exteriors + interiors.
-                        {
-                            D3DXPLANE pl = makeBandClipPlane(distProj, nearViewRange - 768.0f, true);
-                            device->SetClipPlane(0, pl);
-                            device->SetRenderState(D3DRS_CLIPPLANEENABLE, 1);
-                        }
-                        vsr.beginAlphaToCoverage(device);
-                        renderDistantStatics();
-                        vsr.endAlphaToCoverage(device);
-                        device->SetRenderState(D3DRS_CLIPPLANEENABLE, 0);
-                        effect->EndPass();
-                    }
-                }
-                else {
-                    visDistant.RemoveAll();
-                }
-            }
-
-            // Sky scattering and sky objects. Drawn AFTER distant land/statics (so the
-            // horizon haze still blends over them) but BEFORE the cache near pass and
-            // the distant-only blend capture below — so that capture is genuinely
-            // distant-only (no near scene). The cache near is opaque and z-occludes the
-            // sky where present, so moving sky ahead of it leaves the image unchanged.
-            // (Was drawn after cache near; "as late as possible" is satisfied relative
-            // to the distant passes, which is what the horizon blend needs.)
-            if ((Configuration.MGEFlags & USE_ATM_SCATTER) && mwBridge->CellHasWeather()
-                && !RenderProcess::forgeOwnsFrame()) {       // SK3: Forge owns the sky → don't draw MGE's
-                renderSky();
-            }
-
-            // Capture the distant-only frame (distant land + statics + sky, NO near
-            // scene) for the MW/MGE handover blend. renderStage1 PASS_BLENDMGE feathers
-            // this over the near scene across [nearViewRange-512, nearViewRange]. In
-            // ENGINE mode the engine draws the near scene later; in CACHE mode the cache
-            // near is drawn just below — either way the near scene is NOT in this frame,
-            // which is what makes the feather work. (Was captured at the END of stage0,
-            // which in CACHE mode wrongly included the cache near and killed the blend.
-            // Reflection/waves below render to their own RTs, not the backbuffer, so the
-            // backbuffer distant content is final at this point.)
-            if (~Configuration.MGEFlags & NO_MW_MGE_BLEND) {
-                texDistantBlend = PostShaders::borrowBuffer(1);
-            }
-
-            // Phase 1 Milestone 1: in CACHE mode, draw the simple-opaque subset of
-            // the near scene authoritatively from the GeometryCache walk (same
-            // immutable snapshot feeding depth/shadow), replacing the engine's
-            // reactive per-draw opaque (suppressed in inspectIndexedPrimitive). The
-            // real backbuffer + main depthstencil are bound here and the engine's
-            // near scene hasn't run yet, so both paths hit the same RT/camera. Uses
-            // the true near projection; restore the distant projection afterwards
-            // for the reflection passes that follow.
-            if (cacheOpaqueMode) {
-                renderCachedOpaque(&mwView, &mwProj);
-                // M2.1: own the terrain too (objects + terrain = all opaque). The
-                // engine's near-terrain base + splat passes are suppressed in
-                // inspectIndexedPrimitive in CACHE mode, so this is the only near
-                // terrain; DL LOD sits behind via the distant projection.
-                //
-                // Handover band far-cut: bound the full-res cache terrain to the band
-                // END so the DL LOD owns everything beyond it (else cache terrain runs
-                // all the way to the engine view distance, overlapping the LOD). Plane
-                // built from mwProj (cache terrain's projection). renderCachedOpaque
-                // above just issued shader draws, so SetClipPlane sticks here even
-                // before renderCachedTerrain's internal BeginPass.
-                {
-                    D3DXPLANE p = makeBandClipPlane(mwProj, nearViewRange, false);
-                    device->SetClipPlane(0, p);
-                    device->SetRenderState(D3DRS_CLIPPLANEENABLE, 1);
-                }
-                renderCachedTerrain(&mwView, &mwProj);
-                device->SetRenderState(D3DRS_CLIPPLANEENABLE, 0);
-                effect->SetMatrix(ehProj, &distProj);
-            }
-
-            // S3: MGE's water reflection / wave / foam simulation lived here. The Forge host
-            // owns the water surface outright (WT1-WT3), so nothing sampled texReflection any
-            // more and the whole reflect-cull-simulate chain was pure cost.
-
-            effect->End();
+            // MSOC / terrain-box occluder overlays. These visualise the cull worker, which
+            // outlives every stage of the DX9 retirement, so they stay; they manage their
+            // own device state and run outside any effect Begin/End.
             renderMSOCBasinBoundsDebug(&mwView, &distProj);
             renderBasinDebug(&mwView, &distProj);
-            // Curtain occluder superseded by box occluders (contributeTerrainBox-
-            // Occluders); the curtain path is no longer fed, so this overlay always
-            // no-ops. Disabled here but kept defined/parked alongside the basin code.
-            // renderCurtainDebug();
             renderBoxOccluderDebug(&mwView, &distProj);
-
-            // Reset matrices
-            effect->SetMatrix(ehView, &mwView);
-            effect->SetMatrix(ehProj, &mwProj);
-
-            // (Distant-only blend frame is now captured earlier — right after sky and
-            // before the cache near pass — so CACHE mode's near scene is excluded.)
-
-            // Restore render state
-            stateSaved->Apply();
-            stateSaved->Release();
         } else {
-            // Interior / non-distant cell: no distant land, but the scene-graph
-            // cache still must be rebuilt (evicting stale exterior geometry) and
-            // the depth texture cleared + repopulated — otherwise SSAO/DOF read
-            // the last exterior frame. renderDepth() self-gates its distant
-            // land/statics/grass parts off when !isDistantCell(), leaving the
-            // depth clear + MW cache depth + the onFrameReady walk. State-blocked
-            // because effectDepth uses D3DXFX_DONOTSAVESTATE.
-            device->CreateStateBlock(D3DSBT_ALL, &stateSaved);
-            effect->BeginPass(PASS_SETUP);
-            effect->EndPass();
-
+            // Interior / non-distant cell: no distant land, but the scene-graph cache still
+            // must be rebuilt (evicting stale exterior geometry) and the depth texture
+            // cleared + repopulated — otherwise SSAO/DOF read the last exterior frame.
+            // renderDepth() self-gates its distant land/statics parts off when
+            // !isDistantCell(), leaving the depth clear, the MW cache depth and the walk.
             effectDepth->Begin(&passes, D3DXFX_DONOTSAVESTATE);
             renderDepth();
             effectDepth->End();
-
-            stateSaved->Apply();
-            stateSaved->Release();
-
-            // Phase 1 Milestone 1 (non-distant cell): CACHE-mode opaque from the cache
-            // walk. The cache is the engine's NEAR scene (engine view distance), so it
-            // runs independent of distant land — interiors AND DL-off exteriors. Bracket
-            // with a state block (the depth pass restored engine state) so the render
-            // states we touch don't leak into the reflection/wave passes.
-            if (cacheOpaqueMode) {
-                device->CreateStateBlock(D3DSBT_ALL, &stateSaved);
-                effect->Begin(&passes, D3DXFX_DONOTSAVESTATE);
-                renderCachedOpaque(&mwView, &mwProj);
-                // Terrain too, so cache owns ALL opaque here as well (DL-off exteriors;
-                // a no-op in interiors — no isLandscape entries). Engine near terrain is
-                // suppressed in inspectIndexedPrimitive whenever CACHE mode is on.
-                renderCachedTerrain(&mwView, &mwProj);
-                effect->End();
-                stateSaved->Apply();
-                stateSaved->Release();
-            }
-
-            // S3: the interior water reflection + wave/foam sim were here (see the exterior
-            // branch above). Both went with MGE's water renderer — the Forge host owns
-            // interior water surfaces too, so REFLECT_INTERIOR had no consumer left.
         }
+
+        // Restore render state
+        stateSaved->Apply();
+        stateSaved->Release();
     }
 
     // Clear stray recordings
     recordMW.clear();
-    recordSky.clear();
 }
 
-// renderStage1 - Render grass and shadows over near features, and write depth texture for scene 0
+// renderStage1 - EndScene(scene 0). Closes the MW-draw timing window and drains the
+// per-scene record list.
+//
+// S4: the grass colour pass (the last thing this stage drew) is gone with rendergrass.cpp.
+// What remains is bookkeeping the stage owns and nothing else does: the MW-draw accumulator,
+// the Tracy zone close, and the recordMW drain — without which scene 0's records would leak
+// into renderStage2's depth replay for scenes 1+.
 void DistantLand::renderStage1() {
     if (s_mwDrawsT0 != 0.0) {
         mwDrawsAccum(fseNowMs() - s_mwDrawsT0);
@@ -929,51 +724,6 @@ void DistantLand::renderStage1() {
 #endif
     MGE_ZoneScopedN("Stage1");
     MGE_TracyPlot("MW draw calls", (int64_t)recordMW.size());
-
-    // Phase 2 (MW-only pipeline): Forge renders all 3D — skip MGE's grass + shadow
-    // overlay on steady-state Forge frames. Grass returns host-side (fed from distant-
-    // land data); the shadow overlay is already Forge-gated below. Preserve the recordMW
-    // clear this stage owned. (!earlyForgeKickoff keeps the full path for warm-up / menu
-    // / F11-off; the Tracy MW-draws zone was closed at the top.)
-    if (earlyForgeKickoff) {
-        recordMW.clear();
-        return;
-    }
-
-    auto mwBridge = MWBridge::get();
-    IDirect3DStateBlock9* stateSaved;
-    UINT passes;
-
-    ///LOG::logline("Stage 1 prims: %d", recordMW.size());
-
-    if (!isRenderCached) {
-        // Save state block manually since we can change FVF/decl
-        device->CreateStateBlock(D3DSBT_ALL, &stateSaved);
-
-        if (isDistantCell()) {
-            // Render over Morrowind domain
-            effect->Begin(&passes, D3DXFX_DONOTSAVESTATE);
-
-            // Draw grass with shadows
-            if (Configuration.MGEFlags & USE_GRASS) {
-                effect->BeginPass(PASS_RENDERGRASSINST);
-                vsr.beginAlphaToCoverage(device);
-                renderGrassInst();
-                vsr.endAlphaToCoverage(device);
-                effect->EndPass();
-            }
-
-            // S3: the sun-shadow receiver overlay was here. It re-drew recordMW geometry to
-            // darken the backbuffer, which the Forge composite then overwrote; shadows are
-            // host-side now (sun + point-light, with a screen-space mask).
-
-            effect->End();
-        }
-
-        // Restore render state
-        stateSaved->Apply();
-        stateSaved->Release();
-    }
 
     recordMW.clear();
 }
@@ -995,7 +745,7 @@ void DistantLand::renderStage2() {
     // Skip in Forge mode too: this entire block is the recorded-render shadow receiver +
     // recorded depth replay (renderDepthAdditional), both superseded — depth now comes from
     // the cache (renderCacheDepthToMainZ + the depth-texture cache pass) and shadows are
-    // deferred host-side. recordMW capture / recordSky / the clear below are untouched.
+    // deferred host-side. The recordMW capture and the clear below are untouched.
     if (!isRenderCached && !RenderProcess::forgeOwnsFrame()) {
         // Save state block manually since we can change FVF/decl
         device->CreateStateBlock(D3DSBT_ALL, &stateSaved);
@@ -1016,45 +766,10 @@ void DistantLand::renderStage2() {
 }
 
 
-// renderStageBlend - Blend between MGE distant land and Morrowind, rendering caustics first so it blends out
-void DistantLand::renderStageBlend() {
-    auto mwBridge = MWBridge::get();
-    IDirect3DStateBlock9* stateSaved;
-    UINT passes;
-
-    if (isRenderCached) {
-        return;
-    }
-
-    // Forge owns the composited frame (F11): the MW↔MGE handover feather (PASS_BLENDMGE) blends a
-    // distant-only capture into the band the Forge composite then overwrites — invisible. Caustics
-    // likewise draw on MW water that Forge owns. Both consume texDepthFrame; skipping them here is a
-    // step toward retiring the MGE depth pre-pass. F11-off restores the full blend (clean A/B).
-    if (RenderProcess::forgeOwnsFrame()) {
-        return;
-    }
-
-    // Save state block manually since we can change FVF/decl
-    device->CreateStateBlock(D3DSBT_ALL, &stateSaved);
-    effect->Begin(&passes, D3DXFX_DONOTSAVESTATE);
-
-    // S3: water caustics were projected here, onto the MW water surface the host now owns.
-
-    // Blend MW/MGE
-    if (isDistantCell() && (~Configuration.MGEFlags & NO_MW_MGE_BLEND)) {
-        effect->SetTexture(ehTex0, texDistantBlend);
-        effect->SetTexture(ehTex3, texDepthFrame);
-        effect->CommitChanges();
-
-        effect->BeginPass(PASS_BLENDMGE);
-        PostShaders::applyBlend();
-        effect->EndPass();
-    }
-
-    effect->End();
-    stateSaved->Apply();
-    stateSaved->Release();
-}
+// S4: renderStageBlend is gone. It fed the MW<->MGE handover feather (PASS_BLENDMGE over a
+// distant-only capture) and, before S3, the water caustics. Both of its inputs died with the
+// DX9 distant land: there is no distant-only frame to feather any more, and the Forge
+// composite owns the handover band outright.
 
 // setupCommonEffect - Set shared shader variables for this frame
 void DistantLand::setupCommonEffect(const D3DXMATRIX* view, const D3DXMATRIX* proj) {
@@ -1377,7 +1092,7 @@ void DistantLand::postProcess() {
         // S6 has to retire regardless.
         if ((Configuration.MGEFlags & USE_MENU_CACHING) && mwBridge->IsMenu()
                 && !RenderProcess::forgeOwnsFrame()) {
-            texDistantBlend = PostShaders::borrowBuffer(0);
+            texMenuCache = PostShaders::borrowBuffer(0);
             isRenderCached = true;
         }
 
@@ -1391,7 +1106,7 @@ void DistantLand::postProcess() {
         // Blit cached frame to screen
         IDirect3DSurface9* backbuffer, *surfDistant;
         device->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &backbuffer);
-        texDistantBlend->GetSurfaceLevel(0, &surfDistant);
+        texMenuCache->GetSurfaceLevel(0, &surfDistant);
         device->StretchRect(surfDistant, 0, backbuffer, 0, D3DTEXF_NONE);
         surfDistant->Release();
         backbuffer->Release();
@@ -1725,62 +1440,33 @@ bool DistantLand::inspectIndexedPrimitive(int sceneCount, const RenderedState* r
         return false;
     }
 
-    // Special case, capture sky
+    // Special case, detect sky. MW's sky is the first blended geometry of scene 0 in a
+    // weather cell — nothing has written z yet, so recordMW is still empty.
+    //
+    // S4: MGE's atmosphere-scattering sky (renderSky + the recordSky replay list it drew
+    // from) is gone; the Forge host owns the sky (SK3/SK4). So the suppression that used to
+    // hang off USE_ATM_SCATTER — "reject MW's sky, MGE will draw it later in stage 0" — now
+    // hangs off the host actually drawing one. With the seam off, MW draws its own vanilla
+    // sky, which is the fallback this retirement is meant to leave intact.
     if (recordMW.empty() && rs->blendEnable && sceneCount == 0 && mwBridge->CellHasWeather()) {
-        recordSky.emplace_back(*rs);
-        // (Sky FFP facts, probed 2026-07-07: DIPs carry useFog=0 — vanilla never fogs
-        // the sky — and lighting is enabled but fully white (white material, SkyNode
-        // ambientLight amb=(1,1,1) dimmer=1, globalAmbient 0, no active lights), so
-        // raw baked vertex colour IS the exact vanilla sky output. The Forge sky pass
-        // renders shipped vcols directly; SK4 keeps them live.)
-
-        // Check for moon geometry, and mark those records by setting lighting off
-        if (frs->material.emissive.a == kMoonTag) {
-            recordSky.back().useLighting = false;
-        }
-
-        // If using atmosphere scattering, draw sky later in stage 0
-        if ((Configuration.MGEFlags & USE_DISTANT_LAND) && (Configuration.MGEFlags & USE_ATM_SCATTER)) {
+        if (RenderProcess::forgeOwnsFrame()) {
             return false;
         }
     } else {
-        // CACHE mode: the simple-opaque subset (objects + terrain) is drawn
-        // authoritatively by renderCachedOpaque/renderCachedTerrain in renderStage0.
-        // Suppress the engine's reactive draw of those covered parts whenever CACHE
-        // mode is on — INDEPENDENT of the PPL lighting mode. The cache draw isn't
-        // PPL-gated, so suppressing only under isPPLActive let the engine redraw the
-        // same surface in fixed-function mode and the two z-fought (the cache snapshot
-        // pose vs the engine live pose differ by a sub-frame on animated parts).
-        // isLandSplat covers the terrain splat overlay passes so renderCachedTerrain
-        // isn't double-drawn. (recordMW capture above is untouched — depth replay
-        // still sees the engine geometry.)
+        // Suppress the engine's scene-0 opaque draw when the Forge seam owns the frame
+        // (F11 composite live): the host's full-screen composite overwrites MW's frame, so
+        // the engine's draw is redundant double work.
         //
-        // Gated on cacheOpaqueMode ONLY (not isDistantCell): renderStage0 draws the
-        // cache opaque+terrain in BOTH the distant-cell and the non-distant branches,
-        // so the cache owns this geometry regardless of distant land. Gating on
-        // isDistantCell here would un-suppress the engine in the non-distant branch
-        // where the cache still draws -> double draw / z-fight.
+        // sceneCount == 0 is REQUIRED. isCoveredOpaque matches textured opaque in ANY scene,
+        // so without this gate the first-person arm gets suppressed but never host-drawn ->
+        // hands vanish. isLandSplat covers the terrain splat overlay passes and already
+        // self-gates to scene 0. The recordMW capture above is untouched — the depth replay
+        // still sees the engine geometry.
         //
-        // sceneCount == 0 is REQUIRED: the cache records/replays scene 0 (the opaque
-        // world) only. Later scenes — the first-person arm, alpha-sorted, UI — stay on
-        // the engine path (plan scope). isCoveredOpaque matches textured opaque in any
-        // scene, so without this gate the 1st-person arm gets suppressed but never
-        // cache-drawn -> hands vanish. (isLandSplat already self-gates to scene 0.)
-        // Also suppress when the Forge seam owns the opaque world (F11 composite live): the
-        // host's full-screen composite overwrites MW's frame, so the engine's scene-0 draw is
-        // redundant double work. Removing it lets us measure the Forge path's true cost without
-        // the engine's scene 0 confounding the numbers. Same gate as cacheOpaqueMode (scene 0,
-        // covered-opaque or land splat); depth capture above is untouched.
-        if ((cacheOpaqueMode || RenderProcess::forgeOwnsFrame()) && sceneCount == 0
+        // (S4: this gate used to read `cacheOpaqueMode || forgeOwnsFrame()`. The cache half
+        // was the CACHE-mode opaque takeover, which the Forge host superseded.)
+        if (RenderProcess::forgeOwnsFrame() && sceneCount == 0
             && (isCoveredOpaque(rs, frs) || isLandSplat)) {
-            return false;
-        }
-        // CACHE-ONLY diagnostic: suppress every remaining colour draw across ALL scenes
-        // (non-covered opaque, blended fence/lava/glow, decals, first-person hands,
-        // alpha-sorted, UI) so the frame shows ONLY what renderCachedOpaque/
-        // renderCachedTerrain produced. recordMW above is untouched (depth replay still
-        // sees the geometry).
-        if (cacheOnlyMode) {
             return false;
         }
         // PPL reactive colour path: render non-covered opaque (and, in plain PPL mode,

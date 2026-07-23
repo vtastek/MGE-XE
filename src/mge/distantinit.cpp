@@ -29,13 +29,10 @@ using std::vector;
 bool DistantLand::ready = false;
 bool DistantLand::isRenderCached = false;
 bool DistantLand::isPPLActive = false;
-bool DistantLand::cacheOpaqueMode = false;
-bool DistantLand::cacheOnlyMode = false;
 bool DistantLand::earlyWalkedCache = false;
 bool DistantLand::renderThreadJobKicked = false;
 bool DistantLand::earlyForgeKickoff = false;
 bool DistantLand::menuFreeze = false;
-bool DistantLand::earlyCulledGrass = false;
 // Branch A (lead-in shrink): boot HOST-CULL-ONLY. The host's two-phase Hi-Z GPU cull owns
 // occlusion, which lets frameSetupEarly skip the ~1.4ms main-thread MSOC classify entirely —
 // the single largest serial item between MW's physics and the produce kick. VK_SCROLL flips
@@ -63,9 +60,7 @@ ID3DXEffectPool* DistantLand::effectPool;
 IDirect3DVertexDeclaration9* DistantLand::LandDecl;
 IDirect3DVertexDeclaration9* DistantLand::StaticDecl;
 IDirect3DVertexDeclaration9* DistantLand::PosOnlyDecl;
-IDirect3DVertexDeclaration9* DistantLand::GrassDecl;
 
-VendorSpecificRendering DistantLand::vsr;
 
 IPC::Client DistantLand::ipcClient;
 std::vector<DistantLand::DynamicVisGroup> DistantLand::dynamicVisGroups;
@@ -74,32 +69,26 @@ bool DistantLand::isDistantLandLoaded = false;
 
 VisibleSet<StlVector> DistantLand::visLand;
 VisibleSet<StlVector> DistantLand::visDistant;
-VisibleSet<StlVector> DistantLand::visGrass;
 VisibleSet<StlVector> DistantLand::visDistantSurvivors;
 
 VisibleSet<IpcClientVector> DistantLand::visLandShared;
 VisibleSet<IpcClientVector> DistantLand::visDistantShared;
-VisibleSet<IpcClientVector> DistantLand::visGrassShared;
 IPC::VecView<IPC::DynVisFlag> DistantLand::dynVisFlagsShared;
 IPC::VecView<OcclusionMask::MaskChunk> DistantLand::maskBlobShared;
 
 IPC::VecId DistantLand::visLandSharedId = IPC::InvalidVector;
 IPC::VecId DistantLand::visDistantSharedId = IPC::InvalidVector;
-IPC::VecId DistantLand::visGrassSharedId = IPC::InvalidVector;
 IPC::VecId DistantLand::dynVisFlagsSharedId = IPC::InvalidVector;
 IPC::VecId DistantLand::maskBlobSharedId = IPC::InvalidVector;
 
 vector<DistantLand::RecordedState> DistantLand::recordMW;
-vector<DistantLand::RecordedState> DistantLand::recordSky;
-vector< std::pair<const RenderMesh*, int> > DistantLand::batchedGrass;
 std::unordered_map<IDirect3DVertexBuffer9*, DistantLand::LandMeshCache> DistantLand::landMeshes;
 std::vector<std::uint8_t> DistantLand::msocOccluded;
 
 IDirect3DTexture9* DistantLand::texWorldColour, *DistantLand::texWorldNormals, *DistantLand::texWorldDetail;
 IDirect3DTexture9* DistantLand::texDepthFrame;
 IDirect3DSurface9* DistantLand::surfDepthDepth;
-IDirect3DTexture9* DistantLand::texDistantBlend;
-IDirect3DVertexBuffer9* DistantLand::vbGrassInstances;
+IDirect3DTexture9* DistantLand::texMenuCache;
 
 IDirect3DVertexBuffer9* DistantLand::vbFullFrame;
 
@@ -267,17 +256,6 @@ const D3DVERTEXELEMENT9 StaticElem[] = {
     D3DDECL_END()
 };
 
-// Instanced grass vertex declaration
-const D3DVERTEXELEMENT9 GrassElem[] = {
-    {0, 0,  D3DDECLTYPE_FLOAT16_4, D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_POSITION, 0},
-    {0, 8,  D3DDECLTYPE_UBYTE4N,   D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_NORMAL,   0},
-    {0, 12, D3DDECLTYPE_D3DCOLOR,  D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_COLOR,    0},
-    {0, 16, D3DDECLTYPE_FLOAT16_2, D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_TEXCOORD, 0},
-    {1, 0,  D3DDECLTYPE_FLOAT4,    D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_TEXCOORD, 1},
-    {1, 16, D3DDECLTYPE_FLOAT4,    D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_TEXCOORD, 2},
-    {1, 32, D3DDECLTYPE_FLOAT4,    D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_TEXCOORD, 3},
-    D3DDECL_END()
-};
 
 
 
@@ -296,7 +274,6 @@ bool DistantLand::init() {
     }
 
     LOG::logline(">> Starting Distant Land init");
-    vsr.init(device);
     MGE::GeometryCache::init(device);
     BSA::init();
 
@@ -328,9 +305,6 @@ bool DistantLand::init() {
         return false;
     }
 
-    if (!initGrass()) {
-        return false;
-    }
 
     // Probe msoc.dll for the CPU occlusion mask. Soft dependency:
     // returns silently if the plugin isn't installed. Must run after
@@ -379,16 +353,8 @@ bool DistantLand::initIpc() {
     visDistantSharedId = distantVec.id();
     visDistantShared.SetVector((IpcClientVector(distantVec)));
 
-    // we force the maximum number of grass elements to always be resident in memory. this currently equates to 704 KiB of
-    // grass memory compared to the standard window size of 64 KiB, but it allows us to avoid a bunch of copying when
-    // rendering grass.
-    auto maybeGrassVec = ipcClient.allocVecBlocking<RenderMesh>(MaxGrassElements, MaxGrassElements, MaxGrassElements);
-    if (!maybeGrassVec.has_value()) {
-        return false;
-    }
-    auto& grassVec = maybeGrassVec.value();
-    visGrassSharedId = grassVec.id();
-    visGrassShared.SetVector((IpcClientVector(grassVec)));
+    // S4: a MaxGrassElements RenderMesh vector was allocated here, kept fully resident so
+    // the grass instance VB could be built without copying. MGE no longer renders grass.
 
     // S3: a 4th 200k-RenderMesh shared vector (visExtraShared) was allocated here for
     // the water-reflection statics query. Nothing fills or reads it now.
@@ -1202,24 +1168,6 @@ bool DistantLand::initLandscape() {
     return true;
 }
 
-bool DistantLand::initGrass() {
-    HRESULT hr;
-
-    hr = device->CreateVertexDeclaration(GrassElem, &GrassDecl);
-    if (hr != D3D_OK) {
-        LOG::logline("!! Failed to create grass decl");
-        return false;
-    }
-
-    hr = device->CreateVertexBuffer(MaxGrassElements * GrassInstStride, D3DUSAGE_DYNAMIC|D3DUSAGE_WRITEONLY, 0, D3DPOOL_DEFAULT, &vbGrassInstances, NULL);
-    if (hr != D3D_OK) {
-        LOG::logline("!! Failed to create grass instance buffer");
-        return false;
-    }
-
-    return true;
-}
-
 void DistantLand::release() {
     if (!ready) {
         return;
@@ -1228,7 +1176,6 @@ void DistantLand::release() {
     LOG::logline("-- Renderer unloading");
 
     recordMW.clear();
-    recordSky.clear();
 
     PostShaders::release();
     FixedFunctionShader::release();
@@ -1280,11 +1227,7 @@ void DistantLand::release() {
     StaticDecl = nullptr;
     PosOnlyDecl->Release();
     PosOnlyDecl = nullptr;
-    GrassDecl->Release();
-    GrassDecl = nullptr;
 
-    vbGrassInstances->Release();
-    vbGrassInstances = nullptr;
     vbFullFrame->Release();
     vbFullFrame = nullptr;
 

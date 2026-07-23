@@ -3,7 +3,6 @@
 #include "quadtree.h"
 #include "ffeshader.h"
 #include "mwbridge.h"
-#include "specificrender.h"
 #include "ipc/client.h"
 #include "ipc/dlshare.h"
 #include "ipc/occlusionmask.h"
@@ -51,8 +50,6 @@ public:
         RecordedState(RecordedState&&) noexcept;
     };
 
-    static constexpr int GrassInstStride = 48;
-    static constexpr int MaxGrassElements = 8192;
     static constexpr float kCellSize = 8192.0f;
     static constexpr float kDistantZBias = 5e-6f;
     static constexpr float kDistantNearPlane = 4.0f;
@@ -62,19 +59,8 @@ public:
     static bool isRenderCached;
     static bool isPPLActive;
     // Phase 1 Milestone 1 A/B toggle (NUMPAD7). false = ENGINE (untouched
-    // reactive path). true = CACHE (renderCachedOpaque draws the simple-opaque
-    // subset authoritatively from the GeometryCache walk in renderStage0, and
-    // inspectIndexedPrimitive suppresses the engine's covered opaque draws).
-    // Read once per frame at renderStage0 entry so inspectIndexedPrimitive sees
-    // a stable value for the whole frame.
-    static bool cacheOpaqueMode;
-    // NUMPAD7 third state (CACHE-ONLY): when true, cacheOpaqueMode is also true, but
-    // inspectIndexedPrimitive additionally suppresses EVERY other colour draw across ALL
-    // scenes (reactive PPL, the fixed-function fallback, first-person hands, alpha-sorted,
-    // UI) so only what renderCachedOpaque/renderCachedTerrain produce is visible. A
-    // diagnostic to read cache coverage at a glance: anything not owned by the cache goes
-    // black. (sky stage is separate from inspectIndexedPrimitive, so it still backdrops.)
-    static bool cacheOnlyMode;
+    // S4: cacheOpaqueMode / cacheOnlyMode (the NUMPAD7 opaque-source cycle) went with
+    // rendercachedcolor.cpp — the Forge host is the opaque takeover CACHE mode reached for.
     // Set by frameSetupEarly() when the GeometryCache walk ran at BeginScene(0);
     // read by renderDepth (different TU) to skip its own redundant walk.
     static bool earlyWalkedCache;
@@ -111,9 +97,6 @@ public:
     // logic keeps advancing. Requires a valid composited frame to re-show
     // (RenderProcess::hasCompositeFrame).
     static bool menuFreeze;
-    // Set when frameSetupEarly already ran the grass cull (pre-kickoff, channel free);
-    // renderDepth skips its own cullGrass then (grass depth/color consume the same VB).
-    static bool earlyCulledGrass;
     // Phase 1 (MW-only pipeline): route the Forge produce's visible set OFF the engine
     // MSOC classify. When true, liveDrawBuild is forced off (onFrameReady's full refresh
     // walk discovers newly-visible objects instead of the classify's lazy-capture) and
@@ -137,9 +120,7 @@ public:
     // Position-only decl for the fullscreen quad (vbFullFrame). Was WaterDecl:
     // the water plane shared it, and outlived the name by nothing.
     static IDirect3DVertexDeclaration9* PosOnlyDecl;
-    static IDirect3DVertexDeclaration9* GrassDecl;
 
-    static VendorSpecificRendering vsr;
 
     static IPC::Client ipcClient;
     static std::vector<DynamicVisGroup> dynamicVisGroups;
@@ -148,7 +129,6 @@ public:
 
     static VisibleSet<StlVector> visLand;
     static VisibleSet<StlVector> visDistant;
-    static VisibleSet<StlVector> visGrass;
 
     // Cull-then-sort survivor set for distant statics. The server no longer
     // sorts the full visible set; instead applyMSOCToDistantStatics compacts
@@ -161,7 +141,6 @@ public:
 
     static VisibleSet<IpcClientVector> visLandShared;
     static VisibleSet<IpcClientVector> visDistantShared;
-    static VisibleSet<IpcClientVector> visGrassShared;
     static IPC::VecView<IPC::DynVisFlag> dynVisFlagsShared;
     // Single-window chunk vec carrying the occlusion-mask blob shipped to the
     // host each frame (host-side cull). Empty/InvalidVector when disabled.
@@ -169,13 +148,10 @@ public:
 
     static IPC::VecId visLandSharedId;
     static IPC::VecId visDistantSharedId;
-    static IPC::VecId visGrassSharedId;
     static IPC::VecId dynVisFlagsSharedId;
     static IPC::VecId maskBlobSharedId;
 
     static std::vector<RecordedState> recordMW;
-    static std::vector<RecordedState> recordSky;
-    static std::vector< std::pair<const RenderMesh*, int> > batchedGrass;
 
     // CPU-side copy of each distant-land tile's triangle mesh, captured
     // during initLandscape before the VB/IB Unlocks. Used by
@@ -200,11 +176,10 @@ public:
     static IDirect3DTexture9* texWorldColour, *texWorldNormals, *texWorldDetail;
     static IDirect3DTexture9* texDepthFrame;
     static IDirect3DSurface9* surfDepthDepth;
-    static IDirect3DTexture9* texDistantBlend;
+    static IDirect3DTexture9* texMenuCache;
     // S3: texReflection / surfReflectionZ (water reflection RT), texWater (the animated
     // volume normal map), vbWater / ibWater (the radial water mesh) went with
     // renderwater.cpp -- the Forge host owns the water surface.
-    static IDirect3DVertexBuffer9* vbGrassInstances;
 
     // S3: the geo-clipmap water LOD mesh, dynamic-ripple/wave sim targets, the baked
     // water flow map and the whole two-cascade Voronoi foam simulation lived here.
@@ -266,7 +241,6 @@ public:
     static bool initLandscapeClient();
     static bool initLandscape();
     static bool initDistantStaticsClient();
-    static bool initGrass();
     static void loadVisGroupsClient(HANDLE h);
     template<class T, class U>
     static bool loadStaticMeshes(HANDLE h, T& distantStatics, U& distantSubsets);
@@ -290,7 +264,6 @@ public:
     static void adjustFog();
     static bool inspectIndexedPrimitive(int sceneCount, const RenderedState* rs, const FragmentState* frs, LightState* lightrs);
 
-    static void renderSky();
     static void beginSkyZone();
     // Called from BeginScene(scene 0): runs the statics-cull prerequisites
     // (selectDistantCell + camera/fog setup) and kicks off the distant-statics
@@ -301,11 +274,9 @@ public:
     static void beginDrawsZone();
     static void renderStage1();
     static void renderStage2();
-    static void renderStageBlend();
 
     static void setupCommonEffect(const D3DXMATRIX* view,const  D3DXMATRIX* proj);
 
-    static void renderDistantLand(ID3DXEffect* e, const D3DXMATRIX* view, const D3DXMATRIX* proj);
     static void renderDistantLandZ();
     // Build a horizon-curtain occluder from the visible distant-land
     // tiles and feed it to the plugin's MSOC mask via the pre-
@@ -372,7 +343,6 @@ public:
     static void signalCullFinish();
     static void waitCullChannelFree();
     static void joinCullWorker();
-    static void renderDistantStatics();
     static void renderMSOCBasinBoundsDebug(const D3DXMATRIX* view, const D3DXMATRIX* proj);
     static void debugDumpMSOCMask();   // Numpad5 mask dump, post-curtain
     static void renderCurtainDebug();  // Numpad3 cycle: in-world curtain overlay
@@ -408,13 +378,6 @@ public:
     // MSOC pass (group cheap-reject → basin → sphere), so only the flood builder
     // is exposed here.
     static void buildBasinRequiredHeight();
-    static void cullGrass(const D3DXMATRIX* view, const D3DXMATRIX* proj);
-    template<class T>
-    static void buildGrassInstanceVB(VisibleSet<T>& grassSet);
-    static bool hasVisibleGrass();
-    static void renderGrassInst();
-    static void renderGrassInstZ();
-    static void renderGrassCommon(ID3DXEffect* e);
 
     // S3: the water-reflection render (mirrored sky / statics / cache objects / cache
     // terrain, plus their sun-shadow re-draws) went with renderwater.cpp.
@@ -424,14 +387,6 @@ public:
     // engine's reactive per-draw path. Sibling of renderReflectionsFromCache with
     // the main view/proj, documented CW base winding, no water clip plane, and its
     // own z (ZWRITE on, ZFUNC LESSEQUAL). Run from renderStage0 in CACHE mode.
-    static void renderCachedOpaque(const D3DXMATRIX* view, const D3DXMATRIX* proj);
-    // Phase 1 Milestone 2.1 (the reflection sibling is gone; see S3).
-    // Draws the real near terrain (the engine's submitted landscape, two-texture
-    // AlphaGrid splat) from the cache into the MAIN view, so MGE owns ALL opaque
-    // (objects + terrain) in CACHE mode. No near-dist handover (the cache IS the
-    // engine's near terrain; DL LOD owns beyond via the distant projection), no
-    // water clip, main-view CW winding. Run from renderStage0 after renderCachedOpaque.
-    static void renderCachedTerrain(const D3DXMATRIX* view, const D3DXMATRIX* proj);
     // S3: clearReflection, the water-visibility gate, the flow-map bake, the reflection
     // screen-rect / silhouette-mask cull, the reflection-statics worker cull, the dynamic
     // wave + foam simulations and renderWaterPlane were all declared here.

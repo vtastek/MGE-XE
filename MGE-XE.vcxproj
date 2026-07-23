@@ -1,4 +1,4 @@
-<?xml version="1.0" encoding="utf-8"?>
+﻿<?xml version="1.0" encoding="utf-8"?>
 <Project DefaultTargets="Build" ToolsVersion="15.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
   <ItemGroup Label="ProjectConfigurations">
     <ProjectConfiguration Include="Debug|Win32">
@@ -195,12 +195,9 @@
     <ClCompile Include="src\imgui\backends\imgui_impl_dx9.cpp" />
     <ClCompile Include="src\imgui\backends\imgui_impl_win32.cpp" />
     <ClCompile Include="src\mge\imgui_panels.cpp" />
-    <ClCompile Include="src\mge\rendergrass.cpp" />
     <ClCompile Include="src\mge\renderthread.cpp" />
     <ClCompile Include="src\mge\scenegraph.cpp" />
     <ClCompile Include="src\mge\scenegraph_geometry_cache.cpp" />
-    <ClCompile Include="src\mge\rendercachedcolor.cpp" />
-    <ClCompile Include="src\mge\specificrender.cpp" />
     <ClCompile Include="src\mge\statusoverlay.cpp" />
     <ClCompile Include="src\mge\terrain_horizon_occluder.cpp" />
     <ClCompile Include="src\mge\userhud.cpp" />
@@ -272,7 +269,6 @@
     <ClInclude Include="src\mge\scenegraph_geometry_cache.h" />
     <ClInclude Include="src\mge\datahandler_view.h" />
     <ClInclude Include="src\mge\mge_se_prelude.h" />
-    <ClInclude Include="src\mge\specificrender.h" />
     <ClInclude Include="src\mge\statusoverlay.h" />
     <ClInclude Include="src\mge\terrain_horizon_occluder.h" />
     <ClInclude Include="src\mge\userhud.h" />

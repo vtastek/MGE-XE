@@ -159,12 +159,6 @@
     <ClCompile Include="src\mge\renderexterior.cpp">
       <Filter>Source Files\mge</Filter>
     </ClCompile>
-    <ClCompile Include="src\mge\rendergrass.cpp">
-      <Filter>Source Files\mge</Filter>
-    </ClCompile>
-    <ClCompile Include="src\mge\specificrender.cpp">
-      <Filter>Source Files\mge</Filter>
-    </ClCompile>
     <ClCompile Include="src\mge\statusoverlay.cpp">
       <Filter>Source Files\mge</Filter>
     </ClCompile>
@@ -330,9 +324,6 @@
       <Filter>Header Files\mge</Filter>
     </ClInclude>
     <ClInclude Include="src\mge\quadtree.h">
-      <Filter>Header Files\mge</Filter>
-    </ClInclude>
-    <ClInclude Include="src\mge\specificrender.h">
       <Filter>Header Files\mge</Filter>
     </ClInclude>
     <ClInclude Include="src\mge\statusoverlay.h">

@@ -6,6 +6,7 @@
 #include "mmefunctiondefs.h"
 #include "mgeversion.h"
 #include "postshaders.h"
+#include "renderprocess.h"
 #include "scenegraph.h"
 #include "scenegraph_geometry_cache.h"
 #include "userhud.h"
@@ -878,6 +879,10 @@ namespace api {
     // world this frame, so MWSE can no-op the engine's scene0 opaque render.
 
     bool MGEAPIv5::isOpaqueWorldCacheOwned() const {
-        return DistantLand::cacheOpaqueMode && !MGE::GeometryCache::cache().empty();
+        // S4: was `DistantLand::cacheOpaqueMode`, the DX9 CACHE-mode opaque takeover. That
+        // renderer is gone; the Forge host is what owns the opaque world now. The published
+        // meaning of this call — "MWSE may no-op the engine's scene-0 opaque render" — is
+        // unchanged, and is in fact truer of the seam than it ever was of CACHE mode.
+        return RenderProcess::forgeOwnsFrame() && !MGE::GeometryCache::cache().empty();
     }
 }
