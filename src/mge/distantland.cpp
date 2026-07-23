@@ -1390,15 +1390,20 @@ bool DistantLand::inspectIndexedPrimitive(int sceneCount, const RenderedState* r
     // Special case, detect sky. MW's sky is the first blended geometry of scene 0 in a
     // weather cell — nothing has written z yet, so recordMW is still empty.
     //
-    // S4: MGE's atmosphere-scattering sky (renderSky + the recordSky replay list it drew
-    // from) is gone; the Forge host owns the sky (SK3/SK4). So the suppression that used to
-    // hang off USE_ATM_SCATTER — "reject MW's sky, MGE will draw it later in stage 0" — now
-    // hangs off the host actually drawing one. With the seam off, MW draws its own vanilla
-    // sky, which is the fallback this retirement is meant to leave intact.
+    // S4: MGE's atmosphere-scattering sky (renderSky + the recordSky replay list it drew from)
+    // is gone; the Forge host owns the sky (SK3/SK4). The branch survives ONLY to keep these
+    // draws out of the covered-opaque suppression and the PPL reactive path below — MW draws
+    // them, and under the seam they are overwritten by the composite (an opaque full-screen
+    // blit), so letting them through costs a little overdraw and nothing else.
+    //
+    // Do NOT reintroduce a suppression here. S4a briefly gated this on forgeOwnsFrame() as the
+    // successor to the old USE_ATM_SCATTER gate, and it broke cell-transition fades and the
+    // loading bar (reported in-game, 2026-07-23). The predicate is not a sky test: "blended,
+    // scene 0, nothing has written z yet" matches full-screen fade quads and load-screen
+    // overlays just as well as it matches the sky dome. The old gate only looked safe because
+    // it required USE_ATM_SCATTER, which is off in most configs, so it almost never fired.
     if (recordMW.empty() && rs->blendEnable && sceneCount == 0 && mwBridge->CellHasWeather()) {
-        if (RenderProcess::forgeOwnsFrame()) {
-            return false;
-        }
+        // Pass through — MW draws it.
     } else {
         // Suppress the engine's scene-0 opaque draw when the Forge seam owns the frame
         // (F11 composite live): the host's full-screen composite overwrites MW's frame, so
