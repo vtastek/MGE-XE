@@ -3971,6 +3971,35 @@ namespace RenderProcess {
             lightBytes = (std::uint32_t)g_lightScratch.size();
         }
 
+        // The sky is CAMERA-ANCHORED, and that makes it the one payload the camera restamp
+        // below gets wrong. buildSkyDrawList shipped each shape as (skyWorld - bakeEye), and
+        // the restamp folds (bakeEye - eyeNow) into the view translation — which resolves to
+        // (skyWorld - eyeNow), i.e. the sky planted at the world position it occupied at BUILD
+        // time. That is exactly right for statics (they really are world-anchored) and exactly
+        // wrong here: MW re-centres the sky on the camera every frame, so a mode-3 park fire
+        // renders it around last frame's camera and it slides by the frame's camera delta —
+        // the sky visibly lagging translation while the world tracks it (reported in-game,
+        // 2026-07-23). Re-anchor to the fire-time eye by pre-cancelling the restamp: the
+        // shipped (skyWorld - bakeEye) then survives verbatim into view space, which is what
+        // "stationary, fixed to the camera" means. Rotation was never affected — the restamp
+        // uses R_now for everything, so the sky turns with the current camera either way.
+        //
+        // On the serial paths bakeEye == eyePos, so the delta is 0 and this is a no-op.
+        if (skyCount > 0 && !g_skyScratch.empty()) {
+            const float ex = DistantLand::eyePos.x - bakeEye[0];
+            const float ey = DistantLand::eyePos.y - bakeEye[1];
+            const float ez = DistantLand::eyePos.z - bakeEye[2];
+            if (ex != 0.0f || ey != 0.0f || ez != 0.0f) {
+                const std::size_t n = g_skyScratch.size() / sizeof(IPC::SkyDrawWire);
+                auto* sky = reinterpret_cast<IPC::SkyDrawWire*>(g_skyScratch.data());
+                for (std::size_t i = 0; i < n; ++i) {
+                    sky[i].world[12] += ex;
+                    sky[i].world[13] += ey;
+                    sky[i].world[14] += ez;
+                }
+            }
+        }
+
         IPC::VecId   skyId = IPC::InvalidVector;
         std::uint32_t skyBytes = 0;
         if (g_skyVec && skyCount > 0
