@@ -249,16 +249,16 @@ namespace MGE::GeometryCache {
         // entries untouched this long are evicted anyway (frees VBs of genuinely
         // unloaded far cells; they re-capture only if the area is ever revisited).
         constexpr uint64_t kFarKeepFrames = 600;
-        // NEAR-DETACH despawn signal (the ghost-shadow fix). kFarKeepFrames is a FAR-entry
-        // hysteresis, but under cell-grid eviction it became the only within-cell despawn rule
-        // too — so a picked-up object kept its host shadow-caster record for the full 600 frames
-        // (~3.6s at 165fps), and repeated drop/pickup stacked one ghost shadow per cycle.
+        // DETACH despawn signal (the ghost-shadow / lingering-sword fix). kFarKeepFrames is a
+        // FAR-entry hysteresis, but under cell-grid eviction it became the only within-cell despawn
+        // rule too — so a picked-up object kept its host shadow-caster record for the full 600
+        // frames (~3.6s at 165fps), and repeated drop/pickup stacked one ghost per cycle.
         // parentVerdict already answers "despawned?" unambiguously and immediately (a removed
-        // object's shape is left with a detached parent chain), it was just gated behind the age
-        // rule. So climb any entry that missed the last stamp and evict a detached chain on the
-        // spot; entries that are merely off-screen are still parented and survive the climb, so
-        // the 360deg-turn re-capture churn the age rule was protecting against cannot come back.
-        constexpr uint64_t kDetachStaleFrames = kEvictSweepInterval;
+        // object's shape is left with a detached parent chain); it was just gated behind the age
+        // rule. The sweep now climbs every in-grid entry and evicts a detached chain on the spot.
+        // Entries that are merely off-screen (or freshly stamped) are still PARENTED and survive
+        // the climb, so the 360deg-turn re-capture churn the age rule protects against cannot come
+        // back. See the sweep for why no distance or staleness pre-filter is applied.
         // W3 live-read at build: on Forge-owned frames the per-frame refresh walk is
         // SKIPPED entirely — buildFrustumVisibleSet freshens exactly the classify-
         // visible keys via ensureLive() (live NiTriShape reads + lazy capture on first
@@ -2843,11 +2843,6 @@ namespace MGE::GeometryCache {
             };
             unsigned nEvicted = 0, nByGraph = 0, nByAge = 0, nUnknown = 0, nDeferred = 0;
             unsigned nByDetach = 0, nDetachChecked = 0;
-            // Menu mode: the world walk is skipped on cached menu frames, so g_frame barely
-            // advances and a frame-count staleness threshold would never mature — check every
-            // entry that missed this frame's stamp instead. Menu sweeps already run per-frame by
-            // design (see sweepNow) and the near set is small, so this is the cheap direction.
-            const uint64_t detachStale = MWBridge::get()->IsMenu() ? 0 : kDetachStaleFrames;
             unsigned nLogWalkGone = 0, nLogGraphGone = 0;
             unsigned nKeptByParent = 0, nRescueChecked = 0;
             unsigned nRescueGone = 0, nRescueUnknown = 0, nRescueDumped = 0;
@@ -2972,28 +2967,28 @@ namespace MGE::GeometryCache {
                         }
                     }
                     // DETACH (see kDetachStaleFrames): the prompt despawn signal the age rule was
-                    // standing in for. Any in-grid entry that missed the last stamp is climbed;
-                    // a detached chain evicts NOW instead of waiting out kFarKeepFrames.
+                    // standing in for: a detached parent chain evicts NOW instead of waiting out
+                    // kFarKeepFrames. Climbed for EVERY in-grid entry the rescue did not already
+                    // climb — no distance filter, no staleness filter.
                     //
-                    // Deliberately NOT filtered by distance from the eye. The first cut of this
-                    // rule restricted the climb to entries inside g_gateRadius as a cost bound and
-                    // detected nothing at all ([evict] byDetach=0/0): the gate is not armed in
-                    // interiors, so g_gateRadius lingers at its last exterior value while g_gateEye
-                    // still points at the OLD EXTERIOR CAMERA — interior coordinates are a
-                    // different origin, so every interior entry measured as "far" and was skipped.
-                    // (The walk path's far-keep hysteresis carries the same warning; it guards on
-                    // g_gateThisFrame for exactly this reason.) The filter is not needed for
-                    // correctness either: a gate-SKIPPED object is still PARENTED, so the climb
-                    // already answers "alive" for it — the far/near split only ever mattered to the
-                    // walk verdict, which cannot tell skipped from removed.
+                    // Both filters were cost bounds, and BOTH silently voided the rule:
+                    //  * distance from g_gateEye — the gate is not armed in interiors, so the
+                    //    radius lingered at its last exterior value while the eye still pointed at
+                    //    the old exterior camera. Every interior entry read "far": byDetach=0/0.
+                    //  * staleness — a sheathed weapon (MW detaches the node, then something keeps
+                    //    stamping the entry) stayed FRESH, so the scan never looked at it and every
+                    //    sheath left another sword hanging at the waist position.
+                    // Neither is needed for correctness: reachability is the whole answer. A
+                    // gate-skipped or freshly-stamped object is still PARENTED, so the climb returns
+                    // "alive" for it anyway — the near/far and fresh/stale splits only ever mattered
+                    // to the WALK verdict, which cannot tell skipped from removed. Detachment does
+                    // not become true with age, so waiting to ask is pure latency.
                     //
-                    // Cost is bounded without it: this branch and the aged rescue above are
-                    // mutually exclusive, so an entry is climbed at most ONCE per sweep and the
-                    // per-sweep total stays <= cache size — the rescue alone already climbs ~85% of
-                    // it. Shares the rescue's runaway watchdog on top of that.
+                    // Cost: one climb per entry per sweep (the rescue's wasAged latch keeps the two
+                    // branches exclusive), so the per-sweep total is bounded by the cache size —
+                    // the rescue alone already reaches ~85% of it. Shares the runaway watchdog.
                     bool detached = false;
-                    if (!gone && !wasAged && rootsValid && !rescueRunaway
-                            && (g_frame - e.lastFrame) > detachStale) {
+                    if (!gone && !wasAged && rootsValid && !rescueRunaway) {
                         if ((++nDetachChecked & 2047) == 0 && gcNowMs() - tClimb0 > kClimbWatchdogMs) {
                             rescueRunaway = true;   // shares the rescue's watchdog latch
                             LOG::logline("!! [evict-climb] RUNAWAY in detach scan: %.0fms at %u checks"
