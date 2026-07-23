@@ -255,10 +255,9 @@ namespace MGE::GeometryCache {
         // (~3.6s at 165fps), and repeated drop/pickup stacked one ghost shadow per cycle.
         // parentVerdict already answers "despawned?" unambiguously and immediately (a removed
         // object's shape is left with a detached parent chain), it was just gated behind the age
-        // rule. A stale entry INSIDE the gate radius is never gate-skipped, so stale+near really
-        // does mean gone — climb those every sweep and evict on the spot. Far entries keep the
-        // age+rescue behaviour unchanged (that is what stops 360deg-turn re-capture churn), which
-        // also bounds the climb to the near set.
+        // rule. So climb any entry that missed the last stamp and evict a detached chain on the
+        // spot; entries that are merely off-screen are still parented and survive the climb, so
+        // the 360deg-turn re-capture churn the age rule was protecting against cannot come back.
         constexpr uint64_t kDetachStaleFrames = kEvictSweepInterval;
         // W3 live-read at build: on Forge-owned frames the per-frame refresh walk is
         // SKIPPED entirely — buildFrustumVisibleSet freshens exactly the classify-
@@ -286,7 +285,7 @@ namespace MGE::GeometryCache {
         // Per-phase walk timing (QPC), logged every kGcHeartbeatFrames frames as
         // ">> [gc] ..." — the walk is on the dense-city serial chain, so its cost is
         // tracked with the same always-on heartbeat discipline as [hb]/[forge-hb].
-        struct GcAccum { double obj, pick, land, sky, evict, visited, gateSkip, live, cap, kept; uint64_t n; };
+        struct GcAccum { double obj, pick, land, sky, evict, visited, gateSkip, live, cap, kept, detach; uint64_t n; };
         GcAccum           g_gcAccum = {};
         constexpr uint64_t kGcHeartbeatFrames = 300;
         // Per-frame gate observability, accumulated into the [gc] heartbeat:
@@ -2966,30 +2965,36 @@ namespace MGE::GeometryCache {
                             }
                         }
                     }
-                    // NEAR-DETACH (see kDetachStaleFrames): the prompt despawn signal the age rule
-                    // was standing in for. Only entries that (a) are still in-grid, (b) missed the
-                    // last stamp and (c) sit inside the gate radius are climbed — the gate never
-                    // skips that region, so stale+near is a real removal, not an off-screen entry.
-                    // Uses the PERSISTED eye deliberately: on ungated frames (menus, the renderDepth
-                    // fallback) the player cannot move, so the last gated eye is still current, and
-                    // that is precisely when the menu drop/pickup ghost is reported. A cell/interior
-                    // transition can leave the eye stale, but those entries are condemned by
-                    // cellGridGone above, so this rule never sees them.
+                    // DETACH (see kDetachStaleFrames): the prompt despawn signal the age rule was
+                    // standing in for. Any in-grid entry that missed the last stamp is climbed;
+                    // a detached chain evicts NOW instead of waiting out kFarKeepFrames.
+                    //
+                    // Deliberately NOT filtered by distance from the eye. The first cut of this
+                    // rule restricted the climb to entries inside g_gateRadius as a cost bound and
+                    // detected nothing at all ([evict] byDetach=0/0): the gate is not armed in
+                    // interiors, so g_gateRadius lingers at its last exterior value while g_gateEye
+                    // still points at the OLD EXTERIOR CAMERA — interior coordinates are a
+                    // different origin, so every interior entry measured as "far" and was skipped.
+                    // (The walk path's far-keep hysteresis carries the same warning; it guards on
+                    // g_gateThisFrame for exactly this reason.) The filter is not needed for
+                    // correctness either: a gate-SKIPPED object is still PARENTED, so the climb
+                    // already answers "alive" for it — the far/near split only ever mattered to the
+                    // walk verdict, which cannot tell skipped from removed.
+                    //
+                    // Cost is bounded without it: this branch and the aged rescue above are
+                    // mutually exclusive, so an entry is climbed at most ONCE per sweep and the
+                    // per-sweep total stays <= cache size — the rescue alone already climbs ~85% of
+                    // it. Shares the rescue's runaway watchdog on top of that.
                     bool detached = false;
-                    if (!gone && !aged && rootsValid && !rescueRunaway && g_gateRadius > 0.0f
+                    if (!gone && !aged && rootsValid && !rescueRunaway
                             && (g_frame - e.lastFrame) > detachStale) {
-                        const float dx = e.worldTransformD3D[12] - g_gateEye[0];
-                        const float dy = e.worldTransformD3D[13] - g_gateEye[1];
-                        const float dz = e.worldTransformD3D[14] - g_gateEye[2];
-                        if (dx * dx + dy * dy + dz * dz <= evictR2) {
-                            if ((++nDetachChecked & 2047) == 0 && gcNowMs() - tClimb0 > kClimbWatchdogMs) {
-                                rescueRunaway = true;   // shares the rescue's watchdog latch
-                                LOG::logline("!! [evict-climb] RUNAWAY in near-detach: %.0fms at %u checks"
-                                             " — near-detach off this sweep, age rule still applies",
-                                             gcNowMs() - tClimb0, nDetachChecked);
-                            } else {
-                                detached = (parentVerdict(it->first, e) == 1);
-                            }
+                        if ((++nDetachChecked & 2047) == 0 && gcNowMs() - tClimb0 > kClimbWatchdogMs) {
+                            rescueRunaway = true;   // shares the rescue's watchdog latch
+                            LOG::logline("!! [evict-climb] RUNAWAY in detach scan: %.0fms at %u checks"
+                                         " — detach off this sweep, age rule still applies",
+                                         gcNowMs() - tClimb0, nDetachChecked);
+                        } else {
+                            detached = (parentVerdict(it->first, e) == 1);
                         }
                     }
                     evict = gone || aged || detached;
@@ -3092,6 +3097,11 @@ namespace MGE::GeometryCache {
             }
             }
             g_gcAccum.kept += (double)nKeptByParent;
+            // Entries the detach scan CLIMBED (not evicted). Reported unconditionally in [gc]
+            // because the [evict] line only prints on a non-zero sweep: the first cut of the rule
+            // silently climbed nothing at all (stale-eye distance filter), and a counter that only
+            // appears once the rule works cannot show you that it doesn't.
+            g_gcAccum.detach += (double)nDetachChecked;
             // Parent-climb probe (every sweep while the graph verdict is active). countMs = wall time
             // of the full-cache climb; if it ever spikes this IS the freeze. vtBad = dangling/freed
             // parents the vtable guard rejected (the health of the whole premise — a large number
@@ -3113,7 +3123,7 @@ namespace MGE::GeometryCache {
         g_gcAccum.evict += tEvict - tSky;
         if (++g_gcAccum.n >= kGcHeartbeatFrames) {
             const double n = (double)g_gcAccum.n;
-            LOG::logline(">> [gc] %llu frames avg: walk=%.2f (obj=%.2f pick=%.2f land=%.2f sky=%.2f evict=%.2f) entries=%zu visited=%.0f gateSkip=%.0f live=%.0f cap=%.1f kept/sweep=%.0f%s gateR=%.0f",
+            LOG::logline(">> [gc] %llu frames avg: walk=%.2f (obj=%.2f pick=%.2f land=%.2f sky=%.2f evict=%.2f) entries=%zu visited=%.0f gateSkip=%.0f live=%.0f cap=%.1f kept/sweep=%.0f detach/sweep=%.0f%s gateR=%.0f",
                          (unsigned long long)g_gcAccum.n,
                          (g_gcAccum.obj + g_gcAccum.pick + g_gcAccum.land + g_gcAccum.sky + g_gcAccum.evict) / n,
                          g_gcAccum.obj / n, g_gcAccum.pick / n, g_gcAccum.land / n,
@@ -3121,6 +3131,7 @@ namespace MGE::GeometryCache {
                          g_gcAccum.visited / n, g_gcAccum.gateSkip / n,
                          g_gcAccum.live / n, g_gcAccum.cap / n,
                          g_gcAccum.kept * kEvictSweepInterval / n,
+                         g_gcAccum.detach * kEvictSweepInterval / n,
                          g_gateThisFrame ? " gate=ON" : "", g_gateRadius);
             g_gcAccum = GcAccum{};
         }
