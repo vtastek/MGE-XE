@@ -127,18 +127,13 @@ HRESULT _stdcall MGEProxyD3D::CreateDevice(UINT a, D3DDEVTYPE b, HWND c, DWORD d
     D3DDISPLAYMODEEX* pdm = nullptr;
     translatePresentParams8to9(e, useEx, pp, dm, &pdm);
 
-    // MGE render thread: when enabled, the runtime must be multithreaded (a
-    // second core submits GPU work concurrently with the engine) and the
-    // device-submission lock must be armed so the proxy forwarders serialize
-    // against the worker. Off => single-threaded baseline, lock disabled, the
-    // forwarders pay nothing.
-    g_deviceLockEnabled = Configuration.UseRenderThread;
-    if (Configuration.UseRenderThread) {
-        d |= D3DCREATE_MULTITHREADED;
-        LOG::logline("-- [RENDERTHREAD] device created with D3DCREATE_MULTITHREADED (flags=0x%08X)", d);
-    } else {
-        LOG::logline("-- device created SINGLE-THREADED (flags=0x%08X)", d);
-    }
+    // S5a: UseRenderThread armed D3DCREATE_MULTITHREADED + the device-submission lock here
+    // so the MGE render thread could submit concurrently with the engine. The worker is gone
+    // (its one job was the DX9 depth pre-pass), and the flag defaulted off anyway, so this is
+    // the path that always ran. g_deviceLockEnabled stays defined-and-false: MGE_DEVLOCK is
+    // a no-op scope guard in the proxy forwarders, kept for whoever next needs to serialise
+    // a worker against them.
+    LOG::logline("-- device created SINGLE-THREADED (flags=0x%08X)", d);
 
     // Create device in the same manner as the proxy.
     IDirect3DDevice9* realDevice = NULL;

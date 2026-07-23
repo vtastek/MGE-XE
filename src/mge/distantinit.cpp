@@ -30,7 +30,6 @@ bool DistantLand::ready = false;
 bool DistantLand::isRenderCached = false;
 bool DistantLand::isPPLActive = false;
 bool DistantLand::earlyWalkedCache = false;
-bool DistantLand::renderThreadJobKicked = false;
 bool DistantLand::earlyForgeKickoff = false;
 bool DistantLand::menuFreeze = false;
 // Branch A (lead-in shrink): boot HOST-CULL-ONLY. The host's two-phase Hi-Z GPU cull owns
@@ -54,11 +53,9 @@ int  DistantLand::debugOverlayCycle = 0;
 
 IDirect3DDevice9* DistantLand::device;
 ID3DXEffect* DistantLand::effect;
-ID3DXEffect* DistantLand::effectDepth;
 ID3DXEffectPool* DistantLand::effectPool;
 IDirect3DVertexDeclaration9* DistantLand::LandDecl;
 IDirect3DVertexDeclaration9* DistantLand::StaticDecl;
-IDirect3DVertexDeclaration9* DistantLand::PosOnlyDecl;
 
 
 IPC::Client DistantLand::ipcClient;
@@ -73,15 +70,12 @@ IPC::VecView<OcclusionMask::MaskChunk> DistantLand::maskBlobShared;
 IPC::VecId DistantLand::dynVisFlagsSharedId = IPC::InvalidVector;
 IPC::VecId DistantLand::maskBlobSharedId = IPC::InvalidVector;
 
-vector<DistantLand::RecordedState> DistantLand::recordMW;
+unsigned DistantLand::recordMWCount = 0;
 std::unordered_map<IDirect3DVertexBuffer9*, DistantLand::LandMeshCache> DistantLand::landMeshes;
 
 IDirect3DTexture9* DistantLand::texWorldColour, *DistantLand::texWorldNormals, *DistantLand::texWorldDetail;
-IDirect3DTexture9* DistantLand::texDepthFrame;
-IDirect3DSurface9* DistantLand::surfDepthDepth;
 IDirect3DTexture9* DistantLand::texMenuCache;
 
-IDirect3DVertexBuffer9* DistantLand::vbFullFrame;
 
 D3DXMATRIX DistantLand::mwView, DistantLand::mwProj;
 D3DXMATRIX DistantLand::smView[2], DistantLand::smProj[2];
@@ -225,12 +219,6 @@ static void captureLandMesh(
 
 
 
-// Water plane vertex declaration
-const D3DVERTEXELEMENT9 PosOnlyElem[] = {
-    {0, 0,  D3DDECLTYPE_FLOAT3, D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_POSITION, 0},
-    D3DDECL_END()
-};
-
 // World mesh vertex declaration
 const D3DVERTEXELEMENT9 LandElem[] = {
     {0, 0,  D3DDECLTYPE_FLOAT3,  D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_POSITION, 0},
@@ -251,7 +239,7 @@ const D3DVERTEXELEMENT9 StaticElem[] = {
 
 
 // Called from msoc.dll when MSOC finishes verdict classification, before any display() calls.
-// Stores the MSOC-culled visible set for use in renderDepthFromCache this frame.
+// Stores the MSOC-culled visible set for buildFrustumVisibleSet to consume this frame.
 static void __cdecl onVisibleGeom(void* const* shapes, const float* /*boundsXYZR*/, int count) {
     DistantLand::updateVisibleSet(shapes, count);
 }
@@ -281,10 +269,6 @@ bool DistantLand::init() {
     }
 
     if (!PostShaders::init(device)) {
-        return false;
-    }
-
-    if (!initDepth()) {
         return false;
     }
 
@@ -615,9 +599,8 @@ bool DistantLand::initShader() {
     float rcpres[2] = { 1.0f / vp.Width, 1.0f / vp.Height };
     effect->SetFloatArray(ehRcpRes, rcpres, 2);
 
-    if (!createCoreEffectWithMods("XE Depth.fx", device, features, effectPool, &effectDepth, false)) {
-        return false;
-    }
+    // S5a: "XE Depth.fx" (effectDepth) was loaded here — the lean depth-only effect the
+    // pre-pass drew every pass with. Deleted with the pre-pass.
 
     // Atmosphere scattering specific parameters
     if (Configuration.MGEFlags & USE_ATM_SCATTER) {
@@ -641,48 +624,11 @@ bool DistantLand::initShader() {
     return true;
 }
 
-bool DistantLand::initDepth() {
-    HRESULT hr;
-    D3DVIEWPORT9 vp;
-
-    // Set up depth frame texture, requires its own z-buffer (my card fails to support INTZ/DF24)
-    device->GetViewport(&vp);
-
-    hr = device->CreateTexture(vp.Width, vp.Height, 1, D3DUSAGE_RENDERTARGET, D3DFMT_R32F, D3DPOOL_DEFAULT, &texDepthFrame, NULL);
-    if (hr != D3D_OK) {
-        LOG::logline("!! Failed to create depth frame render target");
-        return false;
-    }
-
-    hr = device->CreateDepthStencilSurface(vp.Width, vp.Height, D3DFMT_D24X8, D3DMULTISAMPLE_NONE, 0, FALSE, &surfDepthDepth, NULL);
-    if (hr != D3D_OK) {
-        LOG::logline("!! Failed to create depth target z-buffer");
-        return false;
-    }
-
-    if (FAILED(device->CreateVertexDeclaration(PosOnlyElem, &PosOnlyDecl))) {
-        LOG::logline("!! Failed to create position-only vertex declaration");
-        return false;
-    }
-
-    // Fullscreen quad covering a render target of any dimension. Created by initShadow until
-    // S3 deleted it; the DEPTH pass is its only remaining user (renderdepth.cpp clears and
-    // resolves through it), so ownership follows the consumer.
-    hr = device->CreateVertexBuffer(4 * 12, D3DUSAGE_WRITEONLY, 0, D3DPOOL_DEFAULT, &vbFullFrame, 0);
-    if (hr != D3D_OK) {
-        LOG::logline("!! Failed to create fullscreen quad verts");
-        return false;
-    }
-    D3DXVECTOR3* v;
-    vbFullFrame->Lock(0, 0, (void**)&v, 0);
-    v[0] = D3DXVECTOR3(-1.0f,  1.0f, 1.0f);
-    v[1] = D3DXVECTOR3(-1.0f, -1.0f, 1.0f);
-    v[2] = D3DXVECTOR3( 1.0f,  1.0f, 1.0f);
-    v[3] = D3DXVECTOR3( 1.0f, -1.0f, 1.0f);
-    vbFullFrame->Unlock();
-
-    return true;
-}
+// S5a: initDepth() lived here. It created texDepthFrame (R32F render target) plus its own
+// D24X8 depth-stencil, the position-only vertex declaration and the fullscreen quad VB — the
+// resources MGE's depth pre-pass rendered into and cleared with. The pre-pass is gone and the
+// only thing that ever sampled texDepthFrame, the DX9 post chain's SSAO/DOF, is skipped
+// whenever the Forge seam owns the frame (the host applies its own GTAO).
 
 bool DistantLand::initDistantStaticsClient() {
     if (FAILED(device->CreateVertexDeclaration(StaticElem, &StaticDecl))) {
@@ -1154,7 +1100,7 @@ void DistantLand::release() {
 
     LOG::logline("-- Renderer unloading");
 
-    recordMW.clear();
+    recordMWCount = 0;
 
     PostShaders::release();
     FixedFunctionShader::release();
@@ -1198,21 +1144,8 @@ void DistantLand::release() {
     LandDecl = nullptr;
     StaticDecl->Release();
     StaticDecl = nullptr;
-    PosOnlyDecl->Release();
-    PosOnlyDecl = nullptr;
-
-    vbFullFrame->Release();
-    vbFullFrame = nullptr;
-
-    texDepthFrame->Release();
-    texDepthFrame = nullptr;
-    surfDepthDepth->Release();
-    surfDepthDepth = nullptr;
-
     effectPool->Release();
     effectPool = nullptr;
-    effectDepth->Release();
-    effectDepth = nullptr;
     effect->Release();
     effect = nullptr;
 

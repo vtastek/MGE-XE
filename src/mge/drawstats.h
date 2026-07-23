@@ -26,10 +26,8 @@ namespace DrawStats {
 
     enum Stage : int {
         Scene0, Scene1, Scene2, UI,        // Morrowind scenes (set in BeginScene)
-        // Depth pre-pass, split by content source. Depth = misc (cleardepth /
-        // renderDepthRecorded); DepthCache = renderDepthFromCache (cache geometry,
-        // frustum-only post-Phase-1); DepthLand/Statics/Grass = the distant-land
-        // depth replays. So DepthCache is the apples-to-apples vs scene0.
+        // Depth pre-pass buckets. S5a deleted the pre-pass, so all five are permanently 0;
+        // the enumerators stay until the stats/GUI sweep renumbers the whole table.
         Depth, DepthCache, DepthLand, DepthStatics, DepthGrass,
         // Shadow caster pass, split by source. Shadow = caster misc (per-cascade stencil
         // cube + soften passes; distant-land caster still lands in Land — shares

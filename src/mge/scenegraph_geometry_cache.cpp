@@ -308,27 +308,19 @@ namespace MGE::GeometryCache {
             e.hostUploaded = false;   // buffers/uploads invalidated -> must re-process + re-ship
         }
 
-        // The DX9 mirror VB/IB (e.vb/e.ib) is consumed by the legacy DX9 cache draws that are
-        // STILL live A/B paths:
-        //   - renderDepthFromCache  — runs when !forgeOwnsDepth (Forge off entirely); also via
-        //                             ForgeNearDepthReplay + the UseRenderThread depth job (both
-        //                             their own flags)
-        //   - renderShadowFromCache — gated by the same forgeOwnsDepth expression as depth
-        // forgeOwnsDepth == forgeOwnsFrame() (renderdepth.cpp). NUMPAD7 CACHE
-        // (rendercachedcolor / cacheOpaqueMode) is the
-        // obsolete pre-DX12 opaque-cache attempt — no longer maintained, so it is deliberately NOT
-        // a mirror consumer here (it renders empty; superseded by the Forge takeover). In default
-        // Forge play (F11 on) forgeOwnsDepth is true and both explicit flags are off, so the
-        // mirror is dead weight — skip it so the produce/capture path is D3D9-free
-        // (worker-relocatable). The host IPC capture (captureGeometry/…) is independent and always
-        // runs. This predicate mirrors the live consumers' gates exactly, so a mirror is built iff
-        // something will draw it; the content-identity gate rebuilds a missing mirror on demand
-        // when a mode toggles on (no purge / no host re-ship needed).
+        // The DX9 mirror VB/IB (e.vb/e.ib) existed for the legacy DX9 cache draws:
+        //   - renderDepthFromCache  — the depth pre-pass, plus its ForgeNearDepthReplay and
+        //                             UseRenderThread variants
+        //   - renderShadowFromCache — deleted in S3 with the shadow renderer
+        // S5a deleted the last of them, so the mirror now has NO consumer on any path,
+        // including F11-off (MW draws its own scene there; MGE draws nothing). Constant false
+        // rather than deleted outright so this stage stays a behaviour no-op and the field
+        // removal is its own reviewable change — the content-identity gate below still
+        // rebuilds a mirror on demand if a consumer ever comes back.
+        //
+        // The host IPC capture (captureGeometry/…) is independent of this and always runs.
         static bool needMirror() {
-            const bool forgeOwnsDepth = RenderProcess::forgeOwnsFrame();
-            return Configuration.ForgeNearDepthReplay
-                || Configuration.UseRenderThread
-                || !forgeOwnsDepth;
+            return false;
         }
 
         IDirect3DTexture9* getDX9Texture(NI::Texture* tex) {

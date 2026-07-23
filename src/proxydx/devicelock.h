@@ -13,10 +13,9 @@
 // neither interleaves a multi-call sequence (RT switch + state + draw, or an
 // ID3DXEffect pass) with the other.
 //
-// Gated by g_deviceLockEnabled: only true while a render thread is live (set at
-// device creation from Configuration.UseRenderThread). When the feature is off,
-// the proxy forwarders skip the lock entirely, so the single-threaded path pays
-// nothing and behaves byte-for-byte as before.
+// Gated by g_deviceLockEnabled: only true while a second submitter is live. Nothing sets
+// it since S5a deleted the MGE render thread, so the proxy forwarders skip the lock
+// entirely and the single-threaded path pays nothing.
 //
 // NOTE: the lock is non-recursive. It must be taken at exactly one level per
 // call chain. The MGEProxyDevice overrides that invoke MGE rendering

@@ -38,14 +38,9 @@ enum RenderShadowMapID {
     PASS_RENDERSHADOWMAP_MW_SKINNED   // appended pass P4s; VS palette skinning
 };
 
-enum RenderDepthID {
-    PASS_CLEARDEPTH = 0,
-    PASS_RENDERMWDEPTH,
-    PASS_RENDERLANDDEPTH,
-    PASS_RENDERSTATICSDEPTH,
-    PASS_RENDERGRASSDEPTHINST,
-    PASS_RENDERMWDEPTH_SKINNED         // appended pass D1s; VS palette skinning
-};
+// S5a: enum DepthPassID (PASS_CLEARDEPTH / PASS_RENDERMWDEPTH / PASS_RENDERLANDDEPTH /
+// PASS_RENDERSTATICSDEPTH / PASS_RENDERGRASSDEPTHINST / PASS_RENDERMWDEPTH_SKINNED) indexed
+// the passes of "XE Depth.fx". Both the effect and every pass that used it are gone.
 
 static const int SIZEOFSTATICVERT = 20;
 static const int SIZEOFLANDVERT = 16;

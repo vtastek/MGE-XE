@@ -9,7 +9,6 @@
 #include "scenegraph.h"
 #include "scenegraph_geometry_cache.h"
 #include "renderprocess.h"
-#include "renderthread.h"
 #include "mge_tracy.h"
 #include "statusoverlay.h"
 
@@ -44,7 +43,7 @@ inline double fseNowMs() {
 
 constexpr unsigned kFseWindow = 300;
 struct FseAccum {
-    double lights, cell, view, statics, walk, classify, vis, kick, rt, total;
+    double lights, cell, view, walk, classify, vis, kick, total;
     double maxTotal;
     unsigned n, extN;
 };
@@ -69,12 +68,16 @@ void mwDrawsAccum(double ms) {
 }
 
 // One call at the end of frameSetupEarly; logs the averaged breakdown every window.
-void fseAccum(double lights, double cell, double view, double statics, double walk,
-              double classify, double vis, double kick, double rt,
+//
+// S5a: the `statics` step (the distant-statics cull, deleted in S4b — it had been
+// stamping a zero-width interval ever since) and the `rt` step (the render-thread
+// depth-cache kick) are gone from the breakdown.
+void fseAccum(double lights, double cell, double view, double walk,
+              double classify, double vis, double kick,
               double total, bool exterior) {
     s_fse.lights += lights; s_fse.cell += cell; s_fse.view += view;
-    s_fse.statics += statics; s_fse.walk += walk; s_fse.classify += classify;
-    s_fse.vis += vis; s_fse.kick += kick; s_fse.rt += rt;
+    s_fse.walk += walk; s_fse.classify += classify;
+    s_fse.vis += vis; s_fse.kick += kick;
     s_fse.total += total;
     if (total > s_fse.maxTotal) s_fse.maxTotal = total;
     if (exterior) ++s_fse.extN;
@@ -83,16 +86,16 @@ void fseAccum(double lights, double cell, double view, double statics, double wa
     const double inv = 1.0 / s_fse.n;
     // accounted = the sum of the named steps; total - accounted is frameSetupEarly's own
     // residue (branch/gate work). A large residue means the split is missing a step.
-    const double accounted = (s_fse.lights + s_fse.cell + s_fse.view + s_fse.statics
+    const double accounted = (s_fse.lights + s_fse.cell + s_fse.view
                             + s_fse.walk + s_fse.classify + s_fse.vis
-                            + s_fse.kick + s_fse.rt) * inv;
+                            + s_fse.kick) * inv;
     LOG::logline(">> [fse] %u frames avg: total=%.2f | lights=%.2f cell=%.2f view=%.2f "
-                 "statics=%.2f walk=%.2f classify=%.2f vis=%.2f kick=%.2f rt=%.2f "
+                 "walk=%.2f classify=%.2f vis=%.2f kick=%.2f "
                  "=> accounted=%.2f residue=%.2f | max total=%.2f ext=%u",
                  s_fse.n, s_fse.total * inv, s_fse.lights * inv, s_fse.cell * inv,
-                 s_fse.view * inv, s_fse.statics * inv, s_fse.walk * inv,
+                 s_fse.view * inv, s_fse.walk * inv,
                  s_fse.classify * inv, s_fse.vis * inv,
-                 s_fse.kick * inv, s_fse.rt * inv,
+                 s_fse.kick * inv,
                  accounted, s_fse.total * inv - accounted,
                  s_fse.maxTotal, s_fse.extN);
     s_fse = {};
@@ -114,12 +117,11 @@ void DistantLand::frameSetupEarly() {
     MGE_ZoneScopedN("frameSetupEarly");
     // [fse] step stamps (see fseAccum above). Deltas stay 0 for steps this frame skipped.
     const double tFse0 = fseNowMs();
-    double dStatics = 0, dWalk = 0, dClassify = 0, dVis = 0, dKick = 0, dRt = 0;
+    double dWalk = 0, dClassify = 0, dVis = 0, dKick = 0;
 
     s_frameSetupEarly = false;
     s_earlyKickedStatics = false;
     earlyWalkedCache = false;
-    renderThreadJobKicked = false;
     earlyForgeKickoff = false;
 
     // Drive the scene-graph lights snapshot here (moved from renderStage0, which
@@ -143,7 +145,7 @@ void DistantLand::frameSetupEarly() {
     // Only the IPC (shared-memory) path benefits from the early statics/geometry
     // work: there the cull is async and overlaps. The non-IPC path does
     // synchronous quadtree work in the kickoff, which has no overlap to gain —
-    // leave selectDistantCell + the GeometryCache walk in renderStage0/renderDepth.
+    // leave selectDistantCell + the GeometryCache walk in renderStage0.
     // Not counted in [fse]: menu/load/non-IPC frames are the load-burst contamination
     // that has to stay out of the steady-state budget.
     if (!ready || !device || !Configuration.UseSharedMemory) return;
@@ -380,15 +382,13 @@ void DistantLand::frameSetupEarly() {
         // S4b: the distant-statics cull RPC + MSOC verdict dispatch were here. The whole
         // chain is gone — the Forge host loads, culls (two-phase Hi-Z on the GPU) and
         // draws distant statics itself. s_earlyKickedStatics stays false forever now.
-        const double tStatics0 = fseNowMs();
-        dStatics = fseNowMs() - tStatics0;
+        // (S5a: the zero-width `statics` [fse] stamp that outlived them is gone too.)
 
         // Build the geometry cache (walk + VB uploads). The ~1.46ms main-thread
-        // walk now overlaps both the sky pass and the worker drain kicked above;
-        // renderDepth skips its own call when earlyWalkedCache is set. Cache
-        // CONSUME (renderDepthFromCache) stays in renderDepth where the render
-        // target/effect are bound. Touches no ipcClient, so it can run while the
-        // worker drains the statics RPC on the single channel.
+        // walk overlaps the engine's sky pass; renderStage0's non-early fallback
+        // skips its own copy when earlyWalkedCache is set. The cache is now a pure
+        // producer — the Forge host's draw lists are its only consumer (S5a removed
+        // the DX9 depth pre-pass that used to read it back).
         const double tWalk0 = fseNowMs();
         MGE::GeometryCache::onFrameReady(MGE::SceneGraph::getDataHandler(),
                                          &eyePos.x, cacheGateRadius, liveDrawBuild);
@@ -418,13 +418,11 @@ void DistantLand::frameSetupEarly() {
         }
 
         // Build the current-frame visible set over the fresh cache, using the camera
-        // read above (mwView/mwProj). This is the set MGE owns: the depth pre-pass
-        // (renderDepthFromCache) and the cache opaque color pass both consume it. When
-        // the early classify ran (engine-set mode), it is the engine's exact drawn set
-        // (occlusion-culled); otherwise it is the frustum cull (optionally MSOC-refined)
-        // — either way current-frame, so leading-edge tiles a pan reveals get depth (no
-        // sky holes). Must run before snapshotVisibleKeysForThread (the render-thread
-        // job reads a snapshot of it). ~0.4ms, overlapping the sky window.
+        // read above (mwView/mwProj). When the early classify ran (engine-set mode) it is
+        // the engine's exact drawn set (occlusion-culled); otherwise it is the frustum
+        // cull — either way current-frame, so leading-edge tiles a pan reveals are
+        // included. Sole consumer is the Forge kickoff's draw-list build (directly, or via
+        // foldVisibleKeys on fold frames). ~0.4ms, overlapping the sky window.
         const double tVis0 = fseNowMs();
         buildFrustumVisibleSet(&mwView, &mwProj);
         dVis = fseNowMs() - tVis0;
@@ -439,30 +437,21 @@ void DistantLand::frameSetupEarly() {
         RenderProcess::kickProduceEarly(device);
         dKick += fseNowMs() - tKick0;
 
-        // Kick the render-thread depth-cache job now — after the geometry-cache
-        // walk (so the cache + VBs it consumes are stable) and before the engine's
-        // sky pass — so the worker's ~1ms submission CPU overlaps the engine's
-        // non-device sky-prep CPU. Fenced at the top of renderStage0
-        // (RenderThread::wait) before any main-thread device/effect work; renderDepth
-        // then skips its own Clear/clear-depth/cache and renders land/statics/grass
-        // onto the worker's depth buffer. Snapshot the visible-key set here (main
-        // thread) so the worker never races updateVisibleSet.
-        if (Configuration.UseRenderThread) {
-            const double tRt0 = fseNowMs();
-            snapshotVisibleKeysForThread();
-            MGE::RenderThread::kick(&DistantLand::renderThreadDepthCacheJob);
-            renderThreadJobKicked = true;
-            dRt = fseNowMs() - tRt0;
-        }
+        // S5a: the MGE render thread was kicked here. Its one and only job was the DX9
+        // depth-cache pass (renderThreadDepthCacheJob) — clear texDepthFrame and replay
+        // the geometry cache into it during the engine's sky window. That pass is gone,
+        // so the worker, the device-submission lock it needed, and the
+        // D3DCREATE_MULTITHREADED device it forced all went with it. The overlap it was
+        // reaching for is what the Forge produce worker (kickProduceEarly above) does now.
     } else {
         // Interior / non-distant cell: the exterior early block above is skipped (it
         // exists for the distant-statics overlap, which interiors don't have), so its
-        // cache walk + buildFrustumVisibleSet fall through to the serial renderDepth
-        // path. But the early classify MUST run HERE, at BeginScene(0) before the
-        // engine's scene-0 CullShow — running it later in renderDepth is too late (the
+        // cache walk + buildFrustumVisibleSet fall through to the renderStage0
+        // fallback. But the early classify MUST run HERE, at BeginScene(0) before the
+        // engine's scene-0 CullShow — running it later in renderStage0 is too late (the
         // engine's MSOC is already active and declines with rc=1, so interiors fell to
         // a pure-frustum visible set and drew clutter the engine occludes). This fills
-        // s_visibleKeys + latches s_earlyClassifyRan; renderDepth's buildFrustumVisibleSet
+        // s_visibleKeys + latches s_earlyClassifyRan; renderStage0's buildFrustumVisibleSet
         // then consumes it (MSOC branch) once it has walked the cache.
         // Same host-cull-only skip as the exterior branch above — the result is discarded when
         // the host's Hi-Z GPU cull owns occlusion, so don't pay for it on the critical path.
@@ -473,10 +462,10 @@ void DistantLand::frameSetupEarly() {
         }
 
         // 2b: early-Forge-kickoff frames need the kickoff's inputs ready NOW — hoist the
-        // cache walk + current-frame visible set here (the exact pair renderDepth's
+        // cache walk + current-frame visible set here (the exact pair renderStage0's
         // !earlyWalkedCache fallback runs, in the same order: classify above, walk, build).
-        // renderDepth then skips its own copies. Non-latched frames keep the serial
-        // renderDepth path untouched.
+        // renderStage0 then skips its own copies. Non-latched frames keep the fallback path
+        // untouched.
         if (earlyForgeKickoff) {
             const double tWalk0 = fseNowMs();
             MGE::GeometryCache::onFrameReady(MGE::SceneGraph::getDataHandler(),
@@ -495,8 +484,8 @@ void DistantLand::frameSetupEarly() {
     }
 
     const double tEnd = fseNowMs();
-    fseAccum(tLights - tFse0, tCell - tLights, tView - tCell, dStatics, dWalk,
-             dClassify, dVis, dKick, dRt, tEnd - tFse0,
+    fseAccum(tLights - tFse0, tCell - tLights, tView - tCell, dWalk,
+             dClassify, dVis, dKick, tEnd - tFse0,
              isDistantCell() && !mwBridge->IsMenu());
 }
 
@@ -543,17 +532,9 @@ void DistantLand::renderStage0() {
 #endif
     MGE_ZoneScopedN("Stage0");
     auto mwBridge = MWBridge::get();
-    IDirect3DStateBlock9* stateSaved;
-    UINT passes;
 
-    // Render-thread fence. Join the worker BEFORE any main-thread device or
-    // ID3DXEffect work below (setupCommonEffect, the depth/shadow/distant passes
-    // all share the single effect/effectDepth objects, which are not safe to use
-    // concurrently with the worker). Kicked at BeginScene(0)/frameSetupEarly, the
-    // job has had the whole sky window to finish, so this typically reads ~0.
-    if (renderThreadJobKicked) {
-        MGE::RenderThread::wait();
-    }
+    // (S5a: the render-thread fence stood here, joining the depth-cache worker before any
+    // main-thread ID3DXEffect work. Both the worker and the depth pass it produced are gone.)
 
     // Menu-cache latch maintenance (USE_MENU_CACHING). MUST run on EVERY frame, so it sits ABOVE
     // the early return below — this is the latch's only RELEASE. postProcess() sets isRenderCached
@@ -569,22 +550,15 @@ void DistantLand::renderStage0() {
     // (earlyForgeKickoff — the geometry-cache walk + frustum-visible set were already
     // built in frameSetupEarly, the distant-statics cull RPC is gated off there, and
     // every DX9 pass below would be overwritten by the present composite), skip the
-    // entire DX9 scene layer. Preserve only the per-frame state this stage OWNS: the
-    // record-list drain (recordMW is still captured in inspectIndexedPrimitive but has
-    // no Forge consumer, so they grow across frames if not cleared) and the menu-cache latch above.
-    // The render-thread fence above still ran and the Tracy sky zone was closed at the top.
-    // Warm-up / F11-off frames (!earlyForgeKickoff) fall through to the full path
-    // — that's where the cache-walk fallback and the statics-RPC drain still live.
+    // entire DX9 scene layer. Preserve only the per-frame state this stage OWNS: the scene-0
+    // draw-counter reset (recordMWCount is still bumped in inspectIndexedPrimitive — it is
+    // the "nothing has written z yet" predicate there) and the menu-cache latch above. The
+    // Tracy sky zone was closed at the top. Warm-up / F11-off frames (!earlyForgeKickoff)
+    // fall through to the full path — that's where the cache-walk fallback still lives.
     if (earlyForgeKickoff) {
-        recordMW.clear();
+        recordMWCount = 0;
         return;
     }
-
-    // (Channel-free gate moved into renderDepth, right after renderDepthFromCache:
-    // that cache-only depth work touches no ipcClient and can overlap the worker's
-    // statics-RPC drain, so we let it run before blocking on the channel. Nothing
-    // in renderStage0 before renderDepth touches ipcClient on the worker path —
-    // selectDistantCell and the fallback kickoff are both skipped there.)
 
     // (Scene-graph lights snapshot — MGE::SceneGraph::onFrameReady() — moved to
     // frameSetupEarly() at BeginScene(0) so the async worker overlaps the sky
@@ -627,30 +601,26 @@ void DistantLand::renderStage0() {
             ? "Point lights: TILED (screen grid)" : "Point lights: PER-MESH (selection)");
     }
 
-    if (!isRenderCached) {
-        // Save state block manually since we can change FVF/decl, and because the depth
-        // pass runs with D3DXFX_DONOTSAVESTATE.
-        //
-        // S4b: this used to fork on isDistantCell() — the exterior branch ran the statics
-        // cull, the distant land/statics colour passes and the MSOC overlays around the
-        // depth call, the interior branch just ran depth. With all of that deleted the two
-        // branches were character-for-character identical, so there is one path now.
-        // renderDepth still self-gates its own distant parts on isDistantCell().
-        device->CreateStateBlock(D3DSBT_ALL, &stateSaved);
-        effect->BeginPass(PASS_SETUP);
-        effect->EndPass();
-
-        effectDepth->Begin(&passes, D3DXFX_DONOTSAVESTATE);
-        renderDepth();
-        effectDepth->End();
-
-        // Restore render state
-        stateSaved->Apply();
-        stateSaved->Release();
+    // S5a: this was MGE's depth pre-pass — a state block, a PASS_SETUP bracket on the main
+    // effect and an effectDepth bracket around renderDepth(), which cleared texDepthFrame
+    // and replayed the geometry cache into it. Its only consumer was the DX9 post chain's
+    // depth effects (SSAO/DOF), which postProcess() already skips whenever the Forge seam
+    // owns the frame, so under Forge the whole pass produced a texture nobody sampled.
+    // With it gone, the last thing renderDepth() still did on this path was the *CPU*
+    // fallback below: if frameSetupEarly did not walk the geometry cache this frame
+    // (menus, warm-up, non-IPC), walk it and build the visible set now, so the Forge
+    // kickoff downstream always has a current-frame set to draw from.
+    if (!isRenderCached && !earlyWalkedCache) {
+        MGE::GeometryCache::onFrameReady(MGE::SceneGraph::getDataHandler());
+        // The early classify itself must run at BeginScene(0) in frameSetupEarly, before
+        // the engine's CullShow — running it here is too late (the engine's MSOC is already
+        // active and declines with rc=1). frameSetupEarly runs it for interiors too, so the
+        // MSOC branch of buildFrustumVisibleSet may still be latched when we get here.
+        buildFrustumVisibleSet(&mwView, &mwProj);
     }
 
-    // Clear stray recordings
-    recordMW.clear();
+    // Close the scene-0 draw window
+    recordMWCount = 0;
 }
 
 // renderStage1 - EndScene(scene 0). Closes the MW-draw timing window and drains the
@@ -658,8 +628,7 @@ void DistantLand::renderStage0() {
 //
 // S4: the grass colour pass (the last thing this stage drew) is gone with rendergrass.cpp.
 // What remains is bookkeeping the stage owns and nothing else does: the MW-draw accumulator,
-// the Tracy zone close, and the recordMW drain — without which scene 0's records would leak
-// into renderStage2's depth replay for scenes 1+.
+// the Tracy zone close, and the scene-0 draw-counter reset.
 void DistantLand::renderStage1() {
     if (s_mwDrawsT0 != 0.0) {
         mwDrawsAccum(fseNowMs() - s_mwDrawsT0);
@@ -670,48 +639,16 @@ void DistantLand::renderStage1() {
     s_mwDrawsZone = nullptr;
 #endif
     MGE_ZoneScopedN("Stage1");
-    MGE_TracyPlot("MW draw calls", (int64_t)recordMW.size());
+    MGE_TracyPlot("MW draw calls", (int64_t)recordMWCount);
 
-    recordMW.clear();
+    recordMWCount = 0;
 }
 
-// renderStage2 - Render shadows and depth texture for scenes 1+ (post-stencil redraw/alpha/1st person)
-void DistantLand::renderStage2() {
-    MGE_ZoneScopedN("Stage2");
-    auto mwBridge = MWBridge::get();
-    IDirect3DStateBlock9* stateSaved;
-    UINT passes;
-
-    ///LOG::logline("Stage 2 prims: %d", recordMW.size());
-
-    // Early out if nothing is happening
-    if (recordMW.empty()) {
-        return;
-    }
-
-    // Skip in Forge mode too: this entire block is the recorded-render shadow receiver +
-    // recorded depth replay (renderDepthAdditional), both superseded — depth now comes from
-    // the cache (renderCacheDepthToMainZ + the depth-texture cache pass) and shadows are
-    // deferred host-side. The recordMW capture and the clear below are untouched.
-    if (!isRenderCached && !RenderProcess::forgeOwnsFrame()) {
-        // Save state block manually since we can change FVF/decl
-        device->CreateStateBlock(D3DSBT_ALL, &stateSaved);
-
-        // S3: shadowing onto recorded renders was here (same receiver as renderStage1).
-
-        // Depth texture from recorded renders
-        effectDepth->Begin(&passes, D3DXFX_DONOTSAVESTATE);
-        renderDepthAdditional();
-        effectDepth->End();
-
-        // Restore state
-        stateSaved->Apply();
-        stateSaved->Release();
-    }
-
-    recordMW.clear();
-}
-
+// S5a: renderStage2 is gone. It ran for scenes 1+ and did exactly one thing — replay the
+// recorded scene draws into the depth texture (renderDepthAdditional) so first-person and
+// sorted alpha appeared in SSAO/DOF. It already self-skipped under Forge, and the depth
+// texture it wrote no longer exists. Its other duty, draining the record list, went with
+// the list: recordMW is a counter now (see inspectIndexedPrimitive), reset at scene 0.
 
 // S4: renderStageBlend is gone. It fed the MW<->MGE handover feather (PASS_BLENDMGE over a
 // distant-only capture) and, before S3, the water caustics. Both of its inputs died with the
@@ -994,10 +931,14 @@ void DistantLand::postProcess() {
         device->CreateStateBlock(D3DSBT_ALL, &stateSaved);
 
         // Forge owns the composited frame (F11): the host already shades + applies its own GTAO,
-        // and the MGE post chain's depth effects (SSAO/DOF) read texDepthFrame — the last consumer
-        // of the MGE depth pre-pass. Skip the whole HW post chain when Forge is on so depth can be
-        // retired. NOTE: this also drops any depth-free MGE post (bloom/colour/underwater); F11-off
-        // restores it (clean A/B). Screenshot + menu-cache + foam-debug below still run.
+        // so skip the whole HW post chain. NOTE: this also drops any depth-free MGE post
+        // (bloom/colour/underwater); F11-off restores it (clean A/B). Screenshot + menu-cache
+        // below still run.
+        //
+        // This gate is what let S5a retire the depth pre-pass: the chain's depth effects
+        // (SSAO/DOF) were texDepthFrame's only consumer, and they never ran under the seam.
+        // On the F11-off side they now read an unbound EV_depthframe — see updatePostShader.
+        // Both are moot once S7 moves post-processing onto the host.
         if ((Configuration.MGEFlags & USE_HW_SHADER) && !RenderProcess::forgeOwnsFrame()) {
             // Set flags to reflect cell environment
             int envFlags = 0;
@@ -1067,12 +1008,13 @@ void DistantLand::postProcess() {
 void DistantLand::updatePostShader(MGEShader* shader) {
     auto mwBridge = MWBridge::get();
 
-    // Internal textures
-    // TODO: Should be set once at init time
-    shader->SetTexture(EV_depthframe, texDepthFrame);
+    // S5a: EV_depthframe fed texDepthFrame, the depth pre-pass's R32F output — the input
+    // MGE's own SSAO and DOF post shaders sampled. The pre-pass is gone (the host applies
+    // GTAO), so depth-driven post shaders now read whatever they default to. Depth-free post
+    // (bloom, HDR, colour grading, underwater) is unaffected. postProcess() already skips
+    // this whole chain under the Forge seam, so this only changes the F11-off baseline.
     // S3: EV_watertexture fed MGE's animated water volume map, deleted with the water
-    // renderer. Post shaders that declare it now see whatever they default to; the
-    // input is retired for real when post-processing moves to the host (S7).
+    // renderer. Both inputs are retired for real when post-processing moves to the host (S7).
 
     // View position
     float zoom = (Configuration.MGEFlags & ZOOM_ASPECT) ? Configuration.CameraEffects.zoom : 1.0f;
@@ -1352,14 +1294,17 @@ bool DistantLand::inspectIndexedPrimitive(int sceneCount, const RenderedState* r
     const auto& stage0 = frs->stage[0];
     bool isDecal = stage0.texcoordIndex != 0 && (stage0.colorArg1 == D3DTA_TEXTURE || stage0.colorArg2 == D3DTA_TEXTURE);
 
-    // Capture all writes to z-buffer, except detectable second passes of multi-pass rendering
+    // Count all writes to z-buffer, except detectable second passes of multi-pass rendering.
+    //
+    // S5a: this used to COPY each such draw into recordMW (a vector<RecordedState>, which
+    // AddRef'd the VB, IB and texture per DIP — a heap push and three COM refcount round
+    // trips on the hottest path in the proxy). The recorded list existed to be replayed:
+    // into the depth texture (renderDepthAdditional / renderDepthRecorded) and, before S3,
+    // as the stencil-shadow receiver. All of those replays are gone. The single surviving
+    // consumer is the `== 0` test below — "has anything written z yet this scene?" — so a
+    // counter carries the whole remaining meaning at none of the cost.
     if (rs->zWrite && !isLandSplat && !isDecal) {
-        recordMW.emplace_back(*rs);
-
-        // Unify alpha test operator/reference to be equivalent to GREATEREQUAL
-        if (rs->alphaFunc == D3DCMP_GREATER) {
-            recordMW.back().alphaRef++;
-        }
+        ++recordMWCount;
     }
 
     // AT1 sorted-alpha A/B + AT3 inventory: while the Forge alpha pass is live, MW's sorted-alpha
@@ -1369,8 +1314,8 @@ bool DistantLand::inspectIndexedPrimitive(int sceneCount, const RenderedState* r
     // 1st-person scene, and with stencil shadows the indices shift; a scene-index gate would eat
     // the player's hands. Blended-only matches exactly what the sorter draws (No-Sorter blends
     // went to scene 0; water never reaches here — the isWaterMaterial branch bypasses
-    // inspection). Placed AFTER the recordMW capture above so depth-replay records are
-    // untouched. Whatever still renders with this ON is the AT3 leftover set (particles/VFX —
+    // inspection). Placed AFTER the z-write count above so the sky predicate below is
+    // unaffected. Whatever still renders with this ON is the AT3 leftover set (particles/VFX —
     // not NiTriShapes, not captured by the cache walk).
     // AT2: the msoc plugin's kOwnedAlpha display skip (renderdepth.cpp setOwnedFlags) is now
     // the PRIMARY mechanism — most covered blended leaves never display, so their DIPs never
@@ -1388,7 +1333,7 @@ bool DistantLand::inspectIndexedPrimitive(int sceneCount, const RenderedState* r
     }
 
     // Special case, detect sky. MW's sky is the first blended geometry of scene 0 in a
-    // weather cell — nothing has written z yet, so recordMW is still empty.
+    // weather cell — nothing has written z yet, so recordMWCount is still 0.
     //
     // S4: MGE's atmosphere-scattering sky (renderSky + the recordSky replay list it drew from)
     // is gone; the Forge host owns the sky (SK3/SK4). The branch survives ONLY to keep these
@@ -1402,7 +1347,7 @@ bool DistantLand::inspectIndexedPrimitive(int sceneCount, const RenderedState* r
     // scene 0, nothing has written z yet" matches full-screen fade quads and load-screen
     // overlays just as well as it matches the sky dome. The old gate only looked safe because
     // it required USE_ATM_SCATTER, which is off in most configs, so it almost never fired.
-    if (recordMW.empty() && rs->blendEnable && sceneCount == 0 && mwBridge->CellHasWeather()) {
+    if (recordMWCount == 0 && rs->blendEnable && sceneCount == 0 && mwBridge->CellHasWeather()) {
         // Pass through — MW draws it.
     } else {
         // Suppress the engine's scene-0 opaque draw when the Forge seam owns the frame
@@ -1412,8 +1357,7 @@ bool DistantLand::inspectIndexedPrimitive(int sceneCount, const RenderedState* r
         // sceneCount == 0 is REQUIRED. isCoveredOpaque matches textured opaque in ANY scene,
         // so without this gate the first-person arm gets suppressed but never host-drawn ->
         // hands vanish. isLandSplat covers the terrain splat overlay passes and already
-        // self-gates to scene 0. The recordMW capture above is untouched — the depth replay
-        // still sees the engine geometry.
+        // self-gates to scene 0.
         //
         // (S4: this gate used to read `cacheOpaqueMode || forgeOwnsFrame()`. The cache half
         // was the CACHE-mode opaque takeover, which the Forge host superseded.)
@@ -1490,70 +1434,9 @@ IDirect3DSurface9* DistantLand::captureScreenshot() {
 
 
 // ------------------------------------
-// DistantLand::RecordedState
-
-DistantLand::RecordedState::RecordedState(const RenderedState& state)
-    : RenderedState(state) {
-    vb->AddRef();
-    ib->AddRef();
-    if (texture) {
-        texture->AddRef();
-    }
-}
-
-DistantLand::RecordedState::~RecordedState() {
-    if (vb) {
-        vb->Release();
-    }
-    if (ib) {
-        ib->Release();
-    }
-    if (texture) {
-        texture->Release();
-    }
-}
-
-DistantLand::RecordedState::RecordedState(RecordedState&& source) noexcept
-    : RenderedState(source) {
-    source.vb = nullptr;
-    source.ib = nullptr;
-    source.texture = nullptr;
-}
+// S5a: DistantLand::RecordedState lived here — a RenderedState that AddRef'd its VB, IB and
+// texture on capture and released them on destruction, so a recorded draw could be replayed
+// safely later in the frame. Nothing replays recorded draws any more (see recordMWCount in
+// inspectIndexedPrimitive), so the type and its per-DIP refcounting are gone.
 
 
-// ------------------------------------
-// RenderTargetSwitcher
-
-// RenderTargetSwitcher - Switch to a render target, restoring state at end of scope
-RenderTargetSwitcher::RenderTargetSwitcher(IDirect3DSurface9* target, IDirect3DSurface9* targetDepthStencil) {
-    init(target, targetDepthStencil);
-}
-
-// RenderTargetSwitcher - Switch to a render surface belonging to a texture, restoring state at end of scope
-RenderTargetSwitcher::RenderTargetSwitcher(IDirect3DTexture9* targetTex, IDirect3DSurface9* targetDepthStencil) {
-    // Note the device still holds a reference to the target while it's active
-    IDirect3DSurface9* target;
-    targetTex->GetSurfaceLevel(0, &target);
-    init(target, targetDepthStencil);
-    target->Release();
-}
-
-void RenderTargetSwitcher::init(IDirect3DSurface9* target, IDirect3DSurface9* targetDepthStencil) {
-    DistantLand::device->GetRenderTarget(0, &savedTarget);
-    DistantLand::device->GetDepthStencilSurface(&savedDepthStencil);
-
-    DistantLand::device->SetRenderTarget(0, target);
-    DistantLand::device->SetDepthStencilSurface(targetDepthStencil);
-}
-
-RenderTargetSwitcher::~RenderTargetSwitcher() {
-    DistantLand::device->SetRenderTarget(0, savedTarget);
-    DistantLand::device->SetDepthStencilSurface(savedDepthStencil);
-
-    if (savedTarget) {
-        savedTarget->Release();
-    }
-    if (savedDepthStencil) {
-        savedDepthStencil->Release();
-    }
-}

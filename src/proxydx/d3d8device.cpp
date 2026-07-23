@@ -10,9 +10,10 @@
 #include "mge/ffeshader.h"
 #include "support/log.h"
 
-// Device-submission lock shared with the MGE render thread (see devicelock.h).
-// Disabled until a device is created with Configuration.UseRenderThread on, so
-// the single-threaded path takes the lock's cheap disabled branch only.
+// Device-submission lock (see devicelock.h). Armed by the MGE render thread until S5a
+// deleted it; nothing sets g_deviceLockEnabled now, so every MGE_DEVLOCK below takes the
+// lock's cheap disabled branch. Kept for whoever next needs to serialise a worker against
+// the proxy forwarders.
 std::mutex g_deviceMtx;
 bool       g_deviceLockEnabled = false;
 bool       g_spikeForceDefaultPool = false;
