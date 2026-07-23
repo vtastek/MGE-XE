@@ -3732,7 +3732,21 @@ namespace RenderProcess {
         static bool        s_haveEye = false;
         const float ex = eye[0] - s_lastEye[0], ey = eye[1] - s_lastEye[1], ez = eye[2] - s_lastEye[2];
         const bool teleport = s_haveEye && (ex*ex + ey*ey + ez*ez > kCellTeleportDist * kCellTeleportDist);
-        if (interiorCell != s_lastInteriorCell || teleport) {
+        // SAVE-GAME RELOAD. Neither signal above fires when you reload a save of where you already
+        // are: the interior-cell pointer is unchanged and the eye lands back on the same spot — yet
+        // MW tore the scene graph down and rebuilt it, so every cached entry is keyed on a dead
+        // shape address while the new scene captures alongside it. That is the reported "reload →
+        // frozen duplicate NPCs" (measured live: 68,400 frames across several reloads with not one
+        // [cell-purge] line). The loading bar is the engine's own authoritative "the world is being
+        // rebuilt" flag and covers every rebuild MW does, including the two above. Purge on its
+        // FALLING edge — during the load there is nothing to purge to yet, and the first frame
+        // after it clears is exactly when the stale entries would otherwise be emitted.
+        static bool s_sawLoadingBar = false;
+        const bool  loadingNow = MWBridge::get()->isLoadingBar();
+        const bool  reloaded   = s_sawLoadingBar && !loadingNow;
+        s_sawLoadingBar = loadingNow;
+        if (loadingNow) { return; }   // mid-load: the roots are in flux, decide on the way out
+        if (interiorCell != s_lastInteriorCell || teleport || reloaded) {
             ++g_cellEpoch;
             g_lightTracks.clear();   // new-cell lights all take fresh ids (no address-reuse inheritance)
             // The scene graph was torn down with the old cell, but the geometry cache keys on
@@ -3745,9 +3759,9 @@ namespace RenderProcess {
             // startup walk just captured, for nothing. There is no old cell to leave yet. (s_haveEye
             // is false exactly once, which is the same condition the teleport test already uses.)
             const bool firstEval = !s_haveEye;
-            LOG::logline(">> [cell-purge] epoch=%u frame=%u interiorChanged=%d teleport=%d first=%d cached=%u",
+            LOG::logline(">> [cell-purge] epoch=%u frame=%u interiorChanged=%d teleport=%d reloaded=%d first=%d cached=%u",
                          g_cellEpoch, frame, (int)(interiorCell != s_lastInteriorCell), (int)teleport,
-                         (int)firstEval, (unsigned)MGE::GeometryCache::cache().size());
+                         (int)reloaded, (int)firstEval, (unsigned)MGE::GeometryCache::cache().size());
             if (!firstEval) {
                 MGE::GeometryCache::purgeAll();
                 // Then resolve those keys to host slots IMMEDIATELY — do not leave them for the
