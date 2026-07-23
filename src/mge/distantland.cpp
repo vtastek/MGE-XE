@@ -261,18 +261,48 @@ void DistantLand::frameSetupEarly() {
     // kickoff, so the whole client+host world pipeline drops out; only MW's UI still draws, over
     // the composite blit of g_mainTex. See the header for the full contract.
     //
-    // Released for one frame on mouse-button release so anything the player changes from a menu
-    // (dropping an item, equipping in 3rd person) lands in a fresh frame — MGE's DX9 menu cache
-    // used exactly this expiry. Requires a valid composited frame to re-show, so a host death
-    // falls straight back to normal rendering.
+    // NOT a hard freeze — a LOW-RATE refresh. The world still renders every kMenuRefreshEvery-th
+    // frame, plus a short burst after each click. The first cut froze on everything except the
+    // click frame itself, which was wrong twice over (in-game, 2026-07-23):
+    //   - "item appears/disappears after the SECOND click": the refresh frame is synchronous with
+    //     the click, but MW applies the drop/pickup AFTER it, so the fresh frame still showed the
+    //     old world and the change only surfaced on the NEXT click's refresh. A click is a poor
+    //     proxy for "the world changed" — it fires strictly too early.
+    //   - anything that evolves on its own (a caster settling, an effect finishing) can never
+    //     appear at all, because a genuinely frozen image cannot change and the host's own
+    //     per-frame settle/expiry logic stops advancing.
+    // A refresh cadence fixes both without needing to predict what changed: any world change shows
+    // up within kMenuRefreshEvery frames, the host keeps ticking, and the click burst keeps direct
+    // interaction feeling immediate. At 8 we still skip ~7/8 of all world rendering.
     //
-    // Not gated on isLoadingBar: load screens ARE menus, but earlyForgeKickoff is already false
-    // there (forgeEligibleNow), and menuFreeze implies it.
-    menuFreeze = earlyForgeKickoff
-              && (Configuration.MGEFlags & USE_MENU_CACHING)
-              && mwBridge->IsMenu()
-              && RenderProcess::hasCompositeFrame()
-              && !MGEProxyDirectInput::mouseClick;
+    // Requires a valid composited frame to re-show, so a host death falls straight back to normal
+    // rendering. Not gated on isLoadingBar: load screens ARE menus, but earlyForgeKickoff is
+    // already false there (forgeEligibleNow), and menuFreeze implies it.
+    constexpr int kMenuRefreshEvery  = 8;   // world refresh cadence while a menu is open
+    constexpr int kMenuClickRefresh  = 4;   // frames of normal rendering after a click (MW applies
+                                            // the drop/pickup a frame or two after the release edge)
+    static int s_menuFrame = 0, s_menuClickFrames = 0;
+
+    const bool freezeEligible = earlyForgeKickoff
+                             && (Configuration.MGEFlags & USE_MENU_CACHING)
+                             && mwBridge->IsMenu()
+                             && RenderProcess::hasCompositeFrame();
+    if (!freezeEligible) {
+        // Leaving the menu (or losing the composite) resets the cadence so the next menu always
+        // opens on a freshly rendered frame rather than mid-cycle.
+        s_menuFrame = s_menuClickFrames = 0;
+        menuFreeze = false;
+    } else {
+        if (MGEProxyDirectInput::mouseClick) {
+            s_menuClickFrames = kMenuClickRefresh;
+        }
+        bool refresh = ((s_menuFrame++ % kMenuRefreshEvery) == 0);   // frame 0 of the menu renders
+        if (s_menuClickFrames > 0) {
+            --s_menuClickFrames;
+            refresh = true;
+        }
+        menuFreeze = !refresh;
+    }
     if (menuFreeze) {
         // The IPC channel is left exactly as onFrameAheadCollect (which ran at BeginScene(0),
         // before this) left it: produce drained, any deferred/parked finish stashed and closed.

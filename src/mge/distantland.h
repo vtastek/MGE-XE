@@ -120,10 +120,10 @@ public:
     // pauses simulation.
     //
     // Implies earlyForgeKickoff (never latches on warm-up / late-kickoff frames, where EndScene
-    // would kick anyway). Releases for one frame on every mouse-button RELEASE
-    // (MGEProxyDirectInput::mouseClick) so anything the player changes from a menu — dropping an
-    // item, equipping in 3rd person — is picked up by a fresh frame; that is the same expiry MGE's
-    // DX9 menu cache used, for the same reason. Requires a valid composited frame to re-show
+    // would kick anyway). NOT a hard freeze: the world still refreshes on a cadence (every 8th
+    // menu frame) plus a short burst after each click, so a change made from a menu — or anything
+    // evolving on its own — appears within a few frames and the host's per-frame settle/expiry
+    // logic keeps advancing. Requires a valid composited frame to re-show
     // (RenderProcess::hasCompositeFrame).
     static bool menuFreeze;
     // Set when frameSetupEarly already ran the grass cull (pre-kickoff, channel free);
