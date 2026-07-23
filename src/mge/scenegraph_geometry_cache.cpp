@@ -46,7 +46,6 @@ namespace MGE::GeometryCache {
     namespace {
 
         IDirect3DDevice9* g_device          = nullptr;
-        IDirect3DVertexDeclaration9* g_skinnedDecl = nullptr;
         uint64_t          g_frame          = 0;
         // Set while walking the landscape (terrain) root so visitGeometry can tag
         // entries (CachedGeometry::isLandscape). Terrain is excluded from the
@@ -302,26 +301,16 @@ namespace MGE::GeometryCache {
         std::unordered_map<IDirect3DTexture9*, const char*> g_textureNameMap;
 
         void releaseEntry(CachedGeometry& e) {
-            if (e.vb[0]) { e.vb[0]->Release(); e.vb[0] = nullptr; }
-            if (e.vb[1]) { e.vb[1]->Release(); e.vb[1] = nullptr; }
-            if (e.ib)    { e.ib->Release();    e.ib    = nullptr; }
-            e.hostUploaded = false;   // buffers/uploads invalidated -> must re-process + re-ship
+            // S5b: released the entry's DX9 mirror VB slots + IB. The entry owns no GPU
+            // resources at all now; what remains is invalidating the host ship.
+            e.hostUploaded = false;   // uploads invalidated -> must re-process + re-ship
         }
 
-        // The DX9 mirror VB/IB (e.vb/e.ib) existed for the legacy DX9 cache draws:
-        //   - renderDepthFromCache  — the depth pre-pass, plus its ForgeNearDepthReplay and
-        //                             UseRenderThread variants
-        //   - renderShadowFromCache — deleted in S3 with the shadow renderer
-        // S5a deleted the last of them, so the mirror now has NO consumer on any path,
-        // including F11-off (MW draws its own scene there; MGE draws nothing). Constant false
-        // rather than deleted outright so this stage stays a behaviour no-op and the field
-        // removal is its own reviewable change — the content-identity gate below still
-        // rebuilds a mirror on demand if a consumer ever comes back.
-        //
-        // The host IPC capture (captureGeometry/…) is independent of this and always runs.
-        static bool needMirror() {
-            return false;
-        }
+        // S5b: needMirror() decided whether to build the entry's DX9 mirror VB/IB, for the
+        // legacy cache draws (renderDepthFromCache and, before S3, renderShadowFromCache).
+        // S5a deleted the last of them and proved the predicate constant-false in a shipped
+        // build; the buffers and this gate go with it. The host IPC capture
+        // (captureGeometry/…) was always independent and is unaffected.
 
         IDirect3DTexture9* getDX9Texture(NI::Texture* tex) {
             if (!tex || !tex->rendererData) return nullptr;
@@ -666,17 +655,8 @@ namespace MGE::GeometryCache {
         // generic byte-offset writer rather than a fixed struct, so 1..4 UV sets
         // share one code path; the depth/shadow VS read only TEXCOORD0.
 
-        // Skinned vertex layout matching SkinnedVertIn (VS palette skinning input).
-        // Drawn with g_skinnedDecl; stride 56.
-        struct SkinnedVertex {
-            float x, y, z;          // POSITION     (12) bind-pose
-            float nx, ny, nz;       // NORMAL       (12) bind-pose model-space
-            float w0, w1, w2, w3;   // BLENDWEIGHT  (16) top-4 influences, normalized
-            DWORD indices;          // BLENDINDICES ( 4) UBYTE4 bone palette indices
-            float u, v;             // TEXCOORD0    ( 8)
-            DWORD color;            // COLOR        ( 4) Phase 2: per-vertex colour
-        };
-        static_assert(sizeof(SkinnedVertex) == 56, "SkinnedVertex size mismatch");
+        // S5b: struct SkinnedVertex (the stride-56 DX9 skinned mirror layout) lived here.
+        // The wire layout the host reads is IPC::SkinnedVertexWire (ipc/geomwire.h).
 
         // NiUVController takeover: find an ACTIVE NiUVController that animates the UV OFFSETS
         // of this shape. The engine applies such a controller by rewriting the mesh's vertex UV
@@ -871,9 +851,6 @@ namespace MGE::GeometryCache {
                 ? static_cast<uint8_t>(std::min<unsigned>(data->textureSets, 4u)) : 1u;
             uint8_t uvSetCount = std::min<uint8_t>(static_cast<uint8_t>(maxMapUV + 1), availSets);
             if (uvSetCount < 1 || g_walkingLandscape) uvSetCount = 1;
-            const unsigned int stride = MGE::GeometryCache::kVBStridePos + 8u * uvSetCount;
-            const DWORD vbFVF = MGE::GeometryCache::kVBFVFBase
-                              | (static_cast<DWORD>(uvSetCount) << D3DFVF_TEXCOUNT_SHIFT);
 
             // NiUVController takeover: build the key-track payload BEFORE the content gate so
             // the gate can drop the UV component from its hash — the engine's per-tick UV
@@ -938,14 +915,11 @@ namespace MGE::GeometryCache {
                 struct ContentSig { uint64_t h; uint64_t hc[5]; uint32_t lastChangeWalk; bool loggedDiff; };
                 static std::unordered_map<uint32_t, ContentSig> s_contentSig;
                 auto it = s_contentSig.find(key);
-                // Skip only if the content is unchanged AND every output the CURRENT consumers
-                // want is already produced: the host ship (if wantsGeometryCapture) and the DX9
-                // mirror VB (if needMirror). When a mode toggles on (F11-off, NUMPAD7 CACHE) the
-                // mirror term goes false for entries captured mirror-free, so this stops skipping
-                // and the body below rebuilds the mirror on the next walk — no purge required.
-                const bool haveHost   = e.hostUploaded || !RenderProcess::wantsGeometryCapture();
-                const bool haveMirror = e.vb[e.writeSlot] || !needMirror();
-                if (it != s_contentSig.end() && it->second.h == h && haveHost && haveMirror) {
+                // Skip only if the content is unchanged AND the one output a consumer still
+                // wants is already produced: the host ship (if wantsGeometryCapture).
+                // (S5b: a second term covered the DX9 mirror VB, which no longer exists.)
+                const bool haveHost = e.hostUploaded || !RenderProcess::wantsGeometryCapture();
+                if (it != s_contentSig.end() && it->second.h == h && haveHost) {
                     e.revisionID = data->revisionID;   // consume the spurious bump
                     return;
                 }
@@ -997,31 +971,11 @@ namespace MGE::GeometryCache {
                 if (uploadCat != RenderProcess::kUpNew) uploadCat = RenderProcess::kUpTopo;  // realloc dominates
             }
 
-            const uint8_t slot = 1u - e.writeSlot;
-
-            // DX9 mirror VB/IB — legacy cache consumers only (needMirror). Skipped in default
-            // Forge play so the capture path stays D3D9-free (the host IPC ship below is
-            // independent and always runs). The AABB + sky baselines are CPU-side cache outputs
-            // (world-AABB light selection, SK3/SK4) and are ALWAYS computed; only the per-vertex
-            // VB write is folded in when the mirror buffer is live. Model-space VB
-            // (XYZ|NORMAL|DIFFUSE|TEXn); per-draw world*view palette.
-            uint8_t* vbBase = nullptr;
-            if (needMirror()) {
-                if (!e.vb[slot]) {
-                    HRESULT hr = g_device->CreateVertexBuffer(
-                        vertexCount * stride, D3DUSAGE_WRITEONLY, vbFVF,
-                        g_spikeForceDefaultPool ? D3DPOOL_DEFAULT : D3DPOOL_MANAGED, &e.vb[slot], nullptr);
-                    if (FAILED(hr)) e.vb[slot] = nullptr;
-                }
-                if (e.ib == nullptr) {
-                    g_device->CreateIndexBuffer(
-                        triCount * 6, D3DUSAGE_WRITEONLY, D3DFMT_INDEX16,
-                        g_spikeForceDefaultPool ? D3DPOOL_DEFAULT : D3DPOOL_MANAGED, &e.ib, nullptr);
-                }
-                void* vbData = nullptr;
-                if (e.vb[slot] && SUCCEEDED(e.vb[slot]->Lock(0, 0, &vbData, 0)))
-                    vbBase = static_cast<uint8_t*>(vbData);
-            }
+            // S5b: the DX9 mirror VB/IB were allocated and locked here (double-buffered, one
+            // slot per upload), and the per-vertex loop below wrote the interleaved
+            // XYZ|NORMAL|DIFFUSE|TEXn layout into them. What that loop produces now is purely
+            // CPU-side: the tight model-space AABB (world-AABB point-light selection) and the
+            // sky UV/vcol baselines (SK3/SK4). The host gets its vertices via captureGeometry.
 
             {
                 const auto* uvs = data->textureCoords;  // NI::Point2*, set-major, nullptr if no UVs
@@ -1037,22 +991,6 @@ namespace MGE::GeometryCache {
                     if (mv[i].x < mn[0]) mn[0] = mv[i].x; if (mv[i].x > mx[0]) mx[0] = mv[i].x;
                     if (mv[i].y < mn[1]) mn[1] = mv[i].y; if (mv[i].y > mx[1]) mx[1] = mv[i].y;
                     if (mv[i].z < mn[2]) mn[2] = mv[i].z; if (mv[i].z > mx[2]) mx[2] = mv[i].z;
-                    if (vbBase) {
-                        auto* v = reinterpret_cast<DepthVertex*>(vbBase + i * stride);
-                        v->x = mv[i].x; v->y = mv[i].y; v->z = mv[i].z;
-                        if (nrm) { v->nx = nrm[i].x; v->ny = nrm[i].y; v->nz = nrm[i].z; }
-                        else     { v->nx = 0.0f; v->ny = 0.0f; v->nz = 1.0f; }
-                        // PackedColor byte order (b,g,r,a) is exactly D3DCOLOR, copy straight.
-                        v->color = vcol ? *reinterpret_cast<const DWORD*>(&vcol[i]) : 0xFFFFFFFF;
-                        v->u = uvs ? uvs[i].x : 0.0f;          // UV set 0
-                        v->v = uvs ? uvs[i].y : 0.0f;
-                        auto* extra = reinterpret_cast<float*>(vbBase + i * stride + 36);
-                        for (uint8_t s = 1; s < uvSetCount; ++s) {
-                            const auto& p = uvs[s * storedVerts + i];
-                            *extra++ = p.x;
-                            *extra++ = p.y;
-                        }
-                    }
                 }
                 e.aabbMin[0] = mn[0]; e.aabbMin[1] = mn[1]; e.aabbMin[2] = mn[2];
                 e.aabbMax[0] = mx[0]; e.aabbMax[1] = mx[1]; e.aabbMax[2] = mx[2];
@@ -1069,24 +1007,11 @@ namespace MGE::GeometryCache {
                 // per-frame sky walk re-uploads when the live colours diverge.
                 e.skyVcolHash = (g_walkingSky && vcol)
                     ? hashVertexColors(vcol, vertexCount) : 0u;
-                if (vbBase) e.vb[slot]->Unlock();
             }
 
-            // Non-skinned topology may change on a revision bump, so rewrite the IB whenever
-            // uploadEntry runs (rare — first upload or revision change). needMirror only (e.ib
-            // is null in default Forge play — the host gets its indices via captureGeometry).
-            if (e.ib) {
-                const auto* triList = data->getTriList();
-                if (triList) {
-                    void* ibData = nullptr;
-                    if (SUCCEEDED(e.ib->Lock(0, 0, &ibData, 0))) {
-                        memcpy(ibData, triList, triCount * 6);
-                        e.ib->Unlock();
-                    }
-                }
-            }
+            // S5b: the mirror IB was rewritten here on every uploadEntry (topology can change
+            // on a revision bump). The host gets its indices via captureGeometry.
 
-            e.writeSlot          = slot;
             e.vertexCount        = vertexCount;
             e.triangleCount      = triCount;
             e.revisionID         = data->revisionID;
@@ -1094,8 +1019,6 @@ namespace MGE::GeometryCache {
             e.numBones           = 0;
             e.skinnedUnsupported = false;
             e.uvSetCount         = uvSetCount;
-            e.vbStride           = static_cast<uint16_t>(stride);
-            e.vbFVF              = vbFVF;
             e.hasVertexColor     = (data->color != nullptr);
 
             const auto& b = data->bounds;
@@ -1220,15 +1143,12 @@ namespace MGE::GeometryCache {
             const uint32_t numBones = sd->numBones;
 
             releaseEntry(e);
-            e.writeSlot          = 0;
             e.vertexCount        = vertexCount;
             e.triangleCount      = triCount;
             e.revisionID         = data->revisionID;
             e.isSkinned          = true;
             e.numBones           = numBones;
-            e.uvSetCount         = 1;       // skinnedDecl carries one UV set; multi-map is non-skinned only
-            e.vbStride           = MGE::GeometryCache::kSkinnedVBStride;
-            e.vbFVF              = 0;        // skinned draws use skinnedDecl, not an FVF
+            e.uvSetCount         = 1;       // multi-map is non-skinned only
             e.hasVertexColor     = (data->color != nullptr);   // Phase 2: skinned VB now carries colour
 
             if (numBones > MGE::GeometryCache::kMaxBones) {
@@ -1257,22 +1177,23 @@ namespace MGE::GeometryCache {
                 }
             }
 
-            // M-Skinning: compute the per-vertex skinned layout ONCE into a CPU staging array.
-            // The Forge host wire stream (wantCapture) and the DX9 mirror VB (needMirror) both
-            // copy from it, so in default Forge play neither the mirror nor the D3D9 device is
-            // touched here. Wire stream shipped once per (key,revision), re-uploaded on change;
-            // carries base-map UV (per-vertex colour DiffAmb is a later fidelity tier).
+            // M-Skinning: compute the per-vertex skinned layout straight into the host wire
+            // stream. Shipped once per (key,revision), re-uploaded on change; carries base-map
+            // UV (per-vertex colour DiffAmb is a later fidelity tier).
+            //
+            // S5b: this went through an intermediate SkinnedVertex staging array, because the
+            // DX9 mirror VB and the wire stream wanted different layouts and the weight sort
+            // was worth doing once. With the mirror gone the staging copy has one consumer, so
+            // the loop writes the wire vertex directly — and skips entirely when nothing is
+            // capturing. (The skinned record loop is the dense-city CPU bottleneck; this is on
+            // that path.)
             const bool wantCapture = RenderProcess::wantsGeometryCapture();
-            const bool wantMirror  = needMirror();
             static std::vector<IPC::SkinnedVertexWire> skScratch;   // single-threaded cache walk
-            static std::vector<SkinnedVertex>          stg;         // CPU staging (mirror source)
             if (wantCapture) skScratch.resize(vertexCount);
-            stg.resize(vertexCount);
 
-            {
+            if (wantCapture) {
                 const auto* uvs = data->textureCoords;
                 const auto* nrm = data->normal;         // bind-pose model-space normals
-                const auto* vcol = data->color;         // NI::PackedColor*(b,g,r,a)=D3DCOLOR, null if none
                 for (uint32_t i = 0; i < vertexCount; ++i) {
                     auto& infs = perVert[i];
                     std::sort(infs.begin(), infs.end(),
@@ -1285,61 +1206,19 @@ namespace MGE::GeometryCache {
                     if (sum > 1e-6f) { for (int j = 0; j < 4; ++j) w[j] /= sum; }
                     else             { w[0] = 1.0f; }
 
-                    auto& v = stg[i];
-                    v.x = mv[i].x; v.y = mv[i].y; v.z = mv[i].z;
-                    // Bind-pose normals; the VS skins them by the bone palette (same as
-                    // position) for the cache color pass. Up if the mesh has none.
-                    if (nrm) { v.nx = nrm[i].x; v.ny = nrm[i].y; v.nz = nrm[i].z; }
-                    else     { v.nx = 0.0f; v.ny = 0.0f; v.nz = 1.0f; }
-                    v.w0 = w[0]; v.w1 = w[1]; v.w2 = w[2]; v.w3 = w[3];
-                    v.indices = static_cast<DWORD>(idx[0])
-                              | (static_cast<DWORD>(idx[1]) << 8)
-                              | (static_cast<DWORD>(idx[2]) << 16)
-                              | (static_cast<DWORD>(idx[3]) << 24);
-                    v.u = uvs ? uvs[i].x : 0.0f;
-                    v.v = uvs ? uvs[i].y : 0.0f;
-                    // PackedColor byte order (b,g,r,a) is exactly D3DCOLOR, copy straight.
-                    v.color = vcol ? *reinterpret_cast<const DWORD*>(&vcol[i]) : 0xFFFFFFFF;
-                    if (wantCapture) {
-                        auto& sw = skScratch[i];
-                        sw.px = v.x;  sw.py = v.y;  sw.pz = v.z;
-                        sw.nx = v.nx; sw.ny = v.ny; sw.nz = v.nz;
-                        sw.w0 = v.w0; sw.w1 = v.w1;
-                        sw.w2 = v.w2; sw.w3 = v.w3;
-                        sw.indices = v.indices;
-                        sw.u = v.u;   sw.v = v.v;   // base-map UV for the host
-                    }
-                }
-            }
-
-            // DX9 mirror VB/IB — legacy cache consumers only (needMirror). Copies from the CPU
-            // staging array; skipped (D3D9-free) in default Forge play. A mirror-alloc failure
-            // no longer aborts the host ship below — the wire stream is already staged.
-            if (wantMirror) {
-                HRESULT hr = g_device->CreateVertexBuffer(
-                    vertexCount * MGE::GeometryCache::kSkinnedVBStride, D3DUSAGE_WRITEONLY,
-                    0, g_spikeForceDefaultPool ? D3DPOOL_DEFAULT : D3DPOOL_MANAGED, &e.vb[0], nullptr);
-                if (SUCCEEDED(hr)) {
-                    void* vbData = nullptr;
-                    if (SUCCEEDED(e.vb[0]->Lock(0, 0, &vbData, 0))) {
-                        memcpy(vbData, stg.data(), vertexCount * (uint32_t)sizeof(SkinnedVertex));
-                        e.vb[0]->Unlock();
-                    }
-                    hr = g_device->CreateIndexBuffer(
-                        triCount * 6, D3DUSAGE_WRITEONLY, D3DFMT_INDEX16,
-                        g_spikeForceDefaultPool ? D3DPOOL_DEFAULT : D3DPOOL_MANAGED, &e.ib, nullptr);
-                    if (SUCCEEDED(hr)) {
-                        const auto* triList = data->getTriList();
-                        if (triList) {
-                            void* ibData = nullptr;
-                            if (SUCCEEDED(e.ib->Lock(0, 0, &ibData, 0))) {
-                                memcpy(ibData, triList, triCount * 6);
-                                e.ib->Unlock();
-                            }
-                        }
-                    }
-                } else {
-                    e.vb[0] = nullptr;
+                    auto& sw = skScratch[i];
+                    sw.px = mv[i].x; sw.py = mv[i].y; sw.pz = mv[i].z;
+                    // Bind-pose normals; the host skins them by the bone palette (same as
+                    // position). Up if the mesh has none.
+                    if (nrm) { sw.nx = nrm[i].x; sw.ny = nrm[i].y; sw.nz = nrm[i].z; }
+                    else     { sw.nx = 0.0f; sw.ny = 0.0f; sw.nz = 1.0f; }
+                    sw.w0 = w[0]; sw.w1 = w[1]; sw.w2 = w[2]; sw.w3 = w[3];
+                    sw.indices = static_cast<DWORD>(idx[0])
+                               | (static_cast<DWORD>(idx[1]) << 8)
+                               | (static_cast<DWORD>(idx[2]) << 16)
+                               | (static_cast<DWORD>(idx[3]) << 24);
+                    sw.u = uvs ? uvs[i].x : 0.0f;   // base-map UV for the host
+                    sw.v = uvs ? uvs[i].y : 0.0f;
                 }
             }
 
@@ -1720,7 +1599,6 @@ namespace MGE::GeometryCache {
                 // deref of this key safe — including ensureLive()'s, on an offscreen key, frames after
                 // the engine dropped the object. Released only where the key leaves the cache.
                 g_geomRefs[key] = geom;
-                e.vb[0] = e.vb[1] = nullptr; e.ib = nullptr; e.writeSlot = 0;
                 e.numBones = 0; e.skinnedUnsupported = false;
                 e.dataPtr = data;
                 // Material first: uploadEntry reads the captured map UV sets (baseUV/
@@ -2247,40 +2125,17 @@ namespace MGE::GeometryCache {
 
     void init(IDirect3DDevice9* device) {
         // DEVICE RE-CREATION (resolution / display-mode change: MW releases its device and calls
-        // CreateDevice again, re-running DistantLand::init). Every cached entry holds D3D9 buffers and
-        // MW texture pointers owned by the DEAD device; using one is an access violation inside D3DX9
-        // — observed as renderDepthFromCache → CEffect::SetTexture on a stale texture after a
+        // CreateDevice again, re-running DistantLand::init). Cached entries hold MW texture
+        // pointers owned by the DEAD device; using one is an access violation inside D3DX9 —
+        // observed as the depth pre-pass's CEffect::SetTexture on a stale texture after a
         // resolution change with the composite off. The cache must never outlive its device.
+        // (S5b: entries also held D3D9 vertex/index buffers of their own, and a skinned vertex
+        // declaration was created here. All of that went with the mirror.)
         if (g_device && g_device != device) {
             purgeAll();
-            if (g_skinnedDecl) {          // vertex decl belongs to the old device too
-                g_skinnedDecl->Release();
-                g_skinnedDecl = nullptr;
-            }
             LOG::logline(">> [gc] device re-created — geometry cache purged (stale D3D9 resources dropped)");
         }
         g_device = device;
-
-        // Vertex declaration for skinned VBs (SkinnedVertex, stride 56). The COLOR
-        // element (offset 52) is read only by the FFE cache-skin color path when the
-        // part uses vertex colour; the depth/shadow skinned VS don't declare it and
-        // D3D9 ignores unread elements, so those passes are unaffected.
-        if (!g_skinnedDecl && g_device) {
-            static const D3DVERTEXELEMENT9 elems[] = {
-                {0, 0,  D3DDECLTYPE_FLOAT3,   D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_POSITION,     0},
-                {0, 12, D3DDECLTYPE_FLOAT3,   D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_NORMAL,       0},
-                {0, 24, D3DDECLTYPE_FLOAT4,   D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_BLENDWEIGHT,  0},
-                {0, 40, D3DDECLTYPE_UBYTE4,   D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_BLENDINDICES, 0},
-                {0, 44, D3DDECLTYPE_FLOAT2,   D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_TEXCOORD,     0},
-                {0, 52, D3DDECLTYPE_D3DCOLOR, D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_COLOR,        0},
-                D3DDECL_END()
-            };
-            g_device->CreateVertexDeclaration(elems, &g_skinnedDecl);
-        }
-    }
-
-    IDirect3DVertexDeclaration9* skinnedDecl() {
-        return g_skinnedDecl;
     }
 
     // ---- SK0: sky-takeover diagnostic (scene-graph inspect, NO capture) ----------

@@ -14,20 +14,18 @@ struct IDirect3DVertexDeclaration9;
 namespace MGE::GeometryCache {
 
     // Per-geometry entry keyed on NiTriShape* (cast to uint32_t on x86).
-    // Non-skinned objects: VB holds model-space positions (kVBFVF); worldTransformD3D
-    //   updated each frame; per-draw world*view palette applied in the renderers.
-    // Skinned objects: STATIC bind-pose VB with per-vertex weights + bone indices
-    //   (kSkinnedDecl); the bone matrices update per frame into bonePalette and the
-    //   vertex shader skins (no per-frame CPU skinning, no per-frame VB rewrite).
+    // Non-skinned objects: worldTransformD3D updated each frame.
+    // Skinned objects: bind-pose vertices with per-vertex weights + bone indices ship once;
+    //   the bone matrices update per frame into bonePalette and the host's vertex shader
+    //   skins (no per-frame CPU skinning, no per-frame re-ship).
     // Entries are created on first visit and evicted when the object is no longer
     // in the scene (skipped by a complete onFrameReady walk).
+    // S5b: entries used to carry a DX9 mirror of the geometry — a double-buffered vertex
+    // buffer (vb[2]/writeSlot/readVB), an index buffer, and the stride/FVF to bind them —
+    // for MGE's own cache draws. S5a deleted the last of those draws (the depth pre-pass),
+    // so the cache is a pure producer now: CPU-side bounds/material data plus the wire
+    // stream it ships to the Forge host. Nothing here touches the D3D9 device.
     struct CachedGeometry {
-        // Double-buffered VB (kept for non-skinned model-space VBs; skinned VBs are
-        // static so they only use slot 0). Use readVB() to fetch the draw slot.
-        IDirect3DVertexBuffer9* vb[2];
-        uint8_t  writeSlot;             // slot holding the most recently written VB
-        IDirect3DIndexBuffer9*  ib;     // D3DFMT_INDEX16 triangle list (slot-shared)
-        IDirect3DVertexBuffer9* readVB() const { return vb[writeSlot]; }
         uint32_t vertexCount;
         uint32_t triangleCount;
         float    boundsCenter[3];       // model-space bound center (for culling)
@@ -171,14 +169,12 @@ namespace MGE::GeometryCache {
         // value-initializes, and a zeroed clampMode would read as CLAMP_S_CLAMP_T — the exact
         // OPPOSITE of MW's default. A shape with no texturing property would clamp instead of wrap.
         uint8_t baseClamp = 3, darkClamp = 3, detailClamp = 3, glowClamp = 3;
-        // Non-skinned VB UV-set count + the derived stride/FVF. uvSetCount = the
-        // highest UV set any present map uses + 1, bounded by the mesh's set count and
-        // 4 (1 = ordinary single-UV geometry, the 99% case → stride 36). Every cache
-        // draw path binds vbStride/vbFVF per entry so depth/shadow/color agree on the
-        // layout. Skinned entries keep uvSetCount=1 (skinnedDecl has one UV set).
+        // Non-skinned VB UV-set count: the highest UV set any present map uses + 1,
+        // bounded by the mesh's set count and 4 (1 = ordinary single-UV geometry, the 99%
+        // case). Shipped to the host, which sizes its own vertex layout from it. Skinned
+        // entries keep uvSetCount=1.
+        // (S5b: the derived vbStride/vbFVF went with the DX9 mirror they bound.)
         uint8_t  uvSetCount;
-        uint16_t vbStride;
-        uint32_t vbFVF;
         const char*        textureName; // SourceTexture::fileName, null if none
         // Multi-map sibling source filenames (SourceTexture::fileName), for resolving the
         // dark/detail/glow maps to Forge bindless slots. Null when the map is absent. The
@@ -368,29 +364,19 @@ namespace MGE::GeometryCache {
     // and stays vanilla (it is the A/B reference). `out` receives 3 floats.
     void emissiveForDraw(const CachedGeometry& e, float* out);
 
-    // Vertex buffer format used by each CachedGeometry::vb.
+    // Vertex buffer format used by the reflection-moon shapes below (and, until S5b, by
+    // each CachedGeometry's DX9 mirror VB).
     // D3DFVF_XYZ | D3DFVF_NORMAL | D3DFVF_DIFFUSE | D3DFVF_TEX1
     // Layout: float3 pos, float3 normal, DWORD color(0xFFFFFFFF), float2 uv
     static constexpr unsigned int kVBStride = 36;
     static constexpr unsigned int kVBFVF    = 0x152; // XYZ|NORMAL|DIFFUSE|TEX1
 
-    // Multi-map shapes carry extra UV sets. Per-entry stride = kVBStridePos (28:
-    // pos+normal+color) + 8 bytes per UV set; FVF = kVBFVFBase | (uvSetCount <<
-    // D3DFVF_TEXCOUNT_SHIFT). Computed into CachedGeometry::vbStride/vbFVF
-    // (uvSetCount 1..4). Single-UV geometry resolves to kVBStride/kVBFVF.
-    static constexpr unsigned int kVBStridePos = 28;
-    static constexpr unsigned int kVBFVFBase   = 0x052; // XYZ|NORMAL|DIFFUSE (no TEX bits)
+    // S5b: kVBStridePos / kVBFVFBase sized the multi-map mirror VB, and kSkinnedVBStride +
+    // skinnedDecl() described the skinned one. Both mirrors are gone; uvSetCount is shipped
+    // to the host, which sizes its own layout.
 
-    // Skinned vertex layout (SkinnedVertIn in the shaders): float3 pos,
-    // float3 normal, float4 blendweights, UBYTE4 blendindices, float2 uv, DWORD color.
-    // Drawn with skinnedDecl(). kMaxBones must match MAX_BONES in "XE Common.fx".
-    // Phase 2: color appended at offset 52 (depth/shadow skinned VS ignore it; the
-    // FFE cache-skin color path reads it when the part uses vertex colour).
-    static constexpr unsigned int kSkinnedVBStride = 56;
-    static constexpr unsigned int kMaxBones        = 32;
-
-    // Vertex declaration for skinned VBs (created in init). Null until init runs.
-    IDirect3DVertexDeclaration9* skinnedDecl();
+    // kMaxBones must match MAX_BONES in "XE Common.fx".
+    static constexpr unsigned int kMaxBones = 32;
 
     // ---- Reflection moon support -------------------------------------------------
     // One drawable billboard shape of a moon (its Shadow Node cutout or Moon Node disc),
