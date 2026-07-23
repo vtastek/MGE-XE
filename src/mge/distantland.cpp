@@ -168,21 +168,16 @@ void DistantLand::frameSetupEarly() {
     s_frameSetupEarly = true;
     const double tView = fseNowMs();
 
-    // Skip in menus: renderStage0 may take the render-cached path there and
-    // never run renderDepth / cullDistantStatics_finish. (An undrained RPC is
-    // still safe — the next frame's WAIT_FOR_PREVIOUS drains it — but doing work
-    // that won't be used is wasted.) The renderStage0/renderDepth fallbacks cover
-    // these cases (earlyWalkedCache / s_earlyKickedStatics stay false).
     // Async full-frame overlap (Phase 2): decide whether THIS frame runs the early
     // Forge kickoff at BeginScene(0), making the whole scene 0 the IPC-free window.
-    // Requires the Forge baseline — seam compositing (F11) + Forge water (F7) —
+    // Requires the Forge baseline — seam compositing (F11) —
     // because exactly then every MGE consumer of the statics cull, shadow, reflection
     // and depth-production RPCs is suppressed, so the main channel can be vacated for
     // the async RenderFrame. Cell shape (2a + 2b):
     //   - exterior distant cell    → eligible; the statics cull is gated off below.
     //   - plain interior / any non-distant cell → eligible; NO scene-0 RPC exists there
     //     at all (no statics/grass/land cull; no weather → no shadow map; the interior
-    //     reflection RPC is wantsWaterCapture-suppressed). The else-branch below hoists
+    //     reflection RPC is forgeOwnsFrame-suppressed). The else-branch below hoists
     //     the cache walk + visible set so the kickoff has fresh data (2b).
     //   - interior DISTANT cell (worldspace interior — DL gen bakes LOD for it; the
     //     TR-showcase category) → eligible TOO: on kickoff frames the statics cull and
@@ -193,17 +188,71 @@ void DistantLand::frameSetupEarly() {
     //     (host DL is exterior-only; interior LOD is future host work), so the cull was a
     //     dead RPC squatting the channel — and it silently forced these monster interiors
     //     to the fused serial render (client blocked for the whole host GPU frame).
-    // One warm-up frame after any transition (load, interior↔exterior, toggle): the
-    // first eligible frame keeps the late kickoff so the host never renders params
-    // captured before the engine pushed this environment's sun/ambient
-    // (SetLight/SetRenderState arrive mid-scene-0 — steady-state values are smooth,
-    // transition jumps are not).
+    // MENUS ARE ORDINARY FORGE FRAMES (S2). The old gate excluded them, so a menu frame fell to
+    // the LATE kickoff (mged3d8device.cpp) — the fused serial render, client blocked for the whole
+    // host GPU frame — while ALSO still running the legacy DX9 work the composite then overwrote.
+    // That was the "menus are slow" report. The host owns the frame in menus exactly as it does in
+    // play (forgeOwnsFrame is not menu-aware and the composite is on screen there), so there is no
+    // reason for the frame SHAPE to differ. The one thing menus really do change — renderStage0 may
+    // take the render-cached path and never reach cullDistantStatics_finish — is a property of the
+    // statics-cull RPC pairing, so that guard now lives on the RPC itself (below) instead of
+    // disqualifying the whole early stage.
+    //
+    // The one-frame warm-up latch STAYS, but its trigger is now explicit. It used to reset only as
+    // a SIDE EFFECT of the menu term above: loading screens are menus, so a load made the frame
+    // ineligible and the first frame back was a warm-up. Dropping !IsMenu() therefore deleted the
+    // latch's only reset trigger along with the menu exclusion — and the first frame after a load
+    // then kicked the host before the freshly-walked cache had shipped its geometry, rendering an
+    // empty fogged world (in-game, 2026-07-22). isLoadingBar() is the signal the menu term was
+    // accidentally standing in for, so name it directly: menus stay eligible (the FPS win), loads
+    // still get their warm-up frame.
+    //
+    // What the warm-up frame buys, on top of the geometry above: the host would otherwise render a
+    // transition frame with sun/ambient captured from the PREVIOUS environment (those arrive
+    // mid-scene-0 via SetLight(6)/D3DRS_AMBIENT, i.e. after the early kickoff has already fired).
+    // buildFrameLighting reads sun dir/diffuse/ambient LIVE from the scene graph now
+    // (getSceneSunlight, interiors and exteriors both), so only the exterior D3DRS_AMBIENT global
+    // (ambCol) is still captured state across a transition.
     static bool s_forgePrevEligible = false;
     const bool forgeEligibleNow = Configuration.UseAsyncHostFrame
-        && RenderProcess::ownsOpaqueWorld() && RenderProcess::wantsWaterCapture()
-        && !mwBridge->IsMenu();
+        && RenderProcess::forgeOwnsFrame()
+        && !mwBridge->isLoadingBar();
     earlyForgeKickoff = forgeEligibleNow && s_forgePrevEligible;
     s_forgePrevEligible = forgeEligibleNow;
+
+    // S2 verification counter (temporary): the change's premise is that every Forge frame is now an
+    // early-kickoff frame, so anything below 100% is a frame shape we did not account for. Also
+    // quantifies the residual "menus are slower" report by splitting the FRAME PERIOD (successive
+    // frameSetupEarly calls, i.e. wall clock per MW frame) into menu vs play. If menu frames are
+    // still slower with both at 100% early, the cost is OUTSIDE the stage machinery this stage
+    // touches — MW's own UI DIP storm through the proxy, post-process, and the composite — not the
+    // frame shape. Drop this whole block once S2 is signed off.
+    {
+        static unsigned s_n = 0, s_early = 0, s_menuN = 0, s_menuEarly = 0;
+        static double s_prevMs = 0.0, s_playSum = 0.0, s_menuSum = 0.0, s_menuMax = 0.0;
+        const bool inMenu = mwBridge->IsMenu();
+        const double nowMs = fseNowMs();
+        const double period = (s_prevMs > 0.0) ? (nowMs - s_prevMs) : 0.0;
+        s_prevMs = nowMs;
+
+        ++s_n;
+        if (earlyForgeKickoff) { ++s_early; if (inMenu) ++s_menuEarly; }
+        // Drop load bursts (>100ms) so a cell load can't masquerade as menu cost.
+        if (period > 0.0 && period < 100.0) {
+            if (inMenu) { ++s_menuN; s_menuSum += period; if (period > s_menuMax) s_menuMax = period; }
+            else        { s_playSum += period; }
+        }
+        if (s_n >= 600) {
+            const unsigned playN = (s_n > s_menuN) ? (s_n - s_menuN) : 0;
+            LOG::logline(">> [s2] earlyForgeKickoff %u/%u (%.1f%%) | play %u frames avg %.2f ms | "
+                         "menu %u frames avg %.2f ms (max %.2f, early %u)",
+                         s_early, s_n, 100.0 * s_early / (double)s_n,
+                         playN, playN ? s_playSum / playN : 0.0,
+                         s_menuN, s_menuN ? s_menuSum / s_menuN : 0.0, s_menuMax, s_menuEarly);
+            s_n = s_early = s_menuN = s_menuEarly = 0;
+            s_playSum = s_menuSum = s_menuMax = 0.0;
+        }
+    }
 
     // Early Forge kickoff frames: run the grass cull NOW, before the async window opens.
     // Grass is the one scene-0 RPC with a live consumer in Forge mode (MGE still draws grass
@@ -239,11 +288,11 @@ void DistantLand::frameSetupEarly() {
     // culls on view-z, so a corner object sits at viewDist * sqrt(1 + tanX² + tanY²)
     // Euclidean from the eye (tan factors from the live projection — fov is moddable).
     // Exterior only (interiors are one root, nothing to cut) and gated by
-    // ownsOpaqueWorld so legacy consumers that reach past the view distance (MGE
+    // forgeOwnsFrame so legacy consumers that reach past the view distance (MGE
     // shadows/reflections) are never starved. 0 disables the gate (full walk).
     float cacheGateRadius = 0.0f;
     if (Configuration.ForgeActiveCellWalk
-            && RenderProcess::ownsOpaqueWorld() && mwBridge->IsExterior()) {
+            && RenderProcess::forgeOwnsFrame() && mwBridge->IsExterior()) {
         const float tanX = (mwProj._11 != 0.0f) ? 1.0f / mwProj._11 : 1.0f;
         const float tanY = (mwProj._22 != 0.0f) ? 1.0f / mwProj._22 : 1.0f;
         cacheGateRadius = mwBridge->GetViewDistance()
@@ -257,9 +306,9 @@ void DistantLand::frameSetupEarly() {
     // newly-visible objects (lazy capture from s_visibleKeys). With the classify decoupled,
     // force it off so onFrameReady's full refresh walk does the discovery instead.
     const bool liveDrawBuild =
-        Configuration.ForgeLiveDrawBuild && RenderProcess::ownsOpaqueWorld() && !hostCullOnly;
+        Configuration.ForgeLiveDrawBuild && RenderProcess::forgeOwnsFrame() && !hostCullOnly;
 
-    if (isDistantCell() && !mwBridge->IsMenu()) {
+    if (isDistantCell()) {
         // Kick the distant-statics cull FIRST — before the GeometryCache walk —
         // so the cull worker's IPC drain (the server-side quadtree cull, ~2.7ms
         // in heavy scenes) overlaps BOTH the ~1.46ms cache walk below (main
@@ -273,10 +322,17 @@ void DistantLand::frameSetupEarly() {
         // statics itself (GPU cull over the resident set) and every MGE draw that
         // consumed this cull is suppressed in this mode, so the RPC is dead weight —
         // and it would squat the main channel exactly where the async RenderFrame
-        // needs it. First cut of the MGE gutting, not a workaround; F11/F7-off or
+        // needs it. First cut of the MGE gutting, not a workaround; F11-off or
         // fused mode restores it (clean A/B).
+        //
+        // ALSO skipped in menus (S2 moved this guard down from the branch condition): renderStage0
+        // may take the render-cached path in a menu and never reach cullDistantStatics_finish, so
+        // the RPC would go unpaired. That is safe in itself — the next frame's WAIT_FOR_PREVIOUS
+        // drains it — but it is work nobody consumes. This is the ONLY part of the early stage that
+        // menus genuinely change; everything else below runs in menus exactly as in play.
         const double tStatics0 = fseNowMs();
-        if ((Configuration.MGEFlags & USE_DISTANT_STATICS) && !earlyForgeKickoff) {
+        if ((Configuration.MGEFlags & USE_DISTANT_STATICS) && !earlyForgeKickoff
+                && !mwBridge->IsMenu()) {
             // Stash the reflection cull inputs FIRST — before the kickoff — so the
             // batched statics RPC can fold in the reflection query (4th query →
             // visExtraShared). Its server-cull then overlaps the kickoff→drain
@@ -369,7 +425,7 @@ void DistantLand::frameSetupEarly() {
             renderThreadJobKicked = true;
             dRt = fseNowMs() - tRt0;
         }
-    } else if (!mwBridge->IsMenu()) {
+    } else {
         // Interior / non-distant cell: the exterior early block above is skipped (it
         // exists for the distant-statics overlap, which interiors don't have), so its
         // cache walk + buildFrustumVisibleSet fall through to the serial renderDepth
@@ -470,15 +526,25 @@ void DistantLand::renderStage0() {
         MGE::RenderThread::wait();
     }
 
+    // Menu-cache latch maintenance (USE_MENU_CACHING). MUST run on EVERY frame, so it sits ABOVE
+    // the early return below — this is the latch's only RELEASE. postProcess() sets isRenderCached
+    // on the first menu frame and thereafter blits the cached frame instead of rendering; nothing
+    // else lowers it except the mouse-click expiry in that same blit path. Leaving it below the
+    // early return meant the world stayed frozen after the menu closed until you clicked (in-game,
+    // 2026-07-22) — the UI/minimap kept updating over the stale blit, which reads exactly like a
+    // lost-focus freeze. That was invisible before S2 only because menu frames were excluded from
+    // earlyForgeKickoff and so always reached the full path.
+    isRenderCached &= (Configuration.MGEFlags & USE_MENU_CACHING) && mwBridge->IsMenu();
+
     // Phase 2 (MW-only pipeline): Forge renders ALL 3D. On steady-state Forge frames
     // (earlyForgeKickoff — the geometry-cache walk + frustum-visible set were already
     // built in frameSetupEarly, the distant-statics cull RPC is gated off there, and
     // every DX9 pass below would be overwritten by the present composite), skip the
-    // entire DX9 scene layer. Preserve only the per-frame record-list clear this stage
-    // owned: recordMW/recordSky are still captured in inspectIndexedPrimitive but have
-    // no Forge consumer, so they must be drained here or they grow across frames. The
-    // render-thread fence above still ran and the Tracy sky zone was closed at the top.
-    // Warm-up / menu / F11-off frames (!earlyForgeKickoff) fall through to the full path
+    // entire DX9 scene layer. Preserve only the per-frame state this stage OWNS: the
+    // record-list drain (recordMW/recordSky are still captured in inspectIndexedPrimitive but have
+    // no Forge consumer, so they grow across frames if not cleared) and the menu-cache latch above.
+    // The render-thread fence above still ran and the Tracy sky zone was closed at the top.
+    // Warm-up / F11-off frames (!earlyForgeKickoff) fall through to the full path
     // — that's where the cache-walk fallback and the statics-RPC drain still live.
     if (earlyForgeKickoff) {
         recordMW.clear();
@@ -516,7 +582,7 @@ void DistantLand::renderStage0() {
     setupCommonEffect(&mwView, &mwProj);
     FixedFunctionShader::updateLighting(lightSunMult, lightAmbMult);
 
-    isRenderCached &= (Configuration.MGEFlags & USE_MENU_CACHING) && mwBridge->IsMenu();
+    // (isRenderCached maintenance hoisted above the earlyForgeKickoff early return — see there.)
     isPPLActive = (Configuration.MGEFlags & USE_FFESHADER) && !(Configuration.PerPixelLightFlags == 1 && !mwBridge->IntCurCellAddr());
 
     // Phase 1 Milestone 1 A/B toggle. Read NUMPAD7 once per frame here (before the
@@ -606,13 +672,11 @@ void DistantLand::renderStage0() {
             //
             // Forge color has no shadows and its composite overwrites every MGE opaque/DL
             // pixel, so the shadow map's only surviving consumer whose output ISN'T overwritten
-            // is the water reflection (texReflection → MGE water, visible only when F7 is off).
-            // Skip the whole shadow-map BUILD when Forge owns BOTH the opaque world (receiver
-            // already gated in renderStage1/2) AND the water (reflection suppressed below) — then
-            // nothing samples it. F7-off keeps it so MGE water still gets reflected shadows.
-            const bool forgeOwnsAllShadowConsumers =
-                RenderProcess::ownsOpaqueWorld() && RenderProcess::wantsWaterCapture();
-            const bool shadowBuildEligible = (Configuration.MGEFlags & USE_SHADOWS) && !forgeOwnsAllShadowConsumers;
+            // is the water reflection (texReflection → MGE water, which Forge also owns). While
+            // Forge owns the frame the receiver is gated in renderStage1/2 and the reflection is
+            // suppressed below, so nothing samples the map — skip the whole BUILD. F11-off keeps
+            // it so MW/MGE water still gets reflected shadows.
+            const bool shadowBuildEligible = (Configuration.MGEFlags & USE_SHADOWS) && !RenderProcess::forgeOwnsFrame();
             if (shadowBuildEligible) {
                 if (mwBridge->CellHasWeather() && !mwBridge->IsMenu()) {
                     effectShadow->Begin(&passes, D3DXFX_DONOTSAVESTATE);
@@ -621,15 +685,14 @@ void DistantLand::renderStage0() {
                 }
             }
             // Baseline-thinning verify (2026-07-02): confirm the shadow-map BUILD is actually skipped
-            // when Forge owns opaque + water (the default F11-on/F7-on baseline). Throttled so it
-            // doesn't spam. If this logs eligible=1 in the baseline, water/opaque ownership isn't
-            // engaging (e.g. F7-off MGE-water A/B) — see the shadow gate above.
+            // in the default F11-on baseline. Throttled so it doesn't spam. If this logs eligible=1
+            // there, frame ownership isn't engaging — see the shadow gate above.
             {
                 static unsigned s_shadowGateLog = 0;
                 if ((s_shadowGateLog++ % 300) == 0) {
-                    LOG::logline(">> [baseline][shadow] build eligible=%d (USE_SHADOWS=%d ownsOpaque=%d wantsWater=%d)",
+                    LOG::logline(">> [baseline][shadow] build eligible=%d (USE_SHADOWS=%d forgeOwnsFrame=%d)",
                                  (int)shadowBuildEligible, (int)((Configuration.MGEFlags & USE_SHADOWS) != 0),
-                                 (int)RenderProcess::ownsOpaqueWorld(), (int)RenderProcess::wantsWaterCapture());
+                                 (int)RenderProcess::forgeOwnsFrame());
                 }
             }
 
@@ -641,11 +704,11 @@ void DistantLand::renderStage0() {
 
             // Forge owns exterior distant-land COLOR: the host draws LOD land + statics into the
             // Forge frame and the present composite lays it over MW, so MW's own exterior DL color
-            // here is pure overdraw the composite overwrites. Skip it when ownsDistantLand (F11) in
+            // here is pure overdraw the composite overwrites. Skip it when Forge owns the frame (F11) in
             // exteriors. Interiors keep drawing (Forge DL is exterior-only). renderDepth's DL depth +
             // statics CULL are untouched (separate pass) so SSAO/blend/grass still have their inputs.
             const bool forgeOwnsExteriorDL =
-                RenderProcess::ownsDistantLand() && mwBridge->IsExterior();
+                RenderProcess::forgeOwnsFrame() && mwBridge->IsExterior();
             if (!mwBridge->IsUnderwater(eyePos.z)) {
                 // Draw distant landscape
                 if (mwBridge->IsExterior() && !forgeOwnsExteriorDL) {
@@ -707,7 +770,7 @@ void DistantLand::renderStage0() {
             // (Was drawn after cache near; "as late as possible" is satisfied relative
             // to the distant passes, which is what the horizon blend needs.)
             if ((Configuration.MGEFlags & USE_ATM_SCATTER) && mwBridge->CellHasWeather()
-                && !RenderProcess::wantsSkyCapture()) {       // SK3: Forge owns the sky → don't draw MGE's
+                && !RenderProcess::forgeOwnsFrame()) {       // SK3: Forge owns the sky → don't draw MGE's
                 renderSky();
             }
 
@@ -761,7 +824,7 @@ void DistantLand::renderStage0() {
             // actually visible (frustum + MSOC); when it isn't, clearReflection()
             // keeps a valid flat-fog target for the distant-water sampler and the
             // transition frame without paying the reflection pass.
-            if (mwBridge->CellHasWater() && !RenderProcess::wantsWaterCapture()) {
+            if (mwBridge->CellHasWater() && !RenderProcess::forgeOwnsFrame()) {
                 // Join the worker's late reflection fence before reading its
                 // results. The reflection gate/cull was split off the early
                 // staticsDone fence so renderDepth's statics join didn't wait on
@@ -780,7 +843,7 @@ void DistantLand::renderStage0() {
                     clearReflection();
                 }
             } else if (mwBridge->CellHasWater()) {
-                // Forge owns the water surface (F7): MGE water is suppressed, so its reflection RT
+                // Forge owns the water surface: MGE water is suppressed, so its reflection RT
                 // has no visible consumer. The cull was already skipped (prepareReflectionCullForWorker
                 // returned early → reflGateWanted false). Keep a valid flat-fog target for the
                 // distant-water sampler without paying the reflection cull/draw.
@@ -863,7 +926,7 @@ void DistantLand::renderStage0() {
             // flat-fog target and we don't reflect the previous cell. Cleared every
             // frame regardless to react to lighting changes.
             if ((Configuration.MGEFlags & REFLECT_INTERIOR) && mwBridge->CellHasWater()
-                && !RenderProcess::wantsWaterCapture()) {
+                && !RenderProcess::forgeOwnsFrame()) {
                 device->CreateStateBlock(D3DSBT_ALL, &stateSaved);
                 effect->Begin(&passes, D3DXFX_DONOTSAVESTATE);
                 renderWaterReflection(&mwView, &mwProj);
@@ -871,7 +934,7 @@ void DistantLand::renderStage0() {
                 stateSaved->Apply();
                 stateSaved->Release();
             } else {
-                // Forge owns interior water too (F7) → fall through to clearReflection (keeps a valid
+                // Forge owns interior water too → fall through to clearReflection (keeps a valid
                 // flat target for the distant-water sampler), same as the no-reflection-enabled case.
                 clearReflection();
             }
@@ -951,7 +1014,7 @@ void DistantLand::renderStage1() {
             // but the Forge composite (end of scene 0) overwrites exactly those covered pixels
             // — pure waste. Shadows return host-side once Forge owns more of the pipeline.
             if ((Configuration.MGEFlags & USE_SHADOWS) && mwBridge->CellHasWeather()
-                && !RenderProcess::ownsOpaqueWorld()) {
+                && !RenderProcess::forgeOwnsFrame()) {
                 // CACHE mode: the cache owns scene-0 textured-opaque color/depth at the
                 // snapshot pose. renderShadow() skips that set (skipCacheCovered); its sun
                 // shadow is folded into the cache color passes (renderCachedOpaque /
@@ -991,7 +1054,7 @@ void DistantLand::renderStage2() {
     // recorded depth replay (renderDepthAdditional), both superseded — depth now comes from
     // the cache (renderCacheDepthToMainZ + the depth-texture cache pass) and shadows are
     // deferred host-side. recordMW capture / recordSky / the clear below are untouched.
-    if (!isRenderCached && !RenderProcess::ownsOpaqueWorld()) {
+    if (!isRenderCached && !RenderProcess::forgeOwnsFrame()) {
         // Save state block manually since we can change FVF/decl
         device->CreateStateBlock(D3DSBT_ALL, &stateSaved);
 
@@ -1034,7 +1097,7 @@ void DistantLand::renderStageBlend() {
     // distant-only capture into the band the Forge composite then overwrites — invisible. Caustics
     // likewise draw on MW water that Forge owns. Both consume texDepthFrame; skipping them here is a
     // step toward retiring the MGE depth pre-pass. F11-off restores the full blend (clean A/B).
-    if (RenderProcess::ownsOpaqueWorld()) {
+    if (RenderProcess::forgeOwnsFrame()) {
         return;
     }
 
@@ -1089,8 +1152,8 @@ void DistantLand::renderStageWater() {
     // WT3: Forge owns the water → skip MGE's replacement water plane entirely (analogous to the SK3
     // sky gate). Both call sites still suppress MW's own raw water grid (the d3d8device water-material
     // path returns D3D_OK after this no-op), so with Forge water ON exactly ONE surface draws: Forge's.
-    // OFF → MGE water draws unchanged (clean F7 A/B). Gated on wantsWaterCapture (F11 composite + F7).
-    if (RenderProcess::wantsWaterCapture()) {
+    // F11-off → MW/MGE water draws unchanged (the vanilla A/B). Gated on forgeOwnsFrame.
+    if (RenderProcess::forgeOwnsFrame()) {
         return;
     }
 
@@ -1222,7 +1285,7 @@ void DistantLand::adjustFog() {
     // lets MGE's DL machinery turn off entirely while the horizon stays at host distance.
     // Weather-gated so interiors keep vanilla fog exactly like the DL-on non-distant case;
     // F11-off restores vanilla fog via the else-branch's nearViewRange re-sync (clean A/B).
-    const bool forgeFog = RenderProcess::ownsDistantLand() && mwBridge->CellHasWeather();
+    const bool forgeFog = RenderProcess::forgeOwnsFrame() && mwBridge->CellHasWeather();
 
     // Get fog cell ranges based on environment and weather
     if (mwBridge->IsUnderwater(eyePos.z)) {
@@ -1406,7 +1469,7 @@ void DistantLand::postProcess() {
         // of the MGE depth pre-pass. Skip the whole HW post chain when Forge is on so depth can be
         // retired. NOTE: this also drops any depth-free MGE post (bloom/colour/underwater); F11-off
         // restores it (clean A/B). Screenshot + menu-cache + foam-debug below still run.
-        if ((Configuration.MGEFlags & USE_HW_SHADER) && !RenderProcess::ownsOpaqueWorld()) {
+        if ((Configuration.MGEFlags & USE_HW_SHADER) && !RenderProcess::forgeOwnsFrame()) {
             // Set flags to reflect cell environment
             int envFlags = 0;
 
@@ -1803,7 +1866,7 @@ bool DistantLand::inspectIndexedPrimitive(int sceneCount, const RenderedState* r
     // the plugin conservatively keeps displaying (decal/multi-map/untextured) that our host
     // pass doesn't draw either.
     if (Configuration.ForgeAlphaPass && Configuration.ForgeAlphaSuppressS1
-        && sceneCount >= 1 && rs->blendEnable && RenderProcess::ownsOpaqueWorld()) {
+        && sceneCount >= 1 && rs->blendEnable && RenderProcess::forgeOwnsFrame()) {
         // AT3: before rejecting, capture MW's already-billboarded blended DIP (NiParticles smoke/
         // flames + multimap/decal/untextured blends the host cache pass doesn't own) so the Forge
         // host can draw it in the post-water sorted-alpha pass. Silent no-op when disabled/unsuited;
@@ -1858,7 +1921,7 @@ bool DistantLand::inspectIndexedPrimitive(int sceneCount, const RenderedState* r
         // redundant double work. Removing it lets us measure the Forge path's true cost without
         // the engine's scene 0 confounding the numbers. Same gate as cacheOpaqueMode (scene 0,
         // covered-opaque or land splat); depth capture above is untouched.
-        if ((cacheOpaqueMode || RenderProcess::ownsOpaqueWorld()) && sceneCount == 0
+        if ((cacheOpaqueMode || RenderProcess::forgeOwnsFrame()) && sceneCount == 0
             && (isCoveredOpaque(rs, frs) || isLandSplat)) {
             return false;
         }

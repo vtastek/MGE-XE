@@ -99,11 +99,11 @@ void DistantLand::earlyClassifyMainScene(void* worldCamera) {
     // per-draw anyway (inspectIndexedPrimitive). Alpha bit: it also skips
     // single-map blended leaves our sorted-alpha host pass redraws (AT1) —
     // gated on SuppressS1 so the F-panel A/B (suppress off = MW's full alpha
-    // path) stays intact. F11 (ownsOpaqueWorld false) restores full display
+    // path) stays intact. F11 (forgeOwnsFrame false) restores full display
     // next frame. Logged plugin-side on change; absent/old export = opaque-
     // only or no-op = the per-DIP reject fallback keeps correctness.
     int ownedFlags = 0;
-    if (RenderProcess::ownsOpaqueWorld()) {
+    if (RenderProcess::forgeOwnsFrame()) {
         if (Configuration.ForgeOpaqueDisplaySkip) {
             ownedFlags |= MSOCClient::kOwnedOpaque;
         }
@@ -211,7 +211,7 @@ void DistantLand::buildFrustumVisibleSet(const D3DXMATRIX* view, const D3DXMATRI
     if (Configuration.UseOcclusionCulling && s_earlyClassifyRan && !hostCullOnly) {
         s_earlyClassifyRan = false;   // one frame only
 
-        // Cut 2B fold: in the Forge baseline (F11 composite + F7 water, no render
+        // Cut 2B fold: in the Forge baseline (F11 composite, no render
         // thread, near-depth replay off) NOTHING else consumes s_frustumVisibleKeys —
         // the near depth draws are skipped (forgeOwnsDepth), the render-thread
         // snapshot is off, and the legacy cache color/shadow paths only run without
@@ -222,7 +222,7 @@ void DistantLand::buildFrustumVisibleSet(const D3DXMATRIX* view, const D3DXMATRI
         // frames (cleared above; nothing may consume it stale). The VISKEYS /
         // refineCulled diagnostics simply don't update on fold frames.
         const bool fold = Configuration.ForgeLiveDrawBuild
-            && RenderProcess::ownsOpaqueWorld() && RenderProcess::wantsWaterCapture()  // == forgeOwnsDepth
+            && RenderProcess::forgeOwnsFrame()   // == forgeOwnsDepth
             && !Configuration.UseRenderThread
             && !Configuration.ForgeNearDepthReplay;
         if (fold) {
@@ -331,15 +331,14 @@ void DistantLand::renderDepth() {
     // of the worker's buffer, byte-identical to the serial path.
     const bool depthCacheOnThread = renderThreadJobKicked;
 
-    // Forge owns the composited frame AND the water (F11 + Forge water always-on): nothing samples
-    // texDepthFrame this frame — post-process (SSAO/DOF), the MW↔MGE blend, caustics, and MGE water
-    // are all suppressed. So skip PRODUCING the depth texture: the float-depth clear + the cache /
-    // land / statics (renderdepth.cpp:310) / grass DEPTH draws. The cache WALK, the frustum-visible
-    // set, the IPC channel drain (waitCullChannelFree), and the statics + grass CULLS still run —
-    // Forge's draw lists + MGE grass color depend on them, and the statics RPC MUST be drained to
-    // keep the one-at-a-time IPC channel paired. F7-off (MGE water A/B) restores the full depth pass.
-    const bool forgeOwnsDepth =
-        RenderProcess::ownsOpaqueWorld() && RenderProcess::wantsWaterCapture();
+    // Forge owns the composited frame (F11): nothing samples texDepthFrame this frame — post-process
+    // (SSAO/DOF), the MW↔MGE blend, caustics, and MGE water are all suppressed. So skip PRODUCING
+    // the depth texture: the float-depth clear + the cache / land / statics (renderdepth.cpp:310) /
+    // grass DEPTH draws. The cache WALK, the frustum-visible set, the IPC channel drain
+    // (waitCullChannelFree), and the statics + grass CULLS still run — Forge's draw lists + MGE grass
+    // color depend on them, and the statics RPC MUST be drained to keep the one-at-a-time IPC channel
+    // paired. F11-off (vanilla MW) restores the full depth pass.
+    const bool forgeOwnsDepth = RenderProcess::forgeOwnsFrame();
 
     if (!depthCacheOnThread && !forgeOwnsDepth) {
         device->Clear(0, 0, D3DCLEAR_ZBUFFER, 0, 1.0, 0);

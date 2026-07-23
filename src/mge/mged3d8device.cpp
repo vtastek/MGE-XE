@@ -726,8 +726,9 @@ HRESULT _stdcall MGEProxyDevice::BeginScene() {
                     // visible set) and — when the latch is up — vacated the IPC channel
                     // (statics cull gated off, grass culled pre-kickoff). The paired
                     // Finish stays at the EndScene(0) composite point (UI constraint).
-                    // Latch false (interiors, menus, F11/F7-off, fused mode, warm-up
-                    // frame) → the late kickoff at EndScene(0) runs instead.
+                    // Latch false (F11-off / seam down / fused mode) → the late kickoff at
+                    // EndScene(0) runs instead. Menus and warm-up frames are NO LONGER excluded
+                    // (S2): they are ordinary Forge frames and take this same early path.
                     if (DistantLand::earlyForgeKickoff) {
                         // Phase 0: the kickoff dispatcher finishes the PREVIOUS deferred frame
                         // late (host had the whole BeginScene window → exposed wait → ~0), then
@@ -842,7 +843,7 @@ HRESULT _stdcall MGEProxyDevice::EndScene() {
             // overlaps client work, then wait+composite. Phase 2: when the early kickoff
             // already fired at BeginScene(0) (DistantLand::earlyForgeKickoff — the host has
             // been rendering under ALL of scene 0), skip the late kickoff and only Finish
-            // here. Otherwise (interiors, menus, warm-up, F11/F7-off) kick late — Phase 1
+            // here. Otherwise (F11-off / seam down) kick late — Phase 1
             // behaviour, window = the cache-depth replay below. The window between Kickoff
             // and Finish must stay IPC-free on both channels — renderCacheDepthToMainZ is
             // pure client-side D3D9 (verified: no ipcClient traffic). Fused mode keeps the
@@ -864,24 +865,24 @@ HRESULT _stdcall MGEProxyDevice::EndScene() {
                 // hidden by frame-ahead) and already copied g_mainTex, so the relocated blit
                 // needs no second g_kick holder. See mged3d8device BeginScene UI branch.
                 //
-                // Non-early frames (interiors/menus/warm-up) never deferred and have no
+                // Non-early frames (F11-off / seam down) never deferred and have no
                 // after-FP overlap to gain — finish here exactly as before.
                 if (!DistantLand::earlyForgeKickoff) {
                     RenderProcess::waitProduce();
                     if (!RenderProcess::kickoffPending()) {
                         RenderProcess::onStage0CompositeKickoff(realDevice);
                     }
-                    if (RenderProcess::ownsOpaqueWorld() && Configuration.ForgeNearDepthReplay) {
+                    if (RenderProcess::forgeOwnsFrame() && Configuration.ForgeNearDepthReplay) {
                         DistantLand::renderCacheDepthToMainZ();
                     }
                     RenderProcess::onStage0CompositeFinish(realDevice);
-                } else if (RenderProcess::ownsOpaqueWorld() && Configuration.ForgeNearDepthReplay) {
+                } else if (RenderProcess::forgeOwnsFrame() && Configuration.ForgeNearDepthReplay) {
                     // Near-depth replay (if enabled) must still precede scene-1 alpha even on
                     // early frames — only the produce wait + blit relocate, not this.
                     DistantLand::renderCacheDepthToMainZ();
                 }
             } else {
-                if (RenderProcess::ownsOpaqueWorld() && Configuration.ForgeNearDepthReplay) {
+                if (RenderProcess::forgeOwnsFrame() && Configuration.ForgeNearDepthReplay) {
                     DistantLand::renderCacheDepthToMainZ();
                 }
                 RenderProcess::onStage0Composite(realDevice);
@@ -1008,7 +1009,7 @@ HRESULT _stdcall MGEProxyDevice::SetRenderState(D3DRENDERSTATETYPE a, DWORD b) {
     // and equally when the Forge seam owns the frame with DL OFF — adjustFog then forces the
     // same DL-scale fog (forgeFog) so the horizon matches the host's DL.DrawDist-cell render,
     // and MW's per-frame vanilla-range sets would fight it right back to the short fog wall.
-    if (((Configuration.MGEFlags & USE_DISTANT_LAND) || RenderProcess::ownsDistantLand())
+    if (((Configuration.MGEFlags & USE_DISTANT_LAND) || RenderProcess::forgeOwnsFrame())
         && (a == D3DRS_FOGSTART || a == D3DRS_FOGEND)) {
         return D3D_OK;
     }

@@ -5,6 +5,10 @@
 #include "d3d8texture.h"
 #include "devicelock.h"
 #include "drawstats.h"
+#include "mge/mgedirect3d8.h"
+#include "mge/renderprocess.h"
+#include "mge/ffeshader.h"
+#include "support/log.h"
 
 // Device-submission lock shared with the MGE render thread (see devicelock.h).
 // Disabled until a device is created with Configuration.UseRenderThread on, so
@@ -77,6 +81,59 @@ BOOL _stdcall ProxyDevice::ShowCursor(BOOL a) {
 HRESULT _stdcall ProxyDevice::Present(const RECT* a, const RECT* b, HWND c, const RGNDATA* d) {
     MGE_DEVLOCK();
     return realDevice->Present(a, b, c, d);
+}
+
+HRESULT _stdcall ProxyDevice::Reset(D3DPRESENT_PARAMETERS8* a) {
+    // Any in-session backbuffer change (alt-tab fullscreen recovery, mode/window switch, a
+    // mod/MWSE-driven resolution change) reaches MW's device here. Historically this was a stub
+    // (the real D3D9 device was never touched) so MW desynced and froze. Drive the real reset.
+
+    // Quiesce every background user of the device BEFORE locking + resetting — a device reset must
+    // not overlap any other device work on another thread:
+    //   - the async FFE shader precache (D3DXCreateEffectFromFile; overlapping ResetEx corrupts the
+    //     shared effect pool — the c0000005 in D3DX9's _CopyTypeAndData),
+    //   - the Forge seam (finish any in-flight/parked host frame + idle the produce worker).
+    // Done before MGE_DEVLOCK so the joins/drains never wait while holding the device lock.
+    FixedFunctionShader::waitPrecache();
+    RenderProcess::preDeviceReset(realDevice);
+
+    MGE_DEVLOCK();
+
+    // Is this the D3D9Ex takeover device (CreateDeviceEx path)? ResetEx resizes the swap chain
+    // with all other surfaces PERSISTENT — no DEFAULT-pool release/recreate needed. A plain
+    // (non-Ex) device is the legacy DX9 path; a fully correct Reset there would need the DEFAULT
+    // release dance, which is out of scope here (pre-existing behaviour, best-effort).
+    IDirect3DDevice9Ex* exDevice = nullptr;
+    const bool isEx = SUCCEEDED(realDevice->QueryInterface(__uuidof(IDirect3DDevice9Ex),
+                                                           reinterpret_cast<void**>(&exDevice))) && exDevice;
+
+    // Translate the DX8 params with the SAME MGE overrides + Ex fixups as CreateDevice.
+    D3DPRESENT_PARAMETERS9 pp;
+    D3DDISPLAYMODEEX dm = {};
+    D3DDISPLAYMODEEX* pdm = nullptr;
+    translatePresentParams8to9(a, isEx, pp, dm, &pdm);
+
+    HRESULT hr;
+    if (isEx) {
+        // ResetEx: pPresentationParameters non-NULL; pFullscreenDisplayMode required for
+        // fullscreen (pdm), NULL for windowed. Must run on the device-creation thread (this is it).
+        hr = exDevice->ResetEx(&pp, pdm);
+        exDevice->Release();
+    } else {
+        hr = realDevice->Reset(&pp);
+    }
+
+    if (SUCCEEDED(hr)) {
+        // Seam follows the new backbuffer size (no host RPC / surface rebuild — Ex persists them).
+        RenderProcess::postDeviceReset(realDevice);
+    } else {
+        // Device lost/hung: keep the seam safe and return hr unchanged so MW runs its own
+        // recovery / CheckDeviceState loop. Never freeze; recover on a later successful reset.
+        LOG::logline("!! [seam] device %s FAILED 0x%08X — returning to MW for recovery",
+                     isEx ? "ResetEx" : "Reset", hr);
+        RenderProcess::onDeviceResetFailed();
+    }
+    return hr;
 }
 
 HRESULT _stdcall ProxyDevice::GetBackBuffer(UINT a, D3DBACKBUFFER_TYPE b, IDirect3DSurface8** c) {

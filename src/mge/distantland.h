@@ -110,7 +110,7 @@ public:
     // instead of in renderDepth. Read by mged3d8device (fire the kickoff after
     // frameSetupEarly), renderStage0 (skip the fallback statics kickoff) and
     // renderDepth (skip cullDistantStatics_finish). Stable for the frame: the seam's
-    // F11/F7 toggles are polled at composite-finish time, after every consumer.
+    // The F11 toggle is polled at composite-finish time, after every consumer.
     static bool earlyForgeKickoff;
     // Set when frameSetupEarly already ran the grass cull (pre-kickoff, channel free);
     // renderDepth skips its own cullGrass then (grass depth/color consume the same VB).

@@ -108,6 +108,23 @@ namespace RenderProcess {
     // average as mwstart=. Its magnitude decides whether a frame-start cut exists.
     void noteEnginePresentReturn();
 
+    // Device-reset seam hooks (a backbuffer resolution/mode change: alt-tab fullscreen recovery,
+    // window/mode switch, a mod/MWSE-driven resolution change). The proxy Reset calls these around
+    // the real D3D9Ex ResetEx:
+    //   preDeviceReset  — BEFORE the reset: finish any in-flight/parked host frame + idle the
+    //                     produce worker so nothing is mid-submit while ResetEx tears down and
+    //                     recreates the swap chain (and pumps window messages).
+    //   postDeviceReset — AFTER a successful reset: re-read the new backbuffer and re-derive the
+    //                     composite render size. The 2x host allocation (g_w/g_h) + the imported
+    //                     host image persist across ResetEx (Ex "all other surfaces persistent"),
+    //                     so there is NO host RPC and NO seam-surface rebuild.
+    //   onDeviceResetFailed — on a FAILED reset (device lost/hung): mark the seam safe (skip the
+    //                     composite) so MW can drive its own recovery without a stale/torn blit.
+    // All no-op unless the seam came up. Called on MW's render thread (the device-creation thread).
+    void preDeviceReset(IDirect3DDevice9* device);
+    void postDeviceReset(IDirect3DDevice9* device);
+    void onDeviceResetFailed();
+
     void shutdown();
 
     // --- M1b: opaque-geometry capture (32-bit cache -> 64-bit Forge host) ---------
@@ -115,11 +132,21 @@ namespace RenderProcess {
     // seam is live and wants static opaque geometry. Avoids any cost when off.
     bool wantsGeometryCapture();
 
-    // SK1 sky takeover: true when the Forge seam is live AND compositing AND the Forge sky pass
-    // is toggled ON (F7). Gates the cache's skyRoot walk + the per-frame sky draw list. Default
-    // OFF → MW's own sky is untouched (clean A/B). Independent of wantsGeometryCapture so the sky
-    // walk only runs when the host will actually draw it.
-    bool wantsSkyCapture();
+    // THE mode predicate: true when the Forge seam is live (g_initOk) AND the composite is ON
+    // (g_enabled, F11). While true the host owns the whole frame — opaque world, distant land,
+    // sky, water, depth — and MW's own draws for any of it are redundant (the full-screen
+    // composite overwrites exactly those pixels), so MGE suppresses them.
+    //
+    // This single call replaces the former ownsOpaqueWorld / ownsDistantLand / wantsSkyCapture /
+    // wantsWaterCapture family. Those were separately-toggled A/B gates from the era when each
+    // takeover was landing one at a time; every takeover is now DONE and always-on, so all four
+    // had collapsed to the same expression (the sky flag was latched true when SK finished, the
+    // water flag when WT finished). F7 (the last per-pass toggle, water) is retired with them.
+    //
+    // The A/B that remains is F11: off → g_enabled false → every suppression releases and MW
+    // renders its own scene. That vanilla-Morrowind fallback is also what a dead host or a
+    // failed seam falls back to (g_initOk false), and it is the ONLY fallback.
+    bool forgeOwnsFrame();
 
     // FP1a first-person takeover: true when the seam is live AND compositing AND the Forge FP
     // pass is enabled (ForgeFPPass ini) AND the player is in FIRST person. Gates the cache's
@@ -139,28 +166,6 @@ namespace RenderProcess {
     // arms). buildFPFrame diffs the latched pair against the built fpView/fpProj and logs.
     void noteFPZClear();
     void noteFPSceneTransform(bool isProj, const D3DMATRIX* m);
-
-    // WT1 Forge water takeover: true when the seam is live AND compositing (F11) AND the Forge water
-    // pass is toggled ON (F7). No geometry capture (the host generates the geo-clipmap mesh); this
-    // gates the per-frame water-params crossing and, later (WT3), suppression of MGE's own water +
-    // reflection passes. Default OFF → MGE water draws (clean A/B).
-    bool wantsWaterCapture();
-
-    // True when the Forge seam is live AND compositing (F11 on): the host renders the opaque
-    // world and the full-screen composite overwrites MW's frame at present. While true, the
-    // engine's own scene-0 covered-opaque draw is redundant (overwritten) — DistantLand
-    // suppresses it so we don't pay for double rendering. MWSE does NOT consume the API v5
-    // no-op signal, so this in-MGE suppression is the lever. Off = engine draws scene 0 normally.
-    bool ownsOpaqueWorld();
-
-    // True when the Forge seam is live AND compositing (F11 on): the host draws the exterior
-    // distant land + distant statics into the same Forge frame, which the full-screen composite
-    // lays over MW. While true, MW's own main-view DL color (renderDistantLand / renderDistantStatics
-    // in renderStage0) is redundant — the composite overwrites exactly those pixels — so DistantLand
-    // skips those COLOR draws. The depth pre-pass and the statics cull are kept (MW effects still
-    // sample the distant depth). Exterior-only at the call site (Forge DL is exterior-only). Off =
-    // MW draws its own DL normally, giving a clean F11 A/B and a safe fallback if Forge DL has a gap.
-    bool ownsDistantLand();
 
     // Called from the cache upload path (scenegraph_geometry_cache.cpp) for each
     // non-skinned opaque part when its model-space geometry is (re)built. Assigns the

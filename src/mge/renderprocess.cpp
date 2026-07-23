@@ -52,8 +52,6 @@ namespace {
     IPC::Client* g_client = nullptr;
     bool   g_initOk  = false;
     bool   g_enabled = true;           // composite ON by default; F11 toggles it OFF/ON
-    bool   g_skyEnabled = true;        // Sky takeover is DONE → Forge sky is now ALWAYS ON (no longer toggled).
-    bool   g_waterEnabled = true;      // Forge water takeover is DONE → ON by default ("always on"); F7 still toggles OFF for A/B vs MW water
     int    g_debugMode = 0;            // F12 diagnostic cycle: 0=normal, 1=depth (world-distance), 2=scatter, 3=AO, 4=bent normal
     unsigned g_frame = 0;
 
@@ -998,8 +996,50 @@ namespace {
         if (g_client) g_client->setNextRenderSize(g_rw, g_rh);
     }
 
+    // Reset ALL client-side host-residency + dedup state so a freshly re-initialised host is fully
+    // re-fed. Called on a seam RE-init (device re-creation, e.g. an in-session resolution change:
+    // MW releases the device and calls CreateDevice again, re-running DistantLand::init → lazyInit).
+    // The host's init() tears down its prior instance (fresh geometry arena + EMPTY bindless texture
+    // table), so every stale client map would otherwise make the client believe old slots are still
+    // resident and never re-ship. Pure client-side state (maps/ints/pending blobs); no D3D/VK release.
+    //
+    // NOTE (2026-07-22): an in-session RESOLUTION change (MW re-creating its device) is NOT supported
+    // while the D3D9Ex takeover is live — see tasks/forge-device-recreation.md. g_spikeForceDefaultPool
+    // translates MW's MANAGED allocations to DEFAULT, and MW's engine assumes MANAGED survives a device
+    // change, so its own resources (UI textures included) are left dangling and it crashes in unrelated
+    // subsystems. This reset is kept because it is correct and needed for the paths that DO re-init,
+    // but it cannot make a full device re-creation safe on its own.
+    void resetResidencyForReinit() {
+        {
+            std::lock_guard<std::mutex> lk(g_texResidencyMx);
+            g_texSlot.clear();
+            g_slotName.clear();
+            g_slotLastUsed.clear();
+            g_nextTexSlot = 1;                 // 0 = host default white
+            ++g_texEpoch;                      // invalidate every cached ResolvedTex fast-path (name+epoch)
+            g_texPendingBlob.clear();          // drop tex uploads staged for the OLD host
+            g_texPendingCount = 0;
+        }
+        g_keySlot.clear();
+        g_uploadedRev.clear();
+        g_nextSlot = 0;
+        g_pendingBlob.clear();                 // drop geom staged for the OLD host
+        g_pendingParts = 0;
+        // Bump the cell epoch so the fresh host evicts its stale shadow/caster records.
+        ++g_cellEpoch;
+        // The geometry cache is purged by GeometryCache::init, which sees the device change and runs
+        // earlier in DistantLand::init — the cache must not outlive its device.
+        LOG::logline(">> [seam] device re-creation: reset client residency (epoch=%u)", g_cellEpoch);
+    }
+
     // Seam bring-up (called from RenderProcess::init, under the loading bar / live by menu).
     void lazyInit(IDirect3DDevice9* device) {
+        // Seam already up ⇒ this is a RE-init on a re-created device (resolution/mode change). Drop all
+        // stale residency BEFORE the fresh renderInit so the new host gets a complete re-feed.
+        if (g_initOk) {
+            g_initOk = false;                  // a failed re-init must report the seam down, not stale-up
+            resetResidencyForReinit();
+        }
         if (FAILED(device->QueryInterface(__uuidof(ID3D9VkInteropDevice), (void**)&g_vki)) || !g_vki) {
             LOG::logline("!! [seam] main device is not DXVK (no ID3D9VkInteropDevice) — seam disabled");
             return;
@@ -1088,6 +1128,12 @@ namespace {
 
         // M1b/M1c: bring up the geometry upload + per-frame draw-list channels.
         initSceneVecs();
+
+        // NOTE: do NOT walk the geometry cache here. lazyInit runs inside DistantLand::init during MW's
+        // device RE-CREATION, while the engine is mid-teardown — dereferencing cached NiTriShape
+        // pointers at that point walks memory MW is in the middle of freeing (observed: MW's own
+        // "Menu Error: Memory pointer corrupted" dialog on an exterior resolution change). The world
+        // is re-captured later, by the warm-up's full walks, once MW is back in a stable state.
     }
 
     // Copy the imported host RT -> the DXVK D3D9 texture's VkImage, on DXVK's own queue.
@@ -1153,16 +1199,21 @@ namespace {
 
         const double tcRecord = nowMs();
         double tcLocked = tcRecord, tcSubmit = tcRecord;
+        // [experimental, uncommitted] Hold DXVK's submission-queue lock ONLY for the submit —
+        // NOT across the fence wait. The fence is ours; waiting on it touches no DXVK queue state.
+        // Hygiene win (the old code blocked DXVK's submit thread for our whole GPU copy wait) but
+        // did NOT move the lock= spike ([rtcopy] still lock-dominated post-change), so it stays
+        // out of the commit pending a real-play A/B.
         g_vki->LockSubmissionQueue();
         tcLocked = nowMs();                       // time spent waiting on DXVK's submit lock
         VkResult r = vk.QueueSubmit(g_queue, 1, &si, g_fence);
+        g_vki->ReleaseSubmissionQueue();
         tcSubmit = nowMs();
         if (r == VK_SUCCESS) {
-            MGE_ZoneScopedN("RTcopy: fence wait");   // our copy draining behind MW's queued GPU work
+            MGE_ZoneScopedN("RTcopy: fence wait");   // unlocked — our copy's GPU completion only
             vk.WaitForFences(g_dev, 1, &g_fence, VK_TRUE, UINT64_MAX);
             vk.ResetFences(g_dev, 1, &g_fence);
         }
-        g_vki->ReleaseSubmissionQueue();
         const double tcEnd = nowMs();
 
         const double total = tcEnd - tc0;
@@ -2608,11 +2659,11 @@ namespace {
     // world-object drawn set), filtered to isSky entries that have a host slot. SK1 emits ONLY the
     // dome: the untextured vertex-colour shape (isSky && !d3dTexture); SK2 adds the textured shapes
     // (sun/moons/clouds/stars). Camera-relative shift matches the host's translation-free viewProj
-    // (the sky is camera-attached). Only runs when the Forge sky pass is toggled on (F7), so the
-    // full-cache scan is paid only during the A/B. Returns the packed item count.
+    // (the sky is camera-attached). Only runs while Forge owns the frame (F11). Returns the packed
+    // item count.
     std::uint32_t buildSkyDrawList() {
         MGE_ZoneScopedN("build:sky");
-        if (!g_skyVec || !g_skyEnabled) {
+        if (!g_skyVec) {
             return 0;
         }
         const auto& cacheMap = MGE::GeometryCache::cache();
@@ -3180,6 +3231,57 @@ namespace RenderProcess {
         lazyInit(device);
     }
 
+    // --- Device-reset seam hooks (see header) -----------------------------------------
+    void preDeviceReset(IDirect3DDevice9* device) {
+        if (!g_initOk) {
+            return;
+        }
+        // Quiesce the seam BEFORE the real device resets. collectDeferredFinish drains any
+        // in-flight produce and finishes+copies a pending (frame-ahead) host frame; the copy
+        // path signals+waits g_fence inline, so on return no host GPU work is in flight. The
+        // extra waitProduce is belt-and-braces (idempotent no-op once collect has drained).
+        collectDeferredFinish(device);
+        waitProduce();
+        LOG::logline(">> [seam] preDeviceReset: host frame drained, produce worker idle");
+    }
+
+    void postDeviceReset(IDirect3DDevice9* device) {
+        if (!g_initOk || !device) {
+            return;
+        }
+        // Re-read the new backbuffer exactly as lazyInit does, then re-derive the render size.
+        // g_w/g_h (the fixed 2x allocation) and the imported host image persist across ResetEx,
+        // so there is NO host RPC and NO seam-surface rebuild — just follow the new backbuffer.
+        const UINT oldW = g_bbW, oldH = g_bbH;
+        IDirect3DSurface9* bb = nullptr;
+        if (SUCCEEDED(device->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &bb)) && bb) {
+            D3DSURFACE_DESC sd = {};
+            if (SUCCEEDED(bb->GetDesc(&sd)) && sd.Width && sd.Height) {
+                g_bbW = sd.Width;
+                g_bbH = sd.Height;
+            }
+            bb->Release();
+        }
+        if (g_bbW > g_w || g_bbH > g_h) {
+            // New backbuffer exceeds the 2x launch-time allocation (launched low, jumped high).
+            // recomputeRenderSize clamps the render size to the alloc — mild supersample-down.
+            LOG::logline("!! [seam] new backbuffer %ux%u exceeds alloc %ux%u — render clamped to alloc (supersample-down)",
+                         g_bbW, g_bbH, g_w, g_h);
+        }
+        recomputeRenderSize();   // clamps g_rw/g_rh to the alloc, restamps the host render size
+        LOG::logline(">> [seam] device reset %ux%u -> %ux%u (alloc %ux%u, render %ux%u, scale %.2fx)",
+                     oldW, oldH, g_bbW, g_bbH, g_w, g_h, g_rw, g_rh, g_renderScale);
+    }
+
+    void onDeviceResetFailed() {
+        // The real device is in the lost/hung state: drop the last host frame so neither the
+        // deferred blit nor the same-frame composite lays a stale image while MW retries. g_initOk
+        // stays true (Ex persists the seam's resources); a later successful reset recovers via
+        // postDeviceReset. The F11 composite toggle (g_enabled) is left untouched.
+        g_mainTexValid = false;
+        LOG::logline("!! [seam] device reset failed — composite suspended until next successful reset");
+    }
+
 
     // --- Finish-half pieces -----------------------------------------------------------
     // The composite finish is split into once-per-frame pieces so frame-ahead pipelining
@@ -3231,13 +3333,6 @@ namespace RenderProcess {
         if (GetAsyncKeyState(VK_F9) & 0x0001) {
             g_devUiVisible = !g_devUiVisible;
             LOG::logline(">> [seam] dev overlay %s", g_devUiVisible ? "ON" : "OFF");
-        }
-        // F7 toggles the Forge WATER takeover. The sky takeover is finished, so the sky
-        // pass is always on now and F7 was freed — it drives water (WT1). ON (default) →
-        // the host draws its geo-clipmap water surface. OFF → MW's own water (clean A/B).
-        if (GetAsyncKeyState(VK_F7) & 0x0001) {
-            g_waterEnabled = !g_waterEnabled;
-            LOG::logline(">> [seam] Forge water (WT1) %s", g_waterEnabled ? "ON" : "OFF");
         }
         // F8: one-shot host compute-shader hot-reload — rebuild gtao/linearize from the
         // dxil on disk (recompile + redeploy first). Latched into the NEXT kickoff's
@@ -3709,7 +3804,7 @@ namespace RenderProcess {
         const double dtPresent = (g_lastPresentMs > 0.0) ? (tStart - g_lastPresentMs) : 0.0;
         g_lastPresentMs = tStart;
 
-        // (Edge-triggered dev-key polls — F11/F12/F9/F7/F8/… — live in pollDevKeys,
+        // (Edge-triggered dev-key polls — F11/F12/F9/F8/… — live in pollDevKeys,
         // run once per frame from the frame-ahead collect at BeginScene(0) or from
         // onStage0CompositeFinish, so every per-frame ownership gate, including the
         // frameSetupEarly early-kickoff latch that runs BEFORE this function, sees
@@ -4171,7 +4266,7 @@ namespace RenderProcess {
         }
 
         // WT1 Forge water: per-frame surface params (no geometry — the host generates the
-        // geo-clipmap mesh). waterOn (F7) gates the host water pass. depthBaseColor mirrors XE Mod
+        // geo-clipmap mesh). waterOn gates the host water pass. depthBaseColor mirrors XE Mod
         // Water.fx:24 using available DistantLand colours as the skyCol/fogColFar proxies; windFactor
         // is a calm constant (windVec isn't exposed to MGE — tune later). camFwd = mwView's 3rd column
         // (world-space view forward) for the slant→perpendicular shoreline depth correction.
@@ -4180,10 +4275,10 @@ namespace RenderProcess {
         // MGE's own water path always gated on this and the Forge crossing lost it, so the
         // host drew the geo-clipmap at a stale WaterLevel() in dry cells. Per-frame cell
         // state gates only THIS wire flag (host skips water + its reflection pass);
-        // wantsWaterCapture() stays the mode gate (forgeOwnsDepth / fold / WT3 suppression
+        // forgeOwnsFrame() stays the mode gate (forgeOwnsDepth / fold / WT3 suppression
         // must not flip per cell). Exteriors always have water (CellHasWater true there).
         const std::uint32_t waterOn =
-            (wantsWaterCapture() && MWBridge::get()->CellHasWater()) ? 1u : 0u;
+            (forgeOwnsFrame() && MWBridge::get()->CellHasWater()) ? 1u : 0u;
         if (waterOn) {
             MWBridge* mw = MWBridge::get();
             const float sunlightFactor = 1.0f - (1.0f - DistantLand::sunVis) * (1.0f - DistantLand::sunVis);
@@ -4244,10 +4339,11 @@ namespace RenderProcess {
         // collect — but ONLY on early-kickoff frames. The earlyForgeKickoff latch is
         // exactly the "whole MW frame is IPC-free on both channels" predicate (statics
         // cull gated off, grass hoisted, reflection/shadow RPCs suppressed under
-        // wantsWaterCapture), so widening the window from scene 0 to the whole frame is
-        // safe precisely there. Late/warm-up/menu frames keep the same-frame finish —
-        // which also primes g_mainTex before the first deferred blit (the latch needs
-        // two consecutive eligible frames, so a serial frame always runs first).
+        // forgeOwnsFrame), so widening the window from scene 0 to the whole frame is
+        // safe precisely there. Late frames (F11-off / seam down) keep the same-frame finish.
+        // Since S2 retired the warm-up latch there is no longer a guaranteed serial frame ahead
+        // of the first deferred blit, so g_mainTex may still be unprimed then — onFrameAheadBlit
+        // self-gates on g_mainTexValid, costing at most one unblitted frame at startup.
         g_kick.deferFinish   = (g_frameAheadLive && DistantLand::earlyForgeKickoff) || parkFired;
         g_kick.frame         = frame;
         g_kick.drawCount     = drawCount;
@@ -4820,17 +4916,12 @@ namespace RenderProcess {
         return g_initOk && g_geomVec.has_value();
     }
 
-    bool wantsSkyCapture() {
-        // Sky takeover is DONE: walk skyRoot whenever the seam is live, geometry capture is up, and
-        // the composite is ON (F11). g_skyEnabled is now permanently true (F7 freed for water).
-        return g_initOk && g_geomVec.has_value() && g_enabled && g_skyEnabled;
-    }
-
-    bool wantsWaterCapture() {
-        // WT1 Forge water: true when the seam is live, the composite is ON (F11), and the Forge water
-        // pass is toggled ON (F7). No geometry capture (the host generates the mesh); this gate drives
-        // the per-frame water-params crossing and (WT3) the MGE water-pass suppression.
-        return g_initOk && g_enabled && g_waterEnabled;
+    bool forgeOwnsFrame() {
+        // The one mode predicate — see the header. Seam live + composite ON (F11) means the host
+        // owns opaque world, distant land, sky, water and depth; MW's own draws for all of it are
+        // overwritten by the composite, so MGE suppresses them. F11 off (or a dead host / failed
+        // seam → g_initOk false) releases every suppression and MW renders vanilla.
+        return g_initOk && g_enabled;
     }
 
     bool wantsFPCapture() {
@@ -4876,21 +4967,6 @@ namespace RenderProcess {
             g_fpDiagArmed = false;
             g_fpDiagAge = 0;
         }
-    }
-
-    bool ownsOpaqueWorld() {
-        // Forge composites a full-screen blit over MW's frame when enabled; the engine's
-        // scene-0 opaque draw underneath is then pure wasted cost. Gate on the live composite
-        // toggle so F11-off restores normal engine rendering (clean A/B of the double cost).
-        return g_initOk && g_enabled;
-    }
-
-    bool ownsDistantLand() {
-        // The host draws exterior distant land + statics into the Forge frame; the composite
-        // lays it over MW. So MW's own main-view DL color draw is redundant when the seam is
-        // compositing. Same gate as ownsOpaqueWorld (F11 = g_enabled) for a clean A/B; the
-        // caller adds the exterior check (Forge DL is exterior-only). See header.
-        return g_initOk && g_enabled;
     }
 
     void captureAlphaDraw(const RenderedState* rs, const FragmentState* frs) {
@@ -5382,7 +5458,6 @@ void DrawForgeDevPanel() {
     ImGui::Separator();
     ImGui::Text("Seam A/B");
     logCheck("Forge composite (F11)", g_enabled, "composite");
-    logCheck("Forge water (F7)", g_waterEnabled, "Forge water (WT1)");
     logCheck("Frame-ahead pipelining (numpad *)", g_frameAheadLive, "frame-ahead pipelining");
     logCheck("FP arm suppression (numpad /)", g_fpSuppressLive, "FP suppression (FP1b)");
 
