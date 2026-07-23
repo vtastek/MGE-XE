@@ -559,7 +559,7 @@ namespace IPC {
 		params.capturedVertBytes = capturedVertBytes;
 		params.capturedIdxBytes = capturedIdxBytes;
 		params.debugMode = debugMode;
-		// WT1 Forge water: 12 per-frame surface params + the F7 enable gate (no geometry).
+		// WT1 Forge water: 12 per-frame surface params + the per-cell enable gate (no geometry).
 		if (waterParams) { std::memcpy(params.waterParams, waterParams, 12 * sizeof(float)); }
 		else { std::memset(params.waterParams, 0, 12 * sizeof(float)); }
 		params.waterEnabled = waterEnabled;

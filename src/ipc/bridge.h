@@ -368,7 +368,7 @@ namespace IPC {
         IN std::uint32_t debugMode;
 
         // Forge water takeover (WT1): per-frame water surface params (NO geometry — the host
-        // generates the geo-clipmap mesh itself). waterEnabled (F7) gates the host water pass.
+        // generates the geo-clipmap mesh itself). waterEnabled gates the host water pass (cell has water).
         //   [0] waterLevel (absolute world Z)      [6] nearViewRange
         //   [1] windFactor                         [7] underwater (0/1)
         //   [2] shoreDepthBias                     [8..10] camFwd.xyz (world view forward)

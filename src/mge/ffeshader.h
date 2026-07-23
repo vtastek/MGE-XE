@@ -343,6 +343,10 @@ public:
     // No-op when tiled lighting is inactive or there are no point lights.
     static void buildTileGrid();
     static void precacheAsync();
+    // Block until the async precache thread (precacheAsync) has finished. Called before a device
+    // Reset so ResetEx never overlaps D3DXCreateEffectFromFile on the precache thread (undefined:
+    // concurrent device reset + effect creation corrupts the shared effect pool). No-op if idle.
+    static void waitPrecache();
     static void updateLighting(float sunMult, float ambMult);
     // pointLightMult scales the point-light contribution (1 = normal). The cache
     // reflection pass fades it toward 0 at the cache->distant-land handover.

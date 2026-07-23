@@ -233,9 +233,25 @@ bool FixedFunctionShader::init(IDirect3DDevice* d, ID3DXEffectPool* pool) {
     return true;
 }
 
+// The async precache thread, kept joinable (NOT detached) so a device Reset can drain it before
+// ResetEx — a device reset must never overlap D3DXCreateEffectFromFile on another thread (both
+// touch the same device + the shared constantPool, which D3DX does not guard). waitPrecache()
+// joins it; release() joins it too so the cacheEffects teardown can't race an in-flight compile.
+static std::thread s_precacheThread;
+
+void FixedFunctionShader::waitPrecache() {
+    if (s_precacheThread.joinable()) {
+        s_precacheThread.join();
+    }
+}
+
 void FixedFunctionShader::precacheAsync() {
+    // Never overlap two precache runs (reloadShaders re-enters here); drain the prior one first.
+    if (s_precacheThread.joinable()) {
+        s_precacheThread.join();
+    }
     // Move precaching to a separate thread - essential variants to prevent stuttering
-    std::thread precacheThread([]() {
+    s_precacheThread = std::thread([]() {
         LOG::logline("-- Starting async per-pixel shader precaching (essential variants)");
 
         ShaderKey skCommon;
@@ -318,8 +334,6 @@ void FixedFunctionShader::precacheAsync() {
 
         LOG::logline("-- Async precaching completed: %d essential shaders compiled", compiledVariants);
         });
-
-    precacheThread.detach();
 }
 
 void FixedFunctionShader::updateLighting(float sunMult, float ambMult) {
@@ -1872,6 +1886,8 @@ string buildArgString(DWORD arg, const string& mask, const string& sampler) {
 }
 
 void FixedFunctionShader::release() {
+    // Drain any in-flight precache before tearing down effects/pool it is still writing into.
+    waitPrecache();
     for (auto& i : cacheEffects) {
         if (i.second) {
             i.second->Release();

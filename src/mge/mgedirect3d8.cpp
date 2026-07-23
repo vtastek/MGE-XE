@@ -24,6 +24,63 @@ MGEProxyD3D::MGEProxyD3D(IDirect3D9* real) : ProxyD3D(real, MorrowindRequiredD3D
                  HIWORD(adapter.DriverVersion.LowPart), LOWORD(adapter.DriverVersion.LowPart));
 }
 
+void translatePresentParams8to9(D3DPRESENT_PARAMETERS8* e, bool isEx,
+                                D3DPRESENT_PARAMETERS9& pp,
+                                D3DDISPLAYMODEEX& dm, D3DDISPLAYMODEEX** pdm) {
+    // MSAA parameters
+    D3DMULTISAMPLE_TYPE msaaSamples = (D3DMULTISAMPLE_TYPE)Configuration.AALevel;
+    DWORD msaaQuality = 0;
+
+    // Override device parameters
+    // Note that Morrowind will look at the modified parameters
+    if (e->Flags & D3DPRESENTFLAG_LOCKABLE_BACKBUFFER) {
+        e->Flags ^= D3DPRESENTFLAG_LOCKABLE_BACKBUFFER;
+    }
+
+    e->MultiSampleType = msaaSamples;
+    e->AutoDepthStencilFormat = (D3DFORMAT)Configuration.ZBufFormat;
+    e->FullScreen_RefreshRateInHz = (!e->Windowed) ? Configuration.RefreshRate : 0;
+    e->FullScreen_PresentationInterval = (Configuration.VWait == 255) ? D3DPRESENT_INTERVAL_IMMEDIATE : Configuration.VWait;
+
+    // Convert presentation parameters to DX9
+    pp.BackBufferWidth = e->BackBufferWidth;
+    pp.BackBufferHeight = e->BackBufferHeight;
+    pp.BackBufferFormat = e->BackBufferFormat;
+    pp.BackBufferCount = e->BackBufferCount;
+    pp.MultiSampleType = e->MultiSampleType;
+    pp.MultiSampleQuality = msaaQuality;
+    pp.SwapEffect = e->SwapEffect;
+    pp.hDeviceWindow = e->hDeviceWindow;
+    pp.Windowed = e->Windowed;
+    pp.Flags = e->Flags;
+    pp.EnableAutoDepthStencil = e->EnableAutoDepthStencil;
+    pp.AutoDepthStencilFormat = e->AutoDepthStencilFormat;
+    pp.FullScreen_RefreshRateInHz = e->FullScreen_RefreshRateInHz;
+    pp.PresentationInterval = e->FullScreen_PresentationInterval;
+
+    // Present-seam spike: on a D3D9Ex device the present rules are stricter — SwapEffect must be
+    // DISCARD/FLIP (not COPY) and BackBufferCount >= 1; fullscreen needs a D3DDISPLAYMODEEX,
+    // windowed needs NULL. The normal game path (spike off / plain D3D9) leaves these untouched.
+    *pdm = nullptr;
+    if (isEx) {
+        if (pp.SwapEffect == D3DSWAPEFFECT_COPY) {
+            pp.SwapEffect = D3DSWAPEFFECT_DISCARD;
+        }
+        if (pp.BackBufferCount == 0) {
+            pp.BackBufferCount = 1;
+        }
+        if (!pp.Windowed) {
+            dm.Size = sizeof(D3DDISPLAYMODEEX);
+            dm.Width = pp.BackBufferWidth;
+            dm.Height = pp.BackBufferHeight;
+            dm.RefreshRate = pp.FullScreen_RefreshRateInHz;
+            dm.Format = pp.BackBufferFormat;
+            dm.ScanLineOrdering = D3DSCANLINEORDERING_PROGRESSIVE;
+            *pdm = &dm;
+        }
+    }
+}
+
 HRESULT _stdcall MGEProxyD3D::CreateDevice(UINT a, D3DDEVTYPE b, HWND c, DWORD d, D3DPRESENT_PARAMETERS8* e, IDirect3DDevice8** f) {
     // Window positioning
     if (e->Windowed) {
@@ -53,38 +110,22 @@ HRESULT _stdcall MGEProxyD3D::CreateDevice(UINT a, D3DDEVTYPE b, HWND c, DWORD d
         }
     }
 
-    // MSAA parameters
-    D3DMULTISAMPLE_TYPE msaaSamples = (D3DMULTISAMPLE_TYPE)Configuration.AALevel;
-    DWORD msaaQuality = 0;
+    // Present-seam spike (Milestone B): when the factory is a D3D9Ex factory (UseRenderProcessEx),
+    // create a D3D9Ex device via CreateDeviceEx. An Ex device is what lets us create a shared
+    // render-target texture for zero-copy hand-off to Vulkan; it also carries stricter present
+    // rules, applied by the shared translation helper below. The normal game path (spike off /
+    // plain D3D9) is untouched.
+    IDirect3D9Ex* d3dEx = nullptr;
+    const bool useEx = Configuration.UseRenderProcessEx &&
+                       SUCCEEDED(realD3D->QueryInterface(__uuidof(IDirect3D9Ex), reinterpret_cast<void**>(&d3dEx))) && d3dEx;
 
-    // Override device parameters
-    // Note that Morrowind will look at the modified parameters
-    if (e->Flags & D3DPRESENTFLAG_LOCKABLE_BACKBUFFER) {
-        e->Flags ^= D3DPRESENTFLAG_LOCKABLE_BACKBUFFER;
-    }
-
-    e->MultiSampleType = msaaSamples;
-    e->AutoDepthStencilFormat = (D3DFORMAT)Configuration.ZBufFormat;
-    e->FullScreen_RefreshRateInHz = (!e->Windowed) ? Configuration.RefreshRate : 0;
-    e->FullScreen_PresentationInterval = (Configuration.VWait == 255) ? D3DPRESENT_INTERVAL_IMMEDIATE : Configuration.VWait;
-
-    // Convert presentation parameters to DX9
+    // Translate DX8 -> DX9 present params (MGE overrides + DX9 conversion + Ex fixups when useEx).
+    // Shared with the proxy device Reset so a reset backbuffer matches the created one. Morrowind
+    // inspects the (mutated) DX8 params after this returns.
     D3DPRESENT_PARAMETERS9 pp;
-
-    pp.BackBufferWidth = e->BackBufferWidth;
-    pp.BackBufferHeight = e->BackBufferHeight;
-    pp.BackBufferFormat = e->BackBufferFormat;
-    pp.BackBufferCount = e->BackBufferCount;
-    pp.MultiSampleType = e->MultiSampleType;
-    pp.MultiSampleQuality = msaaQuality;
-    pp.SwapEffect = e->SwapEffect;
-    pp.hDeviceWindow = e->hDeviceWindow;
-    pp.Windowed = e->Windowed;
-    pp.Flags = e->Flags;
-    pp.EnableAutoDepthStencil = e->EnableAutoDepthStencil;
-    pp.AutoDepthStencilFormat = e->AutoDepthStencilFormat;
-    pp.FullScreen_RefreshRateInHz = e->FullScreen_RefreshRateInHz;
-    pp.PresentationInterval = e->FullScreen_PresentationInterval;
+    D3DDISPLAYMODEEX dm = {};
+    D3DDISPLAYMODEEX* pdm = nullptr;
+    translatePresentParams8to9(e, useEx, pp, dm, &pdm);
 
     // MGE render thread: when enabled, the runtime must be multithreaded (a
     // second core submits GPU work concurrently with the engine) and the
@@ -103,35 +144,7 @@ HRESULT _stdcall MGEProxyD3D::CreateDevice(UINT a, D3DDEVTYPE b, HWND c, DWORD d
     IDirect3DDevice9* realDevice = NULL;
     HRESULT hr = D3DERR_INVALIDCALL;
 
-    // Present-seam spike (Milestone B): when the factory is a D3D9Ex factory
-    // (UseRenderProcess), create a D3D9Ex device via CreateDeviceEx. An Ex device is
-    // what lets us create a shared render-target texture for zero-copy hand-off to
-    // Vulkan. Ex has stricter present rules: SwapEffect must be DISCARD/FLIP (not COPY)
-    // and BackBufferCount >= 1; windowed needs a NULL fullscreen display mode. The
-    // normal game path (spike off / plain D3D9) is untouched.
-    IDirect3D9Ex* d3dEx = nullptr;
-    if (Configuration.UseRenderProcessEx &&
-        SUCCEEDED(realD3D->QueryInterface(__uuidof(IDirect3D9Ex), reinterpret_cast<void**>(&d3dEx))) && d3dEx) {
-
-        if (pp.SwapEffect == D3DSWAPEFFECT_COPY) {
-            pp.SwapEffect = D3DSWAPEFFECT_DISCARD;
-        }
-        if (pp.BackBufferCount == 0) {
-            pp.BackBufferCount = 1;
-        }
-
-        D3DDISPLAYMODEEX dm = {};
-        D3DDISPLAYMODEEX* pdm = nullptr;
-        if (!pp.Windowed) {
-            dm.Size = sizeof(D3DDISPLAYMODEEX);
-            dm.Width = pp.BackBufferWidth;
-            dm.Height = pp.BackBufferHeight;
-            dm.RefreshRate = pp.FullScreen_RefreshRateInHz;
-            dm.Format = pp.BackBufferFormat;
-            dm.ScanLineOrdering = D3DSCANLINEORDERING_PROGRESSIVE;
-            pdm = &dm;
-        }
-
+    if (useEx) {
         IDirect3DDevice9Ex* exDevice = nullptr;
         hr = d3dEx->CreateDeviceEx(a, b, c, d, &pp, pdm, &exDevice);
         if (SUCCEEDED(hr)) {
@@ -143,6 +156,8 @@ HRESULT _stdcall MGEProxyD3D::CreateDevice(UINT a, D3DDEVTYPE b, HWND c, DWORD d
             LOG::logline("!! [spike] CreateDeviceEx failed 0x%08X; disabling D3D9Ex spike path, using plain CreateDevice", hr);
             Configuration.UseRenderProcessEx = false;
         }
+    }
+    if (d3dEx) {
         d3dEx->Release();
     }
 

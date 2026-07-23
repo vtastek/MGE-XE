@@ -35,7 +35,7 @@ public:
     BOOL _stdcall ShowCursor(BOOL a);
 
     HRESULT _stdcall CreateAdditionalSwapChain(D3DPRESENT_PARAMETERS8* a, IDirect3DSwapChain8** b) { return UnusedFunction(); }
-    HRESULT _stdcall Reset(D3DPRESENT_PARAMETERS8* a) { return UnusedFunction(); }
+    HRESULT _stdcall Reset(D3DPRESENT_PARAMETERS8* a);
     HRESULT _stdcall Present(const RECT* a, const RECT* b, HWND c, const RGNDATA* d);
     HRESULT _stdcall GetBackBuffer(UINT a, D3DBACKBUFFER_TYPE b, IDirect3DSurface8** c);
 

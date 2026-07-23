@@ -300,23 +300,22 @@ namespace MGE::GeometryCache {
 
         // The DX9 mirror VB/IB (e.vb/e.ib) is consumed by the legacy DX9 cache draws that are
         // STILL live A/B paths:
-        //   - renderDepthFromCache  — runs when !forgeOwnsDepth (F7-off MGE-water A/B, or Forge off
-        //                             entirely); also via ForgeNearDepthReplay + the UseRenderThread
-        //                             depth job (both their own flags)
+        //   - renderDepthFromCache  — runs when !forgeOwnsDepth (Forge off entirely); also via
+        //                             ForgeNearDepthReplay + the UseRenderThread depth job (both
+        //                             their own flags)
         //   - renderShadowFromCache — gated by the same forgeOwnsDepth expression as depth
-        // forgeOwnsDepth == ownsOpaqueWorld() && wantsWaterCapture() (renderdepth.cpp:338,
-        // distantland.cpp:436). NUMPAD7 CACHE (rendercachedcolor / cacheOpaqueMode) is the
+        // forgeOwnsDepth == forgeOwnsFrame() (renderdepth.cpp). NUMPAD7 CACHE
+        // (rendercachedcolor / cacheOpaqueMode) is the
         // obsolete pre-DX12 opaque-cache attempt — no longer maintained, so it is deliberately NOT
         // a mirror consumer here (it renders empty; superseded by the Forge takeover). In default
-        // Forge play (F11 + F7 on) forgeOwnsDepth is true and both explicit flags are off, so the
+        // Forge play (F11 on) forgeOwnsDepth is true and both explicit flags are off, so the
         // mirror is dead weight — skip it so the produce/capture path is D3D9-free
         // (worker-relocatable). The host IPC capture (captureGeometry/…) is independent and always
         // runs. This predicate mirrors the live consumers' gates exactly, so a mirror is built iff
         // something will draw it; the content-identity gate rebuilds a missing mirror on demand
         // when a mode toggles on (no purge / no host re-ship needed).
         static bool needMirror() {
-            const bool forgeOwnsDepth =
-                RenderProcess::ownsOpaqueWorld() && RenderProcess::wantsWaterCapture();
+            const bool forgeOwnsDepth = RenderProcess::forgeOwnsFrame();
             return Configuration.ForgeNearDepthReplay
                 || Configuration.UseRenderThread
                 || !forgeOwnsDepth;
@@ -939,7 +938,7 @@ namespace MGE::GeometryCache {
                 auto it = s_contentSig.find(key);
                 // Skip only if the content is unchanged AND every output the CURRENT consumers
                 // want is already produced: the host ship (if wantsGeometryCapture) and the DX9
-                // mirror VB (if needMirror). When a mode toggles on (F7-off, NUMPAD7 CACHE) the
+                // mirror VB (if needMirror). When a mode toggles on (F11-off, NUMPAD7 CACHE) the
                 // mirror term goes false for entries captured mirror-free, so this stops skipping
                 // and the body below rebuilds the mirror on the next walk — no purge required.
                 const bool haveHost   = e.hostUploaded || !RenderProcess::wantsGeometryCapture();
@@ -2018,7 +2017,7 @@ namespace MGE::GeometryCache {
                 // early is harmless when MW re-faces again later — the computation is the same
                 // one, we just need our capture to see the result rather than precede it.
                 const bool refaceWorldBillboards =
-                    !g_walkingFP && !g_walkingSky && RenderProcess::ownsOpaqueWorld();
+                    !g_walkingFP && !g_walkingSky && RenderProcess::forgeOwnsFrame();
                 if ((g_walkingFP || refaceWorldBillboards) &&
                     node->isInstanceOfType(NI::RTTIStaticPtr::NiBillboardNode)) {
                     NI::Camera* faceCam = g_walkingFP ? MWBridge::get()->getArmCamera()
@@ -2245,6 +2244,19 @@ namespace MGE::GeometryCache {
     }
 
     void init(IDirect3DDevice9* device) {
+        // DEVICE RE-CREATION (resolution / display-mode change: MW releases its device and calls
+        // CreateDevice again, re-running DistantLand::init). Every cached entry holds D3D9 buffers and
+        // MW texture pointers owned by the DEAD device; using one is an access violation inside D3DX9
+        // — observed as renderDepthFromCache → CEffect::SetTexture on a stale texture after a
+        // resolution change with the composite off. The cache must never outlive its device.
+        if (g_device && g_device != device) {
+            purgeAll();
+            if (g_skinnedDecl) {          // vertex decl belongs to the old device too
+                g_skinnedDecl->Release();
+                g_skinnedDecl = nullptr;
+            }
+            LOG::logline(">> [gc] device re-created — geometry cache purged (stale D3D9 resources dropped)");
+        }
         g_device = device;
 
         // Vertex declaration for skinned VBs (SkinnedVertex, stride 56). The COLOR
@@ -2515,7 +2527,7 @@ namespace MGE::GeometryCache {
         // Forge lip/blink: the msoc owned-display skip starves MW's own head-morph
         // apply, so drive it here — BEFORE the walks/ensureLive capture this frame's
         // verts. DX9 frames (F11 off) keep the engine's own display-time apply.
-        if (RenderProcess::ownsOpaqueWorld()) {
+        if (RenderProcess::forgeOwnsFrame()) {
             driveHeadMorphs();
         }
 
@@ -2526,7 +2538,7 @@ namespace MGE::GeometryCache {
         // 3rd→1st switch. Stamp the body subtree suppressed EVERY 1st-person frame (the
         // stamp is per-frame); the re-emit loop skips stamped entries. Derefs only the
         // live node fetched from the engine this frame (never cached keys).
-        if (RenderProcess::ownsOpaqueWorld()) {
+        if (RenderProcess::forgeOwnsFrame()) {
             auto* mwBridge = MWBridge::get();
             static bool s_was3rd = true;
             const bool is3rd = mwBridge->is3rdPerson();
@@ -2551,11 +2563,10 @@ namespace MGE::GeometryCache {
             runRefreshWalks();
         }
         const double tLand = gcNowMs();
-        // SK1 sky takeover: walk skyRoot only when the Forge sky pass is live (F7 toggle ON +
-        // seam compositing). walk()'s getAppCulled() early-return gives free day/night/phase/
+        // SK1 sky takeover: walk skyRoot only while Forge owns the frame (F11 seam compositing). walk()'s getAppCulled() early-return gives free day/night/phase/
         // weather selection; captured shapes ride the same capture/IPC seam as opaques but are
         // tagged isSky → the Forge host's dedicated alpha-blend sky pass draws them.
-        if (RenderProcess::wantsSkyCapture()) {
+        if (RenderProcess::forgeOwnsFrame()) {
             MGE_ZoneScopedN("GeomCache:walkSky");
             g_walkingSky = true;
             g_skyVisitCounter = 0;   // SK2: restart back-to-front ordering each sky walk
@@ -2624,7 +2635,7 @@ namespace MGE::GeometryCache {
         // Weather/VFX/projectile/spell roots are NEVER suppressed — they are worldRoot siblings
         // and their particle DIPs are exactly what AT3 capture exists for.
         {
-            const int level = RenderProcess::ownsOpaqueWorld() ? DistantLand::mwWorldSuppress : 0;
+            const int level = RenderProcess::forgeOwnsFrame() ? DistantLand::mwWorldSuppress : 0;
             applyWorldSuppression(level);
         }
 
