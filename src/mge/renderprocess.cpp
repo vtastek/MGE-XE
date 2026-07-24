@@ -2381,6 +2381,91 @@ namespace {
                 else if (rc.kind == 1) emitMultiMapDraw(ks->second, *fr, multiMapCount);
                 else                   emitStaticDraw(ks->second, *fr, drawCount);
             }
+            // Offscreen PLAIN-STATIC shadow casters (lanterns, wall fixtures) — the mover loop above
+            // handles skinned / MM-head / rigid-LIVE, but a plain static is not a mover candidate, so
+            // on first cell load a fixture behind the camera has no host caster record and casts no
+            // shadow until it enters the frustum once (then "completes" as you turn — the reported
+            // bug). The cache maintains a near-eye static-caster snapshot on the eviction sweep; re-
+            // emit any not already in this frame's visible set so the host seeds the record regardless
+            // of view direction. Statics don't move, so one sighting's record stays correct for the
+            // cell; re-emitting every frame just keeps it refreshed cheaply (the host overwrites the
+            // same absolute world). CACHED data only — emitStaticDraw does no NiTriShape deref — and
+            // the host GPU-culls these offscreen draws from the COLOUR pass while keeping their caster
+            // record, exactly the movers' contract.
+            // Once-per-cell seed gate. A plain static's host caster record persists for the WHOLE
+            // cell once it is drawn once: everMoved stays false so the host's compaction sweep never
+            // expires it (forgerender.cpp:7349 gates expiry on everMoved), and the record is only
+            // wiped on a cell change — which bumps g_cellEpoch and clears g_casterSlots host-side
+            // (forgerender.cpp:7069). So re-emitting the same near static every frame is pure waste.
+            // Seed each key once, keyed to its host SLOT: an eviction+re-upload lands on a fresh slot
+            // (host record gone) so the identity mismatch re-seeds it, while a resident static keeps
+            // its slot and stays skipped. The map is cleared on epoch change, matching the host wipe.
+            static std::unordered_map<std::uint32_t, std::uint32_t> s_offscreenSeeded;  // cacheKey -> host slot
+            static std::uint32_t s_offscreenSeededEpoch = 0xFFFFFFFFu;
+            if (s_offscreenSeededEpoch != g_cellEpoch) {
+                s_offscreenSeededEpoch = g_cellEpoch;
+                s_offscreenSeeded.clear();
+            }
+            if (wantStatic) {
+                const auto& staticCasters = MGE::GeometryCache::nearStaticCasters();
+                for (std::uint32_t skey : staticCasters) {
+                    auto cit = cacheMap.find(skey);
+                    if (cit == cacheMap.end()) continue;                      // stale key (evicted since the sweep)
+                    const auto& e = cit->second;
+                    if (s_visLookup.count(skey)) continue;                    // already emitted in the visible set
+                    if (e.suppressedFrame == cacheFrame) continue;
+                    // Precise per-frame classification (the sweep collected a padded superset).
+                    if (e.isSky || e.isFP || e.isSkinned || e.isLandscape || e.blendEnable || e.isLive) continue;
+                    if (e.d3dTexture && (e.d3dDark || e.d3dDetail || e.d3dGlow)) continue;   // MM → mover loop
+                    if (!e.d3dTexture && e.isPickRoot) continue;                             // collision proxy
+                    D3DXVECTOR3 c; float rad;
+                    cacheWorldBounds(e, c, rad);
+                    const float dx = c.x - DistantLand::eyePos.x;
+                    const float dy = c.y - DistantLand::eyePos.y;
+                    const float dz = c.z - DistantLand::eyePos.z;
+                    if (dx * dx + dy * dy + dz * dz > r2) continue;           // precise near-eye cull
+                    auto ks = g_keySlot.find(skey);
+                    if (ks == g_keySlot.end()) continue;                      // never uploaded a host slot
+                    auto seedIt = s_offscreenSeeded.find(skey);
+                    if (seedIt != s_offscreenSeeded.end() && seedIt->second == ks->second.slot) continue;
+                    s_offscreenSeeded[skey] = ks->second.slot;   // seed (or re-seed on a new slot)
+                    emitStaticDraw(ks->second, e, drawCount);
+                }
+            }
+            // Offscreen BLENDED (alpha-over) casters — the lantern case. Blended fixtures cast via
+            // the host ALPHA shadow path (refreshCasterRecord alphaCaster=true), fed by the VISIBLE
+            // alpha draw list, so an off-screen blended lantern casts nothing until looked at. Push
+            // the near ones into alphaCands so they sort + emit with the visible alpha and the host
+            // registers their caster records. They draw in the alpha pass but, being off-screen, are
+            // GPU frustum-culled from the visible image — only the shadow persists. Same CACHED-data,
+            // near-eye, deduped-against-visible discipline as the opaque re-emit above.
+            if (wantAlpha) {
+                const auto& alphaCasters = MGE::GeometryCache::nearAlphaCasters();
+                for (std::uint32_t akey : alphaCasters) {
+                    auto cit = cacheMap.find(akey);
+                    if (cit == cacheMap.end()) continue;               // stale key (evicted since sweep)
+                    const auto& e = cit->second;
+                    if (s_visLookup.count(akey)) continue;             // already in the visible alpha set
+                    if (e.suppressedFrame == cacheFrame) continue;
+                    if (!e.blendEnable || e.isSky || e.isFP || e.isSkinned || e.isLandscape || e.isLive) continue;
+                    if (!e.d3dTexture) continue;                       // need a base map to mask/composite
+                    const float* w = e.worldTransformD3D;
+                    const float cx = e.boundsCenter[0], cy = e.boundsCenter[1], cz = e.boundsCenter[2];
+                    const float wx = cx*w[0] + cy*w[4] + cz*w[8]  + w[12] - DistantLand::eyePos.x;
+                    const float wy = cx*w[1] + cy*w[5] + cz*w[9]  + w[13] - DistantLand::eyePos.y;
+                    const float wz = cx*w[2] + cy*w[6] + cz*w[10] + w[14] - DistantLand::eyePos.z;
+                    if (wx*wx + wy*wy + wz*wz > r2) continue;          // precise near-eye cull
+                    auto ks = g_keySlot.find(akey);
+                    if (ks == g_keySlot.end()) continue;               // never uploaded a host slot
+                    // Once-per-cell seed gate (shares s_offscreenSeeded; alpha/static keys are disjoint).
+                    // A blended static lantern's alpha caster record is likewise persistent (everMoved
+                    // false), so it need only enter the alpha pass once per cell to register.
+                    auto aSeedIt = s_offscreenSeeded.find(akey);
+                    if (aSeedIt != s_offscreenSeeded.end() && aSeedIt->second == ks->second.slot) continue;
+                    s_offscreenSeeded[akey] = ks->second.slot;
+                    alphaCands.push_back({ wx*fwdX + wy*fwdY + wz*fwdZ, &ks->second, &e, nullptr });
+                }
+            }
             // FP0 instrumentation: each skipped frame is a frame the body WOULD have
             // lingered pre-fix. A run ends when the re-emit condition stops matching
             // (eviction / visible again) — its length is the exact pre-fix linger.

@@ -328,6 +328,23 @@ namespace MGE::GeometryCache {
     const std::unordered_set<uint32_t>& skyKeys();
     const std::unordered_set<uint32_t>& fpKeys();
 
+    // Near-eye PLAIN-STATIC shadow-caster keys, rebuilt each eviction sweep (30-frame cadence).
+    // Movers re-emit offscreen via moverCandidates(); a plain static (lantern, wall fixture) is
+    // not a mover candidate, so without this its host caster record is never seeded until it is
+    // drawn once — a fixture behind the camera on first cell load casts no shadow until looked at.
+    // The Forge feed's offscreen re-emit iterates this set and re-applies the precise per-frame
+    // filter (distance / visible-set / suppressedFrame / MM / collision-proxy). A distance-culled
+    // snapshot, not a ⊆-maintained set — cleared+rebuilt wholesale each sweep. Stale keys are
+    // harmless (the consumer guards with cache().find).
+    const std::vector<uint32_t>& nearStaticCasters();
+
+    // Near-eye ALPHA (blended alpha-over cutout) shadow-caster keys, same snapshot discipline as
+    // nearStaticCasters(). Blended fixtures (lanterns/banners/foliage) cast via the host alpha
+    // shadow path, which is fed by the VISIBLE alpha draw list — so an off-screen blended fixture
+    // casts nothing until looked at. The Forge feed re-emits these into alphaCands so their caster
+    // records seed regardless of view. Distance-culled snapshot; stale keys guarded by cache().find.
+    const std::vector<uint32_t>& nearAlphaCasters();
+
     // Frames elapsed since the eviction sweep last ran (0 on a sweep frame). Build-spike
     // observability: tests whether build spikes align with the ~30-frame sweep cadence.
     uint32_t framesSinceEvictSweep();

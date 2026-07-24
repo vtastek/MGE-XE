@@ -107,6 +107,24 @@ namespace MGE::GeometryCache {
         // by updateDerivedMembership + the same erase sites as the mover set. ⊆ keys(g_cache).
         std::unordered_set<uint32_t>                      g_skyKeys;
         std::unordered_set<uint32_t>                      g_fpKeys;
+        // Near-eye PLAIN-STATIC shadow-caster keys, rebuilt each eviction sweep (30-frame cadence)
+        // by collecting kept entries near the eye. The mover set above re-emits offscreen skinned/
+        // MM/rigid-LIVE casters every frame; a plain static (lantern, wall fixture) is NOT a mover
+        // candidate, so on first cell load a fixture behind the camera has no host caster record and
+        // casts nothing until it enters the frustum once. The Forge feed's offscreen re-emit loop
+        // iterates this set (instead of scanning the whole cache) so those records seed regardless
+        // of view direction. Superset of what the feed emits (the feed re-applies the precise
+        // per-frame filter); stale keys are harmless (the feed guards with cacheMap.find).
+        // NOT ⊆-maintained like the sets above — it is a distance-culled snapshot, so it is
+        // cleared+rebuilt wholesale each sweep and simply cleared on purgeAll.
+        std::vector<uint32_t>                             g_nearStaticCasters;
+        // Near-eye ALPHA (blended cutout) shadow-caster keys — the same snapshot as above but for
+        // alpha-OVER blended geometry (lanterns/banners/foliage). These cast via the host's alpha
+        // shadow path (refreshCasterRecord alphaCaster=true), fed by the VISIBLE alpha draw list —
+        // so an off-screen blended fixture (a lantern behind the camera) casts nothing until looked
+        // at (the reported "lantern shadow completes on rotate"). The Forge feed re-emits these into
+        // alphaCands so their caster records seed regardless of view. Same lifetime as above.
+        std::vector<uint32_t>                             g_nearAlphaCasters;
         // STRONG reference to every cached NiTriShape, keyed exactly like g_cache.
         //
         // The cache KEY IS THE RAW ADDRESS of the shape, and ensureLive() dereferences that address
@@ -274,6 +292,11 @@ namespace MGE::GeometryCache {
         NI::Node* g_landRoot = nullptr;
         uint32_t  g_liveRefreshThisFrame = 0;
         uint32_t  g_liveCaptureThisFrame = 0;
+        // bug #2 re-entry: frames of DEEP bypassCull object-root capture remaining after a cell purge.
+        // Set by purgeAll; counted down in onFrameReady. Gives a door-transition the same full-cell
+        // capture a fresh save-load gets for free, so off-screen fixtures (the lantern) cast at once.
+        int       g_postPurgeCaptureFrames = 0;
+        constexpr int kPostPurgeCaptureFrames = 12;   // ~1 eviction-sweep window; interiors are small
         // First-sight capture budget (see setCaptureBudget in the header). -1 = unlimited;
         // >= 0 = remaining first-sight lazy captures ensureLive may still do before deferring.
         int       g_captureBudget   = -1;
@@ -1770,9 +1793,21 @@ namespace MGE::GeometryCache {
         // bypassCull skips the entry's own app-cull check. Used for a NiSwitchNode's
         // active child: switchIndex already selected it, and a menu-frame cull pass may
         // have transiently app-culled it; the cache frustum-culls later anyway.
-        void walk(NI::AVObject* av, bool inCharacter = false, bool bypassCull = false) {
+        void walk(NI::AVObject* av, bool inCharacter = false, bool bypassCull = false,
+                  bool bypassCullDeep = false) {
             if (!av) return;
-            if (!bypassCull && av->getAppCulled()) return;
+            if (!bypassCull && !bypassCullDeep && av->getAppCulled()) return;
+            // bypassCullDeep un-hides app-culled subtrees to reach off-screen fixtures (post-purge
+            // capture), but MW app-culls COLLISION geometry (RootCollisionNode / NiCollisionSwitch)
+            // PERMANENTLY — not for being off-screen. Un-hiding it captures textureless collision
+            // meshes that then draw as white boxes. These node types never hold render geometry, so
+            // skip their whole subtree. Only under bypassCullDeep: a normal walk never reaches them
+            // (app-cull stops it at the check above), so this adds no cost to the common path.
+            if (bypassCullDeep
+                && (av->isInstanceOfType(NI::RTTIStaticPtr::RootCollisionNode)
+                    || av->isInstanceOfType(NI::RTTIStaticPtr::NiCollisionSwitch))) {
+                return;
+            }
 
             // W1.5 active-cell gate: skip anything whose world bound lies entirely
             // beyond the gate sphere — a NiNode prunes its whole subtree (per-cell
@@ -1957,8 +1992,22 @@ namespace MGE::GeometryCache {
                         g_charNodeVerdict.emplace(nodeKey, isCharNode);
                     }
                 }
+                // Deep capture is for STATIC off-screen shadow casters only (furniture + clutter).
+                // A character/NPC subtree — skinned body, bone-attached gear, and its textureless
+                // collision — is DYNAMIC: the normal visible/skinned path captures it correctly when
+                // it is on screen. Deep-walking it off-screen instead captures skinned parts with no
+                // valid bone palette (the NPC hasn't been updated) and un-hides app-culled collision,
+                // both of which render white (the reported "white collision on NPCs"). Skip the whole
+                // character subtree in the deep pass; ordinary and FP walks never set bypassCullDeep.
+                if (bypassCullDeep && isCharNode) return;
+                // bypassCull is TOP-ONLY (children keep their engine cull state — the FP walk
+                // depends on that to select the sheathed/drawn weapon variant), so it is NOT
+                // propagated. bypassCullDeep IS propagated: the fixture shadow-capture below needs
+                // the WHOLE subtree, because the engine app-culls an off-screen fixture at the LEAF
+                // mesh, not just its root (a top-only bypass would descend into an appCulled mesh
+                // child and skip it at ~1786). Default false, so ordinary and FP walks are unchanged.
                 for (size_t i = 0; i < count; ++i)
-                    walk(node->children.at(i), isCharNode);
+                    walk(node->children.at(i), isCharNode, false, bypassCullDeep);
             }
         }
 
@@ -2419,6 +2468,45 @@ namespace MGE::GeometryCache {
         if (!liveDrawBuild) {
             runRefreshWalks();
         }
+
+        // Cell-transition shadow-capture (bug #2, the RE-ENTRY case). On a fresh save-load MW's own
+        // full-scene classify captures the WHOLE cell, so the offscreen re-emit below finds every
+        // fixture and the lantern casts complete. On a DOOR TRANSITION there is no such classify: the
+        // cache is purged and then repopulates VIEW-LIMITED (the walk honours MW's app-cull), so an
+        // off-screen fixture — the lantern behind you — is never captured and its shadow is missing
+        // until you turn to look (the reported "reenter interior, incomplete"). For a short window
+        // after a purge, DEEP-bypassCull-walk the object root so every near static is captured +
+        // uploaded regardless of frustum, exactly the state a save-load starts in. Interiors only:
+        // they are small (bounded cost) and are the lantern case; exterior point-light fixtures can
+        // follow later. Still subject to the active-cell distance gate, so far cells aren't pulled in.
+        if (g_postPurgeCaptureFrames > 0) {
+            if (RenderProcess::forgeOwnsFrame() && g_captureInteriorCell && g_objRoot) {
+                MGE_ZoneScopedN("GeomCache:postPurgeCapture");
+                // Capture the WHOLE interior (skip the active-cell distance gate as well as app-cull).
+                // The gate can't be trusted here: right after a purge g_gateEye is still the OLD cell's
+                // eye, so a distance test rejects the entire new interior (a tight radius captured
+                // nothing; the wide one only worked by accident). An interior is bounded, so a full
+                // capture is safe and correct — it's the same state a fresh save-load starts in. This
+                // is INTERIOR-only; exteriors keep their gate (never reached — g_captureInteriorCell).
+                // BOTH cell roots, exactly as runRefreshWalks does: WorldObjectRoot holds the
+                // architecture + furniture (posts, table, lanterns), but the clutter that casts the
+                // "popping" shadows — barrels, sacks, baskets, bottles, the chest — hangs under
+                // WorldPickObjectRoot (g_pickRoot). Walking only g_objRoot captured the furniture and
+                // left every pickable off-screen caster un-seeded until the frustum swept it (the spin
+                // that "completed" the shadows). g_walkingPick tags the pick-root entries so they
+                // classify like the normal pick pass.
+                const bool savedGate = g_gateThisFrame;
+                g_gateThisFrame = false;
+                walk(g_objRoot, false, /*bypassCull=*/false, /*bypassCullDeep=*/true);
+                if (g_pickRoot) {
+                    g_walkingPick = true;
+                    walk(g_pickRoot, false, /*bypassCull=*/false, /*bypassCullDeep=*/true);
+                    g_walkingPick = false;
+                }
+                g_gateThisFrame = savedGate;
+                --g_postPurgeCaptureFrames;   // only burn a frame that ACTUALLY captured (not load/menu)
+            }
+        }
         const double tLand = gcNowMs();
         // SK1 sky takeover: walk skyRoot only while Forge owns the frame (F11 seam compositing). walk()'s getAppCulled() early-return gives free day/night/phase/
         // weather selection; captured shapes ride the same capture/IPC seam as opaques but are
@@ -2531,7 +2619,15 @@ namespace MGE::GeometryCache {
         // walk verdict is the oracle the refcount verdict is checked against. Menu-mode sweeps keep
         // running every frame and get MORE precise this way (an unparented item is detected on the
         // very next click) while no longer pulling a walk per click.
-        const bool sweepNow = (g_frame % kEvictSweepInterval == 0) || MWBridge::get()->IsMenu();
+        // Post-purge: force the sweep every frame of the capture window. The sweep is what rebuilds
+        // g_nearStaticCasters (the offscreen re-emit's source). Without this, the deep capture fills
+        // the cache on the transition frame but the offscreen casters cannot seed until the next
+        // 30-frame sweep boundary — so a subset of shadows (the frustum-visible ones) appears
+        // immediately and the rest "pop in" up to ~0.3s later. Forcing the sweep here keeps the
+        // near-static set current with the capture, so every caster seeds on the same frame and all
+        // shadows arrive together. Bounded (12 interior frames, hidden inside the load hitch).
+        const bool sweepNow = (g_frame % kEvictSweepInterval == 0) || MWBridge::get()->IsMenu()
+                              || (g_postPurgeCaptureFrames > 0);
         // Cell-grid mode NEVER forces a walk — it reads MW's grid directly. Parent-chain forces one
         // only during its validation window / the forceWalk bisect knob.
         const bool validating = g_evictByParentChain && !g_evictByCellGrid && (g_evictSweepNo < kEvictValidateSweeps);
@@ -2746,6 +2842,9 @@ namespace MGE::GeometryCache {
                 }
             }
             climbCountMs = gcNowMs() - tClimb0;
+            // Rebuilt wholesale below at every keep-point (see g_nearStaticCasters). Fresh each sweep.
+            g_nearStaticCasters.clear();
+            g_nearAlphaCasters.clear();
             for (auto it = g_cache.begin(); it != g_cache.end(); ) {
                 auto& e = it->second;
                 bool evict;
@@ -2925,6 +3024,40 @@ namespace MGE::GeometryCache {
                     g_fpKeys.erase(it->first);
                     it = g_cache.erase(it);
                 } else {
+                    // KEPT: collect near-eye plain-static shadow casters for the Forge feed's
+                    // offscreen re-emit (g_nearStaticCasters). Opaque statics only — movers
+                    // (skinned/MM-head/rigid-LIVE) already ride the mover set; sky/FP/landscape and
+                    // blended geometry are not opaque static casters. A distance-culled snapshot,
+                    // padded past the feed's kShadowCasterRadius (2048, renderprocess) so a fixture
+                    // entering reach between sweeps is already listed. The feed re-applies the exact
+                    // per-frame filter, so this only has to be a cheap SUPERSET.
+                    {
+                        const float dx = e.worldTransformD3D[12] - DistantLand::eyePos.x;
+                        const float dy = e.worldTransformD3D[13] - DistantLand::eyePos.y;
+                        const float dz = e.worldTransformD3D[14] - DistantLand::eyePos.z;
+                        constexpr float kNearStaticCasterR = 3072.0f;  // 2048 emit + ~1 sweep travel
+                        if (dx*dx + dy*dy + dz*dz <= kNearStaticCasterR * kNearStaticCasterR) {
+                            const bool isMM = e.d3dTexture && (e.d3dDark || e.d3dDetail || e.d3dGlow);
+                            const bool collisionProxy = (!e.d3dTexture && e.isPickRoot);
+                            // Reject sky/FP/skinned/landscape first (they are neither static nor
+                            // alpha-over occluders), then classify the rest.
+                            if (!(e.isSky || e.isFP || e.isSkinned || e.isLandscape)) {
+                                if (e.blendEnable) {
+                                    // Alpha-OVER cutout caster candidate (lantern/banner/foliage). Gate
+                                    // on the host alpha-caster path's blend/fade conditions (destBlend
+                                    // INVSRCALPHA + matAlpha > 0.5); the host applies the full texture-
+                                    // alpha-kind test. Additive glows (dst ONE) are light, not occluders;
+                                    // isLive alpha rides its own path (host keeps it off the static gate).
+                                    if (!e.isLive && e.destBlend == D3DBLEND_INVSRCALPHA
+                                        && e.matDiffuse[3] > 0.5f) {
+                                        g_nearAlphaCasters.push_back(it->first);
+                                    }
+                                } else if (!e.isLive && !isMM && !collisionProxy) {
+                                    g_nearStaticCasters.push_back(it->first);   // opaque static shadow caster
+                                }
+                            }
+                        }
+                    }
                     ++it;
                 }
             }
@@ -3042,6 +3175,14 @@ namespace MGE::GeometryCache {
         return g_moverCandidates;
     }
 
+    const std::vector<uint32_t>& nearStaticCasters() {
+        return g_nearStaticCasters;
+    }
+
+    const std::vector<uint32_t>& nearAlphaCasters() {
+        return g_nearAlphaCasters;
+    }
+
     const std::unordered_set<uint32_t>& skyKeys() {
         return g_skyKeys;
     }
@@ -3123,7 +3264,13 @@ namespace MGE::GeometryCache {
         g_moverCandidates.clear();   // whole cache dropped → no derived membership survives
         g_skyKeys.clear();
         g_fpKeys.clear();
+        g_nearStaticCasters.clear(); // stale snapshot (find-guarded anyway); rebuilt next sweep
+        g_nearAlphaCasters.clear();
         g_geomRefs.clear();   // NI::Pointer dtors → DecRef every shape we were pinning
+        // bug #2 re-entry: this purge is a cell transition → the new cell repopulates view-limited,
+        // so force a short window of full-cell (deep bypassCull) capture (see onFrameReady). A fresh
+        // save-load gets this from MW's own classify; a door transition does not.
+        g_postPurgeCaptureFrames = kPostPurgeCaptureFrames;
     }
 
     const CachedGeometry* ensureLive(uint32_t key) {
