@@ -345,7 +345,8 @@ bool DistantLand::initIpc() {
     maskBlobSharedId = maskVec.id();
     maskBlobShared = maskVec;
 
-    // Present-seam: bring up the out-of-process Forge D3D12 renderer + the 9On12 seam
+    // Present-seam: bring up the out-of-process Forge D3D12 renderer + the DXVK
+    // Vulkan-interop seam that imports its shared render target
     // (gated by Configuration.UseRenderProcess; no-op otherwise). Runs here, under the
     // "...MGE XE..." loading bar, so the cold bring-up hides behind the bar instead of
     // stalling the first menu present. DistantLand::device is set at startup.

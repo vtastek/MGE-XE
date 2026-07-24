@@ -1473,8 +1473,12 @@ namespace {
         struct Region { uint64_t off; uint64_t len; };
         std::vector<Region> regions;     // sorted ascending by off; non-adjacent (coalesced)
         uint64_t total = 0;
+        // H2 occupancy: free bytes maintained O(1) by alloc/release (summing `regions` per
+        // heartbeat would be O(fragments) on the hot path for a number we only print).
+        // used = total - freeBytes; regions.size() is the fragmentation read.
+        uint64_t freeBytes = 0;
 
-        void init(uint64_t size) { regions.assign(1, {0, size}); total = size; }
+        void init(uint64_t size) { regions.assign(1, {0, size}); total = size; freeBytes = size; }
 
         // Returns byte offset, or UINT64_MAX if no region fits.
         uint64_t alloc(uint64_t len) {
@@ -1484,6 +1488,7 @@ namespace {
                     uint64_t off = regions[i].off;
                     if (regions[i].len == len) { regions.erase(regions.begin() + i); }
                     else { regions[i].off += len; regions[i].len -= len; }
+                    freeBytes -= len;
                     return off;
                 }
             }
@@ -1492,6 +1497,7 @@ namespace {
 
         void release(uint64_t off, uint64_t len) {   // NOT 'free' — that's a Forge IMemory macro
             if (len == 0) return;
+            freeBytes += len;
             // insert sorted, then coalesce with neighbours
             size_t i = 0;
             while (i < regions.size() && regions[i].off < off) ++i;
@@ -1510,6 +1516,16 @@ namespace {
     };
     FreeList g_arenaVB;   // suballocates pArenaVB (bytes)
     FreeList g_arenaIB;   // suballocates pArenaIB (bytes)
+
+    // H2 "no silent content loss" (external audit PR #2, items 1/2/4). uploadGeometry logs a
+    // per-call `!! parts SKIPPED` line, but a burst 40 minutes ago is invisible now — and a
+    // dropped part is a MISSING OBJECT, the one failure the player sees and we cannot. These are
+    // SESSION CUMULATIVE and ride the heartbeat, so "did we lose anything, ever" is answerable
+    // from any log tail. Non-zero here is always a bug report, never noise.
+    uint64_t g_skippedPartsTotal = 0;   // parts dropped: arena grow refused/failed at the cap
+    uint64_t g_skippedVBTotal    = 0;   // bytes those parts wanted
+    uint64_t g_skippedIBTotal    = 0;
+    uint64_t g_arenaGrowCount    = 0;   // successful doublings (pressure trend, not a failure)
 
     // Per-draw transform: the PROVEN column-major cbuffer convention, BATCHED to beat the
     // 64KB cbuffer cap. CRITICAL: a UNIFORM_BUFFER resource > 64KB makes Forge build an
@@ -2026,9 +2042,19 @@ namespace {
     // WRAP_S_WRAP_T) and it selects the sampler in the frag (opaque.srt.h::sampleBase). It
     // defaults to 3 = WRAP = the old always-REPEAT behaviour, so a caller that forgets it keeps
     // today's look rather than silently clamping the world.
+    // Per-frame set of bindless slots any draw actually referenced. packTexAlpha is the ONE choke
+    // point every draw path goes through (near/skinned/multimap/alpha/DL/sky), so a bit here is an
+    // exact per-frame unique-texture count for two register ops. The question it answers: client
+    // texture residency is CUMULATIVE for the whole session and saturates all 888 slots, but if a
+    // frame only ever touches a few dozen, the residency set is ~20x the working set and the
+    // saturation/LRU machinery is solving a problem that does not exist.
+    uint32_t g_texSeenBits[(MAX_TEXTURES + 31) / 32] = {};
+    unsigned g_lastUniqueTex = 0;
+
     inline uint32_t packTexAlpha(uint32_t texIndex, float alphaRef, uint32_t vColSource = 0u,
                                  uint32_t clampMode = 3u, bool twoSided = false) {
         const uint32_t tex = texIndex < kMaxTextures ? texIndex : 0u;
+        g_texSeenBits[tex >> 5] |= (1u << (tex & 31u));
         float r = alphaRef < 0.0f ? 0.0f : (alphaRef > 1.0f ? 1.0f : alphaRef);
         const uint32_t aref = (uint32_t)(r * 255.0f + 0.5f) & 0xFFu;
         // Bit 28 = two-sided (DRAW_BOTH) flag: opaque.vert forwards it as ClampMode bit2, alpha.frag
@@ -5442,6 +5468,11 @@ namespace {
     double    g_lastGpuOverlapMs = 0.0;
     // GPU-side per-phase ms (breaks down the ~4ms gpu via timestamp queries). kGpuPhase* enum
     // is defined up near kMaxDraws (used in buildOpaquePath, earlier in the TU than this block).
+    // Active shadow-mask slots this frame (popcount of activeBits / dynBits). The mask dispatch
+    // iterates these per pixel, so this — not shadowCasters, not the froxel light count — is what
+    // its cost scales with. Logged in the gpu split line.
+    unsigned  g_lastShadowActive = 0;
+    unsigned  g_lastShadowDyn    = 0;
     double    g_lastGpuPhaseMs[kGpuPhaseCount] = {};
     // CPU-side per-phase RECORD ms (breaks down g_lastRecMs): the same gpuPhaseBegin/End
     // brackets also capture hostNowMs() deltas — CPU cost of RECORDING each phase's commands
@@ -8325,6 +8356,13 @@ namespace ForgeRender {
             // slotBits (uint4): the 32-bit slot masks as REAL uints — a float lane is exact only
             // to 24 bits, so at 32 slots the top-8 would silently vanish.
             reinterpret_cast<uint32_t*>(mp)[284] = activeBits;   // slotBits.x
+            // Heartbeat: popcount(activeBits) is the INDEPENDENT VARIABLE of the mask dispatch —
+            // it loops the active slots per pixel. The heartbeat used to expose only shadowCasters
+            // (a geometry count) and the froxel near-light count, and NEITHER tracks mask cost: a
+            // scene sweep measured 83 froxel lights at 0.58ms against 22 at 1.36ms. Without this
+            // number the mask's cost model is unfalsifiable, so log it beside the phase it explains.
+            g_lastShadowActive = (unsigned)__popcnt(activeBits);
+            g_lastShadowDyn    = (unsigned)__popcnt(dynBits);
             reinterpret_cast<uint32_t*>(mp)[285] = dynBits;      // slotBits.y (C4b dyn tile valid THIS frame)
             reinterpret_cast<uint32_t*>(mp)[286] = flickerBits;  // slotBits.z (flicker-class slots → dir wobble)
             reinterpret_cast<uint32_t*>(mp)[287] = softBits;     // slotBits.w (low-res tile → skip the tap grid)
@@ -11497,6 +11535,39 @@ namespace ForgeRender {
                          g_renderFrame, drawn, skinnedDrawn, multiMapDrawn, skyDrawn, alphaDrawn,
                          g_lastAlphaPrepassDrawn, g_dynamicCount, g_meshHigh,
                          g_recAccum / 300.0, g_gpuAccum / 300.0);
+            // H2 pool occupancy (external audit PR #2). The arenas grow by doubling to a HARD cap
+            // and then drop parts — i.e. objects go missing — so "how close are we" must be a
+            // standing number, not something reconstructed after a bug report. skipped= is SESSION
+            // CUMULATIVE and any non-zero value is a defect. frag= is free-region count: a high
+            // count against plenty of free bytes means the first-fit allocator is fragmenting and
+            // a grow can be refused while the arena looks empty.
+            {
+                // Unique slots referenced since the LAST heartbeat, i.e. the working set over a
+                // 300-frame window — the number that is actually comparable to client residency
+                // (a per-frame count would undercount a set the player pans across). Cleared here,
+                // so each heartbeat reports its own window.
+                g_lastUniqueTex = 0;
+                for (unsigned w = 0; w < (unsigned)((MAX_TEXTURES + 31) / 32); ++w) {
+                    g_lastUniqueTex += (unsigned)__popcnt(g_texSeenBits[w]);
+                    g_texSeenBits[w] = 0;
+                }
+                const uint64_t vbUsed = g_arenaVB.total - g_arenaVB.freeBytes;
+                const uint64_t ibUsed = g_arenaIB.total - g_arenaIB.freeBytes;
+                LOG::logline(">> [forge-hb] pools: arenaVB=%llu/%llu MB (%.0f%%, cap %llu, frag=%zu)"
+                             " arenaIB=%llu/%llu MB (%.0f%%, cap %llu, frag=%zu) grows=%llu"
+                             " | skipped=%llu parts (%llu KB VB / %llu KB IB) | uniqueTex/300f=%u",
+                             (unsigned long long)(vbUsed >> 20), (unsigned long long)(g_arenaVB.total >> 20),
+                             g_arenaVB.total ? 100.0 * (double)vbUsed / (double)g_arenaVB.total : 0.0,
+                             (unsigned long long)(kArenaVBMaxBytes >> 20), g_arenaVB.regions.size(),
+                             (unsigned long long)(ibUsed >> 20), (unsigned long long)(g_arenaIB.total >> 20),
+                             g_arenaIB.total ? 100.0 * (double)ibUsed / (double)g_arenaIB.total : 0.0,
+                             (unsigned long long)(kArenaIBMaxBytes >> 20), g_arenaIB.regions.size(),
+                             (unsigned long long)g_arenaGrowCount,
+                             (unsigned long long)g_skippedPartsTotal,
+                             (unsigned long long)(g_skippedVBTotal >> 10),
+                             (unsigned long long)(g_skippedIBTotal >> 10),
+                             g_lastUniqueTex);
+            }
             // Host-frame split (this frame's instantaneous values) so the ~2ms "unaccounted inside the
             // host" the client saw is localized: setup (per-draw memcpy) + cull (DL CPU cull + lazy
             // loads) + record + gpu + post = total. cull is the prime pre-record suspect.
@@ -11525,7 +11596,8 @@ namespace ForgeRender {
                          g_lastCpuPhaseMs[kGpuPhaseResolve],
                          g_lastRecMs - g_lastCpuPhaseMs[kGpuPhaseFrame]);
             LOG::logline(">> [forge-hb] gpu split: cull=%.2f prepass=%.2f shadow=%.2f (st=%.2f dyn=%.2f) postdepth=%.2f (lin=%.2f ao=%.2f mask=%.2f) reflect=%.2f color=%.2f water=%.2f resolve=%.2f ms"
-                         " | hiz=%.2f (prologue, overruns=%u) | shadowCasters=%u | nearTris=%.2fM atDraws=%u",
+                         " | hiz=%.2f (prologue, overruns=%u) | shadowCasters=%u maskSlots=%u(dyn=%u)"
+                         " | nearTris=%.2fM atDraws=%u",
                          g_lastGpuPhaseMs[kGpuPhaseCull],
                          g_lastGpuPhaseMs[kGpuPhasePrepass], g_lastGpuPhaseMs[kGpuPhaseShadow],
                          g_lastGpuPhaseMs[kGpuPhaseShadowStatic], g_lastGpuPhaseMs[kGpuPhaseShadowDyn],
@@ -11537,6 +11609,7 @@ namespace ForgeRender {
                          g_lastGpuPhaseMs[kGpuPhaseWater], g_lastGpuPhaseMs[kGpuPhaseResolve],
                          g_lastHizGpuMs, g_hizOverruns,
                          (unsigned)g_shadowCasters.size(),
+                         g_lastShadowActive, g_lastShadowDyn,
                          (double)g_lastNearTris / 1e6, g_lastNearATDraws);
             // Host-GPU-shrink sub-phases: WHERE inside color/reflect the ms live. sky+near+skin+mm+dl
             // ≈ color above (same frame's timestamps); refl sky = reflect − reflgeo.
@@ -16113,6 +16186,7 @@ namespace ForgeRender {
         const uint64_t tail = ((oldTotal + align - 1) / align) * align;
         fl.release(tail, newTotal - tail);
         fl.total = newTotal;
+        ++g_arenaGrowCount;
         LOG::logline("-- [forge] %s grown %llu -> %llu MB (contents GPU-copied in place)",
                      name, (unsigned long long)(oldTotal >> 20), (unsigned long long)(newTotal >> 20));
         return true;
@@ -16506,10 +16580,15 @@ namespace ForgeRender {
                         built, partCount, byteCount, g_meshHigh);
         }
         if (skippedParts) {
+            g_skippedPartsTotal += skippedParts;
+            g_skippedVBTotal    += skippedVB;
+            g_skippedIBTotal    += skippedIB;
             LOG::logline("!! [forge] uploadGeometry: %u parts SKIPPED (arena grow failed; "
-                         "need %llu KB VB / %llu KB IB more) — objects will be missing",
+                         "need %llu KB VB / %llu KB IB more) — objects will be missing"
+                         " [session total %llu parts]",
                          skippedParts, (unsigned long long)(skippedVB >> 10),
-                         (unsigned long long)(skippedIB >> 10));
+                         (unsigned long long)(skippedIB >> 10),
+                         (unsigned long long)g_skippedPartsTotal);
         }
         const double totalMs = hostNowMs() - tUp0;
         if (totalMs >= 1.0) {

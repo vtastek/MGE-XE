@@ -17,9 +17,9 @@ struct FragmentState;
 namespace RenderProcess {
     // Called once after the IPC host is up, from inside DistantLand::init() — i.e.
     // UNDER the "...MGE XE..." loading bar, before the first menu present. No-op unless
-    // Configuration.UseRenderProcess. Brings up the seam synchronously here (9On12
-    // side-device + RenderInit RPC + shared-RT open) so the cost hides behind the bar
-    // instead of stalling the first menu frame. Needs the live device for the bring-up.
+    // Configuration.UseRenderProcess. Brings up the seam synchronously here (DXVK
+    // Vulkan-interop QI + RenderInit RPC + shared-RT import) so the cost hides behind the
+    // bar instead of stalling the first menu frame. Needs the live device for the bring-up.
     void init(IPC::Client* client, IDirect3DDevice9* device);
 
     // Drive the host + composite the Forge layer into MW's frame. Called from EndScene at the

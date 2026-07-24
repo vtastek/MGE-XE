@@ -680,6 +680,14 @@ namespace {
     // least-recently-used slot instead. g_frame is the LRU clock.
     std::vector<std::string>                  g_slotName;           // slot -> name (for eviction; size kMaxTextures)
     std::vector<std::uint32_t>                g_slotLastUsed;       // slot -> last g_frame it was referenced
+    // H2 occupancy (external audit PR #2 items 1/2). The audit read this pool as "no eviction,
+    // hard-bounded per session" — stale: the LRU above recycles. What was genuinely silent is the
+    // PRESSURE. Recycling is not free (each one bumps g_texEpoch, forcing a re-resolve of every
+    // cached slot), and thrash — recycling a slot that was used THIS frame — means the working set
+    // does not fit and some texture is drawing white. That warning used to be a `static bool`:
+    // one line per session, then unbounded silence. Now counted and surfaced in the heartbeat.
+    std::uint64_t                             g_texRecycles = 0;    // LRU evictions, session total
+    std::uint64_t                             g_texThrashes = 0;    // recycled a slot used this frame
 
     // Per-frame draw list rides a 4-chunk (4MB) vec: ~61K DrawItemWire, well over the
     // host's kMaxDraws cap. Geometry vec stays 8 chunks (8MB).
@@ -1419,9 +1427,20 @@ namespace {
             for (std::uint32_t s = 1; s < cap; ++s) {
                 if (g_slotLastUsed[s] < best) { best = g_slotLastUsed[s]; lru = s; }
             }
+            ++g_texRecycles;
             if (best == g_frame) {
-                static bool warned = false;   // working set > capacity this frame: unavoidable thrash
-                if (!warned) { LOG::logline("!! [tex] working set exceeds %u client slots — thrashing (white)", cap); warned = true; }
+                // Working set > capacity THIS frame: unavoidable thrash, textures go white. Rate
+                // limited rather than once-per-session, so a scene that starts thrashing an hour
+                // in still says so — but carrying the running count, so the log can't flood.
+                ++g_texThrashes;
+                static std::uint32_t lastWarnFrame = 0;
+                if (g_frame - lastWarnFrame >= 600) {
+                    lastWarnFrame = g_frame;
+                    LOG::logline("!! [tex] working set exceeds %u client slots — thrashing (white)"
+                                 " [%llu thrashes / %llu recycles this session]",
+                                 cap, (unsigned long long)g_texThrashes,
+                                 (unsigned long long)g_texRecycles);
+                }
             }
             g_texSlot.erase(g_slotName[lru]);   // evict the recycled name
             slot = lru;
@@ -3669,6 +3688,30 @@ namespace RenderProcess {
                          g_hb.bTailScan / g_hb.n, g_hb.bTailAlpha / g_hb.n,
                          g_hb.bTailEnsure / g_hb.n,
                          (g_hb.bTailScan - g_hb.bTailEnsure) / g_hb.n);
+            // H2 texture-residency occupancy (external audit PR #2 items 1/2). slots= is how much
+            // of the client's bindless range is claimed; once it saturates every new texture costs
+            // an LRU recycle + a g_texEpoch bump (re-resolve of every cached slot), so a climbing
+            // recycles= is a real per-frame cost and not just bookkeeping. thrash= MUST stay 0 —
+            // non-zero means the frame's working set does not fit and textures are drawing white.
+            // Read the residency state under g_texResidencyMx — the worker mutates g_texSlot
+            // concurrently with main, and an unlocked .size() on a rehashing map is exactly the
+            // race that corrupted the heap once already (see the g_texResidencyMx comment).
+            {
+                std::size_t resident = 0;
+                std::uint32_t nextSlot = 0, epoch = 0;
+                std::uint64_t recycles = 0, thrashes = 0;
+                {
+                    std::lock_guard<std::mutex> lk(g_texResidencyMx);
+                    resident = g_texSlot.size();
+                    nextSlot = g_nextTexSlot;
+                    epoch    = g_texEpoch;
+                    recycles = g_texRecycles;
+                    thrashes = g_texThrashes;
+                }
+                LOG::logline(">> [hb] tex residency: slots=%u/%u resident=%zu | recycles=%llu thrash=%llu epoch=%u",
+                             nextSlot, IPC::kMaxTextures - IPC::kDlReserve, resident,
+                             (unsigned long long)recycles, (unsigned long long)thrashes, epoch);
+            }
             // Host phase split as the CLIENT received it (Tier 1 wire echo). Cross-check against
             // mgeHost64.log's `host split`/`gpu split`: matching numbers prove the x86/x64
             // HostFrameTimings layout agrees. gpuFrame is whole-command-buffer GPU EXECUTION —
