@@ -49,6 +49,19 @@ for _ in $(seq 1 20); do
   sleep 1
 done
 
+# Archive whatever is in the logs before launching. The host TRUNCATES mgeHost64.log at startup, so
+# a harness run silently destroys the log of whatever came before it — including a play session the
+# user has just reported a bug from. Cost is a file copy; the alternative is unreproducible evidence.
+ARCHIVE="/mnt/c/mgem/morrowind64/logarchive"
+mkdir -p "$ARCHIVE"
+stamp=$(date +%Y%m%d-%H%M%S)
+for f in "$LOG" /mnt/c/mgem/morrowind64/mgeXE.log; do
+  [ -s "$f" ] && cp "$f" "$ARCHIVE/$(basename "$f" .log)-$stamp.log" 2>/dev/null
+done
+# Keep the 20 most recent of each; these run to tens of MB.
+ls -1t "$ARCHIVE"/mgeHost64-*.log 2>/dev/null | tail -n +21 | xargs -r rm -f
+ls -1t "$ARCHIVE"/mgeXE-*.log     2>/dev/null | tail -n +21 | xargs -r rm -f
+
 startlines=0
 [ -f "$LOG" ] && startlines=$(wc -l < "$LOG")
 echo "[harness] start offset = $startlines lines; want $SAMPLES new 'gpu split' samples (timeout ${TIMEOUT}s)"
