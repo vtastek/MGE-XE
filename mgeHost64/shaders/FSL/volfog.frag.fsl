@@ -53,7 +53,9 @@ float4 PS_MAIN(VSOutput In)
 {
     INIT_MAIN;
 
-    if (gShadowParams.volFog1.z <= 0.5f) { RETURN(float4(0.0f, 0.0f, 0.0f, 1.0f)); }
+    // Every early-out emits ZERO coverage (0,0,0,0) — the output is premultiplied (rgb, coverage) and
+    // the blend is source-over, so alpha 1 here would mean "fully covered by fog" and wipe the frame.
+    if (gShadowParams.volFog1.z <= 0.5f) { RETURN(float4(0.0f, 0.0f, 0.0f, 0.0f)); }
 
     // TWO different normalisations of the same pixel, and mixing them up is a real trap here.
     // The host allocates every screen-sized RT at the render-scale CEILING (2x backbuffer) and draws
@@ -96,7 +98,7 @@ float4 PS_MAIN(VSOutput In)
         if (tWater > 0.0f) { dist = min(dist, tWater); }
     }
 
-    if (dist <= 0.0f) { RETURN(float4(0.0f, 0.0f, 0.0f, 1.0f)); }
+    if (dist <= 0.0f) { RETURN(float4(0.0f, 0.0f, 0.0f, 0.0f)); }   // zero coverage, see above
 
     int   steps = (int)max(gShadowParams.volFog1.y, 1.0f);
     float ds    = dist / float(steps);
@@ -190,11 +192,25 @@ float4 PS_MAIN(VSOutput In)
     // volFog3.x is Sunshafts' sunrayocclude. At 1.0 this reduces exactly to dst * transmittance —
     // the physically correct composite — so the knob only ever makes the fog LESS destructive than
     // physical, never more.
-    // inscatter already carries its own colour (haze vs shaft), so the only thing left to apply is
-    // the artistic tint + intensity. It used to be multiplied by sunCol HERE, which is what made even
-    // the pedestal sun-coloured.
+    // Output is PREMULTIPLIED (rgb, coverage) and the PSO blends standard source-over on BOTH
+    // channels: dst = src + dst*(1-src.a), for colour AND alpha.
+    //
+    // The alpha half is not optional, and leaving it out is what kept the horizon band bright. The
+    // host colour target clears to alpha 0 and the present seam composites premultiplied over MW:
+    //     MW = hostRGB + MW*(1 - hostA)
+    // so anywhere the host drew nothing — and nothing draws that band; the sky dome does not reach
+    // it, which is why tinting the host sky does not touch it — MW's own fog band shows through at
+    // full strength. Writing colour while PRESERVING dst alpha (the old blend) left hostA at 0 there,
+    // so the fog's in-scatter was added to MW with no occlusion at all, while the sky (hostA 1)
+    // composited properly and darkened. Same fog, two different composites, one frame.
+    // Emitting coverage makes the band occlude like everything else; where the host already drew,
+    // alpha is 1 and src.a + 1*(1-src.a) leaves it 1, so nothing else changes.
+    //
+    // Still SUBTRACTIVE in the Sunshafts.fx sense: volFog3.x is `sunrayocclude`, scaling how much of
+    // what is behind the fog gets removed before the fog's own colour is added. At 1.0 this is the
+    // exact dst*transmittance composite; below it the fog is less destructive, never more.
     float  coverage = 1.0f - transmittance;
     float  occlude  = saturate(gShadowParams.volFog3.x);
     float3 grade    = gShadowParams.volFog2.xyz * gShadowParams.volFog2.w;
-    RETURN(float4(inscatter * grade, saturate(1.0f - occlude * coverage)));
+    RETURN(float4(inscatter * grade, saturate(occlude * coverage)));
 }

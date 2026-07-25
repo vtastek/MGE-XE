@@ -4549,9 +4549,16 @@ namespace {
             }
 
             // VOLUMETRIC height fog: same fullscreen-triangle vert, same PerFrame set, but BLENDED
-            // rather than overwriting. The frag returns (inscatter, transmittance) and the blend is
-            //   dst = 1*src.rgb + src.a*dst
-            // which is the single-scattering composite over an already-shaded frame. Non-fatal.
+            // rather than overwriting. The frag returns PREMULTIPLIED (inscatter, coverage) and the
+            // blend is standard source-over on BOTH channels:
+            //   dst = src + dst*(1 - src.a)
+            // Alpha is NOT a throwaway here. The colour target clears to alpha 0 and the present seam
+            // composites premultiplied over MW (hostRGB + MW*(1-hostA)), so alpha is the coverage mask
+            // that decides whether MW shows through. An earlier version wrote colour but PRESERVED
+            // dst alpha, which meant that wherever the host drew nothing — the fog band above the
+            // horizon, which the sky dome does not reach — the fog's in-scatter was added straight
+            // onto MW's own band with zero occlusion, while the sky composited normally and darkened.
+            // Emitting coverage makes the fog occlude uniformly. Non-fatal.
             ShaderLoadDesc vfDesc = {};
             vfDesc.mVert.pFileName = "shadowatlasview.vert";
             vfDesc.mFrag.pFileName = "volfog.frag";
@@ -4561,13 +4568,11 @@ namespace {
                 vfBlend.mIndependentBlend = false;
                 vfBlend.mRenderTargetMask = BLEND_STATE_TARGET_0;
                 vfBlend.mSrcFactors[0]      = BC_ONE;
-                vfBlend.mDstFactors[0]      = BC_SRC_ALPHA;
+                vfBlend.mDstFactors[0]      = BC_ONE_MINUS_SRC_ALPHA;
                 vfBlend.mBlendModes[0]      = BM_ADD;
-                // Alpha channel: keep the destination's. The composited RT's alpha is not a coverage
-                // signal here, and letting the fog's transmittance leak into it would confuse the
-                // present-seam blit.
-                vfBlend.mSrcAlphaFactors[0] = BC_ZERO;
-                vfBlend.mDstAlphaFactors[0] = BC_ONE;
+                // Alpha: the SAME source-over, so the fog contributes coverage to the seam's mask.
+                vfBlend.mSrcAlphaFactors[0] = BC_ONE;
+                vfBlend.mDstAlphaFactors[0] = BC_ONE_MINUS_SRC_ALPHA;
                 vfBlend.mBlendAlphaModes[0] = BM_ADD;
                 vfBlend.mColorWriteMasks[0] = COLOR_MASK_ALL;
                 sag.pShaderProgram = g_live.pVolFogShader;

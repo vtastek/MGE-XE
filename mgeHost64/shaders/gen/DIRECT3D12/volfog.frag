@@ -1556,7 +1556,9 @@ float4 PS_MAIN(VSOutput In): SV_TARGET
 {
     //INIT_MAIN;
 
-    if (gShadowParams.volFog1.z <= 0.5f) { RETURN(float4(0.0f, 0.0f, 0.0f, 1.0f)); }
+
+
+    if (gShadowParams.volFog1.z <= 0.5f) { RETURN(float4(0.0f, 0.0f, 0.0f, 0.0f)); }
 
 
 
@@ -1599,7 +1601,7 @@ float4 PS_MAIN(VSOutput In): SV_TARGET
         if (tWater > 0.0f) { dist = min(dist, tWater); }
     }
 
-    if (dist <= 0.0f) { RETURN(float4(0.0f, 0.0f, 0.0f, 1.0f)); }
+    if (dist <= 0.0f) { RETURN(float4(0.0f, 0.0f, 0.0f, 0.0f)); }
 
     int steps = (int)max(gShadowParams.volFog1.y, 1.0f);
     float ds = dist / float(steps);
@@ -1681,10 +1683,10 @@ float4 PS_MAIN(VSOutput In): SV_TARGET
         }
         if (transmittance < 0.003f) { break; }
     }
-#line 196 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/volfog.frag.fsl"
+#line 212 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/volfog.frag.fsl"
     float coverage = 1.0f - transmittance;
     float occlude = saturate(gShadowParams.volFog3.x);
     float3 grade = gShadowParams.volFog2.xyz * gShadowParams.volFog2.w;
-    return (float4(inscatter * grade, saturate(1.0f - occlude * coverage)));
+    return (float4(inscatter * grade, saturate(occlude * coverage)));
 }
 #line 74 "FSL/shaders.list"
