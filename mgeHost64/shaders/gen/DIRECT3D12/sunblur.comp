@@ -974,7 +974,7 @@ SamplerState gSampler2xWrapClamp : register( s17 , space100 ) ;
 #line 11 "FSL/shaders.list"
 #line 249 "FSL/shaders.list"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/sunblur.comp.fsl"
-#line 24 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/sunblur.comp.fsl"
+#line 25 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/sunblur.comp.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/sunblur.srt.h"
 #line 11 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/sunblur.srt.h"
 STRUCT(SunBlurParams)
@@ -988,7 +988,7 @@ STRUCT(SunBlurParams)
         CBUFFER(SunBlurParams) gSunBlurParams :  register(b0,space1);
         Tex2D(float4) gSunBlurSrc :  register(t1,space1);
         WTex2D(float4) gSunBlurDst :  register(u2,space1);
-#line 25 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/sunblur.comp.fsl"
+#line 26 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/sunblur.comp.fsl"
 
 
 

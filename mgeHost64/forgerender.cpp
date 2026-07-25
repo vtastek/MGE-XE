@@ -1762,7 +1762,15 @@ namespace {
     // (no spread → hard, pixel-shaped edges). Because it is measured in texels, softness scales with
     // the ortho extent, so coarser texels are always hidden behind a proportionally wider penumbra.
     constexpr uint32_t kSunBlurRadius    = 4;      // MUST match SUN_BLUR_RADIUS (sunblur.comp.fsl)
-    float              g_sunShadowSoftness = 2.0f; // Gaussian sigma in texels; clamped to the radius
+    // Softness is specified in WORLD UNITS, not texels. Texel-relative softness sounds right (it
+    // hides coarse texels automatically) but it couples the two knobs the wrong way: widening the
+    // ortho extent then widens the penumbra in world terms too, and small casters' shadows dissolve
+    // — "extent melts the shadows". Converting world → texels per frame keeps the penumbra a fixed
+    // physical size as the extent changes. Floored at kSunBlurSigmaMin texels so blockiness is still
+    // covered at wide extents, capped at the tap radius.
+    float              g_sunShadowSoftness = 24.0f; // Gaussian sigma in WORLD units (0 = blur off)
+    constexpr float    kSunBlurSigmaMin    = 0.75f; // texels — below this the texel grid shows through
+    constexpr float    kSunSnapAnchor      = 4096.0f; // texel-snap reference anchor (world u); see buildSunOrthoVP
     constexpr float    kShadowNearZ      = 4.0f;   // face frustum near (world u); far = the light's 2·radius
     // How long a slot's lastWorld record stays a caster candidate after the item was last in
     // the client's visible set. Statics don't move so stale is correct; the window only bounds
@@ -1947,8 +1955,23 @@ namespace {
         const float texel = (2.0f * range) / (float)kSunShadowRes;
         float remX = 0.0f, remY = 0.0f;
         if (eyeAbs && texel > 0.0f) {
-            const float ex = eyeAbs[0]*xa[0] + eyeAbs[1]*xa[1] + eyeAbs[2]*xa[2];
-            const float ey = eyeAbs[0]*ya[0] + eyeAbs[1]*ya[1] + eyeAbs[2]*ya[2];
+            // The snap reference must be a COARSELY ANCHORED, near-camera position — never the raw
+            // absolute eye. MW's exterior eye sits ~100k units from the world origin, and the light
+            // basis (xa/ya) rotates a little every frame as the sun moves. dot(hugeVector, rotating
+            // axis) then swings several world units PER FRAME, while the map's actual content — which
+            // is measured relative to the eye, so at most `range` out — moves a small fraction of a
+            // texel. Snapping against the raw eye therefore INJECTS about an order of magnitude more
+            // motion than it cancels, and it shows up as shadows crawling under the sun's motion.
+            // Subtracting a cell-sized anchor bounds the dot product's operand, so the snap offset
+            // now drifts at the same rate as the content it is stabilising. The anchor is world-fixed
+            // (so the grid is world-fixed) and only changes when the camera crosses a kSunSnapAnchor
+            // boundary — a single sub-texel shift every 4096 units of travel, versus per-frame crawl.
+            const float ax = std::floor(eyeAbs[0] / kSunSnapAnchor) * kSunSnapAnchor;
+            const float ay = std::floor(eyeAbs[1] / kSunSnapAnchor) * kSunSnapAnchor;
+            const float az = std::floor(eyeAbs[2] / kSunSnapAnchor) * kSunSnapAnchor;
+            const float lx = eyeAbs[0] - ax, ly = eyeAbs[1] - ay, lz = eyeAbs[2] - az;
+            const float ex = lx*xa[0] + ly*xa[1] + lz*xa[2];
+            const float ey = lx*ya[0] + ly*ya[1] + lz*ya[2];
             remX = ex - std::floor(ex / texel) * texel;
             remY = ey - std::floor(ey / texel) * texel;
         }
@@ -6711,7 +6734,7 @@ namespace {
           t.sliderF("Sun shadow: ortho half-extent (world u)", &g_sunShadowRange, 1024.0f, 32768.0f, 256.0f);
           t.sliderF("Sun shadow: depth bias (normalised)", &g_sunShadowBias, 0.0f, 0.02f, 0.0002f, "%.4f");
           t.sliderF("Sun shadow: normal offset (world u; kills slope acne)", &g_sunShadowNormalOff, 0.0f, 64.0f, 1.0f);
-          t.sliderF("Sun shadow: SOFTNESS (blur sigma, texels; 0 = raw/hard)", &g_sunShadowSoftness, 0.0f, 4.0f, 0.25f);
+          t.sliderF("Sun shadow: SOFTNESS (penumbra, WORLD units; 0 = raw/hard)", &g_sunShadowSoftness, 0.0f, 128.0f, 2.0f);
           t.sliderF("Sun shadow: light-bleed reduction (higher = deeper/tighter)", &g_sunShadowLBR, 0.0f, 0.95f, 0.05f);
           t.flush(); }
 
@@ -16447,7 +16470,11 @@ namespace ForgeRender {
         if (!g_live.sunBlurReady || !g_live.pSunBlurPipeline || !g_live.pSunBlurSet) { return; }
         if (g_sunShadowSoftness <= 0.0f) { return; }   // 0 = raw map (the A/B against no blur)
 
-        const float sigma = std::min(g_sunShadowSoftness, (float)kSunBlurRadius);
+        // World → texels, so the penumbra keeps a fixed PHYSICAL size as the ortho extent changes
+        // (a texel-denominated sigma widens the penumbra with the extent and melts small casters).
+        const float texel = (2.0f * g_sunShadowRange) / (float)kSunShadowRes;
+        const float sigma = std::min(std::max(g_sunShadowSoftness / std::max(texel, 1e-3f),
+                                              kSunBlurSigmaMin), (float)kSunBlurRadius);
         for (uint32_t d = 0; d < 2; ++d) {
             float* p = (float*)g_live.pSunBlurParamsCbv[d]->pCpuMappedAddress;
             p[0] = sigma;

@@ -18,8 +18,9 @@
 // an affine map commutes with a normalised weighted average, so blurring packed == packing blurred.
 //
 // Separable: two dispatches (horizontal then vertical) over two instances of the same SRT set.
-// Sigma is in TEXELS, so softness automatically tracks texel size — a wider sun ortho extent gets a
-// proportionally wider penumbra and the coarser texels stay hidden.
+// Sigma arrives in TEXELS but the HOST derives it from a WORLD-unit penumbra knob (see
+// blurSunMoments), so widening the ortho extent does not widen the penumbra physically — a
+// texel-denominated softness melts small casters' shadows as the extent grows.
 
 #include "sunblur.srt.h"
 
