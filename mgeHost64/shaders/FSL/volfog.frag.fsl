@@ -114,20 +114,33 @@ float4 PS_MAIN(VSOutput In)
     float  eyeH    = gFrameData.lodEye.z;            // absolute world height of the camera
     float  ambient = gShadowParams.volFog1.w;
 
-    // DUAL-LOBE phase, evaluated once (directional light + fixed view dir ⇒ constant along the ray).
-    //   iso      — flat pedestal. THIS is the side/horizontal knob: it lifts fog at every angle
-    //              equally, so you can make the world foggier without the sun direction exploding.
-    //   forward  — the sun halo (g > 0). Its peak is ~1/(1-g)^2, so at g 0.72 it is already ~20x
-    //              isotropic; that steepness is precisely why a single lobe made density unusable.
-    //   backward — the anti-sun lift (g < 0), independent of the halo.
-    float  cosT    = dot(dir, -gFrameData.sunDir.xyz);
-    float  phase   = gShadowParams.volFog4.x
-                   + gShadowParams.volFog3.z * hgNorm(cosT, gShadowParams.volFog1.x)
-                   + gShadowParams.volFog3.w * hgNorm(cosT, gShadowParams.volFog3.y);
-    // Soft ceiling. A hard min() would draw a visible disc edge where the lobe hits the cap; this
-    // Reinhard knee asymptotes to `ceil` instead, so the halo saturates smoothly. ceil <= 0 = off.
+    // DUAL-LOBE phase, evaluated once (directional light + fixed view dir ⇒ constant along the ray),
+    // and split into TWO TERMS THAT ARE NOT THE SAME COLOUR — see the accumulation below.
+    //   iso   — flat pedestal, the side/horizontal knob: lifts fog at every angle equally, so the
+    //           world gets foggier without the sun direction exploding. Physically this stands in for
+    //           MULTIPLE scattering, which is exactly what MW's fog colour already represents.
+    //   lobes — forward HG (the sun halo; peak ~1/(1-g)^2, already ~20x isotropic at g 0.72, which is
+    //           why one lobe made density unusable) + backward HG (the anti-sun lift). SINGLE
+    //           scattering: directional, sun-coloured, and the only part that reads as a shaft.
+    float  cosT  = dot(dir, -gFrameData.sunDir.xyz);
+    float  iso   = gShadowParams.volFog4.x;
+    float  lobes = gShadowParams.volFog3.z * hgNorm(cosT, gShadowParams.volFog1.x)
+                 + gShadowParams.volFog3.w * hgNorm(cosT, gShadowParams.volFog3.y);
+    // Soft ceiling on the LOBES only — the pedestal is bounded by construction, the halo is what
+    // blows out. A hard min() would draw a visible disc edge where it clips; this Reinhard knee
+    // asymptotes to `ceil` instead, so the halo saturates smoothly. ceil <= 0 = off.
     float  phaseCeil = gShadowParams.volFog4.y;
-    if (phaseCeil > 0.0f) { phase = phase / (1.0f + phase / phaseCeil); }
+    if (phaseCeil > 0.0f) { lobes = lobes / (1.0f + lobes / phaseCeil); }
+
+    // The two colours. Getting this wrong is what made the horizon band light up: MW/the host already
+    // paint a fog-coloured band above the horizon, and neither the sky dome nor distant land writes
+    // depth (dlDepth.mDepthWrite = false), so every pixel of that band takes the full maxDist march at
+    // the flattest — hence densest — angle on screen. Painting that much SUN-coloured in-scatter over
+    // an already-fog-coloured band is a guaranteed bright stripe. Haze is fog-coloured by definition,
+    // so the pedestal + ambient floor paint fogColNear over fogColNear and cost nothing visually,
+    // while the lobes stay sun-coloured and remain the visible shafts.
+    float3 hazeCol  = gFrameData.fogColNear.rgb;
+    float3 shaftCol = gFrameData.sunCol.rgb;
 
     float3 inscatter    = float3(0.0f, 0.0f, 0.0f);
     float  transmittance = 1.0f;
@@ -147,7 +160,11 @@ float4 PS_MAIN(VSOutput In)
             // segment absorbs, so use (1 - exp(-sigma)) rather than sigma. At large steps the naive
             // form over-brightens badly, and this fog wants few steps.
             float seg    = 1.0f - exp(-sigma);
-            inscatter    += transmittance * seg * (sunVis * phase + ambient);
+            // Shafts are sun-coloured; haze is fog-coloured. The ambient floor is UNSHADOWED (it is
+            // the reason a shaft's shadow reads as dimmer fog rather than a black void), the pedestal
+            // is shadowed like the lobes — it is still sunlight, just multiply-scattered.
+            inscatter    += transmittance * seg
+                          * (sunVis * lobes * shaftCol + (sunVis * iso + ambient) * hazeCol);
             transmittance *= exp(-sigma);
         }
         if (transmittance < 0.003f) { break; }   // fully opaque; the rest cannot contribute
@@ -164,8 +181,11 @@ float4 PS_MAIN(VSOutput In)
     // volFog3.x is Sunshafts' sunrayocclude. At 1.0 this reduces exactly to dst * transmittance —
     // the physically correct composite — so the knob only ever makes the fog LESS destructive than
     // physical, never more.
+    // inscatter already carries its own colour (haze vs shaft), so the only thing left to apply is
+    // the artistic tint + intensity. It used to be multiplied by sunCol HERE, which is what made even
+    // the pedestal sun-coloured.
     float  coverage = 1.0f - transmittance;
     float  occlude  = saturate(gShadowParams.volFog3.x);
-    float3 fogCol   = gFrameData.sunCol.xyz * gShadowParams.volFog2.xyz * gShadowParams.volFog2.w;
-    RETURN(float4(inscatter * fogCol, saturate(1.0f - occlude * coverage)));
+    float3 grade    = gShadowParams.volFog2.xyz * gShadowParams.volFog2.w;
+    RETURN(float4(inscatter * grade, saturate(1.0f - occlude * coverage)));
 }

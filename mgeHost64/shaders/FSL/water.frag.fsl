@@ -62,7 +62,12 @@ float4 PS_MAIN( VSOutput In )
     //              reconstructWorld needs (invViewProj maps the viewport's NDC, not the allocation's).
     // Distortion offsets below are in PIXELS, so they scale by invAlloc alongside the uv they perturb
     // and stay one-pixel-per-unit at any render scale.
+    // NOT every sampled RT is alloc-sized, and assuming so detaches the reflection: pReflectColor is
+    // its OWN 1024² square drawn with a FULL viewport, so the whole screen maps to its whole 0..1 —
+    // that one wants the VIEWPORT-relative uv. gSceneLinDepth and gRefractColor are the alloc-sized
+    // ones. Check the RT's dimensions before picking a scale here.
     float2 invAlloc  = gShadowParams.screenAlloc.zw;
+    float2 invScreen = gShadowParams.screenParams.zw;   // pReflectColor (1024², full-viewport) only
     float2 texToVp   = gShadowParams.screenAlloc.xy * gShadowParams.screenParams.zw;
     float3 fogCol    = gFrameData.fogColNear.rgb;
 
@@ -135,7 +140,9 @@ float4 PS_MAIN( VSOutput In )
     // so sample it at THIS fragment's screen UV, distorted by the surface normal (MGE's 2.1x/abs
     // pattern). The RT is premultiplied (rgb·a) over a transparent clear, so composite it over the
     // fog colour by (1 - a) → un-drawn areas (below the reflected horizon, pre-DL) read fog, not black.
-    float2 reflUV = baseUV + float2(-2.1f * reffactor.x, abs(reffactor.y)) * invAlloc;
+    // VIEWPORT-relative, not alloc: see invScreen above — this RT is 1024², not screen-allocated.
+    float2 reflUV = In.Position.xy * invScreen
+                  + float2(-2.1f * reffactor.x, abs(reffactor.y)) * invScreen;
     float4 reflSample = SampleLvlTex2D(gReflectColor, gSamplerBilinearClamp, reflUV, 0.0f);
     float3 reflected = reflSample.rgb + fogCol * (1.0f - reflSample.a);
 	float3 deb = reflected;

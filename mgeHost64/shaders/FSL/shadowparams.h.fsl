@@ -113,7 +113,10 @@ STRUCT(ShadowMaskParams)
     //          w = ambient in-scatter floor 0..1 (fraction of the fog colour that lights shadowed
     //              steps — without it, shafts read as pure black voids rather than dimmer fog).
     DATA(float4,   volFog1,     None);
-    // volFog2: xyz = fog TINT multiplied into the sun colour, w = overall intensity.
+    // volFog2: xyz = fog TINT, w = overall intensity. Applied to the FINAL in-scatter, which already
+    //          carries its own colour: the lobes are sun-coloured (shafts), the isotropic pedestal and
+    //          the ambient floor are FOG-coloured (haze). Multiplying everything by the sun colour is
+    //          what made the horizon band light up over MW's own fog band.
     DATA(float4,   volFog2,     None);
     // volFog3: x = OCCLUDE amount 0..1 — how much of the underlying image the fog removes before its
     //              own colour is added (Sunshafts.fx `sunrayocclude`, 0.75 there). 1.0 == the

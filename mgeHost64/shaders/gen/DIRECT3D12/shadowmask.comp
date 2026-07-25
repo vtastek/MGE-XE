@@ -1044,6 +1044,9 @@ STRUCT(ShadowMaskParams)
 
     float4 volFog1;
 
+
+
+
     float4 volFog2;
 
 
@@ -1052,7 +1055,7 @@ STRUCT(ShadowMaskParams)
 
 
     float4 volFog3;
-#line 143 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
+#line 146 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
     float4 volFog4;
 
 
@@ -1062,7 +1065,7 @@ STRUCT(ShadowMaskParams)
 
 
     float4 screenAlloc;
-#line 152
+#line 155
 };
 #line 20 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowmask.srt.h"
 

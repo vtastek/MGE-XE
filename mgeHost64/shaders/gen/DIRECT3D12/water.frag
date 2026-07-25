@@ -1044,6 +1044,9 @@ STRUCT(ShadowMaskParams)
 
     float4 volFog1;
 
+
+
+
     float4 volFog2;
 
 
@@ -1052,7 +1055,7 @@ STRUCT(ShadowMaskParams)
 
 
     float4 volFog3;
-#line 143 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
+#line 146 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
     float4 volFog4;
 
 
@@ -1062,7 +1065,7 @@ STRUCT(ShadowMaskParams)
 
 
     float4 screenAlloc;
-#line 152
+#line 155
 };
 #line 21 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
 #line 35 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
@@ -1294,17 +1297,9 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
     bool underwater = P[1].w > 0.5f;
     float3 camFwd = P[2].xyz;
     uint waterDbg = (uint)(P[3].x + 0.5f);
-
-
-
-
-
-
-
-
-
-
+#line 69 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
     float2 invAlloc = gShadowParams.screenAlloc.zw;
+    float2 invScreen = gShadowParams.screenParams.zw;
     float2 texToVp = gShadowParams.screenAlloc.xy * gShadowParams.screenParams.zw;
     float3 fogCol = gFrameData.fogColNear.rgb;
 
@@ -1377,7 +1372,9 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
 
 
 
-    float2 reflUV = baseUV + float2(-2.1f * reffactor.x, abs(reffactor.y)) * invAlloc;
+
+    float2 reflUV = In.Position.xy * invScreen
+                  + float2(-2.1f * reffactor.x, abs(reffactor.y)) * invScreen;
     float4 reflSample = SampleLvlTex2D(gReflectColor, gSamplerBilinearClamp, reflUV, 0.0f);
     float3 reflected = reflSample.rgb + fogCol * (1.0f - reflSample.a);
 	float3 deb = reflected;

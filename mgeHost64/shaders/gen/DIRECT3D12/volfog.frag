@@ -1044,6 +1044,9 @@ STRUCT(ShadowMaskParams)
 
     float4 volFog1;
 
+
+
+
     float4 volFog2;
 
 
@@ -1052,7 +1055,7 @@ STRUCT(ShadowMaskParams)
 
 
     float4 volFog3;
-#line 143 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
+#line 146 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
     float4 volFog4;
 
 
@@ -1062,7 +1065,7 @@ STRUCT(ShadowMaskParams)
 
 
     float4 screenAlloc;
-#line 152
+#line 155
 };
 #line 21 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
 #line 35 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
@@ -1619,14 +1622,27 @@ float4 PS_MAIN(VSOutput In): SV_TARGET
 
 
 
+
+
     float cosT = dot(dir, -gFrameData.sunDir.xyz);
-    float phase = gShadowParams.volFog4.x
-                   + gShadowParams.volFog3.z * hgNorm(cosT, gShadowParams.volFog1.x)
-                   + gShadowParams.volFog3.w * hgNorm(cosT, gShadowParams.volFog3.y);
+    float iso = gShadowParams.volFog4.x;
+    float lobes = gShadowParams.volFog3.z * hgNorm(cosT, gShadowParams.volFog1.x)
+                 + gShadowParams.volFog3.w * hgNorm(cosT, gShadowParams.volFog3.y);
+
 
 
     float phaseCeil = gShadowParams.volFog4.y;
-    if (phaseCeil > 0.0f) { phase = phase / (1.0f + phase / phaseCeil); }
+    if (phaseCeil > 0.0f) { lobes = lobes / (1.0f + lobes / phaseCeil); }
+
+
+
+
+
+
+
+
+    float3 hazeCol = gFrameData.fogColNear.rgb;
+    float3 shaftCol = gFrameData.sunCol.rgb;
 
     float3 inscatter = float3(0.0f, 0.0f, 0.0f);
     float transmittance = 1.0f;
@@ -1646,15 +1662,19 @@ float4 PS_MAIN(VSOutput In): SV_TARGET
 
 
             float seg = 1.0f - exp(-sigma);
-            inscatter += transmittance * seg * (sunVis * phase + ambient);
+
+
+
+            inscatter += transmittance * seg
+                          * (sunVis * lobes * shaftCol + (sunVis * iso + ambient) * hazeCol);
             transmittance *= exp(-sigma);
         }
         if (transmittance < 0.003f) { break; }
     }
-#line 167 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/volfog.frag.fsl"
+#line 187 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/volfog.frag.fsl"
     float coverage = 1.0f - transmittance;
     float occlude = saturate(gShadowParams.volFog3.x);
-    float3 fogCol = gFrameData.sunCol.xyz * gShadowParams.volFog2.xyz * gShadowParams.volFog2.w;
-    return (float4(inscatter * fogCol, saturate(1.0f - occlude * coverage)));
+    float3 grade = gShadowParams.volFog2.xyz * gShadowParams.volFog2.w;
+    return (float4(inscatter * grade, saturate(1.0f - occlude * coverage)));
 }
 #line 74 "FSL/shaders.list"
