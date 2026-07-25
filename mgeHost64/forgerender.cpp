@@ -1794,7 +1794,6 @@ namespace {
     // covered at wide extents, capped at the tap radius.
     float              g_sunShadowSoftness = 24.0f; // Gaussian sigma in WORLD units (0 = blur off)
     constexpr float    kSunBlurSigmaMin    = 0.75f; // texels — below this the texel grid shows through
-    constexpr float    kSunSnapAnchor      = 4096.0f; // texel-snap reference anchor (world u); see buildSunOrthoVP
     constexpr float    kShadowNearZ      = 4.0f;   // face frustum near (world u); far = the light's 2·radius
     // How long a slot's lastWorld record stays a caster candidate after the item was last in
     // the client's visible set. Statics don't move so stale is correct; the window only bounds
@@ -1929,23 +1928,100 @@ namespace {
         return std::max(0.5f, 1.0f - 2.0f * kShadowFaceGutter / s);
     }
 
-    // SUN shadow: build the reverse-Z ORTHOGRAPHIC view-projection for the directional sun, in the
-    // SAME camera-relative space the live statics.vert projects (eye at origin). `sunDirWorld` = the
-    // world sun TRAVEL direction (gFrameData.sunDir.xyz); the sun "looks" down that axis. `range` =
-    // ortho half-extent perpendicular to the sun (the shadowed radius around the camera). Row/column
-    // layout matches buildShadowFaceVP: out16 row i = world-axis i's contribution to each clip lane;
-    // clip = worldPos * M (row vectors, mul(M,v) in-shader). Reverse-Z (near→1, far→0) so it matches
-    // CMP_GEQUAL, and the sunshadow frags store 1 - In.Position.z (depth grows away from the sun).
+    // The sun's orthonormal light basis: za = the sun's TRAVEL direction (the "view forward", down-sun),
+    // xa/ya the two axes PERPENDICULAR to it — the plane the shadow map is rasterised in, and the only
+    // two axes the texel snap touches (the depth axis is compared, never filtered). Shared by the VP
+    // build, the snap accumulator and the sun cull box so all three cannot disagree about the frame.
+    inline void sunLightBasis(const float* sunDirWorld, float* xa, float* ya, float* za) {
+        za[0] = sunDirWorld[0]; za[1] = sunDirWorld[1]; za[2] = sunDirWorld[2];
+        float zl = std::sqrt(za[0]*za[0] + za[1]*za[1] + za[2]*za[2]);
+        if (zl < 1e-6f) { za[0] = 0.0f; za[1] = 0.0f; za[2] = -1.0f; zl = 1.0f; }
+        za[0] /= zl; za[1] /= zl; za[2] /= zl;
+        // World up = MW Z-up, unless the sun is near-vertical (|za.z|→1); then use Y as the up ref.
+        float up[3];
+        if (std::fabs(za[2]) < 0.99f) { up[0] = 0.0f; up[1] = 0.0f; up[2] = 1.0f; }
+        else                          { up[0] = 0.0f; up[1] = 1.0f; up[2] = 0.0f; }
+        xa[0] = up[1]*za[2] - up[2]*za[1];                  // cross(up, za)
+        xa[1] = up[2]*za[0] - up[0]*za[2];
+        xa[2] = up[0]*za[1] - up[1]*za[0];
+        float xl = std::sqrt(xa[0]*xa[0] + xa[1]*xa[1] + xa[2]*xa[2]);
+        if (xl < 1e-6f) { xl = 1.0f; }
+        xa[0] /= xl; xa[1] /= xl; xa[2] /= xl;
+        ya[0] = za[1]*xa[2] - za[2]*xa[1];                  // cross(za, xa) (already unit)
+        ya[1] = za[2]*xa[0] - za[0]*xa[2];
+        ya[2] = za[0]*xa[1] - za[1]*xa[0];
+    }
+
+    // --- TEXEL SNAP: an ODOMETER, not an absolute-world grid ------------------------------------
+    // The map is camera-centred and rebuilt every frame, so without snapping every world point's
+    // texel address drifts sub-texel each frame and every shadow edge CRAWLS as you walk (the classic
+    // shadow "swim"). The fix is to quantise the map's origin to whole texels — but WHICH grid it is
+    // quantised to decides whether a MOVING SUN also crawls, and that is the subtle part:
     //
-    // TEXEL SNAPPING (`eyeAbs` = the ABSOLUTE world camera position, g_dlEye). The map is centred on
-    // the camera and rebuilt every frame, so without snapping every world point's shadow-map texel
-    // address drifts by a sub-texel amount each frame and every shadow edge CRAWLS as you walk —
-    // the classic shadow "swim". The fix is to quantise the map's origin to whole texels on a grid
-    // fixed in WORLD space: a world point then keeps the same texel until the camera has moved a
-    // full texel, and the edge steps once instead of shimmering continuously.
-    // Texel size = 2*range/kSunShadowRes, so the artefact scales with `range` — at range 1024 the
-    // texel is 1 world unit and the drift is invisible; at 8192 it is 8 units and unmissable. Only
-    // the two axes PERPENDICULAR to the sun are snapped; the depth axis is compared, not filtered.
+    //   A world-fixed light-space grid CANNOT be stable under a rotating light. Its lines sit at
+    //   dot(worldPos, xa) = k*texel, so their offset from the camera is dot(eye, xa) mod texel. MW's
+    //   exterior eye is ~100k units from the world origin, and xa rotates as the sun moves, so that
+    //   dot product swings ~2 world units PER FRAME — the grid slides bodily past the world, an
+    //   order of magnitude more motion than the camera-drift it was meant to cancel. Anchoring the
+    //   eye to a coarse cell (the previous fix) bounds the REMAINDER's operand but leaves an
+    //   unquantised dot(anchor, xa) in the origin, so the slide stays; the cascades merely made it
+    //   obvious by taking the near texel from 8 world units down to 2.
+    //
+    // So: track the CAMERA'S DISPLACEMENT instead of its absolute position. Each frame project the
+    // frame-to-frame delta onto the CURRENT light axes and accumulate; the snap offset is that
+    // accumulator's sub-texel remainder. The accumulator is an odometer of how far the camera has
+    // travelled along the light axes, and it does not contain the camera's absolute position at all.
+    //   - Sun rotates, camera still  -> delta is zero, the accumulator does not move, the grid is
+    //     rigidly attached to the camera and simply rotates with the sun. NO crawl.
+    //   - Camera moves               -> the accumulator tracks it, and the remainder quantises it, so
+    //     the map steps in whole texels exactly as before. Still world-fixed, to first order over any
+    //     interval short enough that the light basis is effectively constant.
+    // Long-run basis rotation makes the grid slowly skew rather than slide — invisible, and the price
+    // of the trade. Wrapped to kSunSnapWrap so a long session cannot lose float precision.
+    double g_sunSnapAccX = 0.0, g_sunSnapAccY = 0.0;
+    float  g_sunSnapPrevEye[3] = { 0.0f, 0.0f, 0.0f };
+    bool   g_sunSnapHasPrev = false;
+    constexpr double kSunSnapWrap  = 65536.0;   // odometer wrap (world u); divisible by usual texels
+    constexpr float  kSunSnapJumpU = 4096.0f;   // > this in one frame = teleport/cell shift, not travel
+
+    void updateSunSnapAccumulator(const float* eyeAbs, const float* xa, const float* ya) {
+        if (!eyeAbs) { return; }
+        if (g_sunSnapHasPrev) {
+            const float dx = eyeAbs[0] - g_sunSnapPrevEye[0];
+            const float dy = eyeAbs[1] - g_sunSnapPrevEye[1];
+            const float dz = eyeAbs[2] - g_sunSnapPrevEye[2];
+            // A teleport / DL origin shift is not travel; accumulating it would scramble the phase for
+            // no benefit (the whole scene changed anyway). Re-base and carry on.
+            if (std::fabs(dx) < kSunSnapJumpU && std::fabs(dy) < kSunSnapJumpU && std::fabs(dz) < kSunSnapJumpU) {
+                g_sunSnapAccX += (double)(dx*xa[0] + dy*xa[1] + dz*xa[2]);
+                g_sunSnapAccY += (double)(dx*ya[0] + dy*ya[1] + dz*ya[2]);
+                g_sunSnapAccX -= kSunSnapWrap * std::floor(g_sunSnapAccX / kSunSnapWrap);
+                g_sunSnapAccY -= kSunSnapWrap * std::floor(g_sunSnapAccY / kSunSnapWrap);
+            }
+        }
+        g_sunSnapPrevEye[0] = eyeAbs[0];
+        g_sunSnapPrevEye[1] = eyeAbs[1];
+        g_sunSnapPrevEye[2] = eyeAbs[2];
+        g_sunSnapHasPrev = true;
+    }
+
+    // This cascade's sub-texel snap offset. floor() (not fmod) so a negative odometer lands on the
+    // same grid — MW's west/south travel goes negative and fmod would mirror the grid about zero.
+    inline float sunSnapOffset(double acc, float texel) {
+        if (texel <= 0.0f) { return 0.0f; }
+        return (float)(acc - (double)texel * std::floor(acc / (double)texel));
+    }
+
+    // SUN shadow: build the reverse-Z ORTHOGRAPHIC view-projection for the directional sun, in the
+    // SAME camera-relative space the live statics.vert projects (eye at origin). `xa/ya/za` = the
+    // light basis from sunLightBasis; `range` = ortho half-extent perpendicular to the sun (the
+    // shadowed radius around the camera); `snapX/snapY` = this cascade's sub-texel offsets, which
+    // shift the map's origin onto the snap grid:
+    //   clip.x = (dot(p,xa) + snapX) * invR  ⇒  clip.x == 0 at a quantised point on the odometer grid.
+    // Row/column layout matches buildShadowFaceVP: out16 row i = world-axis i's contribution to each
+    // clip lane; clip = worldPos * M (row vectors, mul(M,v) in-shader). Reverse-Z (near→1, far→0) so
+    // it matches CMP_GEQUAL, and the sunshadow frags store 1 - In.Position.z (depth grows away from
+    // the sun).
     //
     // CASCADES: `range` is THIS cascade's half-extent and `depthHalf` is SHARED by all of them (the
     // outermost cascade's slab). Sharing the depth axis is what keeps one bias knob valid everywhere
@@ -1960,60 +2036,13 @@ namespace {
         return near0 * std::pow(far0 / near0, t);
     }
 
-    void buildSunOrthoVP(const float* sunDirWorld, float range, float depthHalf,
-                         const float* eyeAbs, float* out16) {
-        float za[3] = { sunDirWorld[0], sunDirWorld[1], sunDirWorld[2] };   // view forward = down-sun
-        float zl = std::sqrt(za[0]*za[0] + za[1]*za[1] + za[2]*za[2]);
-        if (zl < 1e-6f) { za[0] = 0.0f; za[1] = 0.0f; za[2] = -1.0f; zl = 1.0f; }
-        za[0] /= zl; za[1] /= zl; za[2] /= zl;
-        // World up = MW Z-up, unless the sun is near-vertical (|za.z|→1); then use Y as the up ref.
-        float up[3];
-        if (std::fabs(za[2]) < 0.99f) { up[0] = 0.0f; up[1] = 0.0f; up[2] = 1.0f; }
-        else                          { up[0] = 0.0f; up[1] = 1.0f; up[2] = 0.0f; }
-        float xa[3] = { up[1]*za[2] - up[2]*za[1],          // cross(up, za)
-                        up[2]*za[0] - up[0]*za[2],
-                        up[0]*za[1] - up[1]*za[0] };
-        float xl = std::sqrt(xa[0]*xa[0] + xa[1]*xa[1] + xa[2]*xa[2]);
-        if (xl < 1e-6f) { xl = 1.0f; }
-        xa[0] /= xl; xa[1] /= xl; xa[2] /= xl;
-        float ya[3] = { za[1]*xa[2] - za[2]*xa[1],          // cross(za, xa) (already unit)
-                        za[2]*xa[0] - za[0]*xa[2],
-                        za[0]*xa[1] - za[1]*xa[0] };
+    void buildSunOrthoVP(const float* xa, const float* ya, const float* za,
+                         float range, float depthHalf, float snapX, float snapY, float* out16) {
         const float invR  = 1.0f / range;
         const float invDz = -1.0f / (2.0f * depthHalf);     // reverse-Z ortho z scale
         float V[4][3];
         for (int i = 0; i < 3; ++i) { V[i][0] = xa[i]; V[i][1] = ya[i]; V[i][2] = za[i]; }
-        // Texel snap. Shader space is camera-relative (p = worldPos - eye), so the map's world origin
-        // sits at the eye's light-space coords; shifting by the SUB-TEXEL remainder of those coords
-        // pulls the origin back onto the world-fixed texel grid:
-        //   clip.x = (dot(p,xa) + remX) * invR  ⇒  clip.x == 0 at dot(worldPos,xa) = ex - remX,
-        // which is an exact multiple of the texel size. floor() (not fmod) so negative world coords
-        // land on the same grid — MW's west/south cells are negative and would otherwise snap to a
-        // mirrored grid, putting a seam through the origin.
-        const float texel = (2.0f * range) / (float)kSunShadowRes;
-        float remX = 0.0f, remY = 0.0f;
-        if (eyeAbs && texel > 0.0f) {
-            // The snap reference must be a COARSELY ANCHORED, near-camera position — never the raw
-            // absolute eye. MW's exterior eye sits ~100k units from the world origin, and the light
-            // basis (xa/ya) rotates a little every frame as the sun moves. dot(hugeVector, rotating
-            // axis) then swings several world units PER FRAME, while the map's actual content — which
-            // is measured relative to the eye, so at most `range` out — moves a small fraction of a
-            // texel. Snapping against the raw eye therefore INJECTS about an order of magnitude more
-            // motion than it cancels, and it shows up as shadows crawling under the sun's motion.
-            // Subtracting a cell-sized anchor bounds the dot product's operand, so the snap offset
-            // now drifts at the same rate as the content it is stabilising. The anchor is world-fixed
-            // (so the grid is world-fixed) and only changes when the camera crosses a kSunSnapAnchor
-            // boundary — a single sub-texel shift every 4096 units of travel, versus per-frame crawl.
-            const float ax = std::floor(eyeAbs[0] / kSunSnapAnchor) * kSunSnapAnchor;
-            const float ay = std::floor(eyeAbs[1] / kSunSnapAnchor) * kSunSnapAnchor;
-            const float az = std::floor(eyeAbs[2] / kSunSnapAnchor) * kSunSnapAnchor;
-            const float lx = eyeAbs[0] - ax, ly = eyeAbs[1] - ay, lz = eyeAbs[2] - az;
-            const float ex = lx*xa[0] + ly*xa[1] + lz*xa[2];
-            const float ey = lx*ya[0] + ly*ya[1] + lz*ya[2];
-            remX = ex - std::floor(ex / texel) * texel;
-            remY = ey - std::floor(ey / texel) * texel;
-        }
-        V[3][0] = remX; V[3][1] = remY; V[3][2] = 0.0f;     // eye at origin + sub-texel snap offset
+        V[3][0] = snapX; V[3][1] = snapY; V[3][2] = 0.0f;   // eye at origin + sub-texel snap offset
         for (int i = 0; i < 4; ++i) {
             out16[i*4 + 0] = V[i][0] * invR;
             out16[i*4 + 1] = V[i][1] * invR;
@@ -16425,17 +16454,10 @@ namespace ForgeRender {
         std::memcpy(sp, cam, 240);
 
         const float* mfd = (const float*)g_live.pFrameCbv->pCpuMappedAddress;
-        float za[3] = { mfd[16], mfd[17], mfd[18] };   // sun travel dir (view forward)
-        float zl = std::sqrt(za[0]*za[0] + za[1]*za[1] + za[2]*za[2]);
-        if (zl < 1e-6f) { za[0] = 0.0f; za[1] = 0.0f; za[2] = -1.0f; zl = 1.0f; }
-        za[0] /= zl; za[1] /= zl; za[2] /= zl;
-        float up[3];
-        if (std::fabs(za[2]) < 0.99f) { up[0] = 0.0f; up[1] = 0.0f; up[2] = 1.0f; }
-        else                          { up[0] = 0.0f; up[1] = 1.0f; up[2] = 0.0f; }
-        float xa[3] = { up[1]*za[2] - up[2]*za[1], up[2]*za[0] - up[0]*za[2], up[0]*za[1] - up[1]*za[0] };
-        float xl = std::sqrt(xa[0]*xa[0] + xa[1]*xa[1] + xa[2]*xa[2]); if (xl < 1e-6f) { xl = 1.0f; }
-        xa[0] /= xl; xa[1] /= xl; xa[2] /= xl;
-        float ya[3] = { za[1]*xa[2] - za[2]*xa[1], za[2]*xa[0] - za[0]*xa[2], za[0]*xa[1] - za[1]*xa[0] };
+        float xa[3], ya[3], za[3];
+        sunLightBasis(&mfd[16], xa, ya, za);
+        // The cull box is the OUTERMOST cascade's (the inner ones are concentric subsets of it) and
+        // uses the shared depth slab, so one cull feeds every cascade.
         const float range = g_sunShadowRange, depthHalf = 2.0f * g_sunShadowRange;
         // Gribb-Hartmann planes, camera-relative (tested as pl·(pos−eye) ≥ −effR). Box faces:
         // inside == extent − dot(c,axis) ≥ 0 and dot(c,axis) + extent ≥ 0.
@@ -16606,14 +16628,21 @@ namespace ForgeRender {
         float sunVP[16 * kSunCascades];
         float cascadeTexel[kSunCascades];
         const float depthHalf = 2.0f * g_sunShadowRange;
+        float xa[3], ya[3], za[3];
+        sunLightBasis(&mfd[16], xa, ya, za);
+        // ONE odometer step per frame, before any cascade uses it. g_dlEye = the ABSOLUTE world camera
+        // position (the DL shift origin); only its frame-to-frame DELTA enters the snap — see the
+        // accumulator's comment for why the absolute position must not.
+        updateSunSnapAccumulator(g_dlEye, xa, ya);
         for (uint32_t c = 0; c < kSunCascades; ++c) {
             const float ext = sunCascadeExtent(c);
-            // g_dlEye = the ABSOLUTE world camera position (the DL shift origin) — the texel-snap grid
-            // is anchored in world space, so the snap needs the real eye, not the camera-relative zero.
-            // Each cascade snaps to its OWN texel grid; they differ in size, so one shared snap would
-            // leave the finer cascades drifting.
-            buildSunOrthoVP(&mfd[16], ext, depthHalf, g_dlEye, sunVP + 16 * c);
             cascadeTexel[c] = (2.0f * ext) / (float)kSunShadowRes;
+            // Each cascade snaps to its OWN texel grid — they differ in size, so one shared offset
+            // would leave the finer cascades drifting.
+            buildSunOrthoVP(xa, ya, za, ext, depthHalf,
+                            sunSnapOffset(g_sunSnapAccX, cascadeTexel[c]),
+                            sunSnapOffset(g_sunSnapAccY, cascadeTexel[c]),
+                            sunVP + 16 * c);
             std::memcpy(g_live.pSunFrameCbv[c]->pCpuMappedAddress, mfd, kFrameDataBytes);
             std::memcpy(g_live.pSunFrameCbv[c]->pCpuMappedAddress, sunVP + 16 * c, 16 * sizeof(float));
         }
