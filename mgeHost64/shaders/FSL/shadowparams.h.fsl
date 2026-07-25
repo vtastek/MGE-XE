@@ -49,8 +49,9 @@ STRUCT(ShadowMaskParams)
     //                whole feature A/Bs from one float; also the "no map this frame" signal),
     //            y = depth bias in NORMALISED sun-depth units (the ortho depth span is 4*range world
     //                units, so bias_world = y * 4 * g_sunShadowRange),
-    //            z = light-bleeding reduction 0..0.95 (crushes the low end of the reconstructed
-    //                occlusion, killing MSM's residual quantisation haze),
+    //            z = light-bleeding reduction 0..0.95 (AMPLIFIES the reconstructed occlusion by
+    //                1/(1-z) so an under-reported shadow core saturates to fully occluded; higher =
+    //                deeper, tighter shadows. Raising it must never LIGHTEN a shadow — see msmrecv),
     //            w = NORMAL-OFFSET in world units (the receiver samples from worldPos + N*w — the
     //                cheap slope-acne fix that costs no depth precision).
     DATA(float4,   sunParams,   None);

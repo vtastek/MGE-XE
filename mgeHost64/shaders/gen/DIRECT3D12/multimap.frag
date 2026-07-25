@@ -1020,8 +1020,9 @@ STRUCT(ShadowMaskParams)
 
 
 
+
     float4 sunParams;
-#line 57
+#line 58
 };
 #line 21 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
 #line 35 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
@@ -1320,8 +1321,15 @@ float sunShadowVisibility(float3 worldPosRel, float3 N)
     float occlusion = ComputeMSMShadowIntensity(moments, zf);
 
 
+
+
+
+
+
+
+
     float lbr = gShadowParams.sunParams.z;
-    occlusion = saturate((occlusion - lbr) / max(1.0f - lbr, 1.0e-4f));
+    occlusion = saturate(occlusion / max(1.0f - lbr, 1.0e-4f));
 
 
     float2 toEdge = min(uv, float2(1.0f, 1.0f) - uv);

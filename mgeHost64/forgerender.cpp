@@ -1745,7 +1745,7 @@ namespace {
     // early-outs to "fully lit" and the pass costs nothing but the caster draw.
     float              g_sunShadowStrength = 1.0f;   // 0 = sun shadows OFF, 1 = full
     float              g_sunShadowBias     = 0.0015f;// normalised sun-depth units (span = 4·range world u)
-    float              g_sunShadowLBR      = 0.25f;  // light-bleeding reduction (crush the low end)
+    float              g_sunShadowLBR      = 0.25f;  // light-bleeding reduction (amplify occlusion 1/(1-x))
     float              g_sunShadowNormalOff= 12.0f;  // normal-offset in world units (slope acne)
     constexpr float    kShadowNearZ      = 4.0f;   // face frustum near (world u); far = the light's 2·radius
     // How long a slot's lastWorld record stays a caster candidate after the item was last in
@@ -6626,7 +6626,7 @@ namespace {
           t.sliderF("Sun shadow: ortho half-extent (world u)", &g_sunShadowRange, 1024.0f, 32768.0f, 256.0f);
           t.sliderF("Sun shadow: depth bias (normalised)", &g_sunShadowBias, 0.0f, 0.02f, 0.0002f, "%.4f");
           t.sliderF("Sun shadow: normal offset (world u; kills slope acne)", &g_sunShadowNormalOff, 0.0f, 64.0f, 1.0f);
-          t.sliderF("Sun shadow: light-bleed reduction", &g_sunShadowLBR, 0.0f, 0.95f, 0.05f);
+          t.sliderF("Sun shadow: light-bleed reduction (higher = deeper/tighter)", &g_sunShadowLBR, 0.0f, 0.95f, 0.05f);
           t.flush(); }
 
         // -- Tab: Flicker (procedural light/shadow scintillation) --

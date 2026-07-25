@@ -109,9 +109,16 @@ float sunShadowVisibility(float3 worldPosRel, float3 N)
     float4 moments = UnpackMoments(packed);
     float  occlusion = ComputeMSMShadowIntensity(moments, zf);
 
-    // Light-bleeding reduction: crush the low end, where the reconstruction's residual haze lives.
+    // Light-bleeding reduction. "Light bleeding" is light leaking INTO a region that should be fully
+    // shadowed: the 3-point quadrature under-reports occlusion (returns e.g. 0.8 where the truth is
+    // 1.0), so shadow cores read washed out. The fix is to AMPLIFY occlusion so a nearly-occluded
+    // pixel saturates to fully occluded — the reference's `shadingFactor / bleedingReductionMultiplier`
+    // with multiplier = 1 - lbr. Raising lbr therefore DEEPENS shadows and removes bleed.
+    // (Crushing the low end instead — linstep(lbr,1,occlusion) — is the opposite operation: it erases
+    // partial occlusion, which washes shadows out and reads as MORE bleeding, not less.)
+    // Fully-lit pixels sit near 0 occlusion, so the amplification leaves them alone.
     float lbr = gShadowParams.sunParams.z;
-    occlusion = saturate((occlusion - lbr) / max(1.0f - lbr, 1.0e-4f));
+    occlusion = saturate(occlusion / max(1.0f - lbr, 1.0e-4f));
 
     // Ramp to lit across the outer border of the map instead of cutting at the box edge.
     float2 toEdge = min(uv, float2(1.0f, 1.0f) - uv);
