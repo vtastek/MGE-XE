@@ -5,8 +5,9 @@
 // shadowcaster) so the sun caster pass reuses the whole vertex + instancing path — only the frag
 // and the render target differ (COLOR moments here vs the point atlas's depth-only).
 //
-// Depth stored is In.Position.z DIRECTLY — our sun ortho pass is reverse-Z (near = 1, far = 0),
-// same convention the receiver reconstructs against (opaque/alpha frag calcSunShadow). MSM is a
+// Depth stored is 1 - In.Position.z: our sun ortho is reverse-Z (sun-facing plane = 1, far = 0), and
+// Algorithm 3 assumes a depth that GROWS away from the light, so the flip is what makes "occluder in
+// front of receiver" the shadowed case. msmrecv.h.fsl's receiver applies the identical flip. MSM is a
 // filterable representation: the map can be gaussian-blurred so the receiver gets soft, low-leak
 // shadows without the acne/peter-panning of raw depth-compare — which is exactly the "no artifacts,
 // no leaking" bar. Alpha cutout matches the caster (strict '<'); NO emissive carve — the carve
@@ -53,7 +54,7 @@ PsOut PS_MAIN( VSOutput In )
     float4 tex = sampleBase(In.TexIndex, In.ClampMode, In.Uv, useLowAF(In.AlphaRef, false));
     clip(tex.a < In.AlphaRef ? -1.0f : 1.0f);
 
-    float  d = In.Position.z;   // reverse-Z sun depth in [0,1]
+    float  d = 1.0f - In.Position.z;   // reverse-Z flipped: 0 at the sun, 1 at the far plane
     PsOut Out;
     Out.moments = PackMoments(float4(d, d*d, d*d*d, d*d*d*d));
     RETURN(Out);

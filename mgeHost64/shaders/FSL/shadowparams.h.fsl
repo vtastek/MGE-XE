@@ -37,4 +37,21 @@ STRUCT(ShadowMaskParams)
     // Per-slot flame state (flicker slots only). x = wobble amp gain, y = flame phase (rad),
     // z = the face-frustum uvScale this slot's tile was BAKED with (< 1 = wider than 90°), w = spare.
     DATA(float4,   slotFlick[MAX_SHADOW_SLOTS], None);
+    // --- SUN (directional) shadow, Phase B receiver (forge-sun-shadows.md) --------------------
+    // The sun MSM map's ortho view*proj, CAMERA-RELATIVE (eye at origin) — the same matrix the
+    // caster pass projected by, so every receiver reconstructs the identical mapping. It lives HERE
+    // rather than in FrameData because FrameData is exactly full at its 512B CBV, while this cbuffer
+    // (1664B of struct in a 2048B buffer) has room — and it is already bound into every PerFrame set
+    // AND the compute mask, so one write reaches all receivers. Same convention as gFrameData.viewProj:
+    // mul(M, worldPos) == D3DX row-vector worldPos*M.
+    DATA(float4x4, sunViewProj, None);
+    // sunParams: x = shadow STRENGTH 0..1 (0 = sun shadows OFF — the receiver's early-out, so the
+    //                whole feature A/Bs from one float; also the "no map this frame" signal),
+    //            y = depth bias in NORMALISED sun-depth units (the ortho depth span is 4*range world
+    //                units, so bias_world = y * 4 * g_sunShadowRange),
+    //            z = light-bleeding reduction 0..0.95 (crushes the low end of the reconstructed
+    //                occlusion, killing MSM's residual quantisation haze),
+    //            w = NORMAL-OFFSET in world units (the receiver samples from worldPos + N*w — the
+    //                cheap slope-acne fix that costs no depth precision).
+    DATA(float4,   sunParams,   None);
 };

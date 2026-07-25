@@ -1004,7 +1004,24 @@ STRUCT(ShadowMaskParams)
 
 
     float4 slotFlick[ 32 ];
-#line 40
+
+
+
+
+
+
+
+    float4x4 sunViewProj;
+
+
+
+
+
+
+
+
+    float4 sunParams;
+#line 57
 };
 #line 20 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowmask.srt.h"
 

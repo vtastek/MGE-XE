@@ -24,6 +24,7 @@ STRUCT(VSOutput)
     DATA(FLAT(uint),       Flags,       TEXCOORD3);
     DATA(float3,           WorldPos,    TEXCOORD4);
     DATA(float3,           WorldNormal, TEXCOORD5);
+    DATA(CENTROID(float3), SunLight,    TEXCOORD6);   // unused here; present to match statics.vert
 };
 
 STRUCT(PsOut)
@@ -44,7 +45,8 @@ PsOut PS_MAIN( VSOutput In )
         if (tex.a < (133.0f / 255.0f)) { discard; }
     }
 
-    float  d = In.Position.z;   // reverse-Z sun depth in [0,1]
+    // Depth GROWS away from the sun (the ortho is reverse-Z), matching msmrecv.h.fsl's receiver.
+    float  d = 1.0f - In.Position.z;
     PsOut Out;
     Out.moments = PackMoments(float4(d, d*d, d*d*d, d*d*d*d));
     RETURN(Out);

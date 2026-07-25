@@ -9,6 +9,7 @@
 // FFE tonemap because its FFE source did). Matching MGE's DL look means no inline tonemap here.
 
 #include "opaque.srt.h"
+#include "msmrecv.h.fsl"   // sunShadowVisibility() — MSM sun-shadow receiver
 
 // Static semi-HDR tonemap — byte-identical to opaque.frag::tonemap (XE FixedFuncEmu.fx). The near
 // path tonemaps its final lit colour; distant land historically did NOT (to match old MGE DL, which
@@ -49,8 +50,11 @@ float4 PS_MAIN( VSOutput In )
     float detail = SampleTex2D(gTextures[detailIdx], gSamplerAnisotropic, In.Uv * 333.0f).g + 0.5f;
     detail *= 0.5f * SampleTex2D(gTextures[detailIdx], gSamplerAnisotropic, In.Uv * 90.0f).g + 0.75f;
 
-    // Sun diffuse (to-sun = -sunDir) + distant-land ambient. Matches LandscapePS:93.
-    result *= gFrameData.sunCol.rgb * saturate(dot(-gFrameData.sunDir.xyz, normal)) + gFrameData.lodSunAmb.rgb;
+    // Sun diffuse (to-sun = -sunDir) + distant-land ambient. Matches LandscapePS:93, with the Phase-B
+    // MSM sun shadow attenuating the sun term only — this is where the statics caster set pays off
+    // visually: buildings/trees drop their shadow onto the ground. Ambient is never shadowed.
+    float sunVis = sunShadowVisibility(In.WorldPos, normal);
+    result *= gFrameData.sunCol.rgb * saturate(dot(-gFrameData.sunDir.xyz, normal)) * sunVis + gFrameData.lodSunAmb.rgb;
     result *= detail;
 
     // Phase C: baked DISTANT point lights. gLights is bound to the streamed baked set (camera-relative

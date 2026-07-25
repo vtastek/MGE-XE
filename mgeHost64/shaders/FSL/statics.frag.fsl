@@ -9,6 +9,7 @@
 // alpha-to-coverage StaticPS uses (calc_coverage); real A2C is a live-path (MSAA) refinement.
 
 #include "opaque.srt.h"
+#include "msmrecv.h.fsl"   // sunShadowVisibility() — MSM sun-shadow receiver
 
 // Static semi-HDR tonemap — byte-identical to opaque.frag / distantland.frag::tonemap (XE
 // FixedFuncEmu.fx). Applied to the final lit colour so the distant statics' point-light core rolls
@@ -34,6 +35,7 @@ STRUCT(VSOutput)
     DATA(FLAT(uint),       Flags,    TEXCOORD3);
     DATA(float3,           WorldPos, TEXCOORD4);
     DATA(float3,           WorldNormal, TEXCOORD5);   // Phase C: for the distant point-light loop
+    DATA(CENTROID(float3), SunLight, TEXCOORD6);      // Phase B: the shadowable sun half of the lighting
 };
 
 ROOT_SIGNATURE(DefaultRootSignature)
@@ -52,7 +54,12 @@ float4 PS_MAIN( VSOutput In )
         if (tex.a < (133.0f / 255.0f)) { discard; }
     }
 
-    float3 result = tex.rgb * In.Color.rgb;
+    // Sun shadows (Phase B): statics.vert split its per-vertex lighting into Color (ambient +
+    // emissive, never shadowed) and SunLight (the sun N.L term). Attenuating only the latter by the
+    // MSM visibility is what keeps a shadowed static sitting in ambient instead of going black —
+    // and vis == 1 reproduces the pre-split colour exactly.
+    float sunVis = sunShadowVisibility(In.WorldPos, normalize(In.WorldNormal));
+    float3 result = tex.rgb * (In.Color.rgb + In.SunLight * sunVis);
 
     // Phase C: baked DISTANT point lights (same camera-relative gLights set the distant land loops).
     // Statics carry their SUN+ambient per-vertex in Color; this ADDS point diffuse modulated by the

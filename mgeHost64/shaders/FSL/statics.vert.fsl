@@ -61,6 +61,11 @@ STRUCT(VSOutput)
     // Also emitted by statics_heroblend.vert (HERO_PASS=1, same body); statics_blend.frag declares
     // the matching field so both frag signatures stay byte-identical to this VSOutput.
     DATA(float3,           WorldNormal, TEXCOORD5);
+    // Sun shadows (forge-sun-shadows.md Phase B): the SUN half of the per-vertex lighting, split out
+    // of Color so the frag can multiply it by the MSM sun visibility. Color keeps ambient + emissive
+    // (never shadowed); Color + SunLight reproduces the pre-split value bit-for-bit when vis == 1.
+    // CENTROID for the same sliver-extrapolation reason as Color — it IS part of that lighting.
+    DATA(CENTROID(float3), SunLight, TEXCOORD6);
     // Real water reflection (WV2): below-water clip. Pass-all (0,0,0,1) in every non-reflect frame
     // cbuffer → Clip = 1 >= 0 (nothing clipped). Rasterizer system-value; no frag input, no PSO state.
     DATA(float,            Clip,     SV_ClipDistance0);
@@ -89,9 +94,14 @@ VSOutput VS_MAIN( VSInput In )
     float3 nWorld = n.x * In.W0.xyz + n.y * In.W1.xyz + n.z * In.W2.xyz;
     Out.WorldNormal = nWorld;   // Phase C: for the point-light Lambert in statics.frag (frag normalizes)
     float  emissive = In.Normal.w;
-    float3 light = gFrameData.sunCol.rgb * saturate(dot(nWorld, -gFrameData.sunDir.xyz))
-                 + gFrameData.lodSunAmb.rgb + emissive;
-    Out.Color = float4(In.Color.rgb * light, In.Color.a);
+    // Phase B split: the SUN term rides its own interpolator so statics.frag can attenuate it by the
+    // MSM sun visibility; ambient + emissive stay in Color (a shadow must never darken those). The
+    // sum Color.rgb + SunLight is identical to the old single `light` product, so vis == 1 is a
+    // byte-for-byte no-op against the pre-split image.
+    float3 ambient = gFrameData.lodSunAmb.rgb + emissive;
+    float3 sunlit  = gFrameData.sunCol.rgb * saturate(dot(nWorld, -gFrameData.sunDir.xyz));
+    Out.Color    = float4(In.Color.rgb * ambient, In.Color.a);
+    Out.SunLight = In.Color.rgb * sunlit;
 
     Out.TexIndex = (uint)(In.InstParams.x + 0.5f);
     Out.Flags    = (uint)(In.InstParams.y + 0.5f);

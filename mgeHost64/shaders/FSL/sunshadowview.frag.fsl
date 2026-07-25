@@ -7,6 +7,7 @@
 // there like the atlas views). Pure debug overlay: OVERWRITES the composited scene, alpha = 1.
 
 #include "opaque.srt.h"
+#include "msmrecv.h.fsl"   // UnpackMoments() — show the RAW depth, not the packed lane
 
 STRUCT(VSOutput)
 {
@@ -21,10 +22,12 @@ float4 PS_MAIN( VSOutput In )
     // Host draws this into a small SQUARE corner viewport (non-destructive overlay), so the map maps
     // straight from the fullscreen-triangle Uv — no aspect-fit needed. Uv > 1 is off-viewport.
     float2 mapUv = saturate(In.Uv);
-    float4 m = SampleLvlTex2D(gSunMoments, gSamplerAnisotropic, mapUv, 0);
-    // Packed first moment tracks caster depth non-linearly — enough to read silhouettes. A faint
-    // border tints empty (no-caster, m≈0) texels so the overlay's extent is always visible.
-    float v = saturate(m.x);
-    float3 rgb = (v < 0.002f) ? float3(0.03f, 0.05f, 0.10f) : float3(v, v, v);
+    float4 m = SampleLvlTex2D(gSunMoments, gSamplerBilinearClamp, mapUv, 0);
+    // Unpack to the RAW first moment = the caster's distance from the sun, 0 (at the sun) .. 1 (far
+    // plane) — the same quantity the receiver compares against, so this view IS the shadow test's
+    // input. Casters read dark on a white sky; texels the caster pass never touched hold the "far"
+    // clear (depth 1) and are tinted so the map's extent stays visible.
+    float v = saturate(UnpackMoments(m).x);
+    float3 rgb = (v > 0.999f) ? float3(0.03f, 0.05f, 0.10f) : float3(v, v, v);
     RETURN(float4(rgb, 1.0f));
 }

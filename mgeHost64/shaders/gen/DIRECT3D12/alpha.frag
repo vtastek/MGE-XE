@@ -1004,7 +1004,24 @@ STRUCT(ShadowMaskParams)
 
 
     float4 slotFlick[ 32 ];
-#line 40
+
+
+
+
+
+
+
+    float4x4 sunViewProj;
+
+
+
+
+
+
+
+
+    float4 sunParams;
+#line 57
 };
 #line 21 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
 #line 35 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
@@ -1221,6 +1238,98 @@ bool useLowAF(float alphaRef, bool alphaBlended)
     return (gFrameData.alphaParams.y > 0.5f) && (alphaBlended || (alphaRef > 0.0f));
 }
 #line 18 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/alpha.frag.fsl"
+#line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/msmrecv.h.fsl"
+#line 33 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/msmrecv.h.fsl"
+float4 UnpackMoments(float4 packedMoments)
+{
+    packedMoments -= float4(0.5f, 0.0f, 0.5f, 0.0f);
+
+    float4x4 inv = make_f4x4_row_elems(-1.0f/3.0f, 0.0f, sqrt(3.0f), 0.0f,
+                                        0.0f, 0.125f, 0.0f, 1.0f,
+                                       -0.75f, 0.0f, 0.75f * sqrt(3.0f), 0.0f,
+                                        0.0f, -1.125f, 0.0f, 1.0f);
+
+    float4 unpackedMoments = mul(inv, packedMoments);
+    return lerp(unpackedMoments, float4(0.0f, 0.63f, 0.0f, 0.63f),  6.0e-5f );
+}
+
+float3x3 msmInverse3x3(float3x3 A)
+{
+    float3x3 result;
+    float detA = dot(A[0], cross(A[1], A[2]));
+    float invDetA = 1.0f / detA;
+    result[0] = invDetA * cross(A[1], A[2]);
+    result[1] = invDetA * cross(A[2], A[0]);
+    result[2] = invDetA * cross(A[0], A[1]);
+    result = transpose(result);
+    return result;
+}
+
+
+float ComputeMSMShadowIntensity(float4 b, float zf)
+{
+
+    float3x3 B = float3x3(float3(1.0f, b.x, b.y),
+                          float3(b.x, b.y, b.z),
+                          float3(b.y, b.z, b.w));
+
+    float3 c = mul(msmInverse3x3(B), float3(1.0f, zf, zf*zf));
+
+
+    float discriminant = sqrt(max(c.y * c.y - 4.0f * c.z * c.x, 0.0f));
+
+    float z2 = (-c.y - discriminant) / (2.0f * c.z);
+    float z3 = (-c.y + discriminant) / (2.0f * c.z);
+
+    if (z3 < z2) { float temp = z2; z2 = z3; z3 = temp; }
+
+    float case2 = step(z2, zf) * step(zf, z3);
+    float case3 = step(z3, zf);
+
+    float result2 = (zf * z3 - b.x * (zf + z3) + b.y) / ((z3 - z2) * (zf - z2));
+    float result3 = 1.0f - (z2 * z3 - b.x * (z2 + z3) + b.y) / ((zf - z2) * (zf - z3));
+
+    return saturate(case2 * result2 + case3 * result3);
+}
+
+
+
+
+
+
+
+float sunShadowVisibility(float3 worldPosRel, float3 N)
+{
+    float strength = gShadowParams.sunParams.x;
+    if (strength <= 0.0f) { return 1.0f; }
+
+    float3 p = worldPosRel + N * gShadowParams.sunParams.w;
+    float4 posLS = mul(gShadowParams.sunViewProj, float4(p, 1.0f));
+
+
+    posLS.xyz /= posLS.w;
+
+    float2 uv = posLS.xy * float2(0.5f, -0.5f) + float2(0.5f, 0.5f);
+    if (uv.x <= 0.0f || uv.x >= 1.0f || uv.y <= 0.0f || uv.y >= 1.0f) { return 1.0f; }
+    if (posLS.z <= 0.0f || posLS.z >= 1.0f) { return 1.0f; }
+
+    float zf = (1.0f - posLS.z) - gShadowParams.sunParams.y;
+
+    float4 packed = SampleLvlTex2D(gSunMoments, gSamplerBilinearClamp, uv, 0);
+    float4 moments = UnpackMoments(packed);
+    float occlusion = ComputeMSMShadowIntensity(moments, zf);
+
+
+    float lbr = gShadowParams.sunParams.z;
+    occlusion = saturate((occlusion - lbr) / max(1.0f - lbr, 1.0e-4f));
+
+
+    float2 toEdge = min(uv, float2(1.0f, 1.0f) - uv);
+    float edge = saturate(min(toEdge.x, toEdge.y) /  0.03f );
+
+    return 1.0f - occlusion * strength * edge;
+}
+#line 19 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/alpha.frag.fsl"
 
 STRUCT(VSOutput)
 {
@@ -1238,7 +1347,7 @@ STRUCT(VSOutput)
     DATA(float3, WorldPos, TEXCOORD8);
     DATA(FLAT(uint), OverlayIndex,TEXCOORD9);
     DATA(FLAT(uint), ClampMode, TEXCOORD10);
-#line 35
+#line 36
 };
 
 
@@ -1298,7 +1407,12 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
 
 
     float ndl = saturate(sndl);
-    float3 d = gFrameData.sunCol.rgb * ndl;
+
+
+
+
+    float sunVis = sunShadowVisibility(In.WorldPos, N);
+    float3 d = gFrameData.sunCol.rgb * ndl * sunVis;
     float3 a = ((aoFlags & 4u) != 0u) ? float3(1.0f, 1.0f, 1.0f) : gFrameData.ambCol.rgb;
     if ((aoFlags & 1u) != 0u) { a *= aoSample.a; }
     a *= gFrameData.dbgScales.x;

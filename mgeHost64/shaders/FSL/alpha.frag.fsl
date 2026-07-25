@@ -15,6 +15,7 @@
 
 #include "opaque.srt.h"
 #include "texsample.h.fsl"   // sampleBase() — MW address mode + AF level
+#include "msmrecv.h.fsl"     // sunShadowVisibility() — MSM sun-shadow receiver
 
 STRUCT(VSOutput)
 {
@@ -91,7 +92,12 @@ float4 PS_MAIN( VSOutput In )
     // wrap term until real sun shadows land; two-sided POINT lighting (below) is unaffected because
     // it IS occluded by the point-light mask. (twoSidedLight still drives the point-light path.)
     float  ndl  = saturate(sndl);
-    float3 d = gFrameData.sunCol.rgb * ndl;
+    // Phase B: the sun term is now OCCLUDABLE — the MSM map is sampled from THIS fragment's own world
+    // position, which is the whole reason the receiver is in-frag rather than a screen-space mask:
+    // transparents never enter the depth buffer, so a mask could not shadow them at all. Restoring
+    // the two-sided/wrap sun on transparents is a separate visual call, not required by the shadow.
+    float  sunVis = sunShadowVisibility(In.WorldPos, N);
+    float3 d = gFrameData.sunCol.rgb * ndl * sunVis;
     float3 a = ((aoFlags & 4u) != 0u) ? float3(1.0f, 1.0f, 1.0f) : gFrameData.ambCol.rgb;
     if ((aoFlags & 1u) != 0u) { a *= aoSample.a; }
     a *= gFrameData.dbgScales.x;

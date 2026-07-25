@@ -9,6 +9,7 @@
 // distance-grayscale parity) is byte-identical to statics.frag.
 
 #include "opaque.srt.h"
+#include "msmrecv.h.fsl"   // sunShadowVisibility() — MSM sun-shadow receiver
 
 // MUST stay byte-identical to statics.vert.fsl's VSOutput (CENTROID modifiers included).
 STRUCT(VSOutput)
@@ -21,6 +22,7 @@ STRUCT(VSOutput)
     DATA(FLAT(uint),       Flags,    TEXCOORD3);
     DATA(float3,           WorldPos, TEXCOORD4);
     DATA(float3,           WorldNormal, TEXCOORD5);   // Phase C: unused here; matches statics.vert (HERO_PASS) VSOutput
+    DATA(CENTROID(float3), SunLight, TEXCOORD6);      // Phase B: the shadowable sun half of the lighting
 };
 
 ROOT_SIGNATURE(DefaultRootSignature)
@@ -31,7 +33,9 @@ float4 PS_MAIN( VSOutput In )
     uint layer  = In.TexIndex & 0xFFFFu;
     float4 tex = SampleTex2DArray(gStaticsArrays[bucket], gSamplerAnisotropic, float3(In.Uv, (float)layer));
 
-    float3 result = tex.rgb * In.Color.rgb;
+    // Sun shadows: Color carries ambient+emissive, SunLight the sun half (split in statics.vert).
+    float sunVis = sunShadowVisibility(In.WorldPos, normalize(In.WorldNormal));
+    float3 result = tex.rgb * (In.Color.rgb + In.SunLight * sunVis);
     result = lerp(gFrameData.fogColNear.rgb, result, In.Fog);
 
     // F12 distance grayscale parity (debugParams.x 1/2), matching statics.frag.

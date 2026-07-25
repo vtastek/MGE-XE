@@ -1,0 +1,123 @@
+// mgeHost64 — Moment Shadow Map RECEIVER (forge-sun-shadows.md, Phase B).
+//
+// The analytic inverse of msmpack.h.fsl's PackMoments plus the Hamburger-4MSM reconstruction from
+// Peters & Klein, "Moment Shadow Mapping" (I3D 2015), Algorithm 3 — ported verbatim from The-Forge
+// 09_LightShadowPlayground/visibilityBufferShade.frag.fsl so the caster/receiver pair stays exactly
+// the reference pair. Given the four moments of the caster-depth distribution in a texel, it answers
+// "what fraction of that distribution lies IN FRONT of this receiver" — a smooth, filterable,
+// low-leak occlusion estimate. That is the whole point of MSM here: the map can be bilinearly
+// filtered (and later blurred / MSAA'd) like a colour texture, so we get soft edges with no PCF tap
+// storm and none of VSM's light leaking.
+//
+// DEPTH CONVENTION (must match the casters): the sun ortho is reverse-Z, so device z is 1 at the
+// sun-facing plane and 0 at the far plane. Both the caster (sunshadow*.frag) and this receiver use
+//     depth = 1 - deviceZ
+// which INCREASES with distance from the sun — the orientation Algorithm 3 assumes ("an occluder is
+// at smaller depth than the shadowed receiver"). Feeding it raw reverse-Z inverts the test.
+//
+// Requires (include AFTER opaque.srt.h): gSunMoments (PerFrame) + gShadowParams.sunViewProj/sunParams.
+
+#ifndef MSM_RECV_H
+#define MSM_RECV_H
+
+// Moment-quantisation slack. The reconstruction inverts a 3x3 Hankel matrix built from the moments;
+// a texel holding a single Dirac (one flat caster, or the "no caster" clear) makes that matrix
+// singular. Biasing every unpacked moment vector a hair toward the moments of a uniform-ish
+// distribution regularises it — standard MSM practice, and it costs a sliver of contact hardness.
+#define MSM_ROUNDING_CORRECTION 6.0e-5f
+
+// Fraction of the map's uv extent over which shadowing fades to fully lit at the border, so leaving
+// the sun ortho box is a ramp instead of a visible straight line across the world.
+#define MSM_EDGE_FADE 0.03f
+
+float4 UnpackMoments(float4 packedMoments)
+{
+    packedMoments -= float4(0.5f, 0.0f, 0.5f, 0.0f);
+
+    float4x4 inv = make_f4x4_row_elems(-1.0f/3.0f, 0.0f,   sqrt(3.0f),         0.0f,
+                                        0.0f,      0.125f, 0.0f,               1.0f,
+                                       -0.75f,     0.0f,   0.75f * sqrt(3.0f), 0.0f,
+                                        0.0f,     -1.125f, 0.0f,               1.0f);
+
+    float4 unpackedMoments = mul(inv, packedMoments);
+    return lerp(unpackedMoments, float4(0.0f, 0.63f, 0.0f, 0.63f), MSM_ROUNDING_CORRECTION);
+}
+
+float3x3 msmInverse3x3(float3x3 A)
+{
+    float3x3 result;
+    float detA = dot(A[0], cross(A[1], A[2]));
+    float invDetA = 1.0f / detA;
+    result[0] = invDetA * cross(A[1], A[2]);
+    result[1] = invDetA * cross(A[2], A[0]);
+    result[2] = invDetA * cross(A[0], A[1]);
+    result = transpose(result);
+    return result;
+}
+
+// Returns 0 = fully lit .. 1 = fully shadowed, for a receiver at depth zf given moments b.
+float ComputeMSMShadowIntensity(float4 b, float zf)
+{
+    // https://momentsingraphics.de/Media/I3D2015/MomentShadowMapping.pdf, Page 6, Algorithm 3.
+    float3x3 B = float3x3(float3(1.0f, b.x, b.y),
+                          float3(b.x,  b.y, b.z),
+                          float3(b.y,  b.z, b.w));
+
+    float3 c = mul(msmInverse3x3(B), float3(1.0f, zf, zf*zf));
+
+    // Solve c.z*z^2 + c.y*z + c.x = 0 for the two depths the 3-point quadrature places mass at.
+    float discriminant = sqrt(max(c.y * c.y - 4.0f * c.z * c.x, 0.0f));
+
+    float z2 = (-c.y - discriminant) / (2.0f * c.z);
+    float z3 = (-c.y + discriminant) / (2.0f * c.z);
+
+    if (z3 < z2) { float temp = z2; z2 = z3; z3 = temp; }
+
+    float case2 = step(z2, zf) * step(zf, z3);
+    float case3 = step(z3, zf);
+
+    float result2 =        (zf * z3 - b.x * (zf + z3) + b.y) / ((z3 - z2) * (zf - z2));
+    float result3 = 1.0f - (z2 * z3 - b.x * (z2 + z3) + b.y) / ((zf - z2) * (zf - z3));
+
+    return saturate(case2 * result2 + case3 * result3);
+}
+
+// THE receiver entry point. worldPosRel = the fragment's CAMERA-RELATIVE world position (what every
+// Forge frag already interpolates); N = its world normal (for the normal-offset bias — pass the same
+// normal the sun N.L uses). Returns sun visibility: 1 = lit, 0 = fully shadowed.
+//
+// Everything early-outs to 1.0 (fully lit, zero cost beyond the branch) when the feature is off or
+// the fragment falls outside the map — so a fragment the sun map never covered is never darkened.
+float sunShadowVisibility(float3 worldPosRel, float3 N)
+{
+    float strength = gShadowParams.sunParams.x;
+    if (strength <= 0.0f) { return 1.0f; }
+
+    float3 p = worldPosRel + N * gShadowParams.sunParams.w;   // normal-offset (slope acne)
+    float4 posLS = mul(gShadowParams.sunViewProj, float4(p, 1.0f));
+    // The sun projection is ORTHOgraphic, so w is exactly 1 — the divide is kept only so a future
+    // perspective cascade drops in unchanged.
+    posLS.xyz /= posLS.w;
+
+    float2 uv = posLS.xy * float2(0.5f, -0.5f) + float2(0.5f, 0.5f);
+    if (uv.x <= 0.0f || uv.x >= 1.0f || uv.y <= 0.0f || uv.y >= 1.0f) { return 1.0f; }
+    if (posLS.z <= 0.0f || posLS.z >= 1.0f) { return 1.0f; }   // outside the ortho depth slab
+
+    float zf = (1.0f - posLS.z) - gShadowParams.sunParams.y;   // depth grows away from the sun
+
+    float4 packed = SampleLvlTex2D(gSunMoments, gSamplerBilinearClamp, uv, 0);
+    float4 moments = UnpackMoments(packed);
+    float  occlusion = ComputeMSMShadowIntensity(moments, zf);
+
+    // Light-bleeding reduction: crush the low end, where the reconstruction's residual haze lives.
+    float lbr = gShadowParams.sunParams.z;
+    occlusion = saturate((occlusion - lbr) / max(1.0f - lbr, 1.0e-4f));
+
+    // Ramp to lit across the outer border of the map instead of cutting at the box edge.
+    float2 toEdge = min(uv, float2(1.0f, 1.0f) - uv);
+    float  edge   = saturate(min(toEdge.x, toEdge.y) / MSM_EDGE_FADE);
+
+    return 1.0f - occlusion * strength * edge;
+}
+
+#endif // MSM_RECV_H

@@ -1740,6 +1740,13 @@ namespace {
     constexpr uint32_t kSunShadowRes     = 2048;   // moments map resolution (single cascade, v1)
     float              g_sunShadowRange  = 8192.0f;// camera-relative ortho half-extent (one MW cell; live knob)
     bool               g_drawSunShadow   = true;   // Phase A: render the sun caster pass (F12 13 to view)
+    // Phase B receiver knobs — published each frame into gShadowParams.sunParams (see
+    // shadowparams.h.fsl / msmrecv.h.fsl). Strength 0 is the whole feature's A/B: every receiver
+    // early-outs to "fully lit" and the pass costs nothing but the caster draw.
+    float              g_sunShadowStrength = 1.0f;   // 0 = sun shadows OFF, 1 = full
+    float              g_sunShadowBias     = 0.0015f;// normalised sun-depth units (span = 4·range world u)
+    float              g_sunShadowLBR      = 0.25f;  // light-bleeding reduction (crush the low end)
+    float              g_sunShadowNormalOff= 12.0f;  // normal-offset in world units (slope acne)
     constexpr float    kShadowNearZ      = 4.0f;   // face frustum near (world u); far = the light's 2·radius
     // How long a slot's lastWorld record stays a caster candidate after the item was last in
     // the client's visible set. Statics don't move so stale is correct; the window only bounds
@@ -2602,8 +2609,13 @@ namespace {
                 smd.mSampleCount = SAMPLE_COUNT_1; smd.mSampleQuality = 0;
                 smd.mFormat = TinyImageFormat_R16G16B16A16_UNORM;
                 smd.mStartState = RESOURCE_STATE_SHADER_RESOURCE;
+                // The clear MUST be the packed moments of "an occluder infinitely far from the sun"
+                // (a Dirac at depth 1) = PackMoments(1,1,1,1), NOT zero. A zeroed texel unpacks to a
+                // nonsense distribution and the receiver reads it as a near occluder — i.e. every
+                // pixel the caster pass never covered would go black. See msmpack.h.fsl:
+                //   x = 1.5-2+0.5 = 0, y = 4-4 = 0, z = sqrt(3)/2 - sqrt(12)/9 + 0.5, w = 0.5+0.5 = 1.
                 smd.mClearValue.r = 0.0f; smd.mClearValue.g = 0.0f;
-                smd.mClearValue.b = 0.0f; smd.mClearValue.a = 0.0f;
+                smd.mClearValue.b = 0.98112522f; smd.mClearValue.a = 1.0f;
                 smd.mDescriptors = DESCRIPTOR_TYPE_TEXTURE;
                 smd.pName = "sunMoments";
                 addRenderTarget(R, &smd, &g_live.pSunMoments);
@@ -4735,7 +4747,7 @@ namespace {
             if (!g_live.pPerFrameSetReflectGeo) { return false; }
             {
                 Texture* vol = g_live.pWaterNormalVol ? g_live.pWaterNormalVol : g_live.pDefaultWhite;
-                DescriptorData p[8] = {};
+                DescriptorData p[10] = {};
                 p[0].mIndex = SRT_RES_IDX(SrtData, PerFrame, gFrameData);
                 p[0].ppBuffers = &g_live.pReflectFrameCbvGeo;
                 p[1].mIndex = SRT_RES_IDX(SrtData, PerFrame, gAO);
@@ -4754,9 +4766,18 @@ namespace {
                     p[rn].mCount = 1; p[rn].ppBuffers = &g_live.pUVAnimBuf;
                     ++rn;
                 }
-                if (g_live.pShadowMaskParamsCbv) {   // gShadowParams: type-valid bind (reflect-geo never reads it)
+                if (g_live.pShadowMaskParamsCbv) {   // gShadowParams: REAL — carries the sun VP + knobs
                     p[rn].mIndex = SRT_RES_IDX(SrtData, PerFrame, gShadowParams);
                     p[rn].ppBuffers = &g_live.pShadowMaskParamsCbv;
+                    ++rn;
+                }
+                // Phase B: the mirror pass redraws statics + distant land with the SAME receiver frags,
+                // so the sun map must be bound here too — otherwise the reflected world samples an
+                // unbound SRV. Reflected geometry keeps its true world position (the VIEW is mirrored,
+                // not the geometry), so the camera-relative sun mapping applies unchanged.
+                if (g_live.pSunMoments) {
+                    p[rn].mIndex = SRT_RES_IDX(SrtData, PerFrame, gSunMoments);
+                    p[rn].mCount = 1; p[rn].ppTextures = &g_live.pSunMoments->pTexture;
                     ++rn;
                 }
                 updateDescriptorSet(R, 0, g_live.pPerFrameSetReflectGeo, rn, p);
@@ -5218,7 +5239,7 @@ namespace {
                 Texture* vol  = g_live.pWaterNormalVol ? g_live.pWaterNormalVol : g_live.pDefaultWhite;
                 Texture* refr = g_live.pRefractColor   ? g_live.pRefractColor   : g_live.pDefaultWhite;
                 Texture* lin  = g_live.pLinearDepth    ? g_live.pLinearDepth    : g_live.pDefaultWhite;
-                DescriptorData p[12] = {};
+                DescriptorData p[14] = {};
                 p[0].mIndex = SRT_RES_IDX(SrtData, PerFrame, gFrameData);
                 p[0].ppBuffers = &g_live.pFPFrameCbv;
                 p[1].mIndex = SRT_RES_IDX(SrtData, PerFrame, gAO);
@@ -5262,6 +5283,14 @@ namespace {
                     ++fpn;
                     p[fpn].mIndex = SRT_RES_IDX(SrtData, PerFrame, gShadowParams);
                     p[fpn].ppBuffers = &g_live.pShadowMaskParamsCbv;
+                    ++fpn;
+                }
+                // Phase B: the arms run opaque.frag, so they receive the sun shadow like the world —
+                // walking your hands into a building's shadow darkens them. The arm view is a second
+                // camera at the SAME eye, so the camera-relative sun mapping needs no adjustment.
+                if (g_live.pSunMoments) {
+                    p[fpn].mIndex = SRT_RES_IDX(SrtData, PerFrame, gSunMoments);
+                    p[fpn].mCount = 1; p[fpn].ppTextures = &g_live.pSunMoments->pTexture;
                     ++fpn;
                 }
                 updateDescriptorSet(R, 0, g_live.pPerFrameSetFP, fpn, p);
@@ -6560,6 +6589,19 @@ namespace {
           t.sliderF("Shadow: lantern enclosure depth (light must sit this deep in its shade; 1.2 = every fixture)", &g_shadowLanternEnclose, 0.0f, 1.2f, 0.05f);
           t.checkbox("Shadow: cutout-blend casters", &g_shadowBlendCasters);
           t.sliderF("Shadow: blend caster alpha ref (0 = mask-only)", &g_shadowBlendRef, 0.0f, 1.0f, 0.05f);
+          t.flush(); }
+
+        // -- Tab: Sun shadows (directional MSM — forge-sun-shadows.md) --
+        // Strength 0 is the feature's A/B: every receiver early-outs to fully lit, so the whole sun
+        // shadow can be toggled against the previous build's image from one slider. F12 mode 13
+        // shows the moments map itself (corner overlay).
+        { TabBuilder t; t.panel = g_uiPanel; t.name = "Sun shadow";
+          t.checkbox("Sun shadow: render the caster pass", &g_drawSunShadow);
+          t.sliderF("Sun shadow: STRENGTH (0 = off, the A/B)", &g_sunShadowStrength, 0.0f, 1.0f, 0.05f);
+          t.sliderF("Sun shadow: ortho half-extent (world u)", &g_sunShadowRange, 1024.0f, 32768.0f, 256.0f);
+          t.sliderF("Sun shadow: depth bias (normalised)", &g_sunShadowBias, 0.0f, 0.02f, 0.0002f, "%.4f");
+          t.sliderF("Sun shadow: normal offset (world u; kills slope acne)", &g_sunShadowNormalOff, 0.0f, 64.0f, 1.0f);
+          t.sliderF("Sun shadow: light-bleed reduction", &g_sunShadowLBR, 0.0f, 0.95f, 0.05f);
           t.flush(); }
 
         // -- Tab: Flicker (procedural light/shadow scintillation) --
@@ -9587,6 +9629,14 @@ namespace ForgeRender {
         }
         gpuPhaseEnd(kGpuPhaseShadowDyn);
 
+        // SUN shadow: render the DL-statics MSM moments map. It MUST be here — inside the shadow
+        // phase, before reflect/colour — because from Phase B on, every colour pass SAMPLES it. The
+        // map is CAMERA-RELATIVE, so a frame-late map is offset by the camera delta and the shadows
+        // visibly slide under motion; same-frame is not an optimisation, it is correctness. The sun
+        // cull it consumes ran back in kGpuPhaseCull, and the pass is self-contained (own RT +
+        // barriers, leaves pSunMoments in SHADER_RESOURCE), so it slots in with no state coupling.
+        renderSunShadow();
+
         if (g_live.shadowReady && g_shadowFrameActive) {
             // Restore the full-screen viewport/scissor for the compute + colour passes below
             // (the colour pass re-sets them at bind, but the AO block in between binds nothing).
@@ -11478,11 +11528,8 @@ namespace ForgeRender {
         }
         gpuPhaseEnd(kGpuPhaseColorFP);
 
-        // SUN shadow (Phase A): render the DL-statics MSM moments map. Self-contained (own RT +
-        // barriers); the scene passes have all closed (RTs unbound above). A1 draws the camera-culled
-        // statics set from the sun ortho VP just to light up + verify the map (F12 13); the sun-ortho
-        // cull (off-screen casters) is A2. Nothing samples it yet — the live image is unchanged.
-        renderSunShadow();
+        // (The sun moments map is built back in the SHADOW phase — every colour pass above samples
+        // it now, so it can no longer be produced here. See renderSunShadow()'s call site.)
 
         // --- Shadow-atlas debug view (F12 mode 11 static / 12 dynamic) --------------------------
         // Fullscreen-triangle OVERWRITE of the composited colour target with the whole D32 shadow
@@ -16255,16 +16302,39 @@ namespace ForgeRender {
     // (reusing pGpuArgs/pGpuInstOut) but from the sun ortho VP into pSunMoments, to light up + verify
     // the map (F12 13). A2 replaces the cull with a sun-ortho-box cull (off-screen casters). Nothing
     // samples the map yet, so the live image is unchanged. Self-contained: own RT + barriers.
+    // Phase B: publish the sun MSM mapping + the receiver knobs into the SHARED shadow-params cbuffer
+    // (gShadowParams). That buffer is already bound into EVERY PerFrame set and into the compute mask,
+    // so this one write reaches near opaque, multimap, sorted alpha, distant statics, distant land and
+    // the first-person arms — no per-pass plumbing, and no need to grow FrameData (which is exactly
+    // full at its 512B CBV). Float layout must track ShadowMaskParams (shadowparams.h.fsl):
+    //   invViewProj 0..15 | screenParams 16..19 | maskParams 20..23 | slotPosRad[32] 24..151 |
+    //   slotTile[32] 152..279 | biasParams 280..283 | slotBits 284..287 | slotFlick[32] 288..415 |
+    //   sunViewProj 416..431 | sunParams 432..435   (1744 B used of the 2048 B buffer)
+    // active == false publishes strength 0 — the receivers' early-out — so a frame that renders NO sun
+    // map (interior, DL not resident, knob off) can never sample a stale one from the last exterior.
+    void publishSunShadowParams(const float* sunVP, bool active) {
+        if (!g_live.pShadowMaskParamsCbv || !g_live.pShadowMaskParamsCbv->pCpuMappedAddress) { return; }
+        float* mp = (float*)g_live.pShadowMaskParamsCbv->pCpuMappedAddress;
+        constexpr uint32_t kSunVPFloat = 416, kSunParamsFloat = 432;
+        if (active && sunVP) { std::memcpy(mp + kSunVPFloat, sunVP, 16 * sizeof(float)); }
+        mp[kSunParamsFloat + 0] = active ? std::max(0.0f, std::min(g_sunShadowStrength, 1.0f)) : 0.0f;
+        mp[kSunParamsFloat + 1] = g_sunShadowBias;
+        mp[kSunParamsFloat + 2] = std::max(0.0f, std::min(g_sunShadowLBR, 0.95f));
+        mp[kSunParamsFloat + 3] = g_sunShadowNormalOff;
+    }
+
     void renderSunShadow() {
-        if (!g_drawSunShadow) { return; }
-        if (!g_pSunShadowStaticsPipeline || !g_live.pSunMoments || !g_live.pSunMomentsDepth
-            || !g_live.pSunFrameCbv || !g_live.pPerFrameSetSun) { return; }
-        if (!g_dlExterior || !g_dlLiveInit || !g_landLoaded || !g_staticsLiveOk) { return; }
         // A2: prefer the sun cull (near + off-screen casters). Fall back to the camera-culled set (A1,
         // far/on-screen only) if the sun cull isn't ready — never break, just lose the near/off-screen fill.
         const bool sunDraw = g_live.sunCullReady && g_live.sunArgsInDrawState;
         const bool gpuDraw = g_gpuStaticsCull && g_live.gpuStaticsReady && g_live.gpuArgsInDrawState;
-        if (!(sunDraw || gpuDraw || g_liveLastSubsets > 0)) { return; }
+        const bool ready = g_drawSunShadow
+                        && g_pSunShadowStaticsPipeline && g_live.pSunMoments && g_live.pSunMomentsDepth
+                        && g_live.pSunFrameCbv && g_live.pPerFrameSetSun
+                        && g_dlExterior && g_dlLiveInit && g_landLoaded && g_staticsLiveOk
+                        && (sunDraw || gpuDraw || g_liveLastSubsets > 0);
+        // Single exit for "no map this frame": disarm every receiver before returning.
+        if (!ready) { g_live.sunShadowReady = false; publishSunShadowParams(nullptr, false); return; }
 
         // Sun frame CBV = copy of the main frame data, viewProj := the sun ortho VP built from
         // gFrameData.sunDir (float[16..18], camera-relative space — same as statics.vert projects).
@@ -16273,6 +16343,9 @@ namespace ForgeRender {
         buildSunOrthoVP(&mfd[16], g_sunShadowRange, sunVP);
         std::memcpy(g_live.pSunFrameCbv->pCpuMappedAddress, mfd, kFrameDataBytes);
         std::memcpy(g_live.pSunFrameCbv->pCpuMappedAddress, sunVP, 16 * sizeof(float));
+        // Phase B: hand the SAME matrix to the receivers. Caster and receiver must project by one
+        // matrix or the shadow slides — this is the only place it is built.
+        publishSunShadowParams(sunVP, true);
 
         cmdBeginDebugMarker(g_live.pCmd, 0.9f, 0.85f, 0.2f, "SUN SHADOW (DL statics)");
         {
@@ -16315,6 +16388,11 @@ namespace ForgeRender {
             cmdResourceBarrier(g_live.pCmd, 0, nullptr, 0, nullptr, 1, &rtb);
         }
         cmdEndDebugMarker(g_live.pCmd);
+        // Restore the full-screen viewport/scissor: this pass runs mid-frame now (before reflect +
+        // colour), and it left them at kSunShadowRes². Keeping the pass self-contained means no
+        // downstream bind has to know it ran.
+        cmdSetViewport(g_live.pCmd, 0.0f, 0.0f, (float)g_live.width, (float)g_live.height, 0.0f, 1.0f);
+        cmdSetScissor(g_live.pCmd, 0, 0, g_live.width, g_live.height);
         g_live.sunShadowReady = true;
 
         static uint32_t s_sunLog = 0;
