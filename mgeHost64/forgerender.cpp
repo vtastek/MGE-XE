@@ -6555,11 +6555,20 @@ namespace {
     // explicit-NIF-test or MASK-classified textures cast. Any change sweeps alpha records live.
     float g_shadowBlendRef = 0.5f;
 
-    // F12 debug-view names; index = debugParams.x. The dropdown writes g_debugMode directly so the
-    // overlay selector and the F12 key cycle stay unified.
+    // F12 debug-view names; index = debugParams.x. The dropdown binds &g_debugMode DIRECTLY, so this
+    // table is not just labels — it is the host's only bound on that index.
+    //
+    // g_debugMode is CLIENT-driven (the F12 key cycles it in renderprocess.cpp and ships it over IPC),
+    // so the two sides must agree on the count or the host reads past this array and hands ImGui a
+    // garbage char* — an instant AV in BeginCombo/FindRenderedTextEnd the moment the dev panel draws.
+    // That is exactly what adding mode 13 in Phase A did: the client's cycle went to %14, this table
+    // stayed at 13. ADD THE NAME IN THE SAME COMMIT AS THE MODE. setDebugMode() clamps as the
+    // backstop, so a future client-side mode degrades to "clamped and visible" instead of a crash.
     const char* const kDebugModeNames[] = { "0 normal", "1 depth", "2 scatter", "3 AO", "4 bent-normal",
                                             "5 albedo", "6 lit", "7 ambient", "8 world-normal", "9 light-count",
-                                            "10 shadow-mask", "11 shadow-atlas (static)", "12 shadow-atlas (dyn)" };
+                                            "10 shadow-mask", "11 shadow-atlas (static)", "12 shadow-atlas (dyn)",
+                                            "13 sun moments (cascade atlas)" };
+    constexpr uint32_t kDebugModeCount = (uint32_t)(sizeof(kDebugModeNames) / sizeof(kDebugModeNames[0]));
 
     // The dev panel outgrew a flat widget list (~250 entries → unreadable). TabBuilder groups them
     // into WIDGET_TYPE_COLLAPSING_HEADER sections ("tabs"). The-Forge deep-copies the whole subtree
@@ -6691,7 +6700,7 @@ namespace {
         DropdownWidget dd = {};
         dd.pData = &g_debugMode;
         dd.pNames = kDebugModeNames;
-        dd.mCount = (uint32_t)(sizeof(kDebugModeNames) / sizeof(kDebugModeNames[0]));
+        dd.mCount = kDebugModeCount;
         uiAddComponentWidget(g_uiPanel, "Fullscreen buffer", &dd, WIDGET_TYPE_DROPDOWN);
 
         // Dropdown name tables must outlive the panel (cloneDropdownWidget copies pNames BY POINTER,
@@ -12170,7 +12179,13 @@ namespace ForgeRender {
         return true;
     }
 
-    void setDebugMode(unsigned m) { g_debugMode = m; }
+    // CLAMPED at the client boundary. The dev-panel dropdown binds &g_debugMode directly and indexes
+    // kDebugModeNames with it, so an out-of-range value from the client is not a bad label — it is a
+    // wild char* and an immediate AV inside ImGui. Clamping here means the host survives a client that
+    // knows about a mode the host does not (it shows the last named mode instead of dying).
+    void setDebugMode(unsigned m) {
+        g_debugMode = (m < kDebugModeCount) ? m : (kDebugModeCount - 1u);
+    }
 
     void setClientStats(unsigned frameAhead, float clientWaitMs, float clientDtMs,
                         float clientMwStartMs, double hostIdleMs) {
