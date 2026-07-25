@@ -60,6 +60,10 @@ namespace MGE::SceneGraph {
         bool  fixture;       // name matches an ESM fixture prefix (light*/torch*/furn*). Runtime-
                              // injected fill (nameless window/ambient lights) is NOT a fixture →
                              // lower shadow-slot priority so real fixtures win. Set in extractPointLight.
+        bool  carried;       // the PLAYER's held light (torch/lantern), tagged by the first-person
+                             // carried-light walk. It moves every frame with the camera, so its host
+                             // shadow slot must re-render dynamically each frame and NEVER cache a
+                             // baked tile — a cached tile detaches under slow rotation. Set in runWalk.
         // P2 light identity: the source NI::PointLight* (opaque — consumers that can't take
         // NI headers still get a stable per-frame key). A persistent light keeps the same
         // pointer across frames; a freed lantern's NiLight can have its address recycled by a

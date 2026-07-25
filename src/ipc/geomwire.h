@@ -285,6 +285,9 @@ namespace IPC {
     constexpr std::uint32_t kLightFlagFixture = 1u << 2;   // ESM fixture light (name light*/torch*/furn*) →
                                                            // shadow-priority BOOST so real fixtures win slots
                                                            // over nameless injected window/ambient fill.
+    constexpr std::uint32_t kLightFlagCarried = 1u << 3;   // the PLAYER's held light (rides the camera). Host
+                                                           // forces its shadow slot to re-render every frame —
+                                                           // never caches a baked tile (detaches on slow rotate).
 
     inline float packLightIdFlags(std::uint32_t id, std::uint32_t flags) {
         const std::uint32_t bits = ((id & 0x00FFFFFFu) << 8) | (flags & 0xFFu);

@@ -1861,7 +1861,17 @@ namespace {
     struct ShadowSlot {
         bool     valid           = false;   // slot currently owns a light id
         uint32_t lightId         = 0;
-        float    absPos[3]       = {};      // ABSOLUTE light pos (rel + shift eye) — motion test across frames
+        float    absPos[3]       = {};      // ABSOLUTE light pos (rel + shift eye) — updated EVERY frame (the mask
+                                            // projects from this current pos)
+        float    bakedPos[3]     = {};      // ABSOLUTE light pos the CACHED tile+faceVPs were last baked at. The
+                                            // re-bake trigger tests drift against THIS, not last frame's absPos:
+                                            // a slowly-moving light (carried torch under a slow camera turn) whose
+                                            // per-frame step stays under kShadowMovedEps would otherwise never
+                                            // re-bake, so the frozen tile drifts arbitrarily far from the mask's
+                                            // current-pos projection — the shadow "detaches". Bounding drift to the
+                                            // eps re-bakes it whenever it accumulates past one texel-ish.
+        float    bakedRadius     = 0.0f;    // light radius the cached tile was baked with (same accumulate-blind fix
+                                            // for a slowly ramping darkening-mod radius)
         float    radius          = 0.0f;
         float    importance      = 0.0f;    // this frame's score (challenger comparison)
         uint32_t assignedFrame   = 0;       // frame the light took this slot (hysteresis hold)
@@ -7664,17 +7674,30 @@ namespace ForgeRender {
                 const float ax = L.pos[0] + g_eyeAbsShadow[0];
                 const float ay = L.pos[1] + g_eyeAbsShadow[1];
                 const float az = L.pos[2] + g_eyeAbsShadow[2];
-                const float dx = ax - sl.absPos[0], dy = ay - sl.absPos[1], dz = az - sl.absPos[2];
+                // Drift is measured from the BAKED pos, not last frame's absPos: the cached tile is
+                // what the mask must agree with, so what matters is how far the light has moved SINCE
+                // the tile was baked, accumulated across frames. Comparing to last frame instead let a
+                // sub-eps-per-frame crawl (a carried torch under a slow camera turn) never trip the
+                // threshold while the total divergence grew without bound → the shadow detached and
+                // drifted far. Against bakedPos the drift is bounded to the eps and re-bakes on cross.
+                const float dx = ax - sl.bakedPos[0], dy = ay - sl.bakedPos[1], dz = az - sl.bakedPos[2];
                 // Re-render on a position move OR a RADIUS change: the face frustum far plane is 2r
                 // and the mask's depth reconstruction uses the same 2r, so if a darkening mod shrinks
                 // a light's radius the cached tile (old frustum) no longer matches the mask → must
                 // re-render with the new extent. Radius from specular.r is FP-stable, so > 1u = real.
                 // (MW flicker/pulse modulate the light's COLOR, not its radius — verified: no re-bake
                 // churn from flickering fixtures — so the flicker classifier below reads pl[4..6], and
-                // this radius test stays untouched.)
-                const bool moved = (L.flags & IPC::kLightFlagMoved)
+                // this radius test stays untouched.) Radius drift is likewise vs the BAKED radius.
+                // The PLAYER's carried light rides the camera and moves every frame. A cached tile
+                // detaches from its casters under slow rotation (the per-frame step stays under the
+                // move eps, so the drift test never fires while the total divergence grows), and the
+                // periodic re-bake it DID get on faster motion flickered. So it never caches: force it
+                // dirty every frame → re-rendered fresh, fully dynamic, always agreeing with the mask.
+                const bool carried = (L.flags & IPC::kLightFlagCarried) != 0;
+                const bool moved = carried
+                                   || (L.flags & IPC::kLightFlagMoved)
                                    || (dx*dx + dy*dy + dz*dz > kShadowMovedEps * kShadowMovedEps)
-                                   || (std::fabs(L.radius - sl.radius) > 1.0f);
+                                   || (std::fabs(L.radius - sl.bakedRadius) > 1.0f);
                 // Motion drive: how fast this light is TRAVELLING (world u/s), from the same delta the move
                 // test above already computed — a carried torch flickers harder than a wall sconce. Only
                 // sampled on frame-CONTIGUOUS sightings: a slot that was inactive for a while (light out of
@@ -7772,6 +7795,10 @@ namespace ForgeRender {
                 sl.absPos[0] = L.pos[0] + g_eyeAbsShadow[0];
                 sl.absPos[1] = L.pos[1] + g_eyeAbsShadow[1];
                 sl.absPos[2] = L.pos[2] + g_eyeAbsShadow[2];
+                // Seed the drift anchor to the assign pos so the pre-first-bake match frame reads a 0
+                // delta (the must-render below bakes and re-anchors it properly next).
+                sl.bakedPos[0] = sl.absPos[0]; sl.bakedPos[1] = sl.absPos[1]; sl.bakedPos[2] = sl.absPos[2];
+                sl.bakedRadius = L.radius;
                 sl.radius = L.radius; sl.importance = L.imp;
                 sl.assignedFrame = frame; sl.lastSeenFrame = frame;
                 sl.lastRenderFrame = 0;   // must render once
@@ -8226,6 +8253,11 @@ namespace ForgeRender {
                 }
                 sl.lastRenderFrame = frame;
                 sl.dirty = false;   // precise invalidation satisfied — this tile is current again
+                // Anchor the drift test to the pos/radius this tile was actually baked at (lightRel
+                // above == sl.absPos − eye). Now the moved test measures divergence SINCE this bake,
+                // so a slow crawl re-bakes once it accumulates past kShadowMovedEps instead of never.
+                sl.bakedPos[0] = sl.absPos[0]; sl.bakedPos[1] = sl.absPos[1]; sl.bakedPos[2] = sl.absPos[2];
+                sl.bakedRadius = sl.radius;
                 if (wasMust) { ++nMustR; } else { ++nStaleR; }   // diag
                 g_shadowRenders.push_back({ s, begin, end, regionBase });
                 usedMats += end - begin;

@@ -281,9 +281,17 @@ namespace MGE::SceneGraph {
             // objRoot walk already covered it), so this runs only when needed.
             if (!MWBridge::get()->is3rdPerson()) {
                 if (NI::Node* body = MWBridge::get()->getPlayer3rdPersonNode()) {
+                    // Any point light discovered under the held body root is the player's carried
+                    // light. It rides the camera and moves every frame, so tag it: the host forces
+                    // its shadow slot to re-render dynamically each frame instead of caching a baked
+                    // tile that would detach under slow rotation.
+                    const size_t before = gw_pointLights->size();
                     const auto count = body->children.getEndIndex();
                     for (size_t i = 0; i < count; ++i) {
                         walk(body->children.at(i));
+                    }
+                    for (size_t i = before; i < gw_pointLights->size(); ++i) {
+                        (*gw_pointLights)[i].carried = true;
                     }
                 }
             }

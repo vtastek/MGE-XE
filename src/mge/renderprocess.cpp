@@ -2743,6 +2743,7 @@ namespace {
             w.color[1] = diffuse[1] * pointLightMult;
             w.color[2] = diffuse[2] * pointLightMult;
             if (pl.fixture) { flags |= IPC::kLightFlagFixture; }   // ESM fixture → host shadow-priority boost
+            if (pl.carried) { flags |= IPC::kLightFlagCarried; }   // player's held light → host renders it dynamic
             w.color[3] = IPC::packLightIdFlags(id, flags);   // P2 identity lane (shader ignores .w)
             w.falloff[0] = falloff[0];
             w.falloff[1] = falloff[1];
