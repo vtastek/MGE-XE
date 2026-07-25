@@ -115,4 +115,18 @@ STRUCT(ShadowMaskParams)
     DATA(float4,   volFog1,     None);
     // volFog2: xyz = fog TINT multiplied into the sun colour, w = overall intensity.
     DATA(float4,   volFog2,     None);
+    // volFog3: x = OCCLUDE amount 0..1 — how much of the underlying image the fog removes before its
+    //              own colour is added (Sunshafts.fx `sunrayocclude`, 0.75 there). 1.0 == the
+    //              physically exact composite dst*transmittance; below that the fog is less
+    //              destructive of the scene behind it, which is what stops bright shafts blowing out.
+    //          yzw spare.
+    DATA(float4,   volFog3,     None);
+    // ALLOCATION size of the screen-sized render targets — NOT the current render size.
+    // These differ: the host allocates every size-dependent RT at the render-scale CEILING
+    // (2x backbuffer) and draws into a sub-VIEWPORT of it, so at scale 1.0 the live image occupies
+    // the top-left QUARTER of each texture. Anything sampling a screen-sized texture by uv must
+    // therefore scale by pixel/alloc, while anything reconstructing NDC must use pixel/render.
+    // screenParams above is the RENDER size; these two are not interchangeable.
+    //   xy = alloc w,h ; zw = 1/alloc w,h
+    DATA(float4,   screenAlloc, None);
 };

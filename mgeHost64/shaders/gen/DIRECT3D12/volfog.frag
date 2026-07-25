@@ -1045,7 +1045,21 @@ STRUCT(ShadowMaskParams)
     float4 volFog1;
 
     float4 volFog2;
-#line 118
+
+
+
+
+
+    float4 volFog3;
+
+
+
+
+
+
+
+    float4 screenAlloc;
+#line 132
 };
 #line 21 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
 #line 35 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
@@ -1537,11 +1551,23 @@ float4 PS_MAIN(VSOutput In): SV_TARGET
 
 
 
-    float deviceZ = SampleLvlTex2D(gSceneLinDepth, gSamplerPointClamp, In.Uv, 0).r;
 
 
 
-    float2 ndc = float2(In.Uv.x * 2.0f - 1.0f, 1.0f - In.Uv.y * 2.0f);
+
+
+
+    float2 pix = In.Position.xy;
+    float2 texUv = pix * gShadowParams.screenAlloc.zw;
+    float2 vpUv = pix * gShadowParams.screenParams.zw;
+
+
+
+    float deviceZ = SampleLvlTex2D(gSceneLinDepth, gSamplerPointClamp, texUv, 0).r;
+
+
+
+    float2 ndc = float2(vpUv.x * 2.0f - 1.0f, 1.0f - vpUv.y * 2.0f);
     float4 hp = mul(gShadowParams.invViewProj, float4(ndc, max(deviceZ, 1.0e-6f), 1.0f));
     float3 P = hp.xyz / hp.w;
 
@@ -1558,8 +1584,7 @@ float4 PS_MAIN(VSOutput In): SV_TARGET
 
 
 
-    float2 px = In.Uv * float2(gShadowParams.screenParams.x, gShadowParams.screenParams.y);
-    float jitter = frac(sin(dot(floor(px), float2(12.9898f, 78.233f))) * 43758.5453f);
+    float jitter = frac(sin(dot(floor(pix), float2(12.9898f, 78.233f))) * 43758.5453f);
 
     float d0 = gShadowParams.volFog0.x;
     float falloff = max(gShadowParams.volFog0.y, 1.0f);
@@ -1594,8 +1619,10 @@ float4 PS_MAIN(VSOutput In): SV_TARGET
         }
         if (transmittance < 0.003f) { break; }
     }
-
+#line 133 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/volfog.frag.fsl"
+    float coverage = 1.0f - transmittance;
+    float occlude = saturate(gShadowParams.volFog3.x);
     float3 fogCol = gFrameData.sunCol.xyz * gShadowParams.volFog2.xyz * gShadowParams.volFog2.w;
-    return (float4(inscatter * fogCol, transmittance));
+    return (float4(inscatter * fogCol, saturate(1.0f - occlude * coverage)));
 }
 #line 74 "FSL/shaders.list"

@@ -1829,7 +1829,11 @@ namespace {
     // what MSM is for and what PCSS could never afford. Exponential height fog with single
     // scattering, composited after water + alpha and before the FP arms.
     bool               g_volFog          = true;
-    float              g_volFogDensity   = 0.0018f; // per world unit at the fog base
+    // Density is PER WORLD UNIT, and a Morrowind unit is ~1.4 cm — so the scale here is far smaller
+    // than it looks. 6e-5 puts optical depth 1 at roughly 16000 units (~230 m) of level ground,
+    // which is light haze. The first value shipped here was 1.8e-3: opaque within ~15 m, i.e. pea
+    // soup, which is most of why the near field read as solid fog.
+    float              g_volFogDensity   = 0.00006f; // per world unit at the fog base
     float              g_volFogFalloff   = 900.0f;  // world units of height per e-fold
     float              g_volFogBase      = 0.0f;    // ABSOLUTE world height of the fog base (MW Z up)
     float              g_volFogMaxDist   = 12288.0f;// march clamp; sky rays run to here
@@ -1838,6 +1842,35 @@ namespace {
     float              g_volFogAmbient   = 0.12f;   // in-scatter floor so shafts dim rather than void
     float              g_volFogTint[3]   = { 1.0f, 0.98f, 0.92f };
     float              g_volFogIntensity = 1.0f;
+    // Sunshafts.fx `sunrayocclude`: how much of the image behind the fog is removed before the fog's
+    // colour is added. 1.0 = the physically exact dst*transmittance composite; 0.75 is the legacy
+    // shader's value and keeps bright shafts from blowing out. Never makes fog denser than physical.
+    float              g_volFogOcclude   = 0.75f;
+
+    // Float layout of the SHARED shadow-params cbuffer (gShadowParams, shadowparams.h.fsl). That
+    // buffer is already bound into EVERY PerFrame set and into the compute mask, so one host write
+    // reaches near opaque, multimap, sorted alpha, distant statics, distant land, the FP arms and the
+    // fog — no per-pass plumbing, and no need to grow FrameData (exactly full at its 512B CBV):
+    //   invViewProj 0..15 | screenParams 16..19 | maskParams 20..23 | slotPosRad[32] 24..151 |
+    //   slotTile[32] 152..279 | biasParams 280..283 | slotBits 284..287 | slotFlick[32] 288..415 |
+    //   sunViewProj[N] 416.. | sunParams | sunCascadeTexel | sunPcf0/1 | volFog0..3 | screenAlloc
+    // Declared HERE rather than beside publishSunShadowParams because the per-frame camera write
+    // (invViewProj + screenParams + screenAlloc) happens far earlier in the frame than that function.
+    constexpr uint32_t kSunVPFloat     = 416;
+    constexpr uint32_t kSunParamsFloat = kSunVPFloat + 16 * kSunCascades;
+    constexpr uint32_t kSunTexelFloat  = kSunParamsFloat + 4;
+    constexpr uint32_t kSunPcf0Float   = kSunTexelFloat + 4;    // PCSS geometry (all cascades)
+    constexpr uint32_t kSunPcf1Float   = kSunPcf0Float + 4;     // PCSS biases + enable
+    constexpr uint32_t kVolFog0Float   = kSunPcf1Float + 4;     // volumetric height fog
+    constexpr uint32_t kVolFog1Float   = kVolFog0Float + 4;
+    constexpr uint32_t kVolFog2Float   = kVolFog1Float + 4;
+    constexpr uint32_t kVolFog3Float   = kVolFog2Float + 4;
+    constexpr uint32_t kScreenAllocFloat = kVolFog3Float + 4;   // RT ALLOCATION size (≠ render size)
+    static_assert((kScreenAllocFloat + 4) * sizeof(float) <= 2048,
+                  "ShadowMaskParams overflows its 2048B CBV — too many sun cascades");
+    // msmrecv.h.fsl's PCSS works in TEXELS, so SUN_SHADOW_RES has to agree with the atlas the host
+    // actually allocated. Same mirroring contract as SUN_CASCADES / kSunCascades.
+    static_assert(kSunShadowRes == 2048, "SUN_SHADOW_RES in shadowparams.h.fsl must match kSunShadowRes");
     constexpr float    kShadowNearZ      = 4.0f;   // face frustum near (world u); far = the light's 2·radius
     // How long a slot's lastWorld record stays a caster candidate after the item was last in
     // the client's visible set. Statics don't move so stale is correct; the window only bounds
@@ -6940,7 +6973,8 @@ namespace {
           // Volumetric fog — the MSM moments' consumer. The MSM softness slider above shapes THIS,
           // not the hard shadows any more.
           t.checkbox("Vol fog: enable (height fog + sun shafts)", &g_volFog);
-          t.sliderF("Vol fog: density (per world unit at base)", &g_volFogDensity, 0.0f, 0.02f, 0.0002f, "%.4f");
+          t.sliderF("Vol fog: density (per world unit at base)", &g_volFogDensity, 0.0f, 0.0008f, 0.00001f, "%.5f");
+          t.sliderF("Vol fog: OCCLUDE (Sunshafts sunrayocclude; 1 = physical)", &g_volFogOcclude, 0.0f, 1.0f, 0.05f, "%.2f");
           t.sliderF("Vol fog: height falloff (WORLD units/e-fold)", &g_volFogFalloff, 64.0f, 8192.0f, 32.0f, "%.0f");
           t.sliderF("Vol fog: base height (ABSOLUTE world Z)", &g_volFogBase, -4096.0f, 8192.0f, 64.0f, "%.0f");
           t.sliderF("Vol fog: max march distance (world units)", &g_volFogMaxDist, 1024.0f, 32768.0f, 256.0f, "%.0f");
@@ -7893,6 +7927,16 @@ namespace ForgeRender {
             std::memcpy(cp, camInvVP, 16 * sizeof(float));
             cp[16] = (float)g_live.width;        cp[17] = (float)g_live.height;
             cp[18] = 1.0f / (float)g_live.width; cp[19] = 1.0f / (float)g_live.height;
+            // ...and the ALLOCATION size, which is NOT the same number. Every screen-sized RT is
+            // built at the render-scale ceiling (2x backbuffer) and the scene draws into a
+            // sub-viewport, so at scale 1.0 the live image is the top-left QUARTER of each texture.
+            // A shader addressing one of those textures by uv must divide the pixel by ALLOC;
+            // rebuilding NDC must divide by RENDER. Published next to each other precisely so the
+            // pair is visibly two different numbers at the point of use.
+            const uint32_t aw = g_live.allocWidth  ? g_live.allocWidth  : g_live.width;
+            const uint32_t ah = g_live.allocHeight ? g_live.allocHeight : g_live.height;
+            cp[kScreenAllocFloat + 0] = (float)aw;        cp[kScreenAllocFloat + 1] = (float)ah;
+            cp[kScreenAllocFloat + 2] = 1.0f / (float)aw; cp[kScreenAllocFloat + 3] = 1.0f / (float)ah;
         }
         if (g_live.shadowReady) {
             // Follow-on 3: lazy one-time create of the occlusion-cull resources (runs BEFORE beginCmd,
@@ -16702,19 +16746,8 @@ namespace ForgeRender {
     //   sunViewProj[N] 416.. | sunParams | sunCascadeTexel   (N=2 → 456 floats = 1824 B of 2048)
     // active == false publishes strength 0 — the receivers' early-out — so a frame that renders NO sun
     // map (interior, DL not resident, knob off) can never sample a stale one from the last exterior.
-    constexpr uint32_t kSunVPFloat     = 416;
-    constexpr uint32_t kSunParamsFloat = kSunVPFloat + 16 * kSunCascades;
-    constexpr uint32_t kSunTexelFloat  = kSunParamsFloat + 4;
-    constexpr uint32_t kSunPcf0Float   = kSunTexelFloat + 4;    // PCSS geometry (all cascades)
-    constexpr uint32_t kSunPcf1Float   = kSunPcf0Float + 4;     // PCSS biases + enable
-    constexpr uint32_t kVolFog0Float   = kSunPcf1Float + 4;     // volumetric height fog
-    constexpr uint32_t kVolFog1Float   = kVolFog0Float + 4;
-    constexpr uint32_t kVolFog2Float   = kVolFog1Float + 4;
-    static_assert((kVolFog2Float + 4) * sizeof(float) <= 2048,
-                  "ShadowMaskParams overflows its 2048B CBV — too many sun cascades");
-    // msmrecv.h.fsl's PCSS works in TEXELS, so SUN_SHADOW_RES has to agree with the atlas the host
-    // actually allocated. Same mirroring contract as SUN_CASCADES / kSunCascades.
-    static_assert(kSunShadowRes == 2048, "SUN_SHADOW_RES in shadowparams.h.fsl must match kSunShadowRes");
+    // (The kSunVPFloat.. offsets are declared up with the sun knobs — the screen-alloc write needs
+    // them well before this point.)
 
     void publishSunShadowParams(const float* sunVPs, const float* cascadeTexels, bool active) {
         if (!g_live.pShadowMaskParamsCbv || !g_live.pShadowMaskParamsCbv->pCpuMappedAddress) { return; }
@@ -16761,6 +16794,10 @@ namespace ForgeRender {
         mp[kVolFog2Float + 1] = g_volFogTint[1];
         mp[kVolFog2Float + 2] = g_volFogTint[2];
         mp[kVolFog2Float + 3] = std::max(0.0f, g_volFogIntensity);
+        mp[kVolFog3Float + 0] = std::max(0.0f, std::min(g_volFogOcclude, 1.0f));
+        mp[kVolFog3Float + 1] = 0.0f;
+        mp[kVolFog3Float + 2] = 0.0f;
+        mp[kVolFog3Float + 3] = 0.0f;
     }
 
     // Separable Gaussian over the sun moments map — THE pass that makes MSM soft (see

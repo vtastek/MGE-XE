@@ -48,13 +48,25 @@ float4 PS_MAIN(VSOutput In)
 
     if (gShadowParams.volFog1.z <= 0.5f) { RETURN(float4(0.0f, 0.0f, 0.0f, 1.0f)); }
 
+    // TWO different normalisations of the same pixel, and mixing them up is a real trap here.
+    // The host allocates every screen-sized RT at the render-scale CEILING (2x backbuffer) and draws
+    // into a sub-viewport, so at scale 1.0 the live image is the top-left QUARTER of each texture:
+    //   texUv = pixel / ALLOC   — to address a screen-sized texture
+    //   vpUv  = pixel / RENDER  — to rebuild NDC (the projection covers the viewport, not the alloc)
+    // Using the fullscreen triangle's own 0..1 Uv for the texture read is what put the whole effect
+    // in the top-left quarter and made every other ray read never-written depth (= "sky" = march to
+    // the far clamp = solid fog everywhere).
+    float2 pix   = In.Position.xy;
+    float2 texUv = pix * gShadowParams.screenAlloc.zw;
+    float2 vpUv  = pix * gShadowParams.screenParams.zw;
+
     // Scene depth (RAW reverse-Z device depth from the prepass: near = 1, far = 0). 0 means nothing
     // was drawn — sky — so the ray runs to the far clamp instead of stopping at a surface.
-    float deviceZ = SampleLvlTex2D(gSceneLinDepth, gSamplerPointClamp, In.Uv, 0).r;
+    float deviceZ = SampleLvlTex2D(gSceneLinDepth, gSamplerPointClamp, texUv, 0).r;
 
     // Reconstruct the CAMERA-RELATIVE world position. invViewProj comes from the same rzViewProj the
     // frame was drawn with, so the eye sits at the origin and the view ray is just normalize(P).
-    float2 ndc = float2(In.Uv.x * 2.0f - 1.0f, 1.0f - In.Uv.y * 2.0f);
+    float2 ndc = float2(vpUv.x * 2.0f - 1.0f, 1.0f - vpUv.y * 2.0f);
     float4 hp  = mul(gShadowParams.invViewProj, float4(ndc, max(deviceZ, 1.0e-6f), 1.0f));
     float3 P   = hp.xyz / hp.w;
 
@@ -71,8 +83,7 @@ float4 PS_MAIN(VSOutput In)
     // the shadow signal changes fast. Screen-space noise is right HERE (unlike the surface receiver,
     // where it would crawl): each pixel owns its own ray, and neighbouring rays decorrelating is the
     // entire point — the bands become fine grain that the eye reads as fog.
-    float2 px    = In.Uv * float2(gShadowParams.screenParams.x, gShadowParams.screenParams.y);
-    float  jitter = frac(sin(dot(floor(px), float2(12.9898f, 78.233f))) * 43758.5453f);
+    float  jitter = frac(sin(dot(floor(pix), float2(12.9898f, 78.233f))) * 43758.5453f);
 
     float  d0      = gShadowParams.volFog0.x;
     float  falloff = max(gShadowParams.volFog0.y, 1.0f);
@@ -108,6 +119,19 @@ float4 PS_MAIN(VSOutput In)
         if (transmittance < 0.003f) { break; }   // fully opaque; the rest cannot contribute
     }
 
-    float3 fogCol = gFrameData.sunCol.xyz * gShadowParams.volFog2.xyz * gShadowParams.volFog2.w;
-    RETURN(float4(inscatter * fogCol, transmittance));
+    // SUBTRACTIVE composite, following XEshaders/Sunshafts.fx `combine()`:
+    //     col *= saturate(1 - sunrayocclude * ray.a);
+    //     col  = saturate(col + ray.rgb * ray.a);
+    // i.e. the shaft REMOVES part of the image behind it before adding its own colour, instead of
+    // piling light on top. Purely additive in-scatter is what makes fog read as a white-out: the
+    // scene keeps all its brightness and the fog adds more, so everything saturates.
+    //
+    // Here the "coverage" that does the occluding is the fog's own opacity (1 - transmittance), and
+    // volFog3.x is Sunshafts' sunrayocclude. At 1.0 this reduces exactly to dst * transmittance —
+    // the physically correct composite — so the knob only ever makes the fog LESS destructive than
+    // physical, never more.
+    float  coverage = 1.0f - transmittance;
+    float  occlude  = saturate(gShadowParams.volFog3.x);
+    float3 fogCol   = gFrameData.sunCol.xyz * gShadowParams.volFog2.xyz * gShadowParams.volFog2.w;
+    RETURN(float4(inscatter * fogCol, saturate(1.0f - occlude * coverage)));
 }
