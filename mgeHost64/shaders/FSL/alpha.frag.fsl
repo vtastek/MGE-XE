@@ -72,7 +72,7 @@ float4 PS_MAIN( VSOutput In )
     // caster / RED not-alpha-over / ORANGE fading / WHITE strict reject / BLUE captured /
     // GRAY casters-off. Returned flat so the alpha set reads at a glance (opaque ignores bit3).
     if ((aoFlags & 8u) != 0u) { RETURN(float4(In.MatDiffuse, 1.0f)); }
-    float2 aoUv     = In.Position.xy * gFrameData.debugParams.yz;
+    float2 aoUv     = In.Position.xy * gShadowParams.screenAlloc.zw;   // gAO is ALLOC-sized, not render-sized
     float4 aoSample = SampleTex2D(gAO, gSamplerAnisotropic, aoUv);
     if ((aoFlags & 2u) != 0u) { N = normalize(aoSample.rgb); }
 

@@ -1829,23 +1829,40 @@ namespace {
     // what MSM is for and what PCSS could never afford. Exponential height fog with single
     // scattering, composited after water + alpha and before the FP arms.
     bool               g_volFog          = true;
-    // Density is PER WORLD UNIT, and a Morrowind unit is ~1.4 cm — so the scale here is far smaller
-    // than it looks. 6e-5 puts optical depth 1 at roughly 16000 units (~230 m) of level ground,
-    // which is light haze. The first value shipped here was 1.8e-3: opaque within ~15 m, i.e. pea
-    // soup, which is most of why the near field read as solid fog.
-    float              g_volFogDensity   = 0.00006f; // per world unit at the fog base
+    // Density as a DISTANCE: the ground-level range over which optical depth reaches 1 (density =
+    // 1/this). The shader wants a per-world-unit coefficient, but a Morrowind unit is ~1.4 cm, so
+    // every useful value sits in ~1e-5..1e-4 — a slider range where one notch is the difference
+    // between clear air and pea soup. Expressing it as visibility distance spreads the same range
+    // over thousands of units and makes it readable: 16000 units is roughly 230 m, i.e. light haze.
+    float              g_volFogVisDist   = 16000.0f;// world units to optical depth 1 at the base
     float              g_volFogFalloff   = 900.0f;  // world units of height per e-fold
     float              g_volFogBase      = 0.0f;    // ABSOLUTE world height of the fog base (MW Z up)
     float              g_volFogMaxDist   = 12288.0f;// march clamp; sky rays run to here
-    float              g_volFogAniso     = 0.72f;   // Henyey-Greenstein g (forward = sun glow)
     float              g_volFogSteps     = 24.0f;
     float              g_volFogAmbient   = 0.12f;   // in-scatter floor so shafts dim rather than void
     float              g_volFogTint[3]   = { 1.0f, 0.98f, 0.92f };
     float              g_volFogIntensity = 1.0f;
+    // DUAL-LOBE phase. One HG lobe ties the sun halo, the anti-sun lift and the side scattering to a
+    // single number, so the only way to get more fog at 90 degrees to the sun was to make the halo
+    // explode. Three independently-gained normalised terms (1.0 == isotropic) fix that:
+    //   iso     — the flat pedestal, and the knob to reach for when the scene wants more fog;
+    //   forward — the sun halo, g near 1 = tight;
+    //   back    — the anti-sun brightening, g negative.
+    // The ceiling is a soft Reinhard knee (not a clamp — that would draw a disc edge round the sun).
+    float              g_volFogIso       = 0.55f;   // isotropic gain: the side/horizontal knob
+    float              g_volFogAniso     = 0.72f;   // forward-lobe g
+    float              g_volFogFwdGain   = 0.55f;   // forward-lobe gain
+    float              g_volFogBackG     = -0.45f;  // back-lobe g (negative = back-scatter)
+    float              g_volFogBackGain  = 0.18f;   // back-lobe gain
+    float              g_volFogPhaseCeil = 8.0f;    // soft ceiling on the summed phase (0 = off)
     // Sunshafts.fx `sunrayocclude`: how much of the image behind the fog is removed before the fog's
     // colour is added. 1.0 = the physically exact dst*transmittance composite; 0.75 is the legacy
     // shader's value and keeps bright shafts from blowing out. Never makes fog denser than physical.
     float              g_volFogOcclude   = 0.75f;
+    // Water-plane march clamp (volFog4.zw), restamped per frame from the water params — see the
+    // clamp in volfog.frag for why the opaque prepass depth is not enough over open sea.
+    float              g_volFogWaterZ    = 0.0f;
+    bool               g_volFogWaterOn   = false;
 
     // Float layout of the SHARED shadow-params cbuffer (gShadowParams, shadowparams.h.fsl). That
     // buffer is already bound into EVERY PerFrame set and into the compute mask, so one host write
@@ -1853,7 +1870,7 @@ namespace {
     // fog — no per-pass plumbing, and no need to grow FrameData (exactly full at its 512B CBV):
     //   invViewProj 0..15 | screenParams 16..19 | maskParams 20..23 | slotPosRad[32] 24..151 |
     //   slotTile[32] 152..279 | biasParams 280..283 | slotBits 284..287 | slotFlick[32] 288..415 |
-    //   sunViewProj[N] 416.. | sunParams | sunCascadeTexel | sunPcf0/1 | volFog0..3 | screenAlloc
+    //   sunViewProj[N] 416.. | sunParams | sunCascadeTexel | sunPcf0/1 | volFog0..4 | screenAlloc
     // Declared HERE rather than beside publishSunShadowParams because the per-frame camera write
     // (invViewProj + screenParams + screenAlloc) happens far earlier in the frame than that function.
     constexpr uint32_t kSunVPFloat     = 416;
@@ -1865,7 +1882,8 @@ namespace {
     constexpr uint32_t kVolFog1Float   = kVolFog0Float + 4;
     constexpr uint32_t kVolFog2Float   = kVolFog1Float + 4;
     constexpr uint32_t kVolFog3Float   = kVolFog2Float + 4;
-    constexpr uint32_t kScreenAllocFloat = kVolFog3Float + 4;   // RT ALLOCATION size (≠ render size)
+    constexpr uint32_t kVolFog4Float   = kVolFog3Float + 4;     // dual-lobe phase + water clamp
+    constexpr uint32_t kScreenAllocFloat = kVolFog4Float + 4;   // RT ALLOCATION size (≠ render size)
     static_assert((kScreenAllocFloat + 4) * sizeof(float) <= 2048,
                   "ShadowMaskParams overflows its 2048B CBV — too many sun cascades");
     // msmrecv.h.fsl's PCSS works in TEXELS, so SUN_SHADOW_RES has to agree with the atlas the host
@@ -6973,15 +6991,22 @@ namespace {
           // Volumetric fog — the MSM moments' consumer. The MSM softness slider above shapes THIS,
           // not the hard shadows any more.
           t.checkbox("Vol fog: enable (height fog + sun shafts)", &g_volFog);
-          t.sliderF("Vol fog: density (per world unit at base)", &g_volFogDensity, 0.0f, 0.0008f, 0.00001f, "%.5f");
+          t.sliderF("Vol fog: visibility DISTANCE (world units to opacity)", &g_volFogVisDist, 2000.0f, 200000.0f, 500.0f, "%.0f");
           t.sliderF("Vol fog: OCCLUDE (Sunshafts sunrayocclude; 1 = physical)", &g_volFogOcclude, 0.0f, 1.0f, 0.05f, "%.2f");
           t.sliderF("Vol fog: height falloff (WORLD units/e-fold)", &g_volFogFalloff, 64.0f, 8192.0f, 32.0f, "%.0f");
           t.sliderF("Vol fog: base height (ABSOLUTE world Z)", &g_volFogBase, -4096.0f, 8192.0f, 64.0f, "%.0f");
           t.sliderF("Vol fog: max march distance (world units)", &g_volFogMaxDist, 1024.0f, 32768.0f, 256.0f, "%.0f");
-          t.sliderF("Vol fog: anisotropy g (forward = sun glow)", &g_volFogAniso, -0.9f, 0.95f, 0.01f, "%.2f");
           t.sliderF("Vol fog: march steps (cost lives here)", &g_volFogSteps, 4.0f, 96.0f, 1.0f, "%.0f");
           t.sliderF("Vol fog: ambient in-scatter floor", &g_volFogAmbient, 0.0f, 1.0f, 0.01f, "%.2f");
           t.sliderF("Vol fog: intensity", &g_volFogIntensity, 0.0f, 4.0f, 0.05f, "%.2f");
+          // Dual-lobe phase: ISO is the side/horizontal knob (fog everywhere, sun direction untouched);
+          // the two lobes shape the sun halo and the anti-sun lift independently of it.
+          t.sliderF("Vol fog phase: ISOTROPIC gain (the SIDE/horizontal knob)", &g_volFogIso, 0.0f, 4.0f, 0.05f, "%.2f");
+          t.sliderF("Vol fog phase: forward g (sun halo tightness)", &g_volFogAniso, 0.0f, 0.95f, 0.01f, "%.2f");
+          t.sliderF("Vol fog phase: forward GAIN (sun halo strength)", &g_volFogFwdGain, 0.0f, 4.0f, 0.05f, "%.2f");
+          t.sliderF("Vol fog phase: back g (negative = anti-sun lobe)", &g_volFogBackG, -0.95f, 0.0f, 0.01f, "%.2f");
+          t.sliderF("Vol fog phase: back GAIN (anti-sun strength)", &g_volFogBackGain, 0.0f, 4.0f, 0.05f, "%.2f");
+          t.sliderF("Vol fog phase: soft CEILING (0 = uncapped)", &g_volFogPhaseCeil, 0.0f, 32.0f, 0.5f, "%.1f");
           t.flush(); }
 
         // -- Tab: Flicker (procedural light/shadow scintillation) --
@@ -10034,6 +10059,14 @@ namespace ForgeRender {
         // visibly slide under motion; same-frame is not an optimisation, it is correctness. The sun
         // cull it consumes ran back in kGpuPhaseCull, and the pass is self-contained (own RT +
         // barriers, leaves pSunMoments in SHADER_RESOURCE), so it slots in with no state coupling.
+        //
+        // Latch this frame's water plane FIRST: publishSunShadowParams writes the fog block, and both
+        // of renderSunShadow's exits go through it. The volumetric march clamps against this plane
+        // because the depth it reads is the OPAQUE prepass — water is drawn later, so over open sea
+        // the ray would otherwise run to the seabed or the far clamp through solid water.
+        // Held off entirely when the camera is submerged: the height-fog model is an AIR model.
+        g_volFogWaterZ  = waterParams ? waterParams[0] : 0.0f;
+        g_volFogWaterOn = (waterEnabled != 0) && waterParams && !(waterParams[7] > 0.5f);
         renderSunShadow();
 
         if (g_live.shadowReady && g_shadowFrameActive) {
@@ -12320,7 +12353,7 @@ namespace ForgeRender {
             // Host-GPU-shrink sub-phases: WHERE inside color/reflect the ms live. sky+near+skin+mm+dl
             // ≈ color above (same frame's timestamps); refl sky = reflect − reflgeo.
             LOG::logline(">> [forge-hb] gpu color sub: sky=%.2f nearfrox=%.2f(%s,n=%u) near=%.2f skin=%.2f mm=%.2f dl=%.2f alpha=%.2f glow=%.2f(%u,walk=%.2fms)"
-                         " volfog=%.2f(%s,steps=%u) | refl geo=%.2f (refl sky=%.2f) ms",
+                         " volfog=%.2f(%s,steps=%u,waterclamp=%s) | refl geo=%.2f (refl sky=%.2f) ms",
                          g_lastGpuPhaseMs[kGpuPhaseColorSky],
                          g_lastGpuPhaseMs[kGpuPhaseFroxelNear],
                          g_live.froxelNearActive ? "on" : "off", g_live.froxelNearLightCount,
@@ -12335,6 +12368,8 @@ namespace ForgeRender {
                          g_lastGpuPhaseMs[kGpuPhaseVolFog],
                          (g_volFog && g_live.pVolFogPipeline && g_live.sunShadowReady) ? "on" : "off",
                          (unsigned)g_volFogSteps,
+                         // waterclamp off + fog on over open sea = the horizon band is over-marching.
+                         g_volFogWaterOn ? "on" : "off",
                          g_lastGpuPhaseMs[kGpuPhaseReflGeo],
                          g_lastGpuPhaseMs[kGpuPhaseReflect] - g_lastGpuPhaseMs[kGpuPhaseReflGeo]);
             // Skinned-loop CPU RECORD probe: rec-split skin= is prep(palette+instance memcpy, IPC-blob
@@ -16782,7 +16817,9 @@ namespace ForgeRender {
         // --- Volumetric height fog. Published unconditionally: with no sun map the march still runs
         // and sunShadowVolumetric() returns "lit" everywhere, which degrades to plain height fog
         // rather than to a black screen.
-        mp[kVolFog0Float + 0] = g_volFogDensity;
+        // The knob is a visibility DISTANCE; the shader wants a per-world-unit coefficient. Invert
+        // here so the slider stays readable (see g_volFogVisDist).
+        mp[kVolFog0Float + 0] = 1.0f / std::max(g_volFogVisDist, 1.0f);
         mp[kVolFog0Float + 1] = g_volFogFalloff;
         mp[kVolFog0Float + 2] = g_volFogBase;
         mp[kVolFog0Float + 3] = g_volFogMaxDist;
@@ -16795,9 +16832,15 @@ namespace ForgeRender {
         mp[kVolFog2Float + 2] = g_volFogTint[2];
         mp[kVolFog2Float + 3] = std::max(0.0f, g_volFogIntensity);
         mp[kVolFog3Float + 0] = std::max(0.0f, std::min(g_volFogOcclude, 1.0f));
-        mp[kVolFog3Float + 1] = 0.0f;
-        mp[kVolFog3Float + 2] = 0.0f;
-        mp[kVolFog3Float + 3] = 0.0f;
+        mp[kVolFog3Float + 1] = std::max(-0.95f, std::min(g_volFogBackG, 0.95f));
+        mp[kVolFog3Float + 2] = std::max(0.0f, g_volFogFwdGain);
+        mp[kVolFog3Float + 3] = std::max(0.0f, g_volFogBackGain);
+        mp[kVolFog4Float + 0] = std::max(0.0f, g_volFogIso);
+        mp[kVolFog4Float + 1] = std::max(0.0f, g_volFogPhaseCeil);
+        // Water plane: latched by renderScene from this frame's water params (0/off when there is no
+        // water, or when the camera is under it — an air-fog march below the surface is meaningless).
+        mp[kVolFog4Float + 2] = g_volFogWaterZ;
+        mp[kVolFog4Float + 3] = g_volFogWaterOn ? 1.0f : 0.0f;
     }
 
     // Separable Gaussian over the sun moments map — THE pass that makes MSM soft (see

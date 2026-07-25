@@ -48,9 +48,12 @@ float4 PS_MAIN( VSOutput In )
     // Sample the AO buffer once (rgb = world-space bent normal, a = visibility), shared by the
     // ambient term, the bent-normal swap, and the F12 views. gAO is the BILATERAL-BLURRED AO
     // (pAOBlur, denoised in a compute pass), so a single tap is all that's needed here.
-    // debugParams.yz = invScreen; .w = toggle bitmask (bit0 AO->ambient, bit1 bent normal).
+    // debugParams.w = toggle bitmask (bit0 AO->ambient, bit1 bent normal).
+    // gAO is ALLOCATION-sized (every screen RT is allocated at the render-scale ceiling and the frame
+    // draws into a sub-viewport), so the uv scale is 1/ALLOC — screenAlloc.zw, NOT debugParams.yz,
+    // which is 1/RENDER and would stretch the AO buffer by the scale ratio.
     uint   aoFlags  = (uint)(gFrameData.debugParams.w + 0.5f);
-    float2 aoUv     = In.Position.xy * gFrameData.debugParams.yz;
+    float2 aoUv     = In.Position.xy * gShadowParams.screenAlloc.zw;
     float4 aoSample = SampleTex2D(gAO, gSamplerAnisotropic, aoUv);
     if ((aoFlags & 2u) != 0u) { N = normalize(aoSample.rgb); }   // "Bent normal enable" tick: bend the lighting normal
 
@@ -222,7 +225,7 @@ float4 PS_MAIN( VSOutput In )
     c = tonemap(c);
     // Near fog: lerp toward fogColNear as Fog -> 0 (matches FFE's lerp(fogColNear, c, fog)).
     c = lerp(gFrameData.fogColNear.rgb, c, In.Fog);
-    // F12 debug views. gAO is sampled at SV_Position.xy * invScreen (debugParams.yz). The isolation
+    // F12 debug views. gAO is sampled at SV_Position.xy * invAlloc (screenAlloc.zw). The isolation
     // views (5 albedo / 6 lit / 7 ambient) output one shading component so surfaces Forge does NOT
     // draw stay unchanged — a quick way to spot what's still going through MW's own path.
     uint dbg = (uint)(gFrameData.debugParams.x + 0.5f);

@@ -12,6 +12,11 @@
 //   density(h) = d0 * exp(-(h - base) / falloff)      h = ABSOLUTE world height (Morrowind Z is up)
 //   inscatter  = SUM over steps of  T * density * ds * (sunVis * phase(cos) + ambientFloor)
 //   T         *= exp(-density * ds)
+// d0 is published as 1/visibilityDistance so the knob is a DISTANCE, not a raw per-unit coefficient:
+// a Morrowind unit is ~1.4 cm, so useful densities live in a range far too compressed to slide.
+// phase() is a three-term dual-lobe (isotropic pedestal + forward HG + backward HG, soft-ceilinged)
+// rather than one HG, so side/horizontal fog is tunable without the sun direction blowing out.
+// The march is clamped by the OPAQUE depth AND by the water plane — see the clamp below for why.
 // Output is (inscatter, transmittance) and the PSO blends ONE / SRC_ALPHA, i.e.
 //   dst = inscatter + dst * T
 // which is the correct compositing order for single scattering over an already-shaded frame.
@@ -32,13 +37,15 @@ STRUCT(VSOutput)
     DATA(float2, Uv,       TEXCOORD0);
 };
 
-// Henyey-Greenstein. g > 0 pushes scattering forward, which is what puts the bright halo around the
-// sun and makes shafts pointing at the camera glow.
-float hgPhase(float cosT, float g)
+// Henyey-Greenstein, NORMALISED so isotropic == 1.0 (the raw phase integrates to 1 over the sphere;
+// multiplying by 4*pi rescales it so "1" means "no directional preference"). g > 0 pushes scattering
+// forward — the bright halo around the sun; g < 0 pushes it back toward the light, which is the
+// gentler brightening you see looking AWAY from the sun.
+float hgNorm(float cosT, float g)
 {
     float g2 = g * g;
     float d  = 1.0f + g2 - 2.0f * g * cosT;
-    return (1.0f - g2) / (4.0f * 3.14159265f * max(d * sqrt(max(d, 1.0e-4f)), 1.0e-4f));
+    return (1.0f - g2) / max(d * sqrt(max(d, 1.0e-4f)), 1.0e-4f);
 }
 
 ROOT_SIGNATURE(DefaultRootSignature)
@@ -73,6 +80,22 @@ float4 PS_MAIN(VSOutput In)
     float  maxDist = gShadowParams.volFog0.w;
     float3 dir     = normalize(P);
     float  dist    = (deviceZ > 0.0f) ? min(length(P), maxDist) : maxDist;
+
+    // WATER-PLANE clamp. gSceneLinDepth is the OPAQUE PREPASS — water writes depth strictly after it,
+    // so a ray aimed at the sea finds either the seabed or (out past the shelf) NOTHING, and "nothing"
+    // reads as deviceZ 0, i.e. sky, i.e. the full maxDist march. Both cases keep integrating dense
+    // near-ground fog through solid water. That is the band above the horizon getting brighter: those
+    // are the flattest rays, so density never falls off along them, and they were also the longest.
+    // The surface is a plane, so no second depth resolve is needed — intersect it analytically.
+    // (volFog4.w is cleared whenever the camera is UNDER the surface; the underwater look belongs to
+    // water.frag's own tint, not to an air-fog model.)
+    if (gShadowParams.volFog4.w > 0.5f && dir.z < -1.0e-5f)
+    {
+        float waterRelZ = gShadowParams.volFog4.z - gFrameData.lodEye.z;   // < 0 when the camera is above it
+        float tWater    = waterRelZ / dir.z;
+        if (tWater > 0.0f) { dist = min(dist, tWater); }
+    }
+
     if (dist <= 0.0f) { RETURN(float4(0.0f, 0.0f, 0.0f, 1.0f)); }
 
     int   steps = (int)max(gShadowParams.volFog1.y, 1.0f);
@@ -89,11 +112,22 @@ float4 PS_MAIN(VSOutput In)
     float  falloff = max(gShadowParams.volFog0.y, 1.0f);
     float  base    = gShadowParams.volFog0.z;
     float  eyeH    = gFrameData.lodEye.z;            // absolute world height of the camera
-    float  g       = gShadowParams.volFog1.x;
     float  ambient = gShadowParams.volFog1.w;
 
-    // Phase is constant along the ray (directional light + fixed view dir), so evaluate it once.
-    float  phase = hgPhase(dot(dir, -gFrameData.sunDir.xyz), g) * 4.0f * 3.14159265f;
+    // DUAL-LOBE phase, evaluated once (directional light + fixed view dir ⇒ constant along the ray).
+    //   iso      — flat pedestal. THIS is the side/horizontal knob: it lifts fog at every angle
+    //              equally, so you can make the world foggier without the sun direction exploding.
+    //   forward  — the sun halo (g > 0). Its peak is ~1/(1-g)^2, so at g 0.72 it is already ~20x
+    //              isotropic; that steepness is precisely why a single lobe made density unusable.
+    //   backward — the anti-sun lift (g < 0), independent of the halo.
+    float  cosT    = dot(dir, -gFrameData.sunDir.xyz);
+    float  phase   = gShadowParams.volFog4.x
+                   + gShadowParams.volFog3.z * hgNorm(cosT, gShadowParams.volFog1.x)
+                   + gShadowParams.volFog3.w * hgNorm(cosT, gShadowParams.volFog3.y);
+    // Soft ceiling. A hard min() would draw a visible disc edge where the lobe hits the cap; this
+    // Reinhard knee asymptotes to `ceil` instead, so the halo saturates smoothly. ceil <= 0 = off.
+    float  phaseCeil = gShadowParams.volFog4.y;
+    if (phaseCeil > 0.0f) { phase = phase / (1.0f + phase / phaseCeil); }
 
     float3 inscatter    = float3(0.0f, 0.0f, 0.0f);
     float  transmittance = 1.0f;

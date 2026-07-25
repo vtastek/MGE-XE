@@ -974,7 +974,7 @@ SamplerState gSampler2xWrapClamp : register( s17 , space100 ) ;
 #line 11 "FSL/shaders.list"
 #line 73 "FSL/shaders.list"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/volfog.frag.fsl"
-#line 26 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/volfog.frag.fsl"
+#line 31 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/volfog.frag.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
 #line 20 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
@@ -1050,7 +1050,10 @@ STRUCT(ShadowMaskParams)
 
 
 
+
     float4 volFog3;
+#line 143 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
+    float4 volFog4;
 
 
 
@@ -1059,7 +1062,7 @@ STRUCT(ShadowMaskParams)
 
 
     float4 screenAlloc;
-#line 132
+#line 152
 };
 #line 21 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
 #line 35 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
@@ -1256,7 +1259,7 @@ STRUCT(LightData)
 
         Tex2DArray(float4) gStaticsArrays[ 128 ] :  register(t896,space0);
         CBUFFER(BatchData) gBatch :  register(b0,space2);
-#line 27 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/volfog.frag.fsl"
+#line 32 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/volfog.frag.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/msmrecv.h.fsl"
 #line 45 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/msmrecv.h.fsl"
 float4 UnpackMoments(float4 packedMoments)
@@ -1524,22 +1527,24 @@ float sunShadowVisibility(float3 worldPosRel, float3 N)
 
     return 1.0f - occlusion * strength;
 }
-#line 28 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/volfog.frag.fsl"
+#line 33 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/volfog.frag.fsl"
 
 STRUCT(VSOutput)
 {
     DATA(float4, Position, SV_Position);
     DATA(float2, Uv, TEXCOORD0);
-#line 33
+#line 38
 };
 
 
 
-float hgPhase(float cosT, float g)
+
+
+float hgNorm(float cosT, float g)
 {
     float g2 = g * g;
     float d = 1.0f + g2 - 2.0f * g * cosT;
-    return (1.0f - g2) / (4.0f * 3.14159265f * max(d * sqrt(max(d, 1.0e-4f)), 1.0e-4f));
+    return (1.0f - g2) / max(d * sqrt(max(d, 1.0e-4f)), 1.0e-4f);
 }
 
 [RootSignature( "RootFlags(ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT)," "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "3" ", offset = 0)," "CBV(b0, numDescriptors = unbounded, space = " "3" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "3" ", offset = 0))," "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "2" ", offset = 0)," "CBV(b0, numDescriptors = unbounded, space = " "2" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "2" ", offset = 0))," "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "1" ", offset = 0)," "CBV(b0, numDescriptors = unbounded, space = " "1" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "1" ", offset = 0))," "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "0" ", offset = 0)," "CBV(b0, numDescriptors = unbounded, space = " "0" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "0" ", offset = 0))," "DescriptorTable(" "SAMPLER(s0, numDescriptors = unbounded, space = " "0" ", offset = 0))," "StaticSampler(s0, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s1, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s2, space = 100," "filter = FILTER_MIN_MAG_LINEAR_MIP_POINT," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s3, space = 100," "filter = FILTER_MIN_MAG_LINEAR_MIP_POINT," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s4, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s5, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s6, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT," "addressU = TEXTURE_ADDRESS_MIRROR, addressV = TEXTURE_ADDRESS_MIRROR, addressW = TEXTURE_ADDRESS_MIRROR)," "StaticSampler(s7, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT, borderColor = STATIC_BORDER_COLOR_TRANSPARENT_BLACK," "addressU = TEXTURE_ADDRESS_BORDER, addressV = TEXTURE_ADDRESS_BORDER, addressW = TEXTURE_ADDRESS_BORDER)," "StaticSampler(s8, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR," "addressU = TEXTURE_ADDRESS_MIRROR, addressV = TEXTURE_ADDRESS_MIRROR, addressW = TEXTURE_ADDRESS_MIRROR)," "StaticSampler(s9, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR, borderColor = STATIC_BORDER_COLOR_TRANSPARENT_BLACK," "addressU = TEXTURE_ADDRESS_BORDER, addressV = TEXTURE_ADDRESS_BORDER, addressW = TEXTURE_ADDRESS_BORDER)," "StaticSampler(s10, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 8," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s11, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 8," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s12, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 8," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s13, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 8," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s14, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 2," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s15, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 2," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s16, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 2," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s17, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 2," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_WRAP)" )]
@@ -1574,6 +1579,22 @@ float4 PS_MAIN(VSOutput In): SV_TARGET
     float maxDist = gShadowParams.volFog0.w;
     float3 dir = normalize(P);
     float dist = (deviceZ > 0.0f) ? min(length(P), maxDist) : maxDist;
+
+
+
+
+
+
+
+
+
+    if (gShadowParams.volFog4.w > 0.5f && dir.z < -1.0e-5f)
+    {
+        float waterRelZ = gShadowParams.volFog4.z - gFrameData.lodEye.z;
+        float tWater = waterRelZ / dir.z;
+        if (tWater > 0.0f) { dist = min(dist, tWater); }
+    }
+
     if (dist <= 0.0f) { RETURN(float4(0.0f, 0.0f, 0.0f, 1.0f)); }
 
     int steps = (int)max(gShadowParams.volFog1.y, 1.0f);
@@ -1590,11 +1611,22 @@ float4 PS_MAIN(VSOutput In): SV_TARGET
     float falloff = max(gShadowParams.volFog0.y, 1.0f);
     float base = gShadowParams.volFog0.z;
     float eyeH = gFrameData.lodEye.z;
-    float g = gShadowParams.volFog1.x;
     float ambient = gShadowParams.volFog1.w;
 
 
-    float phase = hgPhase(dot(dir, -gFrameData.sunDir.xyz), g) * 4.0f * 3.14159265f;
+
+
+
+
+
+    float cosT = dot(dir, -gFrameData.sunDir.xyz);
+    float phase = gShadowParams.volFog4.x
+                   + gShadowParams.volFog3.z * hgNorm(cosT, gShadowParams.volFog1.x)
+                   + gShadowParams.volFog3.w * hgNorm(cosT, gShadowParams.volFog3.y);
+
+
+    float phaseCeil = gShadowParams.volFog4.y;
+    if (phaseCeil > 0.0f) { phase = phase / (1.0f + phase / phaseCeil); }
 
     float3 inscatter = float3(0.0f, 0.0f, 0.0f);
     float transmittance = 1.0f;
@@ -1619,7 +1651,7 @@ float4 PS_MAIN(VSOutput In): SV_TARGET
         }
         if (transmittance < 0.003f) { break; }
     }
-#line 133 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/volfog.frag.fsl"
+#line 167 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/volfog.frag.fsl"
     float coverage = 1.0f - transmittance;
     float occlude = saturate(gShadowParams.volFog3.x);
     float3 fogCol = gFrameData.sunCol.xyz * gShadowParams.volFog2.xyz * gShadowParams.volFog2.w;

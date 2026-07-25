@@ -1050,7 +1050,10 @@ STRUCT(ShadowMaskParams)
 
 
 
+
     float4 volFog3;
+#line 143 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
+    float4 volFog4;
 
 
 
@@ -1059,7 +1062,7 @@ STRUCT(ShadowMaskParams)
 
 
     float4 screenAlloc;
-#line 132
+#line 152
 };
 #line 21 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
 #line 35 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
@@ -1292,7 +1295,17 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
     float3 camFwd = P[2].xyz;
     uint waterDbg = (uint)(P[3].x + 0.5f);
 
-    float2 invScreen = gFrameData.debugParams.yz;
+
+
+
+
+
+
+
+
+
+    float2 invAlloc = gShadowParams.screenAlloc.zw;
+    float2 texToVp = gShadowParams.screenAlloc.xy * gShadowParams.screenParams.zw;
     float3 fogCol = gFrameData.fogColNear.rgb;
 
 
@@ -1329,12 +1342,12 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
 
 
     float2 reffactor = (windFactor * dist + 0.1f) * normal.xy;
-    float2 baseUV = In.Position.xy * invScreen;
+    float2 baseUV = In.Position.xy * invAlloc;
 
 
-    float2 distUV = baseUV + reffactor.yx * invScreen;
+    float2 distUV = baseUV + reffactor.yx * invAlloc;
     float sceneDevZ= SampleLvlTex2D(gSceneLinDepth, gSamplerPointClamp, distUV, 0.0f).r;
-    float3 sceneW = reconstructWorld(invVP, distUV, sceneDevZ);
+    float3 sceneW = reconstructWorld(invVP, distUV * texToVp, sceneDevZ);
     float sceneDist= length(sceneW);
     float aboveWater = step(sceneDist + shoreDepthBias, dist);
     float depth = max(shoreDepthBias, sceneDist - dist);
@@ -1342,12 +1355,12 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
     float3 refracted = depthColor;
     float shorefactor = 0.0f;
     if (depth < 4000.0f && aboveWater < 0.5f) {
-        float2 ruv = baseUV + saturate(depth / 100.0f) * reffactor.yx * invScreen;
+        float2 ruv = baseUV + saturate(depth / 100.0f) * reffactor.yx * invAlloc;
         refracted = SampleLvlTex2D(gRefractColor, gSamplerBilinearClamp, ruv, 0.0f).rgb;
 
 
         sceneDevZ = SampleLvlTex2D(gSceneLinDepth, gSamplerPointClamp, ruv, 0.0f).r;
-        sceneW = reconstructWorld(invVP, ruv, sceneDevZ);
+        sceneW = reconstructWorld(invVP, ruv * texToVp, sceneDevZ);
         sceneDist = length(sceneW);
         depth = max(shoreDepthBias, sceneDist - dist);
         float denom = max(abs(dot(EyeVec, camFwd)), 0.25f);
@@ -1364,7 +1377,7 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
 
 
 
-    float2 reflUV = baseUV + float2(-2.1f * reffactor.x, abs(reffactor.y)) * invScreen;
+    float2 reflUV = baseUV + float2(-2.1f * reffactor.x, abs(reffactor.y)) * invAlloc;
     float4 reflSample = SampleLvlTex2D(gReflectColor, gSamplerBilinearClamp, reflUV, 0.0f);
     float3 reflected = reflSample.rgb + fogCol * (1.0f - reflSample.a);
 	float3 deb = reflected;

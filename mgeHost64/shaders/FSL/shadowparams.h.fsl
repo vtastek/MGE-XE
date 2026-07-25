@@ -107,7 +107,7 @@ STRUCT(ShadowMaskParams)
     //          z = fog BASE height in ABSOLUTE world units (Morrowind Z is up),
     //          w = max march distance in world units (the ray stops at the depth buffer or here).
     DATA(float4,   volFog0,     None);
-    // volFog1: x = Henyey-Greenstein anisotropy g (0 = isotropic, ->1 = forward/sun glow),
+    // volFog1: x = FORWARD-lobe Henyey-Greenstein g (0 = isotropic, ->1 = tight sun glow),
     //          y = step count,
     //          z = 1 = fog pass ON,
     //          w = ambient in-scatter floor 0..1 (fraction of the fog colour that lights shadowed
@@ -119,8 +119,28 @@ STRUCT(ShadowMaskParams)
     //              own colour is added (Sunshafts.fx `sunrayocclude`, 0.75 there). 1.0 == the
     //              physically exact composite dst*transmittance; below that the fog is less
     //              destructive of the scene behind it, which is what stops bright shafts blowing out.
-    //          yzw spare.
+    //          y = BACK-lobe g (signed; negative = back-scatter, the anti-sun brightening),
+    //          z = forward-lobe GAIN, w = back-lobe GAIN.
     DATA(float4,   volFog3,     None);
+    // --- DUAL-LOBE phase + water clamp ----------------------------------------------------------
+    // A single HG lobe couples three things that want independent control: the sun halo, the anti-sun
+    // brightening, and the SIDE (~90 deg to the sun) scattering that is most of what reads as "fog".
+    // Raising density to get visible side fog necessarily explodes the forward lobe, because HG's
+    // peak scales with the same number. So the phase is a WEIGHTED SUM of three normalised terms —
+    // isotropic + forward HG + backward HG — each with its own gain:
+    //     phase = iso + fwdGain * HG_n(cos, gF) + backGain * HG_n(cos, gB)      (HG_n: 1 == isotropic)
+    // and the sum is passed through a soft ceiling so the forward lobe asymptotes instead of blowing
+    // out (a hard clamp would draw a visible disc edge around the sun).
+    // volFog4: x = ISOTROPIC gain (the side/horizontal knob — raises fog everywhere without touching
+    //              either lobe; this is the one to reach for when "there is not enough fog"),
+    //          y = phase soft ceiling (Reinhard knee; the phase asymptotes to this),
+    //          z = water-plane clamp: ABSOLUTE world Z of the water surface,
+    //          w = 1 = water clamp ACTIVE this frame (water drawn and camera above it).
+    // The water clamp exists because gSceneLinDepth is the OPAQUE PREPASS: water writes depth after
+    // it, so over open sea the depth buffer holds the seabed — or nothing at all, which reads as sky.
+    // Either way the ray marches straight through the water surface and keeps accumulating
+    // near-ground-density fog, which is exactly the bright band above the horizon over water.
+    DATA(float4,   volFog4,     None);
     // ALLOCATION size of the screen-sized render targets — NOT the current render size.
     // These differ: the host allocates every size-dependent RT at the render-scale CEILING
     // (2x backbuffer) and draws into a sub-VIEWPORT of it, so at scale 1.0 the live image occupies

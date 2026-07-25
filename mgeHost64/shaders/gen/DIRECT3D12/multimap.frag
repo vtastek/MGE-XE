@@ -1050,7 +1050,10 @@ STRUCT(ShadowMaskParams)
 
 
 
+
     float4 volFog3;
+#line 143 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
+    float4 volFog4;
 
 
 
@@ -1059,7 +1062,7 @@ STRUCT(ShadowMaskParams)
 
 
     float4 screenAlloc;
-#line 132
+#line 152
 };
 #line 21 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
 #line 35 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
@@ -1588,7 +1591,7 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
 
 
     uint aoFlags = (uint)(gFrameData.debugParams.w + 0.5f);
-    float2 aoUv = In.Position.xy * gFrameData.debugParams.yz;
+    float2 aoUv = In.Position.xy * gShadowParams.screenAlloc.zw;
     float4 aoSample = SampleTex2D(gAO, gSamplerAnisotropic, aoUv);
     if ((aoFlags & 2u) != 0u) { N = normalize(aoSample.rgb); }
 

@@ -48,7 +48,7 @@ float4 PS_MAIN( VSOutput In )
     // pAOBlur, so a single tap suffices. debugParams.w = toggle bitmask (bit0 AO->ambient, bit1
     // bent normal). Kept in lockstep with opaque.frag.
     uint   aoFlags  = (uint)(gFrameData.debugParams.w + 0.5f);
-    float2 aoUv     = In.Position.xy * gFrameData.debugParams.yz;
+    float2 aoUv     = In.Position.xy * gShadowParams.screenAlloc.zw;   // gAO is ALLOC-sized, not render-sized
     float4 aoSample = SampleTex2D(gAO, gSamplerAnisotropic, aoUv);
     if ((aoFlags & 2u) != 0u) { N = normalize(aoSample.rgb); }   // "Bent normal enable" tick
 
