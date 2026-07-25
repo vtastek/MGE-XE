@@ -195,6 +195,12 @@ BEGIN_SRT_NO_AB(SrtData)
         // the opaque/alpha receiver samples it for sun shadows. Bound into pPerFrameSet like the
         // atlas views; harmless null tail elsewhere.
         DECL_TEXTURE(PerFrame, Tex2D(float4), gSunMoments)
+        // ...and the SAME atlas's raw D32 depth — the depth buffer the caster pass already z-tests
+        // against, which up to now was written and thrown away. The near cascade's PCSS/PCF reads it
+        // directly (msmrecv.h.fsl), so hard-surface softness costs no extra pass and no extra VRAM.
+        // Declared Tex2D(float) exactly like gShadowAtlas (also a D32 render target sampled as an
+        // SRV). Rests in SHADER_RESOURCE like gSunMoments; only DEPTH_WRITE inside the caster pass.
+        DECL_TEXTURE(PerFrame, Tex2D(float), gSunDepth)
         // Clustered forward lighting: the froxel light-mask (128 bits/froxel = 4 uint), written by
         // froxelassign.comp (UAV) and read here as an SRV. Appended AFTER gShadowAtlasDyn so every
         // existing PerFrame offset stays stable. Bound once into pPerFrameSet (like gShadowMask); only

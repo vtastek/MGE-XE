@@ -978,7 +978,7 @@ SamplerState gSampler2xWrapClamp : register( s17 , space100 ) ;
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
 #line 20 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
-#line 22 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
+#line 26 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
 STRUCT(ShadowMaskParams)
 {
     float4x4 invViewProj;
@@ -1015,12 +1015,21 @@ STRUCT(ShadowMaskParams)
 
 
     float4x4 sunViewProj[ 2 ];
-#line 71 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
+#line 75 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
     float4 sunParams;
 
 
     float4 sunCascadeTexel;
-#line 75
+#line 94 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
+    float4 sunPcf0;
+
+
+
+
+
+
+    float4 sunPcf1;
+#line 102
 };
 #line 21 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
 #line 35 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
@@ -1174,7 +1183,13 @@ STRUCT(LightData)
 
 
 
-        Buffer(uint) gFroxelMask :  register(t10,space1);
+        Tex2D(float) gSunDepth :  register(t10,space1);
+
+
+
+
+
+        Buffer(uint) gFroxelMask :  register(t11,space1);
 
 
 
@@ -1182,14 +1197,14 @@ STRUCT(LightData)
 
 
 
-        Buffer(uint) gFroxelMaskNear :  register(t11,space1);
+        Buffer(uint) gFroxelMaskNear :  register(t12,space1);
 
 
 
 
 
 
-        Buffer(float4) gUVAnim :  register(t12,space1);
+        Buffer(float4) gUVAnim :  register(t13,space1);
 
 
 
@@ -1198,13 +1213,13 @@ STRUCT(LightData)
 
 
 
-        CBUFFER(ShadowMaskParams) gShadowParams :  register(b13,space1);
+        CBUFFER(ShadowMaskParams) gShadowParams :  register(b14,space1);
 
 
 
 
         CBUFFER(LightData) gLights :  register(b0,space3);
-#line 247 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+#line 253 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
         Tex2D(float4) gTextures[ 896 ] :  register(t0,space0);
 
 

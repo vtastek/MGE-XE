@@ -1794,6 +1794,31 @@ namespace {
     // covered at wide extents, capped at the tap radius.
     float              g_sunShadowSoftness = 24.0f; // Gaussian sigma in WORLD units (0 = blur off)
     constexpr float    kSunBlurSigmaMin    = 0.75f; // texels — below this the texel grid shows through
+    // --- NEAR cascade: PCSS + PCF over the raw depth (msmrecv.h.fsl) ---------------------------
+    // The moments blur above cannot make cascade 0 soft: its penumbra is capped by kSunBlurRadius
+    // texels, so past sigma == 4 the softness knob does nothing and what remains is a truncated,
+    // axis-aligned kernel — square blocks, worst on terrain (receiver and occluder at nearly equal
+    // depth is where the quadrature is least stable). Cascade 0 therefore samples the caster pass's
+    // own D32 depth instead, with a blocker search driving a variable-radius disc. Costs no extra
+    // pass and no extra VRAM: that depth buffer was already being written and discarded.
+    bool               g_sunPcfNear     = true;   // false = MSM everywhere (the A/B for this whole path)
+    // DIMENSIONLESS softening ratio: penumbra_world = spread * (blocker-to-receiver gap). 0.05 means
+    // "5% of the gap". Deliberately not a texel or world count — the host reconverts it into texels
+    // against the LIVE slab depth and cascade-0 texel size every publish, so moving the extent knobs
+    // cannot silently rescale a tuned value (the bias/softness lesson, twice burned).
+    // The physically honest number for the sun is ~0.009 (0.53 degrees of angular diameter); that is
+    // under one texel over any gap in a Morrowind cell, i.e. invisibly hard, so this is exaggerated
+    // like every game's sun.
+    float              g_sunPcssSpread   = 0.06f;
+    float              g_sunPcssSearch   = 8.0f;  // blocker-search radius in TEXELS
+    float              g_sunPcfMinRadius = 1.2f;  // TEXELS — contact hardness floor
+    float              g_sunPcfMaxRadius = 12.0f; // TEXELS — past this SUN_PCF_TAPS breaks into rings
+    // Depth biases for the near cascade, in WORLD units (normalised at publish, like g_sunShadowBias).
+    // Separate numbers because a binary depth compare and MSM's quadrature fail differently: MSM
+    // needs a large constant bias to survive moment quantisation, PCF needs a small constant one plus
+    // a slope term for surfaces raking away from the sun.
+    float              g_sunPcfBias      = 3.0f;  // world units, constant
+    float              g_sunPcfSlopeBias = 2.0f;  // world units, scaled by tan(acos(N.L))
     constexpr float    kShadowNearZ      = 4.0f;   // face frustum near (world u); far = the light's 2·radius
     // How long a slot's lastWorld record stays a caster candidate after the item was last in
     // the client's visible set. Statics don't move so stale is correct; the window only bounds
@@ -2791,7 +2816,10 @@ namespace {
                 smdd.mArraySize = 1; smdd.mMipLevels = 1;
                 smdd.mSampleCount = SAMPLE_COUNT_1; smdd.mSampleQuality = 0;
                 smdd.mFormat = TinyImageFormat_D32_SFLOAT;
-                smdd.mStartState = RESOURCE_STATE_DEPTH_WRITE;
+                // RESTS in SHADER_RESOURCE (like pShadowAtlas, and like pSunMoments beside it): the
+                // near cascade's PCSS/PCF samples this as gSunDepth, so it is a read-only SRV for the
+                // whole frame and only flips to DEPTH_WRITE inside the caster pass.
+                smdd.mStartState = RESOURCE_STATE_SHADER_RESOURCE;
                 smdd.mClearValue.depth = 0.0f;   // reverse-Z far
                 smdd.mClearValue.stencil = 0;
                 smdd.mDescriptors = DESCRIPTOR_TYPE_TEXTURE;
@@ -3480,6 +3508,13 @@ namespace {
                 p[np].mIndex = SRT_RES_IDX(SrtData, PerFrame, gSunMoments);
                 p[np].mCount = 1;
                 p[np].ppTextures = &g_live.pSunMoments->pTexture;
+                ++np;
+            }
+            // ...and its raw depth, for the near cascade's PCSS/PCF. Same resting state, same pass.
+            if (g_live.pSunMomentsDepth) {
+                p[np].mIndex = SRT_RES_IDX(SrtData, PerFrame, gSunDepth);
+                p[np].mCount = 1;
+                p[np].ppTextures = &g_live.pSunMomentsDepth->pTexture;
                 ++np;
             }
             // FP direct-atlas shadow reception: the per-slot params. Read only by opaque.frag's
@@ -4951,6 +4986,11 @@ namespace {
                     p[rn].mCount = 1; p[rn].ppTextures = &g_live.pSunMoments->pTexture;
                     ++rn;
                 }
+                if (g_live.pSunMomentsDepth) {
+                    p[rn].mIndex = SRT_RES_IDX(SrtData, PerFrame, gSunDepth);
+                    p[rn].mCount = 1; p[rn].ppTextures = &g_live.pSunMomentsDepth->pTexture;
+                    ++rn;
+                }
                 updateDescriptorSet(R, 0, g_live.pPerFrameSetReflectGeo, rn, p);
             }
 
@@ -5509,6 +5549,11 @@ namespace {
                 if (g_live.pSunMoments) {
                     p[fpn].mIndex = SRT_RES_IDX(SrtData, PerFrame, gSunMoments);
                     p[fpn].mCount = 1; p[fpn].ppTextures = &g_live.pSunMoments->pTexture;
+                    ++fpn;
+                }
+                if (g_live.pSunMomentsDepth) {
+                    p[fpn].mIndex = SRT_RES_IDX(SrtData, PerFrame, gSunDepth);
+                    p[fpn].mCount = 1; p[fpn].ppTextures = &g_live.pSunMomentsDepth->pTexture;
                     ++fpn;
                 }
                 updateDescriptorSet(R, 0, g_live.pPerFrameSetFP, fpn, p);
@@ -6829,8 +6874,17 @@ namespace {
           t.sliderF("Sun shadow: NEAR cascade half-extent (world u)", &g_sunShadowNearRange, 256.0f, 16384.0f, 128.0f);
           t.sliderF("Sun shadow: depth bias (WORLD units)", &g_sunShadowBias, 0.0f, 64.0f, 1.0f, "%.1f");
           t.sliderF("Sun shadow: normal offset (TEXELS; kills slope acne)", &g_sunShadowNormalOff, 0.0f, 8.0f, 0.25f, "%.2f");
-          t.sliderF("Sun shadow: SOFTNESS (penumbra, WORLD units; 0 = raw/hard)", &g_sunShadowSoftness, 0.0f, 128.0f, 2.0f);
+          t.sliderF("Sun shadow: MSM softness (FAR cascades + volumetrics; WORLD units)", &g_sunShadowSoftness, 0.0f, 128.0f, 2.0f);
           t.sliderF("Sun shadow: light-bleed reduction (higher = deeper/tighter)", &g_sunShadowLBR, 0.0f, 0.95f, 0.05f);
+          // NEAR cascade only — these drive PCSS/PCF over the raw depth and have nothing to do with
+          // the MSM softness above (which now shapes the far cascades and the future volumetrics).
+          t.checkbox("Sun NEAR: PCSS+PCF (off = MSM everywhere, the A/B)", &g_sunPcfNear);
+          t.sliderF("Sun NEAR: penumbra SPREAD (fraction of blocker gap)", &g_sunPcssSpread, 0.0f, 0.5f, 0.005f, "%.3f");
+          t.sliderF("Sun NEAR: blocker search radius (TEXELS)", &g_sunPcssSearch, 1.0f, 32.0f, 1.0f, "%.0f");
+          t.sliderF("Sun NEAR: min PCF radius (TEXELS; contact hardness)", &g_sunPcfMinRadius, 0.5f, 8.0f, 0.1f, "%.2f");
+          t.sliderF("Sun NEAR: max PCF radius (TEXELS; higher = rings)", &g_sunPcfMaxRadius, 1.0f, 32.0f, 0.5f, "%.1f");
+          t.sliderF("Sun NEAR: PCF depth bias (WORLD units)", &g_sunPcfBias, 0.0f, 32.0f, 0.5f, "%.2f");
+          t.sliderF("Sun NEAR: PCF slope bias (WORLD units x tan)", &g_sunPcfSlopeBias, 0.0f, 32.0f, 0.5f, "%.2f");
           t.flush(); }
 
         // -- Tab: Flicker (procedural light/shadow scintillation) --
@@ -16546,8 +16600,13 @@ namespace ForgeRender {
     constexpr uint32_t kSunVPFloat     = 416;
     constexpr uint32_t kSunParamsFloat = kSunVPFloat + 16 * kSunCascades;
     constexpr uint32_t kSunTexelFloat  = kSunParamsFloat + 4;
-    static_assert((kSunTexelFloat + 4) * sizeof(float) <= 2048,
+    constexpr uint32_t kSunPcf0Float   = kSunTexelFloat + 4;    // near-cascade PCSS geometry
+    constexpr uint32_t kSunPcf1Float   = kSunPcf0Float + 4;     // near-cascade biases + enable
+    static_assert((kSunPcf1Float + 4) * sizeof(float) <= 2048,
                   "ShadowMaskParams overflows its 2048B CBV — too many sun cascades");
+    // msmrecv.h.fsl's PCSS works in TEXELS, so SUN_SHADOW_RES has to agree with the atlas the host
+    // actually allocated. Same mirroring contract as SUN_CASCADES / kSunCascades.
+    static_assert(kSunShadowRes == 2048, "SUN_SHADOW_RES in shadowparams.h.fsl must match kSunShadowRes");
 
     void publishSunShadowParams(const float* sunVPs, const float* cascadeTexels, bool active) {
         if (!g_live.pShadowMaskParamsCbv || !g_live.pShadowMaskParamsCbv->pCpuMappedAddress) { return; }
@@ -16563,6 +16622,21 @@ namespace ForgeRender {
         mp[kSunParamsFloat + 1] = g_sunShadowBias / (4.0f * std::max(g_sunShadowRange, 1.0f));
         mp[kSunParamsFloat + 2] = std::max(0.0f, std::min(g_sunShadowLBR, 0.95f));
         mp[kSunParamsFloat + 3] = g_sunShadowNormalOff;
+
+        // --- Near-cascade PCSS/PCF. Every world knob is reconverted here against the LIVE slab and
+        // cascade-0 texel, so a tuned value keeps its physical meaning when the extent knobs move.
+        const float slabWorld = 4.0f * std::max(g_sunShadowRange, 1.0f);
+        const float texel0    = std::max((2.0f * sunCascadeExtent(0)) / (float)kSunShadowRes, 1.0e-3f);
+        // radiusTexels = spread * (dzNorm * slabWorld) / texel0 — fold the constant part into one
+        // multiplier so the shader keeps a single madd.
+        mp[kSunPcf0Float + 0] = g_sunPcssSearch;
+        mp[kSunPcf0Float + 1] = g_sunPcssSpread * slabWorld / texel0;
+        mp[kSunPcf0Float + 2] = g_sunPcfMinRadius;
+        mp[kSunPcf0Float + 3] = std::max(g_sunPcfMaxRadius, g_sunPcfMinRadius);
+        mp[kSunPcf1Float + 0] = g_sunPcfBias      / slabWorld;
+        mp[kSunPcf1Float + 1] = g_sunPcfSlopeBias / slabWorld;
+        mp[kSunPcf1Float + 2] = (active && g_sunPcfNear) ? 1.0f : 0.0f;
+        mp[kSunPcf1Float + 3] = 0.0f;
     }
 
     // Separable Gaussian over the sun moments map — THE pass that makes MSM soft (see
@@ -16667,11 +16741,16 @@ namespace ForgeRender {
 
         cmdBeginDebugMarker(g_live.pCmd, 0.9f, 0.85f, 0.2f, "SUN SHADOW (DL statics)");
         {
-            RenderTargetBarrier rtb = {};
-            rtb.pRenderTarget = g_live.pSunMoments;
-            rtb.mCurrentState = RESOURCE_STATE_SHADER_RESOURCE;
-            rtb.mNewState = RESOURCE_STATE_RENDER_TARGET;
-            cmdResourceBarrier(g_live.pCmd, 0, nullptr, 0, nullptr, 1, &rtb);
+            // Both attachments rest in SHADER_RESOURCE (the moments feed the MSM receiver, the depth
+            // feeds the near cascade's PCSS) and are acquired together for the caster pass.
+            RenderTargetBarrier rtb[2] = {};
+            rtb[0].pRenderTarget = g_live.pSunMoments;
+            rtb[0].mCurrentState = RESOURCE_STATE_SHADER_RESOURCE;
+            rtb[0].mNewState = RESOURCE_STATE_RENDER_TARGET;
+            rtb[1].pRenderTarget = g_live.pSunMomentsDepth;
+            rtb[1].mCurrentState = RESOURCE_STATE_SHADER_RESOURCE;
+            rtb[1].mNewState = RESOURCE_STATE_DEPTH_WRITE;
+            cmdResourceBarrier(g_live.pCmd, 0, nullptr, 0, nullptr, 2, rtb);
         }
         // Bind the atlas ONCE with CLEAR — that clears every tile (and the shared depth) in one go —
         // then walk the cascades with nothing but a viewport + descriptor-instance change per tile.
@@ -16709,11 +16788,14 @@ namespace ForgeRender {
         }
         cmdBindRenderTargets(g_live.pCmd, nullptr);
         {
-            RenderTargetBarrier rtb = {};
-            rtb.pRenderTarget = g_live.pSunMoments;
-            rtb.mCurrentState = RESOURCE_STATE_RENDER_TARGET;
-            rtb.mNewState = RESOURCE_STATE_SHADER_RESOURCE;
-            cmdResourceBarrier(g_live.pCmd, 0, nullptr, 0, nullptr, 1, &rtb);
+            RenderTargetBarrier rtb[2] = {};
+            rtb[0].pRenderTarget = g_live.pSunMoments;
+            rtb[0].mCurrentState = RESOURCE_STATE_RENDER_TARGET;
+            rtb[0].mNewState = RESOURCE_STATE_SHADER_RESOURCE;
+            rtb[1].pRenderTarget = g_live.pSunMomentsDepth;
+            rtb[1].mCurrentState = RESOURCE_STATE_DEPTH_WRITE;
+            rtb[1].mNewState = RESOURCE_STATE_SHADER_RESOURCE;
+            cmdResourceBarrier(g_live.pCmd, 0, nullptr, 0, nullptr, 2, rtb);
         }
         cmdEndDebugMarker(g_live.pCmd);
         // Restore the full-screen viewport/scissor: this pass runs mid-frame now (before reflect +

@@ -978,7 +978,7 @@ SamplerState gSampler2xWrapClamp : register( s17 , space100 ) ;
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
 #line 20 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
-#line 22 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
+#line 26 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
 STRUCT(ShadowMaskParams)
 {
     float4x4 invViewProj;
@@ -1015,12 +1015,21 @@ STRUCT(ShadowMaskParams)
 
 
     float4x4 sunViewProj[ 2 ];
-#line 71 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
+#line 75 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
     float4 sunParams;
 
 
     float4 sunCascadeTexel;
-#line 75
+#line 94 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
+    float4 sunPcf0;
+
+
+
+
+
+
+    float4 sunPcf1;
+#line 102
 };
 #line 21 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
 #line 35 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
@@ -1174,7 +1183,13 @@ STRUCT(LightData)
 
 
 
-        Buffer(uint) gFroxelMask :  register(t10,space1);
+        Tex2D(float) gSunDepth :  register(t10,space1);
+
+
+
+
+
+        Buffer(uint) gFroxelMask :  register(t11,space1);
 
 
 
@@ -1182,14 +1197,14 @@ STRUCT(LightData)
 
 
 
-        Buffer(uint) gFroxelMaskNear :  register(t11,space1);
+        Buffer(uint) gFroxelMaskNear :  register(t12,space1);
 
 
 
 
 
 
-        Buffer(float4) gUVAnim :  register(t12,space1);
+        Buffer(float4) gUVAnim :  register(t13,space1);
 
 
 
@@ -1198,13 +1213,13 @@ STRUCT(LightData)
 
 
 
-        CBUFFER(ShadowMaskParams) gShadowParams :  register(b13,space1);
+        CBUFFER(ShadowMaskParams) gShadowParams :  register(b14,space1);
 
 
 
 
         CBUFFER(LightData) gLights :  register(b0,space3);
-#line 247 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+#line 253 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
         Tex2D(float4) gTextures[ 896 ] :  register(t0,space0);
 
 
@@ -1310,6 +1325,104 @@ float sunCascadeOcclusion(int c, float3 p, float zBias)
     float4 moments = UnpackMoments(SampleLvlTex2D(gSunMoments, gSamplerBilinearClamp, uv, 0));
     return ComputeMSMShadowIntensity(moments, zf);
 }
+#line 147 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/msmrecv.h.fsl"
+float2 sunDiscTap(int i, int n, float rot)
+{
+    float r = sqrt((float(i) + 0.5f) / float(n));
+    float th = float(i) * 2.39996323f + rot;
+    return float2(r * cos(th), r * sin(th));
+}
+
+
+
+
+
+
+float sunDiscRotation(float3 worldPosRel)
+{
+    float2 h = float2(dot(worldPosRel, float3(0.7391f, 0.3179f, 0.5107f)),
+                      dot(worldPosRel, float3(0.2311f, 0.6203f, 0.1157f)));
+    return frac(sin(dot(h, float2(12.9898f, 78.233f))) * 43758.5453f) * 6.2831853f;
+}
+
+
+
+
+
+
+
+float sunPcfTap(float2 uv, float ref)
+{
+    float4 g = GatherRedTex2D(gSunDepth, gSamplerPointClamp, uv);
+
+    float4 occ = step(ref, g);
+
+    float2 t = frac(uv *  float2(float( 2048 * 2 ), float( 2048 ))  - 0.5f);
+    return lerp(lerp(occ.w, occ.z, t.x), lerp(occ.x, occ.y, t.x), t.y);
+}
+
+
+float sunNearOcclusion(float3 p, float3 worldPosRel, float slopeBias)
+{
+    float4 posLS = mul(gShadowParams.sunViewProj[0], float4(p, 1.0f));
+    posLS.xyz /= posLS.w;
+
+    float2 uvTile = saturate(posLS.xy * float2(0.5f, -0.5f) + float2(0.5f, 0.5f));
+    float2 uv0 = float2(uvTile.x * (1.0f / float( 2 )), uvTile.y);
+
+    float ref = posLS.z + gShadowParams.sunPcf1.x + slopeBias;
+    float rot = sunDiscRotation(worldPosRel);
+    float srch = gShadowParams.sunPcf0.x;
+
+
+
+    float2 lo =  float2(1.0f / float( 2048 * 2 ), 1.0f / float( 2048 )) ;
+    float2 hi = float2(1.0f / float( 2 ), 1.0f) -  float2(1.0f / float( 2048 * 2 ), 1.0f / float( 2048 )) ;
+
+
+    float blockerSum = 0.0f;
+    float blockerCnt = 0.0f;
+    UNROLL for (int i = 0; i <  12 ; ++i)
+    {
+        float2 sp = clamp(uv0 + sunDiscTap(i,  12 , rot) * srch *  float2(1.0f / float( 2048 * 2 ), 1.0f / float( 2048 )) , lo, hi);
+        float d = SampleLvlTex2D(gSunDepth, gSamplerPointClamp, sp, 0).r;
+        float hit = step(ref, d);
+        blockerSum += d * hit;
+        blockerCnt += hit;
+    }
+
+    if (blockerCnt < 0.5f) { return 0.0f; }
+
+
+
+
+    float dzNorm = max(blockerSum / blockerCnt - posLS.z, 0.0f);
+    float radius = clamp(gShadowParams.sunPcf0.y * dzNorm,
+                          gShadowParams.sunPcf0.z, gShadowParams.sunPcf0.w);
+
+
+    float occlusion = 0.0f;
+    UNROLL for (int j = 0; j <  16 ; ++j)
+    {
+        float2 sp = clamp(uv0 + sunDiscTap(j,  16 , rot) * radius *  float2(1.0f / float( 2048 * 2 ), 1.0f / float( 2048 )) , lo, hi);
+        occlusion += sunPcfTap(sp, ref);
+    }
+    return occlusion * (1.0f / float( 16 ));
+}
+
+
+
+
+
+
+
+
+
+float sunCascadeShadow(int c, float3 p, float3 worldPosRel, float zBias, float slopeBias)
+{
+    if (c == 0 && gShadowParams.sunPcf1.z > 0.5f) { return sunNearOcclusion(p, worldPosRel, slopeBias); }
+    return sunCascadeOcclusion(c, p, zBias);
+}
 
 
 
@@ -1345,7 +1458,16 @@ float sunShadowVisibility(float3 worldPosRel, float3 N)
     float noff = gShadowParams.sunParams.w;
     float4 texel = gShadowParams.sunCascadeTexel;
 
-    float occlusion = sunCascadeOcclusion(sel, worldPosRel + N * (noff * texel[sel]), bias);
+
+
+
+
+
+    float NdotL = saturate(dot(N, -gFrameData.sunDir.xyz));
+    float slopeBias = gShadowParams.sunPcf1.y * min(sqrt(1.0f - NdotL * NdotL) / max(NdotL, 0.1f), 10.0f);
+
+    float occlusion = sunCascadeShadow(sel, worldPosRel + N * (noff * texel[sel]), worldPosRel,
+                                       bias, slopeBias);
 
 
 
@@ -1355,7 +1477,8 @@ float sunShadowVisibility(float3 worldPosRel, float3 N)
         float t = saturate((m - band) /  0.12f );
         if (sel + 1 <  2 )
         {
-            float occNext = sunCascadeOcclusion(sel + 1, worldPosRel + N * (noff * texel[sel + 1]), bias);
+            float occNext = sunCascadeShadow(sel + 1, worldPosRel + N * (noff * texel[sel + 1]),
+                                             worldPosRel, bias, slopeBias);
             occlusion = lerp(occlusion, occNext, t);
         }
         else

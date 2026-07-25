@@ -18,6 +18,10 @@
 // by side into ONE moments atlas (cascade c owns u in [c/N, (c+1)/N]) so every receiver keeps its
 // single gSunMoments binding and no PerFrame set has to grow.
 #define SUN_CASCADES 2
+// PER-CASCADE tile resolution. MUST match host kSunShadowRes (static_asserted there). Needed in the
+// shader only by the near cascade's PCSS/PCF, which works in TEXELS and therefore has to know the
+// atlas's pixel grid — the moments receiver is pure uv and never cared.
+#define SUN_SHADOW_RES 2048
 
 STRUCT(ShadowMaskParams)
 {
@@ -72,4 +76,27 @@ STRUCT(ShadowMaskParams)
     // Cascade c's shadow-map texel size in WORLD units (x = c0 .. w = c3; lanes past SUN_CASCADES
     // are 0). Feeds the normal-offset scaling above.
     DATA(float4,   sunCascadeTexel, None);
+    // --- NEAR-cascade PCSS + PCF (the hard-surface receiver) -----------------------------------
+    // Cascade 0 does NOT use the moments above. MSM's penumbra is bounded by the moments blur's tap
+    // radius (4 texels), so its softness saturates and what is left is a truncated, axis-aligned
+    // kernel — the "square vectorisation" that shows up worst on terrain, where receiver and occluder
+    // depths are close and the quadrature is least stable. Cascade 0 instead runs a blocker search +
+    // variable-radius rotated-disc PCF over the RAW depth the caster pass already wrote
+    // (gSunDepth) — penumbra decoupled from any map-space blur. The moments stay live for every OTHER
+    // cascade and for volumetrics, which need one cheap filterable tap per ray step and cannot afford
+    // a tap storm. Both representations come out of the SAME caster pass; neither costs a second one.
+    // sunPcf0: x = blocker-search radius in TEXELS,
+    //          y = light size in TEXELS (penumbra = y * (zRecv - zBlocker)/zBlocker, the PCSS
+    //              similar-triangles term — this is THE softness knob),
+    //          z = min PCF radius in TEXELS (contact hardness floor; below ~1 the grid shows),
+    //          w = max PCF radius in TEXELS (bounds the tap spread so the disc cannot outrun its
+    //              sample count and break into rings).
+    DATA(float4,   sunPcf0,     None);
+    // sunPcf1: x = PCF depth bias in NORMALISED sun-depth (converted host-side from a WORLD knob,
+    //              like sunParams.y — a binary depth compare needs its OWN, usually smaller, bias
+    //              than MSM's quadrature, so it does not share that number),
+    //          y = slope-scaled bias in the same units, multiplied by tan(acos(N.L)),
+    //          z = 1 = PCSS/PCF near cascade ON, 0 = fall back to MSM everywhere (the A/B),
+    //          w = spare.
+    DATA(float4,   sunPcf1,     None);
 };
