@@ -86,6 +86,10 @@
 // the merged ComputeRootSignature (1 CBV + 1 UAV — within the cull set's union). froxelclear.comp +
 // froxelassign.comp both include it. See tasks/forge-clustered-lighting.md.
 #include "shaders/FSL/froxelassign.srt.h"
+// Sun shadows Phase B2: the moments-map blur SRT (SunBlurSrtData, PerFrame frequency — its own
+// resource names so the merged ComputeRootSignature has no aliasing with aoblur's PerFrame set).
+// Two instances of the one set drive the separable H/V ping-pong. See tasks/forge-sun-shadows.md.
+#include "shaders/FSL/sunblur.srt.h"
 
 // App-layer callback normally provided by WindowsBase.cpp (which we exclude — it
 // drags in the window system). The backend calls this on device-lost. Headless:
@@ -1445,6 +1449,12 @@ namespace {
         // (gFrameData copy, viewProj := sun ortho VP), like pReflectFrameCbvGeo's second-view pattern.
         RenderTarget*  pSunMoments = nullptr;               // kSunShadowRes² RGBA16_UNORM packed 4-moment map
         RenderTarget*  pSunMomentsDepth = nullptr;          // kSunShadowRes² D32 reverse-Z (sun pass z-test)
+        Texture*       pSunMomentsScratch = nullptr;        // separable-blur ping-pong target (same format)
+        Buffer*        pSunBlurParamsCbv[2] = {};           // [0] horizontal, [1] vertical
+        DescriptorSet* pSunBlurSet = nullptr;               // 2 instances: 0 = H, 1 = V
+        Pipeline*      pSunBlurPipeline = nullptr;
+        Shader*        pSunBlurShader = nullptr;
+        bool           sunBlurReady = false;
         Buffer*        pSunFrameCbv = nullptr;              // gFrameData copy, viewProj := sun ortho VP
         DescriptorSet* pPerFrameSetSun = nullptr;           // PerFrame set bound to pSunFrameCbv
         Shader*        pSunShadowViewShader = nullptr;      // shadowatlasview.vert + sunshadowview.frag (F12 13)
@@ -1747,6 +1757,12 @@ namespace {
     float              g_sunShadowBias     = 0.0015f;// normalised sun-depth units (span = 4·range world u)
     float              g_sunShadowLBR      = 0.25f;  // light-bleeding reduction (amplify occlusion 1/(1-x))
     float              g_sunShadowNormalOff= 12.0f;  // normal-offset in world units (slope acne)
+    // Moments-map blur sigma in TEXELS (0 = raw map). This is the softness control: MSM's penumbra
+    // comes from the DEPTH SPREAD inside a texel's neighbourhood, and an unblurred texel is a Dirac
+    // (no spread → hard, pixel-shaped edges). Because it is measured in texels, softness scales with
+    // the ortho extent, so coarser texels are always hidden behind a proportionally wider penumbra.
+    constexpr uint32_t kSunBlurRadius    = 4;      // MUST match SUN_BLUR_RADIUS (sunblur.comp.fsl)
+    float              g_sunShadowSoftness = 2.0f; // Gaussian sigma in texels; clamped to the radius
     constexpr float    kShadowNearZ      = 4.0f;   // face frustum near (world u); far = the light's 2·radius
     // How long a slot's lastWorld record stays a caster candidate after the item was last in
     // the client's visible set. Statics don't move so stale is correct; the window only bounds
@@ -2641,9 +2657,40 @@ namespace {
                 //   x = 1.5-2+0.5 = 0, y = 4-4 = 0, z = sqrt(3)/2 - sqrt(12)/9 + 0.5, w = 0.5+0.5 = 1.
                 smd.mClearValue.r = 0.0f; smd.mClearValue.g = 0.0f;
                 smd.mClearValue.b = 0.98112522f; smd.mClearValue.a = 1.0f;
-                smd.mDescriptors = DESCRIPTOR_TYPE_TEXTURE;
+                // RW as well as SRV: the separable moments blur ping-pongs
+                // pSunMoments -(H)-> pSunMomentsScratch -(V)-> pSunMoments, so the final result
+                // lands back in the texture every receiver already samples (no per-frame rebind).
+                smd.mDescriptors = (DescriptorType)(DESCRIPTOR_TYPE_TEXTURE | DESCRIPTOR_TYPE_RW_TEXTURE);
                 smd.pName = "sunMoments";
                 addRenderTarget(R, &smd, &g_live.pSunMoments);
+
+                // Blur scratch — a plain texture (never a render target), same format/size.
+                TextureDesc sbd = {};
+                sbd.mWidth = kSunShadowRes; sbd.mHeight = kSunShadowRes; sbd.mDepth = 1;
+                sbd.mArraySize = 1; sbd.mMipLevels = 1;
+                sbd.mSampleCount = SAMPLE_COUNT_1;
+                sbd.mFormat = TinyImageFormat_R16G16B16A16_UNORM;
+                sbd.mStartState = RESOURCE_STATE_UNORDERED_ACCESS;
+                sbd.mDescriptors = (DescriptorType)(DESCRIPTOR_TYPE_TEXTURE | DESCRIPTOR_TYPE_RW_TEXTURE);
+                sbd.pName = "sunMomentsScratch";
+                TextureLoadDesc sbl = {};
+                sbl.ppTexture = &g_live.pSunMomentsScratch;
+                sbl.pDesc = &sbd;
+                addResource(&sbl, nullptr);
+
+                // Two tiny param cbuffers, one per blur direction — the set has two INSTANCES and
+                // each binds its own, so both dispatches ride one descriptor set.
+                for (uint32_t d = 0; d < 2; ++d) {
+                    BufferLoadDesc sbp = {};
+                    sbp.mDesc.mDescriptors = DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+                    sbp.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_CPU_TO_GPU;
+                    sbp.mDesc.mFlags = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
+                    sbp.mDesc.mSize = 256;             // one float4; 256B = min CBV
+                    sbp.mDesc.pName = "sunBlurParamsCbv";
+                    sbp.pData = nullptr;
+                    sbp.ppBuffer = &g_live.pSunBlurParamsCbv[d];
+                    addResource(&sbp, nullptr);
+                }
 
                 RenderTargetDesc smdd = {};
                 smdd.mWidth = kSunShadowRes; smdd.mHeight = kSunShadowRes; smdd.mDepth = 1;
@@ -4956,6 +5003,44 @@ namespace {
                 d[3].ppTextures = &g_live.pAOBlur;
                 updateDescriptorSet(R, 0, g_live.pAOBlurSet, 4, d);
             }
+            // --- SUN moments blur: one shader, one set with TWO INSTANCES (0 = horizontal into the
+            // scratch, 1 = vertical back into the moments map). Instances rather than two sets is the
+            // same pattern the per-face shadow passes use, and it keeps the ping-pong to one bind
+            // point. Created only if the sun RTs exist; failure just leaves the blur off. ---
+            if (g_live.pSunMoments && g_live.pSunMomentsScratch
+                && g_live.pSunBlurParamsCbv[0] && g_live.pSunBlurParamsCbv[1]) {
+                ShaderLoadDesc sbs = {};
+                sbs.mComp.pFileName = "sunblur.comp";
+                addShader(R, &sbs, &g_live.pSunBlurShader);
+                if (g_live.pSunBlurShader) {
+                    PipelineDesc sbp = {};
+                    sbp.mType = PIPELINE_TYPE_COMPUTE;
+                    sbp.mComputeDesc.pShaderProgram = g_live.pSunBlurShader;
+                    addPipeline(R, &sbp, &g_live.pSunBlurPipeline);
+                }
+                DescriptorSetDesc sbset = SRT_SET_DESC(SunBlurSrtData, PerFrame, 2, 0);
+                addDescriptorSet(R, &sbset, &g_live.pSunBlurSet);
+                if (g_live.pSunBlurPipeline && g_live.pSunBlurSet) {
+                    DescriptorData d[3] = {};
+                    // Instance 0 — horizontal: moments (SRV) -> scratch (UAV).
+                    d[0].mIndex = SRT_RES_IDX(SunBlurSrtData, PerFrame, gSunBlurParams);
+                    d[0].ppBuffers = &g_live.pSunBlurParamsCbv[0];
+                    d[1].mIndex = SRT_RES_IDX(SunBlurSrtData, PerFrame, gSunBlurSrc);
+                    d[1].mCount = 1; d[1].ppTextures = &g_live.pSunMoments->pTexture;
+                    d[2].mIndex = SRT_RES_IDX(SunBlurSrtData, PerFrame, gSunBlurDst);
+                    d[2].mCount = 1; d[2].ppTextures = &g_live.pSunMomentsScratch;
+                    updateDescriptorSet(R, 0, g_live.pSunBlurSet, 3, d);
+                    // Instance 1 — vertical: scratch (SRV) -> moments (UAV). Landing back in
+                    // pSunMoments is what lets every receiver keep its existing binding.
+                    d[0].ppBuffers = &g_live.pSunBlurParamsCbv[1];
+                    d[1].ppTextures = &g_live.pSunMomentsScratch;
+                    d[2].ppTextures = &g_live.pSunMoments->pTexture;
+                    updateDescriptorSet(R, 1, g_live.pSunBlurSet, 3, d);
+                    g_live.sunBlurReady = true;
+                } else {
+                    std::printf("[forge][sun-shadow] blur pipeline/set FAILED — moments stay unblurred\n");
+                }
+            }
             std::printf("[forge] SET HANDLES: linBatch root=%u handle=%llu stride=%u | gtaoBatch root=%u handle=%llu stride=%u\n",
                         (unsigned)g_live.pLinearizeSet->mDx.mCbvSrvUavRootIndex, (unsigned long long)g_live.pLinearizeSet->mDx.mCbvSrvUavHandle, (unsigned)g_live.pLinearizeSet->mDx.mCbvSrvUavStride,
                         (unsigned)g_live.pGtaoBatchSet->mDx.mCbvSrvUavRootIndex, (unsigned long long)g_live.pGtaoBatchSet->mDx.mCbvSrvUavHandle, (unsigned)g_live.pGtaoBatchSet->mDx.mCbvSrvUavStride);
@@ -6626,6 +6711,7 @@ namespace {
           t.sliderF("Sun shadow: ortho half-extent (world u)", &g_sunShadowRange, 1024.0f, 32768.0f, 256.0f);
           t.sliderF("Sun shadow: depth bias (normalised)", &g_sunShadowBias, 0.0f, 0.02f, 0.0002f, "%.4f");
           t.sliderF("Sun shadow: normal offset (world u; kills slope acne)", &g_sunShadowNormalOff, 0.0f, 64.0f, 1.0f);
+          t.sliderF("Sun shadow: SOFTNESS (blur sigma, texels; 0 = raw/hard)", &g_sunShadowSoftness, 0.0f, 4.0f, 0.25f);
           t.sliderF("Sun shadow: light-bleed reduction (higher = deeper/tighter)", &g_sunShadowLBR, 0.0f, 0.95f, 0.05f);
           t.flush(); }
 
@@ -7167,6 +7253,7 @@ namespace ForgeRender {
                           float dRel, float eyeAbsZ, float waterLevelAbs, bool underwater);
     void dlLiveRecord();
     void renderSunShadow();   // SUN shadow: DL statics → MSM moments map (forge-sun-shadows.md Phase A)
+    void blurSunMoments();    // SUN shadow: separable Gaussian over the moments — what makes MSM soft
     void dispatchSunCull();   // SUN shadow A2: second statics cull (sun ortho box, nearCut=0, Hi-Z off)
     void dlDrawHeroBlend();                                                 // Phase 4 post-water hero blend pass
     bool buildGlowPath(Renderer* R);                                        // Phase F glow billboards: build (idempotent)
@@ -16348,6 +16435,53 @@ namespace ForgeRender {
         mp[kSunParamsFloat + 3] = g_sunShadowNormalOff;
     }
 
+    // Separable Gaussian over the sun moments map — THE pass that makes MSM soft (see
+    // sunblur.comp.fsl: a raw texel is a Dirac, whose Hankel matrix is singular, so the receiver's
+    // reconstruction collapses to a hard step and the only softness left is one bilinear tap).
+    // Blurring MOMENTS is legitimate precisely because moments are linear, and it costs once over
+    // the map instead of a per-fragment PCF tap storm.
+    // Ping-pongs pSunMoments -(H)-> pSunMomentsScratch -(V)-> pSunMoments, so the result lands back
+    // in the texture the receivers already sample. Sigma is in TEXELS, so the penumbra tracks texel
+    // size and a wider ortho extent stays hidden behind a proportionally wider blur.
+    void blurSunMoments() {
+        if (!g_live.sunBlurReady || !g_live.pSunBlurPipeline || !g_live.pSunBlurSet) { return; }
+        if (g_sunShadowSoftness <= 0.0f) { return; }   // 0 = raw map (the A/B against no blur)
+
+        const float sigma = std::min(g_sunShadowSoftness, (float)kSunBlurRadius);
+        for (uint32_t d = 0; d < 2; ++d) {
+            float* p = (float*)g_live.pSunBlurParamsCbv[d]->pCpuMappedAddress;
+            p[0] = sigma;
+            p[1] = (float)kSunShadowRes;
+            p[2] = (d == 0) ? 1.0f : 0.0f;   // tap direction: H then V
+            p[3] = (d == 0) ? 0.0f : 1.0f;
+        }
+
+        cmdBeginDebugMarker(g_live.pCmd, 0.9f, 0.7f, 0.3f, "SUN MOMENTS BLUR");
+        // pSunMoments comes in as SHADER_RESOURCE (the caster pass just left it there). The H pass
+        // reads it and writes the scratch; the V pass reads the scratch and writes BACK into
+        // pSunMoments, so it has to flip to UNORDERED_ACCESS and back before anything samples it.
+        auto texBarrier = [&](Texture* t, ResourceState from, ResourceState to) {
+            TextureBarrier tb = {}; tb.pTexture = t; tb.mCurrentState = from; tb.mNewState = to;
+            cmdResourceBarrier(g_live.pCmd, 0, nullptr, 1, &tb, 0, nullptr);
+        };
+        const uint32_t groups = (kSunShadowRes + 7u) / 8u;
+
+        cmdBindPipeline(g_live.pCmd, g_live.pSunBlurPipeline);
+        cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pSunBlurSet);      // instance 0 = horizontal
+        cmdDispatch(g_live.pCmd, groups, groups, 1);
+
+        texBarrier(g_live.pSunMomentsScratch, RESOURCE_STATE_UNORDERED_ACCESS, RESOURCE_STATE_SHADER_RESOURCE);
+        texBarrier(g_live.pSunMoments->pTexture, RESOURCE_STATE_SHADER_RESOURCE, RESOURCE_STATE_UNORDERED_ACCESS);
+
+        cmdBindDescriptorSet(g_live.pCmd, 1, g_live.pSunBlurSet);      // instance 1 = vertical
+        cmdDispatch(g_live.pCmd, groups, groups, 1);
+
+        // Back to the resting states the rest of the frame assumes.
+        texBarrier(g_live.pSunMoments->pTexture, RESOURCE_STATE_UNORDERED_ACCESS, RESOURCE_STATE_SHADER_RESOURCE);
+        texBarrier(g_live.pSunMomentsScratch, RESOURCE_STATE_SHADER_RESOURCE, RESOURCE_STATE_UNORDERED_ACCESS);
+        cmdEndDebugMarker(g_live.pCmd);
+    }
+
     void renderSunShadow() {
         // A2: prefer the sun cull (near + off-screen casters). Fall back to the camera-culled set (A1,
         // far/on-screen only) if the sun cull isn't ready — never break, just lose the near/off-screen fill.
@@ -16420,6 +16554,7 @@ namespace ForgeRender {
         // downstream bind has to know it ran.
         cmdSetViewport(g_live.pCmd, 0.0f, 0.0f, (float)g_live.width, (float)g_live.height, 0.0f, 1.0f);
         cmdSetScissor(g_live.pCmd, 0, 0, g_live.width, g_live.height);
+        blurSunMoments();
         g_live.sunShadowReady = true;
 
         static uint32_t s_sunLog = 0;
@@ -17494,6 +17629,15 @@ namespace ForgeRender {
         }
         if (g_live.pShadowMaskParamsCbv) { removeResource(g_live.pShadowMaskParamsCbv); }
         if (g_live.pShadowMask)          { removeResource(g_live.pShadowMask); }
+        // Sun moments blur — drop the set/pipeline/shader BEFORE the textures they reference.
+        g_live.sunBlurReady = false;
+        if (g_live.pSunBlurSet)      { removeDescriptorSet(R, g_live.pSunBlurSet); g_live.pSunBlurSet = nullptr; }
+        if (g_live.pSunBlurPipeline) { removePipeline(R, g_live.pSunBlurPipeline); g_live.pSunBlurPipeline = nullptr; }
+        if (g_live.pSunBlurShader)   { removeShader(R, g_live.pSunBlurShader); g_live.pSunBlurShader = nullptr; }
+        for (uint32_t d = 0; d < 2; ++d) {
+            if (g_live.pSunBlurParamsCbv[d]) { removeResource(g_live.pSunBlurParamsCbv[d]); g_live.pSunBlurParamsCbv[d] = nullptr; }
+        }
+        if (g_live.pSunMomentsScratch)   { removeResource(g_live.pSunMomentsScratch); g_live.pSunMomentsScratch = nullptr; }
         if (g_live.pSunMoments)          { removeRenderTarget(R, g_live.pSunMoments); g_live.pSunMoments = nullptr; }
         if (g_live.pSunMomentsDepth)     { removeRenderTarget(R, g_live.pSunMomentsDepth); g_live.pSunMomentsDepth = nullptr; }
         if (g_live.pShadowAtlas)         { removeRenderTarget(R, g_live.pShadowAtlas); }

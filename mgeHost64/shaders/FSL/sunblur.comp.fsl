@@ -1,0 +1,66 @@
+// mgeHost64 — SUN shadow moments-map blur (compute). THE pass that makes MSM soft.
+//
+// This is not a cosmetic polish step, it is what makes Moment Shadow Mapping work at all. The
+// receiver reconstructs a penumbra by asking "given the DISTRIBUTION of caster depths around this
+// point, what fraction is in front of me" — but a raw shadow map texel holds exactly ONE caster
+// depth, i.e. a Dirac. The Hankel matrix built from a Dirac's moments is singular, so the
+// reconstruction collapses to a hard step and the only softness left is the single bilinear tap's
+// one-texel ramp: hard, pixel-shaped edges, going soft only by accident where a bilinear footprint
+// happens to straddle a big depth discontinuity. Blurring the map first gives every texel a real
+// distribution over its neighbourhood, and the penumbra widens to the blur radius.
+//
+// Blurring MOMENTS is exactly why MSM exists: moments are linear, so a weighted average of moment
+// vectors IS the moment vector of the averaged distribution. This is what a depth map cannot do —
+// averaging depths is meaningless, which is why plain shadow maps need per-pixel PCF tap storms
+// instead. Here the cost is paid ONCE over the map, not per lit fragment.
+//
+// It is also valid to blur in PACKED space (what we sample): PackMoments is affine (M*b + c), and
+// an affine map commutes with a normalised weighted average, so blurring packed == packing blurred.
+//
+// Separable: two dispatches (horizontal then vertical) over two instances of the same SRT set.
+// Sigma is in TEXELS, so softness automatically tracks texel size — a wider sun ortho extent gets a
+// proportionally wider penumbra and the coarser texels stay hidden.
+
+#include "sunblur.srt.h"
+
+#define SUN_BLUR_RADIUS 4   // 9 taps per axis; effective extent set by the sigma (texels)
+
+ROOT_SIGNATURE(ComputeRootSignature)
+NUM_THREADS(8, 8, 1)
+void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
+{
+    INIT_MAIN;
+    int2 px  = int2(DispatchThreadID.xy);
+    int  res = (int)gSunBlurParams.params.y;
+    if (px.x >= res || px.y >= res)
+    {
+        RETURN();
+    }
+
+    float4 center = LoadTex2D(gSunBlurSrc, NO_SAMPLER, px, 0);
+    float  sigma  = gSunBlurParams.params.x;
+    if (sigma <= 0.0f)
+    {
+        Write2D(gSunBlurDst, px, center);
+        RETURN();
+    }
+
+    int2  dir  = int2((int)gSunBlurParams.params.z, (int)gSunBlurParams.params.w);
+    float inv2 = 1.0f / (2.0f * sigma * sigma);
+
+    float4 sum  = float4(0.0f, 0.0f, 0.0f, 0.0f);
+    float  wsum = 0.0f;
+
+    // Clamp at the edges (the map's border is already ramped to lit by the receiver, so clamping
+    // cannot pull a false occluder in from outside).
+    UNROLL for (int i = -SUN_BLUR_RADIUS; i <= SUN_BLUR_RADIUS; ++i)
+    {
+        int2  sp  = clamp(px + dir * i, int2(0, 0), int2(res - 1, res - 1));
+        float wgt = exp(-float(i * i) * inv2);
+        sum  += LoadTex2D(gSunBlurSrc, NO_SAMPLER, sp, 0) * wgt;
+        wsum += wgt;
+    }
+
+    Write2D(gSunBlurDst, px, (wsum > 0.0f) ? (sum / wsum) : center);
+    RETURN();
+}

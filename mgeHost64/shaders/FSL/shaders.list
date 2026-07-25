@@ -242,6 +242,13 @@
 #include "aoblur.comp.fsl"
 #end
 
+// SUN shadow moments blur: the pass that makes MSM soft (a raw texel is a Dirac, whose Hankel
+// matrix is singular → hard, pixel-shaped edges). Separable, run as two dispatches over two
+// instances of one SRT set. Compute → hot-reloadable.
+#comp sunblur.comp
+#include "sunblur.comp.fsl"
+#end
+
 // P1 point-light shadows: screen-space visibility mask. Reads the RESOLVED single-sample
 // prepass depth (pLinearDepth) — no MSAA variants needed — plus the shadow atlas; writes the
 // R32G32_UINT per-slot mask the forward frags load. Hot-reloadable (rides the gtao mtime poll).
