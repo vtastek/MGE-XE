@@ -110,8 +110,9 @@ STRUCT(ShadowMaskParams)
     // volFog1: x = FORWARD-lobe Henyey-Greenstein g (0 = isotropic, ->1 = tight sun glow),
     //          y = step count,
     //          z = 1 = fog pass ON,
-    //          w = ambient in-scatter floor 0..1 (fraction of the fog colour that lights shadowed
-    //              steps — without it, shafts read as pure black voids rather than dimmer fog).
+    //          w = HAZE shadow response 0..1: how much a sun shadow dims the haze term. 0 (default)
+    //              = not at all, which is the energy-safe setting — a shadow then removes only the
+    //              SHAFT, never the fog. Above 0 the pass becomes a net darkener at occlude 1.
     DATA(float4,   volFog1,     None);
     // volFog2: xyz = fog TINT, w = overall intensity. Applied to the FINAL in-scatter, which already
     //          carries its own colour: the lobes are sun-coloured (shafts), the isotropic pedestal and
@@ -134,8 +135,11 @@ STRUCT(ShadowMaskParams)
     //     phase = iso + fwdGain * HG_n(cos, gF) + backGain * HG_n(cos, gB)      (HG_n: 1 == isotropic)
     // and the sum is passed through a soft ceiling so the forward lobe asymptotes instead of blowing
     // out (a hard clamp would draw a visible disc edge around the sun).
-    // volFog4: x = ISOTROPIC gain (the side/horizontal knob — raises fog everywhere without touching
-    //              either lobe; this is the one to reach for when "there is not enough fog"),
+    // volFog4: x = HAZE gain — the side/horizontal knob (raises fog at every angle without touching
+    //              either lobe; reach for this when "there is not enough fog"). 1.0 is the
+    //              ENERGY-NEUTRAL point: the haze then returns exactly the (1-T) of fog radiance that
+    //              the occlude term removed, so at occlude 1 the composite is an exact lerp toward
+    //              the fog colour. Below 1 the pass darkens the scene; above 1 it brightens it.
     //          y = phase soft ceiling (Reinhard knee; the phase asymptotes to this),
     //          z = water-plane clamp: ABSOLUTE world Z of the water surface,
     //          w = 1 = water clamp ACTIVE this frame (water drawn and camera above it).

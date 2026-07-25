@@ -112,18 +112,21 @@ float4 PS_MAIN(VSOutput In)
     float  falloff = max(gShadowParams.volFog0.y, 1.0f);
     float  base    = gShadowParams.volFog0.z;
     float  eyeH    = gFrameData.lodEye.z;            // absolute world height of the camera
-    float  ambient = gShadowParams.volFog1.w;
+    // HAZE gain: 1.0 is the ENERGY-NEUTRAL point. At occlude 1 the composite is dst*T + inscatter, so
+    // the haze must return a full (1-T) of fog radiance or the pass is a net darkener — see below.
+    float  hazeGain   = gShadowParams.volFog4.x;
+    float  shadowResp = gShadowParams.volFog1.w;   // how much a sun shadow dims HAZE (0 = not at all)
 
-    // DUAL-LOBE phase, evaluated once (directional light + fixed view dir ⇒ constant along the ray),
-    // and split into TWO TERMS THAT ARE NOT THE SAME COLOUR — see the accumulation below.
-    //   iso   — flat pedestal, the side/horizontal knob: lifts fog at every angle equally, so the
-    //           world gets foggier without the sun direction exploding. Physically this stands in for
-    //           MULTIPLE scattering, which is exactly what MW's fog colour already represents.
+    // The two components, which are NOT the same colour and are NOT shadowed the same way:
+    //   HAZE  — isotropic, FOG-coloured, unshadowed by default. This is the fog itself: physically it
+    //           stands in for multiple scattering, which is exactly what the scene's own fog colour
+    //           already represents. It is what makes the pass energy-neutral (see the accumulation).
     //   lobes — forward HG (the sun halo; peak ~1/(1-g)^2, already ~20x isotropic at g 0.72, which is
     //           why one lobe made density unusable) + backward HG (the anti-sun lift). SINGLE
-    //           scattering: directional, sun-coloured, and the only part that reads as a shaft.
+    //           scattering: directional, sun-coloured, shadowed, and the only part that reads as a
+    //           shaft. Purely ADDITIVE on top of the haze — a shadow removes the shaft, it must never
+    //           remove the fog, or shadowed fog comes out darker than no fog at all.
     float  cosT  = dot(dir, -gFrameData.sunDir.xyz);
-    float  iso   = gShadowParams.volFog4.x;
     float  lobes = gShadowParams.volFog3.z * hgNorm(cosT, gShadowParams.volFog1.x)
                  + gShadowParams.volFog3.w * hgNorm(cosT, gShadowParams.volFog3.y);
     // Soft ceiling on the LOBES only — the pedestal is bounded by construction, the halo is what
@@ -160,11 +163,17 @@ float4 PS_MAIN(VSOutput In)
             // segment absorbs, so use (1 - exp(-sigma)) rather than sigma. At large steps the naive
             // form over-brightens badly, and this fog wants few steps.
             float seg    = 1.0f - exp(-sigma);
-            // Shafts are sun-coloured; haze is fog-coloured. The ambient floor is UNSHADOWED (it is
-            // the reason a shaft's shadow reads as dimmer fog rather than a black void), the pedestal
-            // is shadowed like the lobes — it is still sunlight, just multiply-scattered.
+            // ENERGY. sum(T_i * seg_i) == coverage == 1 - T, so with hazeGain 1 and no shadow response
+            // the haze term integrates to exactly coverage * fogCol. At occlude 1 the composite is
+            //     dst*T + coverage*fogCol
+            // which is the exact lerp toward fog colour: nothing darkens, nothing brightens, and the
+            // shafts are the only visible addition. Any bracket that averages below 1 makes this pass
+            // a net DARKENER at occlude 1 — the earlier (sunVis*iso + ambient) form peaked at 0.67 and
+            // fell to 0.12 in shadow, so every shadowed pixel lost light and the one region that did
+            // not (the horizon band, outside the cascades, sunVis 1) stood out as a bright stripe.
+            float hazeAmt = hazeGain * (1.0f - shadowResp * (1.0f - sunVis));
             inscatter    += transmittance * seg
-                          * (sunVis * lobes * shaftCol + (sunVis * iso + ambient) * hazeCol);
+                          * (hazeAmt * hazeCol + sunVis * lobes * shaftCol);
             transmittance *= exp(-sigma);
         }
         if (transmittance < 0.003f) { break; }   // fully opaque; the rest cannot contribute

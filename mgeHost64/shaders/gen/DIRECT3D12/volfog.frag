@@ -1042,6 +1042,7 @@ STRUCT(ShadowMaskParams)
 
 
 
+
     float4 volFog1;
 
 
@@ -1055,7 +1056,7 @@ STRUCT(ShadowMaskParams)
 
 
     float4 volFog3;
-#line 146 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
+#line 150 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
     float4 volFog4;
 
 
@@ -1065,7 +1066,7 @@ STRUCT(ShadowMaskParams)
 
 
     float4 screenAlloc;
-#line 155
+#line 159
 };
 #line 21 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
 #line 35 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
@@ -1614,7 +1615,11 @@ float4 PS_MAIN(VSOutput In): SV_TARGET
     float falloff = max(gShadowParams.volFog0.y, 1.0f);
     float base = gShadowParams.volFog0.z;
     float eyeH = gFrameData.lodEye.z;
-    float ambient = gShadowParams.volFog1.w;
+
+
+    float hazeGain = gShadowParams.volFog4.x;
+    float shadowResp = gShadowParams.volFog1.w;
+
 
 
 
@@ -1625,7 +1630,6 @@ float4 PS_MAIN(VSOutput In): SV_TARGET
 
 
     float cosT = dot(dir, -gFrameData.sunDir.xyz);
-    float iso = gShadowParams.volFog4.x;
     float lobes = gShadowParams.volFog3.z * hgNorm(cosT, gShadowParams.volFog1.x)
                  + gShadowParams.volFog3.w * hgNorm(cosT, gShadowParams.volFog3.y);
 
@@ -1665,13 +1669,19 @@ float4 PS_MAIN(VSOutput In): SV_TARGET
 
 
 
+
+
+
+
+
+            float hazeAmt = hazeGain * (1.0f - shadowResp * (1.0f - sunVis));
             inscatter += transmittance * seg
-                          * (sunVis * lobes * shaftCol + (sunVis * iso + ambient) * hazeCol);
+                          * (hazeAmt * hazeCol + sunVis * lobes * shaftCol);
             transmittance *= exp(-sigma);
         }
         if (transmittance < 0.003f) { break; }
     }
-#line 187 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/volfog.frag.fsl"
+#line 196 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/volfog.frag.fsl"
     float coverage = 1.0f - transmittance;
     float occlude = saturate(gShadowParams.volFog3.x);
     float3 grade = gShadowParams.volFog2.xyz * gShadowParams.volFog2.w;

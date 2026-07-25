@@ -1839,22 +1839,28 @@ namespace {
     float              g_volFogBase      = 0.0f;    // ABSOLUTE world height of the fog base (MW Z up)
     float              g_volFogMaxDist   = 12288.0f;// march clamp; sky rays run to here
     float              g_volFogSteps     = 24.0f;
-    float              g_volFogAmbient   = 0.12f;   // in-scatter floor so shafts dim rather than void
-    float              g_volFogTint[3]   = { 1.0f, 0.98f, 0.92f };
+    // How much a sun shadow dims the HAZE. 0 = not at all, and that is the energy-safe default: a
+    // shadow then removes only the SHAFT. Anything above 0 makes the pass a net darkener at occlude 1,
+    // because the haze no longer returns the fog radiance the occlude term took out.
+    float              g_volFogHazeShadow = 0.0f;
+    float              g_volFogTint[3]   = { 1.0f, 1.0f, 1.0f };   // neutral: keep the energy-neutral point honest
     float              g_volFogIntensity = 1.0f;
-    // DUAL-LOBE phase. One HG lobe ties the sun halo, the anti-sun lift and the side scattering to a
-    // single number, so the only way to get more fog at 90 degrees to the sun was to make the halo
-    // explode. Three independently-gained normalised terms (1.0 == isotropic) fix that:
-    //   iso     — the flat pedestal, and the knob to reach for when the scene wants more fog;
+    // HAZE + DUAL-LOBE shafts. One HG lobe tied the sun halo, the anti-sun lift and the side
+    // scattering to a single number, so the only way to get more fog at 90 degrees to the sun was to
+    // make the halo explode. Split into a fog-coloured isotropic haze plus two sun-coloured lobes:
+    //   haze    — the knob to reach for when the scene wants more fog. 1.0 is ENERGY-NEUTRAL (the
+    //             haze returns exactly the fog radiance the occlude term removed); below 1 the pass
+    //             darkens the scene, above 1 it brightens it.
     //   forward — the sun halo, g near 1 = tight;
     //   back    — the anti-sun brightening, g negative.
-    // The ceiling is a soft Reinhard knee (not a clamp — that would draw a disc edge round the sun).
-    float              g_volFogIso       = 0.55f;   // isotropic gain: the side/horizontal knob
+    // The ceiling is a soft Reinhard knee on the LOBES (not a clamp — that would draw a disc edge
+    // round the sun); the haze needs none, it is bounded by construction.
+    float              g_volFogHaze      = 1.0f;    // haze gain: the side/horizontal knob; 1 = neutral
     float              g_volFogAniso     = 0.72f;   // forward-lobe g
     float              g_volFogFwdGain   = 0.55f;   // forward-lobe gain
     float              g_volFogBackG     = -0.45f;  // back-lobe g (negative = back-scatter)
     float              g_volFogBackGain  = 0.18f;   // back-lobe gain
-    float              g_volFogPhaseCeil = 8.0f;    // soft ceiling on the summed phase (0 = off)
+    float              g_volFogPhaseCeil = 4.0f;    // soft ceiling on the summed LOBES (0 = off)
     // Sunshafts.fx `sunrayocclude`: how much of the image behind the fog is removed before the fog's
     // colour is added. 1.0 = the physically exact dst*transmittance composite; 0.75 is the legacy
     // shader's value and keeps bright shafts from blowing out. Never makes fog denser than physical.
@@ -6997,11 +7003,11 @@ namespace {
           t.sliderF("Vol fog: base height (ABSOLUTE world Z)", &g_volFogBase, -4096.0f, 8192.0f, 64.0f, "%.0f");
           t.sliderF("Vol fog: max march distance (world units)", &g_volFogMaxDist, 1024.0f, 32768.0f, 256.0f, "%.0f");
           t.sliderF("Vol fog: march steps (cost lives here)", &g_volFogSteps, 4.0f, 96.0f, 1.0f, "%.0f");
-          t.sliderF("Vol fog: ambient in-scatter floor", &g_volFogAmbient, 0.0f, 1.0f, 0.01f, "%.2f");
+          t.sliderF("Vol fog: haze SHADOW response (0 = energy-safe)", &g_volFogHazeShadow, 0.0f, 1.0f, 0.01f, "%.2f");
           t.sliderF("Vol fog: intensity", &g_volFogIntensity, 0.0f, 4.0f, 0.05f, "%.2f");
-          // Dual-lobe phase: ISO is the side/horizontal knob (fog everywhere, sun direction untouched);
-          // the two lobes shape the sun halo and the anti-sun lift independently of it.
-          t.sliderF("Vol fog phase: ISOTROPIC gain (the SIDE/horizontal knob)", &g_volFogIso, 0.0f, 4.0f, 0.05f, "%.2f");
+          // HAZE is the side/horizontal knob (fog everywhere, sun direction untouched) and 1.0 is the
+          // energy-neutral point; the two lobes shape the sun halo and anti-sun lift independently.
+          t.sliderF("Vol fog phase: HAZE gain (SIDE knob; 1.0 = energy-neutral)", &g_volFogHaze, 0.0f, 4.0f, 0.05f, "%.2f");
           t.sliderF("Vol fog phase: forward g (sun halo tightness)", &g_volFogAniso, 0.0f, 0.95f, 0.01f, "%.2f");
           t.sliderF("Vol fog phase: forward GAIN (sun halo strength)", &g_volFogFwdGain, 0.0f, 4.0f, 0.05f, "%.2f");
           t.sliderF("Vol fog phase: back g (negative = anti-sun lobe)", &g_volFogBackG, -0.95f, 0.0f, 0.01f, "%.2f");
@@ -16826,7 +16832,7 @@ namespace ForgeRender {
         mp[kVolFog1Float + 0] = std::max(-0.95f, std::min(g_volFogAniso, 0.95f));
         mp[kVolFog1Float + 1] = std::max(1.0f, std::min(g_volFogSteps, 128.0f));
         mp[kVolFog1Float + 2] = g_volFog ? 1.0f : 0.0f;
-        mp[kVolFog1Float + 3] = std::max(0.0f, g_volFogAmbient);
+        mp[kVolFog1Float + 3] = std::max(0.0f, std::min(g_volFogHazeShadow, 1.0f));
         mp[kVolFog2Float + 0] = g_volFogTint[0];
         mp[kVolFog2Float + 1] = g_volFogTint[1];
         mp[kVolFog2Float + 2] = g_volFogTint[2];
@@ -16835,7 +16841,7 @@ namespace ForgeRender {
         mp[kVolFog3Float + 1] = std::max(-0.95f, std::min(g_volFogBackG, 0.95f));
         mp[kVolFog3Float + 2] = std::max(0.0f, g_volFogFwdGain);
         mp[kVolFog3Float + 3] = std::max(0.0f, g_volFogBackGain);
-        mp[kVolFog4Float + 0] = std::max(0.0f, g_volFogIso);
+        mp[kVolFog4Float + 0] = std::max(0.0f, g_volFogHaze);
         mp[kVolFog4Float + 1] = std::max(0.0f, g_volFogPhaseCeil);
         // Water plane: latched by renderScene from this frame's water params (0/off when there is no
         // water, or when the camera is under it — an air-fog march below the surface is meaningless).
