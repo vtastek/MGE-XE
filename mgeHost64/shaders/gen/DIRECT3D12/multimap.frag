@@ -978,7 +978,7 @@ SamplerState gSampler2xWrapClamp : register( s17 , space100 ) ;
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
 #line 20 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
-#line 15 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
+#line 22 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
 STRUCT(ShadowMaskParams)
 {
     float4x4 invViewProj;
@@ -1011,18 +1011,16 @@ STRUCT(ShadowMaskParams)
 
 
 
-    float4x4 sunViewProj;
 
 
 
-
-
-
-
-
-
+    float4x4 sunViewProj[ 2 ];
+#line 71 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
     float4 sunParams;
-#line 58
+
+
+    float4 sunCascadeTexel;
+#line 75
 };
 #line 21 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
 #line 35 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
@@ -1240,7 +1238,7 @@ bool useLowAF(float alphaRef, bool alphaBlended)
 }
 #line 13 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/multimap.frag.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/msmrecv.h.fsl"
-#line 33 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/msmrecv.h.fsl"
+#line 45 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/msmrecv.h.fsl"
 float4 UnpackMoments(float4 packedMoments)
 {
     packedMoments -= float4(0.5f, 0.0f, 0.5f, 0.0f);
@@ -1298,27 +1296,74 @@ float ComputeMSMShadowIntensity(float4 b, float zf)
 
 
 
+float sunCascadeOcclusion(int c, float3 p, float zBias)
+{
+    float4 posLS = mul(gShadowParams.sunViewProj[c], float4(p, 1.0f));
+
+
+    posLS.xyz /= posLS.w;
+
+    float2 uvTile = saturate(posLS.xy * float2(0.5f, -0.5f) + float2(0.5f, 0.5f));
+    float2 uv = float2((float(c) + uvTile.x) * (1.0f / float( 2 )), uvTile.y);
+    float zf = (1.0f - posLS.z) - zBias;
+
+    float4 moments = UnpackMoments(SampleLvlTex2D(gSunMoments, gSamplerBilinearClamp, uv, 0));
+    return ComputeMSMShadowIntensity(moments, zf);
+}
+
+
+
+
+
+
+
 
 float sunShadowVisibility(float3 worldPosRel, float3 N)
 {
     float strength = gShadowParams.sunParams.x;
     if (strength <= 0.0f) { return 1.0f; }
 
-    float3 p = worldPosRel + N * gShadowParams.sunParams.w;
-    float4 posLS = mul(gShadowParams.sunViewProj, float4(p, 1.0f));
 
 
-    posLS.xyz /= posLS.w;
 
-    float2 uv = posLS.xy * float2(0.5f, -0.5f) + float2(0.5f, 0.5f);
-    if (uv.x <= 0.0f || uv.x >= 1.0f || uv.y <= 0.0f || uv.y >= 1.0f) { return 1.0f; }
-    if (posLS.z <= 0.0f || posLS.z >= 1.0f) { return 1.0f; }
+    int sel = -1;
+    float m = 0.0f;
+    UNROLL for (int i = 0; i <  2 ; ++i)
+    {
+        if (sel < 0)
+        {
+            float4 q = mul(gShadowParams.sunViewProj[i], float4(worldPosRel, 1.0f));
+            float mm = max(abs(q.x), abs(q.y));
 
-    float zf = (1.0f - posLS.z) - gShadowParams.sunParams.y;
 
-    float4 packed = SampleLvlTex2D(gSunMoments, gSamplerBilinearClamp, uv, 0);
-    float4 moments = UnpackMoments(packed);
-    float occlusion = ComputeMSMShadowIntensity(moments, zf);
+            if (mm < 1.0f -  0.008f  && q.z > 0.0f && q.z < 1.0f) { sel = i; m = mm; }
+        }
+    }
+    if (sel < 0) { return 1.0f; }
+
+    float bias = gShadowParams.sunParams.y;
+    float noff = gShadowParams.sunParams.w;
+    float4 texel = gShadowParams.sunCascadeTexel;
+
+    float occlusion = sunCascadeOcclusion(sel, worldPosRel + N * (noff * texel[sel]), bias);
+
+
+
+    float band = 1.0f -  0.008f  -  0.12f ;
+    if (m > band)
+    {
+        float t = saturate((m - band) /  0.12f );
+        if (sel + 1 <  2 )
+        {
+            float occNext = sunCascadeOcclusion(sel + 1, worldPosRel + N * (noff * texel[sel + 1]), bias);
+            occlusion = lerp(occlusion, occNext, t);
+        }
+        else
+        {
+            occlusion *= (1.0f - t);
+        }
+    }
+
 
 
 
@@ -1331,11 +1376,7 @@ float sunShadowVisibility(float3 worldPosRel, float3 N)
     float lbr = gShadowParams.sunParams.z;
     occlusion = saturate(occlusion / max(1.0f - lbr, 1.0e-4f));
 
-
-    float2 toEdge = min(uv, float2(1.0f, 1.0f) - uv);
-    float edge = saturate(min(toEdge.x, toEdge.y) /  0.03f );
-
-    return 1.0f - occlusion * strength * edge;
+    return 1.0f - occlusion * strength;
 }
 #line 14 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/multimap.frag.fsl"
 

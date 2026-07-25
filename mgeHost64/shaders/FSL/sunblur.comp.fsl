@@ -17,10 +17,14 @@
 // It is also valid to blur in PACKED space (what we sample): PackMoments is affine (M*b + c), and
 // an affine map commutes with a normalised weighted average, so blurring packed == packing blurred.
 //
-// Separable: two dispatches (horizontal then vertical) over two instances of the same SRT set.
-// Sigma arrives in TEXELS but the HOST derives it from a WORLD-unit penumbra knob (see
-// blurSunMoments), so widening the ortho extent does not widen the penumbra physically — a
-// texel-denominated softness melts small casters' shadows as the extent grows.
+// Separable: two dispatches (horizontal then vertical) per CASCADE, over 2*N instances of the same
+// SRT set, each pass covering ONE atlas tile. Sigma arrives in TEXELS but the HOST derives it from a
+// WORLD-unit penumbra knob per cascade (see blurSunMoments), so widening the ortho extent does not
+// widen the penumbra physically — a texel-denominated softness melts small casters' shadows as the
+// extent grows. Because each cascade has its own texel size, the same world penumbra lands on a
+// different sigma per cascade, and the near cascade's request usually clips at SUN_BLUR_RADIUS —
+// so near shadows come out tighter than far ones, which reads as contact hardening rather than as
+// an error. The receiver cross-fades across the cascade boundary so the change is a ramp.
 
 #include "sunblur.srt.h"
 
@@ -31,37 +35,49 @@ NUM_THREADS(8, 8, 1)
 void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
 {
     INIT_MAIN;
-    int2 px  = int2(DispatchThreadID.xy);
+    int2 px  = int2(DispatchThreadID.xy);        // TILE-local pixel
     int  res = (int)gSunBlurParams.params.y;
     if (px.x >= res || px.y >= res)
     {
         RETURN();
     }
 
-    float4 center = LoadTex2D(gSunBlurSrc, NO_SAMPLER, px, 0);
+    int   srcOx = (int)gSunBlurParams.params2.x;
+    int   dstOx = (int)gSunBlurParams.params2.y;
+    int2  src   = int2(px.x + srcOx, px.y);
+    int2  dst   = int2(px.x + dstOx, px.y);
+
+    float4 center = LoadTex2D(gSunBlurSrc, NO_SAMPLER, src, 0);
     float  sigma  = gSunBlurParams.params.x;
     if (sigma <= 0.0f)
     {
-        Write2D(gSunBlurDst, px, center);
+        Write2D(gSunBlurDst, dst, center);
         RETURN();
     }
 
     int2  dir  = int2((int)gSunBlurParams.params.z, (int)gSunBlurParams.params.w);
+    bool  horz = (dir.x != 0);
+    int   lo   = (int)gSunBlurParams.params2.z;
+    int   hi   = (int)gSunBlurParams.params2.w;
+    // Split the source coord into the axis the taps walk and the axis they don't, so the clamp can
+    // be a scalar over the tile's own bounds. Clamping (rather than skipping) is safe: the map's
+    // border is already ramped to lit by the receiver, so an edge tap cannot invent an occluder.
+    int   walk = horz ? src.x : src.y;
+    int   fixd = horz ? src.y : src.x;
     float inv2 = 1.0f / (2.0f * sigma * sigma);
 
     float4 sum  = float4(0.0f, 0.0f, 0.0f, 0.0f);
     float  wsum = 0.0f;
 
-    // Clamp at the edges (the map's border is already ramped to lit by the receiver, so clamping
-    // cannot pull a false occluder in from outside).
     UNROLL for (int i = -SUN_BLUR_RADIUS; i <= SUN_BLUR_RADIUS; ++i)
     {
-        int2  sp  = clamp(px + dir * i, int2(0, 0), int2(res - 1, res - 1));
+        int   w   = clamp(walk + i, lo, hi);
+        int2  sp  = horz ? int2(w, fixd) : int2(fixd, w);
         float wgt = exp(-float(i * i) * inv2);
         sum  += LoadTex2D(gSunBlurSrc, NO_SAMPLER, sp, 0) * wgt;
         wsum += wgt;
     }
 
-    Write2D(gSunBlurDst, px, (wsum > 0.0f) ? (sum / wsum) : center);
+    Write2D(gSunBlurDst, dst, (wsum > 0.0f) ? (sum / wsum) : center);
     RETURN();
 }

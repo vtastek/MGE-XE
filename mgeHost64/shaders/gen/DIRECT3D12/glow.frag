@@ -978,7 +978,7 @@ SamplerState gSampler2xWrapClamp : register( s17 , space100 ) ;
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
 #line 20 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
-#line 15 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
+#line 22 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
 STRUCT(ShadowMaskParams)
 {
     float4x4 invViewProj;
@@ -1011,18 +1011,16 @@ STRUCT(ShadowMaskParams)
 
 
 
-    float4x4 sunViewProj;
 
 
 
-
-
-
-
-
-
+    float4x4 sunViewProj[ 2 ];
+#line 71 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
     float4 sunParams;
-#line 58
+
+
+    float4 sunCascadeTexel;
+#line 75
 };
 #line 21 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
 #line 35 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"

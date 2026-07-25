@@ -12,6 +12,13 @@
 
 #define MAX_SHADOW_SLOTS 32   // MUST match host kMaxShadowLights (forgerender.cpp)
 
+// SUN (directional) shadow CASCADE count. MUST match host kSunCascades (forgerender.cpp) — it sizes
+// the matrix array below, so a mismatch silently shifts every float offset publishSunShadowParams
+// writes. Cascades are CONCENTRIC camera-centred ortho boxes at increasing half-extent, packed side
+// by side into ONE moments atlas (cascade c owns u in [c/N, (c+1)/N]) so every receiver keeps its
+// single gSunMoments binding and no PerFrame set has to grow.
+#define SUN_CASCADES 2
+
 STRUCT(ShadowMaskParams)
 {
     DATA(float4x4, invViewProj,  None);   // inverse of the reverse-Z camera-relative viewProj
@@ -37,22 +44,32 @@ STRUCT(ShadowMaskParams)
     // Per-slot flame state (flicker slots only). x = wobble amp gain, y = flame phase (rad),
     // z = the face-frustum uvScale this slot's tile was BAKED with (< 1 = wider than 90°), w = spare.
     DATA(float4,   slotFlick[MAX_SHADOW_SLOTS], None);
-    // --- SUN (directional) shadow, Phase B receiver (forge-sun-shadows.md) --------------------
-    // The sun MSM map's ortho view*proj, CAMERA-RELATIVE (eye at origin) — the same matrix the
-    // caster pass projected by, so every receiver reconstructs the identical mapping. It lives HERE
+    // --- SUN (directional) CASCADED shadow, Phase B/C receiver (forge-sun-shadows.md) ----------
+    // Per-cascade sun MSM ortho view*proj, CAMERA-RELATIVE (eye at origin) — the same matrices the
+    // caster pass projected by, so every receiver reconstructs the identical mapping. They live HERE
     // rather than in FrameData because FrameData is exactly full at its 512B CBV, while this cbuffer
-    // (1664B of struct in a 2048B buffer) has room — and it is already bound into every PerFrame set
-    // AND the compute mask, so one write reaches all receivers. Same convention as gFrameData.viewProj:
+    // has room — and it is already bound into every PerFrame set AND the compute mask, so one write
+    // reaches all receivers. Same convention as gFrameData.viewProj:
     // mul(M, worldPos) == D3DX row-vector worldPos*M.
-    DATA(float4x4, sunViewProj, None);
+    // Every cascade shares ONE depth slab (half-extent 2*outermost range) so a caster high up-sun is
+    // inside all of them and the NORMALISED depth — hence the single depth bias below — is cascade-
+    // independent. Only the two axes perpendicular to the sun shrink per cascade.
+    DATA(float4x4, sunViewProj[SUN_CASCADES], None);
     // sunParams: x = shadow STRENGTH 0..1 (0 = sun shadows OFF — the receiver's early-out, so the
     //                whole feature A/Bs from one float; also the "no map this frame" signal),
-    //            y = depth bias in NORMALISED sun-depth units (the ortho depth span is 4*range world
-    //                units, so bias_world = y * 4 * g_sunShadowRange),
+    //            y = depth bias in NORMALISED sun-depth units — the host converts it from a
+    //                WORLD-unit knob (the shared slab spans 4*g_sunShadowRange world units), so the
+    //                tuned value survives a change to the extent knob,
     //            z = light-bleeding reduction 0..0.95 (AMPLIFIES the reconstructed occlusion by
     //                1/(1-z) so an under-reported shadow core saturates to fully occluded; higher =
     //                deeper, tighter shadows. Raising it must never LIGHTEN a shadow — see msmrecv),
-    //            w = NORMAL-OFFSET in world units (the receiver samples from worldPos + N*w — the
-    //                cheap slope-acne fix that costs no depth precision).
+    //            w = NORMAL-OFFSET in TEXELS of the sampled cascade (the receiver samples from
+    //                worldPos + N*w*texel — the cheap slope-acne fix that costs no depth precision).
+    //                Texels, not world units: the acne it fixes is a one-texel depth-quantisation
+    //                error, so an offset fixed in world units is simultaneously too small for the
+    //                coarse far cascade and a peter-panning gap in the fine near one.
     DATA(float4,   sunParams,   None);
+    // Cascade c's shadow-map texel size in WORLD units (x = c0 .. w = c3; lanes past SUN_CASCADES
+    // are 0). Feeds the normal-offset scaling above.
+    DATA(float4,   sunCascadeTexel, None);
 };

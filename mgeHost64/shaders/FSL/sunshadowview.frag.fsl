@@ -1,10 +1,10 @@
 // mgeHost64 — SUN shadow moments-map debug view (fragment stage).
 //
-// F12 mode 13: aspect-fit the square sun MSM moments map into the screen and show the first packed
-// moment (gSunMoments.x) as greyscale, so Step A1 can VERIFY the DL-statics sun caster pass actually
-// captured geometry from the sun's POV — before any receiver touches the lit image. Reuses
-// shadowatlasview.vert (fullscreen triangle) + the opaque.srt.h PerFrame set (gSunMoments bound
-// there like the atlas views). Pure debug overlay: OVERWRITES the composited scene, alpha = 1.
+// F12 mode 13: show the sun MSM moments ATLAS (SUN_CASCADES tiles side by side, cascade 0 = the
+// sharp near box on the left) as greyscale first-moment, so the DL-statics sun caster pass can be
+// VERIFIED per cascade before any receiver touches the lit image. Reuses shadowatlasview.vert
+// (fullscreen triangle) + the opaque.srt.h PerFrame set (gSunMoments bound there like the atlas
+// views). Pure debug overlay into a small corner viewport; alpha = 1.
 
 #include "opaque.srt.h"
 #include "msmrecv.h.fsl"   // UnpackMoments() — show the RAW depth, not the packed lane
@@ -19,8 +19,9 @@ ROOT_SIGNATURE(DefaultRootSignature)
 float4 PS_MAIN( VSOutput In )
 {
     INIT_MAIN;
-    // Host draws this into a small SQUARE corner viewport (non-destructive overlay), so the map maps
-    // straight from the fullscreen-triangle Uv — no aspect-fit needed. Uv > 1 is off-viewport.
+    // Host draws this into a corner viewport shaped SUN_CASCADES:1 (non-destructive overlay), so the
+    // atlas maps straight from the fullscreen-triangle Uv — no aspect-fit needed. Uv > 1 is
+    // off-viewport.
     float2 mapUv = saturate(In.Uv);
     float4 m = SampleLvlTex2D(gSunMoments, gSamplerBilinearClamp, mapUv, 0);
     // Unpack to the RAW first moment = the caster's distance from the sun, 0 (at the sun) .. 1 (far
@@ -29,5 +30,8 @@ float4 PS_MAIN( VSOutput In )
     // clear (depth 1) and are tinted so the map's extent stays visible.
     float v = saturate(UnpackMoments(m).x);
     float3 rgb = (v > 0.999f) ? float3(0.03f, 0.05f, 0.10f) : float3(v, v, v);
+    // Tile dividers, so it is obvious which cascade is which and that each one is actually filled.
+    float tile = mapUv.x * float(SUN_CASCADES);
+    if (abs(tile - round(tile)) < 0.004f * float(SUN_CASCADES)) { rgb = float3(0.9f, 0.5f, 0.1f); }
     RETURN(float4(rgb, 1.0f));
 }

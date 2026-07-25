@@ -26,9 +26,21 @@
 // distribution regularises it — standard MSM practice, and it costs a sliver of contact hardness.
 #define MSM_ROUNDING_CORRECTION 6.0e-5f
 
-// Fraction of the map's uv extent over which shadowing fades to fully lit at the border, so leaving
-// the sun ortho box is a ramp instead of a visible straight line across the world.
-#define MSM_EDGE_FADE 0.03f
+// CASCADES. Every cascade is the same camera-centred ortho box at a different half-extent, so
+// "which cascade covers this point" is a max-norm test in clip space and the FIRST (sharpest) box
+// that holds it wins. Two constants shape the hand-off, both in CLIP units (1.0 == the box edge):
+//
+//   MSM_CASCADE_INSET — how far inside its own edge a cascade stops being usable. The atlas packs
+//     cascades side by side, so a bilinear tap right at u=0/1 of a tile would reach its neighbour's
+//     texels; the inset keeps every tap inside its own tile. (0.008 clip = 0.004 uv = 8 texels at
+//     2048.) The blur is already tile-clamped, so this only has to cover the bilinear footprint.
+//   MSM_CASCADE_FADE — width of the hand-off band just inside the inset. Crossing a cascade
+//     boundary changes the texel size several-fold, and with it the penumbra width, so a hard
+//     switch draws a visible ring around the player. Inside the band the receiver evaluates BOTH
+//     cascades and lerps. The outermost cascade has nothing to hand off to, so it fades to fully
+//     lit there instead — that is also the map's outer border ramp.
+#define MSM_CASCADE_INSET 0.008f
+#define MSM_CASCADE_FADE  0.12f
 
 float4 UnpackMoments(float4 packedMoments)
 {
@@ -82,32 +94,78 @@ float ComputeMSMShadowIntensity(float4 b, float zf)
     return saturate(case2 * result2 + case3 * result3);
 }
 
+// One cascade's occlusion estimate at `p` (camera-relative, already normal-offset). `c` indexes both
+// the matrix array and the atlas tile: tile c owns u in [c/N, (c+1)/N], so the tile's own 0..1 uv is
+// squeezed into that slice. uv is saturated first because a caller in the hand-off band may be a
+// hair outside the NEXT cascade's [0,1] — clamping keeps the tap inside the tile rather than letting
+// it wander into the neighbour's.
+float sunCascadeOcclusion(int c, float3 p, float zBias)
+{
+    float4 posLS = mul(gShadowParams.sunViewProj[c], float4(p, 1.0f));
+    // The sun projection is ORTHOgraphic, so w is exactly 1 — the divide is kept only so a future
+    // perspective-shadow variant drops in unchanged.
+    posLS.xyz /= posLS.w;
+
+    float2 uvTile = saturate(posLS.xy * float2(0.5f, -0.5f) + float2(0.5f, 0.5f));
+    float2 uv     = float2((float(c) + uvTile.x) * (1.0f / float(SUN_CASCADES)), uvTile.y);
+    float  zf     = (1.0f - posLS.z) - zBias;   // depth grows away from the sun
+
+    float4 moments = UnpackMoments(SampleLvlTex2D(gSunMoments, gSamplerBilinearClamp, uv, 0));
+    return ComputeMSMShadowIntensity(moments, zf);
+}
+
 // THE receiver entry point. worldPosRel = the fragment's CAMERA-RELATIVE world position (what every
 // Forge frag already interpolates); N = its world normal (for the normal-offset bias — pass the same
 // normal the sun N.L uses). Returns sun visibility: 1 = lit, 0 = fully shadowed.
 //
 // Everything early-outs to 1.0 (fully lit, zero cost beyond the branch) when the feature is off or
-// the fragment falls outside the map — so a fragment the sun map never covered is never darkened.
+// the fragment falls outside every cascade — so a fragment the sun map never covered is never
+// darkened.
 float sunShadowVisibility(float3 worldPosRel, float3 N)
 {
     float strength = gShadowParams.sunParams.x;
     if (strength <= 0.0f) { return 1.0f; }
 
-    float3 p = worldPosRel + N * gShadowParams.sunParams.w;   // normal-offset (slope acne)
-    float4 posLS = mul(gShadowParams.sunViewProj, float4(p, 1.0f));
-    // The sun projection is ORTHOgraphic, so w is exactly 1 — the divide is kept only so a future
-    // perspective cascade drops in unchanged.
-    posLS.xyz /= posLS.w;
+    // Cascade select on the UN-offset position: the normal offset is sub-texel-ish and depends on
+    // the cascade we are about to pick, so resolving it first would be circular. Picking on the raw
+    // position and offsetting afterwards costs one extra projection for the chosen cascade only.
+    int   sel = -1;
+    float m   = 0.0f;   // max-norm in the chosen cascade's clip box: 0 = centre, 1 = edge
+    UNROLL for (int i = 0; i < SUN_CASCADES; ++i)
+    {
+        if (sel < 0)
+        {
+            float4 q  = mul(gShadowParams.sunViewProj[i], float4(worldPosRel, 1.0f));
+            float  mm = max(abs(q.x), abs(q.y));
+            // Every cascade shares one depth slab, so this z test is the same for all of them — it
+            // rejects only geometry genuinely outside the sun's depth range.
+            if (mm < 1.0f - MSM_CASCADE_INSET && q.z > 0.0f && q.z < 1.0f) { sel = i; m = mm; }
+        }
+    }
+    if (sel < 0) { return 1.0f; }
 
-    float2 uv = posLS.xy * float2(0.5f, -0.5f) + float2(0.5f, 0.5f);
-    if (uv.x <= 0.0f || uv.x >= 1.0f || uv.y <= 0.0f || uv.y >= 1.0f) { return 1.0f; }
-    if (posLS.z <= 0.0f || posLS.z >= 1.0f) { return 1.0f; }   // outside the ortho depth slab
+    float  bias  = gShadowParams.sunParams.y;
+    float  noff  = gShadowParams.sunParams.w;            // in TEXELS of the sampled cascade
+    float4 texel = gShadowParams.sunCascadeTexel;        // world units per texel, per cascade
 
-    float zf = (1.0f - posLS.z) - gShadowParams.sunParams.y;   // depth grows away from the sun
+    float occlusion = sunCascadeOcclusion(sel, worldPosRel + N * (noff * texel[sel]), bias);
 
-    float4 packed = SampleLvlTex2D(gSunMoments, gSamplerBilinearClamp, uv, 0);
-    float4 moments = UnpackMoments(packed);
-    float  occlusion = ComputeMSMShadowIntensity(moments, zf);
+    // Hand-off band. Inside it, cross-fade into the next (coarser) cascade — or, for the outermost
+    // one, into fully lit, which is the map's outer border ramp.
+    float band = 1.0f - MSM_CASCADE_INSET - MSM_CASCADE_FADE;
+    if (m > band)
+    {
+        float t = saturate((m - band) / MSM_CASCADE_FADE);
+        if (sel + 1 < SUN_CASCADES)
+        {
+            float occNext = sunCascadeOcclusion(sel + 1, worldPosRel + N * (noff * texel[sel + 1]), bias);
+            occlusion = lerp(occlusion, occNext, t);
+        }
+        else
+        {
+            occlusion *= (1.0f - t);
+        }
+    }
 
     // Light-bleeding reduction. "Light bleeding" is light leaking INTO a region that should be fully
     // shadowed: the 3-point quadrature under-reports occlusion (returns e.g. 0.8 where the truth is
@@ -117,14 +175,11 @@ float sunShadowVisibility(float3 worldPosRel, float3 N)
     // (Crushing the low end instead — linstep(lbr,1,occlusion) — is the opposite operation: it erases
     // partial occlusion, which washes shadows out and reads as MORE bleeding, not less.)
     // Fully-lit pixels sit near 0 occlusion, so the amplification leaves them alone.
+    // Applied AFTER the cascade blend so the band cannot amplify a half-faded value into a hard edge.
     float lbr = gShadowParams.sunParams.z;
     occlusion = saturate(occlusion / max(1.0f - lbr, 1.0e-4f));
 
-    // Ramp to lit across the outer border of the map instead of cutting at the box edge.
-    float2 toEdge = min(uv, float2(1.0f, 1.0f) - uv);
-    float  edge   = saturate(min(toEdge.x, toEdge.y) / MSM_EDGE_FADE);
-
-    return 1.0f - occlusion * strength * edge;
+    return 1.0f - occlusion * strength;
 }
 
 #endif // MSM_RECV_H

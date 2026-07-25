@@ -974,21 +974,28 @@ SamplerState gSampler2xWrapClamp : register( s17 , space100 ) ;
 #line 11 "FSL/shaders.list"
 #line 249 "FSL/shaders.list"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/sunblur.comp.fsl"
-#line 25 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/sunblur.comp.fsl"
+#line 29 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/sunblur.comp.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/sunblur.srt.h"
-#line 11 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/sunblur.srt.h"
+#line 15 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/sunblur.srt.h"
 STRUCT(SunBlurParams)
 {
 
 
     float4 params;
-#line 16
+
+
+
+
+
+
+    float4 params2;
+#line 27
 };
 
         CBUFFER(SunBlurParams) gSunBlurParams :  register(b0,space1);
         Tex2D(float4) gSunBlurSrc :  register(t1,space1);
         WTex2D(float4) gSunBlurDst :  register(u2,space1);
-#line 26 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/sunblur.comp.fsl"
+#line 30 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/sunblur.comp.fsl"
 
 
 
@@ -1004,31 +1011,43 @@ void CS_MAIN( uint3 DispatchThreadID : SV_DISPATCHTHREADID )
         return;
     }
 
-    float4 center = LoadTex2D(gSunBlurSrc, NO_SAMPLER, px, 0);
+    int srcOx = (int)gSunBlurParams.params2.x;
+    int dstOx = (int)gSunBlurParams.params2.y;
+    int2 src = int2(px.x + srcOx, px.y);
+    int2 dst = int2(px.x + dstOx, px.y);
+
+    float4 center = LoadTex2D(gSunBlurSrc, NO_SAMPLER, src, 0);
     float sigma = gSunBlurParams.params.x;
     if (sigma <= 0.0f)
     {
-        Write2D(gSunBlurDst, px, center);
+        Write2D(gSunBlurDst, dst, center);
         return;
     }
 
     int2 dir = int2((int)gSunBlurParams.params.z, (int)gSunBlurParams.params.w);
+    bool horz = (dir.x != 0);
+    int lo = (int)gSunBlurParams.params2.z;
+    int hi = (int)gSunBlurParams.params2.w;
+
+
+
+    int walk = horz ? src.x : src.y;
+    int fixd = horz ? src.y : src.x;
     float inv2 = 1.0f / (2.0f * sigma * sigma);
 
     float4 sum = float4(0.0f, 0.0f, 0.0f, 0.0f);
     float wsum = 0.0f;
 
-
-
     UNROLL for (int i = - 4 ; i <=  4 ; ++i)
     {
-        int2 sp = clamp(px + dir * i, int2(0, 0), int2(res - 1, res - 1));
+        int w = clamp(walk + i, lo, hi);
+        int2 sp = horz ? int2(w, fixd) : int2(fixd, w);
         float wgt = exp(-float(i * i) * inv2);
         sum += LoadTex2D(gSunBlurSrc, NO_SAMPLER, sp, 0) * wgt;
         wsum += wgt;
     }
 
-    Write2D(gSunBlurDst, px, (wsum > 0.0f) ? (sum / wsum) : center);
+    Write2D(gSunBlurDst, dst, (wsum > 0.0f) ? (sum / wsum) : center);
     return;
 }
 #line 250 "FSL/shaders.list"
