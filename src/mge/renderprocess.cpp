@@ -3435,7 +3435,7 @@ namespace RenderProcess {
             // P1 shadows added 10 (shadow mask — the host panel's face-id/atlas checkboxes
             // pick what it displays); shadow observability added 11 (shadow-atlas static) +
             // 12 (shadow-atlas dynamic) fullscreen atlas blits — cycle is now %13.
-            g_debugMode = (g_debugMode + 1) % 13;
+            g_debugMode = (g_debugMode + 1) % 14;
             const char* name = (g_debugMode == 1) ? "DEPTH" : (g_debugMode == 2) ? "SCATTER"
                              : (g_debugMode == 3) ? "AO" : (g_debugMode == 4) ? "BENT NORMAL"
                              : (g_debugMode == 5) ? "ALBEDO" : (g_debugMode == 6) ? "LIT"
@@ -3443,7 +3443,8 @@ namespace RenderProcess {
                              : (g_debugMode == 9) ? "LIGHT COUNT"
                              : (g_debugMode == 10) ? "SHADOW MASK"
                              : (g_debugMode == 11) ? "SHADOW ATLAS (STATIC)"
-                             : (g_debugMode == 12) ? "SHADOW ATLAS (DYN)" : "NORMAL";
+                             : (g_debugMode == 12) ? "SHADOW ATLAS (DYN)"
+                             : (g_debugMode == 13) ? "SUN MOMENTS" : "NORMAL";
             LOG::logline(">> [seam] debug mode %d (%s)", g_debugMode, name);
         }
         // F9 toggles the in-host dev overlay.

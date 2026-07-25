@@ -190,6 +190,11 @@ BEGIN_SRT_NO_AB(SrtData)
         // they are bound ONLY into the main pPerFrameSet, like the water/mask SRVs).
         DECL_TEXTURE(PerFrame, Tex2D(float), gShadowAtlas)
         DECL_TEXTURE(PerFrame, Tex2D(float), gShadowAtlasDyn)
+        // SUN (directional) shadow moments map — the DL-statics-primary MSM map, RGBA16_UNORM
+        // (packed 4 moments). Phase A: read only by sunshadowview.frag (F12 mode 13 blit). Phase B:
+        // the opaque/alpha receiver samples it for sun shadows. Bound into pPerFrameSet like the
+        // atlas views; harmless null tail elsewhere.
+        DECL_TEXTURE(PerFrame, Tex2D(float4), gSunMoments)
         // Clustered forward lighting: the froxel light-mask (128 bits/froxel = 4 uint), written by
         // froxelassign.comp (UAV) and read here as an SRV. Appended AFTER gShadowAtlasDyn so every
         // existing PerFrame offset stays stable. Bound once into pPerFrameSet (like gShadowMask); only

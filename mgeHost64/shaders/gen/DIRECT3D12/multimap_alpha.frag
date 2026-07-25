@@ -972,7 +972,7 @@ SamplerState gSampler2xWrapClamp : register( s17 , space100 ) ;
 #line 247 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/../../../3rdparty/The-Forge/Common_3/Graphics/FSL/defaults.h"
 
 #line 11 "FSL/shaders.list"
-#line 98 "FSL/shaders.list"
+#line 117 "FSL/shaders.list"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/multimap_alpha.frag.fsl"
 #line 15 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/multimap_alpha.frag.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
@@ -1152,23 +1152,13 @@ STRUCT(LightData)
 
 
 
-
-        Buffer(uint) gFroxelMask :  register(t9,space1);
-
+        Tex2D(float4) gSunMoments :  register(t9,space1);
 
 
 
 
 
-
-        Buffer(uint) gFroxelMaskNear :  register(t10,space1);
-
-
-
-
-
-
-        Buffer(float4) gUVAnim :  register(t11,space1);
+        Buffer(uint) gFroxelMask :  register(t10,space1);
 
 
 
@@ -1176,14 +1166,29 @@ STRUCT(LightData)
 
 
 
+        Buffer(uint) gFroxelMaskNear :  register(t11,space1);
 
-        CBUFFER(ShadowMaskParams) gShadowParams :  register(b12,space1);
+
+
+
+
+
+        Buffer(float4) gUVAnim :  register(t12,space1);
+
+
+
+
+
+
+
+
+        CBUFFER(ShadowMaskParams) gShadowParams :  register(b13,space1);
 
 
 
 
         CBUFFER(LightData) gLights :  register(b0,space3);
-#line 242 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+#line 247 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
         Tex2D(float4) gTextures[ 896 ] :  register(t0,space0);
 
 
@@ -1398,4 +1403,4 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
     float outA = baseA * In.Color.a;
     return (float4(c, outA));
 }
-#line 99 "FSL/shaders.list"
+#line 118 "FSL/shaders.list"

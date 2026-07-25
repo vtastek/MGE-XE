@@ -1,0 +1,51 @@
+// mgeHost64 — SUN shadow moments map for DL STATICS (the primary sun-caster proxy set).
+//
+// DL statics are the host-resident, GPU-instanced world proxy; drawn from the sun ortho VP they
+// cast shadows into the near scene INCLUDING from off-screen (world-space, camera-independent) —
+// exactly what the old DX9 system used as its shadow caster set. Near dynamics + missing pieces are
+// submitted on top via the opaque.vert-paired sunshadow.frag. This variant pairs with statics.vert
+// (its own vertex format / VSOutput), samples the statics bindless array, and applies the same
+// 133/255 cutout statics.frag uses, then writes the 4 MSM moments from reverse-Z depth.
+//
+// VSOutput MUST stay byte-identical to statics.vert / statics.frag (centroid modifiers + the full
+// field list, WorldNormal included) — a frag whose input doesn't match its paired vert's output
+// hangs the GPU (see project_forge_shared_frag_vsoutput).
+
+#include "opaque.srt.h"      // gStaticsArrays[], gSamplerAnisotropic, gFrameData
+#include "msmpack.h.fsl"     // PackMoments()
+
+STRUCT(VSOutput)
+{
+    DATA(float4,           Position,    SV_Position);
+    DATA(float2,           Uv,          TEXCOORD0);
+    DATA(CENTROID(float4), Color,       COLOR);
+    DATA(CENTROID(float),  Fog,         TEXCOORD1);
+    DATA(FLAT(uint),       TexIndex,    TEXCOORD2);
+    DATA(FLAT(uint),       Flags,       TEXCOORD3);
+    DATA(float3,           WorldPos,    TEXCOORD4);
+    DATA(float3,           WorldNormal, TEXCOORD5);
+};
+
+STRUCT(PsOut)
+{
+    DATA(float4, moments, SV_Target0);
+};
+
+ROOT_SIGNATURE(DefaultRootSignature)
+PsOut PS_MAIN( VSOutput In )
+{
+    INIT_MAIN;
+    // Cutout statics (Flags bit1 = hasAlpha) test at MGE's 133/255 ref — MUST match statics.frag so
+    // the shadow silhouette equals the drawn silhouette. Opaque subsets never discard.
+    if ((In.Flags & 0x2u) != 0u) {
+        uint bucket = In.TexIndex >> 16;
+        uint layer  = In.TexIndex & 0xFFFFu;
+        float4 tex = SampleTex2DArray(gStaticsArrays[bucket], gSamplerAnisotropic, float3(In.Uv, (float)layer));
+        if (tex.a < (133.0f / 255.0f)) { discard; }
+    }
+
+    float  d = In.Position.z;   // reverse-Z sun depth in [0,1]
+    PsOut Out;
+    Out.moments = PackMoments(float4(d, d*d, d*d*d, d*d*d*d));
+    RETURN(Out);
+}

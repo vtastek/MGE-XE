@@ -1152,23 +1152,13 @@ STRUCT(LightData)
 
 
 
-
-        Buffer(uint) gFroxelMask :  register(t9,space1);
-
+        Tex2D(float4) gSunMoments :  register(t9,space1);
 
 
 
 
 
-
-        Buffer(uint) gFroxelMaskNear :  register(t10,space1);
-
-
-
-
-
-
-        Buffer(float4) gUVAnim :  register(t11,space1);
+        Buffer(uint) gFroxelMask :  register(t10,space1);
 
 
 
@@ -1176,14 +1166,29 @@ STRUCT(LightData)
 
 
 
+        Buffer(uint) gFroxelMaskNear :  register(t11,space1);
 
-        CBUFFER(ShadowMaskParams) gShadowParams :  register(b12,space1);
+
+
+
+
+
+        Buffer(float4) gUVAnim :  register(t12,space1);
+
+
+
+
+
+
+
+
+        CBUFFER(ShadowMaskParams) gShadowParams :  register(b13,space1);
 
 
 
 
         CBUFFER(LightData) gLights :  register(b0,space3);
-#line 242 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+#line 247 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
         Tex2D(float4) gTextures[ 896 ] :  register(t0,space0);
 
 

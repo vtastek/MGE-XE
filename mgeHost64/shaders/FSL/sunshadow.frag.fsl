@@ -1,0 +1,60 @@
+// mgeHost64 — SUN (directional) shadow moments-map fragment stage.
+//
+// Writes a 4-moment shadow map (Moment Shadow Mapping, "Hamburger 4MSM", Peters & Klein I3D2015)
+// for the single directional sun. Paired with opaque.vert (same VSOutput as the point-light
+// shadowcaster) so the sun caster pass reuses the whole vertex + instancing path — only the frag
+// and the render target differ (COLOR moments here vs the point atlas's depth-only).
+//
+// Depth stored is In.Position.z DIRECTLY — our sun ortho pass is reverse-Z (near = 1, far = 0),
+// same convention the receiver reconstructs against (opaque/alpha frag calcSunShadow). MSM is a
+// filterable representation: the map can be gaussian-blurred so the receiver gets soft, low-leak
+// shadows without the acne/peter-panning of raw depth-compare — which is exactly the "no artifacts,
+// no leaking" bar. Alpha cutout matches the caster (strict '<'); NO emissive carve — the carve
+// exists to stop a fixture caging its OWN point light, meaningless for the one global sun (a lantern
+// casts a normal sun shadow).
+//
+// PackMoments is inlined (The-Forge keeps it in a vis-buffer util header we can't include). It is a
+// fixed linear reparametrisation that spreads the four raw moments across the [0,1] range so a
+// 16-bit UNORM target holds them with usable precision; UnpackMoments (receiver side) inverts it.
+
+#include "opaque.srt.h"
+#include "texsample.h.fsl"   // sampleBase() — MW address mode + AF level
+#include "msmpack.h.fsl"     // PackMoments()
+
+STRUCT(VSOutput)
+{
+    DATA(float4,      Position, SV_Position);
+    DATA(float3,      Normal,   NORMAL);
+    DATA(float2,      Uv,       TEXCOORD0);
+    DATA(FLAT(uint),  TexIndex, TEXCOORD1);
+    DATA(float,       Fog,      TEXCOORD2);
+    DATA(float4,      Color,    COLOR);
+    DATA(float,       AlphaRef, TEXCOORD3);
+    DATA(FLAT(float3),MatDiffuse, TEXCOORD4);
+    DATA(FLAT(float3),MatAmbient, TEXCOORD5);
+    DATA(FLAT(float3),MatEmissive,TEXCOORD6);
+    DATA(FLAT(uint),  VColSource, TEXCOORD7);
+    DATA(float3,      WorldPos,   TEXCOORD8);
+    DATA(FLAT(uint),  OverlayIndex,TEXCOORD9);
+    DATA(FLAT(uint),  ClampMode,  TEXCOORD10);
+};
+
+STRUCT(PsOut)
+{
+    DATA(float4, moments, SV_Target0);
+};
+
+ROOT_SIGNATURE(DefaultRootSignature)
+PsOut PS_MAIN( VSOutput In )
+{
+    INIT_MAIN;
+    // Alpha cutout — MUST match depthonly.frag / opaque.frag / shadowcaster.frag exactly (strict '<')
+    // so foliage/hammock cutouts cast the same silhouette the colour pass shows.
+    float4 tex = sampleBase(In.TexIndex, In.ClampMode, In.Uv, useLowAF(In.AlphaRef, false));
+    clip(tex.a < In.AlphaRef ? -1.0f : 1.0f);
+
+    float  d = In.Position.z;   // reverse-Z sun depth in [0,1]
+    PsOut Out;
+    Out.moments = PackMoments(float4(d, d*d, d*d*d, d*d*d*d));
+    RETURN(Out);
+}

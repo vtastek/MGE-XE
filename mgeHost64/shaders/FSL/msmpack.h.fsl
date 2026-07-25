@@ -1,0 +1,22 @@
+// mgeHost64 — Moment Shadow Map (MSM) moment packing, shared by every sun-caster frag variant
+// (sunshadow.frag for opaque.vert casters, sunshadow_statics.frag for statics.vert casters, …).
+//
+// PackMoments is the optimal 4-moment quantisation from Peters & Klein, "Moment Shadow Mapping"
+// (I3D 2015) — a fixed linear reparametrisation spreading the raw moments (d, d², d³, d⁴) across
+// [0,1] so a 16-bit UNORM target holds them with usable precision. The receiver's UnpackMoments is
+// the analytic inverse. Byte-identical to The-Forge 09_LightShadowPlayground's PackMoments so the
+// reference Hamburger-4MSM reconstruction applies unchanged.
+
+#ifndef MSM_PACK_H
+#define MSM_PACK_H
+
+float4 PackMoments(float4 b)
+{
+    float4x4 mat = make_f4x4_row_elems(1.5f,            0.0f, -2.0f,             0.0f,
+                                       0.0f,            4.0f,  0.0f,            -4.0f,
+                                       sqrt(3.0f)/2.0f, 0.0f, -sqrt(12.0f)/9.0f, 0.0f,
+                                       0.0f,            0.5f,  0.0f,             0.5f);
+    return mul(mat, b) + float4(0.5f, 0.0f, 0.5f, 0.0f);
+}
+
+#endif // MSM_PACK_H

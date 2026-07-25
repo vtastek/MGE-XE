@@ -1,0 +1,30 @@
+// mgeHost64 — SUN shadow moments-map debug view (fragment stage).
+//
+// F12 mode 13: aspect-fit the square sun MSM moments map into the screen and show the first packed
+// moment (gSunMoments.x) as greyscale, so Step A1 can VERIFY the DL-statics sun caster pass actually
+// captured geometry from the sun's POV — before any receiver touches the lit image. Reuses
+// shadowatlasview.vert (fullscreen triangle) + the opaque.srt.h PerFrame set (gSunMoments bound
+// there like the atlas views). Pure debug overlay: OVERWRITES the composited scene, alpha = 1.
+
+#include "opaque.srt.h"
+
+STRUCT(VSOutput)
+{
+    DATA(float4, Position, SV_Position);
+    DATA(float2, Uv,       TEXCOORD0);
+};
+
+ROOT_SIGNATURE(DefaultRootSignature)
+float4 PS_MAIN( VSOutput In )
+{
+    INIT_MAIN;
+    // Host draws this into a small SQUARE corner viewport (non-destructive overlay), so the map maps
+    // straight from the fullscreen-triangle Uv — no aspect-fit needed. Uv > 1 is off-viewport.
+    float2 mapUv = saturate(In.Uv);
+    float4 m = SampleLvlTex2D(gSunMoments, gSamplerAnisotropic, mapUv, 0);
+    // Packed first moment tracks caster depth non-linearly — enough to read silhouettes. A faint
+    // border tints empty (no-caster, m≈0) texels so the overlay's extent is always visible.
+    float v = saturate(m.x);
+    float3 rgb = (v < 0.002f) ? float3(0.03f, 0.05f, 0.10f) : float3(v, v, v);
+    RETURN(float4(rgb, 1.0f));
+}

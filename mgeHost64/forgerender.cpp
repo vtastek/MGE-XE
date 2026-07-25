@@ -1137,6 +1137,19 @@ namespace {
         uint32_t       cullSubsetCount = 0;         // g_staticsSubsets.size() at upload
         bool           gpuStaticsReady = false;     // all B3 resources + pipelines created
         bool           gpuArgsInDrawState = false;  // pGpuArgs/pGpuInstOut currently in INDIRECT/VERTEX (else UAV)
+        // SUN shadow A2: a SECOND cull dispatch (shares cull.comp/scan/scatter + the gCullInst/subset
+        // inputs) with sun CullParams — frustum = sun ortho box, nearCut=0, Hi-Z OFF — so DL statics
+        // cast into near AND from off-screen. Own output buffers + params CBV + descriptor set.
+        Buffer*        pSunCullParamsCbv = nullptr;
+        Buffer*        pSunCullCount     = nullptr; // uint[4] (cull.comp AtomicAdd target; not read back)
+        Buffer*        pSunSubsetCount   = nullptr;
+        Buffer*        pSunSubsetOffset  = nullptr;
+        Buffer*        pSunSubsetCursor  = nullptr;
+        Buffer*        pSunArgs          = nullptr; // RW|INDIRECT: sun survivor args
+        Buffer*        pSunInstOut       = nullptr; // RW|VERTEX: sun survivor instance rows
+        DescriptorSet* pSunCullSet       = nullptr; // CullSrtData PerBatch bound to the sun buffers
+        bool           sunCullReady      = false;
+        bool           sunArgsInDrawState = false;
         // --- Follow-on 3: shadow-light occlusion cull (one dispatch/frame, 1-frame readback) -------
         // Tests each shadow slot's influence sphere vs the PREVIOUS frame's Hi-Z pyramid (the SAME
         // test as cull.comp); a fully-occluded slot ORs its bit into pLightOccBits[0]. The host reads
@@ -1427,6 +1440,16 @@ namespace {
         // (overwriting pReflectFrameCbv mid-pass would corrupt the sky draws that execute later on the GPU).
         Buffer*        pReflectFrameCbvGeo = nullptr;       // gFrameData for the water-plane mirror + clip plane
         DescriptorSet* pPerFrameSetReflectGeo = nullptr;    // PerFrame set bound to pReflectFrameCbvGeo
+        // SUN (directional) shadow — Phase A (forge-sun-shadows.md). MSM moments map rendered from DL
+        // statics (primary caster proxy) under a sun ortho VP; F12 mode 13 blits it. Its own frame CBV
+        // (gFrameData copy, viewProj := sun ortho VP), like pReflectFrameCbvGeo's second-view pattern.
+        RenderTarget*  pSunMoments = nullptr;               // kSunShadowRes² RGBA16_UNORM packed 4-moment map
+        RenderTarget*  pSunMomentsDepth = nullptr;          // kSunShadowRes² D32 reverse-Z (sun pass z-test)
+        Buffer*        pSunFrameCbv = nullptr;              // gFrameData copy, viewProj := sun ortho VP
+        DescriptorSet* pPerFrameSetSun = nullptr;           // PerFrame set bound to pSunFrameCbv
+        Shader*        pSunShadowViewShader = nullptr;      // shadowatlasview.vert + sunshadowview.frag (F12 13)
+        Pipeline*      pSunShadowViewPipeline = nullptr;
+        bool           sunShadowReady = false;
         Buffer*        pReflectSkyWorldsBuf = nullptr;     // reflect sky gBatch window (own; filled in the reflect pass)
         DescriptorSet* pPerBatchSetReflectSky = nullptr;   // gBatch bound to pReflectSkyWorldsBuf
         Buffer*        pReflectSkyInstanceBuf = nullptr;   // reflect sky per-draw instance VB
@@ -1712,6 +1735,11 @@ namespace {
     constexpr uint32_t kMaxShadowLights  = 32;     // MUST match MAX_SHADOW_SLOTS (shadowmask.srt.h)
     constexpr uint32_t kShadowFaceCbvs   = 192;    // per-frame face wall: kMaxShadowLights x 6 faces (C4b: any/all slots may re-render in one frame)
     constexpr uint32_t kShadowMaxCasters = 256;    // per-light caster cap (sphere-filtered, one list for all 6 faces)
+    // SUN (directional) shadow — MSM moments map (forge-sun-shadows.md, Phase A). Declared early so
+    // the RT-creation block (well above the DL-statics pipeline globals) can see the resolution.
+    constexpr uint32_t kSunShadowRes     = 2048;   // moments map resolution (single cascade, v1)
+    float              g_sunShadowRange  = 8192.0f;// camera-relative ortho half-extent (one MW cell; live knob)
+    bool               g_drawSunShadow   = true;   // Phase A: render the sun caster pass (F12 13 to view)
     constexpr float    kShadowNearZ      = 4.0f;   // face frustum near (world u); far = the light's 2·radius
     // How long a slot's lastWorld record stays a caster candidate after the item was last in
     // the client's visible set. Statics don't move so stale is correct; the window only bounds
@@ -1844,6 +1872,45 @@ namespace {
     inline float shadowFaceUvScale(uint32_t size) {
         const float s = (size > 0u) ? (float)size : 1.0f;
         return std::max(0.5f, 1.0f - 2.0f * kShadowFaceGutter / s);
+    }
+
+    // SUN shadow: build the reverse-Z ORTHOGRAPHIC view-projection for the directional sun, in the
+    // SAME camera-relative space the live statics.vert projects (eye at origin). `sunDirWorld` = the
+    // world sun TRAVEL direction (gFrameData.sunDir.xyz); the sun "looks" down that axis. `range` =
+    // ortho half-extent perpendicular to the sun (the shadowed radius around the camera). Row/column
+    // layout matches buildShadowFaceVP: out16 row i = world-axis i's contribution to each clip lane;
+    // clip = worldPos * M (row vectors, mul(M,v) in-shader). Reverse-Z (near→1, far→0) so it matches
+    // CMP_GEQUAL + the moments-map clear 0, and the sunshadow frag stores In.Position.z directly.
+    void buildSunOrthoVP(const float* sunDirWorld, float range, float* out16) {
+        float za[3] = { sunDirWorld[0], sunDirWorld[1], sunDirWorld[2] };   // view forward = down-sun
+        float zl = std::sqrt(za[0]*za[0] + za[1]*za[1] + za[2]*za[2]);
+        if (zl < 1e-6f) { za[0] = 0.0f; za[1] = 0.0f; za[2] = -1.0f; zl = 1.0f; }
+        za[0] /= zl; za[1] /= zl; za[2] /= zl;
+        // World up = MW Z-up, unless the sun is near-vertical (|za.z|→1); then use Y as the up ref.
+        float up[3];
+        if (std::fabs(za[2]) < 0.99f) { up[0] = 0.0f; up[1] = 0.0f; up[2] = 1.0f; }
+        else                          { up[0] = 0.0f; up[1] = 1.0f; up[2] = 0.0f; }
+        float xa[3] = { up[1]*za[2] - up[2]*za[1],          // cross(up, za)
+                        up[2]*za[0] - up[0]*za[2],
+                        up[0]*za[1] - up[1]*za[0] };
+        float xl = std::sqrt(xa[0]*xa[0] + xa[1]*xa[1] + xa[2]*xa[2]);
+        if (xl < 1e-6f) { xl = 1.0f; }
+        xa[0] /= xl; xa[1] /= xl; xa[2] /= xl;
+        float ya[3] = { za[1]*xa[2] - za[2]*xa[1],          // cross(za, xa) (already unit)
+                        za[2]*xa[0] - za[0]*xa[2],
+                        za[0]*xa[1] - za[1]*xa[0] };
+        const float depthHalf = 2.0f * range;               // generous depth box along the sun axis
+        const float invR  = 1.0f / range;
+        const float invDz = -1.0f / (2.0f * depthHalf);     // reverse-Z ortho z scale
+        float V[4][3];
+        for (int i = 0; i < 3; ++i) { V[i][0] = xa[i]; V[i][1] = ya[i]; V[i][2] = za[i]; }
+        V[3][0] = 0.0f; V[3][1] = 0.0f; V[3][2] = 0.0f;     // eye at origin (camera-relative)
+        for (int i = 0; i < 4; ++i) {
+            out16[i*4 + 0] = V[i][0] * invR;
+            out16[i*4 + 1] = V[i][1] * invR;
+            out16[i*4 + 2] = V[i][2] * invDz + ((i == 3) ? 0.5f : 0.0f);
+            out16[i*4 + 3] = (i == 3) ? 1.0f : 0.0f;        // w = 1 (orthographic)
+        }
     }
 
     // P1 shadow frame state: filled by the manager stub PRE-beginCmd (persistent-mapped CBV
@@ -2525,6 +2592,45 @@ namespace {
                 addRenderTarget(R, &asd, &g_live.pAlphaShadowDepth);
             }
 
+            // SUN shadow (Phase A): the MSM moments map (colour RGBA16_UNORM) + its own reverse-Z
+            // depth, both kSunShadowRes². The moments RT rests SHADER_RESOURCE (sampled by the F12
+            // view + the Phase-B receiver), flips to RENDER_TARGET only during the sun caster pass.
+            {
+                RenderTargetDesc smd = {};
+                smd.mWidth = kSunShadowRes; smd.mHeight = kSunShadowRes; smd.mDepth = 1;
+                smd.mArraySize = 1; smd.mMipLevels = 1;
+                smd.mSampleCount = SAMPLE_COUNT_1; smd.mSampleQuality = 0;
+                smd.mFormat = TinyImageFormat_R16G16B16A16_UNORM;
+                smd.mStartState = RESOURCE_STATE_SHADER_RESOURCE;
+                smd.mClearValue.r = 0.0f; smd.mClearValue.g = 0.0f;
+                smd.mClearValue.b = 0.0f; smd.mClearValue.a = 0.0f;
+                smd.mDescriptors = DESCRIPTOR_TYPE_TEXTURE;
+                smd.pName = "sunMoments";
+                addRenderTarget(R, &smd, &g_live.pSunMoments);
+
+                RenderTargetDesc smdd = {};
+                smdd.mWidth = kSunShadowRes; smdd.mHeight = kSunShadowRes; smdd.mDepth = 1;
+                smdd.mArraySize = 1; smdd.mMipLevels = 1;
+                smdd.mSampleCount = SAMPLE_COUNT_1; smdd.mSampleQuality = 0;
+                smdd.mFormat = TinyImageFormat_D32_SFLOAT;
+                smdd.mStartState = RESOURCE_STATE_DEPTH_WRITE;
+                smdd.mClearValue.depth = 0.0f;   // reverse-Z far
+                smdd.mClearValue.stencil = 0;
+                smdd.mDescriptors = DESCRIPTOR_TYPE_TEXTURE;
+                smdd.pName = "sunMomentsDepth";
+                addRenderTarget(R, &smdd, &g_live.pSunMomentsDepth);
+
+                BufferLoadDesc sfc = {};
+                sfc.mDesc.mDescriptors = DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+                sfc.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_CPU_TO_GPU;
+                sfc.mDesc.mFlags = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
+                sfc.mDesc.mSize = 512;                 // full FrameData copy, viewProj := sun ortho VP
+                sfc.mDesc.pName = "sunFrameCbv";
+                sfc.pData = nullptr;
+                sfc.ppBuffer = &g_live.pSunFrameCbv;
+                addResource(&sfc, nullptr);
+            }
+
             waitForAllResourceLoads();
             if (!g_live.pLinearDepth || !g_live.pAO || !g_live.pAOBlur || !g_live.pAOParamsCbv) {
                 std::printf("[forge] Tier 2 AO resource alloc FAILED\n");
@@ -3130,7 +3236,7 @@ namespace {
             // (pAOBlur), not raw pAO; pAOBlur's per-frame UAV<->SHADER_RESOURCE ping-pong (renderScene)
             // leaves it SHADER_RESOURCE before the colour pass samples it. (Raw pAO still feeds the
             // blur as an SRV, and the DebugTextures/readback paths still inspect pAO directly.)
-            DescriptorData p[9] = {};
+            DescriptorData p[11] = {};   // was 9; +gSunMoments (and headroom)
             p[0].mIndex = SRT_RES_IDX(SrtData, PerFrame, gFrameData);
             p[0].ppBuffers = &g_live.pFrameCbv;
             p[1].mIndex = SRT_RES_IDX(SrtData, PerFrame, gAO);
@@ -3183,6 +3289,14 @@ namespace {
                 p[np].mIndex = SRT_RES_IDX(SrtData, PerFrame, gShadowAtlasDyn);
                 p[np].mCount = 1;
                 p[np].ppTextures = &g_live.pShadowAtlasDyn->pTexture;
+                ++np;
+            }
+            // SUN moments map — read by sunshadowview.frag (F12 13) + the Phase-B receiver. Bound
+            // into the main set like the atlas views; harmless where unread.
+            if (g_live.pSunMoments) {
+                p[np].mIndex = SRT_RES_IDX(SrtData, PerFrame, gSunMoments);
+                p[np].mCount = 1;
+                p[np].ppTextures = &g_live.pSunMoments->pTexture;
                 ++np;
             }
             // FP direct-atlas shadow reception: the per-slot params. Read only by opaque.frag's
@@ -4123,6 +4237,22 @@ namespace {
                 std::printf("[forge] addPipeline(shadowatlasview) FAILED\n");
                 return false;
             }
+
+            // SUN moments-map debug view (F12 mode 13): same fullscreen-triangle vert, frag blits
+            // gSunMoments.x greyscale. Non-fatal: on failure the mode-13 blit is simply skipped.
+            ShaderLoadDesc ssvDesc = {};
+            ssvDesc.mVert.pFileName = "shadowatlasview.vert";
+            ssvDesc.mFrag.pFileName = "sunshadowview.frag";
+            addShader(R, &ssvDesc, &g_live.pSunShadowViewShader);
+            if (g_live.pSunShadowViewShader) {
+                sag.pShaderProgram = g_live.pSunShadowViewShader;
+                addPipeline(R, &savPd, &g_live.pSunShadowViewPipeline);
+                if (!g_live.pSunShadowViewPipeline) {
+                    std::printf("[forge] addPipeline(sunshadowview) FAILED\n");
+                }
+            } else {
+                std::printf("[forge] addShader(sunshadowview) FAILED — F12 13 disabled\n");
+            }
         }
 
         // --- AT1: sorted-alpha shader + 2 blend PSOs + world window + instance VB ---------------
@@ -4630,6 +4760,43 @@ namespace {
                     ++rn;
                 }
                 updateDescriptorSet(R, 0, g_live.pPerFrameSetReflectGeo, rn, p);
+            }
+
+            // SUN shadow: pPerFrameSetSun — a PerFrame set bound to pSunFrameCbv (gFrameData copy,
+            // viewProj := sun ortho VP), so the DL-statics caster draw projects by the sun VP. Same
+            // gAO + water + UV-anim + shadow-param bindings as the reflect-geo set (statics.vert reads
+            // gFrameData + gUVAnim; the moments frag reads gStaticsArrays from the Persistent set; the
+            // rest are type-valid fillers the shared set layout requires).
+            if (g_live.pSunFrameCbv) {
+                DescriptorSetDesc spsDesc = SRT_SET_DESC(SrtData, PerFrame, 1, 0);
+                addDescriptorSet(R, &spsDesc, &g_live.pPerFrameSetSun);
+                if (!g_live.pPerFrameSetSun) { return false; }
+                Texture* vol = g_live.pWaterNormalVol ? g_live.pWaterNormalVol : g_live.pDefaultWhite;
+                DescriptorData p[10] = {};
+                p[0].mIndex = SRT_RES_IDX(SrtData, PerFrame, gFrameData);
+                p[0].ppBuffers = &g_live.pSunFrameCbv;
+                p[1].mIndex = SRT_RES_IDX(SrtData, PerFrame, gAO);
+                p[1].mCount = 1; p[1].ppTextures = &g_live.pAOBlur;
+                p[2].mIndex = SRT_RES_IDX(SrtData, PerFrame, gWaterNormalVol);
+                p[2].mCount = 1; p[2].ppTextures = &vol;
+                p[3].mIndex = SRT_RES_IDX(SrtData, PerFrame, gRefractColor);
+                p[3].mCount = 1; p[3].ppTextures = &g_live.pRefractColor;
+                p[4].mIndex = SRT_RES_IDX(SrtData, PerFrame, gSceneLinDepth);
+                p[4].mCount = 1; p[4].ppTextures = &g_live.pLinearDepth;
+                p[5].mIndex = SRT_RES_IDX(SrtData, PerFrame, gReflectColor);
+                p[5].mCount = 1; p[5].ppTextures = &g_live.pRefractColor;   // sun set never reads this
+                uint32_t sn = 6;
+                if (g_live.pUVAnimBuf) {
+                    p[sn].mIndex = SRT_RES_IDX(SrtData, PerFrame, gUVAnim);
+                    p[sn].mCount = 1; p[sn].ppBuffers = &g_live.pUVAnimBuf;
+                    ++sn;
+                }
+                if (g_live.pShadowMaskParamsCbv) {
+                    p[sn].mIndex = SRT_RES_IDX(SrtData, PerFrame, gShadowParams);
+                    p[sn].ppBuffers = &g_live.pShadowMaskParamsCbv;
+                    ++sn;
+                }
+                updateDescriptorSet(R, 0, g_live.pPerFrameSetSun, sn, p);
             }
 
             g_live.reflectReady = g_live.waterReady && g_live.pReflectColor && g_live.pReflectDepth
@@ -6932,6 +7099,8 @@ namespace ForgeRender {
     void dlReflectGeoCull(Renderer* R, const float* viewProj, const float* fcbvR,
                           float dRel, float eyeAbsZ, float waterLevelAbs, bool underwater);
     void dlLiveRecord();
+    void renderSunShadow();   // SUN shadow: DL statics → MSM moments map (forge-sun-shadows.md Phase A)
+    void dispatchSunCull();   // SUN shadow A2: second statics cull (sun ortho box, nearCut=0, Hi-Z off)
     void dlDrawHeroBlend();                                                 // Phase 4 post-water hero blend pass
     bool buildGlowPath(Renderer* R);                                        // Phase F glow billboards: build (idempotent)
     void dlDrawGlowBillboards();                                            // Phase F glow billboards: per-frame fill + draw
@@ -8742,6 +8911,11 @@ namespace ForgeRender {
                                   g_live.pLightOccBits->mDx.pResource, 0, sizeof(uint32_t));
             bufBarrier2(g_live.pLightOccBits, RESOURCE_STATE_COPY_SOURCE, RESOURCE_STATE_UNORDERED_ACCESS);
         }
+
+        // SUN shadow A2: the second statics cull (sun ortho box, nearCut=0, Hi-Z off) → pSunArgs/
+        // pSunInstOut for renderSunShadow. Pure compute here (no RT bound), same phase as the camera cull.
+        dispatchSunCull();
+
         gpuPhaseEnd(kGpuPhaseCull);
 
         // Near clustered forward: build this frame's NEAR froxel light-mask HERE — in the pure-compute
@@ -11304,6 +11478,12 @@ namespace ForgeRender {
         }
         gpuPhaseEnd(kGpuPhaseColorFP);
 
+        // SUN shadow (Phase A): render the DL-statics MSM moments map. Self-contained (own RT +
+        // barriers); the scene passes have all closed (RTs unbound above). A1 draws the camera-culled
+        // statics set from the sun ortho VP just to light up + verify the map (F12 13); the sun-ortho
+        // cull (off-screen casters) is A2. Nothing samples it yet — the live image is unchanged.
+        renderSunShadow();
+
         // --- Shadow-atlas debug view (F12 mode 11 static / 12 dynamic) --------------------------
         // Fullscreen-triangle OVERWRITE of the composited colour target with the whole D32 shadow
         // atlas, tinted per-slot by active/dyn state. Drawn LAST (after every scene pass incl. FP)
@@ -11318,6 +11498,24 @@ namespace ForgeRender {
             cmdSetViewport(g_live.pCmd, 0.0f, 0.0f, (float)g_live.width, (float)g_live.height, 0.0f, 1.0f);
             cmdSetScissor(g_live.pCmd, 0, 0, g_live.width, g_live.height);
             cmdBindPipeline(g_live.pCmd, g_live.pShadowAtlasViewPipeline);
+            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSet);
+            cmdDraw(g_live.pCmd, 3, 0);
+            cmdBindRenderTargets(g_live.pCmd, nullptr);
+        }
+
+        // --- SUN moments-map debug view (F12 mode 13) -------------------------------------------
+        // NON-DESTRUCTIVE corner overlay: draw the square moments map into a small top-left viewport
+        // (scene kept via LOAD_ACTION_LOAD), so mode 13 never blanks the scene. gSunMoments is bound
+        // in pPerFrameSet. Verifies the sun caster pass before any receiver.
+        if (g_debugMode == 13 && g_live.pSunShadowViewPipeline && g_live.pSunMoments) {
+            const float side = (float)std::min<uint32_t>(512u, g_live.width / 3u);
+            BindRenderTargetsDesc svbind = {};
+            svbind.mRenderTargetCount = 1;
+            svbind.mRenderTargets[0] = { colorTarget, LOAD_ACTION_LOAD };
+            cmdBindRenderTargets(g_live.pCmd, &svbind);
+            cmdSetViewport(g_live.pCmd, 8.0f, 8.0f, side, side, 0.0f, 1.0f);
+            cmdSetScissor(g_live.pCmd, 8, 8, (uint32_t)side, (uint32_t)side);
+            cmdBindPipeline(g_live.pCmd, g_live.pSunShadowViewPipeline);
             cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSet);
             cmdDraw(g_live.pCmd, 3, 0);
             cmdBindRenderTargets(g_live.pCmd, nullptr);
@@ -12415,6 +12613,11 @@ namespace ForgeRender {
     Pipeline* g_pStaticsPipelineNone = nullptr; // CULL_MODE_NONE: facing A/B (see g_staticsFacing)
     Shader*   g_pStaticsBlendShader   = nullptr; // Phase 4 hero blend: statics_heroblend.vert + statics_blend.frag
     Pipeline* g_pStaticsBlendPipeline = nullptr; // SRCALPHA/INVSRCALPHA, depth GEQUAL test / no write, cull NONE
+    // SUN shadow: DL statics drawn from the sun ortho VP into the MSM moments map (statics.vert +
+    // sunshadow_statics.frag → RGBA16_UNORM). Same vertex layout as g_pStaticsPipeline; front = CCW.
+    // (kSunShadowRes / g_sunShadowRange / g_drawSunShadow declared early near the atlas constants.)
+    Shader*   g_pSunShadowStaticsShader   = nullptr;
+    Pipeline* g_pSunShadowStaticsPipeline = nullptr;
     // LIVE path: front face = CCW, per the MGE oracle — XE Main.fx Pass P4ext (the distant-statics
     // exterior pass) sets CullMode = CW, i.e. D3D9 culls the CW-wound triangles, so the FRONT faces are
     // CCW. (An explicit override; D3D9's default is D3DCULL_CCW.) The D3D12 equivalent is
@@ -12926,6 +13129,38 @@ namespace ForgeRender {
         g.pShaderProgram = g_pStaticsShader;
         addPipeline(R, &pd, &g_pStaticsPipeline);
         if (!g_pStaticsPipeline) { std::printf("[forge][dl] addPipeline(statics) FAILED\n"); return false; }
+
+        // SUN shadow: DL statics → MSM moments map. Same vertex layout / depth (GEQUAL) / facing
+        // (CCW back-cull) as the live statics pipeline, but a COLOUR target (RGBA16_UNORM moments,
+        // sample count 1) and the moments frag. Own PipelineDesc so it doesn't disturb g's colour/
+        // sample fields the CW/None variants below reuse. Non-fatal: on failure the sun pass is
+        // skipped (g_pSunShadowStaticsPipeline stays null).
+        {
+            ShaderLoadDesc ssd = {};
+            ssd.mVert.pFileName = "statics.vert";
+            ssd.mFrag.pFileName = "sunshadow_statics.frag";
+            addShader(R, &ssd, &g_pSunShadowStaticsShader);
+            if (g_pSunShadowStaticsShader) {
+                TinyImageFormat sunFmt = TinyImageFormat_R16G16B16A16_UNORM;
+                PipelineDesc sunPd = {};
+                sunPd.mType = PIPELINE_TYPE_GRAPHICS;
+                GraphicsPipelineDesc& sg = sunPd.mGraphicsDesc;
+                sg.mPrimitiveTopo = PRIMITIVE_TOPO_TRI_LIST;
+                sg.mRenderTargetCount = 1;
+                sg.pColorFormats = &sunFmt;
+                sg.mSampleCount = SAMPLE_COUNT_1;
+                sg.mSampleQuality = 0;
+                sg.mDepthStencilFormat = TinyImageFormat_D32_SFLOAT;
+                sg.pDepthState = &ds;
+                sg.pVertexLayout = &vl;
+                sg.pRasterizerState = &rs;
+                sg.pShaderProgram = g_pSunShadowStaticsShader;
+                addPipeline(R, &sunPd, &g_pSunShadowStaticsPipeline);
+                if (!g_pSunShadowStaticsPipeline) { std::printf("[forge][dl] addPipeline(sunshadow statics) FAILED\n"); }
+            } else {
+                std::printf("[forge][dl] addShader(sunshadow statics) FAILED — sun shadow disabled\n");
+            }
+        }
 
         // CW variant for the standalone viewer's synthetic LH camera (inverts the live facing).
         RasterizerStateDesc rsCW = rs; rsCW.mFrontFace = FRONT_FACE_CW;
@@ -15304,6 +15539,96 @@ namespace ForgeRender {
             d[n].ppTextures = g_live.pHiz ? &g_live.pHiz : &g_live.pLinearDepth; ++n;
             updateDescriptorSet(R, 0, g_live.pCullSet, n, d);
         }
+
+        // SUN shadow A2: duplicate the cull OUTPUT buffers + a sun params CBV + a sun descriptor set
+        // (shares the gCullInst/gStaticsSubsets/gCullHiz inputs + the zero-staging + the 3 pipelines).
+        // Non-fatal: on any failure sunCullReady stays false and renderSunShadow falls back to the
+        // camera-culled set (A1). subsetCount / addSubsetUav / kLiveMaxInst are in scope here.
+        {
+            BufferLoadDesc spc = {};
+            spc.mDesc.mDescriptors = DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+            spc.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_CPU_TO_GPU;
+            spc.mDesc.mFlags       = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
+            spc.mDesc.mSize        = 256;
+            spc.mDesc.pName        = "sunCullParamsCbv";
+            spc.ppBuffer           = &g_live.pSunCullParamsCbv;
+            addResource(&spc, nullptr);
+
+            BufferLoadDesc scc = {};
+            scc.mDesc.mDescriptors  = DESCRIPTOR_TYPE_RW_BUFFER;
+            scc.mDesc.mMemoryUsage  = RESOURCE_MEMORY_USAGE_GPU_ONLY;
+            scc.mDesc.mStructStride = sizeof(uint32_t);
+            scc.mDesc.mElementCount = 4;
+            scc.mDesc.mSize         = (uint64_t)sizeof(uint32_t) * 4;
+            scc.mDesc.mStartState   = RESOURCE_STATE_UNORDERED_ACCESS;
+            scc.mDesc.pName         = "sunCullCount";
+            scc.ppBuffer            = &g_live.pSunCullCount;
+            addResource(&scc, nullptr);
+
+            addSubsetUav(&g_live.pSunSubsetCount,  "sunSubsetCount");
+            addSubsetUav(&g_live.pSunSubsetOffset, "sunSubsetOffset");
+            addSubsetUav(&g_live.pSunSubsetCursor, "sunSubsetCursor");
+
+            BufferLoadDesc sab = {};
+            sab.mDesc.mDescriptors  = (DescriptorType)(DESCRIPTOR_TYPE_RW_BUFFER | DESCRIPTOR_TYPE_INDIRECT_BUFFER);
+            sab.mDesc.mMemoryUsage  = RESOURCE_MEMORY_USAGE_GPU_ONLY;
+            sab.mDesc.mStructStride = sizeof(uint32_t);
+            sab.mDesc.mElementCount = subsetCount * 5u;
+            sab.mDesc.mSize         = (uint64_t)sizeof(uint32_t) * subsetCount * 5u;
+            sab.mDesc.mStartState   = RESOURCE_STATE_UNORDERED_ACCESS;
+            sab.mDesc.pName         = "sunCullArgs";
+            sab.ppBuffer            = &g_live.pSunArgs;
+            addResource(&sab, nullptr);
+
+            BufferLoadDesc sob = {};
+            sob.mDesc.mDescriptors  = (DescriptorType)(DESCRIPTOR_TYPE_RW_BUFFER | DESCRIPTOR_TYPE_VERTEX_BUFFER);
+            sob.mDesc.mMemoryUsage  = RESOURCE_MEMORY_USAGE_GPU_ONLY;
+            sob.mDesc.mStructStride = sizeof(uint32_t);
+            sob.mDesc.mElementCount = kLiveMaxInst * 20u;
+            sob.mDesc.mSize         = (uint64_t)sizeof(uint32_t) * kLiveMaxInst * 20u;
+            sob.mDesc.mStartState   = RESOURCE_STATE_UNORDERED_ACCESS;
+            sob.mDesc.pName         = "sunCullInstOut";
+            sob.ppBuffer            = &g_live.pSunInstOut;
+            addResource(&sob, nullptr);
+
+            waitForAllResourceLoads();
+
+            if (g_live.pSunCullParamsCbv && g_live.pSunCullCount && g_live.pSunSubsetCount
+                && g_live.pSunSubsetOffset && g_live.pSunSubsetCursor && g_live.pSunArgs && g_live.pSunInstOut) {
+                DescriptorSetDesc sset = SRT_SET_DESC(CullSrtData, PerBatch, 1, 0);
+                addDescriptorSet(R, &sset, &g_live.pSunCullSet);
+                if (g_live.pSunCullSet) {
+                    DescriptorData sd[10] = {};
+                    uint32_t sn = 0;
+                    sd[sn].mIndex = SRT_RES_IDX(CullSrtData, PerBatch, gCullParams);
+                    sd[sn].ppBuffers = &g_live.pSunCullParamsCbv; ++sn;
+                    sd[sn].mIndex = SRT_RES_IDX(CullSrtData, PerBatch, gCullInst);
+                    sd[sn].mCount = 1; sd[sn].ppBuffers = &g_live.pCullInstBuf; ++sn;   // shared input
+                    sd[sn].mIndex = SRT_RES_IDX(CullSrtData, PerBatch, gCullCount);
+                    sd[sn].mCount = 1; sd[sn].ppBuffers = &g_live.pSunCullCount; ++sn;
+                    sd[sn].mIndex = SRT_RES_IDX(CullSrtData, PerBatch, gStaticsSubsets);
+                    sd[sn].mCount = 1; sd[sn].ppBuffers = &g_live.pStaticsSubsetBuf; ++sn;  // shared input
+                    sd[sn].mIndex = SRT_RES_IDX(CullSrtData, PerBatch, gSubsetCount);
+                    sd[sn].mCount = 1; sd[sn].ppBuffers = &g_live.pSunSubsetCount; ++sn;
+                    sd[sn].mIndex = SRT_RES_IDX(CullSrtData, PerBatch, gSubsetOffset);
+                    sd[sn].mCount = 1; sd[sn].ppBuffers = &g_live.pSunSubsetOffset; ++sn;
+                    sd[sn].mIndex = SRT_RES_IDX(CullSrtData, PerBatch, gSubsetCursor);
+                    sd[sn].mCount = 1; sd[sn].ppBuffers = &g_live.pSunSubsetCursor; ++sn;
+                    sd[sn].mIndex = SRT_RES_IDX(CullSrtData, PerBatch, gArgs);
+                    sd[sn].mCount = 1; sd[sn].ppBuffers = &g_live.pSunArgs; ++sn;
+                    sd[sn].mIndex = SRT_RES_IDX(CullSrtData, PerBatch, gInstOut);
+                    sd[sn].mCount = 1; sd[sn].ppBuffers = &g_live.pSunInstOut; ++sn;
+                    sd[sn].mIndex = SRT_RES_IDX(CullSrtData, PerBatch, gCullHiz);
+                    sd[sn].mCount = 1;
+                    sd[sn].ppTextures = g_live.pHiz ? &g_live.pHiz : &g_live.pLinearDepth; ++sn;   // inert (hiz off)
+                    updateDescriptorSet(R, 0, g_live.pSunCullSet, sn, sd);
+                    g_live.sunCullReady = true;
+                    std::printf("[forge][cull] SUN cull ready (A2): subsets=%u\n", subsetCount);
+                }
+            }
+            if (!g_live.sunCullReady) { std::printf("[forge][cull] SUN cull alloc FAILED — falls back to camera-culled (A1)\n"); }
+        }
+
         std::printf("[forge][cull] Stage B ready: %u instances (struct=%zuB) gpuDraw=%d subsets=%u\n",
                     g_live.cullInstCount, sizeof(GpuCullInstance), (int)g_live.gpuStaticsReady, subsetCount);
         return true;
@@ -15837,6 +16162,167 @@ namespace ForgeRender {
             }
         }
         cmdEndDebugMarker(g_live.pCmd);
+    }
+
+    // SUN shadow A2: the second statics cull. Reuses cull.comp/cullscan/cullscatter + the shared
+    // gCullInst/gStaticsSubsets inputs, but with sun CullParams (frustum = the sun ortho box centred
+    // on the camera, nearCut=0, tier ranges huge, Hi-Z off) → its own pSunArgs/pSunInstOut. So DL
+    // statics cast into the near scene AND from off-screen, which the camera-culled A1 set can't.
+    // Pure compute; runs in the cull phase after the camera cull.
+    void dispatchSunCull() {
+        if (!g_live.sunCullReady || !g_live.pCullPipeline || !g_live.cullInstCount) { return; }
+        if (!g_dlExterior || !g_dlLiveInit || !g_landLoaded || !g_staticsLiveOk) { return; }
+        if (!g_live.pCullParamsCbv || !g_live.pCullParamsCbv->pCpuMappedAddress
+            || !g_live.pSunCullParamsCbv || !g_live.pSunCullParamsCbv->pCpuMappedAddress
+            || !g_live.pFrameCbv || !g_live.pFrameCbv->pCpuMappedAddress) { return; }
+
+        // Sun CullParams = copy of the camera params (inherits eye + misc = inst/subset counts), then
+        // override planes / ranges / Hi-Z. Layout: planes[0..23], eye[24..27], ranges[28..31]
+        // (x/y/z=tier end², w=nearCut²), misc[32..35], hizVP[36..51], hizParams[52..55], hizEyeDelta[56..59].
+        const float* cam = (const float*)g_live.pCullParamsCbv->pCpuMappedAddress;
+        float*       sp  = (float*)g_live.pSunCullParamsCbv->pCpuMappedAddress;
+        std::memcpy(sp, cam, 240);
+
+        const float* mfd = (const float*)g_live.pFrameCbv->pCpuMappedAddress;
+        float za[3] = { mfd[16], mfd[17], mfd[18] };   // sun travel dir (view forward)
+        float zl = std::sqrt(za[0]*za[0] + za[1]*za[1] + za[2]*za[2]);
+        if (zl < 1e-6f) { za[0] = 0.0f; za[1] = 0.0f; za[2] = -1.0f; zl = 1.0f; }
+        za[0] /= zl; za[1] /= zl; za[2] /= zl;
+        float up[3];
+        if (std::fabs(za[2]) < 0.99f) { up[0] = 0.0f; up[1] = 0.0f; up[2] = 1.0f; }
+        else                          { up[0] = 0.0f; up[1] = 1.0f; up[2] = 0.0f; }
+        float xa[3] = { up[1]*za[2] - up[2]*za[1], up[2]*za[0] - up[0]*za[2], up[0]*za[1] - up[1]*za[0] };
+        float xl = std::sqrt(xa[0]*xa[0] + xa[1]*xa[1] + xa[2]*xa[2]); if (xl < 1e-6f) { xl = 1.0f; }
+        xa[0] /= xl; xa[1] /= xl; xa[2] /= xl;
+        float ya[3] = { za[1]*xa[2] - za[2]*xa[1], za[2]*xa[0] - za[0]*xa[2], za[0]*xa[1] - za[1]*xa[0] };
+        const float range = g_sunShadowRange, depthHalf = 2.0f * g_sunShadowRange;
+        // Gribb-Hartmann planes, camera-relative (tested as pl·(pos−eye) ≥ −effR). Box faces:
+        // inside == extent − dot(c,axis) ≥ 0 and dot(c,axis) + extent ≥ 0.
+        sp[0]=-xa[0];  sp[1]=-xa[1];  sp[2]=-xa[2];  sp[3]=range;
+        sp[4]= xa[0];  sp[5]= xa[1];  sp[6]= xa[2];  sp[7]=range;
+        sp[8]=-ya[0];  sp[9]=-ya[1];  sp[10]=-ya[2]; sp[11]=range;
+        sp[12]=ya[0];  sp[13]=ya[1];  sp[14]=ya[2];  sp[15]=range;
+        sp[16]=-za[0]; sp[17]=-za[1]; sp[18]=-za[2]; sp[19]=depthHalf;
+        sp[20]=za[0];  sp[21]=za[1];  sp[22]=za[2];  sp[23]=depthHalf;
+        sp[28]=1e18f; sp[29]=1e18f; sp[30]=1e18f; sp[31]=0.0f;   // tier ranges huge, nearCut²=0
+        sp[55]=0.0f;                                             // hizParams.w=0 → Hi-Z off
+
+        ID3D12GraphicsCommandList* cl = g_live.pCmd->mDx.pCmdList;
+        auto bufBarrier = [&](Buffer* buf, ResourceState from, ResourceState to) {
+            BufferBarrier bb = {}; bb.pBuffer = buf; bb.mCurrentState = from; bb.mNewState = to;
+            cmdResourceBarrier(g_live.pCmd, 1, &bb, 0, nullptr, 0, nullptr);
+        };
+        auto uavBarrier = [&](Buffer* buf) { bufBarrier(buf, RESOURCE_STATE_UNORDERED_ACCESS, RESOURCE_STATE_UNORDERED_ACCESS); };
+
+        // Reset sun count[0..1] + subsetCount from the SHARED zero-staging buffers.
+        bufBarrier(g_live.pSunCullCount, RESOURCE_STATE_UNORDERED_ACCESS, RESOURCE_STATE_COPY_DEST);
+        cl->CopyBufferRegion(g_live.pSunCullCount->mDx.pResource, 0, g_live.pCullCountZero->mDx.pResource, 0, 2 * sizeof(uint32_t));
+        bufBarrier(g_live.pSunCullCount, RESOURCE_STATE_COPY_DEST, RESOURCE_STATE_UNORDERED_ACCESS);
+        bufBarrier(g_live.pSunSubsetCount, RESOURCE_STATE_UNORDERED_ACCESS, RESOURCE_STATE_COPY_DEST);
+        cl->CopyBufferRegion(g_live.pSunSubsetCount->mDx.pResource, 0, g_live.pSubsetCountZero->mDx.pResource, 0,
+                             (uint64_t)sizeof(uint32_t) * g_live.cullSubsetCount);
+        bufBarrier(g_live.pSunSubsetCount, RESOURCE_STATE_COPY_DEST, RESOURCE_STATE_UNORDERED_ACCESS);
+        if (g_live.sunArgsInDrawState) {
+            bufBarrier(g_live.pSunArgs,    RESOURCE_STATE_INDIRECT_ARGUMENT, RESOURCE_STATE_UNORDERED_ACCESS);
+            bufBarrier(g_live.pSunInstOut, RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER, RESOURCE_STATE_UNORDERED_ACCESS);
+            g_live.sunArgsInDrawState = false;
+        }
+
+        cmdBeginDebugMarker(g_live.pCmd, 0.9f, 0.8f, 0.2f, "SUN CULL");
+        cmdBindPipeline(g_live.pCmd, g_live.pCullPipeline);
+        cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pSunCullSet);
+        cmdDispatch(g_live.pCmd, (g_live.cullInstCount + 63u) / 64u, 1, 1);
+        uavBarrier(g_live.pSunSubsetCount);
+        cmdBindPipeline(g_live.pCmd, g_live.pCullScanPipeline);
+        cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pSunCullSet);
+        cmdDispatch(g_live.pCmd, 1, 1, 1);
+        uavBarrier(g_live.pSunSubsetOffset);
+        uavBarrier(g_live.pSunSubsetCursor);
+        uavBarrier(g_live.pSunArgs);
+        cmdBindPipeline(g_live.pCmd, g_live.pCullScatterPipeline);
+        cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pSunCullSet);
+        cmdDispatch(g_live.pCmd, (g_live.cullInstCount + 63u) / 64u, 1, 1);
+        uavBarrier(g_live.pSunInstOut);
+        bufBarrier(g_live.pSunArgs,    RESOURCE_STATE_UNORDERED_ACCESS, RESOURCE_STATE_INDIRECT_ARGUMENT);
+        bufBarrier(g_live.pSunInstOut, RESOURCE_STATE_UNORDERED_ACCESS, RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);
+        g_live.sunArgsInDrawState = true;
+        cmdEndDebugMarker(g_live.pCmd);
+    }
+
+    // SUN shadow (forge-sun-shadows.md, Phase A / Step A1): render the DL-statics MSM moments map.
+    // DL statics are the primary sun-caster proxy — host-resident, world-space, so they cast into the
+    // near scene incl. from off-screen. A1 draws the SAME camera-culled statics set as dlLiveRecord
+    // (reusing pGpuArgs/pGpuInstOut) but from the sun ortho VP into pSunMoments, to light up + verify
+    // the map (F12 13). A2 replaces the cull with a sun-ortho-box cull (off-screen casters). Nothing
+    // samples the map yet, so the live image is unchanged. Self-contained: own RT + barriers.
+    void renderSunShadow() {
+        if (!g_drawSunShadow) { return; }
+        if (!g_pSunShadowStaticsPipeline || !g_live.pSunMoments || !g_live.pSunMomentsDepth
+            || !g_live.pSunFrameCbv || !g_live.pPerFrameSetSun) { return; }
+        if (!g_dlExterior || !g_dlLiveInit || !g_landLoaded || !g_staticsLiveOk) { return; }
+        // A2: prefer the sun cull (near + off-screen casters). Fall back to the camera-culled set (A1,
+        // far/on-screen only) if the sun cull isn't ready — never break, just lose the near/off-screen fill.
+        const bool sunDraw = g_live.sunCullReady && g_live.sunArgsInDrawState;
+        const bool gpuDraw = g_gpuStaticsCull && g_live.gpuStaticsReady && g_live.gpuArgsInDrawState;
+        if (!(sunDraw || gpuDraw || g_liveLastSubsets > 0)) { return; }
+
+        // Sun frame CBV = copy of the main frame data, viewProj := the sun ortho VP built from
+        // gFrameData.sunDir (float[16..18], camera-relative space — same as statics.vert projects).
+        const float* mfd = (const float*)g_live.pFrameCbv->pCpuMappedAddress;
+        float sunVP[16];
+        buildSunOrthoVP(&mfd[16], g_sunShadowRange, sunVP);
+        std::memcpy(g_live.pSunFrameCbv->pCpuMappedAddress, mfd, kFrameDataBytes);
+        std::memcpy(g_live.pSunFrameCbv->pCpuMappedAddress, sunVP, 16 * sizeof(float));
+
+        cmdBeginDebugMarker(g_live.pCmd, 0.9f, 0.85f, 0.2f, "SUN SHADOW (DL statics)");
+        {
+            RenderTargetBarrier rtb = {};
+            rtb.pRenderTarget = g_live.pSunMoments;
+            rtb.mCurrentState = RESOURCE_STATE_SHADER_RESOURCE;
+            rtb.mNewState = RESOURCE_STATE_RENDER_TARGET;
+            cmdResourceBarrier(g_live.pCmd, 0, nullptr, 0, nullptr, 1, &rtb);
+        }
+        BindRenderTargetsDesc sb = {};
+        sb.mRenderTargetCount = 1;
+        sb.mRenderTargets[0] = { g_live.pSunMoments, LOAD_ACTION_CLEAR };
+        sb.mDepthStencil = { g_live.pSunMomentsDepth, LOAD_ACTION_CLEAR };
+        cmdBindRenderTargets(g_live.pCmd, &sb);
+        cmdSetViewport(g_live.pCmd, 0.0f, 0.0f, (float)kSunShadowRes, (float)kSunShadowRes, 0.0f, 1.0f);
+        cmdSetScissor(g_live.pCmd, 0, 0, kSunShadowRes, kSunShadowRes);
+
+        DescriptorSet* distLightsSet = g_live.pPerLightsSetDist ? g_live.pPerLightsSetDist
+                                                                : g_live.pPerLightsSet;
+        cmdBindPipeline(g_live.pCmd, g_pSunShadowStaticsPipeline);
+        cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSetSun);   // gFrameData := sun ortho VP
+        cmdBindDescriptorSet(g_live.pCmd, 0, distLightsSet);
+        cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
+        cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerBatchSet);
+        // Source the survivors: A2 sun cull (pSunInstOut/pSunArgs) → else A1 camera cull → else CPU ring.
+        Buffer* instBuf = sunDraw ? g_live.pSunInstOut : (gpuDraw ? g_live.pGpuInstOut : g_pStaticsInstRing);
+        Buffer* argsBuf = sunDraw ? g_live.pSunArgs    : (gpuDraw ? g_live.pGpuArgs    : g_pStaticsArgsRing);
+        uint32_t argCount = (sunDraw || gpuDraw) ? g_live.cullSubsetCount : g_liveLastSubsets;
+        Buffer*  svbs[2]     = { g_pStaticsVB, instBuf };
+        uint32_t sstrides[2] = { 20, kStaticsInstStride };
+        cmdBindVertexBuffer(g_live.pCmd, 2, svbs, sstrides, nullptr);
+        cmdBindIndexBuffer(g_live.pCmd, g_pStaticsIB, INDEX_TYPE_UINT16, 0);
+        cmdExecuteIndirect(g_live.pCmd, INDIRECT_DRAW_INDEX, argCount, argsBuf, 0, nullptr, 0);
+        cmdBindRenderTargets(g_live.pCmd, nullptr);
+        {
+            RenderTargetBarrier rtb = {};
+            rtb.pRenderTarget = g_live.pSunMoments;
+            rtb.mCurrentState = RESOURCE_STATE_RENDER_TARGET;
+            rtb.mNewState = RESOURCE_STATE_SHADER_RESOURCE;
+            cmdResourceBarrier(g_live.pCmd, 0, nullptr, 0, nullptr, 1, &rtb);
+        }
+        cmdEndDebugMarker(g_live.pCmd);
+        g_live.sunShadowReady = true;
+
+        static uint32_t s_sunLog = 0;
+        if ((s_sunLog++ % 300) == 0) {
+            LOG::logline(">> [sun-shadow] subsets=%u src=%s range=%.0f sunDir=(%.3f,%.3f,%.3f)",
+                 argCount, sunDraw ? "A2-suncull" : (gpuDraw ? "A1-cameracull" : "cpu-ring"),
+                 g_sunShadowRange, mfd[16], mfd[17], mfd[18]);
+        }
     }
 
     // Phase 4: the post-water HERO BLEND pass. Re-issues the SAME statics indirect draw with the
@@ -16736,6 +17222,8 @@ namespace ForgeRender {
         if (g_live.pDebugLineShader)        { removeShader(R, g_live.pDebugLineShader); }
         if (g_live.pShadowAtlasViewPipeline){ removePipeline(R, g_live.pShadowAtlasViewPipeline); }
         if (g_live.pShadowAtlasViewShader)  { removeShader(R, g_live.pShadowAtlasViewShader); }
+        if (g_live.pSunShadowViewPipeline)  { removePipeline(R, g_live.pSunShadowViewPipeline); g_live.pSunShadowViewPipeline = nullptr; }
+        if (g_live.pSunShadowViewShader)    { removeShader(R, g_live.pSunShadowViewShader); g_live.pSunShadowViewShader = nullptr; }
         if (g_live.pPerBatchSetAlpha)       { removeDescriptorSet(R, g_live.pPerBatchSetAlpha); }
         if (g_live.pAlphaWorldsBuf)         { removeResource(g_live.pAlphaWorldsBuf); }
         if (g_live.pAlphaInstanceBuf)       { removeResource(g_live.pAlphaInstanceBuf); }
@@ -16776,9 +17264,11 @@ namespace ForgeRender {
         // WT2 reflection teardown.
         if (g_live.pPerFrameSetReflect)     { removeDescriptorSet(R, g_live.pPerFrameSetReflect); }
         if (g_live.pPerFrameSetReflectGeo)  { removeDescriptorSet(R, g_live.pPerFrameSetReflectGeo); }
+        if (g_live.pPerFrameSetSun)         { removeDescriptorSet(R, g_live.pPerFrameSetSun); g_live.pPerFrameSetSun = nullptr; }
         if (g_live.pPerBatchSetReflectSky)  { removeDescriptorSet(R, g_live.pPerBatchSetReflectSky); }
         if (g_live.pReflectFrameCbv)        { removeResource(g_live.pReflectFrameCbv); }
         if (g_live.pReflectFrameCbvGeo)     { removeResource(g_live.pReflectFrameCbvGeo); }
+        if (g_live.pSunFrameCbv)            { removeResource(g_live.pSunFrameCbv); g_live.pSunFrameCbv = nullptr; }
         if (g_live.pReflectSkyWorldsBuf)    { removeResource(g_live.pReflectSkyWorldsBuf); }
         if (g_live.pReflectSkyInstanceBuf)  { removeResource(g_live.pReflectSkyInstanceBuf); }
         if (g_live.pReflectColor)           { removeRenderTarget(R, g_live.pReflectColor); }
@@ -16801,6 +17291,8 @@ namespace ForgeRender {
         if (g_pStaticsPipelineNone) { removePipeline(R, g_pStaticsPipelineNone); g_pStaticsPipelineNone = nullptr; }
         if (g_pStaticsPipelineCW)   { removePipeline(R, g_pStaticsPipelineCW);   g_pStaticsPipelineCW = nullptr; }
         if (g_pStaticsPipeline) { removePipeline(R, g_pStaticsPipeline); g_pStaticsPipeline = nullptr; }
+        if (g_pSunShadowStaticsPipeline) { removePipeline(R, g_pSunShadowStaticsPipeline); g_pSunShadowStaticsPipeline = nullptr; }
+        if (g_pSunShadowStaticsShader)   { removeShader(R, g_pSunShadowStaticsShader); g_pSunShadowStaticsShader = nullptr; }
         if (g_pStaticsBlendShader) { removeShader(R, g_pStaticsBlendShader); g_pStaticsBlendShader = nullptr; }
         if (g_pStaticsShader)   { removeShader(R, g_pStaticsShader);   g_pStaticsShader = nullptr; }
         g_staticsSubsets.clear(); g_staticsDefs.clear(); g_staticsSubsetTex.clear();
@@ -16839,6 +17331,16 @@ namespace ForgeRender {
         if (g_live.pSubsetCountZero)    { removeResource(g_live.pSubsetCountZero);   g_live.pSubsetCountZero = nullptr; }
         if (g_live.pGpuArgs)            { removeResource(g_live.pGpuArgs);           g_live.pGpuArgs = nullptr; }
         if (g_live.pGpuInstOut)         { removeResource(g_live.pGpuInstOut);        g_live.pGpuInstOut = nullptr; }
+        // SUN shadow A2: the second-cull resources.
+        if (g_live.pSunCullSet)        { removeDescriptorSet(R, g_live.pSunCullSet); g_live.pSunCullSet = nullptr; }
+        if (g_live.pSunCullParamsCbv)  { removeResource(g_live.pSunCullParamsCbv);   g_live.pSunCullParamsCbv = nullptr; }
+        if (g_live.pSunCullCount)      { removeResource(g_live.pSunCullCount);       g_live.pSunCullCount = nullptr; }
+        if (g_live.pSunSubsetCount)    { removeResource(g_live.pSunSubsetCount);     g_live.pSunSubsetCount = nullptr; }
+        if (g_live.pSunSubsetOffset)   { removeResource(g_live.pSunSubsetOffset);    g_live.pSunSubsetOffset = nullptr; }
+        if (g_live.pSunSubsetCursor)   { removeResource(g_live.pSunSubsetCursor);    g_live.pSunSubsetCursor = nullptr; }
+        if (g_live.pSunArgs)           { removeResource(g_live.pSunArgs);            g_live.pSunArgs = nullptr; }
+        if (g_live.pSunInstOut)        { removeResource(g_live.pSunInstOut);         g_live.pSunInstOut = nullptr; }
+        g_live.sunCullReady = false; g_live.sunArgsInDrawState = false;
         // Follow-on 3: shadow-light occlusion-cull resources.
         if (g_live.pShadowLightCullSet)      { removeDescriptorSet(R, g_live.pShadowLightCullSet); g_live.pShadowLightCullSet = nullptr; }
         if (g_live.pShadowLightCullPipeline) { removePipeline(R, g_live.pShadowLightCullPipeline);  g_live.pShadowLightCullPipeline = nullptr; }
@@ -16887,6 +17389,8 @@ namespace ForgeRender {
         }
         if (g_live.pShadowMaskParamsCbv) { removeResource(g_live.pShadowMaskParamsCbv); }
         if (g_live.pShadowMask)          { removeResource(g_live.pShadowMask); }
+        if (g_live.pSunMoments)          { removeRenderTarget(R, g_live.pSunMoments); g_live.pSunMoments = nullptr; }
+        if (g_live.pSunMomentsDepth)     { removeRenderTarget(R, g_live.pSunMomentsDepth); g_live.pSunMomentsDepth = nullptr; }
         if (g_live.pShadowAtlas)         { removeRenderTarget(R, g_live.pShadowAtlas); }
         if (g_live.pShadowAtlasDyn)      { removeRenderTarget(R, g_live.pShadowAtlasDyn); }
         // P3: drop the persistent slot cache — the recreated atlas is undefined, so no slot may
