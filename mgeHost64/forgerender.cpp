@@ -1887,8 +1887,18 @@ namespace {
     // ortho half-extent perpendicular to the sun (the shadowed radius around the camera). Row/column
     // layout matches buildShadowFaceVP: out16 row i = world-axis i's contribution to each clip lane;
     // clip = worldPos * M (row vectors, mul(M,v) in-shader). Reverse-Z (near→1, far→0) so it matches
-    // CMP_GEQUAL + the moments-map clear 0, and the sunshadow frag stores In.Position.z directly.
-    void buildSunOrthoVP(const float* sunDirWorld, float range, float* out16) {
+    // CMP_GEQUAL, and the sunshadow frags store 1 - In.Position.z (depth grows away from the sun).
+    //
+    // TEXEL SNAPPING (`eyeAbs` = the ABSOLUTE world camera position, g_dlEye). The map is centred on
+    // the camera and rebuilt every frame, so without snapping every world point's shadow-map texel
+    // address drifts by a sub-texel amount each frame and every shadow edge CRAWLS as you walk —
+    // the classic shadow "swim". The fix is to quantise the map's origin to whole texels on a grid
+    // fixed in WORLD space: a world point then keeps the same texel until the camera has moved a
+    // full texel, and the edge steps once instead of shimmering continuously.
+    // Texel size = 2*range/kSunShadowRes, so the artefact scales with `range` — at range 1024 the
+    // texel is 1 world unit and the drift is invisible; at 8192 it is 8 units and unmissable. Only
+    // the two axes PERPENDICULAR to the sun are snapped; the depth axis is compared, not filtered.
+    void buildSunOrthoVP(const float* sunDirWorld, float range, const float* eyeAbs, float* out16) {
         float za[3] = { sunDirWorld[0], sunDirWorld[1], sunDirWorld[2] };   // view forward = down-sun
         float zl = std::sqrt(za[0]*za[0] + za[1]*za[1] + za[2]*za[2]);
         if (zl < 1e-6f) { za[0] = 0.0f; za[1] = 0.0f; za[2] = -1.0f; zl = 1.0f; }
@@ -1911,7 +1921,22 @@ namespace {
         const float invDz = -1.0f / (2.0f * depthHalf);     // reverse-Z ortho z scale
         float V[4][3];
         for (int i = 0; i < 3; ++i) { V[i][0] = xa[i]; V[i][1] = ya[i]; V[i][2] = za[i]; }
-        V[3][0] = 0.0f; V[3][1] = 0.0f; V[3][2] = 0.0f;     // eye at origin (camera-relative)
+        // Texel snap. Shader space is camera-relative (p = worldPos - eye), so the map's world origin
+        // sits at the eye's light-space coords; shifting by the SUB-TEXEL remainder of those coords
+        // pulls the origin back onto the world-fixed texel grid:
+        //   clip.x = (dot(p,xa) + remX) * invR  ⇒  clip.x == 0 at dot(worldPos,xa) = ex - remX,
+        // which is an exact multiple of the texel size. floor() (not fmod) so negative world coords
+        // land on the same grid — MW's west/south cells are negative and would otherwise snap to a
+        // mirrored grid, putting a seam through the origin.
+        const float texel = (2.0f * range) / (float)kSunShadowRes;
+        float remX = 0.0f, remY = 0.0f;
+        if (eyeAbs && texel > 0.0f) {
+            const float ex = eyeAbs[0]*xa[0] + eyeAbs[1]*xa[1] + eyeAbs[2]*xa[2];
+            const float ey = eyeAbs[0]*ya[0] + eyeAbs[1]*ya[1] + eyeAbs[2]*ya[2];
+            remX = ex - std::floor(ex / texel) * texel;
+            remY = ey - std::floor(ey / texel) * texel;
+        }
+        V[3][0] = remX; V[3][1] = remY; V[3][2] = 0.0f;     // eye at origin + sub-texel snap offset
         for (int i = 0; i < 4; ++i) {
             out16[i*4 + 0] = V[i][0] * invR;
             out16[i*4 + 1] = V[i][1] * invR;
@@ -16340,7 +16365,9 @@ namespace ForgeRender {
         // gFrameData.sunDir (float[16..18], camera-relative space — same as statics.vert projects).
         const float* mfd = (const float*)g_live.pFrameCbv->pCpuMappedAddress;
         float sunVP[16];
-        buildSunOrthoVP(&mfd[16], g_sunShadowRange, sunVP);
+        // g_dlEye = the ABSOLUTE world camera position (the DL shift origin) — the texel-snap grid is
+        // anchored in world space, so the snap needs the real eye, not the camera-relative zero.
+        buildSunOrthoVP(&mfd[16], g_sunShadowRange, g_dlEye, sunVP);
         std::memcpy(g_live.pSunFrameCbv->pCpuMappedAddress, mfd, kFrameDataBytes);
         std::memcpy(g_live.pSunFrameCbv->pCpuMappedAddress, sunVP, 16 * sizeof(float));
         // Phase B: hand the SAME matrix to the receivers. Caster and receiver must project by one
