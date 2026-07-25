@@ -83,10 +83,15 @@ float4 PS_MAIN( VSOutput In )
     // brightens the back — and it is gated per-draw so single-sided folded carpets keep their
     // correct one-sided shading. The shadow sample itself is position-based (In.Position), unchanged.
     float  sndl = dot(N, -gFrameData.sunDir.xyz);
-    float  ndl  = twoSidedLight ? abs(sndl) : saturate(sndl);
+    // SUN is FRONT-LIT ONLY on transparents, even two-sided ones. The sun has no shadow term on
+    // the host yet (directional CSM is deferred), so ANY backlit sun contribution here leaks: a
+    // two-sided sheet backlit by the sun would glow with abs(N.L), and the wrap term below pushed
+    // sun straight through the far face — both unshadowable today, so a leaf/banner standing inside
+    // a building's shadow still lit up. Clamp the sun to the front face (saturate) and drop the sun
+    // wrap term until real sun shadows land; two-sided POINT lighting (below) is unaffected because
+    // it IS occluded by the point-light mask. (twoSidedLight still drives the point-light path.)
+    float  ndl  = saturate(sndl);
     float3 d = gFrameData.sunCol.rgb * ndl;
-    // Change 3 (opt-in, default off): sun transmitting through the far face (wrap term).
-    transLit += gFrameData.sunCol.rgb * saturate(dot(-N, -gFrameData.sunDir.xyz));
     float3 a = ((aoFlags & 4u) != 0u) ? float3(1.0f, 1.0f, 1.0f) : gFrameData.ambCol.rgb;
     if ((aoFlags & 1u) != 0u) { a *= aoSample.a; }
     a *= gFrameData.dbgScales.x;

@@ -1285,10 +1285,15 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
 
 
     float sndl = dot(N, -gFrameData.sunDir.xyz);
-    float ndl = twoSidedLight ? abs(sndl) : saturate(sndl);
-    float3 d = gFrameData.sunCol.rgb * ndl;
 
-    transLit += gFrameData.sunCol.rgb * saturate(dot(-N, -gFrameData.sunDir.xyz));
+
+
+
+
+
+
+    float ndl = saturate(sndl);
+    float3 d = gFrameData.sunCol.rgb * ndl;
     float3 a = ((aoFlags & 4u) != 0u) ? float3(1.0f, 1.0f, 1.0f) : gFrameData.ambCol.rgb;
     if ((aoFlags & 1u) != 0u) { a *= aoSample.a; }
     a *= gFrameData.dbgScales.x;
