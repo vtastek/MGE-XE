@@ -972,7 +972,7 @@ SamplerState gSampler2xWrapClamp : register( s17 , space100 ) ;
 #line 247 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/../../../3rdparty/The-Forge/Common_3/Graphics/FSL/defaults.h"
 
 #line 11 "FSL/shaders.list"
-#line 216 "FSL/shaders.list"
+#line 224 "FSL/shaders.list"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowatlasview.vert.fsl"
 #line 9 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowatlasview.vert.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
@@ -1029,7 +1029,23 @@ STRUCT(ShadowMaskParams)
 
 
     float4 sunPcf1;
-#line 102
+
+
+
+
+
+
+
+    float4 volFog0;
+
+
+
+
+
+    float4 volFog1;
+
+    float4 volFog2;
+#line 118
 };
 #line 21 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
 #line 35 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
@@ -1245,4 +1261,4 @@ VSOutput VS_MAIN( uint VertexID : SV_VERTEXID )
     Out.Position = float4(uv.x * 2.0f - 1.0f, 1.0f - uv.y * 2.0f, 0.0f, 1.0f);
     return (Out);
 }
-#line 217 "FSL/shaders.list"
+#line 225 "FSL/shaders.list"

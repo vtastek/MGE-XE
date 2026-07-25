@@ -1468,6 +1468,8 @@ namespace {
         DescriptorSet* pPerFrameSetSun = nullptr;           // PerFrame set, instance c bound to pSunFrameCbv[c]
         Shader*        pSunShadowViewShader = nullptr;      // shadowatlasview.vert + sunshadowview.frag (F12 13)
         Pipeline*      pSunShadowViewPipeline = nullptr;
+        Shader*        pVolFogShader = nullptr;             // shadowatlasview.vert + volfog.frag (height fog / shafts)
+        Pipeline*      pVolFogPipeline = nullptr;           // blended ONE / SRC_ALPHA
         bool           sunShadowReady = false;
         Buffer*        pReflectSkyWorldsBuf = nullptr;     // reflect sky gBatch window (own; filled in the reflect pass)
         DescriptorSet* pPerBatchSetReflectSky = nullptr;   // gBatch bound to pReflectSkyWorldsBuf
@@ -1633,6 +1635,7 @@ namespace {
            kGpuPhaseColorFP,    // FP1a first-person pass (after sorted-alpha, before resolve)
            kGpuPhaseColorGlow,  // Phase F distant-light glow billboards (after water, before sorted-alpha)
            kGpuPhaseFroxelNear, // near clustered-lighting froxel clear+assign (before the near colour phase)
+           kGpuPhaseVolFog,     // volumetric height fog / sun shafts (after alpha, before the FP arms)
            kGpuPhaseCount };
 
     // FP1a first-person pass caps: one 64KB world window bounds the rigid list at 1024,
@@ -1794,13 +1797,15 @@ namespace {
     // covered at wide extents, capped at the tap radius.
     float              g_sunShadowSoftness = 24.0f; // Gaussian sigma in WORLD units (0 = blur off)
     constexpr float    kSunBlurSigmaMin    = 0.75f; // texels — below this the texel grid shows through
-    // --- NEAR cascade: PCSS + PCF over the raw depth (msmrecv.h.fsl) ---------------------------
-    // The moments blur above cannot make cascade 0 soft: its penumbra is capped by kSunBlurRadius
+    // --- PCSS + PCF over the raw depth — the COLOUR receiver, ALL cascades (msmrecv.h.fsl) ------
+    // The moments blur above cannot make a cascade soft: its penumbra is capped by kSunBlurRadius
     // texels, so past sigma == 4 the softness knob does nothing and what remains is a truncated,
     // axis-aligned kernel — square blocks, worst on terrain (receiver and occluder at nearly equal
-    // depth is where the quadrature is least stable). Cascade 0 therefore samples the caster pass's
+    // depth is where the quadrature is least stable). Distance did NOT hide it: a coarser cascade
+    // draws the same iso-contours on a bigger world grid. So every cascade samples the caster pass's
     // own D32 depth instead, with a blocker search driving a variable-radius disc. Costs no extra
     // pass and no extra VRAM: that depth buffer was already being written and discarded.
+    // The moments live on for the VOLUMETRIC FOG, whose per-step tap is exactly what they are good at.
     bool               g_sunPcfNear     = true;   // false = MSM everywhere (the A/B for this whole path)
     // DIMENSIONLESS softening ratio: penumbra_world = spread * (blocker-to-receiver gap). 0.05 means
     // "5% of the gap". Deliberately not a texel or world count — the host reconverts it into texels
@@ -1819,6 +1824,20 @@ namespace {
     // a slope term for surfaces raking away from the sun.
     float              g_sunPcfBias      = 3.0f;  // world units, constant
     float              g_sunPcfSlopeBias = 2.0f;  // world units, scaled by tan(acos(N.L))
+    // --- VOLUMETRIC height fog (volfog.frag.fsl) ------------------------------------------------
+    // The moments map's remaining consumer: a ray march wants ONE filterable tap per step, which is
+    // what MSM is for and what PCSS could never afford. Exponential height fog with single
+    // scattering, composited after water + alpha and before the FP arms.
+    bool               g_volFog          = true;
+    float              g_volFogDensity   = 0.0018f; // per world unit at the fog base
+    float              g_volFogFalloff   = 900.0f;  // world units of height per e-fold
+    float              g_volFogBase      = 0.0f;    // ABSOLUTE world height of the fog base (MW Z up)
+    float              g_volFogMaxDist   = 12288.0f;// march clamp; sky rays run to here
+    float              g_volFogAniso     = 0.72f;   // Henyey-Greenstein g (forward = sun glow)
+    float              g_volFogSteps     = 24.0f;
+    float              g_volFogAmbient   = 0.12f;   // in-scatter floor so shafts dim rather than void
+    float              g_volFogTint[3]   = { 1.0f, 0.98f, 0.92f };
+    float              g_volFogIntensity = 1.0f;
     constexpr float    kShadowNearZ      = 4.0f;   // face frustum near (world u); far = the light's 2·radius
     // How long a slot's lastWorld record stays a caster candidate after the item was last in
     // the client's visible set. Statics don't move so stale is correct; the window only bounds
@@ -4471,6 +4490,39 @@ namespace {
             } else {
                 std::printf("[forge] addShader(sunshadowview) FAILED — F12 13 disabled\n");
             }
+
+            // VOLUMETRIC height fog: same fullscreen-triangle vert, same PerFrame set, but BLENDED
+            // rather than overwriting. The frag returns (inscatter, transmittance) and the blend is
+            //   dst = 1*src.rgb + src.a*dst
+            // which is the single-scattering composite over an already-shaded frame. Non-fatal.
+            ShaderLoadDesc vfDesc = {};
+            vfDesc.mVert.pFileName = "shadowatlasview.vert";
+            vfDesc.mFrag.pFileName = "volfog.frag";
+            addShader(R, &vfDesc, &g_live.pVolFogShader);
+            if (g_live.pVolFogShader) {
+                BlendStateDesc vfBlend = {};
+                vfBlend.mIndependentBlend = false;
+                vfBlend.mRenderTargetMask = BLEND_STATE_TARGET_0;
+                vfBlend.mSrcFactors[0]      = BC_ONE;
+                vfBlend.mDstFactors[0]      = BC_SRC_ALPHA;
+                vfBlend.mBlendModes[0]      = BM_ADD;
+                // Alpha channel: keep the destination's. The composited RT's alpha is not a coverage
+                // signal here, and letting the fog's transmittance leak into it would confuse the
+                // present-seam blit.
+                vfBlend.mSrcAlphaFactors[0] = BC_ZERO;
+                vfBlend.mDstAlphaFactors[0] = BC_ONE;
+                vfBlend.mBlendAlphaModes[0] = BM_ADD;
+                vfBlend.mColorWriteMasks[0] = COLOR_MASK_ALL;
+                sag.pShaderProgram = g_live.pVolFogShader;
+                sag.pBlendState = &vfBlend;
+                addPipeline(R, &savPd, &g_live.pVolFogPipeline);
+                sag.pBlendState = nullptr;
+                if (!g_live.pVolFogPipeline) {
+                    std::printf("[forge] addPipeline(volfog) FAILED\n");
+                }
+            } else {
+                std::printf("[forge] addShader(volfog) FAILED — volumetric fog disabled\n");
+            }
         }
 
         // --- AT1: sorted-alpha shader + 2 blend PSOs + world window + instance VB ---------------
@@ -6876,15 +6928,26 @@ namespace {
           t.sliderF("Sun shadow: normal offset (TEXELS; kills slope acne)", &g_sunShadowNormalOff, 0.0f, 8.0f, 0.25f, "%.2f");
           t.sliderF("Sun shadow: MSM softness (FAR cascades + volumetrics; WORLD units)", &g_sunShadowSoftness, 0.0f, 128.0f, 2.0f);
           t.sliderF("Sun shadow: light-bleed reduction (higher = deeper/tighter)", &g_sunShadowLBR, 0.0f, 0.95f, 0.05f);
-          // NEAR cascade only — these drive PCSS/PCF over the raw depth and have nothing to do with
-          // the MSM softness above (which now shapes the far cascades and the future volumetrics).
-          t.checkbox("Sun NEAR: PCSS+PCF (off = MSM everywhere, the A/B)", &g_sunPcfNear);
-          t.sliderF("Sun NEAR: penumbra SPREAD (fraction of blocker gap)", &g_sunPcssSpread, 0.0f, 0.5f, 0.005f, "%.3f");
-          t.sliderF("Sun NEAR: blocker search radius (TEXELS)", &g_sunPcssSearch, 1.0f, 32.0f, 1.0f, "%.0f");
-          t.sliderF("Sun NEAR: min PCF radius (TEXELS; contact hardness)", &g_sunPcfMinRadius, 0.5f, 8.0f, 0.1f, "%.2f");
-          t.sliderF("Sun NEAR: max PCF radius (TEXELS; higher = rings)", &g_sunPcfMaxRadius, 1.0f, 32.0f, 0.5f, "%.1f");
-          t.sliderF("Sun NEAR: PCF depth bias (WORLD units)", &g_sunPcfBias, 0.0f, 32.0f, 0.5f, "%.2f");
-          t.sliderF("Sun NEAR: PCF slope bias (WORLD units x tan)", &g_sunPcfSlopeBias, 0.0f, 32.0f, 0.5f, "%.2f");
+          // PCSS/PCF over the raw depth — the COLOUR receiver on every cascade. Unrelated to the MSM
+          // softness above, which now exists only for the volumetric fog's per-step tap.
+          t.checkbox("Sun PCSS: enable (off = MSM everywhere, the A/B)", &g_sunPcfNear);
+          t.sliderF("Sun PCSS: penumbra SPREAD (fraction of blocker gap)", &g_sunPcssSpread, 0.0f, 0.5f, 0.005f, "%.3f");
+          t.sliderF("Sun PCSS: blocker search radius (TEXELS)", &g_sunPcssSearch, 1.0f, 32.0f, 1.0f, "%.0f");
+          t.sliderF("Sun PCSS: min PCF radius (TEXELS; contact hardness)", &g_sunPcfMinRadius, 0.5f, 8.0f, 0.1f, "%.2f");
+          t.sliderF("Sun PCSS: max PCF radius (TEXELS; higher = rings)", &g_sunPcfMaxRadius, 1.0f, 32.0f, 0.5f, "%.1f");
+          t.sliderF("Sun PCSS: PCF depth bias (WORLD units)", &g_sunPcfBias, 0.0f, 32.0f, 0.5f, "%.2f");
+          t.sliderF("Sun PCSS: PCF slope bias (WORLD units x tan)", &g_sunPcfSlopeBias, 0.0f, 32.0f, 0.5f, "%.2f");
+          // Volumetric fog — the MSM moments' consumer. The MSM softness slider above shapes THIS,
+          // not the hard shadows any more.
+          t.checkbox("Vol fog: enable (height fog + sun shafts)", &g_volFog);
+          t.sliderF("Vol fog: density (per world unit at base)", &g_volFogDensity, 0.0f, 0.02f, 0.0002f, "%.4f");
+          t.sliderF("Vol fog: height falloff (WORLD units/e-fold)", &g_volFogFalloff, 64.0f, 8192.0f, 32.0f, "%.0f");
+          t.sliderF("Vol fog: base height (ABSOLUTE world Z)", &g_volFogBase, -4096.0f, 8192.0f, 64.0f, "%.0f");
+          t.sliderF("Vol fog: max march distance (world units)", &g_volFogMaxDist, 1024.0f, 32768.0f, 256.0f, "%.0f");
+          t.sliderF("Vol fog: anisotropy g (forward = sun glow)", &g_volFogAniso, -0.9f, 0.95f, 0.01f, "%.2f");
+          t.sliderF("Vol fog: march steps (cost lives here)", &g_volFogSteps, 4.0f, 96.0f, 1.0f, "%.0f");
+          t.sliderF("Vol fog: ambient in-scatter floor", &g_volFogAmbient, 0.0f, 1.0f, 0.01f, "%.2f");
+          t.sliderF("Vol fog: intensity", &g_volFogIntensity, 0.0f, 4.0f, 0.05f, "%.2f");
           t.flush(); }
 
         // -- Tab: Flicker (procedural light/shadow scintillation) --
@@ -7817,6 +7880,20 @@ namespace ForgeRender {
         g_shadowCasters.clear();
         g_dynMoverCasters.clear();
         g_lightOccVetoed = 0;   // Follow-on 3: slots vetoed this frame (heartbeat)
+        // ShadowMaskParams floats 0..19 are the CAMERA (invViewProj + screen), not shadow-slot data,
+        // and more than one pass now reconstructs world position from them — the point-light mask,
+        // and volfog.frag. Written UNCONDITIONALLY: leaving it inside the shadowReady gate below
+        // silently coupled every future consumer to the point-light shadow system being up.
+        if (g_live.pShadowMaskParamsCbv && g_live.pShadowMaskParamsCbv->pCpuMappedAddress) {
+            float* cp = (float*)g_live.pShadowMaskParamsCbv->pCpuMappedAddress;
+            float  camInvVP[16];
+            if (!invert4x4(rzViewProj, camInvVP)) {
+                for (int k = 0; k < 16; ++k) { camInvVP[k] = (k % 5 == 0) ? 1.0f : 0.0f; }
+            }
+            std::memcpy(cp, camInvVP, 16 * sizeof(float));
+            cp[16] = (float)g_live.width;        cp[17] = (float)g_live.height;
+            cp[18] = 1.0f / (float)g_live.width; cp[19] = 1.0f / (float)g_live.height;
+        }
         if (g_live.shadowReady) {
             // Follow-on 3: lazy one-time create of the occlusion-cull resources (runs BEFORE beginCmd,
             // where addResource/addPipeline are legal). shadowReady ⇒ buildOpaquePath already made pHiz,
@@ -7925,13 +8002,7 @@ namespace ForgeRender {
             }
 
             float* mp = (float*)g_live.pShadowMaskParamsCbv->pCpuMappedAddress;
-            float  sInvVP[16];
-            if (!invert4x4(rzViewProj, sInvVP)) {
-                for (int k = 0; k < 16; ++k) { sInvVP[k] = (k % 5 == 0) ? 1.0f : 0.0f; }
-            }
-            std::memcpy(mp, sInvVP, 16 * sizeof(float));
-            mp[16] = (float)g_live.width;        mp[17] = (float)g_live.height;
-            mp[18] = 1.0f / (float)g_live.width; mp[19] = 1.0f / (float)g_live.height;
+            // (floats 0..19 — invViewProj + screen — are written unconditionally above.)
 
             // C4a: pre-walk this frame's skinned parts BEFORE dirty-marking (scheduling runs before
             // the skinned Z-prepass that fills the bone windows). SAME blob order + validity as that
@@ -11559,6 +11630,34 @@ namespace ForgeRender {
         }
         gpuPhaseEnd(kGpuPhaseColorAlpha);
 
+        // ===================== VOLUMETRIC height fog / sun shafts =====================
+        // Placed HERE deliberately: after water + sorted alpha so the fog sits in front of everything
+        // the world pass drew, and BEFORE the first-person arms, which are a near overlay a few units
+        // from the eye — fogging them would apply a whole scene's worth of extinction at arm's length.
+        // Reads the PREPASS depth (gSceneLinDepth), so a ray behind a water surface marches to the
+        // opaque bed rather than the water plane; acceptable, and the alternative is a second depth
+        // resolve for a soft effect that cannot show the difference.
+        // The map it samples is the MSM moments — one tap per march step. That is the whole reason the
+        // moments (and their blur) survive PCSS taking over the colour pass.
+        gpuPhaseBegin(kGpuPhaseVolFog);
+        // Gated on sunShadowReady, not merely on "exterior": it is both the exterior/DL-resident test
+        // AND the guarantee that the moments atlas this march samples was actually built this frame.
+        if (g_volFog && g_live.pVolFogPipeline && g_live.pLinearDepth && g_live.sunShadowReady) {
+            cmdBeginDebugMarker(g_live.pCmd, 0.6f, 0.7f, 0.9f, "VOLUMETRIC FOG");
+            BindRenderTargetsDesc vfBind = {};
+            vfBind.mRenderTargetCount = 1;
+            vfBind.mRenderTargets[0] = { colorTarget, LOAD_ACTION_LOAD };
+            cmdBindRenderTargets(g_live.pCmd, &vfBind);
+            cmdSetViewport(g_live.pCmd, 0.0f, 0.0f, (float)g_live.width, (float)g_live.height, 0.0f, 1.0f);
+            cmdSetScissor(g_live.pCmd, 0, 0, g_live.width, g_live.height);
+            cmdBindPipeline(g_live.pCmd, g_live.pVolFogPipeline);
+            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSet);
+            cmdDraw(g_live.pCmd, 3, 0);
+            cmdBindRenderTargets(g_live.pCmd, nullptr);
+            cmdEndDebugMarker(g_live.pCmd);
+        }
+        gpuPhaseEnd(kGpuPhaseVolFog);
+
         // ===================== FP1a: first-person pass =====================
         // MW draws the arms in its OWN scene after a z-clear, with the arm camera's
         // FOV/near/far — reproduce that: colour LOADs, depth binds with LOAD_ACTION_CLEAR
@@ -12177,7 +12276,7 @@ namespace ForgeRender {
             // Host-GPU-shrink sub-phases: WHERE inside color/reflect the ms live. sky+near+skin+mm+dl
             // ≈ color above (same frame's timestamps); refl sky = reflect − reflgeo.
             LOG::logline(">> [forge-hb] gpu color sub: sky=%.2f nearfrox=%.2f(%s,n=%u) near=%.2f skin=%.2f mm=%.2f dl=%.2f alpha=%.2f glow=%.2f(%u,walk=%.2fms)"
-                         " | refl geo=%.2f (refl sky=%.2f) ms",
+                         " volfog=%.2f(%s,steps=%u) | refl geo=%.2f (refl sky=%.2f) ms",
                          g_lastGpuPhaseMs[kGpuPhaseColorSky],
                          g_lastGpuPhaseMs[kGpuPhaseFroxelNear],
                          g_live.froxelNearActive ? "on" : "off", g_live.froxelNearLightCount,
@@ -12186,6 +12285,12 @@ namespace ForgeRender {
                          g_lastGpuPhaseMs[kGpuPhaseColorDL],
                          g_lastGpuPhaseMs[kGpuPhaseColorAlpha],
                          g_lastGpuPhaseMs[kGpuPhaseColorGlow], g_lastGlowDrawn, g_lastGlowWalkMs,
+                         // volfog "off" here means the PASS DID NOT RUN this frame (no sun map =
+                         // interior / DL not resident / knob off), which is the distinction worth
+                         // logging: a 0.00 with "on" would be a timing problem, with "off" it is a gate.
+                         g_lastGpuPhaseMs[kGpuPhaseVolFog],
+                         (g_volFog && g_live.pVolFogPipeline && g_live.sunShadowReady) ? "on" : "off",
+                         (unsigned)g_volFogSteps,
                          g_lastGpuPhaseMs[kGpuPhaseReflGeo],
                          g_lastGpuPhaseMs[kGpuPhaseReflect] - g_lastGpuPhaseMs[kGpuPhaseReflGeo]);
             // Skinned-loop CPU RECORD probe: rec-split skin= is prep(palette+instance memcpy, IPC-blob
@@ -16600,9 +16705,12 @@ namespace ForgeRender {
     constexpr uint32_t kSunVPFloat     = 416;
     constexpr uint32_t kSunParamsFloat = kSunVPFloat + 16 * kSunCascades;
     constexpr uint32_t kSunTexelFloat  = kSunParamsFloat + 4;
-    constexpr uint32_t kSunPcf0Float   = kSunTexelFloat + 4;    // near-cascade PCSS geometry
-    constexpr uint32_t kSunPcf1Float   = kSunPcf0Float + 4;     // near-cascade biases + enable
-    static_assert((kSunPcf1Float + 4) * sizeof(float) <= 2048,
+    constexpr uint32_t kSunPcf0Float   = kSunTexelFloat + 4;    // PCSS geometry (all cascades)
+    constexpr uint32_t kSunPcf1Float   = kSunPcf0Float + 4;     // PCSS biases + enable
+    constexpr uint32_t kVolFog0Float   = kSunPcf1Float + 4;     // volumetric height fog
+    constexpr uint32_t kVolFog1Float   = kVolFog0Float + 4;
+    constexpr uint32_t kVolFog2Float   = kVolFog1Float + 4;
+    static_assert((kVolFog2Float + 4) * sizeof(float) <= 2048,
                   "ShadowMaskParams overflows its 2048B CBV — too many sun cascades");
     // msmrecv.h.fsl's PCSS works in TEXELS, so SUN_SHADOW_RES has to agree with the atlas the host
     // actually allocated. Same mirroring contract as SUN_CASCADES / kSunCascades.
@@ -16623,20 +16731,36 @@ namespace ForgeRender {
         mp[kSunParamsFloat + 2] = std::max(0.0f, std::min(g_sunShadowLBR, 0.95f));
         mp[kSunParamsFloat + 3] = g_sunShadowNormalOff;
 
-        // --- Near-cascade PCSS/PCF. Every world knob is reconverted here against the LIVE slab and
-        // cascade-0 texel, so a tuned value keeps its physical meaning when the extent knobs move.
+        // --- PCSS/PCF (all cascades). Every world knob is reconverted here against the LIVE slab, so
+        // a tuned value keeps its physical meaning when the extent knobs move.
         const float slabWorld = 4.0f * std::max(g_sunShadowRange, 1.0f);
-        const float texel0    = std::max((2.0f * sunCascadeExtent(0)) / (float)kSunShadowRes, 1.0e-3f);
-        // radiusTexels = spread * (dzNorm * slabWorld) / texel0 — fold the constant part into one
-        // multiplier so the shader keeps a single madd.
+        // penumbraWorld = spread * (dzNorm * slabWorld); the SHADER divides by its own cascade's
+        // texel to get texels. The divide cannot happen here: a penumbra is a physical width, and
+        // cascades differ precisely in how many texels a given width spans.
         mp[kSunPcf0Float + 0] = g_sunPcssSearch;
-        mp[kSunPcf0Float + 1] = g_sunPcssSpread * slabWorld / texel0;
+        mp[kSunPcf0Float + 1] = g_sunPcssSpread * slabWorld;
         mp[kSunPcf0Float + 2] = g_sunPcfMinRadius;
         mp[kSunPcf0Float + 3] = std::max(g_sunPcfMaxRadius, g_sunPcfMinRadius);
         mp[kSunPcf1Float + 0] = g_sunPcfBias      / slabWorld;
         mp[kSunPcf1Float + 1] = g_sunPcfSlopeBias / slabWorld;
         mp[kSunPcf1Float + 2] = (active && g_sunPcfNear) ? 1.0f : 0.0f;
         mp[kSunPcf1Float + 3] = 0.0f;
+
+        // --- Volumetric height fog. Published unconditionally: with no sun map the march still runs
+        // and sunShadowVolumetric() returns "lit" everywhere, which degrades to plain height fog
+        // rather than to a black screen.
+        mp[kVolFog0Float + 0] = g_volFogDensity;
+        mp[kVolFog0Float + 1] = g_volFogFalloff;
+        mp[kVolFog0Float + 2] = g_volFogBase;
+        mp[kVolFog0Float + 3] = g_volFogMaxDist;
+        mp[kVolFog1Float + 0] = std::max(-0.95f, std::min(g_volFogAniso, 0.95f));
+        mp[kVolFog1Float + 1] = std::max(1.0f, std::min(g_volFogSteps, 128.0f));
+        mp[kVolFog1Float + 2] = g_volFog ? 1.0f : 0.0f;
+        mp[kVolFog1Float + 3] = std::max(0.0f, g_volFogAmbient);
+        mp[kVolFog2Float + 0] = g_volFogTint[0];
+        mp[kVolFog2Float + 1] = g_volFogTint[1];
+        mp[kVolFog2Float + 2] = g_volFogTint[2];
+        mp[kVolFog2Float + 3] = std::max(0.0f, g_volFogIntensity);
     }
 
     // Separable Gaussian over the sun moments map — THE pass that makes MSM soft (see
@@ -17714,6 +17838,8 @@ namespace ForgeRender {
         if (g_live.pShadowAtlasViewShader)  { removeShader(R, g_live.pShadowAtlasViewShader); }
         if (g_live.pSunShadowViewPipeline)  { removePipeline(R, g_live.pSunShadowViewPipeline); g_live.pSunShadowViewPipeline = nullptr; }
         if (g_live.pSunShadowViewShader)    { removeShader(R, g_live.pSunShadowViewShader); g_live.pSunShadowViewShader = nullptr; }
+        if (g_live.pVolFogPipeline)         { removePipeline(R, g_live.pVolFogPipeline); g_live.pVolFogPipeline = nullptr; }
+        if (g_live.pVolFogShader)           { removeShader(R, g_live.pVolFogShader); g_live.pVolFogShader = nullptr; }
         if (g_live.pPerBatchSetAlpha)       { removeDescriptorSet(R, g_live.pPerBatchSetAlpha); }
         if (g_live.pAlphaWorldsBuf)         { removeResource(g_live.pAlphaWorldsBuf); }
         if (g_live.pAlphaInstanceBuf)       { removeResource(g_live.pAlphaInstanceBuf); }

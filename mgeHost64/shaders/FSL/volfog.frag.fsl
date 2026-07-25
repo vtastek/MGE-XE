@@ -1,0 +1,113 @@
+// mgeHost64 — VOLUMETRIC height fog (sun shafts), fullscreen composite.
+//
+// This pass exists to give the MSM moments map its real job. PCSS took the colour pass because a
+// blurred moment map cannot resolve a hard-surface penumbra past its blur radius. A ray march is the
+// opposite problem: it evaluates sun visibility dozens of times per pixel, so the per-sample budget
+// is ONE texture instruction, and it wants a smooth pre-filtered answer rather than a binary test
+// (binary shadow tests are the classic cause of banded, crawling shafts). That is precisely what a
+// moment map is: linear moments, so the blurred atlas is legitimately bilinear-filterable, and one
+// tap returns partial occlusion. Same caster pass feeds both consumers.
+//
+// Model: exponential height fog with single scattering.
+//   density(h) = d0 * exp(-(h - base) / falloff)      h = ABSOLUTE world height (Morrowind Z is up)
+//   inscatter  = SUM over steps of  T * density * ds * (sunVis * phase(cos) + ambientFloor)
+//   T         *= exp(-density * ds)
+// Output is (inscatter, transmittance) and the PSO blends ONE / SRC_ALPHA, i.e.
+//   dst = inscatter + dst * T
+// which is the correct compositing order for single scattering over an already-shaded frame.
+//
+// Runs AFTER water + sorted alpha and BEFORE the first-person arms: the arms are a near overlay a
+// few units from the eye and fogging them would be wrong at that range.
+//
+// Reuses opaque.srt.h's PerFrame set wholesale (like shadowatlasview/sunshadowview do) — gSunMoments,
+// gShadowParams, gSceneLinDepth and gFrameData are all already bound there, so this pass needs no
+// SRT, no descriptor set and no cbuffer of its own.
+
+#include "opaque.srt.h"
+#include "msmrecv.h.fsl"   // sunShadowVolumetric() — the one-tap MSM sampler
+
+STRUCT(VSOutput)
+{
+    DATA(float4, Position, SV_Position);
+    DATA(float2, Uv,       TEXCOORD0);
+};
+
+// Henyey-Greenstein. g > 0 pushes scattering forward, which is what puts the bright halo around the
+// sun and makes shafts pointing at the camera glow.
+float hgPhase(float cosT, float g)
+{
+    float g2 = g * g;
+    float d  = 1.0f + g2 - 2.0f * g * cosT;
+    return (1.0f - g2) / (4.0f * 3.14159265f * max(d * sqrt(max(d, 1.0e-4f)), 1.0e-4f));
+}
+
+ROOT_SIGNATURE(DefaultRootSignature)
+float4 PS_MAIN(VSOutput In)
+{
+    INIT_MAIN;
+
+    if (gShadowParams.volFog1.z <= 0.5f) { RETURN(float4(0.0f, 0.0f, 0.0f, 1.0f)); }
+
+    // Scene depth (RAW reverse-Z device depth from the prepass: near = 1, far = 0). 0 means nothing
+    // was drawn — sky — so the ray runs to the far clamp instead of stopping at a surface.
+    float deviceZ = SampleLvlTex2D(gSceneLinDepth, gSamplerPointClamp, In.Uv, 0).r;
+
+    // Reconstruct the CAMERA-RELATIVE world position. invViewProj comes from the same rzViewProj the
+    // frame was drawn with, so the eye sits at the origin and the view ray is just normalize(P).
+    float2 ndc = float2(In.Uv.x * 2.0f - 1.0f, 1.0f - In.Uv.y * 2.0f);
+    float4 hp  = mul(gShadowParams.invViewProj, float4(ndc, max(deviceZ, 1.0e-6f), 1.0f));
+    float3 P   = hp.xyz / hp.w;
+
+    float  maxDist = gShadowParams.volFog0.w;
+    float3 dir     = normalize(P);
+    float  dist    = (deviceZ > 0.0f) ? min(length(P), maxDist) : maxDist;
+    if (dist <= 0.0f) { RETURN(float4(0.0f, 0.0f, 0.0f, 1.0f)); }
+
+    int   steps = (int)max(gShadowParams.volFog1.y, 1.0f);
+    float ds    = dist / float(steps);
+
+    // Jitter the first step by a per-pixel fraction. Marching from a fixed offset puts every pixel's
+    // samples on the same distance planes, and those planes show up as concentric banding wherever
+    // the shadow signal changes fast. Screen-space noise is right HERE (unlike the surface receiver,
+    // where it would crawl): each pixel owns its own ray, and neighbouring rays decorrelating is the
+    // entire point — the bands become fine grain that the eye reads as fog.
+    float2 px    = In.Uv * float2(gShadowParams.screenParams.x, gShadowParams.screenParams.y);
+    float  jitter = frac(sin(dot(floor(px), float2(12.9898f, 78.233f))) * 43758.5453f);
+
+    float  d0      = gShadowParams.volFog0.x;
+    float  falloff = max(gShadowParams.volFog0.y, 1.0f);
+    float  base    = gShadowParams.volFog0.z;
+    float  eyeH    = gFrameData.lodEye.z;            // absolute world height of the camera
+    float  g       = gShadowParams.volFog1.x;
+    float  ambient = gShadowParams.volFog1.w;
+
+    // Phase is constant along the ray (directional light + fixed view dir), so evaluate it once.
+    float  phase = hgPhase(dot(dir, -gFrameData.sunDir.xyz), g) * 4.0f * 3.14159265f;
+
+    float3 inscatter    = float3(0.0f, 0.0f, 0.0f);
+    float  transmittance = 1.0f;
+
+    LOOP for (int i = 0; i < steps; ++i)
+    {
+        float  t   = (float(i) + jitter) * ds;
+        float3 pos = dir * t;
+
+        float  h       = pos.z + eyeH;
+        float  density = d0 * exp(-max(h - base, 0.0f) / falloff);
+        if (density > 1.0e-6f)
+        {
+            float sunVis = sunShadowVolumetric(pos);
+            float sigma  = density * ds;
+            // Energy-conserving step integral: the light scattered in over this segment is what the
+            // segment absorbs, so use (1 - exp(-sigma)) rather than sigma. At large steps the naive
+            // form over-brightens badly, and this fog wants few steps.
+            float seg    = 1.0f - exp(-sigma);
+            inscatter    += transmittance * seg * (sunVis * phase + ambient);
+            transmittance *= exp(-sigma);
+        }
+        if (transmittance < 0.003f) { break; }   // fully opaque; the rest cannot contribute
+    }
+
+    float3 fogCol = gFrameData.sunCol.xyz * gShadowParams.volFog2.xyz * gShadowParams.volFog2.w;
+    RETURN(float4(inscatter * fogCol, transmittance));
+}

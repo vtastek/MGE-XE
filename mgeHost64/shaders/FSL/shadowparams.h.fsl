@@ -99,4 +99,20 @@ STRUCT(ShadowMaskParams)
     //          z = 1 = PCSS/PCF near cascade ON, 0 = fall back to MSM everywhere (the A/B),
     //          w = spare.
     DATA(float4,   sunPcf1,     None);
+    // --- VOLUMETRIC height fog (volfog.frag.fsl) ------------------------------------------------
+    // The moments map's actual job now that PCSS owns the colour pass: a ray march wants ONE cheap
+    // filterable tap per step and cannot afford PCSS's 28, so shafts read the MSM atlas.
+    // volFog0: x = density per world unit at the fog base,
+    //          y = height falloff in WORLD units (density *= exp(-(h - base)/y)),
+    //          z = fog BASE height in ABSOLUTE world units (Morrowind Z is up),
+    //          w = max march distance in world units (the ray stops at the depth buffer or here).
+    DATA(float4,   volFog0,     None);
+    // volFog1: x = Henyey-Greenstein anisotropy g (0 = isotropic, ->1 = forward/sun glow),
+    //          y = step count,
+    //          z = 1 = fog pass ON,
+    //          w = ambient in-scatter floor 0..1 (fraction of the fog colour that lights shadowed
+    //              steps — without it, shafts read as pure black voids rather than dimmer fog).
+    DATA(float4,   volFog1,     None);
+    // volFog2: xyz = fog TINT multiplied into the sun colour, w = overall intensity.
+    DATA(float4,   volFog2,     None);
 };

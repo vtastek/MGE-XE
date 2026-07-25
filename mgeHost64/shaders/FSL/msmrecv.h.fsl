@@ -115,29 +115,30 @@ float sunCascadeOcclusion(int c, float3 p, float zBias)
 }
 
 // ---------------------------------------------------------------------------------------------
-// NEAR CASCADE: PCSS + rotated-disc PCF over the RAW depth (gSunDepth), not the moments.
+// PCSS + rotated-disc PCF over the RAW depth (gSunDepth) — the COLOUR receiver, all cascades.
 //
-// Why cascade 0 leaves MSM behind. MSM's penumbra comes entirely from the moments blur, so its width
+// Why MSM lost the colour pass entirely. Its penumbra comes only from the moments blur, so its width
 // is capped by that blur's tap radius (4 texels) — past that the softness knob does nothing, and what
-// is left is a truncated separable kernel whose iso-contours are axis-aligned. On statics it passes,
-// because a static sits well above its receiver: the depth gap is large, the quadrature is in its
-// stable regime, and the blurred moments give a genuinely smooth ramp. On TERRAIN it does not:
-// receiver and occluder depths are nearly equal (grazing sun on a slope), which is exactly where the
-// 3-point quadrature is least accurate and most sensitive to the map's 16-bit quantisation, so the
-// transition collapses onto the texel grid and reads as square blocks.
+// is left is a truncated separable kernel whose iso-contours are axis-aligned. It looked least bad on
+// statics (a static sits well above its receiver: wide depth gap, the quadrature in its stable
+// regime, a real ramp) and worst on terrain (receiver and occluder at nearly equal depth is exactly
+// where the 3-point quadrature is least accurate and most sensitive to the map's 16-bit
+// quantisation, so the transition collapses onto the texel grid). Distance did not rescue it: the
+// far cascade's 8-unit texels put the blocky iso-contours on a bigger world grid, not a finer one.
 //
 // PCSS has no such ceiling: penumbra width is measured from the actual blocker/receiver separation
 // and applied as a sampling radius, so it is bounded by the tap count, not by a pre-filter. The depth
 // it reads is the caster pass's own z-buffer — already rendered, previously discarded.
 //
-// The moments are NOT retired: every other cascade still uses them, and volumetrics will, because a
-// ray march wants one cheap filterable tap per step and could never afford this disc.
+// The moments are NOT dead — they just have a different consumer. Volumetric fog ray-marches the sun
+// shadow and needs ONE cheap filterable tap per step, which is precisely what a moment map is for and
+// precisely what this disc could never afford. See volfog.frag.fsl.
 
 #define SUN_PCSS_BLOCKER_TAPS 12
 #define SUN_PCF_TAPS          16
 
-// Atlas geometry. Cascade 0 owns u in [0, 1/N]; one tile texel is 1/(RES*N) of the atlas in u and
-// 1/RES in v.
+// Atlas geometry. Cascade c owns u in [c/N, (c+1)/N]; one tile texel is 1/(RES*N) of the atlas in u
+// and 1/RES in v.
 #define SUN_ATLAS_TEXEL float2(1.0f / float(SUN_SHADOW_RES * SUN_CASCADES), 1.0f / float(SUN_SHADOW_RES))
 #define SUN_ATLAS_DIMS  float2(float(SUN_SHADOW_RES * SUN_CASCADES), float(SUN_SHADOW_RES))
 
@@ -179,30 +180,31 @@ float sunPcfTap(float2 uv, float ref)
     return lerp(lerp(occ.w, occ.z, t.x), lerp(occ.x, occ.y, t.x), t.y);
 }
 
-// Cascade 0's occlusion. `p` is already normal-offset. Returns 0 = lit .. 1 = fully shadowed.
-float sunNearOcclusion(float3 p, float3 worldPosRel, float slopeBias)
+// Cascade c's occlusion. `p` is already normal-offset. Returns 0 = lit .. 1 = fully shadowed.
+float sunPcssOcclusion(int c, float3 p, float3 worldPosRel, float slopeBias)
 {
-    float4 posLS = mul(gShadowParams.sunViewProj[0], float4(p, 1.0f));
+    float4 posLS = mul(gShadowParams.sunViewProj[c], float4(p, 1.0f));
     posLS.xyz /= posLS.w;
 
     float2 uvTile = saturate(posLS.xy * float2(0.5f, -0.5f) + float2(0.5f, 0.5f));
-    float2 uv0    = float2(uvTile.x * (1.0f / float(SUN_CASCADES)), uvTile.y);
+    float2 uvC    = float2((float(c) + uvTile.x) * (1.0f / float(SUN_CASCADES)), uvTile.y);
 
     float  ref  = posLS.z + gShadowParams.sunPcf1.x + slopeBias;   // reverse-Z: push TOWARD the sun
     float  rot  = sunDiscRotation(worldPosRel);
     float  srch = gShadowParams.sunPcf0.x;
 
-    // Keep every tap inside cascade 0's tile: the atlas packs the cascades side by side, so clamp
-    // addressing at the atlas edge would let the right-hand taps read cascade 1's texels.
-    float2 lo = SUN_ATLAS_TEXEL;
-    float2 hi = float2(1.0f / float(SUN_CASCADES), 1.0f) - SUN_ATLAS_TEXEL;
+    // Keep every tap inside cascade c's OWN tile: the atlas packs the cascades side by side, so clamp
+    // addressing at the atlas edge would let a tap read the neighbouring cascade's texels — which,
+    // being a different world scale, is not a slightly-wrong shadow but a completely unrelated one.
+    float2 lo = float2((float(c)        ) * (1.0f / float(SUN_CASCADES)), 0.0f) + SUN_ATLAS_TEXEL;
+    float2 hi = float2((float(c) + 1.0f) * (1.0f / float(SUN_CASCADES)), 1.0f) - SUN_ATLAS_TEXEL;
 
     // --- Blocker search: how far in front of this receiver is the stuff that shadows it? ---
     float blockerSum = 0.0f;
     float blockerCnt = 0.0f;
     UNROLL for (int i = 0; i < SUN_PCSS_BLOCKER_TAPS; ++i)
     {
-        float2 sp = clamp(uv0 + sunDiscTap(i, SUN_PCSS_BLOCKER_TAPS, rot) * srch * SUN_ATLAS_TEXEL, lo, hi);
+        float2 sp = clamp(uvC + sunDiscTap(i, SUN_PCSS_BLOCKER_TAPS, rot) * srch * SUN_ATLAS_TEXEL, lo, hi);
         float  d  = SampleLvlTex2D(gSunDepth, gSamplerPointClamp, sp, 0).r;
         float  hit = step(ref, d);
         blockerSum += d * hit;
@@ -211,34 +213,62 @@ float sunNearOcclusion(float3 p, float3 worldPosRel, float slopeBias)
     // No blocker found anywhere in the search disc — fully lit, and we skip the PCF entirely.
     if (blockerCnt < 0.5f) { return 0.0f; }
 
-    // --- Penumbra: PCSS similar triangles. sunPcf0.y already carries the host's conversion from a
-    // dimensionless world SPREAD to texels-per-unit-of-normalised-depth, so this stays in texels and
-    // stays correct when the extent knob moves. ---
+    // --- Penumbra: PCSS similar triangles. sunPcf0.y carries the host's dimensionless world SPREAD
+    // already multiplied by the depth slab, so this product is a WORLD penumbra width; dividing by
+    // THIS cascade's world texel size turns it into that cascade's texels. Doing the divide here
+    // rather than host-side is what makes one knob correct for every cascade — cascades differ only
+    // in texel size, and a penumbra is a physical width, not a texel count. ---
     float dzNorm  = max(blockerSum / blockerCnt - posLS.z, 0.0f);
-    float radius  = clamp(gShadowParams.sunPcf0.y * dzNorm,
+    float texelW  = max(gShadowParams.sunCascadeTexel[c], 1.0e-3f);
+    float radius  = clamp(gShadowParams.sunPcf0.y * dzNorm / texelW,
                           gShadowParams.sunPcf0.z, gShadowParams.sunPcf0.w);
 
     // --- Variable-radius PCF ---
     float occlusion = 0.0f;
     UNROLL for (int j = 0; j < SUN_PCF_TAPS; ++j)
     {
-        float2 sp = clamp(uv0 + sunDiscTap(j, SUN_PCF_TAPS, rot) * radius * SUN_ATLAS_TEXEL, lo, hi);
+        float2 sp = clamp(uvC + sunDiscTap(j, SUN_PCF_TAPS, rot) * radius * SUN_ATLAS_TEXEL, lo, hi);
         occlusion += sunPcfTap(sp, ref);
     }
     return occlusion * (1.0f / float(SUN_PCF_TAPS));
 }
 
-// Per-cascade strategy dispatch. Cascade 0 gets PCSS/PCF, every coarser cascade keeps MSM. Both
-// return occlusion in the same 0 = lit .. 1 = shadowed range, which is what lets the hand-off band
-// lerp straight across the change of technique without a seam.
+// VOLUMETRIC sun visibility at an arbitrary point in the air — THE moment map's remaining job.
 //
-// The two are not interchangeable and the split is deliberate: PCSS resolves a real penumbra but
-// costs a tap disc, and its cost lands where it is worth paying — the near cascade covers a small
-// slice of the screen and is the only place a first-person camera can actually inspect a shadow
-// edge. Far away the square-ish MSM look is invisible and one bilinear tap is the right price.
+// A ray march evaluates this once per step, dozens of times per pixel, so the per-sample budget is
+// one texture instruction. That rules out PCSS (28 taps) and even plain PCF, and it is exactly what
+// a moment map is built for: the moments are linear, so the blurred atlas is legitimately
+// bilinear-filterable, and one tap returns a smooth partial-occlusion estimate rather than a binary
+// answer. Hard-edged binary shadow tests are also the classic source of banded, aliased shafts —
+// pre-filtered moments give the march a soft, already-anti-aliased signal for free.
+//
+// No normal offset (there is no surface), no slope bias (no normal), and a small constant bias only.
+// Returns 1 = lit .. 0 = fully shadowed.
+float sunShadowVolumetric(float3 p)
+{
+    if (gShadowParams.sunParams.x <= 0.0f) { return 1.0f; }
+
+    UNROLL for (int i = 0; i < SUN_CASCADES; ++i)
+    {
+        float4 q = mul(gShadowParams.sunViewProj[i], float4(p, 1.0f));
+        if (max(abs(q.x), abs(q.y)) < 1.0f - MSM_CASCADE_INSET && q.z > 0.0f && q.z < 1.0f)
+        {
+            return 1.0f - sunCascadeOcclusion(i, p, gShadowParams.sunParams.y);
+        }
+    }
+    return 1.0f;   // outside every cascade: unshadowed air
+}
+
+// Strategy dispatch for the COLOUR pass. PCSS on every cascade; MSM survives only as the A/B
+// (sunPcf1.z == 0) and as the volumetric fog's sampler, which is a different file.
+//
+// It was worth trying MSM-for-far — one bilinear tap instead of 28 is a real saving and distance
+// usually forgives a filter. It did not survive looking at it: a coarser cascade does not soften the
+// blockiness, it just draws the same axis-aligned iso-contours on an 8-unit world grid instead of a
+// 2-unit one, so the artefact scaled up with the texels rather than fading out.
 float sunCascadeShadow(int c, float3 p, float3 worldPosRel, float zBias, float slopeBias)
 {
-    if (c == 0 && gShadowParams.sunPcf1.z > 0.5f) { return sunNearOcclusion(p, worldPosRel, slopeBias); }
+    if (gShadowParams.sunPcf1.z > 0.5f) { return sunPcssOcclusion(c, p, worldPosRel, slopeBias); }
     return sunCascadeOcclusion(c, p, zBias);
 }
 

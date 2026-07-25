@@ -1029,7 +1029,23 @@ STRUCT(ShadowMaskParams)
 
 
     float4 sunPcf1;
-#line 102
+
+
+
+
+
+
+
+    float4 volFog0;
+
+
+
+
+
+    float4 volFog1;
+
+    float4 volFog2;
+#line 118
 };
 #line 21 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
 #line 35 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
@@ -1300,7 +1316,7 @@ float sunCascadeOcclusion(int c, float3 p, float zBias)
     float4 moments = UnpackMoments(SampleLvlTex2D(gSunMoments, gSamplerBilinearClamp, uv, 0));
     return ComputeMSMShadowIntensity(moments, zf);
 }
-#line 147 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/msmrecv.h.fsl"
+#line 148 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/msmrecv.h.fsl"
 float2 sunDiscTap(int i, int n, float rot)
 {
     float r = sqrt((float(i) + 0.5f) / float(n));
@@ -1337,13 +1353,13 @@ float sunPcfTap(float2 uv, float ref)
 }
 
 
-float sunNearOcclusion(float3 p, float3 worldPosRel, float slopeBias)
+float sunPcssOcclusion(int c, float3 p, float3 worldPosRel, float slopeBias)
 {
-    float4 posLS = mul(gShadowParams.sunViewProj[0], float4(p, 1.0f));
+    float4 posLS = mul(gShadowParams.sunViewProj[c], float4(p, 1.0f));
     posLS.xyz /= posLS.w;
 
     float2 uvTile = saturate(posLS.xy * float2(0.5f, -0.5f) + float2(0.5f, 0.5f));
-    float2 uv0 = float2(uvTile.x * (1.0f / float( 2 )), uvTile.y);
+    float2 uvC = float2((float(c) + uvTile.x) * (1.0f / float( 2 )), uvTile.y);
 
     float ref = posLS.z + gShadowParams.sunPcf1.x + slopeBias;
     float rot = sunDiscRotation(worldPosRel);
@@ -1351,15 +1367,16 @@ float sunNearOcclusion(float3 p, float3 worldPosRel, float slopeBias)
 
 
 
-    float2 lo =  float2(1.0f / float( 2048 * 2 ), 1.0f / float( 2048 )) ;
-    float2 hi = float2(1.0f / float( 2 ), 1.0f) -  float2(1.0f / float( 2048 * 2 ), 1.0f / float( 2048 )) ;
+
+    float2 lo = float2((float(c) ) * (1.0f / float( 2 )), 0.0f) +  float2(1.0f / float( 2048 * 2 ), 1.0f / float( 2048 )) ;
+    float2 hi = float2((float(c) + 1.0f) * (1.0f / float( 2 )), 1.0f) -  float2(1.0f / float( 2048 * 2 ), 1.0f / float( 2048 )) ;
 
 
     float blockerSum = 0.0f;
     float blockerCnt = 0.0f;
     UNROLL for (int i = 0; i <  12 ; ++i)
     {
-        float2 sp = clamp(uv0 + sunDiscTap(i,  12 , rot) * srch *  float2(1.0f / float( 2048 * 2 ), 1.0f / float( 2048 )) , lo, hi);
+        float2 sp = clamp(uvC + sunDiscTap(i,  12 , rot) * srch *  float2(1.0f / float( 2048 * 2 ), 1.0f / float( 2048 )) , lo, hi);
         float d = SampleLvlTex2D(gSunDepth, gSamplerPointClamp, sp, 0).r;
         float hit = step(ref, d);
         blockerSum += d * hit;
@@ -1371,20 +1388,37 @@ float sunNearOcclusion(float3 p, float3 worldPosRel, float slopeBias)
 
 
 
+
+
     float dzNorm = max(blockerSum / blockerCnt - posLS.z, 0.0f);
-    float radius = clamp(gShadowParams.sunPcf0.y * dzNorm,
+    float texelW = max(gShadowParams.sunCascadeTexel[c], 1.0e-3f);
+    float radius = clamp(gShadowParams.sunPcf0.y * dzNorm / texelW,
                           gShadowParams.sunPcf0.z, gShadowParams.sunPcf0.w);
 
 
     float occlusion = 0.0f;
     UNROLL for (int j = 0; j <  16 ; ++j)
     {
-        float2 sp = clamp(uv0 + sunDiscTap(j,  16 , rot) * radius *  float2(1.0f / float( 2048 * 2 ), 1.0f / float( 2048 )) , lo, hi);
+        float2 sp = clamp(uvC + sunDiscTap(j,  16 , rot) * radius *  float2(1.0f / float( 2048 * 2 ), 1.0f / float( 2048 )) , lo, hi);
         occlusion += sunPcfTap(sp, ref);
     }
     return occlusion * (1.0f / float( 16 ));
 }
+#line 247 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/msmrecv.h.fsl"
+float sunShadowVolumetric(float3 p)
+{
+    if (gShadowParams.sunParams.x <= 0.0f) { return 1.0f; }
 
+    UNROLL for (int i = 0; i <  2 ; ++i)
+    {
+        float4 q = mul(gShadowParams.sunViewProj[i], float4(p, 1.0f));
+        if (max(abs(q.x), abs(q.y)) < 1.0f -  0.008f  && q.z > 0.0f && q.z < 1.0f)
+        {
+            return 1.0f - sunCascadeOcclusion(i, p, gShadowParams.sunParams.y);
+        }
+    }
+    return 1.0f;
+}
 
 
 
@@ -1395,7 +1429,7 @@ float sunNearOcclusion(float3 p, float3 worldPosRel, float slopeBias)
 
 float sunCascadeShadow(int c, float3 p, float3 worldPosRel, float zBias, float slopeBias)
 {
-    if (c == 0 && gShadowParams.sunPcf1.z > 0.5f) { return sunNearOcclusion(p, worldPosRel, slopeBias); }
+    if (gShadowParams.sunPcf1.z > 0.5f) { return sunPcssOcclusion(c, p, worldPosRel, slopeBias); }
     return sunCascadeOcclusion(c, p, zBias);
 }
 
