@@ -292,11 +292,51 @@ namespace MGE::GeometryCache {
         NI::Node* g_landRoot = nullptr;
         uint32_t  g_liveRefreshThisFrame = 0;
         uint32_t  g_liveCaptureThisFrame = 0;
-        // bug #2 re-entry: frames of DEEP bypassCull object-root capture remaining after a cell purge.
-        // Set by purgeAll; counted down in onFrameReady. Gives a door-transition the same full-cell
-        // capture a fresh save-load gets for free, so off-screen fixtures (the lantern) cast at once.
+        // Post-load residency window: frames of forced full-cell capture remaining after a cell
+        // transition. Armed by armPostLoadWalk (from purgeAll, and from the first-eval load which
+        // does not purge); counted down in onFrameReady. Two shapes, one counter:
+        //   INTERIOR (bug #2 re-entry) — DEEP bypassCull walk of obj+pick, gate off. Gives a door
+        //     transition the same full-cell capture a fresh save-load gets for free, so off-screen
+        //     fixtures (the lantern) cast at once.
+        //   EXTERIOR (behind-camera pop-in) — a plain gated refresh walk. Under the Forge seam the
+        //     per-frame refresh walk is skipped (liveDrawBuild), so the cache is populated purely by
+        //     ensureLive off the engine's FRUSTUM-limited classify set: geometry behind the camera is
+        //     never captured, so it is never host-resident either. Benign in steady state (the cache
+        //     accumulates the full grid as you look around, and cell-grid eviction keeps it), but
+        //     right after a purge the cache is empty — turn 180 and several thousand first-sight keys
+        //     arrive in one build (a rotation hitch inside the capture grace window, a ~30-frame
+        //     pop-in trickle past it). One walk per window frame front-loads the whole active-cell
+        //     grid into the load hitch instead.
         int       g_postPurgeCaptureFrames = 0;
         constexpr int kPostPurgeCaptureFrames = 12;   // ~1 eviction-sweep window; interiors are small
+        // Exteriors need a longer window than interiors: MW background-loads the 5x5 grid over
+        // several frames after a transition, so a 12-frame window can close before the neighbour
+        // cells even exist — and on the arm frame itself g_gateEye may still be the OLD cell's eye
+        // (which the later frames self-correct). This is the MINIMUM window; the capture budget
+        // below extends it until the cell is actually resident, so the number only has to cover the
+        // late-arriving cells, not the capture volume.
+        constexpr int kPostLoadWalkFramesExterior = 30;
+        // Per-frame first-sight capture cap for the window walk, and the hard ceiling on how long
+        // the window may stay open waiting for the budget to finish. 256/frame clears a ~13k
+        // exterior grid in ~51 frames (~0.3s at 165fps) — far inside the 600-frame capture grace,
+        // and far inside the time it takes a player to physically turn around. The ceiling only
+        // exists so a pathological scene cannot hold the window open indefinitely.
+        constexpr int kPostLoadCaptureBudget   = 256;
+        constexpr int kPostLoadWalkFramesMax   = 180;
+        // Armed ONLY around the window walk (disarmed immediately after, so the sky/FP walks later
+        // in the same frame are never gated). -1 = unlimited, >= 0 = captures still allowed.
+        int       g_windowCaptureBudget   = -1;
+        uint32_t  g_windowCaptureDeferred = 0;   // first-sight keys the budget turned away this frame
+        int       g_postLoadFramesUsed    = 0;   // frames the current window has actually consumed
+        // [postload-walk] observability, sampled at arm time and reported once when the window
+        // closes (once per cell transition — not a hot path).
+        bool      g_postLoadInterior      = false;
+        int       g_postLoadFramesArmed   = 0;
+        uint32_t  g_postLoadCacheAtArm    = 0;
+        uint64_t  g_postLoadCapturesAtArm = 0;
+        // Monotonic count of first-sight captures (walk AND ensureLive — they share one insertion
+        // point), so a window can report exactly how many entries it brought in.
+        uint64_t  g_captureTotal = 0;
         // First-sight capture budget (see setCaptureBudget in the header). -1 = unlimited;
         // >= 0 = remaining first-sight lazy captures ensureLive may still do before deferring.
         int       g_captureBudget   = -1;
@@ -1614,7 +1654,18 @@ namespace MGE::GeometryCache {
                 it = g_cache.end();
             }
             if (it == g_cache.end()) {
+                // Post-load window budget (armed only around the window walk). Gates FIRST SIGHT
+                // only — the refresh path above is correctness and is never throttled. A turned-away
+                // key is simply not cached yet, so nothing references it and nothing can evict it;
+                // the next window frame's walk meets it again. Same carry-over contract as
+                // ensureLive's g_captureBudget, applied to the walk instead of the classify set.
+                if (g_windowCaptureBudget == 0) {
+                    ++g_windowCaptureDeferred;
+                    return;
+                }
+                if (g_windowCaptureBudget > 0) --g_windowCaptureBudget;
                 auto& e = g_cache[key];
+                ++g_captureTotal;   // the ONE first-sight insertion point (walk + ensureLive)
                 // Take the engine reference the moment the key enters the cache. `geom` is provably
                 // alive here (we are dereferencing it), and holding this ref is what makes every LATER
                 // deref of this key safe — including ensureLive()'s, on an offscreen key, frames after
@@ -2467,25 +2518,48 @@ namespace MGE::GeometryCache {
             runRefreshWalks();
         }
 
-        // Cell-transition shadow-capture (bug #2, the RE-ENTRY case). On a fresh save-load MW's own
-        // full-scene classify captures the WHOLE cell, so the offscreen re-emit below finds every
-        // fixture and the lantern casts complete. On a DOOR TRANSITION there is no such classify: the
-        // cache is purged and then repopulates VIEW-LIMITED (the walk honours MW's app-cull), so an
-        // off-screen fixture — the lantern behind you — is never captured and its shadow is missing
-        // until you turn to look (the reported "reenter interior, incomplete"). For a short window
-        // after a purge, DEEP-bypassCull-walk the object root so every near static is captured +
-        // uploaded regardless of frustum, exactly the state a save-load starts in. Interiors only:
-        // they are small (bounded cost) and are the lantern case; exterior point-light fixtures can
-        // follow later. Still subject to the active-cell distance gate, so far cells aren't pulled in.
-        if (g_postPurgeCaptureFrames > 0) {
-            if (RenderProcess::forgeOwnsFrame() && g_captureInteriorCell && g_objRoot) {
+        // Post-load residency window (see kPostPurgeCaptureFrames / kPostLoadWalkFramesExterior).
+        // Both cell kinds get a forced full-cell capture for a few frames after a transition; only
+        // the walk shape differs. Guard is shared, so the counter decrements exactly once per frame
+        // that ACTUALLY captured (never on a load/menu frame that has no roots or no seam).
+        //
+        // The predicate is hoisted because the eviction sweep below keys off it too, and the two
+        // must agree: a counter that CANNOT drain (seam off, no roots) would otherwise leave the
+        // sweep forced on every frame indefinitely. That was live — the decrement used to sit
+        // inside the interior-only branch, so an EXTERIOR purge armed the counter and nothing ever
+        // took it back down, forcing a per-frame eviction sweep for the rest of the session.
+        const bool postLoadWindow =
+            g_postPurgeCaptureFrames > 0 && RenderProcess::forgeOwnsFrame() && g_objRoot;
+        if (postLoadWindow) {
+            // Spread the window's first-sight captures over its frames instead of taking the whole
+            // cell in one. Without this the walk below captures EVERY uncached shape in the gate on
+            // its first frame — measured 13k captures + a 148MB texture flush in a single 340ms
+            // frame on an exterior re-entry. That frame lands while MW's loading bar is up, and it
+            // is long enough to swallow the entire load: the bar renders once, empty, and never
+            // advances (reported in-game). Budgeting turns the one blocking frame into ~50 ordinary
+            // ones, so the bar animates the way it always did and the burst still finishes long
+            // before the player can complete a turn.
+            //
+            // Armed ONLY around the walk below and disarmed straight after: the sky and FP walks run
+            // later in this same frame and must never be starved of captures by an exhausted budget.
+            g_windowCaptureDeferred = 0;
+            g_windowCaptureBudget = kPostLoadCaptureBudget;
+            if (g_captureInteriorCell) {
                 MGE_ZoneScopedN("GeomCache:postPurgeCapture");
+                // INTERIOR (bug #2, the RE-ENTRY case). On a fresh save-load MW's own full-scene
+                // classify captures the WHOLE cell, so the offscreen re-emit below finds every
+                // fixture and the lantern casts complete. On a DOOR TRANSITION there is no such
+                // classify: the cache is purged and then repopulates VIEW-LIMITED (the walk honours
+                // MW's app-cull), so an off-screen fixture — the lantern behind you — is never
+                // captured and its shadow is missing until you turn to look (the reported "reenter
+                // interior, incomplete"). DEEP-bypassCull-walk instead, so every near static is
+                // captured + uploaded regardless of frustum.
+                //
                 // Capture the WHOLE interior (skip the active-cell distance gate as well as app-cull).
                 // The gate can't be trusted here: right after a purge g_gateEye is still the OLD cell's
                 // eye, so a distance test rejects the entire new interior (a tight radius captured
                 // nothing; the wide one only worked by accident). An interior is bounded, so a full
-                // capture is safe and correct — it's the same state a fresh save-load starts in. This
-                // is INTERIOR-only; exteriors keep their gate (never reached — g_captureInteriorCell).
+                // capture is safe and correct — it's the same state a fresh save-load starts in.
                 // BOTH cell roots, exactly as runRefreshWalks does: WorldObjectRoot holds the
                 // architecture + furniture (posts, table, lanterns), but the clutter that casts the
                 // "popping" shadows — barrels, sacks, baskets, bottles, the chest — hangs under
@@ -2502,7 +2576,40 @@ namespace MGE::GeometryCache {
                     g_walkingPick = false;
                 }
                 g_gateThisFrame = savedGate;
-                --g_postPurgeCaptureFrames;   // only burn a frame that ACTUALLY captured (not load/menu)
+            } else {
+                MGE_ZoneScopedN("GeomCache:postLoadWalk");
+                // EXTERIOR: a PLAIN gated walk, not bypassCullDeep. The walk's active-cell gate is
+                // distance-only and explicitly NOT frustum (see walk()) — "so panning never churns
+                // capture" — so a plain gated walk already reaches everything behind the camera
+                // inside cacheGateRadius. bypassCullDeep exists to un-hide MW's app-culled INTERIOR
+                // subtrees and drags in collision meshes it then has to filter; exteriors need none
+                // of that, and the gate is what keeps far cells out.
+                //
+                // ensureFullWalk, not runRefreshWalks directly: it is idempotent, so a frame that
+                // already walked (a DX9 / hostCullOnly frame took the !liveDrawBuild branch above)
+                // costs nothing — and it stamps g_walkRanFrame, which makes the eviction sweep's
+                // walkAuthoritative verdict true for every window frame (strictly more precise
+                // gone-detection, and the sweep's own ensureFullWalk below becomes free).
+                ensureFullWalk();
+            }
+            g_windowCaptureBudget = -1;   // disarm before the sky/FP walks below
+            ++g_postLoadFramesUsed;
+
+            // The window's job is "the cell is resident", not "N frames elapsed". While the budget
+            // is still deferring captures there is grid left to bring in, so hold the window open
+            // rather than closing on a half-captured cell — deferred keys re-arrive on the next
+            // frame's walk exactly as ensureLive's deferred keys re-arrive on the next classify.
+            // Hard-capped so a scene that somehow never stops deferring cannot hold it open forever.
+            const bool stillCapturing = g_windowCaptureDeferred > 0
+                                     && g_postLoadFramesUsed < kPostLoadWalkFramesMax;
+            if (!stillCapturing && --g_postPurgeCaptureFrames == 0) {
+                LOG::logline(">> [postload-walk] %s done: frames=%d/%d cache=%u->%u captures=%u "
+                             "lastDeferred=%u gateR=%.0f",
+                             g_postLoadInterior ? "interior" : "exterior",
+                             g_postLoadFramesUsed, g_postLoadFramesArmed,
+                             g_postLoadCacheAtArm, (unsigned)g_cache.size(),
+                             (unsigned)(g_captureTotal - g_postLoadCapturesAtArm),
+                             g_windowCaptureDeferred, g_gateRadius);
             }
         }
         const double tLand = gcNowMs();
@@ -2623,9 +2730,15 @@ namespace MGE::GeometryCache {
         // 30-frame sweep boundary — so a subset of shadows (the frustum-visible ones) appears
         // immediately and the rest "pop in" up to ~0.3s later. Forcing the sweep here keeps the
         // near-static set current with the capture, so every caster seeds on the same frame and all
-        // shadows arrive together. Bounded (12 interior frames, hidden inside the load hitch).
+        // shadows arrive together. Bounded by the window (which runs until the cell is resident,
+        // ceiling kPostLoadWalkFramesMax) — and free on those frames, since the window walk stamped
+        // g_walkRanFrame, so the sweep's own ensureFullWalk below is a no-op and its verdict is the
+        // precise walk-authoritative one.
+        // postLoadWindow, not the raw counter: it is the frame that actually captured (so the sweep
+        // stays in step with the capture, including the LAST window frame, whose decrement already
+        // took the counter to 0) and it cannot stick on when the window can never drain.
         const bool sweepNow = (g_frame % kEvictSweepInterval == 0) || MWBridge::get()->IsMenu()
-                              || (g_postPurgeCaptureFrames > 0);
+                              || postLoadWindow;
         // Cell-grid mode NEVER forces a walk — it reads MW's grid directly. Parent-chain forces one
         // only during its validation window / the forceWalk bisect knob.
         const bool validating = g_evictByParentChain && !g_evictByCellGrid && (g_evictSweepNo < kEvictValidateSweeps);
@@ -3233,6 +3346,19 @@ namespace MGE::GeometryCache {
         out.swap(g_evictedKeys);   // move-out + leave g_evictedKeys empty for the next sweep
     }
 
+    void armPostLoadWalk() {
+        // Cell kind from a LIVE engine read, not the per-frame g_captureInteriorCell snapshot: the
+        // arm runs on the produce path (checkCellEpochAndPurge), which in park-and-fire mode can
+        // fire before this frame's onFrameReady has refreshed that snapshot.
+        g_postLoadInterior = !MWBridge::get()->IsExterior();
+        g_postPurgeCaptureFrames = g_postLoadInterior ? kPostPurgeCaptureFrames
+                                                      : kPostLoadWalkFramesExterior;
+        g_postLoadFramesArmed   = g_postPurgeCaptureFrames;
+        g_postLoadFramesUsed    = 0;
+        g_postLoadCacheAtArm    = (uint32_t)g_cache.size();
+        g_postLoadCapturesAtArm = g_captureTotal;
+    }
+
     void purgeAll() {
         // A cell teardown (load door, teleport, save load) destroys the whole scene graph, but the
         // cache is keyed on shape ADDRESSES and knows nothing about it — so every entry survives into
@@ -3259,10 +3385,10 @@ namespace MGE::GeometryCache {
         g_nearStaticCasters.clear(); // stale snapshot (find-guarded anyway); rebuilt next sweep
         g_nearAlphaCasters.clear();
         g_geomRefs.clear();   // NI::Pointer dtors → DecRef every shape we were pinning
-        // bug #2 re-entry: this purge is a cell transition → the new cell repopulates view-limited,
-        // so force a short window of full-cell (deep bypassCull) capture (see onFrameReady). A fresh
-        // save-load gets this from MW's own classify; a door transition does not.
-        g_postPurgeCaptureFrames = kPostPurgeCaptureFrames;
+        // This purge is a cell transition → the new cell repopulates view-limited, so force a short
+        // window of full-cell capture (see onFrameReady). Armed AFTER the clear so the window's
+        // cache=/captures= baseline is the empty cache it actually starts from.
+        armPostLoadWalk();
     }
 
     const CachedGeometry* ensureLive(uint32_t key) {

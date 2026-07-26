@@ -264,6 +264,14 @@ namespace MGE::GeometryCache {
     // are re-captured lazily on first sight.
     void purgeAll();
 
+    // Arm the post-load residency window: a few frames of forced full-cell capture, so the whole
+    // active cell (interior) / active-cell grid (exterior) is captured and host-resident before the
+    // player can turn around. Without it the cache fills only from the engine's FRUSTUM-limited
+    // classify set, so geometry behind the camera pops in (or lands as one build-time burst) on the
+    // first rotation after a load. purgeAll() calls this itself; call it directly for a load that
+    // does NOT purge — the very first evaluation, where there is no old cell to flush.
+    void armPostLoadWalk();
+
     // Refresh (or lazily capture) ONE entry straight off its live NiTriShape*. Only
     // valid for keys the engine drew THIS frame (classify visible set) — that is what
     // guarantees the pointer is alive. Refreshes exactly the per-frame-varying fields

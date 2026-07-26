@@ -3910,6 +3910,14 @@ namespace RenderProcess {
                 // Draining here resolves the keys to the OLD slots, while they still mean what
                 // they meant at purge time.
                 drainReleasedSlots();
+            } else {
+                // First load: no purge, so no post-load residency window either — yet this needs one
+                // as much as a transition does. Whatever the pre-seam loading-screen walks left in
+                // the cache (see cached= above), from HERE on the cache fills purely from the
+                // engine's frustum-limited classify set, so everything behind the camera that those
+                // walks missed arrives as first-sight keys on the first 180 turn. Arm the window
+                // without purging: there is no old cell to flush, only a new one to make resident.
+                MGE::GeometryCache::armPostLoadWalk();
             }
         }
         s_lastInteriorCell = interiorCell;
