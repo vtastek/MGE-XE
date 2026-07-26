@@ -31,6 +31,11 @@
 --   distance  how far in front of the player to place the orb.
 --   height    vertical offset from the player's feet, so it sits in the middle of the view.
 
+-- `count` > 1 is the CRASH repro, not just a stress knob. One orb kept the reverse
+-- texture-name map's insert traffic low enough to be survivable; six orbs' worth of flip books
+-- rehashing it under the produce worker, while MAIN reads it per captured DIP, is what turned a
+-- latent data race into an access violation (garbage `[tex] not found:` names in mgeXE.log were
+-- the corrupted reads). Keep a multi-orb run in the loop whenever this path changes.
 local defaults = {
     enabled = false,
     delay = 8,
@@ -38,6 +43,8 @@ local defaults = {
     radius = 400,
     distance = 220,
     height = 90,
+    count = 1,
+    spread = 160,
 }
 
 local cfg = mwse.loadConfig("SpellProbe", defaults)
@@ -160,15 +167,21 @@ end
 -- Spawn through the mod's OWN function, not a hand-rolled createReference: the hit form is a
 -- dynamic LGHT reference with a runtime-assigned radius, and reproducing that by hand would be a
 -- different object path from the one the bug was reported against.
-local function spawnHitForm()
+local function spawnHitForm(index)
     local fns = include("OperatorJack.EnhancedLight.functions")
     local player = tes3.player
     if not player then log("no player"); return nil end
 
+    -- Fan the orbs across the view rather than stacking them, so every one is separately
+    -- visible and separately drawn (a stack would z-fight into one effective draw).
+    local n = math.max(1, cfg.count)
+    local offset = (index - (n + 1) / 2) * cfg.spread
     local facing = player.orientation.z
+    local fwd = tes3vector3.new(-math.sin(facing), math.cos(facing), 0)
+    local right = tes3vector3.new(math.cos(facing), math.sin(facing), 0)
     local pos = tes3vector3.new(
-        player.position.x - math.sin(facing) * -cfg.distance,
-        player.position.y + math.cos(facing) * cfg.distance,
+        player.position.x + fwd.x * cfg.distance + right.x * offset,
+        player.position.y + fwd.y * cfg.distance + right.y * offset,
         player.position.z + cfg.height)
 
     local ref
@@ -186,15 +199,20 @@ local function spawnHitForm()
 end
 
 local function runProbe()
-    local ref = spawnHitForm()
+    local ref
+    for i = 1, math.max(1, cfg.count) do
+        local r = spawnHitForm(i)
+        if r then
+            ref = ref or r
+            log("spawned #%d '%s' at (%.0f,%.0f,%.0f) radius=%d", i, r.id,
+                r.position.x, r.position.y, r.position.z, cfg.radius)
+        end
+    end
     if not ref then
         log("SPAWN FAILED - nothing to observe")
         log("done sampling")
         return
     end
-
-    log("spawned '%s' at (%.0f,%.0f,%.0f) radius=%d", ref.id,
-        ref.position.x, ref.position.y, ref.position.z, cfg.radius)
 
     -- One frame later: the scene node exists but MW has not necessarily instantiated every
     -- controller target yet on the spawn frame itself.

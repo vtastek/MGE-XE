@@ -38,6 +38,8 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <mutex>
+#include <string>
 #include <unordered_set>
 #include <vector>
 
@@ -363,6 +365,28 @@ namespace MGE::GeometryCache {
         // client's captureAlphaDraw resolves rs.texture (a proxy realTexture pointer, identical
         // to getDX9Texture) -> the source name -> a bindless slot. insert_or_assign so a
         // recycled NiTriShape*/GPU-texture pointer self-corrects to the current name.
+        //
+        // TWO HAZARDS, both closed here, both of which only became reachable in practice once
+        // flip books started feeding this map hundreds of short-lived VFX textures:
+        //
+        // 1. THREADING. registerTextureName runs on the PRODUCE WORKER (ensureLive ->
+        //    extractMaterial / refreshAnimatedTexture) while resolveTextureName is read from MAIN
+        //    (captureAlphaDraw, every captured blended DIP). An insert that rehashes frees the
+        //    bucket array under main's find -> garbage `const char*` or an outright AV. This is
+        //    the exact race that corrupted the heap once already on the sibling residency map
+        //    (g_texSlot / g_texResidencyMx in renderprocess.cpp); this map was simply missed.
+        //    Uncontended, and reads are memoized per frame, so the lock is noise.
+        //
+        // 2. LIFETIME. The map keys on a GPU texture pointer but holds NO reference to the NI
+        //    texture that owns the name, and it is never erased. A VFX texture that goes away
+        //    (the spell ends) frees its SourceTexture::fileName, leaving a dangling value — and
+        //    its D3D pointer can then be recycled onto a new texture that still hashes to the
+        //    stale entry. So names are INTERNED into a set this module owns forever. std::
+        //    unordered_set is node-based, so an interned string's address is stable for the
+        //    process lifetime, which also makes the pointer identity that renderprocess's
+        //    SlotInfo cache keys on (baseNamePtr) exact rather than incidental.
+        std::mutex                                          g_texNameMx;
+        std::unordered_set<std::string>                     g_texNamePool;
         std::unordered_map<IDirect3DTexture9*, const char*> g_textureNameMap;
 
         void releaseEntry(CachedGeometry& e) {
@@ -389,6 +413,8 @@ namespace MGE::GeometryCache {
         // reverse map, so the Forge alpha-capture path can resolve rs.texture (a proxy
         // realTexture pointer) to a bindless slot by name. No-op for non-SourceTextures /
         // unloaded (no rendererData) textures. Cheap: one hash insert per material extract.
+        // The NI fileName is copied into the intern pool (see g_texNamePool) — never stored
+        // directly — because this map outlives the textures it names.
         void registerTextureName(NI::Texture* tex) {
             if (!tex) return;
             if (!tex->isInstanceOfType(NI::RTTIStaticPtr::NiSourceTexture)) return;
@@ -396,7 +422,14 @@ namespace MGE::GeometryCache {
             if (!d3d) return;
             const char* name = static_cast<NI::SourceTexture*>(tex)->fileName;
             if (!name) return;
-            g_textureNameMap.insert_or_assign(d3d, name);
+            std::lock_guard<std::mutex> lk(g_texNameMx);
+            const char* interned = g_texNamePool.emplace(name).first->c_str();
+            auto it = g_textureNameMap.find(d3d);
+            if (it == g_textureNameMap.end()) {
+                g_textureNameMap.emplace(d3d, interned);
+            } else if (it->second != interned) {
+                it->second = interned;   // GPU pointer recycled onto a different source
+            }
         }
 
         // Registration-only subtree sweep: map every NiGeometry's base-map GPU texture to its
@@ -3405,8 +3438,15 @@ namespace MGE::GeometryCache {
                         }
                     }
                 }
-                LOG::logline("-- [GEOM CACHE] frame=%llu cached=%zu skinned=%u named=%u nulltex=%u nullname=%u mapSize=%zu uploads/interval=%llu",
-                    g_frame, g_cache.size(), skinnedCount, namedTexCount, nullTexCount, nullNameCount, g_textureNameMap.size(), g_uploadedInterval);
+                size_t nameMapSize = 0, namePoolSize = 0;
+                {   // written by the produce worker — an unlocked .size() on a rehashing map is
+                    // the same UB this map was just fixed for; a diagnostic must not reintroduce it.
+                    std::lock_guard<std::mutex> lk(g_texNameMx);
+                    nameMapSize = g_textureNameMap.size();
+                    namePoolSize = g_texNamePool.size();
+                }
+                LOG::logline("-- [GEOM CACHE] frame=%llu cached=%zu skinned=%u named=%u nulltex=%u nullname=%u mapSize=%zu names=%zu uploads/interval=%llu",
+                    g_frame, g_cache.size(), skinnedCount, namedTexCount, nullTexCount, nullNameCount, nameMapSize, namePoolSize, g_uploadedInterval);
                 LOG::logline("-- [GEOM CACHE] nullbone hits/interval=%u parts/interval=%u sampleTex=%s mirrored=%u",
                     g_nullBoneHitsInterval, g_nullBonePartsInterval,
                     g_nullBoneSampleTex ? g_nullBoneSampleTex : "(none)", mirroredCount);
@@ -3720,6 +3760,10 @@ namespace MGE::GeometryCache {
 
     const char* resolveTextureName(IDirect3DTexture9* tex) {
         if (!tex) return nullptr;
+        // Called from MAIN (captureAlphaDraw) against a map the produce worker writes — see the
+        // g_texNameMx comment. The returned pointer is into the intern pool, which is never
+        // erased, so it stays valid after the lock is dropped.
+        std::lock_guard<std::mutex> lk(g_texNameMx);
         auto it = g_textureNameMap.find(tex);
         return (it != g_textureNameMap.end()) ? it->second : nullptr;
     }
