@@ -327,6 +327,8 @@ namespace MGE::GeometryCache {
         // in the same frame are never gated). -1 = unlimited, >= 0 = captures still allowed.
         int       g_windowCaptureBudget   = -1;
         uint32_t  g_windowCaptureDeferred = 0;   // first-sight keys the budget turned away this frame
+        uint32_t  g_deepDisabledSkips     = 0;   // DISABLED reference subtrees the deep walk refused
+        uint32_t  g_deepDisabledShapes    = 0;   // shapes under them (the refusal's collateral)
         int       g_postLoadFramesUsed    = 0;   // frames the current window has actually consumed
         // [postload-walk] observability, sampled at arm time and reported once when the window
         // closes (once per cell transition — not a hot path).
@@ -1561,6 +1563,45 @@ namespace MGE::GeometryCache {
             return LiveKind::None;
         }
 
+        // Is this node inside a DISABLED reference? MW has no separate "hidden" flag: disabling a
+        // reference IS app-culling its scene node, and the node stays parented under the cell root
+        // (TES3Reference.cpp:474 — disable() = sceneNode->setAppCulled(true), enable() clears it).
+        // So appCulled is overloaded: "MW is not drawing this right now" and "this object is not in
+        // the world at all" look identical from the graph. A normal walk never has to tell them
+        // apart — it stops at appCulled either way — but bypassCullDeep exists precisely to walk
+        // THROUGH app-cull, and it must not walk through this one. Quest props parked out of sight
+        // (the airborne TR flying chair, waiting for its script to enable it) would otherwise be
+        // captured, uploaded, and drawn by the host forever: MW draws nothing, the host draws a
+        // ghost, and eviction never disagrees because the node is still perfectly reachable.
+        // objectFlags @ 0x8, Disabled = bit 11 (MWSE/TES3Object.h:220, :102), read at the documented
+        // offset like referenceLiveKind above (SharedSE keeps TES3::Reference opaque).
+        bool referenceDisabled(const NI::ObjectNET* obj) {
+            const void* ref = obj->getTes3Reference(/*searchParents=*/true);
+            if (!ref) return false;
+            const uint32_t flags = *reinterpret_cast<const uint32_t*>(
+                static_cast<const char*>(ref) + 0x8);
+            return (flags & 0x800u) != 0;
+        }
+
+        // How many shapes would the deep walk have captured under this subtree? Bounds the
+        // collateral of the refusal above: "12 subtrees skipped" says nothing about whether the
+        // rule is too broad, but "12 subtrees, 47 shapes" does — and it is directly comparable to
+        // the residency numbers in the [postload-walk] receipt. Mirrors walk()'s own filters
+        // (collision containers hold no render geometry) so the count means the same thing the
+        // capture would have. Only ever called on a refused subtree, a handful per cell transition.
+        uint32_t countCapturableShapes(const NI::AVObject* av) {
+            if (!av) return 0;
+            if (av->isInstanceOfType(NI::RTTIStaticPtr::RootCollisionNode)
+             || av->isInstanceOfType(NI::RTTIStaticPtr::NiCollisionSwitch)) return 0;
+            if (av->isInstanceOfType(NI::RTTIStaticPtr::NiTriBasedGeom)) return 1;
+            if (!av->isInstanceOfType(NI::RTTIStaticPtr::NiNode)) return 0;
+            const auto* node = static_cast<const NI::Node*>(av);
+            uint32_t n = 0;
+            const auto count = node->children.getEndIndex();
+            for (size_t i = 0; i < count; ++i) n += countCapturableShapes(node->children.at(i).get());
+            return n;
+        }
+
         // Deliverable A source-mover: does this node — or an ancestor within its OWN object
         // hierarchy — carry an ACTIVE transform-animating controller? referenceLiveKind is a
         // coarse TES3 record-TYPE flag (every Activator/Door is "live"), but the shadow atlas
@@ -1845,7 +1886,31 @@ namespace MGE::GeometryCache {
         void walk(NI::AVObject* av, bool inCharacter = false, bool bypassCull = false,
                   bool bypassCullDeep = false) {
             if (!av) return;
-            if (!bypassCull && !bypassCullDeep && av->getAppCulled()) return;
+            const bool culled = av->getAppCulled();
+            if (culled && !bypassCull && !bypassCullDeep) return;
+            // A bypass is in effect and this node is app-culled — so ask WHY it is culled before
+            // un-hiding it. MW encodes "reference disabled" as app-cull on the reference's scene
+            // node (see referenceDisabled), which is not the off-screen case the bypass is for: a
+            // disabled object is not in the world, and capturing it hands the host a ghost that MW
+            // itself never draws. Only pay the reference lookup on nodes that are actually culled —
+            // a handful per deep walk, and zero on the normal path, which never gets here.
+            if (culled && bypassCullDeep && referenceDisabled(av)) {
+                ++g_deepDisabledSkips;
+                const uint32_t shapes = countCapturableShapes(av);
+                g_deepDisabledShapes += shapes;
+                // Name every refusal on the window's FIRST frame only (a dozen lines per cell
+                // transition, never on the hot path). This is the over-skip check: the names must
+                // be quest props, and the shape total must stay small next to the receipt's
+                // capture count. Without it "skipped 12" is unfalsifiable.
+                if (g_postLoadFramesUsed == 0) {
+                    const char* nm = av->getName();
+                    LOG::logline(">> [disabled-skip] '%s' shapes=%u at (%.0f,%.0f,%.0f)",
+                                 nm ? nm : "(unnamed)", shapes,
+                                 av->worldBoundOrigin.x, av->worldBoundOrigin.y,
+                                 av->worldBoundOrigin.z);
+                }
+                return;
+            }
             // bypassCullDeep un-hides app-culled subtrees to reach off-screen fixtures (post-purge
             // capture), but MW app-culls COLLISION geometry (RootCollisionNode / NiCollisionSwitch)
             // PERMANENTLY — not for being off-screen. Un-hiding it captures textureless collision
@@ -2543,6 +2608,8 @@ namespace MGE::GeometryCache {
             // Armed ONLY around the walk below and disarmed straight after: the sky and FP walks run
             // later in this same frame and must never be starved of captures by an exhausted budget.
             g_windowCaptureDeferred = 0;
+            g_deepDisabledSkips = 0;   // per-frame, so the receipt reports the cell's steady count
+            g_deepDisabledShapes = 0;
             g_windowCaptureBudget = kPostLoadCaptureBudget;
             if (g_captureInteriorCell) {
                 MGE_ZoneScopedN("GeomCache:postPurgeCapture");
@@ -2604,12 +2671,13 @@ namespace MGE::GeometryCache {
                                      && g_postLoadFramesUsed < kPostLoadWalkFramesMax;
             if (!stillCapturing && --g_postPurgeCaptureFrames == 0) {
                 LOG::logline(">> [postload-walk] %s done: frames=%d/%d cache=%u->%u captures=%u "
-                             "lastDeferred=%u gateR=%.0f",
+                             "lastDeferred=%u disabledSkipped=%u/%ushapes gateR=%.0f",
                              g_postLoadInterior ? "interior" : "exterior",
                              g_postLoadFramesUsed, g_postLoadFramesArmed,
                              g_postLoadCacheAtArm, (unsigned)g_cache.size(),
                              (unsigned)(g_captureTotal - g_postLoadCapturesAtArm),
-                             g_windowCaptureDeferred, g_gateRadius);
+                             g_windowCaptureDeferred, g_deepDisabledSkips, g_deepDisabledShapes,
+                             g_gateRadius);
             }
         }
         const double tLand = gcNowMs();
