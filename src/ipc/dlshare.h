@@ -270,6 +270,6 @@ public:
     static bool initLandscapeServer(IPC::Vec<IPC::LandscapeBuffers>& landscapeBuffers, ptr32<IDirect3DTexture9> texWorldColour);
     static bool setCurrentWorldSpace(const char* name);
     static void getVisibleMeshesCoarse(IPC::Vec<RenderMesh>& output, const ViewFrustum& viewFrustum, VisibleSetSort sort, DWORD setFlags);
-    static void getVisibleMeshes(IPC::Vec<RenderMesh>& output, const ViewFrustum& viewFrustum, const D3DXVECTOR4& viewSphere, VisibleSetSort sort, DWORD setFlags, const OcclusionFilter* occ = nullptr);
+    static void getVisibleMeshes(IPC::Vec<RenderMesh>& output, const ViewFrustum& viewFrustum, const D3DXVECTOR4& viewSphere, VisibleSetSort sort, DWORD setFlags);
     static void sortVisibleSet(IPC::Vec<RenderMesh>& vec, VisibleSetSort sort);
 };

@@ -212,7 +212,7 @@ void DistantLandShare::getVisibleMeshesCoarse(IPC::Vec<RenderMesh>& output, cons
     }
 }
 
-void DistantLandShare::getVisibleMeshes(IPC::Vec<RenderMesh>& output, const ViewFrustum& viewFrustum, const D3DXVECTOR4& viewSphere, VisibleSetSort sort, DWORD setFlags, const OcclusionFilter* occ) {
+void DistantLandShare::getVisibleMeshes(IPC::Vec<RenderMesh>& output, const ViewFrustum& viewFrustum, const D3DXVECTOR4& viewSphere, VisibleSetSort sort, DWORD setFlags) {
     VisibleSet<IpcServerVector> visibleSet((IpcServerVector(output))); // extra parens for vexing parse
 
     // if we're not sorting, we can do parallel reads and writes where the client processes elements as we add them
@@ -220,17 +220,14 @@ void DistantLandShare::getVisibleMeshes(IPC::Vec<RenderMesh>& output, const View
         visibleSet.StartWrite();
     }
 
-    // The occlusion filter (host-side cull) applies ONLY to distant statics —
-    // the sets fed through the AllRanges main-camera query. Grass/land are not
-    // occlusion-culled here (different geometry / not in the AllRanges path).
     if (setFlags & VIS_NEAR) {
-        currentWorldSpace->NearStatics->GetVisibleMeshes(viewFrustum, viewSphere, visibleSet, occ);
+        currentWorldSpace->NearStatics->GetVisibleMeshes(viewFrustum, viewSphere, visibleSet);
     }
     if (setFlags & VIS_FAR) {
-        currentWorldSpace->FarStatics->GetVisibleMeshes(viewFrustum, viewSphere, visibleSet, occ);
+        currentWorldSpace->FarStatics->GetVisibleMeshes(viewFrustum, viewSphere, visibleSet);
     }
     if (setFlags & VIS_VERY_FAR) {
-        currentWorldSpace->VeryFarStatics->GetVisibleMeshes(viewFrustum, viewSphere, visibleSet, occ);
+        currentWorldSpace->VeryFarStatics->GetVisibleMeshes(viewFrustum, viewSphere, visibleSet);
     }
     if (setFlags & VIS_GRASS) {
         currentWorldSpace->GrassStatics->GetVisibleMeshes(viewFrustum, viewSphere, visibleSet);
