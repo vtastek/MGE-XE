@@ -3748,11 +3748,21 @@ namespace RenderProcess {
                          g_hb.captured / g_hb.n,
                          g_hb.maxFeed, g_hb.maxDt,
                          g_hb.dt > 0.0 ? 1000.0 * g_hb.n / g_hb.dt : 0.0);
+            // white= is the count of captured-alpha DIPs in THIS window whose GPU texture had no
+            // registered source name and drew as bindless slot 0 (host default white — an opaque
+            // white quad). The [alpha-cap] log for it is capped at 20 per session, so only this
+            // delta can distinguish a one-off warm-up from a per-frame strobe (a flip-book VFX
+            // whose textures are not being registered fast enough shows up here and nowhere else).
+            static std::uint32_t s_capNoNamePrev = 0;
+            const std::uint32_t noNameWindow = g_capNoName - s_capNoNamePrev;
+            s_capNoNamePrev = g_capNoName;
             LOG::logline(">> [alpha-dedup] %u frames: drops/frame avg=%.2f min=%u max=%u "
-                         "(captured/frame=%.1f) -- fluctuating min!=max => dedup is eating live particle draws",
+                         "(captured/frame=%.1f) white=%u (%llu session) "
+                         "-- fluctuating min!=max => dedup is eating live particle draws",
                          g_hb.n, (double)g_capDedupWindow / g_hb.n,
                          g_capDedupDropsMin == ~0u ? 0u : g_capDedupDropsMin, g_capDedupDropsMax,
-                         g_hb.captured / g_hb.n);
+                         g_hb.captured / g_hb.n,
+                         noNameWindow, (unsigned long long)g_capNoName);
             g_capDedupWindow = 0; g_capDedupDropsMin = ~0u; g_capDedupDropsMax = 0;
             // Phase 0 build sub-probe: how much of build= is ensureLive (immovable live read)
             // vs emit (worker-offload candidate) vs tail. Gate: emit ≥ ~2ms ⇒ emit→worker worth it.

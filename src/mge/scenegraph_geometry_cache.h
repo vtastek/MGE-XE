@@ -185,6 +185,14 @@ namespace MGE::GeometryCache {
         float alphaRef;
         bool  alphaTest;
         bool  blendEnable;
+        // A NiFlipController is attached to this shape's NiTexturingProperty: the bound base
+        // NiSourceTexture is swapped over time (flip-book animation — fires, water, magic VFX;
+        // 135 controllers across 131 NIFs in a modded install, tools/nif-controller-census.csv).
+        // The swap never touches NiGeometryData, so revisionID does NOT move and the material
+        // re-extract that every other texture change rides is never triggered. Entries carrying
+        // this flag get their bound texture re-read each frame they are visited
+        // (refreshAnimatedTexture); everything else pays nothing.
+        bool  texAnimated;
         // NiStencilProperty DRAW_BOTH: the shape is authored two-sided (window panes,
         // waterfalls, thin cloth) and MW draws it with culling OFF. Single-sided shapes
         // (no stencil / not DRAW_BOTH) MW draws CULL_BACK — the Forge alpha pass must

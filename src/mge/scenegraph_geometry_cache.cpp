@@ -585,6 +585,7 @@ namespace MGE::GeometryCache {
             e.alphaRef    = 0.0f;
             e.alphaTest   = false;
             e.blendEnable = false;
+            e.texAnimated = false;
             e.twoSided    = false;   // single-sided (CULL_BACK) unless NiStencilProperty DRAW_BOTH
             // SK1 sky: default to the standard transparency blend; overwritten below from the
             // NiAlphaProperty flags when present. Only consumed for isSky entries (the Forge
@@ -652,6 +653,21 @@ namespace MGE::GeometryCache {
                         registerTextureName(tex);   // AT3 reverse-map populate (base map)
                     }
                 }
+                // Flip-book detection. The controller hangs off the TEXTURING PROPERTY (not the
+                // geometry, where findUVAnimController looks), and advancing it rebinds a
+                // different NiSourceTexture without touching NiGeometryData — so the revisionID
+                // rule that re-extracts every other texture change never fires here. Both
+                // consumers then go stale: the reverse name map keeps the capture-time texture
+                // (so an engine-drawn flip frame reaches captureAlphaDraw unnamed and falls back
+                // to bindless slot 0 = host default WHITE), and a host-owned cached draw keeps
+                // rendering the capture-time frame forever. Flag it; the refresh happens on the
+                // per-frame visit paths.
+                for (const NI::TimeController* c = ps->texture->controllers; c; c = c->nextController) {
+                    if (c->isOfType(NI::RTTIStaticPtr::NiFlipController)) {
+                        e.texAnimated = true;
+                        break;
+                    }
+                }
                 // Multi-map siblings (dark/detail/glow) on the same property — the
                 // PPL fixed-function blend the cache color pass reconstructs. Store
                 // the D3D9 texture and the UV set it samples (its true texCoordSet,
@@ -702,6 +718,38 @@ namespace MGE::GeometryCache {
             // captured base texture name. Materials are captured once per cache entry, so
             // the gain is derived here and applied per draw by emissiveForDraw().
             computeEmissiveGain(e, geom);
+        }
+
+        // Per-frame refresh for e.texAnimated entries (NiFlipController flip books). Deliberately
+        // NOT a full extractMaterial: that re-derives the emissive gain, which scans the whole
+        // point-light snapshot and re-integrates the shape's triangle area — neither of which can
+        // change when a flip controller merely advances a frame, and this runs every frame the
+        // shape is drawn. Only the bound BASE map moves; the dark/detail/glow siblings and every
+        // property flag are untouched by the controller.
+        //
+        // Both stale consumers are fixed by the two writes below:
+        //   - registerTextureName  -> captureAlphaDraw can resolve this frame's GPU texture to its
+        //                             source name, instead of falling back to bindless slot 0
+        //                             (host default white — a fully opaque WHITE QUAD, which is
+        //                             what a strobing flip book looks like on screen);
+        //   - textureName/d3dTexture -> a host-OWNED cached draw re-resolves its bindless slot
+        //                             (SlotInfo keys on the name POINTER) and so animates instead
+        //                             of freezing on the capture-time frame.
+        void refreshAnimatedTexture(CachedGeometry& e, NI::TriBasedGeometry* geom) {
+            auto* ps = reinterpret_cast<NI::PropertyState*>(geom->propertyState);
+            if (!ps || !ps->texture) return;
+            const auto* baseMap = ps->texture->getBaseMap();
+            if (!baseMap || !baseMap->texture) return;
+            auto* tex = baseMap->texture.get();
+            if (!tex->isInstanceOfType(NI::RTTIStaticPtr::NiSourceTexture)) return;
+            IDirect3DTexture9* d3d = getDX9Texture(tex);
+            // Null = MW has not uploaded this flip frame yet (rendererData still absent). Keep the
+            // previous frame's texture rather than blanking the entry — the next visit retries,
+            // and a one-frame-stale flip frame is invisible next to a white quad.
+            if (!d3d || d3d == e.d3dTexture) return;
+            e.textureName = static_cast<NI::SourceTexture*>(tex)->fileName;
+            e.d3dTexture  = d3d;
+            registerTextureName(tex);
         }
 
         // Vertex layout matching MorrowindVertIn (depth/shadow VS input).
@@ -1835,6 +1883,10 @@ namespace MGE::GeometryCache {
                     } else if ((data->revisionID != e.revisionID) || e.isSkinned) {
                         extractMaterial(e, geom);
                         uploadEntry(e, geom, data, key);
+                    } else if (e.texAnimated) {
+                        // Flip book: the bound texture can differ from last frame's with no
+                        // revisionID movement at all (see refreshAnimatedTexture).
+                        refreshAnimatedTexture(e, geom);
                     } else if (e.d3dTexture == nullptr && e.textureName != nullptr) {
                         // UNRESOLVED-TEXTURE RETRY. getDX9Texture returns null while MW has not yet
                         // uploaded the NiSourceTexture (rendererData null) — the texture streams in
@@ -3581,6 +3633,12 @@ namespace MGE::GeometryCache {
                 uploadEntry(e, geom, data, key);
                 g_walkingLandscape = false;
                 reclassified = true;
+            } else if (e.texAnimated) {
+                // Flip book, same rule as the walk's cached branch. This copy is the one that
+                // matters in normal play: under the Forge seam the refresh WALK does not run, so
+                // ensureLive off the engine-classified visible set is the only per-frame visit a
+                // cached shape gets.
+                refreshAnimatedTexture(e, geom);
             }
             float newTransform[16];
             buildD3DTransform(newTransform, geom);
