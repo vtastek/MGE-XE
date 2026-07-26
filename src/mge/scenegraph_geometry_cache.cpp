@@ -413,6 +413,26 @@ namespace MGE::GeometryCache {
         // AT3: register a confirmed-NiSourceTexture's GPU texture -> source fileName in the
         // reverse map, so the Forge alpha-capture path can resolve rs.texture (a proxy
         // realTexture pointer) to a bindless slot by name. No-op for non-SourceTextures /
+        // Hand a flip controller's whole frame list to the texture-residency layer, which turns it
+        // into one gFlipArrays Texture2DArray (see RenderProcess::registerFlipBook). Only the
+        // NAMES cross over — the host loads the DDS itself — so this never depends on MW having
+        // bound a given frame, and it runs at most once per distinct book.
+        void registerFlipBookOf(const NI::FlipController* fc) {
+            if (!fc) return;
+            const size_t n = fc->textures.getEndIndex();
+            if (n < 2 || n > IPC::kMaxFlipLayers) return;   // a 1-frame "book" is just a texture
+            std::vector<const char*> names;
+            names.reserve(n);
+            for (size_t i = 0; i < n; ++i) {
+                NI::Texture* t = fc->textures.at(i).get();
+                if (!t || !t->isInstanceOfType(NI::RTTIStaticPtr::NiSourceTexture)) return;
+                const char* fn = static_cast<NI::SourceTexture*>(t)->fileName;
+                if (!fn || !*fn) return;                   // incomplete list — leave it per-slot
+                names.push_back(fn);
+            }
+            RenderProcess::registerFlipBook(names.data(), (uint32_t)names.size());
+        }
+
         // unloaded (no rendererData) textures. Cheap: one hash insert per material extract.
         // The NI fileName is copied into the intern pool (see g_texNamePool) — never stored
         // directly — because this map outlives the textures it names.
@@ -699,10 +719,15 @@ namespace MGE::GeometryCache {
                 for (const NI::TimeController* c = ps->texture->controllers; c; c = c->nextController) {
                     if (c->isOfType(NI::RTTIStaticPtr::NiFlipController)) {
                         e.texAnimated = true;
-                        // The controller also carries the WHOLE book (FlipController::textures,
-                        // every source already named and D3D-resident at mesh load) plus the live
-                        // currentIndex — measured 2026-07-26, so a Texture2DArray can be built for
-                        // it with no modder-side change. See tasks/forge-flipbook-array.md.
+                        // The controller carries the WHOLE book, and every source is already named
+                        // at mesh load — so the frame list can be handed straight to the host as
+                        // ONE Texture2DArray with nothing required of the mesh author. Doing it
+                        // here (rather than per drawn frame) is what collapses a 300-frame book
+                        // from 300 bindless slots to one descriptor. Idempotent per book; a refusal
+                        // just leaves it on the per-slot path that refreshAnimatedTexture drives.
+                        if (RenderProcess::wantsGeometryCapture()) {
+                            registerFlipBookOf(static_cast<const NI::FlipController*>(c));
+                        }
                         break;
                     }
                 }

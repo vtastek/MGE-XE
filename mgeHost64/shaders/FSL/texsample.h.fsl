@@ -25,6 +25,35 @@
 #define TEX_WRAP_S_CLAMP_T  2u
 #define TEX_WRAP_S_WRAP_T   3u
 
+// --- Flip-book slices (NiFlipController) ---------------------------------------------------------
+// A flip book claimed one bindless gTextures slot PER FRAME; a 300-frame book was a third of the
+// whole residency. Books are uniform by construction (same format+size every frame), so they live
+// in gFlipArrays: a descriptor-array of Texture2DArrays, one LAYER per frame. The slot encoding is
+// shared verbatim with IPC::makeFlipSlot / the wire / packTexAlpha — one representation end to end,
+// which is why no path needs an extra per-draw lane to say "this one is an array".
+//   bit 15 = flip-array slice   bits 11..14 = bucket   bits 0..10 = layer
+// Plain slots are < MAX_TEXTURES (880), so they can never collide with the flag.
+#define FLIP_SLOT_FLAG   0x8000u
+#define FLIP_LAYER_MASK  0x7FFu
+bool isFlipSlot(uint texIdx) { return (texIdx & FLIP_SLOT_FLAG) != 0u; }
+
+float4 sampleFlip(uint texIdx, uint clampMode, float2 uv, bool lowAF)
+{
+    const uint bucket = (texIdx >> 11u) & (MAX_FLIP_BUCKETS - 1u);
+    const float3 uvw  = float3(uv, (float)(texIdx & FLIP_LAYER_MASK));
+    if (lowAF)
+    {
+        if (clampMode == TEX_CLAMP_S_CLAMP_T) { return SampleTex2DArray(gFlipArrays[bucket], gSampler2xClampClamp, uvw); }
+        if (clampMode == TEX_CLAMP_S_WRAP_T)  { return SampleTex2DArray(gFlipArrays[bucket], gSampler2xClampWrap,  uvw); }
+        if (clampMode == TEX_WRAP_S_CLAMP_T)  { return SampleTex2DArray(gFlipArrays[bucket], gSampler2xWrapClamp,  uvw); }
+        return SampleTex2DArray(gFlipArrays[bucket], gSampler2xWrapWrap, uvw);
+    }
+    if (clampMode == TEX_CLAMP_S_CLAMP_T) { return SampleTex2DArray(gFlipArrays[bucket], gSamplerAnisoClampClamp, uvw); }
+    if (clampMode == TEX_CLAMP_S_WRAP_T)  { return SampleTex2DArray(gFlipArrays[bucket], gSamplerAnisoClampWrap,  uvw); }
+    if (clampMode == TEX_WRAP_S_CLAMP_T)  { return SampleTex2DArray(gFlipArrays[bucket], gSamplerAnisoWrapClamp,  uvw); }
+    return SampleTex2DArray(gFlipArrays[bucket], gSamplerAnisotropic, uvw);
+}
+
 // lowAF: sample this draw at 2x anisotropy instead of 8x. The host sets it for ALPHA-TEST and
 // ALPHA-BLENDED draws only (gFrameData.alphaParams.y, live A/B toggle) — those are the overdraw-
 // and fetch-heavy part of the frame (foliage, grates, banners, glass) and they gain the least from
@@ -32,6 +61,10 @@
 // mode and the AF level are uniform per draw, so this whole chain is a uniform branch: free.
 float4 sampleBase(uint texIdx, uint clampMode, float2 uv, bool lowAF)
 {
+    // Flip books route to gFlipArrays. texIdx is a FLAT per-draw lane, so this is as uniform as the
+    // clamp/AF branches below and costs the same: nothing. Decoding ONCE here is the point — a
+    // per-shader copy is how the wrap sampler survived in seven frags.
+    if (isFlipSlot(texIdx)) { return sampleFlip(texIdx, clampMode, uv, lowAF); }
     if (lowAF)
     {
         if (clampMode == TEX_CLAMP_S_CLAMP_T) { return SampleTex2D(gTextures[texIdx], gSampler2xClampClamp, uv); }

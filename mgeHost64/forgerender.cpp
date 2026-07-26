@@ -1233,9 +1233,14 @@ namespace {
         Texture*       pDefaultWhite = nullptr;    // gTextures[0] / fill for unloaded slots
         Texture*       pTextures[MAX_TEXTURES] = {}; // bindless base maps; unloaded == pDefaultWhite
         uint32_t       texHigh = 0;                // highest assigned slot + 1 (for teardown)
-        DescriptorSet* pPersistentSet = nullptr;   // bindless gTextures[] + gStaticsArrays (bound once per frame)
+        DescriptorSet* pPersistentSet = nullptr;   // bindless gTextures[] + gStaticsArrays + gFlipArrays
         Texture*       pStaticsWhiteArray = nullptr; // 4x4x2 white Tex2DArray; fills every gStaticsArrays slot until the
                                                      // distant-statics buckets build (and stays in the unused tail).
+        // NiFlipController flip books: one Texture2DArray per (format, size) bucket, one layer per
+        // book frame. Created on demand from the FIRST slice that arrives for a bucket (every slice
+        // carries the array's total size), so there is no declaration record and no ordering
+        // requirement. Unbuilt buckets keep pointing at pStaticsWhiteArray.
+        Texture*       pFlipArrays[MAX_FLIP_BUCKETS] = {};
 
         // --- M-Skinning: GPU palette skinning path -----------------------------------
         // Reuses the SAME SrtData/default.rootsig as the static path: gBatch.worlds[1024]
@@ -2342,6 +2347,22 @@ namespace {
     // ref); TRANSLUCENT ones (smoke, ghosts, soft glass) never do.
     enum : uint8_t { kTexAlphaOpaque = 0, kTexAlphaMask = 1, kTexAlphaTranslucent = 2 };
     uint8_t g_texAlphaKind[MAX_TEXTURES] = {};
+    // Same classification for flip-book slices, which have no gTextures slot to key on. One vector
+    // per bucket, sized when the bucket's array is created (uploadFlipSlice).
+    std::vector<uint8_t> g_flipAlphaKind[MAX_FLIP_BUCKETS];
+
+    // Alpha class for ANY encoded texIndex — plain bindless slot or flip-array slice. Every caller
+    // must go through this rather than subscripting g_texAlphaKind directly: a flip slot has bit 15
+    // set, so as a raw index it runs off the end of the array.
+    inline uint8_t texAlphaKindOf(uint32_t texIndex) {
+        if (IPC::isFlipSlot(texIndex)) {
+            const uint32_t b = IPC::flipSlotBucket(texIndex), l = IPC::flipSlotLayer(texIndex);
+            if (b >= MAX_FLIP_BUCKETS) { return kTexAlphaTranslucent; }
+            const auto& v = g_flipAlphaKind[b];
+            return l < v.size() ? v[l] : (uint8_t)kTexAlphaTranslucent;
+        }
+        return texIndex < MAX_TEXTURES ? g_texAlphaKind[texIndex] : (uint8_t)kTexAlphaOpaque;
+    }
 
     // Static per-instance VB stride (uint32 slots). Tier 2b grew it past the old uint2:
     //   [0] DrawIndex (identity, set once)   [1] TexAlpha (tex|alphaRef|vColSource, per-frame)
@@ -2373,8 +2394,13 @@ namespace {
 
     inline uint32_t packTexAlpha(uint32_t texIndex, float alphaRef, uint32_t vColSource = 0u,
                                  uint32_t clampMode = 3u, bool twoSided = false) {
-        const uint32_t tex = texIndex < kMaxTextures ? texIndex : 0u;
-        g_texSeenBits[tex >> 5] |= (1u << (tex & 31u));
+        // A flip-book slice is an ENCODED slot (bit 15 + bucket + layer), not an index into
+        // gTextures — it must pass through untouched, and it must not be range-clamped to 0 (that
+        // would draw every animated frame white) nor counted in g_texSeenBits (whose bit index is
+        // a gTextures slot; 0x8000 >> 5 runs off the end).
+        const bool flip = IPC::isFlipSlot(texIndex);
+        const uint32_t tex = flip ? texIndex : (texIndex < kMaxTextures ? texIndex : 0u);
+        if (!flip) { g_texSeenBits[tex >> 5] |= (1u << (tex & 31u)); }
         float r = alphaRef < 0.0f ? 0.0f : (alphaRef > 1.0f ? 1.0f : alphaRef);
         const uint32_t aref = (uint32_t)(r * 255.0f + 0.5f) & 0xFFu;
         // Bit 28 = two-sided (DRAW_BOTH) flag: opaque.vert forwards it as ClampMode bit2, alpha.frag
@@ -3755,6 +3781,18 @@ namespace {
                 sd.mCount = MAX_STATICS_BUCKETS;
                 sd.ppTextures = whites.data();
                 updateDescriptorSet(R, 0, g_live.pPersistentSet, 1, &sd);
+
+                // gFlipArrays shares the same table and the same white placeholder — no descriptor
+                // in the Persistent table may be left uninitialized, and a book that never loads
+                // (or a bucket index the client never uses) must sample white, not garbage.
+                for (uint32_t i = 0; i < MAX_FLIP_BUCKETS; ++i) {
+                    g_live.pFlipArrays[i] = g_live.pStaticsWhiteArray;
+                }
+                DescriptorData fd = {};
+                fd.mIndex = SRT_RES_IDX(SrtData, Persistent, gFlipArrays);
+                fd.mCount = MAX_FLIP_BUCKETS;
+                fd.ppTextures = g_live.pFlipArrays;
+                updateDescriptorSet(R, 0, g_live.pPersistentSet, 1, &fd);
             }
         }
 
@@ -11462,8 +11500,7 @@ namespace ForgeRender {
                         } else if (it.matAlpha <= 0.5f) {
                             clsR = 1.0f; clsG = 0.4f; clsB = 0.0f;         // ORANGE: fading
                         } else if (it.alphaRef > 0.0f || g_shadowBlendRef > 0.0f
-                                   || (it.texIndex < kMaxTextures
-                                       && g_texAlphaKind[it.texIndex] == kTexAlphaMask)) {
+                                   || texAlphaKindOf(it.texIndex) == kTexAlphaMask) {
                             clsR = 0.0f; clsG = 1.0f; clsB = 0.0f;         // GREEN: caster registered
                             float refUse = (it.alphaRef > g_shadowBlendRef) ? it.alphaRef : g_shadowBlendRef;
                             if (refUse <= 0.0f) { refUse = 0.5f; }   // MASK-only path with the knob at 0
@@ -12963,6 +13000,101 @@ namespace ForgeRender {
         return kTexAlphaTranslucent;
     }
 
+    // Per-bucket flip-array state. `slices` is what the client declared (every slice of a bucket
+    // carries it); fmt/w/h/mips come from the first slice, and later slices that disagree are
+    // dropped rather than corrupting the array — the client guarantees uniformity, so a mismatch
+    // means a bug on that side and must be loud, not silent.
+    struct FlipBucket {
+        TinyImageFormat fmt = TinyImageFormat_UNDEFINED;
+        uint32_t w = 0, h = 0, mips = 0, slices = 0;
+        uint32_t filled = 0;
+    };
+    FlipBucket g_flipBuckets[MAX_FLIP_BUCKETS];
+
+    // Upload one flip-book frame as a layer of gFlipArrays[bucket], creating the array on the
+    // first slice seen for that bucket. Returns true if the slice landed.
+    bool uploadFlipSlice(Renderer* R, const IPC::TexUploadWire& hdr, const uint8_t* dds) {
+        const uint32_t bucket = IPC::flipSlotBucket(hdr.slot);
+        const uint32_t layer  = IPC::flipSlotLayer(hdr.slot);
+        if (bucket >= MAX_FLIP_BUCKETS) { return false; }
+        DdsInfo info = parseDds(dds, hdr.byteLen);
+        if (!info.ok) {
+            LOGF(eWARNING, "[forge] flip bucket %u layer %u: unsupported DDS (stays white)", bucket, layer);
+            return false;
+        }
+        FlipBucket& fb = g_flipBuckets[bucket];
+
+        if (g_live.pFlipArrays[bucket] == g_live.pStaticsWhiteArray) {
+            // First slice for this bucket: create the whole array from what the client declared.
+            if (hdr.arraySize == 0 || hdr.arraySize > IPC::kMaxFlipLayers) {
+                LOGF(eWARNING, "[forge] flip bucket %u: bad arraySize %u — dropped", bucket, hdr.arraySize);
+                return false;
+            }
+            Texture* tex = nullptr;
+            TextureDesc td = {};
+            td.mWidth = info.width; td.mHeight = info.height; td.mDepth = 1;
+            td.mArraySize = hdr.arraySize; td.mMipLevels = info.mipLevels;
+            td.mSampleCount = SAMPLE_COUNT_1;
+            td.mFormat = info.fmt;
+            td.mStartState = RESOURCE_STATE_SHADER_RESOURCE;
+            td.mDescriptors = DESCRIPTOR_TYPE_TEXTURE;
+            td.pName = "mwFlipBook";
+            TextureLoadDesc tld = {};
+            tld.ppTexture = &tex;
+            tld.pDesc = &td;
+            addResource(&tld, nullptr);
+            waitForAllResourceLoads();
+            if (!tex) { return false; }
+
+            fb.fmt = info.fmt; fb.w = info.width; fb.h = info.height;
+            fb.mips = info.mipLevels; fb.slices = hdr.arraySize; fb.filled = 0;
+            g_flipAlphaKind[bucket].assign(hdr.arraySize, (uint8_t)kTexAlphaTranslucent);
+            g_live.pFlipArrays[bucket] = tex;
+
+            DescriptorData dd = {};   // rebind just this bucket's descriptor
+            dd.mIndex = SRT_RES_IDX(SrtData, Persistent, gFlipArrays);
+            dd.mArrayOffset = bucket;
+            dd.mCount = 1;
+            dd.ppTextures = &g_live.pFlipArrays[bucket];
+            updateDescriptorSet(R, 0, g_live.pPersistentSet, 1, &dd);
+            LOGF(eINFO, "[forge] flip bucket %u created: %ux%u mips=%u slices=%u",
+                 bucket, info.width, info.height, info.mipLevels, hdr.arraySize);
+        }
+
+        // A slice that disagrees with its bucket cannot be uploaded into it — the subresource
+        // layout would not match. The client's uniformity check is what should prevent this.
+        if (info.fmt != fb.fmt || info.width != fb.w || info.height != fb.h || layer >= fb.slices) {
+            LOGF(eWARNING, "[forge] flip bucket %u layer %u: slice mismatch (%ux%u fmt=%d vs %ux%u fmt=%d) — dropped",
+                 bucket, layer, info.width, info.height, (int)info.fmt, fb.w, fb.h, (int)fb.fmt);
+            return false;
+        }
+
+        const uint32_t mips = info.mipLevels < fb.mips ? info.mipLevels : fb.mips;
+        const uint8_t* src = dds + info.dataOffset;
+        const uint8_t* ddsEnd = dds + hdr.byteLen;
+        TextureUpdateDesc upd = {};
+        upd.pTexture = g_live.pFlipArrays[bucket];
+        upd.mBaseMipLevel = 0; upd.mMipLevels = mips;
+        upd.mBaseArrayLayer = layer; upd.mLayerCount = 1;
+        upd.mCurrentState = RESOURCE_STATE_SHADER_RESOURCE;
+        beginUpdateResource(&upd);
+        for (uint32_t m = 0; m < mips; ++m) {
+            TextureSubresourceUpdate s = upd.getSubresourceUpdateDesc(m, layer);
+            const uint32_t mipBytes = s.mRowCount * s.mSrcRowStride;
+            if (src + mipBytes > ddsEnd) { break; }   // truncated; stop copying mips
+            for (uint32_t row = 0; row < s.mRowCount; ++row) {
+                std::memcpy(s.pMappedData + (size_t)row * s.mDstRowStride,
+                            src + (size_t)row * s.mSrcRowStride, s.mSrcRowStride);
+            }
+            src += mipBytes;
+        }
+        endUpdateResource(&upd);
+
+        g_flipAlphaKind[bucket][layer] = classifyDdsAlpha(dds, hdr.byteLen, info);
+        ++fb.filled;
+        return true;
+    }
+
     // Parse [TexUploadWire][dds bytes]* and decode each into gTextures[slot]. slot 0 is reserved
     // (default white). Returns the number of textures successfully built. No-op if Forge/the
     // opaque path isn't live yet (textures arrive after the first scene builds the PerFrame set).
@@ -12990,6 +13122,11 @@ namespace ForgeRender {
             if (ddsEnd > end) { break; }
             p = ddsEnd;   // advance regardless of whether this one decodes
 
+            // Flip-book slice: goes into gFlipArrays[bucket] layer N, not gTextures[slot].
+            if (IPC::isFlipSlot(hdr.slot)) {
+                if (uploadFlipSlice(R, hdr, dds)) { ++built; }
+                continue;
+            }
             if (hdr.slot == 0 || hdr.slot >= kMaxTextures) { continue; }   // 0 reserved; OOB dropped
             DdsInfo info = parseDds(dds, hdr.byteLen);
             if (!info.ok) {

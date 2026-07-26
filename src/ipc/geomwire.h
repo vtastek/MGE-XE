@@ -174,17 +174,58 @@ namespace IPC {
     struct TexUploadWire {
         std::uint32_t slot;
         std::uint32_t byteLen;    // length of the DDS blob that follows inline
+        // FLIP-BOOK ARRAY SLICES ONLY (slot & kFlipSlotFlag): total slice count of the
+        // Texture2DArray this slice belongs to. Every slice of a bucket carries the SAME value, so
+        // the host can create the array from whichever slice arrives first and validate the rest —
+        // no separate declaration record, no ordering requirement, no multi-batch state machine.
+        // 0 for ordinary 2D uploads.
+        std::uint32_t arraySize;
     };
 
     // Bindless texture-array capacity (client residency cap == host gTextures[] size; the host
     // mirrors this as MAX_TEXTURES in opaque.srt.h / kMaxTextures in forgerender.cpp).
     // MUST stay in lock-step with host MAX_TEXTURES. The Persistent descriptor TABLE (gTextures +
     // gStaticsArrays) crashes Forge's addDescriptorSet >1024 entries on this stack (2048 faults in
-    // consume_descriptor_handles; 1024 verified OK). gTextures(896) + gStaticsArrays(128) = 1024,
-    // exactly the proven-OK boundary. Distant STATICS no longer live in gTextures — they moved to
-    // gStaticsArrays (descriptor-array of Texture2DArrays, bucketed by format/size; see
-    // forgerender.cpp). Only the 3 distant-land ATLAS slots remain host-reserved in gTextures.
-    constexpr std::uint32_t kMaxTextures = 896;
+    // consume_descriptor_handles; 1024 verified OK). gTextures(880) + gStaticsArrays(128) +
+    // gFlipArrays(16) = 1024, exactly the proven-OK boundary. Distant STATICS no longer live in
+    // gTextures — they moved to gStaticsArrays (descriptor-array of Texture2DArrays, bucketed by
+    // format/size; see forgerender.cpp). Only the 3 distant-land ATLAS slots remain host-reserved
+    // in gTextures. gFlipArrays cost 16 of the former 896: see kMaxFlipBuckets.
+    constexpr std::uint32_t kMaxTextures = 880;
+
+    // ---- Flip-book texture arrays -----------------------------------------------------------
+    // A NiFlipController flip book used to claim ONE BINDLESS SLOT PER FRAME — Enhanced Light's
+    // magelight is 300 frames, i.e. a third of the whole residency for one spell, and a rich scene
+    // then sat at 888/888 recycling. A book is uniform by construction (every frame the same format
+    // and size), which makes it the ideal Texture2DArray: one descriptor for the whole book.
+    //
+    // Same shape as gStaticsArrays: a descriptor-array of Texture2DArrays bucketed by (format,
+    // width, height); books sharing a bucket occupy disjoint layer ranges. 16 buckets is generous —
+    // a bucket is a FORMAT+SIZE class, not a book — and books that overflow it (or that aren't
+    // uniform) simply stay on the per-slot path, which still works.
+    constexpr std::uint32_t kMaxFlipBuckets = 16;
+    constexpr std::uint32_t kMaxFlipLayers  = 2048;   // per bucket; also the 11-bit field limit
+
+    // The ENCODING is shared by the wire slot, the client's g_texSlot values, the per-draw
+    // packTexAlpha field and the shader — ONE representation end to end, which is why nothing
+    // between them needs a second lookup or an extra per-draw lane. It has to survive
+    // packTexAlpha's 16-bit texIndex field, hence the tight layout:
+    //   bit 15      : set = this is a flip-array slice, not a gTextures[] slot
+    //   bits 11..14 : bucket  (0..kMaxFlipBuckets-1)
+    //   bits 0..10  : layer   (0..kMaxFlipLayers-1)
+    // Plain slots are < kMaxTextures (880) so they never collide with the flag.
+    constexpr std::uint32_t kFlipSlotFlag   = 0x8000u;
+    constexpr std::uint32_t kFlipBucketShift = 11u;
+    constexpr std::uint32_t kFlipLayerMask   = 0x7FFu;
+
+    constexpr std::uint32_t makeFlipSlot(std::uint32_t bucket, std::uint32_t layer) {
+        return kFlipSlotFlag | (bucket << kFlipBucketShift) | (layer & kFlipLayerMask);
+    }
+    constexpr bool          isFlipSlot(std::uint32_t s)     { return (s & kFlipSlotFlag) != 0; }
+    constexpr std::uint32_t flipSlotBucket(std::uint32_t s) {
+        return (s >> kFlipBucketShift) & (kMaxFlipBuckets - 1u);
+    }
+    constexpr std::uint32_t flipSlotLayer(std::uint32_t s)  { return s & kFlipLayerMask; }
 
     // Host-owned distant LAND atlas reserves the TOP kDlReserve slots of the shared bindless
     // gTextures[] array (base/normal/detail — 3 slots; the rest is headroom). Distant statics left

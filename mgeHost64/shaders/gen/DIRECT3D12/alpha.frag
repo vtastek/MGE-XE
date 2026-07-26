@@ -1069,7 +1069,7 @@ STRUCT(ShadowMaskParams)
 #line 159
 };
 #line 21 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
-#line 35 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+#line 42 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
 STRUCT(FrameData)
 {
     float4x4 viewProj;
@@ -1151,15 +1151,15 @@ STRUCT(FrameData)
 
 
     float4 alphaShadowParams;
-#line 116
+#line 123
 };
 
 STRUCT(BatchData)
 {
     float4x4 worlds[ 1024 ];
-#line 121
+#line 128
 };
-#line 142 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+#line 149 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
 STRUCT(LightData)
 {
     float4 lightParams;
@@ -1175,7 +1175,7 @@ STRUCT(LightData)
 
     float4 froxelDimsNear;
     float4 froxelZNear;
-#line 157
+#line 164
 };
 
         CBUFFER(FrameData) gFrameData :  register(b0,space1);
@@ -1256,18 +1256,50 @@ STRUCT(LightData)
 
 
         CBUFFER(LightData) gLights :  register(b0,space3);
-#line 253 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
-        Tex2D(float4) gTextures[ 896 ] :  register(t0,space0);
+#line 260 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+        Tex2D(float4) gTextures[ 880 ] :  register(t0,space0);
 
 
 
-        Tex2DArray(float4) gStaticsArrays[ 128 ] :  register(t896,space0);
+        Tex2DArray(float4) gStaticsArrays[ 128 ] :  register(t880,space0);
+
+
+
+        Tex2DArray(float4) gFlipArrays[ 16 ] :  register(t1008,space0);
         CBUFFER(BatchData) gBatch :  register(b0,space2);
 #line 17 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/alpha.frag.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/texsample.h.fsl"
-#line 33 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/texsample.h.fsl"
+#line 38 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/texsample.h.fsl"
+bool isFlipSlot(uint texIdx) { return (texIdx &  0x8000u ) != 0u; }
+
+float4 sampleFlip(uint texIdx, uint clampMode, float2 uv, bool lowAF)
+{
+    const uint bucket = (texIdx >> 11u) & ( 16  - 1u);
+    const float3 uvw = float3(uv, (float)(texIdx &  0x7FFu ));
+    if (lowAF)
+    {
+        if (clampMode ==  0u ) { return SampleTex2DArray(gFlipArrays[bucket], gSampler2xClampClamp, uvw); }
+        if (clampMode ==  1u ) { return SampleTex2DArray(gFlipArrays[bucket], gSampler2xClampWrap, uvw); }
+        if (clampMode ==  2u ) { return SampleTex2DArray(gFlipArrays[bucket], gSampler2xWrapClamp, uvw); }
+        return SampleTex2DArray(gFlipArrays[bucket], gSampler2xWrapWrap, uvw);
+    }
+    if (clampMode ==  0u ) { return SampleTex2DArray(gFlipArrays[bucket], gSamplerAnisoClampClamp, uvw); }
+    if (clampMode ==  1u ) { return SampleTex2DArray(gFlipArrays[bucket], gSamplerAnisoClampWrap, uvw); }
+    if (clampMode ==  2u ) { return SampleTex2DArray(gFlipArrays[bucket], gSamplerAnisoWrapClamp, uvw); }
+    return SampleTex2DArray(gFlipArrays[bucket], gSamplerAnisotropic, uvw);
+}
+
+
+
+
+
+
 float4 sampleBase(uint texIdx, uint clampMode, float2 uv, bool lowAF)
 {
+
+
+
+    if (isFlipSlot(texIdx)) { return sampleFlip(texIdx, clampMode, uv, lowAF); }
     if (lowAF)
     {
         if (clampMode ==  0u ) { return SampleTex2D(gTextures[texIdx], gSampler2xClampClamp, uv); }

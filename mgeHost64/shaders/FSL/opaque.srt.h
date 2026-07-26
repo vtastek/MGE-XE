@@ -20,7 +20,14 @@
 #include "shadowparams.h.fsl"
 
 #define OPAQUE_BATCH 1024   // matrices per 64KB cbuffer window; must match host kBatchSize
-#define MAX_TEXTURES 896    // bindless gTextures[] array size; MUST match IPC::kMaxTextures (geomwire.h)
+#define MAX_TEXTURES 880    // bindless gTextures[] array size; MUST match IPC::kMaxTextures (geomwire.h)
+// NiFlipController flip books: a descriptor-array of Texture2DArrays, one element per (format,
+// size) bucket, one LAYER per book frame. A 300-frame book used to claim 300 gTextures slots; it
+// now claims one descriptor. Same structure as MAX_STATICS_BUCKETS below and the same reason.
+// MAX_TEXTURES + MAX_STATICS_BUCKETS + MAX_FLIP_BUCKETS = 1024, the proven-OK Persistent-table
+// size — these 16 came OUT of gTextures, which is why that dropped 896 -> 880.
+// MUST match IPC::kMaxFlipBuckets (geomwire.h). Slot encoding: see texsample.h.fsl::isFlipSlot.
+#define MAX_FLIP_BUCKETS 16
 // Distant-statics texture residency: a descriptor-array of Texture2DArrays, one element per
 // (format, capped-size) bucket. Each element is ONE descriptor (format/size are runtime resource
 // props; HLSL sees only Texture2DArray<float4>), so this holds arrays of DIFFERENT formats+sizes
@@ -256,6 +263,10 @@ BEGIN_SRT_NO_AB(SrtData)
         // gTextures so it stacks at SRV offset MAX_TEXTURES (FSL single per-set counter); the host
         // binds it via SRT_RES_IDX(...,gStaticsArrays). statics.frag samples gStaticsArrays[bucket].
         DECL_ARRAY_TEXTURES(Persistent, Tex2DArray(float4), gStaticsArrays, MAX_STATICS_BUCKETS)
+        // Flip-book frames (NiFlipController). Declared LAST so it stacks at SRV offset
+        // MAX_TEXTURES + MAX_STATICS_BUCKETS. sampleBase() routes here on the slot's flag bit, so
+        // every world path (opaque/alpha/depth/shadow/multimap) picks it up from that one decode.
+        DECL_ARRAY_TEXTURES(Persistent, Tex2DArray(float4), gFlipArrays, MAX_FLIP_BUCKETS)
     END_SRT_SET(Persistent)
     BEGIN_SRT_SET(PerBatch)
         DECL_CBUFFER(PerBatch, CBUFFER(BatchData), gBatch)

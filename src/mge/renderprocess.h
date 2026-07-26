@@ -128,6 +128,14 @@ namespace RenderProcess {
     // seam is live and wants static opaque geometry. Avoids any cost when off.
     bool wantsGeometryCapture();
 
+    // Register a NiFlipController's whole frame list as one gFlipArrays Texture2DArray, so a flip
+    // book costs ONE bindless descriptor instead of one slot per frame (a 300-frame book was a
+    // third of the client's whole residency). Names are NI SourceTexture::fileName; the call is
+    // idempotent per book — keyed by the first frame, so every instance playing the same book
+    // shares one array. Returns false when the book is refused (non-uniform frames, unreadable, or
+    // no free bucket), which simply leaves it on the per-slot path.
+    bool registerFlipBook(const char* const* names, std::uint32_t count);
+
     // THE mode predicate: true when the Forge seam is live (g_initOk) AND the composite is ON
     // (g_enabled, F11). While true the host owns the whole frame — opaque world, distant land,
     // sky, water, depth — and MW's own draws for any of it are redundant (the full-screen

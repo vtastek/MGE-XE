@@ -689,6 +689,33 @@ namespace {
     std::uint64_t                             g_texRecycles = 0;    // LRU evictions, session total
     std::uint64_t                             g_texThrashes = 0;    // recycled a slot used this frame
 
+    // ---- Flip-book texture arrays (NiFlipController) ---------------------------------------
+    // A book used to claim ONE SLOT PER FRAME out of the ~872 client slots; Enhanced Light's
+    // magelight is 300 frames. Books are uniform by construction, so each becomes a run of LAYERS
+    // in a gFlipArrays bucket (see IPC::makeFlipSlot) and the whole book costs ONE descriptor.
+    //
+    // Buckets are keyed by (format, width, height) and sized in blocks so small books SHARE one:
+    // a 4-frame candle flame should not burn a descriptor. The declared size is fixed at creation
+    // and every slice of every book in the bucket ships it (TexUploadWire::arraySize), which is
+    // what lets the host build the array from whichever slice arrives first.
+    struct FlipBucket {
+        std::uint64_t key = 0;        // (fourcc/format, w, h) identity; 0 = unused
+        std::uint32_t declared = 0;   // layer count declared to the host at creation
+        std::uint32_t used = 0;       // layers handed out so far
+    };
+    FlipBucket                                g_flipBuckets[IPC::kMaxFlipBuckets];
+    // Books already registered, keyed by their FIRST frame's normalized name. Books are shared by
+    // every instance that plays them (six orbs = one book), which is why the key is the content and
+    // not the controller: controllers are per-clone.
+    std::unordered_set<std::string>           g_flipBooksDone;
+    std::uint32_t                             g_flipBooksBuilt = 0;
+    std::uint32_t                             g_flipLayersBuilt = 0;
+    std::uint32_t                             g_flipRefused = 0;    // non-uniform / no bucket / unreadable
+    // Layer granularity. Rounding up lets several small books share a bucket; a big book still gets
+    // an almost-exact fit (300 -> 304). Too large wastes VRAM on tiny books, too small fragments
+    // the 16 buckets.
+    constexpr std::uint32_t kFlipLayerBlock = 16;
+
     // Per-frame draw list rides a 4-chunk (4MB) vec: ~61K DrawItemWire, well over the
     // host's kMaxDraws cap. Geometry vec stays 8 chunks (8MB).
     constexpr unsigned kDrawChunks = 4;
@@ -1394,8 +1421,13 @@ namespace {
         }
         auto it = g_texSlot.find(name);
         if (it != g_texSlot.end()) {
-            if (it->second != 0) { g_slotLastUsed[it->second] = g_frame; }   // refresh LRU age
-            return it->second;   // already resolved (slot or cached-miss 0)
+            // A flip-book frame resolves to an ENCODED array slot, not an index into the LRU range —
+            // subscripting g_slotLastUsed with it would run ~0x8000 past the end. Array-backed
+            // textures are resident for the session and never recycled, so they have no LRU age.
+            if (it->second != 0 && !IPC::isFlipSlot(it->second)) {
+                g_slotLastUsed[it->second] = g_frame;   // refresh LRU age
+            }
+            return it->second;   // already resolved (slot, encoded flip slot, or cached-miss 0)
         }
 
         void* data = nullptr;
@@ -1451,7 +1483,7 @@ namespace {
         g_texSlot[name] = slot;
         g_slotName[slot] = name;
         g_slotLastUsed[slot] = g_frame;
-        IPC::TexUploadWire hdr{ slot, size };
+        IPC::TexUploadWire hdr{ slot, size, 0u };
         const std::size_t at = g_texPendingBlob.size();
         g_texPendingBlob.resize(at + sizeof(hdr) + size);
         std::memcpy(g_texPendingBlob.data() + at, &hdr, sizeof(hdr));
@@ -1459,6 +1491,129 @@ namespace {
         std::free(data);
         ++g_texPendingCount;
         return slot;
+    }
+
+    // Minimal DDS header identity for bucketing: (pixel-format, width, height). We never decode —
+    // the host does that — so this only has to be a faithful EQUALITY key, and the raw format words
+    // are exactly that. Returns 0 for anything that isn't a DDS we can key on.
+    static std::uint64_t ddsBucketKey(const void* data, unsigned size,
+                                      std::uint32_t* outW, std::uint32_t* outH) {
+        if (!data || size < 128) { return 0; }
+        const auto* d = static_cast<const std::uint8_t*>(data);
+        auto rd = [&](unsigned off) {
+            std::uint32_t v; std::memcpy(&v, d + off, 4); return v;
+        };
+        if (rd(0) != 0x20534444u) { return 0; }               // 'DDS '
+        const std::uint32_t h = rd(12), w = rd(16);
+        const std::uint32_t pfFlags = rd(80), fourCC = rd(84), rgbBits = rd(88);
+        if (w == 0 || h == 0) { return 0; }
+        // FourCC when compressed, else bit depth — enough to separate DXT1/3/5 from 32-bit BGRA,
+        // which is all the host's own bucketing distinguishes.
+        const std::uint32_t fmt = (pfFlags & 0x4u) ? fourCC : (0x80000000u | rgbBits);
+        if (outW) { *outW = w; }
+        if (outH) { *outH = h; }
+        return ((std::uint64_t)fmt << 32) ^ ((std::uint64_t)w << 16) ^ (std::uint64_t)h;
+    }
+
+    // Register a NiFlipController's whole frame list as a run of layers in a gFlipArrays bucket,
+    // and point every frame's NAME at its encoded array slot. That last part is what makes this
+    // invisible to the rest of the client: every consumer already resolves a texture by name
+    // (buildGeometryDrawLists via the entry's textureName, captureAlphaDraw via the reverse map),
+    // so once g_texSlot holds encoded slots, both paths ship the right slice with no other change.
+    //
+    // Refuses — leaving the book on the per-slot path, which still works — when the frames are not
+    // uniform, when no bucket can hold them, or when a frame won't load. Called once per distinct
+    // book (keyed by its first frame), so N casts of the same spell share one array.
+    bool registerFlipBookImpl(const char* const* names, std::uint32_t count) {
+        if (!names || count == 0 || count > IPC::kMaxFlipLayers || !g_texVec) { return false; }
+
+        std::vector<std::string> norm;
+        norm.reserve(count);
+        for (std::uint32_t i = 0; i < count; ++i) {
+            std::string n = normalizeTextureName(names[i]);
+            if (n.empty()) { return false; }
+            norm.push_back(std::move(n));
+        }
+
+        std::lock_guard<std::mutex> lk(g_texResidencyMx);
+        if (!g_flipBooksDone.insert(norm[0]).second) { return true; }   // already built (or refused)
+
+        // Pass 1: load every frame and check uniformity BEFORE claiming any layers — a half-built
+        // book that then refuses would strand its bucket range and leave the rest per-slot, i.e.
+        // the same texture reachable two ways.
+        std::vector<void*>         blobs(count, nullptr);
+        std::vector<unsigned>      sizes(count, 0u);
+        std::uint64_t key = 0;
+        std::uint32_t w = 0, h = 0;
+        bool ok = true;
+        for (std::uint32_t i = 0; i < count && ok; ++i) {
+            if (!BSA::loadFileBytes(norm[i].c_str(), &blobs[i], &sizes[i], true)
+                || !blobs[i] || sizes[i] == 0) { ok = false; break; }
+            std::uint32_t fw = 0, fh = 0;
+            const std::uint64_t k = ddsBucketKey(blobs[i], sizes[i], &fw, &fh);
+            if (k == 0) { ok = false; break; }
+            if (i == 0) { key = k; w = fw; h = fh; }
+            else if (k != key) { ok = false; }                  // non-uniform book
+            if (sizeof(IPC::TexUploadWire) + sizes[i] > (std::size_t)IPC::kTexWindowBytes) { ok = false; }
+        }
+
+        std::uint32_t bucket = IPC::kMaxFlipBuckets, baseLayer = 0;
+        if (ok) {
+            // Reuse a bucket of the same identity with room, else open a new one. Sizing in blocks
+            // is what lets several small books share (a 4-frame flame must not burn a descriptor).
+            for (std::uint32_t b = 0; b < IPC::kMaxFlipBuckets && bucket == IPC::kMaxFlipBuckets; ++b) {
+                if (g_flipBuckets[b].key == key && g_flipBuckets[b].used + count <= g_flipBuckets[b].declared) {
+                    bucket = b;
+                }
+            }
+            if (bucket == IPC::kMaxFlipBuckets) {
+                for (std::uint32_t b = 0; b < IPC::kMaxFlipBuckets; ++b) {
+                    if (g_flipBuckets[b].key == 0) {
+                        std::uint32_t decl = ((count + kFlipLayerBlock - 1) / kFlipLayerBlock) * kFlipLayerBlock;
+                        if (decl > IPC::kMaxFlipLayers) { decl = IPC::kMaxFlipLayers; }
+                        g_flipBuckets[b].key = key;
+                        g_flipBuckets[b].declared = decl;
+                        g_flipBuckets[b].used = 0;
+                        bucket = b;
+                        break;
+                    }
+                }
+            }
+            if (bucket == IPC::kMaxFlipBuckets) { ok = false; }   // all 16 buckets spoken for
+            else { baseLayer = g_flipBuckets[bucket].used; }
+        }
+
+        if (!ok) {
+            for (std::uint32_t i = 0; i < count; ++i) { if (blobs[i]) { std::free(blobs[i]); } }
+            ++g_flipRefused;
+            LOG::logline("!! [flipbook] '%s' (%u frames) refused — non-uniform, unreadable, or no free "
+                         "bucket; stays on the per-slot path", norm[0].c_str(), count);
+            return false;
+        }
+
+        // Pass 2: claim the layers and queue every slice. arraySize is the BUCKET's declared size,
+        // not this book's frame count — the host creates one array per bucket and later books fill
+        // the remaining layers of the same array.
+        const std::uint32_t declared = g_flipBuckets[bucket].declared;
+        g_flipBuckets[bucket].used += count;
+        for (std::uint32_t i = 0; i < count; ++i) {
+            const std::uint32_t slot = IPC::makeFlipSlot(bucket, baseLayer + i);
+            g_texSlot[norm[i]] = slot;
+            IPC::TexUploadWire hdr{ slot, sizes[i], declared };
+            const std::size_t at = g_texPendingBlob.size();
+            g_texPendingBlob.resize(at + sizeof(hdr) + sizes[i]);
+            std::memcpy(g_texPendingBlob.data() + at, &hdr, sizeof(hdr));
+            std::memcpy(g_texPendingBlob.data() + at + sizeof(hdr), blobs[i], sizes[i]);
+            std::free(blobs[i]);
+            ++g_texPendingCount;
+        }
+        ++g_flipBooksBuilt;
+        g_flipLayersBuilt += count;
+        LOG::logline(">> [flipbook] '%s' %u frames -> bucket %u layers %u..%u (%ux%u, bucket holds %u) "
+                     "— %u bindless slots saved",
+                     norm[0].c_str(), count, bucket, baseLayer, baseLayer + count - 1,
+                     w, h, declared, count > 1 ? count - 1 : 0);
+        return true;
     }
 
     // Ship queued texture uploads to the host in window-sized batches on whole-entry
@@ -1518,6 +1673,18 @@ namespace {
                 g_texPendingBlob.insert(g_texPendingBlob.begin(), blob.begin() + off, blob.end());
                 g_texPendingCount += (pendingCount - entriesFlushed);
                 return;
+            }
+            // The host returns how many it actually BUILT. Anything less is a silent drop —
+            // unsupported DDS, an out-of-range slot, a flip slice whose bucket refused it — and the
+            // only symptom downstream is geometry drawing white with nothing in either log saying
+            // why. Cheap to check, and it is the receipt that a flip book's slices really landed.
+            if (uploaded != batchCount) {
+                static std::uint32_t s_mismatchLogged = 0;
+                if (s_mismatchLogged++ < 8) {
+                    LOG::logline("!! [texflush] host built %u of %u sent (%u dropped — unsupported "
+                                 "format / bad slot / rejected flip slice)",
+                                 uploaded, batchCount, batchCount - uploaded);
+                }
             }
             entriesFlushed += batchCount;
             off = batchEnd;
@@ -5102,6 +5269,10 @@ namespace RenderProcess {
 
     bool wantsGeometryCapture() {
         return g_initOk && g_geomVec.has_value();
+    }
+
+    bool registerFlipBook(const char* const* names, std::uint32_t count) {
+        return registerFlipBookImpl(names, count);
     }
 
     bool forgeOwnsFrame() {
