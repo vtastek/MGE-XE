@@ -23,11 +23,25 @@
 --   enabled  false = never registers a handler. DEFAULT OFF, like AutoTurn360.
 --   frames   how many frames after `loaded` to sample (the window MGE's post-load walk runs in).
 --   watch    extra reference IDs to track by name, on top of the defaults below.
+--
+-- DISABLE TEST (`disableAfter` > 0): the second half of the bug. A reference disabled AFTER MGE
+-- captured it is a different failure from one that was already disabled at load — reachability
+-- cannot retire it (disable leaves the node parented), so anything in MGE's mover-candidate set
+-- (NPCs, activators) keeps being re-emitted from the cache and ghosts until the cell is re-entered.
+-- Plain statics do not ghost, because they are only ever drawn from the engine's visible set.
+-- So the test has to disable a MOVER, not a crate: this picks a live NPC in the cell, disables it,
+-- and leaves the game running long enough for an eviction sweep to render a verdict. The receipt is
+-- in mgeXE.log, not here: `[evict] ... byDisabled=N` plus the cache `entries=` dropping by the
+-- actor's part count. Console `disable` takes the same engine path, so this stands in for it.
+--   disableAfter  real seconds after load before disabling (0 = off).
+--   disableId     reference ID to disable; empty = pick the nearest enabled NPC in the cell.
 
 local defaults = {
     enabled = false,
     frames = 12,
     watch = { "TR_m3_FlyingChair_01", "TR_m3_SittingChair_01" },
+    disableAfter = 0,
+    disableId = "",
 }
 
 local cfg = mwse.loadConfig("GhostProbe", defaults)
@@ -92,6 +106,39 @@ onSimulate = function()
     end
 end
 
+-- Pick the disable victim: a MOVER is the whole point (see the header), so prefer an NPC. The
+-- player is excluded for the obvious reason.
+local function findVictim()
+    if cfg.disableId ~= "" then return tes3.getReference(cfg.disableId) end
+    local cell = tes3.getPlayerCell()
+    if not cell then return nil end
+    local player = tes3.player
+    for ref in cell:iterateReferences(tes3.objectType.npc) do
+        if ref ~= player and not ref.disabled and ref.sceneNode then return ref end
+    end
+    return nil
+end
+
+local function runDisableTest()
+    local ref = findVictim()
+    if not ref then
+        log("DISABLE TEST: no enabled NPC found in the cell - nothing to disable")
+        return
+    end
+    log("DISABLE TEST: disabling '%s' %s", ref.id, describe(ref))
+    ref:disable()
+    log("DISABLE TEST: disabled '%s' -> %s", ref.id, describe(ref))
+    log("DISABLE TEST: watch mgeXE.log for [evict] byDisabled= and a matching entries= drop")
+    -- Re-read a few seconds later: if the reference somehow re-enabled itself (an AI package, a
+    -- script), the mgeXE.log verdict would be about a different world state than we think.
+    timer.start({
+        type = timer.real, duration = 6.0, iterations = 1,
+        callback = function()
+            log("DISABLE TEST: 6s later '%s' %s", ref.id, describe(ref))
+        end,
+    })
+end
+
 local function onLoaded()
     if not cfg.enabled then
         log("disabled (enabled=false)")
@@ -105,6 +152,13 @@ local function onLoaded()
     sample("onLoaded ")
     frame = 0
     event.register("simulate", onSimulate)
+
+    if cfg.disableAfter > 0 then
+        timer.start({
+            type = timer.real, duration = cfg.disableAfter, iterations = 1,
+            callback = runDisableTest,
+        })
+    end
 end
 
 event.register("loaded", onLoaded)

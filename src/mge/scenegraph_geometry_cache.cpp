@@ -1575,8 +1575,14 @@ namespace MGE::GeometryCache {
         // ghost, and eviction never disagrees because the node is still perfectly reachable.
         // objectFlags @ 0x8, Disabled = bit 11 (MWSE/TES3Object.h:220, :102), read at the documented
         // offset like referenceLiveKind above (SharedSE keeps TES3::Reference opaque).
-        bool referenceDisabled(const NI::ObjectNET* obj) {
-            const void* ref = obj->getTes3Reference(/*searchParents=*/true);
+        //
+        // searchParents=false is for callers that are ALREADY climbing the chain themselves (the
+        // eviction sweep): getTes3Reference's own parent search is an unvalidated pointer climb, and
+        // the sweep's whole safety argument rests on vtable-validating every hop. Asking each hop
+        // about its OWN reference gives the same answer — the node MW app-culls to disable a
+        // reference is exactly the node that owns it — without a second, unchecked traversal.
+        bool referenceDisabled(const NI::ObjectNET* obj, bool searchParents = true) {
+            const void* ref = obj->getTes3Reference(searchParents);
             if (!ref) return false;
             const uint32_t flags = *reinterpret_cast<const uint32_t*>(
                 static_cast<const char*>(ref) + 0x8);
@@ -2914,7 +2920,7 @@ namespace MGE::GeometryCache {
             // vtable, so we treat it as GONE instead of chasing it further. This makes EVERY deref in
             // the loop safe (first hop is off a leaf we hold; every later hop is off a vtable-validated
             // live node) and turns the unbounded hazard into counted diagnostics (climbVtBad).
-            unsigned climbMaxDepth = 0, climbVtBad = 0, climbDepthCap = 0;
+            unsigned climbMaxDepth = 0, climbVtBad = 0, climbDepthCap = 0, climbDisabled = 0;
             auto isLiveNode = [](const NI::Node* n) -> bool {
                 if (!n) return false;
                 namespace VA = NI::VirtualTableAddress;
@@ -2953,6 +2959,23 @@ namespace MGE::GeometryCache {
                     // Engine-informed guard: a real parent is a live node subtype. A dangling/freed
                     // parent fails the vtable check ⇒ the subtree was unlinked and released ⇒ gone.
                     if (!isLiveNode(p)) { ++climbVtBad; return 1; }
+                    // DISABLED reference (console/script `disable`, quest props). Reachability alone
+                    // can never retire these: MW hides a reference by app-culling its scene node and
+                    // leaving it perfectly parented, so the chain stays intact and the entry is kept
+                    // forever. Harmless for a plain static — it is only ever drawn FROM the engine's
+                    // visible set, which it drops out of the moment it is disabled — but anything in
+                    // the mover-candidate set (NPCs/creatures = Mover, activators/doors = Ambiguous)
+                    // is re-emitted every frame straight from the cache, independent of that set, so
+                    // it keeps drawing as a ghost until the cell is re-entered. Ask the reference
+                    // itself, at the hop that owns it. Order matters: the known-root test above runs
+                    // FIRST, so MGE's own root app-culls (MW-ONLY-UI suppression, the FP1b arm root)
+                    // are never examined; and this runs AFTER the vtable guard, so the deref is safe.
+                    // Testing the Disabled BIT, not app-cull, is what keeps the inactive-POV player
+                    // body (app-culled but very much enabled) out of it.
+                    if (p->getAppCulled() && referenceDisabled(p, /*searchParents=*/false)) {
+                        ++climbDisabled;
+                        return 1;
+                    }
                     NI::Node* next = p->parentNode;
                     // Chain ended without reaching a known root: the whole subtree was unlinked
                     // (MW removes an object's ROOT node, so the shape keeps a non-null parent that
@@ -3245,11 +3268,12 @@ namespace MGE::GeometryCache {
             // eviction path is where the freeze/ghosting bugs live, so a non-zero sweep must never
             // be silent (it was, between sweep 20 and the mass-evict investigation).
             if (validating || nEvicted > 0) {
-                LOG::logline(">> [evict] sweeps=%u mode=%s walk-forced=%u entries=%zu evicted=%u byCell=%u grid=(%d,%d)r%d int=%d byGraph=%u byAge=%u byDetach=%u/%u unknown=%u deferred=%u kept=%u disagree(walkGone/parentGone)=%u/%u",
+                LOG::logline(">> [evict] sweeps=%u mode=%s walk-forced=%u entries=%zu evicted=%u byCell=%u grid=(%d,%d)r%d int=%d byGraph=%u byAge=%u byDetach=%u/%u byDisabled=%u unknown=%u deferred=%u kept=%u disagree(walkGone/parentGone)=%u/%u",
                              g_evictSweepNo, cellGrid ? "cell" : (g_evictByParentChain ? "parent" : "walk"),
                              walkedThisFrame ? 1u : 0u, g_cache.size(),
                              nEvicted, nByCell, cgX, cgY, kCellGridRadius, (int)(curInterior != nullptr),
-                             nByGraph, nByAge, nByDetach, nDetachChecked, nUnknown, nDeferred, nKeptByParent,
+                             nByGraph, nByAge, nByDetach, nDetachChecked, climbDisabled,
+                             nUnknown, nDeferred, nKeptByParent,
                              g_evictDisagreeWalkGone, g_evictDisagreeGraphGone);
             if (nRescueGone + nRescueUnknown > 0) {
                 LOG::logline(">> [rescue] sweep=%u kept=%u failGone=%u failUnknown=%u",
