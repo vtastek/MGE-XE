@@ -59,9 +59,9 @@ namespace MGE::EngineCull {
         AlphaCovered    = 2,   // the host's sorted-alpha pass (AT1) redraws it
     };
 
-    // Owned display-skip flags, pushed once per frame before the traversal. Same
-    // bit meanings as MSOCClient::kOwnedOpaque / kOwnedAlpha so the A/B in D2
-    // compares like with like.
+    // Owned display-skip flags, pushed once per frame before the traversal. Bit
+    // meanings were kept identical to msoc's kOwnedOpaque / kOwnedAlpha so the D2
+    // A/B compared like with like; earlyClassifyMainScene is the only caller now.
     constexpr int kOwnedOpaque = 1 << 0;
     constexpr int kOwnedAlpha  = 1 << 1;
 
@@ -73,9 +73,9 @@ namespace MGE::EngineCull {
 
     // Run the world-camera traversal NOW and hand the drawn set to the sink,
     // deferring every geometry leaf to the engine's own top-level CullShow.
-    // `camera` may be the world camera (validated) or null (we resolve it) —
-    // signature-compatible with MSOCClient::classifyMainSceneNow so the two
-    // producers are drop-in comparable.
+    // `camera` may be the world camera (validated) or null (we resolve it) — the
+    // signature is msoc's classifyMainSceneNow, kept when the two producers had to
+    // be drop-in comparable.
     //
     // Returns 0 on success, else the guard that declined. Codes are msoc's,
     // so one legend covers both producers:
@@ -87,10 +87,9 @@ namespace MGE::EngineCull {
     // and no separate scene-phase flag to consult.
     int classifyNow(void* camera);
 
-    // Sink for the current-frame drawn set. Same signature as msoc's
-    // FnVisibleGeomCallback so DistantLand's existing onVisibleGeom registers
-    // with both producers unchanged — one consumer, two feeds, and D5 deletes
-    // the msoc one without touching the sink.
+    // Sink for the current-frame drawn set. Signature inherited from msoc's
+    // FnVisibleGeomCallback, which is what let D5 delete the msoc feed without
+    // touching DistantLand's onVisibleGeom at all.
     using FnVisibleGeom = void(__cdecl*)(void* const* shapes, const float* bounds, int count);
     void setVisibleGeomCallback(FnVisibleGeom cb);
 

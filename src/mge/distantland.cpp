@@ -391,22 +391,23 @@ void DistantLand::frameSetupEarly() {
         earlyWalkedCache = true;
         dWalk = fseNowMs() - tWalk0;
 
-        // Stage 2 early classify. Ask the plugin to run the engine's world-camera
-        // occlusion classify NOW (before the engine's own renderMainScene CullShow), so
-        // the visible/occluded callbacks fire with the CURRENT-frame set. The plugin's
-        // natural scene-0 CullShow then only displays the survivors. Must run before
+        // Stage 2 early classify. Run the engine's world-camera scene walk NOW (before
+        // the engine's own renderMainScene CullShow), so the visible-geom callback fires
+        // with the CURRENT-frame set; the engine's natural scene-0 CullShow then only
+        // displays the leaves the Forge side doesn't cover. Must run before
         // buildFrustumVisibleSet (which consumes the result) and before the render-thread
-        // kick (so the snapshot below captures the engine-set). Null camera = plugin
-        // resolves the world camera. No-op (frustum cull stands) if the plugin predates
-        // the export or self-declines (root unverified, scene disabled).
+        // kick (so the snapshot below captures the engine-set). Null camera = EngineCull
+        // resolves the world camera. No-op (frustum cull stands) if the traversal isn't
+        // installed or self-declines (root unverified, scene disabled).
         //
-        // SKIPPED under host-cull-only: renderdepth.cpp's MSOC branch is gated on
-        // (UseOcclusionCulling && s_earlyClassifyRan && !hostCullOnly), so with the host's Hi-Z
-        // GPU cull owning occlusion the classify's answer is DISCARDED — we were paying ~1.4ms of
-        // main-thread time per frame for a result nobody reads, and paying it on the critical path
-        // between MW's physics and the produce kick, delaying the host RPC by its full duration.
-        // buildFrustumVisibleSet falls back to the self-contained frustum cull (the same path the
-        // plugin-absent case already takes), and the host culls what the frustum over-includes.
+        // SKIPPED under host-cull-only: renderdepth.cpp's engine-classified branch is gated
+        // on (s_earlyClassifyRan && !hostCullOnly), so the classify's answer is DISCARDED —
+        // ~1.4ms of main-thread time for a result nobody reads, paid on the critical path
+        // between MW's physics and the produce kick and delaying the host RPC by its full
+        // duration. buildFrustumVisibleSet falls back to the self-contained frustum cull and
+        // the host's Hi-Z GPU cull culls what the frustum over-includes. That trade is a LOSS
+        // in practice (the classify is also our discovery feed: without it the full refresh
+        // walk costs ~7ms), which is why hostCullOnly boots false — it is the A/B baseline.
         if (!hostCullOnly) {
             const double tCls0 = fseNowMs();
             earlyClassifyMainScene(nullptr);
@@ -1313,11 +1314,11 @@ bool DistantLand::inspectIndexedPrimitive(int sceneCount, const RenderedState* r
     // inspection). Placed AFTER the z-write count above so the sky predicate below is
     // unaffected. Whatever still renders with this ON is the AT3 leftover set (particles/VFX —
     // not NiTriShapes, not captured by the cache walk).
-    // AT2: the msoc plugin's kOwnedAlpha display skip (renderdepth.cpp setOwnedFlags) is now
-    // the PRIMARY mechanism — most covered blended leaves never display, so their DIPs never
-    // reach here. This gate stays as the belt: old msoc.dll (opaque-only), and blended leaves
-    // the plugin conservatively keeps displaying (decal/multi-map/untextured) that our host
-    // pass doesn't draw either.
+    // AT2: EngineCull's kOwnedAlpha display skip (renderdepth.cpp, earlyClassifyMainScene)
+    // is now the PRIMARY mechanism — most covered blended leaves never display, so their DIPs
+    // never reach here. This gate stays as the belt: frames with no classify at all (traversal
+    // not installed / declined), and blended leaves the coverage classifier conservatively
+    // keeps displaying (decal/multi-map/untextured) that our host pass doesn't draw either.
     if (sceneCount >= 1 && rs->blendEnable && RenderProcess::forgeOwnsFrame()) {
         // AT3: before rejecting, capture MW's already-billboarded blended DIP (NiParticles smoke/
         // flames + multimap/decal/untextured blends the host cache pass doesn't own) so the Forge

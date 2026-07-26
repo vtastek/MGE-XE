@@ -111,10 +111,9 @@ struct ConfigurationStruct {
     float UIScale;
     int WindowAlignX, WindowAlignY;
     bool UseSharedMemory;
-    bool UseOcclusionCulling;  // reuse msoc.dll's CPU occlusion mask for distant statics
-    bool UseHostOcclusionCull; // ship the mask to the 64-bit host so it occlusion-culls distant statics in the quadtree walk (only survivors cross IPC). Default off.
-    int OcclusionHysteresisFrames;  // consecutive OCCLUDED frames before a static actually culls
-    float OcclusionSphereInflate;   // per-instance sphere/OBB radius scale for verdict stability
+    // (MSOC retirement D5: UseOcclusionCulling / UseHostOcclusionCull / the two
+    // Occlusion* tuning knobs are gone with msocclient and the mask wire. The Forge
+    // host's two-phase Hi-Z GPU cull owns occlusion and has no ini switch.)
     bool LogDistantPipeline;        // gate per-frame diagnostic loglines + phase-timer reports + Numpad-5 mask dump
     bool UseSceneGraphSnapshot;     // enable MGE-side per-frame scene-graph walk (drives the texture-light variant of FFE)
     bool UseAsyncSceneGraphWalk;    // sub-flag: run the scene-graph walk on a worker thread; main signals at onFrameReady and returns immediately. Snapshot is one frame stale. Default off; on hides the ~350µs walk from the main-thread frame budget.

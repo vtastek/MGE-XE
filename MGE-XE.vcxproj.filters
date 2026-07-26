@@ -132,9 +132,6 @@
     <ClCompile Include="src\mge\morrowindbsa.cpp">
       <Filter>Source Files\mge</Filter>
     </ClCompile>
-    <ClCompile Include="src\mge\msocclient.cpp">
-      <Filter>Source Files\mge</Filter>
-    </ClCompile>
     <ClCompile Include="src\mge\mwbridge.cpp">
       <Filter>Source Files\mge</Filter>
     </ClCompile>
@@ -297,9 +294,6 @@
       <Filter>Header Files\mge</Filter>
     </ClInclude>
     <ClInclude Include="src\mge\morrowindbsa.h">
-      <Filter>Header Files\mge</Filter>
-    </ClInclude>
-    <ClInclude Include="src\mge\msocclient.h">
       <Filter>Header Files\mge</Filter>
     </ClInclude>
     <ClInclude Include="src\mge\mwbridge.h">

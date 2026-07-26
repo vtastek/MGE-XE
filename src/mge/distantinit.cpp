@@ -8,7 +8,6 @@
 #include "dlformat.h"
 #include "postshaders.h"
 #include "morrowindbsa.h"
-#include "msocclient.h"
 #include "enginecull.h"
 #include "mwbridge.h"
 #include "mgeversion.h"
@@ -174,10 +173,9 @@ const D3DVERTEXELEMENT9 StaticElem[] = {
 
 
 
-// The discovery sink. Fired by whichever producer owns the CullShow traversal —
-// MGE's own absorbed one (enginecull.cpp) or msoc.dll — once it has the engine's
-// current-frame drawn set and before any display() calls. Stores it for
-// buildFrustumVisibleSet to consume this frame.
+// The discovery sink. Fired by MGE's absorbed CullShow traversal (enginecull.cpp)
+// once it has the engine's current-frame drawn set and before any display() calls.
+// Stores it for buildFrustumVisibleSet to consume this frame.
 static void __cdecl onVisibleGeom(void* const* shapes, const float* /*boundsXYZR*/, int count) {
     DistantLand::updateVisibleSet(shapes, count);
 }
@@ -219,24 +217,14 @@ bool DistantLand::init() {
     }
 
 
-    // Probe msoc.dll for the CPU occlusion mask. Soft dependency:
-    // returns silently if the plugin isn't installed. Must run after
-    // the rest of distant-land is wired up so the resulting log banner
-    // lands next to other distant-land init lines in mgeXE.log.
-    MSOCClient::init();
-    // Visible-geom callback: with the early classify (mwse_classifyMainSceneNow) this
-    // fires at BeginScene(0) with the engine's current-frame drawn set, which
-    // buildFrustumVisibleSet consumes as the MSOC-culled cache set.
-    MSOCClient::registerVisibleGeomCallback(onVisibleGeom);
-
-    // MSOC retirement D2/D3: optionally take the CullShow traversal in-house instead
-    // (tasks/msoc-detour-absorb.md). Deliberately AFTER MSOCClient::init(), so the
-    // prologue-byte check gets its best chance of seeing an already-armed msoc
-    // detour; install() refuses whenever msoc.dll is present at all. Default off —
-    // with it off this is a single predicate and nothing is patched.
-    // The sink is the SAME onVisibleGeom either way: registering it unconditionally
-    // keeps the two producers interchangeable and makes D5 a deletion of the msoc
-    // line above, not a rewiring.
+    // MSOC retirement D2/D3/D5: MGE owns the CullShow traversal that produces the
+    // engine-driven discovery feed (tasks/msoc-detour-absorb.md). The visible-geom
+    // callback fires at BeginScene(0) with the engine's current-frame drawn set,
+    // which buildFrustumVisibleSet consumes as the engine-classified cache set.
+    // Runs after the rest of distant-land is wired up so install()'s banner lands
+    // next to the other distant-land init lines in mgeXE.log; install() refuses
+    // whenever msoc.dll is present at all (two detours on one 5-byte prologue is
+    // unrecoverable), which then leaves the frustum-only fallback standing.
     MGE::EngineCull::setVisibleGeomCallback(onVisibleGeom);
     MGE::EngineCull::install();
 

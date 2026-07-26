@@ -9,24 +9,23 @@
 #include "scenegraph_geometry_cache.h"
 #include "cachebounds.h"
 #include "enginecull.h"
-#include "msocclient.h"
 #include "support/log.h"
 #include "mge_tracy.h"
 
 #include <unordered_set>
 #include <vector>
 
-// MSOC-culled visible set received from the VisibleGeomCallback, current frame.
+// Engine-classified visible set received from the VisibleGeomCallback, current frame.
 // Keys = NiTriBasedGeometry* cast to uint32_t — matches GeometryCache keys.
-// updateVisibleSet (the only writer) runs on the MAIN thread — msoc.dll fires the
-// callback from inside the engine's drainPendingDisplays — so a main-thread
+// updateVisibleSet (the only writer) runs on the MAIN thread — EngineCull fires the
+// callback from inside its own classify, on this thread — so a main-thread
 // snapshot at kick cannot race it.
 //
 // A plain VECTOR, not a set: every consumer only ITERATES it (buildFrustumVisibleSet
-// MSOC branch, the Cut 2B fold loop) — nothing does membership lookups — and the
-// callback fires INSIDE the synchronous classify call, so the old per-key
+// engine-classified branch, the Cut 2B fold loop) — nothing does membership lookups —
+// and the callback fires INSIDE the synchronous classify call, so the old per-key
 // unordered_set insert (~3.5k hashes) billed straight to the [classify] serial
-// block. assign() is a flat copy. The plugin defers each leaf exactly once per
+// block. assign() is a flat copy. The traversal defers each leaf exactly once per
 // scene, so the set's de-dup was doing nothing (wire counts verify).
 // (The previous-frame copy, s_prevVisibleKeys/visibleCacheKeys, had NO consumers
 // left — removed with the vector change.)
@@ -36,18 +35,18 @@ static std::vector<uint32_t> s_visibleKeys;
 // built in the early stage (frameSetupEarly, after the cache walk) by
 // buildFrustumVisibleSet. This is the set MGE owns: the cache depth pre-pass and
 // the cache opaque color pass both drive off it, so leading-edge tiles a pan
-// reveals THIS frame get depth (no sky holes) and an empty engine-MSOC set no
-// longer collapses the depth pass to an unculled full-cache draw. Frustum-only
-// (no occlusion yet — Phase 3 adds the early MGE-driven MSOC mask).
+// reveals THIS frame get depth (no sky holes) and an empty engine-classified set no
+// longer collapses the depth pass to an unculled full-cache draw. Frustum-only —
+// the Forge host's two-phase Hi-Z GPU cull owns occlusion.
 static std::vector<uint32_t> s_frustumVisibleKeys;
 
-// Count of cache entries the last buildFrustumVisibleSet dropped (in MSOC-culled mode:
-// entries the engine did not draw — occluded / LOD-deselected / out of the engine
+// Count of cache entries the last buildFrustumVisibleSet dropped (in engine-classified
+// mode: entries the engine did not draw — LOD-deselected / out of the engine
 // frustum). Surfaced as the cacheOccCull diagnostic (LogDistantPipeline).
 static unsigned     s_refineCulledCount = 0;
 
 // Stage 2 engine-set consumption. s_visibleCallbackFired is a tripwire flipped by
-// updateVisibleSet; earlyClassifyMainScene() resets it, calls the plugin's early
+// updateVisibleSet; earlyClassifyMainScene() resets it, runs the early
 // classify, and latches s_earlyClassifyRan = "the callback fired DURING the call" -
 // i.e. the world classify ran THIS frame, before the cull, so s_visibleKeys is the
 // engine's current-frame drawn set (no lag). buildFrustumVisibleSet reads
@@ -58,15 +57,15 @@ static unsigned     s_refineCulledCount = 0;
 static bool         s_visibleCallbackFired = false;
 static bool         s_earlyClassifyRan     = false;
 
-// Cut 2B fold latch: this frame's buildFrustumVisibleSet took the MSOC branch but
-// DEFERRED its ensureLive loop into the kickoff draw-list build (see the fold gate
+// Cut 2B fold latch: this frame's buildFrustumVisibleSet took the engine-classified
+// branch but DEFERRED its ensureLive loop into the kickoff draw-list build (see the fold gate
 // in buildFrustumVisibleSet). Set there; consumed by foldVisibleKeys() (once) and
 // reset at the top of the next buildFrustumVisibleSet call. A kickoff early-out
 // wastes it harmlessly (in fold mode nothing else consumes the visible set).
 static bool         s_foldDeferred         = false;
 
 void DistantLand::updateVisibleSet(void* const* shapes, int count) {
-    // x86: void* is 4 bytes, so the plugin's pointer array reinterprets directly as
+    // x86: void* is 4 bytes, so the producer's pointer array reinterprets directly as
     // the key array — one flat assign, no per-key hashing (see s_visibleKeys above).
     static_assert(sizeof(void*) == sizeof(uint32_t), "key = pointer bits");
     const uint32_t* keys = reinterpret_cast<const uint32_t*>(shapes);
@@ -75,50 +74,42 @@ void DistantLand::updateVisibleSet(void* const* shapes, int count) {
 }
 
 // Stage 2 early classify (main thread, called from frameSetupEarly at BeginScene(0),
-// before buildFrustumVisibleSet). Run the world-camera scene walk NOW; the producer
+// before buildFrustumVisibleSet). Run the world-camera scene walk NOW; EngineCull
 // fires the visible-geom callback synchronously on this thread (updateVisibleSet) so
 // the current-frame set is ready for the cull below. Latches whether it actually
-// classified (callback fired during the call) - both producers self-decline (root
-// unverified, scene disabled, menu, absent export) without signalling, so the
-// tripwire is the authoritative "did it run".
+// classified (callback fired during the call) - the traversal self-declines (root
+// unverified, scene disabled, menu) without signalling, so the tripwire is the
+// authoritative "did it run".
 //
-// TWO PRODUCERS, one sink (MSOC retirement D3). MGE's own absorbed CullShow
-// traversal (enginecull.cpp) when it owns the prologue patch, msoc.dll otherwise.
-// They are mutually exclusive by construction: EngineCull::install() refuses
-// whenever msoc could own that prologue. Both call the same onVisibleGeom, return
-// the same status codes and honour the same owned flags, so everything downstream
-// of here is producer-blind - which is what makes D5 a deletion rather than a port.
+// ONE PRODUCER (MSOC retirement D5): MGE's own absorbed CullShow traversal,
+// enginecull.cpp. msoc.dll fed this same sink until D3; the client shim is gone and
+// isInstalled() is the whole gate. If the traversal is NOT installed (EngineCull
+// refuses whenever msoc.dll could own the same prologue) we return without latching,
+// and buildFrustumVisibleSet falls through to its self-contained frustum-only branch.
 void DistantLand::earlyClassifyMainScene(void* worldCamera) {
     s_earlyClassifyRan = false;
 
-    // UseOcclusionCulling is msoc's master switch, and msoc's alone: it gates an
-    // occlusion verdict we no longer consume. Our traversal does no occlusion, so
-    // the knob that gates it is the takeover knob itself, already proven by
-    // isInstalled().
-    const bool ownTraversal = MGE::EngineCull::isInstalled();
-    if (!ownTraversal && (!Configuration.UseOcclusionCulling || !MSOCClient::hasEarlyClassify())) {
+    if (!MGE::EngineCull::isInstalled()) {
         return;
     }
 
-    // Owned display skips (Cut 1 opaque + AT2 alpha): tell the plugin which
-    // parts of the frame the Forge side covers THIS frame, before either
-    // classify path latches its per-frame state. Opaque bit: the plugin skips
-    // engine display() of covered-opaque leaves — the DIPs our proxy rejects
-    // per-draw anyway (inspectIndexedPrimitive). Alpha bit: it also skips
-    // single-map blended leaves our sorted-alpha host pass redraws (AT1).
-    // F11 (forgeOwnsFrame false) restores full display next frame. Logged
-    // plugin-side on change; absent/old export = opaque-only or no-op = the
-    // per-DIP reject fallback keeps correctness.
+    // Owned display skips (Cut 1 opaque + AT2 alpha): tell the traversal which
+    // parts of the frame the Forge side covers THIS frame, before the classify
+    // latches its per-frame state. Opaque bit: skip engine display() of
+    // covered-opaque leaves — the DIPs our proxy rejects per-draw anyway
+    // (inspectIndexedPrimitive). Alpha bit: also skip single-map blended leaves
+    // our sorted-alpha host pass redraws (AT1). F11 (forgeOwnsFrame false)
+    // restores full display next frame; the per-DIP reject is the belt either way.
     int ownedFlags = 0;
     if (RenderProcess::forgeOwnsFrame()) {
-        ownedFlags = MSOCClient::kOwnedOpaque | MSOCClient::kOwnedAlpha;
+        ownedFlags = MGE::EngineCull::kOwnedOpaque | MGE::EngineCull::kOwnedAlpha;
     }
     s_visibleCallbackFired = false;
     // The classify is SYNCHRONOUS: the engine's world-camera scene walk (~10k nodes)
-    // bills here, and under msoc so does the owned-mode deferred-display drain — post-W3
-    // it was the largest un-zoned block in the frameready→stage1 window (MSOC.log drainUs
-    // alone ~1.8ms), so it gets its own timer + heartbeat. The absorbed traversal splits
-    // that: the walk bills here, the display bills to the engine's own CullShow.
+    // bills here. The absorbed traversal splits walk from display — the walk bills
+    // here, the display bills to the engine's own CullShow — so this timer sees the
+    // walk alone. Its own timer + heartbeat: post-W3 this was the largest un-zoned
+    // block in the frameready→stage1 window.
     LARGE_INTEGER ecFreq, ecT0, ecT1;
     QueryPerformanceFrequency(&ecFreq);
     QueryPerformanceCounter(&ecT0);
@@ -126,37 +117,32 @@ void DistantLand::earlyClassifyMainScene(void* worldCamera) {
     {
         MGE_ZoneScopedN("earlyClassifyMainScene");
         MGE_SCOPED_TIMER("earlyClassifyMainScene");
-        if (ownTraversal) {
-            MGE::EngineCull::beginFrame(ownedFlags);
-            rc = MGE::EngineCull::classifyNow(worldCamera);
-        } else {
-            MSOCClient::setOwnedFlags(ownedFlags);
-            rc = MSOCClient::classifyMainSceneNow(worldCamera);
-        }
+        MGE::EngineCull::beginFrame(ownedFlags);
+        rc = MGE::EngineCull::classifyNow(worldCamera);
     }
     QueryPerformanceCounter(&ecT1);
     static double s_ecMsAccum = 0.0; static unsigned s_ecN = 0;
     s_ecMsAccum += 1000.0 * (double)(ecT1.QuadPart - ecT0.QuadPart) / (double)ecFreq.QuadPart;
     if (++s_ecN >= 300) {
-        LOG::logline(">> [classify] 300 frames avg: %s=%.2f ms",
-                     ownTraversal ? "EngineCull::classifyNow" : "classifyMainSceneNow",
+        LOG::logline(">> [classify] 300 frames avg: EngineCull::classifyNow=%.2f ms",
                      s_ecMsAccum / (double)s_ecN);
         s_ecMsAccum = 0.0; s_ecN = 0;
     }
     s_earlyClassifyRan = s_visibleCallbackFired;
 
-    // Diagnostic: surface the producer's status code so we can see WHETHER the early
-    // classify engaged and, if not, which guard declined. Both producers share the
-    // numbering (see EngineCull::classifyNow / msoc OcclusionPass.cpp); codes 2 and 10
-    // are msoc-only, 12 is ours. Logged on every change + periodically.
+    // Diagnostic: surface the traversal's status code so we can see WHETHER the early
+    // classify engaged and, if not, which guard declined. The numbering is msoc's
+    // (see EngineCull::classifyNow) so logs from the D3/D4 A/B still read the same;
+    // 2 and 10 were msoc-only and can no longer occur, 12 is ours. Logged on every
+    // change + periodically.
     static int s_lastRc = -2;
     static unsigned s_n = 0;
     if (rc != s_lastRc || (++s_n % 600 == 0)) {
-        LOG::logline("-- [EARLY CLASSIFY] src=%s rc=%d ran=%d (0=classified; 1=reentrant "
-                     "2=!inRenderMainScene 3=noRootCaptured 4=alreadyClassified 5=sceneHandled "
-                     "6=noCamera 7=menuMode 8=wrongCamera 9=noDataHandler 10=gateDeclined "
-                     "11=staleRoot 12=notInstalled -1=exportAbsent)",
-                     ownTraversal ? "mge" : "msoc", rc, s_earlyClassifyRan ? 1 : 0);
+        LOG::logline("-- [EARLY CLASSIFY] rc=%d ran=%d (0=classified; 1=reentrant "
+                     "3=noRootCaptured 4=alreadyClassified 5=sceneHandled "
+                     "6=noCamera 7=menuMode 8=wrongCamera 9=noDataHandler "
+                     "11=staleRoot 12=notInstalled)",
+                     rc, s_earlyClassifyRan ? 1 : 0);
         s_lastRc = rc;
     }
 }
@@ -186,18 +172,18 @@ unsigned DistantLand::lastRefineCulled() {
 // were required to replay the SAME set; the host is the only consumer now.)
 //
 // Two modes, picked per frame:
-//  - MSOC-culled (preferred): the early classify ran this frame
-//    (mwse_classifyMainSceneNow), so s_visibleKeys is the engine's EXACT current-frame
-//    drawn set - occlusion-culled AND with the engine's own LOD switch already applied
-//    (it holds the engine-selected LOD leaf, not every cached level). Keep a cache
+//  - Engine-classified (preferred): the early classify ran this frame
+//    (EngineCull::classifyNow), so s_visibleKeys is the engine's EXACT current-frame
+//    drawn set - with the engine's own LOD switch already applied (it holds the
+//    engine-selected LOD leaf, not every cached level). Keep a cache
 //    entry iff the engine drew it. Absence culls, which is safe because the verdict is
 //    current-frame (no lag, no leading-edge holes). NO second frustum cull - the engine
 //    already frustum-culled and its frustum may differ from ours. worldPickObjectRoot
 //    entries (isPickRoot) are outside the world-camera classify, so keep those via
 //    frustum. First-person (arm root) is a separate camera and not cached - nothing to do.
-//  - Frustum only (fallback): no MSOC this frame (occlusion culling off, plugin absent,
-//    or the early classify declined). Deterministic current-frame frustum cull over the
-//    full cache, from the game view*proj.
+//  - Frustum only (fallback): no classify this frame (hostCullOnly, the traversal not
+//    installed, or the early classify declined). Deterministic current-frame frustum
+//    cull over the full cache, from the game view*proj.
 //
 // Skinned entries with no usable palette are excluded in both modes - they're never
 // drawn and would trip the bound helper (div-by-zero / pts[] overrun); see cachebounds.h.
@@ -215,14 +201,14 @@ void DistantLand::buildFrustumVisibleSet(const D3DXMATRIX* view, const D3DXMATRI
     D3DXMatrixMultiply(&viewproj, view, proj);
     ViewFrustum frustum(&viewproj);
 
-    // Engine-classified mode: the engine's authoritative current-frame drawn set,
-    // from whichever producer owns the traversal (MGE's absorbed CullShow or msoc).
+    // Engine-classified mode: the engine's authoritative current-frame drawn set, from
+    // MGE's absorbed CullShow traversal (enginecull.cpp).
     // Phase 1 host-cull-only (VK_SCROLL): bypass this branch so the produce feeds off the
     // self-contained frustum-only fallback below (no s_visibleKeys / engine-classify
     // dependency); the Forge host's Hi-Z GPU cull owns occlusion.
-    // D3: the old `Configuration.UseOcclusionCulling &&` term is gone - it was already
-    // implied (earlyClassifyMainScene returns before latching s_earlyClassifyRan when the
-    // knob is off) and it is msoc's switch, which must not gate MGE's own feed.
+    // D3/D5: no Configuration term gates this. It was `UseOcclusionCulling &&` once —
+    // already implied (earlyClassifyMainScene returns before latching s_earlyClassifyRan)
+    // and it was msoc's switch, which must not gate MGE's own feed. The knob is deleted.
     if (s_earlyClassifyRan && !hostCullOnly) {
         s_earlyClassifyRan = false;   // one frame only
 
@@ -293,7 +279,7 @@ void DistantLand::buildFrustumVisibleSet(const D3DXMATRIX* view, const D3DXMATRI
         return;
     }
 
-    // Frustum-only fallback: no MSOC this frame. On live-draw-build frames the refresh
+    // Frustum-only fallback: no engine classify this frame. On live-draw-build frames the refresh
     // walk was skipped and this path iterates the WHOLE cache with a freshness filter —
     // pull the full walk in now (idempotent; no-op when onFrameReady already walked).
     MGE::GeometryCache::ensureFullWalk();
