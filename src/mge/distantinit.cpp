@@ -174,8 +174,10 @@ const D3DVERTEXELEMENT9 StaticElem[] = {
 
 
 
-// Called from msoc.dll when MSOC finishes verdict classification, before any display() calls.
-// Stores the MSOC-culled visible set for buildFrustumVisibleSet to consume this frame.
+// The discovery sink. Fired by whichever producer owns the CullShow traversal —
+// MGE's own absorbed one (enginecull.cpp) or msoc.dll — once it has the engine's
+// current-frame drawn set and before any display() calls. Stores it for
+// buildFrustumVisibleSet to consume this frame.
 static void __cdecl onVisibleGeom(void* const* shapes, const float* /*boundsXYZR*/, int count) {
     DistantLand::updateVisibleSet(shapes, count);
 }
@@ -227,11 +229,15 @@ bool DistantLand::init() {
     // buildFrustumVisibleSet consumes as the MSOC-culled cache set.
     MSOCClient::registerVisibleGeomCallback(onVisibleGeom);
 
-    // MSOC retirement D2: optionally take the CullShow traversal in-house instead
+    // MSOC retirement D2/D3: optionally take the CullShow traversal in-house instead
     // (tasks/msoc-detour-absorb.md). Deliberately AFTER MSOCClient::init(), so the
     // prologue-byte check gets its best chance of seeing an already-armed msoc
     // detour; install() refuses whenever msoc.dll is present at all. Default off —
     // with it off this is a single predicate and nothing is patched.
+    // The sink is the SAME onVisibleGeom either way: registering it unconditionally
+    // keeps the two producers interchangeable and makes D5 a deletion of the msoc
+    // line above, not a rewiring.
+    MGE::EngineCull::setVisibleGeomCallback(onVisibleGeom);
     MGE::EngineCull::install();
 
     MWBridge::get()->patchResolveDuringInit(&resolveDynamicVisGroups);

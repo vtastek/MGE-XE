@@ -60,12 +60,45 @@ constexpr uintptr_t kCullShowAddr = 0x6EB480;
 // g_msocActive, and carries the same contract: when FALSE this file's traversal
 // must behave identically to the engine's own CullShow. That equivalence is what
 // makes the prologue patch survivable for the six non-main-scene callers.
+//
+// Leaking this true is the one catastrophic failure mode in the module — every
+// CullShow in the process would collect and nothing would ever draw — so it is
+// only ever set through DeferGuard below.
 bool g_deferring = false;
 
 bool g_installed = false;
 
 bool g_skipOwnedOpaque = false;
 bool g_skipOwnedAlpha  = false;
+
+// Recursion depth. Interior nodes display() into their children, which re-enter
+// this body through the patched prologue, so "outer entry" (depth 1) is the only
+// way to tell one of CullShow's seven callers from the traversal's own descent.
+// msoc used !g_msocActive for the same job; that only works while a build is
+// active, and the root capture below has to run on frames where none is.
+int g_callDepth = 0;
+
+// The EXACT NiAVObject* the engine hands its top-level world-camera CullShow.
+// NOT worldObjectRoot — an ancestor that contains it. Captured from the engine's
+// own call (we cannot synthesise it: traversing a wider root would collect
+// leaves the engine's pass never displays, a narrower one would miss whole
+// subtrees, and either way the display-pass identity match below stops firing).
+// Only ever pointer-compared, never dereferenced, so a root freed by a
+// worldspace change is caught without a crash.
+NI::AVObject* g_topLevelRoot = nullptr;
+
+// Set by classifyNow() when it has collected leaves that the engine's own
+// top-level pass still has to draw. Consumed by that pass, cleared by
+// beginFrame() — a frame that ends with it still set drew no world geometry.
+bool g_displayPending = false;
+
+// World-camera outer entries since beginFrame(). Guards the "engine already
+// handled this scene" case (msoc's isTopLevelFiresThisScene).
+unsigned g_mainCamFires = 0;
+
+// Where the drawn set goes. Registered once at init; null just means the feed
+// is dropped, which degrades to the frustum fallback rather than misbehaving.
+FnVisibleGeom g_visibleGeomCb = nullptr;
 
 // Roots latched once per frame by beginFrame(). Null means UNKNOWN, and the
 // coverage classifier must treat unknown as "not safe to skip" — a null sky root
@@ -78,11 +111,15 @@ NI::AVObject* g_stormRoot     = nullptr;
 
 Stats g_stats{};
 
-struct PendingLeaf {
-    NI::AVObject* shape;
-    NI::Camera*   camera;
-};
-std::vector<PendingLeaf> g_pending;
+// Leaves collected by the deferring traversal, in engine draw order.
+//
+// A flat pointer vector rather than msoc's {shape, camera} pairs: one classify
+// pass has exactly one camera, so carrying it per leaf was redundant. The payoff
+// is that this vector IS the feed's wire format — DistantLand::updateVisibleSet
+// reinterprets the pointers as cache keys — so the sink gets g_pending.data()
+// with no copy, where msoc had to build a parallel g_visCallbackNodes array.
+std::vector<NI::AVObject*> g_pending;
+NI::Camera* g_deferCamera = nullptr;
 
 // Memoised coverage class per leaf.
 //
@@ -249,6 +286,86 @@ public:
     }
 };
 
+// Depth bookkeeping for every entry; the collecting flag for the classify pass
+// only. Both are RAII for the same reason the ignore bits are: there is no
+// original CullShow left to fall back to if one of them leaks.
+struct DepthGuard {
+    DepthGuard()  { ++g_callDepth; }
+    ~DepthGuard() { --g_callDepth; }
+};
+
+struct DeferGuard {
+    DeferGuard(NI::Camera* camera) { g_deferCamera = camera; g_deferring = true; }
+    ~DeferGuard() { g_deferring = false; }
+};
+
+// ---------------------------------------------------------------------------
+// Top-level root identity
+// ---------------------------------------------------------------------------
+
+// Is `candidate` the engine's world render root — i.e. on the live parent chain
+// of worldObjectRoot? Walks the FRESH chain from DataHandler (always current)
+// and pointer-compares; `candidate` is never dereferenced, so a stale capture
+// answers false instead of faulting.
+bool isRenderRootOf(NI::AVObject* candidate, void* dh) {
+    NI::AVObject* p = MGE::DataHandlerView::worldObjectRoot(dh);
+    for (int i = 0; i < 32 && p; ++i) {
+        if (p == candidate) return true;
+        p = p->parentNode;
+    }
+    return false;
+}
+
+// Outer CullShow entry outside the classify pass. Two jobs, and it is the only
+// place either happens:
+//
+//  * Mode B — hand the engine's own top-level pass the leaves classifyNow()
+//    already collected, instead of letting it re-traverse. Matched on ROOT
+//    IDENTITY (self == g_topLevelRoot), which is strictly tighter than msoc's
+//    "first main-camera fire this scene": a sky or first-person pass that
+//    happened to share the world camera cannot consume the world's leaves.
+//  * Capture the root for the next frame's classify, on the engine's own pass.
+//
+// Returns true when the entry was fully handled and must not traverse.
+bool handleTopLevelEntry(NI::AVObject* self, NI::Camera* camera) {
+    if (camera != MGE::WorldControllerView::worldCamera()) return false;
+    ++g_mainCamFires;
+
+    if (g_displayPending) {
+        if (self != g_topLevelRoot) return false;   // a different main-camera pass
+        g_displayPending = false;
+        displayDeferred();
+        return true;
+    }
+
+    // Capture only while we have no root. Re-capturing every scene (msoc's rule)
+    // risks latching a NARROWER root mid-session — a later main-camera pass on
+    // some subtree also sits on worldObjectRoot's chain — and once that happens
+    // the engine's real top-level pass stops matching, so it traverses and draws
+    // the world while the narrow pass ALSO displays our collected leaves. Double
+    // draw. classifyNow() is the sole invalidator: it nulls the root the moment
+    // its staleness check fails, and the next pass through here re-captures.
+    if (!g_topLevelRoot) {
+        void* dh = MGE::SceneGraph::getDataHandler();
+        if (dh && isRenderRootOf(self, dh)) {
+            g_topLevelRoot = self;
+            NI::AVObject* wor = MGE::DataHandlerView::worldObjectRoot(dh);
+            LOG::logline(">> [enginecull] captured top-level render root %p (worldObjectRoot=%p)%s",
+                         (void*)self, (void*)wor,
+                         (self == wor) ? " - IS worldObjectRoot, expected an ancestor" : "");
+        }
+    }
+    return false;
+}
+
+void fireVisibleGeomFeed() {
+    g_stats.fed = static_cast<uint32_t>(g_pending.size());
+    if (!g_visibleGeomCb) return;
+    static_assert(sizeof(NI::AVObject*) == sizeof(void*), "feed is a flat pointer array");
+    g_visibleGeomCb(reinterpret_cast<void* const*>(g_pending.data()), nullptr,
+                    static_cast<int>(g_pending.size()));
+}
+
 }  // namespace
 
 // The engine-faithful body. Every one of NiAVObject::CullShow's seven direct
@@ -256,6 +373,14 @@ public:
 // the first-person subtree and NiCamera::Click, not just the main world scene.
 // With g_deferring false it is behaviourally identical to the engine's.
 void __fastcall cullShowBody(NI::AVObject* self, void* /*edx*/, NI::Camera* camera) {
+    DepthGuard depth;
+
+    // Outer entry, and not the classify pass driving itself: this is one of the
+    // engine's own seven call sites, so run the phase machine before traversing.
+    if (g_callDepth == 1 && !g_deferring && handleTopLevelEntry(self, camera)) {
+        return;
+    }
+
     if (g_deferring) ++g_stats.recursiveCalls;
 
     if (self->getAppCulled()) {
@@ -294,7 +419,7 @@ void __fastcall cullShowBody(NI::AVObject* self, void* /*edx*/, NI::Camera* came
         // through to display(), which recurses into children and re-enters this
         // body through the detour — that recursion IS the traversal.
         if (self->isInstanceOfType(NI::RTTIStaticPtr::NiTriBasedGeom)) {
-            g_pending.push_back({self, camera});
+            g_pending.push_back(self);
             ++g_stats.deferred;
             return;
         }
@@ -304,6 +429,33 @@ void __fastcall cullShowBody(NI::AVObject* self, void* /*edx*/, NI::Camera* came
 }
 
 void beginFrame(int ownedFlags) {
+    // Previous frame's numbers, published before they are cleared. This is the
+    // only place that always runs, so it is also where a classify with no
+    // matching display surfaces.
+    if (g_displayPending) ++g_stats.missedDisplays;
+    if (Configuration.LogDistantPipeline) {
+        static unsigned s_n = 0;
+        static uint32_t s_missed = 0;
+        s_missed += g_stats.missedDisplays;
+        if (++s_n % 300 == 0) {
+            LOG::logline("-- [enginecull] deferred=%u fed=%u displayed=%u skipOpaque=%u skipAlpha=%u "
+                         "nodes=%u appCulled=%u frustumCulled=%u missedDisplays=%u/300",
+                         g_stats.deferred, g_stats.fed, g_stats.displayed,
+                         g_stats.ownedOpaqueSkipped, g_stats.ownedAlphaSkipped,
+                         g_stats.recursiveCalls, g_stats.appCulled, g_stats.frustumCulled,
+                         s_missed);
+            s_missed = 0;
+        }
+    }
+
+    // Re-arm the classify/display pair. Dropping leaves the engine never drew is
+    // deliberate: they are raw NiTriShape* whose only liveness guarantee was
+    // being current-frame, so carrying them forward is exactly the use-after-free
+    // this whole design exists to avoid.
+    g_displayPending = false;
+    g_pending.clear();
+    g_mainCamFires = 0;
+
     g_skipOwnedOpaque = (ownedFlags & kOwnedOpaque) != 0;
     g_skipOwnedAlpha  = (ownedFlags & kOwnedAlpha) != 0;
 
@@ -356,9 +508,9 @@ void invalidateCoverageCache() {
 // asymmetry is why every doubtful case in classifyUncached returns EngineDraws.
 void displayDeferred() {
     const bool skipping = g_skipOwnedOpaque || g_skipOwnedAlpha;
-    for (const auto& leaf : g_pending) {
+    for (NI::AVObject* shape : g_pending) {
         if (skipping) {
-            const Coverage c = classifyCoverage(leaf.shape);
+            const Coverage c = classifyCoverage(shape);
             if (g_skipOwnedOpaque && c == Coverage::OpaqueRedundant) {
                 ++g_stats.ownedOpaqueSkipped;
                 continue;
@@ -369,9 +521,58 @@ void displayDeferred() {
             }
         }
         ++g_stats.displayed;
-        leaf.shape->vTable.asAVObject->display(leaf.shape, leaf.camera);
+        shape->vTable.asAVObject->display(shape, g_deferCamera);
     }
     g_pending.clear();
+}
+
+// The early classify: run the traversal at BeginScene(0) instead of waiting for
+// the engine, so MGE's produce kickoff gets a CURRENT-frame drawn set.
+//
+// Every guard below returns rather than degrading, and a return means MGE falls
+// back to its own frustum cull for the frame — correct, just ~7 ms slower. The
+// one thing that must never happen is collecting leaves without arming the
+// display, so g_displayPending is set last, only on the success path.
+int classifyNow(void* cameraIn) {
+    if (!g_installed)     return 12;
+    if (g_deferring)      return 1;
+    if (!g_topLevelRoot)  return 3;   // engine hasn't rendered once yet
+    if (g_displayPending) return 4;
+    if (g_mainCamFires)   return 5;   // engine already ran its pass this scene
+
+    NI::Camera* mainCamera = MGE::WorldControllerView::worldCamera();
+    if (!mainCamera) return 6;
+    // Menu parity with msoc, which skipped for a threadpool reason we no longer
+    // have. Kept for D4 so the A/B compares like with like; menus fall back to
+    // the frustum walk exactly as they do today. Lifting it is a separate,
+    // measurable change.
+    if (MGE::WorldControllerView::menuMode()) return 7;
+    auto* camera = static_cast<NI::Camera*>(cameraIn);
+    if (camera && camera != mainCamera) return 8;
+
+    void* dh = MGE::SceneGraph::getDataHandler();
+    if (!dh || !MGE::DataHandlerView::worldObjectRoot(dh)) return 9;
+
+    // Staleness: a worldspace change frees the captured root. Null it so the
+    // engine's own pass re-captures this frame; we never dereference it.
+    if (!isRenderRootOf(g_topLevelRoot, dh)) {
+        g_topLevelRoot = nullptr;
+        return 11;
+    }
+
+    g_pending.clear();
+    {
+        DeferGuard defer(mainCamera);
+        cullShowBody(g_topLevelRoot, nullptr, mainCamera);
+    }
+
+    fireVisibleGeomFeed();
+    g_displayPending = true;
+    return 0;
+}
+
+void setVisibleGeomCallback(FnVisibleGeom cb) {
+    g_visibleGeomCb = cb;
 }
 
 const Stats& lastFrameStats() {
@@ -413,9 +614,9 @@ bool install() {
     // patched for the process lifetime.
     se::memory::genJumpUnprotected(kCullShowAddr, reinterpret_cast<DWORD>(&cullShowBody));
     g_installed = true;
-    LOG::logline(">> [enginecull] CullShow detour installed at 0x%X (MGE owns the traversal; "
-                 "D2 non-deferring - no discovery feed, buildFrustumVisibleSet uses its "
-                 "frustum-only fallback).", kCullShowAddr);
+    LOG::logline(">> [enginecull] CullShow detour installed at 0x%X - MGE owns the traversal "
+                 "and the discovery feed. First frame runs vanilla (no root captured yet), "
+                 "then the early classify takes over.", kCullShowAddr);
     return true;
 }
 

@@ -14,11 +14,20 @@
 // module is that replacement: msoc's already-shipping engine-faithful traversal
 // with every occlusion branch removed.
 //
-// STATUS: D1 — compiled, reviewable, NOT INSTALLED. install() is not called from
-// anywhere yet and returns false unless explicitly enabled. Behaviour is
-// unchanged; msoc.dll still owns the detour. D2 installs it behind the
-// mod-presence A/B, D3 adds the early-classify phase machine.
+// STATUS: D3 — the feed is live. install() takes the prologue (D2) and
+// classifyNow() runs the traversal EARLY, at BeginScene(0), deferring geometry
+// display to the engine's own pass. That is what replaces msoc's discovery feed.
 // Plan: tasks/msoc-detour-absorb.md.
+//
+// THE FRAME, in order:
+//   BeginScene(0)  beginFrame()   — roots, owned flags, previous frame's stats
+//                  classifyNow()  — deferring traversal from g_topLevelRoot;
+//                                   fires the visible-geom sink with the drawn set
+//   engine's own top-level CullShow  — matched by root identity, displays the
+//                                   collected leaves minus the ones Forge covers
+// Neither half is optional: the classify without the display draws nothing, and
+// the display without the classify is a stale (freed) leaf list. beginFrame()
+// re-arms both and counts any frame where the pair did not complete.
 //
 // THE SHARP EDGE. Installation is a 5-byte prologue overwrite at 0x6EB480 with
 // NO trampoline — the original CullShow is *gone* once patched, so this body must
@@ -56,11 +65,34 @@ namespace MGE::EngineCull {
     constexpr int kOwnedOpaque = 1 << 0;
     constexpr int kOwnedAlpha  = 1 << 1;
 
-    // Per-frame setup, called from earlyClassifyMainScene alongside (D2) or
-    // instead of (D5) MSOCClient::setOwnedFlags. Latches the owned flags and
-    // re-reads the sky/landscape/weather roots the coverage classifier needs.
+    // Per-frame setup, called from earlyClassifyMainScene immediately before
+    // classifyNow(). Latches the owned flags, re-reads the sky/landscape/weather
+    // roots the coverage classifier needs, and re-arms the classify/display pair.
     // Cheap; safe to call on frames where the traversal never runs.
     void beginFrame(int ownedFlags);
+
+    // Run the world-camera traversal NOW and hand the drawn set to the sink,
+    // deferring every geometry leaf to the engine's own top-level CullShow.
+    // `camera` may be the world camera (validated) or null (we resolve it) —
+    // signature-compatible with MSOCClient::classifyMainSceneNow so the two
+    // producers are drop-in comparable.
+    //
+    // Returns 0 on success, else the guard that declined. Codes are msoc's,
+    // so one legend covers both producers:
+    //   1 re-entrant  3 noRootCaptured  4 alreadyClassified  5 sceneHandled
+    //   6 noMainCamera  7 menuMode  8 wrongCamera  9 noDataHandler
+    //   11 staleRoot  12 notInstalled (ours; msoc has no equivalent)
+    // msoc's 2 (!inRenderMainScene) and 10 (detourDeclined) have no counterpart:
+    // this call IS the traversal driver, so there is no second gate to decline
+    // and no separate scene-phase flag to consult.
+    int classifyNow(void* camera);
+
+    // Sink for the current-frame drawn set. Same signature as msoc's
+    // FnVisibleGeomCallback so DistantLand's existing onVisibleGeom registers
+    // with both producers unchanged — one consumer, two feeds, and D5 deletes
+    // the msoc one without touching the sink.
+    using FnVisibleGeom = void(__cdecl*)(void* const* shapes, const float* bounds, int count);
+    void setVisibleGeomCallback(FnVisibleGeom cb);
 
     // Coverage verdict for one deferred leaf, memoised per NiTriShape until
     // invalidateCoverageCache(). Exposed for D2's A/B: it can be diffed against
@@ -86,21 +118,29 @@ namespace MGE::EngineCull {
     // Install the prologue patch at NiAVObject::CullShow (0x6EB480). Refuses and
     // returns false if that prologue is already detoured — two detours on one
     // 5-byte patch is unrecoverable, so the check is not optional.
-    // D1: never called, and the patch write itself is not implemented yet.
+    // isInstalled() doubles as "which producer owns the feed this session":
+    // install() refuses whenever msoc could own the prologue, so the two are
+    // mutually exclusive by construction.
     bool install();
     bool isInstalled();
 
-    // Diagnostics for the D2 A/B. Counters mirror the MSOC.log names so the two
+    // Diagnostics for the D4 A/B. Counters mirror the MSOC.log names so the two
     // paths can be compared directly: deferred / ownedOpaqueSkipped /
     // ownedAlphaSkipped must match msoc at the same camera.
     struct Stats {
-        uint32_t deferred;            // NiTriBasedGeom leaves reached
+        uint32_t deferred;            // NiTriBasedGeom leaves collected
         uint32_t appCulled;
         uint32_t frustumCulled;
         uint32_t recursiveCalls;
+        uint32_t fed;                 // leaves handed to the sink
         uint32_t ownedOpaqueSkipped;
         uint32_t ownedAlphaSkipped;
         uint32_t displayed;
+        // Frames where classifyNow() collected leaves but the engine's display
+        // pass never arrived to draw them. Should be 0. Anything else means the
+        // root-identity match is missing the engine's real top-level pass, which
+        // is a frame of missing world geometry, not a slow frame.
+        uint32_t missedDisplays;
     };
     const Stats& lastFrameStats();
 

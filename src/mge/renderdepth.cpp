@@ -8,6 +8,7 @@
 #include "scenegraph.h"
 #include "scenegraph_geometry_cache.h"
 #include "cachebounds.h"
+#include "enginecull.h"
 #include "msocclient.h"
 #include "support/log.h"
 #include "mge_tracy.h"
@@ -74,15 +75,30 @@ void DistantLand::updateVisibleSet(void* const* shapes, int count) {
 }
 
 // Stage 2 early classify (main thread, called from frameSetupEarly at BeginScene(0),
-// before buildFrustumVisibleSet). Ask the plugin to run the world-camera occlusion
-// classify NOW; the plugin fires the visible-geom callback synchronously on this
-// thread (updateVisibleSet) so the current-frame set is ready for the cull below.
-// Latches whether it actually classified (callback fired during the
-// call) - the plugin self-declines (root unverified, scene disabled, menu, absent
-// export) without signalling, so the tripwire is the authoritative "did it run".
+// before buildFrustumVisibleSet). Run the world-camera scene walk NOW; the producer
+// fires the visible-geom callback synchronously on this thread (updateVisibleSet) so
+// the current-frame set is ready for the cull below. Latches whether it actually
+// classified (callback fired during the call) - both producers self-decline (root
+// unverified, scene disabled, menu, absent export) without signalling, so the
+// tripwire is the authoritative "did it run".
+//
+// TWO PRODUCERS, one sink (MSOC retirement D3). MGE's own absorbed CullShow
+// traversal (enginecull.cpp) when it owns the prologue patch, msoc.dll otherwise.
+// They are mutually exclusive by construction: EngineCull::install() refuses
+// whenever msoc could own that prologue. Both call the same onVisibleGeom, return
+// the same status codes and honour the same owned flags, so everything downstream
+// of here is producer-blind - which is what makes D5 a deletion rather than a port.
 void DistantLand::earlyClassifyMainScene(void* worldCamera) {
     s_earlyClassifyRan = false;
-    if (!Configuration.UseOcclusionCulling || !MSOCClient::hasEarlyClassify()) return;
+
+    // UseOcclusionCulling is msoc's master switch, and msoc's alone: it gates an
+    // occlusion verdict we no longer consume. Our traversal does no occlusion, so
+    // the knob that gates it is the takeover knob itself, already proven by
+    // isInstalled().
+    const bool ownTraversal = MGE::EngineCull::isInstalled();
+    if (!ownTraversal && (!Configuration.UseOcclusionCulling || !MSOCClient::hasEarlyClassify())) {
+        return;
+    }
 
     // Owned display skips (Cut 1 opaque + AT2 alpha): tell the plugin which
     // parts of the frame the Forge side covers THIS frame, before either
@@ -103,13 +119,12 @@ void DistantLand::earlyClassifyMainScene(void* worldCamera) {
             ownedFlags |= MSOCClient::kOwnedAlpha;
         }
     }
-    MSOCClient::setOwnedFlags(ownedFlags);
-
     s_visibleCallbackFired = false;
-    // classifyMainSceneNow is a SYNCHRONOUS plugin call: the engine's world-camera
-    // classify walk (~10k nodes) AND the owned-mode deferred-display drain both bill
-    // here — post-W3 it is the largest un-zoned block in the frameready→stage1
-    // window (MSOC.log drainUs alone ~1.8ms), so it gets its own timer + heartbeat.
+    // The classify is SYNCHRONOUS: the engine's world-camera scene walk (~10k nodes)
+    // bills here, and under msoc so does the owned-mode deferred-display drain — post-W3
+    // it was the largest un-zoned block in the frameready→stage1 window (MSOC.log drainUs
+    // alone ~1.8ms), so it gets its own timer + heartbeat. The absorbed traversal splits
+    // that: the walk bills here, the display bills to the engine's own CullShow.
     LARGE_INTEGER ecFreq, ecT0, ecT1;
     QueryPerformanceFrequency(&ecFreq);
     QueryPerformanceCounter(&ecT0);
@@ -117,28 +132,37 @@ void DistantLand::earlyClassifyMainScene(void* worldCamera) {
     {
         MGE_ZoneScopedN("earlyClassifyMainScene");
         MGE_SCOPED_TIMER("earlyClassifyMainScene");
-        rc = MSOCClient::classifyMainSceneNow(worldCamera);
+        if (ownTraversal) {
+            MGE::EngineCull::beginFrame(ownedFlags);
+            rc = MGE::EngineCull::classifyNow(worldCamera);
+        } else {
+            MSOCClient::setOwnedFlags(ownedFlags);
+            rc = MSOCClient::classifyMainSceneNow(worldCamera);
+        }
     }
     QueryPerformanceCounter(&ecT1);
     static double s_ecMsAccum = 0.0; static unsigned s_ecN = 0;
     s_ecMsAccum += 1000.0 * (double)(ecT1.QuadPart - ecT0.QuadPart) / (double)ecFreq.QuadPart;
     if (++s_ecN >= 300) {
-        LOG::logline(">> [classify] 300 frames avg: classifyMainSceneNow=%.2f ms", s_ecMsAccum / (double)s_ecN);
+        LOG::logline(">> [classify] 300 frames avg: %s=%.2f ms",
+                     ownTraversal ? "EngineCull::classifyNow" : "classifyMainSceneNow",
+                     s_ecMsAccum / (double)s_ecN);
         s_ecMsAccum = 0.0; s_ecN = 0;
     }
     s_earlyClassifyRan = s_visibleCallbackFired;
 
-    // Diagnostic: surface the plugin's status code so we can see WHETHER the early
-    // classify engaged and, if not, which guard declined. rc 0 = classified; non-zero
-    // codes (see msoc OcclusionPass.cpp): 2 = engine not in renderMainScene at this
-    // point (timing assumption broken), 3 = render root not yet confirmed, 5 = scene
-    // already handled, 10 = scene gate declined. Logged on every change + periodically.
+    // Diagnostic: surface the producer's status code so we can see WHETHER the early
+    // classify engaged and, if not, which guard declined. Both producers share the
+    // numbering (see EngineCull::classifyNow / msoc OcclusionPass.cpp); codes 2 and 10
+    // are msoc-only, 12 is ours. Logged on every change + periodically.
     static int s_lastRc = -2;
     static unsigned s_n = 0;
     if (rc != s_lastRc || (++s_n % 600 == 0)) {
-        LOG::logline("-- [EARLY CLASSIFY] rc=%d ran=%d (0=classified; 2=!inRenderMainScene "
-                     "3=noRootCaptured 5=sceneHandled 10=gateDeclined 11=staleRoot -1=exportAbsent)",
-                     rc, s_earlyClassifyRan ? 1 : 0);
+        LOG::logline("-- [EARLY CLASSIFY] src=%s rc=%d ran=%d (0=classified; 1=reentrant "
+                     "2=!inRenderMainScene 3=noRootCaptured 4=alreadyClassified 5=sceneHandled "
+                     "6=noCamera 7=menuMode 8=wrongCamera 9=noDataHandler 10=gateDeclined "
+                     "11=staleRoot 12=notInstalled -1=exportAbsent)",
+                     ownTraversal ? "mge" : "msoc", rc, s_earlyClassifyRan ? 1 : 0);
         s_lastRc = rc;
     }
 }
@@ -197,11 +221,15 @@ void DistantLand::buildFrustumVisibleSet(const D3DXMATRIX* view, const D3DXMATRI
     D3DXMatrixMultiply(&viewproj, view, proj);
     ViewFrustum frustum(&viewproj);
 
-    // MSOC-culled mode: the engine's authoritative current-frame drawn set.
+    // Engine-classified mode: the engine's authoritative current-frame drawn set,
+    // from whichever producer owns the traversal (MGE's absorbed CullShow or msoc).
     // Phase 1 host-cull-only (VK_SCROLL): bypass this branch so the produce feeds off the
     // self-contained frustum-only fallback below (no s_visibleKeys / engine-classify
     // dependency); the Forge host's Hi-Z GPU cull owns occlusion.
-    if (Configuration.UseOcclusionCulling && s_earlyClassifyRan && !hostCullOnly) {
+    // D3: the old `Configuration.UseOcclusionCulling &&` term is gone - it was already
+    // implied (earlyClassifyMainScene returns before latching s_earlyClassifyRan when the
+    // knob is off) and it is msoc's switch, which must not gate MGE's own feed.
+    if (s_earlyClassifyRan && !hostCullOnly) {
         s_earlyClassifyRan = false;   // one frame only
 
         // Cut 2B fold: under the Forge seam NOTHING else consumes s_frustumVisibleKeys —
