@@ -501,7 +501,7 @@ HRESULT _stdcall MGEProxyDevice::Present(const RECT* a, const RECT* b, HWND c, c
     // Reset scene identifiers
     sceneCount = -1;
     // Display-frame tick for the seam's once-per-frame dev-key poll dedup
-    // (ForgeFrameAhead: the poll can run at the BeginScene(0) collect OR the
+    // (frame-ahead: the poll can run at the BeginScene(0) collect OR the
     // EndScene(0) finish — the serial makes whichever runs first this frame win).
     // [s0cost] Report the scene-0 DIP probe: how many calls MW issued and how much of the
     // "MW draws" zone was spent inside our handler. If inHandler is a small fraction of the
@@ -603,7 +603,7 @@ HRESULT _stdcall MGEProxyDevice::Present(const RECT* a, const RECT* b, HWND c, c
 
     // Present-seam: the Forge composite now runs at the end of scene 0 (EndScene), not here —
     // so Forge's opaque world lands behind scene 1's sorted-alpha + first-person. See
-    // RenderProcess::onStage0Composite.
+    // RenderProcess::onStage0CompositeKickoff / onStage0CompositeFinish.
 
     // MGE frame limiter: pace to the target before presenting. Off when
     // Configuration.FPSLimit == 0.
@@ -705,7 +705,7 @@ HRESULT _stdcall MGEProxyDevice::BeginScene() {
 
             // Set any custom FOV and check distant water state
             if (sceneCount == 0) {
-                // Frame-ahead collect (ForgeFrameAhead): consume LAST frame's deferred
+                // Frame-ahead collect: consume LAST frame's deferred
                 // host render NOW — dev-key poll + renderSceneFinish + RT copy — BEFORE
                 // frameSetupEarly opens this frame's IPC traffic (setWorldSpace, culls,
                 // flushes). No-op unless the previous kickoff deferred its finish; in
@@ -794,7 +794,7 @@ HRESULT _stdcall MGEProxyDevice::BeginScene() {
                 // frame start (mwstart) — the only overlap window this frame shape still has.
                 // onFrameAheadBlit self-gates on g_mainTexValid. Non-early frames composite at
                 // EndScene(0) and skip this. postProcess() is a proven draw point here.
-                if (DistantLand::earlyForgeKickoff && Configuration.UseAsyncHostFrame) {
+                if (DistantLand::earlyForgeKickoff) {
                     RenderProcess::onFrameAheadBlit(realDevice);
                 }
                 // MW-ONLY-UI: hand MW's world roots back BEFORE the UI/menu layer. Past this
@@ -851,41 +851,37 @@ HRESULT _stdcall MGEProxyDevice::EndScene() {
             // OFF by default (ForgeNearDepthReplay) since 2026-07-02, superseded by the host's
             // own sorted-alpha pass. It went with the rest of the DX9 depth layer.
             //
-            // Async split (UseAsyncHostFrame): kick the host off FIRST so its D3D12 frame
-            // overlaps client work, then wait+composite. Phase 2: when the early kickoff
-            // already fired at BeginScene(0) (DistantLand::earlyForgeKickoff — the host has
-            // been rendering under ALL of scene 0), skip the late kickoff and only Finish
-            // here. Otherwise (F11-off / seam down) kick late — Phase 1
-            // behaviour. The window between Kickoff and Finish must stay IPC-free on both
-            // channels. Fused mode keeps the exact pre-split order for a deterministic A/B.
+            // Async split: kick the host off FIRST so its D3D12 frame overlaps client work,
+            // then wait+composite. Phase 2: when the early kickoff already fired at
+            // BeginScene(0) (DistantLand::earlyForgeKickoff — the host has been rendering
+            // under ALL of scene 0), skip the late kickoff and only Finish here. Otherwise
+            // (F11-off / seam down) kick late — Phase 1 behaviour. The window between Kickoff
+            // and Finish must stay IPC-free on both channels.
             //
-            // Frame-ahead (ForgeFrameAhead, early-kickoff frames only): the Finish moves
-            // to the NEXT frame's BeginScene(0) collect and this composite point only
-            // blits the previous host frame — the IPC-free window widens from scene 0 to
-            // the whole MW frame, which the early-kickoff eligibility predicate already
-            // guarantees is RPC-free on both channels.
-            if (Configuration.UseAsyncHostFrame) {
-                // After-FP consume (early-kickoff frames): the produce wait + composite blit
-                // move OUT of here to the first-person→UI transition (BeginScene UI branch,
-                // the postProcess point). Phase 2 emptied scene 0, so waiting on the ~3ms
-                // produce worker here just blocked exposed; deferring it to after scenes 1..FP
-                // hides it under MW's alpha + first-person draws, and blitting there lays the
-                // host frame (incl. host-rendered hands) in the correct order, before the HUD.
-                // The N-1 host FINISH still ran at BeginScene (doDeferredFinish, ~0 — host is
-                // hidden by frame-ahead) and already copied g_mainTex, so the relocated blit
-                // needs no second g_kick holder. See mged3d8device BeginScene UI branch.
-                //
-                // Non-early frames (F11-off / seam down) never deferred and have no
-                // after-FP overlap to gain — finish here exactly as before.
-                if (!DistantLand::earlyForgeKickoff) {
-                    RenderProcess::waitProduce();
-                    if (!RenderProcess::kickoffPending()) {
-                        RenderProcess::onStage0CompositeKickoff(realDevice);
-                    }
-                    RenderProcess::onStage0CompositeFinish(realDevice);
+            // Frame-ahead (early-kickoff frames only): the Finish moves to the NEXT frame's
+            // BeginScene(0) collect and this composite point only blits the previous host
+            // frame — the IPC-free window widens from scene 0 to the whole MW frame, which
+            // the early-kickoff eligibility predicate already guarantees is RPC-free on both
+            // channels.
+            //
+            // After-FP consume (early-kickoff frames): the produce wait + composite blit
+            // move OUT of here to the first-person→UI transition (BeginScene UI branch,
+            // the postProcess point). Phase 2 emptied scene 0, so waiting on the ~3ms
+            // produce worker here just blocked exposed; deferring it to after scenes 1..FP
+            // hides it under MW's alpha + first-person draws, and blitting there lays the
+            // host frame (incl. host-rendered hands) in the correct order, before the HUD.
+            // The N-1 host FINISH still ran at BeginScene (doDeferredFinish, ~0 — host is
+            // hidden by frame-ahead) and already copied g_mainTex, so the relocated blit
+            // needs no second g_kick holder. See mged3d8device BeginScene UI branch.
+            //
+            // Non-early frames (F11-off / seam down) never deferred and have no
+            // after-FP overlap to gain — finish here exactly as before.
+            if (!DistantLand::earlyForgeKickoff) {
+                RenderProcess::waitProduce();
+                if (!RenderProcess::kickoffPending()) {
+                    RenderProcess::onStage0CompositeKickoff(realDevice);
                 }
-            } else {
-                RenderProcess::onStage0Composite(realDevice);
+                RenderProcess::onStage0CompositeFinish(realDevice);
             }
         }
         // S5a: scenes 1+ used to call renderStage2 here, which replayed the recorded scene
@@ -1150,7 +1146,7 @@ ULONG _stdcall MGEProxyDevice::Release() {
 // Initializes distant land
 // Called after new game or load game is selected from the main menu
 void initOnLoad() {
-    // Frame-ahead backstop (ForgeFrameAhead): a quickload can reach this re-init path
+    // Frame-ahead backstop: a quickload can reach this re-init path
     // with the previous frame's deferred finish still pending — finish it before the
     // load path's blocking init RPCs (renderInit/allocVec) hit the window guard. Phase 0:
     // the FINISH lives in collectDeferredFinish now (onFrameAheadCollect only polls/probes).

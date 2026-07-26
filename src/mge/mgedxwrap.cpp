@@ -1,6 +1,7 @@
 
 #include "mgedirect3d8.h"
 #include "mge/configuration.h"
+#include "proxydx/devicelock.h"
 #include "support/log.h"
 
 
@@ -24,9 +25,9 @@ void* CreateD3DWrapper(UINT version) {
 
     IDirect3D9* d3d = nullptr;
 
-    // Present seam: create a D3D9Ex factory so MW's main device is a D3D9Ex device. Gated
-    // by UseRenderProcessEx; if the Ex factory is unavailable we fall through to plain D3D9.
-    if (Configuration.UseRenderProcessEx) {
+    // Present seam: create a D3D9Ex factory so MW's main device is a D3D9Ex device.
+    // If the Ex factory is unavailable we fall through to plain D3D9.
+    if (g_useD3D9Ex) {
         D3DProc9Ex func9Ex = (D3DProc9Ex)GetProcAddress(d3ddll, "Direct3DCreate9Ex");
         IDirect3D9Ex* d3dEx = nullptr;
         if (func9Ex && SUCCEEDED(func9Ex(D3D_SDK_VERSION, &d3dEx)) && d3dEx) {
@@ -34,7 +35,7 @@ void* CreateD3DWrapper(UINT version) {
             LOG::logline(">> [seam] Direct3DCreate9Ex OK (DXVK D3D9Ex main device)");
         } else {
             LOG::logline("!! [seam] Direct3DCreate9Ex unavailable; disabling D3D9Ex seam path for this run");
-            Configuration.UseRenderProcessEx = false;
+            g_useD3D9Ex = false;
         }
     }
 

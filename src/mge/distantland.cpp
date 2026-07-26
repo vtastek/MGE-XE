@@ -212,9 +212,7 @@ void DistantLand::frameSetupEarly() {
     // (ambCol) is still captured state across a transition.
     static bool s_forgePrevEligible = false;
     const bool loadingBar = mwBridge->isLoadingBar();
-    const bool forgeEligibleNow = Configuration.UseAsyncHostFrame
-        && RenderProcess::forgeOwnsFrame()
-        && !loadingBar;
+    const bool forgeEligibleNow = RenderProcess::forgeOwnsFrame() && !loadingBar;
     earlyForgeKickoff = forgeEligibleNow && s_forgePrevEligible;
     s_forgePrevEligible = forgeEligibleNow;
 
@@ -340,8 +338,7 @@ void DistantLand::frameSetupEarly() {
     // forgeOwnsFrame so legacy consumers that reach past the view distance (MGE
     // shadows/reflections) are never starved. 0 disables the gate (full walk).
     float cacheGateRadius = 0.0f;
-    if (Configuration.ForgeActiveCellWalk
-            && RenderProcess::forgeOwnsFrame() && mwBridge->IsExterior()) {
+    if (RenderProcess::forgeOwnsFrame() && mwBridge->IsExterior()) {
         const float tanX = (mwProj._11 != 0.0f) ? 1.0f / mwProj._11 : 1.0f;
         const float tanY = (mwProj._22 != 0.0f) ? 1.0f / mwProj._22 : 1.0f;
         cacheGateRadius = mwBridge->GetViewDistance()
@@ -354,8 +351,7 @@ void DistantLand::frameSetupEarly() {
     // Phase 1 host-cull-only: live-draw-build leans on the engine classify to discover
     // newly-visible objects (lazy capture from s_visibleKeys). With the classify decoupled,
     // force it off so onFrameReady's full refresh walk does the discovery instead.
-    const bool liveDrawBuild =
-        Configuration.ForgeLiveDrawBuild && RenderProcess::forgeOwnsFrame() && !hostCullOnly;
+    const bool liveDrawBuild = RenderProcess::forgeOwnsFrame() && !hostCullOnly;
 
     if (isDistantCell()) {
         // Kick the distant-statics cull FIRST — before the GeometryCache walk —
@@ -1322,8 +1318,7 @@ bool DistantLand::inspectIndexedPrimitive(int sceneCount, const RenderedState* r
     // reach here. This gate stays as the belt: old msoc.dll (opaque-only), and blended leaves
     // the plugin conservatively keeps displaying (decal/multi-map/untextured) that our host
     // pass doesn't draw either.
-    if (Configuration.ForgeAlphaPass && Configuration.ForgeAlphaSuppressS1
-        && sceneCount >= 1 && rs->blendEnable && RenderProcess::forgeOwnsFrame()) {
+    if (sceneCount >= 1 && rs->blendEnable && RenderProcess::forgeOwnsFrame()) {
         // AT3: before rejecting, capture MW's already-billboarded blended DIP (NiParticles smoke/
         // flames + multimap/decal/untextured blends the host cache pass doesn't own) so the Forge
         // host can draw it in the post-water sorted-alpha pass. Silent no-op when disabled/unsuited;

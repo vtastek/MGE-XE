@@ -110,13 +110,13 @@ HRESULT _stdcall MGEProxyD3D::CreateDevice(UINT a, D3DDEVTYPE b, HWND c, DWORD d
         }
     }
 
-    // Present-seam spike (Milestone B): when the factory is a D3D9Ex factory (UseRenderProcessEx),
-    // create a D3D9Ex device via CreateDeviceEx. An Ex device is what lets us create a shared
-    // render-target texture for zero-copy hand-off to Vulkan; it also carries stricter present
-    // rules, applied by the shared translation helper below. The normal game path (spike off /
-    // plain D3D9) is untouched.
+    // Present seam: when the factory is a D3D9Ex factory (g_useD3D9Ex), create a D3D9Ex
+    // device via CreateDeviceEx. An Ex device is what lets us create a shared render-target
+    // texture for zero-copy hand-off to Vulkan; it also carries stricter present rules,
+    // applied by the shared translation helper below. If Ex is unavailable the plain-D3D9
+    // path below runs instead, untouched.
     IDirect3D9Ex* d3dEx = nullptr;
-    const bool useEx = Configuration.UseRenderProcessEx &&
+    const bool useEx = g_useD3D9Ex &&
                        SUCCEEDED(realD3D->QueryInterface(__uuidof(IDirect3D9Ex), reinterpret_cast<void**>(&d3dEx))) && d3dEx;
 
     // Translate DX8 -> DX9 present params (MGE overrides + DX9 conversion + Ex fixups when useEx).
@@ -148,8 +148,8 @@ HRESULT _stdcall MGEProxyD3D::CreateDevice(UINT a, D3DDEVTYPE b, HWND c, DWORD d
             g_spikeForceDefaultPool = true;
             LOG::logline(">> [spike] CreateDeviceEx OK (D3D9Ex device, windowed=%d, swap=%d); MANAGED->DEFAULT pool translation armed", pp.Windowed, pp.SwapEffect);
         } else {
-            LOG::logline("!! [spike] CreateDeviceEx failed 0x%08X; disabling D3D9Ex spike path, using plain CreateDevice", hr);
-            Configuration.UseRenderProcessEx = false;
+            LOG::logline("!! [seam] CreateDeviceEx failed 0x%08X; disabling D3D9Ex path, using plain CreateDevice", hr);
+            g_useD3D9Ex = false;
         }
     }
     if (d3dEx) {

@@ -1828,7 +1828,11 @@ namespace {
     // The moments map's remaining consumer: a ray march wants ONE filterable tap per step, which is
     // what MSM is for and what PCSS could never afford. Exponential height fog with single
     // scattering, composited after water + alpha and before the FP arms.
-    bool               g_volFog          = true;
+    //
+    // OFF by default (2026-07-26). The march is energy-neutral only against the tonemap it was
+    // tuned on; it lands with the linear/HDR pipeline, not before it. The F12 panel checkbox
+    // still turns it on for development.
+    bool               g_volFog          = false;
     // Density as a DISTANCE: the ground-level range over which optical depth reaches 1 (density =
     // 1/this). The shader wants a per-world-unit coefficient, but a Morrowind unit is ~1.4 cm, so
     // every useful value sits in ~1e-5..1e-4 — a slider range where one notch is the difference

@@ -59,7 +59,7 @@ namespace IPC {
 		bool m_frameWindowOpen;
 		// Cumulative count of RPCs refused because the window was open (either channel).
 		// Must stay 0 — nonzero means an unaudited call site fired mid-window (surfaced
-		// as refuse= in the client's [hb] heartbeat, critical for ForgeFrameAhead where
+		// as refuse= in the client's [hb] heartbeat, critical under frame-ahead where
 		// the window spans the whole MW frame).
 		unsigned m_windowRefusals;
 

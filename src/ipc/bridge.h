@@ -283,7 +283,7 @@ namespace IPC {
         std::uint32_t distLightsToggle = 0; // one-shot (numpad- edge): host flips baked distant-light loop (perf A/B)
         // Frame-ahead observability: the client's own last-frame timings, shown live in the
         // host Stats panel. Purely informational — no host behaviour keys off these.
-        std::uint32_t frameAhead = 0;      // 1 = deferred-finish pipelining live (ForgeFrameAhead / numpad-*)
+        std::uint32_t frameAhead = 0;      // 1 = deferred-finish pipelining live (default on; numpad-*)
         float clientWaitMs = 0.0f;         // last residual collect wait (the pipeline success metric)
         float clientDtMs = 0.0f;           // last whole MW frame delta (kickoff-to-kickoff)
         float clientMwStartMs = 0.0f;      // last Present-return -> BeginScene(0) gap (engine sim)

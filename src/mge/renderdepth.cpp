@@ -105,19 +105,13 @@ void DistantLand::earlyClassifyMainScene(void* worldCamera) {
     // classify path latches its per-frame state. Opaque bit: the plugin skips
     // engine display() of covered-opaque leaves — the DIPs our proxy rejects
     // per-draw anyway (inspectIndexedPrimitive). Alpha bit: it also skips
-    // single-map blended leaves our sorted-alpha host pass redraws (AT1) —
-    // gated on SuppressS1 so the F-panel A/B (suppress off = MW's full alpha
-    // path) stays intact. F11 (forgeOwnsFrame false) restores full display
-    // next frame. Logged plugin-side on change; absent/old export = opaque-
-    // only or no-op = the per-DIP reject fallback keeps correctness.
+    // single-map blended leaves our sorted-alpha host pass redraws (AT1).
+    // F11 (forgeOwnsFrame false) restores full display next frame. Logged
+    // plugin-side on change; absent/old export = opaque-only or no-op = the
+    // per-DIP reject fallback keeps correctness.
     int ownedFlags = 0;
     if (RenderProcess::forgeOwnsFrame()) {
-        if (Configuration.ForgeOpaqueDisplaySkip) {
-            ownedFlags |= MSOCClient::kOwnedOpaque;
-        }
-        if (Configuration.ForgeAlphaPass && Configuration.ForgeAlphaSuppressS1) {
-            ownedFlags |= MSOCClient::kOwnedAlpha;
-        }
+        ownedFlags = MSOCClient::kOwnedOpaque | MSOCClient::kOwnedAlpha;
     }
     s_visibleCallbackFired = false;
     // The classify is SYNCHRONOUS: the engine's world-camera scene walk (~10k nodes)
@@ -243,10 +237,9 @@ void DistantLand::buildFrustumVisibleSet(const D3DXMATRIX* view, const D3DXMATRI
         // S5a: the gate also required !UseRenderThread && !ForgeNearDepthReplay — the two
         // flags that could still put a DX9 depth consumer on s_frustumVisibleKeys. Both the
         // render thread and the near-depth replay are gone, so nothing outside the kickoff
-        // reads the set at all and only the live-draw-build + seam conditions remain.
-        const bool fold = Configuration.ForgeLiveDrawBuild
-            && RenderProcess::forgeOwnsFrame();
-        if (fold) {
+        // reads the set at all, and the live-draw-build flag that also rode this gate is now
+        // unconditional — the seam owning the frame is the whole condition.
+        if (RenderProcess::forgeOwnsFrame()) {
             s_foldDeferred = true;
             return;
         }

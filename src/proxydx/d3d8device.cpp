@@ -16,6 +16,7 @@
 // the proxy forwarders.
 std::mutex g_deviceMtx;
 bool       g_deviceLockEnabled = false;
+bool       g_useD3D9Ex = true;
 bool       g_spikeForceDefaultPool = false;
 
 

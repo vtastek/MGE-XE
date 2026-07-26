@@ -26,11 +26,16 @@
 extern std::mutex g_deviceMtx;
 extern bool       g_deviceLockEnabled;
 
-// Present-seam spike (Milestone B): set true only when MW's device was created as
-// D3D9Ex (UseRenderProcessEx). D3D9Ex rejects D3DPOOL_MANAGED, so while this is set
-// the proxy resource-creation forwarders translate MANAGED -> DEFAULT (textures also
-// gain D3DUSAGE_DYNAMIC so they stay lockable), and MGE's own MANAGED allocations do
-// the same. Off (the normal game) = every allocation stays exactly as before.
+// Present seam: create MW's device as D3D9Ex (shared render-target HANDLE -> zero-copy
+// Vulkan hand-off). On by default and no longer an ini setting; it self-clears at startup
+// if Direct3DCreate9Ex or CreateDeviceEx fails, so this is the runtime answer to "did the
+// Ex path actually take?" and must be read, not assumed, after device creation.
+extern bool       g_useD3D9Ex;
+
+// Set true only when MW's device really was created as D3D9Ex. D3D9Ex rejects
+// D3DPOOL_MANAGED, so while this is set the proxy resource-creation forwarders translate
+// MANAGED -> DEFAULT (textures also gain D3DUSAGE_DYNAMIC so they stay lockable), and
+// MGE's own MANAGED allocations do the same. Off = every allocation stays as before.
 extern bool       g_spikeForceDefaultPool;
 
 struct MgeDeviceLock {

@@ -585,7 +585,6 @@ bool isInstalled() {
 
 bool install() {
     if (g_installed) return true;
-    if (!Configuration.ForgeEngineCullTakeover) return false;
 
     // Two detours on one 5-byte prologue is unrecoverable: whoever patches second
     // overwrites the first's jump and the first's target is orphaned. msoc arms

@@ -2,6 +2,7 @@
 #include "mge/mwinitpatch.h"
 #include "mge/configuration.h"
 #include "mge/mwbridge.h"
+#include "proxydx/devicelock.h"
 #include "support/timing.h"
 #include <algorithm>
 
@@ -50,9 +51,9 @@ void MWInitPatch::patch() {
         mwBridge->disableIntroMovies();
     }
 
-    if (Configuration.UseDefaultTexturePool || Configuration.UseRenderProcessEx) {
+    if (Configuration.UseDefaultTexturePool || g_useD3D9Ex) {
         // Patch texture loading to reduce process memory footprint. Also force-on for the
-        // D3D9Ex spike path: Ex rejects D3DPOOL_MANAGED, and this routes Morrowind's static
+        // D3D9Ex seam path: Ex rejects D3DPOOL_MANAGED, and this routes Morrowind's static
         // textures through a SYSTEMMEM staging texture into a DEFAULT-pool texture.
         mwBridge->patchLoadTexture2D();
     }

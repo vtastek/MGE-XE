@@ -64,15 +64,15 @@ namespace {
     HWND   g_devHwnd = nullptr;        // MW focus window (cached from device creation params)
     bool   g_reloadShadersPending = false; // F8 latched at composite finish, consumed by the next kickoff
     bool   g_distLightsTogglePending = false; // numpad- latched at composite finish; one-shot host dist-light A/B
-    bool   g_fpSuppressLive = false;   // FP1b: MW arm suppression; seeded from ForgeFPSuppress at init, numpad-/ flips live
+    bool   g_fpSuppressLive = true;    // FP1b: MW arm suppression; on by default, numpad-/ flips live for the A/B
 
-    // Frame-ahead pipelining (ForgeFrameAhead): on early-kickoff frames the paired
+    // Frame-ahead pipelining: on early-kickoff frames the paired
     // renderSceneFinish + RT copy defer to the NEXT frame's BeginScene(0) collect, and the
     // EndScene(0) composite point blits the PREVIOUS host frame from g_mainTex (which the
     // copy left as a stable snapshot — the blit never reads the shared RT directly). The
     // host frame thus overlaps the WHOLE MW frame, not just scene 0. World image lags
     // input by one frame (UI stays current).
-    bool   g_frameAheadLive = false;   // seeded from ForgeFrameAhead at init; numpad-* flips live (A/B)
+    bool   g_frameAheadLive = true;    // on by default; numpad-* flips live (A/B)
     // Client produce (buildGeometryDrawLists + flush + RPC-start, D3D9-free after Tier 1a) on a
     // fresh dedicated worker. NUMPAD8 cycles 3 modes. (S5a: every mode was additionally gated on
     // !UseRenderThread — the legacy MGE render thread owned the device lock and forced a
@@ -195,7 +195,7 @@ namespace {
     struct KickState {
         bool rpcPending;
         bool early;     // fired from the BeginScene(0) site (DistantLand::earlyForgeKickoff latch)
-        // ForgeFrameAhead: this kickoff's finish is deferred to the NEXT frame's
+        // Frame-ahead: this kickoff's finish is deferred to the NEXT frame's
         // BeginScene(0) collect; the EndScene(0) composite point blits the previous
         // frame instead of finishing. Set only on early-kickoff frames — exactly the
         // frames whose whole MW frame is already validated IPC-free on both channels.
@@ -2116,9 +2116,7 @@ namespace {
         const bool wantStatic  = (bool)g_drawVec;
         const bool wantSkinned = (bool)g_skinnedVec;
         const bool wantMM      = (bool)g_multiMapVec;
-        // AT1 sorted-alpha: gated by the bring-up ini flag on top of the vec (capture + emit +
-        // host draw all ride this one gate; off = the blended set stays engine-drawn as before).
-        const bool wantAlpha   = (bool)g_alphaVec && Configuration.ForgeAlphaPass;
+        const bool wantAlpha   = (bool)g_alphaVec;
         if (!wantStatic && !wantSkinned && !wantMM && !wantAlpha) {
             // AT3 defensive clear: drop any captured records/geometry so an idle frame (menu/
             // loading) can't leave last frame's captures to accumulate or ship stale.
@@ -3337,8 +3335,6 @@ namespace RenderProcess {
             return;
         }
         g_client = client;
-        g_fpSuppressLive = Configuration.ForgeFPSuppress;   // FP1b seed; numpad-/ flips live
-        g_frameAheadLive = Configuration.ForgeFrameAhead;   // frame-ahead seed; numpad-* flips live
         if (!device) {
             LOG::logline("!! [seam] no device at init; seam disabled");
             return;
@@ -3402,7 +3398,7 @@ namespace RenderProcess {
 
     // --- Finish-half pieces -----------------------------------------------------------
     // The composite finish is split into once-per-frame pieces so frame-ahead pipelining
-    // (ForgeFrameAhead) can run them at different points: dev-key poll + finish/copy at
+    // can run them at different points: dev-key poll + finish/copy at
     // the NEXT frame's BeginScene(0) collect, the composite blit alone at EndScene(0).
     // The non-deferred path (onStage0CompositeFinish) runs all of them back to back —
     // behaviour identical to before the split.
@@ -3473,7 +3469,7 @@ namespace RenderProcess {
             g_fpSuppressLive = !g_fpSuppressLive;
             LOG::logline(">> [seam] FP suppression (FP1b) %s", g_fpSuppressLive ? "ON" : "OFF");
         }
-        // Numpad *: frame-ahead pipelining live A/B (ForgeFrameAhead). Takes effect at the
+        // Numpad *: frame-ahead pipelining live A/B. Takes effect at the
         // next kickoff; a pending deferred frame still collects normally (the collect keys
         // on g_kick.deferFinish, not this flag), so the toggle can never wedge the window.
         if (GetAsyncKeyState(VK_MULTIPLY) & 0x0001) {
@@ -3569,7 +3565,7 @@ namespace RenderProcess {
         // whole RPC round trip, NOT GPU time — these plots are what tell you which half of it you
         // are actually looking at. "host GPU frame ms" is whole-command-buffer GPU execution: if
         // it sits far below the box width, the frame is host-CPU/serial-bound and shrinking shader
-        // work buys little. Names carry (N-1) because under ForgeFrameAhead the drained frame is
+        // work buys little. Names carry (N-1) because under frame-ahead the drained frame is
         // one behind MW's current frame — the plot point lands on the frame that CONSUMED it.
         g_lastHostTimings = hostT;
         MGE_TracyPlot("host GPU frame ms (N-1)",  (double)hostT.gpuFrameMs);
@@ -4931,13 +4927,6 @@ namespace RenderProcess {
         accumFrameStats(g_kick, fr, nowMs(), false, 0.0);
     }
 
-    void onStage0Composite(IDirect3DDevice9* device) {
-        // Fused kickoff+finish — the exact pre-split serial behaviour (A/B reference,
-        // UseAsyncHostFrame=0). overlap ≈ 0 by construction.
-        onStage0CompositeKickoff(device);
-        onStage0CompositeFinish(device);
-    }
-
     bool kickoffPending() {
         // g_produceInFlight covers the mode-2 window between the BeginScene(0) async kick and the
         // EndScene(0) waitProduce, so the late-kick guard never double-kicks before g_kick is set.
@@ -5146,17 +5135,17 @@ namespace RenderProcess {
     }
 
     bool wantsFPCapture() {
-        // FP1a: seam live + geometry capture up + composite ON (F11) + ini flag + FIRST person.
+        // FP1a: seam live + geometry capture up + composite ON (F11) + FIRST person.
         // Gates the cache's armCamera-root walk, the FP draw-list build and the fp wire crossing.
         return g_initOk && g_geomVec.has_value() && g_enabled
-            && Configuration.ForgeFPPass && !MWBridge::get()->is3rdPerson();
+            && !MWBridge::get()->is3rdPerson();
     }
 
     bool wantsFPSuppression() {
         // FP1b: suppress MW's own arm draws ONLY while the host FP pass is actually able
         // to ship them (capture live + camera math validated) — the arms must never
-        // vanish without a replacement. g_fpSuppressLive seeds from ForgeFPSuppress and
-        // flips live on numpad-/ for the A/B.
+        // vanish without a replacement. g_fpSuppressLive is on by default and flips live
+        // on numpad-/ for the A/B.
         return wantsFPCapture() && g_fpSuppressLive && g_fpCamValid;
     }
 
@@ -5191,7 +5180,6 @@ namespace RenderProcess {
     }
 
     void captureAlphaDraw(const RenderedState* rs, const FragmentState* frs) {
-        if (!Configuration.ForgeAlphaCapture) return;
         if (!g_initOk || !g_enabled || !g_capturedVec) return;
         if (!rs || !frs) return;
         // HW-skinned blends (ghosts) excluded — the bind-pose VB here is the wrong pose (a

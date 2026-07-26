@@ -58,8 +58,8 @@ public:
     // read by renderStage0 to skip its own redundant fallback walk.
     static bool earlyWalkedCache;
     // Async full-frame overlap (Phase 2): latched by frameSetupEarly() when THIS frame
-    // runs the early Forge kickoff at BeginScene(0) — UseAsyncHostFrame + the Forge
-    // baseline (seam compositing + Forge water), one warm-up frame after any transition.
+    // runs the early Forge kickoff at BeginScene(0) — i.e. the Forge baseline is up
+    // (seam compositing + Forge water), one warm-up frame after any transition.
     // Covers exterior distant cells (2a: the distant-statics cull is gated off — the
     // host renders those statics) AND plain interiors / non-distant cells (2b: no
     // scene-0 RPC exists there; the interior cache walk + visible set are hoisted to

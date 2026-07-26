@@ -27,11 +27,7 @@ namespace RenderProcess {
     // BEHIND s1's sorted-alpha + first-person and post-process works on the whole composite.
     // (Was onPresent — moved earlier so the opaque layer composites in scene order.)
     //
-    // FUSED form (UseAsyncHostFrame=0): kickoff+finish back-to-back — the exact pre-split
-    // serial behaviour for A/B.
-    void onStage0Composite(IDirect3DDevice9* device);
-
-    // Async-frame split (UseAsyncHostFrame=1). Kickoff: flush geom/tex, build the draw
+    // Async-frame split. Kickoff: flush geom/tex, build the draw
     // lists + frame params, and START the host RenderFrame without waiting — the host
     // renders frame N while MW's own frame-N work continues. Finish: wait for the host
     // (GPU-complete fence), copy the shared RT, composite over MW's backbuffer. The two
@@ -71,7 +67,7 @@ namespace RenderProcess {
     // fired this frame.
     bool kickoffPending();
 
-    // Frame-ahead pipelining (ForgeFrameAhead ini, numpad-* live A/B). On early-kickoff
+    // Frame-ahead pipelining (on by default, numpad-* live A/B). On early-kickoff
     // frames the kickoff marks its finish DEFERRED: the EndScene(0) composite point only
     // blits the PREVIOUS host frame (onFrameAheadBlit — zero IPC, zero wait), and the
     // finish + RT copy run at the NEXT frame's BeginScene(0) (onFrameAheadCollect —
@@ -176,14 +172,14 @@ namespace RenderProcess {
     // this hands it over. Sticky until the purge consumes it.
     void noteLoadingBar(bool loading);
 
-    // FP1a first-person takeover: true when the seam is live AND compositing AND the Forge FP
-    // pass is enabled (ForgeFPPass ini) AND the player is in FIRST person. Gates the cache's
-    // armCamera-root walk + the per-frame FP draw lists + the FP camera crossing. Default off
-    // (ini) → MW's own first-person rendering is untouched.
+    // FP1a first-person takeover: true when the seam is live AND compositing AND the player
+    // is in FIRST person. Gates the cache's armCamera-root walk + the per-frame FP draw lists
+    // + the FP camera crossing. False (3rd person / seam down) → MW's own first-person
+    // rendering is untouched.
     bool wantsFPCapture();
 
     // FP1b: true when the host FP pass is live (wantsFPCapture + camera math validated) AND
-    // suppression is on (ForgeFPSuppress ini, flipped live with numpad-/). The cache walk
+    // suppression is on (default, flipped live with numpad-/). The cache walk
     // applies it by force-culling MW's arm-scene root each frame (restored once on release),
     // so MW's own first-person draws no-op while the host draws the arms.
     bool wantsFPSuppression();
@@ -240,7 +236,7 @@ namespace RenderProcess {
                                  const std::uint16_t* indices, std::uint32_t indexCount,
                                  const std::uint8_t* uvAnim = nullptr, std::uint16_t uvAnimBytes = 0);
 
-    // AT3 captured-alpha: called from the ForgeAlphaSuppressS1 reject gate
+    // AT3 captured-alpha: called from the AT1 sorted-alpha reject gate
     // (distantland.cpp inspectIndexedPrimitive) for each alpha-BLENDED DIP MW is about to skip
     // in scenes >= 1. MW already billboarded + sorted it; we Lock the live VB/IB, copy the final
     // verts + rebased indices into pending scratch, and record the draw metadata so the next

@@ -657,10 +657,8 @@ namespace MGE::GeometryCache {
             }
 
             // Last: needs matEmissive (read above) and, for the diagnostic logline, the
-            // captured base texture name. Derived unconditionally rather than gated on the
-            // INI knob so ForgeEmissiveBoost can be flipped live — materials are captured
-            // once per cache entry, so the gain must already be sitting there when the
-            // toggle turns on.
+            // captured base texture name. Materials are captured once per cache entry, so
+            // the gain is derived here and applied per draw by emissiveForDraw().
             computeEmissiveGain(e, geom);
         }
 
@@ -3221,15 +3219,9 @@ namespace MGE::GeometryCache {
     }
 
     void emissiveForDraw(const CachedGeometry& e, float* out) {
-        if (Configuration.ForgeEmissiveBoost) {
-            out[0] = e.matEmissive[0] * e.emissiveGain[0];
-            out[1] = e.matEmissive[1] * e.emissiveGain[1];
-            out[2] = e.matEmissive[2] * e.emissiveGain[2];
-        } else {
-            out[0] = e.matEmissive[0];
-            out[1] = e.matEmissive[1];
-            out[2] = e.matEmissive[2];
-        }
+        out[0] = e.matEmissive[0] * e.emissiveGain[0];
+        out[1] = e.matEmissive[1] * e.emissiveGain[1];
+        out[2] = e.matEmissive[2] * e.emissiveGain[2];
     }
 
     uint64_t currentFrame() {
