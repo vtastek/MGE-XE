@@ -19,6 +19,7 @@
 #include "NITriBasedGeometryData.h"
 #include "NISkinInstance.h"
 #include "NIUVController.h"
+#include "NIFlipController.h"
 
 #include "configuration.h"
 #include "datahandler_view.h"
@@ -698,6 +699,10 @@ namespace MGE::GeometryCache {
                 for (const NI::TimeController* c = ps->texture->controllers; c; c = c->nextController) {
                     if (c->isOfType(NI::RTTIStaticPtr::NiFlipController)) {
                         e.texAnimated = true;
+                        // The controller also carries the WHOLE book (FlipController::textures,
+                        // every source already named and D3D-resident at mesh load) plus the live
+                        // currentIndex — measured 2026-07-26, so a Texture2DArray can be built for
+                        // it with no modder-side change. See tasks/forge-flipbook-array.md.
                         break;
                     }
                 }
