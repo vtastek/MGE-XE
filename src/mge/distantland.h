@@ -132,25 +132,11 @@ public:
     // the draws could be replayed into the depth texture. Nothing replays them now.)
     static unsigned recordMWCount;
 
-    // CPU-side copy of each distant-land tile's triangle mesh, captured
-    // during initLandscape before the VB/IB Unlocks. Used by
-    // contributeDistantLandOccluders to feed the plugin's MSOC mask the
-    // real terrain surface — sampled subsets (regular grids etc.) fight
-    // ROAM's adaptive tessellation and produce poor silhouettes, so we
-    // store the full mesh. Cost: ~20 MB extra RAM per worldspace, well
-    // within budget for a 32-bit process with a 2-4 GB heap.
-    //
-    // Keyed by the tile's VB pointer (the vBuffer field each RenderMesh
-    // in visLand / visLandShared carries).
-    //
-    // Indices are stored uniformly as uint32 regardless of the on-disk
-    // format (16-bit for small tiles, 32-bit for large) so the runtime
-    // rebase path doesn't have to branch.
-    struct LandMeshCache {
-        std::vector<D3DXVECTOR3>   positions;   // POSITION float3 only; UVs discarded
-        std::vector<std::uint32_t> indices;     // promoted to uint32 uniformly
-    };
-    static std::unordered_map<IDirect3DVertexBuffer9*, LandMeshCache> landMeshes;
+    // (Removed: LandMeshCache / landMeshes — the CPU-side copy of every distant-land
+    // tile's triangle mesh, ~20 MB per worldspace. Its only consumer was
+    // contributeDistantLandOccluders, which fed the plugin's MSOC horizon curtain; that
+    // went out with renderexterior.cpp in S4, leaving the map written and never read.
+    // See tasks/msoc-retirement.md.)
 
     static IDirect3DTexture9* texWorldColour, *texWorldNormals, *texWorldDetail;
     static IDirect3DTexture9* texMenuCache;
