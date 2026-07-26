@@ -230,12 +230,10 @@ namespace IPC {
         IN D3DXVECTOR4 reflSphere;
         IN VisibleSetSort reflSort;
 
-        // Host-side occlusion cull. occlusionMask is a Vec holding the
-        // [OcclusionMask::Header][raw MOC ZTile buffer] blob shipped from
-        // msoc.dll; the server reconstructs the mask and TestRect-culls each
-        // frustum survivor before PushBack, so only visible statics cross the
-        // wire. InvalidVector ⇒ no host cull (behaves exactly as before).
-        IN VecId occlusionMask;
+        // (MSOC retirement D5: an IN VecId occlusionMask followed, carrying the
+        // shipped MOC mask blob the server culled distant statics against. No
+        // caller ever set it — the host's Hi-Z GPU cull owns occlusion — so the
+        // field and the whole server-side filter behind it are gone.)
     };
 
     // --- Present-seam spike params ---

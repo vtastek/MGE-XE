@@ -408,7 +408,7 @@ namespace IPC {
 		const DWORD (&setFlags)[3], VisibleSetSort sort,
 		VecId reflSet, DWORD reflFlags,
 		const ViewFrustum* reflFrustum, const D3DXVECTOR4* reflSphere,
-		VisibleSetSort reflSort, VecId occlusionMask)
+		VisibleSetSort reflSort)
 	{
 		WAIT_FOR_PREVIOUS_COMMAND;
 
@@ -429,8 +429,6 @@ namespace IPC {
 			params.reflFrustum = *reflFrustum;
 			params.reflSphere = *reflSphere;
 		}
-		// Host-side occlusion cull mask Vec (InvalidVector ⇒ disabled).
-		params.occlusionMask = occlusionMask;
 		return beginRpc(Command::GetVisibleMeshesAllRanges);
 	}
 

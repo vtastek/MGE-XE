@@ -670,8 +670,6 @@
     <ClInclude Include="..\src\mge\quadtree.h" />
     <ClInclude Include="..\src\support\log.h" />
     <ClInclude Include="..\src\support\winheader.h" />
-    <ClInclude Include="..\src\ipc\occlusionmask.h" />
-    <ClInclude Include="..\src\ipc\occlusiontest.h" />
     <ClInclude Include="..\3rdparty\msoc\MaskedOcclusionCulling.h" />
     <ClInclude Include="vkrender.h" />
     <ClInclude Include="vkshaders.h" />

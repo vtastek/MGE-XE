@@ -276,8 +276,7 @@ namespace IPC {
 			VecId reflSet = InvalidVector, DWORD reflFlags = 0,
 			const ViewFrustum* reflFrustum = nullptr,
 			const D3DXVECTOR4* reflSphere = nullptr,
-			VisibleSetSort reflSort = VisibleSetSort::None,
-			VecId occlusionMask = InvalidVector);
+			VisibleSetSort reflSort = VisibleSetSort::None);
 
 		/**
 		* @brief Asynchronously sort an already-populated visible set.

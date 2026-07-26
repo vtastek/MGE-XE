@@ -1,6 +1,5 @@
 #include "ipc/dlshare.h"
 #include "ipc/server.h"
-#include "ipc/occlusiontest.h"
 #include "ipc/geomwire.h"
 #include "support/log.h"
 #include "vkrender.h"
@@ -54,37 +53,16 @@ namespace {
     };
     AllRangesStats g_allRangesStats;
 
-    // Host-side occlusion mask, reconstructed from the shipped blob. Persistent
-    // so the MOC instance survives across frames (recreated only on tier/res
-    // change). The quadtree walk consults it via the OcclusionFilter callback
-    // below, skipping occluded distant statics before PushBack so only visible
-    // survivors cross the IPC boundary.
-    OcclusionMask::HostMask g_hostMask;
-    int g_hostMaskLogFrame   = 0;
-    int g_hostCulledThisRpc  = 0;
-
     // --- Present-seam state ---
     // Target size of the Forge-owned shared render target (set at RenderInit), used
     // to report bytesWritten back to the client.
     std::uint32_t g_spikeWidth = 0;
     std::uint32_t g_spikeHeight = 0;
 
-    // OcclusionFilter callback: raw per-frame verdict (matches MGE's in-process
-    // cull — no inflate, no hysteresis, both unwired in MGE today). ctx is the
-    // HostMask. Returns true to CULL (occluded). VIEW_CULLED / VISIBLE are kept
-    // (the host's distant frustum is wider than the mask's). The QuadTreeMesh
-    // pointer is available here, so a future host-side hysteresis streak map
-    // would key on &m without any wire change.
-    bool hostOcclCull(void* ctx, const QuadTreeMesh& m) {
-        auto* mask = static_cast<OcclusionMask::HostMask*>(ctx);
-        const auto r = mask->testSphere(
-            m.sphere.center.x, m.sphere.center.y, m.sphere.center.z, m.sphere.radius);
-        if (r == MaskedOcclusionCulling::OCCLUDED) {
-            ++g_hostCulledThisRpc;
-            return true;
-        }
-        return false;
-    }
+    // (MSOC retirement D5: g_hostMask + the hostOcclCull OcclusionFilter callback
+    // lived here — the host reconstructed msoc's shipped MOC mask and TestRect-culled
+    // distant statics before PushBack. The client never shipped a mask, so the filter
+    // never ran; the Forge host's two-phase Hi-Z GPU cull owns occlusion now.)
 }
 
 namespace IPC {
@@ -368,29 +346,6 @@ namespace IPC {
 		auto& params = m_ipcParameters->params.meshAllRangesParams;
 		auto& vec = getVec<RenderMesh>(params.visibleSet);
 
-		// Host-side occlusion cull: reconstruct the shipped mask and build the
-		// filter the walk consults per-mesh (occluded → skipped pre-PushBack, so
-		// only survivors cross IPC). Built BEFORE the walks. Any failure (no mask
-		// shipped, stale snapshot, version/layout mismatch) leaves occPtr null →
-		// the walk behaves exactly as before (full set).
-		OcclusionFilter occ{};
-		const OcclusionFilter* occPtr = nullptr;
-		bool maskLoaded = false;
-		std::uint32_t availBytes = 0;
-		if (params.occlusionMask != InvalidVector) {
-			auto& mv = getVec<OcclusionMask::MaskChunk>(params.occlusionMask);
-			availBytes = mv.size() * static_cast<std::uint32_t>(sizeof(OcclusionMask::MaskChunk));
-			if (mv.size() >= 1 && availBytes >= sizeof(OcclusionMask::Header)) {
-				maskLoaded = g_hostMask.load(&mv[0], static_cast<int>(availBytes));
-				if (maskLoaded) {
-					occ.cull = &hostOcclCull;
-					occ.ctx  = &g_hostMask;
-					occPtr   = &occ;
-				}
-			}
-		}
-		g_hostCulledThisRpc = 0;
-
 		// Sort runs once at the end across the merged set — pass None to
 		// the per-range fetches so they don't sort intermediate state.
 		LARGE_INTEGER t0, t;
@@ -400,7 +355,7 @@ namespace IPC {
 		for (std::uint8_t i = 0; i < params.rangeCount; ++i) {
 			DistantLandShare::getVisibleMeshes(
 				vec, params.viewFrustum[i], params.viewSphere[i],
-				VisibleSetSort::None, params.setFlags[i], occPtr);
+				VisibleSetSort::None, params.setFlags[i]);
 			QueryPerformanceCounter(&t);
 			if (i < 3) rangeMs[i] = msBetween(prev, t);
 			prev = t;  // prev now marks the end of the walks
@@ -423,19 +378,6 @@ namespace IPC {
 				rvec, params.reflFrustum, params.reflSphere,
 				VisibleSetSort::None, params.reflFlags);
 			DistantLandShare::sortVisibleSet(rvec, params.reflSort);
-		}
-
-		// Host-side occlusion cull diagnostic (Increment 2). The walk already
-		// dropped occluded statics; vec is now the survivor set. Log the cull
-		// count + survivors every 60 frames when a mask was shipped.
-		if (params.occlusionMask != InvalidVector && (g_hostMaskLogFrame++ % 60) == 0) {
-			const auto& h = g_hostMask.header();
-			LOG::logline("-- [host occl] avail=%u B %s | ready=%d impl=%d res=%dx%d zbuf=%u age=%llums "
-			             "| culled=%d survivors=%u",
-			             availBytes, maskLoaded ? "loaded" : "REJECTED",
-			             h.ready, h.impl, h.maskW, h.maskH, h.zbufBytes, h.ageMs,
-			             g_hostCulledThisRpc, vec.size());
-			LOG::flush();
 		}
 
 		g_allRangesStats.record(rangeMs, sortMs, walkMs + sortMs, vec.size());

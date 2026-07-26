@@ -65,10 +65,8 @@ bool DistantLand::isDistantLandLoaded = false;
 
 
 IPC::VecView<IPC::DynVisFlag> DistantLand::dynVisFlagsShared;
-IPC::VecView<OcclusionMask::MaskChunk> DistantLand::maskBlobShared;
 
 IPC::VecId DistantLand::dynVisFlagsSharedId = IPC::InvalidVector;
-IPC::VecId DistantLand::maskBlobSharedId = IPC::InvalidVector;
 
 unsigned DistantLand::recordMWCount = 0;
 
@@ -267,20 +265,9 @@ bool DistantLand::initIpc() {
     dynVisFlagsSharedId = dynVisVec.id();
     dynVisFlagsShared = dynVisVec;
 
-    // Occlusion-mask transfer vec (host-side cull). One resident window of
-    // kBlobChunks × 64KB chunks — large enough for the biggest blob (AVX512
-    // ZTile buffer ~96KB + header) while keeping the Vec reservation tiny (the
-    // element is a 64KB chunk, not a byte, so maxSize*windowBytes stays small;
-    // see occlusionmask.h). Allocated unconditionally; written only when
-    // host-cull is enabled + supported.
-    auto maybeMaskVec = ipcClient.allocVecBlocking<OcclusionMask::MaskChunk>(
-        OcclusionMask::kBlobChunks, OcclusionMask::kBlobChunks, OcclusionMask::kBlobChunks);
-    if (!maybeMaskVec.has_value()) {
-        return false;
-    }
-    auto& maskVec = maybeMaskVec.value();
-    maskBlobSharedId = maskVec.id();
-    maskBlobShared = maskVec;
+    // D5: a 192KB single-window chunk vec was allocated here to ship msoc's occlusion
+    // mask blob to the host. It was never written — no caller ever passed its VecId to
+    // getVisibleMeshesAllRanges — and the host-side filter it fed is gone with it.
 
     // Present-seam: bring up the out-of-process Forge D3D12 renderer + the DXVK
     // Vulkan-interop seam that imports its shared render target
