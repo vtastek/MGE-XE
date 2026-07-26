@@ -185,6 +185,7 @@
     <ClCompile Include="src\mge\phasetimers.cpp" />
     <ClCompile Include="src\mge\postshaders.cpp" />
     <ClCompile Include="src\mge\quadtree.cpp" />
+    <ClCompile Include="src\mge\enginecull.cpp" />
     <ClCompile Include="src\mge\renderdepth.cpp" />
     <ClCompile Include="src\mge\renderprocess.cpp" />
     <ClCompile Include="src\imgui\imgui.cpp" />
@@ -264,6 +265,8 @@
     <ClInclude Include="src\mge\scenegraph.h" />
     <ClInclude Include="src\mge\scenegraph_geometry_cache.h" />
     <ClInclude Include="src\mge\datahandler_view.h" />
+    <ClInclude Include="src\mge\enginecull.h" />
+    <ClInclude Include="src\mge\worldcontroller_view.h" />
     <ClInclude Include="src\mge\mge_se_prelude.h" />
     <ClInclude Include="src\mge\statusoverlay.h" />
     <ClInclude Include="src\mge\userhud.h" />

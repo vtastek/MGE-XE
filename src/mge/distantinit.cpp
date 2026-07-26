@@ -9,6 +9,7 @@
 #include "postshaders.h"
 #include "morrowindbsa.h"
 #include "msocclient.h"
+#include "enginecull.h"
 #include "mwbridge.h"
 #include "mgeversion.h"
 #include "scenegraph_geometry_cache.h"
@@ -225,6 +226,13 @@ bool DistantLand::init() {
     // fires at BeginScene(0) with the engine's current-frame drawn set, which
     // buildFrustumVisibleSet consumes as the MSOC-culled cache set.
     MSOCClient::registerVisibleGeomCallback(onVisibleGeom);
+
+    // MSOC retirement D2: optionally take the CullShow traversal in-house instead
+    // (tasks/msoc-detour-absorb.md). Deliberately AFTER MSOCClient::init(), so the
+    // prologue-byte check gets its best chance of seeing an already-armed msoc
+    // detour; install() refuses whenever msoc.dll is present at all. Default off —
+    // with it off this is a single predicate and nothing is patched.
+    MGE::EngineCull::install();
 
     MWBridge::get()->patchResolveDuringInit(&resolveDynamicVisGroups);
 

@@ -90,8 +90,13 @@ public:
     // walk discovers newly-visible objects instead of the classify's lazy-capture) and
     // buildFrustumVisibleSet takes the frustum-only branch (whole-cache frustum cull, no
     // s_visibleKeys dependency) — the host's two-phase Hi-Z GPU cull then owns ALL
-    // occlusion. A/B live via VK_SCROLL. Boot default off (= known-good MSOC path) until
-    // verified; Phase 2 deletes earlyClassifyMainScene once this is proven.
+    // occlusion. A/B live via VK_SCROLL. Boot default off (= known-good MSOC path).
+    // DISPROVEN as a deletion route (2026-07-26): flipping this on costs a 7.05 ms full
+    // cache walk (runRefreshWalks over 12,572 entries) because the classify is not just an
+    // occlusion verdict — it is the engine-driven DISCOVERY feed. earlyClassifyMainScene
+    // therefore STAYS; retiring MSOC means absorbing the CullShow detour that produces the
+    // feed, not deleting the consumer. See tasks/msoc-detour-absorb.md. Keep this knob: it
+    // is the A/B baseline (frustum-only) the absorbed path is measured against.
     static bool hostCullOnly;
     // MW-ONLY-UI: BITMASK of the world roots the engine is forbidden to traverse
     // (GeometryCache::kSuppressLand/Pick/Objects). Independent bits, not a ladder — a cumulative
