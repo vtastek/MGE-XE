@@ -36,6 +36,12 @@ STRUCT(VSOutput)
     DATA(float3,      WorldPos,   TEXCOORD8); // Tier 3a: world position for point-light eval
     DATA(FLAT(uint),  OverlayIndex,TEXCOORD9);// terrain DECAL_1 bindless slot (0 = no decal)
     DATA(FLAT(uint),  ClampMode,  TEXCOORD10);// MW texture address mode (0..3) -> sampleBase()
+    // This draw's instance index — the same value that selected gBatch.worlds above. Forwarding it
+    // is what lets a paired frag read ARBITRARY per-draw data out of a side table without adding
+    // instance lanes: kStaticInstU32 and the binding-1 vertex layout are shared by every
+    // opaque-layout pipeline, so growing them for one frag ripples through all of them. alpha.frag
+    // uses it for gAlphaStages; every other paired frag simply omits it from its own VSOutput.
+    DATA(FLAT(uint),  DrawIdx,    TEXCOORD11);
 };
 
 ROOT_SIGNATURE(DefaultRootSignature)
@@ -77,6 +83,7 @@ VSOutput VS_MAIN( VSInput In )
     Out.MatAmbient  = In.MatAmbient;
     Out.MatEmissive = In.MatEmissive;
     Out.OverlayIndex = In.OverlayIndex;   // terrain DECAL_1 slot (0 = no decal)
+    Out.DrawIdx      = drawIndex;         // side-table index (alpha.frag -> gAlphaStages)
     // MW near fog (per-vertex, as FFE): dist is camera distance = |worldPos - eye| (the view
     // transform is rigid, so this equals length(viewpos)). fog = saturate((end-dist)/(end-start)).
     float dist = length(worldPos.xyz - gFrameData.eyePos.xyz);

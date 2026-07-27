@@ -589,6 +589,10 @@ namespace {
         float alphaRef;
         std::uint32_t vColSource;
         float matDiffuse[3], matAmbient[3], matEmissive[3], matAlpha;
+        // FFE stages beyond the base map (dark/detail/glow folded into the same DIP) — see
+        // IPC::AlphaDrawWire::stages. packMMStage-encoded, uvSet always 0.
+        std::uint32_t stageCount;
+        std::uint32_t stages[3];
     };
     // CONSUME/SHIP side (produce WORKER only): buildGeometryDrawLists reads g_capRecs, appends FP
     // particles to g_capVertScratch/g_capIdxScratch, and the kickoff ships them. Filled by the swap
@@ -597,8 +601,24 @@ namespace {
     std::vector<std::uint16_t>       g_capIdxScratch;    // consumed/shipped indices (frame N-1)
     std::vector<CapturedAlphaRec>    g_capRecs;          // consumed records (frame N-1)
     std::optional<IPC::VecView<IPC::GeomChunk>> g_capturedVec;   // shipped at kickoff ([verts][indices])
-    // Old-msoc double-draw guard: (d3dTexture<<32 | vertCount) of every cached blended shape the
-    // host already draws; a captured DIP that matches one is a duplicate and is skipped.
+    // Old-msoc double-draw guard: (bindless slot << 32 | vertCount) of every cached blended shape
+    // the host already draws; a captured DIP that matches one is a duplicate and is skipped.
+    //
+    // The key used to be the GPU TEXTURE POINTER, which silently stopped working for flip books.
+    // A NiFlipController at secondsPerFrame=0.0067 (150 fps) rebinds a different
+    // IDirect3DTexture9* nearly every displayed frame, so the pointer the worker recorded never
+    // matched the one MAIN saw — Enhanced Light's magelight quad was drawn TWICE every frame
+    // (Route C base x dark, plus an AT3 base-only copy blended on top = the "too bright" orb).
+    // Keying on the RESOLVED BINDLESS SLOT fixes it: since the flip-array work every frame of a
+    // book encodes as bit15|bucket<<11|layer, so masking the LAYER off yields one value for the
+    // whole book, and both sides already resolve that slot for their own draw.
+    // Slot 0 (unnamed / host default white) is NEVER inserted or matched — a pointer key kept
+    // unnamed draws distinct, a slot key would alias every unnamed draw of the same vertCount.
+    inline std::uint64_t alphaDedupKey(std::uint32_t texSlot, std::uint32_t vertCount) {
+        const std::uint32_t book = IPC::isFlipSlot(texSlot)
+                                 ? (texSlot & ~IPC::kFlipLayerMask) : texSlot;
+        return ((std::uint64_t)book << 32) | (std::uint64_t)vertCount;
+    }
     // DOUBLE-BUFFERED (2026-07-21): the WORKER clears+builds g_alphaDedup in buildGeometryDrawLists
     // while MAIN's captureAlphaDraw reads it — the same worker-build/main-read race as the capture
     // scratch. Reading it directly made the glow-window blended-MM draw flicker white/orange (main
@@ -641,6 +661,10 @@ namespace {
     }
     // Drop counters (one-shot logged): lock fail / cap overflow / INDEX32 rebase / no-name-white.
     std::uint32_t g_capDropLock = 0, g_capDropCap = 0, g_capDropIdx32 = 0, g_capNoName = 0;
+    // AT3 extra-stage drops: a dark/detail/glow stage sampling UV set 1+ that the single-UV
+    // captured VB cannot carry (see captureAlphaDraw). Non-zero means the documented limit is
+    // being hit by real content and the captured path needs a wide-vertex variant.
+    std::uint32_t g_capStageUVDrop = 0;
     // [alpha-dedup] Is the (texture, vertexCount) dedup key eating LIVE particle draws?
     // World particles are never cached shapes ("not NiTriShapes, not captured by the cache walk"),
     // so the dedup must never drop one — but its key is a coarse alias, and a particle system whose
@@ -2173,6 +2197,12 @@ namespace {
             // like the draped altar cloth gets CULL_BACK, hiding its back/interior faces).
             item.cullFlags = (e.twoSided ? IPC::kAlphaCullTwoSided : 0u)
                            | (e.mirrored ? IPC::kAlphaCullMirrored : 0u);
+            // A CACHED blend on this list is single-map by construction — dispatch() routes any
+            // entry carrying dark/detail/glow to Route C (MultiMapDrawWire) instead, which has its
+            // own full stage loop. The AT3 extra stages are for captured DIPs only; zero them so
+            // the host's per-draw stage table never reads stale bytes for a cached item.
+            item.stageCount = 0;
+            item.stages[0] = item.stages[1] = item.stages[2] = 0;
             const std::size_t at = dst.size();
             dst.resize(at + sizeof(item));
             memcpy(dst.data() + at, &item, sizeof(item));
@@ -2213,6 +2243,9 @@ namespace {
             // same sample. If a captured DECAL ever shows the tiling artifact, the fix is to snapshot
             // D3DSAMP_ADDRESSU/V into RenderedState at the reject gate and ship it here.
             item.clampMode  = IPC::kTexWrapSWrapT;
+            // Dark/detail/glow stages MW folded into this same DIP (captureAlphaDraw resolved them).
+            item.stageCount = rec.stageCount;
+            item.stages[0] = rec.stages[0]; item.stages[1] = rec.stages[1]; item.stages[2] = rec.stages[2];
             const std::size_t at = g_alphaScratch.size();
             g_alphaScratch.resize(at + sizeof(item));
             memcpy(g_alphaScratch.data() + at, &item, sizeof(item));
@@ -2365,12 +2398,19 @@ namespace {
                 } else {
                     return;   // feature off — leave MW's DIP (AT3 white) as the fallback, no dedup
                 }
-                // AT3: record (GPU texture, vertexCount) so captureAlphaDraw skips this exact blend
+                // AT3: record (bindless slot, vertexCount) so captureAlphaDraw skips this exact blend
                 // if MW's own DIP for it still reaches the reject gate (old-msoc dll: opaque-only
                 // skip → cached blends both DIP AND ride the host). Both host paths above suppress it.
-                if (e.d3dTexture) {
-                    g_alphaDedup.insert(((std::uint64_t)(std::uintptr_t)e.d3dTexture << 32)
-                                        | (std::uint64_t)e.vertexCount);
+                // The slot — not e.d3dTexture — is the key: a NiFlipController rebinds a new GPU
+                // texture nearly every frame, so a pointer key never matched for flip books and the
+                // magelight quad was drawn twice (see alphaDedupKey). resolveCachedSlot is memoized
+                // into this SlotInfo, so the emit above/below re-reads it for free.
+                if (e.d3dTexture && e.textureName) {
+                    const std::uint32_t texSlot = resolveCachedSlot(e.textureName, slot.baseNamePtr,
+                                                                    slot.baseSlot, slot.baseEpoch);
+                    if (texSlot != 0u) {
+                        g_alphaDedup.insert(alphaDedupKey(texSlot, e.vertexCount));
+                    }
                 }
                 return;
             }
@@ -5380,27 +5420,49 @@ namespace RenderProcess {
         if ((rs->fvf & D3DFVF_POSITION_MASK) != D3DFVF_XYZ) return;   // untransformed XYZ only
         if (rs->vertCount == 0 || rs->primCount == 0) return;
 
+        // Texture slot: rs->texture is the proxy realTexture pointer, identical to the GPU texture
+        // the cache walk registered in g_textureNameMap. Resolve name -> bindless slot (per-frame
+        // memo). No name -> slot 0 (host default white): a visible white particle beats an invisible
+        // one, and NiFlipController textures self-correct after the first walk registers them.
+        // Resolved BEFORE the dedup below because the dedup keys on this slot, not the pointer.
+        auto slotOfStageTexture = [&](IDirect3DTexture9* tex, bool warnUnnamed) -> std::uint32_t {
+            auto mit = g_capInTexMemo.find(tex);
+            if (mit != g_capInTexMemo.end()) {
+                return mit->second;
+            }
+            const char* name = MGE::GeometryCache::resolveTextureName(tex);
+            const std::uint32_t slot = name ? resolveTextureSlot(name) : 0u;
+            if (!name && warnUnnamed && g_capNoName++ < 20) {
+                LOG::logline("!! [alpha-cap] no source name for tex=%p (white)", (void*)tex);
+            }
+            g_capInTexMemo.emplace(tex, slot);
+            return slot;
+        };
+        const std::uint32_t texIndex = slotOfStageTexture(rs->texture, /*warnUnnamed=*/true);
+
         // Old-msoc double-draw guard: this DIP is a duplicate iff the host already draws a cached
-        // blended shape with the same (GPU texture, vertexCount) — the cache draws from its own VB
-        // copies so rs->vb never matches, but (tex, vertCount) does (the vertCount term kills the
+        // blended shape with the same (bindless slot, vertexCount) — the cache draws from its own VB
+        // copies so rs->vb never matches, but (slot, vertCount) does (the vertCount term kills the
         // shared-texture false positive — particle counts vary). Read the ACTIVE (prev-frame) set,
         // NOT g_alphaDedup — the worker is concurrently rebuilding g_alphaDedup and reading it here
         // raced (glow-window white/orange flicker). swapCaptureBuffers hands over a stable snapshot.
-        const std::uint64_t dedupKey =
-            ((std::uint64_t)(std::uintptr_t)rs->texture << 32) | (std::uint64_t)rs->vertCount;
-        if (g_alphaDedupActive.find(dedupKey) != g_alphaDedupActive.end()) {
-            // [alpha-dedup] probe: log the first few victims with enough identity to tell a real
-            // cached-blend duplicate from an aliased particle draw (a particle's vertCount moves
-            // frame to frame; a cached blend's does not).
-            static std::uint32_t s_logged = 0;
-            if (s_logged < 12) {
-                ++s_logged;
-                const char* nm = MGE::GeometryCache::resolveTextureName(rs->texture);
-                LOG::logline("!! [alpha-dedup] dropped DIP tex=%s vc=%u tri=%u (key collision)",
-                             nm ? nm : "(unnamed)", rs->vertCount, rs->primCount);
+        // See alphaDedupKey for why the key is the SLOT and not the GPU texture pointer.
+        if (texIndex != 0u) {
+            const std::uint64_t dedupKey = alphaDedupKey(texIndex, rs->vertCount);
+            if (g_alphaDedupActive.find(dedupKey) != g_alphaDedupActive.end()) {
+                // [alpha-dedup] probe: log the first few victims with enough identity to tell a real
+                // cached-blend duplicate from an aliased particle draw (a particle's vertCount moves
+                // frame to frame; a cached blend's does not).
+                static std::uint32_t s_logged = 0;
+                if (s_logged < 12) {
+                    ++s_logged;
+                    const char* nm = MGE::GeometryCache::resolveTextureName(rs->texture);
+                    LOG::logline("!! [alpha-dedup] dropped DIP tex=%s vc=%u tri=%u (key collision)",
+                                 nm ? nm : "(unnamed)", rs->vertCount, rs->primCount);
+                }
+                ++g_capDedupDrops;
+                return;
             }
-            ++g_capDedupDrops;
-            return;
         }
 
         // Caps: keep the shared captured buffers within their single-chunk budget. Drop WHOLE
@@ -5415,21 +5477,54 @@ namespace RenderProcess {
             return;
         }
 
-        // Texture slot: rs->texture is the proxy realTexture pointer, identical to the GPU texture
-        // the cache walk registered in g_textureNameMap. Resolve name -> bindless slot (per-frame
-        // memo). No name -> slot 0 (host default white): a visible white particle beats an invisible
-        // one, and NiFlipController textures self-correct after the first walk registers them.
-        std::uint32_t texIndex;
-        auto mit = g_capInTexMemo.find(rs->texture);
-        if (mit != g_capInTexMemo.end()) {
-            texIndex = mit->second;
-        } else {
-            const char* name = MGE::GeometryCache::resolveTextureName(rs->texture);
-            texIndex = name ? resolveTextureSlot(name) : 0u;
-            if (!name && g_capNoName++ < 20) {
-                LOG::logline("!! [alpha-cap] no source name for tex=%p (white)", (void*)rs->texture);
+        // FFE stages BEYOND the base map. MW folds a shape's dark/detail/glow siblings into extra
+        // stages of this same DIP, so reading stage 0 alone draws it at full base brightness —
+        // exactly the "too bright" kurp VFX (every one pairs its base with a blackmip*/darkmap*
+        // MODULATE layer). Walk forward and stop at the first DISABLE, which is precisely how D3D
+        // terminates the FFE chain: MW leaves stale COLOROPs in later stages (stageOps=[4,1,4,1]
+        // is ONE effective stage, not two), so scanning all four would resurrect dead state.
+        std::uint32_t capStageCount = 0;
+        std::uint32_t capStages[3] = { 0, 0, 0 };
+        for (std::uint32_t s = 1; s < 4 && capStageCount < 3; ++s) {
+            const auto& st = frs->stage[s];
+            if (st.colorOp == D3DTOP_DISABLE) break;
+            std::uint32_t op;
+            if (st.colorOp == D3DTOP_MODULATE)        op = IPC::kMMOpMod;
+            else if (st.colorOp == D3DTOP_MODULATE2X) op = IPC::kMMOpMod2X;
+            else if (st.colorOp == D3DTOP_ADD)        op = IPC::kMMOpAdd;
+            else break;   // BLENDTEXTUREALPHA/DOTPRODUCT3/... — unmodelled, stop rather than guess
+            IDirect3DTexture9* stex = rs->stageTexture[s];
+            if (!stex) break;                       // op with no texture bound: nothing to fold
+            // The captured VB carries ONE UV set (GeomVertexWire, shared with every cached mesh and
+            // with the alpha PSO input layout), so a stage sampling set 1+ cannot be honoured. DROP
+            // it — sampling the wrong coordinates would be worse than the pre-existing base-only
+            // look. Those shapes are cached/Route-C-owned in every case measured (see
+            // tasks/forge-at3-darkmap.md); the counter says if that ever stops being true.
+            if (st.texcoordIndex != 0) {
+                if (g_capStageUVDrop++ == 0) {
+                    const char* nm = MGE::GeometryCache::resolveTextureName(stex);
+                    LOG::logline("!! [cap-stage] stage %u on UV set %u dropped (captured VB is single-UV) tex=%s",
+                                 s, (unsigned)st.texcoordIndex, nm ? nm : "(unnamed)");
+                }
+                break;
             }
-            g_capInTexMemo.emplace(rs->texture, texIndex);
+            const std::uint32_t sslot = slotOfStageTexture(stex, /*warnUnnamed=*/false);
+            if (sslot == 0u) break;                 // unnamed → white → MODULATE by white = no-op
+            // clampMode: RenderedState carries no sampler address state at all, per stage or
+            // otherwise — the captured base map ships MW's default for the same reason
+            // (emitCapturedAlphaDraw's disclosed scope gap). Match it.
+            capStages[capStageCount++] = IPC::packMMStage(sslot, 0u, op, IPC::kTexWrapSWrapT);
+        }
+        if (capStageCount) {
+            static std::uint32_t s_stageLogged = 0;
+            if (s_stageLogged < 8) {
+                ++s_stageLogged;
+                const char* nm = MGE::GeometryCache::resolveTextureName(rs->texture);
+                LOG::logline(">> [cap-stage] %s + %u stage(s) ops=[%d,%d,%d,%d]",
+                             nm ? nm : "(unnamed)", capStageCount,
+                             (int)frs->stage[0].colorOp, (int)frs->stage[1].colorOp,
+                             (int)frs->stage[2].colorOp, (int)frs->stage[3].colorOp);
+            }
         }
 
         // FVF offsets within the source stride (XYZ at 0; then NORMAL, PSIZE, DIFFUSE, SPECULAR,
@@ -5558,6 +5653,8 @@ namespace RenderProcess {
             rec.matEmissive[0] = frs->material.emissive.r; rec.matEmissive[1] = frs->material.emissive.g; rec.matEmissive[2] = frs->material.emissive.b;
         }
         rec.matAlpha = frs->material.diffuse.a;
+        rec.stageCount = capStageCount;
+        rec.stages[0] = capStages[0]; rec.stages[1] = capStages[1]; rec.stages[2] = capStages[2];
         g_capInRecs.push_back(rec);
     }
 

@@ -1255,8 +1255,17 @@ STRUCT(LightData)
 
 
 
+
+
+
+
+        Buffer(uint4) gAlphaStages :  register(t15,space1);
+
+
+
+
         CBUFFER(LightData) gLights :  register(b0,space3);
-#line 260 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+#line 269 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
         Tex2D(float4) gTextures[ 880 ] :  register(t0,space0);
 
 

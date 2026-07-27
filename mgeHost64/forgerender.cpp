@@ -1405,6 +1405,14 @@ namespace {
         Buffer*        pAlphaWorldsBuf = nullptr;          // gBatch: one 64KB world window (kMaxAlphaDraws x 64B)
         DescriptorSet* pPerBatchSetAlpha = nullptr;        // gBatch bound to pAlphaWorldsBuf, 1 instance
         Buffer*        pAlphaInstanceBuf = nullptr;        // per-draw instance VB (kStaticInstU32 slots), CPU-mapped
+        // AT3 multi-stage: gAlphaStages — the per-draw FFE stages BEYOND the base map (dark/detail/
+        // glow that MW folded into one captured DIP), uint4[kMaxAlphaDraws] indexed by the draw's
+        // instance index. NOT extra instance lanes: kStaticInstU32 and the binding-1 vertex layout
+        // are shared by every opaque-layout pipeline (opaque/shadow/sky/FP/reflect), so widening
+        // them to feed one frag would ripple through all of them. opaque.vert already computes
+        // drawIndex, so forwarding it as ONE flat uint buys the frag arbitrary per-draw data.
+        // .xyz = packMMStage words, .w = stage count (0 = base map only, the overwhelming case).
+        Buffer*        pAlphaStagesBuf = nullptr;
         // AT3 captured-alpha: single-buffered persistent-mapped VB/IB the client refills each frame
         // from its VB/IB Lock-copy of MW's blended DIPs (NiParticles smoke/flames + multimap/decal/
         // untextured blends). Sentinel-slot AlphaDrawWire items (slot == kAlphaSlotCaptured) draw
@@ -3548,12 +3556,37 @@ namespace {
                 std::printf("[forge] gUVAnim table alloc FAILED — UV animation disabled (base UVs)\n");
             }
         }
+        // AT3 multi-stage: the gAlphaStages table — same shape as gUVAnim (persistent-mapped typed
+        // buffer SRV) but uint4 and indexed by the alpha draw's own instance index. Created here so
+        // every SrtData PerFrame instance below can bind it. Zeroed once: .w == 0 means "base map
+        // only", which is what every cached alpha draw and every single-map capture wants, so a
+        // failed alloc or a stale entry degrades to exactly today's behaviour.
+        if (!g_live.pAlphaStagesBuf) {
+            BufferLoadDesc sb = {};
+            sb.mDesc.mDescriptors  = DESCRIPTOR_TYPE_BUFFER;
+            sb.mDesc.mMemoryUsage  = RESOURCE_MEMORY_USAGE_CPU_TO_GPU;
+            sb.mDesc.mFlags        = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
+            sb.mDesc.mFormat       = TinyImageFormat_R32G32B32A32_UINT;   // typed Buffer<uint4>
+            sb.mDesc.mElementCount = kMaxAlphaDraws;
+            sb.mDesc.mStructStride = 0;
+            sb.mDesc.mSize         = (uint64_t)kMaxAlphaDraws * 16;
+            sb.mDesc.pName         = "alphaStageTable";
+            sb.pData               = nullptr;
+            sb.ppBuffer            = &g_live.pAlphaStagesBuf;
+            addResource(&sb, nullptr);
+            waitForAllResourceLoads();
+            if (g_live.pAlphaStagesBuf) {
+                std::memset(g_live.pAlphaStagesBuf->pCpuMappedAddress, 0, (size_t)kMaxAlphaDraws * 16);
+            } else {
+                std::printf("[forge] gAlphaStages table alloc FAILED — captured alpha stays base-map only\n");
+            }
+        }
         {
             // PerFrame set: gFrameData CBV + gAO SRV. The frags read the BILATERAL-BLURRED AO
             // (pAOBlur), not raw pAO; pAOBlur's per-frame UAV<->SHADER_RESOURCE ping-pong (renderScene)
             // leaves it SHADER_RESOURCE before the colour pass samples it. (Raw pAO still feeds the
             // blur as an SRV, and the DebugTextures/readback paths still inspect pAO directly.)
-            DescriptorData p[11] = {};   // was 9; +gSunMoments (and headroom)
+            DescriptorData p[13] = {};   // was 9; +gSunMoments, +gAlphaStages (and headroom)
             p[0].mIndex = SRT_RES_IDX(SrtData, PerFrame, gFrameData);
             p[0].ppBuffers = &g_live.pFrameCbv;
             p[1].mIndex = SRT_RES_IDX(SrtData, PerFrame, gAO);
@@ -3566,6 +3599,14 @@ namespace {
                 p[np].mIndex = SRT_RES_IDX(SrtData, PerFrame, gUVAnim);
                 p[np].mCount = 1;
                 p[np].ppBuffers = &g_live.pUVAnimBuf;
+                ++np;
+            }
+            // AT3 multi-stage: the per-draw extra-stage table (alpha.frag indexes it by the draw's
+            // own instance index; .w == 0 = base map only, which is every other draw on the list).
+            if (g_live.pAlphaStagesBuf) {
+                p[np].mIndex = SRT_RES_IDX(SrtData, PerFrame, gAlphaStages);
+                p[np].mCount = 1;
+                p[np].ppBuffers = &g_live.pAlphaStagesBuf;
                 ++np;
             }
             // Clustered forward: bind the froxel light-mask (read as an SRV here; froxelassign.comp
@@ -5068,7 +5109,7 @@ namespace {
             if (!g_live.pPerFrameSetReflect || !g_live.pPerBatchSetReflectSky) { return false; }
             {
                 Texture* vol = g_live.pWaterNormalVol ? g_live.pWaterNormalVol : g_live.pDefaultWhite;
-                DescriptorData p[8] = {};
+                DescriptorData p[9] = {};
                 p[0].mIndex = SRT_RES_IDX(SrtData, PerFrame, gFrameData);
                 p[0].ppBuffers = &g_live.pReflectFrameCbv;
                 p[1].mIndex = SRT_RES_IDX(SrtData, PerFrame, gAO);
@@ -5085,6 +5126,11 @@ namespace {
                 if (g_live.pUVAnimBuf) {   // type-valid bind (reflect draws stamp id 0 = never read)
                     p[rn].mIndex = SRT_RES_IDX(SrtData, PerFrame, gUVAnim);
                     p[rn].mCount = 1; p[rn].ppBuffers = &g_live.pUVAnimBuf;
+                    ++rn;
+                }
+                if (g_live.pAlphaStagesBuf) {   // type-valid bind (reflect draws no alpha stages)
+                    p[rn].mIndex = SRT_RES_IDX(SrtData, PerFrame, gAlphaStages);
+                    p[rn].mCount = 1; p[rn].ppBuffers = &g_live.pAlphaStagesBuf;
                     ++rn;
                 }
                 if (g_live.pShadowMaskParamsCbv) {   // gShadowParams: type-valid bind (reflect never reads it)
@@ -5109,7 +5155,7 @@ namespace {
             if (!g_live.pPerFrameSetReflectGeo) { return false; }
             {
                 Texture* vol = g_live.pWaterNormalVol ? g_live.pWaterNormalVol : g_live.pDefaultWhite;
-                DescriptorData p[10] = {};
+                DescriptorData p[11] = {};
                 p[0].mIndex = SRT_RES_IDX(SrtData, PerFrame, gFrameData);
                 p[0].ppBuffers = &g_live.pReflectFrameCbvGeo;
                 p[1].mIndex = SRT_RES_IDX(SrtData, PerFrame, gAO);
@@ -5126,6 +5172,11 @@ namespace {
                 if (g_live.pUVAnimBuf) {   // type-valid bind (reflect-geo draws never read it)
                     p[rn].mIndex = SRT_RES_IDX(SrtData, PerFrame, gUVAnim);
                     p[rn].mCount = 1; p[rn].ppBuffers = &g_live.pUVAnimBuf;
+                    ++rn;
+                }
+                if (g_live.pAlphaStagesBuf) {   // type-valid bind (reflect-geo draws never read it)
+                    p[rn].mIndex = SRT_RES_IDX(SrtData, PerFrame, gAlphaStages);
+                    p[rn].mCount = 1; p[rn].ppBuffers = &g_live.pAlphaStagesBuf;
                     ++rn;
                 }
                 if (g_live.pShadowMaskParamsCbv) {   // gShadowParams: REAL — carries the sun VP + knobs
@@ -5163,7 +5214,7 @@ namespace {
                 if (!g_live.pPerFrameSetSun) { return false; }
                 Texture* vol = g_live.pWaterNormalVol ? g_live.pWaterNormalVol : g_live.pDefaultWhite;
                 for (uint32_t c = 0; c < kSunCascades; ++c) {
-                    DescriptorData p[10] = {};
+                    DescriptorData p[11] = {};
                     p[0].mIndex = SRT_RES_IDX(SrtData, PerFrame, gFrameData);
                     p[0].ppBuffers = &g_live.pSunFrameCbv[c];
                     p[1].mIndex = SRT_RES_IDX(SrtData, PerFrame, gAO);
@@ -5180,6 +5231,11 @@ namespace {
                     if (g_live.pUVAnimBuf) {
                         p[sn].mIndex = SRT_RES_IDX(SrtData, PerFrame, gUVAnim);
                         p[sn].mCount = 1; p[sn].ppBuffers = &g_live.pUVAnimBuf;
+                        ++sn;
+                    }
+                    if (g_live.pAlphaStagesBuf) {   // type-valid bind (sun caster pass never reads it)
+                        p[sn].mIndex = SRT_RES_IDX(SrtData, PerFrame, gAlphaStages);
+                        p[sn].mCount = 1; p[sn].ppBuffers = &g_live.pAlphaStagesBuf;
                         ++sn;
                     }
                     if (g_live.pShadowMaskParamsCbv) {
@@ -5653,7 +5709,7 @@ namespace {
                 Texture* vol  = g_live.pWaterNormalVol ? g_live.pWaterNormalVol : g_live.pDefaultWhite;
                 Texture* refr = g_live.pRefractColor   ? g_live.pRefractColor   : g_live.pDefaultWhite;
                 Texture* lin  = g_live.pLinearDepth    ? g_live.pLinearDepth    : g_live.pDefaultWhite;
-                DescriptorData p[14] = {};
+                DescriptorData p[15] = {};
                 p[0].mIndex = SRT_RES_IDX(SrtData, PerFrame, gFrameData);
                 p[0].ppBuffers = &g_live.pFPFrameCbv;
                 p[1].mIndex = SRT_RES_IDX(SrtData, PerFrame, gAO);
@@ -5681,6 +5737,13 @@ namespace {
                 if (g_live.pUVAnimBuf) {
                     p[fpn].mIndex = SRT_RES_IDX(SrtData, PerFrame, gUVAnim);
                     p[fpn].mCount = 1; p[fpn].ppBuffers = &g_live.pUVAnimBuf;
+                    ++fpn;
+                }
+                // AT3 multi-stage: REAL here — the FP alpha pass draws captured particle quads with
+                // alpha.frag out of the TAIL of the same instance window, so it indexes the same table.
+                if (g_live.pAlphaStagesBuf) {
+                    p[fpn].mIndex = SRT_RES_IDX(SrtData, PerFrame, gAlphaStages);
+                    p[fpn].mCount = 1; p[fpn].ppBuffers = &g_live.pAlphaStagesBuf;
                     ++fpn;
                 }
                 // FP direct-atlas shadow reception: the arms sample gShadowAtlas/gShadowAtlasDyn
@@ -11610,6 +11673,18 @@ namespace ForgeRender {
                 // alpha.frag asfloat's it back — the terrain splat doesn't run in this frag).
                 finst[idx * kStaticInstU32 + 11] = it.matAlpha;
 
+                // AT3 multi-stage: the dark/detail/glow stages MW folded into this DIP. Written for
+                // EVERY item (0 for cached blends, which are single-map by construction) so a stale
+                // entry from an earlier frame can never leak a texture into an unrelated draw.
+                if (g_live.pAlphaStagesBuf) {
+                    uint32_t* stg = (uint32_t*)g_live.pAlphaStagesBuf->pCpuMappedAddress;
+                    const uint32_t n = (it.stageCount < 3u) ? it.stageCount : 3u;
+                    stg[idx * 4u + 0u] = it.stages[0];
+                    stg[idx * 4u + 1u] = it.stages[1];
+                    stg[idx * 4u + 2u] = it.stages[2];
+                    stg[idx * 4u + 3u] = n;
+                }
+
                 s_alphaCmds.push_back(AlphaCmd{ meshVb, meshIb, firstVertex, firstIndex,
                                                 drawIndexCount, idx, want, wantDepth, wantShadow });
                 ++alphaDrawn;
@@ -12016,6 +12091,15 @@ namespace ForgeRender {
                     finst[idx * kStaticInstU32 + 9]  = it.matEmissive[1];
                     finst[idx * kStaticInstU32 + 10] = it.matEmissive[2];
                     finst[idx * kStaticInstU32 + 11] = it.matAlpha;      // alpha.frag asfloat's it back
+                    // AT3 multi-stage — same table, tail indices (see the main alpha loop).
+                    if (g_live.pAlphaStagesBuf) {
+                        uint32_t* stg = (uint32_t*)g_live.pAlphaStagesBuf->pCpuMappedAddress;
+                        const uint32_t n = (it.stageCount < 3u) ? it.stageCount : 3u;
+                        stg[idx * 4u + 0u] = it.stages[0];
+                        stg[idx * 4u + 1u] = it.stages[1];
+                        stg[idx * 4u + 2u] = it.stages[2];
+                        stg[idx * 4u + 3u] = n;
+                    }
 
                     if (want != curFPAlphaPipe) {
                         cmdBindPipeline(g_live.pCmd, want);
@@ -18075,6 +18159,7 @@ namespace ForgeRender {
         if (g_live.pPerBatchSetAlpha)       { removeDescriptorSet(R, g_live.pPerBatchSetAlpha); }
         if (g_live.pAlphaWorldsBuf)         { removeResource(g_live.pAlphaWorldsBuf); }
         if (g_live.pAlphaInstanceBuf)       { removeResource(g_live.pAlphaInstanceBuf); }
+        if (g_live.pAlphaStagesBuf)         { removeResource(g_live.pAlphaStagesBuf); }
         if (g_live.pCapAlphaVB)             { removeResource(g_live.pCapAlphaVB); }
         if (g_live.pCapAlphaIB)             { removeResource(g_live.pCapAlphaIB); }
         if (g_live.pAlphaPipeline)          { removePipeline(R, g_live.pAlphaPipeline); }

@@ -10,6 +10,13 @@
 
 struct RenderedState {
     IDirect3DTexture9* texture;
+    // The textures bound to FFE stages 0..3 (texture == stageTexture[0]). MW folds a shape's
+    // dark/detail/glow siblings into extra stages of the SAME DIP, so a consumer that reads only
+    // stage 0 reproduces the base map at full brightness. FragmentState::stage[] already carried
+    // the ops; this carries what those ops sample. (Stages 4-7 exist in D3D but MW never binds
+    // past 3 — NiTexturingProperty has base/dark/detail/gloss/glow/bump + decals, and the FFE
+    // chain terminates at the first COLOROP = DISABLE well before then.)
+    IDirect3DTexture9* stageTexture[4];
     IDirect3DVertexBuffer9* vb;
     UINT vbOffset, vbStride;
     IDirect3DIndexBuffer9* ib;

@@ -33,6 +33,7 @@ STRUCT(VSOutput)
     DATA(float3,      WorldPos,   TEXCOORD8); // Tier 3a: world position for point-light eval
     DATA(FLAT(uint),  OverlayIndex,TEXCOORD9);// AT1: matAlpha bit-cast (overlay slot reused)
     DATA(FLAT(uint),  ClampMode,  TEXCOORD10);// MW texture address mode (0..3) -> sampleBase()
+    DATA(FLAT(uint),  DrawIdx,    TEXCOORD11);// AT3: this draw's index into gAlphaStages
 };
 
 // Static semi-HDR tonemap — ported verbatim from XE FixedFuncEmu.fx::tonemap.
@@ -165,6 +166,35 @@ float4 PS_MAIN( VSOutput In )
     if (albedo.a < In.AlphaRef) { discard; }
 
     albedo.rgb *= gFrameData.dbgScales.z;
+
+    // AT3 multi-stage: the dark/detail/glow maps MW folded into this same DIP. A CAPTURED blended
+    // DIP is reconstructed from D3D8 render state, not from the scene graph, so before this it
+    // sampled stage 0 alone and drew at full base brightness — the kurp Enhanced Light VFX pair
+    // every base map with a blackmip*/darkmap* MODULATE layer and rendered blown out.
+    // gAlphaStages.w is 0 for every cached alpha draw (those are single-map by construction; a
+    // cached MULTI-map blend rides Route C / multimap_alpha.frag instead), so this whole block is
+    // one uniform branch that costs nothing on the overwhelming majority of the list.
+    // Ops match multimap.frag's stage loop exactly — keep them in lockstep.
+    // Only the ALPHA of the base stage matters for coverage (MW's alpha chain is SELECTARG1 on
+    // stage 0 for this content), so the extra stages fold into rgb only.
+    {
+        uint4 stg      = gAlphaStages[In.DrawIdx];
+        uint  nStages  = stg.w;
+        for (uint s = 0u; s < 3u; ++s)
+        {
+            if (s >= nStages) { break; }
+            uint sw = (s == 0u) ? stg.x : (s == 1u) ? stg.y : stg.z;
+            uint tex   = sw & 0xFFFFu;
+            // uvSet (bits 16-17) is ALWAYS 0 here: the captured VB is single-UV, and the client
+            // DROPS any stage that samples another set rather than ship wrong coordinates.
+            uint op    = (sw >> 18u) & 0x3u;
+            uint scl   = (sw >> 20u) & 0x3u;
+            float4 t = sampleBase(tex, scl, In.Uv, useLowAF(In.AlphaRef, true));
+            if (op == 1u)      { albedo.rgb *= t.rgb; }          // MODULATE
+            else if (op == 2u) { albedo.rgb *= t.rgb * 2.0f; }   // MODULATE2X
+            else               { albedo.rgb += t.rgb; }          // ADD
+        }
+    }
 
     // AT1 output alpha: texture alpha x per-vertex alpha (only when vertex colour drives the
     // shape) x material alpha (bit-cast through the overlay instance slot).

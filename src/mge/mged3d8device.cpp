@@ -1205,8 +1205,14 @@ bool detectMenu(const D3DMATRIX* m) {
 // State recording
 
 HRESULT _stdcall MGEProxyDevice::SetTexture(DWORD a, IDirect3DBaseTexture8* b) {
-    if (a == 0) {
-        rs.texture = b ? static_cast<ProxyTexture*>(b)->realTexture : NULL;
+    // Stages 1..3 matter to the AT3 captured-alpha path: MW folds a shape's dark/detail/glow maps
+    // into extra stages of the same DIP, and a capture that reads stage 0 only draws it too bright.
+    if (a < 4) {
+        IDirect3DTexture9* real = b ? static_cast<ProxyTexture*>(b)->realTexture : NULL;
+        rs.stageTexture[a] = real;
+        if (a == 0) {
+            rs.texture = real;
+        }
     }
     return ProxyDevice::SetTexture(a, b);
 }

@@ -395,7 +395,8 @@ namespace IPC {
     // sorts the list back-to-front (MW's sorter criterion: bound-center view depth) and the host
     // draws in received order, depth-tested against the opaque prepass but never writing.
     // matAlpha = MaterialProperty alpha (the FFE per-draw fade); the frag does
-    // a = tex.a * vcolA * matAlpha. 144 bytes (128 + AT3 captured-geometry locators + cullFlags).
+    // a = tex.a * vcolA * matAlpha. 128 + AT3 captured-geometry locators + cullFlags/clampMode +
+    // the AT3 extra-stage words (all APPENDED, so every existing field offset is stable).
     struct AlphaDrawWire {
         std::uint32_t slot;
         float         world[16];
@@ -422,6 +423,23 @@ namespace IPC {
         // like the opaque mirror PSO). Single-sided non-mirrored (flags==0) → CULL_BACK.
         std::uint32_t cullFlags;
         std::uint32_t clampMode;   // NiTexturingProperty::Map::clampMode, RAW (see kTexClamp*)
+        // AT3 multi-stage: the FFE texture stages BEYOND the base map (dark/detail/glow), which MW
+        // folds into the same DIP. Without them a base x dark shape renders at base brightness —
+        // kurp's Enhanced Light VFX pair every base map with a blackmip*/darkmap* MODULATE layer.
+        // Cached multi-map blends never need this (they ride Route C's MultiMapDrawWire); this is
+        // for the shapes that only ever reach us as a captured DIP.
+        //
+        // Packed with packMMStage() — the SAME encoding Route C uses, so the shader decode is
+        // shared: texIndex (low 16) | uvSet (bits 16-17) | op (bits 18-19) | clampMode (bits 20-21).
+        // op is kMMOpMod / kMMOpMod2X / kMMOpAdd (never kMMOpBase — stage 0 IS texIndex above).
+        //
+        // uvSet is ALWAYS 0 here. The captured VB is GeomVertexWire (one UV set, 36 B) shared with
+        // every cached mesh and with the alpha PSO's input layout, so a stage sampling UV set 1+
+        // cannot be honoured; the client DROPS such a stage rather than sample the wrong
+        // coordinates (that shape then renders exactly as it did before this field existed). The
+        // Enhanced Light census says the uvSet-1 shapes are all cached/Route-C-owned anyway.
+        std::uint32_t stageCount;  // extra stages actually present, 0..3 (0 = base map only)
+        std::uint32_t stages[3];
     };
     constexpr std::uint32_t kAlphaCullTwoSided = 1u;   // bit0
     constexpr std::uint32_t kAlphaCullMirrored = 2u;   // bit1

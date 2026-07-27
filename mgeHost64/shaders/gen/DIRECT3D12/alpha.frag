@@ -1255,8 +1255,17 @@ STRUCT(LightData)
 
 
 
+
+
+
+
+        Buffer(uint4) gAlphaStages :  register(t15,space1);
+
+
+
+
         CBUFFER(LightData) gLights :  register(b0,space3);
-#line 260 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+#line 269 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
         Tex2D(float4) gTextures[ 880 ] :  register(t0,space0);
 
 
@@ -1606,7 +1615,8 @@ STRUCT(VSOutput)
     DATA(float3, WorldPos, TEXCOORD8);
     DATA(FLAT(uint), OverlayIndex,TEXCOORD9);
     DATA(FLAT(uint), ClampMode, TEXCOORD10);
-#line 36
+    DATA(FLAT(uint), DrawIdx, TEXCOORD11);
+#line 37
 };
 
 
@@ -1739,6 +1749,25 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
     if (albedo.a < In.AlphaRef) { discard; }
 
     albedo.rgb *= gFrameData.dbgScales.z;
+#line 180 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/alpha.frag.fsl"
+    {
+        uint4 stg = gAlphaStages[In.DrawIdx];
+        uint nStages = stg.w;
+        for (uint s = 0u; s < 3u; ++s)
+        {
+            if (s >= nStages) { break; }
+            uint sw = (s == 0u) ? stg.x : (s == 1u) ? stg.y : stg.z;
+            uint tex = sw & 0xFFFFu;
+
+
+            uint op = (sw >> 18u) & 0x3u;
+            uint scl = (sw >> 20u) & 0x3u;
+            float4 t = sampleBase(tex, scl, In.Uv, useLowAF(In.AlphaRef, true));
+            if (op == 1u) { albedo.rgb *= t.rgb; }
+            else if (op == 2u) { albedo.rgb *= t.rgb * 2.0f; }
+            else { albedo.rgb += t.rgb; }
+        }
+    }
 
 
 

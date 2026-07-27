@@ -238,6 +238,15 @@ BEGIN_SRT_NO_AB(SrtData)
         // compute mask uses (slots are camera-relative → identical for the arm view). Read only when the
         // FP flag is set (harmless everywhere else). MUST be bound into every SrtData PerFrame instance.
         DECL_CBUFFER(PerFrame, CBUFFER(ShadowMaskParams), gShadowParams)
+        // AT3 multi-stage: per-draw FFE texture stages BEYOND the base map, indexed by the alpha
+        // draw's own instance index (opaque.vert forwards it as DrawIdx). xyz = packMMStage words
+        // (texIndex | uvSet | op | clampMode — the SAME encoding Route C's MultiMapDrawWire uses,
+        // so the decode below is shared with multimap.frag), w = how many of them are live.
+        // w == 0 means "base map only" and is the case for every cached alpha draw, so an unbound
+        // or stale table degrades to the pre-existing single-map look rather than to garbage.
+        // Only alpha.frag reads it (harmless null tail everywhere else). Appended LAST so every
+        // existing PerFrame offset stays stable.
+        DECL_BUFFER(PerFrame, Buffer(uint4), gAlphaStages)
     END_SRT_SET(PerFrame)
     // Point-light cbuffer — rides the otherwise-unused PerDraw set (FSL has exactly four
     // fixed update frequencies: Persistent/PerFrame/PerBatch/PerDraw; a custom set name has
