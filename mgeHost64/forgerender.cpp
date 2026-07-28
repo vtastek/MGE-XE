@@ -13422,8 +13422,13 @@ namespace ForgeRender {
     // per-frame U/V offset lands in FrameData.uvOffsets[slot-1]. See tasks/forge-hero-statics.md.
     constexpr uint32_t kMaxHeroAnimSlots = 8;   // MUST match FrameData.uvOffsets[8] (opaque.srt.h)
     struct HeroAnim {                            // one unique animation; slot = index+1
-        float cycleStop = 1.0f;
-        std::vector<std::pair<float, float>> uKeys, vKeys;   // (time, value) piecewise-linear
+        // NiTimeController window, in CONTROLLER time: t = appSeconds * frequency + phase, wrapped
+        // into [cycleStart, cycleStop]. frequency is NOT decorative — the ghostfence ships 0.12, so
+        // its 10.375 span is ~86 real seconds. Treating controller time as seconds ran it 8.3x fast.
+        float cycleStart = 0.0f, cycleStop = 1.0f;
+        float frequency  = 1.0f, phase     = 0.0f;
+        std::vector<std::pair<float, float>> uKeys, vKeys;           // offset  (NiUVData groups 0/1)
+        std::vector<std::pair<float, float>> uTileKeys, vTileKeys;   // tiling  (NiUVData groups 2/3)
     };
     struct HeroSubset {                          // one animated/blended hero subset
         uint32_t globalSubset = 0;               // index into g_staticsSubsets
@@ -13435,8 +13440,9 @@ namespace ForgeRender {
     std::vector<HeroSubset> g_heroSubsets;
 
     // Piecewise-linear key evaluation (mirrors a MW NiUVData float key group), clamped at the ends.
-    inline float heroEvalKeys(const std::vector<std::pair<float, float>>& k, float t) {
-        if (k.empty())     { return 0.0f; }
+    // `def` is the value an EMPTY group means: 0 for an offset, 1 for a tiling factor.
+    inline float heroEvalKeys(const std::vector<std::pair<float, float>>& k, float t, float def = 0.0f) {
+        if (k.empty())     { return def; }
         if (k.size() == 1) { return k[0].second; }
         if (t <= k.front().first) { return k.front().second; }
         if (t >= k.back().first)  { return k.back().second; }
@@ -13450,18 +13456,29 @@ namespace ForgeRender {
         return k.back().second;
     }
 
-    // Write this frame's hero UV offsets into FrameData.uvOffsets (float index 84.., after
-    // timeParams). Each unique anim is evaluated at fmod(simTime, its cycleStop); statics.vert adds
-    // uvOffsets[slot-1] for any subset carrying a 1-based slot in flags bits 16-23. Defined here (with
-    // the hero globals) and forward-declared for the per-frame cbuffer update earlier in the file.
+    // Write this frame's hero UV transform into FrameData.uvOffsets (float index 84.., after
+    // timeParams). Each unique anim is evaluated at fmod(simTime, its cycleStop); statics.vert applies
+    // `uv = uv * .zw + .xy` for any subset carrying a 1-based slot in flags bits 16-23. Defined here
+    // (with the hero globals) and forward-declared for the per-frame cbuffer update earlier in the file.
+    //
+    // .zw are the NiUVData TILING groups. They were previously written as 0 and ignored by the shader,
+    // so the two lanes were already reserved — carrying tiling costs no wire and no cbuffer growth.
+    // An anim with no tiling keys evaluates to 1.0, i.e. an exact identity against the old behaviour.
     void heroWriteUvOffsets(float* fd, double simT) {
         for (size_t a = 0; a < g_heroAnims.size(); ++a) {
             const HeroAnim& ha = g_heroAnims[a];
-            float tt = (float)std::fmod(simT, (double)ha.cycleStop);
-            fd[84 + a * 4 + 0] = heroEvalKeys(ha.uKeys, tt);
-            fd[84 + a * 4 + 1] = heroEvalKeys(ha.vKeys, tt);
-            fd[84 + a * 4 + 2] = 0.0f;
-            fd[84 + a * 4 + 3] = 0.0f;
+            // App seconds -> CONTROLLER time, then LOOP-wrap into the controller's own window.
+            // std::fmod keeps the sign of its operand, so a negative phase needs the += span.
+            double span = (double)ha.cycleStop - (double)ha.cycleStart;
+            if (span <= 1e-6) { span = 1.0; }
+            double scaled = simT * (double)ha.frequency + (double)ha.phase;
+            double w = std::fmod(scaled - (double)ha.cycleStart, span);
+            if (w < 0.0) { w += span; }
+            float tt = (float)((double)ha.cycleStart + w);
+            fd[84 + a * 4 + 0] = heroEvalKeys(ha.uKeys, tt, 0.0f);
+            fd[84 + a * 4 + 1] = heroEvalKeys(ha.vKeys, tt, 0.0f);
+            fd[84 + a * 4 + 2] = heroEvalKeys(ha.uTileKeys, tt, 1.0f);
+            fd[84 + a * 4 + 3] = heroEvalKeys(ha.vTileKeys, tt, 1.0f);
         }
     }
     // DL statics texture residency = gStaticsArrays: a descriptor-array of Texture2DArrays, one
@@ -14195,14 +14212,30 @@ namespace ForgeRender {
                         out.emplace_back(t, v);
                     }
                 };
-                for (uint32_t r = 0; r < count && hp + 20 <= hend; ++r) {
+                // 22 = the fixed head of one record (ord 4 + subIdx 2 + blend/alpha 6 + cycle 8 +
+                // nU/nV 2); the old bound of 20 let a truncated file read nU/nV two bytes past the end.
+                for (uint32_t r = 0; r < count && hp + 22 <= hend; ++r) {
                     uint32_t ord = 0; std::memcpy(&ord, hp, 4); hp += 4;
                     uint16_t subIdx = 0; std::memcpy(&subIdx, hp, 2); hp += 2;
                     uint8_t blendEnabled = hp[0], srcB = hp[1], dstB = hp[2]; hp += 6; // + alphaTest/func/thr
                     float cs = 0, ce = 0; std::memcpy(&cs, hp, 4); std::memcpy(&ce, hp + 4, 4); hp += 8;
                     uint8_t nU = hp[0], nV = hp[1]; hp += 2;
-                    HeroAnim anim; anim.cycleStop = (ce > 1e-4f) ? ce : 1.0f;
+                    HeroAnim anim;
+                    anim.cycleStop  = (ce > 1e-4f) ? ce : 1.0f;
+                    anim.cycleStart = (cs < ce) ? cs : 0.0f;
                     rdKeys(nU, anim.uKeys); rdKeys(nV, anim.vKeys);
+                    // v2 tail: the NiUVData TILING groups. A v1 file simply has none, and the empty
+                    // vectors evaluate to 1.0 in heroWriteUvOffsets => byte-identical to before.
+                    if (ver >= 2 && hp + 2 <= hend) {
+                        uint8_t nUT = hp[0], nVT = hp[1]; hp += 2;
+                        rdKeys(nUT, anim.uTileKeys); rdKeys(nVT, anim.vTileKeys);
+                    }
+                    // v3 tail: the controller's time mapping. v1/v2 keep frequency 1 / phase 0, which
+                    // is what those files were (wrongly) evaluated as anyway — so no silent change.
+                    if (ver >= 3 && hp + 8 <= hend) {
+                        std::memcpy(&anim.frequency, hp, 4); std::memcpy(&anim.phase, hp + 4, 4); hp += 8;
+                        if (!(anim.frequency > 1e-6f)) { anim.frequency = 1.0f; }
+                    }
 
                     if (ord >= g_staticsDefs.size()) { continue; }
                     const StaticsDefCPU& d = g_staticsDefs[ord];
@@ -14213,16 +14246,29 @@ namespace ForgeRender {
                     // Dedup: subsets with identical key groups share one anim slot (fence/lava layers
                     // repeat across every instance mesh). Blend differs per subset and doesn't split slots.
                     uint32_t slot = 0;
-                    if (!anim.uKeys.empty() || !anim.vKeys.empty()) {
+                    if (!anim.uKeys.empty()     || !anim.vKeys.empty()
+                        || !anim.uTileKeys.empty() || !anim.vTileKeys.empty()) {
                         int found = -1;
                         for (size_t a = 0; a < g_heroAnims.size(); ++a) {
                             if (g_heroAnims[a].cycleStop == anim.cycleStop
+                                && g_heroAnims[a].cycleStart == anim.cycleStart
+                                && g_heroAnims[a].frequency == anim.frequency
+                                && g_heroAnims[a].phase == anim.phase
                                 && g_heroAnims[a].uKeys == anim.uKeys
-                                && g_heroAnims[a].vKeys == anim.vKeys) { found = (int)a; break; }
+                                && g_heroAnims[a].vKeys == anim.vKeys
+                                && g_heroAnims[a].uTileKeys == anim.uTileKeys
+                                && g_heroAnims[a].vTileKeys == anim.vTileKeys) { found = (int)a; break; }
                         }
                         if (found < 0 && g_heroAnims.size() < kMaxHeroAnimSlots) {
                             found = (int)g_heroAnims.size();
                             g_heroAnims.push_back(anim);
+                        } else if (found < 0) {
+                            static bool warnedSlots = false;
+                            if (!warnedSlots) {
+                                warnedSlots = true;
+                                LOG::logline("!! [forge][dl] hero_anim: >%u unique animations - the rest render UNANIMATED",
+                                             kMaxHeroAnimSlots);
+                            }
                         }
                         if (found >= 0) {
                             slot = (uint32_t)found + 1;
@@ -14237,8 +14283,20 @@ namespace ForgeRender {
                     if (hs.blend) { g_staticsSubsets[gsub].flags |= 0x20u; }
                     g_heroSubsets.push_back(hs);
                 }
-                LOG::logline(">> [forge][dl] hero_anim: %u records -> %zu unique anims, %zu hero subsets",
-                             count, g_heroAnims.size(), g_heroSubsets.size());
+                size_t tiled = 0, scaled = 0;
+                for (const HeroAnim& ha : g_heroAnims) {
+                    if (!ha.uTileKeys.empty() || !ha.vTileKeys.empty()) { ++tiled; }
+                    if (ha.frequency != 1.0f) { ++scaled; }
+                }
+                LOG::logline(">> [forge][dl] hero_anim: v%u, %u records -> %zu unique anims (%zu tiling, %zu freq!=1), %zu hero subsets",
+                             ver, count, g_heroAnims.size(), tiled, scaled, g_heroSubsets.size());
+                for (size_t a = 0; a < g_heroAnims.size(); ++a) {
+                    const HeroAnim& ha = g_heroAnims[a];
+                    LOG::logline("   [forge][dl] hero anim %zu: window=[%.3f,%.3f] freq=%.4f phase=%.3f -> %.1fs real | keys u=%zu v=%zu ut=%zu vt=%zu",
+                                 a, ha.cycleStart, ha.cycleStop, ha.frequency, ha.phase,
+                                 (ha.cycleStop - ha.cycleStart) / (ha.frequency > 1e-6f ? ha.frequency : 1.0f),
+                                 ha.uKeys.size(), ha.vKeys.size(), ha.uTileKeys.size(), ha.vTileKeys.size());
+                }
             } else {
                 LOG::logline(">> [forge][dl] hero_anim.data absent - hero statics inert");
             }

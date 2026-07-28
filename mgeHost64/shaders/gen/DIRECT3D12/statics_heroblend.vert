@@ -1354,13 +1354,9 @@ VSOutput VS_MAIN( VSInput In )
     float3 nWorld = n.x * In.W0.xyz + n.y * In.W1.xyz + n.z * In.W2.xyz;
     Out.WorldNormal = nWorld;
     float emissive = In.Normal.w;
-
-
-
-
-    float3 ambient = gFrameData.lodSunAmb.rgb + emissive;
+#line 126 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/statics.vert.fsl"
     float3 sunlit = gFrameData.sunCol.rgb * saturate(dot(nWorld, -gFrameData.sunDir.xyz));
-    Out.Color = float4(In.Color.rgb * ambient, In.Color.a);
+    Out.Color = float4(In.Color.rgb * gFrameData.lodSunAmb.rgb + emissive, In.Color.a);
     Out.SunLight = In.Color.rgb * sunlit;
 
     Out.TexIndex = (uint)(In.InstParams.x + 0.5f);
@@ -1376,13 +1372,11 @@ VSOutput VS_MAIN( VSInput In )
     if ((Out.Flags & 0x4u) != 0u) {
         Out.Uv.y += frac(0.08f * gFrameData.timeParams.x);
     }
-
-
-
-
+#line 155 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/statics.vert.fsl"
     uint animSlot = (Out.Flags >> 16) & 0xFFu;
     if (animSlot != 0u) {
-        Out.Uv += gFrameData.uvOffsets[animSlot - 1u].xy;
+        float4 uvAnim = gFrameData.uvOffsets[animSlot - 1u];
+        Out.Uv = Out.Uv * uvAnim.zw + uvAnim.xy;
     }
 
 
@@ -1394,7 +1388,7 @@ VSOutput VS_MAIN( VSInput In )
 
 
     Out.Clip = dot(gFrameData.gReflWaterClip.xyz, worldPos.xyz) + gFrameData.gReflWaterClip.w;
-#line 170 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/statics.vert.fsl"
+#line 187 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/statics.vert.fsl"
     if ((Out.Flags & 0x18u) != 0u) {
         bool lit = (gFrameData.timeParams.z + In.InstParams.z) > 0.0f;
         bool want = lit ? ((Out.Flags & 0x8u) != 0u)
@@ -1422,11 +1416,11 @@ VSOutput VS_MAIN( VSInput In )
     if (!heroBlend) {
         Out.Position = float4(1e9f, 1e9f, 1e9f, 1.0f);
     } else {
-#line 209 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/statics.vert.fsl"
+#line 226 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/statics.vert.fsl"
         float distXY = length(In.W3.xy);
         if (distXY < gFrameData.lodParams.w) { Out.Position = float4(1e9f, 1e9f, 1e9f, 1.0f); }
     }
-#line 218 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/statics.vert.fsl"
+#line 235 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/statics.vert.fsl"
     return (Out);
 }
 #line 193 "FSL/shaders.list"

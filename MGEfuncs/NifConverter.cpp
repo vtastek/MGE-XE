@@ -133,9 +133,20 @@ struct HeroAnim {
     bool    test       = false;              // alpha test enabled
     uint8_t func       = 4;                  // TestFunc TF_GREATER
     uint8_t threshold  = 128;
-    float   cycleStart = 0.0f, cycleStop = 0.0f;  // NiTimeController LOOP window
-    std::vector<std::pair<float, float>> uKeys;   // (time, U offset)
-    std::vector<std::pair<float, float>> vKeys;   // (time, V offset)
+    float   cycleStart = 0.0f, cycleStop = 0.0f;  // NiTimeController LOOP window (CONTROLLER time)
+    // NiTimeController maps app seconds to controller time as `t = appTime * frequency + phase`, so
+    // start/stop above are NOT seconds. The ghostfence ships frequency = 0.12: its 10.375s key span
+    // really takes ~86s of wall clock. Ignoring frequency ran the fence 8.3x too fast and made the
+    // tiling pulse flutter too quickly to read as motion at all.
+    float   frequency  = 1.0f, phase = 0.0f;
+    std::vector<std::pair<float, float>> uKeys;   // (time, U offset)   NiUVData group 0
+    std::vector<std::pair<float, float>> vKeys;   // (time, V offset)   NiUVData group 1
+    // NiUVData carries FOUR groups; the transform is uv' = uv * tiling + offset. Capturing only the
+    // offsets dropped the ghostfence's VERTICAL motion, which is a V-tiling pulse (0.93 <-> 1.30) —
+    // the host then showed only the horizontal U scroll while the near path (which hands animated-
+    // tiling shapes back to the engine on purpose) kept pulsing. Empty => the host defaults to 1.0.
+    std::vector<std::pair<float, float>> uTileKeys;   // (time, U tiling) NiUVData group 2
+    std::vector<std::pair<float, float>> vTileKeys;   // (time, V tiling) NiUVData group 3
 };
 
 struct ExportedNode {
@@ -749,19 +760,27 @@ private:
             }
         }
         if (g_heroMode) {
-            // Hero path: capture the REAL NiUVData key groups (0=U off, 1=V off) + LOOP window. No tag
-            // required (the _herodist copy IS the opt-in). hasUVController stays FALSE so the host does
-            // NOT also apply the legacy 0.08 V-scroll; hero anim rides its own slot from hero_anim.data.
+            // Hero path: capture ALL FOUR real NiUVData key groups (0=U off, 1=V off, 2=U tiling,
+            // 3=V tiling) + the LOOP window. No tag required (the _herodist copy IS the opt-in).
+            // hasUVController stays FALSE so the host does NOT also apply the legacy 0.08 V-scroll;
+            // hero anim rides its own slot from hero_anim.data.
             if (uvCtrl) {
                 NiUVDataRef uvData = uvCtrl->GetData();
                 if (uvData) {
                     vector<KeyGroup<float>> groups = uvData->GetUVGroups();
-                    for (const auto& k : groups[0].keys) { node->hero.uKeys.push_back(std::make_pair(k.time, k.data)); }
-                    for (const auto& k : groups[1].keys) { node->hero.vKeys.push_back(std::make_pair(k.time, k.data)); }
+                    if (groups.size() >= 4) {
+                        for (const auto& k : groups[0].keys) { node->hero.uKeys.push_back(std::make_pair(k.time, k.data)); }
+                        for (const auto& k : groups[1].keys) { node->hero.vKeys.push_back(std::make_pair(k.time, k.data)); }
+                        for (const auto& k : groups[2].keys) { node->hero.uTileKeys.push_back(std::make_pair(k.time, k.data)); }
+                        for (const auto& k : groups[3].keys) { node->hero.vTileKeys.push_back(std::make_pair(k.time, k.data)); }
+                    }
                 }
                 node->hero.cycleStart = uvCtrl->GetStartTime();
                 node->hero.cycleStop  = uvCtrl->GetStopTime();
-                node->hero.hasAnim    = !node->hero.uKeys.empty() || !node->hero.vKeys.empty();
+                node->hero.frequency  = uvCtrl->GetFrequency();
+                node->hero.phase      = uvCtrl->GetPhase();
+                node->hero.hasAnim    = !node->hero.uKeys.empty()     || !node->hero.vKeys.empty()
+                                     || !node->hero.uTileKeys.empty() || !node->hero.vTileKeys.empty();
             }
         } else if (detectedUVAnim) {
             // Legacy path: only the hand-tagged _dist stand-ins get the single-layer V scroll.
@@ -1127,6 +1146,8 @@ extern "C" float __stdcall ProcessNif(char* data, int datasize, float simplify, 
             uint8_t  test  = h.test  ? 1 : 0;
             uint8_t  nU = h.uKeys.size() > 255 ? 255 : (uint8_t)h.uKeys.size();
             uint8_t  nV = h.vKeys.size() > 255 ? 255 : (uint8_t)h.vKeys.size();
+            uint8_t  nUT = h.uTileKeys.size() > 255 ? 255 : (uint8_t)h.uTileKeys.size();
+            uint8_t  nVT = h.vTileKeys.size() > 255 ? 255 : (uint8_t)h.vTileKeys.size();
             WriteFile(g_heroFile, &thisStatic, 4, &unused, 0);
             WriteFile(g_heroFile, &subset, 2, &unused, 0);
             WriteFile(g_heroFile, &blend, 1, &unused, 0);
@@ -1149,6 +1170,25 @@ extern "C" float __stdcall ProcessNif(char* data, int datasize, float simplify, 
                 WriteFile(g_heroFile, &t, 4, &unused, 0);
                 WriteFile(g_heroFile, &v, 4, &unused, 0);
             }
+            // v2 tail: the two TILING groups, APPENDED after the offset keys so a v1 reader that
+            // stops here still parses every earlier field identically. hero_anim.data has a real
+            // magic + version header (unlike static_meshes, which is positional and headerless), so
+            // versioning is the sanctioned way to grow it.
+            WriteFile(g_heroFile, &nUT, 1, &unused, 0);
+            WriteFile(g_heroFile, &nVT, 1, &unused, 0);
+            for (uint8_t k = 0; k < nUT; ++k) {
+                float t = h.uTileKeys[k].first, v = h.uTileKeys[k].second;
+                WriteFile(g_heroFile, &t, 4, &unused, 0);
+                WriteFile(g_heroFile, &v, 4, &unused, 0);
+            }
+            for (uint8_t k = 0; k < nVT; ++k) {
+                float t = h.vTileKeys[k].first, v = h.vTileKeys[k].second;
+                WriteFile(g_heroFile, &t, 4, &unused, 0);
+                WriteFile(g_heroFile, &v, 4, &unused, 0);
+            }
+            // v3 tail: the controller's time mapping. Appended again, so a v2 reader is unaffected.
+            WriteFile(g_heroFile, &h.frequency, 4, &unused, 0);
+            WriteFile(g_heroFile, &h.phase, 4, &unused, 0);
             ++g_heroRecordCount;
         }
     }
@@ -1183,7 +1223,7 @@ extern "C" void __stdcall BeginHeroAnim(char* outpath) {
             g_heroFile = h;
             DWORD unused;
             char     magic[4] = { 'M', 'G', 'H', 'A' };
-            uint32_t version  = 1;
+            uint32_t version  = 3;   // v2 = TILING key groups; v3 = + controller frequency/phase
             uint32_t count    = 0;   // placeholder, backpatched in EndHeroAnim
             WriteFile(g_heroFile, magic, 4, &unused, 0);
             WriteFile(g_heroFile, &version, 4, &unused, 0);
