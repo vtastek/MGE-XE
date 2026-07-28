@@ -14,6 +14,7 @@
 
 #include "cull.srt.h"
 #include "hizocclusion.h.fsl"
+#include "cellown.h.fsl"
 
 ROOT_SIGNATURE(ComputeRootSignature)
 NUM_THREADS(64, 1, 1)
@@ -59,6 +60,16 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
     float d2 = dx * dx + dy * dy;
     float dNear2 = d2 + cz * cz;
     if (dNear2 < gCullParams.ranges.w || d2 > rangeEnd2)
+        RETURN();
+
+    // Near/far handover: MW's near path covers the half-space in front of the slab, so the LOD proxy
+    // is CLIPPED there (statics.vert) rather than rejected — see cellown.h.fsl for why an object-level
+    // reject holes. All that is rejected here is the instance that would be clipped away in full.
+    // Exactly one of this and ranges.w above is ever armed. cullscatter.comp.fsl calls the SAME header
+    // functions — that is what keeps the scatter and the prefix-sum in agreement. Cell coords come
+    // from wr3.xy (the placement ORIGIN — the position MW files the reference under), NOT from
+    // posX/posY, which is the bound centre and can sit in the neighbouring cell.
+    if (nearPathCovers(nearPathSlab(inst.wr3.x, inst.wr3.y), dNear2, inst.effR))
         RETURN();
 
     // Frustum-cull the instance sphere (camera-relative center, radius effR).

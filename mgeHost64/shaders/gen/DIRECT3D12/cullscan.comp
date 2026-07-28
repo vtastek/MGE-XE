@@ -983,6 +983,7 @@ STRUCT(CullInstance)
     float4 wr1;
     float4 wr2;
     float4 wr3;
+
     float posX;
     float posY;
     float posZ;
@@ -992,7 +993,7 @@ STRUCT(CullInstance)
     uint numSubsets;
     uint visIndex;
 
-#line 46
+#line 47
 };
 
 
@@ -1003,7 +1004,7 @@ STRUCT(StaticsSubset)
     uint indexCount;
     uint texSlot;
     uint flags;
-#line 56
+#line 57
 };
 
 STRUCT(CullParams)
@@ -1012,6 +1013,7 @@ STRUCT(CullParams)
     float4 eye;
     float4 ranges;
     float4 misc;
+
 
 
 
@@ -1027,7 +1029,14 @@ STRUCT(CullParams)
 
 
     float4 visMask[16];
-#line 79
+
+
+
+
+
+
+    float4 cellOwn;
+#line 88
 };
 
         CBUFFER(CullParams) gCullParams :  register(b0,space2);

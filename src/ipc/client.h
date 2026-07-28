@@ -69,6 +69,13 @@ namespace IPC {
 		std::uint32_t m_renderWidth = 0;
 		std::uint32_t m_renderHeight = 0;
 
+		// Statics near/far handover: MW's active exterior cell set + its cull reach, stamped into
+		// every render RPC. Mask 0 (no centre cell) ⇒ the host keeps its old near-cut distance.
+		std::int32_t m_nearCellX = 0;
+		std::int32_t m_nearCellY = 0;
+		std::uint32_t m_nearCellMask = 0;
+		float m_nearCellReach = 0.0f;
+
 		// Dev FSL hot-reload watcher: a Windows-python child (watch_shaders.py) launched alongside
 		// the host in a dev tree, killed with it. INVALID when not spawned (shipped tree / no python).
 		HANDLE m_watcherProcess;
@@ -387,6 +394,13 @@ namespace IPC {
 		// Live render-scale: stamp the current internal render resolution into every subsequent
 		// render RPC. Persists until changed. 0,0 ⇒ host renders at its full allocation size.
 		void setNextRenderSize(std::uint32_t w, std::uint32_t h) { m_renderWidth = w; m_renderHeight = h; }
+
+		// Statics near/far handover: stamp MW's active exterior cell set (centre grid coords +
+		// a 9-bit LOADED mask, bit (dy+1)*3 + (dx+1)) and its cull reach into every subsequent
+		// render RPC. Refreshed per frame by the seam; mask 0 disables the host's ownership gate.
+		void setNextNearCells(std::int32_t cx, std::int32_t cy, std::uint32_t mask, float reach) {
+			m_nearCellX = cx; m_nearCellY = cy; m_nearCellMask = mask; m_nearCellReach = reach;
+		}
 
 		WakeReason waitForCompletion(DWORD ms = MaxWait);
 

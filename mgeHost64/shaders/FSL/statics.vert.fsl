@@ -51,7 +51,8 @@ STRUCT(VSInput)
     DATA(float4, W2, TEXCOORD3);
     DATA(float4, W3, TEXCOORD4);
     DATA(float4, InstParams, TEXCOORD5); // x = packed texSlot (bucket<<16|layer), y = flags (bit1 = hasAlpha cutout),
-                                         // z = GitD window stagger in game hours (cullscatter.comp), w unused
+                                         // z = GitD window stagger in game hours (cullscatter.comp),
+                                         // w = near/far handover slab in view-Z (0 = no clip)
 };
 
 // CENTROID on Color + Fog is REQUIRED, not cosmetic — MGE marks the same two (XE Common.fx
@@ -166,7 +167,27 @@ VSOutput VS_MAIN( VSInput In )
 
     // Below-water clip (reflect-geo pass only): keep the above-water side of the water plane. worldPos
     // is camera-relative (statics are host-shifted by -eye), matching the plane. Pass-all elsewhere.
-    Out.Clip = dot(gFrameData.gReflWaterClip.xyz, worldPos.xyz) + gFrameData.gReflWaterClip.w;
+    float waterClip = dot(gFrameData.gReflWaterClip.xyz, worldPos.xyz) + gFrameData.gReflWaterClip.w;
+
+    // NEAR/FAR HANDOVER SLAB. InstParams.w is the view-Z plane where MW's near path stops covering
+    // this instance (cullscatter.comp / cellown.h.fsl; 0 = DL owns it outright — non-resident cell,
+    // the reflection, the sun-shadow stream, interiors, the viewer). MW culls per NiTriShape against
+    // its own far plane, so its coverage is exactly the half-space in front of this plane — cutting
+    // DL at the SAME plane makes the two producers meet at a surface, with no double-draw in front of
+    // it and, crucially, no hole behind it when MW's per-shape cull eats a big object piecemeal.
+    // This is MGE's original DX9 mechanism (a user clip plane, commit db5d27a), restored: the Forge
+    // port had kept its distance and replaced the slab with a per-object test, which is what put a
+    // moving hole in tiled runs like ex_hlaalu_canal_01 and swallowed whole castle pieces.
+    //
+    // Under a perspective projection clip.w IS view-Z, so the plane costs one subtract.
+    //
+    // SELECT, never min(). SV_ClipDistance is INTERPOLATED and the hardware cuts the triangle where
+    // it crosses zero, so the magnitude matters, not just the sign: min() against the main pass's
+    // pass-all water clip (a constant 1.0 — gReflWaterClip is identity (0,0,0,1) everywhere except
+    // the reflect-geo pass) flattens every positive distance to 1.0 and drags the zero crossing far
+    // out along the edge, cutting a straddling triangle in the wrong place. The two clips are never
+    // armed together — the reflection cull disarms the slab — so picking one is exact.
+    Out.Clip = (In.InstParams.w > 0.0f) ? (Out.Position.w - In.InstParams.w) : waterClip;
 
     // Glow in the Dahrk distant windows. A GitD window mesh is a NiSwitchNode whose "off"/"on"
     // children share vertex POSITIONS but not UVs, so the bake exports both as separate subsets:

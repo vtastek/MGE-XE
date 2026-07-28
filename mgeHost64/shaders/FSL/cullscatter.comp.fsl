@@ -12,6 +12,7 @@
 
 #include "cull.srt.h"
 #include "hizocclusion.h.fsl"
+#include "cellown.h.fsl"
 
 #define kMaxInst 65536u
 
@@ -62,6 +63,14 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
     float dNear2 = d2 + cz * cz;
     if (dNear2 < gCullParams.ranges.w || d2 > rangeEnd2)
         RETURN();
+
+    // Near/far handover — same header functions, same inputs (wr3.xy = placement ORIGIN, see
+    // cull.comp.fsl), same order as cull.comp.fsl, so the scatter agrees bit-for-bit with the
+    // counts the prefix-sum sized the runs from. Survivors carry the slab into InstParams.w below,
+    // which is what lets statics.vert clip the half MW already draws instead of dropping the object.
+    float nearSlab = nearPathSlab(inst.wr3.x, inst.wr3.y);
+    if (nearPathCovers(nearSlab, dNear2, inst.effR))
+        RETURN();
     UNROLL
     for (uint p = 0u; p < 6u; ++p)
     {
@@ -85,9 +94,10 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
     r3.y -= gCullParams.eye.y;
     r3.z -= gCullParams.eye.z;
 
-    // Per-instance GitD window stagger from the ABSOLUTE position (see kGlowVarianceHours). Constant
-    // for a given instance for the whole session, so it can never flicker.
-    float glowStagger = sin(inst.posX * 1.35f + inst.posY) * kGlowVarianceHours;
+    // Per-instance GitD window stagger from the ABSOLUTE PLACEMENT ORIGIN (see kGlowVarianceHours) —
+    // wr3.xy, the reference position GitD hashes on the near side, NOT posX/posY (the bound centre).
+    // Constant for a given instance for the whole session, so it can never flicker.
+    float glowStagger = sin(inst.wr3.x * 1.35f + inst.wr3.y) * kGlowVarianceHours;
 
     for (uint k = 0u; k < inst.numSubsets; ++k)
     {
@@ -111,7 +121,7 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
         gInstOut[b + 16u] = asuint((float)s.texSlot);
         gInstOut[b + 17u] = asuint((float)s.flags);
         gInstOut[b + 18u] = asuint(glowStagger);
-        gInstOut[b + 19u] = asuint(0.0f);
+        gInstOut[b + 19u] = asuint(nearSlab);   // 0 = no clip (DL owns it outright)
     }
     RETURN();
 }

@@ -33,10 +33,11 @@ STRUCT(CullInstance)
     DATA(float4, wr0, None);            // world row 0 (64B total = the CPU GpuCullInstance.world[0..15])
     DATA(float4, wr1, None);
     DATA(float4, wr2, None);
-    DATA(float4, wr3, None);            // wr3.xyz = absolute translation
-    DATA(float,  posX,        None);
-    DATA(float,  posY,        None);
-    DATA(float,  posZ,        None);
+    DATA(float4, wr3, None);            // wr3.xyz = absolute translation = the placement ORIGIN (the MW
+                                        // reference position: MW cell membership + the GitD glow hash)
+    DATA(float,  posX,        None);    // absolute BOUND-SPHERE CENTRE (origin + the model's own centre
+    DATA(float,  posY,        None);    // rotated/scaled into world). effR is measured about THIS point,
+    DATA(float,  posZ,        None);    // not about the origin — see the host's buildStaticsGrid.
     DATA(float,  effR,        None);    // -> 80B  frustum sphere radius
     DATA(uint,   rangeEndIdx, None);    // 0=near 1=far 2=vfar ; 0xFFFFFFFF = skip (grass/invalid)
     DATA(uint,   firstSubset, None);
@@ -59,8 +60,9 @@ STRUCT(CullParams)
 {
     DATA(float4, planes[6], None);  // 96B  Gribb-Hartmann planes (a,b,c,d); inside == a·x+b·y+c·z+d >= 0
     DATA(float4, eye,       None);  // xyz = camera eye (absolute world)
-    DATA(float4, ranges,    None);  // x=nearEnd² y=farEnd² z=vfarEnd² w=nearCut²
+    DATA(float4, ranges,    None);  // x=nearEnd² y=farEnd² z=vfarEnd² w=nearCut² (0 when cellOwn is armed)
     DATA(float4, misc,      None);  // x = instance count, y = subset count (as floats; uint4 not C++-safe)
+                                    // z = MW's view distance = the near/far HANDOVER SLAB (view-Z plane)
     // -- Occlusion M2: the previous frame's Hi-Z pyramid camera (snapshotted at prologue submit).
     // hizVP = the RAW rzViewProj bytes of the frame that filled the pyramid (camera-relative,
     // reverse-Z, extended-far — the exact matrix statics.vert projected with). float4x4 in a
@@ -74,8 +76,15 @@ STRUCT(CullParams)
     // SRT resource / descriptor-set change is needed, and BOTH pCullSet and pSunCullSet inherit it
     // (the sun cull copies the whole 496B, which is what stops LOD shadows from ghost buildings).
     // float4 not uint4: this header is #included in the host C++ TU, where uint4 is not available —
-    // the shaders read it back with asuint, a pure bitcast. floats 60..123 -> 496B total.
+    // the shaders read it back with asuint, a pure bitcast. floats 60..123.
     DATA(float4,   visMask[16], None);
+    // Statics near/far handover: MW's ACTIVE exterior cell set, so the cull can arm the slab clip
+    // (misc.z) on the instances whose MW copy is actually loaded. x/y = centre grid coords, z = 9-bit
+    // LOADED mask (bit (dy+1)*3 + (dx+1)), w = armed (0 ⇒ ranges.w's fixed near-cut instead; the
+    // sun cull zeroes it so DL statics keep casting into the near scene). Values are small
+    // integers, exact in float. Rides the cbuffer for the same reason visMask does — no new SRT
+    // resource, no descriptor-set change. See cellown.h.fsl. floats 124..127 -> 512B total.
+    DATA(float4,   cellOwn,     None);
 };
 
 BEGIN_SRT(CullSrtData)

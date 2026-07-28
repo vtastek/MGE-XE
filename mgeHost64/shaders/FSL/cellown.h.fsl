@@ -1,0 +1,76 @@
+// mgeHost64 — statics near/far OWNERSHIP, shared by cull.comp AND cullscatter.comp. SHADER-ONLY
+// header: cull.srt.h stays the C++-safe one; include this AFTER it (needs gCullParams).
+//
+// The Forge NEAR path (cache opaque) and the DL statics path are two producers for the handover
+// band. Drawing an object in both is the z-fight the user sees; drawing it in neither deletes a
+// building. So the two must PARTITION the world, and the partition MW itself uses has two halves:
+//
+//   1. RESIDENCY — MW only draws references out of its 9 active exterior cells. cellOwn.xy is
+//      DataHandler's centralGridX/Y and cellOwn.z is a 9-bit mask of which neighbours are LOADED
+//      (bit (dy+1)*3 + (dx+1)). A cell that is still background-loading has its bit CLEAR, so DL
+//      keeps covering it — the fail-open direction, because a hole is worse than a duplicate.
+//   2. REACH — and this is a PLANE, not a radius. MW culls per NiTriShape, each shape's own bound
+//      against a frustum whose far plane is the view distance (misc.z). The host's near draw list
+//      IS that classify set (buildFrustumVisibleSet folds s_visibleKeys straight across), so the
+//      near path covers exactly the half-space `view-Z < reach` — every shape with geometry inside
+//      it survives, every shape wholly beyond it is gone.
+//
+// So ownership CANNOT be decided per object. A big static straddling the plane keeps its near shapes
+// and loses its far ones, one at a time; rejecting its whole LOD proxy on an object-radius test
+// deletes the part MW just dropped. That is a hole whose width scales with the object — measured on
+// ex_hlaalu_canal_01 (r=333, one section), flora_tree_04 (r≈900, "briefly gone"), the Imperial castle
+// pieces ("gone"). The DX9 path never had it: MGE cut DL with a user CLIP PLANE at this same slab,
+// and the Forge port kept the number while dropping the mechanism.
+//
+// The mechanism is back. DL is not rejected in the handover band, it is CLIPPED at the same plane
+// (statics.vert, SV_ClipDistance0, fed the slab per instance through InstParams.w), so the two
+// producers meet at a surface instead of arguing over an object. Per-object rejection survives only
+// as the free case: an instance whose whole sphere is inside the slab would be clipped away entirely,
+// so it is never submitted.
+//
+// The cull grid cell IS an MW cell (8192, same origin), so the instance's cell is just
+// floor(origin.xy / 8192) — no lookup table. Feed it the placement ORIGIN (wr3.xy), which is what MW
+// files a reference under; the bound centre can land in the next cell over.
+//
+// cellOwn.w == 0 (interior, standalone viewer, sun cull, or MW's own cell not committed yet)
+// disarms this entirely and CullParams.ranges.w — the old fixed near-cut distance — takes over.
+// The host arms exactly one of the two.
+
+#define kMWCellSize 8192.0f
+
+// The view-Z plane where MW's near coverage ENDS for this instance: misc.z (MW's view distance) when
+// the instance's MW cell is confirmed LOADED, and 0 — DL owns it outright, pre-gate behaviour — when
+// it is not. A cell still background-loading therefore keeps its full DL cover, which is the
+// fail-open direction: a hole is worse than a duplicate. cullscatter.comp re-runs this through the
+// SAME header, so the scatter can never disagree with the counts the prefix-sum sized its runs from.
+float nearPathSlab(float originX, float originY)
+{
+    if (gCullParams.cellOwn.w < 0.5f)
+        return 0.0f;
+
+    int cx = (int)floor(originX * (1.0f / kMWCellSize));
+    int cy = (int)floor(originY * (1.0f / kMWCellSize));
+    int dx = cx - (int)gCullParams.cellOwn.x;
+    int dy = cy - (int)gCullParams.cellOwn.y;
+    if (dx < -1 || dx > 1 || dy < -1 || dy > 1)
+        return 0.0f;                       // outside the 3x3 window — MW has no such cell
+
+    uint mask = (uint)gCullParams.cellOwn.z;
+    if (((mask >> (uint)((dy + 1) * 3 + (dx + 1))) & 1u) == 0u)
+        return 0.0f;                       // cell not committed — DL still owns it
+
+    return gCullParams.misc.z;
+}
+
+// True when the instance's whole bound sphere lies inside the slab, i.e. statics.vert would clip
+// every one of its vertices — so there is nothing to submit. This is the ONLY per-object rejection
+// left, and it is conservative by construction: dist2 is to the bound CENTRE and effR is the radius
+// about that same centre, so it fires only when MW demonstrably covers every vertex. Euclidean
+// against MW's view-Z is the safe mismatch here (Euclidean >= view-Z): it can only under-reject.
+bool nearPathCovers(float slab, float dist2, float effR)
+{
+    if (slab <= 0.0f || effR >= slab)
+        return false;
+    float inner = slab - effR;
+    return dist2 < inner * inner;
+}

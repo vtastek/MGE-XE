@@ -444,6 +444,19 @@ namespace IPC {
         IN std::uint32_t renderWidth;
         IN std::uint32_t renderHeight;
 
+        // Statics near/far handover: MW's ACTIVE exterior cell set + how far its own cull reaches,
+        // so the host can tell which distant statics the NEAR path is already drawing at full
+        // detail (drawing both is the handover z-fight). nearCellX/Y = DataHandler centralGridX/Y;
+        // nearCellMask bit (dy+1)*3 + (dx+1) is set for each LOADED neighbour (engine residency
+        // table, exteriorCellData[9]); nearCellReach = MW's view distance this frame, the radius
+        // its bounding-sphere cull reaches. The CENTRE bit doubles as the valid flag: clear ⇒ the
+        // host falls back to its old fixed near-cut distance. Appended after the render-scale
+        // fields so every existing IN offset is unchanged.
+        IN std::int32_t  nearCellX;
+        IN std::int32_t  nearCellY;
+        IN std::uint32_t nearCellMask;
+        IN float         nearCellReach;
+
         OUT std::uint32_t bytesWritten;
         OUT double renderMs;             // host-side render+readback time
 

@@ -615,6 +615,10 @@ namespace IPC {
 			// allocation size host-side). 0,0 ⇒ render at the full allocation. Per-frame viewport
 			// move only — no RT reallocation.
 			ForgeRender::setRenderSize(params.renderWidth, params.renderHeight);
+			// Statics near/far handover: MW's active exterior cell set + how far its own cull
+			// reaches. Mask 0 (no centre cell) ⇒ the host keeps its fixed near-cut distance.
+			ForgeRender::setNearCells(params.nearCellX, params.nearCellY,
+				params.nearCellMask, params.nearCellReach);
 			ok = ForgeRender::renderScene(params.viewProj, params.lighting, drawPtr, params.drawCount, bytes,
 				skinnedPtr, params.skinnedCount, skinnedBytes,
 				multiMapPtr, params.multiMapCount, multiMapBytes,

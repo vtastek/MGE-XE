@@ -6270,6 +6270,42 @@ namespace {
     // Viewer: draw DL statics all the way to the eye (same reason the water REFLECTION does — no near
     // path covers them, so the near-cut would just delete them).
     bool  g_dlNoStaticsNearCut = false;
+
+    // ---- Statics near/far OWNERSHIP (setNearCells; see the gate in dlCullAndBuild) ---------------
+    // MW's active exterior cell set + the reach of MW's own cull, shipped every frame. A distant
+    // static is the NEAR path's to draw iff its MW cell is resident AND MW's bounding-sphere cull
+    // reaches it; the DL cull then skips it, which is what stops the two producers double-drawing
+    // the same building in the handover band. Written on the server thread immediately before
+    // renderScene on the SAME thread — no synchronisation needed.
+    int32_t  g_nearCellX    = 0;
+    int32_t  g_nearCellY    = 0;
+    uint32_t g_nearCellMask = 0;      // bit (dy+1)*3 + (dx+1); centre bit (4) doubles as "valid"
+    float    g_nearCellReach = 0.0f;  // MW view distance — the radius its cull reaches
+    // Gate armed only with the player's own cell confirmed loaded: without it there is nothing to
+    // trust and the fixed near-cut distance stays in charge (today's behaviour).
+    inline bool dlCellOwnActive() {
+        return (g_nearCellMask & (1u << 4)) != 0u && g_nearCellReach > 0.0f;
+    }
+    // Is MW holding this cell (grid coords = floor(worldXY / 8192), the same partition the cull
+    // grid uses)? Outside the 3x3 window, or merely loading, reads as NOT resident — DL keeps
+    // drawing there. A hole deletes world geometry; a duplicate is only ugly.
+    inline bool dlCellResident(int32_t gx, int32_t gy) {
+        const int32_t dx = gx - g_nearCellX, dy = gy - g_nearCellY;
+        if (dx < -1 || dx > 1 || dy < -1 || dy > 1) { return false; }
+        return (g_nearCellMask >> ((dy + 1) * 3 + (dx + 1))) & 1u;
+    }
+    // Per-frame ownership diagnostics (dlLogHeartbeat + the dev panel), one counter per class the
+    // handover sorts a resident-cell instance into:
+    //   suppressed  — wholly in front of the slab: MW draws all of it, no proxy submitted.
+    //   clipped     — STRADDLING the slab: submitted and cut at it. This is the class that used to
+    //                 be a hole (rejected whole while MW's per-shape cull was eating the far half),
+    //                 so it is the number that says the slab is actually doing its job.
+    //   drawn       — wholly beyond: ordinary DL. The anti-hole tripwire — it must stay well above
+    //                 zero, because the resident 3x3 reaches ~12288 into the corners while MW's
+    //                 cull only reaches ~7168.
+    uint32_t g_dlOwnSuppressed  = 0;
+    uint32_t g_dlOwnClipped     = 0;
+    uint32_t g_dlOwnResidentDrawn = 0;
     // Stage B (B3): draw the far statics from the GPU-driven cull (count->prefix-sum->scatter->
     // execute-indirect) instead of the CPU cull's rings. The CPU cull still runs (fills g_liveLastInst
     // for the parity check + the reflect path); this only switches which instance/arg buffers the MAIN
@@ -7585,6 +7621,13 @@ namespace ForgeRender {
         }
         g_live.width  = (w < g_live.allocWidth)  ? (uint32_t)w : g_live.allocWidth;
         g_live.height = (h < g_live.allocHeight) ? (uint32_t)h : g_live.allocHeight;
+    }
+
+    void setNearCells(int centreX, int centreY, unsigned loadedMask, float reach) {
+        g_nearCellX     = (int32_t)centreX;
+        g_nearCellY     = (int32_t)centreY;
+        g_nearCellMask  = (uint32_t)loadedMask & 0x1FFu;
+        g_nearCellReach = (reach > 0.0f) ? reach : 0.0f;
     }
 
     void* sharedHandle() {
@@ -13378,7 +13421,11 @@ namespace ForgeRender {
         uint32_t texSlot;      // bindless gTextures slot (0 until its texture is loaded in scope)
         uint32_t flags;        // bit1 = hasAlpha cutout, bit2 = UV-animated (NiUVController)
     };
-    struct StaticsDefCPU { uint32_t firstSubset, numSubsets; float radius; uint8_t type; }; // mirrors DistantStatic
+    // mirrors DistantStatic. centre = the model's bound-sphere centre in MODEL space (static_meshes
+    // stores it right after the radius); radius is measured about IT, not about the placement origin,
+    // so any consumer that treats the origin as the sphere centre is wrong by |centre| — see
+    // buildStaticsGrid, which resolves it to world space once.
+    struct StaticsDefCPU { uint32_t firstSubset, numSubsets; float radius; float centre[3]; uint8_t type; };
 
     Buffer*   g_pStaticsVB       = nullptr;   // mega per-vertex (GPU_ONLY, stride 20)
     Buffer*   g_pStaticsIB       = nullptr;   // mega 16-bit index (GPU_ONLY)
@@ -13508,8 +13555,13 @@ namespace ForgeRender {
     // alignment, so the shader struct rounds 80 -> 96; an explicit posZ + _pad keep the C++ upload
     // byte-identical to that stride and let the cull shader test the sphere z without decoding world.
     struct GpuCullInstance {
-        float    world[16];        // absolute world matrix (64 B)
-        float    posX, posY, posZ; // absolute position (xy = horizontal dist test, z = frustum sphere)
+        float    world[16];        // absolute world matrix (64 B). world[12..14] = the placement ORIGIN
+                                   // (the MW reference position: cell membership + the GitD glow hash).
+        float    posX, posY, posZ; // absolute BOUND-SPHERE CENTRE (origin + the model centre rotated/
+                                   // scaled into world). NOT the origin: effR is measured about the
+                                   // model's own centre, so pairing it with the origin under-covers the
+                                   // mesh on one side and over-covers it on the other — which showed up
+                                   // as a one-piece hole in tiled modular runs at the near/far handover.
         float    effR;             // frustum sphere radius (def.radius * scale)            -> 80 B
         uint32_t rangeEndIdx;      // tier: 0=nearEnd 1=farEnd 2=vfarEnd ; 0xFFFFFFFF = skip
         uint32_t firstSubset;
@@ -13664,8 +13716,14 @@ namespace ForgeRender {
     struct LiveGridCell {
         std::vector<uint32_t> inst;                    // instance indices into g_usageData ws0 records
         float minx, miny, minz, maxx, maxy, maxz;      // AABB of member placements (padded for cull)
+        int32_t gx, gy;                                // grid coords — kLiveGridCell is ONE MW cell at
+                                                       // the same origin, so these ARE MW cell coords
+                                                       // (the near/far ownership gate keys on them)
     };
     std::vector<LiveGridCell> g_liveGrid;
+    // (gx,gy) -> index into g_liveGrid, so the ownership tally can visit the <=9 resident cells
+    // directly instead of scanning the whole world grid. Built with the grid.
+    std::unordered_map<uint64_t, uint32_t> g_liveGridIndex;
     bool      g_dlExterior   = false;                  // per-frame: client's isExterior gate
     bool      g_dlLiveInit   = false;                  // resident load + grid + rings done
     bool      g_staticsLiveOk = false;                 // statics library + rings ready
@@ -14199,10 +14257,12 @@ namespace ForgeRender {
             if (p + 21 > end) { break; }
             uint32_t numSubsets = 0; std::memcpy(&numSubsets, p, 4);
             float    sradius = 0.0f; std::memcpy(&sradius, p + 4, 4);   // model bounding radius
+            float    scentre[3];     std::memcpy(scentre, p + 8, 12);   // ...measured about THIS centre
             uint8_t  stype   = *(p + 4 + 4 + 12);                       // StaticType (dlformat.h)
             p += 4 + 4 + 12 + 1;                          // numSubsets + radius + center + type
             StaticsDefCPU def; def.firstSubset = (uint32_t)g_staticsSubsets.size(); def.numSubsets = numSubsets;
             def.radius = sradius; def.type = stype;
+            def.centre[0] = scentre[0]; def.centre[1] = scentre[1]; def.centre[2] = scentre[2];
             for (uint32_t ss = 0; ss < numSubsets; ++ss) {
                 if (p + 44 > end) { p = end; break; }
                 p += 4 + 12 + 12 + 12;                    // subset sphere + aabbMin + aabbMax
@@ -16122,6 +16182,15 @@ namespace ForgeRender {
         LOG::logline(">> [forge-hb][dl] exterior=%d land=%u/%u static-instances=%u subsets=%u tex-buckets=%zu",
                      (int)g_dlExterior, g_liveLastLand, g_landMeshCount, g_liveLastInst,
                      g_liveLastSubsets, g_staticsBuckets.empty() ? 0 : g_staticsBuckets.size() - 1);
+        // Near/far handover: suppressed = wholly MW-covered (the double-draw that used to ship);
+        // clipped = STRADDLING the slab, submitted and cut at it (the class that was a hole while
+        // the gate rejected whole objects); residentDrawn = survivors wholly beyond it (must stay
+        // well above 0 — that band, from MW's ~reach out to the cell edge, is DL's alone).
+        // gate=0 means no cell set arrived and the fixed near-cut distance is in charge.
+        LOG::logline(">> [forge-hb][dl] cellown gate=%d centre=(%d,%d) mask=0x%03X reach=%.0f"
+                     " suppressed=%u clipped=%u residentDrawn=%u",
+                     (int)dlCellOwnActive(), g_nearCellX, g_nearCellY, g_nearCellMask,
+                     g_nearCellReach, g_dlOwnSuppressed, g_dlOwnClipped, g_dlOwnResidentDrawn);
     }
 
     // Build a uniform grid (cell = one MW cell) over the resident exterior placements: gridCell ->
@@ -16141,7 +16210,10 @@ namespace ForgeRender {
         g_visGroupInstCount.assign((size_t)g_visGroupCount + 1, 0u);
         const float gFarMin  = Configuration.DL.FarStaticMinSize;
         const float gVfarMin = Configuration.DL.VeryFarStaticMinSize;
-        std::unordered_map<uint64_t, uint32_t> cellMap;
+        // Kept as a member (not a local) so the per-frame ownership tally can look up the <=9
+        // resident MW cells straight away instead of scanning the world grid.
+        std::unordered_map<uint64_t, uint32_t>& cellMap = g_liveGridIndex;
+        cellMap.clear();
         cellMap.reserve(4096);
         const uint8_t* rec = &g_usageData[g_ws0Off];
         for (uint32_t i = 0; i < g_ws0Count; ++i, rec += 34) {
@@ -16172,12 +16244,24 @@ namespace ForgeRender {
                 float Tm[16] = { 1,0,0,0, 0,1,0,0, 0,0,1,0, pos[0],pos[1],pos[2],1 };
                 float m0[16], m1[16], m2[16];
                 dlMul(S,  Rz, m0); dlMul(m0, Ry, m1); dlMul(m1, Rx, m2); dlMul(m2, Tm, gi.world);
-                gi.posX = pos[0]; gi.posY = pos[1]; gi.posZ = pos[2];
+                gi.posX = pos[0]; gi.posY = pos[1]; gi.posZ = pos[2];   // overwritten with the bound centre below
                 // tier/effR/subset range — precomputed (constant per session: type, size, DL config).
                 if (staticRef >= g_staticsDefs.size()) { gi.rangeEndIdx = 0xFFFFFFFFu; }
                 else {
                     const StaticsDefCPU& def = g_staticsDefs[staticRef];
                     gi.effR = def.radius * scale;
+                    // Resolve the model's bound-sphere CENTRE into world space (row-vector convention:
+                    // p' = p·world, so the columns are strided by 4). effR is the radius about this
+                    // point, so this is the sphere every downstream test wants — tier range, near cut,
+                    // near/far ownership, frustum, Hi-Z. Placement origins are frequently at one end or
+                    // corner of a modular piece (ex_hlaalu_canal_01: centre is 235 u off its origin,
+                    // against a 333 u radius), and testing that radius about the origin biased every
+                    // distance by the offset — a systematic error the whole width of one canal section.
+                    const float* w = gi.world;
+                    const float* mc = def.centre;
+                    gi.posX = mc[0]*w[0] + mc[1]*w[4] + mc[2]*w[8]  + w[12];
+                    gi.posY = mc[0]*w[1] + mc[1]*w[5] + mc[2]*w[9]  + w[13];
+                    gi.posZ = mc[0]*w[2] + mc[1]*w[6] + mc[2]*w[10] + w[14];
                     gi.firstSubset = def.firstSubset; gi.numSubsets = def.numSubsets;
                     float tierR = (def.type == DL_STATIC_BUILDING) ? gi.effR * 2.0f : gi.effR;
                     switch (def.type) {
@@ -16189,6 +16273,10 @@ namespace ForgeRender {
                     }
                 }
             }
+            // Grid cell from the ORIGIN, not the bound centre: kLiveGridCell IS one MW cell at the same
+            // origin, and MW files a reference under the cell its POSITION falls in — so origin-keying
+            // is what makes c.gx/c.gy answer "is MW's copy of this loaded?". The cull shaders derive the
+            // same cell from wr3.xy for exactly this reason.
             int32_t ix = (int32_t)std::floor(pos[0] / kLiveGridCell);
             int32_t iy = (int32_t)std::floor(pos[1] / kLiveGridCell);
             uint64_t key = ((uint64_t)(uint32_t)ix << 32) | (uint32_t)iy;
@@ -16200,15 +16288,18 @@ namespace ForgeRender {
                 LiveGridCell c;
                 c.minx = c.miny = c.minz =  3.4e38f;
                 c.maxx = c.maxy = c.maxz = -3.4e38f;
+                c.gx = ix; c.gy = iy;
                 g_liveGrid.push_back(std::move(c));
             } else {
                 ci = it->second;
             }
             LiveGridCell& c = g_liveGrid[ci];
             c.inst.push_back(i);
-            c.minx = std::min(c.minx, pos[0]); c.maxx = std::max(c.maxx, pos[0]);
-            c.miny = std::min(c.miny, pos[1]); c.maxy = std::max(c.maxy, pos[1]);
-            c.minz = std::min(c.minz, pos[2]); c.maxz = std::max(c.maxz, pos[2]);
+            // AABB over the SPHERE CENTRES — the points the per-instance test actually measures, so the
+            // coarse cell reject stays a true bound of them (it is padded by a whole cell besides).
+            c.minx = std::min(c.minx, gi.posX); c.maxx = std::max(c.maxx, gi.posX);
+            c.miny = std::min(c.miny, gi.posY); c.maxy = std::max(c.maxy, gi.posY);
+            c.minz = std::min(c.minz, gi.posZ); c.maxz = std::max(c.maxz, gi.posZ);
         }
         std::printf("[forge][dl] live grid: %zu cells over %u placements\n", g_liveGrid.size(), g_ws0Count);
         std::printf("[forge][dl] visgroups: %u groups, %u gated instances\n",
@@ -16434,7 +16525,7 @@ namespace ForgeRender {
         pb.mDesc.mDescriptors = DESCRIPTOR_TYPE_UNIFORM_BUFFER;
         pb.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_CPU_TO_GPU;
         pb.mDesc.mFlags       = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
-        pb.mDesc.mSize        = 512;                          // >= sizeof(CullParams) (496B), CBV-aligned
+        pb.mDesc.mSize        = 512;                          // == sizeof(CullParams) (512B), CBV-aligned
         pb.mDesc.pName        = "cullParamsCbv";
         pb.ppBuffer           = &g_live.pCullParamsCbv;
         addResource(&pb, nullptr);
@@ -16594,7 +16685,7 @@ namespace ForgeRender {
             spc.mDesc.mDescriptors = DESCRIPTOR_TYPE_UNIFORM_BUFFER;
             spc.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_CPU_TO_GPU;
             spc.mDesc.mFlags       = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
-            spc.mDesc.mSize        = 512;                     // matches the camera CullParams (496B)
+            spc.mDesc.mSize        = 512;                     // matches the camera CullParams (512B)
             spc.mDesc.pName        = "sunCullParamsCbv";
             spc.ppBuffer           = &g_live.pSunCullParamsCbv;
             addResource(&spc, nullptr);
@@ -16959,13 +17050,46 @@ namespace ForgeRender {
         const float vfarEnd = Configuration.DL.VeryFarStaticEnd  * 8192.0f;
         // (FarStaticMinSize/VeryFarStaticMinSize are now consumed at LOAD — tier is precomputed into
         //  g_cullInst.rangeEndIdx, so the per-frame hot loop no longer needs the MinSize thresholds.)
-        // Near cutoff: the Forge NEAR path (cache opaque) already draws statics within the near
-        // scene, so a DL static drawn there is a DUPLICATE → z-fight ("double rendering, near and DL").
-        // Skip DL statics closer than the handover (MGE clips its distant statics at nearViewRange-768).
-        // lodParams.w (fd[51]) = nearViewRange; per-origin cut (a large mesh straddling the band can
-        // still gap — acceptable for the additive phase; MGE uses a slab clip plane there).
-        // WV2: the REFLECTION suppresses this cut (no near-scene path reflects, so DL must cover near too).
-        const float nearCut  = T.suppressNearCut ? 0.0f : (fd[51] - 768.0f);
+        // ---- Near/far OWNERSHIP -------------------------------------------------------------------
+        // The Forge NEAR path (cache opaque) already draws statics inside the near scene, so a DL
+        // proxy drawn there is a DUPLICATE → z-fight ("double rendering, near and DL"). The two
+        // producers must partition the world, and the partition MW actually uses has two halves:
+        //   1. RESIDENCY — MW only draws references from its 9 active exterior cells. A cell that
+        //      is still background-loading contributes nothing, so DL must keep covering it.
+        //   2. REACH — and this is a PLANE, not a radius. MW culls per NiTriShape, each shape's own
+        //      bound against a frustum whose far plane is its view distance (pinned to 7168 in
+        //      mged3d8device.cpp), and the host's near draw list IS that classify set
+        //      (buildFrustumVisibleSet hands s_visibleKeys straight across on Forge frames). So the
+        //      near path covers exactly the half-space `view-Z < reach`.
+        //
+        // Which means ownership cannot be settled per OBJECT, and trying to is what holed. A static
+        // straddling the plane keeps its near shapes and loses its far ones one at a time; rejecting
+        // its whole proxy on any object-radius test deletes precisely the half MW just dropped. The
+        // hole is as wide as the object, which is why the reports scaled with size:
+        // ex_hlaalu_canal_01 (r=333) lost one section, flora_tree_04 (r~900) blinked out, the
+        // Imperial castle pieces went altogether.
+        //
+        // So DL is CLIPPED at the slab instead of rejected — `slab` rides each instance row into
+        // statics.vert's SV_ClipDistance0. This is MGE's own DX9 mechanism (a user clip plane,
+        // db5d27a); the Forge port had carried its distance over while dropping the slab, and every
+        // handover artefact on this branch traces back to that swap. Two producers now meet at a
+        // surface, so there is no double-draw in front of it and no hole behind it. The only
+        // rejection left is the free one: an instance wholly inside the slab would be clipped away
+        // in full, so it is never submitted.
+        //
+        // `dist` is to the instance's BOUND CENTRE (gi.pos*), which is what makes that rejection
+        // conservative: effR is the radius about the model's own centre, and pairing it with the
+        // placement ORIGIN instead biases the test by the centre offset — on modular architecture a
+        // large fraction of the radius (ex_hlaalu_canal_01: 235 u against 333 u).
+        //
+        // The old fixed cut (nearViewRange-768, MGE's slab distance carried over per-origin)
+        // stays as the FALLBACK for every path with no cell set: interiors, the standalone viewer,
+        // and the moment before MW's own cell is committed. Exactly one of the two is ever armed.
+        //   WV2: the REFLECTION suppresses both (no near-scene path reflects, so DL must cover near
+        //   too, or objects vanish from the mirror with nobody else drawing them).
+        const bool  cellOwn  = !T.suppressNearCut && dlCellOwnActive();
+        const float ownReach = cellOwn ? g_nearCellReach : 0.0f;
+        const float nearCut  = (T.suppressNearCut || cellOwn) ? 0.0f : (fd[51] - 768.0f);
         const float nearCut2 = nearCut * nearCut;
 
         // When the GPU cull drives the PRIMARY statics draw (g_gpuStaticsCull), skip this whole CPU
@@ -17004,6 +17128,9 @@ namespace ForgeRender {
                 if (ndx*ndx + ndy*ndy > farLimit*farLimit) { continue; }
             }
             ++cellsHit;
+            // Ownership half 1 (per CELL — kLiveGridCell IS one MW cell at the same origin, so a
+            // grid cell and an MW cell are the same thing). Half 2 is per-instance, below.
+            const bool residentCell = cellOwn && dlCellResident(c.gx, c.gy);
 
             for (uint32_t ii : c.inst) {
                 ++examined;
@@ -17017,9 +17144,21 @@ namespace ForgeRender {
                                                                    // A/B, so the mirror gets gated too)
                 float rangeEnd = (gi.rangeEndIdx == 0) ? nearEnd : (gi.rangeEndIdx == 1) ? farEnd : vfarEnd;
                 float dx = gi.posX - eye[0], dy = gi.posY - eye[1];
-                float dz = gi.world[14] - eye[2];
+                float dz = gi.posZ - eye[2];   // bound centre, matching cull.comp.fsl's inst.posZ
                 float d2 = dx*dx + dy*dy;
                 float dNear2 = d2 + dz*dz;   // near cut 3D (height-aware, matches DX9); far tier stays horizontal
+                // Ownership half 2 (per INSTANCE): the only rejection left is the free one — an
+                // instance whose whole sphere is inside the slab is clipped away vertex by vertex
+                // anyway, so it is never submitted. Everything straddling the slab IS submitted and
+                // carries the plane in its instance row; statics.vert cuts it there. Mirrors
+                // cellown.h.fsl::nearPathCovers exactly (same order, same Euclidean-vs-view-Z
+                // under-reject) or the CPU and GPU culls disagree. Exactly one of slab / nearCut2
+                // is ever armed.
+                const float slab = residentCell ? ownReach : 0.0f;
+                if (slab > 0.0f && gi.effR < slab) {
+                    const float inner = slab - gi.effR;
+                    if (dNear2 < inner * inner) { continue; }   // wholly MW-covered — nothing to draw
+                }
                 if (dNear2 < nearCut2 || d2 > rangeEnd*rangeEnd) { continue; }   // near-owned or beyond tier
 
                 // Frustum-cull the instance sphere (relative space). z = world[14] (absolute pos.z).
@@ -17031,10 +17170,11 @@ namespace ForgeRender {
                 std::memcpy(W, gi.world, 16 * sizeof(float));
                 W[12] -= eye[0]; W[13] -= eye[1]; W[14] -= eye[2];   // camera-relative shift
 
-                // GitD window stagger — hashed from the ABSOLUTE position, exactly as
-                // cullscatter.comp.fsl does it (the GPU cull is the primary path; this is the
-                // fallback and the two must agree or windows would pop when the mode is toggled).
-                const float glowStagger = std::sin(gi.posX * 1.35f + gi.posY) * kGlowVarianceHours;
+                // GitD window stagger — hashed from the absolute PLACEMENT ORIGIN (world[12..13], the
+                // reference position GitD's own near-side hash uses), exactly as cullscatter.comp.fsl
+                // does it from wr3.xy. Not posX/posY: those are the bound centre now, and hashing that
+                // would put the far stagger out of step with the near one.
+                const float glowStagger = std::sin(gi.world[12] * 1.35f + gi.world[13]) * kGlowVarianceHours;
 
                 for (uint32_t k = 0; k < gi.numSubsets; ++k) {
                     uint32_t sid = gi.firstSubset + k;
@@ -17046,7 +17186,7 @@ namespace ForgeRender {
                     dst.insert(dst.end(), W, W + 16);
                     dst.push_back((float)ts);
                     dst.push_back((float)g_staticsSubsets[sid].flags);
-                    dst.push_back(glowStagger); dst.push_back(0.0f);
+                    dst.push_back(glowStagger); dst.push_back(slab);   // w = handover slab (0 = no clip)
                 }
             }
         }
@@ -17092,7 +17232,8 @@ namespace ForgeRender {
             cp[28] = nearEnd * nearEnd; cp[29] = farEnd * farEnd;                                   // ranges
             cp[30] = vfarEnd * vfarEnd; cp[31] = nearCut2;
             cp[32] = (float)g_live.cullInstCount;                                                   // misc.x = instance count
-            cp[33] = (float)g_live.cullSubsetCount; cp[34] = cp[35] = 0.0f;                         // misc.y = subset count
+            cp[33] = (float)g_live.cullSubsetCount;                                                 // misc.y = subset count
+            cp[34] = ownReach; cp[35] = 0.0f;                                                       // misc.z = MW cull reach
             // M2: the prev-frame Hi-Z pyramid camera (raw matrix bytes + dims + eye rebase).
             // valid only when a fresh pyramid exists AND the toggle is on AND the eye hasn't
             // jumped since the snapshot (teleport/cell-load guard — a reprojection across a jump
@@ -17106,12 +17247,63 @@ namespace ForgeRender {
             cp[56] = dEx; cp[57] = dEy; cp[58] = dEz; cp[59] = 0.0f;                                // hizEyeDelta
             // Dynamic visibility mask (floats 60..123). Stored as raw bits — the shaders asuint it
             // back. The CPU gate above (dlVisEnabled) reads the SAME g_visMask, so the two cull paths
-            // and the two cull shaders all agree. dispatchSunCull copies the whole 496 B, so the sun
+            // and the two cull shaders all agree. dispatchSunCull copies the whole 512 B, so the sun
             // cull inherits this before it overrides planes/ranges — that is what stops a hidden
             // building's LOD from casting a shadow onto bare ground.
             uint32_t* cpu = (uint32_t*)cp;
             for (uint32_t w = 0; w < DL_VIS_MASK_WORDS; ++w) {
                 cpu[60 + w] = g_visMask[w].load(std::memory_order_relaxed);
+            }
+            // Near/far ownership (floats 124..127): MW's resident cell set. Rides the cbuffer like
+            // visMask does, so no new SRT resource and no descriptor-set change — and both cull
+            // shaders read the SAME words the CPU gate above used. The mask is 9 bits and the grid
+            // coords are small integers, so float carries them exactly.
+            cp[124] = (float)g_nearCellX;
+            cp[125] = (float)g_nearCellY;
+            cp[126] = (float)(cellOwn ? g_nearCellMask : 0u);
+            cp[127] = cellOwn ? 1.0f : 0.0f;   // gate armed (0 ⇒ ranges.w near-cut instead)
+        }
+
+        // Ownership tally. "The shimmer looks better" is not falsifiable, so measure the two
+        // numbers that are: how many instances the gate handed to the near path (= the double-draw
+        // that used to happen, and the DL work now saved) and how many survivors STILL sit in a
+        // resident cell (the anti-hole tripwire — the resident 3x3 reaches ~12288 into its corners
+        // while MW's cull reaches only ~7168, so a healthy frame keeps drawing plenty of DL inside
+        // it; a collapse to zero would mean the gate ate the whole resident set).
+        //
+        // Runs independently of which cull path drove the draw — the GPU cull skips the CPU
+        // cell-walk entirely, and the number has to survive that. Only the <=9 resident cells are
+        // visited (straight lookups into g_liveGridIndex), so it costs a couple of thousand tests.
+        // Hi-Z is not applied, matching the CPU cull / gCullCount[0] pre-occlusion convention.
+        if (T.primary) {
+            g_dlOwnSuppressed = g_dlOwnClipped = g_dlOwnResidentDrawn = 0;
+            if (cellOwn && !g_liveGrid.empty()) {
+                for (int dy = -1; dy <= 1; ++dy) {
+                    for (int dx = -1; dx <= 1; ++dx) {
+                        if (!dlCellResident(g_nearCellX + dx, g_nearCellY + dy)) { continue; }
+                        const uint64_t key = ((uint64_t)(uint32_t)(g_nearCellX + dx) << 32)
+                                           | (uint32_t)(g_nearCellY + dy);
+                        auto it = g_liveGridIndex.find(key);
+                        if (it == g_liveGridIndex.end()) { continue; }
+                        for (uint32_t ii : g_liveGrid[it->second].inst) {
+                            const GpuCullInstance& gi = g_cullInst[ii];
+                            if (gi.rangeEndIdx == 0xFFFFFFFFu || !dlVisEnabled(gi.visIndex)) { continue; }
+                            const float rangeEnd = (gi.rangeEndIdx == 0) ? nearEnd
+                                                 : (gi.rangeEndIdx == 1) ? farEnd : vfarEnd;
+                            const float ex = gi.posX - eye[0], ey = gi.posY - eye[1];
+                            const float ez = gi.posZ - eye[2];
+                            const float h2 = ex*ex + ey*ey;
+                            if (h2 > rangeEnd * rangeEnd) { continue; }
+                            if (!dlSphereInFrustum(planes, ex, ey, ez, gi.effR)) { continue; }
+                            const float d3 = h2 + ez*ez;
+                            const float inner = ownReach - gi.effR;
+                            const float outer = ownReach + gi.effR;
+                            if (gi.effR < ownReach && d3 < inner * inner) { ++g_dlOwnSuppressed; }
+                            else if (d3 < outer * outer)                  { ++g_dlOwnClipped; }
+                            else                                          { ++g_dlOwnResidentDrawn; }
+                        }
+                    }
+                }
             }
         }
         if (overflow) {
@@ -17271,13 +17463,13 @@ namespace ForgeRender {
         // Sun CullParams = copy of the camera params (inherits eye + misc = inst/subset counts + the
         // dynamic visibility mask), then override planes / ranges / Hi-Z. Layout: planes[0..23],
         // eye[24..27], ranges[28..31] (x/y/z=tier end², w=nearCut²), misc[32..35], hizVP[36..51],
-        // hizParams[52..55], hizEyeDelta[56..59], visMask[60..123].
-        // The copy MUST span all 496 B: the sun cull runs with nearCut²=0 and huge tier ranges so DL
+        // hizParams[52..55], hizEyeDelta[56..59], visMask[60..123], cellOwn[124..127].
+        // The copy MUST span all 512 B: the sun cull runs with nearCut²=0 and huge tier ranges so DL
         // statics cast into the near scene and from off-screen, which means a hidden instance the
         // camera cull dropped would still cast here — a shadow on bare ground with no building.
         const float* cam = (const float*)g_live.pCullParamsCbv->pCpuMappedAddress;
         float*       sp  = (float*)g_live.pSunCullParamsCbv->pCpuMappedAddress;
-        std::memcpy(sp, cam, 496);
+        std::memcpy(sp, cam, 512);
 
         const float* mfd = (const float*)g_live.pFrameCbv->pCpuMappedAddress;
         float xa[3], ya[3], za[3];
@@ -17295,6 +17487,11 @@ namespace ForgeRender {
         sp[20]=za[0];  sp[21]=za[1];  sp[22]=za[2];  sp[23]=depthHalf;
         sp[28]=1e18f; sp[29]=1e18f; sp[30]=1e18f; sp[31]=0.0f;   // tier ranges huge, nearCut²=0
         sp[55]=0.0f;                                             // hizParams.w=0 → Hi-Z off
+        // Near/far ownership OFF for shadows, deliberately — the same reason nearCut² is 0 here.
+        // A near-owned building's LOD proxy double-CASTING over itself is invisible (same shadow,
+        // same place), unlike double-DRAWING; suppressing it would delete real shadows, since the
+        // near scene's own casters are only re-cast from what the camera sees.
+        sp[127]=0.0f;
 
         ID3D12GraphicsCommandList* cl = g_live.pCmd->mDx.pCmdList;
         auto bufBarrier = [&](Buffer* buf, ResourceState from, ResourceState to) {
@@ -18630,7 +18827,8 @@ namespace ForgeRender {
         g_lightOccludedBits = 0; g_lightOccValid = false;
         g_live.cullInstCount = 0; g_live.cullSubsetCount = 0;
         g_live.gpuStaticsReady = false; g_live.gpuArgsInDrawState = false;
-        g_liveGrid.clear(); g_liveLandVisible.clear(); g_liveLandVisibleRefl.clear();
+        g_liveGrid.clear(); g_liveGridIndex.clear();
+        g_liveLandVisible.clear(); g_liveLandVisibleRefl.clear();
         g_dlLiveInit = false; g_staticsLiveOk = false; g_dlExterior = false;
         g_liveLastInst = g_liveLastSubsets = g_liveLastLand = 0;
         g_liveLastSubsetsRefl = g_liveLastInstRefl = 0;

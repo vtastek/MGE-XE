@@ -599,6 +599,11 @@ namespace IPC {
 		// Live render-scale: the current internal render resolution (0 ⇒ full allocation size).
 		params.renderWidth = m_renderWidth;
 		params.renderHeight = m_renderHeight;
+		// Statics near/far handover: MW's active exterior cell set + cull reach (mask 0 ⇒ gate off).
+		params.nearCellX = m_nearCellX;
+		params.nearCellY = m_nearCellY;
+		params.nearCellMask = m_nearCellMask;
+		params.nearCellReach = m_nearCellReach;
 		params.bytesWritten = 0;
 		params.renderMs = 0.0;
 		if (!beginRpc(Command::RenderFrame)) {

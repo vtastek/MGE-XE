@@ -4720,6 +4720,45 @@ namespace RenderProcess {
             waterParams[11] = 0.0f;
         }
 
+        // Statics near/far handover: hand the host MW's ACTIVE exterior cell set plus how far
+        // MW's own cull reaches, so it can clip its distant-statics LOD proxies at the same plane
+        // the NEAR path stops at (both drawing = the handover z-fight; neither = a hole). MW culls
+        // per NiTriShape against its view distance, so that plane is what `reach` means — the host
+        // slices the proxies there rather than dropping whole objects. Read straight off
+        // DataHandler::exteriorCellData[9] — the engine's own residency table, no detour. Only a
+        // cell confirmed LOADED counts; everything else (background-loading, unloading, world
+        // edge, no DataHandler) leaves its bit clear so the host keeps drawing DL there. Erring
+        // toward a transient double-draw is right; erring the other way deletes world geometry.
+        // The CENTRE bit is the valid flag: without the player's own cell there is nothing to
+        // trust, and the host falls back to its fixed near-cut distance.
+        std::int32_t nearCellX = 0, nearCellY = 0;
+        std::uint32_t nearCellMask = 0;
+        float nearCellReach = 0.0f;
+        if (isExterior) {
+            void* dh = MGE::SceneGraph::getDataHandler();
+            if (dh) {
+                nearCellX = MGE::DataHandlerView::centralGridX(dh);
+                nearCellY = MGE::DataHandlerView::centralGridY(dh);
+                for (std::size_t i = 0; i < MGE::DataHandlerView::EXT_CELL_DATA_COUNT; ++i) {
+                    void* ecd = MGE::DataHandlerView::exteriorCellData(dh, i);
+                    if (!MGE::DataHandlerView::exteriorCellLoaded(ecd)) { continue; }
+                    void* cell = MGE::DataHandlerView::exteriorCellRecord(ecd);
+                    // Grid coords come from the cell record, not the slot index — the CellGrid
+                    // slot order never has to be assumed correct.
+                    const int dx = MGE::DataHandlerView::cellExteriorGridX(cell) - nearCellX;
+                    const int dy = MGE::DataHandlerView::cellExteriorGridY(cell) - nearCellY;
+                    if (dx < -1 || dx > 1 || dy < -1 || dy > 1) { continue; }
+                    nearCellMask |= 1u << ((dy + 1) * 3 + (dx + 1));
+                }
+                // MW's cull reach = its view distance (the engine culls subtrees on view-z against
+                // it — the same bound distantland.cpp's cache gate uses). nearViewRange is that
+                // value, re-read every frame in adjustFog.
+                nearCellReach = DistantLand::nearViewRange;
+            }
+        }
+        if (nearCellReach <= 0.0f) { nearCellMask = 0; }   // no reach ⇒ nothing to hand over
+        g_client->setNextNearCells(nearCellX, nearCellY, nearCellMask, nearCellReach);
+
         // Async kickoff: copy the frame params into shared memory and start the host, then
         // RETURN — the host renders while MW's frame-N work continues. All the pointer args
         // (viewProj/lighting/devInput/waterParams) are memcpy'd into the IPC block before

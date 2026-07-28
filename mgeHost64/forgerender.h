@@ -59,6 +59,12 @@ namespace ForgeRender {
     // reallocation. w==0 || h==0 ⇒ render at the full allocation size (the default).
     void setRenderSize(unsigned w, unsigned h);
 
+    // Statics near/far handover: MW's ACTIVE exterior cell set (centre grid coords + a 9-bit
+    // LOADED mask, bit (dy+1)*3 + (dx+1)) and how far MW's own cull reaches (its view distance).
+    // The distant-statics cull drops the LOD proxies the near path is already drawing at full
+    // detail. Centre bit clear / reach 0 ⇒ gate off, the fixed near-cut distance applies instead.
+    void setNearCells(int centreX, int centreY, unsigned loadedMask, float reach);
+
     // The exported NT shared-RT handle — valid in the HOST process. Null until a
     // successful init(). The IPC server DuplicateHandles this into MW's process.
     void* sharedHandle();

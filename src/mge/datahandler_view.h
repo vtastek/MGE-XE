@@ -30,6 +30,23 @@ namespace MGE::DataHandlerView {
     constexpr size_t OFF_sgSunlight                = 0x98;
     constexpr size_t OFF_sgFogProperty             = 0x9C;
 
+    // Active exterior cell set. exteriorCellData is an array of NINE POINTERS (0x04, stride 4)
+    // to ExteriorCellData { u8 state; Cell* cell; void* landRenderData; } — the engine's own
+    // 3x3 residency table. A slot only counts as loaded when the pointer is non-null, state ==
+    // Loaded (1) and cell is non-null (MWSE's DataHandler::ExteriorCellData::isFullyLoaded).
+    // The slot ORDER is TES3::CellGrid (NW,N,NE,W,C,E,SW,S,SE), but nothing here depends on it:
+    // each cell's own gridX/gridY is read out of the Cell record, so the mapping cannot be got
+    // wrong. Read-only field reads — no detour (MWSE already hooks the cell-attach path;
+    // a second hook there is the double-hook hazard).
+    constexpr size_t OFF_exteriorCellData          = 0x04;
+    constexpr size_t EXT_CELL_DATA_COUNT           = 9;
+    constexpr size_t OFF_ecdState                  = 0x00;   // ExteriorDataLoadingState, u8; 1 = Loaded
+    constexpr size_t OFF_ecdCell                   = 0x04;
+    constexpr unsigned char EXT_CELL_STATE_LOADED  = 1;
+    // TES3::Cell::variantData.exterior (union @0x1C): { PackedColor, Land*, int gridX, int gridY }.
+    constexpr size_t OFF_cellExteriorGridX         = 0x24;
+    constexpr size_t OFF_cellExteriorGridY         = 0x28;
+
     // Cell context.
     constexpr size_t OFF_centralGridX              = 0xA0;
     constexpr size_t OFF_centralGridY              = 0xA4;
@@ -81,6 +98,31 @@ namespace MGE::DataHandlerView {
     }
     inline void* lastExteriorCell(void* dh) {
         return *reinterpret_cast<void**>(static_cast<unsigned char*>(dh) + OFF_lastExteriorCell);
+    }
+
+    // exteriorCellData[i], i in [0,9). Null when the engine has no cell in that grid slot.
+    inline void* exteriorCellData(void* dh, size_t i) {
+        return *(reinterpret_cast<void**>(static_cast<unsigned char*>(dh) + OFF_exteriorCellData) + i);
+    }
+    // A slot is LOADED only when it exists, its state is Loaded and it carries a cell record.
+    // Anything else (background-loading, pending commit, unloading, absent) reads as not loaded —
+    // the fail-safe direction for every consumer: "the engine is not drawing this cell yet".
+    inline bool exteriorCellLoaded(void* ecd) {
+        if (!ecd) { return false; }
+        const unsigned char state = *(static_cast<unsigned char*>(ecd) + OFF_ecdState);
+        if (state != EXT_CELL_STATE_LOADED) { return false; }
+        return *reinterpret_cast<void**>(static_cast<unsigned char*>(ecd) + OFF_ecdCell) != nullptr;
+    }
+    inline void* exteriorCellRecord(void* ecd) {
+        return *reinterpret_cast<void**>(static_cast<unsigned char*>(ecd) + OFF_ecdCell);
+    }
+    // Exterior cell grid coords, read from the cell record itself (valid only for exterior cells —
+    // the union holds interior lighting otherwise).
+    inline int cellExteriorGridX(void* cell) {
+        return *reinterpret_cast<int*>(static_cast<unsigned char*>(cell) + OFF_cellExteriorGridX);
+    }
+    inline int cellExteriorGridY(void* cell) {
+        return *reinterpret_cast<int*>(static_cast<unsigned char*>(cell) + OFF_cellExteriorGridY);
     }
 
 }
