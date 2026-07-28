@@ -303,8 +303,19 @@ namespace IPC {
 		auto& params = m_ipcParameters->params.dynVisParams;
 		auto& vec = getVec<DynVisFlag>(params.id);
 		for (auto& update : vec) {
-			for (auto mesh : DistantLandShare::dynamicVisGroupsServer[update.groupIndex]) {
-				mesh->enabled = update.enable;
+			// The Forge DL renderer keeps its own instance list and is the only thing that draws
+			// distant land now, so the group state has to reach IT — otherwise every gated instance
+			// (unbuilt strongholds, Raven Rock colony stages) draws unconditionally as a ghost town,
+			// complete with sun shadows the sun cull casts from off-screen.
+			ForgeRender::setDistantVisGroup(update.groupIndex, update.enable);
+
+			// Legacy quadtree mesh list (the retired DX9 path). Bounds-checked: under the Forge
+			// takeover this vector is typically empty, and a client group index off the end is a
+			// straight CPU access violation.
+			if (update.groupIndex < DistantLandShare::dynamicVisGroupsServer.size()) {
+				for (auto mesh : DistantLandShare::dynamicVisGroupsServer[update.groupIndex]) {
+					mesh->enabled = update.enable;
+				}
 			}
 		}
 	}

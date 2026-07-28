@@ -33,6 +33,7 @@
 #include <unordered_map>
 #include <algorithm>
 #include <array>
+#include <atomic>
 
 #include "OS/Interfaces/IOperatingSystem.h"
 #include "Utilities/Interfaces/IFileSystem.h"
@@ -13331,13 +13332,16 @@ namespace ForgeRender {
         float    radius;
         uint8_t  r, g, b;
         bool     hasMesh;
+        uint16_t visIndex;   // v2: dynamic-vis group (0 = ungated). A stronghold lantern must go dark
+                             // with its building, or it lights bare ground — the statics' ghost-town
+                             // bug one dataset over.
     };
     std::vector<DlBakedLight> g_dlBakedLights;
     bool  g_dlBakedLightsLoaded = false;
     // Phase F: compact, MESHED-only glow source list (positions + precomputed luminance/chromaticity),
     // built once from g_dlBakedLights. The per-frame billboard walk streams THIS — cache-tight, no
     // meshless skips (6098/9504 were meshless), no per-frame colour math — not the full 20B×9504 set.
-    struct GlowSrc { float x, y, z, lum, hueR, hueG, hueB; };
+    struct GlowSrc { float x, y, z, lum, hueR, hueG, hueB; uint32_t visIndex; };
     std::vector<GlowSrc> g_glowSrc;
     float g_dlBakedLightStreamR = 8192.0f * 6.0f;   // ~6 cells: deferred/billboard working radius
     // (g_drawDistLights / g_distLightIntensity / g_distLightRadiusScale declared up by the shadow
@@ -13510,9 +13514,69 @@ namespace ForgeRender {
         uint32_t rangeEndIdx;      // tier: 0=nearEnd 1=farEnd 2=vfarEnd ; 0xFFFFFFFF = skip
         uint32_t firstSubset;
         uint32_t numSubsets;
-        uint32_t _pad;             // -> 96 B (matches the HLSL StructuredBuffer element stride)
+        uint32_t visIndex;         // -> 96 B. usage.data dynamic-vis group (0 = ungated). Was _pad;
+                                   // occupying it costs nothing — the stride is unchanged.
     };
     std::vector<GpuCullInstance>  g_cullInst;
+
+    // --- Dynamic visibility groups -------------------------------------------------------------
+    // A stronghold that isn't built yet, a Raven Rock at colony stage 1, a quest-toggled ruin: the DL
+    // bake gates those placements on a journal/global/reference value and writes the group id into
+    // each instance record (usage.data offset 4). The CLIENT evaluates the groups on every cell change
+    // (DistantLand::scanDynamicVisGroups) and ships enable DELTAS into this process over IPC, so all
+    // the host has to do is remember the state and test it in the cull — no new IPC, no wire-format
+    // change, no distant-land regeneration.
+    //
+    // All bits START SET, matching loadVisGroupsClient's `dvg.enabled = true`: the client only sends a
+    // group whose state CHANGED, so its first post-load scan delivers exactly the groups that must go
+    // dark and nothing else. Atomic because the RPC dispatch thread writes while the frame-recording
+    // thread reads — the same cross-thread trap as the texture-name/texture-slot races. Relaxed is
+    // enough: a flag landing one frame late is invisible.
+    std::atomic<uint32_t> g_visMask[DL_VIS_MASK_WORDS];
+    // Set every bit during static init, before any RPC or frame can touch the mask — a zero-init
+    // array would read as "every group hidden" and blank the gated half of the world.
+    const bool            g_visMaskAllSet = [] {
+        for (uint32_t w = 0; w < DL_VIS_MASK_WORDS; ++w) {
+            g_visMask[w].store(0xFFFFFFFFu, std::memory_order_relaxed);
+        }
+        return true;
+    }();
+    uint32_t              g_visGroupCount     = 0;  // groups in usage.data (observability)
+    uint32_t              g_visGatedInstances = 0;  // instances with visIndex != 0 (observability)
+    std::vector<uint32_t> g_visGroupInstCount;      // [visIndex] -> exterior instances gated on it
+
+    // Cull-side read. Fail-open on anything past the mask: an over-eager gate silently deletes real
+    // world geometry, which is far worse than a ghost building.
+    inline bool dlVisEnabled(uint32_t v) {
+        if (v == 0u) { return true; }                        // ungated — the common case
+        if (v >= DL_VIS_MASK_BITS) {
+            static bool warned = false;
+            if (!warned) {
+                std::printf("[forge][dl] vis group %u past the %u-group mask — failing OPEN\n",
+                            v, DL_VIS_MASK_BITS);
+                warned = true;
+            }
+            return true;
+        }
+        return ((g_visMask[v >> 5].load(std::memory_order_relaxed) >> (v & 31u)) & 1u) != 0u;
+    }
+
+    // The writer (public API — declared in forgerender.h). The client resolved a vis group's
+    // journal/global/reference value on a cell change and it CHANGED state
+    // (DistantLand::scanDynamicVisGroups -> Server::updateDynVis). Flip the bit; the camera cull, the
+    // water-reflection cull and the SUN cull all read it on the next frame. Called from the RPC
+    // dispatch thread while the recording thread reads — hence the atomic RMW.
+    void setDistantVisGroup(unsigned group, bool enable) {
+        if (group == 0u || group >= DL_VIS_MASK_BITS) { return; }   // 0 = ungated sentinel; fail open
+        const uint32_t bit = 1u << (group & 31u);
+        uint32_t prev;
+        if (enable) { prev = g_visMask[group >> 5].fetch_or(bit, std::memory_order_relaxed); }
+        else        { prev = g_visMask[group >> 5].fetch_and(~bit, std::memory_order_relaxed); }
+        if (((prev & bit) != 0u) == enable) { return; }             // no actual change — stay quiet
+        const uint32_t moved = (group < g_visGroupInstCount.size()) ? g_visGroupInstCount[group] : 0u;
+        LOG::logline(">> [forge][dl] vis group %u -> %s (%u instances)", group,
+                     enable ? "SHOWN" : "HIDDEN", moved);
+    }
     uint64_t  g_ws0Off    = 0;                          // byte offset of the first exterior instance record
     uint32_t  g_ws0Count  = 0;                          // exterior instance count
     uint32_t  g_staticsDrawCount = 0;                   // EI arg count (subsets with scoped instances)
@@ -13744,6 +13808,9 @@ namespace ForgeRender {
     // Phase B: load the DL-gen baked static lights (distantland\lights.data) into the resident set.
     // One-shot (missing file is fine — pre-Phase-A DL gens have none). Format v1: int32 version;
     // int32 count; then count * { float x,y,z; float radius; byte r,g,b; byte flags(bit0=hasMesh) }.
+    // v2 appends a `ushort visIndex` per record (20 B -> 22 B) — the dynamic-vis group that gates the
+    // light, resolved by the baker from the LIGH's own script / object id exactly as statics are.
+    // v1 still loads (every light ungated), so an old bake keeps working — it just keeps the ghosts.
     void dlLoadBakedLights() {
         if (g_dlBakedLightsLoaded) { return; }
         g_dlBakedLightsLoaded = true;   // one-shot regardless of outcome
@@ -13759,16 +13826,17 @@ namespace ForgeRender {
         uint32_t version = 0, count = 0;
         std::memcpy(&version, p, 4); p += 4;
         std::memcpy(&count,   p, 4); p += 4;
-        if (version != 1) {
+        if (version != 1 && version != 2) {
             LOG::logline(">> [forge][dl] baked lights: unsupported version %u", version);
             return;
         }
+        const uint32_t recSize = (version >= 2) ? 22u : 20u;
 
         g_dlBakedLights.reserve(count);
-        uint32_t meshless = 0;
+        uint32_t meshless = 0, gated = 0;
         float rmin = 1e30f, rmax = 0.0f;
         for (uint32_t i = 0; i < count; ++i) {
-            if (p + 20 > end) { LOG::logline(">> [forge][dl] baked lights: truncated at %u/%u", i, count); break; }
+            if (p + recSize > end) { LOG::logline(">> [forge][dl] baked lights: truncated at %u/%u", i, count); break; }
             DlBakedLight L;
             std::memcpy(&L.x,      p,      4);
             std::memcpy(&L.y,      p + 4,  4);
@@ -13776,15 +13844,21 @@ namespace ForgeRender {
             std::memcpy(&L.radius, p + 12, 4);
             L.r = p[16]; L.g = p[17]; L.b = p[18];
             L.hasMesh = (p[19] & 0x1) != 0;
-            p += 20;
+            L.visIndex = 0;
+            if (version >= 2) { std::memcpy(&L.visIndex, p + 20, 2); }
+            p += recSize;
             if (!L.hasMesh) { ++meshless; }
+            if (L.visIndex != 0) { ++gated; }
             rmin = std::min(rmin, L.radius);
             rmax = std::max(rmax, L.radius);
             g_dlBakedLights.push_back(L);
         }
-        LOG::logline(">> [forge][dl] baked lights: %zu loaded (%u meshless), radius %.0f..%.0f",
-                     g_dlBakedLights.size(), meshless,
+        LOG::logline(">> [forge][dl] baked lights: %zu loaded v%u (%u meshless, %u gated), radius %.0f..%.0f",
+                     g_dlBakedLights.size(), version, meshless, gated,
                      g_dlBakedLights.empty() ? 0.0f : rmin, rmax);
+        if (version < 2) {
+            LOG::logline(">> [forge][dl] baked lights: v1 bake — NO vis gating (regen distant land to gate them)");
+        }
     }
 
     // Load the 3 atlas textures + parse the distantland\world container into resident Forge
@@ -14094,6 +14168,10 @@ namespace ForgeRender {
         uint32_t distantStaticCount = 0, visGroupCount = 0;
         std::memcpy(&distantStaticCount, &g_usageData[0], 4);
         std::memcpy(&visGroupCount,      &g_usageData[4], 4);
+        // The 130 B vis-group records themselves stay the CLIENT's business (it owns the journal/
+        // global/reference lookups and ships us the resolved enable state); the host only needs the
+        // count, to bound the per-group tally and to report it.
+        g_visGroupCount = visGroupCount;
         uint64_t uoff = 8 + (uint64_t)visGroupCount * 130;
         if (uoff + 4 > g_usageData.size()) { std::printf("[forge][dl] usage.data truncated header\n"); return false; }
         std::memcpy(&g_ws0Count, &g_usageData[uoff], 4); uoff += 4;
@@ -14657,7 +14735,7 @@ namespace ForgeRender {
                 const float lum = std::max(lr, std::max(lg, lb));
                 if (lum <= 1e-4f) { continue; }   // black/zero light: no glow ever — drop at build time
                 const float inv = 1.0f / lum;
-                g_glowSrc.push_back(GlowSrc{ L.x, L.y, L.z, lum, lr*inv, lg*inv, lb*inv });
+                g_glowSrc.push_back(GlowSrc{ L.x, L.y, L.z, lum, lr*inv, lg*inv, lb*inv, L.visIndex });
             }
             LOG::logline(">> [forge][glow] compacted %zu meshed sources (of %zu baked)",
                          g_glowSrc.size(), g_dlBakedLights.size());
@@ -16057,6 +16135,10 @@ namespace ForgeRender {
         // exact tier/effR rule the old per-frame hot loop used (dlshare.h:184) so survivors are
         // byte-identical; only the per-frame distance + frustum tests + -eye stay in the loop.
         g_cullInst.assign((size_t)g_ws0Count, GpuCullInstance{});
+        // Per-group instance tally, for the flip log ("group 6 -> HIDDEN (32 instances)"). Without a
+        // count, "the town is gone" is unfalsifiable — it could equally be a cull bug.
+        g_visGatedInstances = 0;
+        g_visGroupInstCount.assign((size_t)g_visGroupCount + 1, 0u);
         const float gFarMin  = Configuration.DL.FarStaticMinSize;
         const float gVfarMin = Configuration.DL.VeryFarStaticMinSize;
         std::unordered_map<uint64_t, uint32_t> cellMap;
@@ -16067,6 +16149,15 @@ namespace ForgeRender {
             GpuCullInstance& gi = g_cullInst[i];
             {
                 uint32_t staticRef; std::memcpy(&staticRef, rec, 4);
+                // usage.data offset 4: the dynamic-vis group this placement is gated on (0 = always
+                // visible). Rides in what used to be the struct's pure padding word, so the 96 B
+                // stride and the upload are unchanged.
+                uint16_t visIndex; std::memcpy(&visIndex, rec + 4, 2);
+                gi.visIndex = visIndex;
+                if (visIndex != 0) {
+                    ++g_visGatedInstances;
+                    if (visIndex < g_visGroupInstCount.size()) { ++g_visGroupInstCount[visIndex]; }
+                }
                 float yaw, pitch, roll, scale;
                 std::memcpy(&yaw, rec + 18, 4); std::memcpy(&pitch, rec + 22, 4);
                 std::memcpy(&roll, rec + 26, 4); std::memcpy(&scale, rec + 30, 4);
@@ -16120,6 +16211,31 @@ namespace ForgeRender {
             c.minz = std::min(c.minz, pos[2]); c.maxz = std::max(c.maxz, pos[2]);
         }
         std::printf("[forge][dl] live grid: %zu cells over %u placements\n", g_liveGrid.size(), g_ws0Count);
+        std::printf("[forge][dl] visgroups: %u groups, %u gated instances\n",
+                    g_visGroupCount, g_visGatedInstances);
+        LOG::logline(">> [forge][dl] visgroups: %u groups, %u gated instances",
+                     g_visGroupCount, g_visGatedInstances);
+        // The client's FIRST scan (cell change on load) reaches setDistantVisGroup BEFORE the statics
+        // are parsed, so those flips can't report an instance count — and they are exactly the ones
+        // worth reading ("is the unbuilt stronghold actually hidden?"). Restate the resolved state
+        // here, now that the per-group tally exists, so the load-time answer is falsifiable.
+        {
+            uint32_t hiddenGroups = 0, hiddenInst = 0;
+            std::string list;
+            for (uint32_t g = 1; g <= g_visGroupCount && g < DL_VIS_MASK_BITS; ++g) {
+                if (dlVisEnabled(g)) { continue; }
+                ++hiddenGroups;
+                const uint32_t n = (g < g_visGroupInstCount.size()) ? g_visGroupInstCount[g] : 0u;
+                hiddenInst += n;
+                if (n > 0) {
+                    char buf[32];
+                    std::snprintf(buf, sizeof(buf), "%s%u:%u", list.empty() ? "" : " ", g, n);
+                    list += buf;
+                }
+            }
+            LOG::logline(">> [forge][dl] visgroups hidden now: %u/%u groups, %u/%u instances [%s]",
+                         hiddenGroups, g_visGroupCount, hiddenInst, g_visGatedInstances, list.c_str());
+        }
     }
 
     // Create the persistent per-frame instance + indirect-arg rings (CPU_TO_GPU, mapped). Replaces
@@ -16318,7 +16434,7 @@ namespace ForgeRender {
         pb.mDesc.mDescriptors = DESCRIPTOR_TYPE_UNIFORM_BUFFER;
         pb.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_CPU_TO_GPU;
         pb.mDesc.mFlags       = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
-        pb.mDesc.mSize        = 256;                          // >= sizeof(CullParams) (144B), CBV-aligned
+        pb.mDesc.mSize        = 512;                          // >= sizeof(CullParams) (496B), CBV-aligned
         pb.mDesc.pName        = "cullParamsCbv";
         pb.ppBuffer           = &g_live.pCullParamsCbv;
         addResource(&pb, nullptr);
@@ -16478,7 +16594,7 @@ namespace ForgeRender {
             spc.mDesc.mDescriptors = DESCRIPTOR_TYPE_UNIFORM_BUFFER;
             spc.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_CPU_TO_GPU;
             spc.mDesc.mFlags       = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
-            spc.mDesc.mSize        = 256;
+            spc.mDesc.mSize        = 512;                     // matches the camera CullParams (496B)
             spc.mDesc.pName        = "sunCullParamsCbv";
             spc.ppBuffer           = &g_live.pSunCullParamsCbv;
             addResource(&spc, nullptr);
@@ -16708,6 +16824,7 @@ namespace ForgeRender {
                                            // "nothing is in the near field" (hilltop: nearest=35652).
             for (uint32_t i = 0; i < (uint32_t)g_dlBakedLights.size(); ++i) {
                 const DlBakedLight& L = g_dlBakedLights[i];
+                if (!dlVisEnabled(L.visIndex)) { continue; }   // fixture's vis group is hidden
                 const float dx = L.x - eye[0], dy = L.y - eye[1], dz = L.z - eye[2];
                 const float d2 = dx * dx + dy * dy + dz * dz;
                 if (d2 > sr2) { continue; }
@@ -16894,6 +17011,10 @@ namespace ForgeRender {
                 // (distance vs eye, frustum) + the -eye shift remain. world[12..14] == absolute pos.
                 const GpuCullInstance& gi = g_cullInst[ii];
                 if (gi.rangeEndIdx == 0xFFFFFFFFu) { continue; }   // grass / invalid → skip
+                if (!dlVisEnabled(gi.visIndex)) { continue; }      // vis group currently hidden
+                                                                   // (this path also serves the water
+                                                                   // reflection and the GPU-cull-off
+                                                                   // A/B, so the mirror gets gated too)
                 float rangeEnd = (gi.rangeEndIdx == 0) ? nearEnd : (gi.rangeEndIdx == 1) ? farEnd : vfarEnd;
                 float dx = gi.posX - eye[0], dy = gi.posY - eye[1];
                 float dz = gi.world[14] - eye[2];
@@ -16983,6 +17104,15 @@ namespace ForgeRender {
             cp[54] = (float)(g_live.hizMips > 0 ? g_live.hizMips - 1 : 0);                          // hizParams.z = mipCount-1
             cp[55] = (g_hizValid && g_hizOcclusion && !eyeJump) ? 1.0f : 0.0f;                      // hizParams.w = valid
             cp[56] = dEx; cp[57] = dEy; cp[58] = dEz; cp[59] = 0.0f;                                // hizEyeDelta
+            // Dynamic visibility mask (floats 60..123). Stored as raw bits — the shaders asuint it
+            // back. The CPU gate above (dlVisEnabled) reads the SAME g_visMask, so the two cull paths
+            // and the two cull shaders all agree. dispatchSunCull copies the whole 496 B, so the sun
+            // cull inherits this before it overrides planes/ranges — that is what stops a hidden
+            // building's LOD from casting a shadow onto bare ground.
+            uint32_t* cpu = (uint32_t*)cp;
+            for (uint32_t w = 0; w < DL_VIS_MASK_WORDS; ++w) {
+                cpu[60 + w] = g_visMask[w].load(std::memory_order_relaxed);
+            }
         }
         if (overflow) {
             static bool warned = false;
@@ -17138,12 +17268,16 @@ namespace ForgeRender {
             || !g_live.pSunCullParamsCbv || !g_live.pSunCullParamsCbv->pCpuMappedAddress
             || !g_live.pFrameCbv || !g_live.pFrameCbv->pCpuMappedAddress) { return; }
 
-        // Sun CullParams = copy of the camera params (inherits eye + misc = inst/subset counts), then
-        // override planes / ranges / Hi-Z. Layout: planes[0..23], eye[24..27], ranges[28..31]
-        // (x/y/z=tier end², w=nearCut²), misc[32..35], hizVP[36..51], hizParams[52..55], hizEyeDelta[56..59].
+        // Sun CullParams = copy of the camera params (inherits eye + misc = inst/subset counts + the
+        // dynamic visibility mask), then override planes / ranges / Hi-Z. Layout: planes[0..23],
+        // eye[24..27], ranges[28..31] (x/y/z=tier end², w=nearCut²), misc[32..35], hizVP[36..51],
+        // hizParams[52..55], hizEyeDelta[56..59], visMask[60..123].
+        // The copy MUST span all 496 B: the sun cull runs with nearCut²=0 and huge tier ranges so DL
+        // statics cast into the near scene and from off-screen, which means a hidden instance the
+        // camera cull dropped would still cast here — a shadow on bare ground with no building.
         const float* cam = (const float*)g_live.pCullParamsCbv->pCpuMappedAddress;
         float*       sp  = (float*)g_live.pSunCullParamsCbv->pCpuMappedAddress;
-        std::memcpy(sp, cam, 240);
+        std::memcpy(sp, cam, 496);
 
         const float* mfd = (const float*)g_live.pFrameCbv->pCpuMappedAddress;
         float xa[3], ya[3], za[3];
@@ -17537,6 +17671,7 @@ namespace ForgeRender {
         const GlowSrc* src = g_glowSrc.data();
         for (size_t i = 0; i < nSrc && n < cap; ++i) {
             const GlowSrc& L = src[i];                             // meshed + non-black only (compacted at build)
+            if (!dlVisEnabled(L.visIndex)) { continue; }           // fixture's vis group is hidden
 
             const float cx = L.x - eye[0], cy = L.y - eye[1], cz = L.z - eye[2];
             const float d2 = cx*cx + cy*cy + cz*cz;

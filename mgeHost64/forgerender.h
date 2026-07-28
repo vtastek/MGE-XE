@@ -172,6 +172,12 @@ namespace ForgeRender {
     // dev panel "Dist lights: enable" checkbox drives — diff the gpu-split `dl=` bracket with it.
     void toggleDistLights();
 
+    // Dynamic distant visibility: show/hide every distant-land instance gated on a usage.data vis
+    // group (unbuilt strongholds, Raven Rock colony stages, quest-toggled ruins). Fed by the enable
+    // deltas the client already ships on every cell change (Server::updateDynVis). group is the
+    // 1-based usage.data vis index; 0 means "ungated" and is ignored.
+    void setDistantVisGroup(unsigned group, bool enable);
+
     // Last frame's CPU/GPU phase split, copied into the RenderFrame completion so the client can
     // plot it in Tracy (tasks/forge-host-gpu-lane.md, Tier 1). Pure reads of values renderScene
     // already computed. See ipc/hostframetimings.h for what each field means and why it exists.

@@ -39,6 +39,16 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
     if (inst.rangeEndIdx == 0xFFFFFFFFu)
         RETURN();
 
+    // Dynamic visibility — VERBATIM copy of cull.comp.fsl's gate (see the rationale there). Same
+    // inputs, same order, same fail-open bound, so the scatter agrees bit-for-bit with the counts
+    // the prefix-sum sized the runs from.
+    if (inst.visIndex != 0u && inst.visIndex < DL_VIS_MASK_BITS)
+    {
+        uint visWord = asuint(gCullParams.visMask[inst.visIndex >> 7u][(inst.visIndex >> 5u) & 3u]);
+        if (((visWord >> (inst.visIndex & 31u)) & 1u) == 0u)
+            RETURN();
+    }
+
     float rangeEnd2 = (inst.rangeEndIdx == 0u) ? gCullParams.ranges.x
                     : (inst.rangeEndIdx == 1u) ? gCullParams.ranges.y
                                                : gCullParams.ranges.z;

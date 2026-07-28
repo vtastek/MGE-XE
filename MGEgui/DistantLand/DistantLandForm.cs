@@ -1391,7 +1391,8 @@ namespace MGEgui.DistantLand {
 
             // Baked static point lights for the Forge deferred distant lightmap. Main worldspace
             // ("") only -- distant lighting is an exterior concern. Record layout per light:
-            //   float posX,posY,posZ; float radius; byte r,g,b; byte flags(bit0=hasMesh)
+            //   float posX,posY,posZ; float radius; byte r,g,b; byte flags(bit0=hasMesh);
+            //   ushort visIndex   (v2; 0 = ungated, else the dynamic-vis group that gates it)
             // Negative + OffByDefault lights were already dropped at parse (never enter LightDefs).
             // Radius is the base LHDT radius (vanilla does not scale light range by ref XSCL).
             Dictionary<string, LightReference> mainLights;
@@ -1400,7 +1401,7 @@ namespace MGEgui.DistantLand {
             }
             int lightsMeshless = 0;
             using (var lbw = new BinaryWriter(File.Create(Statics.fn_lightsdata), Statics.ESPEncoding)) {
-                lbw.Write((int)1);              // version
+                lbw.Write((int)2);              // version (v2 = + ushort visIndex per record)
                 lbw.Write(mainLights.Count);
                 foreach (var lp in mainLights) {
                     if (!lp.Value.HasMesh) { lightsMeshless++; }
@@ -2516,6 +2517,7 @@ namespace MGEgui.DistantLand {
             public byte R, G, B;
             public int Flags;
             public bool HasMesh;
+            public int VisIndex;
         }
 
         private class LightReference {
@@ -2524,6 +2526,7 @@ namespace MGEgui.DistantLand {
             public float Radius;
             public byte R, G, B;
             public bool HasMesh;
+            public int VisIndex;
 
             public void Write(BinaryWriter bw) {
                 bw.Write(X);
@@ -2534,6 +2537,7 @@ namespace MGEgui.DistantLand {
                 bw.Write(G);
                 bw.Write(B);
                 bw.Write((byte)(HasMesh ? 1 : 0));
+                bw.Write((ushort)VisIndex);
             }
         }
 
@@ -3041,6 +3045,21 @@ namespace MGEgui.DistantLand {
                             ld.R = lightR; ld.G = lightG; ld.B = lightB;
                             ld.Flags = lightFlags;
                             ld.HasMesh = (model != null && model.Trim() != string.Empty);
+                            // Dynamic vis, matched on script or object ID -- the same two lookups
+                            // the statics block runs just below. Repeated here (not shared) because
+                            // that block requires a model, so a MESHLESS light never reaches it,
+                            // and because a lantern belonging to an unbuilt stronghold must go dark
+                            // with the building instead of hanging in the air lighting bare ground.
+                            if (dynamicVisDataSet != null) {
+                                DynamicVisGroup lightDvg = null;
+                                if (script != null) {
+                                    dynamicVisDataSet.scripts.TryGetValue(script, out lightDvg);
+                                }
+                                if (lightDvg == null) {
+                                    dynamicVisDataSet.uniqueObjects.TryGetValue(name, out lightDvg);
+                                }
+                                ld.VisIndex = (lightDvg != null) ? lightDvg.Index : 0;
+                            }
                             LightDefs[name] = ld;
                         } else {
                             lightsSkippedFlagged++;
@@ -3152,6 +3171,7 @@ namespace MGEgui.DistantLand {
             lr.Radius = ld.Radius;
             lr.R = ld.R; lr.G = ld.G; lr.B = ld.B;
             lr.HasMesh = ld.HasMesh;
+            lr.VisIndex = ld.VisIndex;
             UsedLightsList[worldspace][refKey] = lr;
         }
 

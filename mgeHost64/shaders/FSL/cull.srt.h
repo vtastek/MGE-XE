@@ -18,6 +18,11 @@
 // d3d.py `is`-bug that aliased 2nd+ same-type resources is fixed to `==`).
 #pragma once
 
+// Dynamic-visibility mask geometry, shared by the host fill and BOTH cull shaders so the three can
+// never disagree on a bound. 64 words of 32 bits = 2048 groups (a heavy TR+Bloodmoon bake uses ~100).
+#define DL_VIS_MASK_WORDS 64u
+#define DL_VIS_MASK_BITS  2048u
+
 // NB: named CullInstance (NOT GpuCullInstance) — this header is #included in the host C++ TU too,
 // where STRUCT(T) expands to `struct T`; reusing the host's GpuCullInstance name would redefine it.
 // Byte layout (not the name) is what must match the host upload stride (96 B). world stored as 4
@@ -36,7 +41,8 @@ STRUCT(CullInstance)
     DATA(uint,   rangeEndIdx, None);    // 0=near 1=far 2=vfar ; 0xFFFFFFFF = skip (grass/invalid)
     DATA(uint,   firstSubset, None);
     DATA(uint,   numSubsets,  None);
-    DATA(uint,   pad,         None);    // -> 96B (matches the host C++ GpuCullInstance stride)
+    DATA(uint,   visIndex,    None);    // -> 96B. usage.data dynamic-vis group (0 = ungated); gated
+                                        // instances draw only while CullParams.visMask has the bit.
 };
 
 // Mirrors the host StaticsSubsetGPU (5 uints, 20B): the mega-VB/IB spans + bindless texSlot + flags.
@@ -62,6 +68,14 @@ STRUCT(CullParams)
     DATA(float4x4, hizVP,       None);  // floats 36..51  prev-frame relative world -> clip
     DATA(float4,   hizParams,   None);  // 52..55: x=mip0 W, y=mip0 H, z=mipCount-1, w=valid (0 = pass-through)
     DATA(float4,   hizEyeDelta, None);  // 56..59: xyz = eyeNow - hizEye (rebase this frame's c_rel into hiz space)
+    // Dynamic visibility mask: 2048 bits (one per usage.data vis group), bit set = group VISIBLE.
+    // The client already ships per-group enable deltas on every cell change (scanDynamicVisGroups ->
+    // Server::updateDynVis); this is that state, mirrored into the cull. Rides the cbuffer so no new
+    // SRT resource / descriptor-set change is needed, and BOTH pCullSet and pSunCullSet inherit it
+    // (the sun cull copies the whole 496B, which is what stops LOD shadows from ghost buildings).
+    // float4 not uint4: this header is #included in the host C++ TU, where uint4 is not available —
+    // the shaders read it back with asuint, a pure bitcast. floats 60..123 -> 496B total.
+    DATA(float4,   visMask[16], None);
 };
 
 BEGIN_SRT(CullSrtData)

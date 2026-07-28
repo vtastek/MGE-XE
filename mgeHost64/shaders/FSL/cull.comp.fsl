@@ -31,6 +31,18 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
     if (inst.rangeEndIdx == 0xFFFFFFFFu)   // grass / invalid -> skip
         RETURN();
 
+    // Dynamic visibility: a gated instance (visIndex != 0 — a stronghold stage, a Raven Rock build
+    // stage, a quest-toggled ruin) draws only while its group bit is set in visMask. Fail-open past
+    // DL_VIS_MASK_BITS: an over-eager gate silently deletes real world geometry, far worse than a
+    // ghost. cullscatter.comp.fsl repeats this test VERBATIM — the two must agree bit-for-bit or the
+    // prefix-sum sizes and the scatter disagree (shows up as a gpuCull MATCH failure, not corruption).
+    if (inst.visIndex != 0u && inst.visIndex < DL_VIS_MASK_BITS)
+    {
+        uint visWord = asuint(gCullParams.visMask[inst.visIndex >> 7u][(inst.visIndex >> 5u) & 3u]);
+        if (((visWord >> (inst.visIndex & 31u)) & 1u) == 0u)
+            RETURN();
+    }
+
     // Tier range² (x/y/z = near/far/vfar end, squared host-side).
     float rangeEnd2 = (inst.rangeEndIdx == 0u) ? gCullParams.ranges.x
                     : (inst.rangeEndIdx == 1u) ? gCullParams.ranges.y
