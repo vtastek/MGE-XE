@@ -62,6 +62,25 @@ static uint32_t g_heroRecordCount = 0; // backpatched into the hero_anim.data he
 // instead of dropping them. Toggled by the SetAllowTexturelessShapes export around a sky bake.
 static bool g_allowTextureless = false;
 
+// --- Glow in the Dahrk day/night window variants ---
+// GitD ships each window mesh as a NiSwitchNode with children named "off" / "on" / "int-day" and
+// bakes indexActive = 0 = OFF into the file. SearchShapes used to resolve that switch with
+// GetActiveChild(), so distant land froze on the UNLIT variant forever and a lit town dissolved
+// into dark windows at the DL handoff. A subset now carries which variant it is; the host draws
+// exactly one of the pair and clips the other (static_meshes flags[1] bits 1/2 -> subset flags
+// bits 3/4). kVariantAll is every other subset in the game: no bits, drawn unconditionally.
+enum SubsetVariant : unsigned char {
+    kVariantAll   = 0,   // not part of a day/night pair — always drawn
+    kVariantNight = 1,   // GitD "on" child: lit windows
+    kVariantDay   = 2,   // the switch's active child: today's (unlit) appearance
+};
+
+// One shape found by SearchShapes, plus the variant of the subtree it was found in.
+struct SubsetRef {
+    NiTriBasedGeomRef geom;
+    unsigned char     variant;
+};
+
 // Functions from OpenEXR to convert a float to a half float
 static inline unsigned short FloatToHalfI(unsigned int i) {
     int s =  (i >> 16) & 0x00008000;
@@ -133,16 +152,25 @@ struct ExportedNode {
     bool alphaTestEnabled;
     bool alphaBlendEnabled;
     bool hasUVController;
+    unsigned char variant;   // SubsetVariant — GitD day/night window pair member, or kVariantAll
+    // Fixed-function stage op for a multi-map layer above the base: 0 = not a layer (the base, or
+    // any ordinary single-texture subset), 1 = MOD, 2 = MOD2X, 3 = ADD. Mirrors the near path's
+    // reconstruction exactly (scenegraph_geometry_cache.h: "MODULATE dark / MODULATE2X detail /
+    // ADD glow") — using plain MOD for a grey-centred detail map halves the whole window, and
+    // dropping the ADD glow layer is what made lit windows read as barely emissive.
+    unsigned char layerOp;
     HeroAnim hero;
 
     ExportedNode() :
         center(0,0,0), radius(0), verts(0), faces(0), emissive(0),
-        alphaTestEnabled(false), alphaBlendEnabled(false), hasUVController(false) {
+        alphaTestEnabled(false), alphaBlendEnabled(false), hasUVController(false),
+        variant(kVariantAll), layerOp(0) {
     }
 
     ExportedNode(const ExportedNode& src) :
         center(0,0,0), radius(0), verts(0), faces(0), emissive(0),
-        alphaTestEnabled(false), alphaBlendEnabled(false), hasUVController(false) {
+        alphaTestEnabled(false), alphaBlendEnabled(false), hasUVController(false),
+        variant(kVariantAll), layerOp(0) {
 
         *this = src;
     }
@@ -158,6 +186,8 @@ struct ExportedNode {
         alphaTestEnabled = src.alphaTestEnabled;
         alphaBlendEnabled = src.alphaBlendEnabled;
         hasUVController = src.hasUVController;
+        variant = src.variant;
+        layerOp = src.layerOp;
         hero = src.hero;
 
         if (verts) {
@@ -328,10 +358,17 @@ struct ExportedNode {
         WriteFile(file, &*compVBuf.begin(), verts * sizeof(DXCompressedVertex), &unused, 0);
         WriteFile(file, iBuffer.get(), faces * 3 * sizeof(unsigned short), &unused, 0);
 
-        // Write texturing flags
-        bool flags[2];
-        flags[0] = alphaTestEnabled || alphaBlendEnabled;
-        flags[1] = hasUVController;
+        // Write texturing flags. static_meshes has NO version or magic header — it is parsed
+        // positionally — so the GitD day/night variant is encoded by WIDENING flags[1] (only ever
+        // 0 or 1 before) instead of appending a field. An existing distant-land install therefore
+        // reads bits 1/2 as 0 on every subset, i.e. unconditional, i.e. exactly today's behaviour;
+        // regenerating is what opts in. flags[0] stays a plain bool.
+        unsigned char flags[2];
+        flags[0] = (alphaTestEnabled || alphaBlendEnabled) ? 1 : 0;
+        flags[1] = (unsigned char)((hasUVController          ? 0x1 : 0)    // bit0: NiUVController
+                                 | (variant == kVariantNight ? 0x2 : 0)    // bit1: night-only variant
+                                 | (variant == kVariantDay   ? 0x4 : 0)    // bit2: day-only variant
+                                 | ((layerOp & 0x3)         << 3));      // bits3-4: layer op (1 MOD, 2 MOD2X, 3 ADD)
         WriteFile(file, &flags, 2, &unused, 0);
 
         // Write texture name
@@ -450,7 +487,7 @@ private:
         return true;
     }
 
-    void SearchShapes(NiAVObjectRef rootObj, vector<NiTriBasedGeomRef>* SubsetNodes) {
+    void SearchShapes(NiAVObjectRef rootObj, vector<SubsetRef>* SubsetNodes, unsigned char variant) {
         // Exclude hidden objects
         if (!rootObj->GetVisibility()) {
             return;
@@ -459,7 +496,8 @@ private:
         // Check if this object is derived from NiTriBasedGeom
         NiTriBasedGeomRef niGeom = DynamicCast<NiTriBasedGeom>(rootObj);
         if (niGeom) {
-            SubsetNodes->push_back(niGeom);
+            SubsetRef ref = { niGeom, variant };
+            SubsetNodes->push_back(ref);
             return;
         }
 
@@ -486,18 +524,66 @@ private:
                 }
 
                 if (index >= 0 && index < children.size()) {
-                    SearchShapes(children[index], SubsetNodes);
+                    SearchShapes(children[index], SubsetNodes, variant);
                 }
             } else if (niSwitch) {
-                // Search just the selected child
+                // Glow in the Dahrk day/night windows. GetActiveChild() is children[indexActive]
+                // straight from the file, and every GitD mesh ships indexActive = 0 = "off", so the
+                // bake used to freeze distant land on the unlit variant permanently — the lit
+                // geometry and its glow-atlas UVs were never in the LOD at all.
+                //
+                // When a child named "on" exists (GitD's own convention, the same key the mod keys
+                // on), export BOTH: the active child tagged day-only and "on" tagged night-only.
+                // They share vertex POSITIONS but not UVs ("on" indexes the glow atlas), so they
+                // cannot share a vertex buffer — the lit variant is its own subset, ~1 KB per mesh
+                // DEFINITION shared by every instance of it.
+                //
+                // Any other use of NiSwitchNode, and any switch nested inside an already-tagged
+                // subtree, keeps the old single-active-child behaviour (fail-safe direction: no
+                // night variant, behaves exactly as today).
+                //
+                // NEVER split a HERO mesh. The ghostfence _herodist.nif carries its own
+                // NightDaySwitch with OFF/ON children, but there the two sides are not the
+                // day/night alternatives this split assumes — hero subsets are captured
+                // as-is and joined back to hero_anim.data BY ORDINAL, so splitting both
+                // shifted every anim slot and clipped half the layers, and the fence lost
+                // its glow. Hero mode is the whole "capture every layer exactly" contract;
+                // it opts out of this feature entirely.
                 auto child = niSwitch->GetActiveChild();
-                if (child) {
-                    SearchShapes(child, SubsetNodes);
+                NiAVObjectRef onChild;
+                if (variant == kVariantAll && !g_heroMode) {
+                    for (auto c : children) {
+                        if (c && _stricmp(c->GetName().c_str(), "on") == 0) {
+                            onChild = c;
+                            break;
+                        }
+                    }
+                }
+
+                if (onChild && onChild != child) {
+                    const size_t dayFirst = SubsetNodes->size();
+                    if (child) {
+                        SearchShapes(child, SubsetNodes, kVariantDay);
+                    }
+                    const size_t nightFirst = SubsetNodes->size();
+                    SearchShapes(onChild, SubsetNodes, kVariantNight);
+
+                    // A day/night split is only safe if BOTH halves exist: the host clips the day
+                    // subsets after dark, so tagging them while the "on" subtree yielded nothing
+                    // (hidden, or no geometry under it) would make the windows VANISH at night
+                    // rather than merely not glow. Demote the pair back to unconditional.
+                    if (SubsetNodes->size() == nightFirst) {
+                        for (size_t i = dayFirst; i < nightFirst; ++i) {
+                            (*SubsetNodes)[i].variant = variant;
+                        }
+                    }
+                } else if (child) {
+                    SearchShapes(child, SubsetNodes, variant);
                 }
             } else if (!collision) {
                 // Call this function for any children
                 for (auto child : children) {
-                    SearchShapes(child, SubsetNodes);
+                    SearchShapes(child, SubsetNodes, variant);
                 }
             }
         }
@@ -515,20 +601,72 @@ private:
         return parent ? ResolveProperty(parent, type) : nullptr;
     }
 
-    bool ExportShape(NiTriBasedGeomRef niGeom, ExportedNode* node) {
+    // The populated texture layers of a shape's material, in fixed-function stage order, with the
+    // stage op each one combines with. This is the SAME reconstruction the near path uses
+    // (scenegraph_geometry_cache.h: "MODULATE dark / MODULATE2X detail / ADD glow"), so a lit window
+    // reads identically either side of the DL handoff — which is the entire point. Getting these
+    // wrong is visible: MOD on the grey-centred detail map halves the window, and omitting the
+    // additive glow layer is what left lit windows looking barely emissive.
+    // Returns the layer count; out[] = TexType slot, ops[] = 0 base / 1 MOD / 2 MOD2X / 3 ADD.
+    static const int kMaxLayers = 4;
+    int LayerSlots(NiTriBasedGeomRef niGeom, int out[kMaxLayers], unsigned char ops[kMaxLayers]) {
+        NiAVObjectRef asAVObject = DynamicCast<NiAVObject>(niGeom);
+        NiTexturingPropertyRef tp =
+            DynamicCast<NiTexturingProperty>(ResolveProperty(asAVObject, NiTexturingProperty::TYPE));
+        int n = 0;
+        if (!tp) { return 0; }
+        const int           order[kMaxLayers] = { BASE_MAP, DARK_MAP, DETAIL_MAP, GLOW_MAP };
+        const unsigned char op[kMaxLayers]    = { 0,        1,        2,          3        };
+        for (int i = 0; i < kMaxLayers; ++i) {
+            const int s = order[i];
+            if (s < tp->GetTextureCount() && tp->HasTexture(s)
+                && tp->GetTexture(s).source && tp->GetTexture(s).source->IsTextureExternal()) {
+                out[n] = s;
+                ops[n] = op[i];
+                ++n;
+            }
+        }
+        // A material with no BASE but e.g. a glow map would make the first layer an ADD onto nothing.
+        // Demote whatever comes first to the base so there is always something to combine onto.
+        if (n > 0) { ops[0] = 0; }
+        return n;
+    }
+
+    bool ExportShape(NiTriBasedGeomRef niGeom, ExportedNode* node, int forceSlot = -1) {
         // Resolve property inheritance
         NiAVObjectRef asAVObject = DynamicCast<NiAVObject>(niGeom);
         NiTexturingPropertyRef niTexProp = DynamicCast<NiTexturingProperty>(ResolveProperty(asAVObject, NiTexturingProperty::TYPE));
         NiAlphaPropertyRef niAlphaProp = DynamicCast<NiAlphaProperty>(ResolveProperty(asAVObject, NiAlphaProperty::TYPE));
         NiMaterialPropertyRef niMatProp = DynamicCast<NiMaterialProperty>(ResolveProperty(asAVObject, NiMaterialProperty::TYPE));
 
+        // Which texture slot to bake. Distant land is single-texture, single-UV-set, so it takes
+        // the BASE map — except on a Glow in the Dahrk LIT variant, which is a MULTI-MAP material
+        // whose three layers each carry a different part of the look, on their own UV set:
+        //   in_redoran_window_01 "on": base=glow\tex02_dark1 (uv0)  — a near-neutral glow sheet
+        //                              dark=glow\tex03_2      (uv1)  — THE COLOUR (the orange)
+        //                              detail=tx_glass_amber_02 (uv2) — the glass artwork
+        // No ONE layer is enough — measured on real scenes, each carries a different part:
+        //   base   -> "just white windows"                (the sheet is nearly colourless)
+        //   detail -> "less white, but still white"; ex_vivec_c_04 "very close, slight hue change"
+        //   dark   -> the tint the other two are missing
+        // and per the author, "sometimes just dark is enough, sometimes you need 2, sometimes all 3".
+        // So the bake replicates the material: LayerSlots() enumerates the populated layers and the
+        // caller exports ONE SUBSET PER LAYER, each with its own texture AND its own UV set (the sets
+        // differ on purpose — verified max delta 0.68 between sets on in_redoran_window_01, so they
+        // cannot be composited offline). forceSlot picks which layer THIS node bakes; layers after
+        // the first carry multiplyLayer, and the host multiplies them onto the one beneath.
+        // forceSlot < 0 = the default single-texture behaviour every other static in the game gets.
+        const int texSlot = (forceSlot >= 0) ? forceSlot : 0;
+
         // Check that an external texture exists. Textureless shapes are dropped, EXCEPT during a sky
         // bake (g_allowTextureless) where the MW atmosphere dome is deliberately texture-free.
         NiSourceTextureRef niSrcTex;
         bool hasTexture = false;
-        if (niTexProp && niTexProp->GetTextureCount() > 0) {
-            TexDesc texDesc = niTexProp->GetTexture(0);
+        unsigned int texUVSet = 0;
+        if (niTexProp && niTexProp->GetTextureCount() > texSlot) {
+            TexDesc texDesc = niTexProp->GetTexture(texSlot);
             niSrcTex = texDesc.source;
+            texUVSet = texDesc.uvSet;
             hasTexture = (niSrcTex && niSrcTex->IsTextureExternal());
         }
         if (!hasTexture && !g_allowTextureless) {
@@ -553,7 +691,13 @@ private:
 
         // Check that there is at least one set of texture coords available. As with the texture check,
         // the sky dome legitimately has none, so tolerate that during a sky bake (UVs default to 0).
+        // The baked UV set follows the baked texture SLOT (see texSlot above): a lit GitD window
+        // indexes its artwork through uv set 2, so taking set 0 there would map the glow sheet's
+        // coordinates onto the window art. Falls back to set 0 if the shape doesn't carry that set.
         bool hasUV = niGeomData->GetUVSetCount() > 0;
+        if (texUVSet >= (unsigned int)niGeomData->GetUVSetCount()) {
+            texUVSet = 0;
+        }
         if (!hasUV && !g_allowTextureless) {
             // log_file << "There are no texture coordinates on this mesh." << endl;
             return false;
@@ -650,7 +794,7 @@ private:
         vector<Color4> colors = niGeomData->GetColors();
         vector<TexCoord> texCoords;
         if (hasUV) {
-            texCoords = niGeomData->GetUVSet(0);
+            texCoords = niGeomData->GetUVSet(texUVSet);
         }
 
         // Vertices
@@ -743,12 +887,32 @@ public:
         // kill it. Keep every subset distinct so each carries its own controller + alpha state.
         if (!g_heroMode) {
         for (size_t i = 0; i < nodes.size(); ++i) {
+            // GitD day/night window variants are ALTERNATIVES, not layers, and they can share a
+            // texture (the "on" child often just indexes a glow region of the same atlas). Merging
+            // them would collapse the pair into one always-drawn subset and lose the whole feature,
+            // so the merge key carries the variant as well as the texture path.
+            //
+            // NIGHT variants are never merged at all: each is one LAYER of a multi-map material,
+            // carrying its own UV set, and two layers can even share a texture (ray_alpha appears as
+            // both base and glow). Merging would concatenate two different UV parameterisations
+            // under one texture. The key is a zero-padded ordinal so it is unique AND sorts in
+            // emission order — the merged-node rebuild below iterates the map by key, so a
+            // non-ordered key would reshuffle layers away from their base.
+            char okey[24];
+            string key;
+            if (nodes[i].variant == kVariantNight) {
+                sprintf_s(okey, "1%08zu", i);
+                key = okey;
+            } else {
+                key = string(1, (char)('0' + nodes[i].variant)) + nodes[i].tex;
+            }
+
             // Check if this node has already been found
-            map<string, ExportedNode*>::iterator it = node_tex.find(nodes[i].tex);
+            map<string, ExportedNode*>::iterator it = node_tex.find(key);
 
             if (it == node_tex.end()) {
                 // Nothing with this texture has been found yet.  Store the node's pointer in the map
-                node_tex[ nodes[i].tex ] = &nodes[i];
+                node_tex[key] = &nodes[i];
             } else {
                 // A shape with this texture has been found already.  Merge this one into it.
                 MergeShape(it->second, &nodes[i]);
@@ -796,8 +960,8 @@ public:
         // Object root transform should not affect results
         rootObj->SetLocalTransform(Matrix44::IDENTITY);
 
-        vector<NiTriBasedGeomRef> SubsetNodes;
-        SearchShapes(rootObj, &SubsetNodes);
+        vector<SubsetRef> SubsetNodes;
+        SearchShapes(rootObj, &SubsetNodes, kVariantAll);
 
         if (SubsetNodes.size() == 0) {
             // log_file << "SubsetNodes size is zero." << endl;
@@ -805,8 +969,39 @@ public:
         }
 
         for (size_t i = 0; i < SubsetNodes.size(); ++i) {
-            ExportedNode tmp_node;
-            if (ExportShape(SubsetNodes[i], &tmp_node)) {
+            const unsigned char variant = SubsetNodes[i].variant;
+
+            // A GitD LIT window is a multi-map material and no single layer reproduces it, so
+            // replicate it: one subset per populated layer, each carrying its own texture and its
+            // own UV set, multiplied back together at draw time. Every other subset in the game
+            // (including the unlit DAY variant, which is single-map) takes the one-texture path.
+            int           layers[kMaxLayers];
+            unsigned char layerOps[kMaxLayers] = { 0, 0, 0, 0 };
+            int layerCount = (variant == kVariantNight)
+                           ? LayerSlots(SubsetNodes[i].geom, layers, layerOps) : 0;
+            if (layerCount <= 1) {
+                layers[0] = -1;       // default: base map, ExportShape's own resolution
+                layerOps[0] = 0;
+                layerCount = 1;
+            }
+
+            for (int L = 0; L < layerCount; ++L) {
+                ExportedNode tmp_node;
+                // Set BEFORE the export: ExportShape reads variant for the layer semantics and
+                // never writes the field back.
+                tmp_node.variant = variant;
+                if (!ExportShape(SubsetNodes[i].geom, &tmp_node, layers[L])) { continue; }
+                // Animations are the one thing distant land gives up here (the author's call:
+                // "only sacrifice the animations. herodists keep the animations"). Hero meshes
+                // never reach this path at all — g_heroMode opts out of the variant split — so
+                // the ghostfence/lava NiUVController replay is untouched.
+                if (variant == kVariantNight) {
+                    tmp_node.hasUVController = false;
+                }
+                // Layer 0 is the base (op 0); each layer above it folds onto what is already there
+                // with its own fixed-function op — MOD for the dark map, MOD2X for the detail map,
+                // ADD for the glow map.
+                tmp_node.layerOp = layerOps[L];
                 nodes.push_back(tmp_node);
             }
         }
@@ -814,6 +1009,21 @@ public:
         if (nodes.size() == 0) {
             // log_file << "nodes size is zero." << endl;
             return false;
+        }
+
+        // The other half of the "both halves or neither" rule above. SearchShapes only collects
+        // CANDIDATE shapes; ExportShape still drops any that have no external texture, no triangles
+        // or no UVs, so the night variant can disappear after the switch was already split. If none
+        // survived, no subset may stay day-only — the windows would go missing after dark. (Per NIF
+        // rather than per switch node: GitD meshes carry exactly one day/night switch.)
+        bool haveNight = false;
+        for (size_t i = 0; i < nodes.size(); ++i) {
+            if (nodes[i].variant == kVariantNight) { haveNight = true; break; }
+        }
+        if (!haveNight) {
+            for (size_t i = 0; i < nodes.size(); ++i) {
+                if (nodes[i].variant == kVariantDay) { nodes[i].variant = kVariantAll; }
+            }
         }
 
         // Success

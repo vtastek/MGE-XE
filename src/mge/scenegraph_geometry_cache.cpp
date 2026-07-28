@@ -110,6 +110,11 @@ namespace MGE::GeometryCache {
         // by updateDerivedMembership + the same erase sites as the mover set. ⊆ keys(g_cache).
         std::unordered_set<uint32_t>                      g_skyKeys;
         std::unordered_set<uint32_t>                      g_fpKeys;
+        // Keys whose entry hangs under a NiSwitchNode (see CachedGeometry::switchOwner). Tiny —
+        // only glow-mod windows and similar variant meshes qualify — so the per-frame "is your
+        // branch still the displayed one?" pass iterates this instead of the whole cache. Same
+        // maintenance contract as the sets above. ⊆ keys(g_cache).
+        std::unordered_set<uint32_t>                      g_switchKeys;
         // Near-eye PLAIN-STATIC shadow-caster keys, rebuilt each eviction sweep (30-frame cadence)
         // by collecting kept entries near the eye. The mover set above re-emits offscreen skinned/
         // MM/rigid-LIVE casters every frame; a plain static (lantern, wall fixture) is NOT a mover
@@ -593,8 +598,31 @@ namespace MGE::GeometryCache {
             const float r = geom->worldBoundRadius;
             if (!(r > 0.0f)) return;
 
+            // This models a self-illuminated FIXTURE: a lantern is a ~30cm object with its emitter
+            // inside it. Measured, that is bound radius 14.1 units with the light 0.5 units off
+            // centre (a candle flame: 2.6 / 1.5) — so a MW unit is ~1cm and a fixture's bound is
+            // tens of units, not hundreds.
+            //
+            // Two independent things must hold: the shape has to BE a fixture, and the light has
+            // to be INSIDE it. Testing only "is the light within the world bound" checked neither
+            // once the mesh got large, because the tolerance then scaled with the mesh: a
+            // Glow-in-the-Dahrk window strip spans a whole facade (r=529.6), so a street lantern
+            // 365 units away was claimed as its own light and the flux/area term divided the
+            // authored emissive by an 87,000-unit^2 area — emissive=(1,1,1) reached the host as
+            // (0.01,0.01,0.00) and those windows stayed dark, while every smaller window in the
+            // same scene (gain 1,1,1) glowed correctly.
+            //
+            // Gate both, absolutely. Real fixtures are unaffected (their own radius still binds);
+            // architecture is rejected outright rather than merely needing a nearer lantern.
+            // Rejection leaves emissiveGain at 1, so the authored emissive passes through — the
+            // correct answer for a shape that has no fixture light of its own.
+            constexpr float kMaxFixtureBoundRadius = 64.0f;   // ~1.4m across: brazier/chandelier still fit
+            constexpr float kMaxOwnLightDistance   = 32.0f;   // the emitter sits in the fixture body
+            if (r > kMaxFixtureBoundRadius) return;           // architecture, not a fixture
+            const float tol = (r < kMaxOwnLightDistance) ? r : kMaxOwnLightDistance;
+
             const MGE::SceneGraph::PointLight* own = nullptr;
-            float bestD2 = r * r;   // doubles as the inside-the-bound threshold
+            float bestD2 = tol * tol;   // doubles as the inside-the-fixture threshold
             for (const auto& pl : g_lightSnapshot) {
                 const float dx = pl.worldPos[0] - geom->worldBoundOrigin.x;
                 const float dy = pl.worldPos[1] - geom->worldBoundOrigin.y;
@@ -616,11 +644,11 @@ namespace MGE::GeometryCache {
                 if (s_logged < 16) {
                     ++s_logged;
                     LOG::logline(">> [emissive] fixture tex=%s emissive=(%.2f,%.2f,%.2f) light=(%.3f,%.3f,%.3f) "
-                                 "d=%.1f r=%.1f area=%.1f gain=(%.2f,%.2f,%.2f)",
+                                 "d=%.1f r=%.1f tol=%.1f area=%.1f gain=(%.2f,%.2f,%.2f)",
                                  e.textureName ? e.textureName : "(none)",
                                  e.matEmissive[0], e.matEmissive[1], e.matEmissive[2],
                                  own->diffuse[0], own->diffuse[1], own->diffuse[2],
-                                 std::sqrt(bestD2), r, area,
+                                 std::sqrt(bestD2), r, tol, area,
                                  e.emissiveGain[0], e.emissiveGain[1], e.emissiveGain[2]);
                 }
             }
@@ -1754,6 +1782,71 @@ namespace MGE::GeometryCache {
             return false;
         }
 
+        // Engine-informed liveness guard for a stored raw node pointer. A cached leaf keeps a
+        // strong ref on ITSELF but NOT on its ancestors, so once MW frees a detached subtree our
+        // stored pointer dangles into stale heap and the next deref reads dead memory. Validate
+        // against the real NI node-subtype vtables (MWSE-provided addresses in
+        // NI::VirtualTableAddress — no disassembly): a freed slot no longer matches any node
+        // vtable, so it reads as GONE instead of being chased.
+        //
+        // Used by BOTH the eviction parent-climb (where it was introduced, 2026-07-20) and the
+        // switch-variant pass — one list, so a node type accepted by one is accepted by the other.
+        bool isLiveNodeVT(const NI::Node* n) {
+            if (!n) return false;
+            namespace VA = NI::VirtualTableAddress;
+            switch (reinterpret_cast<std::uintptr_t>(n->vTable.asNode)) {
+                case VA::NiNode:            case VA::NiBillboardNode:  case VA::BSMirroredNode:
+                case VA::NiSwitchNode:      case VA::NiBSAnimationNode: case VA::NiBSParticleNode:
+                case VA::NiBSPNode:         case VA::NiFltAnimationNode: case VA::NiLODNode:
+                case VA::NiSortAdjustNode:  case VA::AvoidNode:        case VA::RootCollisionNode:
+                // MW parents the INTERIOR cell scene under a node carrying the
+                // NiBSAnimationManager vtable (every interior chain's 2nd hop — [rescue-diag]
+                // 2026-07-21). Rejecting it read the whole interior as freed → mass age-evict
+                // → the interior 360° re-capture trickle. NiCollisionSwitch is a common
+                // in-mesh node with the same silent-miss failure mode.
+                case VA::NiBSAnimationManager: case VA::NiCollisionSwitch:
+                    return true;
+                default:
+                    return false;   // dangling/freed parent, or a node type outside the family
+            }
+        }
+
+        // Capture-time switch binding. Climb to the nearest NiSwitchNode ancestor and record BOTH
+        // the switch and the index of the child we came up through, so a later frame can ask "is
+        // this shape's branch still the displayed one?" without re-walking.
+        //
+        // Why this is needed at all: walk() descends a switch's ACTIVE child only, so a full walk
+        // never captures an inactive variant. But ensureLive()'s first-sight capture is driven by
+        // the engine classify feed, which hands us leaves directly, with no switch context — and
+        // under the Forge seam that lazy path is how nearly everything gets cached (the per-frame
+        // refresh walk is skipped, see W3 live-read). So the variant that was active when the
+        // player first looked at it gets captured, and nothing ever retires it: it stays parented,
+        // so the eviction sweep's chain climb keeps voting ALIVE forever.
+        //
+        // Bounded by kMaxParentDepth like every other climb here. Called once per entry at capture,
+        // alongside referenceLiveKind/hasTransformAnim.
+        void bindSwitchOwner(CachedGeometry& e, NI::AVObject* geom) {
+            e.switchOwner = nullptr;
+            e.switchChild = -1;
+            NI::AVObject* child = geom;
+            NI::Node* p = geom->parentNode;
+            for (int depth = 0; p && depth < kMaxParentDepth; ++depth) {
+                if (p->isInstanceOfType(NI::RTTIStaticPtr::NiSwitchNode)) {
+                    const auto count = p->children.getEndIndex();
+                    for (size_t i = 0; i < count; ++i) {
+                        if (p->children.at(i).get() == child) {
+                            e.switchOwner = p;
+                            e.switchChild = static_cast<int>(i);
+                            return;
+                        }
+                    }
+                    return;     // switch found but our chain isn't among its children — leave unbound
+                }
+                child = p;
+                p = p->parentNode;
+            }
+        }
+
         // Offscreen shadow-caster PRE-DISTANCE predicate — a byte-for-byte mirror of the filter in
         // renderprocess.cpp buildGeometryDrawLists' offscreen re-emit loop, MINUS the per-frame parts
         // (distance, visible-set, suppressedFrame, want-flags), which the consumer keeps. It reads only
@@ -1787,6 +1880,8 @@ namespace MGE::GeometryCache {
             else         g_skyKeys.erase(key);
             if (e.isFP)  g_fpKeys.insert(key);
             else         g_fpKeys.erase(key);
+            if (e.switchOwner) g_switchKeys.insert(key);
+            else               g_switchKeys.erase(key);
         }
 
         void visitGeometry(NI::TriBasedGeometry* geom, bool inCharacter) {
@@ -1864,6 +1959,9 @@ namespace MGE::GeometryCache {
                 e.isSky = g_walkingSky;
                 e.isFP = g_walkingFP;
                 if (g_walkingSky) e.skyOrder = g_skyVisitCounter++;  // SK2 back-to-front key
+                // NiSwitchNode variant binding (day/night window glow). Sky is exempt: the sky walk
+                // has its own visibility rules and carries no switch variants.
+                if (!g_walkingSky) bindSwitchOwner(e, geom);
                 e.mirrored = computeMirrored(e);                    // winding flip for depth/shadow
             } else {
                 auto& e = it->second;
@@ -2696,6 +2794,83 @@ namespace MGE::GeometryCache {
             s_was3rd = is3rd;
         }
 
+        // NiSwitchNode variant pass (day/night window glow). A switch displays ONLY the child at
+        // switchIndex, but a cached entry under an INACTIVE child is still fully parented, so
+        // nothing else retires it: walk() honours switchIndex on the way DOWN, ensureLive's
+        // first-sight capture has no switch context at all, and the eviction sweep's chain climb
+        // votes ALIVE for any parented shape. Glow-in-the-Dahrk's variants are coincident (all
+        // three branches are identity transform, scale 1), so a stale variant does not just linger
+        // — it Z-fights its live sibling and the winner is decided by draw order.
+        //
+        // Reuse suppressedFrame, the flag every consumer already honours (FP0 body suppression
+        // established it), so this costs no new plumbing and no wire change. Runs on the tiny
+        // g_switchKeys set, not the cache. Every deref is vtable-guarded: switchOwner is a raw
+        // engine pointer and the shape can outlive the switch that owned it.
+        for (uint32_t key : g_switchKeys) {
+            auto it = g_cache.find(key);
+            if (it == g_cache.end()) continue;
+            auto& e = it->second;
+            const auto* sw = static_cast<const NI::Node*>(e.switchOwner);
+            if (!isLiveNodeVT(sw)) continue;          // freed/recycled — leave it to the sweep
+            if (!sw->isInstanceOfType(NI::RTTIStaticPtr::NiSwitchNode)) continue;
+            if (static_cast<const NI::SwitchNode*>(sw)->switchIndex != e.switchChild) {
+                e.suppressedFrame = g_frame;
+            }
+        }
+
+        // Switch-variant state probe. Reports the CAPTURED SHADING INPUTS of every switch-bound
+        // entry, not just which branch it belongs to — the day/night window bug turned out NOT to
+        // be variant selection (the live shape draws, correctly textured and UV-animated) but the
+        // material behind it: two structurally identical glow-mod windows, one lit and one not.
+        //
+        // These are exactly the fields the host's lit block consumes:
+        //   vColSource 2 (DiffAmb):  lit = Color.rgb * (d + a) + matEmissive
+        //   vColSource 1 (Emissive): lit = matDiffuse * d + matAmbient * a + Color.rgb
+        //   vColSource 0 (None):     lit = matDiffuse * d + matAmbient * a + matEmissive
+        // so a window that will not glow has to differ in emis=, vcol= or gain= — and whichever it
+        // is names the bug. rev= is the re-extract gate: extractMaterial re-runs only on a
+        // revisionID bump, so an entry captured with stale property state keeps a wrong material
+        // indefinitely, and a per-frame-bumping neighbour would silently self-heal.
+        //
+        // Logged on CHANGE only (state hash per key), so it costs one burst at first sight and one
+        // more at each day/night flip instead of spamming every frame.
+        if (Configuration.LogDistantPipeline && !g_switchKeys.empty()) {
+            static std::unordered_map<uint32_t, uint32_t> s_shown;
+            for (uint32_t key : g_switchKeys) {
+                auto it = g_cache.find(key);
+                if (it == g_cache.end()) continue;
+                const auto& e = it->second;
+                const auto* sw = static_cast<const NI::Node*>(e.switchOwner);
+                if (!isLiveNodeVT(sw)) continue;
+                const int live = static_cast<const NI::SwitchNode*>(sw)->switchIndex;
+                const uint32_t stateHash =
+                      (uint32_t)(e.matEmissive[0] * 255.0f) * 2654435761u
+                    ^ (uint32_t)(e.vColSource + 1) * 2246822519u
+                    ^ (uint32_t)(e.hasVertexColor ? 3266489917u : 0u)
+                    ^ (uint32_t)(live * 40503 + e.switchChild) * 668265263u
+                    ^ (uint32_t)(e.emissiveGain[0] * 255.0f) * 374761393u;
+                auto sit = s_shown.find(key);
+                if (sit != s_shown.end() && sit->second == stateHash) continue;
+                s_shown[key] = stateHash;
+                auto rit = g_geomRefs.find(key);
+                const char* nm = (rit != g_geomRefs.end() && rit->second.get())
+                                 ? rit->second.get()->getName() : nullptr;
+                LOG::logline(">> [switchvar] key=%08X '%s' branch=%d live=%d %s | emis=(%.2f,%.2f,%.2f) "
+                             "gain=(%.2f,%.2f,%.2f) diff=(%.2f,%.2f,%.2f) amb=(%.2f,%.2f,%.2f) "
+                             "vcol=%u/hasCol=%d rev=%u mm=%d tex=%s",
+                             key, (nm && *nm) ? nm : "?", e.switchChild, live,
+                             (live == e.switchChild) ? "DRAW" : "suppressed",
+                             e.matEmissive[0], e.matEmissive[1], e.matEmissive[2],
+                             e.emissiveGain[0], e.emissiveGain[1], e.emissiveGain[2],
+                             e.matDiffuse[0], e.matDiffuse[1], e.matDiffuse[2],
+                             e.matAmbient[0], e.matAmbient[1], e.matAmbient[2],
+                             (unsigned)e.vColSource, e.hasVertexColor ? 1 : 0,
+                             (unsigned)e.revisionID,
+                             (e.d3dDark || e.d3dDetail || e.d3dGlow) ? 1 : 0,
+                             e.textureName ? e.textureName : "(none)");
+            }
+        }
+
         // W3 live-read: on Forge-owned frames the refresh walk is dead work — the
         // classify-visible keys are freshened one-by-one off their live NiTriShapes
         // in buildFrustumVisibleSet (ensureLive), and a frame with no classify pulls
@@ -3036,25 +3211,7 @@ namespace MGE::GeometryCache {
             // the loop safe (first hop is off a leaf we hold; every later hop is off a vtable-validated
             // live node) and turns the unbounded hazard into counted diagnostics (climbVtBad).
             unsigned climbMaxDepth = 0, climbVtBad = 0, climbDepthCap = 0, climbDisabled = 0;
-            auto isLiveNode = [](const NI::Node* n) -> bool {
-                if (!n) return false;
-                namespace VA = NI::VirtualTableAddress;
-                switch (reinterpret_cast<std::uintptr_t>(n->vTable.asNode)) {
-                    case VA::NiNode:            case VA::NiBillboardNode:  case VA::BSMirroredNode:
-                    case VA::NiSwitchNode:      case VA::NiBSAnimationNode: case VA::NiBSParticleNode:
-                    case VA::NiBSPNode:         case VA::NiFltAnimationNode: case VA::NiLODNode:
-                    case VA::NiSortAdjustNode:  case VA::AvoidNode:        case VA::RootCollisionNode:
-                    // MW parents the INTERIOR cell scene under a node carrying the
-                    // NiBSAnimationManager vtable (every interior chain's 2nd hop — [rescue-diag]
-                    // 2026-07-21). Rejecting it read the whole interior as freed → mass age-evict
-                    // → the interior 360° re-capture trickle. NiCollisionSwitch is a common
-                    // in-mesh node with the same silent-miss failure mode.
-                    case VA::NiBSAnimationManager: case VA::NiCollisionSwitch:
-                        return true;
-                    default:
-                        return false;   // dangling/freed parent, or a node type outside the family
-                }
-            };
+            auto isLiveNode = isLiveNodeVT;
             auto parentVerdict = [&](uint32_t key, const CachedGeometry& e) -> int {
                 if (!rootsValid) return 2;              // no usable reference point → age rule only
                 // The walk reached it this frame ⇒ reachable. Belt-and-braces against any root we
@@ -3339,6 +3496,7 @@ namespace MGE::GeometryCache {
                     g_moverCandidates.erase(it->first);   // key leaving the cache → drop from every
                     g_skyKeys.erase(it->first);           //   derived membership set
                     g_fpKeys.erase(it->first);
+                    g_switchKeys.erase(it->first);
                     it = g_cache.erase(it);
                 } else {
                     // KEPT: collect near-eye plain-static shadow casters for the Forge feed's
@@ -3596,6 +3754,7 @@ namespace MGE::GeometryCache {
         g_moverCandidates.clear();   // whole cache dropped → no derived membership survives
         g_skyKeys.clear();
         g_fpKeys.clear();
+        g_switchKeys.clear();        // switchOwner points at engine nodes this purge invalidates
         g_nearStaticCasters.clear(); // stale snapshot (find-guarded anyway); rebuilt next sweep
         g_nearAlphaCasters.clear();
         g_geomRefs.clear();   // NI::Pointer dtors → DecRef every shape we were pinning
@@ -3634,6 +3793,7 @@ namespace MGE::GeometryCache {
             g_moverCandidates.erase(key);   // stale entry gone; re-capture below re-adds if applicable
             g_skyKeys.erase(key);
             g_fpKeys.erase(key);
+            g_switchKeys.erase(key);
             it = g_cache.end();
         }
 

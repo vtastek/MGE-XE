@@ -99,6 +99,9 @@ STRUCT(FrameData)
     // host to [0, 12.5) — exactly one V cycle of the 0.08/s scroll, so the wrap is seamless and t stays
     // small enough for float32 to hold sub-frame precision. Only statics.vert reads it (a subset scrolls
     // only if its flags carry bit2, set from the NIF's NiUVController at bake time). 336B < 512B.
+    // y = hero blend-pass enabled. z = Glow in the Dahrk night signal: the client's signed margin in
+    // GAME HOURS into the period where GitD lights a window mesh (>0 lit, <0 dark), consumed only by
+    // statics.vert's day/night variant clip (flags bits 3/4). w unused.
     DATA(float4, timeParams, None);
     // Hero distant statics UV animation (Phase 3). The host evaluates the real NiUVController keys
     // for up to 8 UNIQUE (deduped) animations — the fence fasterA/fasterB/slower layers + lava

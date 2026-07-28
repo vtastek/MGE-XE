@@ -10,6 +10,7 @@
 #include "cachebounds.h"
 #include "scenegraph.h"
 #include "datahandler_view.h"
+#include "worldcontroller_view.h"
 #include "morrowindbsa.h"
 #include "mge_tracy.h"
 #include "imgui.h"
@@ -1970,7 +1971,16 @@ namespace {
     std::uint32_t resolveCachedSlot(const char* name, const char*& namePtr,
                                     std::uint32_t& slotVal, std::uint32_t& slotEpoch) {
         if (name == namePtr && slotEpoch == g_texEpoch) {
-            if (slotVal != 0) { g_slotLastUsed[slotVal] = g_frame; }
+            // isFlipSlot is NOT optional here. A flip-book frame resolves to an ENCODED array slot
+            // (bucket<<16|layer), not an index into the LRU range, so subscripting g_slotLastUsed
+            // with it runs ~0x8000 elements (~128 KB) past the end. resolveTextureSlot's memoized
+            // return guards exactly this (:1452); this fast path — which is the one that actually
+            // runs, every frame, once a name is cached — did not. The stray store lands in whatever
+            // the allocator put after the vector, so the crash surfaces LATER and ELSEWHERE: the
+            // reported one was an access violation inside g_texSlot's own node insert, on the
+            // produce worker, with a garbage list pointer. Array-backed textures are resident for
+            // the session and never recycled, so they have no LRU age to refresh.
+            if (slotVal != 0 && !IPC::isFlipSlot(slotVal)) { g_slotLastUsed[slotVal] = g_frame; }
             return slotVal;
         }
         slotVal = resolveTextureSlot(name);
@@ -4583,6 +4593,13 @@ namespace RenderProcess {
             s_smoothWind[1] += 0.02f * (wind[1] - s_smoothWind[1]);
             windMag = std::sqrt(s_smoothWind[0] * s_smoothWind[0] + s_smoothWind[1] * s_smoothWind[1]);
         }
+        // Glow in the Dahrk distant windows (lighting[35]): hours into the period where GitD shows a
+        // window mesh's lit "on" child (>0 lit, <0 dark). The host adds a per-instance stagger and
+        // uses the sign to pick the night or day variant of a distant window subset. Before a world
+        // exists there is nothing to light and no distant land either, so fall back to a value that
+        // is unambiguously "day" rather than to 0, which sits exactly on the switch boundary.
+        float glowMargin = -24.0f;
+        MGE::WorldControllerView::glowLitMargin(glowMargin);
         const float lighting[36] = {
             sunVecEff.x,               sunVecEff.y,               sunVecEff.z,               0.0f,
             sunColEff.r,               sunColEff.g,               sunColEff.b,               0.0f,
@@ -4612,7 +4629,8 @@ namespace RenderProcess {
             // [33]/[34] Part A upload cost: THIS frame's total host-geom reship KB + part count,
             // surfaced on the host perf panel. Filled from g_upFrame just below (the array is const,
             // so a non-const alias writes the two slots after the aggregate is computed).
-            mwb->simulationTime(),     0.0f,                      0.0f,                      0.0f,
+            // [35] GitD night signal -> FrameData.timeParams.z (statics.vert day/night window clip).
+            mwb->simulationTime(),     0.0f,                      0.0f,               glowMargin,
         };
 
         // Part A: aggregate this frame's per-category upload cost, publish the total to the host

@@ -37,6 +37,10 @@ namespace MGE::WorldControllerView {
     constexpr size_t OFF_weatherController          = 0x58;
     constexpr size_t OFF_worldCameraData            = 0x124 + 0x10;  // CameraData::camera
     constexpr size_t OFF_flagMenuMode               = 0xD6;
+    constexpr size_t OFF_gvarGameHour               = 0xA8;          // TES3::GlobalVariable* GameHour
+
+    // TES3::GlobalVariable::value.
+    constexpr size_t OFF_globalValue                = 0x34;
 
     // WeatherController fields (NI::Pointer<NI::Node> — raw pointer is the first
     // and only member, so reading a Node** at the offset is the same load).
@@ -44,6 +48,18 @@ namespace MGE::WorldControllerView {
     constexpr size_t OFF_sgRainRoot                 = 0x5C;
     constexpr size_t OFF_sgSnowRoot                 = 0x60;
     constexpr size_t OFF_sgStormRoot                = 0x6C;
+
+    // WeatherController sun-hour schedule. These are the boundaries Glow in the
+    // Dahrk derives its day/night window switch from (GlowInTheDahrk/interop.lua
+    // getSunHours), which is why they are read here rather than approximated from
+    // the sun elevation — a derived elevation disagrees with the mod's near-field
+    // windows by tens of game-minutes at dawn and dusk.
+    constexpr size_t OFF_sunriseHour                = 0xDC;
+    constexpr size_t OFF_sunsetHour                 = 0xE0;
+    constexpr size_t OFF_sunriseDuration            = 0xE4;
+    constexpr size_t OFF_sunsetDuration             = 0xE8;
+    constexpr size_t OFF_sunPreSunriseTime          = 0x120;
+    constexpr size_t OFF_sunPostSunsetTime          = 0x12C;
 
     inline void* worldController() {
         return *reinterpret_cast<void**>(ADDR_worldController);
@@ -82,5 +98,44 @@ namespace MGE::WorldControllerView {
     inline NI::Node* sgRainRoot()  { return detail::weatherRoot(OFF_sgRainRoot); }
     inline NI::Node* sgSnowRoot()  { return detail::weatherRoot(OFF_sgSnowRoot); }
     inline NI::Node* sgStormRoot() { return detail::weatherRoot(OFF_sgStormRoot); }
+
+    // How far the current game hour is INTO the period where Glow in the Dahrk shows a
+    // window mesh's lit "on" child: positive = lit, negative = dark, magnitude in game
+    // hours from the nearest boundary. The host adds a per-instance stagger to this and
+    // picks the night or day variant of a distant window subset from the sign, which is
+    // what makes distant land light up at night instead of freezing on the unlit bake.
+    //
+    // GitD's rule is `hour < sunriseStart || hour > sunsetStop` with
+    //   sunriseStart = sunriseHour - sunPreSunriseTime
+    //   sunsetStop   = sunsetHour + sunsetDuration + sunPostSunsetTime
+    // (GlowInTheDahrk/interop.lua getSunHours + main.lua). Reading the real boundaries is
+    // what keeps distant windows in step with the mod's near ones.
+    //
+    // Returns false, leaving `out` untouched, before a world exists (main menu, pre-load)
+    // — MWBridge::getGameHour() is the unguarded twin of the same read, so the global is
+    // dereferenced here only after both it and the weather controller are known non-null.
+    inline bool glowLitMargin(float& out) {
+        void* wc = worldController();
+        if (!wc) return false;
+        void* wtr = *reinterpret_cast<void**>(static_cast<unsigned char*>(wc) + OFF_weatherController);
+        if (!wtr) return false;
+        void* gvar = *reinterpret_cast<void**>(static_cast<unsigned char*>(wc) + OFF_gvarGameHour);
+        if (!gvar) return false;
+
+        auto weatherFloat = [wtr](size_t offset) {
+            return *reinterpret_cast<float*>(static_cast<unsigned char*>(wtr) + offset);
+        };
+        const float hour = *reinterpret_cast<float*>(static_cast<unsigned char*>(gvar) + OFF_globalValue);
+        const float sunriseStart = weatherFloat(OFF_sunriseHour) - weatherFloat(OFF_sunPreSunriseTime);
+        const float sunsetStop = weatherFloat(OFF_sunsetHour) + weatherFloat(OFF_sunsetDuration)
+                               + weatherFloat(OFF_sunPostSunsetTime);
+
+        // Distance past whichever boundary we are outside of; when inside the lit day both
+        // terms are negative and the larger (nearer boundary) is the one that matters.
+        const float toDawn = sunriseStart - hour;
+        const float toDusk = hour - sunsetStop;
+        out = (toDawn > toDusk) ? toDawn : toDusk;
+        return true;
+    }
 
 }

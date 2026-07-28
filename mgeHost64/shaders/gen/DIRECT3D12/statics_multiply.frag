@@ -972,9 +972,9 @@ SamplerState gSampler2xWrapClamp : register( s17 , space100 ) ;
 #line 247 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/../../../3rdparty/The-Forge/Common_3/Graphics/FSL/defaults.h"
 
 #line 11 "FSL/shaders.list"
-#line 38 "FSL/shaders.list"
-#line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/depthonly.frag.fsl"
-#line 17 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/depthonly.frag.fsl"
+#line 210 "FSL/shaders.list"
+#line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/statics_multiply.frag.fsl"
+#line 25 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/statics_multiply.frag.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
 #line 20 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
@@ -1279,89 +1279,42 @@ STRUCT(LightData)
 
         Tex2DArray(float4) gFlipArrays[ 16 ] :  register(t1008,space0);
         CBUFFER(BatchData) gBatch :  register(b0,space2);
-#line 18 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/depthonly.frag.fsl"
-#line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/texsample.h.fsl"
-#line 38 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/texsample.h.fsl"
-bool isFlipSlot(uint texIdx) { return (texIdx &  0x8000u ) != 0u; }
-
-float4 sampleFlip(uint texIdx, uint clampMode, float2 uv, bool lowAF)
-{
-    const uint bucket = (texIdx >> 11u) & ( 16  - 1u);
-    const float3 uvw = float3(uv, (float)(texIdx &  0x7FFu ));
-    if (lowAF)
-    {
-        if (clampMode ==  0u ) { return SampleTex2DArray(gFlipArrays[bucket], gSampler2xClampClamp, uvw); }
-        if (clampMode ==  1u ) { return SampleTex2DArray(gFlipArrays[bucket], gSampler2xClampWrap, uvw); }
-        if (clampMode ==  2u ) { return SampleTex2DArray(gFlipArrays[bucket], gSampler2xWrapClamp, uvw); }
-        return SampleTex2DArray(gFlipArrays[bucket], gSampler2xWrapWrap, uvw);
-    }
-    if (clampMode ==  0u ) { return SampleTex2DArray(gFlipArrays[bucket], gSamplerAnisoClampClamp, uvw); }
-    if (clampMode ==  1u ) { return SampleTex2DArray(gFlipArrays[bucket], gSamplerAnisoClampWrap, uvw); }
-    if (clampMode ==  2u ) { return SampleTex2DArray(gFlipArrays[bucket], gSamplerAnisoWrapClamp, uvw); }
-    return SampleTex2DArray(gFlipArrays[bucket], gSamplerAnisotropic, uvw);
-}
+#line 26 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/statics_multiply.frag.fsl"
 
 
 
-
-
-
-float4 sampleBase(uint texIdx, uint clampMode, float2 uv, bool lowAF)
-{
-
-
-
-    if (isFlipSlot(texIdx)) { return sampleFlip(texIdx, clampMode, uv, lowAF); }
-    if (lowAF)
-    {
-        if (clampMode ==  0u ) { return SampleTex2D(gTextures[texIdx], gSampler2xClampClamp, uv); }
-        if (clampMode ==  1u ) { return SampleTex2D(gTextures[texIdx], gSampler2xClampWrap, uv); }
-        if (clampMode ==  2u ) { return SampleTex2D(gTextures[texIdx], gSampler2xWrapClamp, uv); }
-        return SampleTex2D(gTextures[texIdx], gSampler2xWrapWrap, uv);
-    }
-    if (clampMode ==  0u ) { return SampleTex2D(gTextures[texIdx], gSamplerAnisoClampClamp, uv); }
-    if (clampMode ==  1u ) { return SampleTex2D(gTextures[texIdx], gSamplerAnisoClampWrap, uv); }
-    if (clampMode ==  2u ) { return SampleTex2D(gTextures[texIdx], gSamplerAnisoWrapClamp, uv); }
-    return SampleTex2D(gTextures[texIdx], gSamplerAnisotropic, uv);
-}
-
-
-
-
-bool useLowAF(float alphaRef, bool alphaBlended)
-{
-    return (gFrameData.alphaParams.y > 0.5f) && (alphaBlended || (alphaRef > 0.0f));
-}
-#line 19 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/depthonly.frag.fsl"
 
 STRUCT(VSOutput)
 {
     DATA(float4, Position, SV_Position);
-    DATA(float3, Normal, NORMAL);
     DATA(float2, Uv, TEXCOORD0);
-    DATA(FLAT(uint), TexIndex, TEXCOORD1);
-    DATA(float, Fog, TEXCOORD2);
-    DATA(float4, Color, COLOR);
-    DATA(float, AlphaRef, TEXCOORD3);
-    DATA(FLAT(float3),MatDiffuse, TEXCOORD4);
-    DATA(FLAT(float3),MatAmbient, TEXCOORD5);
-    DATA(FLAT(float3),MatEmissive,TEXCOORD6);
-    DATA(FLAT(uint), VColSource, TEXCOORD7);
-    DATA(float3, WorldPos, TEXCOORD8);
-    DATA(FLAT(uint), OverlayIndex,TEXCOORD9);
-    DATA(FLAT(uint), ClampMode, TEXCOORD10);
-#line 36
+    DATA(CENTROID(float4), Color, COLOR);
+    DATA(CENTROID(float), Fog, TEXCOORD1);
+    DATA(FLAT(uint), TexIndex, TEXCOORD2);
+    DATA(FLAT(uint), Flags, TEXCOORD3);
+    DATA(float3, WorldPos, TEXCOORD4);
+    DATA(float3, WorldNormal, TEXCOORD5);
+    DATA(CENTROID(float3), SunLight, TEXCOORD6);
+#line 41
 };
 
 [RootSignature( "RootFlags(ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT)," "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "3" ", offset = 0)," "CBV(b0, numDescriptors = unbounded, space = " "3" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "3" ", offset = 0))," "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "2" ", offset = 0)," "CBV(b0, numDescriptors = unbounded, space = " "2" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "2" ", offset = 0))," "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "1" ", offset = 0)," "CBV(b0, numDescriptors = unbounded, space = " "1" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "1" ", offset = 0))," "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "0" ", offset = 0)," "CBV(b0, numDescriptors = unbounded, space = " "0" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "0" ", offset = 0))," "DescriptorTable(" "SAMPLER(s0, numDescriptors = unbounded, space = " "0" ", offset = 0))," "StaticSampler(s0, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s1, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s2, space = 100," "filter = FILTER_MIN_MAG_LINEAR_MIP_POINT," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s3, space = 100," "filter = FILTER_MIN_MAG_LINEAR_MIP_POINT," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s4, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s5, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s6, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT," "addressU = TEXTURE_ADDRESS_MIRROR, addressV = TEXTURE_ADDRESS_MIRROR, addressW = TEXTURE_ADDRESS_MIRROR)," "StaticSampler(s7, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT, borderColor = STATIC_BORDER_COLOR_TRANSPARENT_BLACK," "addressU = TEXTURE_ADDRESS_BORDER, addressV = TEXTURE_ADDRESS_BORDER, addressW = TEXTURE_ADDRESS_BORDER)," "StaticSampler(s8, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR," "addressU = TEXTURE_ADDRESS_MIRROR, addressV = TEXTURE_ADDRESS_MIRROR, addressW = TEXTURE_ADDRESS_MIRROR)," "StaticSampler(s9, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR, borderColor = STATIC_BORDER_COLOR_TRANSPARENT_BLACK," "addressU = TEXTURE_ADDRESS_BORDER, addressV = TEXTURE_ADDRESS_BORDER, addressW = TEXTURE_ADDRESS_BORDER)," "StaticSampler(s10, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 8," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s11, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 8," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s12, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 8," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s13, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 8," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s14, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 2," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s15, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 2," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s16, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 2," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s17, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 2," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_WRAP)" )]
-void PS_MAIN( VSOutput In )
+float4 PS_MAIN( VSOutput In ): SV_TARGET
 {
-    INIT_MAIN;
+    //INIT_MAIN;
+    uint bucket = In.TexIndex >> 16;
+    uint layer = In.TexIndex & 0xFFFFu;
+    float4 tex = SampleTex2DArray(gStaticsArrays[bucket], gSamplerAnisotropic, float3(In.Uv, (float)layer));
 
 
 
-    float a = sampleBase(In.TexIndex, In.ClampMode, In.Uv, useLowAF(In.AlphaRef, false)).a;
-    clip(a < In.AlphaRef ? -1.0f : 1.0f);
-    return;
+
+    uint layerOp = (In.Flags >> 6) & 0x3u;
+    float3 t = (layerOp == 2u) ? tex.rgb * 2.0f : tex.rgb;
+
+
+
+    float3 m = lerp(float3(1.0f, 1.0f, 1.0f), t, saturate(In.Fog));
+    return (float4(m, 1.0f));
 }
-#line 39 "FSL/shaders.list"
+#line 211 "FSL/shaders.list"

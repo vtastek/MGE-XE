@@ -7840,6 +7840,14 @@ namespace ForgeRender {
             // timeParams.y = hero blend-pass enabled (statics.vert HERO_PASS=0 clips hero-blend
             // subsets only when set, so toggling the blend pass off falls back to drawing them opaque).
             fd[81] = g_heroBlendPass ? 1.0f : 0.0f;
+            // timeParams.z = Glow in the Dahrk night signal: lighting[35] is the client's signed
+            // margin in GAME HOURS into the period where GitD switches a window mesh to its lit "on"
+            // child (>0 lit, <0 dark), from the same sunrise/sunset boundaries the mod uses. Only
+            // statics.vert reads it, and only for the day/night window subsets (flags bits 3/4); it
+            // adds the per-instance stagger the cull scatter hashed from the instance's absolute
+            // position, so a town does not switch on as one block. Free ride: no wire growth
+            // (lighting[35] was an unused tail slot) and no cbuffer growth (timeParams.z was 0).
+            fd[82] = lighting[35];
         }
         // F12 debug view: debugParams.x at float index 40 (160B = viewProj 16f + 6×float4 24f).
         // 0=normal (frag is byte-for-byte unchanged), 1=depth world-distance grayscale,
@@ -13352,6 +13360,12 @@ namespace ForgeRender {
     }
     constexpr uint32_t kStaticsInstStride = 80;    // 4 world rows (64 B) + params float4 (16 B)
     constexpr float    kStaticsScopeR     = 6144.0f; // probe: draw instances within this radius of the densest cell
+    // Glow in the Dahrk distant windows: half-width, in GAME HOURS, of the per-instance spread in
+    // when a window lights up, so a distant town does not switch on as one block. Mirrors GitD's
+    // config.varianceInMinutes (30) / 60. MUST match kGlowVarianceHours in cullscatter.comp.fsl —
+    // the GPU cull scatter is the primary producer of the instance stream and these two CPU paths
+    // (fallback cull + --forge-statics probe) are its mirrors.
+    constexpr float    kGlowVarianceHours = 0.5f;
 
     struct StaticsSubsetGPU {
         uint32_t vbBase;       // first vertex in the mega-VB (BaseVertexLocation)
@@ -13372,6 +13386,12 @@ namespace ForgeRender {
     Pipeline* g_pStaticsPipelineNone = nullptr; // CULL_MODE_NONE: facing A/B (see g_staticsFacing)
     Shader*   g_pStaticsBlendShader   = nullptr; // Phase 4 hero blend: statics_heroblend.vert + statics_blend.frag
     Pipeline* g_pStaticsBlendPipeline = nullptr; // SRCALPHA/INVSRCALPHA, depth GEQUAL test / no write, cull NONE
+    // GitD lit-window multi-map layers: DESTCOLOR/ZERO (multiply), depth EQUAL test / no write.
+    Shader*   g_pStaticsLayerShader   = nullptr;
+    Pipeline* g_pStaticsLayerPipeline = nullptr;
+    // ...and the ADDITIVE glow-map layer: ONE/ONE, depth EQUAL test / no write.
+    Shader*   g_pStaticsAddShader     = nullptr;
+    Pipeline* g_pStaticsAddPipeline   = nullptr;
     // SUN shadow: DL statics drawn from the sun ortho VP into the MSM moments map (statics.vert +
     // sunshadow_statics.frag → RGBA16_UNORM). Same vertex layout as g_pStaticsPipeline; front = CCW.
     // (kSunShadowRes / g_sunShadowRange / g_drawSunShadow declared early near the atlas constants.)
@@ -13965,6 +13985,81 @@ namespace ForgeRender {
         addPipeline(R, &pd, &g_pStaticsBlendPipeline);
         if (!g_pStaticsBlendPipeline) { std::printf("[forge][dl] addPipeline(statics blend) FAILED\n"); return false; }
 
+        // GitD lit-window multi-map LAYER pass: statics_layer.vert (MULTIPLY_PASS=1 — keeps only the
+        // multiply-layer subsets) + statics_multiply.frag (raw layer texture). MULTIPLY blend
+        // (dst*src via DESTCOLOR/ZERO) with depth EQUAL and NO write: the layer subsets are the SAME
+        // geometry as their base, drawn immediately after it, so EQUAL lands them on exactly the
+        // base's pixels with no z-fight and no double depth write. Cull BACK/CCW like the base draw
+        // (same winding — anything the base culled must stay culled here or a layer would appear on
+        // back faces the base never drew). Non-fatal: on failure the layer pass is skipped and lit
+        // windows fall back to their base layer only (today's appearance).
+        {
+            ShaderLoadDesc mld = {};
+            mld.mVert.pFileName = "statics_layer.vert";
+            mld.mFrag.pFileName = "statics_multiply.frag";
+            addShader(R, &mld, &g_pStaticsLayerShader);
+            if (!g_pStaticsLayerShader) {
+                std::printf("[forge][dl] addShader(statics layer) FAILED — lit-window layers off\n");
+            } else {
+                DepthStateDesc dsM = {};
+                dsM.mDepthTest = true; dsM.mDepthWrite = false; dsM.mDepthFunc = CMP_EQUAL;
+                RasterizerStateDesc rsM = {};
+                rsM.mCullMode = CULL_MODE_BACK; rsM.mFrontFace = FRONT_FACE_CCW;
+                BlendStateDesc bsM = {};
+                bsM.mSrcFactors[0]      = BC_DST_COLOR;   // src*dst ...
+                bsM.mDstFactors[0]      = BC_ZERO;        // ... + 0 = MULTIPLY
+                bsM.mSrcAlphaFactors[0] = BC_ZERO;
+                bsM.mDstAlphaFactors[0] = BC_ONE;         // leave dst alpha alone
+                bsM.mBlendModes[0]      = BM_ADD;
+                bsM.mBlendAlphaModes[0] = BM_ADD;
+                bsM.mColorWriteMasks[0] = COLOR_MASK_ALL;
+                bsM.mRenderTargetMask   = BLEND_STATE_TARGET_0;
+                bsM.mIndependentBlend   = false;
+                g.pDepthState      = &dsM;
+                g.pRasterizerState = &rsM;
+                g.pBlendState      = &bsM;
+                g.pShaderProgram   = g_pStaticsLayerShader;
+                addPipeline(R, &pd, &g_pStaticsLayerPipeline);
+                if (!g_pStaticsLayerPipeline) {
+                    std::printf("[forge][dl] addPipeline(statics layer) FAILED — lit-window layers off\n");
+                }
+            }
+
+            // ...and the ADDITIVE (glow-map) layer: same geometry/depth rules, blend ONE/ONE. MW
+            // folds a glow map with ADD *after* lighting, so this pass is unlit — and it is what
+            // gives a lit window its punch (the multiplicative layers can only ever darken).
+            ShaderLoadDesc ald = {};
+            ald.mVert.pFileName = "statics_addlayer.vert";
+            ald.mFrag.pFileName = "statics_add.frag";
+            addShader(R, &ald, &g_pStaticsAddShader);
+            if (!g_pStaticsAddShader) {
+                std::printf("[forge][dl] addShader(statics add) FAILED — lit-window glow off\n");
+            } else {
+                DepthStateDesc dsA2 = {};
+                dsA2.mDepthTest = true; dsA2.mDepthWrite = false; dsA2.mDepthFunc = CMP_EQUAL;
+                RasterizerStateDesc rsA2 = {};
+                rsA2.mCullMode = CULL_MODE_BACK; rsA2.mFrontFace = FRONT_FACE_CCW;
+                BlendStateDesc bsA2 = {};
+                bsA2.mSrcFactors[0]      = BC_ONE;
+                bsA2.mDstFactors[0]      = BC_ONE;      // additive
+                bsA2.mSrcAlphaFactors[0] = BC_ZERO;
+                bsA2.mDstAlphaFactors[0] = BC_ONE;      // leave dst alpha alone
+                bsA2.mBlendModes[0]      = BM_ADD;
+                bsA2.mBlendAlphaModes[0] = BM_ADD;
+                bsA2.mColorWriteMasks[0] = COLOR_MASK_ALL;
+                bsA2.mRenderTargetMask   = BLEND_STATE_TARGET_0;
+                bsA2.mIndependentBlend   = false;
+                g.pDepthState      = &dsA2;
+                g.pRasterizerState = &rsA2;
+                g.pBlendState      = &bsA2;
+                g.pShaderProgram   = g_pStaticsAddShader;
+                addPipeline(R, &pd, &g_pStaticsAddPipeline);
+                if (!g_pStaticsAddPipeline) {
+                    std::printf("[forge][dl] addPipeline(statics add) FAILED — lit-window glow off\n");
+                }
+            }
+        }
+
         std::printf("[forge][dl] statics pipeline built\n");
         return true;
     }
@@ -14023,7 +14118,18 @@ namespace ForgeRender {
                 if (verts < 0 || faces < 0 || p + vbBytes + ibBytes + 4 > end) { p = end; break; }
                 const uint8_t* vbSrc = p;       p += vbBytes;
                 const uint8_t* ibSrc = p;       p += ibBytes;
-                uint8_t hasAlpha = p[0], hasUVCtrl = p[1]; p += 2;   // bool[2] {hasAlpha, hasUVController}
+                // byte[2] {hasAlpha, texFlags}. texFlags was a plain bool (hasUVController) until the
+                // GitD glow windows needed a variant tag; static_meshes carries no version or magic
+                // header (it is parsed positionally), so the tag WIDENS this byte rather than
+                // appending a field. An install baked before that change has texFlags in {0,1}, so
+                // bits 1/2 read 0 and every subset stays unconditional = exactly the old behaviour.
+                uint8_t hasAlpha = p[0], texFlags = p[1]; p += 2;
+                const bool hasUVCtrl  = (texFlags & 0x1u) != 0;   // NiUVController -> legacy V scroll
+                const bool nightOnly  = (texFlags & 0x2u) != 0;   // GitD "on" child: lit windows
+                const bool dayOnly    = (texFlags & 0x4u) != 0;   // the switch's active (unlit) child
+                // bits3-4 = multi-map layer op: 0 none, 1 MOD, 2 MOD2X, 3 ADD. Mirrors the near
+                // path's FFE reconstruction (MODULATE dark / MODULATE2X detail / ADD glow).
+                const uint32_t layerOp = (texFlags >> 3) & 0x3u;
                 uint16_t pathsize = 0; std::memcpy(&pathsize, p, 2); p += 2;
                 if (p + pathsize > end) { p = end; break; }
                 // texname -> path RELATIVE to statics\textures\, lowercased, .dds. The LOD library
@@ -14057,7 +14163,10 @@ namespace ForgeRender {
                 sub.indexCount = (uint32_t)faces * 3;
                 sub.texSlot    = 0;                       // assigned lazily when first drawn in scope
                 sub.flags      = (hasAlpha ? 0x2u : 0u)      // bit1: alpha-test cutout
-                               | (hasUVCtrl ? 0x4u : 0u);   // bit2: NiUVController -> scroll V (ghostfence)
+                               | (hasUVCtrl ? 0x4u : 0u)    // bit2: NiUVController -> scroll V (ghostfence)
+                               | (nightOnly ? 0x8u : 0u)    // bit3: draw only while windows are lit
+                               | (dayOnly  ? 0x10u : 0u)    // bit4: draw only while they are not
+                               | (layerOp << 6);            // bits6-7: layer op (1 MOD, 2 MOD2X, 3 ADD)
                 if (verts > 0 && faces > 0) {
                     megaVB.insert(megaVB.end(), vbSrc, vbSrc + vbBytes);
                     megaIB.insert(megaIB.end(), ibSrc, ibSrc + ibBytes);
@@ -15078,6 +15187,9 @@ namespace ForgeRender {
             dlMul(m1, Rx, m2);
             dlMul(m2, Tm, W);                             // world (row-major D3DX)
 
+            // GitD window stagger, hashed from the absolute position (see cullscatter.comp.fsl).
+            const float glowStagger = std::sin(pos[0] * 1.35f + pos[1]) * kGlowVarianceHours;
+
             const StaticsDefCPU& def = g_staticsDefs[staticRef];
             for (uint32_t k = 0; k < def.numSubsets; ++k) {
                 uint32_t sid = def.firstSubset + k;
@@ -15086,7 +15198,7 @@ namespace ForgeRender {
                 dst.insert(dst.end(), W, W + 16);
                 dst.push_back((float)g_staticsSubsets[sid].texSlot);
                 dst.push_back((float)g_staticsSubsets[sid].flags);
-                dst.push_back(0.0f); dst.push_back(0.0f);
+                dst.push_back(glowStagger); dst.push_back(0.0f);
             }
         }
 
@@ -16740,6 +16852,11 @@ namespace ForgeRender {
                 std::memcpy(W, gi.world, 16 * sizeof(float));
                 W[12] -= eye[0]; W[13] -= eye[1]; W[14] -= eye[2];   // camera-relative shift
 
+                // GitD window stagger — hashed from the ABSOLUTE position, exactly as
+                // cullscatter.comp.fsl does it (the GPU cull is the primary path; this is the
+                // fallback and the two must agree or windows would pop when the mode is toggled).
+                const float glowStagger = std::sin(gi.posX * 1.35f + gi.posY) * kGlowVarianceHours;
+
                 for (uint32_t k = 0; k < gi.numSubsets; ++k) {
                     uint32_t sid = gi.firstSubset + k;
                     // texSlot = (bucket<<16)|layer, resolved once in buildStaticsTextureArrays; all
@@ -16750,7 +16867,7 @@ namespace ForgeRender {
                     dst.insert(dst.end(), W, W + 16);
                     dst.push_back((float)ts);
                     dst.push_back((float)g_staticsSubsets[sid].flags);
-                    dst.push_back(0.0f); dst.push_back(0.0f);
+                    dst.push_back(glowStagger); dst.push_back(0.0f);
                 }
             }
         }
@@ -16918,6 +17035,34 @@ namespace ForgeRender {
             } else {
                 cmdExecuteIndirect(g_live.pCmd, INDIRECT_DRAW_INDEX, g_liveLastSubsets,
                                    g_pStaticsArgsRing, 0, nullptr, 0);
+            }
+
+            // GitD lit-window multi-map LAYER pass. Same VB/IB/instance stream, same arg buffer,
+            // same bindings — only the PSO changes (multiply blend, depth EQUAL, no write) and the
+            // vertex clip flips (MULTIPLY_PASS=1 keeps only the layer subsets, which the draw above
+            // clipped). Must run HERE, immediately after the base draw and before anything else
+            // touches the RT, so each layer multiplies onto its own base pixels. Nothing to do when
+            // the bake has no layers — the clipped subsets simply produce no raster work.
+            if (g_pStaticsLayerPipeline) {
+                cmdBindPipeline(g_live.pCmd, g_pStaticsLayerPipeline);
+                if (gpuDraw) {
+                    cmdExecuteIndirect(g_live.pCmd, INDIRECT_DRAW_INDEX, g_live.cullSubsetCount,
+                                       g_live.pGpuArgs, 0, nullptr, 0);
+                } else {
+                    cmdExecuteIndirect(g_live.pCmd, INDIRECT_DRAW_INDEX, g_liveLastSubsets,
+                                       g_pStaticsArgsRing, 0, nullptr, 0);
+                }
+            }
+            // ADD (glow-map) layers last, so they land on the finished multiplicative stack.
+            if (g_pStaticsAddPipeline) {
+                cmdBindPipeline(g_live.pCmd, g_pStaticsAddPipeline);
+                if (gpuDraw) {
+                    cmdExecuteIndirect(g_live.pCmd, INDIRECT_DRAW_INDEX, g_live.cullSubsetCount,
+                                       g_live.pGpuArgs, 0, nullptr, 0);
+                } else {
+                    cmdExecuteIndirect(g_live.pCmd, INDIRECT_DRAW_INDEX, g_liveLastSubsets,
+                                       g_pStaticsArgsRing, 0, nullptr, 0);
+                }
             }
         }
         cmdEndDebugMarker(g_live.pCmd);
@@ -18222,6 +18367,10 @@ namespace ForgeRender {
         if (g_pStaticsInst)     { removeResource(g_pStaticsInst);     g_pStaticsInst = nullptr; }
         if (g_pStaticsVB)       { removeResource(g_pStaticsVB);       g_pStaticsVB = nullptr; }
         if (g_pStaticsIB)       { removeResource(g_pStaticsIB);       g_pStaticsIB = nullptr; }
+        if (g_pStaticsAddPipeline) { removePipeline(R, g_pStaticsAddPipeline); g_pStaticsAddPipeline = nullptr; }
+        if (g_pStaticsAddShader) { removeShader(R, g_pStaticsAddShader); g_pStaticsAddShader = nullptr; }
+        if (g_pStaticsLayerPipeline) { removePipeline(R, g_pStaticsLayerPipeline); g_pStaticsLayerPipeline = nullptr; }
+        if (g_pStaticsLayerShader) { removeShader(R, g_pStaticsLayerShader); g_pStaticsLayerShader = nullptr; }
         if (g_pStaticsBlendPipeline) { removePipeline(R, g_pStaticsBlendPipeline); g_pStaticsBlendPipeline = nullptr; }
         if (g_pStaticsPipelineNone) { removePipeline(R, g_pStaticsPipelineNone); g_pStaticsPipelineNone = nullptr; }
         if (g_pStaticsPipelineCW)   { removePipeline(R, g_pStaticsPipelineCW);   g_pStaticsPipelineCW = nullptr; }

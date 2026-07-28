@@ -196,6 +196,32 @@
 #include "statics_blend.frag.fsl"
 #end
 
+// GitD lit-window multi-map LAYER pass: the SAME statics.vert body built MULTIPLY_PASS=1 (keeps only
+// the multiply-layer subsets, clips the rest) + a frag that outputs the layer's raw texture. Drawn
+// right after the opaque statics draw on a DESTCOLOR/ZERO depth-EQUAL/no-write PSO, so each layer
+// multiplies onto its own base pixels. Reuses the same gArgs/instance stream; the opaque
+// statics.vert (MULTIPLY_PASS=0) clips these same subsets.
+#vert statics_layer.vert
+#define LAYER_PASS 1
+#include "statics.vert.fsl"
+#end
+
+#frag statics_multiply.frag
+#include "statics_multiply.frag.fsl"
+#end
+
+// ...and the ADDITIVE (glow-map) layer pass: LAYER_PASS=2 keeps only the ADD layers, drawn ONE/ONE.
+// MW folds a glow map with ADD after lighting, so this is unlit and is what gives a lit window its
+// punch — without it the stack can only darken and windows read as barely emissive.
+#vert statics_addlayer.vert
+#define LAYER_PASS 2
+#include "statics.vert.fsl"
+#end
+
+#frag statics_add.frag
+#include "statics_add.frag.fsl"
+#end
+
 // Forge water takeover (WT1): host-generated geo-clipmap water. Position-only verts + per-instance
 // clipmap level; reuses opaque.srt.h / DefaultRootSignature (worlds+params ride gBatch, 4 water SRVs
 // appended to the PerFrame set). Depth-write reverse-Z GEQUAL, cull NONE, frag outputs alpha=1.

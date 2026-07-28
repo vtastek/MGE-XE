@@ -1,0 +1,42 @@
+// mgeHost64 — distant STATICS multi-map ADDITIVE (glow) layer, fragment stage.
+//
+// LAYER_PASS 2 of the split described in statics.vert.fsl. MW's fixed-function chain folds a GLOW
+// map with ADD (multimap.frag: `c += t.rgb`), not MODULATE — and it is added AFTER the lit term, so
+// it is deliberately UNLIT. That additive layer is what gives a lit window its punch; baking only
+// the multiplicative layers is what left them reading as "no emissive or very weak emissive",
+// because every MOD layer can only ever darken what the base laid down.
+//
+// Blend is ONE/ONE, depth EQUAL, no depth write — the layer is the same geometry as its base, drawn
+// straight after it, so it lands on exactly the base's pixels.
+//
+// Fog fades the ADDEND toward 0 (the ADDITIVE identity), the mirror of statics_multiply.frag fading
+// its multiplier toward 1. A fully fogged window therefore gains no glow, which is what the base
+// pass's own fog blend already implies.
+
+#include "opaque.srt.h"
+
+// MUST stay byte-identical to statics.vert.fsl's VSOutput (shared vertex container — a mismatched
+// frag signature hangs the GPU; see [[project_forge_shared_frag_vsoutput]]).
+STRUCT(VSOutput)
+{
+    DATA(float4,           Position, SV_Position);
+    DATA(float2,           Uv,       TEXCOORD0);
+    DATA(CENTROID(float4), Color,    COLOR);
+    DATA(CENTROID(float),  Fog,      TEXCOORD1);
+    DATA(FLAT(uint),       TexIndex, TEXCOORD2);
+    DATA(FLAT(uint),       Flags,    TEXCOORD3);
+    DATA(float3,           WorldPos, TEXCOORD4);
+    DATA(float3,           WorldNormal, TEXCOORD5);
+    DATA(CENTROID(float3), SunLight, TEXCOORD6);
+};
+
+ROOT_SIGNATURE(DefaultRootSignature)
+float4 PS_MAIN( VSOutput In )
+{
+    INIT_MAIN;
+    uint bucket = In.TexIndex >> 16;
+    uint layer  = In.TexIndex & 0xFFFFu;
+    float4 tex = SampleTex2DArray(gStaticsArrays[bucket], gSamplerAnisotropic, float3(In.Uv, (float)layer));
+
+    RETURN(float4(tex.rgb * saturate(In.Fog), 0.0f));
+}

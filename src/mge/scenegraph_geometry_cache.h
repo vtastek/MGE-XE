@@ -227,6 +227,25 @@ namespace MGE::GeometryCache {
         // this the freshly-culled 3rd-person body keeps rendering until the eviction
         // sweep. Consumers skip entries with suppressedFrame == currentFrame().
         uint64_t suppressedFrame;
+        // Nearest NiSwitchNode ancestor at capture (null for the overwhelming majority of
+        // entries), plus the index of the switch child this shape hangs under. A NiSwitchNode
+        // displays ONLY the child at switchIndex — Glow in the Dahrk's "NightDaySwitch" flips
+        // between coincident OFF / ON / INT-DAY window variants that differ only in material
+        // (ON/INT-DAY are emissive white, OFF is not).
+        //
+        // walk() honours switchIndex (it descends the active child only), but it is the ONLY
+        // thing that did: ensureLive()'s first-sight capture off the engine classify feed does
+        // not, and the eviction sweep's parentVerdict only asks whether the chain still reaches
+        // a live root — an INACTIVE switch child is still fully parented, so a variant captured
+        // while it was active never left the cache. Both variants then sat in the host's draw
+        // list at identical transforms and the winner was decided by draw order, not by the flag
+        // that is supposed to decide it (the day/night window glow bug: MW drew the lit variant,
+        // we drew whichever landed last).
+        //
+        // switchOwner is a raw engine node, so it is vtable-validated before every deref (same
+        // guard the eviction climb uses) and cleared by purgeAll.
+        const void* switchOwner = nullptr;
+        int         switchChild = -1;
         // The GeometryData* this entry was built from. A NiTriShape address can be
         // recycled onto a NEW shape (cell transitions) while the entry survives —
         // with deferred eviction + the far-keep hysteresis that window is real, so

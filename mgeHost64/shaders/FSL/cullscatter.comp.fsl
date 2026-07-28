@@ -15,6 +15,17 @@
 
 #define kMaxInst 65536u
 
+// Glow in the Dahrk distant windows: the per-instance lighting-up stagger, in GAME HOURS, so a town
+// does not switch on as one block. Mirrors GitD's own per-reference hash (main.lua:193,
+// sin(position.x * 1.35 + position.y) * varianceInMinutes/60) so near and far stagger in step rather
+// than fighting. It is hashed HERE, from the instance's ABSOLUTE world position, and not in
+// statics.vert: the vertex stream's translation row is camera-RELATIVE, so hashing it there would
+// re-roll every building's offset as the player walks and make windows flicker at their switch
+// moment. Written into the otherwise-unused InstParams.z of every instance (free — the slot was a
+// hard 0), where statics.vert adds it to gFrameData.timeParams.z. The CPU cull fallback
+// (forgerender.cpp) and the --forge-statics probe compute the identical value.
+#define kGlowVarianceHours 0.5f
+
 ROOT_SIGNATURE(ComputeRootSignature)
 NUM_THREADS(64, 1, 1)
 void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
@@ -64,6 +75,10 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
     r3.y -= gCullParams.eye.y;
     r3.z -= gCullParams.eye.z;
 
+    // Per-instance GitD window stagger from the ABSOLUTE position (see kGlowVarianceHours). Constant
+    // for a given instance for the whole session, so it can never flicker.
+    float glowStagger = sin(inst.posX * 1.35f + inst.posY) * kGlowVarianceHours;
+
     for (uint k = 0u; k < inst.numSubsets; ++k)
     {
         uint sid = inst.firstSubset + k;
@@ -85,7 +100,7 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
         gInstOut[b + 14u] = asuint(r3.z); gInstOut[b + 15u] = asuint(r3.w);
         gInstOut[b + 16u] = asuint((float)s.texSlot);
         gInstOut[b + 17u] = asuint((float)s.flags);
-        gInstOut[b + 18u] = asuint(0.0f);
+        gInstOut[b + 18u] = asuint(glowStagger);
         gInstOut[b + 19u] = asuint(0.0f);
     }
     RETURN();

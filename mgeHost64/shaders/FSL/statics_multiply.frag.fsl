@@ -1,0 +1,61 @@
+// mgeHost64 — distant STATICS multi-map LAYER (fragment stage).
+//
+// The second half of the MULTIPLY_PASS split described in statics.vert.fsl. A Glow in the Dahrk lit
+// window is a multi-map material: 2-3 texture layers, each on its OWN UV set, combined by MW's
+// fixed-function stage chain with MODULATE. Distant statics carry one texture + one UV set per
+// subset, so the bake emits one subset per layer and this pass multiplies the layers above the base
+// back onto it (blend DESTCOLOR/ZERO, depth EQUAL, no depth write — identical geometry to the base
+// draw, so it lands on exactly the base's pixels).
+//
+// This outputs the layer's RAW texture colour and NOTHING else: no lighting, no point lights, no
+// tonemap, no fog. The base pass already applied all of that, and the fixed-function chain combines
+// the texture stages BEFORE modulating by the lit vertex colour — so
+//   (base*lit) * dark * detail  ==  (base*dark*detail) * lit
+// which is the FFE result exactly. Re-lighting here would square the lighting instead.
+//
+// KNOWN APPROXIMATION — fog. The base pass has already blended toward the fog colour, so a
+// multiply here scales the fogged pixel rather than the unfogged one: exact at zero fog and exact
+// at full fog, slightly too dark in between. Making it exact needs all layers in ONE draw (extra
+// UV sets per vertex, the way the near multimap.vert carries Uv0..Uv3), which the 20-byte
+// positional static_meshes vertex cannot express without a side file. Deliberate trade.
+//
+// The alpha test deliberately does NOT run here: the base pass owns the cutout decision, and a
+// layer's alpha belongs to its own texture, not to the silhouette.
+
+#include "opaque.srt.h"
+
+// MUST stay byte-identical to statics.vert.fsl's VSOutput (shared vertex container — a mismatched
+// frag signature hangs the GPU; see [[project_forge_shared_frag_vsoutput]]). Unused fields stay
+// declared for exactly that reason.
+STRUCT(VSOutput)
+{
+    DATA(float4,           Position, SV_Position);
+    DATA(float2,           Uv,       TEXCOORD0);
+    DATA(CENTROID(float4), Color,    COLOR);
+    DATA(CENTROID(float),  Fog,      TEXCOORD1);
+    DATA(FLAT(uint),       TexIndex, TEXCOORD2);
+    DATA(FLAT(uint),       Flags,    TEXCOORD3);
+    DATA(float3,           WorldPos, TEXCOORD4);
+    DATA(float3,           WorldNormal, TEXCOORD5);
+    DATA(CENTROID(float3), SunLight, TEXCOORD6);
+};
+
+ROOT_SIGNATURE(DefaultRootSignature)
+float4 PS_MAIN( VSOutput In )
+{
+    INIT_MAIN;
+    uint bucket = In.TexIndex >> 16;
+    uint layer  = In.TexIndex & 0xFFFFu;
+    float4 tex = SampleTex2DArray(gStaticsArrays[bucket], gSamplerAnisotropic, float3(In.Uv, (float)layer));
+
+    // flags bits6-7: 1 = MOD (c *= t), 2 = MOD2X (c *= t*2). MOD2X is not cosmetic — a detail map is
+    // grey-centred, so 0.5 is its neutral value and plain MOD halves the whole window. This is the
+    // same op table multimap.frag applies on the near path.
+    uint   layerOp = (In.Flags >> 6) & 0x3u;
+    float3 t = (layerOp == 2u) ? tex.rgb * 2.0f : tex.rgb;
+
+    // Fade the multiplier toward 1.0 (the multiplicative identity) with distance fog, so a fully
+    // fogged window is not darkened by its own layers. Fog is the base pass's own interpolator.
+    float3 m = lerp(float3(1.0f, 1.0f, 1.0f), t, saturate(In.Fog));
+    RETURN(float4(m, 1.0f));
+}
