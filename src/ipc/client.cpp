@@ -90,32 +90,52 @@ namespace IPC {
 
 	void Client::startWatcher() {
 		// Dev-only FSL hot-reload watcher: recompiles + deploys shaders on save so the host's
-		// dxil-mtime auto-reload makes edit->live automatic. Two gates keep it out of every non-dev run:
-		//   (1) the dev python + script paths must exist (never true in a shipped tree), AND
-		//   (2) the running game must BE the install the watcher deploys into (C:\mgem\morrowind64 — see
-		//       watch_shaders.py DEPLOY). So the RELEASE install (e.g. morrowinddonottouch) run on this
-		//       same dev machine gets NO watcher and NO window.
-		// In the dev install it launches with a MINIMIZED, non-activating console (SW_SHOWMINNOACTIVE):
-		// its compile/deploy log is there when wanted but it never steals focus from the game or covers it.
-		static const char* kPython = "C:\\Users\\devbox\\AppData\\Local\\Programs\\Python\\Python311\\python.exe";
-		static const char* kScript = "C:\\projects\\mgexe\\MGE-XE\\mgeHost64\\shaders\\watch_shaders.py";
-		if (GetFileAttributesA(kPython) == INVALID_FILE_ATTRIBUTES ||
-			GetFileAttributesA(kScript) == INVALID_FILE_ATTRIBUTES) {
-			return;   // not a dev tree — no watcher
-		}
-		// Gate (2): only the DEV install (the one watch_shaders.py DEPLOYs to) runs the watcher.
+		// dxil-mtime auto-reload makes edit->live automatic.
+		//
+		// Opt-in PER INSTALL via a marker file next to the running Morrowind.exe:
+		//
+		//     mgeXE_fslwatch.txt   — one line, the command to run, e.g.
+		//     "<...>\python.exe" "<repo>\mgeHost64\shaders\watch_shaders.py" "<install>\DIRECT3D12"
+		//
+		// So every machine-specific path — and every developer's user name — lives in an UNTRACKED
+		// file on the dev box, not in this source and not in the shipped mgecore.dll. It used to be a
+		// pair of hardcoded absolute paths, which meant `strings mgecore.dll` handed every player the
+		// build machine's profile path. A shipped install has no marker file and starts nothing; and
+		// because the marker is per-DIRECTORY, a release install on the same dev machine stays quiet
+		// without this code having to pattern-match install paths (the old gate (2)).
+		//
+		// Not new attack surface: anything that can write next to Morrowind.exe can already replace
+		// mgecore.dll outright.
+		char cmd[1024] = { 0, };
 		{
-			char exePath[MAX_PATH];
-			DWORD n = GetModuleFileNameA(NULL, exePath, MAX_PATH);
+			char marker[MAX_PATH];
+			DWORD n = GetModuleFileNameA(NULL, marker, MAX_PATH);
 			if (n == 0 || n >= MAX_PATH) { return; }
-			for (DWORD i = 0; i <= n; ++i) {
-				const char c = exePath[i];
-				exePath[i] = (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c;   // lowercase in place
-			}
-			if (!std::strstr(exePath, "\\mgem\\morrowind64\\")) {
-				return;   // release / other install → no watcher, no window
+			char* slash = std::strrchr(marker, '\\');
+			if (slash == nullptr) { return; }
+			static const char kMarkerName[] = "mgeXE_fslwatch.txt";
+			if (std::size_t(slash + 1 - marker) + sizeof(kMarkerName) > MAX_PATH) { return; }
+			std::strcpy(slash + 1, kMarkerName);
+
+			HANDLE f = CreateFileA(marker, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+			                       OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+			if (f == INVALID_HANDLE_VALUE) { return; }   // no marker → not a dev install, no watcher
+			DWORD got = 0;
+			const BOOL read = ReadFile(f, cmd, sizeof(cmd) - 1, &got, NULL);
+			CloseHandle(f);
+			if (!read) { return; }
+			cmd[got] = 0;
+			for (DWORD i = 0; i < got; ++i) {          // first line only
+				if (cmd[i] == '\r' || cmd[i] == '\n') { cmd[i] = 0; break; }
 			}
 		}
+		char* run = cmd;
+		while (*run != 0 && (unsigned char)*run <= ' ') { ++run; }
+		for (std::size_t len = std::strlen(run); len > 0 && (unsigned char)run[len - 1] <= ' '; --len) {
+			run[len - 1] = 0;
+		}
+		if (*run == 0) { return; }   // empty marker = deliberately disabled
+
 		// Job object so the watcher dies with us even on a hard exit (~Client may not run): the OS
 		// kills every process in the job when the last handle to it closes, i.e. when WE terminate.
 		m_watcherJob = CreateJobObjectA(NULL, NULL);
@@ -124,17 +144,17 @@ namespace IPC {
 			jeli.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
 			SetInformationJobObject(m_watcherJob, JobObjectExtendedLimitInformation, &jeli, sizeof(jeli));
 		}
-		char cmd[768];
-		std::sprintf(cmd, "\"%s\" \"%s\"", kPython, kScript);
 		STARTUPINFOA si = {}; si.cb = sizeof(si);
 		// Start the console MINIMIZED and WITHOUT activating it, so it never steals focus from the game
 		// or sits on top of it (CREATE_NEW_CONSOLE alone made a normal foreground window).
 		si.dwFlags     = STARTF_USESHOWWINDOW;
 		si.wShowWindow = SW_SHOWMINNOACTIVE;
 		PROCESS_INFORMATION pi = {};
+		// lpApplicationName = NULL: the marker line IS the command line, quotes and all, so the
+		// interpreter and its arguments are the dev's choice and nothing is assumed here.
 		// CREATE_NEW_CONSOLE keeps the watcher's own log window (minimized, per si above). Suspended so
 		// we can assign it to the job BEFORE it runs.
-		if (CreateProcessA(kPython, cmd, NULL, NULL, FALSE, CREATE_NEW_CONSOLE | CREATE_SUSPENDED, NULL, NULL, &si, &pi)) {
+		if (CreateProcessA(NULL, run, NULL, NULL, FALSE, CREATE_NEW_CONSOLE | CREATE_SUSPENDED, NULL, NULL, &si, &pi)) {
 			if (m_watcherJob) { AssignProcessToJobObject(m_watcherJob, pi.hProcess); }
 			ResumeThread(pi.hThread);
 			m_watcherProcess = pi.hProcess;

@@ -594,7 +594,9 @@ namespace ForgeRender {
         std::printf("[forge] RDOC: GetAPI -> %d (table=%p)\n", ok, (void*)g_rdoc);
         if (!ok || !g_rdoc) { g_rdoc = nullptr; return false; }
         // Frame number gets appended; the .rdc lands next to the game so the user can open it.
-        g_rdoc->SetCaptureFilePathTemplate("C:\\mgem\\morrowind64\\forge_gtao");
+        // RELATIVE on purpose — our cwd IS the install dir, so this follows whatever install is
+        // running instead of writing into one developer's hardcoded path.
+        g_rdoc->SetCaptureFilePathTemplate("forge_gtao");
         std::printf("[forge] RDOC capture armed (start=%p end=%p)\n",
                     (void*)g_rdoc->StartFrameCapture, (void*)g_rdoc->EndFrameCapture);
         return true;
@@ -782,7 +784,7 @@ namespace ForgeRender {
             std::printf("[forge] scene-probe: renderScene #3 (multi-map only)...\n");
             // PIX: capture THIS renderScene (linearize + GTAO dispatches + colour pass) if armed.
             if (g_pixBegin) {
-                struct GpuCapParams { const wchar_t* fileName; } params = { L"C:\\mgem\\morrowind64\\forge_gtao.wpix" };
+                struct GpuCapParams { const wchar_t* fileName; } params = { L"forge_gtao.wpix" };   // relative: cwd = install dir
                 long hr = g_pixBegin(&params);
                 std::printf("[forge] PIX: BeginProgrammaticGpuCapture -> hr=0x%08lX\n", hr);
             }
@@ -796,11 +798,11 @@ namespace ForgeRender {
                              nullptr, 0, 0);
             if (g_rdoc) {
                 uint32_t cap = g_rdoc->EndFrameCapture(nullptr, nullptr);
-                std::printf("[forge] RDOC: EndFrameCapture -> %u (capture: C:\\mgem\\morrowind64\\forge_gtao_frameNNN.rdc)\n", cap);
+                std::printf("[forge] RDOC: EndFrameCapture -> %u (capture: forge_gtao_frameNNN.rdc, in the install dir)\n", cap);
             }
             if (g_pixEnd) {
                 long hr = g_pixEnd();
-                std::printf("[forge] PIX: EndProgrammaticGpuCapture -> hr=0x%08lX (capture: C:\\mgem\\morrowind64\\forge_gtao.wpix)\n", hr);
+                std::printf("[forge] PIX: EndProgrammaticGpuCapture -> hr=0x%08lX (capture: forge_gtao.wpix, in the install dir)\n", hr);
             }
             std::printf("[forge] scene-probe: multi-map renderScene returned %d (multiMapDrawn=%u) -> expect CENTRE ~248\n",
                         (int)ok, lastMultiMapDrawn());

@@ -10,8 +10,13 @@ This script is exactly those two missing steps, on every save:
 
 RUN WITH WINDOWS PYTHON (fsl.py shells out to the bundled DXC; WSL python will NOT work):
 
-    & "C:\\Users\\devbox\\AppData\\Local\\Programs\\Python\\Python311\\python.exe" `
-      "C:\\projects\\mgexe\\MGE-XE\\mgeHost64\\shaders\\watch_shaders.py"
+    & "<your-python>\python.exe" "<repo>\mgeHost64\shaders\watch_shaders.py" "<install>\DIRECT3D12"
+
+The repo half is found from this file's own location, so the only argument is the DIRECT3D12 folder
+of the install to deploy into (or set MGEXE_FSL_DEPLOY instead). Nothing machine-specific is stored
+in the repo — that is deliberate: hardcoding it here once leaked a developer's user name into every
+shipped mgecore.dll. mgecore launches this automatically when the install has an untracked
+mgeXE_fslwatch.txt holding that command line (see IPC::Client::startWatcher).
 
 Leave it running in its own terminal while the game is up. It prints what it does on EVERY save, so
 if a save produces no "[compile] ok / [deploy] ok" lines, detection failed; if it prints a compile
@@ -24,8 +29,9 @@ import shutil
 import traceback
 import subprocess
 
-ROOT      = r"C:\projects\mgexe\MGE-XE"
-SHADERS   = os.path.join(ROOT, "mgeHost64", "shaders")
+HERE      = os.path.dirname(os.path.abspath(__file__))          # <repo>\mgeHost64\shaders
+ROOT      = os.path.abspath(os.path.join(HERE, "..", ".."))     # <repo>
+SHADERS   = HERE
 FSL_DIR   = os.path.join(SHADERS, "FSL")
 GEN_DIR   = os.path.join(SHADERS, "gen")
 BIN_DIR   = os.path.join(SHADERS, "bin")
@@ -33,7 +39,9 @@ BIN_D3D12 = os.path.join(BIN_DIR, "DIRECT3D12")
 FSL_PY    = os.path.join(ROOT, "3rdparty", "The-Forge", "Common_3", "Tools",
                          "ForgeShadingLanguage", "fsl.py")
 LIST_REL  = os.path.join("FSL", "shaders.list")     # relative to SHADERS (fsl.py cwd)
-DEPLOY    = r"C:\mgem\morrowind64\DIRECT3D12"
+# Deploy target: argv[1], else $MGEXE_FSL_DEPLOY. No default — guessing an install path is how the
+# hardcoded paths got here in the first place, and a wrong guess would silently deploy nowhere.
+DEPLOY    = (sys.argv[1] if len(sys.argv) > 1 else os.environ.get("MGEXE_FSL_DEPLOY", "")).strip('"')
 
 # The host watches this file's mtime; copy it LAST + atomically so its deps are already in place.
 TRIGGER      = "gtao.comp_0.dxil"
@@ -49,6 +57,12 @@ def preflight():
     ok = True
     log("watcher starting")
     log("  python : %s" % sys.executable)
+    log("  repo   : %s" % ROOT)
+    if not DEPLOY:
+        log("  deploy   : *** NOT SET ***")
+        log("PREFLIGHT FAILED - pass the install's DIRECT3D12 dir as argv[1], or set "
+            "MGEXE_FSL_DEPLOY. Watcher will idle.")
+        return False
     for label, p, isdir in (("fsl.py", FSL_PY, False), ("FSL dir", FSL_DIR, True),
                             ("bin/D3D12", BIN_D3D12, True), ("deploy", DEPLOY, True)):
         exists = os.path.isdir(p) if isdir else os.path.isfile(p)
@@ -126,7 +140,11 @@ def deploy():
 
 
 def main():
-    preflight()
+    if not preflight():
+        # Idle rather than exit: mgecore starts us in our OWN console, so returning would close the
+        # window and take the diagnostic above with it.
+        while True:
+            time.sleep(60)
     last = snapshot()
     log("ready — edit + save a .fsl in FSL/ to trigger a rebuild.")
     while True:

@@ -121,6 +121,8 @@
     <Link>
       <SubSystem>Console</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
+      <!-- PDB name only, not the build machine's path to it — see MGE-XE.vcxproj. -->
+      <AdditionalOptions>/PDBALTPATH:$(TargetName).pdb %(AdditionalOptions)</AdditionalOptions>
     </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">
@@ -137,6 +139,8 @@
       <EnableCOMDATFolding>true</EnableCOMDATFolding>
       <OptimizeReferences>true</OptimizeReferences>
       <GenerateDebugInformation>true</GenerateDebugInformation>
+      <!-- PDB name only, not the build machine's path to it — see MGE-XE.vcxproj. -->
+      <AdditionalOptions>/PDBALTPATH:$(TargetName).pdb %(AdditionalOptions)</AdditionalOptions>
     </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
@@ -151,6 +155,8 @@
     <Link>
       <SubSystem>Console</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
+      <!-- PDB name only, not the build machine's path to it — see MGE-XE.vcxproj. -->
+      <AdditionalOptions>/PDBALTPATH:$(TargetName).pdb %(AdditionalOptions)</AdditionalOptions>
       <AdditionalDependencies>d3dx9.lib;vulkan-1.lib;winmm.lib;amd_ags_x64.lib;nvapi64.lib;dxcompiler.lib;WinPixEventRuntime.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <AdditionalLibraryDirectories>$(SolutionDir)3rdparty\The-Forge\Common_3\Graphics\ThirdParty\OpenSource\ags\ags_lib\lib;$(SolutionDir)3rdparty\The-Forge\Common_3\Graphics\ThirdParty\OpenSource\nvapi\amd64;$(SolutionDir)3rdparty\The-Forge\Common_3\Graphics\ThirdParty\OpenSource\DirectXShaderCompiler\lib\x64;$(SolutionDir)3rdparty\The-Forge\Common_3\Graphics\ThirdParty\OpenSource\winpixeventruntime\bin;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
     </Link>
@@ -176,6 +182,8 @@
       <EnableCOMDATFolding>true</EnableCOMDATFolding>
       <OptimizeReferences>true</OptimizeReferences>
       <GenerateDebugInformation>true</GenerateDebugInformation>
+      <!-- PDB name only, not the build machine's path to it — see MGE-XE.vcxproj. -->
+      <AdditionalOptions>/PDBALTPATH:$(TargetName).pdb %(AdditionalOptions)</AdditionalOptions>
       <AdditionalDependencies>d3dx9.lib;vulkan-1.lib;winmm.lib;amd_ags_x64.lib;nvapi64.lib;dxcompiler.lib;WinPixEventRuntime.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <AdditionalLibraryDirectories>$(SolutionDir)3rdparty\The-Forge\Common_3\Graphics\ThirdParty\OpenSource\ags\ags_lib\lib;$(SolutionDir)3rdparty\The-Forge\Common_3\Graphics\ThirdParty\OpenSource\nvapi\amd64;$(SolutionDir)3rdparty\The-Forge\Common_3\Graphics\ThirdParty\OpenSource\DirectXShaderCompiler\lib\x64;$(SolutionDir)3rdparty\The-Forge\Common_3\Graphics\ThirdParty\OpenSource\winpixeventruntime\bin;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
     </Link>
@@ -201,6 +209,8 @@
       <EnableCOMDATFolding>true</EnableCOMDATFolding>
       <OptimizeReferences>true</OptimizeReferences>
       <GenerateDebugInformation>true</GenerateDebugInformation>
+      <!-- PDB name only, not the build machine's path to it — see MGE-XE.vcxproj. -->
+      <AdditionalOptions>/PDBALTPATH:$(TargetName).pdb %(AdditionalOptions)</AdditionalOptions>
       <AdditionalDependencies>d3dx9.lib;vulkan-1.lib;winmm.lib;amd_ags_x64.lib;nvapi64.lib;dxcompiler.lib;WinPixEventRuntime.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <AdditionalLibraryDirectories>$(SolutionDir)3rdparty\The-Forge\Common_3\Graphics\ThirdParty\OpenSource\ags\ags_lib\lib;$(SolutionDir)3rdparty\The-Forge\Common_3\Graphics\ThirdParty\OpenSource\nvapi\amd64;$(SolutionDir)3rdparty\The-Forge\Common_3\Graphics\ThirdParty\OpenSource\DirectXShaderCompiler\lib\x64;$(SolutionDir)3rdparty\The-Forge\Common_3\Graphics\ThirdParty\OpenSource\winpixeventruntime\bin;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
     </Link>

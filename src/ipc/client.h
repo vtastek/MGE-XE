@@ -76,8 +76,9 @@ namespace IPC {
 		std::uint32_t m_nearCellMask = 0;
 		float m_nearCellReach = 0.0f;
 
-		// Dev FSL hot-reload watcher: a Windows-python child (watch_shaders.py) launched alongside
-		// the host in a dev tree, killed with it. INVALID when not spawned (shipped tree / no python).
+		// Dev FSL hot-reload watcher: a child launched alongside the host and killed with it, opt-in
+		// per install via an untracked mgeXE_fslwatch.txt next to Morrowind.exe (see startWatcher —
+		// no dev path is compiled in). INVALID when not spawned, which is every shipped install.
 		HANDLE m_watcherProcess;
 		// Job object owning the watcher, with JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: when THIS process
 		// (Morrowind) dies — even on a hard exit where ~Client never runs — the OS closes the job
@@ -102,7 +103,7 @@ namespace IPC {
 		bool beginRpc(Command command);
 		bool beginGeomRpc(Command command);
 		WakeReason waitGeomCompletion(DWORD ms = MaxWait);
-		void startWatcher();   // dev FSL hot-reload watcher; no-op outside a dev tree
+		void startWatcher();   // dev FSL hot-reload watcher; no-op without the marker file
 		void stopWatcher();
 
 	public:
