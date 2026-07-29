@@ -6286,13 +6286,21 @@ namespace {
     // block — reports `g_terrainReady && g_drawTerrain` to the client as terrainOwned, and that is
     // what decides whether MW may stop drawing its own near land.
     bool     g_terrainReady       = false;
-    // ...and the safety valve on that report. T3's risk is asymmetric: if the host silently lacks the
-    // LAND record for the cell the camera stands in, suppressing MW's land turns a quality difference
-    // into a HOLE IN THE WORLD. That is the exact failure the ini/plugin mismatch produces (MO2's
-    // virtual ini, a Wrye Mash reorder, a plugin we failed to parse), and it is invisible from a
-    // plugin-name diff — the lists can match perfectly and a cell still be absent. So test the
-    // consequence, not the cause: when the eye's own cell is missing, drop ownership and let MW draw.
-    // Overlap in the neighbouring cells is the cheaper failure, exactly as the near-cut note argues.
+    // DIAGNOSTIC ONLY — this does not touch ownership. It was built as a safety valve for T3's
+    // asymmetric risk (if the host lacks the LAND record under the camera, suppressing MW's land
+    // turns a quality difference into a HOLE IN THE WORLD) and it does not work, because the test it
+    // performs cannot distinguish the two cases it must:
+    //   "no LAND record here" = the edge of the world. Most of the grid rectangle. MW draws nothing
+    //                           there either, so there is no hole and nothing to hand back.
+    //   "no LAND record here" = we failed to parse the plugin that has it. A real hole.
+    // Both are slotAt() < 0. Wired to ownership it fired continuously at sea, where it made things
+    // strictly worse: MW resumed drawing its near land while the host kept drawing the same
+    // heightfield through it, and two coplanar producers z-fight into a checkerboard.
+    // The guard that CAN work needs MW's answer, not ours: MW knows whether a loaded cell has a
+    // landscape (TES3::Cell), and a cell MW has land for that we have no record for is a true gap by
+    // construction — and silent over water, because MW has nothing there either. That is a client
+    // report we do not plumb yet; until we do, the load-time checks are the real guard (the
+    // "plugins: N loaded, M MISSING" census catches an unreadable plugin, which is most of it).
     bool     g_terrainEyeCellMissing = false;
     std::unordered_map<int64_t, uint32_t> g_terrainMissingSeen;   // logged-once set, keyed by cell
     uint32_t g_lastTerrainCells   = 0;
@@ -7278,9 +7286,9 @@ namespace {
             g_terrainCovColor = float4(0.75f, 0.75f, 0.75f, 1.0f);
             bformat(&g_terrainCovText, "coverage: draw toggle OFF — MW draws its own land");
         } else if (g_terrainEyeCellMissing) {
-            g_terrainCovColor = float4(1.0f, 0.35f, 0.30f, 1.0f);
-            bformat(&g_terrainCovText, "coverage: GAP within 1 cell of the camera — MW land handed back "
-                                       "(missing cells listed in mgeHost64.log)");
+            g_terrainCovColor = float4(1.0f, 0.85f, 0.45f, 1.0f);
+            bformat(&g_terrainCovText, "coverage: host terrain owns the near field — no LAND record within "
+                                       "1 cell (usual at the edge of the world; inland it means a gap)");
         } else {
             g_terrainCovColor = float4(0.70f, 1.0f, 0.70f, 1.0f);
             bformat(&g_terrainCovText, "coverage: OK — host terrain owns the near field (%u cells resident)",
@@ -12620,7 +12628,7 @@ namespace ForgeRender {
                          (double)g_lastTerrainTris / 1e6,
                          g_lastTerrainLodHist[0], g_lastTerrainLodHist[1], g_lastTerrainLodHist[2],
                          g_lastTerrainLodHist[3], g_lastTerrainLodHist[4], g_lastTerrainLodHist[5],
-                         g_terrainEyeCellMissing ? "  <-- COVERAGE GAP, MW land handed back" : "");
+                         g_terrainEyeCellMissing ? "  (no LAND record within 1 cell of the eye)" : "");
             // Host-GPU-shrink sub-phases: WHERE inside color/reflect the ms live. sky+near+skin+mm+dl
             // ≈ color above (same frame's timestamps); refl sky = reflect − reflgeo.
             LOG::logline(">> [forge-hb] gpu color sub: sky=%.2f nearfrox=%.2f(%s,n=%u) near=%.2f skin=%.2f mm=%.2f dl=%.2f alpha=%.2f glow=%.2f(%u,walk=%.2fms)"
@@ -12911,9 +12919,15 @@ namespace ForgeRender {
         // safe for MW to stop drawing its own. Requires residency AND the draw toggle — a panel
         // flip has to hand the near field straight back to MW, or turning host terrain off in game
         // would leave nothing at all under the player.
-        // g_terrainEyeCellMissing is the coverage tripwire: a gap within one cell of the camera hands
-        // the near field straight back to MW rather than opening a hole we cannot see from here.
-        out.terrainOwned   = (g_terrainReady && g_drawTerrain && !g_terrainEyeCellMissing) ? 1.0f : 0.0f;
+        // Deliberately NOT gated on g_terrainEyeCellMissing. That tripwire asked "is a LAND record
+        // absent near the eye", which cannot mean what it was built to mean: an absent record is far
+        // more often the edge of the world than a parse failure (3898 of the 78x92 = 7176 grid slots
+        // have no LAND at all — everything past the coast). At sea it therefore fired every frame,
+        // handed the near field back, and MW's land then drew coplanar with ours: same heightfield,
+        // two producers, z-fight. Nothing host-side separates "no land here" from "we failed to load
+        // the land here" — both are slotAt() < 0 — so the tripwire stays a diagnostic and keeps its
+        // hands off ownership. See the note on g_terrainEyeCellMissing for the guard that can work.
+        out.terrainOwned   = (g_terrainReady && g_drawTerrain) ? 1.0f : 0.0f;
     }
 
     unsigned lastDrawn() { return g_lastDrawn; }
@@ -14596,18 +14610,13 @@ namespace ForgeRender {
         }
         if (!g_terrainReady || !g_drawTerrain) { return; }
 
-        // Coverage tripwire (see g_terrainEyeCellMissing). Cheap enough to run every frame — one hash
-        // lookup — and it has to be per-frame, because the cell that matters is the one you walked
-        // into. PRIMARY only: it is about the cell the PLAYER stands in, and it drives an ownership
-        // report the reflection has no say in.
+        // Coverage diagnostic (see g_terrainEyeCellMissing — it does NOT gate ownership). One hash
+        // lookup per frame, PRIMARY only: it is about the cell the PLAYER stands in.
         if (primary) {
             const int32_t ecx = (int32_t)std::floor(eye[0] / Terrain::kCellSize);
             const int32_t ecy = (int32_t)std::floor(eye[1] / Terrain::kCellSize);
-            // The 3x3 around the eye, not just the eye's own cell. terrainOwned reaches the client one
-            // RPC late, so testing only the cell you are standing in reports the hole on the frame you
-            // are already in it — one frame of visible hole per crossing. A cell is 8192 units; you
-            // cannot cross a whole one in a frame, so the ring buys a full cell of warning and the
-            // handover lands before anything is missing on screen.
+            // The 3x3 around the eye, not just the eye's own cell — a cell is 8192 units, so the ring
+            // reports the gap a full cell before you can reach it.
             bool    missing = false;
             int32_t mx = ecx, my = ecy;
             for (int32_t oy = -1; oy <= 1 && !missing; ++oy) {
@@ -14617,21 +14626,21 @@ namespace ForgeRender {
                     }
                 }
             }
-            if (missing != g_terrainEyeCellMissing) {
-                g_terrainEyeCellMissing = missing;
-                LOG::logline(">> [terrain] coverage %s near cell (%d,%d) — %s",
-                             missing ? "LOST" : "regained", ecx, ecy,
-                             missing ? "a LAND record is absent within one cell of the eye, handing the near field back to MW"
-                                     : "host terrain owns the near field again");
-            }
-            // One line per distinct hole, not per frame: a hole you can walk in and out of would
-            // otherwise bury the log, and the cell list is what identifies the missing plugin.
-            if (missing) {
+            g_terrainEyeCellMissing = missing;
+            // One line per distinct cell, and capped: the overwhelmingly common cause is standing near
+            // the edge of the world, so a boat trip crosses a new "missing" cell every 8192 units and
+            // would otherwise bury the log. The cap keeps the first few — enough to name a region if a
+            // plugin really did fail to load — and then shuts up.
+            constexpr size_t kMaxMissingLogged = 24;
+            if (missing && g_terrainMissingSeen.size() < kMaxMissingLogged) {
                 const int64_t key = ((int64_t)mx << 32) ^ (uint32_t)my;
                 if (g_terrainMissingSeen.emplace(key, 0u).second) {
-                    LOG::logline(">> [terrain] MISSING CELL (%d,%d) — not in the %u LAND records parsed from "
-                                 "Morrowind.ini. Check the host's ini matches the one the game loaded.",
-                                 mx, my, Terrain::cellCount());
+                    LOG::logline(">> [terrain] no LAND record for cell (%d,%d) — normally the edge of the "
+                                 "world (only %u cells in the grid rectangle have land); a real gap would "
+                                 "be inland%s",
+                                 mx, my, Terrain::cellCount(),
+                                 g_terrainMissingSeen.size() + 1 >= kMaxMissingLogged
+                                     ? ". Cap reached, further cells silent." : "");
                 }
             }
         }
@@ -14649,8 +14658,10 @@ namespace ForgeRender {
             const float d2 = dx * dx + dy * dy + dz * dz;
             if (d2 > maxView2) { continue; }
             ++nInRange;
-            // Near cut (T1 only): MW still draws its own land inside nearCut, so skip cells that lie
-            // WHOLLY inside it. Two deliberate choices:
+            // Near cut: skip cells lying WHOLLY inside nearCut. Since T3 this is the g_terrainNearCut
+            // checkbox only — MW no longer draws land for us to avoid, so ticking it carves a visible
+            // hole around the camera, which is exactly its use (anything still drawn there is not
+            // ours). The two choices below date from T1, when the cut had a second producer to miss:
             //  - 3D distance, not XY. MW culls its land shapes against a view-distance SPHERE, so an
             //    XY-only column keeps cutting when the camera climbs away and MW has already stopped
             //    drawing — the airborne hole in [[project_statics_nearcull_height]].

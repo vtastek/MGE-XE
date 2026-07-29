@@ -60,10 +60,11 @@ Three layers, all live:
 |---|---|---|
 | ini lists a plugin, disk lacks it | named at load | `terrain.cpp` — `"plugin missing: %s"` |
 | cell has no LAND record anywhere | enumerated at load | the heightless/no-terrain list above |
-| gap within one cell of the camera | per-frame tripwire | `g_terrainEyeCellMissing`, below |
+| gap within one cell of the camera | per-frame diagnostic | `g_terrainEyeCellMissing`, below |
 
-The third is the one that closes the plan's "T3 is the irreversible one" risk, and it does more than
-log: **it hands the near field back to MW.** See the T3 section.
+The third was meant to close the plan's "T3 is the irreversible one" risk by handing the near field
+back to MW. **It could not, and it has been demoted to a diagnostic** — see "the coverage tripwire"
+under T3 for why the test is unsound and what the working guard would need.
 
 ## IMPLEMENTED 2026-07-29 — T1: heightfield residency + terrain draw
 
@@ -332,21 +333,42 @@ rather than silently drawing nothing."* That is now enforced, in `terrainCullAnd
   reports the hole on the frame you are already standing in it: one frame of visible hole per
   crossing. A cell is 8192 units and you cannot cross one in a frame, so the ring buys a full cell of
   warning and the handover completes before anything is missing on screen.
-- On a gap, `g_terrainEyeCellMissing` goes true and is ANDed **out** of `terrainOwned` — so MW's near
-  land comes straight back. Overlap in the neighbouring cells is the cheaper failure, the same
-  trade the near-cut straddler rule already makes: *overlap costs a ring of shading, a gap costs a
-  hole.*
-- **Logged once per distinct cell**, not per frame — a hole you can walk in and out of would
-  otherwise bury the log — and the line names the cell `(x,y)` and the resident cell count, which is
-  what identifies the missing plugin.
-- **Visible in game, not only in the log:** a coverage line on the Draw tab under the terrain
-  toggles, red when the near field has been handed back. It distinguishes the three ways host
-  terrain can stop covering the near field — not resident / toggle off / real gap — which are
-  otherwise indistinguishable on screen.
+- **Logged once per distinct cell**, not per frame, and capped at 24 — the line names the cell `(x,y)`
+  and the resident cell count.
+- **Visible in game, not only in the log:** a coverage line on the Draw tab under the terrain toggles.
+  It distinguishes the three ways host terrain can stop covering the near field — not resident /
+  toggle off / no LAND record — which are otherwise indistinguishable on screen.
 - Cleared with the residency it describes, so a reload cannot come up claiming a hole it never
   tested for (the logged-once set being sticky would otherwise hide the re-test).
 
-Cost is one hash lookup per frame in the common case.
+Cost is one hash lookup per frame.
+
+#### CORRECTED 2026-07-29 — it does not touch ownership, and never should have
+
+As first written, a gap ANDed `g_terrainEyeCellMissing` **out** of `terrainOwned`, handing MW's near
+land back. Shipped, it produced a **checkerboard z-fight over every stretch of open water**. Two
+independent faults, both mine:
+
+1. **The test is not a failure test.** `slotAt() < 0` means "the world has no land in this cell",
+   which is overwhelmingly the *edge of the world*: only **3898 of the 78×92 = 7176** grid slots have
+   a LAND record at all. At sea the 3×3 ring is empty, so the tripwire fired every frame on a
+   perfectly healthy install — the log shows a clean diagonal of `MISSING CELL` lines, one per cell
+   of a boat trip. Nothing host-side can separate that from a parse failure; both are `slotAt() < 0`.
+2. **Handing ownership back did not withdraw us.** MW resumed drawing its near land while the host
+   kept drawing the *same heightfield* through it at `nearCut=0`. Two coplanar producers of one
+   surface — z-fight. The "safety valve" converted a hypothetical hole into a certain artefact.
+
+So `terrainOwned` is now `g_terrainReady && g_drawTerrain`, full stop, and the tripwire is a
+diagnostic line only. The load-time layers (rows 1–2 of the table in T0) remain the real guard; the
+`plugins: N loaded, M MISSING` census catches an unreadable plugin, which is most of the exposure.
+
+**The guard that would work** needs MW's answer rather than ours: `TES3::Cell` knows whether a loaded
+cell has a landscape, so *"MW has land in this cell and we have no record for it"* is a true gap by
+construction — and silent over water for free, because MW has nothing there either. That is a client
+report we do not plumb today (a handful of bits alongside `terrainOwned`), and it is the correct
+shape for restoring a real fallback. Whatever restores it **must also withdraw host terrain
+cell-granularly**, not by radius: a radius leaves straddling cells drawn by both producers, which is
+the z-fight again in a thinner ring.
 
 ## LANDED 2026-07-29 — T4: the old pipeline deleted
 
