@@ -14005,6 +14005,7 @@ namespace ForgeRender {
 
     Shader*   g_pTerrainShader     = nullptr;
     Pipeline* g_pTerrainPipeline   = nullptr;
+    Pipeline* g_pTerrainPipelineMirror = nullptr;   // reflect-geo: CULL_NONE (open sheet, see creation)
     Pipeline* g_pTerrainPipelineWire = nullptr;
     Buffer*   g_pTerrainVB         = nullptr;   // shared lattice (all LODs)
     Buffer*   g_pTerrainIB         = nullptr;   // all LOD strides back to back
@@ -14064,8 +14065,14 @@ namespace ForgeRender {
                     const uint16_t b = (uint16_t)(a + 1);
                     const uint16_t c = (uint16_t)(a + (n + 1));
                     const uint16_t d = (uint16_t)(c + 1);
-                    indices.push_back(a); indices.push_back(c); indices.push_back(b);
-                    indices.push_back(b); indices.push_back(c); indices.push_back(d);
+                    // Wound so the right-hand normal points UP (+Z), matching the outward-facing
+                    // convention NIF geometry uses — which is what makes the statics pipeline's
+                    // verified FRONT_FACE_CCW + CULL_MODE_BACK the correct pair here too (see
+                    // g_dlStaticsFrontCW). The original (a,c,b)/(b,c,d) order pointed the normal DOWN
+                    // and only worked because the PSO culled nothing; that made the world's one
+                    // surface double-sided and its underside visible from below.
+                    indices.push_back(a); indices.push_back(b); indices.push_back(c);
+                    indices.push_back(b); indices.push_back(d); indices.push_back(c);
                 }
             }
             rg.indexCount = (uint32_t)indices.size() - rg.firstIndex;
@@ -14139,8 +14146,12 @@ namespace ForgeRender {
 
         DepthStateDesc ds = {};
         ds.mDepthTest = true; ds.mDepthWrite = true; ds.mDepthFunc = CMP_GEQUAL;
+        // Back-face cull, same convention as statics on the live camera. Terrain is a single sheet
+        // with no underside to show: MW's own land is single-sided too, so culling is parity as well
+        // as fill saved. The water-plane mirror flips handedness, hence the CW twin below — the same
+        // main/mirror PSO pair every other geometry path here keeps (dlPickStaticsPipeline).
         RasterizerStateDesc rs = {};
-        rs.mCullMode = CULL_MODE_NONE; rs.mFrontFace = FRONT_FACE_CCW;
+        rs.mCullMode = CULL_MODE_BACK; rs.mFrontFace = FRONT_FACE_CCW;
 
         PipelineDesc pd = {};
         pd.mType = PIPELINE_TYPE_GRAPHICS;
@@ -14157,6 +14168,20 @@ namespace ForgeRender {
         g.pShaderProgram      = g_pTerrainShader;
         addPipeline(R, &pd, &g_pTerrainPipeline);
         if (!g_pTerrainPipeline) { std::printf("[forge][terrain] addPipeline FAILED\n"); return false; }
+
+        // Mirror twin for the reflect-geo pass. CULL_MODE_NONE, deliberately, and NOT the CW winding
+        // flip statics uses: statics are closed solids, so the mirror always shows their outward
+        // faces and the flip is exact. Terrain is an OPEN SHEET — which side faces the mirrored
+        // camera depends on the view (the reflection of an overhanging cliff shows its underside),
+        // so no single front-face setting is right for every cell. MEASURED: FRONT_FACE_CW culled
+        // the entire surface out of the mirror while the CPU was still submitting it (heartbeat read
+        // "terrain=245 (refl 242)" with nothing on screen but statics), which is the trap
+        // g_dlStaticsFrontCW's note warns about. Cost is bounded — one 1024² target.
+        RasterizerStateDesc rm = rs; rm.mCullMode = CULL_MODE_NONE;
+        g.pRasterizerState = &rm;
+        addPipeline(R, &pd, &g_pTerrainPipelineMirror);
+        if (!g_pTerrainPipelineMirror) { std::printf("[forge][terrain] addPipeline(mirror) FAILED\n"); return false; }
+        g.pRasterizerState = &rs;
 
         // Wireframe twin — the only way to actually SEE which stride a cell picked and whether the
         // stitch closed. Same everything else, so it is a pure raster-mode A/B.
@@ -14305,7 +14330,13 @@ namespace ForgeRender {
             sd.mIndex = SRT_RES_IDX(SrtData, PerFrame, gTerrainArrays);
             sd.mArrayOffset = 0; sd.mCount = kTerrainBuckets;
             sd.ppTextures = texs.data();
+            // EVERY PerFrame set, not just the main one — the reflect-geo pass binds its own
+            // (pPerFrameSetReflectGeo) and draws the same terrain. See the note at the buffer
+            // update below for what an unbound terrain descriptor actually looks like.
             updateDescriptorSet(R, 0, g_live.pPerFrameSet, 1, &sd);
+            if (g_live.pPerFrameSetReflectGeo) {
+                updateDescriptorSet(R, 0, g_live.pPerFrameSetReflectGeo, 1, &sd);
+            }
         }
 
         // Pass 3: upload each texture's capped mip range into its slice.
@@ -14540,7 +14571,19 @@ namespace ForgeRender {
             tp[2].mCount = 1; tp[2].ppBuffers = &g_pTerrainTex;
             tp[3].mIndex = SRT_RES_IDX(SrtData, PerFrame, gTerrainCellGrid);
             tp[3].mCount = 1; tp[3].ppBuffers = &g_pTerrainCellGrid;
+            // Terrain is drawn by the reflect-geo pass too, and that pass binds a DIFFERENT PerFrame
+            // set (pPerFrameSetReflectGeo — mirror viewProj + below-water clip). Binding these to the
+            // main set alone left the mirror reading unbound descriptors, which does not fail loudly:
+            // gTerrainHeights returns 0, so the terrain collapsed to a FLAT SHEET AT ABSOLUTE HEIGHT
+            // 0 — the water level itself — and gTerrainColor returned 0, multiplying albedo to black.
+            // The result was a black plane lying on the water, with sky visible only over cells that
+            // have no LAND record (no instance, so no sheet). It reads as "the water is black", which
+            // is why it was hunted in the water and reflection code for a long time before landing
+            // here. Any resource a shared shader reads must reach EVERY set that shader draws under.
             updateDescriptorSet(R, 0, g_live.pPerFrameSet, 4, tp);
+            if (g_live.pPerFrameSetReflectGeo) {
+                updateDescriptorSet(R, 0, g_live.pPerFrameSetReflectGeo, 4, tp);
+            }
         }
 
         // CPU cull table: one bounding sphere + neighbour slots per cell. Both are static for the
@@ -14750,13 +14793,15 @@ namespace ForgeRender {
         }
     }
 
-    // Record one view's terrain draws. Caller has the colour target + depth bound; `frameSet` is the
-    // only thing that differs between views — the main view passes pPerFrameSet, the reflection
-    // passes pPerFrameSetReflectGeo (mirror-about-water matrix + below-water clip plane). Terrain is
-    // CULL_NONE, so unlike statics the mirror's winding flip needs no second PSO.
-    void terrainRecord(Cmd* cmd, TerrainView& V, DescriptorSet* frameSet) {
+    // Record one view's terrain draws. Caller has the colour target + depth bound. Two things differ
+    // between views: `frameSet` (main = pPerFrameSet, reflection = pPerFrameSetReflectGeo, carrying
+    // the mirror-about-water matrix + the below-water clip plane) and `mirror`, which picks the
+    // winding-flipped PSO — the water plane reverses handedness, so the same triangles rasterize CW
+    // there and a back-face cull would otherwise drop precisely the surface being reflected.
+    void terrainRecord(Cmd* cmd, TerrainView& V, DescriptorSet* frameSet, bool mirror) {
         if (!g_terrainReady || !g_drawTerrain || !V.cells) { return; }
         Pipeline* pso = (g_terrainWire && g_pTerrainPipelineWire) ? g_pTerrainPipelineWire
+                      : mirror                                    ? g_pTerrainPipelineMirror
                                                                   : g_pTerrainPipeline;
         cmdBindPipeline(cmd, pso);
         cmdBindDescriptorSet(cmd, 0, frameSet);
@@ -16972,8 +17017,12 @@ namespace ForgeRender {
     // Per-300-frame DL heartbeat (from renderScene's heartbeat block).
     void dlLogHeartbeat() {
         if (!g_dlLiveInit) { return; }
-        LOG::logline(">> [forge-hb][dl] exterior=%d terrain=%u/%u cells static-instances=%u subsets=%u tex-buckets=%zu",
-                     (int)g_dlExterior, g_lastTerrainCells, Terrain::cellCount(), g_liveLastInst,
+        // terrain-refl is the ONLY window onto what the mirror actually drew — every other terrain
+        // counter here is the main view. "the reflection is dark" cannot be told apart from "the
+        // reflection is empty" without it.
+        LOG::logline(">> [forge-hb][dl] exterior=%d terrain=%u/%u cells (refl %u) static-instances=%u subsets=%u tex-buckets=%zu",
+                     (int)g_dlExterior, g_lastTerrainCells, Terrain::cellCount(), g_terrainRefl.cells,
+                     g_liveLastInst,
                      g_liveLastSubsets, g_staticsBuckets.empty() ? 0 : g_staticsBuckets.size() - 1);
         // Near/far handover: suppressed = wholly MW-covered (the double-draw that used to ship);
         // clipped = STRADDLING the slab, submitted and cut at it (the class that was a hole while
@@ -18168,7 +18217,7 @@ namespace ForgeRender {
         // Host-owned terrain FIRST: it is the real surface, at true height with no z-sink. The old
         // DL bake below (when its A/B toggle is on) still sinks itself, so wherever the two overlap
         // the sunk mesh simply loses the depth test.
-        terrainRecord(g_live.pCmd, g_terrainMain, g_live.pPerFrameSet);
+        terrainRecord(g_live.pCmd, g_terrainMain, g_live.pPerFrameSet, /*mirror*/false);
 
         // Phase C: bind the baked DISTANT light set for BOTH distant land + statics frags (falls back
         // to the near set if the baked set failed to build). They loop these camera-relative lights.
@@ -18739,7 +18788,7 @@ namespace ForgeRender {
     // WV2: record the reflected land + statics into pReflectColor/pReflectDepth (already bound by the
     // reflect pass). A mirror of dlLiveRecord bound to the REFLECT targets: pPerFrameSetReflectGeo (the
     // water-plane mirror matrix + below-water clip plane), the reflection rings, and the OPPOSITE-winding
-    // statics PSO (the mirror flips triangle winding). Land is cull NONE → winding-agnostic. Drawn AFTER
+    // statics AND terrain PSOs (the mirror flips triangle winding). Drawn AFTER
     // the sky into the same RT (depth GEQUAL+write, so land/statics occlude each other + the sky behind).
     void dlReflectRecordGeo() {
         if (!g_dlExterior || !g_dlLiveInit) { return; }
@@ -18749,7 +18798,7 @@ namespace ForgeRender {
         // gap the old bake left: the reflection now sees the SAME surface at the same resolution the
         // camera does, so a coastline reflects its actual shape instead of a 915-tri approximation
         // that had to be clipped at waterLevel-1 to hide the mismatch.
-        terrainRecord(g_live.pCmd, g_terrainRefl, g_live.pPerFrameSetReflectGeo);
+        terrainRecord(g_live.pCmd, g_terrainRefl, g_live.pPerFrameSetReflectGeo, /*mirror*/true);
 
         if (g_drawDLStatics && g_staticsLiveOk && g_liveLastSubsetsRefl > 0) {
             // Opposite winding to the main record (the water-plane mirror flips handedness).
@@ -19369,6 +19418,7 @@ namespace ForgeRender {
         exitDevUI();       // Forge IUI/IFont teardown while the renderer is still alive
         // Host-owned terrain teardown (before the descriptor sets that reference the data buffers).
         if (g_pTerrainPipelineWire) { removePipeline(R, g_pTerrainPipelineWire); g_pTerrainPipelineWire = nullptr; }
+        if (g_pTerrainPipelineMirror) { removePipeline(R, g_pTerrainPipelineMirror); g_pTerrainPipelineMirror = nullptr; }
         if (g_pTerrainPipeline)     { removePipeline(R, g_pTerrainPipeline);     g_pTerrainPipeline = nullptr; }
         if (g_pTerrainShader)       { removeShader(R, g_pTerrainShader);         g_pTerrainShader = nullptr; }
         if (g_pTerrainVB)           { removeResource(g_pTerrainVB);              g_pTerrainVB = nullptr; }
