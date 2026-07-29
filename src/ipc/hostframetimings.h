@@ -50,12 +50,27 @@ namespace IPC {
         // setup + cull + record + gpuWait + post, host-measured. Compare against the inflight
         // box width: the remainder is IPC + drain latency.
         float totalMs;
+
+        // --- NOT a timing: host TERRAIN ownership (tasks/forge-terrain.md T3). ---------------
+        // 1.0 = the host has the world's LAND heightfield resident and is drawing it; 0.0 = it is
+        // not (still loading, failed to load, or the debug toggle is off — the host then falls back
+        // to the old DL world bake).
+        //
+        // The client uses this to decide whether to stop drawing MW's OWN near terrain. That has to
+        // be the host's call, not a client setting: if the host is not drawing terrain and the
+        // client has already suppressed MW's, the near field is a HOLE, and a hole is much worse
+        // than the double-draw it replaces. Riding the frame timings rather than a new channel
+        // because this block already flows back every frame and is already layout-contract'd.
+        //
+        // float, not bool — see the layout note above: bool differs in size/padding across the
+        // x86/x64 wire, and this struct is shared BY LAYOUT.
+        float terrainOwned;
     };
 
-    // 9 GPU + 4 CPU + gpuWait + total. Update the count when appending a field: the point is that
-    // a stray double/pointer (or padding from one) can never slip in unnoticed, because this
-    // struct is interpreted by two differently-sized processes.
-    static_assert(sizeof(HostFrameTimings) == 15 * sizeof(float),
+    // 9 GPU + 4 CPU + gpuWait + total + terrainOwned. Update the count when appending a field: the
+    // point is that a stray double/pointer (or padding from one) can never slip in unnoticed,
+    // because this struct is interpreted by two differently-sized processes.
+    static_assert(sizeof(HostFrameTimings) == 16 * sizeof(float),
                   "HostFrameTimings must stay tightly packed floats - it crosses the x86/x64 wire");
 
 }

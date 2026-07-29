@@ -1,0 +1,225 @@
+// mgeHost64 — host-owned terrain (tasks/forge-terrain.md, T2): fragment stage.
+//
+// Albedo is the REAL land textures now — the per-cell 16x16 VTEX index map sampling full-resolution
+// LTEX out of bucketed Texture2DArrays. The old DL bake gave the entire world one 4096^2 atlas, i.e.
+// ~44 texels per cell edge (one texel taller than a character); a land texture here tiles once per
+// 512-unit texture square, which is ~92x finer per axis.
+//
+// **The detail map is gone.** Its two-scale modulation existed to fake surface variation the atlas
+// could not carry. With the real textures it is a haze over correct data, so it is not carried
+// forward — the reason it was there stopped being true.
+//
+// The texture layout reproduces Morrowind's own, which MGE's generator documents exactly
+// (MGEgui/DirectX/DistantLandTextures.cs::CalcWeights, "match Morrowind rounding"):
+//   * a vertex (x,y) in 0..64 takes the texture square (floor((x-2)/4), ceil((y-2)/4)) — note the
+//     floor/ceil asymmetry, that is the engine's, not a typo — wrapping into the NEIGHBOUR cell
+//     when the square index leaves 0..15 (their ModCell);
+//   * that assignment is a hard per-vertex choice, and MW blends by interpolating the resulting
+//     0/1 weights across the quad.
+// So per pixel we take the four bracketing VERTICES, look up each one's square, and blend the four
+// with bilinear weights — which is that interpolation, evaluated exactly, in one pass instead of
+// MGE's four-layer "texture bank" (a limit imposed by fixed-function stages we no longer have).
+
+#include "opaque.srt.h"
+#include "msmrecv.h.fsl"   // sunShadowVisibility() — MSM sun-shadow receiver
+
+#define TERRAIN_VERTS   65
+#define TERRAIN_QUADS   64
+#define TERRAIN_TSTRIDE 256u   // uints per cell in gTerrainTex — ONE texture slot per square
+#define TERRAIN_CSTRIDE 4225u  // uints per cell in gTerrainColor — one 0x00BBGGRR per vertex
+
+// Byte-identical to distantland.frag::tonemap / opaque.frag::tonemap (XE FixedFuncEmu.fx).
+float3 tonemap(float3 c)
+{
+    c = clamp(c, 0.0f, 2.2f);
+    c = (((0.0548303f * c - 0.189786f) * c - 0.154732f) * c + 1.12969f) * c;
+    return c;
+}
+
+STRUCT(VSOutput)
+{
+    DATA(float4, Position, SV_Position);
+    DATA(float3, WorldPos, TEXCOORD0);
+    DATA(float3, Normal,   TEXCOORD1);
+    DATA(CENTROID(float),  Fog,   TEXCOORD2);
+    DATA(float2, Lattice,  TEXCOORD3);
+    DATA(FLAT(uint4), Cell, TEXCOORD4);   // slot, localX, localY, packed grid span
+};
+
+// One vertex's VCLR (Morrowind's hand-painted terrain tint), 0x00BBGGRR per vertex.
+float3 loadVertexColor(uint slot, int x, int y)
+{
+    uint c = gTerrainColor[slot * TERRAIN_CSTRIDE + (uint)(y * TERRAIN_VERTS + x)];
+    return float3(float(c & 0xFFu), float((c >> 8u) & 0xFFu), float((c >> 16u) & 0xFFu))
+         * (1.0f / 255.0f);
+}
+
+uint terrainCellAt(int lx, int ly, uint spanX, uint spanY)
+{
+    if (lx < 0 || ly < 0 || lx >= (int)spanX || ly >= (int)spanY) { return 0u; }
+    return gTerrainCellGrid[(uint)ly * spanX + (uint)lx];
+}
+
+// The land-texture SLOT ((bucket<<16)|layer) at texture square (tx, ty) of the cell at grid
+// (lx, ly), where tx/ty may be -1 or 16 — Morrowind's rounding reaches one square into the
+// neighbouring cell, so this wraps cell and square together exactly as MGEgui's ModCell does.
+// gTerrainTex holds slots, not LTEX ids: the host resolves them once at residency build, so the
+// hot path here is one load instead of a load plus an id->slot indirection.
+uint landTexSlot(int lx, int ly, uint spanX, uint spanY, int tx, int ty)
+{
+    if (tx <  0) { --lx; tx += 16; } else if (tx > 15) { ++lx; tx -= 16; }
+    if (ty <  0) { --ly; ty += 16; } else if (ty > 15) { ++ly; ty -= 16; }
+    uint cell = terrainCellAt(lx, ly, spanX, spanY);
+    if (cell == 0u) { return 0u; }
+    return gTerrainTex[(cell - 1u) * TERRAIN_TSTRIDE + (uint)(ty * 16 + tx)];
+}
+
+// Morrowind's per-vertex square assignment. Kept in float so the negative cases round the way the
+// engine's floor/ceil do (integer division truncates toward zero and would disagree at x < 2).
+int squareX(int x) { return (int)floor((float(x) - 2.0f) * 0.25f); }
+int squareY(int y) { return (int)ceil ((float(y) - 2.0f) * 0.25f); }
+
+// One land texture, sampled through the bucketed arrays. uv tiles once per texture square, matching
+// the generator's `cv.u = x / 4` over a 0..64 lattice. Slot 0 (and any unresolved texture) is the
+// default ground, which the host uploads as layer 0 of bucket 0.
+float3 sampleLand(uint slot, float2 uv)
+{
+    uint bucket = slot >> 16u;
+    uint layer  = slot & 0xFFFFu;
+    return SampleTex2DArray(gTerrainArrays[bucket], gSamplerAnisotropic,
+                            float3(uv, float(layer))).rgb;
+}
+
+ROOT_SIGNATURE(DefaultRootSignature)
+float4 PS_MAIN( VSOutput In )
+{
+    INIT_MAIN;
+
+    const int  lx    = (int)In.Cell.y;
+    const int  ly    = (int)In.Cell.z;
+    const uint spanX = In.Cell.w & 0xFFFFu;
+    const uint spanY = In.Cell.w >> 16u;
+
+    // Bracketing vertices of this fragment's quad, and the bilinear weights between them — this IS
+    // MW's per-vertex 0/1 weight interpolation, evaluated per pixel.
+    float2 lat = clamp(In.Lattice, float2(0.0f, 0.0f), float2(float(TERRAIN_QUADS), float(TERRAIN_QUADS)));
+    int    x0  = (int)floor(lat.x), y0 = (int)floor(lat.y);
+    int    x1  = min(x0 + 1, TERRAIN_QUADS), y1 = min(y0 + 1, TERRAIN_QUADS);
+    float  fx  = lat.x - float(x0), fy = lat.y - float(y0);
+
+    uint id00 = landTexSlot(lx, ly, spanX, spanY, squareX(x0), squareY(y0));
+    uint id10 = landTexSlot(lx, ly, spanX, spanY, squareX(x1), squareY(y0));
+    uint id01 = landTexSlot(lx, ly, spanX, spanY, squareX(x0), squareY(y1));
+    uint id11 = landTexSlot(lx, ly, spanX, spanY, squareX(x1), squareY(y1));
+
+    // uv tiles once per 512-unit texture square (lattice/4), continuous because the texture wraps.
+    float2 uv = lat * 0.25f;
+
+    float3 albedo;
+    if (id00 == id10 && id00 == id01 && id00 == id11) {
+        albedo = sampleLand(id00, uv);          // interior of a square: one tap, the common case
+    } else {
+        float w00 = (1.0f - fx) * (1.0f - fy);
+        float w10 = fx * (1.0f - fy);
+        float w01 = (1.0f - fx) * fy;
+        float w11 = fx * fy;
+        albedo  = sampleLand(id00, uv) * w00;
+        albedo += sampleLand(id10, uv) * w10;
+        albedo += sampleLand(id01, uv) * w01;
+        albedo += sampleLand(id11, uv) * w11;
+    }
+
+    // VCLR is Morrowind's hand-painted per-vertex TINT over the land texture — it multiplies, it is
+    // not the albedo (which is what T1 had to pretend while there were no textures).
+    //
+    // Sampled HERE, per pixel, bilinearly over the full 65x65 field — NOT interpolated from the
+    // vertex stage. A vertex-stage fetch only sees the vertices the current LOD actually draws, so
+    // at stride 8 seven of every eight painted values are dropped and the survivors are smeared
+    // across 1024 world units: thin hand-painted features (roads are the obvious case) wash out or
+    // crawl as the LOD changes under you. The paint's resolution is a property of the DATA, not of
+    // the mesh, so it is decoupled from the mesh — the same reasoning that put heights in the VS
+    // instead of baking them into geometry ([[feedback_vtf_over_cpu_baking]]).
+    //
+    // Reuses the x0/x1/y0/y1/fx/fy the texture blend above already derived, so the whole fix costs
+    // four buffer loads and three lerps. Edge behaviour is a clamp, which is faithful: each MW cell
+    // interpolates its OWN vertex colours and neighbours agree at the shared boundary column.
+    {
+        const uint cslot = In.Cell.x;
+        float3 c00 = loadVertexColor(cslot, x0, y0);
+        float3 c10 = loadVertexColor(cslot, x1, y0);
+        float3 c01 = loadVertexColor(cslot, x0, y1);
+        float3 c11 = loadVertexColor(cslot, x1, y1);
+        albedo *= lerp(lerp(c00, c10, fx), lerp(c01, c11, fx), fy);
+    }
+
+    float3 normal = normalize(In.Normal);
+    float  sunVis = sunShadowVisibility(In.WorldPos, normal);
+    float3 result = albedo
+                  * (gFrameData.sunCol.rgb * saturate(dot(-gFrameData.sunDir.xyz, normal)) * sunVis
+                     + gFrameData.lodSunAmb.rgb);
+
+    // Baked DISTANT point lights, clustered by froxel when the grid is live — the same inlined body
+    // distantland.frag/statics.frag use, so a lamp lights the ground identically on all three paths.
+    float3 pointDiffuse = float3(0.0f, 0.0f, 0.0f);
+    {
+        uint  nL     = (uint)gLights.lightParams.x;
+        float reachK = gLights.lightParams.y;
+        int   tilesX = (int)gFrameData.froxelDims.x;
+        bool  clustered = (tilesX > 0);
+        uint  base = 0u;
+        if (clustered)
+        {
+            int   tilesY = (int)gFrameData.froxelDims.y;
+            int   NZ     = (int)gFrameData.froxelDims.z;
+            float tile   = gFrameData.froxelDims.w;
+            int tx = clamp((int)(In.Position.x / tile), 0, tilesX - 1);
+            int ty = clamp((int)(In.Position.y / tile), 0, tilesY - 1);
+            float dd = length(In.WorldPos);
+            int zs = clamp((int)((log(max(dd, 1.0f)) - gFrameData.froxelZ.x) * gFrameData.froxelZ.y * (float)NZ), 0, NZ - 1);
+            base = (((uint)ty * (uint)tilesX + (uint)tx) * (uint)NZ + (uint)zs) * 4u;
+        }
+        for (uint wi = 0u; wi < 4u; ++wi)
+        {
+            uint bits;
+            if (clustered) {
+                bits = gFroxelMask[base + wi];
+            } else {
+                uint lo = wi * 32u;
+                uint cnt = (lo >= nL) ? 0u : min(32u, nL - lo);
+                bits = (cnt >= 32u) ? 0xFFFFFFFFu : ((1u << cnt) - 1u);
+            }
+            while (bits != 0u)
+            {
+                uint i = wi * 32u + firstbitlow(bits);
+                bits = bits & (bits - 1u);
+                if (i >= nL) { continue; }
+                float4 posR = gLights.lights[i * 3u + 0u];
+                float3 lcol = gLights.lights[i * 3u + 1u].rgb;
+                float3 fo   = gLights.lights[i * 3u + 2u].xyz;   // k0, k1, k2
+                float  reach = posR.w * reachK;
+                float3 toL  = posR.xyz - In.WorldPos;
+                float  d2   = dot(toL, toL);
+                if (d2 >= reach * reach) { continue; }
+                float invD = rsqrt(max(d2, 1e-8f));
+                float d    = d2 * invD;
+                float att  = 1.0f / max(fo.z * d2 + fo.y * d + fo.x, 1e-4f);
+                att *= 1.0f - smoothstep(POINT_LIGHT_TAIL * reach, reach, d);
+                float lambert = saturate(dot(normal, toL) * invD);
+                pointDiffuse += lambert * att * lcol;
+            }
+        }
+    }
+    result += albedo * pointDiffuse;
+
+    result = tonemap(result);
+    result = lerp(gFrameData.fogColNear.rgb, result, In.Fog);
+
+    // F12 distance grayscale parity (debugParams.x 1/2), matching opaque.frag / distantland.frag.
+    uint dbg = (uint)(gFrameData.debugParams.x + 0.5f);
+    if (dbg == 1u || dbg == 2u) {
+        float dist = length(In.WorldPos - gFrameData.eyePos.xyz);
+        float g = saturate(dist * (1.0f / 8192.0f));
+        RETURN(float4(g, g, g, 1.0f));
+    }
+    RETURN(float4(result, 1.0f));
+}

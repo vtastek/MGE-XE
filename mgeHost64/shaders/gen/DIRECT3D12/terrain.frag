@@ -972,9 +972,9 @@ SamplerState gSampler2xWrapClamp : register( s17 , space100 ) ;
 #line 247 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/../../../3rdparty/The-Forge/Common_3/Graphics/FSL/defaults.h"
 
 #line 11 "FSL/shaders.list"
-#line 172 "FSL/shaders.list"
-#line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/distantland.frag.fsl"
-#line 11 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/distantland.frag.fsl"
+#line 174 "FSL/shaders.list"
+#line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terrain.frag.fsl"
+#line 23 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terrain.frag.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
 #line 20 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
@@ -1069,7 +1069,7 @@ STRUCT(ShadowMaskParams)
 #line 159
 };
 #line 21 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
-#line 42 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+#line 46 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
 STRUCT(FrameData)
 {
     float4x4 viewProj;
@@ -1089,6 +1089,7 @@ STRUCT(FrameData)
 
 
     float4 dbgScales;
+
 
 
 
@@ -1154,15 +1155,15 @@ STRUCT(FrameData)
 
 
     float4 alphaShadowParams;
-#line 126
+#line 131
 };
 
 STRUCT(BatchData)
 {
     float4x4 worlds[ 1024 ];
-#line 131
+#line 136
 };
-#line 152 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+#line 157 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
 STRUCT(LightData)
 {
     float4 lightParams;
@@ -1178,7 +1179,7 @@ STRUCT(LightData)
 
     float4 froxelDimsNear;
     float4 froxelZNear;
-#line 167
+#line 172
 };
 
         CBUFFER(FrameData) gFrameData :  register(b0,space1);
@@ -1267,8 +1268,36 @@ STRUCT(LightData)
 
 
 
+
+
+
+
+
+        Buffer(uint) gTerrainHeights :  register(t16,space1);
+        Buffer(uint) gTerrainColor :  register(t17,space1);
+
+
+
+
+
+
+
+
+
+        Buffer(uint) gTerrainTex :  register(t18,space1);
+        Buffer(uint) gTerrainCellGrid :  register(t19,space1);
+
+
+
+
+
+        Tex2DArray(float4) gTerrainArrays[ 32 ] :  register(t20,space1);
+
+
+
+
         CBUFFER(LightData) gLights :  register(b0,space3);
-#line 272 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+#line 305 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
         Tex2D(float4) gTextures[ 880 ] :  register(t0,space0);
 
 
@@ -1279,7 +1308,7 @@ STRUCT(LightData)
 
         Tex2DArray(float4) gFlipArrays[ 16 ] :  register(t1008,space0);
         CBUFFER(BatchData) gBatch :  register(b0,space2);
-#line 12 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/distantland.frag.fsl"
+#line 24 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terrain.frag.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/msmrecv.h.fsl"
 #line 45 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/msmrecv.h.fsl"
 float4 UnpackMoments(float4 packedMoments)
@@ -1547,7 +1576,8 @@ float sunShadowVisibility(float3 worldPosRel, float3 N)
 
     return 1.0f - occlusion * strength;
 }
-#line 13 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/distantland.frag.fsl"
+#line 25 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terrain.frag.fsl"
+
 
 
 
@@ -1564,38 +1594,114 @@ float3 tonemap(float3 c)
 STRUCT(VSOutput)
 {
     DATA(float4, Position, SV_Position);
-    DATA(float2, Uv, TEXCOORD0);
-    DATA(float3, WorldPos, TEXCOORD1);
-    DATA(float, Fog, TEXCOORD2);
-#line 32
+    DATA(float3, WorldPos, TEXCOORD0);
+    DATA(float3, Normal, TEXCOORD1);
+    DATA(CENTROID(float), Fog, TEXCOORD2);
+    DATA(float2, Lattice, TEXCOORD3);
+    DATA(FLAT(uint4), Cell, TEXCOORD4);
+#line 47
 };
+
+
+float3 loadVertexColor(uint slot, int x, int y)
+{
+    uint c = gTerrainColor[slot *  4225u  + (uint)(y *  65  + x)];
+    return float3(float(c & 0xFFu), float((c >> 8u) & 0xFFu), float((c >> 16u) & 0xFFu))
+         * (1.0f / 255.0f);
+}
+
+uint terrainCellAt(int lx, int ly, uint spanX, uint spanY)
+{
+    if (lx < 0 || ly < 0 || lx >= (int)spanX || ly >= (int)spanY) { return 0u; }
+    return gTerrainCellGrid[(uint)ly * spanX + (uint)lx];
+}
+
+
+
+
+
+
+uint landTexSlot(int lx, int ly, uint spanX, uint spanY, int tx, int ty)
+{
+    if (tx < 0) { --lx; tx += 16; } else if (tx > 15) { ++lx; tx -= 16; }
+    if (ty < 0) { --ly; ty += 16; } else if (ty > 15) { ++ly; ty -= 16; }
+    uint cell = terrainCellAt(lx, ly, spanX, spanY);
+    if (cell == 0u) { return 0u; }
+    return gTerrainTex[(cell - 1u) *  256u  + (uint)(ty * 16 + tx)];
+}
+
+
+
+int squareX(int x) { return (int)floor((float(x) - 2.0f) * 0.25f); }
+int squareY(int y) { return (int)ceil ((float(y) - 2.0f) * 0.25f); }
+
+
+
+
+float3 sampleLand(uint slot, float2 uv)
+{
+    uint bucket = slot >> 16u;
+    uint layer = slot & 0xFFFFu;
+    return SampleTex2DArray(gTerrainArrays[bucket], gSamplerAnisotropic,
+                            float3(uv, float(layer))).rgb;
+}
 
 [RootSignature( "RootFlags(ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT)," "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "3" ", offset = 0)," "CBV(b0, numDescriptors = unbounded, space = " "3" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "3" ", offset = 0))," "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "2" ", offset = 0)," "CBV(b0, numDescriptors = unbounded, space = " "2" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "2" ", offset = 0))," "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "1" ", offset = 0)," "CBV(b0, numDescriptors = unbounded, space = " "1" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "1" ", offset = 0))," "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "0" ", offset = 0)," "CBV(b0, numDescriptors = unbounded, space = " "0" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "0" ", offset = 0))," "DescriptorTable(" "SAMPLER(s0, numDescriptors = unbounded, space = " "0" ", offset = 0))," "StaticSampler(s0, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s1, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s2, space = 100," "filter = FILTER_MIN_MAG_LINEAR_MIP_POINT," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s3, space = 100," "filter = FILTER_MIN_MAG_LINEAR_MIP_POINT," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s4, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s5, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s6, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT," "addressU = TEXTURE_ADDRESS_MIRROR, addressV = TEXTURE_ADDRESS_MIRROR, addressW = TEXTURE_ADDRESS_MIRROR)," "StaticSampler(s7, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT, borderColor = STATIC_BORDER_COLOR_TRANSPARENT_BLACK," "addressU = TEXTURE_ADDRESS_BORDER, addressV = TEXTURE_ADDRESS_BORDER, addressW = TEXTURE_ADDRESS_BORDER)," "StaticSampler(s8, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR," "addressU = TEXTURE_ADDRESS_MIRROR, addressV = TEXTURE_ADDRESS_MIRROR, addressW = TEXTURE_ADDRESS_MIRROR)," "StaticSampler(s9, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR, borderColor = STATIC_BORDER_COLOR_TRANSPARENT_BLACK," "addressU = TEXTURE_ADDRESS_BORDER, addressV = TEXTURE_ADDRESS_BORDER, addressW = TEXTURE_ADDRESS_BORDER)," "StaticSampler(s10, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 8," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s11, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 8," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s12, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 8," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s13, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 8," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s14, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 2," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s15, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 2," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s16, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 2," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s17, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 2," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_WRAP)" )]
 float4 PS_MAIN( VSOutput In ): SV_TARGET
 {
     //INIT_MAIN;
-    uint baseIdx = (uint)(gFrameData.lodParams.x + 0.5f);
-    uint normalIdx = (uint)(gFrameData.lodParams.y + 0.5f);
-    uint detailIdx = (uint)(gFrameData.lodParams.z + 0.5f);
 
-
-    float3 normal = normalize(2.0f * SampleTex2D(gTextures[normalIdx], gSamplerAnisotropic, In.Uv).rgb - 1.0f);
-
-
-    float3 result = SampleTex2D(gTextures[baseIdx], gSamplerAnisotropic, In.Uv).rgb;
-    float3 albedo = result;
-
-
-    float detail = SampleTex2D(gTextures[detailIdx], gSamplerAnisotropic, In.Uv * 333.0f).g + 0.5f;
-    detail *= 0.5f * SampleTex2D(gTextures[detailIdx], gSamplerAnisotropic, In.Uv * 90.0f).g + 0.75f;
+    const int lx = (int)In.Cell.y;
+    const int ly = (int)In.Cell.z;
+    const uint spanX = In.Cell.w & 0xFFFFu;
+    const uint spanY = In.Cell.w >> 16u;
 
 
 
+    float2 lat = clamp(In.Lattice, float2(0.0f, 0.0f), float2(float( 64 ), float( 64 )));
+    int x0 = (int)floor(lat.x), y0 = (int)floor(lat.y);
+    int x1 = min(x0 + 1,  64 ), y1 = min(y0 + 1,  64 );
+    float fx = lat.x - float(x0), fy = lat.y - float(y0);
 
+    uint id00 = landTexSlot(lx, ly, spanX, spanY, squareX(x0), squareY(y0));
+    uint id10 = landTexSlot(lx, ly, spanX, spanY, squareX(x1), squareY(y0));
+    uint id01 = landTexSlot(lx, ly, spanX, spanY, squareX(x0), squareY(y1));
+    uint id11 = landTexSlot(lx, ly, spanX, spanY, squareX(x1), squareY(y1));
+
+
+    float2 uv = lat * 0.25f;
+
+    float3 albedo;
+    if (id00 == id10 && id00 == id01 && id00 == id11) {
+        albedo = sampleLand(id00, uv);
+    } else {
+        float w00 = (1.0f - fx) * (1.0f - fy);
+        float w10 = fx * (1.0f - fy);
+        float w01 = (1.0f - fx) * fy;
+        float w11 = fx * fy;
+        albedo = sampleLand(id00, uv) * w00;
+        albedo += sampleLand(id10, uv) * w10;
+        albedo += sampleLand(id01, uv) * w01;
+        albedo += sampleLand(id11, uv) * w11;
+    }
+#line 146 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terrain.frag.fsl"
+    {
+        const uint cslot = In.Cell.x;
+        float3 c00 = loadVertexColor(cslot, x0, y0);
+        float3 c10 = loadVertexColor(cslot, x1, y0);
+        float3 c01 = loadVertexColor(cslot, x0, y1);
+        float3 c11 = loadVertexColor(cslot, x1, y1);
+        albedo *= lerp(lerp(c00, c10, fx), lerp(c01, c11, fx), fy);
+    }
+
+    float3 normal = normalize(In.Normal);
     float sunVis = sunShadowVisibility(In.WorldPos, normal);
-    result *= gFrameData.sunCol.rgb * saturate(dot(-gFrameData.sunDir.xyz, normal)) * sunVis + gFrameData.lodSunAmb.rgb;
-    result *= detail;
-#line 70 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/distantland.frag.fsl"
+    float3 result = albedo
+                  * (gFrameData.sunCol.rgb * saturate(dot(-gFrameData.sunDir.xyz, normal)) * sunVis
+                     + gFrameData.lodSunAmb.rgb);
+
+
+
     float3 pointDiffuse = float3(0.0f, 0.0f, 0.0f);
     {
         uint nL = (uint)gLights.lightParams.x;
@@ -1645,13 +1751,9 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
             }
         }
     }
-    result += albedo * pointDiffuse * detail;
-
-
+    result += albedo * pointDiffuse;
 
     result = tonemap(result);
-
-
     result = lerp(gFrameData.fogColNear.rgb, result, In.Fog);
 
 
@@ -1663,4 +1765,4 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
     }
     return (float4(result, 1.0f));
 }
-#line 173 "FSL/shaders.list"
+#line 175 "FSL/shaders.list"

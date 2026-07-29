@@ -76,19 +76,9 @@ namespace MGEgui.DistantLand {
         private string lastFileProcessed;
 
         // Keeps track of map extents in terms of cells
-        private int MapSize = 0;
-        private int MapMaxX = Int32.MinValue;
-        private int MapMaxY = Int32.MinValue;
-        private int MapMinX = Int32.MaxValue;
-        private int MapMinY = Int32.MaxValue;
 
-        private int CellCount;
 
-        private readonly LAND DefaultLand = new LAND();
         private static LTEX DefaultTex;
-        private static LAND[,] LandMap;
-        private List<AtlasRegion> Atlas;
-        private int AtlasSpanX, AtlasSpanY;
 
         /* Common handlers */
 
@@ -156,15 +146,6 @@ namespace MGEgui.DistantLand {
                 cell++;
                 tex -= 16;
             }
-        }
-
-        static public LTEX GetTex(int cellx, int celly, int texx, int texy) {
-            LTEX t = DefaultTex;
-            var c = LandMap[cellx, celly];
-            if (c != null) {
-                t = c.Textures[c.Tex[texx, texy]];
-            }
-            return t;
         }
 
         /* Configuration properties */
@@ -461,14 +442,6 @@ namespace MGEgui.DistantLand {
         }
 
         private void workerLoadPlugins(object sender, System.ComponentModel.DoWorkEventArgs e) {
-            LandMap = (LAND[,])Array.CreateInstance(typeof(LAND), new int[] {
-                501,
-                801
-            }, new int[] {
-                -250,
-                -250
-            });
-
             DefaultTex = new LTEX();
             DefaultTex.FilePath = "_land_default.tga";
             DefaultTex.index = 0;
@@ -478,8 +451,10 @@ namespace MGEgui.DistantLand {
                 throw new ApplicationException("Failed to load default ground texture (" + ex.Message + ")", ex);
             }
 
+            // Every land texture the LTEX records name, for the mip repair below.
+            var landTexPaths = new List<string>();
+
             const int invalidCellCoord = -99999;
-            CellCount = 0;
             int progress = 0;
             var warnings = new List<string>();
 
@@ -494,106 +469,7 @@ namespace MGEgui.DistantLand {
                 Textures.Add(0, DefaultTex);
 
                 while (rr.NextRecord()) {
-                    if (rr.Tag == "LAND") {
-                        var land = new LAND();
-                        land.Textures = Textures;
-                        int lx = invalidCellCoord, ly = invalidCellCoord;
-                        bool usesVertexHeights = true;
-
-                        while (rr.NextSubrecord()) {
-                            switch (rr.SubTag) {
-                                case "INTV":
-                                    lx = br.ReadInt32();
-                                    ly = br.ReadInt32();
-                                    land.xpos = lx;
-                                    land.ypos = ly;
-                                    break;
-                                case "DATA":
-                                    int flags = br.ReadInt32();
-                                    usesVertexHeights = (flags & 1) == 1;
-                                    break;
-                                case "VHGT":
-                                    int offset = (int)br.ReadSingle();
-                                    for (int y = 0; y < 65; y++) {
-                                        for (int x = 0; x < 65; x++) {
-                                            offset += br.ReadSByte();
-                                            land.Heights[x, y] = offset;
-                                        }
-                                        offset = land.Heights[0, y];
-                                    }
-                                    break;
-                                case "VNML":
-                                    for (int y = 0; y < 65; y++) {
-                                        for (int x = 0; x < 65; x++) {
-                                            sbyte vx, vy, vz;
-                                            vx = br.ReadSByte();
-                                            vy = br.ReadSByte();
-                                            vz = br.ReadSByte();
-                                            land.Normals[x, y] = new Normal(vx, vy, vz);
-                                        }
-                                    }
-                                    break;
-                                case "VCLR":
-                                    for (int y = 0; y < 65; y++) {
-                                        for (int x = 0; x < 65; x++) {
-                                            land.Color[x, y] = new RGB(br.ReadByte(), br.ReadByte(), br.ReadByte());
-                                        }
-                                    }
-                                    break;
-                                case "VTEX":
-                                    for (int y1 = 0; y1 < 4; y1++) {
-                                        for (int x1 = 0; x1 < 4; x1++) {
-                                            for (int y2 = 0; y2 < 4; y2++) {
-                                                for (int x2 = 0; x2 < 4; x2++) {
-                                                    land.Tex[x1 * 4 + x2, y1 * 4 + y2] = br.ReadInt16();
-                                                }
-                                            }
-                                        }
-                                    }
-
-                                    // Verify land texture index records exist
-                                    bool warningLatch = false;
-                                    for (int y = 0; y < 16; y++) {
-                                        for (int x = 0; x < 16; x++) {
-                                            int t = land.Tex[x, y];
-                                            if (!land.Textures.ContainsKey(t)) {
-                                                if (!warningLatch) {
-                                                    String warn = String.Format(strings["MissingLandTexture"], lx, ly, file);
-                                                    MessageBox.Show(warn, "Warning", MessageBoxButtons.OK);
-                                                    warnings.Add(warn);
-                                                    warningLatch = true;
-                                                }
-                                                // Reset missing index to use default texture
-                                                land.Tex[x, y] = 0;
-                                            }
-                                        }
-                                    }
-                                    break;
-                            }
-                        }
-                        if (usesVertexHeights && lx != invalidCellCoord && ly != invalidCellCoord) {
-                            if (lx >= LandMap.GetLowerBound(0) && lx <= LandMap.GetUpperBound(0)
-                                && ly >= LandMap.GetLowerBound(1) && ly <= LandMap.GetUpperBound(1)) {
-                                // Keep track of map extents
-                                MapMinX = Math.Min(MapMinX, lx);
-                                MapMaxX = Math.Max(MapMaxX, lx);
-                                MapMinY = Math.Min(MapMinY, ly);
-                                MapMaxY = Math.Max(MapMaxY, ly);
-    
-                                int maxDimension = Math.Max(MapMaxX - MapMinX, MapMaxY - MapMinY);
-                                MapSize = Math.Max(MapSize, maxDimension);
-    
-                                // Add land to map
-                                if (LandMap[lx, ly] == null) {
-                                    CellCount++;
-                                }
-                                LandMap[lx, ly] = land;
-                            }
-                            else {
-                                warnings.Add("Cell (" + lx + "," + ly + ") in plugin '" + file + "' is too far from the map centre. It will not be generated.");
-                            }
-                        }
-                    } else if (rr.Tag == "LTEX") {
+                    if (rr.Tag == "LTEX") {
                         var tex = new LTEX();
                         while (rr.NextSubrecord()) {
                             if (rr.SubTag == "INTV") {
@@ -613,17 +489,38 @@ namespace MGEgui.DistantLand {
                             tex.tex = DefaultTex.tex;
                         }
                         Textures.Add(tex.index, tex);
+                        landTexPaths.Add(tex.FilePath);
                     }
                 }
                 br.Close();
                 backgroundWorker.ReportProgress(++progress);
             }
+            // Complete truncated mip chains on the LOOSE land textures. Append-only, authored mips
+            // kept byte-for-byte, originals backed up under distantland\\mipfix_backup, BSA-packed
+            // vanilla assets never touched. The Forge host renders terrain from these directly
+            // (tasks/forge-terrain.md) and buckets them into Texture2DArrays, where ONE short source
+            // caps the mip chain of every texture sharing its bucket. This is the only point where
+            // the whole land-texture set is known. `_land_default.tga` is added explicitly: it is
+            // constructed outside the LTEX branch and is the most-drawn land texture there is.
+            landTexPaths.Add(DefaultTex.FilePath);
+            MGEgui.DirectX.LandMipFixer.Reset();
+            MGEgui.DirectX.LandMipFixer.Run(landTexPaths);
+            if (MGEgui.DirectX.LandMipFixer.Fixed > 0 || MGEgui.DirectX.LandMipFixer.SkippedBsa > 0) {
+                warnings.Add("Land texture mipmaps: completed " + MGEgui.DirectX.LandMipFixer.Fixed
+                    + " incomplete chain(s) (originals backed up to "
+                    + MGEgui.DirectX.StaticTexCreator.MipFixBackupDir + "), skipped "
+                    + MGEgui.DirectX.LandMipFixer.SkippedBsa + " BSA-packed.");
+                foreach (string mp in MGEgui.DirectX.LandMipFixer.FixedPaths) {
+                    warnings.Add("  mip-fixed land texture: " + mp);
+                }
+                foreach (string mp in MGEgui.DirectX.LandMipFixer.BsaSkippedPaths) {
+                    warnings.Add("  incomplete mips, BSA-packed (not modified): " + mp);
+                }
+            }
+
             if (warnings.Count > 0) {
                 e.Result = warnings;
             }
-
-            // Calculate texture atlas for both texture and land gen texture UVs
-            AtlasSetup();
         }
 
         private void workerFLoadPlugins(object sender, System.ComponentModel.RunWorkerCompletedEventArgs e) {
@@ -651,329 +548,29 @@ namespace MGEgui.DistantLand {
             backgroundWorker.DoWork -= workerLoadPlugins;
             backgroundWorker.RunWorkerCompleted -= workerFLoadPlugins;
             SavePlugsSettings();
+            // T4 (tasks/forge-terrain.md): the world-texture and world-mesh stages are GONE. The Forge
+            // host reads the LAND records itself at launch and draws the real heightfield, so there is
+            // nothing left here to bake - and the OOM that used to end this wizard was 32-bit address
+            // space in exactly those two stages. Plugins now hand straight to statics.
+            LTEX.ReleaseCache();
             if (SetupFlags["AutoRun"]) {
-                setFinishDesc(1);
-                if (SetupFlags["ChkLandTex"]) {
-                    bTexRun_Click(null, null);
+                setFinishDesc(3);
+                if (SetupFlags["ChkStatics"]) {
+                    bStatRun_Click(null, null);
                 } else {
-                    bTexSkip_Click(null, null);
+                    bStatSkip_Click(null, null);
                 }
             } else {
-                bTexSkip.Enabled = true;
-                bTexRun.Enabled = true;
-            }
-        }
-
-        private struct CreateTextureArgs {
-            public int WorldRes;
-            public int WorldNormal;
-        }
-
-        void workerCreateTextures(object sender, System.ComponentModel.DoWorkEventArgs e) {
-            var args = (CreateTextureArgs)e.Argument;
-            var ctc = new CellTexCreator(args.WorldRes);
-            int count = 0;
-            backgroundWorker.ReportProgress(count, strings["LandTextureCreate"]);
-
-            // Render world texture
-            var wtc = new WorldTexCreator(args.WorldRes, AtlasSpanX, AtlasSpanY);
-            wtc.Begin();
-            ctc.Begin();
-            foreach (var r in Atlas) {
-                for (int y = r.MinY; y <= r.MaxY; y++) {
-                    backgroundWorker.ReportProgress(Math.Min(++count, statusProgress.Maximum));
-                    for (int x = r.MinX; x <= r.MaxX; x++) {
-                        if (LandMap[x, y] == null || LandMap[x, y] == DefaultLand) {
-                            ctc.SetDefaultCell(DefaultTex);
-                        } else {
-                            // Set the colors and normals
-                            ctc.SetCell(LandMap[x, y]);
-                        }
-                        float x_pos = ((float)(x - r.MinX + r.OffsetX) + 0.5f) * wtc.x_spacing - 1.0f;
-                        float y_pos = ((float)(y - r.MinY + r.OffsetY) + 0.5f) * wtc.y_spacing - 1.0f;
-                        ctc.Render(x_pos, y_pos, wtc.x_scale, wtc.y_scale);
-                    }
+                if (lbStatOverrideList.Items.Count == 0) {
+                    lStatOverrideList.Visible = true;
                 }
-            }
-            ctc.End();
-            // Save the world texture.
-            wtc.FinishCompressed(Statics.fn_worldds, true);
-            wtc.Dispose();
-
-            // World normal map
-            wtc = new WorldTexCreator(args.WorldNormal, AtlasSpanX, AtlasSpanY);
-            wtc.Begin();
-            ctc.BeginNormalMap();
-            foreach (var r in Atlas) {
-                for (int y = r.MinY; y <= r.MaxY; y++) {
-                    backgroundWorker.ReportProgress(Math.Min(++count, statusProgress.Maximum));
-                    for (int x = r.MinX; x <= r.MaxX; x++) {
-                        if (LandMap[x, y] == null || LandMap[x, y] == DefaultLand) {
-                            ctc.SetDefaultCell(DefaultTex);
-                        } else {
-                            // Set the colors and normals
-                            ctc.SetCell(LandMap[x, y]);
-                        }
-                        float x_pos = ((float)(x - r.MinX + r.OffsetX) + 0.5f) * wtc.x_spacing - 1.0f;
-                        float y_pos = ((float)(y - r.MinY + r.OffsetY) + 0.5f) * wtc.y_spacing - 1.0f;
-                        ctc.RenderNormalMap(x_pos, y_pos, wtc.x_scale, wtc.y_scale);
-                    }
-                }
-            }
-            ctc.EndNormalMap();
-            wtc.FinishUncompressed(Statics.fn_worldn, false);
-            wtc.Dispose();
-
-            ctc.Dispose();
-        }
-
-        private class AtlasRegion {
-            public int Id;
-            public int MinX, MinY, MaxX, MaxY;
-            public int OffsetX, OffsetY;
-        }
-
-        void AtlasSetup() {
-            // Merge cells into atlas regions
-            var regions = new List<AtlasRegion>();
-            int currentAtlasId = 0;
-
-            for (int y = MapMinY; y <= MapMaxY; y++) {
-                for (int x = MapMinX; x <= MapMaxX; x++) {
-                    LAND land = LandMap[x, y];
-                    if (land == null || land == DefaultLand || land.atlasId >= 0) {
-                        continue;
-                    }
-
-                    // Found new starting cell
-                    var r = new AtlasRegion();
-                    regions.Add(r);
-                    r.Id = currentAtlasId;
-                    land.atlasId = currentAtlasId;
-
-                    // Search for connecting cells on the atlas border
-                    r.MinX = r.MaxX = x;
-                    r.MinY = r.MaxY = y;
-                    bool continueSearch = true, extend = false;
-
-                    while (continueSearch) {
-                        continueSearch = false;
-
-                        extend = false;
-                        for (int searchX = r.MinX - 1; searchX <= r.MaxX + 1; searchX++) {
-                            LAND searchLand = LandMap[searchX, r.MinY - 1];
-                            if (searchLand != null && searchLand != DefaultLand) {
-                                searchLand.atlasId = currentAtlasId;
-                                extend = true;
-                            }
-                        }
-                        if (extend) {
-                            r.MinY--;
-                            continueSearch = true;
-                        }
-
-                        extend = false;
-                        for (int searchX = r.MinX - 1; searchX <= r.MaxX + 1; searchX++) {
-                            LAND searchLand = LandMap[searchX, r.MaxY + 1];
-                            if (searchLand != null && searchLand != DefaultLand) {
-                                searchLand.atlasId = currentAtlasId;
-                                extend = true;
-                            }
-                        }
-                        if (extend) {
-                            r.MaxY++;
-                            continueSearch = true;
-                        }
-
-                        extend = false;
-                        for (int searchY = r.MinY - 1; searchY <= r.MaxY + 1; searchY++) {
-                            LAND searchLand = LandMap[r.MinX - 1, searchY];
-                            if (searchLand != null && searchLand != DefaultLand) {
-                                searchLand.atlasId = currentAtlasId;
-                                extend = true;
-                            }
-                        }
-                        if (extend) {
-                            r.MinX--;
-                            continueSearch = true;
-                        }
-
-                        extend = false;
-                        for (int searchY = r.MinY - 1; searchY <= r.MaxY + 1; searchY++) {
-                            LAND searchLand = LandMap[r.MaxX + 1, searchY];
-                            if (searchLand != null && searchLand != DefaultLand) {
-                                searchLand.atlasId = currentAtlasId;
-                                extend = true;
-                            }
-                        }
-                        if (extend) {
-                            r.MaxX++;
-                            continueSearch = true;
-                        }
-                    }
-
-                    currentAtlasId++;
-                }
-            }
-
-            // Pack regions closely into a square texture
-            int currentOffsetX = 0, currentOffsetY = 0;
-            Atlas = new List<AtlasRegion>();
-
-            // Sort regions by width, largest first
-            regions.Sort((a, b) => (b.MaxX - b.MinX).CompareTo(a.MaxX - a.MinX));
-
-            // Pack first (widest) region
-            var first = regions[0];
-            Atlas.Add(first);
-            regions.RemoveAt(0);
-
-            AtlasSpanX = first.MaxX - first.MinX + 1;
-            AtlasSpanY = first.MaxY - first.MinY + 1;
-            currentOffsetY += AtlasSpanY;
-
-            // Pack wide regions
-            int widthLimit = AtlasSpanX * 3 / 4;
-
-            while (regions.Count > 0) {
-                var r = regions[0];
-                int width = r.MaxX - r.MinX + 1, height = r.MaxY - r.MinY + 1;
-                if (width < widthLimit) {
-                    break;
-                }
-
-                r.OffsetX = 0;
-                r.OffsetY = currentOffsetY;
-                currentOffsetY += height;
-                AtlasSpanY += height;
-
-                Atlas.Add(r);
-                regions.RemoveAt(0);
-            }
-
-            // Sort remaining regions by height, largest first
-            regions.Sort((a, b) => (b.MaxY - b.MinY).CompareTo(a.MaxY - a.MinY));
-
-            // Pack smaller regions
-            while (regions.Count > 0) {
-                var r = regions[0];
-                int width = r.MaxX - r.MinX + 1, height = r.MaxY - r.MinY + 1;
-                if (currentOffsetX + width > AtlasSpanX) {
-                    currentOffsetX = 0;
-                    currentOffsetY = AtlasSpanY;
-                }
-                if (currentOffsetX == 0) {
-                    AtlasSpanY += height;
-                }
-
-                r.OffsetX = currentOffsetX;
-                r.OffsetY = currentOffsetY;
-                currentOffsetX += width;
-
-                Atlas.Add(r);
-                regions.RemoveAt(0);
-            }
-            
-            // Log atlas generation
-            var atlas_log = new StringBuilder("### World atlas ###\r\n\r\n");
-            int n = 0;
-            foreach (var a in Atlas) {
-                atlas_log.AppendFormat("World atlas {0}: Cells ({1},{2}) to ({3},{4})\r\n", n, a.MinX, a.MinY, a.MaxX, a.MaxY);
-                n++;
-            }
-            atlas_log.AppendLine();
-            File.AppendAllText(Statics.fn_dlLog, atlas_log.ToString());
-        }
-
-        void workerFCreateTextures(object sender, System.ComponentModel.RunWorkerCompletedEventArgs e) {
-            if (e.Error != null) {
-                DumpError(e.Error);
-                MessageBox.Show(strings["LandTextureError"] + "\n\n" + e.Error.ToString());
                 ChangingPage = true;
-                Close();
-                return;
-            }
-            statusProgress.Value = 0;
-            if (e.Result != null) {
-                warnings = (List<string>)e.Result;
-                allWarnings.AddRange(warnings);
-                saveWarnings("Textures");
-                if (!SetupFlags["AutoRun"]) {
-                    statusWarnings.Text = warnings.Count + " " + strings["WarningCount"];
-                    statusWarnings.Enabled = true;
-                }
-            }
-            if (DEBUG) {
-                allWarnings.Add("Landscape textures created");
-            }
-            statusText.Text = strings["LandTextureStatus"];
-            backgroundWorker.DoWork -= workerCreateTextures;
-            backgroundWorker.RunWorkerCompleted -= workerFCreateTextures;
-            if (SetupFlags["AutoRun"]) {
-                setFinishDesc(2);
-                if (SetupFlags["ChkLandMesh"]) {
-                    bMeshRun_Click(null, null);
-                } else {
-                    bMeshSkip_Click(null, null);
-                }
-            } else {
-                SaveTexSettings();
-                bMeshSkip.Enabled = true;
-                bMeshRun.Enabled = true;
-            }
-        }
-
-        private struct CreateMeshArgs {
-            public int MeshDetail;
-        }
-
-        void workerCreateMeshes(object sender, System.ComponentModel.DoWorkEventArgs e) {
-            var cma = (CreateMeshArgs)e.Argument;
-            backgroundWorker.ReportProgress(0, strings["LandMeshCreate"]);
-            GenerateWorldMesh(cma.MeshDetail, Statics.fn_world);
-            // Dispose of map object, high memory use
-            LandMap = null;
-        }
-
-        void workerFCreateMeshes(object sender, System.ComponentModel.RunWorkerCompletedEventArgs e) {
-            if (e != null) {
-                LTEX.ReleaseCache();
-                if (e.Error != null) {
-                    DumpError(e.Error);
-                    MessageBox.Show(strings["LandMeshError"] + "\n\n" + e.Error.ToString());
-                    ChangingPage = true;
-                    Close();
-                    return;
-                }
-                statusProgress.Value = 0;
-                if (e.Result != null) {
-                    warnings = (List<string>)e.Result;
-                    allWarnings.AddRange(warnings);
-                    saveWarnings("Meshes");
-                    if (!SetupFlags["AutoRun"]) {
-                        statusWarnings.Text = warnings.Count + " " + strings["WarningCount"];
-                        statusWarnings.Enabled = true;
-                    }
-                }
-                if (DEBUG) {
-                    allWarnings.Add("Landscape meshes created");
-                }
-                statusText.Text = strings["LandMeshStatus"];
-                backgroundWorker.DoWork -= workerCreateMeshes;
-                backgroundWorker.RunWorkerCompleted -= workerFCreateMeshes;
-                if (SetupFlags["AutoRun"]) {
-                    setFinishDesc(3);
-                    if (SetupFlags["ChkStatics"]) {
-                        bStatRun_Click(null, null);
-                    } else {
-                        bStatSkip_Click(null, null);
-                    }
-                } else {
-                    SaveMeshSettings();
-                    bStatExportStatics.Enabled = true;
-                    bStatRun.Enabled = true;
-                    bStatSkip.Enabled = true;
-                }
+                tabControl.SelectedIndex = 3;
+                statusWarnings.Text = strings["NoWarnings"];
+                statusWarnings.Enabled = false;
+                bStatExportStatics.Enabled = true;
+                bStatRun.Enabled = true;
+                bStatSkip.Enabled = true;
             }
         }
 
@@ -2229,41 +1826,12 @@ namespace MGEgui.DistantLand {
             }
         }
 
+        // T4: the world texture/mesh pages are bypassed (workerFLoadPlugins goes straight to
+        // statics), so these two Run handlers can no longer be reached from the wizard. They stay as
+        // methods only because the designer wires the buttons to them; if one is somehow clicked, do
+        // the one sane thing and move on to statics rather than silently no-op.
         private void bTexRun_Click(object sender, EventArgs e) {
-            if ((128 << cmbTexWorldResolution.SelectedIndex > DXMain.mCaps.MaxTexSize) || (128 << cmbTexWorldNormalRes.SelectedIndex > DXMain.mCaps.MaxTexSize)) {
-                MessageBox.Show(strings["TexResError"], Statics.strings["Error"]);
-                return;
-            }
-            if (cmbMeshWorldDetail.SelectedIndex == -1) {
-                cmbMeshWorldDetail_auto = true;
-                cmbMeshWorldDetail.SelectedIndex = 2;
-                cmbMeshWorldDetail.SelectedIndexChanged += new EventHandler(cmbMeshWorldDetail_SelectedIndexChanged);
-                lMeshAutoInfo.Visible = true;
-                if (DEBUG) {
-                    allWarnings.Add("World mesh auto-set to " + cmbMeshWorldDetail.Text);
-                }
-            } else {
-                lMeshAutoInfo.Visible = false;
-            }
-            if (!SetupFlags["AutoRun"]) {
-                ChangingPage = true;
-                tabControl.SelectedIndex = 2;
-            }
-            if (DEBUG) {
-                allWarnings.Add("Creating world textures");
-            }
-            statusText.Text = strings["LandTextureCreate"];
-            statusProgress.Maximum = AtlasSpanY * Atlas.Count;
-            backgroundWorker.WorkerReportsProgress = true;
-            backgroundWorker.DoWork += workerCreateTextures;
-            backgroundWorker.RunWorkerCompleted += workerFCreateTextures;
-            statusWarnings.Text = strings["NoWarnings"];
-            statusWarnings.Enabled = false;
-
-            var args = new CreateTextureArgs();
-            args.WorldRes = 128 << cmbTexWorldResolution.SelectedIndex;
-            args.WorldNormal = 128 << cmbTexWorldNormalRes.SelectedIndex;
-            backgroundWorker.RunWorkerAsync(args);
+            bTexSkip_Click(sender, e);
         }
 
         /* Land mesh tab properties */
@@ -2278,27 +1846,7 @@ namespace MGEgui.DistantLand {
         }
 
         private void bMeshRun_Click(object sender, EventArgs e) {
-            if (lbStatOverrideList.Items.Count == 0) {
-                lStatOverrideList.Visible = true;
-            }
-            if (!SetupFlags["AutoRun"]) {
-                ChangingPage = true;
-                tabControl.SelectedIndex = 3;
-            }
-            if (DEBUG) {
-                allWarnings.Add("Creating world meshes");
-            }
-            statusText.Text = strings["LandMeshCreate"];
-            statusProgress.Maximum = 100;
-            backgroundWorker.WorkerReportsProgress = true;
-            backgroundWorker.DoWork += workerCreateMeshes;
-            backgroundWorker.RunWorkerCompleted += workerFCreateMeshes;
-            statusWarnings.Text = strings["NoWarnings"];
-            statusWarnings.Enabled = false;
-
-            var cma = new CreateMeshArgs();
-            cma.MeshDetail = cmbMeshWorldDetail.SelectedIndex;
-            backgroundWorker.RunWorkerAsync(cma);
+            bMeshSkip_Click(sender, e);
         }
 
         private void bMeshSkip_Click(object sender, EventArgs e) {
@@ -2359,71 +1907,6 @@ namespace MGEgui.DistantLand {
                 }
             }
             bw.Close();
-        }
-
-        /* Land mesh methods */
-
-        private void GenerateWorldMesh(int detail, string path) {
-            // Landscape detail selection
-            float tolerance = 125.0f;
-            if (detail >= 0 && detail <= 4) {
-                var toleranceOptions = new float[] { 15.0f, 70.0f, 125.0f, 180.0f, 235.0f };
-                tolerance = toleranceOptions[detail];
-            }
-
-            // Produce packed atlas data
-            var atlas_data = new float[8 * Atlas.Count];
-            var iAtlas = 0;
-            foreach (var r in Atlas) {
-                atlas_data[iAtlas + 0] = r.MinX * 8192.0f;
-                atlas_data[iAtlas + 1] = r.MaxX * 8192.0f;
-                atlas_data[iAtlas + 2] = r.MinY * 8192.0f;
-                atlas_data[iAtlas + 3] = r.MaxY * 8192.0f;
-                atlas_data[iAtlas + 4] = r.OffsetX * 8192.0f;
-                atlas_data[iAtlas + 5] = r.OffsetY * 8192.0f;
-                atlas_data[iAtlas + 6] = AtlasSpanX * 8192.0f;
-                atlas_data[iAtlas + 7] = AtlasSpanY * 8192.0f;
-                iAtlas += 8;
-            }
-
-            // Ensure previous landscape data is erased
-            if (File.Exists(path)) {
-                File.Delete(path);
-            }
-
-            // Generate optimized landscape mesh
-            foreach (var r in Atlas) {
-                // Produce atlas region heightmap array
-                int RegionSpanX = r.MaxX - r.MinX + 1;
-                int RegionSpanY = r.MaxY - r.MinY + 1;
-                int DataSpanX = RegionSpanX * 64;
-                int DataSpanY = RegionSpanY * 64;
-                var height_data = new float[DataSpanX * DataSpanY];
-    
-                for (int y1 = r.MinY; y1 <= r.MaxY; y1++) {
-                    for (int y2 = 0; y2 < 64; y2++) {
-                        for (int x1 = r.MinX; x1 <= r.MaxX; x1++) {
-                            for (int x2 = 0; x2 < 64; x2++) {
-                                int y = (y1 - r.MinY) * 64 + y2;
-                                int x = (x1 - r.MinX) * 64 + x2;
-                                if (LandMap[x1, y1] != null) {
-                                    height_data[y * DataSpanX + x] = (float)LandMap[x1, y1].Heights[x2, y2] * 8.0f;
-                                } else {
-                                    height_data[y * DataSpanX + x] = -2048.0f;
-                                }
-                            }
-                        }
-                    }
-                }
-    
-                float minX = (float)r.MinX * 8192.0f;
-                float maxX = (float)(r.MaxX + 1) * 8192.0f;
-                float minY = (float)r.MinY * 8192.0f;
-                float maxY = (float)(r.MaxY + 1) * 8192.0f;
-    
-                backgroundWorker.ReportProgress(10, strings["LandTessellating"]);
-                NativeMethods.TessellateLandscapeAtlased(path, height_data, (uint)DataSpanX, (uint)DataSpanY, atlas_data, (uint)Atlas.Count, minX, minY, maxX, maxY, tolerance);
-            }
         }
 
         /* Statics tab properties */
@@ -3467,7 +2950,7 @@ namespace MGEgui.DistantLand {
         private void bFinish_Click(object sender, EventArgs e) {
             File.WriteAllBytes(Statics.fn_dlver, new byte[] { Statics.DistantLandVersion });
             // If the user generated everything they need for distant land, go ahead and enable it
-            if (File.Exists(Statics.fn_dlver) && File.Exists(Statics.fn_world) && File.Exists(Statics.fn_worldds) && File.Exists(Statics.fn_worldn)) {
+            if (File.Exists(Statics.fn_dlver)) {
                 Statics.mf.cbDLDistantLand.Checked = true;
             }
             ChangingPage = true;

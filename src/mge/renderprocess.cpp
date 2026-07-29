@@ -67,6 +67,22 @@ namespace {
     bool   g_distLightsTogglePending = false; // numpad- latched at composite finish; one-shot host dist-light A/B
     bool   g_fpSuppressLive = true;    // FP1b: MW arm suppression; on by default, numpad-/ flips live for the A/B
 
+    // T3 (tasks/forge-terrain.md): stop emitting MW's OWN near terrain once the host is drawing the
+    // real LAND heightfield for near AND far on one LOD ladder. Two producers of one surface is the
+    // seam this whole plan exists to delete — and the old handover (z-sink, nearViewRange-1152, the
+    // band) has nothing left to reconcile.
+    //
+    // Gated on the HOST's report, not on a client setting: g_hostOwnsTerrain mirrors
+    // HostFrameTimings::terrainOwned, so if the host is not actually drawing terrain (still loading,
+    // load failed, panel toggle off) MW keeps drawing its own. Suppressing without that check turns
+    // a double-draw into a HOLE, which is strictly worse. Cleared whenever the seam drops so an
+    // F11-off frame is always vanilla.
+    // No client-side override and no new key: the host's own "Draw: terrain" panel checkbox IS the
+    // A/B. Unchecking it drops terrainOwned to 0, which hands the near field straight back to MW on
+    // the very next frame. One switch, both halves, and the keyspace stays untouched (the free
+    // numpad keys collide with the water-flow handlers' edge polls — see the note at the key block).
+    bool   g_hostOwnsTerrain = false;
+
     // Frame-ahead pipelining: on early-kickoff frames the paired
     // renderSceneFinish + RT copy defer to the NEXT frame's BeginScene(0) collect, and the
     // EndScene(0) composite point blits the PREVIOUS host frame from g_mainTex (which the
@@ -2369,11 +2385,24 @@ namespace {
         const float fwdY = DistantLand::mwView._23;
         const float fwdZ = DistantLand::mwView._33;
 
+        // T3: MW's near terrain is the host's job now — one heightfield covers near and far on a
+        // single LOD ladder, so emitting MW's copy is a second producer of one surface. OFF unless
+        // the host reports it is actually drawing terrain this frame (see g_hostOwnsTerrain):
+        // suppressing when the host is not drawing turns a double-draw into a HOLE.
+        // forgeOwnsFrame() is ANDed in for correctness-by-construction, not belt-and-braces: when
+        // the seam drops there is no RPC, so g_hostOwnsTerrain keeps its last value and would read
+        // stale-true. Every other suppression keys on this same predicate for the same reason.
+        const bool dropMWLand = g_hostOwnsTerrain && RenderProcess::forgeOwnsFrame();
+
         // Per-entry dispatch, identical on both paths (see the filter contract above).
         // slot is mutable — the emit helpers update its cached texture SlotInfo.
         auto dispatch = [&](auto& slot, const auto& e) {
             if (e.isSky) return;   // sky rides the Forge alpha-blend sky pass (buildSkyDrawList)
             if (e.isFP) return;    // FP arms ride the dedicated host FP pass (buildFPDrawLists)
+            // Terrain: host-owned. Covers the alpha-SPLAT trishapes too (MW multi-passes terrain
+            // texture blending), which is why this sits above the blendEnable branches — the host
+            // heightfield already carries the blend, per-pixel, from the same VTEX data.
+            if (e.isLandscape && dropMWLand) return;
             if (e.isSkinned) {
                 if (wantSkinned) emitSkinnedDraw(slot, e, skinnedCount);
                 return;
@@ -3785,6 +3814,18 @@ namespace RenderProcess {
         // work buys little. Names carry (N-1) because under frame-ahead the drained frame is
         // one behind MW's current frame — the plot point lands on the frame that CONSUMED it.
         g_lastHostTimings = hostT;
+        // T3: does the host own the world's terrain this frame? Only then may MW stop drawing its
+        // own (buildGeometryDrawLists' dropMWLand). r.ok gates it because a FAILED finish leaves
+        // hostT default-constructed — reading a zeroed block as "not owned" is the safe direction
+        // anyway (MW keeps drawing), but keying on r.ok makes that explicit rather than incidental.
+        {
+            const bool owns = r.ok && hostT.terrainOwned > 0.5f;
+            if (owns != g_hostOwnsTerrain) {
+                g_hostOwnsTerrain = owns;
+                LOG::logline(">> [seam] host terrain ownership %s — MW near land %s",
+                             owns ? "ON" : "OFF", owns ? "SUPPRESSED" : "restored");
+            }
+        }
         MGE_TracyPlot("host GPU frame ms (N-1)",  (double)hostT.gpuFrameMs);
         MGE_TracyPlot("host CPU setup ms (N-1)",  (double)hostT.cpuSetupMs);
         MGE_TracyPlot("host CPU cull ms (N-1)",   (double)hostT.cpuCullMs);

@@ -1258,7 +1258,7 @@ namespace MGEgui {
 
         private void cbDistantLand_CheckedChanged(object sender, EventArgs e) {
             if (cbDLDistantLand.Checked) {
-                if (!File.Exists(Statics.fn_dlver) || !File.Exists(Statics.fn_world) || !File.Exists(Statics.fn_worldds) || !File.Exists(Statics.fn_worldn)) {
+                if (!File.Exists(Statics.fn_dlver)) {
                     cbDLDistantLand.Checked = false;
                     MessageBox.Show(strings["NoDLOrOld"], Statics.strings["Warning"]);
                     return;
@@ -1485,7 +1485,7 @@ namespace MGEgui {
             bool exists = false;
             
             if (Directory.Exists(Statics.fn_dl)) {
-                if (!File.Exists(Statics.fn_dlver) || !File.Exists(Statics.fn_world) || !File.Exists(Statics.fn_worldds) || !File.Exists(Statics.fn_worldn)) {
+                if (!File.Exists(Statics.fn_dlver)) {
                     if (MessageBox.Show(strings["DLDelOldCorrupt"], Statics.strings["Warning"], MessageBoxButtons.YesNo) != DialogResult.Yes) {
                         return;
                     }

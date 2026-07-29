@@ -161,15 +161,17 @@
 #include "glow.frag.fsl"
 #end
 
-// Phase 1a: host-owned distant-land LOD. Own 16B vertex layout (pos + SHORT2N atlas UV),
-// reuses opaque.srt.h / DefaultRootSignature + the bindless gTextures atlas. One colour
-// pipeline (depth-write, reverse-Z GEQUAL), no prepass (terrain is fully opaque).
-#vert distantland.vert
-#include "distantland.vert.fsl"
+// Host-owned TERRAIN (tasks/forge-terrain.md): the real Morrowind heightfield, read from the plugin
+// LAND records at launch and drawn as one shared 65x65 lattice VB instanced per cell, with the
+// height fetched per-vertex out of gTerrainHeights in the VS. LOD = index-buffer stride, cracks
+// closed by edge stitching (no skirts). Reuses opaque.srt.h / DefaultRootSignature; the two data
+// buffers are appended to the PerFrame set. This REPLACED distantland.vert/.frag (deleted in T4).
+#vert terrain.vert
+#include "terrain.vert.fsl"
 #end
 
-#frag distantland.frag
-#include "distantland.frag.fsl"
+#frag terrain.frag
+#include "terrain.frag.fsl"
 #end
 
 // Phase 1b: host-owned distant STATICS. Binding 0 = StaticElem vertex (20B); binding 1 = per-

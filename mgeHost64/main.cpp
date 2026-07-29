@@ -3,6 +3,7 @@
 #include "mge/configuration.h"
 #include "ipc/server.h"
 #include "forgerender.h"
+#include "terrain.h"
 
 #include <cstdio>
 #include <cstring>
@@ -76,8 +77,26 @@ int main(int argc, char** argv) {
 		return ForgeRender::sceneProbe() ? 0 : 1;
 	}
 
+	// Standalone terrain census (tasks/forge-terrain.md T0): parse every plugin's LAND/LTEX
+	// records and print the census, with no GPU, no IPC and no Morrowind — so the loader can be
+	// verified (cell count, extent, texture count, parse time) without driving the game.
+	// MUST run with cwd = the install dir.
+	if (argc >= 2 && std::strcmp(argv[1], "--terrain-census") == 0) {
+		LOG::open("mgeHost64_terrain.log");
+		Terrain::beginLoadAsync();
+		const bool ok = Terrain::waitLoaded(600000);
+		LOG::flush();
+		return (ok && Terrain::cellCount() > 0) ? 0 : 1;
+	}
+
 	LOG::open("mgeHost64.log");
 	LOG::logline("Host process started");
+
+	// Host-owned terrain (tasks/forge-terrain.md): read every plugin's LAND records NOW, on a
+	// background thread, so the parse overlaps MW's own load and the client handshake below.
+	// cwd is the install dir, so Morrowind.ini and Data Files resolve relative. No disk artifact,
+	// no MGEgui bake, nothing to regenerate when the mod list changes.
+	Terrain::beginLoadAsync();
 
 	HANDLE sharedMem = INVALID_HANDLE_VALUE;
 	HANDLE clientProcess = INVALID_HANDLE_VALUE;

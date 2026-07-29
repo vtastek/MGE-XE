@@ -209,9 +209,6 @@ namespace MGEgui {
         public const string fn_textures = fn_dataFiles + @"\textures";
         public const string fn_dl = fn_dataFiles + @"\distantland";
         public const string fn_dlver = fn_dl + @"\version";
-        public const string fn_world = fn_dl + @"\world";
-        public const string fn_worldds = fn_dl + @"\world.dds";
-        public const string fn_worldn = fn_dl + @"\world_n.dds";
         public const string fn_statics = fn_dl + @"\statics";
         public const string fn_usagedata = fn_dl + @"\statics\usage.data";
         public const string fn_statmesh = fn_dl + @"\statics\static_meshes";

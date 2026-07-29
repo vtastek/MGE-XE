@@ -34,6 +34,10 @@
 // indexed bindlessly — no switch, no per-texture descriptor. MAX_TEXTURES + MAX_STATICS_BUCKETS =
 // 1024, the proven-OK Persistent-table size (see geomwire.h). statics texSlot = (bucket<<16)|layer.
 #define MAX_STATICS_BUCKETS 128
+// Host-owned terrain land textures: same bucketed-Texture2DArray residency as gStaticsArrays, in
+// its OWN declaration (see gTerrainArrays). 499 unique LTEX over a handful of (format, capped size)
+// combinations, so this is generously sized; the residency log reports actual occupancy.
+#define MAX_TERRAIN_BUCKETS 32
 #define MAX_POINT_LIGHTS 128 // per-frame point-light cap; MUST match IPC::kMaxPointLights (geomwire.h)
 // NiUVController takeover: per-frame UV-animation table (gUVAnim). Entry id = (du, dv, setIndex, 0);
 // id 0 is reserved = "no animation" (entry 0 stays zero). MUST match host kMaxUVAnim (forgerender.cpp).
@@ -59,9 +63,10 @@ STRUCT(FrameData)
     // — cranking one isolates what's still on MW's own path. 192B total < 256B CBV min.
     DATA(float4, dbgScales,   None);  // x = ambient, y = diffuse, z = albedo, w = overall
     // Phase 1a distant-land LOD (host-owned DL). Appended so every field above keeps its offset.
-    // distantland.vert/.frag read these; opaque/skinned/multimap never touch them (harmless when 0).
-    // lodParams: x = base-atlas bindless slot, y = normal-atlas slot, z = detail-atlas slot,
-    //            w = nearViewRange (for the landBias z-sink). 208B.
+    // lodParams.xyz WERE the DL world bake's base/normal/detail atlas slots; the bake and its
+    // distantland.vert/.frag were deleted in T4 (tasks/forge-terrain.md), so xyz are now written 0
+    // and read by nothing. Kept as padding rather than repacked — every field below would shift.
+    // lodParams.w = nearViewRange, still LIVE: statics.vert gates the hero near-cut on it. 208B.
     DATA(float4, lodParams,   None);
     // lodSunAmb: xyz = distant-land sun ambient (XE Mod Landscape.fx sunAmb). 224B < 256B CBV min.
     DATA(float4, lodSunAmb,   None);
@@ -250,6 +255,34 @@ BEGIN_SRT_NO_AB(SrtData)
         // Only alpha.frag reads it (harmless null tail everywhere else). Appended LAST so every
         // existing PerFrame offset stays stable.
         DECL_BUFFER(PerFrame, Buffer(uint4), gAlphaStages)
+        // Host-owned TERRAIN residency (tasks/forge-terrain.md). The whole world's LAND heightfield
+        // and hand-painted vertex colour, uploaded ONCE at first exterior and never streamed — 3910
+        // cells is ~99 MB, which simply fits, so there is no residency scheme to get wrong.
+        //   gTerrainHeights: two int16 (VHGT units) per uint, cell stride 2113 uints.
+        //   gTerrainColor  : one 0x00BBGGRR per vertex,       cell stride 4225 uints.
+        // Both index as slot*stride + (y*65 + x). Read by terrain.vert ONLY (a null tail for every
+        // other shader on this root signature); appended LAST so every existing PerFrame offset
+        // stays stable. In the PerFrame set rather than Persistent because that set's SRV table is
+        // already at its proven-OK 1024 entries (gTextures + gStaticsArrays + gFlipArrays).
+        DECL_BUFFER(PerFrame, Buffer(uint), gTerrainHeights)
+        DECL_BUFFER(PerFrame, Buffer(uint), gTerrainColor)
+        // ...and the LAND texture layout: gTerrainTex holds each cell's 16x16 VTEX as ONE texture
+        // SLOT per uint (cell stride 256) — the LTEX ids are resolved to (bucket<<16)|layer once at
+        // residency build, so the frag's hot path is one load, not a load plus an id->slot
+        // indirection. One slot per uint, not two packed: a slot needs the full 32 bits, and
+        // packing two per uint truncated every real texture to 0 (white).
+        // gTerrainCellGrid maps a WORLD grid coord to slot+1 (0 = no cell); it is what
+        // lets the frag reach into a NEIGHBOUR cell's VTEX, which Morrowind's own vertex->texture-
+        // square rounding requires at every cell edge — without it the world gets a texture seam
+        // every 8192 units.
+        DECL_BUFFER(PerFrame, Buffer(uint), gTerrainTex)
+        DECL_BUFFER(PerFrame, Buffer(uint), gTerrainCellGrid)
+        // Land textures: array of Texture2DArrays bucketed by (format, capped size), exactly the
+        // gStaticsArrays shape and for the same reason — 499 unique LTEX will not fit in individual
+        // bindless slots (MAX_TEXTURES is 880 with the near scene already contending). Its own
+        // declaration, NOT gStaticsArrays: the statics bake is itself on the way out.
+        // Slot encoding is the same (bucket<<16)|layer. Declared LAST in the set.
+        DECL_ARRAY_TEXTURES(PerFrame, Tex2DArray(float4), gTerrainArrays, MAX_TERRAIN_BUCKETS)
     END_SRT_SET(PerFrame)
     // Point-light cbuffer — rides the otherwise-unused PerDraw set (FSL has exactly four
     // fixed update frequencies: Persistent/PerFrame/PerBatch/PerDraw; a custom set name has

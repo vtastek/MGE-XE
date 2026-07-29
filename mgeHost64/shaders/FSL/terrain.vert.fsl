@@ -1,0 +1,171 @@
+// mgeHost64 — host-owned terrain (tasks/forge-terrain.md, T1): vertex stage.
+//
+// This replaces the DL world bake's decimated mesh with the REAL Morrowind heightfield. There is no
+// terrain mesh anywhere: one shared unit grid VB (65x65 lattice positions, in grid units) is drawn
+// once per visible cell, and each vertex fetches its own height out of gTerrainHeights in the VS —
+// per [[feedback_vtf_over_cpu_baking]]. Displacement and erosion later drop into this same fetch
+// with no data-format change.
+//
+// LOD is index-buffer STRIDE (1/2/4/8/16/32 over the 65x65 lattice), picked per cell by distance on
+// the CPU. Cracks between neighbouring cells at different strides are closed by EDGE STITCHING, not
+// by skirts: a boundary vertex whose neighbour is coarser resamples its height on the neighbour's
+// lattice, so the two cells' shared edge is literally the same polyline. Corners never move (0 and
+// 64 are multiples of every power-of-two stride), so the two axes can never fight over one vertex.
+//
+// Camera-relative like the rest of the live frame: the CPU passes each cell's origin already
+// shifted by -eye (absolute cell origins reach ~400k units, where float32 starts to shake — see
+// [[project_forge_precision_far_origin]]); only Z is shifted here, against gFrameData.lodEye.
+
+#include "opaque.srt.h"
+
+#define TERRAIN_VERTS   65
+#define TERRAIN_QUADS   64
+#define TERRAIN_SPACING 128.0f    // world units between LAND vertices
+#define TERRAIN_HSCALE  8.0f      // VHGT units -> world units
+#define TERRAIN_HSTRIDE 2113u     // uints per cell in gTerrainHeights (4225 int16, 2 per uint)
+#define TERRAIN_CSTRIDE 4225u     // uints per cell in gTerrainColor  (one 0x00BBGGRR per vertex)
+
+STRUCT(VSInput)
+{
+    DATA(float2, Grid,   POSITION);    // lattice coords (gx, gy) in 0..64, multiples of the LOD stride
+    DATA(float2, Origin, TEXCOORD1);   // per-instance: cell origin XY, ALREADY camera-relative
+    DATA(uint4,  Inst0,  TEXCOORD2);   // per-instance: slot, stride, packed neighbour strides, local XY
+    DATA(uint2,  Inst1,  TEXCOORD3);   // per-instance: packed grid span, flags
+};
+
+STRUCT(VSOutput)
+{
+    DATA(float4, Position, SV_Position);
+    DATA(float3, WorldPos, TEXCOORD0);            // camera-relative (fog, shadows, point lights)
+    DATA(float3, Normal,   TEXCOORD1);            // from the heightfield — VNML is never uploaded
+    // VCLR is NOT interpolated from here: it is sampled per PIXEL in the frag, at the full 65x65
+    // rate, so hand-painted detail (thin roads) survives a coarse LOD. See terrain.frag.fsl.
+    // CENTROID on Fog for the same reason statics.vert marks Color/Fog: an MSAA sliver
+    // extrapolates a non-centroid interpolator past the triangle and speckles the shading.
+    // See [[project_forge_centroid_interpolators]].
+    DATA(CENTROID(float),  Fog,   TEXCOORD2);
+    // CONTINUOUS lattice coords (0..64 within this cell). The frag reconstructs Morrowind's own
+    // per-vertex texture-square assignment from these, so they must interpolate smoothly.
+    DATA(float2, Lattice,  TEXCOORD3);
+    DATA(FLAT(uint4), Cell, TEXCOORD4);           // slot, localX, localY, packed grid span
+    // Below-water clip for the reflect pass; pass-all (0,0,0,1) in every other frame cbuffer,
+    // exactly as distantland.vert uses it.
+    DATA(float,  Clip,     SV_ClipDistance0);
+};
+
+// World-grid cell lookup: local grid coords -> slot+1, 0 when that cell has no LAND record (or is
+// off the map). One flat table replaces plumbing per-neighbour slots through the instance, and it
+// reaches DIAGONALLY, which the frag's texture-square wrap needs at cell corners.
+uint terrainCellAt(int lx, int ly, uint spanX, uint spanY)
+{
+    if (lx < 0 || ly < 0 || lx >= (int)spanX || ly >= (int)spanY) { return 0u; }
+    return gTerrainCellGrid[(uint)ly * spanX + (uint)lx];
+}
+
+// One vertex's height, in WORLD units. Heights are int16 packed two per uint.
+float loadHeight(uint slot, int x, int y)
+{
+    uint v    = (uint)(y * TERRAIN_VERTS + x);
+    uint word = gTerrainHeights[slot * TERRAIN_HSTRIDE + (v >> 1u)];
+    uint h16  = ((v & 1u) != 0u) ? (word >> 16u) : (word & 0xFFFFu);
+    int  h    = (int)h16;
+    if (h > 32767) { h -= 65536; }                // sign-extend the int16
+    return (float)h * TERRAIN_HSCALE;
+}
+
+// Height at a lattice coord that may fall ONE step outside this cell (normals only). Crossing into
+// the neighbour cell keeps the normal continuous across cell boundaries; without it every cell edge
+// in the world gets a lighting seam. x == -s in this cell is x == 64-s in the -X neighbour, because
+// the two cells SHARE their boundary vertex column. Falls back to clamping when there is no
+// neighbour (world edge).
+float loadHeightWide(uint slot, int lx, int ly, uint spanX, uint spanY, int x, int y)
+{
+    int dx = 0, dy = 0;
+    if (x < 0)                  { dx = -1; x += TERRAIN_QUADS; }
+    else if (x > TERRAIN_QUADS) { dx =  1; x -= TERRAIN_QUADS; }
+    if (y < 0)                  { dy = -1; y += TERRAIN_QUADS; }
+    else if (y > TERRAIN_QUADS) { dy =  1; y -= TERRAIN_QUADS; }
+    if (dx != 0 || dy != 0) {
+        uint n = terrainCellAt(lx + dx, ly + dy, spanX, spanY);
+        if (n != 0u) { return loadHeight(n - 1u, x, y); }
+        // No neighbour (world edge): clamp back into this cell rather than invent a height.
+        return loadHeight(slot, clamp(x - dx * TERRAIN_QUADS, 0, TERRAIN_QUADS),
+                                clamp(y - dy * TERRAIN_QUADS, 0, TERRAIN_QUADS));
+    }
+    return loadHeight(slot, x, y);
+}
+
+ROOT_SIGNATURE(DefaultRootSignature)
+VSOutput VS_MAIN( VSInput In )
+{
+    INIT_MAIN;
+    VSOutput Out;
+
+    const int  gx     = (int)In.Grid.x;
+    const int  gy     = (int)In.Grid.y;
+    const uint slot   = In.Inst0.x;
+    const uint stride = In.Inst0.y;
+    const uint nbrS   = In.Inst0.z;    // neighbour strides, one byte each: -X, +X, -Y, +Y
+    const int  lx     = (int)(In.Inst0.w & 0xFFFFu);          // this cell's world-grid coords...
+    const int  ly     = (int)(In.Inst0.w >> 16u);
+    const uint spanX  = In.Inst1.x & 0xFFFFu;                 // ...and the grid's dimensions
+    const uint spanY  = In.Inst1.x >> 16u;
+
+    // --- Edge stitch: resample onto the COARSER neighbour's lattice so the shared edge matches. ---
+    uint snap = stride;
+    uint axis = 0u;                    // 0 = interior, 1 = snap along X, 2 = snap along Y
+    if (gy == 0)                  { uint s = (nbrS >> 16u) & 0xFFu; if (s > snap) { snap = s; axis = 1u; } }
+    else if (gy == TERRAIN_QUADS) { uint s = (nbrS >> 24u) & 0xFFu; if (s > snap) { snap = s; axis = 1u; } }
+    if (gx == 0)                  { uint s = (nbrS       ) & 0xFFu; if (s > snap) { snap = s; axis = 2u; } }
+    else if (gx == TERRAIN_QUADS) { uint s = (nbrS >>  8u) & 0xFFu; if (s > snap) { snap = s; axis = 2u; } }
+
+    float h;
+    if (axis == 1u) {
+        int   x0 = (gx / (int)snap) * (int)snap;
+        int   x1 = min(x0 + (int)snap, TERRAIN_QUADS);
+        float t  = float(gx - x0) / float(snap);
+        h = lerp(loadHeight(slot, x0, gy), loadHeight(slot, x1, gy), t);
+    } else if (axis == 2u) {
+        int   y0 = (gy / (int)snap) * (int)snap;
+        int   y1 = min(y0 + (int)snap, TERRAIN_QUADS);
+        float t  = float(gy - y0) / float(snap);
+        h = lerp(loadHeight(slot, gx, y0), loadHeight(slot, gx, y1), t);
+    } else {
+        h = loadHeight(slot, gx, gy);
+    }
+
+    // Camera-relative position. NO z-sink: unlike the DL world bake this mesh is native resolution,
+    // so it has nothing to hide under (XE Mod Landscape.fx's landBias existed only because the
+    // decimated mesh disagreed with MW's near land — see tasks/forge-near-far-unify.md).
+    float3 worldPos;
+    worldPos.x = In.Origin.x + float(gx) * TERRAIN_SPACING;
+    worldPos.y = In.Origin.y + float(gy) * TERRAIN_SPACING;
+    worldPos.z = h - gFrameData.lodEye.z;
+
+    // Normal by central difference at the FULL-RESOLUTION step (1), never at the LOD stride. The
+    // sample rate of the shading data is deliberately decoupled from the mesh's: at stride 16 a
+    // stride-16 difference averages the gradient over 2048 world units and the terrain shades flat
+    // at exactly the distance you are looking at most of it. Stride 1 gives each drawn vertex its
+    // TRUE normal — the same one MW's own per-vertex normal carries — for the same 4 loads, and the
+    // rasterizer interpolates between them. Free, and it is parity rather than embellishment.
+    {
+        const float hL = loadHeightWide(slot, lx, ly, spanX, spanY, gx - 1, gy);
+        const float hR = loadHeightWide(slot, lx, ly, spanX, spanY, gx + 1, gy);
+        const float hD = loadHeightWide(slot, lx, ly, spanX, spanY, gx, gy - 1);
+        const float hU = loadHeightWide(slot, lx, ly, spanX, spanY, gx, gy + 1);
+        const float d  = 2.0f * TERRAIN_SPACING;
+        Out.Normal = normalize(float3(-(hR - hL) / d, -(hU - hD) / d, 1.0f));
+    }
+
+    Out.Position = mul(gFrameData.viewProj, float4(worldPos, 1.0f));
+    Out.WorldPos = worldPos;
+    Out.Lattice  = float2(float(gx), float(gy));
+    Out.Cell     = uint4(slot, (uint)lx, (uint)ly, In.Inst1.x);
+
+    float dist = length(worldPos - gFrameData.eyePos.xyz);
+    Out.Fog = saturate((gFrameData.fogParams.y - dist)
+                       / (gFrameData.fogParams.y - gFrameData.fogParams.x));
+
+    Out.Clip = dot(gFrameData.gReflWaterClip.xyz, worldPos) + gFrameData.gReflWaterClip.w;
+    RETURN(Out);
+}

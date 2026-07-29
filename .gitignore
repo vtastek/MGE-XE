@@ -4,3 +4,5 @@
 /mgeHost64/bin/
 *.vcxproj.user
 *.csproj.user
+/mgeHost64/shaders/fsl_out.txt
+/mgeHost64/shaders/fsl_err.txt

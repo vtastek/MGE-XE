@@ -21,6 +21,9 @@
 #include "ipc/hostframetimings.h"   // IPC::HostFrameTimings (fillFrameTimings)
 #include "mge/configuration.h"   // Configuration.DL.* for the host-owned live distant-land cull
 #include "support/log.h"   // LOG::logline -> mgeHost64.log (LOGF goes to uncaptured stdout)
+// Host-owned terrain (tasks/forge-terrain.md). POD-only surface by design: terrain.cpp is built on
+// the host's DEFAULT MSVC ABI, so nothing it allocates may cross into this TU's IMemory allocator.
+#include "terrain.h"
 
 #include <cstdio>
 #include <cstdint>
@@ -1648,6 +1651,12 @@ namespace {
            // slots permanently dyn).
            kGpuPhaseShadowStatic,
            kGpuPhaseShadowDyn,
+           // ...and the SUN cascade caster pass (renderSunShadow), which also lives inside Shadow
+           // but had no bracket of its own. That gap made the FPS-dip spikes unattributable: a
+           // measured `shadow=45.25 (st=0.20 dyn=0.20)` says 44.85ms is inside the phase and
+           // outside both sub-timers, with no way to tell the sun pass from a point-light bake
+           // whose cost retired late. Bracket it so the next spike names itself.
+           kGpuPhaseShadowSun,
            kGpuPhaseColorFP,    // FP1a first-person pass (after sorted-alpha, before resolve)
            kGpuPhaseColorGlow,  // Phase F distant-light glow billboards (after water, before sorted-alpha)
            kGpuPhaseFroxelNear, // near clustered-lighting froxel clear+assign (before the near colour phase)
@@ -6244,7 +6253,7 @@ namespace {
     bool      g_hizValid  = false;
     // Live DL cull survivors (set in dlLiveCullAndBuild). Declared here (not in the DL section lower
     // in the TU) so the Phase 0 panel readout in drawDevUI can see them.
-    uint32_t  g_liveLastInst = 0, g_liveLastSubsets = 0, g_liveLastLand = 0;
+    uint32_t  g_liveLastInst = 0, g_liveLastSubsets = 0;
     uint32_t  g_lastCullExamined = 0;   // instances the cull TESTED this frame (cull-ms normalizer)
     uint32_t  g_lastGpuCullCount = 0;   // Stage B (B2): GPU cull FRUSTUM survivor count (Σ numSubsets,
                                         // pre-occlusion), read back post-fence; must equal g_liveLastInst.
@@ -6254,8 +6263,43 @@ namespace {
     // premultiplied composite (instant visual A/B). All default ON (no behaviour change). Host-side —
     // they gate the host render blocks; MGE's counterparts are gated separately on the client (F-keys).
     bool g_drawSky       = true;
-    bool g_drawDLLand    = true;
     bool g_drawDLStatics = true;
+    // Host-owned terrain (tasks/forge-terrain.md) — the world's ONE surface since T4, near and far,
+    // main view and reflection. The DL world bake it replaced (294 chunk meshes at 915 tris/cell
+    // under a 44-texel-per-cell atlas) is gone, so this toggle no longer has an A/B partner: turning
+    // it off leaves the near field to MW (via terrainOwned) and the distance empty.
+    bool g_drawTerrain = true;
+    // T3: OFF. The host owns terrain for near AND far on one LOD ladder now — the client stops
+    // emitting MW's own land whenever `terrainOwned` says we are drawing (HostFrameTimings), so
+    // there is no second producer left to keep out of. Turning this back on would carve a hole
+    // around the camera, not avoid an overlap. Kept as a checkbox only because it is the fastest
+    // way to prove the near field really is ours: with it on, anything still drawn near the camera
+    // came from somewhere else.
+    bool g_terrainNearCut = false;
+    bool g_terrainWire    = false;   // LOD/stitch inspection: draw the lattice, not the surface
+    // Terrain heartbeat counters. Terrain's triangle count is OURS to own now (the DL bake's was
+    // fixed at 915 tris/cell forever), so it rides the gpu-split line next to nearTris; the LOD
+    // histogram is what tells you whether the ladder is spending them in the right place.
+    constexpr uint32_t kTerrainLods = 6;      // vertex strides 1, 2, 4, 8, 16, 32
+    // Residency is live (heights/VCLR/VTEX uploaded, cull table built). Declared HERE, with the
+    // toggles, rather than down in the terrain block: fillFrameTimings — which sits above that
+    // block — reports `g_terrainReady && g_drawTerrain` to the client as terrainOwned, and that is
+    // what decides whether MW may stop drawing its own near land.
+    bool     g_terrainReady       = false;
+    // ...and the safety valve on that report. T3's risk is asymmetric: if the host silently lacks the
+    // LAND record for the cell the camera stands in, suppressing MW's land turns a quality difference
+    // into a HOLE IN THE WORLD. That is the exact failure the ini/plugin mismatch produces (MO2's
+    // virtual ini, a Wrye Mash reorder, a plugin we failed to parse), and it is invisible from a
+    // plugin-name diff — the lists can match perfectly and a cell still be absent. So test the
+    // consequence, not the cause: when the eye's own cell is missing, drop ownership and let MW draw.
+    // Overlap in the neighbouring cells is the cheaper failure, exactly as the near-cut note argues.
+    bool     g_terrainEyeCellMissing = false;
+    std::unordered_map<int64_t, uint32_t> g_terrainMissingSeen;   // logged-once set, keyed by cell
+    uint32_t g_lastTerrainCells   = 0;
+    uint64_t g_lastTerrainTris    = 0;
+    uint32_t g_lastTerrainInRange = 0;   // passed the DrawDist cap (so: drawn/inRange = frustum yield)
+    uint32_t g_lastTerrainNearCut = 0;   // dropped as wholly inside MW's own near land
+    uint32_t g_lastTerrainLodHist[kTerrainLods] = {};
     // Statics facing A/B (dlPickStaticsPipeline). Built while hunting the dark/bright distant statics, on
     // the theory that back-face rasterization was shading each mesh's FAR side with outward normals (N.L
     // saturating to 0 or 1). It wasn't — the cause was the missing `centroid` on statics' Color+Fog — but
@@ -6263,11 +6307,11 @@ namespace {
     // global winding right?" in one frame instead of a rebuild.
     //   0 = auto (g_dlStaticsFrontCW: CCW live / CW viewer), 1 = force CCW, 2 = force CW, 3 = no cull
     uint32_t g_staticsFacing = 0;
-    // lodParams.w = nearViewRange. Two consumers, both about the near HANDOVER (which only exists in
-    // game, where the near cache owns the near field): the DL land z-sink in distantland.vert, and the
-    // statics near-cut in the CPU cull. The viewer has NO near scene, so both just carve a hole around
-    // the camera and stop you inspecting anything up close — it sets this to 0 (see worldViewer).
-    // 0 also switches the land z-sink off entirely (distantland.vert gates on lodParams.w > 0).
+    // lodParams.w = nearViewRange, about the near HANDOVER (which only exists in game, where the near
+    // cache owns the near field). ONE consumer left: the statics near-cut in the CPU cull + the hero
+    // gate in statics.vert. The DL land z-sink was the other, and it died with the bake in T4 — host
+    // terrain draws at TRUE height because it IS the surface, so there is nothing to hide under.
+    // The viewer has no near scene, so the cut would just carve a hole; it sets this to 0.
     float g_dlNearViewRange = 7168.0f;
     // Viewer: draw DL statics all the way to the eye (same reason the water REFLECTION does — no near
     // path covers them, so the near-cut would just delete them).
@@ -6410,6 +6454,12 @@ namespace {
     unsigned char g_statsBuf[1024] = {};
     bstring       g_statsText = bfromarr(g_statsBuf);
     float4        g_statsColor = { 0.70f, 1.0f, 0.70f, 1.0f };
+    // Terrain coverage readout, on the Draw tab beside the terrain toggles. The log names the missing
+    // cell, but a hole is something you notice while LOOKING at the world — this says, in the panel
+    // you already have open, whether the near field is ours or was handed back. Red when handed back.
+    unsigned char g_terrainCovBuf[192] = {};
+    bstring       g_terrainCovText = bfromarr(g_terrainCovBuf);
+    float4        g_terrainCovColor = { 0.70f, 1.0f, 0.70f, 1.0f };
     // Frame-ahead observability: client-forwarded last-frame timings (setClientStats, per
     // kickoff) + the server-measured host idle gap between RenderFrames. Stats panel only.
     unsigned      g_clientFrameAhead = 0;
@@ -7024,7 +7074,10 @@ namespace {
           t.checkbox("Dist lights: drop near-owned (handoff dedup)", &g_dlLightNearDedup);
           t.checkbox("Dist glow: enable (fixture billboards)", &g_drawGlow);
           t.checkbox("Draw: sky", &g_drawSky);
-          t.checkbox("Draw: distant land", &g_drawDLLand);
+          t.checkbox("Draw: terrain (host LAND heightfield)", &g_drawTerrain);
+          t.checkbox("Terrain: near cut (leave MW's own land alone)", &g_terrainNearCut);
+          t.checkbox("Terrain: wireframe (LOD + stitch inspection)", &g_terrainWire);
+          t.dynamicText("", &g_terrainCovText, &g_terrainCovColor);
           t.checkbox("Draw: distant statics", &g_drawDLStatics);
           t.checkbox("Statics: GPU cull (B3 draw)", &g_gpuStaticsCull);
           t.dropdown("Statics: facing (dark/bright A/B)", &g_staticsFacing, kStaticsFacingNames, 4);
@@ -7215,11 +7268,30 @@ namespace {
             s_texWidgetAdded = true;
         }
 
+        // Terrain coverage state, same refresh. Says which of the three ways the near field can stop
+        // being ours actually happened, because "no host terrain" looks identical on screen for all of
+        // them: not loaded yet, the checkbox above, or a real gap in the LAND records.
+        if (!g_terrainReady) {
+            g_terrainCovColor = float4(0.75f, 0.75f, 0.75f, 1.0f);
+            bformat(&g_terrainCovText, "coverage: terrain not resident — MW draws its own land");
+        } else if (!g_drawTerrain) {
+            g_terrainCovColor = float4(0.75f, 0.75f, 0.75f, 1.0f);
+            bformat(&g_terrainCovText, "coverage: draw toggle OFF — MW draws its own land");
+        } else if (g_terrainEyeCellMissing) {
+            g_terrainCovColor = float4(1.0f, 0.35f, 0.30f, 1.0f);
+            bformat(&g_terrainCovText, "coverage: GAP within 1 cell of the camera — MW land handed back "
+                                       "(missing cells listed in mgeHost64.log)");
+        } else {
+            g_terrainCovColor = float4(0.70f, 1.0f, 0.70f, 1.0f);
+            bformat(&g_terrainCovText, "coverage: OK — host terrain owns the near field (%u cells resident)",
+                    Terrain::cellCount());
+        }
+
         // Phase 0: refresh the live-stats text from this frame's counters (Forge bformat pattern).
         bformat(&g_statsText,
                 "near opaque %u | skinned %u | multimap %u\n"
                 "sky %u | reflect-sky %u | lights %u | alpha %u\n"
-                "DL land %u | DL statics %u inst / %u subsets\n"
+                "terrain %u cells | DL statics %u inst / %u subsets\n"
                 "water levels %u\n"
                 "host %.2f ms = setup %.2f + cull %.2f + rec %.2f + gpu %.2f + post %.2f\n"
                 "gpu: prepass %.2f postdepth %.2f (lin %.2f ao %.2f mask %.2f) reflect %.2f color %.2f water %.2f resolve %.2f\n"
@@ -7227,7 +7299,7 @@ namespace {
                 "frame-ahead %s | client dt %.2f wait %.2f mwstart %.2f | host idle %.2f ms",
                 g_lastDrawn, g_lastSkinnedDrawn, g_lastMultiMapDrawn,
                 g_lastSkyDrawn, g_lastReflSkyDrawn, g_lastLightCount, g_lastAlphaDrawn,
-                g_liveLastLand, g_liveLastInst, g_liveLastSubsets,
+                g_lastTerrainCells, g_liveLastInst, g_liveLastSubsets,
                 g_lastWaterLevels,
                 g_lastTotalMs, g_lastSetupMs, g_lastCullMs, g_lastRecMs, g_lastGpuMs, g_lastPostMs,
                 g_lastGpuPhaseMs[kGpuPhasePrepass], g_lastGpuPhaseMs[kGpuPhasePostDepth],
@@ -10237,7 +10309,9 @@ namespace ForgeRender {
         // Held off entirely when the camera is submerged: the height-fog model is an AIR model.
         g_volFogWaterZ  = waterParams ? waterParams[0] : 0.0f;
         g_volFogWaterOn = (waterEnabled != 0) && waterParams && !(waterParams[7] > 0.5f);
+        gpuPhaseBegin(kGpuPhaseShadowSun);
         renderSunShadow();
+        gpuPhaseEnd(kGpuPhaseShadowSun);
 
         if (g_live.shadowReady && g_shadowFrameActive) {
             // Restore the full-screen viewport/scissor for the compute + colour passes below
@@ -12524,12 +12598,14 @@ namespace ForgeRender {
                          g_lastCpuPhaseMs[kGpuPhaseColorAlpha],
                          g_lastCpuPhaseMs[kGpuPhaseResolve],
                          g_lastRecMs - g_lastCpuPhaseMs[kGpuPhaseFrame]);
-            LOG::logline(">> [forge-hb] gpu split: cull=%.2f prepass=%.2f shadow=%.2f (st=%.2f dyn=%.2f) postdepth=%.2f (lin=%.2f ao=%.2f mask=%.2f) reflect=%.2f color=%.2f water=%.2f resolve=%.2f ms"
+            LOG::logline(">> [forge-hb] gpu split: cull=%.2f prepass=%.2f shadow=%.2f (st=%.2f dyn=%.2f sun=%.2f) postdepth=%.2f (lin=%.2f ao=%.2f mask=%.2f) reflect=%.2f color=%.2f water=%.2f resolve=%.2f ms"
                          " | hiz=%.2f (prologue, overruns=%u) | shadowCasters=%u maskSlots=%u(dyn=%u)"
-                         " | nearTris=%.2fM atDraws=%u",
+                         " | nearTris=%.2fM atDraws=%u"
+                         " | terrain=%u/%u cells (nearCut=%u) %.2fM tris (lod %u/%u/%u/%u/%u/%u)%s",
                          g_lastGpuPhaseMs[kGpuPhaseCull],
                          g_lastGpuPhaseMs[kGpuPhasePrepass], g_lastGpuPhaseMs[kGpuPhaseShadow],
                          g_lastGpuPhaseMs[kGpuPhaseShadowStatic], g_lastGpuPhaseMs[kGpuPhaseShadowDyn],
+                         g_lastGpuPhaseMs[kGpuPhaseShadowSun],
                          g_lastGpuPhaseMs[kGpuPhasePostDepth],
                          g_lastGpuPhaseMs[kGpuPhaseLinearize],
                          g_lastGpuPhaseMs[kGpuPhasePostDepth] - g_lastGpuPhaseMs[kGpuPhaseLinearize] - g_lastGpuPhaseMs[kGpuPhaseShadowMask],
@@ -12539,7 +12615,12 @@ namespace ForgeRender {
                          g_lastHizGpuMs, g_hizOverruns,
                          (unsigned)g_shadowCasters.size(),
                          g_lastShadowActive, g_lastShadowDyn,
-                         (double)g_lastNearTris / 1e6, g_lastNearATDraws);
+                         (double)g_lastNearTris / 1e6, g_lastNearATDraws,
+                         g_lastTerrainCells, g_lastTerrainInRange, g_lastTerrainNearCut,
+                         (double)g_lastTerrainTris / 1e6,
+                         g_lastTerrainLodHist[0], g_lastTerrainLodHist[1], g_lastTerrainLodHist[2],
+                         g_lastTerrainLodHist[3], g_lastTerrainLodHist[4], g_lastTerrainLodHist[5],
+                         g_terrainEyeCellMissing ? "  <-- COVERAGE GAP, MW land handed back" : "");
             // Host-GPU-shrink sub-phases: WHERE inside color/reflect the ms live. sky+near+skin+mm+dl
             // ≈ color above (same frame's timestamps); refl sky = reflect − reflgeo.
             LOG::logline(">> [forge-hb] gpu color sub: sky=%.2f nearfrox=%.2f(%s,n=%u) near=%.2f skin=%.2f mm=%.2f dl=%.2f alpha=%.2f glow=%.2f(%u,walk=%.2fms)"
@@ -12826,6 +12907,13 @@ namespace ForgeRender {
         out.cpuPostMs      = (float)g_lastPostMs;
         out.gpuWaitMs      = (float)g_lastGpuMs;
         out.totalMs        = (float)g_lastTotalMs;
+        // T3: tell the client whether WE are drawing the world's terrain, so it knows whether it is
+        // safe for MW to stop drawing its own. Requires residency AND the draw toggle — a panel
+        // flip has to hand the near field straight back to MW, or turning host terrain off in game
+        // would leave nothing at all under the player.
+        // g_terrainEyeCellMissing is the coverage tripwire: a gap within one cell of the camera hands
+        // the near field straight back to MW rather than opening a hole we cannot see from here.
+        out.terrainOwned   = (g_terrainReady && g_drawTerrain && !g_terrainEyeCellMissing) ? 1.0f : 0.0f;
     }
 
     unsigned lastDrawn() { return g_lastDrawn; }
@@ -13345,28 +13433,6 @@ namespace ForgeRender {
     // The --forge-dl probe renders it from a synthetic camera to ground-truth the loader/pipeline
     // /atlas in isolation; the same loader+pipeline+draw wire into renderScene for the live path.
 
-    constexpr uint32_t kMaxLandMeshes  = 16384;
-    // DL LAND atlas lives in the TOP 3 slots of gTextures[] (the client caps its own bottom-up
-    // residency below kDlReserve; see IPC::kDlReserve) so host-owned land never stomps the client's
-    // near-scene textures. Distant STATICS no longer use gTextures — they live in gStaticsArrays
-    // (the bucketed Texture2DArray residency, below).
-    constexpr uint32_t kLandBaseSlot   = MAX_TEXTURES - 1;   // 895
-    constexpr uint32_t kLandNormalSlot = MAX_TEXTURES - 2;   // 894
-    constexpr uint32_t kLandDetailSlot = MAX_TEXTURES - 3;   // 893
-
-    struct LandMeshGPU {
-        Buffer*  vb;
-        Buffer*  ib;
-        uint32_t indexCount;
-        bool     large;             // 32-bit indices
-        float    cx, cy, cz, r;     // bounding sphere (world)
-    };
-    LandMeshGPU g_landMeshes[kMaxLandMeshes];
-    uint32_t    g_landMeshCount = 0;
-    Shader*     g_pLandShader   = nullptr;
-    Pipeline*   g_pLandPipeline = nullptr;
-    bool        g_landLoaded    = false;
-
     // --- Phase B: baked distant static lights (DL-gen lights.data) ------------------------------
     // Resident set loaded once with the land; distance-streamed per frame around g_dlEye. This is
     // the load+stream+observe checkpoint — the Phase C deferred lightmap consumes them (no GPU
@@ -13712,7 +13778,6 @@ namespace ForgeRender {
     // must not clobber — the main pass records them later in the same command buffer).
     Buffer*   g_pStaticsInstRingRefl = nullptr;
     Buffer*   g_pStaticsArgsRingRefl = nullptr;
-    std::vector<uint32_t> g_liveLandVisibleRefl;       // land mesh indices surviving the MIRROR frustum
     uint32_t  g_liveLastSubsetsRefl = 0;               // indirect-arg count for the reflect statics draw
     uint32_t  g_liveLastInstRefl    = 0;               // instance count (diagnostics)
     struct LiveGridCell {
@@ -13731,7 +13796,6 @@ namespace ForgeRender {
     bool      g_staticsLiveOk = false;                 // statics library + rings ready
     float     g_dlEye[3]     = { 0, 0, 0 };            // realEye this frame (DL shift origin)
     // (Statics textures are all resident from load via gStaticsArrays — no per-frame load budget.)
-    std::vector<uint32_t> g_liveLandVisible;           // land mesh indices surviving the frustum cull
     // g_liveLastInst/Subsets/Land declared up with the other per-frame counters (Phase 0 panel needs
     // them in drawDevUI, which is defined earlier in the TU).
 
@@ -13810,61 +13874,6 @@ namespace ForgeRender {
         return true;
     }
 
-    // Build the land pipeline: distantland.vert/.frag, 16 B vertex layout (pos + SHORT2N uv),
-    // depth-write + reverse-Z GEQUAL (land owns its depth — no prepass, terrain is fully opaque),
-    // drawn after the near colour pass. Reuses default.rootsig + the opaque descriptor sets.
-    bool buildLandPath(Renderer* R) {
-        if (g_pLandPipeline) { return true; }
-        ShaderLoadDesc sd = {};
-        sd.mVert.pFileName = "distantland.vert";
-        sd.mFrag.pFileName = "distantland.frag";
-        addShader(R, &sd, &g_pLandShader);
-        if (!g_pLandShader) { std::printf("[forge][dl] addShader(distantland) FAILED\n"); return false; }
-
-        VertexLayout vl = {};
-        vl.mBindingCount = 1;
-        vl.mBindings[0].mStride = 16;               // LandElem: float3 pos + SHORT2N uv
-        vl.mBindings[0].mRate = VERTEX_BINDING_RATE_VERTEX;
-        vl.mAttribCount = 2;
-        vl.mAttribs[0].mSemantic = SEMANTIC_POSITION;
-        vl.mAttribs[0].mFormat = TinyImageFormat_R32G32B32_SFLOAT;
-        vl.mAttribs[0].mBinding = 0;
-        vl.mAttribs[0].mLocation = 0;
-        vl.mAttribs[0].mOffset = 0;
-        vl.mAttribs[1].mSemantic = SEMANTIC_TEXCOORD0;
-        vl.mAttribs[1].mFormat = TinyImageFormat_R16G16_SNORM;   // SHORT2N -> [-1,1], as the D3D9 decl
-        vl.mAttribs[1].mBinding = 0;
-        vl.mAttribs[1].mLocation = 1;
-        vl.mAttribs[1].mOffset = 12;
-
-        DepthStateDesc ds = {};
-        ds.mDepthTest = true;
-        ds.mDepthWrite = true;
-        ds.mDepthFunc = CMP_GEQUAL;                 // reverse-Z (near->1, far->0); pDepth clears to 0
-
-        RasterizerStateDesc rs = {};
-        rs.mCullMode = CULL_MODE_NONE;              // terrain heightfield: don't risk culling LOD faces
-        rs.mFrontFace = FRONT_FACE_CCW;
-
-        PipelineDesc pd = {};
-        pd.mType = PIPELINE_TYPE_GRAPHICS;
-        GraphicsPipelineDesc& g = pd.mGraphicsDesc;
-        g.mPrimitiveTopo = PRIMITIVE_TOPO_TRI_LIST;
-        g.mRenderTargetCount = 1;
-        g.pColorFormats = &g_live.pRT->mFormat;
-        g.mSampleCount = (SampleCount)g_live.sampleCount;
-        g.mSampleQuality = 0;
-        g.mDepthStencilFormat = TinyImageFormat_D32_SFLOAT;
-        g.pDepthState = &ds;
-        g.pVertexLayout = &vl;
-        g.pRasterizerState = &rs;
-        g.pShaderProgram = g_pLandShader;
-        addPipeline(R, &pd, &g_pLandPipeline);
-        if (!g_pLandPipeline) { std::printf("[forge][dl] addPipeline(distantland) FAILED\n"); return false; }
-        std::printf("[forge][dl] land pipeline built\n");
-        return true;
-    }
-
     // Phase B: load the DL-gen baked static lights (distantland\lights.data) into the resident set.
     // One-shot (missing file is fine — pre-Phase-A DL gens have none). Format v1: int32 version;
     // int32 count; then count * { float x,y,z; float radius; byte r,g,b; byte flags(bit0=hasMesh) }.
@@ -13921,78 +13930,844 @@ namespace ForgeRender {
         }
     }
 
-    // Load the 3 atlas textures + parse the distantland\world container into resident Forge
-    // VB/IB + bounding spheres. Idempotent. Requires buildOpaquePath (pPersistentSet) already built.
-    bool loadDistantLand(Renderer* R) {
-        if (g_landLoaded) { return true; }
-        bool a0 = dlLoadAtlas(R, "Data Files\\distantland\\world.dds",          kLandBaseSlot);
-        bool a1 = dlLoadAtlas(R, "Data Files\\distantland\\world_n.dds",        kLandNormalSlot);
-        bool a2 = dlLoadAtlas(R, "Data Files\\textures\\MGE\\world_detail.dds", kLandDetailSlot);
-        if (!a0 || !a1 || !a2) { std::printf("[forge][dl] atlas incomplete (a0=%d a1=%d a2=%d)\n", a0, a1, a2); return false; }
+    void dlMul(const float a[16], const float b[16], float out[16]);   // defined with the camera helpers below
+    bool dlSphereInFrustum(const float planes[6][4], float cx, float cy, float cz, float r);   // ...with the DL cull
+    static uint32_t ddsTightMipBytes(TinyImageFormat fmt, uint32_t w, uint32_t h);   // ...with the statics tex arrays
 
-        std::vector<uint8_t> file;
-        if (!dlReadWholeFile("Data Files\\distantland\\world", file) || file.size() < 4) {
-            std::printf("[forge][dl] world container missing/empty\n");
+    // ================================ HOST-OWNED TERRAIN (T1) ==================================
+    // tasks/forge-terrain.md. The world's LAND records are parsed at host startup by terrain.cpp;
+    // here they become GPU residency and draws. Nothing is baked, nothing is on disk, and nothing
+    // needs regenerating when the mod list changes — which is the whole point of retiring the
+    // MGEgui distant-land world generator (whose every OOM was 32-bit address space, and whose only
+    // quality knob was the same knob that triggered the OOM).
+    //
+    // Residency: ONE shared 65x65 lattice VB (in grid units, no positions baked in) + one index
+    // buffer holding all six LOD strides back to back, plus two data buffers holding every cell's
+    // heights and VCLR. Per frame the CPU frustum-culls cells, picks a stride per cell by distance,
+    // and writes one 40-byte instance row each; the draw is six cmdDrawIndexedInstanced calls, one
+    // per stride. The VS fetches the height itself — see terrain.vert.fsl.
+
+    // (kTerrainLods + the heartbeat counters are declared up with the panel toggles, which the dev-UI
+    //  setup earlier in this file binds against.)
+    constexpr uint32_t kTerrainMaxInst  = 8192;   // per-frame visible-cell cap (world is ~3.9k cells)
+    constexpr uint32_t kTerrainInstStride = 32;   // float2 origin + uint4 inst0 + uint2 inst1
+
+    // LOD ladder: a cell whose centre is within kTerrainLodDist[i] cells of the eye draws at stride
+    // 1<<i. Deliberately generous at the near end — the handover to MW's near land happens inside
+    // the first entry, so the cells either side of it are always full resolution and cannot step.
+    const float kTerrainLodDist[kTerrainLods] = { 3.0f, 6.0f, 12.0f, 24.0f, 48.0f, 1e9f };
+
+    struct TerrainLodRange { uint32_t firstIndex, indexCount, firstVertex, stride; };
+    TerrainLodRange g_terrainLodRange[kTerrainLods] = {};
+
+    // CPU-side cull record per resident cell. Deliberately flat and small — this is walked in full
+    // every frame, and 3.9k cells is nothing next to the statics cull it sits beside.
+    struct TerrainCellCull {
+        float    cx, cy, cz, r;      // bounding sphere, ABSOLUTE world
+        int32_t  gx, gy;             // cell grid coords
+        uint32_t nbr[4];             // slot+1 of the -X, +X, -Y, +Y neighbour (0 = none)
+    };
+    std::vector<TerrainCellCull> g_terrainCull;
+
+    // Per-VIEW cull state. The main view and the water reflection cull the same world against two
+    // different frustums inside ONE command buffer, so every buffer the cull writes has to exist
+    // twice or the second cull overwrites the first (the DlCullTargets split, applied to terrain).
+    // The LOD arrays in particular MUST NOT be shared: the edge stitch reads a NEIGHBOUR's chosen
+    // stride, so one view's LOD decisions leaking into the other's stitch would tear cell edges in
+    // whichever view recorded second.
+    struct TerrainView {
+        std::vector<uint8_t>  lodOf;      // per slot, this view's chosen stride index this frame
+        // ...and WHICH frame that value is from. A neighbour culled away this frame has no stride of
+        // its own, and reading its stale one would stitch an edge to a cell nobody is drawing.
+        std::vector<uint32_t> lodStamp;
+        uint32_t              cullFrame = 0;
+        std::vector<uint32_t> visible;    // slots surviving the cull, this frame
+        uint32_t              drawCounts[kTerrainLods] = {};   // per-LOD instance count
+        Buffer*               instRing = nullptr;             // per-frame instance rows (CPU_TO_GPU)
+        uint32_t              cells = 0;                       // = visible.size(), for the record gate
+    };
+    TerrainView g_terrainMain;
+    TerrainView g_terrainRefl;
+
+    Shader*   g_pTerrainShader     = nullptr;
+    Pipeline* g_pTerrainPipeline   = nullptr;
+    Pipeline* g_pTerrainPipelineWire = nullptr;
+    Buffer*   g_pTerrainVB         = nullptr;   // shared lattice (all LODs)
+    Buffer*   g_pTerrainIB         = nullptr;   // all LOD strides back to back
+    Buffer*   g_pTerrainHeights    = nullptr;   // whole-world heightfield  (GPU_ONLY SRV)
+    Buffer*   g_pTerrainColors     = nullptr;   // whole-world VCLR         (GPU_ONLY SRV)
+    Buffer*   g_pTerrainTex        = nullptr;   // whole-world VTEX as SLOTS (GPU_ONLY SRV)
+    Buffer*   g_pTerrainCellGrid   = nullptr;   // world grid -> slot+1     (GPU_ONLY SRV)
+    // (the per-frame instance rings live in TerrainView — one per view)
+    // World grid the cell lookup is addressed in (from Terrain::extent) — the per-instance rows
+    // carry each cell's local coords + this span so the shaders can walk to any neighbour.
+    int32_t   g_terrainGridMinX = 0, g_terrainGridMinY = 0;
+    uint32_t  g_terrainGridSpanX = 0, g_terrainGridSpanY = 0;
+
+    // Land-texture residency, the gStaticsArrays shape in its own descriptor array (see
+    // gTerrainArrays in opaque.srt.h). One Texture2DArray per (format, capped size) bucket, every
+    // unique LTEX uploaded ONCE as a slice by RAW MIP EXTRACT — the largest mip whose long side is
+    // <= kTerrainTexCap, plus the chain below it, copied with no decode/resize/encode. That mip
+    // chain is the whole streaming story: there is no texture streaming or indirection here and
+    // none is wanted, because the LOD handover distance decides which mip is ever sampled.
+    constexpr uint32_t kTerrainBuckets = MAX_TERRAIN_BUCKETS;
+    constexpr uint32_t kTerrainTexCap  = 1024;   // cap the long side; measured occupancy is logged
+    struct TerrainTexBucket {
+        TinyImageFormat fmt = TinyImageFormat_UNDEFINED;
+        uint32_t w = 0, h = 0, mips = 1;
+        Texture* tex = nullptr;
+        uint32_t count = 0;
+    };
+    std::vector<TerrainTexBucket> g_terrainBuckets;
+    Texture*  g_pTerrainWhite  = nullptr;        // bucket 0 layer 0: the "texture is missing" fill
+    // (g_terrainReady is declared up with the panel toggles — fillFrameTimings needs it.)
+    bool      g_terrainLoadTried   = false;
+
+    // Build the lattice VB + the six stride IBs and the terrain pipeline. The lattice is pure grid
+    // coordinates (0..64): every cell in the world shares it, and the height comes from the buffer.
+    bool buildTerrainPath(Renderer* R) {
+        if (g_pTerrainPipeline) { return true; }
+
+        // (1) Vertices + indices for all six strides, packed back to back into one VB/IB pair.
+        std::vector<float>    verts;      // (gx, gy) pairs
+        std::vector<uint16_t> indices;
+        for (uint32_t l = 0; l < kTerrainLods; ++l) {
+            const uint32_t stride = 1u << l;
+            const uint32_t n      = Terrain::kCellQuads / stride;    // quads per side
+            TerrainLodRange& rg = g_terrainLodRange[l];
+            rg.stride      = stride;
+            rg.firstVertex = (uint32_t)(verts.size() / 2);
+            rg.firstIndex  = (uint32_t)indices.size();
+            for (uint32_t j = 0; j <= n; ++j) {
+                for (uint32_t i = 0; i <= n; ++i) {
+                    verts.push_back((float)(i * stride));
+                    verts.push_back((float)(j * stride));
+                }
+            }
+            for (uint32_t j = 0; j < n; ++j) {
+                for (uint32_t i = 0; i < n; ++i) {
+                    const uint16_t a = (uint16_t)(j * (n + 1) + i);
+                    const uint16_t b = (uint16_t)(a + 1);
+                    const uint16_t c = (uint16_t)(a + (n + 1));
+                    const uint16_t d = (uint16_t)(c + 1);
+                    indices.push_back(a); indices.push_back(c); indices.push_back(b);
+                    indices.push_back(b); indices.push_back(c); indices.push_back(d);
+                }
+            }
+            rg.indexCount = (uint32_t)indices.size() - rg.firstIndex;
+        }
+
+        BufferLoadDesc vb = {};
+        vb.mDesc.mDescriptors = DESCRIPTOR_TYPE_VERTEX_BUFFER;
+        vb.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_GPU_ONLY;
+        vb.mDesc.mSize        = verts.size() * sizeof(float);
+        vb.mDesc.pName        = "terrainLatticeVB";
+        vb.pData              = verts.data();
+        vb.ppBuffer           = &g_pTerrainVB;
+        addResource(&vb, nullptr);
+
+        BufferLoadDesc ib = {};
+        ib.mDesc.mDescriptors = DESCRIPTOR_TYPE_INDEX_BUFFER;
+        ib.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_GPU_ONLY;
+        ib.mDesc.mSize        = indices.size() * sizeof(uint16_t);
+        ib.mDesc.pName        = "terrainLatticeIB";
+        ib.pData              = indices.data();
+        ib.ppBuffer           = &g_pTerrainIB;
+        addResource(&ib, nullptr);
+
+        // One instance ring PER VIEW — the reflect cull runs mid-command-buffer, after the main cull
+        // has already filled its own ring, so they cannot share storage.
+        for (TerrainView* v : { &g_terrainMain, &g_terrainRefl }) {
+            BufferLoadDesc ir = {};
+            ir.mDesc.mDescriptors = DESCRIPTOR_TYPE_VERTEX_BUFFER;
+            ir.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_CPU_TO_GPU;
+            ir.mDesc.mFlags       = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
+            ir.mDesc.mSize        = (uint64_t)kTerrainMaxInst * kTerrainInstStride;
+            ir.mDesc.pName        = (v == &g_terrainMain) ? "terrainInstRing" : "terrainInstRingRefl";
+            ir.pData              = nullptr;
+            ir.ppBuffer           = &v->instRing;
+            addResource(&ir, nullptr);
+        }
+        waitForAllResourceLoads();
+        if (!g_pTerrainVB || !g_pTerrainIB || !g_terrainMain.instRing || !g_terrainRefl.instRing) {
+            std::printf("[forge][terrain] lattice buffer alloc FAILED\n");
             return false;
         }
-        const uint8_t* p   = file.data();
-        const uint8_t* end = file.data() + file.size();
-        uint32_t meshCount = 0;
-        std::memcpy(&meshCount, p, 4); p += 4;
-        std::printf("[forge][dl] world container: %u meshes (%zu bytes)\n", meshCount, file.size());
 
-        uint32_t built = 0;
-        for (uint32_t i = 0; i < meshCount && g_landMeshCount < kMaxLandMeshes; ++i) {
-            // Per-mesh header: radius(4) + center(12) + boxMin(12) + boxMax(12) = 40, then verts(4)+faces(4).
-            if (p + 48 > end) { break; }
-            float radius; float center[3];
-            std::memcpy(&radius, p, 4);
-            std::memcpy(center, p + 4, 12);
-            p += 40;                                 // skip boxMin/boxMax (sphere suffices for the cull)
-            uint32_t verts = 0, faces = 0;
-            std::memcpy(&verts, p, 4); std::memcpy(&faces, p + 4, 4); p += 8;
+        // (2) Pipeline. Same depth contract as the DL land it replaces (reverse-Z GEQUAL, depth
+        //     write, no prepass — terrain is fully opaque) and the same CULL_NONE, so a stitched
+        //     edge triangle can never be culled away into a crack.
+        ShaderLoadDesc sd = {};
+        sd.mVert.pFileName = "terrain.vert";
+        sd.mFrag.pFileName = "terrain.frag";
+        addShader(R, &sd, &g_pTerrainShader);
+        if (!g_pTerrainShader) { std::printf("[forge][terrain] addShader(terrain) FAILED\n"); return false; }
 
-            bool large = (verts > 0xFFFFu || faces > 0xFFFFu);
-            size_t vbBytes = (size_t)verts * 16;
-            size_t ibBytes = (size_t)faces * (large ? 12 : 6);
-            if (p + vbBytes + ibBytes > end) { std::printf("[forge][dl] mesh %u truncated\n", i); break; }
-            const uint8_t* vbSrc = p;
-            const uint8_t* ibSrc = p + vbBytes;
-            p += vbBytes + ibBytes;
-            if (!verts || !faces) { continue; }
+        VertexLayout vl = {};
+        vl.mBindingCount = 2;
+        vl.mBindings[0].mStride = 8;                        // lattice: float2 (gx, gy)
+        vl.mBindings[0].mRate   = VERTEX_BINDING_RATE_VERTEX;
+        vl.mBindings[1].mStride = kTerrainInstStride;
+        vl.mBindings[1].mRate   = VERTEX_BINDING_RATE_INSTANCE;
+        vl.mAttribCount = 4;
+        vl.mAttribs[0].mSemantic = SEMANTIC_POSITION;
+        vl.mAttribs[0].mFormat   = TinyImageFormat_R32G32_SFLOAT;
+        vl.mAttribs[0].mBinding  = 0; vl.mAttribs[0].mLocation = 0; vl.mAttribs[0].mOffset = 0;
+        vl.mAttribs[1].mSemantic = SEMANTIC_TEXCOORD1;      // cell origin XY (camera-relative)
+        vl.mAttribs[1].mFormat   = TinyImageFormat_R32G32_SFLOAT;
+        vl.mAttribs[1].mBinding  = 1; vl.mAttribs[1].mLocation = 1; vl.mAttribs[1].mOffset = 0;
+        vl.mAttribs[2].mSemantic = SEMANTIC_TEXCOORD2;      // slot, stride, nbr strides, flags
+        vl.mAttribs[2].mFormat   = TinyImageFormat_R32G32B32A32_UINT;
+        vl.mAttribs[2].mBinding  = 1; vl.mAttribs[2].mLocation = 2; vl.mAttribs[2].mOffset = 8;
+        vl.mAttribs[3].mSemantic = SEMANTIC_TEXCOORD3;      // packed grid span, flags
+        vl.mAttribs[3].mFormat   = TinyImageFormat_R32G32_UINT;
+        vl.mAttribs[3].mBinding  = 1; vl.mAttribs[3].mLocation = 3; vl.mAttribs[3].mOffset = 24;
 
-            LandMeshGPU& m = g_landMeshes[g_landMeshCount];
-            m.vb = nullptr; m.ib = nullptr;
-            BufferLoadDesc vbd = {};
-            vbd.mDesc.mDescriptors = DESCRIPTOR_TYPE_VERTEX_BUFFER;
-            vbd.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_GPU_ONLY;
-            vbd.mDesc.mSize = vbBytes;
-            vbd.pData = vbSrc;
-            vbd.ppBuffer = &m.vb;
-            addResource(&vbd, nullptr);
-            BufferLoadDesc ibd = {};
-            ibd.mDesc.mDescriptors = DESCRIPTOR_TYPE_INDEX_BUFFER;
-            ibd.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_GPU_ONLY;
-            ibd.mDesc.mSize = ibBytes;
-            ibd.pData = ibSrc;
-            ibd.ppBuffer = &m.ib;
-            addResource(&ibd, nullptr);
-            waitForAllResourceLoads();
-            if (!m.vb || !m.ib) { std::printf("[forge][dl] mesh %u buffer alloc FAILED\n", i); continue; }
+        DepthStateDesc ds = {};
+        ds.mDepthTest = true; ds.mDepthWrite = true; ds.mDepthFunc = CMP_GEQUAL;
+        RasterizerStateDesc rs = {};
+        rs.mCullMode = CULL_MODE_NONE; rs.mFrontFace = FRONT_FACE_CCW;
 
-            m.indexCount = faces * 3;
-            m.large = large;
-            m.cx = center[0]; m.cy = center[1]; m.cz = center[2]; m.r = radius;
-            ++g_landMeshCount;
-            ++built;
-        }
-        std::printf("[forge][dl] resident land meshes: %u\n", g_landMeshCount);
-        g_landLoaded = (built > 0);
-        dlLoadBakedLights();
-        return g_landLoaded;
+        PipelineDesc pd = {};
+        pd.mType = PIPELINE_TYPE_GRAPHICS;
+        GraphicsPipelineDesc& g = pd.mGraphicsDesc;
+        g.mPrimitiveTopo      = PRIMITIVE_TOPO_TRI_LIST;
+        g.mRenderTargetCount  = 1;
+        g.pColorFormats       = &g_live.pRT->mFormat;
+        g.mSampleCount        = (SampleCount)g_live.sampleCount;
+        g.mSampleQuality      = 0;
+        g.mDepthStencilFormat = TinyImageFormat_D32_SFLOAT;
+        g.pDepthState         = &ds;
+        g.pVertexLayout       = &vl;
+        g.pRasterizerState    = &rs;
+        g.pShaderProgram      = g_pTerrainShader;
+        addPipeline(R, &pd, &g_pTerrainPipeline);
+        if (!g_pTerrainPipeline) { std::printf("[forge][terrain] addPipeline FAILED\n"); return false; }
+
+        // Wireframe twin — the only way to actually SEE which stride a cell picked and whether the
+        // stitch closed. Same everything else, so it is a pure raster-mode A/B.
+        RasterizerStateDesc rw = rs; rw.mFillMode = FILL_MODE_WIREFRAME;
+        g.pRasterizerState = &rw;
+        addPipeline(R, &pd, &g_pTerrainPipelineWire);
+
+        std::printf("[forge][terrain] lattice built: %zu verts, %zu indices, 6 LODs\n",
+                    verts.size() / 2, indices.size());
+        return true;
     }
 
-    void dlMul(const float a[16], const float b[16], float out[16]);   // defined with the camera helpers below
+    // Build the land-texture residency and resolve every LTEX id to a (bucket<<16)|layer slot.
+    // Mirrors buildStaticsTextureArrays; the differences are all consequences of what land textures
+    // ARE: there are only ~500 of them, they are all resident forever, and they tile, so the sampler
+    // must WRAP (the shared static anisotropic sampler already does).
+    // outSlots is indexed by Terrain::texId and is what the VTEX pack gets remapped through.
+    bool buildTerrainTextureArrays(Renderer* R, std::vector<uint32_t>& outSlots) {
+        const uint32_t texCount = Terrain::texCount();
+        outSlots.assign(texCount, 0u);
+        g_terrainBuckets.clear();
+
+        // Bucket 0 layer 0 is a 4x4 white RGBA — what an unresolvable LTEX draws as. White, not
+        // magenta: a missing land texture should read as "untextured ground", because at T3 this is
+        // the surface the player walks on and a magenta cell would be worse than a pale one.
+        {
+            TextureDesc td = {};
+            td.mWidth = 4; td.mHeight = 4; td.mDepth = 1;
+            td.mArraySize = 1; td.mMipLevels = 1;
+            td.mSampleCount = SAMPLE_COUNT_1;
+            td.mFormat = TinyImageFormat_R8G8B8A8_UNORM;
+            td.mStartState = RESOURCE_STATE_SHADER_RESOURCE;
+            td.mDescriptors = DESCRIPTOR_TYPE_TEXTURE;
+            td.pName = "terrainWhite";
+            TextureLoadDesc tld = {}; tld.ppTexture = &g_pTerrainWhite; tld.pDesc = &td;
+            addResource(&tld, nullptr);
+            waitForAllResourceLoads();
+            if (g_pTerrainWhite) {
+                TextureUpdateDesc upd = {};
+                upd.pTexture = g_pTerrainWhite;
+                upd.mBaseMipLevel = 0; upd.mMipLevels = 1;
+                upd.mBaseArrayLayer = 0; upd.mLayerCount = 1;
+                upd.mCurrentState = RESOURCE_STATE_SHADER_RESOURCE;
+                beginUpdateResource(&upd);
+                TextureSubresourceUpdate s = upd.getSubresourceUpdateDesc(0, 0);
+                for (uint32_t row = 0; row < s.mRowCount; ++row) {
+                    std::memset(s.pMappedData + (size_t)row * s.mDstRowStride, 0xFF, s.mSrcRowStride);
+                }
+                endUpdateResource(&upd);
+            }
+            TerrainTexBucket b0;
+            b0.fmt = TinyImageFormat_R8G8B8A8_UNORM; b0.w = 4; b0.h = 4; b0.mips = 1;
+            b0.tex = g_pTerrainWhite; b0.count = 1;
+            g_terrainBuckets.push_back(b0);
+        }
+
+        struct TexPlan { uint32_t capStep = 0, bucket = 0, layer = 0; };
+        std::vector<TexPlan> plan(texCount);
+        std::unordered_map<uint64_t, uint32_t> keyToBucket;
+        // The bucket key includes the AVAILABLE MIP COUNT, which the statics version does not — and
+        // that difference is load-bearing here. A Texture2DArray has one mip count for every slice,
+        // so with a (format,size)-only key the chain is the MIN over members and a single DDS that
+        // ships a truncated chain drags every other texture in the bucket down with it. Measured on
+        // this install: 463 of 499 land textures are 1024², and one short member cut all 463 to 4
+        // mips of 11 — i.e. nothing below 128², so the whole world shimmered past that distance.
+        // Keying on mips too costs a couple of extra buckets (of 32) and isolates the offenders.
+        auto bucketKey = [](TinyImageFormat f, uint32_t w, uint32_t h, uint32_t mips) -> uint64_t {
+            return ((uint64_t)(uint32_t)f << 46) | ((uint64_t)(mips & 0x3F) << 40)
+                 | ((uint64_t)(w & 0xFFFFF) << 20) | (uint64_t)(h & 0xFFFFF);
+        };
+        std::vector<std::string> missingNames;
+        std::vector<std::vector<uint32_t>> bucketMembers;   // bucket -> texIds
+        bucketMembers.emplace_back();
+
+        // Pass 1: header scan -> bucket plan. Every texture is read once here and once more in
+        // pass 3; both come out of the OS cache, and it keeps the arrays sized before any upload.
+        // id 0 is `_land_default.tga`, Morrowind's own fallback ground — every texture square a cell
+        // never had painted uses it, so it is one of the most-drawn textures in the world and must
+        // load like any other. (Skipping it was drawing large stretches of unedited terrain white.)
+        uint32_t missing = 0, overflow = 0;
+        for (uint32_t id = 0; id < texCount; ++id) {
+            uint32_t sz = 0;
+            const uint8_t* bytes = Terrain::readLandTextureFile(id, &sz);
+            DdsInfo info = bytes ? parseDds(bytes, sz) : DdsInfo{};
+            if (!info.ok) {                                   // slot stays 0 (white)
+                ++missing;
+                if (missingNames.size() < 16) { missingNames.emplace_back(Terrain::texName(id)); }
+                continue;
+            }
+            uint32_t k = 0, w = info.width, h = info.height;
+            while ((w > kTerrainTexCap || h > kTerrainTexCap) && (k + 1) < info.mipLevels) {
+                w = (w > 1) ? w >> 1 : 1; h = (h > 1) ? h >> 1 : 1; ++k;
+            }
+            const uint32_t avail = info.mipLevels - k;
+            const uint64_t key   = bucketKey(info.fmt, w, h, avail);
+            auto bit = keyToBucket.find(key);
+            // A Texture2DArray is capped at 2048 slices (D3D12_REQ_TEXTURE2D_ARRAY_AXIS_DIMENSION).
+            // One bucket holds 370 today, but this world is half of Tamriel Rebuilt with Skyrim
+            // landmasses still to come, and every added landmass adds LTEX to the SAME dominant
+            // (DXT1, 1024², full-chain) bucket. Rolling over into a fresh bucket on the same key
+            // removes the ceiling instead of failing the resource creation at some future install
+            // size — which would surface as "those textures are white", far from the cause.
+            const bool full = (bit != keyToBucket.end())
+                            && g_terrainBuckets[bit->second].count >= 2048u;
+            if (bit == keyToBucket.end() || full) {
+                if (g_terrainBuckets.size() >= kTerrainBuckets) { ++overflow; continue; }
+                const uint32_t b = (uint32_t)g_terrainBuckets.size();
+                keyToBucket[key] = b;                    // later textures on this key go to the new one
+                TerrainTexBucket nb;
+                nb.fmt = info.fmt; nb.w = w; nb.h = h; nb.mips = avail;
+                g_terrainBuckets.push_back(nb);
+                bucketMembers.emplace_back();
+                bit = keyToBucket.find(key);
+            }
+            TexPlan p;
+            p.capStep = k;
+            p.bucket  = bit->second;
+            TerrainTexBucket& b = g_terrainBuckets[p.bucket];
+            p.layer = b.count++;
+            bucketMembers[p.bucket].push_back(id);
+            plan[id] = p;
+        }
+
+        // Pass 2: create + bind one Texture2DArray per real bucket.
+        for (uint32_t b = 1; b < g_terrainBuckets.size(); ++b) {
+            TerrainTexBucket& bk = g_terrainBuckets[b];
+            TextureDesc td = {};
+            td.mWidth = bk.w; td.mHeight = bk.h; td.mDepth = 1;
+            td.mArraySize = bk.count; td.mMipLevels = bk.mips;
+            td.mSampleCount = SAMPLE_COUNT_1;
+            td.mFormat = bk.fmt;
+            td.mStartState = RESOURCE_STATE_SHADER_RESOURCE;
+            td.mDescriptors = DESCRIPTOR_TYPE_TEXTURE;
+            td.pName = "terrainBucket";
+            TextureLoadDesc tld = {}; tld.ppTexture = &bk.tex; tld.pDesc = &td;
+            addResource(&tld, nullptr);
+        }
+        waitForAllResourceLoads();
+        {
+            std::vector<Texture*> texs(kTerrainBuckets);
+            for (uint32_t b = 0; b < kTerrainBuckets; ++b) {
+                texs[b] = (b < g_terrainBuckets.size() && g_terrainBuckets[b].tex)
+                        ? g_terrainBuckets[b].tex : g_pTerrainWhite;
+            }
+            DescriptorData sd = {};
+            sd.mIndex = SRT_RES_IDX(SrtData, PerFrame, gTerrainArrays);
+            sd.mArrayOffset = 0; sd.mCount = kTerrainBuckets;
+            sd.ppTextures = texs.data();
+            updateDescriptorSet(R, 0, g_live.pPerFrameSet, 1, &sd);
+        }
+
+        // Pass 3: upload each texture's capped mip range into its slice.
+        uint32_t uploaded = 0;
+        for (uint32_t b = 1; b < g_terrainBuckets.size(); ++b) {
+            TerrainTexBucket& bk = g_terrainBuckets[b];
+            if (!bk.tex) { continue; }
+            for (uint32_t layer = 0; layer < (uint32_t)bucketMembers[b].size(); ++layer) {
+                const uint32_t id = bucketMembers[b][layer];
+                uint32_t sz = 0;
+                const uint8_t* bytes = Terrain::readLandTextureFile(id, &sz);
+                if (!bytes) { continue; }
+                DdsInfo info = parseDds(bytes, sz);
+                if (!info.ok) { continue; }
+                const uint8_t* src = bytes + info.dataOffset;
+                const uint8_t* end = bytes + sz;
+                uint32_t sw = info.width, sh = info.height;
+                for (uint32_t i = 0; i < plan[id].capStep; ++i) {     // skip the capped-off top mips
+                    src += ddsTightMipBytes(info.fmt, sw, sh);
+                    sw = (sw > 1) ? sw >> 1 : 1; sh = (sh > 1) ? sh >> 1 : 1;
+                }
+                TextureUpdateDesc upd = {};
+                upd.pTexture = bk.tex;
+                upd.mBaseMipLevel = 0; upd.mMipLevels = bk.mips;
+                upd.mBaseArrayLayer = layer; upd.mLayerCount = 1;
+                upd.mCurrentState = RESOURCE_STATE_SHADER_RESOURCE;
+                beginUpdateResource(&upd);
+                for (uint32_t m = 0; m < bk.mips; ++m) {
+                    TextureSubresourceUpdate s = upd.getSubresourceUpdateDesc(m, layer);
+                    const uint32_t mipBytes = s.mRowCount * s.mSrcRowStride;
+                    if (src + mipBytes > end) { break; }
+                    for (uint32_t row = 0; row < s.mRowCount; ++row) {
+                        std::memcpy(s.pMappedData + (size_t)row * s.mDstRowStride,
+                                    src + (size_t)row * s.mSrcRowStride, s.mSrcRowStride);
+                    }
+                    src += mipBytes;
+                }
+                endUpdateResource(&upd);
+                outSlots[id] = (plan[id].bucket << 16) | (plan[id].layer & 0xFFFF);
+                ++uploaded;
+            }
+            flushTextureUploads(R);   // submit per bucket (bounds the staging ring)
+        }
+
+        // Report the buckets and the real VRAM. The plan budgeted "~333 MB at a 1024 cap" as an
+        // upper bound to be MEASURED, not assumed — 6 GB is the floor GPU. Also flag short mip
+        // chains: a bucket's chain is the MIN over its members, so one DDS shipping no mips
+        // collapses the bucket and every cell using it shimmers at distance.
+        uint64_t vram = 0;
+        uint32_t shortChain = 0;   // SLICES (not buckets) whose chain stops short of 1x1
+        for (uint32_t b = 1; b < g_terrainBuckets.size(); ++b) {
+            const TerrainTexBucket& bk = g_terrainBuckets[b];
+            uint32_t mw = bk.w, mh = bk.h;
+            for (uint32_t m = 0; m < bk.mips; ++m) {
+                vram += (uint64_t)ddsTightMipBytes(bk.fmt, mw, mh) * bk.count;
+                mw = (mw > 1) ? mw >> 1 : 1; mh = (mh > 1) ? mh >> 1 : 1;
+            }
+            const uint32_t full = fullMipCount(bk.w, bk.h);
+            if (bk.mips < full) { shortChain += bk.count; }
+            LOG::logline(">> [terrain-tex] bucket=%u %ux%u slices=%u mips=%u (full=%u)%s",
+                         b, bk.w, bk.h, bk.count, bk.mips, full,
+                         (bk.mips < full) ? "  <-- SHORT CHAIN (these slices shimmer at distance)" : "");
+            // NAME the offenders: the chain is truncated in the source DDS, so the fix is on disk,
+            // not here. MGEXEgui's plugin step repairs loose ones in place (LandMipFixer).
+            if (bk.mips < full) {
+                std::string names;
+                for (uint32_t i = 0; i < bucketMembers[b].size() && i < 12; ++i) {
+                    names += (i ? " " : ""); names += Terrain::texName(bucketMembers[b][i]);
+                }
+                LOG::logline(">> [terrain-tex]   short-chain sources: %s%s", names.c_str(),
+                             (bucketMembers[b].size() > 12) ? " ..." : "");
+            }
+        }
+        LOG::logline(">> [terrain-tex] %u textures: %u uploaded, %u missing, %u overflow;"
+                     " %zu/%u buckets (size cap %u), short-chain slices=%u, ~%llu MB VRAM",
+                     texCount - 1u, uploaded, missing, overflow, g_terrainBuckets.size() - 1,
+                     kTerrainBuckets - 1u, kTerrainTexCap, shortChain,
+                     (unsigned long long)(vram >> 20));
+        if (overflow) {
+            LOG::logline("!! [terrain-tex] %u textures DROPPED to the default ground: out of buckets"
+                         " (MAX_TERRAIN_BUCKETS=%u). Raise it in opaque.srt.h if the world grew.",
+                         overflow, kTerrainBuckets);
+        }
+        // Unresolvable textures fall back to the DEFAULT ground, not to white — that is what the
+        // engine does, and vanilla Morrowind genuinely ships LTEX records whose texture is absent
+        // (tx_lavacrust00, tx_ma_sandstone02 here: named by meshes, shipped by nobody). White would
+        // make a content gap look like a renderer bug. Only a missing default itself stays white.
+        if (!outSlots.empty() && outSlots[0] != 0u) {
+            for (uint32_t id = 1; id < texCount; ++id) {
+                if (outSlots[id] == 0u) { outSlots[id] = outSlots[0]; }
+            }
+        }
+        for (const std::string& nm : missingNames) {
+            LOG::logline("!! [terrain-tex] unresolved (drawn as the DEFAULT ground): %s", nm.c_str());
+        }
+        LOG::flush();
+        std::printf("[forge][terrain] land textures: %u uploaded, %u missing, %zu buckets, ~%lluMB\n",
+                    uploaded, missing, g_terrainBuckets.size() - 1, (unsigned long long)(vram >> 20));
+        return true;
+    }
+
+    // Upload the whole world's heights + VCLR and build the CPU cull table. One-shot; waits on the
+    // background parse that started at host launch (by first exterior it has long finished — the
+    // wait is only a safety net for a cold disk).
+    bool loadTerrainResidency(Renderer* R) {
+        if (g_terrainReady) { return true; }
+        if (g_terrainLoadTried) { return false; }
+        g_terrainLoadTried = true;
+
+        if (!Terrain::waitLoaded(30000) || Terrain::cellCount() == 0) {
+            std::printf("[forge][terrain] LAND parse unavailable — host terrain disabled\n");
+            LOG::logline("!! [terrain] no cells parsed — falling back to the OLD DL world bake");
+            return false;
+        }
+        if (!Terrain::buildGpuPack()) { return false; }
+
+        const uint32_t cells = Terrain::cellCount();
+        const uint64_t hBytes = (uint64_t)cells * Terrain::kHeightStrideUints * 4ull;
+        const uint64_t cBytes = (uint64_t)cells * Terrain::kColorStrideUints  * 4ull;
+
+        BufferLoadDesc hb = {};
+        hb.mDesc.mDescriptors  = DESCRIPTOR_TYPE_BUFFER;
+        hb.mDesc.mMemoryUsage  = RESOURCE_MEMORY_USAGE_GPU_ONLY;
+        hb.mDesc.mFormat       = TinyImageFormat_R32_UINT;        // typed Buffer<uint>
+        hb.mDesc.mElementCount = (uint32_t)(hBytes / 4);
+        hb.mDesc.mStructStride = 0;
+        hb.mDesc.mSize         = hBytes;
+        hb.mDesc.mStartState   = RESOURCE_STATE_SHADER_RESOURCE;
+        hb.mDesc.pName         = "terrainHeights";
+        hb.pData               = nullptr;                         // staged in chunks below
+        hb.ppBuffer            = &g_pTerrainHeights;
+        addResource(&hb, nullptr);
+
+        BufferLoadDesc cb = hb;
+        cb.mDesc.mElementCount = (uint32_t)(cBytes / 4);
+        cb.mDesc.mSize         = cBytes;
+        cb.mDesc.pName         = "terrainColor";
+        cb.ppBuffer            = &g_pTerrainColors;
+        addResource(&cb, nullptr);
+
+        // VTEX (remapped to texture SLOTS below) + the world cell-lookup grid.
+        int32_t eMaxX = 0, eMaxY = 0;
+        Terrain::extent(g_terrainGridMinX, g_terrainGridMinY, eMaxX, eMaxY);
+        g_terrainGridSpanX = (uint32_t)(eMaxX - g_terrainGridMinX) + 1u;
+        g_terrainGridSpanY = (uint32_t)(eMaxY - g_terrainGridMinY) + 1u;
+        const uint64_t tBytes = (uint64_t)cells * Terrain::kTexStrideUints * 4ull;
+        const uint64_t gBytes = (uint64_t)g_terrainGridSpanX * g_terrainGridSpanY * 4ull;
+
+        BufferLoadDesc tb = hb;
+        tb.mDesc.mElementCount = (uint32_t)(tBytes / 4);
+        tb.mDesc.mSize         = tBytes;
+        tb.mDesc.pName         = "terrainTex";
+        tb.ppBuffer            = &g_pTerrainTex;
+        addResource(&tb, nullptr);
+
+        BufferLoadDesc gb = hb;
+        gb.mDesc.mElementCount = (uint32_t)(gBytes / 4);
+        gb.mDesc.mSize         = gBytes;
+        gb.mDesc.pName         = "terrainCellGrid";
+        gb.ppBuffer            = &g_pTerrainCellGrid;
+        addResource(&gb, nullptr);
+
+        waitForAllResourceLoads();
+        if (!g_pTerrainHeights || !g_pTerrainColors || !g_pTerrainTex || !g_pTerrainCellGrid) {
+            std::printf("[forge][terrain] residency alloc FAILED (%llu MB)\n",
+                        (unsigned long long)((hBytes + cBytes + tBytes + gBytes) >> 20));
+            Terrain::releaseGpuPack();
+            return false;
+        }
+
+        // Stage in bounded chunks: ~100 MB in one BufferUpdateDesc would demand a staging
+        // allocation the loader's ring cannot serve. Flush between chunks, exactly as the statics
+        // texture upload bounds itself per bucket.
+        const uint64_t kChunk = 8ull << 20;
+        auto upload = [&](Buffer* dst, const uint32_t* src, uint64_t bytes) {
+            for (uint64_t off = 0; off < bytes; off += kChunk) {
+                const uint64_t n = (bytes - off < kChunk) ? (bytes - off) : kChunk;
+                BufferUpdateDesc u = {};
+                u.pBuffer = dst; u.mDstOffset = off; u.mSize = n;
+                beginUpdateResource(&u);
+                std::memcpy(u.pMappedData, (const uint8_t*)src + off, (size_t)n);
+                endUpdateResource(&u);
+                flushTextureUploads(R);   // settle this chunk before reusing the staging ring
+            }
+        };
+        upload(g_pTerrainHeights, Terrain::packedHeights(), hBytes);
+        upload(g_pTerrainColors,  Terrain::packedColors(),  cBytes);
+
+        // Land textures FIRST, so the VTEX pack can be remapped from LTEX ids to resolved
+        // (bucket<<16)|layer slots before it is uploaded — the frag then needs one load per tap
+        // instead of a load plus an id->slot indirection.
+        std::vector<uint32_t> idToSlot;
+        buildTerrainTextureArrays(R, idToSlot);
+        {
+            std::vector<uint32_t> texSlots(Terrain::packedTex(),
+                                           Terrain::packedTex() + (size_t)(tBytes / 4));
+            uint32_t unresolved = 0;
+            for (uint32_t& sq : texSlots) {
+                const uint32_t id = sq;
+                sq = (id < idToSlot.size()) ? idToSlot[id] : 0u;
+                if (sq == 0u) { ++unresolved; }
+            }
+            upload(g_pTerrainTex, texSlots.data(), tBytes);
+            // Count what stayed at slot 0 (= the white fill). This is the tripwire that would have
+            // caught the first version of this remap immediately: it packed two slots per uint, so
+            // every real texture overflowed 16 bits and the WHOLE WORLD resolved to white, silently.
+            LOG::logline(">> [terrain-tex] VTEX remap: %zu squares -> slots, %u unresolved (white)%s",
+                         texSlots.size(), unresolved,
+                         (unresolved == texSlots.size()) ? "  <-- ALL WHITE, remap is broken" : "");
+        }
+        Terrain::releaseGpuPack();
+
+        // World cell-lookup grid: local (x,y) -> slot+1, 0 where there is no LAND record.
+        {
+            std::vector<uint32_t> grid((size_t)g_terrainGridSpanX * g_terrainGridSpanY, 0u);
+            const Terrain::LandCell* ca = Terrain::cells();
+            for (uint32_t s = 0; s < cells; ++s) {
+                const uint32_t lx = (uint32_t)(ca[s].cellX - g_terrainGridMinX);
+                const uint32_t ly = (uint32_t)(ca[s].cellY - g_terrainGridMinY);
+                grid[(size_t)ly * g_terrainGridSpanX + lx] = s + 1u;
+            }
+            upload(g_pTerrainCellGrid, grid.data(), gBytes);
+        }
+
+        {
+            DescriptorData tp[4] = {};
+            tp[0].mIndex = SRT_RES_IDX(SrtData, PerFrame, gTerrainHeights);
+            tp[0].mCount = 1; tp[0].ppBuffers = &g_pTerrainHeights;
+            tp[1].mIndex = SRT_RES_IDX(SrtData, PerFrame, gTerrainColor);
+            tp[1].mCount = 1; tp[1].ppBuffers = &g_pTerrainColors;
+            tp[2].mIndex = SRT_RES_IDX(SrtData, PerFrame, gTerrainTex);
+            tp[2].mCount = 1; tp[2].ppBuffers = &g_pTerrainTex;
+            tp[3].mIndex = SRT_RES_IDX(SrtData, PerFrame, gTerrainCellGrid);
+            tp[3].mCount = 1; tp[3].ppBuffers = &g_pTerrainCellGrid;
+            updateDescriptorSet(R, 0, g_live.pPerFrameSet, 4, tp);
+        }
+
+        // CPU cull table: one bounding sphere + neighbour slots per cell. Both are static for the
+        // process life (the world does not move), so this is built once, not per frame.
+        const Terrain::LandCell* cellArr = Terrain::cells();
+        g_terrainCull.resize(cells);
+        for (TerrainView* v : { &g_terrainMain, &g_terrainRefl }) {
+            v->lodOf.assign(cells, 0);
+            v->lodStamp.assign(cells, 0);
+        }
+        for (uint32_t s = 0; s < cells; ++s) {
+            const Terrain::LandCell& c = cellArr[s];
+            TerrainCellCull& t = g_terrainCull[s];
+            const float ox = (float)c.cellX * Terrain::kCellSize;
+            const float oy = (float)c.cellY * Terrain::kCellSize;
+            const float zLo = (float)c.minHeight * Terrain::kHeightScale;
+            const float zHi = (float)c.maxHeight * Terrain::kHeightScale;
+            const float half = 0.5f * Terrain::kCellSize;
+            t.cx = ox + half;
+            t.cy = oy + half;
+            t.cz = 0.5f * (zLo + zHi);
+            t.r  = std::sqrt(2.0f * half * half + 0.25f * (zHi - zLo) * (zHi - zLo));
+            t.gx = c.cellX; t.gy = c.cellY;
+            const int32_t nx = Terrain::slotAt(c.cellX - 1, c.cellY);
+            const int32_t px = Terrain::slotAt(c.cellX + 1, c.cellY);
+            const int32_t ny = Terrain::slotAt(c.cellX, c.cellY - 1);
+            const int32_t py = Terrain::slotAt(c.cellX, c.cellY + 1);
+            t.nbr[0] = (nx < 0) ? 0u : (uint32_t)nx + 1u;
+            t.nbr[1] = (px < 0) ? 0u : (uint32_t)px + 1u;
+            t.nbr[2] = (ny < 0) ? 0u : (uint32_t)ny + 1u;
+            t.nbr[3] = (py < 0) ? 0u : (uint32_t)py + 1u;
+        }
+        g_terrainMain.visible.reserve(cells);
+        g_terrainRefl.visible.reserve(cells);
+
+        const uint64_t bufBytes = hBytes + cBytes + tBytes + gBytes;
+        std::printf("[forge][terrain] residency: %u cells, %llu MB buffers (heights %llu + colour %llu)\n",
+                    cells, (unsigned long long)(bufBytes >> 20),
+                    (unsigned long long)(hBytes >> 20), (unsigned long long)(cBytes >> 20));
+        LOG::logline(">> [terrain] residency uploaded: %u cells x[%d..%d] y[%d..%d] (grid %ux%u),"
+                     " %llu MB buffers (heights %llu + VCLR %llu + VTEX %llu + grid %llu)",
+                     cells, g_terrainGridMinX, eMaxX, g_terrainGridMinY, eMaxY,
+                     g_terrainGridSpanX, g_terrainGridSpanY,
+                     (unsigned long long)(bufBytes >> 20), (unsigned long long)(hBytes >> 20),
+                     (unsigned long long)(cBytes >> 20), (unsigned long long)(tBytes >> 20),
+                     (unsigned long long)(gBytes >> 20));
+        LOG::flush();
+        g_terrainReady = true;
+        return true;
+    }
+
+    // Per-frame cull: frustum-test every cell's sphere, pick a stride from distance, then write the
+    // instance rows grouped by stride. Two passes because the edge stitch needs each cell to know
+    // its NEIGHBOURS' strides, which is only settled once every visible cell has picked one.
+    // `eye` is the REAL eye in both views — only `planes` differ (the reflection passes the
+    // mirror-about-water frustum). Distances, the LOD ladder and the camera-relative instance
+    // origins all key off the true camera, exactly as the DL cull does, so the reflection draws
+    // terrain to the same distance at the same detail as the view it mirrors.
+    void terrainCullAndBuild(TerrainView& V, bool primary,
+                             const float planes[6][4], const float eye[3], float nearCut) {
+        V.cells = 0;
+        for (uint32_t l = 0; l < kTerrainLods; ++l) { V.drawCounts[l] = 0; }
+        if (primary) {
+            g_lastTerrainCells = 0;
+            g_lastTerrainTris  = 0;
+            for (uint32_t l = 0; l < kTerrainLods; ++l) { g_lastTerrainLodHist[l] = 0; }
+        }
+        if (!g_terrainReady || !g_drawTerrain) { return; }
+
+        // Coverage tripwire (see g_terrainEyeCellMissing). Cheap enough to run every frame — one hash
+        // lookup — and it has to be per-frame, because the cell that matters is the one you walked
+        // into. PRIMARY only: it is about the cell the PLAYER stands in, and it drives an ownership
+        // report the reflection has no say in.
+        if (primary) {
+            const int32_t ecx = (int32_t)std::floor(eye[0] / Terrain::kCellSize);
+            const int32_t ecy = (int32_t)std::floor(eye[1] / Terrain::kCellSize);
+            // The 3x3 around the eye, not just the eye's own cell. terrainOwned reaches the client one
+            // RPC late, so testing only the cell you are standing in reports the hole on the frame you
+            // are already in it — one frame of visible hole per crossing. A cell is 8192 units; you
+            // cannot cross a whole one in a frame, so the ring buys a full cell of warning and the
+            // handover lands before anything is missing on screen.
+            bool    missing = false;
+            int32_t mx = ecx, my = ecy;
+            for (int32_t oy = -1; oy <= 1 && !missing; ++oy) {
+                for (int32_t ox = -1; ox <= 1 && !missing; ++ox) {
+                    if (Terrain::slotAt(ecx + ox, ecy + oy) < 0) {
+                        missing = true; mx = ecx + ox; my = ecy + oy;
+                    }
+                }
+            }
+            if (missing != g_terrainEyeCellMissing) {
+                g_terrainEyeCellMissing = missing;
+                LOG::logline(">> [terrain] coverage %s near cell (%d,%d) — %s",
+                             missing ? "LOST" : "regained", ecx, ecy,
+                             missing ? "a LAND record is absent within one cell of the eye, handing the near field back to MW"
+                                     : "host terrain owns the near field again");
+            }
+            // One line per distinct hole, not per frame: a hole you can walk in and out of would
+            // otherwise bury the log, and the cell list is what identifies the missing plugin.
+            if (missing) {
+                const int64_t key = ((int64_t)mx << 32) ^ (uint32_t)my;
+                if (g_terrainMissingSeen.emplace(key, 0u).second) {
+                    LOG::logline(">> [terrain] MISSING CELL (%d,%d) — not in the %u LAND records parsed from "
+                                 "Morrowind.ini. Check the host's ini matches the one the game loaded.",
+                                 mx, my, Terrain::cellCount());
+                }
+            }
+        }
+
+        V.visible.clear();
+        ++V.cullFrame;
+        const float maxView = (Configuration.DL.DrawDist > 0 ? (float)Configuration.DL.DrawDist : 40.0f)
+                            * Terrain::kCellSize;
+        const float maxView2 = (maxView + Terrain::kCellSize) * (maxView + Terrain::kCellSize);
+
+        uint32_t nInRange = 0, nNearCut = 0;   // cull funnel, for the one-shot diagnostic below
+        for (uint32_t s = 0; s < (uint32_t)g_terrainCull.size(); ++s) {
+            const TerrainCellCull& t = g_terrainCull[s];
+            const float dx = t.cx - eye[0], dy = t.cy - eye[1], dz = t.cz - eye[2];
+            const float d2 = dx * dx + dy * dy + dz * dz;
+            if (d2 > maxView2) { continue; }
+            ++nInRange;
+            // Near cut (T1 only): MW still draws its own land inside nearCut, so skip cells that lie
+            // WHOLLY inside it. Two deliberate choices:
+            //  - 3D distance, not XY. MW culls its land shapes against a view-distance SPHERE, so an
+            //    XY-only column keeps cutting when the camera climbs away and MW has already stopped
+            //    drawing — the airborne hole in [[project_statics_nearcull_height]].
+            //  - straddlers are KEPT, so the two surfaces briefly overlap rather than briefly gap.
+            //    They are the same heightfield at the same stride here, so the overlap costs a ring
+            //    of untextured-vs-textured shading; a gap would cost a hole. T3 deletes both this cut
+            //    and MW's near land, and the ring with them.
+            if (nearCut > 0.0f && std::sqrt(d2) + t.r < nearCut) { ++nNearCut; continue; }
+            if (!dlSphereInFrustum(planes, dx, dy, dz, t.r)) { continue; }
+            if (V.visible.size() >= kTerrainMaxInst) { break; }
+
+            uint32_t lod = kTerrainLods - 1;
+            const float dCells = std::sqrt(d2) * (1.0f / Terrain::kCellSize);
+            for (uint32_t l = 0; l < kTerrainLods; ++l) {
+                if (dCells < kTerrainLodDist[l]) { lod = l; break; }
+            }
+            V.lodOf[s]    = (uint8_t)lod;
+            V.lodStamp[s] = V.cullFrame;
+            V.visible.push_back(s);
+            ++V.drawCounts[lod];
+        }
+        // Cull funnel, per frame (not one-shot): "why is the host drawing so few cells" has three
+        // independent answers — the DrawDist cap, the near cut, and the frustum — and from the
+        // outside they look identical. Carrying in-range next to drawn makes a low count
+        // attributable at a glance instead of a rebuild-and-guess.
+        if (primary) {
+            g_lastTerrainInRange = nInRange;
+            g_lastTerrainNearCut = nNearCut;
+        }
+        if (V.visible.empty()) { return; }
+
+        // Pass 2: group by LOD and emit. Instances for stride 1<<l occupy one contiguous run, so
+        // each LOD is one instanced draw with its own index range.
+        uint32_t base[kTerrainLods] = {};
+        uint32_t running = 0;
+        for (uint32_t l = 0; l < kTerrainLods; ++l) {
+            base[l] = running;
+            running += V.drawCounts[l];
+        }
+        uint8_t* dst = (uint8_t*)V.instRing->pCpuMappedAddress;
+        uint32_t cursor[kTerrainLods];
+        for (uint32_t l = 0; l < kTerrainLods; ++l) { cursor[l] = base[l]; }
+
+        for (uint32_t s : V.visible) {
+            const TerrainCellCull& t = g_terrainCull[s];
+            const uint32_t lod    = V.lodOf[s];
+            const uint32_t stride = 1u << lod;
+
+            // Neighbour strides for the edge stitch. A neighbour that is NOT visible this frame has
+            // no stride of its own; treat it as equal (no snap) — there is no edge to match, because
+            // nothing is drawn on the other side.
+            uint32_t nbrStrides = 0;
+            for (uint32_t k = 0; k < 4; ++k) {
+                uint32_t ns = stride;
+                if (t.nbr[k]) {
+                    const uint32_t nslot = t.nbr[k] - 1u;
+                    if (V.lodStamp[nslot] == V.cullFrame) { ns = 1u << V.lodOf[nslot]; }
+                }
+                nbrStrides |= (ns & 0xFFu) << (k * 8u);
+            }
+
+            uint8_t* row = dst + (size_t)(cursor[lod]++) * kTerrainInstStride;
+            const float originRel[2] = { (float)((double)t.gx * Terrain::kCellSize - (double)eye[0]),
+                                         (float)((double)t.gy * Terrain::kCellSize - (double)eye[1]) };
+            // Local grid coords + the grid span, so both shader stages can walk to ANY neighbour
+            // (including diagonals, which the frag's texture-square wrap needs at cell corners)
+            // through gTerrainCellGrid — one table instead of plumbing 8 neighbour slots per row.
+            const uint32_t localXY = (uint32_t)(t.gx - g_terrainGridMinX)
+                                   | ((uint32_t)(t.gy - g_terrainGridMinY) << 16);
+            const uint32_t spanXY  = g_terrainGridSpanX | (g_terrainGridSpanY << 16);
+            const uint32_t inst0[4] = { s, stride, nbrStrides, localXY };
+            const uint32_t inst1[2] = { spanXY, 0u };
+            std::memcpy(row + 0,  originRel, 8);
+            std::memcpy(row + 8,  inst0,     16);
+            std::memcpy(row + 24, inst1,     8);
+        }
+
+        V.cells = (uint32_t)V.visible.size();
+        if (primary) {
+            for (uint32_t l = 0; l < kTerrainLods; ++l) {
+                g_lastTerrainLodHist[l] = V.drawCounts[l];
+                const uint32_t n = Terrain::kCellQuads >> l;
+                g_lastTerrainTris += (uint64_t)V.drawCounts[l] * n * n * 2ull;
+            }
+            g_lastTerrainCells = V.cells;
+        }
+    }
+
+    // Record one view's terrain draws. Caller has the colour target + depth bound; `frameSet` is the
+    // only thing that differs between views — the main view passes pPerFrameSet, the reflection
+    // passes pPerFrameSetReflectGeo (mirror-about-water matrix + below-water clip plane). Terrain is
+    // CULL_NONE, so unlike statics the mirror's winding flip needs no second PSO.
+    void terrainRecord(Cmd* cmd, TerrainView& V, DescriptorSet* frameSet) {
+        if (!g_terrainReady || !g_drawTerrain || !V.cells) { return; }
+        Pipeline* pso = (g_terrainWire && g_pTerrainPipelineWire) ? g_pTerrainPipelineWire
+                                                                  : g_pTerrainPipeline;
+        cmdBindPipeline(cmd, pso);
+        cmdBindDescriptorSet(cmd, 0, frameSet);
+        cmdBindDescriptorSet(cmd, 0, g_live.pPerLightsSetDist ? g_live.pPerLightsSetDist
+                                                              : g_live.pPerLightsSet);
+        cmdBindDescriptorSet(cmd, 0, g_live.pPersistentSet);
+        cmdBindDescriptorSet(cmd, 0, g_live.pPerBatchSet);
+        Buffer*  vbs[2]     = { g_pTerrainVB, V.instRing };
+        uint32_t strides[2] = { 8, kTerrainInstStride };
+        cmdBindVertexBuffer(cmd, 2, vbs, strides, nullptr);
+        cmdBindIndexBuffer(cmd, g_pTerrainIB, INDEX_TYPE_UINT16, 0);
+        uint32_t firstInstance = 0;
+        for (uint32_t l = 0; l < kTerrainLods; ++l) {
+            const uint32_t n = V.drawCounts[l];
+            if (!n) { continue; }
+            const TerrainLodRange& rg = g_terrainLodRange[l];
+            cmdDrawIndexedInstanced(cmd, rg.indexCount, rg.firstIndex, n, rg.firstVertex, firstInstance);
+            firstInstance += n;
+        }
+    }
+
+    // ============================== end host-owned terrain (T1) ================================
 
     // Build the statics pipeline: statics.vert/.frag, two vertex bindings (0 = StaticElem 20 B,
     // per-vertex; 1 = per-INSTANCE world matrix rows + params, 80 B), depth-write + reverse-Z
@@ -15521,9 +16296,16 @@ namespace ForgeRender {
         if (!buildOpaquePath(R, g_live.width, g_live.height)) {
             std::printf("[forge][dl] buildOpaquePath FAILED\n"); shutdown(); return false;
         }
-        if (!buildLandPath(R))     { shutdown(); return false; }
-        if (!loadDistantLand(R))   { shutdown(); return false; }
-        if (g_landMeshCount == 0)  { std::printf("[forge][dl] no land meshes\n"); shutdown(); return false; }
+        // T4: the land half of this probe validated the DL world BAKE, which no longer exists. The
+        // world's surface is now the LAND heightfield, drawn by the live camera-relative path — and
+        // this probe is deliberately absolute-space (lodEye = 0), so it cannot host it. --forge-view
+        // is the world inspector now; what survives here is the statics library probe.
+        if (!withStatics) {
+            std::printf("[forge][dl] --forge-dl is retired with the DL world bake."
+                        " Use --forge-view to fly the real terrain.\n");
+            shutdown(); return false;
+        }
+        dlLoadBakedLights();
 
         // Phase 1b: load the statics library + build the scoped instance/indirect buffers around the
         // densest exterior cell (the probe camera then frames that cluster).
@@ -15536,31 +16318,19 @@ namespace ForgeRender {
             if (!buildStaticsScope(R, staticsT)) { shutdown(); return false; }
         }
 
-        // Terrain bounds from the loaded sphere centres.
-        float mnX=3.4e38f,mnY=3.4e38f,mnZ=3.4e38f,mxX=-3.4e38f,mxY=-3.4e38f,mxZ=-3.4e38f;
-        for (uint32_t i=0;i<g_landMeshCount;++i){
-            const LandMeshGPU& m=g_landMeshes[i];
-            mnX = (m.cx-m.r<mnX)?m.cx-m.r:mnX; mxX=(m.cx+m.r>mxX)?m.cx+m.r:mxX;
-            mnY = (m.cy-m.r<mnY)?m.cy-m.r:mnY; mxY=(m.cy+m.r>mxY)?m.cy+m.r:mxY;
-            mnZ = (m.cz-m.r<mnZ)?m.cz-m.r:mnZ; mxZ=(m.cz+m.r>mxZ)?m.cz+m.r:mxZ;
-        }
-        float cx=0.5f*(mnX+mxX), cy=0.5f*(mnY+mxY), cz=0.5f*(mnZ+mxZ);
-        float extX=mxX-mnX, extY=mxY-mnY, ext=(extX>extY)?extX:extY;
-        std::printf("[forge][dl] bounds c(%.0f,%.0f,%.0f) ext %.0f z[%.0f,%.0f]\n", cx,cy,cz,ext,mnZ,mxZ);
+        // Scope bounds: the statics cluster picked above (there is no land mesh set to size from).
+        const float ext = 2.0f * kStaticsScopeR;
+        std::printf("[forge][dl] statics scope c(%.0f,%.0f,%.0f) ext %.0f\n",
+                    staticsT[0], staticsT[1], staticsT[2], ext);
 
         // Synthetic camera. Land-only: high above the terrain top near the centre, looking across it.
         // Statics: a ground-level oblique view of the dense cluster so the instanced statics fill the
         // frame (land still draws behind, sharing depth). MW is Z-up.
         float eye[3], at[3];
-        if (withStatics) {
-            eye[0] = staticsT[0] - 0.9f*kStaticsScopeR;
-            eye[1] = staticsT[1] - 0.3f*kStaticsScopeR;
-            eye[2] = staticsT[2] + 0.55f*kStaticsScopeR;
-            at[0]  = staticsT[0]; at[1] = staticsT[1]; at[2] = staticsT[2] + 600.0f;
-        } else {
-            eye[0] = cx - 0.35f*ext; eye[1] = cy; eye[2] = mxZ + 0.10f*ext + 4000.0f;
-            at[0]  = cx + 0.25f*ext; at[1] = cy; at[2] = cz;
-        }
+        eye[0] = staticsT[0] - 0.9f*kStaticsScopeR;
+        eye[1] = staticsT[1] - 0.3f*kStaticsScopeR;
+        eye[2] = staticsT[2] + 0.55f*kStaticsScopeR;
+        at[0]  = staticsT[0]; at[1] = staticsT[1]; at[2] = staticsT[2] + 600.0f;
         float up[3]  = { 0.0f, 0.0f, 1.0f };
         float zn=8.0f, zf=2.0f*ext + 40000.0f;
         const float yScale = 1.732051f;        // 1/tan(30deg) → 60° vertical FOV
@@ -15583,8 +16353,7 @@ namespace ForgeRender {
         fd[36]=eye[0]; fd[37]=eye[1]; fd[38]=eye[2]; fd[39]=0;       // eyePos
         fd[40]=0; fd[41]=1.0f/(float)W; fd[42]=1.0f/(float)H; fd[43]=0; // debugParams
         fd[44]=1; fd[45]=1; fd[46]=1; fd[47]=1;                      // dbgScales
-        fd[48]=(float)kLandBaseSlot; fd[49]=(float)kLandNormalSlot;  // lodParams.xy
-        fd[50]=(float)kLandDetailSlot; fd[51]=7168.0f;               // lodParams.zw (detail slot, nearViewRange)
+        fd[48]=0; fd[49]=0; fd[50]=0; fd[51]=7168.0f;                // lodParams.w = nearViewRange (statics.vert)
         fd[52]=0.34f; fd[53]=0.38f; fd[54]=0.46f; fd[55]=0;          // lodSunAmb (= ambCol for 1a)
         fd[56]=0; fd[57]=0; fd[58]=0; fd[59]=0;                      // lodEye = 0 (probe camera is absolute)
 
@@ -15613,21 +16382,7 @@ namespace ForgeRender {
         cmdBindRenderTargets(g_live.pCmd, &bind);
         cmdSetViewport(g_live.pCmd, 0.0f, 0.0f, (float)W, (float)H, 0.0f, 1.0f);
         cmdSetScissor(g_live.pCmd, 0, 0, W, H);
-        cmdBindPipeline(g_live.pCmd, g_pLandPipeline);
-        cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSet);
-        cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerLightsSet);
-        cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
-        cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerBatchSet);
-        uint64_t drawnTris = 0;
-        for (uint32_t i=0;i<g_landMeshCount;++i){
-            LandMeshGPU& m = g_landMeshes[i];
-            Buffer*  vbs[1]     = { m.vb };
-            uint32_t strides[1] = { 16 };
-            cmdBindVertexBuffer(g_live.pCmd, 1, vbs, strides, nullptr);
-            cmdBindIndexBuffer(g_live.pCmd, m.ib, m.large ? INDEX_TYPE_UINT32 : INDEX_TYPE_UINT16, 0);
-            cmdDrawIndexedInstanced(g_live.pCmd, m.indexCount, 0, 1, 0, 0);
-            drawnTris += m.indexCount / 3;
-        }
+        const uint64_t drawnTris = 0;   // statics-only probe: the land draw retired with the bake
 
         // Statics: one cmdExecuteIndirect over the mega VB/IB + per-instance stream. The arg buffer
         // holds one IndirectDrawIndexArguments per scoped subset (StartInstanceLocation selects its
@@ -15681,8 +16436,8 @@ namespace ForgeRender {
                 }
             }
             const uint8_t* c=&px[(uint64_t)(H/2)*rowPitch + (uint64_t)(W/2)*4];
-            std::printf("[forge][dl] drew %u land meshes / %llu tris + %u static draw-instances (%u subsets); centre=%u,%u,%u,%u; non-clear samples=%llu\n",
-                        g_landMeshCount, (unsigned long long)drawnTris, g_staticsInstTotal, g_staticsDrawCount,
+            std::printf("[forge][dl] drew %llu tris + %u static draw-instances (%u subsets); centre=%u,%u,%u,%u; non-clear samples=%llu\n",
+                        (unsigned long long)drawnTris, g_staticsInstTotal, g_staticsDrawCount,
                         c[0],c[1],c[2],c[3], (unsigned long long)nonClear);
             ok = nonClear > 0;
             std::printf("[forge][dl] rendered: %s\n", ok ? "YES" : "NO");
@@ -15787,14 +16542,16 @@ namespace ForgeRender {
         if (!init(W, H, viewSamples, viewAniso)) { std::printf("[forge][view] init FAILED\n"); return false; }
         Renderer* R = g_live.pRenderer;
 
-        // Run the SAME resident load the live path's lazy init does (buildLandPath/loadDistantLand +
-        // statics library/textures/rings/grid), eagerly — so we have land bounds for the camera start
-        // — then set g_dlLiveInit so dlLiveCullAndBuild skips re-loading and just culls+records each
-        // frame across the WHOLE world (per-frame frustum + tier cull), exercising the in-game DL code.
+        // Run the SAME resident load the live path's lazy init does (terrain residency + statics
+        // library/textures/rings/grid), eagerly — then set g_dlLiveInit so dlLiveCullAndBuild skips
+        // re-loading and just culls+records each frame across the WHOLE world (per-frame frustum +
+        // tier cull), exercising the in-game DL code.
         // (We skip dlCreateCullResources — that's only the B2 GPU-cull validation; CPU cull is live.)
-        if (!buildOpaquePath(R, g_live.width, g_live.height) || !buildLandPath(R) || !loadDistantLand(R)) {
-            std::printf("[forge][view] DL load FAILED\n"); shutdown(); return false;
+        if (!buildOpaquePath(R, g_live.width, g_live.height)
+            || !buildTerrainPath(R) || !loadTerrainResidency(R)) {
+            std::printf("[forge][view] terrain load FAILED\n"); shutdown(); return false;
         }
+        dlLoadBakedLights();
         float staticsT[3] = { 0, 0, 0 };
         g_staticsLiveOk = buildStaticsPath(R) && loadDistantStatics(R) && buildStaticsTextureArrays(R)
                         && dlCreateLiveRings(R);
@@ -15820,8 +16577,8 @@ namespace ForgeRender {
         // always documented to run.
         g_gpuStaticsCull = false;
         bool haveStatics = g_staticsLiveOk;
-        std::printf("[forge][view] loaded: %u land meshes, statics-live=%d\n",
-                    g_landMeshCount, (int)haveStatics);
+        std::printf("[forge][view] loaded: %u terrain cells, statics-live=%d\n",
+                    Terrain::cellCount(), (int)haveStatics);
 
         // SK V2 viewer sky: baked dome + clouds + sun billboard (host-side, no MW). Non-fatal —
         // if the bake is missing (run MGEXEgui --bake-sky), the viewer runs land-only as before.
@@ -15905,9 +16662,9 @@ namespace ForgeRender {
         Semaphore* pImgSem = nullptr; Semaphore* pRenderSem = nullptr;
         initSemaphore(R, &pImgSem); initSemaphore(R, &pRenderSem);
 
-        // --- terrain bounds → camera start (the probe's land overview), then free-fly ---
+        // --- terrain bounds → camera start (a whole-world overview), then free-fly ---
         float mnX=3.4e38f,mnY=3.4e38f,mnZ=3.4e38f,mxX=-3.4e38f,mxY=-3.4e38f,mxZ=-3.4e38f;
-        for (uint32_t i=0;i<g_landMeshCount;++i){ const LandMeshGPU& m=g_landMeshes[i];
+        for (const TerrainCellCull& m : g_terrainCull) {
             mnX=(m.cx-m.r<mnX)?m.cx-m.r:mnX; mxX=(m.cx+m.r>mxX)?m.cx+m.r:mxX;
             mnY=(m.cy-m.r<mnY)?m.cy-m.r:mnY; mxY=(m.cy+m.r>mxY)?m.cy+m.r:mxY;
             mnZ=(m.cz-m.r<mnZ)?m.cz-m.r:mnZ; mxZ=(m.cz+m.r>mxZ)?m.cz+m.r:mxZ; }
@@ -16173,16 +16930,39 @@ namespace ForgeRender {
     }
 
     // Per-frame GPU-spike log (from renderScene), reads the DL draw counts living below it.
+    //
+    // Carries the WHOLE GPU phase split, not just the total. This trigger fires on every spike,
+    // whereas the heartbeat is 1-in-300 — so before this, a dip was only ever attributable when it
+    // happened to coincide with a sample frame, which is why one went unexplained for so long. The
+    // phase array is resolved just above the call site, so it costs nothing to print here.
+    //
+    // shadow is split st/dyn/sun: the point-light atlas halves against the SUN cascade pass. That
+    // last one had no bracket at all until 2026-07-29, which is precisely what made the measured
+    // `shadow=58.66 (st=0.31 dyn=0.12)` unreadable — 58ms inside the phase and outside both timers.
     void dlLogGpuSlow(double gpuMs, double recMs, unsigned drawn) {
-        LOG::logline(">> [gpu-slow] gpu=%.1fms record=%.1fms drawn=%u dl-land=%u dl-inst=%u dl-subsets=%u",
-                     gpuMs, recMs, drawn, g_liveLastLand, g_liveLastInst, g_liveLastSubsets);
+        LOG::logline(">> [gpu-slow] gpu=%.1fms record=%.1fms drawn=%u terrain=%u dl-inst=%u dl-subsets=%u",
+                     gpuMs, recMs, drawn, g_lastTerrainCells, g_liveLastInst, g_liveLastSubsets);
+        LOG::logline(">> [gpu-slow]   phases: cull=%.2f prepass=%.2f shadow=%.2f (st=%.2f dyn=%.2f sun=%.2f)"
+                     " postdepth=%.2f reflect=%.2f (geo=%.2f) color=%.2f water=%.2f alpha=%.2f resolve=%.2f ms",
+                     g_lastGpuPhaseMs[kGpuPhaseCull], g_lastGpuPhaseMs[kGpuPhasePrepass],
+                     g_lastGpuPhaseMs[kGpuPhaseShadow], g_lastGpuPhaseMs[kGpuPhaseShadowStatic],
+                     g_lastGpuPhaseMs[kGpuPhaseShadowDyn], g_lastGpuPhaseMs[kGpuPhaseShadowSun],
+                     g_lastGpuPhaseMs[kGpuPhasePostDepth], g_lastGpuPhaseMs[kGpuPhaseReflect],
+                     g_lastGpuPhaseMs[kGpuPhaseReflGeo], g_lastGpuPhaseMs[kGpuPhaseColor],
+                     g_lastGpuPhaseMs[kGpuPhaseWater], g_lastGpuPhaseMs[kGpuPhaseColorAlpha],
+                     g_lastGpuPhaseMs[kGpuPhaseResolve]);
+        LOG::logline(">> [gpu-slow]   scene: shadowCasters=%u maskSlots=%u(dyn=%u) nearTris=%.2fM"
+                     " terrain=%u/%u cells %.2fM tris | gpuCull=%u hizOccl=%u",
+                     (unsigned)g_shadowCasters.size(), g_lastShadowActive, g_lastShadowDyn,
+                     (double)g_lastNearTris / 1e6, g_lastTerrainCells, g_lastTerrainInRange,
+                     (double)g_lastTerrainTris / 1e6, g_lastGpuCullCount, g_lastGpuOccluded);
     }
 
     // Per-300-frame DL heartbeat (from renderScene's heartbeat block).
     void dlLogHeartbeat() {
         if (!g_dlLiveInit) { return; }
-        LOG::logline(">> [forge-hb][dl] exterior=%d land=%u/%u static-instances=%u subsets=%u tex-buckets=%zu",
-                     (int)g_dlExterior, g_liveLastLand, g_landMeshCount, g_liveLastInst,
+        LOG::logline(">> [forge-hb][dl] exterior=%d terrain=%u/%u cells static-instances=%u subsets=%u tex-buckets=%zu",
+                     (int)g_dlExterior, g_lastTerrainCells, Terrain::cellCount(), g_liveLastInst,
                      g_liveLastSubsets, g_staticsBuckets.empty() ? 0 : g_staticsBuckets.size() - 1);
         // Near/far handover: suppressed = wholly MW-covered (the double-draw that used to ship);
         // clipped = STRADDLING the slab, submitted and cut at it (the class that was a hole while
@@ -16810,7 +17590,6 @@ namespace ForgeRender {
     // belong to the main path ONLY: lazy resident load, the DL gFrameData block, the GPU-cull CullParams
     // cbuffer, and the g_liveLast* diagnostic counters.
     struct DlCullTargets {
-        std::vector<uint32_t>* landVisible;
         Buffer**               instRing;   // by-ref: the primary rings are created by the lazy init
         Buffer**               argRing;    //         INSIDE this call, so read the global at flatten time
         uint32_t*              lastSubsets;
@@ -16823,14 +17602,13 @@ namespace ForgeRender {
 
     // Per-frame cull + ring fill (the PRIMARY call runs BEFORE command recording — it lazily creates GPU
     // resources + loads newly-visible textures, which must not happen mid-command-buffer). Fills
-    // T.landVisible + T.instRing/T.argRing, and (primary only) writes the DL fields of gFrameData. viewProj
+    // T.instRing/T.argRing, and (primary only) writes the DL fields of gFrameData. viewProj
     // = the relative, reverse-Z, extended-far matrix (main) or the mirror-about-water matrix (reflection);
     // only the frustum planes come from it — tier/distance ranges + g_dlEye are the REAL eye either way.
     void dlCullAndBuild(Renderer* R, const float* viewProj, const DlCullTargets& T) {
-        T.landVisible->clear();
         *T.lastSubsets = 0;
         if (T.lastInst) { *T.lastInst = 0; }
-        if (T.primary) { g_liveLastInst = g_liveLastSubsets = g_liveLastLand = 0; }
+        if (T.primary) { g_liveLastInst = g_liveLastSubsets = 0; }
         if (!g_dlExterior) { return; }
         const double tCull0 = hostNowMs();   // CPU cull+build cost (NOT in the host record/gpu metrics)
 
@@ -16838,10 +17616,14 @@ namespace ForgeRender {
         // PRIMARY only — it does addResource/updateDescriptorSet, illegal mid-command-buffer. The reflect
         // cull runs INSIDE the command buffer, so it relies on the primary cull having already run.
         if (T.primary && !g_dlLiveInit) {
-            if (!buildLandPath(R) || !loadDistantLand(R)) {
-                std::printf("[forge][dl] live land load FAILED — DL disabled\n");
+            // Host-owned terrain (tasks/forge-terrain.md): the real LAND heightfield. Since T4 there
+            // is no DL world bake to fall back to — this IS the world's surface, so a failure here
+            // disables distant land outright rather than quietly degrading to something else.
+            if (!buildTerrainPath(R) || !loadTerrainResidency(R)) {
+                std::printf("[forge][terrain] resident load FAILED — distant land disabled\n");
                 g_dlExterior = false; return;
             }
+            dlLoadBakedLights();
             g_staticsLiveOk = buildStaticsPath(R) && loadDistantStatics(R)
                             && buildStaticsTextureArrays(R) && dlCreateLiveRings(R);
             if (g_staticsLiveOk) {
@@ -16851,12 +17633,12 @@ namespace ForgeRender {
                 dlCreateCullResources(R);
             }
             else { std::printf("[forge][dl] live statics unavailable — land only\n"); }
-            // Phase F: build the glow-billboard path now that loadDistantLand has populated
+            // Phase F: build the glow-billboard path now that dlLoadBakedLights has populated
             // g_dlBakedLights (the instance buffer is sized from it). Non-fatal (glowReady gates the pass).
             buildGlowPath(R);
             g_dlLiveInit = true;
-            std::printf("[forge][dl] live init done (land meshes=%u, statics=%d)\n",
-                        g_landMeshCount, (int)g_staticsLiveOk);
+            std::printf("[forge][dl] live init done (terrain cells=%u, statics=%d)\n",
+                        Terrain::cellCount(), (int)g_staticsLiveOk);
         }
         if (!g_dlLiveInit) { return; }   // reflect cull before the primary init ran → nothing to do
 
@@ -16865,8 +17647,9 @@ namespace ForgeRender {
         // is a copy made in the reflect pass).
         if (T.primary) {
             float* fd = (float*)g_live.pFrameCbv->pCpuMappedAddress;
-            fd[48] = (float)kLandBaseSlot; fd[49] = (float)kLandNormalSlot;
-            fd[50] = (float)kLandDetailSlot; fd[51] = g_dlNearViewRange;  // lodParams.zw (detail slot, nearViewRange)
+            // lodParams.xyz were the DL world/normal/detail atlas slots — retired with the bake.
+            // .w (nearViewRange) survives: statics.vert still gates the hero near-cut on it.
+            fd[48] = 0.0f; fd[49] = 0.0f; fd[50] = 0.0f; fd[51] = g_dlNearViewRange;
             fd[52] = fd[24]; fd[53] = fd[25]; fd[54] = fd[26]; fd[55] = 0.0f;  // lodSunAmb = ambCol
             fd[56] = g_dlEye[0]; fd[57] = g_dlEye[1]; fd[58] = g_dlEye[2]; fd[59] = 0.0f;  // lodEye
             fd[116] = 0.0f;   // clustered forward default OFF (froxelDims.x); the froxel fill below sets it when active
@@ -16877,14 +17660,12 @@ namespace ForgeRender {
         dlExtractFrustum(viewProj, planes);
         const float eye[3] = { g_dlEye[0], g_dlEye[1], g_dlEye[2] };
 
-        // Land: frustum-cull the resident sphere set in relative space.
-        for (uint32_t i = 0; i < g_landMeshCount; ++i) {
-            const LandMeshGPU& m = g_landMeshes[i];
-            if (dlSphereInFrustum(planes, m.cx - eye[0], m.cy - eye[1], m.cz - eye[2], m.r)) {
-                T.landVisible->push_back(i);
-            }
-        }
-        if (T.primary) { g_liveLastLand = (uint32_t)T.landVisible->size(); }
+        // Host-owned terrain: same frustum, its own per-cell LOD + instance fill, into whichever
+        // view this cull belongs to. The reflection gets the REAL terrain here — the near cut is
+        // main-view-only (it exists to leave MW's own land alone, and the reflection has no MW land
+        // to leave alone), so the mirror always sees the full surface down to the eye.
+        terrainCullAndBuild(T.primary ? g_terrainMain : g_terrainRefl, T.primary, planes, eye,
+                            (T.primary && g_terrainNearCut) ? g_dlNearViewRange : 0.0f);
 
         // Phase C: stream + UPLOAD the baked distant lights around the eye. Fill the gLights-layout
         // distant cbuffer with the NEAREST <=128 within the working radius (camera-relative: pos-eye,
@@ -17320,8 +18101,8 @@ namespace ForgeRender {
         // (cells/instances examined, survivors). Statics textures are all resident (no per-frame loads).
         const double cullMs = hostNowMs() - tCull0;
         if (T.primary && cullMs > 20.0) {
-            LOG::logline(">> [dl-slow] cull=%.1fms cellsHit=%u examined=%u land=%u inst=%u subsets=%u buckets=%zu",
-                         cullMs, cellsHit, examined, g_liveLastLand, g_liveLastInst, g_liveLastSubsets,
+            LOG::logline(">> [dl-slow] cull=%.1fms cellsHit=%u examined=%u terrain=%u inst=%u subsets=%u buckets=%zu",
+                         cullMs, cellsHit, examined, g_lastTerrainCells, g_liveLastInst, g_liveLastSubsets,
                          g_staticsBuckets.empty() ? 0 : g_staticsBuckets.size() - 1);
         }
     }
@@ -17329,7 +18110,6 @@ namespace ForgeRender {
     // Main-path wrapper: cull into the LIVE globals (behaviour-identical to the pre-WV2 signature).
     void dlLiveCullAndBuild(Renderer* R, const float* rzViewProj) {
         DlCullTargets T = {};
-        T.landVisible = &g_liveLandVisible;
         T.instRing    = &g_pStaticsInstRing;
         T.argRing     = &g_pStaticsArgsRing;
         T.lastSubsets = &g_liveLastSubsets;
@@ -17345,7 +18125,6 @@ namespace ForgeRender {
     // no GPU-cull cbuffer write, so it is safe to run mid-command-buffer (the primary cull already ran).
     void dlReflectCullAndBuild(Renderer* R, const float* mirrorViewProj) {
         DlCullTargets T = {};
-        T.landVisible = &g_liveLandVisibleRefl;
         T.instRing    = &g_pStaticsInstRingRefl;
         T.argRing     = &g_pStaticsArgsRingRefl;
         T.lastSubsets = &g_liveLastSubsetsRefl;
@@ -17372,29 +18151,18 @@ namespace ForgeRender {
     // reverse-Z) correctly occludes DL behind it, and DL fills the empty sky/horizon. (No GTAO on DL:
     // GTAO already ran on the near-only depth before this.)
     void dlLiveRecord() {
-        if (!g_dlExterior || !g_dlLiveInit || !g_landLoaded) { return; }
+        if (!g_dlExterior || !g_dlLiveInit) { return; }
         cmdBeginDebugMarker(g_live.pCmd, 0.3f, 0.8f, 0.5f, "DISTANT LAND (live)");
+
+        // Host-owned terrain FIRST: it is the real surface, at true height with no z-sink. The old
+        // DL bake below (when its A/B toggle is on) still sinks itself, so wherever the two overlap
+        // the sunk mesh simply loses the depth test.
+        terrainRecord(g_live.pCmd, g_terrainMain, g_live.pPerFrameSet);
 
         // Phase C: bind the baked DISTANT light set for BOTH distant land + statics frags (falls back
         // to the near set if the baked set failed to build). They loop these camera-relative lights.
         DescriptorSet* distLightsSet = g_live.pPerLightsSetDist ? g_live.pPerLightsSetDist
                                                                 : g_live.pPerLightsSet;
-
-        if (g_drawDLLand) {   // Phase 0 panel toggle
-        cmdBindPipeline(g_live.pCmd, g_pLandPipeline);
-        cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSet);
-        cmdBindDescriptorSet(g_live.pCmd, 0, distLightsSet);
-        cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
-        cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerBatchSet);
-        for (uint32_t idx : g_liveLandVisible) {
-            LandMeshGPU& m = g_landMeshes[idx];
-            Buffer*  vbs[1]     = { m.vb };
-            uint32_t strides[1] = { 16 };
-            cmdBindVertexBuffer(g_live.pCmd, 1, vbs, strides, nullptr);
-            cmdBindIndexBuffer(g_live.pCmd, m.ib, m.large ? INDEX_TYPE_UINT32 : INDEX_TYPE_UINT16, 0);
-            cmdDrawIndexedInstanced(g_live.pCmd, m.indexCount, 0, 1, 0, 0);
-        }
-        }
 
         // B3: draw the far statics from the GPU-driven cull (count->prefix->scatter filled pGpuArgs +
         // pGpuInstOut this frame) when g_gpuStaticsCull; else the CPU cull's rings. The CPU cull still
@@ -17457,7 +18225,7 @@ namespace ForgeRender {
     // Pure compute; runs in the cull phase after the camera cull.
     void dispatchSunCull() {
         if (!g_live.sunCullReady || !g_live.pCullPipeline || !g_live.cullInstCount) { return; }
-        if (!g_dlExterior || !g_dlLiveInit || !g_landLoaded || !g_staticsLiveOk) { return; }
+        if (!g_dlExterior || !g_dlLiveInit || !g_staticsLiveOk) { return; }
         if (!g_live.pCullParamsCbv || !g_live.pCullParamsCbv->pCpuMappedAddress
             || !g_live.pSunCullParamsCbv || !g_live.pSunCullParamsCbv->pCpuMappedAddress
             || !g_live.pFrameCbv || !g_live.pFrameCbv->pCpuMappedAddress) { return; }
@@ -17680,7 +18448,7 @@ namespace ForgeRender {
         const bool ready = g_drawSunShadow
                         && g_pSunShadowStaticsPipeline && g_live.pSunMoments && g_live.pSunMomentsDepth
                         && g_live.pSunFrameCbv[kSunCascades - 1] && g_live.pPerFrameSetSun
-                        && g_dlExterior && g_dlLiveInit && g_landLoaded && g_staticsLiveOk
+                        && g_dlExterior && g_dlLiveInit && g_staticsLiveOk
                         && (sunDraw || gpuDraw || g_liveLastSubsets > 0);
         // Single exit for "no map this frame": disarm every receiver before returning.
         if (!ready) { g_live.sunShadowReady = false; publishSunShadowParams(nullptr, nullptr, false); return; }
@@ -17963,24 +18731,14 @@ namespace ForgeRender {
     // statics PSO (the mirror flips triangle winding). Land is cull NONE → winding-agnostic. Drawn AFTER
     // the sky into the same RT (depth GEQUAL+write, so land/statics occlude each other + the sky behind).
     void dlReflectRecordGeo() {
-        if (!g_dlExterior || !g_dlLiveInit || !g_landLoaded) { return; }
+        if (!g_dlExterior || !g_dlLiveInit) { return; }
         cmdBeginDebugMarker(g_live.pCmd, 0.3f, 0.6f, 0.9f, "DISTANT LAND (reflect)");
 
-        if (g_drawDLLand) {
-            cmdBindPipeline(g_live.pCmd, g_pLandPipeline);
-            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSetReflectGeo);   // MIRROR-about-water + clip
-            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerLightsSet);
-            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
-            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerBatchSet);
-            for (uint32_t idx : g_liveLandVisibleRefl) {
-                LandMeshGPU& m = g_landMeshes[idx];
-                Buffer*  vbs[1]     = { m.vb };
-                uint32_t strides[1] = { 16 };
-                cmdBindVertexBuffer(g_live.pCmd, 1, vbs, strides, nullptr);
-                cmdBindIndexBuffer(g_live.pCmd, m.ib, m.large ? INDEX_TYPE_UINT32 : INDEX_TYPE_UINT16, 0);
-                cmdDrawIndexedInstanced(g_live.pCmd, m.indexCount, 0, 1, 0, 0);
-            }
-        }
+        // Host-owned terrain in the mirror, same as the main view. This is what closes the shoreline
+        // gap the old bake left: the reflection now sees the SAME surface at the same resolution the
+        // camera does, so a coastline reflects its actual shape instead of a 915-tri approximation
+        // that had to be clipped at waterLevel-1 to hide the mismatch.
+        terrainRecord(g_live.pCmd, g_terrainRefl, g_live.pPerFrameSetReflectGeo);
 
         if (g_drawDLStatics && g_staticsLiveOk && g_liveLastSubsetsRefl > 0) {
             // Opposite winding to the main record (the water-plane mirror flips handedness).
@@ -18006,7 +18764,7 @@ namespace ForgeRender {
     void dlReflectGeoCull(Renderer* R, const float* viewProj, const float* fcbvR,
                           float dRel, float eyeAbsZ, float waterLevelAbs, bool underwater) {
         g_reflGeoReady = false;
-        if (!g_drawReflectGeo || !g_dlExterior || !g_dlLiveInit || !g_landLoaded) { return; }
+        if (!g_drawReflectGeo || !g_dlExterior || !g_dlLiveInit) { return; }
 
         // Mirror about the water plane: the sky's M with M[14] = 2·dRel (reflect about z = dRel, the
         // camera-relative water level). Same reverse-Z + half-pixel edits the sky/main paths apply.
@@ -18598,6 +19356,33 @@ namespace ForgeRender {
         }
         freeMeshStore();   // release VB/IB before the resource loader goes down
         exitDevUI();       // Forge IUI/IFont teardown while the renderer is still alive
+        // Host-owned terrain teardown (before the descriptor sets that reference the data buffers).
+        if (g_pTerrainPipelineWire) { removePipeline(R, g_pTerrainPipelineWire); g_pTerrainPipelineWire = nullptr; }
+        if (g_pTerrainPipeline)     { removePipeline(R, g_pTerrainPipeline);     g_pTerrainPipeline = nullptr; }
+        if (g_pTerrainShader)       { removeShader(R, g_pTerrainShader);         g_pTerrainShader = nullptr; }
+        if (g_pTerrainVB)           { removeResource(g_pTerrainVB);              g_pTerrainVB = nullptr; }
+        if (g_pTerrainIB)           { removeResource(g_pTerrainIB);              g_pTerrainIB = nullptr; }
+        if (g_pTerrainHeights)      { removeResource(g_pTerrainHeights);         g_pTerrainHeights = nullptr; }
+        if (g_pTerrainColors)       { removeResource(g_pTerrainColors);          g_pTerrainColors = nullptr; }
+        if (g_pTerrainTex)          { removeResource(g_pTerrainTex);             g_pTerrainTex = nullptr; }
+        if (g_pTerrainCellGrid)     { removeResource(g_pTerrainCellGrid);        g_pTerrainCellGrid = nullptr; }
+        for (TerrainView* v : { &g_terrainMain, &g_terrainRefl }) {
+            if (v->instRing) { removeResource(v->instRing); v->instRing = nullptr; }
+            v->visible.clear(); v->lodOf.clear(); v->lodStamp.clear();
+            v->cells = 0;
+            for (uint32_t l = 0; l < kTerrainLods; ++l) { v->drawCounts[l] = 0; }
+        }
+        for (uint32_t b = 1; b < g_terrainBuckets.size(); ++b) {   // [0] is g_pTerrainWhite
+            if (g_terrainBuckets[b].tex) { removeResource(g_terrainBuckets[b].tex); }
+        }
+        g_terrainBuckets.clear();
+        if (g_pTerrainWhite)        { removeResource(g_pTerrainWhite);           g_pTerrainWhite = nullptr; }
+        g_terrainReady = false;
+        g_terrainLoadTried = false;
+        // Clear the coverage tripwire with the residency it describes, or a reload comes up already
+        // claiming a hole it has not tested for (and never re-logs the cells, the set being sticky).
+        g_terrainEyeCellMissing = false;
+        g_terrainMissingSeen.clear();
         // M1c opaque path teardown.
         if (g_live.pPerFrameSet)    { removeDescriptorSet(R, g_live.pPerFrameSet); }
         if (g_live.pPerLightsSet)   { removeDescriptorSet(R, g_live.pPerLightsSet); }
@@ -18745,15 +19530,6 @@ namespace ForgeRender {
         if (g_live.pReflectSkyInstanceBuf)  { removeResource(g_live.pReflectSkyInstanceBuf); }
         if (g_live.pReflectColor)           { removeRenderTarget(R, g_live.pReflectColor); }
         if (g_live.pReflectDepth)           { removeRenderTarget(R, g_live.pReflectDepth); }
-        // Phase 1a distant-land teardown (atlas textures freed by the bindless loop below).
-        for (uint32_t i = 0; i < g_landMeshCount; ++i) {
-            if (g_landMeshes[i].vb) { removeResource(g_landMeshes[i].vb); g_landMeshes[i].vb = nullptr; }
-            if (g_landMeshes[i].ib) { removeResource(g_landMeshes[i].ib); g_landMeshes[i].ib = nullptr; }
-        }
-        g_landMeshCount = 0;
-        g_landLoaded = false;
-        if (g_pLandPipeline) { removePipeline(R, g_pLandPipeline); g_pLandPipeline = nullptr; }
-        if (g_pLandShader)   { removeShader(R, g_pLandShader);     g_pLandShader = nullptr; }
         // Phase 1b distant-statics teardown (per-subset textures freed by the bindless loop below).
         if (g_pStaticsArgs)     { removeResource(g_pStaticsArgs);     g_pStaticsArgs = nullptr; }
         if (g_pStaticsInst)     { removeResource(g_pStaticsInst);     g_pStaticsInst = nullptr; }
@@ -18830,9 +19606,8 @@ namespace ForgeRender {
         g_live.cullInstCount = 0; g_live.cullSubsetCount = 0;
         g_live.gpuStaticsReady = false; g_live.gpuArgsInDrawState = false;
         g_liveGrid.clear(); g_liveGridIndex.clear();
-        g_liveLandVisible.clear(); g_liveLandVisibleRefl.clear();
         g_dlLiveInit = false; g_staticsLiveOk = false; g_dlExterior = false;
-        g_liveLastInst = g_liveLastSubsets = g_liveLastLand = 0;
+        g_liveLastInst = g_liveLastSubsets = 0;
         g_liveLastSubsetsRefl = g_liveLastInstRefl = 0;
         // Phase 3 Hi-Z prologue (fence already waited at the top of shutdown).
         if (g_live.pHizSet)          { removeDescriptorSet(R, g_live.pHizSet); }

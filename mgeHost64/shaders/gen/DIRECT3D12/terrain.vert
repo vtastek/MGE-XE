@@ -972,9 +972,9 @@ SamplerState gSampler2xWrapClamp : register( s17 , space100 ) ;
 #line 247 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/../../../3rdparty/The-Forge/Common_3/Graphics/FSL/defaults.h"
 
 #line 11 "FSL/shaders.list"
-#line 168 "FSL/shaders.list"
-#line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/distantland.vert.fsl"
-#line 14 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/distantland.vert.fsl"
+#line 170 "FSL/shaders.list"
+#line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terrain.vert.fsl"
+#line 19 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terrain.vert.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
 #line 20 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
@@ -1069,7 +1069,7 @@ STRUCT(ShadowMaskParams)
 #line 159
 };
 #line 21 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
-#line 42 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+#line 46 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
 STRUCT(FrameData)
 {
     float4x4 viewProj;
@@ -1089,6 +1089,7 @@ STRUCT(FrameData)
 
 
     float4 dbgScales;
+
 
 
 
@@ -1154,15 +1155,15 @@ STRUCT(FrameData)
 
 
     float4 alphaShadowParams;
-#line 126
+#line 131
 };
 
 STRUCT(BatchData)
 {
     float4x4 worlds[ 1024 ];
-#line 131
+#line 136
 };
-#line 152 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+#line 157 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
 STRUCT(LightData)
 {
     float4 lightParams;
@@ -1178,7 +1179,7 @@ STRUCT(LightData)
 
     float4 froxelDimsNear;
     float4 froxelZNear;
-#line 167
+#line 172
 };
 
         CBUFFER(FrameData) gFrameData :  register(b0,space1);
@@ -1267,8 +1268,36 @@ STRUCT(LightData)
 
 
 
+
+
+
+
+
+        Buffer(uint) gTerrainHeights :  register(t16,space1);
+        Buffer(uint) gTerrainColor :  register(t17,space1);
+
+
+
+
+
+
+
+
+
+        Buffer(uint) gTerrainTex :  register(t18,space1);
+        Buffer(uint) gTerrainCellGrid :  register(t19,space1);
+
+
+
+
+
+        Tex2DArray(float4) gTerrainArrays[ 32 ] :  register(t20,space1);
+
+
+
+
         CBUFFER(LightData) gLights :  register(b0,space3);
-#line 272 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+#line 305 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
         Tex2D(float4) gTextures[ 880 ] :  register(t0,space0);
 
 
@@ -1279,26 +1308,86 @@ STRUCT(LightData)
 
         Tex2DArray(float4) gFlipArrays[ 16 ] :  register(t1008,space0);
         CBUFFER(BatchData) gBatch :  register(b0,space2);
-#line 15 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/distantland.vert.fsl"
+#line 20 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terrain.vert.fsl"
+
+
+
+
+
+
+
 
 STRUCT(VSInput)
 {
-    DATA(float3, Position, POSITION);
-    DATA(float2, Uv, TEXCOORD0);
-#line 20
+    DATA(float2, Grid, POSITION);
+    DATA(float2, Origin, TEXCOORD1);
+    DATA(uint4, Inst0, TEXCOORD2);
+    DATA(uint2, Inst1, TEXCOORD3);
+#line 34
 };
 
 STRUCT(VSOutput)
 {
     DATA(float4, Position, SV_Position);
-    DATA(float2, Uv, TEXCOORD0);
-    DATA(float3, WorldPos, TEXCOORD1);
-    DATA(float, Fog, TEXCOORD2);
+    DATA(float3, WorldPos, TEXCOORD0);
+    DATA(float3, Normal, TEXCOORD1);
+
+
+
+
+
+    DATA(CENTROID(float), Fog, TEXCOORD2);
+
+
+    DATA(float2, Lattice, TEXCOORD3);
+    DATA(FLAT(uint4), Cell, TEXCOORD4);
 
 
     DATA(float, Clip, SV_ClipDistance0);
-#line 31
+#line 54
 };
+
+
+
+
+uint terrainCellAt(int lx, int ly, uint spanX, uint spanY)
+{
+    if (lx < 0 || ly < 0 || lx >= (int)spanX || ly >= (int)spanY) { return 0u; }
+    return gTerrainCellGrid[(uint)ly * spanX + (uint)lx];
+}
+
+
+float loadHeight(uint slot, int x, int y)
+{
+    uint v = (uint)(y *  65  + x);
+    uint word = gTerrainHeights[slot *  2113u  + (v >> 1u)];
+    uint h16 = ((v & 1u) != 0u) ? (word >> 16u) : (word & 0xFFFFu);
+    int h = (int)h16;
+    if (h > 32767) { h -= 65536; }
+    return (float)h *  8.0f ;
+}
+
+
+
+
+
+
+float loadHeightWide(uint slot, int lx, int ly, uint spanX, uint spanY, int x, int y)
+{
+    int dx = 0, dy = 0;
+    if (x < 0) { dx = -1; x +=  64 ; }
+    else if (x >  64 ) { dx = 1; x -=  64 ; }
+    if (y < 0) { dy = -1; y +=  64 ; }
+    else if (y >  64 ) { dy = 1; y -=  64 ; }
+    if (dx != 0 || dy != 0) {
+        uint n = terrainCellAt(lx + dx, ly + dy, spanX, spanY);
+        if (n != 0u) { return loadHeight(n - 1u, x, y); }
+
+        return loadHeight(slot, clamp(x - dx *  64 , 0,  64 ),
+                                clamp(y - dy *  64 , 0,  64 ));
+    }
+    return loadHeight(slot, x, y);
+}
 
 [RootSignature( "RootFlags(ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT)," "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "3" ", offset = 0)," "CBV(b0, numDescriptors = unbounded, space = " "3" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "3" ", offset = 0))," "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "2" ", offset = 0)," "CBV(b0, numDescriptors = unbounded, space = " "2" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "2" ", offset = 0))," "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "1" ", offset = 0)," "CBV(b0, numDescriptors = unbounded, space = " "1" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "1" ", offset = 0))," "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "0" ", offset = 0)," "CBV(b0, numDescriptors = unbounded, space = " "0" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "0" ", offset = 0))," "DescriptorTable(" "SAMPLER(s0, numDescriptors = unbounded, space = " "0" ", offset = 0))," "StaticSampler(s0, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s1, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s2, space = 100," "filter = FILTER_MIN_MAG_LINEAR_MIP_POINT," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s3, space = 100," "filter = FILTER_MIN_MAG_LINEAR_MIP_POINT," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s4, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s5, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s6, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT," "addressU = TEXTURE_ADDRESS_MIRROR, addressV = TEXTURE_ADDRESS_MIRROR, addressW = TEXTURE_ADDRESS_MIRROR)," "StaticSampler(s7, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT, borderColor = STATIC_BORDER_COLOR_TRANSPARENT_BLACK," "addressU = TEXTURE_ADDRESS_BORDER, addressV = TEXTURE_ADDRESS_BORDER, addressW = TEXTURE_ADDRESS_BORDER)," "StaticSampler(s8, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR," "addressU = TEXTURE_ADDRESS_MIRROR, addressV = TEXTURE_ADDRESS_MIRROR, addressW = TEXTURE_ADDRESS_MIRROR)," "StaticSampler(s9, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR, borderColor = STATIC_BORDER_COLOR_TRANSPARENT_BLACK," "addressU = TEXTURE_ADDRESS_BORDER, addressV = TEXTURE_ADDRESS_BORDER, addressW = TEXTURE_ADDRESS_BORDER)," "StaticSampler(s10, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 8," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s11, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 8," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s12, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 8," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s13, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 8," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s14, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 2," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s15, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 2," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s16, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 2," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s17, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 2," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_WRAP)" )]
 VSOutput VS_MAIN( VSInput In )
@@ -1306,33 +1395,72 @@ VSOutput VS_MAIN( VSInput In )
     //INIT_MAIN;
     VSOutput Out;
 
+    const int gx = (int)In.Grid.x;
+    const int gy = (int)In.Grid.y;
+    const uint slot = In.Inst0.x;
+    const uint stride = In.Inst0.y;
+    const uint nbrS = In.Inst0.z;
+    const int lx = (int)(In.Inst0.w & 0xFFFFu);
+    const int ly = (int)(In.Inst0.w >> 16u);
+    const uint spanX = In.Inst1.x & 0xFFFFu;
+    const uint spanY = In.Inst1.x >> 16u;
 
 
+    uint snap = stride;
+    uint axis = 0u;
+    if (gy == 0) { uint s = (nbrS >> 16u) & 0xFFu; if (s > snap) { snap = s; axis = 1u; } }
+    else if (gy ==  64 ) { uint s = (nbrS >> 24u) & 0xFFu; if (s > snap) { snap = s; axis = 1u; } }
+    if (gx == 0) { uint s = (nbrS ) & 0xFFu; if (s > snap) { snap = s; axis = 2u; } }
+    else if (gx ==  64 ) { uint s = (nbrS >> 8u) & 0xFFu; if (s > snap) { snap = s; axis = 2u; } }
 
-
-
-    float3 worldPos = In.Position - gFrameData.lodEye.xyz;
-    float dist = length(worldPos - gFrameData.eyePos.xyz);
-#line 57 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/distantland.vert.fsl"
-    if (gFrameData.gReflWaterClip.z == 0.0f && gFrameData.lodParams.w > 0.0f) {
-        float maxDist = gFrameData.lodParams.w - 1152.0f;
-        worldPos.z += -30.0f + -2.0f * max(0.0f, maxDist - dist);
+    float h;
+    if (axis == 1u) {
+        int x0 = (gx / (int)snap) * (int)snap;
+        int x1 = min(x0 + (int)snap,  64 );
+        float t = float(gx - x0) / float(snap);
+        h = lerp(loadHeight(slot, x0, gy), loadHeight(slot, x1, gy), t);
+    } else if (axis == 2u) {
+        int y0 = (gy / (int)snap) * (int)snap;
+        int y1 = min(y0 + (int)snap,  64 );
+        float t = float(gy - y0) / float(snap);
+        h = lerp(loadHeight(slot, gx, y0), loadHeight(slot, gx, y1), t);
+    } else {
+        h = loadHeight(slot, gx, gy);
     }
 
 
 
+
+    float3 worldPos;
+    worldPos.x = In.Origin.x + float(gx) *  128.0f ;
+    worldPos.y = In.Origin.y + float(gy) *  128.0f ;
+    worldPos.z = h - gFrameData.lodEye.z;
+
+
+
+
+
+
+
+    {
+        const float hL = loadHeightWide(slot, lx, ly, spanX, spanY, gx - 1, gy);
+        const float hR = loadHeightWide(slot, lx, ly, spanX, spanY, gx + 1, gy);
+        const float hD = loadHeightWide(slot, lx, ly, spanX, spanY, gx, gy - 1);
+        const float hU = loadHeightWide(slot, lx, ly, spanX, spanY, gx, gy + 1);
+        const float d = 2.0f *  128.0f ;
+        Out.Normal = normalize(float3(-(hR - hL) / d, -(hU - hD) / d, 1.0f));
+    }
+
     Out.Position = mul(gFrameData.viewProj, float4(worldPos, 1.0f));
     Out.WorldPos = worldPos;
-    Out.Uv = In.Uv;
+    Out.Lattice = float2(float(gx), float(gy));
+    Out.Cell = uint4(slot, (uint)lx, (uint)ly, In.Inst1.x);
 
-
-
+    float dist = length(worldPos - gFrameData.eyePos.xyz);
     Out.Fog = saturate((gFrameData.fogParams.y - dist)
                        / (gFrameData.fogParams.y - gFrameData.fogParams.x));
-
-
 
     Out.Clip = dot(gFrameData.gReflWaterClip.xyz, worldPos) + gFrameData.gReflWaterClip.w;
     return (Out);
 }
-#line 169 "FSL/shaders.list"
+#line 171 "FSL/shaders.list"
