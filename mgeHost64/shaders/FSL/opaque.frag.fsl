@@ -11,6 +11,7 @@
 #include "texsample.h.fsl"   // sampleBase() — MW address mode + AF level
 #include "fpshadow.h.fsl"    // fpShadowVisibility() — first-person direct cube-atlas shadow test
 #include "msmrecv.h.fsl"     // sunShadowVisibility() — MSM sun-shadow receiver
+#include "skyamb.h.fsl"      // skyAmbFactor() — SH-L1 sky-directional ambient (SH1)
 
 STRUCT(VSOutput)
 {
@@ -80,7 +81,16 @@ float4 PS_MAIN( VSOutput In )
     // (matches lightSunDiffuse*N.L + Σ pointlights + lightSceneAmbient.)
     float3 d = gFrameData.sunCol.rgb * ndl * sunVis;
     // "Ambient = white (debug)" tick (bit2): force ambient to 1.0 so AO darkening is visible.
-    float3 a = ((aoFlags & 4u) != 0u) ? float3(1.0f, 1.0f, 1.0f) : gFrameData.ambCol.rgb;
+    // SH1: ambient is no longer flat — the sky's own dome function, projected to L1, gives it
+    // direction. GEOMETRIC normal, not the possibly-bent N above: bending toward the unoccluded
+    // direction and then sampling directional sky double-counts the same occlusion. The factor
+    // averages exactly 1 over the sphere, so this redistributes ambient without changing its level.
+    // What it looks like depends on the weather's two colours, and at midday it is mostly a HUE
+    // shift (up-facing cooler, undersides warmer) rather than a brightness one — the v1 dome fills
+    // the lower hemisphere with fogColNear, which is usually brighter than the zenith. See
+    // tasks/lighting.md SH1 before tuning.
+    float3 a = ((aoFlags & 4u) != 0u) ? float3(1.0f, 1.0f, 1.0f)
+                                      : gFrameData.ambCol.rgb * skyAmbFactor(In.Normal);
 
     // Tier 3: GTAO modulates AMBIENT only (scene-walk oracle — sun/point diffuse untouched).
     // Gated by the "AO enable" tick (debugParams.w bit0). Sky/no-geom AO = 1 (no-op).

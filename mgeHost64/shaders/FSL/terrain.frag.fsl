@@ -22,6 +22,7 @@
 
 #include "opaque.srt.h"
 #include "msmrecv.h.fsl"   // sunShadowVisibility() — MSM sun-shadow receiver
+#include "skyamb.h.fsl"    // skyAmbFactor() — SH-L1 sky-directional ambient (SH1)
 
 #define TERRAIN_VERTS   65
 #define TERRAIN_QUADS   64
@@ -154,9 +155,12 @@ float4 PS_MAIN( VSOutput In )
 
     float3 normal = normalize(In.Normal);
     float  sunVis = sunShadowVisibility(In.WorldPos, normal);
+    // SH1: distant ambient gets the same sky direction the near paths do. Landed together with them
+    // on purpose — giving near geometry directional ambient while the distant paths stayed flat puts
+    // a visible seam across the near/far handover on the same building.
     float3 result = albedo
                   * (gFrameData.sunCol.rgb * saturate(dot(-gFrameData.sunDir.xyz, normal)) * sunVis
-                     + gFrameData.lodSunAmb.rgb);
+                     + gFrameData.lodSunAmb.rgb * skyAmbFactor(normal));
 
     // Baked DISTANT point lights, clustered by froxel when the grid is live — the same inlined body
     // distantland.frag/statics.frag use, so a lamp lights the ground identically on all three paths.

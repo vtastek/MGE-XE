@@ -1943,15 +1943,56 @@ namespace {
     float              g_volFogWaterZ    = 0.0f;
     bool               g_volFogWaterOn   = false;
 
+    // --- SKY-DIRECTIONAL AMBIENT, SH-L1 (SH1, tasks/lighting.md) ---------------------------------
+    // Ambient was one flat colour everywhere, so an upward-facing roof and a downward-facing arch
+    // soffit received identically and the only thing telling them apart was screen-space GTAO, which
+    // has no idea where the sky is. The sky is already an analytic function of direction (sky.frag's
+    // VColSource 3 dome), so it is a light source we simply were not sampling. Projected to L1 once
+    // per frame here; three dots per fragment at the receiver (skyamb.h.fsl).
+    //
+    // STRENGTH is the feature's A/B: the coefficients are published normalised by their own DC, so
+    // the receiver applies a directional factor whose spherical average is 1. 0 = bit-identical to
+    // the old flat ambient; 1 = full directionality at the SAME overall brightness. The slider
+    // redistributes ambient, it never dims or brightens the scene — which is the whole reason to
+    // normalise rather than replace ambCol.
+    // Shipped at 1.0 after in-game tuning (2026-07-31). Full strength is not a "max out the effect"
+    // setting here the way it would be for a normal intensity slider: because the factor is
+    // DC-normalised it is the UNATTENUATED, physically-derived answer, and anything below it is a
+    // deliberate lerp back toward the flat ambient that was there because nobody had projected the
+    // sky yet. There is no exposure or contrast cost to pay for it.
+    float              g_skyAmbStrength  = 1.0f;
+    // The sun LOBE added to the projected radiance: ambient arriving warm from the sun's SIDE,
+    // without touching the direct N.L term. Because the publish is DC-normalised, adding this cannot
+    // brighten the scene — it only tilts the ambient distribution toward the sun, which is exactly
+    // what was asked for ("some direction from the sun when it is there").
+    float              g_skyAmbSunGain   = 0.5f;   // lobe weight, relative to sunCol
+    float              g_skyAmbSunTight  = 4.0f;   // pow() exponent: higher = tighter lobe
+    // GROUND albedo — what the lower hemisphere returns, as a fraction of the horizon colour.
+    // v1 shipped without this and OVERCAST came out completely flat, which is the case that proves
+    // why it is needed: under overcast fogColNear ~= skyZenith, so the dome is a CONSTANT field, and
+    // a constant field projects to pure DC — the L1 fit is exactly identity and there is no direction
+    // to be had. The only thing that can break the symmetry of a uniform sky is the ground being
+    // darker than it, which is also the physically real reason the effect exists.
+    //   1.0 = the v1 behaviour exactly (ground as bright as the horizon → bit-identical A/B),
+    //   ~0.3 = dirt/rock. Continuous at the horizon: the term ramps in over the lower hemisphere
+    //   from 1 at d.z == 0 to this at nadir, so there is no seam at the skyline.
+    float              g_skyAmbGround    = 0.35f;
+    // Published DC (the projected sky's mean radiance, pre-normalisation) + whether the gate fired,
+    // for the panel readout. The gate is silent by construction, so it needs to be visible.
+    float              g_skyAmbDC[3]     = { 0.0f, 0.0f, 0.0f };
+    bool               g_skyAmbActive    = false;
+
     // Float layout of the SHARED shadow-params cbuffer (gShadowParams, shadowparams.h.fsl). That
     // buffer is already bound into EVERY PerFrame set and into the compute mask, so one host write
     // reaches near opaque, multimap, sorted alpha, distant statics, distant land, the FP arms and the
     // fog — no per-pass plumbing, and no need to grow FrameData (exactly full at its 512B CBV):
     //   invViewProj 0..15 | screenParams 16..19 | maskParams 20..23 | slotPosRad[32] 24..151 |
     //   slotTile[32] 152..279 | biasParams 280..283 | slotBits 284..287 | slotFlick[32] 288..415 |
-    //   sunViewProj[N] 416.. | sunParams | sunCascadeTexel | sunPcf0/1 | volFog0..4 | screenAlloc
+    //   sunViewProj[N] 416.. | sunParams | sunCascadeTexel | sunPcf0/1 | volFog0..4 | screenAlloc |
+    //   shAr/shAg/shAb | skyParams
     // Declared HERE rather than beside publishSunShadowParams because the per-frame camera write
-    // (invViewProj + screenParams + screenAlloc) happens far earlier in the frame than that function.
+    // (invViewProj + screenParams + screenAlloc + the sky SH) happens far earlier in the frame than
+    // that function.
     constexpr uint32_t kSunVPFloat     = 416;
     constexpr uint32_t kSunParamsFloat = kSunVPFloat + 16 * kSunCascades;
     constexpr uint32_t kSunTexelFloat  = kSunParamsFloat + 4;
@@ -1963,11 +2004,151 @@ namespace {
     constexpr uint32_t kVolFog3Float   = kVolFog2Float + 4;
     constexpr uint32_t kVolFog4Float   = kVolFog3Float + 4;     // dual-lobe phase + water clamp
     constexpr uint32_t kScreenAllocFloat = kVolFog4Float + 4;   // RT ALLOCATION size (≠ render size)
-    static_assert((kScreenAllocFloat + 4) * sizeof(float) <= 2048,
+    // SH1 sky-directional ambient: the sky dome projected to SH-L1, packed Unity-style as three
+    // float4 so the receiver evaluates one dot per channel (skyamb.h.fsl). Lives HERE for the same
+    // reason the sun cascade matrices do — FrameData is exactly full at its 512B CBV and is copied
+    // into 192 shadow-face cbuffers, while this one has room and is already bound into every PerFrame
+    // set. 488 + 12 + 4 = 504 floats = 2016 B of 2048.
+    constexpr uint32_t kSkySHFloat     = kScreenAllocFloat + 4;  // shAr / shAg / shAb
+    constexpr uint32_t kSkyParamsFloat = kSkySHFloat + 12;       // x = strength (0 = off / interior)
+    static_assert((kSkyParamsFloat + 4) * sizeof(float) <= 2048,
                   "ShadowMaskParams overflows its 2048B CBV — too many sun cascades");
     // msmrecv.h.fsl's PCSS works in TEXELS, so SUN_SHADOW_RES has to agree with the atlas the host
     // actually allocated. Same mirroring contract as SUN_CASCADES / kSunCascades.
     static_assert(kSunShadowRes == 2048, "SUN_SHADOW_RES in shadowparams.h.fsl must match kSunShadowRes");
+
+    // SH1 — project the SKY into an SH-L1 basis and publish it for every lit path (skyamb.h.fsl).
+    //
+    // The radiance being projected is the SAME dome function sky.frag draws (VColSource 3), plus a
+    // sun lobe:
+    //     L(d) = lerp(fogColNear, skyZenith, saturate(d.z))
+    //          + sunCol * sunGain * pow(saturate(dot(d, -sunDir)), sunTightness)
+    // Sharing the dome function is the point — the ambient then cannot disagree with the sky the
+    // player is looking at, and it tracks a weather change with no reload because both read the same
+    // two per-frame colours. saturate(d.z) also gives the lower hemisphere a flat fogColNear floor,
+    // which is a serviceable ground-bounce approximation and costs no extra knob.
+    //
+    // Numeric quadrature over a fixed direction table rather than the closed form. A linear-in-z
+    // gradient does have one, but it would not cover the sun lobe (or anything we add later), and at
+    // 128 directions x a few flops this is a rounding error on the frame — so the version that is
+    // obviously correct wins.
+    //
+    // Published NORMALISED BY ITS OWN DC: see skyamb.h.fsl for why enhancing beats replacing.
+    // `exterior` false publishes strength 0 — the receiver's early-out — because an interior has no
+    // sky to project. Same "one float disarms every receiver" idiom as sunParams.x.
+    void publishSkyAmbientSH(const float* fd, bool exterior) {
+        if (!g_live.pShadowMaskParamsCbv || !g_live.pShadowMaskParamsCbv->pCpuMappedAddress) { return; }
+        float* mp = (float*)g_live.pShadowMaskParamsCbv->pCpuMappedAddress;
+
+        const float strength = std::max(0.0f, std::min(g_skyAmbStrength, 1.0f));
+        g_skyAmbActive = exterior && strength > 0.0f && fd != nullptr;
+        if (!g_skyAmbActive) {
+            // Publish IDENTITY, not stale coefficients. The receiver early-outs on strength 0 and
+            // never reads them, but a frame captured in an interior should not show the last
+            // exterior's sky sitting in the buffer.
+            for (uint32_t c = 0; c < 3; ++c) {
+                mp[kSkySHFloat + 4 * c + 0] = 0.0f;
+                mp[kSkySHFloat + 4 * c + 1] = 0.0f;
+                mp[kSkySHFloat + 4 * c + 2] = 0.0f;
+                mp[kSkySHFloat + 4 * c + 3] = 1.0f;
+            }
+            mp[kSkyParamsFloat + 0] = 0.0f;
+            mp[kSkyParamsFloat + 1] = 0.0f;
+            mp[kSkyParamsFloat + 2] = 0.0f;
+            mp[kSkyParamsFloat + 3] = 0.0f;
+            g_skyAmbDC[0] = g_skyAmbDC[1] = g_skyAmbDC[2] = 0.0f;
+            return;
+        }
+
+        // FrameData floats: sunDir 16..18, sunCol 20..22, fogColNear 28..30, skyZenith 68..70.
+        const float sunDir[3] = { fd[16], fd[17], fd[18] };
+        const float sunCol[3] = { fd[20], fd[21], fd[22] };
+        const float horiz[3]  = { fd[28], fd[29], fd[30] };
+        const float zenith[3] = { fd[68], fd[69], fd[70] };
+
+        // Fixed ~uniform direction table, built once. Fibonacci sphere: z is uniform over [-1,1],
+        // which IS uniform in solid angle, so every sample carries the same weight 4*pi/N and the
+        // quadrature is a plain sum with no per-direction Jacobian. 128 directions is ample for a
+        // basis with 4 coefficients per channel.
+        constexpr int kSHDirs = 128;
+        static const std::array<float, 3 * kSHDirs> kDirs = [] {
+            std::array<float, 3 * kSHDirs> d{};
+            const float golden = 2.39996322972865332f;   // golden angle, radians
+            for (int i = 0; i < kSHDirs; ++i) {
+                const float z   = 1.0f - (2.0f * (float)i + 1.0f) / (float)kSHDirs;
+                const float r   = std::sqrt(std::max(0.0f, 1.0f - z * z));
+                const float phi = golden * (float)i;
+                d[3 * i + 0] = r * std::cos(phi);
+                d[3 * i + 1] = r * std::sin(phi);
+                d[3 * i + 2] = z;                        // MW Z is up: this is the elevation axis
+            }
+            return d;
+        }();
+
+        // Real SH basis, l = 0..1: Y00 = 0.282095, Y1m = 0.488603 * {y, z, x}.
+        constexpr float kY0 = 0.28209479f;
+        constexpr float kY1 = 0.48860251f;
+        const float w = 4.0f * 3.14159265f / (float)kSHDirs;   // per-sample solid angle
+
+        float c00[3] = {}, c1x[3] = {}, c1y[3] = {}, c1z[3] = {};
+        const float gain   = std::max(0.0f, g_skyAmbSunGain);
+        const float tight  = std::max(1.0f, g_skyAmbSunTight);
+        const float ground = std::max(0.0f, std::min(g_skyAmbGround, 1.0f));
+        for (int i = 0; i < kSHDirs; ++i) {
+            const float dx = kDirs[3 * i + 0], dy = kDirs[3 * i + 1], dz = kDirs[3 * i + 2];
+            // The dome, evaluated exactly as sky.frag does it.
+            const float t = std::max(0.0f, dz);
+            // GROUND. sky.frag's saturate() leaves the lower hemisphere flat fogColNear, i.e. a
+            // ground as bright as the horizon haze — under overcast (fogColNear ~= skyZenith) that
+            // makes the whole sphere CONSTANT, which projects to pure DC and gives back exactly
+            // identity. Ramp the lower hemisphere down toward the ground albedo instead: 1 at the
+            // horizon, `ground` at nadir, so the term is continuous across the skyline and
+            // ground == 1 reproduces the previous behaviour bit for bit.
+            const float below = (dz < 0.0f) ? (1.0f + (ground - 1.0f) * (-dz)) : 1.0f;
+            // ...and the sun lobe. gFrameData.sunDir is the TRAVEL direction, so to-sun is -sunDir
+            // and a direction pointing AT the sun gives dot == 1 (the same convention every N.L on
+            // the host uses). NOT ground-attenuated: it is the sun disc, not something the ground
+            // reflects, and sunCol already falls to ~0 once the sun is down.
+            const float sd = -(dx * sunDir[0] + dy * sunDir[1] + dz * sunDir[2]);
+            const float lobe = (gain > 0.0f && sd > 0.0f) ? gain * std::pow(sd, tight) : 0.0f;
+            for (int ch = 0; ch < 3; ++ch) {
+                const float sky = horiz[ch] + t * (zenith[ch] - horiz[ch]);
+                const float L   = sky * below + sunCol[ch] * lobe;
+                const float Lw = L * w;
+                c00[ch] += Lw * kY0;
+                c1y[ch] += Lw * kY1 * dy;
+                c1z[ch] += Lw * kY1 * dz;
+                c1x[ch] += Lw * kY1 * dx;
+            }
+        }
+
+        // Cosine convolution (A0 = pi, A1 = 2pi/3), then divide by pi so the published value IS the
+        // ambient multiplier: for a constant radiance C the whole thing collapses to exactly C, which
+        // is the property the DC normalisation below relies on.
+        constexpr float kA0 = 1.0f;              // A0 / pi
+        constexpr float kA1 = 2.0f / 3.0f;       // A1 / pi
+        for (int ch = 0; ch < 3; ++ch) {
+            const float dc = kA0 * kY0 * c00[ch];
+            g_skyAmbDC[ch] = dc;
+            // Normalise by the DC so the receiver's factor averages 1 over the sphere — the feature
+            // then redistributes ambient without changing its level, at any strength. A black sky
+            // (night with no moons, a fully-dark weather) has no direction to give: fall back to
+            // identity rather than dividing by ~0 and publishing noise.
+            const float inv = (dc > 1.0e-5f) ? (1.0f / dc) : 0.0f;
+            const float dirK = kA1 * kY1 * inv;
+            mp[kSkySHFloat + 4 * ch + 0] = dirK * c1x[ch];   // * N.x
+            mp[kSkySHFloat + 4 * ch + 1] = dirK * c1y[ch];   // * N.y
+            mp[kSkySHFloat + 4 * ch + 2] = dirK * c1z[ch];   // * N.z
+            // The DC lane is 1 by construction — that IS the normalisation. When inv is 0 (black sky)
+            // dirK is 0 too, so the published float4 is exactly identity.
+            mp[kSkySHFloat + 4 * ch + 3] = 1.0f;
+        }
+        mp[kSkyParamsFloat + 0] = strength;
+        mp[kSkyParamsFloat + 1] = 0.0f;
+        mp[kSkyParamsFloat + 2] = 0.0f;
+        mp[kSkyParamsFloat + 3] = 0.0f;
+    }
+
     constexpr float    kShadowNearZ      = 4.0f;   // face frustum near (world u); far = the light's 2·radius
     // How long a slot's lastWorld record stays a caster candidate after the item was last in
     // the client's visible set. Statics don't move so stale is correct; the window only bounds
@@ -6592,6 +6773,13 @@ namespace {
     unsigned char g_waterHeightBuf[256] = {};
     bstring       g_waterHeightText = bfromarr(g_waterHeightBuf);
     float4        g_waterHeightColor = { 0.70f, 0.85f, 1.0f, 1.0f };
+    // SH1 sky-ambient readout, on the Sky & Water tab. The interior gate is a silent one float — the
+    // receivers just stop applying the factor — so without this there is nothing on screen that says
+    // whether the feature is live. Shows the projected DC (the sky's mean radiance, before the
+    // normalisation) so a weather change is visibly tracked, plus ON / off and why.
+    unsigned char g_skyAmbBuf[192] = {};
+    bstring       g_skyAmbText  = bfromarr(g_skyAmbBuf);
+    float4        g_skyAmbColor = { 0.80f, 0.85f, 1.0f, 1.0f };
     // Frame-ahead observability: client-forwarded last-frame timings (setClientStats, per
     // kickoff) + the server-measured host idle gap between RenderFrames. Stats panel only.
     unsigned      g_clientFrameAhead = 0;
@@ -7268,6 +7456,18 @@ namespace {
           t.checkbox("Sky tint pulse", &g_skyTintPulse);
           t.checkbox("Water: reflection only (raw RT, undistorted)", &g_waterReflOnly);
           t.checkbox("Water: refraction only", &g_waterRefrOnly);
+          // SH1 sky-directional ambient (skyamb.h.fsl). STRENGTH 0 is the A/B: every receiver
+          // early-outs to flat ambient, so the whole feature toggles against the previous image from
+          // one slider — and because the coefficients are DC-normalised, moving it can only
+          // redistribute ambient, never change the scene's overall brightness.
+          t.sliderF("Sky ambient: STRENGTH (0 = flat, the A/B)", &g_skyAmbStrength, 0.0f, 1.0f, 0.05f);
+          t.sliderF("Sky ambient: sun gain (warmth from the sun's side)", &g_skyAmbSunGain, 0.0f, 2.0f, 0.05f);
+          t.sliderF("Sky ambient: sun tightness (lobe exponent)", &g_skyAmbSunTight, 1.0f, 16.0f, 0.5f, "%.1f");
+          // The knob that makes OVERCAST work: a uniform sky has no direction in it at all, so the
+          // only thing that can shade an underside differently from a roof is the ground being
+          // darker than the sky. 1.0 = the pre-ground behaviour (flat under overcast).
+          t.sliderF("Sky ambient: GROUND albedo (1 = no darkening)", &g_skyAmbGround, 0.0f, 1.0f, 0.05f);
+          t.dynamicText("", &g_skyAmbText, &g_skyAmbColor);
           t.flush(); }
 
         // -- Tab: Shadows (P1 point-light shadow atlas + fixture classification) --
@@ -7906,6 +8106,10 @@ namespace ForgeRender {
     // renderScene (earlier in the file) can drive them. dlSetFrameEye/dlLogHeartbeat wrap the DL
     // global state renderScene touches so those globals can stay next to their definitions.
     void dlSetFrameEye(float x, float y, float z, bool exterior);
+    // ...and the flag it latches. renderScene needs it well before the DL globals are declared: the
+    // SH1 sky-ambient publish is gated on exterior-ness, and it happens up with the per-frame camera
+    // write, not down in the DL cull.
+    extern bool g_dlExterior;
     void dlLiveCullAndBuild(Renderer* R, const float* rzViewProj);
     void dlReflectCullAndBuild(Renderer* R, const float* mirrorViewProj);   // WV2 reflect-geo cull
     void dlReflectRecordGeo();                                              // WV2 reflect-geo record
@@ -8359,6 +8563,22 @@ namespace ForgeRender {
             cp[kScreenAllocFloat + 0] = (float)aw;        cp[kScreenAllocFloat + 1] = (float)ah;
             cp[kScreenAllocFloat + 2] = 1.0f / (float)aw; cp[kScreenAllocFloat + 3] = 1.0f / (float)ah;
         }
+        // SH1 sky-directional ambient. Published from HERE — unconditionally, every frame, right
+        // after the frame cbuffer's sky/sun colours were written above — rather than from
+        // publishSunShadowParams: the SH is not a shadow, and hanging it off the sun-shadow path
+        // would make exterior ambient depend on the sun map being up. g_dlExterior is this frame's
+        // client isExterior (dlSetFrameEye, called above with the same lighting block), and it is the
+        // only gate: interiors publish strength 0 and every receiver early-outs.
+        publishSkyAmbientSH((const float*)g_live.pFrameCbv->pCpuMappedAddress, g_dlExterior);
+        // Panel readout. The gate is one float and disarms every receiver silently, so say out loud
+        // whether it fired and what sky is being projected — a DC that moves with the weather is the
+        // proof the SH is rebuilt per frame rather than latched at load.
+        bformat(&g_skyAmbText, "Sky SH  DC=%.2f %.2f %.2f   %s",
+                g_skyAmbDC[0], g_skyAmbDC[1], g_skyAmbDC[2],
+                g_skyAmbActive ? "ON"
+                               : (g_dlExterior ? "off (strength 0)" : "off (interior)"));
+        g_skyAmbColor = g_skyAmbActive ? float4(0.80f, 0.85f, 1.0f, 1.0f)
+                                       : float4(0.65f, 0.65f, 0.65f, 1.0f);
         if (g_live.shadowReady) {
             // Follow-on 3: lazy one-time create of the occlusion-cull resources (runs BEFORE beginCmd,
             // where addResource/addPipeline are legal). shadowReady ⇒ buildOpaquePath already made pHiz,

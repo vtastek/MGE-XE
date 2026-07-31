@@ -156,4 +156,23 @@ STRUCT(ShadowMaskParams)
     // screenParams above is the RENDER size; these two are not interchangeable.
     //   xy = alloc w,h ; zw = 1/alloc w,h
     DATA(float4,   screenAlloc, None);
+    // --- SKY ambient, projected to SH-L1 (SH1, tasks/lighting.md) --------------------------------
+    // Ambient used to be ONE flat colour, so a surface facing the sky and a surface facing the dirt
+    // received identically — the only thing breaking that up was screen-space GTAO, which has no idea
+    // where the sky is. The sky is already an analytic function of direction (sky.frag's VColSource 3
+    // dome: lerp(fogColNear, skyZenith, saturate(dir.z)), plus a sun lobe), i.e. a light source we
+    // were not sampling. The host projects THAT function into an L1 basis once per frame; the
+    // receiver costs three dot products.
+    // Packed Unity-style so evaluation is exactly a dot: irr.r = dot(shAr, float4(N, 1)).
+    // NORMALISED BY ITS OWN DC, so what these publish is a directional FACTOR whose spherical average
+    // is 1 — not a replacement ambient. That is what makes strength 0 bit-identical to flat ambient
+    // and strength 1 a pure redistribution: the slider cannot make the world darker or brighter.
+    DATA(float4,   shAr, None);
+    DATA(float4,   shAg, None);
+    DATA(float4,   shAb, None);
+    // skyParams: x = STRENGTH 0..1 (0 = feature off — the receiver's early-out AND the interior gate,
+    //                the same "one float disarms it at every receiver" idiom sunParams.x uses; there
+    //                is no sky to project in an interior, so the host publishes 0 there),
+    //            y,z,w = spare.
+    DATA(float4,   skyParams, None);
 };

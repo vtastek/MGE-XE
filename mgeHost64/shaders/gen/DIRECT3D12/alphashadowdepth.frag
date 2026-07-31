@@ -1066,7 +1066,16 @@ STRUCT(ShadowMaskParams)
 
 
     float4 screenAlloc;
-#line 159
+#line 170 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
+    float4 shAr;
+    float4 shAg;
+    float4 shAb;
+
+
+
+
+    float4 skyParams;
+#line 178
 };
 #line 21 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
 #line 46 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"

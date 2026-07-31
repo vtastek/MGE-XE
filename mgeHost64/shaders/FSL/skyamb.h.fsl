@@ -1,0 +1,55 @@
+// mgeHost64 — SKY-directional ambient receiver (SH1, tasks/lighting.md).
+//
+// Ambient on every lit path was one flat colour: `a = gFrameData.ambCol.rgb` (or lodSunAmb on the
+// distant paths). An upward-facing roof and a downward-facing arch soffit therefore received exactly
+// the same ambient, and the only thing separating them was screen-space GTAO — which measures local
+// occlusion and has no idea which way the sky is. So undersides, north faces and overhangs all read
+// like roofs.
+//
+// The sky, meanwhile, is already an analytic function of direction. C2 moved the dome's colour out of
+// the mesh and into sky.frag's VColSource == 3 branch, which is literally
+//     lerp(fogColNear, skyZenith, saturate(dir.z))
+// — a light source we were not sampling. The host projects that same function (plus a sun lobe, so
+// ambient arrives warm from the sun's SIDE without touching the direct N.L term) into an SH-L1 basis
+// once per frame and publishes it into gShadowParams. Evaluating it here is three dot products.
+// Building the SH from the SAME dome function the sky draws is the point: the ambient cannot
+// disagree with the sky the player is looking at, and it tracks weather with no reload.
+//
+// THIS ENHANCES, IT DOES NOT REPLACE. The published coefficients are normalised by their own DC, so
+// what comes back is a directional FACTOR whose spherical average is 1. Callers keep their existing
+// ambient colour and multiply:
+//     a = gFrameData.ambCol.rgb * skyAmbFactor(N);
+// At strength 0 that is bit-identical to today's flat ambient; at 1 it is full directionality at the
+// SAME overall brightness. The slider can only redistribute ambient, never dim or brighten the scene
+// — which is exactly what makes it a safe A/B, and why the host normalises rather than publishing a
+// replacement for ambCol.
+//
+// Pass the GEOMETRIC normal. opaque/alpha/multimap swap N for the GTAO BENT normal when that toggle
+// is on; bending toward the unoccluded direction and then sampling directional sky would count the
+// same occlusion twice.
+//
+// Requires (include AFTER opaque.srt.h): gShadowParams.shAr/shAg/shAb + skyParams.
+
+#ifndef SKY_AMB_H
+#define SKY_AMB_H
+
+float3 skyAmbFactor(float3 N)
+{
+    // strength 0 = feature off. Also how interiors are handled: the host publishes 0 there (no sky to
+    // project), so there is no shader branch on interior-ness and no second code path. Uniform across
+    // the draw — it is a cbuffer value — so the untaken side costs nothing.
+    float s = gShadowParams.skyParams.x;
+    if (s <= 0.0f) { return float3(1.0f, 1.0f, 1.0f); }
+
+    float4 n = float4(normalize(N), 1.0f);
+    float3 f = float3(dot(gShadowParams.shAr, n),
+                      dot(gShadowParams.shAg, n),
+                      dot(gShadowParams.shAb, n));
+    // An L1 fit of a strongly directional field goes negative on the far side. Clamp rather than
+    // rescale: rescaling would drag the whole sphere back toward flat, which is the one thing this
+    // is for. The clamp only ever adds a hair of energy, so the "cannot darken the scene" property
+    // survives it.
+    return lerp(float3(1.0f, 1.0f, 1.0f), max(f, float3(0.0f, 0.0f, 0.0f)), s);
+}
+
+#endif // SKY_AMB_H

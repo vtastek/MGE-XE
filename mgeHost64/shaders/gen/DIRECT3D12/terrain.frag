@@ -1066,7 +1066,16 @@ STRUCT(ShadowMaskParams)
 
 
     float4 screenAlloc;
-#line 159
+#line 170 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
+    float4 shAr;
+    float4 shAg;
+    float4 shAb;
+
+
+
+
+    float4 skyParams;
+#line 178
 };
 #line 21 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
 #line 46 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
@@ -1577,6 +1586,27 @@ float sunShadowVisibility(float3 worldPosRel, float3 N)
     return 1.0f - occlusion * strength;
 }
 #line 25 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terrain.frag.fsl"
+#line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyamb.h.fsl"
+#line 36 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyamb.h.fsl"
+float3 skyAmbFactor(float3 N)
+{
+
+
+
+    float s = gShadowParams.skyParams.x;
+    if (s <= 0.0f) { return float3(1.0f, 1.0f, 1.0f); }
+
+    float4 n = float4(normalize(N), 1.0f);
+    float3 f = float3(dot(gShadowParams.shAr, n),
+                      dot(gShadowParams.shAg, n),
+                      dot(gShadowParams.shAb, n));
+
+
+
+
+    return lerp(float3(1.0f, 1.0f, 1.0f), max(f, float3(0.0f, 0.0f, 0.0f)), s);
+}
+#line 26 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terrain.frag.fsl"
 
 
 
@@ -1599,7 +1629,7 @@ STRUCT(VSOutput)
     DATA(CENTROID(float), Fog, TEXCOORD2);
     DATA(float2, Lattice, TEXCOORD3);
     DATA(FLAT(uint4), Cell, TEXCOORD4);
-#line 47
+#line 48
 };
 
 
@@ -1684,7 +1714,7 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
         albedo += sampleLand(id01, uv) * w01;
         albedo += sampleLand(id11, uv) * w11;
     }
-#line 146 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terrain.frag.fsl"
+#line 147 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terrain.frag.fsl"
     {
         const uint cslot = In.Cell.x;
         float3 c00 = loadVertexColor(cslot, x0, y0);
@@ -1696,9 +1726,12 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
 
     float3 normal = normalize(In.Normal);
     float sunVis = sunShadowVisibility(In.WorldPos, normal);
+
+
+
     float3 result = albedo
                   * (gFrameData.sunCol.rgb * saturate(dot(-gFrameData.sunDir.xyz, normal)) * sunVis
-                     + gFrameData.lodSunAmb.rgb);
+                     + gFrameData.lodSunAmb.rgb * skyAmbFactor(normal));
 
 
 

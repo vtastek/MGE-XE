@@ -13,6 +13,7 @@
 // viewProj keeps the column-major mul like opaque/distantland). Placeholder linear fog (1c = scatter).
 
 #include "opaque.srt.h"
+#include "skyamb.h.fsl"   // skyAmbFactor() — SH-L1 sky-directional ambient (SH1)
 
 // Phase 4 hero-blend split. The SAME vertex body builds two containers: HERO_PASS 0 (the normal
 // opaque statics draw) clips the hero-blend subsets offscreen; HERO_PASS 1 (the post-water blend
@@ -124,8 +125,12 @@ VSOutput VS_MAIN( VSInput In )
     // with emissive (1,1,1) white, so a green fence came out BLUE at distance while the near FFE
     // path kept it green. Whenever emissive == 0 (10669 of 10910 subsets, 99.3% of verts) the two
     // forms are algebraically identical, so this only moves the 241 subsets that actually glow.
+    // SH1 sky-directional ambient. PER-VERTEX here, and that is fine: the factor is an L1 fit, i.e.
+    // low-frequency by construction, so interpolating it across a triangle loses nothing a per-pixel
+    // evaluation would have kept. EMISSIVE stays outside the multiply for the same reason it stays
+    // outside the vertex colour above — it is an independent FFE term, not ambient.
     float3 sunlit  = gFrameData.sunCol.rgb * saturate(dot(nWorld, -gFrameData.sunDir.xyz));
-    Out.Color    = float4(In.Color.rgb * gFrameData.lodSunAmb.rgb + emissive, In.Color.a);
+    Out.Color    = float4(In.Color.rgb * gFrameData.lodSunAmb.rgb * skyAmbFactor(nWorld) + emissive, In.Color.a);
     Out.SunLight = In.Color.rgb * sunlit;
 
     Out.TexIndex = (uint)(In.InstParams.x + 0.5f);

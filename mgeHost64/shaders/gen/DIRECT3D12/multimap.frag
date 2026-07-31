@@ -1066,7 +1066,16 @@ STRUCT(ShadowMaskParams)
 
 
     float4 screenAlloc;
-#line 159
+#line 170 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
+    float4 shAr;
+    float4 shAg;
+    float4 shAb;
+
+
+
+
+    float4 skyParams;
+#line 178
 };
 #line 21 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
 #line 46 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
@@ -1630,6 +1639,27 @@ float sunShadowVisibility(float3 worldPosRel, float3 N)
     return 1.0f - occlusion * strength;
 }
 #line 14 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/multimap.frag.fsl"
+#line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyamb.h.fsl"
+#line 36 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyamb.h.fsl"
+float3 skyAmbFactor(float3 N)
+{
+
+
+
+    float s = gShadowParams.skyParams.x;
+    if (s <= 0.0f) { return float3(1.0f, 1.0f, 1.0f); }
+
+    float4 n = float4(normalize(N), 1.0f);
+    float3 f = float3(dot(gShadowParams.shAr, n),
+                      dot(gShadowParams.shAg, n),
+                      dot(gShadowParams.shAb, n));
+
+
+
+
+    return lerp(float3(1.0f, 1.0f, 1.0f), max(f, float3(0.0f, 0.0f, 0.0f)), s);
+}
+#line 15 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/multimap.frag.fsl"
 
 STRUCT(VSOutput)
 {
@@ -1647,7 +1677,7 @@ STRUCT(VSOutput)
     DATA(float3, WorldPos, TEXCOORD8);
     DATA(FLAT(uint4), Stages, TEXCOORD9);
     DATA(FLAT(uint), Packed, TEXCOORD10);
-#line 31
+#line 32
 };
 
 
@@ -1677,7 +1707,9 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
     float sunVis = sunShadowVisibility(In.WorldPos, normalize(In.Normal));
     float3 d = gFrameData.sunCol.rgb * ndl * sunVis;
 
-    float3 a = ((aoFlags & 4u) != 0u) ? float3(1.0f, 1.0f, 1.0f) : gFrameData.ambCol.rgb;
+
+    float3 a = ((aoFlags & 4u) != 0u) ? float3(1.0f, 1.0f, 1.0f)
+                                      : gFrameData.ambCol.rgb * skyAmbFactor(In.Normal);
 
     if ((aoFlags & 1u) != 0u) { a *= aoSample.a; }
     a *= gFrameData.dbgScales.x;
