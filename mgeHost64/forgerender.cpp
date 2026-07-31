@@ -1612,13 +1612,36 @@ namespace {
                                                  // this, so the reflected fence/lava animate from the same
                                                  // uvOffsets the main pass writes (and no stale tail).
 
-    // M-Skinning palette packing: a FIXED 32-matrix stride per skinned part (kMaxBonesPerPart,
-    // matches the cache's kMaxBones). One 64KB bone window (float4x4[1024]) holds 1024/32 = 32
-    // parts; reusing the kMaxBatches windows → 256 skinned parts/frame. base = (p%32)*32 ∈
-    // {0,32,...,992} < 1024, so the identity instance buffer gives instanceBuf[base]==base.
-    constexpr uint32_t kMaxBonesPerPart = 32;
-    constexpr uint32_t kSkinnedPerWindow = kBatchSize / kMaxBonesPerPart;   // 32
-    constexpr uint32_t kMaxSkinned = kSkinnedPerWindow * kMaxBatches;       // 256
+    // M-Skinning palette packing: palettes pack CONTIGUOUSLY into the 64KB bone windows at each
+    // part's OWN bone count (skinPackNext below). This was a FIXED 32-matrix stride, which cost
+    // twice over. Meshes above 32 bones were dropped outright by the client's matching kMaxBones —
+    // 350 of this install's 3394 skinned meshes, including nixhound.nif (48) and TR's whole
+    // bestiary up to the dreugh queen (94) — and they vanished SILENTLY, because in the DX9 era
+    // that guard only meant "the cache won't accelerate this" and MW still drew the creature; once
+    // S4 suppressed MW's draws the same guard became a hole. Meanwhile 46% of skinned meshes are
+    // ≤8 bones and still burned a full 32 slots each. Contiguous packing fixes both ends: it admits
+    // the entire census AND fits more parts per window than the fixed stride did, since a typical
+    // scene's ~42 skinned parts average far under 32 bones (42×32 = 1344 already spilled to a
+    // second window; packed tight they fit in one).
+    // In.Base is written per part into the skinned instance buffer, so it is an arbitrary offset —
+    // nothing requires the old {0,32,…,992} alignment.
+    constexpr uint32_t kMaxBonesPerPart = 128;   // per-part clamp; census max is 94
+    constexpr uint32_t kMaxSkinned      = 256;   // skinned instance-buffer entries (Base + texAlpha)
+
+    // Assign one part's palette slot within the bone windows. EVERY pass that walks the skinned
+    // blob — shadow-caster collection, depth prepass, colour, FP — must call this with its own
+    // cursor, in blob order, and only for parts it actually packs. Their skip rules are identical
+    // (cap, then slot validity), which is what keeps the cursors in lockstep; if they ever diverge
+    // the depth pass skins a different pose than the colour pass. The old formula had the same
+    // requirement, it was just implicit in the part counter.
+    inline bool skinPackNext(uint32_t bones, uint32_t windowCount,
+                             uint32_t& window, uint32_t& cursor, uint32_t& base) {
+        if (cursor + bones > kBatchSize) { ++window; cursor = 0; }
+        if (window >= windowCount) { return false; }
+        base    = cursor;
+        cursor += bones;
+        return true;
+    }
 
     // GPU timestamp phases (the ~4ms gpu breakdown). Index = QueryDesc index in renderScene.
     // kGpuPhasePostDepth: the post-depth compute container (between prepass and reflect). Despite
@@ -1665,9 +1688,10 @@ namespace {
 
     // FP1a first-person pass caps: one 64KB world window bounds the rigid list at 1024,
     // capped far lower (the arm scene is ~10-30 parts); ONE 64KB bone window bounds the
-    // skinned list at kSkinnedPerWindow (32) parts.
+    // skinned list; with contiguous packing the real bound is kBatchSize matrices in that window,
+    // and this is the instance-buffer entry count.
     constexpr uint32_t kMaxFPDraws   = 128;
-    constexpr uint32_t kMaxFPSkinned = kSkinnedPerWindow;   // 32
+    constexpr uint32_t kMaxFPSkinned = 32;
 
     // Tier 4 multi-map: ONE 64KB world window holds kBatchSize(1024) matrices; cap at 1024
     // parts/frame (== the window, no batching). Raised 256 -> 1024 (2026-07-17): glow-windows
@@ -8334,6 +8358,7 @@ namespace ForgeRender {
                 const uint8_t* sp   = (const uint8_t*)skinnedBlob;
                 const uint8_t* sEnd = sp + skinnedBytes;
                 uint32_t idx = 0;
+                uint32_t packWin = 0, packCur = 0;   // must mirror the prepass/colour cursors
                 for (uint32_t k = 0; k < skinnedCount; ++k) {
                     if (sp + sizeof(IPC::SkinnedDrawWire) > sEnd) { break; }
                     IPC::SkinnedDrawWire item;
@@ -8346,6 +8371,8 @@ namespace ForgeRender {
                     const uint32_t mslot = item.slot;
                     if (mslot >= g_meshHigh || !g_meshes[mslot].valid || !g_meshes[mslot].skinned) { continue; }
                     const uint32_t bones = (item.numBones < kMaxBonesPerPart) ? item.numBones : kMaxBonesPerPart;
+                    uint32_t packBase = 0;
+                    if (!skinPackNext(bones, kMaxBatches, packWin, packCur, packBase)) { continue; }
                     float cx = 0.0f, cy = 0.0f, cz = 0.0f;
                     for (uint32_t bb = 0; bb < bones; ++bb) {
                         const float* m = (const float*)(palette + (size_t)bb * 64);
@@ -8361,7 +8388,7 @@ namespace ForgeRender {
                     }
                     SkinnedCaster sc;
                     sc.index  = idx;
-                    sc.window = idx / kSkinnedPerWindow;
+                    sc.window = packWin;
                     sc.mirror = item.mirror ? 1u : 0u;
                     sc.slot   = mslot;
                     sc.cRel[0] = cx; sc.cRel[1] = cy; sc.cRel[2] = cz;
@@ -9856,6 +9883,7 @@ namespace ForgeRender {
                 uint32_t boundWindow = UINT32_MAX;
                 int      boundSkinMirror = 0;
                 uint32_t preDrawn = 0;
+                uint32_t packWin = 0, packCur = 0;   // must mirror the caster/colour cursors
                 for (uint32_t k = 0; k < skinnedCount; ++k) {
                     if (sp + sizeof(IPC::SkinnedDrawWire) > sEnd) { break; }
                     IPC::SkinnedDrawWire item;
@@ -9868,8 +9896,9 @@ namespace ForgeRender {
                     if (preDrawn >= kMaxSkinned) { continue; }
                     const uint32_t slot = item.slot;
                     if (slot >= g_meshHigh || !g_meshes[slot].valid || !g_meshes[slot].skinned) { continue; }
-                    const uint32_t window = preDrawn / kSkinnedPerWindow;
-                    const uint32_t base   = (preDrawn % kSkinnedPerWindow) * kMaxBonesPerPart;
+                    uint32_t window = 0, base = 0;
+                    if (!skinPackNext(bones, kMaxBatches, packWin, packCur, base)) { continue; }
+                    window = packWin;
                     uint8_t* dst = (uint8_t*)g_live.pBonesBuf[window]->pCpuMappedAddress;
                     std::memcpy(dst + (size_t)base * 64, palette, (size_t)bones * 64);
                     uint32_t* sinst = (uint32_t*)g_live.pInstanceBufSkin->pCpuMappedAddress;
@@ -10958,6 +10987,7 @@ namespace ForgeRender {
             const uint8_t* sEnd = sp + skinnedBytes;
             uint32_t boundWindow = UINT32_MAX;
             int      boundSkinMirror = 0;
+            uint32_t packWin = 0, packCur = 0;   // must mirror the caster/prepass cursors
             bool     dropLogged = false;
             double   skinPrepMs = 0.0, skinRecMs = 0.0;   // record probe (see g_lastSkinPrepMs)
             double   skinMaxPartMs = 0.0;
@@ -11000,8 +11030,9 @@ namespace ForgeRender {
                 }
 
                 const double tPrep0 = hostNowMs();
-                const uint32_t window = skinnedDrawn / kSkinnedPerWindow;
-                const uint32_t base   = (skinnedDrawn % kSkinnedPerWindow) * kMaxBonesPerPart;
+                uint32_t base = 0;
+                if (!skinPackNext(bones, kMaxBatches, packWin, packCur, base)) { continue; }
+                const uint32_t window = packWin;
                 uint8_t* dst = (uint8_t*)g_live.pBonesBuf[window]->pCpuMappedAddress;
                 std::memcpy(dst + (size_t)base * 64, palette, (size_t)bones * 64);
 
@@ -12066,6 +12097,7 @@ namespace ForgeRender {
             if (fp->skinnedBlob && fp->skinnedCount && fp->skinnedBytes) {
                 const uint8_t* sp   = (const uint8_t*)fp->skinnedBlob;
                 const uint8_t* sEnd = sp + fp->skinnedBytes;
+                uint32_t fpPackCur = 0;
                 for (uint32_t k = 0; k < fp->skinnedCount; ++k) {
                     if (sp + sizeof(IPC::SkinnedDrawWire) > sEnd) { break; }
                     IPC::SkinnedDrawWire item;
@@ -12079,7 +12111,12 @@ namespace ForgeRender {
                     const uint32_t slot = item.slot;
                     if (slot >= g_meshHigh || !g_meshes[slot].valid || !g_meshes[slot].skinned) { continue; }
 
-                    const uint32_t base = fpSkinnedDrawn * kMaxBonesPerPart;
+                    // ONE window here (pFPBonesBuf), so windowCount = 1: a part that would spill is
+                    // skipped rather than wrapping onto another part's palette. The old
+                    // fpSkinnedDrawn*kMaxBonesPerPart stride would now walk off the window at the
+                    // 8th part, since kMaxBonesPerPart is 128.
+                    uint32_t fpWin = 0, base = 0;
+                    if (!skinPackNext(bones, 1u, fpWin, fpPackCur, base)) { continue; }
                     uint8_t* bdst = (uint8_t*)g_live.pFPBonesBuf->pCpuMappedAddress;
                     std::memcpy(bdst + (size_t)base * 64, palette, (size_t)bones * 64);
                     uint32_t* sinst = (uint32_t*)g_live.pFPInstanceBufSkin->pCpuMappedAddress;

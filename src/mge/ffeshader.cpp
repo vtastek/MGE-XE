@@ -1339,7 +1339,14 @@ void FixedFunctionShader::renderMorrowind(const RenderedState* rs, const Fragmen
     if (sk.usesCacheSkin) {
         // boneMatrices (model->world) + view; the VS skins via skinIndexed then
         // applies view. No rigid world/worldview needed.
-        effectFFE->SetMatrixArray(ehBoneMatrices, cacheBonePalette, cacheNumBones);
+        // Clamp to THIS effect's array bound. The cache's kMaxBones is 128 now (the Forge host
+        // packs bones contiguously), but "XE Common.fx" declares boneMatrices[32] and vs_3_0
+        // cannot hold more — 32 matrices are already 128 of its 256 constant registers. Kept as a
+        // local next to the effect it describes rather than shared with the cache constant, which
+        // is exactly the coupling that made 32 look like a global truth.
+        constexpr UINT kDX9BoneMatrices = 32;   // must match MAX_BONES in "XE Common.fx"
+        effectFFE->SetMatrixArray(ehBoneMatrices, cacheBonePalette,
+                                  cacheNumBones < kDX9BoneMatrices ? cacheNumBones : kDX9BoneMatrices);
         if (cacheView) effectFFE->SetMatrix(ehView, cacheView);
     } else if (rs->vertexBlendState) {
         effectFFE->SetMatrixArray(ehVertexBlendPalette, rs->worldViewTransforms, 4);

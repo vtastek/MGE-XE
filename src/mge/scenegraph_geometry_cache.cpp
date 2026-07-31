@@ -1354,13 +1354,22 @@ namespace MGE::GeometryCache {
             e.hasVertexColor     = (data->color != nullptr);   // Phase 2: skinned VB now carries colour
 
             if (numBones > MGE::GeometryCache::kMaxBones) {
-                // Too many bones for the VS palette — skip this caster, report once.
+                // Too many bones for the VS palette — this mesh is now INVISIBLE (MW's own draw is
+                // suppressed under the seam), so name every distinct offender and carry a running
+                // total. The old warnOnce reported the first one and nothing else: three missing
+                // creatures in a scene produced a single anonymous line, which is why a 10% hole in
+                // the skinned world went unnoticed. Cheap — it fires once per mesh, at VB build.
                 e.skinnedUnsupported = true;
-                static bool warnOnce = true;
-                if (warnOnce) {
-                    LOG::logline("!! [GEOM CACHE] skinned mesh has %u bones (> kMaxBones %u); skipped",
-                                 numBones, MGE::GeometryCache::kMaxBones);
-                    warnOnce = false;
+                static unsigned skippedTotal = 0;
+                ++skippedTotal;
+                // Bone count is the identifier: it maps to a mesh via the NIF census in
+                // tasks/lessons.md (48 = nixhound, 94 = tr_dreughqueen01, ...). Deliberately NOT
+                // logging e.textureName — extractMaterial has not necessarily run for this entry
+                // yet, so that pointer may not be live here.
+                if (skippedTotal <= 32) {
+                    LOG::logline("!! [GEOM CACHE] skinned mesh SKIPPED (INVISIBLE — MW's own draw is"
+                                 " suppressed): %u bones > kMaxBones %u (%u skipped so far)",
+                                 numBones, MGE::GeometryCache::kMaxBones, skippedTotal);
                 }
                 return;
             }

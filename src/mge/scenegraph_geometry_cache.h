@@ -426,8 +426,22 @@ namespace MGE::GeometryCache {
     // skinnedDecl() described the skinned one. Both mirrors are gone; uvSetCount is shipped
     // to the host, which sizes its own layout.
 
-    // kMaxBones must match MAX_BONES in "XE Common.fx".
-    static constexpr unsigned int kMaxBones = 32;
+    // Palette bound for the FORGE path, which packs bones contiguously (mgeHost64 skinPackNext) and
+    // so has no per-part stride to bust. A census of this install's meshes -- 47401 NIFs, 3394
+    // skinned -- tops out at 94 bones (TR's dreugh queen), with authoring spikes at exactly 32 and
+    // 64; 128 clears all of it.
+    //
+    // This was 32, matching MAX_BONES in "XE Common.fx", and it silently deleted 350 skinned meshes
+    // (10.3%), nixhound.nif at 48 among them. That was survivable in the DX9 era for a reason worth
+    // remembering: skinnedUnsupported only meant "the cache will not accelerate this", and MW's own
+    // draw still rendered the creature. S4 suppressed MW's draws, which turned the same guard into
+    // a creature that does not exist. A cap shared with a fallback path is not the same cap once
+    // the fallback is gone.
+    static constexpr unsigned int kMaxBones = 128;
+
+    // NOTE: the DX9 effect path cannot follow this up — "XE Common.fx" declares boneMatrices[32]
+    // and vs_3_0 has only 256 constant registers. It clamps locally at its own SetMatrixArray
+    // (ffeshader.cpp); it draws nothing under the seam, but the palette upload still runs.
 
     // ---- Reflection moon support -------------------------------------------------
     // One drawable billboard shape of a moon (its Shadow Node cutout or Moon Node disc),
