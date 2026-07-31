@@ -1056,7 +1056,7 @@ STRUCT(ShadowMaskParams)
 
 
     float4 volFog3;
-#line 150 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
+#line 151 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
     float4 volFog4;
 
 
@@ -1066,11 +1066,11 @@ STRUCT(ShadowMaskParams)
 
 
     float4 screenAlloc;
-#line 170 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
+#line 171 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
     float4 shAr;
     float4 shAg;
     float4 shAb;
-#line 185 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
+#line 186 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
     float4 skyParams;
 
 
@@ -1083,7 +1083,9 @@ STRUCT(ShadowMaskParams)
 
 
     float4 skyAOMap;
-#line 197
+#line 219 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
+    float4 sunOcc;
+#line 220
 };
 #line 21 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
 #line 46 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
@@ -1206,14 +1208,7 @@ STRUCT(LightData)
 
 
         Tex2D(float4) gAO :  register(t1,space1);
-
-
-
-
-
-
-
-
+#line 196 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
         Tex3D(float4) gWaterNormalVol :  register(t2,space1);
         Tex2D(float4) gRefractColor :  register(t3,space1);
         Tex2D(float4) gSceneLinDepth :  register(t4,space1);
@@ -1324,8 +1319,16 @@ STRUCT(LightData)
 
 
 
+
+
+
+        Tex2D(float) gSunOcc :  register(t53,space1);
+
+
+
+
         CBUFFER(LightData) gLights :  register(b0,space3);
-#line 316 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+#line 329 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
         Tex2D(float4) gTextures[ 880 ] :  register(t0,space0);
 
 
@@ -1551,20 +1554,68 @@ float sunPcssOcclusion(int c, float3 p, float3 worldPosRel, float slopeBias)
     }
     return occlusion * (1.0f / float( 16 ));
 }
-#line 247 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/msmrecv.h.fsl"
+#line 251 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/msmrecv.h.fsl"
+float sunOccMapOcclusion(float3 worldAbs)
+{
+    float4 so = gShadowParams.sunOcc;
+    if (so.x <= 0.0f) { return 0.0f; }
+
+
+    float4 m = gShadowParams.skyAOMap;
+    float2 uv = (worldAbs.xy - m.xy) * m.z;
+
+
+
+    float2 e = abs(uv - 0.5f) * 2.0f;
+    float edge = saturate((1.0f - max(e.x, e.y)) * 8.0f);
+    if (edge <= 0.0f) { return 0.0f; }
+
+    float blockZ = SampleLvlTex2D(gSunOcc, gSamplerBilinearClamp, uv, 0).r;
+
+
+
+
+    float t = saturate(((blockZ - so.z) - worldAbs.z) / max(so.y, 1.0e-3f));
+    t = t * t * (3.0f - 2.0f * t);
+    return t * so.x * edge;
+}
+#line 305 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/msmrecv.h.fsl"
 float sunShadowVolumetric(float3 p)
 {
     if (gShadowParams.sunParams.x <= 0.0f) { return 1.0f; }
 
+
+    int sel = -1;
+    float m = 0.0f;
     UNROLL for (int i = 0; i <  2 ; ++i)
     {
-        float4 q = mul(gShadowParams.sunViewProj[i], float4(p, 1.0f));
-        if (max(abs(q.x), abs(q.y)) < 1.0f -  0.008f  && q.z > 0.0f && q.z < 1.0f)
+        if (sel < 0)
         {
-            return 1.0f - sunCascadeOcclusion(i, p, gShadowParams.sunParams.y);
+            float4 q = mul(gShadowParams.sunViewProj[i], float4(p, 1.0f));
+            float mm = max(abs(q.x), abs(q.y));
+            if (mm < 1.0f -  0.008f  && q.z > 0.0f && q.z < 1.0f) { sel = i; m = mm; }
         }
     }
-    return 1.0f;
+
+    float mapOcc = sunOccMapOcclusion(p + gFrameData.lodEye.xyz);
+
+
+    if (sel < 0) { return 1.0f - mapOcc; }
+
+    float occ = sunCascadeOcclusion(sel, p, gShadowParams.sunParams.y);
+
+
+
+
+
+
+
+    float band = 1.0f -  0.008f  -  0.12f ;
+    if (m > band && sel + 1 >=  2 )
+    {
+        occ = lerp(occ, mapOcc, saturate((m - band) /  0.12f ));
+    }
+    return 1.0f - occ;
 }
 
 
@@ -1579,18 +1630,17 @@ float sunCascadeShadow(int c, float3 p, float3 worldPosRel, float zBias, float s
     if (gShadowParams.sunPcf1.z > 0.5f) { return sunPcssOcclusion(c, p, worldPosRel, slopeBias); }
     return sunCascadeOcclusion(c, p, zBias);
 }
-
-
-
-
-
-
-
-
+#line 366 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/msmrecv.h.fsl"
 float sunShadowVisibility(float3 worldPosRel, float3 N)
 {
     float strength = gShadowParams.sunParams.x;
     if (strength <= 0.0f) { return 1.0f; }
+
+
+
+
+
+    float mapOcc = sunOccMapOcclusion(worldPosRel + gFrameData.lodEye.xyz);
 
 
 
@@ -1608,7 +1658,9 @@ float sunShadowVisibility(float3 worldPosRel, float3 N)
             if (mm < 1.0f -  0.008f  && q.z > 0.0f && q.z < 1.0f) { sel = i; m = mm; }
         }
     }
-    if (sel < 0) { return 1.0f; }
+
+
+    if (sel < 0) { return 1.0f - mapOcc * strength; }
 
     float bias = gShadowParams.sunParams.y;
     float noff = gShadowParams.sunParams.w;
@@ -1627,33 +1679,23 @@ float sunShadowVisibility(float3 worldPosRel, float3 N)
 
 
 
+
+
+
     float band = 1.0f -  0.008f  -  0.12f ;
-    if (m > band)
+    float t = (m > band) ? saturate((m - band) /  0.12f ) : 0.0f;
+    bool toMap = (sel + 1 >=  2 );
+    if (t > 0.0f && !toMap)
     {
-        float t = saturate((m - band) /  0.12f );
-        if (sel + 1 <  2 )
-        {
-            float occNext = sunCascadeShadow(sel + 1, worldPosRel + N * (noff * texel[sel + 1]),
-                                             worldPosRel, bias, slopeBias);
-            occlusion = lerp(occlusion, occNext, t);
-        }
-        else
-        {
-            occlusion *= (1.0f - t);
-        }
+        float occNext = sunCascadeShadow(sel + 1, worldPosRel + N * (noff * texel[sel + 1]),
+                                         worldPosRel, bias, slopeBias);
+        occlusion = lerp(occlusion, occNext, t);
     }
-
-
-
-
-
-
-
-
-
-
+#line 440 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/msmrecv.h.fsl"
     float lbr = gShadowParams.sunParams.z;
     occlusion = saturate(occlusion / max(1.0f - lbr, 1.0e-4f));
+
+    if (t > 0.0f && toMap) { occlusion = lerp(occlusion, mapOcc, t); }
 
     return 1.0f - occlusion * strength;
 }

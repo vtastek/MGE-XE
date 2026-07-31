@@ -1,0 +1,83 @@
+// mgeHost64 — SUN-OCCLUSION height map, one thread per texel (tasks/lighting.md).
+//
+// See sunocc.srt.h for what this map IS and why it stores a height rather than an angle. This file
+// is just the march:
+//
+//     blockZ(p) = max over d > 0 of ( H(p + d * sunXY) - d * tan(elevation) )
+//
+// GEOMETRIC step spacing, the same choice skyamb.h.fsl's horizon march makes and for the same
+// reason: the near taps decide almost all of the answer (an occluder 300 units away has to be 300
+// units tall to matter; one 8000 units away has to be 8000), so samples are spent where the signal
+// is. It also means the reach is set by a RATIO, not by a tap count, so doubling the distance costs
+// a handful of taps instead of doubling them.
+//
+// The alternative — a running-max sweep along sun-aligned lines, which is O(1) per texel instead of
+// O(steps) — was measured on paper as a wash here: it needs ~1k threads doing ~1k dependent loads
+// each (latency-bound, one wave per SM) against this version's 1M fully-parallel threads
+// (bandwidth-bound), and both land near a fifth of a millisecond on the target GPU. This one is the
+// version that is obviously correct, so it wins until it profiles hot. If it ever does, the
+// recurrence is B(p) = max(H(p+ds), B(p+ds)) - d*tan, swept from the far end inward.
+
+#include "sunocc.srt.h"
+
+NUM_THREADS(8, 8, 1)
+void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
+{
+    INIT_MAIN;
+
+    int2 px  = int2(DispatchThreadID.xy);
+    int  res = (int)gSunOccParams.mapOrigin.w;
+    // RETURN() on its own line: fsl.py's rewrite of it into a bare `return` is line-based, and a
+    // one-liner `{ RETURN(); }` transpiles to `return ()`.
+    if (px.x >= res || px.y >= res)
+    {
+        RETURN();
+    }
+
+    // Texel CENTRE. The receiver samples this map bilinearly through a clamp sampler, whose taps are
+    // centred too, so evaluating the field at centres is what makes the two agree.
+    float texel = gSunOccParams.mapOrigin.z;
+    float2 org  = gSunOccParams.mapOrigin.xy;
+    float2 w0   = org + (float2(float(px.x), float(px.y)) + f2(0.5f)) * texel;
+
+    float2 dir     = gSunOccParams.sunMarch.xy;
+    float  tanElev = gSunOccParams.sunMarch.z;
+    int    steps   = (int)max(gSunOccParams.sunMarch.w, 1.0f);
+    float  inner   = max(gSunOccParams.marchDist.x, 1.0f);
+    float  outer   = max(gSunOccParams.marchDist.y, inner + 1.0f);
+
+    int   srcRes   = (int)gSunOccParams.srcMap.x;
+    float srcTexel = max(gSunOccParams.srcMap.y, 1.0f);
+    float invSrc   = 1.0f / srcTexel;
+
+    float logRatio = log2(outer / inner);
+    float blockZ   = SUN_OCC_NONE;
+
+    for (int k = 0; k < steps; ++k)
+    {
+        float t = ((float)k + 1.0f) / (float)steps;
+        float d = inner * exp2(t * logRatio);
+        float2 wp = w0 + dir * d;
+
+        // Integer load, not a filtered sample: the source is 32 u/texel and the steps are never
+        // finer than that, so bilinear would only blur a value the march is about to take a max of.
+        // It also keeps this pass off the sampler heap entirely.
+        int2 sp = int2(floor((wp - org) * invSrc));
+        if (sp.x < 0 || sp.y < 0 || sp.x >= srcRes || sp.y >= srcRes)
+        {
+            // Off the window. We do not know what is out there, and INVENTING an occluder is the one
+            // unrecoverable answer (it would paint a permanent shadow along the map's edge). Keep
+            // marching — a later tap cannot come back inside, but the loop is cheap and branchless
+            // this way, and the receiver fades the term out over the border regardless.
+            continue;
+        }
+        float h = LoadTex2D(gSunOccHeightIn, NO_SAMPLER, sp, 0).r;
+        // An empty source texel carries SKY_HEIGHT_NONE, which is hugely negative, so it loses this
+        // max() with no branch — the sentinel disarms itself, exactly as it does in skyamb.h.fsl.
+        blockZ = max(blockZ, h - d * tanElev);
+    }
+
+    Write2D(gSunOccOut, px, blockZ);
+
+    RETURN();
+}

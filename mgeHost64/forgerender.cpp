@@ -76,6 +76,10 @@
 // frequency). Shares the merged ComputeRootSignature. Re-declares the two terrain buffers in its
 // OWN set rather than reaching them through the graphics PerFrame sets — see the header.
 #include "shaders/FSL/skyheight.srt.h"
+// ...and the SUN-OCCLUSION map derived from it (SunOccSrtData, PerBatch): the sun-blocked world Z
+// per texel, i.e. the long-range sun shadow past the cascades' one-cell reach. Same window and the
+// same published origin as the height map above; rebuilt on sun motion or on that map's rebuild.
+#include "shaders/FSL/sunocc.srt.h"
 // Stage B (M1) GPU statics cull SRT (CullSrtData: gCullParams + gCullInst + gCullCount). Also shares
 // the merged ComputeRootSignature. Names its element CullInstance (not GpuCullInstance) to avoid
 // redefining the host C++ struct when STRUCT(T) expands to `struct T` in this TU.
@@ -1113,6 +1117,19 @@ namespace {
         bool           skyCullReady   = false;
         bool           skyArgsInDrawState = false;
 
+        // --- LONG-RANGE sun occlusion, derived from pSkyHeight (tasks/lighting.md) ---------------
+        // The sun-BLOCKED world Z per texel, over the SAME window as the height map above. It exists
+        // because the cascades reach one MW cell and answer "fully lit" outside it, so the whole
+        // distant world was unshadowed — surfaces AND the volumetric march, which is where it showed.
+        // A plain texture, not a render target: nothing rasters into it, one compute pass writes it
+        // whole. Rests SHADER_RESOURCE (every receiver samples it; rebuilds are rare).
+        Texture*       pSunOcc = nullptr;             // kSunOccRes² R16_FLOAT (SRV + UAV)
+        Shader*        pSunOccShader = nullptr;
+        Pipeline*      pSunOccPipeline = nullptr;
+        Buffer*        pSunOccParamsCbv = nullptr;    // gSunOccParams (origin + sun march + reach)
+        DescriptorSet* pSunOccSet = nullptr;          // SunOccSrtData PerBatch: CBV + SRV + UAV
+        bool           sunOccReady = false;
+
         // --- P1 point-light shadows: cached cube-face atlas + screen-space mask -------------
         // One D32 atlas of 3x2 face blocks per light (kShadowAtlasW/H, kMaxShadowLights). Face
         // tiles are re-rendered with opaque.vert + depthonly.frag into SINGLE-SAMPLE depth-only
@@ -2069,8 +2086,41 @@ namespace {
     float              g_skyAOInner     = 256.0f;
     float              g_skyAOOuter     = 8192.0f;   // how far a cliff can still shade you
     float              g_skyAOTaps      = 4.0f;      // steps per direction; 5 directions => 20 samples
+    // --- LONG-RANGE sun occlusion (sunocc.comp.fsl) ---------------------------------------------
+    // Derived from the height map above, over the SAME window — so it needs no origin of its own and
+    // there is exactly one published mapping between them. HALF the resolution, deliberately: this
+    // is the term that reaches the far horizon, where a 64-unit texel is well under a pixel, and the
+    // rebuild cost is quadratic in it. The near field is the cascades' job and they are 32x finer.
+    constexpr uint32_t kSunOccRes   = 1024;
+    constexpr float    kSunOccTexel = kSkyHeightExtent / (float)kSunOccRes;   // 64 world u
+    // "Nothing blocks the sun here" — MUST match SUN_OCC_NONE in sunocc.srt.h, and not 0 for the same
+    // reason kSkyHeightNone is not 0: 0 is sea level, so a zero map would shadow every coast.
+    constexpr float    kSunOccNone  = -30000.0f;
+    // The tallest thing that can plausibly cast: Red Mountain's peak over the sea floor is ~18k
+    // units. Past relief/tan(elev) horizontally, H - d*tan can no longer beat what the march already
+    // holds, so the host SHORTENS the reach as the sun climbs and the noon march costs a fraction of
+    // the dawn one. A bound, not a tuning knob — raising it only wastes taps.
+    constexpr float    kSunOccRelief = 20000.0f;
+    float              g_sunOccStrength = 1.0f;      // 0 = off (and the zero-change A/B)
+    float              g_sunOccSoft     = 192.0f;    // world units of soft transition BELOW blockZ
+    float              g_sunOccBias     = 96.0f;     // world units — the self-shadow guard
+    float              g_sunOccOuter    = 16384.0f;  // max march reach (2 cells) before the sun-angle cut
+    float              g_sunOccInner    = 64.0f;     // first tap (2 source texels — skip your own)
+    float              g_sunOccSteps    = 48.0f;     // geometric taps per texel
+    // Rebuild threshold: how far the sun direction may rotate before the map is stale, in DEGREES.
+    // MW's sun crosses the sky in one game day, so at a typical timescale this fires every few
+    // seconds — rare by frame standards, which is the entire budget argument for the brute-force
+    // march. Too coarse and the shadow line STEPS across the landscape at dawn instead of sweeping.
+    float              g_sunOccSunDeg   = 0.75f;
+
     // Map state. The origin is the map's (0,0) texel CORNER in absolute world XY.
     float              g_skyHeightOrigin[2] = { 0.0f, 0.0f };
+    bool               g_sunOccValid    = false;     // false until the first rebuild lands
+    uint32_t           g_sunOccBuilds   = 0;
+    uint32_t           g_sunOccBuildFrame = 0;
+    float              g_sunOccBuiltDir[3] = { 0.0f, 0.0f, 0.0f };   // sun dir the LIVE map was built for
+    float              g_sunOccBuiltOrigin[2] = { 0.0f, 0.0f };      // ...and the window it was built over
+    float              g_sunOccLastOuter = 0.0f;     // reach the last rebuild actually used (panel)
     bool               g_skyHeightValid = false;     // false until the first rebuild lands
     uint32_t           g_skyHeightBuildFrame = 0;    // last rebuild (panel readout)
     uint32_t           g_skyHeightBuilds = 0;
@@ -2117,8 +2167,15 @@ namespace {
     // than growing the cbuffer: 504 + 4 = 508 of 512 floats, so 4 are still free. If a later stage
     // needs more, the CBV allocation is one line (2048 -> 4096) plus this bound.
     constexpr uint32_t kSkyAOMapFloat  = kSkyParamsFloat + 4;
-    static_assert((kSkyAOMapFloat + 4) * sizeof(float) <= 2048,
-                  "ShadowMaskParams overflows its 2048B CBV — too many sun cascades");
+    // LONG-RANGE sun occlusion (sunOcc) — strength / soft band / bias. Its ADDRESSING is skyAOMap's,
+    // because it is derived from that map over that window; publishing a second copy of one origin is
+    // how a derived map ends up sampled through last frame's mapping.
+    constexpr uint32_t kSunOccFloat    = kSkyAOMapFloat + 4;
+    // ...which lands on exactly 512 floats. The allocation has no slack left, so the next lane added
+    // here moves this one line to 4096 (a CBV, not a per-frame cost) rather than being squeezed in.
+    constexpr uint32_t kShadowParamsBytes = 2048;
+    static_assert((kSunOccFloat + 4) * sizeof(float) <= kShadowParamsBytes,
+                  "ShadowMaskParams overflows its CBV — too many sun cascades");
     // msmrecv.h.fsl's PCSS works in TEXELS, so SUN_SHADOW_RES has to agree with the atlas the host
     // actually allocated. Same mirroring contract as SUN_CASCADES / kSunCascades.
     static_assert(kSunShadowRes == 2048, "SUN_SHADOW_RES in shadowparams.h.fsl must match kSunShadowRes");
@@ -2159,12 +2216,29 @@ namespace {
         mp[kSkyAOMapFloat  + 3] = std::max(1.0f, std::min(g_skyAOTaps, 16.0f));
     }
 
+    // ...and the LONG-RANGE sun occlusion lanes. Split out for the same reason publishSkyAO is: it
+    // gates on a DIFFERENT thing again (its own map built, over the CURRENT height-map window). The
+    // origin it is read through is the one publishSkyAO just wrote, so this must run after it — and
+    // must publish strength 0 the moment the two could disagree, or the receiver samples a map built
+    // for another window through this window's mapping, which is a shadow in the wrong place.
+    void publishSunOcc(float* mp, bool exterior) {
+        const float strength = std::max(0.0f, std::min(g_sunOccStrength, 1.0f));
+        const bool  inSync   = g_sunOccValid
+                            && g_sunOccBuiltOrigin[0] == g_skyHeightOrigin[0]
+                            && g_sunOccBuiltOrigin[1] == g_skyHeightOrigin[1];
+        mp[kSunOccFloat + 0] = (exterior && inSync && strength > 0.0f) ? strength : 0.0f;
+        mp[kSunOccFloat + 1] = std::max(1.0f, g_sunOccSoft);
+        mp[kSunOccFloat + 2] = g_sunOccBias;
+        mp[kSunOccFloat + 3] = 0.0f;
+    }
+
     void publishSkyAmbientSH(const float* fd, bool exterior) {
         if (!g_live.pShadowMaskParamsCbv || !g_live.pShadowMaskParamsCbv->pCpuMappedAddress) { return; }
         float* mp = (float*)g_live.pShadowMaskParamsCbv->pCpuMappedAddress;
         // Unconditionally, and BEFORE the SH's early-out below: the AO lanes have their own gate and
         // must not inherit the SH's. (The SH's inactive path zeroes only skyParams.x now.)
         publishSkyAO(mp, exterior);
+        publishSunOcc(mp, exterior);   // shares the origin publishSkyAO just wrote — order matters
 
         const float strength = std::max(0.0f, std::min(g_skyAmbStrength, 1.0f));
         g_skyAmbActive = exterior && strength > 0.0f && fd != nullptr;
@@ -3363,6 +3437,32 @@ namespace {
                 shf.pData = nullptr;
                 shf.ppBuffer = &g_live.pSkyHeightFrameCbv;
                 addResource(&shf, nullptr);
+
+                // LONG-RANGE sun occlusion: 1024² R16F = 2 MB, derived from the map above. A plain
+                // texture (SRV + UAV, no RTV) — nothing rasters into it, one compute pass writes it
+                // whole, so there is no clear value to get wrong and no render pass to bind.
+                TextureDesc sod = {};
+                sod.mWidth = kSunOccRes; sod.mHeight = kSunOccRes; sod.mDepth = 1;
+                sod.mArraySize = 1; sod.mMipLevels = 1;
+                sod.mSampleCount = SAMPLE_COUNT_1; sod.mSampleQuality = 0;
+                sod.mFormat = TinyImageFormat_R16_SFLOAT;
+                sod.mStartState = RESOURCE_STATE_SHADER_RESOURCE;
+                sod.mDescriptors = (DescriptorType)(DESCRIPTOR_TYPE_TEXTURE | DESCRIPTOR_TYPE_RW_TEXTURE);
+                sod.pName = "sunOcc";
+                TextureLoadDesc sol = {};
+                sol.ppTexture = &g_live.pSunOcc;
+                sol.pDesc = &sod;
+                addResource(&sol, nullptr);
+
+                BufferLoadDesc sop = {};
+                sop.mDesc.mDescriptors = DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+                sop.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_CPU_TO_GPU;
+                sop.mDesc.mFlags = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
+                sop.mDesc.mSize = 256;                 // SunOccParams (4 float4) — min CBV size
+                sop.mDesc.pName = "sunOccParamsCbv";
+                sop.pData = nullptr;
+                sop.ppBuffer = &g_live.pSunOccParamsCbv;
+                addResource(&sop, nullptr);
             }
 
             waitForAllResourceLoads();
@@ -3439,7 +3539,7 @@ namespace {
             sp.mDesc.mDescriptors = DESCRIPTOR_TYPE_UNIFORM_BUFFER;
             sp.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_CPU_TO_GPU;
             sp.mDesc.mFlags = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
-            sp.mDesc.mSize = 2048;                     // >= sizeof(ShadowMaskParams) (1152B)
+            sp.mDesc.mSize = kShadowParamsBytes;       // >= sizeof(ShadowMaskParams)
             sp.mDesc.pName = "shadowMaskParamsCbv";
             sp.pData = nullptr;
             sp.ppBuffer = &g_live.pShadowMaskParamsCbv;
@@ -3475,7 +3575,7 @@ namespace {
                 || !g_live.pShadowWorldsBuf || !g_live.pShadowInstanceBuf) {
                 std::printf("[forge][shadow] resource alloc FAILED — shadows disabled\n");
             } else {
-                std::memset(g_live.pShadowMaskParamsCbv->pCpuMappedAddress, 0, 2048);
+                std::memset(g_live.pShadowMaskParamsCbv->pCpuMappedAddress, 0, kShadowParamsBytes);
                 // Shadow instance VB: [0] = identity DrawIndex (firstInstance=k reads its own
                 // matrix), [1] texAlpha per gather, material/overlay lanes stay 0 (depth-only).
                 uint32_t* sinst = (uint32_t*)g_live.pShadowInstanceBuf->pCpuMappedAddress;
@@ -3995,7 +4095,7 @@ namespace {
             // (pAOBlur), not raw pAO; pAOBlur's per-frame UAV<->SHADER_RESOURCE ping-pong (renderScene)
             // leaves it SHADER_RESOURCE before the colour pass samples it. (Raw pAO still feeds the
             // blur as an SRV, and the DebugTextures/readback paths still inspect pAO directly.)
-            DescriptorData p[15] = {};   // was 9; +gSunMoments, +gAlphaStages, +gSkyHeight (and headroom)
+            DescriptorData p[18] = {};   // was 9; +gSunMoments, +gAlphaStages, +gSkyHeight, +gSunOcc (and headroom)
             p[0].mIndex = SRT_RES_IDX(SrtData, PerFrame, gFrameData);
             p[0].ppBuffers = &g_live.pFrameCbv;
             p[1].mIndex = SRT_RES_IDX(SrtData, PerFrame, gAO);
@@ -4087,6 +4187,15 @@ namespace {
                 p[np].mIndex = SRT_RES_IDX(SrtData, PerFrame, gSkyHeight);
                 p[np].mCount = 1;
                 p[np].ppTextures = &g_live.pSkyHeight->pTexture;
+                ++np;
+            }
+            // ...and the LONG-RANGE sun occlusion derived from it — REAL here. Every receiver that
+            // calls sunShadowVisibility samples it past the last cascade, which since P2 is where
+            // most of the visible world lives.
+            if (g_live.pSunOcc) {
+                p[np].mIndex = SRT_RES_IDX(SrtData, PerFrame, gSunOcc);
+                p[np].mCount = 1;
+                p[np].ppTextures = &g_live.pSunOcc;
                 ++np;
             }
             updateDescriptorSet(R, 0, g_live.pPerFrameSet, np, p);
@@ -5543,7 +5652,7 @@ namespace {
             if (!g_live.pPerFrameSetReflect || !g_live.pPerBatchSetReflectSky) { return false; }
             {
                 Texture* vol = g_live.pWaterNormalVol ? g_live.pWaterNormalVol : g_live.pDefaultWhite;
-                DescriptorData p[11] = {};   // was 9; +gSkyHeight (and headroom)
+                DescriptorData p[14] = {};   // was 9; +gSkyHeight, +gSunOcc (and headroom)
                 p[0].mIndex = SRT_RES_IDX(SrtData, PerFrame, gFrameData);
                 p[0].ppBuffers = &g_live.pReflectFrameCbv;
                 p[1].mIndex = SRT_RES_IDX(SrtData, PerFrame, gAO);
@@ -5577,6 +5686,11 @@ namespace {
                     p[rn].mCount = 1; p[rn].ppTextures = &g_live.pSkyHeight->pTexture;
                     ++rn;
                 }
+                if (g_live.pSunOcc) {      // gSunOcc: type-valid bind (the sky pass takes no sun shadow)
+                    p[rn].mIndex = SRT_RES_IDX(SrtData, PerFrame, gSunOcc);
+                    p[rn].mCount = 1; p[rn].ppTextures = &g_live.pSunOcc;
+                    ++rn;
+                }
                 updateDescriptorSet(R, 0, g_live.pPerFrameSetReflect, rn, p);
             }
             {
@@ -5594,7 +5708,7 @@ namespace {
             if (!g_live.pPerFrameSetReflectGeo) { return false; }
             {
                 Texture* vol = g_live.pWaterNormalVol ? g_live.pWaterNormalVol : g_live.pDefaultWhite;
-                DescriptorData p[15] = {};   // was 13; +gSkyHeight (and headroom)
+                DescriptorData p[18] = {};   // was 13; +gSkyHeight, +gSunOcc (and headroom)
                 p[0].mIndex = SRT_RES_IDX(SrtData, PerFrame, gFrameData);
                 p[0].ppBuffers = &g_live.pReflectFrameCbvGeo;
                 p[1].mIndex = SRT_RES_IDX(SrtData, PerFrame, gAO);
@@ -5662,6 +5776,16 @@ namespace {
                     p[rn].mCount = 1; p[rn].ppTextures = &g_live.pSkyHeight->pTexture;
                     ++rn;
                 }
+                // ...and the sun-occlusion map, REAL for the same reason: the mirror redraws terrain
+                // and statics with the SAME receiver frags, and reflected geometry keeps its true
+                // world position, so the world-space lookup applies unchanged. Leave it unbound and
+                // the reflection would carry no distant sun shadow while the original does — the
+                // water would read as brighter than the world it mirrors.
+                if (g_live.pSunOcc) {
+                    p[rn].mIndex = SRT_RES_IDX(SrtData, PerFrame, gSunOcc);
+                    p[rn].mCount = 1; p[rn].ppTextures = &g_live.pSunOcc;
+                    ++rn;
+                }
                 updateDescriptorSet(R, 0, g_live.pPerFrameSetReflectGeo, rn, p);
             }
 
@@ -5678,7 +5802,7 @@ namespace {
                 if (!g_live.pPerFrameSetSun) { return false; }
                 Texture* vol = g_live.pWaterNormalVol ? g_live.pWaterNormalVol : g_live.pDefaultWhite;
                 for (uint32_t c = 0; c < kSunCascades; ++c) {
-                    DescriptorData p[13] = {};   // was 11; +gSkyHeight (and headroom)
+                    DescriptorData p[16] = {};   // was 11; +gSkyHeight, +gSunOcc (and headroom)
                     p[0].mIndex = SRT_RES_IDX(SrtData, PerFrame, gFrameData);
                     p[0].ppBuffers = &g_live.pSunFrameCbv[c];
                     p[1].mIndex = SRT_RES_IDX(SrtData, PerFrame, gAO);
@@ -5718,6 +5842,11 @@ namespace {
                         p[sn].mCount = 1; p[sn].ppTextures = &g_live.pSkyHeight->pTexture;
                         ++sn;
                     }
+                    if (g_live.pSunOcc) {   // type-valid bind (a caster pass computes no shadowing)
+                        p[sn].mIndex = SRT_RES_IDX(SrtData, PerFrame, gSunOcc);
+                        p[sn].mCount = 1; p[sn].ppTextures = &g_live.pSunOcc;
+                        ++sn;
+                    }
                     updateDescriptorSet(R, c, g_live.pPerFrameSetSun, sn, p);
                 }
             }
@@ -5736,7 +5865,7 @@ namespace {
                 addDescriptorSet(R, &khDesc, &g_live.pPerFrameSetSkyHeight);
                 if (g_live.pPerFrameSetSkyHeight) {
                     Texture* khVol = g_live.pWaterNormalVol ? g_live.pWaterNormalVol : g_live.pDefaultWhite;
-                    DescriptorData p[13] = {};
+                    DescriptorData p[16] = {};   // +gSunOcc (and headroom)
                     p[0].mIndex = SRT_RES_IDX(SrtData, PerFrame, gFrameData);
                     p[0].ppBuffers = &g_live.pSkyHeightFrameCbv;
                     p[1].mIndex = SRT_RES_IDX(SrtData, PerFrame, gAO);
@@ -5768,6 +5897,13 @@ namespace {
                     if (g_live.pDefaultWhite) {
                         p[kn].mIndex = SRT_RES_IDX(SrtData, PerFrame, gSkyHeight);
                         p[kn].mCount = 1; p[kn].ppTextures = &g_live.pDefaultWhite;
+                        ++kn;
+                    }
+                    // gSunOcc, unlike gSkyHeight above, is NOT the target of this pass, so it binds
+                    // to itself. Nothing here reads it either way — this is a type-valid fill.
+                    if (g_live.pSunOcc) {
+                        p[kn].mIndex = SRT_RES_IDX(SrtData, PerFrame, gSunOcc);
+                        p[kn].mCount = 1; p[kn].ppTextures = &g_live.pSunOcc;
                         ++kn;
                     }
                     updateDescriptorSet(R, 0, g_live.pPerFrameSetSkyHeight, kn, p);
@@ -5862,6 +5998,40 @@ namespace {
                 addDescriptorSet(R, &shset, &g_live.pSkyHeightSet);
                 if (!g_live.pSkyHeightPipeline || !g_live.pSkyHeightSet) {
                     std::printf("[forge][skyao] skyheight compute pipeline/set FAILED — sky AO disabled\n");
+                }
+            }
+            // ...and the SUN-OCCLUSION pass that derives the long-range shadow from that map. Its
+            // whole input is the height map's texture, so unlike skyheight it can be wired up right
+            // here — no terrain residency to wait for. Not fatal if it fails: g_sunOccValid stays
+            // false, the publish sends strength 0, and the receivers behave exactly as they did
+            // before this feature existed (fully lit past the last cascade).
+            if (g_live.pSkyHeight && g_live.pSunOcc && g_live.pSunOccParamsCbv) {
+                ShaderLoadDesc sosd = {};
+                sosd.mComp.pFileName = "sunocc.comp";
+                addShader(R, &sosd, &g_live.pSunOccShader);
+                if (g_live.pSunOccShader) {
+                    PipelineDesc sopd = {};
+                    sopd.mType = PIPELINE_TYPE_COMPUTE;
+                    sopd.mComputeDesc.pShaderProgram = g_live.pSunOccShader;
+                    addPipeline(R, &sopd, &g_live.pSunOccPipeline);
+                }
+                DescriptorSetDesc soset = SRT_SET_DESC(SunOccSrtData, PerBatch, 1, 0);
+                addDescriptorSet(R, &soset, &g_live.pSunOccSet);
+                if (g_live.pSunOccPipeline && g_live.pSunOccSet) {
+                    // mCount = 1 on BOTH the SRV and the UAV, or the slot binds nothing and the
+                    // dispatch writes into the void — the failure this file's other single-texture
+                    // binds all carry a note about.
+                    DescriptorData d[3] = {};
+                    d[0].mIndex = SRT_RES_IDX(SunOccSrtData, PerBatch, gSunOccParams);
+                    d[0].ppBuffers = &g_live.pSunOccParamsCbv;
+                    d[1].mIndex = SRT_RES_IDX(SunOccSrtData, PerBatch, gSunOccHeightIn);
+                    d[1].mCount = 1; d[1].ppTextures = &g_live.pSkyHeight->pTexture;
+                    d[2].mIndex = SRT_RES_IDX(SunOccSrtData, PerBatch, gSunOccOut);
+                    d[2].mCount = 1; d[2].ppTextures = &g_live.pSunOcc;
+                    updateDescriptorSet(R, 0, g_live.pSunOccSet, 3, d);
+                    g_live.sunOccReady = true;
+                } else {
+                    std::printf("[forge][sunocc] compute pipeline/set FAILED — no long-range sun shadow\n");
                 }
             }
             {
@@ -6258,7 +6428,7 @@ namespace {
                 Texture* vol  = g_live.pWaterNormalVol ? g_live.pWaterNormalVol : g_live.pDefaultWhite;
                 Texture* refr = g_live.pRefractColor   ? g_live.pRefractColor   : g_live.pDefaultWhite;
                 Texture* lin  = g_live.pLinearDepth    ? g_live.pLinearDepth    : g_live.pDefaultWhite;
-                DescriptorData p[17] = {};   // was 15; +gSkyHeight (and headroom)
+                DescriptorData p[20] = {};   // was 15; +gSkyHeight, +gSunOcc (and headroom)
                 p[0].mIndex = SRT_RES_IDX(SrtData, PerFrame, gFrameData);
                 p[0].ppBuffers = &g_live.pFPFrameCbv;
                 p[1].mIndex = SRT_RES_IDX(SrtData, PerFrame, gAO);
@@ -6330,6 +6500,13 @@ namespace {
                 if (g_live.pSkyHeight) {
                     p[fpn].mIndex = SRT_RES_IDX(SrtData, PerFrame, gSkyHeight);
                     p[fpn].mCount = 1; p[fpn].ppTextures = &g_live.pSkyHeight->pTexture;
+                    ++fpn;
+                }
+                // ...and the long-range sun occlusion, for the same reason again: walk out of a
+                // mountain's shadow and the arms brighten with the ground under them.
+                if (g_live.pSunOcc) {
+                    p[fpn].mIndex = SRT_RES_IDX(SrtData, PerFrame, gSunOcc);
+                    p[fpn].mCount = 1; p[fpn].ppTextures = &g_live.pSunOcc;
                     ++fpn;
                 }
                 updateDescriptorSet(R, 0, g_live.pPerFrameSetFP, fpn, p);
@@ -7092,6 +7269,13 @@ namespace {
     unsigned char g_skyAOBuf[192] = {};
     bstring       g_skyAOText  = bfromarr(g_skyAOBuf);
     float4        g_skyAOColor = { 0.80f, 0.95f, 0.85f, 1.0f };
+    // ...and the sun-occlusion map's, for a third reason on top of those two: this map is rebuilt on
+    // a THROTTLE, so "the shadow line is in the wrong place" has two completely different causes —
+    // a stale build (the counter is not moving) and a bad build (it is). Only a readout separates
+    // them, and the sun angle it was built for is what makes a stale one obvious at a glance.
+    unsigned char g_sunOccBuf[192] = {};
+    bstring       g_sunOccText  = bfromarr(g_sunOccBuf);
+    float4        g_sunOccColor = { 0.95f, 0.88f, 0.70f, 1.0f };
     // Frame-ahead observability: client-forwarded last-frame timings (setClientStats, per
     // kickoff) + the server-measured host idle gap between RenderFrames. Stats panel only.
     unsigned      g_clientFrameAhead = 0;
@@ -7862,6 +8046,21 @@ namespace {
           t.sliderF("Sun PCSS: max PCF radius (TEXELS; higher = rings)", &g_sunPcfMaxRadius, 1.0f, 32.0f, 0.5f, "%.1f");
           t.sliderF("Sun PCSS: PCF depth bias (WORLD units)", &g_sunPcfBias, 0.0f, 32.0f, 0.5f, "%.2f");
           t.sliderF("Sun PCSS: PCF slope bias (WORLD units x tan)", &g_sunPcfSlopeBias, 0.0f, 32.0f, 0.5f, "%.2f");
+          // LONG-RANGE sun occlusion (sunocc.comp.fsl) — what shadows the world PAST the cascades,
+          // which is most of it. Its own strength lane so it A/Bs against the cascades: at 0 the
+          // distant world goes back to being unshadowed and the shafts go back to ignoring ridges.
+          t.sliderF("Sun far-shadow: STRENGTH (0 = off, the A/B)", &g_sunOccStrength, 0.0f, 1.0f, 0.05f);
+          // The map stores a hard height. SOFT is what stops that reading as a stair-stepped line
+          // across the landscape; BIAS is the self-shadow guard (the surfaces receiving from this map
+          // are the ones that built it). Both are in world units, so they survive a resolution change.
+          t.sliderF("Sun far-shadow: SOFT transition (WORLD units)", &g_sunOccSoft, 16.0f, 1024.0f, 16.0f, "%.0f");
+          t.sliderF("Sun far-shadow: BIAS (WORLD units; self-shadow guard)", &g_sunOccBias, 0.0f, 512.0f, 8.0f, "%.0f");
+          t.sliderF("Sun far-shadow: march REACH (world u; cut by sun height)", &g_sunOccOuter, 2048.0f, 65536.0f, 1024.0f, "%.0f");
+          t.sliderF("Sun far-shadow: taps per texel (rebuild cost)", &g_sunOccSteps, 8.0f, 128.0f, 4.0f, "%.0f");
+          // Rebuild threshold. Too coarse and the shadow line STEPS at dawn instead of sweeping; too
+          // fine and a rare pass becomes a frequent one.
+          t.sliderF("Sun far-shadow: rebuild on sun motion (DEGREES)", &g_sunOccSunDeg, 0.1f, 10.0f, 0.05f, "%.2f");
+          t.dynamicText("", &g_sunOccText, &g_sunOccColor);
           // Volumetric fog — the MSM moments' consumer. The MSM softness slider above shapes THIS,
           // not the hard shadows any more.
           t.checkbox("Vol fog: enable (height fog + sun shafts)", &g_volFog);
@@ -8474,10 +8673,12 @@ namespace ForgeRender {
     void dlReflectGeoCull(Renderer* R, const float* viewProj, const float* fcbvR,
                           float dRel, float eyeAbsZ, float waterLevelAbs, bool underwater);
     void dlLiveRecord();
+    void terrainRecordDepth(Cmd* cmd);   // host-owned terrain, depth-only — the Z-prepass entry
     void renderSunShadow();   // SUN shadow: DL statics → MSM moments map (forge-sun-shadows.md Phase A)
     void blurSunMoments();    // SUN shadow: separable Gaussian over the moments — what makes MSM soft
     void dispatchSunCull();   // SUN shadow A2: second statics cull (sun ortho box, nearCut=0, Hi-Z off)
     void rebuildSkyHeightMap();  // SH2: clear + statics raster + terrain compute, when the eye leaves its snap cell
+    void rebuildSunOccMap(bool force);   // ...and the sun-BLOCKED height derived from it (sun motion / forced)
     void dlDrawHeroBlend();                                                 // Phase 4 post-water hero blend pass
     bool buildGlowPath(Renderer* R);                                        // Phase F glow billboards: build (idempotent)
     void dlDrawGlowBillboards();                                            // Phase F glow billboards: per-frame fill + draw
@@ -8935,6 +9136,25 @@ namespace ForgeRender {
             g_skyAOColor = over ? float4(1.0f, 0.55f, 0.35f, 1.0f)
                                 : (aoOn ? float4(0.80f, 0.95f, 0.85f, 1.0f)
                                         : float4(0.65f, 0.65f, 0.65f, 1.0f));
+        }
+        // Sun far-shadow readout. The throttle is what makes this necessary: a shadow line in the
+        // wrong place is either a STALE map (builds not ticking) or a bad one (they are), and the two
+        // are indistinguishable on screen. elev is the angle the LIVE map was built for — compare it
+        // against the sun you can see and a missed trigger is obvious.
+        {
+            const bool occOn = g_dlExterior && g_sunOccValid && g_sunOccStrength > 0.0f;
+            const float builtElev = g_sunOccValid
+                ? std::asin(std::max(-1.0f, std::min(g_sunOccBuiltDir[2], 1.0f))) * 57.2957795f : 0.0f;
+            bformat(&g_sunOccText, "Sun far  builds=%u (f%u)  elev=%.1f deg  reach=%.0f u x%.0f taps"
+                                   "  soft=%.0f bias=%.0f  %s",
+                    g_sunOccBuilds, g_sunOccBuildFrame, builtElev, g_sunOccLastOuter, g_sunOccSteps,
+                    g_sunOccSoft, g_sunOccBias,
+                    occOn ? "ON"
+                          : (!g_dlExterior ? "off (interior)"
+                                           : (!g_sunOccValid ? "off (no map — night or not built)"
+                                                             : "off (strength 0)")));
+            g_sunOccColor = occOn ? float4(0.95f, 0.88f, 0.70f, 1.0f)
+                                  : float4(0.65f, 0.65f, 0.65f, 1.0f);
         }
         if (g_live.shadowReady) {
             // Follow-on 3: lazy one-time create of the occlusion-cull resources (runs BEFORE beginCmd,
@@ -10256,6 +10476,10 @@ namespace ForgeRender {
         // FIRST, before the cull and before any pass that samples it, so the frame that triggers a
         // rebuild already reads the new map rather than lagging one behind. Almost always a no-op.
         rebuildSkyHeightMap();
+        // ...and the SUN-OCCLUSION map derived from it, if the SUN has moved past its threshold. The
+        // other trigger — the height map changing under it — is handled inside the call above, which
+        // is why this one only has to watch the sun. Also almost always a no-op.
+        rebuildSunOccMap(/*force*/false);
 
         gpuPhaseBegin(kGpuPhaseCull);
 
@@ -10715,6 +10939,17 @@ namespace ForgeRender {
                     ++preDrawnMM;
                 }
             }
+
+            // --- HOST-OWNED TERRAIN, depth-only. LAST in the prepass on purpose: terrain is by far
+            // the largest surface in the frame, and by this point the near scene has already written
+            // its depth, so most terrain fragments are rejected before they are ever shaded (they
+            // aren't shaded here at all — this PSO is PS-less — but the same ordering keeps the
+            // rasteriser's early-Z doing the work).
+            //
+            // The cull + instance ring this reads were filled by dlLiveCullAndBuild, well before the
+            // record phase, so there is no second cull and no extra CPU work: this is the SAME
+            // g_terrainMain the colour pass draws, one pipeline swap apart.
+            terrainRecordDepth(g_live.pCmd);
         }
 
         gpuPhaseEnd(kGpuPhasePrepass);
@@ -11111,7 +11346,11 @@ namespace ForgeRender {
                         (void*)g_live.pAO, (void*)g_live.pLinearDepth, (int)g_live.firstFrame);
             s_aoDispatchLogged = true;
         }
-        if (g_aoComputeEnable && g_live.pLinearizePipeline && g_live.pGtaoPipeline) {
+        // Named once, because THREE later blocks depend on the states this one leaves behind
+        // (pLinearDepth in SHADER_RESOURCE above all) and each used to re-spell the condition by
+        // hand. A hand-mirrored gate that drifts is a silent state-mismatch, not a compile error.
+        const bool aoBlockRan = g_aoComputeEnable && g_live.pLinearizePipeline && g_live.pGtaoPipeline;
+        if (aoBlockRan) {
             // Build gAOParams: invViewProj (from the SAME rzViewProj geometry used, incl. the
             // half-pixel offset) + screen + knobs + eye. Seeds follow scene-walk (WORLD-unit knobs;
             // may need MW-scale tuning — change here). eye is read back from the frame cbuffer
@@ -11234,13 +11473,13 @@ namespace ForgeRender {
             }
         }
 
-        // P1: screen-space shadow-mask dispatch. Needs pLinearDepth in SHADER_RESOURCE, which
-        // the AO block above guarantees (linearize always runs; only the GTAO dispatches are
-        // gated) — mirror its gate so the states line up. Runs whenever shadowReady, even with
+        // P1: screen-space shadow-mask dispatch. Needs pLinearDepth in SHADER_RESOURCE, which the
+        // AO block above guarantees (linearize always runs; only the GTAO dispatches are gated) —
+        // hence aoBlockRan rather than a hand-copied gate. Runs whenever shadowReady, even with
         // ZERO active slots: the comp then writes an all-lit mask, keeping the UAV/SRV ping-pong
         // and the colour frag's mode-10 read state-valid. Own nested timer (kGpuPhaseShadowMask):
         // per-pixel cost scales with ACTIVE slots (PCF loads, x2 for dynBits slots).
-        if (g_live.shadowReady && g_live.pLinearizePipeline && g_live.pGtaoPipeline) {
+        if (g_live.shadowReady && aoBlockRan) {
             gpuPhaseBegin(kGpuPhaseShadowMask);
             if (!g_live.firstFrame) {
                 TextureBarrier tb = {};
@@ -12074,45 +12313,99 @@ namespace ForgeRender {
 
         gpuPhaseEnd(kGpuPhaseColor);
 
-        // ===================== Occlusion M2: Hi-Z mip-0 fill (colour->water seam) ==================
-        // pDepth NOW holds the FULL scene depth (prepass + DL land + statics) — the occluders the
-        // distant-statics test needs. Water depth-writes AFTER this and must NOT enter the pyramid
-        // (it would falsely occlude refraction-visible geometry), hence this exact seam. Copy
-        // sample 0 -> pHiz mip 0 here in the MAIN cmd; the tail prologue reduces mips 1..N.
+        // ============ COLOUR->WATER SEAM: the two readers of FULL scene depth ======================
+        // pDepth NOW holds the FULL scene depth (prepass + DL land + TERRAIN + statics). Water
+        // depth-writes AFTER this and must not reach either consumer here, so this exact seam is the
+        // only place both can be taken. One barrier bracket serves both — pDepth flips
+        // DEPTH_WRITE->SHADER_RESOURCE once, not once per consumer.
+        //
+        //  (a) Hi-Z mip 0 for the distant-statics occlusion test (water in the pyramid would falsely
+        //      occlude refraction-visible geometry); the tail prologue reduces mips 1..N.
+        //  (b) RE-LINEARIZE pLinearDepth. The pre-colour linearize snapshots the Z-PREPASS. Terrain
+        //      is IN that prepass now (P0), so the ground reaches both snapshots — but DL STATICS
+        //      still are not: they are drawn straight into the colour pass and depth-write there.
+        //      Without this refresh the two post-colour consumers read deviceZ 0 over every distant
+        //      building and treat it as sky:
+        //        - volfog.frag marches the full maxDist straight THROUGH it, painting fog and shafts
+        //          over the geometry;
+        //        - water.frag reconstructs that pixel at the far plane, so its shore-depth branch
+        //          never opens.
+        //      Refreshing here costs one dispatch on a bracket that already exists, and leaves the
+        //      pre-colour snapshot alone for GTAO, the shadow mask and the contact-shadow march,
+        //      which all run before the colour pass and cannot use this one. (This becomes deletable
+        //      the day DL statics gain a prepass entry of their own.)
         bool hizMip0Filled = false;
-        if (g_live.hizReady && g_hizPrologue) {
+        const bool doHizMip0 = g_live.hizReady && g_hizPrologue;
+        // Gate on aoBlockRan, not on the pipeline alone: that block is what leaves pLinearDepth in
+        // SHADER_RESOURCE, and the SR->UAV flip below is only valid if it ran. Also gate on the two
+        // consumers actually running — with water off (F7) and volfog off nothing reads it again.
+        const bool doSeamLinearize = aoBlockRan && g_live.pLinearizeSet
+                                  && ((g_live.waterReady && waterEnabled && g_drawWater) || g_volFog);
+        if (doHizMip0 || doSeamLinearize) {
             cmdBindRenderTargets(g_live.pCmd, nullptr);
             {
                 RenderTargetBarrier rtb = {};
                 rtb.pRenderTarget = g_live.pDepth;
                 rtb.mCurrentState = RESOURCE_STATE_DEPTH_WRITE;
                 rtb.mNewState = RESOURCE_STATE_SHADER_RESOURCE;
-                TextureBarrier tb = {};
-                tb.pTexture = g_live.pHiz;
-                tb.mCurrentState = RESOURCE_STATE_SHADER_RESOURCE;
-                tb.mNewState = RESOURCE_STATE_UNORDERED_ACCESS;
-                cmdResourceBarrier(g_live.pCmd, 0, nullptr, 1, &tb, 1, &rtb);
+                TextureBarrier tb[2] = {};
+                uint32_t nt = 0;
+                if (doHizMip0) {
+                    tb[nt].pTexture = g_live.pHiz;
+                    tb[nt].mCurrentState = RESOURCE_STATE_SHADER_RESOURCE;
+                    tb[nt].mNewState = RESOURCE_STATE_UNORDERED_ACCESS;
+                    ++nt;
+                }
+                if (doSeamLinearize) {
+                    tb[nt].pTexture = g_live.pLinearDepth;
+                    tb[nt].mCurrentState = RESOURCE_STATE_SHADER_RESOURCE;
+                    tb[nt].mNewState = RESOURCE_STATE_UNORDERED_ACCESS;
+                    ++nt;
+                }
+                cmdResourceBarrier(g_live.pCmd, 0, nullptr, nt, tb, 1, &rtb);
             }
-            cmdBeginDebugMarker(g_live.pCmd, 0.3f, 0.8f, 0.8f, "HI-Z MIP0 (scene depth -> pHiz mip 0)");
-            cmdBindPipeline(g_live.pCmd, g_live.pHizPipelineFirst);
-            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pHizSet);
-            // Build the pyramid over the FULL allocation, not the current render sub-rect: pDepth's
-            // out-of-viewport border is cleared to far (0.0) each frame, so the border pyramid
-            // texels reduce to far = conservative no-occlude. The occlusion test (hizParams.xy =
-            // current render size) still addresses only the [0..render] sub-rect, but its edge taps
-            // now read a fully-built pyramid instead of a stale border. Correct at every scale.
-            cmdDispatch(g_live.pCmd, (g_live.allocWidth + 7u) / 8u, (g_live.allocHeight + 7u) / 8u, 1);
-            cmdEndDebugMarker(g_live.pCmd);
+            if (doHizMip0) {
+                cmdBeginDebugMarker(g_live.pCmd, 0.3f, 0.8f, 0.8f, "HI-Z MIP0 (scene depth -> pHiz mip 0)");
+                cmdBindPipeline(g_live.pCmd, g_live.pHizPipelineFirst);
+                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pHizSet);
+                // Build the pyramid over the FULL allocation, not the current render sub-rect: pDepth's
+                // out-of-viewport border is cleared to far (0.0) each frame, so the border pyramid
+                // texels reduce to far = conservative no-occlude. The occlusion test (hizParams.xy =
+                // current render size) still addresses only the [0..render] sub-rect, but its edge taps
+                // now read a fully-built pyramid instead of a stale border. Correct at every scale.
+                cmdDispatch(g_live.pCmd, (g_live.allocWidth + 7u) / 8u, (g_live.allocHeight + 7u) / 8u, 1);
+                cmdEndDebugMarker(g_live.pCmd);
+            }
+            if (doSeamLinearize) {
+                // Same pipeline and same set as the pre-colour dispatch — only pDepth's CONTENTS have
+                // moved on. Sized by the RENDER rect (the linearize writes what the frame drew), unlike
+                // the Hi-Z above which covers the whole allocation.
+                cmdBeginDebugMarker(g_live.pCmd, 0.2f, 0.6f, 1.0f, "RE-LINEARIZE (full scene depth incl. terrain)");
+                cmdBindPipeline(g_live.pCmd, g_live.pLinearizePipeline);
+                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pLinearizeSet);
+                cmdDispatch(g_live.pCmd, (g_live.width + 7u) / 8u, (g_live.height + 7u) / 8u, 1);
+                cmdEndDebugMarker(g_live.pCmd);
+            }
             {
                 RenderTargetBarrier rtb = {};
                 rtb.pRenderTarget = g_live.pDepth;
                 rtb.mCurrentState = RESOURCE_STATE_SHADER_RESOURCE;
                 rtb.mNewState = RESOURCE_STATE_DEPTH_WRITE;
-                TextureBarrier tb = {};
-                tb.pTexture = g_live.pHiz;
-                tb.mCurrentState = RESOURCE_STATE_UNORDERED_ACCESS;
-                tb.mNewState = RESOURCE_STATE_SHADER_RESOURCE;
-                cmdResourceBarrier(g_live.pCmd, 0, nullptr, 1, &tb, 1, &rtb);
+                TextureBarrier tb[2] = {};
+                uint32_t nt = 0;
+                if (doHizMip0) {
+                    tb[nt].pTexture = g_live.pHiz;
+                    tb[nt].mCurrentState = RESOURCE_STATE_UNORDERED_ACCESS;
+                    tb[nt].mNewState = RESOURCE_STATE_SHADER_RESOURCE;
+                    ++nt;
+                }
+                if (doSeamLinearize) {
+                    tb[nt].pTexture = g_live.pLinearDepth;
+                    tb[nt].mCurrentState = RESOURCE_STATE_UNORDERED_ACCESS;
+                    tb[nt].mNewState = RESOURCE_STATE_SHADER_RESOURCE;
+                    ++nt;
+                }
+                cmdResourceBarrier(g_live.pCmd, 0, nullptr, nt, tb, 1, &rtb);
             }
             // Re-bind the colour pass (LOAD/LOAD) so the water-off path below is unaffected.
             BindRenderTargetsDesc hbind = {};
@@ -12122,7 +12415,7 @@ namespace ForgeRender {
             cmdBindRenderTargets(g_live.pCmd, &hbind);
             cmdSetViewport(g_live.pCmd, 0.0f, 0.0f, (float)g_live.width, (float)g_live.height, 0.0f, 1.0f);
             cmdSetScissor(g_live.pCmd, 0, 0, g_live.width, g_live.height);
-            hizMip0Filled = true;
+            hizMip0Filled = doHizMip0;
         }
 
         gpuPhaseBegin(kGpuPhaseWater);
@@ -14847,11 +15140,21 @@ namespace ForgeRender {
     };
     TerrainView g_terrainMain;
     TerrainView g_terrainRefl;
+    // ...and the SUN caster view. Culled against the OUTERMOST cascade's ortho box rather than the
+    // camera frustum, because a caster does not have to be visible to shadow you — the ridge behind
+    // the camera is exactly the one the player notices. Its own view for the same reason the
+    // reflection has one: the LOD array is read by the neighbour stitch, so two culls sharing it
+    // would tear whichever recorded second.
+    TerrainView g_terrainSun;
 
     Shader*   g_pTerrainShader     = nullptr;
     Pipeline* g_pTerrainPipeline   = nullptr;
     Pipeline* g_pTerrainPipelineMirror = nullptr;   // reflect-geo: CULL_NONE (open sheet, see creation)
     Pipeline* g_pTerrainPipelineWire = nullptr;
+    Shader*   g_pTerrainDepthShader   = nullptr;    // terrain.vert ALONE (PS-less) — the Z-prepass entry
+    Pipeline* g_pTerrainDepthPipeline = nullptr;
+    Shader*   g_pSunShadowTerrainShader   = nullptr;   // terrain.vert + sunshadow_terrain.frag
+    Pipeline* g_pSunShadowTerrainPipeline = nullptr;   // ...into the MSM moments atlas
     Buffer*   g_pTerrainVB         = nullptr;   // shared lattice (all LODs)
     Buffer*   g_pTerrainIB         = nullptr;   // all LOD strides back to back
     Buffer*   g_pTerrainHeights    = nullptr;   // whole-world heightfield  (GPU_ONLY SRV)
@@ -14941,28 +15244,33 @@ namespace ForgeRender {
         ib.ppBuffer           = &g_pTerrainIB;
         addResource(&ib, nullptr);
 
-        // One instance ring PER VIEW — the reflect cull runs mid-command-buffer, after the main cull
-        // has already filled its own ring, so they cannot share storage.
-        for (TerrainView* v : { &g_terrainMain, &g_terrainRefl }) {
+        // One instance ring PER VIEW — the reflect and sun culls run mid-command-buffer, after the
+        // main cull has already filled its own ring, so they cannot share storage.
+        for (TerrainView* v : { &g_terrainMain, &g_terrainRefl, &g_terrainSun }) {
             BufferLoadDesc ir = {};
             ir.mDesc.mDescriptors = DESCRIPTOR_TYPE_VERTEX_BUFFER;
             ir.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_CPU_TO_GPU;
             ir.mDesc.mFlags       = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
             ir.mDesc.mSize        = (uint64_t)kTerrainMaxInst * kTerrainInstStride;
-            ir.mDesc.pName        = (v == &g_terrainMain) ? "terrainInstRing" : "terrainInstRingRefl";
+            ir.mDesc.pName        = (v == &g_terrainMain) ? "terrainInstRing"
+                                  : (v == &g_terrainRefl) ? "terrainInstRingRefl"
+                                                          : "terrainInstRingSun";
             ir.pData              = nullptr;
             ir.ppBuffer           = &v->instRing;
             addResource(&ir, nullptr);
         }
         waitForAllResourceLoads();
-        if (!g_pTerrainVB || !g_pTerrainIB || !g_terrainMain.instRing || !g_terrainRefl.instRing) {
+        if (!g_pTerrainVB || !g_pTerrainIB || !g_terrainMain.instRing || !g_terrainRefl.instRing
+            || !g_terrainSun.instRing) {
             std::printf("[forge][terrain] lattice buffer alloc FAILED\n");
             return false;
         }
 
         // (2) Pipeline. Same depth contract as the DL land it replaces (reverse-Z GEQUAL, depth
-        //     write, no prepass — terrain is fully opaque) and the same CULL_NONE, so a stitched
-        //     edge triangle can never be culled away into a crack.
+        //     write) and the same CULL_NONE, so a stitched edge triangle can never be culled away
+        //     into a crack. Terrain DOES have a Z-prepass entry now (the depth-only twin built at the
+        //     end of this function); the colour draw's GEQUAL therefore lands on equal depth and
+        //     passes, while every fragment a nearer surface covers is rejected before it shades.
         ShaderLoadDesc sd = {};
         sd.mVert.pFileName = "terrain.vert";
         sd.mFrag.pFileName = "terrain.frag";
@@ -15033,6 +15341,84 @@ namespace ForgeRender {
         RasterizerStateDesc rw = rs; rw.mFillMode = FILL_MODE_WIREFRAME;
         g.pRasterizerState = &rw;
         addPipeline(R, &pd, &g_pTerrainPipelineWire);
+        g.pRasterizerState = &rs;
+
+        // DEPTH-ONLY twin, for the Z-prepass. Terrain used to skip the prepass entirely ("no prepass —
+        // terrain is fully opaque"), which was true of the COLOUR pass and wrong about everything that
+        // reads depth BEFORE it: GTAO, the point-light shadow mask and the screen-space contact-shadow
+        // march all ran on a depth buffer with no ground in it, so the largest surface in the world was
+        // invisible to every one of them (GTAO could not darken a single terrain crease, and the mask
+        // reconstructed terrain pixels at the far plane). One PS-less draw fixes all three.
+        //
+        // PS-less like pOpaquePrepassPipelineNoAT — terrain has no alpha test, so it runs at full-rate
+        // early-Z. Same vertex layout, same GEQUAL + depth-write and the same BACK/CCW facing as the
+        // colour PSO, so SV_Position is bit-identical and the colour draw's GEQUAL test passes on
+        // equality. That equality is also why this is a net WIN rather than a cost: the colour pass now
+        // early-Z-rejects every terrain fragment a nearer surface already covered.
+        {
+            ShaderLoadDesc td = {};
+            td.mVert.pFileName = "terrain.vert";   // vert ONLY: the D3D12 backend leaves PS null, legal at 0 RTs
+            addShader(R, &td, &g_pTerrainDepthShader);
+            if (g_pTerrainDepthShader) {
+                PipelineDesc dpd = {};
+                dpd.mType = PIPELINE_TYPE_GRAPHICS;
+                GraphicsPipelineDesc& dg = dpd.mGraphicsDesc;
+                dg.mPrimitiveTopo      = PRIMITIVE_TOPO_TRI_LIST;
+                dg.mRenderTargetCount  = 0;          // depth-only — no colour attachment
+                dg.pColorFormats       = nullptr;
+                dg.mSampleCount        = (SampleCount)g_live.sampleCount;
+                dg.mSampleQuality      = 0;
+                dg.mDepthStencilFormat = TinyImageFormat_D32_SFLOAT;
+                dg.pDepthState         = &ds;
+                dg.pVertexLayout       = &vl;
+                dg.pRasterizerState    = &rs;
+                dg.pShaderProgram      = g_pTerrainDepthShader;
+                addPipeline(R, &dpd, &g_pTerrainDepthPipeline);
+            }
+            // Non-fatal: without it the prepass simply has no terrain, which is where this started.
+            if (!g_pTerrainDepthPipeline) {
+                std::printf("[forge][terrain] depth-only PSO FAILED — terrain stays out of the Z-prepass\n");
+            }
+        }
+
+        // SUN-CASTER twin: the same lattice drawn from a cascade's ortho VP into the MSM moments
+        // atlas. Own PipelineDesc (RGBA16_UNORM colour, single-sample — the atlas is not MSAA).
+        //
+        // CULL_MODE_NONE, and this one is not a shrug. From the CAMERA, terrain is a single sheet
+        // whose underside is never seen, so the colour PSO back-culls for free fill. From the SUN the
+        // question is different: a slope steeper than the sun's elevation and facing away from it
+        // rasterizes BACK-facing, and where that slope is the only surface along a texel's ray,
+        // culling it leaves the texel with no caster at all — a hole in the shadow map exactly over
+        // the ground that should be darkest. Reverse-Z GEQUAL already picks the surface nearest the
+        // sun, so drawing both faces cannot produce a wrong answer, only a redundant one.
+        {
+            ShaderLoadDesc ssd = {};
+            ssd.mVert.pFileName = "terrain.vert";
+            ssd.mFrag.pFileName = "sunshadow_terrain.frag";
+            addShader(R, &ssd, &g_pSunShadowTerrainShader);
+            if (g_pSunShadowTerrainShader) {
+                TinyImageFormat sunFmt = TinyImageFormat_R16G16B16A16_UNORM;
+                RasterizerStateDesc sr = rs; sr.mCullMode = CULL_MODE_NONE;
+                PipelineDesc spd = {};
+                spd.mType = PIPELINE_TYPE_GRAPHICS;
+                GraphicsPipelineDesc& sg = spd.mGraphicsDesc;
+                sg.mPrimitiveTopo      = PRIMITIVE_TOPO_TRI_LIST;
+                sg.mRenderTargetCount  = 1;
+                sg.pColorFormats       = &sunFmt;
+                sg.mSampleCount        = SAMPLE_COUNT_1;
+                sg.mSampleQuality      = 0;
+                sg.mDepthStencilFormat = TinyImageFormat_D32_SFLOAT;
+                sg.pDepthState         = &ds;
+                sg.pVertexLayout       = &vl;
+                sg.pRasterizerState    = &sr;
+                sg.pShaderProgram      = g_pSunShadowTerrainShader;
+                addPipeline(R, &spd, &g_pSunShadowTerrainPipeline);
+            }
+            // Non-fatal: the sun pass then keeps casting statics only, which is where this started.
+            if (!g_pSunShadowTerrainPipeline) {
+                std::printf("[forge][terrain] sun-caster PSO FAILED — landscape casts no sun shadow\n");
+            }
+        }
 
         std::printf("[forge][terrain] lattice built: %zu verts, %zu indices, 6 LODs\n",
                     verts.size() / 2, indices.size());
@@ -15429,6 +15815,16 @@ namespace ForgeRender {
             if (g_live.pPerFrameSetReflectGeo) {
                 updateDescriptorSet(R, 0, g_live.pPerFrameSetReflectGeo, 4, tp);
             }
+            // ...and the SUN caster set, once per cascade instance. terrain.vert draws under it now
+            // (P1: the landscape casts), so this is the third instance of the same lesson — and the
+            // failure mode here is quieter than the mirror's was, because nothing about a shadow map
+            // looks obviously black: an unbound gTerrainHeights would simply flatten every caster to
+            // absolute height 0 and paint a sea-level shadow across the whole world.
+            if (g_live.pPerFrameSetSun) {
+                for (uint32_t c = 0; c < kSunCascades; ++c) {
+                    updateDescriptorSet(R, c, g_live.pPerFrameSetSun, 4, tp);
+                }
+            }
         }
 
         // SH2: the same two buffers reach the sky-height COMPUTE pass through its own set. That pass
@@ -15457,7 +15853,7 @@ namespace ForgeRender {
         // process life (the world does not move), so this is built once, not per frame.
         const Terrain::LandCell* cellArr = Terrain::cells();
         g_terrainCull.resize(cells);
-        for (TerrainView* v : { &g_terrainMain, &g_terrainRefl }) {
+        for (TerrainView* v : { &g_terrainMain, &g_terrainRefl, &g_terrainSun }) {
             v->lodOf.assign(cells, 0);
             v->lodStamp.assign(cells, 0);
         }
@@ -15485,6 +15881,7 @@ namespace ForgeRender {
         }
         g_terrainMain.visible.reserve(cells);
         g_terrainRefl.visible.reserve(cells);
+        g_terrainSun.visible.reserve(cells);
 
         const uint64_t bufBytes = hBytes + cBytes + tBytes + gBytes;
         std::printf("[forge][terrain] residency: %u cells, %llu MB buffers (heights %llu + colour %llu)\n",
@@ -15665,13 +16062,22 @@ namespace ForgeRender {
     // the mirror-about-water matrix + the below-water clip plane) and `mirror`, which picks the
     // winding-flipped PSO — the water plane reverses handedness, so the same triangles rasterize CW
     // there and a back-face cull would otherwise drop precisely the surface being reflected.
-    void terrainRecord(Cmd* cmd, TerrainView& V, DescriptorSet* frameSet, bool mirror) {
+    //
+    // The two optional tails serve the passes that draw the SAME cells through a different lens:
+    //   frameSetIndex — pPerFrameSetSun has one INSTANCE per cascade (each holding that cascade's
+    //     ortho VP), so the sun caster has to name which one. 0 is every other caller's answer.
+    //   psoOverride   — the depth-only (Z-prepass) and moments (sun caster) pipelines. It also
+    //     deliberately short-circuits the wireframe toggle: a wireframe SHADOW is not an A/B anyone
+    //     wants, it is a hole in the shadow map.
+    void terrainRecord(Cmd* cmd, TerrainView& V, DescriptorSet* frameSet, bool mirror,
+                       uint32_t frameSetIndex = 0, Pipeline* psoOverride = nullptr) {
         if (!g_terrainReady || !g_drawTerrain || !V.cells) { return; }
-        Pipeline* pso = (g_terrainWire && g_pTerrainPipelineWire) ? g_pTerrainPipelineWire
-                      : mirror                                    ? g_pTerrainPipelineMirror
-                                                                  : g_pTerrainPipeline;
+        Pipeline* pso = psoOverride                                 ? psoOverride
+                      : (g_terrainWire && g_pTerrainPipelineWire)   ? g_pTerrainPipelineWire
+                      : mirror                                      ? g_pTerrainPipelineMirror
+                                                                    : g_pTerrainPipeline;
         cmdBindPipeline(cmd, pso);
-        cmdBindDescriptorSet(cmd, 0, frameSet);
+        cmdBindDescriptorSet(cmd, frameSetIndex, frameSet);
         cmdBindDescriptorSet(cmd, 0, g_live.pPerLightsSetDist ? g_live.pPerLightsSetDist
                                                               : g_live.pPerLightsSet);
         cmdBindDescriptorSet(cmd, 0, g_live.pPersistentSet);
@@ -15688,6 +16094,23 @@ namespace ForgeRender {
             cmdDrawIndexedInstanced(cmd, rg.indexCount, rg.firstIndex, n, rg.firstVertex, firstInstance);
             firstInstance += n;
         }
+    }
+
+    // The Z-PREPASS entry, wrapped so the prepass block (thousands of lines above these globals) needs
+    // one forward declaration instead of six. Same cells, same instance ring and same matrix as the
+    // colour draw further down the frame — only the pipeline differs — so the depth it writes is
+    // bit-identical to the depth that draw would have written, which is the whole zero-change claim.
+    void terrainRecordDepth(Cmd* cmd) {
+        if (!g_pTerrainDepthPipeline) { return; }
+        // ...but NOT under the wireframe toggle. That mode exists to show which stride each cell
+        // picked and whether the stitch closed, and it can only do that if you can see THROUGH the
+        // near cells to the far ones. A solid depth prefill would occlude everything behind the
+        // wireframe and leave the tool showing a single layer of lines.
+        if (g_terrainWire) { return; }
+        cmdBeginDebugMarker(cmd, 0.35f, 0.6f, 0.35f, "TERRAIN (Z-prepass)");
+        terrainRecord(cmd, g_terrainMain, g_live.pPerFrameSet, /*mirror*/false,
+                      /*frameSetIndex*/0, g_pTerrainDepthPipeline);
+        cmdEndDebugMarker(cmd);
     }
 
     // ============================== end host-owned terrain (T1) ================================
@@ -19620,6 +20043,13 @@ namespace ForgeRender {
         g_skyHeightBuiltMinR = g_skyAOMinRadius;
         ++g_skyHeightBuilds;
 
+        // The sun-occlusion map is DERIVED from what this function just wrote, so it is stale the
+        // instant the height map changes — and it is read through the origin published just below,
+        // so a rebuild that skipped it would sample a map built over the OLD window through the NEW
+        // mapping. Forcing it from inside the rebuild is what makes that unrepresentable, rather
+        // than a rule someone has to remember at the two call sites.
+        rebuildSunOccMap(/*force*/true);
+
         // RE-PUBLISH the mapping, and this is not optional. publishSkyAO ran up with the per-frame
         // camera write — BEFORE this function — so on a rebuild frame it stamped the PREVIOUS
         // origin, and the receiver would sample this brand-new map through it: a 2048-unit offset
@@ -19627,9 +20057,123 @@ namespace ForgeRender {
         // snap-and-rebuild is that crossing a boundary is invisible, so the origin and the contents
         // have to change in the same frame. Safe to write here: the params cbuffer is persistent-
         // mapped and the GPU reads it when the frame executes, which is after all recording.
+        // (publishSunOcc rides along for the same reason, and its in-sync check needs BOTH the new
+        // origin and the rebuild above to have happened.)
         if (g_live.pShadowMaskParamsCbv && g_live.pShadowMaskParamsCbv->pCpuMappedAddress) {
-            publishSkyAO((float*)g_live.pShadowMaskParamsCbv->pCpuMappedAddress, true);
+            float* mp = (float*)g_live.pShadowMaskParamsCbv->pCpuMappedAddress;
+            publishSkyAO(mp, true);
+            publishSunOcc(mp, true);
         }
+    }
+
+    // LONG-RANGE sun occlusion — rebuild the sun-BLOCKED height map (tasks/lighting.md).
+    //
+    // The cascades cover one MW cell and report fully lit outside it, so nothing beyond 8192 units
+    // has ever cast a sun shadow onto anything: not a mountain onto the valley below it, and not
+    // onto the volumetric march, which is where it finally showed as fog lit up inside a ridge's
+    // shadow. This map answers that range with ONE sample per query by storing a HEIGHT (see
+    // sunocc.srt.h for why a height and not a horizon angle).
+    //
+    // THROTTLED, and that is the whole cost argument. It is a pure function of two things — the
+    // height map and the sun direction — so it is rebuilt only when one of them moves:
+    //   * the height map's own rebuild forces it (called from the tail of rebuildSkyHeightMap, so
+    //     the two can never describe different windows), and
+    //   * the sun rotating past g_sunOccSunDeg triggers it here.
+    // MW's sun crosses the sky in a game day, so the second fires every few seconds of play. At
+    // 1024² x ~48 taps that is a fraction of a millisecond, on frames that are already rare.
+    void rebuildSunOccMap(bool force) {
+        if (!g_live.sunOccReady || !g_dlExterior) { return; }
+        if (!g_live.pFrameCbv || !g_live.pFrameCbv->pCpuMappedAddress) { return; }
+        if (!g_live.pSunOccParamsCbv || !g_live.pSunOccParamsCbv->pCpuMappedAddress) { return; }
+        // Nothing to build over a map that does not exist yet — the first exterior frames.
+        if (!g_skyHeightValid) { return; }
+
+        // Any exit that CHANGES g_sunOccValid has to re-publish, because the per-frame publish ran
+        // far earlier in the frame (with publishSkyAmbientSH) and stamped the state as it was then.
+        // Without this, arming and — more importantly — DISARMING at dusk both take effect one frame
+        // late, which is a frame of the receiver sampling a map built for a sun that has set.
+        auto republish = [&]() {
+            if (g_live.pShadowMaskParamsCbv && g_live.pShadowMaskParamsCbv->pCpuMappedAddress) {
+                publishSunOcc((float*)g_live.pShadowMaskParamsCbv->pCpuMappedAddress, true);
+            }
+        };
+
+        // gFrameData.sunDir is the direction light TRAVELS, so the direction TO the sun is its
+        // negation — the same flip every receiver makes when it writes -gFrameData.sunDir.
+        const float* mfd = (const float*)g_live.pFrameCbv->pCpuMappedAddress;
+        float sx = -mfd[16], sy = -mfd[17], sz = -mfd[18];
+        const float sl = std::sqrt(sx*sx + sy*sy + sz*sz);
+        if (sl < 1e-6f) { g_sunOccValid = false; republish(); return; }
+        sx /= sl; sy /= sl; sz /= sl;
+
+        // Sun at or below the horizon: there is no sun to occlude, and tan(elevation) goes negative
+        // (which would march the shadow UPWARD and shadow the whole world). Disarm instead — MW's
+        // night has no directional sun term anyway, and the publish then sends strength 0.
+        const float horiz = std::sqrt(sx*sx + sy*sy);
+        if (sz <= 0.02f || horiz < 1e-4f) { g_sunOccValid = false; republish(); return; }
+
+        // Trigger. The threshold is on the ANGLE between the built direction and the current one:
+        // a dot product, so it costs nothing and is uniform in the thing that actually matters (a
+        // degree of sun motion sweeps the shadow line by the same fraction of its length wherever
+        // the sun is, whereas a per-component epsilon would fire unevenly across the day).
+        if (!force && g_sunOccValid) {
+            const float d = sx * g_sunOccBuiltDir[0] + sy * g_sunOccBuiltDir[1] + sz * g_sunOccBuiltDir[2];
+            const float cosThresh = std::cos(std::max(g_sunOccSunDeg, 0.01f) * 0.017453293f);
+            if (d >= cosThresh) { return; }
+        }
+
+        // tan(elevation) = sin/cos with the horizontal component as cos. Clamped: a near-vertical sun
+        // makes this explode, and the march then subtracts an enormous amount at the first tap so
+        // nothing can ever block — which is CORRECT (noon casts no long shadows) but is better
+        // reached by a bounded number than by an infinity.
+        const float tanElev = std::min(sz / std::max(horiz, 1e-4f), 64.0f);
+        const float dirX = sx / horiz, dirY = sy / horiz;
+
+        // Reach. Past kSunOccRelief / tan(elev) the term H - d*tan cannot beat anything already
+        // found, because no world feature is that tall — so the march SHORTENS as the sun climbs
+        // and midday costs a fraction of dawn. Kept above one texel so the geometric spacing is
+        // always well-formed.
+        const float outer = std::max(std::min(g_sunOccOuter, kSunOccRelief / std::max(tanElev, 1e-3f)),
+                                     g_sunOccInner + kSunOccTexel);
+
+        float* sp = (float*)g_live.pSunOccParamsCbv->pCpuMappedAddress;
+        sp[0] = g_skyHeightOrigin[0];   sp[1] = g_skyHeightOrigin[1];
+        sp[2] = kSunOccTexel;           sp[3] = (float)kSunOccRes;
+        sp[4] = dirX;                   sp[5] = dirY;
+        sp[6] = tanElev;                sp[7] = std::max(1.0f, std::min(g_sunOccSteps, 128.0f));
+        sp[8] = std::max(1.0f, g_sunOccInner); sp[9] = outer;
+        sp[10] = 0.0f;                  sp[11] = 0.0f;
+        sp[12] = (float)kSkyHeightRes;  sp[13] = kSkyHeightTexel;
+        sp[14] = 0.0f;                  sp[15] = 0.0f;
+
+        cmdBeginDebugMarker(g_live.pCmd, 0.95f, 0.75f, 0.3f, "SUN OCCLUSION MAP (rebuild)");
+        {
+            TextureBarrier tb = {};
+            tb.pTexture = g_live.pSunOcc;
+            tb.mCurrentState = RESOURCE_STATE_SHADER_RESOURCE;
+            tb.mNewState = RESOURCE_STATE_UNORDERED_ACCESS;
+            cmdResourceBarrier(g_live.pCmd, 0, nullptr, 1, &tb, 0, nullptr);
+        }
+        cmdBindPipeline(g_live.pCmd, g_live.pSunOccPipeline);
+        cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pSunOccSet);
+        cmdDispatch(g_live.pCmd, (kSunOccRes + 7u) / 8u, (kSunOccRes + 7u) / 8u, 1);
+        {
+            TextureBarrier tb = {};
+            tb.pTexture = g_live.pSunOcc;
+            tb.mCurrentState = RESOURCE_STATE_UNORDERED_ACCESS;
+            tb.mNewState = RESOURCE_STATE_SHADER_RESOURCE;
+            cmdResourceBarrier(g_live.pCmd, 0, nullptr, 1, &tb, 0, nullptr);
+        }
+        cmdEndDebugMarker(g_live.pCmd);
+
+        g_sunOccBuiltDir[0] = sx; g_sunOccBuiltDir[1] = sy; g_sunOccBuiltDir[2] = sz;
+        g_sunOccBuiltOrigin[0] = g_skyHeightOrigin[0];
+        g_sunOccBuiltOrigin[1] = g_skyHeightOrigin[1];
+        g_sunOccLastOuter  = outer;
+        g_sunOccBuildFrame = g_renderFrame;
+        g_sunOccValid = true;
+        ++g_sunOccBuilds;
+        republish();
     }
 
     // SUN shadow (forge-sun-shadows.md, Phase A / Step A1): render the DL-statics MSM moments map.
@@ -19810,7 +20354,29 @@ namespace ForgeRender {
         // matrix or the shadow slides — this is the only place they are built.
         publishSunShadowParams(sunVP, cascadeTexel, true);
 
-        cmdBeginDebugMarker(g_live.pCmd, 0.9f, 0.85f, 0.2f, "SUN SHADOW (DL statics)");
+        // --- TERRAIN caster cull (P1) -------------------------------------------------------------
+        // The landscape joins the caster set. Cull it against the OUTERMOST cascade's ortho box, the
+        // same six Gribb-Hartmann planes dispatchSunCull builds for the statics: box faces from the
+        // sun basis, camera-relative, tested as pl·(pos−eye) >= −r. ONE cull feeds every cascade
+        // because the inner boxes are concentric subsets of the outer one, exactly as for statics.
+        //
+        // primary=false so it cannot touch the panel counters (those describe the CAMERA's terrain),
+        // and nearCut=0 because a caster right under the eye still shadows the ground it stands on.
+        // The LOD ladder stays keyed off camera distance, deliberately: reusing it keeps caster and
+        // receiver on ONE heightfield, so a cell's shadow is cast by the very surface that receives
+        // it and the two cannot disagree about where the ground is.
+        {
+            const float range = g_sunShadowRange;
+            float planes[6][4] = {
+                { -xa[0], -xa[1], -xa[2], range     }, {  xa[0],  xa[1],  xa[2], range     },
+                { -ya[0], -ya[1], -ya[2], range     }, {  ya[0],  ya[1],  ya[2], range     },
+                { -za[0], -za[1], -za[2], depthHalf }, {  za[0],  za[1],  za[2], depthHalf },
+            };
+            const float eye[3] = { g_dlEye[0], g_dlEye[1], g_dlEye[2] };
+            terrainCullAndBuild(g_terrainSun, /*primary*/false, planes, eye, /*nearCut*/0.0f);
+        }
+
+        cmdBeginDebugMarker(g_live.pCmd, 0.9f, 0.85f, 0.2f, "SUN SHADOW (DL statics + terrain)");
         {
             // Both attachments rest in SHADER_RESOURCE (the moments feed the MSM receiver, the depth
             // feeds the near cascade's PCSS) and are acquired together for the caster pass.
@@ -19833,10 +20399,6 @@ namespace ForgeRender {
 
         DescriptorSet* distLightsSet = g_live.pPerLightsSetDist ? g_live.pPerLightsSetDist
                                                                 : g_live.pPerLightsSet;
-        cmdBindPipeline(g_live.pCmd, g_pSunShadowStaticsPipeline);
-        cmdBindDescriptorSet(g_live.pCmd, 0, distLightsSet);
-        cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
-        cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerBatchSet);
         // Source the survivors: A2 sun cull (pSunInstOut/pSunArgs) → else A1 camera cull → else CPU ring.
         // ONE cull feeds every cascade: the sun cull box is the OUTERMOST cascade's, and the inner
         // boxes are concentric subsets of it, so a per-cascade cull could only remove instances the
@@ -19848,14 +20410,32 @@ namespace ForgeRender {
         uint32_t argCount = (sunDraw || gpuDraw) ? g_live.cullSubsetCount : g_liveLastSubsets;
         Buffer*  svbs[2]     = { g_pStaticsVB, instBuf };
         uint32_t sstrides[2] = { 20, kStaticsInstStride };
-        cmdBindVertexBuffer(g_live.pCmd, 2, svbs, sstrides, nullptr);
-        cmdBindIndexBuffer(g_live.pCmd, g_pStaticsIB, INDEX_TYPE_UINT16, 0);
+        // Both caster sets are recorded per cascade inside ONE loop, so the statics VB/IB + PSO bind
+        // moved in here: terrainRecord below binds its own lattice VB/IB and its own pipeline, and
+        // whatever binds second owns the state for the next iteration. Four extra binds per frame
+        // against a loop body that is otherwise two indirect draws.
         for (uint32_t c = 0; c < kSunCascades; ++c) {
             const float ox = (float)(c * kSunShadowRes);
             cmdSetViewport(g_live.pCmd, ox, 0.0f, (float)kSunShadowRes, (float)kSunShadowRes, 0.0f, 1.0f);
             cmdSetScissor(g_live.pCmd, c * kSunShadowRes, 0, kSunShadowRes, kSunShadowRes);
+
+            cmdBindPipeline(g_live.pCmd, g_pSunShadowStaticsPipeline);
+            cmdBindDescriptorSet(g_live.pCmd, 0, distLightsSet);
+            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
+            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerBatchSet);
             cmdBindDescriptorSet(g_live.pCmd, c, g_live.pPerFrameSetSun);   // gFrameData := cascade c's ortho VP
+            cmdBindVertexBuffer(g_live.pCmd, 2, svbs, sstrides, nullptr);
+            cmdBindIndexBuffer(g_live.pCmd, g_pStaticsIB, INDEX_TYPE_UINT16, 0);
             cmdExecuteIndirect(g_live.pCmd, INDIRECT_DRAW_INDEX, argCount, argsBuf, 0, nullptr, 0);
+
+            // ...and the landscape, into the same tile. Same cells for every cascade (one cull), each
+            // projected by that cascade's own ortho VP through pPerFrameSetSun instance c. The null
+            // check is load-bearing: terrainRecord falls back to the COLOUR pipeline when handed no
+            // override, and that PSO's RT format is the scene target, not the moments atlas.
+            if (g_pSunShadowTerrainPipeline) {
+                terrainRecord(g_live.pCmd, g_terrainSun, g_live.pPerFrameSetSun, /*mirror*/false,
+                              /*frameSetIndex*/c, g_pSunShadowTerrainPipeline);
+            }
         }
         cmdBindRenderTargets(g_live.pCmd, nullptr);
         {
@@ -19879,8 +20459,10 @@ namespace ForgeRender {
 
         static uint32_t s_sunLog = 0;
         if ((s_sunLog++ % 300) == 0) {
-            LOG::logline(">> [sun-shadow] subsets=%u src=%s cascades=%u ext=%.0f..%.0f texel=%.2f..%.2f sunDir=(%.3f,%.3f,%.3f)",
+            LOG::logline(">> [sun-shadow] subsets=%u src=%s terrainCells=%u%s cascades=%u"
+                         " ext=%.0f..%.0f texel=%.2f..%.2f sunDir=(%.3f,%.3f,%.3f)",
                  argCount, sunDraw ? "A2-suncull" : (gpuDraw ? "A1-cameracull" : "cpu-ring"),
+                 g_terrainSun.cells, g_pSunShadowTerrainPipeline ? "" : " (NO terrain PSO)",
                  kSunCascades, sunCascadeExtent(0), sunCascadeExtent(kSunCascades - 1),
                  cascadeTexel[0], cascadeTexel[kSunCascades - 1], mfd[16], mfd[17], mfd[18]);
         }
@@ -20872,6 +21454,10 @@ namespace ForgeRender {
         // Host-owned terrain teardown (before the descriptor sets that reference the data buffers).
         if (g_pTerrainPipelineWire) { removePipeline(R, g_pTerrainPipelineWire); g_pTerrainPipelineWire = nullptr; }
         if (g_pTerrainPipelineMirror) { removePipeline(R, g_pTerrainPipelineMirror); g_pTerrainPipelineMirror = nullptr; }
+        if (g_pSunShadowTerrainPipeline) { removePipeline(R, g_pSunShadowTerrainPipeline); g_pSunShadowTerrainPipeline = nullptr; }
+        if (g_pSunShadowTerrainShader)   { removeShader(R, g_pSunShadowTerrainShader);     g_pSunShadowTerrainShader = nullptr; }
+        if (g_pTerrainDepthPipeline) { removePipeline(R, g_pTerrainDepthPipeline); g_pTerrainDepthPipeline = nullptr; }
+        if (g_pTerrainDepthShader)   { removeShader(R, g_pTerrainDepthShader);     g_pTerrainDepthShader = nullptr; }
         if (g_pTerrainPipeline)     { removePipeline(R, g_pTerrainPipeline);     g_pTerrainPipeline = nullptr; }
         if (g_pTerrainShader)       { removeShader(R, g_pTerrainShader);         g_pTerrainShader = nullptr; }
         if (g_pTerrainVB)           { removeResource(g_pTerrainVB);              g_pTerrainVB = nullptr; }
@@ -20880,7 +21466,7 @@ namespace ForgeRender {
         if (g_pTerrainColors)       { removeResource(g_pTerrainColors);          g_pTerrainColors = nullptr; }
         if (g_pTerrainTex)          { removeResource(g_pTerrainTex);             g_pTerrainTex = nullptr; }
         if (g_pTerrainCellGrid)     { removeResource(g_pTerrainCellGrid);        g_pTerrainCellGrid = nullptr; }
-        for (TerrainView* v : { &g_terrainMain, &g_terrainRefl }) {
+        for (TerrainView* v : { &g_terrainMain, &g_terrainRefl, &g_terrainSun }) {
             if (v->instRing) { removeResource(v->instRing); v->instRing = nullptr; }
             v->visible.clear(); v->lodOf.clear(); v->lodStamp.clear();
             v->cells = 0;

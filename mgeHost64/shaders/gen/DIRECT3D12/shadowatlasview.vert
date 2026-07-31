@@ -972,7 +972,7 @@ SamplerState gSampler2xWrapClamp : register( s17 , space100 ) ;
 #line 247 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/../../../3rdparty/The-Forge/Common_3/Graphics/FSL/defaults.h"
 
 #line 11 "FSL/shaders.list"
-#line 252 "FSL/shaders.list"
+#line 259 "FSL/shaders.list"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowatlasview.vert.fsl"
 #line 9 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowatlasview.vert.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
@@ -1056,7 +1056,7 @@ STRUCT(ShadowMaskParams)
 
 
     float4 volFog3;
-#line 150 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
+#line 151 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
     float4 volFog4;
 
 
@@ -1066,11 +1066,11 @@ STRUCT(ShadowMaskParams)
 
 
     float4 screenAlloc;
-#line 170 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
+#line 171 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
     float4 shAr;
     float4 shAg;
     float4 shAb;
-#line 185 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
+#line 186 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
     float4 skyParams;
 
 
@@ -1083,7 +1083,9 @@ STRUCT(ShadowMaskParams)
 
 
     float4 skyAOMap;
-#line 197
+#line 219 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
+    float4 sunOcc;
+#line 220
 };
 #line 21 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
 #line 46 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
@@ -1206,14 +1208,7 @@ STRUCT(LightData)
 
 
         Tex2D(float4) gAO :  register(t1,space1);
-
-
-
-
-
-
-
-
+#line 196 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
         Tex3D(float4) gWaterNormalVol :  register(t2,space1);
         Tex2D(float4) gRefractColor :  register(t3,space1);
         Tex2D(float4) gSceneLinDepth :  register(t4,space1);
@@ -1324,8 +1319,16 @@ STRUCT(LightData)
 
 
 
+
+
+
+        Tex2D(float) gSunOcc :  register(t53,space1);
+
+
+
+
         CBUFFER(LightData) gLights :  register(b0,space3);
-#line 316 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+#line 329 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
         Tex2D(float4) gTextures[ 880 ] :  register(t0,space0);
 
 
@@ -1355,4 +1358,4 @@ VSOutput VS_MAIN( uint VertexID : SV_VERTEXID )
     Out.Position = float4(uv.x * 2.0f - 1.0f, 1.0f - uv.y * 2.0f, 0.0f, 1.0f);
     return (Out);
 }
-#line 253 "FSL/shaders.list"
+#line 260 "FSL/shaders.list"

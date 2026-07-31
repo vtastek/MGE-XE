@@ -233,6 +233,46 @@ float sunPcssOcclusion(int c, float3 p, float3 worldPosRel, float slopeBias)
     return occlusion * (1.0f / float(SUN_PCF_TAPS));
 }
 
+// ---------------------------------------------------------------------------------------------
+// LONG-RANGE sun occlusion from the height map (gSunOcc, sunocc.comp.fsl).
+//
+// Everything above this line stops at the outermost cascade — 8192 world units, one MW cell. Past
+// it both receivers returned 1.0, so the entire distant world was unshadowed BY CONSTRUCTION: no
+// mountain shadowed a valley two cells away, and the volumetric march lit up air that a ridge in the
+// next cell should have blacked out. That last one is what made the gap visible; it was never a fog
+// bug.
+//
+// gSunOcc stores the sun-BLOCKED world Z per texel, so the test is a compare against the point's own
+// height and costs ONE sample at any altitude. Returns occlusion, 0 = lit .. 1 = fully shadowed, and
+// already carries its own strength lane and border fade — so a caller can use it raw.
+//
+// worldAbs is ABSOLUTE world position: every Forge path carries camera-relative, so callers add
+// gFrameData.lodEye.xyz exactly as skyAmbFactor does.
+float sunOccMapOcclusion(float3 worldAbs)
+{
+    float4 so = gShadowParams.sunOcc;
+    if (so.x <= 0.0f) { return 0.0f; }
+
+    // Same window, hence the SAME published mapping, as the sky-AO height map this is derived from.
+    float4 m  = gShadowParams.skyAOMap;
+    float2 uv = (worldAbs.xy - m.xy) * m.z;
+    // Outside the window there is no data. A clamp sampler would smear the border texel across the
+    // rest of the world — one ridge at the edge would shadow everything behind it forever — so fade
+    // the term out over the outer eighth instead, exactly as skyAOVisibility does.
+    float2 e    = abs(uv - 0.5f) * 2.0f;
+    float  edge = saturate((1.0f - max(e.x, e.y)) * 8.0f);
+    if (edge <= 0.0f) { return 0.0f; }
+
+    float blockZ = SampleLvlTex2D(gSunOcc, gSamplerBilinearClamp, uv, 0).r;
+    // The ramp runs DOWNWARD from (blockZ - bias): a point at the blocked height is fully lit and one
+    // `soft` below it is fully shadowed. Biasing toward lit is deliberate — the map is coarse and is
+    // built from the very surfaces that receive from it, so the failure mode to design out is a
+    // surface shadowing itself.
+    float t = saturate(((blockZ - so.z) - worldAbs.z) / max(so.y, 1.0e-3f));
+    t = t * t * (3.0f - 2.0f * t);            // smoothstep — a linear ramp shows its own edges
+    return t * so.x * edge;
+}
+
 // VOLUMETRIC sun visibility at an arbitrary point in the air — THE moment map's remaining job.
 //
 // A ray march evaluates this once per step, dozens of times per pixel, so the per-sample budget is
@@ -244,19 +284,60 @@ float sunPcssOcclusion(int c, float3 p, float3 worldPosRel, float slopeBias)
 //
 // No normal offset (there is no surface), no slope bias (no normal), and a small constant bias only.
 // Returns 1 = lit .. 0 = fully shadowed.
+// THE RANGE POLICY MUST MATCH sunShadowVisibility'S, EXACTLY, AND THAT IS NOT A STYLE CHOICE.
+//
+// The two functions answer the same question about the same world — one for a surface, one for the
+// air above it — and a shaft is only legible when the two AGREE. Every lit patch of ground has to be
+// traceable up its own shaft, and it is that correspondence, not the absolute value, that the eye
+// reads as "the sun is coming from over there".
+//
+// This was got wrong once, and it is worth recording what it looked like: the fog took
+// min(cascade, map) EVERYWHERE while the surface receiver used the map only past the last cascade.
+// Inside cascade range the ground and the air above it were then answering to different sources, so
+// the map could cut a shaft away over ground the cascade still called lit — the pool of light stayed,
+// its shaft did not. Worse, the two disagreed with different GEOMETRY: gSunOcc stores one blocked
+// height per XY column, so its boundary is a surface of constant Z — a HORIZONTAL cut — while a
+// cascade's boundary is swept along the sun. A horizontal edge sweeping through the ray march, laid
+// over sun-aligned shafts, reads as two light directions cancelling each other.
+//
+// So: cascade where it covers, map beyond, and the outermost cascade's hand-off band fades from one
+// into the other. Identical to the surface path below.
 float sunShadowVolumetric(float3 p)
 {
     if (gShadowParams.sunParams.x <= 0.0f) { return 1.0f; }
 
+    // Which cascade covers this point (the first/sharpest that does), and how close to its edge.
+    int   sel = -1;
+    float m   = 0.0f;
     UNROLL for (int i = 0; i < SUN_CASCADES; ++i)
     {
-        float4 q = mul(gShadowParams.sunViewProj[i], float4(p, 1.0f));
-        if (max(abs(q.x), abs(q.y)) < 1.0f - MSM_CASCADE_INSET && q.z > 0.0f && q.z < 1.0f)
+        if (sel < 0)
         {
-            return 1.0f - sunCascadeOcclusion(i, p, gShadowParams.sunParams.y);
+            float4 q  = mul(gShadowParams.sunViewProj[i], float4(p, 1.0f));
+            float  mm = max(abs(q.x), abs(q.y));
+            if (mm < 1.0f - MSM_CASCADE_INSET && q.z > 0.0f && q.z < 1.0f) { sel = i; m = mm; }
         }
     }
-    return 1.0f;   // outside every cascade: unshadowed air
+
+    float mapOcc = sunOccMapOcclusion(p + gFrameData.lodEye.xyz);
+    // Past every cascade the map is the whole answer — the distant fog gets ridge shadows for the
+    // first time, and the distant GROUND under it gets the same ones from the same map.
+    if (sel < 0) { return 1.0f - mapOcc; }
+
+    float occ = sunCascadeOcclusion(sel, p, gShadowParams.sunParams.y);
+
+    // Hand-off band, outermost cascade only: fade into the map rather than switching at its edge.
+    // Without this the map's arrival is a ring 8192 units out that travels with the player — and in
+    // fog, which integrates dozens of samples per pixel, a ring is far more visible than it is on a
+    // surface. (The cascade-to-cascade fade the surface path also does is deliberately NOT copied
+    // here: the fog has always hard-switched between cascades, that boundary is interior to the
+    // cascade set, and it is not what this change is about.)
+    float band = 1.0f - MSM_CASCADE_INSET - MSM_CASCADE_FADE;
+    if (m > band && sel + 1 >= SUN_CASCADES)
+    {
+        occ = lerp(occ, mapOcc, saturate((m - band) / MSM_CASCADE_FADE));
+    }
+    return 1.0f - occ;
 }
 
 // Strategy dispatch for the COLOUR pass. PCSS on every cascade; MSM survives only as the A/B
@@ -276,13 +357,22 @@ float sunCascadeShadow(int c, float3 p, float3 worldPosRel, float zBias, float s
 // Forge frag already interpolates); N = its world normal (for the normal-offset bias — pass the same
 // normal the sun N.L uses). Returns sun visibility: 1 = lit, 0 = fully shadowed.
 //
-// Everything early-outs to 1.0 (fully lit, zero cost beyond the branch) when the feature is off or
-// the fragment falls outside every cascade — so a fragment the sun map never covered is never
-// darkened.
+// Two sources, in ascending order of range and descending order of precision: the cascades (one MW
+// cell) and the long-range height map (the whole world). Each covers a band the other cannot, and
+// the outermost cascade's hand-off band fades from one into the other.
+//
+// Everything early-outs to 1.0 (fully lit, zero cost beyond the branch) when the feature is off — so
+// a fragment no source covers is never darkened.
 float sunShadowVisibility(float3 worldPosRel, float3 N)
 {
     float strength = gShadowParams.sunParams.x;
     if (strength <= 0.0f) { return 1.0f; }
+
+    // The long-range map's answer for this fragment. Resolved up front because BOTH exits below want
+    // it: past the last cascade it is the only answer there is, and inside the outermost cascade's
+    // hand-off band it is what that band now fades INTO (it used to fade into fully lit, which is
+    // where a mountain shadow stopped dead at 8192 units).
+    float mapOcc = sunOccMapOcclusion(worldPosRel + gFrameData.lodEye.xyz);
 
     // Cascade select on the UN-offset position: the normal offset is sub-texel-ish and depends on
     // the cascade we are about to pick, so resolving it first would be circular. Picking on the raw
@@ -300,7 +390,9 @@ float sunShadowVisibility(float3 worldPosRel, float3 N)
             if (mm < 1.0f - MSM_CASCADE_INSET && q.z > 0.0f && q.z < 1.0f) { sel = i; m = mm; }
         }
     }
-    if (sel < 0) { return 1.0f; }
+    // Past every cascade the map is the whole answer, and this is the first time anything out here
+    // has been shadowed at all.
+    if (sel < 0) { return 1.0f - mapOcc * strength; }
 
     float  bias  = gShadowParams.sunParams.y;
     float  noff  = gShadowParams.sunParams.w;            // in TEXELS of the sampled cascade
@@ -317,22 +409,19 @@ float sunShadowVisibility(float3 worldPosRel, float3 N)
     float occlusion = sunCascadeShadow(sel, worldPosRel + N * (noff * texel[sel]), worldPosRel,
                                        bias, slopeBias);
 
-    // Hand-off band. Inside it, cross-fade into the next (coarser) cascade — or, for the outermost
-    // one, into fully lit, which is the map's outer border ramp.
-    float band = 1.0f - MSM_CASCADE_INSET - MSM_CASCADE_FADE;
-    if (m > band)
+    // Hand-off band. Inside it, cross-fade into the next (coarser) cascade — or, for the OUTERMOST
+    // cascade, into the long-range map, which is literally what lies beyond it. That last case used
+    // to fade to fully lit, so every shadow in the world ended at a ring 8192 units from the camera
+    // that travelled with the player; fading into the map makes the ring a change of representation
+    // instead of a change of answer.
+    float band  = 1.0f - MSM_CASCADE_INSET - MSM_CASCADE_FADE;
+    float t     = (m > band) ? saturate((m - band) / MSM_CASCADE_FADE) : 0.0f;
+    bool  toMap = (sel + 1 >= SUN_CASCADES);
+    if (t > 0.0f && !toMap)
     {
-        float t = saturate((m - band) / MSM_CASCADE_FADE);
-        if (sel + 1 < SUN_CASCADES)
-        {
-            float occNext = sunCascadeShadow(sel + 1, worldPosRel + N * (noff * texel[sel + 1]),
-                                             worldPosRel, bias, slopeBias);
-            occlusion = lerp(occlusion, occNext, t);
-        }
-        else
-        {
-            occlusion *= (1.0f - t);
-        }
+        float occNext = sunCascadeShadow(sel + 1, worldPosRel + N * (noff * texel[sel + 1]),
+                                         worldPosRel, bias, slopeBias);
+        occlusion = lerp(occlusion, occNext, t);
     }
 
     // Light-bleeding reduction. "Light bleeding" is light leaking INTO a region that should be fully
@@ -343,9 +432,15 @@ float sunShadowVisibility(float3 worldPosRel, float3 N)
     // (Crushing the low end instead — linstep(lbr,1,occlusion) — is the opposite operation: it erases
     // partial occlusion, which washes shadows out and reads as MORE bleeding, not less.)
     // Fully-lit pixels sit near 0 occlusion, so the amplification leaves them alone.
-    // Applied AFTER the cascade blend so the band cannot amplify a half-faded value into a hard edge.
+    // Applied AFTER the cascade-to-cascade blend so the band cannot amplify a half-faded value into a
+    // hard edge — and BEFORE the cascade-to-map one, because this correction is a property of the
+    // MOMENT QUADRATURE and the map has no quadrature. Amplifying the map instead would put a step of
+    // exactly 1/(1-lbr) at the outer edge of the band, where the same fragment is answered by the map
+    // alone a texel later.
     float lbr = gShadowParams.sunParams.z;
     occlusion = saturate(occlusion / max(1.0f - lbr, 1.0e-4f));
+
+    if (t > 0.0f && toMap) { occlusion = lerp(occlusion, mapOcc, t); }
 
     return 1.0f - occlusion * strength;
 }

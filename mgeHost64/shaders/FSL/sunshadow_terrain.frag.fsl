@@ -1,0 +1,48 @@
+// mgeHost64 — SUN shadow moments map for host-owned TERRAIN (tasks/lighting.md, terrain sun shadows).
+//
+// Terrain RECEIVED sun shadows from the day the cascades landed (terrain.frag calls
+// sunShadowVisibility) but never CAST one: renderSunShadow bound exactly one geometry source, the DL
+// statics. So a mountain did not shadow the valley below it, a cliff did not shadow the ground at its
+// foot, and — because the volumetric march reads the same map — sun shafts lit up air that a ridge
+// should have blacked out. The landscape is the largest occluder in the world and it was the one
+// thing missing from the caster set.
+//
+// This is the terrain twin of sunshadow_statics.frag: same reverse-Z depth convention, same four
+// packed moments, no alpha test (terrain is opaque everywhere — there is no cutout to reproduce, so
+// the silhouette is the geometry's). Nothing else is needed: the caster's job is depth alone.
+//
+// VSOutput MUST stay byte-identical to terrain.vert's output as terrain.frag declares it — the same
+// fields in the same order with the same interpolation modifiers. A frag whose input does not match
+// its paired vert's output hangs the GPU (see [[project_forge_shared_frag_vsoutput]]). Clip is a
+// rasterizer system value and is deliberately absent here, exactly as in terrain.frag.
+
+#include "opaque.srt.h"      // gFrameData (terrain.vert projects by it)
+#include "msmpack.h.fsl"     // PackMoments()
+
+STRUCT(VSOutput)
+{
+    DATA(float4, Position, SV_Position);
+    DATA(float3, WorldPos, TEXCOORD0);
+    DATA(float3, Normal,   TEXCOORD1);
+    DATA(CENTROID(float),  Fog,   TEXCOORD2);
+    DATA(float2, Lattice,  TEXCOORD3);
+    DATA(FLAT(uint4), Cell, TEXCOORD4);   // slot, localX, localY, packed grid span
+};
+
+STRUCT(PsOut)
+{
+    DATA(float4, moments, SV_Target0);
+};
+
+ROOT_SIGNATURE(DefaultRootSignature)
+PsOut PS_MAIN( VSOutput In )
+{
+    INIT_MAIN;
+    // Depth GROWS away from the sun (the ortho is reverse-Z), matching msmrecv.h.fsl's receiver and
+    // sunshadow_statics.frag's caster. Caster and receiver must agree on this flip or the test
+    // inverts — a shadow map that lights exactly what it should darken.
+    float  d = 1.0f - In.Position.z;
+    PsOut Out;
+    Out.moments = PackMoments(float4(d, d*d, d*d*d, d*d*d*d));
+    RETURN(Out);
+}

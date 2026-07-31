@@ -83,11 +83,13 @@ float4 PS_MAIN(VSOutput In)
     float3 dir     = normalize(P);
     float  dist    = (deviceZ > 0.0f) ? min(length(P), maxDist) : maxDist;
 
-    // WATER-PLANE clamp. gSceneLinDepth is the OPAQUE PREPASS — water writes depth strictly after it,
-    // so a ray aimed at the sea finds either the seabed or (out past the shelf) NOTHING, and "nothing"
-    // reads as deviceZ 0, i.e. sky, i.e. the full maxDist march. Both cases keep integrating dense
-    // near-ground fog through solid water. That is the band above the horizon getting brighter: those
-    // are the flattest rays, so density never falls off along them, and they were also the longest.
+    // WATER-PLANE clamp. gSceneLinDepth is re-linearized at the colour->water seam, so it holds the
+    // full opaque scene INCLUDING terrain — but water itself writes depth strictly after that seam
+    // (deliberately: it must not clamp its own refraction source). A ray aimed at the sea therefore
+    // finds either the seabed or, out past the shelf, NOTHING — and "nothing" reads as deviceZ 0,
+    // i.e. sky, i.e. the full maxDist march. Both cases keep integrating dense near-ground fog
+    // through solid water. That is the band above the horizon getting brighter: those are the
+    // flattest rays, so density never falls off along them, and they were also the longest.
     // The surface is a plane, so no second depth resolve is needed — intersect it analytically.
     // (volFog4.w is cleared whenever the camera is UNDER the surface; the underwater look belongs to
     // water.frag's own tint, not to an air-fog model.)

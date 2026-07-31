@@ -174,6 +174,13 @@
 #include "terrain.frag.fsl"
 #end
 
+// SUN shadow moments for host-owned TERRAIN — the landscape as a CASTER. Pairs with terrain.vert
+// (whose VSOutput it mirrors byte for byte); no alpha test, terrain is opaque. Without it a mountain
+// shadows nothing, which is also why sun shafts lit valleys a ridge should have blacked out.
+#frag sunshadow_terrain.frag
+#include "sunshadow_terrain.frag.fsl"
+#end
+
 // Phase 1b: host-owned distant STATICS. Binding 0 = StaticElem vertex (20B); binding 1 = per-
 // INSTANCE world matrix + bindless texSlot. Drawn GPU-driven (mega VB/IB + instance stream +
 // cmdExecuteIndirect). Reuses opaque.srt.h / DefaultRootSignature + bindless gTextures.
@@ -289,6 +296,14 @@
 // world Z with BM_MAX blending (so the highest occluder wins with no depth attachment at all).
 #frag skyheight_statics.frag
 #include "skyheight_statics.frag.fsl"
+#end
+
+// SUN-OCCLUSION map, derived from the SAME height map: the sun-blocked world Z per texel, i.e. the
+// LONG-range sun shadow the 8192-unit cascades cannot reach. One tap answers "is this point lit",
+// at any altitude, which is what the volumetric march needs and what a horizon ANGLE could not give
+// it. Rebuilt only when the sun moves past a threshold or the height map itself rebuilds.
+#comp sunocc.comp
+#include "sunocc.comp.fsl"
 #end
 
 // ...and the map's DEBUG VIEW (F12 mode 14). Reuses shadowatlasview.vert (fullscreen tri); false-

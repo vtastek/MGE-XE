@@ -143,10 +143,11 @@ STRUCT(ShadowMaskParams)
     //          y = phase soft ceiling (Reinhard knee; the phase asymptotes to this),
     //          z = water-plane clamp: ABSOLUTE world Z of the water surface,
     //          w = 1 = water clamp ACTIVE this frame (water drawn and camera above it).
-    // The water clamp exists because gSceneLinDepth is the OPAQUE PREPASS: water writes depth after
-    // it, so over open sea the depth buffer holds the seabed — or nothing at all, which reads as sky.
-    // Either way the ray marches straight through the water surface and keeps accumulating
-    // near-ground-density fog, which is exactly the bright band above the horizon over water.
+    // The water clamp exists because water writes depth AFTER the seam gSceneLinDepth is taken at
+    // (it must not clamp its own refraction source), so over open sea that depth holds the seabed —
+    // or nothing at all, which reads as sky. Either way the ray marches straight through the water
+    // surface and keeps accumulating near-ground-density fog, which is exactly the bright band above
+    // the horizon over water.
     DATA(float4,   volFog4,     None);
     // ALLOCATION size of the screen-sized render targets — NOT the current render size.
     // These differ: the host allocates every size-dependent RT at the render-scale CEILING
@@ -194,4 +195,26 @@ STRUCT(ShadowMaskParams)
     //   z  = 1 / (world extent) — i.e. uv = (worldXY - origin) * z,
     //   w  = tap COUNT per direction (the cost knob; 0 is treated as 1).
     DATA(float4,   skyAOMap,  None);
+    // --- LONG-RANGE sun occlusion (gSunOcc / sunocc.comp.fsl, tasks/lighting.md) -----------------
+    // The cascades reach ONE MW cell and return fully lit outside it, so until this landed the whole
+    // distant world was unshadowed by construction — a ridge three cells away shadowed neither the
+    // ground nor the fog. gSunOcc holds the sun-BLOCKED world Z per texel; a point is lit iff its own
+    // z is at or above it, which is one sample and is correct in the air as well as on the ground.
+    //
+    // It shares gSkyHeight's window, so its ADDRESSING is skyAOMap.xy/.z above — deliberately not
+    // duplicated here, because two copies of one origin is exactly how a derived map ends up sampled
+    // through the wrong mapping for a frame. The host keeps the two in lockstep by rebuilding this
+    // one inside the height map's own rebuild.
+    // sunOcc: x = STRENGTH 0..1 (0 = off — the receiver's early-out, the A/B, and the "no map"
+    //             signal: night, interior, or not yet built),
+    //         y = SOFT transition height in WORLD units. The stored value is a hard boundary and the
+    //             map is coarse, so a binary test would draw a stair-stepped shadow line across the
+    //             landscape; the ramp runs from blockZ (lit) DOWNWARD, never upward, so the soft
+    //             band can only ever lighten and never invents shadow above the blocked height.
+    //         z = BIAS in world units, subtracted from blockZ before the compare. The map is
+    //             max(terrain, statics) sampled coarsely, so a point standing ON the surface that
+    //             generated its own texel would otherwise shadow itself — the height-map equivalent
+    //             of depth acne, and fixed the same way.
+    //         w = spare.
+    DATA(float4,   sunOcc,    None);
 };

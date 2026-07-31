@@ -187,6 +187,11 @@ BEGIN_SRT_NO_AB(SrtData)
         //   gWaterNormalVol = water_NRM.dds as a 3D animated-normal volume (rg = normal, a = height).
         //   gRefractColor   = host copy of the pre-water colour target (refraction source).
         //   gSceneLinDepth  = pLinearDepth (RAW reverse-Z DEVICE depth; near=1 far=0) for shoreline.
+        //                     Filled TWICE per frame: once after the Z-prepass (near opaque + TERRAIN
+        //                     — what GTAO and the point-light shadow mask read, both running before
+        //                     the colour pass) and again at the colour->water seam,
+        //                     which adds the DL statics that draw only in the colour pass. The second
+        //                     fill is the version water.frag and volfog.frag sample.
         //   gReflectColor   = reflection RT (WT1 = stand-in / unused; WT2 fills it with the mirror pass).
         DECL_TEXTURE(PerFrame, Tex3D(float4), gWaterNormalVol)
         DECL_TEXTURE(PerFrame, Tex2D(float4), gRefractColor)
@@ -294,6 +299,14 @@ BEGIN_SRT_NO_AB(SrtData)
         // its mOffset from ONE running per-set counter, so inserting a declaration anywhere above
         // silently re-points every bind after it. Append only.
         DECL_TEXTURE(PerFrame, Tex2D(float), gSkyHeight)
+        // LONG-RANGE sun occlusion (sunocc.comp.fsl): the sun-BLOCKED world Z per texel, derived
+        // from gSkyHeight over the SAME window. One sample says whether a point — on the ground or
+        // in the air — is in the shadow of anything up-sun of it, out to the whole 65536-unit map
+        // rather than the cascades' one cell. Read by msmrecv.h.fsl's two receivers (the colour pass
+        // past the last cascade, and the volumetric march everywhere). Its mapping rides
+        // gShadowParams.skyAOMap + sunOcc, so this texture carries no state of its own.
+        // Appended after gSkyHeight — append only, see the note above it.
+        DECL_TEXTURE(PerFrame, Tex2D(float), gSunOcc)
     END_SRT_SET(PerFrame)
     // Point-light cbuffer — rides the otherwise-unused PerDraw set (FSL has exactly four
     // fixed update frequencies: Persistent/PerFrame/PerBatch/PerDraw; a custom set name has
