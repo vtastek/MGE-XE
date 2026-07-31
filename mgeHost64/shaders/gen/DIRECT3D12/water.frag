@@ -1363,11 +1363,6 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
     float2 worldXY = In.WorldPos.xy + gFrameData.lodEye.xy;
 
 
-    if (underwater) {
-        float uw = saturate(exp(-dist / 4096.0f));
-        float3 col = lerp(fogCol, depthBaseColor, uw);
-        return (float4(col, 1.0f));
-    }
 
 
     float t = 0.4f * time;
@@ -1378,12 +1373,61 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
     float2 normal_R = 2.0f * lerp(close_n, far_n, saturate(dist / 8000.0f)) - 1.0f;
     float3 normal = normalize(float3(normal_R, 1.0f));
 
+    float2 baseUV = In.Position.xy * invAlloc;
+
+
+
+
+
+
+
+
+    if (underwater) {
+        float uwFog = saturate(exp(-dist / 4096.0f));
+        float3 nrm = -normal;
+
+
+        float2 reffactorU = 2.0f * (windFactor * dist + 0.1f) * nrm.xy;
+
+
+        float2 ruvU = baseUV + (-2.0f * reffactorU) * invAlloc;
+        float3 refractedU = SampleLvlTex2D(gRefractColor, gSamplerBilinearClamp, ruvU, 0.0f).rgb;
+        refractedU = lerp(fogCol, refractedU, exp(-dist / 500.0f));
+
+
+
+
+
+        float2 reflUVU = In.Position.xy * invScreen
+                       + float2(-2.1f * reffactorU.x, abs(reffactorU.y)) * invScreen;
+        float4 reflSampleU = SampleLvlTex2D(gReflectColor, gSamplerBilinearClamp, reflUVU, 0.0f);
+        float3 reflectedU = reflSampleU.rgb + fogCol * (1.0f - reflSampleU.a);
+
+        if (waterDbg == 1u) {
+            float4 rawReflU = SampleLvlTex2D(gReflectColor, gSamplerBilinearClamp,
+                                             In.Position.xy * invScreen, 0.0f);
+            return (float4(rawReflU.rgb, 1.0f));
+        }
+        if (waterDbg == 2u) { RETURN(float4(refractedU, 1.0f)); }
+
+
+
+        float fresnelU = pow(saturate(1.12f - 0.65f * dot(-EyeVec, nrm)), 8.0f);
+        float3 resultU = lerp(refractedU, reflectedU, fresnelU);
+
+
+        float3 sunPosU = -gFrameData.sunDir.xyz;
+        float refractsun = saturate(dot(-EyeVec, normalize(-sunPosU + nrm)));
+        resultU += gFrameData.sunCol.rgb * pow(refractsun, 6.0f) * uwFog;
+
+        return (float4(resultU, 1.0f));
+    }
+
 
     float3 depthColor = lerp(fogCol, depthBaseColor, fog);
 
 
     float2 reffactor = (windFactor * dist + 0.1f) * normal.xy;
-    float2 baseUV = In.Position.xy * invAlloc;
 
 
     float2 distUV = baseUV + reffactor.yx * invAlloc;
@@ -1430,7 +1474,16 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
 
 
 
-    if (waterDbg == 1u) { RETURN(float4(reflSample.rgb, 1.0f)); }
+
+
+
+
+
+    if (waterDbg == 1u) {
+        float4 rawRefl = SampleLvlTex2D(gReflectColor, gSamplerBilinearClamp,
+                                        In.Position.xy * invScreen, 0.0f);
+        return (float4(rawRefl.rgb, 1.0f));
+    }
     if (waterDbg == 2u) { RETURN(float4(refracted, 1.0f)); }
 
 

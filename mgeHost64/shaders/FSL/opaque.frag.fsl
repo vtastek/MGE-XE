@@ -53,9 +53,21 @@ float4 PS_MAIN( VSOutput In )
     // draws into a sub-viewport), so the uv scale is 1/ALLOC — screenAlloc.zw, NOT debugParams.yz,
     // which is 1/RENDER and would stretch the AO buffer by the scale ratio.
     uint   aoFlags  = (uint)(gFrameData.debugParams.w + 0.5f);
+    // IR3b REFLECTION TAG. This frag also runs in the water-reflection pass now, drawing into a
+    // 1024² mirror RT — and gAO, gShadowMask and the near froxel grid are all MAIN-VIEW screen-space
+    // buffers. Indexed by this pass's pixels they read a completely unrelated part of the screen, so
+    // every one of them is tagged off below. The tag is the same one distantland.vert/statics.vert
+    // use: gReflWaterClip is the below-water clip plane, which is (0,0,0,1) — z == 0 — in EVERY frame
+    // cbuffer except pReflectFrameCbvGeo, where z is ±1. It is a cbuffer value, so the branch is
+    // uniform across the draw and the untaken side costs nothing.
+    // World-space terms (sun MSM shadows, point-light attenuation/Lambert) are NOT tagged: reflected
+    // geometry keeps its true world position — the VIEW is mirrored, not the geometry — so they are
+    // correct as-is. Only screen-space lookups are wrong.
+    bool   inReflect = (gFrameData.gReflWaterClip.z != 0.0f);
     float2 aoUv     = In.Position.xy * gShadowParams.screenAlloc.zw;
-    float4 aoSample = SampleTex2D(gAO, gSamplerAnisotropic, aoUv);
-    if ((aoFlags & 2u) != 0u) { N = normalize(aoSample.rgb); }   // "Bent normal enable" tick: bend the lighting normal
+    float4 aoSample = inReflect ? float4(0.0f, 0.0f, 0.0f, 1.0f)   // AO = 1 (no darkening), bent-N unused
+                                : SampleTex2D(gAO, gSamplerAnisotropic, aoUv);
+    if ((aoFlags & 2u) != 0u && !inReflect) { N = normalize(aoSample.rgb); }   // "Bent normal enable" tick: bend the lighting normal
 
     // MW lighting: sun diffuse (to-sun = -sunDir) + scene ambient. FFE convention.
     float  ndl = saturate(dot(N, -gFrameData.sunDir.xyz));
@@ -96,7 +108,10 @@ float4 PS_MAIN( VSOutput In )
         // byte-identical, just far fewer iterations. Slice metric = length(In.WorldPos), matching
         // froxelassign.comp (near lights are camera-relative, same space as In.WorldPos).
         int   nfTilesX = (int)gLights.froxelDimsNear.x;
-        bool  clustered = (nfTilesX > 0);
+        // ...but never in the reflection: the froxel tile is picked from In.Position.xy, which in the
+        // mirror pass indexes the MAIN view's grid at an unrelated screen location. Brute-loop there
+        // (same result, more iterations) rather than read another pixel's light set.
+        bool  clustered = (nfTilesX > 0) && !inReflect;
         uint  fbase = 0u;
         if (clustered)
         {
@@ -151,7 +166,11 @@ float4 PS_MAIN( VSOutput In )
                 // shadow). shadowmask.comp already did the cube-face atlas test for this pixel —
                 // the slot's 4-bit visibility just scales the light (15 = lit, 0 = shadowed).
                 uint slotP1 = (uint)gLights.lights[i * 3u + 2u].w;
-                if (slotP1 != 0u)
+                // ...and never in the reflection: gShadowMask is main-view screen-space (see the
+                // reflection tag above). Reflected near geometry is therefore UNSHADOWED by point
+                // lights — a deliberate IR3 limitation. Doing it properly means a mirror-view mask,
+                // which is a pass, not a branch.
+                if (slotP1 != 0u && !inReflect)
                 {
                     // First-person arms (alphaShadowParams.y set): sample the cube atlas DIRECTLY
                     // from the true world pos + geometric vertex normal — the screen gShadowMask

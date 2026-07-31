@@ -84,14 +84,9 @@ float4 PS_MAIN( VSOutput In )
     // the real absolute eye). Without this the normals swim with the camera.
     float2 worldXY = In.WorldPos.xy + gFrameData.lodEye.xy;
 
-    // --- underwater: simple tinted, distance-faded fog (UnderwaterPS core) ---
-    if (underwater) {
-        float uw = saturate(exp(-dist / 4096.0f));
-        float3 col = lerp(fogCol, depthBaseColor, uw);
-        RETURN(float4(col, 1.0f));
-    }
-
     // --- animated water normal (getFinalWaterNormal, #else no-flow branch) ---
+    // Computed BEFORE the underwater branch: both surfaces are the same wave field, the underside
+    // just uses its negation.
     float t = 0.4f * time;
     float2 tc1 = worldXY / 3900.0f;   // far  scale
     float2 tc2 = worldXY / 527.0f;    // close scale
@@ -100,12 +95,61 @@ float4 PS_MAIN( VSOutput In )
     float2 normal_R = 2.0f * lerp(close_n, far_n, saturate(dist / 8000.0f)) - 1.0f;
     float3 normal = normalize(float3(normal_R, 1.0f));
 
+    float2 baseUV = In.Position.xy * invAlloc;           // this fragment, in TEXTURE space
+
+    // --- underwater: the real UnderwaterPS (XE Mod Water.fx:594) ---------------------------------
+    // What was here before was a flat tint that returned before refraction, reflection and Fresnel
+    // ever ran, so the underside of the surface was a solid colour. The real shader is a surface:
+    // the normal is INVERTED (we are looking at the underside), refraction is the above-water world
+    // seen through it, and the Fresnel term is a TOTAL-INTERNAL-REFLECTION curve — which is what
+    // makes the surface act as a mirror at grazing angles and go transparent looking straight up.
+    // Fog stays the FORGE FRAME's (fogColNear), not MGE's atmospheric scatter, per the WT1 decision.
+    if (underwater) {
+        float  uwFog = saturate(exp(-dist / 4096.0f));   // special-case fog, no fog offset
+        float3 nrm   = -normal;
+
+        // Distortion factor: 2x the above-water one (MGE's underwater constant).
+        float2 reffactorU = 2.0f * (windFactor * dist + 0.1f) * nrm.xy;
+
+        // Refraction — alloc-sized RT, so pixel offsets scale by invAlloc (see the block above).
+        float2 ruvU = baseUV + (-2.0f * reffactorU) * invAlloc;
+        float3 refractedU = SampleLvlTex2D(gRefractColor, gSamplerBilinearClamp, ruvU, 0.0f).rgb;
+        refractedU = lerp(fogCol, refractedU, exp(-dist / 500.0f));
+
+        // Reflection — pReflectColor is its OWN 1024² full-viewport RT, so this one is
+        // VIEWPORT-relative (invScreen), NOT invAlloc. Same premultiplied-over-fog resolve as the
+        // above-water path. Underwater the reflect pass draws no sky (host-side), so what lands here
+        // is the mirrored seabed/world below the surface — exactly the TIR content.
+        float2 reflUVU = In.Position.xy * invScreen
+                       + float2(-2.1f * reffactorU.x, abs(reffactorU.y)) * invScreen;
+        float4 reflSampleU = SampleLvlTex2D(gReflectColor, gSamplerBilinearClamp, reflUVU, 0.0f);
+        float3 reflectedU  = reflSampleU.rgb + fogCol * (1.0f - reflSampleU.a);
+
+        if (waterDbg == 1u) {   // undistorted, as above
+            float4 rawReflU = SampleLvlTex2D(gReflectColor, gSamplerBilinearClamp,
+                                             In.Position.xy * invScreen, 0.0f);
+            RETURN(float4(rawReflU.rgb, 1.0f));
+        }
+        if (waterDbg == 2u) { RETURN(float4(refractedU, 1.0f)); }
+
+        // Total internal reflection. Unlike the above-water Fresnel this saturates HARD as the view
+        // flattens out: below the critical angle the surface stops transmitting entirely.
+        float  fresnelU = pow(saturate(1.12f - 0.65f * dot(-EyeVec, nrm)), 8.0f);
+        float3 resultU  = lerp(refractedU, reflectedU, fresnelU);
+
+        // Sun refraction — the bright disc smeared through the surface from below.
+        float3 sunPosU    = -gFrameData.sunDir.xyz;   // gFrameData.sunDir = travel dir; to-sun = -dir
+        float  refractsun = saturate(dot(-EyeVec, normalize(-sunPosU + nrm)));
+        resultU += gFrameData.sunCol.rgb * pow(refractsun, 6.0f) * uwFog;
+
+        RETURN(float4(resultU, 1.0f));
+    }
+
     // --- fogged deep-water base colour ---
     float3 depthColor = lerp(fogCol, depthBaseColor, fog);
 
     // Reflection/refraction pixel distortion (wind strength increases it).
     float2 reffactor = (windFactor * dist + 0.1f) * normal.xy;
-    float2 baseUV = In.Position.xy * invAlloc;           // this fragment, in TEXTURE space
 
     // --- refraction (depth-gated, distorted) ---
     float2 distUV   = baseUV + reffactor.yx * invAlloc;
@@ -148,11 +192,20 @@ float4 PS_MAIN( VSOutput In )
 	float3 deb = reflected;
     reflected = lerp(reflected * 0.96f, reflected, fog);
 	
-    // Dev-panel water debug views (g_waterDebugMode → P[3].x). Output an isolated term so the
-    // reflection / refraction RT contents are directly visible. Mode 1 shows the RAW reflection
-    // sample (rgb·a premultiplied): a black surface = the reflection RT is empty; coverage shows the
-    // mirrored scene. Mode 2 shows the refraction term. 0 = normal water (no branch taken).
-    if (waterDbg == 1u) { RETURN(float4(reflSample.rgb, 1.0f)); }
+    // Dev-panel water debug views (P[3].x). Output an isolated term so the reflection / refraction RT
+    // contents are directly visible. Mode 1 shows the RAW reflection sample (rgb·a premultiplied): a
+    // black surface = the reflection RT is empty; coverage shows the mirrored scene. Mode 2 shows the
+    // refraction term. 0 = normal water (no branch taken).
+    // Mode 1 is UNDISTORTED on purpose — it samples at the plain viewport uv, not the wave-perturbed
+    // one the lit path uses. A debug view of an RT should show the RT: the distortion is a few pixels,
+    // which is the same order as the alignment offsets this view gets used to measure, so carrying it
+    // made the view useless for exactly the question it is opened for (where does the reflected
+    // waterline sit) while looking identical for the question it is fine for (is anything in there).
+    if (waterDbg == 1u) {
+        float4 rawRefl = SampleLvlTex2D(gReflectColor, gSamplerBilinearClamp,
+                                        In.Position.xy * invScreen, 0.0f);
+        RETURN(float4(rawRefl.rgb, 1.0f));
+    }
     if (waterDbg == 2u) { RETURN(float4(refracted, 1.0f)); }
 
     // --- Fresnel ---

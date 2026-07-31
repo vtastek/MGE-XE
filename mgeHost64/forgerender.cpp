@@ -1734,6 +1734,26 @@ namespace {
     constexpr uint32_t kWaterLevels    = 6;
     // WT2 reflection RT side (matches MGE texReflection's 1024² budget; sampled with normalized UV).
     constexpr uint32_t kReflectSize = 1024;
+    // WATER MESH SNAP — a CAMERA-AVOIDANCE hack, NOT where the water conceptually is. The mesh is
+    // pushed 5 units down above water / 5 up below it, so the surface never intersects the camera at
+    // the IsUnderwater threshold (MGE's s_waterMeshSnapAbove/-Underwater, renderwater.cpp:44). The
+    // visible waterline does not move with it: the frag's depth-driven shoreline fade, not the
+    // mesh/terrain intersection, is what the eye reads as the water's edge.
+    //
+    // DO NOT slave the reflection to this. Tried 2026-07-31, reverted the same session — it made the
+    // shoreline mismatch WORSE, and the prior art says why: scene-walk-v2 carries this exact snap AND
+    // mirrors about `WaterLevel - 1`, which its own comment calls "the TRUE water level"
+    // (renderwater.cpp:160-167 on that branch). The reflect plane tracks MW's water level; the mesh
+    // offset is a rendering dodge that the shading already compensates for.
+    constexpr float kWaterMeshSnap = 5.0f;
+    inline float waterMeshZ(float waterLevelAbs, bool underwater) {
+        return waterLevelAbs + (underwater ? kWaterMeshSnap : -kWaterMeshSnap);
+    }
+    // The TRUE water level — the plane the reflection CLIPS against. MGE, scene-walk and
+    // scene-walk-v2 all use WaterLevel - 1 and all three matched.
+    inline float waterTrueLevel(float waterLevelAbs) { return waterLevelAbs - 1.0f; }
+    // ...and the plane it MIRRORS about, which is a separate, TUNED question (g_reflWaterLevelOffset).
+    inline float waterMirrorZ(float waterLevelAbs);
     constexpr float    kWaterCell0     = 128.0f;
     constexpr int      kWaterGrid      = 64;     // cells per side per level (even)
     // One per-level draw record: which IB sub-range each of the 4 trim variants occupies.
@@ -5191,7 +5211,7 @@ namespace {
             if (!g_live.pPerFrameSetReflectGeo) { return false; }
             {
                 Texture* vol = g_live.pWaterNormalVol ? g_live.pWaterNormalVol : g_live.pDefaultWhite;
-                DescriptorData p[11] = {};
+                DescriptorData p[13] = {};
                 p[0].mIndex = SRT_RES_IDX(SrtData, PerFrame, gFrameData);
                 p[0].ppBuffers = &g_live.pReflectFrameCbvGeo;
                 p[1].mIndex = SRT_RES_IDX(SrtData, PerFrame, gAO);
@@ -5232,6 +5252,21 @@ namespace {
                 if (g_live.pSunMomentsDepth) {
                     p[rn].mIndex = SRT_RES_IDX(SrtData, PerFrame, gSunDepth);
                     p[rn].mCount = 1; p[rn].ppTextures = &g_live.pSunMomentsDepth->pTexture;
+                    ++rn;
+                }
+                // IR3: the mirror now also redraws the NEAR scene with opaque.frag, which REFERENCES
+                // gShadowMask and gFroxelMaskNear. Both are MAIN-VIEW screen-space, so the frag tags
+                // them off in the reflection (gReflWaterClip.z != 0) and never reads them here — but
+                // the descriptors must still be type-valid, so bind them like every other filler in
+                // this set rather than leaving two holes in the table.
+                if (g_live.pShadowMask) {
+                    p[rn].mIndex = SRT_RES_IDX(SrtData, PerFrame, gShadowMask);
+                    p[rn].mCount = 1; p[rn].ppTextures = &g_live.pShadowMask;
+                    ++rn;
+                }
+                if (g_live.pFroxelMaskNear) {
+                    p[rn].mIndex = SRT_RES_IDX(SrtData, PerFrame, gFroxelMaskNear);
+                    p[rn].mCount = 1; p[rn].ppBuffers = &g_live.pFroxelMaskNear;
                     ++rn;
                 }
                 updateDescriptorSet(R, 0, g_live.pPerFrameSetReflectGeo, rn, p);
@@ -6466,9 +6501,65 @@ namespace {
     bool g_fpReceiveShadows = true;
     bool g_drawReflect   = true;
     bool g_drawReflectGeo = true;   // WV2: reflect host-owned land + statics (off = sky-only reflection)
+    bool g_drawReflectNear = true;  // IR3: reflect the NEAR scene (opaque + skinned) — the only content
+                                    // an interior has, and near-shore detail outdoors
     bool g_reflHorizonScissor = true; // WV2 perf: scissor the reflect pass to below the water-plane horizon
+    // IR4: where the reflection clip sits relative to the true water level. NEGATIVE = cut HIGHER
+    // (drop more near-water geometry) — the direction this renderer actually wants; see the plane
+    // build in dlReflectGeoCull. scene-walk-v2's s_reflWaterClipBias defaulted to +3 in the opposite
+    // sense; that default does not transfer, the mechanism does.
+    // TUNED 2026-07-31 against MW's own splash effects, then explained. It is almost entirely a
+    // CORRECTION FOR TWO LEGACY OFFSETS the clip carries before this knob applies (dlReflectGeoCull):
+    //     -(WaterLevel - 1)              -1   MGE legacy: its mesh sat there, before the ±5 snap
+    //     += 0.5 * WaterWaveHeight      +25   DYNAMIC_RIPPLES, with Water Wave Height = 50
+    // At bias 0 the clip lands at W-26, i.e. it KEEPS 26 units of SUBMERGED geometry — which the
+    // mirror flips UPWARD into the reflection. That is the whole artifact: the mirrored seabed rising
+    // into view showing its underside ("terrain's insides") and the submerged half of an NPC standing
+    // in water appearing above the waterline.
+    //   -1 + 25 - 21.5  ->  clip at W - 4.5, one slider step from the mirror plane at W - 4.75.
+    // Both land on the water MESH plane (W-5): mirror about the surface, clip at the surface.
+    //
+    // The ripple slack is wrong for THIS renderer specifically: MGE's mesh had real Gerstner wave
+    // displacement and could dip 0.5*waveHeight below its plane, so its clip had to follow. The host's
+    // water.vert.fsl has Height = 0 (WT1 deferred crests) — it compensates for a dip that cannot
+    // happen. Drop both legacy terms and this knob returns to 0; see the note in tasks/forge-water.md.
+    float g_reflWaterClipBias = -21.5f;
+    // IR4: the plane the reflection MIRRORS about, as an offset from MW's WaterLevel. -1 reproduces
+    // MGE / scene-walk / scene-walk-v2. A SLIDER, not a constant, because Morrowind does not agree
+    // with itself about where its water is — see waterHeightReadout():
+    //   mesh          = WaterLevel ∓ 5   (camera-avoidance snap)
+    //   IsUnderwater  < WaterLevel − 1   (client-side, mwbridge.cpp:515)
+    //   MW's splashes render as though it were HIGHER than any of those
+    // No single value satisfies all three, and a reflection is an illusion regardless: the number
+    // that LOOKS right against the splashes is the correct one, so it is tuned, not derived.
+    //
+    // REDUNDANT with the clip bias at 2:1 — moving this plane by d moves the reflected image by 2d,
+    // which the clip absorbs. Measured on this build: (mirror −1, bias −29) and (mirror −5, bias −21)
+    // put the reflected-image floor at the identical height. Tune ONE at a time or you learn nothing.
+    // TUNED 2026-07-31 to -4.75 — the water MESH plane (W-5) to within one slider step, which is where
+    // the reflecting surface actually is. Paired with the clip bias below, the reflected image floor
+    // lands at exactly W-5; three independent by-eye tunings ((-1,-29), (-5,-21), (-4.75,-21.5)) all
+    // produce that same floor, which is what says this is the real plane and not a preference.
+    // MW's splashes still read ~2-3 units high: they are placed off WaterLevel (W) while the surface
+    // is drawn at W-5, and that gap is the camera-avoidance snap, not a reflection error.
+    float g_reflWaterLevelOffset = -4.75f;
+    // IR4 diagnostic, ORTHOGONAL to the plane/bias pair (those two are redundant — 2:1 — so neither
+    // can implicate the other). The mirror flips triangle handedness, so reflRecordNear picks the
+    // OPPOSITE winding PSO per draw. If that call is backwards, every reflected near surface shows
+    // its backface: single-sided geometry vanishes and you see into the shell — which is exactly the
+    // reported "terrain's insides", and would be masked by throwing away near-water geometry.
+    bool g_reflNearSwapWinding = true;
+    inline float waterMirrorZ(float waterLevelAbs) {
+        return waterLevelAbs + g_reflWaterLevelOffset;
+    }
     bool g_reflGeoReady = false;    // WV2 perf: reflect-geo CPU cull ran pre-beginCmd this frame (rings
                                     // valid) → the reflect pass records the draws; else skips (no stale draw)
+    bool g_reflFrameReady = false;  // IR3: the MIRROR frame cbuffer (pReflectFrameCbvGeo — mirror viewProj
+                                    // + below-water clip) was written this frame. Split out of
+                                    // g_reflGeoReady because an INTERIOR has no DL to cull but still needs
+                                    // that matrix to reflect its near scene.
+    uint32_t g_lastReflNearDrawn = 0;   // heartbeat: reflected near opaque draws (indirect + inline)
+    uint32_t g_lastReflSkinDrawn = 0;   // heartbeat: reflected skinned draws
     uint32_t  g_debugMode = 0;         // F12 debug view: 0=normal, 1=depth, 2=scatter (written to FrameData.debugParams.x)
 
     // ---- Dev overlay (Forge IUI) state ----
@@ -6492,6 +6583,15 @@ namespace {
     unsigned char g_terrainCovBuf[192] = {};
     bstring       g_terrainCovText = bfromarr(g_terrainCovBuf);
     float4        g_terrainCovColor = { 0.70f, 1.0f, 0.70f, 1.0f };
+    // IR4 water-height readout, on the Reflection tab. Morrowind carries THREE different ideas of
+    // where the water is and they do not agree; the reflection has to pick one, so put all of them on
+    // screen next to the sliders instead of leaving it to be re-derived from the source every time.
+    // The underwater FLAG is the client's IsUnderwater (WaterLevel-1 threshold, mwbridge.cpp:515) —
+    // the host cannot move it, so a mirror plane tuned far from it will disagree about which side of
+    // the surface the camera is on right at the transition. That is worth SEEING, not discovering.
+    unsigned char g_waterHeightBuf[256] = {};
+    bstring       g_waterHeightText = bfromarr(g_waterHeightBuf);
+    float4        g_waterHeightColor = { 0.70f, 0.85f, 1.0f, 1.0f };
     // Frame-ahead observability: client-forwarded last-frame timings (setClientStats, per
     // kickoff) + the server-measured host idle gap between RenderFrames. Stats panel only.
     unsigned      g_clientFrameAhead = 0;
@@ -7118,7 +7218,12 @@ namespace {
           t.checkbox("Draw: water", &g_drawWater);
           t.checkbox("Draw: reflection", &g_drawReflect);
           t.checkbox("Draw: reflect land+statics", &g_drawReflectGeo);
+          t.checkbox("Draw: reflect near scene (interiors + shoreline)", &g_drawReflectNear);
           t.checkbox("Reflect: horizon scissor", &g_reflHorizonScissor);
+          t.sliderF("Reflect: water level offset (mirror plane, from MW WaterLevel)", &g_reflWaterLevelOffset, -32.0f, 32.0f, 0.25f);
+          t.sliderF("Reflect: water clip bias (-) cuts higher / (+) keeps submerged", &g_reflWaterClipBias, -50.0f, 16.0f, 0.5f);
+          t.checkbox("Reflect: near scene swaps winding (off = backfaces)", &g_reflNearSwapWinding);
+          t.dynamicText("", &g_waterHeightText, &g_waterHeightColor);
           t.flush(); }
 
         // -- Tab: Alpha (sorted-alpha takeover debug) --
@@ -7161,7 +7266,7 @@ namespace {
         { TabBuilder t; t.panel = g_uiPanel; t.name = "Sky & Water";
           t.sliderF("Sky tint (Forge tell)", &g_skyDebugTint, 0.0f, 1.0f, 0.02f);
           t.checkbox("Sky tint pulse", &g_skyTintPulse);
-          t.checkbox("Water: reflection only", &g_waterReflOnly);
+          t.checkbox("Water: reflection only (raw RT, undistorted)", &g_waterReflOnly);
           t.checkbox("Water: refraction only", &g_waterRefrOnly);
           t.flush(); }
 
@@ -7804,6 +7909,23 @@ namespace ForgeRender {
     void dlLiveCullAndBuild(Renderer* R, const float* rzViewProj);
     void dlReflectCullAndBuild(Renderer* R, const float* mirrorViewProj);   // WV2 reflect-geo cull
     void dlReflectRecordGeo();                                              // WV2 reflect-geo record
+    // IR3: the NEAR-scene draw state the reflection replays into the mirror. Nothing here is built
+    // for the reflection — the indirect args + per-batch instance windows come from renderScene's
+    // classify block and the bone palettes from the Z-prepass, both of which have already run by the
+    // time the reflect pass records. The mirror therefore costs a second traversal of the SAME
+    // buffers and no extra CPU fill. Pointers into renderScene's per-frame locals: valid only inside
+    // that frame's record phase.
+    struct ReflNearInput {
+        const uint32_t* groupCount;    // flattened [2 mirror][2 alphaTest][kMaxBatches]
+        const uint32_t* groupOff;      // ...same shape: index (mir*2 + at)*kMaxBatches + b
+        const uint32_t* dynamic;       // draw indices of the dynamic-morph (own VB/IB) parts
+        uint32_t        dynamicCount;
+        const IPC::DrawItemWire* items;
+        const void*     skinnedBlob;
+        uint32_t        skinnedCount;
+        uint32_t        skinnedBytes;
+    };
+    void reflRecordNear(const ReflNearInput& in);                           // IR3 reflected near scene
     void heroWriteUvOffsets(float* fd, double simT);                        // Phase 3 hero UV anim (defined w/ hero globals)
     // WV2: reflect-geo CPU CULL (build mirror-about-water matrix + clip plane, write pReflectFrameCbvGeo,
     // cull into the reflection rings). Runs PRE-beginCmd (hoisted off the record phase, like the main
@@ -9457,12 +9579,32 @@ namespace ForgeRender {
             const float* fcbvR = (const float*)g_live.pFrameCbv->pCpuMappedAddress;
             const float  eyeAbsZ = fcbvR[58];                       // lodEye.z (absolute camera)
             const float  waterLevelAbs = waterParams ? waterParams[0] : 0.0f;
-            const float  dRel = (waterLevelAbs - 1.0f) - eyeAbsZ;
             const bool   underwater = waterParams && waterParams[7] > 0.5f;
+            const float  dRel = waterMirrorZ(waterLevelAbs) - eyeAbsZ;
+            // Panel readout: every height Morrowind believes in, side by side, plus the two the
+            // reflection derives. eye-W is the number that decides IsUnderwater client-side; when it
+            // is near -1 the flag is about to flip, and a mirror plane far from -1 will disagree with
+            // it about which side of the surface the camera is on.
+            if (waterParams) {
+                bformat(&g_waterHeightText,
+                        "W=%.1f  mesh=%+.1f  uwTrip=-1.0  mirror=%+.1f  clip=%+.1f  |  eye-W=%+.1f  %s",
+                        waterLevelAbs,
+                        waterMeshZ(waterLevelAbs, underwater) - waterLevelAbs,
+                        g_reflWaterLevelOffset,
+                        (waterTrueLevel(waterLevelAbs) - g_reflWaterClipBias) - waterLevelAbs,
+                        eyeAbsZ - waterLevelAbs,
+                        underwater ? "UNDERWATER" : "above");
+                // Amber when the mirror plane has been tuned well away from the underwater trip: the
+                // two are then describing different surfaces, and the transition will pop.
+                g_waterHeightColor = (std::fabs(g_reflWaterLevelOffset + 1.0f) > 8.0f)
+                                   ? float4(1.0f, 0.85f, 0.45f, 1.0f)
+                                   : float4(0.70f, 0.85f, 1.0f, 1.0f);
+            }
             if (g_drawReflect && g_live.reflectReady && waterEnabled && waterParams) {
                 dlReflectGeoCull(R, viewProj, fcbvR, dRel, eyeAbsZ, waterLevelAbs, underwater);
             } else {
                 g_reflGeoReady = false;
+                g_reflFrameReady = false;
             }
         }
         const double tCull1 = hostNowMs();   // end of the DL cull (+ lazy resource/texture load)
@@ -10579,15 +10721,24 @@ namespace ForgeRender {
         {
             static uint32_t s_reflGateLog = 0;
             if ((s_reflGateLog++ % 120) == 0) {
-                LOG::logline(">> [forge][reflect] GATE ready=%d waterEn=%u params=%d skyBlob=%d skyCount=%u skyBytes=%u",
+                LOG::logline(">> [forge][reflect] GATE ready=%d waterEn=%u params=%d skyBlob=%d skyCount=%u skyBytes=%u uw=%d geoReady=%d frameReady=%d",
                              (int)g_live.reflectReady, waterEnabled, (int)(waterParams != nullptr),
-                             (int)(skyBlob != nullptr), skyCount, skyBytes);
+                             (int)(skyBlob != nullptr), skyCount, skyBytes,
+                             (int)(waterParams && waterParams[7] > 0.5f),
+                             (int)g_reflGeoReady, (int)g_reflFrameReady);
                 LOG::flush();
             }
         }
         g_lastReflSkyDrawn = 0;   // Phase 0 panel: 0 unless the reflection pass runs below
-        const bool reflectOn = g_drawReflect && g_live.reflectReady && waterEnabled
-            && waterParams && skyBlob && skyCount && skyBytes;
+        g_lastReflNearDrawn = 0;
+        g_lastReflSkinDrawn = 0;
+        // IR1: the pass no longer requires a SKY LIST. It used to, and that made INTERIORS worse than
+        // useless rather than merely empty: an interior walks no sky root, so skyCount == 0, so the
+        // pass never ran — and pReflectColor is cleared at BIND, *inside* the pass, then left resting
+        // in SHADER_RESOURCE. Interior water therefore went on sampling the last EXTERIOR frame's sky
+        // and landscape indefinitely. Running whenever water is on clears the RT every frame, so the
+        // floor is an honest empty (fog-coloured) reflection instead of a frozen outdoor one.
+        const bool reflectOn = g_drawReflect && g_live.reflectReady && waterEnabled && waterParams;
         // Gated-off frames still write the ReflGeo pair (adjacent = ~0) — an index the
         // frame never begins/ends reads back stale garbage at resolve.
         if (!reflectOn) {
@@ -10598,7 +10749,8 @@ namespace ForgeRender {
             const float* fcbvR = (const float*)g_live.pFrameCbv->pCpuMappedAddress;
             const float eyeAbsZ = fcbvR[58];                       // lodEye.z (absolute camera)
             const float waterLevelAbs = waterParams[0];
-            const float dRel = (waterLevelAbs - 1.0f) - eyeAbsZ;   // water plane, camera-relative (logged)
+            const bool  underwaterR = waterParams[7] > 0.5f;
+            const float dRel = waterMirrorZ(waterLevelAbs) - eyeAbsZ;   // camera-relative (logged)
 
             // STAGE 1 (sky): mirror about the CAMERA's horizontal plane (z = 0 camera-relative), NOT
             // the water plane. The sky is an infinite, camera-attached dome; reflecting a FINITE dome
@@ -10686,68 +10838,79 @@ namespace ForgeRender {
             // Sky draw (mirror): fill the reflect sky buffers + replay the shapes. Cull NONE in the
             // sky PSO makes the mirror's winding flip irrelevant. Same per-shape data as the main sky
             // pass (only the bound frame cbuffer differs).
-            const uint32_t haveSkyR = skyBytes / (uint32_t)sizeof(IPC::SkyDrawWire);
-            uint32_t nSkyR = (skyCount < haveSkyR) ? skyCount : haveSkyR;
-            if (nSkyR > kMaxSkyDraws) { nSkyR = kMaxSkyDraws; }
-            const IPC::SkyDrawWire* skyItemsR = (const IPC::SkyDrawWire*)skyBlob;
-            cmdBindPipeline(g_live.pCmd, g_live.pSkyPipeline);
-            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSetReflect);   // MIRROR matrix
-            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerLightsSet);
-            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
-            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerBatchSetReflectSky);
-            Pipeline* curReflSky = g_live.pSkyPipeline;
-            uint32_t reflSkyDrawn = 0;
-            for (uint32_t k = 0; k < nSkyR; ++k) {
-                const IPC::SkyDrawWire& it = skyItemsR[k];
-                const uint32_t slot = it.slot;
-                if (slot >= g_meshHigh || !g_meshes[slot].valid) continue;
-                HostMesh& m = g_meshes[slot];
-                if (m.skinned || m.multimap) continue;
-                const uint32_t idx = reflSkyDrawn;
-                Pipeline* want = g_live.pSkyPipeline;
-                if (it.srcBlend == kD3DBLEND_SRCALPHA && it.destBlend == kD3DBLEND_ONE) {
-                    want = g_live.pSkyPipelineAdd;
-                }
-                if (want != curReflSky) { cmdBindPipeline(g_live.pCmd, want); curReflSky = want; }
+            //
+            // NOT underwater. The underside of the surface reflects the SEABED, never the sky — MGE
+            // refuses the same draw (renderwater.cpp's REFLECT_SKY test carries
+            // `&& !mwBridge->IsUnderwater(eyePos.z)`). The geo clip plane already flips underwater
+            // (dlReflectGeoCull: nz = -nz, dw = -dw) so the half-space it keeps IS the seabed, i.e.
+            // exactly the total-internal-reflection content; only the sky was wrong. Interiors have
+            // no sky list and skip this on their own.
+            uint32_t nSkyR = 0, reflSkyDrawn = 0;
+            const bool drawReflSky = skyBlob && skyCount && skyBytes && !underwaterR
+                                  && g_live.pSkyPipeline && g_live.pReflectSkyWorldsBuf;
+            if (drawReflSky) {
+                const uint32_t haveSkyR = skyBytes / (uint32_t)sizeof(IPC::SkyDrawWire);
+                nSkyR = (skyCount < haveSkyR) ? skyCount : haveSkyR;
+                if (nSkyR > kMaxSkyDraws) { nSkyR = kMaxSkyDraws; }
+                const IPC::SkyDrawWire* skyItemsR = (const IPC::SkyDrawWire*)skyBlob;
+                cmdBindPipeline(g_live.pCmd, g_live.pSkyPipeline);
+                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSetReflect);   // MIRROR matrix
+                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerLightsSet);
+                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
+                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerBatchSetReflectSky);
+                Pipeline* curReflSky = g_live.pSkyPipeline;
+                for (uint32_t k = 0; k < nSkyR; ++k) {
+                    const IPC::SkyDrawWire& it = skyItemsR[k];
+                    const uint32_t slot = it.slot;
+                    if (slot >= g_meshHigh || !g_meshes[slot].valid) continue;
+                    HostMesh& m = g_meshes[slot];
+                    if (m.skinned || m.multimap) continue;
+                    const uint32_t idx = reflSkyDrawn;
+                    Pipeline* want = g_live.pSkyPipeline;
+                    if (it.srcBlend == kD3DBLEND_SRCALPHA && it.destBlend == kD3DBLEND_ONE) {
+                        want = g_live.pSkyPipelineAdd;
+                    }
+                    if (want != curReflSky) { cmdBindPipeline(g_live.pCmd, want); curReflSky = want; }
 
-                uint8_t* dst = (uint8_t*)g_live.pReflectSkyWorldsBuf->pCpuMappedAddress;
-                std::memcpy(dst + (size_t)idx * 64, it.world, 64);
-                // WT2 sun-disc fix: the client faces the sun to the MAIN camera, so after the mirror
-                // (M = flip world-z) it faces the REFLECTED camera while we view from the main camera
-                // → foreshortened/squashed. Pre-flip the z-component of its 3 basis rows here; M then
-                // un-flips the rotation (→ faces the view = round) but still mirrors the translation
-                // (→ correct reflected position). Only the flagged sun shape (moons look fine as-is).
-                if (it.isSunDisc) {
-                    float* w = (float*)(dst + (size_t)idx * 64);
-                    w[2]  = -w[2];    // +X basis z
-                    w[6]  = -w[6];    // +Y basis z
-                    w[10] = -w[10];   // +Z basis z
-                }
-                uint32_t* inst = (uint32_t*)g_live.pReflectSkyInstanceBuf->pCpuMappedAddress;
-                inst[idx * kStaticInstU32 + 0] = idx;
-                inst[idx * kStaticInstU32 + 1] = packTexAlpha(it.texIndex, it.alphaRef, it.vColSource);
-                float* finst = (float*)inst;
-                finst[idx * kStaticInstU32 + 2] = it.matColor[0];
-                finst[idx * kStaticInstU32 + 3] = it.matColor[1];
-                finst[idx * kStaticInstU32 + 4] = it.matColor[2];
-                // SK3 cloud scroll (mirror): same matAmbient-lane transport as the main sky pass.
-                finst[idx * kStaticInstU32 + 5] = it.uvOffset[0];
-                finst[idx * kStaticInstU32 + 6] = it.uvOffset[1];
-                finst[idx * kStaticInstU32 + 7] = 0.0f;
-                finst[idx * kStaticInstU32 + 11] = it.matAlpha;
+                    uint8_t* dst = (uint8_t*)g_live.pReflectSkyWorldsBuf->pCpuMappedAddress;
+                    std::memcpy(dst + (size_t)idx * 64, it.world, 64);
+                    // WT2 sun-disc fix: the client faces the sun to the MAIN camera, so after the mirror
+                    // (M = flip world-z) it faces the REFLECTED camera while we view from the main camera
+                    // → foreshortened/squashed. Pre-flip the z-component of its 3 basis rows here; M then
+                    // un-flips the rotation (→ faces the view = round) but still mirrors the translation
+                    // (→ correct reflected position). Only the flagged sun shape (moons look fine as-is).
+                    if (it.isSunDisc) {
+                        float* w = (float*)(dst + (size_t)idx * 64);
+                        w[2]  = -w[2];    // +X basis z
+                        w[6]  = -w[6];    // +Y basis z
+                        w[10] = -w[10];   // +Z basis z
+                    }
+                    uint32_t* inst = (uint32_t*)g_live.pReflectSkyInstanceBuf->pCpuMappedAddress;
+                    inst[idx * kStaticInstU32 + 0] = idx;
+                    inst[idx * kStaticInstU32 + 1] = packTexAlpha(it.texIndex, it.alphaRef, it.vColSource);
+                    float* finst = (float*)inst;
+                    finst[idx * kStaticInstU32 + 2] = it.matColor[0];
+                    finst[idx * kStaticInstU32 + 3] = it.matColor[1];
+                    finst[idx * kStaticInstU32 + 4] = it.matColor[2];
+                    // SK3 cloud scroll (mirror): same matAmbient-lane transport as the main sky pass.
+                    finst[idx * kStaticInstU32 + 5] = it.uvOffset[0];
+                    finst[idx * kStaticInstU32 + 6] = it.uvOffset[1];
+                    finst[idx * kStaticInstU32 + 7] = 0.0f;
+                    finst[idx * kStaticInstU32 + 11] = it.matAlpha;
 
-                Buffer*  meshVb     = m.inArena ? g_live.pArenaVB : m.vb;
-                Buffer*  meshIb     = m.inArena ? g_live.pArenaIB : m.ib;
-                uint32_t firstVertex = m.inArena ? (uint32_t)(m.vbOff / sizeof(IPC::GeomVertexWire)) : 0u;
-                uint32_t firstIndex  = m.inArena ? (uint32_t)(m.ibOff / sizeof(uint16_t)) : 0u;
-                if (!meshVb || !meshIb) continue;
-                Buffer*  vbs[2]     = { meshVb, g_live.pReflectSkyInstanceBuf };
-                uint32_t strides[2] = { vStride, iStride };
-                cmdBindVertexBuffer(g_live.pCmd, 2, vbs, strides, nullptr);
-                cmdBindIndexBuffer(g_live.pCmd, meshIb, INDEX_TYPE_UINT16, 0);
-                cmdDrawIndexedInstanced(g_live.pCmd, m.indexCount, firstIndex, 1, firstVertex, idx);
-                ++reflSkyDrawn;
-            }
+                    Buffer*  meshVb     = m.inArena ? g_live.pArenaVB : m.vb;
+                    Buffer*  meshIb     = m.inArena ? g_live.pArenaIB : m.ib;
+                    uint32_t firstVertex = m.inArena ? (uint32_t)(m.vbOff / sizeof(IPC::GeomVertexWire)) : 0u;
+                    uint32_t firstIndex  = m.inArena ? (uint32_t)(m.ibOff / sizeof(uint16_t)) : 0u;
+                    if (!meshVb || !meshIb) continue;
+                    Buffer*  vbs[2]     = { meshVb, g_live.pReflectSkyInstanceBuf };
+                    uint32_t strides[2] = { vStride, iStride };
+                    cmdBindVertexBuffer(g_live.pCmd, 2, vbs, strides, nullptr);
+                    cmdBindIndexBuffer(g_live.pCmd, meshIb, INDEX_TYPE_UINT16, 0);
+                    cmdDrawIndexedInstanced(g_live.pCmd, m.indexCount, firstIndex, 1, firstVertex, idx);
+                    ++reflSkyDrawn;
+                }
+            }   // drawReflSky
             g_lastReflSkyDrawn = reflSkyDrawn;   // Phase 0 panel
 
             // ---- WV2 (real reflection): reflected LAND + STATICS over the reflected sky --------------
@@ -10757,6 +10920,23 @@ namespace ForgeRender {
             // g_reflGeoReady (the cull ran + rings valid this frame).
             gpuPhaseBegin(kGpuPhaseReflGeo);
             if (g_reflGeoReady) { dlReflectRecordGeo(); }
+            // IR3: ...then the NEAR scene, over both. Gated on g_reflFrameReady (the mirror matrix +
+            // clip plane were written this frame) rather than g_reflGeoReady, which additionally
+            // requires distant land — an interior has none, and an interior is the case that needs
+            // this most. Drawn AFTER the DL so the near set's depth writes win where they overlap,
+            // exactly as in the main colour pass.
+            if (g_reflFrameReady && g_drawReflectNear) {
+                ReflNearInput ni = {};
+                ni.groupCount   = &groupCount[0][0][0];
+                ni.groupOff     = &groupOff[0][0][0];
+                ni.dynamic      = s_dynamic.empty() ? nullptr : s_dynamic.data();
+                ni.dynamicCount = (uint32_t)s_dynamic.size();
+                ni.items        = items;
+                ni.skinnedBlob  = skinnedBlob;
+                ni.skinnedCount = skinnedCount;
+                ni.skinnedBytes = skinnedBytes;
+                reflRecordNear(ni);
+            }
             gpuPhaseEnd(kGpuPhaseReflGeo);
 
             static uint32_t s_reflDrawLog = 0;
@@ -11422,7 +11602,7 @@ namespace ForgeRender {
             const float eyeAbsX = fcbv[56], eyeAbsY = fcbv[57], eyeAbsZ = fcbv[58];
             const float waterLevelAbs = waterParams ? waterParams[0] : 0.0f;
             const bool  underwater    = waterParams && waterParams[7] > 0.5f;
-            const float waterZ = waterLevelAbs + (underwater ? 5.0f : -5.0f);
+            const float waterZ = waterMeshZ(waterLevelAbs, underwater);   // camera-avoidance snap only
 
             uint8_t* wbuf = (uint8_t*)g_live.pWaterWorldsBuf->pCpuMappedAddress;
             for (uint32_t k = 0; k < kWaterLevels; ++k) {
@@ -12579,9 +12759,11 @@ namespace ForgeRender {
                              lf[56], lf[57], lf[58]);   // lodEye = ABSOLUTE world eye (viewer start pos)
             }
             LOG::logline(">> [forge-hb] frame=%u drawn=%u skinned=%u multimap=%u sky=%u alpha=%u(zpre=%u) dynamic=%u meshHigh=%u "
+                         "| refl sky=%u near=%u skin=%u "
                          "| record=%.2fms gpu=%.2fms (avg/frame over 300)",
                          g_renderFrame, drawn, skinnedDrawn, multiMapDrawn, skyDrawn, alphaDrawn,
                          g_lastAlphaPrepassDrawn, g_dynamicCount, g_meshHigh,
+                         g_lastReflSkyDrawn, g_lastReflNearDrawn, g_lastReflSkinDrawn,
                          g_recAccum / 300.0, g_gpuAccum / 300.0);
             // H2 pool occupancy (external audit PR #2). The arenas grow by doubling to a HARD cap
             // and then drop parts — i.e. objects go missing — so "how close are we" must be a
@@ -18854,6 +19036,174 @@ namespace ForgeRender {
         cmdEndDebugMarker(g_live.pCmd);
     }
 
+    // IR3: record the reflected NEAR scene (opaque + skinned) into the still-bound reflect targets.
+    // This is what an INTERIOR reflection is actually made of: indoors there is no sky and no distant
+    // land, so without this the RT clears to transparent and the water frag resolves flat fog.
+    // Outdoors it is the near-shore detail that only coarse DL used to stand in for.
+    //
+    // Bound to pPerFrameSetReflectGeo (water-plane mirror viewProj + below-water clip plane), so the
+    // very buffers the main view already filled replay under a mirrored camera.
+    //
+    // COLOUR PSOs ARE THE FIRST-PERSON PAIR (pFPOpaquePipeline / pFPSkinnedPipeline). They exist for
+    // exactly this situation — GEQUAL + depth WRITE against a freshly CLEARED depth buffer with no
+    // Z-prepass to test EQUAL against. The main colour PSOs (CMP_EQUAL, no depth write) would fail
+    // every pixel here.
+    //
+    // WINDING IS SWAPPED, NOT COPIED: the water-plane mirror has negative determinant, so it flips
+    // triangle handedness on screen. A draw the main view renders with the CCW PSO needs the CW
+    // (Mirror) one here and vice versa — the same swap dlPickStaticsPipeline(mirror=true) applies to
+    // distant statics. Copying the main pass's choice renders every reflected mesh inside-out.
+    //
+    // The clip plane is what keeps the seabed (and an interior's sub-floor) out of the mirror; see
+    // opaque.vert/skinned.vert's SV_ClipDistance0. Screen-space terms (gAO, gShadowMask, the near
+    // froxel grid) are tagged off inside opaque.frag — they are MAIN-VIEW buffers and would read
+    // garbage when indexed by this 1024² RT's pixels.
+    void reflRecordNear(const ReflNearInput& in) {
+        if (!g_live.pFPOpaquePipeline || !g_live.pFPOpaquePipelineMirror) { return; }
+        cmdBeginDebugMarker(g_live.pCmd, 0.5f, 0.8f, 0.9f, "NEAR SCENE (reflect)");
+
+        const uint32_t vStride = (uint32_t)sizeof(IPC::GeomVertexWire);
+        const uint32_t iStride = (uint32_t)(kStaticInstU32 * sizeof(uint32_t));
+        // Index [mir] with the MAIN pass's mirror flag; the entries are swapped (see header).
+        // g_reflNearSwapWinding = false restores the main pass's own choice — a diagnostic A/B, since
+        // an inverted winding here shows every reflected surface's backface.
+        Pipeline* const opaquePSO[2] = {
+            g_reflNearSwapWinding ? g_live.pFPOpaquePipelineMirror : g_live.pFPOpaquePipeline,
+            g_reflNearSwapWinding ? g_live.pFPOpaquePipeline       : g_live.pFPOpaquePipelineMirror,
+        };
+        uint32_t nearDrawn = 0, skinDrawn = 0;
+
+        cmdBindPipeline(g_live.pCmd, opaquePSO[0]);
+        cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSetReflectGeo);
+        cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerLightsSet);
+        cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
+        int boundMirror = 0;
+
+        // Re-execute the SAME indirect groups the main pass walks. The colour PSO ignores the
+        // alpha-test split (that exists only to keep the prepass's PS-less fast path), so both `at`
+        // blocks of a mirror group go through one pipeline.
+        for (uint32_t mir = 0; mir < 2; ++mir) {
+            bool anyInMirror = false;
+            for (uint32_t at = 0; at < 2 && !anyInMirror; ++at) {
+                for (uint32_t b = 0; b < kMaxBatches; ++b) {
+                    if (in.groupCount[(mir * 2 + at) * kMaxBatches + b]) { anyInMirror = true; break; }
+                }
+            }
+            if (!anyInMirror) { continue; }
+            if ((int)mir != boundMirror) {
+                cmdBindPipeline(g_live.pCmd, opaquePSO[mir]);
+                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSetReflectGeo);
+                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerLightsSet);
+                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
+                boundMirror = (int)mir;
+            }
+            for (uint32_t at = 0; at < 2; ++at) {
+                for (uint32_t b = 0; b < kMaxBatches; ++b) {
+                    const uint32_t c = in.groupCount[(mir * 2 + at) * kMaxBatches + b];
+                    if (!c) { continue; }
+                    cmdBindDescriptorSet(g_live.pCmd, b, g_live.pPerBatchSet);
+                    Buffer*  vbs[2]     = { g_live.pArenaVB, g_live.pInstanceBuf[b] };
+                    uint32_t strides[2] = { vStride, iStride };
+                    cmdBindVertexBuffer(g_live.pCmd, 2, vbs, strides, nullptr);
+                    cmdBindIndexBuffer(g_live.pCmd, g_live.pArenaIB, INDEX_TYPE_UINT16, 0);
+                    cmdExecuteIndirect(g_live.pCmd, INDIRECT_DRAW_INDEX, c, g_live.pIndirectArgs,
+                                       (uint64_t)in.groupOff[(mir * 2 + at) * kMaxBatches + b]
+                                           * sizeof(IndirectDrawIndexArguments),
+                                       nullptr, 0);
+                    nearDrawn += c;
+                }
+            }
+        }
+
+        // Dynamic-morph parts (own CPU_TO_GPU VB/IB, so they can't ride the shared-arena indirect
+        // call). ~1-4 per frame.
+        for (uint32_t k = 0; k < in.dynamicCount; ++k) {
+            const uint32_t i     = in.dynamic[k];
+            const uint32_t slot  = in.items[i].slot;
+            const uint32_t batch = i / kBatchSize;
+            const uint32_t local = i % kBatchSize;
+            const int mirror = worldMirrored(in.items[i].world) ? 1 : 0;
+            if (mirror != boundMirror) {
+                cmdBindPipeline(g_live.pCmd, opaquePSO[mirror]);
+                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSetReflectGeo);
+                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerLightsSet);
+                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
+                boundMirror = mirror;
+            }
+            cmdBindDescriptorSet(g_live.pCmd, batch, g_live.pPerBatchSet);
+            HostMesh& m = g_meshes[slot];
+            Buffer*  vbs[2]     = { m.vb, g_live.pInstanceBuf[batch] };
+            uint32_t strides[2] = { vStride, iStride };
+            cmdBindVertexBuffer(g_live.pCmd, 2, vbs, strides, nullptr);
+            cmdBindIndexBuffer(g_live.pCmd, m.ib, INDEX_TYPE_UINT16, 0);
+            cmdDrawIndexedInstanced(g_live.pCmd, m.indexCount, 0, 1, 0, local);
+            ++nearDrawn;
+        }
+
+        // --- skinned (NPCs, creatures) --------------------------------------------------------
+        // RECORD ONLY: the Z-prepass already packed every palette into pBonesBuf[window] and every
+        // (base, texAlpha) pair into pInstanceBufSkin, and it ran earlier this frame. So this walk
+        // must reproduce that walk EXACTLY — same skip rules, same order, same skinPackNext cursor —
+        // or a part draws with another part's bones. Re-filling would be equally wrong: the colour
+        // pass re-walks these same buffers after us.
+        if (in.skinnedBlob && in.skinnedCount && in.skinnedBytes
+            && g_live.pFPSkinnedPipeline && g_live.pFPSkinnedPipelineMirror) {
+            Pipeline* const skinPSO[2] = {
+                g_reflNearSwapWinding ? g_live.pFPSkinnedPipelineMirror : g_live.pFPSkinnedPipeline,
+                g_reflNearSwapWinding ? g_live.pFPSkinnedPipeline       : g_live.pFPSkinnedPipelineMirror,
+            };
+            cmdBindPipeline(g_live.pCmd, skinPSO[0]);
+            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSetReflectGeo);
+            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerLightsSet);
+            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
+            const uint8_t* sp   = (const uint8_t*)in.skinnedBlob;
+            const uint8_t* sEnd = sp + in.skinnedBytes;
+            uint32_t boundWindow = UINT32_MAX;
+            int      boundSkinMirror = 0;
+            uint32_t packWin = 0, packCur = 0;   // must mirror the prepass/colour cursors
+            for (uint32_t k = 0; k < in.skinnedCount; ++k) {
+                if (sp + sizeof(IPC::SkinnedDrawWire) > sEnd) { break; }
+                IPC::SkinnedDrawWire item;
+                std::memcpy(&item, sp, sizeof(item));
+                const uint8_t* palette = sp + sizeof(item);
+                const uint32_t bones = (item.numBones < kMaxBonesPerPart) ? item.numBones : kMaxBonesPerPart;
+                const uint64_t paletteBytes = (uint64_t)item.numBones * 64;
+                if (palette + paletteBytes > sEnd) { break; }
+                sp = palette + paletteBytes;
+                if (skinDrawn >= kMaxSkinned) { continue; }
+                const uint32_t slot = item.slot;
+                if (slot >= g_meshHigh || !g_meshes[slot].valid || !g_meshes[slot].skinned) { continue; }
+                uint32_t base = 0;
+                if (!skinPackNext(bones, kMaxBatches, packWin, packCur, base)) { continue; }
+                const uint32_t window = packWin;
+                const int mirror = item.mirror ? 1 : 0;
+                if (mirror != boundSkinMirror) {
+                    cmdBindPipeline(g_live.pCmd, skinPSO[mirror]);
+                    boundSkinMirror = mirror;
+                    boundWindow = UINT32_MAX;
+                }
+                if (window != boundWindow) {
+                    cmdBindDescriptorSet(g_live.pCmd, window, g_live.pPerBatchSetSkin);
+                    boundWindow = window;
+                }
+                // No vb/ib null guard here on purpose: the prepass walk this one must stay in
+                // lockstep with has none either, and an extra skip would desync skinDrawn from the
+                // instance slot the palette was packed into.
+                HostMesh& sm = g_meshes[slot];
+                Buffer*  vbs[2]     = { sm.vb, g_live.pInstanceBufSkin };
+                uint32_t strides[2] = { (uint32_t)sizeof(IPC::SkinnedVertexWire), (uint32_t)(2 * sizeof(uint32_t)) };
+                cmdBindVertexBuffer(g_live.pCmd, 2, vbs, strides, nullptr);
+                cmdBindIndexBuffer(g_live.pCmd, sm.ib, INDEX_TYPE_UINT16, 0);
+                cmdDrawIndexedInstanced(g_live.pCmd, sm.indexCount, 0, 1, 0, skinDrawn);
+                ++skinDrawn;
+            }
+        }
+
+        g_lastReflNearDrawn = nearDrawn;
+        g_lastReflSkinDrawn = skinDrawn;
+        cmdEndDebugMarker(g_live.pCmd);
+    }
+
     // WV2: the reflect-geo CPU CULL (mirror matrix + clip plane + pReflectFrameCbvGeo write + cull into
     // the reflection rings). Runs PRE-beginCmd — no GPU commands here, only CPU work + persistent-mapped
     // writes — so it's off the record phase. Sets g_reflGeoReady when the rings are valid; the reflect
@@ -18861,7 +19211,7 @@ namespace ForgeRender {
     void dlReflectGeoCull(Renderer* R, const float* viewProj, const float* fcbvR,
                           float dRel, float eyeAbsZ, float waterLevelAbs, bool underwater) {
         g_reflGeoReady = false;
-        if (!g_drawReflectGeo || !g_dlExterior || !g_dlLiveInit) { return; }
+        g_reflFrameReady = false;
 
         // Mirror about the water plane: the sky's M with M[14] = 2·dRel (reflect about z = dRel, the
         // camera-relative water level). Same reverse-Z + half-pixel edits the sky/main paths apply.
@@ -18885,9 +19235,21 @@ namespace ForgeRender {
         // water side: (0,0,1, -(waterLevel-1)); flipped underwater; +½·wave if dynamic ripples. Then
         // camera-relative for the shader (worldPos = pos - lodEye, plane normal only in z): d += nz·eyeZ.
         float nz = 1.0f;
-        float dw = -(waterLevelAbs - 1.0f);
+        float dw = -waterTrueLevel(waterLevelAbs);
         if (underwater) { nz = -nz; dw = -dw; }
         if (Configuration.MGEFlags & DYNAMIC_RIPPLES) { dw += 0.5f * (float)Configuration.DL.WaterWaveHeight; }
+        // IR4: move the cut off the water plane. Applied AFTER the underwater sign flip, so the sign
+        // means the same thing on both sides: POSITIVE slackens (keeps geometry further past the
+        // waterline), NEGATIVE tightens (cuts higher, above the water).
+        //
+        // IT WANTS TO BE NEGATIVE, which is the opposite of scene-walk-v2's s_reflWaterClipBias
+        // default (+3). Slack does not close the shells here, it opens them: geometry kept BELOW the
+        // water plane is MIRRORED UP into the reflection, and what faces the camera there is its
+        // UNDERSIDE — a backface, which the swapped-winding mirror PSO culls. The result is a hole
+        // where the mirrored submerged strip should be, i.e. exactly the reported "can see terrain's
+        // insides" and the shoreline land mismatch. Cutting above the water drops that strip instead.
+        // Live slider ("Reflect: clip slack past waterline") — tune it at a shoreline.
+        dw += g_reflWaterClipBias;
         const float dClip = dw + nz * eyeAbsZ;
 
         // pReflectFrameCbvGeo = copy of the main frame data, viewProj := mirror-about-water,
@@ -18905,7 +19267,13 @@ namespace ForgeRender {
             // is wrong. Force froxelDims.x = 0 so the reflected DL frags brute-loop gLights instead.
             gp[116] = 0.0f;
         }
+        // The mirror matrix + clip plane are now live, which is all the NEAR reflect record needs.
+        // This used to sit behind `!g_dlExterior` along with the DL cull below, so an interior — which
+        // is 100% near-cache geometry and has no distant land at all — left this cbuffer holding the
+        // last exterior frame's matrix. IR3 needs it indoors, so only the DL half is gated now.
+        g_reflFrameReady = true;
 
+        if (!g_drawReflectGeo || !g_dlExterior || !g_dlLiveInit) { return; }
         // Cull into the reflection rings with the mirror frustum. primary=false → no lazy loads (the
         // main cull, which ran just before this pre-beginCmd, did the init). Rings now valid for the pass.
         dlReflectCullAndBuild(R, mirrorGeoVP);
