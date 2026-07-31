@@ -1,0 +1,47 @@
+// mgeHost64 — SH2 sky-height map debug view (fragment stage).
+//
+// F12 mode 14: show the top-down world height map as a false-colour elevation plot in a corner
+// overlay, so the map can be LOOKED AT rather than inferred from the ambient it produces. Sky AO is
+// a term with no silhouette of its own — when it is wrong the symptom is "the shading feels off
+// somewhere", which is close to undiagnosable without this.
+//
+// Reuses shadowatlasview.vert (fullscreen triangle) + the opaque.srt.h PerFrame set (gSkyHeight is
+// bound there for the receivers). Non-destructive overlay; alpha = 1.
+//
+// The camera is drawn as a crosshair at the map centre — the origin is snapped, so the eye is
+// within one snap cell of centre, and seeing it sit there is the fastest confirmation that the
+// published origin and the map's contents agree.
+
+#include "opaque.srt.h"
+
+STRUCT(VSOutput)
+{
+    DATA(float4, Position, SV_Position);
+    DATA(float2, Uv,       TEXCOORD0);
+};
+
+ROOT_SIGNATURE(DefaultRootSignature)
+float4 PS_MAIN( VSOutput In )
+{
+    INIT_MAIN;
+    float2 mapUv = saturate(In.Uv);
+    float  h = SampleLvlTex2D(gSkyHeight, gSamplerBilinearClamp, mapUv, 0).r;
+
+    // The sentinel reads as "no data" — a distinct blue, NOT black, so an empty map is obviously
+    // empty rather than merely dark. Every real Morrowind height is far above it.
+    if (h < -20000.0f) { RETURN(float4(0.05f, 0.08f, 0.22f, 1.0f)); }
+
+    // Elevation ramp over the world's actual span (roughly the sea floor to Red Mountain), with the
+    // WATERLINE called out: height 0 is where most of the interesting terrain sits, and a band there
+    // gives the eye a fixed reference to judge everything else against.
+    float t = saturate((h + 4096.0f) / 20480.0f);
+    float3 rgb = lerp(float3(0.10f, 0.25f, 0.15f), float3(0.95f, 0.90f, 0.70f), t);
+    if (abs(h) < 48.0f) { rgb = float3(0.15f, 0.45f, 0.85f); }
+
+    // Camera crosshair at the map centre.
+    float2 d = abs(mapUv - 0.5f);
+    if ((d.x < 0.0015f && d.y < 0.02f) || (d.y < 0.0015f && d.x < 0.02f)) {
+        rgb = float3(1.0f, 0.25f, 0.15f);
+    }
+    RETURN(float4(rgb, 1.0f));
+}

@@ -22,7 +22,7 @@
 
 #include "opaque.srt.h"
 #include "msmrecv.h.fsl"   // sunShadowVisibility() — MSM sun-shadow receiver
-#include "skyamb.h.fsl"    // skyAmbFactor() — SH-L1 sky-directional ambient (SH1)
+#include "skyamb.h.fsl"    // skyAmbFactor() — SH-L1 sky ambient (SH1) + sky AO (SH2)
 
 #define TERRAIN_VERTS   65
 #define TERRAIN_QUADS   64
@@ -160,7 +160,7 @@ float4 PS_MAIN( VSOutput In )
     // a visible seam across the near/far handover on the same building.
     float3 result = albedo
                   * (gFrameData.sunCol.rgb * saturate(dot(-gFrameData.sunDir.xyz, normal)) * sunVis
-                     + gFrameData.lodSunAmb.rgb * skyAmbFactor(normal));
+                     + gFrameData.lodSunAmb.rgb * skyAmbFactor(normal, In.WorldPos));
 
     // Baked DISTANT point lights, clustered by froxel when the grid is live — the same inlined body
     // distantland.frag/statics.frag use, so a lamp lights the ground identically on all three paths.

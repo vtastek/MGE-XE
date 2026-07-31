@@ -32,6 +32,16 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
     if (inst.rangeEndIdx == 0xFFFFFFFFu)   // grass / invalid -> skip
         RETURN();
 
+    // Minimum-radius floor. Armed ONLY by SH2's sky-height cull; misc.w is 0 in the camera and sun
+    // params, so this line changes nothing for them and the GPU/CPU cull parity check still holds.
+    // Why a radius and not the tier: rangeEndIdx answers "is this worth a draw call from far away",
+    // which is a question about SILHOUETTE AT DISTANCE and has nothing to do with occluding the sky
+    // from ten metres away — a 250-unit shack is tier 0 and is also the single most important
+    // occluder in a Balmora alley. What the height map actually cannot use is anything below its own
+    // TEXEL, and effR says that directly. cullscatter.comp.fsl repeats this VERBATIM.
+    if (inst.effR < gCullParams.misc.w)
+        RETURN();
+
     // Dynamic visibility: a gated instance (visIndex != 0 — a stronghold stage, a Raven Rock build
     // stage, a quest-toggled ruin) draws only while its group bit is set in visMask. Fail-open past
     // DL_VIS_MASK_BITS: an over-eager gate silently deletes real world geometry, far worse than a

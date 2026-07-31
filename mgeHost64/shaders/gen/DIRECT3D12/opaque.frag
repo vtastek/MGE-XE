@@ -1070,12 +1070,20 @@ STRUCT(ShadowMaskParams)
     float4 shAr;
     float4 shAg;
     float4 shAb;
-
-
-
-
+#line 185 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
     float4 skyParams;
-#line 178
+
+
+
+
+
+
+
+
+
+
+    float4 skyAOMap;
+#line 197
 };
 #line 21 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
 #line 46 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
@@ -1305,8 +1313,19 @@ STRUCT(LightData)
 
 
 
+
+
+
+
+
+
+        Tex2D(float) gSkyHeight :  register(t52,space1);
+
+
+
+
         CBUFFER(LightData) gLights :  register(b0,space3);
-#line 305 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+#line 316 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
         Tex2D(float4) gTextures[ 880 ] :  register(t0,space0);
 
 
@@ -1722,14 +1741,94 @@ float sunShadowVisibility(float3 worldPosRel, float3 N)
 }
 #line 14 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.frag.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyamb.h.fsl"
-#line 36 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyamb.h.fsl"
-float3 skyAmbFactor(float3 N)
+#line 83 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyamb.h.fsl"
+float skyAOVisibility(float3 worldAbs)
+{
+    float4 m = gShadowParams.skyAOMap;
+
+
+
+
+
+    float2 uv = (worldAbs.xy - m.xy) * m.z;
+    float2 e = abs(uv - 0.5f) * 2.0f;
+    float edge = saturate((1.0f - max(e.x, e.y)) * 8.0f);
+    if (edge <= 0.0f) { return 1.0f; }
+
+    float inner = gShadowParams.skyParams.z;
+    float outer = gShadowParams.skyParams.w;
+    int steps = (int)max(m.w, 1.0f);
+
+
+
+
+    float logRatio = log2(max(outer / max(inner, 1.0f), 1.0f));
+    float myH = worldAbs.z;
+
+
+
+
+
+    float4 maxS = f4(0.0f);
+    float maxS4 = 0.0f;
+
+    for (int k = 0; k < steps; ++k)
+    {
+        float t = ((float)k + 1.0f) / (float)steps;
+        float d = inner * exp2(t * logRatio);
+
+        float r = d * m.z;
+        float2 o0 = float2( 0.98769f, 0.15643f) * r;
+        float2 o1 = float2( 0.15643f, 0.98769f) * r;
+        float2 o2 = float2(-0.89101f, 0.45399f) * r;
+        float2 o3 = float2(-0.70711f, -0.70711f) * r;
+        float2 o4 = float2( 0.45399f, -0.89101f) * r;
+
+
+
+        float4 h;
+        h.x = SampleLvlTex2D(gSkyHeight, gSamplerBilinearClamp, uv + o0, 0).r;
+        h.y = SampleLvlTex2D(gSkyHeight, gSamplerBilinearClamp, uv + o1, 0).r;
+        h.z = SampleLvlTex2D(gSkyHeight, gSamplerBilinearClamp, uv + o2, 0).r;
+        h.w = SampleLvlTex2D(gSkyHeight, gSamplerBilinearClamp, uv + o3, 0).r;
+        float h4 = SampleLvlTex2D(gSkyHeight, gSamplerBilinearClamp, uv + o4, 0).r;
+
+
+
+
+        float4 dh = h - f4(myH);
+        float dh4 = h4 - myH;
+        maxS = max(maxS, dh * rsqrt(dh * dh + f4(d * d)));
+        maxS4 = max(maxS4, dh4 * rsqrt(dh4 * dh4 + d * d));
+    }
+
+    float4 s = saturate(maxS);
+    float s4 = saturate(maxS4);
+    float4 vis = f4(1.0f) - s * s;
+    float vis4 = 1.0f - s4 * s4;
+    float ao = (dot(vis, f4(1.0f)) + vis4) * 0.2f;
+
+
+    return lerp(1.0f, ao, gShadowParams.skyParams.y * edge);
+}
+
+
+
+
+
+float3 skyAmbFactor(float3 N, float3 worldPosRel)
 {
 
 
 
+
+
+    float ao = (gShadowParams.skyParams.y > 0.0f) ? skyAOVisibility(worldPosRel + gFrameData.lodEye.xyz)
+                                                  : 1.0f;
+
+
     float s = gShadowParams.skyParams.x;
-    if (s <= 0.0f) { return float3(1.0f, 1.0f, 1.0f); }
+    if (s <= 0.0f) { return float3(ao, ao, ao); }
 
     float4 n = float4(normalize(N), 1.0f);
     float3 f = float3(dot(gShadowParams.shAr, n),
@@ -1739,7 +1838,11 @@ float3 skyAmbFactor(float3 N)
 
 
 
-    return lerp(float3(1.0f, 1.0f, 1.0f), max(f, float3(0.0f, 0.0f, 0.0f)), s);
+
+
+
+
+    return lerp(float3(1.0f, 1.0f, 1.0f), max(f, float3(0.0f, 0.0f, 0.0f)), s) * ao;
 }
 #line 15 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.frag.fsl"
 
@@ -1821,7 +1924,7 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
 
 
     float3 a = ((aoFlags & 4u) != 0u) ? float3(1.0f, 1.0f, 1.0f)
-                                      : gFrameData.ambCol.rgb * skyAmbFactor(In.Normal);
+                                      : gFrameData.ambCol.rgb * skyAmbFactor(In.Normal, In.WorldPos);
 
 
 

@@ -1,0 +1,95 @@
+// mgeHost64 — SH2 top-down world height map: the TERRAIN layer (tasks/lighting.md).
+//
+// One thread per texel. Texel -> absolute world XY -> LAND cell -> bilinear over the four
+// bracketing heightfield vertices. Writes max(existing, terrainHeight), so this pass runs LAST in
+// the rebuild and folds itself over whatever the statics raster already put down (Stage B) —
+// which is why the statics pass needs no blend state at all, only a depth test.
+//
+// Bilinear needs no neighbour-cell lookup, unlike terrain.vert's normals: a cell's lattice is 65
+// vertices spanning 64 quads and the boundary column IS shared, so a sample anywhere inside the
+// cell brackets between local indices 0..64 and never leaves. The one thing that CAN be missing is
+// the cell itself (sea, off-map), and that writes the sentinel.
+
+#include "skyheight.srt.h"
+
+#define TERRAIN_VERTS   65
+#define TERRAIN_QUADS   64
+#define TERRAIN_HSTRIDE 2113u    // uints per cell in gSkyTerrainHeights (4225 int16, 2 per uint)
+#define TERRAIN_HSCALE  8.0f     // VHGT units -> world units
+#define TERRAIN_CELL    8192.0f  // world units per cell (64 quads x 128)
+#define TERRAIN_SPACING 128.0f   // world units between lattice vertices
+
+// One vertex's height in WORLD units — the same decode as terrain.vert.fsl::loadHeight. Two int16
+// packed per uint, sign-extended by hand (HLSL has no int16 load off a Buffer<uint>).
+float skyLoadHeight(uint slot, int x, int y)
+{
+    uint v    = (uint)(y * TERRAIN_VERTS + x);
+    uint word = gSkyTerrainHeights[slot * TERRAIN_HSTRIDE + (v >> 1u)];
+    uint h16  = ((v & 1u) != 0u) ? (word >> 16u) : (word & 0xFFFFu);
+    int  h    = (int)h16;
+    if (h > 32767) { h -= 65536; }
+    return (float)h * TERRAIN_HSCALE;
+}
+
+NUM_THREADS(8, 8, 1)
+void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
+{
+    INIT_MAIN;
+
+    int2 px  = int2(DispatchThreadID.xy);
+    int  res = (int)gSkyHeightParams.mapOrigin.w;
+    // RETURN() on its own line: fsl.py's rewrite of it into a bare `return` is line-based, and a
+    // one-liner `{ RETURN(); }` transpiles to `return ()`.
+    if (px.x >= res || px.y >= res)
+    {
+        RETURN();
+    }
+
+    // Texel CENTRE, not corner: the receiver samples this map bilinearly through a clamp sampler,
+    // whose taps are centred too, so sampling the field at centres is what makes the two agree.
+    float texel = gSkyHeightParams.mapOrigin.z;
+    float wx = gSkyHeightParams.mapOrigin.x + ((float)px.x + 0.5f) * texel;
+    float wy = gSkyHeightParams.mapOrigin.y + ((float)px.y + 0.5f) * texel;
+
+    float h = SKY_HEIGHT_NONE;
+
+    // World XY -> cell. floor(), not a truncating cast: cell coords go negative over half the map
+    // and truncation would fold x in (-8192, 0) into cell 0, duplicating a strip of the world.
+    int cellX = (int)floor(wx / TERRAIN_CELL);
+    int cellY = (int)floor(wy / TERRAIN_CELL);
+    int lx    = cellX - (int)gSkyHeightParams.gridInfo.x;
+    int ly    = cellY - (int)gSkyHeightParams.gridInfo.y;
+    int spanX = (int)gSkyHeightParams.gridInfo.z;
+    int spanY = (int)gSkyHeightParams.gridInfo.w;
+
+    if (lx >= 0 && ly >= 0 && lx < spanX && ly < spanY)
+    {
+        uint slotP1 = gSkyTerrainCellGrid[(uint)(ly * spanX + lx)];
+        if (slotP1 != 0u)
+        {
+            uint  slot = slotP1 - 1u;
+            // Lattice coords within the cell, in [0, 64). ix+1 tops out at 64 = the shared
+            // boundary vertex, which this cell owns a copy of — so the bracket never escapes.
+            float fx = (wx - (float)cellX * TERRAIN_CELL) * (1.0f / TERRAIN_SPACING);
+            float fy = (wy - (float)cellY * TERRAIN_CELL) * (1.0f / TERRAIN_SPACING);
+            int   ix = clamp((int)floor(fx), 0, TERRAIN_QUADS - 1);
+            int   iy = clamp((int)floor(fy), 0, TERRAIN_QUADS - 1);
+            float tx = saturate(fx - (float)ix);
+            float ty = saturate(fy - (float)iy);
+
+            float h00 = skyLoadHeight(slot, ix,     iy);
+            float h10 = skyLoadHeight(slot, ix + 1, iy);
+            float h01 = skyLoadHeight(slot, ix,     iy + 1);
+            float h11 = skyLoadHeight(slot, ix + 1, iy + 1);
+            h = lerp(lerp(h00, h10, tx), lerp(h01, h11, tx), ty);
+        }
+    }
+
+    // max(), not assign: Stage B's statics raster has already written this texel, and a building
+    // stands ABOVE the ground it sits on. Where no static covered the texel the incoming value is
+    // the cleared sentinel, so the max is the terrain height and this reads as a plain write.
+    float cur = LoadRWTex2D(gSkyHeightOut, px);
+    Write2D(gSkyHeightOut, px, max(cur, h));
+
+    RETURN();
+}

@@ -3676,8 +3676,12 @@ namespace RenderProcess {
             // 7 (ambient) shading-isolation views; 8 (world normal) 9 (point-light count);
             // P1 shadows added 10 (shadow mask — the host panel's face-id/atlas checkboxes
             // pick what it displays); shadow observability added 11 (shadow-atlas static) +
-            // 12 (shadow-atlas dynamic) fullscreen atlas blits — cycle is now %13.
-            g_debugMode = (g_debugMode + 1) % 14;
+            // 12 (shadow-atlas dynamic) fullscreen atlas blits; sun shadows added 13 (moments
+            // cascade atlas); SH2 sky AO added 14 (the top-down world height map) — cycle is %15.
+            // THIS MODULUS AND THE HOST'S kDebugModeNames MUST MOVE IN THE SAME COMMIT: the host
+            // indexes that array with the value we send here, and a mode with no name is a garbage
+            // char* straight into ImGui's dev panel (an instant AV, recorded in forgerender.cpp).
+            g_debugMode = (g_debugMode + 1) % 15;
             const char* name = (g_debugMode == 1) ? "DEPTH" : (g_debugMode == 2) ? "SCATTER"
                              : (g_debugMode == 3) ? "AO" : (g_debugMode == 4) ? "BENT NORMAL"
                              : (g_debugMode == 5) ? "ALBEDO" : (g_debugMode == 6) ? "LIT"
@@ -3686,7 +3690,8 @@ namespace RenderProcess {
                              : (g_debugMode == 10) ? "SHADOW MASK"
                              : (g_debugMode == 11) ? "SHADOW ATLAS (STATIC)"
                              : (g_debugMode == 12) ? "SHADOW ATLAS (DYN)"
-                             : (g_debugMode == 13) ? "SUN MOMENTS" : "NORMAL";
+                             : (g_debugMode == 13) ? "SUN MOMENTS"
+                             : (g_debugMode == 14) ? "SKY HEIGHT MAP" : "NORMAL";
             LOG::logline(">> [seam] debug mode %d (%s)", g_debugMode, name);
         }
         // F9 toggles the in-host dev overlay.

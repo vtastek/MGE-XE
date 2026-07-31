@@ -1,0 +1,59 @@
+// mgeHost64 — SH2 top-down world height map: the STATICS layer (tasks/lighting.md).
+//
+// Stage A's map is terrain only, which shades cliffs, canyons and Red Mountain but cannot know that
+// a building is next to you — and a Balmora alley is precisely the case sky AO exists for. This
+// frag is the other half: the distant-statics set, drawn once from a top-down ortho, writing each
+// fragment's ABSOLUTE world Z. The terrain compute pass then folds max() over the result.
+//
+// NO DEPTH BUFFER, and that is the design rather than an omission. "The highest occluder wins"
+// between two overlapping statics is exactly a MAX, so the pipeline blends BM_MAX and the question
+// answers itself — no depth attachment (a second 2048² surface), no depth state, and no dependence
+// on draw order. The RT's sentinel clear is hugely negative, so it loses every max on first contact.
+//
+// The 133/255 cutout matches statics.frag, for the same reason sunshadow_statics.frag does: a fence
+// or a tree canopy must occlude the sky with the silhouette it is actually drawn with, not as a
+// solid slab.
+//
+// VSOutput MUST stay byte-identical to statics.vert's output — CENTROID modifiers, unused fields
+// and all. A frag whose input does not match its paired vert's output hangs the GPU
+// (see project_forge_shared_frag_vsoutput). Copied verbatim from sunshadow_statics.frag.
+
+#include "opaque.srt.h"      // gStaticsArrays[], gSamplerAnisotropic, gFrameData
+
+STRUCT(VSOutput)
+{
+    DATA(float4,           Position,    SV_Position);
+    DATA(float2,           Uv,          TEXCOORD0);
+    DATA(CENTROID(float4), Color,       COLOR);
+    DATA(CENTROID(float),  Fog,         TEXCOORD1);
+    DATA(FLAT(uint),       TexIndex,    TEXCOORD2);
+    DATA(FLAT(uint),       Flags,       TEXCOORD3);
+    DATA(float3,           WorldPos,    TEXCOORD4);
+    DATA(float3,           WorldNormal, TEXCOORD5);
+    DATA(CENTROID(float3), SunLight,    TEXCOORD6);   // unused here; present to match statics.vert
+};
+
+STRUCT(PsOut)
+{
+    DATA(float4, height, SV_Target0);
+};
+
+ROOT_SIGNATURE(DefaultRootSignature)
+PsOut PS_MAIN( VSOutput In )
+{
+    INIT_MAIN;
+    if ((In.Flags & 0x2u) != 0u) {
+        uint bucket = In.TexIndex >> 16;
+        uint layer  = In.TexIndex & 0xFFFFu;
+        float4 tex = SampleTex2DArray(gStaticsArrays[bucket], gSamplerAnisotropic, float3(In.Uv, (float)layer));
+        if (tex.a < (133.0f / 255.0f)) { discard; }
+    }
+
+    // ABSOLUTE world height. statics.vert emits a CAMERA-RELATIVE position (the whole live frame is
+    // shifted by -eye), while the map is world-locked — so the eye has to come back in. lodEye is
+    // the absolute camera and rides along in this pass's gFrameData copy, exactly as it does for the
+    // sun cascades.
+    PsOut Out;
+    Out.height = f4(In.WorldPos.z + gFrameData.lodEye.z);
+    RETURN(Out);
+}

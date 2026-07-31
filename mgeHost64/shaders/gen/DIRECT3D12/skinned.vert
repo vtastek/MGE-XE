@@ -1070,12 +1070,20 @@ STRUCT(ShadowMaskParams)
     float4 shAr;
     float4 shAg;
     float4 shAb;
-
-
-
-
+#line 185 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
     float4 skyParams;
-#line 178
+
+
+
+
+
+
+
+
+
+
+    float4 skyAOMap;
+#line 197
 };
 #line 21 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
 #line 46 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
@@ -1305,8 +1313,19 @@ STRUCT(LightData)
 
 
 
+
+
+
+
+
+
+        Tex2D(float) gSkyHeight :  register(t52,space1);
+
+
+
+
         CBUFFER(LightData) gLights :  register(b0,space3);
-#line 305 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+#line 316 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
         Tex2D(float4) gTextures[ 880 ] :  register(t0,space0);
 
 

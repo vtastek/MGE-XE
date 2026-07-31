@@ -283,6 +283,17 @@ BEGIN_SRT_NO_AB(SrtData)
         // declaration, NOT gStaticsArrays: the statics bake is itself on the way out.
         // Slot encoding is the same (bucket<<16)|layer. Declared LAST in the set.
         DECL_ARRAY_TEXTURES(PerFrame, Tex2DArray(float4), gTerrainArrays, MAX_TERRAIN_BUCKETS)
+        // SH2 top-down world HEIGHT map (skyamb.h.fsl / skyheight.comp.fsl): one R16F world height
+        // per texel — max(terrain, statics) — over a 65536-unit window that follows the camera.
+        // Read by every lit path through skyAmbFactor(), which marches a few taps of it to get the
+        // sky occlusion GTAO cannot reach (it only sees what is on screen) and the SH does not model
+        // (it assumes the whole hemisphere is visible). Its world mapping rides
+        // gShadowParams.skyAOMap, so this texture carries no state of its own.
+        //
+        // DECLARED LAST, and that is load-bearing, not tidiness: FSL assigns every resource in a set
+        // its mOffset from ONE running per-set counter, so inserting a declaration anywhere above
+        // silently re-points every bind after it. Append only.
+        DECL_TEXTURE(PerFrame, Tex2D(float), gSkyHeight)
     END_SRT_SET(PerFrame)
     // Point-light cbuffer — rides the otherwise-unused PerDraw set (FSL has exactly four
     // fixed update frequencies: Persistent/PerFrame/PerBatch/PerDraw; a custom set name has

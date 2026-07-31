@@ -13,7 +13,7 @@
 // viewProj keeps the column-major mul like opaque/distantland). Placeholder linear fog (1c = scatter).
 
 #include "opaque.srt.h"
-#include "skyamb.h.fsl"   // skyAmbFactor() — SH-L1 sky-directional ambient (SH1)
+#include "skyamb.h.fsl"   // skyAmbFactor() — SH-L1 sky ambient (SH1) + sky AO (SH2)
 
 // Phase 4 hero-blend split. The SAME vertex body builds two containers: HERO_PASS 0 (the normal
 // opaque statics draw) clips the hero-blend subsets offscreen; HERO_PASS 1 (the post-water blend
@@ -130,7 +130,7 @@ VSOutput VS_MAIN( VSInput In )
     // evaluation would have kept. EMISSIVE stays outside the multiply for the same reason it stays
     // outside the vertex colour above — it is an independent FFE term, not ambient.
     float3 sunlit  = gFrameData.sunCol.rgb * saturate(dot(nWorld, -gFrameData.sunDir.xyz));
-    Out.Color    = float4(In.Color.rgb * gFrameData.lodSunAmb.rgb * skyAmbFactor(nWorld) + emissive, In.Color.a);
+    Out.Color    = float4(In.Color.rgb * gFrameData.lodSunAmb.rgb * skyAmbFactor(nWorld, worldPos.xyz) + emissive, In.Color.a);
     Out.SunLight = In.Color.rgb * sunlit;
 
     Out.TexIndex = (uint)(In.InstParams.x + 0.5f);

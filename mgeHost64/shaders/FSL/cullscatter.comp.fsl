@@ -40,6 +40,11 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
     if (inst.rangeEndIdx == 0xFFFFFFFFu)
         RETURN();
 
+    // Minimum-radius floor — VERBATIM copy of cull.comp.fsl's (see the rationale there). Same input,
+    // same order, so the scatter agrees bit-for-bit with the counts the prefix-sum sized its runs from.
+    if (inst.effR < gCullParams.misc.w)
+        RETURN();
+
     // Dynamic visibility — VERBATIM copy of cull.comp.fsl's gate (see the rationale there). Same
     // inputs, same order, same fail-open bound, so the scatter agrees bit-for-bit with the counts
     // the prefix-sum sized the runs from.

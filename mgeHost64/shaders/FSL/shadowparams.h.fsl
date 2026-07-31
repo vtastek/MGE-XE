@@ -170,9 +170,28 @@ STRUCT(ShadowMaskParams)
     DATA(float4,   shAr, None);
     DATA(float4,   shAg, None);
     DATA(float4,   shAb, None);
-    // skyParams: x = STRENGTH 0..1 (0 = feature off — the receiver's early-out AND the interior gate,
-    //                the same "one float disarms it at every receiver" idiom sunParams.x uses; there
-    //                is no sky to project in an interior, so the host publishes 0 there),
-    //            y,z,w = spare.
+    // skyParams: x = SH STRENGTH 0..1 (0 = the directional half off — the receiver's early-out AND
+    //                the interior gate, the same "one float disarms it at every receiver" idiom
+    //                sunParams.x uses; there is no sky to project in an interior, so the host
+    //                publishes 0 there),
+    //            y = SH2 sky-AO STRENGTH 0..1 (0 = no taps taken at all, i.e. bit-identical to the
+    //                SH1 build). Its OWN lane rather than sharing x: occlusion is a separate
+    //                measurement from direction and each has to be A/B-able against the other. Also
+    //                0 in interiors — the height map covers the exterior world only.
+    //            z = INNER tap radius in world units. The march STARTS here so it does not restate
+    //                what screen-space GTAO already multiplied into the same ambient; the two are
+    //                complementary bands, not stacked copies of one.
+    //            w = OUTER tap radius in world units — how far a cliff can still shade you.
     DATA(float4,   skyParams, None);
+    // --- SH2: where the top-down world height map lives, in WORLD space ------------------------
+    // gSkyHeight is a camera-following window, so a receiver cannot know its mapping from the
+    // texture alone. Publishing it (rather than deriving it from the eye) is what keeps the map's
+    // addressing in ONE place: the host snaps the origin to a coarse grid and rebuilds wholesale
+    // when the camera leaves it, and because the content is WORLD-LOCKED a rebuild reproduces
+    // identical values over the overlap — nothing pops, only the far edge changes. Swapping this
+    // for toroidal addressing later changes the host update and the one uv line in skyamb.h.fsl.
+    //   xy = ABSOLUTE world XY of the map's (0,0) texel CORNER,
+    //   z  = 1 / (world extent) — i.e. uv = (worldXY - origin) * z,
+    //   w  = tap COUNT per direction (the cost knob; 0 is treated as 1).
+    DATA(float4,   skyAOMap,  None);
 };

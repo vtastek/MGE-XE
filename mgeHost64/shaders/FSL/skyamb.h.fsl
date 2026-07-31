@@ -18,7 +18,7 @@
 // THIS ENHANCES, IT DOES NOT REPLACE. The published coefficients are normalised by their own DC, so
 // what comes back is a directional FACTOR whose spherical average is 1. Callers keep their existing
 // ambient colour and multiply:
-//     a = gFrameData.ambCol.rgb * skyAmbFactor(N);
+//     a = gFrameData.ambCol.rgb * skyAmbFactor(N, worldPosRel);
 // At strength 0 that is bit-identical to today's flat ambient; at 1 it is full directionality at the
 // SAME overall brightness. The slider can only redistribute ambient, never dim or brighten the scene
 // — which is exactly what makes it a safe A/B, and why the host normalises rather than publishing a
@@ -28,18 +28,145 @@
 // is on; bending toward the unoccluded direction and then sampling directional sky would count the
 // same occlusion twice.
 //
-// Requires (include AFTER opaque.srt.h): gShadowParams.shAr/shAg/shAb + skyParams.
+// ---------------------------------------------------------------------------------------------
+// SH2 — and how much of that sky can this point actually SEE (tasks/lighting.md).
+//
+// The SH above answers "which way is the sky brightest" while assuming the whole hemisphere is
+// visible. It has no idea a wall is next to you, that you are in a canyon, or under an arch.
+// Screen-space GTAO owns the fine end (contact shadows, a couple of hundred units) and only ever
+// sees what is ON SCREEN. The band between GTAO's radius and the sky — buildings, cliffs, canyon
+// walls, Red Mountain — was covered by nothing.
+//
+// gSkyHeight is a top-down max-height map of the world (terrain u statics) in a camera-following
+// window, published through gShadowParams.skyAOMap. Marching a few taps outward and taking the
+// steepest horizon gives that band directly:
+//     vis = cos^2(horizon elevation)
+// which is exactly the cosine-weighted fraction of a hemisphere left above a horizon at that
+// elevation — so this is the physically-shaped term, not a curve that was tuned to look right.
+//
+// SEVERAL DIRECTIONS, NOT ONE MAX. Tracking a single max over a spiral makes any one tall occluder
+// darken the point from every side, which is wrong in exactly the case this feature exists for
+// (one wall of an alley, one canyon face). Independent horizons averaged cost the same taps and a
+// few more registers, and a wall on one side then removes its own share of the sky rather than all
+// of it.
+//
+// FIVE of them, an ODD count, and that is the whole reason for the number. Morrowind's world sits on
+// an 8192-unit cell grid with its buildings square to it — a 4-fold symmetric world. Any EVEN set of
+// azimuths is 2-fold symmetric (every direction has its own opposite in the set), so it shares that
+// symmetry and aliases against it: the four walls of a courtyard get sampled by the same two axes
+// twice. Five directions at 72 degrees have no opposite pair and no common factor with the grid's
+// 4-fold symmetry at all, so no wall orientation is ever privileged.
+//
+// The taps START at an inner radius (default ~256 u) so this does NOT restate what GTAO already
+// multiplied into the same ambient — the two are complementary bands, not stacked copies.
+//
+// Requires (include AFTER opaque.srt.h): gShadowParams.shAr/shAg/shAb + skyParams + skyAOMap,
+// and gSkyHeight + gFrameData.lodEye.
 
 #ifndef SKY_AMB_H
 #define SKY_AMB_H
 
-float3 skyAmbFactor(float3 N)
+// The five azimuths, 72 degrees apart, phase-shifted 9 degrees off the axes:
+//     9, 81, 153, 225, 297 degrees.
+// 9 is not arbitrary. Five directions spaced 72 land on five DISTINCT offsets mod 90 (0,18,36,54,72
+// shifted by the phase), so they cover a 72-degree spread inside the grid's 90-degree period and
+// leave an 18-degree gap. Centring that gap on the axes — phase 9 — is what maximises the smallest
+// angle any direction makes with a wall, at 9 degrees. Any other phase puts a tap closer to, or
+// straight down, an axis-aligned wall.
+//
+// Written inline at the point of use rather than in a constant array: the project's other tap loops
+// (msmrecv's PCSS disc) build their offsets the same way, and it keeps the samples as independent
+// scalars instead of dynamically-indexed vector lanes, which is what lets them coissue.
+
+// Sky visibility 0..1 at an ABSOLUTE world position. 1 = open sky.
+// worldAbs.z is this point's own height, which is what every horizon is measured against.
+float skyAOVisibility(float3 worldAbs)
 {
-    // strength 0 = feature off. Also how interiors are handled: the host publishes 0 there (no sky to
-    // project), so there is no shader branch on interior-ness and no second code path. Uniform across
-    // the draw — it is a cbuffer value — so the untaken side costs nothing.
+    float4 m = gShadowParams.skyAOMap;   // xy = map origin (world), z = 1/extent, w = tap count
+
+    // Map-space uv. Outside the window there is no data, and a clamp sampler would smear the edge
+    // texel across the whole world beyond it — a wall at the boundary would shadow everything
+    // behind it forever. Fade the term out over the outer eighth instead, so distant land leaves
+    // the effect smoothly rather than crossing a ring.
+    float2 uv = (worldAbs.xy - m.xy) * m.z;
+    float2 e  = abs(uv - 0.5f) * 2.0f;
+    float  edge = saturate((1.0f - max(e.x, e.y)) * 8.0f);
+    if (edge <= 0.0f) { return 1.0f; }
+
+    float inner = gShadowParams.skyParams.z;
+    float outer = gShadowParams.skyParams.w;
+    int   steps = (int)max(m.w, 1.0f);
+
+    // Geometric step spacing: the near taps decide almost all of the answer (a horizon at 300 units
+    // subtends far more sky than one at 6000), so spend samples where the signal is. logRatio is
+    // the same for every direction and every step, so it is hoisted out of the whole march.
+    float logRatio = log2(max(outer / max(inner, 1.0f), 1.0f));
+    float myH      = worldAbs.z;
+
+    // One running horizon SLOPE per direction — sin(elevation), which is what the visibility term
+    // squares. Four ride a float4 so those marches vectorise into the same instructions; the fifth
+    // is a scalar alongside. An odd count cannot pack evenly into vector lanes, and that is a fair
+    // trade for not sharing the world's symmetry (see the header note).
+    float4 maxS  = f4(0.0f);
+    float  maxS4 = 0.0f;
+
+    for (int k = 0; k < steps; ++k)
+    {
+        float t = ((float)k + 1.0f) / (float)steps;
+        float d = inner * exp2(t * logRatio);
+        // The step is taken in MAP space, so the whole march is five adds off one scaled radius.
+        float r = d * m.z;
+        float2 o0 = float2( 0.98769f,  0.15643f) * r;   //   9 degrees
+        float2 o1 = float2( 0.15643f,  0.98769f) * r;   //  81
+        float2 o2 = float2(-0.89101f,  0.45399f) * r;   // 153
+        float2 o3 = float2(-0.70711f, -0.70711f) * r;   // 225
+        float2 o4 = float2( 0.45399f, -0.89101f) * r;   // 297
+
+        // SampleLvl, not Sample: this header is included by statics.vert, and a vertex stage has no
+        // derivatives to pick a mip from. The map has one mip anyway.
+        float4 h;
+        h.x = SampleLvlTex2D(gSkyHeight, gSamplerBilinearClamp, uv + o0, 0).r;
+        h.y = SampleLvlTex2D(gSkyHeight, gSamplerBilinearClamp, uv + o1, 0).r;
+        h.z = SampleLvlTex2D(gSkyHeight, gSamplerBilinearClamp, uv + o2, 0).r;
+        h.w = SampleLvlTex2D(gSkyHeight, gSamplerBilinearClamp, uv + o3, 0).r;
+        float h4 = SampleLvlTex2D(gSkyHeight, gSamplerBilinearClamp, uv + o4, 0).r;
+
+        // sin(elevation) = dh / sqrt(dh^2 + d^2). An empty texel carries SKY_HEIGHT_NONE, so dh is
+        // hugely negative there and the max() below discards it with no branch — the sentinel
+        // disarms itself.
+        float4 dh  = h - f4(myH);
+        float  dh4 = h4 - myH;
+        maxS  = max(maxS,  dh * rsqrt(dh * dh + f4(d * d)));
+        maxS4 = max(maxS4, dh4 * rsqrt(dh4 * dh4 + d * d));
+    }
+
+    float4 s   = saturate(maxS);
+    float  s4  = saturate(maxS4);
+    float4 vis = f4(1.0f) - s * s;          // cos^2(horizon) per direction
+    float  vis4 = 1.0f - s4 * s4;
+    float  ao  = (dot(vis, f4(1.0f)) + vis4) * 0.2f;   // average the five hemispherical wedges
+
+    // strength lerps the whole thing back toward "fully open", so 0 is exactly the SH1 image.
+    return lerp(1.0f, ao, gShadowParams.skyParams.y * edge);
+}
+
+// worldPosRel = the CAMERA-RELATIVE world position every one of the six lit paths already carries
+// (near geometry is pre-shifted by -eye, distant statics are host-shifted, terrain subtracts
+// lodEye in its VS). gFrameData.lodEye is the absolute eye and is written EVERY frame, interiors
+// included, so this reconstruction is the same one water.frag uses for its world-anchored normals.
+float3 skyAmbFactor(float3 N, float3 worldPosRel)
+{
+    // SH2 occlusion, on its OWN strength lane so the two halves A/B independently — SH off with AO
+    // on is a legitimate thing to want to look at, and it would be unreachable if AO hung off the
+    // SH's early-out. At AO strength 0 not one tap is taken and this whole block folds away, which
+    // is the zero-change proof the feature ships behind. Interiors publish 0 in BOTH lanes (there
+    // is no sky to project and no map to march), so neither needs a shader branch on interior-ness.
+    float ao = (gShadowParams.skyParams.y > 0.0f) ? skyAOVisibility(worldPosRel + gFrameData.lodEye.xyz)
+                                                  : 1.0f;
+
+    // SH strength 0 = the directional half is off. AO still applies — it is a separate measurement.
     float s = gShadowParams.skyParams.x;
-    if (s <= 0.0f) { return float3(1.0f, 1.0f, 1.0f); }
+    if (s <= 0.0f) { return float3(ao, ao, ao); }
 
     float4 n = float4(normalize(N), 1.0f);
     float3 f = float3(dot(gShadowParams.shAr, n),
@@ -49,7 +176,11 @@ float3 skyAmbFactor(float3 N)
     // rescale: rescaling would drag the whole sphere back toward flat, which is the one thing this
     // is for. The clamp only ever adds a hair of energy, so the "cannot darken the scene" property
     // survives it.
-    return lerp(float3(1.0f, 1.0f, 1.0f), max(f, float3(0.0f, 0.0f, 0.0f)), s);
+    // The AO scales the whole factor. SH1's "can only redistribute, never dim" guarantee is a
+    // property of the SH ALONE and is deliberately not extended here — removing light is precisely
+    // what an occlusion term is for. Keeping them as separate multiplies is what lets the panel
+    // A/B either one against the other.
+    return lerp(float3(1.0f, 1.0f, 1.0f), max(f, float3(0.0f, 0.0f, 0.0f)), s) * ao;
 }
 
 #endif // SKY_AMB_H

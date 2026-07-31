@@ -63,6 +63,11 @@ STRUCT(CullParams)
     DATA(float4, ranges,    None);  // x=nearEnd² y=farEnd² z=vfarEnd² w=nearCut² (0 when cellOwn is armed)
     DATA(float4, misc,      None);  // x = instance count, y = subset count (as floats; uint4 not C++-safe)
                                     // z = MW's view distance = the near/far HANDOVER SLAB (view-Z plane)
+                                    // w = minimum instance RADIUS (0 = no floor). Armed only by SH2's
+                                    //     sky-height cull, where the target's texel size — not an LOD
+                                    //     threshold — is what decides whether an object is worth
+                                    //     rasterising. 0 everywhere else keeps the camera cull
+                                    //     bit-for-bit identical (the CPU/GPU parity check depends on it).
     // -- Occlusion M2: the previous frame's Hi-Z pyramid camera (snapshotted at prologue submit).
     // hizVP = the RAW rzViewProj bytes of the frame that filled the pyramid (camera-relative,
     // reverse-Z, extended-far — the exact matrix statics.vert projected with). float4x4 in a

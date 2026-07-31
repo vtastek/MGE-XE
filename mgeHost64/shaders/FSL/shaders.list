@@ -278,6 +278,26 @@
 #include "aoblur.comp.fsl"
 #end
 
+// SH2 sky AO: the TERRAIN layer of the top-down world height map. One thread per texel, straight
+// off the resident heightfield (no cull, no instance build, no draw); runs LAST in the rebuild so it
+// folds max() over the statics raster. Rebuilt only when the camera leaves its snap cell.
+#comp skyheight.comp
+#include "skyheight.comp.fsl"
+#end
+
+// ...and the STATICS layer of the same map: statics.vert under a top-down ortho, writing absolute
+// world Z with BM_MAX blending (so the highest occluder wins with no depth attachment at all).
+#frag skyheight_statics.frag
+#include "skyheight_statics.frag.fsl"
+#end
+
+// ...and the map's DEBUG VIEW (F12 mode 14). Reuses shadowatlasview.vert (fullscreen tri); false-
+// colour elevation plot of gSkyHeight, because sky AO has no silhouette of its own and a wrong map
+// is otherwise close to undiagnosable.
+#frag skyheightview.frag
+#include "skyheightview.frag.fsl"
+#end
+
 // SUN shadow moments blur: the pass that makes MSM soft (a raw texel is a Dirac, whose Hankel
 // matrix is singular → hard, pixel-shaped edges). Separable, run as two dispatches over two
 // instances of one SRT set. Compute → hot-reloadable.
