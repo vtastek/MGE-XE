@@ -73,7 +73,10 @@ float4 fogSkySample(float2 pixelXy)
 
 // The sky behind this fragment, composited over fogColNear and faded by the feature's strength.
 // Strength rides fogColNear.w — a lane the client already ships as 0 and nothing read, so this cost
-// no wire growth, no CBV growth and no IPC change. 0 = byte-for-byte the flat-fog image (the A/B).
+// no wire growth, no CBV growth and no IPC change. 0 = byte-for-byte the flat-fog image (the A/B),
+// and that claim covers EXTINCTION too: the host zeroes skyParams.w whenever this strength is 0, so
+// one knob still switches the whole feature off. It has to — the host also skips the sky snapshot at
+// strength 0, so anything still reading s.a past that point is reading a stale frame's sky.
 float3 fogSkyTarget(float4 s)
 {
     float3 sky = s.rgb + gFrameData.fogColNear.rgb * (1.0f - s.a);
@@ -130,6 +133,16 @@ float3 applyFog(float3 lit, float3 worldPosRel, float2 pixelXy, float fog)
     // than dropping the gate: BOTH signals are zero at and below the eye's horizontal plane, so the
     // ground, the sea and terrain viewed from above still cannot move at any strength. It also keeps
     // the exact signal in charge wherever it exists — the geometric one only fills the hole.
+    //
+    // AND THE GEOMETRIC ONE IS EXTERIOR-ONLY, enforced by the host publishing skyParams.w = 0 in
+    // interiors (forgerender.cpp, the dp[63] write). It is a GUESS that sky is behind anything above
+    // the eye, which is a fair guess under an open sky and a false one in a room: indoors s.a is 0
+    // everywhere and correctly so, leaving the guess unopposed, and a step that completes in ~1.5
+    // degrees about the eye's horizontal plane then draws a LEVEL LINE across every fogged wall —
+    // darkened above, untouched below, tracking the camera, on surfaces only. That was a real
+    // artifact (2026-08-01), and it is why the gate cannot be read as "sky coverage" without also
+    // asking whether this frame has a sky at all. The steepness is deliberate (see the RAMP note) so
+    // it cannot be softened away; the fix is to not ask the question indoors.
     //
     // rsqrt on a floored length² rather than normalize(): a fragment landing exactly at the eye would
     // make normalize() return NaN, and NaN survives every multiply and lerp below.

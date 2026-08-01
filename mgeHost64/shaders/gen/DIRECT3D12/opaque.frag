@@ -1955,6 +1955,9 @@ float4 fogSkySample(float2 pixelXy)
 
 
 
+
+
+
 float3 fogSkyTarget(float4 s)
 {
     float3 sky = s.rgb + gFrameData.fogColNear.rgb * (1.0f - s.a);
@@ -1966,7 +1969,7 @@ float3 fogSkyColor(float2 pixelXy)
 {
     return fogSkyTarget(fogSkySample(pixelXy));
 }
-#line 100 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skydome.h.fsl"
+#line 103 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skydome.h.fsl"
 float3 applyFog(float3 lit, float3 worldPosRel, float2 pixelXy, float fog)
 {
     float4 s = fogSkySample(pixelXy);
@@ -1980,10 +1983,10 @@ float3 applyFog(float3 lit, float3 worldPosRel, float2 pixelXy, float fog)
 
 
     fog = saturate(fog);
-#line 136 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skydome.h.fsl"
+#line 149 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skydome.h.fsl"
     float upness = worldPosRel.z * rsqrt(max(dot(worldPosRel, worldPosRel), 1.0e-12f));
     float skyBehind = max(s.a, saturate(upness *  38.0f ));
-#line 158 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skydome.h.fsl"
+#line 171 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skydome.h.fsl"
     float ramp = pow(1.0f - fog, gFrameData.timeParams.w);
     lit *= 1.0f - gFrameData.skyParams.w * ramp * skyBehind;
 

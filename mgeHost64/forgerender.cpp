@@ -9443,7 +9443,32 @@ namespace ForgeRender {
             // bites once fog is complete, by which point there is no surface left to silhouette.
             // The shader scales it by sky COVERAGE, so it cannot reach the ground/sea/below-horizon
             // fragments that the negative control watches. 0 = no darkening on the way in.
-            dp[63] = std::max(0.0f, std::min(g_fogSkyExtinct, 1.0f));
+            //
+            // TWO gates, and both of them close it completely rather than scaling it down:
+            //
+            //   EXTERIOR. Coverage is `max(s.a, saturate(upness * RAMP))` — the exact sky-pass alpha,
+            //   unioned with a geometric guess that fills the band between the dome's lower rim and
+            //   the horizon, where the host draws nothing at all. Indoors s.a is 0 everywhere and
+            //   CORRECTLY so, so the guess is the only term left and it FABRICATES sky above the eye:
+            //   `upness` is sin(elevation) about the eye, RAMP 38 makes it a step that completes in
+            //   ~1.5 degrees, and the result is a level line through the eye's horizontal plane with
+            //   every fogged surface above it darkened and everything below it untouched. Reported
+            //   2026-08-01 as a line across the middle of an interior, tracking the camera, on
+            //   surfaces only (it multiplies `lit`, so the fog clear colour never moved). An interior
+            //   has no sky to silhouette against, so the honest strength there is 0 — the same idiom
+            //   the sun, sky-AO and sky-ambient publishes already use for interiors.
+            //   (A terrain-residency failure also clears g_dlExterior. That kills distant land
+            //   outright, so there are no distant silhouettes left to extinguish either.)
+            //
+            //   STRENGTH. g_fogSkyStrength is the master for the whole feature, not just for the
+            //   target half — its slider promises "0 = flat fog, the A/B", and extinction bypassing it
+            //   quietly broke that promise the moment extinction was added. It also made the promise
+            //   actively misleading: the sky SNAPSHOT is skipped at strength 0 (see the colour pass),
+            //   so extinction's own `max(s.a, ...)` went on reading whatever gSkyColor last held — in
+            //   an interior, the previous exterior's sky. Gating here restores both at once: at 0
+            //   nothing reads the snapshot, so not taking it is correct by construction.
+            dp[63] = (g_dlExterior && g_fogSkyStrength > 0.0f)
+                   ? std::max(0.0f, std::min(g_fogSkyExtinct, 1.0f)) : 0.0f;
             // timeParams.w (float 83) = the SHAPE of that same ramp — see g_fogSkyShape. Written HERE
             // beside its partner rather than with timeParams.xyz above, which sit inside the
             // `if (lighting)` guard: these two knobs are a pair and reading one without the other is
