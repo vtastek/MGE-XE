@@ -10,6 +10,7 @@
 #include "opaque.srt.h"
 #include "texsample.h.fsl"   // sampleBase() — MW address mode + AF level
 #include "fpshadow.h.fsl"    // fpShadowVisibility() — first-person direct cube-atlas shadow test
+#include "shadowreceive.h.fsl" // shadowMaskPixel() — the mask texel that is actually OURS under MSAA
 #include "msmrecv.h.fsl"     // sunShadowVisibility() — MSM sun-shadow receiver
 #include "skyamb.h.fsl"      // skyAmbFactor() — SH-L1 sky ambient (SH1) + sky AO (SH2)
 #include "skydome.h.fsl"     // applyFog() — extinguish into a silhouette, then melt into the SAMPLED sky
@@ -104,6 +105,15 @@ float4 PS_MAIN( VSOutput In )
     // lights cbuffer packs 3 float4 per light: [i*3+0]=(pos.xyz, radius), [i*3+1]=(col.rgb,_),
     // [i*3+2]=(k0,k1,k2,_). lightParams.x is the active count (host-written), .y the reach.
     uint litCount = 0u;   // debug (mode 9): point lights that reach this pixel
+    // Which gShadowMask texel is OURS (shadowreceive.h.fsl). Resolved HERE, at top level, because it
+    // takes derivatives and the mask is read from deep inside the divergent light loop; one int2 then
+    // serves every light. All three guards are cbuffer-driven, so the branch is uniform across the
+    // draw and quad-coherent: no slots means no light carries one, the mirror pass never reads the
+    // main-view mask at all, and the FP arms take the direct atlas path below instead.
+    int2 maskPx = int2(In.Position.xy);
+    if (!inReflect && gShadowParams.slotBits.x != 0u && gFrameData.alphaShadowParams.y <= 0.5f) {
+        maskPx = shadowMaskPixel(In.Position);
+    }
     {
         uint nLights = (uint)gLights.lightParams.x;
         // Light reach in radii — host-slaved to the shadow test range (see opaque.srt.h). The
@@ -192,7 +202,9 @@ float4 PS_MAIN( VSOutput In )
                     }
                     else
                     {
-                        uint4 mw   = LoadTex2D(gShadowMask, NO_SAMPLER, int2(In.Position.xy), 0).xyzw;
+                        // maskPx, not our own pixel: under MSAA the mask at a silhouette pixel can
+                        // belong to the geometry behind us (see shadowreceive.h.fsl).
+                        uint4 mw   = LoadTex2D(gShadowMask, NO_SAMPLER, maskPx, 0).xyzw;
                         uint  s    = slotP1 - 1u;
                         uint  lane = s >> 3u;
                         uint  word = lane == 0u ? mw.x : (lane == 1u ? mw.y : (lane == 2u ? mw.z : mw.w));

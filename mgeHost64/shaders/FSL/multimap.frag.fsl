@@ -11,6 +11,7 @@
 #include "opaque.srt.h"
 #include "texsample.h.fsl"   // sampleBase() — MW address mode + AF level
 #include "msmrecv.h.fsl"     // sunShadowVisibility() — MSM sun-shadow receiver
+#include "shadowreceive.h.fsl" // shadowMaskPixel() — the mask texel that is actually OURS under MSAA
 #include "skyamb.h.fsl"      // skyAmbFactor() — SH-L1 sky ambient (SH1) + sky AO (SH2)
 #include "skydome.h.fsl"     // applyFog() — extinguish into a silhouette, then melt into the SAMPLED sky
 
@@ -65,6 +66,12 @@ float4 PS_MAIN( VSOutput In )
     // Tier 3: GTAO modulates AMBIENT only — gated by the "AO enable" tick (debugParams.w bit0).
     if ((aoFlags & 1u) != 0u) { a *= aoSample.a; }
     a *= gFrameData.dbgScales.x;   // dev panel: ambient intensity modifier (lockstep w/ opaque.frag)
+    // Which gShadowMask texel is OURS under MSAA (shadowreceive.h.fsl) — lockstep with opaque.frag.
+    // Top level, because it takes derivatives and the mask is read from inside the divergent light
+    // loop. The guard is cbuffer-driven (uniform across the draw): no active slot means no light
+    // carries one, so nothing reads the mask at all.
+    int2 maskPx = int2(In.Position.xy);
+    if (gShadowParams.slotBits.x != 0u) { maskPx = shadowMaskPixel(In.Position); }
     {
         uint nLights = (uint)gLights.lightParams.x;
         float reachK = gLights.lightParams.y;   // host-slaved light reach — see opaque.srt.h
@@ -124,7 +131,9 @@ float4 PS_MAIN( VSOutput In )
                 uint slotP1 = (uint)gLights.lights[i * 3u + 2u].w;
                 if (slotP1 != 0u)
                 {
-                    uint4 mw   = LoadTex2D(gShadowMask, NO_SAMPLER, int2(In.Position.xy), 0).xyzw;
+                    // maskPx, not our own pixel: under MSAA the mask at a silhouette pixel can
+                    // belong to the geometry behind us (see shadowreceive.h.fsl).
+                    uint4 mw   = LoadTex2D(gShadowMask, NO_SAMPLER, maskPx, 0).xyzw;
                     uint  s    = slotP1 - 1u;
                     uint  lane = s >> 3u;
                     uint  word = lane == 0u ? mw.x : (lane == 1u ? mw.y : (lane == 2u ? mw.z : mw.w));

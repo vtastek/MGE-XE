@@ -1,0 +1,78 @@
+// mgeHost64 — reading the screen-space point-light shadow mask from a forward frag, under MSAA.
+//
+// THE PROBLEM. shadowmask.comp runs over pLinearDepth, and pLinearDepth is SAMPLE 0 of the MSAA
+// depth buffer (linearizedepth.comp.fsl — Load(coord, 0)). So each mask texel describes exactly ONE
+// surface: whichever one happened to cover sample 0. Everywhere inside a triangle that is also this
+// fragment's surface and the mask is right. At a SILHOUETTE it is a coin toss — two surfaces share
+// the pixel, one texel exists, and the loser's fragment gets handed a shadow state that belongs to
+// the geometry behind it:
+//
+//   a shadowed NPC in front of a lit wall  -> its rim pixels read LIT      -> bright outline
+//   a lit head in front of a shadowed wall -> its rim pixels read SHADOWED -> dark outline
+//
+// and symmetrically the wall's own rim pixels pick up the NPC's state. It reads as "non-MSAA pixels
+// along the silhouette" because that is precisely what it is: one PIXEL-rate attribute inside a pass
+// that is otherwise sample-rate, so the resolve has nothing to average away. Statics show it less
+// only because statics.frag takes no point-light shadow at all and near statics mostly meet other
+// surfaces of similar shadow state; a character is an isolated silhouette against unrelated depth.
+//
+// THE FIX. Verify the texel, and if it isn't ours, step to a neighbour that is. SV_Position.z is
+// this triangle's DEVICE depth at the pixel CENTRE, and z_ndc is AFFINE in screen space (that is
+// what lets the rasteriser interpolate depth linearly), so ddx/ddy give the triangle's exact plane —
+// evaluate it at a neighbour and compare against what the prepass stored there. The first neighbour
+// that agrees is a pixel our own surface owns, and its mask is our shadow to within one pixel of
+// parallax. If none agrees (a sliver thinner than a pixel) we keep the centre texel: the OLD
+// behaviour, not a new failure mode.
+//
+// Not a per-sample mask, and not a direct atlas test per fragment: this keeps the mask's PCF grid,
+// flicker wobble and per-pixel K-cap exactly as the interior pixels see them, so the rim can't
+// disagree with its own surface two pixels inward.
+//
+// Cost: one depth load per fragment that has any shadow slot to read, four more only on the pixels
+// that actually straddle an edge.
+//
+// CALL IT FROM UNIFORM CONTROL FLOW — it takes derivatives, so it must not be called inside the
+// light loop (divergent) . Resolve it once near the top of the frag and reuse the int2 for every
+// light. Requires opaque.srt.h (gSceneLinDepth, gShadowParams).
+//
+// VALID ONLY IN THE OPAQUE COLOUR PASS. gSceneLinDepth holds the pre-colour linearize — the exact
+// snapshot shadowmask.comp consumed — from the Z-prepass until the colour->water seam re-linearizes
+// it. The alpha stage rebuilds the mask from a DIFFERENT depth (pAlphaShadowDepth) against an
+// already-refreshed gSceneLinDepth, so alpha.frag / multimap_alpha.frag must NOT use this: there the
+// two buffers describe different things and every pixel would "disagree".
+#pragma once
+
+// The mask texel this fragment should read. Returns int2(svPos.xy) unchanged whenever the mask is
+// already ours (the overwhelmingly common case) or when no neighbour can be proven ours.
+int2 shadowMaskPixel(float4 svPos)
+{
+    int2  px  = int2(svPos.xy);
+    float dzx = ddx(svPos.z);
+    float dzy = ddy(svPos.z);
+
+    // Half a screen-space step is the furthest any sample position can sit from the pixel centre, so
+    // inside that the stored depth IS our own plane. The epsilon covers float rounding in the finite
+    // difference; reverse-Z puts near geometry — the only place a point light reaches — up near 1,
+    // where it is comfortably below one ULP of the real depth differences we mean to catch.
+    float tol = 0.5f * (abs(dzx) + abs(dzy)) + 1e-6f;
+    if (abs(LoadTex2D(gSceneLinDepth, NO_SAMPLER, px, 0).r - svPos.z) <= tol) { return px; }
+
+    // Straddling an edge. Compare each neighbour against OUR plane EXTRAPOLATED to it, not against
+    // svPos.z: on a sloped surface the depth moves a full step per pixel, and a test against the
+    // centre value would reject our own floor. 1.5 steps of slack so a curved or faceted surface's
+    // neighbouring triangle still counts as ours. Out-of-bounds loads return 0 = reverse-Z far, which
+    // fails the compare — no edge clamp needed.
+    float ntol = 1.5f * (abs(dzx) + abs(dzy)) + 1e-6f;
+    UNROLL
+    for (int i = 0; i < 4; ++i)
+    {
+        int2 o = (i == 0) ? int2(-1, 0)
+               : (i == 1) ? int2( 1, 0)
+               : (i == 2) ? int2( 0,-1)
+                          : int2( 0, 1);
+        int2  q  = px + o;
+        float zq = svPos.z + dzx * float(o.x) + dzy * float(o.y);
+        if (abs(LoadTex2D(gSceneLinDepth, NO_SAMPLER, q, 0).r - zq) <= ntol) { return q; }
+    }
+    return px;
+}

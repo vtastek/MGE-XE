@@ -22,6 +22,7 @@
 
 #include "opaque.srt.h"
 #include "msmrecv.h.fsl"   // sunShadowVisibility() — MSM sun-shadow receiver
+#include "shadowreceive.h.fsl" // shadowMaskPixel() — the mask texel that is actually OURS under MSAA
 #include "skyamb.h.fsl"    // skyAmbFactor() — SH-L1 sky ambient (SH1) + sky AO (SH2)
 #include "skydome.h.fsl"   // applyFog() — extinguish into a silhouette, then melt into the SAMPLED sky
 
@@ -186,6 +187,13 @@ float4 PS_MAIN( VSOutput In )
     // boundary. Handoff 0 (dedup off) ⇒ distant everywhere ⇒ byte-identical to before this landed.
     float3 pointDiffuse = float3(0.0f, 0.0f, 0.0f);
     bool   inReflect    = (gFrameData.gReflWaterClip.z != 0.0f);
+    // Which gShadowMask texel is OURS under MSAA (shadowreceive.h.fsl). The ground is the surface
+    // every silhouette is drawn AGAINST, so it takes the other half of the artifact: its pixels along
+    // an NPC's outline read the NPC's shadow state. Resolved here, at top level — it takes derivatives
+    // and the mask is read from inside both divergent light loops. Guards are cbuffer-driven, so the
+    // branch is uniform across the draw.
+    int2 maskPx = int2(In.Position.xy);
+    if (!inReflect && gShadowParams.slotBits.x != 0u) { maskPx = shadowMaskPixel(In.Position); }
     if (length(In.WorldPos) < gFrameData.lodParams.x)
     {
         // NEAR live lights — opaque.frag's inlined body, clustered through the NEAR grid
@@ -244,7 +252,9 @@ float4 PS_MAIN( VSOutput In )
                 uint slotP1 = (uint)fo.w;
                 if (slotP1 != 0u && !inReflect)   // mirror: gShadowMask is main-view screen space
                 {
-                    uint4 mw   = LoadTex2D(gShadowMask, NO_SAMPLER, int2(In.Position.xy), 0).xyzw;
+                    // maskPx, not our own pixel: under MSAA the mask at a silhouette pixel can
+                    // belong to whatever is standing in front of us (see shadowreceive.h.fsl).
+                    uint4 mw   = LoadTex2D(gShadowMask, NO_SAMPLER, maskPx, 0).xyzw;
                     uint  s    = slotP1 - 1u;
                     uint  lane = s >> 3u;
                     uint  word = lane == 0u ? mw.x : (lane == 1u ? mw.y : (lane == 2u ? mw.z : mw.w));

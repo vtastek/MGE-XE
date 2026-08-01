@@ -5871,16 +5871,25 @@ namespace {
             // reverse-Z device depth, Tier 2 AO block above). gReflectColor is the WT1 stand-in — bind
             // pRefractColor as a valid placeholder (the frag ignores it in WT1; WT2 rebinds the mirror RT).
             if (g_live.waterReady) {
-                DescriptorData wp[4] = {};
+                DescriptorData wp[3] = {};
                 wp[0].mIndex = SRT_RES_IDX(SrtData, PerFrame, gWaterNormalVol);
                 wp[0].mCount = 1; wp[0].ppTextures = &g_live.pWaterNormalVol;
                 wp[1].mIndex = SRT_RES_IDX(SrtData, PerFrame, gRefractColor);
                 wp[1].mCount = 1; wp[1].ppTextures = &g_live.pRefractColor;
-                wp[2].mIndex = SRT_RES_IDX(SrtData, PerFrame, gSceneLinDepth);
-                wp[2].mCount = 1; wp[2].ppTextures = &g_live.pLinearDepth;
-                wp[3].mIndex = SRT_RES_IDX(SrtData, PerFrame, gReflectColor);
-                wp[3].mCount = 1; wp[3].ppTextures = &g_live.pRefractColor;   // WT1 stand-in
-                updateDescriptorSet(R, 0, g_live.pPerFrameSet, 4, wp);
+                wp[2].mIndex = SRT_RES_IDX(SrtData, PerFrame, gReflectColor);
+                wp[2].mCount = 1; wp[2].ppTextures = &g_live.pRefractColor;   // WT1 stand-in
+                updateDescriptorSet(R, 0, g_live.pPerFrameSet, 3, wp);
+            }
+            // gSceneLinDepth, OUTSIDE the waterReady gate for the same reason gSkyColor is below it:
+            // this stopped being water's private SRV. shadowreceive.h.fsl reads it from the opaque /
+            // multimap / terrain frags to find the mask texel that belongs to their own surface, and
+            // those draw whether or not the water mesh built. Every other PerFrame instance already
+            // binds it unconditionally; this was the last one that didn't.
+            if (g_live.pLinearDepth) {
+                DescriptorData lp = {};
+                lp.mIndex = SRT_RES_IDX(SrtData, PerFrame, gSceneLinDepth);
+                lp.mCount = 1; lp.ppTextures = &g_live.pLinearDepth;
+                updateDescriptorSet(R, 0, g_live.pPerFrameSet, 1, &lp);
             }
             // gSkyColor into the MAIN PerFrame set. Deliberately OUTSIDE the waterReady gate above:
             // "fog samples the sky" has nothing to do with water, and hanging it off water's readiness

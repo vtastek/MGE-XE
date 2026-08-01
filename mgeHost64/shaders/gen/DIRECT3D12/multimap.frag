@@ -1712,6 +1712,41 @@ float sunShadowVisibility(float3 worldPosRel, float3 N)
     return 1.0f - occlusion * strength;
 }
 #line 14 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/multimap.frag.fsl"
+#line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowreceive.h.fsl"
+#line 47 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowreceive.h.fsl"
+int2 shadowMaskPixel(float4 svPos)
+{
+    int2 px = int2(svPos.xy);
+    float dzx = ddx(svPos.z);
+    float dzy = ddy(svPos.z);
+
+
+
+
+
+    float tol = 0.5f * (abs(dzx) + abs(dzy)) + 1e-6f;
+    if (abs(LoadTex2D(gSceneLinDepth, NO_SAMPLER, px, 0).r - svPos.z) <= tol) { return px; }
+
+
+
+
+
+
+    float ntol = 1.5f * (abs(dzx) + abs(dzy)) + 1e-6f;
+    UNROLL
+    for (int i = 0; i < 4; ++i)
+    {
+        int2 o = (i == 0) ? int2(-1, 0)
+               : (i == 1) ? int2( 1, 0)
+               : (i == 2) ? int2( 0,-1)
+                          : int2( 0, 1);
+        int2 q = px + o;
+        float zq = svPos.z + dzx * float(o.x) + dzy * float(o.y);
+        if (abs(LoadTex2D(gSceneLinDepth, NO_SAMPLER, q, 0).r - zq) <= ntol) { return q; }
+    }
+    return px;
+}
+#line 15 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/multimap.frag.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyamb.h.fsl"
 #line 83 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyamb.h.fsl"
 float skyAOVisibility(float3 worldAbs)
@@ -1827,7 +1862,7 @@ float3 skyAmbFactor(float3 N, float3 worldPosRel)
 
     return lerp(float3(1.0f, 1.0f, 1.0f), max(f, float3(0.0f, 0.0f, 0.0f)), s) * ao;
 }
-#line 15 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/multimap.frag.fsl"
+#line 16 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/multimap.frag.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skydome.h.fsl"
 #line 69 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skydome.h.fsl"
 float4 fogSkySample(float2 pixelXy)
@@ -1872,7 +1907,7 @@ float3 applyFog(float3 lit, float3 worldPosRel, float2 pixelXy, float fog)
 
     return lerp(fogSkyTarget(s), lit, fog);
 }
-#line 16 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/multimap.frag.fsl"
+#line 17 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/multimap.frag.fsl"
 
 STRUCT(VSOutput)
 {
@@ -1890,7 +1925,7 @@ STRUCT(VSOutput)
     DATA(float3, WorldPos, TEXCOORD8);
     DATA(FLAT(uint4), Stages, TEXCOORD9);
     DATA(FLAT(uint), Packed, TEXCOORD10);
-#line 33
+#line 34
 };
 
 
@@ -1926,6 +1961,12 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
 
     if ((aoFlags & 1u) != 0u) { a *= aoSample.a; }
     a *= gFrameData.dbgScales.x;
+
+
+
+
+    int2 maskPx = int2(In.Position.xy);
+    if (gShadowParams.slotBits.x != 0u) { maskPx = shadowMaskPixel(In.Position); }
     {
         uint nLights = (uint)gLights.lightParams.x;
         float reachK = gLights.lightParams.y;
@@ -1985,7 +2026,9 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
                 uint slotP1 = (uint)gLights.lights[i * 3u + 2u].w;
                 if (slotP1 != 0u)
                 {
-                    uint4 mw = LoadTex2D(gShadowMask, NO_SAMPLER, int2(In.Position.xy), 0).xyzw;
+
+
+                    uint4 mw = LoadTex2D(gShadowMask, NO_SAMPLER, maskPx, 0).xyzw;
                     uint s = slotP1 - 1u;
                     uint lane = s >> 3u;
                     uint word = lane == 0u ? mw.x : (lane == 1u ? mw.y : (lane == 2u ? mw.z : mw.w));
