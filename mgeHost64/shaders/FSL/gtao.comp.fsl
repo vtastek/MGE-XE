@@ -1,47 +1,32 @@
-// mgeHost64 — Tier 2: GTAO compute stage (horizon-search AO + native bent normals, option A).
+// mgeHost64 — GTAO: ground-truth ambient occlusion (Jimenez et al. 2016), + native bent normals.
 //
-// Reads the single-sample reverse-Z DEVICE depth (gLinearDepthIn from the linearize pass),
-// reconstructs WORLD positions per tap via gAOParams.invViewProj (only the combined viewProj is
-// available host-side — no separate view/proj — so the whole search runs in world space keyed off
-// gAOParams.eyePos), reconstructs the surface normal from min-difference depth neighbours, and runs
-// an HBAO-style elevation search (occlusion = how high a neighbour rises above the tangent plane,
-// N-relative so it is VIEW-INDEPENDENT — no matcap, no grazing blackening; V is only used to orient
-// the bent normal). Writes float4(bentNormalWS, visibility) to gAOOut.
+// Mode 0 of four (see aocommon.h.fsl for the shared core and the invariants all four keep;
+// hbao/vbao/ssaofast are the others). This is the reference mode: a cosine-weighted horizon-arc
+// integral, which is what "ground truth" in the name refers to — the other three approximate it.
 //
-//   a (visibility)  : 1 = fully open (white), 0 = fully occluded (cavity). Tier 3 will do ambient *= a.
-//   rgb (bent normal): world-space mean unoccluded direction (debug mode 4 outputs it RAW, no remap).
+// Per slice:
+//   1. Build an orthonormal basis (V, T) in the slice plane; every angle below is measured from V
+//      toward T, so a tap's angle is +acos(dot(d,V)) on the +T side and -acos(...) on the -T side.
+//   2. Project the surface normal into that plane: its angle n and its length projLen (the slice's
+//      weight — a slice edge-on to the normal contributes almost nothing, which is what makes the
+//      few-slice average come out right).
+//   3. Search the horizon on each side as a RUNNING MAX of dot(d, V): the tap closest in angle to
+//      the view ray is the one that occludes most. Distance-attenuated taps lerp toward -1 (fully
+//      open), so the falloff can only ever REDUCE occlusion, monotonically in distance.
+//   4. Clamp each horizon into the hemisphere around n (n +- 90 degrees = fully open) and evaluate
+//      the arc integral. A flat plane has no tap above its own tangent plane, so both horizons hit
+//      the clamp exactly and the slice integrates to 1 at ANY camera angle — the view-independence
+//      the whole design rests on.
 //
-// Tier 2 is AO-in-isolation: nothing here feeds the colour pass except the F12 debug views. Seeds
-// follow scene-walk (radius/falloff/intensity in gAOParams); they are WORLD-unit knobs and may need
-// MW-scale tuning — host-side constants, one line to change. Spatial/temporal denoise = follow-up.
+// The bent normal is the mid-angle of the open arc, accumulated in the same (V,T) basis and
+// weighted by projLen. opaque.frag/multimap.frag shade with it when "bent normal" is ticked.
 
 #include "gtao.srt.h"
+#include "aocommon.h.fsl"
 
-#define GTAO_PI       3.14159265359f
-#define GTAO_HALF_PI  1.57079632679f
-#define NUM_SLICES    3
-#define NUM_STEPS     8
-
-float3 reconstructWorld(float2 uv, float deviceZ)
-{
-    float ndcX = uv.x * 2.0f - 1.0f;
-    float ndcY = 1.0f - uv.y * 2.0f;
-    float4 p = mul(gAOParams.invViewProj, float4(ndcX, ndcY, deviceZ, 1.0f));
-    return p.xyz / p.w;
-}
-
-float loadDeviceZ(int2 c)
-{
-    return LoadTex2D(gLinearDepthIn, NO_SAMPLER, c, 0).r;
-}
-
-// Interleaved gradient noise — rotates the slice set per pixel to hide banding.
-float ignoise(float2 p)
-{
-    return frac(52.9829189f * frac(dot(p, float2(0.06711056f, 0.00583715f))));
-}
-
-// One side of one slice: GTAO inner integral term for a clamped horizon angle h vs normal angle n.
+// Inner term of the GTAO arc integral for one clamped horizon angle h against the in-slice normal
+// angle n. It is the antiderivative of cos(theta - n)*|sin theta| plus the constant that makes the
+// two sides sum from the shared origin at theta = 0.
 float gtaoInner(float h, float n)
 {
     return 0.25f * (-cos(2.0f * h - n) + cos(n) + 2.0f * h * sin(n));
@@ -52,137 +37,106 @@ NUM_THREADS(8, 8, 1)
 void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
 {
     INIT_MAIN;
-	float vis = 0.0f;
-	float3 bn = 0.0f;
-	float3 deb = 0.0f;
     int2   px        = int2(DispatchThreadID.xy);
     float2 screen    = gAOParams.screenParams.xy;
     float2 invScreen = gAOParams.screenParams.zw;
-    float2 uv        = (float2(px) + 0.5f) * invScreen;
-
-    float deviceZ = loadDeviceZ(px);
-	
-	
-    // Reverse-Z far/cleared = 0.0 (sky / no geometry) → fully unoccluded.
-    if (deviceZ <= 0.0f)
+    if (px.x >= (int)screen.x || px.y >= (int)screen.y)
     {
-        Write2D(gAOOut, px, float4(0.0f, 0.0f, 1.0f, 1.0f));
         RETURN();
     }
-    float3 P = reconstructWorld(uv, deviceZ);
-    float3 V = normalize(gAOParams.eyePos.xyz - P);
+    float2 uv = (float2(px) + 0.5f) * invScreen;
 
-
-    // Screen-axis world deltas (also map screen directions → world tangent for the slices).
-    float3 Pr = reconstructWorld(uv + float2(invScreen.x, 0.0f), loadDeviceZ(px + int2(1, 0)));
-    float3 Pl = reconstructWorld(uv - float2(invScreen.x, 0.0f), loadDeviceZ(px - int2(1, 0)));
-    float3 Pu = reconstructWorld(uv + float2(0.0f, invScreen.y), loadDeviceZ(px + int2(0, 1)));
-    float3 Pd = reconstructWorld(uv - float2(0.0f, invScreen.y), loadDeviceZ(px - int2(0, 1)));
-	
-
-    // Min-difference neighbours (smaller world gap = same surface; rejects silhouette bleed).
-    float3 dxr = Pr - P, dxl = P - Pl;
-    float3 ddxv = (dot(dxr, dxr) < dot(dxl, dxl)) ? dxr : dxl;
-    float3 dyr = Pu - P, dyl = P - Pd;
-    float3 ddyv = (dot(dyr, dyr) < dot(dyl, dyl)) ? dyr : dyl;
-    float3 N = normalize(cross(ddxv, ddyv));
-    if (dot(N, V) < 0.0f) { N = -N; }   // orient toward the camera
-	
-
-
-
-    // Adaptive screen radius: keep the world search extent ~constant regardless of distance.
-    float wpp = max(min(length(dxr), length(dxl)), 1e-4f);
-	// world units per pixel (approx)
-    float radiusWorld = gAOParams.aoParams.x;
-    float searchPixels = clamp(radiusWorld / wpp, 2.0f, 96.0f);
-
-    // Force >=1px per step: sub-pixel steps make every sample land on ~the same texel, so ds is a
-    // tiny depth-quantized world delta and dot(ds,N)/|ds| explodes into noise (worst where wpp is
-    // large — distant / low-radius pixels, amplified by reverse-Z quantization). 1px steps give each
-    // sample a real, distinct world delta. The effective search may exceed radius where wpp is big;
-    // that trade buys clean AO.
-    float stepPx = max(searchPixels / float(NUM_STEPS), 1.0f);
-
-
-    float falloff = max(gAOParams.aoParams.y, 1e-3f);
-	
-    // N-relative thickness bias: a sample only occludes if it rises more than this above the
-    // surface tangent plane (sin of elevation). This is VIEW-INDEPENDENT, unlike a horizon-cosine
-    // bias — a flat plane has elevation 0 everywhere, so it never self-occludes at any camera angle.
-    float horizonBias = gAOParams.aoParams.w;
-
-    float  rnd   = ignoise(float2(px));
-    float  occ   = 0.0f;                       // accumulated OCCLUSION (0 = open, 1 = blocked)
-    float3 bentN = float3(0.0f, 0.0f, 0.0f);
-
-    // HBAO-style horizon search: occlusion is the ELEVATION a neighbour rises above this surface's
-    // tangent plane (sin of the horizon angle), measured purely N-relative. The view vector V never
-    // enters the occlusion term, so flat surfaces give 0 at EVERY camera angle — no matcap, no
-    // grazing-angle blackening. (V is only used to orient the bent normal / N.) NOTE: hP/hM take the
-    // elevation as-is per step (no running max) — maxing let one tall/noisy sample latch the whole
-    // sweep's horizon, which showed up as artifacts; per-step assignment is cleaner here.
-    UNROLL
-    for (int s = 0; s < NUM_SLICES; ++s)
+    float3 P, N, V, ddxv, ddyv;
+    float  wpp;
+    if (!aoSurface(px, uv, invScreen, P, N, V, ddxv, ddyv, wpp))
     {
-        float  phi = (float(s) + rnd) * (GTAO_PI / float(NUM_SLICES));
-        float2 dir = float2(cos(phi), sin(phi));            // screen-space (pixels)
-        float3 sliceDirW = normalize(ddxv * dir.x + ddyv * dir.y);
+        Write2D(gAOOut, px, AO_SKY_RESULT);
+        RETURN();
+    }
 
-        float hP = 0.0f;   // +dir elevation above tangent plane (sin), >= 0
-        float hM = 0.0f;   // -dir elevation
+    int    slices = aoSlices();
+    int    steps  = aoSteps();
+    float  stepPx = aoStepPixels(wpp, steps);
+    float2 dither = aoDither(px);
+    float  bias   = aoBias();
 
-        for (int t = 1; t <= NUM_STEPS; ++t)
+    float  visSum  = 0.0f;
+    float3 bentSum = float3(0.0f, 0.0f, 0.0f);
+
+    for (int s = 0; s < slices; ++s)
+    {
+        float  phi = (float(s) + dither.x) * (AO_PI / float(slices));
+        float2 dir = float2(cos(phi), sin(phi));
+
+        // In-slice basis: T is the slice direction made perpendicular to V.
+        float3 T  = aoSliceDirW(ddxv, ddyv, dir);
+        T = T - V * dot(T, V);
+        float tl = length(T);
+        if (tl < 1e-5f)
         {
-            float off = (float(t) - 0.5f) * stepPx;
-            // +dir
-            int2  scp = px + int2(dir * off + 0.5f);
-            float dzp = loadDeviceZ(scp);
-            if (dzp > 0.0f)
+            continue;   // degenerate slice (looking straight down this tangent)
+        }
+        T = T / tl;
+
+        // Normal projected into the slice plane.
+        float nV      = dot(N, V);
+        float nT      = dot(N, T);
+        float projLen = sqrt(nV * nV + nT * nT);
+        if (projLen < 1e-5f)
+        {
+            continue;
+        }
+        float n = atan2(nT, nV);
+
+        // Horizon search, running max of the cosine to V. -1 = nothing found = fully open.
+        float cosP = -1.0f;
+        float cosM = -1.0f;
+        for (int t = 0; t < steps; ++t)
+        {
+            float off = aoStepOffset(t, stepPx, dither.y);
+
+            int2  sp = aoTap(px, dir, off);
+            float zp = aoLoadZ(sp);
+            if (zp > 0.0f)
             {
-                float3 ds = reconstructWorld((float2(scp) + 0.5f) * invScreen, dzp) - P;
-                float  dl = length(ds);
-                // sin(elevation above tangent) minus the height bias; clamp negatives (at/below
-                // the surface) to 0, then fade with distance so far geometry stops occluding.
-                float  e = max(dot(ds, N) / max(dl, 1e-6f) - horizonBias, 0.0f);
-                e *= saturate(1.0f - dl / falloff);
-                hP = e;
+                float3 ds = aoReconstructWorld((float2(sp) + 0.5f) * invScreen, zp) - P;
+                float  dl = max(length(ds), 1e-6f);
+                float3 d  = ds / dl;
+                if (dot(d, N) > bias)   // must rise above the tangent plane: view-independent
+                {
+                    cosP = max(cosP, lerp(-1.0f, dot(d, V), aoFalloffWeight(dl)));
+                }
             }
-            // -dir
-            int2  scm = px - int2(dir * off + 0.5f);
-            float dzm = loadDeviceZ(scm);
-            if (dzm > 0.0f)
+
+            int2  sm = aoTap(px, -dir, off);
+            float zm = aoLoadZ(sm);
+            if (zm > 0.0f)
             {
-                float3 ds = reconstructWorld((float2(scm) + 0.5f) * invScreen, dzm) - P;
-                float  dl = length(ds);
-                float  e = max(dot(ds, N) / max(dl, 1e-6f) - horizonBias, 0.0f);
-                e *= saturate(1.0f - dl / falloff);
-                hM = e;
+                float3 ds = aoReconstructWorld((float2(sm) + 0.5f) * invScreen, zm) - P;
+                float  dl = max(length(ds), 1e-6f);
+                float3 d  = ds / dl;
+                if (dot(d, N) > bias)
+                {
+                    cosM = max(cosM, lerp(-1.0f, dot(d, V), aoFalloffWeight(dl)));
+                }
             }
         }
 
-        // Slice occlusion = mean of the two horizon sines. Bent normal tilts toward the more-open
-        // side (lower horizon) along the slice tangent, lifted by overall openness.
-        occ += 0.5f * (hP + hM);
-        float openP = 1.0f - hP;
-        float openM = 1.0f - hM;
-        bentN += N * (openP + openM) + sliceDirW * (openP - openM);
+        float h1 =  acos(clamp(cosP, -1.0f, 1.0f));   // +T side
+        float h0 = -acos(clamp(cosM, -1.0f, 1.0f));   // -T side
+        h1 = n + min(h1 - n,  AO_HALF_PI);
+        h0 = n + max(h0 - n, -AO_HALF_PI);
+
+        visSum += projLen * (gtaoInner(h0, n) + gtaoInner(h1, n));
+
+        float bentAngle = 0.5f * (h0 + h1);
+        bentSum += (V * cos(bentAngle) + T * sin(bentAngle)) * projLen;
     }
 
-    occ = saturate(occ / float(NUM_SLICES));
-    // Resolve fade: where the world radius is finer than a pixel (radiusWorld < wpp), the search
-    // CAN'T represent it — the pixel/step floors over-reach and sample geometry tens of units away,
-    // producing flickery false occlusion (worst in the distance / at grazing, where wpp is large).
-    // Fade AO to zero there: a sub-pixel radius should yield NO AO, not noise. Full once the radius
-    // spans >~2 px. This is what makes a small radius (e.g. 1) usable — tight AO up close, clean
-    // (empty) where it can't be resolved — and never touches well-resolved large-radius pixels.
-    occ *= saturate(radiusWorld / wpp - 1.0f);
-    occ *= gAOParams.aoParams.z;                                     // intensity scales occlusion
-    vis = saturate(1.0f - occ);
- 
-    bn = bentN + N * 1e-3f;   // guard fully-degenerate accumulation
-    bn = normalize(bn);
-	
-    Write2D(gAOOut, px, float4(bn, vis));
+    // Per-slice values legitimately exceed 1 for a tilted normal and fall short for a slice
+    // edge-on to it; projLen is what makes the average land back on 1. saturate() only guards the
+    // few-slice residual.
+    float vis = saturate(visSum / float(slices));
+    Write2D(gAOOut, px, aoResolve(1.0f - vis, bentSum, N));
     RETURN();
 }

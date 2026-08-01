@@ -275,9 +275,27 @@
 #include "linearizedepth.comp.fsl"
 #end
 
-// GTAO: single variant — reads the already-resolved single-sample depth, never the MSAA DSV.
+// Screen-space AO — FOUR interchangeable modes behind one SRT (AOSrtData) and one descriptor set.
+// The host holds pAOShader[]/pAOPipeline[] indexed by the "AO mode" dropdown and binds one of them;
+// all four read the already-resolved single-sample depth (never the MSAA DSV) and write
+// float4(bentNormalWS, visibility) to pAO, so aoblur.comp and the colour frags are untouched by the
+// choice. Shared core (depth load, world reconstruct, min-difference normal, search geometry, slice
+// basis, dither, resolve) is aocommon.h.fsl — the four differ ONLY in their accumulator.
 #comp gtao.comp
 #include "gtao.comp.fsl"
+#end
+
+#comp hbao.comp
+#include "hbao.comp.fsl"
+#end
+
+#comp vbao.comp
+#include "vbao.comp.fsl"
+#end
+
+// ...and the same bitmask body at a fixed 2 slices / 4 steps (literal bounds => fully unrolled).
+#comp ssaofast.comp
+#include "ssaofast.comp.fsl"
 #end
 
 // AO bilateral blur: third compute pass — denoises pAO -> pAOBlur (depth-aware, no silhouette bleed).

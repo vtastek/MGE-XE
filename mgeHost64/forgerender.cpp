@@ -1010,6 +1010,25 @@ namespace {
     // it fixes the moments atlas width, and the atlas is allocated once at init.
     constexpr uint32_t kSunCascades = 2;
 
+    // Screen-space AO MODE table. Four interchangeable compute shaders behind ONE SRT (AOSrtData)
+    // and ONE descriptor set (pGtaoBatchSet) — same root signature, same bindings, same
+    // float4(bentNormalWS, visibility) output — so the host just binds pAOPipeline[g_aoMode] and
+    // nothing downstream (aoblur.comp, opaque/multimap.frag, the F12 views) knows or cares.
+    // Declared up here, well before the g_ao* knob block, only because it sizes the shader/pipeline
+    // arrays inside LiveRenderer below — same reason kSunCascades is up here.
+    enum AOMode : uint32_t {
+        kAOModeGTAO = 0,     // cosine-weighted horizon-arc integral (the reference)
+        kAOModeHBAO,         // classic horizon elevation, sin-difference
+        kAOModeVBAO,         // 32-bin visibility bitmask (thin + multiple occluders)
+        kAOModeSSAOFast,     // the bitmask body at a fixed 2 slices / 4 steps
+        kAOModeCount
+    };
+    // INDEXED BY AOMode. Must stay in lockstep with the enum AND with kAOModeNames in initDevUI —
+    // a count/name mismatch is exactly what crashed the F12 debug table once.
+    constexpr const char* kAOShaderFiles[kAOModeCount] = {
+        "gtao.comp", "hbao.comp", "vbao.comp", "ssaofast.comp"
+    };
+
     // Persistent renderer state, alive between RenderInit and shutdown. Distinct
     // from the one-shot probes: the shared RT + pipeline + cmd infra survive across
     // renderFrame calls.
@@ -1072,8 +1091,10 @@ namespace {
         Texture*       pAOBlur = nullptr;         // RGBA16F bilateral-blurred AO (the frags' gAO) (SRV+UAV)
         Shader*        pLinearizeShader = nullptr;
         Pipeline*      pLinearizePipeline = nullptr;
-        Shader*        pGtaoShader = nullptr;
-        Pipeline*      pGtaoPipeline = nullptr;
+        // One shader/pipeline per AOMode; the dropdown picks which one the dispatch binds. They
+        // share pGtaoBatchSet below (identical root signature and bindings).
+        Shader*        pAOShader[kAOModeCount] = {};
+        Pipeline*      pAOPipeline[kAOModeCount] = {};
         Shader*        pAOBlurShader = nullptr;
         Pipeline*      pAOBlurPipeline = nullptr;
         Buffer*        pAOParamsCbv = nullptr;    // gAOParams (invViewProj/screen/knobs/eye), persistent-mapped
@@ -6253,14 +6274,22 @@ namespace {
             ShaderLoadDesc lsd = {};
             lsd.mComp.pFileName = linName;
             addShader(R, &lsd, &g_live.pLinearizeShader);
-            ShaderLoadDesc gsd = {};
-            gsd.mComp.pFileName = "gtao.comp";
-            addShader(R, &gsd, &g_live.pGtaoShader);
+            // The four AO modes, as a table rather than four copy-pasted blocks.
+            bool aoShadersOk = true;
+            for (uint32_t m = 0; m < kAOModeCount; ++m) {
+                ShaderLoadDesc gsd = {};
+                gsd.mComp.pFileName = kAOShaderFiles[m];
+                addShader(R, &gsd, &g_live.pAOShader[m]);
+                if (!g_live.pAOShader[m]) {
+                    std::printf("[forge] addShader(compute %s) FAILED\n", kAOShaderFiles[m]);
+                    aoShadersOk = false;
+                }
+            }
             ShaderLoadDesc absd = {};
             absd.mComp.pFileName = "aoblur.comp";
             addShader(R, &absd, &g_live.pAOBlurShader);
-            if (!g_live.pLinearizeShader || !g_live.pGtaoShader || !g_live.pAOBlurShader) {
-                std::printf("[forge] addShader(compute %s/gtao.comp/aoblur.comp) FAILED\n", linName);
+            if (!g_live.pLinearizeShader || !aoShadersOk || !g_live.pAOBlurShader) {
+                std::printf("[forge] addShader(compute %s/AO modes/aoblur.comp) FAILED\n", linName);
                 return false;
             }
 
@@ -6268,23 +6297,30 @@ namespace {
             lpd.mType = PIPELINE_TYPE_COMPUTE;
             lpd.mComputeDesc.pShaderProgram = g_live.pLinearizeShader;
             addPipeline(R, &lpd, &g_live.pLinearizePipeline);
-            PipelineDesc gpd = {};
-            gpd.mType = PIPELINE_TYPE_COMPUTE;
-            gpd.mComputeDesc.pShaderProgram = g_live.pGtaoShader;
-            addPipeline(R, &gpd, &g_live.pGtaoPipeline);
+            bool aoPipesOk = true;
+            for (uint32_t m = 0; m < kAOModeCount; ++m) {
+                PipelineDesc gpd = {};
+                gpd.mType = PIPELINE_TYPE_COMPUTE;
+                gpd.mComputeDesc.pShaderProgram = g_live.pAOShader[m];
+                addPipeline(R, &gpd, &g_live.pAOPipeline[m]);
+                if (!g_live.pAOPipeline[m]) { aoPipesOk = false; }
+            }
             PipelineDesc abpd = {};
             abpd.mType = PIPELINE_TYPE_COMPUTE;
             abpd.mComputeDesc.pShaderProgram = g_live.pAOBlurShader;
             addPipeline(R, &abpd, &g_live.pAOBlurPipeline);
-            if (!g_live.pLinearizePipeline || !g_live.pGtaoPipeline || !g_live.pAOBlurPipeline) {
-                std::printf("[forge] addPipeline(compute linearize/gtao/aoblur) FAILED\n");
+            if (!g_live.pLinearizePipeline || !aoPipesOk || !g_live.pAOBlurPipeline) {
+                std::printf("[forge] addPipeline(compute linearize/AO modes/aoblur) FAILED\n");
                 return false;
             }
 
             // Linearize PerBatch set: gSceneDepth (pDepth SRV) + gLinearDepthOut (pLinearDepth UAV).
             DescriptorSetDesc lset = SRT_SET_DESC(LinDepthSrtData, PerBatch, 1, 0);
             addDescriptorSet(R, &lset, &g_live.pLinearizeSet);
-            // GTAO PerFrame set: gAOParams cbuffer. PerBatch set: gLinearDepthIn SRV + gAOOut UAV.
+            // AO set: ONE PerDraw set (gAOParams cbuffer + gLinearDepthIn SRV + gAOOut UAV), shared
+            // by all four mode pipelines — the bindings are identical, so a per-mode set would be
+            // four copies of the same descriptors and four more chances to hit the set/root-index
+            // collision gtao.srt.h documents.
             DescriptorSetDesc gbset = SRT_SET_DESC(AOSrtData, PerDraw, 1, 0);
             addDescriptorSet(R, &gbset, &g_live.pGtaoBatchSet);
             // AO blur PerFrame set (root index distinct from PerBatch/PerDraw — no rebind collision).
@@ -7618,20 +7654,42 @@ namespace {
     double        g_hostIdleMs = 0.0;
 
     // ---- AO knobs (Stage 3): promoted from the hardcoded constants so sliders drive them live.
-    // ap[20..23] read these each frame, so a slider move takes effect next frame. aoThickness is
-    // the GTAO horizon self-occlusion bias (Stage 4) — was reserved/unused before.
-    float g_aoRadius    = 1.5f;    // world-unit search extent (in-game keeper)
-    float g_aoFalloff   = 20.0f;   // world-unit distance falloff (in-game keeper)
-    float g_aoIntensity = 4.0f;    // occlusion scale (in-game keeper; darker than before)
-    float g_aoThickness = 0.4f;    // horizon self-occlusion bias (in-game keeper; kills flat-ground matcap)
-    float g_aoBlurPx    = 2.0f;    // bilateral blur spatial sigma in pixels (0 = passthrough)
-    float g_aoBlurDepth = 5.0f;    // bilateral blur range sigma in WORLD units (rejects across silhouettes)
+    // ap[20..23] read these each frame, so a slider move takes effect next frame.
+    //
+    // 2026-08-01 re-seed. The four values below were all tuned against a horizon search that never
+    // maximised — it ASSIGNED the horizon per step, so occlusion came from whichever single tap
+    // happened to be last and most attenuated. Every one of them was compensating for that:
+    //   radius    1.5 -> 48    a MW unit is ~1.4 cm (the host says so at the terrain scale), so the
+    //                          old default searched TWO CENTIMETRES. 48 u is ~0.7 m; the slider now
+    //                          reaches 256 u (~3.6 m) instead of 64 u (~0.9 m, the LOW end of useful).
+    //   falloff  20.0 -> 96    same units error — 20 u is ~28 cm, which clamped the search extent
+    //                          far below even the old radius ceiling. ~2x the radius gives a smooth
+    //                          taper across the whole search rather than a wall inside it.
+    //   intensity 4.0 -> 1.0   x4 was making a near-zero occlusion visible. The corrected integral
+    //                          returns real occlusion, so x4 crushes cavities to black.
+    //   bias      0.4 -> 0.05  sin(elev) 0.4 rejects everything under 24 degrees of elevation. It
+    //                          was there to swallow the single-tap noise; view-independence now
+    //                          comes from the horizon clamp itself, so the bias only has to cover
+    //                          depth quantisation.
+    float    g_aoRadius    = 48.0f;   // world-unit search extent (~0.7 m)
+    float    g_aoFalloff   = 96.0f;   // world-unit distance falloff (~1.35 m)
+    float    g_aoIntensity = 1.0f;    // occlusion scale
+    float    g_aoThickness = 0.05f;   // horizon bias: min sin(elevation above tangent) that occludes
+    float    g_aoBlurPx    = 2.0f;    // bilateral blur spatial sigma in pixels (0 = passthrough)
+    float    g_aoBlurDepth = 5.0f;    // bilateral blur range sigma in WORLD units (rejects across silhouettes)
+    // Sample budget (ap[27] / ap[30]) and the bitmask modes' assumed occluder depth (ap[31]).
+    // SSAO-fast ignores the first two by design — it is compiled at a fixed 2/4.
+    uint32_t g_aoSlices    = 3u;      // horizon directions per pixel
+    uint32_t g_aoSteps     = 8u;      // taps per direction, per side
+    float    g_aoBitThick  = 16.0f;   // VBAO/SSAO-fast: how deep a visible surface is assumed to be (~23 cm)
+    uint32_t g_aoMode      = kAOModeGTAO;   // which of the four AO compute pipelines the dispatch binds
 
     // AO contribution toggles → FrameData.debugParams.w bitmask (bit0 AO, bit1 bent normal, bit2 ambient=white).
-    // Baseline-thinning (2026-07-02): GTAO is off by default (g_aoGtaoDispatch below), so g_aoEnable
-    // defaults OFF too — else the colour frag would multiply ambient by a STALE pAOBlur (never written
-    // this frame) → black AO. Re-tick both in the dev panel to bring GTAO back for an A/B.
-    bool  g_aoEnable         = false;   // AO visibility modulates ambient (OFF: GTAO not running)
+    // These two now ARM the AO dispatch as well as consume it (renderScene derives the dispatch gate
+    // from them plus the F12 AO views), so baseline-thinning still holds — both off = no AO compute
+    // at all — while it is no longer possible to tick one and get a STALE pAOBlur, which is what the
+    // old separate dispatch flag made easy and which read as black AO rather than as no AO.
+    bool  g_aoEnable         = false;   // AO visibility modulates ambient (also arms the AO dispatch)
     bool  g_bentNormalEnable = false;   // use the AO bent normal as the lighting normal (A/B; off = geometric N)
     bool  g_ambientWhite     = false;   // debug: force ambient term to 1.0 so AO darkening is visible (pair w/ Diffuse=0)
 
@@ -8212,6 +8270,11 @@ namespace {
         static const char* const kCasterCullNames[] = { "0 back (light faces)", "1 none (two-sided)", "2 front (back faces)" };
         static const char* const kStaticsFacingNames[] = {
             "0 auto (CCW live / CW viewer)", "1 force CCW", "2 force CW", "3 no cull (two-sided)" };
+        static const char* const kAOModeNames[] = {
+            "0 GTAO (cosine horizon integral)", "1 HBAO (classic, punchier)",
+            "2 VBAO (visibility bitmask)",      "3 SSAO-fast (2 slices / 4 steps)" };
+        static_assert(sizeof(kAOModeNames) / sizeof(kAOModeNames[0]) == (size_t)kAOModeCount,
+                      "kAOModeNames must have exactly one entry per AOMode (see kAOShaderFiles)");
 
         // The panel is grouped into collapsing-header "tabs" (WIDGET_TYPE_COLLAPSING_HEADER) so the
         // ~250 controls aren't one unreadable scroll. TabBuilder deep-copies on flush(); one block
@@ -8261,13 +8324,20 @@ namespace {
 
         // -- Tab: AO & Lighting (GTAO knobs + intensity debug scales) --
         { TabBuilder t; t.panel = g_uiPanel; t.name = "AO & Lighting";
+          // The AO compute dispatch is ARMED by consumption (g_aoEnable / bent normal / the F12 AO
+          // views) — see renderScene — so nothing here can multiply ambient by a stale pAOBlur, and
+          // AO still costs exactly zero at the baseline where all three are off.
           t.checkbox("AO enable", &g_aoEnable);
           t.checkbox("Bent normal enable", &g_bentNormalEnable);
           t.checkbox("Ambient = white (debug)", &g_ambientWhite);
-          t.sliderF("AO radius (world)",  &g_aoRadius,    1.0f, 64.0f,  0.5f);
-          t.sliderF("AO falloff (world)", &g_aoFalloff,   1.0f, 200.0f, 1.0f);
-          t.sliderF("AO intensity",       &g_aoIntensity, 0.0f, 8.0f,   0.05f);
+          t.dropdown("AO mode", &g_aoMode, kAOModeNames, (uint32_t)kAOModeCount);
+          t.sliderF("AO radius (world)",  &g_aoRadius,    1.0f, 256.0f, 1.0f);
+          t.sliderF("AO falloff (world)", &g_aoFalloff,   1.0f, 512.0f, 2.0f);
+          t.sliderF("AO intensity",       &g_aoIntensity, 0.0f, 4.0f,   0.05f);
           t.sliderF("AO horizon bias",    &g_aoThickness, 0.0f, 0.5f,   0.005f);
+          t.sliderU("AO slices (dirs/px; not SSAO-fast)", &g_aoSlices, 1u, 8u,  1u);
+          t.sliderU("AO steps (taps/dir; not SSAO-fast)", &g_aoSteps,  1u, 16u, 1u);
+          t.sliderF("AO bitmask thickness (world; VBAO/SSAO-fast)", &g_aoBitThick, 0.0f, 128.0f, 1.0f);
           t.sliderF("AO blur spatial (px)",  &g_aoBlurPx,    0.0f, 4.0f,   0.1f);
           t.sliderF("AO blur range (world)", &g_aoBlurDepth, 1.0f, 256.0f, 1.0f);
           t.sliderF("Ambient intensity", &g_ambScale,     0.0f, 4.0f, 0.02f);
@@ -11787,18 +11857,25 @@ namespace ForgeRender {
         // ALWAYS-ON water pass (gSceneLinDepth) and the colour pass samples pAOBlur (gAO), so the
         // resource-state transitions here are load-bearing beyond AO — fully gating this off would
         // leave those in UNORDERED_ACCESS while sampled (the old "clean Tier-1 degradation" comment
-        // predates water-takeover + the bilateral blur). The EXPENSIVE GTAO horizon-search + blur
-        // dispatches are gated separately by g_aoGtaoDispatch below (baseline: off).
+        // predates water-takeover + the bilateral blur). The EXPENSIVE AO horizon-search + blur
+        // dispatches are gated separately by aoDispatchRuns below.
         static const bool g_aoComputeEnable = true;
-        // Baseline-thinning (2026-07-02): skip the two costly GTAO dispatches (horizon search + blur,
-        // ~0.8ms) while keeping linearize + all state barriers. pAO/pAOBlur are still transitioned
-        // (states stay valid) but not written — their stale values are inert because g_aoEnable is
-        // OFF (colour frag doesn't read AO). Re-tick in the dev panel with g_aoEnable for an A/B.
-        static bool g_aoGtaoDispatch = false;
+        // Baseline-thinning (2026-07-02): skip the two costly AO dispatches (horizon search + blur,
+        // ~0.8ms) unless something actually READS the result. Derived rather than a knob of its own,
+        // because the two states a knob allows are both wrong: dispatch-off with a consumer on hands
+        // the colour frag a STALE pAOBlur (never written this frame) and reads as black AO;
+        // dispatch-on with no consumer is 0.8ms of GPU for nothing. Consumption is the whole answer,
+        // so the baseline (all three off) still costs exactly zero and cannot be mis-set.
+        const bool aoDispatchRuns = g_aoEnable || g_bentNormalEnable
+                                      || g_debugMode == 3u || g_debugMode == 4u;
+        // Which of the four AO modes runs. Falls back to GTAO if the picked pipeline is missing (a
+        // half-deployed shader tree after F8), so switching modes live can never drop the UAV write.
+        Pipeline* aoPipeline = (g_aoMode < (uint32_t)kAOModeCount) ? g_live.pAOPipeline[g_aoMode] : nullptr;
+        if (!aoPipeline) { aoPipeline = g_live.pAOPipeline[kAOModeGTAO]; }
         static bool s_aoDispatchLogged = false;
         if (!s_aoDispatchLogged) {
-            std::printf("[forge] AO dispatch GATE: enable=%d linPipe=%p gtaoPipe=%p linSet=%p gBatchSet=%p pAO=%p pLinDepth=%p firstFrame=%d\n",
-                        (int)g_aoComputeEnable, (void*)g_live.pLinearizePipeline, (void*)g_live.pGtaoPipeline,
+            std::printf("[forge] AO dispatch GATE: enable=%d aoPipe=%p linPipe=%p linSet=%p gBatchSet=%p pAO=%p pLinDepth=%p firstFrame=%d\n",
+                        (int)g_aoComputeEnable, (void*)aoPipeline, (void*)g_live.pLinearizePipeline,
                         (void*)g_live.pLinearizeSet, (void*)g_live.pGtaoBatchSet,
                         (void*)g_live.pAO, (void*)g_live.pLinearDepth, (int)g_live.firstFrame);
             s_aoDispatchLogged = true;
@@ -11806,7 +11883,7 @@ namespace ForgeRender {
         // Named once, because THREE later blocks depend on the states this one leaves behind
         // (pLinearDepth in SHADER_RESOURCE above all) and each used to re-spell the condition by
         // hand. A hand-mirrored gate that drifts is a silent state-mismatch, not a compile error.
-        const bool aoBlockRan = g_aoComputeEnable && g_live.pLinearizePipeline && g_live.pGtaoPipeline;
+        const bool aoBlockRan = g_aoComputeEnable && g_live.pLinearizePipeline && aoPipeline;
         if (aoBlockRan) {
             // Build gAOParams: invViewProj (from the SAME rzViewProj geometry used, incl. the
             // half-pixel offset) + screen + knobs + eye. Seeds follow scene-walk (WORLD-unit knobs;
@@ -11823,8 +11900,11 @@ namespace ForgeRender {
             ap[16] = (float)g_live.width;  ap[17] = (float)g_live.height;
             ap[18] = 1.0f / (float)g_live.width; ap[19] = 1.0f / (float)g_live.height;
             ap[20] = g_aoRadius; ap[21] = g_aoFalloff; ap[22] = g_aoIntensity; ap[23] = g_aoThickness;
-            ap[24] = fcbv[36]; ap[25] = fcbv[37]; ap[26] = fcbv[38]; ap[27] = 0.0f;
-            ap[28] = g_aoBlurPx; ap[29] = g_aoBlurDepth; ap[30] = 0.0f; ap[31] = 0.0f;  // gBlurParams.blurParams
+            // ap[27] and ap[30..31] are the AO pass's sample-budget lanes (eyePos.w / sliceParams.zw
+            // in gtao.srt.h). ap[28..29] are the BLUR's, in the same float4 — one buffer, two struct
+            // views; the two .srt.h files must stay byte-identical or this line corrupts the blur.
+            ap[24] = fcbv[36]; ap[25] = fcbv[37]; ap[26] = fcbv[38]; ap[27] = (float)g_aoSlices;
+            ap[28] = g_aoBlurPx; ap[29] = g_aoBlurDepth; ap[30] = (float)g_aoSteps; ap[31] = g_aoBitThick;
 
             const uint32_t gx = (g_live.width + 7u) / 8u;
             const uint32_t gy = (g_live.height + 7u) / 8u;
@@ -11874,16 +11954,22 @@ namespace ForgeRender {
                 cmdResourceBarrier(g_live.pCmd, 0, nullptr, nt, tb, 0, nullptr);
             }
 
-            // (2) GTAO dispatch (single PerDraw set holds cbuffer + depth SRV + AO UAV). Gated:
-            // baseline skips this (pAO left stale but state-valid; g_aoEnable off makes it inert).
-            if (g_aoGtaoDispatch) {
-                cmdBeginDebugMarker(g_live.pCmd, 1.0f, 0.3f, 0.2f, "GTAO (pLinearDepth -> pAO: bent normal + visibility)");
-                cmdBindPipeline(g_live.pCmd, g_live.pGtaoPipeline);
+            // (2) AO dispatch — pAOPipeline[g_aoMode] over the ONE shared PerDraw set (cbuffer +
+            // depth SRV + AO UAV; identical bindings for all four modes). Gated: with nothing
+            // consuming AO this is skipped and pAO is left stale but state-valid.
+            if (aoDispatchRuns) {
+                cmdBeginDebugMarker(g_live.pCmd, 1.0f, 0.3f, 0.2f, "AO (pLinearDepth -> pAO: bent normal + visibility)");
+                cmdBindPipeline(g_live.pCmd, aoPipeline);
                 cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pGtaoBatchSet);
                 cmdDispatch(g_live.pCmd, gx, gy, 1);
                 cmdEndDebugMarker(g_live.pCmd);
-                static bool s_gtaoDispatched = false;
-                if (!s_gtaoDispatched) { std::printf("[forge] GTAO dispatch ISSUED gx=%u gy=%u (w=%u h=%u)\n", gx, gy, g_live.width, g_live.height); s_gtaoDispatched = true; }
+                static uint32_t s_aoDispatchedMode = 0xFFFFFFFFu;
+                if (s_aoDispatchedMode != g_aoMode) {
+                    std::printf("[forge] AO dispatch ISSUED mode=%u (%s) gx=%u gy=%u (w=%u h=%u)\n",
+                                g_aoMode, kAOShaderFiles[g_aoMode < (uint32_t)kAOModeCount ? g_aoMode : 0u],
+                                gx, gy, g_live.width, g_live.height);
+                    s_aoDispatchedMode = g_aoMode;
+                }
             }
 
             // pAO UAV -> SRV (blur + F12 debug read it); pAOBlur SRV -> UAV (blur writes it, skip f0);
@@ -11914,7 +12000,7 @@ namespace ForgeRender {
             {
                 // Gated with the GTAO dispatch: baseline skips the blur (pAOBlur stays stale but is
                 // still transitioned UAV -> SRV below, so the colour pass samples it in a valid state).
-                if (g_aoGtaoDispatch) {
+                if (aoDispatchRuns) {
                     cmdBeginDebugMarker(g_live.pCmd, 0.6f, 1.0f, 0.4f, "AO BILATERAL BLUR (pAO -> pAOBlur)");
                     cmdBindPipeline(g_live.pCmd, g_live.pAOBlurPipeline);
                     cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pAOBlurSet);
@@ -14449,19 +14535,23 @@ namespace ForgeRender {
         LOG::logline(">> [devui] dist lights %s (perf A/B)", g_drawDistLights ? "ON" : "OFF");
     }
 
-    // Dev hot-reload (F8): rebuild the compute pipelines (gtao + linearize) from the dxil currently
-    // on disk — no game restart. The descriptor sets stay valid (bound to the root signature, which
-    // is unchanged), so only shader+pipeline are swapped. Recompile externally with fsl.py + redeploy
-    // the *_0.dxil first, then trigger this. Queue is idled so no in-flight dispatch uses the old PSO.
+    // Dev hot-reload (F8): rebuild the compute pipelines (all four AO modes + linearize + blur) from
+    // the dxil currently on disk — no game restart. The descriptor sets stay valid (bound to the root
+    // signature, which is unchanged), so only shader+pipeline are swapped. Recompile externally with
+    // fsl.py + redeploy first, then trigger this. Queue is idled so no in-flight dispatch uses the
+    // old PSO. NOTE: this reloads the mode SHADERS, not the mode TABLE — adding a fifth mode is a
+    // host restart.
     void reloadComputeShaders() {
         Renderer* R = g_live.pRenderer;
-        if (!R || !g_live.pGtaoShader) {
+        if (!R || !g_live.pAOShader[kAOModeGTAO]) {
             return;
         }
         waitQueueIdle(g_live.pQueue);
 
-        removePipeline(R, g_live.pGtaoPipeline);       g_live.pGtaoPipeline = nullptr;
-        removeShader(R, g_live.pGtaoShader);           g_live.pGtaoShader = nullptr;
+        for (uint32_t m = 0; m < kAOModeCount; ++m) {
+            if (g_live.pAOPipeline[m]) { removePipeline(R, g_live.pAOPipeline[m]); g_live.pAOPipeline[m] = nullptr; }
+            if (g_live.pAOShader[m])   { removeShader(R, g_live.pAOShader[m]);     g_live.pAOShader[m] = nullptr; }
+        }
         removePipeline(R, g_live.pLinearizePipeline);  g_live.pLinearizePipeline = nullptr;
         removeShader(R, g_live.pLinearizeShader);      g_live.pLinearizeShader = nullptr;
         removePipeline(R, g_live.pAOBlurPipeline);     g_live.pAOBlurPipeline = nullptr;
@@ -14472,13 +14562,20 @@ namespace ForgeRender {
         ShaderLoadDesc lsd = {};
         lsd.mComp.pFileName = linName;
         addShader(R, &lsd, &g_live.pLinearizeShader);
-        ShaderLoadDesc gsd = {};
-        gsd.mComp.pFileName = "gtao.comp";
-        addShader(R, &gsd, &g_live.pGtaoShader);
+        bool aoShadersOk = true;
+        for (uint32_t m = 0; m < kAOModeCount; ++m) {
+            ShaderLoadDesc gsd = {};
+            gsd.mComp.pFileName = kAOShaderFiles[m];
+            addShader(R, &gsd, &g_live.pAOShader[m]);
+            if (!g_live.pAOShader[m]) {
+                LOG::logline("!! [forge] hot-reload addShader(%s) FAILED", kAOShaderFiles[m]);
+                aoShadersOk = false;
+            }
+        }
         ShaderLoadDesc absd = {};
         absd.mComp.pFileName = "aoblur.comp";
         addShader(R, &absd, &g_live.pAOBlurShader);
-        if (!g_live.pLinearizeShader || !g_live.pGtaoShader || !g_live.pAOBlurShader) {
+        if (!g_live.pLinearizeShader || !aoShadersOk || !g_live.pAOBlurShader) {
             LOG::logline("!! [forge] hot-reload addShader FAILED (dxil missing on disk?)"); LOG::flush();
             return;
         }
@@ -14486,15 +14583,18 @@ namespace ForgeRender {
         lpd.mType = PIPELINE_TYPE_COMPUTE;
         lpd.mComputeDesc.pShaderProgram = g_live.pLinearizeShader;
         addPipeline(R, &lpd, &g_live.pLinearizePipeline);
-        PipelineDesc gpd = {};
-        gpd.mType = PIPELINE_TYPE_COMPUTE;
-        gpd.mComputeDesc.pShaderProgram = g_live.pGtaoShader;
-        addPipeline(R, &gpd, &g_live.pGtaoPipeline);
+        for (uint32_t m = 0; m < kAOModeCount; ++m) {
+            PipelineDesc gpd = {};
+            gpd.mType = PIPELINE_TYPE_COMPUTE;
+            gpd.mComputeDesc.pShaderProgram = g_live.pAOShader[m];
+            addPipeline(R, &gpd, &g_live.pAOPipeline[m]);
+        }
         PipelineDesc abpd = {};
         abpd.mType = PIPELINE_TYPE_COMPUTE;
         abpd.mComputeDesc.pShaderProgram = g_live.pAOBlurShader;
         addPipeline(R, &abpd, &g_live.pAOBlurPipeline);
-        LOG::logline(">> [forge] compute shaders hot-reloaded (gtao.comp + aoblur.comp + %s)", linName); LOG::flush();
+        LOG::logline(">> [forge] compute shaders hot-reloaded (%u AO modes + aoblur.comp + %s)",
+                     (unsigned)kAOModeCount, linName); LOG::flush();
 
         // Phase 3 prologue: rebuild the two hiz pipelines too (queue already idled above, so no
         // in-flight prologue uses the old PSOs). Failure DISABLES the prologue (hizReady=false,
@@ -22452,15 +22552,19 @@ namespace ForgeRender {
         // P3: drop the persistent slot cache — the recreated atlas is undefined, so no slot may
         // claim a "cached" (lastRenderFrame != 0) tile after a device reinit.
         for (uint32_t s = 0; s < kMaxShadowLights; ++s) { g_shadowSlots[s] = ShadowSlot{}; }
-        // Tier 2 compute (linearize + GTAO + AO bilateral blur).
+        // Tier 2 compute (linearize + the four AO modes + AO bilateral blur).
         if (g_live.pAOBlurSet)      { removeDescriptorSet(R, g_live.pAOBlurSet); }
         if (g_live.pGtaoBatchSet)   { removeDescriptorSet(R, g_live.pGtaoBatchSet); }
         if (g_live.pLinearizeSet)   { removeDescriptorSet(R, g_live.pLinearizeSet); }
         if (g_live.pAOBlurPipeline) { removePipeline(R, g_live.pAOBlurPipeline); }
-        if (g_live.pGtaoPipeline)   { removePipeline(R, g_live.pGtaoPipeline); }
+        for (uint32_t m = 0; m < kAOModeCount; ++m) {
+            if (g_live.pAOPipeline[m]) { removePipeline(R, g_live.pAOPipeline[m]); }
+        }
         if (g_live.pLinearizePipeline) { removePipeline(R, g_live.pLinearizePipeline); }
         if (g_live.pAOBlurShader)   { removeShader(R, g_live.pAOBlurShader); }
-        if (g_live.pGtaoShader)     { removeShader(R, g_live.pGtaoShader); }
+        for (uint32_t m = 0; m < kAOModeCount; ++m) {
+            if (g_live.pAOShader[m]) { removeShader(R, g_live.pAOShader[m]); }
+        }
         if (g_live.pLinearizeShader){ removeShader(R, g_live.pLinearizeShader); }
         if (g_live.pAOParamsCbv)    { removeResource(g_live.pAOParamsCbv); }
         if (g_live.pAOBlur)         { removeResource(g_live.pAOBlur); }

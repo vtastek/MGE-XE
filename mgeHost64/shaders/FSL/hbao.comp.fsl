@@ -1,0 +1,113 @@
+// mgeHost64 — HBAO: horizon-based ambient occlusion (Bavoil & Sainz 2008).
+//
+// Mode 1 of four (shared core + invariants: aocommon.h.fsl). The classic, and the cheapest of the
+// three full-quality modes: no arc integral, no trig in the inner loop — occlusion is just the SINE
+// of the horizon elevation above the tangent plane, which is exactly what dot(d, N) already is for
+// a unit tap direction.
+//
+// Per slice and side:
+//   h = max over taps of (sin of elevation above the tangent plane) - bias
+//   occlusion contribution = h * W(r_h), W(r) = 1 - (r/R)^2 evaluated at the WINNING tap
+//
+// Two things distinguish it from GTAO here. It is not cosine-weighted, so cavities read harder and
+// contact darkening is punchier — that is the HBAO look, not a defect. And the attenuation is
+// applied at the horizon tap rather than folded into the search, which is why the classic
+// quadratic W(r) is used verbatim instead of the shared aoFalloffWeight().
+//
+// The tangent angle is 0 by construction: elevations are measured against this surface's own
+// tangent plane rather than against a view-space tangent, so a flat plane gives h = 0 at every
+// camera angle. That is the same view-independence GTAO gets from its horizon clamp.
+
+#include "gtao.srt.h"
+#include "aocommon.h.fsl"
+
+ROOT_SIGNATURE(ComputeRootSignature)
+NUM_THREADS(8, 8, 1)
+void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
+{
+    INIT_MAIN;
+    int2   px        = int2(DispatchThreadID.xy);
+    float2 screen    = gAOParams.screenParams.xy;
+    float2 invScreen = gAOParams.screenParams.zw;
+    if (px.x >= (int)screen.x || px.y >= (int)screen.y)
+    {
+        RETURN();
+    }
+    float2 uv = (float2(px) + 0.5f) * invScreen;
+
+    float3 P, N, V, ddxv, ddyv;
+    float  wpp;
+    if (!aoSurface(px, uv, invScreen, P, N, V, ddxv, ddyv, wpp))
+    {
+        Write2D(gAOOut, px, AO_SKY_RESULT);
+        RETURN();
+    }
+
+    int    slices = aoSlices();
+    int    steps  = aoSteps();
+    float  stepPx = aoStepPixels(wpp, steps);
+    float2 dither = aoDither(px);
+    float  bias   = aoBias();
+    float  invR2  = 1.0f / (aoFalloff() * aoFalloff());
+
+    float  occSum  = 0.0f;
+    float3 bentSum = float3(0.0f, 0.0f, 0.0f);
+
+    for (int s = 0; s < slices; ++s)
+    {
+        float  phi = (float(s) + dither.x) * (AO_PI / float(slices));
+        float2 dir = float2(cos(phi), sin(phi));
+        float3 sliceW = aoSliceDirW(ddxv, ddyv, dir);
+
+        // Running max of the horizon sine per side, plus the attenuation OF THAT TAP (not of the
+        // last one seen) — the horizon is one specific sample, so its weight travels with it.
+        float hP = 0.0f, wP = 0.0f;
+        float hM = 0.0f, wM = 0.0f;
+
+        for (int t = 0; t < steps; ++t)
+        {
+            float off = aoStepOffset(t, stepPx, dither.y);
+
+            int2  sp = aoTap(px, dir, off);
+            float zp = aoLoadZ(sp);
+            if (zp > 0.0f)
+            {
+                float3 ds = aoReconstructWorld((float2(sp) + 0.5f) * invScreen, zp) - P;
+                float  dl = max(length(ds), 1e-6f);
+                float  e  = dot(ds, N) / dl - bias;   // sin(elevation above tangent), biased
+                if (e > hP)
+                {
+                    hP = e;
+                    wP = saturate(1.0f - dl * dl * invR2);
+                }
+            }
+
+            int2  sm = aoTap(px, -dir, off);
+            float zm = aoLoadZ(sm);
+            if (zm > 0.0f)
+            {
+                float3 ds = aoReconstructWorld((float2(sm) + 0.5f) * invScreen, zm) - P;
+                float  dl = max(length(ds), 1e-6f);
+                float  e  = dot(ds, N) / dl - bias;
+                if (e > hM)
+                {
+                    hM = e;
+                    wM = saturate(1.0f - dl * dl * invR2);
+                }
+            }
+        }
+
+        float occP = saturate(hP * wP);
+        float occM = saturate(hM * wM);
+        occSum += 0.5f * (occP + occM);
+
+        // Bent normal: lift by overall openness along N, tilt along the slice tangent toward
+        // whichever side is more open.
+        float openP = 1.0f - occP;
+        float openM = 1.0f - occM;
+        bentSum += N * (openP + openM) + sliceW * (openP - openM);
+    }
+
+    Write2D(gAOOut, px, aoResolve(occSum / float(slices), bentSum, N));
+    RETURN();
+}

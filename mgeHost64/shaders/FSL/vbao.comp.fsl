@@ -1,0 +1,174 @@
+// mgeHost64 — VBAO: visibility-bitmask ambient occlusion (Therrien 2023).
+//
+// Mode 2 of four, and mode 3 (SSAO-fast) is this same body compiled with AO_FAST — see
+// ssaofast.comp.fsl. Shared core + invariants: aocommon.h.fsl.
+//
+// A horizon search answers ONE question per direction — "how high does the tallest thing get" — and
+// then assumes everything below it is solid. That is wrong twice: a thin railing occludes as if it
+// were a wall behind it, and two separate occluders at different elevations count as one. This mode
+// drops the horizon entirely and tracks OCCUPANCY instead: the hemisphere around the normal is 32
+// angular bins, each tap sets the run of bins it actually subtends, and
+//
+//     visibility = 1 - popcount(mask) / 32
+//
+// Multiple occluders compose by construction (a bin already set costs nothing more), and a thin one
+// stops shadowing the space behind it.
+//
+// Where the "back" of a tap is: a depth buffer only records front surfaces, so the far side has to
+// be assumed. The thickness knob (gAOParams.sliceParams.w, world units) pushes the tap away from
+// the eye by that much and takes the angle there — so thickness is literally "how deep do I assume
+// the thing I can see is". Small = everything is a sheet, large = everything is a solid block.
+//
+// Distance attenuation applies to the bins a tap NEWLY sets, which is the one place a bitmask can
+// take a partial weight without lying about occupancy.
+
+#include "gtao.srt.h"
+#include "aocommon.h.fsl"
+
+// SSAO-fast: the same accumulator on a fixed, small budget, so the loop bounds are literals and the
+// whole thing unrolls into a handful of registers. It ignores the slice/step sliders on purpose —
+// "fast" that a slider can make slow is not a mode, it is a trap.
+#if defined(AO_FAST)
+    #define VBAO_SLICES 2
+    #define VBAO_STEPS  4
+#endif
+
+ROOT_SIGNATURE(ComputeRootSignature)
+NUM_THREADS(8, 8, 1)
+void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
+{
+    INIT_MAIN;
+    int2   px        = int2(DispatchThreadID.xy);
+    float2 screen    = gAOParams.screenParams.xy;
+    float2 invScreen = gAOParams.screenParams.zw;
+    if (px.x >= (int)screen.x || px.y >= (int)screen.y)
+    {
+        RETURN();
+    }
+    float2 uv = (float2(px) + 0.5f) * invScreen;
+
+    float3 P, N, V, ddxv, ddyv;
+    float  wpp;
+    if (!aoSurface(px, uv, invScreen, P, N, V, ddxv, ddyv, wpp))
+    {
+        Write2D(gAOOut, px, AO_SKY_RESULT);
+        RETURN();
+    }
+
+#if defined(VBAO_SLICES)
+    const int slices = VBAO_SLICES;
+    const int steps  = VBAO_STEPS;
+#else
+    int slices = aoSlices();
+    int steps  = aoSteps();
+#endif
+    float  stepPx = aoStepPixels(wpp, steps);
+    float2 dither = aoDither(px);
+    float  bias   = aoBias();
+    float  thick  = aoThickness();
+
+    float  occSum  = 0.0f;
+    float3 bentSum = float3(0.0f, 0.0f, 0.0f);
+
+    for (int s = 0; s < slices; ++s)
+    {
+        float  phi = (float(s) + dither.x) * (AO_PI / float(slices));
+        float2 dir = float2(cos(phi), sin(phi));
+
+        // Same in-slice basis as GTAO: angles run from V toward T.
+        float3 T = aoSliceDirW(ddxv, ddyv, dir);
+        T = T - V * dot(T, V);
+        float tl = length(T);
+        if (tl < 1e-5f)
+        {
+            continue;
+        }
+        T = T / tl;
+
+        float nV      = dot(N, V);
+        float nT      = dot(N, T);
+        float projLen = sqrt(nV * nV + nT * nT);
+        if (projLen < 1e-5f)
+        {
+            continue;
+        }
+        float n = atan2(nT, nV);
+
+        // The 32 bins span the hemisphere around the normal, [n - 90, n + 90] degrees. Anything
+        // outside is below the surface and cannot occlude, so it falls off the ends of the mask.
+        float base   = n - AO_HALF_PI;
+        float toBin  = 32.0f / AO_PI;
+        uint  mask   = 0u;
+        float occ    = 0.0f;
+
+        for (int t = 0; t < steps; ++t)
+        {
+            float off = aoStepOffset(t, stepPx, dither.y);
+
+            UNROLL
+            for (int side = 0; side < 2; ++side)
+            {
+                float2 sdir = (side == 0) ? dir : -dir;
+                float  sgn  = (side == 0) ? 1.0f : -1.0f;
+
+                int2  sc = aoTap(px, sdir, off);
+                float z  = aoLoadZ(sc);
+                if (z <= 0.0f)
+                {
+                    continue;
+                }
+
+                float3 ds = aoReconstructWorld((float2(sc) + 0.5f) * invScreen, z) - P;
+                float  dl = max(length(ds), 1e-6f);
+                float3 d  = ds / dl;
+                if (dot(d, N) <= bias)
+                {
+                    continue;   // at or below the tangent plane — view-independent rejection
+                }
+                float w = aoFalloffWeight(dl);
+                if (w <= 0.0f)
+                {
+                    continue;
+                }
+
+                // Front angle from the visible surface; back angle from the same point pushed
+                // AWAY from the eye by the thickness. Pushing away can only increase the angle
+                // from V, so the pair always brackets a real span.
+                float  aF = sgn * acos(clamp(dot(d, V), -1.0f, 1.0f));
+                float3 dB = ds - V * thick;
+                float  bl = max(length(dB), 1e-6f);
+                float  aB = sgn * acos(clamp(dot(dB / bl, V), -1.0f, 1.0f));
+
+                float lo = min(aF, aB);
+                float hi = max(aF, aB);
+
+                uint span = aoBitRange((int)floor((lo - base) * toBin),
+                                       (int)ceil ((hi - base) * toBin));
+                uint fresh = span & (~mask);
+                occ  += float(countbits(fresh)) * (1.0f / 32.0f) * w;
+                mask |= span;
+            }
+        }
+
+        float visSlice = saturate(1.0f - occ);
+        occSum += 1.0f - visSlice;
+
+        // Bent normal: the middle of the open run of bins, back in world space. Fully open gives
+        // exactly the in-slice normal direction, so the sum over slices degenerates to N.
+        uint openMask = ~mask;
+        if (openMask != 0u)
+        {
+            // Lowest and highest CLEAR bin. The high end is reversebits + firstbitlow rather than
+            // firstbithigh: firstbithigh's index convention (from the LSB or from the MSB) has
+            // differed between compilers, and firstbitlow is the one this codebase already proves.
+            uint loBin = firstbitlow(openMask);
+            uint hiBin = 31u - firstbitlow(reversebits(openMask));
+            float mid = (float(loBin) + float(hiBin) + 1.0f) * 0.5f * (1.0f / 32.0f);
+            float a = base + mid * AO_PI;
+            bentSum += (V * cos(a) + T * sin(a)) * projLen * visSlice;
+        }
+    }
+
+    Write2D(gAOOut, px, aoResolve(occSum / float(slices), bentSum, N));
+    RETURN();
+}

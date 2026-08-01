@@ -14,12 +14,18 @@
 // view/proj, so world-space horizon search keyed off gAOParams.eyePos is the robust choice).
 #pragma once
 
+// SHARED BYTE LAYOUT with aoblur.srt.h's BlurParams — ONE host buffer (pAOParamsCbv) backs both
+// gAOParams and gBlurParams. Growing this struct WITHOUT mirroring the change there silently
+// corrupts the blur's knobs instead of failing to compile, so the two must be edited together.
+// Float indices are host-side (forgerender.cpp writes ap[0..31]).
 STRUCT(AOParams)
 {
-    DATA(float4x4, invViewProj,  None);   // inverse of the reverse-Z world->clip (row-major bytes)
-    DATA(float4,   screenParams, None);   // xy = screen w,h ; zw = 1/w, 1/h
-    DATA(float4,   aoParams,     None);   // x = radius (world u), y = falloff, z = intensity, w = thickness
-    DATA(float4,   eyePos,       None);   // xyz = world camera position
+    DATA(float4x4, invViewProj,  None);   //  0..15 inverse of the reverse-Z world->clip (row-major bytes)
+    DATA(float4,   screenParams, None);   // 16..19 xy = screen w,h ; zw = 1/w, 1/h
+    DATA(float4,   aoParams,     None);   // 20..23 x = radius (world u), y = falloff, z = intensity, w = horizon bias
+    DATA(float4,   eyePos,       None);   // 24..27 xyz = world camera position, w = SLICE COUNT
+    DATA(float4,   sliceParams,  None);   // 28..31 xy = the BLUR's knobs (aoblur owns them), z = STEP COUNT,
+                                          //        w = bitmask occluder thickness (world u; vbao/ssaofast)
 };
 
 // All three resources live in ONE PerBatch set (CBV + SRV + UAV), mirroring 09's

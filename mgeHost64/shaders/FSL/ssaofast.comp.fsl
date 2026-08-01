@@ -1,0 +1,15 @@
+// mgeHost64 — SSAO-fast: mode 3 of four. The VBAO accumulator on a fixed 2-slice / 4-step budget.
+//
+// A separate BINARY, not a separate algorithm: the bitmask accumulator is already the one that
+// degrades most gracefully with a tiny sample count (a horizon search with 4 taps latches onto
+// whatever it happens to hit; occupancy bins just get coarser), so the cheap mode is that same body
+// with literal loop bounds. Literals matter — they let the compiler fully unroll both loops, so
+// this pipeline does not carry the register pressure of the 8x16 worst case the sliders allow.
+//
+// The slice/step sliders deliberately do NOT reach this mode; see vbao.comp.fsl.
+//
+// This mirrors how statics_heroblend.vert / statics_layer.vert are built: one body, several #comp
+// entries in shaders.list, each with its own #define.
+
+#define AO_FAST 1
+#include "vbao.comp.fsl"

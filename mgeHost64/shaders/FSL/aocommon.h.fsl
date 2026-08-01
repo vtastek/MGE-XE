@@ -1,0 +1,211 @@
+// mgeHost64 — shared screen-space AO core (FSL ONLY).
+//
+// Four AO modes ship as four compute shaders (gtao / hbao / vbao / ssaofast). They differ ONLY in
+// their accumulator; everything that FEEDS an accumulator — depth load, world reconstruct,
+// min-difference normal, screen-space search geometry, slice basis, dither, resolve — lives here,
+// once, so the four cannot drift apart. (Same reasoning that put applyFog in skydome.h.fsl rather
+// than copying it into five frags.)
+//
+// Include AFTER gtao.srt.h: this needs gAOParams + gLinearDepthIn in scope. SHADER-ONLY — the host
+// C++ includes gtao.srt.h and must never see raw HLSL (same discipline as texsample.h.fsl /
+// hizocclusion.h.fsl).
+//
+// Three invariants every mode keeps:
+//
+//   * WORLD space. Only the combined viewProj is available host-side (there is no separate view or
+//     proj), so each tap is unprojected through gAOParams.invViewProj and the search runs off
+//     gAOParams.eyePos.
+//
+//   * The horizon search is a running MAX over a direction's taps. That is what a horizon search
+//     IS. Assigning per step instead leaves the horizon holding whatever the LAST tap saw — one
+//     sample per direction, and the one the distance falloff has attenuated most — which makes the
+//     radius knob run BACKWARDS: raise the radius, that sample moves further out, the falloff kills
+//     it, and AO gets WEAKER. That was the bug behind "its radius is pitiful".
+//
+//   * VIEW-INDEPENDENCE. A flat plane must give zero occlusion at every camera angle. Every
+//     accumulator rejects taps that do not rise above the tangent plane by aoBias(), so a plane
+//     self-occludes at no angle — no matcap, no grazing blackening.
+//
+// Output contract (unchanged, all four modes): float4(bentNormalWS, visibility) into gAOOut, where
+// 1 = fully open and 0 = cavity. aoblur.comp then bilaterally denoises it into the frags' gAO.
+
+#ifndef AO_COMMON_H
+#define AO_COMMON_H
+
+#define AO_PI       3.14159265359f
+#define AO_HALF_PI  1.57079632679f
+
+// Sky / no geometry (reverse-Z far or cleared = 0): fully open, bent normal irrelevant.
+#define AO_SKY_RESULT float4(0.0f, 0.0f, 1.0f, 1.0f)
+
+// ---- knobs ---------------------------------------------------------------------------------
+// The slice/step/thickness lanes ride float4s the AO pass would otherwise waste: eyePos.w and
+// sliceParams.zw. sliceParams.xy belong to aoblur.comp — the SAME host buffer backs gAOParams and
+// gBlurParams, so those two struct views must stay byte-identical (see gtao.srt.h).
+float aoRadius()    { return max(gAOParams.aoParams.x, 1e-3f); }
+float aoFalloff()   { return max(gAOParams.aoParams.y, 1e-3f); }
+float aoIntensity() { return gAOParams.aoParams.z; }
+float aoBias()      { return gAOParams.aoParams.w; }   // sin of the minimum elevation that occludes
+int   aoSlices()    { return (int)clamp(gAOParams.eyePos.w,      1.0f,  8.0f); }
+int   aoSteps()     { return (int)clamp(gAOParams.sliceParams.z, 1.0f, 16.0f); }
+float aoThickness() { return max(gAOParams.sliceParams.w, 0.0f); }  // world u, bitmask modes only
+
+// ---- depth / world -------------------------------------------------------------------------
+float3 aoReconstructWorld(float2 uv, float deviceZ)
+{
+    float ndcX = uv.x * 2.0f - 1.0f;
+    float ndcY = 1.0f - uv.y * 2.0f;
+    float4 p = mul(gAOParams.invViewProj, float4(ndcX, ndcY, deviceZ, 1.0f));
+    return p.xyz / p.w;
+}
+
+float aoLoadZ(int2 c)
+{
+    return LoadTex2D(gLinearDepthIn, NO_SAMPLER, c, 0).r;
+}
+
+// ---- dither --------------------------------------------------------------------------------
+// 4x4 spatial pattern (Activision GTAO): 16 distinct slice rotations and 4 step offsets per tile,
+// laid out so no two horizontal neighbours share a rotation. That last property is what kills the
+// screen-aligned streaks: with a rotation that is constant along a row, a slice can land ON the
+// scanline, and then a pixel's whole horizon comes from its own row while the rows above and below
+// disagree — a 1px-tall, screen-axis-aligned line. The 7x7 bilateral blur downstream is wide
+// enough to resolve a 4x4 pattern.
+//   x = slice rotation [0,1)   y = step offset [0,1)
+float2 aoDither(int2 px)
+{
+    float rot = (1.0f / 16.0f) * float((((px.x + px.y) & 3) << 2) + (px.x & 3));
+    float off = (1.0f /  4.0f) * float((px.y - px.x) & 3);
+    return float2(rot, off);
+}
+
+// ---- surface -------------------------------------------------------------------------------
+// Everything the accumulators need at this pixel. Returns false for sky, where the caller writes
+// AO_SKY_RESULT and stops.
+//   P     world position
+//   N     min-difference world normal, oriented toward the camera
+//   V     unit P -> eye
+//   ddxv  world delta of one screen pixel in x, ddyv the same in y (these span the tangent frame
+//         the slice directions are built in)
+//   wpp   world units per pixel at this depth (drives the screen-space search extent)
+bool aoSurface(int2 px, float2 uv, float2 invScreen,
+               out(float3) P, out(float3) N, out(float3) V,
+               out(float3) ddxv, out(float3) ddyv, out(float) wpp)
+{
+    P    = float3(0.0f, 0.0f, 0.0f);
+    N    = float3(0.0f, 0.0f, 1.0f);
+    V    = float3(0.0f, 0.0f, 1.0f);
+    ddxv = float3(1.0f, 0.0f, 0.0f);
+    ddyv = float3(0.0f, 1.0f, 0.0f);
+    wpp  = 1.0f;
+
+    float deviceZ = aoLoadZ(px);
+    if (deviceZ <= 0.0f)
+    {
+        return false;
+    }
+
+    P = aoReconstructWorld(uv, deviceZ);
+    V = normalize(gAOParams.eyePos.xyz - P);
+
+    float3 Pr = aoReconstructWorld(uv + float2(invScreen.x, 0.0f), aoLoadZ(px + int2(1, 0)));
+    float3 Pl = aoReconstructWorld(uv - float2(invScreen.x, 0.0f), aoLoadZ(px - int2(1, 0)));
+    float3 Pu = aoReconstructWorld(uv + float2(0.0f, invScreen.y), aoLoadZ(px + int2(0, 1)));
+    float3 Pd = aoReconstructWorld(uv - float2(0.0f, invScreen.y), aoLoadZ(px - int2(0, 1)));
+
+    // Min-difference neighbours: the SMALLER world gap is the one on this surface, so a silhouette
+    // neighbour can never tilt the normal.
+    float3 dxr = Pr - P;
+    float3 dxl = P - Pl;
+    ddxv = (dot(dxr, dxr) < dot(dxl, dxl)) ? dxr : dxl;
+    float3 dyr = Pu - P;
+    float3 dyl = P - Pd;
+    ddyv = (dot(dyr, dyr) < dot(dyl, dyl)) ? dyr : dyl;
+    N = normalize(cross(ddxv, ddyv));
+    if (dot(N, V) < 0.0f)
+    {
+        N = -N;   // orient toward the camera
+    }
+
+    wpp = max(min(length(dxr), length(dxl)), 1e-4f);
+    return true;
+}
+
+// ---- search geometry -----------------------------------------------------------------------
+// Screen-space step length. Converting the world radius through wpp keeps the search extent
+// roughly constant with distance. Each step must cover at least one pixel: sub-pixel steps land
+// every tap on ~the same texel, so ds is a depth-quantized crumb whose direction is pure noise.
+// The 96px ceiling is the perf clamp — it is what caps the cost of a large radius up close.
+float aoStepPixels(float wpp, int steps)
+{
+    float searchPixels = clamp(aoRadius() / wpp, 2.0f, 96.0f);
+    return max(searchPixels / float(steps), 1.0f);
+}
+
+// Tap offset in pixels for step t (0-based), jittered by the per-pixel dither so neighbouring
+// pixels do not all read the same texels. Monotone in t, and never closer than 1px to the centre.
+float aoStepOffset(int t, float stepPx, float ditherOff)
+{
+    return max((float(t) + ditherOff) * stepPx, float(t) + 1.0f);
+}
+
+// Round-to-nearest tap. int2() truncates TOWARD ZERO, so a +dir and a -dir tap at the same distance
+// rounded to different pixel counts and the sweep came out asymmetric; floor(x + 0.5) rounds both
+// the same way. Pass the negated dir for the other side rather than negating the result.
+int2 aoTap(int2 px, float2 dir, float off)
+{
+    return px + int2(floor(dir * off + 0.5f));
+}
+
+// Screen slice direction -> world direction, in the surface's own tangent frame.
+float3 aoSliceDirW(float3 ddxv, float3 ddyv, float2 dir)
+{
+    return normalize(ddxv * dir.x + ddyv * dir.y);
+}
+
+// Distance attenuation: 1 at the surface, 0 at and beyond the falloff. The knob that decides how
+// far a neighbour is still allowed to occlude.
+float aoFalloffWeight(float dl)
+{
+    return saturate(1.0f - dl / aoFalloff());
+}
+
+// ---- bitmask helper (vbao / ssaofast) --------------------------------------------------------
+// Bits [b0, b1) of a 32-bit hemisphere occupancy mask. Clamped, and count == 32 is special-cased
+// because a shift of 32 is masked to 0 by the hardware (1u << 32 == 1u, not 0).
+uint aoBitRange(int b0, int b1)
+{
+    b0 = clamp(b0, 0, 32);
+    b1 = clamp(b1, 0, 32);
+    if (b1 <= b0)
+    {
+        return 0u;
+    }
+    uint count = uint(b1 - b0);
+    if (count >= 32u)
+    {
+        return 0xFFFFFFFFu;
+    }
+    return ((1u << count) - 1u) << uint(b0);
+}
+
+// ---- resolve -------------------------------------------------------------------------------
+// Shared tail: intensity, the visibility clamp, and the bent-normal guard. Every mode ends here so
+// that "AO enable OFF, bent normal ON" can never hand the colour frag a degenerate normal —
+// opaque.frag does N = normalize(aoSample.rgb) and SHADES with it, so garbage there reads as BLACK,
+// not as dimming.
+float4 aoResolve(float occ, float3 bentSum, float3 N)
+{
+    float vis = saturate(1.0f - saturate(occ) * aoIntensity());
+
+    float3 bn = bentSum + N * 1e-3f;
+    float  l2 = dot(bn, bn);
+    bn = (l2 > 1e-12f) ? (bn * rsqrt(l2)) : N;
+    if (dot(bn, N) <= 0.0f)
+    {
+        bn = N;   // never hand back a normal facing INTO the surface
+    }
+    return float4(bn, vis);
+}
+
+#endif // AO_COMMON_H

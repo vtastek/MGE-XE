@@ -18,13 +18,15 @@
 // the one cbuffer.
 #pragma once
 
+// MIRROR of gtao.srt.h's AOParams, byte for byte — same host buffer. Edit the two together.
 STRUCT(BlurParams)
 {
     DATA(float4x4, invViewProj,  None);   // 0..15  depth -> world (bilateral range weight)
     DATA(float4,   screenParams, None);   // 16..19 xy = w,h ; zw = 1/w,1/h
     DATA(float4,   _padAO,       None);   // 20..23 (aoParams slot — unused here)
     DATA(float4,   _padEye,      None);   // 24..27 (eyePos slot — unused here)
-    DATA(float4,   blurParams,   None);   // 28..31 x = spatial sigma (px), y = range sigma (world u)
+    DATA(float4,   blurParams,   None);   // 28..31 x = spatial sigma (px), y = range sigma (world u);
+                                          //        zw belong to the AO pass (slice/step + thickness)
 };
 
 BEGIN_SRT(AOBlurSrtData)
