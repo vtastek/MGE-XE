@@ -1853,10 +1853,20 @@ float3 fogSkyColor(float2 pixelXy)
 float3 applyFog(float3 lit, float3 worldPosRel, float2 pixelXy, float fog)
 {
     float4 s = fogSkySample(pixelXy);
-#line 126 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skydome.h.fsl"
+
+
+
+
+
+
+
+
+
+    fog = saturate(fog);
+#line 136 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skydome.h.fsl"
     float upness = worldPosRel.z * rsqrt(max(dot(worldPosRel, worldPosRel), 1.0e-12f));
     float skyBehind = max(s.a, saturate(upness *  38.0f ));
-#line 148 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skydome.h.fsl"
+#line 158 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skydome.h.fsl"
     float ramp = pow(1.0f - fog, gFrameData.timeParams.w);
     lit *= 1.0f - gFrameData.skyParams.w * ramp * skyBehind;
 
@@ -1872,7 +1882,7 @@ STRUCT(VSOutput)
     DATA(float2, Uv1, TEXCOORD1);
     DATA(float2, Uv2, TEXCOORD2);
     DATA(float2, Uv3, TEXCOORD3);
-    DATA(float, Fog, TEXCOORD4);
+    DATA(CENTROID(float), Fog, TEXCOORD4);
     DATA(float4, Color, COLOR);
     DATA(FLAT(float3),MatDiffuse, TEXCOORD5);
     DATA(FLAT(float3),MatAmbient, TEXCOORD6);

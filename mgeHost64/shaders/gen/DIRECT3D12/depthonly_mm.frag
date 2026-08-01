@@ -1414,7 +1414,7 @@ STRUCT(VSOutput)
     DATA(float2, Uv1, TEXCOORD1);
     DATA(float2, Uv2, TEXCOORD2);
     DATA(float2, Uv3, TEXCOORD3);
-    DATA(float, Fog, TEXCOORD4);
+    DATA(CENTROID(float), Fog, TEXCOORD4);
     DATA(float4, Color, COLOR);
     DATA(FLAT(float3),MatDiffuse, TEXCOORD5);
     DATA(FLAT(float3),MatAmbient, TEXCOORD6);

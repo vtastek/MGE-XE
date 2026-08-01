@@ -25,7 +25,7 @@ STRUCT(VSOutput)
     DATA(float3,      Normal,   NORMAL);
     DATA(float2,      Uv,       TEXCOORD0);
     DATA(FLAT(uint),  TexIndex, TEXCOORD1);
-    DATA(float,       Fog,      TEXCOORD2);
+    DATA(CENTROID(float), Fog,      TEXCOORD2);
     DATA(float4,      Color,    COLOR);       // per-vertex DiffAmb colour
     DATA(float,       AlphaRef, TEXCOORD3);   // alpha-test ref 0..1 (0 = no test)
     DATA(FLAT(float3),MatDiffuse, TEXCOORD4); // Tier 2b material constants (per draw)

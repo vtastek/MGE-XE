@@ -39,7 +39,7 @@ STRUCT(VSOutput)
     DATA(float3,      Normal,   NORMAL);
     DATA(float2,      Uv,       TEXCOORD0);   // base-map UV (shared opaque.frag)
     DATA(FLAT(uint),  TexIndex, TEXCOORD1);   // bindless base-map slot (0 = default white)
-    DATA(float,       Fog,      TEXCOORD2);   // MW fog scalar (shared opaque.frag, matches opaque.vert)
+    DATA(CENTROID(float), Fog,      TEXCOORD2);   // MW fog scalar (shared opaque.frag, matches opaque.vert)
     DATA(float4,      Color,    COLOR);       // Tier 2a: white (skinned VB has no vcol) → (d+a) fidelity
     DATA(float,       AlphaRef, TEXCOORD3);   // alpha-test ref 0..1 (shared opaque.frag; 0 = no test)
     DATA(FLAT(float3),MatDiffuse, TEXCOORD4); // Tier 2b: shared frag struct. Skinned has no captured

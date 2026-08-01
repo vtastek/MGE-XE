@@ -26,7 +26,7 @@ STRUCT(VSOutput)
     DATA(float3,      Normal,   NORMAL);
     DATA(float2,      Uv,       TEXCOORD0);
     DATA(FLAT(uint),  TexIndex, TEXCOORD1);
-    DATA(float,       Fog,      TEXCOORD2);   // MW fog scalar (1 = clear, 0 = full fogColNear)
+    DATA(CENTROID(float), Fog,      TEXCOORD2);   // MW fog scalar (1 = clear, 0 = full fogColNear)
     DATA(float4,      Color,    COLOR);       // per-vertex DiffAmb colour (shared opaque.frag)
     DATA(float,       AlphaRef, TEXCOORD3);   // alpha-test ref 0..1 (shared opaque.frag; 0 = no test)
     DATA(FLAT(float3),MatDiffuse, TEXCOORD4); // per-draw material (Tier 2b; FLAT = constant per draw)
