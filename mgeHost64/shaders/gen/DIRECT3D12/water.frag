@@ -1352,12 +1352,47 @@ STRUCT(LightData)
         Tex2DArray(float4) gFlipArrays[ 16 ] :  register(t1008,space0);
         CBUFFER(BatchData) gBatch :  register(b0,space2);
 #line 22 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
+#line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skydome.h.fsl"
+#line 69 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skydome.h.fsl"
+float4 fogSkySample(float2 pixelXy)
+{
+    return SampleLvlTex2D(gSkyColor, gSamplerBilinearClamp, pixelXy * gFrameData.fogParams.zw, 0);
+}
+
+
+
+
+float3 fogSkyTarget(float4 s)
+{
+    float3 sky = s.rgb + gFrameData.fogColNear.rgb * (1.0f - s.a);
+    return lerp(gFrameData.fogColNear.rgb, sky, gFrameData.fogColNear.w);
+}
+
+
+float3 fogSkyColor(float2 pixelXy)
+{
+    return fogSkyTarget(fogSkySample(pixelXy));
+}
+#line 100 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skydome.h.fsl"
+float3 applyFog(float3 lit, float3 worldPosRel, float2 pixelXy, float fog)
+{
+    float4 s = fogSkySample(pixelXy);
+#line 126 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skydome.h.fsl"
+    float upness = worldPosRel.z * rsqrt(max(dot(worldPosRel, worldPosRel), 1.0e-12f));
+    float skyBehind = max(s.a, saturate(upness *  38.0f ));
+#line 148 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skydome.h.fsl"
+    float ramp = pow(1.0f - fog, gFrameData.timeParams.w);
+    lit *= 1.0f - gFrameData.skyParams.w * ramp * skyBehind;
+
+    return lerp(fogSkyTarget(s), lit, fog);
+}
+#line 23 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
 
 STRUCT(VSOutput)
 {
     DATA(float4, Position, SV_Position);
     DATA(float3, WorldPos, TEXCOORD0);
-#line 27
+#line 28
 };
 
 
@@ -1386,7 +1421,7 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
     bool underwater = P[1].w > 0.5f;
     float3 camFwd = P[2].xyz;
     uint waterDbg = (uint)(P[3].x + 0.5f);
-#line 69 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
+#line 70 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
     float2 invAlloc = gShadowParams.screenAlloc.zw;
     float2 invScreen = gShadowParams.screenParams.zw;
     float2 texToVp = gShadowParams.screenAlloc.xy * gShadowParams.screenParams.zw;
@@ -1512,6 +1547,8 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
     float3 reflected = reflSample.rgb + fogCol * (1.0f - reflSample.a);
 	float3 deb = reflected;
     reflected = lerp(reflected * 0.96f, reflected, fog);
+#line 211 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
+    reflected = lerp(fogSkyColor(In.Position.xy), reflected, fog);
 
 
 

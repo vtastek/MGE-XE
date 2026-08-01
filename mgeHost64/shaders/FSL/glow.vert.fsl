@@ -32,6 +32,7 @@ STRUCT(VSOutput)
     DATA(float2,       Uv,        TEXCOORD0);   // radial UV (smooth, non-centroid — no lighting interp)
     DATA(FLAT(float3), Colour,    TEXCOORD1);
     DATA(FLAT(float),  Intensity, TEXCOORD2);
+    DATA(FLAT(float),  Fog,       TEXCOORD3);   // MW fog scalar (1 = clear, 0 = fully fogged)
 };
 
 ROOT_SIGNATURE(DefaultRootSignature)
@@ -55,5 +56,21 @@ VSOutput VS_MAIN( VSInput In )
     Out.Uv        = In.Corner.zw;
     Out.Colour    = In.I1.rgb;
     Out.Intensity = In.I1.w;
+
+    // Fog. These sprites carried NONE, so a lamp four cells into a fog bank punched through it at full
+    // intensity — and once every other path started melting into the sampled sky, the distant lights
+    // were left as the one thing the weather could not touch.
+    //
+    // Additive, so fog here is TRANSMITTANCE, not a colour to lerp toward: the identity is 0 and the
+    // sprite simply fades out. Same treatment as statics_add.frag (`tex.rgb * saturate(In.Fog)`), for
+    // the same reason — a fog-COLOURED addend would ADD haze on top of the fog rather than being
+    // dimmed by it, brightening exactly the distance where the light should be disappearing.
+    //
+    // Measured at the light's CENTRE, not per-vertex, and FLAT: the sprite is one point source that
+    // happens to be drawn as a quad, so a fog gradient across its own face would be meaningless — and
+    // the same reasoning already makes Colour and Intensity flat. centre is camera-relative, so its
+    // length is the eye distance directly (eyePos is the origin in the live frame).
+    Out.Fog = saturate((gFrameData.fogParams.y - length(centre))
+                       / (gFrameData.fogParams.y - gFrameData.fogParams.x));
     RETURN(Out);
 }

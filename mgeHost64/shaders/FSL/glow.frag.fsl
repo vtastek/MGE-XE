@@ -17,6 +17,7 @@ STRUCT(VSOutput)
     DATA(float2,       Uv,        TEXCOORD0);
     DATA(FLAT(float3), Colour,    TEXCOORD1);
     DATA(FLAT(float),  Intensity, TEXCOORD2);
+    DATA(FLAT(float),  Fog,       TEXCOORD3);
 };
 
 ROOT_SIGNATURE(DefaultRootSignature)
@@ -26,5 +27,10 @@ float4 PS_MAIN( VSOutput In )
     float r2 = dot(In.Uv, In.Uv);
     float f  = saturate(1.0f - r2);
     f = f * f;                                  // saturate(1 - r²)²
-    RETURN(float4(In.Colour * f, In.Intensity * f));
+    // Fog fades the sprite toward 0, the ADDITIVE identity (glow.vert). On BOTH lanes: the PSO
+    // accumulates dst += rgb·a, so dimming only one of them still leaves the product carrying a
+    // fogged light at reduced-but-nonzero strength. Squaring the fade this way also matches the
+    // sprite's own f² contribution curve, so a light dims as it recedes rather than shrinking.
+    float fg = saturate(In.Fog);
+    RETURN(float4(In.Colour * f * fg, In.Intensity * f * fg));
 }

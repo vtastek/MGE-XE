@@ -19,6 +19,7 @@
 //   g3 = (reflectStandInAmt, _, _, _)
 
 #include "opaque.srt.h"
+#include "skydome.h.fsl"   // fogSkyColor() — the same sampled fog target the world melts into
 
 STRUCT(VSOutput)
 {
@@ -191,6 +192,23 @@ float4 PS_MAIN( VSOutput In )
     float3 reflected = reflSample.rgb + fogCol * (1.0f - reflSample.a);
 	float3 deb = reflected;
     reflected = lerp(reflected * 0.96f, reflected, fog);
+    // ...and FOG it, which nothing here did. This was the one term in the whole surface that never
+    // converged: `refracted` reaches fogCol through depthColor and through gRefractColor (already a
+    // fogged scene copy), but the reflection only got the 0.96 distance darkening above — so at
+    // grazing angles, where Fresnel goes to ~1 and the water IS its reflection, the mirror image
+    // survived to the fog wall at 96% strength. Distant water therefore stayed a hard mirror while
+    // every other surface melted, which is what "water isn't fogged properly" looks like.
+    //
+    // Toward the SAME sampled target as the world (skydome.h.fsl), not a private fogCol: at water
+    // pixels the sky pass drew nothing, so that target evaluates to exactly fogColNear today — but
+    // routing it through the shared helper means water follows automatically if the host sky is ever
+    // extended down over the horizon band, instead of quietly becoming the one surface left behind.
+    //
+    // Applied to `reflected` rather than to the final `result`: depthColor already lerps toward fog by
+    // the same scalar, so fogging the composite would fog the refraction TWICE (fog²) and pull the
+    // mid-distance water under. One term, one fog, and the Fresnel mix then converges on its own —
+    // at fog 0 both inputs are the target, so the surface is the target at any Fresnel weight.
+    reflected = lerp(fogSkyColor(In.Position.xy), reflected, fog);
 	
     // Dev-panel water debug views (P[3].x). Output an isolated term so the reflection / refraction RT
     // contents are directly visible. Mode 1 shows the RAW reflection sample (rgb·a premultiplied): a
