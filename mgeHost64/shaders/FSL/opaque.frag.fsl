@@ -12,6 +12,7 @@
 #include "fpshadow.h.fsl"    // fpShadowVisibility() — first-person direct cube-atlas shadow test
 #include "msmrecv.h.fsl"     // sunShadowVisibility() — MSM sun-shadow receiver
 #include "skyamb.h.fsl"      // skyAmbFactor() — SH-L1 sky ambient (SH1) + sky AO (SH2)
+#include "skydome.h.fsl"     // applyFog() — extinguish into a silhouette, then melt into the SAMPLED sky
 
 STRUCT(VSOutput)
 {
@@ -252,8 +253,10 @@ float4 PS_MAIN( VSOutput In )
     float3 c = albedo.rgb * lit;
     c *= gFrameData.dbgScales.w;   // dev panel: overall output intensity modifier
     c = tonemap(c);
-    // Near fog: lerp toward fogColNear as Fog -> 0 (matches FFE's lerp(fogColNear, c, fog)).
-    c = lerp(gFrameData.fogColNear.rgb, c, In.Fog);
+    // Near fog: lerp toward the SKY as Fog -> 0. At the horizon and below that target IS fogColNear,
+    // so this is FFE's lerp(fogColNear, c, fog) for everything at or under the eye; above it the
+    // target follows the dome so a tower cannot end up brighter than the sky behind it (skydome.h).
+    c = applyFog(c, In.WorldPos, In.Position.xy, In.Fog);
     // F12 debug views. gAO is sampled at SV_Position.xy * invAlloc (screenAlloc.zw). The isolation
     // views (5 albedo / 6 lit / 7 ambient) output one shading component so surfaces Forge does NOT
     // draw stay unchanged — a quick way to spot what's still going through MW's own path.

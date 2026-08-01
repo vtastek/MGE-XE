@@ -12,6 +12,7 @@
 #include "texsample.h.fsl"   // sampleBase() — MW address mode + AF level
 #include "msmrecv.h.fsl"     // sunShadowVisibility() — MSM sun-shadow receiver
 #include "skyamb.h.fsl"      // skyAmbFactor() — SH-L1 sky ambient (SH1) + sky AO (SH2)
+#include "skydome.h.fsl"     // applyFog() — extinguish into a silhouette, then melt into the SAMPLED sky
 
 STRUCT(VSOutput)
 {
@@ -182,7 +183,7 @@ float4 PS_MAIN( VSOutput In )
 
     c *= gFrameData.dbgScales.w;   // dev panel: overall output intensity modifier
     c = tonemap(c);
-    c = lerp(gFrameData.fogColNear.rgb, c, In.Fog);
+    c = applyFog(c, In.WorldPos, In.Position.xy, In.Fog);
     // F12 debug views (see opaque.frag — kept in lockstep). gAO sampled at SV_Position.xy * invScreen.
     uint dbg = (uint)(gFrameData.debugParams.x + 0.5f);
     if (dbg == 3u || dbg == 4u) {

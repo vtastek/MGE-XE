@@ -1,0 +1,154 @@
+// mgeHost64 — fog melts into the REAL sky, sampled, not modelled (tasks/lighting.md).
+//
+// The fog AMOUNT was never the bug. `fogEnd = max(0.875, weatherFogRatio * AboveWaterFogEnd) * 8192`
+// with every weather's ratio <= 1, so fog reaches exactly 1.0 at or before the draw distance in every
+// weather, at every height. The fog COLOUR was: every lit path ended with
+//     result = lerp(gFrameData.fogColNear.rgb, result, In.Fog);   // ONE flat colour
+// while the sky it is meant to melt into is a gradient. The two agree ONLY exactly at the horizon,
+// and MW's palette makes the divergence large — clear weather is a horizon of ~(206,227,255) against
+// a zenith of ~(95,135,215), so the horizon colour is ~70% BRIGHTER than the zenith. Anything rising
+// above the eye's horizontal plane was fogged toward a colour brighter than the sky behind it, and
+// the error grew with elevation angle: a tower or a mountain came out as a GLOWING CUTOUT rather than
+// a silhouette.
+//
+// WHY THIS SAMPLES INSTEAD OF EVALUATING A DOME. v1 of this fix lerped toward
+// `lerp(fogColNear, skyZenith, saturate(dir.z))` — sky.frag's VColSource == 3 branch — on the
+// assumption that that branch draws the sky. It does not, and has not since SK4: the client retired
+// the host-gradient dome and re-ships MW's OWN per-vertex atmosphere colours, so branch 3 is dead
+// code and that expression is a documented-slightly-bright APPROXIMATION of a gradient nothing draws
+// (renderprocess.cpp, the SK4 note). Measured in game: mountain 148 against sky 143 far/low, 122
+// against 115 nearer/higher — the right sign, growing with elevation, exactly as an over-bright
+// analytic dome predicts. Clouds compounded it, and no analytic dome can ever contain a textured
+// cloud layer.
+//
+// So there is no dome function here at all. gSkyColor is a copy of the colour target taken right
+// after the sky pass — which is drawn FIRST in the colour pass, depth off — so sampling it at the
+// fragment's own screen position returns the exact pixel this fragment is covering. At full fog the
+// surface does not approach the sky, it BECOMES it, pixel for pixel, clouds and moons and sun glare
+// included. There is nothing left to keep in sync and nothing left to drift: the one failure this
+// class of fix keeps having is a second definition of the sky, and sampling removes the definition.
+//
+// STILL SCOPED BY CONSTRUCTION, and this is the property to re-check when looking at it: a fragment
+// at or below the eye's horizontal plane is covering sky the dome does not reach, where the copy's
+// alpha is 0 and the helper returns fogColNear — bit-identical to the flat fog it replaced. Ground,
+// roads, the sea and terrain viewed from above cannot move. Looking DOWN from a height is the
+// negative control; if anything shifts there, the uv is wrong.
+//
+// Requires (include AFTER opaque.srt.h): gSkyColor + gFrameData.fogColNear + gFrameData.fogParams.
+
+#ifndef SKY_DOME_H
+#define SKY_DOME_H
+
+// ORDER MATTERS, and getting it wrong is why v2 still read as a cutout at mid distance. Extinction
+// applied to the fog TARGET only shows up once fog is complete — by which point the surface has
+// already been replaced by the sky and there is nothing left to silhouette. Extinction belongs on the
+// SURFACE, ramping with how much fog stands between it and the eye:
+//
+//     lit *= 1 - extinct·(1-fog)·coverage      // FIRST: sit in the fog as a dark silhouette
+//     result = lerp(skyTarget, lit, fog)       // THEN: melt into the sky
+//
+// so a ridge darkens as fog closes in, holds as a silhouette through the middle distance, and only
+// then dissolves. The darkening's contribution to the final pixel is fog·extinct·(1-fog)·lit — a
+// parabola peaking at HALF fog with a quarter of the knob's value, which is why the knob's useful
+// range is much larger than the old target-side one was.
+//
+// pixelXy = this fragment's SV_Position.xy.
+//
+// The uv scale rides gFrameData.fogParams.zw and NOT gShadowParams.screenAlloc.zw, even though the
+// main-view sky copy is alloc-sized and the two agree there. gShadowParams is one cbuffer shared by
+// every pass, while gFrameData is per-pass — and the water mirror binds its OWN sky copy, which is
+// kReflectSize² and drawn with a full viewport, so it needs a different scale for the identical
+// shader code. Publishing the bound texture's own inverse extent alongside the texture keeps the two
+// impossible to mismatch. (fogParams.zw carried wind/cell-epoch, which the host reads CPU-side off
+// the wire and no shader ever read — see the FrameData note.)
+//
+// gSkyColor is PREMULTIPLIED (rgb·a, a), so compositing it over fogColNear is the source-over
+// `s.rgb + fogColNear*(1-s.a)` — an ADD, not a lerp. lerp(fogColNear, s.rgb, s.a) would scale the
+// already-premultiplied colour by alpha a second time and darken every partially-covered pixel.
+// a == 1 (the dome) gives s.rgb exactly; a == 0 (no sky drawn) gives fogColNear exactly.
+float4 fogSkySample(float2 pixelXy)
+{
+    return SampleLvlTex2D(gSkyColor, gSamplerBilinearClamp, pixelXy * gFrameData.fogParams.zw, 0);
+}
+
+// The sky behind this fragment, composited over fogColNear and faded by the feature's strength.
+// Strength rides fogColNear.w — a lane the client already ships as 0 and nothing read, so this cost
+// no wire growth, no CBV growth and no IPC change. 0 = byte-for-byte the flat-fog image (the A/B).
+float3 fogSkyTarget(float4 s)
+{
+    float3 sky = s.rgb + gFrameData.fogColNear.rgb * (1.0f - s.a);
+    return lerp(gFrameData.fogColNear.rgb, sky, gFrameData.fogColNear.w);
+}
+
+// What fog lerps toward, for callers that have no surface of their own (volfog's haze).
+float3 fogSkyColor(float2 pixelXy)
+{
+    return fogSkyTarget(fogSkySample(pixelXy));
+}
+
+// How fast "am I standing against sky" ramps in above the eye's horizontal plane, as a reciprocal of
+// sin(elevation): 38 = full by ~1.5 degrees. Deliberately a soft STEP and not a gradient — a ramp
+// spread over the few degrees a distant mountain actually subtends would paint a vertical gradient up
+// its own silhouette, which is a worse artefact than the one this fixes. The softness exists only to
+// keep the horizon from being a hard line.
+#define FOG_SKY_HORIZON_RAMP 38.0f
+
+// THE fog operation: extinguish, then melt. `fog` is MW's scalar — 1 = clear, 0 = fully fogged.
+// worldPosRel = the camera-relative world position every lit path already carries.
+// Every lit path calls this rather than writing its own lerp, so the ORDER above cannot drift back
+// apart one shader at a time.
+float3 applyFog(float3 lit, float3 worldPosRel, float2 pixelXy, float fog)
+{
+    float4 s = fogSkySample(pixelXy);
+
+    // EXTINCTION (skyParams.w), on the surface, ramped by the fog between it and the eye. The
+    // standard lerp already carries the energy-conserving amount of extinction; this is deliberately
+    // EXTRA, because "melts perfectly into the sky" and "reads as a silhouette on the way there" are
+    // different asks and only the second one survives being looked at.
+    //
+    // IS THERE SKY BEHIND ME — two signals, and the extinction needs the UNION of them:
+    //   s.a   is exact wherever the host sky pass drew: 1 under the dome, 0 elsewhere.
+    //   dir.z is geometric, and covers the band between the dome's lower rim and the horizon where the
+    //         host draws NOTHING at all (the target is cleared transparent, the host does not
+    //         replicate MW's own sky clear, and MW's flat fog band shows through the composite there).
+    //         s.a is 0 in that band even though sky is exactly what is behind you — and that band is
+    //         where distant mountains stand, so gating on s.a alone put the extinction everywhere
+    //         EXCEPT the one place it was asked for. Confirmed in play: "extinction applies above
+    //         horizon band" and nowhere below it.
+    //
+    // The union keeps the negative control intact, which is the reason to bound it this way rather
+    // than dropping the gate: BOTH signals are zero at and below the eye's horizontal plane, so the
+    // ground, the sea and terrain viewed from above still cannot move at any strength. It also keeps
+    // the exact signal in charge wherever it exists — the geometric one only fills the hole.
+    //
+    // rsqrt on a floored length² rather than normalize(): a fragment landing exactly at the eye would
+    // make normalize() return NaN, and NaN survives every multiply and lerp below.
+    float upness = worldPosRel.z * rsqrt(max(dot(worldPosRel, worldPosRel), 1.0e-12f));
+    float skyBehind = max(s.a, saturate(upness * FOG_SKY_HORIZON_RAMP));
+
+    // SHAPE (timeParams.w) — the knob that decides whether you get ONE hill going slightly dark and
+    // then melting, or a stack of ridges in distinct shades.
+    //
+    // MW's fog is LINEAR in distance. A darkening that also ramps linearly with it therefore rises in
+    // step with the wash toward the sky, so the two happen AT ONCE: by the time a ridge is dark enough
+    // to read as a silhouette, most of it has already been replaced by sky, and the whole silhouette
+    // phase is compressed into the last stretch before the fog wall. Successive ridges then differ
+    // almost entirely by how washed-out they are, which is a single axis, and they collapse together.
+    //
+    // Real aerial perspective layers because extinction is EXPONENTIAL in distance — each equal step
+    // costs a fixed FRACTION of contrast, so ridge after ridge stays distinguishable instead of
+    // converging. That behaviour is front-loaded: most of the darkening is spent early. `shape` < 1
+    // reproduces it against a linear fog scalar (0.45 ~ the Beer-Lambert knee over this range),
+    // saturating the darkening well before the melt takes over. Then the two run in SEQUENCE — darken
+    // into a silhouette first, wash toward the sky second — which is the order that gives each ridge
+    // its own shade. shape == 1 is the old linear ramp.
+    //
+    // The host clamps shape away from 0 (pow(0,0) is 1, which would slam full extinction onto
+    // geometry at the eye).
+    float ramp = pow(1.0f - fog, gFrameData.timeParams.w);
+    lit *= 1.0f - gFrameData.skyParams.w * ramp * skyBehind;
+
+    return lerp(fogSkyTarget(s), lit, fog);
+}
+
+#endif // SKY_DOME_H

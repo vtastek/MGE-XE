@@ -10,6 +10,7 @@
 
 #include "opaque.srt.h"
 #include "msmrecv.h.fsl"   // sunShadowVisibility() — MSM sun-shadow receiver
+#include "skydome.h.fsl"   // applyFog() — extinguish into a silhouette, then melt into the SAMPLED sky
 
 // MUST stay byte-identical to statics.vert.fsl's VSOutput (CENTROID modifiers included).
 STRUCT(VSOutput)
@@ -36,7 +37,7 @@ float4 PS_MAIN( VSOutput In )
     // Sun shadows: Color carries ambient+emissive, SunLight the sun half (split in statics.vert).
     float sunVis = sunShadowVisibility(In.WorldPos, normalize(In.WorldNormal));
     float3 result = tex.rgb * (In.Color.rgb + In.SunLight * sunVis);
-    result = lerp(gFrameData.fogColNear.rgb, result, In.Fog);
+    result = applyFog(result, In.WorldPos, In.Position.xy, In.Fog);
 
     // F12 distance grayscale parity (debugParams.x 1/2), matching statics.frag.
     uint dbg = (uint)(gFrameData.debugParams.x + 0.5f);

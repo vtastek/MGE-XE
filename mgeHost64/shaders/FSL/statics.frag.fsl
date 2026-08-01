@@ -10,6 +10,7 @@
 
 #include "opaque.srt.h"
 #include "msmrecv.h.fsl"   // sunShadowVisibility() — MSM sun-shadow receiver
+#include "skydome.h.fsl"   // applyFog() — extinguish into a silhouette, then melt into the SAMPLED sky
 
 // Static semi-HDR tonemap — byte-identical to opaque.frag / distantland.frag::tonemap (XE
 // FixedFuncEmu.fx). Applied to the final lit colour so the distant statics' point-light core rolls
@@ -125,7 +126,7 @@ float4 PS_MAIN( VSOutput In )
     // rolls off identically (opaque.frag order).
     result = tonemap(result);
 
-    result = lerp(gFrameData.fogColNear.rgb, result, In.Fog);
+    result = applyFog(result, In.WorldPos, In.Position.xy, In.Fog);
 
     // F12 distance grayscale parity (debugParams.x 1/2) with distantland.frag + opaque.frag.
     uint dbg = (uint)(gFrameData.debugParams.x + 0.5f);

@@ -30,6 +30,7 @@
 
 #include "opaque.srt.h"
 #include "msmrecv.h.fsl"   // sunShadowVolumetric() — the one-tap MSM sampler
+#include "skydome.h.fsl"   // fogSkyColor() — the haze is the same sampled sky every surface melts into
 
 STRUCT(VSOutput)
 {
@@ -146,7 +147,13 @@ float4 PS_MAIN(VSOutput In)
     // an already-fog-coloured band is a guaranteed bright stripe. Haze is fog-coloured by definition,
     // so the pedestal + ambient floor paint fogColNear over fogColNear and cost nothing visually,
     // while the lobes stay sun-coloured and remain the visible shafts.
-    float3 hazeCol  = gFrameData.fogColNear.rgb;
+    // ...and the haze takes the SAME fog target every surface now melts into (skydome.h.fsl) — the
+    // sky sampled at this ray's own pixel, not the flat horizon colour. Keeping the two in step is
+    // the whole point: a ray aimed above the eye that accumulated flat horizon-coloured haze would
+    // re-brighten the very silhouettes the surface fog just corrected. Note this takes `pix`, not
+    // texUv — fogSkyColor does its own alloc normalisation off the per-pass fogParams.zw, which
+    // is 1/ALLOC here and 1/kReflectSize in the mirror.
+    float3 hazeCol  = fogSkyColor(pix);
     float3 shaftCol = gFrameData.sunCol.rgb;
 
     float3 inscatter    = float3(0.0f, 0.0f, 0.0f);

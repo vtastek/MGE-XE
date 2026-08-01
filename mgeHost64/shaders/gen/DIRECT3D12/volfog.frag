@@ -1151,13 +1151,7 @@ STRUCT(FrameData)
 
 
     float4 alphaParams;
-
-
-
-
-
-
-
+#line 117 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
     float4 timeParams;
 
 
@@ -1179,15 +1173,15 @@ STRUCT(FrameData)
 
 
     float4 alphaShadowParams;
-#line 134
+#line 138
 };
 
 STRUCT(BatchData)
 {
     float4x4 worlds[ 1024 ];
-#line 139
+#line 143
 };
-#line 160 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+#line 164 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
 STRUCT(LightData)
 {
     float4 lightParams;
@@ -1203,7 +1197,7 @@ STRUCT(LightData)
 
     float4 froxelDimsNear;
     float4 froxelZNear;
-#line 175
+#line 179
 };
 
         CBUFFER(FrameData) gFrameData :  register(b0,space1);
@@ -1213,7 +1207,7 @@ STRUCT(LightData)
 
 
         Tex2D(float4) gAO :  register(t1,space1);
-#line 199 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+#line 203 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
         Tex3D(float4) gWaterNormalVol :  register(t2,space1);
         Tex2D(float4) gRefractColor :  register(t3,space1);
         Tex2D(float4) gSceneLinDepth :  register(t4,space1);
@@ -1328,6 +1322,8 @@ STRUCT(LightData)
 
 
         Tex2D(float) gSunOcc :  register(t53,space1);
+#line 335 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+        Tex2D(float4) gSkyColor :  register(t54,space1);
 
 
 
@@ -1344,7 +1340,7 @@ STRUCT(LightData)
 
 
         CBUFFER(LightData) gLightsNear :  register(b1,space3);
-#line 343 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+#line 366 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
         Tex2D(float4) gTextures[ 880 ] :  register(t0,space0);
 
 
@@ -1663,12 +1659,47 @@ float sunShadowVisibility(float3 worldPosRel, float3 N)
     return 1.0f - occlusion * strength;
 }
 #line 33 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/volfog.frag.fsl"
+#line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skydome.h.fsl"
+#line 69 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skydome.h.fsl"
+float4 fogSkySample(float2 pixelXy)
+{
+    return SampleLvlTex2D(gSkyColor, gSamplerBilinearClamp, pixelXy * gFrameData.fogParams.zw, 0);
+}
+
+
+
+
+float3 fogSkyTarget(float4 s)
+{
+    float3 sky = s.rgb + gFrameData.fogColNear.rgb * (1.0f - s.a);
+    return lerp(gFrameData.fogColNear.rgb, sky, gFrameData.fogColNear.w);
+}
+
+
+float3 fogSkyColor(float2 pixelXy)
+{
+    return fogSkyTarget(fogSkySample(pixelXy));
+}
+#line 100 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skydome.h.fsl"
+float3 applyFog(float3 lit, float3 worldPosRel, float2 pixelXy, float fog)
+{
+    float4 s = fogSkySample(pixelXy);
+#line 126 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skydome.h.fsl"
+    float upness = worldPosRel.z * rsqrt(max(dot(worldPosRel, worldPosRel), 1.0e-12f));
+    float skyBehind = max(s.a, saturate(upness *  38.0f ));
+#line 148 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skydome.h.fsl"
+    float ramp = pow(1.0f - fog, gFrameData.timeParams.w);
+    lit *= 1.0f - gFrameData.skyParams.w * ramp * skyBehind;
+
+    return lerp(fogSkyTarget(s), lit, fog);
+}
+#line 34 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/volfog.frag.fsl"
 
 STRUCT(VSOutput)
 {
     DATA(float4, Position, SV_Position);
     DATA(float2, Uv, TEXCOORD0);
-#line 38
+#line 39
 };
 
 
@@ -1716,7 +1747,7 @@ float4 PS_MAIN(VSOutput In): SV_TARGET
     float maxDist = gShadowParams.volFog0.w;
     float3 dir = normalize(P);
     float dist = (deviceZ > 0.0f) ? min(length(P), maxDist) : maxDist;
-#line 96 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/volfog.frag.fsl"
+#line 97 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/volfog.frag.fsl"
     if (gShadowParams.volFog4.w > 0.5f && dir.z < -1.0e-5f)
     {
         float waterRelZ = gShadowParams.volFog4.z - gFrameData.lodEye.z;
@@ -1762,15 +1793,8 @@ float4 PS_MAIN(VSOutput In): SV_TARGET
 
     float phaseCeil = gShadowParams.volFog4.y;
     if (phaseCeil > 0.0f) { lobes = lobes / (1.0f + lobes / phaseCeil); }
-
-
-
-
-
-
-
-
-    float3 hazeCol = gFrameData.fogColNear.rgb;
+#line 156 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/volfog.frag.fsl"
+    float3 hazeCol = fogSkyColor(pix);
     float3 shaftCol = gFrameData.sunCol.rgb;
 
     float3 inscatter = float3(0.0f, 0.0f, 0.0f);
@@ -1806,7 +1830,7 @@ float4 PS_MAIN(VSOutput In): SV_TARGET
         }
         if (transmittance < 0.003f) { break; }
     }
-#line 214 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/volfog.frag.fsl"
+#line 221 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/volfog.frag.fsl"
     float coverage = 1.0f - transmittance;
     float occlude = saturate(gShadowParams.volFog3.x);
     float3 grade = gShadowParams.volFog2.xyz * gShadowParams.volFog2.w;

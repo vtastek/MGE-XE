@@ -39,6 +39,13 @@ float4 PS_MAIN( VSOutput In )
     //   0 none: the constant material colour (moon disc/shadow).
     float4 base;
     if (In.VColSource == 3u) {
+        // DEAD BRANCH since SK4 — kept only so the enum stays complete. The client retired the
+        // host-gradient dome and re-ships MW's OWN per-vertex atmosphere colours, which arrive as
+        // vColSource 2 and render pixel-exact with vanilla through the In.Color path below; this
+        // gradient was a slightly-bright approximation of it and is never selected now.
+        // Do NOT resurrect it as "the definition of the sky" for anything else to match: fog melts
+        // into the sky by SAMPLING what this pass drew (skydome.h.fsl / gSkyColor), precisely so
+        // there is no second definition to keep in step.
         float3 dir = normalize(In.WorldDir);
         float  t   = saturate(dir.z);
         base = float4(lerp(gFrameData.fogColNear.rgb, gFrameData.skyZenith.rgb, t), 1.0f);

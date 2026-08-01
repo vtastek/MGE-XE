@@ -1497,6 +1497,14 @@ namespace {
         Buffer*        pWaterVB = nullptr;                 // GPU_ONLY clipmap verts (float3, stride 12)
         Buffer*        pWaterIB = nullptr;                 // GPU_ONLY clipmap indices (uint16)
         Texture*       pRefractColor = nullptr;            // screen copy of the pre-water colour (refraction src)
+        // "Fog samples the sky" (skydome.h.fsl): copies of the colour target taken right AFTER the sky
+        // pass — which draws FIRST, depth off — so each is "the sky behind this fragment" for its own
+        // view. Two, because the mirror draws its own sky into its own RT and its geometry has to melt
+        // into THAT, not into the main screen's. Same shape/format as pRefractColor and made in the
+        // same block; each is bound into the PerFrame set instances that its pass uses, and each
+        // publishes its own inverse extent into that pass's gFrameData.fogParams.zw.
+        Texture*       pSkyColor = nullptr;                // alloc-sized copy of the main view's sky
+        Texture*       pReflectSkyColor = nullptr;         // kReflectSize² copy of the mirror's sky
         Texture*       pWaterNormalVol = nullptr;          // water_NRM.dds 3D animated-normal volume
         bool           waterReady = false;                 // all water resources built (gates the pass)
 
@@ -2002,6 +2010,46 @@ namespace {
     float              g_volFogWaterZ    = 0.0f;
     bool               g_volFogWaterOn   = false;
 
+    // --- FOG SAMPLES THE SKY (skydome.h.fsl) -----------------------------------------------------
+    // Every lit path used to fog toward the single flat colour fogColNear, while the sky behind it is
+    // a gradient. The two agree ONLY exactly at the horizon, and MW's palette makes the divergence
+    // large — clear-weather horizon ~(206,227,255) against a zenith of ~(95,135,215), i.e. the fog
+    // target was ~70% BRIGHTER than the sky wherever geometry rose above the eye. A tower or a
+    // mountain at 8-16 cells therefore came out as a glowing cutout instead of a silhouette. The
+    // fragment now fogs toward the dome evaluated in its OWN view direction, so at full fog it does
+    // not approach the sky, it EQUALS it.
+    //
+    // Rides gFrameData.fogColNear.w, a lane the client already ships as 0 and nothing read — no wire
+    // growth, no CBV growth, no IPC change. 0 = byte-for-byte the flat-fog image (the A/B), 1 = full.
+    // Below the eye's horizontal plane saturate(dir.z) is 0 and this is inert at ANY strength, which
+    // is why the ground, the sea and everything under the horizon cannot move: the negative control.
+    float              g_fogSkyStrength  = 1.0f;
+    // ...and EXTINCTION: how dark a surface goes as fog closes in, BEFORE it melts. Applied to the
+    // surface and ramped by (1 - fog), not to the fog target — a target-side term only shows up once
+    // fog is complete, by which point the surface has already been replaced by the sky and there is
+    // nothing left to silhouette. This is the knob that lets a ridge sit IN the fog as a dark shape
+    // through the middle distance and only then dissolve.
+    //
+    // Scaled by sky coverage in the shader, so it only silhouettes geometry that is actually standing
+    // against sky. 0 = no extinction (the surface melts from its own brightness).
+    //
+    // 0.75, not the 0.35 this shipped with: at 0.35 a ridge only ever loses a third of its brightness,
+    // so it never reaches "dark shape against sky" at any distance — it just dims a little and then
+    // dissolves. Depth and DISTRIBUTION are independent axes here and both were wrong, which is why
+    // both move together: shape alone at 0.35 has too little darkness to distribute, and depth alone
+    // at a linear ramp arrives too late to be seen (see g_fogSkyShape).
+    float              g_fogSkyExtinct   = 0.75f;
+    // ...and WHERE along the fog range that darkening is spent. MW's fog is linear in distance, so a
+    // linear ramp (1.0) darkens in step with the wash toward the sky and the two phases overlap: a
+    // ridge is still brightening toward sky-colour while it is meant to be going dark, so the
+    // silhouette phase gets squeezed into the last stretch before the fog wall and successive ridges
+    // pile up on one axis. Real aerial perspective layers because extinction is EXPONENTIAL — each
+    // equal step costs a fixed fraction of contrast — which is a front-loaded curve. Below 1 this
+    // reproduces that against a linear fog scalar, finishing the darkening before the melt starts, so
+    // the two run in SEQUENCE and each ridge lands on its own shade. Clamped away from 0: pow(0,0) is
+    // 1, which would put full extinction on geometry at the eye.
+    float              g_fogSkyShape     = 0.45f;
+
     // --- SKY-DIRECTIONAL AMBIENT, SH-L1 (SH1, tasks/lighting.md) ---------------------------------
     // Ambient was one flat colour everywhere, so an upward-facing roof and a downward-facing arch
     // soffit received identically and the only thing telling them apart was screen-space GTAO, which
@@ -2319,7 +2367,11 @@ namespace {
         const float ground = std::max(0.0f, std::min(g_skyAmbGround, 1.0f));
         for (int i = 0; i < kSHDirs; ++i) {
             const float dx = kDirs[3 * i + 0], dy = kDirs[3 * i + 1], dz = kDirs[3 * i + 2];
-            // The dome, evaluated exactly as sky.frag does it.
+            // The dome, evaluated exactly as skyDomeColor() does it — shaders/FSL/skydome.h.fsl is the
+            // single shader-side definition (sky.frag draws it, every fog site melts into it). This is
+            // the fourth copy and the one C++ cannot share, so it is the one that can silently drift:
+            // any change to that gradient's SHAPE (clouds, a third stop, a sun lobe) has to be mirrored
+            // in the `sky` expression below or the ambient stops agreeing with the sky it came from.
             const float t = std::max(0.0f, dz);
             // GROUND. sky.frag's saturate() leaves the lower hemisphere flat fogColNear, i.e. a
             // ground as bright as the horizon haze — under overcast (fogColNear ~= skyZenith) that
@@ -5518,6 +5570,37 @@ namespace {
                 addResource(&rld, nullptr);
             }
 
+            // pSkyColor / pReflectSkyColor: the same kind of copy target, for the SKY (skydome.h.fsl).
+            // Made here rather than in a block of their own because they are the identical resource
+            // shape and share the copy helper; the sky feature is otherwise unrelated to water.
+            // pSkyColor is ALLOC-sized like pRefractColor (screen RTs are allocated at the render-scale
+            // ceiling and the frame draws a sub-viewport), so it is addressed pixel/ALLOC.
+            // pReflectSkyColor matches pReflectColor's fixed kReflectSize² and a FULL viewport, so it
+            // is addressed pixel/kReflectSize. Both scales are published per-pass rather than derived
+            // in-shader — see fogTargetColor().
+            {
+                TextureDesc sd = {};
+                sd.mWidth = width; sd.mHeight = height; sd.mDepth = 1;
+                sd.mArraySize = 1; sd.mMipLevels = 1;
+                sd.mSampleCount = SAMPLE_COUNT_1;
+                sd.mFormat = TinyImageFormat_B8G8R8A8_UNORM;
+                sd.mStartState = RESOURCE_STATE_SHADER_RESOURCE;
+                sd.mDescriptors = DESCRIPTOR_TYPE_TEXTURE;
+                sd.pName = "skyColor";
+                TextureLoadDesc sld = {};
+                sld.ppTexture = &g_live.pSkyColor;
+                sld.pDesc = &sd;
+                addResource(&sld, nullptr);
+
+                TextureDesc rsd = sd;
+                rsd.mWidth = kReflectSize; rsd.mHeight = kReflectSize;
+                rsd.pName = "reflectSkyColor";
+                TextureLoadDesc rsld = {};
+                rsld.ppTexture = &g_live.pReflectSkyColor;
+                rsld.pDesc = &rsd;
+                addResource(&rsld, nullptr);
+            }
+
             // gBatch window for water (worlds[0..5]=levels, [6]=params, [7]=invVP) + per-draw instance
             // VB (DrawIndex per level). Same layout as the sky window.
             BufferLoadDesc wwb = {};
@@ -5581,6 +5664,16 @@ namespace {
                 wp[3].mIndex = SRT_RES_IDX(SrtData, PerFrame, gReflectColor);
                 wp[3].mCount = 1; wp[3].ppTextures = &g_live.pRefractColor;   // WT1 stand-in
                 updateDescriptorSet(R, 0, g_live.pPerFrameSet, 4, wp);
+            }
+            // gSkyColor into the MAIN PerFrame set. Deliberately OUTSIDE the waterReady gate above:
+            // "fog samples the sky" has nothing to do with water, and hanging it off water's readiness
+            // is how a feature ends up silently off in the one install where water failed to build.
+            // The other four PerFrame instances bind it in their own creation blocks below.
+            if (g_live.pSkyColor) {
+                DescriptorData sp = {};
+                sp.mIndex = SRT_RES_IDX(SrtData, PerFrame, gSkyColor);
+                sp.mCount = 1; sp.ppTextures = &g_live.pSkyColor;
+                updateDescriptorSet(R, 0, g_live.pPerFrameSet, 1, &sp);
             }
             std::printf("[forge][water] build: mesh=%d vol=%d ready=%d\n",
                         (int)meshOk, (int)volOk, (int)g_live.waterReady);
@@ -5719,6 +5812,11 @@ namespace {
                     p[rn].mCount = 1; p[rn].ppTextures = &g_live.pSunOcc;
                     ++rn;
                 }
+                if (g_live.pSkyColor) {    // gSkyColor: type-valid bind (sky.frag never fogs)
+                    p[rn].mIndex = SRT_RES_IDX(SrtData, PerFrame, gSkyColor);
+                    p[rn].mCount = 1; p[rn].ppTextures = &g_live.pSkyColor;
+                    ++rn;
+                }
                 updateDescriptorSet(R, 0, g_live.pPerFrameSetReflect, rn, p);
             }
             {
@@ -5814,6 +5912,17 @@ namespace {
                     p[rn].mCount = 1; p[rn].ppTextures = &g_live.pSunOcc;
                     ++rn;
                 }
+                // gSkyColor: the MIRROR's own sky copy, and this is the one bind in the set that must
+                // NOT be the main-view texture. This set draws the reflected terrain and statics, whose
+                // fog melts toward the sky at their position in the 1024² mirror RT; handing them the
+                // screen copy would sample an unrelated image at the wrong scale — the same class of
+                // mistake the inReflect tag exists to prevent for gAO and the shadow mask. The scale
+                // that goes with it rides pReflectFrameCbvGeo's own fogParams.zw (see renderScene).
+                if (g_live.pReflectSkyColor) {
+                    p[rn].mIndex = SRT_RES_IDX(SrtData, PerFrame, gSkyColor);
+                    p[rn].mCount = 1; p[rn].ppTextures = &g_live.pReflectSkyColor;
+                    ++rn;
+                }
                 updateDescriptorSet(R, 0, g_live.pPerFrameSetReflectGeo, rn, p);
             }
 
@@ -5875,6 +5984,11 @@ namespace {
                         p[sn].mCount = 1; p[sn].ppTextures = &g_live.pSunOcc;
                         ++sn;
                     }
+                    if (g_live.pSkyColor) { // type-valid bind (a caster pass computes no fog)
+                        p[sn].mIndex = SRT_RES_IDX(SrtData, PerFrame, gSkyColor);
+                        p[sn].mCount = 1; p[sn].ppTextures = &g_live.pSkyColor;
+                        ++sn;
+                    }
                     updateDescriptorSet(R, c, g_live.pPerFrameSetSun, sn, p);
                 }
             }
@@ -5932,6 +6046,11 @@ namespace {
                     if (g_live.pSunOcc) {
                         p[kn].mIndex = SRT_RES_IDX(SrtData, PerFrame, gSunOcc);
                         p[kn].mCount = 1; p[kn].ppTextures = &g_live.pSunOcc;
+                        ++kn;
+                    }
+                    if (g_live.pSkyColor) {   // type-valid fill (a height raster computes no fog)
+                        p[kn].mIndex = SRT_RES_IDX(SrtData, PerFrame, gSkyColor);
+                        p[kn].mCount = 1; p[kn].ppTextures = &g_live.pSkyColor;
                         ++kn;
                     }
                     updateDescriptorSet(R, 0, g_live.pPerFrameSetSkyHeight, kn, p);
@@ -6535,6 +6654,15 @@ namespace {
                 if (g_live.pSunOcc) {
                     p[fpn].mIndex = SRT_RES_IDX(SrtData, PerFrame, gSunOcc);
                     p[fpn].mCount = 1; p[fpn].ppTextures = &g_live.pSunOcc;
+                    ++fpn;
+                }
+                // gSkyColor: the arms run opaque.frag, which now fogs through it. The arm camera is
+                // the MAIN view's (a post-composite overlay at a different FOV, same screen), so the
+                // screen copy is the right one — and at arm distance In.Fog is ~1 anyway, so this is
+                // a correctness/type bind rather than something that changes a pixel.
+                if (g_live.pSkyColor) {
+                    p[fpn].mIndex = SRT_RES_IDX(SrtData, PerFrame, gSkyColor);
+                    p[fpn].mCount = 1; p[fpn].ppTextures = &g_live.pSkyColor;
                     ++fpn;
                 }
                 updateDescriptorSet(R, 0, g_live.pPerFrameSetFP, fpn, p);
@@ -8022,6 +8150,23 @@ namespace {
           // caring about is the map's own texel: below ~1-2 texels an object cannot be represented.
           t.sliderF("Sky AO: statics MIN radius (0 = every static)", &g_skyAOMinRadius, 0.0f, 512.0f, 16.0f, "%.0f");
           t.dynamicText("", &g_skyAOText, &g_skyAOColor);
+          // Fog samples the SKY (skydome.h.fsl) — the third consumer of the same dome function as the
+          // two above. 0 is the A/B: fog lerps toward the flat fogColNear exactly as it always did.
+          // Watch it by looking DOWN from a height as well as up — the ground and the sea must not
+          // move at ANY strength, because saturate(dir.z) is 0 below the eye's horizontal plane.
+          t.sliderF("Fog: sample the SKY (0 = flat fog, the A/B)", &g_fogSkyStrength, 0.0f, 1.0f, 0.05f);
+          // How dark a surface goes as fog closes in, before it melts — the silhouette knob. 0 = the
+          // surface melts straight from its own brightness with no darkening on the way. This sets how
+          // dark; the SHAPE below sets where along the distance that darkness is spent, and both are
+          // needed — depth with no distribution arrives too late to see, distribution with no depth
+          // has nothing to distribute.
+          t.sliderF("Fog: extinction (how dark the silhouette gets)", &g_fogSkyExtinct, 0.0f, 1.0f, 0.05f, "%.02f");
+          // The layering knob. 1.0 = a linear ramp, which darkens in step with the wash toward the sky
+          // — the two overlap, so ridges go dark only once they are already half sky and they pile up
+          // on top of each other. Below 1 front-loads it (real extinction is exponential, i.e. a fixed
+          // fraction of contrast per equal step), so ridges finish darkening BEFORE they melt and each
+          // one lands on its own shade. Lower = more separation between successive hills.
+          t.sliderF("Fog: silhouette SHAPE (<1 = layered ridges, 1 = linear)", &g_fogSkyShape, 0.15f, 2.0f, 0.05f, "%.02f");
           t.flush(); }
 
         // -- Tab: Shadows (P1 point-light shadow atlas + fixture classification) --
@@ -8760,6 +8905,47 @@ namespace ForgeRender {
         dst[13] += dy * dst[15];
     }
 
+    // Snapshot a colour render target into an SRV copy, mid-pass. Used by "fog samples the sky"
+    // (skydome.h.fsl) to capture the sky the instant the sky pass finishes and before any geometry
+    // draws over it. The caller must have ended the render-target binding first and must re-bind
+    // (LOAD/LOAD) after — this only moves the pixels.
+    //
+    // Factored out because the main view and the water mirror both need it and the barrier dance is
+    // exactly the transition sequence the water refraction copy already proved: RESOLVE for MSAA
+    // (the colour target is multisampled and the copy is not), plain CopyResource at 1x.
+    void snapshotColorTarget(RenderTarget* src, Texture* dst, bool msaa) {
+        if (!src || !dst || !src->pTexture) { return; }
+        ID3D12GraphicsCommandList* cl = g_live.pCmd->mDx.pCmdList;
+        ID3D12Resource* srcRes = src->pTexture->mDx.pResource;
+        ID3D12Resource* dstRes = dst->mDx.pResource;
+        D3D12_RESOURCE_BARRIER pre[2] = {};
+        pre[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        pre[0].Transition.pResource = srcRes;
+        pre[0].Transition.Subresource = 0;
+        pre[0].Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        pre[0].Transition.StateAfter  = msaa ? D3D12_RESOURCE_STATE_RESOLVE_SOURCE
+                                             : D3D12_RESOURCE_STATE_COPY_SOURCE;
+        pre[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        pre[1].Transition.pResource = dstRes;
+        pre[1].Transition.Subresource = 0;
+        pre[1].Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE
+                                      | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        pre[1].Transition.StateAfter  = msaa ? D3D12_RESOURCE_STATE_RESOLVE_DEST
+                                             : D3D12_RESOURCE_STATE_COPY_DEST;
+        cl->ResourceBarrier(2, pre);
+        if (msaa) { cl->ResolveSubresource(dstRes, 0, srcRes, 0, DXGI_FORMAT_B8G8R8A8_UNORM); }
+        else      { cl->CopyResource(dstRes, srcRes); }
+        D3D12_RESOURCE_BARRIER post[2] = {};
+        post[0] = pre[0];
+        post[0].Transition.StateBefore = pre[0].Transition.StateAfter;
+        post[0].Transition.StateAfter  = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        post[1] = pre[1];
+        post[1].Transition.StateBefore = pre[1].Transition.StateAfter;
+        post[1].Transition.StateAfter  = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE
+                                       | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        cl->ResourceBarrier(2, post);
+    }
+
     bool renderScene(const float* viewProj, const float* lighting, const void* drawBlob,
                      unsigned drawCount, unsigned drawBytes,
                      const void* skinnedBlob, unsigned skinnedCount, unsigned skinnedBytes,
@@ -8872,6 +9058,28 @@ namespace ForgeRender {
             // at 64..67). The scene-probe passes only 24 floats, so guard on the null-lighting path.
             float* fd = (float*)g_live.pFrameCbv->pCpuMappedAddress;
             fd[68] = lighting[28]; fd[69] = lighting[29]; fd[70] = lighting[30]; fd[71] = lighting[31];
+            // "Fog samples the sky" (skydome.h.fsl) — three lanes, all of which have to land HERE:
+            // after the 24-float lighting memcpy above (which covers floats 16..39, so it would
+            // otherwise stomp two of them) and before the reflect/FP cbuffer copies further down,
+            // which carry them across so every view melts the same way off one write.
+            //   fogColNear.w (31) = strength. 0 = the flat-fog image byte for byte (the A/B).
+            fd[31] = std::max(0.0f, std::min(g_fogSkyStrength, 1.0f));
+            //   fogParams.zw (34,35) = the inverse extent of the sky copy bound to THIS pass, so the
+            // shader turns SV_Position into a uv without knowing which view it is in. The main copy is
+            // ALLOC-sized (screen RTs are allocated at the render-scale ceiling and the frame draws a
+            // sub-viewport), NOT render-sized — the distinction that has bitten six shaders before, and
+            // using 1/render here would stretch the sky by the scale ratio. The mirror overwrites these
+            // two with its own 1/kReflectSize in dlReflectGeoCull. Both lanes carried wind/cell-epoch,
+            // which the host reads CPU-side straight off `lighting` and no shader ever read.
+            {
+                const float aw = (float)(g_live.allocWidth  ? g_live.allocWidth  : g_live.width);
+                const float ah = (float)(g_live.allocHeight ? g_live.allocHeight : g_live.height);
+                fd[34] = (aw > 0.0f) ? (1.0f / aw) : 0.0f;
+                fd[35] = (ah > 0.0f) ? (1.0f / ah) : 0.0f;
+            }
+            // The third lane, skyParams.w (63) = fog EXTINCTION, is written with the rest of skyParams
+            // further down rather than here — that block runs unconditionally and would clobber a
+            // write made inside this `if (lighting)` guard.
             // lighting[32] = MW's simulation time (seconds this session; frozen in menus) -> the UV
             // scroll of UV-animated distant statics (statics.vert, FrameData.timeParams.x at float 80).
             // WRAP IT HERE, in double, before the float cast: the scroll is fmod(0.08*t, 1), so period
@@ -8923,7 +9131,19 @@ namespace ForgeRender {
             dp[60] = g_skyDebugTint;
             dp[61] = (float)(hostNowMs() * 0.001);
             dp[62] = g_skyTintPulse ? 1.0f : 0.0f;
-            dp[63] = 0.0f;
+            // skyParams.w = "fog samples the sky" EXTINCTION (skydome.h.fsl): how dark a surface goes
+            // as fog closes in, BEFORE it melts. On the surface and ramped by (1 - fog), so it shapes
+            // the middle distance where the object is still visible — a target-side term instead only
+            // bites once fog is complete, by which point there is no surface left to silhouette.
+            // The shader scales it by sky COVERAGE, so it cannot reach the ground/sea/below-horizon
+            // fragments that the negative control watches. 0 = no darkening on the way in.
+            dp[63] = std::max(0.0f, std::min(g_fogSkyExtinct, 1.0f));
+            // timeParams.w (float 83) = the SHAPE of that same ramp — see g_fogSkyShape. Written HERE
+            // beside its partner rather than with timeParams.xyz above, which sit inside the
+            // `if (lighting)` guard: these two knobs are a pair and reading one without the other is
+            // meaningless, so they publish together and unconditionally. Floor is not cosmetic —
+            // pow(0, 0) evaluates to 1, which would apply FULL extinction at zero distance.
+            dp[83] = std::max(0.05f, std::min(g_fogSkyShape, 4.0f));
             // atlasDbg (float index 72/73): shadow-atlas debug-view per-slot state bitmasks. Default
             // 0 (every tile dim); the shadow manager overwrites with the real active/dyn masks below.
             reinterpret_cast<uint32_t*>(dp)[72] = 0u;
@@ -11776,6 +11996,26 @@ namespace ForgeRender {
             }   // drawReflSky
             g_lastReflSkyDrawn = reflSkyDrawn;   // Phase 0 panel
 
+            // "Fog samples the sky", mirror side: snapshot the reflected sky before reflected geometry
+            // draws over it, exactly as the main view does after its own sky pass. The mirror needs its
+            // OWN copy — the reflected mountains have to melt into the reflected sky at their position
+            // in the 1024² mirror RT, and the main screen's copy is a different image at a different
+            // scale. pReflectColor is never MSAA (its own fixed RT), so this is always a plain copy.
+            if (g_live.pReflectSkyColor && g_fogSkyStrength > 0.0f) {
+                cmdBindRenderTargets(g_live.pCmd, nullptr);
+                snapshotColorTarget(g_live.pReflectColor, g_live.pReflectSkyColor, false);
+                BindRenderTargetsDesc rsb = {};
+                rsb.mRenderTargetCount = 1;
+                rsb.mRenderTargets[0] = { g_live.pReflectColor, LOAD_ACTION_LOAD };
+                rsb.mDepthStencil = { g_live.pReflectDepth, LOAD_ACTION_LOAD };
+                cmdBindRenderTargets(g_live.pCmd, &rsb);
+                cmdSetViewport(g_live.pCmd, 0.0f, 0.0f, (float)kReflectSize, (float)kReflectSize, 0.0f, 1.0f);
+                // Restore the horizon scissor the reflect pass set for itself — rebinding does not
+                // touch scissor state, but the viewport call above pairs with it and leaving the two
+                // out of step is the kind of thing that only shows up as a clipped mirror later.
+                cmdSetScissor(g_live.pCmd, 0, reflScissorTop, kReflectSize, reflScissorH);
+            }
+
             // ---- WV2 (real reflection): reflected LAND + STATICS over the reflected sky --------------
             // The CPU cull + mirror matrix + clip plane + pReflectFrameCbvGeo write already ran PRE-beginCmd
             // (dlReflectGeoCull, hoisted off record). Here we only RECORD the draws into the still-bound
@@ -11941,6 +12181,29 @@ namespace ForgeRender {
         }
 
         gpuPhaseEnd(kGpuPhaseColorSky);
+
+        // "Fog samples the sky" (skydome.h.fsl): snapshot the colour target NOW. The sky pass is the
+        // first thing in the colour pass and nothing else has drawn yet, so what is in the target is
+        // exactly the sky — and at a given pixel it is exactly the sky that the geometry about to be
+        // drawn there will cover. Every fog site then lerps toward this texture at its own screen
+        // position, which is why a fully fogged surface BECOMES the sky pixel for pixel (clouds,
+        // moons, sun glare included) instead of converging on an analytic dome that has to be kept
+        // in sync with the one the sky pass actually draws.
+        //
+        // Skipping this (feature off / resource missing) leaves the texture reading whatever it last
+        // held; the shader gates on its ALPHA, and a never-written copy is zero-alpha, which is the
+        // flat-fog fallback. So the failure mode here is the old image, not a wrong one.
+        if (g_live.pSkyColor && g_fogSkyStrength > 0.0f) {
+            cmdBindRenderTargets(g_live.pCmd, nullptr);
+            snapshotColorTarget(colorTarget, g_live.pSkyColor, g_live.sampleCount > 1);
+            BindRenderTargetsDesc rebind = {};
+            rebind.mRenderTargetCount = 1;
+            rebind.mRenderTargets[0] = { colorTarget, LOAD_ACTION_LOAD };   // keep the sky we just drew
+            rebind.mDepthStencil = { g_live.pDepth, LOAD_ACTION_LOAD };
+            cmdBindRenderTargets(g_live.pCmd, &rebind);
+            cmdSetViewport(g_live.pCmd, 0.0f, 0.0f, (float)g_live.width, (float)g_live.height, 0.0f, 1.0f);
+            cmdSetScissor(g_live.pCmd, 0, 0, g_live.width, g_live.height);
+        }
 
         gpuPhaseBegin(kGpuPhaseColorNear);
 
@@ -20959,6 +21222,13 @@ namespace ForgeRender {
             // (float 116), but this pass uses the MIRROR viewProj + reflection rings, so its froxel grid
             // is wrong. Force froxelDims.x = 0 so the reflected DL frags brute-loop gLights instead.
             gp[116] = 0.0f;
+            // Same reasoning, same class of bug: fogParams.zw (34,35) is the inverse extent of the sky
+            // copy that pass samples for fog, and the copy bound to THIS set is the mirror's own
+            // kReflectSize² one, drawn with a FULL viewport — not the alloc-sized screen copy the
+            // memcpy just brought over. Leaving the main view's scale here would sample the reflected
+            // sky at the wrong rate and slide it against the geometry it is supposed to melt into.
+            gp[34] = 1.0f / (float)kReflectSize;
+            gp[35] = 1.0f / (float)kReflectSize;
         }
         // The mirror matrix + clip plane are now live, which is all the NEAR reflect record needs.
         // This used to sit behind `!g_dlExterior` along with the DL cull below, so an interior — which

@@ -23,6 +23,7 @@
 #include "opaque.srt.h"
 #include "msmrecv.h.fsl"   // sunShadowVisibility() — MSM sun-shadow receiver
 #include "skyamb.h.fsl"    // skyAmbFactor() — SH-L1 sky ambient (SH1) + sky AO (SH2)
+#include "skydome.h.fsl"   // applyFog() — extinguish into a silhouette, then melt into the SAMPLED sky
 
 #define TERRAIN_VERTS   65
 #define TERRAIN_QUADS   64
@@ -309,7 +310,7 @@ float4 PS_MAIN( VSOutput In )
     result += albedo * pointDiffuse;
 
     result = tonemap(result);
-    result = lerp(gFrameData.fogColNear.rgb, result, In.Fog);
+    result = applyFog(result, In.WorldPos, In.Position.xy, In.Fog);
 
     // F12 distance grayscale parity (debugParams.x 1/2), matching opaque.frag / distantland.frag.
     uint dbg = (uint)(gFrameData.debugParams.x + 0.5f);

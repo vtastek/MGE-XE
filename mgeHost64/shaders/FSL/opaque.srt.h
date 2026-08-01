@@ -109,7 +109,11 @@ STRUCT(FrameData)
     // only if its flags carry bit2, set from the NIF's NiUVController at bake time). 336B < 512B.
     // y = hero blend-pass enabled. z = Glow in the Dahrk night signal: the client's signed margin in
     // GAME HOURS into the period where GitD lights a window mesh (>0 lit, <0 dark), consumed only by
-    // statics.vert's day/night variant clip (flags bits 3/4). w unused.
+    // statics.vert's day/night variant clip (flags bits 3/4).
+    // w = "fog samples the sky" silhouette SHAPE — the exponent on the extinction's fog ramp
+    // (skydome.h.fsl). < 1 front-loads the darkening so ridges finish going dark BEFORE the melt
+    // washes them out, which is what separates them into distinct shades; 1 = a linear ramp. Read
+    // only by applyFog(); host clamps it away from 0.
     DATA(float4, timeParams, None);
     // Hero distant statics UV animation (Phase 3). The host evaluates the real NiUVController keys
     // for up to 8 UNIQUE (deduped) animations — the fence fasterA/fasterB/slower layers + lava
@@ -310,6 +314,25 @@ BEGIN_SRT_NO_AB(SrtData)
         // gShadowParams.skyAOMap + sunOcc, so this texture carries no state of its own.
         // Appended after gSkyHeight — append only, see the note above it.
         DECL_TEXTURE(PerFrame, Tex2D(float), gSunOcc)
+        // "Fog samples the sky" (skydome.h.fsl): a copy of the colour target taken RIGHT AFTER the
+        // SK1 sky pass — which is drawn FIRST in the colour pass, depth off — so this texture is
+        // literally "what is behind this fragment", clouds/moons/sun glare and all. Fog lerps toward
+        // it at the fragment's own screen position, which is what makes a distant surface converge on
+        // the exact pixel it is covering instead of on an analytic dome that has to be kept in sync.
+        //
+        // PREMULTIPLIED (rgb·a, a): the sky blends SRCALPHA/INVSRCALPHA into a transparent-cleared
+        // target, so a == sky coverage and a == 0 means the dome does not reach that pixel (the band
+        // MW's own flat fog owns). An UNBOUND or stale binding therefore reads (0,0,0,0) → a = 0 →
+        // the helper returns fogColNear → exactly the flat-fog behaviour this replaced. The failure
+        // mode is the old image, not a black one.
+        //
+        // Per-pass: the main sets get the screen copy, pPerFrameSetReflectGeo gets the MIRROR's own
+        // sky copy, so both sides of the water melt into their own sky. The texture's inverse extent
+        // rides gFrameData.fogParams.zw (per-pass, because gFrameData is the per-pass cbuffer while
+        // gShadowParams is shared) — see skydome.h.fsl.
+        //
+        // Appended AFTER gSunOcc — append only, see the note above gSkyHeight.
+        DECL_TEXTURE(PerFrame, Tex2D(float4), gSkyColor)
     END_SRT_SET(PerFrame)
     // Point-light cbuffer — rides the otherwise-unused PerDraw set (FSL has exactly four
     // fixed update frequencies: Persistent/PerFrame/PerBatch/PerDraw; a custom set name has

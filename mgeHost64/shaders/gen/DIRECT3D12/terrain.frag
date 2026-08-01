@@ -1151,13 +1151,7 @@ STRUCT(FrameData)
 
 
     float4 alphaParams;
-
-
-
-
-
-
-
+#line 117 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
     float4 timeParams;
 
 
@@ -1179,15 +1173,15 @@ STRUCT(FrameData)
 
 
     float4 alphaShadowParams;
-#line 134
+#line 138
 };
 
 STRUCT(BatchData)
 {
     float4x4 worlds[ 1024 ];
-#line 139
+#line 143
 };
-#line 160 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+#line 164 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
 STRUCT(LightData)
 {
     float4 lightParams;
@@ -1203,7 +1197,7 @@ STRUCT(LightData)
 
     float4 froxelDimsNear;
     float4 froxelZNear;
-#line 175
+#line 179
 };
 
         CBUFFER(FrameData) gFrameData :  register(b0,space1);
@@ -1213,7 +1207,7 @@ STRUCT(LightData)
 
 
         Tex2D(float4) gAO :  register(t1,space1);
-#line 199 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+#line 203 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
         Tex3D(float4) gWaterNormalVol :  register(t2,space1);
         Tex2D(float4) gRefractColor :  register(t3,space1);
         Tex2D(float4) gSceneLinDepth :  register(t4,space1);
@@ -1328,6 +1322,8 @@ STRUCT(LightData)
 
 
         Tex2D(float) gSunOcc :  register(t53,space1);
+#line 335 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+        Tex2D(float4) gSkyColor :  register(t54,space1);
 
 
 
@@ -1344,7 +1340,7 @@ STRUCT(LightData)
 
 
         CBUFFER(LightData) gLightsNear :  register(b1,space3);
-#line 343 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+#line 366 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
         Tex2D(float4) gTextures[ 880 ] :  register(t0,space0);
 
 
@@ -1779,6 +1775,41 @@ float3 skyAmbFactor(float3 N, float3 worldPosRel)
     return lerp(float3(1.0f, 1.0f, 1.0f), max(f, float3(0.0f, 0.0f, 0.0f)), s) * ao;
 }
 #line 26 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terrain.frag.fsl"
+#line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skydome.h.fsl"
+#line 69 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skydome.h.fsl"
+float4 fogSkySample(float2 pixelXy)
+{
+    return SampleLvlTex2D(gSkyColor, gSamplerBilinearClamp, pixelXy * gFrameData.fogParams.zw, 0);
+}
+
+
+
+
+float3 fogSkyTarget(float4 s)
+{
+    float3 sky = s.rgb + gFrameData.fogColNear.rgb * (1.0f - s.a);
+    return lerp(gFrameData.fogColNear.rgb, sky, gFrameData.fogColNear.w);
+}
+
+
+float3 fogSkyColor(float2 pixelXy)
+{
+    return fogSkyTarget(fogSkySample(pixelXy));
+}
+#line 100 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skydome.h.fsl"
+float3 applyFog(float3 lit, float3 worldPosRel, float2 pixelXy, float fog)
+{
+    float4 s = fogSkySample(pixelXy);
+#line 126 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skydome.h.fsl"
+    float upness = worldPosRel.z * rsqrt(max(dot(worldPosRel, worldPosRel), 1.0e-12f));
+    float skyBehind = max(s.a, saturate(upness *  38.0f ));
+#line 148 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skydome.h.fsl"
+    float ramp = pow(1.0f - fog, gFrameData.timeParams.w);
+    lit *= 1.0f - gFrameData.skyParams.w * ramp * skyBehind;
+
+    return lerp(fogSkyTarget(s), lit, fog);
+}
+#line 27 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terrain.frag.fsl"
 
 
 
@@ -1801,7 +1832,7 @@ STRUCT(VSOutput)
     DATA(CENTROID(float), Fog, TEXCOORD2);
     DATA(float2, Lattice, TEXCOORD3);
     DATA(FLAT(uint4), Cell, TEXCOORD4);
-#line 48
+#line 49
 };
 
 
@@ -1886,7 +1917,7 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
         albedo += sampleLand(id01, uv) * w01;
         albedo += sampleLand(id11, uv) * w11;
     }
-#line 147 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terrain.frag.fsl"
+#line 148 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terrain.frag.fsl"
     {
         const uint cslot = In.Cell.x;
         float3 c00 = loadVertexColor(cslot, x0, y0);
@@ -1904,7 +1935,7 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
     float3 result = albedo
                   * (gFrameData.sunCol.rgb * saturate(dot(-gFrameData.sunDir.xyz, normal)) * sunVis
                      + gFrameData.lodSunAmb.rgb * skyAmbFactor(normal, In.WorldPos));
-#line 186 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terrain.frag.fsl"
+#line 187 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terrain.frag.fsl"
     float3 pointDiffuse = float3(0.0f, 0.0f, 0.0f);
     bool inReflect = (gFrameData.gReflWaterClip.z != 0.0f);
     if (length(In.WorldPos) < gFrameData.lodParams.x)
@@ -2031,7 +2062,7 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
     result += albedo * pointDiffuse;
 
     result = tonemap(result);
-    result = lerp(gFrameData.fogColNear.rgb, result, In.Fog);
+    result = applyFog(result, In.WorldPos, In.Position.xy, In.Fog);
 
 
     uint dbg = (uint)(gFrameData.debugParams.x + 0.5f);

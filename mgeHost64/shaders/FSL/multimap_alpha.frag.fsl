@@ -15,6 +15,7 @@
 #include "opaque.srt.h"
 #include "texsample.h.fsl"   // sampleBase() — MW address mode + AF level
 #include "skyamb.h.fsl"      // skyAmbFactor() — SH-L1 sky ambient (SH1) + sky AO (SH2)
+#include "skydome.h.fsl"     // applyFog() — extinguish into a silhouette, then melt into the SAMPLED sky
 
 STRUCT(VSOutput)
 {
@@ -167,7 +168,7 @@ float4 PS_MAIN( VSOutput In )
 
     c *= gFrameData.dbgScales.w;
     c = tonemap(c);
-    c = lerp(gFrameData.fogColNear.rgb, c, In.Fog);
+    c = applyFog(c, In.WorldPos, In.Position.xy, In.Fog);
 
     // F12 debug views (lockstep with multimap.frag; alpha forced 1 so the view reads clearly).
     uint dbg = (uint)(gFrameData.debugParams.x + 0.5f);
