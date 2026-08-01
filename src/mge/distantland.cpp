@@ -8,6 +8,7 @@
 #include "mwbridge.h"
 #include "scenegraph.h"
 #include "scenegraph_geometry_cache.h"
+#include "enginecull.h"
 #include "renderprocess.h"
 #include "mge_tracy.h"
 #include "statusoverlay.h"
@@ -309,6 +310,14 @@ void DistantLand::frameSetupEarly() {
         // the menu, and its only clear point (swapCaptureBuffers) rides the produce we just
         // skipped. Drop the pending captures or they grow for the life of the menu.
         RenderProcess::discardPendingCaptures();
+        // Same shape of problem, same frame: this return skips earlyClassifyMainScene, and with
+        // it EngineCull::beginFrame — the only thing that re-arms the classify/display pair. MW
+        // still renders the world behind the frozen menu, so its own top-level CullShow will
+        // fire; if the pair were left armed it would display the leaves an EARLIER frame
+        // collected, which are raw NiTriShape* good for one frame only. Menus never armed it
+        // before (classifyNow declined on menuMode), so this hole opens exactly when that guard
+        // is lifted — see enginecull.cpp.
+        MGE::EngineCull::abandonDeferred();
         return;
     }
 

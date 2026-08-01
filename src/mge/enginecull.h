@@ -84,8 +84,21 @@ namespace MGE::EngineCull {
     //   11 staleRoot  12 notInstalled (ours; msoc has no equivalent)
     // msoc's 2 (!inRenderMainScene) and 10 (detourDeclined) have no counterpart:
     // this call IS the traversal driver, so there is no second gate to decline
-    // and no separate scene-phase flag to consult.
+    // and no separate scene-phase flag to consult. 7 (menuMode) can no longer occur
+    // either — see classifyNow: menus classify exactly as play does, because
+    // declining there put the whole menu frame on the frustum-only fallback and drew
+    // the world past MW's view distance. The number stays reserved so one legend
+    // still reads across both producers' logs.
     int classifyNow(void* camera);
+
+    // Drop leaves collected by a classify whose display pass will never run, WITHOUT
+    // the rest of beginFrame(). One caller: DistantLand::frameSetupEarly's menuFreeze
+    // early-return, which is the only path that skips beginFrame() on a frame where
+    // the engine still renders the world — so without this the engine's own top-level
+    // pass would display the PREVIOUS frame's g_pending, and those are raw NiTriShape*
+    // whose only liveness guarantee was being current-frame. Same reasoning, and the
+    // same frame, as RenderProcess::discardPendingCaptures().
+    void abandonDeferred();
 
     // Sink for the current-frame drawn set. Signature inherited from msoc's
     // FnVisibleGeomCallback, which is what let D5 delete the msoc feed without

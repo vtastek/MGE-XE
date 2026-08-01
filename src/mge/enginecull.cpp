@@ -484,6 +484,20 @@ void beginFrame(int ownedFlags) {
     g_stats = Stats{};
 }
 
+// The clear above, without the re-arm — for the one path that skips beginFrame()
+// entirely (menuFreeze's early return in frameSetupEarly). Before menus classified
+// this could not matter, because a menu never armed the pair; now it can, and a
+// frozen frame still lets the engine run its own top-level pass. Leaving the pair
+// armed would hand that pass the PREVIOUS frame's leaves. Counted as a missed
+// display so it shows up in the same statistic as every other classify that never
+// reached a display, rather than silently.
+void abandonDeferred() {
+    if (!g_displayPending && g_pending.empty()) return;
+    ++g_stats.missedDisplays;
+    g_displayPending = false;
+    g_pending.clear();
+}
+
 Coverage classifyCoverage(NI::AVObject* obj) {
     auto it = g_coverageCache.find(obj);
     if (it != g_coverageCache.end()) {
@@ -542,11 +556,21 @@ int classifyNow(void* cameraIn) {
 
     NI::Camera* mainCamera = MGE::WorldControllerView::worldCamera();
     if (!mainCamera) return 6;
-    // Menu parity with msoc, which skipped for a threadpool reason we no longer
-    // have. Kept for D4 so the A/B compares like with like; menus fall back to
-    // the frustum walk exactly as they do today. Lifting it is a separate,
-    // measurable change.
-    if (MGE::WorldControllerView::menuMode()) return 7;
+    // rc=7 (menuMode) USED TO BE GUARDED HERE and no longer can occur. The guard was msoc
+    // parity — msoc skipped menus for a threadpool reason we never had — kept through D4 only
+    // so the A/B compared like with like. It was not free: declining put every menu frame on
+    // buildFrustumVisibleSet's frustum-only fallback, which runs ensureFullWalk() and then keeps
+    // every cache entry inside the frustum out to the walk gate radius, instead of the engine's
+    // own drawn set. In-game that renders the world PAST MW's view distance and past the active
+    // grid — creatures and lights that belong to background-loaded cells appear the moment a
+    // menu opens and vanish when it closes. The log says it plainly across a menu open:
+    //     rc=0 walk=0.08 visited=17   live=708   <- classify: the engine's drawn set
+    //     rc=7 walk=3.53 visited=6029 live=9     <- fallback: the whole gated grid
+    // Nothing about the traversal needs the world to be simulating: menus render the world
+    // through the same root with the same camera, and a paused world is if anything MORE stable
+    // to walk. So classify in menus exactly as in play. Any menu frame where MW does not render
+    // the world at all (a loading screen) simply never fires the display pass, and beginFrame()
+    // drops the collected leaves next frame — the case it already counts as missedDisplays.
     auto* camera = static_cast<NI::Camera*>(cameraIn);
     if (camera && camera != mainCamera) return 8;
 
