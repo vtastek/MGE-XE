@@ -1085,7 +1085,9 @@ STRUCT(ShadowMaskParams)
     float4 skyAOMap;
 #line 219 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
     float4 sunOcc;
-#line 220
+#line 235 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
+    float4 skyAO2;
+#line 236
 };
 #line 20 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowmask.srt.h"
 

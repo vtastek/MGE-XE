@@ -2086,6 +2086,21 @@ namespace {
     float              g_skyAOInner     = 256.0f;
     float              g_skyAOOuter     = 8192.0f;   // how far a cliff can still shade you
     float              g_skyAOTaps      = 4.0f;      // steps per direction; 5 directions => 20 samples
+    // The OVERHANG correction — the one place a height map is provably lying. Every column reads as
+    // solid from -inf to its stored top, so anywhere with open air above the receiver and geometry
+    // above THAT (Baar Dau over Vivec, a tower shaft under a wider top, an arch, a canton walkway)
+    // every azimuth reports a steep horizon at once and the point goes near-black, while the real sky
+    // is open toward the horizon all the way round. One point-sampled tap at the receiver's own texel
+    // detects it; see skyamb.h.fsl for why that tap is nearest-filtered and not bilinear.
+    //
+    // START is deliberately small. With a POINT tap, a receiver standing on the surface that generated
+    // its own texel reads ~0 clearance — the common case — so this only has to clear map quantisation
+    // (R16F is ~8 units of ulp at Red Mountain height) and a texel of slop, not a building.
+    float              g_skyAOOverhang      = 128.0f;
+    float              g_skyAOOverhangFade  = 1024.0f;
+    // Never 0: a blocker the size of the meteor genuinely does remove sky, so the correction may only
+    // lighten toward the truth and not past it. The residue in that band is GTAO's to own.
+    float              g_skyAOOverhangFloor = 0.25f;
     // --- LONG-RANGE sun occlusion (sunocc.comp.fsl) ---------------------------------------------
     // Derived from the height map above, over the SAME window — so it needs no origin of its own and
     // there is exactly one published mapping between them. HALF the resolution, deliberately: this
@@ -2171,10 +2186,12 @@ namespace {
     // because it is derived from that map over that window; publishing a second copy of one origin is
     // how a derived map ends up sampled through last frame's mapping.
     constexpr uint32_t kSunOccFloat    = kSkyAOMapFloat + 4;
-    // ...which lands on exactly 512 floats. The allocation has no slack left, so the next lane added
-    // here moves this one line to 4096 (a CBV, not a per-frame cost) rather than being squeezed in.
-    constexpr uint32_t kShadowParamsBytes = 2048;
-    static_assert((kSunOccFloat + 4) * sizeof(float) <= kShadowParamsBytes,
+    // SH2 overhang correction (ramp start / width / trust floor). This is the lane that crossed 512
+    // floats, so the CBV allocation moved 2048 -> 4096 exactly as its own comment predicted — a one-off
+    // CBV size, not a per-frame cost. Keep the assert against the ALLOCATION.
+    constexpr uint32_t kSkyAO2Float    = kSunOccFloat + 4;
+    constexpr uint32_t kShadowParamsBytes = 4096;
+    static_assert((kSkyAO2Float + 4) * sizeof(float) <= kShadowParamsBytes,
                   "ShadowMaskParams overflows its CBV — too many sun cascades");
     // msmrecv.h.fsl's PCSS works in TEXELS, so SUN_SHADOW_RES has to agree with the atlas the host
     // actually allocated. Same mirroring contract as SUN_CASCADES / kSunCascades.
@@ -2214,6 +2231,12 @@ namespace {
         mp[kSkyAOMapFloat  + 1] = g_skyHeightOrigin[1];
         mp[kSkyAOMapFloat  + 2] = 1.0f / kSkyHeightExtent;
         mp[kSkyAOMapFloat  + 3] = std::max(1.0f, std::min(g_skyAOTaps, 16.0f));
+        // Overhang correction. Published unconditionally alongside the march it corrects — it rides
+        // the same strength gate above, so there is no separate disarm to get wrong.
+        mp[kSkyAO2Float    + 0] = std::max(0.0f, g_skyAOOverhang);
+        mp[kSkyAO2Float    + 1] = std::max(1.0f, g_skyAOOverhangFade);
+        mp[kSkyAO2Float    + 2] = std::max(0.0f, std::min(g_skyAOOverhangFloor, 1.0f));
+        mp[kSkyAO2Float    + 3] = 0.0f;
     }
 
     // ...and the LONG-RANGE sun occlusion lanes. Split out for the same reason publishSkyAO is: it
@@ -4201,10 +4224,15 @@ namespace {
             updateDescriptorSet(R, 0, g_live.pPerFrameSet, np, p);
         }
         {
-            DescriptorData p = {};
-            p.mIndex = SRT_RES_IDX(SrtData, PerDraw, gLights);
-            p.ppBuffers = &g_live.pLightCbv;
-            updateDescriptorSet(R, 0, g_live.pPerLightsSet, 1, &p);
+            DescriptorData p[2] = {};
+            p[0].mIndex = SRT_RES_IDX(SrtData, PerDraw, gLights);
+            p[0].ppBuffers = &g_live.pLightCbv;
+            // gLightsNear rides EVERY PerDraw instance, always pointing at the near live list, so
+            // terrain can pick per fragment whichever set is bound (opaque.srt.h). Leaving it unbound
+            // is not an option — an unwritten CBV descriptor is undefined heap memory, not a null read.
+            p[1].mIndex = SRT_RES_IDX(SrtData, PerDraw, gLightsNear);
+            p[1].ppBuffers = &g_live.pLightCbv;
+            updateDescriptorSet(R, 0, g_live.pPerLightsSet, 2, p);
         }
 
         // P1 shadows: per-face PerFrame set — instance f binds face CBV f (the reflection pass's
@@ -6511,18 +6539,24 @@ namespace {
                 }
                 updateDescriptorSet(R, 0, g_live.pPerFrameSetFP, fpn, p);
 
-                DescriptorData lp = {};
-                lp.mIndex = SRT_RES_IDX(SrtData, PerDraw, gLights);
-                lp.ppBuffers = &g_live.pFPLightCbv;
-                updateDescriptorSet(R, 0, g_live.pPerLightsSetFP, 1, &lp);
+                DescriptorData lp[2] = {};
+                lp[0].mIndex = SRT_RES_IDX(SrtData, PerDraw, gLights);
+                lp[0].ppBuffers = &g_live.pFPLightCbv;
+                lp[1].mIndex = SRT_RES_IDX(SrtData, PerDraw, gLightsNear);
+                lp[1].ppBuffers = &g_live.pLightCbv;   // never read by the arms; a valid CBV, not a hole
+                updateDescriptorSet(R, 0, g_live.pPerLightsSetFP, 2, lp);
 
                 // Phase C: bind the baked distant-light cbuffer to its PerDraw set (same gLights slot).
                 if (g_live.pDistLightCbv && g_live.pPerLightsSetDist) {
                     std::memset(g_live.pDistLightCbv->pCpuMappedAddress, 0, kLightCbvBytes);
-                    DescriptorData dlp = {};
-                    dlp.mIndex = SRT_RES_IDX(SrtData, PerDraw, gLights);
-                    dlp.ppBuffers = &g_live.pDistLightCbv;
-                    updateDescriptorSet(R, 0, g_live.pPerLightsSetDist, 1, &dlp);
+                    DescriptorData dlp[2] = {};
+                    dlp[0].mIndex = SRT_RES_IDX(SrtData, PerDraw, gLights);
+                    dlp[0].ppBuffers = &g_live.pDistLightCbv;
+                    // ...and the near live list beside it. This is the instance terrainRecord binds,
+                    // so this is the one whose gLightsNear the per-fragment pick actually reads.
+                    dlp[1].mIndex = SRT_RES_IDX(SrtData, PerDraw, gLightsNear);
+                    dlp[1].ppBuffers = &g_live.pLightCbv;
+                    updateDescriptorSet(R, 0, g_live.pPerLightsSetDist, 2, dlp);
                 }
 
                 DescriptorData bw = {};
@@ -7972,6 +8006,13 @@ namespace {
           t.sliderF("Sky AO: INNER radius (GTAO handoff — do not overlap)", &g_skyAOInner, 32.0f, 2048.0f, 32.0f, "%.0f");
           t.sliderF("Sky AO: OUTER radius (how far a cliff still shades)", &g_skyAOOuter, 512.0f, 32768.0f, 256.0f, "%.0f");
           t.sliderF("Sky AO: taps per direction (x5 dirs = samples)", &g_skyAOTaps, 1.0f, 16.0f, 1.0f, "%.0f");
+          // OVERHANG correction. A height map reads every column as solid to -inf, so under Baar Dau,
+          // on a tower shaft, or beneath an arch all five azimuths report a steep horizon at once and
+          // the point goes near-black — while the sky is open toward the horizon in every direction.
+          // FLOOR at 1.0 disables the correction (full trust everywhere) and is the A/B for it.
+          t.sliderF("Sky AO: overhang START (world u of clearance)", &g_skyAOOverhang, 0.0f, 2048.0f, 32.0f, "%.0f");
+          t.sliderF("Sky AO: overhang FADE width (world u)", &g_skyAOOverhangFade, 64.0f, 8192.0f, 64.0f, "%.0f");
+          t.sliderF("Sky AO: overhang TRUST floor (1 = correction off)", &g_skyAOOverhangFloor, 0.0f, 1.0f, 0.05f);
           // Stage A/B split. OFF = terrain only: cliffs and canyons shade, the alley you are standing
           // in does not. Both of these join the rebuild trigger, so they take effect on the spot
           // rather than after walking a whole snap cell.
@@ -19116,6 +19157,17 @@ namespace ForgeRender {
         *T.lastSubsets = 0;
         if (T.lastInst) { *T.lastInst = 0; }
         if (T.primary) { g_liveLastInst = g_liveLastSubsets = 0; }
+        // Terrain gets the same treatment as the statics counters above, and for the same reason:
+        // V.cells is set ONLY by terrainCullAndBuild, which lives below the exterior return, so an
+        // interior frame would otherwise keep the LAST EXTERIOR frame's cell list — and terrainRecord
+        // draws on nothing but `V.cells != 0`. The Z-prepass entry is deliberately ungated (it runs in
+        // the prepass, long before dlLiveRecord's exterior gate), so a stale list there wrote a slab of
+        // outdoor landscape into the interior depth buffer and ate the room behind it.
+        //
+        // Cleared HERE rather than by gating each consumer: the cull is the single thing that decides
+        // terrain is drawable, so revoking it in one place covers the prepass, the colour pass, the sun
+        // caster and the mirror at once, and the next pass to draw terrain can't forget its own gate.
+        (T.primary ? g_terrainMain : g_terrainRefl).cells = 0;
         if (!g_dlExterior) { return; }
         const double tCull0 = hostNowMs();   // CPU cull+build cost (NOT in the host record/gpu metrics)
 
@@ -19149,14 +19201,22 @@ namespace ForgeRender {
         }
         if (!g_dlLiveInit) { return; }   // reflect cull before the primary init ran → nothing to do
 
+        // Phase E near↔far light handoff radius. ONE definition, read TWICE and they must never
+        // disagree: the baked-light stream below DELETES fixtures wholly inside it, and terrain.frag
+        // switches light lists at it. A mismatch is a ring of unlit ground exactly the width of the
+        // difference. Viewer/no-near-cut paths leave g_dlNearViewRange 0 → 0 → neither ever fires.
+        const float nearOwn = (g_dlLightNearDedup && !g_dlNoStaticsNearCut)
+                            ? std::max(g_dlNearViewRange - 1152.0f, 0.0f) : 0.0f;
+
         // DL frame constants into gFrameData (mirrors the probe's fd[48..59] block). PRIMARY only —
         // these are camera-independent, so the reflect cull must not touch pFrameCbv (its geo cbuffer
         // is a copy made in the reflect pass).
         if (T.primary) {
             float* fd = (float*)g_live.pFrameCbv->pCpuMappedAddress;
-            // lodParams.xyz were the DL world/normal/detail atlas slots — retired with the bake.
+            // lodParams.x = the light handoff above (terrain.frag's per-fragment near/far pick).
+            // .yz were the DL world bake's normal/detail atlas slots — retired with the bake.
             // .w (nearViewRange) survives: statics.vert still gates the hero near-cut on it.
-            fd[48] = 0.0f; fd[49] = 0.0f; fd[50] = 0.0f; fd[51] = g_dlNearViewRange;
+            fd[48] = nearOwn; fd[49] = 0.0f; fd[50] = 0.0f; fd[51] = g_dlNearViewRange;
             fd[52] = fd[24]; fd[53] = fd[25]; fd[54] = fd[26]; fd[55] = 0.0f;  // lodSunAmb = ambCol
             fd[56] = g_dlEye[0]; fd[57] = g_dlEye[1]; fd[58] = g_dlEye[2]; fd[59] = 0.0f;  // lodEye
             fd[116] = 0.0f;   // clustered forward default OFF (froxelDims.x); the froxel fill below sets it when active
@@ -19183,19 +19243,22 @@ namespace ForgeRender {
             // reachK (shader's posR.w * reachK = a light's max reach) — hoisted so the candidate
             // loop can frustum-cull by reach-sphere AND the fill below reuses it (one source).
             const float reachK = g_shadowRangeK * std::min(std::max(g_lightReachFrac, 0.05f), 1.0f);
-            // Phase E — near↔far handoff dedup. This baked set feeds ONLY the main-view DL land +
-            // DL statics (the reflection binds the LIVE near set at dlReflectRecordGeo), and both are
-            // near-cut: statics inside nearViewRange-768 are skipped as near-path duplicates, and DL
-            // land inside nearViewRange-1152 is z-sunk under MW's near land (always ≥1 cell = 8192
-            // around the eye) so its fragments fail early-Z. So a baked light whose whole reach sphere
-            // stays inside `nearOwn` of the eye lights ZERO distant fragments — the live near set is
-            // already drawing that light, on the near geometry that owns those pixels. Dropping it is
-            // provably invisible, and NOT free to keep: the ≤128 upload keeps the NEAREST candidates,
-            // so near-owned duplicates were evicting genuinely distant lights, which then never
-            // appeared at all. nearOwn is deliberately the SMALLER of the two cuts (conservative).
-            // Viewer/no-near-cut paths set g_dlNearViewRange = 0 → nearOwn 0 → the test never fires.
-            const float nearOwn = (g_dlLightNearDedup && !g_dlNoStaticsNearCut)
-                                ? std::max(g_dlNearViewRange - 1152.0f, 0.0f) : 0.0f;
+            // Phase E — near↔far handoff dedup, using the `nearOwn` hoisted at the top of this
+            // function. A baked light whose whole reach sphere stays inside `nearOwn` of the eye
+            // lights ZERO fragments that this list is responsible for, so dropping it is invisible —
+            // and NOT free to keep: the ≤128 upload keeps the NEAREST candidates, so near-owned
+            // duplicates were evicting genuinely distant lights, which then never appeared at all.
+            //
+            // Who covers those pixels instead depends on the surface. DL statics inside
+            // nearViewRange-768 are skipped as near-path duplicates, so MW's near geometry has them
+            // and draws them from the live list. The LAND used to be the same story — the old DL
+            // land inside nearViewRange-1152 was z-sunk under MW's near land and lost early-Z — but
+            // host terrain retired that: it is the real near surface now, at true height, with
+            // nothing underneath it. So the ground's cover is terrain.frag's per-fragment pick,
+            // which switches to the live list inside this exact radius. The two MUST agree on it,
+            // which is why there is one definition and not two.
+            //
+            // nearOwn is deliberately the SMALLER of the two cuts (conservative).
             static std::vector<std::pair<float, uint32_t>> s_cand;   // (dist2, index), reused
             s_cand.clear();
             uint32_t inRadius  = 0;  // diagnostics: within stream radius, pre-dedup/frustum

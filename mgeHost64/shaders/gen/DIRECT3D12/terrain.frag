@@ -1085,7 +1085,9 @@ STRUCT(ShadowMaskParams)
     float4 skyAOMap;
 #line 219 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
     float4 sunOcc;
-#line 220
+#line 235 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
+    float4 skyAO2;
+#line 236
 };
 #line 21 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
 #line 46 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
@@ -1108,6 +1110,9 @@ STRUCT(FrameData)
 
 
     float4 dbgScales;
+
+
+
 
 
 
@@ -1174,15 +1179,15 @@ STRUCT(FrameData)
 
 
     float4 alphaShadowParams;
-#line 131
+#line 134
 };
 
 STRUCT(BatchData)
 {
     float4x4 worlds[ 1024 ];
-#line 136
+#line 139
 };
-#line 157 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+#line 160 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
 STRUCT(LightData)
 {
     float4 lightParams;
@@ -1198,7 +1203,7 @@ STRUCT(LightData)
 
     float4 froxelDimsNear;
     float4 froxelZNear;
-#line 172
+#line 175
 };
 
         CBUFFER(FrameData) gFrameData :  register(b0,space1);
@@ -1208,7 +1213,7 @@ STRUCT(LightData)
 
 
         Tex2D(float4) gAO :  register(t1,space1);
-#line 196 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+#line 199 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
         Tex3D(float4) gWaterNormalVol :  register(t2,space1);
         Tex2D(float4) gRefractColor :  register(t3,space1);
         Tex2D(float4) gSceneLinDepth :  register(t4,space1);
@@ -1328,7 +1333,18 @@ STRUCT(LightData)
 
 
         CBUFFER(LightData) gLights :  register(b0,space3);
-#line 329 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+
+
+
+
+
+
+
+
+
+
+        CBUFFER(LightData) gLightsNear :  register(b1,space3);
+#line 343 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
         Tex2D(float4) gTextures[ 880 ] :  register(t0,space0);
 
 
@@ -1671,6 +1687,11 @@ float skyAOVisibility(float3 worldAbs)
 
     float logRatio = log2(max(outer / max(inner, 1.0f), 1.0f));
     float myH = worldAbs.z;
+#line 137 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyamb.h.fsl"
+    float selfH = SampleLvlTex2D(gSkyHeight, gSamplerPointClamp, uv, 0).r;
+    float above = selfH - myH;
+    float trust = 1.0f - (1.0f - gShadowParams.skyAO2.z)
+                       * saturate((above - gShadowParams.skyAO2.x) / max(gShadowParams.skyAO2.y, 1.0f));
 
 
 
@@ -1714,6 +1735,12 @@ float skyAOVisibility(float3 worldAbs)
     float4 vis = f4(1.0f) - s * s;
     float vis4 = 1.0f - s4 * s4;
     float ao = (dot(vis, f4(1.0f)) + vis4) * 0.2f;
+
+
+
+
+
+    ao = lerp(1.0f, ao, trust);
 
 
     return lerp(1.0f, ao, gShadowParams.skyParams.y * edge);
@@ -1877,11 +1904,83 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
     float3 result = albedo
                   * (gFrameData.sunCol.rgb * saturate(dot(-gFrameData.sunDir.xyz, normal)) * sunVis
                      + gFrameData.lodSunAmb.rgb * skyAmbFactor(normal, In.WorldPos));
-
-
-
+#line 186 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terrain.frag.fsl"
     float3 pointDiffuse = float3(0.0f, 0.0f, 0.0f);
+    bool inReflect = (gFrameData.gReflWaterClip.z != 0.0f);
+    if (length(In.WorldPos) < gFrameData.lodParams.x)
     {
+
+
+        uint nL = (uint)gLightsNear.lightParams.x;
+        float reachK = gLightsNear.lightParams.y;
+        int tilesX = (int)gLightsNear.froxelDimsNear.x;
+
+
+
+        bool clustered = (tilesX > 0) && !inReflect;
+        uint base = 0u;
+        if (clustered)
+        {
+            int tilesY = (int)gLightsNear.froxelDimsNear.y;
+            int NZ = (int)gLightsNear.froxelDimsNear.z;
+            float tile = gLightsNear.froxelDimsNear.w;
+            int tx = clamp((int)(In.Position.x / tile), 0, tilesX - 1);
+            int ty = clamp((int)(In.Position.y / tile), 0, tilesY - 1);
+            float dd = length(In.WorldPos);
+            int zs = clamp((int)((log(max(dd, 1.0f)) - gLightsNear.froxelZNear.x) * gLightsNear.froxelZNear.y * (float)NZ), 0, NZ - 1);
+            base = (((uint)ty * (uint)tilesX + (uint)tx) * (uint)NZ + (uint)zs) * 4u;
+        }
+        for (uint wi = 0u; wi < 4u; ++wi)
+        {
+            uint bits;
+            if (clustered) {
+                bits = gFroxelMaskNear[base + wi];
+            } else {
+                uint lo = wi * 32u;
+                uint cnt = (lo >= nL) ? 0u : min(32u, nL - lo);
+                bits = (cnt >= 32u) ? 0xFFFFFFFFu : ((1u << cnt) - 1u);
+            }
+            while (bits != 0u)
+            {
+                uint i = wi * 32u + firstbitlow(bits);
+                bits = bits & (bits - 1u);
+                if (i >= nL) { continue; }
+                float4 posR = gLightsNear.lights[i * 3u + 0u];
+                float3 lcol = gLightsNear.lights[i * 3u + 1u].rgb;
+                float4 fo = gLightsNear.lights[i * 3u + 2u];
+                float reach = posR.w * reachK;
+                float3 toL = posR.xyz - In.WorldPos;
+                float d2 = dot(toL, toL);
+                if (d2 >= reach * reach) { continue; }
+                float invD = rsqrt(max(d2, 1e-8f));
+                float d = d2 * invD;
+                float att = 1.0f / max(fo.z * d2 + fo.y * d + fo.x, 1e-4f);
+                att *= 1.0f - smoothstep( 0.75f  * reach, reach, d);
+
+
+
+
+
+
+                uint slotP1 = (uint)fo.w;
+                if (slotP1 != 0u && !inReflect)
+                {
+                    uint4 mw = LoadTex2D(gShadowMask, NO_SAMPLER, int2(In.Position.xy), 0).xyzw;
+                    uint s = slotP1 - 1u;
+                    uint lane = s >> 3u;
+                    uint word = lane == 0u ? mw.x : (lane == 1u ? mw.y : (lane == 2u ? mw.z : mw.w));
+                    uint nib = (word >> ((s & 7u) * 4u)) & 0xFu;
+                    att *= float(nib) * (1.0f / 15.0f);
+                }
+                float lambert = saturate(dot(normal, toL) * invD);
+                pointDiffuse += lambert * att * lcol;
+            }
+        }
+    }
+    else
+    {
+
+
         uint nL = (uint)gLights.lightParams.x;
         float reachK = gLights.lightParams.y;
         int tilesX = (int)gFrameData.froxelDims.x;

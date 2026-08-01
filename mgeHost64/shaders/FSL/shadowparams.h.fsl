@@ -217,4 +217,20 @@ STRUCT(ShadowMaskParams)
     //             of depth acne, and fixed the same way.
     //         w = spare.
     DATA(float4,   sunOcc,    None);
+    // --- SH2 OVERHANG correction (skyamb.h.fsl) --------------------------------------------------
+    // A height map cannot represent that the space under a roof is open — every column reads as solid
+    // from -inf up to its stored height — so a point under Baar Dau, on a tower shaft, or beneath an
+    // arch is reported near-black when the sky is in fact open toward the horizon in every direction.
+    // One point-sampled tap at the receiver's OWN texel detects it: geometry above my head at my own
+    // XY proves this column is not solid below its top.
+    // x = ramp START in world units of overhead clearance. Below it the map is trusted completely —
+    //     a receiver standing ON the surface that generated its own texel reads ~0 here, which is the
+    //     overwhelmingly common case and must stay untouched.
+    // y = ramp WIDTH in world units over which trust falls from 1 to the floor.
+    // z = trust FLOOR 0..1. Not 0: a genuinely enormous overhead blocker really does take a bite out
+    //     of the sky, so the correction may lighten toward the truth and never past it. What is left
+    //     of the occlusion in that band is GTAO's, which sees the real geometry and is already
+    //     multiplied into this same ambient.
+    // w = spare.
+    DATA(float4,   skyAO2,    None);
 };

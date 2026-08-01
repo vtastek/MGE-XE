@@ -63,8 +63,11 @@ STRUCT(FrameData)
     // — cranking one isolates what's still on MW's own path. 192B total < 256B CBV min.
     DATA(float4, dbgScales,   None);  // x = ambient, y = diffuse, z = albedo, w = overall
     // Phase 1a distant-land LOD (host-owned DL). Appended so every field above keeps its offset.
-    // lodParams.xyz WERE the DL world bake's base/normal/detail atlas slots; the bake and its
-    // distantland.vert/.frag were deleted in T4 (tasks/forge-terrain.md), so xyz are now written 0
+    // lodParams.x = the near↔far POINT-LIGHT handoff radius (Phase E's `nearOwn`, camera-relative
+    // world units; 0 = the dedup is off). Only terrain.frag reads it, to choose between gLightsNear
+    // and gLights per fragment — see the pick there for why this exact radius makes the seam invisible.
+    // lodParams.yz WERE the DL world bake's normal/detail atlas slots; the bake and its
+    // distantland.vert/.frag were deleted in T4 (tasks/forge-terrain.md), so yz are now written 0
     // and read by nothing. Kept as padding rather than repacked — every field below would shift.
     // lodParams.w = nearViewRange, still LIVE: statics.vert gates the hero near-cut on it. 208B.
     DATA(float4, lodParams,   None);
@@ -314,6 +317,17 @@ BEGIN_SRT_NO_AB(SrtData)
     // b0. Read by opaque.frag for both the static and skinned paths.
     BEGIN_SRT_SET(PerDraw)
         DECL_CBUFFER(PerDraw, CBUFFER(LightData), gLights)
+        // The NEAR live light list, bound ALONGSIDE gLights on EVERY PerDraw instance. Every other
+        // path picks its list at bind time — near geometry takes the live set, distant geometry the
+        // baked one — because every other path lives on one side of the handoff. Terrain doesn't: the
+        // ground runs from underfoot to the horizon in a single draw, so it is the one surface that
+        // spans both, and it needs both lists resident to pick per fragment (terrain.frag).
+        //
+        // Declared LAST, so gLights keeps offset 0 and every existing bind is untouched (FSL assigns
+        // offsets from ONE running per-set counter — inserting mid-set silently re-points the rest).
+        // The host points this at pLightCbv in all three instances, so the near/dist/FP choice for
+        // gLights is unaffected; only terrain.frag reads it.
+        DECL_CBUFFER(PerDraw, CBUFFER(LightData), gLightsNear)
     END_SRT_SET(PerDraw)
     // Bindless base-map textures only — NO dynamic sampler here. The frag samples with the FSL
     // built-in STATIC sampler gSamplerAnisotropic (anisotropic 8x, WRAP, baked into the root sig).

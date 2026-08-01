@@ -162,10 +162,103 @@ float4 PS_MAIN( VSOutput In )
                   * (gFrameData.sunCol.rgb * saturate(dot(-gFrameData.sunDir.xyz, normal)) * sunVis
                      + gFrameData.lodSunAmb.rgb * skyAmbFactor(normal, In.WorldPos));
 
-    // Baked DISTANT point lights, clustered by froxel when the grid is live — the same inlined body
-    // distantland.frag/statics.frag use, so a lamp lights the ground identically on all three paths.
+    // Point lights. Terrain is the ONE surface that spans the whole near↔far handoff — the ground
+    // runs from underfoot to the horizon in a single draw — so unlike every other path it cannot be
+    // served by choosing a light list at bind time. It reads both and picks per fragment.
+    //
+    // Why it must: the near list (gLightsNear) is MW's live scene-graph set, and it alone carries
+    // dynamic lights — a carried torch, a spell, a lamp on a walking NPC. It is also the only list
+    // still holding the baked fixtures CLOSE to the eye: Phase E's near↔far dedup deliberately drops
+    // any baked light whose whole reach sphere lies inside gFrameData.lodParams.x of the camera,
+    // because near geometry was assumed to own those pixels. Once host terrain took over the ground
+    // underfoot it BECAME that near geometry while still reading only the distant list — which is
+    // exactly why the ground went dark under every lamp in town while the same lamp lit it fine from
+    // a distance.
+    //
+    // A PICK, not a sum. Past the handoff the two lists OVERLAP: MW streams every active-cell light,
+    // while the dedup drops only those lying WHOLLY inside the ball. Adding them would double-light
+    // every lamp in the overlap band.
+    //
+    // The seam is invisible by construction, which is why the boundary is the dedup's OWN radius and
+    // not a tuned number: a light dropped from the distant list had its entire reach inside the ball,
+    // so it cannot reach any fragment on the far side of the boundary — both lists agree AT the
+    // boundary. Handoff 0 (dedup off) ⇒ distant everywhere ⇒ byte-identical to before this landed.
     float3 pointDiffuse = float3(0.0f, 0.0f, 0.0f);
+    bool   inReflect    = (gFrameData.gReflWaterClip.z != 0.0f);
+    if (length(In.WorldPos) < gFrameData.lodParams.x)
     {
+        // NEAR live lights — opaque.frag's inlined body, clustered through the NEAR grid
+        // (froxelDimsNear + gFroxelMaskNear), which is where froxelassign.comp bins these lights.
+        uint  nL     = (uint)gLightsNear.lightParams.x;
+        float reachK = gLightsNear.lightParams.y;
+        int   tilesX = (int)gLightsNear.froxelDimsNear.x;
+        // ...but never in the mirror: the froxel tile comes from In.Position.xy, which in the
+        // reflection indexes the MAIN view's grid at an unrelated screen location. Brute-loop there
+        // — same result, more iterations — exactly as opaque.frag does.
+        bool  clustered = (tilesX > 0) && !inReflect;
+        uint  base = 0u;
+        if (clustered)
+        {
+            int   tilesY = (int)gLightsNear.froxelDimsNear.y;
+            int   NZ     = (int)gLightsNear.froxelDimsNear.z;
+            float tile   = gLightsNear.froxelDimsNear.w;
+            int tx = clamp((int)(In.Position.x / tile), 0, tilesX - 1);
+            int ty = clamp((int)(In.Position.y / tile), 0, tilesY - 1);
+            float dd = length(In.WorldPos);
+            int zs = clamp((int)((log(max(dd, 1.0f)) - gLightsNear.froxelZNear.x) * gLightsNear.froxelZNear.y * (float)NZ), 0, NZ - 1);
+            base = (((uint)ty * (uint)tilesX + (uint)tx) * (uint)NZ + (uint)zs) * 4u;
+        }
+        for (uint wi = 0u; wi < 4u; ++wi)
+        {
+            uint bits;
+            if (clustered) {
+                bits = gFroxelMaskNear[base + wi];
+            } else {
+                uint lo = wi * 32u;
+                uint cnt = (lo >= nL) ? 0u : min(32u, nL - lo);
+                bits = (cnt >= 32u) ? 0xFFFFFFFFu : ((1u << cnt) - 1u);
+            }
+            while (bits != 0u)
+            {
+                uint i = wi * 32u + firstbitlow(bits);
+                bits = bits & (bits - 1u);
+                if (i >= nL) { continue; }
+                float4 posR = gLightsNear.lights[i * 3u + 0u];
+                float3 lcol = gLightsNear.lights[i * 3u + 1u].rgb;
+                float4 fo   = gLightsNear.lights[i * 3u + 2u];   // xyz = k0,k1,k2 ; w = shadow slot+1
+                float  reach = posR.w * reachK;
+                float3 toL  = posR.xyz - In.WorldPos;
+                float  d2   = dot(toL, toL);
+                if (d2 >= reach * reach) { continue; }
+                float invD = rsqrt(max(d2, 1e-8f));
+                float d    = d2 * invD;
+                float att  = 1.0f / max(fo.z * d2 + fo.y * d + fo.x, 1e-4f);
+                att *= 1.0f - smoothstep(POINT_LIGHT_TAIL * reach, reach, d);
+                // P1 point-light shadows — the near list is the only one carrying slots (the baked
+                // entries write w = 0). The ground has to take these or it becomes the one surface a
+                // wall cannot shade: a lamp would spill its full disc across the road behind the
+                // building it stands against, while the building itself shadows correctly. Reading
+                // the screen mask is only legal because terrain now writes the Z-prepass — before
+                // that these pixels sat at the far plane and the mask was meaningless here.
+                uint slotP1 = (uint)fo.w;
+                if (slotP1 != 0u && !inReflect)   // mirror: gShadowMask is main-view screen space
+                {
+                    uint4 mw   = LoadTex2D(gShadowMask, NO_SAMPLER, int2(In.Position.xy), 0).xyzw;
+                    uint  s    = slotP1 - 1u;
+                    uint  lane = s >> 3u;
+                    uint  word = lane == 0u ? mw.x : (lane == 1u ? mw.y : (lane == 2u ? mw.z : mw.w));
+                    uint  nib  = (word >> ((s & 7u) * 4u)) & 0xFu;
+                    att *= float(nib) * (1.0f / 15.0f);
+                }
+                float lambert = saturate(dot(normal, toL) * invD);
+                pointDiffuse += lambert * att * lcol;
+            }
+        }
+    }
+    else
+    {
+        // Baked DISTANT point lights, clustered by froxel when the grid is live — the same inlined
+        // body statics.frag uses, so a lamp lights the ground and the buildings on it identically.
         uint  nL     = (uint)gLights.lightParams.x;
         float reachK = gLights.lightParams.y;
         int   tilesX = (int)gFrameData.froxelDims.x;

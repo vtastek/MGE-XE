@@ -103,6 +103,42 @@ float skyAOVisibility(float3 worldAbs)
     float logRatio = log2(max(outer / max(inner, 1.0f), 1.0f));
     float myH      = worldAbs.z;
 
+    // --- THE OVERHANG CORRECTION, and the one place this technique is provably lying ---------------
+    //
+    // A height map is 2.5D: one number per column, the top. The horizon test below then declares
+    // everything BELOW that elevation blocked, which quietly assumes each column is SOLID from -inf up
+    // to its stored height. There is no way to encode "the space under that roof is open", and that
+    // assumption fails hardest in exactly the places players stand: under Baar Dau over Vivec, on the
+    // shaft of a tower with a wider top, under a bridge, an arch, or a canton walkway. The blocker is
+    // near and tall, so every one of the five azimuths reports a steep horizon, the five-way average
+    // that normally rescues one-sided occluders has nothing one-sided to work with, and the point goes
+    // near-black — while the truth is that the sky toward the horizon is open in every direction and
+    // the blocker covers only a cone overhead.
+    //
+    // ONE extra tap detects it: the receiver's OWN column. If there is geometry above my head at my
+    // own XY, then this column is demonstrably NOT solid below its stored height — I am standing in
+    // the air that the march is about to pretend is rock. That is direct evidence, not a heuristic
+    // about shape, and it is the only such evidence the map contains.
+    //
+    // POINT sampled, deliberately, where every other tap here is bilinear. The question is about MY
+    // texel, and bilinear would blend a neighbour's answer into it: stand on open ground a few tens of
+    // units from a tower and a bilinear tap returns a large fraction of the tower's height, firing the
+    // correction where nothing is overhead at all. Nearest keeps the test honest at the cost of a
+    // 64-unit hard edge, which is far below what this low-frequency term resolves anyway.
+    //
+    // An empty texel carries SKY_HEIGHT_NONE (-30000), so `above` goes hugely negative and the
+    // saturate below pins trust at 1 — the sentinel disarms this the same way it disarms the march.
+    //
+    // Where the map is lying, the answer is to hand the job back to GTAO rather than to invent one:
+    // GTAO is screen-space, sees the real geometry, and is already multiplied into this same ambient.
+    // The trust FLOOR is what keeps a genuinely huge overhead blocker (the meteor really does take a
+    // bite out of the sky) from going to zero occlusion, so this can only ever lighten toward the
+    // truth, never past it.
+    float selfH = SampleLvlTex2D(gSkyHeight, gSamplerPointClamp, uv, 0).r;
+    float above = selfH - myH;
+    float trust = 1.0f - (1.0f - gShadowParams.skyAO2.z)
+                       * saturate((above - gShadowParams.skyAO2.x) / max(gShadowParams.skyAO2.y, 1.0f));
+
     // One running horizon SLOPE per direction — sin(elevation), which is what the visibility term
     // squares. Four ride a float4 so those marches vectorise into the same instructions; the fifth
     // is a scalar alongside. An odd count cannot pack evenly into vector lanes, and that is a fair
@@ -145,6 +181,12 @@ float skyAOVisibility(float3 worldAbs)
     float4 vis = f4(1.0f) - s * s;          // cos^2(horizon) per direction
     float  vis4 = 1.0f - s4 * s4;
     float  ao  = (dot(vis, f4(1.0f)) + vis4) * 0.2f;   // average the five hemispherical wedges
+
+    // Overhang correction (see the note above the self tap): fold the march's answer back toward open
+    // by however much this column proved the solid-below assumption wrong. Applied HERE, after the
+    // five wedges are averaged, because the lie is a property of the COLUMN and not of any one
+    // azimuth — under an overhang every direction is wrong by the same reasoning.
+    ao = lerp(1.0f, ao, trust);
 
     // strength lerps the whole thing back toward "fully open", so 0 is exactly the SH1 image.
     return lerp(1.0f, ao, gShadowParams.skyParams.y * edge);

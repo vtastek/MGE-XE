@@ -1085,7 +1085,9 @@ STRUCT(ShadowMaskParams)
     float4 skyAOMap;
 #line 219 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
     float4 sunOcc;
-#line 220
+#line 235 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
+    float4 skyAO2;
+#line 236
 };
 #line 21 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
 #line 46 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
@@ -1108,6 +1110,9 @@ STRUCT(FrameData)
 
 
     float4 dbgScales;
+
+
+
 
 
 
@@ -1174,15 +1179,15 @@ STRUCT(FrameData)
 
 
     float4 alphaShadowParams;
-#line 131
+#line 134
 };
 
 STRUCT(BatchData)
 {
     float4x4 worlds[ 1024 ];
-#line 136
+#line 139
 };
-#line 157 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+#line 160 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
 STRUCT(LightData)
 {
     float4 lightParams;
@@ -1198,7 +1203,7 @@ STRUCT(LightData)
 
     float4 froxelDimsNear;
     float4 froxelZNear;
-#line 172
+#line 175
 };
 
         CBUFFER(FrameData) gFrameData :  register(b0,space1);
@@ -1208,7 +1213,7 @@ STRUCT(LightData)
 
 
         Tex2D(float4) gAO :  register(t1,space1);
-#line 196 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+#line 199 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
         Tex3D(float4) gWaterNormalVol :  register(t2,space1);
         Tex2D(float4) gRefractColor :  register(t3,space1);
         Tex2D(float4) gSceneLinDepth :  register(t4,space1);
@@ -1328,7 +1333,18 @@ STRUCT(LightData)
 
 
         CBUFFER(LightData) gLights :  register(b0,space3);
-#line 329 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+
+
+
+
+
+
+
+
+
+
+        CBUFFER(LightData) gLightsNear :  register(b1,space3);
+#line 343 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
         Tex2D(float4) gTextures[ 880 ] :  register(t0,space0);
 
 
@@ -1364,6 +1380,11 @@ float skyAOVisibility(float3 worldAbs)
 
     float logRatio = log2(max(outer / max(inner, 1.0f), 1.0f));
     float myH = worldAbs.z;
+#line 137 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyamb.h.fsl"
+    float selfH = SampleLvlTex2D(gSkyHeight, gSamplerPointClamp, uv, 0).r;
+    float above = selfH - myH;
+    float trust = 1.0f - (1.0f - gShadowParams.skyAO2.z)
+                       * saturate((above - gShadowParams.skyAO2.x) / max(gShadowParams.skyAO2.y, 1.0f));
 
 
 
@@ -1407,6 +1428,12 @@ float skyAOVisibility(float3 worldAbs)
     float4 vis = f4(1.0f) - s * s;
     float vis4 = 1.0f - s4 * s4;
     float ao = (dot(vis, f4(1.0f)) + vis4) * 0.2f;
+
+
+
+
+
+    ao = lerp(1.0f, ao, trust);
 
 
     return lerp(1.0f, ao, gShadowParams.skyParams.y * edge);
