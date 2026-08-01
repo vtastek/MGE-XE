@@ -2111,6 +2111,26 @@ namespace {
             item.texIndex = resolveCachedSlot(e.textureName, si.baseNamePtr, si.baseSlot, si.baseEpoch);
             item.alphaRef = e.alphaTest ? e.alphaRef : 0.0f;     // alpha-test cutout (0 = no test)
             item.clampMode = e.baseClamp;                        // MW's per-map texture address mode
+            // Alpha-BLEND state. dispatch() still routes every skinned entry here — a blended
+            // skinned part needs the bone palette that only this list carries — so the blend is a
+            // TAG, not a re-route: the host packs it in every walk exactly as before and moves only
+            // its draw into the alpha stage. Ghosts and hair/mane cards live entirely in this flag.
+            item.blendFlags = (e.blendEnable ? IPC::kSkinFlagBlended  : 0u)
+                            | (e.twoSided    ? IPC::kSkinFlagTwoSided : 0u);
+            item.matAlpha   = e.matDiffuse[3];   // FFE per-draw fade (same source as emitAlphaDraw)
+            item.srcBlend   = e.srcBlend;
+            item.destBlend  = e.destBlend;
+            // Sort key: BONE 0's world translation, eye-relative, along the view forward. Read
+            // BEFORE the camera-relative shift below (the shift subtracts the same eyePos, so the
+            // key would be identical either way — taking it here keeps it independent of that).
+            {
+                const float bx = e.bonePalette[12] - DistantLand::eyePos.x;
+                const float by = e.bonePalette[13] - DistantLand::eyePos.y;
+                const float bz = e.bonePalette[14] - DistantLand::eyePos.z;
+                item.viewDepth = bx * DistantLand::mwView._13
+                               + by * DistantLand::mwView._23
+                               + bz * DistantLand::mwView._33;
+            }
 
             const std::size_t paletteBytes = (std::size_t)e.numBones * 64;  // numBones * 16 floats
             const std::size_t at = dst.size();

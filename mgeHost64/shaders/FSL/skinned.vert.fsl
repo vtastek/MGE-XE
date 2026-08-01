@@ -23,7 +23,15 @@ STRUCT(VSInput)
     DATA(uint,   Base,     TEXCOORD2);   // per-instance: palette offset in the bound window
     DATA(float2, Uv,       TEXCOORD3);   // per-vertex base-map UV
     DATA(uint,   TexAlpha, TEXCOORD4);   // per-instance packed: texIndex (low 16) | alphaRef*255 (bits 16-23)
+    // per-instance: MaterialProperty::alpha, bit-cast. Read ONLY when the packed word's blend bit
+    // is set (see SKIN_BLEND_BIT) — on the opaque skinned path it is ignored and OverlayIndex
+    // stays 0, which is what keeps opaque.frag's terrain-decal splat gated off.
+    DATA(uint,   MatAlphaBits, TEXCOORD5);
 };
+
+// Bit 29 of the packed instance word = this part is alpha-BLENDED (host: kSkinBlendBit). Bits
+// 0-15 texIndex, 16-23 alphaRef, 24-25 vColSource, 26-27 clampMode, 28 two-sided — 29 was free.
+#define SKIN_BLEND_BIT 0x20000000u
 
 STRUCT(VSOutput)
 {
@@ -39,8 +47,18 @@ STRUCT(VSOutput)
     DATA(FLAT(float3),MatEmissive,TEXCOORD6); // vColSource==2 branch to white*(d+a) = current fidelity.
     DATA(FLAT(uint),  VColSource, TEXCOORD7);
     DATA(float3,      WorldPos,   TEXCOORD8); // Tier 3a: world position for point-light eval
-    DATA(FLAT(uint),  OverlayIndex,TEXCOORD9);// MUST match opaque.frag input sig; skinned = 0 (never terrain)
+    DATA(FLAT(uint),  OverlayIndex,TEXCOORD9);// opaque: 0 (skinned is never terrain, so no decal).
+                                              // BLENDED: matAlpha bit-cast, which is how alpha.frag
+                                              // and alphashadowdepth.frag read it (same slot reuse
+                                              // opaque.vert already does for the AT1 list).
     DATA(FLAT(uint),  ClampMode,  TEXCOORD10);// MW texture address mode (0..3) -> sampleBase()
+    // AT3 stage-table index, so this vert can PAIR WITH alpha.frag (blended skinned parts). A vert
+    // may output more than a frag reads — opaque.frag/depthonly.frag simply ignore it — but a frag
+    // reading what the vert does NOT output hangs the GPU ([[project_forge_shared_frag_vsoutput]]),
+    // and that is exactly what pairing alpha.frag with the old signature would have done. Skinned
+    // parts never carry captured multi-stage data, so this is the "no stages" sentinel: the index
+    // would otherwise address pInstanceBufSkin's unrelated gAlphaStages entry.
+    DATA(FLAT(uint),  DrawIdx,    TEXCOORD11);
     // Real water reflection (IR3): below-water clip — identical to opaque.vert's (see the comment
     // there). Pass-all outside the reflect pass; a rasterizer system value, so opaque.frag's shared
     // VSOutput does not declare it.
@@ -85,12 +103,33 @@ VSOutput VS_MAIN( VSInput In )
     // Tier 2b defaults: white vcol drives diffuse+ambient (vColSource 2), zero emissive →
     // frag computes white*(d+a) = current skinned fidelity. Per-part skinned material is a
     // later milestone (needs the skinned instance VB / wire extended like the static path).
+    //
+    // THIS PLACEHOLDER IS LOAD-BEARING FOR BLENDED SKINNED PARTS — read before replacing it.
+    // With VColSource 2 and a white Color, alpha.frag's `albedo.a * vcolA * matAlpha` has
+    // vcolA == 1, so it degenerates to `albedo.a * matAlpha` and the shape's authored
+    // MaterialProperty alpha survives. That is what makes TR_velk.nif's mane render as
+    // translucent strands instead of the opaque white card MW and OpenMW draw (see the long
+    // note at scenegraph_geometry_cache.cpp `e.vColSource = 0` for the full mechanism and the
+    // decision to keep it). Shipping a real per-part material here will hand this line a real
+    // vColSource and can silently undo that — re-check the velk mane when that milestone lands.
+    //
+    // NO VERTEX-COLOUR CHANNEL is coming to SkinnedVertexWire (stride 52), and that is measured,
+    // not lazy: of 458 skinned meshes sampled, 51 carry a colour array but ZERO carry a
+    // NiVertexColorProperty with source 2 — the only case the client's `hasVertexColor &&
+    // vColSource == 2` gate lets through (scenegraph_geometry_cache.cpp:1245/2016). A colour
+    // channel would cost 4 bytes on every skinned vertex to feed exactly nothing. It becomes
+    // worth adding only if that cache rule is flipped to the MW/OpenMW data-driven default.
     Out.MatDiffuse  = float3(1.0f, 1.0f, 1.0f);
     Out.MatAmbient  = float3(1.0f, 1.0f, 1.0f);
     Out.MatEmissive = float3(0.0f, 0.0f, 0.0f);
     Out.VColSource  = 2u;
     Out.ClampMode   = (In.TexAlpha >> 26u) & 0x3u;   // MW texture address mode (see opaque.vert)
-    Out.OverlayIndex = 0u;   // skinned parts are never terrain — gates opaque.frag's decal splat off
+    // Opaque skinned keeps OverlayIndex 0 — opaque.frag reads this slot as a terrain DECAL_1
+    // bindless index and a non-zero value there would sample gTextures[asuint(matAlpha)], far
+    // outside the array. Only a BLENDED part (drawn by alpha.frag / alphashadowdepth.frag, which
+    // read the slot as matAlpha) may carry it.
+    Out.OverlayIndex = ((In.TexAlpha & SKIN_BLEND_BIT) != 0u) ? In.MatAlphaBits : 0u;
+    Out.DrawIdx      = 0xFFFFFFFFu;   // no AT3 stage table for skinned parts (alpha.frag sentinel)
     // MW near fog, same per-vertex form as opaque.vert (palette is already world-space).
     float dist = length(worldPos.xyz - gFrameData.eyePos.xyz);
     Out.Fog = saturate((gFrameData.fogParams.y - dist)

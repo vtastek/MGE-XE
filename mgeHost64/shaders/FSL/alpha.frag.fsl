@@ -75,9 +75,19 @@ float4 PS_MAIN( VSOutput In )
     // caster / RED not-alpha-over / ORANGE fading / WHITE strict reject / BLUE captured /
     // GRAY casters-off. Returned flat so the alpha set reads at a glance (opaque ignores bit3).
     if ((aoFlags & 8u) != 0u) { RETURN(float4(In.MatDiffuse, 1.0f)); }
+    // SCREEN-SPACE terms must be tagged off in the reflection, exactly as opaque.frag tags them:
+    // gAO and gShadowMask are MAIN-VIEW buffers, and indexed by this 1024² mirror RT's pixels they
+    // read a completely unrelated part of the screen. This frag only started running in the reflect
+    // pass with blended SKINNED parts (a ghost has to appear in the water) — before that the alpha
+    // list was main-view only, which is why the tag was never needed here. Same uniform cbuffer
+    // branch (gReflWaterClip.z is ±1 only in pReflectFrameCbvGeo), so the untaken side is free.
+    // World-space terms (sun MSM, point-light attenuation/Lambert) are NOT tagged: reflected
+    // geometry keeps its true world position — the VIEW is mirrored, not the geometry.
+    bool   inReflect = (gFrameData.gReflWaterClip.z != 0.0f);
     float2 aoUv     = In.Position.xy * gShadowParams.screenAlloc.zw;   // gAO is ALLOC-sized, not render-sized
-    float4 aoSample = SampleTex2D(gAO, gSamplerAnisotropic, aoUv);
-    if ((aoFlags & 2u) != 0u) { N = normalize(aoSample.rgb); }
+    float4 aoSample = inReflect ? float4(0.0f, 0.0f, 0.0f, 1.0f)       // AO = 1 (no darkening), bent-N unused
+                                : SampleTex2D(gAO, gSamplerAnisotropic, aoUv);
+    if ((aoFlags & 2u) != 0u && !inReflect) { N = normalize(aoSample.rgb); }
 
     // Two-sided LIGHTING (the "normal trick"). A DRAW_BOTH sheet's far face is UNLIT under a one-
     // sided N.L, so a point-light shadow landing on it can't be SEEN — the light contributes 0 there,
@@ -134,7 +144,7 @@ float4 PS_MAIN( VSOutput In )
             // host patches falloff.w = shadow slot + 1 (0 = no shadow); shadowmask.comp already did
             // the cube-face atlas PCF, so the slot's 4-bit visibility just scales the light.
             uint slotP1 = (uint)gLights.lights[i * 3u + 2u].w;
-            if (receiveShadows && slotP1 != 0u)
+            if (receiveShadows && slotP1 != 0u && !inReflect)   // screen-space mask — see inReflect
             {
                 uint4 mw   = LoadTex2D(gShadowMask, NO_SAMPLER, int2(In.Position.xy), 0).xyzw;
                 uint  s    = slotP1 - 1u;
@@ -181,6 +191,12 @@ float4 PS_MAIN( VSOutput In )
     // Ops match multimap.frag's stage loop exactly — keep them in lockstep.
     // Only the ALPHA of the base stage matters for coverage (MW's alpha chain is SELECTARG1 on
     // stage 0 for this content), so the extra stages fold into rgb only.
+    //
+    // DrawIdx == ~0 means "this draw has no stage table at all" — skinned.vert's sentinel. A
+    // skinned instance index addresses pInstanceBufSkin, an unrelated buffer, so reading
+    // gAlphaStages at it would pull a stranger's stages. One uniform compare; the AT1/AT3 list
+    // never sets the sentinel, so those draws are untouched.
+    if (In.DrawIdx != 0xFFFFFFFFu)
     {
         uint4 stg      = gAlphaStages[In.DrawIdx];
         uint  nStages  = stg.w;

@@ -1326,12 +1326,25 @@ namespace {
         Pipeline*      pSkinnedShadowPipelineNone = nullptr;     // CULL_NONE (two-sided)
         Pipeline*      pSkinnedShadowPipelineFront = nullptr;    // CULL_FRONT CCW
         Pipeline*      pSkinnedShadowPipelineFrontMirror = nullptr; // CULL_FRONT CW
+        // Blended skinned parts (ghosts, mane/hair cards): skinned.vert + alpha.frag, composited in
+        // the alpha stage with REAL alpha instead of opaque.frag's forced 1.0. Depth GEQUAL test /
+        // never write, same rule the AT1 colour PSOs follow. Cull honours the part's DRAW_BOTH flag.
+        Shader*        pSkinnedAlphaShader = nullptr;
+        Pipeline*      pSkinnedAlphaPipeline = nullptr;           // alpha-over, CULL_BACK CCW
+        Pipeline*      pSkinnedAlphaPipelineMirror = nullptr;     // alpha-over, CULL_BACK CW
+        Pipeline*      pSkinnedAlphaPipelineNone = nullptr;       // alpha-over, CULL_NONE (DRAW_BOTH)
+        Pipeline*      pSkinnedAlphaPipelineAdd = nullptr;        // SRCALPHA/ONE additive, CULL_NONE
+        // …and its shadow-caster twin: skinned.vert + alphashadowdepth.frag into the single-sample
+        // cube atlas, so a blended part casts at the opacity threshold rather than the cutout test.
+        Shader*        pSkinnedAlphaShadowShader = nullptr;
+        Pipeline*      pSkinnedAlphaShadowPipeline = nullptr;     // CULL_NONE
         Buffer*        pBonesBuf[16] = {};               // bone windows: one 64KB cbuffer per window, persistent-mapped
         DescriptorSet* pPerBatchSetSkin = nullptr;       // gBatch bound to pBonesBuf[], kMaxBatches instances
-        // Skinned instance-rate VB of uint2 { .x = Base (bone offset in window), .y = texIndex }.
+        // Skinned instance-rate VB of uint3 { Base (bone offset in window), texAlpha, matAlphaBits }.
         // Indexed by the global skinnedDrawn (0..kMaxSkinned-1) via firstInstance, so each drawn
         // part gets a UNIQUE entry — no per-part overwrite hazard (can't reuse pInstanceBuf[0],
         // which the static loop fills with its own texIndices). Written per frame in the skinned loop.
+        // A BLENDED part keeps its entry here and the alpha stage draws straight from it.
         Buffer*        pInstanceBufSkin = nullptr;
 
         // --- Tier 4: multi-map (dark/detail/glow) path -------------------------------
@@ -1693,7 +1706,17 @@ namespace {
     // In.Base is written per part into the skinned instance buffer, so it is an arbitrary offset —
     // nothing requires the old {0,32,…,992} alignment.
     constexpr uint32_t kMaxBonesPerPart = 128;   // per-part clamp; census max is 94
-    constexpr uint32_t kMaxSkinned      = 256;   // skinned instance-buffer entries (Base + texAlpha)
+    constexpr uint32_t kMaxSkinned      = 256;   // skinned instance-buffer entries (Base + texAlpha + matAlpha)
+    // Skinned per-instance stride, in uint32s: { Base, texAlpha, matAlphaBits }. The third lane
+    // arrived with blended skinned parts (ghosts, mane cards): alpha.frag needs the real
+    // MaterialProperty alpha, and there is no room left in the packed word for a float. Shared by
+    // EVERY skinned layout (main, FP, shadow) because they all bind the one skinned.vert.
+    constexpr uint32_t kSkinInstU32 = 3;
+    // Bit 29 of the packed word = BLENDED (must match SKIN_BLEND_BIT in skinned.vert.fsl). Set it
+    // ONLY where the draw will be consumed by alpha.frag / alphashadowdepth.frag: it makes
+    // skinned.vert forward matAlpha through OverlayIndex, which opaque.frag would read as a
+    // terrain-decal bindless slot.
+    constexpr uint32_t kSkinBlendBit = 1u << 29;
 
     // Assign one part's palette slot within the bone windows. EVERY pass that walks the skinned
     // blob — shadow-caster collection, depth prepass, colour, FP — must call this with its own
@@ -1708,6 +1731,23 @@ namespace {
         base    = cursor;
         cursor += bones;
         return true;
+    }
+
+    // Blended SKINNED parts (ghosts, hair/mane cards) composite in the alpha stage instead of
+    // riding the opaque skinned pipeline, which forced alpha to 1 and rendered them solid — a ghost
+    // as a solid creature, a mane as the white card its alpha was supposed to carve strands out of.
+    // OFF reproduces exactly that: every walk still packs identically (the bone-palette cursor is
+    // never allowed to diverge), the parts simply go back to being drawn opaque in place. That is
+    // the A/B. Dev panel, Alpha tab. See [[project_forge_alpha_composite_gap]].
+    bool g_skinnedAlpha = true;
+
+    // Is this part alpha-BLENDED? Every walk asks the same question the same way, and a blended
+    // part is skipped ONLY at its draw call — never at its skinPackNext, never at its counter.
+    // That is the whole safety argument: the five walks' index arithmetic is bit-identical to what
+    // it was before this existed, so no part can end up drawing with another part's bone palette.
+    // With the toggle off this is always false, which is why "off" is byte-identical to before.
+    inline bool skinIsBlended(const IPC::SkinnedDrawWire& it) {
+        return g_skinnedAlpha && (it.blendFlags & IPC::kSkinFlagBlended) != 0u;
     }
 
     // GPU timestamp phases (the ~4ms gpu breakdown). Index = QueryDesc index in renderScene.
@@ -2831,8 +2871,27 @@ namespace {
     // centre (localCenter through the root bone, same space as the shadow face VP); rad = a padded
     // world radius. window = i/kSkinnedPerWindow (the bone window pPerBatchSetSkin binds). The bone
     // palettes these draw from are filled by the prepass (runs before the shadow face pass).
-    struct SkinnedCaster { uint32_t index; uint32_t window; uint32_t mirror; uint32_t slot; float cRel[3]; float rad; };
+    // alphaCast: this part is alpha-BLENDED, so it casts through alphashadowdepth.frag's opacity
+    // threshold instead of depthonly.frag's cutout test — a solid-ish mane casts a mane-shaped
+    // shadow, a sheer ghost casts almost nothing. One rule, no per-creature case.
+    struct SkinnedCaster { uint32_t index; uint32_t window; uint32_t mirror; uint32_t slot; float cRel[3]; float rad;
+                           bool alphaCast; };
     std::vector<SkinnedCaster> g_skinnedCasters;
+    // Blended skinned parts deferred out of the colour walk into the alpha stage. Recorded DURING
+    // that walk (never in a walk of its own) because the base/window they need are the ones the
+    // shared skinPackNext cursor produced — the invariant every skinned walk hangs off. base lives
+    // in the instance entry the walk already wrote, so only the window (descriptor set) and the
+    // per-draw PSO inputs need carrying.
+    struct SkinAlphaCmd {
+        uint32_t idx;        // firstInstance == the slot in pInstanceBufSkin the colour walk wrote
+        uint32_t window;     // bone window (pPerBatchSetSkin instance)
+        uint32_t slot;       // host mesh slot
+        uint8_t  mirror;
+        uint8_t  additive;   // SRCALPHA/ONE (else alpha-over)
+        uint8_t  twoSided;   // NiStencilProperty DRAW_BOTH → CULL_NONE
+        float    viewDepth;  // back-to-front sort key (larger = farther)
+    };
+    std::vector<SkinAlphaCmd> g_skinAlphaCmds;
     // Multimap shadow casters (NPC heads / glow parts). Pre-walked from the multimap blob in the
     // SAME order + skip logic the MM Z-prepass assigns firstInstance (index i), so a head reuses the
     // resident pMMWorldsBuf/pInstanceBufMM slot i (both filled by the prepass, which runs before the
@@ -4467,15 +4526,15 @@ namespace {
 
             // Skinned vertex layout: binding 0 = mesh (IPC::SkinnedVertexWire, stride 52:
             // pos@0, normal@12, weights@24 float4, indices@40 UBYTE4→R8G8B8A8_UINT, uv@44);
-            // binding 1 = per-INSTANCE uint2 { Base @0 (palette offset in the bound window),
-            // texIndex @4 }, fed by pInstanceBufSkin + firstInstance=skinnedDrawn.
+            // binding 1 = per-INSTANCE uint3 { Base @0 (palette offset in the bound window),
+            // texAlpha @4, matAlphaBits @8 }, fed by pInstanceBufSkin + firstInstance=skinnedDrawn.
             VertexLayout svl = {};
             svl.mBindingCount = 2;
             svl.mBindings[0].mStride = sizeof(IPC::SkinnedVertexWire);
             svl.mBindings[0].mRate = VERTEX_BINDING_RATE_VERTEX;
-            svl.mBindings[1].mStride = 2 * sizeof(uint32_t);   // instance uint2; Base @0, texIndex @4
+            svl.mBindings[1].mStride = kSkinInstU32 * sizeof(uint32_t);   // Base @0, texAlpha @4, matAlpha @8
             svl.mBindings[1].mRate = VERTEX_BINDING_RATE_INSTANCE;
-            svl.mAttribCount = 7;
+            svl.mAttribCount = 8;
             svl.mAttribs[0].mSemantic = SEMANTIC_POSITION;
             svl.mAttribs[0].mFormat = TinyImageFormat_R32G32B32_SFLOAT;
             svl.mAttribs[0].mBinding = 0;
@@ -4511,6 +4570,11 @@ namespace {
             svl.mAttribs[6].mBinding = 1;
             svl.mAttribs[6].mLocation = 6;
             svl.mAttribs[6].mOffset = 4;
+            svl.mAttribs[7].mSemantic = SEMANTIC_TEXCOORD5;       // MatAlphaBits (per-instance uint)
+            svl.mAttribs[7].mFormat = TinyImageFormat_R32_UINT;
+            svl.mAttribs[7].mBinding = 1;
+            svl.mAttribs[7].mLocation = 7;
+            svl.mAttribs[7].mOffset = 8;
 
             // BISECT (Tier 1b skinned-only): skinned in the Z-prepass → colour matches with EQUAL.
             DepthStateDesc skDepth = {};
@@ -4639,6 +4703,105 @@ namespace {
                     std::printf("[forge] addPipeline(skinned shadow) FAILED\n");
                     return false;
                 }
+
+                // Blended skinned CASTER: skinned.vert + alphashadowdepth.frag into the same
+                // single-sample atlas. That frag computes albedo.a * vcolA * matAlpha (matAlpha
+                // arriving through OverlayIndex, which skinned.vert fills only for blended parts)
+                // and clips below gFrameData.alphaShadowParams.x — so opacity, not a cutout ref,
+                // decides what a translucent part occludes. CULL_NONE: the caster-cull knob's
+                // back/front variants fight opaque shadow acne, which a thresholded translucent
+                // caster does not produce. Non-fatal — without it blended parts simply keep the
+                // opaque caster PSO's behaviour.
+                {
+                    ShaderLoadDesc skAsDesc = {};
+                    skAsDesc.mVert.pFileName = "skinned.vert";
+                    skAsDesc.mFrag.pFileName = "alphashadowdepth.frag";
+                    addShader(R, &skAsDesc, &g_live.pSkinnedAlphaShadowShader);
+                    if (g_live.pSkinnedAlphaShadowShader) {
+                        spg.pShaderProgram  = g_live.pSkinnedAlphaShadowShader;
+                        spg.pRasterizerState = &skShNone;      // CULL_NONE
+                        addPipeline(R, &skpPd, &g_live.pSkinnedAlphaShadowPipeline);
+                    }
+                    if (!g_live.pSkinnedAlphaShadowPipeline) {
+                        std::printf("[forge] addPipeline(skinned alpha shadow) FAILED — "
+                                    "blended skinned parts cast as opaque\n");
+                    }
+                }
+            }
+
+            // --- Blended skinned COLOUR PSOs (skinned.vert + alpha.frag) ------------------------
+            // The fix for ghosts rendering solid and mane cards rendering white: the skinned list is
+            // drawn by opaque.frag, which ends RETURN(float4(c, 1.0f)) — alpha forced to 1, so a
+            // texture whose alpha carves strands out of a near-white sheet renders as the sheet.
+            // alpha.frag already computes exactly the wanted result (same Tier 1/2b/3a lighting,
+            // real outA = albedo.a * vcolA * matAlpha), so no new frag is needed — only a legal
+            // PAIRING, which is what skinned.vert's DrawIdx output now provides.
+            //
+            // Depth GEQUAL test / NEVER write, matching the AT1 colour PSOs: these draw in the alpha
+            // stage after opaque+DL+water, so they occlude behind walls without depth-killing the
+            // translucents sorted after them. Same RT format and sample count as the skinned colour
+            // PSOs, so the reflection pass can reuse them for its own blended skinned draws.
+            {
+                ShaderLoadDesc skaDesc = {};
+                skaDesc.mVert.pFileName = "skinned.vert";
+                skaDesc.mFrag.pFileName = "alpha.frag";
+                addShader(R, &skaDesc, &g_live.pSkinnedAlphaShader);
+                if (!g_live.pSkinnedAlphaShader) {
+                    std::printf("[forge] addShader(skinned alpha) FAILED\n");
+                    return false;
+                }
+
+                DepthStateDesc skaDepth = {};
+                skaDepth.mDepthTest  = true;
+                skaDepth.mDepthWrite = false;
+                skaDepth.mDepthFunc  = CMP_GEQUAL;
+
+                // Same premultiplied-coverage convention as the AT1 PSOs: colour
+                // SRCALPHA/INVSRCALPHA, alpha ONE/INVSRCALPHA so RT coverage accumulates for the
+                // present-seam composite.
+                BlendStateDesc skaBlend = {};
+                skaBlend.mSrcFactors[0]      = BC_SRC_ALPHA;
+                skaBlend.mDstFactors[0]      = BC_ONE_MINUS_SRC_ALPHA;
+                skaBlend.mSrcAlphaFactors[0] = BC_ONE;
+                skaBlend.mDstAlphaFactors[0] = BC_ONE_MINUS_SRC_ALPHA;
+                skaBlend.mBlendModes[0]      = BM_ADD;
+                skaBlend.mBlendAlphaModes[0] = BM_ADD;
+                skaBlend.mColorWriteMasks[0] = COLOR_MASK_ALL;
+                skaBlend.mRenderTargetMask   = BLEND_STATE_TARGET_0;
+                skaBlend.mIndependentBlend   = false;
+                BlendStateDesc skaBlendAdd = skaBlend;                 // SRCALPHA/ONE
+                skaBlendAdd.mDstFactors[0]      = BC_ONE;
+                skaBlendAdd.mDstAlphaFactors[0] = BC_ONE;
+
+                RasterizerStateDesc skaRasterNone = skRaster;
+                skaRasterNone.mCullMode = CULL_MODE_NONE;
+
+                PipelineDesc skaPd = {};
+                skaPd.mType = PIPELINE_TYPE_GRAPHICS;
+                GraphicsPipelineDesc& skag = skaPd.mGraphicsDesc;
+                skag.mPrimitiveTopo = PRIMITIVE_TOPO_TRI_LIST;
+                skag.mRenderTargetCount = 1;
+                skag.pColorFormats = &g_live.pRT->mFormat;
+                skag.mSampleCount = (SampleCount)g_live.sampleCount;
+                skag.mSampleQuality = 0;
+                skag.mDepthStencilFormat = TinyImageFormat_D32_SFLOAT;
+                skag.pDepthState = &skaDepth;
+                skag.pBlendState = &skaBlend;
+                skag.pVertexLayout = &svl;
+                skag.pShaderProgram = g_live.pSkinnedAlphaShader;
+                skag.pRasterizerState = &skRaster;              // CULL_BACK CCW (MW's default)
+                addPipeline(R, &skaPd, &g_live.pSkinnedAlphaPipeline);
+                skag.pRasterizerState = &skRasterMirror;        // CULL_BACK CW (negative determinant)
+                addPipeline(R, &skaPd, &g_live.pSkinnedAlphaPipelineMirror);
+                skag.pRasterizerState = &skaRasterNone;         // CULL_NONE (DRAW_BOTH)
+                addPipeline(R, &skaPd, &g_live.pSkinnedAlphaPipelineNone);
+                skag.pBlendState = &skaBlendAdd;                // additive glows, order-independent
+                addPipeline(R, &skaPd, &g_live.pSkinnedAlphaPipelineAdd);
+                if (!g_live.pSkinnedAlphaPipeline || !g_live.pSkinnedAlphaPipelineMirror
+                    || !g_live.pSkinnedAlphaPipelineNone || !g_live.pSkinnedAlphaPipelineAdd) {
+                    std::printf("[forge] addPipeline(skinned alpha x4) FAILED\n");
+                    return false;
+                }
             }
 
             // Bone windows: ONE exactly-64KB cbuffer per window (same CBV rule as worlds).
@@ -4653,16 +4816,18 @@ namespace {
                 bb.ppBuffer = &g_live.pBonesBuf[b];
                 addResource(&bb, nullptr);
             }
-            // Skinned instance buffer: kMaxSkinned uint2 { Base, texIndex }, one entry per
-            // drawn part (indexed by skinnedDrawn via firstInstance). CPU-mapped, written per
+            // Skinned instance buffer: kMaxSkinned uint3 { Base, texAlpha, matAlphaBits }, one entry
+            // per drawn part (indexed by skinnedDrawn via firstInstance). CPU-mapped, written per
             // frame in the skinned loop. Dedicated (not pInstanceBuf[0]) so the static loop's
-            // per-frame texIndices can't clobber it.
+            // per-frame texIndices can't clobber it. A BLENDED part keeps its entry here and is
+            // drawn from it in the alpha stage — same Base, same bone window — so the alpha path
+            // needs no instance buffer of its own and no second index to keep in step.
             {
                 BufferLoadDesc sib = {};
                 sib.mDesc.mDescriptors = DESCRIPTOR_TYPE_VERTEX_BUFFER;
                 sib.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_CPU_TO_GPU;
                 sib.mDesc.mFlags = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
-                sib.mDesc.mSize = (uint64_t)kMaxSkinned * 2 * sizeof(uint32_t);
+                sib.mDesc.mSize = (uint64_t)kMaxSkinned * kSkinInstU32 * sizeof(uint32_t);
                 sib.mDesc.pName = "instanceVBSkin";
                 sib.pData = nullptr;
                 sib.ppBuffer = &g_live.pInstanceBufSkin;
@@ -5853,7 +6018,11 @@ namespace {
                     p[rn].mCount = 1; p[rn].ppBuffers = &g_live.pUVAnimBuf;
                     ++rn;
                 }
-                if (g_live.pAlphaStagesBuf) {   // type-valid bind (reflect-geo draws never read it)
+                // gAlphaStages: bound but never READ here. The mirror redraws BLENDED skinned parts
+                // (a ghost has to appear in the water) with alpha.frag, which declares this buffer —
+                // those draws carry skinned.vert's ~0 DrawIdx sentinel so the load never executes,
+                // and the descriptor exists only to keep the table type-valid.
+                if (g_live.pAlphaStagesBuf) {
                     p[rn].mIndex = SRT_RES_IDX(SrtData, PerFrame, gAlphaStages);
                     p[rn].mCount = 1; p[rn].ppBuffers = &g_live.pAlphaStagesBuf;
                     ++rn;
@@ -6529,7 +6698,7 @@ namespace {
             fsb.mDesc.mDescriptors = DESCRIPTOR_TYPE_VERTEX_BUFFER;
             fsb.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_CPU_TO_GPU;
             fsb.mDesc.mFlags = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
-            fsb.mDesc.mSize = (uint64_t)kMaxFPSkinned * 2 * sizeof(uint32_t);
+            fsb.mDesc.mSize = (uint64_t)kMaxFPSkinned * kSkinInstU32 * sizeof(uint32_t);
             fsb.mDesc.pName = "instanceVBFPSkin";
             fsb.pData = nullptr;
             fsb.ppBuffer = &g_live.pFPInstanceBufSkin;
@@ -7030,6 +7199,8 @@ namespace {
     unsigned  g_lastSkyDrawn = 0;      // SK1 sky parts actually drawn in the last renderScene
     unsigned  g_lastAlphaDrawn = 0;    // AT1 sorted-alpha parts actually drawn in the last renderScene
     unsigned  g_lastAlphaPrepassDrawn = 0;  // ...of which contributed to the near-opaque depth prepass
+    unsigned  g_lastSkinAlphaDrawn = 0;     // blended SKINNED parts composited in the alpha stage
+                                            // (of g_lastSkinnedDrawn — they share the instance buffer)
     unsigned  g_lastLightCount = 0;    // point lights uploaded in the last renderScene
     // Phase 0 panel readouts: extra per-frame counters + single-frame timings (the 300-frame
     // accumulators g_recAccum/g_gpuAccum are for the heartbeat; these are this frame's values).
@@ -7319,6 +7490,8 @@ namespace {
     // scratch depth so the mask pays full per-light PCF over the whole alpha coverage (waterfalls =
     // "fans loud"); higher = only solid-ish alpha pays. Default 0 = richest (user pref); raise for ms.
     float g_alphaShadowRef = 0.0f;
+    // (g_skinnedAlpha — blended skinned parts in the alpha stage — is declared beside kMaxSkinned
+    // with the rest of the skinned packing rules, since skinIsBlended() gates the walks there.)
     // FP2-lite: first-person arms/weapon RECEIVE point-light shadows. Off = today's behaviour
     // (falloff.w zeroed → arms lit unshadowed). On = render FP depth into the alpha scratch, re-run
     // shadowmask under the ARM camera, overwrite gShadowMask so the arms read their own visibility.
@@ -8081,6 +8254,7 @@ namespace {
           t.checkbox("ALPHA: 2x AF on alpha-test/blend draws (perf A/B)", &g_alphaLowAF);
           t.checkbox("ALPHA: receive point-light shadows", &g_alphaReceiveShadows);
           t.sliderF("ALPHA: shadow-receive opacity (lower = thinner sheets receive)", &g_alphaShadowRef, 0.0f, 1.0f, 0.02f);
+          t.checkbox("ALPHA: skinned blends (ghosts / hair cards composite)", &g_skinnedAlpha);
           t.checkbox("ALPHA: two-sided lighting (light far face so shadow shows)", &g_alphaTwoSidedLight);
           t.sliderF("ALPHA: light transmission strength", &g_alphaTransmitStrength, 0.0f, 1.0f, 0.02f);
           t.flush(); }
@@ -9573,6 +9747,11 @@ namespace ForgeRender {
                     sc.slot   = mslot;
                     sc.cRel[0] = cx; sc.cRel[1] = cy; sc.cRel[2] = cz;
                     sc.rad = std::sqrt(maxd2) + 96.0f;   // bone spread + limb/vertex slop
+                    // A blended part still registers — it just casts through the opacity threshold
+                    // rather than the cutout test, so a dense mane casts a mane and a sheer ghost
+                    // casts nearly nothing. Registering it (rather than skipping) is also what keeps
+                    // idx walking in step with the prepass's instance slots.
+                    sc.alphaCast = skinIsBlended(item);
                     g_skinnedCasters.push_back(sc);
                     ++idx;
                 }
@@ -11111,9 +11290,19 @@ namespace ForgeRender {
                     window = packWin;
                     uint8_t* dst = (uint8_t*)g_live.pBonesBuf[window]->pCpuMappedAddress;
                     std::memcpy(dst + (size_t)base * 64, palette, (size_t)bones * 64);
+                    const bool     blended = skinIsBlended(item);
+                    const uint32_t inst    = preDrawn;
+                    ++preDrawn;   // the instance slot is CONSUMED whether or not we draw
                     uint32_t* sinst = (uint32_t*)g_live.pInstanceBufSkin->pCpuMappedAddress;
-                    sinst[preDrawn * 2 + 0] = base;
-                    sinst[preDrawn * 2 + 1] = packTexAlpha(item.texIndex, item.alphaRef, 0u, item.clampMode);
+                    sinst[inst * kSkinInstU32 + 0] = base;
+                    sinst[inst * kSkinInstU32 + 1] = packTexAlpha(item.texIndex, item.alphaRef, 0u, item.clampMode)
+                                                   | (blended ? kSkinBlendBit : 0u);
+                    std::memcpy(&sinst[inst * kSkinInstU32 + 2], &item.matAlpha, sizeof(float));
+                    // A transparent surface must not write the depth the opaque colour pass then
+                    // tests EQUAL against — it would depth-kill everything behind the ghost. The
+                    // pack above still ran, so the bone window and the instance slot are identical
+                    // to what every other walk expects; only the draw is gone.
+                    if (blended) { continue; }
                     const int mirror = item.mirror ? 1 : 0;
                     if (mirror != boundSkinMirror) {
                         cmdBindPipeline(g_live.pCmd, mirror ? g_live.pSkinnedPrepassPipelineMirror : g_live.pSkinnedPrepassPipeline);
@@ -11128,11 +11317,10 @@ namespace ForgeRender {
                     }
                     HostMesh& sm = g_meshes[slot];
                     Buffer*  pvbs[2]     = { sm.vb, g_live.pInstanceBufSkin };
-                    uint32_t pstrides[2] = { (uint32_t)sizeof(IPC::SkinnedVertexWire), (uint32_t)(2 * sizeof(uint32_t)) };
+                    uint32_t pstrides[2] = { (uint32_t)sizeof(IPC::SkinnedVertexWire), (uint32_t)(kSkinInstU32 * sizeof(uint32_t)) };
                     cmdBindVertexBuffer(g_live.pCmd, 2, pvbs, pstrides, nullptr);
                     cmdBindIndexBuffer(g_live.pCmd, sm.ib, INDEX_TYPE_UINT16, 0);
-                    cmdDrawIndexedInstanced(g_live.pCmd, sm.indexCount, 0, 1, 0, preDrawn);
-                    ++preDrawn;
+                    cmdDrawIndexedInstanced(g_live.pCmd, sm.indexCount, 0, 1, 0, inst);
                 }
             }
 
@@ -11433,13 +11621,19 @@ namespace ForgeRender {
 
                     // C4a skinned casters for THIS slot/face (this-frame poses, firstInstance=index).
                     {
-                        int      skMirror = -1;
+                        Pipeline* skBound = nullptr;   // tracks the PSO, not just mirror: a BLENDED
+                                                       // caster switches frag as well as winding
                         uint32_t skWindow = UINT32_MAX;
                         for (const DynHit& h : skHits) {
                             if ((h.faces & (1u << f)) == 0u) { continue; }
                             const SkinnedCaster& sc = g_skinnedCasters[h.idx];
-                            if ((int)sc.mirror != skMirror) {
-                                Pipeline* skPso;
+                            Pipeline* skPso;
+                            if (sc.alphaCast && g_live.pSkinnedAlphaShadowPipeline) {
+                                // Opacity-thresholded caster (alphashadowdepth.frag), CULL_NONE: the
+                                // cull knob's back/front variants exist to fight opaque shadow acne,
+                                // which a thresholded translucent caster does not produce.
+                                skPso = g_live.pSkinnedAlphaShadowPipeline;
+                            } else {
                                 switch (g_shadowCasterCull) {
                                 case 1:  skPso = g_live.pSkinnedShadowPipelineNone; break;
                                 case 2:  skPso = sc.mirror ? g_live.pSkinnedShadowPipelineFrontMirror
@@ -11447,10 +11641,12 @@ namespace ForgeRender {
                                 default: skPso = sc.mirror ? g_live.pSkinnedShadowPipelineMirror
                                                            : g_live.pSkinnedShadowPipeline; break;
                                 }
+                            }
+                            if (skPso != skBound) {
                                 cmdBindPipeline(g_live.pCmd, skPso);
                                 cmdBindDescriptorSet(g_live.pCmd, s * 6 + f, g_live.pShadowFaceSet);
                                 cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
-                                skMirror = (int)sc.mirror;
+                                skBound = skPso;
                                 skWindow = UINT32_MAX;
                             }
                             if (sc.window != skWindow) {
@@ -11459,7 +11655,7 @@ namespace ForgeRender {
                             }
                             HostMesh& sm = g_meshes[sc.slot];
                             Buffer*  svbs[2]     = { sm.vb, g_live.pInstanceBufSkin };
-                            uint32_t sstrides[2] = { (uint32_t)sizeof(IPC::SkinnedVertexWire), (uint32_t)(2 * sizeof(uint32_t)) };
+                            uint32_t sstrides[2] = { (uint32_t)sizeof(IPC::SkinnedVertexWire), (uint32_t)(kSkinInstU32 * sizeof(uint32_t)) };
                             cmdBindVertexBuffer(g_live.pCmd, 2, svbs, sstrides, nullptr);
                             cmdBindIndexBuffer(g_live.pCmd, sm.ib, INDEX_TYPE_UINT16, 0);
                             cmdDrawIndexedInstanced(g_live.pCmd, sm.indexCount, 0, 1, 0, sc.index);
@@ -12282,6 +12478,7 @@ namespace ForgeRender {
         // at base = (p%32)*32, then draws with firstInstance=base so the per-instance Base
         // attribute selects gBatch.worlds[base + BoneIdx]. Capped at kMaxSkinned (256).
         uint32_t skinnedDrawn = 0;
+        g_skinAlphaCmds.clear();   // blended parts recorded here, drawn in the alpha stage below
         if (skinnedBlob && skinnedCount && skinnedBytes &&
             g_live.pSkinnedPipeline && g_live.pSkinnedPipelineMirror) {
             cmdBindPipeline(g_live.pCmd, g_live.pSkinnedPipeline);
@@ -12342,10 +12539,29 @@ namespace ForgeRender {
                 uint8_t* dst = (uint8_t*)g_live.pBonesBuf[window]->pCpuMappedAddress;
                 std::memcpy(dst + (size_t)base * 64, palette, (size_t)bones * 64);
 
+                const bool     blended = skinIsBlended(item);
+                const uint32_t inst    = skinnedDrawn;
+                ++skinnedDrawn;   // the instance slot is CONSUMED whether or not we draw here
                 uint32_t* sinst = (uint32_t*)g_live.pInstanceBufSkin->pCpuMappedAddress;
-                sinst[skinnedDrawn * 2 + 0] = base;
-                sinst[skinnedDrawn * 2 + 1] = packTexAlpha(item.texIndex, item.alphaRef, 0u, item.clampMode);
+                sinst[inst * kSkinInstU32 + 0] = base;
+                sinst[inst * kSkinInstU32 + 1] = packTexAlpha(item.texIndex, item.alphaRef, 0u, item.clampMode)
+                                               | (blended ? kSkinBlendBit : 0u);
+                std::memcpy(&sinst[inst * kSkinInstU32 + 2], &item.matAlpha, sizeof(float));
                 skinPrepMs += hostNowMs() - tPrep0;
+
+                // Blended: everything above already happened (pack, palette, instance entry) — this
+                // walk is where base/window are correct, which is exactly why the deferred record is
+                // taken HERE rather than in a sixth walk of its own. Only the draw moves, to the
+                // alpha stage, sorted back-to-front and composited with real alpha.
+                if (blended) {
+                    g_skinAlphaCmds.push_back(SkinAlphaCmd{
+                        inst, window, slot,
+                        (uint8_t)(item.mirror ? 1u : 0u),
+                        (uint8_t)((item.srcBlend == kD3DBLEND_SRCALPHA && item.destBlend == kD3DBLEND_ONE) ? 1u : 0u),
+                        (uint8_t)((item.blendFlags & IPC::kSkinFlagTwoSided) ? 1u : 0u),
+                        item.viewDepth });
+                    continue;
+                }
 
                 const double tRec0s = hostNowMs();
                 const int mirror = item.mirror ? 1 : 0;
@@ -12363,14 +12579,13 @@ namespace ForgeRender {
 
                 HostMesh& sm = g_meshes[slot];
                 Buffer*  vbs[2]     = { sm.vb, g_live.pInstanceBufSkin };
-                uint32_t strides[2] = { (uint32_t)sizeof(IPC::SkinnedVertexWire), (uint32_t)(2 * sizeof(uint32_t)) };
+                uint32_t strides[2] = { (uint32_t)sizeof(IPC::SkinnedVertexWire), (uint32_t)(kSkinInstU32 * sizeof(uint32_t)) };
                 cmdBindVertexBuffer(g_live.pCmd, 2, vbs, strides, nullptr);
                 cmdBindIndexBuffer(g_live.pCmd, sm.ib, INDEX_TYPE_UINT16, 0);
-                cmdDrawIndexedInstanced(g_live.pCmd, sm.indexCount, 0, 1, 0, skinnedDrawn);
+                cmdDrawIndexedInstanced(g_live.pCmd, sm.indexCount, 0, 1, 0, inst);
                 skinRecMs += hostNowMs() - tRec0s;
                 const double partMs = hostNowMs() - tPrep0;   // prep + rec for THIS part
                 if (partMs > skinMaxPartMs) { skinMaxPartMs = partMs; skinMaxSlot = slot; }
-                ++skinnedDrawn;
             }
             g_lastSkinPrepMs      = skinPrepMs;
             g_lastSkinRecMs       = skinRecMs;
@@ -13359,6 +13574,67 @@ namespace ForgeRender {
             }
             cmdBindRenderTargets(g_live.pCmd, nullptr);
         }
+
+        // --- Blended SKINNED parts (ghosts, mane/hair cards) --------------------------------
+        // Deferred out of the colour walk, which already packed their bone palettes and wrote their
+        // instance entries — this only issues the draws, from the SAME pInstanceBufSkin slots, with
+        // alpha.frag instead of opaque.frag. Last in the alpha stage: creatures stand in front of
+        // the world's banners and glass far more often than behind them, and the sort below is
+        // WITHIN this list (exactly how the alpha stage already works — hero blend, then MM alpha,
+        // then near sorted alpha, each internally ordered; there is no global sort across them).
+        g_lastSkinAlphaDrawn = 0;
+        if (!g_skinAlphaCmds.empty() && g_live.pSkinnedAlphaPipeline) {
+            // Back-to-front: viewDepth is distance along the view forward, so farthest draws first.
+            std::sort(g_skinAlphaCmds.begin(), g_skinAlphaCmds.end(),
+                      [](const SkinAlphaCmd& a, const SkinAlphaCmd& b) { return a.viewDepth > b.viewDepth; });
+
+            cmdBeginDebugMarker(g_live.pCmd, 0.8f, 0.4f, 0.9f, "SKINNED ALPHA (ghosts / hair cards)");
+            BindRenderTargetsDesc sabind = {};
+            sabind.mRenderTargetCount = 1;
+            sabind.mRenderTargets[0] = { colorTarget, LOAD_ACTION_LOAD };
+            sabind.mDepthStencil = { g_live.pDepth, LOAD_ACTION_LOAD };   // GEQUAL test, never write
+            cmdBindRenderTargets(g_live.pCmd, &sabind);
+            cmdSetViewport(g_live.pCmd, 0.0f, 0.0f, (float)g_live.width, (float)g_live.height, 0.0f, 1.0f);
+            cmdSetScissor(g_live.pCmd, 0, 0, g_live.width, g_live.height);
+
+            // Pipeline FIRST (establishes the shared default.rootsig), then the descriptor sets.
+            cmdBindPipeline(g_live.pCmd, g_live.pSkinnedAlphaPipeline);
+            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSet);
+            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerLightsSet);
+            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
+            Pipeline* curSkinAlpha = g_live.pSkinnedAlphaPipeline;
+            uint32_t  boundSkinAlphaWindow = UINT32_MAX;
+
+            for (const SkinAlphaCmd& c : g_skinAlphaCmds) {
+                if (c.slot >= g_meshHigh || !g_meshes[c.slot].valid || !g_meshes[c.slot].skinned) {
+                    continue;   // mesh evicted between the colour walk and here
+                }
+                // Blend pair from MW's NiAlphaProperty (additive glows are light, not surfaces);
+                // cull from NiStencilProperty DRAW_BOTH, else MW's single-sided default + winding.
+                Pipeline* want = c.additive ? g_live.pSkinnedAlphaPipelineAdd
+                               : c.twoSided ? g_live.pSkinnedAlphaPipelineNone
+                               : (c.mirror  ? g_live.pSkinnedAlphaPipelineMirror
+                                            : g_live.pSkinnedAlphaPipeline);
+                if (want != curSkinAlpha) {
+                    cmdBindPipeline(g_live.pCmd, want);
+                    curSkinAlpha = want;
+                    boundSkinAlphaWindow = UINT32_MAX;
+                }
+                if (c.window != boundSkinAlphaWindow) {
+                    cmdBindDescriptorSet(g_live.pCmd, c.window, g_live.pPerBatchSetSkin);
+                    boundSkinAlphaWindow = c.window;
+                }
+                HostMesh& sm = g_meshes[c.slot];
+                Buffer*  vbs[2]     = { sm.vb, g_live.pInstanceBufSkin };
+                uint32_t strides[2] = { (uint32_t)sizeof(IPC::SkinnedVertexWire), (uint32_t)(kSkinInstU32 * sizeof(uint32_t)) };
+                cmdBindVertexBuffer(g_live.pCmd, 2, vbs, strides, nullptr);
+                cmdBindIndexBuffer(g_live.pCmd, sm.ib, INDEX_TYPE_UINT16, 0);
+                cmdDrawIndexedInstanced(g_live.pCmd, sm.indexCount, 0, 1, 0, c.idx);
+                ++g_lastSkinAlphaDrawn;
+            }
+            cmdBindRenderTargets(g_live.pCmd, nullptr);
+            cmdEndDebugMarker(g_live.pCmd);
+        }
         gpuPhaseEnd(kGpuPhaseColorAlpha);
 
         // ===================== VOLUMETRIC height fog / sun shafts =====================
@@ -13480,8 +13756,13 @@ namespace ForgeRender {
                     uint8_t* bdst = (uint8_t*)g_live.pFPBonesBuf->pCpuMappedAddress;
                     std::memcpy(bdst + (size_t)base * 64, palette, (size_t)bones * 64);
                     uint32_t* sinst = (uint32_t*)g_live.pFPInstanceBufSkin->pCpuMappedAddress;
-                    sinst[fpSkinnedDrawn * 2 + 0] = base;
-                    sinst[fpSkinnedDrawn * 2 + 1] = packTexAlpha(item.texIndex, item.alphaRef, 0u, item.clampMode);
+                    sinst[fpSkinnedDrawn * kSkinInstU32 + 0] = base;
+                    // No blend bit on the FP path: these draws pair skinned.vert with opaque.frag,
+                    // which reads OverlayIndex as a terrain-decal bindless slot. FP blended parts
+                    // (there are essentially none — the torch flame is a separate FP alpha list) stay
+                    // opaque here rather than handing that frag a bit-cast float to index with.
+                    sinst[fpSkinnedDrawn * kSkinInstU32 + 1] = packTexAlpha(item.texIndex, item.alphaRef, 0u, item.clampMode);
+                    sinst[fpSkinnedDrawn * kSkinInstU32 + 2] = 0u;
 
                     HostMesh& sm = g_meshes[slot];
                     s_fpSkin.push_back({ sm.vb, sm.ib, sm.indexCount, fpSkinnedDrawn, item.mirror ? 1 : 0 });
@@ -13538,7 +13819,7 @@ namespace ForgeRender {
                         csMirror = r.mirror;
                     }
                     Buffer*  vbs[2]     = { r.vb, g_live.pFPInstanceBufSkin };
-                    uint32_t strides[2] = { (uint32_t)sizeof(IPC::SkinnedVertexWire), (uint32_t)(2 * sizeof(uint32_t)) };
+                    uint32_t strides[2] = { (uint32_t)sizeof(IPC::SkinnedVertexWire), (uint32_t)(kSkinInstU32 * sizeof(uint32_t)) };
                     cmdBindVertexBuffer(g_live.pCmd, 2, vbs, strides, nullptr);
                     cmdBindIndexBuffer(g_live.pCmd, r.ib, INDEX_TYPE_UINT16, 0);
                     cmdDrawIndexedInstanced(g_live.pCmd, r.indexCount, 0, 1, 0, r.instance);
@@ -13976,10 +14257,10 @@ namespace ForgeRender {
                              lf[16], lf[17], lf[18], lf[20], lf[21], lf[22], lf[24], lf[25], lf[26],
                              lf[56], lf[57], lf[58]);   // lodEye = ABSOLUTE world eye (viewer start pos)
             }
-            LOG::logline(">> [forge-hb] frame=%u drawn=%u skinned=%u multimap=%u sky=%u alpha=%u(zpre=%u) dynamic=%u meshHigh=%u "
+            LOG::logline(">> [forge-hb] frame=%u drawn=%u skinned=%u(blend=%u) multimap=%u sky=%u alpha=%u(zpre=%u) dynamic=%u meshHigh=%u "
                          "| refl sky=%u near=%u skin=%u "
                          "| record=%.2fms gpu=%.2fms (avg/frame over 300)",
-                         g_renderFrame, drawn, skinnedDrawn, multiMapDrawn, skyDrawn, alphaDrawn,
+                         g_renderFrame, drawn, skinnedDrawn, g_lastSkinAlphaDrawn, multiMapDrawn, skyDrawn, alphaDrawn,
                          g_lastAlphaPrepassDrawn, g_dynamicCount, g_meshHigh,
                          g_lastReflSkyDrawn, g_lastReflNearDrawn, g_lastReflSkinDrawn,
                          g_recAccum / 300.0, g_gpuAccum / 300.0);
@@ -21117,6 +21398,14 @@ namespace ForgeRender {
             uint32_t boundWindow = UINT32_MAX;
             int      boundSkinMirror = 0;
             uint32_t packWin = 0, packCur = 0;   // must mirror the prepass/colour cursors
+            // Blended parts held back for after the opaque walk, so a ghost in the mirror composites
+            // over the reflected world rather than against whatever had been recorded when its turn
+            // in blob order came up. Reuses the alpha stage's PSOs — same RT format, sample count and
+            // GEQUAL/no-write depth — so this costs no pipeline of its own.
+            struct ReflSkinAlpha { uint32_t idx; uint32_t window; uint32_t slot; uint8_t mirror;
+                                   uint8_t additive; uint8_t twoSided; float viewDepth; };
+            static std::vector<ReflSkinAlpha> s_reflSkinAlpha;   // reused frame-to-frame
+            s_reflSkinAlpha.clear();
             for (uint32_t k = 0; k < in.skinnedCount; ++k) {
                 if (sp + sizeof(IPC::SkinnedDrawWire) > sEnd) { break; }
                 IPC::SkinnedDrawWire item;
@@ -21132,6 +21421,21 @@ namespace ForgeRender {
                 uint32_t base = 0;
                 if (!skinPackNext(bones, kMaxBatches, packWin, packCur, base)) { continue; }
                 const uint32_t window = packWin;
+                // A blended part MUST NOT go through skinPSO here: those are skinned.vert +
+                // opaque.frag, and its instance entry carries the blend bit, which makes
+                // skinned.vert forward matAlpha through OverlayIndex — opaque.frag would read that
+                // bit-cast float as a terrain-decal bindless index. Defer it; skinDrawn still
+                // advances, keeping this walk's cursor identical to the prepass's.
+                if (skinIsBlended(item)) {
+                    s_reflSkinAlpha.push_back(ReflSkinAlpha{
+                        skinDrawn, window, slot,
+                        (uint8_t)(item.mirror ? 1u : 0u),
+                        (uint8_t)((item.srcBlend == kD3DBLEND_SRCALPHA && item.destBlend == kD3DBLEND_ONE) ? 1u : 0u),
+                        (uint8_t)((item.blendFlags & IPC::kSkinFlagTwoSided) ? 1u : 0u),
+                        item.viewDepth });
+                    ++skinDrawn;
+                    continue;
+                }
                 const int mirror = item.mirror ? 1 : 0;
                 if (mirror != boundSkinMirror) {
                     cmdBindPipeline(g_live.pCmd, skinPSO[mirror]);
@@ -21147,11 +21451,47 @@ namespace ForgeRender {
                 // instance slot the palette was packed into.
                 HostMesh& sm = g_meshes[slot];
                 Buffer*  vbs[2]     = { sm.vb, g_live.pInstanceBufSkin };
-                uint32_t strides[2] = { (uint32_t)sizeof(IPC::SkinnedVertexWire), (uint32_t)(2 * sizeof(uint32_t)) };
+                uint32_t strides[2] = { (uint32_t)sizeof(IPC::SkinnedVertexWire), (uint32_t)(kSkinInstU32 * sizeof(uint32_t)) };
                 cmdBindVertexBuffer(g_live.pCmd, 2, vbs, strides, nullptr);
                 cmdBindIndexBuffer(g_live.pCmd, sm.ib, INDEX_TYPE_UINT16, 0);
                 cmdDrawIndexedInstanced(g_live.pCmd, sm.indexCount, 0, 1, 0, skinDrawn);
                 ++skinDrawn;
+            }
+
+            // Reflected blended skinned parts, back-to-front, after the whole opaque reflection.
+            // The winding swap does NOT apply: these PSOs pick their cull from the part's own
+            // DRAW_BOTH/mirror flags exactly as the main alpha stage does, and a translucent sheet
+            // showing its far face in a mirror is invisible next to it showing the wrong one.
+            if (!s_reflSkinAlpha.empty() && g_live.pSkinnedAlphaPipeline) {
+                std::sort(s_reflSkinAlpha.begin(), s_reflSkinAlpha.end(),
+                          [](const ReflSkinAlpha& a, const ReflSkinAlpha& b) { return a.viewDepth > b.viewDepth; });
+                cmdBindPipeline(g_live.pCmd, g_live.pSkinnedAlphaPipeline);
+                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSetReflectGeo);
+                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerLightsSet);
+                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
+                Pipeline* curPipe = g_live.pSkinnedAlphaPipeline;
+                uint32_t  curWindow = UINT32_MAX;
+                for (const ReflSkinAlpha& r : s_reflSkinAlpha) {
+                    Pipeline* want = r.additive ? g_live.pSkinnedAlphaPipelineAdd
+                                   : r.twoSided ? g_live.pSkinnedAlphaPipelineNone
+                                   : (r.mirror  ? g_live.pSkinnedAlphaPipelineMirror
+                                                : g_live.pSkinnedAlphaPipeline);
+                    if (want != curPipe) {
+                        cmdBindPipeline(g_live.pCmd, want);
+                        curPipe = want;
+                        curWindow = UINT32_MAX;
+                    }
+                    if (r.window != curWindow) {
+                        cmdBindDescriptorSet(g_live.pCmd, r.window, g_live.pPerBatchSetSkin);
+                        curWindow = r.window;
+                    }
+                    HostMesh& sm = g_meshes[r.slot];
+                    Buffer*  vbs[2]     = { sm.vb, g_live.pInstanceBufSkin };
+                    uint32_t strides[2] = { (uint32_t)sizeof(IPC::SkinnedVertexWire), (uint32_t)(kSkinInstU32 * sizeof(uint32_t)) };
+                    cmdBindVertexBuffer(g_live.pCmd, 2, vbs, strides, nullptr);
+                    cmdBindIndexBuffer(g_live.pCmd, sm.ib, INDEX_TYPE_UINT16, 0);
+                    cmdDrawIndexedInstanced(g_live.pCmd, sm.indexCount, 0, 1, 0, r.idx);
+                }
             }
         }
 
@@ -21862,6 +22202,13 @@ namespace ForgeRender {
         if (g_live.pSkinnedShadowPipelineNone)        { removePipeline(R, g_live.pSkinnedShadowPipelineNone); }
         if (g_live.pSkinnedShadowPipelineFront)       { removePipeline(R, g_live.pSkinnedShadowPipelineFront); }
         if (g_live.pSkinnedShadowPipelineFrontMirror) { removePipeline(R, g_live.pSkinnedShadowPipelineFrontMirror); }
+        if (g_live.pSkinnedAlphaPipeline)       { removePipeline(R, g_live.pSkinnedAlphaPipeline); }
+        if (g_live.pSkinnedAlphaPipelineMirror) { removePipeline(R, g_live.pSkinnedAlphaPipelineMirror); }
+        if (g_live.pSkinnedAlphaPipelineNone)   { removePipeline(R, g_live.pSkinnedAlphaPipelineNone); }
+        if (g_live.pSkinnedAlphaPipelineAdd)    { removePipeline(R, g_live.pSkinnedAlphaPipelineAdd); }
+        if (g_live.pSkinnedAlphaShadowPipeline) { removePipeline(R, g_live.pSkinnedAlphaShadowPipeline); }
+        if (g_live.pSkinnedAlphaShadowShader)   { removeShader(R, g_live.pSkinnedAlphaShadowShader); }
+        if (g_live.pSkinnedAlphaShader)    { removeShader(R, g_live.pSkinnedAlphaShader); }
         if (g_live.pSkinnedDepthShader)    { removeShader(R, g_live.pSkinnedDepthShader); }
         if (g_live.pSkinnedShader)         { removeShader(R, g_live.pSkinnedShader); }
         // Tier 4 multi-map teardown.

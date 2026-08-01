@@ -1921,9 +1921,19 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
 
 
     if ((aoFlags & 8u) != 0u) { RETURN(float4(In.MatDiffuse, 1.0f)); }
+
+
+
+
+
+
+
+
+    bool inReflect = (gFrameData.gReflWaterClip.z != 0.0f);
     float2 aoUv = In.Position.xy * gShadowParams.screenAlloc.zw;
-    float4 aoSample = SampleTex2D(gAO, gSamplerAnisotropic, aoUv);
-    if ((aoFlags & 2u) != 0u) { N = normalize(aoSample.rgb); }
+    float4 aoSample = inReflect ? float4(0.0f, 0.0f, 0.0f, 1.0f)
+                                : SampleTex2D(gAO, gSamplerAnisotropic, aoUv);
+    if ((aoFlags & 2u) != 0u && !inReflect) { N = normalize(aoSample.rgb); }
 
 
 
@@ -1980,7 +1990,7 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
 
 
             uint slotP1 = (uint)gLights.lights[i * 3u + 2u].w;
-            if (receiveShadows && slotP1 != 0u)
+            if (receiveShadows && slotP1 != 0u && !inReflect)
             {
                 uint4 mw = LoadTex2D(gShadowMask, NO_SAMPLER, int2(In.Position.xy), 0).xyzw;
                 uint s = slotP1 - 1u;
@@ -2016,7 +2026,8 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
     if (albedo.a < In.AlphaRef) { discard; }
 
     albedo.rgb *= gFrameData.dbgScales.z;
-#line 184 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/alpha.frag.fsl"
+#line 199 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/alpha.frag.fsl"
+    if (In.DrawIdx != 0xFFFFFFFFu)
     {
         uint4 stg = gAlphaStages[In.DrawIdx];
         uint nStages = stg.w;

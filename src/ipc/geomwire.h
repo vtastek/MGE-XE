@@ -234,12 +234,21 @@ namespace IPC {
     // kMaxTextures). Client over-cap falls back to white (client-side LRU recycles its range).
     constexpr std::uint32_t kDlReserve = 8;
 
+    // SkinnedDrawWire::blendFlags — a skinned part's NiAlphaProperty state. Alpha-TEST rides
+    // alphaRef (and always has); these are the alpha-BLEND bits, which the wire carried no room
+    // for until ghosts/manes turned up rendering solid. A blended skinned part stays on the
+    // skinned list (it needs the bone palette, which only that list carries) and is merely
+    // TAGGED — the host packs it in every walk exactly as before and moves only its DRAW into
+    // the alpha stage. See [[project_forge_alpha_composite_gap]].
+    constexpr std::uint32_t kSkinFlagBlended  = 1u << 0;   // NiAlphaProperty alpha blend enabled
+    constexpr std::uint32_t kSkinFlagTwoSided = 1u << 1;   // NiStencilProperty DRAW_BOTH → CULL_NONE
+
     // M-Skinning per-frame draw item: which uploaded skinned mesh (slot) to draw, the
     // part's bone count, and its mirror flag (left-side parts reuse the right mesh via a
     // negative-scale bone → inside-out without the mirror pipeline). There is NO per-draw
     // world matrix — the bone palette is already world-space. A SkinnedDrawWire is
     // followed INLINE by numBones * 64 palette bytes (each bone a model->world D3DXMATRIX,
-    // row-major). A skinned-draw blob = repeated [SkinnedDrawWire][palette]. 16 bytes + palette.
+    // row-major). A skinned-draw blob = repeated [SkinnedDrawWire][palette]. 44 bytes + palette.
     struct SkinnedDrawWire {
         std::uint32_t slot;
         std::uint32_t numBones;
@@ -247,6 +256,15 @@ namespace IPC {
         std::uint32_t texIndex;      // bindless gTextures[] slot for the base map (0 = default white)
         float         alphaRef;      // alpha-test reference 0..1 (0 = no alpha test; frag discards a < ref)
         std::uint32_t clampMode;     // NiTexturingProperty::Map::clampMode, RAW (see kTexClamp*)
+        std::uint32_t blendFlags;    // kSkinFlag* (0 for the opaque majority)
+        float         matAlpha;      // MaterialProperty::alpha — the FFE per-draw fade (AlphaDrawWire::matAlpha)
+        std::uint32_t srcBlend;      // D3DBLEND_* (translated from NiAlphaProperty); read only when BLENDED
+        std::uint32_t destBlend;     // D3DBLEND_*
+        // Back-to-front sort key for the host's skinned-alpha draw list: BONE 0's translation
+        // dotted with the view forward. A skinned part's worldTransformD3D is not a meaningful
+        // position (the bones carry it), so the static path's bound-centre expression does not
+        // transfer. Eye-relative, so it is invariant to the camera-relative palette shift below.
+        float         viewDepth;
     };
 
     // Tier 4 multi-map per-frame draw item: a STATIC opaque part with up to 4 ORDERED texture

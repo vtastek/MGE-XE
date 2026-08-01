@@ -680,6 +680,34 @@ namespace MGE::GeometryCache {
             e.matAmbient[0]  = e.matAmbient[1]  = e.matAmbient[2]  = e.matAmbient[3]  = 1.0f;
             e.matEmissive[0] = e.matEmissive[1] = e.matEmissive[2] = e.matEmissive[3] = 0.0f;
             e.emissiveGain[0] = e.emissiveGain[1] = e.emissiveGain[2] = 1.0f;   // no boost
+            // Vertex-colour routing. MGE's rule is PROPERTY-driven: vertex colours are used only
+            // when a NiVertexColorProperty says so. A shape carrying a colour ARRAY but no such
+            // property falls through as SOURCE_IGNORE, so the material drives diffuse — and with it
+            // the material's ALPHA (XE FixedFuncEmu.fx::vertexMaterialNone returns materialDiffuse.a).
+            //
+            // THIS IS A KNOWN, DELIBERATE DIVERGENCE — measured 2026-08-01, keep it on purpose:
+            //   - D3D fixed function defaults D3DRS_DIFFUSEMATERIALSOURCE to D3DMCS_COLOR1, so
+            //     vanilla MW uses the colour array whenever the FVF has one, property or not.
+            //   - OpenMW reproduces exactly that (nifosg/nifloader.cpp::applyDrawableProperties):
+            //         mat->setColorMode(hasVertexColors ? AMBIENT_AND_DIFFUSE : OFF);
+            //     keyed on !niGeometryData->mColors.empty() BEFORE any property is consulted.
+            // So both engines let the vertex alpha displace MaterialProperty::alpha; we don't.
+            //
+            // Worked example — TR_velk.nif 'Tri body 1' (the mane, 40 verts): colour array present
+            // (pure white, alpha 1.0), NO NiVertexColorProperty, MaterialProperty alpha 0.180,
+            // NiAlphaProperty blend SRC_ALPHA/INV_SRC_ALPHA. MW and OpenMW discard the 0.180 and
+            // draw an opaque white-lit card; we honour it and the mane reads as translucent strands.
+            // User call (2026-08-01): KEEP OURS — the vanilla result is over-lit against this
+            // renderer's sun shadows / SH sky ambient / GTAO, and the authored 0.180 plus a blend
+            // property is plainly the artist asking for a translucent mane.
+            //
+            // Cost of the divergence, so it is not rediscovered as a bug: 11% of skinned meshes
+            // (51 of 458 sampled) carry colour arrays that this rule makes unreachable — including
+            // that same velk's BODY, 810 hand-painted values, mean 0.826, range 0->1 of baked
+            // shading. Flipping to `e.vColSource = e.hasVertexColor ? 2 : 0` adopts the MW/OpenMW
+            // rule and unlocks them, at the price of the mane. Do not flip it by halves: the RGB
+            // and the alpha ride the SAME diffuse lane in both engines, so taking the vertex colour
+            // for shading necessarily takes its alpha too.
             e.vColSource = 0;   // SOURCE_IGNORE until a VertexColorProperty says otherwise
 
             auto* ps = reinterpret_cast<NI::PropertyState*>(geom->propertyState);
