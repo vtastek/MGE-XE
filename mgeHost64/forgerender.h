@@ -209,7 +209,17 @@ namespace ForgeRender {
     // Arm RenderDoc in-application capture — MUST be called before sceneProbe()/init() so
     // renderdoc.dll hooks d3d12 device creation. sceneProbe wraps one renderScene in
     // StartFrameCapture/EndFrameCapture (no Present needed). Best launched via the RenderDoc UI.
-    bool enableRdocCapture();
+    // allowLoad: true = LoadLibrary renderdoc.dll if it is not already in the process (the probes);
+    // false = attach only if the RenderDoc UI already injected it (the live game path, so a shipped
+    // install never pulls the hooks in). MGE_RDOC=1 in the environment forces true.
+    bool enableRdocCapture(bool allowLoad);
+
+    // Arm N whole HOST frames for programmatic RenderDoc capture, from the client's numpad-0
+    // one-shot. Bracketed host-side across renderScene boundaries rather than by RenderDoc's own
+    // hotkey: the host never Presents (the client does, a frame or two later), so a UI-triggered
+    // capture never lands on the frame you were looking at. No-op + a loud log if RenderDoc is
+    // not attached.
+    void armGpuCapture(unsigned frames);
 
     // Debug: read back the live shared RT centre pixel and printf it (BGRA). Used by the
     // --forge-scene probe to ground-truth the fragment output offline.

@@ -611,6 +611,10 @@ namespace IPC {
 			if (params.devDistLightsToggle) {
 				ForgeRender::toggleDistLights();
 			}
+			// Arm BEFORE renderScene, so the frame this key was pressed for is the one captured.
+			if (params.devGpuCapture) {
+				ForgeRender::armGpuCapture(params.devGpuCapture);
+			}
 			// Live render-scale: set this frame's internal render resolution (clamped to the
 			// allocation size host-side). 0,0 ⇒ render at the full allocation. Per-frame viewport
 			// move only — no RT reallocation.

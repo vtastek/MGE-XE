@@ -279,6 +279,7 @@ namespace IPC {
         std::uint32_t uiVisible = 0;
         std::uint32_t reloadShaders = 0;   // one-shot (F8 edge): host rebuilds compute pipelines from disk
         std::uint32_t distLightsToggle = 0; // one-shot (numpad- edge): host flips baked distant-light loop (perf A/B)
+        std::uint32_t gpuCapture = 0;      // one-shot (numpad0 edge): N host frames of RenderDoc capture
         // Frame-ahead observability: the client's own last-frame timings, shown live in the
         // host Stats panel. Purely informational — no host behaviour keys off these.
         std::uint32_t frameAhead = 0;      // 1 = deferred-finish pipelining live (default on; numpad-*)
@@ -386,6 +387,10 @@ namespace IPC {
         IN std::uint32_t devUiVisible;
         IN std::uint32_t devReloadShaders;   // one-shot (F8 edge): host rebuilds compute pipelines from disk
         IN std::uint32_t devDistLightsToggle; // one-shot (numpad- edge): host flips baked distant-light loop (perf A/B)
+        // One-shot (numpad0 edge): capture N whole HOST frames with RenderDoc, bracketed host-side.
+        // The host never Presents — the client does, a frame or two later — so RenderDoc's own
+        // hotkey can never land on the frame being looked at. This arms it from the game instead.
+        IN std::uint32_t devGpuCapture;
 
         // AT1 sorted-alpha takeover: per-frame alpha draw list of AlphaDrawWire[] (geomwire.h) —
         // the scene-1 blended world shapes, CLIENT-sorted back-to-front, drawn by the host after

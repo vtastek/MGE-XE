@@ -7,6 +7,7 @@
 
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
 
 // DirectX 12 Agility SDK loader exports. The OS d3d12.dll looks these up in the host
 // EXE at startup; without them it ignores the D3D12Core.dll we ship beside the exe and
@@ -72,7 +73,7 @@ int main(int argc, char** argv) {
 		}
 		// `--forge-scene rdoc` arms a RenderDoc capture instead (better descriptor-table inspection).
 		if (argc >= 3 && std::strcmp(argv[2], "rdoc") == 0) {
-			ForgeRender::enableRdocCapture();  // loads renderdoc.dll BEFORE device init
+			ForgeRender::enableRdocCapture(true);  // loads renderdoc.dll BEFORE device init
 		}
 		return ForgeRender::sceneProbe() ? 0 : 1;
 	}
@@ -91,6 +92,18 @@ int main(int argc, char** argv) {
 
 	LOG::open("mgeHost64.log");
 	LOG::logline("Host process started");
+
+	// GPU capture, BEFORE any device creation (renderdoc.dll has to hook d3d12 first). Attach-only
+	// by default: if the RenderDoc UI launched or injected us the dll is already in the process and
+	// numpad 0 works, and if it is not this costs one failed GetModuleHandle — a shipped install
+	// never pulls the hooks into a play session. MGE_RDOC=1 opts into the LoadLibrary for the case
+	// where the host was spawned by the client rather than launched under the UI.
+	{
+		const bool allowLoad = std::getenv("MGE_RDOC") != nullptr;
+		if (ForgeRender::enableRdocCapture(allowLoad)) {
+			LOG::logline(">> RenderDoc attached — numpad 0 in-game captures the next host frame");
+		}
+	}
 
 	// Host-owned terrain (tasks/forge-terrain.md): read every plugin's LAND records NOW, on a
 	// background thread, so the parse overlaps MW's own load and the client handshake below.

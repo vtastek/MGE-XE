@@ -65,6 +65,7 @@ namespace {
     HWND   g_devHwnd = nullptr;        // MW focus window (cached from device creation params)
     bool   g_reloadShadersPending = false; // F8 latched at composite finish, consumed by the next kickoff
     bool   g_distLightsTogglePending = false; // numpad- latched at composite finish; one-shot host dist-light A/B
+    unsigned g_gpuCapturePending = 0;  // numpad0 latched at composite finish; N host frames of RenderDoc capture
     bool   g_fpSuppressLive = true;    // FP1b: MW arm suppression; on by default, numpad-/ flips live for the A/B
 
     // T3 (tasks/forge-terrain.md): stop emitting MW's OWN near terrain once the host is drawing the
@@ -3733,6 +3734,16 @@ namespace RenderProcess {
             g_distLightsTogglePending = true;
             LOG::logline(">> [seam] distant-light A/B toggle requested (numpad -)");
         }
+        // Numpad 0: capture the NEXT host frame with RenderDoc, bracketed by the host itself.
+        // Not RenderDoc's own hotkey: the host has no Present of its own (it hands a shared
+        // texture back and WE present it, a frame or two later), so a UI-triggered capture lands
+        // on whatever frame RenderDoc guessed at — never the one on screen. Needs renderdoc.dll in
+        // the HOST process: launch via the RenderDoc UI with child-process capture, or set
+        // MGE_RDOC=1. The host logs loudly to mgeHost64.log if it is not attached.
+        if (GetAsyncKeyState(VK_NUMPAD0) & 0x0001) {
+            g_gpuCapturePending = 1u;
+            LOG::logline(">> [seam] GPU frame capture requested (numpad 0) — see mgeHost64.log");
+        }
         // FP1b: numpad-/ toggles MW first-person arm suppression live (A/B of MW arms
         // over the host FP pass vs host arms alone). Only takes effect while the FP
         // pass ships (wantsFPSuppression gates on capture + camera validation).
@@ -4728,6 +4739,12 @@ namespace RenderProcess {
         if (g_distLightsTogglePending) {
             devInput.distLightsToggle = 1u;
             g_distLightsTogglePending = false;
+        }
+        // Numpad 0: one-shot host-bracketed RenderDoc capture. Latched at the edge and consumed
+        // here so the arm reaches the host BEFORE the renderScene it is meant to capture.
+        if (g_gpuCapturePending) {
+            devInput.gpuCapture = g_gpuCapturePending;
+            g_gpuCapturePending = 0;
         }
         // Frame-ahead observability → host Stats panel: last frame's collect wait and
         // mwstart (1-frame skew, panel only) + this frame's dt and the live toggle.

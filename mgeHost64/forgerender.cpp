@@ -574,13 +574,27 @@ namespace {
     };
     static RDOC_API_Table* g_rdoc = nullptr;
 
-    static HMODULE findRenderDoc() {
+    // allowLoad=false = GetModuleHandle ONLY. That is what the live game path uses: if the process
+    // was launched/injected through the RenderDoc UI the dll is already here and we get programmatic
+    // control for free, and if it is not, this costs one failed handle lookup and a shipped install
+    // never pulls RenderDoc's hooks into a play session. MGE_RDOC=1 opts into the LoadLibrary.
+    static HMODULE findRenderDoc(bool allowLoad) {
         HMODULE m = GetModuleHandleW(L"renderdoc.dll");        // already injected by the RenderDoc UI?
-        if (m) { return m; }
+        if (m || !allowLoad) { return m; }
         m = LoadLibraryW(L"renderdoc.dll");                    // next to exe / on PATH
         if (m) { return m; }
         return LoadLibraryW(L"C:\\Program Files\\RenderDoc\\renderdoc.dll");
     }
+
+    // Programmatic frame capture, armed from the client (numpad 0) and bracketed BY THE HOST, which
+    // is the whole point: RenderDoc's own hotkey brackets whatever it thinks a frame is, and this
+    // host has no Present of its own — it hands a shared texture back to the client, which presents
+    // it one or two frames later. A key pressed while looking at the artifact therefore captured a
+    // frame that had already moved on. Arming a COUNT here and closing frame N's capture at the top
+    // of frame N+1 makes the boundaries exact and includes every tail submission (the Hi-Z prologue
+    // is submitted after the frame fence, so a capture that ended at renderScene's return missed it).
+    static unsigned g_rdocArmFrames = 0;      // frames still to capture
+    static bool     g_rdocCapturing = false;  // a StartFrameCapture is open
 }
 
 namespace ForgeRender {
@@ -595,8 +609,10 @@ namespace ForgeRender {
     }
 
     // Public: call ONCE before sceneProbe()/init() so renderdoc.dll hooks d3d12 device creation.
-    bool enableRdocCapture() {
-        HMODULE m = findRenderDoc();
+    // allowLoad: probes pass true (they exist to be captured); the live game path passes false so a
+    // shipped install never loads RenderDoc, unless MGE_RDOC is set in the environment.
+    bool enableRdocCapture(bool allowLoad) {
+        HMODULE m = findRenderDoc(allowLoad);
         if (!m) { std::printf("[forge] RDOC: renderdoc.dll NOT found (launch via RenderDoc UI or install it)\n"); return false; }
         PFN_RDOC_GetAPI getApi = (PFN_RDOC_GetAPI)GetProcAddress(m, "RENDERDOC_GetAPI");
         if (!getApi) { std::printf("[forge] RDOC: RENDERDOC_GetAPI export missing\n"); return false; }
@@ -607,10 +623,25 @@ namespace ForgeRender {
         // Frame number gets appended; the .rdc lands next to the game so the user can open it.
         // RELATIVE on purpose — our cwd IS the install dir, so this follows whatever install is
         // running instead of writing into one developer's hardcoded path.
-        g_rdoc->SetCaptureFilePathTemplate("forge_gtao");
+        g_rdoc->SetCaptureFilePathTemplate("forge_frame");
         std::printf("[forge] RDOC capture armed (start=%p end=%p)\n",
                     (void*)g_rdoc->StartFrameCapture, (void*)g_rdoc->EndFrameCapture);
         return true;
+    }
+
+    // Arm N whole host frames for capture. Called from the IPC server on the numpad-0 one-shot, so
+    // the arm lands BEFORE the renderScene it is meant to capture. Loud when RenderDoc is absent —
+    // "I pressed the key and nothing happened" is the failure this has to be able to explain.
+    void armGpuCapture(unsigned frames) {
+        if (!g_rdoc) {
+            LOG::logline("!! [forge] GPU capture requested but RenderDoc is NOT attached. Launch Morrowind "
+                         "from the RenderDoc UI with 'capture child processes' ticked, or set MGE_RDOC=1 "
+                         "in the environment before launching."); LOG::flush();
+            return;
+        }
+        g_rdocArmFrames = (frames > 8u) ? 8u : frames;   // a capture is ~GBs; 8 is already generous
+        LOG::logline(">> [forge] GPU capture ARMED for %u frame(s) -> forge_frame_frameNNN.rdc in the install dir",
+                     g_rdocArmFrames); LOG::flush();
     }
 
     bool probe() {
@@ -9205,6 +9236,28 @@ namespace ForgeRender {
         }
         Renderer* R = g_live.pRenderer;
         const double tEntry = hostNowMs();   // host-frame split: start of renderScene
+
+        // GPU capture boundary. Frame N's capture CLOSES here, at the top of frame N+1, rather than
+        // at renderScene's return: the Hi-Z prologue is tail-submitted after the frame fence and the
+        // host-frame split can defer work past the return, so an end-of-renderScene bracket dropped
+        // exactly the passes worth looking at. Closing one frame late costs a sliver of the next
+        // frame in the capture and guarantees the whole of the one asked for.
+        if (g_rdoc) {
+            if (g_rdocCapturing) {
+                uint32_t cap = g_rdoc->EndFrameCapture(nullptr, nullptr);
+                g_rdocCapturing = false;
+                LOG::logline(">> [forge] GPU capture WRITTEN (ok=%u, %u frame(s) left) -> forge_frame_frameNNN.rdc",
+                             cap, g_rdocArmFrames); LOG::flush();
+            }
+            if (g_rdocArmFrames > 0u) {
+                --g_rdocArmFrames;
+                g_rdoc->StartFrameCapture(nullptr, nullptr);   // NULL device = every queue the host owns
+                g_rdocCapturing = true;
+                LOG::logline(">> [forge] GPU capture STARTED (host frame %llu)", (unsigned long long)g_renderFrame);
+                LOG::flush();
+            }
+        }
+
         checkShaderHotReload();   // auto-reload compute pipelines if a recompiled dxil landed on disk
 
         // If the device was already removed on a PRIOR frame (e.g. during a dense exterior),
