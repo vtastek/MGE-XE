@@ -3758,19 +3758,14 @@ namespace RenderProcess {
             g_frameAheadLive = !g_frameAheadLive;
             LOG::logline(">> [seam] frame-ahead pipelining %s", g_frameAheadLive ? "ON" : "OFF");
         }
-        // NUMPAD8: produce-worker mode cycle OFF -> FENCED (Tier 1b) -> OVERLAP (Tier 2) ->
-        // PARK (mode 3, fire-at-frame-start) -> OFF. FENCED runs the produce on the worker but
-        // waits immediately (serial A/B); OVERLAP defers the wait to EndScene(0) so it overlaps
-        // scene-0 draw; PARK builds frame N on the worker without firing and the main thread
-        // fires it at the START of frame N+1 with a restamped camera (frame = max, not sum).
-        // Takes effect at the next kickoff.
-        if (GetAsyncKeyState(VK_NUMPAD8) & 0x0001) {
-            g_produceMode = (g_produceMode + 1) % 4;
-            const char* name = (g_produceMode == 1) ? "FENCED (Tier 1b)"
-                             : (g_produceMode == 2) ? "OVERLAP (Tier 2)"
-                             : (g_produceMode == 3) ? "PARK (fire-at-frame-start)" : "OFF (inline)";
-            LOG::logline(">> [seam] produce worker: %s", name);
-        }
+        // (The NUMPAD8 produce-worker mode cycle lived here — a bring-up knob from before PARK
+        // became the shipping default. Deleted 2026-08-02: one stray keypress cycled the mode to
+        // OFF (inline), which DEADLOCKS against the async frame-split. Inline produce runs inside
+        // the async RenderFrame window, so every geom upload it needs is refused by the
+        // clobber guard and re-queued into the same forbidden window forever — observed 6988
+        // consecutive "keeping N bytes for retry" with zero progress, image frozen, game live and
+        // unrecoverable without a restart. The mode still exists behind the imgui combo; nothing
+        // reaches it by accident any more.)
         // VK_SCROLL (Scroll Lock): Phase 1 host-cull-only A/B. ON routes the Forge produce
         // off the engine MSOC classify onto the self-contained frustum-only visible set
         // (full refresh walk + whole-cache frustum cull; host Hi-Z GPU cull owns occlusion).
