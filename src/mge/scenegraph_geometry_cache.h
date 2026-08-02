@@ -193,6 +193,23 @@ namespace MGE::GeometryCache {
         // this flag get their bound texture re-read each frame they are visited
         // (refreshAnimatedTexture); everything else pays nothing.
         bool  texAnimated;
+        // A NiAlphaController and/or NiMaterialColorController is attached to this shape's
+        // NiMaterialProperty: the property's alpha / diffuse / ambient / emissive are rewritten
+        // over time (enchanted-item pulse, magic VFX fades; 1018 alpha controllers across 145 NIFs
+        // and 64 colour controllers across 50, tools/nif-controller-census.csv).
+        //
+        // Same failure as the flip-book case above, one property over: the controller writes the
+        // PROPERTY, never NiGeometryData, so revisionID does not move and the revision-gated
+        // material re-extract never fires. The entry keeps whatever alpha happened to be live at
+        // capture, forever. Repro: pc_act_ar_dwelkynd.nif (the dwemer crystal), one controller,
+        // one curve, 0.80 -> 0.00 -> 1.00 on a 5 s loop, rendered as a constant dull crystal.
+        //
+        // Entries carrying this flag re-read their material colours each frame they are visited
+        // (refreshAnimatedMaterial); everything else pays one bool test. matAlpha and matDiffuse
+        // already ride the PER-FRAME draw wire (renderprocess buildGeometryDrawLists -> the host's
+        // per-instance buffer), so refreshing the cached value is the whole fix — no wire change,
+        // no host change.
+        bool  matAnimated;
         // NiStencilProperty DRAW_BOTH: the shape is authored two-sided (window panes,
         // waterfalls, thin cloth) and MW draws it with culling OFF. Single-sided shapes
         // (no stencil / not DRAW_BOTH) MW draws CULL_BACK — the Forge alpha pass must
@@ -246,6 +263,27 @@ namespace MGE::GeometryCache {
         // guard the eviction climb uses) and cleared by purgeAll.
         const void* switchOwner = nullptr;
         int         switchChild = -1;
+        // Nearest ancestor (this shape included) that carries a NiVisController — the controller
+        // that hides/shows a subtree by keying appCulled over time. Null for the overwhelming
+        // majority of entries (1084 controllers across 264 NIFs).
+        //
+        // Same shape of bug as switchOwner, one flag over: when the controller hides the node,
+        // walk() early-returns on the appCulled ancestor and the entry is simply never visited
+        // again — nothing marks it gone. It stays fully parented, so the eviction sweep's chain
+        // climb votes ALIVE; and a creature is a mover candidate, so the offscreen shadow-caster
+        // re-emit loop ships it EVERY frame from the cache, independently of the visible set.
+        // Result: dwarvenspecter.nif's death animation hides the body over the last 0.8 s of every
+        // death (keys at 50.067 OFF / 50.933 ON / 51.933 OFF, stop 52.667) and MW swaps in the ash
+        // pile, while the host keeps drawing the last pose until the cell is purged.
+        //
+        // Only nodes that THEMSELVES carry a NiVisController are tested. Plain appCulled is not
+        // usable as the signal: MGE app-culls roots of its own (MW-ONLY-UI suppression, the FP1b
+        // arm root) and the inactive-POV player body is app-culled while perfectly enabled. Binding
+        // to a controller found inside the object's own NIF keeps all of that out by construction.
+        // Nearest owner only, exactly like switchOwner — no vanilla mesh nests vis controllers.
+        //
+        // Raw engine node → vtable-validated before every deref, and cleared by purgeAll.
+        const void* visOwner = nullptr;
         // The GeometryData* this entry was built from. A NiTriShape address can be
         // recycled onto a NEW shape (cell transitions) while the entry survives —
         // with deferred eviction + the far-keep hysteresis that window is real, so

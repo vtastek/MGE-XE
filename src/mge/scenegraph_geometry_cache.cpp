@@ -115,6 +115,11 @@ namespace MGE::GeometryCache {
         // branch still the displayed one?" pass iterates this instead of the whole cache. Same
         // maintenance contract as the sets above. ⊆ keys(g_cache).
         std::unordered_set<uint32_t>                      g_switchKeys;
+        // Keys whose entry hangs under a NiVisController-bearing node (see CachedGeometry::
+        // visOwner). Tiny — creatures with hide/show death or transform animations, magic VFX — so
+        // the per-frame "has your owner been hidden?" pass iterates this instead of the whole
+        // cache. Same maintenance contract as the sets above. ⊆ keys(g_cache).
+        std::unordered_set<uint32_t>                      g_visKeys;
         // Near-eye PLAIN-STATIC shadow-caster keys, rebuilt each eviction sweep (30-frame cadence)
         // by collecting kept entries near the eye. The mover set above re-emits offscreen skinned/
         // MM/rigid-LIVE casters every frame; a plain static (lantern, wall fixture) is NOT a mover
@@ -654,6 +659,18 @@ namespace MGE::GeometryCache {
             }
         }
 
+        // Does this object own a controller of the given RTTI type? MW chains an NiObjectNET's
+        // controllers through TimeController::nextController; a shape/node/property carries a
+        // handful at most. Bounded so a corrupt or cyclic chain cannot spin the frame.
+        bool hasController(const NI::ObjectNET* obj, std::uintptr_t rtti) {
+            if (!obj) return false;
+            const NI::TimeController* c = obj->controllers.get();
+            for (int i = 0; c && i < 16; ++i, c = c->nextController.get()) {
+                if (c->isInstanceOfType(rtti)) return true;
+            }
+            return false;
+        }
+
         void extractMaterial(CachedGeometry& e, NI::TriBasedGeometry* geom) {
             e.d3dTexture  = nullptr;
             e.d3dOverlay  = nullptr;
@@ -668,6 +685,7 @@ namespace MGE::GeometryCache {
             e.alphaTest   = false;
             e.blendEnable = false;
             e.texAnimated = false;
+            e.matAnimated = false;
             e.twoSided    = false;   // single-sided (CULL_BACK) unless NiStencilProperty DRAW_BOTH
             // SK1 sky: default to the standard transparency blend; overwritten below from the
             // NiAlphaProperty flags when present. Only consumed for isSky entries (the Forge
@@ -725,6 +743,13 @@ namespace MGE::GeometryCache {
                 e.matAmbient[2]  = mp->ambient.b;  e.matAmbient[3]  = 1.0f;
                 e.matEmissive[0] = mp->emissive.r; e.matEmissive[1] = mp->emissive.g;
                 e.matEmissive[2] = mp->emissive.b; e.matEmissive[3] = 0.0f;
+                // Animated material: a NiAlphaController (alpha) or NiMaterialColorController
+                // (diffuse/ambient/emissive) rewrites this property over time. The write never
+                // touches NiGeometryData, so revisionID does not move and this re-extract is never
+                // triggered again — the values above would freeze at capture. Flag it so the
+                // per-frame visit re-reads them (refreshAnimatedMaterial).
+                e.matAnimated = hasController(mp, NI::RTTIStaticPtr::NiAlphaController)
+                             || hasController(mp, NI::RTTIStaticPtr::NiMaterialColorController);
             }
 
             if (ps->alpha) {
@@ -869,6 +894,26 @@ namespace MGE::GeometryCache {
             e.textureName = static_cast<NI::SourceTexture*>(tex)->fileName;
             e.d3dTexture  = d3d;
             registerTextureName(tex);
+        }
+
+        // Animated material re-read — the per-frame twin of refreshAnimatedTexture, for shapes whose
+        // NiMaterialProperty carries a NiAlphaController / NiMaterialColorController (e.matAnimated).
+        //
+        // Deliberately NOT a full extractMaterial: that re-resolves every texture map, re-registers
+        // texture names (which crosses the produce-worker / MAIN boundary — see the registerTextureName
+        // threading note) and re-derives the emissive gain from the scene's lights. None of that can
+        // have changed, and doing it per frame on every enchanted item would be a real cost. This
+        // touches the four material colours and nothing else.
+        void refreshAnimatedMaterial(CachedGeometry& e, NI::TriBasedGeometry* geom) {
+            auto* ps = reinterpret_cast<NI::PropertyState*>(geom->propertyState);
+            if (!ps || !ps->material) return;
+            const auto* mp = ps->material;
+            e.matDiffuse[0]  = mp->diffuse.r;  e.matDiffuse[1]  = mp->diffuse.g;
+            e.matDiffuse[2]  = mp->diffuse.b;  e.matDiffuse[3]  = mp->alpha;
+            e.matAmbient[0]  = mp->ambient.r;  e.matAmbient[1]  = mp->ambient.g;
+            e.matAmbient[2]  = mp->ambient.b;
+            e.matEmissive[0] = mp->emissive.r; e.matEmissive[1] = mp->emissive.g;
+            e.matEmissive[2] = mp->emissive.b;
         }
 
         // Vertex layout matching MorrowindVertIn (depth/shadow VS input).
@@ -1884,6 +1929,28 @@ namespace MGE::GeometryCache {
             }
         }
 
+        // Capture-time NiVisController binding — the visibility twin of bindSwitchOwner, and needed
+        // for the same reason: the flag lives on an ancestor the cache stops visiting the moment it
+        // is set, so nothing downstream can notice. Record the nearest owner (the shape itself
+        // counts — a controller may target the NiTriShape directly) so a later frame can ask "has
+        // your owner been hidden?" without re-walking. Bounded by kMaxParentDepth like every other
+        // climb here; called once per entry at capture, alongside bindSwitchOwner.
+        void bindVisOwner(CachedGeometry& e, NI::AVObject* geom) {
+            e.visOwner = nullptr;
+            if (hasController(geom, NI::RTTIStaticPtr::NiVisController)) {
+                e.visOwner = geom;      // pinned by g_geomRefs — the one owner needing no vtable guard
+                return;
+            }
+            NI::Node* p = geom->parentNode;
+            for (int depth = 0; p && depth < kMaxParentDepth; ++depth) {
+                if (hasController(p, NI::RTTIStaticPtr::NiVisController)) {
+                    e.visOwner = p;
+                    return;
+                }
+                p = p->parentNode;
+            }
+        }
+
         // Offscreen shadow-caster PRE-DISTANCE predicate — a byte-for-byte mirror of the filter in
         // renderprocess.cpp buildGeometryDrawLists' offscreen re-emit loop, MINUS the per-frame parts
         // (distance, visible-set, suppressedFrame, want-flags), which the consumer keeps. It reads only
@@ -1919,6 +1986,8 @@ namespace MGE::GeometryCache {
             else         g_fpKeys.erase(key);
             if (e.switchOwner) g_switchKeys.insert(key);
             else               g_switchKeys.erase(key);
+            if (e.visOwner) g_visKeys.insert(key);
+            else            g_visKeys.erase(key);
         }
 
         void visitGeometry(NI::TriBasedGeometry* geom, bool inCharacter) {
@@ -1999,6 +2068,9 @@ namespace MGE::GeometryCache {
                 // NiSwitchNode variant binding (day/night window glow). Sky is exempt: the sky walk
                 // has its own visibility rules and carries no switch variants.
                 if (!g_walkingSky) bindSwitchOwner(e, geom);
+                // NiVisController binding (animated hide/show). Sky is exempt for the same reason
+                // as the switch binding: the sky walk has its own visibility rules.
+                if (!g_walkingSky) bindVisOwner(e, geom);
                 e.mirrored = computeMirrored(e);                    // winding flip for depth/shadow
             } else {
                 auto& e = it->second;
@@ -2120,6 +2192,12 @@ namespace MGE::GeometryCache {
                         }
                     }
                 }
+                // Animated material (NiAlphaController / NiMaterialColorController). Placed OUTSIDE
+                // the skinned/non-skinned split because both kinds carry them — the census's own
+                // examples are creature meshes (spriggan_summon, were_morph) — and outside the
+                // else-if chains inside them because a shape can be flip-book AND alpha-animated,
+                // which magic VFX routinely are. Idempotent after a re-extract, so order is free.
+                if (e.matAnimated) refreshAnimatedMaterial(e, geom);
                 // Winding flip for depth/shadow. The sign is a pure function of the
                 // world/bone transform, so recompute only when that changed (skinned
                 // and inCharacter paths re-derive every frame; the static path's
@@ -2855,6 +2933,37 @@ namespace MGE::GeometryCache {
             }
         }
 
+        // NiVisController pass (animated hide/show). Identical failure to the switch pass above and
+        // fixed the same way: the controller keys appCulled on its target, walk() early-returns on
+        // an appCulled node, and from then on NOTHING visits the entry — while the eviction sweep's
+        // chain climb keeps voting ALIVE (it is still parented) and the mover re-emit loop keeps
+        // shipping it every frame from the cache, independently of the visible set. The dwarven
+        // specter's body outlived its own death animation this way, frozen in its last pose beside
+        // the ash pile MW had already swapped in, until the cell was purged.
+        //
+        // Testing appCulled generally would be wrong — MGE app-culls roots of its own (MW-ONLY-UI
+        // suppression, the FP1b arm root) and the inactive-POV player body is app-culled while
+        // enabled. This tests ONLY nodes that carry a NiVisController, found inside the object's
+        // own NIF at capture, so none of that is reachable from here.
+        //
+        // Reuses suppressedFrame, which every consumer already honours; the stamp is per-frame, so
+        // the controller keying the node back ON un-hides it by simply not being stamped again.
+        // Runs on the tiny g_visKeys set. visOwner is a raw engine pointer: an ANCESTOR owner is
+        // vtable-guarded exactly like switchOwner, while an owner that IS the shape is pinned by
+        // g_geomRefs and needs no guard.
+        for (uint32_t key : g_visKeys) {
+            auto it = g_cache.find(key);
+            if (it == g_cache.end()) continue;
+            auto& e = it->second;
+            if (e.visOwner != reinterpret_cast<const void*>(key)
+                && !isLiveNodeVT(static_cast<const NI::Node*>(e.visOwner))) {
+                continue;               // freed/recycled ancestor — leave it to the sweep
+            }
+            if (static_cast<const NI::AVObject*>(e.visOwner)->getAppCulled()) {
+                e.suppressedFrame = g_frame;
+            }
+        }
+
         // Switch-variant state probe. Reports the CAPTURED SHADING INPUTS of every switch-bound
         // entry, not just which branch it belongs to — the day/night window bug turned out NOT to
         // be variant selection (the live shape draws, correctly textured and UV-animated) but the
@@ -3534,6 +3643,7 @@ namespace MGE::GeometryCache {
                     g_skyKeys.erase(it->first);           //   derived membership set
                     g_fpKeys.erase(it->first);
                     g_switchKeys.erase(it->first);
+                    g_visKeys.erase(it->first);
                     it = g_cache.erase(it);
                 } else {
                     // KEPT: collect near-eye plain-static shadow casters for the Forge feed's
@@ -3792,6 +3902,7 @@ namespace MGE::GeometryCache {
         g_skyKeys.clear();
         g_fpKeys.clear();
         g_switchKeys.clear();        // switchOwner points at engine nodes this purge invalidates
+        g_visKeys.clear();           // visOwner likewise
         g_nearStaticCasters.clear(); // stale snapshot (find-guarded anyway); rebuilt next sweep
         g_nearAlphaCasters.clear();
         g_geomRefs.clear();   // NI::Pointer dtors → DecRef every shape we were pinning
@@ -3831,6 +3942,7 @@ namespace MGE::GeometryCache {
             g_skyKeys.erase(key);
             g_fpKeys.erase(key);
             g_switchKeys.erase(key);
+            g_visKeys.erase(key);
             it = g_cache.end();
         }
 
@@ -3917,6 +4029,11 @@ namespace MGE::GeometryCache {
                 --e.dynamicHint;
             }
         }
+        // Animated material, same rule as the walk's cached branch — and, as with the flip book,
+        // THIS is the copy that matters in normal play: under the Forge seam the refresh walk does
+        // not run, so ensureLive off the engine-classified visible set is the only per-frame visit
+        // a cached shape gets.
+        if (e.matAnimated) refreshAnimatedMaterial(e, geom);
         if (reclassified) updateDerivedMembership(key, e);
         return &e;
     }
