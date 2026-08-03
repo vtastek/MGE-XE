@@ -29,9 +29,12 @@ STRUCT(VSInput)
     DATA(uint,   MatAlphaBits, TEXCOORD5);
 };
 
-// Bit 29 of the packed instance word = this part is alpha-BLENDED (host: kSkinBlendBit). Bits
-// 0-15 texIndex, 16-23 alphaRef, 24-25 vColSource, 26-27 clampMode, 28 two-sided — 29 was free.
-#define SKIN_BLEND_BIT 0x20000000u
+// Bit 30 of the packed instance word = this part is alpha-BLENDED (host: kSkinBlendBit).
+// packTexAlpha owns bits 0-29: 0-15 texIndex, 16-23 alphaRef, 24-25 vColSource, 26-27 clampMode,
+// 28 two-sided, 29 ENCHANTED-ITEM GLOW. This bit was 29 until the glow took it, at which point
+// every enchanted opaque skinned part read as blended and OverlayIndex handed opaque.frag
+// asuint(matAlpha) as a decal slot — white armour. Path-private bits go 30, then 31.
+#define SKIN_BLEND_BIT 0x40000000u
 
 STRUCT(VSOutput)
 {
@@ -123,7 +126,11 @@ VSOutput VS_MAIN( VSInput In )
     Out.MatAmbient  = float3(1.0f, 1.0f, 1.0f);
     Out.MatEmissive = float3(0.0f, 0.0f, 0.0f);
     Out.VColSource  = 2u;
-    Out.ClampMode   = (In.TexAlpha >> 26u) & 0x3u;   // MW texture address mode (see opaque.vert)
+    // Bits 26-29, the same four opaque.vert forwards: address mode (0-1), two-sided (2, always 0
+    // here — skinned two-sidedness rides blendFlags into its own PSO), enchanted-item glow (3).
+    // Taking only two bits used to drop the glow on the skinned path, which is the ONE path
+    // enchanted armour and clothing actually travel.
+    Out.ClampMode   = (In.TexAlpha >> 26u) & 0xFu;   // MW texture address mode (see opaque.vert)
     // Opaque skinned keeps OverlayIndex 0 — opaque.frag reads this slot as a terrain DECAL_1
     // bindless index and a non-zero value there would sample gTextures[asuint(matAlpha)], far
     // outside the array. Only a BLENDED part (drawn by alpha.frag / alphashadowdepth.frag, which

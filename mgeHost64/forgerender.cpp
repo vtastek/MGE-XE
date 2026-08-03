@@ -1764,11 +1764,17 @@ namespace {
     // MaterialProperty alpha, and there is no room left in the packed word for a float. Shared by
     // EVERY skinned layout (main, FP, shadow) because they all bind the one skinned.vert.
     constexpr uint32_t kSkinInstU32 = 3;
-    // Bit 29 of the packed word = BLENDED (must match SKIN_BLEND_BIT in skinned.vert.fsl). Set it
+    // Bit 30 of the packed word = BLENDED (must match SKIN_BLEND_BIT in skinned.vert.fsl). Set it
     // ONLY where the draw will be consumed by alpha.frag / alphashadowdepth.frag: it makes
     // skinned.vert forward matAlpha through OverlayIndex, which opaque.frag would read as a
     // terrain-decal bindless slot.
-    constexpr uint32_t kSkinBlendBit = 1u << 29;
+    //
+    // It was bit 29 until the enchanted-item glow claimed that bit inside packTexAlpha, which every
+    // skinned pack calls before OR-ing this on — so an ENCHANTED OPAQUE skinned part (armour and
+    // clothing are skinned; that is the whole enchantable set) read as blended, handed opaque.frag
+    // asuint(matAlpha) as a decal slot, and drew WHITE. Bits 30-31 are the private half of this
+    // word: packTexAlpha owns 0-29 and path-private overlays take from the top down.
+    constexpr uint32_t kSkinBlendBit = 1u << 30;
 
     // Assign one part's palette slot within the bone windows. EVERY pass that walks the skinned
     // blob — shadow-caster collection, depth prepass, colour, FP — must call this with its own
@@ -3068,6 +3074,13 @@ namespace {
         // per-path change and no call-site edit. Paths that pass a literal address mode (sky,
         // terrain, distant land) can never set it, which is correct: none of them can be enchanted.
         // opaque.vert forwards it as ClampMode bit3; enchantglow.h.fsl reads it.
+        //
+        // THE WHOLE WORD, because a private bit added downstream once collided with one of these
+        // and the only symptom was white armour (see kSkinBlendBit):
+        //   0-15 texIndex   16-23 alphaRef*255   24-25 vColSource   26-27 clampMode
+        //   28 two-sided    29 enchanted-item glow                  30-31 FREE
+        // This packer owns 0-29 on every path. A path that needs a bit of its own OR-s it in after
+        // the call and must take it from the TOP (30, then 31) — never from a gap in the middle.
         return tex | (aref << 16) | ((vColSource & 0x3u) << 24) | ((clampMode & 0x3u) << 26)
              | (twoSided ? (1u << 28) : 0u)
              | ((clampMode & IPC::kTexFlagEnchantGlow) ? (1u << 29) : 0u);
@@ -14562,6 +14575,29 @@ namespace ForgeRender {
             // count against plenty of free bytes means the first-fit allocator is fragmenting and
             // a grow can be refused while the arena looks empty.
             {
+                // WHITE-TEXTURE TRIAGE. Slots a draw actually REFERENCED this window that are still
+                // the host's default white — geometry drawn untextured while nothing in either log
+                // complains. Slot 0 is the legitimate textureless case and is excluded; any other
+                // slot here means the client resolved a name to it and the DDS never became a
+                // texture (upload dropped, parse failed, or the batch never arrived). Reads the
+                // bitset packTexAlpha already maintains, so it costs one pass per 300 frames, and
+                // it must run BEFORE the clearing loop below. Pairs with the client's [tex-census]
+                // line, which is what maps the slot back to a texture NAME.
+                if (g_live.pDefaultWhite) {
+                    char list[220]; int n = 0; unsigned whites = 0;
+                    for (unsigned s = 1; s < (unsigned)MAX_TEXTURES; ++s) {
+                        if (!(g_texSeenBits[s >> 5] & (1u << (s & 31u)))) { continue; }
+                        if (g_live.pTextures[s] != g_live.pDefaultWhite) { continue; }
+                        ++whites;
+                        if (n < 200) {
+                            n += snprintf(list + n, sizeof(list) - (size_t)n, "%s%u", n ? "," : "", s);
+                        }
+                    }
+                    if (whites) {
+                        LOG::logline("!! [forge] %u referenced slot(s) still DEFAULT WHITE: %s",
+                                     whites, list);
+                    }
+                }
                 // Unique slots referenced since the LAST heartbeat, i.e. the working set over a
                 // 300-frame window — the number that is actually comparable to client residency
                 // (a per-frame count would undercount a set the player pans across). Cleared here,
@@ -15390,7 +15426,14 @@ namespace ForgeRender {
                 if (uploadFlipSlice(R, hdr, dds)) { ++built; }
                 continue;
             }
-            if (hdr.slot == 0 || hdr.slot >= kMaxTextures) { continue; }   // 0 reserved; OOB dropped
+            if (hdr.slot == 0 || hdr.slot >= kMaxTextures) {
+                // Was a silent drop: the texture simply never appeared and the geometry drew white
+                // with nothing said anywhere. built/count still tallies, so even the DONE line reads
+                // healthy. (0 is reserved for the default white and is never uploaded.)
+                LOGF(eWARNING, "[forge] tex upload DROPPED: slot %u out of range [1,%u)",
+                     hdr.slot, kMaxTextures);
+                continue;
+            }
             DdsInfo info = parseDds(dds, hdr.byteLen);
             if (!info.ok) {
                 LOGF(eWARNING, "[forge] tex slot %u: unsupported DDS format (slot stays white)", hdr.slot);
@@ -15413,7 +15456,12 @@ namespace ForgeRender {
             tld.pDesc = &td;
             addResource(&tld, nullptr);
             waitForAllResourceLoads();
-            if (!tex) { continue; }
+            if (!tex) {
+                LOGF(eWARNING, "[forge] tex slot %u: addResource gave no texture for %ux%u fmt=%u"
+                     " mips=%u (slot stays white)", hdr.slot, info.width, info.height,
+                     (unsigned)info.fmt, info.mipLevels);
+                continue;
+            }
 
             // Upload the tightly-packed DDS mip chain into the (row-aligned) GPU texture.
             const uint8_t* src = dds + info.dataOffset;
@@ -15426,7 +15474,15 @@ namespace ForgeRender {
             for (uint32_t m = 0; m < info.mipLevels; ++m) {
                 TextureSubresourceUpdate s = upd.getSubresourceUpdateDesc(m, 0);
                 const uint32_t mipBytes = s.mRowCount * s.mSrcRowStride;
-                if (src + mipBytes > ddsEnd) { break; }   // truncated; stop copying mips
+                if (src + mipBytes > ddsEnd) {
+                    // Truncated: stop copying mips. Loud because a break at m == 0 leaves the WHOLE
+                    // texture uninitialised, which reads on screen as an untextured surface and is
+                    // indistinguishable from a slot that never uploaded at all.
+                    LOGF(eWARNING, "[forge] tex slot %u: DDS short at mip %u of %u (%ux%u,"
+                         " %u bytes) — remaining mips not uploaded", hdr.slot, m, info.mipLevels,
+                         info.width, info.height, hdr.byteLen);
+                    break;
+                }
                 for (uint32_t row = 0; row < s.mRowCount; ++row) {
                     std::memcpy(s.pMappedData + (size_t)row * s.mDstRowStride,
                                 src + (size_t)row * s.mSrcRowStride, s.mSrcRowStride);

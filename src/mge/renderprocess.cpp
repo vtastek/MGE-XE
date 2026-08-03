@@ -2060,15 +2060,49 @@ namespace {
     // the normal relative to the surface (green<->purple in F12 mode 8), which mis-lights the shape.
     // Called from BOTH the opaque (STATIC) and sorted-alpha (ALPHA) emit so a wall's sign can be
     // compared directly to a tapestry's.
+    // THREAD SAFETY FOR BOTH PROBES BELOW. The emit helpers run on the produce worker AND on the
+    // main thread (that is why resolveTextureSlot holds g_texResidencyMx at all), so a `static`
+    // container inside one of them is shared mutable state. Unsynchronized, it corrupts the heap
+    // under cell-change churn — when the set of names turns over fastest — and the access violation
+    // then lands somewhere else entirely, on whichever thread next touches the damaged block.
+    // Each probe is ARMED until it has said everything it has to say; the lock is taken only while
+    // armed, so once disarmed a call is one relaxed atomic load and a predicted branch.
+    std::mutex            g_diagProbeMx;
+    std::atomic<bool>     g_normDiagArmed{true};
+    std::atomic<bool>     g_texCensusArmed{true};
+
     void diagWorldDet(const char* tag, const char* name, const float* w) {
+        if (!g_normDiagArmed.load(std::memory_order_relaxed)) { return; }
         static std::unordered_set<std::string> s_seen;
         std::string key = std::string(tag) + "|" + (name ? name : "(null)");
-        if (!s_seen.insert(key).second || s_seen.size() > 128) return;
+        std::lock_guard<std::mutex> lk(g_diagProbeMx);
+        if (!s_seen.insert(key).second) { return; }
+        if (s_seen.size() >= 128) { g_normDiagArmed.store(false, std::memory_order_relaxed); }
         const float det = w[0] * (w[5]*w[10] - w[6]*w[9])
                         - w[1] * (w[4]*w[10] - w[6]*w[8])
                         + w[2] * (w[4]*w[9]  - w[5]*w[8]);
         LOG::logline(">> [norm-diag] %s %s det=%.3f %s", tag, name ? name : "(null)",
                      det, det < 0.0f ? "MIRRORED" : "normal");
+    }
+
+    // WHITE-TEXTURE TRIAGE (TEMP): a census of what each draw path actually SHIPS as its bindless
+    // slot. resolveTextureSlot only speaks up on its loud failures (not found / too large /
+    // thrashing); a draw can still reach the host with slot 0 = host default white through routes
+    // that say nothing at all — a null or empty texture name, a name-gated call site that never
+    // asks the resolver, or a cached SlotInfo holding a stale 0. This prints one line per unique
+    // (path, name, slot) triple and then switches itself off, so the steady-state cost on the
+    // produce path is one predicted branch. A name that reappears under a DIFFERENT slot prints
+    // again, which is exactly the LRU-recycle signal. Pairs with the host's "referenced slot(s)
+    // still DEFAULT WHITE" line: this side maps name -> slot, that side maps slot -> white.
+    void diagTexSlot(const char* tag, const char* name, std::uint32_t slot, bool hasD3D, bool glow) {
+        if (!g_texCensusArmed.load(std::memory_order_relaxed)) { return; }
+        static std::unordered_set<std::string> s_seen;
+        std::string key = std::string(tag) + "|" + (name ? name : "(null)") + "|" + std::to_string(slot);
+        std::lock_guard<std::mutex> lk(g_diagProbeMx);
+        if (!s_seen.insert(key).second) { return; }
+        if (s_seen.size() >= 600) { g_texCensusArmed.store(false, std::memory_order_relaxed); }
+        LOG::logline(">> [tex-census] %-5s slot=%-4u d3d=%d glow=%d %s", tag, slot,
+                     hasD3D ? 1 : 0, glow ? 1 : 0, name ? name : "(null)");
     }
 
     // FP1a: `dst` defaults to the main-pass scratch; buildFPDrawLists redirects the
@@ -2082,6 +2116,7 @@ namespace {
             // would std::string(nullptr) on the name lookup, so short-circuit it.
             item.texIndex = e.textureName
                 ? resolveCachedSlot(e.textureName, si.baseNamePtr, si.baseSlot, si.baseEpoch) : 0u;
+            diagTexSlot("STAT", e.textureName, item.texIndex, e.d3dTexture != nullptr, e.enchantGlow);
             // Terrain DECAL_1 overlay (second land texture). resolveTextureSlot ships its DDS
             // bytes the same way as the base map. Non-landscape / single-texture draws get 0,
             // which gates the frag's splat off → byte-for-byte unchanged.
@@ -2160,6 +2195,7 @@ namespace {
             item.numBones = e.numBones;
             item.mirror   = e.mirrored ? 1u : 0u;
             item.texIndex = resolveCachedSlot(e.textureName, si.baseNamePtr, si.baseSlot, si.baseEpoch);
+            diagTexSlot("SKIN", e.textureName, item.texIndex, e.d3dTexture != nullptr, e.enchantGlow);
             item.alphaRef = e.alphaTest ? e.alphaRef : 0.0f;     // alpha-test cutout (0 = no test)
             // Address mode + the enchanted-item glow bit (IPC::kTexFlagEnchantGlow). Skinned parts
             // are how ENCHANTED ARMOUR AND CLOTHING glow — they are body parts, not rigid props.
@@ -2260,6 +2296,7 @@ namespace {
             item.matAlpha   = e.matDiffuse[3];   // FFE per-draw fade (same source as emitAlphaDraw)
             for (int s = 0; s < ns; ++s) {
                 const std::uint32_t tex = resolveTextureSlot(st[s].name);   // bindless slot (0 = white)
+                diagTexSlot(s == 0 ? "MM0" : "MMn", st[s].name, tex, true, e.enchantGlow);
                 item.stages[s] = IPC::packMMStage(tex, st[s].uv, st[s].op, st[s].clamp);
             }
             const std::size_t at = g_multiMapScratch.size();
@@ -2285,6 +2322,7 @@ namespace {
             item.slot      = si.slot;
             diagWorldDet("ALPHA", e.textureName, e.worldTransformD3D);
             item.texIndex  = resolveCachedSlot(e.textureName, si.baseNamePtr, si.baseSlot, si.baseEpoch);
+            diagTexSlot("ALPH", e.textureName, item.texIndex, e.d3dTexture != nullptr, e.enchantGlow);
             item.srcBlend  = e.srcBlend;
             item.destBlend = e.destBlend;
             item.alphaRef  = e.alphaTest ? e.alphaRef : 0.0f;
