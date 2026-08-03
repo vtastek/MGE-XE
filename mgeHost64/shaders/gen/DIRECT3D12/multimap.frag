@@ -2005,9 +2005,19 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
 
 
     uint aoFlags = (uint)(gFrameData.debugParams.w + 0.5f);
+
+
+
+
+
+
+
+
+    bool inReflect = (gFrameData.gReflWaterClip.z != 0.0f);
     float2 aoUv = In.Position.xy * gShadowParams.screenAlloc.zw;
-    float4 aoSample = SampleTex2D(gAO, gSamplerAnisotropic, aoUv);
-    if ((aoFlags & 2u) != 0u) { N = normalize(aoSample.rgb); }
+    float4 aoSample = inReflect ? float4(0.0f, 0.0f, 0.0f, 1.0f)
+                                : SampleTex2D(gAO, gSamplerAnisotropic, aoUv);
+    if ((aoFlags & 2u) != 0u && !inReflect) { N = normalize(aoSample.rgb); }
 
 
     float ndl = saturate(dot(N, -gFrameData.sunDir.xyz));
@@ -2024,8 +2034,10 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
 
 
 
+
+
     int2 maskPx = int2(In.Position.xy);
-    if (gShadowParams.slotBits.x != 0u) { maskPx = shadowMaskPixel(In.Position); }
+    if (!inReflect && gShadowParams.slotBits.x != 0u) { maskPx = shadowMaskPixel(In.Position); }
     {
         uint nLights = (uint)gLights.lightParams.x;
         float reachK = gLights.lightParams.y;
@@ -2033,7 +2045,10 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
 
 
         int nfTilesX = (int)gLights.froxelDimsNear.x;
-        bool clustered = (nfTilesX > 0);
+
+
+
+        bool clustered = (nfTilesX > 0) && !inReflect;
         uint fbase = 0u;
         if (clustered)
         {
@@ -2083,7 +2098,10 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
 
 
                 uint slotP1 = (uint)gLights.lights[i * 3u + 2u].w;
-                if (slotP1 != 0u)
+
+
+
+                if (slotP1 != 0u && !inReflect)
                 {
 
 

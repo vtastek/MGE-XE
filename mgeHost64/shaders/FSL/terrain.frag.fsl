@@ -157,12 +157,42 @@ float4 PS_MAIN( VSOutput In )
 
     float3 normal = normalize(In.Normal);
     float  sunVis = sunShadowVisibility(In.WorldPos, normal);
+
+    // GTAO on the ground. Terrain was already an AO OCCLUDER — terrainRecordDepth is the last thing
+    // in the Z-prepass and the AO dispatch reads that depth (opaque.srt.h says so where it documents
+    // gSceneLinDepth) — but it was never a RECEIVER. So a crate got its contact darkening while the
+    // ground it stands on got none: half a contact shadow, which reads worse than none at all, and
+    // which went from a ticked-box curiosity to always-visible when AO became on-by-default.
+    //
+    // AMBIENT ONLY, exactly as opaque.frag does it (the scene-walk oracle — sun and point diffuse are
+    // untouched, so an occluded surface drops toward ambient and no further). This is also what keeps
+    // it from fighting skyAmbFactor's SH2 sky AO: that one occludes the sky's own contribution at
+    // world scale (a valley floor vs a ridge top), GTAO occludes at contact scale. Different scales,
+    // same term, and they multiply.
+    //
+    // gAO is ALLOCATION-sized — every screen RT is allocated at the render-scale ceiling and the frame
+    // draws into a sub-viewport — so the uv scale is screenAlloc.zw (1/ALLOC), NOT debugParams.yz
+    // (1/RENDER), which would stretch the buffer by the scale ratio.
+    //
+    // inReflect (hoisted up from the light block below, which also needs it): gAO is a MAIN-VIEW
+    // screen-space buffer, so in the 1024² mirror it would be indexed at an unrelated screen location.
+    // Forced to 1 = no darkening there, same tag opaque.frag/multimap.frag take.
+    //
+    // Bit 1 (bent normal) is deliberately NOT wired here: it is a separate look feature, it is off by
+    // default, and this normal also feeds the MSM bias and the point-light Lambert below.
+    bool   inReflect = (gFrameData.gReflWaterClip.z != 0.0f);
+    uint   aoFlags   = (uint)(gFrameData.debugParams.w + 0.5f);
+    float4 aoSample  = inReflect ? float4(0.0f, 0.0f, 0.0f, 1.0f)
+                                 : SampleTex2D(gAO, gSamplerAnisotropic,
+                                               In.Position.xy * gShadowParams.screenAlloc.zw);
     // SH1: distant ambient gets the same sky direction the near paths do. Landed together with them
     // on purpose — giving near geometry directional ambient while the distant paths stayed flat puts
     // a visible seam across the near/far handover on the same building.
+    float3 amb = gFrameData.lodSunAmb.rgb * skyAmbFactor(normal, In.WorldPos);
+    if ((aoFlags & 1u) != 0u) { amb *= aoSample.a; }   // "AO enable" tick (debugParams.w bit0)
     float3 result = albedo
                   * (gFrameData.sunCol.rgb * saturate(dot(-gFrameData.sunDir.xyz, normal)) * sunVis
-                     + gFrameData.lodSunAmb.rgb * skyAmbFactor(normal, In.WorldPos));
+                     + amb);
 
     // Point lights. Terrain is the ONE surface that spans the whole near↔far handoff — the ground
     // runs from underfoot to the horizon in a single draw — so unlike every other path it cannot be
@@ -186,7 +216,7 @@ float4 PS_MAIN( VSOutput In )
     // so it cannot reach any fragment on the far side of the boundary — both lists agree AT the
     // boundary. Handoff 0 (dedup off) ⇒ distant everywhere ⇒ byte-identical to before this landed.
     float3 pointDiffuse = float3(0.0f, 0.0f, 0.0f);
-    bool   inReflect    = (gFrameData.gReflWaterClip.z != 0.0f);
+    // (inReflect is declared up with the AO sample, which needs it first.)
     // Which gShadowMask texel is OURS under MSAA (shadowreceive.h.fsl). The ground is the surface
     // every silhouette is drawn AGAINST, so it takes the other half of the artifact: its pixels along
     // an NPC's outline read the NPC's shadow state. Resolved here, at top level — it takes derivatives
@@ -324,6 +354,15 @@ float4 PS_MAIN( VSOutput In )
 
     // F12 distance grayscale parity (debugParams.x 1/2), matching opaque.frag / distantland.frag.
     uint dbg = (uint)(gFrameData.debugParams.x + 0.5f);
+    // AO buffer views (3/4), same branches as opaque.frag / multimap.frag. Added with the AO
+    // receive above: the ground is most of the screen, so without these the AO debug view was
+    // mostly normally-shaded terrain — i.e. the one view you'd use to judge terrain AO couldn't
+    // show it. mode 4 displays the buffer's bent normal even though terrain doesn't shade with
+    // it; this is a view of the BUFFER, not of what consumed it.
+    if (dbg == 3u || dbg == 4u) {
+        if (dbg == 4u) { RETURN(float4(aoSample.rgb, 1.0f)); }   // mode 4: bent normal (raw, no remap)
+        float v = aoSample.a; RETURN(float4(v, v, v, 1.0f));      // mode 3: AO/visibility
+    }
     if (dbg == 1u || dbg == 2u) {
         float dist = length(In.WorldPos - gFrameData.eyePos.xyz);
         float g = saturate(dist * (1.0f / 8192.0f));

@@ -1406,6 +1406,11 @@ namespace {
         Shader*        pMultiMapShader = nullptr;
         Pipeline*      pMultiMapPipeline = nullptr;        // FRONT_FACE_CCW (non-mirrored)
         Pipeline*      pMultiMapPipelineMirror = nullptr;  // FRONT_FACE_CW (mirrored world)
+        // IR5 reflection pair: same shader/layout/formats, depth GEQUAL + WRITE. The reflect pass
+        // binds a freshly cleared depth buffer and runs no Z-prepass, so the CMP_EQUAL colour PSOs
+        // above fail every pixel there. Exactly the reason the FP opaque pair exists.
+        Pipeline*      pMultiMapReflectPipeline = nullptr;        // FRONT_FACE_CCW
+        Pipeline*      pMultiMapReflectPipelineMirror = nullptr;  // FRONT_FACE_CW
         // Tier 1b Z-prepass: multimap.vert + depthonly_mm.frag (own VSOutput, base-stage alpha
         // test), GEQUAL + depthWrite, 0 RTs. Multi-map COLOUR pipelines flip to CMP_EQUAL + no-write.
         Shader*        pMultiMapDepthShader = nullptr;
@@ -5056,6 +5061,28 @@ namespace {
                 return false;
             }
 
+            // IR5: multi-map REFLECT PSOs — same shader/layout/formats, depth GEQUAL + WRITE.
+            // The reflect pass clears depth on bind and has no Z-prepass to test EQUAL against,
+            // so the colour pair above would reject every pixel. Same reasoning (and the same
+            // 12 lines) as the FP opaque pair.
+            {
+                DepthStateDesc mmReflDepth = {};
+                mmReflDepth.mDepthTest = true;
+                mmReflDepth.mDepthWrite = true;
+                mmReflDepth.mDepthFunc = CMP_GEQUAL;
+                mg.pDepthState = &mmReflDepth;
+                mg.pRasterizerState = &mmRaster;
+                addPipeline(R, &mmPd, &g_live.pMultiMapReflectPipeline);
+                mg.pRasterizerState = &mmRasterMirror;
+                addPipeline(R, &mmPd, &g_live.pMultiMapReflectPipelineMirror);
+                mg.pRasterizerState = &mmRaster;    // restore for any later use of mmPd
+                mg.pDepthState = &mmDepth;
+                if (!g_live.pMultiMapReflectPipeline || !g_live.pMultiMapReflectPipelineMirror) {
+                    std::printf("[forge] addPipeline(multimap reflect) FAILED\n");
+                    return false;
+                }
+            }
+
             // Tier 1b multi-map Z-prepass: multimap.vert + depthonly_mm.frag (own VSOutput,
             // base-stage alpha test), GEQUAL + depthWrite, 0 RTs. Same mvl → SV_Position matches
             // the colour pass's EQUAL test.
@@ -7683,6 +7710,7 @@ namespace {
                                     // that matrix to reflect its near scene.
     uint32_t g_lastReflNearDrawn = 0;   // heartbeat: reflected near opaque draws (indirect + inline)
     uint32_t g_lastReflSkinDrawn = 0;   // heartbeat: reflected skinned draws
+    uint32_t g_lastReflMMDrawn   = 0;   // heartbeat: reflected multi-map draws (heads, glow lamps, trim)
     uint32_t  g_debugMode = 0;         // F12 debug view: 0=normal, 1=depth, 2=scatter (written to FrameData.debugParams.x)
 
     // ---- Dev overlay (Forge IUI) state ----
@@ -7778,7 +7806,10 @@ namespace {
     // from them plus the F12 AO views), so baseline-thinning still holds — both off = no AO compute
     // at all — while it is no longer possible to tick one and get a STALE pAOBlur, which is what the
     // old separate dispatch flag made easy and which read as black AO rather than as no AO.
-    bool  g_aoEnable         = false;   // AO visibility modulates ambient (also arms the AO dispatch)
+    // ON by default: AO is a shipped feature, not a dev A/B. There is no ini or IPC path for any
+    // g_ao* knob, so this declaration IS the persistence story — the host starts every session with
+    // AO live and nothing needs ticking. The checkbox stays, as an A/B.
+    bool  g_aoEnable         = true;    // AO visibility modulates ambient (also arms the AO dispatch)
     bool  g_bentNormalEnable = false;   // use the AO bent normal as the lighting normal (A/B; off = geometric N)
     bool  g_ambientWhite     = false;   // debug: force ambient term to 1.0 so AO darkening is visible (pair w/ Diffuse=0)
 
@@ -9197,6 +9228,12 @@ namespace ForgeRender {
         const void*     skinnedBlob;
         uint32_t        skinnedCount;
         uint32_t        skinnedBytes;
+        // IR5: the multi-map blob (dark/detail/glow parts — NPC HEADS carry a glow map, so the
+        // head replacer routes every head here). Same record-only deal as skinned: the Tier 1b
+        // Z-prepass already filled pMMWorldsBuf + pInstanceBufMM from this very blob.
+        const void*     multiMapBlob;
+        uint32_t        multiMapCount;
+        uint32_t        multiMapBytes;
     };
     void reflRecordNear(const ReflNearInput& in);                           // IR3 reflected near scene
     void heroWriteUvOffsets(float* fd, double simT);                        // Phase 3 hero UV anim (defined w/ hero globals)
@@ -12275,6 +12312,7 @@ namespace ForgeRender {
         g_lastReflSkyDrawn = 0;   // Phase 0 panel: 0 unless the reflection pass runs below
         g_lastReflNearDrawn = 0;
         g_lastReflSkinDrawn = 0;
+        g_lastReflMMDrawn   = 0;
         // IR1: the pass no longer requires a SKY LIST. It used to, and that made INTERIORS worse than
         // useless rather than merely empty: an interior walks no sky root, so skyCount == 0, so the
         // pass never ran — and pReflectColor is cleared at BIND, *inside* the pass, then left resting
@@ -12498,6 +12536,9 @@ namespace ForgeRender {
                 ni.skinnedBlob  = skinnedBlob;
                 ni.skinnedCount = skinnedCount;
                 ni.skinnedBytes = skinnedBytes;
+                ni.multiMapBlob  = multiMapBlob;
+                ni.multiMapCount = multiMapCount;
+                ni.multiMapBytes = multiMapBytes;
                 reflRecordNear(ni);
             }
             gpuPhaseEnd(kGpuPhaseReflGeo);
@@ -14562,11 +14603,11 @@ namespace ForgeRender {
                              lf[56], lf[57], lf[58]);   // lodEye = ABSOLUTE world eye (viewer start pos)
             }
             LOG::logline(">> [forge-hb] frame=%u drawn=%u skinned=%u(blend=%u) multimap=%u sky=%u alpha=%u(zpre=%u) dynamic=%u meshHigh=%u "
-                         "| refl sky=%u near=%u skin=%u "
+                         "| refl sky=%u near=%u skin=%u mm=%u "
                          "| record=%.2fms gpu=%.2fms (avg/frame over 300)",
                          g_renderFrame, drawn, skinnedDrawn, g_lastSkinAlphaDrawn, multiMapDrawn, skyDrawn, alphaDrawn,
                          g_lastAlphaPrepassDrawn, g_dynamicCount, g_meshHigh,
-                         g_lastReflSkyDrawn, g_lastReflNearDrawn, g_lastReflSkinDrawn,
+                         g_lastReflSkyDrawn, g_lastReflNearDrawn, g_lastReflSkinDrawn, g_lastReflMMDrawn,
                          g_recAccum / 300.0, g_gpuAccum / 300.0);
             // H2 pool occupancy (external audit PR #2). The arenas grow by doubling to a HARD cap
             // and then drop parts — i.e. objects go missing — so "how close are we" must be a
@@ -21639,7 +21680,8 @@ namespace ForgeRender {
         cmdEndDebugMarker(g_live.pCmd);
     }
 
-    // IR3: record the reflected NEAR scene (opaque + skinned) into the still-bound reflect targets.
+    // IR3: record the reflected NEAR scene (opaque + skinned + multi-map) into the still-bound
+    // reflect targets.
     // This is what an INTERIOR reflection is actually made of: indoors there is no sky and no distant
     // land, so without this the RT clears to transparent and the water frag resolves flat fog.
     // Outdoors it is the near-shore detail that only coarse DL used to stand in for.
@@ -21647,10 +21689,10 @@ namespace ForgeRender {
     // Bound to pPerFrameSetReflectGeo (water-plane mirror viewProj + below-water clip plane), so the
     // very buffers the main view already filled replay under a mirrored camera.
     //
-    // COLOUR PSOs ARE THE FIRST-PERSON PAIR (pFPOpaquePipeline / pFPSkinnedPipeline). They exist for
-    // exactly this situation — GEQUAL + depth WRITE against a freshly CLEARED depth buffer with no
-    // Z-prepass to test EQUAL against. The main colour PSOs (CMP_EQUAL, no depth write) would fail
-    // every pixel here.
+    // COLOUR PSOs ARE THE FIRST-PERSON PAIR (pFPOpaquePipeline / pFPSkinnedPipeline), plus multi-map's
+    // own pMultiMapReflectPipeline pair. They exist for exactly this situation — GEQUAL + depth WRITE
+    // against a freshly CLEARED depth buffer with no Z-prepass to test EQUAL against. The main colour
+    // PSOs (CMP_EQUAL, no depth write) would fail every pixel here.
     //
     // WINDING IS SWAPPED, NOT COPIED: the water-plane mirror has negative determinant, so it flips
     // triangle handedness on screen. A draw the main view renders with the CCW PSO needs the CW
@@ -21861,8 +21903,78 @@ namespace ForgeRender {
             }
         }
 
+        // --- multi-map (NPC heads, glow lamps, interior trim) ---------------------------------
+        // IR5. The client classifies a part as multi-map the moment it carries a dark, detail OR
+        // GLOW map (renderprocess.cpp), and the multimap branch wins over the static path — so a
+        // head replacer that gives every head a glow map takes every head out of the arena draw
+        // list and out of the dynamic-morph list. Without this walk the mirror simply has no heads
+        // in it, and no lamps or trim either.
+        //
+        // RECORD ONLY, exactly like the skinned walk above: the Tier 1b Z-prepass already filled
+        // pMMWorldsBuf[idx] and pInstanceBufMM[idx] from this same blob, so this walk must
+        // reproduce its cursor EXACTLY — same skip set, same order, idx = the same running count —
+        // or a head draws with a lamp's world matrix. Writing here would be equally wrong: the
+        // multi-map COLOUR loop re-walks these buffers after us and re-fills them identically,
+        // save for the enchanted-glow bit the prepass leaves zero. These are CPU-mapped upload
+        // buffers, so the GPU sees that last writer's version — which means reflected multi-map
+        // parts inherit the colour loop's glow bit for free, and correctly.
+        //
+        // Route C (blended) multi-map — Glow-in-the-Dahrk night windows — stays OUT of the mirror:
+        // its list really is built in the colour pass, which is the refactor tasks/forge-water.md
+        // warned about. Skipped here on the same kMMDrawFlagBlended test both other walks use, so
+        // the cursor stays in lockstep with them.
+        uint32_t mmDrawn = 0;
+        if (in.multiMapBlob && in.multiMapCount && in.multiMapBytes
+            && g_live.pMultiMapReflectPipeline && g_live.pMultiMapReflectPipelineMirror) {
+            // Same winding swap as the opaque/skinned pairs: the mirror matrix has negative
+            // determinant, so a draw the main pass renders CCW needs the CW PSO here.
+            Pipeline* const mmPSO[2] = {
+                g_reflNearSwapWinding ? g_live.pMultiMapReflectPipelineMirror : g_live.pMultiMapReflectPipeline,
+                g_reflNearSwapWinding ? g_live.pMultiMapReflectPipeline       : g_live.pMultiMapReflectPipelineMirror,
+            };
+            cmdBindPipeline(g_live.pCmd, mmPSO[0]);
+            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSetReflectGeo);
+            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerLightsSet);
+            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
+            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerBatchSetMM);   // single world window
+
+            const uint32_t haveMM = in.multiMapBytes / (uint32_t)sizeof(IPC::MultiMapDrawWire);
+            const uint32_t nMM = (in.multiMapCount < haveMM) ? in.multiMapCount : haveMM;
+            const IPC::MultiMapDrawWire* mmItems = (const IPC::MultiMapDrawWire*)in.multiMapBlob;
+            int boundMMMirror = 0;
+            for (uint32_t k = 0; k < nMM; ++k) {
+                if (mmDrawn >= kMaxMultiMap) { break; }   // matches the prepass/colour cap exactly
+                const IPC::MultiMapDrawWire& it = mmItems[k];
+                if (it.drawFlags & IPC::kMMDrawFlagBlended) { continue; }
+                const uint32_t slot = it.slot;
+                if (slot >= g_meshHigh || !g_meshes[slot].valid || !g_meshes[slot].multimap) { continue; }
+                const uint32_t idx = mmDrawn;
+
+                // Winding is picked from the part's own world determinant and then swapped, the
+                // same way the opaque walk picks it — NOT copied from the main pass's choice.
+                const int mirror = worldMirrored(it.world) ? 1 : 0;
+                if (mirror != boundMMMirror) {
+                    cmdBindPipeline(g_live.pCmd, mmPSO[mirror]);
+                    cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSetReflectGeo);
+                    cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerLightsSet);
+                    cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
+                    cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerBatchSetMM);
+                    boundMMMirror = mirror;
+                }
+
+                HostMesh& mm = g_meshes[slot];
+                Buffer*  vbs[2]     = { mm.vb, g_live.pInstanceBufMM };
+                uint32_t strides[2] = { (uint32_t)sizeof(IPC::GeomVertexWireMM), (uint32_t)(kMMInstU32 * sizeof(uint32_t)) };
+                cmdBindVertexBuffer(g_live.pCmd, 2, vbs, strides, nullptr);
+                cmdBindIndexBuffer(g_live.pCmd, mm.ib, INDEX_TYPE_UINT16, 0);
+                cmdDrawIndexedInstanced(g_live.pCmd, mm.indexCount, 0, 1, 0, idx);   // firstInstance=idx
+                ++mmDrawn;
+            }
+        }
+
         g_lastReflNearDrawn = nearDrawn;
         g_lastReflSkinDrawn = skinDrawn;
+        g_lastReflMMDrawn   = mmDrawn;
         cmdEndDebugMarker(g_live.pCmd);
     }
 
@@ -22583,6 +22695,8 @@ namespace ForgeRender {
         if (g_live.pInstanceBufMM)          { removeResource(g_live.pInstanceBufMM); }
         if (g_live.pMultiMapPipeline)       { removePipeline(R, g_live.pMultiMapPipeline); }
         if (g_live.pMultiMapPipelineMirror) { removePipeline(R, g_live.pMultiMapPipelineMirror); }
+        if (g_live.pMultiMapReflectPipeline)       { removePipeline(R, g_live.pMultiMapReflectPipeline); }
+        if (g_live.pMultiMapReflectPipelineMirror) { removePipeline(R, g_live.pMultiMapReflectPipelineMirror); }
         if (g_live.pMultiMapPrepassPipeline)       { removePipeline(R, g_live.pMultiMapPrepassPipeline); }
         if (g_live.pMultiMapPrepassPipelineMirror) { removePipeline(R, g_live.pMultiMapPrepassPipelineMirror); }
         if (g_live.pMultiMapShadowPipeline)            { removePipeline(R, g_live.pMultiMapShadowPipeline); }

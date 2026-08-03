@@ -1977,15 +1977,23 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
 
     float3 normal = normalize(In.Normal);
     float sunVis = sunShadowVisibility(In.WorldPos, normal);
+#line 183 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terrain.frag.fsl"
+    bool inReflect = (gFrameData.gReflWaterClip.z != 0.0f);
+    uint aoFlags = (uint)(gFrameData.debugParams.w + 0.5f);
+    float4 aoSample = inReflect ? float4(0.0f, 0.0f, 0.0f, 1.0f)
+                                 : SampleTex2D(gAO, gSamplerAnisotropic,
+                                               In.Position.xy * gShadowParams.screenAlloc.zw);
 
 
 
+    float3 amb = gFrameData.lodSunAmb.rgb * skyAmbFactor(normal, In.WorldPos);
+    if ((aoFlags & 1u) != 0u) { amb *= aoSample.a; }
     float3 result = albedo
                   * (gFrameData.sunCol.rgb * saturate(dot(-gFrameData.sunDir.xyz, normal)) * sunVis
-                     + gFrameData.lodSunAmb.rgb * skyAmbFactor(normal, In.WorldPos));
-#line 188 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terrain.frag.fsl"
+                     + amb);
+#line 218 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terrain.frag.fsl"
     float3 pointDiffuse = float3(0.0f, 0.0f, 0.0f);
-    bool inReflect = (gFrameData.gReflWaterClip.z != 0.0f);
+
 
 
 
@@ -2123,6 +2131,15 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
 
 
     uint dbg = (uint)(gFrameData.debugParams.x + 0.5f);
+
+
+
+
+
+    if (dbg == 3u || dbg == 4u) {
+        if (dbg == 4u) { RETURN(float4(aoSample.rgb, 1.0f)); }
+        float v = aoSample.a; RETURN(float4(v, v, v, 1.0f));
+    }
     if (dbg == 1u || dbg == 2u) {
         float dist = length(In.WorldPos - gFrameData.eyePos.xyz);
         float g = saturate(dist * (1.0f / 8192.0f));

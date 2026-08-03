@@ -52,9 +52,19 @@ float4 PS_MAIN( VSOutput In )
     // pAOBlur, so a single tap suffices. debugParams.w = toggle bitmask (bit0 AO->ambient, bit1
     // bent normal). Kept in lockstep with opaque.frag.
     uint   aoFlags  = (uint)(gFrameData.debugParams.w + 0.5f);
+    // IR3b REFLECTION TAG (lockstep with opaque.frag). This frag also runs in the water-reflection
+    // pass now, drawing into a 1024² mirror RT — and gAO, gShadowMask and the near froxel grid are
+    // all MAIN-VIEW screen-space buffers. Indexed by this pass's pixels they read a completely
+    // unrelated part of the screen, so every one of them is tagged off below. gReflWaterClip is the
+    // below-water clip plane, which is (0,0,0,1) — z == 0 — in EVERY frame cbuffer except
+    // pReflectFrameCbvGeo. Cbuffer value → the branch is uniform across the draw and the untaken
+    // side costs nothing. World-space terms (sun MSM, point attenuation/Lambert, sky ambient, fog)
+    // are NOT tagged: reflected geometry keeps its true world position.
+    bool   inReflect = (gFrameData.gReflWaterClip.z != 0.0f);
     float2 aoUv     = In.Position.xy * gShadowParams.screenAlloc.zw;   // gAO is ALLOC-sized, not render-sized
-    float4 aoSample = SampleTex2D(gAO, gSamplerAnisotropic, aoUv);
-    if ((aoFlags & 2u) != 0u) { N = normalize(aoSample.rgb); }   // "Bent normal enable" tick
+    float4 aoSample = inReflect ? float4(0.0f, 0.0f, 0.0f, 1.0f)   // AO = 1 (no darkening), bent-N unused
+                                : SampleTex2D(gAO, gSamplerAnisotropic, aoUv);
+    if ((aoFlags & 2u) != 0u && !inReflect) { N = normalize(aoSample.rgb); }   // "Bent normal enable" tick
 
     // --- BEGIN lit block (DUPLICATED from opaque.frag — keep in lockstep) ---
     float  ndl = saturate(dot(N, -gFrameData.sunDir.xyz));
@@ -71,8 +81,10 @@ float4 PS_MAIN( VSOutput In )
     // Top level, because it takes derivatives and the mask is read from inside the divergent light
     // loop. The guard is cbuffer-driven (uniform across the draw): no active slot means no light
     // carries one, so nothing reads the mask at all.
+    // ...and never in the reflection (see the tag above). No FP guard here: multi-map never runs in
+    // the first-person pass — the client skips multi-map FP parts.
     int2 maskPx = int2(In.Position.xy);
-    if (gShadowParams.slotBits.x != 0u) { maskPx = shadowMaskPixel(In.Position); }
+    if (!inReflect && gShadowParams.slotBits.x != 0u) { maskPx = shadowMaskPixel(In.Position); }
     {
         uint nLights = (uint)gLights.lightParams.x;
         float reachK = gLights.lightParams.y;   // host-slaved light reach — see opaque.srt.h
@@ -80,7 +92,10 @@ float4 PS_MAIN( VSOutput In )
         // fragment's froxel lights from gFroxelMaskNear; else the brute loop over all uploaded lights.
         // Byte-identical result — the brute path just synthesizes full-word bitmasks.
         int   nfTilesX = (int)gLights.froxelDimsNear.x;
-        bool  clustered = (nfTilesX > 0);
+        // ...but never in the reflection: the froxel tile is picked from In.Position.xy, which in the
+        // mirror pass indexes the MAIN view's grid at an unrelated screen location. Brute-loop there
+        // (same result, more iterations) rather than read another pixel's light set.
+        bool  clustered = (nfTilesX > 0) && !inReflect;
         uint  fbase = 0u;
         if (clustered)
         {
@@ -130,7 +145,10 @@ float4 PS_MAIN( VSOutput In )
                 // visibility (15 = lit, 0 = shadowed). Fixes multimap receivers (NPC heads,
                 // interior walls/trim) that previously took point lights with no shadow.
                 uint slotP1 = (uint)gLights.lights[i * 3u + 2u].w;
-                if (slotP1 != 0u)
+                // ...and never in the reflection: gShadowMask is main-view screen-space (see the
+                // reflection tag above). Reflected multi-map parts are therefore UNSHADOWED by point
+                // lights — the same deliberate IR3 limitation opaque.frag takes.
+                if (slotP1 != 0u && !inReflect)
                 {
                     // maskPx, not our own pixel: under MSAA the mask at a silhouette pixel can
                     // belong to the geometry behind us (see shadowreceive.h.fsl).
