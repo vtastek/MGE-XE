@@ -14051,11 +14051,21 @@ namespace ForgeRender {
             cmdSetScissor(g_live.pCmd, 0, 0, g_live.width, g_live.height);
 
             if (!s_fpRigid.empty()) {
+                // Pipeline FIRST, then the sets — load-bearing here, not house style.
+                // cmdBindDescriptorSet routes to the GRAPHICS or the COMPUTE root table by whichever
+                // pipeline is CURRENTLY bound (Direct3D12.c: `mPipelineType`, set only by
+                // cmdBindPipeline and NOT reset by beginCmd). In an interior with no water, no sorted
+                // alpha and no volumetric fog in view, the last pipeline bound before this block is the
+                // seam Hi-Z / re-linearize COMPUTE pipeline — so binding the FP sets here sent all four
+                // to SetComputeRootDescriptorTable, and these draws kept the world colour pass's
+                // tables: arms rendered under the WORLD viewProj, gLights and gBatch, i.e. wearing some
+                // world object's matrix and scattered across the cell. Every other pass survived the
+                // same ordering only because it re-binds the sets it already had bound.
+                cmdBindPipeline(g_live.pCmd, g_live.pFPOpaquePipeline);
                 cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSetFP);
                 cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerLightsSetFP);
                 cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
                 cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerBatchSetFP);
-                cmdBindPipeline(g_live.pCmd, g_live.pFPOpaquePipeline);
                 int cMirror = 0;
                 for (const FPRigidRec& r : s_fpRigid) {
                     if (r.mirror != cMirror) {
@@ -14072,11 +14082,14 @@ namespace ForgeRender {
             }
 
             if (!s_fpSkin.empty()) {
+                // Pipeline FIRST — see the rigid block above. The skinned arms looked correct only
+                // because the rigid block ran first and left a GRAPHICS pipeline current; a frame with
+                // skinned FP parts and no rigid ones would have stranded the hands the same way.
+                cmdBindPipeline(g_live.pCmd, g_live.pFPSkinnedPipeline);
                 cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSetFP);
                 cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerLightsSetFP);
                 cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
                 cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerBatchSetFPSkin);   // the ONE FP bone window
-                cmdBindPipeline(g_live.pCmd, g_live.pFPSkinnedPipeline);
                 int csMirror = 0;
                 for (const FPSkinRec& r : s_fpSkin) {
                     if (r.mirror != csMirror) {
