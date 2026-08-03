@@ -13943,6 +13943,13 @@ namespace ForgeRender {
             static std::vector<FPSkinRec>  s_fpSkin;
             s_fpRigid.clear();
             s_fpSkin.clear();
+            // Every `continue` below drops an arm part, and all of them were silent — the old
+            // rigid=%u/%u line said parts were lost but never which gate ate them, so a client-side
+            // and a host-side loss looked identical from the logs. Named counters + a bone total,
+            // because kBatchSize is a real ceiling here (ONE window, and the "32 parts × 32 bones"
+            // arithmetic in its allocation assumes 32-bone parts when the census max is 94).
+            uint32_t fpSkipSlot = 0, fpSkipKind = 0, fpSkipBuf = 0, fpSkipCap = 0,
+                     fpSkipBones = 0, fpBonesUsed = 0;
 
             // --- rigid FP parts (DrawItemWire[]) — FILL + RECORD ---
             if (fp->drawBlob && fp->drawCount && fp->drawBytes) {
@@ -13953,12 +13960,12 @@ namespace ForgeRender {
                 for (uint32_t k = 0; k < nFP; ++k) {
                     const IPC::DrawItemWire& it = fpItems[k];
                     const uint32_t slot = it.slot;
-                    if (slot >= g_meshHigh || !g_meshes[slot].valid) { continue; }
+                    if (slot >= g_meshHigh || !g_meshes[slot].valid) { ++fpSkipSlot; continue; }
                     HostMesh& m = g_meshes[slot];
-                    if (m.skinned || m.multimap) { continue; }   // rigid GeomVertexWire only
+                    if (m.skinned || m.multimap) { ++fpSkipKind; continue; }   // rigid GeomVertexWire only
                     Buffer*  meshVb = m.inArena ? g_live.pArenaVB : m.vb;
                     Buffer*  meshIb = m.inArena ? g_live.pArenaIB : m.ib;
-                    if (!meshVb || !meshIb) { continue; }
+                    if (!meshVb || !meshIb) { ++fpSkipBuf; continue; }
                     const uint32_t idx = fpRigidDrawn;
 
                     uint8_t* wdst = (uint8_t*)g_live.pFPWorldsBuf->pCpuMappedAddress;
@@ -14000,16 +14007,18 @@ namespace ForgeRender {
                     const uint64_t paletteBytes = (uint64_t)item.numBones * 64;
                     if (palette + paletteBytes > sEnd) { break; }
                     sp = palette + paletteBytes;
-                    if (fpSkinnedDrawn >= kMaxFPSkinned) { continue; }
+                    if (fpSkinnedDrawn >= kMaxFPSkinned) { ++fpSkipCap; continue; }
                     const uint32_t slot = item.slot;
-                    if (slot >= g_meshHigh || !g_meshes[slot].valid || !g_meshes[slot].skinned) { continue; }
+                    if (slot >= g_meshHigh || !g_meshes[slot].valid) { ++fpSkipSlot; continue; }
+                    if (!g_meshes[slot].skinned) { ++fpSkipKind; continue; }
 
                     // ONE window here (pFPBonesBuf), so windowCount = 1: a part that would spill is
                     // skipped rather than wrapping onto another part's palette. The old
                     // fpSkinnedDrawn*kMaxBonesPerPart stride would now walk off the window at the
                     // 8th part, since kMaxBonesPerPart is 128.
                     uint32_t fpWin = 0, base = 0;
-                    if (!skinPackNext(bones, 1u, fpWin, fpPackCur, base)) { continue; }
+                    if (!skinPackNext(bones, 1u, fpWin, fpPackCur, base)) { ++fpSkipBones; continue; }
+                    fpBonesUsed = fpPackCur;   // running high-water of the ONE FP bone window
                     uint8_t* bdst = (uint8_t*)g_live.pFPBonesBuf->pCpuMappedAddress;
                     std::memcpy(bdst + (size_t)base * 64, palette, (size_t)bones * 64);
                     uint32_t* sinst = (uint32_t*)g_live.pFPInstanceBufSkin->pCpuMappedAddress;
@@ -14186,12 +14195,24 @@ namespace ForgeRender {
             }
             cmdBindRenderTargets(g_live.pCmd, nullptr);
 
+            // On CHANGE, like the client's [fp] line and for the same reason: a part that vanishes
+            // between two timed lines is invisible at exactly the moment it matters. bones=used/cap
+            // is the one to watch — it is a single window, and a part that would spill it is
+            // dropped outright rather than wrapping onto another part's palette.
             static uint32_t s_fpLog = 0;
-            if ((s_fpLog++ % 300) == 0) {
-                LOG::logline(">> [fp host] rigid=%u/%u skinned=%u/%u alpha=%u/%u",
+            static uint32_t s_lastR = 0xFFFFFFFFu, s_lastS = 0, s_lastA = 0;
+            const bool fpChanged = (fpRigidDrawn != s_lastR || fpSkinnedDrawn != s_lastS
+                                    || fpAlphaDrawn != s_lastA);
+            if (fpChanged || (s_fpLog % 300) == 0) {
+                LOG::logline(">> [fp host] rigid=%u/%u skinned=%u/%u alpha=%u/%u | "
+                             "skips slot=%u kind=%u buf=%u cap=%u bones=%u | boneWin=%u/%u",
                              fpRigidDrawn, fp->drawCount, fpSkinnedDrawn, fp->skinnedCount,
-                             fpAlphaDrawn, fp->alphaCount);
+                             fpAlphaDrawn, fp->alphaCount,
+                             fpSkipSlot, fpSkipKind, fpSkipBuf, fpSkipCap, fpSkipBones,
+                             fpBonesUsed, (uint32_t)kBatchSize);
             }
+            ++s_fpLog;
+            s_lastR = fpRigidDrawn; s_lastS = fpSkinnedDrawn; s_lastA = fpAlphaDrawn;
         }
         gpuPhaseEnd(kGpuPhaseColorFP);
 

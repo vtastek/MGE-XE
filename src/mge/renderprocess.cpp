@@ -507,6 +507,41 @@ namespace {
     std::vector<std::uint8_t>                 g_multiMapScratch;    // packed MultiMapDrawWire[] this frame (Tier 4)
     std::vector<std::uint8_t>                 g_lightScratch;       // packed PointLightWire[] this frame
 
+    // PARK-LAG CORRECTION for the player's own geometry.
+    //
+    // Park mode builds frame N's payload on the worker and fires it at the start of N+1 with a
+    // restamped camera: v_view = (v_rel + bakeEye - eyeNow)·R_now. For anything world-anchored
+    // that resolves to (world - eyeNow)·R_now — exactly right, and the whole point of the restamp
+    // (no camera latency). For the PLAYER it is exactly wrong: the body ships as (pcBake -
+    // bakeEye), so it renders at (pcBake - eyeNow) when it wants (pcNow - eyeNow). The error is
+    // one frame of the player's own motion, and because the camera tracks the player it is fully
+    // correlated with the camera — which is why it reads as the body sliding off centre and
+    // catching up when you stop, while nothing else in the world looks late.
+    //
+    // Same disease and same cure as the camera-anchored sky (see the pre-cancel in
+    // flushAssignAndKick): record where the player's transforms landed in the scratch, then add
+    // the player's own bake→fire delta back before the bytes are assigned. Deltas come from the
+    // player NODE, not the eye — in 3rd person the camera also ORBITS a standing player, and an
+    // eye delta would shove the body sideways on a pure mouse-look.
+    struct PlayerPatch {
+        std::uint8_t  scratch;   // 0 = static, 1 = skinned palette, 2 = multimap
+        std::uint32_t at;        // byte offset of the FIRST translation
+        std::uint32_t count;     // translations at 64-byte stride (bone count; 1 for rigid)
+    };
+    std::vector<PlayerPatch>                  g_playerPatch;
+    float                                     g_playerBake[3] = {};
+    bool                                      g_playerBakeValid = false;
+    std::uint64_t                             g_buildCacheFrame = 0;   // cache frame the build read
+    unsigned                                  g_seamSkipRun = 0;       // consecutive no-payload seam skips
+
+    // markSubtreePlayer stamps the body subtree every 3rd-person frame, so a stale stamp from an
+    // earlier frame never counts — which is what keeps a piece of equipment you just dropped from
+    // being dragged along by the correction.
+    inline bool isPlayerOwned(const MGE::GeometryCache::CachedGeometry& e) {
+        return g_playerBakeValid && e.playerFrame == g_buildCacheFrame;
+    }
+
+
     // Offscreen shadow casters: skinned + multimap NPC parts this far (world units) from the eye
     // are re-emitted for shadowing even when frustum-culled, so their shadows don't freeze/lose
     // parts as they leave view. ~2r of the largest shadow lights; bounded to a few NPCs indoors.
@@ -570,10 +605,19 @@ namespace {
     // — zero copy. Only counts + the FP bundle + the build-time eye need holding here.
     // Invalidated (a) at every kickoffBody entry (a serial/inline kickoff supersedes it),
     // (b) at fire on a cell-epoch mismatch (teleport between build and fire → drop, one
-    // repeated composite frame), (c) on fire (consumed).
+    // repeated composite frame), (c) at fire on a POV flip (see bake3rd), (d) on fire (consumed).
     struct ParkedPayload {
         bool valid = false;
         std::uint32_t epoch = 0;              // g_cellEpoch at build → fire-time invalidation
+        // POV at build. The camera restamp re-aims the payload with the CURRENT camera, and a
+        // 3rd→1st switch moves the camera INSIDE the head — so frame N's body geometry, which was
+        // perfectly correct behind a 3rd-person camera, gets re-aimed from inside itself and you
+        // see the inside of your own head for exactly one frame. No transform patch can fix that:
+        // the body must not be DRAWN, and whether to draw it was decided a frame before MW
+        // changed its mind. So treat a POV flip the way a teleport is treated — the payload
+        // describes a world that no longer exists. Dropping repeats one composite frame, which
+        // during a POV cut is invisible; drawing it is not.
+        bool bake3rd = true;
         float bakeEye[3] = {};                // DistantLand::eyePos at build (payload's relative space)
         std::uint32_t drawCount = 0, skinnedCount = 0, multiMapCount = 0,
                       lightCount = 0, skyCount = 0, alphaCount = 0;
@@ -2088,6 +2132,10 @@ namespace {
             const std::size_t at = dst.size();
             dst.resize(at + sizeof(item));
             memcpy(dst.data() + at, &item, sizeof(item));
+            if (isPlayerOwned(e) && &dst == &g_drawScratch) {
+                g_playerPatch.push_back({ 0, (std::uint32_t)(at + offsetof(IPC::DrawItemWire, world)
+                                                                + 12 * sizeof(float)), 1 });
+            }
             ++count;
     }
 
@@ -2154,6 +2202,12 @@ namespace {
                     pal[b * 16 + 14] -= DistantLand::eyePos.z;
                 }
             }
+            // The palette IS this part's transform, so the whole palette carries the player's
+            // motion — every bone, not just the root.
+            if (isPlayerOwned(e) && &dst == &g_skinnedScratch) {
+                g_playerPatch.push_back({ 1, (std::uint32_t)(at + sizeof(item) + 12 * sizeof(float)),
+                                          e.numBones });
+            }
             ++count;
     }
 
@@ -2211,6 +2265,10 @@ namespace {
             const std::size_t at = g_multiMapScratch.size();
             g_multiMapScratch.resize(at + sizeof(item));
             memcpy(g_multiMapScratch.data() + at, &item, sizeof(item));
+            if (isPlayerOwned(e)) {
+                g_playerPatch.push_back({ 2, (std::uint32_t)(at + offsetof(IPC::MultiMapDrawWire, world)
+                                                                + 12 * sizeof(float)), 1 });
+            }
             ++count;
     }
 
@@ -2259,6 +2317,10 @@ namespace {
             const std::size_t at = dst.size();
             dst.resize(at + sizeof(item));
             memcpy(dst.data() + at, &item, sizeof(item));
+            if (isPlayerOwned(e) && &dst == &g_alphaScratch) {
+                g_playerPatch.push_back({ 3, (std::uint32_t)(at + offsetof(IPC::AlphaDrawWire, world)
+                                                                + 12 * sizeof(float)), 1 });
+            }
             ++count;
     }
 
@@ -2359,6 +2421,13 @@ namespace {
         const auto* foldKeys = DistantLand::foldVisibleKeys();
         const auto& keys = DistantLand::frustumVisibleKeys();
         const auto& cacheMap = MGE::GeometryCache::cache();
+
+        // Park-lag correction: where the player was when this payload was built, and a clean patch
+        // list for the emit helpers to fill. Captured HERE, not at the stamp, so the origin and the
+        // transforms that ride it come from the same instant.
+        g_playerPatch.clear();
+        g_buildCacheFrame = MGE::GeometryCache::currentFrame();
+        g_playerBakeValid = MGE::GeometryCache::playerRootOrigin(g_playerBake);
 
         g_drawScratch.clear();
         g_drawScratch.reserve((foldKeys ? foldKeys->size() : keys.size()) * sizeof(IPC::DrawItemWire));
@@ -2571,7 +2640,21 @@ namespace {
             static std::vector<ReEmitCand> s_reEmitRefresh;   s_reEmitRefresh.clear();
             const float r2 = kShadowCasterRadius * kShadowCasterRadius;
             const std::uint64_t cacheFrame = MGE::GeometryCache::currentFrame();
-            std::uint32_t suppressSkips = 0;
+            std::uint32_t suppressSkips = 0, ghostSkips = 0;
+            // OFF-SCREEN is a frustum statement, and this loop exists only for off-screen casters.
+            // "The engine didn't draw it" has three causes and only that one wants a re-emit; hidden
+            // and DESPAWNED look identical from here and both ship a FROZEN cached transform. That is
+            // the sheathed-weapon ghost: MW unparents the drawn weapon, so it leaves the classify set
+            // and nothing updates its world transform again — while this loop keeps feeding the host
+            // the last pose it had, so the sword hangs in the air where your hand was and you walk out
+            // from under it. Only the eviction sweep retired it, up to 30 frames later.
+            // So let the frustum answer its own question: a bound sphere FULLY inside the view that
+            // the engine still declined to draw is not an off-screen caster, and only those pay the
+            // parent climb below. Steady state costs 6 dot products — near movers that miss the
+            // visible set genuinely are behind you, and their sphere fails INSIDE immediately.
+            D3DXMATRIX viewProjNow;
+            D3DXMatrixMultiply(&viewProjNow, &DistantLand::mwView, &DistantLand::mwProj);
+            const ViewFrustum viewNow(&viewProjNow);
             // Iterate the cache's maintained mover-candidate set (skinned / multimap head / rigid
             // LIVE) instead of the WHOLE cache — the offscreen re-emit only ever cared about that
             // subset, and the full-map scan was the fixed ~1ms tail the build sub-probe pinned down.
@@ -2624,6 +2707,15 @@ namespace {
                 const float dy = c.y - DistantLand::eyePos.y;
                 const float dz = c.z - DistantLand::eyePos.z;
                 if (dx * dx + dy * dy + dz * dz > r2) continue;
+                // In full view and still not drawn ⇒ ask the graph whether it is there at all.
+                BoundingSphere bs;
+                bs.center = c;
+                bs.radius = rad;
+                if (viewNow.ContainsSphere(bs) == ViewFrustum::INSIDE
+                    && !MGE::GeometryCache::attachedNow(mkey)) {
+                    ++ghostSkips;
+                    continue;
+                }
                 auto ks = g_keySlot.find(mkey);
                 if (ks == g_keySlot.end()) continue;       // never uploaded a host slot
                 if (g_shadowLiveNearActors) {
@@ -2749,6 +2841,21 @@ namespace {
                              s_supRunFrames, s_supRunMax);
                 s_supRunFrames = 0;
                 s_supRunMax = 0;
+            }
+            // Same run-length shape, same reason: each frame counted here is a frame a despawned
+            // part WOULD have hung in full view, so the run length IS the pre-fix ghost duration —
+            // and it should read as a fraction of the 30-frame sweep interval that used to own it.
+            // A run that never ends means something in view is permanently condemned: look there
+            // before believing the fix.
+            static std::uint32_t s_ghostRunFrames = 0, s_ghostRunMax = 0;
+            if (ghostSkips > 0) {
+                ++s_ghostRunFrames;
+                if (ghostSkips > s_ghostRunMax) s_ghostRunMax = ghostSkips;
+            } else if (s_ghostRunFrames > 0) {
+                LOG::logline("[ghost] in-view despawn run ended: %u frames (pre-fix linger), max %u draws/frame",
+                             s_ghostRunFrames, s_ghostRunMax);
+                s_ghostRunFrames = 0;
+                s_ghostRunMax = 0;
             }
         }
         const double tScanEnd = nowMs();   // Phase 0: offscreen-caster scan done; alpha merge/sort next
@@ -3420,18 +3527,31 @@ namespace {
                 }
             }
         }
+        // Every `continue` below is a part the arms LOSE, and until now they were all silent and
+        // indistinguishable in the heartbeat — which is why "some angles drop arm pieces" could not
+        // be pinned to the client or the host from a log. Count them by cause; the heartbeat prints
+        // the breakdown whenever the composition changes, so a part vanishing names its own reason
+        // in the same instant. A drop with EVERY counter zero is the host's, not ours.
+        struct FPSkips { std::uint32_t stale, multimap, noslot, blendless, blendSkin, proxy, palette; };
+        FPSkips skip = {};
+        // How far the furthest shipped FP part sits from the arm camera. A measurement, not a
+        // verdict: a threshold I choose can hide the bug (and did — the first one was 256 units,
+        // i.e. across the room), whereas a number in the heartbeat cannot. Arms-on-the-arm reads
+        // as a few tens of units; anything larger is the artifact, in units, every frame.
+        float fpMaxDist2 = 0.0f;
         for (std::uint32_t fkey : fpSet) {
             auto cit = cacheMap.find(fkey);
             if (cit == cacheMap.end()) continue;   // set ⊆ cache invariant; guard anyway
             const auto& e = cit->second;
-            if (!e.isFP || e.lastFrame != cacheFrame) continue;
+            if (!e.isFP) continue;
+            if (e.lastFrame != cacheFrame) { ++skip.stale; continue; }
             // Multi-map FP parts would need the wide-VB multimap pipeline in the FP pass;
             // none expected on arms — skip rather than bind the wrong vertex layout.
-            if (e.d3dDark || e.d3dDetail || e.d3dGlow) continue;
+            if (e.d3dDark || e.d3dDetail || e.d3dGlow) { ++skip.multimap; continue; }
             auto ks = g_keySlot.find(fkey);
-            if (ks == g_keySlot.end()) continue;   // not uploaded yet (first-sight frame)
+            if (ks == g_keySlot.end()) { ++skip.noslot; continue; }   // not uploaded yet (first sight)
             if (e.blendEnable && !e.isSkinned) {
-                if (!e.d3dTexture) continue;   // textureless blend: nothing to composite
+                if (!e.d3dTexture) { ++skip.blendless; continue; }   // no base to composite
                 // Depth key: bound-center view depth against the ARM camera (pos/dir from
                 // getRenderCameraState above) — MW's sorter criterion, FP camera's frame.
                 const float* w = e.worldTransformD3D;
@@ -3446,13 +3566,29 @@ namespace {
             if (e.isSkinned) {
                 // Skinned blends stay dropped (as in FP1a) — the skinned pipeline has no
                 // blend state, so drawing them opaquely would be wrong, not better.
-                if (e.blendEnable) continue;
+                if (e.blendEnable) { ++skip.blendSkin; continue; }
+                // emitSkinnedDraw returns SILENTLY on an unbuilt/short bone palette, which on a
+                // per-frame-rebuilt skeleton is a real and invisible way to lose a limb. Ask the
+                // same question here so the loss is attributable instead of just absent.
+                if (e.skinnedUnsupported || e.numBones == 0
+                    || e.bonePalette.size() < (std::size_t)e.numBones * 16) {
+                    ++skip.palette;
+                    continue;
+                }
                 emitSkinnedDraw(ks->second, e, fpSkinned, g_fpSkinnedScratch);
             } else {
                 // Same textureless rule as dispatch: collision proxies drop; genuine
                 // textureless visuals draw opaque on slot 0 (host default white).
-                if (!e.d3dTexture && e.isPickRoot) continue;
+                if (!e.d3dTexture && e.isPickRoot) { ++skip.proxy; continue; }
                 emitStaticDraw(ks->second, e, fpDraws, g_fpDrawScratch);
+            }
+            // Distance of this part from the ARM camera; the heartbeat reports the max.
+            {
+                const float* bt = e.isSkinned && e.bonePalette.size() >= 16
+                                  ? e.bonePalette.data() : e.worldTransformD3D;
+                const float ox = bt[12] - pos[0], oy = bt[13] - pos[1], oz = bt[14] - pos[2];
+                const float d2 = ox * ox + oy * oy + oz * oz;
+                if (d2 > fpMaxDist2) { fpMaxDist2 = d2; }
             }
         }
 
@@ -3552,11 +3688,31 @@ namespace {
             }
         }
 
+        // Heartbeat on CHANGE, not on a 300-frame timer. A part that disappears for the two
+        // seconds between timed lines is invisible to the log at exactly the moment it matters,
+        // and "rotate until the arm drops, then read the last line" is the whole diagnostic.
+        // Timed lines still come through so a steady state is confirmable.
         static unsigned s_hb = 0;
-        if (s_hb++ % 300 == 0) {
-            LOG::logline(">> [fp] draws=%u skinned=%u alpha=%u | cam fov=%.1f near=%.1f far=%.1f vp=%.0fx%.0f",
-                         fpDraws, fpSkinned, fpAlpha, cd[0], cd[1], cd[2], cd[3], cd[4]);
+        static std::uint32_t s_lastD = 0xFFFFFFFFu, s_lastS = 0, s_lastA = 0;
+        // maxDist joins the change test: the counts were constant all along while parts moved, so
+        // composition alone could never have caught this. A 32-unit bucket keeps it from chattering.
+        static std::uint32_t s_lastBucket = 0xFFFFFFFFu;
+        const std::uint32_t distBucket = (std::uint32_t)(sqrtf(fpMaxDist2) / 32.0f);
+        const bool composeChanged = (fpDraws != s_lastD || fpSkinned != s_lastS || fpAlpha != s_lastA
+                                     || distBucket != s_lastBucket);
+        s_lastBucket = distBucket;
+        if (composeChanged || s_hb % 300 == 0) {
+            LOG::logline(">> [fp] draws=%u skinned=%u alpha=%u | skips stale=%u mm=%u noslot=%u "
+                         "blendless=%u blendskin=%u proxy=%u palette=%u | set=%u maxDist=%.0f | "
+                         "cam fov=%.1f near=%.1f far=%.1f vp=%.0fx%.0f",
+                         fpDraws, fpSkinned, fpAlpha,
+                         skip.stale, skip.multimap, skip.noslot, skip.blendless,
+                         skip.blendSkin, skip.proxy, skip.palette, (unsigned)fpSet.size(),
+                         sqrtf(fpMaxDist2),
+                         cd[0], cd[1], cd[2], cd[3], cd[4]);
         }
+        ++s_hb;
+        s_lastD = fpDraws; s_lastS = fpSkinned; s_lastA = fpAlpha;
 
         // Continuous arm-camera validation: diff the latched native-arm-scene matrices
         // (see noteFPZClear/noteFPSceneTransform) against what we built. The latch is
@@ -4389,6 +4545,51 @@ namespace RenderProcess {
         const double tTexFlush = nowMs();
         markWorkerPhase(WK_ASSIGN);
 
+        // PARK-LAG CORRECTION — same shape as the sky pre-cancel below, for the same reason, and
+        // it must run BEFORE the assigns: everything under here is shared memory the host reads.
+        //
+        // The camera restamp re-aims the whole payload with THIS frame's camera, which plants every
+        // shipped transform at the world position it held at BUILD time. Right for the world, wrong
+        // for the player: the camera is welded to them, so their one-frame staleness is the only
+        // lag in the frame that is fully correlated with where you are looking — the body slides
+        // off centre while you move and slots back when you stop.
+        //
+        // The delta comes from the player NODE, not the eye. In 3rd person the camera also ORBITS
+        // a standing player, and an eye delta would shove the body sideways on a pure mouse-look —
+        // a new artifact in place of the old one. Pose is deliberately NOT corrected: the limbs are
+        // one frame stale and stay that way, because that error is small and uncorrelated.
+        //
+        // On the serial paths build and fire are the same instant, so the delta is exactly zero and
+        // every byte matches the pre-correction code.
+        if (!g_playerPatch.empty() && g_playerBakeValid) {
+            float now[3];
+            if (MGE::GeometryCache::playerRootOrigin(now)) {
+                const float dx = now[0] - g_playerBake[0];
+                const float dy = now[1] - g_playerBake[1];
+                const float dz = now[2] - g_playerBake[2];
+                if (dx != 0.0f || dy != 0.0f || dz != 0.0f) {
+                    for (const PlayerPatch& p : g_playerPatch) {
+                        std::vector<std::uint8_t>* s =
+                            (p.scratch == 0) ? &g_drawScratch     :
+                            (p.scratch == 1) ? &g_skinnedScratch  :
+                            (p.scratch == 2) ? &g_multiMapScratch : &g_alphaScratch;
+                        // A scratch is only rebuilt wholesale, never truncated between build and
+                        // fire, so an out-of-range offset would mean the two disagree about the
+                        // payload — skip rather than write past it.
+                        const std::size_t need = (std::size_t)p.at
+                                               + (std::size_t)(p.count - 1) * 64 + 3 * sizeof(float);
+                        if (p.count == 0 || need > s->size()) continue;
+                        auto* t = reinterpret_cast<float*>(s->data() + p.at);
+                        for (std::uint32_t i = 0; i < p.count; ++i) {
+                            t[i * 16 + 0] += dx;
+                            t[i * 16 + 1] += dy;
+                            t[i * 16 + 2] += dz;
+                        }
+                    }
+                }
+            }
+        }
+
         const bool haveDraw = g_drawVec && drawCount > 0
             && g_drawVec->assign_bytes(g_drawScratch.data(), (std::uint32_t)g_drawScratch.size());
 
@@ -4526,9 +4727,31 @@ namespace RenderProcess {
         // draw list (loading doors, menus, empty cells) we must NOT fall back to the bring-up
         // triangle and composite it — that flashes the debug triangle over MW's loading/menu
         // frame. Skip the seam entirely and let MW present its own (fixed-function) frame.
+        //
+        // THE ARMS ARE SCENE DATA. This listed only the WORLD payloads, so standing where no world
+        // geometry is in view — out past the last object, looking into flat fog — emptied all five
+        // and skipped the seam. "Let MW present its own frame" is not a safe fallback there: MW's
+        // world draws are suppressed at the reject gate AND FP1b force-culls the arm root, so what
+        // MW presents is a frame with no arms in it, while the composite stops advancing. That is
+        // the reported freeze — the world stops, the arms vanish, and MW goes on animating a
+        // first-person skeleton nobody draws. A frame holding nothing but arms is a real frame.
+        const bool haveFP = fpHave && (fpDraws > 0 || fpSkinnedDraws > 0 || fpAlphaDraws > 0);
         if (!haveDraw && skinnedId == IPC::InvalidVector && multiMapId == IPC::InvalidVector
-            && skyId == IPC::InvalidVector && alphaId == IPC::InvalidVector) {
+            && skyId == IPC::InvalidVector && alphaId == IPC::InvalidVector && !haveFP) {
+            // Silent until now, which is why an empty-payload skip and a genuinely stalled produce
+            // looked identical from the log. Run-length: a skip lasting one frame is a load door,
+            // a skip lasting hundreds is a player standing in the void.
+            ++g_seamSkipRun;
+            if (g_seamSkipRun == 1 || (g_seamSkipRun % 60) == 0) {
+                LOG::logline(">> [seam] skip %u: no payload (draw=%u skin=%u mm=%u sky=%u alpha=%u fp=%u)",
+                             g_seamSkipRun, drawCount, skinnedCount, multiMapCount, skyCount,
+                             alphaCount, fpDraws + fpSkinnedDraws + fpAlphaDraws);
+            }
             return;
+        }
+        if (g_seamSkipRun > 0) {
+            LOG::logline(">> [seam] resumed after %u skipped frame(s)", g_seamSkipRun);
+            g_seamSkipRun = 0;
         }
 
         // CAMERA-RELATIVE viewProj: the payload's world translations are pre-shifted by -bakeEye
@@ -4642,6 +4865,27 @@ namespace RenderProcess {
                                  DistantLand::sunAmb.r, DistantLand::sunAmb.g, DistantLand::sunAmb.b,
                                  DistantLand::ambCol.r, DistantLand::ambCol.g, DistantLand::ambCol.b,
                                  DistantLand::sunVec.x, DistantLand::sunVec.y, DistantLand::sunVec.z);
+                }
+            } else {
+                // The SILENT branch, and the one that matters here: with no live sgSunlight the sun
+                // and ambient stay on the CAPTURED values, which refresh only on SetLight(6) /
+                // D3DRS_AMBIENT — i.e. only while MW is drawing something lit. A static interior
+                // reached from another interior can starve that capture completely, leaving the
+                // whole frame lit by whatever was last captured, or by nothing at all. Geometry lit
+                // by nothing is geometry you cannot see, which is why dropping a light into the
+                // room "brings the missing pieces back": they were never missing, they were black.
+                static std::uint32_t s_noSunEpoch = ~0u;
+                static unsigned s_noSunN = 0;
+                if (g_cellEpoch != s_noSunEpoch || (s_noSunN++ % 900 == 0)) {
+                    s_noSunEpoch = g_cellEpoch;
+                    LOG::logline("!! [light] getSceneSunlight FAILED (%s) — falling back to CAPTURED: "
+                                 "sun=(%.3f %.3f %.3f) sunAmb=(%.3f %.3f %.3f) ambCol=(%.3f %.3f %.3f) "
+                                 "-> ambient=(%.3f %.3f %.3f)",
+                                 isExterior ? "exterior" : "interior",
+                                 DistantLand::sunCol.r, DistantLand::sunCol.g, DistantLand::sunCol.b,
+                                 DistantLand::sunAmb.r, DistantLand::sunAmb.g, DistantLand::sunAmb.b,
+                                 DistantLand::ambCol.r, DistantLand::ambCol.g, DistantLand::ambCol.b,
+                                 ambColEff.r, ambColEff.g, ambColEff.b);
                 }
             }
         }
@@ -4976,6 +5220,7 @@ namespace RenderProcess {
             fpHave = buildFPFrame(fpFrame, fpDraws, fpSkinnedDraws, fpAlphaDraws);
         }
         g_park.epoch           = g_cellEpoch;
+        g_park.bake3rd         = MWBridge::get()->is3rdPerson();
         g_park.bakeEye[0]      = DistantLand::eyePos.x;
         g_park.bakeEye[1]      = DistantLand::eyePos.y;
         g_park.bakeEye[2]      = DistantLand::eyePos.z;
@@ -5000,7 +5245,7 @@ namespace RenderProcess {
     // main-thread cost split + park age + drop causes. Fire ≤ ~1ms and parkAge ≈ one frame
     // are the design targets; drops should appear only at cell transitions.
     struct ParkStats {
-        unsigned fires = 0, dropEpoch = 0, dropInvalid = 0;
+        unsigned fires = 0, dropEpoch = 0, dropInvalid = 0, dropPov = 0;
         double fireMs = 0.0, geomF = 0.0, texF = 0.0, assign = 0.0, kick = 0.0;
         double parkAge = 0.0, buildMs = 0.0;
     };
@@ -5267,6 +5512,16 @@ namespace RenderProcess {
                          g_park.epoch, g_cellEpoch, frame);
             return;
         }
+        if (g_park.bake3rd != MWBridge::get()->is3rdPerson()) {
+            // POV flipped between build and fire (see ParkedPayload::bake3rd). Same treatment as a
+            // teleport, for the same reason: the payload's visibility set was decided against a
+            // camera that no longer exists.
+            g_park.valid = false;
+            ++g_parkStats.dropPov;
+            LOG::logline(">> [park] drop: POV %s at frame %u (switch between build and fire)",
+                         g_park.bake3rd ? "3rd -> 1st" : "1st -> 3rd", frame);
+            return;
+        }
         const double parkAge = tStart - g_park.tBuildEnd;
         g_capturedEmitted = g_park.capturedEmitted;   // restore the build-time AT3 count for g_kick
         // tBuild == tStart: the build cost lives in the park ([park] build=), not this frame's
@@ -5291,11 +5546,11 @@ namespace RenderProcess {
         if (++g_parkStats.fires >= 300) {
             const double inv = 1.0 / g_parkStats.fires;
             LOG::logline(">> [park] %u fires avg: fire=%.2f (geomF=%.2f texF=%.2f assign=%.2f kick=%.2f) "
-                         "parkAge=%.2f build=%.2f ms | drops epoch=%u invalid=%u",
+                         "parkAge=%.2f build=%.2f ms | drops epoch=%u invalid=%u pov=%u",
                          g_parkStats.fires, g_parkStats.fireMs * inv, g_parkStats.geomF * inv,
                          g_parkStats.texF * inv, g_parkStats.assign * inv, g_parkStats.kick * inv,
                          g_parkStats.parkAge * inv, g_parkStats.buildMs * inv,
-                         g_parkStats.dropEpoch, g_parkStats.dropInvalid);
+                         g_parkStats.dropEpoch, g_parkStats.dropInvalid, g_parkStats.dropPov);
             g_parkStats = ParkStats{};
         }
     }
@@ -6061,6 +6316,25 @@ void DrawForgeDevPanel() {
         if (ImGui::Checkbox(label, &v))
             LOG::logline(">> [seam] %s %s", msg, v ? "ON" : "OFF");
     };
+
+    // GPU capture. This panel exists because some seam keys are missing on compact keyboards,
+    // and NUMPAD0 is exactly that kind of key — it was the one A/B with no clickable twin, so a
+    // capture simply could not be armed without a numpad. Same latch the key sets, so the host
+    // path (armGpuCapture -> StartFrameCapture at the next renderScene) is untouched.
+    ImGui::Separator();
+    ImGui::Text("GPU capture (RenderDoc)");
+    if (ImGui::Button("Capture next host frame")) {
+        g_gpuCapturePending = 1u;
+        LOG::logline(">> [seam] GPU frame capture requested (panel) — see mgeHost64.log");
+    }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip(
+            "Arms ONE host frame, bracketed by the host itself (mgeHost64 has no Present of\n"
+            "its own, so RenderDoc's hotkey would capture a Morrowind frame instead).\n"
+            "Needs renderdoc.dll in the HOST process: launch under the RenderDoc UI with\n"
+            "'capture child processes', or set MGE_RDOC=1. Writes forge_frame_frameNNN.rdc\n"
+            "next to mgeHost64.exe; mgeHost64.log says ARMED / STARTED / WRITTEN.\n"
+            "Equivalent to numpad 0.");
 
     ImGui::Separator();
     ImGui::Text("Phase 1 - MW-only pipeline");

@@ -244,6 +244,13 @@ namespace MGE::GeometryCache {
         // this the freshly-culled 3rd-person body keeps rendering until the eviction
         // sweep. Consumers skip entries with suppressedFrame == currentFrame().
         uint64_t suppressedFrame;
+        // Frame stamp set by markSubtreePlayer on everything hanging off the player's own scene
+        // node (body parts AND held equipment). The Forge feed's park mode fires frame N's
+        // geometry with frame N+1's camera; that is exactly right for a world that did not move,
+        // and exactly wrong for the one object the camera is welded to — the body renders where
+        // it WAS while the camera looks where it IS. The emit helpers use this stamp to record
+        // which shipped transforms need the player's own motion added back at fire time.
+        uint64_t playerFrame;
         // Nearest NiSwitchNode ancestor at capture (null for the overwhelming majority of
         // entries), plus the index of the switch child this shape hangs under. A NiSwitchNode
         // displays ONLY the child at switchIndex — Glow in the Dahrk's "NightDaySwitch" flips
@@ -458,6 +465,26 @@ namespace MGE::GeometryCache {
     // Frames elapsed since the eviction sweep last ran (0 on a sweep frame). Build-spike
     // observability: tests whether build spikes align with the ~30-frame sweep cadence.
     uint32_t framesSinceEvictSweep();
+
+    // Stamp playerFrame = currentFrame() on every cached shape under the player's scene node —
+    // body parts and held equipment alike. Same walker and same contract as
+    // markSubtreeSuppressed: touches only entries that already exist, derefs nothing but the
+    // child arrays. Returns the number stamped.
+    uint32_t markSubtreePlayer(void* avObject);
+
+    // The player scene node's world translation right now. This is the ORIGIN the body moves
+    // with, not its bound centre — a bound centre also shifts when the pose changes (arms out),
+    // which would feed animation noise into a correction that only wants locomotion.
+    // False if there is no player node yet (menus, load).
+    bool playerRootOrigin(float out[3]);
+
+    // "The engine did not draw this shape this frame — is it merely off-screen, or is it GONE?"
+    // The same vtable-validated parent climb the eviction sweep votes with, asked on demand at the
+    // point of use instead of once per 30-frame sweep. FALSE only on a confirmed detach or a
+    // disabled reference; every ambiguous state answers TRUE, because a false answer stops geometry
+    // being drawn. The offscreen shadow-caster re-emit is the caller: eviction cadence is the right
+    // speed for reclaiming memory and slots, and far too slow for a thing you can see.
+    bool attachedNow(uint32_t key);
 
     // First-sight capture budget. setCaptureBudget(-1) = unlimited (the default);
     // setCaptureBudget(n >= 0) lets ensureLive() do at most n first-sight lazy captures

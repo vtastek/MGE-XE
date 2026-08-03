@@ -465,9 +465,13 @@ namespace IPC {
 		static LARGE_INTEGER s_lastExit = {};
 		const double idleMs = s_lastExit.QuadPart ? msBetween(s_lastExit, t0) : 0.0;
 		bool ok;
+		// fpEnabled belongs in this test for the same reason it belongs in the client's: the arms
+		// are scene data, and a frame whose only content is arms must still take the SCENE path.
+		// Without it an FP-only frame fell through to renderFrame() — the bring-up triangle — so
+		// the client fix alone would have replaced a frozen world with a debug triangle.
 		if (params.drawList != InvalidVector || params.skinnedList != InvalidVector
 			|| params.multiMapList != InvalidVector || params.skyList != InvalidVector
-			|| params.alphaList != InvalidVector) {
+			|| params.alphaList != InvalidVector || params.fpEnabled) {
 			// M1c/M-Skinning scene path: static DrawItemWire[] (drawList) and/or skinned
 			// [SkinnedDrawWire][palette]* (skinnedList) + inline camera. Either may be Invalid.
 			const void* drawPtr = nullptr;

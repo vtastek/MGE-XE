@@ -1923,6 +1923,49 @@ namespace MGE::GeometryCache {
             }
         }
 
+        // THE parent climb — "is this chain still hanging off a live root, and is anything on it
+        // hiding the shape?". Extracted so the eviction sweep (parentVerdict) and the Forge feed's
+        // offscreen re-emit gate (attachedNow) ask the SAME question of the SAME graph: the two act
+        // on the answer at very different cadences (once per 30-frame sweep vs every frame), and a
+        // second, separately-maintained copy of these rules is exactly how one of them ends up
+        // drawing what the other has already condemned.
+        //
+        // Verdict: 0 alive / 1 gone / 2 unknown (depth cap — refuse to guess).
+        // `p` is the FIRST parent (caller has already handled a null parent, which is an outright
+        // detach); every hop after that is vtable-validated before it is dereferenced.
+        struct ClimbCounters { unsigned maxDepth = 0, vtBad = 0, disabled = 0, depthCap = 0; };
+        int climbParents(NI::Node* p, NI::Node* armRoot, ClimbCounters& cc) {
+            for (int depth = 0; depth < kMaxParentDepth; ++depth) {
+                if (p == g_objRoot || p == g_pickRoot || p == g_landRoot || (armRoot && p == armRoot)) {
+                    if ((unsigned)depth > cc.maxDepth) cc.maxDepth = (unsigned)depth;
+                    return 0;
+                }
+                // Engine-informed guard: a real parent is a live node subtype. A dangling/freed
+                // parent fails the vtable check ⇒ the subtree was unlinked and released ⇒ gone.
+                if (!isLiveNodeVT(p)) { ++cc.vtBad; return 1; }
+                // DISABLED reference (console/script `disable`, quest props). Reachability alone can
+                // never retire these: MW hides a reference by app-culling its scene node and leaving
+                // it perfectly parented, so the chain stays intact. Ask the reference itself, at the
+                // hop that owns it. Order matters: the known-root test above runs FIRST, so MGE's own
+                // root app-culls (MW-ONLY-UI suppression, the FP1b arm root) are never examined; and
+                // this runs AFTER the vtable guard, so the deref is safe. Testing the Disabled BIT,
+                // not app-cull, is what keeps the inactive-POV player body (app-culled but very much
+                // enabled) out of it.
+                if (p->getAppCulled() && referenceDisabled(p, /*searchParents=*/false)) {
+                    ++cc.disabled;
+                    return 1;
+                }
+                NI::Node* next = p->parentNode;
+                // Chain ended without reaching a known root: the whole subtree was unlinked (MW
+                // removes an object's ROOT node, so the shape keeps a non-null parent that is itself
+                // detached). This is the case a plain !parent test would miss.
+                if (!next) return 1;
+                p = next;
+            }
+            ++cc.depthCap;
+            return 2;
+        }
+
         // Capture-time switch binding. Climb to the nearest NiSwitchNode ancestor and record BOTH
         // the switch and the index of the child we came up through, so a later frame can ask "is
         // this shape's branch still the displayed one?" without re-walking.
@@ -3081,19 +3124,28 @@ namespace MGE::GeometryCache {
         // live node fetched from the engine this frame (never cached keys).
         if (RenderProcess::forgeOwnsFrame()) {
             auto* mwBridge = MWBridge::get();
-            static bool s_was3rd = true;
+            // -1 = not read yet. Seeding this to "3rd" made the very first 1st-person frame of a
+            // session report a POV SWITCH that never happened (with 0 entries stamped, because the
+            // cache is still empty) — a phantom event in a log whose whole job is to mark real ones.
+            static int s_was3rd = -1;
             const bool is3rd = mwBridge->is3rdPerson();
             if (!is3rd) {
                 const uint32_t stamped =
                     markSubtreeSuppressed(mwBridge->getPlayer3rdPersonNode());
-                if (s_was3rd) {
+                if (s_was3rd == 1) {
                     LOG::logline("[fp0] POV switch -> 1st person (frame %llu): stamped %u body entries suppressed",
                                  (unsigned long long)g_frame, stamped);
                 }
-            } else if (!s_was3rd) {
+            } else if (s_was3rd == 0) {
                 LOG::logline("[fp0] POV switch -> 3rd person (frame %llu)", (unsigned long long)g_frame);
             }
-            s_was3rd = is3rd;
+            s_was3rd = is3rd ? 1 : 0;
+            // Park-lag correction (3rd person only — in 1st the body is suppressed above and
+            // never emitted, and the arms ride their own baked arm-camera bundle). One walk of
+            // the body subtree per frame, sharing the node the POV check just fetched.
+            if (is3rd) {
+                markSubtreePlayer(mwBridge->getPlayer3rdPersonNode());
+            }
         }
 
         // NiSwitchNode variant pass (day/night window glow). A switch displays ONLY the child at
@@ -3548,8 +3600,7 @@ namespace MGE::GeometryCache {
             // vtable, so we treat it as GONE instead of chasing it further. This makes EVERY deref in
             // the loop safe (first hop is off a leaf we hold; every later hop is off a vtable-validated
             // live node) and turns the unbounded hazard into counted diagnostics (climbVtBad).
-            unsigned climbMaxDepth = 0, climbVtBad = 0, climbDepthCap = 0, climbDisabled = 0;
-            auto isLiveNode = isLiveNodeVT;
+            ClimbCounters climb;
             auto parentVerdict = [&](uint32_t key, const CachedGeometry& e) -> int {
                 if (!rootsValid) return 2;              // no usable reference point → age rule only
                 // The walk reached it this frame ⇒ reachable. Belt-and-braces against any root we
@@ -3561,40 +3612,7 @@ namespace MGE::GeometryCache {
                 NI::Node* p = rit->second.get()->parentNode;
                 // Detached outright — the common drop/pick-up case, and unambiguous.
                 if (!p) return 1;
-                for (int depth = 0; depth < kMaxParentDepth; ++depth) {
-                    if (p == g_objRoot || p == g_pickRoot || p == g_landRoot || (armRoot && p == armRoot)) {
-                        if ((unsigned)depth > climbMaxDepth) climbMaxDepth = (unsigned)depth;
-                        return 0;
-                    }
-                    // Engine-informed guard: a real parent is a live node subtype. A dangling/freed
-                    // parent fails the vtable check ⇒ the subtree was unlinked and released ⇒ gone.
-                    if (!isLiveNode(p)) { ++climbVtBad; return 1; }
-                    // DISABLED reference (console/script `disable`, quest props). Reachability alone
-                    // can never retire these: MW hides a reference by app-culling its scene node and
-                    // leaving it perfectly parented, so the chain stays intact and the entry is kept
-                    // forever. Harmless for a plain static — it is only ever drawn FROM the engine's
-                    // visible set, which it drops out of the moment it is disabled — but anything in
-                    // the mover-candidate set (NPCs/creatures = Mover, activators/doors = Ambiguous)
-                    // is re-emitted every frame straight from the cache, independent of that set, so
-                    // it keeps drawing as a ghost until the cell is re-entered. Ask the reference
-                    // itself, at the hop that owns it. Order matters: the known-root test above runs
-                    // FIRST, so MGE's own root app-culls (MW-ONLY-UI suppression, the FP1b arm root)
-                    // are never examined; and this runs AFTER the vtable guard, so the deref is safe.
-                    // Testing the Disabled BIT, not app-cull, is what keeps the inactive-POV player
-                    // body (app-culled but very much enabled) out of it.
-                    if (p->getAppCulled() && referenceDisabled(p, /*searchParents=*/false)) {
-                        ++climbDisabled;
-                        return 1;
-                    }
-                    NI::Node* next = p->parentNode;
-                    // Chain ended without reaching a known root: the whole subtree was unlinked
-                    // (MW removes an object's ROOT node, so the shape keeps a non-null parent that
-                    // is itself detached). This is the case a plain !parent test would miss.
-                    if (!next) return 1;
-                    p = next;
-                }
-                ++climbDepthCap;
-                return 2;   // depth cap: refuse to guess
+                return climbParents(p, armRoot, climb);
             };
             unsigned nEvicted = 0, nByGraph = 0, nByAge = 0, nUnknown = 0, nDeferred = 0;
             unsigned nByDetach = 0, nDetachChecked = 0;
@@ -3640,7 +3658,7 @@ namespace MGE::GeometryCache {
                                      " (maxDepth=%u vtBad=%u depthCap=%u) — aborting graph verdict,"
                                      " age rule only this sweep",
                                      gcNowMs() - tClimb0, scanned, g_cache.size(),
-                                     climbMaxDepth, climbVtBad, climbDepthCap);
+                                     climb.maxDepth, climb.vtBad, climb.depthCap);
                         break;
                     }
                 }
@@ -3712,7 +3730,7 @@ namespace MGE::GeometryCache {
                                     for (int d = 0; p && d < kMaxParentDepth && off < (int)sizeof(chain) - 48; ++d) {
                                         off += snprintf(chain + off, sizeof(chain) - off, " %p(vt=%p)",
                                                         (void*)p, (void*)p->vTable.asNode);
-                                        if (!isLiveNode(p)) { off += snprintf(chain + off, sizeof(chain) - off, "!VT"); break; }
+                                        if (!isLiveNodeVT(p)) { off += snprintf(chain + off, sizeof(chain) - off, "!VT"); break; }
                                         p = p->parentNode;
                                     }
                                     LOG::logline("!! [rescue-diag] key=%08x v=%d live=%d skinned=%d homeInt=%p age=%llu chain=%s | roots obj=%p pick=%p land=%p arm=%p",
@@ -3884,7 +3902,7 @@ namespace MGE::GeometryCache {
                              g_evictSweepNo, cellGrid ? "cell" : (g_evictByParentChain ? "parent" : "walk"),
                              walkedThisFrame ? 1u : 0u, g_cache.size(),
                              nEvicted, nByCell, cgX, cgY, kCellGridRadius, (int)(curInterior != nullptr),
-                             nByGraph, nByAge, nByDetach, nDetachChecked, climbDisabled,
+                             nByGraph, nByAge, nByDetach, nDetachChecked, climb.disabled,
                              nUnknown, nDeferred, nKeptByParent,
                              g_evictDisagreeWalkGone, g_evictDisagreeGraphGone);
             if (nRescueGone + nRescueUnknown > 0) {
@@ -3907,7 +3925,7 @@ namespace MGE::GeometryCache {
             if (g_evictByParentChain && !cellGrid) {
                 LOG::logline(">> [evict-climb] sweep=%u entries=%zu countMs=%.2f maxDepth=%u vtBad=%u depthCap=%u runaway=%d trusted=%d walked=%d",
                              g_evictSweepNo, g_cache.size(), climbCountMs,
-                             climbMaxDepth, climbVtBad, climbDepthCap,
+                             climb.maxDepth, climb.vtBad, climb.depthCap,
                              (int)climbRunaway, (int)graphTrusted, walkedThisFrame ? 1 : 0);
             }
         }
@@ -4015,6 +4033,19 @@ namespace MGE::GeometryCache {
 
     uint32_t framesSinceEvictSweep() {
         return (uint32_t)(g_frame - g_lastSweepFrame);
+    }
+
+    bool attachedNow(uint32_t key) {
+        // Asymmetric on purpose: only a CONFIRMED detach/disable answers false. Every ambiguous
+        // state (no roots yet, no stored ref, depth cap) answers true, because the caller's
+        // response to false is "stop drawing this" — that must never be reachable by a guess.
+        if (!g_objRoot) return true;
+        auto rit = g_geomRefs.find(key);
+        if (rit == g_geomRefs.end() || !rit->second.get()) return true;
+        NI::Node* p = rit->second.get()->parentNode;
+        if (!p) return false;                   // detached outright — unambiguous
+        ClimbCounters cc;                       // per-call; the sweep owns the reported ones
+        return climbParents(p, MWBridge::get()->getArmCameraRoot(), cc) != 1;
     }
 
     void setCaptureBudget(int budget) {
@@ -4263,6 +4294,31 @@ namespace MGE::GeometryCache {
         return n;
     }
 
+    // Twin of stampSuppressed, writing playerFrame. Same contract (existing entries only, no
+    // capture, no derefs past the child arrays) and deliberately appCull-blind for the same
+    // reason: a drawn weapon and a body part are both "the player" whether or not the engine
+    // happens to be showing them this frame.
+    static uint32_t stampPlayer(NI::AVObject* av) {
+        if (!av) return 0;
+        if (av->isInstanceOfType(NI::RTTIStaticPtr::NiTriBasedGeom)) {
+            auto it = g_cache.find(reinterpret_cast<uint32_t>(av));
+            if (it != g_cache.end()) {
+                it->second.playerFrame = g_frame;
+                return 1;
+            }
+            return 0;
+        }
+        uint32_t n = 0;
+        if (av->isInstanceOfType(NI::RTTIStaticPtr::NiNode)) {
+            auto* node = static_cast<NI::Node*>(av);
+            const auto count = node->children.getEndIndex();
+            for (size_t i = 0; i < count; ++i) {
+                n += stampPlayer(node->children.at(i).get());
+            }
+        }
+        return n;
+    }
+
     // MW-ONLY-UI: drive the engine's world-root appCulled flags to `level` (0..3, see the ladder
     // at the call site). Idempotent — re-asserted every frame because the engine rewrites its own
     // cull state on cell/POV changes — and it only ever clears flags it set itself, so a level
@@ -4291,6 +4347,18 @@ namespace MGE::GeometryCache {
 
     uint32_t markSubtreeSuppressed(void* avObject) {
         return stampSuppressed(static_cast<NI::AVObject*>(avObject));
+    }
+
+    uint32_t markSubtreePlayer(void* avObject) {
+        return stampPlayer(static_cast<NI::AVObject*>(avObject));
+    }
+
+    bool playerRootOrigin(float out[3]) {
+        auto* node = MWBridge::get()->getPlayer3rdPersonNode();
+        if (!node) return false;
+        const NI::Point3& t = node->worldTransform.translation;
+        out[0] = t.x; out[1] = t.y; out[2] = t.z;
+        return true;
     }
 
     const char* enchantGlowTexture() {
