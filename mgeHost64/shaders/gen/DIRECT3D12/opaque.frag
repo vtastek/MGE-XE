@@ -1356,8 +1356,19 @@ STRUCT(LightData)
 #line 38 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/texsample.h.fsl"
 bool isFlipSlot(uint texIdx) { return (texIdx &  0x8000u ) != 0u; }
 
-float4 sampleFlip(uint texIdx, uint clampMode, float2 uv, bool lowAF)
+
+
+
+
+
+
+
+
+
+float4 sampleFlip(uint texIdxIn, uint clampModeIn, float2 uv, bool lowAF)
 {
+    const uint texIdx = texIdxIn;
+    const uint clampMode = clampModeIn &  3u ;
     const uint bucket = (texIdx >> 11u) & ( 16  - 1u);
     const float3 uvw = float3(uv, (float)(texIdx &  0x7FFu ));
     if (lowAF)
@@ -1378,8 +1389,9 @@ float4 sampleFlip(uint texIdx, uint clampMode, float2 uv, bool lowAF)
 
 
 
-float4 sampleBase(uint texIdx, uint clampMode, float2 uv, bool lowAF)
+float4 sampleBase(uint texIdx, uint clampModeIn, float2 uv, bool lowAF)
 {
+    const uint clampMode = clampModeIn &  3u ;
 
 
 
@@ -1993,6 +2005,50 @@ float3 applyFog(float3 lit, float3 worldPosRel, float2 pixelXy, float fog)
     return lerp(fogSkyTarget(s), lit, fog);
 }
 #line 17 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.frag.fsl"
+#line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/enchantglow.h.fsl"
+#line 78 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/enchantglow.h.fsl"
+float3 enchantCamRight() { return normalize(gFrameData.viewProj[0].xyz); }
+float3 enchantCamUp() { return normalize(gFrameData.viewProj[1].xyz); }
+#line 96 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/enchantglow.h.fsl"
+uint enchantWord() { return (uint)(gFrameData.skyZenith.w + 0.5f); }
+uint enchantSlot() { return enchantWord() & ( 4096u  - 1u); }
+bool enchantReflect() { return (enchantWord() &  4096u ) != 0u; }
+float enchantStrength() { return gFrameData.eyePos.w; }
+
+
+
+
+float3 enchantTint()
+{
+    uint p = (uint)(gFrameData.lodParams.y + 0.5f);
+    return float3(float((p >> 16u) & 0xFFu),
+                  float((p >> 8u) & 0xFFu),
+                  float( p & 0xFFu)) * (1.0f / 255.0f);
+}
+#line 124 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/enchantglow.h.fsl"
+float3 enchantGlow(float3 N, float3 worldPos, bool glowing)
+{
+    if (!glowing) { return float3(0.0f, 0.0f, 0.0f); }
+    uint slot = enchantSlot();
+    float k = enchantStrength();
+    if (slot == 0u || slot >=  880  || k <= 0.0f) { return float3(0.0f, 0.0f, 0.0f); }
+
+    float3 n = normalize(N);
+
+
+
+
+    float3 dir = enchantReflect() ? reflect(normalize(worldPos - gFrameData.eyePos.xyz), n) : n;
+
+
+
+    float2 uv = float2(0.5f + 0.5f * dot(enchantCamRight(), dir),
+                       0.5f - 0.5f * dot(enchantCamUp(), dir));
+
+
+    return SampleTex2D(gTextures[slot], gSamplerAnisoClampClamp, uv).rgb * enchantTint() * k;
+}
+#line 18 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.frag.fsl"
 
 STRUCT(VSOutput)
 {
@@ -2010,7 +2066,7 @@ STRUCT(VSOutput)
     DATA(float3, WorldPos, TEXCOORD8);
     DATA(FLAT(uint), OverlayIndex,TEXCOORD9);
     DATA(FLAT(uint), ClampMode, TEXCOORD10);
-#line 34
+#line 35
 };
 
 
@@ -2243,6 +2299,14 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
     albedo.rgb *= gFrameData.dbgScales.z;
 
     float3 c = albedo.rgb * lit;
+
+
+
+
+
+
+
+    c *= 1.0f + enchantGlow(In.Normal, In.WorldPos, (In.ClampMode & 8u) != 0u);
     c *= gFrameData.dbgScales.w;
     c = tonemap(c);
 

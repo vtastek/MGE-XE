@@ -1398,9 +1398,11 @@ VSOutput VS_MAIN( VSInput In )
 
 
 
+
     uint drawIndex = In.Meta & 0x3FFu;
     uint stageCount = (In.Meta >> 10u) & 0x7u;
     uint vColSource = (In.Meta >> 13u) & 0x3u;
+    uint glowBit = (In.Meta >> 15u) & 0x1u;
     uint alphaRefB = (In.Meta >> 16u) & 0xFFu;
     uint uvAnimId = (In.Meta >> 24u) & 0xFFu;
 
@@ -1437,7 +1439,8 @@ VSOutput VS_MAIN( VSInput In )
 
 
 
-    Out.Packed = stageCount | (vColSource << 3u) | (alphaRefB << 8u);
+
+    Out.Packed = stageCount | (vColSource << 3u) | (glowBit << 5u) | (alphaRefB << 8u);
 
     float dist = length(worldPos.xyz - gFrameData.eyePos.xyz);
     Out.Fog = saturate((gFrameData.fogParams.y - dist)

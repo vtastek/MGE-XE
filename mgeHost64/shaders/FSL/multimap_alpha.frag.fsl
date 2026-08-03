@@ -16,6 +16,7 @@
 #include "texsample.h.fsl"   // sampleBase() — MW address mode + AF level
 #include "skyamb.h.fsl"      // skyAmbFactor() — SH-L1 sky ambient (SH1) + sky AO (SH2)
 #include "skydome.h.fsl"     // applyFog() — extinguish into a silhouette, then melt into the SAMPLED sky
+#include "enchantglow.h.fsl" // enchantGlow() — MW's caustic env map over enchanted items
 
 STRUCT(VSOutput)
 {
@@ -166,6 +167,10 @@ float4 PS_MAIN( VSOutput In )
     // Alpha test on the BASE stage (kept for parity; these windows carry no test → alphaRef 0).
     if (baseA < alphaRef) { discard; }
 
+    // MW's enchanted-item glow (Packed bit5 — see multimap.vert). Multiplicative on the shaded
+    // result, and not scaled by the output alpha: the blend PSO is SRCALPHA, so coverage is applied
+    // at blend time, as alpha.frag notes.
+    c *= 1.0f + enchantGlow(In.Normal, In.WorldPos, (In.Packed & 0x20u) != 0u);
     c *= gFrameData.dbgScales.w;
     c = tonemap(c);
     c = applyFog(c, In.WorldPos, In.Position.xy, In.Fog);

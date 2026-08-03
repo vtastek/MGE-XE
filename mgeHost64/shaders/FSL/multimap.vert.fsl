@@ -19,7 +19,7 @@ STRUCT(VSInput)
     DATA(float2, Uv1,        TEXCOORD1);   // per-vertex UV set 1
     DATA(float2, Uv2,        TEXCOORD2);   // per-vertex UV set 2
     DATA(float2, Uv3,        TEXCOORD3);   // per-vertex UV set 3
-    DATA(uint,   Meta,       TEXCOORD4);   // per-instance: DrawIndex(0-9)|stageCount(10-12)|vColSource(13-14)|alphaRef*255(16-23)|uvAnimId(24-31)
+    DATA(uint,   Meta,       TEXCOORD4);   // per-instance: DrawIndex(0-9)|stageCount(10-12)|vColSource(13-14)|enchantGlow(15)|alphaRef*255(16-23)|uvAnimId(24-31)
     DATA(uint4,  Stages,     TEXCOORD5);   // per-instance: 4 packed stage words (texIndex(16)|uvSet(16-17)|op(18-19))
     DATA(float3, MatDiffuse, TEXCOORD6);   // per-instance: material diffuse rgb
     DATA(float3, MatAmbient, TEXCOORD7);   // per-instance: material ambient rgb
@@ -42,7 +42,7 @@ STRUCT(VSOutput)
     DATA(FLAT(float3),MatEmissive,TEXCOORD7);
     DATA(float3,      WorldPos,   TEXCOORD8); // Tier 3a: world position for point-light eval
     DATA(FLAT(uint4), Stages,     TEXCOORD9); // 4 packed stage words
-    DATA(FLAT(uint),  Packed,     TEXCOORD10);// stageCount(0-2)|vColSource(3-4)|alphaRef*255(8-15)  (== Meta>>8)
+    DATA(FLAT(uint),  Packed,     TEXCOORD10);// stageCount(0-2)|vColSource(3-4)|enchantGlow(5)|alphaRef*255(8-15)
 };
 
 ROOT_SIGNATURE(DefaultRootSignature)
@@ -52,10 +52,12 @@ VSOutput VS_MAIN( VSInput In )
     VSOutput Out;
 
     // Meta layout (kMaxMultiMap=1024 widened the index to 10 bits):
-    //   idx(0-9) | stageCount(10-12) | vColSource(13-14) | alphaRef*255(16-23) | uvAnimId(24-31)
+    //   idx(0-9) | stageCount(10-12) | vColSource(13-14) | enchantGlow(15) | alphaRef*255(16-23) |
+    //   uvAnimId(24-31)
     uint drawIndex  = In.Meta & 0x3FFu;
     uint stageCount = (In.Meta >> 10u) & 0x7u;
     uint vColSource = (In.Meta >> 13u) & 0x3u;
+    uint glowBit    = (In.Meta >> 15u) & 0x1u;   // MW's enchanted-item glow (Meta's last spare bit)
     uint alphaRefB  = (In.Meta >> 16u) & 0xFFu;
     uint uvAnimId   = (In.Meta >> 24u) & 0xFFu;
     // Cbuffer matrices are column-major (DXC default), so mul(M, v) with the D3DX bytes
@@ -91,8 +93,9 @@ VSOutput VS_MAIN( VSInput In )
     Out.Stages = In.Stages;
     // Packed keeps the LEGACY interpolator layout — stageCount(0-2)|vColSource(3-4)|
     // alphaRef*255(8-15) — repacked explicitly from the new Meta bits, so multimap.frag /
-    // depthonly_mm.frag are byte-for-byte unchanged.
-    Out.Packed = stageCount | (vColSource << 3u) | (alphaRefB << 8u);
+    // depthonly_mm.frag are byte-for-byte unchanged. Bit 5 was spare in that layout and now carries
+    // the enchant-glow flag; depthonly_mm.frag reads neither it nor anything above bit 4.
+    Out.Packed = stageCount | (vColSource << 3u) | (glowBit << 5u) | (alphaRefB << 8u);
     // MW near fog (per-vertex, matches opaque.vert).
     float dist = length(worldPos.xyz - gFrameData.eyePos.xyz);
     Out.Fog = saturate((gFrameData.fogParams.y - dist)

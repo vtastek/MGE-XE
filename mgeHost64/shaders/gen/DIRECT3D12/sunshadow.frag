@@ -1356,8 +1356,19 @@ STRUCT(LightData)
 #line 38 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/texsample.h.fsl"
 bool isFlipSlot(uint texIdx) { return (texIdx &  0x8000u ) != 0u; }
 
-float4 sampleFlip(uint texIdx, uint clampMode, float2 uv, bool lowAF)
+
+
+
+
+
+
+
+
+
+float4 sampleFlip(uint texIdxIn, uint clampModeIn, float2 uv, bool lowAF)
 {
+    const uint texIdx = texIdxIn;
+    const uint clampMode = clampModeIn &  3u ;
     const uint bucket = (texIdx >> 11u) & ( 16  - 1u);
     const float3 uvw = float3(uv, (float)(texIdx &  0x7FFu ));
     if (lowAF)
@@ -1378,8 +1389,9 @@ float4 sampleFlip(uint texIdx, uint clampMode, float2 uv, bool lowAF)
 
 
 
-float4 sampleBase(uint texIdx, uint clampMode, float2 uv, bool lowAF)
+float4 sampleBase(uint texIdx, uint clampModeIn, float2 uv, bool lowAF)
 {
+    const uint clampMode = clampModeIn &  3u ;
 
 
 

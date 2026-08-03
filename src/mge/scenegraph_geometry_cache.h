@@ -284,6 +284,28 @@ namespace MGE::GeometryCache {
         //
         // Raw engine node → vtable-validated before every deref, and cleared by purgeAll.
         const void* visOwner = nullptr;
+        // MW's enchanted-item glow reaches this shape: the game's ONE shared enchant
+        // NI::TextureEffect is attached to a node above it, so MW's own fixed-function renderer
+        // lays the magicitem\caust00..31 caustic environment map over the item. The Forge path has
+        // no NiTextureEffect support at all, so the effect was simply dropped and every enchanted
+        // item rendered plain — while MW's correct version stayed suppressed at the reject gate.
+        //
+        // NOT captured — recomputed EVERY frame, from the effect's own affectedNodes list
+        // (stampEnchantGlow). It has to be: this flag changes the moment an item is equipped,
+        // dropped, or picked up, and none of those touch NiGeometryData, so the revisionID gate
+        // that re-extracts materials would never fire (the capture-once trap that froze the
+        // NiAlphaController fade — see matAnimated). Driving it top-down from the ONE effect also
+        // costs nothing on the 99.99% of entries that never glow: they are never visited by it.
+        bool  enchantGlow;
+        // ...and the colour MW would tint that glow with: the item's enchantment's FIRST magic
+        // effect's MGEF lighting RGB (Alteration violet, Restoration blue, Destruction red, ...).
+        // Resolved per ITEM, top-down with enchantGlow, from the glow root's own TES3 object —
+        // every attachment root turns out to own a reference ('CLONE thief_ring' -> CLOT
+        // 'thief_ring'), so no engine detour is needed. See enchantcolor.h.
+        //
+        // Only meaningful while enchantGlow is set. Defaults to white, which is what an
+        // unresolvable enchantment falls back to — an untinted glow rather than a black one.
+        float enchantTint[3] = { 1.0f, 1.0f, 1.0f };
         // The GeometryData* this entry was built from. A NiTriShape address can be
         // recycled onto a NEW shape (cell transitions) while the entry survives —
         // with deferred eviction + the far-keep hysteresis that window is real, so
@@ -358,6 +380,22 @@ namespace MGE::GeometryCache {
     // fetched from the engine THIS frame; never touches cached keys. Returns the number
     // of entries stamped. Called from onFrameReady for the player's inactive-POV body.
     uint32_t markSubtreeSuppressed(void* avObject);
+
+    // The caustic texture MW's enchanted-item glow is showing THIS frame
+    // (textures\magicitem\caust00..31.dds — the engine advances it itself), or null when nothing
+    // in the scene is enchanted / the effect has not been created yet. The name is a live pointer
+    // into the engine's NiSourceTexture, valid for the frame; the draw builder resolves it to a
+    // bindless slot and ships that in the frame's lighting block. Set by onFrameReady's glow pass,
+    // beside the CachedGeometry::enchantGlow stamps that say which shapes it applies to.
+    const char* enchantGlowTexture();
+
+    // The WHOLE 32-frame caustic book (engine-owned filename pointers, valid for the session).
+    // Returns the frame count and writes a generation that bumps whenever MW reallocates the book,
+    // so the caller can warm every frame's bindless slot ONCE rather than per frame. Warming is what
+    // removes the load-time flicker: resolving only the frame MW is currently showing first-sights
+    // each of the 32 separately as the animation plays, and each first sight is a slot that samples
+    // empty until its DDS upload lands. Count 0 = the effect has not been created yet.
+    int enchantGlowBook(const char* const*& out, uint32_t& generation);
 
     // MW-ONLY-UI world suppression. Drives appCulled on MW's world roots so the ENGINE stops
     // traversing them (Phase 2 stopped MGE drawing, but MW still walked the graph and issued

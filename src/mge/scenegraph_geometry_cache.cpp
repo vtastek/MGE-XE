@@ -20,21 +20,25 @@
 #include "NISkinInstance.h"
 #include "NIUVController.h"
 #include "NIFlipController.h"
+#include "NITextureEffect.h"
 
 #include "configuration.h"
 #include "datahandler_view.h"
+#include "enchantcolor.h"
 #include "mge_tracy.h"
 #include "mwbridge.h"
 #include "proxydx/d3d8texture.h"
 #include "proxydx/devicelock.h"
 #include "scenegraph.h"
 #include "scenegraph_geometry_cache.h"
+#include "worldcontroller_view.h"
 #include "renderprocess.h"
 #include "distantland.h"   // DistantLand::mwWorldSuppress (MW-ONLY-UI suppression level)
 #include "ipc/geomwire.h"
 #include "support/log.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -120,6 +124,26 @@ namespace MGE::GeometryCache {
         // the per-frame "has your owner been hidden?" pass iterates this instead of the whole
         // cache. Same maintenance contract as the sets above. ⊆ keys(g_cache).
         std::unordered_set<uint32_t>                      g_visKeys;
+        // Keys stamped enchantGlow LAST frame, so the next frame's pass can clear them before it
+        // re-stamps. Unlike the sets above this is NOT membership derived from capture — it is a
+        // per-frame undo list, rebuilt from scratch every frame from the engine's own affected-node
+        // list. That is why it needs no maintenance at the eviction / purge / ensureLive-drop sites
+        // the others do: a key whose entry has gone simply misses on find(), and the very next
+        // frame's rebuild drops it. Typically a handful of entries (the items you are carrying).
+        std::unordered_set<uint32_t>                      g_glowKeys;
+        // The caustic frame the enchant effect is showing this frame (NiSourceTexture::fileName,
+        // engine-owned, re-read every frame because MW advances the flip itself). Null = nothing
+        // enchanted on screen / the effect has not been created yet.
+        const char*                                       g_enchantGlowTex = nullptr;
+        // The WHOLE 32-frame caustic book (engine-owned NiSourceTexture::fileName pointers), plus a
+        // generation that bumps whenever it is (re)collected. The draw builder warms every frame's
+        // bindless slot off this instead of resolving only the one frame MW happens to be showing —
+        // see the flicker note in refreshEnchantGlow.
+        std::vector<const char*>                          g_enchantBook;
+        uint32_t                                          g_enchantBookGen = 0;
+        // Per-item glow tint, memoized by the effect's attachment root (an item's enchantment is
+        // fixed while attached). Bounded by the number of enchanted items in play — single digits.
+        std::unordered_map<const void*, std::array<float, 3>> g_glowTint;
         // Near-eye PLAIN-STATIC shadow-caster keys, rebuilt each eviction sweep (30-frame cadence)
         // by collecting kept entries near the eye. The mover set above re-emits offscreen skinned/
         // MM/rigid-LIVE casters every frame; a plain static (lantern, wall fixture) is NOT a mover
@@ -840,6 +864,12 @@ namespace MGE::GeometryCache {
                 captureMap(ps->texture->getDarkMap(),   e.d3dDark,   e.darkUV,   e.darkTextureName,   e.darkClamp);
                 captureMap(ps->texture->getDetailMap(), e.d3dDetail, e.detailUV, e.detailTextureName, e.detailClamp);
                 captureMap(ps->texture->getGlowMap(),   e.d3dGlow,   e.glowUV,   e.glowTextureName,   e.glowClamp);
+
+                // (The enchanted-item GLOSS probe deliberately does NOT live here: extractMaterial is
+                // revision-gated, and MW attaches the enchant effect to an already-captured shape
+                // without touching NiGeometryData — the same capture-once trap as matAnimated — so a
+                // probe on this path would never fire for the very case it is meant to observe. It
+                // runs in the per-frame glow pass instead, where the state is live by construction.)
 
                 // Terrain decal overlay: maps[6] = DECAL_1 (the second land texture
                 // for splat blending). Present on multi-texture terrain patches.
@@ -2812,6 +2842,163 @@ namespace MGE::GeometryCache {
         g_walkRanFrame = g_frame;
     }
 
+    // Enchanted-item glow: recursive stamp over a live subtree the enchant effect is attached to.
+    // Twin of stampSuppressed — same "touch only entries that already exist, deref nothing but the
+    // child arrays" contract — writing enchantGlow instead of suppressedFrame, and recording each
+    // key so next frame's pass can clear it again.
+    static uint32_t stampEnchantGlow(NI::AVObject* av, const float tint[3]) {
+        if (!av) return 0;
+        if (av->isInstanceOfType(NI::RTTIStaticPtr::NiTriBasedGeom)) {
+            const uint32_t key = reinterpret_cast<uint32_t>(av);
+            auto it = g_cache.find(key);
+            if (it == g_cache.end()) return 0;
+            it->second.enchantGlow = true;
+            it->second.enchantTint[0] = tint[0];
+            it->second.enchantTint[1] = tint[1];
+            it->second.enchantTint[2] = tint[2];
+            g_glowKeys.insert(key);
+
+            // (The gloss/material tint probe that lived here is gone: it answered its question and
+            // the answer is recorded in enchantcolor.h — the colour is NOT on the shape. Every one
+            // of 25 enchanted shapes reported dif=(1,1,1), emis=(0,0,0), an empty GLOSS slot and the
+            // ARTIST's own ambient, which is what sent the search to device state and then to the
+            // TES3 enchantment.)
+            return 1;
+        }
+        uint32_t n = 0;
+        if (av->isInstanceOfType(NI::RTTIStaticPtr::NiNode)) {
+            auto* node = static_cast<NI::Node*>(av);
+            const auto count = node->children.getEndIndex();
+            for (size_t i = 0; i < count; ++i) {
+                n += stampEnchantGlow(node->children.at(i).get(), tint);
+            }
+        }
+        return n;
+    }
+
+    // Rebuild the enchant-glow stamps for this frame from MW's own state, and pick up the caustic
+    // frame the engine has advanced to. Called once per frame from onFrameReady.
+    //
+    // Top-down from the ONE effect, not bottom-up from each shape, because the question "does the
+    // glow reach me?" has no capture-time answer: equipping, dropping or picking up an item changes
+    // it, and none of those touch NiGeometryData, so the revisionID gate that re-extracts materials
+    // would never fire. (That is the capture-once trap that froze the dwemer crystal's alpha fade —
+    // see CachedGeometry::matAnimated.) Driven from the effect it costs literally nothing on the
+    // entries that do not glow: they are never visited.
+    //
+    // affectedNodes is the effect's back-pointer list, and the engine registers EVERY node in each
+    // affected subtree, not just the attachment point. Descending from all of them would re-walk
+    // the same geometry once per level of nesting, so only the FOREST ROOTS descend: a node whose
+    // own parent is also in the list is already covered by that parent's descent.
+    static void refreshEnchantGlow() {
+        for (uint32_t key : g_glowKeys) {
+            auto it = g_cache.find(key);
+            if (it != g_cache.end()) it->second.enchantGlow = false;
+        }
+        g_glowKeys.clear();
+        g_enchantGlowTex = nullptr;
+
+        NI::TextureEffect* fx = MGE::WorldControllerView::enchantedItemEffect();
+        if (!fx || !fx->enabled) return;
+        if (auto* src = fx->sourceTexture.get()) {
+            g_enchantGlowTex = src->fileName;
+            registerTextureName(src);   // so an engine-drawn glow DIP can still name its texture
+        }
+
+        // Collect the whole caustic book ONCE per book allocation. The effect only ever exposes the
+        // frame it is showing this instant, so a client that resolves from sourceTexture alone
+        // first-sights all 32 frames one at a time as the animation advances — each one a fresh
+        // bindless slot with its own queued DDS upload, and each sampling an unpopulated slot until
+        // that upload lands. That is exactly the few-second flicker at load, ending the moment the
+        // last frame becomes resident. MW hands us the entire book, so take it in one go — the same
+        // reasoning registerFlipBookOf applies to NiFlipController.
+        NI::SourceTexture** book = MGE::WorldControllerView::enchantedItemEffectTextures();
+        static NI::SourceTexture** s_lastBook = nullptr;
+        if (book && book != s_lastBook) {
+            s_lastBook = book;
+            g_enchantBook.clear();
+            for (size_t i = 0; i < MGE::WorldControllerView::kEnchantedItemEffectFrames; ++i) {
+                NI::SourceTexture* st = book[i];
+                if (!st || !st->fileName) continue;
+                g_enchantBook.push_back(st->fileName);
+                registerTextureName(st);
+            }
+            ++g_enchantBookGen;
+            LOG::logline(">> [enchant] caustic book collected: %u/%u frames (warms the bindless "
+                         "residency up front; without this each frame first-sights as it plays)",
+                         (unsigned)g_enchantBook.size(),
+                         (unsigned)MGE::WorldControllerView::kEnchantedItemEffectFrames);
+        }
+
+        static std::unordered_set<const void*> s_fxNodes;
+        s_fxNodes.clear();
+        for (const auto* n = &fx->affectedNodes; n && n->data; n = n->next) {
+            s_fxNodes.insert(n->data);
+        }
+        uint32_t roots = 0, stamped = 0;
+        for (const auto* n = &fx->affectedNodes; n && n->data; n = n->next) {
+            const NI::Node* parent = n->data->parentNode;
+            if (parent && s_fxNodes.count(parent)) continue;   // an ancestor's descent covers this
+            ++roots;
+
+            // PER-ITEM TINT. Each attachment root owns its own TES3 reference — measured, not
+            // assumed: 'CLONE icicle' -> WEAP 'icicle', 'CLONE thief_ring' -> CLOT 'thief_ring',
+            // seven for seven. That is what makes this a plain read instead of a detour of
+            // applyEnchantEffect: the reference gives the base object, and the object's virtual
+            // getEnchantment gives the enchantment whose first effect carries the colour.
+            //
+            // baseObject @0x28 is the same MWSE-documented offset referenceLiveKind uses.
+            // White is the deliberate fallback for an unresolvable item (no reference, no
+            // enchantment, or an effect with no MGEF record): the glow stays untinted rather than
+            // vanishing, so a miss degrades to the previous look instead of to a black item.
+            //
+            // MEMOIZED per attachment root, because an item's enchantment cannot change while it is
+            // attached — so this is a once-per-item cost, not a per-frame one. It matters only
+            // because nothing on the GPU consumes enchantTint yet (the per-draw palette was
+            // deliberately not built): re-deriving a value no shader reads, every frame, is exactly
+            // the kind of cost that has no business being in the frame loop. Keyed on the root node
+            // and cleared with the rest of the glow state on purge.
+            float tint[3] = { 1.0f, 1.0f, 1.0f };
+            {
+                auto memo = g_glowTint.find(n->data);
+                if (memo != g_glowTint.end()) {
+                    tint[0] = memo->second[0]; tint[1] = memo->second[1]; tint[2] = memo->second[2];
+                } else {
+                    if (const void* ref = n->data->getTes3Reference(/*searchParents=*/false)) {
+                        if (const void* base = *reinterpret_cast<void* const*>(
+                                static_cast<const char*>(ref) + 0x28)) {
+                            MGE::EnchantColor::colorForObject(base, tint);
+                        }
+                    }
+                    g_glowTint.emplace(n->data, std::array<float, 3>{ tint[0], tint[1], tint[2] });
+                }
+            }
+            stamped += stampEnchantGlow(n->data, tint);
+
+            if (Configuration.LogDistantPipeline) {
+                static std::unordered_set<const void*> s_rootProbed;
+                if (s_rootProbed.size() < 24 && s_rootProbed.insert(n->data).second) {
+                    LOG::logline(">> [enchant-item] root '%s' tint=(%.3f,%.3f,%.3f)",
+                                 n->data->name ? n->data->name : "(unnamed)",
+                                 tint[0], tint[1], tint[2]);
+                }
+            }
+        }
+
+        // One line per CHANGE of shape: how many distinct items the shared effect is attached to and
+        // how many cached shapes that reached. If the tint really is per item, each root here is one
+        // item — which is the hook a per-item colour would hang off.
+        if (Configuration.LogDistantPipeline) {
+            static uint32_t s_lastRoots = 0xFFFFFFFFu, s_lastStamped = 0xFFFFFFFFu;
+            if (roots != s_lastRoots || stamped != s_lastStamped) {
+                s_lastRoots = roots; s_lastStamped = stamped;
+                LOG::logline(">> [enchant] effect attached to %u item root(s), %u cached shape(s); "
+                             "caustic='%s'", roots, stamped,
+                             g_enchantGlowTex ? g_enchantGlowTex : "(none)");
+            }
+        }
+    }
+
     void onFrameReady(void* dataHandler, const float* gateEye, float gateRadius, bool liveDrawBuild) {
         if (!g_device || !dataHandler) return;
         if (!Configuration.UseSceneGraphSnapshot) return;
@@ -2963,6 +3150,11 @@ namespace MGE::GeometryCache {
                 e.suppressedFrame = g_frame;
             }
         }
+
+        // Enchanted-item glow pass. Third in the same family as the two above and the cheapest of
+        // them: MW keeps ONE NiTextureEffect for the whole game and tells us exactly which nodes it
+        // is attached to, so there is nothing to search for. See refreshEnchantGlow.
+        refreshEnchantGlow();
 
         // Switch-variant state probe. Reports the CAPTURED SHADING INPUTS of every switch-bound
         // entry, not just which branch it belongs to — the day/night window bug turned out NOT to
@@ -3903,6 +4095,9 @@ namespace MGE::GeometryCache {
         g_fpKeys.clear();
         g_switchKeys.clear();        // switchOwner points at engine nodes this purge invalidates
         g_visKeys.clear();           // visOwner likewise
+        g_glowKeys.clear();          // undo list for entries this purge just dropped
+        g_glowTint.clear();          // keyed on engine nodes this purge invalidates
+        g_enchantGlowTex = nullptr;  // engine NiSourceTexture; refreshEnchantGlow re-reads it
         g_nearStaticCasters.clear(); // stale snapshot (find-guarded anyway); rebuilt next sweep
         g_nearAlphaCasters.clear();
         g_geomRefs.clear();   // NI::Pointer dtors → DecRef every shape we were pinning
@@ -4096,6 +4291,16 @@ namespace MGE::GeometryCache {
 
     uint32_t markSubtreeSuppressed(void* avObject) {
         return stampSuppressed(static_cast<NI::AVObject*>(avObject));
+    }
+
+    const char* enchantGlowTexture() {
+        return g_enchantGlowTex;
+    }
+
+    int enchantGlowBook(const char* const*& out, uint32_t& generation) {
+        out = g_enchantBook.data();
+        generation = g_enchantBookGen;
+        return (int)g_enchantBook.size();
     }
 
     int buildMoonDrawList(void* moonRoot, MoonShapeDraw out[2]) {

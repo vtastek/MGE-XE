@@ -1,0 +1,145 @@
+// mgeHost64 — MW's enchanted-item glow (FSL ONLY).
+//
+// Morrowind lays a caustic ENVIRONMENT MAP over every enchanted weapon, armour piece and misc
+// item. It is not authored into any mesh: the engine keeps ONE NI::TextureEffect for the whole
+// game (TES3::WorldController::enchantedItemEffect), attaches it to the scene node of each
+// enchanted item, and re-points its sourceTexture at textures\magicitem\caust00..31.dds frame by
+// frame. MW's fixed-function renderer then draws the item with an extra texture stage whose
+// coordinates come from D3D texgen off the CAMERA-SPACE NORMAL.
+//
+// MGE's DX9 baseline reproduces that because its FFE JIT implements all four D3D texgen modes
+// (ffeshader.cpp: texgenNormal/Position/Reflection/Sphere). The Forge path had no NiTextureEffect
+// support of any kind, so the effect was simply dropped — and because MW's own draw of the item is
+// suppressed at the reject gate, the glow disappeared entirely rather than falling back.
+//
+// WHAT THIS REPRODUCES, and where the numbers come from: MGE's FFE shader generator precaches the
+// exact stage setup MW uses for this effect (ffeshader.cpp, "Enchantment effects"):
+//     stage0 = MODULATE(TEXTURE = envmap, DIFFUSE)     texcoordGen 3 = CAMERASPACEREFLECTIONVECTOR
+//     stage1 = MODULATE(TEXTURE = base,   CURRENT)     fogMode 0
+// Decoding that against the Stage bitfield (colorOp, colorArg1, colorArg2, colorArg0, ...), stage0
+// is MODULATE(TEXTURE, DIFFUSE) and stage1 is MODULATE(TEXTURE, CURRENT), so the glow pass draws
+//
+//     base * caustic * DIFFUSE          (DIFFUSE = the LIT vertex colour, i.e. the same shading
+//                                        the ordinary draw computes, tinted by the D3D material)
+//
+// blended over the item's ordinary draw `base * lit`. Summing the two passes:
+//
+//     base*lit + base*caustic*tint*lit  ==  c * (1 + caustic*tint)
+//
+// which is why this is MULTIPLICATIVE on the already-shaded colour rather than an additive term.
+// Two things fall out, both confirmed against MW by eye (2026-08-03):
+//   * the glow is modulated by the item's OWN BASE TEXTURE (stage1) and by the scene lighting. A
+//     flat additive white caustic reads far too bright and loses the tint entirely — the first
+//     cut's mistake; an additive UNLIT version was the second, and it is equally wrong, because
+//     colorArg2 is D3DTA_DIFFUSE and that is the lit colour, not a flat constant.
+//   * the coordinates come from the REFLECTION vector, not the surface normal. The reflection turns
+//     about twice as fast as the normal and depends on where you are standing, so the caustics
+//     sweep across a blade rather than sitting on it. g_enchantGlowReflect switches back to the
+//     plain sphere map (texgenNormal) for a live A/B, because the difference is subtle enough that
+//     it is worth being able to flip.
+//
+// THE TINT, and where it is NOT. The caust textures are pure GREYSCALE (decoded 2026-08-03: mean
+// RGB 19,19,19), so MW's violet comes from the DIFFUSE arg, not the texture. A live probe over 25
+// enchanted shapes then ruled out the whole scene graph: every one reported dif=(1,1,1),
+// emis=(0,0,0), a GLOSS slot that is empty at runtime as well as in the mesh, and an `amb` equal to
+// the artist's authored value (c_ring_common04.nif really is 0.180/0.063/0.169). Nothing on the
+// shape carries it, and WorldController keeps ONE shared NiTextureEffect, which cannot.
+//
+// It lives in DEVICE STATE: `frs->material.diffuse`, the D3D material at the glow draw
+// (ffeshader.cpp:1081 feeds exactly that to the DX9 path's materialDiffuse). MW sets it per item
+// from the enchantment — applyEnchantEffect takes an Enchantment*, and the MGEF records carry a
+// per-effect RGB, which is also what OpenMW's getEnchantmentColor reads. That is why the DX9
+// baseline gets the tint for free and this path does not: the value never enters the scene graph.
+//
+// Until that is captured per item the tint is one host colour. Correct if MW's is fixed, a good
+// average if not; the observed spread is by magic school (Alteration violet, Restoration blue,
+// Destruction red) and subtle.
+//
+// FFE's texgen also carries a per-stage texture MATRIX (D3DTS_TEXTURE0+stage) which the DX9 path
+// reads off the device. There is no equivalent on this path, so the [0,1] remap below stands in for
+// it — the standard sphere-map transform, which is what MW's matrix is.
+//
+// KNOWN DIVERGENCE, deliberate: MW does not fog its glow pass (fogMode 0), so at distance MW's
+// caustic punches through fog while ours melts with the surface it is folded into. Enchanted items
+// are near-field; not worth a separate pass to reproduce.
+//
+// Include AFTER opaque.srt.h + texsample.h.fsl (needs gFrameData, gTextures and the static
+// samplers). Every world frag that can draw an enchantable shape calls it: opaque.frag (static +
+// skinned, the bulk — held weapons and worn armour), alpha.frag (blended items), multimap.frag /
+// multimap_alpha.frag (items carrying dark/detail/glow sibling maps).
+
+// The camera basis, recovered from viewProj rather than shipped as a second matrix. With the
+// column-major cbuffer convention this codebase uses (mul(M,v) == D3DX's v*M), HLSL row 0 of
+// viewProj is the D3DX matrix's first COLUMN — which for View*Proj is the world-space camera RIGHT
+// scaled by the projection's x scale, and row 1 likewise the camera UP. Normalising drops the
+// aspect/FOV scaling and leaves the orthonormal axes, so no new FrameData field is needed and this
+// stays correct when the FOV changes (the first-person ARM camera runs at a different FOV to the
+// main scene — see [[project_forge_first_person]]).
+float3 enchantCamRight() { return normalize(gFrameData.viewProj[0].xyz); }
+float3 enchantCamUp()    { return normalize(gFrameData.viewProj[1].xyz); }
+
+// The caustic frame this draw should show, as a bindless slot, plus the texgen mode. The CLIENT
+// resolves MW's current sourceTexture to a slot each frame and ships it in skyZenith.w (a lane the
+// sky dome never used); the HOST then ORs in the mode bit. Packed into ONE lane rather than taking
+// a second: bindless slots are < MAX_TEXTURES (880), so a bit at 4096 can never collide with one,
+// and the alternative free FrameData lanes are all written from paths that do not run every frame
+// (the DL primary block zeroes lodParams.yz, and it is skipped in interiors).
+//
+// The host copies this block into the reflection and first-person frame cbuffers too, so an
+// enchanted sword glows in the water and in the player's hands off one write.
+//
+// Slot 0 means "nothing enchanted on screen", and it is ALSO what an unbound/stale cbuffer reads
+// as — so the failure mode of every step in this chain is the old, glow-less image rather than a
+// wrong one. eyePos.w is the host's strength knob (0 = the A/B; the near frame is camera-relative,
+// so eyePos.xyz is the origin and its w never carried anything).
+#define ENCHANT_REFLECT_BIT 4096u
+uint  enchantWord()     { return (uint)(gFrameData.skyZenith.w + 0.5f); }
+uint  enchantSlot()     { return enchantWord() & (ENCHANT_REFLECT_BIT - 1u); }
+bool  enchantReflect()  { return (enchantWord() & ENCHANT_REFLECT_BIT) != 0u; }
+float enchantStrength() { return gFrameData.eyePos.w; }
+
+// The glow colour, as RGB888 packed into ONE float lane (lodParams.y — retired DL-bake padding).
+// One lane rather than three because FrameData is exactly full at its 512B CBV, and float32 holds
+// integers to 2^24 exactly, so r*65536 + g*256 + b round-trips with no error at all.
+float3 enchantTint()
+{
+    uint p = (uint)(gFrameData.lodParams.y + 0.5f);
+    return float3(float((p >> 16u) & 0xFFu),
+                  float((p >>  8u) & 0xFFu),
+                  float( p         & 0xFFu)) * (1.0f / 255.0f);
+}
+
+// The caustic factor for a fragment. The caller does
+//     c *= 1.0f + enchantGlow(...)
+// which is MW's two passes summed — see the derivation above. The base map and the lighting are
+// both already in the caller's `c`, so neither is passed in. Returns black when the draw does not
+// glow, the feature is off, or the slot is out of range: 1 + 0 is the identity, so callers apply it
+// unconditionally and the compiler folds the whole thing away on the uniform branch.
+//
+// `glowing` comes from a FLAT per-draw lane and the slot/strength/mode from the cbuffer, so this is
+// a uniform branch across the whole draw: it costs nothing on the ~all of the frame that never
+// glows. worldPos is in whatever space the pass uses — the eye vector is taken against
+// gFrameData.eyePos, exactly as opaque.vert's fog distance is, so the near (camera-relative),
+// mirror and first-person passes are all handled by the same expression.
+float3 enchantGlow(float3 N, float3 worldPos, bool glowing)
+{
+    if (!glowing) { return float3(0.0f, 0.0f, 0.0f); }
+    uint slot = enchantSlot();
+    float k = enchantStrength();
+    if (slot == 0u || slot >= MAX_TEXTURES || k <= 0.0f) { return float3(0.0f, 0.0f, 0.0f); }
+
+    float3 n = normalize(N);
+    // FFE texgenReflection(viewpos, normal) = reflect(normalize(viewpos), normalize(normal)),
+    // computed in VIEW space. reflect() is rotation-invariant, so reflecting in world space and
+    // then projecting onto the camera axes below gives the identical result without needing the
+    // view matrix in the cbuffer.
+    float3 dir = enchantReflect() ? reflect(normalize(worldPos - gFrameData.eyePos.xyz), n) : n;
+
+    // The [0,1] remap that stands in for MW's texture matrix. V is flipped because D3D texture V
+    // runs DOWN while the camera's up axis runs up.
+    float2 uv = float2(0.5f + 0.5f * dot(enchantCamRight(), dir),
+                       0.5f - 0.5f * dot(enchantCamUp(),    dir));
+    // CLAMP, not wrap: the uv is a projection of a DIRECTION, so the [0,1] edge is the silhouette
+    // of the sphere and wrapping there tiles the caustic pattern back across the surface.
+    return SampleTex2D(gTextures[slot], gSamplerAnisoClampClamp, uv).rgb * enchantTint() * k;
+}

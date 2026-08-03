@@ -18,6 +18,7 @@
 #include "msmrecv.h.fsl"     // sunShadowVisibility() — MSM sun-shadow receiver
 #include "skyamb.h.fsl"      // skyAmbFactor() — SH-L1 sky ambient (SH1) + sky AO (SH2)
 #include "skydome.h.fsl"     // applyFog() — extinguish into a silhouette, then melt into the SAMPLED sky
+#include "enchantglow.h.fsl" // enchantGlow() — MW's caustic env map over enchanted items
 
 STRUCT(VSOutput)
 {
@@ -227,6 +228,11 @@ float4 PS_MAIN( VSOutput In )
     // thinness (1 - final opacity: thinner/more-transparent -> more bleed-through). transStrength
     // (alphaParams.z) drives it live; at 0 the far side is flat MW-dark (parity).
     c += transStrength * (1.0f - outA) * transLit * albedo.rgb;
+    // MW's enchanted-item glow (ClampMode bit3; bit2 is the two-sided flag this frag already reads).
+    // Multiplicative on the shaded colour — see opaque.frag for the two-pass derivation. No extra
+    // scaling by outA: the pipeline blends SRCALPHA, so a translucent item's glow is already
+    // attenuated by its own coverage at blend time, exactly as MW's own second draw would be.
+    c *= 1.0f + enchantGlow(In.Normal, In.WorldPos, (In.ClampMode & 8u) != 0u);
     c *= gFrameData.dbgScales.w;
     c = tonemap(c);
     c = applyFog(c, In.WorldPos, In.Position.xy, In.Fog);

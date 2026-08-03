@@ -2116,6 +2116,34 @@ namespace {
     // Below the eye's horizontal plane saturate(dir.z) is 0 and this is inert at ANY strength, which
     // is why the ground, the sea and everything under the horizon cannot move: the negative control.
     float              g_fogSkyStrength  = 1.0f;
+    // MW's enchanted-item glow: the caustic environment map the engine lays over every enchanted
+    // weapon, armour piece and misc item (textures\magicitem\caust00..31.dds, cycled by MW itself).
+    // The DX9 baseline reproduces it because MGE's FFE JIT implements D3D texgen in full; the Forge
+    // path had no NiTextureEffect support at all, so the effect was dropped on the floor while MW's
+    // own correct draw stayed suppressed at the reject gate — enchanted gear rendered plain.
+    //
+    // Which shapes glow comes from the engine (the effect's own affectedNodes list) and rides one
+    // spare bit per draw; WHICH caustic frame comes from the client each frame in skyZenith.w. The
+    // only free parameters are these two, and they exist for the A/B: 0 strength = the pre-takeover
+    // image exactly, with no other path disturbed.
+    bool               g_enchantGlow         = true;
+    float              g_enchantGlowStrength = 1.0f;
+    // Which texgen the caustic coordinates come from. TRUE = the CAMERASPACEREFLECTIONVECTOR the
+    // FFE precache key records for this effect (ffeshader.cpp, "Enchantment effects": texcoordGen
+    // 3); FALSE = the plain camera-space normal, i.e. a sphere map. The reflection turns about
+    // twice as fast and depends on viewer position, so caustics sweep across a blade instead of
+    // sitting on it. A live toggle rather than a constant because the two are close enough that
+    // eyeballing one in isolation does not settle it.
+    bool               g_enchantGlowReflect  = true;
+    // The glow's COLOUR. The caust textures are pure greyscale (verified 2026-08-03: mean RGB
+    // 19,19,19), so MW's characteristic violet comes from the DIFFUSE argument of its glow stage,
+    // which TES3::WorldController::applyEnchantEffect takes from the item's Enchantment — and the
+    // MGEF records carry a per-effect RGB (OpenMW reads the first effect's colour for exactly this).
+    // Whether MW actually varies it per item or uses one colour is still open, so this is a single
+    // host colour for now: right either way if MW is fixed, and a good average if it is not.
+    // Default = Mysticism's (255,223,255), the most common violet in the MGEF table and the school
+    // most soul-gem enchantments land in.
+    float              g_enchantGlowTint[3]  = { 1.0f, 0.875f, 1.0f };
     // ...and EXTINCTION: how dark a surface goes as fog closes in, BEFORE it melts. Applied to the
     // surface and ramped by (1 - fog), not to the fog target — a target-side term only shows up once
     // fog is complete, by which point the surface has already been replaced by the sky and there is
@@ -3033,8 +3061,16 @@ namespace {
         const uint32_t aref = (uint32_t)(r * 255.0f + 0.5f) & 0xFFu;
         // Bit 28 = two-sided (DRAW_BOTH) flag: opaque.vert forwards it as ClampMode bit2, alpha.frag
         // reads it for two-sided |N.L| lighting. Only alpha draws pass twoSided; opaque leaves it 0.
+        // Bit 29 = MW's ENCHANTED-ITEM GLOW, decoded out of the clampMode argument's own spare bit
+        // (IPC::kTexFlagEnchantGlow) rather than taken as another parameter. Doing it here is the
+        // whole plumbing: every draw path that already forwards its wire's clampMode — near static,
+        // skinned, sorted alpha, and each of their first-person twins — picks the glow up with no
+        // per-path change and no call-site edit. Paths that pass a literal address mode (sky,
+        // terrain, distant land) can never set it, which is correct: none of them can be enchanted.
+        // opaque.vert forwards it as ClampMode bit3; enchantglow.h.fsl reads it.
         return tex | (aref << 16) | ((vColSource & 0x3u) << 24) | ((clampMode & 0x3u) << 26)
-             | (twoSided ? (1u << 28) : 0u);
+             | (twoSided ? (1u << 28) : 0u)
+             | ((clampMode & IPC::kTexFlagEnchantGlow) ? (1u << 29) : 0u);
     }
 
     // SK2: D3DBLEND_* (the SkyDrawWire blend factors, captured from NiAlphaProperty) — the host
@@ -8451,6 +8487,21 @@ namespace {
           // fraction of contrast per equal step), so ridges finish darkening BEFORE they melt and each
           // one lands on its own shade. Lower = more separation between successive hills.
           t.sliderF("Fog: silhouette SHAPE (<1 = layered ridges, 1 = linear)", &g_fogSkyShape, 0.15f, 2.0f, 0.05f, "%.02f");
+          // MW's enchanted-item glow. Only shapes the engine's own enchant NiTextureEffect is
+          // attached to are touched, so the whole rest of the frame is the negative control: draw a
+          // sword you have enchanted, then unequip it, and nothing else in the image may move.
+          t.checkbox("Enchant glow: enable (env map on enchanted items)", &g_enchantGlow);
+          t.sliderF("Enchant glow: strength (0 = the A/B)", &g_enchantGlowStrength, 0.0f, 4.0f, 0.05f, "%.02f");
+          // Which direction the caustic is sampled along. ON = MW's recorded texgen (reflection
+          // vector); OFF = the surface normal (sphere map). Turn on the spot with a weapon drawn:
+          // the reflection sweeps as you turn, the normal stays put on the blade.
+          t.checkbox("Enchant glow: reflection texgen (off = sphere/normal)", &g_enchantGlowReflect);
+          // The tint MW gets from the enchantment's magic effect (the caust textures themselves are
+          // greyscale). No colour-picker widget on this panel, so three sliders; 1/1/1 gives the
+          // untinted white the first cut had, for the A/B against MW's violet.
+          t.sliderF("Enchant glow: tint R", &g_enchantGlowTint[0], 0.0f, 1.0f, 0.01f, "%.02f");
+          t.sliderF("Enchant glow: tint G", &g_enchantGlowTint[1], 0.0f, 1.0f, 0.01f, "%.02f");
+          t.sliderF("Enchant glow: tint B", &g_enchantGlowTint[2], 0.0f, 1.0f, 0.01f, "%.02f");
           t.flush(); }
 
         // -- Tab: Shadows (P1 point-light shadow atlas + fixture classification) --
@@ -9364,6 +9415,13 @@ namespace ForgeRender {
             // at 64..67). The scene-probe passes only 24 floats, so guard on the null-lighting path.
             float* fd = (float*)g_live.pFrameCbv->pCpuMappedAddress;
             fd[68] = lighting[28]; fd[69] = lighting[29]; fd[70] = lighting[30]; fd[71] = lighting[31];
+            // ...and skyZenith.w (71), which the dome never used, carries the enchanted-item glow:
+            // the client's bindless slot for MW's current caustic frame, plus the texgen mode bit
+            // ORed in here. Packed into the one lane because bindless slots are < kMaxTextures
+            // (880), so 4096 cannot collide with one — and because every OTHER free FrameData lane
+            // is written from a block that does not run every frame (lodParams.yz is zeroed in the
+            // DL primary path, which interiors skip). enchantglow.h.fsl decodes both.
+            if (g_enchantGlowReflect) { fd[71] = lighting[31] + 4096.0f; }
             // "Fog samples the sky" (skydome.h.fsl) — three lanes, all of which have to land HERE:
             // after the 24-float lighting memcpy above (which covers floats 16..39, so it would
             // otherwise stomp two of them) and before the reflect/FP cbuffer copies further down,
@@ -9382,6 +9440,26 @@ namespace ForgeRender {
                 const float ah = (float)(g_live.allocHeight ? g_live.allocHeight : g_live.height);
                 fd[34] = (aw > 0.0f) ? (1.0f / aw) : 0.0f;
                 fd[35] = (ah > 0.0f) ? (1.0f / ah) : 0.0f;
+            }
+            // Enchanted-item glow strength -> eyePos.w (39), the last lane of the same memcpy block
+            // and read by nothing else (the near frame is camera-relative, so eyePos is 0,0,0 and its
+            // w has never carried anything). Written HERE for the same reason fd[31] is: after the
+            // lighting memcpy that would stomp it, before the reflect/FP copies that carry it across.
+            // 0 turns the glow off entirely — the A/B against the pre-takeover image — without the
+            // client having to stop resolving the caustic slot.
+            fd[39] = g_enchantGlow ? std::max(0.0f, g_enchantGlowStrength) : 0.0f;
+            // ...and the glow TINT into lodParams.y (49), RGB888 in one float lane. float32 holds
+            // integers exactly to 2^24, so 24 bits round-trip with no error. dlCullAndBuild used to
+            // zero this lane as dead DL-bake padding and no longer touches it — see the note there;
+            // it runs after this write, so a second writer meant no glow outdoors.
+            {
+                auto q = [](float v) -> uint32_t {
+                    const float c = v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
+                    return (uint32_t)(c * 255.0f + 0.5f) & 0xFFu;
+                };
+                fd[49] = (float)((q(g_enchantGlowTint[0]) << 16)
+                               | (q(g_enchantGlowTint[1]) <<  8)
+                               |  q(g_enchantGlowTint[2]));
             }
             // The third lane, skyParams.w (63) = fog EXTINCTION, is written with the rest of skyParams
             // further down rather than here — that block runs unconditionally and would clobber a
@@ -12824,8 +12902,13 @@ namespace ForgeRender {
                 const uint32_t vcs  = it.vColSource & 0x3u;
                 // Meta layout matches the Z-prepass pack above (idx 10 bits + uvAnimId 24-31);
                 // uvAnimIdFor is memoized per frame, so both loops stamp the same id.
+                // Bit 15 was Meta's one remaining spare and now carries MW's enchanted-item glow.
+                // Multi-map has no clampMode lane to hide it in (address mode is per STAGE, packed
+                // into the stage words), so Route C ships it in drawFlags and it lands here; the
+                // Z-prepass pack above deliberately leaves it 0 (depth does not glow).
                 const uint32_t uvId = g_meshes[slot].uvKeys ? uvAnimIdFor(g_meshes[slot]) : 0u;
-                e[0] = (idx & 0x3FFu) | (sc << 10u) | (vcs << 13u) | (aref << 16u) | (uvId << 24u);
+                const uint32_t glow = (it.drawFlags & IPC::kMMDrawFlagEnchantGlow) ? (1u << 15) : 0u;
+                e[0] = (idx & 0x3FFu) | (sc << 10u) | (vcs << 13u) | glow | (aref << 16u) | (uvId << 24u);
                 e[1] = it.stages[0]; e[2] = it.stages[1]; e[3] = it.stages[2]; e[4] = it.stages[3];
                 float* fe = (float*)e;
                 fe[5]  = it.matDiffuse[0];  fe[6]  = it.matDiffuse[1];  fe[7]  = it.matDiffuse[2];
@@ -13323,7 +13406,8 @@ namespace ForgeRender {
                 const uint32_t aref = (uint32_t)(ar * 255.0f + 0.5f) & 0xFFu;
                 const uint32_t vcs  = it.vColSource & 0x3u;
                 const uint32_t uvId = g_meshes[slot].uvKeys ? uvAnimIdFor(g_meshes[slot]) : 0u;
-                e[0] = (idx & 0x3FFu) | (sc << 10u) | (vcs << 13u) | (aref << 16u) | (uvId << 24u);
+                const uint32_t glow = (it.drawFlags & IPC::kMMDrawFlagEnchantGlow) ? (1u << 15) : 0u;
+                e[0] = (idx & 0x3FFu) | (sc << 10u) | (vcs << 13u) | glow | (aref << 16u) | (uvId << 24u);
                 e[1] = it.stages[0]; e[2] = it.stages[1]; e[3] = it.stages[2]; e[4] = it.stages[3];
                 float* fe = (float*)e;
                 fe[5]  = it.matDiffuse[0];  fe[6]  = it.matDiffuse[1];  fe[7]  = it.matDiffuse[2];
@@ -19945,9 +20029,14 @@ namespace ForgeRender {
         if (T.primary) {
             float* fd = (float*)g_live.pFrameCbv->pCpuMappedAddress;
             // lodParams.x = the light handoff above (terrain.frag's per-fragment near/far pick).
-            // .yz were the DL world bake's normal/detail atlas slots — retired with the bake.
+            // .z was one of the DL world bake's normal/detail atlas slots — retired with the bake.
             // .w (nearViewRange) survives: statics.vert still gates the hero near-cut on it.
-            fd[48] = nearOwn; fd[49] = 0.0f; fd[50] = 0.0f; fd[51] = g_dlNearViewRange;
+            // .y is NOT touched here: it now carries the enchanted-item glow TINT, written once per
+            // frame in the lighting block. This function runs AFTER that write (renderScene calls it
+            // at the DL stage), so zeroing the lane here — as it did while it was dead padding —
+            // blacked the glow out in every exterior while leaving it correct in interiors, which
+            // the DL path skips. One lane, one owner.
+            fd[48] = nearOwn; fd[50] = 0.0f; fd[51] = g_dlNearViewRange;
             fd[52] = fd[24]; fd[53] = fd[25]; fd[54] = fd[26]; fd[55] = 0.0f;  // lodSunAmb = ambCol
             fd[56] = g_dlEye[0]; fd[57] = g_dlEye[1]; fd[58] = g_dlEye[2]; fd[59] = 0.0f;  // lodEye
             fd[116] = 0.0f;   // clustered forward default OFF (froxelDims.x); the froxel fill below sets it when active

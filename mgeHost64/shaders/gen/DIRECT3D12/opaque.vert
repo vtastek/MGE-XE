@@ -1430,11 +1430,8 @@ VSOutput VS_MAIN( VSInput In )
     Out.TexIndex = In.TexAlpha & 0xFFFFu;
     Out.AlphaRef = float((In.TexAlpha >> 16u) & 0xFFu) * (1.0f / 255.0f);
     Out.VColSource = (In.TexAlpha >> 24u) & 0x3u;
-
-
-
-
-    Out.ClampMode = (In.TexAlpha >> 26u) & 0x7u;
+#line 96 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.vert.fsl"
+    Out.ClampMode = (In.TexAlpha >> 26u) & 0xFu;
     Out.Color = In.Color;
     Out.MatDiffuse = In.MatDiffuse;
     Out.MatAmbient = In.MatAmbient;

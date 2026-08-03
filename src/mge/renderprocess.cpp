@@ -2044,7 +2044,9 @@ namespace {
             item.overlayTexIndex = (e.isLandscape && e.d3dOverlay && e.overlayTextureName)
                 ? resolveCachedSlot(e.overlayTextureName, si.ovNamePtr, si.ovSlot, si.ovEpoch) : 0u;
             item.alphaRef = e.alphaTest ? e.alphaRef : 0.0f;     // alpha-test cutout (0 = no test)
-            item.clampMode = e.baseClamp;                        // MW's per-map texture address mode
+            // MW's per-map texture address mode, plus the enchanted-item glow bit riding this
+            // lane's spare bits (see IPC::kTexFlagEnchantGlow — one decode, in packTexAlpha).
+            item.clampMode = e.baseClamp | (e.enchantGlow ? IPC::kTexFlagEnchantGlow : 0u);
             // Tier 2b material: ship the captured MaterialProperty colours + the vertex-colour
             // routing, replicating buildCacheReflectionState/buildCacheMainState EXACTLY. useVCol
             // = mesh has colours AND its VertexColorProperty says to use them (else real material
@@ -2111,7 +2113,9 @@ namespace {
             item.mirror   = e.mirrored ? 1u : 0u;
             item.texIndex = resolveCachedSlot(e.textureName, si.baseNamePtr, si.baseSlot, si.baseEpoch);
             item.alphaRef = e.alphaTest ? e.alphaRef : 0.0f;     // alpha-test cutout (0 = no test)
-            item.clampMode = e.baseClamp;                        // MW's per-map texture address mode
+            // Address mode + the enchanted-item glow bit (IPC::kTexFlagEnchantGlow). Skinned parts
+            // are how ENCHANTED ARMOUR AND CLOTHING glow — they are body parts, not rigid props.
+            item.clampMode = e.baseClamp | (e.enchantGlow ? IPC::kTexFlagEnchantGlow : 0u);
             // Alpha-BLEND state. dispatch() still routes every skinned entry here — a blended
             // skinned part needs the bone palette that only this list carries — so the blend is a
             // TAG, not a re-route: the host packs it in every walk exactly as before and moves only
@@ -2197,7 +2201,8 @@ namespace {
             item.vColSource = (e.hasVertexColor && e.vColSource != 0) ? e.vColSource : 0u;
             item.alphaRef   = e.alphaTest ? e.alphaRef : 0.0f;   // base-stage alpha test
             item.stageCount = (std::uint32_t)ns;
-            item.drawFlags  = blended ? IPC::kMMDrawFlagBlended : 0u;   // Route C: alpha-stage blend draw
+            item.drawFlags  = (blended ? IPC::kMMDrawFlagBlended : 0u)   // Route C: alpha-stage blend draw
+                            | (e.enchantGlow ? IPC::kMMDrawFlagEnchantGlow : 0u);
             item.matAlpha   = e.matDiffuse[3];   // FFE per-draw fade (same source as emitAlphaDraw)
             for (int s = 0; s < ns; ++s) {
                 const std::uint32_t tex = resolveTextureSlot(st[s].name);   // bindless slot (0 = white)
@@ -2225,7 +2230,8 @@ namespace {
             item.srcBlend  = e.srcBlend;
             item.destBlend = e.destBlend;
             item.alphaRef  = e.alphaTest ? e.alphaRef : 0.0f;
-            item.clampMode = e.baseClamp;            // MW's per-map texture address mode
+            // Address mode + the enchanted-item glow bit (IPC::kTexFlagEnchantGlow).
+            item.clampMode = e.baseClamp | (e.enchantGlow ? IPC::kTexFlagEnchantGlow : 0u);
             item.matDiffuse[0]  = e.matDiffuse[0];  item.matDiffuse[1]  = e.matDiffuse[1];  item.matDiffuse[2]  = e.matDiffuse[2];
             item.matAlpha       = e.matDiffuse[3];   // MaterialProperty::alpha (the FFE per-draw fade)
             item.matAmbient[0]  = e.matAmbient[0];  item.matAmbient[1]  = e.matAmbient[1];  item.matAmbient[2]  = e.matAmbient[2];
@@ -4672,6 +4678,30 @@ namespace RenderProcess {
         // is unambiguously "day" rather than to 0, which sits exactly on the switch boundary.
         float glowMargin = -24.0f;
         MGE::WorldControllerView::glowLitMargin(glowMargin);
+        // Enchanted-item glow (lighting[31]): the bindless slot of the caustic frame MW's shared
+        // enchant NiTextureEffect is showing RIGHT NOW. The engine cycles magicitem\caust00..31.dds
+        // itself, so this is re-resolved every frame; the 32 frames cost 32 of ~870 residency slots
+        // once and never churn after that. 0 = nothing enchanted on screen, which is also what the
+        // shader reads as "no glow" — so a scene with no enchanted items pays nothing and a failed
+        // texture load degrades to the current (glow-less) image rather than to garbage.
+        // Warm EVERY frame of the caustic book the first time it appears (and again if MW ever
+        // reallocates it — the generation says so). Resolving only the frame currently on screen
+        // works, but first-sights all 32 one at a time as the animation plays, and a slot whose DDS
+        // upload has not landed yet samples empty — the few-second flicker at load. 32 textures at
+        // 32x32 DXT1 is ~21 KB of residency, paid once.
+        {
+            const char* const* book = nullptr;
+            uint32_t gen = 0;
+            const int n = MGE::GeometryCache::enchantGlowBook(book, gen);
+            static uint32_t s_warmedGen = 0;
+            if (n > 0 && gen != s_warmedGen) {
+                s_warmedGen = gen;
+                for (int i = 0; i < n; ++i) resolveTextureSlot(book[i]);
+                LOG::logline(">> [enchant] warmed %d caustic frames into bindless residency", n);
+            }
+        }
+        const float enchantSlot =
+            float(resolveTextureSlot(MGE::GeometryCache::enchantGlowTexture()));
         const float lighting[36] = {
             sunVecEff.x,               sunVecEff.y,               sunVecEff.z,               0.0f,
             sunColEff.r,               sunColEff.g,               sunColEff.b,               0.0f,
@@ -4691,7 +4721,12 @@ namespace RenderProcess {
             bakeEye[0],                bakeEye[1],                bakeEye[2],                isExterior ? 1.0f : 0.0f,
             // C2 skyZenith (float4 28..31): zenith sky colour for the host dome gradient. Host reads
             // it into FrameData.skyZenith; only sky.frag (dome branch) consumes it.
-            skyZenithR,                skyZenithG,                skyZenithB,                0.0f,
+            // [31] = skyZenith.w, which the dome never used: the enchanted-item glow's caustic
+            // bindless slot. It rides HERE because the host already copies floats 28..31 straight
+            // into FrameData.skyZenith AND carries that block into the reflection and first-person
+            // frame cbuffers — so an enchanted sword glows in its own reflection and in the player's
+            // hands off one write, with no wire growth and no new cbuffer field.
+            skyZenithR,                skyZenithG,                skyZenithB,                enchantSlot,
             // [32] MW SIMULATION time (seconds this session, frozen in menus) — drives the UV scroll
             // of UV-animated distant statics (ghostfence) in statics.vert. This is the SAME clock MGE's
             // DX9 path feeds its `time` uniform (distantland.cpp:987), so the Forge and MGE fences

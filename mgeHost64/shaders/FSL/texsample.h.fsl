@@ -37,8 +37,19 @@
 #define FLIP_LAYER_MASK  0x7FFu
 bool isFlipSlot(uint texIdx) { return (texIdx & FLIP_SLOT_FLAG) != 0u; }
 
-float4 sampleFlip(uint texIdx, uint clampMode, float2 uv, bool lowAF)
+// clampMode arrives as the RAW ClampMode interpolator, which is a flag word, not just an address
+// mode: bit2 = two-sided (alpha.frag), bit3 = enchanted-item glow (enchantglow.h.fsl). Mask to the
+// two address bits HERE, once, in the two functions that actually sample. The comparisons below are
+// equality tests with the last mode as the fallback, so an unmasked flag bit does not fail loudly —
+// every compare simply misses and the draw silently samples WRAP no matter what MW authored. Doing
+// it at the leaf means the next flag added to that word cannot reintroduce the bug in a caller that
+// forgot to mask (alpha.frag masks its own; opaque.frag did not, and had no bits set to catch it).
+#define TEX_ADDR_MASK 3u
+
+float4 sampleFlip(uint texIdxIn, uint clampModeIn, float2 uv, bool lowAF)
 {
+    const uint texIdx    = texIdxIn;
+    const uint clampMode = clampModeIn & TEX_ADDR_MASK;
     const uint bucket = (texIdx >> 11u) & (MAX_FLIP_BUCKETS - 1u);
     const float3 uvw  = float3(uv, (float)(texIdx & FLIP_LAYER_MASK));
     if (lowAF)
@@ -59,8 +70,9 @@ float4 sampleFlip(uint texIdx, uint clampMode, float2 uv, bool lowAF)
 // and fetch-heavy part of the frame (foliage, grates, banners, glass) and they gain the least from
 // high AF, so it is the cheapest AF to give back. Opaque geometry always keeps 8x. Both the address
 // mode and the AF level are uniform per draw, so this whole chain is a uniform branch: free.
-float4 sampleBase(uint texIdx, uint clampMode, float2 uv, bool lowAF)
+float4 sampleBase(uint texIdx, uint clampModeIn, float2 uv, bool lowAF)
 {
+    const uint clampMode = clampModeIn & TEX_ADDR_MASK;   // strip the flag bits (see TEX_ADDR_MASK)
     // Flip books route to gFlipArrays. texIdx is a FLAT per-draw lane, so this is as uniform as the
     // clamp/AF branches below and costs the same: nothing. Decoding ONCE here is the point — a
     // per-shader copy is how the wrap sampler survived in seven frags.

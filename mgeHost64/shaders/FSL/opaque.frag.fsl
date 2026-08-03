@@ -14,6 +14,7 @@
 #include "msmrecv.h.fsl"     // sunShadowVisibility() — MSM sun-shadow receiver
 #include "skyamb.h.fsl"      // skyAmbFactor() — SH-L1 sky ambient (SH1) + sky AO (SH2)
 #include "skydome.h.fsl"     // applyFog() — extinguish into a silhouette, then melt into the SAMPLED sky
+#include "enchantglow.h.fsl" // enchantGlow() — MW's caustic env map over enchanted items
 
 STRUCT(VSOutput)
 {
@@ -263,6 +264,14 @@ float4 PS_MAIN( VSOutput In )
     albedo.rgb *= gFrameData.dbgScales.z;   // dev panel: albedo (texture) intensity modifier
 
     float3 c = albedo.rgb * lit;
+    // MW's enchanted-item glow. MW draws the item a second time as base*caustic*DIFFUSE and blends
+    // it over the ordinary draw; summed, that is c*(1 + caustic*tint) — so this is multiplicative
+    // on the already-shaded colour, which carries the item's base map and its lighting for free.
+    // Applied after shading, before tonemap/fog, matching where MW's extra stage sits in the
+    // fixed-function chain. ClampMode bit3 is the per-draw "this shape is enchanted" flag
+    // (opaque.vert), and it folds away when clear. Covers the STATIC and SKINNED paths at once:
+    // they share this frag, which is how a held weapon and worn armour both light up off one call.
+    c *= 1.0f + enchantGlow(In.Normal, In.WorldPos, (In.ClampMode & 8u) != 0u);
     c *= gFrameData.dbgScales.w;   // dev panel: overall output intensity modifier
     c = tonemap(c);
     // Near fog: lerp toward the SKY as Fog -> 0. At the horizon and below that target IS fogColNear,

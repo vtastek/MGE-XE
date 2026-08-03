@@ -166,6 +166,19 @@ namespace IPC {
     constexpr std::uint32_t kTexWrapSClampT  = 2u;
     constexpr std::uint32_t kTexWrapSWrapT   = 3u;   // default when a mesh has no texturing property
 
+    // ENCHANTED-ITEM GLOW, riding the clampMode lane's spare bits (DrawItemWire / SkinnedDrawWire /
+    // AlphaDrawWire all carry clampMode as a full uint32 for a 2-bit value). Set = MW has attached
+    // its shared enchant NiTextureEffect to this shape's node, so the host must lay the caustic
+    // environment map over it (enchantglow.h.fsl).
+    //
+    // A spare bit here rather than a new wire field on purpose: clampMode is ALREADY forwarded from
+    // every one of those three wires into packTexAlpha, which is the single choke point every draw
+    // path goes through — so the host decodes it in ONE place and every path (near/skinned/alpha,
+    // main and first-person) inherits it with no per-path plumbing and no wire size change.
+    // packTexAlpha masks the address mode to & 3 before packing, so this bit can never be mistaken
+    // for a sampler mode.
+    constexpr std::uint32_t kTexFlagEnchantGlow = 4u;
+
     // Texture-residency upload (Phase 2 bindless texturing). The client resolves each unique
     // texture to a dense slot, reads its RAW DDS bytes via BSA::loadFileBytes, and ships
     // [TexUploadWire][dds bytes] entries through the geometry channel's chunked vec. The host
@@ -307,6 +320,10 @@ namespace IPC {
         float         matAlpha;
     };
     constexpr std::uint32_t kMMDrawFlagBlended = 1u;   // MultiMapDrawWire::drawFlags bit0
+    // Enchanted-item glow, Route C's copy of kTexFlagEnchantGlow. Multi-map has no clampMode lane
+    // to hide in (its address mode is PER STAGE, packed into the stage words), so the bit rides
+    // drawFlags instead; the host relays it into the multimap instance Meta word.
+    constexpr std::uint32_t kMMDrawFlagEnchantGlow = 2u;   // drawFlags bit1
 
     // Per-stage word packers (client builds, host/shader unpack).
     constexpr std::uint32_t kMMOpBase  = 0u;

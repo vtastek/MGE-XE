@@ -26,6 +26,8 @@
 namespace NI {
     struct Node;
     struct Camera;
+    struct TextureEffect;
+    struct SourceTexture;
 }
 
 namespace MGE::WorldControllerView {
@@ -38,6 +40,24 @@ namespace MGE::WorldControllerView {
     constexpr size_t OFF_worldCameraData            = 0x124 + 0x10;  // CameraData::camera
     constexpr size_t OFF_flagMenuMode               = 0xD6;
     constexpr size_t OFF_gvarGameHour               = 0xA8;          // TES3::GlobalVariable* GameHour
+    // Enchanted-item glow. The whole game shares exactly ONE NI::TextureEffect for this: MW builds
+    // it lazily the first time an enchanted item is displayed (hence the `created` bool beside it),
+    // attaches it to the scene node of every enchanted weapon / armour piece / misc item, and
+    // re-points its sourceTexture at textures\magicitem\caust00..31.dds as the animation advances.
+    // So the ONE effect answers both questions the renderer has: its affectedNodes list says WHICH
+    // shapes glow, and its current sourceTexture says WHAT to lay over them — and both have to be
+    // re-read every frame, because equipping an item and advancing the caustic frame are exactly
+    // the two things that change them.
+    constexpr size_t OFF_enchantedItemEffectCreated = 0x368;         // bool
+    constexpr size_t OFF_enchantedItemEffect        = 0x36C;         // NI::Pointer<NI::TextureEffect>
+    // ...and the WHOLE 32-frame caustic book, which is the cure for the load-time flicker: the
+    // effect exposes only the frame it is showing RIGHT NOW, so resolving from that alone first-
+    // sights each frame separately as the animation advances — 32 separate bindless slots, each
+    // with its own queued DDS upload, every one of them sampling an unpopulated slot until it
+    // lands. Warming all 32 up front is the same trick registerFlipBookOf uses for
+    // NiFlipController: the engine already holds the entire book, so take it in one go.
+    constexpr size_t OFF_enchantedItemEffectTextures = 0x370;        // NI::Pointer<NI::SourceTexture>*
+    constexpr size_t kEnchantedItemEffectFrames      = 32;
 
     // TES3::GlobalVariable::value.
     constexpr size_t OFF_globalValue                = 0x34;
@@ -78,6 +98,30 @@ namespace MGE::WorldControllerView {
         void* wc = worldController();
         if (!wc) return nullptr;
         return *reinterpret_cast<NI::Camera**>(static_cast<unsigned char*>(wc) + OFF_worldCameraData);
+    }
+
+    // The shared enchanted-item glow effect, or null before any enchanted item has been displayed
+    // this session (MW creates it lazily — the `created` bool guards a pointer that is garbage,
+    // not null, until then). NI::Pointer's raw pointer is its first and only member, so reading a
+    // TextureEffect** at the offset is the same load, exactly as the weather roots above do.
+    inline NI::TextureEffect* enchantedItemEffect() {
+        void* wc = worldController();
+        if (!wc) return nullptr;
+        auto* base = static_cast<unsigned char*>(wc);
+        if (!*reinterpret_cast<bool*>(base + OFF_enchantedItemEffectCreated)) return nullptr;
+        return *reinterpret_cast<NI::TextureEffect**>(base + OFF_enchantedItemEffect);
+    }
+
+    // Base of MW's 32-entry caustic frame array, or null before the effect exists. Each element is
+    // an NI::Pointer<NI::SourceTexture> — raw pointer first and only member, so the array indexes as
+    // SourceTexture*[]. Guarded by the same `created` bool as the effect itself (the field is
+    // garbage, not null, until MW builds it).
+    inline NI::SourceTexture** enchantedItemEffectTextures() {
+        void* wc = worldController();
+        if (!wc) return nullptr;
+        auto* base = static_cast<unsigned char*>(wc);
+        if (!*reinterpret_cast<bool*>(base + OFF_enchantedItemEffectCreated)) return nullptr;
+        return *reinterpret_cast<NI::SourceTexture***>(base + OFF_enchantedItemEffectTextures);
     }
 
     inline bool menuMode() {

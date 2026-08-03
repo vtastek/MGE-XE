@@ -84,8 +84,16 @@ VSOutput VS_MAIN( VSInput In )
     // MW texture address mode (NiTexturingProperty::Map::clampMode, bits 26-27). 3 = WRAP_S_WRAP_T =
     // MW's default; before this the host sampled everything REPEAT and clamped meshes tiled.
     // Bit 28 (packed by packTexAlpha for two-sided DRAW_BOTH alpha) rides along as ClampMode bit2:
-    // alpha.frag reads (ClampMode & 4) for two-sided lighting and masks (& 3) before sampling.
-    Out.ClampMode  = (In.TexAlpha >> 26u) & 0x7u;
+    // alpha.frag reads (ClampMode & 4) for two-sided lighting.
+    // Bit 29 (MW's enchanted-item glow) rides along as ClampMode bit3 — enchantglow.h.fsl reads it.
+    // Both flags share the word with the address mode, which is why sampleBase()/sampleFlip() mask
+    // it to & 3 at the point of sampling rather than trusting each caller to.
+    //
+    // This is a lane, not a new interpolator, on purpose: opaque.vert's VSOutput is shared by
+    // opaque.frag, depthonly.frag, shadowcaster.frag, sunshadow.frag, alpha.frag, alphadepth.frag
+    // and alphashadowdepth.frag, and a field added here has to be added to EVERY one of them or the
+    // GPU hangs ([[project_forge_shared_frag_vsoutput]]).
+    Out.ClampMode  = (In.TexAlpha >> 26u) & 0xFu;
     Out.Color = In.Color;
     Out.MatDiffuse  = In.MatDiffuse;
     Out.MatAmbient  = In.MatAmbient;
