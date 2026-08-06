@@ -1066,8 +1066,12 @@ namespace MGE::GeometryCache {
         // Build the GeomUVAnimWire blob (header + U keys + V keys) shipped once with the mesh.
         // Returns false (empty out) when nothing usable — the caller then keeps the engine
         // reship path (and must NOT exclude the UV component from the content gate).
+        //
+        // `undoU`/`undoV` come back as the controller's CURRENT offsets, for the caller to remove
+        // from the vertex UVs it uploads (see the ORIGINAL-UV rule below). The wire's baseU/baseV
+        // ship as ZERO, because after that removal there is no capture-time offset left to cancel.
         bool buildUVAnimPayload(NI::UVController* uvc, uint8_t uvSetCount,
-                                std::vector<uint8_t>& out) {
+                                std::vector<uint8_t>& out, float& undoU, float& undoV) {
             out.clear();
             NI::UVData* d = uvc->uvData.get();
             if (!d) { return false; }
@@ -1115,10 +1119,22 @@ namespace MGE::GeometryCache {
             w.phase     = uvc->phase;
             w.keyMin    = uvc->lowKeyFrame;
             w.keyMax    = uvc->highKeyFrame;
-            // The verts captured THIS run already embed the controller's current offsets —
-            // the host applies eval(t) - base so capture time drops out.
-            w.baseU     = uvc->currentUOffset;
-            w.baseV     = uvc->currentVOffset;
+            // ORIGINAL-UV RULE. We used to ship the controller's current offsets as baseU/baseV and
+            // let the host cancel them (eval(t) - base). That is only exact if the vertex UVs we
+            // captured had EXACTLY those offsets applied — and nothing enforces that pairing. MW
+            // stops rewriting an off-screen object's UV array while the controller keeps running,
+            // so the two drift apart in proportion to time spent unrendered: lava tiles came back
+            // from off-screen further and further out of phase, permanently.
+            //
+            // So hand the offsets back instead and let the caller SUBTRACT them from the uploaded
+            // UVs, recovering the artist's untouched coordinates (MW writes u' = u - offU and
+            // v' = v + offV, hence the asymmetry at the call site). The uploaded mesh then carries
+            // no timestamp at all and the host evaluates absolutely, so a tile can sit off-screen
+            // for an hour and return in phase.
+            undoU = uvc->currentUOffset;
+            undoV = uvc->currentVOffset;
+            w.baseU     = 0.0f;
+            w.baseV     = 0.0f;
 
             out.resize(bytes);
             uint8_t* dst = out.data();
@@ -1198,9 +1214,17 @@ namespace MGE::GeometryCache {
             // its own SK3 scroll-diff mechanism; FP and landscape have no host id stamping.
             static std::vector<uint8_t> uvAnimPayload;   // single-threaded cache walk
             uvAnimPayload.clear();
+            // The controller offsets to REMOVE from the uploaded UVs (ORIGINAL-UV rule, see
+            // buildUVAnimPayload). MW writes u' = u - offU but v' = v + offV, so undoing them is
+            // `u + undoU` and `v - undoV` — the asymmetry is MW's, matching the negated U delta in
+            // the host's uvAnimIdFor.
+            float uvUndoU = 0.0f, uvUndoV = 0.0f;
+            uint8_t uvAnimSet = 0;
             if (!g_walkingSky && !g_walkingFP && !g_walkingLandscape && data->textureCoords) {
                 if (NI::UVController* uvc = findUVAnimController(geom)) {
-                    buildUVAnimPayload(uvc, uvSetCount, uvAnimPayload);
+                    if (buildUVAnimPayload(uvc, uvSetCount, uvAnimPayload, uvUndoU, uvUndoV)) {
+                        uvAnimSet = ((const IPC::GeomUVAnimWire*)uvAnimPayload.data())->setIndex;
+                    }
                 }
             }
             const bool hasUVAnim = !uvAnimPayload.empty();
@@ -1381,6 +1405,76 @@ namespace MGE::GeometryCache {
                 const auto* vcol = (e.hasVertexColor && e.vColSource == 2) ? data->color : nullptr;
                 const auto* triList = data->getTriList();
 
+                // ---- UV-animated meshes: one shared UV array for every INSTANCE ------------------
+                // 23 lava tiles are 23 clones of one NIF running one animation; the only thing that
+                // ever differed between them was WHEN we happened to capture. Chasing that per
+                // instance is the wrong shape of fix, and neither formulation of it worked: MW may
+                // have advanced the controller without yet rewriting a given clone's UV array (or
+                // the reverse, off-screen), so `currentUOffset` and `textureCoords` are simply not
+                // guaranteed to describe the same instant — the tiles at cell load matched only
+                // because the offset was still ~0 there.
+                //
+                // What actually matters is AGREEMENT, not absolute phase: the texture wraps and the
+                // animation is a pure translation, so one shared phase error is invisible while a
+                // per-instance one is glaring. So capture the UVs ONCE per distinct geometry and
+                // hand the same array to every later clone. Key on the mesh WITHOUT its UVs
+                // (positions + normals + triangles + counts) — clones share those exactly, and the
+                // UV array is the one thing that has been contaminated.
+                static std::unordered_map<uint64_t, std::vector<float>> s_uvShare;  // key -> 2*n floats
+                uint64_t uvShareKey = 0;
+                if (hasUVAnim) {
+                    auto fnv = [](const void* p, size_t n, uint64_t h) {
+                        const uint8_t* b = static_cast<const uint8_t*>(p);
+                        for (size_t i = 0; i < n; ++i) { h ^= b[i]; h *= 1099511628211ull; }
+                        return h;
+                    };
+                    const uint32_t counts[4] = { vertexCount, triCount, uvSetCount, uvAnimSet };
+                    uvShareKey = fnv(counts, sizeof(counts), 1469598103934665603ull);
+                    uvShareKey = fnv(mv, vertexCount * sizeof(mv[0]), uvShareKey);
+                    if (nrm)     { uvShareKey = fnv(nrm, vertexCount * sizeof(nrm[0]), uvShareKey); }
+                    if (triList) { uvShareKey = fnv(triList, (size_t)triCount * 6u, uvShareKey); }
+                    // …and the UV LAYOUT, or two shapes that differ ONLY in their UVs collide.
+                    // in_lava_1024_01 is exactly that: both layers are the same 4 verts at the same
+                    // Z with the same normals and triangles, distinguished purely by UV frames
+                    // rotated 90 degrees from each other — so keying on geometry alone handed the
+                    // blended overlay the opaque base's UVs, and it rendered rotated.
+                    //
+                    // The UVs are contaminated by the controller, but only by a TRANSLATION, so
+                    // vertex-relative UVs (uv[i] - uv[0]) are invariant to it and identical across
+                    // clones. Quantised before hashing because the contamination is subtracted in
+                    // float: (a-c)-(b-c) need not be bit-identical to a-b across different c.
+                    if (capUvs) {
+                        const uint32_t ab = (uint32_t)uvAnimSet * storedVerts;
+                        const float u0 = capUvs[ab].x, v0 = capUvs[ab].y;
+                        for (uint32_t i = 0; i < vertexCount; ++i) {
+                            const int32_t q[2] = {
+                                (int32_t)std::lround((capUvs[ab + i].x - u0) * 4096.0f),
+                                (int32_t)std::lround((capUvs[ab + i].y - v0) * 4096.0f) };
+                            uvShareKey = fnv(q, sizeof(q), uvShareKey);
+                        }
+                    }
+                }
+                // Resolve the UV pair to upload for vertex i: the shared array if this geometry has
+                // been seen, else this capture's own UVs with the controller offset stripped out
+                // (see buildUVAnimPayload) — which is then stored as the shared array.
+                std::vector<float>* uvShare = nullptr;
+                if (hasUVAnim && capUvs) {
+                    auto it = s_uvShare.find(uvShareKey);
+                    if (it != s_uvShare.end() && it->second.size() == (size_t)vertexCount * 2) {
+                        uvShare = &it->second;
+                    } else {
+                        auto& v = s_uvShare[uvShareKey];
+                        v.resize((size_t)vertexCount * 2);
+                        const uint32_t animBase = (uint32_t)uvAnimSet * storedVerts;
+                        for (uint32_t i = 0; i < vertexCount; ++i) {
+                            v[i * 2 + 0] = capUvs[animBase + i].x + uvUndoU;
+                            v[i * 2 + 1] = capUvs[animBase + i].y - uvUndoV;
+                        }
+                        uvShare = &v;
+                        if (s_uvShare.size() > 4096) { s_uvShare.clear(); uvShare = nullptr; }
+                    }
+                }
+
                 // Tier 4 multi-map: a part with dark/detail/glow siblings rides the SEPARATE
                 // wide vertex format (GeomVertexWireMM, 4 UV sets) + its own host pipeline.
                 // Single-map parts (the 99% case) keep the lean GeomVertexWire path. Landscape
@@ -1405,6 +1499,12 @@ namespace MGE::GeometryCache {
                             if (capUvs) {
                                 const auto& p = capUvs[(uint32_t)src * storedVerts + i];
                                 w.uv[s][0] = p.x; w.uv[s][1] = p.y;
+                                // The controller-driven set comes from the shared array, so every
+                                // clone of this mesh uploads identical UVs and they stay in phase.
+                                if (uvShare && s == uvAnimSet) {
+                                    w.uv[s][0] = (*uvShare)[i * 2 + 0];
+                                    w.uv[s][1] = (*uvShare)[i * 2 + 1];
+                                }
                             } else {
                                 w.uv[s][0] = 0.0f; w.uv[s][1] = 0.0f;
                             }
@@ -1432,6 +1532,9 @@ namespace MGE::GeometryCache {
                         else     { w.nx = 0.0f;    w.ny = 0.0f;    w.nz = 1.0f; }
                         if (capUvs) { w.u = capUvs[uvBase + i].x; w.v = capUvs[uvBase + i].y; }
                         else        { w.u = 0.0f;                 w.v = 0.0f; }
+                        // Shared UV array (see above): this VB carries ONE set and the host's shader
+                        // adds the delta to it regardless of setIndex, so take it unconditionally.
+                        if (uvShare) { w.u = (*uvShare)[i * 2 + 0]; w.v = (*uvShare)[i * 2 + 1]; }
                         w.color = vcol ? *reinterpret_cast<const DWORD*>(&vcol[i]) : 0xFFFFFFFFu;
                     }
                     if (triList) {
