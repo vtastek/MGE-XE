@@ -976,7 +976,7 @@ SamplerState gSampler2xWrapClamp : register( s17 , space100 ) ;
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/resolve.frag.fsl"
 #line 35 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/resolve.frag.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/resolve.srt.h"
-#line 30 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/resolve.srt.h"
+#line 52 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/resolve.srt.h"
 STRUCT(ResolveParams)
 {
 
@@ -995,8 +995,11 @@ STRUCT(ResolveParams)
 
 
 
+
+
+
     float4 opts;
-#line 49
+#line 74
 };
 
         CBUFFER(ResolveParams) gResolveParams :  register(b0,space3);
@@ -1058,11 +1061,9 @@ float4 PS_MAIN(PsIn In): SV_TARGET
     int sampRad = int(gResolveParams.dims.w);
     float invLuma = gResolveParams.opts.x;
 
-    float3 sum = float3(0.0f, 0.0f, 0.0f);
-    float totalWeight = 0.0f;
 
-    float sumA = 0.0f;
-    float totalWeightA = 0.0f;
+    float4 sum = float4(0.0f, 0.0f, 0.0f, 0.0f);
+    float totalWeight = 0.0f;
 
     LOOP for (int y = -sampRad; y <= sampRad; ++y)
     {
@@ -1085,23 +1086,27 @@ float4 PS_MAIN(PsIn In): SV_TARGET
                     float w = rFilterCubic(sampleDist.x * 2.0f, 0.0f, 0.5f) *
                               rFilterCubic(sampleDist.y * 2.0f, 0.0f, 0.5f);
 
-                    sumA += smp.a * w;
-                    totalWeightA += w;
-
-                    float wr = w;
                     if (invLuma > 0.5f)
                     {
-                        wr *= 1.0f / (1.0f + rLuminance(smp.rgb));
+                        w *= 1.0f / (1.0f + rLuminance(smp.rgb));
                     }
-                    sum += smp.rgb * wr;
-                    totalWeight += wr;
+
+
+                    sum += smp * w;
+                    totalWeight += w;
                 }
             }
         }
     }
 
-    float3 outRgb = max(sum / max(totalWeight, 1.0e-5f), float3(0.0f, 0.0f, 0.0f));
-    float outA = saturate(sumA / max(totalWeightA, 1.0e-5f));
-    return (float4(outRgb, outA));
+    float4 outRgba = sum / max(totalWeight, 1.0e-5f);
+#line 147 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/resolve.frag.fsl"
+    float aRaw = outRgba.a;
+    float3 rgb = outRgba.rgb;
+    if (aRaw > 1.0f) { rgb *= 1.0f / aRaw; }
+    if (aRaw < 0.0f) { rgb = float3(0.0f, 0.0f, 0.0f); }
+
+
+    return (float4(max(rgb, float3(0.0f, 0.0f, 0.0f)), saturate(aRaw)));
 }
 #line 270 "FSL/shaders.list"

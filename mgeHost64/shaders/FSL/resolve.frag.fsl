@@ -93,11 +93,9 @@ float4 PS_MAIN(PsIn In)
     int    sampRad  = int(gResolveParams.dims.w);                  // integer neighbourhood bound
     float  invLuma  = gResolveParams.opts.x;
 
-    float3 sum         = float3(0.0f, 0.0f, 0.0f);
+    // ONE accumulator over all four channels — see the premultiplication note in resolve.srt.h.
+    float4 sum         = float4(0.0f, 0.0f, 0.0f, 0.0f);
     float  totalWeight = 0.0f;
-    // SECOND accumulator: coverage, plain weights. See the alpha rule in resolve.srt.h.
-    float  sumA        = 0.0f;
-    float  totalWeightA = 0.0f;
 
     LOOP for (int y = -sampRad; y <= sampRad; ++y)
     {
@@ -120,22 +118,37 @@ float4 PS_MAIN(PsIn In)
                     float w = rFilterCubic(sampleDist.x * 2.0f, 0.0f, 0.5f) *
                               rFilterCubic(sampleDist.y * 2.0f, 0.0f, 0.5f);
 
-                    sumA         += smp.a * w;
-                    totalWeightA += w;
-
-                    float wr = w;
                     if (invLuma > 0.5f)
                     {
-                        wr *= 1.0f / (1.0f + rLuminance(smp.rgb));
+                        w *= 1.0f / (1.0f + rLuminance(smp.rgb));
                     }
-                    sum         += smp.rgb * wr;
-                    totalWeight += wr;
+                    // Colour AND coverage take the SAME weight. Anything else tears the
+                    // premultiplied pair apart — see resolve.srt.h.
+                    sum         += smp * w;
+                    totalWeight += w;
                 }
             }
         }
     }
 
-    float3 outRgb = max(sum / max(totalWeight, 1.0e-5f), float3(0.0f, 0.0f, 0.0f));
-    float  outA   = saturate(sumA / max(totalWeightA, 1.0e-5f));
-    RETURN(float4(outRgb, outA));
+    float4 outRgba = sum / max(totalWeight, 1.0e-5f);
+
+    // CLAMPING MUST RESPECT PREMULTIPLICATION TOO — the same rule as the weights above, and the
+    // second place it bites. Catmull-Rom rings in BOTH directions at a hard coverage edge (the
+    // horizon band, where the sky's alpha steps to the fog band's), and a per-channel clamp treats
+    // the two halves of the premultiplied pair differently:
+    //
+    //   overshoot side: alpha rings past 1 and saturate() clips it, while colour KEEPS its
+    //                   overshoot -> rgb:a too high -> a slightly BRIGHTER seam.
+    //   undershoot side: alpha rings below 0, i.e. no coverage at all, so the premultiplied colour
+    //                   there must be 0 and not merely non-negative.
+    //
+    // So clip the pair together: rescale colour by exactly the factor coverage was clipped by.
+    float  aRaw = outRgba.a;
+    float3 rgb  = outRgba.rgb;
+    if (aRaw > 1.0f) { rgb *= 1.0f / aRaw; }                 // coverage clipped => colour clipped alike
+    if (aRaw < 0.0f) { rgb  = float3(0.0f, 0.0f, 0.0f); }    // no coverage => no premultiplied colour
+    // Colour's OWN undershoot, where alpha never left range. A negative radiance is meaningless and
+    // this cannot pull the ratio around: it only fires on a colour edge, where alpha is flat.
+    RETURN(float4(max(rgb, float3(0.0f, 0.0f, 0.0f)), saturate(aRaw)));
 }

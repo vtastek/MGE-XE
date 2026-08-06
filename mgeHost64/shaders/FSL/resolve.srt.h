@@ -17,10 +17,32 @@
 //
 // ⚠ ALPHA IS LOAD-BEARING and the reference throws it away (`return float4(output, 1.0f)`).
 // pRT's alpha is the PRESENT-SEAM COVERAGE MASK feeding an ONE/INVSRCALPHA composite over MW's
-// frame. So resolve.frag carries a SECOND accumulator for alpha with the plain filter weights and
-// NOT the 1/(1+luma) modulation — luminance-weighting a coverage value is meaningless — and
-// saturates the result, because Catmull-Rom has negative lobes and coverage outside [0,1] breaks
-// the composite.
+// frame, so the resolve has to carry real coverage through. It is saturated on the way out, because
+// Catmull-Rom has negative lobes and coverage outside [0,1] breaks the composite.
+//
+// ⚠⚠ AND THE BUFFER IS PREMULTIPLIED, WHICH DECIDES HOW ALPHA IS FILTERED. `ONE/INVSRCALPHA` means
+// `dst = src.rgb + dst*(1 - src.a)`: src.rgb is ALREADY scaled by src.a. RGB and coverage are two
+// components of one premultiplied 4-vector, not two independent signals — so a linear filter must
+// apply the SAME weight to all four, or the RGB:A ratio drifts and the composite reads the result
+// at the wrong brightness.
+//
+// This was got wrong first time round, and the symptom is worth recording because it points
+// straight at the cause: a **darker seam along the horizon fog band, and along anything melting
+// into it**. That is where volfog and the sky write PARTIAL coverage — everywhere else alpha is a
+// flat 0 or 1 and the error is identically zero, which is why it hid. Filtering RGB with the
+// inverse-luminance weights while filtering alpha with the plain ones down-weights the bright sky
+// samples in RGB only; alpha keeps the full average, so the pair lands darker than it should.
+//
+// The plausible-sounding argument for splitting them — "luminance-weighting a coverage value is
+// meaningless" — is true of STRAIGHT alpha and false of premultiplied alpha. Do not re-split them.
+//
+// **THE RULE, stated once so it does not have to be rediscovered a third time: EVERY operation in
+// this shader treats (rgb, a) as ONE premultiplied vector.** Both bugs found so far were the same
+// mistake wearing different clothes, and both showed up at the horizon band because that is the
+// only place in the frame where coverage is neither 0 nor 1:
+//   1. WEIGHTS  — filtering rgb and a with different weight sets  -> a DARKER seam.
+//   2. CLAMPING — saturate()ing a while letting rgb keep its ring -> a BRIGHTER seam.
+// Anything that touches one component without the other will produce a third version of this.
 #pragma once
 
 #ifndef SAMPLE_COUNT
@@ -43,7 +65,10 @@ STRUCT(ResolveParams)
     // x = inverse-luminance (Karis) firefly weighting on/off. The A/B for "did it actually catch
     //     anything", and in LDR it is weak by construction: the samples are already tonemapped into
     //     [0,1], so 1/(1+luma) spans only 1.0..0.5. It earns its keep at step 6 when the source is
-    //     genuinely HDR — wired now so that switch is a format change and nothing else.
+    //     genuinely HDR — wired now so that switch is a format change and nothing else. It is also
+    //     the A/B for a residual horizon-band tint that is NOT ringing: a luminance-weighted mean is
+    //     pulled toward the darker samples, so a strong luminance gradient biases the result even
+    //     with the premultiplied pair kept intact. Different mechanism, different fix.
     // yzw reserved.
     DATA(float4, opts, None);
 };
