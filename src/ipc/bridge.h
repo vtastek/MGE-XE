@@ -267,6 +267,14 @@ namespace IPC {
         // above are now ignored — the host owns the RT. Field name kept to avoid churn.)
         OUT HANDLE32 framebufferHandle;
         OUT bool ok;
+
+        // Tier 1 (tasks/forge-host-gpu-lane.md): the host's SHARED, monotonic D3D12 frame FENCE,
+        // duplicated into the CLIENT process. The client imports it as a Vulkan timeline semaphore
+        // and waits on it in its RT copy, which is what lets the host stop CPU-blocking on its own
+        // fence (the RPC reply then no longer means "GPU-complete"). Null ⇒ the host could not
+        // create a shared fence; the client must keep the old blocking contract. Appended after
+        // `ok` so every existing field offset is unchanged.
+        OUT HANDLE32 frameFenceHandle;
     };
 
     // Dev overlay input snapshot forwarded client -> host each frame (Stage 2). Mouse is in host
@@ -462,6 +470,19 @@ namespace IPC {
         IN std::uint32_t nearCellMask;
         IN float         nearCellReach;
 
+        // Tier 1 (tasks/forge-host-gpu-lane.md): 1 ⇒ the client HAS imported the host's shared frame
+        // fence as a Vulkan timeline semaphore and will wait frameFenceValue before touching the
+        // shared RT, so the host may return from renderScene without waiting its own fence and let
+        // frame N's GPU work overlap the reply, the RT copy and MW's frame.
+        //
+        // 0 ⇒ the client has NO sync object (no shared fence on this device, or the import failed on
+        // this DXVK build) and cannot make the copy safe. The host must then keep its old
+        // end-of-frame fence wait, which restores the "reply implies GPU-complete" contract. This
+        // field is the ONLY thing standing between such a machine and a torn frame every frame, so
+        // it is fail-SAFE by construction: anything but an explicit 1 means "host must block".
+        // Appended after the near-cell fields so every existing IN offset is unchanged.
+        IN std::uint32_t clientSyncsOnFence;
+
         OUT std::uint32_t bytesWritten;
         OUT double renderMs;             // host-side render+readback time
 
@@ -471,6 +492,15 @@ namespace IPC {
         // Appended at the end so every existing field offset is unchanged — but the struct is
         // shared by LAYOUT across x86/x64, so rebuild and deploy both binaries together.
         OUT HostFrameTimings hostTimings;
+
+        // Tier 1 (tasks/forge-host-gpu-lane.md): the value the host signalled on the SHARED frame
+        // fence for THIS frame's submit. The host no longer blocks on its own fence, so this reply
+        // arrives while the GPU may still be drawing — and this number is what makes that safe: the
+        // client waits it on the imported timeline semaphore before its RT copy reads the shared RT.
+        // 0 ⇒ no shared fence on this host (or the client failed to import it); the client then has
+        // no sync object and must not overlap. Appended at the end so every existing OUT offset is
+        // unchanged; uint64 because a D3D12 fence value is 64-bit and the wire is layout-shared.
+        OUT std::uint64_t frameFenceValue;
     };
 
     // M1b geometry upload. blob = a byte VecId holding partCount packed parts

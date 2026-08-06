@@ -69,6 +69,27 @@ namespace ForgeRender {
     // successful init(). The IPC server DuplicateHandles this into MW's process.
     void* sharedHandle();
 
+    // Tier 1 (tasks/forge-host-gpu-lane.md): the exported NT handle of the SHARED, monotonic
+    // D3D12 fence the host signals on each frame submit — valid in the HOST process, null until
+    // a successful init() (and null if the device refused a shared fence). The IPC server
+    // DuplicateHandles it into MW's process, where the client imports it as a Vulkan timeline
+    // semaphore so its RT copy can order itself behind the host's draw WITHOUT the host CPU
+    // blocking on its own fence. Null ⇒ client keeps the old "RPC reply implies GPU-complete".
+    void* sharedFenceHandle();
+
+    // Tier 1: the value signalled on that shared fence for the frame renderScene just submitted.
+    // Monotonic, one increment per submitted frame. The server puts it in the RenderFrame reply so
+    // the client knows WHICH value to wait on before copying the shared RT. 0 until the first
+    // submit. Declared as unsigned long long, not uint64_t, to keep this header <cstdint>-free.
+    unsigned long long lastFrameFenceValue();
+
+    // Tier 1 fail-safe. The overlap is only sound if the CLIENT can wait the shared fence before it
+    // copies the shared RT. The client reports that per frame (bridge.h clientSyncsOnFence); pass it
+    // here before renderScene. false ⇒ renderScene fence-waits its own frame before returning, i.e.
+    // the pre-Tier-1 behaviour, so the reply again implies "GPU-complete". Defaults to false, so a
+    // client that never calls this can never be handed a half-drawn frame.
+    void setClientSyncsOnFence(bool syncs);
+
     // True if the M1c opaque scene path (depth RT + opaque pipeline + descriptor sets)
     // built successfully in init(). False ⇒ renderScene returns false and the seam
     // falls back to the triangle. The server logs this so the buffered host stdout

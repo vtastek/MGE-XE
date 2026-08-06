@@ -1,8 +1,16 @@
-// mgeHost64 — GTAO: ground-truth ambient occlusion (Jimenez et al. 2016), + native bent normals.
+// mgeHost64 — VB-GTAO: visibility-bitmask occupancy under GTAO's cosine-weighted arc integral.
 //
 // Mode 0 of four (see aocommon.h.fsl for the shared core and the invariants all four keep;
-// hbao/vbao/ssaofast are the others). This is the reference mode: a cosine-weighted horizon-arc
-// integral, which is what "ground truth" in the name refers to — the other three approximate it.
+// hbao/vbao/ssaofast are the others). This is the reference mode, and it is the only one that gets
+// BOTH halves right: the bitmask's occupancy and ground-truth's cosine weighting.
+//
+// What it replaced, and why. Classic GTAO searches the horizon as a running max of dot(d, V) per
+// side — one question per direction, "how high is the tallest thing", after which everything below
+// is assumed solid. That is wrong twice (vbao.comp.fsl says the same): a thin railing occludes as
+// if it were a wall, and two occluders at different elevations count as one. VBAO fixes the
+// occupancy but resolves it as 1 - popcount/32, which weights every angular bin EQUALLY —
+// uniform-over-angle, not cosine-weighted, so it is not ground truth. Keeping GTAO's arc integral
+// and feeding it the bitmask's occupancy gets both.
 //
 // Per slice:
 //   1. Build an orthonormal basis (V, T) in the slice plane; every angle below is measured from V
@@ -10,27 +18,27 @@
 //   2. Project the surface normal into that plane: its angle n and its length projLen (the slice's
 //      weight — a slice edge-on to the normal contributes almost nothing, which is what makes the
 //      few-slice average come out right).
-//   3. Search the horizon on each side as a RUNNING MAX of dot(d, V): the tap closest in angle to
-//      the view ray is the one that occludes most. Distance-attenuated taps lerp toward -1 (fully
-//      open), so the falloff can only ever REDUCE occlusion, monotonically in distance.
-//   4. Clamp each horizon into the hemisphere around n (n +- 90 degrees = fully open) and evaluate
-//      the arc integral. A flat plane has no tap above its own tangent plane, so both horizons hit
-//      the clamp exactly and the slice integrates to 1 at ANY camera angle — the view-independence
-//      the whole design rests on.
+//   3. Build the 32-bin occupancy mask over the hemisphere [n - 90, n + 90] degrees exactly as
+//      VBAO does: front angle from the visible surface, back angle from the same point pushed away
+//      from the eye by aoThickness(). Multiple occluders compose by construction; a thin one stops
+//      shadowing the space behind it.
+//   4. Integrate the OPEN bins — walk the runs of ~mask and sum gtaoArc() over each. Typical open
+//      sets are 1-3 runs, so this is 2-6 gtaoInner calls, comparable to the two acos the horizon
+//      search used to cost.
 //
-// The bent normal is the mid-angle of the open arc, accumulated in the same (V,T) basis and
-// weighted by projLen. opaque.frag/multimap.frag shade with it when "bent normal" is ticked.
+// The invariant this preserves. Summed over ALL bins gtaoArc telescopes to
+// inner(n - 90) + inner(n + 90) — precisely what classic GTAO computes when both horizons hit the
+// hemisphere clamp. So a fully-open slice still integrates to exactly the old value, at any camera
+// angle, and aocommon.h.fsl's view-independence invariant is kept by construction rather than
+// approximated. Fully open also leaves one run symmetric about n, so the bent normal degenerates
+// to the in-slice projection of N and the sum over slices is still N.
+//
+// Distance attenuation stays where VBAO puts it — on the bins a tap NEWLY sets, the one place a
+// bitmask can take a partial weight without lying about occupancy — and then scales the integrated
+// occluded arc rather than the mask.
 
 #include "gtao.srt.h"
 #include "aocommon.h.fsl"
-
-// Inner term of the GTAO arc integral for one clamped horizon angle h against the in-slice normal
-// angle n. It is the antiderivative of cos(theta - n)*|sin theta| plus the constant that makes the
-// two sides sum from the shared origin at theta = 0.
-float gtaoInner(float h, float n)
-{
-    return 0.25f * (-cos(2.0f * h - n) + cos(n) + 2.0f * h * sin(n));
-}
 
 ROOT_SIGNATURE(ComputeRootSignature)
 NUM_THREADS(8, 8, 1)
@@ -59,9 +67,14 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
     float  stepPx = aoStepPixels(wpp, steps);
     float2 dither = aoDither(px);
     float  bias   = aoBias();
+    float  thick  = aoThickness();
 
     float  visSum  = 0.0f;
     float3 bentSum = float3(0.0f, 0.0f, 0.0f);
+    // The same accumulation run against a fully open hemisphere. aoResolve references the bend
+    // against this rather than against N so the few-slice quadrature residual cancels instead of
+    // having to be damped away — see the comment there.
+    float3 refSum  = float3(0.0f, 0.0f, 0.0f);
 
     for (int s = 0; s < slices; ++s)
     {
@@ -88,55 +101,110 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
         }
         float n = atan2(nT, nV);
 
-        // Horizon search, running max of the cosine to V. -1 = nothing found = fully open.
-        float cosP = -1.0f;
-        float cosM = -1.0f;
+        // The 32 bins span the hemisphere around the normal, [n - 90, n + 90] degrees. Anything
+        // outside is below the surface and cannot occlude, so it falls off the ends of the mask.
+        float base    = n - AO_HALF_PI;
+        float binStep = AO_PI / 32.0f;
+        float toBin   = 32.0f / AO_PI;
+        uint  mask    = 0u;
+        float occ     = 0.0f;   // falloff-weighted occluded bin fraction (<= countbits(mask)/32)
+
         for (int t = 0; t < steps; ++t)
         {
             float off = aoStepOffset(t, stepPx, dither.y);
 
-            int2  sp = aoTap(px, dir, off);
-            float zp = aoLoadZ(sp);
-            if (zp > 0.0f)
+            UNROLL
+            for (int side = 0; side < 2; ++side)
             {
-                float3 ds = aoReconstructWorld((float2(sp) + 0.5f) * invScreen, zp) - P;
-                float  dl = max(length(ds), 1e-6f);
-                float3 d  = ds / dl;
-                if (dot(d, N) > bias)   // must rise above the tangent plane: view-independent
-                {
-                    cosP = max(cosP, lerp(-1.0f, dot(d, V), aoFalloffWeight(dl)));
-                }
-            }
+                float2 sdir = (side == 0) ? dir : -dir;
+                float  sgn  = (side == 0) ? 1.0f : -1.0f;
 
-            int2  sm = aoTap(px, -dir, off);
-            float zm = aoLoadZ(sm);
-            if (zm > 0.0f)
-            {
-                float3 ds = aoReconstructWorld((float2(sm) + 0.5f) * invScreen, zm) - P;
+                int2  sc = aoTap(px, sdir, off);
+                float z  = aoLoadZ(sc);
+                if (z <= 0.0f)
+                {
+                    continue;
+                }
+
+                float3 ds = aoReconstructWorld((float2(sc) + 0.5f) * invScreen, z) - P;
                 float  dl = max(length(ds), 1e-6f);
                 float3 d  = ds / dl;
-                if (dot(d, N) > bias)
+                if (dot(d, N) <= bias)
                 {
-                    cosM = max(cosM, lerp(-1.0f, dot(d, V), aoFalloffWeight(dl)));
+                    continue;   // at or below the tangent plane — view-independent rejection
                 }
+                float w = aoFalloffWeight(dl);
+                if (w <= 0.0f)
+                {
+                    continue;
+                }
+
+                // Front angle from the visible surface; back angle from the same point pushed
+                // AWAY from the eye by the thickness. Pushing away can only increase the angle
+                // from V, so the pair always brackets a real span.
+                float  aF = sgn * acos(clamp(dot(d, V), -1.0f, 1.0f));
+                float3 dB = ds - V * thick;
+                float  bl = max(length(dB), 1e-6f);
+                float  aB = sgn * acos(clamp(dot(dB / bl, V), -1.0f, 1.0f));
+
+                float lo = min(aF, aB);
+                float hi = max(aF, aB);
+
+                uint span  = aoBitRange((int)floor((lo - base) * toBin),
+                                        (int)ceil ((hi - base) * toBin));
+                uint fresh = span & (~mask);
+                occ  += float(countbits(fresh)) * (1.0f / 32.0f) * w;
+                mask |= span;
             }
         }
 
-        float h1 =  acos(clamp(cosP, -1.0f, 1.0f));   // +T side
-        float h0 = -acos(clamp(cosM, -1.0f, 1.0f));   // -T side
-        h1 = n + min(h1 - n,  AO_HALF_PI);
-        h0 = n + max(h0 - n, -AO_HALF_PI);
+        // Cosine-weighted measure of the OPEN bins, plus the same measure over the whole
+        // hemisphere (what a fully-open slice is worth — identical to classic GTAO at full clamp).
+        float  fullArc  = gtaoArc(base, base + AO_PI, n);
+        float  openArc  = 0.0f;
+        float3 bentDir  = float3(0.0f, 0.0f, 0.0f);
+        uint   open     = ~mask;
+        uint   runLo, runLen;
+        // 32 bins hold at most 16 disjoint runs of set bits.
+        for (int r = 0; r < 16; ++r)
+        {
+            if (!aoNextRun(open, runLo, runLen))
+            {
+                break;
+            }
+            float a0  = base + float(runLo)          * binStep;
+            float a1  = base + float(runLo + runLen) * binStep;
+            float arc = gtaoArc(a0, a1, n);
+            openArc  += arc;
+            // Bent normal: each run's MID angle, weighted by that run's own arc contribution.
+            // (VBAO takes the midpoint of the lowest and highest open bin, which ignores every
+            // occluder between them.)
+            float mid = 0.5f * (a0 + a1);
+            bentDir  += (V * cos(mid) + T * sin(mid)) * arc;
+        }
 
-        visSum += projLen * (gtaoInner(h0, n) + gtaoInner(h1, n));
+        // Distance attenuation. occ is the falloff-weighted occluded bin fraction and
+        // countbits(mask)/32 the raw one, so their ratio is the average falloff weight over the
+        // bins that ARE closed. Scaling the occluded ARC by it keeps attenuation a property of the
+        // occluders (as in VBAO) instead of smearing it over the integral: no occluders => k = 0
+        // => the slice integrates to fullArc exactly, which is the view-independence invariant.
+        float closedRaw = float(countbits(mask)) * (1.0f / 32.0f);
+        float k         = (closedRaw > 1e-6f) ? saturate(occ / closedRaw) : 0.0f;
+        float visSlice  = openArc + (1.0f - k) * max(fullArc - openArc, 0.0f);
 
-        float bentAngle = 0.5f * (h0 + h1);
-        bentSum += (V * cos(bentAngle) + T * sin(bentAngle)) * projLen;
+        visSum  += projLen * visSlice;
+        bentSum += bentDir * projLen;
+        // Fully open leaves one run spanning every bin, so a0 = base, a1 = base + PI, arc = fullArc
+        // and mid = n. Its contribution is then (V cos n + T sin n) * fullArc * projLen, and
+        // (V cos n + T sin n) * projLen is just V*nV + T*nT. So bentSum == refSum EXACTLY when
+        // nothing occludes — dither, slice count and all.
+        refSum  += (V * nV + T * nT) * fullArc;
     }
 
     // Per-slice values legitimately exceed 1 for a tilted normal and fall short for a slice
     // edge-on to it; projLen is what makes the average land back on 1. saturate() only guards the
     // few-slice residual.
     float vis = saturate(visSum / float(slices));
-    Write2D(gAOOut, px, aoResolve(1.0f - vis, bentSum, N));
+    Write2D(gAOOut, px, aoResolve(1.0f - vis, bentSum, refSum, N));
     RETURN();
 }

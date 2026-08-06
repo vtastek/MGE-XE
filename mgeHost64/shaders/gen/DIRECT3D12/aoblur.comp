@@ -974,7 +974,7 @@ SamplerState gSampler2xWrapClamp : register( s17 , space100 ) ;
 #line 11 "FSL/shaders.list"
 #line 303 "FSL/shaders.list"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/aoblur.comp.fsl"
-#line 10 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/aoblur.comp.fsl"
+#line 39 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/aoblur.comp.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/aoblur.srt.h"
 #line 22 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/aoblur.srt.h"
 STRUCT(BlurParams)
@@ -985,14 +985,28 @@ STRUCT(BlurParams)
     float4 _padEye;
     float4 blurParams;
 
-#line 30
+    float4 blurParams2;
+
+
+
+
+
+
+#line 37
 };
 
         CBUFFER(BlurParams) gBlurParams :  register(b0,space1);
         Tex2D(float4) gAOSrc :  register(t1,space1);
         Tex2D(float) gBlurDepthIn :  register(t2,space1);
         WTex2D(float4) gAODst :  register(u3,space1);
-#line 11 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/aoblur.comp.fsl"
+#line 40 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/aoblur.comp.fsl"
+
+
+
+
+
+
+
 
 
 
@@ -1002,6 +1016,37 @@ float3 reconstructWorldB(float2 uv, float deviceZ)
     float ndcY = 1.0f - uv.y * 2.0f;
     float4 p = mul(gBlurParams.invViewProj, float4(ndcX, ndcY, deviceZ, 1.0f));
     return p.xyz / p.w;
+}
+
+float3 loadWorldB(int2 sp, float2 invScreen)
+{
+    float z = LoadTex2D(gBlurDepthIn, NO_SAMPLER, sp, 0).r;
+    return reconstructWorldB((float2(sp) + 0.5f) * invScreen, z);
+}
+
+
+
+
+
+
+float3 blurMinDiff(float3 dr, float3 dl)
+{
+    float lr = dot(dr, dr);
+    float ll = dot(dl, dl);
+    float hi = max(lr, ll);
+    float lo = max(min(lr, ll), 1e-12f);
+    float t = saturate((hi / lo - 1.0f) * (1.0f / 3.0f));
+    return lerp(0.5f * (dr + dl), (lr < ll) ? dr : dl, t);
+}
+
+float blurPlaneWeight(float3 nC, float3 dw, float minLen, float sigma)
+{
+    if (sigma <= 0.0f)
+    {
+        return 1.0f;
+    }
+    float sn = abs(dot(nC, dw)) / max(length(dw), minLen);
+    return exp(-(sn * sn) / (2.0f * sigma * sigma));
 }
 
 [RootSignature( "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "3" ", offset = 0)," "CBV(b0, numDescriptors = unbounded, space = " "3" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "3" ", offset = 0))," "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "2" ", offset = 0)," "CBV(b0, numDescriptors = unbounded, space = " "2" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "2" ", offset = 0))," "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "1" ", offset = 0)," "CBV(b0, numDescriptors = unbounded, space = " "1" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "1" ", offset = 0))," "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "0" ", offset = 0)," "CBV(b0, numDescriptors = unbounded, space = " "0" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "0" ", offset = 0))," "DescriptorTable(" "SAMPLER(s0, numDescriptors = unbounded, space = " "0" ", offset = 0))," "StaticSampler(s0, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s1, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s2, space = 100," "filter = FILTER_MIN_MAG_LINEAR_MIP_POINT," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s3, space = 100," "filter = FILTER_MIN_MAG_LINEAR_MIP_POINT," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s4, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s5, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s6, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT," "addressU = TEXTURE_ADDRESS_MIRROR, addressV = TEXTURE_ADDRESS_MIRROR, addressW = TEXTURE_ADDRESS_MIRROR)," "StaticSampler(s7, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT, borderColor = STATIC_BORDER_COLOR_TRANSPARENT_BLACK," "addressU = TEXTURE_ADDRESS_BORDER, addressV = TEXTURE_ADDRESS_BORDER, addressW = TEXTURE_ADDRESS_BORDER)," "StaticSampler(s8, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR," "addressU = TEXTURE_ADDRESS_MIRROR, addressV = TEXTURE_ADDRESS_MIRROR, addressW = TEXTURE_ADDRESS_MIRROR)," "StaticSampler(s9, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR, borderColor = STATIC_BORDER_COLOR_TRANSPARENT_BLACK," "addressU = TEXTURE_ADDRESS_BORDER, addressV = TEXTURE_ADDRESS_BORDER, addressW = TEXTURE_ADDRESS_BORDER)," "StaticSampler(s10, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 8," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s11, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 8," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s12, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 8," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s13, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 8," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s14, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 2," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s15, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 2," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s16, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 2," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s17, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 2," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_WRAP)" )]
@@ -1032,10 +1077,37 @@ void CS_MAIN( uint3 DispatchThreadID : SV_DISPATCHTHREADID )
     float3 centerW = reconstructWorldB(uv, centerZ);
     float sigmaW = max(gBlurParams.blurParams.y, 1e-3f);
     float invSp = 1.0f / (2.0f * sigmaPx * sigmaPx);
-    float invSr = 1.0f / (2.0f * sigmaW * sigmaW);
 
-    float4 sum = float4(0.0f, 0.0f, 0.0f, 0.0f);
-    float wsum = 0.0f;
+
+
+
+
+    float planeSigma = gBlurParams.blurParams2.y;
+    float3 dxr = loadWorldB(px + int2(1, 0), invScreen) - centerW;
+    float3 dxl = centerW - loadWorldB(px - int2(1, 0), invScreen);
+    float3 dyr = loadWorldB(px + int2(0, 1), invScreen) - centerW;
+    float3 dyl = centerW - loadWorldB(px - int2(0, 1), invScreen);
+    float3 cx = blurMinDiff(dxr, dxl);
+    float3 cy = blurMinDiff(dyr, dyl);
+    float3 cn = cross(cx, cy);
+    float cn2 = dot(cn, cn);
+
+
+    float3 centerN = (cn2 > 1e-20f) ? (cn * rsqrt(cn2)) : float3(0.0f, 0.0f, 0.0f);
+    float planeSigmaU = (cn2 > 1e-20f) ? planeSigma : 0.0f;
+    float wppC = max(min(length(dxr), length(dxl)), 1e-4f);
+#line 156 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/aoblur.comp.fsl"
+    float wppLoc = max(length(cx), length(cy));
+    float sigFar = max(gBlurParams.blurParams2.z, sigmaW);
+    float sigmaR = clamp(float( 3 ) * wppLoc, sigmaW, sigFar);
+    float invSr = 1.0f / (2.0f * sigmaR * sigmaR);
+
+
+
+    float sumA = 0.0f;
+    float wsumA = 0.0f;
+    float3 sumN = float3(0.0f, 0.0f, 0.0f);
+    float wsumN = 0.0f;
 
     UNROLL for (int j = - 3 ; j <=  3 ; ++j)
     UNROLL for (int i = - 3 ; i <=  3 ; ++i)
@@ -1051,12 +1123,17 @@ void CS_MAIN( uint3 DispatchThreadID : SV_DISPATCHTHREADID )
             float3 dw = w - centerW;
             float dr2 = dot(dw, dw);
             float wgt = exp(-ds2 * invSp - dr2 * invSr);
-            sum += ao * wgt;
-            wsum += wgt;
+            sumA += ao.a * wgt;
+            wsumA += wgt;
+            float wn = wgt * blurPlaneWeight(centerN, dw, wppC, planeSigmaU);
+            sumN += ao.rgb * wn;
+            wsumN += wn;
         }
     }
 
-    float4 outAO = (wsum > 0.0f) ? (sum / wsum) : centerAO;
+    float4 outAO;
+    outAO.a = (wsumA > 0.0f) ? (sumA / wsumA) : centerAO.a;
+    outAO.rgb = (wsumN > 1e-6f) ? (sumN / wsumN) : centerAO.rgb;
     Write2D(gAODst, px, outAO);
     return;
 }

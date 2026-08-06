@@ -987,24 +987,26 @@ STRUCT(AOParams)
     float4 eyePos;
     float4 sliceParams;
 
-#line 29
+    float4 aoParams2;
+
+
+
+
+
+
+
+
+
+#line 39
 };
-
-
-
-
-
-
-
-
-
-
+#line 56 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/gtao.srt.h"
         CBUFFER(AOParams) gAOParams :  register(b0,space3);
         Tex2D(float) gLinearDepthIn :  register(t1,space3);
         WTex2D(float4) gAOOut :  register(u2,space3);
+        Tex2D(float4) gStbn :  register(t3,space3);
 #line 26 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/vbao.comp.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/aocommon.h.fsl"
-#line 45 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/aocommon.h.fsl"
+#line 77 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/aocommon.h.fsl"
 float aoRadius() { return max(gAOParams.aoParams.x, 1e-3f); }
 float aoFalloff() { return max(gAOParams.aoParams.y, 1e-3f); }
 float aoIntensity() { return gAOParams.aoParams.z; }
@@ -1012,6 +1014,14 @@ float aoBias() { return gAOParams.aoParams.w; }
 int aoSlices() { return (int)clamp(gAOParams.eyePos.w, 1.0f, 8.0f); }
 int aoSteps() { return (int)clamp(gAOParams.sliceParams.z, 1.0f, 16.0f); }
 float aoThickness() { return max(gAOParams.sliceParams.w, 0.0f); }
+
+
+
+
+
+
+
+float aoBentStrength() { float s = gAOParams.aoParams2.x; return (s > 0.0f) ? s : 1.0f; }
 
 
 float3 aoReconstructWorld(float2 uv, float deviceZ)
@@ -1026,10 +1036,19 @@ float aoLoadZ(int2 c)
 {
     return LoadTex2D(gLinearDepthIn, NO_SAMPLER, c, 0).r;
 }
-
-
-
-
+#line 121 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/aocommon.h.fsl"
+float2 aoDitherTile(int2 px)
+{
+    float rot = (1.0f / 16.0f) * float((((px.x + px.y) & 3) << 2) + (px.x & 3));
+    float off = (1.0f / 4.0f) * float((px.y - px.x) & 3);
+    return float2(rot, off);
+}
+#line 144 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/aocommon.h.fsl"
+float2 aoDitherStbn(int2 px, int slice)
+{
+    int2 t = int2(px.x & 63, (px.y & 63) + 64 * (slice & 15));
+    return LoadTex2D(gStbn, NO_SAMPLER, t, 0).rg;
+}
 
 
 
@@ -1037,9 +1056,42 @@ float aoLoadZ(int2 c)
 
 float2 aoDither(int2 px)
 {
-    float rot = (1.0f / 16.0f) * float((((px.x + px.y) & 3) << 2) + (px.x & 3));
-    float off = (1.0f / 4.0f) * float((px.y - px.x) & 3);
-    return float2(rot, off);
+    float sel = gAOParams.aoParams2.w;
+    if (sel < 0.0f)
+    {
+        return aoDitherTile(px);
+    }
+    return aoDitherStbn(px, (int)(sel + 0.5f));
+}
+#line 186 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/aocommon.h.fsl"
+float3 aoMinDiff(float3 dr, float3 dl)
+{
+    float lr = dot(dr, dr);
+    float ll = dot(dl, dl);
+    float hi = max(lr, ll);
+    float lo = max(min(lr, ll), 1e-12f);
+
+    float t = saturate((hi / lo - 1.0f) * (1.0f / 3.0f));
+    return lerp(0.5f * (dr + dl), (lr < ll) ? dr : dl, t);
+}
+
+
+
+
+
+
+
+
+
+
+float aoPlaneWeight(float3 nC, float3 dw, float minLen, float sigma)
+{
+    if (sigma <= 0.0f)
+    {
+        return 1.0f;
+    }
+    float sn = abs(dot(nC, dw)) / max(length(dw), minLen);
+    return exp(-(sn * sn) / (2.0f * sigma * sigma));
 }
 
 
@@ -1078,12 +1130,13 @@ bool aoSurface(int2 px, float2 uv, float2 invScreen,
 
 
 
+
     float3 dxr = Pr - P;
     float3 dxl = P - Pl;
-    ddxv = (dot(dxr, dxr) < dot(dxl, dxl)) ? dxr : dxl;
+    ddxv = aoMinDiff(dxr, dxl);
     float3 dyr = Pu - P;
     float3 dyl = P - Pd;
-    ddyv = (dot(dyr, dyr) < dot(dyl, dyl)) ? dyr : dyl;
+    ddyv = aoMinDiff(dyr, dyl);
     N = normalize(cross(ddxv, ddyv));
     if (dot(N, V) < 0.0f)
     {
@@ -1156,19 +1209,77 @@ uint aoBitRange(int b0, int b1)
 
 
 
+bool aoNextRun(inout(uint) open, out(uint) lo, out(uint) len)
+{
+    lo = 0u;
+    len = 0u;
+    if (open == 0u)
+    {
+        return false;
+    }
+    lo = firstbitlow(open);
 
-float4 aoResolve(float occ, float3 bentSum, float3 N)
+
+
+
+    uint inv = ~(open >> lo);
+    len = (inv == 0u) ? 32u : firstbitlow(inv);
+    open = open & (~aoBitRange((int)lo, (int)(lo + len)));
+    return true;
+}
+
+
+
+
+
+
+float gtaoInner(float h, float n)
+{
+    return 0.25f * (-cos(2.0f * h - n) + cos(n) + 2.0f * h * sin(n));
+}
+
+
+
+
+
+
+float gtaoArc(float a, float b, float n)
+{
+    if (a >= 0.0f)
+    {
+        return gtaoInner(b, n) - gtaoInner(a, n);
+    }
+    if (b <= 0.0f)
+    {
+        return gtaoInner(a, n) - gtaoInner(b, n);
+    }
+    return gtaoInner(a, n) + gtaoInner(b, n);
+}
+#line 399 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/aocommon.h.fsl"
+float4 aoResolve(float occ, float3 bentSum, float3 refSum, float3 N)
 {
     float vis = saturate(1.0f - saturate(occ) * aoIntensity());
 
-    float3 bn = bentSum + N * 1e-3f;
-    float l2 = dot(bn, bn);
-    bn = (l2 > 1e-12f) ? (bn * rsqrt(l2)) : N;
+    float q2 = dot(refSum, refSum);
+    float3 nq = (q2 > 1e-12f) ? (refSum * rsqrt(q2)) : N;
+    float b2 = dot(bentSum, bentSum);
+    float3 bn = (b2 > 1e-12f) ? (bentSum * rsqrt(b2)) : nq;
+
+
+
+    float3 bs = nq + (bn - nq) * aoBentStrength();
+    float s2 = dot(bs, bs);
+    bn = (s2 > 1e-12f) ? (bs * rsqrt(s2)) : nq;
     if (dot(bn, N) <= 0.0f)
     {
         bn = N;
     }
-    return float4(bn, vis);
+
+
+
+
+
+    return float4(bn - vis * nq, vis);
 }
 #line 27 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/vbao.comp.fsl"
 
@@ -1198,7 +1309,7 @@ void CS_MAIN( uint3 DispatchThreadID : SV_DISPATCHTHREADID )
     float wpp;
     if (!aoSurface(px, uv, invScreen, P, N, V, ddxv, ddyv, wpp))
     {
-        Write2D(gAOOut, px,  float4(0.0f, 0.0f, 1.0f, 1.0f) );
+        Write2D(gAOOut, px,  float4(0.0f, 0.0f, 0.0f, 1.0f) );
         return;
     }
 
@@ -1213,6 +1324,8 @@ void CS_MAIN( uint3 DispatchThreadID : SV_DISPATCHTHREADID )
 
     float occSum = 0.0f;
     float3 bentSum = float3(0.0f, 0.0f, 0.0f);
+
+    float3 refSum = float3(0.0f, 0.0f, 0.0f);
 
     for (int s = 0; s < slices; ++s)
     {
@@ -1299,6 +1412,9 @@ void CS_MAIN( uint3 DispatchThreadID : SV_DISPATCHTHREADID )
 
 
 
+        refSum += V * nV + T * nT;
+
+
         uint openMask = ~mask;
         if (openMask != 0u)
         {
@@ -1313,7 +1429,7 @@ void CS_MAIN( uint3 DispatchThreadID : SV_DISPATCHTHREADID )
         }
     }
 
-    Write2D(gAOOut, px, aoResolve(occSum / float(slices), bentSum, N));
+    Write2D(gAOOut, px, aoResolve(occSum / float(slices), bentSum, refSum, N));
     return;
 }
 #line 16 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/ssaofast.comp.fsl"

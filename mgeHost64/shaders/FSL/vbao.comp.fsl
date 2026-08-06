@@ -69,6 +69,8 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
 
     float  occSum  = 0.0f;
     float3 bentSum = float3(0.0f, 0.0f, 0.0f);
+    // The same accumulation against a fully open hemisphere — aoResolve's quadrature reference.
+    float3 refSum  = float3(0.0f, 0.0f, 0.0f);
 
     for (int s = 0; s < slices; ++s)
     {
@@ -153,8 +155,11 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
         float visSlice = saturate(1.0f - occ);
         occSum += 1.0f - visSlice;
 
-        // Bent normal: the middle of the open run of bins, back in world space. Fully open gives
-        // exactly the in-slice normal direction, so the sum over slices degenerates to N.
+        // Fully open gives loBin 0, hiBin 31 => mid angle n and visSlice 1, i.e. exactly this — so
+        // bentSum == refSum when nothing occludes, at any slice count and any dither phase.
+        refSum += V * nV + T * nT;
+
+        // Bent normal: the middle of the open run of bins, back in world space.
         uint openMask = ~mask;
         if (openMask != 0u)
         {
@@ -169,6 +174,6 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
         }
     }
 
-    Write2D(gAOOut, px, aoResolve(occSum / float(slices), bentSum, N));
+    Write2D(gAOOut, px, aoResolve(occSum / float(slices), bentSum, refSum, N));
     RETURN();
 }

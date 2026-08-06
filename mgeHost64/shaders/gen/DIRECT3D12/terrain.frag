@@ -1090,7 +1090,7 @@ STRUCT(ShadowMaskParams)
 #line 236
 };
 #line 21 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
-#line 46 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+#line 58 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
 STRUCT(FrameData)
 {
     float4x4 viewProj;
@@ -1151,7 +1151,7 @@ STRUCT(FrameData)
 
 
     float4 alphaParams;
-#line 117 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+#line 129 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
     float4 timeParams;
 
 
@@ -1168,20 +1168,17 @@ STRUCT(FrameData)
 
     float4 froxelDims;
     float4 froxelZ;
-
-
-
-
+#line 158 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
     float4 alphaShadowParams;
-#line 138
+#line 159
 };
 
 STRUCT(BatchData)
 {
     float4x4 worlds[ 1024 ];
-#line 143
+#line 164
 };
-#line 164 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+#line 185 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
 STRUCT(LightData)
 {
     float4 lightParams;
@@ -1197,7 +1194,7 @@ STRUCT(LightData)
 
     float4 froxelDimsNear;
     float4 froxelZNear;
-#line 179
+#line 200
 };
 
         CBUFFER(FrameData) gFrameData :  register(b0,space1);
@@ -1207,7 +1204,7 @@ STRUCT(LightData)
 
 
         Tex2D(float4) gAO :  register(t1,space1);
-#line 203 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+#line 224 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
         Tex3D(float4) gWaterNormalVol :  register(t2,space1);
         Tex2D(float4) gRefractColor :  register(t3,space1);
         Tex2D(float4) gSceneLinDepth :  register(t4,space1);
@@ -1322,7 +1319,7 @@ STRUCT(LightData)
 
 
         Tex2D(float) gSunOcc :  register(t53,space1);
-#line 335 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+#line 356 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
         Tex2D(float4) gSkyColor :  register(t54,space1);
 
 
@@ -1340,7 +1337,7 @@ STRUCT(LightData)
 
 
         CBUFFER(LightData) gLightsNear :  register(b1,space3);
-#line 366 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+#line 387 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
         Tex2D(float4) gTextures[ 880 ] :  register(t0,space0);
 
 
@@ -1432,12 +1429,7 @@ float2 sunDiscTap(int i, int n, float rot)
     float th = float(i) * 2.39996323f + rot;
     return float2(r * cos(th), r * sin(th));
 }
-
-
-
-
-
-
+#line 170 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/msmrecv.h.fsl"
 float sunDiscRotation(float3 worldPosRel)
 {
     float2 h = float2(dot(worldPosRel, float3(0.7391f, 0.3179f, 0.5107f)),
@@ -1513,7 +1505,7 @@ float sunPcssOcclusion(int c, float3 p, float3 worldPosRel, float slopeBias)
     }
     return occlusion * (1.0f / float( 16 ));
 }
-#line 251 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/msmrecv.h.fsl"
+#line 261 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/msmrecv.h.fsl"
 float sunOccMapOcclusion(float3 worldAbs)
 {
     float4 so = gShadowParams.sunOcc;
@@ -1538,7 +1530,7 @@ float sunOccMapOcclusion(float3 worldAbs)
     t = t * t * (3.0f - 2.0f * t);
     return t * so.x * edge;
 }
-#line 305 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/msmrecv.h.fsl"
+#line 315 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/msmrecv.h.fsl"
 float sunShadowVolumetric(float3 p)
 {
     if (gShadowParams.sunParams.x <= 0.0f) { return 1.0f; }
@@ -1589,7 +1581,7 @@ float sunCascadeShadow(int c, float3 p, float3 worldPosRel, float zBias, float s
     if (gShadowParams.sunPcf1.z > 0.5f) { return sunPcssOcclusion(c, p, worldPosRel, slopeBias); }
     return sunCascadeOcclusion(c, p, zBias);
 }
-#line 366 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/msmrecv.h.fsl"
+#line 376 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/msmrecv.h.fsl"
 float sunShadowVisibility(float3 worldPosRel, float3 N)
 {
     float strength = gShadowParams.sunParams.x;
@@ -1650,7 +1642,7 @@ float sunShadowVisibility(float3 worldPosRel, float3 N)
                                          worldPosRel, bias, slopeBias);
         occlusion = lerp(occlusion, occNext, t);
     }
-#line 440 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/msmrecv.h.fsl"
+#line 450 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/msmrecv.h.fsl"
     float lbr = gShadowParams.sunParams.z;
     occlusion = saturate(occlusion / max(1.0f - lbr, 1.0e-4f));
 
@@ -1977,12 +1969,23 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
 
     float3 normal = normalize(In.Normal);
     float sunVis = sunShadowVisibility(In.WorldPos, normal);
-#line 183 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terrain.frag.fsl"
+#line 191 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terrain.frag.fsl"
     bool inReflect = (gFrameData.gReflWaterClip.z != 0.0f);
     uint aoFlags = (uint)(gFrameData.debugParams.w + 0.5f);
+
+
+
+
+
+
+    uint dbgMode = (uint)(gFrameData.debugParams.x + 0.5f);
+    bool aoUsed = ((aoFlags & 3u) != 0u) || dbgMode == 3u || dbgMode == 4u;
+    int2 srcPx = int2(In.Position.xy);
+    if (!inReflect && (aoUsed || gShadowParams.slotBits.x != 0u)) {
+        srcPx = shadowMaskPixel(In.Position);
+    }
     float4 aoSample = inReflect ? float4(0.0f, 0.0f, 0.0f, 1.0f)
-                                 : SampleTex2D(gAO, gSamplerAnisotropic,
-                                               In.Position.xy * gShadowParams.screenAlloc.zw);
+                                 : LoadTex2D(gAO, NO_SAMPLER, srcPx, 0);
 
 
 
@@ -1991,7 +1994,7 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
     float3 result = albedo
                   * (gFrameData.sunCol.rgb * saturate(dot(-gFrameData.sunDir.xyz, normal)) * sunVis
                      + amb);
-#line 218 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terrain.frag.fsl"
+#line 237 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terrain.frag.fsl"
     float3 pointDiffuse = float3(0.0f, 0.0f, 0.0f);
 
 
@@ -1999,8 +2002,7 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
 
 
 
-    int2 maskPx = int2(In.Position.xy);
-    if (!inReflect && gShadowParams.slotBits.x != 0u) { maskPx = shadowMaskPixel(In.Position); }
+    int2 maskPx = srcPx;
     if (length(In.WorldPos) < gFrameData.lodParams.x)
     {
 
@@ -2137,7 +2139,12 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
 
 
     if (dbg == 3u || dbg == 4u) {
-        if (dbg == 4u) { RETURN(float4(aoSample.rgb, 1.0f)); }
+
+
+
+
+
+        if (dbg == 4u) { RETURN(float4(aoSample.rgb * 0.5f + 0.5f, 1.0f)); }
         float v = aoSample.a; RETURN(float4(v, v, v, 1.0f));
     }
     if (dbg == 1u || dbg == 2u) {

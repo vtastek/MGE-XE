@@ -231,6 +231,10 @@ namespace {
         // Host phase split captured by that early finish — the composite path must plot THESE,
         // not a fresh read, or early-finish frames would plot the previous frame's numbers.
         IPC::HostFrameTimings earlyHostTimings;
+        // Tier 1: the shared frame-fence value that early finish read. Same reasoning as the
+        // timings — the composite path must wait on THIS frame's value, and re-reading the shared
+        // Parameters later would hand it whatever the next frame has since written.
+        std::uint64_t earlyFenceValue;
         double tEarlyFinish;
         unsigned frame;
         std::uint32_t drawCount, skinnedCount, multiMapCount, lightCount, skyCount, alphaCount;
@@ -845,6 +849,16 @@ namespace {
     VkCommandBuffer g_cmd     = VK_NULL_HANDLE;
     VkFence         g_fence   = VK_NULL_HANDLE;  // owned
 
+    // Tier 1 (tasks/forge-host-gpu-lane.md): the host's SHARED monotonic D3D12 frame fence,
+    // imported here as a Vulkan TIMELINE semaphore. When the host stops CPU-blocking on its own
+    // frame fence, the RPC reply no longer means "GPU-complete" — this is the sync object that
+    // makes the RT copy wait for the host's draw instead. g_frameSemOk is the ONLY authority on
+    // whether the import actually worked: a resolved vkImportSemaphoreWin32HandleKHR pointer is
+    // not proof the extension was enabled at vkCreateDevice (loaders hand those out regardless).
+    HANDLE      g_fenceHandle = nullptr;          // duplicated host fence NT handle (we own it)
+    VkSemaphore g_frameSem    = VK_NULL_HANDLE;   // owned
+    bool        g_frameSemOk  = false;
+
     HMODULE g_vulkanDll = nullptr;
 
     // Dynamically-resolved Vulkan entry points (DXVK's loader, via vulkan-1.dll).
@@ -873,6 +887,13 @@ namespace {
         PFN_vkDestroyFence               DestroyFence;
         PFN_vkWaitForFences              WaitForFences;
         PFN_vkResetFences                ResetFences;
+        // Tier 1 shared-fence import. OPTIONAL — resolved outside the required-entry-point block
+        // below, because a device that lacks VK_KHR_external_semaphore_win32 must still get the
+        // (working) seam, just without the semaphore handoff.
+        PFN_vkGetPhysicalDeviceExternalSemaphoreProperties GetPhysicalDeviceExternalSemaphoreProperties;
+        PFN_vkImportSemaphoreWin32HandleKHR ImportSemaphoreWin32HandleKHR;
+        PFN_vkCreateSemaphore            CreateSemaphore;
+        PFN_vkDestroySemaphore           DestroySemaphore;
     } vk = {};
 
     bool loadVulkan() {
@@ -917,6 +938,14 @@ namespace {
         DEV(ResetFences);
         #undef INST
         #undef DEV
+        // Tier 1 optional set — deliberately NOT folded into `ok`. Missing entry points here cost
+        // us the semaphore handoff, not the seam.
+        vk.GetPhysicalDeviceExternalSemaphoreProperties =
+            (PFN_vkGetPhysicalDeviceExternalSemaphoreProperties)vk.GetInstanceProcAddr(g_inst, "vkGetPhysicalDeviceExternalSemaphoreProperties");
+        vk.ImportSemaphoreWin32HandleKHR =
+            (PFN_vkImportSemaphoreWin32HandleKHR)vk.GetDeviceProcAddr(g_dev, "vkImportSemaphoreWin32HandleKHR");
+        vk.CreateSemaphore  = (PFN_vkCreateSemaphore)vk.GetDeviceProcAddr(g_dev, "vkCreateSemaphore");
+        vk.DestroySemaphore = (PFN_vkDestroySemaphore)vk.GetDeviceProcAddr(g_dev, "vkDestroySemaphore");
         if (!ok) {
             LOG::logline("!! [seam] failed to resolve required Vulkan entry points — seam disabled");
         }
@@ -951,6 +980,93 @@ namespace {
             return false;
         }
         return (efp.externalMemoryProperties.externalMemoryFeatures & VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT) != 0;
+    }
+
+    // Tier 1 step 0a: can DXVK's device import the host's shared D3D12 fence as a Vulkan semaphore?
+    //
+    // This is NOT answerable by reading our code: we do not create the Vulkan device, DXVK does, and
+    // device extensions must be enabled at vkCreateDevice. So the question is entirely about the
+    // shipped DXVK build, and the ONLY honest test is a real vkImportSemaphoreWin32HandleKHR on the
+    // real handle — a non-null function pointer proves nothing (loaders return pointers for
+    // extensions the device never enabled).
+    //
+    // A D3D12 fence is a monotonic 64-bit counter, so the natural Vulkan mirror is a TIMELINE
+    // semaphore; that is what the RT copy wants to wait on (a specific frame's value). We try
+    // timeline first and fall back to BINARY (the pre-timeline VK_KHR_external_semaphore_win32
+    // shape, driven by VkD3D12FenceSubmitInfoKHR) only to distinguish "no external-semaphore
+    // support at all" from "no timeline import" in the log — the caller only uses the timeline.
+    // Sets g_frameSem/g_frameSemOk on success. Never fatal.
+    void probeSharedFenceSemaphore() {
+        if (!g_fenceHandle) {
+            LOG::logline(">> [seam][tier1] host provided no shared frame fence — semaphore handoff unavailable");
+            return;
+        }
+        LOG::logline(">> [seam][tier1] shared frame-fence handle (this process) = %p", g_fenceHandle);
+
+        // Advisory: does the physical device even claim D3D12_FENCE is importable? Logged, not gated
+        // on — the import call below is the authority.
+        if (vk.GetPhysicalDeviceExternalSemaphoreProperties) {
+            VkPhysicalDeviceExternalSemaphoreInfo si = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_SEMAPHORE_INFO };
+            si.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D12_FENCE_BIT;
+            VkExternalSemaphoreProperties sp = { VK_STRUCTURE_TYPE_EXTERNAL_SEMAPHORE_PROPERTIES };
+            vk.GetPhysicalDeviceExternalSemaphoreProperties(g_phys, &si, &sp);
+            LOG::logline(">> [seam][tier1] D3D12_FENCE external-semaphore features=0x%X (importable=%d) compatible=0x%X",
+                         (unsigned)sp.externalSemaphoreFeatures,
+                         (int)((sp.externalSemaphoreFeatures & VK_EXTERNAL_SEMAPHORE_FEATURE_IMPORTABLE_BIT) != 0),
+                         (unsigned)sp.compatibleHandleTypes);
+        } else {
+            LOG::logline(">> [seam][tier1] vkGetPhysicalDeviceExternalSemaphoreProperties unresolved");
+        }
+        LOG::logline(">> [seam][tier1] entry points: ImportSemaphoreWin32HandleKHR=%p CreateSemaphore=%p",
+                     (void*)vk.ImportSemaphoreWin32HandleKHR, (void*)vk.CreateSemaphore);
+        if (!vk.ImportSemaphoreWin32HandleKHR || !vk.CreateSemaphore || !vk.DestroySemaphore) {
+            LOG::logline("!! [seam][tier1] RESULT: semaphore import UNAVAILABLE (entry points missing)");
+            return;
+        }
+
+        // The import does NOT consume the handle (NT handles: we keep ownership and CloseHandle it),
+        // so both attempts can use g_fenceHandle directly.
+        for (int pass = 0; pass < 2; ++pass) {
+            const bool timeline = (pass == 0);
+            VkSemaphoreTypeCreateInfo stci = { VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO };
+            stci.semaphoreType = timeline ? VK_SEMAPHORE_TYPE_TIMELINE : VK_SEMAPHORE_TYPE_BINARY;
+            stci.initialValue  = 0;
+            VkSemaphoreCreateInfo sci = { VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
+            sci.pNext = &stci;
+            VkSemaphore sem = VK_NULL_HANDLE;
+            VkResult r = vk.CreateSemaphore(g_dev, &sci, nullptr, &sem);
+            if (r != VK_SUCCESS || sem == VK_NULL_HANDLE) {
+                LOG::logline("!! [seam][tier1] vkCreateSemaphore (%s) failed VkResult=%d",
+                             timeline ? "timeline" : "binary", (int)r);
+                continue;
+            }
+            VkImportSemaphoreWin32HandleInfoKHR imp = { VK_STRUCTURE_TYPE_IMPORT_SEMAPHORE_WIN32_HANDLE_INFO_KHR };
+            imp.semaphore  = sem;
+            imp.flags      = 0;   // permanent import: the payload outlives any single wait
+            imp.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D12_FENCE_BIT;
+            imp.handle     = g_fenceHandle;
+            r = vk.ImportSemaphoreWin32HandleKHR(g_dev, &imp);
+            LOG::logline(">> [seam][tier1] vkImportSemaphoreWin32HandleKHR(%s, D3D12_FENCE) VkResult=%d",
+                         timeline ? "timeline" : "binary", (int)r);
+            if (r == VK_SUCCESS) {
+                if (timeline) {
+                    g_frameSem   = sem;
+                    g_frameSemOk = true;
+                    LOG::logline(">> [seam][tier1] RESULT: shared-fence semaphore import OK (timeline) — "
+                                 "Tier 1 can use the semaphore handoff");
+                    return;
+                }
+                // Binary imported but timeline did not: usable in principle, but the RT copy needs a
+                // per-frame VALUE, so we do not adopt it. Report the distinction and stop.
+                vk.DestroySemaphore(g_dev, sem, nullptr);
+                LOG::logline("!! [seam][tier1] RESULT: only BINARY import works — timeline unavailable; "
+                             "Tier 1 must take the double-RT branch");
+                return;
+            }
+            vk.DestroySemaphore(g_dev, sem, nullptr);
+        }
+        LOG::logline("!! [seam][tier1] RESULT: shared-fence semaphore import FAILED — "
+                     "Tier 1 must take the double-RT branch");
     }
 
     // Import the host's shared NT handle as a VkImage on DXVK's device.
@@ -1096,6 +1212,9 @@ namespace {
 
     void releaseAll() {
         if (g_dev) {
+            if (g_frameSem && vk.DestroySemaphore) { vk.DestroySemaphore(g_dev, g_frameSem, nullptr); }
+            g_frameSem = VK_NULL_HANDLE;
+            g_frameSemOk = false;
             if (g_fence)     { vk.DestroyFence(g_dev, g_fence, nullptr); g_fence = VK_NULL_HANDLE; }
             if (g_cmdPool)   { vk.DestroyCommandPool(g_dev, g_cmdPool, nullptr); g_cmdPool = VK_NULL_HANDLE; g_cmd = VK_NULL_HANDLE; }
             if (g_importImg) { vk.DestroyImage(g_dev, g_importImg, nullptr); g_importImg = VK_NULL_HANDLE; }
@@ -1105,6 +1224,7 @@ namespace {
         g_mainTexValid = false;
         g_dstImg = VK_NULL_HANDLE;
         if (g_hostHandle)  { CloseHandle(g_hostHandle); g_hostHandle = nullptr; }
+        if (g_fenceHandle) { CloseHandle(g_fenceHandle); g_fenceHandle = nullptr; }
         if (g_vki)         { g_vki->Release(); g_vki = nullptr; }
         g_inst = VK_NULL_HANDLE; g_phys = VK_NULL_HANDLE; g_dev = VK_NULL_HANDLE; g_queue = VK_NULL_HANDLE;
     }
@@ -1202,6 +1322,27 @@ namespace {
             }
             g_w = (UINT)(g_bbW * kMaxRenderScale + 0.5f);
             g_h = (UINT)(g_bbH * kMaxRenderScale + 0.5f);
+            // Dev-only startup override so a resolution sweep can be SCRIPTED. The scale is otherwise
+            // reachable only through the panel slider, and the perf harness runs the game minimized
+            // with no one at the keyboard — without this, "measure the cost at 3 resolutions" means 3
+            // rebuilds, and the three builds are then not provably identical in anything else.
+            // Read ONCE here, never in recomputeRenderSize, so the slider still wins at runtime.
+            // Same shape as the host's MGE_RDOC (mgeHost64/main.cpp): absent => today's behaviour.
+            // GetEnvironmentVariableA rather than getenv: getenv reads a CRT snapshot and trips
+            // C4996 here, and we already have windows.h.
+            {
+                char rs[32] = {};
+                if (GetEnvironmentVariableA("MGE_RENDER_SCALE", rs, sizeof(rs)) > 0) {
+                    const float s = (float)std::atof(rs);
+                    if (s >= kMinRenderScale && s <= kMaxRenderScale) {
+                        g_renderScale = s;
+                        LOG::logline(">> [seam] MGE_RENDER_SCALE=%.2f applied at init (dev override)", s);
+                    } else {
+                        LOG::logline("!! [seam] MGE_RENDER_SCALE='%s' out of [%.2f..%.2f] — ignored",
+                                     rs, kMinRenderScale, kMaxRenderScale);
+                    }
+                }
+            }
             recomputeRenderSize();   // sets g_rw/g_rh + stamps the host render size (g_client is live here)
             LOG::logline(">> [seam] backbuffer %ux%u — alloc %ux%u (ceiling %.2fx), render %ux%u (scale %.2fx)",
                          g_bbW, g_bbH, g_w, g_h, kMaxRenderScale, g_rw, g_rh, g_renderScale);
@@ -1210,16 +1351,18 @@ namespace {
         // Host brings up Forge + creates the shared RT; returns the NT handle already
         // duplicated into THIS process.
         HANDLE hostHandle = nullptr;
+        HANDLE hostFence = nullptr;
         // MSAA: Configuration.AALevel is the D3DMULTISAMPLE value (0/2/4/8); map 0 -> 1 sample.
         const std::uint32_t sampleCount = Configuration.AALevel > 0 ? (std::uint32_t)Configuration.AALevel : 1u;
         // AF: Configuration.AnisoLevel (0 = off, else max anisotropy) — host sampler (Phase 2).
         const std::uint32_t anisoLevel = (std::uint32_t)Configuration.AnisoLevel;
-        if (!g_client->renderInitBlocking(g_w, g_h, sampleCount, anisoLevel, nullptr, nullptr, &hostHandle) || hostHandle == nullptr) {
+        if (!g_client->renderInitBlocking(g_w, g_h, sampleCount, anisoLevel, nullptr, nullptr, &hostHandle, &hostFence) || hostHandle == nullptr) {
             LOG::logline("!! [seam] renderInit RPC failed or no shared handle; seam disabled");
             releaseAll();
             return;
         }
         g_hostHandle = hostHandle;
+        g_fenceHandle = hostFence;   // may be null; probeSharedFenceSemaphore reports either way
         LOG::logline(">> [seam] host shared-RT NT handle (this process) = %p", hostHandle);
 
         // Cross-vendor: pick the first external handle type the GPU can import.
@@ -1251,6 +1394,15 @@ namespace {
             releaseAll();
             return;
         }
+        // Tier 1: import the host's shared frame fence as a timeline semaphore, and tell the host
+        // whether it worked. THIS CALL IS THE SAFETY INTERLOCK — the host only stops fence-waiting
+        // its own frame once we have said we can wait it ourselves, so an import failure silently
+        // degrades to the old blocking behaviour instead of to a torn composite.
+        probeSharedFenceSemaphore();
+        g_client->setClientSyncsOnFence(g_frameSemOk);
+        LOG::logline(">> [seam][tier1] host frame overlap %s",
+                     g_frameSemOk ? "ENABLED (client waits the shared fence before each RT copy)"
+                                  : "DISABLED (no semaphore — host keeps its own fence wait)");
 
         g_initOk = true;
         LOG::logline(">> [seam] DXVK Vulkan-interop seam ready (%ux%u). F11 toggles the composite.", g_w, g_h);
@@ -1267,7 +1419,21 @@ namespace {
 
     // Copy the imported host RT -> the DXVK D3D9 texture's VkImage, on DXVK's own queue.
     // Blocking: CPU-waits the copy so the subsequent StretchRect reads finished pixels.
-    bool copyHostRtToDst() {
+    //
+    // hostFenceValue (Tier 1): the value the host signalled on the SHARED D3D12 frame fence for the
+    // frame we are copying. The host no longer blocks on its own fence, so the RPC reply arrives
+    // while the GPU may still be drawing into this very image — without an explicit wait, every
+    // frame would copy a half-drawn RT. We add the imported timeline semaphore as a WAIT on the
+    // copy's submit, which is a GPU-side dependency: it costs nothing on the CPU, and under
+    // frame-ahead (deferFinish) the copy already happens at the NEXT frame's BeginScene, by which
+    // point the semaphore is long signalled and the wait is free in the steady state.
+    //
+    // 0 (or no imported semaphore) ⇒ no sync object. We cannot make the copy safe from this side, so
+    // the client tells the host so every kickoff (renderFrameParams.clientSyncsOnFence) and the host
+    // keeps its old end-of-frame fence wait — the reply then means "GPU-complete" exactly as before
+    // and this copy is safe with no wait at all. That is the fallback for a DXVK build where step
+    // 0a's import fails; it costs the Tier 1 win, not correctness.
+    bool copyHostRtToDst(std::uint64_t hostFenceValue) {
         // Spike attribution (rare 12ms "Forge RT copy" with host already finished): the outer
         // zone can't say WHICH of the three main-thread blockers stalled — the DXVK flush (drains
         // MW's whole pending D3D9 batch), the submit-queue lock (contends DXVK's submit thread),
@@ -1326,6 +1492,22 @@ namespace {
         si.commandBufferCount = 1;
         si.pCommandBuffers    = &g_cmd;
 
+        // Tier 1: order this copy behind the host's draw with a GPU-side wait on the imported
+        // timeline semaphore. TOP_OF_PIPE is the correct stage mask for a timeline wait that must
+        // gate everything in the command buffer, including the first layout transition — the copy
+        // has no earlier work to overlap with, so nothing is lost by blocking the whole submit.
+        const uint64_t waitValue = hostFenceValue;
+        VkTimelineSemaphoreSubmitInfo tsi = { VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO };
+        const VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+        if (g_frameSemOk && waitValue != 0) {
+            tsi.waitSemaphoreValueCount = 1;
+            tsi.pWaitSemaphoreValues    = &waitValue;
+            si.pNext                = &tsi;
+            si.waitSemaphoreCount   = 1;
+            si.pWaitSemaphores      = &g_frameSem;
+            si.pWaitDstStageMask    = &waitStage;
+        }
+
         const double tcRecord = nowMs();
         double tcLocked = tcRecord, tcSubmit = tcRecord;
         // [experimental, uncommitted] Hold DXVK's submission-queue lock ONLY for the submit —
@@ -1348,11 +1530,17 @@ namespace {
         const double total = tcEnd - tc0;
         MGE_TracyPlot("Forge RTcopy flush ms", tcFlush - tc0);
         MGE_TracyPlot("Forge RTcopy wait ms",  tcEnd - tcSubmit);
-        // Only rare spikes log — the steady RT copy is ~0.2ms, so >3ms means a real stall to
-        // attribute (flush / lock / submit / fence-wait). Rare by construction ⇒ no hot-path spam.
-        if (total > 3.0) {
-            LOG::logline(">> [rtcopy] spike total=%.2fms | flush=%.2f record=%.2f lock=%.2f submit=%.2f wait=%.2f",
-                         total, tcFlush - tc0, tcRecord - tcFlush, tcLocked - tcRecord,
+        // Only rare spikes log. The trigger deliberately EXCLUDES the fence-wait phase: since Tier 1
+        // that phase also contains the semaphore wait for the host's draw, which is multi-ms by
+        // design on every frame — testing `total` here made this fire once per frame (1848 lines in
+        // one session), and a LOG::logline on the per-frame path is the exact shape that collapsed
+        // the multimap night scene. What is still worth a line is a stall in the parts that are
+        // supposed to be ~0: the DXVK flush, the submit lock, the record, the submit. The waiting
+        // itself stays visible in the Tracy plot below and in the [hb] copy= average.
+        const double nonWait = total - (tcEnd - tcSubmit);
+        if (nonWait > 3.0) {
+            LOG::logline(">> [rtcopy] spike nonWait=%.2fms total=%.2f | flush=%.2f record=%.2f lock=%.2f submit=%.2f wait=%.2f",
+                         nonWait, total, tcFlush - tc0, tcRecord - tcFlush, tcLocked - tcRecord,
                          tcSubmit - tcLocked, tcEnd - tcSubmit);
         }
         return r == VK_SUCCESS;
@@ -2002,8 +2190,10 @@ namespace {
             g_kick.rpcEarlyFinished = true;
             g_kick.earlyHostMs      = 0.0;
             g_kick.earlyHostTimings = {};
+            g_kick.earlyFenceValue  = 0;
             g_kick.earlyOk          = g_client->renderSceneFinish(&g_kick.earlyHostMs,
-                                                                  &g_kick.earlyHostTimings);
+                                                                  &g_kick.earlyHostTimings,
+                                                                  &g_kick.earlyFenceValue);
             g_kick.tEarlyFinish     = nowMs();
         }
         LOG::logline("-- [seam] geometry staging at %u KB mid-walk — draining to host",
@@ -4016,14 +4206,18 @@ namespace RenderProcess {
         r.overlap = (earlyFinished ? ks.tEarlyFinish : r.tWait0) - ks.tKick;
 
         IPC::HostFrameTimings hostT{};
+        // Tier 1: the shared frame-fence value for the frame we are about to copy. The RPC reply no
+        // longer implies the host's GPU is done, so this is what copyHostRtToDst waits on.
+        std::uint64_t frameFence = 0;
         if (earlyFinished) {
             r.ok     = ks.earlyOk;
             r.hostMs = ks.earlyHostMs;
             hostT    = ks.earlyHostTimings;   // captured at the mid-walk drain, not re-read here
+            frameFence = ks.earlyFenceValue;  // ...and neither is the fence value (same reason)
         } else {
             MGE_ZoneScopedN("Forge renderSceneFinish (host wait)");
             markMainPhase(MP_FINISH_COPY);   // main is now blocked on the host IPC finish
-            r.ok = g_client->renderSceneFinish(&r.hostMs, &hostT);
+            r.ok = g_client->renderSceneFinish(&r.hostMs, &hostT, &frameFence);
         }
         r.tRender = nowMs();
         // Split the wait: hostMs = host self-timed cost; (residual wait + kickoff cost - hostMs)
@@ -4082,7 +4276,7 @@ namespace RenderProcess {
         bool copyOk;
         {
             MGE_ZoneScopedN("Forge RT copy");
-            copyOk = copyHostRtToDst();
+            copyOk = copyHostRtToDst(frameFence);
         }
         if (!copyOk) {
             static bool logged = false;

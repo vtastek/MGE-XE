@@ -53,7 +53,9 @@ float4 PS_MAIN( VSOutput In )
     uint   aoFlags  = (uint)(gFrameData.debugParams.w + 0.5f);
     float2 aoUv     = In.Position.xy * gShadowParams.screenAlloc.zw;   // gAO is ALLOC-sized, not render-sized
     float4 aoSample = SampleTex2D(gAO, gSamplerAnisotropic, aoUv);
-    if ((aoFlags & 2u) != 0u) { N = normalize(aoSample.rgb); }
+    // NO bent-normal bend and NO AO scalar — alpha sheets are not in the Z-prepass gAO is built
+    // from, so aoSample here belongs to whatever is BEHIND the sheet. Same reasoning and same
+    // decision as alpha.frag; keep the two in lockstep. Read only for the F12 AO views below.
 
     // --- BEGIN lit block (DUPLICATED from multimap.frag — keep in lockstep) ---
     float  ndl = saturate(dot(N, -gFrameData.sunDir.xyz));
@@ -61,7 +63,10 @@ float4 PS_MAIN( VSOutput In )
     // SH1 sky-directional ambient — geometric normal, not the possibly-bent N (see skyamb.h.fsl).
     float3 a = ((aoFlags & 4u) != 0u) ? float3(1.0f, 1.0f, 1.0f)
                                       : gFrameData.ambCol.rgb * skyAmbFactor(In.Normal, In.WorldPos);
-    if ((aoFlags & 1u) != 0u) { a *= aoSample.a; }
+    // NO AO on ambient — aoSample belongs to the opaque surface BEHIND the sheet, so this was
+    // stamping the wall's occlusion onto a transparent surface in front of it. Same reasoning and
+    // same decision as alpha.frag; keep the two in lockstep. aoSample stays sampled for the F12
+    // AO views (dbg 3/4) below.
     a *= gFrameData.dbgScales.x;
     {
         uint nLights = (uint)gLights.lightParams.x;
@@ -178,7 +183,12 @@ float4 PS_MAIN( VSOutput In )
     // F12 debug views (lockstep with multimap.frag; alpha forced 1 so the view reads clearly).
     uint dbg = (uint)(gFrameData.debugParams.x + 0.5f);
     if (dbg == 3u || dbg == 4u) {
-        if (dbg == 4u) { RETURN(float4(aoSample.rgb, 1.0f)); }
+        // mode 4: the gAO bend term, remapped *0.5+0.5 so zero reads as mid grey. It is not a
+        // normal (aocommon.h.fsl): it runs from EXACTLY zero where nothing occludes to the
+        // absolute bent direction where everything does. So flat mid grey == "no bend here",
+        // and it must be flat on an OPEN surface — any 4x4 dither-tile texture there means the
+        // quadrature reference is not cancelling. Cavities legitimately read as a normal map.
+        if (dbg == 4u) { RETURN(float4(aoSample.rgb * 0.5f + 0.5f, 1.0f)); }
         float v = aoSample.a; RETURN(float4(v, v, v, 1.0f));
     }
     if (dbg == 5u) { RETURN(float4(alb, 1.0f)); }

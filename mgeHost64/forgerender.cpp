@@ -72,6 +72,12 @@
 #include "shaders/FSL/linearizedepth.srt.h"
 #include "shaders/FSL/gtao.srt.h"
 #include "shaders/FSL/aoblur.srt.h"
+// ...and the two ends of the OPTIONAL half-res AO chain (AODownSrtData / AOUpSrtData, both
+// Persistent frequency). One SRT per header — see aohalfres.srt.h, which holds the AOUpParams
+// cbuffer struct both of them share.
+#include "shaders/FSL/aodepthdown.srt.h"
+#include "stbn_mask.h"          // embedded spatiotemporal blue-noise mask (generated)
+#include "shaders/FSL/aoupscale.srt.h"
 // SH2 sky-AO: the top-down world height map's TERRAIN-fill compute SRT (SkyHeightSrtData, PerBatch
 // frequency). Shares the merged ComputeRootSignature. Re-declares the two terrain buffers in its
 // OWN set rather than reaching them through the graphics PerFrame sets — see the header.
@@ -1077,6 +1083,22 @@ namespace {
         double          gpuTickFreq = 0.0;         // timestamp ticks/sec (getTimestampFrequency)
         ID3D12Resource* pSharedRes = nullptr;   // owned by pRT (released on removeRenderTarget)
         HANDLE          ntHandle = nullptr;     // host-process NT shared handle
+        // Tier 1 (tasks/forge-host-gpu-lane.md): a SHARED, monotonic D3D12 fence signalled on the
+        // frame submit, exported as an NT handle for the client to import as a Vulkan semaphore.
+        // Once renderScene stops fence-waiting its own frame, the RPC reply no longer implies
+        // "GPU-complete", so the client's RT copy needs a real cross-process sync object. Created
+        // best-effort: if the client can't import it we fall back to the double-RT scheme.
+        ID3D12Fence*    pSharedFence = nullptr;
+        HANDLE          ntFenceHandle = nullptr;   // host-process NT shared handle for pSharedFence
+        uint64_t        sharedFenceValue = 0;      // last value signalled on pSharedFence
+        // Tier 1: between-frames GPU work (arena grow-by-copy) gets its OWN pool/cmd/fence, following
+        // the pHizCmdPool precedent. It used to borrow the frame loop's pCmdPool/pCmd/pFence and
+        // resetCmdPool them, which was safe only while renderScene fence-waited its own frame before
+        // returning. It no longer does, and resetting an allocator whose commands are still executing
+        // is undefined behaviour — so the IPC-service thread must never touch the frame's objects.
+        CmdPool*        pAuxCmdPool = nullptr;
+        Cmd*            pAuxCmd = nullptr;
+        Fence*          pAuxFence = nullptr;
         uint32_t        width = 0, height = 0;         // CURRENT render size (<= alloc); per-frame viewport
         uint32_t        allocWidth = 0, allocHeight = 0; // fixed RT allocation size (ceiling scale x backbuffer)
         bool            firstFrame = true;
@@ -1132,6 +1154,45 @@ namespace {
         DescriptorSet* pLinearizeSet = nullptr;   // LinDepthSrtData PerBatch: gSceneDepth + gLinearDepthOut
         DescriptorSet* pGtaoBatchSet = nullptr;   // AOSrtData PerBatch:  gLinearDepthIn + gAOOut
         DescriptorSet* pAOBlurSet = nullptr;      // AOBlurSrtData PerFrame: gBlurParams + gAOSrc + gBlurDepthIn + gAODst
+
+        // --- Half-res AO (g_aoHalfRes; default OFF) -------------------------------------------
+        // AO is a low-frequency signal already denoised by a 7x7 bilateral, so it is the classic
+        // candidate for running at half and upsampling. The AO shader and the blur shader are
+        // UNCHANGED — they run against the *Half descriptor sets below — and pAOBlur stays full
+        // res and stays what the colour frags sample as gAO, so the frag-side contract is
+        // untouched. pLinearDepth also stays FULL res: shadowmask.comp and water.frag's
+        // gSceneLinDepth both read it. Only the AO chain goes half.
+        //
+        // All three textures are allocated at half of allocWidth/allocHeight — allocation-sized
+        // like every other screen RT — so a render-scale change needs no reallocation and the
+        // toggle is free. Both sets of descriptor sets are pre-created at init and picked by the
+        // toggle, so there is no per-frame updateDescriptorSet.
+        Texture*       pLinearDepthHalf = nullptr;   // R32F half-res device depth the AO reads
+        Texture*       pAOHalf = nullptr;            // RGBA16F half-res AO output
+        Texture*       pAOBlurHalf = nullptr;        // RGBA16F half-res bilateral result (the upscale's source)
+        Shader*        pAODownShader = nullptr;
+        Pipeline*      pAODownPipeline = nullptr;
+        Shader*        pAOUpShader = nullptr;
+        Pipeline*      pAOUpPipeline = nullptr;
+        // Its OWN cbuffer, deliberately: the upscale needs full AND half dims, and ONE host buffer
+        // backs gAOParams and gBlurParams — growing one struct without the other corrupts the
+        // blur's knobs SILENTLY (gtao.srt.h:17, aoblur.srt.h:21). A separate buffer sidesteps it.
+        Buffer*        pAOUpCbv = nullptr;
+        DescriptorSet* pAODownSet = nullptr;         // AODownSrtData Persistent
+        DescriptorSet* pAOUpSet = nullptr;           // AOUpSrtData Persistent
+        DescriptorSet* pGtaoBatchSetHalf = nullptr;  // AOSrtData PerDraw, half-res depth in / AO out
+        // Spatiotemporal blue-noise mask (stbn_mask.h), 64 x (64*16) R8G8: 16 time slices of a 64x64
+        // mask stacked vertically. Created once, never resized — it is resolution-independent by
+        // construction (the shader wraps px & 63).
+        Texture*       pStbn = nullptr;
+        DescriptorSet* pAOBlurSetHalf = nullptr;     // AOBlurSrtData PerFrame, all-half variant
+        bool           aoHalfReady = false;          // every half-res resource/pipeline/set built
+        // Which AO texture the LAST renderScene actually wrote and left in SHADER_RESOURCE. The two
+        // diagnostic readers (debugReadbackAO, the F12 debug-texture widget) must follow THIS, not
+        // g_aoHalfRes: the toggle is flipped from the UI pass, which runs AFTER the AO chain, so on
+        // the frame it changes the two disagree — and each reader would then size a readback, or
+        // assume a resource state, for a texture the frame never touched.
+        bool           aoLastHalf = false;
 
         // --- SH2: top-down world HEIGHT map (tasks/lighting.md) ---------------------------------
         // ONE R16F world height per texel — max(terrain, statics) — over a kSkyHeightExtent window
@@ -3511,6 +3572,31 @@ namespace {
             abld.pDesc = &abd;
             addResource(&abld, nullptr);
 
+            // Half-res AO chain (default OFF; allocated unconditionally so the toggle costs no
+            // reallocation). Sized off the ALLOCATION rect like every other screen RT, so a live
+            // render-scale change never touches them. Same formats as their full-res twins.
+            const uint32_t halfW = (width  + 1u) / 2u;
+            const uint32_t halfH = (height + 1u) / 2u;
+            {
+                TextureDesc ldh = ld;
+                ldh.mWidth = halfW; ldh.mHeight = halfH;
+                ldh.pName = "linearDepthHalf";
+                TextureLoadDesc l = {}; l.ppTexture = &g_live.pLinearDepthHalf; l.pDesc = &ldh;
+                addResource(&l, nullptr);
+
+                TextureDesc adh = ad;
+                adh.mWidth = halfW; adh.mHeight = halfH;
+                adh.pName = "aoBufferHalf";
+                TextureLoadDesc a = {}; a.ppTexture = &g_live.pAOHalf; a.pDesc = &adh;
+                addResource(&a, nullptr);
+
+                TextureDesc abh = ad;
+                abh.mWidth = halfW; abh.mHeight = halfH;
+                abh.pName = "aoBlurBufferHalf";
+                TextureLoadDesc b = {}; b.ppTexture = &g_live.pAOBlurHalf; b.pDesc = &abh;
+                addResource(&b, nullptr);
+            }
+
             // gAOParams cbuffer (invViewProj + screen + knobs + eye), uploaded per frame.
             // UNIFORM_BUFFER (CBV), NOT DESCRIPTOR_TYPE_BUFFER: a structured-SRV view over a
             // CPU_TO_GPU (UPLOAD-heap) resource is illegal in D3D12 and silently removes the device
@@ -3519,11 +3605,19 @@ namespace {
             cb.mDesc.mDescriptors = DESCRIPTOR_TYPE_UNIFORM_BUFFER;
             cb.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_CPU_TO_GPU;
             cb.mDesc.mFlags = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
-            cb.mDesc.mSize = 256;                                   // >= sizeof(AOParams) (112B), CBV-aligned
+            cb.mDesc.mSize = 256;                                   // >= sizeof(AOParams) (144B), CBV-aligned
             cb.mDesc.pName = "aoParamsCbv";
             cb.pData = nullptr;
             cb.ppBuffer = &g_live.pAOParamsCbv;
             addResource(&cb, nullptr);
+
+            // gAOUpParams: the half-res chain's OWN cbuffer (invViewProj + full dims + half dims +
+            // upscale knobs). Separate from pAOParamsCbv on purpose — see the g_live declaration.
+            BufferLoadDesc ub = cb;
+            ub.mDesc.mSize = 256;                                   // >= sizeof(AOUpParams) (112B)
+            ub.mDesc.pName = "aoUpParamsCbv";
+            ub.ppBuffer = &g_live.pAOUpCbv;
+            addResource(&ub, nullptr);
 
             // Alpha shadow-receive scratch depth (screen-size single-sample D32, SRV-readable as
             // R32F — same recipe as pShadowAtlas). The alpha shadow prepass draws the sheets at the
@@ -3709,6 +3803,11 @@ namespace {
             if (!g_live.pLinearDepth || !g_live.pAO || !g_live.pAOBlur || !g_live.pAOParamsCbv) {
                 std::printf("[forge] Tier 2 AO resource alloc FAILED\n");
                 return false;
+            }
+            // Half-res is an OPTIONAL path: a failure here only disables the toggle (aoHalfReady
+            // stays false and the dispatch chain keeps running full res), never the whole AO block.
+            if (!g_live.pLinearDepthHalf || !g_live.pAOHalf || !g_live.pAOBlurHalf || !g_live.pAOUpCbv) {
+                std::printf("[forge] half-res AO resource alloc FAILED — half-res AO unavailable\n");
             }
             if (!g_live.pAlphaShadowDepth) {
                 std::printf("[forge] alpha shadow-depth RT alloc FAILED (alpha shadow-receive disabled)\n");
@@ -6439,12 +6538,99 @@ namespace {
             // collision gtao.srt.h documents.
             DescriptorSetDesc gbset = SRT_SET_DESC(AOSrtData, PerDraw, 1, 0);
             addDescriptorSet(R, &gbset, &g_live.pGtaoBatchSet);
+
+            // Spatiotemporal blue-noise mask -> a plain 2D texture. It is embedded in the binary
+            // (stbn_mask.h says why), 128 KB, created once and never resized: the shader wraps with
+            // px & 63, so it is resolution-independent and survives every render-scale change.
+            if (!g_live.pStbn) {
+                TextureDesc td = {};
+                td.mWidth = kStbnWidth; td.mHeight = kStbnHeight; td.mDepth = 1;
+                td.mArraySize = 1; td.mMipLevels = 1;
+                td.mSampleCount = SAMPLE_COUNT_1;
+                td.mFormat = TinyImageFormat_R8G8_UNORM;
+                td.mStartState = RESOURCE_STATE_SHADER_RESOURCE;
+                td.mDescriptors = DESCRIPTOR_TYPE_TEXTURE;
+                td.pName = "stbnMask";
+                TextureLoadDesc tld = {};
+                tld.ppTexture = &g_live.pStbn;
+                tld.pDesc = &td;
+                addResource(&tld, nullptr);
+                waitForAllResourceLoads();
+                if (g_live.pStbn) {
+                    TextureUpdateDesc upd = {};
+                    upd.pTexture = g_live.pStbn;
+                    upd.mBaseMipLevel = 0; upd.mMipLevels = 1;
+                    upd.mBaseArrayLayer = 0; upd.mLayerCount = 1;
+                    upd.mCurrentState = RESOURCE_STATE_SHADER_RESOURCE;
+                    beginUpdateResource(&upd);
+                    {
+                        TextureSubresourceUpdate sub = upd.getSubresourceUpdateDesc(0, 0);
+                        // Row-by-row, not one memcpy: the destination row pitch is whatever the
+                        // driver wants (256-byte aligned on D3D12) and the source is packed 2 bytes
+                        // per texel. Copying the whole blob in one go would shear the image.
+                        for (uint32_t row = 0; row < sub.mRowCount; ++row) {
+                            std::memcpy(sub.pMappedData + (size_t)row * sub.mDstRowStride,
+                                        kStbnMaskRG8 + (size_t)row * kStbnWidth * 2u,
+                                        (size_t)kStbnWidth * 2u);
+                        }
+                    }
+                    endUpdateResource(&upd);
+                    // LOG::logline, not printf: the host runs with no console, so a printf here goes
+                    // nowhere and the ONLY evidence that the dither is the mask rather than the 4x4
+                    // tile fallback would be the pixels themselves. Init-time, not a hot path.
+                    LOG::logline(">> [forge][ao] STBN mask %ux%u R8G8 (%u slices, %u bytes) uploaded",
+                                 kStbnWidth, kStbnHeight, kStbnSlices, kStbnBytes);
+                } else {
+                    LOG::logline("!! [forge][ao] STBN mask addResource FAILED — dither falls back to the 4x4 tile");
+                }
+            }
             // AO blur PerFrame set (root index distinct from PerBatch/PerDraw — no rebind collision).
             DescriptorSetDesc abset = SRT_SET_DESC(AOBlurSrtData, PerFrame, 1, 0);
             addDescriptorSet(R, &abset, &g_live.pAOBlurSet);
             if (!g_live.pLinearizeSet || !g_live.pGtaoBatchSet || !g_live.pAOBlurSet) {
                 std::printf("[forge] addDescriptorSet(compute) FAILED\n");
                 return false;
+            }
+
+            // --- Half-res AO chain: two shaders/pipelines + four sets. Non-fatal throughout —
+            // aoHalfReady gates the toggle, so a missing dxil leaves the full-res path intact
+            // rather than taking AO down with it. The two new SRTs claim Persistent, the one
+            // frequency the AO chain does not already use (linearize PerBatch, AO PerDraw, blur
+            // PerFrame), for the rebind-cache reason gtao.srt.h:31-39 records. ---
+            if (g_live.pLinearDepthHalf && g_live.pAOHalf && g_live.pAOBlurHalf && g_live.pAOUpCbv) {
+                ShaderLoadDesc dsd = {};
+                dsd.mComp.pFileName = "aodepthdown.comp";
+                addShader(R, &dsd, &g_live.pAODownShader);
+                ShaderLoadDesc usd = {};
+                usd.mComp.pFileName = "aoupscale.comp";
+                addShader(R, &usd, &g_live.pAOUpShader);
+                if (g_live.pAODownShader && g_live.pAOUpShader) {
+                    PipelineDesc dpd = {};
+                    dpd.mType = PIPELINE_TYPE_COMPUTE;
+                    dpd.mComputeDesc.pShaderProgram = g_live.pAODownShader;
+                    addPipeline(R, &dpd, &g_live.pAODownPipeline);
+                    PipelineDesc upd = {};
+                    upd.mType = PIPELINE_TYPE_COMPUTE;
+                    upd.mComputeDesc.pShaderProgram = g_live.pAOUpShader;
+                    addPipeline(R, &upd, &g_live.pAOUpPipeline);
+                }
+                DescriptorSetDesc dset = SRT_SET_DESC(AODownSrtData, Persistent, 1, 0);
+                addDescriptorSet(R, &dset, &g_live.pAODownSet);
+                DescriptorSetDesc uset = SRT_SET_DESC(AOUpSrtData, Persistent, 1, 0);
+                addDescriptorSet(R, &uset, &g_live.pAOUpSet);
+                // Half-res twins of the AO + blur sets. Same SRTs, same root indices, different
+                // textures — pre-created so the toggle is a pointer pick, never a per-frame
+                // updateDescriptorSet (which would stall on in-flight descriptor reads).
+                DescriptorSetDesc gbh = SRT_SET_DESC(AOSrtData, PerDraw, 1, 0);
+                addDescriptorSet(R, &gbh, &g_live.pGtaoBatchSetHalf);
+                DescriptorSetDesc abh = SRT_SET_DESC(AOBlurSrtData, PerFrame, 1, 0);
+                addDescriptorSet(R, &abh, &g_live.pAOBlurSetHalf);
+                g_live.aoHalfReady = g_live.pAODownPipeline && g_live.pAOUpPipeline
+                                     && g_live.pAODownSet && g_live.pAOUpSet
+                                     && g_live.pGtaoBatchSetHalf && g_live.pAOBlurSetHalf;
+                if (!g_live.aoHalfReady) {
+                    std::printf("[forge] half-res AO pipeline/set build FAILED — toggle disabled\n");
+                }
             }
 
             // SH2 terrain-fill compute (skyheight.comp). Pipeline + set are built here with every
@@ -6518,7 +6704,7 @@ namespace {
             }
             {
                 // PerDraw set (root 0, distinct from linearize's PerBatch root 1): CBV + SRV + UAV.
-                DescriptorData d[3] = {};
+                DescriptorData d[4] = {};
                 d[0].mIndex = SRT_RES_IDX(AOSrtData, PerDraw, gAOParams);
                 d[0].ppBuffers = &g_live.pAOParamsCbv;
                 d[1].mIndex = SRT_RES_IDX(AOSrtData, PerDraw, gLinearDepthIn);
@@ -6527,7 +6713,10 @@ namespace {
                 d[2].mIndex = SRT_RES_IDX(AOSrtData, PerDraw, gAOOut);
                 d[2].mCount = 1;
                 d[2].ppTextures = &g_live.pAO;
-                updateDescriptorSet(R, 0, g_live.pGtaoBatchSet, 3, d);
+                d[3].mIndex = SRT_RES_IDX(AOSrtData, PerDraw, gStbn);
+                d[3].mCount = 1;
+                d[3].ppTextures = &g_live.pStbn;
+                updateDescriptorSet(R, 0, g_live.pGtaoBatchSet, 4, d);
             }
             {
                 // AO blur PerFrame set: CBV (shared pAOParamsCbv) + 2 SRV (pAO, pLinearDepth) + UAV (pAOBlur).
@@ -6544,6 +6733,77 @@ namespace {
                 d[3].mCount = 1;
                 d[3].ppTextures = &g_live.pAOBlur;
                 updateDescriptorSet(R, 0, g_live.pAOBlurSet, 4, d);
+            }
+            if (g_live.aoHalfReady) {
+                // Downsample: pLinearDepth (full SRV) -> pLinearDepthHalf (UAV).
+                {
+                    DescriptorData d[3] = {};
+                    d[0].mIndex = SRT_RES_IDX(AODownSrtData, Persistent, gAODownParams);
+                    d[0].ppBuffers = &g_live.pAOUpCbv;
+                    d[1].mIndex = SRT_RES_IDX(AODownSrtData, Persistent, gAODownDepthIn);
+                    d[1].mCount = 1;
+                    d[1].ppTextures = &g_live.pLinearDepth;
+                    d[2].mIndex = SRT_RES_IDX(AODownSrtData, Persistent, gAODownDepthOut);
+                    d[2].mCount = 1;
+                    d[2].ppTextures = &g_live.pLinearDepthHalf;
+                    updateDescriptorSet(R, 0, g_live.pAODownSet, 3, d);
+                }
+                // AO, half: the SAME AOSrtData bindings pointed at the half-res pair.
+                {
+                    DescriptorData d[4] = {};
+                    d[0].mIndex = SRT_RES_IDX(AOSrtData, PerDraw, gAOParams);
+                    d[0].ppBuffers = &g_live.pAOParamsCbv;
+                    d[1].mIndex = SRT_RES_IDX(AOSrtData, PerDraw, gLinearDepthIn);
+                    d[1].mCount = 1;
+                    d[1].ppTextures = &g_live.pLinearDepthHalf;
+                    d[2].mIndex = SRT_RES_IDX(AOSrtData, PerDraw, gAOOut);
+                    d[2].mCount = 1;
+                    d[2].ppTextures = &g_live.pAOHalf;
+                    // The mask is NOT half-res — it is indexed in whatever pixels this pass runs in
+                    // (px & 63), so the same texture serves both and the tile simply covers twice
+                    // the screen when the pass is half. That octave is the cost of half-res AO, not
+                    // something a different mask would fix; judge the pattern at half res.
+                    d[3].mIndex = SRT_RES_IDX(AOSrtData, PerDraw, gStbn);
+                    d[3].mCount = 1;
+                    d[3].ppTextures = &g_live.pStbn;
+                    updateDescriptorSet(R, 0, g_live.pGtaoBatchSetHalf, 4, d);
+                }
+                // Blur, half: all three textures half-res (the depth too, or the range weight
+                // reconstructs from a depth that does not correspond to the AO texel it weights).
+                {
+                    DescriptorData d[4] = {};
+                    d[0].mIndex = SRT_RES_IDX(AOBlurSrtData, PerFrame, gBlurParams);
+                    d[0].ppBuffers = &g_live.pAOParamsCbv;
+                    d[1].mIndex = SRT_RES_IDX(AOBlurSrtData, PerFrame, gAOSrc);
+                    d[1].mCount = 1;
+                    d[1].ppTextures = &g_live.pAOHalf;
+                    d[2].mIndex = SRT_RES_IDX(AOBlurSrtData, PerFrame, gBlurDepthIn);
+                    d[2].mCount = 1;
+                    d[2].ppTextures = &g_live.pLinearDepthHalf;
+                    d[3].mIndex = SRT_RES_IDX(AOBlurSrtData, PerFrame, gAODst);
+                    d[3].mCount = 1;
+                    d[3].ppTextures = &g_live.pAOBlurHalf;
+                    updateDescriptorSet(R, 0, g_live.pAOBlurSetHalf, 4, d);
+                }
+                // Upscale: half AO + half depth + FULL depth -> pAOBlur (full).
+                {
+                    DescriptorData d[5] = {};
+                    d[0].mIndex = SRT_RES_IDX(AOUpSrtData, Persistent, gAOUpParams);
+                    d[0].ppBuffers = &g_live.pAOUpCbv;
+                    d[1].mIndex = SRT_RES_IDX(AOUpSrtData, Persistent, gAOUpSrc);
+                    d[1].mCount = 1;
+                    d[1].ppTextures = &g_live.pAOBlurHalf;
+                    d[2].mIndex = SRT_RES_IDX(AOUpSrtData, Persistent, gAOUpDepthHalf);
+                    d[2].mCount = 1;
+                    d[2].ppTextures = &g_live.pLinearDepthHalf;
+                    d[3].mIndex = SRT_RES_IDX(AOUpSrtData, Persistent, gAOUpDepthFull);
+                    d[3].mCount = 1;
+                    d[3].ppTextures = &g_live.pLinearDepth;
+                    d[4].mIndex = SRT_RES_IDX(AOUpSrtData, Persistent, gAOUpDst);
+                    d[4].mCount = 1;
+                    d[4].ppTextures = &g_live.pAOBlur;
+                    updateDescriptorSet(R, 0, g_live.pAOUpSet, 5, d);
+                }
             }
             // --- SUN moments blur: one shader, one set with TWO INSTANCES PER CASCADE (2c =
             // horizontal, tile c into the scratch; 2c+1 = vertical, scratch back into tile c).
@@ -7038,9 +7298,14 @@ namespace {
     // that re-uploads at the same shape is promoted to a ring of persistently-mapped
     // CPU_TO_GPU buffers we just memcpy into (no recreate, no fence). The ring lets a write
     // land on a buffer the GPU isn't reading — explicit double-buffering, the modern
-    // replacement for D9's MANAGED/vb[2] driver magic. 2 is enough while renderScene is
-    // GPU-blocking (each frame completes before the next upload); bump if render goes async.
-    constexpr uint32_t kGeomRing = 2;
+    // replacement for D9's MANAGED/vb[2] driver magic.
+    //
+    // WAS 2, with the note "2 is enough while renderScene is GPU-blocking (each frame completes
+    // before the next upload); bump if render goes async." Tier 1 is that moment: renderScene now
+    // waits the PREVIOUS frame's fence at the top instead of its own at the bottom, so frame N can
+    // still be reading a slot while the between-frames upload writes the next one. 3 keeps a full
+    // frame of separation between the slot being written and the slot the GPU is reading.
+    constexpr uint32_t kGeomRing = 3;
 
     struct HostMesh {
         Buffer*  vb;            // per-mesh VB: skinned + dynamic-morph only (null when inArena)
@@ -7260,6 +7525,15 @@ namespace {
         }
     }
 
+    // Dirty EVERY valid slot. The precise version above is right for a caster that moved (one
+    // caster can only affect the slots that gather it); it is wrong for a change to the carve
+    // POLICY, which changes how every slot bakes every emissive caster it already holds.
+    static inline void markAllSlotsDirty() {
+        for (uint32_t s = 0; s < kMaxShadowLights; ++s) {
+            if (g_shadowSlots[s].valid) { g_shadowSlots[s].dirty = true; }
+        }
+    }
+
     // C3: shared caster-record refresh — the items[] static loop and the cached-alpha cutout
     // path (C3a) both land here. world = the CAMERA-RELATIVE wire transform; stored ABSOLUTE
     // (+ this frame's shift eye) so the record survives camera motion between refreshes.
@@ -7390,6 +7664,40 @@ namespace {
     // when the next frame reached the tail (MW's inter-frame window shorter than the build).
     double    g_lastHizGpuMs = 0.0;
     unsigned  g_hizOverruns  = 0;
+    // Tier 1 (tasks/forge-host-gpu-lane.md): the frame fence is now waited at the TOP of the next
+    // renderScene instead of right after our own submit, so frame N's GPU work overlaps the reply,
+    // the client's RT copy/blit, MW's remaining frame and frame N+1's setup/cull.
+    //  - g_frameOverruns counts frames whose PREVIOUS submission had not finished when we came back
+    //    for it. Same shape as g_hizOverruns, but read the opposite way: here a climbing count is
+    //    the SUCCESS signal (the GPU is now saturated, which is the point). It only indicates a
+    //    fault if it climbs while dt climbs too.
+    //  - g_lastGpuWaitMs is the CPU ms actually blocked at that top-of-frame wait. It is NOT the
+    //    GPU's frame time any more (see g_lastGpuMs, which now comes from the resolved
+    //    kGpuPhaseFrame timestamp) — it is the residual the overlap failed to hide.
+    unsigned  g_frameOverruns = 0;
+    double    g_lastGpuWaitMs = 0.0;
+    // Tier 1 fail-safe: does the CLIENT hold an imported timeline semaphore it will wait before
+    // copying the shared RT? Only then may renderScene return without settling its own frame.
+    // Defaults FALSE: a client that never reports (old build, failed import, no shared fence) gets
+    // the pre-Tier-1 blocking behaviour rather than a torn composite.
+    bool      g_clientSyncsOnFence = false;
+    // Tier 1 retirement queue. A texture-revision re-upload (uploadTextures, dlLoadAtlas) used to
+    // removeResource the OLD Texture* on the spot, on the grounds that "the GPU doesn't read them
+    // until renderScene (its own fence). Safe between frames." That grounds is gone: a frame may be
+    // executing right now, and it can still reach the old resource through the bindless table.
+    //
+    // The hold is short and needs no per-entry bookkeeping. These paths run between frames on the
+    // IPC-service thread, so anything pushed here was pushed while some already-submitted frame may
+    // still be in flight — and the very next settleFrameFence waits the frame fence, which (single
+    // queue, in-order) proves EVERY submission up to that point has retired. So the drain is simply
+    // "after that wait", and nothing can be pushed between the wait and the next submit (renderScene
+    // owns the thread across that span).
+    std::vector<Texture*> g_texRetire;
+    // True once a frame has been submitted on g_live.pFence, so the top-of-frame settle knows there
+    // is a previous frame to read back at all. getFenceStatus's NOTSUBMITTED would answer this too,
+    // but only until the first wait — after that the fence is "submitted" forever, and the readback
+    // block needs a stable "is there an N-1" rather than a first-frame-only guard.
+    bool      g_framePending  = false;
     // Skinned-loop record probe: splits the per-part CPU cost of the skinned colour loop into
     // data-prep (palette + instance memcpy — reads the IPC blob, so page-faults under memory
     // pressure surface HERE) vs command-recording (bindVB/IB + draw — the ONLY part a skinned
@@ -7773,33 +8081,130 @@ namespace {
     // ---- AO knobs (Stage 3): promoted from the hardcoded constants so sliders drive them live.
     // ap[20..23] read these each frame, so a slider move takes effect next frame.
     //
-    // 2026-08-01 re-seed. The four values below were all tuned against a horizon search that never
+    // 2026-08-01 re-seed. The four values then were all tuned against a horizon search that never
     // maximised — it ASSIGNED the horizon per step, so occlusion came from whichever single tap
     // happened to be last and most attenuated. Every one of them was compensating for that:
     //   radius    1.5 -> 48    a MW unit is ~1.4 cm (the host says so at the terrain scale), so the
-    //                          old default searched TWO CENTIMETRES. 48 u is ~0.7 m; the slider now
-    //                          reaches 256 u (~3.6 m) instead of 64 u (~0.9 m, the LOW end of useful).
+    //                          old default searched TWO CENTIMETRES. The slider now reaches 256 u
+    //                          (~3.6 m) instead of 64 u (~0.9 m, the LOW end of useful).
     //   falloff  20.0 -> 96    same units error — 20 u is ~28 cm, which clamped the search extent
-    //                          far below even the old radius ceiling. ~2x the radius gives a smooth
-    //                          taper across the whole search rather than a wall inside it.
-    //   intensity 4.0 -> 1.0   x4 was making a near-zero occlusion visible. The corrected integral
-    //                          returns real occlusion, so x4 crushes cavities to black.
-    //   bias      0.4 -> 0.05  sin(elev) 0.4 rejects everything under 24 degrees of elevation. It
-    //                          was there to swallow the single-tap noise; view-independence now
-    //                          comes from the horizon clamp itself, so the bias only has to cover
-    //                          depth quantisation.
-    float    g_aoRadius    = 48.0f;   // world-unit search extent (~0.7 m)
-    float    g_aoFalloff   = 96.0f;   // world-unit distance falloff (~1.35 m)
-    float    g_aoIntensity = 1.0f;    // occlusion scale
-    float    g_aoThickness = 0.05f;   // horizon bias: min sin(elevation above tangent) that occludes
+    //                          far below even the old radius ceiling.
+    //   intensity 4.0 -> 1.0   x4 was making a near-zero occlusion visible.
+    //   bias      0.4 -> 0.05  view-independence now comes from the horizon clamp itself.
+    //
+    // 2026-08-04 re-seed — a LOOK decision rather than a correction. These are the values the
+    // project settled on in game after C7/C8/C9, adopted wholesale. It reads as a partial revert of
+    // the 08-01 pass above, so the reasons matter. (Two iterations: a first tune at radius 14 /
+    // falloff 19 / intensity 4.0 / bias 0.5 / thickness 26 was tried and then walked back to what is
+    // below. Where the two disagree, the reasoning below is the live one.)
+    //
+    //   * CONTACT SCALE, not room scale. radius 10 u is ~14 cm: AO lives in the crease where two
+    //     surfaces meet and is gone a hand's width away. That is what makes the rest of the numbers
+    //     hang together, and it is why the blur's and upscale's WORLD-unit range sigmas can be tight
+    //     without costing anything — past a couple of metres there is no AO signal to preserve, so
+    //     both filters degrading toward passthrough with distance is free.
+    //
+    //   * FALLOFF 100 IS NOT AN EXTENT. The search extent is set by the RADIUS alone
+    //     (aoStepPixels clamps radius/wpp); the falloff only weights a tap by distance,
+    //     saturate(1 - dl/falloff). At 100 against taps that cannot exceed ~10 u that weight runs
+    //     1.0..0.9 — i.e. the distance taper is deliberately switched OFF and every occluder inside
+    //     the radius counts at full strength. Do not read "100" as 1.4 m of AO, and if the look ever
+    //     wants softening, LOWER THE FALLOFF rather than raising the radius.
+    //
+    //   * bias 0.2 + intensity 2.2 are ONE setting. The bias rejects occluders under ~11.5 degrees
+    //     of elevation; the intensity buys the contrast back on what survives. NOT the 2026-08-01
+    //     mistake repeating: that x4 was amplifying a broken near-zero integral, this is amplifying
+    //     a deliberately narrowed slice of a correct one. Move either alone and the look breaks —
+    //     the first iteration moved both together (0.5 / 4.0) and landed somewhere valid too.
+    //
+    //   * thickness 9 against radius 10 is now slightly UNDER the search extent, so spans are narrow
+    //     and the bitmask's thin-occluder fidelity is genuinely in play. The first iteration paired
+    //     26 against 14 for the opposite reason — spans wide enough that a 4-step budget still
+    //     filled the 32-bin mask. Both work; they are different trades between fidelity and
+    //     coverage, and the pairing is with the RADIUS, so move it whenever the radius moves.
+    //
+    //   * TRAP, and the first thing to suspect if smooth low-poly geometry ever shows its facets
+    //     with bent normal on: the shipped visibility is `1 - occ * intensity`, and that same value
+    //     is what a consumer reconstructs the BENT NORMAL from (aocommon.h.fsl). At x2.2 it reaches
+    //     0 by 45% occlusion, past which the bend is the raw measured direction — which on a barely
+    //     occluded surface is that surface's FLAT depth-derived normal. 45% is deep enough to be a
+    //     real cavity, which is why this is comfortable here; the first iteration's x4 put the
+    //     crossover at 25% and leaned on a heavy bias to stay clear of it.
+    float    g_aoRadius    = 10.0f;   // world-unit search extent (~14 cm — contact scale)
+    float    g_aoFalloff   = 100.0f;  // world-unit distance falloff — ~10x the radius, i.e. OFF
+    float    g_aoIntensity = 2.2f;    // occlusion scale — paired with the 0.2 bias, see above
+    float    g_aoThickness = 0.2f;    // horizon bias: min sin(elevation above tangent) that occludes
+    // Spatial sigma in PIXELS, against aoblur.comp's fixed +/-3 (7x7) tap kernel, and that kernel is
+    // what bounds it: at sigma 4 the weights across the whole 7x7 span only 0.57..1.0 — a BOX filter
+    // wearing a Gaussian's name, and everything above ~1.5 is that same box. A box cannot preserve a
+    // narrow dark valley, so it raises the crease and spreads its darkness outward (C9). 2.0 sits
+    // just inside the resolved range (corner tap ~0.105) and halves to 1.0 at half res, where the
+    // upload compensates for the bigger pixels. More smoothing than this needs a WIDER KERNEL
+    // (separable, or a-trous with a stride that does not alias aoDither's 4x4 tile), not more sigma.
     float    g_aoBlurPx    = 2.0f;    // bilateral blur spatial sigma in pixels (0 = passthrough)
-    float    g_aoBlurDepth = 5.0f;    // bilateral blur range sigma in WORLD units (rejects across silhouettes)
+    // The range sigma is DISTANCE-ADAPTIVE: the shader drives it off the local world-units-per-pixel
+    // and clamps into [near, far]. A single world-unit sigma is two different filters at two
+    // distances, because the taps are pixel-spaced — permissive up close, and far enough away tight
+    // enough to reject a flat surface's OWN taps, at which point the blur is a passthrough and the
+    // dither noise comes back. Setting far <= near restores the old constant sigma exactly.
+    float    g_aoBlurDepth = 2.0f;    // bilateral blur range sigma, NEAR end, WORLD units
+    // 40, not 4: the far end is not really a silhouette-rejection setting, it is the DITHER budget.
+    // aoDither's 4x4 tile is screen-locked, so at distance a tile spans a large patch of world and
+    // the range weight — which is what decides how much of the 7x7 the blur is allowed to use — has
+    // to admit at least a tile's worth of world or the pattern survives the blur. Any real depth
+    // step is orders of magnitude past 40 u, so this costs no silhouette protection.
+    float    g_aoBlurDepthFar = 40.0f; // ...and the FAR end (<= near disables the ramp)
+    // Blur/upscale plane-distance sigma, as the SINE of the angle out of the centre's tangent plane,
+    // applied to the BEND channel only. A Euclidean range weight cannot see a crease — the two walls
+    // of an inside corner are physically adjacent — and averaging their bend terms mixes two
+    // incompatible bases into a corner that reads sharpened. 0 disables it: the A/B for that fix.
+    float    g_aoPlaneSig  = 0.22f;   // ~12.7 degrees
+    // Bent-normal strength (aocommon.h.fsl's aoBentStrength), rotating the measured bend away from
+    // the quadrature reference. 1 = the measured direction, and the open surface is a fixed point at
+    // every value. Lives here rather than in a frag #define so it is tunable in the running game —
+    // the AO shaders are COMPUTE and hot-reload on F8.
+    float    g_aoBentStr   = 1.0f;
+    // Dither source. 0 = the legacy 4x4 Activision tile, 1 = the embedded spatiotemporal blue-noise
+    // mask FROZEN on one slice (spatial-only: fixes the tile's diagonal, changes nothing per frame),
+    // 2 = the mask advancing. Three rungs on purpose — 1 is the safe half of the upgrade, so if the
+    // animation is ever the suspect it can be taken out without going back to the diagonal.
+    uint32_t g_aoDither    = 2u;
+    // Frames per mask slice. 1 = advance every frame, which is what the worst case wants: a slowly
+    // moving NPC or swaying grass keeps a surface point on the SAME pixel for many frames, so motion
+    // cannot reshuffle the spatial mask and the temporal column is the only thing decorrelating it.
+    // Raise it only to trade that away for calm at a dead standstill.
+    uint32_t g_aoDitherStride = 1u;
     // Sample budget (ap[27] / ap[30]) and the bitmask modes' assumed occluder depth (ap[31]).
-    // SSAO-fast ignores the first two by design — it is compiled at a fixed 2/4.
-    uint32_t g_aoSlices    = 3u;      // horizon directions per pixel
-    uint32_t g_aoSteps     = 8u;      // taps per direction, per side
-    float    g_aoBitThick  = 16.0f;   // VBAO/SSAO-fast: how deep a visible surface is assumed to be (~23 cm)
-    uint32_t g_aoMode      = kAOModeGTAO;   // which of the four AO compute pipelines the dispatch binds
+    // SSAO-fast — the DEFAULT mode — ignores the first two by design: it is compiled at a literal
+    // 2/4 so the loops fully unroll ("fast that a slider can make slow is not a mode"). They are
+    // seeded to the same 2/4 so switching to GTAO/VBAO/HBAO changes the algorithm and NOT the
+    // budget; raise them there if you want the reference quality back.
+    uint32_t g_aoSlices    = 2u;      // horizon directions per pixel  (inert on SSAO-fast)
+    uint32_t g_aoSteps     = 4u;      // taps per direction, per side  (inert on SSAO-fast)
+    // 9 u against a 10 u radius — just under the search extent, so each tap paints a NARROW span and
+    // the bitmask actually behaves like a bitmask: a thin occluder stops shadowing the space behind
+    // it, and two occluders at different elevations both count. The trade is coverage, since a
+    // 4-step budget leaves gaps between narrow spans. Pairs with the RADIUS, so move it whenever the
+    // radius moves — and raise it toward ~2x if you ever want the sparse-sample look back.
+    float    g_aoBitThick  = 9.0f;    // GTAO/VBAO/SSAO-fast: how deep a visible surface is assumed to be
+    uint32_t g_aoMode      = kAOModeSSAOFast;   // which of the four AO compute pipelines the dispatch binds
+
+    // Half-res AO + adaptive Lanczos upscale. Default ON as of the 2026-08-04 re-seed: AO is a
+    // low-frequency signal already denoised by a 7x7 bilateral, and at contact scale there is
+    // nothing in it that half res loses. Unticking it is still a clean A/B — pAOBlur is FULL res
+    // either way, so nothing downstream of the upscale changes.
+    // NOTE half-res AO is not a pure subset of full-res AO even after accounting for resolution:
+    // aoStepPixels' 96px search ceiling and 1px step floor are now HALF pixels, i.e. twice the world
+    // extent. So the A/B will not be pixel-identical. Expected.
+    // Safe to default ON — the three half-res targets ride s_aoHalfPrimed, not firstFrame, so the
+    // first half-frame issues no barrier from a state they were never in.
+    bool     g_aoHalfRes    = true;
+    // 1 world unit is a deliberately TIGHT range sigma, and it is scale-coupled: the taps are pixel-
+    // spaced, so it keeps the Lanczos up close and degrades toward nearest-tap in the distance —
+    // free at a 14 u radius, because there is no AO out there to reconstruct. It also means this
+    // value is resolution- and FOV-dependent in a way the radius is not; retune it if either moves
+    // far, and raise it first if half res ever looks blocky rather than blaming the AO.
+    float    g_aoUpSigma    = 1.0f;   // upscale range sigma, WORLD units (same form as the blur's)
 
     // AO contribution toggles → FrameData.debugParams.w bitmask (bit0 AO, bit1 bent normal, bit2 ambient=white).
     // These two now ARM the AO dispatch as well as consume it (renderScene derives the dispatch gate
@@ -8183,8 +8588,78 @@ namespace {
     // OFF → the old un-keyed carve (see-through from every light), for A/B. Glass rides the alpha-cutout
     // path and is untouched either way.
     bool  g_shadowEmissiveOwnerOnly = true;
+    // Why a given fixture does or does not get the carve. The last time a lantern went dark
+    // ([[project_forge_emissive_carve_tint]]) the summary logs were IDENTICAL good-vs-bad and the
+    // defect lived per-caster underneath them; the decisive step was logging the emissiveHot INPUT
+    // per draw (`emMax=0.73 vcs=2 hot=0` against a known-good `emMax=1.00 hot=1`). That diag was
+    // removed afterwards, so the next occurrence starts from nothing again — hence a permanent,
+    // opt-in version. Logged on CHANGE per slot only, so ticking it costs one burst, not a stream.
+    bool  g_shadowEmissiveLog = false;
+
+    // The shadow atlas is a MULTI-FRAME cache: slots are baked once and held until something
+    // dirties them. Four of the five emissive-carve knobs are consumed at BAKE time —
+    // g_shadowEmissiveTexel rides gFrameData.atlasDbg.z into shadowcaster.frag, ownerOnly/Cast
+    // pick what is submitted, and the vouch box decides owner resolution — so moving any of them
+    // used to change nothing at all until the slot happened to be rebaked for an unrelated reason
+    // (the light moved, a caster moved, the slot got recycled). Standing in front of a lantern
+    // dragging the sliders is exactly the case where none of that happens, which is why the panel
+    // read as "too many settings, none has any effect".
+    //
+    // Only g_shadowEmissiveSkip had a path to the screen, and only indirectly: it can flip a
+    // caster's emissiveHot, and refreshCasterRecord dirties on that flip. The other four had none.
+    //
+    // So: watch all five, and dirty every slot when any of them moves. These are dev knobs — a
+    // full re-bake on change is the correct cost, and it is what makes the panel a usable bisect
+    // (skip → is the fixture even hot; ownerOnly → is it the owner-keying) instead of a row of
+    // controls that silently do nothing.
+    static void invalidateShadowsOnEmissiveKnobChange() {
+        static float s_skip = -1.0f, s_texel = -1.0f, s_box = -1.0f;
+        static int   s_cast = -1, s_ownerOnly = -1;
+        const int castNow = g_shadowEmissiveCast ? 1 : 0;
+        const int ownNow  = g_shadowEmissiveOwnerOnly ? 1 : 0;
+        if (s_skip == g_shadowEmissiveSkip && s_texel == g_shadowEmissiveTexel
+            && s_box == g_shadowFixtureEmissiveBox && s_cast == castNow && s_ownerOnly == ownNow) {
+            return;
+        }
+        const bool first = (s_cast < 0);
+        s_skip = g_shadowEmissiveSkip; s_texel = g_shadowEmissiveTexel;
+        s_box  = g_shadowFixtureEmissiveBox; s_cast = castNow; s_ownerOnly = ownNow;
+        if (first) { return; }   // startup latch, not a user change — nothing is baked yet
+        markAllSlotsDirty();
+        LOG::logline(">> [shadow] emissive carve knobs changed (skip=%.2f texel=%.2f box=%.1f "
+                     "perTexel=%d ownerOnly=%d) — rebaking every slot",
+                     g_shadowEmissiveSkip, g_shadowEmissiveTexel, g_shadowFixtureEmissiveBox,
+                     castNow, ownNow);
+    }
     // Owner slot of an emissive-hot caster, +1 (0 = no owner: its light isn't slotted, so it simply casts
     // opaque everywhere). Cost is (emissive meshes x 32) float compares per frame — noise.
+    // The geometric half of emissiveOwnerSlot: which shadow light (if any) sits INSIDE this mesh's
+    // bound. Split out because it answers a question the emissive test cannot — "is this mesh caging
+    // a light?" — for meshes that are NOT emissive and therefore can never be carved. A lantern's
+    // legacy `Tri ShadowBox` (untextured, emissive 0, opaque) is exactly that: it encloses the
+    // light, casts solid, and no emissive knob can reach it.
+    static uint32_t enclosingLightSlot(const HostMesh& hm) {
+        if (hm.lastWorldFrame == 0) { return 0; }
+        const float* w = hm.lastWorld;   // ABSOLUTE
+        const float cx = hm.localCenter[0]*w[0] + hm.localCenter[1]*w[4] + hm.localCenter[2]*w[8]  + w[12];
+        const float cy = hm.localCenter[0]*w[1] + hm.localCenter[1]*w[5] + hm.localCenter[2]*w[9]  + w[13];
+        const float cz = hm.localCenter[0]*w[2] + hm.localCenter[1]*w[6] + hm.localCenter[2]*w[10] + w[14];
+        const float s0 = w[0]*w[0] + w[1]*w[1] + w[2]*w[2];
+        const float s1 = w[4]*w[4] + w[5]*w[5] + w[6]*w[6];
+        const float s2 = w[8]*w[8] + w[9]*w[9] + w[10]*w[10];
+        float smax = s0 > s1 ? s0 : s1; if (s2 > smax) { smax = s2; }
+        const float wr = hm.localRadius * std::sqrt(smax);
+        const float reach = wr + g_shadowFixtureEmissiveBox;
+        uint32_t best = 0; float bestD2 = reach * reach;
+        for (uint32_t s = 0; s < kMaxShadowLights; ++s) {
+            const ShadowSlot& sl = g_shadowSlots[s];
+            if (!sl.valid || !sl.activeThisFrame) { continue; }
+            const float dx = sl.absPos[0] - cx, dy = sl.absPos[1] - cy, dz = sl.absPos[2] - cz;
+            const float d2 = dx*dx + dy*dy + dz*dz;
+            if (d2 <= bestD2) { bestD2 = d2; best = s + 1; }
+        }
+        return best;
+    }
     static uint32_t emissiveOwnerSlot(const HostMesh& hm) {
         if (!hm.emissiveHot || hm.lastWorldFrame == 0) { return 0; }
         const float* w = hm.lastWorld;   // ABSOLUTE
@@ -8457,9 +8932,24 @@ namespace {
           t.sliderF("AO horizon bias",    &g_aoThickness, 0.0f, 0.5f,   0.005f);
           t.sliderU("AO slices (dirs/px; not SSAO-fast)", &g_aoSlices, 1u, 8u,  1u);
           t.sliderU("AO steps (taps/dir; not SSAO-fast)", &g_aoSteps,  1u, 16u, 1u);
-          t.sliderF("AO bitmask thickness (world; VBAO/SSAO-fast)", &g_aoBitThick, 0.0f, 128.0f, 1.0f);
+          t.sliderF("AO bitmask thickness (world; GTAO/VBAO/SSAO-fast)", &g_aoBitThick, 0.0f, 128.0f, 1.0f);
           t.sliderF("AO blur spatial (px)",  &g_aoBlurPx,    0.0f, 4.0f,   0.1f);
-          t.sliderF("AO blur range (world)", &g_aoBlurDepth, 1.0f, 256.0f, 1.0f);
+          t.sliderF("AO blur range NEAR (world)", &g_aoBlurDepth,    1.0f, 256.0f, 0.5f);
+          // Distance-adaptive: the shader ramps between these two off the local pixel footprint.
+          // Set far <= near to get the old single fixed-world sigma back — that is the A/B.
+          t.sliderF("AO blur range FAR (world)",  &g_aoBlurDepthFar, 1.0f, 256.0f, 0.5f);
+          // Blur spatial -> 0 is the bent-normal diagnostic: aoblur.comp makes that a straight
+          // passthrough copy, so an artifact that VANISHES there came from the blur and one that
+          // PERSISTS came from the slice quadrature.
+          static const char* const kAODitherNames[] = { "4x4 tile (legacy)", "blue noise (frozen)", "blue noise (spatiotemporal)" };
+          t.dropdown("AO dither", &g_aoDither, kAODitherNames, 3u);
+          t.sliderU("AO dither frames/slice (1 = every frame)", &g_aoDitherStride, 1u, 8u, 1u);
+          t.sliderF("Bent normal strength",  &g_aoBentStr,   0.0f, 4.0f,   0.05f);
+          // 0 on the plane sigma is the A/B for the crease fix: it reverts the blur AND the upscale
+          // to the depth-only weighting that cannot see an inside corner.
+          t.sliderF("AO bend crease reject (sine; 0 = off)", &g_aoPlaneSig, 0.0f, 1.0f, 0.01f);
+          t.checkbox("AO half-res (adaptive Lanczos upscale)", &g_aoHalfRes);
+          t.sliderF("AO upscale depth sigma (world)", &g_aoUpSigma,  1.0f, 256.0f, 1.0f);
           t.sliderF("Ambient intensity", &g_ambScale,     0.0f, 4.0f, 0.02f);
           t.sliderF("Diffuse intensity", &g_litScale,     0.0f, 4.0f, 0.02f);
           t.sliderF("Albedo intensity",  &g_albedoScale,  0.0f, 4.0f, 0.02f);
@@ -8582,6 +9072,7 @@ namespace {
           t.checkbox("Shadow: emissive per-texel carve (off = whole-mesh drop)", &g_shadowEmissiveCast);
           t.sliderF("Shadow: emissive carve threshold (0 = cast all)", &g_shadowEmissiveTexel, 0.0f, 1.0f, 0.02f);
           t.checkbox("Shadow: emissive carve OWN light only (off = see-through to all)", &g_shadowEmissiveOwnerOnly);
+          t.checkbox("Shadow: LOG emissive caster decisions (per slot, on change)", &g_shadowEmissiveLog);
           t.sliderF("Shadow: big-light soft radius (>= this = low-res/soft; 0 = lanterns only)", &g_shadowBigLightRadius, 0.0f, 1200.0f, 25.0f);
           t.sliderU("Shadow: lantern low-res tile shift (0 = crisp, 1 = half, 2 = quarter)", &g_shadowLanternShift, 0, 2, 1);
           t.sliderF("Shadow: lantern enclosure depth (light must sit this deep in its shade; 1.2 = every fixture)", &g_shadowLanternEnclose, 0.0f, 1.2f, 0.05f);
@@ -8687,6 +9178,14 @@ namespace {
         // renderScene, after initDevUI). The widget clones a pointer to this persistent array.
         static const Texture* s_debugTex[2] = {};
         static bool s_texWidgetAdded = false;
+        // The widget clones a POINTER to this array, so re-pointing entry 0 tracks the half-res
+        // toggle live: with half-res on, pAO is never written and would show a stale image. Keyed
+        // on what the last frame actually WROTE (g_live.aoLastHalf), not on the checkbox — this
+        // pass is where the checkbox changes, so on that one frame the two disagree and only the
+        // former names a texture that is both fresh and in SHADER_RESOURCE.
+        if (s_texWidgetAdded) {
+            s_debugTex[0] = (g_live.aoLastHalf && g_live.pAOHalf) ? g_live.pAOHalf : g_live.pAO;
+        }
         if (!s_texWidgetAdded && g_live.pAO && g_live.pLinearDepth) {
             s_debugTex[0] = g_live.pAO;
             s_debugTex[1] = g_live.pLinearDepth;
@@ -9053,6 +9552,25 @@ namespace ForgeRender {
         }
         std::printf("[forge] live shared NT handle = %p\n", (void*)g_live.ntHandle);
 
+        // Tier 1 probe/mechanism: a SHARED monotonic fence alongside the shared RT. D3D12_FENCE_FLAG_SHARED
+        // is required for CreateSharedHandle, and the client imports the NT handle as a Vulkan TIMELINE
+        // semaphore (VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D12_FENCE_BIT) so its RT copy can wait on the
+        // frame's GPU completion without the host CPU-blocking. NON-FATAL: an old/limited DXVK that can't
+        // import it just leaves the client on the old "reply implies complete" contract.
+        HRESULT fhr = pDevice->CreateFence(0, D3D12_FENCE_FLAG_SHARED, IID_PPV_ARGS(&g_live.pSharedFence));
+        if (SUCCEEDED(fhr) && g_live.pSharedFence) {
+            fhr = pDevice->CreateSharedHandle(g_live.pSharedFence, nullptr, GENERIC_ALL, nullptr, &g_live.ntFenceHandle);
+        }
+        if (FAILED(fhr) || !g_live.ntFenceHandle) {
+            std::printf("[forge] live shared FENCE unavailable (hr 0x%08lX) — client keeps the blocking contract\n",
+                        (unsigned long)fhr);
+            if (g_live.pSharedFence) { g_live.pSharedFence->Release(); g_live.pSharedFence = nullptr; }
+            g_live.ntFenceHandle = nullptr;
+        } else {
+            std::printf("[forge] live shared FENCE NT handle = %p\n", (void*)g_live.ntFenceHandle);
+        }
+        g_live.sharedFenceValue = 0;
+
         RenderTargetDesc rtDesc = {};
         rtDesc.mWidth = width;
         rtDesc.mHeight = height;
@@ -9086,6 +9604,15 @@ namespace ForgeRender {
         initCmd(R, &cmdDesc, &g_live.pCmd);
         initCmd(R, &cmdDesc, &g_live.pCmdB);   // O1: chunk-B cmd for the intra-frame split-submit
         initFence(R, &g_live.pFence);
+        // Tier 1: separate pool/cmd/fence for between-frames GPU work (see pAuxCmdPool). Own pool is
+        // the point — a shared allocator cannot be reset while the frame it recorded is in flight.
+        CmdPoolDesc auxPoolDesc = {};
+        auxPoolDesc.pQueue = g_live.pQueue;
+        initCmdPool(R, &auxPoolDesc, &g_live.pAuxCmdPool);
+        CmdDesc auxCmdDesc = {};
+        auxCmdDesc.pPool = g_live.pAuxCmdPool;
+        initCmd(R, &auxCmdDesc, &g_live.pAuxCmd);
+        initFence(R, &g_live.pAuxFence);
 
         // M1c opaque scene path (depth RT + opaque pipeline + scene CBVs) is built
         // LAZILY on the first renderScene — NOT here. Building it during init (before
@@ -9138,9 +9665,36 @@ namespace ForgeRender {
         return (void*)g_live.ntHandle;
     }
 
+    void* sharedFenceHandle() {
+        return (void*)g_live.ntFenceHandle;
+    }
+
+    // 0 when the host has no shared fence — the client reads that as "no sync object, don't
+    // overlap" and keeps the old blocking contract.
+    unsigned long long lastFrameFenceValue() {
+        return g_live.pSharedFence ? (unsigned long long)g_live.sharedFenceValue : 0ull;
+    }
+
+    void setClientSyncsOnFence(bool syncs) {
+        // AND with our own half: no shared fence here means no value for the client to wait on, no
+        // matter what it believes it imported.
+        const bool want = syncs && (g_live.pSharedFence != nullptr);
+        if (want != g_clientSyncsOnFence) {
+            std::printf("[forge] Tier 1 frame overlap %s (client sync=%d, host shared fence=%d)\n",
+                        want ? "ENABLED" : "DISABLED (host will fence-wait its own frame)",
+                        (int)syncs, (int)(g_live.pSharedFence != nullptr));
+        }
+        g_clientSyncsOnFence = want;
+    }
+
     bool sceneReady() {
         return g_live.pOpaquePipeline != nullptr;
     }
+
+    // Tier 1 top-of-frame settle. Defined just above renderScene (that is where it belongs); declared
+    // here because every path that wants the frame's cmd pool / fence for itself must call it first,
+    // and renderFrame below is the one such path that precedes the definition.
+    void settleFrameFence(Renderer* R);
 
     bool renderFrame(unsigned frameIndex) {
         if (!g_live.pRenderer || !g_live.pPipeline) {
@@ -9148,6 +9702,11 @@ namespace ForgeRender {
         }
         Renderer* R = g_live.pRenderer;
 
+        // Tier 1: the bring-up triangle path shares the frame's cmd pool and fence, and the server
+        // chooses between it and renderScene per frame — so a renderScene frame may still be
+        // executing when we get here. Settle it before resetting the allocator. This path keeps its
+        // own end-of-frame wait below, so its reply still implies GPU-complete.
+        settleFrameFence(R);
         resetCmdPool(R, g_live.pCmdPool);
         beginCmd(g_live.pCmd);
 
@@ -9329,6 +9888,102 @@ namespace ForgeRender {
         post[1].Transition.StateAfter  = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE
                                        | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
         cl->ResourceBarrier(2, post);
+    }
+
+    // Tier 1: settle the PREVIOUS frame and drain everything that was only readable once its fence
+    // signalled. Called from the TOP of renderScene (and from every between-frames path that needs
+    // the frame's cmd pool / fence for itself), never from the end of a frame.
+    //
+    // Ordering here is load-bearing and easy to break silently: pGpuQueryPool is SINGLE-buffered
+    // (one pool, kGpuPhaseCount slots) and so are the three readback buffers, so N-1's values must
+    // be read AFTER N-1's fence and BEFORE frame N records into the same pool. That is exactly this
+    // spot and nowhere else. No ring is needed as long as it stays here.
+    //
+    // Everything this fills is therefore one frame stale by construction. That is a diagnostic cost
+    // only, EXCEPT for g_lastGpuMs — see below.
+    void settleFrameFence(Renderer* R) {
+        if (!g_live.pFence) { return; }
+        const double tFence0 = hostNowMs();
+        FenceStatus fs = FENCE_STATUS_NOTSUBMITTED;
+        getFenceStatus(R, g_live.pFence, &fs);
+        // Still executing = the previous frame outlived everything we did after submitting it. That
+        // is the GOAL state (a saturated GPU), not a fault; counted so "the overlap is working" and
+        // "something is wedged" stay distinguishable. Mirrors the Hi-Z prologue's g_hizOverruns.
+        // Only meaningful in overlap mode. In the fail-safe blocking mode this is called immediately
+        // after the submit, where INCOMPLETE is the normal state and counting it would report a
+        // 100% overrun rate that means nothing.
+        if (fs == FENCE_STATUS_INCOMPLETE && g_clientSyncsOnFence) { ++g_frameOverruns; }
+        waitForFences(R, 1, &g_live.pFence);
+        g_lastGpuWaitMs = hostNowMs() - tFence0;
+        // Every submission up to this point has now retired, so anything the between-frames paths
+        // parked is safe to free (see g_texRetire). Drained before the g_framePending early-out:
+        // a load burst can queue retirements on a frame that never submitted.
+        if (!g_texRetire.empty()) {
+            for (Texture* t : g_texRetire) { removeResource(t); }
+            g_texRetire.clear();
+        }
+        if (!g_framePending) { return; }   // nothing submitted yet ⇒ nothing to read back
+        g_framePending = false;
+
+        // GPU per-phase breakdown: read back the timestamps (valid now the fence has signalled).
+        if (g_live.pGpuQueryPool && g_live.gpuTickFreq > 0.0) {
+            for (uint32_t i = 0; i < kGpuPhaseCount; ++i) {
+                QueryData qd = {};
+                getQueryData(R, g_live.pGpuQueryPool, i, &qd);
+                const uint64_t b = qd.mBeginTimestamp, e = qd.mEndTimestamp;
+                g_lastGpuPhaseMs[i] = (e > b) ? ((double)(e - b) / g_live.gpuTickFreq) * 1000.0 : 0.0;
+            }
+        }
+        // THE ONE THAT IS NOT COSMETIC. g_lastGpuMs used to be `hostNowMs() - tRec1`, i.e. the CPU's
+        // blocked wall time across its own submit->fence — which now measures the residual the
+        // overlap failed to hide and would read ~0 on a healthy frame. It is the number the perf
+        // harness and fillFrameTimings report as "GPU", so leaving it as the wait would make this
+        // whole change look like a spectacular win for entirely the wrong reason. It is now the
+        // RESOLVED whole-frame GPU execution timestamp, read a frame late.
+        g_lastGpuMs = g_lastGpuPhaseMs[kGpuPhaseFrame];
+        g_gpuAccum += g_lastGpuMs;
+
+        // Stage B (B2): GPU cull counters. [0] = frustum survivors (compare to the CPU cull's
+        // g_liveLastInst in the heartbeat — they MUST match); [1] = M2 Hi-Z-occluded.
+        if (g_live.pCullCountReadback && g_live.pCullCountReadback->pCpuMappedAddress) {
+            const uint32_t* rb = (const uint32_t*)g_live.pCullCountReadback->pCpuMappedAddress;
+            g_lastGpuCullCount = rb[0];
+            g_lastGpuOccluded  = rb[1];
+        }
+        // SH2: the sky-height cull's survivor count. Only a rebuild frame writes this buffer, so the
+        // value latches the LAST rebuild and holds — which is what the panel wants to report.
+        //
+        // It is also the CAPACITY tripwire, and that matters more here than for the camera cull. This
+        // cull deliberately has no distance limit and no tier filter (see rebuildSkyHeightMap), so the
+        // only thing bounding it is the map box and the radius floor — and the survivor stream shares
+        // the camera path's kLiveMaxInst row budget. Past that, cullscan hands out offsets the scatter
+        // never fills, so the tail of the map silently loses its occluders: shading that is subtly
+        // wrong in a way nobody would think to look for. Say it out loud instead, once per rebuild.
+        if (g_live.pSkyCullReadback && g_live.pSkyCullReadback->pCpuMappedAddress) {
+            const uint32_t n = *(const uint32_t*)g_live.pSkyCullReadback->pCpuMappedAddress;
+            if (n != g_skyHeightLastInst) {
+                g_skyHeightLastInst = n;
+                if (n > kSkyStaticsRowCap) {
+                    std::printf("[forge][skyao] statics OVERFLOW: %u rows > %u capacity — raise "
+                                "'Sky AO: statics MIN radius' (now %.0f); the map is missing occluders\n",
+                                n, kSkyStaticsRowCap, g_skyHeightBuiltMinR);
+                }
+            }
+        }
+        // Follow-on 3: latch the shadow-light occlusion bits. Next frame's shadow manager consumes
+        // them (keyed by g_lightOccTestId) to veto bakes only. Already documented as 1 frame late;
+        // reading them here makes it 2. Still a veto-only input, and the manager keys on the test id
+        // rather than assuming freshness, so the extra frame is tolerated by construction.
+        if (g_live.shadowLightCullReady && g_live.pLightOccReadback
+            && g_live.pLightOccReadback->pCpuMappedAddress) {
+            g_lightOccludedBits = *(const uint32_t*)g_live.pLightOccReadback->pCpuMappedAddress;
+            g_lightOccValid     = true;
+        }
+        // Per-frame slow-GPU self-report (the 300-frame average can't surface a fresh dense-area
+        // stall at 0.2 fps). Pairs with [dl-slow] (CPU cull) to localize a hitch to CPU vs GPU.
+        if (g_lastGpuMs > 30.0) {
+            dlLogGpuSlow(g_lastGpuMs, g_lastRecMs, g_lastDrawn);
+        }
     }
 
     bool renderScene(const float* viewProj, const float* lighting, const void* drawBlob,
@@ -9628,6 +10283,13 @@ namespace ForgeRender {
             // main frame cbuffer so opaque.frag reads the screen-space gShadowMask; the FP frame copy
             // sets it to 1 so the arms sample the cube atlas directly (see the FP cbuffer fill).
             dp[125] = 0.0f;
+            // alphaShadowParams.z (float index 126): plain "this is the FIRST-PERSON pass" flag.
+            // Distinct from .y, which is FP *and* wants direct-atlas shadows — a frag that used .y to
+            // ask "am I the arm?" got the right answer only while FP shadow reception happened to be
+            // on. gAO needs the unconditional question: the arms are a post-composite overlay under
+            // the ARM camera and are not in the world Z-prepass at all, so every gAO texel under them
+            // belongs to whatever the world put behind them.
+            dp[126] = 0.0f;
         }
 
         // Tier 3a: upload this frame's point lights into gLights. Each PointLightWire is exactly
@@ -9764,6 +10426,10 @@ namespace ForgeRender {
         // halves of a punch shadow stay attached. (Was fused into the worlds-upload loop below,
         // which runs after the manager — records lagged one frame.)
         const double tCasterRefresh0 = hostNowMs();
+        // Dev-panel carve knobs are baked into the atlas, so a change has to invalidate it (see
+        // invalidateShadowsOnEmissiveKnobChange). Before the caster refresh so a skip-threshold move
+        // and the emissiveHot flips it causes land in the same frame's dirty set.
+        invalidateShadowsOnEmissiveKnobChange();
         for (uint32_t i = 0; i < count; ++i) {
             const float* em = items[i].matEmissive;
             const float emMax = em[0] > em[1] ? (em[0] > em[2] ? em[0] : em[2])
@@ -9774,6 +10440,49 @@ namespace ForgeRender {
                                 emissiveHot, /*alphaCaster=*/false,
                                 (items[i].casterFlags & IPC::kDrawCasterLive) != 0,
                                 (items[i].casterFlags & IPC::kDrawCasterAnimated) != 0);
+            // Opt-in per-caster decision trace. Everything that can veto the carve, in one line:
+            //   emMax  — the emissive AS SHIPPED, i.e. already multiplied by the client's
+            //            emissiveGain (kEmissiveFlux * ownLight / area). NOT the NIF's authored
+            //            value, which is why a (1,1,1) paper can arrive as 0.10 and miss the skip.
+            //   vcs    — vColSource; 1 means vcol drives emissive and there is no material signal
+            //            at all, so the mesh can never be hot whatever the sliders say.
+            //   hot    — the gate every one of the carve knobs sits behind.
+            //   owner  — emissiveOwnerSlot: 0 means NO shadow light resolved inside this mesh's
+            //            bound + the vouch box, and shadowcaster.frag then casts it fully opaque
+            //            no matter what else is set. This is the second silent veto.
+            // Deliberately NOT filtered to emissive meshes. The interesting case is the opposite one:
+            // a NON-emissive part of a fixture that ENCLOSES the fixture's own light. It casts solid
+            // into that light and no emissive knob can reach it, because every one of them is gated
+            // behind emissiveHot. light_de_lantern_10's legacy `Tri ShadowBox` (untextured, emissive
+            // 0, opaque) is exactly that, and it is the whole difference from light_de_lantern_08,
+            // which has no such shape and works. So log any caster that encloses a light.
+            if (g_shadowEmissiveLog) {
+                const uint32_t slot = items[i].slot;
+                const bool haveMesh = (slot < g_meshHigh && g_meshes[slot].valid);
+                const uint32_t encl = haveMesh ? enclosingLightSlot(g_meshes[slot]) : 0u;
+                if (encl != 0u || emMax > 0.001f) {
+                    static std::unordered_map<uint32_t, uint32_t> s_seen;
+                    const uint32_t sig = (uint32_t)(emMax * 1000.0f) * 2654435761u
+                                       ^ (items[i].vColSource + 1u) * 2246822519u
+                                       ^ (emissiveHot ? 3266489917u : 0u)
+                                       ^ (encl + 1u) * 668265263u;
+                    auto it = s_seen.find(slot);
+                    if (it == s_seen.end() || it->second != sig) {
+                        s_seen[slot] = sig;
+                        const uint32_t owner = haveMesh ? emissiveOwnerSlot(g_meshes[slot]) : 0u;
+                        LOG::logline(">> [emhot] slot=%u tex=%u emMax=%.3f em=(%.3f,%.3f,%.3f) vcs=%u "
+                                     "hot=%d owner=%u encloses=%u skip=%.2f%s",
+                                     slot, items[i].texIndex, emMax, em[0], em[1], em[2],
+                                     items[i].vColSource, (int)emissiveHot, owner, encl,
+                                     g_shadowEmissiveSkip,
+                                     (encl != 0u && !emissiveHot)
+                                         ? "  <-- CAGES ITS LIGHT AND IS NOT EMISSIVE (no knob can carve it)"
+                                     : (emissiveHot && owner == 0u) ? "  <-- HOT BUT UNOWNED (casts opaque)"
+                                     : (!emissiveHot && items[i].vColSource == 1u) ? "  <-- vcol emissive, never hot"
+                                     : (!emissiveHot) ? "  <-- below skip threshold" : "");
+                    }
+                }
+            }
         }
         const double tShadowMgr0 = hostNowMs();
         g_lastSetupCasterRefreshMs = tShadowMgr0 - tCasterRefresh0;
@@ -11157,6 +11866,10 @@ namespace ForgeRender {
             // FP direct-atlas shadow flag (alphaShadowParams.y, float index 125). 1 → opaque.frag's
             // FP path samples the cube atlas; 0 → it would read the (wrong-for-arms) screen mask.
             ((float*)g_live.pFPFrameCbv->pCpuMappedAddress)[125] = fpWantShadow ? 1.0f : 0.0f;
+            // ...and the unconditional FP flag (index 126), which is what the AO read keys on. Not
+            // the same question as [125]: the arms are never in the world Z-prepass, so they have no
+            // gAO of their own whether or not they are receiving shadows this frame.
+            ((float*)g_live.pFPFrameCbv->pCpuMappedAddress)[126] = 1.0f;
             std::memcpy(g_live.pFPLightCbv->pCpuMappedAddress,
                         g_live.pLightCbv->pCpuMappedAddress, kLightCbvBytes);
             float* flc = (float*)g_live.pFPLightCbv->pCpuMappedAddress;
@@ -11170,6 +11883,22 @@ namespace ForgeRender {
             // FP pixels. Force the FP near frags to brute-loop (froxelDimsNear.x = 0).
             flc[4 + kMaxPointLights * 3 * 4] = 0.0f;
         }
+
+        // ===================== Tier 1: settle the PREVIOUS frame HERE =====================
+        // This wait used to sit immediately after THIS frame's submit. That held the host CPU — and
+        // so the RPC reply, and so the client — until the GPU had fully drained, leaving the GPU
+        // idle across the reply, the client's RT copy + blit, MW's remaining frame work, the next
+        // kickoff's IPC and the next frame's setup/cull. Waiting the PREVIOUS frame's fence here
+        // keeps the invariant that actually matters (the host never touches a GPU-visible buffer
+        // while the GPU is reading it: the pool, cmd and per-frame cbuffers we are about to reset
+        // and refill all belong to the frame we just settled) while letting frame N's GPU work
+        // overlap all of the above. Nothing per-frame therefore needs double-buffering.
+        //
+        // What DOES change is the meaning of the RPC reply: it no longer implies "GPU-complete", so
+        // the client's RT copy needs a sync object of its own — the shared D3D12 fence signalled
+        // after the submit below, which the client imports as a Vulkan timeline semaphore. Step 1
+        // must never ship without that (see ipc/server.cpp renderFrame). tasks/forge-host-gpu-lane.md.
+        settleFrameFence(R);
 
         resetCmdPool(R, g_live.pCmdPool);
         beginCmd(g_live.pCmd);
@@ -12099,6 +12828,14 @@ namespace ForgeRender {
         // (pLinearDepth in SHADER_RESOURCE above all) and each used to re-spell the condition by
         // hand. A hand-mirrored gate that drifts is a silent state-mismatch, not a compile error.
         const bool aoBlockRan = g_aoComputeEnable && g_live.pLinearizePipeline && aoPipeline;
+        // Half-res AO: the AO pass and the blur run at half, bracketed by a depth downsample and an
+        // adaptive Lanczos upscale. Only armed when the AO dispatches themselves are — with them
+        // gated off there is nothing to downsample FOR, and pAOBlur must be left exactly as the
+        // full-res path leaves it (stale but state-valid) rather than half-written.
+        const bool aoHalf = g_aoHalfRes && g_live.aoHalfReady && aoDispatchRuns;
+        // Latched the first time the half chain actually runs — see the barrier block below for why
+        // g_live.firstFrame cannot stand in for it.
+        static bool s_aoHalfPrimed = false;
         if (aoBlockRan) {
             // Build gAOParams: invViewProj (from the SAME rzViewProj geometry used, incl. the
             // half-pixel offset) + screen + knobs + eye. Seeds follow scene-walk (WORLD-unit knobs;
@@ -12111,18 +12848,68 @@ namespace ForgeRender {
             // AO knobs are now dev-overlay sliders (g_ao*); the per-frame upload reads them live.
             const float* fcbv = (const float*)g_live.pFrameCbv->pCpuMappedAddress;
             float* ap = (float*)g_live.pAOParamsCbv->pCpuMappedAddress;
+            // Both the AO pass and the blur run at HALF when the toggle is on, so the one
+            // screenParams lane serves both — that is why it can live in the shared struct.
+            const uint32_t aoW = aoHalf ? ((g_live.width  + 1u) / 2u) : g_live.width;
+            const uint32_t aoH = aoHalf ? ((g_live.height + 1u) / 2u) : g_live.height;
             std::memcpy(ap, invVP, 16 * sizeof(float));
-            ap[16] = (float)g_live.width;  ap[17] = (float)g_live.height;
-            ap[18] = 1.0f / (float)g_live.width; ap[19] = 1.0f / (float)g_live.height;
+            ap[16] = (float)aoW;  ap[17] = (float)aoH;
+            ap[18] = 1.0f / (float)aoW; ap[19] = 1.0f / (float)aoH;
             ap[20] = g_aoRadius; ap[21] = g_aoFalloff; ap[22] = g_aoIntensity; ap[23] = g_aoThickness;
             // ap[27] and ap[30..31] are the AO pass's sample-budget lanes (eyePos.w / sliceParams.zw
             // in gtao.srt.h). ap[28..29] are the BLUR's, in the same float4 — one buffer, two struct
             // views; the two .srt.h files must stay byte-identical or this line corrupts the blur.
             ap[24] = fcbv[36]; ap[25] = fcbv[37]; ap[26] = fcbv[38]; ap[27] = (float)g_aoSlices;
-            ap[28] = g_aoBlurPx; ap[29] = g_aoBlurDepth; ap[30] = (float)g_aoSteps; ap[31] = g_aoBitThick;
+            // The blur's spatial sigma is in PIXELS, and at half res those pixels are twice as big —
+            // so shipping the slider value unscaled silently DOUBLED the blur's screen-space width
+            // the moment half res went on, which at a contact-scale AO radius is enough to wash the
+            // crease valley flat and leave the crease reading brighter than its surroundings. Halve
+            // it so the toggle stays a look-neutral A/B ("a softer version of the same signal, not a
+            // differently-shaped one"). The RANGE sigma below needs no such fix — it is in world
+            // units, which do not care about the resolution. Neither does the AO pass's own
+            // aoStepPixels, whose 96px ceiling and 1px floor are genuinely not compensable; that one
+            // is documented as an accepted difference beside g_aoHalfRes.
+            ap[28] = aoHalf ? (g_aoBlurPx * 0.5f) : g_aoBlurPx;
+            ap[29] = g_aoBlurDepth; ap[30] = (float)g_aoSteps; ap[31] = g_aoBitThick;
+            // ap[32..35] = AOParams::aoParams2 / BlurParams::blurParams2 — one float4 read by BOTH
+            // passes through their two struct views, same lockstep rule as sliceParams.xy. x is the
+            // AO pass's bent strength, y the blur's plane sigma, z the blur's FAR range sigma; w
+            // stays zeroed rather than left stale, since an unwritten lane here is an unspecified
+            // value there.
+            // ap[35] packs the dither SOURCE and its PHASE into one lane, because it is one
+            // question: < 0 = the legacy 4x4 tile, >= 0 = the STBN mask at that time slice. Mode 1
+            // pins slice 0 (spatial-only), mode 2 advances. The counter is frame-driven, not
+            // time-driven, so a frame-rate change alters how fast it walks in SECONDS but never
+            // makes it skip a slice — a dropped frame must not put a hole in the sequence.
+            static uint32_t s_ditherFrame = 0;
+            ++s_ditherFrame;
+            float ditherSel = -1.0f;
+            if (g_aoDither == 1u) {
+                ditherSel = 0.0f;
+            } else if (g_aoDither >= 2u) {
+                const uint32_t stride = (g_aoDitherStride < 1u) ? 1u : g_aoDitherStride;
+                ditherSel = (float)((s_ditherFrame / stride) & 15u);
+            }
+            if (!g_live.pStbn) { ditherSel = -1.0f; }   // upload failed → the tile, not a black read
+            ap[32] = g_aoBentStr; ap[33] = g_aoPlaneSig; ap[34] = g_aoBlurDepthFar; ap[35] = ditherSel;
 
             const uint32_t gx = (g_live.width + 7u) / 8u;
             const uint32_t gy = (g_live.height + 7u) / 8u;
+            // Half-res dispatch extent. The textures are allocated at half of alloc*, and the live
+            // rect never exceeds the alloc rect, so this can never overrun them.
+            const uint32_t gxH = (aoW + 7u) / 8u;
+            const uint32_t gyH = (aoH + 7u) / 8u;
+            if (aoHalf) {
+                // The half-res chain's own cbuffer: full AND half dims, which is exactly why it is
+                // not in the shared AOParams/BlurParams layout.
+                float* up = (float*)g_live.pAOUpCbv->pCpuMappedAddress;
+                std::memcpy(up, invVP, 16 * sizeof(float));
+                up[16] = (float)g_live.width;  up[17] = (float)g_live.height;
+                up[18] = 1.0f / (float)g_live.width; up[19] = 1.0f / (float)g_live.height;
+                up[20] = (float)aoW; up[21] = (float)aoH;
+                up[22] = 1.0f / (float)aoW; up[23] = 1.0f / (float)aoH;
+                up[24] = g_aoUpSigma; up[25] = g_aoPlaneSig; up[26] = 0.0f; up[27] = 0.0f;
+            }
 
             // End the prepass render pass, then pDepth DEPTH_WRITE -> SHADER_RESOURCE (first depth
             // -> SRV transition in the host) and flip pLinearDepth back to UAV (skip on frame 0).
@@ -12132,10 +12919,28 @@ namespace ForgeRender {
                 rtb.pRenderTarget = g_live.pDepth;
                 rtb.mCurrentState = RESOURCE_STATE_DEPTH_WRITE;
                 rtb.mNewState = RESOURCE_STATE_SHADER_RESOURCE;
-                TextureBarrier tb[1] = {};
+                TextureBarrier tb[4] = {};
                 uint32_t nt = 0;
                 if (!g_live.firstFrame) {
                     tb[nt].pTexture = g_live.pLinearDepth;
+                    tb[nt].mCurrentState = RESOURCE_STATE_SHADER_RESOURCE;
+                    tb[nt].mNewState = RESOURCE_STATE_UNORDERED_ACCESS;
+                    ++nt;
+                }
+                // The three half-res targets ride their own "primed" latch rather than firstFrame:
+                // they are created UNORDERED_ACCESS and only reach SHADER_RESOURCE at the end of a
+                // frame that actually ran the half chain, which may be any frame (or never). Using
+                // firstFrame here would issue an SR->UAV from a state they were never in.
+                if (aoHalf && s_aoHalfPrimed) {
+                    tb[nt].pTexture = g_live.pLinearDepthHalf;
+                    tb[nt].mCurrentState = RESOURCE_STATE_SHADER_RESOURCE;
+                    tb[nt].mNewState = RESOURCE_STATE_UNORDERED_ACCESS;
+                    ++nt;
+                    tb[nt].pTexture = g_live.pAOHalf;
+                    tb[nt].mCurrentState = RESOURCE_STATE_SHADER_RESOURCE;
+                    tb[nt].mNewState = RESOURCE_STATE_UNORDERED_ACCESS;
+                    ++nt;
+                    tb[nt].pTexture = g_live.pAOBlurHalf;
                     tb[nt].mCurrentState = RESOURCE_STATE_SHADER_RESOURCE;
                     tb[nt].mNewState = RESOURCE_STATE_UNORDERED_ACCESS;
                     ++nt;
@@ -12169,22 +12974,42 @@ namespace ForgeRender {
                 cmdResourceBarrier(g_live.pCmd, 0, nullptr, nt, tb, 0, nullptr);
             }
 
+            // (1b) Half-res only: pLinearDepth (full) -> pLinearDepthHalf, MAX of each 2x2.
+            if (aoHalf) {
+                cmdBeginDebugMarker(g_live.pCmd, 0.3f, 0.5f, 0.9f, "AO DEPTH DOWNSAMPLE (pLinearDepth -> half)");
+                cmdBindPipeline(g_live.pCmd, g_live.pAODownPipeline);
+                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pAODownSet);
+                cmdDispatch(g_live.pCmd, gxH, gyH, 1);
+                cmdEndDebugMarker(g_live.pCmd);
+                TextureBarrier tb = {};
+                tb.pTexture = g_live.pLinearDepthHalf;
+                tb.mCurrentState = RESOURCE_STATE_UNORDERED_ACCESS;
+                tb.mNewState = RESOURCE_STATE_SHADER_RESOURCE;
+                cmdResourceBarrier(g_live.pCmd, 0, nullptr, 1, &tb, 0, nullptr);
+            }
+
             // (2) AO dispatch — pAOPipeline[g_aoMode] over the ONE shared PerDraw set (cbuffer +
             // depth SRV + AO UAV; identical bindings for all four modes). Gated: with nothing
-            // consuming AO this is skipped and pAO is left stale but state-valid.
+            // consuming AO this is skipped and pAO is left stale but state-valid. Half-res swaps
+            // the SET, not the shader: same pipeline, same root index, half-res textures. The full
+            // pAO's UAV/SRV ping-pong above and below is unconditional either way, so its state
+            // machine never depends on the toggle — it is simply left unwritten on a half frame.
             if (aoDispatchRuns) {
-                cmdBeginDebugMarker(g_live.pCmd, 1.0f, 0.3f, 0.2f, "AO (pLinearDepth -> pAO: bent normal + visibility)");
+                cmdBeginDebugMarker(g_live.pCmd, 1.0f, 0.3f, 0.2f, "AO (linear depth -> pAO: bent normal + visibility)");
                 cmdBindPipeline(g_live.pCmd, aoPipeline);
-                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pGtaoBatchSet);
-                cmdDispatch(g_live.pCmd, gx, gy, 1);
+                cmdBindDescriptorSet(g_live.pCmd, 0, aoHalf ? g_live.pGtaoBatchSetHalf : g_live.pGtaoBatchSet);
+                cmdDispatch(g_live.pCmd, aoHalf ? gxH : gx, aoHalf ? gyH : gy, 1);
                 cmdEndDebugMarker(g_live.pCmd);
                 static uint32_t s_aoDispatchedMode = 0xFFFFFFFFu;
-                if (s_aoDispatchedMode != g_aoMode) {
-                    std::printf("[forge] AO dispatch ISSUED mode=%u (%s) gx=%u gy=%u (w=%u h=%u)\n",
+                static bool     s_aoDispatchedHalf = false;
+                if (s_aoDispatchedMode != g_aoMode || s_aoDispatchedHalf != aoHalf) {
+                    std::printf("[forge] AO dispatch ISSUED mode=%u (%s) half=%d gx=%u gy=%u (w=%u h=%u)\n",
                                 g_aoMode, kAOShaderFiles[g_aoMode < (uint32_t)kAOModeCount ? g_aoMode : 0u],
-                                gx, gy, g_live.width, g_live.height);
+                                (int)aoHalf, aoHalf ? gxH : gx, aoHalf ? gyH : gy, aoW, aoH);
                     s_aoDispatchedMode = g_aoMode;
+                    s_aoDispatchedHalf = aoHalf;
                 }
+                g_live.aoLastHalf = aoHalf;
             }
 
             // pAO UAV -> SRV (blur + F12 debug read it); pAOBlur SRV -> UAV (blur writes it, skip f0);
@@ -12194,12 +13019,18 @@ namespace ForgeRender {
                 rtb.pRenderTarget = g_live.pDepth;
                 rtb.mCurrentState = RESOURCE_STATE_SHADER_RESOURCE;
                 rtb.mNewState = RESOURCE_STATE_DEPTH_WRITE;
-                TextureBarrier tb[2] = {};
+                TextureBarrier tb[3] = {};
                 uint32_t nt = 0;
                 tb[nt].pTexture = g_live.pAO;
                 tb[nt].mCurrentState = RESOURCE_STATE_UNORDERED_ACCESS;
                 tb[nt].mNewState = RESOURCE_STATE_SHADER_RESOURCE;
                 ++nt;
+                if (aoHalf) {
+                    tb[nt].pTexture = g_live.pAOHalf;
+                    tb[nt].mCurrentState = RESOURCE_STATE_UNORDERED_ACCESS;
+                    tb[nt].mNewState = RESOURCE_STATE_SHADER_RESOURCE;
+                    ++nt;
+                }
                 if (!g_live.firstFrame) {
                     tb[nt].pTexture = g_live.pAOBlur;
                     tb[nt].mCurrentState = RESOURCE_STATE_SHADER_RESOURCE;
@@ -12211,16 +13042,37 @@ namespace ForgeRender {
 
             // (3) Bilateral AO blur: pAO + pLinearDepth (both SRV) -> pAOBlur (UAV). PerFrame set
             // (root distinct from gtao/linearize). Depth-aware, so it denoises without silhouette
-            // bleed. The colour frags sample pAOBlur as gAO.
+            // bleed. The colour frags sample pAOBlur as gAO. Half-res again swaps only the SET —
+            // and the DEPTH in that set is the half one too, or the range weight would reconstruct
+            // from a depth that does not correspond to the AO texel it is weighting.
             {
                 // Gated with the GTAO dispatch: baseline skips the blur (pAOBlur stays stale but is
                 // still transitioned UAV -> SRV below, so the colour pass samples it in a valid state).
                 if (aoDispatchRuns) {
                     cmdBeginDebugMarker(g_live.pCmd, 0.6f, 1.0f, 0.4f, "AO BILATERAL BLUR (pAO -> pAOBlur)");
                     cmdBindPipeline(g_live.pCmd, g_live.pAOBlurPipeline);
-                    cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pAOBlurSet);
+                    cmdBindDescriptorSet(g_live.pCmd, 0, aoHalf ? g_live.pAOBlurSetHalf : g_live.pAOBlurSet);
+                    cmdDispatch(g_live.pCmd, aoHalf ? gxH : gx, aoHalf ? gyH : gy, 1);
+                    cmdEndDebugMarker(g_live.pCmd);
+                }
+                // (4) Half-res only: pAOBlurHalf UAV -> SRV, then the depth+normal-adaptive
+                // Lanczos-2 upscale writes the FULL pAOBlur — so everything downstream, colour
+                // frags included, sees exactly the resource it always did.
+                if (aoHalf) {
+                    TextureBarrier hb = {};
+                    hb.pTexture = g_live.pAOBlurHalf;
+                    hb.mCurrentState = RESOURCE_STATE_UNORDERED_ACCESS;
+                    hb.mNewState = RESOURCE_STATE_SHADER_RESOURCE;
+                    cmdResourceBarrier(g_live.pCmd, 0, nullptr, 1, &hb, 0, nullptr);
+
+                    cmdBeginDebugMarker(g_live.pCmd, 0.9f, 0.8f, 0.3f, "AO LANCZOS UPSCALE (half -> pAOBlur)");
+                    cmdBindPipeline(g_live.pCmd, g_live.pAOUpPipeline);
+                    cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pAOUpSet);
                     cmdDispatch(g_live.pCmd, gx, gy, 1);
                     cmdEndDebugMarker(g_live.pCmd);
+                    // All three half targets now rest in SHADER_RESOURCE, which is what the primed
+                    // latch promises the next half frame's SR->UAV flip.
+                    s_aoHalfPrimed = true;
                 }
                 // pAOBlur UAV -> SRV for the colour pass.
                 TextureBarrier tb = {};
@@ -14404,7 +15256,9 @@ namespace ForgeRender {
         }
         gpuPhaseEnd(kGpuPhaseResolve);
         gpuPhaseEnd(kGpuPhaseFrame);   // close the whole-frame GPU-execution timer
-        // Resolve all GPU phase timestamps into the readback buffer (valid after the fence below).
+        // Resolve all GPU phase timestamps into the readback buffer. Tier 1: these are valid after
+        // this frame's fence, which is now waited at the TOP of the NEXT renderScene — so they are
+        // read there (settleFrameFence), one frame late, before anything records into the pool again.
         if (g_live.pGpuQueryPool) {
             cmdResolveQuery(g_live.pCmd, g_live.pGpuQueryPool, 0, kGpuPhaseCount);
         }
@@ -14417,67 +15271,39 @@ namespace ForgeRender {
         submitDesc.pSignalFence = g_live.pFence;
         submitDesc.mSubmitDone = true;
         queueSubmit(g_live.pQueue, &submitDesc);
-        waitForFences(R, 1, &g_live.pFence);
+        // Tier 1: NO fence wait here — the wait moved to the top of the NEXT renderScene
+        // (settleFrameFence). Instead, signal the SHARED, monotonic D3D12 fence on the same queue,
+        // queue-ordered behind the frame we just submitted. That signal is the client's only proof
+        // the RT is finished, now that the RPC reply returns before the GPU does: the client waits
+        // this value as a Vulkan timeline semaphore in its RT copy. Signalled here rather than after
+        // the Hi-Z prologue on purpose — the prologue builds NEXT frame's pyramid and touches
+        // nothing the client reads, so making the client wait for it would add latency for nothing.
+        ++g_live.sharedFenceValue;
+        if (g_live.pSharedFence && g_live.pQueue && g_live.pQueue->mDx.pQueue) {
+            g_live.pQueue->mDx.pQueue->Signal(g_live.pSharedFence, g_live.sharedFenceValue);
+        }
+        g_framePending = true;
         g_live.pCmd = pCmdChunkA;   // O1: restore the primary cmd for next frame / other paths
         // O1 win metric: how long CPU record (of B) ran while the GPU was already executing A.
         g_lastGpuOverlapMs = splitSubmit ? (tRec1 - tSubmitA) : 0.0;
-        const double gpuMs = hostNowMs() - tRec1;
         g_recAccum += (tRec1 - tRec0);            // CPU per-draw bind+draw recording
-        g_gpuAccum += gpuMs;                       // GPU execute (submit→fence)
         g_lastRecMs = tRec1 - tRec0;               // Phase 0 panel: this frame's single values
-        g_lastGpuMs = gpuMs;
         for (uint32_t i = 0; i < kGpuPhaseCount; ++i) { g_lastCpuPhaseMs[i] = cpuPhaseAcc[i]; }
-        // GPU per-phase breakdown of gpuMs: read back the timestamps (valid now the fence signalled).
-        if (g_live.pGpuQueryPool && g_live.gpuTickFreq > 0.0) {
-            for (uint32_t i = 0; i < kGpuPhaseCount; ++i) {
-                QueryData qd = {};
-                getQueryData(R, g_live.pGpuQueryPool, i, &qd);
-                const uint64_t b = qd.mBeginTimestamp, e = qd.mEndTimestamp;
-                g_lastGpuPhaseMs[i] = (e > b) ? ((double)(e - b) / g_live.gpuTickFreq) * 1000.0 : 0.0;
-            }
+        // Tier 1 fail-safe: with no client-side sync object there is nothing to stop MW's copy
+        // racing this draw, so fall back to the pre-Tier-1 contract and settle right here. Costs
+        // the overlap, never correctness. settleFrameFence rather than a bare wait so the readbacks
+        // still land this frame; it clears g_framePending, so next frame's top-of-frame call then
+        // finds nothing left to do. Placed after g_lastRecMs so its dlLogGpuSlow reports THIS
+        // frame's record time rather than the previous frame's.
+        if (!g_clientSyncsOnFence) {
+            settleFrameFence(R);
         }
-        // Stage B (B2): the GPU cull counters are valid now the fence signalled. [0] = frustum
-        // survivors (compare to the CPU cull's g_liveLastInst in the heartbeat — they MUST match);
-        // [1] = M2 Hi-Z-occluded (subsets the occlusion test removed on top of the frustum cull).
-        if (g_live.pCullCountReadback && g_live.pCullCountReadback->pCpuMappedAddress) {
-            const uint32_t* rb = (const uint32_t*)g_live.pCullCountReadback->pCpuMappedAddress;
-            g_lastGpuCullCount = rb[0];
-            g_lastGpuOccluded  = rb[1];
-        }
-        // SH2: the sky-height cull's survivor count. Only a rebuild frame writes this buffer, so the
-        // value latches the LAST rebuild and holds — which is what the panel wants to report.
-        //
-        // It is also the CAPACITY tripwire, and that matters more here than for the camera cull. This
-        // cull deliberately has no distance limit and no tier filter (see rebuildSkyHeightMap), so the
-        // only thing bounding it is the map box and the radius floor — and the survivor stream shares
-        // the camera path's kLiveMaxInst row budget. Past that, cullscan hands out offsets the scatter
-        // never fills, so the tail of the map silently loses its occluders: shading that is subtly
-        // wrong in a way nobody would think to look for. Say it out loud instead, once per rebuild.
-        if (g_live.pSkyCullReadback && g_live.pSkyCullReadback->pCpuMappedAddress) {
-            const uint32_t n = *(const uint32_t*)g_live.pSkyCullReadback->pCpuMappedAddress;
-            if (n != g_skyHeightLastInst) {
-                g_skyHeightLastInst = n;
-                if (n > kSkyStaticsRowCap) {
-                    std::printf("[forge][skyao] statics OVERFLOW: %u rows > %u capacity — raise "
-                                "'Sky AO: statics MIN radius' (now %.0f); the map is missing occluders\n",
-                                n, kSkyStaticsRowCap, g_skyHeightBuiltMinR);
-                }
-            }
-        }
-        // Follow-on 3: latch this frame's shadow-light occlusion bits (valid now the fence signalled).
-        // Next frame's shadow manager consumes them (keyed by g_lightOccTestId) to veto bakes only.
-        if (g_live.shadowLightCullReady && g_live.pLightOccReadback
-            && g_live.pLightOccReadback->pCpuMappedAddress) {
-            g_lightOccludedBits = *(const uint32_t*)g_live.pLightOccReadback->pCpuMappedAddress;
-            g_lightOccValid     = true;
-        }
-        // Per-frame slow-GPU self-report (the 300-frame average can't surface a fresh dense-area
-        // stall at 0.2 fps). Pairs with [dl-slow] (CPU cull) to localize a hitch to CPU vs GPU.
-        if (gpuMs > 30.0) {
-            dlLogGpuSlow(gpuMs, tRec1 - tRec0, drawn);
-        }
+        // NOTE: g_lastGpuMs / g_lastGpuPhaseMs / the three readback buffers are NOT read here any
+        // more — they are only valid once this frame's fence signals, which is now next frame's
+        // settleFrameFence. Everything they feed is one frame stale by construction.
         // A dense exterior frame is the suspected trigger; pin a removal to the draw submit.
         logDeviceRemoved(R, "renderScene/submit");
+        const double tSubmit1 = hostNowMs();   // Tier 1: end of submit == start of the "post" phase
 
         // ===================== Hi-Z prologue: reduce mips 1..N (tail submit) =====================
         // Frame N's mip 0 (filled in the MAIN cmd at the colour->water seam) -> full mip pyramid
@@ -14589,7 +15415,10 @@ namespace ForgeRender {
         // client's [hb] frame cost with what the Forge renderer is actually drawing.
         // Post-fence + whole-frame totals (host-internal; the server also wall-times renderScene for
         // the client's hostMs — these let us see WHERE that wall goes: setup+cull+record+gpu+post).
-        g_lastPostMs  = hostNowMs() - (tRec1 + gpuMs);
+        // Tier 1: "post" used to start where the fence wait ended; the wait is gone, so it starts at
+        // the submit. The host split now reads setup + cull + gpuWait(top-of-frame) + record + post,
+        // and gpuWait is the residual the overlap failed to hide rather than the GPU's frame time.
+        g_lastPostMs  = hostNowMs() - tSubmit1;
         g_lastTotalMs = hostNowMs() - tEntry;
         if ((g_renderFrame % 300u) == 0u) {
             // MW's live lighting, as the host actually received it. The standalone viewer has no MW, so
@@ -14668,9 +15497,14 @@ namespace ForgeRender {
             // Host-frame split (this frame's instantaneous values) so the ~2ms "unaccounted inside the
             // host" the client saw is localized: setup (per-draw memcpy) + cull (DL CPU cull + lazy
             // loads) + record + gpu + post = total. cull is the prime pre-record suspect.
-            LOG::logline(">> [forge-hb] host split: setup=%.2f cull=%.2f record=%.2f gpu=%.2f gpuOverlap=%.2f post=%.2f total=%.2fms"
+            // Tier 1: `gpu=` is now the RESOLVED whole-frame GPU execution (kGpuPhaseFrame, one
+            // frame late) rather than this frame's submit->fence wall — deliberately, so it stays
+            // comparable across the change and cannot read ~0 just because the block moved. The new
+            // `wait=` is the residual top-of-frame block, and it is what `total` actually contains:
+            // total = setup + cull + wait + record + post. `gpu` is alongside, not inside, it.
+            LOG::logline(">> [forge-hb] host split: setup=%.2f cull=%.2f record=%.2f gpu=%.2f wait=%.2f gpuOverlap=%.2f post=%.2f total=%.2fms"
                          " | cull examined=%u survivors=%u (%.3f us/1k examined) | gpuCull=%u %s hizOccl=%u",
-                         g_lastSetupMs, g_lastCullMs, g_lastRecMs, g_lastGpuMs, g_lastGpuOverlapMs, g_lastPostMs, g_lastTotalMs,
+                         g_lastSetupMs, g_lastCullMs, g_lastRecMs, g_lastGpuMs, g_lastGpuWaitMs, g_lastGpuOverlapMs, g_lastPostMs, g_lastTotalMs,
                          g_lastCullExamined, g_liveLastInst,
                          g_lastCullExamined ? (g_lastCullMs * 1000.0 / (g_lastCullExamined / 1000.0)) : 0.0,
                          g_lastGpuCullCount, (g_lastGpuCullCount == g_liveLastInst) ? "MATCH" : "MISMATCH",
@@ -14771,10 +15605,18 @@ namespace ForgeRender {
                          g_lastSkinMaxPartMs * 1000.0, g_lastSkinMaxSlot, g_lastSkinPipeSwitches);
             // Whole-frame GPU EXECUTION vs submit->fence WALL clock. If exec << wall, the frame is
             // GPU-idle/queue-bound (waiting behind the client's shared-GPU work), NOT render-bound.
+            // Tier 1: `wall` is no longer submit->fence around OUR OWN frame — it is the residual
+            // block at the TOP of this frame waiting for the PREVIOUS one. exec is the real GPU
+            // execution (resolved timestamps, one frame late). So the reading inverts: a SMALL
+            // residual with a large exec means the overlap is working; residual ~= exec means the
+            // host is right back to serial. overruns = frames that were still executing when we
+            // came back for them, which is the saturated-GPU signal, not a fault.
             const double frameExec = g_lastGpuPhaseMs[kGpuPhaseFrame];
-            LOG::logline(">> [forge-hb] gpu frame: exec=%.2f wall=%.2f idle/queue=%.2f ms (%s)",
-                         frameExec, g_lastGpuMs, g_lastGpuMs - frameExec,
-                         (frameExec < 0.5 * g_lastGpuMs) ? "IDLE-BOUND (GPU waits, not busy)" : "gpu-work-bound");
+            LOG::logline(">> [forge-hb] gpu frame: exec=%.2f residualWait=%.2f hidden=%.2f ms"
+                         " (overruns=%u) (%s)",
+                         frameExec, g_lastGpuWaitMs, frameExec - g_lastGpuWaitMs, g_frameOverruns,
+                         (g_lastGpuWaitMs < 0.5 * frameExec) ? "OVERLAPPED (host ran under the GPU)"
+                                                             : "still serial (host waits the GPU)");
             dlLogHeartbeat();
             g_recAccum = 0.0;
             g_gpuAccum = 0.0;
@@ -14838,6 +15680,12 @@ namespace ForgeRender {
         removeShader(R, g_live.pLinearizeShader);      g_live.pLinearizeShader = nullptr;
         removePipeline(R, g_live.pAOBlurPipeline);     g_live.pAOBlurPipeline = nullptr;
         removeShader(R, g_live.pAOBlurShader);         g_live.pAOBlurShader = nullptr;
+        // The half-res chain's two shaders reload with the rest. Its DESCRIPTOR SETS are bound to
+        // the (unchanged) root signature and stay valid, exactly like the full-res ones.
+        if (g_live.pAODownPipeline) { removePipeline(R, g_live.pAODownPipeline); g_live.pAODownPipeline = nullptr; }
+        if (g_live.pAODownShader)   { removeShader(R, g_live.pAODownShader);     g_live.pAODownShader = nullptr; }
+        if (g_live.pAOUpPipeline)   { removePipeline(R, g_live.pAOUpPipeline);   g_live.pAOUpPipeline = nullptr; }
+        if (g_live.pAOUpShader)     { removeShader(R, g_live.pAOUpShader);       g_live.pAOUpShader = nullptr; }
 
         const char* linName = (g_live.sampleCount > 1) ? "linearizedepth_sc4.comp"
                                                        : "linearizedepth_sc1.comp";
@@ -14875,7 +15723,33 @@ namespace ForgeRender {
         abpd.mType = PIPELINE_TYPE_COMPUTE;
         abpd.mComputeDesc.pShaderProgram = g_live.pAOBlurShader;
         addPipeline(R, &abpd, &g_live.pAOBlurPipeline);
-        LOG::logline(">> [forge] compute shaders hot-reloaded (%u AO modes + aoblur.comp + %s)",
+        // Half-res chain. A failure here only clears aoHalfReady (the toggle goes inert and the
+        // full-res path keeps running) — it must not take the whole reload down with it.
+        if (g_live.pLinearDepthHalf && g_live.pAOHalf && g_live.pAOBlurHalf && g_live.pAOUpCbv) {
+            ShaderLoadDesc dsd = {};
+            dsd.mComp.pFileName = "aodepthdown.comp";
+            addShader(R, &dsd, &g_live.pAODownShader);
+            ShaderLoadDesc usd = {};
+            usd.mComp.pFileName = "aoupscale.comp";
+            addShader(R, &usd, &g_live.pAOUpShader);
+            if (g_live.pAODownShader && g_live.pAOUpShader) {
+                PipelineDesc dpd = {};
+                dpd.mType = PIPELINE_TYPE_COMPUTE;
+                dpd.mComputeDesc.pShaderProgram = g_live.pAODownShader;
+                addPipeline(R, &dpd, &g_live.pAODownPipeline);
+                PipelineDesc upd = {};
+                upd.mType = PIPELINE_TYPE_COMPUTE;
+                upd.mComputeDesc.pShaderProgram = g_live.pAOUpShader;
+                addPipeline(R, &upd, &g_live.pAOUpPipeline);
+            }
+            g_live.aoHalfReady = g_live.pAODownPipeline && g_live.pAOUpPipeline
+                                 && g_live.pAODownSet && g_live.pAOUpSet
+                                 && g_live.pGtaoBatchSetHalf && g_live.pAOBlurSetHalf;
+            if (!g_live.aoHalfReady) {
+                LOG::logline("!! [forge] hot-reload: half-res AO chain FAILED — toggle disabled");
+            }
+        }
+        LOG::logline(">> [forge] compute shaders hot-reloaded (%u AO modes + aoblur.comp + half-res chain + %s)",
                      (unsigned)kAOModeCount, linName); LOG::flush();
 
         // Phase 3 prologue: rebuild the two hiz pipelines too (queue already idled above, so no
@@ -15013,7 +15887,9 @@ namespace ForgeRender {
         out.cpuCullMs      = (float)g_lastCullMs;
         out.cpuRecordMs    = (float)g_lastRecMs;
         out.cpuPostMs      = (float)g_lastPostMs;
-        out.gpuWaitMs      = (float)g_lastGpuMs;
+        // Tier 1: this is now the RESIDUAL top-of-frame block (what the overlap failed to hide),
+        // not submit->fence around our own frame. gpuFrameMs above is the real GPU execution.
+        out.gpuWaitMs      = (float)g_lastGpuWaitMs;
         out.totalMs        = (float)g_lastTotalMs;
         // T3: tell the client whether WE are drawing the world's terrain, so it knows whether it is
         // safe for MW to stop drawing its own. Requires residency AND the draw toggle — a panel
@@ -15039,6 +15915,11 @@ namespace ForgeRender {
             return;
         }
         Renderer* R = g_live.pRenderer;
+        // Tier 1: this runs a full resetCmdPool/beginCmd/submit/wait cycle on the FRAME's pool and
+        // fence, which since the wait moved may belong to a frame still executing. Dev-triggered
+        // and not per-frame, so the cheapest correct fix is to settle the frame first rather than
+        // give a diagnostic its own pool.
+        settleFrameFence(R);
 
         // Direct texture readback: copy the default-white texture (4x4 RGBA, uploaded via
         // TextureUpdateDesc) straight to a buffer — proves whether the UPLOAD worked, bypassing
@@ -15117,6 +15998,15 @@ namespace ForgeRender {
     void debugReadbackAO() {
         if (!g_live.pRenderer || !g_live.pAO) { std::printf("[forge] AO readback: no pAO\n"); return; }
         Renderer* R = g_live.pRenderer;
+        // Tier 1: same hazard as debugReadbackCenterPixel — this cycles the FRAME's pool/fence and
+        // a frame may be in flight. Settle it first (dev-triggered, so the cost is irrelevant).
+        settleFrameFence(R);
+        // Follow what the last frame actually WROTE, not the checkbox: with half-res on, pAO is
+        // never written and the AO the frame produced lives in pAOHalf at HALF dimensions. Sizing
+        // this readback at pAO's dimensions would walk past the end of the half resource, and the
+        // SHADER_RESOURCE -> COPY_SOURCE barrier below would name a state the texture is not in.
+        const bool aoHalfRb = g_live.aoLastHalf && g_live.pAOHalf;
+        Texture* const pAORb = aoHalfRb ? g_live.pAOHalf : g_live.pAO;
         // --- pLinearDepth readback (R32F, 4bpp) — does the LINEARIZE compute UAV write land? ---
         if (g_live.pLinearDepth) {
             const uint32_t W2 = g_live.width, H2 = g_live.height, bpp2 = 4;
@@ -15149,7 +16039,8 @@ namespace ForgeRender {
             }
             removeResource(pRb2);
         }
-        const uint32_t W = g_live.width, H = g_live.height;
+        const uint32_t W = aoHalfRb ? ((g_live.width  + 1u) / 2u) : g_live.width;
+        const uint32_t H = aoHalfRb ? ((g_live.height + 1u) / 2u) : g_live.height;
         const uint32_t bpp = 8;   // R16G16B16A16_SFLOAT
         const uint32_t rowAlign = (R->pGpu->mUploadBufferTextureRowAlignment > 1u) ? R->pGpu->mUploadBufferTextureRowAlignment : 1u;
         const uint32_t texAlign = (R->pGpu->mUploadBufferTextureAlignment > 1u) ? R->pGpu->mUploadBufferTextureAlignment : 1u;
@@ -15165,14 +16056,14 @@ namespace ForgeRender {
         addResource(&bd, nullptr); waitForAllResourceLoads();
         resetCmdPool(R, g_live.pCmdPool);
         beginCmd(g_live.pCmd);
-        // pAO ends each renderScene in SHADER_RESOURCE (post-GTAO barrier) → COPY_SOURCE.
-        TextureBarrier tb = { g_live.pAO, RESOURCE_STATE_SHADER_RESOURCE, RESOURCE_STATE_COPY_SOURCE };
+        // pAO(Half) ends each renderScene in SHADER_RESOURCE (post-GTAO barrier) → COPY_SOURCE.
+        TextureBarrier tb = { pAORb, RESOURCE_STATE_SHADER_RESOURCE, RESOURCE_STATE_COPY_SOURCE };
         cmdResourceBarrier(g_live.pCmd, 0, nullptr, 1, &tb, 0, nullptr);
         endCmd(g_live.pCmd);
         QueueSubmitDesc sd = {}; sd.mCmdCount = 1; sd.ppCmds = &g_live.pCmd; sd.pSignalFence = g_live.pFence; sd.mSubmitDone = true;
         queueSubmit(g_live.pQueue, &sd); waitForFences(R, 1, &g_live.pFence);
         TextureCopyDesc cd = {};
-        cd.pTexture = g_live.pAO; cd.pBuffer = pRb;
+        cd.pTexture = pAORb; cd.pBuffer = pRb;
         cd.mTextureState = RESOURCE_STATE_COPY_SOURCE; cd.mQueueType = QUEUE_TYPE_GRAPHICS;
         SyncToken ct = {}; copyResource(&cd, &ct); waitForToken(&ct);
         const uint8_t* base = (const uint8_t*)pRb->pCpuMappedAddress;
@@ -15194,6 +16085,7 @@ namespace ForgeRender {
                 std::printf("[forge] AO readback %-6s (%u,%u) = R%.3f G%.3f B%.3f A%.3f\n",
                             name, x, y, half2f(p[0]), half2f(p[1]), half2f(p[2]), half2f(p[3]));
             };
+            std::printf("[forge] AO readback source = %s (%ux%u)\n", aoHalfRb ? "pAOHalf" : "pAO", W, H);
             logpx(W / 4u, H / 2u, "left");
             logpx(W / 2u, H / 2u, "centre");
             logpx(3u * W / 4u, H / 2u, "right");
@@ -15536,10 +16428,13 @@ namespace ForgeRender {
             // whole batch N times (the "slow" with hundreds of new textures on area load).
 
             // Replace any prior texture in this slot (revision re-upload), store, rebind the
-            // single bindless descriptor. The rebind only copies CPU descriptor handles; the GPU
-            // doesn't read them until renderScene (its own fence). Safe between frames.
+            // single bindless descriptor. The rebind only copies CPU descriptor handles, so the
+            // rebind itself is safe between frames — but the OLD Texture* is NOT free to release
+            // here: since Tier 1 a frame may be executing right now and can still reach it through
+            // the bindless table. Park it; settleFrameFence frees it once the frame fence proves
+            // every submission has retired.
             if (g_live.pTextures[hdr.slot] != g_live.pDefaultWhite) {
-                removeResource(g_live.pTextures[hdr.slot]);
+                g_texRetire.push_back(g_live.pTextures[hdr.slot]);
             }
             g_live.pTextures[hdr.slot] = tex;
             if (hdr.slot + 1 > g_live.texHigh) { g_live.texHigh = hdr.slot + 1; }
@@ -15999,7 +16894,9 @@ namespace ForgeRender {
         endUpdateResource(&upd);
         flushTextureUploads(R);
 
-        if (g_live.pTextures[slot] != g_live.pDefaultWhite) { removeResource(g_live.pTextures[slot]); }
+        // Tier 1: park, don't free — an in-flight frame may still sample the old atlas through the
+        // bindless table. settleFrameFence drains this once the frame fence has signalled.
+        if (g_live.pTextures[slot] != g_live.pDefaultWhite) { g_texRetire.push_back(g_live.pTextures[slot]); }
         g_live.pTextures[slot] = tex;
         if (slot + 1 > g_live.texHigh) { g_live.texHigh = slot + 1; }
         DescriptorData dd = {};
@@ -18761,6 +19658,11 @@ namespace ForgeRender {
         addResource(&rbd, nullptr);
         waitForAllResourceLoads();
 
+        // Tier 1: this probe cycles the FRAME's pool/cmd/fence. Standalone (no IPC, no live frames)
+        // so nothing should be in flight, but settle first for the same reason the dev readbacks do
+        // — resetting an allocator whose commands are still executing is undefined behaviour, and a
+        // "can't happen here" is not worth a device removal.
+        settleFrameFence(R);
         resetCmdPool(R, g_live.pCmdPool);
         beginCmd(g_live.pCmd);
         BindRenderTargetsDesc bind = {};
@@ -22098,15 +23000,21 @@ namespace ForgeRender {
     // SAME offsets (raw CopyBufferRegion — Forge has no buffer->buffer copy; same idiom as the
     // cull-counter resets), swap the live pointer, free the old buffer, and hand the new tail
     // to the free list. Existing vbOff/ibOff stay valid, so no draw-path changes anywhere.
-    // Safe to run here: uploadGeometry executes between host frames on the single IPC-service
-    // thread — renderScene fence-waits its own frame before returning, and the only overlapped
-    // GPU work (the Hi-Z prologue) never touches the arena; the copy is queue-ordered behind it
-    // anyway. Caller must settle any staged arena updates (flushTextureUploads) FIRST — the
-    // loader's update stream still targets the old Buffer*. Load-burst cost only.
+    // Runs between host frames on the single IPC-service thread. Tier 1 removed the precondition
+    // this used to lean on ("renderScene fence-waits its own frame before returning"), so a frame
+    // may well be EXECUTING right now — hence its own pool/cmd/fence (pAuxCmdPool, the pHizCmdPool
+    // precedent). Resetting the frame loop's allocator here would be undefined behaviour, and the
+    // frame's own fence must not be reused for this submit either.
+    //
+    // The copy itself needs no extra ordering: it goes on the SAME queue, so it is queue-ordered
+    // behind any frame already submitted, and the old buffer is only freed after this fence — i.e.
+    // after every earlier submission that could still be reading it has retired. Caller must settle
+    // any staged arena updates (flushTextureUploads) FIRST — the loader's update stream still
+    // targets the old Buffer*. Load-burst cost only.
     bool growArenaBuffer(Buffer** ppBuf, FreeList& fl, uint64_t needBytes, uint64_t align,
                          uint64_t maxBytes,
                          DescriptorType descriptors, ResourceState liveState, const char* name) {
-        if (!g_live.pRenderer || !g_live.pCmd || !*ppBuf) { return false; }
+        if (!g_live.pRenderer || !g_live.pAuxCmd || !*ppBuf) { return false; }
         const uint64_t oldTotal = fl.total;
         uint64_t newTotal = oldTotal;
         while (newTotal - oldTotal < needBytes + align) { newTotal *= 2; }
@@ -22143,28 +23051,30 @@ namespace ForgeRender {
         }
 
         Renderer* R = g_live.pRenderer;
-        resetCmdPool(R, g_live.pCmdPool);
-        beginCmd(g_live.pCmd);
+        resetCmdPool(R, g_live.pAuxCmdPool);
+        beginCmd(g_live.pAuxCmd);
         BufferBarrier toSrc = {};
         toSrc.pBuffer = *ppBuf;
         toSrc.mCurrentState = liveState;
         toSrc.mNewState = RESOURCE_STATE_COPY_SOURCE;
-        cmdResourceBarrier(g_live.pCmd, 1, &toSrc, 0, nullptr, 0, nullptr);
-        g_live.pCmd->mDx.pCmdList->CopyBufferRegion(pNew->mDx.pResource, 0,
-                                                    (*ppBuf)->mDx.pResource, 0, oldTotal);
+        cmdResourceBarrier(g_live.pAuxCmd, 1, &toSrc, 0, nullptr, 0, nullptr);
+        g_live.pAuxCmd->mDx.pCmdList->CopyBufferRegion(pNew->mDx.pResource, 0,
+                                                       (*ppBuf)->mDx.pResource, 0, oldTotal);
         BufferBarrier toLive = {};
         toLive.pBuffer = pNew;
         toLive.mCurrentState = RESOURCE_STATE_COPY_DEST;
         toLive.mNewState = liveState;
-        cmdResourceBarrier(g_live.pCmd, 1, &toLive, 0, nullptr, 0, nullptr);
-        endCmd(g_live.pCmd);
+        cmdResourceBarrier(g_live.pAuxCmd, 1, &toLive, 0, nullptr, 0, nullptr);
+        endCmd(g_live.pAuxCmd);
         QueueSubmitDesc sd = {};
         sd.mCmdCount = 1;
-        sd.ppCmds = &g_live.pCmd;
-        sd.pSignalFence = g_live.pFence;
+        sd.ppCmds = &g_live.pAuxCmd;
+        sd.pSignalFence = g_live.pAuxFence;
         sd.mSubmitDone = true;
         queueSubmit(g_live.pQueue, &sd);
-        waitForFences(R, 1, &g_live.pFence);
+        // Waiting THIS fence also settles every earlier submission on the queue (same queue, in
+        // order), which is exactly the guarantee needed before freeing the old buffer below.
+        waitForFences(R, 1, &g_live.pAuxFence);
 
         removeResource(*ppBuf);
         *ppBuf = pNew;
@@ -22594,9 +23504,16 @@ namespace ForgeRender {
             g_live = LiveRenderer{};
             return;
         }
-        // Phase 3 prologue: the LAST tail submit may still be in flight — renderScene fence-waits
-        // its OWN frame but deliberately never waits the prologue. This wait is MANDATORY (not
-        // defensive): releasing pHiz/pHizCmd under a running prologue is a device-removal.
+        // Tier 1: renderScene no longer waits its OWN frame, so the last frame submitted may still
+        // be executing right now. Settle it before anything below is released — this wait is
+        // MANDATORY, not defensive: tearing down the RT/pipelines/buffers under a running frame is
+        // a device-removal. Same reason the Hi-Z tail submit has always needed the wait below.
+        if (g_live.pFence) {
+            waitForFences(R, 1, &g_live.pFence);
+        }
+        // Phase 3 prologue: the LAST tail submit may still be in flight — the prologue is
+        // deliberately never waited during the frame loop. Releasing pHiz/pHizCmd under a running
+        // prologue is a device-removal.
         if (g_live.pHizFence) {
             waitForFences(R, 1, &g_live.pHizFence);
         }
@@ -22652,6 +23569,11 @@ namespace ForgeRender {
         for (uint32_t b = 0; b < kMaxBatches; ++b) {
             if (g_live.pInstanceBuf[b]) { removeResource(g_live.pInstanceBuf[b]); }
         }
+        // Tier 1: anything parked for retirement is unreachable from pTextures[] and would otherwise
+        // leak past shutdown. The mandatory frame-fence wait at the top of this function already
+        // settled every submission, so freeing them here is safe.
+        for (Texture* t : g_texRetire) { removeResource(t); }
+        g_texRetire.clear();
         // Phase 2 texture teardown: distinct uploaded textures, then the shared default.
         for (uint32_t i = 0; i < g_live.texHigh; ++i) {
             if (g_live.pTextures[i] && g_live.pTextures[i] != g_live.pDefaultWhite) {
@@ -22932,8 +23854,21 @@ namespace ForgeRender {
         // P3: drop the persistent slot cache — the recreated atlas is undefined, so no slot may
         // claim a "cached" (lastRenderFrame != 0) tile after a device reinit.
         for (uint32_t s = 0; s < kMaxShadowLights; ++s) { g_shadowSlots[s] = ShadowSlot{}; }
-        // Tier 2 compute (linearize + the four AO modes + AO bilateral blur).
+        // Tier 2 compute (linearize + the four AO modes + AO bilateral blur + the half-res chain).
+        if (g_live.pAOUpSet)          { removeDescriptorSet(R, g_live.pAOUpSet); }
+        if (g_live.pAODownSet)        { removeDescriptorSet(R, g_live.pAODownSet); }
+        if (g_live.pAOBlurSetHalf)    { removeDescriptorSet(R, g_live.pAOBlurSetHalf); }
+        if (g_live.pGtaoBatchSetHalf) { removeDescriptorSet(R, g_live.pGtaoBatchSetHalf); }
+        if (g_live.pAOUpPipeline)     { removePipeline(R, g_live.pAOUpPipeline); }
+        if (g_live.pAODownPipeline)   { removePipeline(R, g_live.pAODownPipeline); }
+        if (g_live.pAOUpShader)       { removeShader(R, g_live.pAOUpShader); }
+        if (g_live.pAODownShader)     { removeShader(R, g_live.pAODownShader); }
+        if (g_live.pAOUpCbv)          { removeResource(g_live.pAOUpCbv); }
+        if (g_live.pAOBlurHalf)       { removeResource(g_live.pAOBlurHalf); }
+        if (g_live.pAOHalf)           { removeResource(g_live.pAOHalf); }
+        if (g_live.pLinearDepthHalf)  { removeResource(g_live.pLinearDepthHalf); }
         if (g_live.pAOBlurSet)      { removeDescriptorSet(R, g_live.pAOBlurSet); }
+        if (g_live.pStbn)           { removeResource(g_live.pStbn); g_live.pStbn = nullptr; }
         if (g_live.pGtaoBatchSet)   { removeDescriptorSet(R, g_live.pGtaoBatchSet); }
         if (g_live.pLinearizeSet)   { removeDescriptorSet(R, g_live.pLinearizeSet); }
         if (g_live.pAOBlurPipeline) { removePipeline(R, g_live.pAOBlurPipeline); }
@@ -22967,12 +23902,17 @@ namespace ForgeRender {
         if (g_live.pUVAnimBuf)            { removeResource(g_live.pUVAnimBuf); }
         if (g_live.pMSAAColor)      { removeRenderTarget(R, g_live.pMSAAColor); }
         if (g_live.pDepth)          { removeRenderTarget(R, g_live.pDepth); }
+        if (g_live.pAuxFence)   { waitForFences(R, 1, &g_live.pAuxFence); exitFence(R, g_live.pAuxFence); }
+        if (g_live.pAuxCmd)     { exitCmd(R, g_live.pAuxCmd); }
+        if (g_live.pAuxCmdPool) { exitCmdPool(R, g_live.pAuxCmdPool); }
         if (g_live.pFence)    { exitFence(R, g_live.pFence); }
         if (g_live.pCmd)      { exitCmd(R, g_live.pCmd); }
         if (g_live.pCmdB)     { exitCmd(R, g_live.pCmdB); }
         if (g_live.pCmdPool)  { exitCmdPool(R, g_live.pCmdPool); }
         if (g_live.pPipeline) { removePipeline(R, g_live.pPipeline); }
         if (g_live.ntHandle)  { CloseHandle(g_live.ntHandle); }
+        if (g_live.ntFenceHandle) { CloseHandle(g_live.ntFenceHandle); }
+        if (g_live.pSharedFence)  { g_live.pSharedFence->Release(); }
         if (g_live.pRT)       { removeRenderTarget(R, g_live.pRT); }  // releases pSharedRes
         if (g_live.pShader)   { removeShader(R, g_live.pShader); exitRootSignature(R); }
         forgeTearDown(R, g_live.pQueue);

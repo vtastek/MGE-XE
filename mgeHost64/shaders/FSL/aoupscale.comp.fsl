@@ -1,0 +1,209 @@
+// mgeHost64 — half-res AO chain, step 2: adaptive Lanczos-2 upscale (half -> full).
+//
+// AO is a low-frequency signal already denoised by a 7x7 bilateral, which makes it the classic
+// candidate for running at half resolution. What it is NOT is a candidate for a naive upsample:
+// the reconstruction must be edge-aware or it bleeds occlusion across silhouettes — exactly the
+// halo the bilateral blur exists to avoid.
+//
+// Three things this does that a plain bilinear/Lanczos blit does not:
+//
+//   * ADAPTIVE ON DEPTH, and — for the bend channel only — ON THE TANGENT PLANE. Each tap's Lanczos
+//     weight is multiplied by a bilateral range weight on reconstructed WORLD-POSITION difference
+//     against the full-res centre, the same exp(-dr^2 / 2 sigma^2) form aoblur.comp.fsl uses, so the
+//     two agree about what "a different surface" means. That form cannot see a CREASE, where depth
+//     is continuous and only the normal jumps, and at half res that blindness costs twice as much —
+//     so rgb takes the same extra plane-distance weight the blur applies, for the same reason
+//     (aoblur.comp.fsl's header has the argument). A normal-SIMILARITY term is a different thing and
+//     stays gone: rgb is ~zero on open surfaces, so dot() of two taps is direction noise.
+//
+//   * ANTI-RINGING CLAMP, and it is required rather than optional. Lanczos has negative lobes;
+//     unclamped it overshoots at every AO edge and paints dark rims around objects — which would
+//     read as a bad AO radius, i.e. the wrong knob gets blamed. The result is clamped into the
+//     min/max of the nearest 2x2 taps, the standard FSR/TAA anti-ringing box.
+//
+//   * FALLBACKS. If every tap is rejected (a thin sliver with no valid half-res neighbour) it
+//     takes the nearest valid tap rather than dividing by ~0; if the full-res centre is sky it
+//     writes the same AO_SKY_RESULT all four AO modes write.
+//
+// rgb interpolates sanely through all of this because zero means "no bend" rather than naming a
+// direction, and the frags re-normalise it into place — see aocommon.h.fsl for the contract.
+
+#include "aoupscale.srt.h"
+
+#define AOUP_PI 3.14159265359f
+
+float3 aoUpWorld(float2 uv, float deviceZ)
+{
+    float ndcX = uv.x * 2.0f - 1.0f;
+    float ndcY = 1.0f - uv.y * 2.0f;
+    float4 p = mul(gAOUpParams.invViewProj, float4(ndcX, ndcY, deviceZ, 1.0f));
+    return p.xyz / p.w;
+}
+
+float3 aoUpLoadFull(int2 sp, float2 invFull)
+{
+    float z = LoadTex2D(gAOUpDepthFull, NO_SAMPLER, sp, 0).r;
+    return aoUpWorld((float2(sp) + 0.5f) * invFull, z);
+}
+
+// Local copies of aocommon.h.fsl's aoMinDiff / aoPlaneWeight, for the same reason aoUpWorld is a
+// local copy of aoReconstructWorld: that header is written against gAOParams / gLinearDepthIn and
+// this pass has its own names. aoblur.comp.fsl carries the third copy. Keep all three in step.
+float3 aoUpMinDiff(float3 dr, float3 dl)
+{
+    float lr = dot(dr, dr);
+    float ll = dot(dl, dl);
+    float hi = max(lr, ll);
+    float lo = max(min(lr, ll), 1e-12f);
+    float t  = saturate((hi / lo - 1.0f) * (1.0f / 3.0f));
+    return lerp(0.5f * (dr + dl), (lr < ll) ? dr : dl, t);
+}
+
+float aoUpPlaneWeight(float3 nC, float3 dw, float minLen, float sigma)
+{
+    if (sigma <= 0.0f)
+    {
+        return 1.0f;
+    }
+    float sn = abs(dot(nC, dw)) / max(length(dw), minLen);
+    return exp(-(sn * sn) / (2.0f * sigma * sigma));
+}
+
+float aoUpSinc(float x)
+{
+    if (abs(x) < 1e-5f)
+    {
+        return 1.0f;
+    }
+    float p = AOUP_PI * x;
+    return sin(p) / p;
+}
+
+// Lanczos-2: sinc(x) * sinc(x/2), identically zero outside |x| < 2.
+float aoUpLanczos(float x)
+{
+    float a = abs(x);
+    if (a >= 2.0f)
+    {
+        return 0.0f;
+    }
+    return aoUpSinc(a) * aoUpSinc(a * 0.5f);
+}
+
+ROOT_SIGNATURE(ComputeRootSignature)
+NUM_THREADS(8, 8, 1)
+void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
+{
+    INIT_MAIN;
+    int2   px       = int2(DispatchThreadID.xy);
+    int2   fullD    = int2(gAOUpParams.fullDims.xy);
+    int2   halfD    = int2(gAOUpParams.halfDims.xy);
+    float2 invFull  = gAOUpParams.fullDims.zw;
+    float2 invHalf  = gAOUpParams.halfDims.zw;
+    if (px.x >= fullD.x || px.y >= fullD.y)
+    {
+        RETURN();
+    }
+
+    float centerZ = LoadTex2D(gAOUpDepthFull, NO_SAMPLER, px, 0).r;
+    if (centerZ <= 0.0f)
+    {
+        Write2D(gAOUpDst, px, float4(0.0f, 0.0f, 0.0f, 1.0f));   // AO_SKY_RESULT (zero bend, open)
+        RETURN();
+    }
+
+    float2 uv      = (float2(px) + 0.5f) * invFull;
+    float3 centerW = aoUpWorld(uv, centerZ);
+
+    float sigmaW = max(gAOUpParams.upParams.x, 1e-3f);
+    float invSr  = 1.0f / (2.0f * sigmaW * sigmaW);
+
+    // Centre tangent plane at FULL res, for the bend channel's extra weight. Same min-difference
+    // rule as aoSurface and aoblur, so all three agree which surface this pixel is on.
+    float  planeSigma = gAOUpParams.upParams.y;
+    float3 dxr  = aoUpLoadFull(px + int2(1, 0), invFull) - centerW;
+    float3 dxl  = centerW - aoUpLoadFull(px - int2(1, 0), invFull);
+    float3 dyr  = aoUpLoadFull(px + int2(0, 1), invFull) - centerW;
+    float3 dyl  = centerW - aoUpLoadFull(px - int2(0, 1), invFull);
+    float3 cn   = cross(aoUpMinDiff(dxr, dxl), aoUpMinDiff(dyr, dyl));
+    float  cn2  = dot(cn, cn);
+    // Only |dot(cn, dw)| is used, so the sign is irrelevant; a degenerate cross disables the test
+    // here rather than inventing a plane.
+    float3 centerN     = (cn2 > 1e-20f) ? (cn * rsqrt(cn2)) : float3(0.0f, 0.0f, 0.0f);
+    float  planeSigmaU = (cn2 > 1e-20f) ? planeSigma : 0.0f;
+    float  wppC = max(min(length(dxr), length(dxl)), 1e-4f);
+
+    // Half-res continuous coordinate of this full-res pixel centre, and the 4x4 tap footprint
+    // around it. The downsample maps half texel h to full texels 2h/2h+1, so the inverse is an
+    // exact factor of two — not the fullD/halfD ratio, which differs at an odd resolution.
+    float2 c    = (float2(px) + 0.5f) * 0.5f - 0.5f;
+    int2   b    = int2(floor(c));
+    float2 frac = c - float2(b);
+
+    // Two accumulators: the AO scalar keeps exactly the weighting it had, only the bend pays the
+    // plane test (aoblur.comp.fsl's header says why the scalar must NOT).
+    float  sumA  = 0.0f;
+    float  wsumA = 0.0f;
+    float3 sumN  = float3(0.0f, 0.0f, 0.0f);
+    float  wsumN = 0.0f;
+    // Anti-ringing box over the nearest 2x2 taps, and the nearest-valid-tap fallback.
+    float4 boxMin  = float4( 1e30f,  1e30f,  1e30f,  1e30f);
+    float4 boxMax  = float4(-1e30f, -1e30f, -1e30f, -1e30f);
+    bool   boxAny  = false;
+    float4 nearest = float4(0.0f, 0.0f, 0.0f, 1.0f);   // zero bend, fully open
+    float  nearD2  = 1e30f;
+
+    UNROLL for (int j = -1; j <= 2; ++j)
+    UNROLL for (int i = -1; i <= 2; ++i)
+    {
+        int2  sp = clamp(b + int2(i, j), int2(0, 0), halfD - int2(1, 1));
+        float z  = LoadTex2D(gAOUpDepthHalf, NO_SAMPLER, sp, 0).r;
+        if (z <= 0.0f)
+        {
+            continue;   // sky tap — no geometry, would reconstruct garbage
+        }
+        float4 ao = LoadTex2D(gAOUpSrc, NO_SAMPLER, sp, 0);
+
+        float2 dxy = float2(float(i), float(j)) - frac;   // tap offset from c, in half-res texels
+        float  d2  = dot(dxy, dxy);
+        if (d2 < nearD2)
+        {
+            nearD2  = d2;
+            nearest = ao;
+        }
+        if (i >= 0 && i <= 1 && j >= 0 && j <= 1)
+        {
+            boxMin = min(boxMin, ao);
+            boxMax = max(boxMax, ao);
+            boxAny = true;
+        }
+
+        float  wl  = aoUpLanczos(dxy.x) * aoUpLanczos(dxy.y);
+        float3 w   = aoUpWorld((float2(sp) + 0.5f) * invHalf, z);
+        float3 dw  = w - centerW;
+        float  wgt = wl * exp(-dot(dw, dw) * invSr);
+        sumA  += ao.a * wgt;
+        wsumA += wgt;
+        float wn = wgt * aoUpPlaneWeight(centerN, dw, wppC, planeSigmaU);
+        sumN  += ao.rgb * wn;
+        wsumN += wn;
+    }
+
+    // Lanczos weights are signed, so a weight sum can legitimately be small OR negative where the
+    // negative lobes dominate a sparse valid set. Either way the reconstruction is meaningless there
+    // and the nearest valid tap stands in — per channel group, since the plane test can starve the
+    // bend on a crease pixel while the scalar still has a full set.
+    float4 outAO = nearest;
+    if (abs(wsumA) > 1e-4f)
+    {
+        float a = sumA / wsumA;
+        outAO.a = boxAny ? clamp(a, boxMin.a, boxMax.a) : a;
+    }
+    if (abs(wsumN) > 1e-4f)
+    {
+        float3 n = sumN / wsumN;
+        outAO.rgb = boxAny ? clamp(n, boxMin.rgb, boxMax.rgb) : n;
+    }
+    Write2D(gAOUpDst, px, outAO);
+    RETURN();
+}

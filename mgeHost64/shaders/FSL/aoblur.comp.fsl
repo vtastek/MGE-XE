@@ -6,10 +6,46 @@
 // weight collapses across depth discontinuities so it does NOT bleed across silhouettes (the halo
 // a naive box blur produces). Spatial sigma <= 0 => straight passthrough copy. Output gAODst
 // (pAOBlur) is what the colour frags sample as gAO.
+//
+// TWO range weights, and the second one applies to the BEND CHANNEL ONLY.
+//
+// A Euclidean range weight is structurally blind to a CREASE. Across the inside of an L the two
+// walls are physically adjacent, so |tapW - centreW| is a couple of pixels' worth of world and the
+// weight fires at full strength — while the surface normal has jumped 90 degrees. For the AO scalar
+// that is harmless and in fact wanted: occlusion really is similar on both walls, and rejecting the
+// taps would only leave the corner noisier. For rgb it is not, because rgb is expressed against
+// this pass's own normal (aocommon.h.fsl's contract): averaging the two walls' values mixes two
+// incompatible bases, and the consumer reconstructs a corner that is LESS bent than either wall —
+// a corner that reads sharpened, with the error bleeding out over the whole blur radius.
+//
+// So the bend gets an extra aoPlaneWeight — |dot(centreN, dw)| / |dw|, the sine of the angle out of
+// the centre's tangent plane. Scale-free, silent on a plane at any grazing angle, and it needs the
+// CENTRE normal only: 4 extra depth loads per pixel, none per tap. Sigma <= 0 turns it off, which is
+// the A/B against the old behaviour.
+//
+// DO NOT extend that plane weight to the AO SCALAR to stop a crease washing out. It is the obvious
+// next move and it makes the crease WORSE, for a reason that only shows up when you ask which taps
+// it removes: across an inside corner the other wall is ALSO near the corner, so its AO is just as
+// dark as the centre's. Those cross-crease taps are the ones holding the valley DOWN. The taps that
+// brighten it are the ones running along each surface AWAY from the corner — which lie in the
+// centre's own tangent plane and sail through any plane test. Rejecting the dark half of the
+// neighbourhood and keeping the bright half raises the crease. The scalar's valley is a spatial
+// EXTENT problem, not a basis problem; see the kernel note below.
+//
+// A normal-SIMILARITY term (dot of two taps' rgb) is a different thing and stays gone: rgb is ~zero
+// wherever nothing occludes, dot() of two near-zero vectors is direction noise, and pow(noise, 8)
+// collapsed the tap weights to nothing on exactly the open surfaces where the blur has work to do.
 
 #include "aoblur.srt.h"
 
-#define BLUR_RADIUS 3   // 7x7 tap budget; effective extent is set by the spatial sigma (px)
+// 7x7 tap budget. The spatial sigma (px) sets the effective extent only UP TO this radius: at
+// sigma 1.5 the corner tap is already at exp(-4) and the Gaussian is genuinely resolved, while at
+// sigma 4 every weight in the kernel lies between 0.57 and 1.0 and this is a box filter wearing a
+// Gaussian's name. That matters because a box filter cannot preserve a narrow dark valley — it
+// raises the crease and pushes its darkness outward. If more smoothing is ever needed than sigma
+// ~1.5 buys, the answer is a wider kernel (separable, or a-trous with a stride that does not alias
+// aoDither's 4x4 tile), NOT a larger sigma against these same 49 taps.
+#define BLUR_RADIUS 3
 
 float3 reconstructWorldB(float2 uv, float deviceZ)
 {
@@ -17,6 +53,37 @@ float3 reconstructWorldB(float2 uv, float deviceZ)
     float ndcY = 1.0f - uv.y * 2.0f;
     float4 p = mul(gBlurParams.invViewProj, float4(ndcX, ndcY, deviceZ, 1.0f));
     return p.xyz / p.w;
+}
+
+float3 loadWorldB(int2 sp, float2 invScreen)
+{
+    float z = LoadTex2D(gBlurDepthIn, NO_SAMPLER, sp, 0).r;
+    return reconstructWorldB((float2(sp) + 0.5f) * invScreen, z);
+}
+
+// Local copies of aocommon.h.fsl's aoMinDiff / aoPlaneWeight — see there for what they are for and
+// why the neighbour pick is soft at a tie. They cannot be shared: that header is written against
+// gAOParams / gLinearDepthIn and this pass has its own names for the same two resources, which is
+// the same reason reconstructWorldB above exists rather than aoReconstructWorld. Keep the three in
+// step; they are the same functions.
+float3 blurMinDiff(float3 dr, float3 dl)
+{
+    float lr = dot(dr, dr);
+    float ll = dot(dl, dl);
+    float hi = max(lr, ll);
+    float lo = max(min(lr, ll), 1e-12f);
+    float t  = saturate((hi / lo - 1.0f) * (1.0f / 3.0f));
+    return lerp(0.5f * (dr + dl), (lr < ll) ? dr : dl, t);
+}
+
+float blurPlaneWeight(float3 nC, float3 dw, float minLen, float sigma)
+{
+    if (sigma <= 0.0f)
+    {
+        return 1.0f;
+    }
+    float sn = abs(dot(nC, dw)) / max(length(dw), minLen);
+    return exp(-(sn * sn) / (2.0f * sigma * sigma));
 }
 
 ROOT_SIGNATURE(ComputeRootSignature)
@@ -47,10 +114,56 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
     float3 centerW = reconstructWorldB(uv, centerZ);
     float  sigmaW  = max(gBlurParams.blurParams.y, 1e-3f);
     float  invSp   = 1.0f / (2.0f * sigmaPx * sigmaPx);   // spatial (px^2) falloff
-    float  invSr   = 1.0f / (2.0f * sigmaW * sigmaW);     // range (world^2) falloff
 
-    float4 sum  = float4(0.0f, 0.0f, 0.0f, 0.0f);
-    float  wsum = 0.0f;
+    // Centre tangent plane, for the bend channel's extra weight. Same min-difference rule as
+    // aoSurface, so the two passes agree about which surface this pixel is on. wppC (the shorter of
+    // the two one-pixel world gaps) is the floor that keeps sub-pixel depth quantisation out of the
+    // sine.
+    float  planeSigma = gBlurParams.blurParams2.y;
+    float3 dxr  = loadWorldB(px + int2(1, 0), invScreen) - centerW;
+    float3 dxl  = centerW - loadWorldB(px - int2(1, 0), invScreen);
+    float3 dyr  = loadWorldB(px + int2(0, 1), invScreen) - centerW;
+    float3 dyl  = centerW - loadWorldB(px - int2(0, 1), invScreen);
+    float3 cx   = blurMinDiff(dxr, dxl);
+    float3 cy   = blurMinDiff(dyr, dyl);
+    float3 cn   = cross(cx, cy);
+    float  cn2  = dot(cn, cn);
+    // Only |dot(cn, dw)| is used below, so the sign does not matter; a degenerate cross (flat depth
+    // in both axes) disables the test for this pixel rather than producing a random plane.
+    float3 centerN    = (cn2 > 1e-20f) ? (cn * rsqrt(cn2)) : float3(0.0f, 0.0f, 0.0f);
+    float  planeSigmaU = (cn2 > 1e-20f) ? planeSigma : 0.0f;
+    float  wppC = max(min(length(dxr), length(dxl)), 1e-4f);
+
+    // DISTANCE-ADAPTIVE range sigma. The taps are PIXEL-spaced, so the world distance a fixed 7x7
+    // neighbourhood spans grows with depth — which makes a fixed world sigma two different filters:
+    // permissive up close, and in the distance tight enough to reject a flat surface's OWN taps, so
+    // the blur quietly degenerates to a passthrough exactly where the dither noise it exists to
+    // remove is most visible. Drive it off the local pixel footprint instead and clamp the result
+    // into [near, far].
+    //
+    // BLUR_RADIUS is the scale factor, and it is not a free parameter: a tap at the KERNEL EDGE on a
+    // flat surface sits ~BLUR_RADIUS * wpp away, so this is precisely the sigma that admits the
+    // kernel's own reach and nothing more. It moves if the kernel moves.
+    //
+    // wppLoc takes the LARGER of the two on-surface axis footprints. A surface grazing along one
+    // screen axis has a huge world step per pixel along it; taking the smaller would have that
+    // surface rejecting its own taps in that direction — the same self-rejection this fixes for
+    // distance, just rotated. (cx/cy are the min-difference deltas, so they are already on THIS
+    // surface — a silhouette neighbour never enters them.)
+    //
+    // far <= near, which includes an unwritten lane reading 0, collapses this to the old constant
+    // world sigma exactly. That is the A/B.
+    float  wppLoc = max(length(cx), length(cy));
+    float  sigFar = max(gBlurParams.blurParams2.z, sigmaW);
+    float  sigmaR = clamp(float(BLUR_RADIUS) * wppLoc, sigmaW, sigFar);
+    float  invSr  = 1.0f / (2.0f * sigmaR * sigmaR);       // range (world^2) falloff
+
+    // Two accumulators. The AO scalar keeps exactly the weighting it had; only the bend pays the
+    // plane test — see the header.
+    float  sumA  = 0.0f;
+    float  wsumA = 0.0f;
+    float3 sumN  = float3(0.0f, 0.0f, 0.0f);
+    float  wsumN = 0.0f;
 
     UNROLL for (int j = -BLUR_RADIUS; j <= BLUR_RADIUS; ++j)
     UNROLL for (int i = -BLUR_RADIUS; i <= BLUR_RADIUS; ++i)
@@ -66,12 +179,17 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
             float3 dw  = w - centerW;
             float  dr2 = dot(dw, dw);              // range distance^2 (world units)
             float  wgt = exp(-ds2 * invSp - dr2 * invSr);
-            sum  += ao * wgt;
-            wsum += wgt;
+            sumA  += ao.a * wgt;
+            wsumA += wgt;
+            float wn = wgt * blurPlaneWeight(centerN, dw, wppC, planeSigmaU);
+            sumN  += ao.rgb * wn;
+            wsumN += wn;
         }
     }
 
-    float4 outAO = (wsum > 0.0f) ? (sum / wsum) : centerAO;
+    float4 outAO;
+    outAO.a   = (wsumA > 0.0f)    ? (sumA / wsumA) : centerAO.a;
+    outAO.rgb = (wsumN > 1e-6f)   ? (sumN / wsumN) : centerAO.rgb;
     Write2D(gAODst, px, outAO);
     RETURN();
 }

@@ -48,9 +48,9 @@ float4 PS_MAIN( VSOutput In )
     INIT_MAIN;
     float3 N = normalize(In.Normal);
 
-    // Sample the AO buffer once (rgb = bent normal, a = visibility). gAO is the bilateral-blurred
-    // pAOBlur, so a single tap suffices. debugParams.w = toggle bitmask (bit0 AO->ambient, bit1
-    // bent normal). Kept in lockstep with opaque.frag.
+    // Sample the AO buffer once (rgb = the bend term, a = visibility — aocommon.h.fsl). gAO is the
+    // bilateral-blurred pAOBlur, so a single tap suffices. debugParams.w = toggle bitmask (bit0
+    // AO->ambient, bit1 bent normal). Kept in lockstep with opaque.frag.
     uint   aoFlags  = (uint)(gFrameData.debugParams.w + 0.5f);
     // IR3b REFLECTION TAG (lockstep with opaque.frag). This frag also runs in the water-reflection
     // pass now, drawing into a 1024² mirror RT — and gAO, gShadowMask and the near froxel grid are
@@ -61,10 +61,30 @@ float4 PS_MAIN( VSOutput In )
     // side costs nothing. World-space terms (sun MSM, point attenuation/Lambert, sky ambient, fog)
     // are NOT tagged: reflected geometry keeps its true world position.
     bool   inReflect = (gFrameData.gReflWaterClip.z != 0.0f);
-    float2 aoUv     = In.Position.xy * gShadowParams.screenAlloc.zw;   // gAO is ALLOC-sized, not render-sized
-    float4 aoSample = inReflect ? float4(0.0f, 0.0f, 0.0f, 1.0f)   // AO = 1 (no darkening), bent-N unused
-                                : SampleTex2D(gAO, gSamplerAnisotropic, aoUv);
-    if ((aoFlags & 2u) != 0u && !inReflect) { N = normalize(aoSample.rgb); }   // "Bent normal enable" tick
+    // WHICH TEXEL IS OURS UNDER MSAA — gAO is built from pLinearDepth, i.e. SAMPLE 0, so at a
+    // silhouette its texel can describe the surface BEHIND us and the rim reads as a bright pixel.
+    // Same defect and same fix as the point-light shadow mask; see opaque.frag for the full note.
+    // Resolved once at top level (shadowMaskPixel takes derivatives) and reused as maskPx below.
+    uint   dbgMode  = (uint)(gFrameData.debugParams.x + 0.5f);
+    bool   aoUsed   = ((aoFlags & 3u) != 0u) || dbgMode == 3u || dbgMode == 4u;
+    int2   srcPx    = int2(In.Position.xy);
+    if (!inReflect && (aoUsed || gShadowParams.slotBits.x != 0u)) {
+        srcPx = shadowMaskPixel(In.Position);
+    }
+    // LOAD, not Sample: gAO is ALLOC-sized and read 1:1, so the old uv was already a point sample —
+    // just one that could not be redirected to a neighbour.
+    float4 aoSample = inReflect ? float4(0.0f, 0.0f, 0.0f, 1.0f)   // AO = 1 (no darkening), no bend
+                                : LoadTex2D(gAO, NO_SAMPLER, srcPx, 0);
+    // "Bent normal enable" tick. gAO.rgb = bentDir - gAO.a * (the AO pass's normal), so the
+    // reconstruction weights OUR smooth normal by gAO.a — see opaque.frag for the full reasoning
+    // (open => rgb is exactly zero and N survives untouched; sealed => their normal has dropped out
+    // and the measured direction stands alone, which is what carries an inside corner). Lockstep.
+    if ((aoFlags & 2u) != 0u && !inReflect) {
+        float3 bn  = N * aoSample.a + aoSample.rgb;
+        float  bl2 = dot(bn, bn);
+        float3 bnn = (bl2 > 1e-8f) ? (bn * rsqrt(bl2)) : N;
+        N = (dot(bnn, N) > 0.0f) ? bnn : N;
+    }
 
     // --- BEGIN lit block (DUPLICATED from opaque.frag — keep in lockstep) ---
     float  ndl = saturate(dot(N, -gFrameData.sunDir.xyz));
@@ -83,8 +103,7 @@ float4 PS_MAIN( VSOutput In )
     // carries one, so nothing reads the mask at all.
     // ...and never in the reflection (see the tag above). No FP guard here: multi-map never runs in
     // the first-person pass — the client skips multi-map FP parts.
-    int2 maskPx = int2(In.Position.xy);
-    if (!inReflect && gShadowParams.slotBits.x != 0u) { maskPx = shadowMaskPixel(In.Position); }
+    int2 maskPx = srcPx;   // resolved with the AO read above — same snapshot, same size
     {
         uint nLights = (uint)gLights.lightParams.x;
         float reachK = gLights.lightParams.y;   // host-slaved light reach — see opaque.srt.h
@@ -219,7 +238,12 @@ float4 PS_MAIN( VSOutput In )
     // F12 debug views (see opaque.frag — kept in lockstep). gAO sampled at SV_Position.xy * invScreen.
     uint dbg = (uint)(gFrameData.debugParams.x + 0.5f);
     if (dbg == 3u || dbg == 4u) {
-        if (dbg == 4u) { RETURN(float4(aoSample.rgb, 1.0f)); }              // mode 4: bent normal (raw float3, no remap)
+        // mode 4: the gAO bend term, remapped *0.5+0.5 so zero reads as mid grey. It is not a
+        // normal (aocommon.h.fsl): it runs from EXACTLY zero where nothing occludes to the
+        // absolute bent direction where everything does. So flat mid grey == "no bend here",
+        // and it must be flat on an OPEN surface — any 4x4 dither-tile texture there means the
+        // quadrature reference is not cancelling. Cavities legitimately read as a normal map.
+        if (dbg == 4u) { RETURN(float4(aoSample.rgb * 0.5f + 0.5f, 1.0f)); }
         float v = aoSample.a; RETURN(float4(v, v, v, 1.0f));                 // mode 3: AO/visibility
     }
     if (dbg == 5u) { RETURN(float4(alb, 1.0f)); }                            // mode 5: albedo only (texture product)

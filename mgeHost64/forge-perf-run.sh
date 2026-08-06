@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
 # Forge automated perf harness: launch minimized (auto-loads test scene) -> poll host log for N new
 # 'gpu split' heartbeats -> verify no device-removal -> kill both procs -> report the last N splits.
-# Usage: forge-perf-run.sh [samples=5] [timeout=180] [save.ess]
+# Usage: forge-perf-run.sh [samples=5] [timeout=180] [save.ess] [renderScale]
+#
+# renderScale (4th arg, 1.0-2.0) drives the client's MGE_RENDER_SCALE startup override, which is the
+# ONLY scriptable way to change the internal render resolution — the live knob is a panel slider and
+# nobody is at the keyboard during a minimized run. Omitted => whatever the build defaults to (1.0).
 #
 # THE SAVE ARGUMENT MATTERS. Without it the "instant load" mod runs in continue=true mode and loads
 # whatever .ess is NEWEST — i.e. the measured scene is whatever you last saved, which silently
@@ -12,6 +16,7 @@ set -u
 SAMPLES="${1:-5}"
 TIMEOUT="${2:-180}"
 SAVE="${3:-}"
+SCALE="${4:-}"
 LOG="/mnt/c/mgem/morrowind64/mgeHost64.log"
 CFG="/mnt/c/mgem/morrowind64/Data Files/MWSE/config/instant load.json"
 CFGBAK="$(mktemp)"
@@ -64,16 +69,42 @@ ls -1t "$ARCHIVE"/mgeXE-*.log     2>/dev/null | tail -n +21 | xargs -r rm -f
 
 startlines=0
 [ -f "$LOG" ] && startlines=$(wc -l < "$LOG")
+# Same offset trick on the CLIENT log. The host's numbers alone cannot answer "is the host the
+# bottleneck" — only the client's render=[host=] / overlap= pair says how much of the host frame the
+# client actually waited for. mgecore does NOT truncate mgeXE.log, so this offset is what separates
+# this run from the session before it.
+CLOG="/mnt/c/mgem/morrowind64/mgeXE.log"
+cstartlines=0
+[ -f "$CLOG" ] && cstartlines=$(wc -l < "$CLOG")
 echo "[harness] start offset = $startlines lines; want $SAMPLES new 'gpu split' samples (timeout ${TIMEOUT}s)"
 
 # Launch minimized (no focus steal). The save auto-loads.
-powershell.exe -Command "Start-Process -FilePath 'Morrowind.exe' -WorkingDirectory 'C:\\mgem\\morrowind64' -WindowStyle Minimized" >/dev/null 2>&1
+# The render-scale override has to be set INSIDE the same powershell that calls Start-Process:
+# exporting it from bash does not cross the WSL->Win32 boundary without WSLENV, and a var that
+# silently fails to arrive would report the wrong resolution's numbers under the right label.
+if [ -n "$SCALE" ]; then
+  echo "[harness] render scale = ${SCALE}x (MGE_RENDER_SCALE)"
+  powershell.exe -Command "\$env:MGE_RENDER_SCALE='$SCALE'; Start-Process -FilePath 'Morrowind.exe' -WorkingDirectory 'C:\\mgem\\morrowind64' -WindowStyle Minimized" >/dev/null 2>&1
+else
+  powershell.exe -Command "Start-Process -FilePath 'Morrowind.exe' -WorkingDirectory 'C:\\mgem\\morrowind64' -WindowStyle Minimized" >/dev/null 2>&1
+fi
 echo "[harness] launched Morrowind; polling..."
 
 t0=$(date +%s)
 got=0
+unthrottled=0
 while :; do
   sleep 3
+  # Undo Windows' background/minimized power throttling as soon as the host exists. Applied ONCE,
+  # not every poll: each call spawns a powershell, and the setting is sticky for the process
+  # lifetime. Skipping this cost ~2.2x on every number in the run — see forge-perf-unthrottle.ps1.
+  if [ "$unthrottled" = "0" ]; then
+    hostalive=$(powershell.exe -Command "@(Get-Process mgeHost64 -ErrorAction SilentlyContinue).Count" 2>/dev/null | tr -d '\r\n ')
+    if [ "${hostalive:-0}" -gt 0 ]; then
+      powershell.exe -ExecutionPolicy Bypass -File 'C:\projects\mgexe\MGE-XE\mgeHost64\forge-perf-unthrottle.ps1' 2>&1 | sed 's/^/[harness] /'
+      unthrottled=1
+    fi
+  fi
   now=$(date +%s); el=$((now - t0))
   cur=0; [ -f "$LOG" ] && cur=$(wc -l < "$LOG")
   # The host TRUNCATES mgeHost64.log on launch → cur < startlines means the log rotated; measure from 0.
@@ -97,6 +128,14 @@ tail -n +$((startlines + 1)) "$LOG" | grep -Ei "device removed|FAILED|fatal|cras
 
 echo "=== last splits ==="
 tail -n +$((startlines + 1)) "$LOG" | grep -E "host split:|gpu split:|gpu color sub:|\[dl\] exterior|dist lights " | tail -$((SAMPLES * 4))
+
+# The client side of the same frames. [seam] backbuffer is printed FIRST so every table row carries
+# the resolution it was actually measured at, rather than the one that was asked for.
+echo "=== client (mgeXE.log) ==="
+if [ "$(wc -l < "$CLOG" 2>/dev/null || echo 0)" -lt "$cstartlines" ]; then cstartlines=0; fi
+tail -n +$((cstartlines + 1)) "$CLOG" 2>/dev/null \
+  | grep -E "\[seam\] backbuffer|MGE_RENDER_SCALE|\[hb\] [0-9]+ frames avg:|\[hb\] host recv:|\[produce\] overlap:" \
+  | tail -12 || echo "  (no client heartbeats)"
 
 echo "[harness] killing procs..."
 powershell.exe -Command "Stop-Process -Name Morrowind,mgeHost64 -Force -ErrorAction SilentlyContinue" >/dev/null 2>&1

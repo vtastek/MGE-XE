@@ -303,6 +303,19 @@
 #include "aoblur.comp.fsl"
 #end
 
+// Half-res AO chain (the "AO half-res" panel toggle; default OFF, so the full-res path above stays
+// byte-identical until it is ticked). The AO pass and the blur are UNCHANGED — they simply run
+// against half-res descriptor sets — so only the two ends of the chain are new: a depth downsample
+// in front and a depth+normal-adaptive Lanczos-2 upscale behind. pAOBlur stays full res and stays
+// what the colour frags sample as gAO, so no frag is touched. See aoupscale.srt.h.
+#comp aodepthdown.comp
+#include "aodepthdown.comp.fsl"
+#end
+
+#comp aoupscale.comp
+#include "aoupscale.comp.fsl"
+#end
+
 // SH2 sky AO: the TERRAIN layer of the top-down world height map. One thread per texel, straight
 // off the resident heightfield (no cull, no instance build, no draw); runs LAST in the rebuild so it
 // folds max() over the statics raster. Rebuilt only when the camera leaves its snap cell.

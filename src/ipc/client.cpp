@@ -467,7 +467,8 @@ namespace IPC {
 	}
 
 	bool Client::renderInitBlocking(std::uint32_t width, std::uint32_t height, std::uint32_t sampleCount,
-		std::uint32_t anisoLevel, HANDLE sharedTexture0, HANDLE sharedTexture1, HANDLE* outFramebufferHandle) {
+		std::uint32_t anisoLevel, HANDLE sharedTexture0, HANDLE sharedTexture1, HANDLE* outFramebufferHandle,
+		HANDLE* outFrameFenceHandle) {
 		WAIT_FOR_PREVIOUS_COMMAND;
 
 		auto& params = m_ipcParameters->params.renderInitParams;
@@ -481,6 +482,7 @@ namespace IPC {
 		params.sharedTextureHandles[1] = static_cast<HANDLE32>(sharedTexture1);
 #pragma warning(pop)
 		params.framebufferHandle = nullptr;
+		params.frameFenceHandle = nullptr;
 		params.ok = false;
 		if (!beginRpc(Command::RenderInit)) {
 			return false;
@@ -492,6 +494,9 @@ namespace IPC {
 
 		if (params.ok && outFramebufferHandle) {
 			*outFramebufferHandle = static_cast<HANDLE>(params.framebufferHandle);
+		}
+		if (params.ok && outFrameFenceHandle) {
+			*outFrameFenceHandle = static_cast<HANDLE>(params.frameFenceHandle);
 		}
 		return params.ok;
 	}
@@ -625,8 +630,11 @@ namespace IPC {
 		params.nearCellY = m_nearCellY;
 		params.nearCellMask = m_nearCellMask;
 		params.nearCellReach = m_nearCellReach;
+		// Tier 1: whether the host may overlap frame N's GPU work past its reply (see bridge.h).
+		params.clientSyncsOnFence = m_clientSyncsOnFence;
 		params.bytesWritten = 0;
 		params.renderMs = 0.0;
+		params.frameFenceValue = 0;
 		if (!beginRpc(Command::RenderFrame)) {
 			return false;
 		}
@@ -638,11 +646,18 @@ namespace IPC {
 		return true;
 	}
 
-	bool Client::renderSceneFinish(double* outRenderMs, HostFrameTimings* outTimings) {
+	bool Client::renderSceneFinish(double* outRenderMs, HostFrameTimings* outTimings,
+		std::uint64_t* outFrameFenceValue) {
 		// ALWAYS drop the window guard, even on failure — a stale guard would refuse
 		// every subsequent RPC forever (fail-loud, not fail-dead).
 		m_frameWindowOpen = false;
 
+		if (outFrameFenceValue) {
+			// Tier 1: default to 0 = "no sync object". A failed completion must not leave the
+			// caller holding the PREVIOUS frame's value, which it would then wait on and treat as
+			// proof that THIS frame is drawn.
+			*outFrameFenceValue = 0;
+		}
 		if (waitForCompletion() != WakeReason::Complete) {
 			return false;
 		}
@@ -653,6 +668,9 @@ namespace IPC {
 		}
 		if (outTimings) {
 			*outTimings = params.hostTimings;
+		}
+		if (outFrameFenceValue) {
+			*outFrameFenceValue = params.frameFenceValue;
 		}
 		return params.bytesWritten > 0;
 	}

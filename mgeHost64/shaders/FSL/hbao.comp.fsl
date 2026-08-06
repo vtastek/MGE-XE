@@ -108,6 +108,9 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
         bentSum += N * (openP + openM) + sliceW * (openP - openM);
     }
 
-    Write2D(gAOOut, px, aoResolve(occSum / float(slices), bentSum, N));
+    // Quadrature reference = N itself, and exactly so: this accumulator lifts along N rather than
+    // along the in-slice projection, so a fully open frame sums to 2 * slices * N and normalises to
+    // N with no residual to cancel. The other two modes have to build a refSum; this one does not.
+    Write2D(gAOOut, px, aoResolve(occSum / float(slices), bentSum, N, N));
     RETURN();
 }

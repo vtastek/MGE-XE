@@ -180,11 +180,30 @@ float4 PS_MAIN( VSOutput In )
     //
     // Bit 1 (bent normal) is deliberately NOT wired here: it is a separate look feature, it is off by
     // default, and this normal also feeds the MSM bias and the point-light Lambert below.
+    // KNOWN near/far divergence, kept on purpose for now: opaque.frag and multimap.frag were changed
+    // from a hard normal SWAP to an occlusion-weighted lerp (2026-08-04), which removes the reason
+    // this path most wanted to stay out — the lerp is a no-op wherever nothing occludes, so it can no
+    // longer wreck an open surface. What still holds it back is the sentence above: unlike
+    // opaque.frag, which feeds the MSM bias the GEOMETRIC normal and keeps skyAmbFactor on it too,
+    // this path has ONE `normal` serving shading, the sun bias and the point Lambert. Wiring the bend
+    // means splitting those first. Terrain also spans the whole near<->far handover in one draw, so
+    // getting it wrong shows up as a seam on the same hillside rather than on one object.
     bool   inReflect = (gFrameData.gReflWaterClip.z != 0.0f);
     uint   aoFlags   = (uint)(gFrameData.debugParams.w + 0.5f);
+    // WHICH TEXEL IS OURS UNDER MSAA — gAO comes from pLinearDepth (SAMPLE 0), so at a silhouette
+    // its texel can belong to whatever is standing in front of the ground and the rim reads bright.
+    // Same defect and same fix as the shadow mask below; see opaque.frag for the full note. The
+    // ground is the surface everything else is silhouetted AGAINST, so it is on the receiving end of
+    // this more than any other path. Resolved once (shadowMaskPixel takes derivatives), reused as
+    // maskPx further down.
+    uint   dbgMode   = (uint)(gFrameData.debugParams.x + 0.5f);
+    bool   aoUsed    = ((aoFlags & 3u) != 0u) || dbgMode == 3u || dbgMode == 4u;
+    int2   srcPx     = int2(In.Position.xy);
+    if (!inReflect && (aoUsed || gShadowParams.slotBits.x != 0u)) {
+        srcPx = shadowMaskPixel(In.Position);
+    }
     float4 aoSample  = inReflect ? float4(0.0f, 0.0f, 0.0f, 1.0f)
-                                 : SampleTex2D(gAO, gSamplerAnisotropic,
-                                               In.Position.xy * gShadowParams.screenAlloc.zw);
+                                 : LoadTex2D(gAO, NO_SAMPLER, srcPx, 0);
     // SH1: distant ambient gets the same sky direction the near paths do. Landed together with them
     // on purpose — giving near geometry directional ambient while the distant paths stayed flat puts
     // a visible seam across the near/far handover on the same building.
@@ -222,8 +241,7 @@ float4 PS_MAIN( VSOutput In )
     // an NPC's outline read the NPC's shadow state. Resolved here, at top level — it takes derivatives
     // and the mask is read from inside both divergent light loops. Guards are cbuffer-driven, so the
     // branch is uniform across the draw.
-    int2 maskPx = int2(In.Position.xy);
-    if (!inReflect && gShadowParams.slotBits.x != 0u) { maskPx = shadowMaskPixel(In.Position); }
+    int2 maskPx = srcPx;   // resolved with the AO read above — same snapshot, same size
     if (length(In.WorldPos) < gFrameData.lodParams.x)
     {
         // NEAR live lights — opaque.frag's inlined body, clustered through the NEAR grid
@@ -360,7 +378,12 @@ float4 PS_MAIN( VSOutput In )
     // show it. mode 4 displays the buffer's bent normal even though terrain doesn't shade with
     // it; this is a view of the BUFFER, not of what consumed it.
     if (dbg == 3u || dbg == 4u) {
-        if (dbg == 4u) { RETURN(float4(aoSample.rgb, 1.0f)); }   // mode 4: bent normal (raw, no remap)
+        // mode 4: the gAO bend term, remapped *0.5+0.5 so zero reads as mid grey. It is not a
+        // normal (aocommon.h.fsl): it runs from EXACTLY zero where nothing occludes to the
+        // absolute bent direction where everything does. So flat mid grey == "no bend here",
+        // and it must be flat on an OPEN surface — any 4x4 dither-tile texture there means the
+        // quadrature reference is not cancelling. Cavities legitimately read as a normal map.
+        if (dbg == 4u) { RETURN(float4(aoSample.rgb * 0.5f + 0.5f, 1.0f)); }
         float v = aoSample.a; RETURN(float4(v, v, v, 1.0f));      // mode 3: AO/visibility
     }
     if (dbg == 1u || dbg == 2u) {

@@ -22,11 +22,18 @@
 STRUCT(BlurParams)
 {
     DATA(float4x4, invViewProj,  None);   // 0..15  depth -> world (bilateral range weight)
-    DATA(float4,   screenParams, None);   // 16..19 xy = w,h ; zw = 1/w,1/h
+    DATA(float4,   screenParams, None);   // 16..19 xy = w,h ; zw = 1/w,1/h  (HALF dims when half-res AO is on)
     DATA(float4,   _padAO,       None);   // 20..23 (aoParams slot — unused here)
     DATA(float4,   _padEye,      None);   // 24..27 (eyePos slot — unused here)
     DATA(float4,   blurParams,   None);   // 28..31 x = spatial sigma (px), y = range sigma (world u);
                                           //        zw belong to the AO pass (slice/step + thickness)
+    DATA(float4,   blurParams2,  None);   // 32..35 mirrors gtao.srt.h's aoParams2. x = the AO pass's
+                                          //        bent strength (not read here); y = THIS pass's
+                                          //        plane-distance sine sigma for the bend channel
+                                          //        (<= 0 disables it); z = the FAR end of the
+                                          //        distance-adaptive range sigma, with blurParams.y
+                                          //        as the near end (z <= y disables the ramp);
+                                          //        w spare.
 };
 
 BEGIN_SRT(AOBlurSrtData)

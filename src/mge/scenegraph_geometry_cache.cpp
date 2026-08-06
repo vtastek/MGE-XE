@@ -2287,6 +2287,33 @@ namespace MGE::GeometryCache {
             if (mit != g_cache.end()) updateDerivedMembership(key, mit->second);
         }
 
+        // Morrowind's legacy fake-shadow geometry: an untextured, fully OPAQUE box that ships
+        // inside a fixture's own mesh (light_de_lantern_10 has `Tri ShadowBox`; the working
+        // light_de_lantern_08 has none — that is the entire difference between them). Captured, it
+        // becomes a host shadow caster that ENCLOSES the fixture's own light and cages it. And
+        // because its material emissive is (0,0,0) it can never be `emissiveHot`, so not one of the
+        // five emissive-carve knobs can reach it — which is exactly why that panel read as a row of
+        // settings with no effect. It is decoration for an engine feature we replaced; drop it.
+        //
+        // THE MATCH MUST BE EXACT-OR-NUMERIC, NEVER A PREFIX. A census of the three vanilla BSAs
+        // turns up two unrelated families sharing the word: the legacy geometry (`Tri Shadow` x64,
+        // `Tri ShadowBox` x55, `ShadowBox02..04`, `Tri Shadow01`) and CREATURES that are simply
+        // called Shadow — `Tri Shadow_Wolf`, `Tri ShadowGuar`, `Tri Shadowrat`,
+        // `Tri ShadowBoneWalker`, `Tri Shadowbody/neck/mandible02`, `Shadow_Goblin2Head`,
+        // `ShadowL2_01`, `ShadowR3S0`. A `strncmp(name, "Shadow", 6)` would delete the shadow wolf.
+        // So: strip NetImmerse's "Tri " shape prefix, require "shadow" (+ optional "box"), then
+        // allow only digits before the terminator.
+        static bool isLegacyShadowGeometry(const char* name) {
+            if (!name) { return false; }
+            const char* n = name;
+            if (_strnicmp(n, "Tri ", 4) == 0) { n += 4; }   // shapes carry it, the wrapping node does not
+            if (_strnicmp(n, "shadow", 6) != 0) { return false; }
+            n += 6;
+            if (_strnicmp(n, "box", 3) == 0) { n += 3; }
+            while (*n >= '0' && *n <= '9') { ++n; }
+            return *n == '\0';
+        }
+
         // bypassCull skips the entry's own app-cull check. Used for a NiSwitchNode's
         // active child: switchIndex already selected it, and a menu-frame cull pass may
         // have transiently app-culled it; the cache frustum-culls later anyway.
@@ -2327,6 +2354,15 @@ namespace MGE::GeometryCache {
             if (bypassCullDeep
                 && (av->isInstanceOfType(NI::RTTIStaticPtr::RootCollisionNode)
                     || av->isInstanceOfType(NI::RTTIStaticPtr::NiCollisionSwitch))) {
+                return;
+            }
+
+            // Legacy fake-shadow geometry — see isLegacyShadowGeometry. Pruned on EVERY walk, not
+            // just the deep one: the whole point is that it must never reach the host, neither as a
+            // draw nor as the shadow caster that cages its own fixture's light. Returning here also
+            // prunes the subtree, which is what removes `Tri ShadowBox` when the wrapping NiNode is
+            // itself named `ShadowBox`.
+            if (isLegacyShadowGeometry(av->getName())) {
                 return;
             }
 

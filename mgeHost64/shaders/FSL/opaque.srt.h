@@ -19,6 +19,18 @@
 // binds the SAME pShadowMaskParamsCbv the compute mask uses into PerFrame gShadowParams.
 #include "shadowparams.h.fsl"
 
+// Bent-normal strength used to live here as AO_BENT_INTENSITY, a compile-time gain on gAO.rgb. It
+// is gone: the strength is a PRODUCER-side knob now (aocommon.h.fsl's aoBentStrength, a live slider
+// in the AO panel), which is strictly better placed. Compute shaders hot-reload on F8, so it can be
+// tuned in the running game — whereas this file's consumers are graphics shaders and retuning here
+// cost an FSL recompile AND a host restart. It could not have moved into FrameData either: that
+// struct is exactly 512 B against a 512 B CBV.
+//
+// The consumers now reconstruct rather than gain: `normalize(N * gAO.a + gAO.rgb)`, which is exact.
+// See aocommon.h.fsl for what gAO.rgb means and opaque.frag for why our normal carries the gAO.a
+// weight. opaque.frag and multimap.frag must stay in lockstep; alpha.frag / multimap_alpha.frag do
+// not apply the bend at all (they are not in the Z-prepass gAO is built from).
+
 #define OPAQUE_BATCH 1024   // matrices per 64KB cbuffer window; must match host kBatchSize
 #define MAX_TEXTURES 880    // bindless gTextures[] array size; MUST match IPC::kMaxTextures (geomwire.h)
 // NiFlipController flip books: a descriptor-array of Texture2DArrays, one element per (format,
@@ -130,10 +142,19 @@ STRUCT(FrameData)
     // these). Slice metric = length(worldPosRel), matching froxelassign.comp exactly.
     DATA(float4, froxelDims, None);   // x=tilesX, y=tilesY, z=NZslices, w=tileSize(px); x<=0 => brute loop
     DATA(float4, froxelZ,    None);   // x=log(d0), y=invLogRange (1/log(d1/d0)); zw unused
-    // Alpha SHADOW-RECEIVE threshold (496B, float index 124). x = the opacity at/above which an alpha
-    // sheet writes into the dedicated shadow-receive depth (alphashadowdepth.frag) so it receives its
-    // own point-light shadow — SEPARATE from alphaParams.x (the fold-fix depth-write threshold). Only
-    // alphashadowdepth.frag reads it; 0 elsewhere is inert. 512B == the 512B host CBV.
+    // 496B, float indices 124..127. The LAST float4 in FrameData — 512B == the 512B host CBV.
+    //   x (124) alpha SHADOW-RECEIVE threshold: the opacity at/above which an alpha sheet writes into
+    //           the dedicated shadow-receive depth (alphashadowdepth.frag) so it receives its own
+    //           point-light shadow. SEPARATE from alphaParams.x (the fold-fix depth-write threshold).
+    //           Only alphashadowdepth.frag reads it; 0 elsewhere is inert.
+    //   y (125) FP direct-atlas shadow flag = "first person AND receiving shadows". Drives
+    //           opaque.frag's fpShadowVisibility. NOT an "am I the arm?" test — it is 0 in the FP
+    //           pass whenever FP shadow reception is off or the atlas is not resident.
+    //   z (126) FIRST-PERSON pass, unconditionally. That IS the "am I the arm?" test, and gAO needs
+    //           it: the arms are never in the world Z-prepass, so every screen-space buffer built
+    //           from that depth describes the world behind them (opaque.frag gates the gAO read on
+    //           it). Two flags because the two questions came apart the first time .y was reused.
+    //   w (127) spare.
     DATA(float4, alphaShadowParams, None);
 };
 

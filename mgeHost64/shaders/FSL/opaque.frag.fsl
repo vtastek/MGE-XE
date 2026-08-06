@@ -49,8 +49,8 @@ float4 PS_MAIN( VSOutput In )
     INIT_MAIN;
     float3 N = normalize(In.Normal);
 
-    // Sample the AO buffer once (rgb = world-space bent normal, a = visibility), shared by the
-    // ambient term, the bent-normal swap, and the F12 views. gAO is the BILATERAL-BLURRED AO
+    // Sample the AO buffer once (rgb = the world-space bend term, a = visibility — aocommon.h.fsl
+    // has the contract), shared by the ambient term, the bend below, and the F12 views. gAO is the BILATERAL-BLURRED AO
     // (pAOBlur, denoised in a compute pass), so a single tap is all that's needed here.
     // debugParams.w = toggle bitmask (bit0 AO->ambient, bit1 bent normal).
     // gAO is ALLOCATION-sized (every screen RT is allocated at the render-scale ceiling and the frame
@@ -68,10 +68,74 @@ float4 PS_MAIN( VSOutput In )
     // geometry keeps its true world position — the VIEW is mirrored, not the geometry — so they are
     // correct as-is. Only screen-space lookups are wrong.
     bool   inReflect = (gFrameData.gReflWaterClip.z != 0.0f);
-    float2 aoUv     = In.Position.xy * gShadowParams.screenAlloc.zw;
-    float4 aoSample = inReflect ? float4(0.0f, 0.0f, 0.0f, 1.0f)   // AO = 1 (no darkening), bent-N unused
-                                : SampleTex2D(gAO, gSamplerAnisotropic, aoUv);
-    if ((aoFlags & 2u) != 0u && !inReflect) { N = normalize(aoSample.rgb); }   // "Bent normal enable" tick: bend the lighting normal
+    // WHICH TEXEL IS OURS UNDER MSAA. gAO has exactly the same defect the point-light shadow mask
+    // has, and for exactly the same reason: it is computed from pLinearDepth, which is SAMPLE 0 of
+    // the MSAA depth (linearizedepth.comp — Load(coord, 0)). So one AO texel describes ONE surface,
+    // whichever covered sample 0. Inside a triangle that is us; at a SILHOUETTE it is a coin toss,
+    // and the loser's fragment gets handed the AO — and now the bend — of the geometry behind it.
+    // A shadowed/occluded rim reading the open wall behind it is a BRIGHT pixel on the silhouette,
+    // the same artifact shadowreceive.h.fsl was written for, and it survives the resolve because it
+    // is one PIXEL-rate attribute inside an otherwise sample-rate pass.
+    //
+    // Half-res does not cause it and does not fix it: pAOBlur is FULL res either way (the upscale
+    // writes full res), so this lookup is identical in both settings — which is exactly what
+    // "happens with and without half-res" says.
+    //
+    // Resolved ONCE here, at top level, because shadowMaskPixel takes derivatives (it must not be
+    // called from the divergent light loop) and because the SAME int2 is the right texel for both
+    // consumers — gAO and gShadowMask are the same size and both derive from that one snapshot.
+    // Guards are all cbuffer-driven, so the branch is uniform across the draw.
+    // NOT in the first-person pass, and there the point is much stronger than a texel choice: the
+    // arms are a post-composite overlay drawn under the ARM camera, and they are not in the world
+    // Z-prepass AT ALL. gAO under an arm pixel therefore describes whatever the world put behind the
+    // arm — usually the floor or wall a step away, which up close is the most occluded thing on
+    // screen. Multiplying the arms' ambient by it is what made first person read as very dark with
+    // AO on, and the bend would substitute that surface's direction on top. So FP takes the same
+    // "no AO here" constant the reflection pass takes, for BOTH channels.
+    //
+    // The flag is alphaShadowParams.Z, not .y. .y means "FP *and* receiving direct-atlas shadows",
+    // so it goes to 0 in the FP pass whenever FP shadow reception is off or the atlas is not
+    // resident — an FP test built on it silently stops being an FP test. .z is the plain question.
+    uint   dbgMode  = (uint)(gFrameData.debugParams.x + 0.5f);
+    bool   aoUsed   = ((aoFlags & 3u) != 0u) || dbgMode == 3u || dbgMode == 4u;   // mirrors the host's dispatch arm
+    bool   isFP     = (gFrameData.alphaShadowParams.z > 0.5f);
+    bool   aoValid  = !inReflect && !isFP;
+    int2   srcPx    = int2(In.Position.xy);
+    if (aoValid && (aoUsed || gShadowParams.slotBits.x != 0u)) {
+        srcPx = shadowMaskPixel(In.Position);
+    }
+    // LOAD, not Sample: gAO is ALLOCATION-sized and read 1:1 (the render rect starts at 0,0), so the
+    // old `In.Position.xy * screenAlloc.zw` uv landed exactly on a texel centre anyway — it was
+    // already a point sample, just an expensive one that could not be redirected to a neighbour.
+    float4 aoSample = aoValid ? LoadTex2D(gAO, NO_SAMPLER, srcPx, 0)
+                              : float4(0.0f, 0.0f, 0.0f, 1.0f);   // AO = 1 (no darkening), no bend
+    // "Bent normal enable" tick: replace the lighting normal with the direction the unoccluded
+    // hemisphere actually sits in. gAO's contract (aocommon.h.fsl) is
+    //     gAO.rgb = bentDirection - gAO.a * (the AO pass's own normal)
+    // so the reconstruction is `normalize(OUR normal * gAO.a + gAO.rgb)` — one mad, and it is exact
+    // wherever our normal agrees with theirs.
+    //
+    // Why our normal is weighted by visibility rather than simply replaced or simply added to:
+    //   * Where nothing occludes (a == 1) rgb is EXACTLY zero, so this is normalize(N) — untouched,
+    //     bit for bit. That matters because the AO pass's normal comes from DEPTH, i.e. the FLAT
+    //     per-triangle normal, while In.Normal is the smooth interpolated one; anything that carried
+    //     an absolute direction here would drag every smooth-shaded barrel, column and rock onto its
+    //     facets the moment the tick went on.
+    //   * Where everything occludes (a == 0) their normal has dropped out of rgb entirely and we
+    //     take the measured direction whole. That is what an inside corner needs: both walls see the
+    //     same open quarter-space, so the bent direction is continuous across the crease even though
+    //     the surface normal jumps 90 degrees there.
+    // The bend's STRENGTH is a producer-side slider now (aoBentStrength, live in the AO panel), not
+    // the compile-time AO_BENT_INTENSITY this used to carry — that needed a host restart to retune,
+    // since graphics shaders do not hot-reload.
+    if ((aoFlags & 2u) != 0u && aoValid) {
+        float3 bn  = N * aoSample.a + aoSample.rgb;
+        float  bl2 = dot(bn, bn);
+        float3 bnn = (bl2 > 1e-8f) ? (bn * rsqrt(bl2)) : N;
+        // Strength, blur and upscale can all over-rotate past the true bent direction; never let it
+        // tip below the surface, which would light the back of the polygon.
+        N = (dot(bnn, N) > 0.0f) ? bnn : N;
+    }
 
     // MW lighting: sun diffuse (to-sun = -sunDir) + scene ambient. FFE convention.
     float  ndl = saturate(dot(N, -gFrameData.sunDir.xyz));
@@ -106,15 +170,11 @@ float4 PS_MAIN( VSOutput In )
     // lights cbuffer packs 3 float4 per light: [i*3+0]=(pos.xyz, radius), [i*3+1]=(col.rgb,_),
     // [i*3+2]=(k0,k1,k2,_). lightParams.x is the active count (host-written), .y the reach.
     uint litCount = 0u;   // debug (mode 9): point lights that reach this pixel
-    // Which gShadowMask texel is OURS (shadowreceive.h.fsl). Resolved HERE, at top level, because it
-    // takes derivatives and the mask is read from deep inside the divergent light loop; one int2 then
-    // serves every light. All three guards are cbuffer-driven, so the branch is uniform across the
-    // draw and quad-coherent: no slots means no light carries one, the mirror pass never reads the
-    // main-view mask at all, and the FP arms take the direct atlas path below instead.
-    int2 maskPx = int2(In.Position.xy);
-    if (!inReflect && gShadowParams.slotBits.x != 0u && gFrameData.alphaShadowParams.y <= 0.5f) {
-        maskPx = shadowMaskPixel(In.Position);
-    }
+    // Which gShadowMask texel is OURS (shadowreceive.h.fsl) — already resolved as srcPx up with the
+    // AO read, since both buffers derive from the same sample-0 snapshot and are the same size.
+    // Resolving it once up there rather than twice here is why it must stay at top level: it takes
+    // derivatives, and the mask is read from deep inside the divergent light loop.
+    int2 maskPx = srcPx;
     {
         uint nLights = (uint)gLights.lightParams.x;
         // Light reach in radii — host-slaved to the shadow test range (see opaque.srt.h). The
@@ -283,7 +343,12 @@ float4 PS_MAIN( VSOutput In )
     // draw stay unchanged — a quick way to spot what's still going through MW's own path.
     uint dbg = (uint)(gFrameData.debugParams.x + 0.5f);
     if (dbg == 3u || dbg == 4u) {
-        if (dbg == 4u) { RETURN(float4(aoSample.rgb, 1.0f)); }              // mode 4: bent normal (raw float3, no remap)
+        // mode 4: the gAO bend term, remapped *0.5+0.5 so zero reads as mid grey. It is not a
+        // normal (aocommon.h.fsl): it runs from EXACTLY zero where nothing occludes to the
+        // absolute bent direction where everything does. So flat mid grey == "no bend here",
+        // and it must be flat on an OPEN surface — any 4x4 dither-tile texture there means the
+        // quadrature reference is not cancelling. Cavities legitimately read as a normal map.
+        if (dbg == 4u) { RETURN(float4(aoSample.rgb * 0.5f + 0.5f, 1.0f)); }
         float v = aoSample.a; RETURN(float4(v, v, v, 1.0f));                 // mode 3: AO/visibility
     }
     if (dbg == 5u) { RETURN(float4(albedo.rgb, 1.0f)); }                     // mode 5: albedo only (texture, no lighting)

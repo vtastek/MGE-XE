@@ -409,6 +409,7 @@ namespace IPC {
 	void Server::renderInit() {
 		auto& params = m_ipcParameters->params.renderInitParams;
 		params.framebufferHandle = nullptr;   // reused as the shared-RT NT handle (client-process value)
+		params.frameFenceHandle = nullptr;    // Tier 1 shared frame fence (client-process value)
 		params.ok = false;
 
 		if (!ForgeRender::init(params.width, params.height, params.sampleCount, params.anisoLevel)) {
@@ -437,22 +438,46 @@ namespace IPC {
 			return;
 		}
 
+		// Tier 1: same duplication for the host's SHARED frame fence. Best-effort — a null handle
+		// (or a failed duplicate) just leaves the client on the blocking contract, so it must NOT
+		// fail renderInit the way a missing RT handle does.
+		HANDLE clientFence = nullptr;
+		HANDLE hostFence = static_cast<HANDLE>(ForgeRender::sharedFenceHandle());
+		if (hostFence != nullptr) {
+			if (!DuplicateHandle(GetCurrentProcess(), hostFence, m_clientProcess, &clientFence,
+					0, FALSE, DUPLICATE_SAME_ACCESS)) {
+				LOG::winerror("[seam] failed to duplicate shared frame-fence handle to client");
+				clientFence = nullptr;
+			}
+		}
+
 #pragma warning(push)
 #pragma warning(disable: 4244 4302 4311)
 		params.framebufferHandle = static_cast<HANDLE32>(clientHandle);
+		params.frameFenceHandle = static_cast<HANDLE32>(clientFence);
 #pragma warning(pop)
 		params.ok = true;
 		LOG::logline(">> [seam] render init ok (%ux%u, Forge shared RT, host handle %p -> client %p) sceneReady=%d",
 			params.width, params.height, hostHandle, clientHandle, (int)ForgeRender::sceneReady());
+		LOG::logline(">> [seam] shared frame fence: host %p -> client %p", hostFence, clientFence);
 		LOG::flush();
 	}
 
-	// Render one frame into the shared RT. Blocking (host fence-waits), so the reply
-	// implies the frame is GPU-complete and MW's StretchRect won't race the draw.
+	// Render one frame into the shared RT.
+	//
+	// TIER 1 CHANGED THE CONTRACT HERE. This used to be blocking — the host fence-waited its own
+	// frame — so the reply implied the frame was GPU-complete and MW's StretchRect could not race
+	// the draw. renderScene now waits the PREVIOUS frame's fence at the top of the NEXT frame
+	// instead, so this reply returns while the GPU may still be drawing. What replaces the implicit
+	// guarantee is params.frameFenceValue below: the value the host signalled on the SHARED D3D12
+	// fence for this submit, which the client waits on an imported Vulkan timeline semaphore before
+	// its RT copy. 0 ⇒ no shared fence, and the client must fall back to not overlapping.
+	// tasks/forge-host-gpu-lane.md.
 	void Server::renderFrame() {
 		auto& params = m_ipcParameters->params.renderFrameParams;
 		params.bytesWritten = 0;
 		params.renderMs = 0.0;
+		params.frameFenceValue = 0;
 		// Clear the timing block too: renderScene can bail early (the !ok return below) without
 		// ever reaching fillFrameTimings, and a stale block would plot the last GOOD frame's
 		// numbers on a frame that never rendered — a lie that reads as a healthy flat line.
@@ -627,6 +652,10 @@ namespace IPC {
 			// reaches. Mask 0 (no centre cell) ⇒ the host keeps its fixed near-cut distance.
 			ForgeRender::setNearCells(params.nearCellX, params.nearCellY,
 				params.nearCellMask, params.nearCellReach);
+			// Tier 1: does the client hold the sync object that makes overlapping this frame's GPU
+			// work past our reply safe? Fail-safe — anything but an explicit 1 makes renderScene
+			// settle its own frame before returning, exactly as it did pre-Tier-1.
+			ForgeRender::setClientSyncsOnFence(params.clientSyncsOnFence == 1u);
 			ok = ForgeRender::renderScene(params.viewProj, params.lighting, drawPtr, params.drawCount, bytes,
 				skinnedPtr, params.skinnedCount, skinnedBytes,
 				multiMapPtr, params.multiMapCount, multiMapBytes,
@@ -655,6 +684,10 @@ namespace IPC {
 		// client can plot it in Tracy. Cost is 16 float stores into shared memory already being
 		// written for bytesWritten/renderMs — no extra sync, no extra RPC.
 		ForgeRender::fillFrameTimings(params.hostTimings);
+		// Tier 1: the shared-fence value this frame's submit signals. MUST be read after renderScene
+		// (it increments per submit) and MUST reach the client, because it is now the only thing
+		// standing between the client's RT copy and a half-drawn frame.
+		params.frameFenceValue = ForgeRender::lastFrameFenceValue();
 		s_lastExit = t1;
 	}
 

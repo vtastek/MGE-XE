@@ -75,6 +75,8 @@ namespace IPC {
 		std::int32_t m_nearCellY = 0;
 		std::uint32_t m_nearCellMask = 0;
 		float m_nearCellReach = 0.0f;
+		// Tier 1 overlap consent — see setClientSyncsOnFence. 0 = host must keep fence-waiting.
+		std::uint32_t m_clientSyncsOnFence = 0;
 
 		// Dev FSL hot-reload watcher: a child launched alongside the host and killed with it, opt-in
 		// per install via an untracked mgeXE_fslwatch.txt next to Morrowind.exe (see startWatcher —
@@ -301,10 +303,13 @@ namespace IPC {
 		* @param sharedTexture0 D3D9Ex shared RT handle for zero-copy (Milestone B); null ⇒ CPU readback (A).
 		* @param sharedTexture1 Second shared RT handle to double-buffer (Milestone C); null ⇒ single-buffered.
 		* @param outFramebufferHandle A path only: receives a file-mapping HANDLE for the W*H*4 pixel blob (null on B).
+		* @param outFrameFenceHandle Tier 1: receives the host's SHARED D3D12 frame-fence NT handle
+		*        (this process's value), or null if the host has none. Optional.
 		* @return Whether the host renderer initialized successfully (blocking).
 		*/
 		bool renderInitBlocking(std::uint32_t width, std::uint32_t height, std::uint32_t sampleCount,
-			std::uint32_t anisoLevel, HANDLE sharedTexture0, HANDLE sharedTexture1, HANDLE* outFramebufferHandle);
+			std::uint32_t anisoLevel, HANDLE sharedTexture0, HANDLE sharedTexture1, HANDLE* outFramebufferHandle,
+			HANDLE* outFrameFenceHandle = nullptr);
 
 		/**
 		* @brief Present-seam spike: render one frame into shared buffer targetIndex.
@@ -373,7 +378,12 @@ namespace IPC {
 		*/
 		// outTimings (optional): the host's CPU/GPU phase split for the frame just drained, for
 		// Tracy plots — see ipc/hostframetimings.h. Zeroed by the host on a failed frame.
-		bool renderSceneFinish(double* outRenderMs = nullptr, HostFrameTimings* outTimings = nullptr);
+		// outFrameFenceValue (Tier 1): the SHARED frame-fence value the host signalled for this
+		// frame's submit. Since the host stopped fence-waiting its own frame, the completion no
+		// longer implies the GPU has finished — the caller must wait this value on the imported
+		// timeline semaphore before reading the shared RT. 0 ⇒ no sync object available.
+		bool renderSceneFinish(double* outRenderMs = nullptr, HostFrameTimings* outTimings = nullptr,
+			std::uint64_t* outFrameFenceValue = nullptr);
 
 		/**
 		* @brief M1b: upload a batch of static opaque meshes to the Forge host.
@@ -402,6 +412,12 @@ namespace IPC {
 		void setNextNearCells(std::int32_t cx, std::int32_t cy, std::uint32_t mask, float reach) {
 			m_nearCellX = cx; m_nearCellY = cy; m_nearCellMask = mask; m_nearCellReach = reach;
 		}
+
+		// Tier 1: tell the host whether we hold an imported timeline semaphore for its shared frame
+		// fence, i.e. whether it may return from renderScene without settling its own frame. Set
+		// once at seam bring-up (after the import attempt) and stamped into every render RPC.
+		// Defaults false so a client that never calls it can never be handed a half-drawn frame.
+		void setClientSyncsOnFence(bool syncs) { m_clientSyncsOnFence = syncs ? 1u : 0u; }
 
 		WakeReason waitForCompletion(DWORD ms = MaxWait);
 

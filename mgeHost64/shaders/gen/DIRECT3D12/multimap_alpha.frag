@@ -1090,7 +1090,7 @@ STRUCT(ShadowMaskParams)
 #line 236
 };
 #line 21 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
-#line 46 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+#line 58 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
 STRUCT(FrameData)
 {
     float4x4 viewProj;
@@ -1151,7 +1151,7 @@ STRUCT(FrameData)
 
 
     float4 alphaParams;
-#line 117 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+#line 129 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
     float4 timeParams;
 
 
@@ -1168,20 +1168,17 @@ STRUCT(FrameData)
 
     float4 froxelDims;
     float4 froxelZ;
-
-
-
-
+#line 158 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
     float4 alphaShadowParams;
-#line 138
+#line 159
 };
 
 STRUCT(BatchData)
 {
     float4x4 worlds[ 1024 ];
-#line 143
+#line 164
 };
-#line 164 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+#line 185 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
 STRUCT(LightData)
 {
     float4 lightParams;
@@ -1197,7 +1194,7 @@ STRUCT(LightData)
 
     float4 froxelDimsNear;
     float4 froxelZNear;
-#line 179
+#line 200
 };
 
         CBUFFER(FrameData) gFrameData :  register(b0,space1);
@@ -1207,7 +1204,7 @@ STRUCT(LightData)
 
 
         Tex2D(float4) gAO :  register(t1,space1);
-#line 203 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+#line 224 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
         Tex3D(float4) gWaterNormalVol :  register(t2,space1);
         Tex2D(float4) gRefractColor :  register(t3,space1);
         Tex2D(float4) gSceneLinDepth :  register(t4,space1);
@@ -1322,7 +1319,7 @@ STRUCT(LightData)
 
 
         Tex2D(float) gSunOcc :  register(t53,space1);
-#line 335 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+#line 356 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
         Tex2D(float4) gSkyColor :  register(t54,space1);
 
 
@@ -1340,7 +1337,7 @@ STRUCT(LightData)
 
 
         CBUFFER(LightData) gLightsNear :  register(b1,space3);
-#line 366 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+#line 387 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
         Tex2D(float4) gTextures[ 880 ] :  register(t0,space0);
 
 
@@ -1662,7 +1659,9 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
     uint aoFlags = (uint)(gFrameData.debugParams.w + 0.5f);
     float2 aoUv = In.Position.xy * gShadowParams.screenAlloc.zw;
     float4 aoSample = SampleTex2D(gAO, gSamplerAnisotropic, aoUv);
-    if ((aoFlags & 2u) != 0u) { N = normalize(aoSample.rgb); }
+
+
+
 
 
     float ndl = saturate(dot(N, -gFrameData.sunDir.xyz));
@@ -1670,7 +1669,10 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
 
     float3 a = ((aoFlags & 4u) != 0u) ? float3(1.0f, 1.0f, 1.0f)
                                       : gFrameData.ambCol.rgb * skyAmbFactor(In.Normal, In.WorldPos);
-    if ((aoFlags & 1u) != 0u) { a *= aoSample.a; }
+
+
+
+
     a *= gFrameData.dbgScales.x;
     {
         uint nLights = (uint)gLights.lightParams.x;
@@ -1787,7 +1789,12 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
 
     uint dbg = (uint)(gFrameData.debugParams.x + 0.5f);
     if (dbg == 3u || dbg == 4u) {
-        if (dbg == 4u) { RETURN(float4(aoSample.rgb, 1.0f)); }
+
+
+
+
+
+        if (dbg == 4u) { RETURN(float4(aoSample.rgb * 0.5f + 0.5f, 1.0f)); }
         float v = aoSample.a; RETURN(float4(v, v, v, 1.0f));
     }
     if (dbg == 5u) { RETURN(float4(alb, 1.0f)); }
@@ -1809,7 +1816,7 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
         float g = float(mw.x & 0xFu) * (1.0f / 15.0f);
         return (float4(g, g, g, 1.0f));
     }
-#line 217 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/multimap_alpha.frag.fsl"
+#line 227 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/multimap_alpha.frag.fsl"
     float outA = baseA * In.Color.a;
     return (float4(c, outA));
 }

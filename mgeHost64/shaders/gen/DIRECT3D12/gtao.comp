@@ -974,7 +974,7 @@ SamplerState gSampler2xWrapClamp : register( s17 , space100 ) ;
 #line 11 "FSL/shaders.list"
 #line 285 "FSL/shaders.list"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/gtao.comp.fsl"
-#line 24 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/gtao.comp.fsl"
+#line 40 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/gtao.comp.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/gtao.srt.h"
 #line 21 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/gtao.srt.h"
 STRUCT(AOParams)
@@ -985,24 +985,26 @@ STRUCT(AOParams)
     float4 eyePos;
     float4 sliceParams;
 
-#line 29
+    float4 aoParams2;
+
+
+
+
+
+
+
+
+
+#line 39
 };
-
-
-
-
-
-
-
-
-
-
+#line 56 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/gtao.srt.h"
         CBUFFER(AOParams) gAOParams :  register(b0,space3);
         Tex2D(float) gLinearDepthIn :  register(t1,space3);
         WTex2D(float4) gAOOut :  register(u2,space3);
-#line 25 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/gtao.comp.fsl"
+        Tex2D(float4) gStbn :  register(t3,space3);
+#line 41 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/gtao.comp.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/aocommon.h.fsl"
-#line 45 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/aocommon.h.fsl"
+#line 77 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/aocommon.h.fsl"
 float aoRadius() { return max(gAOParams.aoParams.x, 1e-3f); }
 float aoFalloff() { return max(gAOParams.aoParams.y, 1e-3f); }
 float aoIntensity() { return gAOParams.aoParams.z; }
@@ -1010,6 +1012,14 @@ float aoBias() { return gAOParams.aoParams.w; }
 int aoSlices() { return (int)clamp(gAOParams.eyePos.w, 1.0f, 8.0f); }
 int aoSteps() { return (int)clamp(gAOParams.sliceParams.z, 1.0f, 16.0f); }
 float aoThickness() { return max(gAOParams.sliceParams.w, 0.0f); }
+
+
+
+
+
+
+
+float aoBentStrength() { float s = gAOParams.aoParams2.x; return (s > 0.0f) ? s : 1.0f; }
 
 
 float3 aoReconstructWorld(float2 uv, float deviceZ)
@@ -1024,10 +1034,19 @@ float aoLoadZ(int2 c)
 {
     return LoadTex2D(gLinearDepthIn, NO_SAMPLER, c, 0).r;
 }
-
-
-
-
+#line 121 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/aocommon.h.fsl"
+float2 aoDitherTile(int2 px)
+{
+    float rot = (1.0f / 16.0f) * float((((px.x + px.y) & 3) << 2) + (px.x & 3));
+    float off = (1.0f / 4.0f) * float((px.y - px.x) & 3);
+    return float2(rot, off);
+}
+#line 144 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/aocommon.h.fsl"
+float2 aoDitherStbn(int2 px, int slice)
+{
+    int2 t = int2(px.x & 63, (px.y & 63) + 64 * (slice & 15));
+    return LoadTex2D(gStbn, NO_SAMPLER, t, 0).rg;
+}
 
 
 
@@ -1035,9 +1054,42 @@ float aoLoadZ(int2 c)
 
 float2 aoDither(int2 px)
 {
-    float rot = (1.0f / 16.0f) * float((((px.x + px.y) & 3) << 2) + (px.x & 3));
-    float off = (1.0f / 4.0f) * float((px.y - px.x) & 3);
-    return float2(rot, off);
+    float sel = gAOParams.aoParams2.w;
+    if (sel < 0.0f)
+    {
+        return aoDitherTile(px);
+    }
+    return aoDitherStbn(px, (int)(sel + 0.5f));
+}
+#line 186 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/aocommon.h.fsl"
+float3 aoMinDiff(float3 dr, float3 dl)
+{
+    float lr = dot(dr, dr);
+    float ll = dot(dl, dl);
+    float hi = max(lr, ll);
+    float lo = max(min(lr, ll), 1e-12f);
+
+    float t = saturate((hi / lo - 1.0f) * (1.0f / 3.0f));
+    return lerp(0.5f * (dr + dl), (lr < ll) ? dr : dl, t);
+}
+
+
+
+
+
+
+
+
+
+
+float aoPlaneWeight(float3 nC, float3 dw, float minLen, float sigma)
+{
+    if (sigma <= 0.0f)
+    {
+        return 1.0f;
+    }
+    float sn = abs(dot(nC, dw)) / max(length(dw), minLen);
+    return exp(-(sn * sn) / (2.0f * sigma * sigma));
 }
 
 
@@ -1076,12 +1128,13 @@ bool aoSurface(int2 px, float2 uv, float2 invScreen,
 
 
 
+
     float3 dxr = Pr - P;
     float3 dxl = P - Pl;
-    ddxv = (dot(dxr, dxr) < dot(dxl, dxl)) ? dxr : dxl;
+    ddxv = aoMinDiff(dxr, dxl);
     float3 dyr = Pu - P;
     float3 dyl = P - Pd;
-    ddyv = (dot(dyr, dyr) < dot(dyl, dyl)) ? dyr : dyl;
+    ddyv = aoMinDiff(dyr, dyl);
     N = normalize(cross(ddxv, ddyv));
     if (dot(N, V) < 0.0f)
     {
@@ -1154,21 +1207,26 @@ uint aoBitRange(int b0, int b1)
 
 
 
-
-float4 aoResolve(float occ, float3 bentSum, float3 N)
+bool aoNextRun(inout(uint) open, out(uint) lo, out(uint) len)
 {
-    float vis = saturate(1.0f - saturate(occ) * aoIntensity());
-
-    float3 bn = bentSum + N * 1e-3f;
-    float l2 = dot(bn, bn);
-    bn = (l2 > 1e-12f) ? (bn * rsqrt(l2)) : N;
-    if (dot(bn, N) <= 0.0f)
+    lo = 0u;
+    len = 0u;
+    if (open == 0u)
     {
-        bn = N;
+        return false;
     }
-    return float4(bn, vis);
+    lo = firstbitlow(open);
+
+
+
+
+    uint inv = ~(open >> lo);
+    len = (inv == 0u) ? 32u : firstbitlow(inv);
+    open = open & (~aoBitRange((int)lo, (int)(lo + len)));
+    return true;
 }
-#line 26 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/gtao.comp.fsl"
+
+
 
 
 
@@ -1177,6 +1235,51 @@ float gtaoInner(float h, float n)
 {
     return 0.25f * (-cos(2.0f * h - n) + cos(n) + 2.0f * h * sin(n));
 }
+
+
+
+
+
+
+float gtaoArc(float a, float b, float n)
+{
+    if (a >= 0.0f)
+    {
+        return gtaoInner(b, n) - gtaoInner(a, n);
+    }
+    if (b <= 0.0f)
+    {
+        return gtaoInner(a, n) - gtaoInner(b, n);
+    }
+    return gtaoInner(a, n) + gtaoInner(b, n);
+}
+#line 399 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/aocommon.h.fsl"
+float4 aoResolve(float occ, float3 bentSum, float3 refSum, float3 N)
+{
+    float vis = saturate(1.0f - saturate(occ) * aoIntensity());
+
+    float q2 = dot(refSum, refSum);
+    float3 nq = (q2 > 1e-12f) ? (refSum * rsqrt(q2)) : N;
+    float b2 = dot(bentSum, bentSum);
+    float3 bn = (b2 > 1e-12f) ? (bentSum * rsqrt(b2)) : nq;
+
+
+
+    float3 bs = nq + (bn - nq) * aoBentStrength();
+    float s2 = dot(bs, bs);
+    bn = (s2 > 1e-12f) ? (bs * rsqrt(s2)) : nq;
+    if (dot(bn, N) <= 0.0f)
+    {
+        bn = N;
+    }
+
+
+
+
+
+    return float4(bn - vis * nq, vis);
+}
+#line 42 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/gtao.comp.fsl"
 
 [RootSignature( "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "3" ", offset = 0)," "CBV(b0, numDescriptors = unbounded, space = " "3" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "3" ", offset = 0))," "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "2" ", offset = 0)," "CBV(b0, numDescriptors = unbounded, space = " "2" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "2" ", offset = 0))," "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "1" ", offset = 0)," "CBV(b0, numDescriptors = unbounded, space = " "1" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "1" ", offset = 0))," "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "0" ", offset = 0)," "CBV(b0, numDescriptors = unbounded, space = " "0" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "0" ", offset = 0))," "DescriptorTable(" "SAMPLER(s0, numDescriptors = unbounded, space = " "0" ", offset = 0))," "StaticSampler(s0, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s1, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s2, space = 100," "filter = FILTER_MIN_MAG_LINEAR_MIP_POINT," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s3, space = 100," "filter = FILTER_MIN_MAG_LINEAR_MIP_POINT," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s4, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s5, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s6, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT," "addressU = TEXTURE_ADDRESS_MIRROR, addressV = TEXTURE_ADDRESS_MIRROR, addressW = TEXTURE_ADDRESS_MIRROR)," "StaticSampler(s7, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT, borderColor = STATIC_BORDER_COLOR_TRANSPARENT_BLACK," "addressU = TEXTURE_ADDRESS_BORDER, addressV = TEXTURE_ADDRESS_BORDER, addressW = TEXTURE_ADDRESS_BORDER)," "StaticSampler(s8, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR," "addressU = TEXTURE_ADDRESS_MIRROR, addressV = TEXTURE_ADDRESS_MIRROR, addressW = TEXTURE_ADDRESS_MIRROR)," "StaticSampler(s9, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR, borderColor = STATIC_BORDER_COLOR_TRANSPARENT_BLACK," "addressU = TEXTURE_ADDRESS_BORDER, addressV = TEXTURE_ADDRESS_BORDER, addressW = TEXTURE_ADDRESS_BORDER)," "StaticSampler(s10, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 8," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s11, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 8," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s12, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 8," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s13, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 8," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s14, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 2," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s15, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 2," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s16, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 2," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s17, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 2," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_WRAP)" )]
 NUM_THREADS(8, 8, 1)
@@ -1196,7 +1299,7 @@ void CS_MAIN( uint3 DispatchThreadID : SV_DISPATCHTHREADID )
     float wpp;
     if (!aoSurface(px, uv, invScreen, P, N, V, ddxv, ddyv, wpp))
     {
-        Write2D(gAOOut, px,  float4(0.0f, 0.0f, 1.0f, 1.0f) );
+        Write2D(gAOOut, px,  float4(0.0f, 0.0f, 0.0f, 1.0f) );
         return;
     }
 
@@ -1205,9 +1308,14 @@ void CS_MAIN( uint3 DispatchThreadID : SV_DISPATCHTHREADID )
     float stepPx = aoStepPixels(wpp, steps);
     float2 dither = aoDither(px);
     float bias = aoBias();
+    float thick = aoThickness();
 
     float visSum = 0.0f;
     float3 bentSum = float3(0.0f, 0.0f, 0.0f);
+
+
+
+    float3 refSum = float3(0.0f, 0.0f, 0.0f);
 
     for (int s = 0; s < slices; ++s)
     {
@@ -1235,55 +1343,110 @@ void CS_MAIN( uint3 DispatchThreadID : SV_DISPATCHTHREADID )
         float n = atan2(nT, nV);
 
 
-        float cosP = -1.0f;
-        float cosM = -1.0f;
+
+        float base = n -  1.57079632679f ;
+        float binStep =  3.14159265359f  / 32.0f;
+        float toBin = 32.0f /  3.14159265359f ;
+        uint mask = 0u;
+        float occ = 0.0f;
+
         for (int t = 0; t < steps; ++t)
         {
             float off = aoStepOffset(t, stepPx, dither.y);
 
-            int2 sp = aoTap(px, dir, off);
-            float zp = aoLoadZ(sp);
-            if (zp > 0.0f)
+            UNROLL
+            for (int side = 0; side < 2; ++side)
             {
-                float3 ds = aoReconstructWorld((float2(sp) + 0.5f) * invScreen, zp) - P;
-                float dl = max(length(ds), 1e-6f);
-                float3 d = ds / dl;
-                if (dot(d, N) > bias)
-                {
-                    cosP = max(cosP, lerp(-1.0f, dot(d, V), aoFalloffWeight(dl)));
-                }
-            }
+                float2 sdir = (side == 0) ? dir : -dir;
+                float sgn = (side == 0) ? 1.0f : -1.0f;
 
-            int2 sm = aoTap(px, -dir, off);
-            float zm = aoLoadZ(sm);
-            if (zm > 0.0f)
-            {
-                float3 ds = aoReconstructWorld((float2(sm) + 0.5f) * invScreen, zm) - P;
+                int2 sc = aoTap(px, sdir, off);
+                float z = aoLoadZ(sc);
+                if (z <= 0.0f)
+                {
+                    continue;
+                }
+
+                float3 ds = aoReconstructWorld((float2(sc) + 0.5f) * invScreen, z) - P;
                 float dl = max(length(ds), 1e-6f);
                 float3 d = ds / dl;
-                if (dot(d, N) > bias)
+                if (dot(d, N) <= bias)
                 {
-                    cosM = max(cosM, lerp(-1.0f, dot(d, V), aoFalloffWeight(dl)));
+                    continue;
                 }
+                float w = aoFalloffWeight(dl);
+                if (w <= 0.0f)
+                {
+                    continue;
+                }
+
+
+
+
+                float aF = sgn * acos(clamp(dot(d, V), -1.0f, 1.0f));
+                float3 dB = ds - V * thick;
+                float bl = max(length(dB), 1e-6f);
+                float aB = sgn * acos(clamp(dot(dB / bl, V), -1.0f, 1.0f));
+
+                float lo = min(aF, aB);
+                float hi = max(aF, aB);
+
+                uint span = aoBitRange((int)floor((lo - base) * toBin),
+                                        (int)ceil ((hi - base) * toBin));
+                uint fresh = span & (~mask);
+                occ += float(countbits(fresh)) * (1.0f / 32.0f) * w;
+                mask |= span;
             }
         }
 
-        float h1 = acos(clamp(cosP, -1.0f, 1.0f));
-        float h0 = -acos(clamp(cosM, -1.0f, 1.0f));
-        h1 = n + min(h1 - n,  1.57079632679f );
-        h0 = n + max(h0 - n, - 1.57079632679f );
 
-        visSum += projLen * (gtaoInner(h0, n) + gtaoInner(h1, n));
 
-        float bentAngle = 0.5f * (h0 + h1);
-        bentSum += (V * cos(bentAngle) + T * sin(bentAngle)) * projLen;
+        float fullArc = gtaoArc(base, base +  3.14159265359f , n);
+        float openArc = 0.0f;
+        float3 bentDir = float3(0.0f, 0.0f, 0.0f);
+        uint open = ~mask;
+        uint runLo, runLen;
+
+        for (int r = 0; r < 16; ++r)
+        {
+            if (!aoNextRun(open, runLo, runLen))
+            {
+                break;
+            }
+            float a0 = base + float(runLo) * binStep;
+            float a1 = base + float(runLo + runLen) * binStep;
+            float arc = gtaoArc(a0, a1, n);
+            openArc += arc;
+
+
+
+            float mid = 0.5f * (a0 + a1);
+            bentDir += (V * cos(mid) + T * sin(mid)) * arc;
+        }
+
+
+
+
+
+
+        float closedRaw = float(countbits(mask)) * (1.0f / 32.0f);
+        float k = (closedRaw > 1e-6f) ? saturate(occ / closedRaw) : 0.0f;
+        float visSlice = openArc + (1.0f - k) * max(fullArc - openArc, 0.0f);
+
+        visSum += projLen * visSlice;
+        bentSum += bentDir * projLen;
+
+
+
+
+        refSum += (V * nV + T * nT) * fullArc;
     }
 
 
 
 
     float vis = saturate(visSum / float(slices));
-    Write2D(gAOOut, px, aoResolve(1.0f - vis, bentSum, N));
+    Write2D(gAOOut, px, aoResolve(1.0f - vis, bentSum, refSum, N));
     return;
 }
 #line 286 "FSL/shaders.list"

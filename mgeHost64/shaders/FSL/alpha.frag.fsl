@@ -88,7 +88,18 @@ float4 PS_MAIN( VSOutput In )
     float2 aoUv     = In.Position.xy * gShadowParams.screenAlloc.zw;   // gAO is ALLOC-sized, not render-sized
     float4 aoSample = inReflect ? float4(0.0f, 0.0f, 0.0f, 1.0f)       // AO = 1 (no darkening), bent-N unused
                                 : SampleTex2D(gAO, gSamplerAnisotropic, aoUv);
-    if ((aoFlags & 2u) != 0u && !inReflect) { N = normalize(aoSample.rgb); }
+    // NO bent-normal bend here, deliberately — this pass has no valid bend to read. gAO is built
+    // from the Z-PREPASS depth, and alpha sheets are not in that prepass: the only alpha depth-write
+    // is AT1's near-opaque fold fix, which happens inside the ALPHA phase, long after both the
+    // prepass and the colour pass. So aoSample at this pixel describes whatever OPAQUE surface is
+    // BEHIND the sheet. A sheet cannot be handed a screen-space normal term that was never computed
+    // for it.
+    //
+    // aoSample.a is not used for AMBIENT either any more — see the ambient block below. The
+    // borrowed scalar was kept once as "an approximation" where the borrowed normal was "simply
+    // wrong", but both come from the surface behind and both are visible on the sheet. (If alpha
+    // ever earns a real prepass entry, both become wireable — copy opaque.frag's
+    // `normalize(N * gAO.a + gAO.rgb)` and restore the ambient multiply.)
 
     // Two-sided LIGHTING (the "normal trick"). A DRAW_BOTH sheet's far face is UNLIT under a one-
     // sided N.L, so a point-light shadow landing on it can't be SEEN — the light contributes 0 there,
@@ -115,7 +126,18 @@ float4 PS_MAIN( VSOutput In )
     // SH1 sky-directional ambient — geometric normal, not the possibly-bent N (see skyamb.h.fsl).
     float3 a = ((aoFlags & 4u) != 0u) ? float3(1.0f, 1.0f, 1.0f)
                                       : gFrameData.ambCol.rgb * skyAmbFactor(In.Normal, In.WorldPos);
-    if ((aoFlags & 1u) != 0u) { a *= aoSample.a; }
+    // NO AO on the ambient either — the same argument as the bent normal above, carried to its
+    // conclusion. gAO is built from the Z-prepass and alpha sheets are not in it, so aoSample at
+    // this pixel is the OPAQUE SURFACE BEHIND the sheet. Multiplying by it does not darken the
+    // sheet's own creases (it has none in that buffer); it stamps the wall's occlusion onto a
+    // transparent surface floating in front of it, which reads as AO sliding across the sheet as
+    // the camera moves. A borrowed scalar looked defensible while it was the only AO alpha could
+    // get, but it is wrong for the same reason the borrowed normal was, and it is visible.
+    //
+    // Ambient on sheets is therefore unoccluded. That is the honest answer until alpha earns a real
+    // prepass entry; at that point restore this as `a *= aoSample.a;` alongside opaque.frag's bend.
+    // aoSample stays sampled above — the F12 AO views (dbg 3/4) still read it, so the buffer can be
+    // inspected on a sheet even though it no longer shades one.
     a *= gFrameData.dbgScales.x;
 
     // Tier 3a point lights — same evalOnePointLight loop as opaque.frag.
@@ -240,7 +262,12 @@ float4 PS_MAIN( VSOutput In )
     // F12 debug views (opaque.frag's, alpha forced 1 so the view reads clearly).
     uint dbg = (uint)(gFrameData.debugParams.x + 0.5f);
     if (dbg == 3u || dbg == 4u) {
-        if (dbg == 4u) { RETURN(float4(aoSample.rgb, 1.0f)); }
+        // mode 4: the gAO bend term, remapped *0.5+0.5 so zero reads as mid grey. It is not a
+        // normal (aocommon.h.fsl): it runs from EXACTLY zero where nothing occludes to the
+        // absolute bent direction where everything does. So flat mid grey == "no bend here",
+        // and it must be flat on an OPEN surface — any 4x4 dither-tile texture there means the
+        // quadrature reference is not cancelling. Cavities legitimately read as a normal map.
+        if (dbg == 4u) { RETURN(float4(aoSample.rgb * 0.5f + 0.5f, 1.0f)); }
         float v = aoSample.a; RETURN(float4(v, v, v, 1.0f));
     }
     if (dbg == 5u) { RETURN(float4(albedo.rgb, 1.0f)); }

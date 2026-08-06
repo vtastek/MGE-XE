@@ -1,0 +1,35 @@
+// mgeHost64 — half-res AO chain, step 1: depth downsample (full -> half).
+//
+// One thread per HALF-res texel; reads the 2x2 full-res block and keeps the MAX. See
+// aodepthdown.srt.h for why max and not min or average — reverse-Z makes the closest surface the
+// largest value, and this is the one line in the half-res chain whose sign error would read as a
+// tuning problem ("AO got weaker") rather than as a bug.
+//
+// Clamped to the FULL-res rect: the half texture is allocated at half of allocWidth/allocHeight
+// so a render-scale change needs no reallocation, but only the live w/h holds this frame's depth.
+
+#include "aodepthdown.srt.h"
+
+ROOT_SIGNATURE(ComputeRootSignature)
+NUM_THREADS(8, 8, 1)
+void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
+{
+    INIT_MAIN;
+    int2 px    = int2(DispatchThreadID.xy);
+    int2 halfD = int2(gAODownParams.halfDims.xy);
+    int2 fullD = int2(gAODownParams.fullDims.xy);
+    if (px.x >= halfD.x || px.y >= halfD.y)
+    {
+        RETURN();
+    }
+
+    int2 f  = px * 2;
+    int2 hi = fullD - int2(1, 1);
+    float z0 = LoadTex2D(gAODownDepthIn, NO_SAMPLER, min(f + int2(0, 0), hi), 0).r;
+    float z1 = LoadTex2D(gAODownDepthIn, NO_SAMPLER, min(f + int2(1, 0), hi), 0).r;
+    float z2 = LoadTex2D(gAODownDepthIn, NO_SAMPLER, min(f + int2(0, 1), hi), 0).r;
+    float z3 = LoadTex2D(gAODownDepthIn, NO_SAMPLER, min(f + int2(1, 1), hi), 0).r;
+
+    Write2D(gAODownDepthOut, px, max(max(z0, z1), max(z2, z3)));
+    RETURN();
+}

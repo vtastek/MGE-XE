@@ -26,8 +26,37 @@
 //     accumulator rejects taps that do not rise above the tangent plane by aoBias(), so a plane
 //     self-occludes at no angle — no matcap, no grazing blackening.
 //
-// Output contract (unchanged, all four modes): float4(bentNormalWS, visibility) into gAOOut, where
-// 1 = fully open and 0 = cavity. aoblur.comp then bilaterally denoises it into the frags' gAO.
+// Output contract (all four modes): float4(bendWS, visibility) into gAOOut, where visibility 1 =
+// fully open and 0 = cavity. aoblur.comp then bilaterally denoises it into the frags' gAO.
+//
+// rgb is neither the bent normal nor a plain deviation from it. It is
+//
+//     rgb = bentDirection - vis * Nq          (Nq = THIS pass's normal, vis = what lands in .a)
+//
+// and a consumer reconstructs the bent normal as `normalize(itsOwnNormal * gAO.a + gAO.rgb)`.
+//
+// The reason for the vis weight is that the two ends of this buffer do not agree about the surface
+// normal, and the disagreement matters by a different amount depending on how occluded the pixel is:
+//
+//   * Fully OPEN (vis -> 1). The bent normal IS the surface normal, and the honest one is the
+//     CONSUMER's. This pass's normal comes from depth (`cross(ddxv, ddyv)` in aoSurface), so it is
+//     the FLAT per-triangle normal, while the frags shade with a SMOOTH interpolated vertex normal:
+//     hand them an absolute direction built on the flat one and every smooth-shaded low-poly barrel,
+//     column and rock gains its polygons. Here rgb is EXACTLY zero, so the consumer's own normal
+//     survives bit for bit at any strength.
+//
+//   * Fully OCCLUDED (vis -> 0). The bent normal is set by the OCCLUDERS, not by the surface, and
+//     the measured direction is the honest one. rgb is that absolute direction with Nq dropped out
+//     of it entirely — which is what makes a concave corner work. Inside an L both walls see the
+//     same open quarter-space, so the bent direction is CONTINUOUS across the crease while the
+//     surface normal jumps 90 degrees. Anything that carries the surface normal across this buffer
+//     (a plain deviation did) turns that jump into a hard aliased line down the corner, and lets the
+//     blur average the two walls' incompatible bases into a corner that reads SHARPER, not softer.
+//
+// So the representation interpolates between "trust the vertex normal" and "trust the measurement"
+// on exactly the term that says which of the two to trust. In between, the reconstruction is exact
+// wherever the consumer's normal agrees with ours and degrades as vis * |theirs - ours| where it
+// does not — worst at vis 0.5, zero at both ends.
 
 #ifndef AO_COMMON_H
 #define AO_COMMON_H
@@ -35,8 +64,11 @@
 #define AO_PI       3.14159265359f
 #define AO_HALF_PI  1.57079632679f
 
-// Sky / no geometry (reverse-Z far or cleared = 0): fully open, bent normal irrelevant.
-#define AO_SKY_RESULT float4(0.0f, 0.0f, 1.0f, 1.0f)
+// Sky / no geometry (reverse-Z far or cleared = 0): fully open, ZERO bend. Under the contract above
+// a consumer reads this as normalize(itsNormal * 1 + 0) = its own normal, untouched.
+// rgb was (0,0,1) back when it held an absolute normal, and an absolute world axis sitting in the
+// buffer snapped sky-backed surfaces to world-up wherever anything sampled a sky texel.
+#define AO_SKY_RESULT float4(0.0f, 0.0f, 0.0f, 1.0f)
 
 // ---- knobs ---------------------------------------------------------------------------------
 // The slice/step/thickness lanes ride float4s the AO pass would otherwise waste: eyePos.w and
@@ -49,6 +81,14 @@ float aoBias()      { return gAOParams.aoParams.w; }   // sin of the minimum ele
 int   aoSlices()    { return (int)clamp(gAOParams.eyePos.w,      1.0f,  8.0f); }
 int   aoSteps()     { return (int)clamp(gAOParams.sliceParams.z, 1.0f, 16.0f); }
 float aoThickness() { return max(gAOParams.sliceParams.w, 0.0f); }  // world u, bitmask modes only
+// Bent-normal strength. Rotates the measured bend AWAY FROM THE QUADRATURE REFERENCE (aoResolve),
+// so "nothing occluded" is a fixed point at every setting and the open-surface guarantee above
+// cannot be tuned away. It lives in the AO cbuffer rather than in FrameData because FrameData is
+// exactly 512 B against a 512 B CBV — and because it wants to be a LIVE slider: the frags' old
+// compile-time AO_BENT_INTENSITY needed a host restart to retune, since graphics shaders do not
+// hot-reload. An unwritten lane reads 0; take that as 1 so a hot-reload against an older host does
+// not silently flatten the bend to nothing.
+float aoBentStrength() { float s = gAOParams.aoParams2.x; return (s > 0.0f) ? s : 1.0f; }
 
 // ---- depth / world -------------------------------------------------------------------------
 float3 aoReconstructWorld(float2 uv, float deviceZ)
@@ -65,18 +105,112 @@ float aoLoadZ(int2 c)
 }
 
 // ---- dither --------------------------------------------------------------------------------
-// 4x4 spatial pattern (Activision GTAO): 16 distinct slice rotations and 4 step offsets per tile,
-// laid out so no two horizontal neighbours share a rotation. That last property is what kills the
-// screen-aligned streaks: with a rotation that is constant along a row, a slice can land ON the
-// scanline, and then a pixel's whole horizon comes from its own row while the rows above and below
-// disagree — a 1px-tall, screen-axis-aligned line. The 7x7 bilateral blur downstream is wide
-// enough to resolve a 4x4 pattern.
 //   x = slice rotation [0,1)   y = step offset [0,1)
-float2 aoDither(int2 px)
+//
+// LEGACY: the 4x4 Activision GTAO tile. 16 slice rotations and 4 step offsets, laid out so no two
+// horizontal neighbours share a rotation — which is what kills screen-aligned streaks, because a
+// rotation that is constant along a row lets a slice land ON the scanline, and then a pixel's whole
+// horizon comes from its own row while the rows above and below disagree.
+//
+// It buys that with a DIAGONAL, and nobody wrote that part down. `off` is a pure function of
+// (y - x), so it is constant along every +45 degree diagonal at period 4; `rot`'s HIGH bits come
+// from (x + y) & 3 and are constant along the anti-diagonals — and those are the bits that matter,
+// moving rot by 0.25 a step where (x & 3) moves it by at most 0.19. The energy has to go somewhere,
+// and it went onto the diagonals, which is exactly how it reads on screen. It is also screen-locked
+// with NO temporal axis: a fixed pattern at a standstill, and it beats against slow motion.
+float2 aoDitherTile(int2 px)
 {
     float rot = (1.0f / 16.0f) * float((((px.x + px.y) & 3) << 2) + (px.x & 3));
     float off = (1.0f /  4.0f) * float((px.y - px.x) & 3);
     return float2(rot, off);
+}
+
+// SPATIOTEMPORAL BLUE NOISE (Wolfe et al., EGSR 2022) — the default. gStbn is a 64 x (64*16) R8G8
+// atlas of 16 time slices; R drives the rotation, G the step offset, generated from independent
+// seeds so the two are uncorrelated. Blue over SPACE within a slice (no diagonal, nothing the eye
+// locks onto, and the residual sits at high frequency where the bilateral eats it) AND blue over
+// TIME along each pixel's 16-frame column.
+//
+// Both axes earn their keep, on different motion:
+//   * CAMERA MOVING — a surface point lands on a different pixel each frame, so what it walks is the
+//     SPATIAL mask at a moving location. Blue there means that walk is well distributed however the
+//     camera moves. The 4x4 tile fails this by beating against its own 4-period diagonal.
+//   * NOTHING MOVING, or moving SLOWLY — a surface point sits on one pixel or crawls across a few,
+//     so only the TIME axis can decorrelate it and a spatial-only mask is as frozen as the tile.
+//     That is the case a walking NPC or swaying grass lives in: too slow for motion to reshuffle the
+//     spatial mask, so the temporal column does all the work. It is the worst case for this pass and
+//     the reason the mask is spatioTEMPORAL rather than merely a better tile.
+// Toroidal on all three axes, so neither the screen tiling nor the frame wrap seams.
+float2 aoDitherStbn(int2 px, int slice)
+{
+    int2 t = int2(px.x & 63, (px.y & 63) + 64 * (slice & 15));
+    return LoadTex2D(gStbn, NO_SAMPLER, t, 0).rg;
+}
+
+// aoParams2.w packs both the choice and the phase: < 0 = the legacy tile, >= 0 = STBN at that time
+// slice. One lane, because it is one question — which phase of what pattern. A slice the host never
+// advances is therefore spatial-only STBN, the useful middle rung: it fixes the diagonal without
+// introducing any per-frame change at all, for when the temporal axis is the thing under suspicion.
+float2 aoDither(int2 px)
+{
+    float sel = gAOParams.aoParams2.w;
+    if (sel < 0.0f)
+    {
+        return aoDitherTile(px);
+    }
+    return aoDitherStbn(px, (int)(sel + 0.5f));
+}
+
+// ---- neighbour selection -------------------------------------------------------------------
+// Pick the world-space gap that belongs to THIS surface out of the two one-sided neighbour deltas.
+//
+// Min-difference — take the shorter gap — is the right rule at a SILHOUETTE, where the far neighbour
+// is orders of magnitude further away and would otherwise tilt the normal clean off the surface. It
+// has nothing to say at a CREASE: an inside corner is continuous in depth, so both neighbours are
+// about equidistant, the winner is decided by float noise, and the normal COIN-FLIPS between the two
+// walls along a 1 px band. That band is where the bent normal reads as an aliased line down the
+// corner, because rgb is expressed against this very normal.
+//
+// So blend rather than choose, on the RATIO of the two gaps: a tie takes the central difference, a
+// 2x or worse gap takes the shorter one exactly as before. Two facts make that safe:
+//   * on a PLANE both deltas lie in the plane, so any blend of them spans the same plane and the
+//     normal is unchanged at every ratio — including the ratio a grazing plane's perspective
+//     foreshortening produces, which is the case that would otherwise argue for a tighter threshold;
+//   * a silhouette's ratio is in the hundreds, so it still hard-picks.
+// At a crease the central difference gives the average of the two facets, which is continuous across
+// the band AND closer to the smooth vertex normal the consumers shade with.
+//
+// Known limit: a corner between a face-on wall and a grazing floor has a large ratio for a reason
+// that is not a silhouette, so the band there still hard-picks the face-on facet. Deterministic
+// rather than dithered, so it reads as 1 px of slightly wrong shading instead of noise.
+float3 aoMinDiff(float3 dr, float3 dl)
+{
+    float lr = dot(dr, dr);
+    float ll = dot(dl, dl);
+    float hi = max(lr, ll);
+    float lo = max(min(lr, ll), 1e-12f);
+    // Squared ratio, so /3 puts full min-difference at a 2x LENGTH ratio.
+    float t  = saturate((hi / lo - 1.0f) * (1.0f / 3.0f));
+    return lerp(0.5f * (dr + dl), (lr < ll) ? dr : dl, t);
+}
+
+// Bilateral weight a Euclidean range weight cannot supply: how far a tap sits OUT of the centre's
+// tangent plane, measured as a SINE so it is scale-free. It fires on a crease — where depth is
+// continuous and a distance test never fires at all — and stays quiet on a plane at any grazing
+// angle, where every neighbour is IN the plane no matter how far the depth ran away.
+//   nC      unit centre normal        dw   tap world position - centre world position
+//   minLen  floor on |dw| (pass the centre's world-units-per-pixel): a sub-pixel dw is depth
+//           quantisation, and dividing by it turns that quantisation into random rejection
+//   sigma   sine tolerance; <= 0 disables the test — which is both the A/B and the safe reading of
+//           an unwritten cbuffer lane
+float aoPlaneWeight(float3 nC, float3 dw, float minLen, float sigma)
+{
+    if (sigma <= 0.0f)
+    {
+        return 1.0f;
+    }
+    float sn = abs(dot(nC, dw)) / max(length(dw), minLen);
+    return exp(-(sn * sn) / (2.0f * sigma * sigma));
 }
 
 // ---- surface -------------------------------------------------------------------------------
@@ -114,13 +248,14 @@ bool aoSurface(int2 px, float2 uv, float2 invScreen,
     float3 Pd = aoReconstructWorld(uv - float2(0.0f, invScreen.y), aoLoadZ(px - int2(0, 1)));
 
     // Min-difference neighbours: the SMALLER world gap is the one on this surface, so a silhouette
-    // neighbour can never tilt the normal.
+    // neighbour can never tilt the normal. Softened at a tie, where the rule is arbitrary and a hard
+    // pick coin-flips the normal along every crease — see aoMinDiff.
     float3 dxr = Pr - P;
     float3 dxl = P - Pl;
-    ddxv = (dot(dxr, dxr) < dot(dxl, dxl)) ? dxr : dxl;
+    ddxv = aoMinDiff(dxr, dxl);
     float3 dyr = Pu - P;
     float3 dyl = P - Pd;
-    ddyv = (dot(dyr, dyr) < dot(dyl, dyl)) ? dyr : dyl;
+    ddyv = aoMinDiff(dyr, dyl);
     N = normalize(cross(ddxv, ddyv));
     if (dot(N, V) < 0.0f)
     {
@@ -170,7 +305,7 @@ float aoFalloffWeight(float dl)
     return saturate(1.0f - dl / aoFalloff());
 }
 
-// ---- bitmask helper (vbao / ssaofast) --------------------------------------------------------
+// ---- bitmask helper (gtao / vbao / ssaofast) -------------------------------------------------
 // Bits [b0, b1) of a 32-bit hemisphere occupancy mask. Clamped, and count == 32 is special-cased
 // because a shift of 32 is masked to 0 by the hardware (1u << 32 == 1u, not 0).
 uint aoBitRange(int b0, int b1)
@@ -189,23 +324,102 @@ uint aoBitRange(int b0, int b1)
     return ((1u << count) - 1u) << uint(b0);
 }
 
+// Pop the LOWEST run of consecutive set bits out of `open`: its start bin in lo, its length in
+// len, and the run cleared from `open`. Returns false when nothing is left, so the caller drives
+// it as a loop. Used to walk the OPEN (unoccluded) intervals of a hemisphere occupancy mask —
+// typically 1-3 of them, which is why integrating runs beats iterating 32 bins.
+bool aoNextRun(inout(uint) open, out(uint) lo, out(uint) len)
+{
+    lo  = 0u;
+    len = 0u;
+    if (open == 0u)
+    {
+        return false;
+    }
+    lo = firstbitlow(open);
+    // Run length = index of the first CLEAR bit of the shifted mask. firstbitlow(0) is UNDEFINED,
+    // and the shift leaves ~shifted == 0 in exactly one case: open was all ones (so lo == 0 and the
+    // run is the whole 32 bins). Every other case has zero high bits after the shift, so the
+    // complement is non-zero and firstbitlow is well defined.
+    uint inv = ~(open >> lo);
+    len = (inv == 0u) ? 32u : firstbitlow(inv);
+    open = open & (~aoBitRange((int)lo, (int)(lo + len)));
+    return true;
+}
+
+// ---- GTAO arc integral -----------------------------------------------------------------------
+// Antiderivative of cos(theta - n) * |sin theta| anchored at theta = 0, where n is the in-slice
+// normal angle. inner(0, n) == 0, and because of the |sin| the function is "distance from 0"
+// flavoured on BOTH sides: for a >= 0 it measures [0, a], for a <= 0 it measures [a, 0]. That is
+// what lets the two horizon sides of classic GTAO simply be SUMMED.
+float gtaoInner(float h, float n)
+{
+    return 0.25f * (-cos(2.0f * h - n) + cos(n) + 2.0f * h * sin(n));
+}
+
+// Cosine-weighted visible measure of ONE angular interval [a, b] (a <= b), in the same units as
+// the classic two-horizon form. Because inner() is anchored at 0 on both sides, an interval that
+// STRADDLES zero sums its two halves while one that does not differences them. Getting that case
+// wrong stays plausible on screen and only breaks view-independence at particular normal
+// orientations, so it is the one line here worth re-deriving before trusting.
+float gtaoArc(float a, float b, float n)
+{
+    if (a >= 0.0f)
+    {
+        return gtaoInner(b, n) - gtaoInner(a, n);
+    }
+    if (b <= 0.0f)
+    {
+        return gtaoInner(a, n) - gtaoInner(b, n);
+    }
+    return gtaoInner(a, n) + gtaoInner(b, n);
+}
+
 // ---- resolve -------------------------------------------------------------------------------
-// Shared tail: intensity, the visibility clamp, and the bent-normal guard. Every mode ends here so
-// that "AO enable OFF, bent normal ON" can never hand the colour frag a degenerate normal —
-// opaque.frag does N = normalize(aoSample.rgb) and SHADES with it, so garbage there reads as BLACK,
-// not as dimming.
-float4 aoResolve(float occ, float3 bentSum, float3 N)
+// Shared tail: intensity, the visibility clamp, the strength knob and the below-surface guard. Every
+// mode ends here so that "AO enable OFF, bent normal ON" can never hand the colour frag a degenerate
+// normal.
+//
+//   occ      the mode's occlusion, 0 open .. 1 sealed
+//   bentSum  its accumulated bent direction, unnormalised
+//   refSum   what bentSum WOULD have been with nothing occluding — the SAME slices, the same
+//            per-pixel dither, the same per-slice weights, run against a fully open hemisphere
+//   N        the surface normal from aoSurface
+//
+// refSum is what makes this exact rather than approximate. Normalised it is the surface normal AS
+// THE QUADRATURE SEES IT: N to within the residual that 3 dithered slices leave, and that residual
+// is a 4x4 tile-shaped wobble which is LARGEST where nothing occludes. Referencing the bend against
+// it instead of against N makes the wobble CANCEL — the two carry it identically — so a fully open
+// surface lands on exactly zero bend at any slice count.
+//
+// The previous version had no reference and damped the entire bend by visibility to hide that same
+// residual. It worked, and it cost half the bend on every corner: at an inside corner vis is ~0.5,
+// so the one place with the most to say about the bent normal said it at half volume. That is gone;
+// the corner now ships its measured direction at full strength.
+float4 aoResolve(float occ, float3 bentSum, float3 refSum, float3 N)
 {
     float vis = saturate(1.0f - saturate(occ) * aoIntensity());
 
-    float3 bn = bentSum + N * 1e-3f;
-    float  l2 = dot(bn, bn);
-    bn = (l2 > 1e-12f) ? (bn * rsqrt(l2)) : N;
+    float  q2 = dot(refSum, refSum);
+    float3 nq = (q2 > 1e-12f) ? (refSum * rsqrt(q2)) : N;
+    float  b2 = dot(bentSum, bentSum);
+    float3 bn = (b2 > 1e-12f) ? (bentSum * rsqrt(b2)) : nq;
+
+    // Strength rotates the bend away FROM THE REFERENCE, not from an arbitrary axis, so bn == nq
+    // (nothing occluding) is a fixed point at every setting.
+    float3 bs = nq + (bn - nq) * aoBentStrength();
+    float  s2 = dot(bs, bs);
+    bn = (s2 > 1e-12f) ? (bs * rsqrt(s2)) : nq;
     if (dot(bn, N) <= 0.0f)
     {
-        bn = N;   // never hand back a normal facing INTO the surface
+        bn = N;   // never hand back a direction facing INTO the surface
     }
-    return float4(bn, vis);
+
+    // The contract at the top of this file. vis == 1 with nothing occluding, and there bn == nq
+    // exactly, so this is EXACTLY zero and the consumer's own normal survives untouched. vis == 0 in
+    // a cavity leaves the absolute bent direction with our normal subtracted out of it entirely,
+    // which is what survives a concave crease and the blur that runs across one.
+    return float4(bn - vis * nq, vis);
 }
 
 #endif // AO_COMMON_H

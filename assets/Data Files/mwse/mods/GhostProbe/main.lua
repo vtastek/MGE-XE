@@ -36,12 +36,34 @@
 --   disableAfter  real seconds after load before disabling (0 = off).
 --   disableId     reference ID to disable; empty = pick the nearest enabled NPC in the cell.
 
+-- DEATH WATCH (`deathWatch`): the THIRD way a reference leaves the world, after "already disabled at
+-- load" and "disabled after capture". Some creatures do not leave a corpse — a dwarven specter dies
+-- and the body is replaced by an ectoplasm pile. Reported 2026-08-01: the host goes on drawing the
+-- body's last pose PERMANENTLY (cell re-entry is the only thing that clears it, i.e. purgeAll), while
+-- the ectoplasm captures fine. Permanent is the tell — a creature is a Mover, so it is re-emitted
+-- from the cache every frame independent of the engine's visible set, and only an eviction verdict
+-- can ever retire it. So the sweep is looking at the body and concluding it is still alive.
+--
+-- The question this answers is exactly the one the disable bug turned on, one bit over: when the
+-- engine removes that body, what does it leave behind? MGE reads the Disabled bit (0x800). There is
+-- also a Delete bit (0x20, MWSE/TES3Object.h:100) which MGE tests NOWHERE, and `deleted`/`disabled`
+-- are independent flags. Three outcomes, three different fixes:
+--   deleted=true, node still parented   -> a verdict hole; the sweep needs to ask about Delete too.
+--   node detached / no scene node       -> NOT a hole; the sweep should already say gone, so the bug
+--                                          is upstream (the entry is being kept by something else).
+--   neither, body simply still there    -> the engine keeps it and MW hides it some other way; the
+--                                          whole premise is wrong and this is not an eviction bug.
+-- The climb below deliberately mirrors the sweep's own parent climb, so its verdict is directly
+-- comparable to `[evict] byDetach=`/`byDisabled=` in mgeXE.log rather than merely suggestive.
+
 local defaults = {
     enabled = false,
     frames = 12,
     watch = { "TR_m3_FlyingChair_01", "TR_m3_SittingChair_01" },
     disableAfter = 0,
     disableId = "",
+    deathWatch = false,
+    deathFrames = 240,
 }
 
 local cfg = mwse.loadConfig("GhostProbe", defaults)
@@ -139,6 +161,80 @@ local function runDisableTest()
     })
 end
 
+-- Mirror of the eviction sweep's parentVerdict climb (scenegraph_geometry_cache.cpp): walk parentNode
+-- up to the depth cap and report where it ended. MGE evicts on "chain ended without reaching a known
+-- root"; it keeps on "reached g_objRoot". We cannot name MGE's roots from Lua, so report the SHAPE of
+-- the chain — depth reached and whether it terminated in nil — which is the same discriminator.
+local kMaxParentDepth = 32
+local function climb(node)
+    if not node then return "(no node)" end
+    local p = node.parent
+    if not p then return "detached(depth0)" end
+    for depth = 1, kMaxParentDepth do
+        local next = p.parent
+        if not next then
+            -- Terminated. A chain ending at the world root is normal and means REACHABLE; MGE
+            -- distinguishes them by root identity, which is why the top node's name is printed.
+            return string.format("ends depth=%d top='%s' culled=%s",
+                depth, p.name or "(unnamed)", tostring(p.appCulled))
+        end
+        p = next
+    end
+    return "depth-capped"
+end
+
+-- Latched at death: the REFERENCE only, never its scene node. MWSE hands out NI objects as raw
+-- pointers without taking a reference, so a node held across frames is a use-after-free the moment the
+-- engine releases the body — which is precisely the event being measured, so the crash would be
+-- reliable rather than rare. Re-read ref.sceneNode every sample instead: "it went nil" is one of the
+-- three answers anyway, so nothing is lost. (MW keeps deleted references in the cell list until the
+-- cell unloads, so the reference itself stays addressable.)
+local deathWatch = nil
+
+local function deathSample(tag)
+    local w = deathWatch
+    if not w then return end
+    local ref = w.ref
+    local node = ref and ref.sceneNode or nil
+    log("%s %-24s deleted=%-5s disabled=%-5s sceneNode=%-4s parent=%-5s appCulled=%-5s climb=%s",
+        tag, w.id,
+        ref and tostring(ref.deleted) or "?",
+        ref and tostring(ref.disabled) or "?",
+        node and "yes" or "nil",
+        node and tostring(node.parent ~= nil) or "-",
+        node and tostring(node.appCulled) or "-",
+        node and climb(node) or "(no node)")
+end
+
+local function onDeathSimulate()
+    local w = deathWatch
+    if not w then return end
+    -- Every frame while it matters, then thin out: the interesting transition is within a second or
+    -- two of death, but the whole point is that this state PERSISTS, so keep sampling long enough to
+    -- outlast several 30-frame eviction sweeps and prove it never changes.
+    w.frame = w.frame + 1
+    if w.frame <= 30 or (w.frame % 30) == 0 then
+        deathSample(string.format("death+%-3d", w.frame))
+    end
+    if w.frame >= cfg.deathFrames then
+        event.unregister("simulate", onDeathSimulate)
+        deathSample("death-END")
+        log("death watch done after %d frames - compare with [evict] in mgeXE.log", w.frame)
+        deathWatch = nil
+    end
+end
+
+local function onDeath(e)
+    if not cfg.deathWatch or deathWatch then return end   -- first death only; one clean trace
+    local ref = e.reference
+    if not ref or not ref.sceneNode then return end
+    deathWatch = { ref = ref, id = ref.id, frame = 0 }
+    log("DEATH '%s' base=%s - watching %d frames",
+        ref.id, ref.baseObject and ref.baseObject.id or "?", cfg.deathFrames)
+    deathSample("death+0  ")
+    event.register("simulate", onDeathSimulate)
+end
+
 local function onLoaded()
     if not cfg.enabled then
         log("disabled (enabled=false)")
@@ -162,3 +258,6 @@ local function onLoaded()
 end
 
 event.register("loaded", onLoaded)
+-- Registered unconditionally; onDeath itself gates on cfg.deathWatch, so toggling the config does not
+-- depend on having reloaded the save since.
+event.register("death", onDeath)
