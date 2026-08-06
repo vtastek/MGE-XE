@@ -8491,6 +8491,18 @@ namespace {
     // far, and raise it first if half res ever looks blocky rather than blaming the AO.
     float    g_aoUpSigma    = 1.0f;   // upscale range sigma, WORLD units (same form as the blur's)
 
+    // --- Alpha-to-coverage (a2c.h.fsl) -----------------------------------------------------------
+    // MSAA antialiases geometric edges only — the pixel shader runs once per pixel, so a `discard`
+    // cutout (foliage, grates, fences) stays hard-aliased however many samples the target has. A2C
+    // turns the cutout's fractional alpha into a per-sample coverage mask, which is the only thing
+    // that antialiases an alpha test. MGE's DX9 path already did this (XE Common.fx::calc_coverage);
+    // the Forge port dropped it, and statics.frag has carried the gap as a comment ever since.
+    //
+    // Publishes into gFrameData.alphaShadowParams.w (see the fill). Off ⇒ every participating frag
+    // takes a2cCoverageMask's exact-parity path, so this is a true A/B and not an approximation of
+    // one. Inert at sampleCount == 1.
+    bool     g_alphaToCoverage = true;
+
     // --- Custom MSAA resolve (tasks/forge-postprocess.md step 4) ---------------------------------
     // Ticking this off falls back to cl->ResolveSubresource, so the whole feature is a LIVE A/B in
     // one build against the 0.14-0.18 ms fixed-function baseline — which matters because the tap
@@ -9213,6 +9225,10 @@ namespace {
         // which is how the cost gets measured honestly: watch `resolve` in the gpu split across the
         // toggle and across the diameter, on one frame, in one session.
         { TabBuilder t; t.panel = g_uiPanel; t.name = "Resolve (MSAA)";
+          // A2C lives here rather than under "Alpha" because that tab is the SORTED-ALPHA (blended)
+          // takeover, and A2C is the opposite case: alpha-TESTED cutouts, which are opaque geometry.
+          // Both knobs on this tab only do anything when MSAA is on.
+          t.checkbox("Alpha-to-coverage (antialiased cutouts: foliage/grates)", &g_alphaToCoverage);
           t.checkbox("Custom resolve (off = hardware ResolveSubresource)", &g_customResolve);
           t.sliderF("Filter diameter (px; 6 = 7x7, 4 = 5x5, 2 = 3x3)", &g_resolveDiameter, 1.0f, 6.0f, 0.5f);
           t.checkbox("Inverse-luminance firefly weighting", &g_resolveInvLuma);
@@ -10616,6 +10632,16 @@ namespace ForgeRender {
             // the ARM camera and are not in the world Z-prepass at all, so every gAO texel under them
             // belongs to whatever the world put behind them.
             dp[126] = 0.0f;
+            // alphaShadowParams.w (float index 127): ALPHA-TO-COVERAGE — the MSAA sample count when
+            // A2C is on, 0 when it is off. ONE lane carrying both the switch and the count, because
+            // this is the LAST spare component of a FrameData that is exactly 512 B against a 512 B
+            // CBV. The count cannot be a compile-time #define the way resolve.frag's is: these frags
+            // are shared by every pass and are built once.
+            //
+            // Only meaningful at sampleCount > 1 — a single-sample target has one coverage bit, so
+            // a mask is a boolean and A2C degenerates to the alpha test it replaces. Publishing 0
+            // there keeps a2cCoverageMask on its exact-parity path.
+            dp[127] = (g_alphaToCoverage && g_live.sampleCount > 1) ? (float)g_live.sampleCount : 0.0f;
         }
 
         // Tier 3a: upload this frame's point lights into gLights. Each PointLightWire is exactly

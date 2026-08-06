@@ -11,6 +11,7 @@
 
 #include "opaque.srt.h"
 #include "texsample.h.fsl"   // sampleBase() — MW address mode + AF level
+#include "a2c.h.fsl"         // a2cCoverageMask() — SHARED cutout coverage (prepass/colour parity)
 
 STRUCT(VSOutput)
 {
@@ -30,8 +31,14 @@ STRUCT(VSOutput)
     DATA(FLAT(uint),  Packed,     TEXCOORD10);
 };
 
+// SV_Coverage, no SV_Target — the pipeline still binds mRenderTargetCount = 0. See depthonly.frag.
+STRUCT(PSOut)
+{
+    DATA(uint, Coverage, SV_Coverage);
+};
+
 ROOT_SIGNATURE(DefaultRootSignature)
-void PS_MAIN( VSOutput In )
+PSOut PS_MAIN( VSOutput In )
 {
     INIT_MAIN;
     uint  stageCount = In.Packed & 0x7u;
@@ -55,6 +62,12 @@ void PS_MAIN( VSOutput In )
             baseA = sampleBase(tex, clampMode, uv, useLowAF(alphaRef, false)).a;
         }
     }
-    clip(baseA < alphaRef ? -1.0f : 1.0f);
-    RETURN();
+    // Alpha-to-coverage: same shared mask multimap.frag's discard consults, so the pair cannot
+    // drift and CMP_EQUAL keeps rejecting exactly the samples this pass skipped. With A2C off this
+    // is bit-for-bit the old strict '<'. See a2c.h.fsl.
+    uint cov = a2cCoverageMask(baseA, alphaRef);
+    clip(cov == 0u ? -1.0f : 1.0f);
+    PSOut Out;
+    Out.Coverage = cov;
+    RETURN(Out);
 }

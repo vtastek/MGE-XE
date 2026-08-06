@@ -1,0 +1,77 @@
+// mgeHost64 — alpha-to-coverage: the ONE definition of "which MSAA samples does this cutout cover".
+//
+// WHAT IT FIXES. MSAA runs the pixel shader ONCE per pixel and applies its result to every covered
+// sample, so it antialiases GEOMETRIC edges only. A cutout edge — foliage, grates, fences — is made
+// by `discard`, which is all-or-nothing per pixel, so it stays hard-aliased no matter how many
+// samples the target has. Alpha-to-coverage turns the cutout's fractional alpha into a per-sample
+// coverage mask, which is the only way an alpha test gets antialiased at all.
+//
+// PRIOR ART, AND WHY WE DIVERGE FROM IT. MGE's DX9 path already did this: `XE Common.fx:333`
+//     float calc_coverage(float a, float ref, float rate) { return saturate(rate*(a-ref) + ref); }
+// used by `XE Mod Statics.fx:93` (rate 2.0) and `XE Mod Grass.fx:116` (rate 4.0), feeding hardware
+// A2C. `statics.frag.fsl`'s header has carried "real A2C is a live-path (MSAA) refinement" as a
+// known gap ever since the port. We keep the mechanism and drop the constants
+// ([[feedback_prior_art_constants_dont_transfer]]):
+//
+// **A FIXED rate cannot be stable with distance.** `rate*(a-ref)` is a slope in ALPHA, and the
+// alpha of a mip-reduced leaf texture flattens toward its mean as the object recedes — so the same
+// slope spans more and more of the surface, the cutout softens, and distant foliage dissolves into
+// translucent mush. That is the classic alpha-test-under-mipmaps failure, and a rate knob can only
+// choose WHICH distance it happens at.
+//
+// So the slope here is taken from the SCREEN, not from a constant: dividing by `fwidth(alpha)`
+// makes the transition exactly one pixel wide at every distance and every mip level, which is
+// scale-invariant by construction. Distant foliage keeps its shape instead of fading out; near
+// foliage gets a soft edge instead of a staircase.
+//
+// **WHY THERE IS NO WIDTH KNOB.** One pixel is not a taste setting, it is the width at which the
+// coverage ramp matches the sampling rate — wider blurs the cutout, narrower re-aliases it. The
+// tunable thing (which passes participate, and whether A2C runs at all) is the on/off toggle.
+//
+// ⚠ THE PREPASS/COLOUR PARITY IS THE WHOLE RISK. The colour PSOs test `CMP_EQUAL` against the
+// Z-prepass, so the prepass and the colour pass must agree on coverage BIT FOR BIT — a pixel whose
+// two passes disagree fails EQUAL and vanishes. That is why this is a shared header called from
+// both sides rather than two copies of the same three lines: they cannot drift. The existing code
+// already depended on this (`depthonly.frag`: "Strict '<' must MATCH the colour pass exactly"); A2C
+// only raises the stakes.
+//
+// ⚠ `fwidth` NEEDS UNIFORM CONTROL FLOW. Derivatives come from the 2x2 quad, so every caller must
+// reach this function with the whole quad intact — i.e. call it BEFORE any discard, never inside a
+// branch that can differ across a quad. All current callers sample albedo and come straight here.
+#pragma once
+
+// gFrameData.alphaShadowParams.w carries the MSAA sample count when A2C is on and 0 when it is off
+// — ONE lane doing both jobs, because it is the last spare float4 component in a FrameData that is
+// exactly 512 B against a 512 B CBV (opaque.srt.h:145). The count has to be a uniform: these frags
+// are shared by every pass, so it cannot be a per-variant #define the way resolve.frag's is.
+#define A2C_SAMPLES (gFrameData.alphaShadowParams.w)
+
+// Coverage mask for a cutout pixel. Returns 0 (kill the pixel) or a mask of covered samples.
+//
+// A2C OFF, or 1x, or a non-alpha-tested draw (alphaRef == 0) => the classic binary answer, so this
+// is a drop-in for `a < ref ? discard : keep` and the A/B is exact.
+uint a2cCoverageMask(float alpha, float alphaRef)
+{
+    // Unconditionally, before any branch: see the uniform-control-flow note above.
+    float aw = fwidth(alpha);
+
+    float samples = A2C_SAMPLES;
+    if (samples < 1.5f || alphaRef <= 0.0f)
+    {
+        return (alpha < alphaRef) ? 0u : ~0u;
+    }
+
+    // One-pixel-wide ramp centred on the reference: 0.5 at a == ref, so the 50% coverage contour
+    // sits exactly where the binary test used to flip. That keeps the silhouette in the same place
+    // as the A/B and confines the change to the edge pixels.
+    float cov = saturate((alpha - alphaRef) / max(aw, 1.0e-5f) + 0.5f);
+
+    // Fraction -> mask. Ordered and DETERMINISTIC (no per-pixel dither): a stochastic mask would
+    // give a nominally better distribution and would crawl under any camera motion, and "stable" is
+    // the requirement here. Bits are taken in order; the D3D standard 4x/8x sample positions are
+    // spread across the pixel, so any prefix of them is a reasonable spatial subset.
+    uint n = (uint)(cov * samples + 0.5f);
+    if (n == 0u)                { return 0u; }
+    if (n >= (uint)(samples))   { return ~0u; }
+    return (1u << n) - 1u;
+}

@@ -16,6 +16,7 @@
 
 #include "opaque.srt.h"
 #include "texsample.h.fsl"   // sampleBase() — MW address mode + AF level
+#include "a2c.h.fsl"         // a2cCoverageMask() — the SHARED cutout coverage, see below
 
 STRUCT(VSOutput)
 {
@@ -35,14 +36,29 @@ STRUCT(VSOutput)
     DATA(FLAT(uint),  ClampMode,  TEXCOORD10);// MW texture address mode (0..3) -> sampleBase()
 };
 
+// Alpha-to-coverage makes this pass the SOURCE OF TRUTH for cutout edges. It writes depth at only
+// the covered samples, and opaque.frag's CMP_EQUAL then rejects every sample the prepass skipped —
+// so the colour pass needs no coverage output of its own, it inherits the mask through the depth
+// test. That is why the pair stays in sync with a one-line change on the colour side.
+//
+// Output struct with SV_Coverage and NO SV_Target: legal, and the pipeline still binds
+// mRenderTargetCount = 0. Coverage is not a render-target write.
+STRUCT(PSOut)
+{
+    DATA(uint, Coverage, SV_Coverage);
+};
+
 ROOT_SIGNATURE(DefaultRootSignature)
-void PS_MAIN( VSOutput In )
+PSOut PS_MAIN( VSOutput In )
 {
     INIT_MAIN;
     // Same test as opaque.frag: discard where albedo.a < AlphaRef (ref 0 = never discards, so
-    // pure-opaque draws keep every pixel). Strict '<' must MATCH the colour pass exactly or
-    // cutout edges fail the EQUAL test in the colour pass.
+    // pure-opaque draws keep every pixel). The comparison now lives in a2cCoverageMask so the two
+    // passes CANNOT drift — with A2C off it is still exactly the old strict '<'.
     float a = sampleBase(In.TexIndex, In.ClampMode, In.Uv, useLowAF(In.AlphaRef, false)).a;
-    clip(a < In.AlphaRef ? -1.0f : 1.0f);
-    RETURN();
+    uint cov = a2cCoverageMask(a, In.AlphaRef);
+    clip(cov == 0u ? -1.0f : 1.0f);
+    PSOut Out;
+    Out.Coverage = cov;
+    RETURN(Out);
 }

@@ -10,6 +10,7 @@
 
 #include "opaque.srt.h"
 #include "texsample.h.fsl"   // sampleBase() — MW address mode + AF level
+#include "a2c.h.fsl"         // a2cCoverageMask() — SHARED cutout coverage (prepass/colour parity)
 #include "msmrecv.h.fsl"     // sunShadowVisibility() — MSM sun-shadow receiver
 #include "shadowreceive.h.fsl" // shadowMaskPixel() — the mask texel that is actually OURS under MSAA
 #include "skyamb.h.fsl"      // skyAmbFactor() — SH-L1 sky ambient (SH1) + sky AO (SH2)
@@ -219,7 +220,9 @@ float4 PS_MAIN( VSOutput In )
     }
 
     // Alpha test on the BASE stage (other stages keep-prev alpha; irrelevant to coverage).
-    if (baseA < alphaRef) { discard; }
+    // Coverage comes from depthonly_mm.frag through CMP_EQUAL — see opaque.frag for why this only
+    // has to answer "are ANY samples covered", and why it must not be the raw '<' any more.
+    if (a2cCoverageMask(baseA, alphaRef) == 0u) { discard; }
 
     // MW's enchanted-item glow — after the whole stage chain, like MW's own extra stage, and
     // multiplicative on the shaded result for the reason opaque.frag derives.

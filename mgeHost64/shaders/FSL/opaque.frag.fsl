@@ -9,6 +9,7 @@
 
 #include "opaque.srt.h"
 #include "texsample.h.fsl"   // sampleBase() — MW address mode + AF level
+#include "a2c.h.fsl"         // a2cCoverageMask() — SHARED cutout coverage (prepass/colour parity)
 #include "fpshadow.h.fsl"    // fpShadowVisibility() — first-person direct cube-atlas shadow test
 #include "shadowreceive.h.fsl" // shadowMaskPixel() — the mask texel that is actually OURS under MSAA
 #include "msmrecv.h.fsl"     // sunShadowVisibility() — MSM sun-shadow receiver
@@ -311,7 +312,14 @@ float4 PS_MAIN( VSOutput In )
     // Alpha test (cutout foliage/grates/fences). MW drives this per-part via D3DRS_ALPHAREF
     // with GREATER; we approximate with GREATEREQUAL (keep a >= ref). Strict '<' means a ref of
     // 0 (non-alpha-test geometry) never discards — opaque base maps with stray low alpha are safe.
-    if (albedo.a < In.AlphaRef) { discard; }
+    //
+    // This pass writes NO coverage of its own: it tests CMP_EQUAL against the Z-prepass, so the
+    // prepass's alpha-to-coverage mask ALREADY rejects every sample it skipped, for free, through
+    // the depth test. What it must not do is kill the whole pixel at an edge the prepass kept part
+    // of — that would leave those samples holding foliage depth with background colour. So the
+    // condition becomes "no samples at all", evaluated by the SAME shared function the prepass
+    // used. With A2C off it reduces to the old strict '<' exactly. See a2c.h.fsl.
+    if (a2cCoverageMask(albedo.a, In.AlphaRef) == 0u) { discard; }
 
     albedo.rgb *= gFrameData.dbgScales.z;   // dev panel: albedo (texture) intensity modifier
 
