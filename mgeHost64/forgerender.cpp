@@ -1462,6 +1462,19 @@ namespace {
         Pipeline*      pSkinnedAlphaPipelineMirror = nullptr;     // alpha-over, CULL_BACK CW
         Pipeline*      pSkinnedAlphaPipelineNone = nullptr;       // alpha-over, CULL_NONE (DRAW_BOTH)
         Pipeline*      pSkinnedAlphaPipelineAdd = nullptr;        // SRCALPHA/ONE additive, CULL_NONE
+        // …and its NEAR-OPAQUE depth prepass (skinned.vert + alphadepth.frag), the exact twin of the
+        // static list's pAlphaPrepassPipeline*. Without it a blended skinned part had no depth
+        // ANYWHERE — skipped in the Z-prepass (blended parts `continue` there) and drawn depth-write
+        // off here — so a closed body composited in submission order and the far shell won: Dagoth Ur
+        // rendered INSIDE OUT. His four body shapes are NiAlphaProperty BLEND only so his death
+        // dissolve can fade them; the NiAlphaController holds alpha at 1.0 for the whole fight, and
+        // MW draws him with depth WRITE (no NiZBufferProperty on the body shapes -> engine default).
+        // alphadepth.frag decides per PIXEL on outA >= gFrameData.alphaParams.x, so this gives a solid
+        // body its self-occlusion while a real ghost still writes nothing. See tasks/forge-akulakhan-aside.md.
+        Shader*        pSkinnedAlphaDepthShader = nullptr;
+        Pipeline*      pSkinnedAlphaPrepassPipeline = nullptr;       // CULL_BACK CCW (MW default)
+        Pipeline*      pSkinnedAlphaPrepassPipelineMirror = nullptr; // CULL_BACK CW  (negative determinant)
+        Pipeline*      pSkinnedAlphaPrepassPipelineNone = nullptr;   // CULL_NONE     (DRAW_BOTH)
         // …and its shadow-caster twin: skinned.vert + alphashadowdepth.frag into the single-sample
         // cube atlas, so a blended part casts at the opacity threshold rather than the cutout test.
         Shader*        pSkinnedAlphaShadowShader = nullptr;
@@ -3056,9 +3069,23 @@ namespace {
         uint8_t  mirror;
         uint8_t  additive;   // SRCALPHA/ONE (else alpha-over)
         uint8_t  twoSided;   // NiStencilProperty DRAW_BOTH → CULL_NONE
+        // matAlpha >= g_alphaDepthRef: the part is EFFECTIVELY OPAQUE, so its pixels are the ones
+        // that cleared the prepass threshold and put real depth in pDepth. Such a part is the
+        // BACKMOST alpha content by construction — anything behind it was depth-killed — so it must
+        // composite FIRST, before the near sorted-alpha list. Drawing it last (the old rule, from
+        // when these parts had no depth at all and "creatures are usually in front" was the best
+        // guess available) made Dagoth Ur paint over the ash particles swirling in front of him.
+        // Parts below the threshold are genuine translucents and keep the old late slot exactly.
+        uint8_t  nearOpaque;
         float    viewDepth;  // back-to-front sort key (larger = farther)
     };
     std::vector<SkinAlphaCmd> g_skinAlphaCmds;
+    // The same parts again, recorded in the Z-PREPASS walk so their near-opaque depth lands BEFORE
+    // PostDepth builds GTAO and the point-light shadow mask. Separate list because the prepass walk
+    // runs first and has its own instance indices (preDrawn), which is the value alphadepth.frag
+    // must read — g_skinAlphaCmds carries the COLOUR walk's indices (skinnedDrawn) and the two
+    // cursors are only equal by accident. additive is always 0 here (glows are filtered at record).
+    std::vector<SkinAlphaCmd> g_skinAlphaPrepassCmds;
     // Multimap shadow casters (NPC heads / glow parts). Pre-walked from the multimap blob in the
     // SAME order + skip logic the MM Z-prepass assigns firstInstance (index i), so a head reuses the
     // resident pMMWorldsBuf/pInstanceBufMM slot i (both filled by the prepass, which runs before the
@@ -5021,6 +5048,58 @@ namespace {
                     || !g_live.pSkinnedAlphaPipelineNone || !g_live.pSkinnedAlphaPipelineAdd) {
                     std::printf("[forge] addPipeline(skinned alpha x4) FAILED\n");
                     return false;
+                }
+
+                // --- skinned near-opaque depth prepass (skinned.vert + alphadepth.frag) ------------
+                // The static alpha list's fold fix, given to the skinned list, which never had one.
+                // Depth-only (0 RTs), GEQUAL + WRITE, same sample count and the same three cull
+                // variants as the colour PSOs above so the depth describes the geometry that draws.
+                //
+                // PAIRING: alphadepth.frag declares a SUBSET of opaque.vert's VSOutput and is
+                // documented as pairing with it. skinned.vert emits that same VSOutput (that is
+                // exactly why skinned.vert + depthonly.frag links for the Tier 1b Z-prepass), so
+                // this pairing is legal by the same argument — see [[project_forge_shared_frag_vsoutput]].
+                // The frag reads matAlpha as asfloat(OverlayIndex); skinned.vert puts MatAlphaBits
+                // there whenever SKIN_BLEND_BIT is set, which is precisely this list, and its
+                // VColSource = 2 makes vcolA = Color.a exactly as alpha.frag computes it.
+                {
+                    ShaderLoadDesc skadDesc = {};
+                    skadDesc.mVert.pFileName = "skinned.vert";
+                    skadDesc.mFrag.pFileName = "alphadepth.frag";
+                    addShader(R, &skadDesc, &g_live.pSkinnedAlphaDepthShader);
+                    if (!g_live.pSkinnedAlphaDepthShader) {
+                        std::printf("[forge] addShader(skinned alphadepth) FAILED\n");
+                        return false;
+                    }
+                    DepthStateDesc skadDepth = {};
+                    skadDepth.mDepthTest  = true;
+                    skadDepth.mDepthWrite = true;
+                    skadDepth.mDepthFunc  = CMP_GEQUAL;
+
+                    PipelineDesc skadPd = {};
+                    skadPd.mType = PIPELINE_TYPE_GRAPHICS;
+                    GraphicsPipelineDesc& skadg = skadPd.mGraphicsDesc;
+                    skadg.mPrimitiveTopo = PRIMITIVE_TOPO_TRI_LIST;
+                    skadg.mRenderTargetCount = 0;                  // depth only
+                    skadg.pColorFormats = nullptr;
+                    skadg.mSampleCount = (SampleCount)g_live.sampleCount;
+                    skadg.mSampleQuality = 0;
+                    skadg.mDepthStencilFormat = TinyImageFormat_D32_SFLOAT;
+                    skadg.pDepthState = &skadDepth;
+                    skadg.pBlendState = nullptr;
+                    skadg.pVertexLayout = &svl;
+                    skadg.pShaderProgram = g_live.pSkinnedAlphaDepthShader;
+                    skadg.pRasterizerState = &skRaster;            // CULL_BACK CCW
+                    addPipeline(R, &skadPd, &g_live.pSkinnedAlphaPrepassPipeline);
+                    skadg.pRasterizerState = &skRasterMirror;      // CULL_BACK CW
+                    addPipeline(R, &skadPd, &g_live.pSkinnedAlphaPrepassPipelineMirror);
+                    skadg.pRasterizerState = &skaRasterNone;       // CULL_NONE
+                    addPipeline(R, &skadPd, &g_live.pSkinnedAlphaPrepassPipelineNone);
+                    if (!g_live.pSkinnedAlphaPrepassPipeline || !g_live.pSkinnedAlphaPrepassPipelineMirror
+                        || !g_live.pSkinnedAlphaPrepassPipelineNone) {
+                        std::printf("[forge] addPipeline(skinned alpha prepass x3) FAILED\n");
+                        return false;
+                    }
                 }
             }
 
@@ -7713,6 +7792,9 @@ namespace {
     unsigned  g_lastAlphaPrepassDrawn = 0;  // ...of which contributed to the near-opaque depth prepass
     unsigned  g_lastSkinAlphaDrawn = 0;     // blended SKINNED parts composited in the alpha stage
                                             // (of g_lastSkinnedDrawn — they share the instance buffer)
+    unsigned  g_lastSkinAlphaPrepassDrawn = 0;  // ...of which contributed to the near-opaque depth prepass
+                                                // (non-additive only; the per-PIXEL opacity test then
+                                                // decides what actually lands — see alphadepth.frag)
     unsigned  g_lastLightCount = 0;    // point lights uploaded in the last renderScene
     // Phase 0 panel readouts: extra per-frame counters + single-frame timings (the 300-frame
     // accumulators g_recAccum/g_gpuAccum are for the heartbeat; these are this frame's values).
@@ -10805,6 +10887,10 @@ namespace ForgeRender {
             // for limb/vertex extent. A slot with a skinned part in reach is forced to re-render.
             const double tBlkSkin0 = hostNowMs();
             g_skinnedCasters.clear();
+            // Reset here, ahead of the Z-prepass walk that fills it (the alpha stage is far too late
+            // now — it runs after the prepass has already counted).
+            g_skinAlphaPrepassCmds.clear();
+            g_lastSkinAlphaPrepassDrawn = 0;
             if (g_shadowSkinnedCasters && skinnedBlob && skinnedCount && skinnedBytes) {
                 const uint8_t* sp   = (const uint8_t*)skinnedBlob;
                 const uint8_t* sEnd = sp + skinnedBytes;
@@ -12419,7 +12505,31 @@ namespace ForgeRender {
                     // tests EQUAL against — it would depth-kill everything behind the ghost. The
                     // pack above still ran, so the bone window and the instance slot are identical
                     // to what every other walk expects; only the draw is gone.
-                    if (blended) { continue; }
+                    //
+                    // …but "transparent" is a PER-PIXEL fact, not a per-mesh one. Deferring the whole
+                    // part left a blended-but-SOLID body (Dagoth Ur: BLEND only so his death dissolve
+                    // can fade him, alpha pinned at 1.0 until then) out of the depth buffer that
+                    // PostDepth builds AO and the shadow mask from — so he sampled the AO and the
+                    // shadowing of whatever was BEHIND him and read as a thin backlit sheet. Record
+                    // the part instead and run alphadepth.frag over it below, which keeps depth only
+                    // where outA >= gFrameData.alphaParams.x: the solid body lands in the prepass and
+                    // gets real AO + shadows, a genuine ghost still writes nothing anywhere.
+                    // Additives never occlude. See tasks/forge-akulakhan-aside.md.
+                    if (blended) {
+                        if (g_alphaDepthWrite && !g_alphaDebugNoDepth
+                            && !(item.srcBlend == kD3DBLEND_SRCALPHA && item.destBlend == kD3DBLEND_ONE)) {
+                            g_skinAlphaPrepassCmds.push_back(SkinAlphaCmd{
+                                inst, window, slot,
+                                (uint8_t)(item.mirror ? 1u : 0u),
+                                0u,   // additive: filtered out by the condition above
+                                (uint8_t)((item.blendFlags & IPC::kSkinFlagTwoSided) ? 1u : 0u),
+                                0u,   // nearOpaque: unused here — this list only writes depth, and
+                                      // alphadepth.frag makes that call per PIXEL. The flag matters
+                                      // only for the COLOUR list's group ordering.
+                                item.viewDepth });
+                        }
+                        continue;
+                    }
                     const int mirror = item.mirror ? 1 : 0;
                     if (mirror != boundSkinMirror) {
                         cmdBindPipeline(g_live.pCmd, mirror ? g_live.pSkinnedPrepassPipelineMirror : g_live.pSkinnedPrepassPipeline);
@@ -12438,6 +12548,43 @@ namespace ForgeRender {
                     cmdBindVertexBuffer(g_live.pCmd, 2, pvbs, pstrides, nullptr);
                     cmdBindIndexBuffer(g_live.pCmd, sm.ib, INDEX_TYPE_UINT16, 0);
                     cmdDrawIndexedInstanced(g_live.pCmd, sm.indexCount, 0, 1, 0, inst);
+                }
+
+                // --- blended skinned parts: NEAR-OPAQUE depth, inside the prepass ------------------
+                // Same instance buffer, same bone windows, same cull variants — only the PSO differs
+                // (alphadepth.frag discards below the opacity threshold). This must run HERE, not in
+                // the alpha stage: everything screen-space that a solid body needs to look solid —
+                // GTAO, the point-light shadow mask — is built by PostDepth from this buffer, and a
+                // depth write after that point is invisible to all of it.
+                if (!g_skinAlphaPrepassCmds.empty() && g_live.pSkinnedAlphaPrepassPipeline) {
+                    cmdBindPipeline(g_live.pCmd, g_live.pSkinnedAlphaPrepassPipeline);
+                    cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSet);
+                    cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
+                    Pipeline* curPre = g_live.pSkinnedAlphaPrepassPipeline;
+                    uint32_t  boundPreWindow = UINT32_MAX;
+                    for (const SkinAlphaCmd& c : g_skinAlphaPrepassCmds) {
+                        Pipeline* want = c.twoSided ? g_live.pSkinnedAlphaPrepassPipelineNone
+                                       : (c.mirror  ? g_live.pSkinnedAlphaPrepassPipelineMirror
+                                                    : g_live.pSkinnedAlphaPrepassPipeline);
+                        if (want != curPre) {
+                            cmdBindPipeline(g_live.pCmd, want);
+                            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSet);
+                            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
+                            curPre = want;
+                            boundPreWindow = UINT32_MAX;   // pipeline rebind drops the batch set
+                        }
+                        if (c.window != boundPreWindow) {
+                            cmdBindDescriptorSet(g_live.pCmd, c.window, g_live.pPerBatchSetSkin);
+                            boundPreWindow = c.window;
+                        }
+                        HostMesh& sm = g_meshes[c.slot];
+                        Buffer*  pvbs[2]     = { sm.vb, g_live.pInstanceBufSkin };
+                        uint32_t pstrides[2] = { (uint32_t)sizeof(IPC::SkinnedVertexWire), (uint32_t)(kSkinInstU32 * sizeof(uint32_t)) };
+                        cmdBindVertexBuffer(g_live.pCmd, 2, pvbs, pstrides, nullptr);
+                        cmdBindIndexBuffer(g_live.pCmd, sm.ib, INDEX_TYPE_UINT16, 0);
+                        cmdDrawIndexedInstanced(g_live.pCmd, sm.indexCount, 0, 1, 0, c.idx);
+                        ++g_lastSkinAlphaPrepassDrawn;
+                    }
                 }
             }
 
@@ -13814,11 +13961,26 @@ namespace ForgeRender {
                 // taken HERE rather than in a sixth walk of its own. Only the draw moves, to the
                 // alpha stage, sorted back-to-front and composited with real alpha.
                 if (blended) {
+                    const bool additiveB = (item.srcBlend == kD3DBLEND_SRCALPHA
+                                            && item.destBlend == kD3DBLEND_ONE);
                     g_skinAlphaCmds.push_back(SkinAlphaCmd{
                         inst, window, slot,
                         (uint8_t)(item.mirror ? 1u : 0u),
-                        (uint8_t)((item.srcBlend == kD3DBLEND_SRCALPHA && item.destBlend == kD3DBLEND_ONE) ? 1u : 0u),
+                        (uint8_t)(additiveB ? 1u : 0u),
                         (uint8_t)((item.blendFlags & IPC::kSkinFlagTwoSided) ? 1u : 0u),
+                        // "Solid body that merely fades" — MW's own three signals, not a guess:
+                        //   NiAlphaProperty blend on, TEST OFF   (a cutout card tests; this doesn't)
+                        //   NiAlphaController present            (alpha is DRIVEN, resting at 1.0)
+                        //   that controller currently at ~1.0    (re-read every frame client-side)
+                        // All three -> it is opaque right now, wrote real prepass depth, and is the
+                        // backmost alpha content, so it composites FIRST. When the death dissolve
+                        // drives matAlpha down, the third test fails on its own and the part moves
+                        // to the translucent group — MW's "opaque until its alpha is triggered".
+                        // An additive glow never occludes and is never in this group.
+                        (uint8_t)((!additiveB
+                                   && !(item.blendFlags & IPC::kSkinFlagAlphaTest)
+                                   &&  (item.blendFlags & IPC::kSkinFlagAlphaAnim)
+                                   && item.matAlpha >= g_alphaDepthRef) ? 1u : 0u),
                         item.viewDepth });
                     continue;
                 }
@@ -14381,6 +14543,91 @@ namespace ForgeRender {
         uint32_t alphaDrawn = 0;
         gpuPhaseBegin(kGpuPhaseColorAlpha);
 
+        // --- Blended SKINNED parts (ghosts, mane/hair cards) --------------------------------
+        // Deferred out of the colour walk, which already packed their bone palettes and wrote their
+        // instance entries — this only issues the draws, from the SAME pInstanceBufSkin slots, with
+        // alpha.frag instead of opaque.frag.
+        //
+        // Split into TWO groups by SkinAlphaCmd::nearOpaque, because this list stopped being one
+        // kind of thing the moment its near-opaque members started writing prepass depth:
+        //
+        //   nearOpaque -> drawn HERE, before every other alpha group. It already put real depth in
+        //                 pDepth, so anything behind it was depth-killed and it is the backmost
+        //                 alpha content by construction; everything else must composite OVER it.
+        //   otherwise  -> drawn LAST, exactly where the whole list used to go.
+        //
+        // Drawing the whole list last is what made Dagoth Ur paint over the ash particles in front
+        // of him: the particles (captured alpha) drew first, he drew after and passed GEQUAL at his
+        // own depth. Sorting is still WITHIN each group — there is no global sort across the alpha
+        // groups (hero blend, MM alpha, near sorted alpha, skinned), only this ordering of them.
+        g_lastSkinAlphaDrawn = 0;   // (g_lastSkinAlphaPrepassDrawn is reset with the prepass list)
+        auto drawSkinAlphaGroup = [&](bool wantNearOpaque, const char* marker) {
+            if (g_skinAlphaCmds.empty() || !g_live.pSkinnedAlphaPipeline) { return; }
+            uint32_t inGroup = 0;
+            for (const SkinAlphaCmd& c : g_skinAlphaCmds) {
+                if ((c.nearOpaque != 0) == wantNearOpaque) { ++inGroup; }
+            }
+            if (!inGroup) { return; }
+
+            cmdBeginDebugMarker(g_live.pCmd, 0.8f, 0.4f, 0.9f, marker);
+            // (The near-opaque depth for this list is written back in the Z-PREPASS, not here — see
+            // g_skinAlphaPrepassCmds. Writing it at this point would be too late for GTAO and the
+            // shadow mask, which PostDepth has already built.)
+            BindRenderTargetsDesc sabind = {};
+            sabind.mRenderTargetCount = 1;
+            sabind.mRenderTargets[0] = { colorTarget, LOAD_ACTION_LOAD };
+            sabind.mDepthStencil = { g_live.pDepth, LOAD_ACTION_LOAD };   // GEQUAL test, never write
+            cmdBindRenderTargets(g_live.pCmd, &sabind);
+            cmdSetViewport(g_live.pCmd, 0.0f, 0.0f, (float)g_live.width, (float)g_live.height, 0.0f, 1.0f);
+            cmdSetScissor(g_live.pCmd, 0, 0, g_live.width, g_live.height);
+
+            // Pipeline FIRST (establishes the shared default.rootsig), then the descriptor sets.
+            cmdBindPipeline(g_live.pCmd, g_live.pSkinnedAlphaPipeline);
+            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSet);
+            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerLightsSet);
+            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
+            Pipeline* curSkinAlpha = g_live.pSkinnedAlphaPipeline;
+            uint32_t  boundSkinAlphaWindow = UINT32_MAX;
+
+            for (const SkinAlphaCmd& c : g_skinAlphaCmds) {
+                if ((c.nearOpaque != 0) != wantNearOpaque) { continue; }
+                if (c.slot >= g_meshHigh || !g_meshes[c.slot].valid || !g_meshes[c.slot].skinned) {
+                    continue;   // mesh evicted between the colour walk and here
+                }
+                // Blend pair from MW's NiAlphaProperty (additive glows are light, not surfaces);
+                // cull from NiStencilProperty DRAW_BOTH, else MW's single-sided default + winding.
+                Pipeline* want = c.additive ? g_live.pSkinnedAlphaPipelineAdd
+                               : c.twoSided ? g_live.pSkinnedAlphaPipelineNone
+                               : (c.mirror  ? g_live.pSkinnedAlphaPipelineMirror
+                                            : g_live.pSkinnedAlphaPipeline);
+                if (want != curSkinAlpha) {
+                    cmdBindPipeline(g_live.pCmd, want);
+                    curSkinAlpha = want;
+                    boundSkinAlphaWindow = UINT32_MAX;
+                }
+                if (c.window != boundSkinAlphaWindow) {
+                    cmdBindDescriptorSet(g_live.pCmd, c.window, g_live.pPerBatchSetSkin);
+                    boundSkinAlphaWindow = c.window;
+                }
+                HostMesh& sm = g_meshes[c.slot];
+                Buffer*  vbs[2]     = { sm.vb, g_live.pInstanceBufSkin };
+                uint32_t strides[2] = { (uint32_t)sizeof(IPC::SkinnedVertexWire), (uint32_t)(kSkinInstU32 * sizeof(uint32_t)) };
+                cmdBindVertexBuffer(g_live.pCmd, 2, vbs, strides, nullptr);
+                cmdBindIndexBuffer(g_live.pCmd, sm.ib, INDEX_TYPE_UINT16, 0);
+                cmdDrawIndexedInstanced(g_live.pCmd, sm.indexCount, 0, 1, 0, c.idx);
+                ++g_lastSkinAlphaDrawn;
+            }
+            cmdBindRenderTargets(g_live.pCmd, nullptr);
+            cmdEndDebugMarker(g_live.pCmd);
+        };
+        // Back-to-front: viewDepth is distance along the view forward, so farthest draws first.
+        // Sorted ONCE here; each group walks the same ordered vector and skips the other's members.
+        std::sort(g_skinAlphaCmds.begin(), g_skinAlphaCmds.end(),
+                  [](const SkinAlphaCmd& a, const SkinAlphaCmd& b) { return a.viewDepth > b.viewDepth; });
+
+        // The effectively-opaque half, before every other alpha group (see above).
+        drawSkinAlphaGroup(true, "SKINNED ALPHA near-opaque (solid bodies)");
+
         // Phase 4: distant hero statics (ghostfence/lava) blend FIRST — they're the farthest
         // translucent geometry, so drawing them before the near sorted-alpha keeps back-to-front.
         dlDrawHeroBlend();
@@ -14841,66 +15088,11 @@ namespace ForgeRender {
             cmdBindRenderTargets(g_live.pCmd, nullptr);
         }
 
-        // --- Blended SKINNED parts (ghosts, mane/hair cards) --------------------------------
-        // Deferred out of the colour walk, which already packed their bone palettes and wrote their
-        // instance entries — this only issues the draws, from the SAME pInstanceBufSkin slots, with
-        // alpha.frag instead of opaque.frag. Last in the alpha stage: creatures stand in front of
-        // the world's banners and glass far more often than behind them, and the sort below is
-        // WITHIN this list (exactly how the alpha stage already works — hero blend, then MM alpha,
-        // then near sorted alpha, each internally ordered; there is no global sort across them).
-        g_lastSkinAlphaDrawn = 0;
-        if (!g_skinAlphaCmds.empty() && g_live.pSkinnedAlphaPipeline) {
-            // Back-to-front: viewDepth is distance along the view forward, so farthest draws first.
-            std::sort(g_skinAlphaCmds.begin(), g_skinAlphaCmds.end(),
-                      [](const SkinAlphaCmd& a, const SkinAlphaCmd& b) { return a.viewDepth > b.viewDepth; });
-
-            cmdBeginDebugMarker(g_live.pCmd, 0.8f, 0.4f, 0.9f, "SKINNED ALPHA (ghosts / hair cards)");
-            BindRenderTargetsDesc sabind = {};
-            sabind.mRenderTargetCount = 1;
-            sabind.mRenderTargets[0] = { colorTarget, LOAD_ACTION_LOAD };
-            sabind.mDepthStencil = { g_live.pDepth, LOAD_ACTION_LOAD };   // GEQUAL test, never write
-            cmdBindRenderTargets(g_live.pCmd, &sabind);
-            cmdSetViewport(g_live.pCmd, 0.0f, 0.0f, (float)g_live.width, (float)g_live.height, 0.0f, 1.0f);
-            cmdSetScissor(g_live.pCmd, 0, 0, g_live.width, g_live.height);
-
-            // Pipeline FIRST (establishes the shared default.rootsig), then the descriptor sets.
-            cmdBindPipeline(g_live.pCmd, g_live.pSkinnedAlphaPipeline);
-            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSet);
-            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerLightsSet);
-            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
-            Pipeline* curSkinAlpha = g_live.pSkinnedAlphaPipeline;
-            uint32_t  boundSkinAlphaWindow = UINT32_MAX;
-
-            for (const SkinAlphaCmd& c : g_skinAlphaCmds) {
-                if (c.slot >= g_meshHigh || !g_meshes[c.slot].valid || !g_meshes[c.slot].skinned) {
-                    continue;   // mesh evicted between the colour walk and here
-                }
-                // Blend pair from MW's NiAlphaProperty (additive glows are light, not surfaces);
-                // cull from NiStencilProperty DRAW_BOTH, else MW's single-sided default + winding.
-                Pipeline* want = c.additive ? g_live.pSkinnedAlphaPipelineAdd
-                               : c.twoSided ? g_live.pSkinnedAlphaPipelineNone
-                               : (c.mirror  ? g_live.pSkinnedAlphaPipelineMirror
-                                            : g_live.pSkinnedAlphaPipeline);
-                if (want != curSkinAlpha) {
-                    cmdBindPipeline(g_live.pCmd, want);
-                    curSkinAlpha = want;
-                    boundSkinAlphaWindow = UINT32_MAX;
-                }
-                if (c.window != boundSkinAlphaWindow) {
-                    cmdBindDescriptorSet(g_live.pCmd, c.window, g_live.pPerBatchSetSkin);
-                    boundSkinAlphaWindow = c.window;
-                }
-                HostMesh& sm = g_meshes[c.slot];
-                Buffer*  vbs[2]     = { sm.vb, g_live.pInstanceBufSkin };
-                uint32_t strides[2] = { (uint32_t)sizeof(IPC::SkinnedVertexWire), (uint32_t)(kSkinInstU32 * sizeof(uint32_t)) };
-                cmdBindVertexBuffer(g_live.pCmd, 2, vbs, strides, nullptr);
-                cmdBindIndexBuffer(g_live.pCmd, sm.ib, INDEX_TYPE_UINT16, 0);
-                cmdDrawIndexedInstanced(g_live.pCmd, sm.indexCount, 0, 1, 0, c.idx);
-                ++g_lastSkinAlphaDrawn;
-            }
-            cmdBindRenderTargets(g_live.pCmd, nullptr);
-            cmdEndDebugMarker(g_live.pCmd);
-        }
+        // The TRANSLUCENT half of the skinned blends (see drawSkinAlphaGroup). Genuine ghosts and
+        // fading parts keep the original late slot: they wrote no depth, so ordering is the only
+        // tool available, and "creatures stand in front of the world's banners and glass far more
+        // often than behind them" is still the best guess for them.
+        drawSkinAlphaGroup(false, "SKINNED ALPHA translucent (ghosts / fades)");
         gpuPhaseEnd(kGpuPhaseColorAlpha);
 
         // ===================== VOLUMETRIC height fog / sun shafts =====================
@@ -15588,10 +15780,11 @@ namespace ForgeRender {
                              lf[16], lf[17], lf[18], lf[20], lf[21], lf[22], lf[24], lf[25], lf[26],
                              lf[56], lf[57], lf[58]);   // lodEye = ABSOLUTE world eye (viewer start pos)
             }
-            LOG::logline(">> [forge-hb] frame=%u drawn=%u skinned=%u(blend=%u) multimap=%u sky=%u alpha=%u(zpre=%u) dynamic=%u meshHigh=%u "
+            LOG::logline(">> [forge-hb] frame=%u drawn=%u skinned=%u(blend=%u zpre=%u) multimap=%u sky=%u alpha=%u(zpre=%u) dynamic=%u meshHigh=%u "
                          "| refl sky=%u near=%u skin=%u mm=%u "
                          "| record=%.2fms gpu=%.2fms (avg/frame over 300)",
-                         g_renderFrame, drawn, skinnedDrawn, g_lastSkinAlphaDrawn, multiMapDrawn, skyDrawn, alphaDrawn,
+                         g_renderFrame, drawn, skinnedDrawn, g_lastSkinAlphaDrawn, g_lastSkinAlphaPrepassDrawn,
+                         multiMapDrawn, skyDrawn, alphaDrawn,
                          g_lastAlphaPrepassDrawn, g_dynamicCount, g_meshHigh,
                          g_lastReflSkyDrawn, g_lastReflNearDrawn, g_lastReflSkinDrawn, g_lastReflMMDrawn,
                          g_recAccum / 300.0, g_gpuAccum / 300.0);
@@ -23787,8 +23980,12 @@ namespace ForgeRender {
         if (g_live.pSkinnedAlphaPipelineMirror) { removePipeline(R, g_live.pSkinnedAlphaPipelineMirror); }
         if (g_live.pSkinnedAlphaPipelineNone)   { removePipeline(R, g_live.pSkinnedAlphaPipelineNone); }
         if (g_live.pSkinnedAlphaPipelineAdd)    { removePipeline(R, g_live.pSkinnedAlphaPipelineAdd); }
+        if (g_live.pSkinnedAlphaPrepassPipeline)       { removePipeline(R, g_live.pSkinnedAlphaPrepassPipeline); }
+        if (g_live.pSkinnedAlphaPrepassPipelineMirror) { removePipeline(R, g_live.pSkinnedAlphaPrepassPipelineMirror); }
+        if (g_live.pSkinnedAlphaPrepassPipelineNone)   { removePipeline(R, g_live.pSkinnedAlphaPrepassPipelineNone); }
         if (g_live.pSkinnedAlphaShadowPipeline) { removePipeline(R, g_live.pSkinnedAlphaShadowPipeline); }
         if (g_live.pSkinnedAlphaShadowShader)   { removeShader(R, g_live.pSkinnedAlphaShadowShader); }
+        if (g_live.pSkinnedAlphaDepthShader) { removeShader(R, g_live.pSkinnedAlphaDepthShader); }
         if (g_live.pSkinnedAlphaShader)    { removeShader(R, g_live.pSkinnedAlphaShader); }
         if (g_live.pSkinnedDepthShader)    { removeShader(R, g_live.pSkinnedDepthShader); }
         if (g_live.pSkinnedShader)         { removeShader(R, g_live.pSkinnedShader); }

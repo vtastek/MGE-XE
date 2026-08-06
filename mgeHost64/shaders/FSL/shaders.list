@@ -83,7 +83,9 @@
 // AT1 near-opaque depth prepass: runs BEFORE the alpha colour draws, writes depth ONLY at pixels
 // that are near-opaque (a >= gFrameData.alphaParams.x). Keeps the fold fix (solid cloth self-
 // occludes) while translucent pixels (glass) write nothing, so they can never depth-kill a
-// translucent draw that sorts after them (the flame-in-a-lantern bug). Pairs with opaque.vert.
+// translucent draw that sorts after them (the flame-in-a-lantern bug). Pairs with opaque.vert AND
+// with skinned.vert (identical VSOutput) — the skinned list runs the same prepass, which is what
+// stops a blended-but-solid body compositing itself back-to-front (Dagoth Ur inside out).
 #frag alphadepth.frag
 #include "alphadepth.frag.fsl"
 #end

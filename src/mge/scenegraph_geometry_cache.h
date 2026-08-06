@@ -210,6 +210,12 @@ namespace MGE::GeometryCache {
         // per-instance buffer), so refreshing the cached value is the whole fix — no wire change,
         // no host change.
         bool  matAnimated;
+        // Narrower than matAnimated: the NiMaterialProperty carries a NiAlphaController
+        // specifically. Shipped to the host (kSkinFlagAlphaAnim) because it is what separates a
+        // solid body that merely fades (Dagoth Ur — alpha pinned at 1.0 until his death dissolve)
+        // from something authored translucent. matAnimated is the superset that also catches
+        // NiMaterialColorController and only governs whether to re-read the material each frame.
+        bool  alphaAnimated;
         // NiStencilProperty DRAW_BOTH: the shape is authored two-sided (window panes,
         // waterfalls, thin cloth) and MW draws it with culling OFF. Single-sided shapes
         // (no stencil / not DRAW_BOTH) MW draws CULL_BACK — the Forge alpha pass must

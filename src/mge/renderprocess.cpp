@@ -2394,8 +2394,14 @@ namespace {
             // skinned part needs the bone palette that only this list carries — so the blend is a
             // TAG, not a re-route: the host packs it in every walk exactly as before and moves only
             // its draw into the alpha stage. Ghosts and hair/mane cards live entirely in this flag.
-            item.blendFlags = (e.blendEnable ? IPC::kSkinFlagBlended  : 0u)
-                            | (e.twoSided    ? IPC::kSkinFlagTwoSided : 0u);
+            // alphaTest rides its OWN bit rather than being inferred from alphaRef != 0: MW lets a
+            // cutout test at ref 0 (GREATER 0 = drop only fully transparent texels), and the velk's
+            // mane does exactly that, so alphaRef alone reports it as untested. The host uses these
+            // two to tell a solid-body-that-fades from a card whose texture alpha carves it.
+            item.blendFlags = (e.blendEnable  ? IPC::kSkinFlagBlended   : 0u)
+                            | (e.twoSided     ? IPC::kSkinFlagTwoSided  : 0u)
+                            | (e.alphaTest    ? IPC::kSkinFlagAlphaTest : 0u)
+                            | (e.alphaAnimated? IPC::kSkinFlagAlphaAnim : 0u);
             item.matAlpha   = e.matDiffuse[3];   // FFE per-draw fade (same source as emitAlphaDraw)
             item.srcBlend   = e.srcBlend;
             item.destBlend  = e.destBlend;

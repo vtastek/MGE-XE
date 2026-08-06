@@ -255,6 +255,22 @@ namespace IPC {
     // the alpha stage. See [[project_forge_alpha_composite_gap]].
     constexpr std::uint32_t kSkinFlagBlended  = 1u << 0;   // NiAlphaProperty alpha blend enabled
     constexpr std::uint32_t kSkinFlagTwoSided = 1u << 1;   // NiStencilProperty DRAW_BOTH → CULL_NONE
+    // Together these two answer "is this blended part actually a SOLID body?", which alphaRef alone
+    // cannot: the wire encodes "no alpha test" as alphaRef == 0, and a cutout card is free to test
+    // at ref 0 (GREATER 0 = "discard only fully transparent texels"). The velk's mane does exactly
+    // that — NiAlphaProperty 0x12ED, test ON, ref 0 — so it arrives indistinguishable from Dagoth
+    // Ur's 0x00ED, test OFF. Census over 3058 skinned NIFs: 901 blend-without-test properties vs
+    // 449 blend-with-test, so the split is real and worth a bit each.
+    //
+    //   kSkinFlagAlphaTest — NiAlphaProperty TEST_ENABLE. The shape leans on its texture's alpha to
+    //                        carve holes (hair/mane/foliage cards). NEVER treat as solid.
+    //   kSkinFlagAlphaAnim — the NiMaterialProperty carries a NiAlphaController, i.e. this shape's
+    //                        alpha is DRIVEN and is normally 1.0. That is what makes Dagoth Ur
+    //                        blended at all: his controller sits at 1.0 for the whole fight and only
+    //                        runs 1->0 for the death dissolve. matAlpha below is re-read every frame
+    //                        (refreshAnimatedMaterial), so the host can simply watch it fall.
+    constexpr std::uint32_t kSkinFlagAlphaTest = 1u << 2;
+    constexpr std::uint32_t kSkinFlagAlphaAnim = 1u << 3;
 
     // M-Skinning per-frame draw item: which uploaded skinned mesh (slot) to draw, the
     // part's bone count, and its mirror flag (left-side parts reuse the right mesh via a

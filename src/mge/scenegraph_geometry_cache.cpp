@@ -710,6 +710,7 @@ namespace MGE::GeometryCache {
             e.blendEnable = false;
             e.texAnimated = false;
             e.matAnimated = false;
+            e.alphaAnimated = false;
             e.twoSided    = false;   // single-sided (CULL_BACK) unless NiStencilProperty DRAW_BOTH
             // SK1 sky: default to the standard transparency blend; overwritten below from the
             // NiAlphaProperty flags when present. Only consumed for isSky entries (the Forge
@@ -772,7 +773,13 @@ namespace MGE::GeometryCache {
                 // touches NiGeometryData, so revisionID does not move and this re-extract is never
                 // triggered again — the values above would freeze at capture. Flag it so the
                 // per-frame visit re-reads them (refreshAnimatedMaterial).
-                e.matAnimated = hasController(mp, NI::RTTIStaticPtr::NiAlphaController)
+                // Tracked separately as well as folded into matAnimated: a NiAlphaController is the
+                // authored statement "this shape's alpha is DRIVEN, and its resting value is 1.0".
+                // That is the difference between a solid body wearing a blend flag so it can
+                // dissolve on death (Dagoth Ur) and something authored translucent for good. The
+                // host needs it to decide draw ORDER; matAnimated only decides whether to re-read.
+                e.alphaAnimated = hasController(mp, NI::RTTIStaticPtr::NiAlphaController);
+                e.matAnimated = e.alphaAnimated
                              || hasController(mp, NI::RTTIStaticPtr::NiMaterialColorController);
             }
 

@@ -33,7 +33,13 @@
 // as see-through, which is the original bug wearing a different hat.
 //
 // PAIRING HAZARD: shares VSOutput with opaque.vert (like alpha.frag / depthonly.frag) and must ONLY
-// be paired with it — see [[project_forge_shared_frag_vsoutput]]; a mismatched vert hangs the GPU.
+// be paired with a vert emitting that same VSOutput — see [[project_forge_shared_frag_vsoutput]]; a
+// mismatched vert hangs the GPU. Two verts qualify: opaque.vert (the AT1 static list) and
+// skinned.vert, whose VSOutput is identical by construction — that is why skinned.vert+depthonly.frag
+// already links for the Tier 1b Z-prepass. The skinned pairing runs the SKINNED alpha list's
+// prepass. It reads matAlpha as asfloat(In.OverlayIndex), which skinned.vert fills with MatAlphaBits
+// exactly when SKIN_BLEND_BIT is set — i.e. exactly for the parts on that list — and its
+// VColSource = 2 makes vcolA = Color.a, the same product alpha.frag blends with.
 // Convention (void PS_MAIN + clip + RETURN(), 0 render targets) = The Forge's own depth-pass pattern.
 
 #include "opaque.srt.h"
