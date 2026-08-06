@@ -1,0 +1,85 @@
+// mgeHost64 — APL (Average Picture Level) instrument.  tasks/forge-postprocess.md step 2.
+//
+// Reduces the finished scene colour to mean(R), mean(G), mean(B), mean(log luma) — see apl.srt.h
+// for why those four and why this ships enabled.
+//
+// ONE THREAD GROUP, SPARSE LATTICE — not a full-frame pyramid reduction.
+// MJP's LuminanceReduction.hlsl (the reference this is adapted from) reduces every pixel through a
+// chain of intermediate textures because it feeds real-time eye adaptation, where a wrong average
+// is a visible exposure error. This feeds a LOG LINE. A 128x128 lattice is 16384 samples; the
+// standard error of a mean over 16384 samples is ~0.8% of the distribution's sigma, which is far
+// below any look change worth arguing about — and because the lattice is DETERMINISTIC, the same
+// pixels are sampled on both sides of an A/B, so even that bias cancels exactly. One group,
+// one dispatch, no intermediate buffer, 16-byte readback.
+//
+// The lattice is computed in normalised space and scaled by the image size, so it covers the frame
+// at any render scale and the numbers stay comparable when SSAA changes.
+//
+// MSAA: sample 0 only. At an edge pixel that is one of the two surfaces rather than their resolved
+// mix, so the mean carries a small edge bias — identical on both sides of an A/B, therefore
+// harmless here, and reading all 4 samples would quadruple the loads to sharpen a number whose
+// third decimal nobody reads.
+
+#include "apl.srt.h"
+
+#define APL_THREADS 256u
+
+GroupShared(float4, g_apl[256]);
+
+ROOT_SIGNATURE(ComputeRootSignature)
+NUM_THREADS(256, 1, 1)
+void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
+{
+    INIT_MAIN;
+    uint tid = DispatchThreadID.x;
+
+    float2 imgSize = gAplParams.dims.xy;
+    uint   grid    = (uint)gAplParams.dims.z;
+    float  invGrid = 1.0f / max(gAplParams.dims.z, 1.0f);
+
+    float4 acc = float4(0.0f, 0.0f, 0.0f, 0.0f);
+
+    // Strided walk over the lattice. No barriers in here, so the divergent tail is free.
+    for (uint i = tid; i < grid * grid; i += APL_THREADS)
+    {
+        uint gx = i % grid;
+        uint gy = i / grid;
+        int2 p = int2(int((float(gx) + 0.5f) * invGrid * imgSize.x),
+                      int((float(gy) + 0.5f) * invGrid * imgSize.y));
+#if SAMPLE_COUNT > 1
+        float3 c = LoadTex2DMS(gAplColor, NO_SAMPLER, p, 0).rgb;
+#else
+        float3 c = LoadTex2D(gAplColor, NO_SAMPLER, p, 0).rgb;
+#endif
+        c = max(c, 0.0f);
+        float luma = dot(c, float3(0.299f, 0.587f, 0.114f));
+        acc.rgb += c;
+        // Geometric mean => arithmetic mean of the log. The floor keeps log() off -inf on a black
+        // pixel; interiors and night skies have plenty of those and one -inf poisons the whole sum.
+        acc.a += log(max(luma, 1.0e-5f));
+    }
+
+    g_apl[tid] = acc;
+    GroupMemoryBarrier();
+
+    // Tree reduce. Read into a register, barrier, guarded write, barrier — cullscan.comp.fsl's
+    // idiom, and for its reason: EVERY thread must reach EVERY GroupMemoryBarrier, so the guard
+    // wraps only the write, never the barrier.
+    for (uint s = APL_THREADS / 2u; s > 0u; s >>= 1u)
+    {
+        float4 v = (tid < s) ? g_apl[tid + s] : float4(0.0f, 0.0f, 0.0f, 0.0f);
+        GroupMemoryBarrier();
+        if (tid < s) { g_apl[tid] = g_apl[tid] + v; }
+        GroupMemoryBarrier();
+    }
+
+    if (tid == 0u)
+    {
+        float4 m = g_apl[0] * gAplParams.dims.w;
+        gAplOut[0] = asuint(m.r);
+        gAplOut[1] = asuint(m.g);
+        gAplOut[2] = asuint(m.b);
+        gAplOut[3] = asuint(m.a);
+    }
+    RETURN();
+}

@@ -11,17 +11,7 @@
 #include "opaque.srt.h"
 #include "msmrecv.h.fsl"   // sunShadowVisibility() — MSM sun-shadow receiver
 #include "skydome.h.fsl"   // applyFog() — extinguish into a silhouette, then melt into the SAMPLED sky
-
-// Static semi-HDR tonemap — byte-identical to opaque.frag / distantland.frag::tonemap (XE
-// FixedFuncEmu.fx). Applied to the final lit colour so the distant statics' point-light core rolls
-// off the same as the near path (and the distant land, which also tonemaps). Maps 0->0, 1->0.84,
-// clamps 2.2->1.0.
-float3 tonemap(float3 c)
-{
-    c = clamp(c, 0.0f, 2.2f);
-    c = (((0.0548303f * c - 0.189786f) * c - 0.154732f) * c + 1.12969f) * c;
-    return c;
-}
+#include "tonemap.h.fsl"   // tonemap() — the shared semi-HDR curve (was six byte-identical copies)
 
 // MUST stay byte-identical to statics.vert.fsl's VSOutput, CENTROID modifiers included — see the
 // long comment there for why Color/Fog are centroid (MSAA sliver extrapolation drove the lit colour

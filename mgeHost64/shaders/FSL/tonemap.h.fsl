@@ -1,0 +1,37 @@
+// mgeHost64 — the scene tonemap (FSL ONLY).
+//
+// Static semi-HDR curve, ported verbatim from XE FixedFuncEmu.fx::tonemap. Applied to the final lit
+// colour BEFORE fog, so that a point-light core rolls off identically on every surface class — near
+// opaque, distant statics, terrain, multi-map and alpha all reach the same curve at the same stage.
+// That "same stage on every path" property is the whole reason it exists as one function.
+//
+//   Maps 0 -> 0, 1.0 -> 0.84, and 2.2 -> 1.0 — i.e. sun + ambient may overshoot 1.0 without
+//   clipping flat, which is what "semi-HDR" means here.
+//
+// Hoisted 2026-08-06 from SIX byte-identical copies (opaque / statics / alpha / multimap /
+// multimap_alpha / terrain .frag.fsl). They were copied deliberately rather than shared — see
+// forge-deferred-lightmap.md:182, where the copies were made verbatim to unify the near/far look —
+// but six independently-editable copies of the curve that is about to change is how a hue shift
+// becomes unfindable. Behaviour is identical to before the hoist; this commit changes nothing that
+// renders.
+//
+// (Older comments in statics.frag / terrain.frag pointed at "distantland.frag::tonemap" as the twin.
+// That file no longer exists — distant land is drawn by statics.frag / terrain.frag now — so the
+// reference is dropped rather than carried forward.)
+//
+// ⚠ THE `clamp(c, 0, 2.2)` IS THE HDR BLOCKER. It is not a safety clamp, it is the ceiling of the
+// whole colour chain: emissive calibration needs k ~4.5 for a lantern and ~100+ for a candle, and
+// above 2.2 every channel flattens together, so brightness survives and HUE does not. See
+// forge-deferred-lightmap.md:343 and forge-postprocess.md. When HDR lands, this file is where it
+// lands — that is why the curve is here and not inside skydome.h.fsl next to applyFog().
+//
+// SHADER-ONLY, like texsample.h.fsl / hizocclusion.h.fsl / aocommon.h.fsl: the host C++ must never
+// see raw HLSL. Needs no SRT resources — pure maths on a colour — so include order does not matter.
+// No include guard, matching every other .h.fsl here; include it exactly once per shader.
+
+float3 tonemap(float3 c)
+{
+    c = clamp(c, 0.0f, 2.2f);
+    c = (((0.0548303f * c - 0.189786f) * c - 0.154732f) * c + 1.12969f) * c;
+    return c;
+}

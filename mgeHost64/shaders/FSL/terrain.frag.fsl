@@ -25,19 +25,12 @@
 #include "shadowreceive.h.fsl" // shadowMaskPixel() — the mask texel that is actually OURS under MSAA
 #include "skyamb.h.fsl"    // skyAmbFactor() — SH-L1 sky ambient (SH1) + sky AO (SH2)
 #include "skydome.h.fsl"   // applyFog() — extinguish into a silhouette, then melt into the SAMPLED sky
+#include "tonemap.h.fsl"   // tonemap() — the shared semi-HDR curve (was six byte-identical copies)
 
 #define TERRAIN_VERTS   65
 #define TERRAIN_QUADS   64
 #define TERRAIN_TSTRIDE 256u   // uints per cell in gTerrainTex — ONE texture slot per square
 #define TERRAIN_CSTRIDE 4225u  // uints per cell in gTerrainColor — one 0x00BBGGRR per vertex
-
-// Byte-identical to distantland.frag::tonemap / opaque.frag::tonemap (XE FixedFuncEmu.fx).
-float3 tonemap(float3 c)
-{
-    c = clamp(c, 0.0f, 2.2f);
-    c = (((0.0548303f * c - 0.189786f) * c - 0.154732f) * c + 1.12969f) * c;
-    return c;
-}
 
 STRUCT(VSOutput)
 {

@@ -72,6 +72,11 @@
 #include "shaders/FSL/linearizedepth.srt.h"
 #include "shaders/FSL/gtao.srt.h"
 #include "shaders/FSL/aoblur.srt.h"
+// APL instrument (tasks/forge-postprocess.md step 2). Like linearizedepth.srt.h this header keys a
+// texture type off SAMPLE_COUNT; on the C++ side SAMPLE_COUNT is undefined so the header's own
+// #ifndef picks 1, which is harmless — both variants declare the SAME three slots in the SAME order,
+// so SRT_RES_IDX resolves identically whichever the GPU is running.
+#include "shaders/FSL/apl.srt.h"
 // ...and the two ends of the OPTIONAL half-res AO chain (AODownSrtData / AOUpSrtData, both
 // Persistent frequency). One SRT per header — see aohalfres.srt.h, which holds the AOUpParams
 // cbuffer struct both of them share.
@@ -1152,6 +1157,16 @@ namespace {
         Pipeline*      pAOBlurPipeline = nullptr;
         Buffer*        pAOParamsCbv = nullptr;    // gAOParams (invViewProj/screen/knobs/eye), persistent-mapped
         DescriptorSet* pLinearizeSet = nullptr;   // LinDepthSrtData PerBatch: gSceneDepth + gLinearDepthOut
+        // APL instrument (tasks/forge-postprocess.md step 2) — the measuring stick for the linear
+        // migration. Reduces the finished colour to mean RGB + mean log-luma, one 256-thread group,
+        // straight into the heartbeat. Ships ON: the BEFORE numbers have to come from runs made
+        // while the renderer is still gamma-space, so an instrument that defaults off is useless.
+        Shader*        pAplShader    = nullptr;
+        Pipeline*      pAplPipeline  = nullptr;
+        DescriptorSet* pAplSet       = nullptr;   // AplSrtData PerBatch: cbv + colour SRV + out UAV
+        Buffer*        pAplParamsCbv = nullptr;   // AplParams (dims)
+        Buffer*        pAplOut       = nullptr;   // GPU_ONLY, 4 uints = asuint(meanR,G,B,logLuma)
+        Buffer*        pAplReadback  = nullptr;   // GPU_TO_CPU, persistent-mapped (post-fence read)
         DescriptorSet* pGtaoBatchSet = nullptr;   // AOSrtData PerBatch:  gLinearDepthIn + gAOOut
         DescriptorSet* pAOBlurSet = nullptr;      // AOBlurSrtData PerFrame: gBlurParams + gAOSrc + gBlurDepthIn + gAODst
 
@@ -6532,6 +6547,60 @@ namespace {
             // Linearize PerBatch set: gSceneDepth (pDepth SRV) + gLinearDepthOut (pLinearDepth UAV).
             DescriptorSetDesc lset = SRT_SET_DESC(LinDepthSrtData, PerBatch, 1, 0);
             addDescriptorSet(R, &lset, &g_live.pLinearizeSet);
+
+            // --- APL instrument (tasks/forge-postprocess.md step 2) ---
+            // Same sc1/sc4 variant selection as linearize above, for the same reason: it reads the
+            // colour target, which is multisampled exactly when the scene is. NON-FATAL throughout —
+            // this is a measuring stick, and a renderer that refuses to start because its ruler is
+            // missing is a worse outcome than an unmeasured frame. Every use site null-checks.
+            {
+                ShaderLoadDesc asd = {};
+                asd.mComp.pFileName = (g_live.sampleCount > 1) ? "apl_sc4.comp" : "apl_sc1.comp";
+                addShader(R, &asd, &g_live.pAplShader);
+                if (g_live.pAplShader) {
+                    PipelineDesc apd = {};
+                    apd.mType = PIPELINE_TYPE_COMPUTE;
+                    apd.mComputeDesc.pShaderProgram = g_live.pAplShader;
+                    addPipeline(R, &apd, &g_live.pAplPipeline);
+                }
+                if (g_live.pAplPipeline) {
+                    DescriptorSetDesc aset = SRT_SET_DESC(AplSrtData, PerBatch, 1, 0);
+                    addDescriptorSet(R, &aset, &g_live.pAplSet);
+
+                    BufferLoadDesc acb = {};
+                    acb.mDesc.mDescriptors  = DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+                    acb.mDesc.mMemoryUsage  = RESOURCE_MEMORY_USAGE_CPU_TO_GPU;
+                    acb.mDesc.mFlags        = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
+                    acb.mDesc.mSize         = 256;   // cbuffer alignment, not sizeof(AplParams)
+                    acb.mDesc.pName         = "aplParams";
+                    acb.ppBuffer            = &g_live.pAplParamsCbv;
+                    addResource(&acb, nullptr);
+
+                    BufferLoadDesc aob = {};
+                    aob.mDesc.mDescriptors  = DESCRIPTOR_TYPE_RW_BUFFER;
+                    aob.mDesc.mMemoryUsage  = RESOURCE_MEMORY_USAGE_GPU_ONLY;
+                    aob.mDesc.mStructStride = sizeof(uint32_t);
+                    aob.mDesc.mElementCount = 4;
+                    aob.mDesc.mSize         = (uint64_t)sizeof(uint32_t) * 4;
+                    aob.mDesc.mStartState   = RESOURCE_STATE_UNORDERED_ACCESS;
+                    aob.mDesc.pName         = "aplOut";
+                    aob.ppBuffer            = &g_live.pAplOut;
+                    addResource(&aob, nullptr);
+
+                    BufferLoadDesc arb = {};
+                    arb.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_GPU_TO_CPU;
+                    arb.mDesc.mFlags       = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
+                    arb.mDesc.mSize        = 16;
+                    arb.mDesc.mStartState  = RESOURCE_STATE_COPY_DEST;
+                    arb.mDesc.pName        = "aplReadback";
+                    arb.ppBuffer           = &g_live.pAplReadback;
+                    addResource(&arb, nullptr);
+                }
+                if (!g_live.pAplPipeline || !g_live.pAplSet || !g_live.pAplOut) {
+                    std::printf("[forge] APL instrument unavailable (shader/pipeline/buffers) — "
+                                "frames render, APL is simply not reported\n");
+                }
+            }
             // AO set: ONE PerDraw set (gAOParams cbuffer + gLinearDepthIn SRV + gAOOut UAV), shared
             // by all four mode pipelines — the bindings are identical, so a per-mode set would be
             // four copies of the same descriptors and four more chances to hit the set/root-index
@@ -6701,6 +6770,23 @@ namespace {
                 d[1].mCount = 1;
                 d[1].ppTextures = &g_live.pLinearDepth;
                 updateDescriptorSet(R, 0, g_live.pLinearizeSet, 2, d);
+            }
+            if (g_live.pAplSet && g_live.pAplOut && g_live.pAplParamsCbv) {
+                // The target the scene finishes in: the MSAA colour when AA is on, else pRT (which
+                // wraps the shared cross-process resource). Both are created with
+                // DESCRIPTOR_TYPE_TEXTURE, so both are SRV-bindable; both live by now, since
+                // pMSAAColor is made at the top of this same buildOpaquePath and pRT back in init().
+                Texture* aplSrc = (g_live.sampleCount > 1 && g_live.pMSAAColor)
+                                    ? g_live.pMSAAColor->pTexture : g_live.pRT->pTexture;
+                DescriptorData d[3] = {};
+                d[0].mIndex    = SRT_RES_IDX(AplSrtData, PerBatch, gAplParams);
+                d[0].ppBuffers = &g_live.pAplParamsCbv;
+                d[1].mIndex    = SRT_RES_IDX(AplSrtData, PerBatch, gAplColor);
+                d[1].mCount    = 1;                     // REQUIRED for a single texture — see above
+                d[1].ppTextures = &aplSrc;
+                d[2].mIndex    = SRT_RES_IDX(AplSrtData, PerBatch, gAplOut);
+                d[2].ppBuffers = &g_live.pAplOut;
+                updateDescriptorSet(R, 0, g_live.pAplSet, 3, d);
             }
             {
                 // PerDraw set (root 0, distinct from linearize's PerBatch root 1): CBV + SRV + UAV.
@@ -7675,6 +7761,12 @@ namespace {
     //    GPU's frame time any more (see g_lastGpuMs, which now comes from the resolved
     //    kGpuPhaseFrame timestamp) — it is the residual the overlap failed to hide.
     unsigned  g_frameOverruns = 0;
+    // APL instrument (tasks/forge-postprocess.md step 2). Accumulated over the heartbeat window: a
+    // single frame's average is noisy enough to hide the shift the linear migration must be proved
+    // not to make, so the reported number is the window mean, exactly like gpu/rec.
+    double    g_aplAccum[4] = { 0.0, 0.0, 0.0, 0.0 };   // R, G, B, log-luma
+    unsigned  g_aplN        = 0;
+    float     g_lastApl[4]  = { 0.0f, 0.0f, 0.0f, 0.0f };
     double    g_lastGpuWaitMs = 0.0;
     // Tier 1 fail-safe: does the CLIENT hold an imported timeline semaphore it will wait before
     // copying the shared RT? Only then may renderScene return without settling its own frame.
@@ -9979,6 +10071,17 @@ namespace ForgeRender {
             g_lightOccludedBits = *(const uint32_t*)g_live.pLightOccReadback->pCpuMappedAddress;
             g_lightOccValid     = true;
         }
+        // APL instrument: mean RGB + mean log-luma of the frame that just finished — one frame late,
+        // like every other readback settled here, which is irrelevant for a rolling average.
+        if (g_live.pAplReadback && g_live.pAplReadback->pCpuMappedAddress) {
+            const float* a = (const float*)g_live.pAplReadback->pCpuMappedAddress;
+            for (int i = 0; i < 4; ++i) {
+                g_lastApl[i]   = a[i];
+                g_aplAccum[i] += (double)a[i];
+            }
+            ++g_aplN;
+        }
+
         // Per-frame slow-GPU self-report (the 300-frame average can't surface a fresh dense-area
         // stall at 0.2 fps). Pairs with [dl-slow] (CPU cull) to localize a hitch to CPU vs GPU.
         if (g_lastGpuMs > 30.0) {
@@ -15195,6 +15298,60 @@ namespace ForgeRender {
             cmdBindRenderTargets(g_live.pCmd, nullptr);
         }
 
+        // --- APL instrument (tasks/forge-postprocess.md step 2) -------------------------------
+        // Runs HERE, last thing before the resolve, and the position is the whole point: everything
+        // that will be displayed has drawn (colour, water, glow, sorted alpha, volfog, FP arms) and
+        // the dev overlay has NOT — drawDevUI() draws after the resolve, and an ImGui panel in the
+        // average would swamp the very shift we are trying to measure.
+        //
+        // Reads the target the scene actually finished in: pMSAAColor when AA is on, else pRT. A
+        // self-contained RENDER_TARGET -> SHADER_RESOURCE -> RENDER_TARGET round trip, deliberately
+        // NOT folded into the resolve's own barriers below: that block also drives the cross-process
+        // handoff to D3D9Ex natively, and it is not the place to save one barrier.
+        //
+        // ⚠ width/height, NOT allocWidth/allocHeight. The colour target is ALLOC-sized while the
+        // scene renders into a width x height viewport inside it ([[project_forge_alloc_vs_render_uv]]);
+        // sampling the allocation would average in never-rendered texels and the number would move
+        // whenever render scale changed, which is exactly when it must NOT.
+        if (g_live.pAplPipeline && g_live.pAplSet && g_live.pAplOut && g_live.pAplParamsCbv) {
+            const uint32_t aplGrid = 128u;   // 128x128 = 16384 samples; see apl.comp.fsl
+            if (g_live.pAplParamsCbv->pCpuMappedAddress) {
+                const float p[4] = { (float)g_live.width, (float)g_live.height, (float)aplGrid,
+                                     1.0f / (float)(aplGrid * aplGrid) };
+                std::memcpy(g_live.pAplParamsCbv->pCpuMappedAddress, p, sizeof(p));
+            }
+            RenderTarget* aplRt = (g_live.sampleCount > 1 && g_live.pMSAAColor) ? g_live.pMSAAColor
+                                                                                : g_live.pRT;
+            RenderTargetBarrier arb = {};
+            arb.pRenderTarget = aplRt;
+            arb.mCurrentState = RESOURCE_STATE_RENDER_TARGET;
+            arb.mNewState     = RESOURCE_STATE_SHADER_RESOURCE;
+            cmdResourceBarrier(g_live.pCmd, 0, nullptr, 0, nullptr, 1, &arb);
+
+            cmdBeginDebugMarker(g_live.pCmd, 0.4f, 0.9f, 0.4f, "APL (scene colour -> mean RGB + log luma)");
+            cmdBindPipeline(g_live.pCmd, g_live.pAplPipeline);
+            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pAplSet);
+            cmdDispatch(g_live.pCmd, 1, 1, 1);   // ONE group by design — see apl.comp.fsl
+            cmdEndDebugMarker(g_live.pCmd);
+
+            arb.mCurrentState = RESOURCE_STATE_SHADER_RESOURCE;
+            arb.mNewState     = RESOURCE_STATE_RENDER_TARGET;
+            cmdResourceBarrier(g_live.pCmd, 0, nullptr, 0, nullptr, 1, &arb);
+
+            if (g_live.pAplReadback) {
+                BufferBarrier bb = {};
+                bb.pBuffer = g_live.pAplOut;
+                bb.mCurrentState = RESOURCE_STATE_UNORDERED_ACCESS;
+                bb.mNewState     = RESOURCE_STATE_COPY_SOURCE;
+                cmdResourceBarrier(g_live.pCmd, 1, &bb, 0, nullptr, 0, nullptr);
+                g_live.pCmd->mDx.pCmdList->CopyBufferRegion(
+                    g_live.pAplReadback->mDx.pResource, 0, g_live.pAplOut->mDx.pResource, 0, 16);
+                bb.mCurrentState = RESOURCE_STATE_COPY_SOURCE;
+                bb.mNewState     = RESOURCE_STATE_UNORDERED_ACCESS;
+                cmdResourceBarrier(g_live.pCmd, 1, &bb, 0, nullptr, 0, nullptr);
+            }
+        }
+
         gpuPhaseBegin(kGpuPhaseResolve);
         if (g_live.sampleCount > 1) {
             // MSAA: resolve the multisampled color into the shared single-sample RT, then leave
@@ -15617,9 +15774,33 @@ namespace ForgeRender {
                          frameExec, g_lastGpuWaitMs, frameExec - g_lastGpuWaitMs, g_frameOverruns,
                          (g_lastGpuWaitMs < 0.5 * frameExec) ? "OVERLAPPED (host ran under the GPU)"
                                                              : "still serial (host waits the GPU)");
+            // APL instrument (tasks/forge-postprocess.md step 2). Three numbers, deliberately:
+            //   apl  = luma of the mean colour — the literal average picture level.
+            //   geo  = exp(mean log luma) — the geometric mean, the exposure metric, and later the
+            //          input to the ported Eye Adaptation. It moves differently from apl when the
+            //          distribution changes shape rather than its level, which is precisely what a
+            //          gamma->linear migration does, so reporting only one of the two would hide it.
+            //   cast = mean RGB divided by apl — the colour cast with overall level DIVIDED OUT.
+            //          This is the "hues" half: it stays put under an exposure change and moves the
+            //          moment the migration tints anything, so the two failure modes are separable
+            //          instead of being one number that drifted.
+            if (g_aplN > 0u) {
+                const double inv = 1.0 / (double)g_aplN;
+                const double r = g_aplAccum[0] * inv;
+                const double g = g_aplAccum[1] * inv;
+                const double b = g_aplAccum[2] * inv;
+                const double apl = 0.299 * r + 0.587 * g + 0.114 * b;
+                const double geo = std::exp(g_aplAccum[3] * inv);
+                const double n   = (apl > 1.0e-6) ? (1.0 / apl) : 0.0;
+                LOG::logline(">> [forge-hb] apl: mean=(%.4f,%.4f,%.4f) apl=%.4f geo=%.4f"
+                             " cast=(%.3f,%.3f,%.3f) n=%u",
+                             r, g, b, apl, geo, r * n, g * n, b * n, g_aplN);
+            }
             dlLogHeartbeat();
             g_recAccum = 0.0;
             g_gpuAccum = 0.0;
+            g_aplAccum[0] = g_aplAccum[1] = g_aplAccum[2] = g_aplAccum[3] = 0.0;
+            g_aplN = 0;
         }
         return true;
     }
@@ -23881,6 +24062,14 @@ namespace ForgeRender {
             if (g_live.pAOShader[m]) { removeShader(R, g_live.pAOShader[m]); }
         }
         if (g_live.pLinearizeShader){ removeShader(R, g_live.pLinearizeShader); }
+        // APL instrument (tasks/forge-postprocess.md step 2). Set -> pipeline -> shader -> buffers,
+        // the same order the linearize/AO objects above use.
+        if (g_live.pAplSet)         { removeDescriptorSet(R, g_live.pAplSet);  g_live.pAplSet = nullptr; }
+        if (g_live.pAplPipeline)    { removePipeline(R, g_live.pAplPipeline);  g_live.pAplPipeline = nullptr; }
+        if (g_live.pAplShader)      { removeShader(R, g_live.pAplShader);      g_live.pAplShader = nullptr; }
+        if (g_live.pAplReadback)    { removeResource(g_live.pAplReadback);     g_live.pAplReadback = nullptr; }
+        if (g_live.pAplOut)         { removeResource(g_live.pAplOut);          g_live.pAplOut = nullptr; }
+        if (g_live.pAplParamsCbv)   { removeResource(g_live.pAplParamsCbv);    g_live.pAplParamsCbv = nullptr; }
         if (g_live.pAOParamsCbv)    { removeResource(g_live.pAOParamsCbv); }
         if (g_live.pAOBlur)         { removeResource(g_live.pAOBlur); }
         if (g_live.pAO)             { removeResource(g_live.pAO); }

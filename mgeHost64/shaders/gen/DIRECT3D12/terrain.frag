@@ -1850,19 +1850,20 @@ float3 applyFog(float3 lit, float3 worldPosRel, float2 pixelXy, float fog)
     return lerp(fogSkyTarget(s), lit, fog);
 }
 #line 28 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terrain.frag.fsl"
-
-
-
-
-
-
-
+#line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/tonemap.h.fsl"
+#line 32 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/tonemap.h.fsl"
 float3 tonemap(float3 c)
 {
     c = clamp(c, 0.0f, 2.2f);
     c = (((0.0548303f * c - 0.189786f) * c - 0.154732f) * c + 1.12969f) * c;
     return c;
 }
+#line 29 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terrain.frag.fsl"
+
+
+
+
+
 
 STRUCT(VSOutput)
 {
@@ -1872,7 +1873,7 @@ STRUCT(VSOutput)
     DATA(CENTROID(float), Fog, TEXCOORD2);
     DATA(float2, Lattice, TEXCOORD3);
     DATA(FLAT(uint4), Cell, TEXCOORD4);
-#line 50
+#line 43
 };
 
 
@@ -1957,7 +1958,7 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
         albedo += sampleLand(id01, uv) * w01;
         albedo += sampleLand(id11, uv) * w11;
     }
-#line 149 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terrain.frag.fsl"
+#line 142 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terrain.frag.fsl"
     {
         const uint cslot = In.Cell.x;
         float3 c00 = loadVertexColor(cslot, x0, y0);
@@ -1969,7 +1970,7 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
 
     float3 normal = normalize(In.Normal);
     float sunVis = sunShadowVisibility(In.WorldPos, normal);
-#line 191 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terrain.frag.fsl"
+#line 184 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terrain.frag.fsl"
     bool inReflect = (gFrameData.gReflWaterClip.z != 0.0f);
     uint aoFlags = (uint)(gFrameData.debugParams.w + 0.5f);
 
@@ -1994,7 +1995,7 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
     float3 result = albedo
                   * (gFrameData.sunCol.rgb * saturate(dot(-gFrameData.sunDir.xyz, normal)) * sunVis
                      + amb);
-#line 237 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terrain.frag.fsl"
+#line 230 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terrain.frag.fsl"
     float3 pointDiffuse = float3(0.0f, 0.0f, 0.0f);
 
 

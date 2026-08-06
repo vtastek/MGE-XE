@@ -275,6 +275,20 @@
 #include "linearizedepth.comp.fsl"
 #end
 
+// APL instrument (tasks/forge-postprocess.md step 2): reduces the finished scene colour to
+// mean RGB + mean log-luma, one 256-thread group, straight into the heartbeat. The measuring stick
+// for the linear migration — it must ship ON so that today's runs are the BEFORE baseline.
+// Same two-SAMPLE_COUNT-variants pattern as linearizedepth above.
+#comp apl_sc1.comp
+#define SAMPLE_COUNT 1
+#include "apl.comp.fsl"
+#end
+
+#comp apl_sc4.comp
+#define SAMPLE_COUNT 4
+#include "apl.comp.fsl"
+#end
+
 // Screen-space AO — FOUR interchangeable modes behind one SRT (AOSrtData) and one descriptor set.
 // The host holds pAOShader[]/pAOPipeline[] indexed by the "AO mode" dropdown and binds one of them;
 // all four read the already-resolved single-sample depth (never the MSAA DSV) and write

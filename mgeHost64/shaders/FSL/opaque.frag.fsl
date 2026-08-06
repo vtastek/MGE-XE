@@ -14,6 +14,7 @@
 #include "msmrecv.h.fsl"     // sunShadowVisibility() — MSM sun-shadow receiver
 #include "skyamb.h.fsl"      // skyAmbFactor() — SH-L1 sky ambient (SH1) + sky AO (SH2)
 #include "skydome.h.fsl"     // applyFog() — extinguish into a silhouette, then melt into the SAMPLED sky
+#include "tonemap.h.fsl"     // tonemap() — the shared semi-HDR curve (was six byte-identical copies)
 #include "enchantglow.h.fsl" // enchantGlow() — MW's caustic env map over enchanted items
 
 STRUCT(VSOutput)
@@ -33,15 +34,6 @@ STRUCT(VSOutput)
     DATA(FLAT(uint),  OverlayIndex,TEXCOORD9);// terrain DECAL_1 bindless slot (0 = no decal)
     DATA(FLAT(uint),  ClampMode,  TEXCOORD10);// MW texture address mode (0..3) -> sampleBase()
 };
-
-// Static semi-HDR tonemap — ported verbatim from XE FixedFuncEmu.fx::tonemap.
-// Maps 0->0, 1.0->0.84, up to 2.2->1.0 (lets sun+ambient overshoot 1 without clipping flat).
-float3 tonemap(float3 c)
-{
-    c = clamp(c, 0.0f, 2.2f);
-    c = (((0.0548303f * c - 0.189786f) * c - 0.154732f) * c + 1.12969f) * c;
-    return c;
-}
 
 ROOT_SIGNATURE(DefaultRootSignature)
 float4 PS_MAIN( VSOutput In )
