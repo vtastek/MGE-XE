@@ -77,6 +77,12 @@
 // #ifndef picks 1, which is harmless — both variants declare the SAME three slots in the SAME order,
 // so SRT_RES_IDX resolves identically whichever the GPU is running.
 #include "shaders/FSL/apl.srt.h"
+// Custom MSAA resolve (tasks/forge-postprocess.md step 4) — ResolveSrtData, PerDraw frequency, the
+// host's FIRST graphics SRT other than opaque.srt.h. It unions into the same default.rootsig; The
+// Forge's own Visibility_Buffer ships several graphics SRTs side by side, which is the precedent.
+// Same SAMPLE_COUNT note as apl.srt.h above: C++ sees the header's #ifndef default and all variants
+// declare the same two slots in the same order, so SRT_RES_IDX resolves identically.
+#include "shaders/FSL/resolve.srt.h"
 // ...and the two ends of the OPTIONAL half-res AO chain (AODownSrtData / AOUpSrtData, both
 // Persistent frequency). One SRT per header — see aohalfres.srt.h, which holds the AOUpParams
 // cbuffer struct both of them share.
@@ -1167,6 +1173,14 @@ namespace {
         Buffer*        pAplParamsCbv = nullptr;   // AplParams (dims)
         Buffer*        pAplOut       = nullptr;   // GPU_ONLY, 4 uints = asuint(meanR,G,B,logLuma)
         Buffer*        pAplReadback  = nullptr;   // GPU_TO_CPU, persistent-mapped (post-fence read)
+        // Custom MSAA resolve (tasks/forge-postprocess.md step 4) — Catmull-Rom reconstruction with
+        // inverse-luminance firefly weighting, replacing cl->ResolveSubresource. MSAA only; null at
+        // 1x, where the scene renders straight into pRT. NON-FATAL: if any of these is missing the
+        // hardware resolve runs, which is also the live A/B (g_customResolve).
+        Shader*        pResolveShader    = nullptr;   // resolve.vert + resolve_sc{2,4,8}.frag
+        Pipeline*      pResolvePipeline  = nullptr;   // fullscreen tri into pRT (single-sample), depth OFF, no blend
+        DescriptorSet* pResolveSet       = nullptr;   // ResolveSrtData PerDraw: cbv + MSAA colour SRV
+        Buffer*        pResolveParamsCbv = nullptr;   // ResolveParams (dims + opts), persistent-mapped
         DescriptorSet* pGtaoBatchSet = nullptr;   // AOSrtData PerBatch:  gLinearDepthIn + gAOOut
         DescriptorSet* pAOBlurSet = nullptr;      // AOBlurSrtData PerFrame: gBlurParams + gAOSrc + gBlurDepthIn + gAODst
 
@@ -5779,6 +5793,75 @@ namespace {
             }
         }
 
+        // --- Custom MSAA resolve (tasks/forge-postprocess.md step 4) -----------------------------
+        // Filtered Catmull-Rom reconstruction replacing cl->ResolveSubresource. Unlike every other
+        // fullscreen pass above it does NOT reuse shadowatlasview.vert / opaque.srt.h: its own
+        // resolve.vert (private pairing, no shared-frag hazard) and its own ResolveSrtData PerDraw
+        // set — the MSAA colour has to be bound as a Tex2DMS SRV whose sample count is a shader
+        // literal, and opaque.srt.h is shared by every graphics shader in the host.
+        //
+        // Two things differ from savPd and both matter: mSampleCount is 1 (this draws INTO the
+        // resolved single-sample pRT, not the MSAA target), and there is no depth state at all.
+        //
+        // MSAA-only and NON-FATAL: at 1x the scene renders straight into pRT and there is nothing to
+        // resolve; on any failure g_customResolve simply never engages and the hardware resolve runs.
+        if (g_live.sampleCount > 1) {
+            const char* resolveFrag = (g_live.sampleCount == 8) ? "resolve_sc8.frag"
+                                    : (g_live.sampleCount == 4) ? "resolve_sc4.frag"
+                                    : (g_live.sampleCount == 2) ? "resolve_sc2.frag" : nullptr;
+            if (!resolveFrag) {
+                // 16x (or anything else the client can ask for) has no variant — not a failure, the
+                // hardware resolve covers it. Say so, because "my resolve slider does nothing" is
+                // otherwise indistinguishable from a broken pipeline.
+                LOG::logline(">> [resolve] sampleCount=%u has no shader variant — hardware resolve only",
+                             g_live.sampleCount);
+            } else {
+                ShaderLoadDesc rsDesc = {};
+                rsDesc.mVert.pFileName = "resolve.vert";
+                rsDesc.mFrag.pFileName = resolveFrag;
+                addShader(R, &rsDesc, &g_live.pResolveShader);
+                if (g_live.pResolveShader) {
+                    DepthStateDesc rsDepth = {};
+                    rsDepth.mDepthTest  = false;
+                    rsDepth.mDepthWrite = false;
+
+                    RasterizerStateDesc rsRaster = {};
+                    rsRaster.mCullMode = CULL_MODE_NONE;
+
+                    PipelineDesc rsPd = {};
+                    rsPd.mType = PIPELINE_TYPE_GRAPHICS;
+                    GraphicsPipelineDesc& rsg = rsPd.mGraphicsDesc;
+                    rsg.mPrimitiveTopo     = PRIMITIVE_TOPO_TRI_LIST;
+                    rsg.mRenderTargetCount = 1;
+                    rsg.pColorFormats      = &g_live.pRT->mFormat;
+                    rsg.mSampleCount       = SAMPLE_COUNT_1;   // destination is the RESOLVED target
+                    rsg.mSampleQuality     = 0;
+                    rsg.pDepthState        = &rsDepth;
+                    rsg.pVertexLayout      = nullptr;
+                    rsg.pRasterizerState   = &rsRaster;
+                    rsg.pShaderProgram     = g_live.pResolveShader;
+                    addPipeline(R, &rsPd, &g_live.pResolvePipeline);
+                }
+                if (g_live.pResolvePipeline) {
+                    DescriptorSetDesc rsSet = SRT_SET_DESC(ResolveSrtData, PerDraw, 1, 0);
+                    addDescriptorSet(R, &rsSet, &g_live.pResolveSet);
+
+                    BufferLoadDesc rcb = {};
+                    rcb.mDesc.mDescriptors = DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+                    rcb.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_CPU_TO_GPU;
+                    rcb.mDesc.mFlags       = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
+                    rcb.mDesc.mSize        = 256;   // cbuffer alignment, not sizeof(ResolveParams)
+                    rcb.mDesc.pName        = "resolveParams";
+                    rcb.ppBuffer           = &g_live.pResolveParamsCbv;
+                    addResource(&rcb, nullptr);
+                }
+                if (!g_live.pResolvePipeline || !g_live.pResolveSet || !g_live.pResolveParamsCbv) {
+                    std::printf("[forge] custom resolve unavailable (%s) — hardware ResolveSubresource\n",
+                                resolveFrag);
+                }
+            }
+        }
+
         // --- AT1: sorted-alpha shader + 2 blend PSOs + world window + instance VB ---------------
         // opaque.vert (SAME vl + SrtData/default.rootsig — SV_Position matches the prepass exactly)
         // + a dedicated alpha.frag that keeps the full Tier 1/2b/3a lighting but outputs REAL alpha
@@ -6866,6 +6949,19 @@ namespace {
                 d[2].mIndex    = SRT_RES_IDX(AplSrtData, PerBatch, gAplOut);
                 d[2].ppBuffers = &g_live.pAplOut;
                 updateDescriptorSet(R, 0, g_live.pAplSet, 3, d);
+            }
+            // Custom resolve (step 4): the MSAA colour as a Tex2DMS SRV + its params cbuffer. Bound
+            // ONCE — neither resource is ever recreated without rebuilding this path, and the live
+            // knobs ride the cbuffer contents, not the descriptor. Guarded on pMSAAColor for the same
+            // reason the pipeline is: MSAA-only pass.
+            if (g_live.pResolveSet && g_live.pResolveParamsCbv && g_live.pMSAAColor) {
+                DescriptorData d[2] = {};
+                d[0].mIndex     = SRT_RES_IDX(ResolveSrtData, PerDraw, gResolveParams);
+                d[0].ppBuffers  = &g_live.pResolveParamsCbv;
+                d[1].mIndex     = SRT_RES_IDX(ResolveSrtData, PerDraw, gResolveSource);
+                d[1].mCount     = 1;                     // REQUIRED for a single texture — see above
+                d[1].ppTextures = &g_live.pMSAAColor->pTexture;
+                updateDescriptorSet(R, 0, g_live.pResolveSet, 2, d);
             }
             {
                 // PerDraw set (root 0, distinct from linearize's PerBatch root 1): CBV + SRV + UAV.
@@ -8395,6 +8491,26 @@ namespace {
     // far, and raise it first if half res ever looks blocky rather than blaming the AO.
     float    g_aoUpSigma    = 1.0f;   // upscale range sigma, WORLD units (same form as the blur's)
 
+    // --- Custom MSAA resolve (tasks/forge-postprocess.md step 4) ---------------------------------
+    // Ticking this off falls back to cl->ResolveSubresource, so the whole feature is a LIVE A/B in
+    // one build against the 0.14-0.18 ms fixed-function baseline — which matters because the tap
+    // count is the one number in that plan with no estimate behind it (~200 MSAA loads/pixel at
+    // diameter 6 over 2048x1536). Graphics shaders do NOT hot-reload, so every knob that decides
+    // cost is a uniform, not a #define.
+    bool     g_customResolve   = true;
+    // Sample radius follows as round(diameter/2) — MSAAFilter.cpp:290 — so 6 -> 3 -> a 7x7
+    // neighbourhood (~196 loads/px), 4 -> 2 -> 5x5 (~100), 2 -> 1 -> 3x3 (~36). The corners of each
+    // neighbourhood fail the radius test and are never loaded, so cost tracks the DISC, not the box.
+    //
+    // 4.0 is A/B'd, not inherited: MJP ships 2.0, the ask here was 6.0, and in-game 6 was "pretty
+    // costly" while 2 read sharper — 4 is where distant alpha-test edges smooth out with textures
+    // still crisp. [[project_forge_prior_art_constants_dont_transfer]] is the rule this follows:
+    // port the mechanism, re-derive the value.
+    float    g_resolveDiameter = 4.0f;
+    // Karis 1/(1+luma) weighting. Weak in LDR by construction (samples are already tonemapped into
+    // [0,1]); it is here so the HDR switch at step 6 is a format change and nothing else.
+    bool     g_resolveInvLuma  = true;
+
     // AO contribution toggles → FrameData.debugParams.w bitmask (bit0 AO, bit1 bent normal, bit2 ambient=white).
     // These two now ARM the AO dispatch as well as consume it (renderScene derives the dispatch gate
     // from them plus the F12 AO views), so baseline-thinning still holds — both off = no AO compute
@@ -9090,6 +9206,16 @@ namespace {
           t.sliderF("Reflect: water clip bias (-) cuts higher / (+) keeps submerged", &g_reflWaterClipBias, -50.0f, 16.0f, 0.5f);
           t.checkbox("Reflect: near scene swaps winding (off = backfaces)", &g_reflNearSwapWinding);
           t.dynamicText("", &g_waterHeightText, &g_waterHeightColor);
+          t.flush(); }
+
+        // -- Tab: Resolve (custom MSAA resolve — tasks/forge-postprocess.md step 4) --
+        // MSAA-only. Unticking the first box reverts to cl->ResolveSubresource in the SAME build,
+        // which is how the cost gets measured honestly: watch `resolve` in the gpu split across the
+        // toggle and across the diameter, on one frame, in one session.
+        { TabBuilder t; t.panel = g_uiPanel; t.name = "Resolve (MSAA)";
+          t.checkbox("Custom resolve (off = hardware ResolveSubresource)", &g_customResolve);
+          t.sliderF("Filter diameter (px; 6 = 7x7, 4 = 5x5, 2 = 3x3)", &g_resolveDiameter, 1.0f, 6.0f, 0.5f);
+          t.checkbox("Inverse-luminance firefly weighting", &g_resolveInvLuma);
           t.flush(); }
 
         // -- Tab: Alpha (sorted-alpha takeover debug) --
@@ -15560,7 +15686,84 @@ namespace ForgeRender {
         }
 
         gpuPhaseBegin(kGpuPhaseResolve);
-        if (g_live.sampleCount > 1) {
+        // --- Custom shader resolve (tasks/forge-postprocess.md step 4) ---------------------------
+        // Catmull-Rom reconstruction + inverse-luminance firefly weighting, straight into the shared
+        // RT. Ticking g_customResolve off falls through to the hardware ResolveSubresource below, so
+        // the two are a live A/B in one build — which is the point, since `resolve` in the gpu split
+        // is the only honest measurement of what ~150 MSAA loads/pixel actually costs here.
+        //
+        // It has to exist before HDR can: a hardware resolve cannot format-convert, so the moment
+        // pMSAAColor goes fp16 this is the only path left. See resolve.srt.h.
+        const bool shaderResolve = g_customResolve && (g_live.sampleCount > 1)
+                                && g_live.pResolvePipeline && g_live.pResolveSet
+                                && g_live.pResolveParamsCbv && g_live.pMSAAColor;
+        if (shaderResolve) {
+            ID3D12GraphicsCommandList* cl = g_live.pCmd->mDx.pCmdList;
+
+            if (g_live.pResolveParamsCbv->pCpuMappedAddress) {
+                const float diam = (g_resolveDiameter > 0.001f) ? g_resolveDiameter : 0.001f;
+                // MSAAFilter.cpp:290 — SampleRadius = (uint)((diameter / 2) + 0.499f). Kept exactly,
+                // so diameter 6 -> 3 (7x7), 4 -> 2 (5x5), 2 -> 1 (3x3).
+                const float radius = std::floor(diam * 0.5f + 0.499f);
+                // ⚠ width/height, NOT allocWidth/allocHeight — the clamp bound must be the RENDER
+                // rect or the filter reaches into texels the scene never wrote. Same trap as APL.
+                const float p[8] = { (float)g_live.width, (float)g_live.height, diam, radius,
+                                     g_resolveInvLuma ? 1.0f : 0.0f, 0.0f, 0.0f, 0.0f };
+                std::memcpy(g_live.pResolveParamsCbv->pCpuMappedAddress, p, sizeof(p));
+            }
+
+            // Source: MSAA colour RENDER_TARGET -> SHADER_RESOURCE (the APL block's idiom, and it is
+            // a Forge-managed target so it takes a Forge barrier).
+            RenderTargetBarrier srb = {};
+            srb.pRenderTarget = g_live.pMSAAColor;
+            srb.mCurrentState = RESOURCE_STATE_RENDER_TARGET;
+            srb.mNewState     = RESOURCE_STATE_SHADER_RESOURCE;
+            cmdResourceBarrier(g_live.pCmd, 0, nullptr, 0, nullptr, 1, &srb);
+
+            // Destination: the SHARED resource, driven natively like the hardware path does.
+            // ⚠ Only on non-first frames. Frame 0 it was created RENDER_TARGET, which is already the
+            // state we want — and D3D12 rejects a transition whose before and after states match.
+            if (!g_live.firstFrame) {
+                D3D12_RESOURCE_BARRIER toRt = {};
+                toRt.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                toRt.Transition.pResource   = g_live.pSharedRes;
+                toRt.Transition.Subresource = 0;
+                toRt.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+                toRt.Transition.StateAfter  = D3D12_RESOURCE_STATE_RENDER_TARGET;
+                cl->ResourceBarrier(1, &toRt);
+            }
+
+            cmdBeginDebugMarker(g_live.pCmd, 0.9f, 0.7f, 0.3f, "RESOLVE (Catmull-Rom + firefly)");
+            BindRenderTargetsDesc rbind = {};
+            rbind.mRenderTargetCount = 1;
+            // DONTCARE: the draw covers every pixel of the viewport. Outside it the target keeps its
+            // previous contents, exactly as in the 1x path where the scene also renders into a
+            // width x height rect of an alloc-sized RT.
+            rbind.mRenderTargets[0] = { g_live.pRT, LOAD_ACTION_DONTCARE };
+            cmdBindRenderTargets(g_live.pCmd, &rbind);
+            cmdSetViewport(g_live.pCmd, 0.0f, 0.0f, (float)g_live.width, (float)g_live.height, 0.0f, 1.0f);
+            cmdSetScissor(g_live.pCmd, 0, 0, g_live.width, g_live.height);
+            cmdBindPipeline(g_live.pCmd, g_live.pResolvePipeline);
+            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pResolveSet);
+            cmdDraw(g_live.pCmd, 3, 0);
+            cmdBindRenderTargets(g_live.pCmd, nullptr);
+            cmdEndDebugMarker(g_live.pCmd);
+
+            srb.mCurrentState = RESOURCE_STATE_SHADER_RESOURCE;
+            srb.mNewState     = RESOURCE_STATE_RENDER_TARGET;   // ready for next frame
+            cmdResourceBarrier(g_live.pCmd, 0, nullptr, 0, nullptr, 1, &srb);
+
+            // Dev overlay into the resolved pRT (RENDER_TARGET), then hand off to COMMON natively —
+            // identical tail to the hardware path below.
+            drawDevUI();
+            D3D12_RESOURCE_BARRIER toCommon = {};
+            toCommon.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            toCommon.Transition.pResource   = g_live.pSharedRes;
+            toCommon.Transition.Subresource = 0;
+            toCommon.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+            toCommon.Transition.StateAfter  = D3D12_RESOURCE_STATE_COMMON;   // hand off to D3D9Ex
+            cl->ResourceBarrier(1, &toCommon);
+        } else if (g_live.sampleCount > 1) {
             // MSAA: resolve the multisampled color into the shared single-sample RT, then leave
             // the shared RT in COMMON for MW's D3D9Ex StretchRect. Forge has no RESOLVE resource
             // states, so this is driven natively (the shared RT is already managed natively).
@@ -24282,6 +24485,11 @@ namespace ForgeRender {
         if (g_live.pAplReadback)    { removeResource(g_live.pAplReadback);     g_live.pAplReadback = nullptr; }
         if (g_live.pAplOut)         { removeResource(g_live.pAplOut);          g_live.pAplOut = nullptr; }
         if (g_live.pAplParamsCbv)   { removeResource(g_live.pAplParamsCbv);    g_live.pAplParamsCbv = nullptr; }
+        // Custom MSAA resolve (step 4) — same set -> pipeline -> shader -> buffer order.
+        if (g_live.pResolveSet)      { removeDescriptorSet(R, g_live.pResolveSet); g_live.pResolveSet = nullptr; }
+        if (g_live.pResolvePipeline) { removePipeline(R, g_live.pResolvePipeline); g_live.pResolvePipeline = nullptr; }
+        if (g_live.pResolveShader)   { removeShader(R, g_live.pResolveShader);     g_live.pResolveShader = nullptr; }
+        if (g_live.pResolveParamsCbv){ removeResource(g_live.pResolveParamsCbv);   g_live.pResolveParamsCbv = nullptr; }
         if (g_live.pAOParamsCbv)    { removeResource(g_live.pAOParamsCbv); }
         if (g_live.pAOBlur)         { removeResource(g_live.pAOBlur); }
         if (g_live.pAO)             { removeResource(g_live.pAO); }

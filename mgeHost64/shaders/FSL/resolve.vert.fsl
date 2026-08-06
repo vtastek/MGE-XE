@@ -1,0 +1,29 @@
+// mgeHost64 — custom MSAA resolve (vertex stage).  tasks/forge-postprocess.md step 4.
+//
+// Fullscreen triangle, no vertex buffer, no resources. PRIVATE to resolve.frag: it deliberately does
+// NOT reuse shadowatlasview.vert, and resolve.frag deliberately does not consume that VSOutput.
+// The shared-frag hazard ([[project_forge_shared_frag_vsoutput]]) is a GPU hang, and the resolve is
+// the one pass whose output goes straight into the cross-process shared resource MW reads — the
+// cheapest possible pairing is the right one here. SV_Position alone; the frag needs pixel
+// coordinates and nothing else.
+//
+// No SRT include: this stage binds nothing. DefaultRootSignature is self-contained (tri.vert.fsl).
+
+STRUCT(PsIn)
+{
+    DATA(float4, position, SV_Position);
+};
+
+ROOT_SIGNATURE(DefaultRootSignature)
+PsIn VS_MAIN( SV_VertexID(uint) VertexID )
+{
+    INIT_MAIN;
+    PsIn Out;
+    // (0,0) (2,0) (0,2) in UV -> the standard oversized triangle covering the whole VIEWPORT.
+    // Viewport, not target: pRT is alloc-sized and the resolve is issued under a width x height
+    // viewport at (0,0), so SV_Position.xy comes back as render-space pixel coordinates that index
+    // pMSAAColor 1:1.
+    float2 uv = float2(float((VertexID << 1) & 2), float(VertexID & 2));
+    Out.position = float4(uv.x * 2.0f - 1.0f, 1.0f - uv.y * 2.0f, 0.0f, 1.0f);
+    RETURN(Out);
+}

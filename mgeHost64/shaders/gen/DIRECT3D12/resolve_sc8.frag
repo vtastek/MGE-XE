@@ -4,7 +4,7 @@
 
 #define DIRECT3D12
 #define DIRECT3D12
-#define STAGE_VERT
+#define STAGE_FRAG
 /*
 * Copyright (c) 2017-2025 The Forge Interactive Inc.
 *
@@ -972,399 +972,131 @@ SamplerState gSampler2xWrapClamp : register( s17 , space100 ) ;
 #line 247 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/../../../3rdparty/The-Forge/Common_3/Graphics/FSL/defaults.h"
 
 #line 11 "FSL/shaders.list"
-#line 291 "FSL/shaders.list"
-#line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowatlasview.vert.fsl"
-#line 9 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowatlasview.vert.fsl"
-#line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
-#line 20 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
-#line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
-#line 26 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
-STRUCT(ShadowMaskParams)
+#line 274 "FSL/shaders.list"
+#line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/resolve.frag.fsl"
+#line 35 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/resolve.frag.fsl"
+#line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/resolve.srt.h"
+#line 30 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/resolve.srt.h"
+STRUCT(ResolveParams)
 {
-    float4x4 invViewProj;
 
 
 
 
 
 
-    float4 screenParams;
-    float4 maskParams;
-    float4 slotPosRad[ 32 ];
-    float4 slotTile[ 32 ];
 
 
 
 
-    float4 biasParams;
+    float4 dims;
 
 
 
-    uint4 slotBits;
 
 
-    float4 slotFlick[ 32 ];
-
-
-
-
-
-
-
-
-
-
-    float4x4 sunViewProj[ 2 ];
-#line 75 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
-    float4 sunParams;
-
-
-    float4 sunCascadeTexel;
-#line 94 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
-    float4 sunPcf0;
-
-
-
-
-
-
-    float4 sunPcf1;
-
-
-
-
-
-
-
-    float4 volFog0;
-
-
-
-
-
-
-    float4 volFog1;
-
-
-
-
-    float4 volFog2;
-
-
-
-
-
-
-    float4 volFog3;
-#line 151 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
-    float4 volFog4;
-
-
-
-
-
-
-
-    float4 screenAlloc;
-#line 171 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
-    float4 shAr;
-    float4 shAg;
-    float4 shAb;
-#line 186 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
-    float4 skyParams;
-
-
-
-
-
-
-
-
-
-
-    float4 skyAOMap;
-#line 219 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
-    float4 sunOcc;
-#line 235 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
-    float4 skyAO2;
-#line 236
-};
-#line 21 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
-#line 58 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
-STRUCT(FrameData)
-{
-    float4x4 viewProj;
-
-
-
-    float4 sunDir;
-    float4 sunCol;
-    float4 ambCol;
-    float4 fogColNear;
-    float4 fogParams;
-    float4 eyePos;
-
-
-    float4 debugParams;
-
-
-
-    float4 dbgScales;
-
-
-
-
-
-
-
-
-    float4 lodParams;
-
-    float4 lodSunAmb;
-
-
-
-
-    float4 lodEye;
-
-
-
-
-    float4 skyParams;
-
-
-
-
-
-
-    float4 gReflWaterClip;
-
-
-
-
-    float4 skyZenith;
-
-
-
-    float4 atlasDbg;
-
-
-
-    float4 alphaParams;
-#line 129 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
-    float4 timeParams;
-
-
-
-
-
-
-    float4 uvOffsets[8];
-
-
-
-
-
-
-    float4 froxelDims;
-    float4 froxelZ;
-#line 158 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
-    float4 alphaShadowParams;
-#line 159
+    float4 opts;
+#line 49
 };
 
-STRUCT(BatchData)
+        CBUFFER(ResolveParams) gResolveParams :  register(b0,space3);
+        Tex2DMS(float4, 8 ) gResolveSource :  register(t1,space3);
+#line 36 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/resolve.frag.fsl"
+
+STRUCT(PsIn)
 {
-    float4x4 worlds[ 1024 ];
-#line 164
-};
-#line 185 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
-STRUCT(LightData)
-{
-    float4 lightParams;
-    float4 lights[ 128  * 3];
-
-
-
-
-
-
-
-
-
-    float4 froxelDimsNear;
-    float4 froxelZNear;
-#line 200
+    DATA(float4, position, SV_Position);
+#line 40
 };
 
-        CBUFFER(FrameData) gFrameData :  register(b0,space1);
 
 
-
-
-
-        Tex2D(float4) gAO :  register(t1,space1);
-#line 224 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
-        Tex3D(float4) gWaterNormalVol :  register(t2,space1);
-        Tex2D(float4) gRefractColor :  register(t3,space1);
-        Tex2D(float4) gSceneLinDepth :  register(t4,space1);
-        Tex2D(float4) gReflectColor :  register(t5,space1);
-
-
-
-
-
-
-        Tex2D(uint4) gShadowMask :  register(t6,space1);
-
-
-
-
-        Tex2D(float) gShadowAtlas :  register(t7,space1);
-        Tex2D(float) gShadowAtlasDyn :  register(t8,space1);
-
-
-
-
-        Tex2D(float4) gSunMoments :  register(t9,space1);
-
-
-
-
-
-        Tex2D(float) gSunDepth :  register(t10,space1);
-
-
-
-
-
-        Buffer(uint) gFroxelMask :  register(t11,space1);
-
-
-
-
-
-
-
-        Buffer(uint) gFroxelMaskNear :  register(t12,space1);
-
-
-
-
-
-
-        Buffer(float4) gUVAnim :  register(t13,space1);
-
-
-
-
-
-
-
-
-        CBUFFER(ShadowMaskParams) gShadowParams :  register(b14,space1);
-
-
-
-
-
-
-
-
-        Buffer(uint4) gAlphaStages :  register(t15,space1);
-
-
-
-
-
-
-
-
-
-        Buffer(uint) gTerrainHeights :  register(t16,space1);
-        Buffer(uint) gTerrainColor :  register(t17,space1);
-
-
-
-
-
-
-
-
-
-        Buffer(uint) gTerrainTex :  register(t18,space1);
-        Buffer(uint) gTerrainCellGrid :  register(t19,space1);
-
-
-
-
-
-        Tex2DArray(float4) gTerrainArrays[ 32 ] :  register(t20,space1);
-
-
-
-
-
-
-
-
-
-
-        Tex2D(float) gSkyHeight :  register(t52,space1);
-
-
-
-
-
-
-
-        Tex2D(float) gSunOcc :  register(t53,space1);
-#line 356 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
-        Tex2D(float4) gSkyColor :  register(t54,space1);
-
-
-
-
-        CBUFFER(LightData) gLights :  register(b0,space3);
-
-
-
-
-
-
-
-
-
-
-        CBUFFER(LightData) gLightsNear :  register(b1,space3);
-#line 387 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
-        Tex2D(float4) gTextures[ 880 ] :  register(t0,space0);
-
-
-
-        Tex2DArray(float4) gStaticsArrays[ 128 ] :  register(t880,space0);
-
-
-
-        Tex2DArray(float4) gFlipArrays[ 16 ] :  register(t1008,space0);
-        CBUFFER(BatchData) gBatch :  register(b0,space2);
-#line 10 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowatlasview.vert.fsl"
-
-STRUCT(VSOutput)
+float rFilterCubic(float x, float B, float C)
 {
-    DATA(float4, Position, SV_Position);
-    DATA(float2, Uv, TEXCOORD0);
-#line 15
-};
+    float y = 0.0f;
+    float x2 = x * x;
+    float x3 = x2 * x;
+    if (x < 1.0f)
+    {
+        y = (12.0f - 9.0f * B - 6.0f * C) * x3 + (-18.0f + 12.0f * B + 6.0f * C) * x2 + (6.0f - 2.0f * B);
+    }
+    else if (x <= 2.0f)
+    {
+        y = (-B - 6.0f * C) * x3 + (6.0f * B + 30.0f * C) * x2 + (-12.0f * B - 48.0f * C) * x + (8.0f * B + 24.0f * C);
+    }
+    return y / 6.0f;
+}
+
+
+
+float rLuminance(float3 c)
+{
+    return dot(c, float3(0.299f, 0.587f, 0.114f));
+}
 
 [RootSignature( "RootFlags(ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT)," "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "3" ", offset = 0)," "CBV(b0, numDescriptors = unbounded, space = " "3" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "3" ", offset = 0))," "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "2" ", offset = 0)," "CBV(b0, numDescriptors = unbounded, space = " "2" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "2" ", offset = 0))," "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "1" ", offset = 0)," "CBV(b0, numDescriptors = unbounded, space = " "1" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "1" ", offset = 0))," "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "0" ", offset = 0)," "CBV(b0, numDescriptors = unbounded, space = " "0" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "0" ", offset = 0))," "DescriptorTable(" "SAMPLER(s0, numDescriptors = unbounded, space = " "0" ", offset = 0))," "StaticSampler(s0, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s1, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s2, space = 100," "filter = FILTER_MIN_MAG_LINEAR_MIP_POINT," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s3, space = 100," "filter = FILTER_MIN_MAG_LINEAR_MIP_POINT," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s4, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s5, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s6, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT," "addressU = TEXTURE_ADDRESS_MIRROR, addressV = TEXTURE_ADDRESS_MIRROR, addressW = TEXTURE_ADDRESS_MIRROR)," "StaticSampler(s7, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT, borderColor = STATIC_BORDER_COLOR_TRANSPARENT_BLACK," "addressU = TEXTURE_ADDRESS_BORDER, addressV = TEXTURE_ADDRESS_BORDER, addressW = TEXTURE_ADDRESS_BORDER)," "StaticSampler(s8, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR," "addressU = TEXTURE_ADDRESS_MIRROR, addressV = TEXTURE_ADDRESS_MIRROR, addressW = TEXTURE_ADDRESS_MIRROR)," "StaticSampler(s9, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR, borderColor = STATIC_BORDER_COLOR_TRANSPARENT_BLACK," "addressU = TEXTURE_ADDRESS_BORDER, addressV = TEXTURE_ADDRESS_BORDER, addressW = TEXTURE_ADDRESS_BORDER)," "StaticSampler(s10, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 8," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s11, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 8," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s12, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 8," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s13, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 8," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s14, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 2," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s15, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 2," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s16, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 2," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s17, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 2," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_WRAP)" )]
-VSOutput VS_MAIN( uint VertexID : SV_VERTEXID )
+float4 PS_MAIN(PsIn In): SV_TARGET
 {
     //INIT_MAIN;
-    VSOutput Out;
-    float2 uv = float2((VertexID << 1) & 2, VertexID & 2);
-    Out.Uv = uv;
-    Out.Position = float4(uv.x * 2.0f - 1.0f, 1.0f - uv.y * 2.0f, 0.0f, 1.0f);
-    return (Out);
+
+
+    float2 subOffsets[8] = {
+        float2( 0.0625f, -0.1875f), float2(-0.0625f, 0.1875f),
+        float2( 0.3125f, 0.0625f), float2(-0.1875f, -0.3125f),
+        float2(-0.3125f, 0.3125f), float2(-0.4375f, -0.0625f),
+        float2( 0.1875f, 0.4375f), float2( 0.4375f, -0.4375f)
+    };
+#line 90 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/resolve.frag.fsl"
+    float2 pixelPos = In.position.xy;
+    float2 texSize = gResolveParams.dims.xy;
+    float filtRad = max(gResolveParams.dims.z, 0.001f) * 0.5f;
+    int sampRad = int(gResolveParams.dims.w);
+    float invLuma = gResolveParams.opts.x;
+
+    float3 sum = float3(0.0f, 0.0f, 0.0f);
+    float totalWeight = 0.0f;
+
+    float sumA = 0.0f;
+    float totalWeightA = 0.0f;
+
+    LOOP for (int y = -sampRad; y <= sampRad; ++y)
+    {
+        LOOP for (int x = -sampRad; x <= sampRad; ++x)
+        {
+            float2 sampleOffset = float2(float(x), float(y));
+
+
+            float2 samplePos = clamp(pixelPos + sampleOffset, float2(0.0f, 0.0f), texSize - 1.0f);
+            int2 loadPos = int2(samplePos);
+
+            UNROLL for (int s = 0; s <  8 ; ++s)
+            {
+                float2 sampleDist = abs(sampleOffset + subOffsets[s]) / filtRad;
+                if (all(sampleDist <= float2(1.0f, 1.0f)))
+                {
+                    float4 smp = max(LoadTex2DMS(gResolveSource, NO_SAMPLER, loadPos, s), float4(0.0f, 0.0f, 0.0f, 0.0f));
+
+
+                    float w = rFilterCubic(sampleDist.x * 2.0f, 0.0f, 0.5f) *
+                              rFilterCubic(sampleDist.y * 2.0f, 0.0f, 0.5f);
+
+                    sumA += smp.a * w;
+                    totalWeightA += w;
+
+                    float wr = w;
+                    if (invLuma > 0.5f)
+                    {
+                        wr *= 1.0f / (1.0f + rLuminance(smp.rgb));
+                    }
+                    sum += smp.rgb * wr;
+                    totalWeight += wr;
+                }
+            }
+        }
+    }
+
+    float3 outRgb = max(sum / max(totalWeight, 1.0e-5f), float3(0.0f, 0.0f, 0.0f));
+    float outA = saturate(sumA / max(totalWeightA, 1.0e-5f));
+    return (float4(outRgb, outA));
 }
-#line 292 "FSL/shaders.list"
+#line 275 "FSL/shaders.list"

@@ -1,0 +1,141 @@
+// mgeHost64 — custom MSAA resolve (fragment stage).  tasks/forge-postprocess.md step 4.
+//
+// Replaces cl->ResolveSubresource with a filtered reconstruction: for each output pixel, weight
+// every MSAA sub-sample in a neighbourhood by a separable Catmull-Rom kernel evaluated at the true
+// sub-pixel distance. See resolve.srt.h for why this pass has to exist before HDR can, and for the
+// alpha rule.
+//
+// Ported from MJP's MSAAFilter 2.0 (Resolve.hlsl, ResolvePS + FilterCubic), MIT.
+//
+// THE THREE THINGS THAT MAKE IT A RECONSTRUCTION RATHER THAN A BOX BLUR:
+//
+//  1. SubSampleOffsets. The distance that goes into the kernel is |pixelOffset + subSampleOffset|,
+//     not |pixelOffset|. Without the sub-sample term every sample in a pixel gets one weight and the
+//     4x pattern buys nothing beyond a box average — which is what the hardware resolve already is.
+//     These are the D3D standard patterns (D3D12_STANDARD_MULTISAMPLE_QUALITY_LEVELS); the host runs
+//     4x, and 2x/8x are here so the pass follows Configuration.AALevel instead of pinning it.
+//
+//  2. rescaleCubic. Cubic filters are natively defined over [-2, 2]; the resolve wants them over
+//     [-1, 1], so the argument is doubled before evaluation (Resolve.hlsl:153). Skip it and the
+//     kernel is twice as wide as the radius says, i.e. a soft blur that reads as "AA is broken".
+//
+//  3. Inverse-luminance weighting, `w *= 1/(1 + luma)` — the Karis form, and the ONLY thing needed
+//     to kill fireflies. MJP applies it inside this spatial loop independently of TAA, which is why
+//     firefly suppression here costs no velocity buffer, no jitter and no history target. In LDR
+//     (today) the samples are already tonemapped into [0,1] so the weight only spans 1.0..0.5; it
+//     comes into its own when the source goes fp16.
+//
+// ⚠ NEGATIVE LOBES. Catmull-Rom undershoots, which is where its apparent sharpness comes from. RGB
+// is floored at 0 after normalisation (MJP does the same); ALPHA is saturated, because it is the
+// present-seam coverage mask and a value outside [0,1] corrupts the ONE/INVSRCALPHA composite over
+// MW's frame. Where coverage is locally uniform (nearly everywhere — the sky and terrain cover the
+// frame) a normalised Catmull-Rom is a partition of unity and returns it exactly, so ringing is
+// confined to genuine coverage silhouettes.
+
+#include "resolve.srt.h"
+
+STRUCT(PsIn)
+{
+    DATA(float4, position, SV_Position);
+};
+
+// MJP's FilterCubic. B=0, C=0.5 is Catmull-Rom. Kept general (rather than folded to the Catmull-Rom
+// constants) so switching to Mitchell (1/3, 1/3) or B-spline (1, 0) is a one-line experiment.
+float rFilterCubic(float x, float B, float C)
+{
+    float y  = 0.0f;
+    float x2 = x * x;
+    float x3 = x2 * x;
+    if (x < 1.0f)
+    {
+        y = (12.0f - 9.0f * B - 6.0f * C) * x3 + (-18.0f + 12.0f * B + 6.0f * C) * x2 + (6.0f - 2.0f * B);
+    }
+    else if (x <= 2.0f)
+    {
+        y = (-B - 6.0f * C) * x3 + (6.0f * B + 30.0f * C) * x2 + (-12.0f * B - 48.0f * C) * x + (8.0f * B + 24.0f * C);
+    }
+    return y / 6.0f;
+}
+
+// Same weights the APL instrument averages with, deliberately: the firefly test and the measuring
+// stick must agree on what "bright" means.
+float rLuminance(float3 c)
+{
+    return dot(c, float3(0.299f, 0.587f, 0.114f));
+}
+
+ROOT_SIGNATURE(DefaultRootSignature)
+float4 PS_MAIN(PsIn In)
+{
+    INIT_MAIN;
+
+#if SAMPLE_COUNT == 8
+    float2 subOffsets[8] = {
+        float2( 0.0625f, -0.1875f), float2(-0.0625f,  0.1875f),
+        float2( 0.3125f,  0.0625f), float2(-0.1875f, -0.3125f),
+        float2(-0.3125f,  0.3125f), float2(-0.4375f, -0.0625f),
+        float2( 0.1875f,  0.4375f), float2( 0.4375f, -0.4375f)
+    };
+#elif SAMPLE_COUNT == 4
+    float2 subOffsets[4] = {
+        float2(-0.125f, -0.375f), float2( 0.375f, -0.125f),
+        float2(-0.375f,  0.125f), float2( 0.125f,  0.375f)
+    };
+#else
+    float2 subOffsets[2] = {
+        float2( 0.25f,  0.25f), float2(-0.25f, -0.25f)
+    };
+#endif
+
+    float2 pixelPos = In.position.xy;
+    float2 texSize  = gResolveParams.dims.xy;
+    float  filtRad  = max(gResolveParams.dims.z, 0.001f) * 0.5f;   // diameter -> radius
+    int    sampRad  = int(gResolveParams.dims.w);                  // integer neighbourhood bound
+    float  invLuma  = gResolveParams.opts.x;
+
+    float3 sum         = float3(0.0f, 0.0f, 0.0f);
+    float  totalWeight = 0.0f;
+    // SECOND accumulator: coverage, plain weights. See the alpha rule in resolve.srt.h.
+    float  sumA        = 0.0f;
+    float  totalWeightA = 0.0f;
+
+    LOOP for (int y = -sampRad; y <= sampRad; ++y)
+    {
+        LOOP for (int x = -sampRad; x <= sampRad; ++x)
+        {
+            float2 sampleOffset = float2(float(x), float(y));
+            // Clamp to the RENDER rect, not the allocation — the target is alloc-sized and the
+            // texels outside width x height were never written this frame.
+            float2 samplePos = clamp(pixelPos + sampleOffset, float2(0.0f, 0.0f), texSize - 1.0f);
+            int2   loadPos   = int2(samplePos);
+
+            UNROLL for (int s = 0; s < SAMPLE_COUNT; ++s)
+            {
+                float2 sampleDist = abs(sampleOffset + subOffsets[s]) / filtRad;
+                if (all(sampleDist <= float2(1.0f, 1.0f)))
+                {
+                    float4 smp = max(LoadTex2DMS(gResolveSource, NO_SAMPLER, loadPos, s), float4(0.0f, 0.0f, 0.0f, 0.0f));
+
+                    // rescaleCubic: [-2,2] -> [-1,1]. Separable, so one 1-D evaluation per axis.
+                    float w = rFilterCubic(sampleDist.x * 2.0f, 0.0f, 0.5f) *
+                              rFilterCubic(sampleDist.y * 2.0f, 0.0f, 0.5f);
+
+                    sumA         += smp.a * w;
+                    totalWeightA += w;
+
+                    float wr = w;
+                    if (invLuma > 0.5f)
+                    {
+                        wr *= 1.0f / (1.0f + rLuminance(smp.rgb));
+                    }
+                    sum         += smp.rgb * wr;
+                    totalWeight += wr;
+                }
+            }
+        }
+    }
+
+    float3 outRgb = max(sum / max(totalWeight, 1.0e-5f), float3(0.0f, 0.0f, 0.0f));
+    float  outA   = saturate(sumA / max(totalWeightA, 1.0e-5f));
+    RETURN(float4(outRgb, outA));
+}

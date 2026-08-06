@@ -244,6 +244,36 @@
 #include "water.frag.fsl"
 #end
 
+// CUSTOM MSAA RESOLVE (tasks/forge-postprocess.md step 4): filtered Catmull-Rom reconstruction with
+// inverse-luminance firefly weighting, replacing cl->ResolveSubresource. It has to exist before HDR
+// can, because a hardware resolve cannot format-convert — fp16 MSAA -> BGRA8 shared RT is not a
+// legal ResolveSubresource, so step 3's "flip pMSAAColor and change nothing else" probe is not
+// actually executable and this is its prerequisite. Built LDR-first so its cost is measurable in
+// isolation against the 0.14-0.18 ms fixed-function baseline (live A/B in the dev panel).
+//
+// PRIVATE vert/frag pairing (no shared-frag hazard) + its own ResolveSrtData PerDraw set, following
+// The-Forge's own Examples_3/Visibility_Buffer resolve. One frag variant per sample count, the
+// linearizedepth/apl idiom — Tex2DMS needs SAMPLE_COUNT as a literal. NO sc1 variant: at 1x the
+// scene renders straight into pRT and there is nothing to resolve.
+#vert resolve.vert
+#include "resolve.vert.fsl"
+#end
+
+#frag resolve_sc2.frag
+#define SAMPLE_COUNT 2
+#include "resolve.frag.fsl"
+#end
+
+#frag resolve_sc4.frag
+#define SAMPLE_COUNT 4
+#include "resolve.frag.fsl"
+#end
+
+#frag resolve_sc8.frag
+#define SAMPLE_COUNT 8
+#include "resolve.frag.fsl"
+#end
+
 // Debug line (--forge-view only): solid-colour world-space line list for distance reference rings.
 #vert debugline.vert
 #include "debugline.vert.fsl"
