@@ -1083,6 +1083,32 @@ namespace MGE::GeometryCache {
             w.setIndex  = uvc->textureSet < maxSet ? (uint8_t)uvc->textureSet : maxSet;
             // TimeController cycleType bits 1-2: Loop=0 / Reverse=2 / Clamp=4 -> 0/1/2.
             w.cycleType = (uint8_t)((uvc->flags & NI::TimeControllerFlags::CycleTypeMask) >> 1);
+            // CLAMP in an MW NIF does NOT mean "play once and stop" — it means "the animation
+            // manager owns my time". NiTimeController::computeScaledTime measures from startTime
+            // (NITimeController.h:0x1C), and MW re-start()s these controllers, which rebases it and
+            // replays the window. The host has no manager: it free-runs t = sim time, so a CLAMP
+            // track pins at keyMax forever. heart_akulakhan's forcefield is the repro — it scrolled
+            // for 8.6s and froze while MW's looped.
+            //
+            // A restart is only INVISIBLE if the track is seamless: net offset a whole number of
+            // texture wraps, so the last frame and the first are the same image. That is the
+            // artist's own tell that a loop was intended, and it is exactly what the vanilla CLAMP
+            // tracks look like (heart_akulakhan: +6.000 and +3.000 on both axes). So promote a
+            // seamless CLAMP to LOOP and leave a ragged one genuinely clamped.
+            //
+            // Census (tools/uv-controller-census.py, 43977 NIFs, 1482 NiUVControllers): of the
+            // offset-only CLAMP tracks, 48 are seamless and 3 are ragged — e/magic_area_rest.nif
+            // (net -1.750) and oj/me/lightn_strike.nif (net -0.500), both transient spell VFX that
+            // are re-created per cast. Those 3 keep clamping. Zero net counts as seamless: a track
+            // that returns to its start value restarts most continuously of all.
+            if (w.cycleType == 2) {
+                auto seamless = [](const std::vector<std::pair<float, float>>& k) {
+                    if (k.size() < 2) { return true; }        // no track on this axis constrains it
+                    const float net = k.back().second - k.front().second;
+                    return std::fabs(net - std::round(net)) < 1e-3f;
+                };
+                if (seamless(uKeys) && seamless(vKeys)) { w.cycleType = 0; }
+            }
             w.keyCountU = (uint16_t)uKeys.size();
             w.keyCountV = (uint16_t)vKeys.size();
             w.frequency = uvc->frequency;

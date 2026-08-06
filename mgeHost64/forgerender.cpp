@@ -7660,8 +7660,23 @@ namespace {
         const float* vk = m.uvKeys + (size_t)w.keyCountU * 2;
         // The captured verts already embed the controller's capture-time offset (baseU/baseV),
         // so the shader adds only the delta.
-        const float du = w.keyCountU ? (uvEvalKeys(uk, w.keyCountU, tt) - w.baseU) : 0.0f;
-        const float dv = w.keyCountV ? (uvEvalKeys(vk, w.keyCountV, tt) - w.baseV) : 0.0f;
+        // U IS NEGATED, V IS NOT. MW applies the U offset as u' = u - offU while V goes in as
+        // v' = v + offV, so relative to the captured verts (which embed baseU/baseV) the matching
+        // delta is -(eval - base) on U only.
+        //
+        // This hid for as long as it did because almost nothing animates U. in_lava_1024_01 is two
+        // coplanar layers sharing one texture: 'Tri Magma' (opaque, the base) scrolls V ONLY, so it
+        // cannot exercise the U path at all and has always looked right; 'Tri In_Lava_1024_01' (the
+        // blended overlay) scrolls U and V together and came out mirrored across the vertical — the
+        // wrong diagonal. The two layers also carry UV frames rotated 90 degrees from each other
+        // (Magma: U along world X, V along world Y; the overlay: U along Y, V along X), which is why
+        // the same authored scroll reads on a different screen axis for each and why the fault looks
+        // like a "horizontal flip" rather than a sign error.
+        //
+        // No probe of the controller could have found this: MW's currentUOffset holds the SAME value
+        // we compute. The disagreement is purely in the sign with which it is applied to the UVs.
+        const float du = w.keyCountU ? -(uvEvalKeys(uk, w.keyCountU, tt) - w.baseU) : 0.0f;
+        const float dv = w.keyCountV ?  (uvEvalKeys(vk, w.keyCountV, tt) - w.baseV) : 0.0f;
         const uint32_t id = ++g_uvAnimCount;                 // first id = 1
         float* tbl = (float*)g_live.pUVAnimBuf->pCpuMappedAddress;
         tbl[(size_t)id * 4 + 0] = du;
