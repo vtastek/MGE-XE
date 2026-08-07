@@ -632,6 +632,8 @@ namespace IPC {
 		params.nearCellReach = m_nearCellReach;
 		// Tier 1: whether the host may overlap frame N's GPU work past its reply (see bridge.h).
 		params.clientSyncsOnFence = m_clientSyncsOnFence;
+		// Mode-3 park: the delta the sky payload was pre-cancelled by, for the reflect mirror plane.
+		std::memcpy(params.skyParkEyeDelta, m_skyParkEyeDelta, sizeof(params.skyParkEyeDelta));
 		params.bytesWritten = 0;
 		params.renderMs = 0.0;
 		params.frameFenceValue = 0;

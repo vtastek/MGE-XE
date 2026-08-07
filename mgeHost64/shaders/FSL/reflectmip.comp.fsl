@@ -1,0 +1,44 @@
+// mgeHost64 — planar-reflection mip-pyramid build (WT4d / PBR water, P2).
+//
+// Both variants run in the MAIN cmd, right where the reflect pass ends and pReflectColor flips to
+// SHADER_RESOURCE — before the colour pass, and therefore long before the water draw that samples
+// the result. Compute, so it hot-reloads with F8 while the LOD mapping is being calibrated.
+//
+// Two compiled variants of this one body (REFLMIP_FIRST, like hizreduce):
+//   reflectmipfirst.comp — 1:1 copy pReflectColor -> mip 0 (dispatch covers mip-0 dims).
+//   reflectmip.comp      — 2x2 BOX AVERAGE mip i-1 -> mip i (dispatch covers the DST mip dims).
+//
+// No odd-dimension taps, unlike hizreduce: kReflectSize is 1024, so every source mip down to the
+// last is even and a plain clamp-free 2x2 kernel covers every texel exactly once.
+//
+// ⚠ ALL FOUR CHANNELS, IDENTICAL WEIGHTS. The source is premultiplied — see reflectmip.srt.h for
+// why an alpha-weighted average is a dark fringe along the reflected horizon rather than an
+// improvement.
+//
+// 8x8 groups, no dst bounds check (OOB UAV writes drop — same as hizreduce/linearizedepth).
+
+#include "reflectmip.srt.h"
+
+#ifndef REFLMIP_FIRST
+#define REFLMIP_FIRST 0
+#endif
+
+ROOT_SIGNATURE(ComputeRootSignature)
+NUM_THREADS(8, 8, 1)
+void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
+{
+    INIT_MAIN;
+    int2 p = int2(DispatchThreadID.xy);
+#if REFLMIP_FIRST
+    float4 c = LoadTex2D(gReflMipSrcTex, NO_SAMPLER, p, 0);
+#else
+    int2   s = p * 2;
+    float4 c = LoadRWTex2D(gReflMipSrc, s);
+    c += LoadRWTex2D(gReflMipSrc, s + int2(1, 0));
+    c += LoadRWTex2D(gReflMipSrc, s + int2(0, 1));
+    c += LoadRWTex2D(gReflMipSrc, s + int2(1, 1));
+    c *= 0.25f;
+#endif
+    Write2D(gReflMipDst, p, c);
+    RETURN();
+}

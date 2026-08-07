@@ -90,6 +90,11 @@ namespace ForgeRender {
     // client that never calls this can never be handed a half-drawn frame.
     void setClientSyncsOnFence(bool syncs);
 
+    // (eyeNow - bakeEye) for this frame: the mode-3 park delta the client pre-cancelled the SKY
+    // payload by. Zero on the serial paths. The reflect pass needs it to place its sky mirror plane
+    // at the fire-time camera height — see bridge.h's skyParkEyeDelta. Call before renderScene.
+    void setSkyParkEyeDelta(const float d[4]);
+
     // True if the M1c opaque scene path (depth RT + opaque pipeline + descriptor sets)
     // built successfully in init(). False ⇒ renderScene returns false and the seam
     // falls back to the triangle. The server logs this so the buffered host stdout

@@ -656,6 +656,9 @@ namespace IPC {
 			// work past our reply safe? Fail-safe — anything but an explicit 1 makes renderScene
 			// settle its own frame before returning, exactly as it did pre-Tier-1.
 			ForgeRender::setClientSyncsOnFence(params.clientSyncsOnFence == 1u);
+			// Mode-3 park: the delta the sky payload was pre-cancelled by, so the reflect pass can
+			// put its sky mirror plane at the FIRE-time camera height (see bridge.h).
+			ForgeRender::setSkyParkEyeDelta(params.skyParkEyeDelta);
 			ok = ForgeRender::renderScene(params.viewProj, params.lighting, drawPtr, params.drawCount, bytes,
 				skinnedPtr, params.skinnedCount, skinnedBytes,
 				multiMapPtr, params.multiMapCount, multiMapBytes,

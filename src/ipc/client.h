@@ -77,6 +77,8 @@ namespace IPC {
 		float m_nearCellReach = 0.0f;
 		// Tier 1 overlap consent — see setClientSyncsOnFence. 0 = host must keep fence-waiting.
 		std::uint32_t m_clientSyncsOnFence = 0;
+		// Mode-3 park sky re-anchor delta — see setSkyParkEyeDelta. 0 on the serial paths.
+		float m_skyParkEyeDelta[4] = {};
 
 		// Dev FSL hot-reload watcher: a child launched alongside the host and killed with it, opt-in
 		// per install via an untracked mgeXE_fslwatch.txt next to Morrowind.exe (see startWatcher —
@@ -418,6 +420,16 @@ namespace IPC {
 		// once at seam bring-up (after the import attempt) and stamped into every render RPC.
 		// Defaults false so a client that never calls it can never be handed a half-drawn frame.
 		void setClientSyncsOnFence(bool syncs) { m_clientSyncsOnFence = syncs ? 1u : 0u; }
+
+		// (eyeNow - bakeEye), the mode-3 park delta the sky payload was pre-cancelled by. The host
+		// needs it to place the REFLECT pass's sky mirror plane at the FIRE-time camera height rather
+		// than the bake one — see bridge.h's skyParkEyeDelta. A setter rather than another
+		// renderSceneKickoff parameter: that signature is already 30 arguments wide, and this is set
+		// at exactly one site (the same block that applies the pre-cancel, so the two cannot drift).
+		// Defaults zero, which is the correct value for every serial path.
+		void setSkyParkEyeDelta(float x, float y, float z) {
+			m_skyParkEyeDelta[0] = x; m_skyParkEyeDelta[1] = y; m_skyParkEyeDelta[2] = z;
+		}
 
 		WakeReason waitForCompletion(DWORD ms = MaxWait);
 

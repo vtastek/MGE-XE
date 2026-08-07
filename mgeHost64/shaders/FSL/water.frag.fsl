@@ -1,7 +1,8 @@
 // mgeHost64 — Forge water takeover (fragment stage, WT1).
 //
 // CORE port of XE Mod Water.fx WaterPS / UnderwaterPS (the non-flow, non-foam path): animated
-// normal from the 3D water_NRM volume, refraction (a host copy of the pre-water Forge colour
+// normal from the W3 wave ARRAY (water_NRM.dds bombed at launch into a 1024²x32 RG8 Texture2DArray
+// of slopes — see forgerender.cpp::bakeWaterField), refraction (a host copy of the pre-water Forge colour
 // target, depth-gated), Fresnel, sun specular, fog + depth shoreline. Reflection is a WT1 STAND-IN
 // (flat horizon tint); WT2 fills gReflectColor with a real mirror-view pass. Output alpha = 1 so the
 // present-seam premultiplied composite shows the water (it's opaque coverage, unlike the sky).
@@ -16,10 +17,84 @@
 //   g0 = (waterLevelRel, windFactor, shoreDepthBias, time)
 //   g1 = (depthBaseColor.rgb, underwater)
 //   g2 = (camFwd.xyz, nearViewRange)
-//   g3 = (reflectStandInAmt, _, _, _)
+//   g3 = (waterFlags, alphaBase, reflSize, reflBlurGain)
+// ...and worlds[8..10] carry the W1 surface field's four Blender-style noise textures:
+//   worlds[8] per noise = (scale, detail, roughness, height)
+//   worlds[9] per noise = (rampLo, rampHi, wCells, zOffset)
+//   worlds[10] g0       = (lacunarity, distortion, normalize, isolate)
+//   worlds[10] g1       = (height debug gain, waveAmp, W3 slice count, W3 tile world period)
+//
+// WT4d — WATER IS THE HOST'S FIRST PBR MATERIAL.
+//
+// Most of the parts were already here, badly factored. The `0.02f +` that opened the old Fresnel IS
+// water's F0 (IOR 1.333 -> 0.0204); `lerp(refracted, reflected, fresnel)` is already energy-
+// conserving (T = 1-R); the reflection RT is a radiance source. The ONE quantity missing was
+// ROUGHNESS — and its absence is why three separate hacks existed:
+//
+//   - `adjustnormal` flattened N toward (0,0,1) with distance: roughness applied to the wrong
+//     quantity. It DELETED the sub-pixel slope variance instead of converting it to lobe width.
+//   - `pow(vdotr,170) + 0.07*pow(vdotr,4)`: two Phong lobes faking one wide lobe, with no roughness.
+//   - `reflected * 0.96`: DIMMING to hide a SAMPLING problem (distant water stayed a hard mirror
+//     because both the normal and the reflection were undersampled).
+//
+// Roughness fixes all three at the root, because the reflection mip LOD and the specular lobe width
+// are the same number. See tasks/forge-water.md (WT4d) for the full derivation.
+//
+// ⚠ WATER MUST NEVER CALL tonemap() ON THE COMPOSITE. It is the only colour pass that doesn't, and
+// that is CORRECT, not an oversight someone should helpfully fix: its two big inputs
+// (gRefractColor, gReflectColor) are copies of the ALREADY-TONEMAPPED scene, so tonemapping the
+// result rolls them off twice. Only newly-generated radiance — the sun specular — goes through the
+// curve, and only until forge-postprocess.md step 6 makes the whole chain HDR.
 
 #include "opaque.srt.h"
 #include "skydome.h.fsl"   // fogSkyColor() — the same sampled fog target the world melts into
+#include "tonemap.h.fsl"   // WT4d/P1: the SPECULAR TERM ONLY — see the warning above that call
+#include "wavefield.h.fsl" // W1: the procedural wave field (height + exact gradient + variance)
+
+// Water's F0. Not a tuned constant: n = 1.333 gives ((n-1)/(n+1))² = 0.0204, and the pre-WT4d
+// Fresnel already opened with a literal `0.02f +` — it was carrying this value the whole time
+// without naming it.
+#define kWaterF0 0.02f
+// The sun's angular RADIUS in radians (~0.5° diameter seen from the ground). Drives the
+// representative-point sphere-light widening, which is what keeps the GGX core finite on calm
+// water. A physical constant, not a look knob.
+#define kSunAngularRadius 0.00465f
+// FSL defines no PI (aocommon.h.fsl carries its own AO_PI for the same reason). Prefixed so this
+// file can never collide with a future shared one.
+#define kWaterPI 3.14159265359f
+// Highest LOD in gReflectMips (kReflectMipCount - 1 host-side). A compile-time constant rather than
+// a param because the pyramid's depth is a fixed property of the host's resource, and because
+// SampleLevel's own clamp already handles the "pyramid didn't build" fallback safely.
+#define kReflectMipMax 5
+// ...and the deepest mip this shader will actually SAMPLE. 3 = 128x128, which still magnifies to a
+// 2048-wide screen without visible bilinear structure; 4 (64²) and 5 (32²) do not, and sampling them
+// is what produced the swimming diamonds. Roughness past this level converges to the sky instead
+// (see reflSkyMix). Deliberately lower than kReflectMipMax: the last two levels stay built because
+// the reduce is trivially cheap and a deeper chain costs nothing to keep, but nothing reads them.
+#define kReflectMipUsable 3
+// Anisotropy budget for the wave normal. W3 no longer SPENDS this on taps — the hardware does the
+// filtering now — but the number stays, because it must MATCH gSamplerAnisotropic's own
+// maxAnisotropy (8, defaults.h:206). The variance LOD below is derived from the same clamp the
+// texture unit applies past its budget, so a mismatch here would ask the roughness model to account
+// for detail the sampler already resolved (or vice versa).
+#define kWaterMaxAniso 8
+// The bombed field's side, in texels. Its world PERIOD comes from the host (the bake owns it, and it
+// scales with the source's size); this is the only bake constant the shader has to know, and it is
+// here because the texel-to-world density — period / this — is what every LOD in the file is
+// measured in.
+#define kWaveFieldTexels 1024.0f
+
+// ⚠ FORGE DECLARES SampleLvlTex2DArray AGAINST Texture3D (d3d.h:490-493) — a Forge bug we must
+// neither inherit nor fork-fix ([[project_forge_fork_merge_trap]]). Local macros instead, mirroring
+// Forge's own pattern for these cases.
+// SampleGradArray rather than the implicit-LOD SampleTex2DArray, for a reason worth keeping:
+// worldXY = In.WorldPos.xy + lodEye.xy, and lodEye reaches ~250k world units, so letting the
+// hardware take derivatives of the SUM would have it differencing two rounded large numbers. Passing
+// the gradients of the camera-relative position explicitly keeps the footprint exact
+// ([[project_forge_precision_far_origin]]) — and it also makes the sample legal in non-uniform
+// control flow, which the implicit form is not.
+#define SampleGradArray(N, S, C, DX, DY) N.SampleGrad(S, C, DX, DY)
+#define SampleLvlArray(N, S, C, L)       N.SampleLevel(S, C, L)
 
 STRUCT(VSOutput)
 {
@@ -52,7 +127,46 @@ float4 PS_MAIN( VSOutput In )
     float3 depthBaseColor= P[1].xyz;
     bool   underwater    = P[1].w > 0.5f;
     float3 camFwd        = P[2].xyz;
-    uint   waterDbg      = (uint)(P[3].x + 0.5f);   // 0 normal, 1 reflection-only, 2 refraction-only
+    // Bitfield, not a mode number: bits 0-1 = debug view (0 normal, 1 reflection-only,
+    // 2 refraction-only, 3 roughness), bit 2 = P4 roughness-aware Schlick Fresnel, bit 3 = force the
+    // reflection's fog melt OFF.
+    uint   waterFlags    = (uint)(P[3].x + 0.5f);
+    uint   waterDbg      = waterFlags & 3u;
+    bool   useSchlick    = (waterFlags & 4u) != 0u;
+    // A CALIBRATION AID, and the plan that introduced it says why it has to exist: roughness-LOD is
+    // about sampling RATE, not dimming. Tuned by eye against the fog melt, the roughness will simply
+    // compensate for the melt and the horizon goes flat. Turn the melt off, tune, turn it back on.
+    bool   noFogMelt     = (waterFlags & 8u) != 0u;
+    // W1: procedural height field + analytic normals, instead of the two-scale normal-map lerp.
+    bool   proceduralWaves = (waterFlags & 16u) != 0u;
+    // W1: show the HEIGHT field directly. Its own bit rather than a fifth `waterDbg` mode because
+    // bits 0-1 were already full at 4 modes — and because this one returns before any water shading
+    // happens at all, which the other three do not.
+    bool   heightView    = (waterFlags & 32u) != 0u;
+    // worlds[10] group 1 — the field's globals group, alongside lacunarity/distortion/etc.
+    // (wavefield.h.fsl reads the rest; only these four lanes are needed out here.)
+    float4 waveG1        = transpose(gBatch.worlds[10])[1];
+    float  heightGain    = waveG1.x;
+    // W2 wave amplitude: one multiplier on the decoded slope, so it moves the normals AND the
+    // roughness together — they are the same physical quantity and must never drift apart.
+    float  waveAmp       = waveG1.y;
+    // W3: the BAKE owns both of these, so the shader is told rather than told to assume. waveSlices
+    // is the array's layer count (the animation is cyclic mod this) and waveTile is the bombed
+    // field's world period — 4x the shipped 527 at an unchanged texel density.
+    float  waveSlices    = max(waveG1.z, 1.0f);
+    float  waveTile      = max(waveG1.w, 1.0f);
+    // WT4d roughness + reflection-LOD constants.
+    //   alphaBase  = GGX alpha BELOW the normal map's finest texel (sub-5cm capillary structure the
+    //                map cannot represent). Wind-scaled host-side. THE one hand-tuned knob in this
+    //                shader, and it must stay the only one ([[feedback_prior_art_constants_dont_transfer]]).
+    //   reflSize   = gReflectMips' side in texels (kReflectSize).
+    //   reflBlurGain = calibration scale on the reflection LOD ONLY (never the lobe) — see below.
+    // NOTE there is no reflMipMax param: SampleLevel clamps the LOD to the resource's own mip range,
+    // so the pyramid-failed fallback (gReflectMips bound to the 1-mip pReflectColor) pins itself to
+    // mip 0 = exactly the pre-WT4d image, with no host flag needed.
+    float  alphaBase     = P[3].y;
+    float  reflSize      = P[3].z;
+    float  reflBlurGain  = P[3].w;
 
     // TWO normalisations of this fragment's pixel, and they are NOT interchangeable — the same trap
     // volfog.frag documents. Every screen-sized RT is allocated at the render-scale CEILING (2x
@@ -88,13 +202,313 @@ float4 PS_MAIN( VSOutput In )
     // --- animated water normal (getFinalWaterNormal, #else no-flow branch) ---
     // Computed BEFORE the underwater branch: both surfaces are the same wave field, the underside
     // just uses its negation.
+    //
+    // ⚠ AND BECAUSE DERIVATIVES LIVE HERE. `underwater` below is a dynamic branch, and ddx/ddy
+    // inside non-uniform control flow is undefined behaviour. Everything derivative-shaped —
+    // the world footprint, the per-pixel view angle — has to be computed in this block and passed
+    // down. Real hazard, not style.
     float t = 0.4f * time;
-    float2 tc1 = worldXY / 3900.0f;   // far  scale
-    float2 tc2 = worldXY / 527.0f;    // close scale
-    float2 far_n   = SampleLvlTex3D(gWaterNormalVol, gSamplerBilinearWrap, float3(tc1, t), 0.0f).rg;
-    float2 close_n = SampleLvlTex3D(gWaterNormalVol, gSamplerBilinearWrap, float3(tc2, t), 0.0f).rg;
-    float2 normal_R = 2.0f * lerp(close_n, far_n, saturate(dist / 8000.0f)) - 1.0f;
-    float3 normal = normalize(float3(normal_R, 1.0f));
+    float2 tc2 = worldXY / waveTile;  // the BOMBED wave tile's world period (W3: 2108, was 527)
+    // (The 3900-unit "far" tile is gone with the two-scale crossfade — see the normal block below.)
+
+    // WORLD-SPACE PIXEL FOOTPRINT. worldXY is interpolated, so its screen derivatives give the
+    // footprint directly — and being screen-space derivatives they are grazing-angle-aware for free.
+    //
+    // ⚠ AREA-PRESERVING (geometric mean), NOT max-axis. The first WT4d cut took `max(|dWdx|,|dWdy|)`
+    // reasoning "over-blur is the safe direction". On a near-horizontal plane that is catastrophic
+    // rather than safe: at grazing incidence adjacent pixels land at wildly different distances, so
+    // the major axis runs 10-100x the minor one and the LOD saturates the whole chain — the normal
+    // collapses to its GLOBAL mean, the recovered variance jumps to the field maximum, and every
+    // surface past mid-distance ends up at the coarsest reflection mip. That is where "too much
+    // blur" came from, and it was mine, not the asset's.
+    //
+    // sqrt(|dWdx| * |dWdy|) is the isotropic footprint with the same AREA, which is the honest
+    // single-tap answer when the real footprint is anisotropic: it filters the right TOTAL amount
+    // instead of the worst-axis amount. It also stops the LOD swinging wildly under small camera
+    // rotations near the horizon, where the major axis is extremely sensitive to view angle.
+    //
+    // (An earlier note here claimed the REFLECTION filter also wants to be anisotropic — "real
+    // rippled water streaks vertically". That was wrong and is corrected rather than deleted, because
+    // it is a plausible thing to re-derive. A planar mirror deflects a reflected ray by 2*delta for a
+    // normal tilt of delta, ISOTROPICALLY in angle, and the screen footprint of an isotropic angular
+    // lobe is isotropic too — so an isotropic reflection filter is correct. The vertical streaking in
+    // real water comes from the reflected SCENE being compressed toward the horizon, so an isotropic
+    // blur spans much scene content vertically and little horizontally. It emerges from the content;
+    // it is not something the filter has to impose. This footprint anisotropy, on the NORMAL map, is
+    // a different and real thing — the surface really is seen edge-on.)
+    // ⚠ DERIVATIVES OF THE CAMERA-RELATIVE POSITION, not of worldXY. ddx of a uniform is zero, so the
+    // two are mathematically identical — but adding lodEye (up to ~250k world units) FIRST quantizes
+    // In.WorldPos.xy before the subtraction, and the derivative is then a difference of two rounded
+    // large numbers. Free precision, and it is the footprint that the whole anti-aliasing model rests
+    // on ([[project_forge_precision_far_origin]]).
+    float2 dWdx = ddx(In.WorldPos.xy);
+    float2 dWdy = ddy(In.WorldPos.xy);
+    // ...and THE SCALAR IS GONE — the footprint is only ever an ELLIPSE now. It survived as long as
+    // the normal came from a single mip tap; W2's anisotropic tap set needs both axes and nothing
+    // left in this file reads one number.
+    // ⚠ The area-preserving geometric mean was never *wrong*, and the paragraph above stands as the
+    // reason max-axis is not the "safe" alternative. It is the honest single-tap answer. It is simply
+    // no longer the best available one, because a tap SET can resolve the major axis instead of
+    // averaging it away — and it still appears below, in log space, as the LOD at which the baked
+    // variance volume is read.
+    float4 fpEll = footprintEllipse(dWdx, dWdy);  // (minor^2, major^2, majorDir.xy)
+
+    // ANGULAR size of one screen pixel, in radians: EyeVec is a unit vector, so the length of its
+    // screen derivative IS the angle between two neighbouring view rays. Free, exact at any FOV,
+    // resolution or screen position — which is why the reflection LOD below needs no fudge factor.
+    float pixAngle = max(length(ddx(EyeVec)), length(ddy(EyeVec)));
+
+    // THE TWO-SCALE CROSSFADE THAT USED TO BUILD THE NORMAL HERE IS DELETED — 527-unit tile lerped
+    // into a 3900-unit tile over `saturate(dist/8000)`. It had been dead since W2 landed (the AF
+    // block below overwrites `normal` from the close tile alone), and with it go four texture
+    // fetches and the entire "variance of a lerp of two independent fields" correction chain that
+    // existed only to patch up the crossfade's own detail loss. Nothing visible changes.
+    // ⚠ One line of it IS still load-bearing and is recorded here so it is not re-lost: every sample
+    // of a mip-varying resource in this file uses a MIPMAP_MODE_LINEAR sampler — gSamplerAnisotropic
+    // (s10) for the wave slopes, gSamplerTrilinearWrap (s5) for the variance — NOT the bilinear one
+    // this file used before WT4d. The LOD was pinned to 0 back then so the mip filter mode was moot;
+    // it varies continuously now, and MIPMAP_MODE_NEAREST would SNAP — a visible ring on the sea at
+    // every level step.
+    float3 normal = float3(0.0f, 0.0f, 1.0f);
+
+    // ================================================================================================
+    // W3 — HARDWARE-FILTERED NORMALS FROM THE BOMBED WAVE ARRAY
+    // ================================================================================================
+    // water_NRM.dds's ALPHA channel is the HEIGHT its RG slopes were baked from. Measured, not
+    // assumed: slope = -k * central_difference(height) fits at R² = 0.9887 / 0.9905 with k_x = 8.669,
+    // k_y = 8.709 (isotropic to 0.5%), residual sd 0.0105 against a predicted 8-bit quantization floor
+    // of 0.0073 — i.e. a plain central difference IS effectively the stencil that produced them.
+    // That relationship is what let the host BOMB the height at launch and re-derive the slopes:
+    // a 2108-unit non-tiling field at the shipped 2.06 world units per texel. See bakeWaterField.
+    //
+    // ⚠ THE TAP LOOP IS GONE, AND THE RESOURCE CHANGE IS WHY.
+    // W2 hand-wrote 8 taps along the footprint's major axis because FSL ships NO SampleTex3D for D3D
+    // at all (commented out, d3d.h:621) — only the explicit-LOD form, and an explicit LOD bypasses
+    // anisotropy by definition. SampleTex2DArray exists, so re-baking the field as a Texture2DArray
+    // hands the whole job to gSamplerAnisotropic (s10, REPEAT, maxAnisotropy 8), which does it in
+    // dedicated silicon. Per water pixel: 9 samples becomes 4.
+    //
+    // ⚠ AN ARRAY DOES NOT FILTER ACROSS SLICES. The free time interpolation a Texture3D gave us has to
+    // be done by hand — hence two taps and a lerp rather than one tap. Still 4 total against W2's 9.
+    //
+    // ⚠ AND WE FILTER THE SLOPES DIRECTLY, NEVER THE HEIGHT — which is the one thing that looks like
+    // it would be cheaper and is not. grad(h * G) == (grad h) * G holds only when the differencing
+    // scale MATCHES the filter scale. A fixed texel stencil against an AF footprint that is not fixed
+    // fails exactly where it matters: at distance the filtered height goes nearly constant and a
+    // 1-texel difference collapses toward ZERO, so the normals would VANISH instead of becoming
+    // roughness — which is the whole model. Pre-differenced slopes, filtered by the hardware, is the
+    // only version correct at every LOD. (It is also 4 fewer fetches per slice and 3x less noise; the
+    // bake differences in float, once, before quantizing.)
+    float afSigma2 = 0.0f;   // slope variance the filter removed -> roughness
+    float afAniso  = 1.0f;   // footprint major:minor, for the debug view
+    {
+        // The ellipse survives the tap loop's retirement, because `lodV` below still needs BOTH axes.
+        // What it no longer does is steer the sampling: the texture unit derives its own footprint
+        // from the gradients handed to SampleGrad.
+        float texelWorld = waveTile / kWaveFieldTexels;
+        float sMinW = max(sqrt(fpEll.x), texelWorld);
+        float sMaxW = max(sqrt(fpEll.y), sMinW);
+        afAniso = sMaxW / sMinW;
+
+        // TIME: the array's slice axis is cyclic mod waveSlices, so the loop is exact and the two
+        // taps that bracket `t` wrap around at the end without a seam.
+        float zf = frac(t) * waveSlices;
+        float z0 = floor(zf);
+        float fz = zf - z0;
+        float z1 = (z0 + 1.0f < waveSlices) ? (z0 + 1.0f) : 0.0f;
+
+        // ⚠ GRADIENTS OF THE CAMERA-RELATIVE POSITION, scaled into tile space — not derivatives of
+        // tc2 taken by the hardware. tc2 carries lodEye (up to ~250k world units), so an implicit
+        // derivative would be a difference of two rounded large numbers; dWdx/dWdy above were taken
+        // before that addition and are exact ([[project_forge_precision_far_origin]]).
+        float2 dTdx = dWdx / waveTile;
+        float2 dTdy = dWdy / waveTile;
+        float2 s0 = 2.0f * SampleGradArray(gWaterNormalVol, gSamplerAnisotropic,
+                                           float3(tc2, z0), dTdx, dTdy).rg - 1.0f;
+        float2 s1 = 2.0f * SampleGradArray(gWaterNormalVol, gSamplerAnisotropic,
+                                           float3(tc2, z1), dTdx, dTdy).rg - 1.0f;
+        normal = normalize(float3(lerp(s0, s1, fz) * waveAmp, 1.0f));
+
+        // --- ROUGHNESS: FROM THE BAKED ARRAY, NOT FROM THE TAPS -----------------------------------
+        // ⚠⚠ AN INTER-TAP SAMPLE VARIANCE IS NOT AN OPTION HERE, and was not one when the taps still
+        // existed. E[|s|²] − |E[s]|² over N taps is an honest estimator of the right quantity and it
+        // failed three ways at once ("sigma2 has pulsing and a near cutoff"):
+        //
+        //   1. DOUBLE COUNTED. It was added to the baked sub-texel variance read at the geometric-mean
+        //      lod — and that term already contains the inter-tap detail, because the geometric mean
+        //      of the ellipse axes is (within ~15%) the isotropic footprint that removes what the
+        //      whole ellipse removes. Two names for one quantity, summed.
+        //   2. IDENTICALLY ZERO AT N=1. One sample has no variance, so the instant the footprint
+        //      became even slightly anisotropic the term jumped from exactly 0 to a full two-sample
+        //      variance — a hard ring at whatever distance the footprint stopped being round.
+        //   3. AN N-SAMPLE VARIANCE OVER 2-8 TAPS IS NOISE. Its own sampling error is the same order
+        //      as its value and the phases slide under camera motion. That is the "pulsing", and no
+        //      care in the estimator removes it — the fix is to stop estimating.
+        //
+        // With hardware AF there are no taps left to take a variance over even in principle, which is
+        // the honest reason this can never come back. The array answers it exactly, at one sample,
+        // with no arithmetic and no noise: it is CPU-baked per texel per level (bakeWaterField), so
+        // V(lod) IS the variance below that scale.
+        //
+        // WHICH lod: the filter resolves wTap ACROSS the footprint and spans sMaxW ALONG it, and for
+        // an isotropic field the variance an a x b box removes tracks the isotropic V(sqrt(a*b))
+        // within ~15% from 2:1 to 10:1 — erring slightly HIGH, which is the safe direction (more
+        // roughness = more filtering). In log space a geometric mean is just an average:
+        //
+        //     lodV = 0.5 * (lodA + log2(sMaxW / texelWorld))
+        //
+        // Continuous in both axes, monotone in both, and exactly 0 when the footprint is one texel —
+        // so "calm water up close is a sharp mirror" stays a property of the data, not of a constant.
+        // (Checked against the alternatives on a band-limited isotropic model: V(sMax) over-reports
+        // badly — at 10:1 it claims 0.99 of the field where the true elliptical answer is 0.87 — and
+        // the tempting ½(V(sMin)+V(sMax)) split under-reports just as badly, 0.50 against the same
+        // 0.87. The geometric mean gives 0.90. Neither of the two "obvious" forms is close.)
+        // wTap is still the texture unit's own clamp, restated: past kWaterMaxAniso the hardware
+        // floors the per-tap width at sMaxW/maxAniso exactly as the manual loop did, so the two
+        // descriptions of the same filter stay in step.
+        float wTap = max(sMinW, sMaxW / (float)kWaterMaxAniso);
+        float lodA = log2(wTap / texelWorld);
+        float lodV = 0.5f * (lodA + log2(sMaxW / texelWorld));
+
+        // ⚠ THE VARIANCE ARRAY IS HALF RESOLUTION AND STARTS AT LEVEL 1. V(0) is identically ZERO by
+        // construction (a single texel has no internal variance), so storing it would be pure waste —
+        // the array's level 0 IS the field's level 1. Everything below that is reconstructed here
+        // EXACTLY from the known V(0) = 0, with no extra sample: V is linear from 0 up to V(1).
+        // This is where an off-by-one would land, and it would land on the most visible property the
+        // model has ("calm water up close is a sharp mirror"), so it is worth the two lines.
+        //
+        // ⚠ ONE SLICE, not a time lerp. The variance is a statistic of the field, and adjacent time
+        // slices of the same wave field have the same statistics — so the second tap would cost a
+        // sample to interpolate between two nearly equal numbers.
+        float lodS = max(lodV - 1.0f, 0.0f);
+        float vr   = SampleLvlArray(gWaterSlopeVar, gSamplerTrilinearWrap, float3(tc2, z0), lodS).r;
+        afSigma2   = max(0.0f, vr) * min(lodV, 1.0f) * (waveAmp * waveAmp);
+    }
+
+    // --- W1: the procedural field, when enabled, REPLACES both the taps and the variance ----------
+    // ⚠ AND IT IS BRANCHED, not evaluated unconditionally. The previous note here claimed "the
+    // compiler dead-strips it when the flag is a uniform false" — that is WRONG and it was costing a
+    // full four-fBm Perlin evaluation on every water pixel with the field switched off (which is now
+    // the default). A cbuffer bit is wave-uniform, not a compile-time constant; DXC cannot fold it
+    // and does not. Uniformity is what makes the BRANCH legal, not what removes the need for one.
+    // The branch is safe here for the reason the derivative hazard above is real: waveFieldGrad takes
+    // the footprint as a PARAMETER and contains no ddx/ddy of its own (checked), and both flags are
+    // bits of one per-draw cbuffer float, so control flow stays wave-uniform.
+    // ⚠ The eye and the camera-relative position go in SEPARATELY, not pre-summed as worldXY: the
+    // noise lattice split needs the large term kept apart from the small one, or float32 spends its
+    // mantissa on Morrowind's ~250k world coordinates and quantizes the interpolant.
+    float  waveSigma2 = 0.0f;
+    float3 waveHG     = float3(0.0f, 0.0f, 0.0f);
+    if (proceduralWaves || heightView) {
+        waveHG = waveFieldGrad(In.WorldPos.xy, gFrameData.lodEye.xy, time, fpEll, waveSigma2);
+    }
+
+    // HEIGHT DEBUG: returns HERE, before any water shading — no reflection, no refraction, no
+    // Fresnel, no fog. The point is to see the field itself and nothing layered over it, and an early
+    // return is also what makes this free when the flag is off (it is uniform, so the branch folds).
+    if (heightView) { RETURN(float4(waveHeightDebug(waveHG, heightGain, dWdx, dWdy), 1.0f)); }
+
+    if (proceduralWaves) {
+        // Height gradient -> normal. The surface normal of z = h(x,y) is (-dh/dx, -dh/dy, 1), which
+        // is the same slopes-with-implicit-z=1 convention the normal map path uses, so everything
+        // downstream (Fresnel, GGX, the distortion offsets) is untouched by the switch.
+        normal = normalize(float3(-waveHG.yz, 1.0f));
+    }
+
+    // --- ROUGHNESS FROM SLOPE VARIANCE (Olano-Baker LEAN/CLEAN) ----------------------------------
+    // The normal above is FILTERED, which is what stops it aliasing — but filtering does not remove
+    // sub-pixel detail, it MOVES it: what was a wobbling normal becomes a flat normal plus a
+    // variance. Recover that variance and it becomes lobe width, which is the whole point. Deleting
+    // it (what `adjustnormal` used to do) is what made distant water a hard mirror, because a flat
+    // normal with no roughness is a perfect one.
+    //
+    //     sigma²(L) = E_L[|s|²] - |E_L[s]|²
+    //
+    // ⚠⚠ THAT SUBTRACTION IS DONE ON THE CPU, PER TEXEL, PER MIP — never here, and never from taps
+    // taken at render time either. gWaterSlopeVar holds the FINISHED variance; the read above is one
+    // tap and no arithmetic. Every attempt to reconstruct it at render time has failed, twice now, in
+    // ways that presented as unrelated bugs — recorded because both are things a careful person
+    // derives on the way past:
+    //
+    //   (a) FROM TWO INTERPOLATED MOMENTS (E[|s|²] and E[s] from two textures, subtracted here):
+    //         bilerp(|s|²) - |bilerp(s)|²  =  SUM_i w_i |s_i - s_bar|²    (Jensen; never zero)
+    //       Nonzero at LOD 0, so water was blurry at centimetres; the bilinear weights oscillate with
+    //       sub-texel position, so it PULSED; and on a two-tap axis the gap w(1-w)(a-b)² vanishes at
+    //       texel centres and peaks between them — a texel-aligned GRID of sharper lines.
+    //   (b) FROM N EXPLICIT AF TAPS (the W2 first cut). Immune to (a) — same taps, equal weights, an
+    //       honest sample variance, exactly zero when the taps agree — and it failed anyway, on
+    //       double counting, a hard zero at N=1, and estimator noise. See the block above.
+    //
+    // The through-line: a variance FIELD interpolates beautifully. A variance ESTIMATED at render
+    // time does not, however the estimate is formed. The operands have to meet while they are exact,
+    // and on this asset that means at bake time.
+    //
+    // Bonus: sigma²[0] is exactly 0 by construction (a single texel has no internal variance), so
+    // "calm water up close is a sharp mirror" is a property of the data, not of a tuned constant.
+    //
+    // W1's procedural field carries its own variance instead, accumulated term by term in the same
+    // loop that produced its normal — no volume, nothing to keep aligned. One line each now that the
+    // two-scale crossfade correction is gone with the crossfade.
+    float sigma2 = proceduralWaves ? waveSigma2 : afSigma2;
+
+    // sigma2 sums both slope axes, so the per-axis variance is sigma2/2; the Beckmann/GGX slope-
+    // space mapping is alpha² = 2 * varPerAxis, which cancels to exactly this. alphaBase covers
+    // structure below EITHER field's finest representable detail — capillary ripple that is simply
+    // not in the model.
+    float alpha = sqrt(alphaBase * alphaBase + sigma2);
+
+    // --- reflection LOD from roughness ------------------------------------------------------------
+    // The reflection is a planar mirror in MAIN-SCREEN space (the whole screen maps to the whole
+    // 1024² RT), so one reflect texel spans (screenW / reflSize) screen pixels, i.e.
+    // pixAngle * screenW / reflSize radians. The BRDF cone: normal tilt has angular std ~alpha and a
+    // reflection DOUBLES it, so the lobe's half-width is ~2*alpha. Divide the two.
+    //
+    // The first cut used 4*alpha — the FULL width — as the filter radius, which is one whole LOD
+    // level of unnecessary blur on top of the footprint error above. A filter footprint wants the
+    // half-width; the mip chain's own reconstruction covers the rest.
+    //
+    // reflBlurGain is a CALIBRATION knob, not a second roughness. It scales only this LOD, never the
+    // lobe — so it answers "how much of the physical blur do I want to see" without touching the
+    // material. Expected to collapse back into the constant once settled.
+    //
+    // SANITY GATE: alpha -> 0 gives LOD 0 — calm water stays a sharp mirror, by construction.
+    float reflTexelRad = max(pixAngle * (gShadowParams.screenParams.x / max(reflSize, 1.0f)), 1e-7f);
+    float reflLodRaw = log2(max(reflBlurGain * 2.0f * alpha / reflTexelRad, 1.0f));
+
+    // ...and BEYOND WHAT THE CHAIN CAN REPRESENT, converge to the sky instead of magnifying mush.
+    //
+    // A mip chain is the wrong instrument past a few levels. The arithmetic is unforgiving: one
+    // reflect texel subtends ~1.3e-3 rad at 2048 wide, so the 6-level chain is fully spent by
+    // alpha ~0.02 — while the measured wave field reaches alpha 0.146. Most of the visible water
+    // therefore pins to the last mip, and sampling a 32x32 image magnified across the screen is not
+    // a blurred reflection, it is bilinear diamonds that swim under camera rotation (observed).
+    // Lowering reflBlurGain only moves where that starts; it cannot add dynamic range.
+    //
+    // So the chain is capped at a mip that still MAGNIFIES cleanly, and the leftover roughness turns
+    // into a blend toward the sampled sky. That is not a fudge: a sufficiently rough mirror reflects
+    // the AVERAGE of the hemisphere above it, which at a water plane is the sky — the same target
+    // the fog melt below already uses, so the two agree instead of fighting. The mush has nowhere to
+    // come from because the tiny mips are never sampled at all.
+    float reflLod = min(reflLodRaw, (float)kReflectMipUsable);
+
+    // ⚠ THE HANDOVER IS AN ENERGY SHARE, NOT A RAMP. It used to be `saturate(raw - kUsable)`: 0 to 1
+    // across ONE lod unit, then pinned at exactly 1 for everything beyond. Two faults, and the
+    // reported one ("hard cutoff... eats all reflections") is the second:
+    //   - the transition is a full crossfade in one octave of roughness, which is abrupt; and
+    //   - past that octave it SATURATES, so there is a locus on the water where the reflection stops
+    //     changing and is simply gone. A saturating term always draws a line at its knee.
+    // What the mix should be is the share of the reflection lobe too wide for the capped mip to
+    // carry. The lobe's width and the mip's width are both lengths, and their ratio is 2^over by
+    // definition of a mip level, so the carried share is 2^-over and:
+    //
+    //     reflSkyMix = 1 - exp2(-over)
+    //
+    // Monotone, smooth, asymptotic — it approaches 1 and never arrives, so no locus exists where the
+    // reflection vanishes and no line can be drawn. It is also GENTLER than the old ramp exactly
+    // where the complaint was (0.29 vs 0.50 at half an octave over; 0.50 vs 1.00 at one), which is
+    // the dynamic range reflBlurGain was being asked for and could not supply from inside a log.
+    float over = max(reflLodRaw - (float)kReflectMipUsable, 0.0f);
+    float reflSkyMix = 1.0f - exp2(-over);
 
     float2 baseUV = In.Position.xy * invAlloc;           // this fragment, in TEXTURE space
 
@@ -121,10 +535,17 @@ float4 PS_MAIN( VSOutput In )
         // VIEWPORT-relative (invScreen), NOT invAlloc. Same premultiplied-over-fog resolve as the
         // above-water path. Underwater the reflect pass draws no sky (host-side), so what lands here
         // is the mirrored seabed/world below the surface — exactly the TIR content.
+        // gReflectMips + TRILINEAR: the mip-point sampler would SNAP between levels and band a
+        // smoothly varying roughness.
         float2 reflUVU = In.Position.xy * invScreen
                        + float2(-2.1f * reffactorU.x, abs(reffactorU.y)) * invScreen;
-        float4 reflSampleU = SampleLvlTex2D(gReflectColor, gSamplerBilinearClamp, reflUVU, 0.0f);
+        float4 reflSampleU = SampleLvlTex2D(gReflectMips, gSamplerTrilinearClamp, reflUVU, reflLod);
         float3 reflectedU  = reflSampleU.rgb + fogCol * (1.0f - reflSampleU.a);
+        // Same cap-and-converge as the above-water path, but toward fogCol rather than the sky
+        // target: looking UP at the underside, what a rough surface averages is the seabed-and-
+        // water world the reflect pass drew for this case, whose ambient IS the near fog colour.
+        // fogSkyColor() would be wrong here — there is no sky on this side of the surface.
+        if (reflSkyMix > 0.0f) { reflectedU = lerp(reflectedU, fogCol, reflSkyMix); }
 
         if (waterDbg == 1u) {   // undistorted, as above
             float4 rawReflU = SampleLvlTex2D(gReflectColor, gSamplerBilinearClamp,
@@ -147,7 +568,7 @@ float4 PS_MAIN( VSOutput In )
     }
 
     // --- fogged deep-water base colour ---
-    float3 depthColor = lerp(fogCol, depthBaseColor, fog);
+    float3 depthColor = depthBaseColor * float3(0.1, 0.3, 1.0) * 0.5; //lerp(fogCol, depthBaseColor, fog);
 
     // Reflection/refraction pixel distortion (wind strength increases it).
     float2 reffactor = (windFactor * dist + 0.1f) * normal.xy;
@@ -176,28 +597,53 @@ float4 PS_MAIN( VSOutput In )
         depth     += 300.0f * (0.95f - normal.z);   // small-scale shoreline animation
 
         float depthscale = saturate(exp(-depth / 500.0f));
-        shorefactor = pow(depthscale, 25.0f);
+        shorefactor = pow(depthscale, 5.0f);
         refracted = lerp(depthColor, refracted, 0.8f * depthscale + 0.2f * shorefactor);
     }
-
+	
+	
+	float3 sunPos = -gFrameData.sunDir.xyz;   // gFrameData.sunDir = travel dir; to-sun = -dir
+    float3 L = normalize(sunPos);
+    float3 V = -EyeVec;
+    float3 H = normalize(L + V);
+    float  NoL = saturate(dot(normal, L));
+    float  NoH = saturate(dot(normal, H));
+    float  VoH = saturate(dot(V, H));
+	
+	refracted = lerp(refracted, ((1.0 - VoH) * 0.3 + 0.2) * gFrameData.sunCol.r * float3(0.2, 0.9, 0.7) * 0.5, 0.5);
     // --- reflection (WT2 Stage 1: real mirror-view RT, sky-only for now) ---
     // gReflectColor is the mirrored scene in MAIN-screen space (mirror world geom + normal camera),
     // so sample it at THIS fragment's screen UV, distorted by the surface normal (MGE's 2.1x/abs
     // pattern). The RT is premultiplied (rgb·a) over a transparent clear, so composite it over the
     // fog colour by (1 - a) → un-drawn areas (below the reflected horizon, pre-DL) read fog, not black.
     // VIEWPORT-relative, not alloc: see invScreen above — this RT is 1024², not screen-allocated.
+    // WT4d/P2: sampled from the PRE-FILTERED pyramid at the roughness LOD, with the TRILINEAR
+    // sampler (s4). gSamplerBilinearClamp is MIP_POINT — it selects a mip but SNAPS, so a smoothly
+    // varying roughness would band across the surface.
     float2 reflUV = In.Position.xy * invScreen
                   + float2(-2.1f * reffactor.x, abs(reffactor.y)) * invScreen;
-    float4 reflSample = SampleLvlTex2D(gReflectColor, gSamplerBilinearClamp, reflUV, 0.0f);
+    float4 reflSample = SampleLvlTex2D(gReflectMips, gSamplerTrilinearClamp, reflUV, reflLod);
     float3 reflected = reflSample.rgb + fogCol * (1.0f - reflSample.a);
-	float3 deb = reflected;
-    reflected = lerp(reflected * 0.96f, reflected, fog);
-    // ...and FOG it, which nothing here did. This was the one term in the whole surface that never
-    // converged: `refracted` reaches fogCol through depthColor and through gRefractColor (already a
-    // fogged scene copy), but the reflection only got the 0.96 distance darkening above — so at
-    // grazing angles, where Fresnel goes to ~1 and the water IS its reflection, the mirror image
-    // survived to the fog wall at 96% strength. Distant water therefore stayed a hard mirror while
-    // every other surface melted, which is what "water isn't fogged properly" looks like.
+    // Roughness past what the chain can represent -> the sky (see reflSkyMix). Applied BEFORE the
+    // fog melt below, and toward the SAME target, so the two compose instead of competing: a rough
+    // near surface reaches the sky by roughness, a smooth far one by fog, and both by both.
+    if (reflSkyMix > 0.0f) {
+        reflected = lerp(reflected, fogSkyColor(In.Position.xy), reflSkyMix);
+    }
+    // WT4d/P3: the `reflected * 0.96` distance darkening that used to sit here is GONE. It was
+    // DIMMING applied to a SAMPLING problem — distant water stayed a hard mirror because the normal
+    // and the reflection were both undersampled, and 4% off the reflection hid it without touching
+    // the cause. The roughness LOD above and P4's Fresnel ceiling below fix it at the root.
+    //
+    // The FOG below stays, and the distinction matters: that one is physically right (aerial
+    // perspective, the same melt every other surface gets) rather than a fudge.
+    //
+    // This was the one term in the whole surface that never converged: `refracted` reaches fogCol
+    // through depthColor and through gRefractColor (already a fogged scene copy), but the reflection
+    // only had the 0.96 darkening — so at grazing angles, where Fresnel goes to ~1 and the water IS
+    // its reflection, the mirror image survived to the fog wall at 96% strength. Distant water
+    // therefore stayed a hard mirror while every other surface melted, which is what "water isn't
+    // fogged properly" looks like.
     //
     // Toward the SAME sampled target as the world (skydome.h.fsl), not a private fogCol: at water
     // pixels the sky pass drew nothing, so that target evaluates to exactly fogColNear today — but
@@ -208,8 +654,9 @@ float4 PS_MAIN( VSOutput In )
     // the same scalar, so fogging the composite would fog the refraction TWICE (fog²) and pull the
     // mid-distance water under. One term, one fog, and the Fresnel mix then converges on its own —
     // at fog 0 both inputs are the target, so the surface is the target at any Fresnel weight.
-    reflected = lerp(fogSkyColor(In.Position.xy), reflected, fog);
-	
+    if (!noFogMelt) { reflected = lerp(fogSkyColor(In.Position.xy), reflected, fog); }
+
+
     // Dev-panel water debug views (P[3].x). Output an isolated term so the reflection / refraction RT
     // contents are directly visible. Mode 1 shows the RAW reflection sample (rgb·a premultiplied): a
     // black surface = the reflection RT is empty; coverage shows the mirrored scene. Mode 2 shows the
@@ -225,22 +672,106 @@ float4 PS_MAIN( VSOutput In )
         RETURN(float4(rawRefl.rgb, 1.0f));
     }
     if (waterDbg == 2u) { RETURN(float4(refracted, 1.0f)); }
+    // Mode 3 = ROUGHNESS, false-coloured. Roughness has no silhouette of its own, so a wrong
+    // variance is close to undiagnosable from the lit image — this is the same reasoning that gave
+    // the sky-height map its debug view.
+    //   R = reflection LOD in use, over the USABLE range (1 = at the cap, i.e. handing over to sky)
+    //   G = alpha, the roughness itself
+    //   B = FOOTPRINT ANISOTROPY in octaves, over the tap budget (1 = at or past kWaterMaxAniso)
+    //
+    // B has been the base term's share and then the two-scale crossfade weight; both answered
+    // questions that stopped existing. Anisotropy earns the channel because it is the one input this
+    // model cannot see from the lit image and gets wrong in a characteristic way — a footprint past
+    // the tap budget is the one place the AF average stops being exact, and
+    // [[project_anisotropic_footprint_filter]] is the record of how long that took to find without a
+    // view of it. Saturated B is not a fault; it is "this pixel is clamped to 8:1".
+    //
+    // R is normalised by kReflectMipUsable, not kReflectMipMax, so "R saturated" now means "this
+    // pixel has handed over to the sky" rather than "this pixel is sampling a 32x32 mip" — which is
+    // the question actually worth asking once the cap exists. Saturated R over a wide area is no
+    // longer a fault; check reflSkyMix's effect in the LIT view instead.
+    if (waterDbg == 3u) {
+        RETURN(float4(saturate(reflLod / (float)kReflectMipUsable),
+                      saturate(alpha * 20.0f),
+                      saturate(log2(afAniso) / log2((float)kWaterMaxAniso)), 1.0f));
+    }
 
-    // --- Fresnel ---
-    float3 adjustnormal = lerp(float3(0, 0, 0.1f), normal, pow(saturate(1.05f * fog), 2.0f));
-    adjustnormal = lerp(adjustnormal, float3(0, 0, 1.0f),
-                        (1.0f + EyeVec.z) * (1.0f - saturate(1.0f / (dist / 1000.0f + 1.0f))));
-    float fresnel = dot(-EyeVec, adjustnormal);
-    fresnel = 0.02f + pow(saturate(0.9988f - 0.28f * fresnel), 16.0f);
+    // --- FRESNEL ---------------------------------------------------------------------------------
+    // The `adjustnormal` flattening that used to open this block is GONE (WT4d/P3). It faded N
+    // toward (0,0,1) with distance and with view angle, which is roughness applied to the wrong
+    // quantity: it deleted the sub-pixel slope variance rather than converting it to lobe width.
+    // That variance is now recovered above and carried in `alpha`, where both the reflection LOD and
+    // the specular lobe read it. N is the honest mip-filtered mean normal.
+    float NoV = saturate(dot(-EyeVec, normal));
+    float fresnel;
+    if (useSchlick) {
+        // TRUE Schlick with the roughness ceiling (P4). max(1-alpha, F0) stops rough water reaching
+        // full mirror reflectance at grazing angles — THIS is what fixes "distant water is a hard
+        // mirror" at the root, instead of fogging it.
+        //
+        // Expect mid-distance water to read slightly LESS reflective than the old curve. The two
+        // agree almost exactly at the endpoints (head-on 0.020 vs 0.025; grazing 1.0 vs 1.0) but the
+        // old one is ~2x hot through the middle. That correction is intended.
+        float f90 = max(1.0f - alpha, kWaterF0);
+        float m   = 1.0f - NoV;
+        float m5  = m * m; m5 = m5 * m5 * m;
+        fresnel = kWaterF0 + (f90 - kWaterF0) * m5;
+    } else {
+        // The pre-WT4d curve, kept verbatim as the A/B partner — note its leading 0.02 IS this
+        // material's F0 (IOR 1.333 -> 0.0204), which is the clue that the old shader was most of the
+        // way to a BRDF already.
+        fresnel = kWaterF0 + pow(saturate(0.9988f - 0.28f * NoV), 16.0f);
+    }
     float3 result = lerp(refracted, reflected, fresnel);
-	
 
-    // --- sun specular (widened Phong lobe, area-light approximation) ---
-    float3 sunPos = -gFrameData.sunDir.xyz;   // gFrameData.sunDir = travel dir; to-sun = -dir
-    float  vdotr = dot(-EyeVec, reflect(-sunPos, normal));
-    vdotr = saturate(1.0025f * vdotr);
-    float3 spec = gFrameData.sunCol.rgb * (pow(vdotr, 170.0f) + 0.07f * pow(vdotr, 4.0f));
-    result += spec * fog;
+    // --- SUN SPECULAR: GGX, sun as a sphere light (WT4d/P1) --------------------------------------
+    // Replaces `pow(vdotr,170) + 0.07*pow(vdotr,4)` — two Phong lobes faking one wide lobe, with two
+    // hard-coded exponents and no roughness anywhere. One GGX lobe of width `alpha` does the job of
+    // both AND is the same number the reflection LOD uses, which is the whole reason water becomes a
+    // PBR material rather than just gaining a slider.
+    //
+    // Karis' representative-point sphere light: widen the lobe by the sun's angular radius so the
+    // core stays FINITE as alpha -> 0. Without it, calm water at the specular angle divides by ~0
+    // and the highlight becomes a single blinding pixel that aliases worse than anything WT4d set
+    // out to fix.
+    
+
+    // ⚠ FLOOR THE SPECULAR ROUGHNESS AT THE SUN'S OWN ANGULAR RADIUS. The representative-point
+    // approximation is derived for alpha >> the light's angular size and degrades below it: its
+    // (alpha/aEff)² energy term goes to ZERO as alpha -> 0, so a perfect mirror would show no sun
+    // glint at all — the opposite of the truth, which is that a mirror shows the sun's DISC. Below
+    // this floor the highlight is the disc, and its width stops being a property of the water.
+    // Costs nothing anywhere else: at the field's measured max roughness (~0.146) the floor is 3% of
+    // alpha and the normalization is already ~0.94.
+    float  aSpec = max(alpha, kSunAngularRadius);
+    float  aEff  = saturate(aSpec + kSunAngularRadius);   // sphere-light widening (energy below)
+    float  a2    = aEff * aEff;
+
+    // GGX / Trowbridge-Reitz D.
+    float  dDen = NoH * NoH * (a2 - 1.0f) + 1.0f;
+    float  D    = a2 / max(kWaterPI * dDen * dDen, 1e-8f);
+
+    // Smith height-correlated visibility (V = G / (4 NoL NoV) — the 4 is already folded in).
+    float  lv = NoL * sqrt(NoV * NoV * (1.0f - a2) + a2);
+    float  ll = NoV * sqrt(NoL * NoL * (1.0f - a2) + a2);
+    float  Vis = 0.5f / max(lv + ll, 1e-8f);
+
+    // Schlick F on the HALF vector (not the normal — this is the microfacet's own Fresnel).
+    float  fm  = 1.0f - VoH;
+    float  fm5 = fm * fm; fm5 = fm5 * fm5 * fm;
+    float  F   = kWaterF0 + (1.0f - kWaterF0) * fm5;
+
+    // Energy normalisation for the representative-point widening: broadening aSpec -> aEff spreads
+    // the same power over a wider lobe, so scale by (aSpec/aEff)² to keep the integral put.
+    float  sphereNorm = (aSpec * aSpec) / max(a2, 1e-8f);
+    float3 spec = gFrameData.sunCol.rgb * (D * Vis * F * NoL * min(sphereNorm, 1.0f));
+
+    // ⚠ INTERIM, and it is deleted by step 6 of forge-postprocess.md. An energy-conserving lobe
+    // peaks far above 1.0, so the glint WILL clip flat white in LDR — that is expected, not a bug.
+    // tonemap() runs on the SPECULAR TERM ALONE because that term is newly-generated radiance, which
+    // is exactly what the curve is for. It must NEVER run on the composite: `refracted` and
+    // `reflected` are copies of the already-tonemapped scene and would roll off twice.
+    result += tonemap(spec) * fog;
 
     // --- water cut feature (vtastek) ---
     float wdist = dist / lerp(1200.0f, 0.0f, saturate((-waterLevelRel) / 7.0f));
@@ -252,10 +783,12 @@ float4 PS_MAIN( VSOutput In )
     result = lerp(result, result * 0.1f, wcutdark);
 	
 
-    // shore-line smoothing
-    result = lerp(result, refracted, shorefactor * fog);
+    
 	
-	result = result;
+	result = lerp(fogCol, result, fog);
+	
+	// shore-line smoothing
+    result = lerp(result, refracted, shorefactor * fog);
 
     RETURN(float4(result, 1.0f));
 }

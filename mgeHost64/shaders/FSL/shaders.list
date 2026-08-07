@@ -425,6 +425,20 @@
 #include "hizreduce.comp.fsl"
 #end
 
+// Planar-reflection mip pyramid (WT4d / PBR water, P2). Same two-variant shape as the Hi-Z above,
+// but a BOX AVERAGE instead of a min — this is radiance, not conservative depth — and over all four
+// PREMULTIPLIED channels with identical weights (see reflectmip.srt.h). Feeds water.frag's
+// roughness-driven reflection LOD; without it a rough surface would sample a mirror-sharp RT and
+// alias. Both run in the main cmd where pReflectColor flips to SHADER_RESOURCE.
+#comp reflectmipfirst.comp
+#define REFLMIP_FIRST 1
+#include "reflectmip.comp.fsl"
+#end
+
+#comp reflectmip.comp
+#include "reflectmip.comp.fsl"
+#end
+
 // Stage B (B3) GPU statics cull — count -> prefix-sum -> scatter -> execute-indirect (drives the far
 // statics draw; the CPU cull stays for parity until visually verified). All three share compute.rootsig
 // + the CullSrtData PerBatch set. cull.comp = COUNT (survivors atomic-add numSubsets for the CPU parity

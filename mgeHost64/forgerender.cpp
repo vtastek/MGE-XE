@@ -37,6 +37,10 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+// W3 water-field bake: every time slice of the wave array is independent (array mips never reduce
+// the slice axis), so the bomb/difference/mip/variance chain parallelises trivially over slices.
+// Included with the other standard headers — i.e. BEFORE IMemory.h overrides new/delete.
+#include <thread>
 
 #include "OS/Interfaces/IOperatingSystem.h"
 #include "Utilities/Interfaces/IFileSystem.h"
@@ -62,6 +66,10 @@
 // Needed by the ResolveSubresource sites, which must be handed a typed format — reading it back
 // off the D3D12 resource instead is what removed the device (see snapshotColorTarget).
 #include "Resources/ResourceLoader/ThirdParty/OpenSource/tinyimageformat/tinyimageformat_apis.h"
+// TinyImageFormat_FloatToHalfAsUint — the CPU-side float32 -> float16 the WT4d slope-moment volume
+// needs to fill an R16_SFLOAT texture (loadWaterNormalVolume). Vendored and correct; hand-rolling a
+// half encoder for one call site is how a subnormal or an inf becomes a silent NaN in a shader.
+#include "Resources/ResourceLoader/ThirdParty/OpenSource/tinyimageformat/tinyimageformat_encode.h"
 // IMemory.h overrides new/delete/malloc — Forge convention: include it LAST.
 #include "Utilities/Interfaces/IMemory.h"
 // M1c opaque-scene SRT. defaults.h provides the C++ definitions of the FSL macros
@@ -108,6 +116,10 @@
 // Phase 3 prologue: Hi-Z pyramid build SRT (HizSrtData, Persistent frequency). Shares the merged
 // ComputeRootSignature. See [[project_forge_gpu_occlusion]] M1.
 #include "shaders/FSL/hizreduce.srt.h"
+// WT4d/P2: planar-reflection mip-pyramid build SRT (ReflectMipSrtData, Persistent frequency —
+// the same shape as HizSrtData's, which is fine: aoblur/sunblur already prove two different
+// headers can share a compute frequency, and the bind cache is keyed on the descriptor HANDLE).
+#include "shaders/FSL/reflectmip.srt.h"
 // P1 point-light shadows: screen-space mask SRT (ShadowMaskSrtData, PerBatch frequency). Shares
 // the merged ComputeRootSignature. See [[project_forge_point_lights]] / tasks/todo.md.
 #include "shaders/FSL/shadowmask.srt.h"
@@ -1701,7 +1713,21 @@ namespace {
         // publishes its own inverse extent into that pass's gFrameData.fogParams.zw.
         Texture*       pSkyColor = nullptr;                // alloc-sized copy of the main view's sky
         Texture*       pReflectSkyColor = nullptr;         // kReflectSize² copy of the mirror's sky
-        Texture*       pWaterNormalVol = nullptr;          // water_NRM.dds 3D animated-normal volume
+        // W3: the wave field, BOMBED from water_NRM.dds at launch into a Texture2DArray — 1024²x32
+        // RG8 SLOPES (not the shipped 256³ Texture3D). The array is what buys hardware AF, which is
+        // what makes a 4x-wider non-tiling field affordable; see bakeWaterField.
+        Texture*       pWaterNormalVol = nullptr;          // 1024x1024x32 RG8, 11 mips (~89 MB)
+        // WT4d/P0: the SLOPE-VARIANCE companion to the array above — sigma² = E[|s|²] - |E[s]|²
+        // per texel per mip, box-chained alongside it, built on the CPU at bake. Holds the FINISHED
+        // variance, not the second moment: subtracting two independently-interpolated moments in the
+        // shader is nonzero even at mip 0, pulses with sub-texel position, and forms a texel-aligned
+        // grid (see bakeWaterField). Toksvig cannot substitute either — water_NRM stores slopes with
+        // an implicit z = 1, so the averaged normal's length is always exactly 1 and carries no
+        // variance.
+        // HALF RESOLUTION and one level short on purpose: its own level 0 is identically zero, so the
+        // 1024 field's levels 1..8 are stored as this array's 0..7 and the frag reconstructs the rest
+        // from V(0) = 0 at no extra sample.
+        Texture*       pWaterSlopeVar = nullptr;           // 512x512x32 R16F, 8 mips (~22 MB)
         bool           waterReady = false;                 // all water resources built (gates the pass)
 
         // --- Phase F: additive distant-light GLOW billboards (procedural sprite per fixture) ------
@@ -1757,6 +1783,20 @@ namespace {
         DescriptorSet* pPerBatchSetReflectSky = nullptr;   // gBatch bound to pReflectSkyWorldsBuf
         Buffer*        pReflectSkyInstanceBuf = nullptr;   // reflect sky per-draw instance VB
         bool           reflectReady = false;               // all reflection resources built (gates the pass)
+        // WT4d/P2: the PRE-FILTERED copy of the above. Water has a roughness now, and a BRDF cone of
+        // half-angle ~alpha at the surface subtends ~alpha in the mirrored image — so the reflection
+        // has to be mip-filtered and sampled at a matching LOD, or a rough surface reads a
+        // mirror-sharp RT and aliases. A SEPARATE texture rather than mips on pReflectColor: that
+        // RT's format is tied to sceneColorFormat and its PSO is shared with the main colour pass,
+        // so adding mips + a UAV to it risks the reflect pass's RTV/clear semantics for no gain.
+        // Always fp16 regardless of sceneColorFormat — see reflectmip.srt.h for both reasons.
+        Texture*       pReflectMips = nullptr;             // kReflectSize², kReflectMipCount, RGBA16F, SRV+UAV
+        DescriptorSet* pReflectMipSet = nullptr;           // ReflectMipSrtData Persistent, maxSets = mips
+        Shader*        pReflectMipShaderFirst = nullptr;   // reflectmipfirst.comp (pReflectColor -> mip 0)
+        Shader*        pReflectMipShader = nullptr;        // reflectmip.comp (2x2 box average)
+        Pipeline*      pReflectMipPipelineFirst = nullptr;
+        Pipeline*      pReflectMipPipeline = nullptr;
+        bool           reflectMipReady = false;            // gates the per-frame pyramid build
 
         // --- Buffer consolidation: one shared mega VB + IB for STATIC non-skinned parts ----
         // Kills the per-draw VB/IB binds (the DX9-shaped bottleneck): bind these ONCE, draw each
@@ -2030,6 +2070,11 @@ namespace {
     constexpr uint32_t kWaterLevels    = 6;
     // WT2 reflection RT side (matches MGE texReflection's 1024² budget; sampled with normalized UV).
     constexpr uint32_t kReflectSize = 1024;
+    // WT4d/P2 pre-filtered reflection pyramid: 1024, 512, 256, 128, 64, 32. Stops at 32² rather than
+    // running to 1x1 because the roughness LOD saturates long before then — alpha would have to
+    // reach ~0.03 rad of surface slope spread for LOD 5, which is already fully diffuse water — and
+    // every extra level is a dispatch that no fragment ever samples.
+    constexpr uint32_t kReflectMipCount = 6;
     // WATER MESH SNAP — a CAMERA-AVOIDANCE hack, NOT where the water conceptually is. The mesh is
     // pushed 5 units down above water / 5 up below it, so the surface never intersects the camera at
     // the IsUnderwater threshold (MGE's s_waterMeshSnapAbove/-Underwater, renderwater.cpp:44). The
@@ -3399,11 +3444,496 @@ namespace {
         return true;
     }
 
-    // WT1: load water_NRM.dds as a 3D animated-normal volume. The host runs from the morrowind64 cwd,
-    // so it reads the file directly. water_NRM is uncompressed 32-bit BGRA (DDS depth at offset 24).
-    // The host's parseDds (uploadTextures) is 2D-only, so this is a dedicated 3D path: parse the
-    // header inline, create a Texture3D, then slice/row-copy each mip (mDstSliceStride per Z slice).
+    // ================================================================================================
+    // W3 — THE WAVE FIELD: bombed at launch, baked into a Texture2DArray, filtered by the hardware.
+    // ================================================================================================
+    //
+    // TWO ASKS, AND THEY TURN OUT TO BE ONE CHANGE.
+    //
+    // W2 sampled the wave normal with 8 hand-written taps along the footprint's major axis, because
+    // FSL ships NO SampleTex3D for D3D at all — it is commented out
+    // (ForgeShadingLanguage/includes/d3d.h:621) and only the explicit-LOD form exists, which bypasses
+    // anisotropy by definition. SampleTex2DArray DOES exist (d3d.h:610-613, implicit LOD) and
+    // gSamplerAnisotropic (s10/space100, REPEAT, maxAnisotropy 8) is already declared in BOTH places
+    // Common_3/Graphics/FSL/defaults.h requires (:76-78 and :206-207). So moving this resource from
+    // Texture3D to Texture2DArray buys REAL hardware AF for ZERO fork edits, and retires the tap loop:
+    // 9 samples per water pixel becomes 4.
+    //
+    // The array conversion is also what makes a WIDER field worth baking. A wider field only helps if
+    // it can be FILTERED, and a texture is the only representation whose filtering is free — which is
+    // exactly why W1's procedural field was retired ([[project_forge_procedural_waves]]). So: bomb the
+    // shipped 527-unit tile into a 2108-unit one (4x the period, IDENTICAL texel density at 2.06 world
+    // units per texel) and let the texture unit do the rest.
+    //
+    // GROUNDED IN THE ASSET, NOT ASSUMED. water_NRM.dds is 256x256x32 BGRA8, 9 mips, uncompressed. Its
+    // ALPHA is the height and its R/G are exactly that height's gradient:
+    //     slope = -k * central_difference(height),  k_x = 8.669  k_y = 8.709  (isotropic to 0.5%)
+    //     R² = 0.9887 / 0.9905, residual sd 0.0105 against a predicted 8-bit quantization floor 0.0073
+    // i.e. a plain central difference IS effectively the stencil that baked the shipped slopes. That
+    // fit is REDONE HERE at load rather than hard-coded, so a modded water_NRM recalibrates itself and
+    // the log says whether the model still holds.
+    //
+    // ⚠ THE BAKE WORKS IN HEIGHT AND STORES SLOPES. "just store the R8 height, it is half the memory"
+    // was measured and is a regression on three counts, the third decisive:
+    //   1. a central difference at render time is 4 extra samples PER SLICE — 8 per pixel instead of
+    //      2, which is the exact cost the AF conversion exists to remove;
+    //   2. 3x noisier normals: differencing an 8-bit height gives slope noise sd 0.0070 against 0.0023
+    //      for stored slopes. This bake differences in FLOAT, once, before quantizing.
+    //   3. ⚠⚠ A FIXED-STENCIL DIFFERENCE OF AN AF-FILTERED HEIGHT IS NOT THE FILTERED GRADIENT.
+    //      grad(h * G) == (grad h) * G holds only when the differencing scale MATCHES the filter
+    //      scale. The stencil is fixed in texels; the AF footprint is not. At distance the filtered
+    //      height goes nearly constant and a 1-texel difference collapses toward ZERO — the normals
+    //      would VANISH instead of becoming roughness, which is the whole model. Storing
+    //      PRE-DIFFERENCED slopes and letting the hardware filter THOSE is the only version correct at
+    //      every LOD, and is what the commutation identity licenses.
+    //   Height is therefore a bake-time INTERMEDIATE — which is the only place "more correct to do in
+    //   height, then convert to normals" is actually correct.
+    //
+    // ⚠ PER-CELL BOMBING, NOT GLOBAL ROTATED LAYERS — forced, not stylistic. The output must tile
+    // seamlessly (REPEAT addressing). A GLOBAL rotated copy tiles only if its matrix is an integer
+    // 2x2, and the integer rotations are either 90-degree multiples or carry a scale
+    // ([[2,1],[-1,2]] = 26.57 deg at sqrt(5)x finer) — so free rotation and exact tiling are
+    // incompatible GLOBALLY. Per cell they are not: each bomb is localised by its weight, so only the
+    // WEIGHT FIELD has to be periodic (it is, because the cell grid divides the output), and the copy
+    // itself may be rotated arbitrarily because the source is defined everywhere by its own wrap.
+    //
+    // ⚠ VARIANCE-PRESERVING BLEND, or the water comes out visibly FLATTER than the source:
+    //     h = mu + SUM_i w_i (h_i - mu) / sqrt(SUM_i w_i²)
+    // For decorrelated copies Var(SUM w_i (h_i - mu)) = SUM w_i² Var(h), so this is EXACT, not a
+    // heuristic. (Water height is a sum of many waves and therefore near-Gaussian, so a
+    // histogram-preserving blend would be overkill here.)
+    //
+    // ⚠ AND THE VARIANCE ARRAY IS HALF RESOLUTION, FOR FREE. Its level 0 would be IDENTICALLY ZERO by
+    // construction (a single texel has no internal variance) and is therefore pure waste. Store the
+    // 1024 field's levels 1..8 as a 512 array's levels 0..7 and reconstruct the sub-level-1 range in
+    // the shader from the known V(0) = 0 — exactly, with NO extra sample. It cannot collapse further
+    // than that: the slope-variance field's spatial coefficient of variation is 0.94 at level 1 and
+    // still 0.24 at level 8, so a per-lod LUT would throw away a real, visible glossiness variation.
+    //     slopes    1024x1024x32 RG8  + mips = 89 MB
+    //     variance   512x 512x32 R16F, 8 mips = 22 MB     ->  111 MB, against 179 MB stored naively.
+    //
+    // ⚠ EVERY SLICE IS INDEPENDENT, because array mips never reduce the slice axis. So the whole bake
+    // — bomb, difference, mip chain, variance chain — parallelises trivially over the slices and needs
+    // only ~12 MB of working floats per worker instead of ~540 MB at once. That falls straight out of
+    // the 2D-array conversion and is worth taking.
+    //
+    // ...and it is a CORRECTNESS side-effect, not just a format change: a Texture3D's mips reduce the
+    // SLICE axis, so the old chain low-passed the ANIMATION and banked TEMPORAL variance as if it were
+    // spatial roughness. A 2D array cannot, so the variance finally describes only what the roughness
+    // model claims it does.
+
+    // The output side and the mip counts are compile-time, because the shader's LOD maths and the
+    // variance array's level-1 offset are written against them. The WORLD PERIOD is DERIVED from the
+    // source's own, so the texel density is preserved exactly whatever the source's size; the shader
+    // reads the period and the slice count out of the param block rather than hard-coding either.
+    static constexpr uint32_t kWaveOutSize = 1024;    // bombed slice side
+    static constexpr uint32_t kWaveOutMips = 11;      // 1024 -> 1
+    static constexpr uint32_t kWaveVarSize = 512;     // == kWaveOutSize >> 1; V's own level 0 IS zero
+    static constexpr uint32_t kWaveVarMips = 8;       // output levels 1..8
+    static constexpr float    kWaveSrcTile = 527.0f;  // MGE's shipped water_NRM world period
+
+    // Bombing knobs — live from the dev panel, consumed by the next bake, so cell count and seed are
+    // tunable without a rebuild. Cells are per AXIS and must DIVIDE the output, so this snaps to a
+    // power of two: C = 8 gives 64 distinct bombs at 128 output texels (several wave crests) each.
+    uint32_t g_waveBombCells = 8;
+    uint32_t g_waveBombSeed  = 1;
+    bool     g_waveRebakeReq = false;   // dev-panel button; consumed at the top of renderScene
+
+    // The DECODED SOURCE, kept resident so a rebake costs only the bomb (8 MB for the shipped asset).
+    std::vector<float> g_waveSrcHeight;      // srcW*srcH*srcD, the DDS ALPHA channel in [0,1]
+    uint32_t g_waveSrcW = 0, g_waveSrcHt = 0, g_waveSrcD = 0;
+    double   g_waveSrcMu       = 0.0;        // its global mean — the blend's mu
+    double   g_waveSrcSigma2   = 0.0;        // global slope variance of the SHIPPED RG at mip 0
+    double   g_waveSrcGradVar  = 0.0;        // ...and of its own central difference (the softening ref)
+    double   g_waveSrcK        = 0.0;        // the shipped slope/height calibration, refit at load
+    double   g_waveSrcR2       = 0.0;
+    float    g_waveTileWorld   = 2108.0f;    // the BOMBED tile's world period -> the shader
+
+    // A cheap, well-mixed 32-bit integer hash (Murmur3 finalizer variant). The bomb needs decorrelated
+    // per-cell rotations/offsets and nothing more; a PRNG with state would only make the table harder
+    // to reproduce from (cell, seed).
+    static inline uint32_t waveHash(uint32_t x) {
+        x ^= x >> 16; x *= 0x7feb352du;
+        x ^= x >> 15; x *= 0x846ca68bu;
+        x ^= x >> 16; return x;
+    }
+    static inline float waveHash01(uint32_t h) { return (float)((double)h * (1.0 / 4294967296.0)); }
+
+    // Bilinear tap into one source slice, wrapping on both axes. `u`,`v` are in SOURCE TEXELS with
+    // texel i centred at i — the half-texel convention is absorbed into the bomb's random offset, so
+    // only consistency matters here.
+    static inline float waveTapWrap(const float* slice, uint32_t w, uint32_t h, float u, float v) {
+        const float fu = std::floor(u), fv = std::floor(v);
+        const float tu = u - fu,        tv = v - fv;
+        int x0 = (int)fu % (int)w; if (x0 < 0) { x0 += (int)w; }
+        int y0 = (int)fv % (int)h; if (y0 < 0) { y0 += (int)h; }
+        const int x1 = (x0 + 1 == (int)w) ? 0 : x0 + 1;
+        const int y1 = (y0 + 1 == (int)h) ? 0 : y0 + 1;
+        const float a = slice[(size_t)y0 * w + x0], b = slice[(size_t)y0 * w + x1];
+        const float c = slice[(size_t)y1 * w + x0], e = slice[(size_t)y1 * w + x1];
+        const float top = a + (b - a) * tu;
+        const float bot = c + (e - c) * tu;
+        return top + (bot - top) * tv;
+    }
+
+    // One bomb: a rotation, a source offset, and an integer TIME-SLICE offset. dz is free extra
+    // variety that preserves the animation loop EXACTLY, because the slice axis is cyclic mod D.
+    struct WaveBomb { float cs, sn, ox, oy; uint32_t dz; };
+
+    // Bytes of one array layer's whole packed mip chain (tight rows, no alignment — the upload path
+    // re-strides into the staging buffer).
+    static size_t waveLayerBytes(uint32_t size, uint32_t mips, uint32_t bpp) {
+        size_t total = 0; uint32_t w = size;
+        for (uint32_t m = 0; m < mips; ++m) { total += (size_t)w * w * bpp; w = (w > 1) ? (w >> 1) : 1; }
+        return total;
+    }
+
+    // Upload a packed per-layer blob into an array texture, ONE LAYER AT A TIME. Deliberately not one
+    // whole-texture beginUpdateResource: that would ask the resource loader for an 89 MB staging
+    // allocation in a single shot, where 32 x 2.7 MB flows through the staging ring the way every
+    // other upload in the host does.
+    static void waveUploadLayers(Texture* tex, const uint8_t* blob, size_t layerBytes,
+                                 uint32_t layers, uint32_t mips) {
+        for (uint32_t z = 0; z < layers; ++z) {
+            TextureUpdateDesc upd = {};
+            upd.pTexture = tex;
+            upd.mBaseMipLevel = 0; upd.mMipLevels = mips;
+            upd.mBaseArrayLayer = z; upd.mLayerCount = 1;
+            upd.mCurrentState = RESOURCE_STATE_SHADER_RESOURCE;
+            beginUpdateResource(&upd);
+            const uint8_t* src = blob + (size_t)z * layerBytes;
+            for (uint32_t m = 0; m < mips; ++m) {
+                TextureSubresourceUpdate s = upd.getSubresourceUpdateDesc(m, z);
+                for (uint32_t row = 0; row < s.mRowCount; ++row) {
+                    std::memcpy(s.pMappedData + (size_t)row * s.mDstRowStride,
+                                src + (size_t)row * s.mSrcRowStride, s.mSrcRowStride);
+                }
+                src += (size_t)s.mSrcRowStride * s.mRowCount;
+            }
+            endUpdateResource(&upd);
+        }
+        waitForAllResourceLoads();
+    }
+
+    // ------------------------------------------------------------------------------------------------
+    // THE BAKE. Content-only: it fills the two EXISTING textures, so the dev-panel rebake needs no
+    // resource teardown and no descriptor rebinding — the views never change, only the bytes.
+    // ------------------------------------------------------------------------------------------------
+    bool bakeWaterField() {
+        if (!g_live.pWaterNormalVol || g_waveSrcHeight.empty()) { return false; }
+        const auto tBake0 = std::chrono::steady_clock::now();
+
+        const uint32_t N  = kWaveOutSize;
+        const uint32_t D  = g_waveSrcD;
+        const uint32_t SW = g_waveSrcW, SH = g_waveSrcHt;
+        const float    mu = (float)g_waveSrcMu;
+
+        // C must DIVIDE the output or the weight field is not periodic and the tile shows a seam, so
+        // snap the request down to a power of two rather than trusting the slider.
+        uint32_t C = (g_waveBombCells < 1u) ? 1u : g_waveBombCells;
+        if (C > 64u) { C = 64u; }
+        uint32_t Csnap = 1u; while ((Csnap << 1) <= C) { Csnap <<= 1; }
+        C = Csnap;
+        const float cellSz = (float)N / (float)C;
+
+        // --- the bomb table: C*C cells, each with its own rotation, source offset and slice offset ---
+        std::vector<WaveBomb> cells((size_t)C * C);
+        for (uint32_t cy = 0; cy < C; ++cy) {
+            for (uint32_t cx = 0; cx < C; ++cx) {
+                // ⚠ COLLISION-FREE BY CONSTRUCTION, not merely unlikely. C <= 64, so (cy<<6)|cx is
+                // injective in the cell, XOR with a fixed value is a bijection, and waveHash is one
+                // too (xor-shift and odd multiply both invert) — so no two cells can draw the same
+                // parameters. A hash of `cx*P1 ^ cy*P2` would only make that improbable, and a
+                // collision there is a visible duplicated patch, which is exactly what the bomb
+                // exists to prevent.
+                uint32_t h = waveHash((((uint32_t)cy << 6) | (uint32_t)cx) ^ (g_waveBombSeed * 0x9e3779b9u));
+                const float th = 6.28318530718f * waveHash01(h);
+                h = waveHash(h); const float ox = waveHash01(h) * (float)SW;
+                h = waveHash(h); const float oy = waveHash01(h) * (float)SH;
+                h = waveHash(h);
+                WaveBomb& b = cells[(size_t)cy * C + cx];
+                b.cs = std::cos(th); b.sn = std::sin(th);
+                b.ox = ox;           b.oy = oy;
+                b.dz = h % D;
+            }
+        }
+
+        // --- per-slice kernels ------------------------------------------------------------------------
+        // The bomb. `w` is a SMOOTH PARTITION OF UNITY over a 2x2 cell neighbourhood: smoothstep(t) +
+        // smoothstep(1-t) == 1 exactly, so there is no jitter and therefore no gap, and the weight
+        // field is periodic in cells — which is what makes the OUTPUT tile under REPEAT even though
+        // each copy is freely rotated.
+        auto bombSlice = [&](uint32_t z, float* H) {
+            for (uint32_t y = 0; y < N; ++y) {
+                const float  gy  = ((float)y + 0.5f) / cellSz - 0.5f;
+                const float  fgy = std::floor(gy);
+                const int    j0  = (int)fgy;
+                const float  fy  = gy - fgy;
+                const float  wy1 = fy * fy * (3.0f - 2.0f * fy);
+                const float  wsy[2] = { 1.0f - wy1, wy1 };
+                for (uint32_t x = 0; x < N; ++x) {
+                    const float gx  = ((float)x + 0.5f) / cellSz - 0.5f;
+                    const float fgx = std::floor(gx);
+                    const int   i0  = (int)fgx;
+                    const float fx  = gx - fgx;
+                    const float wx1 = fx * fx * (3.0f - 2.0f * fx);
+                    const float wsx[2] = { 1.0f - wx1, wx1 };
+                    float acc = 0.0f, w2 = 0.0f;
+                    for (int dj = 0; dj < 2; ++dj) {
+                        for (int di = 0; di < 2; ++di) {
+                            const float w = wsx[di] * wsy[dj];
+                            if (w <= 0.0f) { continue; }
+                            const uint32_t ci = (uint32_t)((((i0 + di) % (int)C) + (int)C) % (int)C);
+                            const uint32_t cj = (uint32_t)((((j0 + dj) % (int)C) + (int)C) % (int)C);
+                            const WaveBomb& b = cells[(size_t)cj * C + ci];
+                            // Position relative to THIS cell's centre, in output texels — which are
+                            // the same world size as source texels, so the copy is 1:1 in frequency.
+                            const float px = ((float)x + 0.5f) - ((float)(i0 + di) + 0.5f) * cellSz;
+                            const float py = ((float)y + 0.5f) - ((float)(j0 + dj) + 0.5f) * cellSz;
+                            const float u  = b.cs * px - b.sn * py + b.ox;
+                            const float v  = b.sn * px + b.cs * py + b.oy;
+                            const uint32_t sz = (z + b.dz) % D;
+                            acc += w * (waveTapWrap(&g_waveSrcHeight[(size_t)sz * SW * SH], SW, SH, u, v) - mu);
+                            w2  += w * w;
+                        }
+                    }
+                    // Variance-preserving, not a plain weighted mean: sqrt(SUM w²) is in [0.5, 1] over
+                    // a 4-term partition of unity, so this never divides by anything near zero.
+                    H[(size_t)y * N + x] = mu + acc * (w2 > 1e-8f ? (1.0f / std::sqrt(w2)) : 0.0f);
+                }
+            }
+        };
+
+        // Central difference with WRAP — the same stencil the shipped slopes were baked with, applied
+        // once in float. N is a power of two, so the wrap is a mask.
+        auto gradSlice = [&](const float* H, float* gx, float* gy) {
+            const uint32_t M = N - 1u;
+            for (uint32_t y = 0; y < N; ++y) {
+                const uint32_t ym = (y + N - 1u) & M, yp = (y + 1u) & M;
+                for (uint32_t x = 0; x < N; ++x) {
+                    const uint32_t xm = (x + N - 1u) & M, xp = (x + 1u) & M;
+                    gx[(size_t)y * N + x] = 0.5f * (H[(size_t)y * N + xp] - H[(size_t)y * N + xm]);
+                    gy[(size_t)y * N + x] = 0.5f * (H[(size_t)yp * N + x] - H[(size_t)ym * N + x]);
+                }
+            }
+        };
+
+        // 2x2 box down, no z axis — array mips never reduce the slice axis, which is the whole point.
+        auto box2 = [](const float* s, float* dst, uint32_t w, uint32_t h, uint32_t nw, uint32_t nh) {
+            for (uint32_t y = 0; y < nh; ++y) {
+                const uint32_t y0 = (h > 1) ? y * 2 : 0, y1 = (h > 1) ? y * 2 + 1 : 0;
+                for (uint32_t x = 0; x < nw; ++x) {
+                    const uint32_t x0 = (w > 1) ? x * 2 : 0, x1 = (w > 1) ? x * 2 + 1 : 0;
+                    dst[(size_t)y * nw + x] = 0.25f * (s[(size_t)y0 * w + x0] + s[(size_t)y0 * w + x1] +
+                                                       s[(size_t)y1 * w + x0] + s[(size_t)y1 * w + x1]);
+                }
+            }
+        };
+
+        const uint32_t nThreads = [&]{
+            uint32_t hw = std::thread::hardware_concurrency();
+            if (hw == 0u) { hw = 4u; }
+            return (hw < D) ? hw : D;
+        }();
+
+        // ---- PASS 1: the raw gradient variance of the BOMBED field ------------------------------------
+        // k is GLOBAL — one number for the whole array, or the slices would disagree and the animation
+        // would breathe — so it cannot be known until every slice has been differenced. The bomb runs
+        // twice rather than keeping 268 MB of float gradients resident; it is deterministic, so the
+        // second run reproduces the first exactly.
+        std::vector<double> sGx(D, 0.0), sGy(D, 0.0), sG2(D, 0.0);
+        {
+            std::atomic<uint32_t> next{0};
+            std::vector<std::thread> pool;
+            pool.reserve(nThreads);
+            for (uint32_t t = 0; t < nThreads; ++t) {
+                pool.emplace_back([&]{
+                    std::vector<float> pa((size_t)N * N), pb((size_t)N * N), pc((size_t)N * N);
+                    for (;;) {
+                        const uint32_t z = next.fetch_add(1u);
+                        if (z >= D) { break; }
+                        bombSlice(z, pa.data());
+                        gradSlice(pa.data(), pb.data(), pc.data());
+                        double ax = 0.0, ay = 0.0, a2 = 0.0;
+                        for (size_t i = 0; i < (size_t)N * N; ++i) {
+                            ax += pb[i]; ay += pc[i]; a2 += (double)pb[i] * pb[i] + (double)pc[i] * pc[i];
+                        }
+                        sGx[z] = ax; sGy[z] = ay; sG2[z] = a2;
+                    }
+                });
+            }
+            for (auto& th : pool) { th.join(); }
+        }
+        const double nAll = (double)N * N * D;
+        double tGx = 0.0, tGy = 0.0, tG2 = 0.0;
+        for (uint32_t z = 0; z < D; ++z) { tGx += sGx[z]; tGy += sGy[z]; tG2 += sG2[z]; }
+        const double gradVar = std::max(tG2 / nAll - (tGx / nAll) * (tGx / nAll) - (tGy / nAll) * (tGy / nAll), 1e-12);
+
+        // ONE number absorbing both the height->slope calibration and the bilinear softening the bomb
+        // introduced. Fitted so the bombed field's GLOBAL slope variance equals the source's exactly;
+        // the sign comes from the source's own regression (the shipped map stores -k * grad h).
+        const double kMag  = std::sqrt(std::max(g_waveSrcSigma2, 0.0) / gradVar);
+        const float  kOut  = (float)((g_waveSrcK < 0.0) ? -kMag : kMag);
+        // ...and the SOFTENING RATIO, which is what says whether bilinear taps were good enough: the
+        // RMS gradient the bomb produced against the RMS gradient of the source itself. 1.0 = the bomb
+        // lost nothing. Below 0.90 the fix is a Catmull-Rom source tap, not a bigger k.
+        const double softening = std::sqrt(gradVar / std::max(g_waveSrcGradVar, 1e-12));
+
+        // ---- PASS 2: bomb, difference, scale, mip, and the variance chain alongside -------------------
+        const size_t normLayer = waveLayerBytes(N, kWaveOutMips, 2);
+        const size_t varLayer  = waveLayerBytes(kWaveVarSize, kWaveVarMips, 2);
+        std::vector<uint8_t> normBlob((size_t)D * normLayer);
+        std::vector<uint8_t> varBlob((size_t)D * varLayer);
+        std::vector<size_t> normOff(kWaveOutMips), varOff(kWaveVarMips);
+        { size_t o = 0; uint32_t w = N;
+          for (uint32_t m = 0; m < kWaveOutMips; ++m) { normOff[m] = o; o += (size_t)w * w * 2; w = (w > 1) ? (w >> 1) : 1; } }
+        { size_t o = 0; uint32_t w = kWaveVarSize;
+          for (uint32_t m = 0; m < kWaveVarMips; ++m) { varOff[m] = o; o += (size_t)w * w * 2; w = (w > 1) ? (w >> 1) : 1; } }
+
+        // Tripwire accumulators, at the DEEPEST variance level (output level 8).
+        std::vector<double> tSx(D, 0.0), tSy(D, 0.0), tV(D, 0.0);
+        // ...and the SEAM tripwire (see the accumulation below).
+        std::vector<double> tSeam(D, 0.0);
+        std::atomic<uint64_t> clamped{0};
+        {
+            std::atomic<uint32_t> next{0};
+            std::vector<std::thread> pool;
+            pool.reserve(nThreads);
+            for (uint32_t t = 0; t < nThreads; ++t) {
+                pool.emplace_back([&]{
+                    // THE ~12 MB WORKING SET the plan budgets: three full-size planes, with the height
+                    // buffer recycled as the second moment the instant differencing is done with it.
+                    std::vector<float> pa((size_t)N * N), pb((size_t)N * N), pc((size_t)N * N);
+                    std::vector<float> qa((size_t)(N / 2) * (N / 2)), qb((size_t)(N / 2) * (N / 2)),
+                                       qc((size_t)(N / 2) * (N / 2));
+                    uint64_t localClamp = 0;
+                    for (;;) {
+                        const uint32_t z = next.fetch_add(1u);
+                        if (z >= D) { break; }
+                        bombSlice(z, pa.data());
+                        gradSlice(pa.data(), pb.data(), pc.data());
+                        // pb/pc become the SLOPES; pa (the height, now spent) becomes |s|².
+                        //
+                        // ⚠ SEAM TRIPWIRE, accumulated in the same sweep. The bomb tiles BY
+                        // CONSTRUCTION — the weight field is periodic in cells and the cell grid
+                        // divides the output — but "by construction" is an ARGUMENT, not a
+                        // measurement, and a seam is precisely the artifact this whole feature exists
+                        // to remove. The central difference on the four boundary lines STRADDLES the
+                        // wrap, so any discontinuity there lands as a slope spike on exactly those
+                        // lines and nowhere else. Ratio ~1 = seamless; a real seam reads far above 1.
+                        double sl2 = 0.0, se2 = 0.0; size_t seN = 0;
+                        for (uint32_t y = 0; y < N; ++y) {
+                            const bool edgeY = (y == 0u || y == N - 1u);
+                            for (uint32_t x = 0; x < N; ++x) {
+                                const size_t i = (size_t)y * N + x;
+                                pb[i] *= kOut; pc[i] *= kOut;
+                                pa[i] = pb[i] * pb[i] + pc[i] * pc[i];
+                                sl2 += pa[i];
+                                if (edgeY || x == 0u || x == N - 1u) { se2 += pa[i]; ++seN; }
+                            }
+                        }
+                        tSeam[z] = (sl2 > 1e-12 && seN)
+                                 ? (se2 / (double)seN) / (sl2 / (double)((size_t)N * N)) : 1.0;
+                        uint8_t* nBase = normBlob.data() + (size_t)z * normLayer;
+                        uint8_t* vBase = varBlob.data()  + (size_t)z * varLayer;
+
+                        auto writeNorm = [&](uint32_t m, uint32_t w) {
+                            uint8_t* o = nBase + normOff[m];
+                            for (size_t i = 0; i < (size_t)w * w; ++i) {
+                                float ex = pb[i] * 0.5f + 0.5f, ey = pc[i] * 0.5f + 0.5f;
+                                if (ex < 0.0f || ex > 1.0f || ey < 0.0f || ey > 1.0f) { ++localClamp; }
+                                ex = (ex < 0.0f) ? 0.0f : ((ex > 1.0f) ? 1.0f : ex);
+                                ey = (ey < 0.0f) ? 0.0f : ((ey > 1.0f) ? 1.0f : ey);
+                                o[i * 2 + 0] = (uint8_t)(ex * 255.0f + 0.5f);
+                                o[i * 2 + 1] = (uint8_t)(ey * 255.0f + 0.5f);
+                            }
+                        };
+                        auto writeVar = [&](uint32_t m, uint32_t w) {
+                            uint16_t* o = (uint16_t*)(vBase + varOff[m]);
+                            for (size_t i = 0; i < (size_t)w * w; ++i) {
+                                // THE subtraction, done where both operands are still exact. Both
+                                // chains are box averages of the SAME float level 0, so this is the
+                                // true variance of that footprint — and it is exactly 0 one level
+                                // below, which is why V(0) never has to be stored.
+                                const float v = pa[i] - (pb[i] * pb[i] + pc[i] * pc[i]);
+                                o[i] = TinyImageFormat_FloatToHalfAsUint(v > 0.0f ? v : 0.0f);
+                            }
+                        };
+
+                        writeNorm(0, N);
+                        uint32_t w = N;
+                        for (uint32_t L = 1; L < kWaveOutMips; ++L) {
+                            const uint32_t nw = (w > 1) ? (w >> 1) : 1;
+                            box2(pb.data(), qb.data(), w, w, nw, nw);
+                            box2(pc.data(), qc.data(), w, w, nw, nw);
+                            box2(pa.data(), qa.data(), w, w, nw, nw);
+                            std::memcpy(pb.data(), qb.data(), (size_t)nw * nw * sizeof(float));
+                            std::memcpy(pc.data(), qc.data(), (size_t)nw * nw * sizeof(float));
+                            std::memcpy(pa.data(), qa.data(), (size_t)nw * nw * sizeof(float));
+                            w = nw;
+                            writeNorm(L, w);
+                            // Output level L lands at var mip L-1 — which is why the variance array is
+                            // half-res and one level short, and costs nothing for it.
+                            if (L <= kWaveVarMips) { writeVar(L - 1, w); }
+                            // ...and the TRIPWIRE reads the DEEPEST STORED level, while it is still
+                            // the live level. Reading whatever the loop leaves behind at 1x1 would
+                            // report a level nothing samples.
+                            if (L == kWaveVarMips) {
+                                double ax = 0.0, ay = 0.0, av = 0.0;
+                                for (size_t i = 0; i < (size_t)w * w; ++i) {
+                                    ax += pb[i]; ay += pc[i];
+                                    av += pa[i] - ((double)pb[i] * pb[i] + (double)pc[i] * pc[i]);
+                                }
+                                const double inv = 1.0 / (double)((size_t)w * w);
+                                tSx[z] = ax * inv; tSy[z] = ay * inv; tV[z] = av * inv;
+                            }
+                        }
+                    }
+                    clamped.fetch_add(localClamp);
+                });
+            }
+            for (auto& th : pool) { th.join(); }
+        }
+
+        waveUploadLayers(g_live.pWaterNormalVol, normBlob.data(), normLayer, D, kWaveOutMips);
+        if (g_live.pWaterSlopeVar) {
+            waveUploadLayers(g_live.pWaterSlopeVar, varBlob.data(), varLayer, D, kWaveVarMips);
+        }
+
+        double eSx = 0.0, eSy = 0.0, eV = 0.0, eSeam = 0.0;
+        for (uint32_t z = 0; z < D; ++z) { eSx += tSx[z]; eSy += tSy[z]; eV += tV[z]; eSeam += tSeam[z]; }
+        eSx /= (double)D; eSy /= (double)D; eV /= (double)D; eSeam /= (double)D;
+        const double meanMag = std::sqrt(eSx * eSx + eSy * eSy);
+        const double ms = std::chrono::duration<double, std::milli>(
+                              std::chrono::steady_clock::now() - tBake0).count();
+
+        // ONE line carrying everything the plan asks to see: bake ms, the softening ratio, the
+        // refitted k, and the level-8 tripwire — whose sigma² must come out at the SOURCE's own global
+        // slope variance, which is the proof the bomb preserved the field's statistics.
+        std::printf("[forge][water] W3 bake %.0f ms (%u threads, %ux%u cells, seed %u): "
+                    "k=%.3f (src fit %.3f, R²=%.4f) softening=%.3f%s seam=%.3f%s | tripwire lvl%u: "
+                    "E[s]=(%.4f, %.4f) |E[s]|=%.4f sigma²=%.6f vs src %.6f%s%s | clamped %llu\n",
+                    ms, nThreads, C, C, g_waveBombSeed,
+                    (double)kOut, g_waveSrcK, g_waveSrcR2, softening,
+                    (softening < 0.90) ? "  !! < 0.90 — switch the source tap to Catmull-Rom" : "",
+                    eSeam,
+                    (eSeam > 1.15) ? "  !! the wrap boundary carries excess slope — the tile has a SEAM" : "",
+                    kWaveVarMips, eSx, eSy, meanMag, eV, g_waveSrcSigma2,
+                    (meanMag > 0.05) ? "  !! |E[s]| NOT near zero" : "",
+                    (std::fabs(eV - g_waveSrcSigma2) > 0.10 * g_waveSrcSigma2)
+                        ? "  !! bombed sigma² disagrees with the source — the blend is not variance-preserving"
+                        : "",
+                    (unsigned long long)clamped.load());
+        return true;
+    }
+
+    // WT1/W3: read water_NRM.dds, calibrate it, create the two ARRAY textures, and bake. The host runs
+    // from the morrowind64 cwd so it reads the file directly; water_NRM is uncompressed 32-bit BGRA
+    // (DDS depth at offset 24) and the host's parseDds (uploadTextures) is 2D-only, so the header is
+    // parsed inline here. Only mip 0 of the DDS is consumed now — the shipped mip chain is no longer
+    // uploaded, because the field it belonged to is not the field being rendered.
     bool loadWaterNormalVolume(Renderer* R) {
+        (void)R;   // addResource takes the loader's renderer; kept for the caller's symmetry
         if (g_live.pWaterNormalVol) { return true; }
         const char* path = "Data Files\\textures\\MGE\\water_NRM.dds";
         FILE* f = std::fopen(path, "rb");
@@ -3421,10 +3951,8 @@ namespace {
         const uint32_t height = ddsRd32(d + 12);
         const uint32_t width  = ddsRd32(d + 16);
         uint32_t       depth  = ddsRd32(d + 24);
-        uint32_t       mips   = ddsRd32(d + 28);
         const uint32_t pfFlags= ddsRd32(d + 80);
         const uint32_t bits   = ddsRd32(d + 88);
-        if (mips == 0) { mips = 1; }
         if (depth == 0) { depth = 1; }
         // water_NRM is an uncompressed 32-bit volume (no FourCC). Treat as BGRA8 (MW A8R8G8B8).
         if ((pfFlags & 0x4) != 0 || bits != 32) {
@@ -3432,49 +3960,119 @@ namespace {
                         pfFlags, bits);
             return false;
         }
+        if (width == 0 || height == 0) { return false; }
         const uint32_t dataOffset = 128;
+        const size_t   texels0 = (size_t)width * height * depth;
+        if ((size_t)sz - dataOffset < texels0 * 4) {
+            std::printf("[forge][water] water_NRM.dds level 0 truncated (%zu bytes for %zu texels)\n",
+                        (size_t)sz - dataOffset, texels0);
+            return false;
+        }
 
+        // --- decode the source, and RE-DERIVE its own calibration ------------------------------------
+        // The height (ALPHA) stays resident so a rebake costs only the bomb. The slopes (R/G, DDS byte
+        // order BGRA) are consumed here and not kept: what the bake needs from them is three numbers.
+        const uint8_t* p0 = d + dataOffset;
+        g_waveSrcW = width; g_waveSrcHt = height; g_waveSrcD = depth;
+        g_waveSrcHeight.assign(texels0, 0.0f);
+        double muAcc = 0.0;
+        for (size_t i = 0; i < texels0; ++i) {
+            const float hv = p0[i * 4 + 3] * (1.0f / 255.0f);
+            g_waveSrcHeight[i] = hv; muAcc += hv;
+        }
+        g_waveSrcMu = muAcc / (double)texels0;
+
+        // slope = k * central_difference(height), fitted THROUGH THE ORIGIN: a periodic field has
+        // exactly zero mean slope and zero mean gradient, so an intercept would only fit noise. k comes
+        // out ~-8.69 on the shipped asset (the map stores the NEGATED gradient, which is the
+        // z-up surface-normal convention the frag already reads).
+        double sg = 0.0, gg = 0.0, ss = 0.0, sumSx = 0.0, sumSy = 0.0, sumGx = 0.0, sumGy = 0.0;
+        for (uint32_t z = 0; z < depth; ++z) {
+            const size_t base = (size_t)z * width * height;
+            const float* H = g_waveSrcHeight.data() + base;
+            for (uint32_t y = 0; y < height; ++y) {
+                const uint32_t ym = (y + height - 1) % height, yp = (y + 1) % height;
+                for (uint32_t x = 0; x < width; ++x) {
+                    const uint32_t xm = (x + width - 1) % width, xp = (x + 1) % width;
+                    const double cdx = 0.5 * (H[(size_t)y * width + xp] - H[(size_t)y * width + xm]);
+                    const double cdy = 0.5 * (H[(size_t)yp * width + x] - H[(size_t)ym * width + x]);
+                    const size_t i = base + (size_t)y * width + x;
+                    const double sx = 2.0 * (p0[i * 4 + 2] / 255.0) - 1.0;   // R lane (DDS is BGRA)
+                    const double sy = 2.0 * (p0[i * 4 + 1] / 255.0) - 1.0;   // G lane
+                    sg += sx * cdx + sy * cdy;
+                    gg += cdx * cdx + cdy * cdy;
+                    ss += sx * sx + sy * sy;
+                    sumSx += sx; sumSy += sy; sumGx += cdx; sumGy += cdy;
+                }
+            }
+        }
+        const double n = (double)texels0;
+        g_waveSrcK  = (gg > 1e-18) ? (sg / gg) : 0.0;
+        g_waveSrcR2 = (ss > 1e-18) ? (g_waveSrcK * sg / ss) : 0.0;
+        g_waveSrcSigma2  = std::max(ss / n - (sumSx / n) * (sumSx / n) - (sumSy / n) * (sumSy / n), 0.0);
+        g_waveSrcGradVar = std::max(gg / n - (sumGx / n) * (sumGx / n) - (sumGy / n) * (sumGy / n), 0.0);
+        // The bombed tile is kWaveOutSize texels at the SOURCE's texel density, so its world period
+        // scales with the size ratio. 256 -> 1024 gives 527 -> 2108 at an unchanged 2.06 u/texel.
+        g_waveTileWorld = kWaveSrcTile * (float)kWaveOutSize / (float)width;
+        std::printf("[forge][water] W3 source %ux%ux%u: mean h=%.4f, slope sigma²=%.6f, "
+                    "grad var=%.3e, k=%.3f R²=%.4f -> tile %.0f world units (%.3f u/texel)%s\n",
+                    width, height, depth, g_waveSrcMu, g_waveSrcSigma2, g_waveSrcGradVar,
+                    g_waveSrcK, g_waveSrcR2, g_waveTileWorld,
+                    g_waveTileWorld / (float)kWaveOutSize,
+                    (g_waveSrcR2 < 0.9) ? "  !! R² low — the shipped RG is NOT this height's gradient" : "");
+
+        // --- the two array resources ------------------------------------------------------------------
+        // mDepth 1 + mArraySize D is what makes Forge build a TEXTURE2DARRAY SRV rather than a 3D one
+        // (Direct3D12.c:3847), and the array is the whole point: hardware AF, and mips that cannot
+        // reduce the slice axis.
         TextureDesc td = {};
-        td.mWidth = width; td.mHeight = height; td.mDepth = depth;
-        td.mArraySize = 1; td.mMipLevels = mips;
+        td.mWidth = kWaveOutSize; td.mHeight = kWaveOutSize; td.mDepth = 1;
+        td.mArraySize = depth; td.mMipLevels = kWaveOutMips;
         td.mSampleCount = SAMPLE_COUNT_1;
-        td.mFormat = TinyImageFormat_B8G8R8A8_UNORM;
+        td.mFormat = TinyImageFormat_R8G8_UNORM;    // the two SLOPE axes; z is implicitly 1
         td.mStartState = RESOURCE_STATE_SHADER_RESOURCE;
         td.mDescriptors = DESCRIPTOR_TYPE_TEXTURE;
-        td.pName = "waterNormalVol";
+        td.pName = "waterWaveSlopes";
         TextureLoadDesc tld = {};
         tld.ppTexture = &g_live.pWaterNormalVol;
         tld.pDesc = &td;
         addResource(&tld, nullptr);
         waitForAllResourceLoads();
-        if (!g_live.pWaterNormalVol) { std::printf("[forge][water] addResource(volume) FAILED\n"); return false; }
+        if (!g_live.pWaterNormalVol) { std::printf("[forge][water] addResource(wave array) FAILED\n"); return false; }
 
-        const uint8_t* src    = d + dataOffset;
-        const uint8_t* srcEnd = d + sz;
-        TextureUpdateDesc upd = {};
-        upd.pTexture = g_live.pWaterNormalVol;
-        upd.mBaseMipLevel = 0; upd.mMipLevels = mips;
-        upd.mBaseArrayLayer = 0; upd.mLayerCount = 1;
-        upd.mCurrentState = RESOURCE_STATE_SHADER_RESOURCE;
-        beginUpdateResource(&upd);
-        for (uint32_t mip = 0; mip < mips; ++mip) {
-            TextureSubresourceUpdate s = upd.getSubresourceUpdateDesc(mip, 0);
-            const uint32_t sliceBytes = s.mRowCount * s.mSrcRowStride;
-            // Slice count for this mip = max(1, depth >> mip).
-            uint32_t mipDepth = depth >> mip; if (mipDepth == 0) mipDepth = 1;
-            for (uint32_t z = 0; z < mipDepth; ++z) {
-                if (src + sliceBytes > srcEnd) { mip = mips; break; }   // truncated → stop
-                uint8_t* dstSlice = s.pMappedData + (size_t)z * s.mDstSliceStride;
-                for (uint32_t row = 0; row < s.mRowCount; ++row) {
-                    std::memcpy(dstSlice + (size_t)row * s.mDstRowStride,
-                                src + (size_t)row * s.mSrcRowStride, s.mSrcRowStride);
-                }
-                src += sliceBytes;
+        // ...and the SLOPE-VARIANCE companion (Olano-Baker LEAN/CLEAN). Half resolution and one level
+        // short on purpose: sigma²(0) is identically zero by construction, so storing it is pure waste,
+        // and the shader reconstructs the whole sub-level-1 range from V(0) = 0 at no extra sample.
+        //
+        // ⚠ THE FINISHED VARIANCE, not the second moment. sigma² = E[|s|²] - |E[s]|² is subtracted in
+        // the bake, where both operands are exact. Reassembling it in the frag from two sampled moments
+        // fails three ways at once — bilerp(|s|²) - |bilerp(s)|² is the bilinear-weighted variance
+        // (Jensen), so it is nonzero even at mip 0 (blurry water at centimetres), oscillates with
+        // sub-texel position (pulsing), and vanishes exactly at texel centres (a texel-aligned GRID).
+        // All three were observed. Toksvig cannot substitute either: water_NRM stores SLOPES with an
+        // implicit z = 1, so the averaged normal's length is always exactly 1 and carries no variance.
+        {
+            TextureDesc vd = {};
+            vd.mWidth = kWaveVarSize; vd.mHeight = kWaveVarSize; vd.mDepth = 1;
+            vd.mArraySize = depth; vd.mMipLevels = kWaveVarMips;
+            vd.mSampleCount = SAMPLE_COUNT_1;
+            vd.mFormat = TinyImageFormat_R16_SFLOAT;   // one scalar: sigma² over both slope axes
+            vd.mStartState = RESOURCE_STATE_SHADER_RESOURCE;
+            vd.mDescriptors = DESCRIPTOR_TYPE_TEXTURE;
+            vd.pName = "waterSlopeVarArray";
+            TextureLoadDesc vld = {};
+            vld.ppTexture = &g_live.pWaterSlopeVar;
+            vld.pDesc = &vd;
+            addResource(&vld, nullptr);
+            waitForAllResourceLoads();
+            if (!g_live.pWaterSlopeVar) {
+                // NON-FATAL: water still draws, just without slope-derived roughness (the unbound slot
+                // reads zero, which degrades to exactly the base term).
+                std::printf("[forge][water] slope-variance array alloc FAILED — roughness falls back to the base term\n");
             }
         }
-        endUpdateResource(&upd);
-        std::printf("[forge][water] volume %ux%ux%u, %u mips (BGRA8) loaded\n", width, height, depth, mips);
-        return true;
+
+        return bakeWaterField();
     }
 
     // WT1/WT2: (re)build the water shader + graphics pipeline ONLY (not the resources/buffers/sets,
@@ -6242,25 +6840,40 @@ namespace {
             updateDescriptorSet(R, 0, g_live.pPerBatchSetWater, 1, &wbp);
 
             // waterReady gates the per-frame pass: needs the mesh, pipeline, worlds window AND the
-            // animated-normal volume (the frag samples a Tex3D — binding a 2D fallback to a 3D slot is
-            // an illegal type mismatch, so the volume is mandatory; it's a shipped MGE asset).
+            // baked wave array (the frag samples a Tex2DArray — binding a plain 2D fallback to an
+            // array slot is an illegal type mismatch, so it is mandatory; it's a shipped MGE asset).
             g_live.waterReady = meshOk && volOk && g_live.pWaterNormalVol && g_live.pWaterPipeline
                               && g_live.pWaterWorldsBuf && g_live.pWaterVB && g_live.pWaterIB;
 
             // Bind the 4 water SRVs into the (already-created) PerFrame set — only when fully ready, so
-            // the Tex3D slot never gets a null/2D binding. These are STABLE views; the refraction/scene-
+            // the array slot never gets a null/2D binding. These are STABLE views; the refraction/scene-
             // depth CONTENTS change per frame (the descriptors don't). gSceneLinDepth = pLinearDepth (RAW
             // reverse-Z device depth, Tier 2 AO block above). gReflectColor is the WT1 stand-in — bind
             // pRefractColor as a valid placeholder (the frag ignores it in WT1; WT2 rebinds the mirror RT).
             if (g_live.waterReady) {
-                DescriptorData wp[3] = {};
+                DescriptorData wp[4] = {};
                 wp[0].mIndex = SRT_RES_IDX(SrtData, PerFrame, gWaterNormalVol);
                 wp[0].mCount = 1; wp[0].ppTextures = &g_live.pWaterNormalVol;
                 wp[1].mIndex = SRT_RES_IDX(SrtData, PerFrame, gRefractColor);
                 wp[1].mCount = 1; wp[1].ppTextures = &g_live.pRefractColor;
                 wp[2].mIndex = SRT_RES_IDX(SrtData, PerFrame, gReflectColor);
                 wp[2].mCount = 1; wp[2].ppTextures = &g_live.pRefractColor;   // WT1 stand-in
-                updateDescriptorSet(R, 0, g_live.pPerFrameSet, 3, wp);
+                // ...and the WT4d/P2 pre-filtered pyramid gets the SAME stand-in here, re-pointed at
+                // the real pReflectMips further down IF the reflect pass and its pyramid both built.
+                // water.frag samples this slot unconditionally, so it must never be left unbound.
+                wp[3].mIndex = SRT_RES_IDX(SrtData, PerFrame, gReflectMips);
+                wp[3].mCount = 1; wp[3].ppTextures = &g_live.pRefractColor;   // WT1 stand-in
+                updateDescriptorSet(R, 0, g_live.pPerFrameSet, 4, wp);
+            }
+            // WT4d/P0 slope-variance array — its own update, and only when it exists. NOT folded
+            // into the block above with a stand-in: this slot is a Tex2DArray(float) and there is no
+            // other scalar array texture in the host to point it at, so on failure it stays unbound
+            // (reads zero -> zero variance -> roughness degrades to the base term exactly).
+            if (g_live.waterReady && g_live.pWaterSlopeVar) {
+                DescriptorData svp = {};
+                svp.mIndex = SRT_RES_IDX(SrtData, PerFrame, gWaterSlopeVar);
+                svp.mCount = 1; svp.ppTextures = &g_live.pWaterSlopeVar;
+                updateDescriptorSet(R, 0, g_live.pPerFrameSet, 1, &svp);
             }
             // gSceneLinDepth, OUTSIDE the waterReady gate for the same reason gSkyColor is below it:
             // this stopped being water's private SRV. shadowreceive.h.fsl reads it from the opaque /
@@ -6688,6 +7301,90 @@ namespace {
                 updateDescriptorSet(R, 0, g_live.pPerFrameSet, 1, &rp);
             }
             std::printf("[forge][reflect] build ready=%d (%u²)\n", (int)g_live.reflectReady, kReflectSize);
+
+            // --- WT4d/P2: the pre-filtered reflection pyramid (Hi-Z shape, box average) ----------
+            // NON-FATAL, following the Hi-Z precedent: any failure leaves reflectMipReady=false, the
+            // per-frame build never dispatches, and water.frag falls back to gReflectColor at LOD 0
+            // (which is exactly the pre-WT4d image). gReflectMips is bound to pReflectColor as a
+            // valid placeholder in that case so the SRV slot is never null.
+            if (g_live.reflectReady) {
+                TextureDesc rmd = {};
+                rmd.mWidth = kReflectSize; rmd.mHeight = kReflectSize; rmd.mDepth = 1;
+                rmd.mArraySize = 1; rmd.mMipLevels = kReflectMipCount;
+                rmd.mSampleCount = SAMPLE_COUNT_1;
+                // fp16 REGARDLESS of sceneColorFormat: B8G8R8A8_UNORM is not in D3D12's
+                // TypedUAVLoadAdditionalFormats set, so the reduce's UAV load of the source mip
+                // would not be legal at LDR. It also decouples the pyramid from the HDR flip.
+                rmd.mFormat = TinyImageFormat_R16G16B16A16_SFLOAT;
+                rmd.mStartState = RESOURCE_STATE_SHADER_RESOURCE;   // resting; the build brackets SR<->UAV
+                rmd.mDescriptors = (DescriptorType)(DESCRIPTOR_TYPE_TEXTURE | DESCRIPTOR_TYPE_RW_TEXTURE);
+                rmd.pName = "reflectMips";
+                TextureLoadDesc rmld = {};
+                rmld.ppTexture = &g_live.pReflectMips;
+                rmld.pDesc = &rmd;
+                addResource(&rmld, nullptr);
+                waitForAllResourceLoads();
+
+                ShaderLoadDesc rfd = {};
+                rfd.mComp.pFileName = "reflectmipfirst.comp";
+                addShader(R, &rfd, &g_live.pReflectMipShaderFirst);
+                ShaderLoadDesc rrd = {};
+                rrd.mComp.pFileName = "reflectmip.comp";
+                addShader(R, &rrd, &g_live.pReflectMipShader);
+                if (g_live.pReflectMipShaderFirst) {
+                    PipelineDesc pd = {};
+                    pd.mType = PIPELINE_TYPE_COMPUTE;
+                    pd.mComputeDesc.pShaderProgram = g_live.pReflectMipShaderFirst;
+                    addPipeline(R, &pd, &g_live.pReflectMipPipelineFirst);
+                }
+                if (g_live.pReflectMipShader) {
+                    PipelineDesc pd = {};
+                    pd.mType = PIPELINE_TYPE_COMPUTE;
+                    pd.mComputeDesc.pShaderProgram = g_live.pReflectMipShader;
+                    addPipeline(R, &pd, &g_live.pReflectMipPipeline);
+                }
+                // One set instance per mip, verbatim pHizSet: index 0 = first pass (pReflectColor SRV
+                // -> mip 0), index i = reduce mip i-1 -> i (mUAVMipSlice picks the per-mip UAV).
+                // The colour SRV rides every instance (the reduce never reads it — DXC strips it).
+                if (g_live.pReflectMips && g_live.pReflectMipPipelineFirst && g_live.pReflectMipPipeline) {
+                    DescriptorSetDesc rset = SRT_SET_DESC(ReflectMipSrtData, Persistent, kReflectMipCount, 0);
+                    addDescriptorSet(R, &rset, &g_live.pReflectMipSet);
+                }
+                if (g_live.pReflectMipSet) {
+                    Texture* reflTex = g_live.pReflectColor->pTexture;
+                    for (uint32_t m = 0; m < kReflectMipCount; ++m) {
+                        DescriptorData d[3] = {};
+                        d[0].mIndex = SRT_RES_IDX(ReflectMipSrtData, Persistent, gReflMipSrcTex);
+                        d[0].mCount = 1;
+                        d[0].ppTextures = &reflTex;
+                        d[1].mIndex = SRT_RES_IDX(ReflectMipSrtData, Persistent, gReflMipSrc);
+                        d[1].mCount = 1;
+                        d[1].ppTextures = &g_live.pReflectMips;
+                        d[1].mUAVMipSlice = (uint16_t)(m > 0 ? m - 1 : 0);
+                        d[2].mIndex = SRT_RES_IDX(ReflectMipSrtData, Persistent, gReflMipDst);
+                        d[2].mCount = 1;
+                        d[2].ppTextures = &g_live.pReflectMips;
+                        d[2].mUAVMipSlice = (uint16_t)m;
+                        updateDescriptorSet(R, m, g_live.pReflectMipSet, 3, d);
+                    }
+                }
+                g_live.reflectMipReady = g_live.pReflectMips && g_live.pReflectMipSet
+                                      && g_live.pReflectMipPipelineFirst && g_live.pReflectMipPipeline;
+                // gReflectMips into the MAIN PerFrame set — the pyramid when it built, pReflectColor
+                // itself otherwise. water.frag samples this slot unconditionally, so the fallback is
+                // the un-filtered mirror (the pre-WT4d image), never a null SRV.
+                if (g_live.waterReady) {
+                    Texture* mipTex = g_live.reflectMipReady ? g_live.pReflectMips
+                                                             : g_live.pReflectColor->pTexture;
+                    DescriptorData mp = {};
+                    mp.mIndex = SRT_RES_IDX(SrtData, PerFrame, gReflectMips);
+                    mp.mCount = 1; mp.ppTextures = &mipTex;
+                    updateDescriptorSet(R, 0, g_live.pPerFrameSet, 1, &mp);
+                }
+                std::printf("[forge][reflect] mip pyramid %s (%u², %u mips, RGBA16F)\n",
+                            g_live.reflectMipReady ? "ready" : "DISABLED (resource/shader/pipeline create failed)",
+                            kReflectSize, kReflectMipCount);
+            }
         }
 
         // --- Tier 2: compute pipelines (linearize + GTAO) + their descriptor sets. First
@@ -8620,6 +9317,224 @@ namespace {
     // into the water params (worlds[6] group 3); water.frag branches on it. Both off = normal water.
     bool g_waterReflOnly = false;
     bool g_waterRefrOnly = false;
+    bool g_waterRoughView = false;   // WT4d debug view 3: roughness / reflection LOD, false-coloured
+    // WT4d CALIBRATION AID. The reflection's fog melt is physically right and stays on in play, but
+    // roughness must NOT be tuned against it: roughness-LOD is about sampling RATE, not dimming, so
+    // by-eye calibration with the melt live just makes the roughness compensate for the melt and the
+    // horizon ends up flat. Force it off, tune, put it back.
+    bool g_waterNoFogMelt = false;
+    // W1: procedural wave field (domain-warped sines with ANALYTIC derivatives) instead of the
+    // two-scale normal-map lerp. Not a look option — a replacement of the cause. The normal-map path
+    // produced the roughness bugs WT4d spent its bring-up chasing (an interpolated-difference grid, a
+    // crossfade band, LOD saturation), all of which are structurally unavailable to a single height
+    // field whose gradient is exact. Kept as a toggle only until the procedural field is dialled in;
+    // then the normal-map path, its 3D volume and its variance companion all go.
+    // water.frag HOT-RELOADS (forgerender.cpp's graphics carve-out on the F8 path), so the wave
+    // constants are tunable in seconds without relaunching the host.
+    // DEFAULT OFF as of W2: the texture path with anisotropic taps. The procedural field is kept for
+    // A/B, but it lost on a structural point rather than on quality — filtering it costs an 8-corner
+    // Perlin evaluation per tap, which capped it at 4 taps, and a ~70:1 grazing footprint at 100 m
+    // then forces everything finer than ~70 world units into roughness (the "grey after 100 m at any
+    // height" report — arithmetically correct, and unfixable at that price). A texture tap is a
+    // fetch, so the same 8 taps are routine.
+    bool g_waterProceduralWaves = false;
+    // W1's surface field: FOUR BLENDER-STYLE NOISE TEXTURES, live on sliders. They ride worlds[8..10],
+    // which the water path left free (it uses 0-5 for clipmap levels, 6 for params, 7 for invVP).
+    //
+    // ⚠ THE WAVE-TRAIN GENERATOR IS GONE ("old method hopelessly tiles"). That was not tunable: a sum
+    // of sinusoids is ALMOST-PERIODIC by definition — for any tolerance there exists a translation
+    // that brings the whole sum back within it. Golden-angle headings and an irrational lacunarity
+    // only push the recurrence further out; they cannot delete it. Gradient noise has no period at
+    // all, because a cell's value comes from an integer hash of its coordinate.
+    //
+    // Parameters are Blender's Noise Texture node, so a look developed there transfers:
+    //   * SCALE — frequency. In Blender's units 1 cell spans 1 unit; here the world is in Morrowind
+    //     units (~1.4 cm), so useful values are SMALL. Range 0..0.25 for that reason: the sliders are
+    //     linear (no log mode), so the range is the only sensitivity control there is and it must
+    //     bracket the interesting band rather than the possible one.
+    //   * DETAIL — octaves, and FRACTIONAL: the last octave blends in by its fractional part, exactly
+    //     as Blender does it, so this is a continuous slider rather than a stepped one. It is also
+    //     the cost throttle — each octave is 16 hashed lattice corners.
+    //   * ROUGHNESS — amplitude ratio per octave (Blender's default 0.5).
+    //   * HEIGHT — world units this noise contributes. 0 switches it off entirely.
+    //   * RAMP LO/HI — a 2-stop ColorRamp on the noise output. Narrow = high contrast; LO > HI
+    //     inverts. Clamped regions are genuinely FLAT (plateaus with flat normals) — the ramp doing
+    //     its job, not a bug.
+    //   * TIME (wCells) — the 4D noise's W axis, in whole lattice cells per 20 s wrap. Whole numbers
+    //     because the W lattice wraps by the same count, which is what makes the loop seamless.
+    //   * SEED (zOffset) — the Z axis, constant per noise. This is what makes the four INDEPENDENT
+    //     fields rather than four views of one, and it is why 4D earns its cost here.
+    // ⚠ TWO NOISES BY DEFAULT, not four (user's call, and it is the right trade). Each octave now
+    // costs up to kMaxAniso=4 full Perlin evaluations, because anisotropic filtering is the only
+    // honest fix for a sliver-shaped footprint — see wavefield.h.fsl. Two well-filtered noises beat
+    // four aliasing ones, and the fBM's own octaves already span 8x of frequency each. Noises 3 and 4
+    // are wired and tunable; give them a HEIGHT to switch them on if the budget allows.
+    float g_noiseScale [4] = { 0.0060f, 0.0300f, 0.0500f, 0.1200f };
+    float g_noiseDetail[4] = {   3.0f,    3.0f,    1.0f,    1.0f  };
+    float g_noiseRough [4] = {   0.5f,    0.5f,    0.5f,    0.5f  };
+    float g_noiseHeight[4] = {   8.0f,    2.5f,    0.0f,    0.0f  };
+    float g_noiseRampLo[4] = {   0.0f,    0.0f,    0.0f,    0.0f  };
+    float g_noiseRampHi[4] = {   1.0f,    1.0f,    1.0f,    1.0f  };
+    // Different per noise so they do not breathe in lockstep; whole numbers (enforced at the write).
+    float g_noiseTime  [4] = {   1.0f,    2.0f,    3.0f,    5.0f  };
+    // Arbitrary but well-separated: >1 lattice cell apart, so the four fields are uncorrelated.
+    float g_noiseSeed  [4] = {   0.0f,   17.3f,   41.7f,   73.1f  };
+    // GLOBALS. Lacunarity 2.0 and Distortion 0.0 are Blender's defaults, and are what the user asked
+    // for. ⚠ A WHOLE-NUMBER LACUNARITY also keeps the animation loop exact: the W period scales with
+    // the octave, so a fractional lacunarity leaves a faint seam in the finest octaves once per wrap.
+    float g_noiseLacunarity = 2.0f;
+    // ⚠ Distortion is EXACT here, not an eyeballed offset — the two extra noise evaluations carry
+    // their own gradients and the chain rule runs through them. It costs 2 extra evaluations per
+    // noise when nonzero, and nothing at all at 0.
+    float g_noiseDistortion = 0.0f;
+    bool  g_noiseNormalize  = true;    // Blender's Normalize: map the fBM to [0,1]
+    // 0 = all four summed, 1..4 = that noise alone. The four are SUMMED, so a combined view cannot
+    // tell you which one produced a feature — and that is the question you actually have while
+    // dialling four of them.
+    uint32_t g_noiseIsolate = 0;
+    const char* const kNoiseIsolateNames[5] = {
+        "All four (summed)", "Noise 1 only", "Noise 2 only", "Noise 3 only", "Noise 4 only"
+    };
+    // HEIGHT DEBUG VIEW + its gain. The field returns a height that NOTHING SHADES WITH — only the
+    // gradient and the variance are consumed — so `h` is an unverified output, and a sign error or a
+    // dead noise in it would stay invisible until a vertex stage started displacing by it. This is
+    // how it gets looked at.
+    // W2 (texture path): one multiplier on the decoded slope. It scales the normals AND the recovered
+    // roughness by construction — they are the same physical quantity, and every past attempt to move
+    // them independently produced a surface whose highlights disagreed with its shape. 1.0 = the
+    // texture's own baked amplitude, i.e. the pre-W1 look.
+    float g_waterWaveAmp = 1.0f;
+    bool  g_waveHeightView = false;
+    // The gain is a MULTIPLIER ON THE HEIGHT, and it spans negative as well as positive:
+    //   * magnitude sets the range the colour ramp spans (it saturates at |h * gain| = 1) and, with
+    //     it, the contour spacing — one knob, so the reading stays unambiguous.
+    //   * NEGATIVE flips crests and troughs, which is the direct check that the height and the
+    //     gradient agree in sign. They are produced by the same terms, so a mismatch there would be a
+    //     real bug in the field rather than a look problem.
+    // Default 0.1 because the field's height is in WORLD UNITS: with Normalize on, each noise spans
+    // its full HEIGHT slider, and the defaults sum to ~12 — so 0.1 is the value that puts the actual
+    // field inside the ramp. It is a display gain, not a look knob; nothing else reads it.
+    float g_waveHeightGain = 0.10f;
+
+    // WT4d: water is the host's first PBR material, and this is its ONE hand-tuned quantity — the
+    // GGX alpha of the structure BELOW the normal map's finest texel (the close tile resolves ~2
+    // world units per texel, so this is sub-5cm capillary ripple). Everything else about the
+    // surface's roughness is DERIVED: the slope variance the mip filter removed comes out of the
+    // second-moment volume, and the reflection LOD comes out of the screen-space pixel angle. Two
+    // redundant knobs is how a calibration goes unfalsifiable ([[feedback_prior_art_constants_dont_transfer]]),
+    // so there is deliberately no second slider here.
+    // Scaled by windFactor / kWaterWindRef host-side, so the slider means "roughness at nominal wind".
+    //
+    // The DEFAULT is derived, not picked. The load-time tripwire measures the wave field's global
+    // slope variance at 0.0212, so the DERIVED term alone reaches alpha ~0.146 on fully mip-collapsed
+    // distant water — ~100x this base. The base therefore only matters on glassy near water, and
+    // there it has to stay under the reflection's own resolution or calm water reads soft:
+    //   one reflect texel ~ pixAngle * screenW / 1024 ~ 1.3e-3 rad at 2048 wide,
+    //   the frag's cone is 4*alpha, so LOD 1 lands at alpha ~6e-4.
+    // 0.0005 keeps calm water inside LOD ~0.6 (visibly a mirror) and lets the measured variance do
+    // all the real work, which is the point: one hand-tuned number, everything else derived.
+    float g_waterRoughBase = 0.0005f;
+    constexpr float kWaterWindRef = 0.013f;   // the windFactor the slider is calibrated at (client default)
+    // P4 roughness-aware Schlick. Its own toggle because it is the single most visible change in the
+    // WT4d set — the old curve is ~2x hot in the middle of its range, so mid-distance water reads
+    // slightly LESS reflective once this is on. That correction is intended; the toggle is so it can
+    // be A/B'd alone rather than inside the rest.
+    bool g_waterSchlick = true;
+    // WT4d CALIBRATION: a scale on the reflection mip LOD ONLY — never on the specular lobe, so it
+    // is NOT a second roughness. It answers "how much of the physical blur do I want to see", which
+    // is a look call rather than a material property.
+    //
+    // It exists because the honest physical answer is at the edge of what an ISOTROPIC 6-level chain
+    // can show well: the measured field really does have 8.3 deg RMS slope, and a surface like that
+    // really does smear a reflection over degrees — but real rippled water smears it ANISOTROPICALLY
+    // (vertically streaked, horizontally coherent — the glitter-path look), while a mip chain blurs
+    // it evenly and the result reads as mush rather than as water. Until there is an anisotropic
+    // lobe, this dials the isotropic stand-in back to where it reads right.
+    // Default 1.0 = the honest physical cone. It was briefly 0.35, picked to damp a blur that turned
+    // out to be a BUG rather than physics (the shader was reconstructing the variance by subtracting
+    // two independently-interpolated moments, which inflates it everywhere — see
+    // loadWaterNormalVolume). Putting it back to 1.0 deliberately: a default must not carry a
+    // correction for a defect that no longer exists, or the next person tunes against a ghost
+    // ([[feedback_prior_art_constants_dont_transfer]]). Dial DOWN from here if mid-distance still
+    // reads mushy, which would be the anisotropy limitation rather than a bug.
+    //
+    // ⚠ AND IT HAPPENED A SECOND TIME, which is why this note now has two paragraphs. "Even at 0.05
+    // it eats all reflections after 5 metres" was, again, a variance bug rather than physics: W2's
+    // first cut added the inter-tap sample variance to the baked variance at the geometric-mean LOD,
+    // and those are two names for one quantity (see water.frag). A knob that divides a doubled input
+    // reads as having no authority, and the temptation is to move the default to compensate — which
+    // is exactly the ghost the paragraph above warns about. STAYING AT 1.0. If it still reads mushy
+    // now that sigma2 is right, that is the isotropic-lobe limitation and the fix is an anisotropic
+    // lobe, not a smaller number here.
+    float g_waterReflBlurGain = 1.0f;
+
+    // The three WT4d floats water.frag reads out of worlds[6] group 3, in one place so the live pass
+    // and the --forge-view viewer cannot drift apart (they already write two independent copies of
+    // this param block, and every past divergence between them has been a silent one).
+    inline float waterFlagsWord() {
+        // bits 0-1 = debug view. Roughness (3) wins over the two RT views so a single stray
+        // checkbox can't leave two of them fighting over the same two bits.
+        uint32_t f = g_waterRoughView ? 3u : (g_waterReflOnly ? 1u : (g_waterRefrOnly ? 2u : 0u));
+        if (g_waterSchlick)         { f |= 4u; }    // bit 2: P4 roughness-aware Schlick
+        if (g_waterNoFogMelt)       { f |= 8u; }    // bit 3: force the reflection fog melt off
+        if (g_waterProceduralWaves) { f |= 16u; }   // bit 4: W1 procedural height field
+        // bit 5: W1 HEIGHT view. Its own bit rather than a fifth waterDbg mode — bits 0-1 were full
+        // at 4 modes, and this one returns before any water shading runs, which the others do not.
+        if (g_waveHeightView)       { f |= 32u; }
+        return (float)f;
+    }
+    inline float waterAlphaBase(float windFactor) {
+        return g_waterRoughBase * (windFactor / kWaterWindRef);
+    }
+    // No waterReflMipMax(): SampleLevel clamps the LOD to the resource's own mip range, so the
+    // pyramid-failed fallback (gReflectMips bound to the 1-mip pReflectColor) pins itself to mip 0.
+    // That freed the lane for the calibration gain above.
+
+    // W1's surface field, as THREE gBatch groups:
+    //   worlds[8]  per noise = (scale, detail, roughness, height)
+    //   worlds[9]  per noise = (rampLo, rampHi, wCells, zOffset)
+    //   worlds[10] g0 = (lacunarity, distortion, normalize, isolate), g1.x = height debug gain
+    // ONE helper owning all three, for the same reason waterFlagsWord() has one: the live pass and
+    // the --forge-view viewer each write their own copy of this param block, and every past
+    // divergence between those two has been a silent one.
+    // ⚠ An UNWRITTEN group reads as GARBAGE, not as zero — the batch buffer is never cleared — so
+    // adding a group means adding it HERE, where both call sites get it, and not at a call site.
+    inline void writeWaveScales(uint8_t* wbuf) {
+        float a[16] = {};   // worlds[8]
+        float b[16] = {};   // worlds[9]
+        for (int i = 0; i < 4; ++i) {
+            a[i * 4 + 0] = g_noiseScale[i];
+            a[i * 4 + 1] = g_noiseDetail[i];
+            a[i * 4 + 2] = g_noiseRough[i];
+            a[i * 4 + 3] = g_noiseHeight[i];
+            b[i * 4 + 0] = g_noiseRampLo[i];
+            b[i * 4 + 1] = g_noiseRampHi[i];
+            // ROUNDED here, not merely stepped by the slider. The 4D noise's W axis is time, and the
+            // animation loops seamlessly only because the W LATTICE wraps by this same whole number
+            // of cells per 20 s. A fractional value would land mid-cell at the wrap and pop once per
+            // period. Enforcing it at the write means no UI path, and no future caller, can do that.
+            b[i * 4 + 2] = std::floor(g_noiseTime[i] + 0.5f);
+            b[i * 4 + 3] = g_noiseSeed[i];
+        }
+        std::memcpy(wbuf + 8 * 64, a, 64);
+        std::memcpy(wbuf + 9 * 64, b, 64);
+
+        float g[16] = {};   // worlds[10]
+        g[0] = g_noiseLacunarity;
+        g[1] = g_noiseDistortion;
+        g[2] = g_noiseNormalize ? 1.0f : 0.0f;
+        g[3] = (float)g_noiseIsolate;
+        g[4] = g_waveHeightGain;
+        g[5] = g_waterWaveAmp;
+        // W3: the BAKE owns the field's slice count and world period, so the shader is told rather
+        // than told to assume. The period scales with the source's size (kWaveSrcTile * outSize /
+        // srcSize), so a modded water_NRM of a different resolution still lands at the right texel
+        // density without a shader edit — and if the bake never ran these read 0, which the frag's
+        // max(...,1) turns into a harmless degenerate tile rather than a divide by zero.
+        g[6] = (float)g_waveSrcD;
+        g[7] = g_waveTileWorld;
+        std::memcpy(wbuf + 10 * 64, g, 64);
+    }
 
     // ---- P1 point-light shadow knobs ----
     // Master toggle gates the slot-lane patch + face re-render only; the mask pass still runs
@@ -9120,6 +10035,7 @@ namespace {
         std::deque<SliderFloatWidget> sfs;
         std::deque<SliderUintWidget>  sus;
         std::deque<DropdownWidget>    dds;
+        std::deque<ButtonWidget>      btns;
         std::deque<LabelWidget>       lbls;
         std::deque<DynamicTextWidget> dyns;
         std::deque<UIWidget>          bases;
@@ -9152,6 +10068,15 @@ namespace {
         void label(const char* label) {
             LabelWidget& w = lbls.emplace_back();
             push(WIDGET_TYPE_LABEL, label, &w);
+        }
+        // A press ACTION, not a value: `pOnEdited` fires once on click. The callback is expected to
+        // set a flag the render loop consumes, never to touch GPU resources itself — the UI runs
+        // mid-frame, where a waitQueueIdle would stall the frame it is inside.
+        void button(const char* label, WidgetCallback onPress, void* user = nullptr) {
+            ButtonWidget& w = btns.emplace_back();
+            push(WIDGET_TYPE_BUTTON, label, &w);
+            bases.back().pOnEdited = onPress;
+            bases.back().pOnEditedUserData = user;
         }
         void dynamicText(const char* label, bstring* text, float4* color) {
             DynamicTextWidget& w = dyns.emplace_back(); w.pText = text; w.pColor = color;
@@ -9367,6 +10292,94 @@ namespace {
           t.checkbox("Sky tint pulse", &g_skyTintPulse);
           t.checkbox("Water: reflection only (raw RT, undistorted)", &g_waterReflOnly);
           t.checkbox("Water: refraction only", &g_waterRefrOnly);
+          // WT4d. The ONE roughness knob — see g_waterRoughBase. It drives the reflection mip LOD
+          // and the GGX lobe width TOGETHER (they are the same number), so at 0 the surface is a
+          // perfect mirror with a delta highlight and the A/B against pre-WT4d water is exact.
+          t.sliderF("Water: base roughness (sub-texel GGX alpha; 0 = perfect mirror)",
+                    &g_waterRoughBase, 0.0f, 0.05f, 0.0005f, "%.4f");
+          // Step 0.01, not 0.05: the interesting region is the low end (this multiplies INSIDE a
+          // log2, so 0.05 -> 1.0 is already 4.3 mip levels) and a 0.05 step made the bottom of the
+          // range unreachable while it was the only place the knob could do anything.
+          t.sliderF("Water: reflection blur gain (LOD only, NOT the lobe; 1.0 = physical)",
+                    &g_waterReflBlurGain, 0.0f, 2.0f, 0.01f, "%.2f");
+          t.checkbox("Water: roughness-aware Schlick Fresnel (P4)", &g_waterSchlick);
+          t.checkbox("Water: PROCEDURAL surface field (W1 noise; OFF = W2 texture + anisotropic taps)",
+                     &g_waterProceduralWaves);
+          t.sliderF("Water: wave amplitude (W2; scales normals AND roughness together)",
+                    &g_waterWaveAmp, 0.0f, 4.0f, 0.05f, "%.2f");
+          // W3 BOMB knobs. Live rather than compiled in, because "does the tile still read" is a
+          // question you answer by flying over open water, and a rebuild-relaunch-fly loop per value
+          // is how a parameter goes untuned. The bake is content-only (~0.5-1 s), so pressing this
+          // does not disturb any descriptor or pipeline — see the handler at the top of renderScene.
+          //
+          // CELLS is per AXIS and SNAPS DOWN TO A POWER OF TWO: it must DIVIDE the 1024 output or the
+          // weight field stops being periodic and the tile grows the very seam the bomb exists to
+          // remove. 8 gives 64 bombs at 128 texels (several wave crests) each — big enough that a
+          // copy reads as water rather than as a patch, small enough that 64 rotations kill the
+          // repeat. Too FEW cells and the source's own 527-unit period shows through; too many and
+          // the variance-preserving blend is averaging so many copies per texel that the crests
+          // soften.
+          t.sliderU("Water: W3 bomb cells per axis (snaps to a power of 2)", &g_waveBombCells, 1u, 64u, 1u);
+          t.sliderU("Water: W3 bomb seed (reshuffles every cell's rotation/offset/time slice)",
+                    &g_waveBombSeed, 0u, 255u, 1u);
+          t.button("Water: REBAKE wave field (applies cells + seed)",
+                   [](void*) { g_waveRebakeReq = true; });
+          // FOUR BLENDER NOISE TEXTURES. HEIGHT 0 switches one off outright — no octaves evaluated,
+          // no slope, no roughness — so these sliders are also the A/B for how many are earning
+          // their cost, and DETAIL is the per-noise cost throttle (16 hashed lattice corners each).
+          //
+          // SCALE range is 0..0.25 because the world is in Morrowind units (~1.4 cm): Blender's
+          // "1 cell per unit" lands at absurdly high frequency here. The sliders are linear (the
+          // widget has no log mode), so the RANGE is the only sensitivity control there is and it
+          // has to bracket the interesting band rather than the possible one.
+          //
+          // RAMP LO/HI is a 2-stop ColorRamp on the noise output: narrow = high contrast, LO > HI
+          // inverts, and clamped regions are genuinely FLAT (plateaus with flat normals).
+          //
+          // TIME is whole lattice cells per 20 s loop — whole because the 4D noise's W lattice wraps
+          // by the same count, which is what makes the animation seamless. 0 freezes that noise.
+          // SEED is its Z offset: what makes the four INDEPENDENT fields rather than four views of
+          // one, and the reason 4D earns its cost.
+          for (int i = 0; i < 4; ++i) {
+              static char lb[4][7][64];
+              snprintf(lb[i][0], 64, "Noise %d scale (frequency)", i + 1);
+              snprintf(lb[i][1], 64, "Noise %d detail (octaves, fractional)", i + 1);
+              snprintf(lb[i][2], 64, "Noise %d roughness (amp ratio)", i + 1);
+              snprintf(lb[i][3], 64, "Noise %d HEIGHT world units (0 = off)", i + 1);
+              snprintf(lb[i][4], 64, "Noise %d ramp lo (lo > hi inverts)", i + 1);
+              snprintf(lb[i][5], 64, "Noise %d ramp hi", i + 1);
+              snprintf(lb[i][6], 64, "Noise %d time (whole cells / 20 s loop)", i + 1);
+              t.sliderF(lb[i][0], &g_noiseScale[i],  0.0f, 0.25f, 0.0005f, "%.4f");
+              t.sliderF(lb[i][1], &g_noiseDetail[i], 0.0f,  7.0f, 0.05f,  "%.2f");
+              t.sliderF(lb[i][2], &g_noiseRough[i],  0.0f,  1.0f, 0.01f,  "%.2f");
+              t.sliderF(lb[i][3], &g_noiseHeight[i], 0.0f, 64.0f, 0.1f,   "%.1f");
+              t.sliderF(lb[i][4], &g_noiseRampLo[i], 0.0f,  1.0f, 0.01f,  "%.2f");
+              t.sliderF(lb[i][5], &g_noiseRampHi[i], 0.0f,  1.0f, 0.01f,  "%.2f");
+              t.sliderF(lb[i][6], &g_noiseTime[i],   0.0f, 16.0f, 1.0f,   "%.0f");
+          }
+          // GLOBALS. ⚠ A WHOLE-NUMBER lacunarity keeps the animation loop exact — the W period scales
+          // with the octave, so a fractional one leaves a faint seam in the finest octaves once per
+          // loop. Distortion is EXACT (the warp's own gradients go through the chain rule), but it
+          // costs 2 extra noise evaluations per noise; at its 0.0 default it costs nothing.
+          t.sliderF("Noise: lacunarity (freq ratio; whole numbers loop exactly)",
+                    &g_noiseLacunarity, 1.0f, 4.0f, 0.05f, "%.2f");
+          t.sliderF("Noise: distortion (domain warp; 0 = off and free)",
+                    &g_noiseDistortion, 0.0f, 2.0f, 0.01f, "%.2f");
+          t.checkbox("Noise: normalize (Blender's; maps the fBM to 0..1)", &g_noiseNormalize);
+          t.dropdown("Noise: ISOLATE (which of the four to show)", &g_noiseIsolate,
+                     kNoiseIsolateNames, 5);
+          // HEIGHT VIEW. The field's height has no shading consumer — only its gradient and its
+          // variance do — so this is the only thing that ever looks at it. Warm = crest, cool =
+          // trough, WHITE = the still-water line, contours every quarter of the ramp. A flat unbroken
+          // white surface means the field is DEAD; a flat saturated one means the gain is too high.
+          t.checkbox("Water: HEIGHT field debug view (W1 noise; bypasses all water shading)", &g_waveHeightView);
+          // Spans NEGATIVE as well as positive: magnitude sets the ramp's range (and with it the
+          // contour spacing), sign flips crests and troughs — which is the direct check that the
+          // height and the gradient, produced by the same terms, agree.
+          t.sliderF("Wave height debug gain (+/-; ramp saturates at |h*gain| = 1)",
+                    &g_waveHeightGain, -4.0f, 4.0f, 0.01f, "%.2f");
+          t.checkbox("Water: roughness debug view (R=reflection LOD, G=alpha, B=near/far crossfade)", &g_waterRoughView);
+          t.checkbox("Water: force reflection fog melt OFF (roughness calibration only)", &g_waterNoFogMelt);
           // SH1 sky-directional ambient (skyamb.h.fsl). STRENGTH 0 is the A/B: every receiver
           // early-outs to flat ambient, so the whole feature toggles against the previous image from
           // one slider — and because the coefficients are DC-normalised, moving it can only
@@ -10097,6 +11110,15 @@ namespace ForgeRender {
         return g_live.pSharedFence ? (unsigned long long)g_live.sharedFenceValue : 0ull;
     }
 
+    // (eyeNow - bakeEye) for the frame being kicked off. See setSkyParkEyeDelta / bridge.h.
+    float g_skyParkEyeDelta[3] = { 0.0f, 0.0f, 0.0f };
+
+    void setSkyParkEyeDelta(const float d[4]) {
+        g_skyParkEyeDelta[0] = d[0];
+        g_skyParkEyeDelta[1] = d[1];
+        g_skyParkEyeDelta[2] = d[2];
+    }
+
     void setClientSyncsOnFence(bool syncs) {
         // AND with our own half: no shared fence here means no value for the client to wait on, no
         // matter what it believes it imported.
@@ -10470,6 +11492,18 @@ namespace ForgeRender {
         }
 
         checkShaderHotReload();   // auto-reload compute pipelines if a recompiled dxil landed on disk
+
+        // W3 dev-panel "Rebake water field". CONTENT-ONLY: the two array textures keep their descs
+        // and therefore their descriptors, so nothing has to be rebound and no set has to be rebuilt
+        // — only the bytes inside them change. Handled HERE rather than in the widget callback
+        // because the bake writes through the resource loader's copy queue, which the in-flight frame
+        // may still be reading from; waitQueueIdle first makes that safe, and doing it at the top of
+        // a frame is the one place in the loop where idling costs nothing that was not already spent.
+        if (g_waveRebakeReq) {
+            g_waveRebakeReq = false;
+            waitQueueIdle(g_live.pQueue);
+            bakeWaterField();
+        }
 
         // If the device was already removed on a PRIOR frame (e.g. during a dense exterior),
         // every subsequent frame stays black no matter the scene — this names that state
@@ -13714,7 +14748,29 @@ namespace ForgeRender {
             // viewed obliquely (squashed). Mirroring about z = 0 keeps the dome centered on the camera
             // (fills the screen at any height) and flips its pitch = the reflected sky directions.
             // (Stage 2 static distant land will mirror about the water plane dRel — different plane.)
-            float M[16] = { 1,0,0,0,  0,1,0,0,  0,0,-1,0,  0,0,0,1 };
+            //
+            // ⚠ ...AND "THE CAMERA" MEANS THE FIRE-TIME CAMERA, WHICH IS NOT z = 0 UNDER PARK.
+            // The payload's relative space is anchored to bakeEye, so a plane at z = 0 here sits at
+            // the BAKE camera's height. Under mode-3 park those differ by one frame of camera motion.
+            //
+            // Work it through with s = the shipped sky z, d = eyeNow.z - bakeEye.z. The client
+            // pre-cancels the restamp for the sky (renderprocess.cpp), so s = (skyW - bE) + d, and
+            // the restamp then adds -d:
+            //     main view:            s - d          = (skyW - bE)              correct, camera-attached
+            //     mirror about z = 0:  -s - d          = -(skyW - bE) - 2d        WRONG by 2d
+            //     mirror about z = d:  (2d - s) - d    = -(skyW - bE)             correct
+            // A reflection DOUBLES any plane offset, so the mirror does not merely inherit the park
+            // delta, it amplifies it — which is why this was visible while the main view (already
+            // fixed by the pre-cancel) was clean. The symptom: the reflected sky STEPS whenever the
+            // camera's height changes between bake and fire — walking a slope, stairs, a jump —
+            // while strafing level ground (d = 0) looks perfect. Reported in-game 2026-08-07 as
+            // "reflection-only debug, sky jumps with forward/backward motion", which is exactly the
+            // motion that changes camera height and exactly the one that does not.
+            //
+            // Only Z matters: the mirror is horizontal, so the X/Y park delta passes through the
+            // restamp unchanged in both passes.
+            const float skyMirrorZ = g_skyParkEyeDelta[2];
+            float M[16] = { 1,0,0,0,  0,1,0,0,  0,0,-1,0,  0,0,2.0f*skyMirrorZ,1 };
             float mirrorVP[16];
             mul4x4(M, viewProj, mirrorVP);   // mirror world geom, then the ORIGINAL (pre-reverse-Z) camera
             // Same reverse-Z + half-pixel edits the main path applies to viewProj (so the reflection
@@ -13932,6 +14988,47 @@ namespace ForgeRender {
                 rb.mCurrentState = RESOURCE_STATE_RENDER_TARGET;
                 rb.mNewState = RESOURCE_STATE_SHADER_RESOURCE;
                 cmdResourceBarrier(g_live.pCmd, 0, nullptr, 0, nullptr, 1, &rb);
+            }
+
+            // WT4d/P2: build the pre-filtered pyramid the moment the mirror is readable, still in
+            // the main cmd and well before the water draw that samples it. Deliberately INSIDE the
+            // reflect-pass block: when that pass skips, pReflectColor is a frame stale (a documented
+            // pre-existing condition) and the pyramid must stay stale with it rather than re-reducing
+            // the same image. Structure is verbatim Hi-Z: bracket SR -> UAV, one first-pass copy,
+            // then per level a UAV barrier (current==new lowers to a true D3D12 UAV barrier) and a
+            // 2x2 box average, back to SR at the end.
+            if (g_live.reflectMipReady) {
+                cmdBeginDebugMarker(g_live.pCmd, 0.4f, 0.7f, 1.0f, "REFLECT MIPS (pReflectColor -> 6-level box pyramid)");
+                {
+                    TextureBarrier tb = {};
+                    tb.pTexture = g_live.pReflectMips;
+                    tb.mCurrentState = RESOURCE_STATE_SHADER_RESOURCE;
+                    tb.mNewState = RESOURCE_STATE_UNORDERED_ACCESS;
+                    cmdResourceBarrier(g_live.pCmd, 0, nullptr, 1, &tb, 0, nullptr);
+                }
+                cmdBindPipeline(g_live.pCmd, g_live.pReflectMipPipelineFirst);
+                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pReflectMipSet);
+                cmdDispatch(g_live.pCmd, (kReflectSize + 7u) / 8u, (kReflectSize + 7u) / 8u, 1);
+                cmdBindPipeline(g_live.pCmd, g_live.pReflectMipPipeline);
+                uint32_t mw = kReflectSize;
+                for (uint32_t m = 1; m < kReflectMipCount; ++m) {
+                    TextureBarrier tb = {};
+                    tb.pTexture = g_live.pReflectMips;
+                    tb.mCurrentState = RESOURCE_STATE_UNORDERED_ACCESS;
+                    tb.mNewState = RESOURCE_STATE_UNORDERED_ACCESS;
+                    cmdResourceBarrier(g_live.pCmd, 0, nullptr, 1, &tb, 0, nullptr);
+                    mw = (mw > 1u) ? (mw >> 1) : 1u;
+                    cmdBindDescriptorSet(g_live.pCmd, m, g_live.pReflectMipSet);
+                    cmdDispatch(g_live.pCmd, (mw + 7u) / 8u, (mw + 7u) / 8u, 1);
+                }
+                {
+                    TextureBarrier tb = {};
+                    tb.pTexture = g_live.pReflectMips;
+                    tb.mCurrentState = RESOURCE_STATE_UNORDERED_ACCESS;
+                    tb.mNewState = RESOURCE_STATE_SHADER_RESOURCE;
+                    cmdResourceBarrier(g_live.pCmd, 0, nullptr, 1, &tb, 0, nullptr);
+                }
+                cmdEndDebugMarker(g_live.pCmd);
             }
         }
 
@@ -14714,12 +15811,17 @@ namespace ForgeRender {
                 p[0] = waterLevelAbs - eyeAbsZ;                 // waterLevelRel (water-cut feature)
                 p[1] = waterParams ? waterParams[1] : 0.013f;  // windFactor
                 p[2] = waterParams ? waterParams[2] : 24.0f;   // shoreDepthBias
-                // Animation time for the normal volume's W axis. MUST be wrapped on the HOST (double)
-                // before the float cast: hostNowMs() is steady_clock-since-BOOT, so seconds is ~1e5-1e6
-                // → float32 ULP ~0.02-0.13s quantizes t into coarse steps ("low frame rate" normals).
-                // The frag does t = 0.4*time and the volume W is REPEAT, so wrapping at period 2.5 keeps
-                // t in [0,1) at full precision AND wraps seamlessly (0.4*2.5 = exactly one W cycle).
-                p[3] = (float)std::fmod(hostNowMs() * 0.001, 2.5);
+                // Water animation time. MUST be wrapped on the HOST (double) before the float cast:
+                // hostNowMs() is steady_clock-since-BOOT, so seconds is ~1e5-1e6 → float32 ULP
+                // ~0.02-0.13s quantizes t into coarse steps ("low frame rate" normals).
+                //
+                // PERIOD 20 s, was 2.5. The wrap period IS the wave field's visible loop, and it is
+                // also its speed quantum (rates must be whole multiples of 2*PI/period or the field
+                // pops at the seam), so 2.5 s bought a 2.5 s loop AND a coarse 0.4 Hz speed step.
+                // 20 s gives an 8x longer loop and an 8x finer step for nothing: float32 at 20.0 has
+                // ~2e-6 resolution, and the normal volume's W axis stays seamless too because it
+                // reads t = 0.4*time on a REPEAT sampler and 0.4*20 is a whole 8 cycles.
+                p[3] = (float)std::fmod(hostNowMs() * 0.001, 20.0);
                 p[4] = waterParams ? waterParams[3] : 0.0f;    // depthBaseColor.r
                 p[5] = waterParams ? waterParams[4] : 0.0f;    // .g
                 p[6] = waterParams ? waterParams[5] : 0.0f;    // .b
@@ -14728,8 +15830,12 @@ namespace ForgeRender {
                 p[9]  = waterParams ? waterParams[9]  : 0.0f;  // camFwd.y
                 p[10] = waterParams ? waterParams[10] : 1.0f;  // camFwd.z
                 p[11] = waterParams ? waterParams[6] : 0.0f;   // nearViewRange
-                p[12] = g_waterReflOnly ? 1.0f : (g_waterRefrOnly ? 2.0f : 0.0f);  // water debug view
+                p[12] = waterFlagsWord();          // debug view (bits 0-1) + P4 Schlick (bit 2)
+                p[13] = waterAlphaBase(p[1]);      // WT4d sub-texel GGX alpha, wind-scaled
+                p[14] = (float)kReflectSize;       // gReflectMips side, for the reflection LOD
+                p[15] = g_waterReflBlurGain;       // reflection-LOD calibration scale (not the lobe)
                 std::memcpy(wbuf + 6 * 64, p, 64);
+                writeWaveScales(wbuf);             // worlds[8] = wave scales, worlds[9] = field extras
             }
             // worlds[7] = invViewProj of the SAME rzViewProj (incl. half-pixel) the GTAO block inverts;
             // uploaded RAW (the frag does mul(invVP, ndc), identical convention to gtao.comp).
@@ -16541,6 +17647,41 @@ namespace ForgeRender {
                 g_live.hizReady = false;
                 g_hizValid = false;   // M2: no rebuilds while disabled -> the occlusion test passes through
                 LOG::logline("!! [forge] hiz hot-reload FAILED — pyramid DISABLED (dxil missing on disk?)"); LOG::flush();
+            }
+        }
+
+        // WT4d/P2 reflection pyramid: same treatment, and it is the reason the reduce is COMPUTE —
+        // the LOD mapping between surface roughness and mirror-image blur is the hot-iteration
+        // surface here, exactly as shadowmask.comp's bias is for shadows. Failure disables the
+        // pyramid (resources/set stay valid for a retry); water.frag then keeps sampling the slot,
+        // which still holds the last good pyramid, at whatever LOD it asks for.
+        if (g_live.pReflectMipShader || g_live.pReflectMipShaderFirst) {
+            if (g_live.pReflectMipPipeline)      { removePipeline(R, g_live.pReflectMipPipeline);      g_live.pReflectMipPipeline = nullptr; }
+            if (g_live.pReflectMipShader)        { removeShader(R, g_live.pReflectMipShader);          g_live.pReflectMipShader = nullptr; }
+            if (g_live.pReflectMipPipelineFirst) { removePipeline(R, g_live.pReflectMipPipelineFirst); g_live.pReflectMipPipelineFirst = nullptr; }
+            if (g_live.pReflectMipShaderFirst)   { removeShader(R, g_live.pReflectMipShaderFirst);     g_live.pReflectMipShaderFirst = nullptr; }
+            ShaderLoadDesc rfd = {};
+            rfd.mComp.pFileName = "reflectmipfirst.comp";
+            addShader(R, &rfd, &g_live.pReflectMipShaderFirst);
+            ShaderLoadDesc rrd = {};
+            rrd.mComp.pFileName = "reflectmip.comp";
+            addShader(R, &rrd, &g_live.pReflectMipShader);
+            if (g_live.pReflectMipShaderFirst && g_live.pReflectMipShader) {
+                PipelineDesc pfd = {};
+                pfd.mType = PIPELINE_TYPE_COMPUTE;
+                pfd.mComputeDesc.pShaderProgram = g_live.pReflectMipShaderFirst;
+                addPipeline(R, &pfd, &g_live.pReflectMipPipelineFirst);
+                PipelineDesc prd = {};
+                prd.mType = PIPELINE_TYPE_COMPUTE;
+                prd.mComputeDesc.pShaderProgram = g_live.pReflectMipShader;
+                addPipeline(R, &prd, &g_live.pReflectMipPipeline);
+            }
+            g_live.reflectMipReady = g_live.pReflectMips && g_live.pReflectMipSet
+                                  && g_live.pReflectMipPipelineFirst && g_live.pReflectMipPipeline;
+            if (g_live.reflectMipReady) {
+                LOG::logline(">> [forge] reflect-mip shaders hot-reloaded (reflectmipfirst + reflectmip)"); LOG::flush();
+            } else {
+                LOG::logline("!! [forge] reflect-mip hot-reload FAILED — pyramid DISABLED (dxil missing on disk?)"); LOG::flush();
             }
         }
 
@@ -19930,13 +21071,17 @@ namespace ForgeRender {
             p[0] = waterLevelAbs - eye[2];                 // waterLevelRel (water-cut feature)
             p[1] = 0.013f;                                 // windFactor
             p[2] = 24.0f;                                  // shoreDepthBias
-            p[3] = (float)std::fmod(hostNowMs() * 0.001, 2.5);   // anim time (wrap host-side; see live pass)
+            p[3] = (float)std::fmod(hostNowMs() * 0.001, 20.0);  // anim time (wrap host-side; see live pass)
             p[4] = depthBase[0]; p[5] = depthBase[1]; p[6] = depthBase[2];
             p[7] = underwater ? 1.0f : 0.0f;
             p[8]  = camFwd[0]; p[9] = camFwd[1]; p[10] = camFwd[2];
             p[11] = 0.0f;                                   // nearViewRange (viewer has no near scene)
-            p[12] = g_waterReflOnly ? 1.0f : (g_waterRefrOnly ? 2.0f : 0.0f);   // water debug view
+            p[12] = waterFlagsWord();          // debug view (bits 0-1) + P4 Schlick (bit 2)
+            p[13] = waterAlphaBase(p[1]);      // WT4d sub-texel GGX alpha, wind-scaled
+            p[14] = (float)kReflectSize;       // gReflectMips side, for the reflection LOD
+            p[15] = g_waterReflBlurGain;       // reflection-LOD calibration scale (not the lobe)
             std::memcpy(wbuf + 6 * 64, p, 64);
+            writeWaveScales(wbuf);             // worlds[8] = wave scales, worlds[9] = field extras
         }
         {
             float invVP[16];
@@ -24459,6 +25604,7 @@ namespace ForgeRender {
         if (g_live.pWaterIB)                { removeResource(g_live.pWaterIB); }
         if (g_live.pRefractColor)           { removeResource(g_live.pRefractColor); }
         if (g_live.pWaterNormalVol)         { removeResource(g_live.pWaterNormalVol); }
+        if (g_live.pWaterSlopeVar)          { removeResource(g_live.pWaterSlopeVar); }
         if (g_live.pWaterPipeline)          { removePipeline(R, g_live.pWaterPipeline); }
         if (g_live.pWaterShader)            { removeShader(R, g_live.pWaterShader); }
         // Phase F glow-billboard teardown.
@@ -24585,6 +25731,13 @@ namespace ForgeRender {
         if (g_live.pHizCmd)          { exitCmd(R, g_live.pHizCmd); }
         if (g_live.pHizCmdPool)      { exitCmdPool(R, g_live.pHizCmdPool); }
         if (g_live.pHiz)             { removeResource(g_live.pHiz); }
+        // WT4d/P2 reflection mip pyramid.
+        if (g_live.pReflectMipSet)          { removeDescriptorSet(R, g_live.pReflectMipSet); }
+        if (g_live.pReflectMipPipeline)     { removePipeline(R, g_live.pReflectMipPipeline); }
+        if (g_live.pReflectMipPipelineFirst){ removePipeline(R, g_live.pReflectMipPipelineFirst); }
+        if (g_live.pReflectMipShader)       { removeShader(R, g_live.pReflectMipShader); }
+        if (g_live.pReflectMipShaderFirst)  { removeShader(R, g_live.pReflectMipShaderFirst); }
+        if (g_live.pReflectMips)            { removeResource(g_live.pReflectMips); }
         // P1 point-light shadows.
         if (g_live.pShadowMaskSet)       { removeDescriptorSet(R, g_live.pShadowMaskSet); }
         if (g_live.pShadowFaceSet)       { removeDescriptorSet(R, g_live.pShadowFaceSet); }

@@ -1,0 +1,560 @@
+#ifndef WAVEFIELD_H
+#define WAVEFIELD_H
+
+// mgeHost64 — W1 PROCEDURAL SURFACE FIELD: four Blender-style Noise Textures.
+//
+// Its own file rather than another 200 lines at the top of water.frag.fsl, for two reasons beyond
+// tidiness. It is a self-contained mathematical object — world position in, height + exact gradient
+// + slope variance out — with three cbuffer groups as its only external dependency; and the height's
+// eventual consumer is a VERTEX STAGE that displaces the clipmap by it, so a shared header is what
+// lets a VS and a PS agree on the field by construction instead of by two copies staying in sync.
+//
+// ⚠ INCLUDE ORDER: after opaque.srt.h (it reads gBatch).
+//
+// ============================================================================================
+// WHY THE WAVE-TRAIN GENERATOR WAS RETIRED  (user: "old method hopelessly tiles")
+// ============================================================================================
+// It could not have been fixed by tuning, and the reason is a theorem rather than a bug. A sum of
+// sinusoids is an ALMOST-PERIODIC function: for any tolerance there is a translation that brings the
+// whole sum back to within it, and one always exists. Irrational heading ratios (the golden angle)
+// and irrational lacunarity only push the recurrence FURTHER OUT — they cannot remove it, because a
+// finite trigonometric sum has no other option. Every knob in that generator was moving the tile,
+// not deleting it.
+//
+// GRADIENT NOISE HAS NO PERIOD AT ALL. Its value at a lattice cell comes from an integer hash of the
+// cell's coordinate, so there is no translation that reproduces the field — repetition is not merely
+// distant, it is unavailable. That is the whole reason for the switch, and it is why no amount of
+// octave/heading cleverness in the old model was ever going to land.
+//
+// ============================================================================================
+// FOUR BLENDER NOISE TEXTURES
+// ============================================================================================
+// Faithful to Blender's Noise Texture node, so a look developed there transfers:
+//   * 4D Perlin, with Blender's own gradient set and its 0.8344 4D scale constant
+//   * Detail is FRACTIONAL — the last octave is blended in by its fractional part
+//   * Normalize maps the fBM to [0,1] as `0.5*sum/maxamp + 0.5`
+//   * Lacunarity (frequency ratio) and Roughness (amplitude ratio) per Blender's meaning
+//   * Distortion perturbs the input domain
+//   * ...then a 2-stop ColorRamp per noise, and the four are summed.
+//
+// NOT bit-identical to Blender: the integer hash is a cheap GPU one rather than Blender's lookup3,
+// so the SEED differs. The gradient set, the quintic interpolant, the scale constant and the fBM
+// accumulation are all Blender's, so the statistics — and therefore the look — match.
+//
+// ⚠ COST. 16 lattice corners per octave, each with a hash: this is far more expensive than the sine
+// field it replaces. `Detail` is the throttle and it is per-noise, so the cheap configuration is a
+// real one (detail 0 = a single octave). Set a noise's HEIGHT to 0 to switch it off entirely.
+// ============================================================================================
+
+#define kNoiseCount      4
+#define kNoiseMaxOctaves 8
+
+// Blender's 3D Perlin output scale — chosen there so the result fits roughly [-1,1].
+#define kNoiseScale3D 0.9820f
+
+// ⚠ MUST MATCH THE HOST'S `time` WRAP (forgerender.cpp writes fmod(seconds, 20.0) into P[0].w).
+// It is what makes the animation loop seamlessly — see the W-axis note in noiseFbm.
+#define kNoiseWrap 20.0f
+
+// --- Properties of Perlin noise, NOT look knobs -------------------------------------------------
+// These two convert "an octave at lattice frequency f" into the two statistics the roughness model
+// needs. They are measurable properties of the gradient set, so they belong here rather than on a
+// slider — but both are ESTIMATES, and the roughness debug view is how to check them: distant water
+// should settle at a plausible alpha rather than pinning to the sky.
+//
+// Perlin's dominant feature is about two lattice cells across, so one cell is ~pi radians of phase.
+#define kPerlinAngFreq  3.14159265f
+// Mean square of d(noise)/d(lattice axis) for the unit-frequency field, per axis.
+#define kPerlinSlopeVar 0.35f
+#define kTwoPi          6.28318531f
+
+// Max anisotropic taps per octave. 4, not 16 like a texture unit: each "tap" here is a full 16-corner
+// 4D Perlin evaluation, not a cached texel fetch. The octave EARLY-OUT below is what keeps this
+// affordable — by the time the footprint is anisotropic enough to want 4 taps, only the coarsest one
+// or two octaves are still resolvable at all.
+#define kMaxAniso 4
+
+// ⚠⚠ WHY THERE IS NO BESSEL TERM HERE ANY MORE — do not re-derive it, it is a correct formula for
+// the wrong question.
+//
+// The angular average of an anisotropic Gaussian filter over an ISOTROPIC field integrates exactly to
+//     <att^2> = exp(-k^2 sMin^2) * I0tilde( 0.5 k^2 (sMax^2 - sMin^2) )
+// and that IS the energy such a filter retains. But I0tilde decays as 1/sqrt(a) — a POWER LAW. At
+// 100:1 anisotropy an octave 100x below the pixel rate still reports ~7.5% surviving amplitude, where
+// the isotropic form gives exp(-5000). Sixteen octaves each leaking a few percent is precisely the
+// "distant features get small and flicker" report.
+//
+// The formula is not wrong; the energy really does survive, because an infinitely thin kernel cannot
+// average out variation running ACROSS it. The mistake was using a RETAINED-ENERGY figure as a
+// deterministic scale on a POINT SAMPLE. The surviving energy varies ALONG the sliver, and one sample
+// per pixel cannot represent it — scaling the sample's amplitude gives the right variance with the
+// wrong spatial structure, which aliases exactly as the unscaled version would.
+//
+// The only honest ways to spend that energy are to RENDER it (sample along the major axis — real
+// anisotropic filtering, which is what this file now does) or to BANK it as roughness. Not to shrink
+// a single sample and call it filtered.
+
+// The pixel's world-space footprint ELLIPSE from its two screen derivatives, as
+// (minor axis squared, major axis squared).
+//
+// These are the SINGULAR VALUES of J = [dWdx | dWdy], not max/min of the two column lengths — and
+// the difference is not cosmetic. dWdx and dWdy are not orthogonal, and at extreme grazing angles
+// they become nearly PARALLEL, at which point the true minor axis collapses toward zero while both
+// column lengths stay large. Taking min(|dWdx|,|dWdy|) there would report a fat footprint for a
+// nearly degenerate one and under-filter exactly where the filtering matters most.
+//
+// For a 2x2 J the singular values squared are the eigenvalues of J^T J, which are available in
+// closed form from its trace and determinant — and det(J^T J) = det(J)^2 is just the squared cross
+// product, so this costs a handful of ops with no iteration.
+// Returns (minor^2, major^2, majorDir.x, majorDir.y) — the DIRECTION is needed too, because the taps
+// have to march along the long axis.
+float4 footprintEllipse(float2 dWdx, float2 dWdy)
+{
+    // A = J*J^T, the footprint's second-moment matrix.
+    float axx = dWdx.x * dWdx.x + dWdy.x * dWdy.x;
+    float ayy = dWdx.y * dWdx.y + dWdy.y * dWdy.y;
+    float axy = dWdx.x * dWdx.y + dWdy.x * dWdy.y;
+
+    float tr   = axx + ayy;
+    float cr   = dWdx.x * dWdy.y - dWdx.y * dWdy.x;      // signed area of the parallelogram
+    float disc = sqrt(max(tr * tr - 4.0f * cr * cr, 0.0f));
+    float lmax = max(0.5f * (tr + disc), 1e-12f);
+    float lmin = max(0.5f * (tr - disc), 0.0f);
+
+    // Eigenvector for lmax. (axy, lmax - axx) degenerates when the ellipse is a circle or axis-
+    // aligned, so fall back to whichever axis carries the larger moment — any direction is correct
+    // when the two are equal, and picking one deterministically keeps it from spinning under motion.
+    float2 v = float2(axy, lmax - axx);
+    float  vl = dot(v, v);
+    float2 dir = (vl > 1e-20f) ? v * rsqrt(vl)
+                               : ((axx >= ayy) ? float2(1.0f, 0.0f) : float2(0.0f, 1.0f));
+    return float4(lmin, lmax, dir);
+}
+
+// One mixing round of the hash chain. Split out because the 8 corners of a cell share PREFIXES:
+// the two x-planes share everything before x, the four xy-columns share everything before y, and so
+// on, so the chain can be evaluated as a TREE instead of once per corner. That is 2 + 4 + 8 = 14
+// rounds for 8 corners rather than 8 x 3 = 24, and it is pure saving — identical values, fewer ops.
+uint noiseMix(uint h, uint k, uint m, uint sh) { h ^= k; h *= m; h ^= h >> sh; return h; }
+
+// Blender's improved 3D `noise_grad`: the 12 cube-edge gradients, indexed by 4 hash bits. Returns
+// dot(g, d) and, separately, g.x and g.y — the only two partials this file ever needs, because only
+// x and y vary spatially (the third interpolated axis is TIME).
+float perlinGrad3(uint h32, float dx, float dy, float dw, out float gx, out float gy)
+{
+    uint  h    = h32 & 15u;
+    bool  uIsX = (h < 8u);
+    bool  vIsY = (h < 4u);
+    bool  vIsX = (h == 12u || h == 14u);
+    float u    = uIsX ? dx : dy;
+    float v    = vIsY ? dy : (vIsX ? dx : dw);
+    float su   = ((h & 1u) != 0u) ? -1.0f : 1.0f;
+    float sv   = ((h & 2u) != 0u) ? -1.0f : 1.0f;
+    gx = (uIsX ? su : 0.0f) + ((!vIsY && vIsX) ? sv : 0.0f);
+    gy = (uIsX ? 0.0f : su) + (vIsY ? sv : 0.0f);
+    return su * u + sv * v;
+}
+
+// One octave of Perlin over (x, y, TIME), returning the value and its exact x/y partials.
+//
+// ⚠⚠ ONLY THREE AXES ARE INTERPOLATED, AND THAT IS NOT A DOWNGRADE FROM 4D. The four noises are
+// decorrelated by a per-noise Z offset — but Z is CONSTANT across the whole surface, so interpolating
+// along it does nothing except blend two arbitrary seeds at a fixed ratio. Folding it into the hash
+// SEED instead gives statistically identical fields for HALF the lattice corners: 8, not 16. Time
+// stays a genuinely interpolated dimension, which is the part of 4D that was ever doing work.
+//
+// ⚠ THE POINT ARRIVES PRE-SPLIT: `pf` is the position near the camera and `ioff` the integer lattice
+// cell the camera sits in. That is the [[project_forge_precision_far_origin]] fix and it is not
+// optional here — Morrowind's exteriors reach ~250k world units, and computing `floor(worldXY*scale)`
+// at that magnitude spends the float32 mantissa on the integer part, leaving the FRACTION (which is
+// what the interpolant reads) visibly quantized. Splitting keeps the caller's large multiply in a
+// per-FRAME uniform, where its rounding error is a global sub-cell shift instead of per-pixel jitter.
+//
+// `wPeriod` makes the TIME axis PERIODIC: its lattice index wraps, so the animation loops seamlessly
+// across the host's `time` wrap. 0 disables it.
+float perlinXYW(float3 pf, int3 ioff, uint zSeed, int wPeriod, out float2 dxy)
+{
+    float3 fl = floor(pf);
+    float3 f  = pf - fl;
+    int3   i  = int3(fl) + ioff;
+
+    // Quintic interpolant (Perlin's improved one) and its derivative — the derivative is why this is
+    // written out rather than folded into nested lerps.
+    float3 u  = f * f * f * (f * (f * 6.0f - 15.0f) + 10.0f);
+    float3 du = 30.0f * f * f * (f * (f - 2.0f) + 1.0f);
+
+    // The two time-lattice rows, wrapped so the animation loop is seamless.
+    int iw0 = i.z, iw1 = i.z + 1;
+    if (wPeriod > 0) {
+        iw0 = ((iw0 % wPeriod) + wPeriod) % wPeriod;      // negative-safe modulo
+        iw1 = ((iw1 % wPeriod) + wPeriod) % wPeriod;
+    }
+
+    // --- the hash TREE: 2 x-planes, then 4 xy-columns, then 8 corners -------------------------
+    const uint seed0 = noiseMix(0x9E3779B9u, zSeed, 0x27D4EB2Fu, 15);
+    uint hx[2];
+    UNROLL
+    for (int a = 0; a < 2; ++a) { hx[a] = noiseMix(seed0, asuint(i.x + a), 0x85EBCA6Bu, 13); }
+    uint hxy[4];
+    UNROLL
+    for (int b = 0; b < 4; ++b) { hxy[b] = noiseMix(hx[b & 1], asuint(i.y + (b >> 1)), 0xC2B2AE35u, 16); }
+
+    float  val = 0.0f;
+    float2 g   = float2(0.0f, 0.0f);
+
+    // The 8 corners of the cell, summed explicitly. For corner c the blend weight is the product of
+    // the three per-axis weights, and its x-partial replaces the x factor with that axis's
+    // derivative — no divisions, so it stays stable at f = 0 and f = 1 where a w/u form would not.
+    UNROLL
+    for (int c = 0; c < 8; ++c)
+    {
+        int cx = c & 1, cy = (c >> 1) & 1, cw = (c >> 2) & 1;
+
+        float ax = (cx != 0) ?  u.x : 1.0f - u.x;
+        float bx = (cx != 0) ? du.x : -du.x;
+        float ay = (cy != 0) ?  u.y : 1.0f - u.y;
+        float by = (cy != 0) ? du.y : -du.y;
+        float aw = (cw != 0) ?  u.z : 1.0f - u.z;
+
+        uint h = noiseMix(hxy[cy * 2 + cx], asuint((cw != 0) ? iw1 : iw0), 0x165667B1u, 13);
+
+        float gx, gy;
+        float dc = perlinGrad3(h, f.x - (float)cx, f.y - (float)cy, f.z - (float)cw, gx, gy);
+
+        float wgt = ax * ay * aw;
+        val += wgt * dc;
+        g.x += (bx * ay * aw) * dc + wgt * gx;
+        g.y += (ax * by * aw) * dc + wgt * gy;
+    }
+
+    dxy = g * kNoiseScale3D;
+    return val * kNoiseScale3D;
+}
+
+// One Blender Noise Texture: fBM over 4D Perlin, with fractional Detail and optional Normalize.
+//   cfgA = (scale, detail, roughness, height)
+//   cfgB = (rampLo, rampHi, wCells, zOffset)
+// Returns the fBM value; `dv` is its exact world-space gradient and `s2` the slope variance of the
+// octaves too fine for this pixel to resolve.
+float noiseFbm(float2 relXY, float2 eyeXY, float tt, float4 cfgA, float4 cfgB,
+               float lac, float distortion, bool doNormalize, float4 fpEll,
+               out float2 dv, out float s2)
+{
+    const float scale  = max(cfgA.x, 1e-7f);
+    const float detail = clamp(cfgA.y, 0.0f, (float)(kNoiseMaxOctaves - 1));
+    const float rough  = max(cfgA.z, 0.0f);
+    const float lacun  = max(lac, 1.0f);
+
+    // THE W AXIS IS TIME, and it is periodic. `wCells` is a whole number of lattice cells per host
+    // wrap (the host rounds it, so no UI path can produce a fractional one): advancing w by exactly
+    // that many cells over kNoiseWrap seconds and wrapping the w lattice index by the same number
+    // makes the loop seamless. This is the same discipline the sine field needed for its phase — the
+    // wrap period is still both the visible loop AND the speed quantum — but it now costs nothing in
+    // the spatial field, because time is a DIMENSION here rather than a translation.
+    const int   wCells = (int)(cfgB.z + 0.5f);
+    const float w0     = tt * ((float)wCells / kNoiseWrap);
+    const float z0     = cfgB.w;   // per-noise seed offset: what makes the four fields independent
+
+    // Precision split (see perlinXYW): the large multiply happens on the EYE, which is uniform.
+    float2 pe   = eyeXY * scale;
+    float2 base = relXY * scale + (pe - floor(pe));
+    float2 eoff = floor(pe);
+
+    // DISTORTION: Blender perturbs the input domain by noise before the fBM. Two extra evaluations
+    // (one per axis, at fixed offsets) — and they carry their own gradients, so the chain rule
+    // through the warp is EXACT rather than an eyeballed offset. `distortion` is uniform, so at its
+    // 0.0 default this whole block folds away and costs nothing.
+    float4 JD = float4(0.0f, 0.0f, 0.0f, 0.0f);   // (dDx/dx, dDx/dy, dDy/dx, dDy/dy)
+    if (distortion != 0.0f)
+    {
+        float2 gdx, gdy;
+        uint   dseed = (uint)((int)(z0 * 64.0f));
+        float  dx = perlinXYW(float3(base + 13.5f, w0 + 13.5f), int3(eoff, 0), dseed ^ 0x51ED2701u, 0, gdx);
+        float  dy = perlinXYW(float3(base -  7.3f, w0 -  7.3f), int3(eoff, 0), dseed ^ 0x9E2A7C15u, 0, gdy);
+        base += distortion * float2(dx, dy);
+        JD    = distortion * float4(gdx.x, gdx.y, gdy.x, gdy.y);
+    }
+
+    const int   octInt  = (int)detail;
+    const float octFrc  = detail - (float)octInt;
+    const int   octLast = octInt + ((octFrc != 0.0f) ? 1 : 0);   // last o the loop would run
+
+    float  sum = 0.0f, maxamp = 0.0f, amp = 1.0f, fs = 1.0f;
+    float2 gsum = float2(0.0f, 0.0f);
+    float  var  = 0.0f;
+    float  lastVal = 0.0f;            // the fractional octave, blended in per Blender
+    float2 lastGrad = float2(0.0f, 0.0f);
+    float  lastAmp = 0.0f;
+
+    LOOP
+    for (int o = 0; o <= kNoiseMaxOctaves; ++o)
+    {
+        if (o > octLast) { break; }   // uniform bound — no divergence
+
+        // Re-split PER OCTAVE rather than scaling one split by fs: with a non-integer lacunarity,
+        // fs * (an integer cell offset) is not an integer, and folding it into the lattice index
+        // would shear the field. Recomputing floor() here keeps it exact for any lacunarity, and the
+        // large term stays frame-uniform.
+        float2 qo = eoff * fs;
+        float2 qi = floor(qo);
+        float3 P  = float3(base * fs + (qo - qi), w0 * fs);
+        // The per-noise Z offset is now a hash SEED, not an interpolated coordinate (see perlinXYW).
+        // Scaled by 64 and truncated so nearby slider values still land on distinct seeds, and mixed
+        // with the octave so an octave's field is not a rescaled copy of its neighbour's.
+        uint zSeed = (uint)((int)(z0 * 64.0f)) * 0x9E3779B9u + (uint)o * 0x7F4A7C15u;
+
+        // The w period scales with the octave. Exact when the lacunarity is a whole number (2.0, the
+        // default, is); otherwise the rounding leaves a faint seam in the finest octaves once per
+        // loop, which is the price of a fractional lacunarity and is documented rather than hidden.
+        int wp = (wCells > 0) ? max(1, (int)(((float)wCells * fs) + 0.5f)) : 0;
+
+        // ---- ANISOTROPIC FILTERING: N taps along the footprint's major axis ---------------------
+        //
+        // A pixel's world footprint at a grazing angle is a long thin SLIVER — tens of world units
+        // along the view direction, a fraction of one across it. That is why the aliasing is
+        // DIRECTION-SELECTIVE (it boils on forward/rotate and not on strafe), and why no single
+        // scalar footprint can fix it: the geometric mean under-filters the long axis, max-axis
+        // over-blurs the short one, and the energy-average Bessel form leaks a power-law tail (see
+        // the note above besselI0Scaled's grave).
+        //
+        // So do what a texture unit does: cover the long axis with SAMPLES, each filtered
+        // isotropically at the width one sample can actually carry. `wTap` is that width — the tap
+        // SPACING, floored at the minor axis — which is also the standard clamp when the ratio
+        // exceeds the tap budget (a texture unit raises its LOD in exactly the same situation).
+        float sMin  = sqrt(fpEll.x);
+        float sMax  = sqrt(fpEll.y);
+        float ratio = sMax / max(sMin, 1e-6f);
+        int   nTap  = (int)clamp(ceil(ratio), 1.0f, (float)kMaxAniso);
+        float wTap  = max(sMax / (float)nTap, sMin);
+
+        float sfreq = scale * fs;
+        float kk    = kPerlinAngFreq * kPerlinAngFreq * sfreq * sfreq;
+        float att   = exp(-0.5f * kk * wTap * wTap);
+        float att2  = att * att;
+
+        // ⚠ EARLY-OUT, and it is what makes the taps affordable. Frequency only ever RISES with the
+        // octave, so once a tap set cannot resolve this one it cannot resolve any finer one either.
+        // The cost therefore self-balances: near water is many octaves at 1 tap, distant grazing
+        // water is 1-2 octaves at 4 taps. Without this, 4 noises x 4 octaves x 4 taps would be 64
+        // full 16-corner evaluations per pixel.
+        //
+        // Everything from here on is unresolvable, so bank all of its slope variance in one closed
+        // form instead of looping. Truncating the loop must not also truncate the ROUGHNESS, or
+        // distant water would go smooth instead of glossy.
+        //
+        // ⚠⚠ THE TAIL MUST COUNT EXACTLY THE OCTAVES THE LOOP WOULD HAVE RUN — no more, no fewer.
+        // Get that right and the early-out is CONTINUOUS by construction: banking octave o and then
+        // breaking at o+1 with (n-1) terms equals breaking at o with n terms. Get it wrong and the
+        // threshold crossing is a visible step in roughness, because the banked variance jumps.
+        //
+        // The first cut summed an INFINITE series, which is wrong twice over. The loop is bounded by
+        // `detail`, so only a handful of octaves ever remain — and at the DEFAULTS (roughness 0.5,
+        // lacunarity 2.0) `rough*lacun` is exactly 1, a flat slope spectrum whose infinite sum does
+        // not converge at all, so it fell into an arbitrary "x8" guard. That guard WAS the hard
+        // roughness discontinuity.
+        //
+        // A finite sum has no such failure: n terms of ratio rr is tailAmp*(1-rr^n)/(1-rr), and the
+        // rr -> 1 case is simply tailAmp*n — which is the common one here, not an edge case.
+        if (att < 0.01f) {
+            float rr      = (rough * lacun) * (rough * lacun);
+            float tailAmp = amp * amp * sfreq * sfreq;
+            float nLeft   = (float)(octLast - o + 1);
+            float tail    = (abs(1.0f - rr) > 1e-3f)
+                          ? tailAmp * (1.0f - pow(rr, nLeft)) / (1.0f - rr)
+                          : tailAmp * nLeft;
+            var += 2.0f * tail * kPerlinSlopeVar;
+            break;
+        }
+
+        // The taps march along the major axis, centred on the pixel, spanning +/-sMax*(1 - 1/N).
+        // Offsets are WORLD units, so the noise-space step is (offset * scale * fs).
+        float2 gOct = float2(0.0f, 0.0f);
+        float  vOct = 0.0f;
+        float2 tapStep = fpEll.zw * (sfreq * 2.0f * sMax);   // full-span step, in NOISE units
+        LOOP
+        for (int t = 0; t < nTap; ++t)
+        {
+            float  u = ((2.0f * (float)t + 1.0f) / (float)nTap) - 1.0f;   // -1+1/N .. 1-1/N
+            float2 gT;
+            float  vT = perlinXYW(float3(P.xy + tapStep * (0.5f * u), P.z),
+                                  int3((int2)qi, 0), zSeed, wp, gT);
+            vOct += vT;
+            gOct += gT;
+        }
+        float invTap = 1.0f / (float)nTap;
+        vOct *= invTap;
+        gOct *= invTap;
+
+        // World-space gradient of this octave: d/d(world) = scale * fs * d/d(lattice).
+        gOct *= sfreq;
+
+        // ...and the power the per-tap filter removed becomes variance. Both axes, hence the 2x.
+        // Resolved detail shades, unresolved detail roughens — the WT4d thesis, intact across two
+        // changes of generator.
+        float bank  = 2.0f * (1.0f - att2) * amp * amp * sfreq * sfreq * kPerlinSlopeVar;
+
+        if (o <= octInt) {
+            sum    += vOct * att * amp;
+            gsum   += gOct * att * amp;
+            maxamp += amp;
+            var    += bank;
+        } else {
+            lastVal  = vOct * att;
+            lastGrad = gOct * att;
+            lastAmp  = amp;
+            var     += bank * octFrc * octFrc;
+        }
+
+        amp *= rough;
+        fs  *= lacun;
+    }
+
+    // Blender's fractional-detail blend: mix between the truncated fBM and the one-octave-longer
+    // fBM, each normalized by its OWN maxamp. Reproduced exactly, because it is what makes Detail a
+    // continuous slider instead of a stepped one.
+    float  sum2  = sum + lastVal * lastAmp;
+    float2 g2    = gsum + lastGrad * lastAmp;
+    float  maxa2 = maxamp + lastAmp;
+
+    float  vA, vB;
+    float2 gA, gB;
+    if (doNormalize) {
+        vA = 0.5f * sum  / max(maxamp, 1e-8f) + 0.5f;
+        vB = 0.5f * sum2 / max(maxa2,  1e-8f) + 0.5f;
+        gA = 0.5f * gsum / max(maxamp, 1e-8f);
+        gB = 0.5f * g2   / max(maxa2,  1e-8f);
+        var *= 0.25f / max(maxamp * maxamp, 1e-16f);
+    } else {
+        vA = sum;  vB = sum2;  gA = gsum;  gB = g2;
+    }
+
+    float mixw = (octFrc != 0.0f) ? octFrc : 0.0f;
+    dv = lerp(gA, gB, mixw);
+    s2 = var;
+
+    // Finally the domain-warp chain rule, so a distorted field still reports an EXACT gradient:
+    // q = p + D(p) => d/dp = (I + JD)^T applied to the gradient computed wrt q.
+    if (distortion != 0.0f) {
+        dv = float2(dv.x + dv.x * JD.x + dv.y * JD.z,
+                    dv.y + dv.x * JD.y + dv.y * JD.w);
+    }
+    return lerp(vA, vB, mixw);
+}
+
+// Height + its exact world-space gradient, and the slope variance of everything too fine to resolve.
+//   returns .x  = height, in WORLD UNITS (see below — nothing shades with it yet)
+//           .yz = d(height)/d(worldXY), dimensionless slope
+//   out sigma2  = summed slope variance of the ATTENUATED (unresolvable) octaves
+//
+// ⚠ THE HEIGHT HAS NO SHADING CONSUMER. Only the gradient and the variance are read; the surface is
+// a flat plane that is merely SHADED as though it were displaced. That is why the height debug view
+// exists — an unconsumed output is an unverified one, and a sign error or a dead noise in `h` would
+// be completely invisible until the day a vertex stage started displacing by it.
+//
+// The four noises are SUMMED, never blended, so their variances add linearly — no crossfade weights,
+// no handoff, nothing to keep aligned. A sum has no handoff to get wrong.
+//
+// Each noise's ColorRamp is a 2-stop linear one: t = saturate((v - lo)/(hi - lo)). Its derivative is
+// the constant 1/(hi-lo) inside the range and ZERO outside, so clamped regions are genuinely flat —
+// plateaus, with flat normals. That is the ramp doing its job, not a bug. lo > hi inverts.
+//
+// The ramp's value at the noise's OWN MEAN is subtracted, so the height is centred whatever the
+// ramp and Normalize are set to. It changes no gradient (a constant has none); it exists so the
+// height debug view's zero line keeps meaning "still water".
+//
+// `fpEll` is the pixel's world footprint ELLIPSE: (minor^2, major^2, majorDir.xy) — see
+// footprintEllipse() and the attenuation note in noiseFbm. A scalar footprint cannot express it.
+float3 waveFieldGrad(float2 relXY, float2 eyeXY, float tt, float4 fpEll, out float sigma2)
+{
+    float4x4 A = transpose(gBatch.worlds[8]);    // per noise: (scale, detail, roughness, height)
+    float4x4 B = transpose(gBatch.worlds[9]);    // per noise: (rampLo, rampHi, wCells, zOffset)
+    float4x4 G = transpose(gBatch.worlds[10]);   // globals
+
+    const float lac       = G[0].x;
+    const float distort   = G[0].y;
+    const bool  normalize = G[0].z > 0.5f;
+    // ISOLATE: 0 = all four summed, 1..4 = that noise alone. The four are summed, so a combined view
+    // cannot tell you which one is producing a feature — and "which noise is that?" is the question
+    // you actually have while dialling four of them.
+    const int   isolate   = (int)(G[0].w + 0.5f);
+
+    float  h  = 0.0f;
+    float2 dh = float2(0.0f, 0.0f);
+    sigma2    = 0.0f;
+
+    UNROLL
+    for (int n = 0; n < kNoiseCount; ++n)
+    {
+        float4 cfgA = A[n];
+        float4 cfgB = B[n];
+        if (cfgA.w == 0.0f) { continue; }                          // height 0 = off (uniform)
+        if (isolate > 0 && n != isolate - 1) { continue; }         // isolate view (uniform)
+
+        float2 dv;  float s2;
+        float  v = noiseFbm(relXY, eyeXY, tt, cfgA, cfgB, lac, distort, normalize, fpEll, dv, s2);
+
+        // 2-stop ColorRamp, and its (constant) derivative.
+        float span  = cfgB.y - cfgB.x;
+        float inv   = (abs(span) > 1e-6f) ? 1.0f / span : 0.0f;
+        float t     = saturate((v - cfgB.x) * inv);
+        float dt    = (t > 0.0f && t < 1.0f) ? inv : 0.0f;
+        float vMid  = normalize ? 0.5f : 0.0f;
+        float tMid  = saturate((vMid - cfgB.x) * inv);
+
+        float k = cfgA.w * dt;                   // the whole ramp+height chain, as one scalar
+        h      += cfgA.w * (t - tMid);
+        dh     += k * dv;
+        sigma2 += k * k * s2;
+    }
+    return float3(h, dh);
+}
+
+// Contour spacing, as a fraction of the ramp's full range — 4 bands each side of the still-water
+// line. Fixed rather than a slider because the gain already sets the range, and one knob controlling
+// both is what makes the reading unambiguous.
+#define kWaveDbgContour 0.25f
+
+// HEIGHT DEBUG VISUALISATION: signed ramp + contour lines, antialiased ANALYTICALLY.
+//
+// The per-pixel change in the displayed height is `gain * (|dh . dWdx| + |dh . dWdy|)` — built from
+// the gradient this field already returns and the world footprint the caller already has, so it needs
+// NO ddx() of its own. That matters, because the debug branch sits inside dynamic control flow where
+// screen-space derivatives are undefined behaviour: the same reason water.frag hoists every
+// derivative above its `underwater` branch.
+//
+// It is also strictly better than ddx(height) would be. The contours FADE OUT exactly where the field
+// stops being resolvable, instead of aliasing into moire — the same resolved-vs-unresolved test the
+// roughness itself uses, applied to the visualisation. So a flat grey distance is the *correct* read,
+// not a broken one.
+//
+// How to read it:
+//   warm  = crest (h > 0)      cool = trough (h < 0)      white = the still-water line
+//   contour density = local steepness; a noise that is contributing shows its own band of spacing
+//   flat, unbroken white       = the field is DEAD (h == 0 everywhere) — the thing worth catching
+//   saturated flat orange/blue = gain too high; wind it down until contours appear
+float3 waveHeightDebug(float3 hg, float gain, float2 dWdx, float2 dWdy)
+{
+    float hv = hg.x * gain;
+    float hw = abs(gain) * (abs(dot(hg.yz, dWdx)) + abs(dot(hg.yz, dWdy))) + 1e-8f;
+
+    // Troughs cool, crests warm, near-black at the water line. saturate() clamps past +/-1, so the
+    // gain sets the RANGE the ramp spans rather than merely its brightness — and a NEGATIVE gain
+    // swaps the two, which is the direct check that height and gradient agree in sign.
+    float3 col = (hv >= 0.0f)
+               ? lerp(float3(0.06f, 0.06f, 0.07f), float3(1.00f, 0.58f, 0.10f), saturate(hv))
+               : lerp(float3(0.06f, 0.06f, 0.07f), float3(0.10f, 0.42f, 1.00f), saturate(-hv));
+
+    // Distance to the nearest contour, IN PIXELS...
+    float ch = hv / kWaveDbgContour;
+    float d  = abs(ch - round(ch)) * kWaveDbgContour / hw;
+    // ...and the lines fade once the contours crowd closer than a pixel.
+    float lines = saturate(1.5f - d) * (1.0f - smoothstep(0.25f, 1.0f, hw / kWaveDbgContour));
+    col = lerp(col, float3(0.02f, 0.02f, 0.02f), 0.6f * lines);
+
+    // The zero crossing in white — the still-water line, and the fastest read on whether the field is
+    // alive at all.
+    col = lerp(float3(1.0f, 1.0f, 1.0f), col, smoothstep(0.0f, 1.5f * hw, abs(hv)));
+    return col;
+}
+
+#endif // WAVEFIELD_H

@@ -4869,6 +4869,20 @@ namespace RenderProcess {
         // uses R_now for everything, so the sky turns with the current camera either way.
         //
         // On the serial paths bakeEye == eyePos, so the delta is 0 and this is a no-op.
+        {
+            const float ex = DistantLand::eyePos.x - bakeEye[0];
+            const float ey = DistantLand::eyePos.y - bakeEye[1];
+            const float ez = DistantLand::eyePos.z - bakeEye[2];
+            // ...and tell the host the same delta. The pre-cancel below makes the sky camera-attached
+            // in the MAIN view, but the reflect pass mirrors it about "z = 0 camera-relative" — a
+            // plane that, like everything in the payload, is BAKE-relative. The mirror therefore
+            // re-introduces this delta DOUBLED (a reflection doubles any plane offset), and the
+            // reflected sky steps by 2*ez whenever the camera's height changes between bake and fire:
+            // walking a slope, stairs, a jump. Set unconditionally and from the SAME three
+            // subtractions the pre-cancel uses, so the host's correction and the client's can never
+            // describe different deltas. See bridge.h's skyParkEyeDelta.
+            if (g_client) { g_client->setSkyParkEyeDelta(ex, ey, ez); }
+        }
         if (skyCount > 0 && !g_skyScratch.empty()) {
             const float ex = DistantLand::eyePos.x - bakeEye[0];
             const float ey = DistantLand::eyePos.y - bakeEye[1];

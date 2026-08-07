@@ -483,6 +483,23 @@ namespace IPC {
         // Appended after the near-cell fields so every existing IN offset is unchanged.
         IN std::uint32_t clientSyncsOnFence;
 
+        // (eyeNow - bakeEye): the mode-3 PARK delta the sky payload was pre-cancelled by, in world
+        // units. Zero on the serial paths, where bakeEye == eyePos.
+        //
+        // ⚠ THE HOST CANNOT DERIVE THIS. `lighting[24..26]` (-> FrameData.lodEye) is deliberately the
+        // BAKE eye, because it has to match the relative space the payload's positions live in; the
+        // fire-time eye only ever existed folded into the restamped viewProj's translation row, which
+        // is not separable without inverting the rotation. So it has to ride the wire.
+        //
+        // Needed because the REFLECT pass mirrors the sky about "z = 0 camera-relative", and that
+        // plane is bake-relative like everything else in the payload — i.e. it sits at the BAKE
+        // camera's height. The sky pre-cancel makes the payload camera-attached in the MAIN view, and
+        // the mirror then re-introduces the delta DOUBLED (a reflection doubles any plane offset).
+        // Whenever the camera's height changes between bake and fire — walking a slope, stairs, a
+        // jump — the reflected sky steps by 2*dz. Appended after clientSyncsOnFence so every existing
+        // IN offset is unchanged.
+        IN float skyParkEyeDelta[4];
+
         OUT std::uint32_t bytesWritten;
         OUT double renderMs;             // host-side render+readback time
 

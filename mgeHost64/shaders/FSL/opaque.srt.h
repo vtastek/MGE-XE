@@ -212,7 +212,19 @@ BEGIN_SRT_NO_AB(SrtData)
         // offsets — opaque/skinned/multimap/sky frags never sample these (harmless null tail). Bound
         // once into pPerFrameSet (stable descriptors; the refraction/reflect CONTENTS change per
         // frame, the views don't). Only water.frag reads them.
-        //   gWaterNormalVol = water_NRM.dds as a 3D animated-normal volume (rg = normal, a = height).
+        //   gWaterNormalVol = the W3 wave field: water_NRM.dds BOMBED at launch into a 1024²x32 RG8
+        //                     Texture2DArray of SLOPES (see forgerender.cpp::bakeWaterField). It is an
+        //                     ARRAY, not a Texture3D, and that is load-bearing twice over:
+        //                       - FSL ships NO SampleTex3D for D3D at all (d3d.h:621 is commented out),
+        //                         so a 3D resource can only be sampled at an EXPLICIT LOD, which
+        //                         bypasses anisotropy by definition. SampleTex2DArray exists, so the
+        //                         array gets real hardware AF through gSamplerAnisotropic for free —
+        //                         9 taps per water pixel becomes 4.
+        //                       - a Texture3D's mips reduce the SLICE axis, i.e. they low-pass the
+        //                         ANIMATION and bank temporal variance as if it were spatial roughness.
+        //                         An array's cannot.
+        //                     ⚠ An array does NOT filter across slices; water.frag lerps the two time
+        //                     slices by hand.
         //   gRefractColor   = host copy of the pre-water colour target (refraction source).
         //   gSceneLinDepth  = pLinearDepth (RAW reverse-Z DEVICE depth; near=1 far=0) for shoreline.
         //                     Filled TWICE per frame: once after the Z-prepass (near opaque + TERRAIN
@@ -221,7 +233,7 @@ BEGIN_SRT_NO_AB(SrtData)
         //                     which adds the DL statics that draw only in the colour pass. The second
         //                     fill is the version water.frag and volfog.frag sample.
         //   gReflectColor   = reflection RT (WT1 = stand-in / unused; WT2 fills it with the mirror pass).
-        DECL_TEXTURE(PerFrame, Tex3D(float4), gWaterNormalVol)
+        DECL_TEXTURE(PerFrame, Tex2DArray(float4), gWaterNormalVol)
         DECL_TEXTURE(PerFrame, Tex2D(float4), gRefractColor)
         DECL_TEXTURE(PerFrame, Tex2D(float4), gSceneLinDepth)
         DECL_TEXTURE(PerFrame, Tex2D(float4), gReflectColor)
@@ -354,6 +366,42 @@ BEGIN_SRT_NO_AB(SrtData)
         //
         // Appended AFTER gSunOcc — append only, see the note above gSkyHeight.
         DECL_TEXTURE(PerFrame, Tex2D(float4), gSkyColor)
+        // WT4d/P2: the PRE-FILTERED planar reflection — pReflectColor box-averaged into a 6-level
+        // mip chain by reflectmip.comp. Water is the host's first PBR material, and roughness is
+        // only meaningful if the reflection LOD and the specular lobe width are the SAME number;
+        // this is the reflection half of that. Sampled with gSamplerTrilinearClamp (s4) at
+        // log2(alpha * kReflectSize * scale), so calm water still resolves to LOD 0 = a sharp
+        // mirror. A SEPARATE texture from gReflectColor because that RT's format and PSO are shared
+        // with the main colour pass (see reflectmip.srt.h); it falls back to gReflectColor's own
+        // texture if the pyramid failed to build, which is the pre-WT4d image.
+        //
+        // Read by water.frag ONLY, bound ONLY into the main pPerFrameSet — the same arrangement as
+        // the four WT1 water SRVs above, and a harmless null tail on every other instance.
+        // Appended AFTER gSkyColor — append only, see the note above gSkyHeight.
+        DECL_TEXTURE(PerFrame, Tex2D(float4), gReflectMips)
+        // ...and the ROUGHNESS half of the same feature: the sub-texel slope VARIANCE of the wave
+        // field, per texel per mip, over a box chain built alongside it (Olano-Baker LEAN/CLEAN).
+        // One scalar per texel (R16F), so it is declared float, not float4.
+        //
+        // ⚠ HALF RESOLUTION AND ONE LEVEL SHORT, deliberately. sigma²(0) is identically ZERO by
+        // construction (a single texel has no internal variance), so storing it is pure waste: this
+        // array's levels 0..7 ARE the 1024² field's levels 1..8, and water.frag reconstructs the whole
+        // sub-level-1 range from the known V(0) = 0 with NO extra sample. 179 MB -> 111 MB.
+        //
+        // ⚠ THE FINISHED VARIANCE, not the second moment. sigma² = E[|s|²] - |E[s]|² is evaluated on
+        // the CPU at load, where both operands are exact. It must NOT be reassembled here from two
+        // sampled moments: bilerp(|s|²) - |bilerp(s)|² is the bilinear-weighted variance (Jensen),
+        // which is nonzero even at mip 0, oscillates with sub-texel position, and vanishes exactly
+        // at texel centres — so it reads as blur-up-close, pulsing, and a texel-aligned GRID of
+        // sharper lines. All three were observed. See the long note in water.frag.fsl.
+        //
+        // Read by water.frag ONLY; bound ONLY into the main pPerFrameSet. If the companion volume
+        // failed to build this slot is left UNBOUND, which reads zero — and zero variance degrades
+        // to exactly the base roughness. No flag and no fallback binding: deliberately NOT a
+        // stand-in texture, since a 2D or float4 resource in a Tex2DArray(float) slot is the type
+        // mismatch the gWaterNormalVol comment above already calls illegal.
+        // Appended AFTER gReflectMips — append only, see the note above gSkyHeight.
+        DECL_TEXTURE(PerFrame, Tex2DArray(float), gWaterSlopeVar)
     END_SRT_SET(PerFrame)
     // Point-light cbuffer — rides the otherwise-unused PerDraw set (FSL has exactly four
     // fixed update frequencies: Persistent/PerFrame/PerBatch/PerDraw; a custom set name has
