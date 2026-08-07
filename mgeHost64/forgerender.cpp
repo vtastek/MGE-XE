@@ -58,6 +58,10 @@
 // allocator macros mangling the system header.
 #include <d3d12sdklayers.h>
 #endif
+// TinyImageFormat_ToDXGI_FORMAT: the TYPED DXGI format a Forge RenderTarget was declared with.
+// Needed by the ResolveSubresource sites, which must be handed a typed format — reading it back
+// off the D3D12 resource instead is what removed the device (see snapshotColorTarget).
+#include "Resources/ResourceLoader/ThirdParty/OpenSource/tinyimageformat/tinyimageformat_apis.h"
 // IMemory.h overrides new/delete/malloc — Forge convention: include it LAST.
 #include "Utilities/Interfaces/IMemory.h"
 // M1c opaque-scene SRT. defaults.h provides the C++ definitions of the FSL macros
@@ -1120,6 +1124,25 @@ namespace {
         uint32_t        sampleCount = 1;
         RenderTarget*   pMSAAColor = nullptr;     // internal MSAA color (null when sampleCount==1)
         uint32_t        anisoLevel = 0;           // texture sampler max anisotropy (0 = linear); Phase 2
+
+        // --- SCENE COLOUR FORMAT (tasks/forge-postprocess.md step 4: the fp16 bandwidth probe) ------
+        // The format the scene is RENDERED in, as opposed to pRT->mFormat, which is what the scene is
+        // DELIVERED in. They were the same value until fp16, and ~14 pipelines had hard-wired the
+        // delivery format because of it.
+        //
+        // Everything that shares a PSO must share this format, and that set is bigger than it looks:
+        // pSkyPipeline draws into pMSAAColor in the main pass AND into pReflectColor in the mirror
+        // pass, so the reflection RT is NOT a free choice — it moves with the scene. The copy/resolve
+        // destinations follow for the same reason (a resolve's src and dst formats must match):
+        //   pMSAAColor, pReflectColor, pRefractColor, pSkyColor, pReflectSkyColor.
+        // pRT / pSharedRes stay B8G8R8A8 — that is the cross-process contract, and converting into it
+        // is precisely what the shader resolve exists to do.
+        //
+        // ⚠ REQUIRES MSAA. At sampleCount==1 the scene renders STRAIGHT into pRT (there is no internal
+        // colour target and no resolve pass to convert in), so there is nowhere for a wider format to
+        // live. Step 6 has to decide whether the 1x path gets its own staging target or whether HDR
+        // simply requires MSAA; until then this silently stays LDR at 1x rather than failing.
+        TinyImageFormat sceneColorFormat = TinyImageFormat_B8G8R8A8_UNORM;
 
         // --- M1c opaque scene path (GPU-driven: one PerFrame set, structured buffer) ---
         RenderTarget*  pDepth = nullptr;          // depth buffer for the scene
@@ -3504,7 +3527,7 @@ namespace {
         GraphicsPipelineDesc& wg = wPd.mGraphicsDesc;
         wg.mPrimitiveTopo = PRIMITIVE_TOPO_TRI_LIST;
         wg.mRenderTargetCount = 1;
-        wg.pColorFormats = &g_live.pRT->mFormat;
+        wg.pColorFormats = &g_live.sceneColorFormat;
         wg.mSampleCount = (SampleCount)g_live.sampleCount;
         wg.mSampleQuality = 0;
         wg.mDepthStencilFormat = TinyImageFormat_D32_SFLOAT;
@@ -3567,7 +3590,10 @@ namespace {
             cDesc.mArraySize = 1;
             cDesc.mMipLevels = 1;
             cDesc.mSampleCount = (SampleCount)g_live.sampleCount;
-            cDesc.mFormat = TinyImageFormat_B8G8R8A8_UNORM;   // same as pRT → resolve is format-compatible
+            // The SCENE format, which is pRT's only while LDR. Once it is fp16 the hardware resolve
+            // into the BGRA8 shared RT is illegal (a resolve cannot format-convert) and the shader
+            // resolve becomes mandatory rather than optional — enforced at the resolve site.
+            cDesc.mFormat = g_live.sceneColorFormat;
             cDesc.mStartState = RESOURCE_STATE_RENDER_TARGET;
             cDesc.mClearValue.r = 0.0f;
             cDesc.mClearValue.g = 0.0f;
@@ -4082,7 +4108,7 @@ namespace {
         GraphicsPipelineDesc& g = pd.mGraphicsDesc;
         g.mPrimitiveTopo = PRIMITIVE_TOPO_TRI_LIST;
         g.mRenderTargetCount = 1;
-        g.pColorFormats = &g_live.pRT->mFormat;   // B8G8R8A8 — same for pRT and the MSAA color
+        g.pColorFormats = &g_live.sceneColorFormat;   // scene format; == pRT's only while LDR
         g.mSampleCount = (SampleCount)g_live.sampleCount;
         g.mSampleQuality = 0;
         g.mDepthStencilFormat = TinyImageFormat_D32_SFLOAT;
@@ -4852,7 +4878,7 @@ namespace {
             GraphicsPipelineDesc& sg = skPd.mGraphicsDesc;
             sg.mPrimitiveTopo = PRIMITIVE_TOPO_TRI_LIST;
             sg.mRenderTargetCount = 1;
-            sg.pColorFormats = &g_live.pRT->mFormat;
+            sg.pColorFormats = &g_live.sceneColorFormat;
             sg.mSampleCount = (SampleCount)g_live.sampleCount;
             sg.mSampleQuality = 0;
             sg.mDepthStencilFormat = TinyImageFormat_D32_SFLOAT;
@@ -5042,7 +5068,7 @@ namespace {
                 GraphicsPipelineDesc& skag = skaPd.mGraphicsDesc;
                 skag.mPrimitiveTopo = PRIMITIVE_TOPO_TRI_LIST;
                 skag.mRenderTargetCount = 1;
-                skag.pColorFormats = &g_live.pRT->mFormat;
+                skag.pColorFormats = &g_live.sceneColorFormat;
                 skag.mSampleCount = (SampleCount)g_live.sampleCount;
                 skag.mSampleQuality = 0;
                 skag.mDepthStencilFormat = TinyImageFormat_D32_SFLOAT;
@@ -5246,7 +5272,7 @@ namespace {
             GraphicsPipelineDesc& mg = mmPd.mGraphicsDesc;
             mg.mPrimitiveTopo = PRIMITIVE_TOPO_TRI_LIST;
             mg.mRenderTargetCount = 1;
-            mg.pColorFormats = &g_live.pRT->mFormat;
+            mg.pColorFormats = &g_live.sceneColorFormat;
             mg.mSampleCount = (SampleCount)g_live.sampleCount;
             mg.mSampleQuality = 0;
             mg.mDepthStencilFormat = TinyImageFormat_D32_SFLOAT;
@@ -5438,7 +5464,7 @@ namespace {
                 GraphicsPipelineDesc& mmag = mmaPd.mGraphicsDesc;
                 mmag.mPrimitiveTopo     = PRIMITIVE_TOPO_TRI_LIST;
                 mmag.mRenderTargetCount = 1;
-                mmag.pColorFormats      = &g_live.pRT->mFormat;
+                mmag.pColorFormats      = &g_live.sceneColorFormat;
                 mmag.mSampleCount       = (SampleCount)g_live.sampleCount;
                 mmag.mSampleQuality     = 0;
                 mmag.mDepthStencilFormat = TinyImageFormat_D32_SFLOAT;
@@ -5535,7 +5561,7 @@ namespace {
             GraphicsPipelineDesc& sg = skPd.mGraphicsDesc;
             sg.mPrimitiveTopo = PRIMITIVE_TOPO_TRI_LIST;
             sg.mRenderTargetCount = 1;
-            sg.pColorFormats = &g_live.pRT->mFormat;
+            sg.pColorFormats = &g_live.sceneColorFormat;
             sg.mSampleCount = (SampleCount)g_live.sampleCount;
             sg.mSampleQuality = 0;
             sg.mDepthStencilFormat = TinyImageFormat_D32_SFLOAT;
@@ -5646,7 +5672,7 @@ namespace {
             GraphicsPipelineDesc& dg = dlPd.mGraphicsDesc;
             dg.mPrimitiveTopo = PRIMITIVE_TOPO_LINE_LIST;
             dg.mRenderTargetCount = 1;
-            dg.pColorFormats = &g_live.pRT->mFormat;
+            dg.pColorFormats = &g_live.sceneColorFormat;
             dg.mSampleCount = (SampleCount)g_live.sampleCount;
             dg.mSampleQuality = 0;
             dg.mDepthStencilFormat = TinyImageFormat_D32_SFLOAT;
@@ -5709,7 +5735,7 @@ namespace {
             GraphicsPipelineDesc& sag = savPd.mGraphicsDesc;
             sag.mPrimitiveTopo = PRIMITIVE_TOPO_TRI_LIST;
             sag.mRenderTargetCount = 1;
-            sag.pColorFormats = &g_live.pRT->mFormat;
+            sag.pColorFormats = &g_live.sceneColorFormat;
             sag.mSampleCount = (SampleCount)g_live.sampleCount;
             sag.mSampleQuality = 0;
             sag.pDepthState = &savDepth;
@@ -5833,6 +5859,10 @@ namespace {
                     GraphicsPipelineDesc& rsg = rsPd.mGraphicsDesc;
                     rsg.mPrimitiveTopo     = PRIMITIVE_TOPO_TRI_LIST;
                     rsg.mRenderTargetCount = 1;
+                    // pRT, NOT sceneColorFormat — this pass is the one that CONVERTS. Its source is
+                    // the (possibly fp16) MSAA target bound as an SRV; its destination is the BGRA8
+                    // shared RT. Pointing it at the scene format is the single edit that would make
+                    // fp16 fail at the last hop, so it is spelled out rather than left to match.
                     rsg.pColorFormats      = &g_live.pRT->mFormat;
                     rsg.mSampleCount       = SAMPLE_COUNT_1;   // destination is the RESOLVED target
                     rsg.mSampleQuality     = 0;
@@ -5911,7 +5941,7 @@ namespace {
             GraphicsPipelineDesc& ag = apd.mGraphicsDesc;
             ag.mPrimitiveTopo = PRIMITIVE_TOPO_TRI_LIST;
             ag.mRenderTargetCount = 1;
-            ag.pColorFormats = &g_live.pRT->mFormat;
+            ag.pColorFormats = &g_live.sceneColorFormat;
             ag.mSampleCount = (SampleCount)g_live.sampleCount;
             ag.mSampleQuality = 0;
             ag.mDepthStencilFormat = TinyImageFormat_D32_SFLOAT;
@@ -6129,7 +6159,7 @@ namespace {
                 rd.mWidth = width; rd.mHeight = height; rd.mDepth = 1;
                 rd.mArraySize = 1; rd.mMipLevels = 1;
                 rd.mSampleCount = SAMPLE_COUNT_1;
-                rd.mFormat = TinyImageFormat_B8G8R8A8_UNORM;       // matches the shared RT
+                rd.mFormat = g_live.sceneColorFormat;              // resolve/copy SOURCE is the scene target
                 rd.mStartState = RESOURCE_STATE_SHADER_RESOURCE;
                 rd.mDescriptors = DESCRIPTOR_TYPE_TEXTURE;
                 rd.pName = "refractColor";
@@ -6152,7 +6182,7 @@ namespace {
                 sd.mWidth = width; sd.mHeight = height; sd.mDepth = 1;
                 sd.mArraySize = 1; sd.mMipLevels = 1;
                 sd.mSampleCount = SAMPLE_COUNT_1;
-                sd.mFormat = TinyImageFormat_B8G8R8A8_UNORM;
+                sd.mFormat = g_live.sceneColorFormat;              // snapshotColorTarget src == scene target
                 sd.mStartState = RESOURCE_STATE_SHADER_RESOURCE;
                 sd.mDescriptors = DESCRIPTOR_TYPE_TEXTURE;
                 sd.pName = "skyColor";
@@ -6266,7 +6296,11 @@ namespace {
             RenderTargetDesc rcd = {};
             rcd.mWidth = kReflectSize; rcd.mHeight = kReflectSize; rcd.mDepth = 1;
             rcd.mArraySize = 1; rcd.mMipLevels = 1; rcd.mSampleCount = SAMPLE_COUNT_1;
-            rcd.mFormat = TinyImageFormat_B8G8R8A8_UNORM;
+            // NOT a free choice: pSkyPipeline (and the DL/near colour PSOs) draw into pMSAAColor in
+            // the main pass and into THIS target in the mirror pass, so one PSO spans both and their
+            // colour formats must agree. "HDR water is forced, not optional" in forge-postprocess.md
+            // turns out to be a PSO-sharing fact, not just a look preference.
+            rcd.mFormat = g_live.sceneColorFormat;
             rcd.mStartState = RESOURCE_STATE_SHADER_RESOURCE;   // resting; pass flips to RENDER_TARGET
             rcd.mClearValue.r = 0.0f;
             rcd.mClearValue.g = 0.0f;
@@ -8516,12 +8550,41 @@ namespace {
     //
     // 4.0 is A/B'd, not inherited: MJP ships 2.0, the ask here was 6.0, and in-game 6 was "pretty
     // costly" while 2 read sharper — 4 is where distant alpha-test edges smooth out with textures
-    // still crisp. [[project_forge_prior_art_constants_dont_transfer]] is the rule this follows:
+    // still crisp. [[feedback_prior_art_constants_dont_transfer]] is the rule this follows:
     // port the mechanism, re-derive the value.
     float    g_resolveDiameter = 4.0f;
     // Karis 1/(1+luma) weighting. Weak in LDR by construction (samples are already tonemapped into
     // [0,1]); it is here so the HDR switch at step 6 is a format change and nothing else.
     bool     g_resolveInvLuma  = true;
+
+    // --- fp16 scene colour (tasks/forge-postprocess.md step 4: the bandwidth probe) ---------------
+    // Renders the scene into R16G16B16A16_SFLOAT instead of B8G8R8A8_UNORM, with the shader resolve
+    // converting back into the BGRA8 shared RT on the way out. Nothing else changes: no tonemap
+    // move, no linear migration, no constant retuned. The delta in the `gpu split` is therefore
+    // HDR's floor price, in isolation, which is the entire point of doing it as its own step.
+    //
+    // NOT a live A/B — unlike every other knob in this block. Formats are baked into render targets
+    // and PSOs at init, so flipping it needs a host restart, which is already the workflow for
+    // graphics-shader changes. Compare against the previous BUILD, not against a checkbox.
+    //
+    // ⚠ IT IS NOT GUARANTEED NEUTRAL, and the plan said it would be ("values still live in [0,2.2];
+    // the format just wastes precision"). That is wrong in one direction: B8G8R8A8_UNORM CLAMPS
+    // every write to [0,1], so anything the frame currently pushes past 1.0 — additive sky glare,
+    // emissive, blend accumulation — is being clipped by the format today and will survive at fp16.
+    // Expect bright and additive areas to read hotter, and expect APL to RISE. That rise is not a
+    // bug and not noise: it is a direct measurement of how much of the frame the 8-bit container was
+    // eating, which is exactly the quantity the HDR work exists to recover.
+    // ⚠ OFF, AND THE MEASUREMENT SAYS IT SHOULD STAY OFF UNTIL STEP 6.
+    // In-game 2026-08-07 the fp16 frame looked IDENTICAL to the LDR one. That is the whole finding:
+    // nothing in the frame is being clipped by B8G8R8A8_UNORM today, because tonemap() already maps
+    // into [0,1] inside each colour pass BEFORE the write. So the wider target currently carries no
+    // information the narrow one did not — it is pure cost (+0.18 ms interior, +0.30 exterior, all
+    // in `color` and `water`), and the user felt it in play.
+    //
+    // fp16 only starts paying when the tonemap RELOCATES into the resolve and the passes write
+    // linear HDR instead. That is step 6, and this flag is its switch. The plumbing below stays
+    // because it is correct and verified behaviour-neutral in LDR — turning it on is one bool.
+    bool     g_hdrSceneColor   = false;
 
     // AO contribution toggles → FrameData.debugParams.w bitmask (bit0 AO, bit1 bent normal, bit2 ambient=white).
     // These two now ARM the AO dispatch as well as consume it (renderScene derives the dispatch gate
@@ -9232,6 +9295,11 @@ namespace {
           t.checkbox("Custom resolve (off = hardware ResolveSubresource)", &g_customResolve);
           t.sliderF("Filter diameter (px; 6 = 7x7, 4 = 5x5, 2 = 3x3)", &g_resolveDiameter, 1.0f, 6.0f, 0.5f);
           t.checkbox("Inverse-luminance firefly weighting", &g_resolveInvLuma);
+          // BISECT 2026-08-07: a read-only t.label() line lived here reporting the scene format.
+          // t.label() had ZERO other callers in this file — the helper existed but had never been
+          // executed — and the build carrying it crashed on a null D3D12 buffer resource in an
+          // unrelated subsystem. Removed as the first bisect step; restore only once the crash is
+          // understood, and the format is in the log as `>> [scenefmt]` regardless.
           t.flush(); }
 
         // -- Tab: Alpha (sorted-alpha takeover debug) --
@@ -9821,6 +9889,11 @@ namespace ForgeRender {
         uint32_t reqSamples = sampleCount < 1 ? 1u : sampleCount;
         if (reqSamples > 1) {
             D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS msq = {};
+            // Queried against the DELIVERY format, while the MSAA target the answer authorises is
+            // created in sceneColorFormat (decided below, once sampleCount is known — hence the
+            // order). Sound in practice because D3D12 feature level 11_0 mandates 4x MSAA for both
+            // B8G8R8A8_UNORM and R16G16B16A16_FLOAT, so BGRA8 passing implies fp16 passing. If a
+            // scene format is ever chosen that is NOT mandatory-MSAA, this query has to move.
             msq.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
             msq.SampleCount = reqSamples;
             HRESULT qr = R->mDx.pDevice->CheckFeatureSupport(
@@ -9919,6 +9992,24 @@ namespace ForgeRender {
         rtDesc.pNativeHandle = (void*)g_live.pSharedRes;
         rtDesc.pName = "liveSharedRT";
         addRenderTarget(R, &rtDesc, &g_live.pRT);
+
+        // Decide the SCENE colour format now — before any render target or pipeline is built, since
+        // both bake it in. See the sceneColorFormat declaration for which resources have to follow it
+        // and why the reflection RT is one of them. MSAA-gated: at 1x there is no internal colour
+        // target to be wide, so the request is dropped rather than half-applied.
+        if (g_live.pRT) {
+            const bool wantHdr = g_hdrSceneColor && (g_live.sampleCount > 1);
+            g_live.sceneColorFormat = wantHdr ? TinyImageFormat_R16G16B16A16_SFLOAT
+                                              : g_live.pRT->mFormat;
+            LOG::logline(">> [scenefmt] %s (requested=%d sampleCount=%u) — deliver=B8G8R8A8_UNORM",
+                         wantHdr ? "R16G16B16A16_SFLOAT" : "B8G8R8A8_UNORM",
+                         (int)g_hdrSceneColor, g_live.sampleCount);
+            LOG::flush();
+            if (g_hdrSceneColor && g_live.sampleCount <= 1) {
+                std::printf("[forge] fp16 scene colour requested but MSAA is OFF — staying LDR "
+                            "(no internal colour target at 1x)\n");
+            }
+        }
 
         g_live.pPipeline = buildTrianglePipeline(R, g_live.pRT, g_live.pShader);
         if (!g_live.pPipeline) {
@@ -10208,7 +10299,20 @@ namespace ForgeRender {
         pre[1].Transition.StateAfter  = msaa ? D3D12_RESOURCE_STATE_RESOLVE_DEST
                                              : D3D12_RESOURCE_STATE_COPY_DEST;
         cl->ResourceBarrier(2, pre);
-        if (msaa) { cl->ResolveSubresource(dstRes, 0, srcRes, 0, DXGI_FORMAT_B8G8R8A8_UNORM); }
+        // Take the format from the SOURCE rather than naming it. src and dst are both scene-format
+        // targets (pMSAAColor→pSkyColor, pReflectColor→pReflectSkyColor), and hard-coding BGRA8 here
+        // is one of the five places the fp16 flip would otherwise break silently.
+        //
+        // ⚠ FROM THE FORGE OBJECT, *NOT* `srcRes->GetDesc().Format`. That was the first attempt and it
+        // recorded an INVALID resolve: the D3D12 resource is not guaranteed to carry the typed format
+        // the RenderTarget was declared with, and a resolve needs a typed one. The failure mode is
+        // worth remembering because it names nothing useful — `Close()` returns E_INVALIDARG, the
+        // device is removed, and the first symptom is a NULL D3D12 resource crashing an unrelated
+        // subsystem several calls later ([[project_forge_close_einvalidarg]]).
+        if (msaa) {
+            cl->ResolveSubresource(dstRes, 0, srcRes, 0,
+                                   (DXGI_FORMAT)TinyImageFormat_ToDXGI_FORMAT(src->mFormat));
+        }
         else      { cl->CopyResource(dstRes, srcRes); }
         D3D12_RESOURCE_BARRIER post[2] = {};
         post[0] = pre[0];
@@ -14564,7 +14668,7 @@ namespace ForgeRender {
                                                      : D3D12_RESOURCE_STATE_COPY_DEST;
                 cl->ResourceBarrier(2, pre);
             }
-            if (msaa) { cl->ResolveSubresource(refrRes, 0, colRes, 0, DXGI_FORMAT_B8G8R8A8_UNORM); }
+            if (msaa) { cl->ResolveSubresource(refrRes, 0, colRes, 0, (DXGI_FORMAT)TinyImageFormat_ToDXGI_FORMAT(colorTarget->mFormat)); }
             else      { cl->CopyResource(refrRes, colRes); }
             {
                 D3D12_RESOURCE_BARRIER post[2] = {};
@@ -15720,6 +15824,22 @@ namespace ForgeRender {
         //
         // It has to exist before HDR can: a hardware resolve cannot format-convert, so the moment
         // pMSAAColor goes fp16 this is the only path left. See resolve.srt.h.
+        // ⚠ ONCE THE SCENE IS fp16 THE FALLBACK BELOW IS ILLEGAL. ResolveSubresource cannot convert
+        // R16G16B16A16_SFLOAT into the BGRA8 shared RT, so the shader path stops being a preference
+        // and becomes the only legal way to finish a frame. Override the A/B checkbox rather than
+        // letting it emit a call the debug layer rejects (and the release runtime turns into a
+        // removed device), and say so once so "my resolve toggle won't stay off" has an explanation.
+        const bool convertingResolve = (g_live.sceneColorFormat != g_live.pRT->mFormat);
+        if (convertingResolve && !g_customResolve) {
+            static bool s_forcedOnce = false;
+            if (!s_forcedOnce) {
+                s_forcedOnce = true;
+                LOG::logline(">> [resolve] scene colour is fp16 — the hardware resolve cannot convert; "
+                             "custom resolve FORCED on (the A/B is a rebuild, not a checkbox)");
+                LOG::flush();
+            }
+            g_customResolve = true;
+        }
         const bool shaderResolve = g_customResolve && (g_live.sampleCount > 1)
                                 && g_live.pResolvePipeline && g_live.pResolveSet
                                 && g_live.pResolveParamsCbv && g_live.pMSAAColor;
@@ -15789,10 +15909,15 @@ namespace ForgeRender {
             toCommon.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
             toCommon.Transition.StateAfter  = D3D12_RESOURCE_STATE_COMMON;   // hand off to D3D9Ex
             cl->ResourceBarrier(1, &toCommon);
-        } else if (g_live.sampleCount > 1) {
+        } else if (g_live.sampleCount > 1 && !convertingResolve) {
             // MSAA: resolve the multisampled color into the shared single-sample RT, then leave
             // the shared RT in COMMON for MW's D3D9Ex StretchRect. Forge has no RESOLVE resource
             // states, so this is driven natively (the shared RT is already managed natively).
+            //
+            // !convertingResolve is a hard gate, not a tidy-up: reaching here at fp16 means the
+            // shader resolve failed to BUILD, and the right answer then is a stale frame (the final
+            // else) rather than an illegal resolve. The format check is what keeps a non-fatal
+            // pipeline failure non-fatal.
             ID3D12GraphicsCommandList* cl = g_live.pCmd->mDx.pCmdList;
             ID3D12Resource* msaaRes = g_live.pMSAAColor->pTexture->mDx.pResource;
             ID3D12Resource* dstRes  = g_live.pSharedRes;
@@ -15840,6 +15965,18 @@ namespace ForgeRender {
             cl->ResourceBarrier(1, &toCommon);
         } else {
             // No MSAA: dev overlay into pRT (still RENDER_TARGET), then hand back to COMMON for StretchRect.
+            // ALSO the degraded fp16 case (MSAA on, converting, shader resolve unavailable): pRT never
+            // receives the scene this frame, so the seam shows a stale image with the overlay on top.
+            // Visibly wrong and diagnosable from the log, which beats losing the device.
+            if (g_live.sampleCount > 1) {
+                static bool s_noPathOnce = false;
+                if (!s_noPathOnce) {
+                    s_noPathOnce = true;
+                    LOG::logline(">> [resolve] MSAA %ux + fp16 scene but NO shader resolve pipeline — "
+                                 "frame NOT delivered (stale composite)", g_live.sampleCount);
+                    LOG::flush();
+                }
+            }
             drawDevUI();
             RenderTargetBarrier toCommon = {};
             toCommon.pRenderTarget = g_live.pRT;
@@ -17813,7 +17950,7 @@ namespace ForgeRender {
         GraphicsPipelineDesc& g = pd.mGraphicsDesc;
         g.mPrimitiveTopo      = PRIMITIVE_TOPO_TRI_LIST;
         g.mRenderTargetCount  = 1;
-        g.pColorFormats       = &g_live.pRT->mFormat;
+        g.pColorFormats       = &g_live.sceneColorFormat;
         g.mSampleCount        = (SampleCount)g_live.sampleCount;
         g.mSampleQuality      = 0;
         g.mDepthStencilFormat = TinyImageFormat_D32_SFLOAT;
@@ -18672,7 +18809,7 @@ namespace ForgeRender {
         GraphicsPipelineDesc& g = pd.mGraphicsDesc;
         g.mPrimitiveTopo = PRIMITIVE_TOPO_TRI_LIST;
         g.mRenderTargetCount = 1;
-        g.pColorFormats = &g_live.pRT->mFormat;
+        g.pColorFormats = &g_live.sceneColorFormat;
         g.mSampleCount = (SampleCount)g_live.sampleCount;
         g.mSampleQuality = 0;
         g.mDepthStencilFormat = TinyImageFormat_D32_SFLOAT;
@@ -19297,7 +19434,7 @@ namespace ForgeRender {
         GraphicsPipelineDesc& g = pd.mGraphicsDesc;
         g.mPrimitiveTopo = PRIMITIVE_TOPO_TRI_LIST;
         g.mRenderTargetCount = 1;
-        g.pColorFormats = &g_live.pRT->mFormat;
+        g.pColorFormats = &g_live.sceneColorFormat;
         g.mSampleCount = (SampleCount)g_live.sampleCount;
         g.mSampleQuality = 0;
         g.mDepthStencilFormat = TinyImageFormat_D32_SFLOAT;
@@ -19427,7 +19564,7 @@ namespace ForgeRender {
             GraphicsPipelineDesc& g = pd.mGraphicsDesc;
             g.mPrimitiveTopo = PRIMITIVE_TOPO_TRI_LIST;
             g.mRenderTargetCount = 1;
-            g.pColorFormats = &g_live.pRT->mFormat;
+            g.pColorFormats = &g_live.sceneColorFormat;
             g.mSampleCount = (SampleCount)g_live.sampleCount;
             g.mSampleQuality = 0;
             g.mDepthStencilFormat = TinyImageFormat_D32_SFLOAT;
@@ -19750,7 +19887,7 @@ namespace ForgeRender {
                                                  : D3D12_RESOURCE_STATE_COPY_DEST;
             cl->ResourceBarrier(2, pre);
         }
-        if (msaa) { cl->ResolveSubresource(refrRes, 0, colRes, 0, DXGI_FORMAT_B8G8R8A8_UNORM); }
+        if (msaa) { cl->ResolveSubresource(refrRes, 0, colRes, 0, (DXGI_FORMAT)TinyImageFormat_ToDXGI_FORMAT(colorTarget->mFormat)); }
         else      { cl->CopyResource(refrRes, colRes); }
         {
             D3D12_RESOURCE_BARRIER post[2] = {};
@@ -20447,6 +20584,12 @@ namespace ForgeRender {
         const uint32_t viewSamples = Configuration.AALevel > 0 ? (uint32_t)Configuration.AALevel : 1u;
         const uint32_t viewAniso   = (uint32_t)Configuration.AnisoLevel;
         std::printf("[forge][view] AA=%ux  AF=%ux (from MGE.ini)\n", viewSamples, viewAniso);
+        // The viewer stays LDR. It resolves the MSAA colour straight into its own BGRA8 swapchain
+        // backbuffer with the hardware resolve, which cannot format-convert — the same constraint
+        // that forced the shader resolve on the live path. Giving the viewer the shader resolve too
+        // is the fix, and tasks/forge-postprocess.md parks that decision at step 6 rather than
+        // spending it inside a bandwidth probe. Until then the viewer shows the LDR image.
+        g_hdrSceneColor = false;
         if (!init(W, H, viewSamples, viewAniso)) { std::printf("[forge][view] init FAILED\n"); return false; }
         Renderer* R = g_live.pRenderer;
 
@@ -20770,7 +20913,10 @@ namespace ForgeRender {
                 pre[1].Transition.StateAfter  = D3D12_RESOURCE_STATE_RESOLVE_DEST;
                 cl->ResourceBarrier(2, pre);
 
-                cl->ResolveSubresource(bbRes, 0, msaaRes, 0, DXGI_FORMAT_B8G8R8A8_UNORM);
+                // Legal only because worldViewer() forces the scene format back to LDR before init —
+                // this destination is the viewer's own BGRA8 swapchain and a resolve cannot convert.
+                cl->ResolveSubresource(bbRes, 0, msaaRes, 0,
+                                       (DXGI_FORMAT)TinyImageFormat_ToDXGI_FORMAT(g_live.pMSAAColor->mFormat));
 
                 D3D12_RESOURCE_BARRIER post[2] = {};
                 post[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;

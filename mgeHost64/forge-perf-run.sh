@@ -82,11 +82,20 @@ echo "[harness] start offset = $startlines lines; want $SAMPLES new 'gpu split' 
 # The render-scale override has to be set INSIDE the same powershell that calls Start-Process:
 # exporting it from bash does not cross the WSL->Win32 boundary without WSLENV, and a var that
 # silently fails to arrive would report the wrong resolution's numbers under the right label.
+# MGE_RDOC makes main.cpp LoadLibrary renderdoc.dll BEFORE device creation, so the measured host
+# runs with RenderDoc hooking every D3D12 call. That is a perf confound of unknown, probably
+# non-uniform size (same class as the EcoQoS throttle above), and its crash handler swallows faults
+# into a modal dialog no one can click during a minimized run. It was left set as a persistent USER
+# variable on 2026-08-04 and silently rode along in every measurement for three days. Stripped HERE
+# rather than trusted to the ambient environment, because clearing the registry value does NOT fix
+# an already-running WSL session: interop hands Windows children a cached env block, so the stale
+# MGE_RDOC=1 keeps arriving until WSL restarts. Set it deliberately if you want a capture.
+RDOC_STRIP="Remove-Item Env:MGE_RDOC -ErrorAction SilentlyContinue; "
 if [ -n "$SCALE" ]; then
   echo "[harness] render scale = ${SCALE}x (MGE_RENDER_SCALE)"
-  powershell.exe -Command "\$env:MGE_RENDER_SCALE='$SCALE'; Start-Process -FilePath 'Morrowind.exe' -WorkingDirectory 'C:\\mgem\\morrowind64' -WindowStyle Minimized" >/dev/null 2>&1
+  powershell.exe -Command "${RDOC_STRIP}\$env:MGE_RENDER_SCALE='$SCALE'; Start-Process -FilePath 'Morrowind.exe' -WorkingDirectory 'C:\\mgem\\morrowind64' -WindowStyle Minimized" >/dev/null 2>&1
 else
-  powershell.exe -Command "Start-Process -FilePath 'Morrowind.exe' -WorkingDirectory 'C:\\mgem\\morrowind64' -WindowStyle Minimized" >/dev/null 2>&1
+  powershell.exe -Command "${RDOC_STRIP}Start-Process -FilePath 'Morrowind.exe' -WorkingDirectory 'C:\\mgem\\morrowind64' -WindowStyle Minimized" >/dev/null 2>&1
 fi
 echo "[harness] launched Morrowind; polling..."
 
