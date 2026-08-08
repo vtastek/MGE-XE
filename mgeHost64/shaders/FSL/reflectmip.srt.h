@@ -33,12 +33,38 @@
 // the set object, so distinct sets at the same root index always rebind (Direct3D12.c:4685).
 // Resource names are unique across all merged compute SRTs (house rule since the d3d.py aliasing
 // bug), and there is exactly ONE SRT per header ([[project_forge_srt_one_per_header]]).
+// ⚠ W5: THE FIRST PASS IS ALSO THE MIRROR PASS'S RESOLVE. pReflectColor/pReflectDepth are MSAA at
+// g_live.sampleCount now, because the reflection was being sampled ~48x more coarsely than the colour
+// pass for the same field of view (1024² x1 against 4096x3072 x4) and 1x geometric edges fold into
+// LOW frequencies, which no amount of downstream mip filtering can undo. Two SAMPLE_COUNT variants
+// (hizfirst's pattern — Tex2DMS needs the count as a literal); the reduce stays single-variant
+// because it only ever reads the already-resolved pyramid.
+//
+// gReflDepthDst is a single-sample copy of the mirror depth, for water.frag's W4c hit-distance term
+// (`1 - dist/D_refl`). It exists so water.frag does NOT have to become a two-variant graphics shader
+// to read an MSAA depth: this dispatch already covers mip-0 dimensions exactly, so the resolve is
+// free here and costs one 1024² R32F.
+// ⚠ Depth takes SAMPLE 0, not an average — averaging depth across a silhouette yields a distance that
+// exists nowhere in the scene. The known cost is a thin rim at silhouettes where sample 0 belongs to
+// the other surface ([[project_forge_msaa_screenspace_lookup]]); it modulates a blur radius, so a rim
+// of slightly-wrong blur is the worst case.
 #pragma once
+
+#ifndef SAMPLE_COUNT
+#define SAMPLE_COUNT 1
+#endif
 
 BEGIN_SRT(ReflectMipSrtData)
     BEGIN_SRT_SET(Persistent)
-        DECL_TEXTURE  (Persistent, Tex2D(float4),  gReflMipSrcTex)  // pReflectColor (first pass only)
-        DECL_RWTEXTURE(Persistent, RTex2D(float4), gReflMipSrc)     // pyramid mip i-1 (reduce only)
-        DECL_RWTEXTURE(Persistent, WTex2D(float4), gReflMipDst)     // pyramid mip i (both passes)
+#if SAMPLE_COUNT > 1
+        DECL_TEXTURE  (Persistent, Tex2DMS(float4, SAMPLE_COUNT),  gReflMipSrcTex)   // pReflectColor MS
+        DECL_TEXTURE  (Persistent, Depth2DMS(float, SAMPLE_COUNT), gReflMipSrcDepth) // pReflectDepth MS
+#else
+        DECL_TEXTURE  (Persistent, Tex2D(float4),  gReflMipSrcTex)   // pReflectColor (first pass only)
+        DECL_TEXTURE  (Persistent, Depth2D(float), gReflMipSrcDepth) // pReflectDepth (first pass only)
+#endif
+        DECL_RWTEXTURE(Persistent, RTex2D(float4), gReflMipSrc)      // pyramid mip i-1 (reduce only)
+        DECL_RWTEXTURE(Persistent, WTex2D(float4), gReflMipDst)      // pyramid mip i (both passes)
+        DECL_RWTEXTURE(Persistent, WTex2D(float),  gReflDepthDst)    // resolved 1x depth (first only)
     END_SRT_SET(Persistent)
 END_SRT(ReflectMipSrtData)

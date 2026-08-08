@@ -112,6 +112,35 @@ float3 reconstructWorld(float4x4 invVP, float2 uv, float deviceZ)
     return p.xyz / p.w;
 }
 
+// W4 — the reflection fetch, smeared along the lobe ellipse's MAJOR axis.
+//
+// The mip chain can only blur isotropically, so the LOD is set by the MINOR axis (see PS_MAIN) and
+// the major axis is resolved the only way an isotropic filter ever resolves anisotropy: a tap set
+// along it. This is the same trick W2 used on the wave normal — retired there only because a texture
+// gets hardware AF for free, which an explicit-LOD pyramid fetch never does.
+//
+// `stepUV` is the HALF-EXTENT of the tap centres (t runs -1..+1), already in this RT's uv.
+// Weights are the slope distribution's own Gaussian: the reflected ray's per-axis deflection has
+// std sqrt(2)*alpha and the extent is 2*alpha, so w(t) = exp(-t^2) exactly, with no free constant.
+//
+// ⚠ ALL FOUR CHANNELS TAKE THE SAME WEIGHT. gReflectMips is PREMULTIPLIED — rgb and coverage are one
+// vector and an alpha-weighted average of them rebuilds the horizon fringe ([[project_forge_premultiplied_pair]]).
+float4 sampleReflectSmear(float2 uv, float lod, float2 stepUV, uint taps)
+{
+    if (taps < 2u) { return SampleLvlTex2D(gReflectMips, gSamplerTrilinearClamp, uv, lod); }
+
+    float4 acc  = float4(0.0f, 0.0f, 0.0f, 0.0f);
+    float  wsum = 0.0f;
+    float  inv  = 2.0f / (float)(taps - 1u);
+    for (uint i = 0u; i < taps; ++i) {
+        float t = (float)i * inv - 1.0f;
+        float w = exp(-t * t);
+        acc  += w * SampleLvlTex2D(gReflectMips, gSamplerTrilinearClamp, uv + t * stepUV, lod);
+        wsum += w;
+    }
+    return acc / wsum;
+}
+
 ROOT_SIGNATURE(DefaultRootSignature)
 float4 PS_MAIN( VSOutput In )
 {
@@ -143,6 +172,12 @@ float4 PS_MAIN( VSOutput In )
     // bits 0-1 were already full at 4 modes — and because this one returns before any water shading
     // happens at all, which the other three do not.
     bool   heightView    = (waterFlags & 32u) != 0u;
+    // W4b bits 6-11: reflection smear tap BUDGET (max anisotropy), 0/1 = OFF (a single isotropic
+    // fetch at the minor-axis LOD, i.e. the shipped W4 look). Six bits, not four: the requirement is
+    // 1/cosI and grazing water — which is most water — needs tens, so a 15 cap WAS the binding
+    // constraint. A slider rather than a #define because where the budget stops paying is an eyeball
+    // call, and this way finding it costs no recompile.
+    uint   smearTaps     = (waterFlags >> 6) & 63u;
     // worlds[10] group 1 — the field's globals group, alongside lacunarity/distortion/etc.
     // (wavefield.h.fsl reads the rest; only these four lanes are needed out here.)
     float4 waveG1        = transpose(gBatch.worlds[10])[1];
@@ -256,7 +291,14 @@ float4 PS_MAIN( VSOutput In )
     // ANGULAR size of one screen pixel, in radians: EyeVec is a unit vector, so the length of its
     // screen derivative IS the angle between two neighbouring view rays. Free, exact at any FOV,
     // resolution or screen position — which is why the reflection LOD below needs no fudge factor.
-    float pixAngle = max(length(ddx(EyeVec)), length(ddy(EyeVec)));
+    // ⚠ KEPT, not just measured: ddx/ddy(EyeVec) ARE the screen basis expressed in world space — the
+    // world-space direction one screen pixel moves the view ray. That makes them the exact
+    // world->screen projection W4's smear axis needs below, per pixel, including FOV, aspect, screen
+    // position and camera roll, for no extra work. Deriving that axis from camFwd + world up instead
+    // would re-assume every one of those.
+    float3 ddxEye  = ddx(EyeVec);
+    float3 ddyEye  = ddy(EyeVec);
+    float pixAngle = max(length(ddxEye), length(ddyEye));
 
     // THE TWO-SCALE CROSSFADE THAT USED TO BUILD THE NORMAL HERE IS DELETED — 527-unit tile lerped
     // into a 3900-unit tile over `saturate(dist/8000)`. It had been dead since W2 landed (the AF
@@ -467,13 +509,121 @@ float4 PS_MAIN( VSOutput In )
     // level of unnecessary blur on top of the footprint error above. A filter footprint wants the
     // half-width; the mip chain's own reconstruction covers the rest.
     //
-    // reflBlurGain is a CALIBRATION knob, not a second roughness. It scales only this LOD, never the
-    // lobe — so it answers "how much of the physical blur do I want to see" without touching the
-    // material. Expected to collapse back into the constant once settled.
+    // ⚠ ...AND THE LOBE IS NOT A DISC. This is the term reflBlurGain was standing in for.
+    // Perturb the normal by a small slope e (n = +z, i = the incoming view ray, i.n = -cosI). To
+    // first order the reflected ray moves by
+    //     dr = 2*cosI*e - 2*(i.e)*n
+    // and splitting e along the two surface axes gives two DIFFERENT answers:
+    //   - OUT of the plane of incidence (i.e = 0):  |dr| = 2*e*cosI   <- vanishes at grazing
+    //   - IN  the plane of incidence:               |dr| = 2*e        <- independent of angle
+    // So the reflected lobe is an ELLIPSE: 2*alpha tall by 2*alpha*cosI wide. At 6 degrees above the
+    // horizon — how anyone actually looks at a lake — that is an 11:1 streak. Which is not a
+    // curiosity, it IS the glitter path: real rippled water smears its reflection VERTICALLY and
+    // stays coherent HORIZONTALLY. The old 2*alpha is the MAJOR axis, i.e. the worst case, applied
+    // to both axes at once.
+    //
+    // An isotropic mip chain must still pick one number, and the two candidates are not symmetric:
+    // over-blurring destroys the image outright, under-blurring leaves aliasing a tap set can still
+    // pay off later. Take the MINOR axis — it is also the axis carrying the detail the eye reads as
+    // "a reflection" ([[project_anisotropic_footprint_filter]]: no scalar is *right*, but the honest
+    // scalar is the one whose residual error is still fixable).
+    //
+    // ⚠ AND THIS IS EXACTLY WHAT reflBlurGain WAS: the knob wanted 0.1, and cos(84 deg) = 0.10. A
+    // constant standing in for a per-pixel term reads as "the default is wrong" every time it is
+    // looked at — three times now, and all three were the model rather than the eye
+    // ([[feedback_model_class_not_knobs]]).
+    // ⚠ SO RESET reflBlurGain TO 1.0. It multiplies a lobe that now carries cosI itself; left at 0.1
+    // it applies the same correction TWICE and distant water snaps back to a hard mirror.
+    //
+    // cosI is taken against the water PLANE (abs(EyeVec.z)), not against `normal`: the compression is
+    // a property of the macro incidence, and reading it off the perturbed normal would modulate the
+    // roughness with the wave pattern itself. No floor is needed — cosI -> 0 gives LOD 0, and the
+    // horizon band genuinely IS horizontally mirror-like; the max(...,1) below is the only clamp.
+    //
+    // reflBlurGain survives as a pure CALIBRATION scale on this LOD, never on the lobe, so it still
+    // cannot become a second roughness. Expected to collapse into the constant now that there is
+    // nothing left for it to stand in for.
     //
     // SANITY GATE: alpha -> 0 gives LOD 0 — calm water stays a sharp mirror, by construction.
     float reflTexelRad = max(pixAngle * (gShadowParams.screenParams.x / max(reflSize, 1.0f)), 1e-7f);
-    float reflLodRaw = log2(max(reflBlurGain * 2.0f * alpha / reflTexelRad, 1.0f));
+    float cosI         = abs(EyeVec.z);              // macro-plane incidence cosine
+
+    // W4c — HOW FAR AWAY IS THE THING BEING REFLECTED? The deflected ray sweeps L before it lands, so
+    // its screen displacement is `2*alpha * L/(L+d)`, not `2*alpha`. Assuming L -> inf makes the blur
+    // CONSTANT along a reflection; in reality it grows from zero at the waterline to full at the tip,
+    // and that gradient is the single most recognisable thing about a reflection in water. Worse, the
+    // shipped model has the gradient BACKWARDS: with no L term the only thing that varies along a
+    // reflection is alpha(d), which is largest at the far shoreline — so the base came out smeary and
+    // the tip sharp, exactly inverted. (Reported, and that is what sent us looking here.)
+    //
+    // Under the mirror the reflected object sits at d + L from the camera, so gReflectDepth IS L + d
+    // and the whole factor collapses to `1 - dist/D_refl`. No special cases: sky is un-drawn, which
+    // in reverse-Z is 0 = far = factor 1; the shoreline touching the water gives D_refl -> dist = 0.
+    //
+    // ⚠ POINT sampled. Averaging depth across a silhouette produces a distance that exists nowhere in
+    // the scene, and this one feeds a blur radius, so it would smear hardest exactly at the edges the
+    // eye uses to judge whether the reflection is sharp.
+    // ⚠ Undistorted uv on purpose: the wave distortion is a few pixels and this is a scalar, so
+    // carrying it would buy nothing and force the reflUV computation above this block.
+    float  reflDevZ  = SampleLvlTex2D(gReflectDepth, gSamplerPointClamp,
+                                      In.Position.xy * invScreen, 0.0f).r;
+    float  reflDist  = length(reconstructWorld(invVP, In.Position.xy * invScreen, reflDevZ));
+    float  hitFrac   = saturate(1.0f - dist / max(reflDist, dist + 1e-3f));
+
+    float lobeMajor    = 2.0f * alpha * hitFrac;     // in-plane   (vertical on screen), radians
+    float lobeMinor    = lobeMajor * cosI;           // out-of-plane (horizontal),        radians
+
+    // W4b — AND THE MAJOR AXIS IS RESOLVED BY A TAP SET, which is the other half of the ellipse.
+    // Taking the minor axis for the LOD is what stopped the reflection being erased; it also means
+    // the vertical smear that makes water read as water is simply MISSING, and the reflection is
+    // under-filtered along that axis by 1/cosI (~30x at 2 degrees above the horizon).
+    //
+    // So: N taps along the major axis, at the minor axis's LOD — textbook anisotropic filtering, and
+    // the identical shape to W3's own `wTap = max(sMinW, sMaxW / kWaterMaxAniso)` for the wave field.
+    // ⚠ AND IT CARRIES THE IDENTICAL CLAMP, which is the one real cost: N taps of radius `tapRad`
+    // only cover the major axis if N*tapRad >= lobeMajor, so below that N the LOD must RISE — blurring
+    // the MINOR axis too, which is exactly what W4 bought back. Measured, and it is not a gentle
+    // degradation: at 2 taps the LOD jump re-crosses the `over` knee and the reflections vanish
+    // outright (observed). The requirement is `1/cosI`, so grazing water needs TENS of taps, not a few.
+    //
+    // ⚠ SO THE SLIDER IS A BUDGET, NOT A COUNT — `maxAnisotropy`, not `numTaps`, exactly as a sampler
+    // means it and exactly as kWaterMaxAniso means it for the wave field. Each pixel asks for the taps
+    // it actually needs and no more:
+    //   - steep water (cosI -> 1) is nearly round and takes 1-2 taps;
+    //   - grazing water takes the budget, and only there;
+    //   - `tapEff` floors a tap at one reflect texel, so the count stops climbing once the LOD has
+    //     bottomed out at mip 0 — without that floor, cosI -> 0 would ask for hundreds of taps to
+    //     resolve detail the pyramid does not physically carry.
+    // A fixed count spends the worst case everywhere and buys nothing for it, which is why the budget
+    // can be set high: the expensive band is the few degrees just above the horizon.
+    float tapEff   = max(lobeMinor, reflTexelRad);
+    float anisoReq = lobeMajor / max(tapEff, 1e-9f);
+    uint  smearN   = (smearTaps > 1u)
+                   ? (uint)clamp(ceil(anisoReq), 1.0f, (float)smearTaps) : 1u;
+    float tapRad   = (smearN > 1u) ? max(tapEff, lobeMajor / (float)smearN) : lobeMinor;
+    float reflLodRaw = log2(max(reflBlurGain * tapRad / reflTexelRad, 1.0f));
+
+    // The smear AXIS, in this RT's uv. An in-plane slope tilts the reflected ray along
+    // `cosI*t_hat - sinI*n`; what the reflect RT holds is the MIRRORED world, so the direction that
+    // matters is that vector mirrored in the plane — the z flips:
+    //     smearDir = (cosI * t_hat, +sinI),   t_hat = normalize(EyeVec.xy)
+    // At grazing that is world +z (straight up in the mirror), which is why the streak is vertical.
+    // Projecting it through the ddx/ddy(EyeVec) basis gives screen PIXELS per radian directly; the
+    // result's length is ~1/pixAngle, since smearDir is perpendicular to the view ray by construction.
+    // ⚠ invScreen, not invAlloc — gReflectMips is the 1024² full-viewport RT (see the block above).
+    // ⚠ nz picks the side the EYE is on. `cosI` threw the sign away with its abs(), and the two sides
+    // are NOT the same axis: flipping only the z component of smearDir is not the same as negating it
+    // (and negating it would change nothing — the tap set is symmetric in t). Above water EyeVec.z<0
+    // so n = +z; underwater the surface normal facing the eye is -z and the streak tilts the other
+    // way. Orthogonality to the view ray is the check: dot(smearDir, EyeVec) == 0 in both cases.
+    float  nz       = (EyeVec.z < 0.0f) ? 1.0f : -1.0f;
+    float  sinI     = max(length(EyeVec.xy), 1e-4f);
+    float3 smearDir = float3(cosI * EyeVec.xy / sinI, sinI * nz);
+    float2 smearPx  = float2(dot(smearDir, ddxEye) / max(dot(ddxEye, ddxEye), 1e-12f),
+                             dot(smearDir, ddyEye) / max(dot(ddyEye, ddyEye), 1e-12f));
+    // Half-extent of the TAP CENTRES: the lobe minus the tap's own footprint, so it collapses to zero
+    // when one tap already covers the lobe (steep views, where major == minor) instead of over-blurring.
+    float2 smearUV  = max(lobeMajor - tapRad, 0.0f) * smearPx * invScreen;
 
     // ...and BEYOND WHAT THE CHAIN CAN REPRESENT, converge to the sky instead of magnifying mush.
     //
@@ -483,6 +633,13 @@ float4 PS_MAIN( VSOutput In )
     // therefore pins to the last mip, and sampling a 32x32 image magnified across the screen is not
     // a blurred reflection, it is bilinear diamonds that swim under camera rotation (observed).
     // Lowering reflBlurGain only moves where that starts; it cannot add dynamic range.
+    //
+    // ⚠ THAT PARAGRAPH WAS MEASURING THE MAJOR AXIS. With cosI above, grazing water — which is most
+    // of the water anyone sees — spends the chain at alpha ~0.2 rather than ~0.02, i.e. never: the
+    // measured field's 0.146 now lands INSIDE the chain instead of a full 4.8 octaves past its end.
+    // The "everything pins to the last mip" regime was the isotropic lobe's, not the surface's. The
+    // cap and the handover below both stay, because looking steeply DOWN at rough water still spends
+    // it honestly (cosI -> 1) — and there Fresnel is ~0.02, so almost none of it is visible anyway.
     //
     // So the chain is capped at a mip that still MAGNIFIES cleanly, and the leftover roughness turns
     // into a blend toward the sampled sky. That is not a fudge: a sufficiently rough mirror reflects
@@ -507,6 +664,10 @@ float4 PS_MAIN( VSOutput In )
     // reflection vanishes and no line can be drawn. It is also GENTLER than the old ramp exactly
     // where the complaint was (0.29 vs 0.50 at half an octave over; 0.50 vs 1.00 at one), which is
     // the dynamic range reflBlurGain was being asked for and could not supply from inside a log.
+    //
+    // `over` follows the MINOR axis with the rest of the LOD, deliberately: measuring the shortfall
+    // on the major axis would hand the vertical smear's excess to the sky and re-erase exactly the
+    // horizontal image the minor-axis choice above exists to keep.
     float over = max(reflLodRaw - (float)kReflectMipUsable, 0.0f);
     float reflSkyMix = 1.0f - exp2(-over);
 
@@ -539,7 +700,7 @@ float4 PS_MAIN( VSOutput In )
         // smoothly varying roughness.
         float2 reflUVU = In.Position.xy * invScreen
                        + float2(-2.1f * reffactorU.x, abs(reffactorU.y)) * invScreen;
-        float4 reflSampleU = SampleLvlTex2D(gReflectMips, gSamplerTrilinearClamp, reflUVU, reflLod);
+        float4 reflSampleU = sampleReflectSmear(reflUVU, reflLod, smearUV, smearN);
         float3 reflectedU  = reflSampleU.rgb + fogCol * (1.0f - reflSampleU.a);
         // Same cap-and-converge as the above-water path, but toward fogCol rather than the sky
         // target: looking UP at the underside, what a rough surface averages is the seabed-and-
@@ -622,7 +783,7 @@ float4 PS_MAIN( VSOutput In )
     // varying roughness would band across the surface.
     float2 reflUV = In.Position.xy * invScreen
                   + float2(-2.1f * reffactor.x, abs(reffactor.y)) * invScreen;
-    float4 reflSample = SampleLvlTex2D(gReflectMips, gSamplerTrilinearClamp, reflUV, reflLod);
+    float4 reflSample = sampleReflectSmear(reflUV, reflLod, smearUV, smearN);
     float3 reflected = reflSample.rgb + fogCol * (1.0f - reflSample.a);
     // Roughness past what the chain can represent -> the sky (see reflSkyMix). Applied BEFORE the
     // fog melt below, and toward the SAME target, so the two compose instead of competing: a rough

@@ -6,14 +6,37 @@
 //
 // Two compiled variants of this one body (REFLMIP_FIRST, like hizreduce):
 //   reflectmipfirst.comp — 1:1 copy pReflectColor -> mip 0 (dispatch covers mip-0 dims).
-//   reflectmip.comp      — 2x2 BOX AVERAGE mip i-1 -> mip i (dispatch covers the DST mip dims).
+//   reflectmip.comp      — [1,3,3,1] TENT mip i-1 -> mip i (dispatch covers the DST mip dims).
 //
-// No odd-dimension taps, unlike hizreduce: kReflectSize is 1024, so every source mip down to the
-// last is even and a plain clamp-free 2x2 kernel covers every texel exactly once.
+// ⚠ THE 2x2 BOX IS GONE, AND THE REASON IS THE SHIMMER. A box is a DECIMATION filter here, and a
+// 2-tap box is a bad one: its response is |cos(pi*f)|, so at the fold frequency f = 0.25 cyc/sample
+// — the exact place a 2x downsample folds — it still passes **0.707**. Seventy percent of the
+// amplitude that must die is copied into the next level instead, and it lands at low frequency where
+// the eye sees it as crawl. Every level adds its own, which is why the artefact grows DOWN the chain
+// rather than being uniform: reported as "with lower mips I see shimmering".
+//
+// [1,3,3,1]/8 is three 2-tap boxes convolved, so its response is |cos(pi*f)|^3, and the improvement
+// is concentrated where it matters. The visible aliasing is not from f just above 0.25 (that folds to
+// just below the new Nyquist, where it is nearly invisible and the next level attenuates it again) —
+// it is mid-band content folding to LOW frequency:
+//        f      0.25    0.30    0.375   0.45
+//   box         0.707   0.588   0.383   0.156
+//   [1,3,3,1]   0.354   0.203   0.056   0.004
+// At f = 0.45, which folds to 0.05 (a slow, highly visible crawl), the tent passes 1/40th of what
+// the box did. A plain 4-tap box is NOT the alternative: it nulls exactly at 0.25 but passes 0.271
+// at 0.375, i.e. it is better precisely where it does not matter and worse where it does.
+//
+// ⚠ This CANNOT fix aliasing that is already in mip 0 — pReflectColor is rendered SAMPLE_COUNT_1
+// (no MSAA), so the mirror's geometric edges arrive aliased and no reduce can unfold them. If shimmer
+// survives this change, that is the remaining cause and it lives in the reflect PASS, not here.
 //
 // ⚠ ALL FOUR CHANNELS, IDENTICAL WEIGHTS. The source is premultiplied — see reflectmip.srt.h for
 // why an alpha-weighted average is a dark fringe along the reflected horizon rather than an
-// improvement.
+// improvement. The tent widens the footprint but does not change that rule.
+//
+// The tent reaches one texel OUTSIDE the 2x2, so unlike the box it needs a clamp: an out-of-bounds
+// typed-UAV read returns ZERO, which would darken the border — invisible at mip 1 and a dark frame
+// around the image by mip 3, where one texel is 1/128th of it and magnifies 16x.
 //
 // 8x8 groups, no dst bounds check (OOB UAV writes drop — same as hizreduce/linearizedepth).
 
@@ -30,14 +53,31 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
     INIT_MAIN;
     int2 p = int2(DispatchThreadID.xy);
 #if REFLMIP_FIRST
+    // W5: RESOLVE + copy. All four channels with identical weights, same as the reduce — the source
+    // is premultiplied and an alpha-weighted resolve is the dark-horizon-fringe bug again.
+  #if SAMPLE_COUNT > 1
+    float4 c = float4(0.0f, 0.0f, 0.0f, 0.0f);
+    for (int k = 0; k < SAMPLE_COUNT; ++k) { c += LoadTex2DMS(gReflMipSrcTex, NO_SAMPLER, p, k); }
+    c *= (1.0f / (float)SAMPLE_COUNT);
+    // ...and the depth, SAMPLE 0 rather than an average: see reflectmip.srt.h.
+    Write2D(gReflDepthDst, p, LoadTex2DMS(gReflMipSrcDepth, NO_SAMPLER, p, 0).r);
+  #else
     float4 c = LoadTex2D(gReflMipSrcTex, NO_SAMPLER, p, 0);
+    Write2D(gReflDepthDst, p, LoadTex2D(gReflMipSrcDepth, NO_SAMPLER, p, 0).r);
+  #endif
 #else
-    int2   s = p * 2;
-    float4 c = LoadRWTex2D(gReflMipSrc, s);
-    c += LoadRWTex2D(gReflMipSrc, s + int2(1, 0));
-    c += LoadRWTex2D(gReflMipSrc, s + int2(0, 1));
-    c += LoadRWTex2D(gReflMipSrc, s + int2(1, 1));
-    c *= 0.25f;
+    // [1,3,3,1] per axis, separable, centred on the 2x2 boundary -> source texels s-1 .. s+2.
+    int2   s   = p * 2;
+    int2   hi  = GetDimensions(gReflMipSrc, NO_SAMPLER) - int2(1, 1);
+    float  w[4]; w[0] = 1.0f; w[1] = 3.0f; w[2] = 3.0f; w[3] = 1.0f;
+    float4 c   = float4(0.0f, 0.0f, 0.0f, 0.0f);
+    for (int j = 0; j < 4; ++j) {
+        for (int i = 0; i < 4; ++i) {
+            int2 q = clamp(s + int2(i - 1, j - 1), int2(0, 0), hi);
+            c += (w[i] * w[j]) * LoadRWTex2D(gReflMipSrc, q);
+        }
+    }
+    c *= (1.0f / 64.0f);
 #endif
     Write2D(gReflMipDst, p, c);
     RETURN();

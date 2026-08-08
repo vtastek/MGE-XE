@@ -1748,7 +1748,11 @@ namespace {
         // lands in main-screen space → the water frag samples it at its own screen UV. Stage 1 draws
         // SKY ONLY (own decoupled buffers; validates the mirror matrix without the DL cull machinery).
         RenderTarget*  pReflectColor = nullptr;            // 1024² B8G8R8A8, alpha = coverage
-        RenderTarget*  pReflectDepth = nullptr;            // 1024² D32 reverse-Z (mirror pass depth)
+        RenderTarget*  pReflectDepth = nullptr;            // 1024² D32 reverse-Z (mirror pass depth, MSAA)
+        // W5: single-sample copy of the above, written by reflectmipfirst alongside mip 0. Exists so
+        // water.frag can read the mirror's depth (W4c hit distance) without becoming a two-variant
+        // graphics shader just to handle Depth2DMS.
+        Texture*       pReflectDepthResolved = nullptr;    // 1024² R32F, SRV+UAV
         Buffer*        pReflectFrameCbv = nullptr;         // gFrameData for the mirror view (own viewProj)
         DescriptorSet* pPerFrameSetReflect = nullptr;      // PerFrame set bound to pReflectFrameCbv (+ gAO + water SRVs)
         // WV2 (real reflection): the land/statics mirror uses a DIFFERENT matrix (mirror about the WATER
@@ -1793,7 +1797,7 @@ namespace {
         Texture*       pReflectMips = nullptr;             // kReflectSize², kReflectMipCount, RGBA16F, SRV+UAV
         DescriptorSet* pReflectMipSet = nullptr;           // ReflectMipSrtData Persistent, maxSets = mips
         Shader*        pReflectMipShaderFirst = nullptr;   // reflectmipfirst.comp (pReflectColor -> mip 0)
-        Shader*        pReflectMipShader = nullptr;        // reflectmip.comp (2x2 box average)
+        Shader*        pReflectMipShader = nullptr;        // reflectmip.comp ([1,3,3,1] tent reduce)
         Pipeline*      pReflectMipPipelineFirst = nullptr;
         Pipeline*      pReflectMipPipeline = nullptr;
         bool           reflectMipReady = false;            // gates the per-frame pyramid build
@@ -6906,9 +6910,21 @@ namespace {
         // sky pipeline (cull NONE → winding-agnostic, so the mirror's handedness flip is a no-op here).
         {
             // 1024² colour RT (alpha = coverage, cleared transparent) + matching D32 reverse-Z depth.
+            // ⚠ W5: MSAA, at the SCENE's sample count. Two reasons, and the second was a latent bug:
+            //  (1) the reflection was sampled ~48x more coarsely than the colour pass over the SAME
+            //      field of view (1024² x1 vs 4096x3072 x4). 1x geometric edges fold into LOW
+            //      frequencies, and no downstream mip filtering can undo that — which is why calm
+            //      distant water (LOD ~0, sampling mip 0 almost directly) shimmered while the colour
+            //      pass was rock solid.
+            //  (2) the colour PSOs that draw this pass — pSkyPipeline and the DL/near set — are all
+            //      built with mSampleCount = g_live.sampleCount. Binding those against a
+            //      SAMPLE_COUNT_1 target is a PSO/RT sample-count mismatch D3D12 does not allow.
+            // Following sampleCount rather than hard-coding 4 keeps the 1x configuration working and
+            // keeps the PSOs matched either way — the whole point is that these must agree.
             RenderTargetDesc rcd = {};
             rcd.mWidth = kReflectSize; rcd.mHeight = kReflectSize; rcd.mDepth = 1;
-            rcd.mArraySize = 1; rcd.mMipLevels = 1; rcd.mSampleCount = SAMPLE_COUNT_1;
+            rcd.mArraySize = 1; rcd.mMipLevels = 1;
+            rcd.mSampleCount = (SampleCount)g_live.sampleCount;
             // NOT a free choice: pSkyPipeline (and the DL/near colour PSOs) draw into pMSAAColor in
             // the main pass and into THIS target in the mirror pass, so one PSO spans both and their
             // colour formats must agree. "HDR water is forced, not optional" in forge-postprocess.md
@@ -6925,9 +6941,17 @@ namespace {
 
             RenderTargetDesc rdd = {};
             rdd.mWidth = kReflectSize; rdd.mHeight = kReflectSize; rdd.mDepth = 1;
-            rdd.mArraySize = 1; rdd.mMipLevels = 1; rdd.mSampleCount = SAMPLE_COUNT_1;
+            rdd.mArraySize = 1; rdd.mMipLevels = 1;
+            rdd.mSampleCount = (SampleCount)g_live.sampleCount;   // W5: must match the colour RT
             rdd.mFormat = TinyImageFormat_D32_SFLOAT;
-            rdd.mStartState = RESOURCE_STATE_DEPTH_WRITE;
+            // W4c: RESTS in SHADER_RESOURCE and flips to DEPTH_WRITE only inside the mirror pass —
+            // exactly pSunMomentsDepth's arrangement, and for the same reason: water.frag samples it
+            // as gReflectDepth for the reflection's hit distance, so it is a read-only SRV for the
+            // rest of the frame. Resting here rather than in DEPTH_WRITE also means a frame where the
+            // reflect pass is SKIPPED leaves it readable and one frame stale, matching pReflectColor
+            // beside it instead of inventing a second staleness rule.
+            rdd.mStartState = RESOURCE_STATE_SHADER_RESOURCE;
+            rdd.mDescriptors = DESCRIPTOR_TYPE_TEXTURE;
             rdd.mClearValue.depth = 0.0f;   // reverse-Z clear
             rdd.mClearValue.stencil = 0;
             rdd.pName = "reflectDepth";
@@ -7293,7 +7317,13 @@ namespace {
 
             // Re-point gReflectColor (in the MAIN PerFrame set) at the real reflection RT, replacing
             // WT1's pRefractColor stand-in. Only when ready, so the water frag samples a valid RT.
-            if (g_live.reflectReady && g_live.waterReady) {
+            // ⚠ W5: at sampleCount > 1 there is NO single-sample mirror texture at this point — both
+            // pReflectColor and pReflectDepth are MSAA, and gReflectColor/gReflectDepth are declared
+            // Tex2D. Binding an MSAA resource into a Tex2D slot is the same type mismatch the
+            // gWaterNormalVol comment calls illegal. The 1x copies are produced by the RESOLVE
+            // (reflectmipfirst), so both slots are bound in the pyramid block below instead, and the
+            // WT1 stand-in stays here until then.
+            if (g_live.reflectReady && g_live.waterReady && g_live.sampleCount == 1) {
                 Texture* reflTex = g_live.pReflectColor->pTexture;
                 DescriptorData rp = {};
                 rp.mIndex = SRT_RES_IDX(SrtData, PerFrame, gReflectColor);
@@ -7325,8 +7355,23 @@ namespace {
                 addResource(&rmld, nullptr);
                 waitForAllResourceLoads();
 
+                // W5: the single-sample mirror depth the resolve writes for water.frag (W4c).
+                TextureDesc rdrd = {};
+                rdrd.mWidth = kReflectSize; rdrd.mHeight = kReflectSize; rdrd.mDepth = 1;
+                rdrd.mArraySize = 1; rdrd.mMipLevels = 1; rdrd.mSampleCount = SAMPLE_COUNT_1;
+                rdrd.mFormat = TinyImageFormat_R32_SFLOAT;   // raw reverse-Z device depth, full precision
+                rdrd.mStartState = RESOURCE_STATE_SHADER_RESOURCE;
+                rdrd.mDescriptors = (DescriptorType)(DESCRIPTOR_TYPE_TEXTURE | DESCRIPTOR_TYPE_RW_TEXTURE);
+                rdrd.pName = "reflectDepthResolved";
+                TextureLoadDesc rdrld = {};
+                rdrld.ppTexture = &g_live.pReflectDepthResolved;
+                rdrld.pDesc = &rdrd;
+                addResource(&rdrld, nullptr);
+                waitForAllResourceLoads();
+
                 ShaderLoadDesc rfd = {};
-                rfd.mComp.pFileName = "reflectmipfirst.comp";
+                rfd.mComp.pFileName = (g_live.sampleCount > 1) ? "reflectmipfirst_sc4.comp"
+                                                               : "reflectmipfirst_sc1.comp";
                 addShader(R, &rfd, &g_live.pReflectMipShaderFirst);
                 ShaderLoadDesc rrd = {};
                 rrd.mComp.pFileName = "reflectmip.comp";
@@ -7351,9 +7396,10 @@ namespace {
                     addDescriptorSet(R, &rset, &g_live.pReflectMipSet);
                 }
                 if (g_live.pReflectMipSet) {
-                    Texture* reflTex = g_live.pReflectColor->pTexture;
+                    Texture* reflTex  = g_live.pReflectColor->pTexture;
+                    Texture* reflDpth = g_live.pReflectDepth->pTexture;
                     for (uint32_t m = 0; m < kReflectMipCount; ++m) {
-                        DescriptorData d[3] = {};
+                        DescriptorData d[5] = {};
                         d[0].mIndex = SRT_RES_IDX(ReflectMipSrtData, Persistent, gReflMipSrcTex);
                         d[0].mCount = 1;
                         d[0].ppTextures = &reflTex;
@@ -7365,7 +7411,17 @@ namespace {
                         d[2].mCount = 1;
                         d[2].ppTextures = &g_live.pReflectMips;
                         d[2].mUAVMipSlice = (uint16_t)m;
-                        updateDescriptorSet(R, m, g_live.pReflectMipSet, 3, d);
+                        // W5: the mirror depth + its resolved destination. Like the colour SRV above,
+                        // both ride EVERY instance and only instance 0 (the first pass) reads/writes
+                        // them — the reduce's copy is stripped by DXC.
+                        d[3].mIndex = SRT_RES_IDX(ReflectMipSrtData, Persistent, gReflMipSrcDepth);
+                        d[3].mCount = 1;
+                        d[3].ppTextures = &reflDpth;
+                        d[4].mIndex = SRT_RES_IDX(ReflectMipSrtData, Persistent, gReflDepthDst);
+                        d[4].mCount = 1;
+                        d[4].ppTextures = &g_live.pReflectDepthResolved;
+                        d[4].mUAVMipSlice = 0;
+                        updateDescriptorSet(R, m, g_live.pReflectMipSet, 5, d);
                     }
                 }
                 g_live.reflectMipReady = g_live.pReflectMips && g_live.pReflectMipSet
@@ -7374,12 +7430,35 @@ namespace {
                 // itself otherwise. water.frag samples this slot unconditionally, so the fallback is
                 // the un-filtered mirror (the pre-WT4d image), never a null SRV.
                 if (g_live.waterReady) {
-                    Texture* mipTex = g_live.reflectMipReady ? g_live.pReflectMips
-                                                             : g_live.pReflectColor->pTexture;
-                    DescriptorData mp = {};
-                    mp.mIndex = SRT_RES_IDX(SrtData, PerFrame, gReflectMips);
-                    mp.mCount = 1; mp.ppTextures = &mipTex;
-                    updateDescriptorSet(R, 0, g_live.pPerFrameSet, 1, &mp);
+                    // ⚠ W5: the pyramid-failed fallback can no longer be pReflectColor when MSAA is
+                    // on — it is a Texture2DMS and this slot is Tex2D. There is then NO single-sample
+                    // mirror at all, so it degrades to the WT1 stand-in (water reads its own
+                    // refraction as "reflection": wrong, but valid, and only on a path that already
+                    // means "the pyramid did not build").
+                    Texture* mipTex = g_live.reflectMipReady
+                                    ? g_live.pReflectMips
+                                    : ((g_live.sampleCount > 1) ? g_live.pRefractColor
+                                                                : g_live.pReflectColor->pTexture);
+                    DescriptorData mp[2] = {};
+                    mp[0].mIndex = SRT_RES_IDX(SrtData, PerFrame, gReflectMips);
+                    mp[0].mCount = 1; mp[0].ppTextures = &mipTex;
+                    // ...and gReflectColor follows it at MSAA: mip 0 IS pReflectColor resolved, which
+                    // is what debug view 1 ("show me the raw reflection RT") wants to display anyway.
+                    mp[1].mIndex = SRT_RES_IDX(SrtData, PerFrame, gReflectColor);
+                    mp[1].mCount = 1; mp[1].ppTextures = &mipTex;
+                    updateDescriptorSet(R, 0, g_live.pPerFrameSet,
+                                        (g_live.sampleCount > 1) ? 2 : 1, mp);
+
+                    // W4c: the mirror depth for the hit-distance term — now the RESOLVED copy, so the
+                    // slot is a plain Tex2D at any sample count. Gated on the pyramid, because the
+                    // resolve is the pyramid's first pass: if it never runs, this is left UNBOUND and
+                    // reads zero = reverse-Z far = the pre-W4c "everything at infinity" model exactly.
+                    if (g_live.reflectMipReady && g_live.pReflectDepthResolved) {
+                        DescriptorData rdp = {};
+                        rdp.mIndex = SRT_RES_IDX(SrtData, PerFrame, gReflectDepth);
+                        rdp.mCount = 1; rdp.ppTextures = &g_live.pReflectDepthResolved;
+                        updateDescriptorSet(R, 0, g_live.pPerFrameSet, 1, &rdp);
+                    }
                 }
                 std::printf("[forge][reflect] mip pyramid %s (%u², %u mips, RGBA16F)\n",
                             g_live.reflectMipReady ? "ready" : "DISABLED (resource/shader/pipeline create failed)",
@@ -9466,7 +9545,28 @@ namespace {
     // is exactly the ghost the paragraph above warns about. STAYING AT 1.0. If it still reads mushy
     // now that sigma2 is right, that is the isotropic-lobe limitation and the fix is an anisotropic
     // lobe, not a smaller number here.
+    //
+    // ✔ AND THAT PREDICTION WAS RIGHT, THIRD TIME (2026-08-08). "At 1.0 no reflection survives; 0.1
+    // makes more sense" — and cos(84 deg) = 0.10. The knob was standing in for the INCIDENCE COSINE:
+    // the reflected lobe is an ellipse 2*alpha tall by 2*alpha*cosI wide (derivation in water.frag),
+    // so the old 2*alpha was the MAJOR axis applied to both screen axes at once, and at the grazing
+    // angles all interesting water is viewed at that is a ~10x over-blur. water.frag now carries the
+    // cosI term and takes the MINOR axis, so this is once again a pure calibration scale over a lobe
+    // that is finally the right shape. STAYS AT 1.0 — and this time there is nothing left for it to
+    // absorb, so if it still wants to move, the next term to suspect is the reflected HIT DISTANCE
+    // (the smear is 2*alpha*L/(L+d), and pReflectDepth already holds L+d), not this number.
+    // Three reports, three model defects, zero look calls: [[feedback_model_class_not_knobs]].
     float g_waterReflBlurGain = 1.0f;
+    // W4b: the tap BUDGET along the lobe ellipse's MAJOR axis — the vertical smear the minor-axis LOD
+    // leaves out. A maxAnisotropy, not a count: the shader asks for ceil(1/cosI) taps and clamps to
+    // this, so steep water spends 1-2 and only the grazing band spends the budget.
+    // ⚠ The requirement is 1/cosI, so this wants TENS. Measured: at 2 the LOD clamp re-crosses the
+    // `over` knee and reflections vanish outright; as a fixed COUNT, 15 was already the binding cap
+    // with no measurable frame cost. **10** is the settled value now that it is a budget rather than
+    // a count — a budget of 10 buys more than a fixed 10 did, because the pixels that were spending
+    // taps they did not need now spend 1-2 and the grazing band gets the rest. 0 disables (the pure
+    // minor-axis W4 look), which is still the A/B baseline for this feature.
+    uint32_t g_waterReflSmearTaps = 10;
 
     // The three WT4d floats water.frag reads out of worlds[6] group 3, in one place so the live pass
     // and the --forge-view viewer cannot drift apart (they already write two independent copies of
@@ -9481,6 +9581,10 @@ namespace {
         // bit 5: W1 HEIGHT view. Its own bit rather than a fifth waterDbg mode — bits 0-1 were full
         // at 4 modes, and this one returns before any water shading runs, which the others do not.
         if (g_waveHeightView)       { f |= 32u; }
+        // W4b bits 6-11: reflection smear tap BUDGET (0/1 = off). Packed into the flags word rather
+        // than given a param lane because worlds[6] group 3 is full and this is a small integer — the
+        // word round-trips exactly through the float (max 4095).
+        f |= (g_waterReflSmearTaps & 63u) << 6;
         return (float)f;
     }
     inline float waterAlphaBase(float windFactor) {
@@ -10302,6 +10406,10 @@ namespace {
           // range unreachable while it was the only place the knob could do anything.
           t.sliderF("Water: reflection blur gain (LOD only, NOT the lobe; 1.0 = physical)",
                     &g_waterReflBlurGain, 0.0f, 2.0f, 0.01f, "%.2f");
+          // W4b. The lobe is an ellipse 2a tall by 2a*cosI wide; the LOD above takes the MINOR axis,
+          // this resolves the major one with a tap set. 0 = off = pure minor axis (the W4 baseline).
+          t.sliderU("Water: reflection vertical smear BUDGET (max taps; 0 = off) — wants tens",
+                    &g_waterReflSmearTaps, 0u, 63u, 1u);
           t.checkbox("Water: roughness-aware Schlick Fresnel (P4)", &g_waterSchlick);
           t.checkbox("Water: PROCEDURAL surface field (W1 noise; OFF = W2 texture + anisotropic taps)",
                      &g_waterProceduralWaves);
@@ -14793,13 +14901,20 @@ namespace ForgeRender {
             std::memcpy(g_live.pReflectFrameCbv->pCpuMappedAddress, fcbvR, 288);
             std::memcpy(g_live.pReflectFrameCbv->pCpuMappedAddress, mirrorVP, 64);
 
-            // pReflectColor SHADER_RESOURCE -> RENDER_TARGET (pReflectDepth stays DEPTH_WRITE).
+            // Into the pass: pReflectColor SHADER_RESOURCE -> RENDER_TARGET, and (W4c) pReflectDepth
+            // SHADER_RESOURCE -> DEPTH_WRITE. The depth used to sit in DEPTH_WRITE permanently; it
+            // now rests readable because water.frag samples it, so BOTH resting states are flipped
+            // here and restored together at the end of the pass. Paired edits — a skipped restore
+            // leaves the next frame's depth clear writing to a read-only resource.
             {
-                RenderTargetBarrier rb = {};
-                rb.pRenderTarget = g_live.pReflectColor;
-                rb.mCurrentState = RESOURCE_STATE_SHADER_RESOURCE;
-                rb.mNewState = RESOURCE_STATE_RENDER_TARGET;
-                cmdResourceBarrier(g_live.pCmd, 0, nullptr, 0, nullptr, 1, &rb);
+                RenderTargetBarrier rb[2] = {};
+                rb[0].pRenderTarget = g_live.pReflectColor;
+                rb[0].mCurrentState = RESOURCE_STATE_SHADER_RESOURCE;
+                rb[0].mNewState = RESOURCE_STATE_RENDER_TARGET;
+                rb[1].pRenderTarget = g_live.pReflectDepth;
+                rb[1].mCurrentState = RESOURCE_STATE_SHADER_RESOURCE;
+                rb[1].mNewState = RESOURCE_STATE_DEPTH_WRITE;
+                cmdResourceBarrier(g_live.pCmd, 0, nullptr, 0, nullptr, 2, rb);
             }
             BindRenderTargetsDesc rbind = {};
             rbind.mRenderTargetCount = 1;
@@ -14930,7 +15045,9 @@ namespace ForgeRender {
             // scale. pReflectColor is never MSAA (its own fixed RT), so this is always a plain copy.
             if (g_live.pReflectSkyColor && g_fogSkyStrength > 0.0f) {
                 cmdBindRenderTargets(g_live.pCmd, nullptr);
-                snapshotColorTarget(g_live.pReflectColor, g_live.pReflectSkyColor, false);
+                // W5: pReflectColor is MSAA now, so this snapshot is a RESOLVE, not a plain copy.
+                snapshotColorTarget(g_live.pReflectColor, g_live.pReflectSkyColor,
+                                    g_live.sampleCount > 1);
                 BindRenderTargetsDesc rsb = {};
                 rsb.mRenderTargetCount = 1;
                 rsb.mRenderTargets[0] = { g_live.pReflectColor, LOAD_ACTION_LOAD };
@@ -14980,14 +15097,19 @@ namespace ForgeRender {
                 LOG::flush();
             }
 
-            // End the reflect pass; pReflectColor RENDER_TARGET -> SHADER_RESOURCE (water samples it).
+            // End the reflect pass; both targets back to SHADER_RESOURCE — water samples the colour
+            // (through the pyramid) and, since W4c, the DEPTH as well. The restore half of the pair
+            // at the top of the pass.
             cmdBindRenderTargets(g_live.pCmd, nullptr);
             {
-                RenderTargetBarrier rb = {};
-                rb.pRenderTarget = g_live.pReflectColor;
-                rb.mCurrentState = RESOURCE_STATE_RENDER_TARGET;
-                rb.mNewState = RESOURCE_STATE_SHADER_RESOURCE;
-                cmdResourceBarrier(g_live.pCmd, 0, nullptr, 0, nullptr, 1, &rb);
+                RenderTargetBarrier rb[2] = {};
+                rb[0].pRenderTarget = g_live.pReflectColor;
+                rb[0].mCurrentState = RESOURCE_STATE_RENDER_TARGET;
+                rb[0].mNewState = RESOURCE_STATE_SHADER_RESOURCE;
+                rb[1].pRenderTarget = g_live.pReflectDepth;
+                rb[1].mCurrentState = RESOURCE_STATE_DEPTH_WRITE;
+                rb[1].mNewState = RESOURCE_STATE_SHADER_RESOURCE;
+                cmdResourceBarrier(g_live.pCmd, 0, nullptr, 0, nullptr, 2, rb);
             }
 
             // WT4d/P2: build the pre-filtered pyramid the moment the mirror is readable, still in
@@ -15000,11 +15122,18 @@ namespace ForgeRender {
             if (g_live.reflectMipReady) {
                 cmdBeginDebugMarker(g_live.pCmd, 0.4f, 0.7f, 1.0f, "REFLECT MIPS (pReflectColor -> 6-level box pyramid)");
                 {
-                    TextureBarrier tb = {};
-                    tb.pTexture = g_live.pReflectMips;
-                    tb.mCurrentState = RESOURCE_STATE_SHADER_RESOURCE;
-                    tb.mNewState = RESOURCE_STATE_UNORDERED_ACCESS;
-                    cmdResourceBarrier(g_live.pCmd, 0, nullptr, 1, &tb, 0, nullptr);
+                    // W5: the resolved-depth target travels with the pyramid — same SR -> UAV bracket,
+                    // same restore below. It is written only by the first dispatch but the bracket
+                    // spans the whole build, which costs nothing and keeps the pair impossible to
+                    // split by a later edit.
+                    TextureBarrier tb[2] = {};
+                    tb[0].pTexture = g_live.pReflectMips;
+                    tb[0].mCurrentState = RESOURCE_STATE_SHADER_RESOURCE;
+                    tb[0].mNewState = RESOURCE_STATE_UNORDERED_ACCESS;
+                    tb[1].pTexture = g_live.pReflectDepthResolved;
+                    tb[1].mCurrentState = RESOURCE_STATE_SHADER_RESOURCE;
+                    tb[1].mNewState = RESOURCE_STATE_UNORDERED_ACCESS;
+                    cmdResourceBarrier(g_live.pCmd, 0, nullptr, 2, tb, 0, nullptr);
                 }
                 cmdBindPipeline(g_live.pCmd, g_live.pReflectMipPipelineFirst);
                 cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pReflectMipSet);
@@ -15022,11 +15151,14 @@ namespace ForgeRender {
                     cmdDispatch(g_live.pCmd, (mw + 7u) / 8u, (mw + 7u) / 8u, 1);
                 }
                 {
-                    TextureBarrier tb = {};
-                    tb.pTexture = g_live.pReflectMips;
-                    tb.mCurrentState = RESOURCE_STATE_UNORDERED_ACCESS;
-                    tb.mNewState = RESOURCE_STATE_SHADER_RESOURCE;
-                    cmdResourceBarrier(g_live.pCmd, 0, nullptr, 1, &tb, 0, nullptr);
+                    TextureBarrier tb[2] = {};
+                    tb[0].pTexture = g_live.pReflectMips;
+                    tb[0].mCurrentState = RESOURCE_STATE_UNORDERED_ACCESS;
+                    tb[0].mNewState = RESOURCE_STATE_SHADER_RESOURCE;
+                    tb[1].pTexture = g_live.pReflectDepthResolved;
+                    tb[1].mCurrentState = RESOURCE_STATE_UNORDERED_ACCESS;
+                    tb[1].mNewState = RESOURCE_STATE_SHADER_RESOURCE;
+                    cmdResourceBarrier(g_live.pCmd, 0, nullptr, 2, tb, 0, nullptr);
                 }
                 cmdEndDebugMarker(g_live.pCmd);
             }
@@ -17661,7 +17793,11 @@ namespace ForgeRender {
             if (g_live.pReflectMipPipelineFirst) { removePipeline(R, g_live.pReflectMipPipelineFirst); g_live.pReflectMipPipelineFirst = nullptr; }
             if (g_live.pReflectMipShaderFirst)   { removeShader(R, g_live.pReflectMipShaderFirst);     g_live.pReflectMipShaderFirst = nullptr; }
             ShaderLoadDesc rfd = {};
-            rfd.mComp.pFileName = "reflectmipfirst.comp";
+            // W5: same sampleCount-driven variant pick as the build path — the two MUST agree, or a
+            // hot-reload silently swaps a resolve for a copy (or a copy for a resolve, which reads a
+            // Tex2DMS through a Tex2D declaration).
+            rfd.mComp.pFileName = (g_live.sampleCount > 1) ? "reflectmipfirst_sc4.comp"
+                                                           : "reflectmipfirst_sc1.comp";
             addShader(R, &rfd, &g_live.pReflectMipShaderFirst);
             ShaderLoadDesc rrd = {};
             rrd.mComp.pFileName = "reflectmip.comp";
@@ -25738,6 +25874,7 @@ namespace ForgeRender {
         if (g_live.pReflectMipShader)       { removeShader(R, g_live.pReflectMipShader); }
         if (g_live.pReflectMipShaderFirst)  { removeShader(R, g_live.pReflectMipShaderFirst); }
         if (g_live.pReflectMips)            { removeResource(g_live.pReflectMips); }
+        if (g_live.pReflectDepthResolved)   { removeResource(g_live.pReflectDepthResolved); }
         // P1 point-light shadows.
         if (g_live.pShadowMaskSet)       { removeDescriptorSet(R, g_live.pShadowMaskSet); }
         if (g_live.pShadowFaceSet)       { removeDescriptorSet(R, g_live.pShadowFaceSet); }

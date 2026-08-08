@@ -402,6 +402,23 @@ BEGIN_SRT_NO_AB(SrtData)
         // mismatch the gWaterNormalVol comment above already calls illegal.
         // Appended AFTER gReflectMips — append only, see the note above gSkyHeight.
         DECL_TEXTURE(PerFrame, Tex2DArray(float), gWaterSlopeVar)
+        // W4c: the mirror pass's own depth (pReflectDepth, 1024² D32 reverse-Z), so water can ask
+        // HOW FAR AWAY the thing it is reflecting actually is.
+        //
+        // The reflection blur is `2*alpha * L/(L+d)`, L = water->reflected object, d = camera->water:
+        // a ray deflected at the surface sweeps L before it lands, and that sweep subtends less angle
+        // the closer the object is. Assuming L -> inf (the shipped model) makes the blur constant
+        // along a reflection, when in reality it GROWS from zero at the waterline to full at the tip —
+        // the single most recognisable thing about a reflection in water.
+        // Under the mirror the reflected object sits at `d + L` from the camera, so this depth IS
+        // `L + d` and the factor is just `1 - dist/D_refl`. Sky (un-drawn, reverse-Z 0 = far) gives 1,
+        // the shoreline touching the water gives 0. Both correct, neither special-cased.
+        //
+        // ⚠ Read by water.frag ONLY, bound ONLY into the main pPerFrameSet, and left UNBOUND when the
+        // reflect pass failed to build — which reads ZERO = reverse-Z far = factor 1 = exactly the
+        // pre-W4c behaviour. Same deliberate no-fallback arrangement as gWaterSlopeVar above.
+        // Appended AFTER gWaterSlopeVar — append only, see the note above gSkyHeight.
+        DECL_TEXTURE(PerFrame, Tex2D(float), gReflectDepth)
     END_SRT_SET(PerFrame)
     // Point-light cbuffer — rides the otherwise-unused PerDraw set (FSL has exactly four
     // fixed update frequencies: Persistent/PerFrame/PerBatch/PerDraw; a custom set name has

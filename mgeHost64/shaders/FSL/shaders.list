@@ -430,8 +430,20 @@
 // PREMULTIPLIED channels with identical weights (see reflectmip.srt.h). Feeds water.frag's
 // roughness-driven reflection LOD; without it a rough surface would sample a mirror-sharp RT and
 // alias. Both run in the main cmd where pReflectColor flips to SHADER_RESOURCE.
-#comp reflectmipfirst.comp
+// W5: the first pass is now also the mirror pass's RESOLVE — pReflectColor/Depth are MSAA at
+// g_live.sampleCount, so it averages the colour samples into mip 0 and writes a single-sample copy of
+// the depth for water.frag's hit-distance term. Two SAMPLE_COUNT variants, hizfirst's pattern, because
+// Tex2DMS needs SAMPLE_COUNT as a literal. The reduce below stays single-variant: it only ever reads
+// the already-resolved pyramid.
+#comp reflectmipfirst_sc1.comp
 #define REFLMIP_FIRST 1
+#define SAMPLE_COUNT 1
+#include "reflectmip.comp.fsl"
+#end
+
+#comp reflectmipfirst_sc4.comp
+#define REFLMIP_FIRST 1
+#define SAMPLE_COUNT 4
 #include "reflectmip.comp.fsl"
 #end
 
