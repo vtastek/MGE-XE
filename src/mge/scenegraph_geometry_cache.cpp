@@ -1935,9 +1935,14 @@ namespace MGE::GeometryCache {
         // hasTransformAnim=false → it takes the STATIC path: shut/teleport doors stay cached, while a
         // swinging door's panel center arcs far past the host move-eps and re-renders via the
         // caster-moved epoch bump that same frame. Same story as a still hammock / fixed lantern.
+        //
+        // searchParents=false answers only at the node that OWNS the reference (the object root).
+        // The deep walk uses that form: it asks the question at every node it descends, and the
+        // climbing form would re-walk the parent chain from each of a static's inner nodes to get
+        // the same "None" it already had. The owning node is the only place the answer differs.
         enum class LiveKind { None, Mover, Ambiguous };
-        LiveKind referenceLiveKind(const NI::ObjectNET* obj) {
-            const void* ref = obj->getTes3Reference(/*searchParents=*/true);
+        LiveKind referenceLiveKind(const NI::ObjectNET* obj, bool searchParents = true) {
+            const void* ref = obj->getTes3Reference(searchParents);
             if (!ref) return LiveKind::None;
             const void* base = *reinterpret_cast<void* const*>(
                 static_cast<const char*>(ref) + 0x28);
@@ -2692,7 +2697,30 @@ namespace MGE::GeometryCache {
                 // valid bone palette (the NPC hasn't been updated) and un-hides app-culled collision,
                 // both of which render white (the reported "white collision on NPCs"). Skip the whole
                 // character subtree in the deep pass; ordinary and FP walks never set bypassCullDeep.
-                if (bypassCullDeep && isCharNode) return;
+                //
+                // ⚠ isCharNode ALONE DOES NOT FIND THE CHARACTER. It asks whether a DIRECT child is
+                // skinned, which is the right question for "does this node's geometry animate" and
+                // the wrong one for "is this a character": a creature wraps its skinned body in a
+                // node of its own, so the verdict is false at the reference root and only turns true
+                // several levels down — after the walk has already descended everywhere else in the
+                // mesh. goblin01.nif's root has NINE children and every one is an NiNode; five of
+                // them are `GoblinHead01..05`, morph-target head shapes the artist shipped
+                // APP_CULLED, which is exactly the flag bypassCullDeep exists to walk through. MW
+                // never draws them. The host drew all five, stacked at the bind-pose head position
+                // above the goblin's real (bone-driven) head — the reported "double heads".
+                //
+                // The flag cannot distinguish "the engine culled this off-screen leaf" (what the
+                // deep walk is for) from "the artist shipped this hidden" (6701 shapes across 1956
+                // vanilla+mod NIFs — tools/nif-hidden-census.py). So don't try: ask the engine what
+                // the reference IS. An NPC or creature is never a static off-screen shadow caster,
+                // which is the entire premise of the deep pass, and the normal visible/skinned path
+                // already captures it correctly. Non-climbing: the answer only differs at the node
+                // that owns the reference, and returning here means we never descend past it.
+                if (bypassCullDeep
+                    && (isCharNode
+                        || referenceLiveKind(node, /*searchParents=*/false) == LiveKind::Mover)) {
+                    return;
+                }
                 // bypassCull is TOP-ONLY (children keep their engine cull state — the FP walk
                 // depends on that to select the sheathed/drawn weapon variant), so it is NOT
                 // propagated. bypassCullDeep IS propagated: the fixture shadow-capture below needs

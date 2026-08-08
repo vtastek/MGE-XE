@@ -3201,7 +3201,13 @@ namespace {
     // e.g. the hammock (active_de_bed_30) is blend=1 test=0 yet its wicker texture is binary
     // 0/255 alpha. MASK-textured alpha-over blends cast shadows (with a synthetic alpha-test
     // ref); TRANSLUCENT ones (smoke, ghosts, soft glass) never do.
-    enum : uint8_t { kTexAlphaOpaque = 0, kTexAlphaMask = 1, kTexAlphaTranslucent = 2 };
+    //
+    // TRANSLUCENT vs SOFT is the same question one step down: a broad mid-band means "soft edges"
+    // on a texture that also has real holes (the hammock's rope weave, 47% transparent), and means
+    // "no holes at all" on one that has none (pc_colouredglass, 0% transparent). Only the first can
+    // be thresholded back into a cutout; see classifyDdsAlpha.
+    enum : uint8_t { kTexAlphaOpaque = 0, kTexAlphaMask = 1, kTexAlphaTranslucent = 2,
+                     kTexAlphaSoft = 3 };
     uint8_t g_texAlphaKind[MAX_TEXTURES] = {};
     // Same classification for flip-book slices, which have no gTextures slot to key on. One vector
     // per bucket, sized when the bucket's array is created (uploadFlipSlice).
@@ -16283,6 +16289,8 @@ namespace ForgeRender {
                 //   GREEN  cached, caster record registered this frame
                 //   RED    cached, blend pair isn't alpha-over (dst != INVSRCALPHA)
                 //   ORANGE cached, matAlpha ≤ 0.5 (fading — must not cast)
+                //   CYAN   cached, SOFT texture with no NIF alpha test (glass/smoke — no holes to
+                //          carve, so the knob's threshold would invent a solid occluder)
                 //   WHITE  cached, strict-mode reject (knob 0, no NIF test, not MASK-classified)
                 //   GRAY   cutout-blend casters checkbox is off
                 float clsR = 0.4f, clsG = 0.4f, clsB = 0.4f;
@@ -16321,11 +16329,28 @@ namespace ForgeRender {
                     // the hammock's woven rope that the histogram calls TRANSLUCENT). Gates:
                     // alpha-over only (dst = D3D INVSRCALPHA = 6; additive glows are light, not
                     // occluders) and matAlpha > 0.5 (a fading part must not cast while invisible).
+                    //
+                    // ⚠ THRESHOLD MODE NEEDS SOMETHING TO THRESHOLD. The knob defaults to 0.5,
+                    // which is > 0, so on its own that third disjunct enrols EVERY alpha-over
+                    // blend whose material alpha clears 0.5 — including surfaces with no
+                    // transparent texel anywhere. pc_col_streetlamp_01's glass is exactly that
+                    // (NIF alphaRef 0, matAlpha 0.8, pc_colouredglass.dds 0% transparent / 85%
+                    // mid-band): the 0.5 cut kept roughly half the mid-band, so the lamp threw a
+                    // solid blotchy occluder around its own AttachLight and caged it — the
+                    // reported "glass lamps blocking light", and the same shape as the ShadowBox
+                    // and lantern-paper cages before it. Raising the knob DOES clear it, and that
+                    // is the tell rather than the fix: the ref that erases the glass also erases
+                    // the hammock's weave, because one global cut cannot serve two histograms.
+                    // The per-texture term is transparent COVERAGE, so kTexAlphaSoft carries it
+                    // and only real cutouts reach the knob.
                     if (g_shadowBlendCasters) {
                         if (it.destBlend != kD3DBLEND_INVSRCALPHA) {
                             clsR = 1.0f; clsG = 0.0f; clsB = 0.0f;         // RED: not alpha-over
                         } else if (it.matAlpha <= 0.5f) {
                             clsR = 1.0f; clsG = 0.4f; clsB = 0.0f;         // ORANGE: fading
+                        } else if (it.alphaRef <= 0.0f
+                                   && texAlphaKindOf(it.texIndex) == kTexAlphaSoft) {
+                            clsR = 0.0f; clsG = 0.8f; clsB = 1.0f;         // CYAN: nothing to carve
                         } else if (it.alphaRef > 0.0f || g_shadowBlendRef > 0.0f
                                    || texAlphaKindOf(it.texIndex) == kTexAlphaMask) {
                             clsR = 0.0f; clsG = 1.0f; clsB = 0.0f;         // GREEN: caster registered
@@ -18260,8 +18285,17 @@ namespace ForgeRender {
             return kTexAlphaOpaque;
         }
         if (nTexels == 0 || (nTrans + nMid) == 0) { return kTexAlphaOpaque; }
-        if (nTrans > nTexels / 64 && nMid < nTexels / 4) { return kTexAlphaMask; }
-        return kTexAlphaTranslucent;
+        const bool hasHoles = nTrans > nTexels / 64;   // meaningful FULLY-transparent coverage
+        if (hasHoles && nMid < nTexels / 4) { return kTexAlphaMask; }
+        // ⚠ The two ways to reach "broad mid-band" are NOT the same surface, and the caster gate
+        // has to tell them apart. tx_rope_woven_01 (the hammock) is 47% transparent + 31% mid: a
+        // real cutout whose edges are just soft, so a threshold carves the weave that is already
+        // there. pc_colouredglass is 0% transparent + 85% mid: a sheet of glass, with no hole in
+        // it at any alpha level. Thresholding THAT does not recover a cutout, it invents one —
+        // and a depth-only atlas can only store the invention as solid occlusion, so the lamp
+        // ends up caging its own light. Nothing downstream can recover the distinction, because
+        // `nTrans` is exactly what the TRANSLUCENT verdict throws away. So keep it.
+        return hasHoles ? kTexAlphaTranslucent : kTexAlphaSoft;
     }
 
     // Per-bucket flip-array state. `slices` is what the client declared (every slice of a bucket
