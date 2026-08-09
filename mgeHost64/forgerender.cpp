@@ -1156,6 +1156,23 @@ namespace {
         // simply requires MSAA; until then this silently stays LDR at 1x rather than failing.
         TinyImageFormat sceneColorFormat = TinyImageFormat_B8G8R8A8_UNORM;
 
+        // ...and what the target's CONTENTS MEAN, which step 6a made a separate question from what
+        // they are stored as — but NOT a separate switch. `sceneReferred` is the folded
+        // `g_hdrSceneColor && sampleCount > 1` decided in the same breath as the format above, and
+        // it is the ONLY place either half is evaluated: every receiver (the colour frags via
+        // gShadowParams.toneParams.x, resolve.frag via gResolveParams.opts.y) reads this bit and
+        // never asks about a format or a sample count.
+        //
+        // The two must move together. Scene-referred values exceed 1.0 by construction — that is the
+        // whole point, it is what bloom reads and what a lantern rolls off from — and writing them
+        // into B8G8R8A8_UNORM would clamp every one of them, which is strictly worse than leaving
+        // the curve in the passes. So "wide format" and "wide units" are one decision.
+        //
+        // false => each colour frag ends with tonemap() exactly as it always has and resolve.frag
+        //          leaves the curve alone: today's image, byte for byte.
+        // true  => the frags write radiance and resolve.frag applies the curve once, at the end.
+        bool            sceneReferred = false;
+
         // --- M1c opaque scene path (GPU-driven: one PerFrame set, structured buffer) ---
         RenderTarget*  pDepth = nullptr;          // depth buffer for the scene
         Shader*        pOpaqueShader = nullptr;
@@ -2302,6 +2319,46 @@ namespace {
     // Below the eye's horizontal plane saturate(dir.z) is 0 and this is inert at ANY strength, which
     // is why the ground, the sea and everything under the horizon cannot move: the negative control.
     float              g_fogSkyStrength  = 1.0f;
+
+    // --- LIFTING AUTHORED FOG INTO SCENE-REFERRED UNITS (step 6a) --------------------------------
+    // A C++ mirror of tonemap.h.fsl's curve, and its inverse. It exists for exactly one input:
+    // fogColNear, MW's authored weather fog colour, which arrives display-referred in [0,1] off the
+    // IPC wire and is the ONE value that reaches the render target today WITHOUT passing through
+    // tonemap() — sky.frag never calls the curve, and applyFog() at full fog returns fogSkyTarget()
+    // untouched. Move the curve to the resolve and that value would suddenly be tonemapped for the
+    // first time, darkening every fogged pixel by ~16% at the top end (tonemap(1.0) = 0.84).
+    //
+    // So it is lifted at the boundary instead: inverse-tonemap on upload, so the final curve returns
+    // it unchanged and interiors, underwater and everything at or below the horizon are BIT-neutral.
+    // That neutrality is the regression test for the whole step. Lighting inputs (ambCol, sunCol) are
+    // deliberately NOT lifted — they already feed a path that gets tonemapped, so nothing about them
+    // changes. The criterion, stated once: lift exactly the values that reach the target today
+    // without passing through the curve.
+    //
+    // ⚠ MIRROR. If tonemap.h.fsl's coefficients ever change, these change with them, and the failure
+    // mode of forgetting is a fog colour that is subtly wrong everywhere at once rather than a crash.
+    inline float tonemapCurve(float c) {
+        c = (c < 0.0f) ? 0.0f : (c > 2.2f ? 2.2f : c);
+        return (((0.0548303f * c - 0.189786f) * c - 0.154732f) * c + 1.12969f) * c;
+    }
+    // BISECTION, not Newton. The cubic is monotone over almost all of [0, 2.2] but has a shallow
+    // non-monotonic dip near c ~ 1.85-2.15 (it overshoots to ~1.0010 at 1.85, sags to ~0.99945 at
+    // 2.0, returns to exactly 1.0 at 2.2) — a derivative that changes sign is precisely where
+    // Newton walks off. Bisection cannot: the invariant is only that the answer lies between the
+    // brackets. Below the dip the root is unique and this is exact to ~1e-7 in 24 halvings; inside
+    // it any of the three roots reproduces the input to within 0.0015, which is under a UNORM8 step.
+    // Three floats per frame, so the iteration count is chosen for accuracy and not for cost.
+    inline float inverseTonemap(float d) {
+        if (d <= 0.0f) { return 0.0f; }
+        if (d >= 1.0f) { return 2.2f; }
+        float lo = 0.0f, hi = 2.2f;
+        for (int i = 0; i < 24; ++i) {
+            const float mid = 0.5f * (lo + hi);
+            if (tonemapCurve(mid) < d) { lo = mid; } else { hi = mid; }
+        }
+        return 0.5f * (lo + hi);
+    }
+
     // MW's enchanted-item glow: the caustic environment map the engine lays over every enchanted
     // weapon, armour piece and misc item (textures\magicitem\caust00..31.dds, cycled by MW itself).
     // The DX9 baseline reproduces it because MGE's FFE JIT implements D3D texgen in full; the Forge
@@ -2510,7 +2567,7 @@ namespace {
     //   invViewProj 0..15 | screenParams 16..19 | maskParams 20..23 | slotPosRad[32] 24..151 |
     //   slotTile[32] 152..279 | biasParams 280..283 | slotBits 284..287 | slotFlick[32] 288..415 |
     //   sunViewProj[N] 416.. | sunParams | sunCascadeTexel | sunPcf0/1 | volFog0..4 | screenAlloc |
-    //   shAr/shAg/shAb | skyParams
+    //   shAr/shAg/shAb | skyParams | skyAOMap | sunOcc | skyAO2 | toneParams
     // Declared HERE rather than beside publishSunShadowParams because the per-frame camera write
     // (invViewProj + screenParams + screenAlloc + the sky SH) happens far earlier in the frame than
     // that function.
@@ -2544,8 +2601,16 @@ namespace {
     // floats, so the CBV allocation moved 2048 -> 4096 exactly as its own comment predicted — a one-off
     // CBV size, not a per-frame cost. Keep the assert against the ALLOCATION.
     constexpr uint32_t kSkyAO2Float    = kSunOccFloat + 4;
+    // SCENE COLOUR UNITS (step 6a): x = 1 when the render target is scene-referred, i.e. when the
+    // tonemap has moved out of the colour frags and into resolve.frag. It rides THIS cbuffer and not
+    // gFrameData for the reason the block comment above gives, and the reason is load-bearing here
+    // rather than merely tidy: gFrameData's six copies are truncated at three different lengths
+    // (464 B for reflect-geo / sun / sky-height, 288 for the reflect sky pass), so a flag past float
+    // 115 would read ZERO in the reflect-geo pass — which draws statics.frag and terrain.frag, and
+    // would have tonemapped the mirrored world while the direct world did not.
+    constexpr uint32_t kToneFloat      = kSkyAO2Float + 4;
     constexpr uint32_t kShadowParamsBytes = 4096;
-    static_assert((kSkyAO2Float + 4) * sizeof(float) <= kShadowParamsBytes,
+    static_assert((kToneFloat + 4) * sizeof(float) <= kShadowParamsBytes,
                   "ShadowMaskParams overflows its CBV — too many sun cascades");
     // msmrecv.h.fsl's PCSS works in TEXELS, so SUN_SHADOW_RES has to agree with the atlas the host
     // actually allocated. Same mirroring contract as SUN_CASCADES / kSunCascades.
@@ -2638,9 +2703,22 @@ namespace {
         }
 
         // FrameData floats: sunDir 16..18, sunCol 20..22, fogColNear 28..30, skyZenith 68..70.
+        //
+        // ⚠ fogColNear IS LIFTED IN THE CBUFFER when the scene target is scene-referred (step 6a),
+        // and this projection must NOT see the lift. Step 6a's criterion is that lighting inputs are
+        // unchanged — the lift exists so the FOG TARGET survives a curve that now runs at the end of
+        // the frame, and the SH is a light, not a fog target. Left lifted, the horizon would brighten
+        // against an un-lifted zenith and the normalised directional factor would quietly tilt.
+        // Undone by running the curve forward rather than by keeping a second copy of the colour:
+        // tonemapCurve(inverseTonemap(x)) == x to ~1e-7, and one copy cannot go stale.
         const float sunDir[3] = { fd[16], fd[17], fd[18] };
         const float sunCol[3] = { fd[20], fd[21], fd[22] };
-        const float horiz[3]  = { fd[28], fd[29], fd[30] };
+        float       horiz[3]  = { fd[28], fd[29], fd[30] };
+        if (g_live.sceneReferred) {
+            horiz[0] = tonemapCurve(horiz[0]);
+            horiz[1] = tonemapCurve(horiz[1]);
+            horiz[2] = tonemapCurve(horiz[2]);
+        }
         const float zenith[3] = { fd[68], fd[69], fd[70] };
 
         // Fixed ~uniform direction table, built once. Fibonacci sphere: z is uniform over [-1,1],
@@ -5664,8 +5742,12 @@ namespace {
                 skaBlend.mColorWriteMasks[0] = COLOR_MASK_ALL;
                 skaBlend.mRenderTargetMask   = BLEND_STATE_TARGET_0;
                 skaBlend.mIndependentBlend   = false;
-                BlendStateDesc skaBlendAdd = skaBlend;                 // SRCALPHA/ONE
+                // SRCALPHA/ONE. Alpha is a coverage UNION, not a sum — see skyBlendAdd's note; the
+                // skinned additive path (enchant/magic effects on animated meshes) is the same
+                // shape as the sorted-alpha one and would inflate coverage identically at fp16.
+                BlendStateDesc skaBlendAdd = skaBlend;
                 skaBlendAdd.mDstFactors[0]      = BC_ONE;
+                skaBlendAdd.mSrcAlphaFactors[0] = BC_ONE_MINUS_DST_ALPHA;   // union, not sum
                 skaBlendAdd.mDstAlphaFactors[0] = BC_ONE;
 
                 RasterizerStateDesc skaRasterNone = skRaster;
@@ -6184,13 +6266,36 @@ namespace {
                 return false;
             }
 
-            // SK2: a second, ADDITIVE sky PSO (SRCALPHA/ONE) — groundwork for the deferred sun
-            // glare + cloud layers. Identical to the alpha-over PSO except dst colour = ONE
-            // (and dst alpha = ONE so coverage accumulates). skyPipelineFor() picks per draw by
-            // the captured (src,dst) blend pair; the SK2 elements (sun/moons/stars) are all
-            // alpha-over and use pSkyPipeline. Built unconditionally (zero cost when unused).
+            // SK2: a second, ADDITIVE sky PSO (SRCALPHA/ONE). skyPipelineFor() picks per draw by
+            // the captured (src,dst) blend pair; the MOON PHASE textures (tx_masser_*/tx_secunda_*)
+            // are the sky's only additive draws — the dome, stars, sun and mooncircles are all
+            // alpha-over. Built unconditionally (zero cost when unused).
+            //
+            // ⚠ COVERAGE IS A UNION, NOT A SUM — and the old `dst alpha = ONE so coverage
+            // accumulates` was only ever safe because B8G8R8A8_UNORM SATURATED it on write.
+            // fp16 removed that clamp (step 6a) and the bug surfaced instantly: a moon drawn
+            // additively over the opaque dome stored alpha 1 + 1 = 2, and the resolve's
+            // premultiplied clamp (`aRaw > 1 -> rgb *= 1/aRaw`, resolve.frag) then divided the
+            // moon's colour by two. Measured: 1.00 in LDR against 0.65 at fp16, a 35% drop on
+            // exactly the two shapes that are additive and nothing else. It read as "moons look
+            // darker" with a gamma-ish falloff across the soft edge, where the stored alpha slides
+            // between 1 and 2.
+            //
+            // ONE_MINUS_DST_ALPHA on the source makes the alpha channel the standard coverage
+            // UNION `src.a*(1-dst.a) + dst.a`: identical to the saturated sum for every input in
+            // [0,1], so this restores the LDR image exactly rather than inventing a third
+            // behaviour, and it can no longer exceed 1 at any format. The colour channels keep
+            // SRCALPHA/ONE — an additive emitter still ADDS LIGHT, it just stops claiming to add
+            // coverage it does not have.
+            //
+            // NOT `BC_ZERO` ("leave dst alpha alone", which the DL statics add/multiply PSOs use):
+            // that is right for a layer drawn ON an existing opaque surface, but a moon can sit
+            // over the transparent band above the dome rim where the host draws nothing, and
+            // contributing zero coverage there would let the seam composite show MW's own frame at
+            // full strength UNDER our moon — a double exposure. The union keeps that case correct.
             BlendStateDesc skyBlendAdd = skyBlend;
             skyBlendAdd.mDstFactors[0]      = BC_ONE;
+            skyBlendAdd.mSrcAlphaFactors[0] = BC_ONE_MINUS_DST_ALPHA;   // union, not sum
             skyBlendAdd.mDstAlphaFactors[0] = BC_ONE;
             sg.pBlendState = &skyBlendAdd;
             addPipeline(R, &skPd, &g_live.pSkyPipelineAdd);
@@ -6535,9 +6640,15 @@ namespace {
             alphaBlend.mColorWriteMasks[0] = COLOR_MASK_ALL;
             alphaBlend.mRenderTargetMask   = BLEND_STATE_TARGET_0;
             alphaBlend.mIndependentBlend   = false;
-            // Additive variant (SRCALPHA/ONE — glows, magic effects on statics).
+            // Additive variant (SRCALPHA/ONE — FIRE and other particle VFX, glows, magic effects).
+            // ⚠ Alpha is a coverage UNION, not a sum — see the long note on skyBlendAdd. This is the
+            // path that made "fire particles look darker" at fp16, and it is the WORST case of that
+            // bug rather than a second one: particles STACK, so a dense flame core summed alpha to
+            // 3, 4, 5+ where the sky's moons only ever reached 2, and the resolve then divided the
+            // colour by all of it. UNORM used to saturate every one of those writes at 1.0.
             BlendStateDesc alphaBlendAdd = alphaBlend;
             alphaBlendAdd.mDstFactors[0]      = BC_ONE;
+            alphaBlendAdd.mSrcAlphaFactors[0] = BC_ONE_MINUS_DST_ALPHA;   // union, not sum
             alphaBlendAdd.mDstAlphaFactors[0] = BC_ONE;
 
             RasterizerStateDesc alphaRaster = {};
@@ -7527,13 +7638,14 @@ namespace {
             addDescriptorSet(R, &lset, &g_live.pLinearizeSet);
 
             // --- APL instrument (tasks/forge-postprocess.md step 2) ---
-            // Same sc1/sc4 variant selection as linearize above, for the same reason: it reads the
-            // colour target, which is multisampled exactly when the scene is. NON-FATAL throughout —
-            // this is a measuring stick, and a renderer that refuses to start because its ruler is
-            // missing is a worse outcome than an unmeasured frame. Every use site null-checks.
+            // ONE variant since step 6a moved the dispatch after the resolve: it now reads pRT, the
+            // delivered single-sample image, in every configuration — so unlike linearize above it
+            // has no sc4 twin to pick between. NON-FATAL throughout — this is a measuring stick, and
+            // a renderer that refuses to start because its ruler is missing is a worse outcome than
+            // an unmeasured frame. Every use site null-checks.
             {
                 ShaderLoadDesc asd = {};
-                asd.mComp.pFileName = (g_live.sampleCount > 1) ? "apl_sc4.comp" : "apl_sc1.comp";
+                asd.mComp.pFileName = "apl_sc1.comp";
                 addShader(R, &asd, &g_live.pAplShader);
                 if (g_live.pAplShader) {
                     PipelineDesc apd = {};
@@ -7750,12 +7862,13 @@ namespace {
                 updateDescriptorSet(R, 0, g_live.pLinearizeSet, 2, d);
             }
             if (g_live.pAplSet && g_live.pAplOut && g_live.pAplParamsCbv) {
-                // The target the scene finishes in: the MSAA colour when AA is on, else pRT (which
-                // wraps the shared cross-process resource). Both are created with
-                // DESCRIPTOR_TYPE_TEXTURE, so both are SRV-bindable; both live by now, since
-                // pMSAAColor is made at the top of this same buildOpaquePath and pRT back in init().
-                Texture* aplSrc = (g_live.sampleCount > 1 && g_live.pMSAAColor)
-                                    ? g_live.pMSAAColor->pTexture : g_live.pRT->pTexture;
+                // pRT — the DELIVERED image, which is what the instrument measures since step 6a
+                // moved the dispatch past the resolve. It wraps the shared cross-process resource,
+                // is created with DESCRIPTOR_TYPE_TEXTURE (so it is SRV-bindable), is always
+                // single-sample, and has existed since init(). The old "MSAA colour when AA is on"
+                // branch went with the move: pMSAAColor now carries scene-referred values whenever
+                // fp16 is on, and averaging those would break every APL number ever recorded.
+                Texture* aplSrc = g_live.pRT->pTexture;
                 DescriptorData d[3] = {};
                 d[0].mIndex    = SRT_RES_IDX(AplSrtData, PerBatch, gAplParams);
                 d[0].ppBuffers = &g_live.pAplParamsCbv;
@@ -9366,6 +9479,17 @@ namespace {
     // fp16 only starts paying when the tonemap RELOCATES into the resolve and the passes write
     // linear HDR instead. That is step 6, and this flag is its switch. The plumbing below stays
     // because it is correct and verified behaviour-neutral in LDR — turning it on is one bool.
+    //
+    // STEP 6a HAS LANDED, so this bool now means MORE than a format. It is the sole input to
+    // g_live.sceneReferred (see that declaration), which relocates the tonemap out of the six
+    // colour frags and water's specular term and into resolve.frag, and which lifts MW's authored
+    // fogColNear through the inverse curve on upload so the fog target survives the move. Format and
+    // units are ONE decision because scene-referred values exceed 1.0 and a UNORM target clamps them.
+    //
+    // ⚠ STILL DEFAULTS OFF, and off must be byte-identical to before step 6a: every frag tonemaps,
+    // the resolve does not, fogColNear is not lifted. The A/B is a REBUILD and not a checkbox — the
+    // format is baked into ~14 pipelines at init, which is the same reason the Resolve tab has no
+    // scene-format control. Flip it here, rebuild, and check the horizon fog band first.
     bool     g_hdrSceneColor   = false;
 
     // AO contribution toggles → FrameData.debugParams.w bitmask (bit0 AO, bit1 bent normal, bit2 ambient=white).
@@ -11128,9 +11252,15 @@ namespace ForgeRender {
             const bool wantHdr = g_hdrSceneColor && (g_live.sampleCount > 1);
             g_live.sceneColorFormat = wantHdr ? TinyImageFormat_R16G16B16A16_SFLOAT
                                               : g_live.pRT->mFormat;
-            LOG::logline(">> [scenefmt] %s (requested=%d sampleCount=%u) — deliver=B8G8R8A8_UNORM",
+            // Step 6a: the SAME expression also decides the target's units. One evaluation, stored
+            // once — see the sceneReferred declaration for why these cannot be two switches.
+            g_live.sceneReferred = wantHdr;
+            LOG::logline(">> [scenefmt] %s (requested=%d sampleCount=%u) — deliver=B8G8R8A8_UNORM, "
+                         "scene colour is %s (tonemap in %s)",
                          wantHdr ? "R16G16B16A16_SFLOAT" : "B8G8R8A8_UNORM",
-                         (int)g_hdrSceneColor, g_live.sampleCount);
+                         (int)g_hdrSceneColor, g_live.sampleCount,
+                         wantHdr ? "SCENE-REFERRED" : "display-referred",
+                         wantHdr ? "resolve.frag" : "each colour frag");
             LOG::flush();
             if (g_hdrSceneColor && g_live.sampleCount <= 1) {
                 std::printf("[forge] fp16 scene colour requested but MSAA is OFF — staying LDR "
@@ -11727,6 +11857,24 @@ namespace ForgeRender {
             // which carry them across so every view melts the same way off one write.
             //   fogColNear.w (31) = strength. 0 = the flat-fog image byte for byte (the A/B).
             fd[31] = std::max(0.0f, std::min(g_fogSkyStrength, 1.0f));
+            //   fogColNear.rgb (28..30) — LIFTED into scene-referred units when the target is
+            // (step 6a). MW's authored weather fog colour is display-referred, and it is the only
+            // value that reaches the render target today WITHOUT passing through tonemap(): sky.frag
+            // never calls the curve and applyFog() at full fog returns its target untouched. Moving
+            // the curve to the resolve would tonemap it for the first time and darken every fogged
+            // pixel; inverse-tonemapping it here means the final curve hands back exactly the
+            // authored colour, so interiors, underwater and everything at or below the horizon are
+            // neutral. See inverseTonemap() for why it bisects.
+            //
+            // Overwrite AFTER the 24-float memcpy that landed it (same reason fd[31] is here), and
+            // before every gFrameData copy further down — float 28 is inside all three truncation
+            // lengths, so those copies propagate the lift to the mirror, sun and FP views for free.
+            // If the neutrality check ever fails, this ordering is the first thing to re-verify.
+            if (g_live.sceneReferred) {
+                fd[28] = inverseTonemap(fd[28]);
+                fd[29] = inverseTonemap(fd[29]);
+                fd[30] = inverseTonemap(fd[30]);
+            }
             //   fogParams.zw (34,35) = the inverse extent of the sky copy bound to THIS pass, so the
             // shader turns SV_Position into a uv without knowing which view it is in. The main copy is
             // ALLOC-sized (screen RTs are allocated at the render-scale ceiling and the frame draws a
@@ -12133,6 +12281,17 @@ namespace ForgeRender {
             const uint32_t ah = g_live.allocHeight ? g_live.allocHeight : g_live.height;
             cp[kScreenAllocFloat + 0] = (float)aw;        cp[kScreenAllocFloat + 1] = (float)ah;
             cp[kScreenAllocFloat + 2] = 1.0f / (float)aw; cp[kScreenAllocFloat + 3] = 1.0f / (float)ah;
+            // SCENE COLOUR UNITS (step 6a) — skydome.h.fsl's tonemapInPass() reads this and every
+            // colour frag now ends in it. Published from the SAME unconditional block as the camera
+            // for the same reason that block was hoisted out of the shadowReady gate: a receiver
+            // that reads zero here silently double-tonemaps (or fails to tonemap at all), and a
+            // whole-frame colour shift is exactly the failure that must not depend on some other
+            // subsystem being up. One host write, every PerFrame set, because gShadowParams is
+            // bound into all of them by pointer.
+            cp[kToneFloat + 0] = g_live.sceneReferred ? 1.0f : 0.0f;
+            cp[kToneFloat + 1] = 0.0f;
+            cp[kToneFloat + 2] = 0.0f;
+            cp[kToneFloat + 3] = 0.0f;
         }
         // SH1 sky-directional ambient. Published from HERE — unconditionally, every frame, right
         // after the frame cbuffer's sky/sun colours were written above — rather than from
@@ -15210,6 +15369,36 @@ namespace ForgeRender {
             // host draws fewer from frame 1. Throttled dump. Remove after root-cause.
             static uint32_t s_skySkipLog = 0;
             const bool logSkips = ((s_skySkipLog++ % 300) == 0);
+
+            // [sk-mat] ONE-SHOT composite table for the step-6a moon hunt (forge-postprocess.md).
+            // The moons are the only sky element drawn as a STACK — tx_mooncircle_full_* under
+            // tx_masser_*/tx_secunda_* — and reasoning about a stack needs its real blend factors,
+            // which are the one input the units arithmetic has to assume. It matters because the
+            // fallback below only warns through std::printf, i.e. into a console nobody reads: an
+            // "unexpected moon-shadow blend" silently becomes alpha-over, and alpha-over is the
+            // case the arithmetic says is neutral, so a mis-blended stack would look exactly like
+            // the maths being wrong. Dumped on any CHANGE of the list length (moon phase swaps the
+            // texture, not the count, so also on the first frame) and cross-references the client's
+            // own `>> [sk-diag]` order/texture table by draw index.
+            {
+                static uint32_t s_lastSkyN = 0xFFFFFFFFu;
+                if (nSky != s_lastSkyN) {
+                    s_lastSkyN = nSky;
+                    LOG::logline(">> [sk-mat] sky stack (%u items) — pair with the client's [sk-diag] name table",
+                                 nSky);
+                    for (uint32_t d = 0; d < nSky; ++d) {
+                        const IPC::SkyDrawWire& si = skyItems[d];
+                        const bool add = (si.srcBlend == kD3DBLEND_SRCALPHA && si.destBlend == kD3DBLEND_ONE);
+                        const bool over = (si.srcBlend == kD3DBLEND_SRCALPHA && si.destBlend == kD3DBLEND_INVSRCALPHA);
+                        LOG::logline(">> [sk-mat]   #%u tex=%u blend=%u/%u(%s) vc=%u mat=(%.3f %.3f %.3f) a=%.3f%s",
+                                     d, si.texIndex, si.srcBlend, si.destBlend,
+                                     add ? "ADD" : (over ? "over" : "UNHANDLED->over"),
+                                     si.vColSource, si.matColor[0], si.matColor[1], si.matColor[2],
+                                     si.matAlpha, si.isSunDisc ? "  <-- SUN" : "");
+                    }
+                    LOG::flush();
+                }
+            }
             for (uint32_t k = 0; k < nSky; ++k) {
                 const IPC::SkyDrawWire& it = skyItems[k];
                 const uint32_t slot = it.slot;
@@ -17025,58 +17214,78 @@ namespace ForgeRender {
         }
 
         // --- APL instrument (tasks/forge-postprocess.md step 2) -------------------------------
-        // Runs HERE, last thing before the resolve, and the position is the whole point: everything
-        // that will be displayed has drawn (colour, water, glow, sorted alpha, volfog, FP arms) and
-        // the dev overlay has NOT — drawDevUI() draws after the resolve, and an ImGui panel in the
-        // average would swamp the very shift we are trying to measure.
+        // MOVED AFTER THE RESOLVE by step 6a, and the move is not a tidy-up: it is what keeps the
+        // step-5 baseline table comparable. Read before the resolve, the instrument would start
+        // averaging SCENE-REFERRED values the moment the tonemap relocates, and every number ever
+        // recorded with it would silently stop meaning the same thing. Read after, it measures what
+        // is DELIVERED — the display-referred image in pRT — which is what APL was always a proxy
+        // for and is unaffected by which pass applied the curve.
         //
-        // Reads the target the scene actually finished in: pMSAAColor when AA is on, else pRT. A
-        // self-contained RENDER_TARGET -> SHADER_RESOURCE -> RENDER_TARGET round trip, deliberately
-        // NOT folded into the resolve's own barriers below: that block also drives the cross-process
+        // It also collapses the two paths it used to have. pRT is single-sample by construction (it
+        // is the shared cross-process resource), so the MSAA and 1x cases now take the SAME source,
+        // the SAME non-MS `apl_sc1` variant and the SAME descriptor — the sc4 variant and the
+        // pMSAAColor branch are both gone. What it loses with them is the sub-sample edge bias
+        // apl.comp.fsl documents; the resolved image has no sub-samples to be biased by.
+        //
+        // POSITION: still the last thing before drawDevUI(), which is the property that actually
+        // matters — an ImGui panel in the average would swamp the shift being measured. That is why
+        // this is bundled WITH the overlay into one helper and every branch below calls the helper
+        // instead of drawDevUI() directly: all three branches leave pRT in RENDER_TARGET at exactly
+        // this point, and pairing the two makes "measure, then draw the overlay" impossible to get
+        // out of order in a branch someone adds later.
+        //
+        // A self-contained RENDER_TARGET -> SHADER_RESOURCE -> RENDER_TARGET round trip, deliberately
+        // NOT folded into the resolve's own barriers: that block also drives the cross-process
         // handoff to D3D9Ex natively, and it is not the place to save one barrier.
         //
-        // ⚠ width/height, NOT allocWidth/allocHeight. The colour target is ALLOC-sized while the
-        // scene renders into a width x height viewport inside it ([[project_forge_alloc_vs_render_uv]]);
-        // sampling the allocation would average in never-rendered texels and the number would move
-        // whenever render scale changed, which is exactly when it must NOT.
-        if (g_live.pAplPipeline && g_live.pAplSet && g_live.pAplOut && g_live.pAplParamsCbv) {
-            const uint32_t aplGrid = 128u;   // 128x128 = 16384 samples; see apl.comp.fsl
-            if (g_live.pAplParamsCbv->pCpuMappedAddress) {
-                const float p[4] = { (float)g_live.width, (float)g_live.height, (float)aplGrid,
-                                     1.0f / (float)(aplGrid * aplGrid) };
-                std::memcpy(g_live.pAplParamsCbv->pCpuMappedAddress, p, sizeof(p));
+        // ⚠ width/height, NOT allocWidth/allocHeight. pRT is ALLOC-sized while the scene lands in a
+        // width x height viewport inside it ([[project_forge_alloc_vs_render_uv]]); sampling the
+        // allocation would average in never-rendered texels and the number would move whenever
+        // render scale changed, which is exactly when it must NOT.
+        //
+        // ⚠ It now sits INSIDE kGpuPhaseResolve rather than between the colour phases and it, so
+        // `resolve` in the gpu split carries one 256-thread dispatch it did not carry before. That
+        // is a one-off step in that number, recorded in tasks/forge-postprocess.md — not a
+        // regression to hunt.
+        auto measureAndOverlay = [&]() {
+            if (g_live.pAplPipeline && g_live.pAplSet && g_live.pAplOut && g_live.pAplParamsCbv) {
+                const uint32_t aplGrid = 128u;   // 128x128 = 16384 samples; see apl.comp.fsl
+                if (g_live.pAplParamsCbv->pCpuMappedAddress) {
+                    const float p[4] = { (float)g_live.width, (float)g_live.height, (float)aplGrid,
+                                         1.0f / (float)(aplGrid * aplGrid) };
+                    std::memcpy(g_live.pAplParamsCbv->pCpuMappedAddress, p, sizeof(p));
+                }
+                RenderTargetBarrier arb = {};
+                arb.pRenderTarget = g_live.pRT;   // the DELIVERED image, always single-sample
+                arb.mCurrentState = RESOURCE_STATE_RENDER_TARGET;
+                arb.mNewState     = RESOURCE_STATE_SHADER_RESOURCE;
+                cmdResourceBarrier(g_live.pCmd, 0, nullptr, 0, nullptr, 1, &arb);
+
+                cmdBeginDebugMarker(g_live.pCmd, 0.4f, 0.9f, 0.4f, "APL (delivered colour -> mean RGB + log luma)");
+                cmdBindPipeline(g_live.pCmd, g_live.pAplPipeline);
+                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pAplSet);
+                cmdDispatch(g_live.pCmd, 1, 1, 1);   // ONE group by design — see apl.comp.fsl
+                cmdEndDebugMarker(g_live.pCmd);
+
+                arb.mCurrentState = RESOURCE_STATE_SHADER_RESOURCE;
+                arb.mNewState     = RESOURCE_STATE_RENDER_TARGET;
+                cmdResourceBarrier(g_live.pCmd, 0, nullptr, 0, nullptr, 1, &arb);
+
+                if (g_live.pAplReadback) {
+                    BufferBarrier bb = {};
+                    bb.pBuffer = g_live.pAplOut;
+                    bb.mCurrentState = RESOURCE_STATE_UNORDERED_ACCESS;
+                    bb.mNewState     = RESOURCE_STATE_COPY_SOURCE;
+                    cmdResourceBarrier(g_live.pCmd, 1, &bb, 0, nullptr, 0, nullptr);
+                    g_live.pCmd->mDx.pCmdList->CopyBufferRegion(
+                        g_live.pAplReadback->mDx.pResource, 0, g_live.pAplOut->mDx.pResource, 0, 16);
+                    bb.mCurrentState = RESOURCE_STATE_COPY_SOURCE;
+                    bb.mNewState     = RESOURCE_STATE_UNORDERED_ACCESS;
+                    cmdResourceBarrier(g_live.pCmd, 1, &bb, 0, nullptr, 0, nullptr);
+                }
             }
-            RenderTarget* aplRt = (g_live.sampleCount > 1 && g_live.pMSAAColor) ? g_live.pMSAAColor
-                                                                                : g_live.pRT;
-            RenderTargetBarrier arb = {};
-            arb.pRenderTarget = aplRt;
-            arb.mCurrentState = RESOURCE_STATE_RENDER_TARGET;
-            arb.mNewState     = RESOURCE_STATE_SHADER_RESOURCE;
-            cmdResourceBarrier(g_live.pCmd, 0, nullptr, 0, nullptr, 1, &arb);
-
-            cmdBeginDebugMarker(g_live.pCmd, 0.4f, 0.9f, 0.4f, "APL (scene colour -> mean RGB + log luma)");
-            cmdBindPipeline(g_live.pCmd, g_live.pAplPipeline);
-            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pAplSet);
-            cmdDispatch(g_live.pCmd, 1, 1, 1);   // ONE group by design — see apl.comp.fsl
-            cmdEndDebugMarker(g_live.pCmd);
-
-            arb.mCurrentState = RESOURCE_STATE_SHADER_RESOURCE;
-            arb.mNewState     = RESOURCE_STATE_RENDER_TARGET;
-            cmdResourceBarrier(g_live.pCmd, 0, nullptr, 0, nullptr, 1, &arb);
-
-            if (g_live.pAplReadback) {
-                BufferBarrier bb = {};
-                bb.pBuffer = g_live.pAplOut;
-                bb.mCurrentState = RESOURCE_STATE_UNORDERED_ACCESS;
-                bb.mNewState     = RESOURCE_STATE_COPY_SOURCE;
-                cmdResourceBarrier(g_live.pCmd, 1, &bb, 0, nullptr, 0, nullptr);
-                g_live.pCmd->mDx.pCmdList->CopyBufferRegion(
-                    g_live.pAplReadback->mDx.pResource, 0, g_live.pAplOut->mDx.pResource, 0, 16);
-                bb.mCurrentState = RESOURCE_STATE_COPY_SOURCE;
-                bb.mNewState     = RESOURCE_STATE_UNORDERED_ACCESS;
-                cmdResourceBarrier(g_live.pCmd, 1, &bb, 0, nullptr, 0, nullptr);
-            }
-        }
+            drawDevUI();
+        };
 
         gpuPhaseBegin(kGpuPhaseResolve);
         // --- Custom shader resolve (tasks/forge-postprocess.md step 4) ---------------------------
@@ -17116,8 +17325,14 @@ namespace ForgeRender {
                 const float radius = std::floor(diam * 0.5f + 0.499f);
                 // ⚠ width/height, NOT allocWidth/allocHeight — the clamp bound must be the RENDER
                 // rect or the filter reaches into texels the scene never wrote. Same trap as APL.
+                // opts.y = scene-referred, i.e. THIS pass owns the tonemap (step 6a). Same folded
+                // expression published to gShadowParams.toneParams.x for the colour frags — two
+                // receivers because the resolve has a private SRT and cannot see gShadowParams, but
+                // ONE source, so the pass that applies the curve and the passes that skip it can
+                // never disagree.
                 const float p[8] = { (float)g_live.width, (float)g_live.height, diam, radius,
-                                     g_resolveInvLuma ? 1.0f : 0.0f, 0.0f, 0.0f, 0.0f };
+                                     g_resolveInvLuma ? 1.0f : 0.0f,
+                                     g_live.sceneReferred ? 1.0f : 0.0f, 0.0f, 0.0f };
                 std::memcpy(g_live.pResolveParamsCbv->pCpuMappedAddress, p, sizeof(p));
             }
 
@@ -17162,9 +17377,9 @@ namespace ForgeRender {
             srb.mNewState     = RESOURCE_STATE_RENDER_TARGET;   // ready for next frame
             cmdResourceBarrier(g_live.pCmd, 0, nullptr, 0, nullptr, 1, &srb);
 
-            // Dev overlay into the resolved pRT (RENDER_TARGET), then hand off to COMMON natively —
-            // identical tail to the hardware path below.
-            drawDevUI();
+            // APL on the resolved pRT, then the dev overlay into it (both need RENDER_TARGET), then
+            // hand off to COMMON natively — identical tail to the hardware path below.
+            measureAndOverlay();
             D3D12_RESOURCE_BARRIER toCommon = {};
             toCommon.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
             toCommon.Transition.pResource   = g_live.pSharedRes;
@@ -17217,8 +17432,8 @@ namespace ForgeRender {
             post[1].Transition.StateAfter  = D3D12_RESOURCE_STATE_RENDER_TARGET;   // ready for next frame
             cl->ResourceBarrier(2, post);
 
-            // Dev overlay into the resolved pRT (RENDER_TARGET), then hand off to COMMON natively.
-            drawDevUI();
+            // APL + dev overlay into the resolved pRT (RENDER_TARGET), then hand off to COMMON.
+            measureAndOverlay();
             D3D12_RESOURCE_BARRIER toCommon = {};
             toCommon.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
             toCommon.Transition.pResource = dstRes;
@@ -17227,7 +17442,9 @@ namespace ForgeRender {
             toCommon.Transition.StateAfter  = D3D12_RESOURCE_STATE_COMMON;   // hand off to D3D9Ex
             cl->ResourceBarrier(1, &toCommon);
         } else {
-            // No MSAA: dev overlay into pRT (still RENDER_TARGET), then hand back to COMMON for StretchRect.
+            // No MSAA: APL + dev overlay into pRT (still RENDER_TARGET), then hand back to COMMON for
+            // StretchRect. At 1x the scene rendered straight into pRT, so this is the same read the
+            // instrument always did here — the move only changed the MSAA path.
             // ALSO the degraded fp16 case (MSAA on, converting, shader resolve unavailable): pRT never
             // receives the scene this frame, so the seam shows a stale image with the overlay on top.
             // Visibly wrong and diagnosable from the log, which beats losing the device.
@@ -17240,7 +17457,7 @@ namespace ForgeRender {
                     LOG::flush();
                 }
             }
-            drawDevUI();
+            measureAndOverlay();
             RenderTargetBarrier toCommon = {};
             toCommon.pRenderTarget = g_live.pRT;
             toCommon.mCurrentState = RESOURCE_STATE_RENDER_TARGET;
@@ -20863,9 +21080,13 @@ namespace ForgeRender {
             DepthStateDesc ds = {}; ds.mDepthTest = true; ds.mDepthWrite = false; ds.mDepthFunc = CMP_GEQUAL;
             RasterizerStateDesc rs = {}; rs.mCullMode = CULL_MODE_NONE; rs.mFrontFace = FRONT_FACE_CCW;
             // Additive: out = src.rgb * src.a + dst (SRCALPHA/ONE).
+            // Alpha is a coverage UNION, not a sum — see skyBlendAdd's note. Glow billboards
+            // OVERLAP (that is the whole look of a distant lit town), so this summed coverage as
+            // freely as the particle path did once fp16 stopped saturating the writes.
             BlendStateDesc ab = {};
             ab.mSrcFactors[0] = BC_SRC_ALPHA;  ab.mDstFactors[0] = BC_ONE;
-            ab.mSrcAlphaFactors[0] = BC_ONE;   ab.mDstAlphaFactors[0] = BC_ONE;
+            ab.mSrcAlphaFactors[0] = BC_ONE_MINUS_DST_ALPHA;   // union, not sum
+            ab.mDstAlphaFactors[0] = BC_ONE;
             ab.mBlendModes[0] = BM_ADD;        ab.mBlendAlphaModes[0] = BM_ADD;
             ab.mColorWriteMasks[0] = COLOR_MASK_ALL; ab.mRenderTargetMask = BLEND_STATE_TARGET_0;
             ab.mIndependentBlend = false;
@@ -21906,6 +22127,17 @@ namespace ForgeRender {
         // spending it inside a bandwidth probe. Until then the viewer shows the LDR image.
         g_hdrSceneColor = false;
         if (!init(W, H, viewSamples, viewAniso)) { std::printf("[forge][view] init FAILED\n"); return false; }
+        // ...and step 6a makes that line load-bearing rather than merely tidy. The viewer resolves
+        // with the HARDWARE path and never runs resolve.frag, so if the scene ever came up
+        // scene-referred here the tonemap would not be relocated, it would be GONE — a blown-out
+        // viewer that looks like a shader bug and is not. Assert the two stay tied rather than
+        // trusting the assignment above to survive a future edit to init()'s format decision.
+        if (g_live.sceneReferred) {
+            std::printf("[forge][view] scene came up SCENE-REFERRED but the viewer has no resolve "
+                        "pass to tonemap in — aborting rather than showing an untonemapped frame\n");
+            shutdown();
+            return false;
+        }
         Renderer* R = g_live.pRenderer;
 
         // Run the SAME resident load the live path's lazy init does (terrain residency + statics

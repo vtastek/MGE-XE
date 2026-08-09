@@ -35,3 +35,34 @@ float3 tonemap(float3 c)
     c = (((0.0548303f * c - 0.189786f) * c - 0.154732f) * c + 1.12969f) * c;
     return c;
 }
+
+// THE INVERSE — for lifting DISPLAY-REFERRED data into scene-referred units so the curve above
+// hands it back unchanged. See scenecolor.h.fsl for which passes need that and why; this file only
+// owns the maths.
+//
+// WHY A FITTED FORM AND NOT AN ITERATION. The host inverts exactly, by bisection, because it does it
+// three times a frame (forgerender.cpp::inverseTonemap). A fragment cannot: Newton is the obvious
+// per-pixel answer and it is the wrong one here, because tonemap'(c) passes through ZERO at
+// c ~= 1.85 — the curve has a shallow maximum before it comes back to exactly 1.0 at 2.2 — and
+// Newton divides by that derivative. Right where white lives.
+//
+// THE SUBSTITUTION IS THE WHOLE TRICK. That vanishing derivative is not an obstacle to model, it is
+// the SHAPE to model: a quadratic maximum means d ~= M - k(c* - c)^2 near the top, i.e. the inverse
+// has a SQUARE-ROOT branch point there. In `s = sqrt(1 - d)` the singularity is gone and what is
+// left is nearly a straight line, so a QUADRATIC in s does the whole [0,1] domain:
+//
+//     max round-trip error 0.16/255, monotone, exact at both ends
+//
+// against 1.07/255 for a degree-SEVEN polynomial in d (fitted and measured, 2026-08-09). One sqrt
+// and three mul-adds. The `(1 - s)` factor is not a fitted term — it forces lift(0) = 0 exactly, so
+// black cannot acquire a floor.
+//
+// Input is clamped to [0,1] because that is the range this inverts FROM: display-referred data is
+// what a UNORM target could hold, so anything above 1 was already clipped on screen and lift(1) is
+// the honest answer for it. Callers with genuine radiance (glow.frag, water's specular) must not
+// come here at all.
+float3 inverseTonemap(float3 d)
+{
+    float3 s = sqrt(max(1.0f - clamp(d, 0.0f, 1.0f), 0.0f));
+    return (1.0f - s) * (1.7636304f + s * (-0.4027722f + s * 0.4084603f));
+}

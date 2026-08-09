@@ -233,4 +233,22 @@ STRUCT(ShadowMaskParams)
     //     multiplied into this same ambient.
     // w = spare.
     DATA(float4,   skyAO2,    None);
+    // --- SCENE COLOUR UNITS (tasks/forge-postprocess.md step 6a) ---------------------------------
+    // x = 1 when the scene render target is SCENE-REFERRED, 0 when it is DISPLAY-REFERRED.
+    //
+    // This is the host's folded `g_hdrSceneColor && sampleCount > 1` and NOTHING may re-derive it.
+    // Scene-referred and fp16 are ONE switch, not two correlated ones: scene-referred values exceed
+    // 1.0 and B8G8R8A8_UNORM would clamp them, which is strictly worse than tonemapping in the pass.
+    // Same "one float disarms it at every receiver" idiom as sunParams.x / skyParams.x above — a
+    // receiver asks this lane and never asks about a format.
+    //
+    // Read by tonemapInPass() in skydome.h.fsl, which is where every colour frag now ends: 0 keeps
+    // the curve in the pass (today's image, byte for byte), 1 defers it to resolve.frag so the target
+    // carries radiance for bloom to read. It lives HERE rather than in gFrameData because that
+    // cbuffer is exactly full at its 512 B CBV and its six copies are TRUNCATED at three different
+    // lengths — a flag past float 115 would read zero in the reflect-geo pass, which draws
+    // statics.frag and terrain.frag. gShadowParams is bound by pointer into every PerFrame set, so
+    // one host write reaches all of them.
+    // yzw spare.
+    DATA(float4,   toneParams, None);
 };

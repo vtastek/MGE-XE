@@ -14,8 +14,9 @@
 #include "shadowreceive.h.fsl" // shadowMaskPixel() — the mask texel that is actually OURS under MSAA
 #include "msmrecv.h.fsl"     // sunShadowVisibility() — MSM sun-shadow receiver
 #include "skyamb.h.fsl"      // skyAmbFactor() — SH-L1 sky ambient (SH1) + sky AO (SH2)
-#include "skydome.h.fsl"     // applyFog() — extinguish into a silhouette, then melt into the SAMPLED sky
 #include "tonemap.h.fsl"     // tonemap() — the shared semi-HDR curve (was six byte-identical copies)
+#include "scenecolor.h.fsl" // tonemapInPass() — class 1: the curve moved to resolve.frag (step 6a)
+#include "skydome.h.fsl"     // applyFog() — extinguish into a silhouette, then melt into the SAMPLED sky
 #include "enchantglow.h.fsl" // enchantGlow() — MW's caustic env map over enchanted items
 
 STRUCT(VSOutput)
@@ -333,7 +334,7 @@ float4 PS_MAIN( VSOutput In )
     // they share this frag, which is how a held weapon and worn armour both light up off one call.
     c *= 1.0f + enchantGlow(In.Normal, In.WorldPos, (In.ClampMode & 8u) != 0u);
     c *= gFrameData.dbgScales.w;   // dev panel: overall output intensity modifier
-    c = tonemap(c);
+    c = tonemapInPass(c);
     // Near fog: lerp toward the SKY as Fog -> 0. At the horizon and below that target IS fogColNear,
     // so this is FFE's lerp(fogColNear, c, fog) for everything at or under the eye; above it the
     // target follows the dome so a tower cannot end up brighter than the sky behind it (skydome.h).

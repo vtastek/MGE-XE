@@ -10,6 +10,15 @@
 
 #include "opaque.srt.h"
 #include "msmrecv.h.fsl"   // sunShadowVisibility() — MSM sun-shadow receiver
+// ⚠ CLASS 2, not class 1 (scenecolor.h.fsl). This pass is a copy of statics.frag that has never
+// called tonemap() — a pre-existing divergence from its own twin — so under 6a the final curve
+// would hit it for the first time and dim every hero blend layer. The tempting fix is "add the
+// tonemap it was always missing", i.e. tonemapInPass(); that is wrong, because it would also change
+// the LDR build, and `g_hdrSceneColor = false` has to stay byte-identical to the pre-6a image.
+// liftInPass() is the one that is inert in LDR and preserves the look under HDR. Closing the
+// divergence with statics.frag is a look change and belongs to whoever wants it, deliberately.
+#include "tonemap.h.fsl"    // the curve + its inverse
+#include "scenecolor.h.fsl" // liftInPass() — class 2 (step 6a)
 #include "skydome.h.fsl"   // applyFog() — extinguish into a silhouette, then melt into the SAMPLED sky
 
 // MUST stay byte-identical to statics.vert.fsl's VSOutput (CENTROID modifiers included).
@@ -37,6 +46,11 @@ float4 PS_MAIN( VSOutput In )
     // Sun shadows: Color carries ambient+emissive, SunLight the sun half (split in statics.vert).
     float sunVis = sunShadowVisibility(In.WorldPos, normalize(In.WorldNormal));
     float3 result = tex.rgb * (In.Color.rgb + In.SunLight * sunVis);
+    // Lift BEFORE the fog, so what is preserved is this pass's own colour and the fog it melts into
+    // stays the shared (already scene-referred) target every surface uses. The [0,1] clamp inside
+    // the lift is exact here rather than lossy: Color + SunLight can exceed 1, and the UNORM target
+    // this reproduces clipped it there anyway, so the lift reproduces what was on screen.
+    result = liftInPass(result);
     result = applyFog(result, In.WorldPos, In.Position.xy, In.Fog);
 
     // F12 distance grayscale parity (debugParams.x 1/2), matching statics.frag.

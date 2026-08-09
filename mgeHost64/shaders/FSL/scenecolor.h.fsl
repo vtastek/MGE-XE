@@ -1,0 +1,76 @@
+// mgeHost64 — WHAT UNITS DOES THE SCENE TARGET WANT, AND HOW DOES A PASS GET INTO THEM.
+// tasks/forge-postprocess.md step 6a.
+//
+// Until step 6a every colour frag ended `c = tonemap(c)`, so pMSAAColor held DISPLAY-REFERRED values
+// whatever its format — which is why the fp16 probe looked identical and why bloom had nothing to
+// bloom from. The curve now runs ONCE, at the very end, inside resolve.frag, and the scene target
+// carries radiance.
+//
+// ONE lane decides: gShadowParams.toneParams.x, the host's folded `g_hdrSceneColor && sampleCount>1`
+// (shadowparams.h.fsl). A shader must never re-derive it from a format or a sample count — the two
+// halves of that condition have to move together, and they stay together because only the host ever
+// evaluates them.
+//
+// ─────────────────────────────────────────────────────────────────────────────────────────────────
+// THE RULE. Every pass that writes to the scene target falls in exactly one of three classes, and
+// THIS LIST IS THE CLASSIFICATION — not a plan document, not a commit message. Step 6a shipped once
+// with sky.frag in the wrong class, and the whole cost of that was that the rule lived somewhere a
+// shader author would never look.
+//
+//   1. LIT / GENERATED, and it already called tonemap() before 6a   ->  tonemapInPass()
+//      opaque, statics, terrain, alpha, multimap, multimap_alpha, water's sun specular.
+//      The curve moves out of the pass; the pass writes radiance.
+//
+//   2. MW's AUTHORED DISPLAY-REFERRED DATA, and it never called tonemap()  ->  liftInPass()
+//      sky.frag (MW's own per-vertex atmosphere colours x MW's sky/moon/star/cloud textures),
+//      statics_add.frag (MW's glow map), statics_blend.frag (hero blend layers).
+//      These reached the target UNCURVED, so moving the curve to the end would apply it to them for
+//      the FIRST time and darken them — up to 41/255 at the top end (tonemap(1.0) = 0.84). Lifting
+//      them through the inverse means the final curve hands the authored value back untouched.
+//
+//   3. GENUINELY GENERATED RADIANCE WITH ITS OWN INTENSITY KNOB  ->  neither; write it raw
+//      glow.frag (Colour x Intensity x f^2). It is not reproducing anything authored, it WANTS to
+//      exceed 1.0 once there is a container for it, and liftInPass would clamp exactly that away.
+//      If it reads dim under HDR, the answer is its Intensity knob, not a lift.
+//
+//   ...plus one thing that is in NO class: statics_multiply.frag writes a MULTIPLIER (DST_COLOR/ZERO
+//   dark map), not a colour. A scale factor has no units to convert, so it is left alone — but note
+//   that a multiply now lands in scene-referred space, which is a real (and more correct) change.
+//
+// HOW TO CLASSIFY A NEW PASS, in one question: **does this pass reproduce a value MW authored, or
+// does it make one up?** Reproduced -> lift it, and the image cannot move. Made up -> it is radiance;
+// let the resolve roll it off.
+// ─────────────────────────────────────────────────────────────────────────────────────────────────
+//
+// ⚠ NEITHER FUNCTION DOES ANYTHING IN THE LDR BUILD. Display-referred, tonemapInPass IS tonemap()
+// and liftInPass is the identity — i.e. every pass keeps exactly the behaviour it had before 6a, so
+// `g_hdrSceneColor = false` stays byte-identical to the pre-6a image. That is the A/B, and it is
+// also why a class-2 pass gets liftInPass() rather than "just add the tonemap it was missing": the
+// two are the same under HDR but only one of them leaves LDR alone.
+//
+// Requires (include AFTER opaque.srt.h and AFTER tonemap.h.fsl): gShadowParams + tonemap()/
+// inverseTonemap(). The curve itself deliberately stays in tonemap.h.fsl with no SRT dependency,
+// because resolve.frag includes it and cannot see gShadowParams — the maths and the policy are
+// separate files precisely so the resolve can have one without the other.
+
+#ifndef SCENE_COLOR_H
+#define SCENE_COLOR_H
+
+// Class 1. The curve, still in the pass, until the scene goes scene-referred.
+float3 tonemapInPass(float3 c)
+{
+    return (gShadowParams.toneParams.x > 0.5f) ? c : tonemap(c);
+}
+
+// Class 2. The mirror image: nothing to do while the target is display-referred, and a lift into
+// scene-referred units when it is not, so resolve.frag's curve returns the authored value.
+//
+// The [0,1] clamp inside inverseTonemap() is CORRECT here rather than merely safe: the target this
+// reproduces was B8G8R8A8_UNORM, which clipped at 1.0, so anything a class-2 pass pushed above 1
+// was never on screen. Lifting the CLIPPED value reproduces what was actually displayed.
+float3 liftInPass(float3 c)
+{
+    return (gShadowParams.toneParams.x > 0.5f) ? inverseTonemap(c) : c;
+}
+
+#endif // SCENE_COLOR_H

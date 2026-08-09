@@ -21,9 +21,11 @@
 //
 //  3. Inverse-luminance weighting, `w *= 1/(1 + luma)` — the Karis form, and the ONLY thing needed
 //     to kill fireflies. MJP applies it inside this spatial loop independently of TAA, which is why
-//     firefly suppression here costs no velocity buffer, no jitter and no history target. In LDR
-//     (today) the samples are already tonemapped into [0,1] so the weight only spans 1.0..0.5; it
-//     comes into its own when the source goes fp16.
+//     firefly suppression here costs no velocity buffer, no jitter and no history target. Display-
+//     referred, the samples are already tonemapped into [0,1] and the weight only spans 1.0..0.5;
+//     scene-referred (step 6a, opts.y) luma is unbounded and so is the weight — this is where it
+//     starts doing real work, and also where the residual horizon-band tint resolve.srt.h warns
+//     about gets stronger. The dev checkbox is the A/B for both at once.
 //
 // ⚠ NEGATIVE LOBES. Catmull-Rom undershoots, which is where its apparent sharpness comes from. RGB
 // is floored at 0 after normalisation (MJP does the same); ALPHA is saturated, because it is the
@@ -33,6 +35,11 @@
 // confined to genuine coverage silhouettes.
 
 #include "resolve.srt.h"
+// The scene tonemap. This pass OWNS it whenever the source is scene-referred (step 6a) — see the
+// tail of PS_MAIN. tonemap.h.fsl is pure maths with no SRT dependency, which is exactly why the
+// curve lives there and the "which pass applies it" policy lives in skydome.h.fsl: this shader has
+// a private SRT and cannot see gShadowParams.
+#include "tonemap.h.fsl"
 
 STRUCT(PsIn)
 {
@@ -150,5 +157,27 @@ float4 PS_MAIN(PsIn In)
     if (aRaw < 0.0f) { rgb  = float3(0.0f, 0.0f, 0.0f); }    // no coverage => no premultiplied colour
     // Colour's OWN undershoot, where alpha never left range. A negative radiance is meaningless and
     // this cannot pull the ratio around: it only fires on a colour edge, where alpha is flat.
-    RETURN(float4(max(rgb, float3(0.0f, 0.0f, 0.0f)), saturate(aRaw)));
+    rgb = max(rgb, float3(0.0f, 0.0f, 0.0f));
+    float aOut = saturate(aRaw);
+
+    // THE TONEMAP, last operation in the frame (step 6a). When opts.y is set the colour frags left
+    // the curve to us and pMSAAColor holds scene-referred radiance; when it is clear they already
+    // applied it and this must be a no-op, byte for byte.
+    //
+    // ⚠ UN-PREMULTIPLIED, and this is the THIRD time this pass has had to learn it (resolve.srt.h
+    // lists the other two). pRT is premultiplied — rgb is already scaled by coverage — and the curve
+    // is non-linear, so tonemap(c·a) != tonemap(c)·a. Applied to the buffer as stored it would
+    // re-tint every pixel whose coverage is neither 0 nor 1, i.e. exactly the horizon fog band and
+    // everything melting into it, which is the one witness this class of bug has ever had.
+    //
+    // Deliberately AFTER the clamp block, so `aOut` is the coverage actually returned rather than
+    // the ringing pre-clamp one — divide by one alpha and multiply by another and the pair is torn
+    // apart again by a different route. Where coverage is 0 the clamp above already forced rgb to 0,
+    // and the epsilon guard keeps 0/0 out of the curve: tonemap(0)·0 = 0, which is what it must be.
+    if (gResolveParams.opts.y > 0.5f)
+    {
+        rgb = tonemap(rgb / max(aOut, 1.0e-4f)) * aOut;
+    }
+
+    RETURN(float4(rgb, aOut));
 }

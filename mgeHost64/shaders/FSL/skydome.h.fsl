@@ -35,6 +35,14 @@
 // negative control; if anything shifts there, the uv is wrong.
 //
 // Requires (include AFTER opaque.srt.h): gSkyColor + gFrameData.fogColNear + gFrameData.fogParams.
+//
+// ⚠ UNITS (step 6a). This helper mixes TWO independently-converted things and they have to agree:
+// gSkyColor, the snapshot of what sky.frag drew, and gFrameData.fogColNear off the wire. Once the
+// scene target is scene-referred the host lifts fogColNear on upload and sky.frag lifts its own
+// output (scenecolor.h.fsl, class 2), so both arrive here in the SAME space and fogSkyTarget's
+// composite is meaningful. Lift only one of them and the mismatch draws a visible line at the sky
+// dome's lower rim — s.a is 1 above it and 0 below, so the two halves of `s.rgb + fogColNear*(1-s.a)`
+// swap over exactly there. That was the horizon-band seam reported on the first 6a build.
 
 #ifndef SKY_DOME_H
 #define SKY_DOME_H

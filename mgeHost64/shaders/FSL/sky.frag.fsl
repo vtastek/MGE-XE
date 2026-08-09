@@ -11,7 +11,26 @@
 // blends SRCALPHA/INVSRCALPHA into a transparent-cleared colour target → premultiplied
 // (rgb·a, a); the present-seam ONE/INVSRCALPHA composite then lays it over MW correctly.
 
+// ⚠ THE SKY IS REPRODUCED DATA, NOT GENERATED RADIANCE — and step 6a shipped once believing the
+// opposite, which is what this include pair exists to prevent recurring. Everything below is MW's
+// OWN authored output: its per-vertex atmosphere colours (vColSource 2, re-shipped by the client
+// since SK4 — see the dead branch in PS_MAIN), its sky/cloud/star textures, its moon material
+// colours. Display-referred, every one of them.
+//
+// This pass has never called tonemap(), so moving the curve into resolve.frag would have applied it
+// to the sky for the FIRST time: 28/255 darker at 0.9, 41/255 at white, plus a per-channel
+// desaturation. In play that read as dimmed moons and silver linings, and as a SEAM along the
+// horizon band — the fog target composites the sky snapshot against fogColNear, which the host
+// already lifts, so tonemapping one and not the other put a visible line exactly at the dome's rim
+// where s.a steps 1 -> 0 (skydome.h.fsl).
+//
+// liftInPass() closes all of it: the authored value goes up through the inverse curve and the
+// resolve's curve hands it straight back. And it must stay that way for a reason beyond fidelity —
+// when the physical sky lands, THIS sky is its reference target, so a 16% dim baked in here would
+// be inherited by everything calibrated against it.
 #include "opaque.srt.h"
+#include "tonemap.h.fsl"    // the curve + its inverse
+#include "scenecolor.h.fsl" // liftInPass() — class 2: MW's authored display-referred sky (step 6a)
 
 STRUCT(VSOutput)
 {
@@ -61,5 +80,11 @@ float4 PS_MAIN( VSOutput In )
     float amt = gFrameData.skyParams.x;
     if (gFrameData.skyParams.z > 0.5f) { amt *= 0.5f + 0.5f * sin(gFrameData.skyParams.y * 3.0f); }
     c.rgb = lerp(c.rgb, float3(1.0f, 0.0f, 1.0f), amt);
+    // Class 2 (scenecolor.h.fsl): lift the authored colour so resolve.frag's curve returns it
+    // unchanged. LAST, after the dev tint, so what is preserved is exactly what this pass decided to
+    // show. On the STRAIGHT colour, before the blend — the SRCALPHA PSO does the premultiply itself,
+    // and lifting a premultiplied value would put the curve on the wrong side of the coverage
+    // multiply (the same trap resolve.srt.h documents three times over).
+    c.rgb = liftInPass(c.rgb);
     RETURN(c);
 }

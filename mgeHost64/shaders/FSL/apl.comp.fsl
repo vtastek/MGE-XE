@@ -15,10 +15,15 @@
 // The lattice is computed in normalised space and scaled by the image size, so it covers the frame
 // at any render scale and the numbers stay comparable when SSAA changes.
 //
-// MSAA: sample 0 only. At an edge pixel that is one of the two surfaces rather than their resolved
-// mix, so the mean carries a small edge bias — identical on both sides of an A/B, therefore
-// harmless here, and reading all 4 samples would quadruple the loads to sharpen a number whose
-// third decimal nobody reads.
+// WHERE IT READS. Since step 6a this runs AFTER the resolve, on pRT — the DELIVERED, display-
+// referred, single-sample image — in every configuration. That is deliberate: pMSAAColor now holds
+// scene-referred radiance whenever fp16 is on, and averaging those values would silently redefine
+// every APL number ever recorded. Measuring what is delivered is also what the instrument was
+// always a proxy for, and it makes the reading independent of which pass applied the tonemap.
+//
+// The Tex2DMS branch below is therefore dead on the live path (only the SAMPLE_COUNT 1 variant is
+// built) and is kept because it costs nothing and the day something wants a pre-resolve reading it
+// is one shaders.list entry away.
 
 #include "apl.srt.h"
 

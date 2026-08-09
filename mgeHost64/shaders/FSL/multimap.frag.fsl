@@ -14,8 +14,9 @@
 #include "msmrecv.h.fsl"     // sunShadowVisibility() — MSM sun-shadow receiver
 #include "shadowreceive.h.fsl" // shadowMaskPixel() — the mask texel that is actually OURS under MSAA
 #include "skyamb.h.fsl"      // skyAmbFactor() — SH-L1 sky ambient (SH1) + sky AO (SH2)
-#include "skydome.h.fsl"     // applyFog() — extinguish into a silhouette, then melt into the SAMPLED sky
 #include "tonemap.h.fsl"     // tonemap() — the shared semi-HDR curve (was six byte-identical copies)
+#include "scenecolor.h.fsl" // tonemapInPass() — class 1: the curve moved to resolve.frag (step 6a)
+#include "skydome.h.fsl"     // applyFog() — extinguish into a silhouette, then melt into the SAMPLED sky
 #include "enchantglow.h.fsl" // enchantGlow() — MW's caustic env map over enchanted items
 
 STRUCT(VSOutput)
@@ -229,7 +230,7 @@ float4 PS_MAIN( VSOutput In )
     // Packed bit5 (multimap.vert repacks it out of Meta bit 15).
     c *= 1.0f + enchantGlow(In.Normal, In.WorldPos, (In.Packed & 0x20u) != 0u);
     c *= gFrameData.dbgScales.w;   // dev panel: overall output intensity modifier
-    c = tonemap(c);
+    c = tonemapInPass(c);
     c = applyFog(c, In.WorldPos, In.Position.xy, In.Fog);
     // F12 debug views (see opaque.frag — kept in lockstep). gAO sampled at SV_Position.xy * invScreen.
     uint dbg = (uint)(gFrameData.debugParams.x + 0.5f);

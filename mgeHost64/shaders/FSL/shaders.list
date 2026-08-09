@@ -310,14 +310,11 @@
 // APL instrument (tasks/forge-postprocess.md step 2): reduces the finished scene colour to
 // mean RGB + mean log-luma, one 256-thread group, straight into the heartbeat. The measuring stick
 // for the linear migration — it must ship ON so that today's runs are the BEFORE baseline.
-// Same two-SAMPLE_COUNT-variants pattern as linearizedepth above.
+// ONE variant, unlike linearizedepth above: step 6a moved the dispatch past the resolve, so it
+// always reads pRT (the delivered, single-sample image) and the SAMPLE_COUNT 4 twin was dropped.
+// The name keeps its _sc1 suffix because the source still compiles through that define.
 #comp apl_sc1.comp
 #define SAMPLE_COUNT 1
-#include "apl.comp.fsl"
-#end
-
-#comp apl_sc4.comp
-#define SAMPLE_COUNT 4
 #include "apl.comp.fsl"
 #end
 

@@ -17,8 +17,9 @@
 #include "texsample.h.fsl"   // sampleBase() — MW address mode + AF level
 #include "msmrecv.h.fsl"     // sunShadowVisibility() — MSM sun-shadow receiver
 #include "skyamb.h.fsl"      // skyAmbFactor() — SH-L1 sky ambient (SH1) + sky AO (SH2)
-#include "skydome.h.fsl"     // applyFog() — extinguish into a silhouette, then melt into the SAMPLED sky
 #include "tonemap.h.fsl"     // tonemap() — the shared semi-HDR curve (was six byte-identical copies)
+#include "scenecolor.h.fsl" // tonemapInPass() — class 1: the curve moved to resolve.frag (step 6a)
+#include "skydome.h.fsl"     // applyFog() — extinguish into a silhouette, then melt into the SAMPLED sky
 #include "enchantglow.h.fsl" // enchantGlow() — MW's caustic env map over enchanted items
 
 STRUCT(VSOutput)
@@ -249,7 +250,7 @@ float4 PS_MAIN( VSOutput In )
     // attenuated by its own coverage at blend time, exactly as MW's own second draw would be.
     c *= 1.0f + enchantGlow(In.Normal, In.WorldPos, (In.ClampMode & 8u) != 0u);
     c *= gFrameData.dbgScales.w;
-    c = tonemap(c);
+    c = tonemapInPass(c);
     c = applyFog(c, In.WorldPos, In.Position.xy, In.Fog);
 
     // F12 debug views (opaque.frag's, alpha forced 1 so the view reads clearly).

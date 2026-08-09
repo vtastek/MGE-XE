@@ -40,15 +40,20 @@
 // Roughness fixes all three at the root, because the reflection mip LOD and the specular lobe width
 // are the same number. See tasks/forge-water.md (WT4d) for the full derivation.
 //
-// ⚠ WATER MUST NEVER CALL tonemap() ON THE COMPOSITE. It is the only colour pass that doesn't, and
-// that is CORRECT, not an oversight someone should helpfully fix: its two big inputs
-// (gRefractColor, gReflectColor) are copies of the ALREADY-TONEMAPPED scene, so tonemapping the
-// result rolls them off twice. Only newly-generated radiance — the sun specular — goes through the
-// curve, and only until forge-postprocess.md step 6 makes the whole chain HDR.
+// ⚠ WATER STILL MUST NOT TONEMAP ITS COMPOSITE — but as of step 6a the REASON changed, and the old
+// one is now false. It used to be that gRefractColor / gReflectColor / pReflectMips were copies of
+// the ALREADY-TONEMAPPED scene, so a curve on the composite would roll them off twice. Nothing is
+// pre-tonemapped any more: those three follow sceneColorFormat and are scene-referred for free, and
+// the curve runs exactly ONCE, at the very end, inside resolve.frag. So the composite is not
+// "never tonemapped", it is "tonemapped somewhere else" — and a curve here would be the second
+// application, which is the same bug wearing new clothes.
+// Everything this pass writes is therefore in the SAME units as everything it reads, which is what
+// made the specular term's own tonemapInPass() call below collapse to a no-op (see it).
 
 #include "opaque.srt.h"
+#include "tonemap.h.fsl"   // tonemap() — the curve itself; scenecolor.h.fsl below decides who applies it
+#include "scenecolor.h.fsl" // tonemapInPass() — class 1: the curve moved to resolve.frag (step 6a)
 #include "skydome.h.fsl"   // fogSkyColor() — the same sampled fog target the world melts into
-#include "tonemap.h.fsl"   // WT4d/P1: the SPECULAR TERM ONLY — see the warning above that call
 #include "wavefield.h.fsl" // W1: the procedural wave field (height + exact gradient + variance)
 
 // Water's F0. Not a tuned constant: n = 1.333 gives ((n-1)/(n+1))² = 0.0204, and the pre-WT4d
@@ -927,12 +932,17 @@ float4 PS_MAIN( VSOutput In )
     float  sphereNorm = (aSpec * aSpec) / max(a2, 1e-8f);
     float3 spec = gFrameData.sunCol.rgb * (D * Vis * F * NoL * min(sphereNorm, 1.0f));
 
-    // ⚠ INTERIM, and it is deleted by step 6 of forge-postprocess.md. An energy-conserving lobe
-    // peaks far above 1.0, so the glint WILL clip flat white in LDR — that is expected, not a bug.
-    // tonemap() runs on the SPECULAR TERM ALONE because that term is newly-generated radiance, which
-    // is exactly what the curve is for. It must NEVER run on the composite: `refracted` and
-    // `reflected` are copies of the already-tonemapped scene and would roll off twice.
-    result += tonemap(spec) * fog;
+    // The specular term is the one thing this pass GENERATES rather than resamples, so it was the one
+    // thing that had to be brought into the target's units — which in LDR meant the curve, applied
+    // here and nowhere else (the composite is resampled scene and would have rolled off twice).
+    //
+    // Step 6a is the "deleted by step 6" this line's old comment promised, and the deletion is what
+    // tonemapInPass() expresses: scene-referred, the target already wants raw radiance, so the call
+    // folds away and an energy-conserving lobe peaking far above 1.0 finally survives the write
+    // instead of clipping flat white. Display-referred, it is the identical `tonemap(spec)` as
+    // before. Kept as a call rather than deleted outright because the LDR path is still a shipped
+    // build and still needs the roll-off.
+    result += tonemapInPass(spec) * fog;
 
     // --- water cut feature (vtastek) ---
     float wdist = dist / lerp(1200.0f, 0.0f, saturate((-waterLevelRel) / 7.0f));

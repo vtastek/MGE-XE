@@ -14,6 +14,8 @@
 // pass's own fog blend already implies.
 
 #include "opaque.srt.h"
+#include "tonemap.h.fsl"    // the curve + its inverse
+#include "scenecolor.h.fsl" // liftInPass() — class 2: MW's authored GLOW map (step 6a)
 
 // MUST stay byte-identical to statics.vert.fsl's VSOutput (shared vertex container — a mismatched
 // frag signature hangs the GPU; see [[project_forge_shared_frag_vsoutput]]).
@@ -38,5 +40,11 @@ float4 PS_MAIN( VSOutput In )
     uint layer  = In.TexIndex & 0xFFFFu;
     float4 tex = SampleTex2DArray(gStaticsArrays[bucket], gSamplerAnisotropic, float3(In.Uv, (float)layer));
 
-    RETURN(float4(tex.rgb * saturate(In.Fog), 0.0f));
+    // Class 2 (scenecolor.h.fsl): the glow map is MW's authored texel, and this pass never called
+    // tonemap(), so under 6a the final curve would darken every lit window. Lift the ADDEND itself
+    // — the fog scale rides outside, because fog fades toward 0 (the additive identity) and that
+    // fade is a coverage-like weight, not a colour to convert. A lone glow over black therefore
+    // survives the resolve exactly; where several additive layers pile up they now sum in
+    // scene-referred space and roll off instead of clipping flat, which is the point of the step.
+    RETURN(float4(liftInPass(tex.rgb) * saturate(In.Fog), 0.0f));
 }

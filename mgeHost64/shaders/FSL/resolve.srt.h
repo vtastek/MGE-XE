@@ -42,7 +42,11 @@
 // only place in the frame where coverage is neither 0 nor 1:
 //   1. WEIGHTS  — filtering rgb and a with different weight sets  -> a DARKER seam.
 //   2. CLAMPING — saturate()ing a while letting rgb keep its ring -> a BRIGHTER seam.
-// Anything that touches one component without the other will produce a third version of this.
+//   3. TONEMAP  — the curve is NON-LINEAR, so tonemap(c·a) != tonemap(c)·a. Applying it to the
+//                 premultiplied buffer directly re-tints every partially-covered pixel. Step 6a
+//                 un-premultiplies, tonemaps, and re-premultiplies by the alpha that is ACTUALLY
+//                 returned. Third instance, same band, same lesson.
+// Anything that touches one component without the other will produce a fourth version of this.
 #pragma once
 
 #ifndef SAMPLE_COUNT
@@ -69,7 +73,13 @@ STRUCT(ResolveParams)
     //     the A/B for a residual horizon-band tint that is NOT ringing: a luminance-weighted mean is
     //     pulled toward the darker samples, so a strong luminance gradient biases the result even
     //     with the premultiplied pair kept intact. Different mechanism, different fix.
-    // yzw reserved.
+    // y = the source is SCENE-REFERRED, so THIS PASS owns the tonemap (step 6a). The host's folded
+    //     `g_hdrSceneColor && sampleCount > 1`, the same bit it publishes to gShadowParams.toneParams.x
+    //     for the colour frags — one expression, two receivers, because this pass has a private SRT
+    //     and cannot see gShadowParams. Scene-referred and fp16 are ONE switch: an un-tonemapped
+    //     value exceeds 1.0 and a UNORM target would clamp it, which is worse than tonemapping in
+    //     the pass. 0 = the frags already tonemapped and this pass must not touch the curve.
+    // zw reserved.
     DATA(float4, opts, None);
 };
 

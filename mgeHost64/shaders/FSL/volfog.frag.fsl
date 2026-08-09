@@ -30,6 +30,8 @@
 
 #include "opaque.srt.h"
 #include "msmrecv.h.fsl"   // sunShadowVolumetric() — the one-tap MSM sampler
+// No units conversion of its own (scenecolor.h.fsl): the haze IS fogSkyColor(), built from the sky
+// snapshot and fogColNear, both of which are already in the target's units by the time this runs.
 #include "skydome.h.fsl"   // fogSkyColor() — the haze is the same sampled sky every surface melts into
 
 STRUCT(VSOutput)
