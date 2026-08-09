@@ -990,9 +990,9 @@ STRUCT(ResolveParams)
 
 
     float4 dims;
-#line 83 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/resolve.srt.h"
+#line 103 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/resolve.srt.h"
     float4 opts;
-#line 84
+#line 104
 };
 
         CBUFFER(ResolveParams) gResolveParams :  register(b0,space3);
@@ -1020,9 +1020,7 @@ STRUCT(PsIn)
     DATA(float4, position, SV_Position);
 #line 47
 };
-
-
-
+#line 68 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/resolve.frag.fsl"
 float rFilterCubic(float x, float B, float C)
 {
     float y = 0.0f;
@@ -1063,12 +1061,13 @@ float4 PS_MAIN(PsIn In): SV_TARGET
         float2(-0.125f, -0.375f), float2( 0.375f, -0.125f),
         float2(-0.375f, 0.125f), float2( 0.125f, 0.375f)
     };
-#line 97 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/resolve.frag.fsl"
+#line 114 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/resolve.frag.fsl"
     float2 pixelPos = In.position.xy;
     float2 texSize = gResolveParams.dims.xy;
     float filtRad = max(gResolveParams.dims.z, 0.001f) * 0.5f;
     int sampRad = int(gResolveParams.dims.w);
     float invLuma = gResolveParams.opts.x;
+    float cubicC = gResolveParams.opts.z;
 
 
     float4 sum = float4(0.0f, 0.0f, 0.0f, 0.0f);
@@ -1092,8 +1091,8 @@ float4 PS_MAIN(PsIn In): SV_TARGET
                     float4 smp = max(LoadTex2DMS(gResolveSource, NO_SAMPLER, loadPos, s), float4(0.0f, 0.0f, 0.0f, 0.0f));
 
 
-                    float w = rFilterCubic(sampleDist.x * 2.0f, 0.0f, 0.5f) *
-                              rFilterCubic(sampleDist.y * 2.0f, 0.0f, 0.5f);
+                    float w = rFilterCubic(sampleDist.x * 2.0f, 0.0f, cubicC) *
+                              rFilterCubic(sampleDist.y * 2.0f, 0.0f, cubicC);
 
                     if (invLuma > 0.5f)
                     {
@@ -1109,7 +1108,7 @@ float4 PS_MAIN(PsIn In): SV_TARGET
     }
 
     float4 outRgba = sum / max(totalWeight, 1.0e-5f);
-#line 154 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/resolve.frag.fsl"
+#line 172 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/resolve.frag.fsl"
     float aRaw = outRgba.a;
     float3 rgb = outRgba.rgb;
     if (aRaw > 1.0f) { rgb *= 1.0f / aRaw; }
@@ -1118,7 +1117,7 @@ float4 PS_MAIN(PsIn In): SV_TARGET
 
     rgb = max(rgb, float3(0.0f, 0.0f, 0.0f));
     float aOut = saturate(aRaw);
-#line 177 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/resolve.frag.fsl"
+#line 195 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/resolve.frag.fsl"
     if (gResolveParams.opts.y > 0.5f)
     {
         rgb = tonemap(rgb / max(aOut, 1.0e-4f)) * aOut;

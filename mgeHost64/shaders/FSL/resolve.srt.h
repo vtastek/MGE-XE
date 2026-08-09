@@ -79,7 +79,27 @@ STRUCT(ResolveParams)
     //     and cannot see gShadowParams. Scene-referred and fp16 are ONE switch: an un-tonemapped
     //     value exceeds 1.0 and a UNORM target would clamp it, which is worse than tonemapping in
     //     the pass. 0 = the frags already tonemapped and this pass must not touch the curve.
-    // zw reserved.
+    // z = cubic SHARPNESS — Mitchell's C at B=0, i.e. the whole filter family on one knob:
+    //     0.5 = Catmull-Rom (the shipped default, and what this pass has always done),
+    //     0.4 = SMAA's filmic-reprojection value (Jimenez, SIGGRAPH 2016 course, p92),
+    //     0.0 = pure cubic Hermite / smoothstep — NO negative lobes at all, i.e. no ringing and
+    //           no apparent sharpening.
+    //     Every value is a partition of unity (verified: |sum(w) - 1| < 1e-15 across c and f), so
+    //     this trades ringing against sharpness and cannot change the image's energy.
+    //     Negative lobe by value: 0.3 -> -0.044, 0.4 -> -0.059, 0.5 -> -0.074, 1.0 -> -0.148.
+    //
+    //     LIVE (dev panel) rather than a constant, for the reason the diameter is: a prior-art
+    //     number was derived in someone else's pass at someone else's resolution, so port the
+    //     mechanism and re-derive the value here ([[feedback_prior_art_constants_dont_transfer]]).
+    //     ⚠ It is partly REDUNDANT with the diameter — both read as "sharper" — so move ONE at a
+    //     time or neither can be attributed.
+    //
+    //     It matters more now than it did in LDR: negative lobes undershoot proportionally to the
+    //     sample values, and the source is scene-referred (step 6a), so a bright HDR sample rings
+    //     much further below zero than a [0,1] one ever could. The RGB floor at 0 then clips that
+    //     undershoot asymmetrically — energy the overshoot side keeps. Lowering C is the direct
+    //     lever on that, and the horizon fog band is where to look.
+    // w reserved.
     DATA(float4, opts, None);
 };
 

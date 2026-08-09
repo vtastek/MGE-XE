@@ -47,7 +47,24 @@ STRUCT(PsIn)
 };
 
 // MJP's FilterCubic. B=0, C=0.5 is Catmull-Rom. Kept general (rather than folded to the Catmull-Rom
-// constants) so switching to Mitchell (1/3, 1/3) or B-spline (1, 0) is a one-line experiment.
+// constants) so switching to Mitchell (1/3, 1/3) or B-spline (1, 0) is a one-line experiment —
+// and C is now a LIVE knob (gResolveParams.opts.z), which is that experiment made continuous.
+//
+// ⚠ THE OTHER CATMULL-ROM YOU WILL FIND IS NOT A REPLACEMENT FOR THIS ONE. The widely-copied
+// `SampleTextureCatmullRom5` (SMAA filmic reprojection, Jimenez SIGGRAPH 2016 p92) folds 4x4 taps
+// into 5 BILINEAR fetches and drops the corners, renormalising by the accumulated weight. It is a
+// TEXTURE RESAMPLER — it needs a sampler and a regular grid, and this pass has neither: the inputs
+// are MSAA sub-samples at irregular in-pixel positions, reachable only by Load on a Tex2DMS. There
+// is nothing here for bilinear to interpolate between, so the 5-tap trick cannot apply.
+//
+// What DOES transfer from it is its sharpness parameter. Its weights are
+//     w0 = -c f^3 + 2c f^2 - c f,  w1 = (2-c) f^3 - (3-c) f^2 + 1, ...
+// and those are algebraically IDENTICAL to Mitchell(B=0, C=c) evaluated at the four tap distances
+// (verified to 3.6e-15 across c and f). So its `c` is exactly this function's `C`, its filmic 0.4
+// is one slider position, and the useful import was a number, not a routine.
+//
+// (If a bloom/DoF upsample or a TAA history reprojection ever lands, THAT is where the 5-tap form
+// belongs — those resample a real texture through a real sampler.)
 float rFilterCubic(float x, float B, float C)
 {
     float y  = 0.0f;
@@ -99,6 +116,7 @@ float4 PS_MAIN(PsIn In)
     float  filtRad  = max(gResolveParams.dims.z, 0.001f) * 0.5f;   // diameter -> radius
     int    sampRad  = int(gResolveParams.dims.w);                  // integer neighbourhood bound
     float  invLuma  = gResolveParams.opts.x;
+    float  cubicC   = gResolveParams.opts.z;                       // Mitchell C: 0.5 = Catmull-Rom
 
     // ONE accumulator over all four channels — see the premultiplication note in resolve.srt.h.
     float4 sum         = float4(0.0f, 0.0f, 0.0f, 0.0f);
@@ -122,8 +140,8 @@ float4 PS_MAIN(PsIn In)
                     float4 smp = max(LoadTex2DMS(gResolveSource, NO_SAMPLER, loadPos, s), float4(0.0f, 0.0f, 0.0f, 0.0f));
 
                     // rescaleCubic: [-2,2] -> [-1,1]. Separable, so one 1-D evaluation per axis.
-                    float w = rFilterCubic(sampleDist.x * 2.0f, 0.0f, 0.5f) *
-                              rFilterCubic(sampleDist.y * 2.0f, 0.0f, 0.5f);
+                    float w = rFilterCubic(sampleDist.x * 2.0f, 0.0f, cubicC) *
+                              rFilterCubic(sampleDist.y * 2.0f, 0.0f, cubicC);
 
                     if (invLuma > 0.5f)
                     {

@@ -9451,6 +9451,13 @@ namespace {
     // Karis 1/(1+luma) weighting. Weak in LDR by construction (samples are already tonemapped into
     // [0,1]); it is here so the HDR switch at step 6 is a format change and nothing else.
     bool     g_resolveInvLuma  = true;
+    // Cubic SHARPNESS — Mitchell's C at B=0 (resolve.srt.h opts.z). 0.5 IS Catmull-Rom, i.e. this
+    // default is exactly what the resolve has always done, so the knob ships as a no-op and only
+    // does something when someone moves it. 0.4 is SMAA's filmic-reprojection value (whose `c` is
+    // algebraically this same parameter — see rFilterCubic's note); 0.0 removes the negative lobes
+    // entirely. Live rather than a constant because a prior-art number was tuned in another pass at
+    // another resolution — port the mechanism, re-derive the value.
+    float    g_resolveSharp    = 0.5f;
 
     // --- fp16 scene colour (tasks/forge-postprocess.md step 4: the bandwidth probe) ---------------
     // Renders the scene into R16G16B16A16_SFLOAT instead of B8G8R8A8_UNORM, with the shader resolve
@@ -10453,6 +10460,10 @@ namespace {
           t.checkbox("Alpha-to-coverage (antialiased cutouts: foliage/grates)", &g_alphaToCoverage);
           t.checkbox("Custom resolve (off = hardware ResolveSubresource)", &g_customResolve);
           t.sliderF("Filter diameter (px; 6 = 7x7, 4 = 5x5, 2 = 3x3)", &g_resolveDiameter, 1.0f, 6.0f, 0.5f);
+          // Mitchell C at B=0: 0.5 = Catmull-Rom (default = today), 0.4 = SMAA filmic, 0 = no
+          // ringing at all. ⚠ Partly redundant with the diameter above — move ONE at a time.
+          t.sliderF("Cubic sharpness C (0.5 = Catmull-Rom, 0.4 = SMAA filmic, 0 = no ringing)",
+                    &g_resolveSharp, 0.0f, 1.0f, 0.05f);
           t.checkbox("Inverse-luminance firefly weighting", &g_resolveInvLuma);
           // BISECT 2026-08-07: a read-only t.label() line lived here reporting the scene format.
           // t.label() had ZERO other callers in this file — the helper existed but had never been
@@ -17332,7 +17343,8 @@ namespace ForgeRender {
                 // never disagree.
                 const float p[8] = { (float)g_live.width, (float)g_live.height, diam, radius,
                                      g_resolveInvLuma ? 1.0f : 0.0f,
-                                     g_live.sceneReferred ? 1.0f : 0.0f, 0.0f, 0.0f };
+                                     g_live.sceneReferred ? 1.0f : 0.0f,
+                                     std::max(0.0f, g_resolveSharp), 0.0f };
                 std::memcpy(g_live.pResolveParamsCbv->pCpuMappedAddress, p, sizeof(p));
             }
 
