@@ -14,6 +14,13 @@
 // overshoot the line above is waiting for. So it writes raw and lets the resolve roll it off. If
 // these read dim once HDR is on, the answer is the Intensity knob, not a lift.
 //
+// STEP 5 leaves this pass alone too, and for the same reason one layer down: In.Colour arrives
+// ALREADY LINEAR — the host decodes each baked light's authored bytes before splitting them into
+// luminance and chromaticity, because that split is a statement about radiance and is wrong taken on
+// gamma bytes. So there is nothing here to convert. What DOES change is what the sprite is worth: the
+// resolve now encodes before the curve, so the same additive contribution lands further up. That is
+// a calibration question for the Intensity knob (step 5's S3), not a conversion this pass is missing.
+//
 // Own VSOutput (private frag ⇒ no shared-frag hazard); shares opaque.srt.h / DefaultRootSignature.
 
 #include "opaque.srt.h"

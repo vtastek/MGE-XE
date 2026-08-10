@@ -40,6 +40,10 @@
 // curve lives there and the "which pass applies it" policy lives in skydome.h.fsl: this shader has
 // a private SRT and cannot see gShadowParams.
 #include "tonemap.h.fsl"
+// The scene's transfer function (step 5). Same reasoning as tonemap.h.fsl and the same reason it is
+// a separate file from scenecolor.h.fsl: this pass has a private SRT, so it can have the maths but
+// not the policy. Which encode to apply arrives as a cbuffer lane instead (gResolveParams.opts.w).
+#include "linearize.h.fsl"
 
 STRUCT(PsIn)
 {
@@ -194,7 +198,22 @@ float4 PS_MAIN(PsIn In)
     // and the epsilon guard keeps 0/0 out of the curve: tonemap(0)·0 = 0, which is what it must be.
     if (gResolveParams.opts.y > 0.5f)
     {
-        rgb = tonemap(rgb / max(aOut, 1.0e-4f)) * aOut;
+        float3 straight = rgb / max(aOut, 1.0e-4f);
+        // STEP 5's COMPENSATING ENCODE, and it belongs INSIDE the un-premultiplied window for the
+        // same reason the curve does: linearToSrgb is non-linear, so encoding the stored (premultiplied)
+        // value would re-tint every pixel whose coverage is neither 0 nor 1 — the horizon fog band
+        // again, the same witness, for the third distinct reason.
+        //
+        // ORDER IS FORCED, not a preference. The curve was fitted against DISPLAY-REFERRED input
+        // (tonemap.h.fsl: 0->0, 1->0.84, 2.2->1.0, clamped at 2.2) and every class-2 lift in the
+        // frame is stated in terms of it. Encoding first hands it exactly the domain it was fitted
+        // in, so S1 changes the encoding of the scene and NOTHING about the curve — which is what
+        // lets S2 replace the curve as a separately-measured step.
+        if (gResolveParams.opts.w > 0.5f)
+        {
+            straight = linearToSrgb(straight);
+        }
+        rgb = tonemap(straight) * aOut;
     }
 
     RETURN(float4(rgb, aOut));

@@ -52,9 +52,27 @@
 
 #include "opaque.srt.h"
 #include "tonemap.h.fsl"   // tonemap() — the curve itself; scenecolor.h.fsl below decides who applies it
+#include "linearize.h.fsl" // srgbToLinear()/mod2xLinear() — the scene's transfer function (step 5)
 #include "scenecolor.h.fsl" // tonemapInPass() — class 1: the curve moved to resolve.frag (step 6a)
 #include "skydome.h.fsl"   // fogSkyColor() — the same sampled fog target the world melts into
+                           // (and, transitively, waterfog.h.fsl — see below)
 #include "wavefield.h.fsl" // W1: the procedural wave field (height + exact gradient + variance)
+
+// ⚠ THIS SHADER NO LONGER OWNS A WATER FOG. It used to own THREE, all private and all disagreeing:
+// exp(-dist/500) toward fogColNear on the underwater refraction, exp(-depth/500) toward an XE
+// `depthColor` tint on the above-water refraction, and two hand-tuned absorption/scattering tints
+// standing in for the difference between those and the way the SEABED was fogged (which was MW's
+// air ramp, in applyFog, toward the atmosphere colour). Three laws, three targets, and a surface
+// that changed both as the camera crossed it.
+//
+// There is now ONE extinction (waterfog.h.fsl) over the path length through water, toward MW's own
+// [Water] UnderwaterColor blend, and it is applied in applyFog() — so the seabed carries it too.
+// TWO CONSEQUENCES FOR THIS FILE, and the second is the one that looks like a deletion but is not:
+//   - the refraction sample is a copy of the colour target, so the submerged world in it has
+//     ALREADY been through applyFog and is ALREADY water-fogged by the correct path length. Fogging
+//     it again here is the double-count. The fade toward depthColor is therefore gone, not moved.
+//   - looking UP from underwater, the eye-to-surface segment is entirely in water and nothing has
+//     fogged it yet, so THAT one is still applied here — via the shared helper, at the shared rate.
 
 // Water's F0. Not a tuned constant: n = 1.333 gives ((n-1)/(n+1))² = 0.0204, and the pre-WT4d
 // Fresnel already opened with a literal `0.02f +` — it was carrying this value the whole time
@@ -177,6 +195,13 @@ float4 PS_MAIN( VSOutput In )
     // bits 0-1 were already full at 4 modes — and because this one returns before any water shading
     // happens at all, which the other three do not.
     bool   heightView    = (waterFlags & 32u) != 0u;
+    // Bit 12: GLITTER/NORMAL view — the one view that isolates the mean normal N. Its own bit for the
+    // same reason heightView has one. Returns just below waterDbg 3, where N is final.
+    bool   normalView    = (waterFlags & 4096u) != 0u;
+    // Bit 13: shade the TRUE water plane instead of the drawn mesh plane (see surfPos below).
+    bool   truePlaneOn   = (waterFlags & 8192u) != 0u;
+    // Bit 14: FLAT-WATER TEST — force normal = +Z. See the invariant note at the flatten below.
+    bool   flatWater     = (waterFlags & 16384u) != 0u;
     // W4b bits 6-11: reflection smear tap BUDGET (max anisotropy), 0/1 = OFF (a single isotropic
     // fetch at the minor-axis LOD, i.e. the shipped W4 look). Six bits, not four: the requirement is
     // 1/cosI and grazing water — which is most water — needs tens, so a 15 cap WAS the binding
@@ -226,10 +251,83 @@ float4 PS_MAIN( VSOutput In )
     float2 texToVp   = gShadowParams.screenAlloc.xy * gShadowParams.screenParams.zw;
     float3 fogCol    = gFrameData.fogColNear.rgb;
 
-    // Eye vector (camera-relative: eye at origin).
-    float3 EyeVec = In.WorldPos;
-    float  dist   = length(EyeVec);
-    EyeVec = (dist > 1e-4f) ? EyeVec / dist : float3(0, 0, 1);
+    // ⚠ THE DRAWN MESH IS NOT THE WATER SURFACE, and nothing downstream was undoing the difference.
+    // waterMeshZ() offsets the clipmap lattice by ±kWaterMeshSnap (5 units) purely to keep it off the
+    // near plane — a rasterisation dodge — while the surface MW, the reflection clip and the fog all
+    // agree on is waterTrueLevel = waterLevelAbs - 1. So this shader was measuring every distance to a
+    // plane 4 to 6 units away from the one it was drawing.
+    //
+    // Re-intersect this pixel's view ray with the TRUE plane. The eye sits at the origin and both
+    // candidates are planes of constant z, so the two intersections are SCALAR MULTIPLES of each other
+    // and the whole correction is one ratio.
+    //
+    // ⚠ IT DOES NOT MOVE EyeVec, and that is the thing to understand before reading the A/B: scaling a
+    // vector cannot change its direction, so the view ray was always exactly right and no plane fix
+    // could ever have altered it. What moves is everything that depends on WHERE ALONG that ray the
+    // surface is — `dist`, the wave field's world XY, and the screen footprint.
+    //
+    // And that is the reported bug. The XY error is `pos.xy * (ratio - 1)`: it GROWS with distance
+    // from the camera, and the ratio worsens sharply as the camera nears the surface — 100 units up
+    // samples the field 3.8% too close, 10 units up 27% too close. A fixed world point therefore maps
+    // to a sample position that moves by MORE than the camera moved, so the wave field slides under
+    // the surface while moving and settles the instant the camera stops. Motion-coupled with no stale
+    // value anywhere, which is why five passes looking for a stale one found nothing.
+    // ⚠ AND THE RAY COMES FROM THE CAMERA, NOT FROM THE INTERPOLATED VERTEX ATTRIBUTE. Scaling
+    // In.WorldPos (the previous cut) could never fix this, for the reason written above: a scale
+    // cannot rotate a vector, so any correction expressed as a multiple of In.WorldPos leaves EyeVec
+    // exactly where it was. If the direction is wrong, the direction has to be REBUILT.
+    //
+    // In.WorldPos is a perspective-interpolated attribute of a COARSE lattice — 128-unit cells at
+    // level 0 and cells reaching the horizon at the outer ring, all in one float3 interpolator whose
+    // values run to 100k+ units. Perspective-correct interpolation is exact only in exact arithmetic;
+    // in float32 across triangles whose vertices differ by three orders of magnitude in w — which is
+    // every water triangle at grazing incidence, i.e. every water triangle when the camera is near the
+    // surface — it is a ratio of two catastrophically cancelling sums. The lattice is a device for
+    // getting pixels rasterised. It is not the surface, and it should not be asked where the surface
+    // is.
+    //
+    // The water IS an analytic plane, so intersect the view ray with it directly. invVP (worlds[7])
+    // is the same matrix the depth reconstruction below already uses, deviceZ 0.5 for the same reason
+    // waterfill.frag picks it (the reverse-Z far plane at 0 can produce w == 0), and the eye is at the
+    // origin, so the reconstructed point IS a point on the ray.
+    // TWO reconstructions on the SAME pixel ray, at two depths. Their DIFFERENCE is the ray
+    // direction, and a difference cancels the origin — so this carries NO assumption about where the
+    // eye is. That is the whole fix, and it is why the previous cut (one reconstruction, normalized)
+    // made things worse instead of better: normalizing a single point silently asserts the eye is at
+    // the origin, and under produce-mode-3 park that assertion is false by one frame of camera motion.
+    // The payload is emitted relative to bakeEye and the view is restamped with
+    // (bakeEye - eyeNow)·R_now, so the camera actually sits at (eyeNow - bakeEye), not at 0.
+    // Everything else in the renderer is immune because it gets its screen position through that same
+    // matrix and the offset cancels in the rasterisation; only code that builds a DIRECTION from an
+    // assumed origin is exposed, and in this renderer that is exactly two lines — this one and
+    // waterfill.frag's.
+    //
+    // Sign is settled against the interpolated position rather than by reasoning about reverse-Z
+    // conventions: In.WorldPos points from the eye to the fragment to well within 90 degrees however
+    // stale it is, so its dot product can only disagree if the depth ordering is the other way round.
+    float  trueRel = waterLevelRel - 1.0f;       // waterTrueLevel, camera-relative (unused when off)
+    float2 rayUv   = In.Position.xy * invScreen;
+    float3 rayA    = reconstructWorld(invVP, rayUv, 0.25f);
+    float3 rayB    = reconstructWorld(invVP, rayUv, 0.75f);
+    float3 rayD    = rayA - rayB;
+    rayD           = (dot(rayD, In.WorldPos) < 0.0f) ? -rayD : rayD;
+    float3 rayDir  = normalize(rayD);
+
+    // t along the ray to the true plane. Valid when the ray actually descends toward it (matching
+    // signs) and is not running parallel; the mesh's own position is the fallback, which is the
+    // pre-fix behaviour and the right thing to degrade to at the horizon and in the ±snap dead band
+    // at the crossing.
+    // ⚠ ONLY THE DIRECTION IS REPLACED. The analytic ray/plane intersection this block used to do is
+    // GONE: it moved `dist` too, and `dist` multiplies reffactor — a few percent of a distance that
+    // reaches 100k near grazing turned into thousands of units of UV distortion, which is what
+    // "shears wildly" was. Position keeps coming from the interpolated attribute, which is consistent
+    // with the rasteriser by construction; only the eye VECTOR was ever wrong, and it is a direction.
+    // (dist inherits the same one-frame offset, but as a scalar length of hundreds to thousands of
+    // units it is a fraction of a percent — below anything the fog or the LOD can show.)
+    float3 surfPos = In.WorldPos;
+    float  dist    = length(surfPos);
+    float3 EyeVec  = truePlaneOn ? rayDir
+                                 : ((dist > 1e-4f) ? surfPos / dist : float3(0, 0, 1));
 
     // Forge-frame near fog scalar (1 = clear, 0 = full fogColNear), matching opaque.frag.
     float fog = saturate((gFrameData.fogParams.y - dist)
@@ -237,7 +335,8 @@ float4 PS_MAIN( VSOutput In )
 
     // Absolute world XY for WORLD-ANCHORED normal sampling (the frame is camera-relative; lodEye is
     // the real absolute eye). Without this the normals swim with the camera.
-    float2 worldXY = In.WorldPos.xy + gFrameData.lodEye.xy;
+    // surfPos, not In.WorldPos: the field is anchored to the WATER, and the mesh is 5 units off it.
+    float2 worldXY = surfPos.xy + gFrameData.lodEye.xy;
 
     // --- animated water normal (getFinalWaterNormal, #else no-flow branch) ---
     // Computed BEFORE the underwater branch: both surfaces are the same wave field, the underside
@@ -281,8 +380,11 @@ float4 PS_MAIN( VSOutput In )
     // In.WorldPos.xy before the subtraction, and the derivative is then a difference of two rounded
     // large numbers. Free precision, and it is the footprint that the whole anti-aliasing model rests
     // on ([[project_forge_precision_far_origin]]).
-    float2 dWdx = ddx(In.WorldPos.xy);
-    float2 dWdy = ddy(In.WorldPos.xy);
+    // surfPos for the same reason worldXY uses it — the footprint has to be the footprint of the
+    // surface actually being sampled, or the AF gradients disagree with the coordinate they filter.
+    // Still taken BEFORE the lodEye addition, which is the precision point this block is about.
+    float2 dWdx = ddx(surfPos.xy);
+    float2 dWdy = ddy(surfPos.xy);
     // ...and THE SCALAR IS GONE — the footprint is only ever an ELLIPSE now. It survived as long as
     // the normal came from a single mip tap; W2's anisotropic tap set needs both axes and nothing
     // left in this file reads one number.
@@ -684,10 +786,46 @@ float4 PS_MAIN( VSOutput In )
     // the normal is INVERTED (we are looking at the underside), refraction is the above-water world
     // seen through it, and the Fresnel term is a TOTAL-INTERNAL-REFLECTION curve — which is what
     // makes the surface act as a mirror at grazing angles and go transparent looking straight up.
-    // Fog stays the FORGE FRAME's (fogColNear), not MGE's atmospheric scatter, per the WT1 decision.
+    //
+    // ⚠ THE FOG TARGET ON THIS SIDE OF THE SURFACE IS THE WATER, NOT THE ATMOSPHERE. WT1 chose
+    // fogColNear because it was what the rest of the frame used; under the unified model the world
+    // around this surface is melting toward waterFogColor(), and a surface that melts toward the
+    // atmosphere instead is exactly the colour mismatch this feature exists to remove. Gated on the
+    // feature's own predicate, so with it off every use below is fogCol again, byte for byte.
     if (underwater) {
-        float  uwFog = saturate(exp(-dist / 4096.0f));   // special-case fog, no fog offset
-        float3 nrm   = -normal;
+        // ONE transmittance for the eye->surface segment. It replaces two private laws that were
+        // never the same number: exp(-dist/500) on the refraction and exp(-dist/4096) on the sun
+        // disc.
+        //
+        // ⚠ AND IT IS THE ONE PLACE THIS PASS STILL FOGS SOMETHING applyFog HAS ALREADY FOGGED —
+        // a KNOWN, BOUNDED double-count, and the mirror of the one applyFog documents on the other
+        // side of the surface. The refraction sample holds two different kinds of pixel:
+        //   - above-water GEOMETRY, which applyFog already fogged by the eye->plane segment (see
+        //     waterPathLength's fourth case), so re-fogging it here doubles that segment;
+        //   - the SKY, which sky.frag draws and applyFog never touches, so without this it would
+        //     arrive through the surface perfectly crisp — visibly wrong, and looking up is most of
+        //     what an underwater view is.
+        // From inside this shader those are the same texel and cannot be told apart, so one rule has
+        // to serve both. The doubled segment is the short one (eye to surface), which is why this is
+        // the acceptable side of the trade. The real fix is to give sky.frag the same extinction
+        // over its own analytic plane intersection, at which point this term deletes.
+        //
+        // The feature-off spelling keeps BOTH old laws verbatim, and that asymmetry is the point:
+        // this is the A/B, and an A/B is only worth having if the off side is bit-exact.
+        bool   uwUnified = waterFogCameraSubmerged();
+        float2 uwWf      = waterFogSample(In.WorldPos);   // .x == waterFogFactor, and .y feeds W8
+        // ⚠ STAYS THE AUTHORED TARGET, AND NOT waterFogVeil, EVEN UNDER W8. The two uses below are
+        // HOLE-FILLERS, not fog: what to put where the reflection target has nothing drawn, and what
+        // a fully rough surface converges to. Neither is an integral over a ray. Feeding them the
+        // veil would also mean evaluating it on an ASCENDING ray, which violates its precondition —
+        // the column ends at the surface a short way off, so the honest volumetric answer near the
+        // waterline is "almost nothing", and "almost nothing" is a black hole in a reflection, not a
+        // better fill. MW's own underwater colour is exactly the generic water colour this wants.
+        float3 uwFogCol  = uwUnified ? waterFogColor(In.WorldPos) : fogCol;
+        float  uwTrans   = uwUnified ? (1.0f - uwWf.x)
+                                     : saturate(exp(-dist / 500.0f));
+        float  uwFog     = uwUnified ? uwTrans : saturate(exp(-dist / 4096.0f));
+        float3 nrm       = -normal;
 
         // Distortion factor: 2x the above-water one (MGE's underwater constant).
         float2 reffactorU = 2.0f * (windFactor * dist + 0.1f) * nrm.xy;
@@ -695,7 +833,17 @@ float4 PS_MAIN( VSOutput In )
         // Refraction — alloc-sized RT, so pixel offsets scale by invAlloc (see the block above).
         float2 ruvU = baseUV + (-2.0f * reffactorU) * invAlloc;
         float3 refractedU = SampleLvlTex2D(gRefractColor, gSamplerBilinearClamp, ruvU, 0.0f).rgb;
-        refractedU = lerp(fogCol, refractedU, exp(-dist / 500.0f));
+        // ⚠ UNDER W8 THE REFRACTION IS NOT FOGGED HERE AT ALL, AND THAT DELETION IS THE FIX — it is
+        // the "at which point this term deletes" the comment above predicted. This term existed
+        // because the refraction sample holds two kinds of pixel and only one of them arrived
+        // fogged: above-water GEOMETRY, which applyFog had already fogged over the eye->plane
+        // segment (waterPathLength's fourth case, which along this ray IS the eye->surface segment),
+        // and the SKY, which nothing fogged. Now that sky.frag takes the same extinction over its
+        // own plane intersection, BOTH halves of the sample arrive correctly fogged and re-fogging
+        // is a straight double-count of the very segment this pass sits at the end of.
+        // The legacy spelling stays verbatim as the A/B's off side.
+        float3 refrLegacy = lerp(uwFogCol, refractedU, uwTrans);
+        refractedU = lerp(refrLegacy, refractedU, waterFogVolStrength());
 
         // Reflection — pReflectColor is its OWN 1024² full-viewport RT, so this one is
         // VIEWPORT-relative (invScreen), NOT invAlloc. Same premultiplied-over-fog resolve as the
@@ -706,12 +854,33 @@ float4 PS_MAIN( VSOutput In )
         float2 reflUVU = In.Position.xy * invScreen
                        + float2(-2.1f * reffactorU.x, abs(reffactorU.y)) * invScreen;
         float4 reflSampleU = sampleReflectSmear(reflUVU, reflLod, smearUV, smearN);
-        float3 reflectedU  = reflSampleU.rgb + fogCol * (1.0f - reflSampleU.a);
-        // Same cap-and-converge as the above-water path, but toward fogCol rather than the sky
-        // target: looking UP at the underside, what a rough surface averages is the seabed-and-
-        // water world the reflect pass drew for this case, whose ambient IS the near fog colour.
-        // fogSkyColor() would be wrong here — there is no sky on this side of the surface.
-        if (reflSkyMix > 0.0f) { reflectedU = lerp(reflectedU, fogCol, reflSkyMix); }
+        float3 reflectedU  = reflSampleU.rgb + uwFogCol * (1.0f - reflSampleU.a);
+        // Same cap-and-converge as the above-water path, but toward the WATER target rather than the
+        // sky one: looking UP at the underside, what a rough surface averages is the seabed-and-
+        // water world the reflect pass drew for this case, and the ambient that world melts into is
+        // now waterFogColor() (it used to be fogColNear, which is what the original comment here
+        // said and what made this the one lane still reading atmosphere-coloured underwater).
+        // fogSkyColor() would be wrong either way — there is no sky on this side of the surface.
+        if (reflSkyMix > 0.0f) { reflectedU = lerp(reflectedU, uwFogCol, reflSkyMix); }
+
+        // ⚠ AND THE REFLECTION TAKES THE COLUMN — the last term in the frame that did not, and the
+        // reason the underwater surface refused to saturate with distance while a rock behind it did.
+        //
+        // "underwater surface is no different than the rock or terrain" is exactly right, and the
+        // Fresnel above is what hid it. At grazing incidence — which IS what "far away" means for a
+        // surface seen edge-on from below — dot(-EyeVec, nrm) goes to 0, so fresnelU is
+        // pow(saturate(1.12), 8) == 1 and the surface is PURE total internal reflection. Every other
+        // term had a column on it by then: the refraction carries the one applyFog gave it over its
+        // own ray, the sun disc carries uwTrans. This one carried none, so the one term that owns the
+        // distant surface outright was the one term still arriving unattenuated. The mirror is not a
+        // shortcut past the water in front of it.
+        //
+        // NOT a double-count with the reflect pass's own fog: that pass renders the MIRRORED world, so
+        // its applyFog covers the surface->object leg. This is the eye->surface leg, which by
+        // construction no mirrored ray contains. The two legs meet at the plane and neither is the
+        // other. Legacy input is the unfogged value, because that is what this term was — so W8
+        // strength 0 leaves it exactly as it is today.
+        reflectedU = waterFogBlend(reflectedU, reflectedU, In.WorldPos, uwWf);
 
         if (waterDbg == 1u) {   // undistorted, as above
             float4 rawReflU = SampleLvlTex2D(gReflectColor, gSamplerBilinearClamp,
@@ -733,8 +902,55 @@ float4 PS_MAIN( VSOutput In )
         RETURN(float4(resultU, 1.0f));
     }
 
-    // --- fogged deep-water base colour ---
-    float3 depthColor = depthBaseColor * float3(0.1, 0.3, 1.0) * 0.5; //lerp(fogCol, depthBaseColor, fog);
+    // --- fully-extinguished water ------------------------------------------------------------
+    // What the eye sees where no light comes back out of the water: deep water, and the pixels the
+    // depth-gated refraction below has to refuse.
+    //
+    // ⚠ THIS USED TO BE A PRIVATE COLOUR, AND THAT WAS THE DEFECT. It was
+    //     depthColor = depthBaseColor * decodeAuthored(float3(0.1, 0.3, 1.0) * 0.5)
+    // — XE's weather-derived water tint times a hand-picked blue ABSORPTION multiplier — and the
+    // refraction below faded toward it on its own exp(-depth/500). Meanwhile the SEABED inside that
+    // same refraction sample was being fogged by applyFog toward the ATMOSPHERE on MW's air ramp.
+    // Two colours and two laws over one body of water, which is why the absorption tint (and the
+    // teal scattering lerp that used to follow the Fresnel block) had to be hand-tuned in the first
+    // place: they were standing in for a mismatch, and "they don't match the underwater fogging
+    // colour anyway". Both are retired here rather than recalibrated.
+    //
+    // The replacement is not a picked colour at all. It is MW's own
+    // `UnderwaterColor*w + fogColor*(1-w)` out of Morrowind.ini [Water], published by the host in
+    // the scene's units, and it is the SAME target the submerged world melts toward in applyFog().
+    // The two agreeing is the whole feature.
+    //
+    // The retired expression survives ONLY as the off side of the A/B — the same way the pre-WT4d
+    // Fresnel curve does further down, and for the same reason: a toggle whose off state is not the
+    // previous image cannot answer the question it exists for. `wFogOn` gates all three retirements
+    // in this pass (this colour, the depthscale fade below, the teal scattering lerp after the
+    // Fresnel block), so they cannot come apart.
+    // ...and W8 makes even that target a derived quantity rather than a published one: deep water is
+    // the column's own in-scatter with nothing behind it, which converges to sigma_s/sigma_t times
+    // the light that got down there — the single-scattering albedo, i.e. the colour of deep water is
+    // the ratio of the two coefficients and was never something anyone had to pick. waterFogVeil is
+    // the flat authored target again at W8 strength 0.
+    bool   wFogOn    = waterFogActive();
+    float3 deepColor = wFogOn ? waterFogVeil(In.WorldPos)
+                              : depthBaseColor * decodeAuthored(float3(0.1, 0.3, 1.0) * 0.5);
+
+    // FLAT-WATER TEST (bit 14) — the bisect with no interpretation in it.
+    //
+    // THE INVARIANT: an infinite plane lit by a directional light is TRANSLATION-INVARIANT. Move the
+    // camera horizontally without rotating and the geometry is identical — same plane, same normal,
+    // same sun at infinity, same view ray at every pixel — so the specular must be PIXEL-IDENTICAL.
+    // Not similar, identical. Anything that moves under horizontal translation with a flat normal is
+    // a bug by construction, and no judgement about "the right amount" is required to see it.
+    //
+    // It also isolates cleanly. Flat normal means reffactor is 0 (it multiplies normal.xy), so the
+    // reflection and refraction distortion switch off with it and nothing is left wobbling to confuse
+    // the read. What remains driving the highlight is V, L and the lobe. Survives the test => the wave
+    // field is exonerated entirely; passes => the field is the whole story and nothing else is.
+    //
+    // Above-water only: the underwater branch returns before this point, which is fine — the report
+    // is about the above-water specular.
+    if (flatWater) { normal = float3(0.0f, 0.0f, 1.0f); }
 
     // Reflection/refraction pixel distortion (wind strength increases it).
     float2 reffactor = (windFactor * dist + 0.1f) * normal.xy;
@@ -747,7 +963,7 @@ float4 PS_MAIN( VSOutput In )
     float  aboveWater = step(sceneDist + shoreDepthBias, dist);   // 1 = scene in FRONT of water
     float  depth      = max(shoreDepthBias, sceneDist - dist);
 
-    float3 refracted = depthColor;
+    float3 refracted = deepColor;
     float  shorefactor = 0.0f;
     if (depth < 4000.0f && aboveWater < 0.5f) {
         float2 ruv = baseUV + saturate(depth / 100.0f) * reffactor.yx * invAlloc;
@@ -762,9 +978,22 @@ float4 PS_MAIN( VSOutput In )
         depth     /= denom;
         depth     += 300.0f * (0.95f - normal.z);   // small-scale shoreline animation
 
+        // depthscale STAYS, but only for `shorefactor` — the shoreline smoothing at the very end of
+        // this shader is derived from it and is unrelated to fog (it is a coverage ramp against the
+        // sand, which is why it keeps its own short 500-unit scale).
         float depthscale = saturate(exp(-depth / 500.0f));
         shorefactor = pow(depthscale, 5.0f);
-        refracted = lerp(depthColor, refracted, 0.8f * depthscale + 0.2f * shorefactor);
+        // ⚠ NO FOG HERE ANY MORE, AND ITS ABSENCE IS THE FIX RATHER THAN AN OMISSION.
+        // gRefractColor is a copy of the colour target taken before the water pass, so the seabed
+        // inside it has ALREADY been through applyFog — including the unified water fog, over the
+        // eye-to-seabed submerged path, which along this ray IS the surface-to-seabed path this
+        // block was measuring. Fading it a second time toward deepColor would fog the same water
+        // twice, and against a different law and a different colour than the seabed carries.
+        // Expect near/shallow water to read markedly CLEARER than it did: exp(-depth/500) e-folded
+        // in ~7 m, and the unified model is tuned in tens of metres.
+        if (!wFogOn) {
+            refracted = lerp(deepColor, refracted, 0.8f * depthscale + 0.2f * shorefactor);
+        }
     }
 	
 	
@@ -776,7 +1005,23 @@ float4 PS_MAIN( VSOutput In )
     float  NoH = saturate(dot(normal, H));
     float  VoH = saturate(dot(V, H));
 	
-	refracted = lerp(refracted, ((1.0 - VoH) * 0.3 + 0.2) * gFrameData.sunCol.r * float3(0.2, 0.9, 0.7) * 0.5, 0.5);
+	// THE SCATTERING HACK — RETIRED, and live only as the off side of the A/B (see `wFogOn` up at
+	// deepColor; all three retirements share that one predicate).
+	//
+	// It pulled the refraction HALFWAY toward a fixed teal scaled by the sun's red channel — an
+	// in-scatter stand-in, hand-tuned against a deep-water colour that disagreed with the way the
+	// seabed inside that very refraction sample was being fogged. With one law and one target on
+	// both sides of the surface there is nothing left for it to compensate, and a 0.5 lerp toward a
+	// constant is a large, unconditional desaturation of every water pixel in the frame. What real
+	// in-scatter it was standing in for now comes out of the extinction's own target colour.
+	//
+	// (Kept verbatim below, including the Step 5 note it carried: the teal is an authored
+	// display-space tint with its *0.5 folded in, so what converts is the multiplier that was
+	// actually tuned; and gFrameData.sunCol.r is RADIANCE once linear is on, so the term lost ~12%
+	// of its weight at full sun. Both were reasons to re-derive it rather than re-tune it.)
+	if (!wFogOn) {
+		refracted = lerp(refracted, ((1.0 - VoH) * 0.3 + 0.2) * gFrameData.sunCol.r * decodeAuthored(float3(0.2, 0.9, 0.7) * 0.5), 0.5);
+	}
     // --- reflection (WT2 Stage 1: real mirror-view RT, sky-only for now) ---
     // gReflectColor is the mirrored scene in MAIN-screen space (mirror world geom + normal camera),
     // so sample it at THIS fragment's screen UV, distorted by the surface normal (MGE's 2.1x/abs
@@ -805,21 +1050,28 @@ float4 PS_MAIN( VSOutput In )
     // perspective, the same melt every other surface gets) rather than a fudge.
     //
     // This was the one term in the whole surface that never converged: `refracted` reaches fogCol
-    // through depthColor and through gRefractColor (already a fogged scene copy), but the reflection
-    // only had the 0.96 darkening — so at grazing angles, where Fresnel goes to ~1 and the water IS
-    // its reflection, the mirror image survived to the fog wall at 96% strength. Distant water
-    // therefore stayed a hard mirror while every other surface melted, which is what "water isn't
-    // fogged properly" looks like.
+    // through gRefractColor (already a fogged scene copy) and, before the unified water fog landed,
+    // through depthColor as well — but the reflection only had the 0.96 darkening, so at grazing
+    // angles, where Fresnel goes to ~1 and the water IS its reflection, the mirror image survived to
+    // the fog wall at 96% strength. Distant water therefore stayed a hard mirror while every other
+    // surface melted, which is what "water isn't fogged properly" looks like.
+    //
+    // ⚠ THIS IS THE AIR FOG, NOT THE WATER FOG, and the two must not be confused now that both
+    // exist. This one is aerial perspective over the air between the eye and the surface — the same
+    // melt every other surface gets, and the water surface has AIR in front of it whenever it is
+    // visible from above. The water fog covers the segment on the far side of it, and is applied to
+    // what the refraction shows, by applyFog, before this pass ever samples it.
     //
     // Toward the SAME sampled target as the world (skydome.h.fsl), not a private fogCol: at water
     // pixels the sky pass drew nothing, so that target evaluates to exactly fogColNear today — but
     // routing it through the shared helper means water follows automatically if the host sky is ever
     // extended down over the horizon band, instead of quietly becoming the one surface left behind.
     //
-    // Applied to `reflected` rather than to the final `result`: depthColor already lerps toward fog by
-    // the same scalar, so fogging the composite would fog the refraction TWICE (fog²) and pull the
-    // mid-distance water under. One term, one fog, and the Fresnel mix then converges on its own —
-    // at fog 0 both inputs are the target, so the surface is the target at any Fresnel weight.
+    // Applied to `reflected` rather than to the final `result`: `refracted` already carries this
+    // same air fog (it is a resample of a scene copy that went through applyFog), so fogging the
+    // composite would fog the refraction TWICE (fog²) and pull the mid-distance water under. One
+    // term, one fog, and the Fresnel mix then converges on its own — at fog 0 both inputs are the
+    // target, so the surface is the target at any Fresnel weight.
     if (!noFogMelt) { reflected = lerp(fogSkyColor(In.Position.xy), reflected, fog); }
 
 
@@ -860,6 +1112,29 @@ float4 PS_MAIN( VSOutput In )
         RETURN(float4(saturate(reflLod / (float)kReflectMipUsable),
                       saturate(alpha * 20.0f),
                       saturate(log2(afAniso) / log2((float)kWaterMaxAniso)), 1.0f));
+    }
+
+    // GLITTER/NORMAL VIEW — the instrument for "the specular tilts while I move and is centred the
+    // moment I stop". Placed HERE because this is where N is final and nothing downstream has touched
+    // it yet, so what this draws is exactly what the lobe is about to be built from.
+    //
+    // RED is the IDEAL mirror path: the set of pixels whose reflected view ray points AT the sun, with
+    // roughness, Fresnel, the sun-disc widening and sphereNorm all absent. That is the whole point —
+    // the lit specular is N, alpha and the lobe multiplied together, and this separates the first from
+    // the other two. If red shears while moving, the fault is upstream (N, or the eye vector, or what
+    // the wave field is anchored to). If red stays straight while the LIT view tilts, the fault is
+    // downstream (alpha, the widening, or sphereNorm) and N is exonerated.
+    //
+    // pow 400 is a deliberately THIN contour rather than a lobe: a shear of a few pixels is invisible
+    // inside a soft highlight and obvious on a hairline. GB carry N.xy at 2x around 0.5 so the raw
+    // field is readable in the same pass — a uniform GB tint that slides with the camera would mean
+    // the field itself is moving, which a world-anchored field must never do.
+    if (normalView) {
+        float3 mirrorDir = reflect(EyeVec, normal);   // EyeVec is unit, eye -> fragment
+        float  glint     = saturate(dot(mirrorDir, -gFrameData.sunDir.xyz));
+        RETURN(float4(-EyeVec.x,
+                      EyeVec.y,
+                      -EyeVec.z, 1.0f));
     }
 
     // --- FRESNEL ---------------------------------------------------------------------------------

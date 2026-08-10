@@ -73,6 +73,14 @@
 #include "volfog.frag.fsl"
 #end
 
+// UNDERWATER BACKSTOP (W8). Same fullscreen tri + PerFrame set as volfog, but a FILL-HOLES blend
+// (INV_DEST_ALPHA / ONE) so it writes only where nothing was drawn — the horizon band, past the
+// shelf, wherever terrain ends. Reads no depth at all: "no depth" is precisely the state it exists
+// to answer, and the answer is that the water goes on forever.
+#frag waterfill.frag
+#include "waterfill.frag.fsl"
+#end
+
 // AT1 sorted-alpha takeover: the scene-1 blended world shapes, drawn after water with depth
 // GEQUAL test / no write. Pairs with opaque.vert (SAME VSOutput — shared-frag hazard) on 4 blend/
 // winding PSOs; outputs real alpha (tex.a * vcolA * matAlpha) for the premultiplied composite.

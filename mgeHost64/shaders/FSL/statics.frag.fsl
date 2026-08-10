@@ -21,6 +21,7 @@
 #include "a2c.h.fsl"       // a2cCoverageMask() — SHARED cutout coverage
 #include "msmrecv.h.fsl"   // sunShadowVisibility() — MSM sun-shadow receiver
 #include "tonemap.h.fsl"   // tonemap() — the shared semi-HDR curve (was six byte-identical copies)
+#include "linearize.h.fsl" // srgbToLinear()/mod2xLinear() — the scene's transfer function (step 5)
 #include "scenecolor.h.fsl" // tonemapInPass() — class 1: the curve moved to resolve.frag (step 6a)
 #include "skydome.h.fsl"   // applyFog() — extinguish into a silhouette, then melt into the SAMPLED sky
 

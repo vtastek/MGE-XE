@@ -14,6 +14,9 @@
 // convention as opaque.vert (the host post-multiplies viewProj by Z_rev before upload).
 
 #include "opaque.srt.h"
+#include "tonemap.h.fsl"    // (scenecolor.h.fsl's prerequisite; the curve is never called in a VS)
+#include "linearize.h.fsl" // srgbToLinear() — the scene's transfer function (step 5)
+#include "scenecolor.h.fsl" // decodeAuthored() — MW's authored colours enter the scene domain HERE
 
 STRUCT(VSInput)
 {
@@ -52,10 +55,13 @@ VSOutput VS_MAIN( VSInput In )
     // client ships the live-vs-uploaded diff instead; the wrap sampler handles the modulo.
     // Zero for every non-UV-animated sky shape.
     Out.Uv = In.Uv + In.UvOff.xy;
-    Out.Color = In.Color;
+    // Step 5: MW's own per-vertex atmosphere colours and the moons' material colours are as authored
+    // and display-referred as any other MW data — the sky is REPRODUCED, not generated (sky.frag's
+    // opening note), which is exactly the class that has to be decoded. .a is coverage and stays.
+    Out.Color = float4(decodeAuthored(In.Color.rgb), In.Color.a);
     Out.TexIndex = In.TexAlpha & 0xFFFFu;          // SK1 dome = 0 → host default white
     Out.VColSource = (In.TexAlpha >> 24u) & 0x3u;  // route vertex colour vs constant material
-    Out.MatDiffuse = In.MatDiffuse;
+    Out.MatDiffuse = decodeAuthored(In.MatDiffuse);
     Out.MatAlpha = asfloat(In.MatAlphaBits);       // weather/night fade (overlay slot reused)
     // C4: the dome is camera-attached and shipped camera-relative (worldPos already -eye), so
     // worldPos.xyz IS the direction from the eye to this vertex. Pass it raw; the frag normalizes

@@ -25,6 +25,7 @@
 #include "shadowreceive.h.fsl" // shadowMaskPixel() — the mask texel that is actually OURS under MSAA
 #include "skyamb.h.fsl"    // skyAmbFactor() — SH-L1 sky ambient (SH1) + sky AO (SH2)
 #include "tonemap.h.fsl"   // tonemap() — the shared semi-HDR curve (was six byte-identical copies)
+#include "linearize.h.fsl" // srgbToLinear()/mod2xLinear() — the scene's transfer function (step 5)
 #include "scenecolor.h.fsl" // tonemapInPass() — class 1: the curve moved to resolve.frag (step 6a)
 #include "skydome.h.fsl"   // applyFog() — extinguish into a silhouette, then melt into the SAMPLED sky
 
@@ -203,9 +204,15 @@ float4 PS_MAIN( VSOutput In )
     // a visible seam across the near/far handover on the same building.
     float3 amb = gFrameData.lodSunAmb.rgb * skyAmbFactor(normal, In.WorldPos);
     if ((aoFlags & 1u) != 0u) { amb *= aoSample.a; }   // "AO enable" tick (debugParams.w bit0)
+    // W7b — absorption on the way IN (waterfog.h.fsl). Terrain matters most of all the callers here:
+    // the SEABED is terrain, so this is the surface whose lighting the whole model is about. Applied
+    // to the sun and ambient terms only, before the point lights below add into `result`.
+    float3 tSunW, tAmbW;
+    waterLightTransmit(In.WorldPos, tSunW, tAmbW);
     float3 result = albedo
                   * (gFrameData.sunCol.rgb * saturate(dot(-gFrameData.sunDir.xyz, normal)) * sunVis
-                     + amb);
+                        * tSunW
+                     + amb * tAmbW);
 
     // Point lights. Terrain is the ONE surface that spans the whole near↔far handoff — the ground
     // runs from underfoot to the horizon in a single draw — so unlike every other path it cannot be

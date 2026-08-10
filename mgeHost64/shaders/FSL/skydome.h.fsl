@@ -47,6 +47,12 @@
 #ifndef SKY_DOME_H
 #define SKY_DOME_H
 
+// The other half of applyFog(): ONE extinction for the water surface and for everything submerged
+// under it. It lives in applyFog rather than in water.frag because the mismatch it fixes is between
+// the water and the SEABED, and the seabed is drawn by opaque/statics/terrain — fogging only the
+// surface would leave the two disagreeing exactly as they do today.
+#include "waterfog.h.fsl"
+
 // ORDER MATTERS, and getting it wrong is why v2 still read as a cutout at mid distance. Extinction
 // applied to the fog TARGET only shows up once fog is complete — by which point the surface has
 // already been replaced by the sky and there is nothing left to silhouette. Extinction belongs on the
@@ -112,6 +118,11 @@ float3 applyFog(float3 lit, float3 worldPosRel, float2 pixelXy, float fog)
 {
     float4 s = fogSkySample(pixelXy);
 
+    // WATER FOG — the segment of this ray that runs through water (waterfog.h.fsl). Exactly (0, 0)
+    // when the feature is off or the fragment is above the surface, so everything below is unchanged.
+    //   .x = the fog factor,  .y = the SHARE of the ray that is under water.
+    float2 wf = waterFogSample(worldPosRel);
+
     // TOTALITY, not tidiness. `pow()` of a NEGATIVE base is NaN, and a NaN then survives every
     // multiply and lerp below — including the multiply by an extinction strength of ZERO, so the
     // feature's own A/B knob could not switch it off and the whole path looked exonerated.
@@ -121,6 +132,33 @@ float3 applyFog(float3 lit, float3 worldPosRel, float2 pixelXy, float fog)
     // edge in the near scene grew black NaN dots. Found 2026-08-01; the interpolators feeding this
     // are CENTROID now, and this line means the next one that is not cannot reach a pow().
     fog = saturate(fog);
+
+    // ⚠ THE AIR RAMP ONLY OWNS THE PART OF THE RAY THAT IS AIR. This is the line that makes the
+    // surface crossing continuous, and leaving it out is what put a hard step there on the first
+    // build — a step that arrived BEFORE the crossing, as the camera descended, which is exactly
+    // where the C0 argument said nothing could happen.
+    //
+    // The v1 rule was "camera below: the water fog REPLACES the air model; camera above: compose
+    // both", with the double-count over the submerged tail written off as short. It is not short
+    // near the surface: as the eye descends, the submerged tail grows until it IS the whole ray, so
+    // a fragment on the seabed was still being melted most of the way toward the bright sky colour
+    // right up to the waterline — and then, one frame later, not at all. The approximation was
+    // largest exactly where the model claimed to be exact, and the switch had to pay for all of it
+    // at once. (It also reads as the whole screen dimming, because what vanishes is the SKY colour
+    // that had been lifting every submerged pixel.)
+    //
+    // MW's fog is LINEAR in distance, which is to say a UNIFORM density along the ray. A uniform
+    // density integrated over a fraction of the ray is just that fraction of the optical depth, so
+    // the air ramp's opacity scales by the air share and nothing has to know where the boundary is:
+    //
+    //     opacityAir = (1 - fog) * (1 - waterShare)   ->   fogAir = fog + (1 - fog) * waterShare
+    //
+    // At waterShare 0 this is `fog` EXACTLY — not to within a rounding error, which matters because
+    // it is the A/B (the `1 - (1-fog)*airShare` spelling of the same algebra is off by up to 2^-25
+    // and would have made "feature off" merely close). At waterShare 1 it is 1, i.e. no air fog at
+    // all, which is precisely the v1 submerged branch — so that branch is gone, not conditioned:
+    // one continuous expression reproduces both of its endpoints and every state between them.
+    float fogAir = saturate(fog + (1.0f - fog) * wf.y);
 
     // EXTINCTION (skyParams.w), on the surface, ramped by the fog between it and the eye. The
     // standard lerp already carries the energy-conserving amount of extinction; this is deliberately
@@ -176,10 +214,22 @@ float3 applyFog(float3 lit, float3 worldPosRel, float2 pixelXy, float fog)
     //
     // The host clamps shape away from 0 (pow(0,0) is 1, which would slam full extinction onto
     // geometry at the eye).
-    float ramp = pow(1.0f - fog, gFrameData.timeParams.w);
+    // fogAir, not fog: the extinction is a stand-against-the-SKY term, so it has to fade out on the
+    // same schedule the sky melt does. It needs no water gate of its own — at waterShare 1,
+    // fogAir is 1, `1 - fogAir` is 0 and the ramp is 0, so a fully submerged fragment is not
+    // silhouetted against a sky it has no line of sight to. One quantity disarms both halves.
+    float ramp = pow(1.0f - fogAir, gFrameData.timeParams.w);
     lit *= 1.0f - gFrameData.skyParams.w * ramp * skyBehind;
 
-    return lerp(fogSkyTarget(s), lit, fog);
+    // AIR over its share of the ray, then WATER over the rest. No branch and no camera test: the
+    // share carries it, and both of the v1 branches fall out of this one expression at its
+    // endpoints (see the fogAir note above).
+    //
+    // The water half is a COMPOSITE and not a lerp, because a medium that scatters does two separable
+    // things to what is behind it — attenuates it and adds to it — and only the attenuation is a
+    // lerp. waterFogComposite reproduces this line exactly at W8 strength 0 (it is handed the lerp
+    // as its own legacy input), so what follows here is unchanged until that lane moves.
+    return waterFogComposite(lerp(fogSkyTarget(s), lit, fogAir), worldPosRel, wf);
 }
 
 #endif // SKY_DOME_H

@@ -16,6 +16,7 @@
 #include "texsample.h.fsl"   // sampleBase() — MW address mode + AF level
 #include "skyamb.h.fsl"      // skyAmbFactor() — SH-L1 sky ambient (SH1) + sky AO (SH2)
 #include "tonemap.h.fsl"     // tonemap() — the shared semi-HDR curve (was six byte-identical copies)
+#include "linearize.h.fsl" // srgbToLinear()/mod2xLinear() — the scene's transfer function (step 5)
 #include "scenecolor.h.fsl" // tonemapInPass() — class 1: the curve moved to resolve.frag (step 6a)
 #include "skydome.h.fsl"     // applyFog() — extinguish into a silhouette, then melt into the SAMPLED sky
 #include "enchantglow.h.fsl" // enchantGlow() — MW's caustic env map over enchanted items
@@ -57,6 +58,9 @@ float4 PS_MAIN( VSOutput In )
     // SH1 sky-directional ambient — geometric normal, not the possibly-bent N (see skyamb.h.fsl).
     float3 a = ((aoFlags & 4u) != 0u) ? float3(1.0f, 1.0f, 1.0f)
                                       : gFrameData.ambCol.rgb * skyAmbFactor(In.Normal, In.WorldPos);
+    // W7b — absorption on the way IN, before the point-light loop adds into `d` (waterfog.h.fsl,
+    // and see opaque.frag for why point lights are excluded). Lockstep with multimap.frag.
+    { float3 tSun, tAmb; waterLightTransmit(In.WorldPos, tSun, tAmb); d *= tSun; a *= tAmb; }
     // NO AO on ambient — aoSample belongs to the opaque surface BEHIND the sheet, so this was
     // stamping the wall's occlusion onto a transparent surface in front of it. Same reasoning and
     // same decision as alpha.frag; keep the two in lockstep. aoSample stays sampled for the F12
@@ -157,9 +161,10 @@ float4 PS_MAIN( VSOutput In )
         float2 uv = (uvSet == 0u) ? In.Uv0 : (uvSet == 1u) ? In.Uv1
                   : (uvSet == 2u) ? In.Uv2 : In.Uv3;
         float4 t = sampleBase(tex, clampMode, uv, useLowAF(alphaRef, false));
+        // Step 5: MOD2X's literal 2 is a display-space number (multimap.frag carries the reasoning).
         if (op == 0u)      { float3 b = t.rgb * albScale; c = b * lit; baseA = t.a; alb = b; }
         else if (op == 1u) { c *= t.rgb;        alb *= t.rgb; }
-        else if (op == 2u) { c *= t.rgb * 2.0f; alb *= t.rgb * 2.0f; }
+        else if (op == 2u) { float3 m = mod2xStage(t.rgb); c *= m; alb *= m; }
         else               { c += t.rgb;        alb += t.rgb; }
     }
 

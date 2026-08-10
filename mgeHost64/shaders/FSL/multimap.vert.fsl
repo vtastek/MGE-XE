@@ -9,6 +9,9 @@
 // the multimap.frag fixed-function stage blend.
 
 #include "opaque.srt.h"
+#include "tonemap.h.fsl"    // (scenecolor.h.fsl's prerequisite; the curve is never called in a VS)
+#include "linearize.h.fsl" // srgbToLinear() — the scene's transfer function (step 5)
+#include "scenecolor.h.fsl" // decodeAuthored() — MW's authored colours enter the scene domain HERE
 
 STRUCT(VSInput)
 {
@@ -95,10 +98,13 @@ VSOutput VS_MAIN( VSInput In )
     // In.Color.rgb and nothing else), and adding a VSOutput field would ripple through every frag
     // paired with this vert — the GPU-hang pairing hazard. The wide VB ships white (a = 1) whenever
     // no VertexColorProperty drives the shape, so this reduces to matAlpha in that case.
-    Out.Color = float4(In.Color.rgb, In.Color.a * In.MatAlpha);
-    Out.MatDiffuse  = In.MatDiffuse;
-    Out.MatAmbient  = In.MatAmbient;
-    Out.MatEmissive = In.MatEmissive;
+    // Step 5: the authored colours enter the scene's domain here, in the vertex stage — see
+    // opaque.vert.fsl for why here and not in the frag, and why .a is deliberately left alone
+    // (it is coverage, and MaterialProperty::alpha rides it).
+    Out.Color = float4(decodeAuthored(In.Color.rgb), In.Color.a * In.MatAlpha);
+    Out.MatDiffuse  = decodeAuthored(In.MatDiffuse);
+    Out.MatAmbient  = decodeAuthored(In.MatAmbient);
+    Out.MatEmissive = decodeAuthored(In.MatEmissive);
     Out.Stages = In.Stages;
     // Packed keeps the LEGACY interpolator layout — stageCount(0-2)|vColSource(3-4)|
     // alphaRef*255(8-15) — repacked explicitly from the new Meta bits, so multimap.frag /

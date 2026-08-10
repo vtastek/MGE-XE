@@ -14,6 +14,9 @@
 
 #include "opaque.srt.h"
 #include "skyamb.h.fsl"   // skyAmbFactor() — SH-L1 sky ambient (SH1) + sky AO (SH2)
+#include "tonemap.h.fsl"    // (scenecolor.h.fsl's prerequisite; the curve is never called in a VS)
+#include "linearize.h.fsl" // srgbToLinear() — the scene's transfer function (step 5)
+#include "scenecolor.h.fsl" // decodeAuthored() — MW's authored colours enter the scene domain HERE
 
 // Phase 4 hero-blend split. The SAME vertex body builds two containers: HERO_PASS 0 (the normal
 // opaque statics draw) clips the hero-blend subsets offscreen; HERO_PASS 1 (the post-water blend
@@ -111,7 +114,19 @@ VSOutput VS_MAIN( VSInput In )
     float3 n      = normalize(2.0f * In.Normal.xyz - 1.0f);
     float3 nWorld = n.x * In.W0.xyz + n.y * In.W1.xyz + n.z * In.W2.xyz;
     Out.WorldNormal = nWorld;   // Phase C: for the point-light Lambert in statics.frag (frag normalizes)
-    float  emissive = In.Normal.w;
+    // STEP 5. Two authored quantities enter the scene's domain here, and only two: the bake's
+    // per-vertex D3DCOLOR (which carries the source NIF's material DIFFUSE) and the emissive
+    // STRENGTH the bake packed into Normal.w. sunCol and lodSunAmb arrive already decoded — the host
+    // does those at their cbuffer write site — so this is the whole of it for distant statics.
+    //
+    // The emissive is a SCALAR added as a grey colour, so it takes the scalar twin of the same
+    // function rather than a bare pass-through: it was authored on the display scale, like every
+    // channel of a colour, and leaving it encoded would make the ghostfence and the lit GitD windows
+    // the one thing in the frame still glowing in gamma.
+    //
+    // NOT Normal.xyz — that is a direction, and a UBYTE4N direction has no transfer function.
+    float3 vcol     = decodeAuthored(In.Color.rgb);
+    float  emissive = decodeAuthored1(In.Normal.w);
     // Phase B split: the SUN term rides its own interpolator so statics.frag can attenuate it by the
     // MSM sun visibility; ambient + emissive stay in Color (a shadow must never darken those). The
     // sum Color.rgb + SunLight is identical to the old single `light` product, so vis == 1 is a
@@ -130,8 +145,8 @@ VSOutput VS_MAIN( VSInput In )
     // evaluation would have kept. EMISSIVE stays outside the multiply for the same reason it stays
     // outside the vertex colour above — it is an independent FFE term, not ambient.
     float3 sunlit  = gFrameData.sunCol.rgb * saturate(dot(nWorld, -gFrameData.sunDir.xyz));
-    Out.Color    = float4(In.Color.rgb * gFrameData.lodSunAmb.rgb * skyAmbFactor(nWorld, worldPos.xyz) + emissive, In.Color.a);
-    Out.SunLight = In.Color.rgb * sunlit;
+    Out.Color    = float4(vcol * gFrameData.lodSunAmb.rgb * skyAmbFactor(nWorld, worldPos.xyz) + emissive, In.Color.a);
+    Out.SunLight = vcol * sunlit;
 
     Out.TexIndex = (uint)(In.InstParams.x + 0.5f);
     Out.Flags    = (uint)(In.InstParams.y + 0.5f);

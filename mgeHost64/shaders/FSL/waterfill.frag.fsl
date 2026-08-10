@@ -1,0 +1,90 @@
+// mgeHost64 — UNDERWATER BACKSTOP: draw the water column where the host drew nothing at all.
+//
+// THE BUG. Reported from underwater: "you see the clear color, horizon band, sun setting underwater".
+// The host colour target clears to (0,0,0,0) and the present seam composites premultiplied over MW:
+//
+//     MW = hostRGB + MW * (1 - hostA)
+//
+// so anywhere the host drew NOTHING, MW's own frame shows through at full strength — and MW's frame
+// is drawn by an engine that has its own ideas about water. Above the surface that is merely a
+// horizon band nobody looks at. Below it, it is MW's ABOVE-WATER sky arriving in the middle of an
+// underwater view, un-fogged, with the sun still setting in it.
+//
+// Three regions have this shape and they are all the same thing — the depth buffer has no value:
+//   - the band between the sky dome's lower rim and the horizon, which no pass reaches;
+//   - past the continental shelf, where there is no seabed to draw;
+//   - anywhere terrain simply ends.
+// "The below horizon has no depth and also under terrain has no depth, just assume max depth there."
+// That is exactly the rule: no depth means the water goes on forever, not that there is no water.
+//
+// ⚠ WHY THIS IS ITS OWN PASS AND NOT A BRANCH IN volfog. The tempting version keys off
+// gSceneLinDepth == 0 inside the existing fullscreen pass. It cannot work: that buffer is snapshotted
+// at the colour->water seam, so the WATER SURFACE is not in it either, and the sky dome and distant
+// land never write depth. A depth-keyed fill would therefore re-fog three things that are already
+// correctly fogged. What actually distinguishes a hole is COVERAGE, not depth — and coverage is
+// readable only through the blend. Hence the fill-holes blend state on this pipeline:
+//
+//     dst = src * (1 - dstAlpha) + dst        (INV_DEST_ALPHA / ONE, colour and alpha alike)
+//
+// which contributes exactly nothing wherever anything was drawn, whatever drew it and whether or not
+// it wrote depth. No double-count is possible by construction, which is the property worth having in
+// a pass that runs over the whole screen.
+//
+// The content is the same thing every surface in the frame melts into — the sampled sky
+// (skydome.h.fsl) with the water column composited over it — so a hole is filled with precisely what
+// a surface at that spot would have become. Reuses opaque.srt.h's PerFrame set wholesale, exactly as
+// volfog does: gSkyColor, gShadowParams and gFrameData are all already bound there.
+
+#include "opaque.srt.h"
+#include "skydome.h.fsl"   // fogSkyColor() + waterFogComposite()
+
+STRUCT(VSOutput)
+{
+    DATA(float4, Position, SV_Position);
+    DATA(float2, Uv,       TEXCOORD0);
+};
+
+ROOT_SIGNATURE(DefaultRootSignature)
+float4 PS_MAIN(VSOutput In)
+{
+    INIT_MAIN;
+
+    // SUBMERGED ONLY. Above water the same holes exist, but what shows through them is MW's own sky
+    // band — which is roughly the right colour, has been there since the takeover began, and is not
+    // this change's business. Filling them would be a large, unrelated, hard-to-attribute shift to
+    // every exterior frame.
+    if (!waterFogCameraSubmerged()) { RETURN(float4(0.0f, 0.0f, 0.0f, 0.0f)); }
+
+    // The ray. No depth is read: there is nothing here to read a depth FOR, which is the whole point.
+    // The eye sits at the origin in this camera-relative space, so any point on the ray gives the
+    // direction; 0.5 is picked simply because it cannot produce a zero w the way the reverse-Z far
+    // plane (0) can.
+    // ⚠ THE EYE IS NOT AT THE ORIGIN, and the comment above used to say it was. Under produce-mode-3
+    // park the payload is emitted relative to bakeEye and the view is restamped with
+    // (bakeEye - eyeNow)·R_now, so the camera sits at (eyeNow - bakeEye) — one frame of camera motion
+    // from 0. Normalizing a single reconstructed point therefore returned a ray tilted by
+    // Δeye/distance: zero when standing still, proportional to speed when moving. Harmless for a
+    // surface, but this pass feeds the phase function, whose value spans 0.61 to 6.99 over view
+    // angle — so a fraction of a degree arrives as a brightness swing, and only in the pixels this
+    // pass owns. That is the "sky holes get brighter or darker than everything else as I move".
+    //
+    // TWO points on the SAME ray, differenced. A difference cancels the origin, so the direction is
+    // exact without anyone having to know where the eye is or ship it. 0.25/0.75 rather than 0/1:
+    // both stay clear of the reverse-Z far plane, where w can reach 0.
+    float2 pix   = In.Position.xy;
+    float2 vpUv  = pix * gShadowParams.screenParams.zw;
+    float2 ndc   = float2(vpUv.x * 2.0f - 1.0f, 1.0f - vpUv.y * 2.0f);
+    float4 hpA   = mul(gShadowParams.invViewProj, float4(ndc, 0.25f, 1.0f));
+    float4 hpB   = mul(gShadowParams.invViewProj, float4(ndc, 0.75f, 1.0f));
+    // Reverse-Z puts the NEARER sample at the LARGER device z, so the outward ray runs B -> A.
+    float3 dir   = normalize(hpA.xyz / hpA.w - hpB.xyz / hpB.w);
+
+    // Push it out past total extinction. As in sky.frag, the distance CANCELS in the branch that
+    // bounds the ray at the surface and saturates in the branch that does not, so 1e5 is not a tuned
+    // number — it is "further than the medium can see", and every exponent downstream stays negative.
+    float3 rel = dir * 1.0e5f;
+
+    // Opaque by construction: the blend decides where this lands, not the alpha.
+    float3 c = waterFogComposite(fogSkyColor(pix), rel, waterFogSample(rel));
+    RETURN(float4(c, 1.0f));
+}

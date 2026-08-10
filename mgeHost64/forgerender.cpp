@@ -26,6 +26,7 @@
 #include "terrain.h"
 
 #include <cstdio>
+#include <cstdlib>   // std::atof — Morrowind.ini [Water]/[Weather] parse (loadWaterIniOnce)
 #include <cstdint>
 #include <cstring>
 #include <chrono>
@@ -1173,6 +1174,24 @@ namespace {
         // true  => the frags write radiance and resolve.frag applies the curve once, at the end.
         bool            sceneReferred = false;
 
+        // ...and step 5's second axis: what ENCODING those units are in. `sceneReferred` says the
+        // target holds radiance rather than pixels; this says the numbers are proportional to it.
+        // Folded `g_linearScene && sceneReferred`, evaluated in the same breath and, like the bit
+        // above, the only place either half is looked at. Receivers: gShadowParams.toneParams.y
+        // (every colour frag + every vertex stage that carries an authored colour) and
+        // gResolveParams.opts.w (resolve.frag's compensating encode).
+        //
+        // WHY IT RIDES ON scene-referred RATHER THAN BEING INDEPENDENT. Linear values are what a
+        // gamma encoding exists to avoid storing in 8 bits: the encoding spends its code points where
+        // the eye is sensitive, and a linear B8G8R8A8 target bands visibly in every shadow. Linear
+        // therefore requires the wide format, and the wide format is what `sceneReferred` already is.
+        //
+        // false => authored colours reach the shaders as MW wrote them and the resolve does not
+        //          encode: byte-identical to step 6a, which is byte-identical to before it.
+        // true  => textures decode in the sampler (_SRGB views), cbuffer/vertex colours decode at
+        //          their write sites, and resolve.frag ends linearToSrgb -> tonemap.
+        bool            linearScene = false;
+
         // --- M1c opaque scene path (GPU-driven: one PerFrame set, structured buffer) ---
         RenderTarget*  pDepth = nullptr;          // depth buffer for the scene
         Shader*        pOpaqueShader = nullptr;
@@ -1799,6 +1818,8 @@ namespace {
         Pipeline*      pSkyHeightViewPipeline = nullptr;
         Shader*        pVolFogShader = nullptr;             // shadowatlasview.vert + volfog.frag (height fog / shafts)
         Pipeline*      pVolFogPipeline = nullptr;           // blended ONE / SRC_ALPHA
+        Shader*        pWaterFillShader = nullptr;          // shadowatlasview.vert + waterfill.frag
+        Pipeline*      pWaterFillPipeline = nullptr;        // FILL-HOLES blend: INV_DEST_ALPHA / ONE
         bool           sunShadowReady = false;
         Buffer*        pReflectSkyWorldsBuf = nullptr;     // reflect sky gBatch window (own; filled in the reflect pass)
         DescriptorSet* pPerBatchSetReflectSky = nullptr;   // gBatch bound to pReflectSkyWorldsBuf
@@ -2305,6 +2326,291 @@ namespace {
     float              g_volFogWaterZ    = 0.0f;
     bool               g_volFogWaterOn   = false;
 
+    // --- UNIFIED WATER FOG (waterfog.h.fsl, tasks/forge-water.md) --------------------------------
+    // ONE Beer-Lambert extinction over the path length through water, for the surface AND for every
+    // submerged fragment, toward MW's own [Water] colour. Replaces three disagreeing private fades
+    // (see the header of water.frag.fsl for the census).
+    //
+    // 0 = the previous image, byte for byte: the shader's `waterFogActive()` gate turns all three
+    // retirements in water.frag back into the expressions they replaced, and applyFog composes with
+    // a factor of exactly 0. Same "one float disarms every receiver" idiom as sunParams.x.
+    bool               g_waterFog        = true;
+    // The knob is a VISIBILITY DISTANCE at MW's DAY density, in world units — the same readability
+    // trade g_volFogVisDist makes and for the same reason (a Morrowind unit is ~1.4 cm, so the
+    // coefficient itself lives in 1e-5..1e-4 where one slider notch spans clear-to-soup).
+    //
+    // ⚠ THE DEFAULT IS THE PRIOR ART'S OWN NUMBER, not a picked one, and the first shipped value
+    // was 2.55x too dense because it was picked. `1 - exp(-(1.56/uFogFar) * waterDepth)` takes
+    // uFogFar from OpenMW's FogManager::getFogEnd(true), which is `min(viewDistance, 7168)` — and
+    // at any normal view distance that is exactly 7168, i.e. 101.8 m. THAT is where "even the
+    // cleanest water has 100 m visibility" comes from; it was never an eyeball figure.
+    //
+    // ⚠ AND uFogFar CARRIES NO DENSITY. In OpenMW the five [Water] densities move only the fog
+    // ramp's START (`min(viewDist,7168)*(1-rho)`, negative for rho > 1) — which is the flat
+    // zero-distance tint this whole feature exists to replace, and which an exponential drops by
+    // construction. So dividing this knob by the raw density, as the first build did, applied a
+    // number that in the source never touched the rate at all. The density is normalised against
+    // DAY below instead: day reproduces the prior art exactly, and night/indoor modulate relative
+    // to it (4/2.5 = 1.6x, 3/2.5 = 1.2x), which keeps MW's real time-of-day data without
+    // re-scaling the one constant that was actually tuned.
+    //
+    // ⚠ ...AND 7168 IS THE CLEAR-WATER CASE, WHICH MORROWIND'S WATER IS NOT. That figure is open
+    // ocean; the Bitter Coast is silt. User's call, and the arithmetic is exact: "reaching it would
+    // be like 1/7", and 7168 / 7 = 1024 units = 14.5 m — murky coastal water. The knob still NAMES
+    // the clear-water distance in the same units, so 7168 remains the reference the prior art was
+    // tuned at and is one drag away.
+    //
+    // At 1024 the mean coefficient e-folds in ~9.3 m and reaches ~79% opacity at 14.5 m; a rock
+    // 1.4 m down still receives 83% of the surface light, one 14.5 m down about 15%.
+    float              g_waterFogVisDist = 1024.0f;
+    // TURBIDITY — the hue of the absorption, orthogonal to its rate above.
+    //
+    // ⚠ THIS IS A MODEL CHANGE, NOT A KNOB, and the distinction is the reason it exists: inverting
+    // UnderwaterColor gives sigma = (1.287, 0.901, 0.813), which is MONOTONE R > G > B. Blue is the
+    // transmission window at every depth and at every setting, so "I expect some green from early
+    // light absorption" was not reachable by turning anything ([[feedback_model_class_not_knobs]] —
+    // when a second parameter cannot get there, ask whether the maths permits the answer at all).
+    //
+    // What the pure-water inversion is missing is CDOM — "yellow substance", the dissolved organic
+    // matter that makes coastal water green and open ocean blue. Its absorption rises exponentially
+    // toward short wavelengths, a(lam) = a(440)*exp(-S*(lam-440)) with S ~ 0.014/nm (Bricaud 1981),
+    // so at RGB centroids ~(600, 550, 450) nm it lands at (0.268, 0.540, 2.191) normalised. Red is
+    // already the most absorbed by water itself; add a term that hits BLUE hardest and the window
+    // necessarily moves to GREEN — which is exactly why turbid water is green and clear water blue.
+    //
+    // Blended as `(1-t)*water + t*CDOM` with BOTH sides normalised to unit mean, so the sum is unit
+    // mean for any t: turbidity rotates the hue and can never change the overall rate. That is what
+    // keeps it orthogonal to the visibility knob rather than a second, redundant density.
+    //
+    // Green overtakes blue at t = 0.051, so this is a sensitive axis near zero.
+    //
+    // ⚠ DEFAULT MOVED 0.15 -> 0, AND THE REASON IS THE WHOLE OF W8. Shipped at 0.15 this reads as
+    // algae green — reported as such — and that is not a mistuning, it is three times past the
+    // crossover. Worse, it was the ONLY hue axis the model had: with a single exponential the
+    // surviving channel is always the minimum-sigma one, so the colour path runs neutral -> window
+    // and nothing can bend it. Turbidity's only expressive direction WAS toward green.
+    //
+    // W8 supplies the direction that was missing, by splitting extinction into absorption and
+    // SCATTERING (g_waterScatterRatio). In-scatter is then coloured by sigma_s/sigma_t, a different
+    // spectrum from the one that attenuates — which is what lets cyan-blue exist at all, and is why
+    // this knob no longer has to carry a job it could not do. CDOM stays reachable for anyone who
+    // wants genuinely green swamp water; it is simply not the default any more.
+    float              g_waterTurbidity  = 0.0f;
+    // --- W8: SCATTERING ----------------------------------------------------------------------
+    // sigma_s / sigma_a, i.e. how much of the medium puts light BACK rather than eating it. This is
+    // what "turbidity" was reaching for and could not express: particles both scatter and attenuate,
+    // and it is the RATIO of the two that sets the colour of deep water.
+    //
+    // The colour falls out rather than being picked. In-scatter over a long ray converges to the
+    // single-scattering albedo sigma_s/sigma_t times the light that got down there, so with the
+    // absorption spectrum red-heavy (water's own, 1.286/0.901/0.812) and the scattering spectrum
+    // mildly blue (lambda^-1, 0.874/0.975/1.151), the albedo at this default is
+    // (0.352, 0.464, 0.531) — normalised (0.66, 0.87, 1.00), which is cyan-blue. Nothing was tuned
+    // to make that happen; it is what two independent spectra do when you divide them.
+    //
+    // ⚠ THE CROSS-CHECK IS WORTH KNOWING. That derived colour's HUE lands within ~8% of MW's own
+    // authored [Water] UnderwaterColor, which was picked by hand and never saw either spectrum. Only
+    // the MAGNITUDE disagreed (by ~3.3x), and magnitude is the one thing the model genuinely cannot
+    // know — see g_waterInscatterGain.
+    //
+    // 0 = a pure absorber: deep water goes BLACK, which is a real setting and a useful negative
+    // control. Up = milkier and paler, because the albedo rises toward 1 in every channel at once.
+    float              g_waterScatterRatio  = 0.8f;
+    // The one calibration constant in W8, and it is honest about why it exists: the in-scatter is
+    // sigma_s * (sunCol * phase + ambCol) * pathlength, but "sunCol" is a radiance the engine never
+    // defined a matching irradiance for, so the absolute scale is not derivable from the wire. 0.30
+    // is the value at which deep water under clear midday light reproduces MW's own authored
+    // UnderwaterColor — chosen so the verified match this feature started from survives the switch
+    // to deriving it. Raise it for livelier, more luminous water; the HUE does not move.
+    float              g_waterInscatterGain = 0.30f;
+    // PHASE (phase.h.fsl). Water is strongly forward-scattering — Petzold's average particle is near
+    // g = 0.92 — so the sun's halo through the water is real and large, and a lone lobe that big
+    // leaves nothing at 90 degrees. Three terms with the gains summing to ~1 keeps the phase roughly
+    // energy-neutral: 0.50 + 0.42 + 0.08. The pedestal is doing a second job as well, standing in for
+    // the MULTIPLE scattering a single-scattering integral cannot see, which in water this dense is
+    // most of what fills the side directions.
+    // At these values the phase is ~7.0 looking into the sun, 0.61 at 90 degrees, 0.77 looking away.
+    float              g_waterPhaseIso      = 0.50f;
+    float              g_waterPhaseFwdG     = 0.85f;
+    float              g_waterPhaseFwdGain  = 0.42f;
+    float              g_waterPhaseBackG    = -0.35f;
+    float              g_waterPhaseBackGain = 0.08f;
+    // Soft ceiling on the LOBES. Unclamped, g = 0.85 peaks at 82x isotropic; a hard clamp would draw
+    // a disc edge around the sun, this asymptotes instead. 0 = off.
+    float              g_waterPhaseCeil     = 8.0f;
+    // W8d: how much the lobes wash out with SCATTERING optical depth (waterColumn). The 11x range
+    // above is right for a first bounce and wrong for a saturated column, where the light has bounced
+    // many times and arrives isotropically — which is why the hole fill and the far water swung with
+    // the camera while the geometry in front of them did not. exp(-sigma_s*L) is the single-scattered
+    // fraction, so the crossover is the medium's, not a tuned one; this lane only says whether to
+    // believe it. 1 = full (physical), 0 = the pre-W8d build bit for bit.
+    float              g_waterPhaseMS       = 1.0f;
+    // W8d diagnostic. One CSV row per frame of every uniform the in-scatter reads, so a value that
+    // arrives a frame late shows up as a PHASE SHIFT against the ones that do not when the camera
+    // oscillates. See the trace block in renderScene for the column pairings.
+    bool               g_waterFogTrace      = false;
+    // W8e: how much of the DOWNWELLING path runs on K_d instead of sigma_t. Measured cause of the
+    // "brighter or darker than everything else as I move camera" swing: e0 = exp(-k*slant*eyeDepth)
+    // on sigma_t darkened 3.84x (ambient) / 4.76x (sun) over a 628 -> 1296 unit dive, while nearby
+    // geometry held still because its lighting keys on the FRAGMENT's depth. K_d is the physically
+    // right coefficient there and is ~1.65x smaller, which takes the same dive to ~2.3x.
+    // 1 = physical, 0 = the host publishes sigma_t verbatim and the image is pre-W8e bit for bit.
+    float              g_waterKd            = 1.0f;
+    // The A/B. 0 = the fade-toward-a-published-target model, bit-identical — including
+    // waterLightTransmit's spectrum, which lerps on this same lane.
+    float              g_waterVolumetric    = 1.0f;
+    // UNDERWATER BACKSTOP. The host colour target clears transparent and the present seam shows MW
+    // through wherever nothing was drawn — which underwater means MW's ABOVE-water sky, sun and all,
+    // arriving in the middle of a submerged view. Three regions have it and they are one state, "the
+    // depth buffer has nothing here": the band under the sky dome's rim, past the continental shelf,
+    // and wherever terrain ends. Fills them with the water column at max depth. Own toggle because
+    // it is a whole extra fullscreen pass and a whole extra failure mode; see waterfill.frag.fsl.
+    bool               g_waterFillHoles     = true;
+    // Blend weight between MW's UnderwaterColor and the weather fog colour. Ini default 0.85 —
+    // exposed because it is the one number that decides whether submerged distance reads as WATER
+    // or as the sky leaking under the surface, and it is cheap to look at both.
+    float              g_waterFogWeight  = 0.85f;
+    // Per-frame latch, stamped beside g_volFogWaterZ from this frame's water params (the volumetric
+    // clamp and this feature need the same plane and must not derive it twice).
+    float              g_waterFogZ       = 0.0f;    // ABSOLUTE world Z of the surface
+    bool               g_waterFogOn      = false;   // cell has water AND the knob is on
+    bool               g_waterFogUnder   = false;   // camera is below the surface
+    float              g_waterFogHour    = 12.0f;   // MW's GameHour, off waterParams[11]
+    // MW's weather fog colour AS AUTHORED — before the step-6a lift and the step-5 decode that
+    // fd[28..30] carries. Latched at that write site (the only place it exists unconverted) because
+    // gFrameData is write-combined and reading one back is a documented trap.
+    float              g_fogColAuthored[3] = { 0.0f, 0.0f, 0.0f };
+
+    // --- W7a: CANCEL MW's GLOBAL UNDERWATER LIGHT TINT -------------------------------------------
+    // MEASURED, not assumed (the crossing log at the water latch is what produced these): the
+    // instant the EYE crosses the surface the engine multiplies its sun and ambient by a fixed
+    // absorption tint — sun x(0.190 0.258 0.292), ambient x(0.225 0.326 0.347) on a clear day. Red
+    // killed hardest, blue least, which is the RIGHT SPECTRUM. Everything else about it is wrong:
+    //
+    //   - it is DEPTH-INDEPENDENT, so a rock 10 cm down and one 20 m down are lit identically;
+    //   - it is CAMERA-dependent, so a rock's lighting changes when the VIEWER moves and the rock
+    //     does not — the defining symptom of a global standing in for a local quantity;
+    //   - it is a ~5x STEP at the crossing, which is a hard cut in its own right, and it stacks on
+    //     top of the unified water fog now modelling the same absorption properly.
+    //
+    // It is cancelled here rather than replaced at the source because the source is not reachable:
+    // MWSE's TES3::WeatherController carries currentSkyColor and currentFogColor but NO current sun
+    // or ambient — the engine drives sgSunlight directly, and what the client captures is already
+    // tinted. (Prime Directive 6 rules out going looking for more.)
+    //
+    // So it is cancelled by MEASUREMENT, which needs no engine internals and self-calibrates:
+    // latch the authored sun/ambient every above-water frame; on the first submerged frame divide
+    // to get K; every later submerged frame divide the LIVE values by that same K, so weather and
+    // time of day keep tracking while only the engine constant is held. A session that begins
+    // submerged has no K yet and ships MW's values unchanged — the old behaviour, recovered the
+    // first time the player surfaces.
+    //
+    // ⚠ The one thing to re-check if this ever looks wrong: whether K is really constant. The log
+    // line below prints it at every crossing precisely so that is falsifiable rather than assumed.
+    float g_waterLightCancel = 1.0f;    // 0 = off (byte-identical: divide by exactly 1)
+    // W7b — and the reason it pairs with the cancel above rather than replacing it: cancelling alone
+    // leaves a submerged world lit at SURFACE brightness, which is as wrong at 20 m down as MW's flat
+    // tint is at 10 cm. This is the term that makes depth mean something. 0 = off (transmittance
+    // exactly 1). Its own lane so the pair can be A/B'd against each other, which matters: "things
+    // underwater got darker" is a symptom the fog, the cancel and this all share.
+    float g_waterLightAbsorb = 1.0f;
+    // SEEDED with the values measured on this install (the crossing log), NOT with 1.0 — because a
+    // save that LOADS underwater never sees an above-water frame, so the latch below can never arm
+    // and the cancel would silently do nothing for the whole session. That is not a corner case: it
+    // is the obvious way to make a test save for this feature, and it is the case where the feature
+    // matters most.
+    //
+    // A seed is legitimate here where a transplanted tuning would not be
+    // ([[feedback_prior_art_constants_dont_transfer]]): this is a measured property of THIS engine,
+    // it is used only until the first real crossing overwrites it, and which one is in force is
+    // logged either way. If K turns out to vary with weather or time of day, the seed is the thing
+    // that has to go — so it is deliberately the same number the log prints.
+    float g_uwTintK[6]       = { 0.190f, 0.258f, 0.292f, 0.225f, 0.326f, 0.347f };   // sun.rgb, amb.rgb
+    float g_uwTintAbove[6]   = {};      // last above-water AUTHORED sun.rgb / amb.rgb
+    bool  g_uwTintHaveAbove  = false;
+    bool  g_uwTintValid      = true;    // the seed above; replaced at the first crossing
+    bool  g_uwTintSeeded     = true;    // ...and this says it has not been replaced yet (log only)
+    bool  g_uwTintWasUnder   = false;
+
+    // fdc points at gFrameData float 0; sun is 20..22, ambient 24..26, both still AUTHORED.
+    void cancelUnderwaterLightTint(float* fdc, bool underwater) {
+        const float live[6] = { fdc[20], fdc[21], fdc[22], fdc[24], fdc[25], fdc[26] };
+
+        if (!underwater) {
+            for (int i = 0; i < 6; ++i) { g_uwTintAbove[i] = live[i]; }
+            g_uwTintHaveAbove = true;
+            g_uwTintWasUnder  = false;
+            return;
+        }
+        if (!g_uwTintWasUnder && g_uwTintHaveAbove) {
+            // First submerged frame: measure. Reject implausible ratios rather than trusting them —
+            // a channel that was ~0 above water carries no information, and a ratio at or above 1 is
+            // not a tint, so both fall back to "no correction on this channel".
+            bool any = false;
+            for (int i = 0; i < 6; ++i) {
+                const float a = g_uwTintAbove[i];
+                const float k = (a > 1.0e-3f) ? (live[i] / a) : 1.0f;
+                g_uwTintK[i] = (k > 0.02f && k < 0.999f) ? k : 1.0f;
+                if (g_uwTintK[i] < 1.0f) { any = true; }
+            }
+            g_uwTintValid  = any;
+            g_uwTintSeeded = false;   // a real measurement now, whatever it said
+            LOG::logline(">> [waterfog] MW underwater light tint MEASURED: sun x(%.3f %.3f %.3f) "
+                         "amb x(%.3f %.3f %.3f)%s",
+                         g_uwTintK[0], g_uwTintK[1], g_uwTintK[2],
+                         g_uwTintK[3], g_uwTintK[4], g_uwTintK[5],
+                         g_uwTintValid ? "" : "  (no usable ratio — not cancelling)");
+        } else if (!g_uwTintWasUnder && g_uwTintSeeded) {
+            // Submerged with no above-water frame this session — a save that LOADED underwater.
+            // Running on the seed; say so, so a wrong-looking cancel is attributable.
+            LOG::logline(">> [waterfog] submerged with no above-water frame yet — using SEEDED tint "
+                         "sun x(%.3f %.3f %.3f) amb x(%.3f %.3f %.3f); surface once to measure it",
+                         g_uwTintK[0], g_uwTintK[1], g_uwTintK[2],
+                         g_uwTintK[3], g_uwTintK[4], g_uwTintK[5]);
+        }
+        g_uwTintWasUnder = true;
+        if (!g_uwTintValid) { return; }
+
+        // Strength lerps the DIVISOR toward 1, so 0 divides by exactly 1.0f and the frame is
+        // bit-identical to the uncancelled one — the A/B, on the same "one float disarms it" idiom
+        // the rest of this file uses.
+        const float s = std::max(0.0f, std::min(g_waterLightCancel, 1.0f));
+        const int   dst[6] = { 20, 21, 22, 24, 25, 26 };
+        for (int i = 0; i < 6; ++i) {
+            const float divisor = 1.0f + s * (g_uwTintK[i] - 1.0f);
+            fdc[dst[i]] = live[i] / divisor;
+        }
+    }
+
+    // Morrowind.ini [Water] + [Weather], read ONCE. These are the numbers OpenMW exposes as its
+    // Water_* / Weather_* fallbacks, i.e. the same data the prior-art shader this ports was tuned
+    // against — so the time-of-day behaviour is reproducible from the player's own install rather
+    // than from constants baked in here. Defaults below are Bethesda's shipped values, used when a
+    // key is missing so a trimmed ini degrades to vanilla instead of to zero.
+    struct WaterIni {
+        float underwaterColor[3] = { 12.0f / 255.0f, 30.0f / 255.0f, 37.0f / 255.0f };
+        float colorWeight        = 0.85f;
+        float fogSunrise         = 3.0f;
+        float fogDay             = 2.5f;
+        float fogSunset          = 3.0f;
+        float fogNight           = 4.0f;
+        float fogIndoor          = 3.0f;
+        // [Weather] bucket boundaries, in game hours.
+        float sunriseTime        = 6.0f;
+        float sunsetTime         = 18.0f;
+        float sunriseDuration    = 2.0f;
+        float sunsetDuration     = 2.0f;
+        // [Weather] "Fog Pre-/Post-Sunrise/Sunset Time" — the transition widths for the FOG class
+        // specifically (MW gives sky, ambient, fog and sun their own, and the underwater density is
+        // a fog-class value).
+        float fogPreSunrise      = 0.5f;
+        float fogPostSunrise     = 1.0f;
+        float fogPreSunset       = 2.0f;
+        float fogPostSunset      = 1.0f;
+        bool  loaded             = false;
+    };
+    WaterIni g_waterIni;
+
     // --- FOG SAMPLES THE SKY (skydome.h.fsl) -----------------------------------------------------
     // Every lit path used to fog toward the single flat colour fogColNear, while the sky behind it is
     // a gradient. The two agree ONLY exactly at the horizon, and MW's palette makes the divergence
@@ -2357,6 +2663,184 @@ namespace {
             if (tonemapCurve(mid) < d) { lo = mid; } else { hi = mid; }
         }
         return 0.5f * (lo + hi);
+    }
+
+    // --- THE SCENE'S TRANSFER FUNCTION, HOST SIDE (step 5) ---------------------------------------
+    // A C++ mirror of linearize.h.fsl, and for the same reason the tonemap above is mirrored: some
+    // authored colours reach the GPU as CBUFFER LANES rather than as texels or vertices, so nothing
+    // in the pipeline would decode them. The sun and ambient colours, the weather fog, the sky
+    // zenith, every point light's colour and every distant-light glow chromaticity are all MW's
+    // display-referred numbers arriving over IPC.
+    //
+    // ⚠ THIS IS THE SAME CURVE THE HARDWARE APPLIES TO A _SRGB VIEW — the exact piecewise
+    // IEC 61966-2-1 EOTF, not pow(x, 2.2). It has to be: a texel decoded by the sampler and a light
+    // colour decoded here multiply together in the very next instruction, and two nearly-identical
+    // transfer functions would put a small, direction-dependent hue error on every lit surface —
+    // the kind that reads as "the colours are slightly off" and is almost unfindable.
+    //
+    // Called a few dozen times per frame at most (six cbuffer lanes plus the light lists), so the
+    // straightforward form is right; there is no hot loop here to justify an approximation.
+    inline float srgbToLinearF(float c) {
+        if (c <= 0.0f) { return 0.0f; }
+        return (c <= 0.04045f) ? (c * (1.0f / 12.92f))
+                               : std::pow((c + 0.055f) * (1.0f / 1.055f), 2.4f);
+    }
+    // Decode in place, gated. Every call site reads as "this lane is authored" and nothing else.
+    inline void decodeAuthoredRGB(float* rgb) {
+        if (!g_live.linearScene) { return; }
+        rgb[0] = srgbToLinearF(rgb[0]);
+        rgb[1] = srgbToLinearF(rgb[1]);
+        rgb[2] = srgbToLinearF(rgb[2]);
+    }
+    // ...and the exact inverse, for the two places that have to hand an authored value BACK out of
+    // the scene domain (the sky-ambient SH projection reads the fog colour out of the cbuffer it was
+    // already written into). Mirrors linearToSrgb().
+    inline float linearToSrgbF(float c) {
+        if (c <= 0.0f) { return 0.0f; }
+        return (c <= 0.0031308f) ? (c * 12.92f)
+                                 : (1.055f * std::pow(c, 1.0f / 2.4f) - 0.055f);
+    }
+
+    // --- Morrowind.ini [Water] / [Weather], for the unified water fog ----------------------------
+    //
+    // Read ONCE, from the host's cwd (the install dir — terrain.cpp reads [Game Files] the same
+    // way). Everything this feature needs beyond a visibility knob is DATA MW already ships:
+    //   [Water]   UnderwaterColor / UnderwaterColorWeight  -> the fog target
+    //             UnderwaterSunriseFog / DayFog / SunsetFog / NightFog / IndoorFog -> the density
+    //   [Weather] Sunrise Time / Sunset Time / Sunrise Duration / Sunset Duration -> the boundaries
+    //             Fog Pre-/Post-Sunrise/Sunset Time -> the transition widths
+    //
+    // Deliberately not hard-coded: these are exactly OpenMW's Water_*/Weather_* fallbacks, so a
+    // player who edited their ini (or a total conversion that did) gets their own numbers, and the
+    // prior-art formula this ports keeps meaning what it meant where it was tuned.
+    //
+    // Minimal by design: the ini is small, and a general parser is a liability next to a loop that
+    // matches two sections and a fixed key list. Values are ASCII floats in the system codepage;
+    // UnderwaterColor is "R,G,B" bytes.
+    void loadWaterIniOnce() {
+        if (g_waterIni.loaded) { return; }
+        g_waterIni.loaded = true;   // set FIRST: a missing/unreadable ini must not retry every frame
+
+        std::FILE* f = std::fopen("Morrowind.ini", "rb");
+        if (!f) {
+            LOG::logline("!! [waterfog] Morrowind.ini unreadable — using vanilla [Water] defaults");
+            return;
+        }
+        std::string text;
+        {
+            char buf[4096];
+            size_t n;
+            while ((n = std::fread(buf, 1, sizeof(buf), f)) > 0) { text.append(buf, n); }
+        }
+        std::fclose(f);
+
+        auto trimmed = [](const std::string& s) {
+            size_t a = 0, b = s.size();
+            while (a < b && (unsigned char)s[a] <= ' ') { ++a; }
+            while (b > a && (unsigned char)s[b - 1] <= ' ') { --b; }
+            return s.substr(a, b - a);
+        };
+        auto lowered = [](std::string s) {
+            for (char& c : s) { if (c >= 'A' && c <= 'Z') { c = (char)(c - 'A' + 'a'); } }
+            return s;
+        };
+
+        int section = 0;   // 0 = neither, 1 = [Water], 2 = [Weather]
+        size_t pos = 0;
+        int found = 0;
+        while (pos <= text.size()) {
+            size_t nl = text.find('\n', pos);
+            if (nl == std::string::npos) { nl = text.size(); }
+            std::string line = trimmed(text.substr(pos, nl - pos));
+            pos = nl + 1;
+            if (line.empty() || line[0] == ';') { continue; }
+            if (line[0] == '[') {
+                const std::string s = lowered(line);
+                section = (s.rfind("[water]", 0) == 0) ? 1 : ((s.rfind("[weather]", 0) == 0) ? 2 : 0);
+                continue;
+            }
+            if (section == 0) { continue; }
+            const size_t eq = line.find('=');
+            if (eq == std::string::npos) { continue; }
+            const std::string key = lowered(trimmed(line.substr(0, eq)));
+            const std::string val = trimmed(line.substr(eq + 1));
+            if (val.empty()) { continue; }
+
+            auto num = [&](float& dst) { dst = (float)std::atof(val.c_str()); ++found; };
+
+            if (section == 1) {
+                if      (key == "underwatersunrisefog")  { num(g_waterIni.fogSunrise); }
+                else if (key == "underwaterdayfog")      { num(g_waterIni.fogDay); }
+                else if (key == "underwatersunsetfog")   { num(g_waterIni.fogSunset); }
+                else if (key == "underwaternightfog")    { num(g_waterIni.fogNight); }
+                else if (key == "underwaterindoorfog")   { num(g_waterIni.fogIndoor); }
+                else if (key == "underwatercolorweight") { num(g_waterIni.colorWeight);
+                                                           g_waterFogWeight = g_waterIni.colorWeight; }
+                else if (key == "underwatercolor") {
+                    // "012,030,037" — three 0..255 bytes.
+                    int c[3] = { 12, 30, 37 };
+                    if (std::sscanf(val.c_str(), "%d , %d , %d", &c[0], &c[1], &c[2]) == 3) {
+                        for (int i = 0; i < 3; ++i) {
+                            const int v = (c[i] < 0) ? 0 : (c[i] > 255 ? 255 : c[i]);
+                            g_waterIni.underwaterColor[i] = (float)v * (1.0f / 255.0f);
+                        }
+                        ++found;
+                    }
+                }
+            } else {
+                if      (key == "sunrise time")           { num(g_waterIni.sunriseTime); }
+                else if (key == "sunset time")            { num(g_waterIni.sunsetTime); }
+                else if (key == "sunrise duration")       { num(g_waterIni.sunriseDuration); }
+                else if (key == "sunset duration")        { num(g_waterIni.sunsetDuration); }
+                else if (key == "fog pre-sunrise time")   { num(g_waterIni.fogPreSunrise); }
+                else if (key == "fog post-sunrise time")  { num(g_waterIni.fogPostSunrise); }
+                else if (key == "fog pre-sunset time")    { num(g_waterIni.fogPreSunset); }
+                else if (key == "fog post-sunset time")   { num(g_waterIni.fogPostSunset); }
+            }
+        }
+        LOG::logline(">> [waterfog] Morrowind.ini: %d keys; color (%.3f %.3f %.3f) w %.2f; "
+                     "fog rise/day/set/night/indoor %.2f/%.2f/%.2f/%.2f/%.2f",
+                     found, g_waterIni.underwaterColor[0], g_waterIni.underwaterColor[1],
+                     g_waterIni.underwaterColor[2], g_waterIni.colorWeight,
+                     g_waterIni.fogSunrise, g_waterIni.fogDay, g_waterIni.fogSunset,
+                     g_waterIni.fogNight, g_waterIni.fogIndoor);
+    }
+
+    // MW's four-value time-of-day blend, ported from OpenMW's TimeOfDayInterpolator::getValue
+    // (apps/openmw/mwworld/weather.cpp) against the same ini inputs — night / sunrise / day / sunset
+    // with the FOG class's own transition widths.
+    //
+    // A faithful interpolator rather than the four hard buckets the plan sketched, because the two
+    // cost the same and only one of them is continuous: a bucket switch at 06:00 would step the
+    // water's clarity in a single frame, and a step is the exact artifact this whole feature exists
+    // to remove at the surface crossing. Same reason, different axis.
+    float waterFogDensityForHour(float hour) {
+        const WaterIni& w = g_waterIni;
+        const float nightStart = w.sunsetTime + w.sunsetDuration;    // 20
+        const float nightEnd   = w.sunriseTime;                      // 6
+        const float dayStart   = w.sunriseTime + w.sunriseDuration;  // 8
+        const float dayEnd     = w.sunsetTime;                       // 18
+
+        auto mix = [](float a, float b, float t) { return a * (1.0f - t) + b * t; };
+
+        if (hour < nightEnd - w.fogPreSunrise || hour > nightStart + w.fogPostSunset) {
+            return w.fogNight;
+        }
+        if (hour <= dayStart + w.fogPostSunrise) {
+            const float dur = (dayStart + w.fogPostSunrise) - (nightEnd - w.fogPreSunrise);
+            const float mid = (nightEnd - w.fogPreSunrise) + dur * 0.5f;
+            if (dur <= 0.0f) { return w.fogSunrise; }
+            return (hour <= mid) ? mix(w.fogSunrise, w.fogNight, (mid - hour) / dur * 2.0f)
+                                 : mix(w.fogSunrise, w.fogDay,   (hour - mid) / dur * 2.0f);
+        }
+        if (hour < dayEnd - w.fogPreSunset) { return w.fogDay; }
+        {
+            const float dur = (nightStart + w.fogPostSunset) - (dayEnd - w.fogPreSunset);
+            const float mid = (dayEnd - w.fogPreSunset) + dur * 0.5f;
+            if (dur <= 0.0f) { return w.fogSunset; }
+            return (hour <= mid) ? mix(w.fogSunset, w.fogDay,   (mid - hour) / dur * 2.0f)
+                                 : mix(w.fogSunset, w.fogNight, (hour - mid) / dur * 2.0f);
+        }
     }
 
     // MW's enchanted-item glow: the caustic environment map the engine lays over every enchanted
@@ -2567,7 +3051,8 @@ namespace {
     //   invViewProj 0..15 | screenParams 16..19 | maskParams 20..23 | slotPosRad[32] 24..151 |
     //   slotTile[32] 152..279 | biasParams 280..283 | slotBits 284..287 | slotFlick[32] 288..415 |
     //   sunViewProj[N] 416.. | sunParams | sunCascadeTexel | sunPcf0/1 | volFog0..4 | screenAlloc |
-    //   shAr/shAg/shAb | skyParams | skyAOMap | sunOcc | skyAO2 | toneParams
+    //   shAr/shAg/shAb | skyParams | skyAOMap | sunOcc | skyAO2 | toneParams |
+    //   waterFogCol | waterFogPlane
     // Declared HERE rather than beside publishSunShadowParams because the per-frame camera write
     // (invViewProj + screenParams + screenAlloc + the sky SH) happens far earlier in the frame than
     // that function.
@@ -2609,8 +3094,27 @@ namespace {
     // 115 would read ZERO in the reflect-geo pass — which draws statics.frag and terrain.frag, and
     // would have tonemapped the mirrored world while the direct world did not.
     constexpr uint32_t kToneFloat      = kSkyAO2Float + 4;
+    // UNIFIED WATER FOG (waterfog.h.fsl): the blended [Water] target + extinction coefficient, then
+    // the plane / active / camera-submerged triple. Deliberately NOT a reuse of volFog4.zw, which
+    // already carries a water plane: that pair's .w is CLEARED the moment the camera submerges
+    // (an air-fog march below the surface is meaningless) and this feature needs exactly the
+    // opposite, so one lane cannot serve both without one of them reading the other's disarm.
+    constexpr uint32_t kWaterFogColFloat   = kToneFloat + 4;
+    constexpr uint32_t kWaterFogPlaneFloat = kWaterFogColFloat + 4;
+    // W7b: per-channel absorption on the DOWNWARD light path + its strength.
+    constexpr uint32_t kWaterFogLightFloat = kWaterFogPlaneFloat + 4;
+    // W8: the medium split into its two physical halves (total extinction / scattering) plus the
+    // phase. Everything above describes a medium that only REMOVES light, which is why its colour had
+    // to be authored — with nothing putting light back there is no colour to derive.
+    constexpr uint32_t kWaterFogExtFloat     = kWaterFogLightFloat + 4;
+    constexpr uint32_t kWaterFogScatterFloat = kWaterFogExtFloat + 4;
+    constexpr uint32_t kWaterFogPhaseFloat   = kWaterFogScatterFloat + 4;
+    constexpr uint32_t kWaterFogPhase2Float  = kWaterFogPhaseFloat + 4;
+    // W8e: the DIFFUSE attenuation coefficient K_d, for the DOWNWELLING light path only. Not a
+    // second tuning of sigma_t — a different physical coefficient (see publishWaterFog).
+    constexpr uint32_t kWaterFogKdFloat      = kWaterFogPhase2Float + 4;
     constexpr uint32_t kShadowParamsBytes = 4096;
-    static_assert((kToneFloat + 4) * sizeof(float) <= kShadowParamsBytes,
+    static_assert((kWaterFogKdFloat + 4) * sizeof(float) <= kShadowParamsBytes,
                   "ShadowMaskParams overflows its CBV — too many sun cascades");
     // msmrecv.h.fsl's PCSS works in TEXELS, so SUN_SHADOW_RES has to agree with the atlas the host
     // actually allocated. Same mirroring contract as SUN_CASCADES / kSunCascades.
@@ -2711,13 +3215,22 @@ namespace {
         // against an un-lifted zenith and the normalised directional factor would quietly tilt.
         // Undone by running the curve forward rather than by keeping a second copy of the colour:
         // tonemapCurve(inverseTonemap(x)) == x to ~1e-7, and one copy cannot go stale.
+        //
+        // ⚠ STEP 5 ADDS A SECOND THING TO UNDO, AND ONLY ON THE HORIZON. The write site applies
+        // lift-then-decode, so recovering the authored colour means encode-then-curve, in that order
+        // — the exact reverse. Then the projection wants LINEAR radiance (it is producing a light),
+        // so the authored value is decoded again. Net, per horizon channel:
+        //     srgbToLinear( tonemapCurve( linearToSrgb(fd[28]) ) )
+        // Zenith and sunCol take NO round trip at all: they were decoded and never lifted, so they
+        // are already the linear radiance this wants. Two lanes treated differently is not an
+        // inconsistency — it is precisely the lift/no-lift distinction 6a drew, surviving intact.
         const float sunDir[3] = { fd[16], fd[17], fd[18] };
         const float sunCol[3] = { fd[20], fd[21], fd[22] };
         float       horiz[3]  = { fd[28], fd[29], fd[30] };
-        if (g_live.sceneReferred) {
-            horiz[0] = tonemapCurve(horiz[0]);
-            horiz[1] = tonemapCurve(horiz[1]);
-            horiz[2] = tonemapCurve(horiz[2]);
+        for (int i = 0; i < 3; ++i) {
+            if (g_live.linearScene)   { horiz[i] = linearToSrgbF(horiz[i]); }
+            if (g_live.sceneReferred) { horiz[i] = tonemapCurve(horiz[i]); }
+            if (g_live.linearScene)   { horiz[i] = srgbToLinearF(horiz[i]); }
         }
         const float zenith[3] = { fd[68], fd[69], fd[70] };
 
@@ -6530,6 +7043,43 @@ namespace {
             } else {
                 std::printf("[forge] addShader(volfog) FAILED — volumetric fog disabled\n");
             }
+
+            // --- W8 UNDERWATER BACKSTOP (waterfill.frag) -----------------------------------------
+            // Same fullscreen triangle and the same PerFrame set, but the blend is what makes it
+            // work rather than the shader:
+            //     dst = src * (1 - dstAlpha) + dst
+            // i.e. it contributes ONLY where the target's coverage is still zero. That is the one
+            // test that identifies "the host drew nothing here" without asking the depth buffer —
+            // which cannot answer it, because the sky dome, distant land and the water surface all
+            // draw without appearing in gSceneLinDepth. Keyed on coverage, no pass can be
+            // double-fogged no matter what order things were drawn in.
+            ShaderLoadDesc wfDesc = {};
+            wfDesc.mVert.pFileName = "shadowatlasview.vert";
+            wfDesc.mFrag.pFileName = "waterfill.frag";
+            addShader(R, &wfDesc, &g_live.pWaterFillShader);
+            if (g_live.pWaterFillShader) {
+                BlendStateDesc wfBlend = {};
+                wfBlend.mIndependentBlend = false;
+                wfBlend.mRenderTargetMask = BLEND_STATE_TARGET_0;
+                wfBlend.mSrcFactors[0]      = BC_ONE_MINUS_DST_ALPHA;
+                wfBlend.mDstFactors[0]      = BC_ONE;
+                wfBlend.mBlendModes[0]      = BM_ADD;
+                // Alpha takes the SAME pair, which is what closes the hole for the present seam:
+                // dstA' = 1*(1-dstA) + dstA == 1 wherever this wrote, so MW stops showing through.
+                wfBlend.mSrcAlphaFactors[0] = BC_ONE_MINUS_DST_ALPHA;
+                wfBlend.mDstAlphaFactors[0] = BC_ONE;
+                wfBlend.mBlendAlphaModes[0] = BM_ADD;
+                wfBlend.mColorWriteMasks[0] = COLOR_MASK_ALL;
+                sag.pShaderProgram = g_live.pWaterFillShader;
+                sag.pBlendState = &wfBlend;
+                addPipeline(R, &savPd, &g_live.pWaterFillPipeline);
+                sag.pBlendState = nullptr;
+                if (!g_live.pWaterFillPipeline) {
+                    std::printf("[forge] addPipeline(waterfill) FAILED\n");
+                }
+            } else {
+                std::printf("[forge] addShader(waterfill) FAILED — underwater backstop disabled\n");
+            }
         }
 
         // --- Custom MSAA resolve (tasks/forge-postprocess.md step 4) -----------------------------
@@ -9499,6 +10049,33 @@ namespace {
     // scene-format control. Flip it here, rebuild, and check the horizon fog band first.
     bool     g_hdrSceneColor   = false;
 
+    // STEP 5 — THE LINEAR MIGRATION. tasks/forge-postprocess.md.
+    //
+    // Scene-referred is not linear. 6a moved the curve to the end of the frame, but the values the
+    // frame is made of are still MW's GAMMA-ENCODED authored data: every texel, vertex colour,
+    // material and light colour. Multiplying, summing, filtering and blending those as if they were
+    // radiance is wrong in a way that mostly hides — until a convolution asks, which is what bloom
+    // is. Gamma encoding compresses a true 16:1 highlight ratio to ~3.5:1, so a physically-based
+    // bloom built on this target would read as flat haze however it was tuned. Hence the ordering:
+    // linear first, bloom after.
+    //
+    // ON: DDS colour textures are created as _SRGB (hardware decodes before filtering — the reason
+    // this cannot be a shader pow()), the authored cbuffer colours are decoded at their write sites
+    // below, the vertex stages decode their per-vertex/per-draw colours, MOD2X stops multiplying by
+    // a display-space 2, and resolve.frag ends linearToSrgb() -> tonemap().
+    //
+    // ⚠ THE ROUND TRIP IS EXACT, THE SUMS ARE NOT — and that is the migration, not a bug. Everything
+    // that is a pure PRODUCT (texture x texture, texture x material, MOD stages) comes back
+    // bit-for-bit through decode->encode. Everything that is a SUM moves: additive glow stages,
+    // emissive, and above all `ambient + sun·N·L`, where a 0.4/0.6 pair that saturated to 1.0 in
+    // gamma now returns ~0.70. Lit surfaces darken by roughly that, which is the gamma-space
+    // over-brightening abot's Darkening has been cancelling by hand. Measure the two separately —
+    // abot off FIRST, re-baseline, then this — or neither number means anything.
+    //
+    // ⚠ REQUIRES g_hdrSceneColor (folded into g_live.linearScene): 8-bit linear bands in the darks.
+    // Ships OFF, and OFF is byte-identical. The A/B is a REBUILD, like the format it rides on.
+    bool     g_linearScene     = false;
+
     // AO contribution toggles → FrameData.debugParams.w bitmask (bit0 AO, bit1 bent normal, bit2 ambient=white).
     // These two now ARM the AO dispatch as well as consume it (renderScene derives the dispatch gate
     // from them plus the F12 AO views), so baseline-thinning still holds — both off = no AO compute
@@ -9621,6 +10198,28 @@ namespace {
     // texture's own baked amplitude, i.e. the pre-W1 look.
     float g_waterWaveAmp = 1.0f;
     bool  g_waveHeightView = false;
+    // The GGX specular tilts with camera MOTION and is correct the moment the camera stops — which a
+    // rasterizer cannot do on its own, so an input is stale. Reflections are stable, so it is not the
+    // mirror; that leaves N, alpha and the lobe, and N is the only one with no debug view. See the
+    // waterFlagsWord bit-12 note for how to read it.
+    bool  g_waterNormalView = false;
+    // Rebuild the view ray from invViewProj and intersect it analytically with waterTrueLevel, instead
+    // of trusting the interpolated position of a coarse lattice that sits ±5 units off the surface
+    // anyway. ON by default — a correctness fix, not an effect — but toggleable because it moves
+    // EyeVec AND `dist`, and dist also feeds the fog, the distortion strength and the reflection LOD.
+    // RESTAMP-SAFE EYE VECTOR. Produce-mode-3 park emits the payload relative to bakeEye and restamps
+    // the view with (bakeEye - eyeNow)·R_now, so the camera sits at (eyeNow - bakeEye), NOT at the
+    // origin — one frame of camera motion away. Anything that builds a DIRECTION from an assumed
+    // origin is wrong by Δeye/distance: zero standing still, proportional to speed moving, worst
+    // close in. In this renderer that is exactly two lines, water.frag's EyeVec and waterfill's ray.
+    // The fix differences two reconstructions on one pixel ray, which cancels the origin outright and
+    // needs nothing on the wire. ON by default: a correctness fix, and a no-op on every serial path
+    // where bakeEye == eyeNow.
+    bool  g_waterTruePlane  = true;
+    // Force normal = +Z. A diagnostic, not a look: it also zeroes reffactor (which multiplies
+    // normal.xy), so the reflection/refraction distortion goes with it and only V, L and the lobe are
+    // left driving the highlight.
+    bool  g_waterFlatTest   = false;
     // The gain is a MULTIPLIER ON THE HEIGHT, and it spans negative as well as positive:
     //   * magnitude sets the range the colour ramp spans (it saturates at |h * gain| = 1) and, with
     //     it, the contour spacing — one knob, so the reading stays unambiguous.
@@ -9722,6 +10321,22 @@ namespace {
         // than given a param lane because worlds[6] group 3 is full and this is a small integer — the
         // word round-trips exactly through the float (max 4095).
         f |= (g_waterReflSmearTaps & 63u) << 6;
+        // bit 12: GLITTER/NORMAL view. Own bit for heightView's reason (bits 0-1 full), and it is the
+        // one view that isolates N: the GGX specular has no screen-space lookup, so a shear in it has
+        // to come from N, from alpha, or from the lobe — and only N is unobservable today. Red is the
+        // IDEAL mirror path (roughness, Fresnel and sun-disc widening all removed), so if red shears
+        // the cause is upstream of the lobe and if red is straight it is downstream.
+        if (g_waterNormalView)      { f |= 4096u; }
+        // bit 13: shade the TRUE water plane, not the drawn mesh plane. waterMeshZ() offsets the
+        // lattice ±5 to keep it off the near plane and nothing undid it, so every distance in the
+        // water frag was measured to the wrong surface — worst close in, and the reason the wave field
+        // slid under the surface while the camera moved. See surfPos in water.frag.fsl.
+        if (g_waterTruePlane)       { f |= 8192u; }
+        // bit 14: FLAT-WATER TEST. An infinite plane under a directional light is translation-
+        // invariant, so with the normal forced to +Z a horizontally moving camera MUST give a
+        // pixel-identical specular. Anything that moves is a bug, with no judgement call involved.
+        if (g_waterFlatTest)        { f |= 16384u; }
+        // Round-trips exactly through the float: integers are exact to 2^24, this word maxes at 32767.
         return (float)f;
     }
     inline float waterAlphaBase(float windFactor) {
@@ -10552,6 +11167,100 @@ namespace {
           t.sliderU("Water: reflection vertical smear BUDGET (max taps; 0 = off) — wants tens",
                     &g_waterReflSmearTaps, 0u, 63u, 1u);
           t.checkbox("Water: roughness-aware Schlick Fresnel (P4)", &g_waterSchlick);
+          // UNIFIED WATER FOG. One extinction for the surface AND the submerged world, toward MW's
+          // own [Water] colour — see waterfog.h.fsl. OFF restores the three private fades it
+          // replaced (and the two absorption/scattering tints), byte for byte, which is the whole
+          // point of having the toggle.
+          t.checkbox("Water fog: UNIFIED extinction (off = the three old private fades, the A/B)",
+                     &g_waterFog);
+          // A visibility DISTANCE at MW's DAY density, not a coefficient — same readability trade
+          // as the volumetric fog's, for the same reason (a MW unit is ~1.4 cm). 7168 = 101.8 m is
+          // the PRIOR ART's own uFogFar and the CLEAR-water case; Morrowind's water is silt, so the
+          // default is 7168/7 = 1024 = 14.5 m. Night/indoor scale relative to day (x1.6 / x1.2).
+          // Range starts at 128 (1.8 m, genuinely soupy) — the interesting region is the low end.
+          t.sliderF("Water fog: visibility DISTANCE at day density (world units)",
+                    &g_waterFogVisDist, 128.0f, 16384.0f, 64.0f, "%.0f");
+          // TURBIDITY = the HUE of the ABSORPTION only, orthogonal to the rate above. 0 = the pure
+          // inversion of UnderwaterColor, which is monotone R>G>B and therefore BLUE-windowed;
+          // CDOM's blue-weighted absorption moves the window to GREEN and crosses over at t = 0.05,
+          // so this axis is sensitive near zero. Defaults to 0 now — at 0.15 it read as algae green,
+          // and W8's scattering (below) is the axis that was actually wanted.
+          t.sliderF("Water fog: CDOM absorption hue (0 = blue-green water, up = green swamp)",
+                    &g_waterTurbidity, 0.0f, 1.0f, 0.01f, "%.2f");
+          // --- W8: VOLUMETRIC in-scatter ---------------------------------------------------------
+          // The model change. 0 = fade toward a published target evaluated at the fragment's own
+          // midpoint depth (which is what printed geometry silhouettes onto the water); 1 = an
+          // analytic single-scattering integral along the ray, whose far end converges and therefore
+          // cannot carry a silhouette. Bit-identical at 0, waterLightTransmit's spectrum included.
+          t.sliderF("Water fog: VOLUMETRIC in-scatter (0 = the flat target, the A/B)",
+                    &g_waterVolumetric, 0.0f, 1.0f, 0.05f, "%.2f");
+          // sigma_s/sigma_a. THE colour knob, and the one turbidity was reaching for: deep water's
+          // colour is the single-scattering albedo sigma_s/sigma_t, so this sets how blue-green and
+          // how luminous the water is at once. 0 = a pure absorber, i.e. deep water goes BLACK (a
+          // useful negative control). Up = milkier and paler as the albedo saturates toward 1.
+          t.sliderF("Water fog: SCATTERING ratio sigma_s/sigma_a (0 = black absorber, up = milky)",
+                    &g_waterScatterRatio, 0.0f, 4.0f, 0.05f, "%.2f");
+          // The model's only free magnitude — the wire has no irradiance to pin sun radiance to.
+          // 0.30 reproduces MW's authored UnderwaterColor at clear midday; the hue does not move.
+          t.sliderF("Water fog: in-scatter GAIN (0.30 = MW's own UnderwaterColor brightness)",
+                    &g_waterInscatterGain, 0.0f, 3.0f, 0.01f, "%.2f");
+          // The backstop. OFF restores MW's own frame showing through every uncovered pixel — which
+          // underwater is the above-water sky with the sun still in it. Fills by COVERAGE, not depth,
+          // so it can never touch anything that was drawn.
+          t.checkbox("Water fog: fill UNDRAWN pixels underwater (clear colour / horizon band)",
+                     &g_waterFillHoles);
+          // PHASE. Water is strongly forward-scattering, so the sun's position matters: the halo
+          // looking INTO the sun and the gentler lift looking AWAY are different lobes with
+          // different gains, and the pedestal is what is left at 90 degrees (where it also stands in
+          // for the multiple scattering single-scattering cannot see). Gains near sum 1 = energy
+          // neutral.
+          t.sliderF("Water phase: isotropic pedestal (also the multiple-scatter stand-in)",
+                    &g_waterPhaseIso, 0.0f, 2.0f, 0.01f, "%.2f");
+          t.sliderF("Water phase: FORWARD lobe g (sun halo through the water)",
+                    &g_waterPhaseFwdG, 0.0f, 0.95f, 0.01f, "%.2f");
+          t.sliderF("Water phase: FORWARD lobe gain", &g_waterPhaseFwdGain, 0.0f, 2.0f, 0.01f, "%.2f");
+          t.sliderF("Water phase: BACK lobe g (negative = brightening looking AWAY from the sun)",
+                    &g_waterPhaseBackG, -0.95f, 0.0f, 0.01f, "%.2f");
+          t.sliderF("Water phase: BACK lobe gain", &g_waterPhaseBackGain, 0.0f, 2.0f, 0.01f, "%.2f");
+          // Reinhard knee on the lobes only. g 0.85 peaks at 82x isotropic unclamped; a hard clamp
+          // would draw a disc edge around the sun.
+          t.sliderF("Water phase: lobe soft ceiling (0 = off)",
+                    &g_waterPhaseCeil, 0.0f, 64.0f, 0.5f, "%.1f");
+          // W8d. The lobes above are a FIRST-BOUNCE shape; past a scattering optical depth of ~1 the
+          // light arriving has bounced many times and comes in isotropically. Without this the deep
+          // background (the hole fill, the far water) swung ~11x with view direction while the
+          // geometry in front of it barely moved — "brighter or darker than everything else as I move
+          // camera". 1 = physical, 0 = the pre-W8d image exactly.
+          t.sliderF("Water phase: multiple-scatter isotropisation with depth (0 = single-scatter only)",
+                    &g_waterPhaseMS, 0.0f, 1.0f, 0.01f, "%.2f");
+          // W8d diagnostic. Turn ON, move back and forth, turn OFF: a value that arrives a frame late
+          // turns around one row after the ones that do not. Writes morrowind64/waterfog_trace.csv,
+          // truncated on every ON. Cheap (buffered fprintf), but it is a file per frame — leave it off.
+          // W8e. The DOWNWELLING light path on K_d instead of sigma_t — a forward scatter on the way
+          // down is not a lost photon, only a deflected one. ~1.65x smaller here, so diving darkens
+          // the water ~2.3x instead of ~4x, and blue penetrates further than red (K_d/sigma_t is
+          // 0.69/0.59/0.53). This is a COEFFICIENT, not a brightness: leave the visibility knob alone
+          // while judging it, or you are moving two things at once.
+          t.sliderF("Water fog: DOWNWELLING light on K_d, not sigma_t (0 = the old conflation)",
+                    &g_waterKd, 0.0f, 1.0f, 0.01f, "%.2f");
+          t.checkbox("Water fog: TRACE scattering inputs to waterfog_trace.csv (diagnostic)",
+                     &g_waterFogTrace);
+          // Morrowind.ini UnderwaterColorWeight. 1 = pure UnderwaterColor, 0 = the weather fog
+          // colour; the ini default (0.85) is loaded over this at startup.
+          t.sliderF("Water fog: UnderwaterColor weight (0 = weather fog colour, 1 = ini colour)",
+                    &g_waterFogWeight, 0.0f, 1.0f, 0.01f, "%.2f");
+          // W7a. MW multiplies sun AND ambient by a fixed absorption tint the moment the EYE
+          // submerges — measured x(0.19 0.26 0.29) / x(0.22 0.33 0.35). Depth-independent and
+          // camera-dependent, i.e. a global standing in for a local quantity, and a ~5x step at
+          // the crossing. 1 = cancelled (the water fog models the same absorption properly);
+          // 0 = MW's own tint, bit-identical. See cancelUnderwaterLightTint.
+          t.sliderF("Water fog: cancel MW's global underwater LIGHT tint (0 = keep MW's)",
+                    &g_waterLightCancel, 0.0f, 1.0f, 0.05f, "%.2f");
+          // W7b. Absorption on the way IN, per channel, from inverting the ini UnderwaterColor —
+          // so a submerged surface is dim and blue because of ITS depth, not the camera's. Pairs
+          // with the cancel above: cancel alone leaves the seabed lit at surface brightness.
+          t.sliderF("Water fog: light ABSORPTION with depth (sun + ambient; 0 = off)",
+                    &g_waterLightAbsorb, 0.0f, 1.0f, 0.05f, "%.2f");
           t.checkbox("Water: PROCEDURAL surface field (W1 noise; OFF = W2 texture + anisotropic taps)",
                      &g_waterProceduralWaves);
           t.sliderF("Water: wave amplitude (W2; scales normals AND roughness together)",
@@ -10622,6 +11331,26 @@ namespace {
           // trough, WHITE = the still-water line, contours every quarter of the ramp. A flat unbroken
           // white surface means the field is DEAD; a flat saturated one means the gain is too high.
           t.checkbox("Water: HEIGHT field debug view (W1 noise; bypasses all water shading)", &g_waveHeightView);
+          // R = the IDEAL sun-mirror path (no roughness, no Fresnel, no sun-disc widening), G/B = N.xy.
+          // Move left/right and watch RED: if the red path shears the fault is in N or V; if red stays
+          // straight while the lit specular tilts, it is alpha or the lobe, downstream of the normal.
+          t.checkbox("Water: GLITTER/NORMAL debug view (R = ideal sun mirror, GB = N.xy)",
+                     &g_waterNormalView);
+          // ON: the view ray is rebuilt from invViewProj and intersected with waterTrueLevel, so no
+          // geometric quantity in the water frag comes from the interpolated lattice. OFF: the old
+          // path, which took the eye vector from a perspective-interpolated attribute of a mesh whose
+          // triangles span three orders of magnitude in w at grazing angles. Judge it in the EyeVec
+          // debug view above — that is the quantity this moves.
+          // ON: EyeVec is the difference of two reconstructions on this pixel's ray, which cancels the
+          // origin — correct even when park mode puts the camera at (eyeNow - bakeEye) instead of 0.
+          // OFF: EyeVec = In.WorldPos, i.e. "the eye is at the origin", which is the stale assumption.
+          t.checkbox("Water: restamp-safe eye vector (park mode moves the eye off the origin)",
+                     &g_waterTruePlane);
+          // The bisect. Flat normal + directional sun = translation-invariant, so strafing must leave
+          // the specular PIXEL-IDENTICAL. If it still moves, the wave field is innocent and the fault
+          // is in V/L/the lobe; if it is rock solid, the field is the whole story.
+          t.checkbox("Water: FLAT-WATER TEST (force normal +Z; strafing must not move the specular)",
+                     &g_waterFlatTest);
           // Spans NEGATIVE as well as positive: magnitude sets the ramp's range (and with it the
           // contour spacing), sign flips crests and troughs — which is the direct check that the
           // height and the gradient, produced by the same terms, agree.
@@ -11143,6 +11872,14 @@ namespace ForgeRender {
         if (!forgeBringUp(&g_live.pRenderer, &g_live.pQueue)) {
             return false;
         }
+        // Morrowind.ini [Water]/[Weather] for the unified water fog. At INIT rather than lazily in
+        // the frame path deliberately: the frame path has early exits, so "it will have run by the
+        // time it is needed" is a claim about control flow that nothing enforces — and the failure
+        // mode is silent (vanilla defaults: right ballpark, wrong for anyone who edited their ini).
+        // AFTER forgeBringUp, because that is what opens mgeHost64.log — called before it, the one
+        // line that says which numbers were picked up goes nowhere, which is how this was caught.
+        // cwd is the install dir here (see main.cpp), so the relative open resolves.
+        loadWaterIniOnce();
         Renderer* R = g_live.pRenderer;
 
         // MSAA: validate the requested count against the device for the shared RT format.
@@ -11266,12 +12003,29 @@ namespace ForgeRender {
             // Step 6a: the SAME expression also decides the target's units. One evaluation, stored
             // once — see the sceneReferred declaration for why these cannot be two switches.
             g_live.sceneReferred = wantHdr;
+            // Step 5: and the DOMAIN, folded the same way. Decided here and not later because the
+            // texture format map reads it at every upload — a texture created before this line
+            // would get the wrong view and never be rebuilt.
+            g_live.linearScene = g_linearScene && wantHdr;
             LOG::logline(">> [scenefmt] %s (requested=%d sampleCount=%u) — deliver=B8G8R8A8_UNORM, "
-                         "scene colour is %s (tonemap in %s)",
+                         "scene colour is %s, %s (tonemap in %s)",
                          wantHdr ? "R16G16B16A16_SFLOAT" : "B8G8R8A8_UNORM",
                          (int)g_hdrSceneColor, g_live.sampleCount,
                          wantHdr ? "SCENE-REFERRED" : "display-referred",
+                         g_live.linearScene ? "LINEAR" : "gamma (MW authored)",
                          wantHdr ? "resolve.frag" : "each colour frag");
+            // ...and to STDOUT as well, because `--forge-scene` is the 20-second validation of
+            // exactly this decision and cannot see the line above: main.cpp opens the MGE log only
+            // AFTER the probe's early return, so LOG::logline is dropped there. A probe that cannot
+            // say which colour domain it just validated is not validating it.
+            std::printf("[forge] scene colour: %s, %s, %s\n",
+                        wantHdr ? "R16G16B16A16_SFLOAT" : "B8G8R8A8_UNORM",
+                        wantHdr ? "scene-referred" : "display-referred",
+                        g_live.linearScene ? "LINEAR" : "gamma (MW authored)");
+            if (g_linearScene && !wantHdr) {
+                std::printf("[forge] linear scene requested but the target is display-referred "
+                            "(needs g_hdrSceneColor + MSAA) — staying in MW's gamma domain\n");
+            }
             LOG::flush();
             if (g_hdrSceneColor && g_live.sampleCount <= 1) {
                 std::printf("[forge] fp16 scene colour requested but MSAA is OFF — staying LDR "
@@ -11809,6 +12563,33 @@ namespace ForgeRender {
         if (lighting) {
             std::memcpy((uint8_t*)g_live.pFrameCbv->pCpuMappedAddress + 16 * sizeof(float),
                         lighting, 24 * sizeof(float));
+            // STEP 5 — THE AUTHORED LIGHT COLOURS. sunCol (20..22) and ambCol (24..26) are MW's
+            // weather-interpolated display-referred values, and this memcpy is their ONE write site,
+            // so this is the boundary. Decoded here rather than in the shaders because they are
+            // cbuffer lanes: nothing in the pipeline would decode them, and both are read by half a
+            // dozen frags plus the vertex-lit distant statics, which would each have to remember.
+            //
+            // ⚠ EVERY LATER READER OF THESE LANES INHERITS THE DECODE, and that is intended: the
+            // reflect/FP/sun cbuffer copies further down, lodSunAmb (fd[52..54] = ambCol) and the
+            // viewer's mirror band all take the value from here. The ONE reader that must NOT see it
+            // is the sky-ambient SH projection, which wants the authored colours; it undoes this
+            // explicitly (publishSkyAmbientSH), the same way it already undoes the fog lift.
+            //
+            // This is where the migration's real change lives. `ambCol + sunCol·N·L` is the biggest
+            // sum in the renderer and a sum does not commute with the transfer function: two terms
+            // that saturated to white in gamma now land around 0.70 re-encoded. Lit surfaces darken.
+            // See the algebra note on g_linearScene — that is the effect abot's Darkening exists to
+            // cancel, and it is why abot has to come off and be re-baselined BEFORE this is measured.
+            {
+                float* fdc = (float*)g_live.pFrameCbv->pCpuMappedAddress;
+                // W7a — BEFORE the decode, because the measurement compares authored values against
+                // authored values and a decode applied to one side only would read as a tint of its
+                // own. See cancelUnderwaterLightTint for why MW's global has to come off at all.
+                cancelUnderwaterLightTint(fdc, (waterEnabled != 0) && waterParams
+                                                                   && waterParams[7] > 0.5f);
+                decodeAuthoredRGB(fdc + 20);   // sunCol
+                decodeAuthoredRGB(fdc + 24);   // ambCol
+            }
             // Phase 1a/1b: lighting[24..27] = realEye.xyz + isExterior (appended by the client; the
             // scene-probe passes 0s). The near scene is camera-relative (eyePos=0); resident DL is in
             // ABSOLUTE coords, so the live DL cull/build shifts it by -realEye. lodEye -> gFrameData[56..59].
@@ -11855,6 +12636,11 @@ namespace ForgeRender {
             // at 64..67). The scene-probe passes only 24 floats, so guard on the null-lighting path.
             float* fd = (float*)g_live.pFrameCbv->pCpuMappedAddress;
             fd[68] = lighting[28]; fd[69] = lighting[29]; fd[70] = lighting[30]; fd[71] = lighting[31];
+            // Step 5: the zenith is an authored sky colour like the horizon one above — but with NO
+            // lift, because unlike fogColNear it never reaches the render target. It is a lighting
+            // input (the SH projection's upper pole) and, in the dead vColSource==3 branch, a
+            // gradient endpoint. .w is the enchant-glow slot packed in below, not a colour.
+            decodeAuthoredRGB(fd + 68);
             // ...and skyZenith.w (71), which the dome never used, carries the enchanted-item glow:
             // the client's bindless slot for MW's current caustic frame, plus the texgen mode bit
             // ORed in here. Packed into the one lane because bindless slots are < kMaxTextures
@@ -11886,6 +12672,24 @@ namespace ForgeRender {
                 fd[29] = inverseTonemap(fd[29]);
                 fd[30] = inverseTonemap(fd[30]);
             }
+            // ...and step 5's decode, AFTER the lift and not before. The lift is stated against the
+            // tonemap, which resolve.frag applies to a DISPLAY-REFERRED argument (it encodes first —
+            // see the tail of resolve.frag). So the value that has to survive the encode is the
+            // lifted one, and this pair composes as: authored -> lift -> decode, undone at the end
+            // as encode -> curve -> authored. Reverse the two and the fog comes back wrong by
+            // exactly one gamma, which reads as a washed-out horizon rather than as a broken one.
+            decodeAuthoredRGB(fd + 28);
+            // ...and a LATCH of the same colour as MW authored it, for the unified water fog, whose
+            // target is `UnderwaterColor*w + fogColour*(1-w)` and therefore needs the fog colour
+            // BEFORE either conversion. Latched here rather than recovered later by running the
+            // curve forward (publishSkyAmbientSH's trick) for one reason: gFrameData is a
+            // WRITE-COMBINED upload buffer and reading one back is a documented trap
+            // ([[project_forge_wc_read_trap]]). Written from `lighting` at the same site and in the
+            // same frame as fd[28..30], so it cannot describe a different frame's weather; a
+            // null-lighting frame leaves both untouched together.
+            g_fogColAuthored[0] = lighting[12];
+            g_fogColAuthored[1] = lighting[13];
+            g_fogColAuthored[2] = lighting[14];
             //   fogParams.zw (34,35) = the inverse extent of the sky copy bound to THIS pass, so the
             // shader turns SV_Position into a uv without knowing which view it is in. The main copy is
             // ALLOC-sized (screen RTs are allocated at the render-scale ceiling and the frame draws a
@@ -12073,6 +12877,16 @@ namespace ForgeRender {
             ((float*)lc)[2] = 0.0f; ((float*)lc)[3] = 0.0f;
             if (nL && lightBlob) {
                 std::memcpy(lc + 16, lightBlob, (size_t)nL * sizeof(IPC::PointLightWire));
+                // STEP 5: each wire entry is 3 float4 and the MIDDLE one is the light's colour —
+                // MW's authored NiPointLight diffuse, display-referred like every other colour it
+                // ships. Decoded in place, right after the copy, so the frags' `d += lambert * att *
+                // lightCol` sums in the same domain as the sun and ambient terms above. Missing this
+                // would leave torchlight the one light in the frame still in gamma, which reads as
+                // interiors that are too warm and too bright next to a correctly-darkened exterior.
+                if (g_live.linearScene) {
+                    float* lf = (float*)(lc + 16);
+                    for (uint32_t i = 0; i < nL; ++i) { decodeAuthoredRGB(lf + i * 12 + 4); }
+                }
             }
             g_lastLightCount = nL;
 
@@ -12300,7 +13114,12 @@ namespace ForgeRender {
             // subsystem being up. One host write, every PerFrame set, because gShadowParams is
             // bound into all of them by pointer.
             cp[kToneFloat + 0] = g_live.sceneReferred ? 1.0f : 0.0f;
-            cp[kToneFloat + 1] = 0.0f;
+            // ...and step 5's domain bit, from the same write for the same reason. Read by
+            // decodeAuthored() in every vertex stage that carries an authored colour and by
+            // liftInPass()/mod2xStage() in the colour frags. A receiver that read zero here would
+            // multiply a decoded texel by an un-decoded vertex colour — two domains in one product,
+            // which is a hue shift, not a brightness one, and the hardest kind to attribute.
+            cp[kToneFloat + 1] = g_live.linearScene ? 1.0f : 0.0f;
             cp[kToneFloat + 2] = 0.0f;
             cp[kToneFloat + 3] = 0.0f;
         }
@@ -14616,9 +15435,199 @@ namespace ForgeRender {
         // Held off entirely when the camera is submerged: the height-fog model is an AIR model.
         g_volFogWaterZ  = waterParams ? waterParams[0] : 0.0f;
         g_volFogWaterOn = (waterEnabled != 0) && waterParams && !(waterParams[7] > 0.5f);
+        // ...and the UNIFIED WATER FOG's own latch, off the SAME params in the SAME place — the two
+        // features must never disagree about where the surface is, and deriving one plane twice is
+        // how that starts. They differ in exactly one respect, which is why they cannot share a
+        // lane: the volumetric clamp above goes OFF when the camera submerges (its model is air),
+        // and this one is at its most load-bearing precisely then.
+        // (The ini behind it is read in ForgeRender::init, not here — see loadWaterIniOnce.)
+        //
+        // ⚠ waterTrueLevel, NOT the raw waterParams[0], and the difference is load-bearing rather
+        // than cosmetic. The client's `underwater` bit is MWBridge::IsUnderwater, which trips at
+        // `WaterLevel() - 1` — so a fog plane at the raw level disagrees with the flag over a
+        // one-unit band around the waterline, i.e. exactly where the model's continuity argument
+        // lives, and the shader's flag-vs-plane guards would fire there instead of never. It is also
+        // what MGE, scene-walk and scene-walk-v2 all mean by "the water plane" (see waterTrueLevel).
+        // Deliberately NOT waterMeshZ: that one snaps +-5 with the camera to keep the drawn mesh off
+        // the near plane, so a fog plane following it would jump 10 units at the crossing.
+        g_waterFogZ     = waterParams ? waterTrueLevel(waterParams[0]) : 0.0f;
+        g_waterFogOn    = (waterEnabled != 0) && waterParams != nullptr;
+        g_waterFogUnder = waterParams && waterParams[7] > 0.5f;
+        // MW's GameHour, off the water block's last (previously reserved) lane — see the client's
+        // waterParams fill. It rides there rather than on a lighting lane because the ONLY consumer
+        // is the water fog's time-of-day density, and because the water block is already gated on
+        // the cell having water, which is exactly when that density matters.
+        if (waterParams) { g_waterFogHour = waterParams[11]; }
+        // DIAGNOSTIC, one line per surface crossing. "MW is also changing lighting underwater" is a
+        // claim the host can SETTLE rather than assume: these are MW's own authored values off the
+        // wire, before any lift or decode, so a diff between the two lines around a crossing says
+        // exactly which of them the engine switches. (OpenMW, the reference reimplementation, moves
+        // only the fog start/end/colour — nothing touches sun or ambient — so if sun/amb DO move
+        // here that is vanilla-specific and we would be inheriting a camera-dependent global where
+        // the physical answer is a per-fragment one. Costs nothing: it fires on an edge.)
+        {
+            static bool s_lastUnder = false;
+            if (g_waterFogUnder != s_lastUnder) {
+                s_lastUnder = g_waterFogUnder;
+                if (lighting) {
+                    LOG::logline(">> [waterfog] crossing -> %-5s  sun(%.3f %.3f %.3f) amb(%.3f %.3f %.3f)"
+                                 " fog(%.3f %.3f %.3f) near %.0f..%.0f",
+                                 g_waterFogUnder ? "UNDER" : "above",
+                                 lighting[4],  lighting[5],  lighting[6],
+                                 lighting[8],  lighting[9],  lighting[10],
+                                 lighting[12], lighting[13], lighting[14],
+                                 lighting[16], lighting[17]);
+                }
+            }
+        }
         gpuPhaseBegin(kGpuPhaseShadowSun);
         renderSunShadow();
         gpuPhaseEnd(kGpuPhaseShadowSun);
+
+        // --- W8d DIAGNOSTIC: every uniform the in-scatter reads, one CSV row per frame ----------
+        //
+        // "There is a value used in scattering that's affected by the one frame delay." A host-side
+        // trace can settle that WITHOUT guessing which one, because a one-frame lag between two
+        // signals is a PHASE SHIFT when the input oscillates: move back and forth, and whichever
+        // column turns around a row after the others is the late one. Everything is sampled at this
+        // single point — after the water plane latch above and after publishSunShadowParams ->
+        // publishWaterFog, i.e. once every value below is the one this frame's pixels will read.
+        //
+        // The columns are deliberately REDUNDANT in three places, because each pair is one candidate:
+        //   eye*   vs wireEye*   — gFrameData.lodEye (what the shader divides by) against lighting[24..26]
+        //                          straight off the wire. These are written from each other, so a split
+        //                          here would mean the cbuffer write is not where it looks.
+        //   waterZ vs waterZraw  — the latched plane against waterParams[0]; and under vs underWire.
+        //   dir*                 — the centre-pixel ray, rebuilt from rzViewProj by the IDENTICAL
+        //                          arithmetic waterfill.frag uses (invert, NDC 0,0,0.5, divide by w).
+        //                          This is the ORIENTATION lane: it is the only column that comes from
+        //                          the matrix rather than from the lighting/water blocks, so if the
+        //                          camera's rotation and the camera's position enter the frame at
+        //                          different times, these two groups separate here and nowhere else.
+        // eyeDepth is the derived quantity that actually scales the in-scatter (e0 = exp(-sigma*slant*
+        // dNear)), so it is worth its own column rather than being recomputed offline.
+        //
+        // Buffered fprintf, not LOGF: a per-frame LOGF is a ~3ms/frame tax in this codebase
+        // ([[project_forge_multimap_night_collapse]]) and a tax that big would distort the very
+        // timing being measured. Flushed each row so a hard exit still leaves a complete capture.
+        {
+            static FILE* s_wfTrace = nullptr;
+            static bool  s_wfTraceWas = false;
+            if (g_waterFogTrace && !s_wfTraceWas) {
+                s_wfTrace = std::fopen("waterfog_trace.csv", "w");
+                if (s_wfTrace) {
+                    std::fprintf(s_wfTrace,
+                        "frame,t_ms,eyeX,eyeY,eyeZ,wireEyeX,wireEyeY,wireEyeZ,"
+                        "waterZ,waterZraw,under,underWire,eyeDepth,"
+                        "dirX,dirY,dirZ,sunDirX,sunDirY,sunDirZ,"
+                        "sunR,sunG,sunB,ambR,ambG,ambB,fogR,fogG,fogB,"
+                        "kView,sigTr,sigTg,sigTb,sigSr,sigSg,sigSb,"
+                        "kdR,kdG,kdB,kdS,gain,volS,msIso,ivpMaxAbs,ivpRayDeg\n");
+                }
+                LOG::logline(">> [waterfog] trace ON -> waterfog_trace.csv");
+            } else if (!g_waterFogTrace && s_wfTraceWas && s_wfTrace) {
+                std::fclose(s_wfTrace);
+                s_wfTrace = nullptr;
+                LOG::logline(">> [waterfog] trace OFF");
+            }
+            s_wfTraceWas = g_waterFogTrace;
+
+            if (s_wfTrace && g_live.pFrameCbv && g_live.pFrameCbv->pCpuMappedAddress
+                          && g_live.pShadowMaskParamsCbv
+                          && g_live.pShadowMaskParamsCbv->pCpuMappedAddress) {
+                const float* fd = (const float*)g_live.pFrameCbv->pCpuMappedAddress;
+                const float* sp = (const float*)g_live.pShadowMaskParamsCbv->pCpuMappedAddress;
+
+                // The centre-pixel ray, by waterfill.frag's own arithmetic. The upload is row-major
+                // and HLSL reads it column-major, so the shader's mul(M, v) is v * M_row here — do
+                // it that way round rather than "the obvious" one, or the printed direction is the
+                // transpose of the one the pixels used.
+                float invVP[16];
+                float dir[3] = { 0.0f, 0.0f, 0.0f };
+                if (invert4x4(rzViewProj, invVP)) {
+                    const float v[4] = { 0.0f, 0.0f, 0.5f, 1.0f };
+                    float hp[4];
+                    for (int j = 0; j < 4; ++j) {
+                        hp[j] = v[0] * invVP[0 * 4 + j] + v[1] * invVP[1 * 4 + j]
+                              + v[2] * invVP[2 * 4 + j] + v[3] * invVP[3 * 4 + j];
+                    }
+                    const float iw = (std::fabs(hp[3]) > 1.0e-9f) ? (1.0f / hp[3]) : 0.0f;
+                    float p[3] = { hp[0] * iw, hp[1] * iw, hp[2] * iw };
+                    const float len = std::sqrt(p[0] * p[0] + p[1] * p[1] + p[2] * p[2]);
+                    if (len > 1.0e-6f) {
+                        dir[0] = p[0] / len; dir[1] = p[1] / len; dir[2] = p[2] / len;
+                    }
+                }
+
+                // --- THE PROBE THIS TRACE SHOULD HAVE HAD FROM THE START ------------------------
+                // The first capture logged `dir` from an inverse computed FRESHLY here, so it compared
+                // this frame's camera against itself and could only ever say "consistent". What the
+                // hole fill actually reads is the PUBLISHED gShadowParams.invViewProj (floats 0..15),
+                // and that is a different object in a different buffer written at a different point in
+                // the frame. Rebuilding water.frag's ray from the analogous lane made its shear an
+                // order of magnitude worse, which is evidence that the published inverse does not
+                // agree with the matrix that rasterised the frame.
+                //
+                // Two numbers, because one of them is interpretable and the other is not:
+                //   ivpMaxAbs — max element-wise |published - fresh|. Nonzero at all = they differ.
+                //   ivpRayDeg — the ANGLE between the centre-pixel ray each one produces, in degrees.
+                //               This is the quantity that matters: it is exactly how far the fill's
+                //               ray points away from where the pixel actually looks, and the phase
+                //               function turns a fraction of a degree near the sun into real
+                //               brightness. Expect ~0 standing still and a velocity-proportional
+                //               value while moving if the one-frame tear is real.
+                float ivpMax = 0.0f;
+                for (int i = 0; i < 16; ++i) {
+                    ivpMax = std::max(ivpMax, std::fabs(sp[i] - invVP[i]));
+                }
+                float ivpDeg = 0.0f;
+                {
+                    const float v[4] = { 0.0f, 0.0f, 0.5f, 1.0f };
+                    float hp[4];
+                    for (int j = 0; j < 4; ++j) {
+                        hp[j] = v[0] * sp[0 * 4 + j] + v[1] * sp[1 * 4 + j]
+                              + v[2] * sp[2 * 4 + j] + v[3] * sp[3 * 4 + j];
+                    }
+                    const float iw = (std::fabs(hp[3]) > 1.0e-9f) ? (1.0f / hp[3]) : 0.0f;
+                    float p[3] = { hp[0] * iw, hp[1] * iw, hp[2] * iw };
+                    const float len = std::sqrt(p[0] * p[0] + p[1] * p[1] + p[2] * p[2]);
+                    if (len > 1.0e-6f && (dir[0] != 0.0f || dir[1] != 0.0f || dir[2] != 0.0f)) {
+                        const float c = (p[0] * dir[0] + p[1] * dir[1] + p[2] * dir[2]) / len;
+                        ivpDeg = std::acos(std::max(-1.0f, std::min(1.0f, c))) * 57.29577951f;
+                    }
+                }
+
+                const float waterZ  = sp[kWaterFogPlaneFloat + 0];
+                const float underSP = sp[kWaterFogPlaneFloat + 2];
+                std::fprintf(s_wfTrace,
+                    "%u,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,"
+                    "%.3f,%.3f,%.0f,%.0f,%.3f,"
+                    "%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,"
+                    "%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,"
+                    "%.8f,%.8f,%.8f,%.8f,%.8f,%.8f,%.8f,"
+                    "%.8f,%.8f,%.8f,%.3f,%.4f,%.3f,%.3f,%.9f,%.6f\n",
+                    g_renderFrame, hostNowMs(),
+                    fd[56], fd[57], fd[58],
+                    lighting ? lighting[24] : 0.0f,
+                    lighting ? lighting[25] : 0.0f,
+                    lighting ? lighting[26] : 0.0f,
+                    waterZ, waterParams ? waterParams[0] : 0.0f,
+                    underSP, waterParams ? waterParams[7] : 0.0f,
+                    (waterZ - fd[58] > 0.0f) ? (waterZ - fd[58]) : 0.0f,
+                    dir[0], dir[1], dir[2], fd[16], fd[17], fd[18],
+                    fd[20], fd[21], fd[22], fd[24], fd[25], fd[26], fd[28], fd[29], fd[30],
+                    sp[kWaterFogColFloat + 3],
+                    sp[kWaterFogExtFloat + 0], sp[kWaterFogExtFloat + 1], sp[kWaterFogExtFloat + 2],
+                    sp[kWaterFogScatterFloat + 0], sp[kWaterFogScatterFloat + 1],
+                    sp[kWaterFogScatterFloat + 2],
+                    sp[kWaterFogKdFloat + 0], sp[kWaterFogKdFloat + 1], sp[kWaterFogKdFloat + 2],
+                    sp[kWaterFogKdFloat + 3],
+                    sp[kWaterFogScatterFloat + 3], sp[kWaterFogExtFloat + 3],
+                    sp[kWaterFogPhase2Float + 2],
+                    ivpMax, ivpDeg);
+                std::fflush(s_wfTrace);
+            }
+        }
 
         if (g_live.shadowReady && g_shadowFrameActive) {
             // Restore the full-screen viewport/scissor for the compute + colour passes below
@@ -16163,6 +17172,21 @@ namespace ForgeRender {
                 p[4] = waterParams ? waterParams[3] : 0.0f;    // depthBaseColor.r
                 p[5] = waterParams ? waterParams[4] : 0.0f;    // .g
                 p[6] = waterParams ? waterParams[5] : 0.0f;    // .b
+                // STEP 5 — and this one was MISSED in the first sweep, which is worth recording:
+                // the sweep went through gFrameData and gLights, i.e. the lanes that LOOK like
+                // lighting, and depthBaseColor is neither. It is every bit as authored as they are —
+                // renderprocess.cpp builds it as XE's weighted sum of MW's sunCol, horizonCol and
+                // nearFogCol (`sunAdj*0.03 + (2*skyC + fogF)*0.075`, per channel) — so undecoded it
+                // left the deep-water colour sitting a full gamma above the scene it tints.
+                //
+                // Decoding the RESULT and not the three inputs is deliberate: that weighted sum is a
+                // TUNED display-space recipe from XE Mod Water.fx, not a radiometric one, and taking
+                // it apart to re-sum it in linear would be re-authoring someone's water colour under
+                // the guise of a units fix. Same treatment fogColNear gets, for the same reason.
+                //
+                // THE LESSON, so the next per-pass cbuffer does not repeat it: "is it authored?" is
+                // not answered by which buffer a value arrives in.
+                decodeAuthoredRGB(p + 4);
                 p[7] = underwater ? 1.0f : 0.0f;
                 p[8]  = waterParams ? waterParams[8]  : 0.0f;  // camFwd.x
                 p[9]  = waterParams ? waterParams[9]  : 0.0f;  // camFwd.y
@@ -16855,6 +17879,27 @@ namespace ForgeRender {
             cmdBindRenderTargets(g_live.pCmd, nullptr);
             cmdEndDebugMarker(g_live.pCmd);
         }
+        // ===================== W8: UNDERWATER BACKSTOP =====================
+        // Fill whatever the frame never covered, but only while submerged. LAST of the world passes
+        // so every earlier one has already staked its coverage — and still before the first-person
+        // arms, which are drawn a few units from the eye and must not be filled around.
+        // No enable test beyond the knob: the shader itself early-outs to zero coverage unless the
+        // camera is under the surface with the water fog live, so this costs one fullscreen triangle
+        // of fully-predicated pixels above water.
+        if (g_waterFillHoles && g_live.pWaterFillPipeline) {
+            cmdBeginDebugMarker(g_live.pCmd, 0.2f, 0.5f, 0.8f, "UNDERWATER BACKSTOP");
+            BindRenderTargetsDesc wfBind = {};
+            wfBind.mRenderTargetCount = 1;
+            wfBind.mRenderTargets[0] = { colorTarget, LOAD_ACTION_LOAD };
+            cmdBindRenderTargets(g_live.pCmd, &wfBind);
+            cmdSetViewport(g_live.pCmd, 0.0f, 0.0f, (float)g_live.width, (float)g_live.height, 0.0f, 1.0f);
+            cmdSetScissor(g_live.pCmd, 0, 0, g_live.width, g_live.height);
+            cmdBindPipeline(g_live.pCmd, g_live.pWaterFillPipeline);
+            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSet);
+            cmdDraw(g_live.pCmd, 3, 0);
+            cmdBindRenderTargets(g_live.pCmd, nullptr);
+            cmdEndDebugMarker(g_live.pCmd);
+        }
         gpuPhaseEnd(kGpuPhaseVolFog);
 
         // ===================== FP1a: first-person pass =====================
@@ -17341,10 +18386,14 @@ namespace ForgeRender {
                 // receivers because the resolve has a private SRT and cannot see gShadowParams, but
                 // ONE source, so the pass that applies the curve and the passes that skip it can
                 // never disagree.
+                // opts.w = step 5's LINEAR bit — this pass owns the compensating sRGB encode, the
+                // exact inverse of every decode the frame went through, applied immediately before
+                // the curve. Second receiver of the same folded host expression as toneParams.y.
                 const float p[8] = { (float)g_live.width, (float)g_live.height, diam, radius,
                                      g_resolveInvLuma ? 1.0f : 0.0f,
                                      g_live.sceneReferred ? 1.0f : 0.0f,
-                                     std::max(0.0f, g_resolveSharp), 0.0f };
+                                     std::max(0.0f, g_resolveSharp),
+                                     g_live.linearScene ? 1.0f : 0.0f };
                 std::memcpy(g_live.pResolveParamsCbv->pCpuMappedAddress, p, sizeof(p));
             }
 
@@ -18394,6 +19443,37 @@ namespace ForgeRender {
         uint32_t width = 0, height = 0, mipLevels = 0, dataOffset = 0;
         bool ok = false;
     };
+    // STEP 5 — the sRGB VIEW. Everything MW ships as art is authored for a gamma display; ask the
+    // hardware to decode it.
+    //
+    // ⚠ THIS MUST BE A FORMAT AND NEVER A SHADER pow(). A _SRGB view decodes each texel BEFORE the
+    // sampler filters it — before bilinear, before anisotropy, before the mip blend. A pow() in the
+    // frag can only run after, i.e. it filters in gamma space and linearises the average, which is
+    // wrong everywhere and conspicuously wrong across a mip transition.
+    //
+    // ⚠ AND IT IS THE SAME VIEW FOR EVERY ROLE. All the multi-map stages sample ONE bindless array
+    // through sampleBase(), and which stage a texture is (base / dark map / detail / glow) is a
+    // runtime `op` bit, not a property of the texture — so a per-role view is not expressible. It
+    // does not need to be: multiplication commutes with the transfer function, so MOD is preserved
+    // exactly and one decode serves base, dark and detail maps alike. Only MOD2X carries a
+    // display-space literal, and that is fixed in the shader (mod2xLinear).
+    //
+    // parseDds itself deliberately keeps returning the UNORM format: the mip-size walk, the alpha
+    // classifier and the bucket keys all switch on it, and _SRGB is a view property with identical
+    // block layout. Converting HERE, at the five places a TextureDesc is filled from it, keeps that
+    // machinery untouched and makes every colour/non-colour decision one visible call.
+    static TinyImageFormat toSceneTextureFormat(TinyImageFormat f) {
+        if (!g_live.linearScene) { return f; }
+        switch (f) {
+        case TinyImageFormat_DXBC1_RGBA_UNORM: return TinyImageFormat_DXBC1_RGBA_SRGB;
+        case TinyImageFormat_DXBC2_UNORM:      return TinyImageFormat_DXBC2_SRGB;
+        case TinyImageFormat_DXBC3_UNORM:      return TinyImageFormat_DXBC3_SRGB;
+        case TinyImageFormat_B8G8R8A8_UNORM:   return TinyImageFormat_B8G8R8A8_SRGB;
+        case TinyImageFormat_R8G8B8A8_UNORM:   return TinyImageFormat_R8G8B8A8_SRGB;
+        default:                               return f;
+        }
+    }
+
     // Parse the formats MW ships: DXT1/3/5 (BCn), uncompressed 32-bit (treated BGRA), and DX10
     // BC1/2/3 / BGRA / RGBA. Anything else → ok=false (slot stays default white).
     static DdsInfo parseDds(const uint8_t* d, uint32_t size) {
@@ -18417,6 +19497,12 @@ namespace ForgeRender {
                     if (size < 148) { return r; }
                     const uint32_t dxgi = ddsRd32(d + 128);
                     dataOffset = 148;
+                    // The _SRGB DXGI codes are FLATTENED to UNORM here, and that stays true after
+                    // step 5: whether the scene decodes is a property of the RENDERER, not of which
+                    // of two interchangeable codes a converter happened to stamp into a header. A
+                    // handful of MW-era DDS files carry 71/74/77 and the rest carry 72/75/78 for
+                    // identical art, so honouring the header would decode a random subset of the
+                    // world. toSceneTextureFormat() at the creation sites is the single decision.
                     switch (dxgi) {
                         case 71: case 72: fmt = TinyImageFormat_DXBC1_RGBA_UNORM; break;  // BC1(_SRGB)
                         case 74: case 75: fmt = TinyImageFormat_DXBC2_UNORM;      break;  // BC2
@@ -18562,7 +19648,7 @@ namespace ForgeRender {
             td.mWidth = info.width; td.mHeight = info.height; td.mDepth = 1;
             td.mArraySize = hdr.arraySize; td.mMipLevels = info.mipLevels;
             td.mSampleCount = SAMPLE_COUNT_1;
-            td.mFormat = info.fmt;
+            td.mFormat = toSceneTextureFormat(info.fmt);   // step 5: MW art is gamma-encoded
             td.mStartState = RESOURCE_STATE_SHADER_RESOURCE;
             td.mDescriptors = DESCRIPTOR_TYPE_TEXTURE;
             td.pName = "mwFlipBook";
@@ -18675,7 +19761,7 @@ namespace ForgeRender {
             td.mWidth = info.width; td.mHeight = info.height; td.mDepth = 1;
             td.mArraySize = 1; td.mMipLevels = info.mipLevels;
             td.mSampleCount = SAMPLE_COUNT_1;
-            td.mFormat = info.fmt;
+            td.mFormat = toSceneTextureFormat(info.fmt);   // step 5: MW art is gamma-encoded
             td.mStartState = RESOURCE_STATE_SHADER_RESOURCE;
             td.mDescriptors = DESCRIPTOR_TYPE_TEXTURE;
             td.pName = "mwTexture";
@@ -19157,7 +20243,7 @@ namespace ForgeRender {
         td.mWidth = info.width; td.mHeight = info.height; td.mDepth = 1;
         td.mArraySize = 1; td.mMipLevels = info.mipLevels;
         td.mSampleCount = SAMPLE_COUNT_1;
-        td.mFormat = info.fmt;
+        td.mFormat = toSceneTextureFormat(info.fmt);   // step 5: MW art is gamma-encoded
         td.mStartState = RESOURCE_STATE_SHADER_RESOURCE;
         td.mDescriptors = DESCRIPTOR_TYPE_TEXTURE;
         td.pName = "dlAtlas";
@@ -19722,7 +20808,7 @@ namespace ForgeRender {
             td.mWidth = bk.w; td.mHeight = bk.h; td.mDepth = 1;
             td.mArraySize = bk.count; td.mMipLevels = bk.mips;
             td.mSampleCount = SAMPLE_COUNT_1;
-            td.mFormat = bk.fmt;
+            td.mFormat = toSceneTextureFormat(bk.fmt);   // step 5: MW art is gamma-encoded
             td.mStartState = RESOURCE_STATE_SHADER_RESOURCE;
             td.mDescriptors = DESCRIPTOR_TYPE_TEXTURE;
             td.pName = "terrainBucket";
@@ -21152,7 +22238,14 @@ namespace ForgeRender {
             g_glowSrc.reserve(g_dlBakedLights.size());
             for (const DlBakedLight& L : g_dlBakedLights) {
                 if (!L.hasMesh) { continue; }
-                const float lr = L.r * (1.0f/255.0f), lg = L.g * (1.0f/255.0f), lb = L.b * (1.0f/255.0f);
+                float lrgb[3] = { L.r * (1.0f/255.0f), L.g * (1.0f/255.0f), L.b * (1.0f/255.0f) };
+                // Step 5: a baked light's colour is MW's authored byte triple, so decode it BEFORE
+                // the luminance/chromaticity split — the split is a statement about radiance, and
+                // taken on gamma bytes it gets both halves wrong (a saturated orange lamp reads far
+                // less saturated than it is, and its `lum` far brighter). Cached list, but it is
+                // built once and g_live.linearScene is fixed at init, so there is nothing to stale.
+                decodeAuthoredRGB(lrgb);
+                const float lr = lrgb[0], lg = lrgb[1], lb = lrgb[2];
                 const float lum = std::max(lr, std::max(lg, lb));
                 if (lum <= 1e-4f) { continue; }   // black/zero light: no glow ever — drop at build time
                 const float inv = 1.0f / lum;
@@ -21628,7 +22721,7 @@ namespace ForgeRender {
             td.mWidth = bk.w; td.mHeight = bk.h; td.mDepth = 1;
             td.mArraySize = bk.count; td.mMipLevels = bk.mips;
             td.mSampleCount = SAMPLE_COUNT_1;
-            td.mFormat = bk.fmt;
+            td.mFormat = toSceneTextureFormat(bk.fmt);   // step 5: MW art is gamma-encoded
             td.mStartState = RESOURCE_STATE_SHADER_RESOURCE;
             td.mDescriptors = DESCRIPTOR_TYPE_TEXTURE;
             td.pName = "staticsBucket";
@@ -21944,6 +23037,11 @@ namespace ForgeRender {
         fd[48]=0; fd[49]=0; fd[50]=0; fd[51]=7168.0f;                // lodParams.w = nearViewRange (statics.vert)
         fd[52]=0.34f; fd[53]=0.38f; fd[54]=0.46f; fd[55]=0;          // lodSunAmb (= ambCol for 1a)
         fd[56]=0; fd[57]=0; fd[58]=0; fd[59]=0;                      // lodEye = 0 (probe camera is absolute)
+        // Step 5: these stand in for the client's lighting block, so they take the same decode it
+        // does — otherwise the probe would shade decoded texels with gamma lights and its readback
+        // would be measuring a domain mismatch this file created rather than the path under test.
+        decodeAuthoredRGB(fd + 20); decodeAuthoredRGB(fd + 24);
+        decodeAuthoredRGB(fd + 28); decodeAuthoredRGB(fd + 52);
 
         // Readback buffer (mirror drawTriangleAndVerify).
         const uint32_t rowAlign = (R->pGpu->mUploadBufferTextureRowAlignment > 1u) ? R->pGpu->mUploadBufferTextureRowAlignment : 1u;
@@ -22402,6 +23500,10 @@ namespace ForgeRender {
             fd[36]=0; fd[37]=0; fd[38]=0; fd[39]=0;                // eyePos = 0 (camera-relative frame)
             fd[40]=0; fd[41]=1.0f/(float)W; fd[42]=1.0f/(float)H; fd[43]=0;
             fd[44]=1; fd[45]=1; fd[46]=1; fd[47]=1;
+            // Step 5: same decode the live lighting block takes — the viewer exists to be directly
+            // comparable to the in-game A/B, which it cannot be if it lights in a different domain.
+            // lodSunAmb (fd[52..54]) needs nothing: dlLiveCullAndBuild copies it from fd[24] below.
+            decodeAuthoredRGB(fd + 20); decodeAuthoredRGB(fd + 24); decodeAuthoredRGB(fd + 28);
             // fd[48..59] (DL slots / lodSunAmb / lodEye) are written by dlLiveCullAndBuild below.
 
             // LIVE DL: per-frame frustum + tier cull of the WHOLE world (land + statics), filling the
@@ -23494,6 +24596,10 @@ namespace ForgeRender {
                         e[5] = L.g * (1.0f / 255.0f);
                         e[6] = L.b * (1.0f / 255.0f);
                         e[7] = 0.0f;
+                        // Step 5: same decode as the near light upload, and it has to be the same or
+                        // a lantern would change colour across the near/far handover — the one place
+                        // a domain mismatch is guaranteed to be visible as a moving seam.
+                        decodeAuthoredRGB(e + 4);
                         // MW ini-baked attenuation: c=0.36, l=0, q=3.25/R². Same coefficients the engine
                         // gives the near lights → distant is byte-identical, no shader change.
                         e[8] = kMWLightConstant; e[9] = 0.0f; e[10] = q; e[11] = 0.0f;   // k0,k1,k2 ; w=0
@@ -24434,6 +25540,232 @@ namespace ForgeRender {
     // (The kSunVPFloat.. offsets are declared up with the sun knobs — the screen-alloc write needs
     // them well before this point.)
 
+    // --- UNIFIED WATER FOG: the two lanes (waterfog.h.fsl) ---------------------------------------
+    //
+    // Published from inside publishSunShadowParams for the same reason the volumetric block is: that
+    // function runs unconditionally through BOTH of renderSunShadow's exits, so there is no frame —
+    // interior, DL-not-resident, sun knob off — on which a receiver can read a stale plane.
+    //
+    // ⚠ THE COLOUR IS AUTHORED AND TAKES THE FOG COLOUR'S EXACT BOUNDARY TREATMENT. UnderwaterColor
+    // is a display-referred byte triple out of the ini and fogColNear is MW's display-referred
+    // weather colour; their blend reaches the render target WITHOUT passing through tonemap(),
+    // which is precisely step 6a's criterion for lifting. So: blend the two AUTHORED colours, then
+    // LIFT and DECODE in that order — the same pair, in the same order, as the fd[28..30] write site
+    // (see the note there for why reversing them costs exactly one gamma). Getting this wrong is the
+    // same defect as the depthBaseColor miss recorded in
+    // tasks/forge-postprocess.md: a per-pass authored colour that did not look like a lighting lane.
+    //
+    // The authored fog colour comes from g_fogColAuthored, latched at the fd[28..30] write site —
+    // NOT read back out of the cbuffer the way publishSkyAmbientSH recovers it. That buffer is
+    // write-combined ([[project_forge_wc_read_trap]]), and unlike the SH projection this one has a
+    // clean source to latch from.
+    void publishWaterFog(float* mp) {
+        const bool active = g_waterFog && g_waterFogOn;
+        mp[kWaterFogPlaneFloat + 0] = g_waterFogZ;
+        mp[kWaterFogPlaneFloat + 1] = active ? 1.0f : 0.0f;
+        mp[kWaterFogPlaneFloat + 2] = (active && g_waterFogUnder) ? 1.0f : 0.0f;
+        mp[kWaterFogPlaneFloat + 3] = 0.0f;
+        if (!active) {
+            // Not stale data behind a disarmed gate: a captured frame should show what the receiver
+            // would read, and 0 extinction is also the honest answer if the gate is ever bypassed.
+            mp[kWaterFogColFloat   + 0] = 0.0f; mp[kWaterFogColFloat   + 1] = 0.0f;
+            mp[kWaterFogColFloat   + 2] = 0.0f; mp[kWaterFogColFloat   + 3] = 0.0f;
+            mp[kWaterFogLightFloat + 0] = 0.0f; mp[kWaterFogLightFloat + 1] = 0.0f;
+            mp[kWaterFogLightFloat + 2] = 0.0f; mp[kWaterFogLightFloat + 3] = 0.0f;
+            for (int i = 0; i < 4; ++i) {
+                mp[kWaterFogExtFloat + i]     = 0.0f;
+                mp[kWaterFogScatterFloat + i] = 0.0f;
+                mp[kWaterFogPhaseFloat + i]   = 0.0f;
+                mp[kWaterFogPhase2Float + i]  = 0.0f;
+                mp[kWaterFogKdFloat + i]      = 0.0f;
+            }
+            return;
+        }
+
+        // MW's own blend: `mUnderwaterColor*w + mFogColor*(1-w)` (OpenMW FogManager::getFogColor),
+        // both sides AUTHORED.
+        const float w = std::max(0.0f, std::min(g_waterFogWeight, 1.0f));
+        float col[3];
+        for (int i = 0; i < 3; ++i) {
+            col[i] = g_waterIni.underwaterColor[i] * w + g_fogColAuthored[i] * (1.0f - w);
+        }
+        // ...and the identical lift-then-decode the fog colour gets at its write site.
+        if (g_live.sceneReferred) {
+            for (int i = 0; i < 3; ++i) { col[i] = inverseTonemap(col[i]); }
+        }
+        decodeAuthoredRGB(col);
+
+        // DENSITY. MW ships five values (sunrise/day/sunset/night/indoor); the interior one wins
+        // indoors and has no time-of-day blend, which is how MW itself uses it.
+        //
+        // ⚠ HOW THE DENSITY ENTERS IS A RE-DERIVATION, NOT A TRANSCRIPTION, and the first build got
+        // it wrong by 2.55x — worth spelling out, because the source is right here to check.
+        //
+        // OpenMW's underwater fog is LINEAR: `start = min(viewDist, 7168) * (1 - rho)`,
+        // `end = min(viewDist, 7168)`. The density rho appears ONLY in the start, and it drives it
+        // NEGATIVE for any rho > 1 — so the ramp is already `(rho-1)/rho` opaque at ZERO distance:
+        // 60% by day, 67% indoors, 75% at night. That constant offset is not a rate, it is the flat
+        // camera-dependent tint this whole feature exists to replace, and an exponential cannot
+        // express it (nor should it — nothing should be 60% fogged at zero distance).
+        //
+        // The END is density-independent, and the END is what the prior art's `1.56/uFogFar` reads.
+        // So the tuned rate never had a density in it at all, and dividing this knob by the raw
+        // density (the first build) applied a number the source only ever used for the offset.
+        //
+        // Normalised against DAY instead. Day reproduces the prior art exactly; night and indoor
+        // modulate relative to it (4/2.5 = 1.6x, 3/2.5 = 1.2x), which keeps MW's real time-of-day
+        // data without re-scaling the one constant that was actually tuned:
+        //     k = (1.56 / visDist) * (density / dayDensity)
+        // The 1.56 is the prior-art shader's own constant, so at visDist and day density the fog
+        // reaches ~79% opacity at exactly the distance the knob names.
+        const float density    = !g_dlExterior ? g_waterIni.fogIndoor
+                                               : waterFogDensityForHour(g_waterFogHour);
+        const float dayDensity = std::max(g_waterIni.fogDay, 0.01f);
+        const float todScale   = std::max(density, 0.01f) / dayDensity;
+        const float kView = (1.56f / std::max(g_waterFogVisDist, 1.0f)) * todScale;
+        mp[kWaterFogColFloat + 0] = col[0];
+        mp[kWaterFogColFloat + 1] = col[1];
+        mp[kWaterFogColFloat + 2] = col[2];
+        mp[kWaterFogColFloat + 3] = kView;
+
+        // --- W7b: the LIGHT path's per-channel coefficient -------------------------------------
+        // "Reverse the UnderwaterColor to get light absorption — the same mechanism, applied to
+        // light itself." Read MW's authored [Water] UnderwaterColor as a TRANSMITTANCE spectrum and
+        // invert it: sigma = -ln(colour) is an optical depth, and its SHAPE is how much faster water
+        // eats red than blue. Normalised to unit mean so this is NOT a second calibration — the view
+        // knob still owns the overall rate and the ini owns only the colour
+        // ([[feedback_model_class_not_knobs]]).
+        //
+        // ⚠ THE READING IS CHECKABLE, AND IT CHECKS OUT. (12,30,37) inverts to a normalised spectrum
+        // of (1.287, 0.901, 0.813); the tint MW ITSELF applies to ambient underwater, measured off
+        // the wire and put through the same normalisation, is (1.219, 0.917, 0.864) — agreement
+        // within ~6%. An authored colour and a hand-picked engine constant independently agree about
+        // the absorption slope, which is what makes "invert the colour" a derivation rather than a
+        // convenient story.
+        //
+        // The AUTHORED colour, deliberately: this is a spectral RATIO, so it must be formed in the
+        // space the three bytes were picked in. Decoding first would tilt the slope by a gamma.
+        {
+            float sig[3], mean = 0.0f;
+            for (int i = 0; i < 3; ++i) {
+                sig[i] = -std::log(std::max(g_waterIni.underwaterColor[i], 1.0e-3f));
+                mean += sig[i];
+            }
+            mean = std::max(mean * (1.0f / 3.0f), 1.0e-6f);
+
+            // ...plus CDOM, the term that makes coastal water GREEN (see g_waterTurbidity). The
+            // shape is exp(-0.014*(lambda-440)) at RGB centroids (600, 550, 450) nm, pre-normalised
+            // to unit mean here so the blend below cannot change the overall rate — only the hue.
+            constexpr float kCdom[3] = { 0.2684f, 0.5403f, 2.1912f };
+            const float t = std::max(0.0f, std::min(g_waterTurbidity, 1.0f));
+            float absShape[3];
+            for (int i = 0; i < 3; ++i) {
+                absShape[i] = (1.0f - t) * (sig[i] / mean) + t * kCdom[i];
+                mp[kWaterFogLightFloat + i] = kView * absShape[i];
+            }
+            mp[kWaterFogLightFloat + 3] = std::max(0.0f, std::min(g_waterLightAbsorb, 1.0f));
+
+            // --- W8: SPLIT THE MEDIUM INTO ABSORPTION AND SCATTERING ---------------------------
+            // Everything above this line describes a medium that only ever REMOVES light — which is
+            // the reason the water colour had to be an authored constant. Nothing was putting light
+            // back, so there was no colour to derive, and the one free parameter (turbidity) could
+            // only rotate the transmission window. A single exponential's surviving channel is
+            // always the minimum-sigma one, so the reachable colours were a one-dimensional family
+            // and green was the direction CDOM pointed in. That is the whole of the "algae green"
+            // report: not a mistuning, a model with one degree of freedom too few.
+            //
+            // Scattering is the missing one, and it introduces a SECOND spectrum. In-scatter over a
+            // long ray converges to sigma_s/sigma_t (the single-scattering albedo) times the light
+            // that got down there, so the colour of deep water is a RATIO of two independent
+            // spectra rather than the tail of one. That ratio can be cyan-blue while the medium
+            // still eats red fastest — which the one-spectrum model could not express at any
+            // setting ([[feedback_model_class_not_knobs]]: the second failed parameter is the
+            // signal to ask whether the maths admits the answer at all).
+            //
+            // SCATTERING SPECTRUM: lambda^-1 at the sRGB primaries' dominant wavelengths
+            // (612, 549, 465 nm), normalised to unit mean. Mie scattering off small particles is
+            // mildly blue-weighted; the exponent is the conventional mid-range value for coastal
+            // particulates (pure-water molecular scattering is lambda^-4.3, large silt is nearly
+            // grey, and real water sits between them).
+            constexpr float kScatterShape[3] = { 0.8744f, 0.9748f, 1.1508f };
+            const float wS = std::max(g_waterScatterRatio, 0.0f);
+
+            // NORMALISE sigma_t, NOT sigma_a. The visibility knob names a BEAM attenuation distance,
+            // and a beam is attenuated by absorption and scattering alike — so what has to carry the
+            // knob's rate is their sum. Doing it this way keeps the distance knob exact at every
+            // turbidity (mean sigma_t is always kView) while still letting the two shapes tilt
+            // sigma_t's own spectrum, which is what makes deep water redden out.
+            float rawS[3], rawT[3], meanT = 0.0f;
+            for (int i = 0; i < 3; ++i) {
+                rawS[i] = wS * kScatterShape[i];
+                rawT[i] = absShape[i] + rawS[i];
+                meanT  += rawT[i];
+            }
+            meanT = std::max(meanT * (1.0f / 3.0f), 1.0e-6f);   // == 1 + wS, both shapes being unit mean
+            const float norm = kView / meanT;
+            for (int i = 0; i < 3; ++i) {
+                mp[kWaterFogExtFloat + i]     = norm * rawT[i];
+                mp[kWaterFogScatterFloat + i] = norm * rawS[i];
+            }
+
+            // --- W8e: THE DOWNWELLING PATH IS NOT THE BEAM PATH --------------------------------
+            // sigma_t was doing two jobs, and only one of them is its own. A beam ACROSS the water
+            // loses a photon the moment it scatters — it has left the line of sight, which is exactly
+            // what an eye ray measures. Light coming DOWN loses nothing to a forward scatter: the
+            // photon is still descending and still arrives. The two coefficients have names in ocean
+            // optics precisely because they differ by a large factor: beam attenuation c (= sigma_t)
+            // and diffuse attenuation K_d.
+            //
+            // MEASURED CONSEQUENCE of conflating them (waterfog_trace.csv, 989 frames): over a
+            // 628 -> 1296 unit dive, e0 = exp(-k*slant*eyeDepth) darkened 3.84x on ambient and 4.76x
+            // on sun. The hole fill is 100% in-scatter so it took all of it; a rock took almost none,
+            // because waterLightTransmit keys its lighting on the ROCK's depth and the rock did not
+            // move. That gap IS the reported "brighter or darker than everything else as I move
+            // camera" — the one-frame delay in the same trace is worth 1.1-2.1%, two orders too small.
+            //
+            // K_d, valid in BOTH limits and exact in each:
+            //     K_d = sqrt(sigma_a^2 + 3*sigma_a*sigma_s')      sigma_s' = sigma_s*(1 - g)
+            // Absorption-dominated (sigma_s' -> 0) it becomes sigma_a, the honest answer when nothing
+            // scatters. Scattering-dominated it becomes sqrt(3*sigma_a*sigma_s'), the diffusion
+            // result. Water here is the first case, which is why plain sigma_a is close — but the
+            // interpolation costs one multiply and cannot mislead if the scatter ratio is raised.
+            //
+            // ⚠ g IS THE MEDIUM'S, NOT THE RENDER PHASE'S, and this is the trap. waterFogPhase's
+            // forward lobe is 0.85, but the published phase also carries a 0.50 ISOTROPIC PEDESTAL
+            // that exists to stand in for multiple scattering — a rendering device, not a claim about
+            // water. Its mean cosine works out to 0.329, and using that here would put 67% of the
+            // scattering into sigma_s' and hand back nearly sigma_t again, quietly cancelling the
+            // whole correction. What belongs here is the real asymmetry of the medium: Petzold's
+            // measured average ocean particle, g = 0.92 — the same number the phase comment cites as
+            // the thing its lobe is approximating.
+            constexpr float kMediumG = 0.92f;
+            const float kdS = std::max(0.0f, std::min(g_waterKd, 1.0f));
+            for (int i = 0; i < 3; ++i) {
+                const float sT  = norm * rawT[i];
+                const float sS  = norm * rawS[i];
+                const float sA  = std::max(sT - sS, 0.0f);
+                const float sSp = sS * (1.0f - kMediumG);
+                const float kd  = std::sqrt(sA * sA + 3.0f * sA * sSp);
+                // Written as sT + s*(kd - sT) so that s == 0 is EXACTLY sigma_t, not almost it: this
+                // lane feeds waterLightTransmit as well as the column, so a near-miss here would make
+                // "W8e off" a slightly different image rather than the previous one.
+                mp[kWaterFogKdFloat + i] = sT + kdS * (kd - sT);
+            }
+            mp[kWaterFogKdFloat + 3] = kdS;
+            mp[kWaterFogExtFloat + 3]     = std::max(0.0f, std::min(g_waterVolumetric, 1.0f));
+            mp[kWaterFogScatterFloat + 3] = std::max(g_waterInscatterGain, 0.0f);
+
+            mp[kWaterFogPhaseFloat + 0] = g_waterPhaseFwdG;
+            mp[kWaterFogPhaseFloat + 1] = std::max(g_waterPhaseFwdGain, 0.0f);
+            mp[kWaterFogPhaseFloat + 2] = g_waterPhaseBackG;
+            mp[kWaterFogPhaseFloat + 3] = std::max(g_waterPhaseBackGain, 0.0f);
+            mp[kWaterFogPhase2Float + 0] = std::max(g_waterPhaseIso, 0.0f);
+            mp[kWaterFogPhase2Float + 1] = g_waterPhaseCeil;
+            mp[kWaterFogPhase2Float + 2] = std::max(0.0f, std::min(g_waterPhaseMS, 1.0f));
+            mp[kWaterFogPhase2Float + 3] = 0.0f;
+        }
+    }
+
     void publishSunShadowParams(const float* sunVPs, const float* cascadeTexels, bool active) {
         if (!g_live.pShadowMaskParamsCbv || !g_live.pShadowMaskParamsCbv->pCpuMappedAddress) { return; }
         float* mp = (float*)g_live.pShadowMaskParamsCbv->pCpuMappedAddress;
@@ -24491,6 +25823,8 @@ namespace ForgeRender {
         // water, or when the camera is under it — an air-fog march below the surface is meaningless).
         mp[kVolFog4Float + 2] = g_volFogWaterZ;
         mp[kVolFog4Float + 3] = g_volFogWaterOn ? 1.0f : 0.0f;
+
+        publishWaterFog(mp);
     }
 
     // Separable Gaussian over the sun moments map — THE pass that makes MSM soft (see
@@ -25986,7 +27320,9 @@ namespace ForgeRender {
         if (g_live.pSunShadowViewPipeline)  { removePipeline(R, g_live.pSunShadowViewPipeline); g_live.pSunShadowViewPipeline = nullptr; }
         if (g_live.pSunShadowViewShader)    { removeShader(R, g_live.pSunShadowViewShader); g_live.pSunShadowViewShader = nullptr; }
         if (g_live.pVolFogPipeline)         { removePipeline(R, g_live.pVolFogPipeline); g_live.pVolFogPipeline = nullptr; }
+        if (g_live.pWaterFillPipeline)      { removePipeline(R, g_live.pWaterFillPipeline); g_live.pWaterFillPipeline = nullptr; }
         if (g_live.pVolFogShader)           { removeShader(R, g_live.pVolFogShader); g_live.pVolFogShader = nullptr; }
+        if (g_live.pWaterFillShader)        { removeShader(R, g_live.pWaterFillShader); g_live.pWaterFillShader = nullptr; }
         if (g_live.pPerBatchSetAlpha)       { removeDescriptorSet(R, g_live.pPerBatchSetAlpha); }
         if (g_live.pAlphaWorldsBuf)         { removeResource(g_live.pAlphaWorldsBuf); }
         if (g_live.pAlphaInstanceBuf)       { removeResource(g_live.pAlphaInstanceBuf); }

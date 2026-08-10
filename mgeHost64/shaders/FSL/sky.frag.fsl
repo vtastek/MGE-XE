@@ -30,7 +30,9 @@
 // be inherited by everything calibrated against it.
 #include "opaque.srt.h"
 #include "tonemap.h.fsl"    // the curve + its inverse
+#include "linearize.h.fsl" // srgbToLinear()/mod2xLinear() — the scene's transfer function (step 5)
 #include "scenecolor.h.fsl" // liftInPass() — class 2: MW's authored display-referred sky (step 6a)
+#include "waterfog.h.fsl"   // the sky is behind water too, and nothing else was going to fog it
 
 STRUCT(VSOutput)
 {
@@ -86,5 +88,34 @@ float4 PS_MAIN( VSOutput In )
     // and lifting a premultiplied value would put the curve on the wrong side of the coverage
     // multiply (the same trap resolve.srt.h documents three times over).
     c.rgb = liftInPass(c.rgb);
+
+    // --- W8: THE SKY IS BEHIND WATER TOO -----------------------------------------------------
+    // Reported from underwater: "you see the clear color, horizon band, sun setting underwater".
+    // This pass was the last thing in the frame with no water fog on it — applyFog never runs here,
+    // so the sun, the moons and the whole dome arrived through metres of water perfectly crisp. The
+    // gap was already written down at water.frag's underwater refraction ("the real fix = give
+    // sky.frag the same extinction over its own plane intersection"); this is that fix, and it
+    // retires that pass's re-fog rather than adding a second one.
+    //
+    // ⚠ THE SKY HAS NO POSITION, ONLY A DIRECTION — and pushing it out along that direction is not a
+    // fudge, it is exact. waterPathLength is HOMOGENEOUS in the ray's length for both branches that
+    // matter here, so the distance chosen cancels:
+    //   looking UP   — the ray exits at the surface, giving eyeDepth/dir.z whatever the far end is;
+    //   looking DOWN — every branch returns the whole ray, i.e. an unbounded column, which is the
+    //                  right answer for a sky dome seen through the sea floor's worth of water and
+    //                  is exactly the "assume max depth where there is none" this needs.
+    // 1e5 units is past total extinction at any usable visibility (~150 optical depths), and every
+    // exponent downstream stays negative, so the deep case saturates rather than overflowing.
+    //
+    // Gated on the camera being SUBMERGED, deliberately. Above water a sky ray carries no water by
+    // construction — but the dome is geometry, and any element of it that dips below the eye's
+    // horizontal plane would take the "ray enters the water" branch and go solid water-colour. The
+    // gate makes that unreachable instead of relying on the mesh never doing it.
+    // No legacy term: this pass never had a water fade, so W8 strength 0 must leave it untouched,
+    // which is exactly what waterFogBlend does when handed its own input as the legacy value.
+    if (waterFogCameraSubmerged()) {
+        float3 skyRel = normalize(In.WorldDir) * 1.0e5f;
+        c.rgb = waterFogBlend(c.rgb, c.rgb, skyRel, waterFogSample(skyRel));
+    }
     RETURN(c);
 }

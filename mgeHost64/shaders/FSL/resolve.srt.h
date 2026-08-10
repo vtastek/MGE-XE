@@ -99,7 +99,18 @@ STRUCT(ResolveParams)
     //     much further below zero than a [0,1] one ever could. The RGB floor at 0 then clips that
     //     undershoot asymmetrically — energy the overshoot side keeps. Lowering C is the direct
     //     lever on that, and the horizon fog band is where to look.
-    // w reserved.
+    // w = SCENE IS LINEAR (step 5). 1 = the source holds values proportional to radiance and this
+    //     pass owns the compensating sRGB ENCODE, applied between the un-premultiply and the curve.
+    //     It is the exact inverse of every decode the frame went through — hardware _SRGB views on
+    //     the textures, decodeAuthored() on the cbuffer and vertex colours — which is what makes the
+    //     migration checkable: any chain that is a pure product must come back unchanged.
+    //     0 = the scene is still in MW's gamma domain and this pass must not encode.
+    //
+    //     ⚠ IT ALSO CHANGES THE FILTER, and deliberately. Both the Catmull-Rom reconstruction above
+    //     and the inverse-luminance firefly weight now run on linear samples, which is where they
+    //     were always supposed to run: averaging gamma values darkens an edge between two
+    //     brightnesses, and `1/(1+luma)` was weighting an encoded number. Neither is a knob change,
+    //     so do not re-tune the diameter or C at S1 — that is what makes them attributable at S2.
     DATA(float4, opts, None);
 };
 

@@ -122,6 +122,9 @@ VSOutput VS_MAIN( VSInput In )
     // vColSource == 2` gate lets through (scenegraph_geometry_cache.cpp:1245/2016). A colour
     // channel would cost 4 bytes on every skinned vertex to feed exactly nothing. It becomes
     // worth adding only if that cache rule is flipped to the MW/OpenMW data-driven default.
+    // Step 5 note: these are CONSTANTS, and 0 and 1 are fixed points of the sRGB transfer function,
+    // so this vert needs no decodeAuthored() while the placeholder stands. The day a real per-part
+    // skinned material lands here it does — see opaque.vert.fsl, whose four lanes these mirror.
     Out.MatDiffuse  = float3(1.0f, 1.0f, 1.0f);
     Out.MatAmbient  = float3(1.0f, 1.0f, 1.0f);
     Out.MatEmissive = float3(0.0f, 0.0f, 0.0f);

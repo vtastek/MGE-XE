@@ -379,7 +379,7 @@ namespace IPC {
         //   [0] waterLevel (absolute world Z)      [6] nearViewRange
         //   [1] windFactor                         [7] underwater (0/1)
         //   [2] shoreDepthBias                     [8..10] camFwd.xyz (world view forward)
-        //   [3..5] depthBaseColor.rgb              [11] reserved
+        //   [3..5] depthBaseColor.rgb              [11] MW GameHour (unified water fog's ToD density)
         // Appended after debugMode so every existing field offset is unchanged.
         IN float waterParams[12];
         IN std::uint32_t waterEnabled;

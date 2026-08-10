@@ -5,6 +5,9 @@
 // position + world-space normal for flat N.L shading.
 
 #include "opaque.srt.h"
+#include "tonemap.h.fsl"    // (scenecolor.h.fsl's prerequisite; the curve is never called in a VS)
+#include "linearize.h.fsl" // srgbToLinear() — the scene's transfer function (step 5)
+#include "scenecolor.h.fsl" // decodeAuthored() — MW's authored colours enter the scene domain HERE
 
 STRUCT(VSInput)
 {
@@ -94,10 +97,26 @@ VSOutput VS_MAIN( VSInput In )
     // and alphashadowdepth.frag, and a field added here has to be added to EVERY one of them or the
     // GPU hangs ([[project_forge_shared_frag_vsoutput]]).
     Out.ClampMode  = (In.TexAlpha >> 26u) & 0xFu;
-    Out.Color = In.Color;
-    Out.MatDiffuse  = In.MatDiffuse;
-    Out.MatAmbient  = In.MatAmbient;
-    Out.MatEmissive = In.MatEmissive;
+    // STEP 5 — THE AUTHORED COLOURS ENTER THE SCENE'S DOMAIN, AND THEY DO IT IN THE VERTEX STAGE.
+    //
+    // Every one of these is MW's display-referred data: In.Color is the D3DCOLOR a
+    // VertexColorProperty painted, the three material lanes are the NiMaterialProperty's own bytes.
+    // Their partner in the very next multiply — the base texel — is decoded by the sampler, so
+    // leaving these encoded would put two domains inside one product, which shows as a HUE shift
+    // rather than a brightness one and is correspondingly hard to attribute.
+    //
+    // ⚠ HERE AND NOT IN THE FRAG. Decode-then-interpolate is the same ordering rule that makes an
+    // _SRGB view mandatory for textures: the rasterizer's interpolation is a filter, and filtering
+    // gamma values then linearising the average is wrong in exactly the way a shader pow() after
+    // bilinear is. The material lanes are FLAT and could go either way; they ride along so that one
+    // rule covers the whole struct and nobody has to remember which lane was which.
+    //
+    // ⚠ .a NEVER COMES HERE. Alpha is coverage, not a colour; it has no transfer function. That is
+    // why this decodes .rgb and rebuilds the float4 rather than converting In.Color wholesale.
+    Out.Color = float4(decodeAuthored(In.Color.rgb), In.Color.a);
+    Out.MatDiffuse  = decodeAuthored(In.MatDiffuse);
+    Out.MatAmbient  = decodeAuthored(In.MatAmbient);
+    Out.MatEmissive = decodeAuthored(In.MatEmissive);
     Out.OverlayIndex = In.OverlayIndex;   // terrain DECAL_1 slot (0 = no decal)
     Out.DrawIdx      = drawIndex;         // side-table index (alpha.frag -> gAlphaStages)
     // MW near fog (per-vertex, as FFE): dist is camera distance = |worldPos - eye| (the view

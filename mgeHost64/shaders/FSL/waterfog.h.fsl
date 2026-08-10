@@ -1,0 +1,525 @@
+// mgeHost64 — ONE water fog, for the surface and for the world underneath it.
+//
+// THE BUG THIS REPLACES. The renderer fogged water three different ways and none of them agreed:
+//
+//   above water, looking down   water.frag  target = depthColor (the XE water tint)
+//                                           law    = exp(-depth/500) on a PERPENDICULAR depth
+//   underwater refraction       water.frag  target = fogColNear (the atmosphere)
+//                                           law    = exp(-dist/500) on the slant distance
+//   the submerged world itself  applyFog()  target = fogColNear
+//                                           law    = MW's per-vertex LINEAR air ramp
+//
+// So crossing the surface swapped both the colour and the model, and the seabed was fogged as if it
+// were standing in air. Two private hacks in water.frag existed to paper over the third row, and
+// could not — "they don't match the underwater fogging colour anyway".
+//
+// THE MODEL. One Beer-Lambert extinction over the PATH LENGTH THROUGH WATER, toward one target:
+//
+//     fog = 1 - exp(-k * waterPathLength)
+//
+// ported from the author's own OpenMW shader (`1 - exp(-(1.56/uFogFar) * waterDepth)`). `k` and the
+// target both ride gShadowParams (see shadowparams.h.fsl); the target is MW's own
+// `UnderwaterColor*w + fogColor*(1-w)`, i.e. Morrowind.ini [Water] data rather than a picked colour.
+//
+// WHY IT IS GENUINELY ONE FOG, AND THIS IS THE LOAD-BEARING PROPERTY. The eye-above and eye-below
+// path lengths are two expressions of ONE continuous function. As the camera descends to the
+// surface, camToSurf -> 0 and the above-water form
+//
+//     posToSurf * d / (camToSurf + posToSurf)   ->   posToSurf * d / posToSurf   =   d
+//
+// which is exactly the submerged branch. The crossing is therefore C0 with nothing to cross-fade
+// and no pop to hide — which is the whole claim, and the thing to check first if the crossing ever
+// starts to step.
+//
+// Requires gShadowParams (shadowparams.h.fsl) + gFrameData.lodEye. Pure maths and the two lanes; no
+// policy — who composes it with what lives in skydome.h.fsl and water.frag.fsl.
+
+#ifndef WATER_FOG_H
+#define WATER_FOG_H
+
+#include "phase.h.fsl"   // hgNorm / phaseDualLobe — W8's in-scatter is directional
+
+// The water plane in the CAMERA-RELATIVE space every colour frag's WorldPos is in: negative when the
+// camera is above the surface. Derived the identical way volfog.frag.fsl:101 derives it, from the
+// identical absolute Z, so the two features cannot disagree about where the water is.
+float waterFogPlaneRelZ()
+{
+    return gShadowParams.waterFogPlane.x - gFrameData.lodEye.z;
+}
+
+// --- shared primitives (the W7b block below derives the two constants) ------------------------
+// n = 1.333 gives a Snell window of half-angle 48.6 deg; kWaterCosCrit is its cosine and bounds the
+// sun's slant factor at 1.512, and kWaterDiffuse = 2/(1 + cosCrit) is the Lambertian mean secant
+// through that window (air's familiar equivalent is 1.66). Derived in full at waterLightTransmit —
+// they live up here only because the fog TARGET needs them too.
+#define kWaterIOR      1.333f
+#define kWaterCosCrit  0.6612f
+#define kWaterDiffuse  1.2039f
+
+// Depth of this fragment BELOW the surface, world units; 0 for anything above it.
+float waterFogDepthBelow(float3 worldPosRel)
+{
+    return max(waterFogPlaneRelZ() - worldPosRel.z, 0.0f);
+}
+
+// ...and the EYE's own depth below the surface (0 when it is above).
+float waterFogEyeDepth()
+{
+    return max(waterFogPlaneRelZ(), 0.0f);
+}
+
+// How much of the eye->fragment ray lies UNDER the surface, in world units.
+//
+// FOUR CASES, not two, and the plane is what decides — never the `camUnder` flag alone:
+//   eye above, fragment above  ->  0            (⚠ see the clamp note)
+//   eye above, fragment below  ->  the ray ENTERS the water: similar triangles
+//   eye below, fragment below  ->  the whole ray
+//   eye below, fragment above  ->  the ray EXITS the water: the same triangles, mirrored
+// The last one is easy to miss because it never arises when this is called on known-submerged
+// geometry — but from underwater, everything above the surface is seen THROUGH it, so "camera
+// submerged => whole ray" would fog a cliff by its full distance rather than by the few metres of
+// water actually in front of it, and the above-water world would go solid water-colour.
+//
+// ⚠ THE `posToSurf <= 0` CLAMP IS NOT IN THE OPENMW ORIGINAL AND IS MANDATORY HERE. That version was
+// only ever called on geometry already known to be underwater. applyFog() is called for EVERYTHING,
+// so an above-water fragment would otherwise produce a NEGATIVE path length, and a negative length
+// through `1 - exp(-k*L)` is negative fog — it would inverse-fog the entire sky.
+//
+// ⚠ THE DENOMINATOR IS NOT THE SUM IT LOOKS LIKE. Writing out `camToSurf + posToSurf` with
+// camToSurf = -waterRelZ and posToSurf = waterRelZ - worldPosRel.z, the plane terms cancel exactly:
+//
+//     camToSurf + posToSurf  ==  -worldPosRel.z
+//
+// i.e. the similar-triangles form IS the exact ray/plane intersection, and its denominator is simply
+// how far the fragment sits below the EYE. Using that directly is cheaper, and it is the better-
+// conditioned of the two spellings: the sum re-adds a large plane offset that the subtraction inside
+// posToSurf just removed. (The mirrored case below cancels the same way, to worldPosRel.z.)
+//
+// It also disposes of the "denominator approaches 0" worry properly, WITHOUT an epsilon. In the
+// entering case -worldPosRel.z - posToSurf == camToSurf >= 0, so the denominator is bounded below by
+// posToSurf itself and the ratio cannot exceed 1 — a submerged segment longer than the whole ray is
+// not a small numerical error, it is a physically impossible answer, and max() enforces exactly that
+// invariant. The only state that reaches the clamp is the camera being geometrically below a surface
+// whose `camUnder` flag still says above (the eye exactly at the waterline, or a one-frame
+// disagreement between the client's underwater bit and the plane); there it returns the full ray,
+// which is the submerged branch's answer, i.e. the same C0 limit the header note derives.
+// The exiting case is bounded the same way by construction and then saturate()d, so the two
+// degenerate spellings of "the flag and the plane disagree" both land on a defined, consistent
+// answer instead of on a 0/0.
+float waterPathLength(float3 worldPosRel, float waterRelZ, bool camUnder)
+{
+    float d = length(worldPosRel);
+    float posToSurf = waterRelZ - worldPosRel.z;   // > 0 only when the FRAGMENT is submerged
+
+    if (camUnder) {
+        if (posToSurf >= 0.0f) { return d; }       // both ends under: the whole ray is in water
+        // The ray exits at the plane. camToSurf + posAboveSurf == worldPosRel.z exactly, so the
+        // submerged share is camToSurf / worldPosRel.z — the mirror of the entering case.
+        // Two guards, both for the one impossible state (the flag says under, the plane says over):
+        //   max(waterRelZ, 0) collapses the share to 0, which is the eye-ABOVE answer for an
+        //     above-water fragment — the right thing to degrade to;
+        //   the z > 0 test always holds in legitimate geometry (worldPosRel.z > waterRelZ > 0 here),
+        //     so 1.0 is only ever reached once the two already contradict each other, and the whole
+        //     ray is the submerged branch's answer, i.e. the consistent one.
+        // saturate then bounds the result whatever the inputs were.
+        float camToSurf = max(waterRelZ, 0.0f);
+        float share = (worldPosRel.z > 0.0f) ? (camToSurf / worldPosRel.z) : 1.0f;
+        return d * saturate(share);
+    }
+
+    if (posToSurf <= 0.0f) { return 0.0f; }        // both ends above: no water on this ray
+    return d * (posToSurf / max(-worldPosRel.z, posToSurf));
+}
+
+// Is the unified model live this frame? The A/B gate, and the one thing a caller has to ask before
+// it may retire a private fade of its own: with this false, every helper below is inert and the
+// caller must fall back to exactly what it did before.
+bool waterFogActive()
+{
+    return gShadowParams.waterFogPlane.y >= 0.5f;
+}
+
+// BOTH numbers a caller needs, from ONE length():
+//   x = the water fog factor, 0 = clear, 1 = fully fogged.
+//   y = the SHARE of the ray that is under water, 0..1.
+//
+// The share exists because MW's air fog and this one describe the SAME ray and must divide it
+// between them rather than both claiming all of it. Returns exactly (0, 0) when the feature is off,
+// so every caller's composite collapses to what it was — see applyFog for why that has to be exact
+// and not merely close.
+float2 waterFogSample(float3 worldPosRel)
+{
+    if (!waterFogActive()) { return float2(0.0f, 0.0f); }
+
+    float d   = length(worldPosRel);
+    float len = waterPathLength(worldPosRel, waterFogPlaneRelZ(),
+                                gShadowParams.waterFogPlane.z > 0.5f);
+    float frac = (d > 1.0e-4f) ? saturate(len / d) : 0.0f;
+    return float2(1.0f - exp(-gShadowParams.waterFogCol.w * len), frac);
+}
+
+// Just the factor, for callers with no air fog to divide against (water.frag's underwater branch,
+// which is looking at a ray that is entirely in water by construction).
+float waterFogFactor(float3 worldPosRel)
+{
+    return waterFogSample(worldPosRel).x;
+}
+
+// The one target every submerged fragment melts toward. Already in the scene's units — the host
+// lifts and decodes it at the boundary exactly as it does fogColNear.
+//
+// ⚠ AND IT IS LIT, which is the difference between turbidity being visible and not. The first build
+// returned the flat authored colour: constant with depth, with the sun, with everything. That made
+// the target the ONE element of the underwater image the model did not touch — and since the target
+// is exactly what dominates as the view fog closes in, the per-channel spectrum was squeezed into
+// the band where it could not be seen. Measured at the shipped default, the lit surface's hue shift
+// peaks at ~15% of the pixel around 14 m (its own hue spread is large by then, but the view fog has
+// already replaced 78% of it) and falls away again. Carried on the TARGET, the same spectrum reaches
+// ~24% at 14 m and ~66% at 28 m, because the target's weight goes to 1 exactly where the surface's
+// goes to 0. Same physics, opposite visibility.
+//
+// So: in-scatter is light that got down here and turned around. Scale MW's authored colour — which
+// is what water looks like AT THE SURFACE, and stays exactly that at depth 0, so the verified match
+// with the engine's own underwater fog is untouched — by the downward transmittance at the
+// REPRESENTATIVE depth of the submerged segment. Midpoint of (where the ray entered the water,
+// where it ends): the segment spans 0..dFrag looking down from above, or dEye..dFrag from below,
+// and a single evaluation at its middle is the cheap stand-in for integrating along it.
+//
+// What is deliberately NOT in the mix: the overall LIGHT LEVEL. The authored colour already bakes in
+// "what water looks like" under typical light, so multiplying by the live sun or ambient would
+// double-count it. Making night water genuinely dark means deriving the in-scatter outright
+// (albedo x light) instead of authoring it, which abandons the exact MW match — a real option, but a
+// different decision.
+float3 waterFogColor(float3 worldPosRel)
+{
+    float3 c = gShadowParams.waterFogCol.rgb;
+
+    float s = gShadowParams.waterFogLight.w;
+    if (s <= 0.0f) { return c; }        // absorption off -> the flat authored colour, as before
+
+    float depthRep = 0.5f * (waterFogEyeDepth() + waterFogDepthBelow(worldPosRel));
+    float3 t = exp(-gShadowParams.waterFogLight.rgb * depthRep * kWaterDiffuse);
+    return c * lerp(float3(1.0f, 1.0f, 1.0f), t, s);
+}
+
+// --- W7b: ABSORPTION ON THE WAY IN ------------------------------------------------------------
+//
+// The eye path is only half of it. Light has to REACH the fragment, and it crosses the same water
+// to get there — so a submerged rock is dimmer and bluer because of where the ROCK is, not because
+// of where the camera is. Both reference engines get that wrong in the same way and for the same
+// reason: MW multiplies sun+ambient by a flat tint when the EYE submerges, OpenMW swaps the whole
+// scene to a fog ramp that starts behind the camera (60-75% opaque at zero distance). Either way a
+// rock's lighting changes when the viewer moves and the rock does not.
+//
+// ⚠ VERTICAL DEPTH IS NOT A SHORTCUT HERE — REFRACTION MAKES IT NEARLY EXACT, and that is the one
+// thing worth understanding about this function. In air a low sun would travel depth/cos(theta),
+// which blows up at grazing and needs an arbitrary clamp. It cannot, under water: Snell compresses
+// the ENTIRE sky into a cone of half-angle asin(1/1.333) = 48.6 deg, so
+//
+//     cos(theta_water) = sqrt(1 - (1 - cos^2(theta_air)) / n^2)   >=   sqrt(1 - 1/n^2) = 0.6612
+//
+// and the slant factor is bounded in [1, 1.512] no matter where the sun is. No clamp, no epsilon,
+// and no dawn blow-up — the bound is physics, not a guard.
+//
+// The same window fixes the AMBIENT path length in closed form. Averaging 1/cos over a Lambertian
+// receiver's view of that cone gives the diffusivity factor
+//
+//     2 / (1 + cos(theta_c)) = 1.204
+//
+// where air's equivalent is the familiar 1.66. Both numbers fall out of n; neither is tuned.
+// Per-channel transmittance of the light reaching this fragment: tSun along the refracted sun ray,
+// tAmb over the sky's whole Snell window. Both are exactly 1 above the surface and exactly 1 with
+// the feature off, so a caller's `*=` is the identity and the A/B is byte-exact.
+//
+// POINT LIGHTS ARE DELIBERATELY NOT A CALLER. Their path is light->fragment, not surface->fragment;
+// a torch carried underwater is not dimmed by the column above it. That is a different (and much
+// shorter) correction, not this one.
+void waterLightTransmit(float3 worldPosRel, out float3 tSun, out float3 tAmb)
+{
+    tSun = float3(1.0f, 1.0f, 1.0f);
+    tAmb = tSun;
+
+    float strength = gShadowParams.waterFogLight.w;
+    if (!waterFogActive() || strength <= 0.0f) { return; }
+
+    float depth = waterFogDepthBelow(worldPosRel);
+    if (depth <= 0.0f) { return; }
+
+    // ONE MEDIUM, ONE SPECTRUM — but the DOWNWELLING spectrum, which is K_d and not sigma_t (W8e).
+    // The light a surface receives and the light the column in front of it scatters must not disagree
+    // about how fast water eats red, so both read this same lane. Without W8 it is the legacy
+    // per-channel lane, and `lerp(a, b, 0)` is exactly `a`, so that A/B stays bit-exact.
+    //
+    // ⚠ THE EARLIER COMMENT HERE WAS WRONG and the error was worth ~1.7x of brightness. It argued
+    // that "scattering belongs in a BEAM's extinction even though it does not destroy the photon:
+    // light scattered out of the sun's direct path has left that path". True for a beam, and this is
+    // not a beam — what a submerged surface is lit by, and what the column has available to scatter,
+    // is the whole DOWNWELLING FIELD. A photon deflected 10 degrees on its way down is still on its
+    // way down. Losing it counts a photon as absorbed that is still in the water and still heading
+    // here. See publishWaterFog for how K_d is derived from the same sigma_a/sigma_s.
+    float3 k = lerp(gShadowParams.waterFogLight.rgb, gShadowParams.waterFogKd.rgb,
+                    gShadowParams.waterFogExt.w);
+
+    // Refracted sun: cos in AIR is |sunDir.z| (sunDir is the travel direction), and the bound above
+    // means this sqrt can never go negative and the divide can never explode.
+    float cosAir   = abs(gFrameData.sunDir.z);
+    float cosWater = sqrt(max(1.0f - (1.0f - cosAir * cosAir) / (kWaterIOR * kWaterIOR), 0.0f));
+    float pathSun  = depth / max(cosWater, kWaterCosCrit);
+
+    tSun = lerp(tSun, exp(-k * pathSun),                 strength);
+    tAmb = lerp(tAmb, exp(-k * depth * kWaterDiffuse),   strength);
+}
+
+// --- W8: THE COLUMN SCATTERS, IT DOES NOT JUST ABSORB -----------------------------------------
+//
+// WHY THE MODEL ABOVE HAD TO CHANGE, in the reporter's words: "this needs to be volumetric, or I see
+// shapes over depth." It is a real defect and it is structural. waterFogColor() evaluates the
+// downward transmittance ONCE, at the midpoint of the eye->FRAGMENT segment — so the colour of the
+// water depends on what the ray happened to hit. Two fragments at different depths behind the same
+// stretch of water get different water colour, and the boundary between them is the geometry's own
+// silhouette. No amount of tuning removes it: the quantity is fragment-indexed, and a fog colour
+// must not be.
+//
+// The fix is to integrate. In-scatter is light that entered the column, turned around, and reached
+// the eye, accumulated over the ray:
+//
+//     I = INTEGRAL[0..L] sigma_s * p(cos) * L_light(depth(s)) * exp(-sigma_t * s) ds
+//
+// and the reason silhouettes vanish is visible in the limit: as L grows, `exp(-sigma_t*s)` kills the
+// far end, so I converges to a value that does not contain L at all. Everything beyond a few optical
+// depths is the SAME colour regardless of what stands there — which is what deep water looks like.
+// The old form's midpoint depth stayed fragment-indexed forever, so it never converged.
+//
+// ⚠ AND IT IS EXACT, WITH NO RAY MARCH. This is worth understanding before anyone "upgrades" it to a
+// loop. Depth along a straight ray is LINEAR in s — depth(s) = dNear + mEff*s — so the illumination
+// term exp(-sigma_t*slant*depth(s)) is an exponential of a linear function, and multiplying it by
+// the view term exp(-sigma_t*s) gives ONE exponential in s. A single exponential integrates in
+// closed form. volfog.frag has to march only because its density is exponential in HEIGHT, making
+// its integrand an exponential of an exponential, which has no elementary antiderivative. Water's
+// density is uniform; only the light varies, and it varies in exactly the way that stays solvable.
+// So: no steps, no jitter, no banding, no step-count knob — three exp() and a divide.
+//
+// The third piece is the PHASE function (phase.h.fsl): water scatters strongly forward, so how much
+// of the sun turns around depends on where you are looking. Without it the column is a flat glow.
+// The ambient term takes no phase — it is already averaged over the sky's whole Snell window.
+
+// ONE segment of the integral above, in closed form. `slant` selects which downward path the light
+// took (the refracted sun ray, or the ambient's mean secant through the Snell window).
+//
+//   e0 = light arriving at the NEAR end of the segment
+//   e1 = light arriving at the FAR end, times the view transmittance back over the whole segment
+//   q  = 1 + mEff*slant, the combined rate: how fast the integrand decays per unit of ray
+//   I  = (e0 - e1) / (sigma_t * q)
+//
+// ⚠ BOTH EXPONENTS ARE NON-POSITIVE BY CONSTRUCTION, and that is deliberate rather than lucky. The
+// algebraically identical spelling e1 = e0*exp(-sigma_t*q*L) has a POSITIVE exponent whenever the ray
+// climbs (mEff < 0, i.e. looking up), and it overflows to inf long before the e0 it multiplies
+// underflows to 0 — inf*0 = NaN, in the one direction an underwater camera spends most of its time
+// looking. Writing e1 from the far end's own depth instead keeps every exp() argument <= 0.
+//
+// r CAN legitimately be zero or negative: looking up, the light gets stronger along the ray, and
+// where that gain exactly cancels the view loss the integrand is CONSTANT. That is a removable
+// singularity, not a divergence, and its limit is the segment length times the (equal) endpoint
+// values.
+//
+// ⚠ W8E MADE r PER-CHANNEL, and that is the one thing to understand before editing this. While the
+// light and the view ran on the SAME sigma_t, the rate factored as sigma_t*(1 + mEff*slant) — a
+// float3 times a SCALAR — so one `abs(q) < eps` branch covered all three channels. With the light on
+// K_d and the view on sigma_t the rate is `sigT + kLight*slant*mEff`, whose channels have different
+// zeros, and a scalar branch would silently fix red while leaving blue on a divide by ~0. Hence the
+// component-wise select below rather than an `if`. It reduces EXACTLY to the old expression when
+// kLight == sigT, which is what the strength lane's 0 publishes.
+//
+// The guard is on the DIMENSIONLESS r*L, not on r: r now carries units (1/world-unit, ~1e-3 here),
+// so a fixed threshold on it would be an arbitrary fraction of the real rate. r*L is what actually
+// governs both the cancellation in (e0 - e1) and the accuracy of the limit.
+float3 waterInscatterSeg(float3 sigT, float3 kLight, float3 tauView, float L,
+                         float dNear, float dFar, float mEff, float slant, bool openEnded)
+{
+    float3 e0 = exp(-kLight * (slant * dNear));
+    // The combined decay per unit of ray: the view beam loses sigT, and the light arriving at
+    // depth(s) = dNear + mEff*s changes at kLight*slant*mEff.
+    float3 r  = sigT + kLight * (slant * mEff);
+
+    if (openEnded) {
+        // L -> infinity: the far end contributes nothing and the integral collapses to its limit.
+        // Only reached looking DOWN into deep water, where mEff >= 0 and therefore r >= sigT; the
+        // floor covers the eye sitting inside the surface's own +-1 unit dead band, where mEff can go
+        // slightly negative for a frame. `0.05*sigT` is the old `max(q, 0.05)` written in the units r
+        // now has, and reduces to it exactly at kLight == sigT.
+        return e0 / max(r, max(0.05f * sigT, float3(1.0e-9f, 1.0e-9f, 1.0e-9f)));
+    }
+
+    float3 e1 = exp(-kLight * (slant * dFar) - tauView);
+
+    // Component-wise removable singularity. `den` is only floored so an exactly-zero r cannot divide;
+    // it never produces a huge quotient, because (e0 - e1) -> 0 on the same channel and at the same
+    // rate, so the ratio stays near its limit e0*L instead of blowing up.
+    float3 sgn = lerp(float3(-1.0f, -1.0f, -1.0f), float3(1.0f, 1.0f, 1.0f), step(0.0f, r));
+    float3 den = sgn * max(abs(r), float3(1.0e-30f, 1.0e-30f, 1.0e-30f));
+    float3 lim = (0.5f * L) * (e0 + e1);
+    return lerp((e0 - e1) / den, lim, step(abs(r * L), float3(1.0e-4f, 1.0e-4f, 1.0e-4f)));
+}
+
+// The phase, from the four+two published lanes. Water is strongly forward-scattering (Petzold's
+// average particle sits near g = 0.92), which is why the ceiling matters: an unclamped forward lobe
+// looking into a low sun is two orders of magnitude above isotropic.
+float waterPhase(float cosT)
+{
+    return phaseDualLobe(cosT,
+                         gShadowParams.waterFogPhase2.x,                                  // pedestal
+                         gShadowParams.waterFogPhase.x, gShadowParams.waterFogPhase.y,    // forward
+                         gShadowParams.waterFogPhase.z, gShadowParams.waterFogPhase.w,    // back
+                         gShadowParams.waterFogPhase2.y);                                 // soft ceiling
+}
+
+// THE COLUMN, as the premultiplied pair every compositor wants:
+//   inscat = the radiance this stretch of water ADDS
+//   trans  = the per-channel factor it MULTIPLIES whatever is behind it by
+// so the composite is always `behind * trans + inscat`, and a caller with nothing behind it simply
+// ignores `trans`.
+//
+// openEnded = "the column never ends" (deep water, no light returning from below). It is a separate
+// argument rather than a huge L because the q ~ 0 limit above is only valid for FINITE L — at
+// L = 1e6 that branch would return half a million times the endpoint value.
+//
+// NOT SHADOWED, deliberately. The sun term uses the unoccluded sun colour, because the analytic form
+// is what buys the exactness above and a shadow term cannot be integrated in closed form. Sampling
+// the shadow map at the FRAGMENT instead would reintroduce precisely the fragment dependence this
+// whole function exists to remove — it would trade a depth silhouette for a shadow silhouette.
+// Fresnel loss at the surface (~6% for the sun at useful angles) is folded into the gain.
+void waterColumn(float3 worldPosRel, float L, bool openEnded, out float3 inscat, out float3 trans)
+{
+    float3 sigT = gShadowParams.waterFogExt.rgb;
+    float3 sigS = gShadowParams.waterFogScatter.rgb;
+    // W8e: the VIEW ray runs on sigma_t and the DOWNWELLING light on K_d. Two coefficients because
+    // they answer two questions — "did this photon leave my line of sight" (yes: scattering counts)
+    // versus "did this photon stop coming down" (no: a forward scatter is still coming down).
+    float3 kLgt = gShadowParams.waterFogKd.rgb;
+
+    float d     = max(length(worldPosRel), 1.0e-4f);
+    // The vertical rate along the ray. This is just -dir.z, and it is worth knowing that it is EXACT
+    // in all four of waterPathLength's cases rather than an approximation of them: dNear + mEff*L
+    // reproduces the fragment's own depth identically whether the ray enters the water, exits it, or
+    // lies wholly inside it. So no case analysis reaches this far — the direction cosine carries it.
+    float mEff  = -worldPosRel.z / d;
+    float dNear = waterFogEyeDepth();
+    float dFar  = max(dNear + mEff * L, 0.0f);
+
+    float3 tauView = sigT * L;
+    trans = openEnded ? float3(0.0f, 0.0f, 0.0f) : exp(-tauView);
+
+    // The refracted sun's path length per unit depth, bounded in [1, 1.512] by the Snell window —
+    // the identical derivation waterLightTransmit spells out, and the identical constants, because
+    // the light reaching a point IN the column and the light reaching a surface UNDER it travelled
+    // the same way down.
+    float cosAir   = abs(gFrameData.sunDir.z);
+    float cosWater = sqrt(max(1.0f - (1.0f - cosAir * cosAir) / (kWaterIOR * kWaterIOR), 0.0f));
+    float slantSun = 1.0f / max(cosWater, kWaterCosCrit);
+
+    float3 iSun = waterInscatterSeg(sigT, kLgt, tauView, L, dNear, dFar, mEff, slantSun,      openEnded);
+    float3 iAmb = waterInscatterSeg(sigT, kLgt, tauView, L, dNear, dFar, mEff, kWaterDiffuse, openEnded);
+
+    float ph = waterPhase(dot(worldPosRel / d, -gFrameData.sunDir.xyz));
+
+    // ⚠ MULTIPLE SCATTERING ISOTROPISES THE PHASE, and leaving that out is what made the deep
+    // background swing with where you were looking: "sky holes ... get brighter or darker than
+    // everything else as I move camera", like a doppler shift.
+    //
+    // At the shipped lobe the phase spans 0.61 (across the sun) to 6.99 (into it) — an 11x range.
+    // On NEAR geometry that barely shows: the pixel is mostly `behind * trans` and the in-scatter is
+    // a small addition. On a SATURATED column it is the entire pixel, so the fill and the far water
+    // swung by an order of magnitude while everything in front of them held still. The mismatch is
+    // not the phase being too strong, it is the phase being applied where it does not apply.
+    //
+    // p(cos) describes ONE scattering event. It is the right answer only while most of the arriving
+    // light has scattered once, i.e. while the SCATTERING optical depth tauS = sigma_s*L is around 1
+    // or less. Past that, light reaching the eye has bounced repeatedly, each bounce multiplying the
+    // residual anisotropy by g again — the diffusion limit, where the radiance field is isotropic and
+    // p -> 1. The fill's column runs tauS ~ 10. It was being handed a first-bounce lobe.
+    //
+    // exp(-tauS) is exactly the single-scattered FRACTION, so it is the weight, not a fitted curve:
+    // near geometry keeps its full sun lobe (tauS ~ 0.2 -> 82% of it), the saturated background goes
+    // isotropic, and the crossover is derived from the medium rather than tuned. openEnded is L ->
+    // infinity, hence no single-scattered fraction at all.
+    //
+    // Note that 1.0 IS isotropic in these units — hgNorm carries the 4pi, so the pedestal and the
+    // lobes are already normalised against an isotropic scatterer of value 1. Nothing is rescaled.
+    //
+    // The strength lane is an A/B, not a knob: `lerp(ph, 1, 0)` is `ph` exactly, so 0 reproduces the
+    // previous build bit for bit.
+    float tauS    = ((sigS.r + sigS.g + sigS.b) * (1.0f / 3.0f)) * L;
+    float wSingle = openEnded ? 0.0f : exp(-tauS);
+    ph = lerp(ph, 1.0f, saturate(gShadowParams.waterFogPhase2.z) * (1.0f - wSingle));
+
+    inscat = sigS * (gFrameData.sunCol.rgb * ph * iSun + gFrameData.ambCol.rgb * iAmb)
+           * gShadowParams.waterFogScatter.w;
+}
+
+// Blend a caller's OWN legacy composite toward the volumetric one.
+//
+// The legacy result is passed IN rather than rebuilt here, and that is not fussiness: each caller
+// spells its fade differently — applyFog has `lerp(behind, target, fog)`, water.frag's underwater
+// branch has `lerp(target, behind, trans)` — and `lerp(a,b,t)` is `a + t*(b-a)`, which is not
+// bit-identical to the same algebra written the other way round. A strength lane whose 0 is only
+// ALMOST the previous image is not an A/B.
+float3 waterFogBlend(float3 legacy, float3 behind, float3 worldPosRel, float2 wf)
+{
+    float volS = gShadowParams.waterFogExt.w;
+    if (volS <= 0.0f) { return legacy; }
+
+    // wf.y is len/d, so this recovers the submerged path length without a second waterPathLength().
+    float L = length(worldPosRel) * wf.y;
+    if (L <= 0.0f) { return legacy; }
+
+    float3 inscat, trans;
+    waterColumn(worldPosRel, L, false, inscat, trans);
+    return lerp(legacy, behind * trans + inscat, volS);
+}
+
+// The whole operation for callers whose legacy spelling IS the canonical one (applyFog).
+float3 waterFogComposite(float3 behind, float3 worldPosRel, float2 wf)
+{
+    return waterFogBlend(lerp(behind, waterFogColor(worldPosRel), wf.x), behind, worldPosRel, wf);
+}
+
+// The column with NOTHING behind it — DEEP water, where no light returns from below. Legacy returns
+// the flat authored target, so this is bit-identical at strength 0.
+//
+// ⚠ PRECONDITION: the eye is ABOVE the surface and looking at it, so the ray descends (mEff >= 0)
+// and the column never ends. That is not an assumption about the caller's intent, it is geometry —
+// you cannot see the top of the water without looking down at it. It matters because the open-ended
+// limit is only finite for q > 0, i.e. only for a descending ray; an ASCENDING one would have to be
+// cut at the surface instead, and passing it through here would divide by the clamp and return a
+// column tens of times too bright. The one state that can violate it is the eye sitting inside the
+// surface's own +-1 unit dead band, where mEff can go slightly negative for a frame; q is then still
+// ~1 and the clamp in waterInscatterSeg never engages. Callers looking UP through water (water.frag's
+// underwater branch) deliberately do NOT use this — see the note at uwFogCol.
+float3 waterFogVeil(float3 worldPosRel)
+{
+    float3 legacy = waterFogColor(worldPosRel);
+    float  volS   = gShadowParams.waterFogExt.w;
+    if (volS <= 0.0f) { return legacy; }
+
+    float3 inscat, trans;
+    waterColumn(worldPosRel, 0.0f, true, inscat, trans);
+    return lerp(legacy, inscat, volS);
+}
+
+// The W8 strength, for callers that have to pick between two spellings rather than blend two
+// results (water.frag's underwater refraction, which under W8 must not be fogged AT ALL).
+float waterFogVolStrength()
+{
+    return gShadowParams.waterFogExt.w;
+}
+
+// Is the camera itself under the surface, with the feature live? The one question callers need that
+// is policy-shaped rather than geometric: below the surface the ENTIRE view ray is in water, so
+// MW's air ramp is not an approximation over the submerged segment, it is a second fog over the
+// same segment — replaced, not composed.
+bool waterFogCameraSubmerged()
+{
+    return waterFogActive() && gShadowParams.waterFogPlane.z > 0.5f;
+}
+
+#endif // WATER_FOG_H

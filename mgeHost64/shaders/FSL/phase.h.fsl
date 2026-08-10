@@ -1,0 +1,47 @@
+// mgeHost64 — scattering PHASE functions, shared by every participating medium.
+//
+// Factored out of volfog.frag.fsl when the water column got its own single-scattering integral
+// (waterfog.h.fsl, W8). Air and water differ in their coefficients and in the geometry of the ray
+// they are integrated over; they do not differ in how a phase function is written, and keeping two
+// copies of Henyey-Greenstein is exactly how two media end up disagreeing about what `g` means.
+//
+// Pure maths — no cbuffer, no texture, no policy. Which lanes drive it belongs to the caller.
+
+#ifndef PHASE_H
+#define PHASE_H
+
+// Henyey-Greenstein, NORMALISED so isotropic == 1.0 (the raw phase integrates to 1 over the sphere;
+// multiplying by 4*pi rescales it so "1" means "no directional preference"). g > 0 pushes scattering
+// forward — the bright halo around the sun; g < 0 pushes it back toward the light, which is the
+// gentler brightening you see looking AWAY from the sun.
+float hgNorm(float cosT, float g)
+{
+    float g2 = g * g;
+    float d  = 1.0f + g2 - 2.0f * g * cosT;
+    return (1.0f - g2) / max(d * sqrt(max(d, 1.0e-4f)), 1.0e-4f);
+}
+
+// THREE terms, because a single HG lobe couples three things that want independent control: the halo
+// around the light, the anti-light brightening, and the SIDE (~90 deg) scattering that is most of
+// what a medium actually reads as. Raising a lone g to get visible side scatter necessarily explodes
+// the forward peak, whose height goes as ~1/(1-g)^2 — 82x isotropic at g = 0.85.
+//
+//     phase = iso + gainFwd * HG_n(cos, gFwd) + gainBack * HG_n(cos, gBack)
+//
+// The pedestal also stands in for MULTIPLE scattering, which single-scattering integrators do not
+// model at all and which is precisely what fills in the side directions in a dense medium. So its
+// natural setting is not 0 but "whatever makes the three gains sum to about 1", i.e. an energy-
+// neutral phase.
+//
+// The soft ceiling applies to the LOBES ONLY — the pedestal is bounded by construction and the halo
+// is what blows out. A hard min() would draw a visible disc edge where it clips; this Reinhard knee
+// asymptotes to `softCeil` instead. softCeil <= 0 = off.
+float phaseDualLobe(float cosT, float iso,
+                    float gFwd, float gainFwd, float gBack, float gainBack, float softCeil)
+{
+    float lobes = gainFwd * hgNorm(cosT, gFwd) + gainBack * hgNorm(cosT, gBack);
+    if (softCeil > 0.0f) { lobes = lobes / (1.0f + lobes / softCeil); }
+    return iso + lobes;
+}
+
+#endif // PHASE_H

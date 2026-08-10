@@ -1,0 +1,87 @@
+// mgeHost64 — THE SCENE'S TRANSFER FUNCTION (FSL ONLY).  tasks/forge-postprocess.md step 5.
+//
+// Everything MW authored — every texel, every vertex colour, every material and light colour — is
+// GAMMA-ENCODED display data. Up to step 5 the renderer multiplied, summed, filtered, blended and
+// resolved those numbers as if they were radiance. They are not, and the one place that finally
+// made it unarguable is bloom: a convolution, and blur(x^(1/g)) != blur(x)^(1/g), so a true 16:1
+// highlight ratio arrives at the blur compressed to ~3.5:1 and the result reads as flat haze rather
+// than as light spilling off something bright.
+//
+// This file is the DECODE/ENCODE MATHS only. scenecolor.h.fsl owns the POLICY — which pass converts
+// what, and the one cbuffer bit that arms it — exactly as tonemap.h.fsl owns the curve while
+// scenecolor.h.fsl says who applies it. The split is not tidiness: resolve.frag has a private SRT,
+// cannot see gShadowParams, and still needs the encode.
+//
+// ─────────────────────────────────────────────────────────────────────────────────────────────────
+// WHY THE PIECEWISE sRGB CURVE AND NOT pow(x, 2.2).
+//
+// Because the TEXTURES are decoded by the hardware, not by us. A `_SRGB` view decodes BEFORE
+// filtering — before bilinear, before anisotropy, before the mip blend — and a shader pow() cannot:
+// it runs after, so it filters in gamma space and then linearises, which is wrong everywhere and
+// VISIBLE on mip transitions. Hardware decode is therefore mandatory, and hardware decode is the
+// piecewise IEC 61966-2-1 curve. Once one operand is decoded that way, every other operand must be
+// too or the domains do not match. So the exact sRGB pair below is the house transfer function, and
+// pow(x, 2.2) appears nowhere.
+//
+// The pair is an EXACT inverse of itself, which is what makes step 5's S1 stage checkable: the
+// resolve ends in linearToSrgb() and every input entered through srgbToLinear(), so any chain that
+// is a pure PRODUCT comes out bit-for-bit unchanged. Only SUMS move — see the algebra note in
+// scenecolor.h.fsl for which ones and by how much.
+// ─────────────────────────────────────────────────────────────────────────────────────────────────
+
+#ifndef LINEARIZE_H
+#define LINEARIZE_H
+
+// sRGB EOTF — display-referred [0,1] -> linear. Bit-identical to what a _SRGB texture view does, so
+// a colour that arrives through a cbuffer lands in the same domain as one that arrives through a
+// texel. Negative inputs are clamped away by the max(); values above 1 continue through the power
+// branch monotonically, which the fitted class-2 lift below relies on.
+float3 srgbToLinear(float3 c)
+{
+    c = max(c, float3(0.0f, 0.0f, 0.0f));
+    float3 lo = c * (1.0f / 12.92f);
+    float3 hi = pow(c * (1.0f / 1.055f) + (0.055f / 1.055f), 2.4f);
+    return lerp(lo, hi, step(float3(0.04045f, 0.04045f, 0.04045f), c));
+}
+
+float srgbToLinear1(float c)
+{
+    c = max(c, 0.0f);
+    float lo = c * (1.0f / 12.92f);
+    float hi = pow(c * (1.0f / 1.055f) + (0.055f / 1.055f), 2.4f);
+    return (c >= 0.04045f) ? hi : lo;
+}
+
+// sRGB OETF — linear -> display-referred. The EXACT inverse of srgbToLinear (round-trip error is
+// float rounding, ~1e-7), which is the whole basis of S1's neutrality gate.
+float3 linearToSrgb(float3 c)
+{
+    c = max(c, float3(0.0f, 0.0f, 0.0f));
+    float3 lo = c * 12.92f;
+    float3 hi = 1.055f * pow(c, 1.0f / 2.4f) - 0.055f;
+    return lerp(lo, hi, step(float3(0.0031308f, 0.0031308f, 0.0031308f), c));
+}
+
+// MW's MODULATE2X, moved into the linear domain.
+//
+// THE ONE FIXED-FUNCTION OP THAT NEEDS A CODE CHANGE. Worked through: with a pure power law,
+// MOD (c *= t) survives decoding both operands EXACTLY — x^g * y^g = (xy)^g — and so does every
+// other multiplicative stage, which is why one shared _SRGB view can serve a bindless array whose
+// role is a runtime `op` bit rather than a property of the texture. MOD2X does not, because the
+// literal 2 is a gamma-space number: doubling a display value is not doubling a radiance.
+//
+// The plan's answer was to replace the literal with 2^g = 4.59. That is right for a pure power law
+// and only approximate for the piecewise curve this file actually uses, where the true ratio
+// srgbToLinear(2t)/srgbToLinear(t) runs from ~3.3 at t=0.1 to ~4.67 at t=0.5 — a constant cannot
+// span that, and a detail-mapped wall is exactly where a wrong constant shows.
+//
+// So double where doubling MEANS something — back in the authored domain — and return. Exact by
+// construction for whatever transfer function this file declares, with no second gamma constant to
+// keep in step. If it ever costs measurably (six transcendentals per MOD2X stage), 4.5948f is the
+// documented cheap substitute; it is not the default because "correct" was available.
+float3 mod2xLinear(float3 tLinear)
+{
+    return srgbToLinear(2.0f * linearToSrgb(tLinear));
+}
+
+#endif // LINEARIZE_H

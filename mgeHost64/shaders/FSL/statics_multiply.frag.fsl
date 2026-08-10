@@ -23,6 +23,9 @@
 // layer's alpha belongs to its own texture, not to the silhouette.
 
 #include "opaque.srt.h"
+#include "tonemap.h.fsl"    // (scenecolor.h.fsl's prerequisite; the curve itself is never called here)
+#include "linearize.h.fsl" // srgbToLinear()/mod2xLinear() — the scene's transfer function (step 5)
+#include "scenecolor.h.fsl" // mod2xStage() — the near path's twin op, in the scene's domain
 
 // MUST stay byte-identical to statics.vert.fsl's VSOutput (shared vertex container — a mismatched
 // frag signature hangs the GPU; see [[project_forge_shared_frag_vsoutput]]). Unused fields stay
@@ -52,10 +55,16 @@ float4 PS_MAIN( VSOutput In )
     // grey-centred, so 0.5 is its neutral value and plain MOD halves the whole window. This is the
     // same op table multimap.frag applies on the near path.
     uint   layerOp = (In.Flags >> 6) & 0x3u;
-    float3 t = (layerOp == 2u) ? tex.rgb * 2.0f : tex.rgb;
+    // Step 5: mod2xStage(), the same helper the near multimap path uses, so a detail-mapped wall
+    // does not change brightness across the DL handoff — the one place this op has a witness.
+    float3 t = (layerOp == 2u) ? mod2xStage(tex.rgb) : tex.rgb;
 
     // Fade the multiplier toward 1.0 (the multiplicative identity) with distance fog, so a fully
     // fogged window is not darkened by its own layers. Fog is the base pass's own interpolator.
+    //
+    // ⚠ THIS PASS WRITES A MULTIPLIER, NOT A COLOUR (scenecolor.h.fsl's fourth, class-less case), so
+    // it takes no decode of its own: a scale factor has no units. It does still need mod2xStage
+    // above, because THAT is about what "twice as bright" means, which is a units question.
     float3 m = lerp(float3(1.0f, 1.0f, 1.0f), t, saturate(In.Fog));
     RETURN(float4(m, 1.0f));
 }

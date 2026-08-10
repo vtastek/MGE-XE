@@ -15,6 +15,7 @@
 
 #include "opaque.srt.h"
 #include "tonemap.h.fsl"    // the curve + its inverse
+#include "linearize.h.fsl" // srgbToLinear()/mod2xLinear() — the scene's transfer function (step 5)
 #include "scenecolor.h.fsl" // liftInPass() — class 2: MW's authored GLOW map (step 6a)
 
 // MUST stay byte-identical to statics.vert.fsl's VSOutput (shared vertex container — a mismatched

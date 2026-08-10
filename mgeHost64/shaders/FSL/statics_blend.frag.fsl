@@ -18,6 +18,7 @@
 // liftInPass() is the one that is inert in LDR and preserves the look under HDR. Closing the
 // divergence with statics.frag is a look change and belongs to whoever wants it, deliberately.
 #include "tonemap.h.fsl"    // the curve + its inverse
+#include "linearize.h.fsl" // srgbToLinear()/mod2xLinear() — the scene's transfer function (step 5)
 #include "scenecolor.h.fsl" // liftInPass() — class 2 (step 6a)
 #include "skydome.h.fsl"   // applyFog() — extinguish into a silhouette, then melt into the SAMPLED sky
 

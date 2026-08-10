@@ -20,6 +20,12 @@
 // as statics.vert (host post-multiplies viewProj by Z_rev before upload). World is the explicit row
 // combination pos*M (W0..W3 = D3DX rows), convention-proof like statics.vert.
 
+// STEP 5 EXCLUSION, deliberate and not an oversight: this pair is `--forge-view` ONLY. It never
+// draws into the live scene target, so there is no linear domain for it to be in and no resolve to
+// encode it back — the viewer composites what these write straight out. Its Tint/AtmoTop/AtmoBot
+// come from the viewer's own sky params, not from MW's weather. If the viewer is ever pointed at
+// the live scene target, this becomes four decodeAuthored() calls (Color.rgb, Tint, AtmoTop,
+// AtmoBot) and nothing else.
 #include "opaque.srt.h"
 
 STRUCT(VSInput)

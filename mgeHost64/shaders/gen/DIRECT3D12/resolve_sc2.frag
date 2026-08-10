@@ -972,7 +972,7 @@ SamplerState gSampler2xWrapClamp : register( s17 , space100 ) ;
 #line 247 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/../../../3rdparty/The-Forge/Common_3/Graphics/FSL/defaults.h"
 
 #line 11 "FSL/shaders.list"
-#line 264 "FSL/shaders.list"
+#line 272 "FSL/shaders.list"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/resolve.frag.fsl"
 #line 37 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/resolve.frag.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/resolve.srt.h"
@@ -990,9 +990,9 @@ STRUCT(ResolveParams)
 
 
     float4 dims;
-#line 103 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/resolve.srt.h"
+#line 114 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/resolve.srt.h"
     float4 opts;
-#line 104
+#line 115
 };
 
         CBUFFER(ResolveParams) gResolveParams :  register(b0,space3);
@@ -1014,13 +1014,47 @@ float3 inverseTonemap(float3 d)
     return (1.0f - s) * (1.7636304f + s * (-0.4027722f + s * 0.4084603f));
 }
 #line 43 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/resolve.frag.fsl"
+#line 46 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/resolve.frag.fsl"
+#line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/linearize.h.fsl"
+#line 39 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/linearize.h.fsl"
+float3 srgbToLinear(float3 c)
+{
+    c = max(c, float3(0.0f, 0.0f, 0.0f));
+    float3 lo = c * (1.0f / 12.92f);
+    float3 hi = pow(c * (1.0f / 1.055f) + (0.055f / 1.055f), 2.4f);
+    return lerp(lo, hi, step(float3(0.04045f, 0.04045f, 0.04045f), c));
+}
+
+float srgbToLinear1(float c)
+{
+    c = max(c, 0.0f);
+    float lo = c * (1.0f / 12.92f);
+    float hi = pow(c * (1.0f / 1.055f) + (0.055f / 1.055f), 2.4f);
+    return (c >= 0.04045f) ? hi : lo;
+}
+
+
+
+float3 linearToSrgb(float3 c)
+{
+    c = max(c, float3(0.0f, 0.0f, 0.0f));
+    float3 lo = c * 12.92f;
+    float3 hi = 1.055f * pow(c, 1.0f / 2.4f) - 0.055f;
+    return lerp(lo, hi, step(float3(0.0031308f, 0.0031308f, 0.0031308f), c));
+}
+#line 82 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/linearize.h.fsl"
+float3 mod2xLinear(float3 tLinear)
+{
+    return srgbToLinear(2.0f * linearToSrgb(tLinear));
+}
+#line 47 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/resolve.frag.fsl"
 
 STRUCT(PsIn)
 {
     DATA(float4, position, SV_Position);
-#line 47
+#line 51
 };
-#line 68 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/resolve.frag.fsl"
+#line 72 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/resolve.frag.fsl"
 float rFilterCubic(float x, float B, float C)
 {
     float y = 0.0f;
@@ -1048,7 +1082,7 @@ float rLuminance(float3 c)
 float4 PS_MAIN(PsIn In): SV_TARGET
 {
     //INIT_MAIN;
-#line 109 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/resolve.frag.fsl"
+#line 113 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/resolve.frag.fsl"
     float2 subOffsets[2] = {
         float2( 0.25f, 0.25f), float2(-0.25f, -0.25f)
     };
@@ -1100,7 +1134,7 @@ float4 PS_MAIN(PsIn In): SV_TARGET
     }
 
     float4 outRgba = sum / max(totalWeight, 1.0e-5f);
-#line 172 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/resolve.frag.fsl"
+#line 176 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/resolve.frag.fsl"
     float aRaw = outRgba.a;
     float3 rgb = outRgba.rgb;
     if (aRaw > 1.0f) { rgb *= 1.0f / aRaw; }
@@ -1109,12 +1143,27 @@ float4 PS_MAIN(PsIn In): SV_TARGET
 
     rgb = max(rgb, float3(0.0f, 0.0f, 0.0f));
     float aOut = saturate(aRaw);
-#line 195 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/resolve.frag.fsl"
+#line 199 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/resolve.frag.fsl"
     if (gResolveParams.opts.y > 0.5f)
     {
-        rgb = tonemap(rgb / max(aOut, 1.0e-4f)) * aOut;
+        float3 straight = rgb / max(aOut, 1.0e-4f);
+
+
+
+
+
+
+
+
+
+
+        if (gResolveParams.opts.w > 0.5f)
+        {
+            straight = linearToSrgb(straight);
+        }
+        rgb = tonemap(straight) * aOut;
     }
 
     return (float4(rgb, aOut));
 }
-#line 265 "FSL/shaders.list"
+#line 273 "FSL/shaders.list"

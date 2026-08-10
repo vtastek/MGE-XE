@@ -251,4 +251,91 @@ STRUCT(ShadowMaskParams)
     // one host write reaches all of them.
     // yzw spare.
     DATA(float4,   toneParams, None);
+    // --- UNIFIED WATER FOG (waterfog.h.fsl, tasks/forge-water.md) --------------------------------
+    // ONE extinction law for the water surface AND for everything submerged under it. Before this
+    // the renderer fogged water three incompatible ways — the surface faded toward the XE depth tint
+    // on a perpendicular depth, the underwater refraction faded toward the atmosphere on a slant
+    // distance, and the seabed itself got MW's per-vertex AIR ramp — so crossing the surface swapped
+    // both the colour and the model, and a submerged rock never matched the water above it.
+    //
+    // waterFogCol: xyz = the fog TARGET, MW's own `UnderwaterColor*w + fogColor*(1-w)` from
+    //                    Morrowind.ini [Water] (LIFTED + DECODED host-side exactly like fogColNear —
+    //                    it is an authored display-referred colour that reaches the target without
+    //                    passing through the curve, so it takes the identical boundary treatment),
+    //              w   = extinction coefficient per WORLD UNIT (the host inverts a readable
+    //                    visibility-distance knob and folds in the time-of-day density).
+    DATA(float4,   waterFogCol,   None);
+    // waterFogPlane: x = ABSOLUTE world Z of the water surface, at the TRUE level (WaterLevel - 1) —
+    //                    the threshold the client's `underwater` bit itself trips at, so .z below and
+    //                    this plane can never disagree about which side the eye is on. Nearly the
+    //                    same quantity volFog4.z carries, and deliberately not shared with it:
+    //                    volFog4.w is CLEARED when the camera submerges (an air-fog march below the
+    //                    surface is meaningless) and this feature needs exactly the opposite,
+    //                y = 1 = water fog ACTIVE this frame (cell has water, knob on) — the receiver's
+    //                    early-out and the A/B, the same "one float disarms every receiver" idiom
+    //                    sunParams.x uses,
+    //                z = 1 = the CAMERA is under the surface (whole view ray is in water),
+    //                w = spare.
+    DATA(float4,   waterFogPlane, None);
+    // --- W7b: absorption on the DOWNWARD LIGHT path (waterfog.h.fsl) -----------------------------
+    // Same medium, same Beer-Lambert law, applied to the light on its way IN rather than to the view
+    // ray on its way out — "absorption is both ways". A submerged surface is therefore dimmer and
+    // bluer because of WHERE IT IS, not because of where the camera is, which is the whole point:
+    // both MW (x0.19..0.35 on sun+ambient) and OpenMW (an underwater fog ramp starting BEHIND the
+    // camera, 60-75% opaque at zero distance) apply a flat, depth-independent, camera-dependent
+    // tint instead. W7a cancels MW's; this replaces it.
+    //
+    // xyz = PER-CHANNEL extinction per world unit for light. Not a second calibration: it is the
+    //       view coefficient (waterFogCol.w) times the spectrum of MW's own [Water] UnderwaterColor,
+    //       read as a transmittance and inverted — sigma = -ln(UnderwaterColor), normalised to unit
+    //       mean so the knob still owns the overall rate and the ini owns only the colour. The
+    //       cross-check that this is the right reading: that normalised spectrum lands within ~6% of
+    //       the tint MW itself applies (measured), so an authored colour and a hand-picked tint agree
+    //       about how fast water eats red.
+    // w   = strength 0..1. 0 = transmittance exactly 1, i.e. bit-identical — the A/B.
+    DATA(float4,   waterFogLight, None);
+    // --- W8: VOLUMETRIC in-scatter (waterfog.h.fsl) ----------------------------------------------
+    // The lanes above describe a medium that only ever REMOVES light. That is why the water colour
+    // had to be authored: with nothing putting light back, there is no colour to derive. Splitting
+    // extinction into its two physical halves is what makes the colour fall out instead of being
+    // picked, and it is the same split that makes the in-scatter a RAY integral rather than a
+    // per-fragment evaluation — see waterfog.h.fsl for the derivation and for why the integral is
+    // closed-form (the depth profile along a straight ray is LINEAR, so the integrand is a single
+    // exponential; volfog has to march only because its density is exponential in height).
+    //
+    // waterFogExt: xyz = TOTAL extinction sigma_t per world unit (absorption + scattering). This is
+    //                    the one spectrum the whole medium runs on: the view beam, the downward sun
+    //                    beam and the ambient path all attenuate by it, so nothing can disagree
+    //                    about how fast water eats red,
+    //              w   = VOLUMETRIC strength 0..1. 0 = the fade-toward-a-target model above,
+    //                    bit-identical, including waterLightTransmit's spectrum (which lerps between
+    //                    waterFogLight.rgb and this one on exactly this lane). The A/B.
+    DATA(float4,   waterFogExt,     None);
+    // waterFogScatter: xyz = SCATTERING coefficient sigma_s per world unit. sigma_s <= sigma_t by
+    //                        construction, and their ratio sigma_s/sigma_t is the single-scattering
+    //                        albedo — which IS the colour of deep water, because that ratio is
+    //                        exactly what an infinitely long ray converges to,
+    //                  w   = in-scatter GAIN. The one calibration constant in the model: the
+    //                        derived colour's HUE matches MW's authored UnderwaterColor to ~8%, but
+    //                        its magnitude does not, because "sun colour" here is a radiance the
+    //                        engine never defined an irradiance for.
+    DATA(float4,   waterFogScatter, None);
+    // waterFogPhase:  x = forward-lobe HG g, y = forward gain, z = back-lobe g (signed), w = back gain
+    DATA(float4,   waterFogPhase,   None);
+    // waterFogPhase2: x = isotropic pedestal (also the stand-in for the multiple scattering a
+    //                     single-scattering integral cannot see — in a medium this dense that is
+    //                     most of the side-scatter),
+    //                 y = phase soft ceiling (Reinhard knee on the lobes),
+    //                 z = multiple-scattering ISOTROPISATION strength, 0..1. The pedestal in .x is a
+    //                     constant; this is the part that has to depend on the PATH, because whether
+    //                     a lobe applies at all is a question about optical depth (waterColumn). 0
+    //                     reproduces the pre-W8d build exactly,
+    //                 w = spare.
+    DATA(float4,   waterFogPhase2,  None);
+    // waterFogKd: xyz = the DIFFUSE attenuation coefficient K_d per world unit, for the DOWNWELLING
+    //                   light path ONLY — how fast the light getting DOWN here dies, which is not how
+    //                   fast a beam ACROSS here dies. w = the A/B strength the host already folded
+    //                   into xyz, published for readout; at 0 the host writes sigma_t here verbatim
+    //                   and every consumer is bit-identical to the pre-W8e build.
+    DATA(float4,   waterFogKd,      None);
 };

@@ -48,10 +48,48 @@
 // also why a class-2 pass gets liftInPass() rather than "just add the tonemap it was missing": the
 // two are the same under HDR but only one of them leaves LDR alone.
 //
-// Requires (include AFTER opaque.srt.h and AFTER tonemap.h.fsl): gShadowParams + tonemap()/
-// inverseTonemap(). The curve itself deliberately stays in tonemap.h.fsl with no SRT dependency,
-// because resolve.frag includes it and cannot see gShadowParams — the maths and the policy are
-// separate files precisely so the resolve can have one without the other.
+// Requires (include AFTER opaque.srt.h, AFTER tonemap.h.fsl and AFTER linearize.h.fsl):
+// gShadowParams + tonemap()/inverseTonemap() + srgbToLinear()/linearToSrgb()/mod2xLinear(). Both
+// maths files deliberately stay free of any SRT dependency, because resolve.frag includes them and
+// cannot see gShadowParams — the maths and the policy are separate files precisely so the resolve
+// can have one without the other. The includes are listed per shader rather than nested here, which
+// is the house convention for .h.fsl and keeps the order visible at each call site.
+//
+// ─────────────────────────────────────────────────────────────────────────────────────────────────
+// STEP 5 — THE SECOND AXIS: WHAT DOMAIN ARE THOSE UNITS IN.
+//
+// 6a answered "how bright" (display-referred vs scene-referred). It did not answer "in what
+// encoding", and the answer was: MW's, i.e. gamma. Step 5 migrates the domain, and the classification
+// above is EXACTLY the right place for it, because the question it already asks — *does this pass
+// reproduce a value MW authored, or does it make one up?* — is the same question the decode asks.
+// Reproduced => it arrived gamma-encoded and must be decoded. Made up => it is already radiance.
+//
+// ONE MORE LANE DECIDES: gShadowParams.toneParams.y, the host's `g_linearScene && sceneReferred`.
+// Same shape, same rule, same reason as toneParams.x — a shader must never re-derive it, and linear
+// rides ON TOP of scene-referred because 8-bit linear bands in the darks and a UNORM target cannot
+// hold what a linear sum overshoots.
+//
+// WHERE THE DECODE ACTUALLY HAPPENS, and it is mostly NOT here:
+//
+//   TEXTURES   — hardware, via _SRGB views (forgerender.cpp's DDS format map). NEVER a shader pow():
+//                the hardware decodes BEFORE filtering and a pow() cannot. See linearize.h.fsl.
+//   CBUFFERS   — host-side, at the single write site (sun/ambient/fog/zenith/light colours). The
+//                fogColNear lift is the established idiom and now composes with it.
+//   VERTEX +
+//   PER-DRAW   — decodeAuthored() in the VERTEX stage. Decode-then-interpolate is the same ordering
+//                rule the hardware follows for texels; decoding in the frag would interpolate in
+//                gamma and linearise after, the exact mistake the _SRGB view exists to prevent.
+//
+// THE ALGEBRA, because it decides what may move. Multiplication commutes with the transfer function
+// and addition does not, so every MODULATING stage is preserved and every SUM is where the migration
+// lives. MOD is exact; MOD2X needs mod2xLinear() (linearize.h.fsl) and is the one op with a code
+// change; ADD moves. The biggest sum in the renderer is `ambient + sun·N·L`, and it moves the most:
+// a 0.4/0.6 pair that summed to 1.0 in gamma sums to 0.458 in linear, ~0.70 once re-encoded. Lit
+// surfaces where two light terms meet therefore DARKEN, and that is not a regression — it is the
+// gamma-space over-brightening that abot's Darkening mod has been cancelling by hand all along
+// (its caveLightnessPerc 42 lands inside the same numbers). Dropping abot and going linear is
+// close to a wash, which is why the plan makes them two separately-measured steps.
+// ─────────────────────────────────────────────────────────────────────────────────────────────────
 
 #ifndef SCENE_COLOR_H
 #define SCENE_COLOR_H
@@ -70,7 +108,52 @@ float3 tonemapInPass(float3 c)
 // was never on screen. Lifting the CLIPPED value reproduces what was actually displayed.
 float3 liftInPass(float3 c)
 {
-    return (gShadowParams.toneParams.x > 0.5f) ? inverseTonemap(c) : c;
+    if (gShadowParams.toneParams.x <= 0.5f) { return c; }
+    // Step 5. The lift's CONTRACT is unchanged — "make the end of the frame hand this authored value
+    // back untouched" — but the end of the frame now runs tonemap(linearToSrgb(x)), so the value that
+    // has to reach it through the encode is inverseTonemap(authored), and the authored value must
+    // first be recovered out of the linear domain this pass is already working in (the texel came
+    // through an _SRGB view; the vertex colour through decodeAuthored). Hence the round trip: encode,
+    // lift, decode. Composition, not a correction — each half is exactly the transform it says.
+    if (gShadowParams.toneParams.y > 0.5f) {
+        return srgbToLinear(inverseTonemap(linearToSrgb(c)));
+    }
+    return inverseTonemap(c);
+}
+
+// ─── Step 5: the domain ──────────────────────────────────────────────────────────────────────────
+
+// Is the scene target LINEAR? For a pass that needs to branch on it structurally. Note this is a
+// cbuffer bit, i.e. wave-uniform but NOT compile-time — DXC will not strip what it guards
+// ([[project_uniform_branch_is_not_free]]), so guard whole blocks, never single instructions.
+bool sceneIsLinear()
+{
+    return gShadowParams.toneParams.y > 0.5f;
+}
+
+// MW authored this colour for a gamma display. Put it in the scene's domain.
+//
+// VERTEX STAGE ONLY for anything interpolated (vertex colours, and the per-draw material lanes that
+// ride the instance stream beside them). Decode-then-interpolate; never the reverse.
+float3 decodeAuthored(float3 c)
+{
+    return (gShadowParams.toneParams.y > 0.5f) ? srgbToLinear(c) : c;
+}
+
+// Scalar twin — MW's per-vertex emissive STRENGTH (distant statics pack it in Normal.w and add it as
+// a grey colour), which is authored on the same display scale as a colour channel and converts the
+// same way. ALPHA NEVER COMES HERE: coverage is not a colour and has no transfer function.
+float decodeAuthored1(float c)
+{
+    return (gShadowParams.toneParams.y > 0.5f) ? srgbToLinear1(c) : c;
+}
+
+// MW's MODULATE2X stage, in whichever domain the scene is in. The literal 2 is a display-space
+// number — see mod2xLinear() in linearize.h.fsl for why a constant cannot replace it under the
+// piecewise curve. `t` is the SAMPLED texel, i.e. already decoded by the _SRGB view when linear.
+float3 mod2xStage(float3 t)
+{
+    return (gShadowParams.toneParams.y > 0.5f) ? mod2xLinear(t) : (t * 2.0f);
 }
 
 #endif // SCENE_COLOR_H

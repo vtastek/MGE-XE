@@ -5326,7 +5326,14 @@ namespace RenderProcess {
             waterParams[8]  = DistantLand::mwView._13;
             waterParams[9]  = DistantLand::mwView._23;
             waterParams[10] = DistantLand::mwView._33;
-            waterParams[11] = 0.0f;
+            // [11] MW's GameHour — the host's unified water fog picks its extinction density from
+            // MW's own [Water] Underwater*Fog time-of-day values, and the host has no clock that
+            // can stand in for this one: FrameData.timeParams.x is sim time wrapped to [0, 12.5)
+            // for a UV scroll and .z is the Glow-in-the-Dahrk margin. This lane was the water
+            // block's reserved slot, so it costs no wire growth — and it belongs here rather than
+            // on a lighting lane because the block is already gated on the cell having water,
+            // which is exactly when a water-fog density matters.
+            waterParams[11] = mw->getGameHour();
         }
 
         // Statics near/far handover: hand the host MW's ACTIVE exterior cell set plus how far

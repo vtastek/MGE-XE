@@ -40,16 +40,12 @@ STRUCT(VSOutput)
     DATA(float2, Uv,       TEXCOORD0);
 };
 
-// Henyey-Greenstein, NORMALISED so isotropic == 1.0 (the raw phase integrates to 1 over the sphere;
-// multiplying by 4*pi rescales it so "1" means "no directional preference"). g > 0 pushes scattering
-// forward — the bright halo around the sun; g < 0 pushes it back toward the light, which is the
-// gentler brightening you see looking AWAY from the sun.
-float hgNorm(float cosT, float g)
-{
-    float g2 = g * g;
-    float d  = 1.0f + g2 - 2.0f * g * cosT;
-    return (1.0f - g2) / max(d * sqrt(max(d, 1.0e-4f)), 1.0e-4f);
-}
+// hgNorm() now lives in phase.h.fsl, which arrives via skydome.h.fsl -> waterfog.h.fsl above. It
+// moved there UNCHANGED (so this pass's output is byte for byte what it was) when the water column
+// grew its own single-scattering integral and needed the same function: air and water differ in
+// their coefficients, not in what `g` means, and two copies is how that stops being true.
+// This pass keeps combining the terms itself rather than calling phaseDualLobe — its pedestal is a
+// separate COLOUR with a separate shadow response, not a third term of one phase.
 
 ROOT_SIGNATURE(DefaultRootSignature)
 float4 PS_MAIN(VSOutput In)
