@@ -92,6 +92,46 @@ namespace MGE::GeometryCache {
         // NiAlphaProperty blend-function index (Gamebryo order) -> D3DBLEND. Defined with the
         // moon support below; forward-declared so extractMaterial can translate sky blend modes.
         D3DBLEND niBlendToD3D(unsigned int ni);
+
+        // NiAlphaProperty (testFunc, testRef) -> the ONE predicate the host implements: keep a
+        // fragment iff `alpha >= alphaRef` (a2c.h.fsl, depthonly*.frag, multimap*.frag all share
+        // it, and the Z-prepass/colour CMP_EQUAL parity depends on them agreeing). MW's test is a
+        // full D3D comparison function, so the property has to be TRANSLATED, not copied.
+        //
+        // GREATER is the whole point. `a > R` and `a >= R+1` select the same texels for 8-bit
+        // source alpha, so GREATER is exactly representable — but only if the +1 is applied.
+        // Skipping it is invisible at any R >= 1 (a 1/255 shift in the cutout threshold) and
+        // TOTAL at R == 0: `a >= 0` is always true, so the test evaporates and a cutout card
+        // renders as a solid quad. `GREATER 0` — "discard only the fully transparent texels" — is
+        // an ordinary authoring idiom, not an edge case: a census of 43977 meshes
+        // (tools/nif-alpharef-census.py) finds 661 properties using it, 55 of them unblended and
+        // so landing on the OPAQUE path. in_cave_plant00.nif is one (a loose override that
+        // retunes vanilla's 0x00ED BLEND to 0x12EC TESTREF); MGE's own OAAB market stalls and
+        // grass are others.
+        //
+        // This is the same rule renderprocess.cpp:6339 already applies on the captured-alpha path
+        // (`rs->alphaFunc == D3DCMP_GREATER ? 1 : 0`), which reads the live D3D8 device state. It
+        // was simply never carried across to the scene-graph PROPERTY path. Gamebryo's test-func
+        // enum is D3DCMP-1, so the two are the same list read from different sources.
+        //
+        // Everything else collapses to "no test" (0). ALWAYS genuinely means that. LESS / EQUAL /
+        // LEQUAL / NOTEQUAL are not one-sided thresholds and cannot be expressed here at all —
+        // today they are silently run as GEQUAL, which INVERTS what LESS asked for; drawing the
+        // whole surface is the honest failure. 54 properties across the census, none of them
+        // unblended. NEVER (draw nothing) is unrepresentable for the same reason and unattested.
+        float niAlphaTestRef(unsigned short flags, unsigned char testRef) {
+            if ((flags & NI::AlphaProperty::TEST_ENABLE_MASK) == 0) { return 0.0f; }
+            const unsigned func = (flags & NI::AlphaProperty::TEST_FUNC_MASK)
+                                >> NI::AlphaProperty::TEST_FUNC_POS;
+            switch (func) {
+            case 4:  // TEST_GREATER      keep a > R   ==  keep a >= R+1 (8-bit alpha)
+                return (testRef >= 255) ? 1.0f : (float)(testRef + 1) / 255.0f;
+            case 6:  // TEST_GREATEREQUAL keep a >= R  ==  the host predicate verbatim
+                return (float)testRef / 255.0f;
+            default: // ALWAYS, and the four we cannot express
+                return 0.0f;
+            }
+        }
         uint32_t          g_uploadedThisFrame  = 0;
         uint64_t          g_uploadedInterval   = 0; // cumulative over log interval
         uint32_t          g_walkSerial         = 0; // ++ per onFrameReady (reship-streak probe)
@@ -909,7 +949,11 @@ namespace MGE::GeometryCache {
                 const auto* ap = ps->alpha;
                 e.alphaTest   = (ap->flags & NI::AlphaProperty::TEST_ENABLE_MASK) != 0;
                 e.blendEnable = (ap->flags & NI::AlphaProperty::ALPHA_MASK) != 0;
-                e.alphaRef    = ap->alphaTestRef / 255.0f;
+                // TRANSLATED, not copied — see niAlphaTestRef. alphaTest stays the raw
+                // TEST_ENABLE bit: it answers "does this shape carve holes with its texture
+                // alpha", which is a statement about authoring intent that kSkinFlagAlphaTest
+                // needs even when the function itself is one we drop to 0.
+                e.alphaRef    = niAlphaTestRef(ap->flags, ap->alphaTestRef);
                 // Sky blend factors (same translation the moon path uses).
                 e.srcBlend  = static_cast<unsigned char>(niBlendToD3D(
                     (ap->flags & NI::AlphaProperty::SRC_BLEND_MASK)  >> NI::AlphaProperty::SRC_BLEND_POS));
