@@ -5300,7 +5300,8 @@ namespace RenderProcess {
         // Water.fx:24 using available DistantLand colours as the skyCol/fogColFar proxies; windFactor
         // is a calm constant (windVec isn't exposed to MGE — tune later). camFwd = mwView's 3rd column
         // (world-space view forward) for the slant→perpendicular shoreline depth correction.
-        float waterParams[12] = {};
+        // ⚠ MUST match bridge.h's waterParams[] exactly — client.cpp memcpy's sizeof(destination).
+        float waterParams[14] = {};
         // CellHasWater: waterless interiors (most of them) must not draw the host water —
         // MGE's own water path always gated on this and the Forge crossing lost it, so the
         // host drew the geo-clipmap at a stale WaterLevel() in dry cells. Per-frame cell
@@ -5334,6 +5335,19 @@ namespace RenderProcess {
             // on a lighting lane because the block is already gated on the cell having water,
             // which is exactly when a water-fog density matters.
             waterParams[11] = mw->getGameHour();
+            // [12]/[13] R1 impulse ripples: MW's own live precipitation counters. The engine ramps
+            // these across a weather TRANSITION, which is the whole reason to read them rather than
+            // the weather TYPE — a type is a step and rain arriving as a step looks like a bug.
+            // Sent RAW; the host maps count -> density, because the reference count can only be
+            // found by watching a real storm with the dev panel open.
+            // Zeroed in interiors: the counters are exterior-only state and a stale one would rain
+            // indoors, which is exactly the class of bug [[project_forge_interior_stale_terrain]]
+            // was — an ungated lane still reporting the last exterior frame.
+            MWBridge::WeatherState ws;
+            if (mw->IsExterior() && mw->getWeatherState(ws)) {
+                waterParams[12] = (float)ws.rainParticles;
+                waterParams[13] = (float)ws.snowParticles;
+            }
         }
 
         // Statics near/far handover: hand the host MW's ACTIVE exterior cell set plus how far

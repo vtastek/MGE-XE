@@ -113,6 +113,11 @@ float4 PS_MAIN( VSOutput In )
     // gate makes that unreachable instead of relying on the mesh never doing it.
     // No legacy term: this pass never had a water fade, so W8 strength 0 must leave it untouched,
     // which is exactly what waterFogBlend does when handed its own input as the legacy value.
+    //
+    // ⚠ A Snell-bounded path length (L = eyeDepth / max(dir.z, kWaterCosCrit)) was tried here and
+    // REVERTED 2026-08-10: it did brighten the below-horizon ring, but it moved objects off the state
+    // the fog fix had just got right and it did not touch the reported dim sky, because the dim sky
+    // is MW's own weather state going underwater and the client copying it — not a path length.
     if (waterFogCameraSubmerged()) {
         float3 skyRel = normalize(In.WorldDir) * 1.0e5f;
         c.rgb = waterFogBlend(c.rgb, c.rgb, skyRel, waterFogSample(skyRel));

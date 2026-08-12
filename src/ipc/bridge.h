@@ -380,8 +380,14 @@ namespace IPC {
         //   [1] windFactor                         [7] underwater (0/1)
         //   [2] shoreDepthBias                     [8..10] camFwd.xyz (world view forward)
         //   [3..5] depthBaseColor.rgb              [11] MW GameHour (unified water fog's ToD density)
-        // Appended after debugMode so every existing field offset is unchanged.
-        IN float waterParams[12];
+        //   [12] rainParticles   [13] snowParticles — R1 impulse-ripple rate. RAW engine counters,
+        //        deliberately not a 0..1 density: the host owns the mapping so its reference count
+        //        can be dialled in the dev panel against real weather, which is the only place the
+        //        number can honestly be found ([[feedback_prior_art_constants_dont_transfer]]).
+        // ⚠ GROWING THIS ARRAY MOVES EVERY FIELD BELOW IT. There is no protocol version or size
+        // assert on this struct, so a client/host pair built from different revisions of it will
+        // silently read garbage from devMouseX down. mgecore.dll and mgeHost64.exe ship together.
+        IN float waterParams[14];
         IN std::uint32_t waterEnabled;
 
         // Dev overlay input bridge (Stage 2): the headless host has no window/InputSystem, so the

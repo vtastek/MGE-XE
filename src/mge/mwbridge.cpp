@@ -408,6 +408,129 @@ const RGBVECTOR* MWBridge::getCurrentWeatherFogCol() {
 
 //-----------------------------------------------------------------------------
 
+// W10 — see the header for why the whole struct is read and where the offsets come from.
+// eWthrArray is arrayWeathers (WeatherController+0x14), so the controller base is 0x14 back.
+bool MWBridge::getWeatherState(WeatherState& out) {
+    out = WeatherState{};
+    out.curWeather = out.nextWeather = -1;
+    if (!m_loaded) {
+        return false;
+    }
+    const DWORD wc = eWthrArray - 0x14;
+
+    const DWORD cur  = read_dword(wc + 0x3c);
+    const DWORD next = read_dword(wc + 0x40);
+    if (cur == 0) {
+        // No live weather (interior with no sky, or before the world exists). Everything
+        // below would read a null deref, and a caller that logs -1 learns the right thing.
+        return false;
+    }
+    out.curWeather  = read_byte(cur + 0x04);
+    out.nextWeather = next ? (int)read_byte(next + 0x04) : out.curWeather;
+    out.transition  = read_float(wc + 0x170);
+
+    out.skyCol = *(const RGBVECTOR*)(wc + 0x90);
+    out.fogCol = *(const RGBVECTOR*)(wc + 0x9c);
+    out.uwCol  = *(const RGBVECTOR*)(wc + 0x1b4);
+    out.uwWeight = read_float(wc + 0x1c0);
+    for (int i = 0; i < 5; ++i) {
+        out.uwFog[i] = read_float(wc + 0x1a0 + 4 * i);
+    }
+
+    out.thunderFlash   = read_float(wc + 0x178);
+    out.rainParticles  = (int)read_dword(wc + 0x13c);
+    out.snowParticles  = (int)read_dword(wc + 0x140);
+    out.sunglareVis    = read_float(wc + 0xd0);
+    out.sunOccluded    = read_byte(wc + 0x1ec) != 0;
+    out.uwSoundState   = read_byte(cur + 0x20d) != 0;
+
+    out.cloudsMaxPercent = read_float(cur + 0xf0);
+    out.landFogDay       = read_float(cur + 0xf4);
+    out.landFogNight     = read_float(cur + 0xf8);
+    out.cloudsSpeed      = read_float(cur + 0xfc);
+    out.windSpeed        = read_float(cur + 0x100);
+    out.cloudTexture     = reinterpret_cast<const char*>(cur + 0x104);   // inline char[260]
+
+    out.triAtmosphere    = reinterpret_cast<void*>(read_dword(wc + 0x7c));
+    out.triCloudsCurrent = reinterpret_cast<void*>(read_dword(wc + 0x80));
+    return true;
+}
+
+//-----------------------------------------------------------------------------
+
+// R0 — MW's live ripple pool. See the header for the offsets and their MWSE provenance.
+//
+// The NI offsets used here are AVObject's: worldTransform at 0x40 (Matrix33 0x24 + Point3 0x0c +
+// float scale), so world translation is +0x64 and world scale +0x70. NI::TimeController's clock is
+// lastScaledTime 0x24 against lowKeyFrame 0x14 / highKeyFrame 0x18.
+bool MWBridge::getRippleState(RippleState& out, RippleSource* sources, int max) {
+    out = RippleState{};
+    if (!m_loaded) {
+        return false;
+    }
+    const DWORD dh = read_dword(eEnviro);
+    if (dh == 0) {
+        return false;
+    }
+    const DWORD wtc = read_dword(dh + 0xb4ec);
+    if (wtc == 0) {
+        return false;
+    }
+
+    out.poolSize      = (int)read_dword(wtc + 0x50);
+    out.lifetime      = read_float(wtc + 0x34);
+    out.scaleBegin    = read_float(wtc + 0x38);
+    out.scaleEnd      = read_float(wtc + 0x3c);
+    out.alphas[0]     = read_float(wtc + 0x40);
+    out.alphas[1]     = read_float(wtc + 0x44);
+    out.alphas[2]     = read_float(wtc + 0x48);
+    out.rotSpeed      = read_float(wtc + 0x4c);
+    out.rippleTexture = reinterpret_cast<const char*>(read_dword(wtc + 0x08));
+    out.rippleNode    = reinterpret_cast<void*>(read_dword(wtc + 0xb0));
+
+    const DWORD pool = read_dword(wtc + 0x54);
+    if (pool == 0 || out.poolSize <= 0) {
+        return true;   // controller exists, pool not built yet — not a failure
+    }
+    // Sanity bound on a value that comes from an ini (MaxNumberRipples): a garbage pool size
+    // would walk arbitrary memory. 4096 is far above anything MW ships and still cheap.
+    const int n = (out.poolSize > 4096) ? 4096 : out.poolSize;
+
+    for (int i = 0; i < n; ++i) {
+        const DWORD r = pool + 0x0c * (DWORD)i;
+        if (read_byte(r + 0x08) == 0) {
+            continue;                       // Ripple::isActive
+        }
+        out.activeInPool++;
+        const DWORD shape = read_dword(r + 0x00);
+        if (shape == 0 || !sources || out.count >= max) {
+            continue;
+        }
+        RippleSource& s = sources[out.count];
+        s.x     = read_float(shape + 0x64);   // worldTransform.translation.x
+        s.y     = read_float(shape + 0x68);
+        s.scale = read_float(shape + 0x70);   // worldTransform.scale
+        // Age from the controller's own clock. Absent controller or a degenerate key range
+        // reports 0 rather than a divide — "just spawned" is the safe reading for a ripple
+        // we can see in the pool but cannot time.
+        s.age = 0.0f;
+        const DWORD ctrl = read_dword(r + 0x04);
+        if (ctrl) {
+            const float lo = read_float(ctrl + 0x14);
+            const float hi = read_float(ctrl + 0x18);
+            const float t  = read_float(ctrl + 0x24);
+            if (hi > lo) {
+                const float a = (t - lo) / (hi - lo);
+                s.age = (a < 0.0f) ? 0.0f : (a > 1.0f ? 1.0f : a);
+            }
+        }
+        out.count++;
+    }
+    return true;
+}
+
+//-----------------------------------------------------------------------------
+
 DWORD MWBridge::getScenegraphFogCol() {
     DWORD addr = read_dword(eEnviro) + 0x9c;
     addr = read_dword(addr) + 0x1c;

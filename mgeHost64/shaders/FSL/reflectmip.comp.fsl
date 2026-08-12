@@ -26,9 +26,20 @@
 // the box did. A plain 4-tap box is NOT the alternative: it nulls exactly at 0.25 but passes 0.271
 // at 0.375, i.e. it is better precisely where it does not matter and worse where it does.
 //
-// ⚠ This CANNOT fix aliasing that is already in mip 0 — pReflectColor is rendered SAMPLE_COUNT_1
-// (no MSAA), so the mirror's geometric edges arrive aliased and no reduce can unfold them. If shimmer
-// survives this change, that is the remaining cause and it lives in the reflect PASS, not here.
+// ⚠ This CANNOT fix aliasing that is already in mip 0. W5 later made pReflectColor MSAA (see the RT
+// creation block), so the mirror's geometric edges are now resolved rather than sampled once — but
+// the resolve is the FIRST variant below, and anything it gets wrong is likewise unreachable from
+// here. If shimmer survives, look at the reflect PASS and at that resolve, not at this reduce.
+//
+// ⚠ THE RESOLVE IS UNWEIGHTED, AND THAT IS AN HDR GAP. resolve.frag (the MAIN colour path) weights
+// each sample by the Karis factor 1/(1 + luma) precisely because scene-referred luma is unbounded, so
+// one sample of the sun disc landing in a 4-sample pixel otherwise contributes a quarter of a huge
+// number and the pixel becomes a firefly. The plain average below has no such term. While the scene
+// was display-referred that was nearly harmless (samples ≤ 1, weights would have spanned only
+// 1.0..0.5); scene-referred it is not, and the tent reduce then SPREADS each firefly down the
+// pyramid, i.e. onto exactly the rough water that samples the low mips. Not fixed here yet because
+// the weighting changes the reflected image and wants its own A/B — water debug bit 17 (the HDR range
+// view) is the instrument for it.
 //
 // ⚠ ALL FOUR CHANNELS, IDENTICAL WEIGHTS. The source is premultiplied — see reflectmip.srt.h for
 // why an alpha-weighted average is a dark fringe along the reflected horizon rather than an

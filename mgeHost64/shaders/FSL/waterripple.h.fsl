@@ -1,0 +1,295 @@
+#ifndef WATERRIPPLE_H
+#define WATERRIPPLE_H
+
+// mgeHost64 — R1: IMPULSE RIPPLES (rain, snow, and — next — MW's actor ripple pool).
+//
+// The reference is GDC2003 "Physically-Based Simulation on GPUs" (Harris), which did this with a
+// ping-pong texture and an explicit finite-difference wave equation. That is the quality bar, not
+// the method, and this clears it without simulating a grid at all:
+//
+//  1. A GRID CANNOT DEGRADE. Beyond the distance where one texel is a pixel, a sampled height field
+//     aliases and no mip chain saves it, because the aliasing is in the SIMULATION's own resolution.
+//     Everything here is closed form, so its sub-pixel content converts to slope VARIANCE and
+//     becomes roughness instead of crawl — the same LEAN/CLEAN accounting water.frag already does
+//     for the wave field. See the `res` split in ripplePacket().
+//  2. A GRID HAS A DOMAIN that has to follow the camera, which means resampling the field against
+//     itself every frame and smearing the structure being simulated.
+//  3. A GRID IS ANISOTROPIC. The discrete Laplacian's phase velocity depends on direction, so waves
+//     run faster along the axes than the diagonals and rings slowly turn into squares.
+//
+// THE MODEL — a RIGID TRAVELLING WAVE PACKET whose amplitude is a function of RADIUS, not of time:
+//
+//     s   = r - c*t                          signed distance from the packet centre
+//     win = 0.5 * (1 + cos(pi * s / W))      |s| <= W, zero value AND zero slope at the edges
+//     h   = A(r) * win(s) * cos(k * s)
+//
+// Two properties, and both are load-bearing:
+//
+//  - THE PHASE IS LOCKED TO `s`, not to r and t separately, so the crests travel WITH the envelope.
+//    The packet moves rigidly rather than having waves march through it.
+//  - THE FADE IS A FUNCTION OF r, AND THAT IS WHY THE RINGS DIE ONE AFTER ANOTHER. Every crest rides
+//    the same curve of its OWN radius, so each one dies at exactly the place the ring ahead of it
+//    died, one wave period later. A fade in TIME — which is what this used to be — multiplies the
+//    whole train by a single number, so every ring in the packet vanishes on the same frame and the
+//    ripple reads as a shape being switched off instead of as water going still.
+//    A(r) is exactly zero at r = rDie, so rDie is also the packet's hard reach; see the 3x3 note.
+//
+// ⚠ SPEED IS CONSTANT AND THE SLOWING DOWN IS AN ILLUSION. Settled — do not add a deceleration term
+// back. For a FIXED wavelength the group velocity 0.5*sqrt(g/k) does not change, so a real ripple of
+// one wavelength never slows. Two things make it look like it does, and both fall out of the model
+// above for free: the amplitude decays with distance travelled, so the leading ring stalls out
+// perceptually as it drops below the eye's threshold; and a constant-speed ring's RELATIVE growth
+// rate (dr/dt)/r = 1/t falls off, which is how expansion actually gets judged. An earlier revision
+// had an explicit exponential deceleration knob standing in for both. It is deleted.
+//
+// ⚠ THIS ALSO REPLACED A DISPERSIVE CHIRP, AND THAT REPLACEMENT IS DELIBERATE. The first model was
+// the far-field Cauchy-Poisson solution — the analytic answer for a real impulse on deep water — in
+// which the local wavenumber k = g t^2 / (4 r^2) VARIES across the ring, long waves leading and
+// short ones trailing. It is more physical and it looked wrong: at any instant the ring contained
+// every wavelength at once, so it read as a broad smear rather than as a ripple, and its size was
+// pinned by the longest wave rather than by anything art-directable. A fixed-wavelength packet is
+// what a small ripple actually LOOKS like, and it makes size, wavelength and crest count three
+// independent knobs. Recorded rather than deleted quietly, because "more physical" lost to "correct
+// on screen" here and that is worth knowing before anyone re-derives the chirp.
+
+// One packet's contribution at radius r. Height is not returned because nothing consumes it — the
+// water surface takes a slope, and the slope is what has an exact closed form here.
+//   r         world distance from the impulse centre
+//   rc        current packet-centre radius (c * t; c is constant)
+//   W         packet half-width
+//   k         wavenumber (2*pi / lambda)
+//   slopeAmp  PEAK SURFACE SLOPE at r = 0. Not an impulse strength: h is scaled by 1/k so this reads
+//             directly as a slope, the only quantity a normal-perturbing field needs a number for.
+//   fade      the radial amplitude law, precomputed once per pixel because it is the same for every
+//             cell: (1/rDie, decay, exp(-decay), 1/(1 - exp(-decay))).
+//   fp        pixel footprint radius ALONG THIS PACKET'S RADIAL DIRECTION — see the caller
+// `res` splits the answer: the resolved part tilts the normal, the rest becomes roughness. They are
+// two halves of one quantity, so anything scaling one must scale the other.
+void ripplePacket(float r, float rc, float W, float k, float slopeAmp, float4 fade, float fp,
+                  out float dhdrOut, out float varOut)
+{
+    dhdrOut = 0.0f; varOut = 0.0f;
+    float s = r - rc;
+    float u = r * fade.x;                                     // radius as a fraction of rDie
+    if (abs(s) >= W || u >= 1.0f || W <= 0.0f || k <= 0.0f) { return; }   // the common case
+
+    // A(r): exponential in the ring's OWN radius, normalised to 1 at r=0 and pinned to EXACTLY 0 at
+    // r = rDie. The subtraction is what pins it — a bare exp() never reaches zero, so the ring would
+    // still be carrying amplitude when it hit the end of its reach and would pop off.
+    // (The VALUE is pinned; dEnv is not, so dh/dr has a step of hA*dEnv*win at exactly r = rDie. It
+    // only exists in the last moments of a packet's life, where the amplitude is already at e^-decay
+    // of nothing — order 1e-3 of a slope, i.e. hundredths of a degree. Left alone knowingly.)
+    float e    = exp(-fade.y * u);
+    float env  = (e - fade.z) * fade.w;
+    float dEnv = -fade.y * fade.x * e * fade.w;
+
+    float x    = 3.14159265f * s / W;
+    float win  = 0.5f * (1.0f + cos(x));
+    float dwin = -0.5f * (3.14159265f / W) * sin(x);
+    float ks   = k * s;
+    float c    = cos(ks);
+    float sn   = sin(ks);
+
+    float hA   = slopeAmp / k;                                // makes the peak of dh/dr equal slopeAmp
+    // Product rule over all three factors. dEnv is small next to k (its ratio is decay*lambda /
+    // (2*pi*rDie), a few percent at the defaults) but it is the term that makes the outer crests
+    // weaker than the inner ones within a single packet, so it is not droppable.
+    float dhdr = hA * (env * (dwin * c - k * win * sn) + dEnv * win * c);
+
+    // RESOLVED vs UNRESOLVED. A footprint of radius fp cannot carry a wave whose half-wavelength is
+    // smaller than it — the Nyquist condition is k*fp < pi. Below that the oscillation is real but
+    // cannot be shape, and its slope has to go to roughness or it aliases. A sinusoid of slope
+    // amplitude a has mean-square slope a^2/2.
+    float res  = 1.0f - smoothstep(1.5f, 3.14159265f, k * fp);
+    dhdrOut    = dhdr * res;
+    float sAmp = slopeAmp * win * env;
+    varOut     = 0.5f * sAmp * sAmp * (1.0f - res * res);
+}
+
+// --- integer hash, for the procedural rain field ------------------------------------------------
+// Deterministic in the CELL, so a ripple stays put in the world while the camera moves — the whole
+// reason this is a hash and not a random number generator.
+//
+// ⚠ THE CYCLE INDEX IS AN INPUT, and it is what stops the field being a visible loop. Hashing on the
+// cell ALONE puts every one of that cell's ripples at the same spot forever, so a fixed lattice of
+// points blinks on and off in place. Re-rolling position, timing, wavelength, crest count and even
+// whether the cell fires at all on each cycle means the only thing the cell decides is a density.
+float4 rippleHash4(int2 cell, int cyc)
+{
+    uint3 p = uint3(uint(cell.x + 32768), uint(cell.y + 32768), uint(cyc + 1));
+    uint  n = p.x * 1597334677u ^ p.y * 3812015801u ^ p.z * 2654435761u;
+    n ^= n >> 15; n *= 2246822519u;
+    n ^= n >> 13; n *= 3266489917u;
+    n ^= n >> 16;
+    uint4 q = uint4(n, n * 1664525u + 1013904223u,
+                    n * 22695477u + 1u, n * 134775813u + 1u);
+    q.y ^= q.y >> 15; q.z ^= q.z >> 15; q.w ^= q.w >> 15;
+    return float4(q & uint4(0xFFFFFFu, 0xFFFFFFu, 0xFFFFFFu, 0xFFFFFFu)) * (1.0f / 16777216.0f);
+}
+
+// --- RAIN / SNOW: a procedural impulse field, not a particle system -----------------------------
+//
+// Precipitation is thousands of impulses. Enumerating them is the wrong shape — the count is
+// unbounded and the CPU has no reason to know about any of them. Instead world XY is tiled and each
+// cell deterministically owns `slots` impulses per cycle: hashed sub-cell position, hashed start
+// time, hashed wavelength and crest count. A fragment evaluates its 3x3 neighbourhood, so the cost
+// is 9*slots packets per pixel and constant no matter how hard it rains. DENSITY is then cell size,
+// slot count and a per-slot probability, all continuous — which is what lets a weather TRANSITION
+// ramp the rain instead of stepping it.
+//
+// ⚠ 3x3 IS EXACT, NOT AN APPROXIMATION, AND THE BOUND IS rDie <= cellSize. A packet is zero wherever
+// A(r) is zero, so its whole disturbance lives inside rDie of its centre whatever the window does —
+// the reach no longer depends on the wavelength at all. The tightest case is a fragment at the far
+// edge of its own cell and an impulse at the near edge of the cell just OUTSIDE the 3x3: exactly one
+// cell apart. Anything larger would silently truncate packets at the neighbourhood edge, which is a
+// hard discontinuity in the normal, so the clamp is enforced here rather than trusted to the UI.
+//
+//   p        world XY of the fragment
+//   phase    the cell cycle counter, INTEGRATED host-side and wrapped at cyclesPerWrap. Not derived
+//            from a clock: `period` is live (density drives it), and phase = time/period would jump
+//            the whole field every time it moved.
+//   cellSize world units per cell        period   seconds per cell cycle, CURRENT value
+//   life     seconds ONE ripple lasts (< period leaves dead time — see the note at uStart)
+//   slots    independent impulses each cell may fire per cycle; a pure RATE multiplier
+//   density  0..1 chance a given SLOT fires in a given cycle
+//   slope    peak surface slope at the impulse centre
+//   lamMin/lamMax   per-ripple wavelength range, world units
+//   radiusMax       the radius every ring dies at (clamped to cellSize)
+//   decay    how fast amplitude falls off over that radius; higher = the rings stop looking like
+//            they are travelling sooner, and the ripple's visible extent shrinks
+//   fpEll    the pixel's world footprint ELLIPSE, (minor^2, major^2, majorDir.xy) — the SQUARES,
+//            which is exactly the form the per-packet projection below wants
+// Returns slope in .xy (dh/dx, dh/dy) and accumulated variance in .z.
+float3 rainRipples(float2 p, float phase, float cellSize, float period, float life,
+                   float density, float slots, float slope, float lamMin, float lamMax,
+                   float radiusMax, float decay, float cyclesPerWrap, float4 fpEll)
+{
+    float3 acc = float3(0.0f, 0.0f, 0.0f);
+    if (density <= 0.0f || slope <= 0.0f || cellSize <= 0.0f || period <= 0.0f || life <= 0.0f) {
+        return acc;
+    }
+
+    float  inv      = 1.0f / cellSize;
+    int2   base     = int2(floor(p * inv));
+    float  lifeFrac = min(life / period, 1.0f);
+    float  N        = max(cyclesPerWrap, 1.0f);
+    int    slotsI   = max(int(slots + 0.5f), 1);   // cbuffer -> wave-uniform loop bound
+
+    // The radial amplitude law. Uniform across the 3x3, so it is built once. `decay` is floored
+    // rather than branched: at 0.01 the exponential is linear to within a rounding error, so the
+    // degenerate case falls out of the same expression instead of needing a second one.
+    float  rDie     = max(min(radiusMax, cellSize), 1e-3f);
+    float  dcy      = max(decay, 0.01f);
+    float  eEnd     = exp(-dcy);
+    float4 fade     = float4(1.0f / rDie, dcy, eEnd, 1.0f / (1.0f - eEnd));
+
+    for (int j = -1; j <= 1; ++j) {
+        for (int i = -1; i <= 1; ++i) {
+            int2   cell = base + int2(i, j);
+
+            // Per-CELL and cycle-stable: a phase offset only. Without it every cell shares the same
+            // cycle boundary, and since a ripple can never span one, the whole surface would go quiet
+            // at the same instant — a global pulse at 1/period Hz.
+            float4 hc = rippleHash4(cell, -1);
+
+            // ⚠ SLOTS EXIST BECAUSE DEAD TIME IS A RATE TAX. The dead time below is what stops a
+            // cell blinking in place, but with one impulse per cycle it also throttles the field to
+            // life/period of the rate the cell density implies — at 1.5s in 5s that is a third, and
+            // rain reads as occasional plops rather than rain. Slots decouple the two: each slot
+            // keeps its own dead time and its own hashed position, so the decorrelation is untouched
+            // while the rate multiplies. It is also the cheap way to buy rate. The alternative —
+            // smaller cells — shrinks rDie with them (the 3x3 bound is rDie <= cellSize) and then
+            // needs a wider neighbourhood to get the size back, which costs a phase hash and a cell
+            // iteration each, where a slot costs one hash.
+            for (int m = 0; m < slotsI; ++m) {
+                // ⚠ EACH SLOT GETS ITS OWN CYCLE BOUNDARY, EVENLY SPREAD. Without the m/slots term
+                // the slots share one boundary and are separated only by uStart, which is scaled by
+                // (1 - lifeFrac) — so the instant dead time reaches zero, uStart collapses to 0 and
+                // all of a cell's slots fire on the SAME frame and die on the same frame. The cell
+                // then bursts and goes quiet instead of trickling. That is not hypothetical: heavy
+                // rain drives period to its floor, life clamps to period, and lifeFrac hits exactly
+                // 1 — i.e. the collapse happens precisely when the field is most visible. Staggering
+                // the boundaries makes slots an INTERLEAVED rate multiplier at every dead time,
+                // including none, and a fixed 1/slots spacing is the maximally spread choice (the
+                // cells are already decorrelated from each other by hc.z).
+                float  ph = phase + hc.z + float(m) / float(slotsI);
+                float  fl = floor(ph);
+                float  u  = ph - fl;
+
+                // ⚠ THE CYCLE INDEX MUST WRAP WITH THE PHASE. The host reduces `phase` modulo N, so
+                // the fractional part `u` is continuous across the wrap. `fl` is NOT: it jumps from
+                // N back to 0. Since the index feeds the hash, an unwrapped one would teleport every
+                // ripple in the world once per wrap. fl mod N is continuous by construction — and
+                // the wrap itself is invisible because a ripple can never span a cycle boundary (see
+                // uStart below), so every packet is at zero amplitude when the index changes.
+                float  cf  = fl - N * floor(fl / N);
+                int    cyc = int(cf + 0.5f);
+
+                int    key = cyc * slotsI + m;
+                float4 h   = rippleHash4(cell, key);
+
+                // Re-rolled EVERY cycle, so `density` is a rate rather than a fixed subset of cells.
+                // A per-cell decision would freeze which points in the world ever ripple, which
+                // reads as a static pattern no matter how the timing is jittered.
+                if (h.w > density) { continue; }
+
+                // ⚠ LIFE IS NOT THE PERIOD. A slot that is busy for its whole cycle shows the player
+                // a ripple restarting the instant the last one dies. The ripple lives for `life` and
+                // the slot then sits DEAD for period - life, with the start jittered across the free
+                // part of the cycle so the gaps are not synchronised either.
+                float uStart = h.z * (1.0f - lifeFrac);
+                float t      = (u - uStart) * period;
+                if (t <= 0.0f || t >= life) { continue; }
+
+                // Second draw for the packet's own character. A separate hash rather than a remix of
+                // the four values above: those are spoken for, and wavelength correlating with
+                // position is the kind of structure that shows up as a diagonal bias across the
+                // surface. +4096 cannot collide: keys run to cyclesPerWrap * slots, far below it.
+                float4 hp  = rippleHash4(cell, key + 4096);
+                float  lam = lerp(lamMin, lamMax, hp.x);
+                float  n   = floor(1.0f + hp.y * 2.999f);   // 1, 2 or 3 waves in the train
+                float  k   = 6.2831853f / max(lam, 0.05f);
+                // (n+1) half-wavelengths, not n. At W = n*lambda/2 the outermost crests sit exactly
+                // on the window's zero for even n, so the train collapses to a single ring and the
+                // whole point — watching rings die in succession — is invisible. The extra half
+                // wavelength costs nothing and keeps the outer crests at a quarter to a half of the
+                // centre's weight.
+                float  W   = 0.5f * (n + 1.0f) * lam;
+
+                // CONSTANT speed, derived so that the TAIL crest (s = -W) reaches rDie exactly at
+                // t = life. Every ripple therefore lives precisely `life` seconds whatever its
+                // wavelength or crest count, which is what lets the scheduling above use one number.
+                float  rc  = ((rDie + W) / life) * t;
+
+                float2 d = p - (float2(cell) + h.xy) * cellSize;
+                float  r = length(d);
+                if (r <= 1e-3f) { continue; }
+                float2 dir = d / r;
+
+                // ⚠ THE FOOTPRINT IS AN ELLIPSE AND THE RIGHT AXIS IS THE PACKET'S OWN.
+                // A ring's wave vector is RADIAL, so what decides whether this pixel can resolve it
+                // is the footprint's extent measured along `dir` — not some average of the ellipse.
+                // For an ellipse with squared semi-axes (minor2, major2) and direction cosine `a`
+                // against the major axis, that extent is sqrt(a^2*major2 + (1-a^2)*minor2), which is
+                // one dot product because fpEll already stores the squares.
+                //   The geometric mean this used to pass is WRONG HERE, and expensively so: water is
+                // looked at from a grazing angle, where the major axis is tens of times the minor,
+                // so the mean sent nearly every ripple to roughness and the field only showed up at
+                // slopes steep enough (0.5 = 26 degrees) to alias the pixels that DID resolve. With
+                // the projection, the half of each ring whose crests run across the view resolves
+                // and the half whose crests run into the view converts — which is both the visible
+                // ripple and the anti-aliasing, from the same term.
+                float  a2   = dot(dir, fpEll.zw); a2 *= a2;
+                float  fpd  = 0.5f * sqrt(max(a2 * fpEll.y + (1.0f - a2) * fpEll.x, 1e-12f));
+
+                float  dd, vv;
+                ripplePacket(r, rc, W, k, slope, fade, fpd, dd, vv);
+                acc.xy += dd * dir;
+                acc.z  += vv;
+            }
+        }
+    }
+    return acc;
+}
+
+#endif // WATERRIPPLE_H

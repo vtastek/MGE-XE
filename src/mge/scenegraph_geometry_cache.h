@@ -129,6 +129,32 @@ namespace MGE::GeometryCache {
         // quantized colour interpolation → a few re-uploads/sec during transitions).
         // Only meaningful for isSky entries; zero otherwise.
         uint32_t skyVcolHash;
+        // W10b UNDERWATER SKY UN-BLEND. MW applies one affine blend toward its authored
+        // UnderwaterColor the instant the eye submerges —
+        //     c' = c·(1 − w) + underwaterColor·w      (w = 0.85, uwCol = 12,30,37 / 255)
+        // — to currentSkyColor and currentFogColor, and it rebakes EVERY sky shape's vertex
+        // colours from those. So what the walk reads while submerged is already tinted, and the
+        // host inherits the dim (F11 shows it in the DX9 baseline too, which is what proves the
+        // dim is an input rather than anything the host does).
+        //
+        // It cannot be undone with one formula for all shapes: the atmosphere dome is a gradient
+        // between fogColor and skyColor and inverts exactly, but the CLOUDS measured
+        // cloud' = 0.90·sky' + 0.10, so the same inverse would drive them to 0.99 where the truth
+        // is 0.44. Each shape has its own response and the engine does not tell us what it is.
+        //
+        // So it is MEASURED, per vertex per channel, at the crossing:
+        //     a      = (v_above − v_under) / (sky_above − sky_under)
+        //     v_out  = v_live + a · (sky_unblended − sky_live)
+        // which keeps the sky LIVE underwater — a thunder flash still reaches the dome — where
+        // simply re-shipping the pre-dive buffer would freeze it. `a` is assumed constant for the
+        // duration of one dive; it is re-measured at every crossing.
+        //
+        // skyVcolAbove is the last above-water colour array (4 bytes/vert, PackedColor) and is
+        // latched every above-water frame, so the reference is the sky one frame before the dive
+        // rather than whenever the entry was captured. Only meaningful for isSky entries.
+        std::vector<uint8_t> skyVcolAbove;
+        std::vector<float>   skyVcolResp;    // 3 per vertex; valid only when skyRespValid
+        bool                 skyRespValid;
         // Material (pointers into NI memory — valid for the session)
         IDirect3DTexture9* d3dTexture;  // null if no base texture
         // Terrain decal overlay (TexturingProperty maps[6] = DECAL_1): the second

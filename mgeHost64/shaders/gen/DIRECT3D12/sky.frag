@@ -1829,7 +1829,7 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
 
 
     c.rgb = liftInPass(c.rgb);
-#line 116 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/sky.frag.fsl"
+#line 121 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/sky.frag.fsl"
     if (waterFogCameraSubmerged()) {
         float3 skyRel = normalize(In.WorldDir) * 1.0e5f;
         c.rgb = waterFogBlend(c.rgb, c.rgb, skyRel, waterFogSample(skyRel));

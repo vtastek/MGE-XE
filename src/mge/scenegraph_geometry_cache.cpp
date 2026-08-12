@@ -527,6 +527,128 @@ namespace MGE::GeometryCache {
             return h;
         }
 
+        // ---- W10b: UNDO MW's UNDERWATER TINT ON THE SKY ---------------------------------------
+        // MW runs one global weather state and blends it toward its authored UnderwaterColor the
+        // instant the eye submerges. MEASURED 2026-08-10, exact to three decimals in four places:
+        //     c' = c·(1 − w) + underwaterColor·w      w = 0.85, uwCol = (0.047, 0.118, 0.145)
+        // It lands on currentSkyColor, currentFogColor, the sun and the ambient — and every sky
+        // shape's vertex colours are rebaked from the first two, which is how the dim reaches us.
+        //
+        // We undo it rather than write MW's state, deliberately: the host owns the underwater
+        // image now (unified water fog models the absorption properly), so MW's blend is a cruder
+        // duplicate of a term we already have — but MW's own frame stays authentic, which the
+        // F11 baseline depends on. See CachedGeometry::skyVcolAbove for why the per-vertex
+        // response has to be measured instead of inverted.
+        //
+        // ⚠ A BLEND TOWARD A CONSTANT IS AFFINE, AND CANNOT BE CANCELLED BY DIVIDING. The ratio
+        // c'/c = (1 − w) + uwCol·w/c depends on c, which is exactly why the host's earlier
+        // multiplicative cancel drifted (its own log spans sun 0.190→0.323, ambient 0.224→0.801)
+        // and over-brightened submerged objects by up to 2x. Everything below is affine.
+        bool  g_uwSkyActive    = false;   // submerged AND MW's tint is live and invertible
+        bool  g_uwSkyHaveAbove = false;
+        float g_uwSkyLive[3]   = {};      // MW's currentSkyColor right now (tinted while under)
+        float g_uwSkyAbove[3]  = {};      // last above-water currentSkyColor (the measure basis)
+        float g_uwSkyTarget[3] = {};      // the un-blended colour the sky SHOULD be showing
+        float g_uwSkyStrength  = 1.0f;    // 0 = ship MW's tinted colours untouched (the A/B)
+
+        // Once per frame, before the sky walk. Operands come from MW's LIVE struct, not from the
+        // ini, so a mod that moves either at runtime is followed rather than contradicted.
+        void updateSkyUnblend() {
+            g_uwSkyActive = false;
+            MWBridge* mwb = MWBridge::get();
+            if (!mwb || !mwb->IsLoaded()) return;
+            MWBridge::WeatherState w;
+            if (!mwb->getWeatherState(w)) return;
+
+            g_uwSkyLive[0] = w.skyCol.r; g_uwSkyLive[1] = w.skyCol.g; g_uwSkyLive[2] = w.skyCol.b;
+
+            if (!(mwb->CellHasWater() && mwb->IsUnderwater(DistantLand::eyePos.z))) {
+                for (int c = 0; c < 3; ++c) { g_uwSkyAbove[c] = g_uwSkyLive[c]; }
+                g_uwSkyHaveAbove = true;
+                return;
+            }
+            // A save that LOADS underwater has no above-water reference and cannot invent one;
+            // it ships MW's tinted sky until the player surfaces once. Same honest degradation
+            // the light-tint measurement had, minus the seeded constant that made it invisible.
+            if (!g_uwSkyHaveAbove) return;
+
+            const float wgt = (w.uwWeight < 0.0f) ? 0.0f
+                            : (w.uwWeight > 0.99f ? 0.99f : w.uwWeight);   // 1.0 is not invertible
+            const float inv = 1.0f / (1.0f - wgt);
+            const float uw[3] = { w.uwCol.r, w.uwCol.g, w.uwCol.b };
+            for (int c = 0; c < 3; ++c) {
+                const float t = (g_uwSkyLive[c] - uw[c] * wgt) * inv;
+                g_uwSkyTarget[c] = (t < 0.0f) ? 0.0f : t;
+            }
+            g_uwSkyActive = (wgt > 0.01f);
+        }
+
+        // Returns the colours to SHIP: MW's live array above water, a corrected copy below.
+        std::vector<uint8_t> g_skyVcolScratch;   // 4B/vert; single-threaded cache walk
+
+        const NI::PackedColor* skyVcolUnblend(CachedGeometry& e,
+                                              const NI::PackedColor* vcol, uint32_t n) {
+            if (!vcol || n == 0) return vcol;
+            const auto* live = reinterpret_cast<const uint8_t*>(vcol);
+
+            if (!g_uwSkyActive) {
+                // Above water this IS the reference. Latch every frame so the basis is the sky one
+                // frame before the dive, not whenever the entry happened to be captured. Dropping
+                // the response here is what makes each dive re-measure.
+                e.skyVcolAbove.assign(live, live + 4u * n);
+                e.skyRespValid = false;
+                return vcol;
+            }
+            if (e.skyVcolAbove.size() != 4u * n) return vcol;   // never seen above water at this size
+
+            // MEASURE, once per dive — but only once MW's tint has actually LANDED in the vertex
+            // data. The eye crosses the plane before the engine rebakes, so measuring on the
+            // geometric crossing alone divides two identical buffers, locks in a = 0, and produces
+            // a correction that silently does nothing for the rest of the dive. Gating on the sky
+            // colour having moved keeps the two in step, because MW rebakes the vcols in the same
+            // update that writes currentSkyColor.
+            if (!e.skyRespValid) {
+                float den[3];
+                for (int c = 0; c < 3; ++c) {
+                    den[c] = g_uwSkyAbove[c] - g_uwSkyLive[c];
+                    if (std::fabs(den[c]) < 0.02f) return vcol;   // not landed yet, or a sky ≈ uwCol
+                }
+                e.skyVcolResp.resize(3u * n);
+                for (uint32_t i = 0; i < n; ++i) {
+                    for (int c = 0; c < 3; ++c) {
+                        const uint32_t src = 4u * i + (2u - (uint32_t)c);   // PackedColor = (b,g,r,a)
+                        const float above = e.skyVcolAbove[src] * (1.0f / 255.0f);
+                        const float under = live[src] * (1.0f / 255.0f);
+                        const float a = (above - under) / den[c];
+                        // Clamped, not trusted: a shape whose colour barely responds to the sky
+                        // gives a ratio of two small noisy numbers, and an unbounded one would be
+                        // multiplied by the full delta every frame after.
+                        e.skyVcolResp[3u * i + (uint32_t)c] = (a < -4.0f) ? -4.0f : (a > 4.0f ? 4.0f : a);
+                    }
+                }
+                e.skyRespValid = true;
+            }
+
+            // APPLY. The delta is recomputed from the LIVE sky colour every frame, so time of day
+            // and a thunder flash still move the sky while submerged; only the per-vertex response
+            // is held. Quantising back to 8 bits is lossless in the sense that matters — the value
+            // being reconstructed was itself an 8-bit above-water colour.
+            g_skyVcolScratch.assign(live, live + 4u * n);
+            const float s = (g_uwSkyStrength < 0.0f) ? 0.0f
+                          : (g_uwSkyStrength > 1.0f ? 1.0f : g_uwSkyStrength);
+            for (uint32_t i = 0; i < n; ++i) {
+                for (int c = 0; c < 3; ++c) {
+                    const uint32_t dst = 4u * i + (2u - (uint32_t)c);
+                    const float v = live[dst] * (1.0f / 255.0f)
+                                  + s * e.skyVcolResp[3u * i + (uint32_t)c]
+                                      * (g_uwSkyTarget[c] - g_uwSkyLive[c]);
+                    const int q = (int)(v * 255.0f + 0.5f);
+                    g_skyVcolScratch[dst] = (uint8_t)((q < 0) ? 0 : (q > 255 ? 255 : q));
+                }
+            }
+            return reinterpret_cast<const NI::PackedColor*>(g_skyVcolScratch.data());
+        }
+
         // Per-walk copy of the scene-graph point-light snapshot, for computeEmissiveGain.
         // Copied (not read under the lock) because the geometry walk is ~1.5ms and would
         // stall the async scene-graph worker's swap, and because ensureLive's lazy capture
@@ -1403,6 +1525,11 @@ namespace MGE::GeometryCache {
                 // host's universal col*(d+a) path reduces to the white-material (d+a) case.
                 // (Emissive routing / non-white material constants are Tier 2b.)
                 const auto* vcol = (e.hasVertexColor && e.vColSource == 2) ? data->color : nullptr;
+                // W10b: strip MW's underwater tint off the sky before it goes on the wire. Placed
+                // on the CAPTURE colour only — e.skyVcolHash above still hashes MW's LIVE array,
+                // so the re-upload trigger keeps tracking the engine rather than our correction
+                // (and the crossing itself, which moves those colours, is what re-fires it).
+                if (g_walkingSky) { vcol = skyVcolUnblend(e, vcol, vertexCount); }
                 const auto* triList = data->getTriList();
 
                 // ---- UV-animated meshes: one shared UV array for every INSTANCE ------------------
@@ -2990,6 +3117,201 @@ namespace MGE::GeometryCache {
         }
     }
 
+    // ---- W10: weather / sky-state probe ------------------------------------------
+    // THE QUESTION: when the eye submerges, WHAT dims the sky? MW runs one global weather
+    // state, and the reported symptom survives F11 — the DX9 baseline dims too — so the dim
+    // is an INPUT, not anything the host does with it. Two candidates, and they are derived
+    // separately by the engine, which is the only reason logging them together decides
+    // anything:
+    //   (a) WeatherController::currentSkyColor / currentFogColor — the controller's own state;
+    //   (b) the sky meshes' per-vertex colours, which MW rebakes in place every frame and SK4
+    //       re-ships to the host on every hash change.
+    // If BOTH move, the dim is at the controller and cancelling it there fixes everything
+    // downstream. If only (b) moves, MW applies underwaterCol during the vertex bake, below
+    // the controller — and the fix is to hold the last above-water vertex colours instead,
+    // because the blend is w=0.85 and inverting it would amplify 8-bit vcols by 6.7x.
+    //
+    // ⚠ Deliberately NOT comparing a value against its own source. That is the mistake that
+    // burned two probes in this feature already ([[feedback_interpolated_difference_trap]]);
+    // skyZenith is currentSkyColor, so those two agreeing would prove nothing whatsoever.
+    //
+    // Secondary, and the reason the counters are in here: rain/snow particle counts and the
+    // thunder flash are live engine state. If they keep moving while submerged then MW never
+    // stopped simulating weather underwater and only the presentation changed — which is what
+    // a takeover has to reproduce.
+    struct SkyVcolStat { uint32_t verts; uint32_t first; float mean[3]; };
+
+    static SkyVcolStat skyVcolStat(void* triShape) {
+        SkyVcolStat s{ 0u, 0u, { -1.0f, -1.0f, -1.0f } };
+        if (!triShape) return s;
+        auto* av = static_cast<NI::AVObject*>(triShape);
+        if (!av->isInstanceOfType(NI::RTTIStaticPtr::NiTriBasedGeom)) return s;
+        auto* data = static_cast<NI::TriBasedGeometry*>(av)->getModelData().get();
+        if (!data || !data->color) return s;
+        const uint32_t n = static_cast<uint32_t>(data->getActiveVertexCount());
+        if (n == 0) return s;
+        // The MEAN, not vertex 0: the atmosphere dome is a vertical gradient, so one vertex
+        // measures whichever band it happens to sit in and would move with time of day for
+        // reasons unrelated to water. vcol0 is kept alongside only so this lines up with the
+        // existing SK4 diag above.
+        const auto* p = reinterpret_cast<const uint8_t*>(data->color);   // PackedColor (b,g,r,a)
+        double acc[3] = {};
+        for (uint32_t i = 0; i < n; ++i) {
+            acc[0] += p[4 * i + 2];
+            acc[1] += p[4 * i + 1];
+            acc[2] += p[4 * i + 0];
+        }
+        s.verts = n;
+        s.first = *reinterpret_cast<const uint32_t*>(data->color);
+        for (int c = 0; c < 3; ++c) { s.mean[c] = float(acc[c] / (255.0 * n)); }
+        return s;
+    }
+
+    // The THIRD candidate, and the one that would be missed by looking only at colours: the sky
+    // subtree carries its own NiAmbientLight, and vanilla's fixed function modulates the lit
+    // vcol sky shapes by it (out = vcol · ambient). If MW dims THAT underwater, the vertex
+    // colours never move and the rendered sky still darkens — a case the two colour lanes above
+    // would both call "unchanged". Returns the first one found; the sky has exactly one.
+    static NI::Light* findSkyLight(NI::AVObject* av) {
+        if (!av) return nullptr;
+        if (av->isInstanceOfType(NI::RTTIStaticPtr::NiAmbientLight)) {
+            return static_cast<NI::Light*>(av);
+        }
+        if (!av->isInstanceOfType(NI::RTTIStaticPtr::NiNode)) return nullptr;
+        auto* node = static_cast<NI::Node*>(av);
+        const auto count = node->children.getEndIndex();
+        for (size_t i = 0; i < count; ++i) {
+            if (NI::Light* l = findSkyLight(node->children.at(i).get())) return l;
+        }
+        return nullptr;
+    }
+
+    static void logWeatherProbe(uint64_t frame, void* dataHandler) {
+        MWBridge* mwb = MWBridge::get();
+        if (!mwb || !mwb->IsLoaded()) return;
+
+        // MGE's OWN predicate — the same one that swaps the fog range (distantland.cpp) and
+        // sets waterParams[7], so the log says exactly what the renderer believes.
+        const bool under = mwb->CellHasWater() && mwb->IsUnderwater(DistantLand::eyePos.z);
+
+        static bool     s_wasUnder  = false;
+        static uint64_t s_lastFrame = 0;
+        static int      s_lastWthr  = -2;
+        const bool edge = (under != s_wasUnder);
+        if (!edge && (frame - s_lastFrame) < 20) return;   // ~8 Hz at 165 fps, plus every crossing
+        s_wasUnder  = under;
+        s_lastFrame = frame;
+
+        MWBridge::WeatherState w;
+        if (!mwb->getWeatherState(w)) {
+            LOG::logline("[wthr] %s under=%d  no live weather (no sky in this cell)",
+                         edge ? "EDGE" : "    ", under ? 1 : 0);
+            s_lastWthr = -2;
+            return;
+        }
+        const SkyVcolStat atm = skyVcolStat(w.triAtmosphere);
+        const SkyVcolStat cld = skyVcolStat(w.triCloudsCurrent);
+        NI::Light* skyLit = findSkyLight(findSkyRoot(dataHandler));
+
+        LOG::logline("[wthr] %s under=%d w=%d->%d t=%.2f | sky=(%.3f %.3f %.3f) fog=(%.3f %.3f %.3f)"
+                     " | atm n=%u vcol0=%08X mean=(%.3f %.3f %.3f) | cld mean=(%.3f %.3f %.3f)"
+                     " | skyAmb=(%.3f %.3f %.3f) dim=%.2f"
+                     " | rain=%d snow=%d flash=%.3f uwSnd=%d glare=%.2f occl=%d",
+                     edge ? "EDGE" : "    ", under ? 1 : 0,
+                     w.curWeather, w.nextWeather, w.transition,
+                     w.skyCol.r, w.skyCol.g, w.skyCol.b,
+                     w.fogCol.r, w.fogCol.g, w.fogCol.b,
+                     atm.verts, atm.first, atm.mean[0], atm.mean[1], atm.mean[2],
+                     cld.mean[0], cld.mean[1], cld.mean[2],
+                     skyLit ? skyLit->ambient.r : -1.0f,
+                     skyLit ? skyLit->ambient.g : -1.0f,
+                     skyLit ? skyLit->ambient.b : -1.0f,
+                     skyLit ? skyLit->dimmer : -1.0f,
+                     w.rainParticles, w.snowParticles, w.thunderFlash,
+                     w.uwSoundState ? 1 : 0, w.sunglareVis, w.sunOccluded ? 1 : 0);
+
+        // The slow-moving half: constant across a dive, so it only prints when it can have
+        // changed. This is also the input set a GENERATED sky would consume — sun angle plus
+        // cloud coverage, with every authored colour demoted to an optional tint.
+        if (edge || w.curWeather != s_lastWthr) {
+            s_lastWthr = w.curWeather;
+            float sx = 0.0f, sy = 0.0f, sz = 0.0f;
+            mwb->GetSunDir(sx, sy, sz);
+            LOG::logline("[wthr]      inputs: sun=(%.3f %.3f %.3f) clouds=%.2f%% spd=%.2f tex='%s'"
+                         " | landFog day=%.2f night=%.2f wind=%.2f"
+                         " | uwCol=(%.3f %.3f %.3f) uwWeight=%.2f uwFog=[%.1f %.1f %.1f %.1f %.1f]",
+                         sx, sy, sz, w.cloudsMaxPercent, w.cloudsSpeed,
+                         w.cloudTexture ? w.cloudTexture : "(none)",
+                         w.landFogDay, w.landFogNight, w.windSpeed,
+                         w.uwCol.r, w.uwCol.g, w.uwCol.b, w.uwWeight,
+                         w.uwFog[0], w.uwFog[1], w.uwFog[2], w.uwFog[3], w.uwFog[4]);
+        }
+    }
+
+    // R0 — MW's ripple pool, logged as `[ripl]`. See MWBridge::getRippleState.
+    //
+    // THE QUESTION THIS ANSWERS, and it is one that cannot be answered by reading code we are
+    // allowed to read: does MW spawn ripples for NPCs and creatures, or only for the player?
+    // createRipple's callers are inside the engine, so the only honest way to find out is to watch
+    // the pool and ask where the entries ARE. A ripple 800 units away while the player stands still
+    // was not made by the player. `far=` counts exactly those, so one swim past a slaughterfish
+    // settles it — no disassembly involved (Prime Directive 6).
+    //
+    // The distance reference is the EYE, not the player reference. In first person they are the
+    // same point, and in third person the offset is ~150 units, which is well inside the `far`
+    // threshold. It also happens to be the reference a ripple SIM would use, since the field has to
+    // be anchored on the camera.
+    static void logRippleProbe(uint64_t frame) {
+        MWBridge* mwb = MWBridge::get();
+        if (!mwb || !mwb->IsLoaded()) return;
+
+        static uint64_t s_lastFrame = 0;
+        static bool     s_loggedCfg = false;
+        static int      s_lastCount = -1;
+
+        MWBridge::RippleState st;
+        MWBridge::RippleSource src[128];
+        if (!mwb->getRippleState(st, src, 128)) return;
+
+        if (!s_loggedCfg && st.poolSize > 0) {
+            s_loggedCfg = true;
+            LOG::logline("[ripl] pool=%d life=%.2fs scale=%.2f..%.2f alphas=(%.2f %.2f %.2f)"
+                         " rot=%.2f tex='%s' node=%p",
+                         st.poolSize, st.lifetime, st.scaleBegin, st.scaleEnd,
+                         st.alphas[0], st.alphas[1], st.alphas[2], st.rotSpeed,
+                         st.rippleTexture ? st.rippleTexture : "(none)", st.rippleNode);
+        }
+
+        // Print on the same ~8 Hz cadence as [wthr], but ALSO on the 0 -> nonzero edge so the
+        // first ripple of a splash is never the one that gets skipped.
+        const bool edge = (st.activeInPool > 0) != (s_lastCount > 0);
+        if (!edge && (frame - s_lastFrame) < 20) return;
+        s_lastFrame = frame;
+        s_lastCount = st.activeInPool;
+        if (st.activeInPool == 0 && !edge) return;
+
+        const float ex = DistantLand::eyePos.x, ey = DistantLand::eyePos.y;
+        int   farCount = 0;
+        float dMax = 0.0f;
+        for (int i = 0; i < st.count; ++i) {
+            const float dx = src[i].x - ex, dy = src[i].y - ey;
+            const float d = std::sqrt(dx * dx + dy * dy);
+            if (d > dMax) dMax = d;
+            if (d > 300.0f) farCount++;
+        }
+        LOG::logline("[ripl] active=%d read=%d far=%d dMax=%.0f  eye=(%.0f %.0f)",
+                     st.activeInPool, st.count, farCount, dMax, ex, ey);
+        // The first few in full: the sim needs to know what an impulse actually looks like
+        // (how fast scale grows against age), and a summary cannot show that.
+        const int show = (st.count < 6) ? st.count : 6;
+        for (int i = 0; i < show; ++i) {
+            const float dx = src[i].x - ex, dy = src[i].y - ey;
+            LOG::logline("[ripl]   #%d at=(%.0f %.0f) d=%.0f age=%.2f scale=%.2f",
+                         i, src[i].x, src[i].y, std::sqrt(dx * dx + dy * dy),
+                         src[i].age, src[i].scale);
+        }
+    }
+
     // QPC millisecond clock for the [gc] heartbeat (same pattern as renderprocess's nowMs).
     static double gcNowMs() {
         static LARGE_INTEGER freq = [] { LARGE_INTEGER f; QueryPerformanceFrequency(&f); return f; }();
@@ -3572,6 +3894,9 @@ namespace MGE::GeometryCache {
         // tagged isSky → the Forge host's dedicated alpha-blend sky pass draws them.
         if (RenderProcess::forgeOwnsFrame()) {
             MGE_ZoneScopedN("GeomCache:walkSky");
+            // W10b: refresh the underwater un-blend state BEFORE the walk, so every sky entry
+            // uploaded this frame sees one consistent sky colour and one consistent verdict.
+            updateSkyUnblend();
             g_walkingSky = true;
             g_skyVisitCounter = 0;   // SK2: restart back-to-front ordering each sky walk
             walk(findSkyRoot(dataHandler));
@@ -3617,6 +3942,31 @@ namespace MGE::GeometryCache {
             }
         }
 
+        // R1: force MW's RIPPLE NODE appCulled while the host owns the frame. MW spawns a decal
+        // quad per actor-in-water into a fixed pool under this one node and fades it with an alpha
+        // controller; the host now draws the same disturbance as a surface perturbation, so the
+        // quads are a second, flatter copy of it (and XE Mod Water.fx used to z-bias against them).
+        //
+        // ⚠ THE NODE, NOT MWBridge::toggleRipples(). That patches inside createRipple and so kills
+        // the POOL along with the decals — and the pool is the data source R2 reads to place host
+        // ripples at MW's own actor positions. Culling the node keeps MW doing every bit of the
+        // actor bookkeeping for free and draws none of it. (toggleRipples is dead code today, so
+        // ripple generation is fully live; see [[project_mw_ripple_pool]].)
+        //
+        // Same shape as FP1b above: re-applied every frame because the engine re-asserts its own
+        // cull state, and restored ONCE on gate release.
+        {
+            static bool s_rippleForcedCull = false;
+            const bool want = RenderProcess::forgeOwnsFrame();
+            if (want || s_rippleForcedCull) {
+                MWBridge::RippleState rs;
+                if (MWBridge::get()->getRippleState(rs, nullptr, 0) && rs.rippleNode) {
+                    static_cast<NI::AVObject*>(rs.rippleNode)->setAppCulled(want);
+                }
+                s_rippleForcedCull = want;
+            }
+        }
+
         // MW-ONLY-UI: force MW's world roots appCulled so the ENGINE never traverses them.
         // Phase 2 stopped MGE drawing, and the proxy reject gate drops MW's draws one by one —
         // but MW still walks its whole scene graph and issues every DrawIndexedPrimitive first.
@@ -3641,6 +3991,14 @@ namespace MGE::GeometryCache {
         {
             const int level = RenderProcess::forgeOwnsFrame() ? DistantLand::mwWorldSuppress : 0;
             applyWorldSuppression(level);
+        }
+
+        // W10 (weather/sky probe): the compact per-dive trace. Its own cadence — the SK0 dump
+        // below is 300 frames apart and many lines wide, which is useless for a crossing that
+        // takes one frame.
+        if (Configuration.LogDistantPipeline) {
+            logWeatherProbe(g_frame, dataHandler);
+            logRippleProbe(g_frame);
         }
 
         // SK0 (sky takeover, diagnostic): periodically dump the skyRoot subtree so we can

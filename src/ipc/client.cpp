@@ -582,9 +582,10 @@ namespace IPC {
 		params.capturedVertBytes = capturedVertBytes;
 		params.capturedIdxBytes = capturedIdxBytes;
 		params.debugMode = debugMode;
-		// WT1 Forge water: 12 per-frame surface params + the per-cell enable gate (no geometry).
-		if (waterParams) { std::memcpy(params.waterParams, waterParams, 12 * sizeof(float)); }
-		else { std::memset(params.waterParams, 0, 12 * sizeof(float)); }
+		// WT1 Forge water: per-frame surface params + the per-cell enable gate (no geometry).
+		// sizeof the DESTINATION, so growing bridge.h's array can never leave a stale count here.
+		if (waterParams) { std::memcpy(params.waterParams, waterParams, sizeof(params.waterParams)); }
+		else { std::memset(params.waterParams, 0, sizeof(params.waterParams)); }
 		params.waterEnabled = waterEnabled;
 		// FP1a first-person: one optional bundle; null ⇒ fpEnabled=0, host skips the FP pass.
 		if (fp) {

@@ -47,6 +47,85 @@ public:
     float GetWeatherRatio();
     const RGBVECTOR* getCurrentWeatherSkyCol();
     const RGBVECTOR* getCurrentWeatherFogCol();
+
+    // -- W10: the whole WeatherController, read at once ---------------------------
+    // MGE has always poked this struct for two colours (eCurSkyCol/eCurFogCol). The sky
+    // takeover needs the rest of it: MW runs ONE global weather state, flips part of it to
+    // underwater values the instant the eye submerges, and the sky inherits that — which is
+    // why the submerged sky dims in the DX9 baseline too (proven with F11). Reading the whole
+    // struct turns "something dims" into a measurement.
+    //
+    // Every offset below is published in the MWSE headers — TES3::WeatherController
+    // (TES3WeatherController.h) and TES3::Weather (TES3Weather.h) — and the two MGE already
+    // used (0x90 sky, 0x9c fog) line up exactly, which is the cross-check that the base
+    // pointer is right. Nothing here was disassembled (Prime Directive 6).
+    //
+    // It also settles the standing question about weather continuing while submerged: the
+    // particle counts and the thunder-flash intensity are live engine counters, so if they
+    // keep moving underwater the simulation never paused and only the LOOK changed.
+    struct WeatherState {
+        int       curWeather, nextWeather;        // TES3::WeatherType index, -1 if absent
+        float     transition;                     // transitionScalar          0x170
+        RGBVECTOR skyCol, fogCol;                 // currentSkyColor/FogColor  0x90 / 0x9c
+        RGBVECTOR uwCol;                          // underwaterCol             0x1b4
+        float     uwWeight;                       // underwaterColWeight       0x1c0
+        float     uwFog[5];                       // sunrise/day/sunset/night/indoor 0x1a0..
+        float     thunderFlash;                   // activeThunderFlashIntensity 0x178
+        int       rainParticles, snowParticles;   //                       0x13c / 0x140
+        float     sunglareVis;                    // smoothedSunglareVis       0xd0
+        bool      sunOccluded;                    // isSunOccluded             0x1ec
+        bool      uwSoundState;                   // currentWeather->underwaterSoundState 0x20d
+        // The physical-sky input set: everything a generated sky would need from MW, with
+        // all the authored COLOURS demoted to optional tints.
+        float     cloudsMaxPercent, cloudsSpeed;  // Weather 0xf0 / 0xfc
+        float     landFogDay, landFogNight;       // Weather 0xf4 / 0xf8
+        float     windSpeed;                      // Weather 0x100
+        const char* cloudTexture;                 // Weather 0x104 (never freed by us)
+        // The sky meshes whose per-vertex colours MW rebakes in place each frame. Handed back
+        // untyped so this header keeps its "no SharedSE NI headers" promise; the geometry
+        // cache casts them (it already owns that idiom).
+        void*     triAtmosphere;                  // sgTriAtmosphere      0x7c
+        void*     triCloudsCurrent;               // sgTriCloudsCurrent   0x80
+    };
+    bool getWeatherState(WeatherState& out);
+
+    // -- R0: MW's live RIPPLE POOL ------------------------------------------------
+    // TES3::WaterController keeps a fixed pool of ripple TriShapes (MaxNumberRipples=75 in
+    // Morrowind.ini) and drives each one from an alpha controller over RippleLifetime. The
+    // engine spawns them itself for anything moving in water, which is the whole point: MGE's
+    // DX9 ripple was ONE origin (the player) because that was all the shader had, while MW has
+    // always had the full list. Reading the pool restores NPC and creature ripples without us
+    // detecting a single actor.
+    //
+    // Offsets are MWSE-published: TES3::WaterController / ::Ripple (TES3WaterController.h) and
+    // NI::TimeController (SharedSE/NITimeController.h). The base cross-checks against MGE's own
+    // long-standing markWaterNode(), which already walks dataHandler+0xB4EC -> +0xB4 (waterPlane).
+    // Nothing disassembled (Prime Directive 6).
+    //
+    // ⚠ The AGE comes from the alpha controller, not from a scale we reverse-engineer. Both the
+    // TriShape scale and the controller advance on the same clock, but only the controller states
+    // its own range (low/highKeyFrame), so deriving age from it needs no assumption about whether
+    // MW's growth curve is linear — and RippleScale=0.15,6.5 is exactly the kind of pair that
+    // invites that assumption.
+    struct RippleSource {
+        float x, y;        // world XY of the ripple centre (TriShape world translation)
+        float age;         // 0 = just spawned, 1 = at the end of its life
+        float scale;       // TriShape world scale, i.e. the ring's current radius factor
+    };
+    struct RippleState {
+        int   count;               // entries written into `out`
+        int   poolSize;            // maxRippleCount            0x50
+        int   activeInPool;        // isActive entries, even those we could not read
+        float lifetime;            // rippleLifetime            0x34
+        float scaleBegin, scaleEnd;// rippleScaleX / Y          0x38 / 0x3c
+        float alphas[3];           // rippleAlphas[3]           0x40
+        float rotSpeed;            // rippleRotationSpeed       0x4c
+        const char* rippleTexture; // rippleTexturePath         0x08 (never freed by us)
+        void* rippleNode;          // NI::Node parent           0xb0 — the SUPPRESSION handle
+    };
+    // Fills up to `max` sources; returns false when there is no water controller (no loaded game).
+    bool getRippleState(RippleState& out, RippleSource* sources, int max);
+
     DWORD getScenegraphFogCol();
     void setScenegraphFogCol(DWORD c);
     float getScenegraphFogDensity();

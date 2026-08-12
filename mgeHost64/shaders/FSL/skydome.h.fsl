@@ -160,6 +160,32 @@ float3 applyFog(float3 lit, float3 worldPosRel, float2 pixelXy, float fog)
     // one continuous expression reproduces both of its endpoints and every state between them.
     float fogAir = saturate(fog + (1.0f - fog) * wf.y);
 
+    // ⚠ ...AND WHILE THE CAMERA IS SUBMERGED, MW'S SCALAR IS NOT AN AIR FOG AT ALL. It changes
+    // MEANING at the surface, which no share can express, and that is why this needs a frame test
+    // where the line above deliberately needs none.
+    //
+    // distantland.cpp:763 swaps the whole range the instant the eye goes under:
+    //     fogStart = DL.BelowWaterFogStart   (default -0.5 cells = -4096 units)
+    //     fogEnd   = DL.BelowWaterFogEnd     (default  0.3 cells =  2458 units, ~35 m)
+    // so `fog` stops describing atmosphere and starts describing WATER — the very medium this
+    // feature models properly. Applying it to the AIR share is then wrong twice over, and both
+    // errors land on the same pixels:
+    //   - WRONG DENSITY. fog = (2458 - d) / 6554 is only 0.375 at ZERO distance and hits 0 by 35 m.
+    //   - WRONG TARGET. What it melts toward is fogSkyTarget(), so an above-water object seen from
+    //     below is 62% SKY at arm's length and 100% SKY past 35 m. Reported exactly that way: "I can
+    //     see sky through objects".
+    // It also drives the extinction ramp below (`pow(1 - fogAir, shape)`), so the same wrong scalar
+    // was DIMMING everything above the eye's horizontal plane at zero distance — the third symptom,
+    // and the one that looked like a lighting bug.
+    //
+    // A submerged fragment was already immune (wf.y == 1 makes fogAir 1), so this only ever touches
+    // the case the share cannot see: the eye under, the fragment over. There the honest answer is
+    // that we do not KNOW the atmospheric range — the client overwrote it — so the air segment
+    // carries no fog rather than the wrong one. Conservative in the direction of visibility, and the
+    // water column over the eye->surface segment is the dominant term anyway. Shipping the
+    // above-water range alongside the below-water one would let this be exact; it needs a wire lane.
+    if (waterFogCameraSubmerged()) { fogAir = 1.0f; }
+
     // EXTINCTION (skyParams.w), on the surface, ramped by the fog between it and the eye. The
     // standard lerp already carries the energy-conserving amount of extinction; this is deliberately
     // EXTRA, because "melts perfectly into the sky" and "reads as a silhouette on the way there" are

@@ -2418,10 +2418,19 @@ namespace {
     float              g_waterScatterRatio  = 0.8f;
     // The one calibration constant in W8, and it is honest about why it exists: the in-scatter is
     // sigma_s * (sunCol * phase + ambCol) * pathlength, but "sunCol" is a radiance the engine never
-    // defined a matching irradiance for, so the absolute scale is not derivable from the wire. 0.30
-    // is the value at which deep water under clear midday light reproduces MW's own authored
+    // defined a matching irradiance for, so the absolute scale is not derivable from the wire.
+    //
+    // 0.30 is the value at which deep water under clear midday light reproduces MW's own authored
     // UnderwaterColor — chosen so the verified match this feature started from survives the switch
     // to deriving it. Raise it for livelier, more luminous water; the HUE does not move.
+    //
+    // ⚠ 1.0 (the model's own value, on the argument that sunCol/ambCol ARE the irradiances the
+    // integral wants) was tried and REVERTED 2026-08-10. The argument for raising it still stands on
+    // paper — 0.30 was fitted against a display-referred target, and fitted while applyFog was
+    // lifting 62-100% of every submerged pixel toward the sky colour. It was reverted because the
+    // PREDICTION attached to it was falsified: in play the gain moves the visible scatter and moves
+    // NOTHING about the dim sky or the horizon band, which are MW's own underwater weather state
+    // arriving over the wire. Do not re-raise it as a fix for those; re-raise it only as a look call.
     float              g_waterInscatterGain = 0.30f;
     // PHASE (phase.h.fsl). Water is strongly forward-scattering — Petzold's average particle is near
     // g = 0.92 — so the sun's halo through the water is real and large, and a lone lobe that big
@@ -2481,104 +2490,103 @@ namespace {
     // gFrameData is write-combined and reading one back is a documented trap.
     float              g_fogColAuthored[3] = { 0.0f, 0.0f, 0.0f };
 
-    // --- W7a: CANCEL MW's GLOBAL UNDERWATER LIGHT TINT -------------------------------------------
-    // MEASURED, not assumed (the crossing log at the water latch is what produced these): the
-    // instant the EYE crosses the surface the engine multiplies its sun and ambient by a fixed
-    // absorption tint — sun x(0.190 0.258 0.292), ambient x(0.225 0.326 0.347) on a clear day. Red
-    // killed hardest, blue least, which is the RIGHT SPECTRUM. Everything else about it is wrong:
+    // --- W7a: UNDO MW's GLOBAL UNDERWATER TINT (was: cancel by division) --------------------------
+    // The instant the EYE crosses the surface MW recolours its whole weather state. Everything
+    // about that is wrong for us:
     //
     //   - it is DEPTH-INDEPENDENT, so a rock 10 cm down and one 20 m down are lit identically;
     //   - it is CAMERA-dependent, so a rock's lighting changes when the VIEWER moves and the rock
     //     does not — the defining symptom of a global standing in for a local quantity;
-    //   - it is a ~5x STEP at the crossing, which is a hard cut in its own right, and it stacks on
-    //     top of the unified water fog now modelling the same absorption properly.
+    //   - it is a ~5x STEP at the crossing, and it stacks on top of the unified water fog, which
+    //     models the same absorption properly. Taking the underwater image over is the one thing
+    //     OpenMW never did; MW's blend is now a cruder duplicate of a term we already have.
     //
-    // It is cancelled here rather than replaced at the source because the source is not reachable:
-    // MWSE's TES3::WeatherController carries currentSkyColor and currentFogColor but NO current sun
-    // or ambient — the engine drives sgSunlight directly, and what the client captures is already
-    // tinted. (Prime Directive 6 rules out going looking for more.)
+    // ⚠ IT IS NOT A TINT. It is an affine BLEND toward MW's authored UnderwaterColor, measured
+    // 2026-08-10 and exact to three decimals on currentSkyColor, currentFogColor, the sun and the
+    // ambient at once:
     //
-    // So it is cancelled by MEASUREMENT, which needs no engine internals and self-calibrates:
-    // latch the authored sun/ambient every above-water frame; on the first submerged frame divide
-    // to get K; every later submerged frame divide the LIVE values by that same K, so weather and
-    // time of day keep tracking while only the engine constant is held. A session that begins
-    // submerged has no K yet and ships MW's values unchanged — the old behaviour, recovered the
-    // first time the player surfaces.
+    //       c' = c·(1 − w) + underwaterColor·w        w = 0.85, uwCol = (0.047, 0.118, 0.145)
     //
-    // ⚠ The one thing to re-check if this ever looks wrong: whether K is really constant. The log
-    // line below prints it at every crossing precisely so that is falsifiable rather than assumed.
-    float g_waterLightCancel = 1.0f;    // 0 = off (byte-identical: divide by exactly 1)
+    // The first version of this divided by a K latched at the crossing, and warned in this very
+    // comment to re-check whether K was constant. IT IS NOT, AND IT CANNOT BE — the ratio of an
+    // affine map depends on its input:
+    //
+    //       K = c'/c = (1 − w) + uwCol·w/c
+    //
+    // which reproduces every K the old code ever logged (sun c=1.000 → 0.190, logged 0.190;
+    // ambient c=0.527 → 0.226, logged 0.224; c=0.549 → 0.332, logged 0.329). Across one session it
+    // spanned sun 0.190→0.323 and ambient 0.224→0.801, so a held K over-brightened submerged
+    // objects by up to 2x as time of day moved. That was the "underwater objects are too bright"
+    // report, and no amount of re-measuring would have fixed it — a divide is the wrong inverse.
+    //
+    // So: apply the EXACT inverse instead, `c = (c' − uwCol·w)/(1 − w)`. No latch, no measurement,
+    // no drift, and correct on the frame it is first applied. It is exact here because these lanes
+    // are FLOATS; the sky MESH lane is 8-bit and per-shape, and is handled client-side (see
+    // scenegraph_geometry_cache's W10b — the clouds do not follow the same law as the dome).
+    //
+    // MW's own frame is left authentic on purpose: the F11 DX9 baseline still shows vanilla's
+    // underwater look, and nothing writes engine state.
+    float g_waterLightCancel = 1.0f;    // 0 = off (byte-identical: MW's own values, untouched)
     // W7b — and the reason it pairs with the cancel above rather than replacing it: cancelling alone
     // leaves a submerged world lit at SURFACE brightness, which is as wrong at 20 m down as MW's flat
     // tint is at 10 cm. This is the term that makes depth mean something. 0 = off (transmittance
     // exactly 1). Its own lane so the pair can be A/B'd against each other, which matters: "things
     // underwater got darker" is a symptom the fog, the cancel and this all share.
     float g_waterLightAbsorb = 1.0f;
-    // SEEDED with the values measured on this install (the crossing log), NOT with 1.0 — because a
-    // save that LOADS underwater never sees an above-water frame, so the latch below can never arm
-    // and the cancel would silently do nothing for the whole session. That is not a corner case: it
-    // is the obvious way to make a test save for this feature, and it is the case where the feature
-    // matters most.
+    bool  g_uwTintWasUnder = false;     // crossing-edge detection, for the log line only
+    bool  g_uwBlendActive  = false;     // this frame's verdict, for the g_fogColAuthored latch
+
+    // The blend's two operands. g_waterIni is declared further down (it is parsed with the rest of
+    // the water settings), so these forward the read rather than duplicating the values — one
+    // source of truth, and publishWaterFog's own lerp already uses the same pair.
+    float uwBlendWeight();
+    float uwBlendColor(int i);
+
+    // The exact inverse of MW's blend, on one authored RGB triple.
+    // Reads from `src` (normal memory) and writes to `dst`, which may be the write-combined
+    // cbuffer — never read a value back out of that ([[project_forge_wc_read_trap]]), which is
+    // also why src and dst are separate parameters instead of one in-place pointer.
+    inline void unblendUnderwaterRGB(const float* src, float* dst, float strength) {
+        const float w = std::max(0.0f, std::min(uwBlendWeight(), 0.99f));   // 1.0 has no inverse
+        const float inv = 1.0f / (1.0f - w);
+        for (int i = 0; i < 3; ++i) {
+            const float un = std::max(0.0f, (src[i] - uwBlendColor(i) * w) * inv);
+            dst[i] = src[i] + strength * (un - src[i]);   // strength 0 → MW's value, bit-exact
+        }
+    }
+
+    // `lighting` is the client's 24-float block in NORMAL memory; fdc points at gFrameData float 0,
+    // where the same block has already been memcpy'd (lighting[k] → fdc[16 + k]). Sun is 20..22,
+    // ambient 24..26, fogColNear 28..30 — all three still AUTHORED at this point, which is the
+    // only state the blend was applied in and therefore the only state it can be undone in.
     //
-    // A seed is legitimate here where a transplanted tuning would not be
-    // ([[feedback_prior_art_constants_dont_transfer]]): this is a measured property of THIS engine,
-    // it is used only until the first real crossing overwrites it, and which one is in force is
-    // logged either way. If K turns out to vary with weather or time of day, the seed is the thing
-    // that has to go — so it is deliberately the same number the log prints.
-    float g_uwTintK[6]       = { 0.190f, 0.258f, 0.292f, 0.225f, 0.326f, 0.347f };   // sun.rgb, amb.rgb
-    float g_uwTintAbove[6]   = {};      // last above-water AUTHORED sun.rgb / amb.rgb
-    bool  g_uwTintHaveAbove  = false;
-    bool  g_uwTintValid      = true;    // the seed above; replaced at the first crossing
-    bool  g_uwTintSeeded     = true;    // ...and this says it has not been replaced yet (log only)
-    bool  g_uwTintWasUnder   = false;
-
-    // fdc points at gFrameData float 0; sun is 20..22, ambient 24..26, both still AUTHORED.
-    void cancelUnderwaterLightTint(float* fdc, bool underwater) {
-        const float live[6] = { fdc[20], fdc[21], fdc[22], fdc[24], fdc[25], fdc[26] };
-
+    // fogColNear matters as much as the light does: publishWaterFog blends it toward uwCol AGAIN
+    // to build the water's own fog colour, so an already-tinted input made that lerp resolve to
+    // 0.0225·fog + 0.9775·uwCol — very nearly pure UnderwaterColor, which is why submerged
+    // distance read as a flat wall of colour.
+    void unblendUnderwaterTint(float* fdc, const float* lighting, bool underwater) {
+        g_uwBlendActive = underwater;
         if (!underwater) {
-            for (int i = 0; i < 6; ++i) { g_uwTintAbove[i] = live[i]; }
-            g_uwTintHaveAbove = true;
-            g_uwTintWasUnder  = false;
+            g_uwTintWasUnder = false;
             return;
         }
-        if (!g_uwTintWasUnder && g_uwTintHaveAbove) {
-            // First submerged frame: measure. Reject implausible ratios rather than trusting them —
-            // a channel that was ~0 above water carries no information, and a ratio at or above 1 is
-            // not a tint, so both fall back to "no correction on this channel".
-            bool any = false;
-            for (int i = 0; i < 6; ++i) {
-                const float a = g_uwTintAbove[i];
-                const float k = (a > 1.0e-3f) ? (live[i] / a) : 1.0f;
-                g_uwTintK[i] = (k > 0.02f && k < 0.999f) ? k : 1.0f;
-                if (g_uwTintK[i] < 1.0f) { any = true; }
-            }
-            g_uwTintValid  = any;
-            g_uwTintSeeded = false;   // a real measurement now, whatever it said
-            LOG::logline(">> [waterfog] MW underwater light tint MEASURED: sun x(%.3f %.3f %.3f) "
-                         "amb x(%.3f %.3f %.3f)%s",
-                         g_uwTintK[0], g_uwTintK[1], g_uwTintK[2],
-                         g_uwTintK[3], g_uwTintK[4], g_uwTintK[5],
-                         g_uwTintValid ? "" : "  (no usable ratio — not cancelling)");
-        } else if (!g_uwTintWasUnder && g_uwTintSeeded) {
-            // Submerged with no above-water frame this session — a save that LOADED underwater.
-            // Running on the seed; say so, so a wrong-looking cancel is attributable.
-            LOG::logline(">> [waterfog] submerged with no above-water frame yet — using SEEDED tint "
-                         "sun x(%.3f %.3f %.3f) amb x(%.3f %.3f %.3f); surface once to measure it",
-                         g_uwTintK[0], g_uwTintK[1], g_uwTintK[2],
-                         g_uwTintK[3], g_uwTintK[4], g_uwTintK[5]);
-        }
-        g_uwTintWasUnder = true;
-        if (!g_uwTintValid) { return; }
-
-        // Strength lerps the DIVISOR toward 1, so 0 divides by exactly 1.0f and the frame is
-        // bit-identical to the uncancelled one — the A/B, on the same "one float disarms it" idiom
-        // the rest of this file uses.
         const float s = std::max(0.0f, std::min(g_waterLightCancel, 1.0f));
-        const int   dst[6] = { 20, 21, 22, 24, 25, 26 };
-        for (int i = 0; i < 6; ++i) {
-            const float divisor = 1.0f + s * (g_uwTintK[i] - 1.0f);
-            fdc[dst[i]] = live[i] / divisor;
+        unblendUnderwaterRGB(lighting + 4,  fdc + 20, s);   // sunCol
+        unblendUnderwaterRGB(lighting + 8,  fdc + 24, s);   // ambCol
+        unblendUnderwaterRGB(lighting + 12, fdc + 28, s);   // fogColNear
+        // g_fogColAuthored gets the same treatment at ITS latch site further down — it is written
+        // from `lighting` after this runs, so undoing it here would simply be overwritten.
+
+        if (!g_uwTintWasUnder) {
+            g_uwTintWasUnder = true;
+            float sun[3], amb[3];
+            unblendUnderwaterRGB(lighting + 4, sun, 1.0f);
+            unblendUnderwaterRGB(lighting + 8, amb, 1.0f);
+            LOG::logline(">> [waterfog] submerged: MW blend w=%.2f uwCol=(%.3f %.3f %.3f) UNDONE — "
+                         "sun (%.3f %.3f %.3f)->(%.3f %.3f %.3f) amb (%.3f %.3f %.3f)->(%.3f %.3f %.3f)",
+                         uwBlendWeight(), uwBlendColor(0), uwBlendColor(1), uwBlendColor(2),
+                         lighting[4], lighting[5], lighting[6],  sun[0], sun[1], sun[2],
+                         lighting[8], lighting[9], lighting[10], amb[0], amb[1], amb[2]);
         }
     }
 
@@ -2610,6 +2618,15 @@ namespace {
         bool  loaded             = false;
     };
     WaterIni g_waterIni;
+
+    // Forwarded from the W7a un-blend above (declared there, defined here — g_waterIni does not
+    // exist yet at that point). The ini is the right source: it is where MW itself reads these at
+    // startup, and it is already what publishWaterFog's blend uses, so the undo and the redo
+    // cannot disagree. A mod that rewrites TES3::WeatherController::underwaterCol at RUNTIME would
+    // not be followed here — the client's sky un-blend reads MW's live struct and would be, so
+    // that is the seam to revisit if one ever turns up.
+    float uwBlendWeight()        { return g_waterIni.colorWeight; }
+    float uwBlendColor(int i)    { return g_waterIni.underwaterColor[i]; }
 
     // --- FOG SAMPLES THE SKY (skydome.h.fsl) -----------------------------------------------------
     // Every lit path used to fog toward the single flat colour fogColNear, while the sky behind it is
@@ -10111,6 +10128,11 @@ namespace {
     bool g_waterReflOnly = false;
     bool g_waterRefrOnly = false;
     bool g_waterRoughView = false;   // WT4d debug view 3: roughness / reflection LOD, false-coloured
+    // Reflection HDR RANGE view (bit 17). "Are reflections HDR too" is not answerable from the lit
+    // image: a reflection that was clipped to 1.0 and one that was never brighter than 1.0 tonemap to
+    // the same picture. This bands the raw reflection radiance so the two separate. See the decode
+    // comment in water.frag.fsl for what each band means.
+    bool g_waterHdrView = false;
     // WT4d CALIBRATION AID. The reflection's fog melt is physically right and stays on in play, but
     // roughness must NOT be tuned against it: roughness-LOD is about sampling RATE, not dimming, so
     // by-eye calibration with the melt live just makes the roughness compensate for the melt and the
@@ -10255,6 +10277,34 @@ namespace {
     // slightly LESS reflective once this is on. That correction is intended; the toggle is so it can
     // be A/B'd alone rather than inside the rest.
     bool g_waterSchlick = true;
+    // W9: the EXACT dielectric interface on both sides of the surface, in place of the two fitted
+    // power curves. Its own toggle because it changes the UNDERWATER image drastically and the
+    // above-water one barely at all — Snell's window shrinks from a 79-degree cone to its real
+    // 48.6-degree one, everything outside becomes a true mirror, and the underwater sun double-count
+    // goes with it. Off restores every previous term verbatim, including that double-count, so the
+    // A/B is exact in both directions. See water.frag.fsl's fresnelDielectric header.
+    bool g_waterFresnelPhys = true;
+    // W9b: the n² RADIANCE GAIN through the surface, split off W9's bit and DEFAULT OFF.
+    //
+    // The physics it encodes is not in dispute and the shader's header states it correctly:
+    // L/n² is what is invariant across a refractive boundary, so per pixel the radiance of the
+    // above-water world genuinely is n² = 1.777x higher seen from below. That is why a diver's
+    // Snell window is the brightest thing in view.
+    //
+    // ⚠ IT IS OFF BECAUSE THE OTHER HALF OF THE CHANGE OF VARIABLES IS NOT IMPLEMENTED, AND
+    // BECAUSE WE HAVE NO EXPOSURE. n² is the Jacobian of a direction remap that squeezes the whole
+    // upper hemisphere into a 48.6-degree cone; we apply the Jacobian to a screen-space copy
+    // sampled along the UNREFRACTED direction, so nothing is squeezed. What makes a real Snell
+    // window read as bright is that concentration against a dark surround — take the gain without
+    // it and a fixed tonemap has nowhere to put the extra 78%, so it lands as flat overexposure on
+    // the whole refracted view. Reported from play twice, in exactly those terms: "everything
+    // above water brighter — objects, sky, sun, moons", which is precisely the set this multiplies.
+    //
+    // So this is not a retraction of the physics, it is a refusal to ship half a model. Turn it
+    // back on the day the refraction actually remaps direction (true Snell mapping), or the day
+    // there is an exposure that can absorb it — and re-derive the look then rather than assuming
+    // this default was a value judgement.
+    bool g_waterSnellGain = false;
     // WT4d CALIBRATION: a scale on the reflection mip LOD ONLY — never on the specular lobe, so it
     // is NOT a second roughness. It answers "how much of the physical blur do I want to see", which
     // is a look call rather than a material property.
@@ -10304,6 +10354,97 @@ namespace {
     // minor-axis W4 look), which is still the A/B baseline for this feature.
     uint32_t g_waterReflSmearTaps = 10;
 
+    // ---- R1 impulse ripples (waterripple.h.fsl) ----
+    // PEAK SURFACE SLOPE at spawn. Not an impulse strength — the packet's height is scaled by
+    // 1/k precisely so this number reads as a slope, the only quantity a normal-perturbing field
+    // needs. 0 = OFF and the whole block folds away on a wave-uniform branch, which is the A/B.
+    // 0.5 is the slider's top and it is a STEEP ripple — 26 degrees, well past what a raindrop
+    // actually makes. Shipped there on the user's call after seeing it in motion: the physically
+    // plausible 0.12 reads as almost nothing once the wave field is under it.
+    float g_rippleAmp    = 0.5f;
+    // Per-ripple wavelength range, world units (1 unit ~ 1.42 cm). Randomised per ripple, FIXED
+    // within one — the packet does not chirp. 2..5 units is 3..7 cm, a raindrop ripple.
+    float g_rippleLamMin = 2.0f;
+    float g_rippleLamMax = 5.0f;
+    // THE RADIUS EVERY RING DIES AT. This — not the wavelength — is the SIZE knob, which is the
+    // point of the rigid-packet model: size, wavelength and crest count came as one number under the
+    // old dispersive chirp and are three independent ones here.
+    // ⚠ CLAMPED TO THE CELL SIZE by the shader. A packet is exactly zero past this radius, so it is
+    // also the packet's hard reach, and the 3x3 neighbourhood can only cover one cell of reach.
+    // Raise the cell size before raising this or the slider silently stops moving.
+    float g_rippleRadius = 20.0f;   // ~28 cm, and inside the 24-unit cell below
+    // Amplitude falloff over that radius. Higher = the rings fade out closer in, so the ripple looks
+    // smaller and looks like it stopped travelling sooner. It is the ONLY thing producing the
+    // apparent deceleration — the packet's speed is constant, which is the physical law for a fixed
+    // wavelength (see the ⚠ block in waterripple.h.fsl before adding a decel knob back).
+    // ⚠ RE-DERIVED WHEN THE ENVELOPE MOVED FROM TIME TO RADIUS, and it had to be. 4.0 was tuned
+    // against a fade over LIFE; read against RADIUS the same number leaves e^-4 = 2% of the
+    // amplitude at rDie and only ~4% at 70% of it, so the ripple died at a fifth of the radius the
+    // size slider claimed and had to be shouted to be seen. The visible extent is roughly
+    // rDie/decay. Same trap as [[feedback_prior_art_constants_dont_transfer]], one step further in:
+    // the constant did not move between projects, it stayed still while its meaning moved.
+    float g_rippleDecay  = 1.5f;
+    float g_rainCellSize = 24.0f;   // world units per impulse cell (~34 cm)
+    // THE CYCLE SHORTENS AS THE RAIN GETS HEAVIER. The dead time below exists so the player cannot
+    // catch a slot repeating, and how long that has to be depends entirely on how much else is
+    // going on: one ripple every few seconds on still water is trackable, the same ripple inside a
+    // downpour is not. So the effective cycle lerps from the slider (drizzle) down to this floor
+    // (downpour) on density, which also compounds with density on the rate — light rain is sparse
+    // AND slow, heavy rain is dense AND fast, which is how rain actually scales.
+    const float kRipplePeriodMin = 1.0f;
+    // ⚠ THE CYCLE INDEX WRAPS ON ITS OWN COUNT, NOT ON THE ANIMATION CLOCK. The phase below is
+    // INTEGRATED, so it has no natural period to hang the wrap on; this is just a bound that keeps
+    // the index small and the phase float exact. Any integer works — the wrap is seamless because a
+    // ripple can never span a cycle boundary (see uStart in waterripple.h.fsl).
+    const float kRippleWrapCycles = 512.0f;
+    // Integrated in writeWaveScales(); read back by the dev panel. Not a knob.
+    double g_ripplePhase = 0.0;
+    // LIFE vs PERIOD. Life is how long one ripple lasts; period is how often a SLOT may fire.
+    // period - life is DEAD time, and it has to be generous: a slot that is busy all cycle shows a
+    // ripple restarting the moment the last one dies, which reads as a blinking lattice however
+    // well the rest is randomised. 1.5 s alive in a 5 s cycle = 70% dead.
+    float g_rippleLife   = 1.5f;
+    // ⚠ SLOTS ARE WHAT KEEP DEAD TIME FROM BEING A RATE TAX. Independent impulses per cell per
+    // cycle, each with its own position, timing and dead time — so the decorrelation above survives
+    // while the impulse RATE multiplies by this. Visible ripples in flight per cell =
+    // density * slots * (life / period); new impulses per second per cell = density * slots /
+    // period. At one slot the 70% dead time above threw away two thirds of the rate and rain read
+    // as occasional plops. This is the cheap axis to buy rate on: the alternative is smaller cells,
+    // but the 3x3 bound is rDie <= cellSize, so that shrinks the ripples and then needs a wider
+    // neighbourhood — a whole extra cell iteration each, where a slot costs one hash.
+    float g_rippleSlots  = 3.0f;
+    float g_rainPeriod   = 5.0f;    // seconds per cell cycle (QUANTIZED at the write to divide the 20 s clock)
+    float g_rainDensity  = 0.0f;    // 0..1 active cells — the MANUAL value, used when the weather
+                                    // drive below is off. Default 0 = dry, so the A/B is the default.
+    // ---- R1 weather drive ----
+    // MW's own live precipitation counters, off waterParams[12]/[13]. Counters and not the weather
+    // TYPE: the engine ramps them across a transition, so rain arrives and leaves as a ramp for
+    // free. A type would be a step, and weather stepping is a bug the player can see.
+    float g_rainWetRain = 0.0f;
+    float g_rainWetSnow = 0.0f;
+    bool  g_rainFromWeather = true;
+    // The count that means "as hard as it rains". ⚠ MEASURED, and the measurement overturned the
+    // first guess by more than an order of magnitude. This was 650, taken from Morrowind.ini
+    // [Weather Rain] Max Raindrops, which turns out NOT to be what the 0x13c counter holds: a
+    // Thunderstorm logs `rain` in the 25..50 band and peaks near 49 (mgeHost64.log, `[ripl]
+    // weather:`). Max Raindrops is the particle system's own budget, a different quantity that
+    // happens to sit in the same ini section. At 650 a full thunderstorm produced density 0.07 and
+    // the surface read as dry. 50 is the observed ceiling.
+    // The same log also confirmed the reason for reading a COUNTER instead of the weather type:
+    // the ramp-in went 0 -> 12 -> 24 -> 38 -> 49, so a transition arrives as a ramp for free.
+    float g_rainWeatherRef = 50.0f;
+    // Snow counts for less. A flake carries a fraction of a raindrop's momentum and some of it
+    // simply lands, so the same particle count has to disturb the surface less.
+    float g_rainSnowWeight = 0.35f;
+    inline float effectiveRainDensity() {
+        if (!g_rainFromWeather) {
+            return std::min(std::max(g_rainDensity, 0.0f), 1.0f);
+        }
+        const float wet = (g_rainWetRain + g_rainSnowWeight * g_rainWetSnow)
+                        / std::max(g_rainWeatherRef, 1.0f);
+        return std::min(std::max(wet, 0.0f), 1.0f);
+    }
+
     // The three WT4d floats water.frag reads out of worlds[6] group 3, in one place so the live pass
     // and the --forge-view viewer cannot drift apart (they already write two independent copies of
     // this param block, and every past divergence between them has been a silent one).
@@ -10336,7 +10477,15 @@ namespace {
         // invariant, so with the normal forced to +Z a horizontally moving camera MUST give a
         // pixel-identical specular. Anything that moves is a bug, with no judgement call involved.
         if (g_waterFlatTest)        { f |= 16384u; }
-        // Round-trips exactly through the float: integers are exact to 2^24, this word maxes at 32767.
+        // bit 15: W9 PHYSICAL FRESNEL — the exact dielectric interface, both sides. The one that puts
+        // Snell's window at 48.6 degrees instead of 79 and retires the underwater sun double-count.
+        if (g_waterFresnelPhys)     { f |= 32768u; }
+        // bit 16: W9b n² radiance gain through the surface. Split from bit 15 because the exact
+        // Fresnel is right regardless, while the gain waits on a real direction remap.
+        if (g_waterSnellGain)       { f |= 65536u; }
+        // bit 17: reflection HDR RANGE view. Own bit, not a waterDbg mode, for heightView's reason.
+        if (g_waterHdrView)         { f |= 131072u; }
+        // Round-trips exactly through the float: integers are exact to 2^24, this word maxes at 262143.
         return (float)f;
     }
     inline float waterAlphaBase(float windFactor) {
@@ -10389,7 +10538,56 @@ namespace {
         // max(...,1) turns into a harmless degenerate tile rather than a divide by zero.
         g[6] = (float)g_waveSrcD;
         g[7] = g_waveTileWorld;
+        // R1 groups 2 and 3 — see waterripple.h.fsl. Written HERE, with the rest of worlds[10], for
+        // the reason stated above this function: an unwritten group reads as garbage, not zero, and
+        // both the live pass and --forge-view go through this one writer.
+        g[8]  = g_rippleAmp;
+        g[9]  = g_rainCellSize;
+        // ⚠ THE CYCLE PHASE IS INTEGRATED HERE, AND IT HAS TO BE. It used to be frac(time / period)
+        // off the 20 s animation clock, which forced `period` to divide 20 exactly (any other value
+        // put a jump at the clock wrap) — and, far worse, meant that CHANGING the period changed
+        // time/period discontinuously and teleported every ripple in the world. That is fatal the
+        // moment the period is driven by anything live, which is exactly what density now does. An
+        // integrated phase only ever changes its RATE, so the period is free, continuous, and needs
+        // no relationship to the animation clock at all. The quantisation is gone with it.
+        const float dens   = effectiveRainDensity();
+        const float period = std::max(g_rainPeriod + (kRipplePeriodMin - g_rainPeriod) * dens,
+                                      kRipplePeriodMin);
+        {
+            static double s_phase  = 0.0;
+            static double s_lastMs = -1.0;
+            const double now = hostNowMs();
+            if (s_lastMs < 0.0) { s_lastMs = now; }
+            double dt = (now - s_lastMs) * 0.001;
+            s_lastMs  = now;
+            // Clamped, so a load screen or an alt-tab does not fast-forward the field through
+            // hundreds of cycles and reshuffle everything the instant the player is looking again.
+            if (dt < 0.0)  { dt = 0.0; }
+            if (dt > 0.25) { dt = 0.25; }
+            s_phase += dt / (double)period;
+            if (s_phase >= (double)kRippleWrapCycles) {
+                s_phase = std::fmod(s_phase, (double)kRippleWrapCycles);
+            }
+            g_ripplePhase = s_phase;
+        }
+        g[10] = period;
+        g[11] = dens;
+        g[12] = g_rippleLamMin;
+        g[13] = std::max(g_rippleLamMax, g_rippleLamMin);
+        g[14] = g_rippleRadius;
+        g[15] = std::min(g_rippleLife, period);   // a ripple can never outlive its own cell cycle
         std::memcpy(wbuf + 10 * 64, g, 64);
+
+        // worlds[11] group 0 — R1 overflow. The wrap count is PUBLISHED rather than recomputed
+        // shader-side: it has to be the same integer the phase above was reduced modulo, and a
+        // second copy of it living in a shader is exactly the silent divergence this function's
+        // header warns about. Here it sits one line from the fmod that used it.
+        float r[16] = {};
+        r[0] = kRippleWrapCycles;
+        r[1] = g_rippleDecay;
+        r[2] = std::floor(std::max(g_rippleSlots, 1.0f) + 0.5f);   // integral; the shader loops on it
+        r[3] = (float)g_ripplePhase;   // < 512, so float32 keeps ~3e-5 of a cycle. Plenty.
+        std::memcpy(wbuf + 11 * 64, r, 64);
     }
 
     // ---- P1 point-light shadow knobs ----
@@ -11166,7 +11364,17 @@ namespace {
           // this resolves the major one with a tap set. 0 = off = pure minor axis (the W4 baseline).
           t.sliderU("Water: reflection vertical smear BUDGET (max taps; 0 = off) — wants tens",
                     &g_waterReflSmearTaps, 0u, 63u, 1u);
-          t.checkbox("Water: roughness-aware Schlick Fresnel (P4)", &g_waterSchlick);
+          // W9. Listed FIRST of the two because it overrides the Schlick checkbox below: with this on,
+          // that one selects nothing. Off = every previous term verbatim, sun double-count included.
+          t.checkbox("Water: PHYSICAL dielectric Fresnel (W9 — true 48.6deg Snell window)",
+                     &g_waterFresnelPhys);
+          // W9b. Its own checkbox, default OFF: the n² is real physics but it is the Jacobian of a
+          // direction remap this renderer does not perform, so on its own it is a flat 78% lift on
+          // everything seen through the surface rather than a bright window against a dark surround.
+          t.checkbox("Water: n2 radiance gain through the surface (W9b — needs true Snell mapping)",
+                     &g_waterSnellGain);
+          t.checkbox("Water: roughness-aware Schlick Fresnel (P4; ignored when W9 is on)",
+                     &g_waterSchlick);
           // UNIFIED WATER FOG. One extinction for the surface AND the submerged world, toward MW's
           // own [Water] colour — see waterfog.h.fsl. OFF restores the three private fades it
           // replaced (and the two absorption/scattering tints), byte for byte, which is the whole
@@ -11249,12 +11457,13 @@ namespace {
           // colour; the ini default (0.85) is loaded over this at startup.
           t.sliderF("Water fog: UnderwaterColor weight (0 = weather fog colour, 1 = ini colour)",
                     &g_waterFogWeight, 0.0f, 1.0f, 0.01f, "%.2f");
-          // W7a. MW multiplies sun AND ambient by a fixed absorption tint the moment the EYE
-          // submerges — measured x(0.19 0.26 0.29) / x(0.22 0.33 0.35). Depth-independent and
-          // camera-dependent, i.e. a global standing in for a local quantity, and a ~5x step at
-          // the crossing. 1 = cancelled (the water fog models the same absorption properly);
-          // 0 = MW's own tint, bit-identical. See cancelUnderwaterLightTint.
-          t.sliderF("Water fog: cancel MW's global underwater LIGHT tint (0 = keep MW's)",
+          // W7a. The moment the EYE submerges MW blends sun, ambient AND its fog/sky colours
+          // toward the authored UnderwaterColor: c' = c(1-w) + uwCol·w, w = 0.85. Depth-
+          // independent and camera-dependent, i.e. a global standing in for a local quantity, and
+          // a ~5x step at the crossing. 1 = exactly undone (the water fog models the same
+          // absorption properly); 0 = MW's own values, bit-identical. See unblendUnderwaterTint —
+          // and note this is an AFFINE inverse now, not the divide that drifted.
+          t.sliderF("Water fog: undo MW's global underwater blend (0 = keep MW's)",
                     &g_waterLightCancel, 0.0f, 1.0f, 0.05f, "%.2f");
           // W7b. Absorption on the way IN, per channel, from inverting the ini UnderwaterColor —
           // so a submerged surface is dim and blue because of ITS depth, not the camera's. Pairs
@@ -11357,6 +11566,22 @@ namespace {
           t.sliderF("Wave height debug gain (+/-; ramp saturates at |h*gain| = 1)",
                     &g_waveHeightGain, -4.0f, 4.0f, 0.01f, "%.2f");
           t.checkbox("Water: roughness debug view (R=reflection LOD, G=alpha, B=near/far crossfade)", &g_waterRoughView);
+          t.checkbox("Water: reflection HDR range view (grey<1, g/y/o/r = 1/2/4/8+, MAGENTA = clipped at 1.0)", &g_waterHdrView);
+          // R1. Density is the rain knob; amplitude is the look knob. They are separate because
+          // density is about to be driven by MW's weather and amplitude never will be.
+          t.checkbox("Ripple density from MW weather (off = the slider below)", &g_rainFromWeather);
+          t.sliderF("Ripple weather REF count (= density 1.0; thunderstorm peaks near 49)", &g_rainWeatherRef, 5.0f, 200.0f, 1.0f, "%.0f");
+          t.sliderF("Ripple snow weight (a flake disturbs less than a drop)", &g_rainSnowWeight, 0.0f, 1.0f, 0.05f, "%.2f");
+          t.sliderF("Ripple density per SLOT, MANUAL (used when the box above is off)", &g_rainDensity, 0.0f, 1.0f, 0.01f, "%.2f");
+          t.sliderF("Ripple impulses per cell (the RATE knob; costs one hash each)", &g_rippleSlots, 1.0f, 8.0f, 1.0f, "%.0f");
+          t.sliderF("Ripple peak slope at the impact point (0 = off)", &g_rippleAmp, 0.0f, 0.5f, 0.005f, "%.3f");
+          t.sliderF("Ripple DIE RADIUS (world units — the SIZE knob; clamped to cell size)", &g_rippleRadius, 2.0f, 120.0f, 1.0f, "%.0f");
+          t.sliderF("Ripple wavelength MIN (world units)", &g_rippleLamMin, 0.5f, 30.0f, 0.1f, "%.1f");
+          t.sliderF("Ripple wavelength MAX (world units)", &g_rippleLamMax, 0.5f, 30.0f, 0.1f, "%.1f");
+          t.sliderF("Ripple decay over RADIUS (the apparent slowing; speed is constant)", &g_rippleDecay, 0.0f, 10.0f, 0.1f, "%.1f");
+          t.sliderF("Ripple cell size (world units between impulses)", &g_rainCellSize, 8.0f, 256.0f, 1.0f, "%.0f");
+          t.sliderF("Ripple LIFE (s one ripple lasts)", &g_rippleLife, 0.2f, 6.0f, 0.05f, "%.2f");
+          t.sliderF("Ripple slot cycle at density 0 (s; lerps to 1.0s as density rises)", &g_rainPeriod, 1.0f, 20.0f, 0.1f, "%.2f");
           t.checkbox("Water: force reflection fog melt OFF (roughness calibration only)", &g_waterNoFogMelt);
           // SH1 sky-directional ambient (skyamb.h.fsl). STRENGTH 0 is the A/B: every receiver
           // early-outs to flat ambient, so the whole feature toggles against the previous image from
@@ -12582,11 +12807,13 @@ namespace ForgeRender {
             // cancel, and it is why abot has to come off and be re-baselined BEFORE this is measured.
             {
                 float* fdc = (float*)g_live.pFrameCbv->pCpuMappedAddress;
-                // W7a — BEFORE the decode, because the measurement compares authored values against
-                // authored values and a decode applied to one side only would read as a tint of its
-                // own. See cancelUnderwaterLightTint for why MW's global has to come off at all.
-                cancelUnderwaterLightTint(fdc, (waterEnabled != 0) && waterParams
-                                                                   && waterParams[7] > 0.5f);
+                // W7a — BEFORE the decode, and that ordering is load-bearing: MW applied its blend
+                // to AUTHORED display-referred values, so the inverse is only exact on the same
+                // side of the transfer function. Undo it after a decode and the linear-space
+                // subtraction removes the wrong amount at every level. See unblendUnderwaterTint.
+                // fogColNear (28..30) is undone here too, ahead of its own lift further down.
+                unblendUnderwaterTint(fdc, lighting, (waterEnabled != 0) && waterParams
+                                                                        && waterParams[7] > 0.5f);
                 decodeAuthoredRGB(fdc + 20);   // sunCol
                 decodeAuthoredRGB(fdc + 24);   // ambCol
             }
@@ -12687,9 +12914,19 @@ namespace ForgeRender {
             // ([[project_forge_wc_read_trap]]). Written from `lighting` at the same site and in the
             // same frame as fd[28..30], so it cannot describe a different frame's weather; a
             // null-lighting frame leaves both untouched together.
-            g_fogColAuthored[0] = lighting[12];
-            g_fogColAuthored[1] = lighting[13];
-            g_fogColAuthored[2] = lighting[14];
+            // ...and W7a's un-blend applies HERE too, on the same authored triple, because this
+            // latch reads `lighting` rather than the cbuffer. Leaving it tinted made
+            // publishWaterFog blend an already-blended colour toward UnderwaterColor a second
+            // time — 0.0225·fog + 0.9775·uwCol, i.e. very nearly pure UnderwaterColor, which is
+            // why submerged distance read as a flat wall rather than as water over a fog colour.
+            if (g_uwBlendActive) {
+                unblendUnderwaterRGB(lighting + 12, g_fogColAuthored,
+                                     std::max(0.0f, std::min(g_waterLightCancel, 1.0f)));
+            } else {
+                g_fogColAuthored[0] = lighting[12];
+                g_fogColAuthored[1] = lighting[13];
+                g_fogColAuthored[2] = lighting[14];
+            }
             //   fogParams.zw (34,35) = the inverse extent of the sky copy bound to THIS pass, so the
             // shader turns SV_Position into a uv without knowing which view it is in. The main copy is
             // ALLOC-sized (screen RTs are allocated at the render-scale ceiling and the frame draws a
@@ -15458,6 +15695,24 @@ namespace ForgeRender {
         // is the water fog's time-of-day density, and because the water block is already gated on
         // the cell having water, which is exactly when that density matters.
         if (waterParams) { g_waterFogHour = waterParams[11]; }
+        // R1: MW's live precipitation counters. Zeroed with the water block rather than latched —
+        // the client already zeroes them in interiors, and a latched counter would keep raining on
+        // the next puddle the player finds indoors.
+        g_rainWetRain = waterParams ? waterParams[12] : 0.0f;
+        g_rainWetSnow = waterParams ? waterParams[13] : 0.0f;
+        // One line per meaningful move in the derived density. The dev panel cannot show this — its
+        // label() takes a static string, so a live readout would freeze at whatever the panel was
+        // built with — and the REF knob above is exactly the kind of constant that can only be found
+        // by watching a real storm arrive. Edge-triggered, so a dry frame costs one compare.
+        {
+            static float s_lastDens = -1.0f;
+            const float dens = effectiveRainDensity();
+            if (std::fabs(dens - s_lastDens) > 0.02f) {
+                LOG::logline(">> [ripl] weather: rain %.0f snow %.0f ref %.0f -> density %.3f",
+                             g_rainWetRain, g_rainWetSnow, g_rainWeatherRef, dens);
+                s_lastDens = dens;
+            }
+        }
         // DIAGNOSTIC, one line per surface crossing. "MW is also changing lighting underwater" is a
         // claim the host can SETTLE rather than assume: these are MW's own authored values off the
         // wire, before any lift or decode, so a diff between the two lines around a crossing says

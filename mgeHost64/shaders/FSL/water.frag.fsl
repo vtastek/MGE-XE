@@ -23,6 +23,9 @@
 //   worlds[9] per noise = (rampLo, rampHi, wCells, zOffset)
 //   worlds[10] g0       = (lacunarity, distortion, normalize, isolate)
 //   worlds[10] g1       = (height debug gain, waveAmp, W3 slice count, W3 tile world period)
+//   worlds[10] g2       = (rippleAmp, rainCellSize, rainPeriod, rainDensity)   R1
+//   worlds[10] g3       = (lambdaMin, lambdaMax, radiusMax, rippleLife)        R1
+//   worlds[11] g0       = (cyclesPerWrap, rippleDecay, rippleSlots, ripplePhase) R1
 //
 // WT4d — WATER IS THE HOST'S FIRST PBR MATERIAL.
 //
@@ -57,6 +60,7 @@
 #include "skydome.h.fsl"   // fogSkyColor() — the same sampled fog target the world melts into
                            // (and, transitively, waterfog.h.fsl — see below)
 #include "wavefield.h.fsl" // W1: the procedural wave field (height + exact gradient + variance)
+#include "waterripple.h.fsl" // R1: analytic travelling-packet impulse ripples (rain/snow now, actors next)
 
 // ⚠ THIS SHADER NO LONGER OWNS A WATER FOG. It used to own THREE, all private and all disagreeing:
 // exp(-dist/500) toward fogColNear on the underwater refraction, exp(-depth/500) toward an XE
@@ -85,6 +89,73 @@
 // FSL defines no PI (aocommon.h.fsl carries its own AO_PI for the same reason). Prefixed so this
 // file can never collide with a future shared one.
 #define kWaterPI 3.14159265359f
+
+// --- PHYSICAL DIELECTRIC FRESNEL --------------------------------------------------------------
+// EXACT unpolarised Fresnel reflectance for a smooth dielectric interface. `eta` is
+// n_incident / n_transmitted, so ONE function serves both sides of the surface:
+//
+//   above water (air -> water)   eta = 1/1.333 = 0.750   no TIR; F climbs 0.020 -> 1 at grazing
+//   below water (water -> air)   eta = 1.333             TIR at 48.6 deg; F is EXACTLY 1 past it
+//
+// ⚠ THE SECOND CASE IS THE WHOLE POINT, AND THE CURVE THIS REPLACES COULD NOT EXPRESS IT. XE's
+// `pow(saturate(1.12 - 0.65*cos), 8)` was fitted to LOOK like a total-internal-reflection ramp, but
+// it has no critical angle anywhere in it — it only reaches 1 at cos = 0.1846, i.e. 79 degrees. So
+// the Snell window it drew was a 79-degree cone rather than a 48.6-degree one, 2.6x the solid angle,
+// and every direction between the two showed 84-95% REFRACTED SKY where the surface is physically a
+// perfect mirror. It is also 8.6x too dark looking straight up (0.0024 against F0 = 0.0204). Both
+// errors are structural: no refit of a two-constant power curve produces a hard edge at 48.6 degrees,
+// because the edge is a square-root singularity in cosT and a polynomial has none.
+//
+// Derived, not fitted: Snell gives sinT = eta*sinI, and the s/p amplitude ratios are the standard
+// interface equations. sin2T >= 1 has no real transmitted angle — that IS total internal reflection,
+// and it falls out of the algebra rather than being tested for at a hard-coded 48.6 degrees.
+//
+// The two max()es guard only the corner where TIR meets exactly grazing incidence (cosI = 0 with
+// eta > 1), where both numerator and denominator vanish; the select overrides that pixel with the
+// exact answer anyway, so they can never shape a value anyone sees. Branchless because this is
+// data-divergent per pixel across the window's rim, unlike a cbuffer bit
+// ([[project_uniform_branch_is_not_free]]).
+float fresnelDielectric(float cosI, float eta)
+{
+    cosI        = saturate(cosI);
+    float sin2T = eta * eta * (1.0f - cosI * cosI);
+    float cosT  = sqrt(max(1.0f - sin2T, 0.0f));
+    float a     = eta * cosI;
+    float rs    = (a - cosT)          / max(a + cosT,          1.0e-6f);
+    float rp    = (cosI - eta * cosT) / max(cosI + eta * cosT, 1.0e-6f);
+    return (sin2T >= 1.0f) ? 1.0f : saturate(0.5f * (rs * rs + rp * rp));
+}
+
+// ...and the same thing on a ROUGH surface, which is what actually softens the window's rim.
+//
+// The angle Fresnel wants is measured against the MICROFACET normal, not the macro one. Tilt N by
+// delta within the plane of incidence and theta_i shifts by exactly delta (out-of-plane tilt is
+// second order), so averaging F over the surface's slope distribution is a ONE-dimensional integral
+// in angle. GGX alpha is an RMS slope; per axis that is alpha/sqrt(2), and at the slopes water
+// actually has, slope and angle are the same number to better than a percent.
+//
+// Three-point Gauss-Hermite: nodes at 0 and +-sqrt(3)*sigma, weights 2/3, 1/6, 1/6. Textbook
+// quadrature, exact through fifth order, and NO tuned constant anywhere — sigma is the same `alpha`
+// the reflection LOD and the GGX lobe already read, so the three cannot drift apart. Rotating the
+// cosine directly (one sincos) instead of going through acos costs two transcendentals less.
+//
+// ⚠ IT SUBSUMES THE `f90 = max(1 - alpha, F0)` CEILING the Schlick branch used above water. That
+// ceiling existed because rough water must not reach a perfect mirror at grazing — and the REASON it
+// must not is that some of its microfacets face the eye more squarely, which is precisely what this
+// average computes. One mechanism, derived, instead of a hand-placed cap.
+//
+// Both clamps inside fresnelDielectric are exact here rather than merely safe: a node past normal
+// incidence (cLo > 1) folds to 0 degrees by symmetry, and a node past grazing (cHi < 0) is grazing.
+float fresnelDielectricRough(float cosI, float alpha, float eta)
+{
+    float d    = 1.7320508f * (alpha * 0.70710678f);   // sqrt(3) * per-axis RMS slope
+    float sinI = sqrt(saturate(1.0f - cosI * cosI));
+    float cd   = cos(d);
+    float sd   = sin(d);
+    return (2.0f / 3.0f) * fresnelDielectric(cosI, eta)
+         + (1.0f / 6.0f) * fresnelDielectric(cosI * cd + sinI * sd, eta)    // theta - d
+         + (1.0f / 6.0f) * fresnelDielectric(cosI * cd - sinI * sd, eta);   // theta + d
+}
 // Highest LOD in gReflectMips (kReflectMipCount - 1 host-side). A compile-time constant rather than
 // a param because the pyramid's depth is a fixed property of the host's resource, and because
 // SampleLevel's own clamp already handles the "pyramid didn't build" fallback safely.
@@ -202,6 +273,25 @@ float4 PS_MAIN( VSOutput In )
     bool   truePlaneOn   = (waterFlags & 8192u) != 0u;
     // Bit 14: FLAT-WATER TEST — force normal = +Z. See the invariant note at the flatten below.
     bool   flatWater     = (waterFlags & 16384u) != 0u;
+    // Bit 15: PHYSICAL FRESNEL (default ON) — the exact dielectric interface on BOTH sides of the
+    // surface, in place of the two fitted power curves. Clearing it restores every previous term
+    // verbatim, including the underwater sun double-count, so the A/B is exact in both directions.
+    bool   physFresnel   = (waterFlags & 32768u) != 0u;
+    // Bit 16: W9b n² RADIANCE GAIN through the surface (default OFF). Split off bit 15 — the exact
+    // Fresnel is right on its own, while the gain is only half of a change of variables whose other
+    // half (the direction remap) this renderer does not do. See the block at the refraction sample.
+    bool   snellGain     = (waterFlags & 65536u) != 0u;
+    // Bit 17: REFLECTION HDR RANGE view. Own bit for heightView's reason (bits 0-1 are full), and it
+    // answers a question the lit image structurally cannot: "is the reflection scene-referred too?"
+    // fails in TWO different ways that look identical once tonemapped, so the view separates them —
+    //   (a) wrong CONTAINER: an 8-bit RT clips, leaving a PLATEAU at exactly 1.0 wherever the mirrored
+    //       sun/sky was brighter. Painted magenta, because a plateau is a clip and nothing else is.
+    //   (b) wrong CONTENT: the reflect pass tonemapped before storing, so values compress smoothly
+    //       toward 1.0 and never plateau. Reads as "no band above 1.0 anywhere", including on the
+    //       mirrored sun disc, which is the one place a scene-referred frame MUST exceed 1.
+    // A correct HDR reflection shows coloured bands over the sun and specular highlights and NO
+    // magenta. See the resolve note in reflectmip.comp.fsl for the other half of this.
+    bool   hdrView       = (waterFlags & 131072u) != 0u;
     // W4b bits 6-11: reflection smear tap BUDGET (max anisotropy), 0/1 = OFF (a single isotropic
     // fetch at the minor-axis LOD, i.e. the shipped W4 look). Six bits, not four: the requirement is
     // 1/cosI and grazing water — which is most water — needs tens, so a 15 cap WAS the binding
@@ -220,6 +310,24 @@ float4 PS_MAIN( VSOutput In )
     // field's world period — 4x the shipped 527 at an unchanged texel density.
     float  waveSlices    = max(waveG1.z, 1.0f);
     float  waveTile      = max(waveG1.w, 1.0f);
+    // R1 — worlds[10] groups 2 and 3. rippleAmp == 0 is the A/B and costs nothing: the whole block
+    // is skipped on a cbuffer value, which is wave-uniform, so it is one of the branches
+    // [[project_uniform_branch_is_not_free]] does NOT apply to.
+    float4 ripG2         = transpose(gBatch.worlds[10])[2];
+    float4 ripG3         = transpose(gBatch.worlds[10])[3];
+    float  rippleAmp     = ripG2.x;
+    float  rainCell      = max(ripG2.y, 1.0f);
+    float  rainPeriod    = max(ripG2.z, 0.01f);
+    float  rainDensity   = ripG2.w;
+    float  rippleLamMin  = max(ripG3.x, 0.1f);      // per-ripple wavelength range, world units
+    float  rippleLamMax  = max(ripG3.y, rippleLamMin);
+    float  rippleRadius  = max(ripG3.z, 0.0f);      // the radius every ring dies at
+    float  rippleLife    = max(ripG3.w, 0.01f);     // how long ONE ripple lasts (< period = dead time)
+    float4 ripG4         = transpose(gBatch.worlds[11])[0];
+    float  rippleCycles  = max(ripG4.x, 1.0f);      // cycles per animation-clock wrap
+    float  rippleDecay   = max(ripG4.y, 0.0f);      // amplitude falloff over the ring's own RADIUS
+    float  rippleSlots   = max(ripG4.z, 1.0f);      // impulses per cell per cycle — the RATE knob
+    float  ripplePhase   = ripG4.w;                 // INTEGRATED host-side; period is live
     // WT4d roughness + reflection-LOD constants.
     //   alphaBase  = GGX alpha BELOW the normal map's finest texel (sub-5cm capillary structure the
     //                map cannot represent). Wind-scaled host-side. THE one hand-tuned knob in this
@@ -600,6 +708,39 @@ float4 PS_MAIN( VSOutput In )
     // two-scale crossfade correction is gone with the crossfade.
     float sigma2 = proceduralWaves ? waveSigma2 : afSigma2;
 
+    // --- R1: IMPULSE RIPPLES, added to BOTH halves of the same quantity --------------------------
+    // The ripple field is another height field over the same surface, so its slope adds to the wave
+    // field's slope and its unresolved variance adds to the wave field's variance. Adding to only
+    // one is the bug the whole LEAN/CLEAN block above exists to prevent: slope without variance is a
+    // ripple that aliases into crawl at distance, variance without slope is a ripple that never has
+    // a shape. ripplePacket() already split them with a single `res`, so they cannot drift.
+    //
+    // ⚠ SLOPES ADD, NORMALS DO NOT. `normal` is normalize(float3(slope, 1)) in both branches above,
+    // so normal.xy/normal.z recovers the slope exactly; re-normalising after the sum is what keeps
+    // the convention. Adding to normal.xy directly would silently rescale the base field by
+    // whatever tilt the ripple happened to have.
+    //
+    // The whole fpEll goes in, not a scalar. Every packet's wave vector points a different way, so
+    // the ellipse has to be projected onto each one — see the ⚠ in rainRipples. This used to pass
+    // the geometric mean of the axes, the same choice the baked-variance LOD makes ten lines up, on
+    // the reasoning that it errs HIGH and so pushes detail into roughness rather than aliasing. That
+    // reasoning holds for an isotropic field and NOT for a ring: at the grazing angles water is
+    // actually viewed at, the mean is dominated by the major axis and buries the ripple entirely.
+    //
+    // ⚠ worldXY, NOT In.WorldPos.xy: the ripple lattice is anchored to the WATER surface and to the
+    // world, not to the camera-relative mesh. That is also why it is not split into eye + offset the
+    // way wavefield's noise lattice is — the hash takes an INTEGER cell index, so the large
+    // coordinate is quantised away before any float precision is spent on it
+    // ([[project_forge_precision_far_origin]] applies to the sub-cell offset only, which is small).
+    if (rippleAmp > 0.0f && !flatWater) {
+        float3 rip  = rainRipples(worldXY, ripplePhase, rainCell, rainPeriod, rippleLife,
+                                  rainDensity, rippleSlots, rippleAmp, rippleLamMin, rippleLamMax,
+                                  rippleRadius, rippleDecay, rippleCycles, fpEll);
+        float2 base = normal.xy / max(normal.z, 1e-4f);
+        normal  = normalize(float3(base + rip.xy, 1.0f));
+        sigma2 += rip.z;
+    }
+
     // sigma2 sums both slope axes, so the per-axis variance is sigma2/2; the Beckmann/GGX slope-
     // space mapping is alpha² = 2 * varPerAxis, which cancels to exactly this. alphaBase covers
     // structure below EITHER field's finest representable detail — capillary ripple that is simply
@@ -833,6 +974,37 @@ float4 PS_MAIN( VSOutput In )
         // Refraction — alloc-sized RT, so pixel offsets scale by invAlloc (see the block above).
         float2 ruvU = baseUV + (-2.0f * reffactorU) * invAlloc;
         float3 refractedU = SampleLvlTex2D(gRefractColor, gSamplerBilinearClamp, ruvU, 0.0f).rgb;
+
+        // ⚠ RADIANCE IS NOT INVARIANT ACROSS A REFRACTIVE BOUNDARY — L/n² is, and THIS is why the
+        // Snell window is famously the brightest thing an underwater diver sees. Light crossing
+        // air -> water gains n² = 1.777 in radiance; the sky genuinely is 78% brighter through the
+        // surface than the same sky viewed in air. Nothing upstream supplies it: sky.frag and the
+        // above-water geometry both render air-referred radiance and neither knows an interface is
+        // coming. So it belongs exactly here, on the sample, before anything mixes into it.
+        //
+        // ⚠ AND I TALKED MYSELF OUT OF IT ONCE, SO HERE IS THE REFUTATION IN FULL. The argument was:
+        // "the n² gain and the hemisphere COMPRESSION are one transaction — this is a screen-space
+        // refraction sampled along the UNREFRACTED direction, so the sky already fills the window
+        // unsqueezed and the flux is already right." That conflates a radiance with a flux. Not
+        // compressing means we read the sky from the WRONG DIRECTION; it does not mean we read a
+        // larger VALUE. Per pixel the correct answer is n²·T·L_air(w_refracted) and we compute
+        // n²·T·L_air(w_view) — the direction is approximate, the n² is not optional. The flux check
+        // agrees: dw_air/dw_water = n²·cos(t_air)/cos(t_water), so the n² is exactly what carries a
+        // hemisphere's worth of sky into the cone, and dropping it loses 44% of the window's light.
+        //
+        // ⚠ ALL OF WHICH IS STILL TRUE, AND IT IS OFF BY DEFAULT ANYWAY (W9b, its own bit 16). The
+        // refutation answers "is the gain physical", which was never the problem. The problem is
+        // what it looks like without its other half: n² is the JACOBIAN of a direction remap, and a
+        // real Snell window reads as bright because that remap concentrates a hemisphere into a
+        // 48.6-degree cone against a dark TIR surround. We apply the Jacobian to an unremapped
+        // screen-space copy and tonemap with a fixed exposure, so there is no concentration and
+        // nowhere to put the extra 78% — it lands as a flat lift on the entire refracted view.
+        // Reported from play twice in exactly those terms ("everything above water brighter —
+        // objects, sky, sun, moons"), which is precisely the set this line multiplies.
+        //
+        // Turn it back on with the direction remap, not before. Written as a multiply by 1.0f when
+        // off, which is exact, so the legacy fade below is untouched byte for byte.
+        refractedU *= snellGain ? (kWaterIOR * kWaterIOR) : 1.0f;
         // ⚠ UNDER W8 THE REFRACTION IS NOT FOGGED HERE AT ALL, AND THAT DELETION IS THE FIX — it is
         // the "at which point this term deletes" the comment above predicted. This term existed
         // because the refraction sample holds two kinds of pixel and only one of them arrived
@@ -889,15 +1061,42 @@ float4 PS_MAIN( VSOutput In )
         }
         if (waterDbg == 2u) { RETURN(float4(refractedU, 1.0f)); }
 
-        // Total internal reflection. Unlike the above-water Fresnel this saturates HARD as the view
-        // flattens out: below the critical angle the surface stops transmitting entirely.
-        float  fresnelU = pow(saturate(1.12f - 0.65f * dot(-EyeVec, nrm)), 8.0f);
+        // --- SNELL'S WINDOW ----------------------------------------------------------------------
+        // ⚠ THE OLD CURVE HAD NO CRITICAL ANGLE IN IT, and that is the whole reported bug: the window
+        // was drawn as a 79-degree cone instead of a 48.6-degree one and filled with refracted sky at
+        // 84-95% weight out to its rim, where the surface is physically a perfect mirror of the
+        // seabed. See fresnelDielectric's header for the measured table. The exact interface puts the
+        // edge where the medium puts it, and fresnelDielectricRough softens it by the surface's OWN
+        // slope distribution rather than by a smoothstep — so calm water gets a crisp rim and choppy
+        // water a broken one, from the same `alpha` the reflection LOD reads.
+        //
+        // eta = kWaterIOR (not its reciprocal): we are INSIDE the water looking out.
+        float  cosU = dot(-EyeVec, nrm);
+        float  fresnelU = physFresnel ? fresnelDielectricRough(cosU, alpha, kWaterIOR)
+                                      : pow(saturate(1.12f - 0.65f * cosU), 8.0f);
         float3 resultU  = lerp(refractedU, reflectedU, fresnelU);
 
-        // Sun refraction — the bright disc smeared through the surface from below.
-        float3 sunPosU    = -gFrameData.sunDir.xyz;   // gFrameData.sunDir = travel dir; to-sun = -dir
-        float  refractsun = saturate(dot(-EyeVec, normalize(-sunPosU + nrm)));
-        resultU += gFrameData.sunCol.rgb * pow(refractsun, 6.0f) * uwFog;
+        // ⚠ AND THE SUN IS ALREADY IN THE REFRACTION — this term was a DOUBLE COUNT, inherited from
+        // XE Mod Water.fx:626 and carried in unexamined. sky.frag draws the sun disc, the moons and
+        // the stars into the colour target; the refraction copy is taken AFTER that pass, so the sun
+        // arrives through `refractedU` on its own. Adding a pow-6 lobe — roughly 40 degrees wide — of
+        // full sunCol on top of it put most of a sun's worth of light across the entire window. In the
+        // DX9 LDR days that clipped and read as glare; scene-referred it is simply a wash, and it is
+        // the other half of "opaque white".
+        //
+        // The real brightness this hack was standing in for is the n² radiance gain, which is now
+        // applied on the sample itself where it belongs — see the note at the fetch.
+        //
+        // TWO approximations legitimately remain, and neither is an additive sun:
+        //   - the refracted DIRECTION. We sample along the view ray, so the window's rim shows sky
+        //     from ~48 degrees up where it should show the horizon. Fixing it means reprojecting
+        //     refract(EyeVec, nrm, kWaterIOR) through the forward viewProj, not offsetting a uv.
+        //   - the roughness BLUR of the refracted image (a LOD on this sample, driven by `alpha`).
+        if (!physFresnel) {
+            float3 sunPosU    = -gFrameData.sunDir.xyz;   // sunDir = travel dir; to-sun = -dir
+            float  refractsun = saturate(dot(-EyeVec, normalize(-sunPosU + nrm)));
+            resultU += gFrameData.sunCol.rgb * pow(refractsun, 6.0f) * uwFog;
+        }
 
         RETURN(float4(resultU, 1.0f));
     }
@@ -1089,6 +1288,32 @@ float4 PS_MAIN( VSOutput In )
                                         In.Position.xy * invScreen, 0.0f);
         RETURN(float4(rawRefl.rgb, 1.0f));
     }
+    // Bit 17: the RANGE of that same sample, false-coloured. Undistorted and POINT-sampled, both on
+    // purpose: bilinear averages a clipped texel with its neighbour and turns the 1.0 plateau this
+    // view exists to find into a smooth ramp, which is precisely the signature it must not erase.
+    //
+    // UNPREMULTIPLIED first — the RT stores rgb*coverage, so a half-covered texel of a 4.0-radiance
+    // sky reads 2.0 and would be reported as a dimmer surface than it is. Coverage 0 has no radiance
+    // to report at all (black, not a division by zero).
+    //
+    // Bands, on max(rgb) so a single saturated channel still counts:
+    //   grey   below 1     — LDR range (the mirrored sun disc must NOT be here)
+    //   green  1 .. 2      | yellow 2 .. 4 | orange 4 .. 8 | red 8+   — genuine HDR headroom in use
+    //   MAGENTA within 0.2% of 1.0 — a clip plateau; the container is too narrow
+    if (hdrView) {
+        float4 raw = SampleLvlTex2D(gReflectColor, gSamplerPointClamp,
+                                    In.Position.xy * invScreen, 0.0f);
+        float3 rad = (raw.a > 0.001f) ? (raw.rgb / raw.a) : float3(0.0f, 0.0f, 0.0f);
+        float  m   = max(rad.r, max(rad.g, rad.b));
+        float3 c;
+        if (m >= 0.998f && m <= 1.002f) { c = float3(1.0f, 0.0f, 1.0f); }        // clipped
+        else if (m <  1.0f)             { c = float3(0.25f, 0.25f, 0.25f) * m; } // LDR range
+        else if (m <  2.0f)             { c = float3(0.0f, 1.0f, 0.0f); }
+        else if (m <  4.0f)             { c = float3(1.0f, 1.0f, 0.0f); }
+        else if (m <  8.0f)             { c = float3(1.0f, 0.5f, 0.0f); }
+        else                            { c = float3(1.0f, 0.0f, 0.0f); }
+        RETURN(float4(c, 1.0f));
+    }
     if (waterDbg == 2u) { RETURN(float4(refracted, 1.0f)); }
     // Mode 3 = ROUGHNESS, false-coloured. Roughness has no silhouette of its own, so a wrong
     // variance is close to undiagnosable from the lit image — this is the same reasoning that gave
@@ -1145,7 +1370,13 @@ float4 PS_MAIN( VSOutput In )
     // the specular lobe read it. N is the honest mip-filtered mean normal.
     float NoV = saturate(dot(-EyeVec, normal));
     float fresnel;
-    if (useSchlick) {
+    if (physFresnel) {
+        // The exact interface, air -> water, so eta is the RECIPROCAL of the underwater case. No TIR
+        // on this side (a denser transmitted medium always has a real refracted ray), so what changes
+        // versus Schlick is only the mid-range: exact runs a few percent lower from 50-80 degrees and
+        // reaches 1 slightly later. The roughness ceiling comes free — see fresnelDielectricRough.
+        fresnel = fresnelDielectricRough(NoV, alpha, 1.0f / kWaterIOR);
+    } else if (useSchlick) {
         // TRUE Schlick with the roughness ceiling (P4). max(1-alpha, F0) stops rough water reaching
         // full mirror reflectance at grazing angles — THIS is what fixes "distant water is a hard
         // mirror" at the root, instead of fogging it.
@@ -1197,10 +1428,17 @@ float4 PS_MAIN( VSOutput In )
     float  ll = NoV * sqrt(NoL * NoL * (1.0f - a2) + a2);
     float  Vis = 0.5f / max(lv + ll, 1e-8f);
 
-    // Schlick F on the HALF vector (not the normal — this is the microfacet's own Fresnel).
+    // F on the HALF vector (not the normal — this is the microfacet's own Fresnel), and here the
+    // EXACT interface rather than Schlick, because D already carries the microfacet distribution:
+    // this evaluation is on one specific facet, so it wants the smooth-surface answer and must NOT be
+    // roughness-averaged a second time. Schlick over-predicts water by up to ~8% around 70 degrees,
+    // which is exactly where the glitter path lives.
+    // (The legacy spelling keeps its explicit multiply chain rather than a pow(), so its off-side is
+    // bit-identical and not merely close.)
     float  fm  = 1.0f - VoH;
     float  fm5 = fm * fm; fm5 = fm5 * fm5 * fm;
-    float  F   = kWaterF0 + (1.0f - kWaterF0) * fm5;
+    float  F   = physFresnel ? fresnelDielectric(VoH, 1.0f / kWaterIOR)
+                             : kWaterF0 + (1.0f - kWaterF0) * fm5;
 
     // Energy normalisation for the representative-point widening: broadening aSpec -> aEff spreads
     // the same power over a wider lobe, so scale by (aSpec/aEff)² to keep the integral put.
