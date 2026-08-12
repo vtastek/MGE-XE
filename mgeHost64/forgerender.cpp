@@ -2396,17 +2396,46 @@ namespace {
     // this knob no longer has to carry a job it could not do. CDOM stays reachable for anyone who
     // wants genuinely green swamp water; it is simply not the default any more.
     float              g_waterTurbidity  = 0.0f;
+    // --- W9: WATER'S OWN BASELINE ABSORPTION ---------------------------------------------------
+    // 0 = the absorption SHAPE inverted out of MW's authored UnderwaterColor (what shipped before
+    // this knob, and bit-exact at 0). 1 = pure water's MEASURED spectrum.
+    //
+    // ⚠ MW'S SLOPE IS NEARLY GREY, AND THE CROSS-CHECK THAT SEEMED TO CONFIRM IT PROVES SOMETHING
+    // WEAKER THAN IT LOOKS. Inverting (12,30,37) gives a normalised (1.287, 0.901, 0.812) — red:blue
+    // of 1.59:1. Pure water is about 24:1. A 1.59:1 spectrum can only DIM; it cannot tint, which is
+    // exactly the report: "sun and ambient is not going blue enough, fast enough... water is just
+    // dark. even exposure doesn't bring any blue." Exposure cannot, and that is the tell — lifting
+    // the level of a nearly-neutral triple returns a brighter neutral.
+    //   The published comment below checks that slope against the tint MW itself applies to ambient
+    // underwater and finds them within 6%. That agreement is real but it is not evidence about
+    // WATER: both numbers are 2002 art choices from the same authors, so it only establishes that
+    // Bethesda was self-consistent. The log makes it worse — -ln compresses, so the authored
+    // colour's healthy 3:1 channel ratio collapses to 1.59:1 in sigma.
+    //
+    // Also worth knowing WHY no amount of turbidity fixed it: CDOM is BLUE-absorbing, so the only
+    // axis the model had ran toward green. Blue was not in the span of (MW slope -> CDOM) at any
+    // setting, which is [[feedback_model_class_not_knobs]] again — the reachable set did not
+    // contain the answer.
+    // 0.5 SETTLED IN PLAY, not a compromise for its own sake. Full purity is the right physics for
+    // an open ocean; Vyzhennye's water is shallow, silty and mostly inland, and the midpoint shape
+    // (1.801, 0.745, 0.454) still runs red:blue at 3.97:1 — two and a half times MW's authored slope,
+    // which is all the complaint needed — without the near-total blue transparency 24:1 gives.
+    // The purely physical end is one slider away and is still the reference.
+    float              g_waterPurity     = 0.5f;
     // --- W8: SCATTERING ----------------------------------------------------------------------
     // sigma_s / sigma_a, i.e. how much of the medium puts light BACK rather than eating it. This is
     // what "turbidity" was reaching for and could not express: particles both scatter and attenuate,
     // and it is the RATIO of the two that sets the colour of deep water.
     //
     // The colour falls out rather than being picked. In-scatter over a long ray converges to the
-    // single-scattering albedo sigma_s/sigma_t times the light that got down there, so with the
-    // absorption spectrum red-heavy (water's own, 1.286/0.901/0.812) and the scattering spectrum
-    // mildly blue (lambda^-1, 0.874/0.975/1.151), the albedo at this default is
-    // (0.352, 0.464, 0.531) — normalised (0.66, 0.87, 1.00), which is cyan-blue. Nothing was tuned
-    // to make that happen; it is what two independent spectra do when you divide them.
+    // single-scattering albedo sigma_s/sigma_t times the light that got down there, so with a
+    // red-heavy absorption spectrum and a mildly blue scattering one (lambda^-1,
+    // 0.874/0.975/1.151), the albedo comes out cyan-blue. Nothing was tuned to make that happen; it
+    // is what two independent spectra do when you divide them.
+    // ⚠ The worked example that used to sit here quoted the absorption shape as a CONSTANT
+    // (1.286/0.901/0.812). It is not one any more — g_waterPurity moves it, and at the 0.5 default
+    // it is (1.801, 0.745, 0.454). The numbers are omitted rather than updated because they would go
+    // stale again on the next slider move; the mechanism is the part worth keeping.
     //
     // ⚠ THE CROSS-CHECK IS WORTH KNOWING. That derived colour's HUE lands within ~8% of MW's own
     // authored [Water] UnderwaterColor, which was picked by hand and never saw either spectrum. Only
@@ -2415,7 +2444,11 @@ namespace {
     //
     // 0 = a pure absorber: deep water goes BLACK, which is a real setting and a useful negative
     // control. Up = milkier and paler, because the albedo rises toward 1 in every channel at once.
-    float              g_waterScatterRatio  = 0.8f;
+    //
+    // 0.5, down from 0.8, settled in play alongside purity 0.5. The two pull the same direction and
+    // had to be set together: a stronger absorption spectrum already darkens and saturates deep
+    // water, so the scattering that was propping the old flat spectrum up now reads as haze.
+    float              g_waterScatterRatio  = 0.5f;
     // The one calibration constant in W8, and it is honest about why it exists: the in-scatter is
     // sigma_s * (sunCol * phase + ambCol) * pathlength, but "sunCol" is a radiance the engine never
     // defined a matching irradiance for, so the absolute scale is not derivable from the wire.
@@ -2424,14 +2457,27 @@ namespace {
     // UnderwaterColor — chosen so the verified match this feature started from survives the switch
     // to deriving it. Raise it for livelier, more luminous water; the HUE does not move.
     //
-    // ⚠ 1.0 (the model's own value, on the argument that sunCol/ambCol ARE the irradiances the
-    // integral wants) was tried and REVERTED 2026-08-10. The argument for raising it still stands on
-    // paper — 0.30 was fitted against a display-referred target, and fitted while applyFog was
-    // lifting 62-100% of every submerged pixel toward the sky colour. It was reverted because the
-    // PREDICTION attached to it was falsified: in play the gain moves the visible scatter and moves
-    // NOTHING about the dim sky or the horizon band, which are MW's own underwater weather state
-    // arriving over the wire. Do not re-raise it as a fix for those; re-raise it only as a look call.
-    float              g_waterInscatterGain = 0.30f;
+    // ⚠ W9b — THIS IS NOW A PURE ARTISTIC MULTIPLIER AND ITS DEFAULT IS 1.0. The physics it stood in
+    // for has moved into the shader where it is derivable, as two separate coefficients:
+    //     sun     0.25    hgNorm's 4pi, over sunCol already being E/pi
+    //     ambient 0.301   n^2 * Omega/4pi — refraction packs the sky into the Snell cone
+    // See waterColumn() in waterfog.h.fsl for both derivations.
+    //
+    // ⚠ AND THE HEADLINE RESULT IS THAT 0.30 WAS ALREADY RIGHT. Two independent derivations land on
+    // 0.25 and 0.301, which is precisely why one hand-fitted knob served both terms for so long. The
+    // fit was not a fudge; it was measuring something real. Splitting them changes almost nothing
+    // (the sun drops 17%, ambient is unmoved) — the value of the split is that the numbers are now
+    // derived rather than fitted, so they stay correct if the medium or the light convention moves.
+    //
+    // ⚠ DO NOT RAISE THIS TO "MAKE OVERCAST LIVELIER". That was tried on 2026-08-12 on the argument
+    // that the ambient coefficient was 1 rather than 0.301, and it is wrong twice: the coefficient is
+    // 0.301, and underwater every term carries the column INCLUDING the TIR mirror, so the lift
+    // floods the ring around Snell's window and destroys the contrast that makes the window read.
+    // It presents as a Fresnel bug. Overcast hue belongs to g_waterPurity, not to this.
+    // The older 2026-08-10 note said the same thing from the other end and its falsified prediction
+    // still stands: this gain moves visible scatter and moves NOTHING about the dim sky or the
+    // horizon band, which are MW's own underwater weather state arriving over the wire.
+    float              g_waterInscatterGain = 1.0f;
     // PHASE (phase.h.fsl). Water is strongly forward-scattering — Petzold's average particle is near
     // g = 0.92 — so the sun's halo through the water is real and large, and a lone lobe that big
     // leaves nothing at 90 degrees. Three terms with the gains summing to ~1 keeps the phase roughly
@@ -11395,6 +11441,11 @@ namespace {
           // and W8's scattering (below) is the axis that was actually wanted.
           t.sliderF("Water fog: CDOM absorption hue (0 = blue-green water, up = green swamp)",
                     &g_waterTurbidity, 0.0f, 1.0f, 0.01f, "%.2f");
+          // W9: which MEDIUM the CDOM hue above is tinting. 0 = MW's authored slope (red:blue
+          // 1.59:1 — it can only dim), 1 = measured pure water (24:1 — it tints). This is the knob
+          // that makes overcast water go BLUE instead of merely dark.
+          t.sliderF("Water fog: purity (0 = MW's authored slope, 1 = measured pure water)",
+                    &g_waterPurity, 0.0f, 1.0f, 0.01f, "%.2f");
           // --- W8: VOLUMETRIC in-scatter ---------------------------------------------------------
           // The model change. 0 = fade toward a published target evaluated at the fragment's own
           // midpoint depth (which is what printed geometry silhouettes onto the water); 1 = an
@@ -11408,9 +11459,11 @@ namespace {
           // useful negative control). Up = milkier and paler as the albedo saturates toward 1.
           t.sliderF("Water fog: SCATTERING ratio sigma_s/sigma_a (0 = black absorber, up = milky)",
                     &g_waterScatterRatio, 0.0f, 4.0f, 0.05f, "%.2f");
-          // The model's only free magnitude — the wire has no irradiance to pin sun radiance to.
-          // 0.30 reproduces MW's authored UnderwaterColor at clear midday; the hue does not move.
-          t.sliderF("Water fog: in-scatter GAIN (0.30 = MW's own UnderwaterColor brightness)",
+          // W9b: the sun (1/4) and ambient (1) coefficients are DERIVED in the shader now, so this is
+          // a pure look multiplier on top of both. 1.0 = physical; 1.2 restores the old clear-midday
+          // match to MW's authored UnderwaterColor. Also the A/B for "is the water brighter than the
+          // land because of SCATTER" — absorption cannot brighten anything, so 0 here settles it.
+          t.sliderF("Water fog: in-scatter GAIN (1.0 = physical; 0 = absorption only)",
                     &g_waterInscatterGain, 0.0f, 3.0f, 0.01f, "%.2f");
           // The backstop. OFF restores MW's own frame showing through every uncovered pixel — which
           // underwater is the above-water sky with the sun still in it. Fills by COVERAGE, not depth,
@@ -25912,10 +25965,27 @@ namespace ForgeRender {
             // shape is exp(-0.014*(lambda-440)) at RGB centroids (600, 550, 450) nm, pre-normalised
             // to unit mean here so the blend below cannot change the overall rate — only the hue.
             constexpr float kCdom[3] = { 0.2684f, 0.5403f, 2.1912f };
-            const float t = std::max(0.0f, std::min(g_waterTurbidity, 1.0f));
+
+            // W9: PURE WATER'S OWN ABSORPTION, the floor no water is cleaner than. Pope & Fry 1997
+            // at the same (600, 550, 450) nm centroids kCdom uses: 0.2224 / 0.0565 / 0.00922 per
+            // metre, normalised to unit mean so it swaps in without touching the rate the visibility
+            // knob owns. Red:blue is 24:1 here against MW's authored 1.59:1 — see g_waterPurity for
+            // why the authored slope is that flat and why the CDOM axis could never compensate.
+            // (The scatter term inside K_d then lifts blue back to an effective ~14:1, which is the
+            // diffusion floor doing its job rather than a loss of the effect.)
+            constexpr float kPureWater[3] = { 2.3157f, 0.5883f, 0.0960f };
+
+            const float t   = std::max(0.0f, std::min(g_waterTurbidity, 1.0f));
+            const float pur = std::max(0.0f, std::min(g_waterPurity, 1.0f));
             float absShape[3];
             for (int i = 0; i < 3; ++i) {
-                absShape[i] = (1.0f - t) * (sig[i] / mean) + t * kCdom[i];
+                // The baseline is a blend between the two candidate MEDIA; CDOM then tints whichever
+                // one you picked. Written as a + p*(b - a) so purity 0 is EXACTLY the authored slope
+                // and not almost it — this lane feeds waterLightTransmit, the column and the view
+                // fog alike, so a near-miss would make the A/B a slightly different image.
+                const float base = sig[i] / mean;
+                const float med  = base + pur * (kPureWater[i] - base);
+                absShape[i] = (1.0f - t) * med + t * kCdom[i];
                 mp[kWaterFogLightFloat + i] = kView * absShape[i];
             }
             mp[kWaterFogLightFloat + 3] = std::max(0.0f, std::min(g_waterLightAbsorb, 1.0f));

@@ -56,6 +56,16 @@ float waterFogPlaneRelZ()
 #define kWaterCosCrit  0.6612f
 #define kWaterDiffuse  1.2039f
 
+// --- W9b: THE TWO IN-SCATTER COEFFICIENTS, derived (see waterColumn for the working) ------------
+// SUN, collimated: hgNorm carries a 4*pi and MW's sunCol is already E/pi, leaving 1/4.
+#define kInscatterSun  0.25f
+// AMBIENT: the phase integrates away for a uniform field, but the field is NOT uniform over the
+// sphere down here — refraction packs the entire sky into the Snell cone. Two factors, opposite
+// signs: only Omega/4pi = (1 - cosCrit)/2 of the sphere carries any sky at all, and the radiance
+// inside that cone is n^2 higher for it. Both fall out of n; nothing is tuned.
+//     0.5 * (1 - 0.6612) * 1.333^2  =  0.1694 * 1.7769  =  0.3010
+#define kInscatterAmb  (0.5f * (1.0f - kWaterCosCrit) * kWaterIOR * kWaterIOR)
+
 // Depth of this fragment BELOW the surface, world units; 0 for anything above it.
 float waterFogDepthBelow(float3 worldPosRel)
 {
@@ -452,7 +462,36 @@ void waterColumn(float3 worldPosRel, float L, bool openEnded, out float3 inscat,
     float wSingle = openEnded ? 0.0f : exp(-tauS);
     ph = lerp(ph, 1.0f, saturate(gShadowParams.waterFogPhase2.z) * (1.0f - wSingle));
 
-    inscat = sigS * (gFrameData.sunCol.rgb * ph * iSun + gFrameData.ambCol.rgb * iAmb)
+    // ⚠ WHERE PI IS. Two of them, pulling opposite ways, and until W9b they were being cancelled by
+    // a single hand-tuned gain that could only be right for one of the two terms.
+    //
+    //   hgNorm multiplies the true phase by 4*pi so that "isotropic == 1" (phase.h.fsl).
+    //   MW's sunCol is a FIXED-FUNCTION value: `albedo * sunCol * NdotL` stands in for Lambert's
+    //   `albedo/pi * E * NdotL`, so sunCol is already E/pi. Inherited convention, written down here
+    //   because it is written down nowhere else and every radiometric question in this file needs it.
+    //
+    // Sun, collimated:  dL/ds = sigma_s * p * E
+    //                         = sigma_s * (ph / 4pi) * (pi * sunCol)  =  sigma_s * ph * sunCol / 4
+    // so the coefficient is 1/4 — the pi cancels and the 4 does not.
+    //
+    // Ambient takes a different route and lands in nearly the same place. The phase integrates away
+    // for a uniform field (∫p dw == 1) and ambCol IS the ambient radiance under the same FFE
+    // convention — but the field is not uniform over the sphere down here. Refraction packs the whole
+    // sky into the Snell cone, so only Omega/4pi = 0.169 of the sphere carries any sky, and the
+    // radiance within it is n^2 = 1.78 higher. Product 0.301. See kInscatterAmb.
+    //
+    // ⚠ AND THAT MEANS THE OLD SHARED GAIN OF 0.30 WAS ALREADY RIGHT FOR BOTH TERMS — 0.25 and 0.301
+    // by two independent derivations, which is exactly why one hand-fitted knob served them. An
+    // earlier revision of this comment claimed the ambient coefficient was 1 and that the term had
+    // been running 3.3x under; that was wrong, and it was wrong in the one direction the renderer
+    // punishes hardest. Underwater EVERY term carries this column — including the TIR mirror
+    // (water.frag's `reflectedU = waterFogBlend(...)`) — so lifting in-scatter 3.3x floods the mirror
+    // ring around Snell's window and erases the contrast that makes the window read as a window. It
+    // presents as "the Fresnel changed" even though the Fresnel curve is untouched.
+    // The error was assuming a full-sphere uniform field INSIDE the medium. Refraction is what makes
+    // that false, and refraction is already the thing every other constant in this file turns on.
+    inscat = sigS * (kInscatterSun * gFrameData.sunCol.rgb * ph * iSun
+                   + kInscatterAmb * gFrameData.ambCol.rgb * iAmb)
            * gShadowParams.waterFogScatter.w;
 }
 
