@@ -552,7 +552,8 @@ namespace IPC {
 		std::uint32_t debugMode,
 		const DevInput* devInput,
 		const float* waterParams, std::uint32_t waterEnabled,
-		const FPFrame* fp) {
+		const FPFrame* fp,
+		const float* actorRipples, std::uint32_t actorRippleCount) {
 		WAIT_FOR_PREVIOUS_COMMAND;
 
 		auto& params = m_ipcParameters->params.renderFrameParams;
@@ -587,6 +588,14 @@ namespace IPC {
 		if (waterParams) { std::memcpy(params.waterParams, waterParams, sizeof(params.waterParams)); }
 		else { std::memset(params.waterParams, 0, sizeof(params.waterParams)); }
 		params.waterEnabled = waterEnabled;
+		// R2 actor ripples. Count is CLAMPED here rather than trusted: it is derived from MW's
+		// live pool walk, and the copy below is straight into a fixed wire array.
+		params.actorRippleCount = (actorRipples && actorRippleCount <= kMaxActorRipples)
+		                        ? actorRippleCount : 0;
+		if (params.actorRippleCount) {
+			std::memcpy(params.actorRipples, actorRipples,
+			            params.actorRippleCount * 4 * sizeof(float));
+		}
 		// FP1a first-person: one optional bundle; null ⇒ fpEnabled=0, host skips the FP pass.
 		if (fp) {
 			std::memcpy(params.fpViewProj, fp->viewProj, 16 * sizeof(float));
@@ -691,6 +700,7 @@ namespace IPC {
 		const DevInput* devInput,
 		const float* waterParams, std::uint32_t waterEnabled,
 		const FPFrame* fp,
+		const float* actorRipples, std::uint32_t actorRippleCount,
 		double* outRenderMs) {
 		// Fused kickoff+finish — the exact pre-split serial behaviour (A/B reference).
 		if (!renderSceneKickoff(frameIndex, viewProj, lighting,
@@ -701,7 +711,8 @@ namespace IPC {
 			skyList, skyCount, skyBytes,
 			alphaList, alphaCount, alphaBytes,
 			capturedAlpha, capturedVertBytes, capturedIdxBytes,
-			debugMode, devInput, waterParams, waterEnabled, fp)) {
+			debugMode, devInput, waterParams, waterEnabled, fp,
+			actorRipples, actorRippleCount)) {
 			return false;
 		}
 

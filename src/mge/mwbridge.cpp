@@ -4,6 +4,14 @@
 #include "mwbridge.h"
 #include "assert.h"
 
+// Ripple activity is read off the decal's own APP_CULLED flag (see getRippleState). Done with
+// the typed vtable accessor rather than a raw `flags & 1`, because MWSE publishes the accessor
+// but not the bit value, and this file's house style of raw offsets is exactly what made the
+// isActive misread survive so long. The header still forward-declares NI to keep SharedSE out
+// of every consumer of mwbridge.h; only this .cpp pulls it in.
+#include "mge_se_prelude.h"
+#include "NIAVObject.h"
+
 #include <cmath>
 
 
@@ -487,8 +495,11 @@ bool MWBridge::getRippleState(RippleState& out, RippleSource* sources, int max) 
     out.rotSpeed      = read_float(wtc + 0x4c);
     out.rippleTexture = reinterpret_cast<const char*>(read_dword(wtc + 0x08));
     out.rippleNode    = reinterpret_cast<void*>(read_dword(wtc + 0xb0));
+    out.pixelShaderEnabled = read_byte(wtc + 0x04) != 0;
+    out.waterShown         = read_byte(wtc + 0x05) != 0;
 
     const DWORD pool = read_dword(wtc + 0x54);
+    out.poolPtr = reinterpret_cast<void*>(pool);
     if (pool == 0 || out.poolSize <= 0) {
         return true;   // controller exists, pool not built yet — not a failure
     }
@@ -496,17 +507,39 @@ bool MWBridge::getRippleState(RippleState& out, RippleSource* sources, int max) 
     // would walk arbitrary memory. 4096 is far above anything MW ships and still cheap.
     const int n = (out.poolSize > 4096) ? 4096 : out.poolSize;
 
+    // ⚠ ACTIVITY IS THE DECAL'S APP_CULLED FLAG, NOT Ripple::isActive.
+    //
+    // MW does not allocate ripples on demand. It builds all MaxNumberRipples quads at load,
+    // parents them under rippleNode permanently, and switches one on by UN-CULLING it and
+    // restarting its alpha controller. Measured: shapes=75 and nodeKids=75 constant from load,
+    // while the un-culled count tracked the player exactly — 0 standing on land, 46 near the
+    // shore, 75 (saturated) while swimming.
+    //
+    // MWSE names the byte at Ripple+0x8 `isActive`, and it reads 0 for every slot at every
+    // moment, including while splashes are visibly on screen. Whatever it is, it is not the
+    // liveness flag. Trusting the name cost a session: `activeInPool` was flat zero throughout,
+    // which read as "MW never ripples for anyone" and nearly got the whole pool written off as
+    // the wrong data source. The struct layout was right the entire time; only the FIELD was
+    // wrong, and a name is not a measurement.
     for (int i = 0; i < n; ++i) {
         const DWORD r = pool + 0x0c * (DWORD)i;
-        if (read_byte(r + 0x08) == 0) {
-            continue;                       // Ripple::isActive
+        const DWORD shape = read_dword(r + 0x00);
+        if (shape == 0) {
+            continue;
+        }
+        out.poolShapes++;
+        if (read_byte(r + 0x08) != 0) {
+            out.legacyIsActive++;           // kept purely as a tripwire; expected to stay 0
+        }
+        if (reinterpret_cast<const NI::AVObject*>(shape)->getAppCulled()) {
+            continue;                       // culled == this slot is idle
         }
         out.activeInPool++;
-        const DWORD shape = read_dword(r + 0x00);
-        if (shape == 0 || !sources || out.count >= max) {
+        if (!sources || out.count >= max) {
             continue;
         }
         RippleSource& s = sources[out.count];
+        s.slot  = i;
         s.x     = read_float(shape + 0x64);   // worldTransform.translation.x
         s.y     = read_float(shape + 0x68);
         s.scale = read_float(shape + 0x70);   // worldTransform.scale

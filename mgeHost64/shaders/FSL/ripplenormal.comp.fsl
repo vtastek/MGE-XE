@@ -1,0 +1,51 @@
+// mgeHost64 — R2 actor-ripple wave sim: SLOPE pass. Model + why: ripplesim.srt.h.
+//
+// Central differences over the height written by ripplesim.comp, into .zw of the same texel.
+// A separate dispatch and not a tail of the step, because a slope needs its NEIGHBOURS' new
+// heights and those do not exist until every thread of the step has retired — computing it inline
+// would read whatever mix of old and new values the scheduler happened to leave.
+//
+// Safe as a read-modify-write on gRippleSimNext: each thread writes only its OWN .zw and reads only
+// neighbours' .x, which nothing in this pass writes. That is the same reason the step above could
+// NOT be done in place — there the quantity read and the quantity written are the same one.
+
+#include "ripplesim.srt.h"
+
+#define RIPPLE_THREADS 8
+
+NUM_THREADS(RIPPLE_THREADS, RIPPLE_THREADS, 1)
+void CS_MAIN(SV_DispatchThreadID(uint3) did)
+{
+    INIT_MAIN;
+
+    int  size = int(gRippleSimParams.sim.x);
+    int2 id   = int2(did.xy);
+    // NB: every RETURN() MUST start its own line (fsl.py only rewrites a line-leading RETURN).
+    if (id.x >= size || id.y >= size)
+    {
+        RETURN();
+    }
+
+    // CLAMPED at the border rather than zero-filled. A zero outside would make the outermost texel
+    // report a slope equal to half the interior height — a bright rim all the way around the
+    // domain, moving with the camera. Clamping makes the edge slope simply go flat.
+    int2 l = int2(max(id.x - 1, 0),        id.y);
+    int2 r = int2(min(id.x + 1, size - 1), id.y);
+    int2 t = int2(id.x, min(id.y + 1, size - 1));
+    int2 b = int2(id.x, max(id.y - 1, 0));
+
+    float4 c  = LoadRWTex2D(gRippleSimNext, id);
+    float  hL = LoadRWTex2D(gRippleSimNext, l).x;
+    float  hR = LoadRWTex2D(gRippleSimNext, r).x;
+    float  hT = LoadRWTex2D(gRippleSimNext, t).x;
+    float  hB = LoadRWTex2D(gRippleSimNext, b).x;
+
+    // dh/dx and dh/dy in HEIGHT PER TEXEL. The water frag converts to world slope with the domain's
+    // texels-per-unit, so changing the grid resolution does not silently change the wave steepness.
+    c.z = (hL - hR) * 0.5f;
+    c.w = (hB - hT) * 0.5f;
+
+    Write2D(gRippleSimNext, id, c);
+
+    RETURN();
+}

@@ -1,0 +1,130 @@
+// mgeHost64 — R2d actor-wake step, ported from MGE's own DX9 dynamic-wave sim. Model and the
+// three-way comparison with the other two step shaders: ripplesim.srt.h.
+//
+// SOURCE: `WaveStepPS` + `PlayerWavePS` in assets/Data Files/shaders/core/XE Main.fx, driven by
+// DistantLand::simulateDynamicWaves() (deleted in DX9 retirement S3 — recover with
+// `git show 036eb611^:src/mge/renderwater.cpp`). The two passes are merged into this one dispatch;
+// see the ordering note at the pin below for why that is equivalent and not a shortcut.
+//
+// ⚠ THE EQUATION IS THE SAME NON-DISPERSIVE LAPLACIAN AS ripplesim.comp. That is worth stating
+// plainly, because it means MGE's V-shaped wake does NOT come from its wave model — the two models
+// are the same one. It comes from the wave SPEED:
+//
+//     a = 0.14 -> c = sqrt(0.14) = 0.374 texels/step,  at 80 steps/s and 2.5 units/texel
+//     => 75 world units per second
+//
+// and a swimming actor moves 80-170 u/s (measured off MW's ripple births). The source therefore
+// OUTRUNS its own waves and the result is a Mach cone, half-angle asin(c/V). ripplesim.comp shipped
+// at 1 texel/step x 2 steps/frame x 1 unit/texel, which is 120 u/s at 60 Hz and 330 u/s at 165 —
+// always faster than the swimmer, hence always concentric circles, and no knob on it could have
+// helped. A Mach cone is not a Kelvin wedge (Kelvin is a fixed 19.47 deg and needs dispersion —
+// that is ripplewave.comp); it is, however, what MGE's water actually looks like, and its angle
+// narrows as the swimmer speeds up, which reads correctly.
+//
+// ⚠ THE TIMESTEP IS FIXED (host-side accumulator, 1/80 s). This is the part that cannot be dropped.
+// A per-frame step makes the wave speed proportional to the frame rate, and the whole effect hinges
+// on that speed sitting BELOW the swimmer's — so on a fast machine a per-frame sim silently walks
+// itself back into the subcritical regime and draws circles again.
+
+#include "ripplesim.srt.h"
+
+#define MGEW_THREADS 8
+
+// Zero outside the previous domain — water the sim has never seen. Clamping would smear the domain
+// edge inward across the newly exposed strip every frame the camera moves.
+float4 mgeFetchPrev(int2 c, int size)
+{
+    if (c.x < 0 || c.y < 0 || c.x >= size || c.y >= size) { return f4(0.0f); }
+    return LoadRWTex2D(gRippleSimPrev, c);
+}
+
+NUM_THREADS(MGEW_THREADS, MGEW_THREADS, 1)
+void CS_MAIN(SV_DispatchThreadID(uint3) did)
+{
+    INIT_MAIN;
+
+    int  size = int(gRippleSimParams.sim.x);
+    int2 id   = int2(did.xy);
+    // NB: every RETURN() MUST start its own line (fsl.py only rewrites a line-leading RETURN).
+    if (id.x >= size || id.y >= size)
+    {
+        RETURN();
+    }
+
+    int   nSrc  = int(gRippleSimParams.sim.w);
+    int2  shift = int2(gRippleSimParams.scroll.xy);
+
+    // Every read is offset by the SAME scroll, so the whole field translates rigidly. Doing it in
+    // the fetch rather than as a separate copy pass makes the domain move free — it is a change of
+    // address, not work. MGE did the equivalent with a StretchRect of the shifted rect.
+    int2   src = id + shift;
+    float4 c   = mgeFetchPrev(src, size);
+
+    // The 4-neighbourhood in the PREVIOUS field, at the same scroll.
+    float nsum = mgeFetchPrev(src + int2(-1,  0), size).x
+               + mgeFetchPrev(src + int2( 1,  0), size).x
+               + mgeFetchPrev(src + int2( 0,  1), size).x
+               + mgeFetchPrev(src + int2( 0, -1), size).x;
+
+    // Damped discrete 2D wave equation, second-order form. LAYOUT DIFFERS from ripplesim.comp:
+    // .x = u(t) and .y = u(t-1), where that shader keeps .y as a velocity. Same physics either way;
+    // this is MGE's arrangement and keeping it makes the port checkable line by line.
+    //   u(t+1) = a*nsum + (2 - udamp - vdamp - 4a)*u(t) - (1 - vdamp)*u(t-1)
+    // MGE's constants are a = 0.14, udamp = vdamp = 0.02, giving its literal 1.40 and 0.98. Both
+    // coefficients are derived host-side from the wave SPEED so the slider can stay in world units
+    // per second, which is the number that decides whether there is a cone at all.
+    // ⚠ a <= 0.5 is the 2D CFL limit. Clamped here as well as host-side: the grid is persistent
+    // state, so one diverged frame poisons the field until the next teleport rather than settling.
+    float a        = min(gRippleSimParams.wave.x, 0.5f);
+    float coefU    = gRippleSimParams.wave.y;
+    float coefPrev = gRippleSimParams.wave.z;
+    float uNext    = a * nsum + coefU * c.x - coefPrev * c.y;
+    float uStore   = c.x;
+
+    // ---- the moving obstacle (MGE's PlayerWavePS) ------------------------------------------------
+    // ⚠ THIS IS A BOUNDARY CONDITION, NOT AN IMPULSE, and that difference is most of why MGE's wake
+    // looks like a wake. Both u(t) AND u(t-1) are pinned inside a soft-edged ring, which makes it a
+    // ZERO-VELOCITY obstacle the water has to flow around — a source that keeps working for as long
+    // as the actor keeps moving. Adding a bump instead injects energy once and lets it spread, which
+    // is a splash; a splash train is a row of rings, not a wake.
+    //
+    // Applied to the OUTPUT rather than the input. MGE ran a pin pass and a step pass alternately;
+    // pinning what we just wrote means the next sub-step reads a field that already contains the
+    // obstacle at its NEIGHBOURS as well as at itself, which is the same fixed point in one dispatch
+    // instead of two. Pinning the input here would be wrong, not merely different — the step would
+    // immediately overwrite it.
+    //
+    // The bounds rectangle is the performance. A rejecting source still costs a length() and a
+    // compare, and almost no texel in the domain is near any actor; four compares in front of the
+    // loop is what keeps this proportional to the disturbed area instead of to the grid.
+    float4 sb = gRippleSimParams.srcBounds;
+    if (nSrc > 0 && float(id.x) >= sb.x && float(id.y) >= sb.y
+                 && float(id.x) <= sb.z && float(id.y) <= sb.w)
+    {
+        LOOP for (int i = 0; i < nSrc; ++i)
+        {
+            float4 s = gRippleSimParams.impulses[i];
+            float  d = length(float2(id) - s.xy);
+            // saturate(2*|d/r - 1|): exactly 0 on the ring, reaching 1 by 0.5r and 1.5r, so the pin
+            // is feathered rather than a step edge. A hard edge in the initial condition injects
+            // every frequency the grid can represent and everything above Nyquist aliases straight
+            // back as an axis-aligned artefact.
+            float disp = saturate(2.0f * abs(d / max(s.z, 1e-3f) - 1.0f));
+            uNext  = lerp(-s.w, uNext,  disp);
+            uStore = lerp(-s.w, uStore, disp);
+        }
+    }
+
+    // Kill denormal-scale residue so an idle grid settles to exactly zero instead of ringing at
+    // 1e-30 forever.
+    if (abs(uNext) < 1.0e-6f && abs(uStore) < 1.0e-6f) { uNext = 0.0f; uStore = 0.0f; }
+
+    // .zw (slope) is written by ripplenormal.comp; carry the scrolled values so the water frag never
+    // samples a frame-old slope against a new height.
+    // ⚠ NOT MGE's slope. Its WaveStepPS computed `2*(n.xy - n.zw) + 0.5*(n2.xy - n2.zw)`, which is
+    // (u(x+1) - u(y+1), u(x-1) - u(y-1)) — it subtracts across the axes and is not a gradient. Our
+    // central difference is correct, and the wake's SHAPE lives in the height field either way.
+    Write2D(gRippleSimNext, id, float4(uNext, uStore, c.z, c.w));
+
+    RETURN();
+}

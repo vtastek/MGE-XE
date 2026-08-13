@@ -111,6 +111,11 @@ public:
         float x, y;        // world XY of the ripple centre (TriShape world translation)
         float age;         // 0 = just spawned, 1 = at the end of its life
         float scale;       // TriShape world scale, i.e. the ring's current radius factor
+        int   slot;        // index in MW's pool — the only stable IDENTITY a ripple has.
+                           // The read below compacts (inactive slots are skipped), so without
+                           // this an observer cannot tell "slot 7 was recycled into a NEW
+                           // ripple" from "the list shifted", and BIRTHS are what measure the
+                           // engine's spawn cadence. Nothing but diagnostics needs it.
     };
     struct RippleState {
         int   count;               // entries written into `out`
@@ -122,6 +127,27 @@ public:
         float rotSpeed;            // rippleRotationSpeed       0x4c
         const char* rippleTexture; // rippleTexturePath         0x08 (never freed by us)
         void* rippleNode;          // NI::Node parent           0xb0 — the SUPPRESSION handle
+        // MW's own view of whether water is being drawn at all. Read because the pool came back
+        // empty for a whole session while every field above matched the ini exactly: the layout
+        // is right (MWSE TES3WaterController.h), so the question moved to whether the engine is
+        // still GENERATING ripples now that the host owns the water surface.
+        bool  waterShown;          // 0x05
+        bool  pixelShaderEnabled;  // 0x04
+        // ⚠ The pool POINTER (0x54), exposed because its absence is otherwise invisible: the read
+        // below returns early when it is null, leaving activeInPool at 0 — the exact same reading
+        // as a fully allocated pool with every slot idle. A whole session of "0/75" was ambiguous
+        // between "no actor was in water" and "MW never allocated the array at all", and those
+        // have opposite fixes. Never dereferenced here; printed as evidence.
+        void* poolPtr;             // 0x54
+        // Non-null Ripple::triShape entries, counted independently of isActive. The two disagree
+        // ONLY if our Ripple layout is wrong, which is the last thing left to rule out after a
+        // run where the node was un-culled, the player was in water, splashes were visibly on
+        // screen, and activeInPool stayed 0.
+        int   poolShapes;
+        // Slots whose Ripple+0x8 byte (MWSE calls it `isActive`) is non-zero. Measured 0 always,
+        // even with the pool saturated — which is why activity is taken from APP_CULLED instead.
+        // Kept as a tripwire: if this ever goes non-zero the field means something after all.
+        int   legacyIsActive;
     };
     // Fills up to `max` sources; returns false when there is no water controller (no loaded game).
     bool getRippleState(RippleState& out, RippleSource* sources, int max);

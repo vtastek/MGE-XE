@@ -3343,16 +3343,158 @@ namespace MGE::GeometryCache {
             if (d > dMax) dMax = d;
             if (d > 300.0f) farCount++;
         }
-        LOG::logline("[ripl] active=%d read=%d far=%d dMax=%.0f  eye=(%.0f %.0f)",
-                     st.activeInPool, st.count, farCount, dMax, ex, ey);
+        const float px = mwb->PlayerPositionX(), py = mwb->PlayerPositionY();
+        int nearPC = 0;
+        for (int i = 0; i < st.count; ++i) {
+            const float dx = src[i].x - px, dy = src[i].y - py;
+            if (dx * dx + dy * dy < 200.0f * 200.0f) nearPC++;
+        }
+        LOG::logline("[ripl] active=%d read=%d far=%d nearPC=%d dMax=%.0f  eye=(%.0f %.0f) pc=(%.0f %.0f)",
+                     st.activeInPool, st.count, farCount, nearPC, dMax, ex, ey, px, py);
         // The first few in full: the sim needs to know what an impulse actually looks like
         // (how fast scale grows against age), and a summary cannot show that.
         const int show = (st.count < 6) ? st.count : 6;
         for (int i = 0; i < show; ++i) {
             const float dx = src[i].x - ex, dy = src[i].y - ey;
-            LOG::logline("[ripl]   #%d at=(%.0f %.0f) d=%.0f age=%.2f scale=%.2f",
-                         i, src[i].x, src[i].y, std::sqrt(dx * dx + dy * dy),
+            LOG::logline("[ripl]   #%d slot=%d at=(%.0f %.0f) d=%.0f age=%.2f scale=%.2f",
+                         i, src[i].slot, src[i].x, src[i].y, std::sqrt(dx * dx + dy * dy),
                          src[i].age, src[i].scale);
+        }
+    }
+
+    static double gcNowMs();   // defined below; the birth probe needs a real clock, not a frame count
+
+    // ---- R2 wake probe: BIRTH events -------------------------------------------------------
+    // THE QUESTION IS THE CADENCE, not the count. A wake is the superposition of ring wavefronts
+    // from a CONTINUOUS train of impulses along the track; a sparse train is a row of separate
+    // rings. OpenMW hit exactly this and left the finding in a comment
+    // (ripplesimulation.cpp:170): its GPU sim emits EVERY FRAME, while its legacy decal path —
+    // the one reproducing vanilla — emits once per 1.5 s or per 10 units moved, and mixing them
+    // up gives "many smaller ripples around actor instead of a smooth wake". Whether MW's own
+    // cadence can carry a wake is therefore the ONE measurement that decides the R2 design, and
+    // a periodic snapshot cannot make it: it samples the population, not the spawn rate.
+    //
+    // So this logs BIRTHS. A birth is a pool slot going inactive->active, or its age running
+    // BACKWARDS (MW recycles a live slot straight into a new ripple, which a snapshot reads as
+    // the same ripple mysteriously getting younger).
+    //
+    // Attribution WITHOUT identity: the pool records no owner, so each birth is paired with the
+    // most recent earlier birth within kSameActor units and reported as (dt, ds) against it.
+    // Consecutive impulses from one swimmer are metres apart while two actors are typically much
+    // further, so proximity recovers the per-actor track well enough to read a cadence off it.
+    // Ambiguity here is visible in the log rather than hidden: an unpaired birth prints dt=- .
+    static void logRippleBirths(double nowMs) {
+        MWBridge* mwb = MWBridge::get();
+        if (!mwb || !mwb->IsLoaded()) return;
+
+        MWBridge::RippleState st;
+        MWBridge::RippleSource src[128];
+        if (!mwb->getRippleState(st, src, 128)) return;
+
+        constexpr int   kMaxSlots   = 256;
+        constexpr float kSameActor  = 150.0f;   // units; pairs a birth with its own track
+        constexpr int   kTrackDepth = 16;       // recent births kept for pairing
+
+        static bool   s_act[kMaxSlots] = {};
+        static float  s_age[kMaxSlots] = {};
+        static bool   s_seen[kMaxSlots];
+        static struct { float x, y; double t; } s_recent[kTrackDepth] = {};
+        static int    s_recentN = 0;
+        static int    s_births  = 0;
+        static double s_windowStart = 0.0;
+
+        for (int i = 0; i < kMaxSlots; ++i) s_seen[i] = false;
+
+        for (int i = 0; i < st.count; ++i) {
+            const int slot = src[i].slot;
+            if (slot < 0 || slot >= kMaxSlots) continue;
+            s_seen[slot] = true;
+            // 0.02 of normalised age is well under one frame of a 3 s life (~0.011 at 60 Hz),
+            // so this cannot fire on ordinary ageing, only on a genuine reset.
+            const bool born = !s_act[slot] || (src[i].age + 0.02f < s_age[slot]);
+            s_act[slot] = true;
+            s_age[slot] = src[i].age;
+            if (!born) continue;
+
+            ++s_births;
+            int   best = -1;
+            float bestD2 = kSameActor * kSameActor;
+            for (int k = 0; k < s_recentN; ++k) {
+                const float dx = src[i].x - s_recent[k].x, dy = src[i].y - s_recent[k].y;
+                const float d2 = dx * dx + dy * dy;
+                if (d2 < bestD2) { bestD2 = d2; best = k; }
+            }
+            const float pcx = mwb->PlayerPositionX(), pcy = mwb->PlayerPositionY();
+            const float pdx = src[i].x - pcx, pdy = src[i].y - pcy;
+            const float dPC = std::sqrt(pdx * pdx + pdy * pdy);
+            if (best >= 0) {
+                LOG::logline("[ripl+] slot=%2d at=(%.0f %.0f) dPC=%.0f  dt=%.3fs ds=%.1f v=%.0f",
+                             slot, src[i].x, src[i].y, dPC,
+                             (nowMs - s_recent[best].t) * 0.001,
+                             std::sqrt(bestD2),
+                             (nowMs > s_recent[best].t)
+                                 ? std::sqrt(bestD2) / (float)((nowMs - s_recent[best].t) * 0.001) : 0.0f);
+            } else {
+                LOG::logline("[ripl+] slot=%2d at=(%.0f %.0f) dPC=%.0f  dt=-      ds=-    (new track)",
+                             slot, src[i].x, src[i].y, dPC);
+            }
+            // Ring buffer of recent births, newest first — pairing wants the LATEST match.
+            for (int k = (s_recentN < kTrackDepth ? s_recentN : kTrackDepth - 1); k > 0; --k) {
+                s_recent[k] = s_recent[k - 1];
+            }
+            s_recent[0].x = src[i].x; s_recent[0].y = src[i].y; s_recent[0].t = nowMs;
+            if (s_recentN < kTrackDepth) ++s_recentN;
+        }
+        for (int i = 0; i < kMaxSlots; ++i) { if (!s_seen[i]) s_act[i] = false; }
+
+        if (s_windowStart <= 0.0) s_windowStart = nowMs;
+        if (nowMs - s_windowStart >= 2000.0) {
+            const double secs = (nowMs - s_windowStart) * 0.001;
+            // The FULL state, not just the count. A whole session of "pool 0/75" says only that
+            // nothing spawned; it cannot distinguish "no actor was in water" from "the engine has
+            // stopped generating ripples because we took the water away from it" — and the second
+            // is a live suspicion, since this session app-culls rippleNode whenever the host owns
+            // the frame. Every field that could gate creation is printed here so ONE run decides:
+            //   waterShown / psEnab  MW's own view of whether it is drawing water at all
+            //   nodeCulled           OUR suppression, observed rather than assumed
+            //   forgeOwns            the gate that drives it (F11 flips this — the A/B)
+            //   pcZ vs waterZ        whether the player is ACTUALLY in water this run
+            const bool culled = st.rippleNode
+                              && static_cast<NI::AVObject*>(st.rippleNode)->getAppCulled();
+            // THE DECISIVE COUNT. Everything above is an offset we believe; this is the scene
+            // graph answering directly. MW parents each ripple decal under rippleNode, so if the
+            // engine is making ripples at all this is non-zero — no layout assumption involved.
+            //   kids > 0, active == 0  -> our Ripple struct read is wrong
+            //   kids == 0              -> nothing is being parented here, and the splashes that
+            //                             are visibly on screen belong to some OTHER system
+            int kids = 0, kidsLive = 0;
+            if (st.rippleNode) {
+                auto* rn = static_cast<NI::AVObject*>(st.rippleNode);
+                if (rn->isInstanceOfType(NI::RTTIStaticPtr::NiNode)) {
+                    auto* node = static_cast<NI::Node*>(rn);
+                    const auto cnt = node->children.getEndIndex();
+                    for (size_t k = 0; k < cnt; ++k) {
+                        NI::AVObject* c = node->children.at(k).get();
+                        if (!c) continue;
+                        ++kids;
+                        if (!c->getAppCulled()) ++kidsLive;
+                    }
+                }
+            }
+            const float pz = mwb->PlayerPositionZ();
+            const float wz = mwb->CellHasWater() ? mwb->WaterLevel() : -99999.0f;
+            // live= is the independent scene-graph count and MUST now equal active=. They are
+            // derived the same way on purpose for this run: if they ever disagree, the pool and
+            // rippleNode's child list have diverged and the pool is no longer the whole story.
+            LOG::logline("[ripl=] %.1f births/s over %.1fs  active=%d/%d shapes=%d live=%d legacy=%d"
+                         "  nodeCulled=%d forgeOwns=%d  pcZ=%.0f waterZ=%.0f %s%s",
+                         s_births / secs, secs, st.activeInPool, st.poolSize, st.poolShapes,
+                         kidsLive, st.legacyIsActive,
+                         culled ? 1 : 0, RenderProcess::forgeOwnsFrame() ? 1 : 0,
+                         pz, wz, (wz > -99998.0f && pz < wz) ? "PC-IN-WATER " : "",
+                         (kids != st.poolShapes) ? " << KIDS != SHAPES" : "");
+            s_births = 0;
+            s_windowStart = nowMs;
         }
     }
 
@@ -4043,6 +4185,10 @@ namespace MGE::GeometryCache {
         if (Configuration.LogDistantPipeline) {
             logWeatherProbe(g_frame, dataHandler);
             logRippleProbe(g_frame);
+            // EVERY frame, unlike the throttled probe above: this one measures the engine's
+            // spawn RATE, and a sampled observer cannot see an event it did not sample. It
+            // logs only on an actual birth, so a dry scene costs one pool read per frame.
+            logRippleBirths(gcNowMs());
         }
 
         // SK0 (sky takeover, diagnostic): periodically dump the skyRoot subtree so we can

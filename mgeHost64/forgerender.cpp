@@ -132,6 +132,9 @@
 // the merged ComputeRootSignature (1 CBV + 1 UAV — within the cull set's union). froxelclear.comp +
 // froxelassign.comp both include it. See tasks/forge-clustered-lighting.md.
 #include "shaders/FSL/froxelassign.srt.h"
+// R2 actor-ripple wave sim SRT (RippleSimSrtData, Persistent frequency). ripplesim.comp +
+// ripplenormal.comp both include it. Model, sizing and the ping-pong rationale: ripplesim.srt.h.
+#include "shaders/FSL/ripplesim.srt.h"
 // Sun shadows Phase B2: the moments-map blur SRT (SunBlurSrtData, PerFrame frequency — its own
 // resource names so the merged ComputeRootSignature has no aliasing with aoblur's PerFrame set).
 // Two instances of the one set drive the separable H/V ping-pong. See tasks/forge-sun-shadows.md.
@@ -1094,6 +1097,55 @@ namespace {
         "gtao.comp", "hbao.comp", "vbao.comp", "ssaofast.comp"
     };
 
+    // ---- One actor-wake wave grid (ripplesim.srt.h) --------------------------------------------
+    // TWO of these exist and they are NOT redundant. Both are camera-following world-space grids
+    // stepped by compute and sampled once by water.frag; they differ in resolution and in which
+    // step shader runs over them:
+    //   fine  1024² @ 1 unit/texel, ripplesim.comp  — near-field splash, NON-dispersive
+    //   wake   512² @ 8 unit/texel, ripplewave.comp — omega² = g|k|, i.e. the Kelvin wedge
+    // Everything structural is identical between them, which is why the state is a struct and the
+    // per-frame advance is one shared function rather than two copies that would drift.
+    struct RippleGrid {
+        // PING-PONG, and the pair is not optional: the step reads a neighbourhood, so writing into
+        // the texture being read is a race whose outcome depends on dispatch order. The reference
+        // implementation does exactly that and gets away with it because diffusion hides the error;
+        // it is still undefined behaviour. tex[0] is what water.frag samples — see the even
+        // sub-step count in advanceRippleGrid.
+        Texture*       tex[2] = { nullptr, nullptr };   // grid², RGBA16F, SRV+UAV
+        // ⚠ ONE CBUFFER PER SUB-STEP, a correctness requirement rather than tidiness. cmdDispatch
+        // RECORDS; it does not execute. Writing one shared mapped cbuffer between two recorded
+        // dispatches means BOTH read whatever the CPU left behind, so the first step never sees the
+        // impulses or the scroll meant only for it — the sim runs, costs what it should, and
+        // produces nothing. [0] carries this frame's scroll + births, [1] is inert.
+        Buffer*        cbv[2] = { nullptr, nullptr };
+        // TWO sets, one per ping-pong orientation (A: prev=0,next=1; B: prev=1,next=0), picked by
+        // parity. Cheaper and far less error-prone than re-running updateDescriptorSet every frame,
+        // which would also have to respect frames in flight.
+        DescriptorSet* set[2] = { nullptr, nullptr };
+        uint32_t       grid   = 0;          // texels per side
+        uint32_t       parity = 0;          // which texture holds the CURRENT field
+        bool           ready  = false;
+        bool           cleared = false;
+        // tex[0] is read by water.frag through an SRV but written by compute through a UAV, so it
+        // has to be transitioned each way around the dispatch. Tracked rather than assumed because
+        // the sim is skipped entirely on frames with no water, and a texture left in
+        // UNORDERED_ACCESS while a frag samples it is exactly the kind of state error the debug
+        // layer catches and the fast build does not.
+        bool           inShaderState = false;
+        // Domain origin in WORLD units, snapped to whole texels. Snapping is what makes the scroll
+        // an integer texel shift, i.e. an exact copy — a fractional origin would need a resample
+        // every frame, and resampling a wave field at 60 Hz low-passes the waves out of existence
+        // within about a second of walking.
+        float          originX = 0.0f;
+        float          originY = 0.0f;
+        bool           originValid = false;
+        // World units per texel. A field on the grid and not a constant because it is a live dev
+        // slider for the wake: it sets which swimming speed lands in the kernel's good band, and
+        // changing it invalidates the field (different metric ⇒ different meaning), so the setter
+        // clears `cleared` and the next frame starts fresh.
+        float          unitsPerTexel = 1.0f;
+    };
+
     // Persistent renderer state, alive between RenderInit and shutdown. Distinct
     // from the one-shot probes: the shared RT + pipeline + cmd infra survive across
     // renderFrame calls.
@@ -1838,6 +1890,21 @@ namespace {
         Shader*        pReflectMipShader = nullptr;        // reflectmip.comp ([1,3,3,1] tent reduce)
         Pipeline*      pReflectMipPipelineFirst = nullptr;
         Pipeline*      pReflectMipPipeline = nullptr;
+
+        // ---- R2 actor-wake wave sims (ripplesim.srt.h) ----------------------------------------
+        // Two grids, two bands, one code path. See the RippleGrid definition above for why both
+        // exist: the fine one cannot make a Kelvin wedge (it is non-dispersive) and the wake one
+        // cannot make splash detail (8 units/texel is below it).
+        RippleGrid     rippleFine;                            // ripplesim.comp
+        RippleGrid     rippleWake;                            // ripplewave.comp
+        Shader*        pRippleSimShader = nullptr;            // ripplesim.comp
+        Shader*        pRippleWaveShader = nullptr;           // ripplewave.comp
+        Shader*        pRippleMgeShader = nullptr;            // ripplemge.comp
+        Shader*        pRippleNormalShader = nullptr;         // ripplenormal.comp
+        Pipeline*      pRippleSimPipeline = nullptr;
+        Pipeline*      pRippleWavePipeline = nullptr;
+        Pipeline*      pRippleMgePipeline = nullptr;
+        Pipeline*      pRippleNormalPipeline = nullptr;
         bool           reflectMipReady = false;            // gates the per-frame pyramid build
 
         // --- Buffer consolidation: one shared mega VB + IB for STATIC non-skinned parts ----
@@ -2531,6 +2598,13 @@ namespace {
     bool               g_waterFogOn      = false;   // cell has water AND the knob is on
     bool               g_waterFogUnder   = false;   // camera is below the surface
     float              g_waterFogHour    = 12.0f;   // MW's GameHour, off waterParams[11]
+    // R2 actor ripples (xy world, z age 0..1, w MW decal scale), nearest-first off the wire.
+    // MW spawns one per ~14.2 units an actor travels through water, so a moving actor arrives as
+    // a TRAIN of these and the overlapping ring packets are the wake.
+    constexpr unsigned kMaxActorRipples = 64;   // MUST match IPC::kMaxActorRipples
+    constexpr unsigned kActorRippleSlot = 16;   // first worlds[] matrix; 4 ripples per slot
+    float              g_actorRipples[kMaxActorRipples * 4] = {};
+    unsigned           g_actorRippleCount = 0;
     // MW's weather fog colour AS AUTHORED — before the step-6a lift and the step-5 decode that
     // fd[28..30] carries. Latched at that write site (the only place it exists unconverted) because
     // gFrameData is write-combined and reading one back is a documented trap.
@@ -4812,6 +4886,7 @@ namespace {
     // SRT in opaque.srt.h). On any failure tears down what it made and returns false
     // (the triangle path stays usable).
     bool createFroxelResources(Renderer* R);   // clustered forward (defined later; called from buildOpaquePath)
+    bool createRippleSimResources(Renderer* R);// R2 actor-ripple wave sim (same pattern)
     bool buildOpaquePath(Renderer* R, uint32_t width, uint32_t height) {
         // Depth target (reverse-Z not needed for M1c; standard LEQUAL + clear to 1.0).
         RenderTargetDesc dDesc = {};
@@ -5723,6 +5798,7 @@ namespace {
         // Clustered forward: create the froxel mask + compute pipelines NOW so gFroxelMask can bind
         // into pPerFrameSet below. Non-fatal — on failure froxelReady stays false and the frags brute-loop.
         createFroxelResources(R);
+        createRippleSimResources(R);
         // NiUVController takeover: the gUVAnim table — a persistent-mapped typed-buffer SRV
         // (Buffer<float4>[kMaxUVAnim]) the draw loops fill via uvAnimIdFor. Created before the
         // PerFrame set updates so every SrtData PerFrame instance can bind it. Zeroed once so
@@ -8189,6 +8265,23 @@ namespace {
                         rdp.mCount = 1; rdp.ppTextures = &g_live.pReflectDepthResolved;
                         updateDescriptorSet(R, 0, g_live.pPerFrameSet, 1, &rdp);
                     }
+                    // R2b/R2c wave fields. Always tex[0] on each grid: the dispatch runs an EVEN
+                    // number of sub-steps precisely so the finished field lands there every frame
+                    // and these bindings can be static — see the sub-step comment in
+                    // advanceRippleGrid. Left unbound if a grid failed to build, which reads zero =
+                    // flat water for that band.
+                    if (g_live.rippleFine.ready) {
+                        DescriptorData rf = {};
+                        rf.mIndex = SRT_RES_IDX(SrtData, PerFrame, gRippleField);
+                        rf.mCount = 1; rf.ppTextures = &g_live.rippleFine.tex[0];
+                        updateDescriptorSet(R, 0, g_live.pPerFrameSet, 1, &rf);
+                    }
+                    if (g_live.rippleWake.ready) {
+                        DescriptorData wf = {};
+                        wf.mIndex = SRT_RES_IDX(SrtData, PerFrame, gWakeField);
+                        wf.mCount = 1; wf.ppTextures = &g_live.rippleWake.tex[0];
+                        updateDescriptorSet(R, 0, g_live.pPerFrameSet, 1, &wf);
+                    }
                 }
                 std::printf("[forge][reflect] mip pyramid %s (%u², %u mips, RGBA16F)\n",
                             g_live.reflectMipReady ? "ready" : "DISABLED (resource/shader/pipeline create failed)",
@@ -10462,6 +10555,276 @@ namespace {
     float g_rainPeriod   = 5.0f;    // seconds per cell cycle (QUANTIZED at the write to divide the 20 s clock)
     float g_rainDensity  = 0.0f;    // 0..1 active cells — the MANUAL value, used when the weather
                                     // drive below is off. Default 0 = dry, so the A/B is the default.
+
+    // ---- R2 actor ripples: their OWN wavelength and reach, deliberately not R1's ----------------
+    // An actor displaces something the size of a body; a raindrop displaces a drop. Sharing R1's
+    // numbers would put a 20-unit, 2-5 unit-wavelength rain ring under a swimming Nord.
+    //
+    // These also decide what the wake LOOKS like, and the honest description of the default is a
+    // BAND, not a Kelvin wedge. MW spawns one impulse per ~14.2 units travelled (measured), so with
+    // a 2-5 unit wavelength consecutive rings sit 3-7 wavelengths apart and carry no phase relation
+    // to each other — they overlap into a continuous disturbance rather than interfering into a
+    // wedge. A real wedge needs the impulse spacing to be small against the wavelength, i.e. a
+    // lambda up near the spacing itself; that is what lamMin/lamMax being this large starts to buy,
+    // and it is the axis to push if the band reads as too fizzy.
+    float g_actRipAmp    = 0.35f;   // peak slope; below rain's 0.5 — a wake is broader and flatter
+    float g_actRipLamMin = 10.0f;   // ~14 cm ... comparable to the 14.2-unit impulse spacing, which
+    float g_actRipLamMax = 22.0f;   // is what lets neighbouring rings blend instead of beating
+    float g_actRipRadius = 140.0f;  // ~2 m of reach; rings must outgrow the 14.2-unit spacing by a
+                                    // wide margin or the "band" is just a row of separate circles
+    float g_actRipDecay  = 2.0f;    // radial amplitude falloff (same meaning as R1's, re-derived)
+    float g_actRipLife   = 3.0f;    // MW's RippleLifetime; age arrives already normalised to it
+    bool  g_actRipOn     = true;
+
+    // ---- R2b: the wave SIM that replaces the analytic loop above --------------------------------
+    // Sizing is derived, not picked. A finite-difference scheme needs roughly 8 texels per
+    // wavelength before numerical dispersion starts bending the waves, and MW lays impulses every
+    // ~14.2 units (measured). At ONE world unit per texel the actor wavelengths (10-22 units)
+    // resolve to 10-22 texels and the impulse spacing to 14 — comfortably above the floor.
+    // 1024 texels then covers 1024 units (~14.5 m) around the camera, which is the range over which
+    // a wake is actually legible; beyond it R1's analytic rain still owns the surface.
+    constexpr uint32_t kRippleGrid       = 1024;   // texels per side
+    constexpr float    kRippleUnitsPerTexel = 1.0f;
+    constexpr uint32_t kRippleThreads    = 8;      // must match RIPPLE_THREADS in the .comp
+    float g_ripSimSpeed  = 1.0f;    // ⚠ CFL: values > 2.0 diverge. Clamped in-shader as well.
+    // ⚠ PER STEP, and there are 120 steps a second — so this lives in a thin sliver below 1 and the
+    // number that matters is the per-SECOND retention: 0.995^120 = 0.55, 0.985^120 = 0.16.
+    // Shipped at 0.985 first, which discarded 84% of the wave energy every second against MW's 3 s
+    // ripple life; the waves died about as fast as they were made and the wake read as "very weak".
+    // 0.995 leaves roughly half a second's worth of ringing, which is what a wake actually does.
+    float g_ripSimDecay  = 0.995f;
+    // Amplitude and radius are a PAIR, because the slope a bump produces goes as amp/radius. Radius
+    // is also what makes the wake continuous rather than beaded: MW lays impulses every ~14.2 units
+    // (measured), so a radius below ~7 texels leaves visible gaps between consecutive splashes.
+    float g_ripSimAmp    = 1.2f;    // impulse height at the centre of a birth splat
+    float g_ripSimRadius = 10.0f;   // impulse radius in TEXELS (1 texel = 1 world unit)
+    float g_ripSimSlope  = 3.0f;    // slope gain into water.frag's normal
+    // Sub-steps are FIXED at 2 in the dispatch, deliberately not a knob: two is what ties the
+    // ping-pong parity to the per-sub-step params buffers, and that pairing is what makes the
+    // impulse injection land in the first step only. Four would re-inject.
+    // ⚠ DEFAULT OFF since the MGE port landed, and not because it looks bad. Its speed/decay are
+    // per STEP, so its wave speed is proportional to the frame rate — 330 units/s at 165 Hz, which
+    // no swimmer can outrun. That guarantees a subcritical source and therefore concentric circles,
+    // and those circles sit in the near field right on top of the wake grid's cone. One checkbox
+    // brings it back for the A/B.
+    bool  g_ripSimOn     = false;   // master; false falls back to the analytic path above
+
+    // ---- R2c: the DISPERSIVE wake grid — the one that actually makes a Kelvin wedge -------------
+    // ⚠ THE GRID ABOVE CANNOT PRODUCE A WEDGE AT ANY SETTING, and that is not a tuning failure.
+    // `v += avg(4-neighbours) - h` is the non-dispersive wave equation: every wavelength travels at
+    // the same speed, so a moving source draws nested circles when it is slower than that speed and
+    // a Mach cone when it is faster. Nothing else is available. Deep-water gravity waves instead
+    // obey omega² = g|k|, long waves outrun short ones, group velocity is half phase velocity, and
+    // the interference of the whole spectrum behind the swimmer closes into the 19.47° wedge — at
+    // that angle whatever the speed. Hence a second grid with a real |k| operator.
+    //
+    // SIZING, all of it derived (tools/iwave_kernel.py prints the table):
+    // the Kelvin transverse wavelength is 2*pi*V²/g, which for MW swim speeds is 33 units at
+    // 60 u/s, 92 at 100, 180 at 140. The 21x21 |k| kernel holds its dispersion exponent near 0.5
+    // over wavelengths of 4..24 TEXELS, so 8 units/texel maps that whole speed range into the good
+    // band. 512 texels then covers 4096 units (58 m), and the wake is legible well inside that.
+    // 1024² rather than 512²: "moving camera erases it partially" was the domain being crossed. The
+    // grid follows the CAMERA (MGE followed the player, so its wake was always generated at the
+    // centre and only ever trailed inward), and at 2.5 units/texel 512 texels is ±640 units — about
+    // four seconds of swimming. 1024 doubles the reach to ±1280 for a cost that rounds to nothing,
+    // because MGE's step is 8 taps where the dispersive one is 441.
+    constexpr uint32_t kWakeGrid          = 1024;
+    constexpr uint32_t kWakeThreads       = 16;     // must match WAVE_THREADS in ripplewave.comp
+    constexpr uint32_t kMgeWakeThreads    = 8;      // must match MGEW_THREADS in ripplemge.comp
+    // Measured from the kernel that was actually generated. alpha is its mean R/|k| over the band
+    // and divides out of the gravity so the wavelength comes out physical; RMax bounds the
+    // timestep. ⚠ BOTH must be regenerated with the taps — tools/iwave_kernel.py --emit prints them.
+    constexpr float    kWakeKernelAlpha   = 1.0096f;
+    constexpr float    kMwUnitMetres      = 0.014224f;   // 64 units = 1 yard
+    // 2.5 is MGE's own metric, kept because the whole port is calibrated around it. The dispersive
+    // mode wants ~8 instead (its |k| kernel is only accurate over 4-24 texels of wavelength), so
+    // flipping the mode moves this slider and clears the field.
+    float g_wakeUnitsPerTexel = 2.5f;   // live; changing it invalidates the field
+
+    // ---- R2d: MGE's own dynamic-wave sim, the DEFAULT ------------------------------------------
+    // ⚠ MGE'S WAVE EQUATION IS THE SAME NON-DISPERSIVE LAPLACIAN as the fine grid's. Its V-shaped
+    // wake is not a property of the model — it is a property of the SPEED. At a = 0.14, 80 steps/s
+    // and 2.5 units/texel the waves travel 75 world units/s, and a swimmer does 80-170, so the
+    // source outruns them and leaves a Mach cone (half-angle asin(c/V), narrowing as it speeds up).
+    // The fine grid's per-FRAME step makes its speed proportional to the frame rate — 330 u/s at
+    // 165 Hz — which is why it can only ever draw circles.
+    bool  g_wakeMge      = true;    // false = the dispersive |k| grid (ripplewave.comp)
+    // The knob is a SPEED, in world units per second, because that is the number that decides
+    // whether there is a cone at all; `a` is derived from it. ⚠ Ceiling is the 2D CFL limit
+    // a <= 0.5, i.e. c <= sqrt(0.5) * unitsPerTexel / waveStep — 141 u/s at MGE's metric.
+    float g_wakeSpeed    = 75.0f;
+    // Fixed simulation timestep. MGE's exactly, and it is load-bearing rather than incidental: a
+    // per-frame step scales the wave speed with the frame rate and walks the sim back into the
+    // subcritical regime on a fast machine.
+    constexpr float kWakeStep = 1.0f / 80.0f;
+    float g_wakeUdamp    = 0.02f;   // MGE's; enters as (2 - udamp - vdamp - 4a) * u(t)
+    float g_wakeVdamp    = 0.02f;   // MGE's; enters as (1 - vdamp) * u(t-1)
+    // The obstacle ring. MGE pinned a 12-unit radius around the player, pulsing slightly so the
+    // wake never looks stamped. Both u(t) and u(t-1) are pinned, which makes it a zero-velocity
+    // boundary the water flows around — a source that keeps working while the actor moves, rather
+    // than an impulse that fires once. A train of impulses is a row of rings; this is a wake.
+    float g_wakeRingRadius = 12.0f;  // world units
+    float g_wakeRingDepth  = 1.0f;   // the pinned value (MGE used -1)
+    // MW only tells us where ripple DECALS are, not where actors are, so the ring centres are the
+    // freshest ripples — anything younger than this fraction of RippleLifetime (3 s). MGE had the
+    // player pointer and interpolated across the frame; a short age window is the same idea, since
+    // MW lays a ripple every ~10-14 units of travel.
+    float g_wakeSrcAge   = 0.06f;
+    uint32_t g_wakeMaxSrc = 24;     // cap on rings per step; the pin loop is per texel in bounds
+
+    // ---- actor TRACKS: the ring source, and why it cannot just be the ripple list ---------------
+    // ⚠ TWO SEPARATE REASONS THE RAW RIPPLE LIST IS UNUSABLE AS A MOVING OBSTACLE.
+    //
+    // (1) IT IS SELECTED BY CAMERA DISTANCE. The client ships the nearest kMaxActorRipples by
+    // distance to DistantLand::eyePos (renderprocess.cpp), so which ripples arrive — and in what
+    // order — is a function of where the camera is. An IMPULSE does not care: it fires once at
+    // birth and the field evolves on its own afterwards. A PIN is re-applied every sub-step, so
+    // churn in that list continuously edits the field, and orbiting a third-person camera around
+    // the player reshuffles the distance ordering. That is the "wake rotates with the camera" and
+    // the "camera movement erases it partially" report, and no amount of tuning reaches it.
+    //
+    // (2) RIPPLE DECALS DO NOT MOVE. A ring pinned at a fixed world point radiates one circle when
+    // it appears and another when it is released; a row of those is a row of circles, which is
+    // exactly the shape we are trying to get rid of. MGE pinned ONE ring that moved continuously
+    // with the player and interpolated it across sub-steps. A moving obstacle is what makes a cone.
+    //
+    // So: reconstruct the actors from the BIRTH stream, which is a sequence of momentary events and
+    // therefore camera-independent, and extrapolate between births. A track survives ~0.5 s without
+    // a birth, which is far longer than any churn in the shipped list, so a wake no longer blinks
+    // when the camera turns.
+    struct WakeTrack {
+        float  x = 0.0f, y = 0.0f;          // extrapolated CURRENT position, world
+        float  vx = 0.0f, vy = 0.0f;        // world units/s
+        float  bx = 0.0f, by = 0.0f;        // last birth position, for the velocity estimate
+        float  interval = 0.12f;            // smoothed seconds between births — sets the coast grace
+        float  strength = 1.0f;             // pin depth scale; eases to 0 instead of vanishing
+        double lastBirthMs = 0.0;
+        bool   active = false;
+    };
+    // ⚠ A SPEED CEILING IS REQUIRED, not defensive padding. The velocity estimate divides the
+    // distance between consecutive births by the time between them, and MW spawns a BURST of
+    // ripples when an actor enters the water. Two of those a single 165 Hz frame apart turn 14 units
+    // of separation into 2300 units/s, and the track leaves like a bullet — "as if I am shooting a
+    // ripple origin". The minimum interval below rejects the burst; this clamps whatever survives.
+    constexpr float kWakeVelMax   = 400.0f;   // world units/s, comfortably above any swim speed
+    constexpr float kWakeVelMinDt = 0.03f;    // s between births before the estimate is believed
+    constexpr int kWakeTracks = 8;
+    WakeTrack g_wakeTrack[kWakeTracks];
+    // A birth joins the nearest track within this radius. MW lays a ripple every ~10-14 units of
+    // travel, so the gate only has to beat that; wide enough to survive a skipped birth, narrow
+    // enough that two actors swimming abreast do not merge into one track.
+    float g_wakeTrackJoin = 96.0f;
+    float g_wakeTrackHold = 0.5f;   // hard backstop; the ease-out below normally retires a track
+    // How quickly a track eases to a stop once the births stop arriving. ⚠ It cannot simply hold
+    // the last velocity for the whole hold window — that is 75 units of sail-on at swim speed, which
+    // reads as input lag rather than momentum. Nor can it damp immediately: births are ~0.1 s apart,
+    // so damping between two normal ones would slow the obstacle and narrow the cone (the angle is
+    // asin(waveSpeed / sourceSpeed), so source speed IS the shape). Hence a grace period scaled to
+    // the track's OWN observed birth interval — still moving, keep going; overdue, ease off.
+    float g_wakeCoastGrace = 1.75f;  // x the observed birth interval before easing starts
+    float g_wakeCoastTau   = 0.08f;  // s; velocity and pin depth e-fold together after that
+    // Debug: hold every ring at the position it had when this was switched on. The field then MUST
+    // be perfectly static under camera motion — it is an invariant with no judgement in it, so it
+    // separates "the lookup is camera-dependent" from "the source is" in one look.
+    bool  g_wakeFreezeSrc = false;
+
+    // Advance every track and fold in this frame's births. Called once per frame, before the grids.
+    void updateWakeTracks(float dt, double nowMs) {
+        if (g_wakeFreezeSrc) { return; }
+        for (int i = 0; i < kWakeTracks; ++i) {
+            WakeTrack& t = g_wakeTrack[i];
+            if (!t.active) { continue; }
+            const float since = (float)((nowMs - t.lastBirthMs) * 0.001);
+            if (since > g_wakeTrackHold) { t.active = false; continue; }
+            // Overdue for a birth => the actor has stopped (or left the water). Ease the obstacle to
+            // a halt AND fade its pin depth on the same time constant. Fading matters as much as
+            // slowing: a pin that simply disappears is a step change in the boundary, and a step
+            // change radiates — it would leave one last expanding circle every time you stop, which
+            // is precisely the artefact this whole exercise is trying to remove.
+            const float grace = std::min(std::max(g_wakeCoastGrace * t.interval, 0.05f), 0.6f);
+            if (since > grace) {
+                const float k = std::exp(-dt / std::max(g_wakeCoastTau, 1e-3f));
+                t.vx *= k; t.vy *= k; t.strength *= k;
+                if (t.strength < 0.04f) { t.active = false; continue; }
+            }
+            t.x += t.vx * dt;
+            t.y += t.vy * dt;
+        }
+        for (unsigned r = 0; r < g_actorRippleCount; ++r) {
+            if (g_actorRipples[r * 4 + 3] < 0.5f) { continue; }      // births only
+            const float px = g_actorRipples[r * 4 + 0];
+            const float py = g_actorRipples[r * 4 + 1];
+            int   best = -1;
+            float bestD2 = g_wakeTrackJoin * g_wakeTrackJoin;
+            for (int i = 0; i < kWakeTracks; ++i) {
+                if (!g_wakeTrack[i].active) { continue; }
+                const float dx = px - g_wakeTrack[i].x, dy = py - g_wakeTrack[i].y;
+                const float d2 = dx * dx + dy * dy;
+                if (d2 < bestD2) { bestD2 = d2; best = i; }
+            }
+            if (best < 0) {
+                // New actor: take a free slot, else the stalest one.
+                best = 0;
+                double oldest = 1e300;
+                for (int i = 0; i < kWakeTracks; ++i) {
+                    if (!g_wakeTrack[i].active) { best = i; break; }
+                    if (g_wakeTrack[i].lastBirthMs < oldest) {
+                        oldest = g_wakeTrack[i].lastBirthMs; best = i;
+                    }
+                }
+                WakeTrack& t = g_wakeTrack[best];
+                t = WakeTrack{};
+                t.x = t.bx = px; t.y = t.by = py;
+                t.lastBirthMs = nowMs; t.active = true;
+                continue;
+            }
+            WakeTrack& t = g_wakeTrack[best];
+            const float bdt = (float)((nowMs - t.lastBirthMs) * 0.001);
+            // ⚠ MINIMUM INTERVAL, not an epsilon guard. Anything closer together than this is a
+            // spawn BURST rather than travel — MW drops several ripples at once when an actor enters
+            // the water — and dividing a real separation by a near-zero dt is what launched the
+            // track across the bay. Below the threshold the position still snaps to the birth; only
+            // the velocity estimate is withheld.
+            if (bdt >= kWakeVelMinDt) {
+                // Half-weighted, because MW's spacing jitters by a few units per birth and an
+                // unsmoothed estimate makes the obstacle stutter — which shows up directly in the
+                // wake, since the cone angle is set by how fast the source moves.
+                float nvx = 0.5f * t.vx + 0.5f * (px - t.bx) / bdt;
+                float nvy = 0.5f * t.vy + 0.5f * (py - t.by) / bdt;
+                const float sp = std::sqrt(nvx * nvx + nvy * nvy);
+                if (sp > kWakeVelMax) { const float s = kWakeVelMax / sp; nvx *= s; nvy *= s; }
+                t.vx = nvx; t.vy = nvy;
+                // The birth cadence is what tells the coast how long to wait before easing off; it
+                // is a property of the actor's speed, so it is measured per track rather than fixed.
+                t.interval = 0.5f * t.interval + 0.5f * std::min(bdt, 0.6f);
+            }
+            t.x = t.bx = px;
+            t.y = t.by = py;
+            t.strength = 1.0f;      // a fresh birth revives a track that had started to fade
+            t.lastBirthMs = nowMs;
+        }
+    }
+    // Damping as a PER-SECOND rate, unlike the fine grid's per-step decay. That difference is the
+    // whole reason the first wake shipped "very weak": 0.985 per step at 120 steps/s is 0.16 per
+    // second, so 84% of the wave energy went every second. A rate in seconds cannot be misread, and
+    // it also makes the sim frame-rate independent, which a wedge needs — its wavelength is set by
+    // gravity and the swimmer's speed, both physical.
+    float g_wakeDamp     = 0.35f;   // 1/s; 0.35 leaves ~3 s of trail, i.e. several wavelengths
+    float g_wakeAmp      = 1.0f;    // impulse height at a birth
+    // Radius in TEXELS, so 2.0 is ~16 units — and it is matched to the wake, not picked. A bump of
+    // radius r puts most of its energy near k ~ 1/r, and 2 texels lands that at ~12 texels of
+    // wavelength, which IS the Kelvin wavelength at swim speed. A much tighter impulse would dump
+    // its energy into short waves, and short gravity waves are the SLOW ones — they would pool
+    // around the actor instead of running out into the wedge.
+    float g_wakeRadius   = 2.0f;
+    // ⚠ Not the fine grid's 3.0, and the difference is physical rather than taste. The frag converts
+    // height-per-texel to world slope with texels-per-unit, so at 8 units/texel this grid's slope is
+    // divided by 8 where the fine grid's is divided by 1 — and its waves are genuinely ~4x longer,
+    // which makes them gentler again for the same height. Both are correct; the gain has to make up
+    // the ~7x or a real wake reads as nothing at all.
+    float g_wakeSlope    = 6.0f;    // slope gain into water.frag's normal
+    float g_wakeGravity  = 1.0f;    // taste multiplier on the DERIVED gravity; 1.0 = physical
+    bool  g_wakeOn       = true;
     // ---- R1 weather drive ----
     // MW's own live precipitation counters, off waterParams[12]/[13]. Counters and not the weather
     // TYPE: the engine ramps them across a transition, so rain arrives and leaves as a ramp for
@@ -10550,7 +10913,9 @@ namespace {
     // divergence between those two has been a silent one.
     // ⚠ An UNWRITTEN group reads as GARBAGE, not as zero — the batch buffer is never cleared — so
     // adding a group means adding it HERE, where both call sites get it, and not at a call site.
-    inline void writeWaveScales(uint8_t* wbuf) {
+    // eyeAbs* is needed only by the R2 actor-ripple block at the end: MW reports ripple centres in
+    // ABSOLUTE world XY, and everything the water frag works in is eye-relative.
+    inline void writeWaveScales(uint8_t* wbuf, float eyeAbsX = 0.0f, float eyeAbsY = 0.0f) {
         float a[16] = {};   // worlds[8]
         float b[16] = {};   // worlds[9]
         for (int i = 0; i < 4; ++i) {
@@ -10633,6 +10998,133 @@ namespace {
         r[1] = g_rippleDecay;
         r[2] = std::floor(std::max(g_rippleSlots, 1.0f) + 0.5f);   // integral; the shader loops on it
         r[3] = (float)g_ripplePhase;   // < 512, so float32 keeps ~3e-5 of a cycle. Plenty.
+        // worlds[11] groups 1-2 — R2 actor ripples. Count is zeroed by the master toggle here
+        // rather than in the shader, so the OFF path costs the frag one compare against 0 and
+        // never enters the loop at all.
+        r[4] = g_actRipOn ? (float)g_actorRippleCount : 0.0f;
+        // ⚠ amp is divided by sqrt(the expected OVERLAP COUNT), and without it the knob is
+        // unusable. MW lays impulses every ~14.2 units of travel while each ring reaches rDie, so a
+        // pixel sits inside roughly rDie/14.2 rings at once — about ten at the default 140. Ten
+        // independent contributions of 0.35 slope is a near-vertical normal, which reads as noise
+        // rather than as a strong wake.
+        //
+        // sqrt and not a straight divide: the rings carry unrelated phases (each has its own
+        // wavelength and its own front position), so they sum in QUADRATURE like any incoherent
+        // superposition — the expected magnitude grows as sqrt(N), not N. Dividing by N would
+        // over-correct and make the wake fade out as the radius knob is raised.
+        //
+        // Done here rather than in the frag so the dev-panel knob stays perceptual: amp means "how
+        // strong is the wake", and changing the RADIUS no longer silently changes the strength too.
+        {
+            const float overlap = std::max(g_actRipRadius / 14.2f, 1.0f);
+            r[5] = g_actRipAmp / std::sqrt(overlap);
+        }
+        r[6] = g_actRipLamMin;
+        r[7] = std::max(g_actRipLamMax, g_actRipLamMin);
+        r[8] = g_actRipRadius;
+        r[9] = std::max(g_actRipDecay, 0.01f);
+        r[10] = std::max(g_actRipLife, 0.01f);
+        r[11] = (float)kActorRippleSlot;
+        // worlds[12] group 0 — R2b wave-sim domain, so the frag can map a world position to a
+        // texel. Eye-relative like everything else the water frag consumes.
+        //   x,y = domain origin (eye-relative)   z = 1/unitsPerTexel   w = grid size in texels
+        // Group 1: x = slope gain, y = enable (0 falls back to the analytic path), zw spare.
+        // Groups 2-3 are the same four lanes again for the R2c DISPERSIVE grid. A second set rather
+        // than a retune of the first because the two grids carry different physics on different
+        // scales — see the RippleGrid definition — and the frag sums their slopes.
+        float w12[16] = {};
+        const bool simOn  = g_live.rippleFine.ready && g_ripSimOn;
+        const bool wakeOn = g_live.rippleWake.ready && g_wakeOn;
+        w12[0] = g_live.rippleFine.originX - eyeAbsX;
+        w12[1] = g_live.rippleFine.originY - eyeAbsY;
+        w12[2] = 1.0f / g_live.rippleFine.unitsPerTexel;
+        w12[3] = (float)g_live.rippleFine.grid;
+        w12[4] = g_ripSimSlope;
+        w12[5] = simOn ? 1.0f : 0.0f;
+        w12[8]  = g_live.rippleWake.originX - eyeAbsX;
+        w12[9]  = g_live.rippleWake.originY - eyeAbsY;
+        w12[10] = 1.0f / std::max(g_live.rippleWake.unitsPerTexel, 0.25f);
+        w12[11] = (float)g_live.rippleWake.grid;
+        w12[12] = g_wakeSlope;
+        w12[13] = wakeOn ? 1.0f : 0.0f;
+        std::memcpy(wbuf + 12 * 64, w12, 64);
+        // The analytic actor path is MUTUALLY EXCLUSIVE with the sims: they perturb the same normal
+        // from the same impulses, so running them together doubles every wake. A sim wins when one
+        // is up; r[4] is the analytic count, so zeroing it here is the whole switch.
+        if (simOn || wakeOn) { r[4] = 0.0f; }
+
+        // worlds[16..] — the ripple array itself, 4 per matrix. Written CAMERA-RELATIVE to match
+        // every other position the water frag sees: worldXY there is already eye-relative, and a
+        // pair of absolute exterior coordinates (~-12000, -72000) would lose all their low bits
+        // against it ([[project_forge_precision_far_origin]]).
+        // ⚠ PER-RIPPLE WORK BELONGS HERE, NOT IN THE FRAG. The frag's loop is per PIXEL per ripple,
+        // so anything derived from the ripple alone gets recomputed hundreds of thousands of times
+        // for a value that does not change over the surface. Doing the wavelength hash, k, W and
+        // the front radius in the shader cost 13 ms of water pass (0.9 -> 14.6 in the gpu split)
+        // and showed up as frame JITTER, because the spike only lands on frames with ripples in
+        // view. Here it is 64 iterations, once.
+        //
+        // Packs to exactly float4(centre.xy, rc, W), which is why the crest count is FIXED at 2
+        // rather than hashed: with n free the frag would need lambda as a fifth value and the
+        // one-float4-per-ripple layout (4 per matrix) would break. Wavelength still varies per
+        // ripple, which is where the visual variety actually comes from; n only set how many
+        // crests rode inside the envelope. k = 2*pi/lam and W = 0.5*(n+1)*lam, so at n=2 the frag
+        // recovers k = 3*pi/W with one divide and no hash at all.
+        if (g_actorRippleCount) {
+            const float rDie = std::max(g_actRipRadius, 1e-3f);
+            const unsigned mats = (g_actorRippleCount + 3u) / 4u;
+            float rip[16];
+            // Bounding circle over every ripple's OUTER reach, eye-relative. The frag tests this
+            // once and skips the whole loop on a miss.
+            //
+            // This is the difference between a loop that costs what it draws and one that costs
+            // what it MIGHT draw. Measured: water=0.31 ms with no ripples, 32.81 ms with them —
+            // and the annulus reject barely dented it, because a rejecting iteration still pays a
+            // cbuffer load, a dot and a compare, 64 times, for EVERY water pixel on screen. Most
+            // of those pixels are nowhere near a wake. One circle test in front of the loop turns
+            // "64 rejects per pixel" into "1 reject per pixel" everywhere except around the actor.
+            float minX = 1e30f, minY = 1e30f, maxX = -1e30f, maxY = -1e30f;
+            for (unsigned i = 0; i < g_actorRippleCount; ++i) {
+                const float x = g_actorRipples[i * 4 + 0] - eyeAbsX;
+                const float y = g_actorRipples[i * 4 + 1] - eyeAbsY;
+                minX = std::min(minX, x); maxX = std::max(maxX, x);
+                minY = std::min(minY, y); maxY = std::max(maxY, y);
+            }
+            const float bcx = 0.5f * (minX + maxX);
+            const float bcy = 0.5f * (minY + maxY);
+            const float half = std::sqrt(0.25f * ((maxX - minX) * (maxX - minX)
+                                                + (maxY - minY) * (maxY - minY)));
+            // + the largest reach any single ripple can have: rDie plus its widest packet.
+            const float reach = rDie + 1.5f * std::max(g_actRipLamMax, g_actRipLamMin);
+            r[12] = bcx;
+            r[13] = bcy;
+            r[14] = half + reach;
+            r[15] = 0.0f;
+            for (unsigned m = 0; m < mats; ++m) {
+                std::memset(rip, 0, sizeof(rip));
+                for (unsigned j = 0; j < 4u; ++j) {
+                    const unsigned i = m * 4u + j;
+                    if (i >= g_actorRippleCount) { break; }
+                    const float ax  = g_actorRipples[i * 4 + 0];
+                    const float ay  = g_actorRipples[i * 4 + 1];
+                    const float age = std::min(std::max(g_actorRipples[i * 4 + 2], 0.0f), 1.0f);
+                    // Hash the ABSOLUTE centre: it is stable for the ripple's whole life, whereas
+                    // the eye-relative one below moves every frame and would make a ring change
+                    // wavelength as the camera walked.
+                    const float hs = std::sin(ax * 12.9898f + ay * 78.233f) * 43758.5453f;
+                    const float h  = hs - std::floor(hs);
+                    const float lam = g_actRipLamMin
+                                    + h * (std::max(g_actRipLamMax, g_actRipLamMin) - g_actRipLamMin);
+                    const float W  = 1.5f * lam;             // n = 2
+                    rip[j * 4 + 0] = ax - eyeAbsX;
+                    rip[j * 4 + 1] = ay - eyeAbsY;
+                    rip[j * 4 + 2] = (rDie + W) * age;       // rc: the front radius, right now
+                    rip[j * 4 + 3] = W;
+                }
+                std::memcpy(wbuf + (size_t)(kActorRippleSlot + m) * 64, rip, 64);
+            }
+        }
+        // AFTER the block above, which fills r[12..14] with the bounding circle it computes.
         std::memcpy(wbuf + 11 * 64, r, 64);
     }
 
@@ -11635,6 +12127,51 @@ namespace {
           t.sliderF("Ripple cell size (world units between impulses)", &g_rainCellSize, 8.0f, 256.0f, 1.0f, "%.0f");
           t.sliderF("Ripple LIFE (s one ripple lasts)", &g_rippleLife, 0.2f, 6.0f, 0.05f, "%.2f");
           t.sliderF("Ripple slot cycle at density 0 (s; lerps to 1.0s as density rises)", &g_rainPeriod, 1.0f, 20.0f, 0.1f, "%.2f");
+          // R2b actor-wake wave sim. Live here rather than on F8: these are HOST constants, and F8
+          // reloads compute SHADERS — it cannot touch a value that arrives through a cbuffer.
+          //
+          // ⚠ DECAY IS PER STEP AND THERE ARE 120 STEPS A SECOND (2 sub-steps at 60 Hz), so the
+          // slider's useful range is a thin sliver just below 1 and the per-second retention is what
+          // to reason about: 0.999 -> 0.89/s, 0.995 -> 0.55/s, 0.99 -> 0.30/s, 0.985 -> 0.16/s.
+          // The first shipped default was 0.985, which threw away 84% of the wave energy every
+          // second on ripples whose whole life is 3 s — the waves died about as fast as MW made
+          // them, which is why the wake read as "very weak" rather than as wrong.
+          t.checkbox("Wake SIM on (off = the analytic per-ripple path, ~30x costlier)", &g_ripSimOn);
+          t.sliderF("Wake sim: impulse amplitude (height at the splash centre)", &g_ripSimAmp, 0.0f, 4.0f, 0.05f, "%.2f");
+          t.sliderF("Wake sim: impulse radius (TEXELS; 1 texel = 1 world unit)", &g_ripSimRadius, 1.0f, 32.0f, 0.5f, "%.1f");
+          t.sliderF("Wake sim: slope gain into the normal", &g_ripSimSlope, 0.0f, 16.0f, 0.25f, "%.2f");
+          t.sliderF("Wake sim: velocity decay PER STEP (0.995 = 0.55/s; 120 steps/s)", &g_ripSimDecay, 0.95f, 1.0f, 0.0005f, "%.4f");
+          t.sliderF("Wake sim: wave speed (CFL — above 2.0 the grid diverges)", &g_ripSimSpeed, 0.1f, 2.0f, 0.05f, "%.2f");
+          // R2c. The fine grid above CANNOT make a wedge at any setting on this panel — it has no
+          // dispersion, so a swimmer in it leaves nested circles or a Mach cone. This second grid is
+          // where the wedge comes from; turn the two on and off independently to see which is which.
+          t.checkbox("WAKE grid on (the V comes from THIS one, not the fine grid above)", &g_wakeOn);
+          t.checkbox("Wake integrator = MGE's own sim (off = the dispersive |k| grid)", &g_wakeMge);
+          t.sliderF("Wake: world units per TEXEL (moves with the integrator; clears the field)", &g_wakeUnitsPerTexel, 1.0f, 24.0f, 0.5f, "%.1f");
+          t.sliderF("Wake: slope gain into the normal", &g_wakeSlope, 0.0f, 16.0f, 0.25f, "%.2f");
+          // ⚠ THE ONE THAT DECIDES WHETHER THERE IS A V AT ALL. A swimmer does 80-170 units/s; the
+          // waves must be SLOWER or the source is subcritical and leaves closed circles around
+          // itself instead of a cone behind it. Half-angle is asin(waveSpeed / swimSpeed), so
+          // lower = narrower. Ceiling is the CFL limit at the current metric.
+          t.sliderF("MGE: WAVE SPEED, units/s (must be BELOW swim speed; angle = asin(c/V))", &g_wakeSpeed, 15.0f, 140.0f, 1.0f, "%.0f");
+          t.sliderF("MGE: obstacle ring radius (world units; MGE used 12)", &g_wakeRingRadius, 2.0f, 48.0f, 0.5f, "%.1f");
+          t.sliderF("MGE: obstacle pin depth (the ring is a boundary, not an impulse)", &g_wakeRingDepth, 0.0f, 2.0f, 0.05f, "%.2f");
+          t.sliderF("MGE: track join radius (a birth this close extends an actor's track)", &g_wakeTrackJoin, 24.0f, 256.0f, 4.0f, "%.0f");
+          t.sliderF("MGE: track hold (s, hard backstop; the ease-out below normally retires it)", &g_wakeTrackHold, 0.1f, 2.0f, 0.05f, "%.2f");
+          // How far the wake keeps travelling after you stop. Too long reads as input lag, zero
+          // reads as the water having no momentum at all.
+          t.sliderF("MGE: coast grace (x the track's own birth interval before easing off)", &g_wakeCoastGrace, 0.5f, 4.0f, 0.05f, "%.2f");
+          t.sliderF("MGE: coast ease-out (s; lower = the wake stops sooner when you do)", &g_wakeCoastTau, 0.01f, 0.5f, 0.01f, "%.2f");
+          // Invariant test, no judgement required: with this on the rings stop moving, so the field
+          // MUST be perfectly static under camera motion. If it still slides, the bug is in the
+          // domain scroll or the lookup; if it is rock solid, the bug is in the source.
+          t.checkbox("MGE: FREEZE sources (debug — field must then be static under camera motion)", &g_wakeFreezeSrc);
+          t.sliderF("MGE: damping u(t) (MGE used 0.02; raise to shorten the wake)", &g_wakeUdamp, 0.0f, 0.2f, 0.002f, "%.3f");
+          t.sliderF("MGE: damping u(t-1) (MGE used 0.02)", &g_wakeVdamp, 0.0f, 0.2f, 0.002f, "%.3f");
+          t.sliderF("Dispersive only: impulse amplitude at a birth", &g_wakeAmp, 0.0f, 4.0f, 0.05f, "%.2f");
+          t.sliderF("Dispersive only: impulse radius (TEXELS)", &g_wakeRadius, 0.5f, 8.0f, 0.25f, "%.2f");
+          t.sliderF("Dispersive only: damping PER SECOND", &g_wakeDamp, 0.0f, 3.0f, 0.01f, "%.2f");
+          t.sliderF("Dispersive only: gravity x (1.0 = physical)", &g_wakeGravity, 0.1f, 4.0f, 0.05f, "%.2f");
           t.checkbox("Water: force reflection fog melt OFF (roughness calibration only)", &g_waterNoFogMelt);
           // SH1 sky-directional ambient (skyamb.h.fsl). STRENGTH 0 is the A/B: every receiver
           // early-outs to flat ambient, so the whole feature toggles against the previous image from
@@ -12014,6 +12551,408 @@ namespace {
     // buildOpaquePath (same anon namespace) before pPerFrameSet binds gFroxelMask. Mirrors
     // createShadowLightCullResources. Non-fatal: on failure froxelReady stays false and the frags
     // fall back to the brute gLights loop.
+    // Build ONE wake grid: the ping-pong RGBA16F pair, one RippleSimParams cbuffer per sub-step, and
+    // one descriptor set per ping-pong orientation. Pipelines are shared between grids and made by
+    // the caller. Non-fatal: on failure `G.ready` stays false, that grid's dispatch never runs, and
+    // its field reads zero = flat water.
+    bool createRippleGrid(Renderer* R, RippleGrid& G, uint32_t size, float unitsPerTexel,
+                          const char* tag) {
+        G.grid = size;
+        G.unitsPerTexel = unitsPerTexel;
+
+        // (1) The ping-pong pair. SRV+UAV both: compute writes them, water.frag reads the current
+        // one. fp16 — heights and velocities are small signed numbers and the field is persistent
+        // state, so the extra range over UNORM matters more than the precision does.
+        for (int i = 0; i < 2; ++i) {
+            char name[48];
+            std::snprintf(name, sizeof(name), "%s%d", tag, i);
+            TextureDesc td = {};
+            td.mWidth = size; td.mHeight = size; td.mDepth = 1;
+            td.mArraySize = 1; td.mMipLevels = 1;
+            td.mSampleCount = SAMPLE_COUNT_1;
+            td.mFormat = TinyImageFormat_R16G16B16A16_SFLOAT;
+            td.mStartState = RESOURCE_STATE_UNORDERED_ACCESS;
+            td.mDescriptors = (DescriptorType)(DESCRIPTOR_TYPE_TEXTURE | DESCRIPTOR_TYPE_RW_TEXTURE);
+            td.pName = name;
+            TextureLoadDesc tld = {};
+            tld.ppTexture = &G.tex[i];
+            tld.pDesc = &td;
+            addResource(&tld, nullptr);
+        }
+
+        // (2) RippleSimParams, ONE PER SUB-STEP. See the declaration: a single shared buffer is read
+        // by every recorded dispatch at execution time, so per-step values cannot live in it.
+        for (int i = 0; i < 2; ++i) {
+            char name[64];
+            std::snprintf(name, sizeof(name), "%sParams%d", tag, i);
+            BufferLoadDesc pb = {};
+            pb.mDesc.mDescriptors = DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+            pb.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_CPU_TO_GPU;
+            pb.mDesc.mFlags       = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
+            pb.mDesc.mSize        = sizeof(RippleSimParams);
+            pb.mDesc.pName        = name;
+            pb.ppBuffer           = &G.cbv[i];
+            addResource(&pb, nullptr);
+        }
+
+        waitForAllResourceLoads();
+        if (!G.tex[0] || !G.tex[1] || !G.cbv[0] || !G.cbv[1]) {
+            std::printf("[forge][ripple] %s resource alloc FAILED — that grid disabled\n", tag);
+            return false;
+        }
+
+        // (3) One set per orientation — which, because parity always starts at 0 and the step count
+        // is fixed at 2, is ALSO one set per sub-step: set[0] is always the first step and set[1]
+        // always the second. That is what lets each carry its own params buffer without a third
+        // dimension of sets. All three pipelines share the SRT, and the normal pass reads and writes
+        // only gRippleSimNext, so it runs correctly under either.
+        for (int i = 0; i < 2; ++i) {
+            DescriptorSetDesc sd = SRT_SET_DESC(RippleSimSrtData, Persistent, 1, 0);
+            addDescriptorSet(R, &sd, &G.set[i]);
+            if (!G.set[i]) {
+                std::printf("[forge][ripple] %s addDescriptorSet FAILED\n", tag); return false;
+            }
+            DescriptorData d[3] = {};
+            d[0].mIndex     = SRT_RES_IDX(RippleSimSrtData, Persistent, gRippleSimParams);
+            d[0].ppBuffers  = &G.cbv[i];
+            d[1].mIndex     = SRT_RES_IDX(RippleSimSrtData, Persistent, gRippleSimPrev);
+            d[1].ppTextures = &G.tex[i];
+            d[2].mIndex     = SRT_RES_IDX(RippleSimSrtData, Persistent, gRippleSimNext);
+            d[2].ppTextures = &G.tex[1 - i];
+            updateDescriptorSet(R, 0, G.set[i], 3, d);
+        }
+
+        G.ready = true;
+        LOG::logline(">> [ripple] %s grid ready: %ux%u @ %.2f units/texel (%.0f world units)",
+                     tag, size, size, unitsPerTexel, size * unitsPerTexel);
+        return true;
+    }
+
+    // R2 actor-wake wave sims: the three compute pipelines, then BOTH grids. Same eager-from-
+    // buildOpaquePath, non-fatal shape as createFroxelResources — a grid that fails to build is
+    // simply skipped and its field reads zero.
+    bool createRippleSimResources(Renderer* R) {
+        if (g_live.pRippleSimPipeline) { return g_live.rippleFine.ready; }
+
+        // Pipelines (merged ComputeRootSignature), shared by both grids.
+        {
+            ShaderLoadDesc ss = {};
+            ss.mComp.pFileName = "ripplesim.comp";
+            addShader(R, &ss, &g_live.pRippleSimShader);
+            ShaderLoadDesc ws = {};
+            ws.mComp.pFileName = "ripplewave.comp";
+            addShader(R, &ws, &g_live.pRippleWaveShader);
+            ShaderLoadDesc ms = {};
+            ms.mComp.pFileName = "ripplemge.comp";
+            addShader(R, &ms, &g_live.pRippleMgeShader);
+            ShaderLoadDesc ns = {};
+            ns.mComp.pFileName = "ripplenormal.comp";
+            addShader(R, &ns, &g_live.pRippleNormalShader);
+            if (!g_live.pRippleSimShader || !g_live.pRippleWaveShader
+                || !g_live.pRippleMgeShader || !g_live.pRippleNormalShader) {
+                std::printf("[forge][ripple] addShader FAILED\n"); return false;
+            }
+            PipelineDesc sp = {}; sp.mType = PIPELINE_TYPE_COMPUTE;
+            sp.mComputeDesc.pShaderProgram = g_live.pRippleSimShader;
+            addPipeline(R, &sp, &g_live.pRippleSimPipeline);
+            PipelineDesc wp = {}; wp.mType = PIPELINE_TYPE_COMPUTE;
+            wp.mComputeDesc.pShaderProgram = g_live.pRippleWaveShader;
+            addPipeline(R, &wp, &g_live.pRippleWavePipeline);
+            PipelineDesc mp = {}; mp.mType = PIPELINE_TYPE_COMPUTE;
+            mp.mComputeDesc.pShaderProgram = g_live.pRippleMgeShader;
+            addPipeline(R, &mp, &g_live.pRippleMgePipeline);
+            PipelineDesc np = {}; np.mType = PIPELINE_TYPE_COMPUTE;
+            np.mComputeDesc.pShaderProgram = g_live.pRippleNormalShader;
+            addPipeline(R, &np, &g_live.pRippleNormalPipeline);
+            if (!g_live.pRippleSimPipeline || !g_live.pRippleWavePipeline
+                || !g_live.pRippleMgePipeline || !g_live.pRippleNormalPipeline) {
+                std::printf("[forge][ripple] addPipeline FAILED\n"); return false;
+            }
+        }
+
+        const bool fine = createRippleGrid(R, g_live.rippleFine, kRippleGrid,
+                                           kRippleUnitsPerTexel, "rippleSim");
+        const bool wake = createRippleGrid(R, g_live.rippleWake, kWakeGrid,
+                                           g_wakeUnitsPerTexel, "rippleWake");
+        return fine && wake;
+    }
+
+    // Move a grid's tex[0] into SHADER_RESOURCE without stepping it. Needed on frames where the sim
+    // is skipped (no water, toggled off) but the texture is still in its UAV creation state while
+    // the frag's SRV binding says otherwise. water.frag samples it unconditionally and gets zero,
+    // which is flat water.
+    void parkRippleGrid(RippleGrid& G) {
+        if (!G.ready || G.inShaderState) { return; }
+        TextureBarrier fwd = {};
+        fwd.pTexture      = G.tex[0];
+        fwd.mCurrentState = RESOURCE_STATE_UNORDERED_ACCESS;
+        fwd.mNewState     = RESOURCE_STATE_SHADER_RESOURCE;
+        cmdResourceBarrier(g_live.pCmd, 0, nullptr, 1, &fwd, 0, nullptr);
+        G.inShaderState = true;
+    }
+
+    // Advance ONE wake grid by exactly two sub-steps. Shared by the fine and the dispersive grid,
+    // because the texel-snapped origin, the integer scroll, the clear-by-huge-scroll, the birth
+    // injection, the barriers and the even sub-step count are identical for both — only the step
+    // pipeline and the handful of numbers it reads differ. Two copies of this would drift.
+    //
+    // `mode` picks the step shader and which RippleSimParams lanes are filled. ⚠ The three do NOT
+    // share a time base, and that is the single most important difference between them:
+    //   kRipModeFine — per-STEP speed/decay, so the wave speed scales with the frame rate.
+    //   kRipModeWave — seconds; gravity/dt/damping.
+    //   kRipModeMge  — seconds, at a FIXED 80 Hz accumulated by the caller, which pins the wave
+    //                  speed at 75 u/s. That is below swim speed, so the source is supercritical
+    //                  and leaves a cone. It is the reason MGE's wake has a V and ours did not.
+    enum RipMode { kRipModeFine = 0, kRipModeWave = 1, kRipModeMge = 2 };
+
+    void advanceRippleGrid(RippleGrid& G, Pipeline* stepPipe, int mode,
+                           float eyeAbsX, float eyeAbsY, float dtFrame, int fixedSteps,
+                           uint32_t stepThreads, float impRadius, float impAmp,
+                           const char* marker) {
+        if (!G.ready || !stepPipe || !g_live.pRippleNormalPipeline) { return; }
+        const bool dispersive = (mode == kRipModeWave);
+        const bool mge        = (mode == kRipModeMge);
+
+        // ⚠ DECIDED BEFORE ANYTHING IS COMMITTED, and the early-out below is a CORRECTNESS
+        // requirement, not an optimisation. MGE mode advances on a fixed 80 Hz accumulator, so above
+        // 40 fps most frames take no step at all — three in four at 165 Hz. The domain origin must
+        // NOT be updated on those frames: the scroll that compensates for camera motion is applied
+        // by the step dispatch, so committing a new origin without stepping throws that frame's
+        // shift away and the whole stored field slides by exactly the camera's motion. New impulses
+        // still land correctly (they are placed against the current origin), which is what made this
+        // present as "the newest ripple is on the player but the older ones detach".
+        // A clear is never skipped — an uninitialised or teleported field is not worth preserving.
+        int steps = mge ? fixedSteps : 2;
+        if (!G.cleared) { steps = 2; }
+        if (steps <= 0) {
+            parkRippleGrid(G);   // leaves originX/originY alone, so the shift accumulates
+            return;
+        }
+        cmdBeginDebugMarker(g_live.pCmd, 0.2f, 0.6f, 0.9f, marker);
+
+        // Back to UAV for the compute below. Only tex[0] is ever handed to the frag, so only tex[0]
+        // can be in SHADER_RESOURCE here.
+        if (G.inShaderState) {
+            TextureBarrier back = {};
+            back.pTexture      = G.tex[0];
+            back.mCurrentState = RESOURCE_STATE_SHADER_RESOURCE;
+            back.mNewState     = RESOURCE_STATE_UNORDERED_ACCESS;
+            cmdResourceBarrier(g_live.pCmd, 0, nullptr, 1, &back, 0, nullptr);
+            G.inShaderState = false;
+        }
+
+        // Snap the domain origin to whole texels around the eye. The snap is what keeps the scroll
+        // an integer, i.e. an exact copy rather than a resample.
+        const float upt   = G.unitsPerTexel;
+        const float halfW = 0.5f * (float)G.grid * upt;
+        const float newOX = std::floor((eyeAbsX - halfW) / upt) * upt;
+        const float newOY = std::floor((eyeAbsY - halfW) / upt) * upt;
+        int shiftX = 0, shiftY = 0;
+        if (G.originValid) {
+            shiftX = (int)std::lround((newOX - G.originX) / upt);
+            shiftY = (int)std::lround((newOY - G.originY) / upt);
+            // A jump larger than the grid (cell change, fast travel, coc) shares no texels with the
+            // old field, so shifting is pointless and the clamped reads would drag one edge row
+            // across the whole domain. Treat it as a fresh start.
+            if (std::abs(shiftX) >= (int)G.grid || std::abs(shiftY) >= (int)G.grid) {
+                G.cleared = false;
+                shiftX = shiftY = 0;
+            }
+        }
+        G.originX = newOX;
+        G.originY = newOY;
+        G.originValid = true;
+
+        // BOTH buffers are written NOW, before any dispatch is recorded. [0] drives the first
+        // sub-step (scroll + this frame's births), [1] the second (inert). See the declaration for
+        // why this cannot be one buffer mutated between cmdDispatch calls.
+        RippleSimParams* rp  = (RippleSimParams*)G.cbv[0]->pCpuMappedAddress;
+        RippleSimParams* rp1 = (RippleSimParams*)G.cbv[1]->pCpuMappedAddress;
+        std::memset(rp,  0, sizeof(*rp));
+        std::memset(rp1, 0, sizeof(*rp1));
+        rp->sim[0] = rp1->sim[0] = (float)G.grid;
+        if (dispersive) {
+            // Gravity is DERIVED so the wake's wavelength comes out physical: the shader's operator
+            // returns alpha*k with k in rad/texel, so omega² = grav*alpha*k_texel must equal
+            // g_SI*k_SI = g_SI*k_texel/metresPerTexel. Everything cancels to this.
+            const float mPerTexel = std::max(upt * kMwUnitMetres, 1e-6f);
+            rp->wave[0] = rp1->wave[0] =
+                g_wakeGravity * 9.81f / (kWakeKernelAlpha * mPerTexel);
+            // Clamped before the split: a load screen or an alt-tab must not fast-forward the field
+            // through half a second of evolution the instant the player is looking again.
+            const float dt = std::min(std::max(dtFrame, 0.0f), 0.05f) * 0.5f;
+            rp->wave[1] = rp1->wave[1] = dt;
+            rp->wave[2] = rp1->wave[2] = std::exp(-std::max(g_wakeDamp, 0.0f) * dt);
+        } else if (mge) {
+            // MGE's second-order form, with `a` derived from the wave SPEED so the knob stays in
+            // world units per second — the quantity that decides whether the swimmer outruns its
+            // own waves, which is the entire effect.
+            //   a = (c * waveStep / unitsPerTexel)^2,  clamped to the 2D CFL limit 0.5
+            //   u(t+1) = a*nsum + (2 - udamp - vdamp - 4a)*u(t) - (1 - vdamp)*u(t-1)
+            // MGE's a = 0.14 / udamp = vdamp = 0.02 reproduce its literal 0.14 / 1.40 / 0.98.
+            const float cTex = std::max(g_wakeSpeed, 0.0f) * kWakeStep / std::max(upt, 1e-3f);
+            const float a    = std::min(cTex * cTex, 0.5f);
+            rp->wave[0] = rp1->wave[0] = a;
+            rp->wave[1] = rp1->wave[1] =
+                2.0f - g_wakeUdamp - g_wakeVdamp - 4.0f * a;
+            rp->wave[2] = rp1->wave[2] = 1.0f - g_wakeVdamp;
+        } else {
+            rp->sim[1] = rp1->sim[1] = std::min(g_ripSimSpeed, 2.0f);
+            rp->sim[2] = rp1->sim[2] = g_ripSimDecay;
+        }
+        rp->scroll[0] = (float)shiftX;
+        rp->scroll[1] = (float)shiftY;
+        // rp1 keeps scroll 0 and impulseCount 0: the domain moves once per frame and the impulse is
+        // already in the field by the time the second step runs.
+
+        // Impulses: ONLY the ripples the client flagged as born this frame (w > 0.5). Injecting
+        // every live ripple every frame would drive the surface continuously instead of
+        // impulsively — the field would saturate and the wake would read as a permanent mound
+        // following the actor rather than as waves leaving it behind.
+        unsigned nImp = 0;
+        float bMinX = 1e9f, bMinY = 1e9f, bMaxX = -1e9f, bMaxY = -1e9f;
+        if (!G.cleared) {
+            // FIRST FRAME (or after a teleport, or after the units/texel slider moved): clear the
+            // grids instead of stepping them. A freshly created texture has no defined contents, and
+            // a single NaN in a PERSISTENT field never leaves — it spreads through the operator to
+            // the whole domain and stays there. Scrolling by more than the grid makes every fetch
+            // fall outside and return zero, so the existing out-of-bounds path IS the clear; two
+            // sub-steps then zero both ping-pong targets. No extra kernel, no extra dispatch.
+            rp->scroll[0] = rp1->scroll[0] = (float)(G.grid * 2);
+            rp->scroll[1] = rp1->scroll[1] = (float)(G.grid * 2);
+        } else if (mge) {
+            // MGE's source is a MOVING OBSTACLE, so it is stamped on EVERY sub-step, not injected
+            // once at birth — that is what distinguishes a wake from a row of splashes. MW gives us
+            // ripple decals rather than actor positions, so the ring centres are every ripple young
+            // enough to still be under its actor; MW lays one every ~10-14 units of travel, so a
+            // short age window tracks the actor about as well as MGE's interpolated player
+            // position did.
+            const float ringTex   = std::max(g_wakeRingRadius / upt, 0.75f);
+            // MGE pulsed the radius with two incommensurate sines so a stationary swimmer never
+            // looks like a stamped decal. Same two frequencies.
+            const float t         = (float)(hostNowMs() * 0.001);
+            const float pulse     = 1.0f + 0.055f * std::sin(16.0f * t)
+                                         + 0.065f * std::sin(12.87645f * t);
+            const float ringR     = ringTex * pulse;
+            const unsigned maxSrc = std::min<unsigned>(g_wakeMaxSrc, RIPPLE_MAX_IMPULSES);
+            // ⚠ TRACKS, NOT THE RIPPLE LIST. See the WakeTrack declaration: the shipped ripples are
+            // selected by camera distance, so pinning them makes the field a function of where the
+            // camera is; and ripple decals do not move, so a pinned decal is a stationary obstacle,
+            // which radiates a circle rather than trailing a cone.
+            for (int i = 0; i < kWakeTracks && nImp < maxSrc; ++i) {
+                const WakeTrack& tr = g_wakeTrack[i];
+                if (!tr.active) { continue; }
+                // SWEPT across the frame: sub-step 0 sits one step behind sub-step 1, so the
+                // obstacle moves through the field instead of teleporting between frames. This is
+                // MGE's `w = -i / numWaveSteps` interpolation, and its stated purpose there was the
+                // same — that a low frame rate must not produce fewer waves.
+                const float x1 = tr.x, y1 = tr.y;
+                const float x0 = tr.x - tr.vx * kWakeStep, y0 = tr.y - tr.vy * kWakeStep;
+                const float t0x = (x0 - newOX) / upt, t0y = (y0 - newOY) / upt;
+                const float t1x = (x1 - newOX) / upt, t1y = (y1 - newOY) / upt;
+                if (t1x < -ringR || t1y < -ringR
+                    || t1x >= (float)G.grid + ringR || t1y >= (float)G.grid + ringR) {
+                    continue;   // its whole ring is outside this domain
+                }
+                const float depth = g_wakeRingDepth * tr.strength;
+                rp->impulses[nImp][0]  = t0x;
+                rp->impulses[nImp][1]  = t0y;
+                rp->impulses[nImp][2]  = ringR;
+                rp->impulses[nImp][3]  = depth;
+                rp1->impulses[nImp][0] = t1x;
+                rp1->impulses[nImp][1] = t1y;
+                rp1->impulses[nImp][2] = ringR;
+                rp1->impulses[nImp][3] = depth;
+                bMinX = std::min(bMinX, std::min(t0x, t1x));
+                bMaxX = std::max(bMaxX, std::max(t0x, t1x));
+                bMinY = std::min(bMinY, std::min(t0y, t1y));
+                bMaxY = std::max(bMaxY, std::max(t0y, t1y));
+                ++nImp;
+            }
+            rp1->sim[3] = (float)nImp;
+            if (nImp) {
+                // Expanded by the ring's outer feather (1.5r) plus a texel of slack.
+                const float pad = 1.5f * ringR + 1.0f;
+                rp->srcBounds[0] = rp1->srcBounds[0] = bMinX - pad;
+                rp->srcBounds[1] = rp1->srcBounds[1] = bMinY - pad;
+                rp->srcBounds[2] = rp1->srcBounds[2] = bMaxX + pad;
+                rp->srcBounds[3] = rp1->srcBounds[3] = bMaxY + pad;
+            }
+        } else {
+            for (unsigned i = 0; i < g_actorRippleCount && nImp < RIPPLE_MAX_IMPULSES; ++i) {
+                if (g_actorRipples[i * 4 + 3] < 0.5f) { continue; }   // not a birth
+                const float tx = (g_actorRipples[i * 4 + 0] - newOX) / upt;
+                const float ty = (g_actorRipples[i * 4 + 1] - newOY) / upt;
+                if (tx < 0.0f || ty < 0.0f || tx >= (float)G.grid || ty >= (float)G.grid) {
+                    continue;   // outside this domain; the far field is R1's problem
+                }
+                rp->impulses[nImp][0] = tx;
+                rp->impulses[nImp][1] = ty;
+                rp->impulses[nImp][2] = impRadius;
+                rp->impulses[nImp][3] = impAmp;
+                ++nImp;
+            }
+        }
+        rp->sim[3] = (float)nImp;
+
+        const uint32_t stepGroups = (G.grid + stepThreads - 1) / stepThreads;
+        // ⚠ The slope pass has its OWN thread count (RIPPLE_THREADS = 8 in ripplenormal.comp) and it
+        // is not the step's — ripplewave.comp uses 16 so its halo amortises. Deriving both group
+        // counts from one number would under-dispatch the slope pass over three quarters of the
+        // wake grid, which reads as a field that only updates in its top-left corner.
+        const uint32_t normGroups = (G.grid + kRippleThreads - 1) / kRippleThreads;
+
+        // ⚠ THE SUB-STEP COUNT IS FORCED EVEN, and that is a binding constraint rather than a tuning
+        // choice. Each step flips the ping-pong, so with an odd count the finished field would land
+        // in a different texture every frame — and the field is bound ONCE into the PerFrame set, of
+        // which there are THREE instances ([[project_forge_perframe_set_instances]]); re-pointing it
+        // per frame means updating all three or silently reading zero from two of them. An even
+        // count returns parity to where it started, so the result is always in tex[0].
+        //
+        // EXACTLY two, not "any even number": parity starting at 0 makes set[0] the first sub-step
+        // and set[1] the second, which is what lets each set carry its own params buffer. At four
+        // steps set[0] would come round again and re-inject the impulses.
+        //
+        // `steps` was resolved at the top of the function, before the origin was touched — see the
+        // early-out there for why that ordering is load-bearing.
+        for (int s = 0; s < steps; ++s) {
+            const uint32_t src = G.parity;
+            TextureBarrier tb[2] = {};
+            tb[0].pTexture = G.tex[src];
+            tb[0].mCurrentState = RESOURCE_STATE_UNORDERED_ACCESS;
+            tb[0].mNewState     = RESOURCE_STATE_UNORDERED_ACCESS;
+            tb[1].pTexture = G.tex[1 - src];
+            tb[1].mCurrentState = RESOURCE_STATE_UNORDERED_ACCESS;
+            tb[1].mNewState     = RESOURCE_STATE_UNORDERED_ACCESS;
+            cmdResourceBarrier(g_live.pCmd, 0, nullptr, 2, tb, 0, nullptr);
+
+            cmdBindPipeline(g_live.pCmd, stepPipe);
+            cmdBindDescriptorSet(g_live.pCmd, 0, G.set[src]);
+            cmdDispatch(g_live.pCmd, stepGroups, stepGroups, 1);
+
+            // The slope pass needs every height written, hence a full UAV barrier between.
+            cmdResourceBarrier(g_live.pCmd, 0, nullptr, 2, tb, 0, nullptr);
+            cmdBindPipeline(g_live.pCmd, g_live.pRippleNormalPipeline);
+            cmdBindDescriptorSet(g_live.pCmd, 0, G.set[src]);
+            cmdDispatch(g_live.pCmd, normGroups, normGroups, 1);
+
+            G.parity = 1u - src;
+        }
+        if (steps > 0) { G.cleared = true; }
+
+        // Hand tex[0] to water.frag. The even sub-step count guarantees the finished field is there;
+        // tex[1] stays a UAV scratch target and is never sampled.
+        {
+            TextureBarrier fwd = {};
+            fwd.pTexture      = G.tex[0];
+            fwd.mCurrentState = RESOURCE_STATE_UNORDERED_ACCESS;
+            fwd.mNewState     = RESOURCE_STATE_SHADER_RESOURCE;
+            cmdResourceBarrier(g_live.pCmd, 0, nullptr, 1, &fwd, 0, nullptr);
+            G.inShaderState = true;
+        }
+        cmdEndDebugMarker(g_live.pCmd);
+    }
+
     bool createFroxelResources(Renderer* R) {
         if (g_live.pFroxelAssignPipeline) { return g_live.froxelReady; }
 
@@ -12750,7 +13689,8 @@ namespace ForgeRender {
                      const void* alphaBlob, unsigned alphaCount, unsigned alphaBytes,
                      const void* capturedAlphaBlob, unsigned capturedVertBytes, unsigned capturedIdxBytes,
                      const float* waterParams, unsigned waterEnabled,
-                     const FPScene* fp) {
+                     const FPScene* fp,
+                     const float* actorRipples, unsigned actorRippleCount) {
         if (!g_live.pRenderer) {
             return false;
         }
@@ -14959,6 +15899,108 @@ namespace ForgeRender {
         // the mask is ready long before the colour pass reads it — the whole prepass/shadow/gtao/reflect
         // stretch hides the build. Params + gLights.froxelDimsNear were filled at the light upload
         // (pre-record). Leaves pFroxelMaskNear in SHADER_RESOURCE so opaque.frag/multimap.frag read it.
+        // R2: MW's actor ripples, already culled to the nearest kMaxActorRipples by the client.
+        // Ingested HERE rather than with the rest of the water block a thousand lines below,
+        // because the wave sim dispatches immediately after this and needs the births that arrived
+        // THIS frame — reading it later would inject every impulse one frame late, i.e. one frame
+        // of camera and actor motion away from where it belongs. Gated on waterParams for the same
+        // reason the precipitation counters are: a latched list would leave wakes on an interior
+        // pool the player walks up to next.
+        g_actorRippleCount = (waterParams && actorRipples)
+                           ? ((actorRippleCount > kMaxActorRipples) ? kMaxActorRipples
+                                                                    : actorRippleCount) : 0u;
+        if (g_actorRippleCount) {
+            std::memcpy(g_actorRipples, actorRipples, g_actorRippleCount * 4 * sizeof(float));
+        }
+
+        // ---- R2b/R2c: advance the actor-wake wave sims ----------------------------------------
+        // Before the colour pass, so water.frag samples fields that are complete this frame. Fixed
+        // cost over fixed grids: it does not depend on how many ripples exist, which is the entire
+        // reason this replaced the analytic per-pixel loop (0.31 -> 32.81 ms).
+        //
+        // TWO grids, from the same births. The fine one is non-dispersive and carries the near-field
+        // splash; the wake one applies omega² = g|k| and is the only one that can produce a Kelvin
+        // wedge — see the RippleGrid definition. They are independent: either may be off.
+        //
+        // ⚠ waterParams/waterEnabled directly, NOT g_waterFogOn: that global is assigned in the
+        // water block below, so reading it here would gate this frame's sim on last frame's water.
+        const bool ripWaterNow = (waterParams && waterEnabled);
+        {
+            // ONE clock for both grids, and it is real elapsed time. The fine grid does not use it
+            // (its rates are per step), but the wake grid's wavelength is set by gravity and the
+            // swimmer's speed, so it has to advance in seconds or the wedge changes size with the
+            // frame rate.
+            static double s_wakeLastMs = -1.0;
+            const double  nowMs = hostNowMs();
+            if (s_wakeLastMs < 0.0) { s_wakeLastMs = nowMs; }
+            const float dtFrame = (float)((nowMs - s_wakeLastMs) * 0.001);
+            s_wakeLastMs = nowMs;
+
+            // Switching integrator changes what .y MEANS (a velocity vs u(t-1)) and wants a
+            // different metric, so both flips throw the field away rather than reinterpreting it.
+            // Cheap: `cleared` false makes the next advance scroll the whole domain out of range,
+            // which is the existing clear path.
+            static bool s_wakeMgeApplied = !g_wakeMge;
+            if (s_wakeMgeApplied != g_wakeMge) {
+                s_wakeMgeApplied = g_wakeMge;
+                // Each integrator has a metric it is calibrated for: MGE's constants assume 2.5
+                // units/texel, and the dispersive kernel is only accurate over 4-24 texels of
+                // wavelength, which needs ~8. Moving the slider with the mode keeps both honest.
+                g_wakeUnitsPerTexel = g_wakeMge ? 2.5f : 8.0f;
+                g_live.rippleWake.cleared = false;
+            }
+            if (g_live.rippleWake.unitsPerTexel != g_wakeUnitsPerTexel) {
+                g_live.rippleWake.unitsPerTexel = std::max(g_wakeUnitsPerTexel, 0.25f);
+                g_live.rippleWake.cleared = false;
+            }
+
+            // ⚠ FIXED-TIMESTEP ACCUMULATOR, and it is the load-bearing part of the MGE port rather
+            // than housekeeping. MGE ran `numWaveSteps = remainingWaveTime / waveStep` at a fixed
+            // 1/80 s, which pins the wave speed to a physical constant. A per-frame step instead
+            // makes the speed proportional to the frame rate — the fine grid's 1 texel/step is
+            // 120 u/s at 60 Hz and 330 at 165 — and the whole wake shape depends on that speed
+            // sitting BELOW the swimmer's, so a per-frame sim silently loses the effect on a fast
+            // machine. Rounded DOWN to a multiple of two (the sub-step count must stay even; see
+            // advanceRippleGrid) with the remainder carried, so the long-run rate is still 80 Hz:
+            // at 60 fps it runs 0,2,2,0,2,2 and at 165 fps 2 steps every fourth frame.
+            static float s_wakeAccum = 0.0f;
+            int wakeSteps = 0;
+            {
+                s_wakeAccum += std::min(std::max(dtFrame, 0.0f), 0.25f);
+                wakeSteps = (int)(s_wakeAccum / kWakeStep);
+                wakeSteps &= ~1;                 // even only
+                if (wakeSteps > 4) { wakeSteps = 4; }   // no death spiral after a hitch
+                s_wakeAccum -= wakeSteps * kWakeStep;
+                if (s_wakeAccum > 0.25f) { s_wakeAccum = 0.25f; }
+            }
+
+            // Rebuild the actor tracks from this frame's births BEFORE either grid runs — the wake
+            // grid pins its rings at their extrapolated positions.
+            updateWakeTracks(std::min(std::max(dtFrame, 0.0f), 0.25f), hostNowMs());
+
+            if (ripWaterNow && g_ripSimOn) {
+                advanceRippleGrid(g_live.rippleFine, g_live.pRippleSimPipeline, kRipModeFine,
+                                  g_eyeAbsShadow[0], g_eyeAbsShadow[1], dtFrame, 2,
+                                  kRippleThreads, g_ripSimRadius, g_ripSimAmp,
+                                  "RIPPLE wave sim (fine)");
+            } else {
+                parkRippleGrid(g_live.rippleFine);
+            }
+            if (ripWaterNow && g_wakeOn) {
+                advanceRippleGrid(g_live.rippleWake,
+                                  g_wakeMge ? g_live.pRippleMgePipeline
+                                            : g_live.pRippleWavePipeline,
+                                  g_wakeMge ? kRipModeMge : kRipModeWave,
+                                  g_eyeAbsShadow[0], g_eyeAbsShadow[1], dtFrame, wakeSteps,
+                                  g_wakeMge ? kMgeWakeThreads : kWakeThreads,
+                                  g_wakeRadius, g_wakeAmp,
+                                  g_wakeMge ? "RIPPLE wake sim (MGE)"
+                                            : "RIPPLE wake sim (dispersive)");
+            } else {
+                parkRippleGrid(g_live.rippleWake);
+            }
+        }
+
         gpuPhaseBegin(kGpuPhaseFroxelNear);
         {
             auto froxBarrierN = [&](ResourceState from, ResourceState to) {
@@ -15753,6 +16795,21 @@ namespace ForgeRender {
         // the next puddle the player finds indoors.
         g_rainWetRain = waterParams ? waterParams[12] : 0.0f;
         g_rainWetSnow = waterParams ? waterParams[13] : 0.0f;
+        // R2 actor ripples are ingested EARLIER (see ingestActorRipples, called before the wave-sim
+        // dispatch) — this block runs ~1000 lines after it, and the sim needs THIS frame's births.
+        {
+            static unsigned s_lastN = 0xFFFFFFFFu;
+            if (g_actorRippleCount != s_lastN) {
+                s_lastN = g_actorRippleCount;
+                if (g_actorRippleCount) {
+                    LOG::logline(">> [ripl] actor ripples: %u  first=(%.0f %.0f) age=%.2f scale=%.2f",
+                                 g_actorRippleCount, g_actorRipples[0], g_actorRipples[1],
+                                 g_actorRipples[2], g_actorRipples[3]);
+                } else {
+                    LOG::logline(">> [ripl] actor ripples: 0");
+                }
+            }
+        }
         // One line per meaningful move in the derived density. The dev panel cannot show this — its
         // label() takes a static string, so a live readout would freeze at whatever the panel was
         // built with — and the REF knob above is exactly the kind of constant that can only be found
@@ -17505,7 +18562,8 @@ namespace ForgeRender {
                 p[14] = (float)kReflectSize;       // gReflectMips side, for the reflection LOD
                 p[15] = g_waterReflBlurGain;       // reflection-LOD calibration scale (not the lobe)
                 std::memcpy(wbuf + 6 * 64, p, 64);
-                writeWaveScales(wbuf);             // worlds[8] = wave scales, worlds[9] = field extras
+                // eyeAbs so the R2 block can make MW's absolute ripple centres eye-relative.
+                writeWaveScales(wbuf, eyeAbsX, eyeAbsY);
             }
             // worlds[7] = invViewProj of the SAME rzViewProj (incl. half-pixel) the GTAO block inverts;
             // uploaded RAW (the frag does mul(invVP, ndc), identical convention to gtao.comp).
@@ -22885,6 +23943,7 @@ namespace ForgeRender {
             p[14] = (float)kReflectSize;       // gReflectMips side, for the reflection LOD
             p[15] = g_waterReflBlurGain;       // reflection-LOD calibration scale (not the lobe)
             std::memcpy(wbuf + 6 * 64, p, 64);
+            // Viewer path: no client, so no actor ripples — the default 0,0 eye is unused.
             writeWaveScales(wbuf);             // worlds[8] = wave scales, worlds[9] = field extras
         }
         {

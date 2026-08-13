@@ -1,0 +1,83 @@
+// mgeHost64 — R2 actor-ripple wave sim: SCROLL + INJECT + INTEGRATE. Model + why: ripplesim.srt.h.
+//
+// One thread per texel. Reads gRippleSimPrev at the scrolled source texel, adds any impulses born
+// this frame, advances the finite-difference wave equation one step, writes gRippleSimNext.xy.
+// Slopes are a second dispatch (ripplenormal.comp) because they need the NEW neighbour heights.
+//
+// Compute, so it hot-reloads on F8 — which matters here more than usual, because speed/decay and
+// the impulse amplitude have to be found by watching a wake and the graphics path would need a
+// host restart per try.
+
+#include "ripplesim.srt.h"
+
+#define RIPPLE_THREADS 8
+
+// The scrolled fetch. Returns zero outside the previous domain, which is exactly right: those
+// texels are water the sim has never seen, and zero is undisturbed water. Clamping instead would
+// SMEAR the domain edge inward across the whole newly exposed strip every frame the camera moves.
+float4 rippleFetchPrev(int2 c, int size)
+{
+    if (c.x < 0 || c.y < 0 || c.x >= size || c.y >= size) { return f4(0.0f); }
+    return LoadRWTex2D(gRippleSimPrev, c);
+}
+
+NUM_THREADS(RIPPLE_THREADS, RIPPLE_THREADS, 1)
+void CS_MAIN(SV_DispatchThreadID(uint3) did)
+{
+    INIT_MAIN;
+
+    int  size = int(gRippleSimParams.sim.x);
+    int2 id   = int2(did.xy);
+    // NB: every RETURN() MUST start its own line (fsl.py only rewrites a line-leading RETURN).
+    if (id.x >= size || id.y >= size)
+    {
+        RETURN();
+    }
+
+    float speed = gRippleSimParams.sim.y;
+    float decay = gRippleSimParams.sim.z;
+    int   nImp  = int(gRippleSimParams.sim.w);
+    int2  shift = int2(gRippleSimParams.scroll.xy);
+
+    // Every read is offset by the SAME scroll, so the whole field translates rigidly. Doing it in
+    // the fetch rather than as a separate copy pass makes the domain move free — it is a change of
+    // address, not work.
+    int2   src = id + shift;
+    float4 h   = rippleFetchPrev(src, size);
+
+    // The 4-neighbourhood, in the PREVIOUS field and at the same scroll. Sampling the new field
+    // here is what makes the reference's in-place version a race.
+    float hL = rippleFetchPrev(src + int2(-1,  0), size).x;
+    float hR = rippleFetchPrev(src + int2( 1,  0), size).x;
+    float hT = rippleFetchPrev(src + int2( 0,  1), size).x;
+    float hB = rippleFetchPrev(src + int2( 0, -1), size).x;
+
+    // Impulses BEFORE the integrate, so a newly born ripple starts as a displacement the very step
+    // it appears rather than one frame late. smoothstep rather than a hard disc: a step edge in the
+    // initial condition injects every frequency the grid can represent, and everything above the
+    // grid's Nyquist immediately aliases into a square artefact travelling along the axes.
+    LOOP for (int i = 0; i < nImp; ++i)
+    {
+        float4 imp = gRippleSimParams.impulses[i];
+        float  d   = length(float2(id) - imp.xy);
+        h.x += imp.w * smoothstep(1.0f, 0.0f, d / max(imp.z, 1e-3f));
+    }
+
+    // v += laplacian; v *= decay; h += v * speed.
+    // ⚠ speed > 2.0 diverges (CFL). Clamped here as well as host-side: a NaN grid is persistent
+    // state, so one bad frame would poison the field until the next clear rather than self-correct.
+    float avg = 0.25f * (hL + hR + hT + hB);
+    h.y += avg - h.x;
+    h.y *= decay;
+    h.x += h.y * min(speed, 2.0f);
+
+    // Kill denormal-scale residue so an idle grid settles to exactly zero instead of ringing at
+    // 1e-30 forever, which would keep the whole field non-zero and defeat any future early-out.
+    if (abs(h.x) < 1e-6f && abs(h.y) < 1e-6f) { h.x = 0.0f; h.y = 0.0f; }
+
+    // .zw (slope) is written by ripplenormal.comp; carry the scrolled values so the water frag
+    // never samples a frame-old slope against a new height.
+    Write2D(gRippleSimNext, id, float4(h.x, h.y, h.z, h.w));
+
+    RETURN();
+}

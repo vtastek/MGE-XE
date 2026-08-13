@@ -1368,6 +1368,23 @@ STRUCT(LightData)
 
 
 
+
+
+
+
+
+        Tex2D(float4) gRippleField :  register(t58,space1);
+
+
+
+
+
+
+        Tex2D(float4) gWakeField :  register(t59,space1);
+
+
+
+
         CBUFFER(LightData) gLights :  register(b0,space3);
 
 
@@ -1380,7 +1397,7 @@ STRUCT(LightData)
 
 
         CBUFFER(LightData) gLightsNear :  register(b1,space3);
-#line 452 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+#line 469 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
         Tex2D(float4) gTextures[ 880 ] :  register(t0,space0);
 
 

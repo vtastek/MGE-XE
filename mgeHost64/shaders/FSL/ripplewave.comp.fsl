@@ -1,0 +1,272 @@
+// mgeHost64 — R2c actor-wake step, DISPERSIVE. Model, sizing and why this exists alongside
+// ripplesim.comp: ripplesim.srt.h.
+//
+// ⚠ THIS SHADER EXISTS BECAUSE THE KELVIN WEDGE IS A DISPERSION EFFECT, and ripplesim.comp has no
+// dispersion. Its `v += avg(4-neighbours) - h` is the plain wave equation: every wavelength travels
+// at the same speed, so a moving source can only draw nested circles (source slower than the wave)
+// or a Mach cone (faster). It cannot draw a wedge at all. Deep-water gravity waves instead obey
+//
+//     omega^2 = g * |k|
+//
+// so long waves outrun short ones, group velocity is HALF phase velocity, and the interference of
+// the whole spectrum behind a moving source closes into the 19.47-degree wedge — at that angle
+// whatever the swimmer's speed. That is the shape; it is not available from a Laplacian.
+//
+// The operator. |k| is not a local stencil (its real-space kernel falls off only as 1/r^3), so it
+// is applied as a 21x21 convolution built by inverse-transforming |k| and tapering the support.
+// Radius 10 is a MEASURED choice, not a guess: what has to be right is not "R(k) resembles |k|" but
+// the LOG-SLOPE p = dln(omega)/dln(k), because the wake half-angle is arcsin((1-p)/(1+p)) — p=0.5
+// gives Kelvin's 19.47 deg and p=1 (a Laplacian) gives zero, i.e. no wedge. Fitting the kernel by
+// least squares got R within 10% and still swung the implied wedge over 12..62 deg, since a ripple
+// in R is a large error in dR/dk. Constructing it instead holds
+//
+//     p = 0.42 .. 0.73  over wavelengths 4..24 texels     (wedge 10..24 deg, true value 19.47)
+//     R/|k| = 0.96 .. 1.07, anisotropy <= 8%
+//
+// and at the shipped 8 world units/texel that band is exactly swim speed: 60 u/s -> 4.1 texels,
+// 100 -> 11.5, 140 -> 22.5. Radius 6 would halve the cost and lose the fast end (p to 0.82);
+// radius 12 costs 1.4x for a little more. See tools/iwave_kernel.py for the derivation.
+//
+// ⚠ SEPARATE GRID FROM ripplesim.comp, NOT A REPLACEMENT. This one is coarse and long-ranged (the
+// gravity-wave far field that makes the wedge); the fine 1 unit/texel grid keeps the near-field
+// splash detail, which at 8 units/texel would simply be below Nyquist. Two bands, each integrated
+// by the scheme that suits it, summed in water.frag.
+//
+// Cost is one dispatch over a fixed grid: 441 taps/texel, all from groupshared. Direct texture
+// loads would be the same arithmetic at roughly 8x the time — the 36x36 tile is read 441 times.
+
+#include "ripplesim.srt.h"
+
+#define WAVE_THREADS 16
+#define WAVE_P       10
+#define WAVE_TILE    36
+// Largest response over the Brillouin zone, from the same construction that produced the taps.
+// Only used for the timestep guard below, and it must be regenerated with them.
+#define WAVE_RMAX    3.4226f
+
+// 36^2 heights: the 16x16 output tile plus a 10-texel halo on every side.
+GroupShared(float, g_wave[1296]);
+
+// Zero outside the previous domain — water the sim has never seen. Clamping would smear the domain
+// edge inward across the newly exposed strip every frame the camera moves, and with a 10-texel halo
+// that strip is wide.
+float4 waveFetchPrev(int2 c, int size)
+{
+    if (c.x < 0 || c.y < 0 || c.x >= size || c.y >= size) { return f4(0.0f); }
+    return LoadRWTex2D(gRippleSimPrev, c);
+}
+
+NUM_THREADS(WAVE_THREADS, WAVE_THREADS, 1)
+void CS_MAIN(SV_DispatchThreadID(uint3) did)
+{
+    INIT_MAIN;
+
+    int   size  = int(gRippleSimParams.sim.x);
+    int   nImp  = int(gRippleSimParams.sim.w);
+    int2  shift = int2(gRippleSimParams.scroll.xy);
+    int2  me    = int2(did.xy);
+
+    // Group/thread indices from the dispatch id rather than SV_GroupThreadID/SV_GroupID: nothing in
+    // this codebase declares a second entry-point semantic, and the grid is a whole number of
+    // 16x16 groups, so the shift and mask are exact.
+    uint2 lt  = did.xy & 15u;
+    int2  org = int2(did.xy >> 4u) * WAVE_THREADS;   // this group's first output texel
+    uint  tid = lt.y * 16u + lt.x;
+
+    // ---- fill the tile ------------------------------------------------------------------------
+    // Heights only (the convolution needs no velocity), scrolled, with this frame's births folded
+    // in DURING the load so a new impulse is convolved the same step it appears — and so its
+    // neighbours see it too, which they would not if it were added after the barrier.
+    LOOP for (uint t = tid; t < 1296u; t += 256u)
+    {
+        int2  lp = int2(int(t % 36u), int(t / 36u));
+        int2  gp = org + lp - WAVE_P;                 // grid texel, THIS frame's domain
+        float h  = waveFetchPrev(gp + shift, size).x;
+        LOOP for (int i = 0; i < nImp; ++i)
+        {
+            float4 imp = gRippleSimParams.impulses[i];
+            float  d   = length(float2(gp) - imp.xy);
+            h += imp.w * smoothstep(1.0f, 0.0f, d / max(imp.z, 1e-3f));
+        }
+        g_wave[t] = h;
+    }
+    GroupMemoryBarrier();
+
+    // ---- apply the |k| operator -----------------------------------------------------------------
+    // GENERATED, folded onto the kernel's 8-fold symmetry: 441 taps in 66 statements, so the
+    // multiplies drop to one per distinct radius while every tap is still read. Do not hand-edit —
+    // regenerate with tools/iwave_kernel.py, which also emits WAVE_RMAX above.
+    int   base = (int(lt.y) + WAVE_P) * WAVE_TILE + int(lt.x) + WAVE_P;
+    float acc  = 0.0f;
+    acc += +2.17780013f * (g_wave[base + 0]);
+    acc += -0.34549933f * (g_wave[base - 1] + g_wave[base - 36] + g_wave[base + 36] + g_wave[base + 1]);
+    acc += -0.08995026f * (g_wave[base - 37] + g_wave[base + 35] + g_wave[base - 35] + g_wave[base + 37]);
+    acc += +0.02103996f * (g_wave[base - 2] + g_wave[base - 72] + g_wave[base + 72] + g_wave[base + 2]);
+    acc += -0.00822204f * (g_wave[base - 38] + g_wave[base + 34] + g_wave[base - 73] + g_wave[base + 71] + 
+                     g_wave[base - 71] + g_wave[base + 73] + g_wave[base - 34] + g_wave[base + 38]);
+    acc += -0.00806185f * (g_wave[base - 74] + g_wave[base + 70] + g_wave[base - 70] + g_wave[base + 74]);
+    acc += -0.02357332f * (g_wave[base - 3] + g_wave[base - 108] + g_wave[base + 108] + g_wave[base + 3]);
+    acc += -0.00795436f * (g_wave[base - 39] + g_wave[base + 33] + g_wave[base - 109] + g_wave[base + 107] + 
+                     g_wave[base - 107] + g_wave[base + 109] + g_wave[base - 33] + g_wave[base + 39]);
+    acc += -0.00314146f * (g_wave[base - 75] + g_wave[base + 69] + g_wave[base - 110] + g_wave[base + 106] + 
+                     g_wave[base - 106] + g_wave[base + 110] + g_wave[base - 69] + g_wave[base + 75]);
+    acc += -0.00241880f * (g_wave[base - 111] + g_wave[base + 105] + g_wave[base - 105] + g_wave[base + 111]);
+    acc += +0.00676221f * (g_wave[base - 4] + g_wave[base - 144] + g_wave[base + 144] + g_wave[base + 4]);
+    acc += -0.00091150f * (g_wave[base - 40] + g_wave[base + 32] + g_wave[base - 145] + g_wave[base + 143] + 
+                     g_wave[base - 143] + g_wave[base + 145] + g_wave[base - 32] + g_wave[base + 40]);
+    acc += -0.00215142f * (g_wave[base - 76] + g_wave[base + 68] + g_wave[base - 146] + g_wave[base + 142] + 
+                     g_wave[base - 142] + g_wave[base + 146] + g_wave[base - 68] + g_wave[base + 76]);
+    acc += -0.00136043f * (g_wave[base - 112] + g_wave[base + 104] + g_wave[base - 147] + g_wave[base + 141] + 
+                     g_wave[base - 141] + g_wave[base + 147] + g_wave[base - 104] + 
+                     g_wave[base + 112]);
+    acc += -0.00112814f * (g_wave[base - 148] + g_wave[base + 140] + g_wave[base - 140] + g_wave[base + 148]);
+    acc += -0.00710518f * (g_wave[base - 5] + g_wave[base - 180] + g_wave[base + 180] + g_wave[base + 5]);
+    acc += -0.00229906f * (g_wave[base - 41] + g_wave[base + 31] + g_wave[base - 181] + g_wave[base + 179] + 
+                     g_wave[base - 179] + g_wave[base + 181] + g_wave[base - 31] + g_wave[base + 41]);
+    acc += -0.00108781f * (g_wave[base - 77] + g_wave[base + 67] + g_wave[base - 182] + g_wave[base + 178] + 
+                     g_wave[base - 178] + g_wave[base + 182] + g_wave[base - 67] + g_wave[base + 77]);
+    acc += -0.00106219f * (g_wave[base - 113] + g_wave[base + 103] + g_wave[base - 183] + g_wave[base + 177] + 
+                     g_wave[base - 177] + g_wave[base + 183] + g_wave[base - 103] + 
+                     g_wave[base + 113]);
+    acc += -0.00079110f * (g_wave[base - 149] + g_wave[base + 139] + g_wave[base - 184] + g_wave[base + 176] + 
+                     g_wave[base - 176] + g_wave[base + 184] + g_wave[base - 139] + 
+                     g_wave[base + 149]);
+    acc += -0.00069344f * (g_wave[base - 185] + g_wave[base + 175] + g_wave[base - 175] + g_wave[base + 185]);
+    acc += +0.00267026f * (g_wave[base - 6] + g_wave[base - 216] + g_wave[base + 216] + g_wave[base + 6]);
+    acc += -0.00032953f * (g_wave[base - 42] + g_wave[base + 30] + g_wave[base - 217] + g_wave[base + 215] + 
+                     g_wave[base - 215] + g_wave[base + 217] + g_wave[base - 30] + g_wave[base + 42]);
+    acc += -0.00092070f * (g_wave[base - 78] + g_wave[base + 66] + g_wave[base - 218] + g_wave[base + 214] + 
+                     g_wave[base - 214] + g_wave[base + 218] + g_wave[base - 66] + g_wave[base + 78]);
+    acc += -0.00071142f * (g_wave[base - 114] + g_wave[base + 102] + g_wave[base - 219] + g_wave[base + 213] + 
+                     g_wave[base - 213] + g_wave[base + 219] + g_wave[base - 102] + 
+                     g_wave[base + 114]);
+    acc += -0.00067088f * (g_wave[base - 150] + g_wave[base + 138] + g_wave[base - 220] + g_wave[base + 212] + 
+                     g_wave[base - 212] + g_wave[base + 220] + g_wave[base - 138] + 
+                     g_wave[base + 150]);
+    acc += -0.00055837f * (g_wave[base - 186] + g_wave[base + 174] + g_wave[base - 221] + g_wave[base + 211] + 
+                     g_wave[base - 211] + g_wave[base + 221] + g_wave[base - 174] + 
+                     g_wave[base + 186]);
+    acc += -0.00050855f * (g_wave[base - 222] + g_wave[base + 210] + g_wave[base - 210] + g_wave[base + 222]);
+    acc += -0.00306437f * (g_wave[base - 7] + g_wave[base - 252] + g_wave[base + 252] + g_wave[base + 7]);
+    acc += -0.00106128f * (g_wave[base - 43] + g_wave[base + 29] + g_wave[base - 253] + g_wave[base + 251] + 
+                     g_wave[base - 251] + g_wave[base + 253] + g_wave[base - 29] + g_wave[base + 43]);
+    acc += -0.00059001f * (g_wave[base - 79] + g_wave[base + 65] + g_wave[base - 254] + g_wave[base + 250] + 
+                     g_wave[base - 250] + g_wave[base + 254] + g_wave[base - 65] + g_wave[base + 79]);
+    acc += -0.00061649f * (g_wave[base - 115] + g_wave[base + 101] + g_wave[base - 255] + g_wave[base + 249] + 
+                     g_wave[base - 249] + g_wave[base + 255] + g_wave[base - 101] + 
+                     g_wave[base + 115]);
+    acc += -0.00052957f * (g_wave[base - 151] + g_wave[base + 137] + g_wave[base - 256] + g_wave[base + 248] + 
+                     g_wave[base - 248] + g_wave[base + 256] + g_wave[base - 137] + 
+                     g_wave[base + 151]);
+    acc += -0.00049909f * (g_wave[base - 187] + g_wave[base + 173] + g_wave[base - 257] + g_wave[base + 247] + 
+                     g_wave[base - 247] + g_wave[base + 257] + g_wave[base - 173] + 
+                     g_wave[base + 187]);
+    acc += -0.00044468f * (g_wave[base - 223] + g_wave[base + 209] + g_wave[base - 258] + g_wave[base + 246] + 
+                     g_wave[base - 246] + g_wave[base + 258] + g_wave[base - 209] + 
+                     g_wave[base + 223]);
+    acc += -0.00041096f * (g_wave[base - 259] + g_wave[base + 245] + g_wave[base - 245] + g_wave[base + 259]);
+    acc += +0.00100610f * (g_wave[base - 8] + g_wave[base - 288] + g_wave[base + 288] + g_wave[base + 8]);
+    acc += -0.00028975f * (g_wave[base - 44] + g_wave[base + 28] + g_wave[base - 289] + g_wave[base + 287] + 
+                     g_wave[base - 287] + g_wave[base + 289] + g_wave[base - 28] + g_wave[base + 44]);
+    acc += -0.00055638f * (g_wave[base - 80] + g_wave[base + 64] + g_wave[base - 290] + g_wave[base + 286] + 
+                     g_wave[base - 286] + g_wave[base + 290] + g_wave[base - 64] + g_wave[base + 80]);
+    acc += -0.00048232f * (g_wave[base - 116] + g_wave[base + 100] + g_wave[base - 291] + g_wave[base + 285] + 
+                     g_wave[base - 285] + g_wave[base + 291] + g_wave[base - 100] + 
+                     g_wave[base + 116]);
+    acc += -0.00047413f * (g_wave[base - 152] + g_wave[base + 136] + g_wave[base - 292] + g_wave[base + 284] + 
+                     g_wave[base - 284] + g_wave[base + 292] + g_wave[base - 136] + 
+                     g_wave[base + 152]);
+    acc += -0.00043155f * (g_wave[base - 188] + g_wave[base + 172] + g_wave[base - 293] + g_wave[base + 283] + 
+                     g_wave[base - 283] + g_wave[base + 293] + g_wave[base - 172] + 
+                     g_wave[base + 188]);
+    acc += -0.00040522f * (g_wave[base - 224] + g_wave[base + 208] + g_wave[base - 294] + g_wave[base + 282] + 
+                     g_wave[base - 282] + g_wave[base + 294] + g_wave[base - 208] + 
+                     g_wave[base + 224]);
+    acc += -0.00035981f * (g_wave[base - 260] + g_wave[base + 244] + g_wave[base - 295] + g_wave[base + 281] + 
+                     g_wave[base - 281] + g_wave[base + 295] + g_wave[base - 244] + 
+                     g_wave[base + 260]);
+    acc += -0.00035981f * (g_wave[base - 296] + g_wave[base + 280] + g_wave[base - 280] + g_wave[base + 296]);
+    acc += -0.00142109f * (g_wave[base - 9] + g_wave[base - 324] + g_wave[base + 324] + g_wave[base + 9]);
+    acc += -0.00061354f * (g_wave[base - 45] + g_wave[base + 27] + g_wave[base - 325] + g_wave[base + 323] + 
+                     g_wave[base - 323] + g_wave[base + 325] + g_wave[base - 27] + g_wave[base + 45]);
+    acc += -0.00042876f * (g_wave[base - 81] + g_wave[base + 63] + g_wave[base - 326] + g_wave[base + 322] + 
+                     g_wave[base - 322] + g_wave[base + 326] + g_wave[base - 63] + g_wave[base + 81]);
+    acc += -0.00044077f * (g_wave[base - 117] + g_wave[base + 99] + g_wave[base - 327] + g_wave[base + 321] + 
+                     g_wave[base - 321] + g_wave[base + 327] + g_wave[base - 99] + 
+                     g_wave[base + 117]);
+    acc += -0.00040806f * (g_wave[base - 153] + g_wave[base + 135] + g_wave[base - 328] + g_wave[base + 320] + 
+                     g_wave[base - 320] + g_wave[base + 328] + g_wave[base - 135] + 
+                     g_wave[base + 153]);
+    acc += -0.00038669f * (g_wave[base - 189] + g_wave[base + 171] + g_wave[base - 329] + g_wave[base + 319] + 
+                     g_wave[base - 319] + g_wave[base + 329] + g_wave[base - 171] + 
+                     g_wave[base + 189]);
+    acc += -0.00035981f * (g_wave[base - 225] + g_wave[base + 207] + g_wave[base - 330] + g_wave[base + 318] + 
+                     g_wave[base - 318] + g_wave[base + 330] + g_wave[base - 207] + 
+                     g_wave[base + 225]);
+    acc += -0.00035981f * (g_wave[base - 261] + g_wave[base + 243] + g_wave[base - 331] + g_wave[base + 317] + 
+                     g_wave[base - 317] + g_wave[base + 331] + g_wave[base - 243] + 
+                     g_wave[base + 261]);
+    acc += -0.00035981f * (g_wave[base - 297] + g_wave[base + 279] + g_wave[base - 332] + g_wave[base + 316] + 
+                     g_wave[base - 316] + g_wave[base + 332] + g_wave[base - 279] + 
+                     g_wave[base + 297]);
+    acc += -0.00035981f * (g_wave[base - 333] + g_wave[base + 315] + g_wave[base - 315] + g_wave[base + 333]);
+    acc += +0.00004636f * (g_wave[base - 10] + g_wave[base - 360] + g_wave[base + 360] + g_wave[base + 10]);
+    acc += -0.00033047f * (g_wave[base - 46] + g_wave[base + 26] + g_wave[base - 361] + g_wave[base + 359] + 
+                     g_wave[base - 359] + g_wave[base + 361] + g_wave[base - 26] + g_wave[base + 46]);
+    acc += -0.00039954f * (g_wave[base - 82] + g_wave[base + 62] + g_wave[base - 362] + g_wave[base + 358] + 
+                     g_wave[base - 358] + g_wave[base + 362] + g_wave[base - 62] + g_wave[base + 82]);
+    acc += -0.00037138f * (g_wave[base - 118] + g_wave[base + 98] + g_wave[base - 363] + g_wave[base + 357] + 
+                     g_wave[base - 357] + g_wave[base + 363] + g_wave[base - 98] + 
+                     g_wave[base + 118]);
+    acc += -0.00035981f * (g_wave[base - 154] + g_wave[base + 134] + g_wave[base - 364] + g_wave[base + 356] + 
+                     g_wave[base - 356] + g_wave[base + 364] + g_wave[base - 134] + 
+                     g_wave[base + 154]);
+    acc += -0.00035981f * (g_wave[base - 190] + g_wave[base + 170] + g_wave[base - 365] + g_wave[base + 355] + 
+                     g_wave[base - 355] + g_wave[base + 365] + g_wave[base - 170] + 
+                     g_wave[base + 190]);
+    acc += -0.00035981f * (g_wave[base - 226] + g_wave[base + 206] + g_wave[base - 366] + g_wave[base + 354] + 
+                     g_wave[base - 354] + g_wave[base + 366] + g_wave[base - 206] + 
+                     g_wave[base + 226]);
+    acc += -0.00035981f * (g_wave[base - 262] + g_wave[base + 242] + g_wave[base - 367] + g_wave[base + 353] + 
+                     g_wave[base - 353] + g_wave[base + 367] + g_wave[base - 242] + 
+                     g_wave[base + 262]);
+    acc += -0.00035981f * (g_wave[base - 298] + g_wave[base + 278] + g_wave[base - 368] + g_wave[base + 352] + 
+                     g_wave[base - 352] + g_wave[base + 368] + g_wave[base - 278] + 
+                     g_wave[base + 298]);
+    acc += -0.00035981f * (g_wave[base - 334] + g_wave[base + 314] + g_wave[base - 369] + g_wave[base + 351] + 
+                     g_wave[base - 351] + g_wave[base + 369] + g_wave[base - 314] + 
+                     g_wave[base + 334]);
+    acc += -0.00035981f * (g_wave[base - 370] + g_wave[base + 350] + g_wave[base - 350] + g_wave[base + 370]);
+
+    // ---- integrate ------------------------------------------------------------------------------
+    // Symplectic Euler on  d2h/dt2 = -g * |k| h.  acc is (|k| h), so -grav*acc is the acceleration.
+    // dt is REAL SECONDS (unlike ripplesim.comp, whose speed/decay are per STEP and therefore run
+    // faster on a faster machine — 165 Hz makes that grid evolve 2.75x quicker than 60 Hz does).
+    // Here the wake's wavelength is set by gravity and the swimmer's speed, both physical, so the
+    // pattern has to be frame-rate independent or the wedge changes size with the frame rate.
+    float grav = gRippleSimParams.wave.x;
+    float dt   = gRippleSimParams.wave.y;
+    float damp = gRippleSimParams.wave.z;
+
+    // ⚠ Stability, and it is clamped HERE as well as host-side because the grid is persistent state:
+    // one diverged frame poisons the field until the next teleport rather than self-correcting.
+    // Symplectic Euler needs omega*dt < 2 and omega_max = sqrt(grav * WAVE_RMAX); 1.8 keeps a
+    // margin. At the shipped gravity this permits dt up to ~0.117 s, i.e. it never bites above 9 fps.
+    dt = min(dt, 1.8f / sqrt(max(grav * WAVE_RMAX, 1.0e-6f)));
+
+    float4 pc = waveFetchPrev(me + shift, size);
+    float  v  = (pc.y - grav * acc * dt) * damp;
+    float  h  = g_wave[base] + v * dt;
+
+    // Settle an idle grid to exactly zero rather than letting it ring at 1e-30 forever.
+    if (abs(h) < 1.0e-6f && abs(v) < 1.0e-6f) { h = 0.0f; v = 0.0f; }
+
+    // .zw (slope) belongs to ripplenormal.comp, which runs next over this same target; carry the
+    // scrolled values so nothing samples a frame-old slope against a new height.
+    if (me.x < size && me.y < size)
+    {
+        Write2D(gRippleSimNext, me, float4(h, v, pc.z, pc.w));
+    }
+
+    RETURN();
+}

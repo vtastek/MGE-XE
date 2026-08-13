@@ -77,6 +77,20 @@ namespace IPC {
     typedef std::uint32_t VecId;
     constexpr VecId InvalidVector = static_cast<VecId>(-1);
 
+    // R2 actor-ripple wire cap (see RenderFrameParameters::actorRipples). This is a PER-PIXEL LOOP
+    // BOUND before it is a bandwidth number: the water frag tests every entry against every water
+    // pixel.
+    //
+    // 64 because 32 measurably clipped. MW's pool ran pegged at 75/75 with births peaking at 80/s
+    // — a single swimmer lays down life*speed/14.2 ≈ 21 rings for its own wake, so 32 shared across
+    // the player plus any nearby actor starved everyone. 64 covers the player and two or three
+    // others; the pool's own 75 is the hard ceiling above that, and rain competes for the same
+    // slots unless Morrowind.ini's `Rain Ripples` is off.
+    //
+    // Sized to the GPU side as well: entries land in the water pass's spare worlds[] matrices, 4
+    // ripples per float4x4, so 64 is exactly 16 slots out of ~1012 free.
+    constexpr std::uint32_t kMaxActorRipples = 64;
+
     static inline void CleanupHandle(HANDLE& h) {
         if (h != INVALID_HANDLE_VALUE && h != NULL) {
             CloseHandle(h);
@@ -505,6 +519,26 @@ namespace IPC {
         // jump — the reflected sky steps by 2*dz. Appended after clientSyncsOnFence so every existing
         // IN offset is unchanged.
         IN float skyParkEyeDelta[4];
+
+        // R2 ACTOR RIPPLES. MW keeps a 75-slot pool of ripple decals and switches one on for every
+        // actor moving in water — player, NPC and creature alike, with no owner field and no way to
+        // ask for one. Measured 2026-08-12: one impulse per ~14.2 units of travel (p25 12.4, median
+        // 14.2, p75 14.9 over 360 births), a DISTANCE rule rather than a timer, out to 7249 units
+        // from the player. The host superposes a ripplePacket per entry; a moving actor therefore
+        // lays down an overlapping train of rings, which IS the wake — the same closed form R1
+        // already uses, with no second wave model.
+        //
+        // ⚠ Liveness is the decal's APP_CULLED flag, NOT the `isActive` byte MWSE names
+        // (see MWBridge::getRippleState). That byte reads 0 always.
+        //
+        // Culled and capped CLIENT-side: the pool is global and reaches far past anything that
+        // resolves on screen, so shipping all 75 would spend wire and per-pixel loop iterations on
+        // ripples smaller than a texel. Entries are the nearest kMaxActorRipples to the eye.
+        //
+        // Appended at the very end of the IN block so every existing offset is unchanged — the same
+        // rule skyParkEyeDelta above followed, and the reason waterParams could NOT carry this.
+        IN std::uint32_t actorRippleCount;
+        IN float actorRipples[kMaxActorRipples * 4];   // xy = world XY, z = age 0..1, w = MW scale
 
         OUT std::uint32_t bytesWritten;
         OUT double renderMs;             // host-side render+readback time

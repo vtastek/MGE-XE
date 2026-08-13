@@ -493,3 +493,32 @@
 #comp froxelassign.comp
 #include "froxelassign.comp.fsl"
 #end
+
+// R2 actor-ripple wave SIM. Two dispatches over a fixed 1024² grid, ping-ponged, replacing the
+// per-pixel analytic loop that cost the water pass 0.31 -> 32.81 ms once a wake was in view.
+// Fixed cost regardless of ripple count, and a moving impulse train through a real wave equation
+// interferes into a wedge — which independent analytic packets cannot do. Both share
+// compute.rootsig + RippleSimSrtData Persistent. See ripplesim.srt.h.
+#comp ripplesim.comp
+#include "ripplesim.comp.fsl"
+#end
+
+// R2c: the DISPERSIVE wake step, on its own coarse grid. ripplesim.comp cannot produce a Kelvin
+// wedge at any setting — it is the non-dispersive wave equation, in which a moving source draws
+// nested circles or a Mach cone and nothing else. This one applies omega^2 = g|k| as a 21x21
+// convolution, which is what makes long waves outrun short ones and closes the wake into a wedge.
+#comp ripplewave.comp
+#include "ripplewave.comp.fsl"
+#end
+
+// R2d: MGE's OWN dynamic-wave sim, ported from XE Main.fx's WaveStepPS + PlayerWavePS. Same
+// non-dispersive Laplacian as ripplesim.comp — the V comes from a FIXED 80 Hz timestep putting the
+// wave speed at 75 units/s, below swim speed, so the source is supercritical.
+#comp ripplemge.comp
+#include "ripplemge.comp.fsl"
+#end
+
+// Runs over EVERY grid — it only takes central differences of whatever gRippleSimNext holds.
+#comp ripplenormal.comp
+#include "ripplenormal.comp.fsl"
+#end

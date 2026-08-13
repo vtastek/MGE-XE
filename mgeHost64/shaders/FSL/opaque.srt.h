@@ -419,6 +419,23 @@ BEGIN_SRT_NO_AB(SrtData)
         // pre-W4c behaviour. Same deliberate no-fallback arrangement as gWaterSlopeVar above.
         // Appended AFTER gWaterSlopeVar — append only, see the note above gSkyHeight.
         DECL_TEXTURE(PerFrame, Tex2D(float), gReflectDepth)
+        // R2b: the actor-ripple wave field (ripplesim.srt.h). .x height .y velocity .zw slope; the
+        // frag reads only .zw. A world-space grid around the camera, 1 unit/texel, advanced by two
+        // compute dispatches per frame — which is the whole point of it existing, since evaluating
+        // the same wakes analytically cost the water pass 0.31 -> 32.81 ms.
+        //
+        // ⚠ Read by water.frag ONLY and bound ONLY into the main pPerFrameSet. Left UNBOUND when
+        // the sim failed to build, which reads ZERO = flat water = exactly the pre-R2b surface.
+        // Same deliberate no-fallback arrangement as gWaterSlopeVar and gReflectDepth above.
+        // Appended AFTER gReflectDepth — append only, see the note above gSkyHeight.
+        DECL_TEXTURE(PerFrame, Tex2D(float4), gRippleField)
+        // R2c: the DISPERSIVE wake field — the same layout as gRippleField above and read the same
+        // way, but a coarser, longer-ranged grid (512² @ 8 units/texel) stepped by ripplewave.comp.
+        // Two fields and not one because the Kelvin wedge needs omega^2 = g|k|, whose kernel cannot
+        // reach a 90-200 unit wavelength at 1 unit/texel, while 8 units/texel puts the near-field
+        // splash below Nyquist. Neither grid can do the other's job; the frag sums their slopes.
+        // Same unbound-reads-zero-is-flat-water arrangement. Appended AFTER gRippleField.
+        DECL_TEXTURE(PerFrame, Tex2D(float4), gWakeField)
     END_SRT_SET(PerFrame)
     // Point-light cbuffer — rides the otherwise-unused PerDraw set (FSL has exactly four
     // fixed update frequencies: Persistent/PerFrame/PerBatch/PerDraw; a custom set name has

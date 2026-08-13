@@ -5350,6 +5350,88 @@ namespace RenderProcess {
             }
         }
 
+        // R2: actor ripples straight out of MW's pool. The engine already switches a decal on for
+        // every actor moving in water — player, NPC, creature — so this needs no actor detection;
+        // it is a read of a list MW maintains anyway. ~1-2us for the whole 75-slot walk.
+        //
+        // Nearest-to-eye selection rather than a distance CUTOFF: a hard radius makes a wake pop
+        // out of existence at the boundary, while taking the closest N degrades by dropping the
+        // ripple that was already the smallest on screen. Insertion into a sorted array — N is 32
+        // and the input is 75, so the obvious O(n*N) is cheaper than setting up anything cleverer.
+        std::uint32_t rippleCount = 0;
+        float ripplePack[IPC::kMaxActorRipples * 4] = {};
+        {
+            MWBridge::RippleState rs;
+            MWBridge::RippleSource rsrc[128];
+            if (MWBridge::get()->getRippleState(rs, rsrc, 128) && rs.count > 0) {
+                float bestD2[IPC::kMaxActorRipples];
+                int   bestIx[IPC::kMaxActorRipples];
+                for (int i = 0; i < rs.count; ++i) {
+                    const float dx = rsrc[i].x - DistantLand::eyePos.x;
+                    const float dy = rsrc[i].y - DistantLand::eyePos.y;
+                    const float d2 = dx * dx + dy * dy;
+                    if (rippleCount == IPC::kMaxActorRipples && d2 >= bestD2[rippleCount - 1]) {
+                        continue;
+                    }
+                    std::uint32_t at = rippleCount;
+                    if (at == IPC::kMaxActorRipples) { at = rippleCount - 1; }
+                    else { ++rippleCount; }
+                    while (at > 0 && bestD2[at - 1] > d2) {
+                        bestD2[at] = bestD2[at - 1];
+                        bestIx[at] = bestIx[at - 1];
+                        --at;
+                    }
+                    bestD2[at] = d2;
+                    bestIx[at] = i;
+                }
+                // BIRTH DETECTION, riding the `w` lane that used to carry MW's decal scale.
+                //
+                // The wave sim needs an IMPULSE — a displacement applied once, at the instant a
+                // ripple appears. Feeding it every live ripple every frame would drive the surface
+                // continuously instead, and the field would saturate into a permanent mound
+                // following the actor rather than waves leaving it behind.
+                //
+                // Detected here and not host-side because identity is a POOL SLOT and only this
+                // side has it: the host receives the list already reordered by distance every
+                // frame, so it cannot tell "slot 7 was recycled into a new ripple" from "the list
+                // shifted". A birth is a slot going inactive->active, or its age running BACKWARDS
+                // (MW recycles a live slot straight into a new ripple, which reads as the same
+                // ripple getting younger). Same test the [ripl+] probe uses; 0.02 of normalised age
+                // is well under one frame of a 3 s life, so it cannot fire on ordinary ageing.
+                //
+                // scale is not lost by this: it is lerp(0.15, 6.5, age), verified live, so age
+                // already carries it.
+                constexpr int kRipSlots = 256;
+                static float s_age[kRipSlots] = {};
+                static bool  s_act[kRipSlots] = {};
+                static bool  s_seen[kRipSlots];
+                for (int i = 0; i < kRipSlots; ++i) { s_seen[i] = false; }
+                for (std::uint32_t k = 0; k < rippleCount; ++k) {
+                    const MWBridge::RippleSource& s = rsrc[bestIx[k]];
+                    bool born = true;
+                    if (s.slot >= 0 && s.slot < kRipSlots) {
+                        s_seen[s.slot] = true;
+                        born = !s_act[s.slot] || (s.age + 0.02f < s_age[s.slot]);
+                        s_act[s.slot] = true;
+                        s_age[s.slot] = s.age;
+                    }
+                    ripplePack[k * 4 + 0] = s.x;
+                    ripplePack[k * 4 + 1] = s.y;
+                    ripplePack[k * 4 + 2] = s.age;
+                    ripplePack[k * 4 + 3] = born ? 1.0f : 0.0f;
+                }
+                // ⚠ Only slots we actually SHIPPED were refreshed above, and the nearest-N cut
+                // drops the far ones — so clear liveness for everything in the POOL that is gone,
+                // not just for what made the wire. Otherwise a ripple that fell out of the nearest
+                // set and came back would not register as a birth, and one that genuinely died in
+                // a slot we stopped shipping would keep its stale age forever.
+                for (int i = 0; i < rs.count; ++i) {
+                    if (rsrc[i].slot >= 0 && rsrc[i].slot < kRipSlots) { s_seen[rsrc[i].slot] = true; }
+                }
+                for (int i = 0; i < kRipSlots; ++i) { if (!s_seen[i]) { s_act[i] = false; } }
+            }
+        }
+
         // Statics near/far handover: hand the host MW's ACTIVE exterior cell set plus how far
         // MW's own cull reaches, so it can clip its distant-statics LOD proxies at the same plane
         // the NEAR path stops at (both drawing = the handover z-fight; neither = a hole). MW culls
@@ -5407,7 +5489,8 @@ namespace RenderProcess {
                      alphaId, (alphaId != IPC::InvalidVector) ? alphaCount : 0, alphaBytes,
                      capturedId, capVertBytes, capIdxBytes,
                      (std::uint32_t)g_debugMode, &devInput, waterParams, waterOn,
-                     fpHave ? &fpFrame : nullptr);
+                     fpHave ? &fpFrame : nullptr,
+                     ripplePack, rippleCount);
         }
         if (!ok) {
             return;     // rpcPending stays false → Finish no-ops

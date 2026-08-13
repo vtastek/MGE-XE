@@ -292,4 +292,69 @@ float3 rainRipples(float2 p, float phase, float cellSize, float period, float li
     return acc;
 }
 
+// ---- R2: actor ripples -----------------------------------------------------------------------
+// The wake, and it needs no wake model. MW switches a ripple decal on for every actor moving in
+// water — player, NPC and creature — and does it once per ~14.2 units TRAVELLED (measured over 360
+// births: p25 12.4, median 14.2, p75 14.9). A moving actor therefore arrives here as a TRAIN of
+// impulses laid along its track, and superposing the same rigid packet R1 already uses turns that
+// train into a continuous disturbance following the actor. Standing still gives concentric rings;
+// moving gives the band. One model, two behaviours, decided entirely by the data.
+//
+// ⚠ What this is NOT is a Kelvin wedge. A wedge is an INTERFERENCE pattern, and it needs the
+// impulse spacing to be small against the wavelength so neighbouring rings hold a phase relation.
+// At 14.2-unit spacing that means a wavelength up near 14 units and above — which is why the
+// actor lambda defaults far above rain's 2-5 and why pushing it further is the knob that moves
+// this toward a wedge. Below roughly the spacing the rings simply beat against each other and the
+// result reads as fizz, not structure.
+//
+// Positions arrive EYE-RELATIVE (the host subtracts the eye when packing worlds[16..]); `p` here is
+// the same eye-relative worldXY the caller uses for everything else.
+//
+// ONE ripple, taking the offset already computed. Deliberately NOT a function over an array: the
+// caller's loop bound is dynamic, so a `float4 ripples[64]` parameter would become a 1 KB
+// dynamically-indexed indexable temp per thread and cost far more occupancy than the maths it
+// carries. The centres live in a constant buffer the caller can index directly for free, so the
+// split is here — the caller owns the fetch, this owns the model.
+//
+// `fade` and `rDie` are hoisted by the caller for the same reason: they are per-FRAME constants
+// (two exps and a divide) that would otherwise be recomputed for every ripple of every pixel.
+// `e` is float4(centre.xy, rc, W) — the front radius and packet width already resolved HOST-side
+// (see writeWaveScales). Everything that depends only on the ripple lives there; this function is
+// the part that genuinely varies across the surface. Doing it the other way round — hashing the
+// wavelength here — cost 13 ms of water pass and read as frame jitter.
+float3 actorRippleOne(float4 e, float2 d, float amp, float4 fade, float4 fpEll)
+{
+    float rc = e.z;
+    float W  = e.w;
+    float r2 = dot(d, d);
+
+    // ⚠ REJECT ON THE ANNULUS, not on the die radius. A packet is zero everywhere except the band
+    // |r - rc| < W around its travelling front, so testing against rDie (140 units) admits every
+    // pixel of a disc that is empty apart from a ~20-unit ring — and near a swimmer, where dozens
+    // of rings overlap, that is the whole cost. The band is what ripplePacket itself tests, only
+    // this reaches it before the sqrt and the divide rather than after.
+    float lo = max(rc - W, 0.0f);
+    float hi = rc + W;
+    if (r2 >= hi * hi || r2 <= lo * lo || r2 <= 1e-6f) { return float3(0.0f, 0.0f, 0.0f); }
+    float r = sqrt(r2);
+
+    // n is fixed at 2 host-side, so W = 1.5*lam and k = 2*pi/lam = 3*pi/W. One divide, no hash.
+    float k = 9.42477796f / max(W, 1e-3f);
+
+    float2 dir = d / r;
+    float  a2  = dot(dir, fpEll.zw); a2 *= a2;
+    float  fpd = 0.5f * sqrt(max(a2 * fpEll.y + (1.0f - a2) * fpEll.x, 1e-12f));
+    float  dd, vv;
+    ripplePacket(r, rc, W, k, amp, fade, fpd, dd, vv);
+    return float3(dd * dir, vv);
+}
+
+// Per-frame constants for the loop above: (1/rDie, decay, exp(-decay), 1/(1-exp(-decay))).
+float4 actorRippleFade(float rDie, float decay)
+{
+    float dcy  = max(decay, 0.01f);
+    float eEnd = exp(-dcy);
+    return float4(1.0f / max(rDie, 1e-3f), dcy, eEnd, 1.0f / (1.0f - eEnd));
+}
+
 #endif // WATERRIPPLE_H

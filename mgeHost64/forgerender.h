@@ -182,7 +182,10 @@ namespace ForgeRender {
                      // + the F7 water-enable gate. Null/0 ⇒ no Forge water pass this frame.
                      const float* waterParams = nullptr, unsigned waterEnabled = 0,
                      // FP1a: first-person bundle (see FPScene above). Null ⇒ no FP pass.
-                     const FPScene* fp = nullptr);
+                     const FPScene* fp = nullptr,
+                     // R2: MW's actor ripples, nearest-to-eye first, 4 floats each
+                     // (xy world, z age 0..1, w MW decal scale). Count <= IPC::kMaxActorRipples.
+                     const float* actorRipples = nullptr, unsigned actorRippleCount = 0);
 
     // F12 debug view: 0 = normal, 1 = depth (world-distance grayscale), 2 = scatter (client-side).
     // Stored in a host global and written into FrameData.debugParams.x each renderScene.
