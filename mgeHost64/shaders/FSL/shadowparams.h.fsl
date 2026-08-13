@@ -249,7 +249,14 @@ STRUCT(ShadowMaskParams)
     // lengths — a flag past float 115 would read zero in the reflect-geo pass, which draws
     // statics.frag and terrain.frag. gShadowParams is bound by pointer into every PerFrame set, so
     // one host write reaches all of them.
-    // yzw spare.
+    // z = THE EXPONENTIAL FOG DISTANCE SCALE (fog.h.fsl), and 0 means MW's linear ramp. One lane
+    // holds the mode AND the constant deliberately: an exponential fog with no scale, or a scale
+    // with no exponential fog, are both unrepresentable. The host writes
+    // `(linearScene && g_fogExp) ? g_fogExpScale : 0`, so the gamma build is byte-identical and the
+    // A/B is a dev-panel tick. Ported value 4.4, from the DX9 path (distantland.cpp:818) — see
+    // fog.h.fsl for why that constant is the fog WALL's position and fogStart is then free to be
+    // the density.
+    // w spare.
     DATA(float4,   toneParams, None);
     // --- UNIFIED WATER FOG (waterfog.h.fsl, tasks/forge-water.md) --------------------------------
     // ONE extinction law for the water surface AND for everything submerged under it. Before this
@@ -274,8 +281,15 @@ STRUCT(ShadowMaskParams)
     //                y = 1 = water fog ACTIVE this frame (cell has water, knob on) — the receiver's
     //                    early-out and the A/B, the same "one float disarms every receiver" idiom
     //                    sunParams.x uses,
-    //                z = 1 = the CAMERA is under the surface (whole view ray is in water),
-    //                w = spare.
+    //                z = 1 = the CAMERA is under the surface (whole view ray is in water). ⚠ NOT
+    //                    ANDed with the feature toggle: this is GEOMETRY, and it feeds the guard that
+    //                    keeps MW's air fog off submerged pixels. It used to carry the toggle, so
+    //                    switching the water fog off to isolate it re-admitted atmospheric fog
+    //                    underwater — the control arm was the broken one. See waterplane.h.fsl,
+    //                w = 1 = this cell HAS a water plane, independent of the toggle AND the camera.
+    //                    The per-FRAGMENT air-fog test compares a world Z against .x, and .x is a
+    //                    latch that holds stale geometry in a waterless cell; without this the test
+    //                    would unfog everything below a plane that is not there.
     DATA(float4,   waterFogPlane, None);
     // --- W7b: absorption on the DOWNWARD LIGHT path (waterfog.h.fsl) -----------------------------
     // Same medium, same Beer-Lambert law, applied to the light on its way IN rather than to the view
@@ -338,4 +352,25 @@ STRUCT(ShadowMaskParams)
     //                   into xyz, published for readout; at 0 the host writes sigma_t here verbatim
     //                   and every consumer is bit-identical to the pre-W8e build.
     DATA(float4,   waterFogKd,      None);
+    // --- S3a SCENE CALIBRATION (tasks/forge-postprocess.md) --------------------------------------
+    // x = material EMISSIVE gain. 1.0 = today's image, byte for byte.
+    //
+    // The linear migration is exact on products and moves every sum, so what it broke is the RATIO
+    // between the terms that are summed — ambient, sun, and the self-illuminated term. A tonemap
+    // curve cannot restore a ratio and neither can an exposure servo; both rescale a total. Hence a
+    // calibration, and hence it is separate from exposure rather than folded into it.
+    //
+    // ONLY emissive rides a lane. Sun and ambient are folded into gFrameData.sunCol/ambCol host-side
+    // at their single decode site, which reaches more passes than a lane could — every truncated copy
+    // of gFrameData inherits them. Emissive arrives per-instance in the vertex stream and cannot be
+    // caught at one host site, and on vColSource 1 meshes the emissive term IS In.Color.rgb, which
+    // the vertex stage cannot distinguish from the modulating vertex colour of a vColSource 0/2 mesh.
+    // Only the frag knows which branch it is in, so only the frag can apply this.
+    //
+    // ⚠ NOT dbgScales. That one is a diagnostic whose PARTIAL reach (four passes) is the feature —
+    // it shows what Forge does not draw. A calibration has to be total or it steps at the near/far
+    // handover. Read the note beside g_calSunGain before merging them.
+    // yzw spare — y is where the exposure servo's value will land, which is why this is its own
+    // float4 rather than the two free lanes of toneParams.
+    DATA(float4,   calParams,       None);
 };

@@ -84,7 +84,32 @@ float4 PS_MAIN(VSOutput In)
     // number — it is "further than the medium can see", and every exponent downstream stays negative.
     float3 rel = dir * 1.0e5f;
 
+    // ⚠ THE SKY IS ONLY BEHIND A RAY THAT ACTUALLY LEAVES THE WATER. The base used to be
+    // fogSkyColor() unconditionally, on the reasoning that a hole should be filled with what a
+    // surface there would have become — true for a ray heading UP, which really does exit the
+    // surface and see sky, and false for every other direction. It survived because the water fog
+    // covered it: over `rel`'s 1e5 units a downward ray reaches wf.x == 1, so the base was multiplied
+    // out before anyone saw it.
+    //
+    // Take the absorption away and the cover comes off. Reported from the isolation run — unified
+    // extinction ON, visibility maxed, absorption master 0 — as "underwater is getting fogged just
+    // like above water", which was exact: what filled the holes was fogColNear, the ABOVE-WATER fog
+    // colour, arriving through this line. Not an air-fog leak; the backstop showing through.
+    //
+    // wf.y is the submerged SHARE of the ray and is precisely the discriminator: 1 for a ray that
+    // never exits, ~0 for one that leaves almost immediately (the eye->surface leg is metres against
+    // rel's 1e5). Scaling the base by (1 - share) therefore hands an upward ray its full sky, an
+    // exiting ray a proportioned amount, and a ray that stays in the water NOTHING — which is the
+    // honest answer, because with no absorption an infinite column of perfectly clear water with
+    // nothing behind it is black.
+    //
+    // ⚠ AND IT IS A NO-OP AT NORMAL ABSORPTION, which is what makes it safe: a downward ray has
+    // wf.x == 1 there, so lerp(base, target, 1) == target whether base was the sky or zero. Only the
+    // degenerate low-absorption end moves, and only toward being readable.
+    float2 wf   = waterFogSample(rel);
+    float3 base = fogSkyColor(pix) * saturate(1.0f - wf.y);
+
     // Opaque by construction: the blend decides where this lands, not the alpha.
-    float3 c = waterFogComposite(fogSkyColor(pix), rel, waterFogSample(rel));
+    float3 c = waterFogComposite(base, rel, wf);
     RETURN(float4(c, 1.0f));
 }

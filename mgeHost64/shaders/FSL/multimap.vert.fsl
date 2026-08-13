@@ -9,6 +9,7 @@
 // the multimap.frag fixed-function stage blend.
 
 #include "opaque.srt.h"
+#include "fog.h.fsl"    // mwFogFactor() — ONE fog law for every stage
 #include "tonemap.h.fsl"    // (scenecolor.h.fsl's prerequisite; the curve is never called in a VS)
 #include "linearize.h.fsl" // srgbToLinear() — the scene's transfer function (step 5)
 #include "scenecolor.h.fsl" // decodeAuthored() — MW's authored colours enter the scene domain HERE
@@ -113,8 +114,7 @@ VSOutput VS_MAIN( VSInput In )
     Out.Packed = stageCount | (vColSource << 3u) | (glowBit << 5u) | (alphaRefB << 8u);
     // MW near fog (per-vertex, matches opaque.vert).
     float dist = length(worldPos.xyz - gFrameData.eyePos.xyz);
-    Out.Fog = saturate((gFrameData.fogParams.y - dist)
-                       / (gFrameData.fogParams.y - gFrameData.fogParams.x));
+    Out.Fog = mwFogFactor(dist);   // ramp only — the submerged test is PER PIXEL (mwFogAir)
     // Below-water clip (reflect pass only) — see the VSOutput comment. worldPos is camera-relative,
     // matching the plane the host writes.
     Out.Clip = dot(gFrameData.gReflWaterClip.xyz, worldPos.xyz) + gFrameData.gReflWaterClip.w;

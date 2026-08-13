@@ -17,6 +17,7 @@
 // [[project_forge_precision_far_origin]]); only Z is shifted here, against gFrameData.lodEye.
 
 #include "opaque.srt.h"
+#include "fog.h.fsl"    // mwFogFactor() — ONE fog law for every stage
 
 #define TERRAIN_VERTS   65
 #define TERRAIN_QUADS   64
@@ -163,8 +164,7 @@ VSOutput VS_MAIN( VSInput In )
     Out.Cell     = uint4(slot, (uint)lx, (uint)ly, In.Inst1.x);
 
     float dist = length(worldPos - gFrameData.eyePos.xyz);
-    Out.Fog = saturate((gFrameData.fogParams.y - dist)
-                       / (gFrameData.fogParams.y - gFrameData.fogParams.x));
+    Out.Fog = mwFogFactor(dist);   // ramp only — the submerged test is PER PIXEL (mwFogAir)
 
     Out.Clip = dot(gFrameData.gReflWaterClip.xyz, worldPos) + gFrameData.gReflWaterClip.w;
     RETURN(Out);

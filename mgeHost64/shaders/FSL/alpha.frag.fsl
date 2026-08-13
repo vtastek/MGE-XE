@@ -185,15 +185,11 @@ float4 PS_MAIN( VSOutput In )
     }
     d *= gFrameData.dbgScales.y;
 
-    // Tier 2b material routing — identical to opaque.frag.
-    float3 lit;
-    if (In.VColSource == 2u) {
-        lit = In.Color.rgb * (d + a) + In.MatEmissive;
-    } else if (In.VColSource == 1u) {
-        lit = In.MatDiffuse * d + In.MatAmbient * a + In.Color.rgb;
-    } else {
-        lit = In.MatDiffuse * d + In.MatAmbient * a + In.MatEmissive;
-    }
+    // Tier 2b material routing — identical to opaque.frag, S3a emissive gain included.
+    float3 emis = ((In.VColSource == 1u) ? In.Color.rgb : In.MatEmissive)
+                * gShadowParams.calParams.x;
+    float3 lit = (In.VColSource == 2u) ? (In.Color.rgb * (d + a) + emis)
+                                       : (In.MatDiffuse * d + In.MatAmbient * a + emis);
 
     float4 albedo = sampleBase(In.TexIndex, clampMode, In.Uv, useLowAF(In.AlphaRef, true));
 

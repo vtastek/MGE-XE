@@ -16,7 +16,7 @@
 // Params ride gBatch.worlds[6] (host writes 4 contiguous float4 groups; transpose to read them):
 //   g0 = (waterLevelRel, windFactor, shoreDepthBias, time)
 //   g1 = (depthBaseColor.rgb, underwater)
-//   g2 = (camFwd.xyz, nearViewRange)
+//   g2 = (camFwd.xyz, distortFar)      // .w WAS an unread duplicate of nearViewRange
 //   g3 = (waterFlags, alphaBase, reflSize, reflBlurGain)
 // ...and worlds[8..10] carry the W1 surface field's four Blender-style noise textures:
 //   worlds[8] per noise = (scale, detail, roughness, height)
@@ -60,6 +60,7 @@
 #include "tonemap.h.fsl"   // tonemap() — the curve itself; scenecolor.h.fsl below decides who applies it
 #include "linearize.h.fsl" // srgbToLinear()/mod2xLinear() — the scene's transfer function (step 5)
 #include "scenecolor.h.fsl" // tonemapInPass() — class 1: the curve moved to resolve.frag (step 6a)
+#include "fog.h.fsl"       // mwFogFactor() — the same fog LAW every other surface is on
 #include "skydome.h.fsl"   // fogSkyColor() — the same sampled fog target the world melts into
                            // (and, transitively, waterfog.h.fsl — see below)
 #include "wavefield.h.fsl" // W1: the procedural wave field (height + exact gradient + variance)
@@ -253,6 +254,12 @@ float4 PS_MAIN( VSOutput In )
     float3 depthBaseColor= P[1].xyz;
     bool   underwater    = P[1].w > 0.5f;
     float3 camFwd        = P[2].xyz;
+    // ⚠ WAS A DEAD DUPLICATE OF nearViewRange. The LIVE copy is gFrameData.lodParams.w (statics.vert
+    // gates the hero near-cut on it); this water-params slot was written every frame and read by
+    // nothing, which is why it is the one free lane in a group the host already calls full.
+    // Now: the distance at which refraction/reflection UV DISTORTION has faded to zero. 0 = the old
+    // unbounded behaviour, i.e. the exact A/B.
+    float  distortFar    = P[2].w;
     // Bitfield, not a mode number: bits 0-1 = debug view (0 normal, 1 reflection-only,
     // 2 refraction-only, 3 roughness), bit 2 = P4 roughness-aware Schlick Fresnel, bit 3 = force the
     // reflection's fog melt OFF.
@@ -450,8 +457,37 @@ float4 PS_MAIN( VSOutput In )
                                  : ((dist > 1e-4f) ? surfPos / dist : float3(0, 0, 1));
 
     // Forge-frame near fog scalar (1 = clear, 0 = full fogColNear), matching opaque.frag.
-    float fog = saturate((gFrameData.fogParams.y - dist)
-                       / (gFrameData.fogParams.y - gFrameData.fogParams.x));
+    // Through the shared helper (fog.h.fsl) so water cannot end up on a different fog LAW from the
+    // world it sits in — the same reason the melt target goes through fogSkyTarget rather than a
+    // private fogCol. This is the one per-PIXEL evaluation; the six vertex stages interpolate theirs.
+    float fog = mwFogAir(mwFogFactor(dist), surfPos);   // per-pixel; surfPos is camera-relative
+
+    // ─── UV-DISTORTION FALLOFF ───────────────────────────────────────────────────────────────────
+    // ⚠ `dist` MULTIPLIES THE DISTORTION, AND THAT IS BACKWARDS. reffactor is a SCREEN-space offset,
+    // and screen space is angular: a wave tilt refracts the view ray by an angle that does not
+    // depend on how far away the water is, so the pixel offset should be roughly CONSTANT with
+    // distance. Multiplying by `dist` instead makes it grow without bound — reported as "refraction
+    // gets stronger with camera altitude/distance", and altitude is just the way `dist` grows for
+    // the water you happen to be looking at.
+    //
+    // ⚠ AND IT IS NOT ONLY A LOOK BUG. reffactor also offsets the DEPTH PROBE (`distUV`, which
+    // decides `aboveWater` and the water depth) and the reflection tap. A runaway offset makes those
+    // read an unrelated pixel, so the refraction GATING goes wrong, not merely the refraction.
+    //
+    // Two halves, because capping alone leaves a permanent offset out to the horizon and fading
+    // alone still lets it grow first:
+    //   distortMag  — stop the growth at the fade's start, so the near field is untouched
+    //   distortFade — smoothstep to exactly 0 by distortFar, so it DROPS COMPLETELY as asked
+    // smoothstep and not a linear fade, for the reason the fog wall taught: a slope discontinuity
+    // reads as an edge even when the value is continuous.
+    float distortMag  = (distortFar > 0.0f) ? min(dist, 0.5f * distortFar) : dist;
+    float distortFade = (distortFar > 0.0f)
+                            ? (1.0f - smoothstep(0.5f * distortFar, distortFar, dist))
+                            : 1.0f;
+    // The whole legacy expression, gathered so both the above- and below-water sites scale
+    // identically instead of drifting — they already disagreed by a factor of 2 on purpose (MGE's
+    // underwater constant) and that factor is preserved at its own site.
+    float distortAmp  = (windFactor * distortMag + 0.1f) * distortFade;
 
     // Absolute world XY for WORLD-ANCHORED normal sampling (the frame is camera-relative; lodEye is
     // the real absolute eye). Without this the normals swim with the camera.
@@ -1038,7 +1074,7 @@ float4 PS_MAIN( VSOutput In )
         float3 nrm       = -normal;
 
         // Distortion factor: 2x the above-water one (MGE's underwater constant).
-        float2 reffactorU = 2.0f * (windFactor * dist + 0.1f) * nrm.xy;
+        float2 reffactorU = 2.0f * distortAmp * nrm.xy;   // 2x = MGE's underwater constant
 
         // Refraction — alloc-sized RT, so pixel offsets scale by invAlloc (see the block above).
         float2 ruvU = baseUV + (-2.0f * reffactorU) * invAlloc;
@@ -1221,7 +1257,7 @@ float4 PS_MAIN( VSOutput In )
     if (flatWater) { normal = float3(0.0f, 0.0f, 1.0f); }
 
     // Reflection/refraction pixel distortion (wind strength increases it).
-    float2 reffactor = (windFactor * dist + 0.1f) * normal.xy;
+    float2 reffactor = distortAmp * normal.xy;
 
     // --- refraction (depth-gated, distorted) ---
     float2 distUV   = baseUV + reffactor.yx * invAlloc;
@@ -1233,7 +1269,23 @@ float4 PS_MAIN( VSOutput In )
 
     float3 refracted = deepColor;
     float  shorefactor = 0.0f;
-    if (depth < 4000.0f && aboveWater < 0.5f) {
+    // ⚠ THE 4000-UNIT CUTOFF IS A HARD EDGE THAT MOVES WITH THE CAMERA, and it is legacy. `depth` is
+    // a SLANT distance (sceneDist - dist) before the perpendicular conversion below, so the depth at
+    // which a given seabed pixel crosses 4000 depends on the view ANGLE — i.e. on camera altitude.
+    // Past it `refracted` keeps its `deepColor` initialiser, a flat dark constant, so the boundary
+    // reads as "a black waterbed height/distance cutoff that moves with camera z". Exactly that,
+    // reported 2026-08-13.
+    //
+    // The cutoff existed because the legacy fade had no other way to bound deep water. The unified
+    // fog does: `refracted` is attenuated by the real path length through water, which grows without
+    // limit as the seabed drops away, so deep water goes to the fog target on its own and there is
+    // nothing left for a threshold to protect. Dropped when wFogOn — and kept verbatim when it is
+    // off, so the legacy A/B is byte-identical.
+    //
+    // `aboveWater < 0.5` STAYS in both: that is not a range limit, it is "is the scene behind this
+    // pixel actually under the surface", and sampling refraction for a rock standing in FRONT of the
+    // water would pull that rock into the water's own colour.
+    if ((wFogOn || depth < 4000.0f) && aboveWater < 0.5f) {
         float2 ruv = baseUV + saturate(depth / 100.0f) * reffactor.yx * invAlloc;
         refracted  = SampleLvlTex2D(gRefractColor, gSamplerBilinearClamp, ruv, 0.0f).rgb;
 
@@ -1340,7 +1392,42 @@ float4 PS_MAIN( VSOutput In )
     // composite would fog the refraction TWICE (fog²) and pull the mid-distance water under. One
     // term, one fog, and the Fresnel mix then converges on its own — at fog 0 both inputs are the
     // target, so the surface is the target at any Fresnel weight.
-    if (!noFogMelt) { reflected = lerp(fogSkyColor(In.Position.xy), reflected, fog); }
+    // fogSkyColorAt, not fogSkyColor: this is a DISTANCE fog, so it takes the same saturation knee
+    // every other surface now does (skydome.h.fsl). Without it, near water melts toward a fully
+    // sky-substituted target and carries cloud structure at a few metres — the same defect, and
+    // water is where it would read worst, because a reflection already looks like the sky and the
+    // wrong sky is therefore hardest to spot as wrong.
+    // EXTINCTION FIRST, THEN THE MELT — the same order, off the same helper, as every applyFog
+    // surface (skydome.h.fsl). Without it water melted toward the identical target on the identical
+    // ramp but was never darkened on the way, so it matched land at saturation and read brighter at
+    // every distance short of it.
+    //
+    // skyBehind = 1, not the geometric test: see fogExtinction's note. The sea is edge-on to the eye,
+    // so both of that gate's signals read 0 exactly where sky IS behind the surface, and `ramp`
+    // (~0 near, 1 at the fog wall) is the honest gate for this one surface.
+    //
+    // Applied to `reflected` and not to the composite, matching the melt for the same reason: the
+    // refraction is a resample of a scene copy that already went through applyFog. At the distances
+    // where this term has any weight the surface is near-grazing and Fresnel makes it almost all
+    // reflection, so the split costs nothing visible.
+    // ⚠ AIR FOG ONLY WHILE THE EYE IS IN AIR — and `noFogMelt` does NOT carry that, it is the
+    // dev-panel roughness-calibration bit. skydome.h.fsl:260 makes exactly this test for exactly
+    // this reason: the instant the eye goes under, distantland.cpp:763 swaps MW's whole fog range
+    // (start -4096, end 2458) and the scalar stops describing atmosphere. `fog` is then 0.375 at
+    // ZERO distance and 0 by ~35 m, so this block would melt the underside reflection 62% toward
+    // the fog target at arm's length and darken it by the extinction ramp on top — the two symptoms
+    // applyFog already documents, arriving here through the one path that does not call it.
+    //
+    // ⚠ AND THE EXTINCTION HALF IS MINE, 2026-08-13. Before the water extinction landed this block
+    // was protected by accident: applyFog's `skyBehind` gate reads 0 for the sea, so the wrong
+    // scalar reached a term that was multiplied by zero anyway. Forcing skyBehind = 1 — correct for
+    // the horizon, which is what it was for — removed the accident and left the guard genuinely
+    // missing. A gate that was doing two jobs only looked like it was doing one.
+    if (!noFogMelt && !waterCameraSubmerged())
+    {
+        reflected *= fogExtinction(fog, 1.0f);
+        reflected  = lerp(fogSkyColorAt(In.Position.xy, fog), reflected, fog);
+    }
 
 
     // Dev-panel water debug views (P[3].x). Output an isolated term so the reflection / refraction RT

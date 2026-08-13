@@ -52,6 +52,7 @@
 // the water and the SEABED, and the seabed is drawn by opaque/statics/terrain — fogging only the
 // surface would leave the two disagreeing exactly as they do today.
 #include "waterfog.h.fsl"
+#include "fog.h.fsl"      // mwFogAir() — the submerged test, per PIXEL
 
 // ORDER MATTERS, and getting it wrong is why v2 still read as a cutout at mid distance. Extinction
 // applied to the fog TARGET only shows up once fog is complete — by which point the surface has
@@ -91,16 +92,89 @@ float4 fogSkySample(float2 pixelXy)
 // and that claim covers EXTINCTION too: the host zeroes skyParams.w whenever this strength is 0, so
 // one knob still switches the whole feature off. It has to — the host also skips the sky snapshot at
 // strength 0, so anything still reading s.a past that point is reading a stale frame's sky.
-float3 fogSkyTarget(float4 s)
+float3 fogSkyTarget(float4 s, float skyShare)
 {
     float3 sky = s.rgb + gFrameData.fogColNear.rgb * (1.0f - s.a);
-    return lerp(gFrameData.fogColNear.rgb, sky, gFrameData.fogColNear.w);
+    return lerp(gFrameData.fogColNear.rgb, sky, gFrameData.fogColNear.w * skyShare);
 }
 
-// What fog lerps toward, for callers that have no surface of their own (volfog's haze).
+// ⚠ THE SKY BELONGS AT THE FAR END OF THE RAMP, NOT SPREAD ALONG IT — user, 2026-08-13: "fog
+// blending with sky is a distance of last percentiles where fog saturates. So sky blending to 1
+// meter away objects is just wrong."
+//
+// The feature's claim is about SATURATED fog: at full fog a surface does not approach the sky, it
+// BECOMES it, clouds and all. But the target was built at full strength for every fragment and then
+// mixed in by `fogAir`, so an object at arm's length with 3% fog opacity received 3% of a fully
+// sky-substituted target — real cloud structure, painted onto near geometry at whatever weight the
+// ramp happened to give it. Clouds visible THROUGH a near object is that, exactly.
+//
+// This is not the flat-fog colour being wrong at short range; fogColNear is right there and always
+// was. What is wrong is asking a distant-field substitution to also be the near-field one. So the
+// sky's SHARE of the target now ramps with fog opacity and arrives only over the last stretch, where
+// the substitution is the thing that was actually claimed. Below the knee the target is flat
+// fogColNear — bit-identical to the pre-feature image, which is the same negative control the
+// strength knob gives, now also reached by distance.
+//
+// A #define and not a lane, matching FOG_SKY_HORIZON_RAMP below: this is a shaping constant on a
+// ramp, not a per-frame quantity, and every free lane in gShadowParams belongs to a different
+// subsystem. ⚠ It therefore costs a HOST RESTART to retune (skydome.h.fsl reaches opaque/statics/
+// terrain/alpha/multimap, none of which hot-reload) — move it to a lane if it needs dialling in play.
+//
+// MW's fog is LINEAR in distance, so a knee on opacity IS a knee on distance: 0.85 hands the sky the
+// last ~15% of the ramp.
+#define FOG_SKY_SATURATION_KNEE 0.85f
+
+// `fogAir` is MW's scalar: 1 = clear, 0 = fully fogged. Opacity is its complement.
+// At fogAir 0 this returns exactly 1, so "at full fog the surface BECOMES the sky" is preserved to
+// the bit — the property this whole helper exists to deliver is untouched at the only place it was
+// ever true.
+float fogSkyShare(float fogAir)
+{
+    return smoothstep(FOG_SKY_SATURATION_KNEE, 1.0f, 1.0f - fogAir);
+}
+
+// What fog lerps toward, for callers that have no surface of their own (volfog's haze, the water
+// fill past the mesh). These are FAR-FIELD by construction — there is no near geometry to protect —
+// so they take the full share and are unchanged by the knee above.
 float3 fogSkyColor(float2 pixelXy)
 {
-    return fogSkyTarget(fogSkySample(pixelXy));
+    return fogSkyTarget(fogSkySample(pixelXy), 1.0f);
+}
+
+// ...and the same target for a caller that DOES have a distance: the melt on water's reflection,
+// which is the one fogSkyColor() site that is a distance fog rather than a far-field fill.
+float3 fogSkyColorAt(float2 pixelXy, float fogAir)
+{
+    return fogSkyTarget(fogSkySample(pixelXy), fogSkyShare(fogAir));
+}
+
+// THE AERIAL EXTINCTION, as a multiplier — hoisted out of applyFog() so the water pass can apply the
+// IDENTICAL curve instead of a lookalike. Returns 1 (no-op) at strength 0, at fog 0, or wherever
+// there is no sky behind the surface. See the long note in applyFog for what `shape` buys.
+//
+// ⚠ WATER WAS BRIGHTER THAN LAND ALL THE WAY IN, AND MATCHED ONLY AT SATURATION — user, 2026-08-13.
+// That is exactly this term's shape: both surfaces melt toward the same target on the same ramp, so
+// they agree at full fog, but only the applyFog path was ALSO being darkened on the way there.
+// water.frag never calls applyFog (it composes its own fog against a reflection), so it was getting
+// the melt and not the extinction.
+//
+// ⚠ AND IT IS NOT A MISSING CALL — the gate would have zeroed it anyway, which is why this needs its
+// own decision rather than a copied line. `skyBehind` is `max(s.a, upness ramp)`: the sea sits AT OR
+// BELOW the eye's horizontal plane, so `upness` is negative and the dome was never drawn at those
+// pixels, making both signals 0. The negative control that deliberately protects ground and terrain-
+// viewed-from-above ("the sea ... cannot move at any strength") also catches the sea seen EDGE ON,
+// where sky is precisely what is behind it. Water is the case that gate cannot express.
+//
+// So water passes skyBehind = 1 and lets `ramp` do the gating instead, which is sound for this
+// surface specifically: the water at the far end of the fog ramp IS the horizon, by construction —
+// the melt already asserts this by melting toward fogSkyTarget(), and the extinction refusing to
+// assert the same thing is the inconsistency. Near water is protected by the ramp (~0), not by a
+// geometric test. Known residual: a river at extreme distance with mountains behind it darkens
+// slightly on a claim that is false there — but at that distance it is nearly all fog target anyway.
+float fogExtinction(float fogAir, float skyBehind)
+{
+    float ramp = pow(1.0f - fogAir, gFrameData.timeParams.w);
+    return 1.0f - gFrameData.skyParams.w * ramp * skyBehind;
 }
 
 // How fast "am I standing against sky" ramps in above the eye's horizontal plane, as a reciprocal of
@@ -132,6 +206,10 @@ float3 applyFog(float3 lit, float3 worldPosRel, float2 pixelXy, float fog)
     // edge in the near scene grew black NaN dots. Found 2026-08-01; the interpolators feeding this
     // are CENTROID now, and this line means the next one that is not cannot reach a pow().
     fog = saturate(fog);
+    // ...and the submerged test HERE rather than in the vertex stage that produced `fog`. A step
+    // function interpolates into a ramp belonging to neither side, which is what put a soft,
+    // wrong-coloured band along every shoreline. This is the same test, evaluated per pixel.
+    fog = mwFogAir(fog, worldPosRel);
 
     // ⚠ THE AIR RAMP ONLY OWNS THE PART OF THE RAY THAT IS AIR. This is the line that makes the
     // surface crossing continuous, and leaving it out is what put a hard step there on the first
@@ -184,7 +262,7 @@ float3 applyFog(float3 lit, float3 worldPosRel, float2 pixelXy, float fog)
     // carries no fog rather than the wrong one. Conservative in the direction of visibility, and the
     // water column over the eye->surface segment is the dominant term anyway. Shipping the
     // above-water range alongside the below-water one would let this be exact; it needs a wire lane.
-    if (waterFogCameraSubmerged()) { fogAir = 1.0f; }
+    if (waterCameraSubmerged()) { fogAir = 1.0f; }   // GEOMETRIC, not the feature toggle
 
     // EXTINCTION (skyParams.w), on the surface, ramped by the fog between it and the eye. The
     // standard lerp already carries the energy-conserving amount of extinction; this is deliberately
@@ -244,8 +322,7 @@ float3 applyFog(float3 lit, float3 worldPosRel, float2 pixelXy, float fog)
     // same schedule the sky melt does. It needs no water gate of its own — at waterShare 1,
     // fogAir is 1, `1 - fogAir` is 0 and the ramp is 0, so a fully submerged fragment is not
     // silhouetted against a sky it has no line of sight to. One quantity disarms both halves.
-    float ramp = pow(1.0f - fogAir, gFrameData.timeParams.w);
-    lit *= 1.0f - gFrameData.skyParams.w * ramp * skyBehind;
+    lit *= fogExtinction(fogAir, skyBehind);
 
     // AIR over its share of the ray, then WATER over the rest. No branch and no camera test: the
     // share carries it, and both of the v1 branches fall out of this one expression at its
@@ -255,7 +332,12 @@ float3 applyFog(float3 lit, float3 worldPosRel, float2 pixelXy, float fog)
     // things to what is behind it — attenuates it and adds to it — and only the attenuation is a
     // lerp. waterFogComposite reproduces this line exactly at W8 strength 0 (it is handed the lerp
     // as its own legacy input), so what follows here is unchanged until that lane moves.
-    return waterFogComposite(lerp(fogSkyTarget(s), lit, fogAir), worldPosRel, wf);
+    // fogSkyShare(fogAir): the sky substitution arrives only where the fog saturates — see the knee.
+    // fogAir and NOT `fog`, so the share follows the same air-only schedule the melt does: a
+    // submerged fragment (fogAir 1) gets share 0, which is right twice over — it has no line of
+    // sight to the sky, and the water fog owns that ray.
+    return waterFogComposite(lerp(fogSkyTarget(s, fogSkyShare(fogAir)), lit, fogAir),
+                             worldPosRel, wf);
 }
 
 #endif // SKY_DOME_H

@@ -13,6 +13,7 @@
 // viewProj keeps the column-major mul like opaque/distantland). Placeholder linear fog (1c = scatter).
 
 #include "opaque.srt.h"
+#include "fog.h.fsl"    // mwFogFactor() — ONE fog law for every stage
 #include "skyamb.h.fsl"   // skyAmbFactor() — SH-L1 sky ambient (SH1) + sky AO (SH2)
 #include "tonemap.h.fsl"    // (scenecolor.h.fsl's prerequisite; the curve is never called in a VS)
 #include "linearize.h.fsl" // srgbToLinear() — the scene's transfer function (step 5)
@@ -126,7 +127,13 @@ VSOutput VS_MAIN( VSInput In )
     //
     // NOT Normal.xyz — that is a direction, and a UBYTE4N direction has no transfer function.
     float3 vcol     = decodeAuthored(In.Color.rgb);
-    float  emissive = decodeAuthored1(In.Normal.w);
+    // S3a's emissive calibration reaches distant land HERE, and unlike the near frags it can be done
+    // in the vertex stage: this is a dedicated scalar lane, so there is no vColSource ambiguity about
+    // whether the value is an emissive or a modulating colour. Applied after the decode, like the
+    // sun/ambient gains at their host site — the ratio being calibrated is a ratio of radiance.
+    // Without this line a glowing window would calibrate up close and not at distance, which is the
+    // near/far step the whole "a calibration must be total" rule exists to prevent.
+    float  emissive = decodeAuthored1(In.Normal.w) * gShadowParams.calParams.x;
     // Phase B split: the SUN term rides its own interpolator so statics.frag can attenuate it by the
     // MSM sun visibility; ambient + emissive stay in Color (a shadow must never darken those). The
     // sum Color.rgb + SunLight is identical to the old single `light` product, so vis == 1 is a
@@ -182,8 +189,7 @@ VSOutput VS_MAIN( VSInput In )
     // Placeholder distant fog (1c = atmospheric scatter), same linear ramp as distantland.vert so
     // statics + land read as one far mass.
     float dist = length(worldPos.xyz - gFrameData.eyePos.xyz);
-    Out.Fog = saturate((gFrameData.fogParams.y - dist)
-                       / (gFrameData.fogParams.y - gFrameData.fogParams.x));
+    Out.Fog = mwFogFactor(dist);   // ramp only — the submerged test is PER PIXEL (mwFogAir)
 
     // Below-water clip (reflect-geo pass only): keep the above-water side of the water plane. worldPos
     // is camera-relative (statics are host-shifted by -eye), matching the plane. Pass-all elsewhere.

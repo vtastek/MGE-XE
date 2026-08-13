@@ -1087,15 +1087,15 @@ STRUCT(ShadowMaskParams)
     float4 sunOcc;
 #line 235 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
     float4 skyAO2;
-#line 253 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
+#line 260 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
     float4 toneParams;
-#line 267 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
+#line 274 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
     float4 waterFogCol;
-#line 279 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
+#line 293 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
     float4 waterFogPlane;
-#line 296 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
+#line 310 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
     float4 waterFogLight;
-#line 313 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
+#line 327 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
     float4 waterFogExt;
 
 
@@ -1124,7 +1124,9 @@ STRUCT(ShadowMaskParams)
 
 
     float4 waterFogKd;
-#line 341
+#line 375 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
+    float4 calParams;
+#line 376
 };
 #line 21 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
 #line 58 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
@@ -1539,6 +1541,41 @@ float phaseDualLobe(float cosT, float iso,
     return iso + lobes;
 }
 #line 41 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/waterfog.h.fsl"
+#line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/waterplane.h.fsl"
+#line 18 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/waterplane.h.fsl"
+bool waterFogActive()
+{
+    return gShadowParams.waterFogPlane.y >= 0.5f;
+}
+#line 36 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/waterplane.h.fsl"
+bool waterCameraSubmerged()
+{
+    return gShadowParams.waterFogPlane.z > 0.5f;
+}
+
+
+
+
+
+bool waterPlaneValid()
+{
+    return gShadowParams.waterFogPlane.w > 0.5f;
+}
+
+
+
+
+float waterPlaneRelZ()
+{
+    return gShadowParams.waterFogPlane.x - gFrameData.lodEye.z;
+}
+
+
+bool waterFogCameraSubmerged()
+{
+    return waterFogActive() && waterCameraSubmerged();
+}
+#line 42 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/waterfog.h.fsl"
 
 
 
@@ -1547,7 +1584,7 @@ float waterFogPlaneRelZ()
 {
     return gShadowParams.waterFogPlane.x - gFrameData.lodEye.z;
 }
-#line 70 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/waterfog.h.fsl"
+#line 71 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/waterfog.h.fsl"
 float waterFogDepthBelow(float3 worldPosRel)
 {
     return max(waterFogPlaneRelZ() - worldPosRel.z, 0.0f);
@@ -1558,7 +1595,7 @@ float waterFogEyeDepth()
 {
     return max(waterFogPlaneRelZ(), 0.0f);
 }
-#line 119 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/waterfog.h.fsl"
+#line 120 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/waterfog.h.fsl"
 float waterPathLength(float3 worldPosRel, float waterRelZ, bool camUnder)
 {
     float d = length(worldPosRel);
@@ -1583,23 +1620,7 @@ float waterPathLength(float3 worldPosRel, float waterRelZ, bool camUnder)
     if (posToSurf <= 0.0f) { return 0.0f; }
     return d * (posToSurf / max(-worldPosRel.z, posToSurf));
 }
-
-
-
-
-bool waterFogActive()
-{
-    return gShadowParams.waterFogPlane.y >= 0.5f;
-}
-
-
-
-
-
-
-
-
-
+#line 160 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/waterfog.h.fsl"
 float2 waterFogSample(float3 worldPosRel)
 {
     if (!waterFogActive()) { return float2(0.0f, 0.0f); }
@@ -1780,15 +1801,6 @@ float3 waterFogVeil(float3 worldPosRel)
 float waterFogVolStrength()
 {
     return gShadowParams.waterFogExt.w;
-}
-
-
-
-
-
-bool waterFogCameraSubmerged()
-{
-    return waterFogActive() && gShadowParams.waterFogPlane.z > 0.5f;
 }
 #line 36 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/sky.frag.fsl"
 

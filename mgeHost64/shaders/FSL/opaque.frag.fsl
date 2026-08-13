@@ -292,14 +292,19 @@ float4 PS_MAIN( VSOutput In )
     // The client forces vColSource 0 unless the mesh has colours AND its VertexColorProperty
     // says to use them (else real material colours get white-washed), so the col-using
     // branches only run on genuine DiffAmb/Emissive meshes.
-    float3 lit;
-    if (In.VColSource == 2u) {
-        lit = In.Color.rgb * (d + a) + In.MatEmissive;
-    } else if (In.VColSource == 1u) {
-        lit = In.MatDiffuse * d + In.MatAmbient * a + In.Color.rgb;
-    } else {
-        lit = In.MatDiffuse * d + In.MatAmbient * a + In.MatEmissive;
-    }
+    // S3a: the emissive addend, isolated so the calibration gain has ONE place to land. On
+    // vColSource 1 the emissive term is the vertex colour — which is why this cannot be done in the
+    // vertex stage beside decodeAuthored(): there, In.Color is indistinguishable from the MODULATING
+    // vertex colour of a vColSource 0/2 mesh, and scaling that would tint the whole surface instead
+    // of its self-illumination. Only the frag knows which branch it is in. See gShadowParams.calParams.
+    float3 emis = ((In.VColSource == 1u) ? In.Color.rgb : In.MatEmissive)
+                * gShadowParams.calParams.x;
+    // With the emissive selected above, sources 1 and 0 differ only in WHICH value is the emissive —
+    // so they are now one branch, not two. Source 2 stays separate: there the vertex colour is a
+    // modulator on (d + a) rather than an addend, which is a different expression, not a different
+    // operand.
+    float3 lit = (In.VColSource == 2u) ? (In.Color.rgb * (d + a) + emis)
+                                       : (In.MatDiffuse * d + In.MatAmbient * a + emis);
 
     // gSamplerAnisotropic: FSL built-in STATIC sampler (anisotropic 8x, WRAP), baked into
     // DefaultRootSignature. We deliberately do NOT use a dynamic sampler: one sharing the Persistent

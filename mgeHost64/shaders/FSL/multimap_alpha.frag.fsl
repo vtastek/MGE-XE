@@ -131,14 +131,11 @@ float4 PS_MAIN( VSOutput In )
     }
     d *= gFrameData.dbgScales.y;
     uint vColSource = (In.Packed >> 3u) & 0x3u;
-    float3 lit;
-    if (vColSource == 2u) {
-        lit = In.Color.rgb * (d + a) + In.MatEmissive;
-    } else if (vColSource == 1u) {
-        lit = In.MatDiffuse * d + In.MatAmbient * a + In.Color.rgb;
-    } else {
-        lit = In.MatDiffuse * d + In.MatAmbient * a + In.MatEmissive;
-    }
+    // S3a emissive gain — see opaque.frag.
+    float3 emis = ((vColSource == 1u) ? In.Color.rgb : In.MatEmissive)
+                * gShadowParams.calParams.x;
+    float3 lit = (vColSource == 2u) ? (In.Color.rgb * (d + a) + emis)
+                                    : (In.MatDiffuse * d + In.MatAmbient * a + emis);
     // --- END lit block ---
 
     // Fixed-function stage loop (IDENTICAL to multimap.frag): BASE = tex*lit + record baseA,

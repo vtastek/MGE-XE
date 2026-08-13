@@ -2430,6 +2430,8 @@ namespace {
     // At 1024 the mean coefficient e-folds in ~9.3 m and reaches ~79% opacity at 14.5 m; a rock
     // 1.4 m down still receives 83% of the surface light, one 14.5 m down about 15%.
     float              g_waterFogVisDist = 1024.0f;
+    // Isolation master on the extinction coefficients only — see publishWaterFog. 1 = normal.
+    float              g_waterFogAbsorb  = 1.0f;
     // TURBIDITY — the hue of the absorption, orthogonal to its rate above.
     //
     // ⚠ THIS IS A MODEL CHANGE, NOT A KNOB, and the distinction is the reason it exists: inverting
@@ -3249,8 +3251,15 @@ namespace {
     // W8e: the DIFFUSE attenuation coefficient K_d, for the DOWNWELLING light path only. Not a
     // second tuning of sigma_t — a different physical coefficient (see publishWaterFog).
     constexpr uint32_t kWaterFogKdFloat      = kWaterFogPhase2Float + 4;
+    // S3a: the calibration gains that need a SHADER lane. Sun and ambient do not — they are folded
+    // into gFrameData.sunCol/ambCol at the host's single decode site, which is strictly better
+    // because every truncated copy of that cbuffer inherits them. Emissive cannot be: it arrives per
+    // INSTANCE in the vertex stream from eight different fill sites, and on vColSource 1 meshes it is
+    // the vertex colour, which only the frag can tell apart from a modulating one. So it rides here,
+    // for the same reason toneParams does — gShadowParams is bound by pointer into every PerFrame set.
+    constexpr uint32_t kCalFloat             = kWaterFogKdFloat + 4;
     constexpr uint32_t kShadowParamsBytes = 4096;
-    static_assert((kWaterFogKdFloat + 4) * sizeof(float) <= kShadowParamsBytes,
+    static_assert((kCalFloat + 4) * sizeof(float) <= kShadowParamsBytes,
                   "ShadowMaskParams overflows its CBV — too many sun cascades");
     // msmrecv.h.fsl's PCSS works in TEXELS, so SUN_SHADOW_RES has to agree with the atlas the host
     // actually allocated. Same mirroring contract as SUN_CASCADES / kSunCascades.
@@ -4054,14 +4063,46 @@ namespace {
         const float c0      = kWaterCell0;
         const int   L       = (int)kWaterLevels;
 
+        // ⚠ THE OUTERMOST RING IS STRETCHED TO THE HORIZON — user's call, 2026-08-13: "just stretch
+        // last edge polygons of water surface towards horizon. no additional polygons, gets fogged
+        // fully there so shape is no more important."
+        //
+        // The clipmap's outer half-extent is exactly kWaterCell0 * 2^(L-1) * (m/2) = 128*32*32 =
+        // 131072 units = 16 cells, which is ALSO the fog end and the draw distance. So the mesh
+        // stopped precisely where the fog finished, and the last ring of quads spanned the stretch
+        // where fog is not yet opaque. Past that edge there is no water surface at all, and what
+        // showed through was `deepColor` — water.frag's constant fallback when the refraction is
+        // skipped (`depth < 4000` at :1238), which nothing fogs. Reported exactly that way: "at the
+        // edge of view distance, water surface reveals a bit of deep colored, unfogged underwater".
+        //
+        // Pushing the boundary vertices out by 8x puts the real edge at 128 cells, far beyond where
+        // the fog reaches 1, so the terminating edge is never visible and the fallback never shows.
+        // Costs NO vertices and NO triangles — the lattice is unchanged, only its outermost
+        // coordinates move, and the index buffer is pure topology so it does not care. The stretched
+        // quads sample the wave field at an absurd rate, which is exactly the "shape is no more
+        // important" part: they are behind an opaque fog wall.
+        //
+        // Coarsest level only. Any finer level's outer ring is stitched to the next one out and
+        // moving it would tear the T-junction fix.
+        constexpr float kWaterSkirt = 8.0f;
         g_waterVertTotal = (uint32_t)(L * verts1D * verts1D);
         std::vector<float> verts;                  // float3 per vertex
         verts.reserve((size_t)g_waterVertTotal * 3);
         for (int k = 0; k < L; ++k) {
+            const bool outermost = (k == L - 1);
             for (int gy = 0; gy <= m; ++gy) {
                 for (int gx = 0; gx <= m; ++gx) {
-                    verts.push_back((float)(gx - half));
-                    verts.push_back((float)(gy - half));
+                    float px = (float)(gx - half);
+                    float py = (float)(gy - half);
+                    if (outermost) {
+                        // Per-axis, so an edge vertex stretches only outward and a corner stretches
+                        // diagonally — the ring stays a ring instead of becoming a scaled square
+                        // that would drag the inner boundary out with it.
+                        if (gx == 0 || gx == m) { px *= kWaterSkirt; }
+                        if (gy == 0 || gy == m) { py *= kWaterSkirt; }
+                    }
+                    verts.push_back(px);
+                    verts.push_back(py);
                     verts.push_back(0.0f);         // z = 0 (height in the VS, follow-up)
                 }
             }
@@ -8374,9 +8415,10 @@ namespace {
                     BufferLoadDesc aob = {};
                     aob.mDesc.mDescriptors  = DESCRIPTOR_TYPE_RW_BUFFER;
                     aob.mDesc.mMemoryUsage  = RESOURCE_MEMORY_USAGE_GPU_ONLY;
+                    // 8, not 4, since S3a: [0..3] the means, [4..6] the p10/p50/p90 display levels.
                     aob.mDesc.mStructStride = sizeof(uint32_t);
-                    aob.mDesc.mElementCount = 4;
-                    aob.mDesc.mSize         = (uint64_t)sizeof(uint32_t) * 4;
+                    aob.mDesc.mElementCount = 8;
+                    aob.mDesc.mSize         = (uint64_t)sizeof(uint32_t) * 8;
                     aob.mDesc.mStartState   = RESOURCE_STATE_UNORDERED_ACCESS;
                     aob.mDesc.pName         = "aplOut";
                     aob.ppBuffer            = &g_live.pAplOut;
@@ -8385,7 +8427,7 @@ namespace {
                     BufferLoadDesc arb = {};
                     arb.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_GPU_TO_CPU;
                     arb.mDesc.mFlags       = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
-                    arb.mDesc.mSize        = 16;
+                    arb.mDesc.mSize        = 32;
                     arb.mDesc.mStartState  = RESOURCE_STATE_COPY_DEST;
                     arb.mDesc.pName        = "aplReadback";
                     arb.ppBuffer           = &g_live.pAplReadback;
@@ -9592,6 +9634,7 @@ namespace {
     // single frame's average is noisy enough to hide the shift the linear migration must be proved
     // not to make, so the reported number is the window mean, exactly like gpu/rec.
     double    g_aplAccum[4] = { 0.0, 0.0, 0.0, 0.0 };   // R, G, B, log-luma
+    double    g_aplPctAccum[3] = { 0.0, 0.0, 0.0 };     // S3a: p10 / p50 / p90 display levels
     unsigned  g_aplN        = 0;
     float     g_lastApl[4]  = { 0.0f, 0.0f, 0.0f, 0.0f };
     double    g_lastGpuWaitMs = 0.0;
@@ -10198,11 +10241,21 @@ namespace {
     // fogColNear through the inverse curve on upload so the fog target survives the move. Format and
     // units are ONE decision because scene-referred values exceed 1.0 and a UNORM target clamps them.
     //
-    // ⚠ STILL DEFAULTS OFF, and off must be byte-identical to before step 6a: every frag tonemaps,
-    // the resolve does not, fogColNear is not lifted. The A/B is a REBUILD and not a checkbox — the
-    // format is baked into ~14 pipelines at init, which is the same reason the Resolve tab has no
-    // scene-format control. Flip it here, rebuild, and check the horizon fog band first.
-    bool     g_hdrSceneColor   = false;
+    // ⚠ ON SINCE 2026-08-13, and the reason is S3 rather than step 6 finishing. The calibration gains
+    // (sun/ambient/emissive) and the exposure servo after them are being derived against a MEASURED
+    // target table, and a gain derived in one colour domain does not transfer to another: the LDR
+    // pass measured this interior class asking 1.7-2.2x, and the same scene linear asks ~1.35x more
+    // because S1 measured linear at apl -26%. Calibrating in the build we do not ship would produce
+    // numbers that have to be thrown away, so the domain moves FIRST and the numbers are derived in
+    // it. See tasks/forge-postprocess.md, "the range is an ADAPTATION ENVELOPE".
+    //
+    // OFF is still byte-identical to before step 6a — every frag tonemaps, the resolve does not,
+    // fogColNear is not lifted — and that path is kept live for the A/B. The A/B is a REBUILD and not
+    // a checkbox: the format is baked into ~14 pipelines at init, which is the same reason the
+    // Resolve tab has no scene-format control. The LDR partner ships beside the host as
+    // `mgeHost64_ldr.exe`, built from THIS source with only these two bools flipped — an older LDR
+    // binary is not a valid A/B partner, it is a different renderer. Check the horizon fog band first.
+    bool     g_hdrSceneColor   = true;
 
     // STEP 5 — THE LINEAR MIGRATION. tasks/forge-postprocess.md.
     //
@@ -10228,8 +10281,15 @@ namespace {
     // abot off FIRST, re-baseline, then this — or neither number means anything.
     //
     // ⚠ REQUIRES g_hdrSceneColor (folded into g_live.linearScene): 8-bit linear bands in the darks.
-    // Ships OFF, and OFF is byte-identical. The A/B is a REBUILD, like the format it rides on.
-    bool     g_linearScene     = false;
+    // The A/B is a REBUILD, like the format it rides on, and OFF is byte-identical.
+    //
+    // ⚠ ON SINCE 2026-08-13, together with the format above and for its reason: S3's gains are being
+    // derived now, and this is the domain they have to be derived in. It rides ON TOP of an unpaid
+    // bill — the sum shift documented above (`ambient + sun·N·L` returning ~0.70 where gamma
+    // saturated to 1.0) is real and un-cancelled, so the scene comes up DARKER than the LDR build by
+    // roughly that amount. That darkening is not a regression to chase; it is the exact deficit the
+    // three calibration gains exist to pay, and it is why they are being set in this build.
+    bool     g_linearScene     = true;
 
     // AO contribution toggles → FrameData.debugParams.w bitmask (bit0 AO, bit1 bent normal, bit2 ambient=white).
     // These two now ARM the AO dispatch as well as consume it (renderScene derives the dispatch gate
@@ -10250,6 +10310,55 @@ namespace {
     float g_litScale     = 1.0f;   // diffuse (sun + point) term
     float g_albedoScale  = 1.0f;   // albedo (texture) term
     float g_overallScale = 1.0f;   // final output
+
+    // ─── S3a CALIBRATION GAINS (tasks/forge-postprocess.md) ──────────────────────────────────────
+    // The linear migration (S1) is exact on every product and moves every SUM, and the biggest sum in
+    // the renderer is `ambCol + sunCol·N·L`. What that changes is not a level — a level is the
+    // exposure servo's job and a curve's job — it is the RATIO between two summed terms, which
+    // neither of those can restore. These are the knobs that set it, and re-deriving them in linear
+    // is the whole content of S3.
+    //
+    // ⚠ THESE ARE NOT dbgScales, AND MERGING THE TWO WOULD DESTROY A TOOL. dbgScales is a DIAGNOSTIC:
+    // it is read by opaque/alpha/multimap/multimap_alpha only, and that partial reach is exactly what
+    // makes cranking one a way to see what Forge is not drawing (see its comment above). A
+    // calibration must be total — every pass, near geometry and distant land alike — or it puts a
+    // step in the near/far handover. Different jobs, opposite requirements on coverage.
+    //
+    // Targets they are aimed at (user, 2026-08-13), as mean DISPLAY value 0-255:
+    //   clear/cloudy   lit 128, shadow 80      -> shadow is ambient alone, lit is ambient+sun, so
+    //                                             the PAIR pins the ratio: ~1.69 in linear against
+    //                                             ~0.60 for what MW authored in gamma.
+    //   city night 60   interior 50   cave < 50
+    // 1.0 = today's image byte for byte, which is what the source ships.
+    // The measured apl, its context setpoint and the factor still missing all ride the `apl:`
+    // heartbeat line (calTargetName), NOT the dev panel — the harness runs minimized, and t.label()
+    // is implicated in the 2026-08-07 crash and has had zero callers since.
+    // ─── EXPONENTIAL DISTANCE FOG (fog.h.fsl) ────────────────────────────────────────────────────
+    // MW's fog is linear in distance; real extinction is not. Rides the LINEAR domain, because a
+    // physical curve wants a physical domain — the gamma build keeps MW's ramp so it stays a valid
+    // A/B partner.
+    //
+    // ⚠ THE SCALE IS CURVATURE, NOT DENSITY AND NOT THE WALL. v1 ported the DX9 constant 4.4, where
+    // S was the far-end opacity; measured at clear weather / 16 cells that put 87% fog at half the
+    // view distance and the mechanism could not be tuned out of it, because lowering S there also
+    // un-hangs the curtain at fogEnd. The shipped form normalises the exponential onto MW's own two
+    // endpoints, so fogStart/fogEnd keep their meanings and S only decides how front-loaded the
+    // extinction is between them. 0 == MW's linear ramp, bit-exact. See fog.h.fsl for the algebra
+    // and the measured table.
+    bool  g_fogExp       = true;
+    float g_fogExpScale  = 2.0f;   // curvature; re-derive in play, 0 = linear
+
+    // ─── WATER UV-DISTORTION FALLOFF (water.frag, P[2].w) ────────────────────────────────────────
+    // The refraction/reflection offset scales with `dist` and so grows without bound; screen space
+    // is angular, so it should not. This is the distance at which it has faded to exactly zero,
+    // with the growth capped at half of it. 16384 = 2 MW cells: wave-scale distortion is not
+    // resolvable at 100 m anyway, and near water (inside 1 cell) is untouched. 0 = the old
+    // unbounded behaviour, i.e. the A/B.
+    float g_waterDistortFar = 16384.0f;
+
+    float g_calSunGain   = 1.0f;   // sunCol   — host-side, at the one decode site
+    float g_calAmbGain   = 1.0f;   // ambCol   — host-side, at the one decode site
+    float g_calEmisGain  = 1.0f;   // material emissive — gShadowParams lane, applied in the frags
 
     // SK2 "ownership tell": the Forge sky takeover is byte-identical to MW's own sky, so there's
     // no way to tell it's live. These tint the Forge sky toward magenta (gFrameData.skyParams,
@@ -11820,10 +11929,26 @@ namespace {
           t.sliderF("AO bend crease reject (sine; 0 = off)", &g_aoPlaneSig, 0.0f, 1.0f, 0.01f);
           t.checkbox("AO half-res (adaptive Lanczos upscale)", &g_aoHalfRes);
           t.sliderF("AO upscale depth sigma (world)", &g_aoUpSigma,  1.0f, 256.0f, 1.0f);
-          t.sliderF("Ambient intensity", &g_ambScale,     0.0f, 4.0f, 0.02f);
-          t.sliderF("Diffuse intensity", &g_litScale,     0.0f, 4.0f, 0.02f);
-          t.sliderF("Albedo intensity",  &g_albedoScale,  0.0f, 4.0f, 0.02f);
-          t.sliderF("Overall intensity", &g_overallScale, 0.0f, 4.0f, 0.02f);
+          // DIAGNOSTIC scales — four passes only (opaque/alpha/multimap/multimap_alpha), which is the
+          // point: crank one and whatever does NOT move is not being drawn by Forge. For a real
+          // calibration use the CAL gains below, which reach distant land too.
+          t.sliderF("Ambient intensity (diag; near only)", &g_ambScale,     0.0f, 4.0f, 0.02f);
+          t.sliderF("Diffuse intensity (diag; near only)", &g_litScale,     0.0f, 4.0f, 0.02f);
+          t.sliderF("Albedo intensity (diag; near only)",  &g_albedoScale,  0.0f, 4.0f, 0.02f);
+          t.sliderF("Overall intensity (diag; near only)", &g_overallScale, 0.0f, 4.0f, 0.02f);
+          // S3a CALIBRATION — total reach (near + distant land), 1.0 = today's image. These set the
+          // RATIO between the summed light terms, which is what the linear migration changed and
+          // what neither a tonemap curve nor an exposure servo can put back. Watch the `apl:`
+          // heartbeat: it prints this context's setpoint and the factor still missing.
+          // ⚠ Sun and ambient move the same sum — move ONE at a time or the ratio is unattributable.
+          t.sliderF("CAL sun gain (with CAL ambient: sets the sun:ambient RATIO)",
+                    &g_calSunGain,  0.0f, 8.0f, 0.05f);
+          t.sliderF("CAL ambient gain", &g_calAmbGain,  0.0f, 8.0f, 0.05f);
+          // The one the 0.5/0.5/2.0 finding actually isolated: those cancel on d and a, so what was
+          // approved for interiors was emissive x2 and nothing else. Point lights are untouched by it
+          // (they accumulate into d) — a lamp's SPILL is unchanged, the lamp's own glow doubles.
+          t.sliderF("CAL emissive gain (self-illumination; NOT point-light spill)",
+                    &g_calEmisGain, 0.0f, 8.0f, 0.05f);
           t.sliderF("Dist glow: flux (brightness law scale)", &g_glowFlux,      0.0f, 8.0f,   0.05f);
           t.sliderF("Dist glow: extra falloff pow (0=physical radiance; >0 dims far, art only)", &g_glowFalloffPow, 0.0f, 2.0f, 0.05f);
           t.sliderF("Dist glow: fade-in start (world)",       &g_glowFadeStart, 0.0f, 65536.0f, 256.0f);
@@ -11876,6 +12001,13 @@ namespace {
           // Range starts at 128 (1.8 m, genuinely soupy) — the interesting region is the low end.
           t.sliderF("Water fog: visibility DISTANCE at day density (world units)",
                     &g_waterFogVisDist, 128.0f, 16384.0f, 64.0f, "%.0f");
+          // THE ISOLATION KNOB. Scales every extinction coefficient (view rate, sigma_t, sigma_s,
+          // K_d) while leaving the model, the plane and the submerged guards live — unlike the
+          // UNIFIED checkbox above, which also swaps in the legacy fades and so cannot answer "what
+          // is left when the water is not fogging". At 0 the water absorbs nothing and whatever fog
+          // remains on screen is NOT water fog.
+          t.sliderF("Water fog: ABSORPTION master (0 = water absorbs nothing; isolation A/B)",
+                    &g_waterFogAbsorb, 0.0f, 1.0f, 0.05f, "%.2f");
           // TURBIDITY = the HUE of the ABSORPTION only, orthogonal to the rate above. 0 = the pure
           // inversion of UnderwaterColor, which is monotone R>G>B and therefore BLUE-windowed;
           // CDOM's blue-weighted absorption moves the window to GREEN and crosses over at t = 0.05,
@@ -12169,6 +12301,19 @@ namespace {
           // Watch it by looking DOWN from a height as well as up — the ground and the sea must not
           // move at ANY strength, because saturate(dir.z) is 0 below the eye's horizontal plane.
           t.sliderF("Fog: sample the SKY (0 = flat fog, the A/B)", &g_fogSkyStrength, 0.0f, 1.0f, 0.05f);
+          // EXPONENTIAL vs MW's LINEAR ramp. Only bites in the linear-colour build (the publish is
+          // gated on it too), so in the gamma A/B partner this tick does nothing and correctly so.
+          t.checkbox("Fog: EXPONENTIAL (Beer-Lambert; off = MW's linear ramp)", &g_fogExp);
+          // ⚠ CURVATURE, NOT DENSITY. Both endpoints are pinned to MW's fogStart/fogEnd whatever this
+          // reads, so it cannot make the far edge translucent or move where fog begins — it only
+          // decides how much of the extinction is spent EARLY. 0 = MW's linear ramp exactly (the
+          // bit-exact A/B). Density still comes from fogStart, i.e. from MW's weather.
+          t.sliderF("Fog: exp curvature (0 = MW linear; higher = more front-loaded)",
+                    &g_fogExpScale, 0.0f, 6.0f, 0.1f);
+          // Water's refraction/reflection UV distortion grows with distance because `dist` multiplies
+          // it; this is where it reaches zero (growth caps at half). 0 = unbounded, the old A/B.
+          t.sliderF("Water: distortion fade distance (0 = unbounded/legacy)",
+                    &g_waterDistortFar, 0.0f, 65536.0f, 512.0f);
           // How dark a surface goes as fog closes in, before it melts — the silhouette knob. 0 = the
           // surface melts straight from its own brightness with no darkening on the way. This sets how
           // dark; the SHAPE below sets where along the distance that darkness is spent, and both are
@@ -13406,6 +13551,74 @@ namespace ForgeRender {
     // SH1 sky-ambient publish is gated on exterior-ness, and it happens up with the per-frame camera
     // write, not down in the DL cull.
     extern bool g_dlExterior;
+
+    // ─── S3a: THE CALIBRATION SETPOINT ───────────────────────────────────────────────────────────
+    // The user's target mean display values, as `apl` (0..1). This table is the whole reason the
+    // gains are tunable against a number instead of an opinion, and it is deliberately written once
+    // HERE rather than in a comment: the exposure servo consumes exactly the same function later, so
+    // the setpoint the panel reports and the setpoint the servo drives to cannot drift apart.
+    //
+    // ⚠ AUTHORED, NOT MEASURED, and that is the design and not a shortcut. "It is a game, we can't do
+    // exposure windows" — a free-running meter driving every scene to 18% grey lands a cave and a
+    // noon exterior on the same number, erasing precisely the differences this table encodes. A
+    // metering loop may choose the PATH to the setpoint; it must never choose the setpoint.
+    //
+    // ⚠ EVERY TARGET IS A RANGE OR A PAIR — NOT ONE NUMBER, and collapsing one to a point is how the
+    // first interior reading came out wrong. Reported as `lo`/`hi` with no average invented between
+    // them, because the two ends mean different things in each row:
+    //
+    //   exterior day  80 / 128  — a PAIR (user: "128 80 is for exterior day"). Shadow is ambient
+    //                             alone, lit is ambient+sun, so the two TOGETHER pin the sun:ambient
+    //                             RATIO — the one quantity S3 exists to set, and the reason this row
+    //                             is worth more than the others. A frame mean cannot check a pair.
+    //   interior      40 / 50   — a RANGE of acceptable values (user: "40-50 for regular interiors").
+    //                             The first run compared against 50 alone and reported need=3.51x
+    //                             where the user's calibration said ~2.5x; against 40 the same frame
+    //                             asks 2.81x. Most of that disagreement was the missing lower end.
+    //   night         60        — a single value, so far.
+    struct CalTarget { float lo; float hi; const char* name; };
+    CalTarget calTarget() {
+        // MW's GameHour comes off the water params (g_waterFogHour <- waterParams[11], declared far
+        // above with the water-fog state). ⚠ It only refreshes on frames that carry water params, so
+        // a waterless interior can hold a stale hour — harmless, because the interior bucket does not
+        // consult the clock. An exterior always has a water plane.
+        // (No `extern` re-declaration: this file's globals have internal linkage, so a block-scope
+        // extern would declare a DIFFERENT, external-linkage entity that nothing defines.)
+        //
+        // ⚠ NO CAVE BUCKET, and the table has one ("darker for dark caves"). Nothing on the wire
+        // distinguishes a cave from a house, so every interior is reported against 40-50 — which
+        // overstates `need` in a cave by exactly the amount the cave is meant to be darker. A cave
+        // should therefore land BELOW 1.00x on this line and that is correct, not a miscalibration.
+        if (!g_dlExterior)         { return {  40.0f,  50.0f, "interior 40-50" }; }
+        const float h = g_waterFogHour;
+        if (h < 6.0f || h > 20.0f) { return {  60.0f,  60.0f, "night" }; }
+        return                              {  80.0f, 128.0f, "ext day shadow/lit" };
+    }
+
+    // ⚠ `need` IS A GAIN, AND A GAIN LIVES IN A DOMAIN. The APL instrument measures the DELIVERED
+    // image; the gains multiply values much earlier in the chain. `target/measured` is only the
+    // required gain when nothing nonlinear sits between the two, and something always does:
+    //
+    //   gamma build:  gain -> [tonemap] -> measured.          need = ratio of inverse-tonemapped
+    //   linear build: gain -> [encode] -> [tonemap] -> measured.   ...and inverse-ENCODED as well.
+    //
+    // In the gamma build the tonemap is near-linear at interior levels, so the raw ratio was right to
+    // ~1% and the distinction did not matter. Flipping to linear inserted a whole transfer function
+    // between the knob and the reading, and the raw ratio silently became a different quantity —
+    // reported 4.89x where the true linear gain was ~8.3x. That is the domain-transfer trap the plan
+    // warns about ([[feedback_prior_art_constants_dont_transfer]]) turned on the INSTRUMENT rather
+    // than on a constant, which is worse: a wrong constant gets tuned out, a wrong instrument teaches
+    // the wrong lesson every session.
+    //
+    // Note the sRGB TOE does most of the work at these levels: a measured level of 8/255 is below
+    // 0.04045 and therefore in the linear segment (slope 1/12.92), so the ratio is nothing like a
+    // naive `x^2.2` — which is exactly why this is computed with the real pair of functions and not
+    // with an exponent someone remembered.
+    double calGainDomain(double displayLevel255) {
+        const double d = std::max(0.0, std::min(1.0, displayLevel255 / 255.0));
+        const double preTone = (double)inverseTonemap((float)d);
+        return g_live.linearScene ? (double)srgbToLinearF((float)preTone) : preTone;
+    }
     // ...and the LAND cell grid's extent, for the same reason: SH2's height-map rebuild is recorded
     // at the very top of renderScene and has to stamp the grid the terrain residency uploaded into
     // its params cbuffer. Defined with the terrain globals far below.
@@ -13644,6 +13857,10 @@ namespace ForgeRender {
                 g_lastApl[i]   = a[i];
                 g_aplAccum[i] += (double)a[i];
             }
+            // S3a percentiles: uints [4..6], NOT asuint'd — they are display levels 0..255, so they
+            // are read as integers and averaged as such over the heartbeat window.
+            const uint32_t* pu = (const uint32_t*)g_live.pAplReadback->pCpuMappedAddress;
+            for (int i = 0; i < 3; ++i) { g_aplPctAccum[i] += (double)pu[4 + i]; }
             ++g_aplN;
         }
 
@@ -13783,6 +14000,26 @@ namespace ForgeRender {
                                                                         && waterParams[7] > 0.5f);
                 decodeAuthoredRGB(fdc + 20);   // sunCol
                 decodeAuthoredRGB(fdc + 24);   // ambCol
+                // S3a — the calibration gains, and THIS is the site precisely because of the ⚠ above:
+                // every later reader inherits from this one write, so the reflect / FP / sun cbuffer
+                // copies, lodSunAmb (fd[52..54]) and the vertex-lit distant statics all calibrate
+                // together with the near scene. A gain applied in a frag would reach whichever passes
+                // remembered it, which is how a near/far seam gets built.
+                //
+                // AFTER the decode, not before: the ratio being set is a ratio of RADIANCE. Scaling
+                // an authored display-referred value and decoding afterwards would put the gain
+                // through the transfer function too, making the knob's effect depend on the weather's
+                // brightness — a 2x at dusk and a 5x at noon.
+                //
+                // Ambient needs no companion elsewhere: skyAmbFactor() averages exactly 1 over the
+                // sphere (it redistributes ambient by direction without changing its level), so
+                // ambCol IS the ambient level and this is the only place it is set.
+                if (g_calSunGain != 1.0f) {
+                    fdc[20] *= g_calSunGain; fdc[21] *= g_calSunGain; fdc[22] *= g_calSunGain;
+                }
+                if (g_calAmbGain != 1.0f) {
+                    fdc[24] *= g_calAmbGain; fdc[25] *= g_calAmbGain; fdc[26] *= g_calAmbGain;
+                }
             }
             // Phase 1a/1b: lighting[24..27] = realEye.xyz + isExterior (appended by the client; the
             // scene-probe passes 0s). The near scene is camera-relative (eyePos=0); resident DL is in
@@ -14324,8 +14561,21 @@ namespace ForgeRender {
             // multiply a decoded texel by an un-decoded vertex colour — two domains in one product,
             // which is a hue shift, not a brightness one, and the hardest kind to attribute.
             cp[kToneFloat + 1] = g_live.linearScene ? 1.0f : 0.0f;
-            cp[kToneFloat + 2] = 0.0f;
+            // ...and the exponential fog's distance scale, 0 = MW's linear ramp (fog.h.fsl). Gated
+            // on linearScene as well as its own bool, because that is the ask: a physical extinction
+            // curve belongs with a physical colour domain, and shipping it into the gamma build
+            // would move the A/B partner's image and stop it being a partner.
+            cp[kToneFloat + 2] = (g_live.linearScene && g_fogExp)
+                                     ? std::max(0.1f, g_fogExpScale) : 0.0f;
             cp[kToneFloat + 3] = 0.0f;
+            // S3a — the emissive calibration gain, from the same unconditional block and for the
+            // identical reason: a receiver reading zero here would erase every self-illuminated
+            // surface in the frame, and "the lamps went black" must not be able to depend on whether
+            // some other subsystem came up. 1.0 is today's image byte for byte.
+            cp[kCalFloat + 0] = std::max(0.0f, g_calEmisGain);
+            cp[kCalFloat + 1] = 1.0f;   // reserved: the exposure servo's multiplier
+            cp[kCalFloat + 2] = 0.0f;
+            cp[kCalFloat + 3] = 0.0f;
         }
         // SH1 sky-directional ambient. Published from HERE — unconditionally, every frame, right
         // after the frame cbuffer's sky/sun colours were written above — rather than from
@@ -18532,7 +18782,12 @@ namespace ForgeRender {
                 p[8]  = waterParams ? waterParams[8]  : 0.0f;  // camFwd.x
                 p[9]  = waterParams ? waterParams[9]  : 0.0f;  // camFwd.y
                 p[10] = waterParams ? waterParams[10] : 1.0f;  // camFwd.z
-                p[11] = waterParams ? waterParams[6] : 0.0f;   // nearViewRange
+                // ⚠ REPURPOSED. This carried a copy of nearViewRange that NO water shader read —
+                // the live one is gFrameData.lodParams.w, which statics.vert gates the hero near-cut
+                // on. It is now the distance at which water's UV distortion has faded to zero; 0
+                // restores the old unbounded behaviour exactly. Group 3 is full, and this was the
+                // only dead lane in it.
+                p[11] = std::max(0.0f, g_waterDistortFar);
                 p[12] = waterFlagsWord();          // debug view (bits 0-1) + P4 Schlick (bit 2)
                 p[13] = waterAlphaBase(p[1]);      // WT4d sub-texel GGX alpha, wind-scaled
                 p[14] = (float)kReflectSize;       // gReflectMips side, for the reflection LOD
@@ -19676,7 +19931,7 @@ namespace ForgeRender {
                     bb.mNewState     = RESOURCE_STATE_COPY_SOURCE;
                     cmdResourceBarrier(g_live.pCmd, 1, &bb, 0, nullptr, 0, nullptr);
                     g_live.pCmd->mDx.pCmdList->CopyBufferRegion(
-                        g_live.pAplReadback->mDx.pResource, 0, g_live.pAplOut->mDx.pResource, 0, 16);
+                        g_live.pAplReadback->mDx.pResource, 0, g_live.pAplOut->mDx.pResource, 0, 32);
                     bb.mCurrentState = RESOURCE_STATE_COPY_SOURCE;
                     bb.mNewState     = RESOURCE_STATE_UNORDERED_ACCESS;
                     cmdResourceBarrier(g_live.pCmd, 1, &bb, 0, nullptr, 0, nullptr);
@@ -20249,14 +20504,40 @@ namespace ForgeRender {
                 const double apl = 0.299 * r + 0.587 * g + 0.114 * b;
                 const double geo = std::exp(g_aplAccum[3] * inv);
                 const double n   = (apl > 1.0e-6) ? (1.0 / apl) : 0.0;
+                // S3a: the same line now carries the SETPOINT this context is aimed at, and the
+                // factor still missing. Reported here rather than in the dev panel for three
+                // reasons: apl already lives on this line, the harness runs minimized with nobody
+                // at the panel, and t.label() is implicated in the 2026-08-07 null-resource crash
+                // (see the Resolve tab — it has had zero callers since).
+                // S3a: the DISTRIBUTION in display levels beside the mean, and the target as the
+                // RANGE or PAIR it actually is. `need` is computed off the frame MEAN, so it is only
+                // a gate where the target is also a frame mean — the first interior run reported
+                // 3.51x against the user's ~2.5x, and most of that was comparing a range's top end
+                // as if it were a point. What is left over is the mean-vs-region question, which is
+                // what p50/p90 are here to answer: a value someone reads off a lit surface is
+                // comparable to p90, never to the mean of a frame full of dark corners.
+                const CalTarget ct = calTarget();
+                const double meanLvl = apl * 255.0;
+                // ...in the domain the KNOBS live in, not in display levels — see calGainDomain().
+                const double gm = calGainDomain(meanLvl);
+                const double kLo = (gm > 1.0e-9) ? (calGainDomain(ct.lo) / gm) : 0.0;
+                const double kHi = (gm > 1.0e-9) ? (calGainDomain(ct.hi) / gm) : 0.0;
                 LOG::logline(">> [forge-hb] apl: mean=(%.4f,%.4f,%.4f) apl=%.4f geo=%.4f"
-                             " cast=(%.3f,%.3f,%.3f) n=%u",
-                             r, g, b, apl, geo, r * n, g * n, b * n, g_aplN);
+                             " cast=(%.3f,%.3f,%.3f) n=%u | lvl mean=%.0f p10=%.0f p50=%.0f p90=%.0f"
+                             " | target[%s]=%.0f-%.0f need=%.2f-%.2fx(%s)"
+                             " cal=(sun %.2f amb %.2f emis %.2f)",
+                             r, g, b, apl, geo, r * n, g * n, b * n, g_aplN,
+                             meanLvl, g_aplPctAccum[0] * inv, g_aplPctAccum[1] * inv,
+                             g_aplPctAccum[2] * inv,
+                             ct.name, ct.lo, ct.hi, kLo, kHi,
+                             g_live.linearScene ? "linear" : "gamma",
+                             g_calSunGain, g_calAmbGain, g_calEmisGain);
             }
             dlLogHeartbeat();
             g_recAccum = 0.0;
             g_gpuAccum = 0.0;
             g_aplAccum[0] = g_aplAccum[1] = g_aplAccum[2] = g_aplAccum[3] = 0.0;
+            g_aplPctAccum[0] = g_aplPctAccum[1] = g_aplPctAccum[2] = 0.0;
             g_aplN = 0;
         }
         return true;
@@ -23913,7 +24194,10 @@ namespace ForgeRender {
             p[4] = depthBase[0]; p[5] = depthBase[1]; p[6] = depthBase[2];
             p[7] = underwater ? 1.0f : 0.0f;
             p[8]  = camFwd[0]; p[9] = camFwd[1]; p[10] = camFwd[2];
-            p[11] = 0.0f;                                   // nearViewRange (viewer has no near scene)
+            p[11] = std::max(0.0f, g_waterDistortFar);      // UV-distortion fade distance (was a
+                                                            // dead nearViewRange copy; see the live
+                                                            // pass). Matched so the viewer cannot
+                                                            // disagree with the game about water.
             p[12] = waterFlagsWord();          // debug view (bits 0-1) + P4 Schlick (bit 2)
             p[13] = waterAlphaBase(p[1]);      // WT4d sub-texel GGX alpha, wind-scaled
             p[14] = (float)kReflectSize;       // gReflectMips side, for the reflection LOD
@@ -26906,8 +27190,24 @@ namespace ForgeRender {
         const bool active = g_waterFog && g_waterFogOn;
         mp[kWaterFogPlaneFloat + 0] = g_waterFogZ;
         mp[kWaterFogPlaneFloat + 1] = active ? 1.0f : 0.0f;
-        mp[kWaterFogPlaneFloat + 2] = (active && g_waterFogUnder) ? 1.0f : 0.0f;
-        mp[kWaterFogPlaneFloat + 3] = 0.0f;
+        // ⚠ camUnder IS A GEOMETRIC FACT AND MUST NOT RIDE THE FEATURE TOGGLE. It used to be
+        // `active && g_waterFogUnder`, which made "is the camera under the surface" false whenever
+        // the unified extinction was switched off — and that answer feeds the guard that keeps MW's
+        // AIR fog off submerged pixels (fog.h.fsl). So turning the water fog off to isolate it
+        // silently re-admitted atmospheric fog underwater: the act of isolating produced the
+        // symptom, which is the worst kind of A/B because the control arm is the broken one.
+        // Reported exactly that way — "removed scattering and visibility maxed, underwater is
+        // getting fogged like above water".
+        //
+        // `g_waterFogOn` STAYS in the test: that is "this cell has water at all", without which
+        // g_waterFogUnder is meaningless. Only the feature knob comes out.
+        mp[kWaterFogPlaneFloat + 2] = (g_waterFogOn && g_waterFogUnder) ? 1.0f : 0.0f;
+        // .w = "this cell HAS a water plane", independent of the feature toggle AND of the camera.
+        // The per-fragment air-fog test (fog.h.fsl) compares a world Z against waterFogPlane.x, and
+        // .x is a latch — in a waterless cell it still holds whatever was last seen, so without this
+        // the test would suppress fog on everything below a stale plane. .y cannot serve: it carries
+        // the feature toggle, and the fragment test must keep working with the model switched off.
+        mp[kWaterFogPlaneFloat + 3] = g_waterFogOn ? 1.0f : 0.0f;
         if (!active) {
             // Not stale data behind a disarmed gate: a captured frame should show what the receiver
             // would read, and 0 extinction is also the honest answer if the gate is ever bypassed.
@@ -27114,6 +27414,37 @@ namespace ForgeRender {
             mp[kWaterFogKdFloat + 3] = kdS;
             mp[kWaterFogExtFloat + 3]     = std::max(0.0f, std::min(g_waterVolumetric, 1.0f));
             mp[kWaterFogScatterFloat + 3] = std::max(g_waterInscatterGain, 0.0f);
+
+            // ─── ABSORPTION MASTER, FOR ISOLATION ────────────────────────────────────────────────
+            // ⚠ THE FEATURE TOGGLE IS NOT AN ISOLATION KNOB, and that is why this exists. Switching
+            // g_waterFog off does four things at once: it drops the unified extinction, restores the
+            // three legacy private fades, flips uwUnified to the legacy branch, and (until the fix
+            // above) turned off the camera-submerged fact that keeps MW's air fog out of the water.
+            // So "turn it off and see what is left" could not answer the question it was asked —
+            // reported as "no turn off knob for them so I can't truly tell it".
+            //
+            // This scales ONLY the extinction coefficients, with the model, the plane, the guards
+            // and the target all still live. At 0 the view optical depth is identically 0, so
+            // trans = exp(0) = 1 and the refraction passes through untouched — and the in-scatter
+            // goes with it for free, because waterInscatterSeg's (e0 - e1) collapses when sigma_t
+            // does. One knob, and what remains on screen is then genuinely NOT the water.
+            //
+            // Applied here, after every coefficient is derived, so it cannot disturb the spectral
+            // RATIOS the derivation above is careful about — it is a scale on the whole spectrum,
+            // never a per-channel edit ([[feedback_model_class_not_knobs]]).
+            const float absorb = std::max(0.0f, std::min(g_waterFogAbsorb, 1.0f));
+            if (absorb != 1.0f) {
+                for (int i = 0; i < 3; ++i) {
+                    mp[kWaterFogExtFloat + i]     *= absorb;
+                    mp[kWaterFogScatterFloat + i] *= absorb;
+                    mp[kWaterFogKdFloat + i]      *= absorb;
+                }
+                // ...and the VIEW rate in waterFogCol.w, which is the one the surface path uses
+                // directly (waterFogSample -> 1 - exp(-k*L)). Missing it would leave the water
+                // surface fogged while everything under it went clear — a half-off state that looks
+                // like a new bug rather than like the knob.
+                mp[kWaterFogColFloat + 3] *= absorb;
+            }
 
             mp[kWaterFogPhaseFloat + 0] = g_waterPhaseFwdG;
             mp[kWaterFogPhaseFloat + 1] = std::max(g_waterPhaseFwdGain, 0.0f);

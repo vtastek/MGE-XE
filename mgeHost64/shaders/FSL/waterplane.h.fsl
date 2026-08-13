@@ -1,0 +1,64 @@
+// mgeHost64 — "where is the water plane, and am I under it", and nothing else.
+//
+// Split out of waterfog.h.fsl so that fog.h.fsl can ask the question WITHOUT pulling in the whole
+// extinction model. Both of these are single gShadowParams lane reads with no texture, sampler or
+// gFrameData dependency, which is what makes them safe to include from a VERTEX stage — the rest of
+// waterfog.h.fsl (path lengths, the closed-form column, the phase function) is not.
+//
+// ⚠ ONE DEFINITION, DELIBERATELY. The alternative was to re-read waterFogPlane.yz in fog.h.fsl and
+// leave a comment asking the next person to keep the two in step. "Am I underwater" is answered in
+// six shaders across two stages; a second spelling of it is a bug waiting for the day one of them
+// changes. waterfog.h.fsl includes this file rather than defining them.
+
+#ifndef WATER_PLANE_H
+#define WATER_PLANE_H
+
+// Is the unified water fog live at all? The host clears waterFogPlane.y when the feature is off, so
+// everything downstream collapses to the pre-feature image through this one test.
+bool waterFogActive()
+{
+    return gShadowParams.waterFogPlane.y >= 0.5f;
+}
+
+// ⚠ TWO QUESTIONS, AND MERGING THEM WAS A BUG. "Is the camera under the surface" is GEOMETRY; "is
+// the unified water fog live" is POLICY. They were one function ANDed together, and the host ANDed
+// the camUnder lane with the same toggle a second time, so switching the water fog off to isolate it
+// also answered "no" to the geometric question. That answer feeds the guard keeping MW's AIR fog off
+// submerged pixels — so the isolation run was the one that fogged underwater like above water. A
+// control arm that breaks the thing it is controlling for cannot be reasoned from.
+//
+// Use waterCameraSubmerged() for anything about where the EYE is — above all, for suppressing MW's
+// air ramp, whose meaning changes at the surface (distantland.cpp:763 swaps the whole range) whether
+// or not we model the water. Use waterFogCameraSubmerged() only to pick between the unified model
+// and the legacy fades, which genuinely is a question about the feature.
+
+// Pure geometry: is the eye below the water plane, in a cell that has water? No feature test.
+bool waterCameraSubmerged()
+{
+    return gShadowParams.waterFogPlane.z > 0.5f;
+}
+
+// Does this cell HAVE a water plane at all? Independent of both the feature toggle and the camera,
+// because a per-FRAGMENT test needs to know the plane is real before comparing a Z against it — in a
+// waterless cell waterFogPlane.x is whatever was last latched, and comparing against stale geometry
+// would silently unfog half an interior.
+bool waterPlaneValid()
+{
+    return gShadowParams.waterFogPlane.w > 0.5f;
+}
+
+// The water plane in the CAMERA-RELATIVE space every stage works in (eye at the origin). Same
+// derivation volfog.frag.fsl:101 uses, from the same absolute Z, so no two features can disagree
+// about where the water is.
+float waterPlaneRelZ()
+{
+    return gShadowParams.waterFogPlane.x - gFrameData.lodEye.z;
+}
+
+// ...and the same, AND the unified model live. Model selection only.
+bool waterFogCameraSubmerged()
+{
+    return waterFogActive() && waterCameraSubmerged();
+}
+
+#endif // WATER_PLANE_H

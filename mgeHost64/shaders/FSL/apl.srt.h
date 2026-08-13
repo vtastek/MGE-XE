@@ -42,9 +42,14 @@ BEGIN_SRT(AplSrtData)
 #else
         DECL_TEXTURE(PerBatch, Tex2D(float4), gAplColor)
 #endif
-        // 4 uints = asuint(mean R, mean G, mean B, mean logLuma). uint element type + asuint(),
-        // matching gInstOut in cull.srt.h — the merged compute rootsig has no float-typed RWBuffer
-        // and this is not the place to introduce one.
+        // 8 uints: [0..3] = asuint(mean R, mean G, mean B, mean logLuma), [4..6] = the p10 / p50 /
+        // p90 luma DISPLAY LEVELS (0..255, plain integers, no asuint), [7] spare. uint element type
+        // + asuint() for the float half, matching gInstOut in cull.srt.h — the merged compute
+        // rootsig has no float-typed RWBuffer and this is not the place to introduce one.
+        //
+        // The percentiles are S3a's doing: the calibration targets are readings off a REGION ("128
+        // for lit parts"), and a frame mean is not the same statistic — comparing them overstated an
+        // interior's gap as 3.51x where the real one was nearer 2.5x. See apl.comp.fsl.
         DECL_RWBUFFER(PerBatch, RWBuffer(uint), gAplOut)
     END_SRT_SET(PerBatch)
 END_SRT(AplSrtData)

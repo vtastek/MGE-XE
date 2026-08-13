@@ -18,6 +18,7 @@
 // floor are all resolved host-side; the VS only billboards + projects).
 
 #include "opaque.srt.h"
+#include "fog.h.fsl"    // mwFogFactor() — ONE fog law for every stage
 
 STRUCT(VSInput)
 {
@@ -70,7 +71,8 @@ VSOutput VS_MAIN( VSInput In )
     // happens to be drawn as a quad, so a fog gradient across its own face would be meaningless — and
     // the same reasoning already makes Colour and Intensity flat. centre is camera-relative, so its
     // length is the eye distance directly (eyePos is the origin in the live frame).
-    Out.Fog = saturate((gFrameData.fogParams.y - length(centre))
-                       / (gFrameData.fogParams.y - gFrameData.fogParams.x));
+    // centre is camera-relative AND identical at all four corners of the billboard, so the
+    // submerged step cannot be interpolated across this quad — the one place it is safe in a VS.
+    Out.Fog = mwFogAir(mwFogFactor(length(centre)), centre);
     RETURN(Out);
 }

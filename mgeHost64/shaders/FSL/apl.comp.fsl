@@ -31,6 +31,19 @@
 
 GroupShared(float4, g_apl[256]);
 
+// S3a — A MEAN IS THE WRONG STATISTIC FOR THE CALIBRATION TARGETS, and one interior run proved it:
+// the instrument asked for 3.51x where the user's own calibration said ~2.5x. The targets that
+// matter ("128 for lit parts, 80 for shadow parts") are readings off a REGION of the frame, and a
+// frame mean is not comparable to one — an interior is mostly dark corners, so its mean sits far
+// below any surface you would point at. Comparing the two silently overstates the gap.
+//
+// So the instrument reports the DISTRIBUTION as well as its mean. 256 bins, one per display level,
+// because that is the unit the targets are stated in and it needs no conversion to read. p50 is the
+// typical pixel; p90 is close to what "a lit surface" means when someone reads a value off an image;
+// the p90/p10 spread is the frame's contrast, which is the thing the sun:ambient ratio actually sets
+// and the thing a single mean can never show. 1 KB of LDS and one atomic per sample.
+GroupShared(uint, g_hist[256]);
+
 ROOT_SIGNATURE(ComputeRootSignature)
 NUM_THREADS(256, 1, 1)
 void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
@@ -43,6 +56,10 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
     float  invGrid = 1.0f / max(gAplParams.dims.z, 1.0f);
 
     float4 acc = float4(0.0f, 0.0f, 0.0f, 0.0f);
+
+    // One bin per thread — exactly 256 of each, so the clear needs no loop and no bounds test.
+    g_hist[tid] = 0u;
+    GroupMemoryBarrier();
 
     // Strided walk over the lattice. No barriers in here, so the divergent tail is free.
     for (uint i = tid; i < grid * grid; i += APL_THREADS)
@@ -62,6 +79,11 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
         // Geometric mean => arithmetic mean of the log. The floor keeps log() off -inf on a black
         // pixel; interiors and night skies have plenty of those and one -inf poisons the whole sum.
         acc.a += log(max(luma, 1.0e-5f));
+        // ...and the same luma into its display level. Rounded, not truncated, so bin k holds the
+        // pixels that would be WRITTEN as level k rather than those in [k, k+1).
+        uint bin = (uint)clamp(luma * 255.0f + 0.5f, 0.0f, 255.0f);
+        uint prevCount;
+        AtomicAdd(g_hist[bin], 1u, prevCount);
     }
 
     g_apl[tid] = acc;
@@ -85,6 +107,35 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
         gAplOut[1] = asuint(m.g);
         gAplOut[2] = asuint(m.b);
         gAplOut[3] = asuint(m.a);
+
+        // Percentiles, by one serial walk of 256 bins on one thread. A parallel scan would be the
+        // reflex and would be slower here: this is 256 adds against the barrier traffic of an
+        // 8-step scan, and the group has nothing else left to do. Every sample was binned exactly
+        // once, so the total is the lattice count and needs no separate reduction.
+        uint total = (uint)(gAplParams.dims.z * gAplParams.dims.z);
+        uint t10   = (uint)(0.10f * (float)total);
+        uint t50   = (uint)(0.50f * (float)total);
+        uint t90   = (uint)(0.90f * (float)total);
+        uint run   = 0u;
+        uint p10   = 255u;
+        uint p50   = 255u;
+        uint p90   = 255u;
+        bool got10 = false;
+        bool got50 = false;
+        bool got90 = false;
+        LOOP for (uint bi = 0u; bi < 256u; ++bi)
+        {
+            run += g_hist[bi];
+            if (!got10 && run >= t10) { p10 = bi; got10 = true; }
+            if (!got50 && run >= t50) { p50 = bi; got50 = true; }
+            if (!got90 && run >= t90) { p90 = bi; got90 = true; }
+        }
+        // Display LEVELS (0..255), not normalised floats — the calibration targets are stated as
+        // levels, so this is the one place a raw integer is more readable than a ratio.
+        gAplOut[4] = p10;
+        gAplOut[5] = p50;
+        gAplOut[6] = p90;
+        gAplOut[7] = 0u;
     }
     RETURN();
 }

@@ -37,7 +37,8 @@
 #ifndef WATER_FOG_H
 #define WATER_FOG_H
 
-#include "phase.h.fsl"   // hgNorm / phaseDualLobe — W8's in-scatter is directional
+#include "phase.h.fsl"       // hgNorm / phaseDualLobe — W8's in-scatter is directional
+#include "waterplane.h.fsl"  // waterFogActive() / waterFogCameraSubmerged() — the two lane reads
 
 // The water plane in the CAMERA-RELATIVE space every colour frag's WorldPos is in: negative when the
 // camera is above the surface. Derived the identical way volfog.frag.fsl:101 derives it, from the
@@ -144,10 +145,9 @@ float waterPathLength(float3 worldPosRel, float waterRelZ, bool camUnder)
 // Is the unified model live this frame? The A/B gate, and the one thing a caller has to ask before
 // it may retire a private fade of its own: with this false, every helper below is inert and the
 // caller must fall back to exactly what it did before.
-bool waterFogActive()
-{
-    return gShadowParams.waterFogPlane.y >= 0.5f;
-}
+// waterFogActive() / waterFogCameraSubmerged() now live in waterplane.h.fsl (included above), so the
+// vertex stages can ask "am I underwater" without this file's extinction machinery. Same functions,
+// same lanes, one definition.
 
 // BOTH numbers a caller needs, from ONE length():
 //   x = the water fog factor, 0 = clear, 1 = fully fogged.
@@ -550,15 +550,6 @@ float3 waterFogVeil(float3 worldPosRel)
 float waterFogVolStrength()
 {
     return gShadowParams.waterFogExt.w;
-}
-
-// Is the camera itself under the surface, with the feature live? The one question callers need that
-// is policy-shaped rather than geometric: below the surface the ENTIRE view ray is in water, so
-// MW's air ramp is not an approximation over the submerged segment, it is a second fog over the
-// same segment — replaced, not composed.
-bool waterFogCameraSubmerged()
-{
-    return waterFogActive() && gShadowParams.waterFogPlane.z > 0.5f;
 }
 
 #endif // WATER_FOG_H

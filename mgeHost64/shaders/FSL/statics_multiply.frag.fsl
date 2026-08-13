@@ -23,6 +23,7 @@
 // layer's alpha belongs to its own texture, not to the silhouette.
 
 #include "opaque.srt.h"
+#include "fog.h.fsl"     // mwFogAir() — per-pixel submerged test
 #include "tonemap.h.fsl"    // (scenecolor.h.fsl's prerequisite; the curve itself is never called here)
 #include "linearize.h.fsl" // srgbToLinear()/mod2xLinear() — the scene's transfer function (step 5)
 #include "scenecolor.h.fsl" // mod2xStage() — the near path's twin op, in the scene's domain
@@ -65,6 +66,6 @@ float4 PS_MAIN( VSOutput In )
     // ⚠ THIS PASS WRITES A MULTIPLIER, NOT A COLOUR (scenecolor.h.fsl's fourth, class-less case), so
     // it takes no decode of its own: a scale factor has no units. It does still need mod2xStage
     // above, because THAT is about what "twice as bright" means, which is a units question.
-    float3 m = lerp(float3(1.0f, 1.0f, 1.0f), t, saturate(In.Fog));
+    float3 m = lerp(float3(1.0f, 1.0f, 1.0f), t, saturate(mwFogAir(In.Fog, In.WorldPos)));
     RETURN(float4(m, 1.0f));
 }

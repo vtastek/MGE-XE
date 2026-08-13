@@ -1,0 +1,210 @@
+// mgeHost64 — MW's distance fog scalar, in ONE place.
+//
+// `fog` is MW's convention throughout the renderer: 1 = clear, 0 = fully fogged. Six vertex stages
+// and water.frag each carried their own copy of the same two-line expression, which was fine while
+// there was one law and is not fine now that there are two.
+//
+// ─── WHY THERE ARE TWO ────────────────────────────────────────────────────────────────────────────
+// MW's fog is LINEAR in distance. Real extinction is exponential — Beer-Lambert, the same law the
+// water fog already runs on (waterfog.h.fsl) and the same law the volumetric march integrates. A
+// linear ramp is not a coarse approximation of that; it is a different shape, with a hard onset at
+// `start` where the derivative jumps from 0, and a hard end at `end` where it jumps back. Both
+// corners are visible on a long vista as a band, which is what an exponential does not have.
+//
+// The migration to a linear colour domain is what makes this worth doing rather than merely correct:
+// fog is a LERP toward a bright target, so its shape lands directly on the tone response, and a
+// physical curve composed in a physical domain is the pair that actually behaves. Hence the gate —
+// see the scale lane below.
+//
+// ─── THE PORTED FORM WAS TRIED FIRST, AND IT DOES NOT SURVIVE A 16-CELL DRAW DISTANCE ─────────────
+// MGE XE has shipped an exponential fog mode on the DX9 path for years (`distantland.cpp:817` +
+// `XE Common.fx:160`), and v1 of this header reused its derivation verbatim:
+//
+//     expStart = fogStart/S;  expDiv = (fogEnd - expStart)/S;  fog = saturate(exp(-(d-expStart)/expDiv))
+//
+// whose whole point is that at d == fogEnd the exponent is exactly S for every fogStart, so the fog
+// WALL is pinned and fogStart is left free to be the density. Elegant, and measured in play at clear
+// weather / 16 cells (fogStart 4.2, fogEnd 16) it is unusable:
+//
+//     4.2 cells (MW's fog START):  61% fogged   (MW linear: 0%)
+//     8   cells:                   87% fogged   (MW linear: 32%)
+//
+// ⚠ AND IT IS NOT A MIS-PORT — with Clear Fog Offset 0 the DX9 path's own `expCorrection` is
+// identically 0, so DX9 renders the same thing. S = 4.4 was chosen against MGE's older, far shorter
+// fog ranges. Porting the MECHANISM was right; porting its CONSTANT was not
+// ([[feedback_prior_art_constants_dont_transfer]]).
+//
+// ⚠ AND THE FAILURE IS STRUCTURAL, NOT A BAD NUMBER, which is why the fix is a different form and
+// not a smaller S. In that form S *is* the far-end opacity, so the two things wanted here are one
+// knob pulling in opposite directions: lower it for a clear mid-field and the fog no longer
+// saturates at fogEnd, which uncovers the draw-distance edge (reported the same session: "at the
+// edge of view distance, water surface reveals a bit of deep colored, unfogged underwater"). Pure
+// Beer-Lambert cannot do both, because MW does not use fogEnd as air — it uses it as the CURTAIN
+// over the world's edge, and a curtain has to be opaque.
+//
+// ─── SO: THE EXPONENTIAL SHAPE, WITH MW'S ENDPOINTS AND NO CORNERS ────────────────────────────────
+// Normalise the exponential onto the same two endpoints the linear ramp has, and put the ramp
+// parameter in SQUARED so neither endpoint has a slope discontinuity:
+//
+//     t   = saturate((dist - fogStart) / (fogEnd - fogStart))  // 0 .. 1 across the ramp
+//     fog = (exp(-S*t*t) - exp(-S)) / (1 - exp(-S))
+//
+//   fog(fogStart) == 1 exactly, and leaves it with slope 0   — no wall (see the t*t note below)
+//   fog(fogEnd)   == 0 exactly                               — the curtain still hangs
+//   S == 0        -> MW's LINEAR ramp, bit-exact (its own branch, not a limit)
+//
+// S stops being an opacity and becomes pure CURVATURE — how front-loaded the extinction is, which is
+// the part of Beer-Lambert that is actually visible as "physical": most of the contrast spent in the
+// middle distance, ridges staying separable instead of converging. It buys the shape without buying
+// the constraint that made the shape unusable.
+//
+// fogStart still sets the DENSITY — it is what MW's weather system varies, and moving it in still
+// moves the whole curve in. That part of the ask is unchanged.
+//
+// (For the record: MGEgui writes an "Exponential Distance Multiplier" (2.5-5.0, default 4.0) into
+// MGE.ini that NOTHING reads. It is not evidence about any of these numbers.)
+//
+// ─── THE GATE ─────────────────────────────────────────────────────────────────────────────────────
+// gShadowParams.toneParams.z carries S itself, and 0 means "MW's linear ramp". One lane holds both
+// the mode and the constant, so there is no way to be in exponential mode with no scale or vice
+// versa. The host writes it as `(linearScene && g_fogExp) ? g_fogExpScale : 0`, which keeps the
+// gamma build byte-identical and leaves an A/B that costs a dev-panel tick.
+//
+// Requires gFrameData.fogParams + gShadowParams.toneParams (include AFTER opaque.srt.h).
+
+#ifndef MW_FOG_H
+#define MW_FOG_H
+
+#include "waterplane.h.fsl"   // waterCameraSubmerged() — one gShadowParams lane read, no more
+
+// How far BELOW the plane a fragment must sit before it starts counting as submerged. The water mesh
+// rides a few units off the true surface, and the surface itself must keep its air fog — it is seen
+// through air. 8 units is ~11 cm.
+#define MW_FOG_WATER_BIAS 8.0f
+
+// ...and how far below THAT the changeover takes to complete.
+//
+// ⚠ MSAA CANNOT HELP A SHADER-SIDE BRANCH, which is why this exists rather than a wider bias. A
+// hard `if` returns the same answer for every sample in a pixel, so multisampling has nothing to
+// average — the boundary aliases at full pixel granularity no matter how many samples are taken, and
+// widening the bias only MOVES the jagged line. Reported as "subtle aliasing" once the test went
+// per-pixel. The only fix for a step evaluated in the shader is to stop it being a step.
+//
+// smoothstep, not a linear ramp, for the reason the fog wall taught earlier today: a continuous value
+// with a discontinuous SLOPE still reads as an edge. This is C1 at both ends.
+//
+// 96 units is ~1.4 m of depth. It has to be small enough that a shallow beach does not turn into a
+// wide smear (the band's SCREEN width is the depth band divided by the terrain slope, so a flat
+// shore stretches it) and large enough to cover a pixel's worth of depth at grazing angles. If it
+// needs dialling in play it wants a lane — this is a #define like MW_FOG_WATER_BIAS and
+// FOG_SKY_SATURATION_KNEE, so changing it costs a host restart.
+#define MW_FOG_WATER_FEATHER 96.0f
+
+// ⚠ THE SUBMERGED TEST IS NOT IN HERE, AND THAT IS THE POINT — see mwFogAir below. It was, briefly,
+// as an extra `relZ` argument, and it produced "shorelines look vertex interpolated ... leaking
+// underwater colors": a BINARY test evaluated per VERTEX and then interpolated. A triangle
+// straddling the waterline got fog = 1 at one corner and the real ramp at the other, and every pixel
+// between them a linear blend of two answers that were never on the same curve. Interpolating a step
+// function does not approximate it; it invents a ramp that belongs to neither side.
+//
+// This function is now purely the smooth distance ramp, which is what interpolation is FOR.
+float mwFogFactor(float dist)
+{
+    // ⚠ NO AIR FOG WHILE THE EYE IS UNDER THE SURFACE, AND THE GUARD BELONGS HERE — at the PRODUCER,
+    // not at each consumer. applyFog() has carried its own copy of this test for a while, which
+    // covered the six lit paths and silently missed the three that read In.Fog raw:
+    //
+    //     glow.frag           fg = saturate(In.Fog)                     — additive glow, attenuated
+    //     statics_add         tex.rgb * saturate(In.Fog)                — additive glow map
+    //     statics_multiply    lerp(1, t, saturate(In.Fog))              — multiply stage toward white
+    //
+    // Those are precisely the ADDITIVE and MULTIPLY blend passes, which is why the leak showed up as
+    // "seen through alpha blending". Underwater, MW swaps its whole fog range (distantland.cpp:763:
+    // start -4096, end 2458), so In.Fog is 0.375 at ZERO distance — every additive glow lost 62% of
+    // itself at arm's length, and every multiply stage was pushed 62% toward white, on a scalar that
+    // stopped meaning "air" the moment the camera went under.
+    //
+    // Guarding the producer fixes all ten consumers at once and cannot be missed by the eleventh.
+    // applyFog's own `fogAir = 1` is now redundant — harmless, and left in place because it states
+    // the same intent locally where the water-share algebra can be read beside it.
+    // The CAMERA test is safe at any stage: it is frame-uniform, so every vertex of every triangle
+    // agrees and there is nothing for the rasteriser to blend between.
+    if (waterCameraSubmerged()) { return 1.0f; }
+
+    float fogStart = gFrameData.fogParams.x;
+    float fogEnd   = gFrameData.fogParams.y;
+    float S        = gShadowParams.toneParams.z;
+
+    // ⚠ FLOORED, and not for tidiness: interiors set fogStart from MW's fog DENSITY and can put it
+    // within a hair of fogEnd (distantland.cpp:801 lerps one to the other), driving the ramp length
+    // to 0 and the quotient to inf. The linear spelling has the identical degeneracy and is guarded
+    // the same way upstream ("avoid density == 0 ... the denominator goes to infinity"). One world
+    // unit is far below anything either curve can show.
+    float span = max(fogEnd - fogStart, 1.0f);
+    float t    = saturate((dist - fogStart) / span);   // 0 at fogStart, 1 at fogEnd
+
+    if (S > 0.0f)
+    {
+        // ⚠ THE EXPONENT IS t*t, AND THE SQUARE IS THE WHOLE POINT — it is what removes the WALL.
+        //
+        // v2 used exp(-S*t) and put a hard edge at fogStart, reported as "a wall of fog about 3-4
+        // cells away, it isn't smooth at all" at exactly MW's 4.2-cell fog start. The cause is the
+        // SLOPE there, not the value: fog is pinned at 1 for everything nearer, and d/dt of
+        // (exp(-S t) - e^-S)/(1 - e^-S) at t = 0 is -S/(1 - e^-S), which is -2.31 at S = 2 against
+        // MW's linear -1.0. Pinning the value while leaving the derivative free made a corner MW
+        // already had into one 2.3x sharper. A curve does not read as smooth because it is
+        // continuous; it reads as smooth because its DERIVATIVE is.
+        //
+        // t*t sends that derivative to exactly 0 at t = 0 (d/dt exp(-S t^2) = -2 S t exp(...)), so
+        // the fog now LEAVES fogStart tangentially — there is no edge to see at any S. At the far
+        // end the slope is -2S e^-S/(1 - e^-S) = -0.63 at S = 2, GENTLER than linear's -1.0, so the
+        // fog wall does not reappear at the other corner either. All the steepness moves to the
+        // middle of the ramp, which is where nothing is standing to show it.
+        //
+        // ⚠ AND IT IS NO LONGER UNIFORM-DENSITY BEER-LAMBERT, which is worth stating plainly rather
+        // than dressing up. A squared exponent is a density rising LINEARLY with distance. That is
+        // still a physical medium — a graded haze — and it is the only kind that can be what MW's
+        // data describes: uniform density has NO clear near field, so a curve pinned clear at
+        // fogStart and opaque at fogEnd cannot be uniform-density whatever we do to it. Measured
+        // against MW's ramp at clear/16 cells this lands 22% fogged at 8 cells (linear 32%, and the
+        // ported 4.4 form 87%), converging back onto the linear ramp's density by the far third.
+        float x = S * t * t;
+        float e = exp(-S);
+        return saturate((exp(-x) - e) / (1.0f - e));
+    }
+
+    // MW's linear ramp — algebraically the exact expression every call site carried before.
+    return 1.0f - t;
+}
+
+
+// ─── THE SUBMERGED TEST, PER PIXEL ────────────────────────────────────────────────────────────────
+// "just put if (world.z < waterlevel) return for global exponential fog, it is not for underwater"
+// (user, 2026-08-13). Applied to an ALREADY-INTERPOLATED fog scalar, in the fragment stage, because
+// the test is a step and a step must not be interpolated (see mwFogFactor).
+//
+// WHY THE AIR FOG HAS NO BUSINESS UNDER THE SURFACE. The eye can be in air while the fragment is
+// not, and applyFog divides that ray between the two media by `wf.y`, fogging the air share. That is
+// physically honest and reads wrong, because the air share GROWS WITH CAMERA HEIGHT — len/d =
+// p/(h+p) for a seabed at depth p seen from height h — so climbing piled atmospheric fog onto the
+// seabed. Reported as "distant underwater is still getting the same above fog", and before that as
+// "refraction gets stronger with camera altitude": one cause, two symptoms. One medium per pixel,
+// chosen by where the surface you are looking at actually is.
+//
+// Cheaper than the share, too: one compare against a plane, no path length.
+//
+// worldPosRel = the fragment's CAMERA-RELATIVE world position, which every lit frag already carries
+// for shadows and point lights.
+float mwFogAir(float fog, float3 worldPosRel)
+{
+    if (!waterPlaneValid()) { return fog; }
+
+    // Depth below the point where the changeover starts. Positive = submerged.
+    float below = (waterPlaneRelZ() - MW_FOG_WATER_BIAS) - worldPosRel.z;
+    // 0 at the bias line, 1 a feather deeper. `1` is "no air fog", so this LERPS TOWARD 1 rather
+    // than returning it — the shoreline crosses over instead of switching.
+    float t = smoothstep(0.0f, MW_FOG_WATER_FEATHER, below);
+    return lerp(fog, 1.0f, t);
+}
+
+#endif // MW_FOG_H
