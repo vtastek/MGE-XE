@@ -2602,7 +2602,6 @@ namespace {
     // MW spawns one per ~14.2 units an actor travels through water, so a moving actor arrives as
     // a TRAIN of these and the overlapping ring packets are the wake.
     constexpr unsigned kMaxActorRipples = 64;   // MUST match IPC::kMaxActorRipples
-    constexpr unsigned kActorRippleSlot = 16;   // first worlds[] matrix; 4 ripples per slot
     float              g_actorRipples[kMaxActorRipples * 4] = {};
     unsigned           g_actorRippleCount = 0;
     // MW's weather fog colour AS AUTHORED — before the step-6a lift and the step-5 decode that
@@ -10556,26 +10555,6 @@ namespace {
     float g_rainDensity  = 0.0f;    // 0..1 active cells — the MANUAL value, used when the weather
                                     // drive below is off. Default 0 = dry, so the A/B is the default.
 
-    // ---- R2 actor ripples: their OWN wavelength and reach, deliberately not R1's ----------------
-    // An actor displaces something the size of a body; a raindrop displaces a drop. Sharing R1's
-    // numbers would put a 20-unit, 2-5 unit-wavelength rain ring under a swimming Nord.
-    //
-    // These also decide what the wake LOOKS like, and the honest description of the default is a
-    // BAND, not a Kelvin wedge. MW spawns one impulse per ~14.2 units travelled (measured), so with
-    // a 2-5 unit wavelength consecutive rings sit 3-7 wavelengths apart and carry no phase relation
-    // to each other — they overlap into a continuous disturbance rather than interfering into a
-    // wedge. A real wedge needs the impulse spacing to be small against the wavelength, i.e. a
-    // lambda up near the spacing itself; that is what lamMin/lamMax being this large starts to buy,
-    // and it is the axis to push if the band reads as too fizzy.
-    float g_actRipAmp    = 0.35f;   // peak slope; below rain's 0.5 — a wake is broader and flatter
-    float g_actRipLamMin = 10.0f;   // ~14 cm ... comparable to the 14.2-unit impulse spacing, which
-    float g_actRipLamMax = 22.0f;   // is what lets neighbouring rings blend instead of beating
-    float g_actRipRadius = 140.0f;  // ~2 m of reach; rings must outgrow the 14.2-unit spacing by a
-                                    // wide margin or the "band" is just a row of separate circles
-    float g_actRipDecay  = 2.0f;    // radial amplitude falloff (same meaning as R1's, re-derived)
-    float g_actRipLife   = 3.0f;    // MW's RippleLifetime; age arrives already normalised to it
-    bool  g_actRipOn     = true;
-
     // ---- R2b: the wave SIM that replaces the analytic loop above --------------------------------
     // Sizing is derived, not picked. A finite-difference scheme needs roughly 8 texels per
     // wavelength before numerical dispersion starts bending the waves, and MW lays impulses every
@@ -10636,10 +10615,11 @@ namespace {
     // timestep. ⚠ BOTH must be regenerated with the taps — tools/iwave_kernel.py --emit prints them.
     constexpr float    kWakeKernelAlpha   = 1.0096f;
     constexpr float    kMwUnitMetres      = 0.014224f;   // 64 units = 1 yard
-    // 2.5 is MGE's own metric, kept because the whole port is calibrated around it. The dispersive
-    // mode wants ~8 instead (its |k| kernel is only accurate over 4-24 texels of wavelength), so
-    // flipping the mode moves this slider and clears the field.
-    float g_wakeUnitsPerTexel = 2.5f;   // live; changing it invalidates the field
+    // 8 is the DISPERSIVE metric and therefore the default: that kernel is accurate over 4-24 texels
+    // of wavelength, and at 8 units/texel MW's whole swim range lands inside it. MGE mode wants 2.5
+    // instead, which is what its constants are calibrated around, so flipping the mode moves this
+    // slider and clears the field.
+    float g_wakeUnitsPerTexel = 8.0f;   // live; changing it invalidates the field
 
     // ---- R2d: MGE's own dynamic-wave sim, the DEFAULT ------------------------------------------
     // ⚠ MGE'S WAVE EQUATION IS THE SAME NON-DISPERSIVE LAPLACIAN as the fine grid's. Its V-shaped
@@ -10648,7 +10628,11 @@ namespace {
     // source outruns them and leaves a Mach cone (half-angle asin(c/V), narrowing as it speeds up).
     // The fine grid's per-FRAME step makes its speed proportional to the frame rate — 330 u/s at
     // 165 Hz — which is why it can only ever draw circles.
-    bool  g_wakeMge      = true;    // false = the dispersive |k| grid (ripplewave.comp)
+    // ⚠ DEFAULT IS THE DISPERSIVE GRID, not this one. MGE's produces a clean V but it is a MACH
+    // CONE — its half-angle is asin(c/V), so it narrows as the swimmer speeds up, and it has no
+    // transverse waves at all (the arcs that cross the track and curve back into the arms). Both of
+    // those need omega^2 = g|k|. Kept as the A/B, and as the cheaper option: 8 taps against 441.
+    bool  g_wakeMge      = false;   // false = the dispersive |k| grid (ripplewave.comp)
     // The knob is a SPEED, in world units per second, because that is the number that decides
     // whether there is a cone at all; `a` is derived from it. ⚠ Ceiling is the 2D CFL limit
     // a <= 0.5, i.e. c <= sqrt(0.5) * unitsPerTexel / waveStep — 141 u/s at MGE's metric.
@@ -10663,13 +10647,22 @@ namespace {
     // wake never looks stamped. Both u(t) and u(t-1) are pinned, which makes it a zero-velocity
     // boundary the water flows around — a source that keeps working while the actor moves, rather
     // than an impulse that fires once. A train of impulses is a row of rings; this is a wake.
-    float g_wakeRingRadius = 12.0f;  // world units
-    float g_wakeRingDepth  = 1.0f;   // the pinned value (MGE used -1)
-    // MW only tells us where ripple DECALS are, not where actors are, so the ring centres are the
-    // freshest ripples — anything younger than this fraction of RippleLifetime (3 s). MGE had the
-    // player pointer and interpolated across the frame; a short age window is the same idea, since
-    // MW lays a ripple every ~10-14 units of travel.
-    float g_wakeSrcAge   = 0.06f;
+    // ⚠ RADIUS SELECTS A WAVELENGTH, so it is not just "how big is the swimmer". A ring of radius r
+    // puts its energy near k ~ 1/r, i.e. around lambda ~ 2*pi*r, and in DISPERSIVE mode the arcs
+    // that matter sit at lambda_t = 2*pi*V^2/g. Too small a ring feeds only short waves, and short
+    // gravity waves are the SLOW ones: they pool around the actor instead of reaching the pattern.
+    //
+    // Without the angle lock the match is r ~ V^2/g = V^2/690 world units, which is 15 at 100 u/s
+    // and 33 at 150 — no single value serves both, and MGE's 12 is right for a ~90 u/s swimmer,
+    // which is presumably why it was 12. WITH the lock the wavelength is pinned into 7..18 texels,
+    // so the ideal radius stops depending on speed at all: lambda/(2*pi) is 1.1..2.9 texels, i.e.
+    // 9..23 world units at 8 units/texel. 16 sits mid-band and now suits every swim speed.
+    float g_wakeRingRadius = 16.0f;  // world units
+    // How deep the obstacle sits, i.e. how hard it drives the whole pattern — this is the amplitude
+    // at the SOURCE, where the slope gain is the amplitude at the EYE. MGE pinned to -1; 1.5 because
+    // its player ring only ever had to feed a Mach cone in the near field, whereas here the energy
+    // has to reach the far transverse arcs as well.
+    float g_wakeRingDepth  = 1.5f;
     uint32_t g_wakeMaxSrc = 24;     // cap on rings per step; the pin loop is per texel in bounds
 
     // ---- actor TRACKS: the ring source, and why it cannot just be the ripple list ---------------
@@ -10727,6 +10720,11 @@ namespace {
     // be perfectly static under camera motion — it is an invariant with no judgement in it, so it
     // separates "the lookup is camera-dependent" from "the source is" in one look.
     bool  g_wakeFreezeSrc = false;
+    // Smoothed representative source speed (world units/s), measured off the tracks and consumed by
+    // the dispersive angle lock. ⚠ SMOOTHED because gravity is a property of the MEDIUM: changing it
+    // re-times every wave already in the field, so a value that jumped frame to frame would visibly
+    // warp the existing pattern rather than just re-aiming the new one.
+    float g_wakeSrcSpeed = 0.0f;
 
     // Advance every track and fold in this frame's births. Called once per frame, before the grids.
     void updateWakeTracks(float dt, double nowMs) {
@@ -10803,27 +10801,72 @@ namespace {
             t.strength = 1.0f;      // a fresh birth revives a track that had started to fade
             t.lastBirthMs = nowMs;
         }
+
+        // Representative source speed for the angle lock. The FASTEST active track, because that is
+        // the one whose wavelength is closest to leaving the kernel's band and therefore the one
+        // about to lose its angle; a slow track sharing the grid keeps a good angle either way.
+        // One value and not one per actor because gravity is a property of the medium — there is a
+        // single field, so there is a single g.
+        float fastest = 0.0f;
+        for (int i = 0; i < kWakeTracks; ++i) {
+            if (!g_wakeTrack[i].active) { continue; }
+            const WakeTrack& t = g_wakeTrack[i];
+            fastest = std::max(fastest, std::sqrt(t.vx * t.vx + t.vy * t.vy));
+        }
+        // ~0.4 s time constant. Held (not decayed to zero) when nothing is moving, so a swimmer who
+        // pauses and starts again does not re-time the whole field on the first birth.
+        if (fastest > 0.0f) {
+            const float a = 1.0f - std::exp(-dt / 0.4f);
+            g_wakeSrcSpeed += (fastest - g_wakeSrcSpeed) * a;
+        }
     }
     // Damping as a PER-SECOND rate, unlike the fine grid's per-step decay. That difference is the
     // whole reason the first wake shipped "very weak": 0.985 per step at 120 steps/s is 0.16 per
     // second, so 84% of the wave energy went every second. A rate in seconds cannot be misread, and
     // it also makes the sim frame-rate independent, which a wedge needs — its wavelength is set by
     // gravity and the swimmer's speed, both physical.
-    float g_wakeDamp     = 0.35f;   // 1/s; 0.35 leaves ~3 s of trail, i.e. several wavelengths
-    float g_wakeAmp      = 1.0f;    // impulse height at a birth
-    // Radius in TEXELS, so 2.0 is ~16 units — and it is matched to the wake, not picked. A bump of
-    // radius r puts most of its energy near k ~ 1/r, and 2 texels lands that at ~12 texels of
-    // wavelength, which IS the Kelvin wavelength at swim speed. A much tighter impulse would dump
-    // its energy into short waves, and short gravity waves are the SLOW ones — they would pool
-    // around the actor instead of running out into the wedge.
-    float g_wakeRadius   = 2.0f;
+    // ⚠ IN DISPERSIVE MODE THIS IS THE "HOW MANY ARCS" KNOB, which is not obvious from its name.
+    // The trail lives V/damp world units and the transverse arcs are 2*pi*V^2/g apart, so the count
+    // visible behind the swimmer is g/(2*pi*V*damp). The first value shipped, 0.35, left about two
+    // arcs at 150 u/s — enough to be a smear and not enough to be structure, which is what "V shape
+    // but not the distinct reverse circles" was. 0.15 gives roughly five, and ~7 at a 100 u/s swim.
+    // It costs nothing: the trail is then 6.7 s long, and at swim speed that is ~700 units inside a
+    // 8192-unit domain.
+    float g_wakeDamp     = 0.15f;   // 1/s
     // ⚠ Not the fine grid's 3.0, and the difference is physical rather than taste. The frag converts
     // height-per-texel to world slope with texels-per-unit, so at 8 units/texel this grid's slope is
     // divided by 8 where the fine grid's is divided by 1 — and its waves are genuinely ~4x longer,
     // which makes them gentler again for the same height. Both are correct; the gain has to make up
-    // the ~7x or a real wake reads as nothing at all.
-    float g_wakeSlope    = 6.0f;    // slope gain into water.frag's normal
+    // the ~7x or a real wake reads as nothing at all. Raised again with the damping drop, because
+    // the arcs the damping now preserves are the LONGEST waves in the field and therefore the
+    // gentlest — the far end of the trail is exactly the part a low gain loses first.
+    float g_wakeSlope    = 10.0f;   // slope gain into water.frag's normal
     float g_wakeGravity  = 1.0f;    // taste multiplier on the DERIVED gravity; 1.0 = physical
+
+    // ---- keeping the wedge ANGLE speed-invariant ------------------------------------------------
+    // ⚠ THE ANGLE IS SUPPOSED TO BE A CONSTANT. Kelvin's 19.47 deg does not depend on how fast the
+    // swimmer goes, so an angle that narrows with speed means the dispersion has stopped holding —
+    // and it has, for a reason that is in the kernel rather than in the physics. |k| has a 1/r^3
+    // real-space tail, so a truncated kernel always loses the LONG wavelengths; measured, ours
+    // tracks |k| over 4..24 texels and past that the exponent p climbs toward 1, which IS the
+    // non-dispersive case. It then draws a Mach cone, whose angle asin(c/V) narrows as V rises.
+    //
+    // lambda_t = 2*pi*V^2/g, so at 8 units/texel that is 11.5 texels at 100 u/s but 26 at 150 and
+    // 46 at 200 — a fast swimmer walks straight out of the band. And it cannot be fixed by choosing
+    // a better metric: MW's swim range spans ~2.8 octaves of lambda and the kernel gives ~2.6.
+    //
+    // So drive gravity from the source's own speed and hold lambda_t inside the band. The ANGLE
+    // depends only on p, the dispersion exponent, so pinning lambda pins the angle at every speed.
+    // What is given up is that the arcs stop lengthening with V once the clamp engages — a real
+    // deviation from physics, and the deliberate trade: the angle is the salient feature and the
+    // wavelength is not.
+    bool  g_wakeAngleLock = true;
+    // Band edges in TEXELS, straight off the measured p table (tools/iwave_kernel.py): p sits
+    // closest to 0.5 — i.e. the wedge closest to 19.47 deg — between about 8 and 19 texels, giving
+    // 18..24 deg. Outside 7..18 it degrades fast: 24.7 texels is already 11.8 deg.
+    constexpr float kWakeLamLo = 7.0f;
+    constexpr float kWakeLamHi = 18.0f;
+    // (g_wakeSrcSpeed is declared with the track state above — updateWakeTracks writes it.)
     bool  g_wakeOn       = true;
     // ---- R1 weather drive ----
     // MW's own live precipitation counters, off waterParams[12]/[13]. Counters and not the weather
@@ -10998,33 +11041,10 @@ namespace {
         r[1] = g_rippleDecay;
         r[2] = std::floor(std::max(g_rippleSlots, 1.0f) + 0.5f);   // integral; the shader loops on it
         r[3] = (float)g_ripplePhase;   // < 512, so float32 keeps ~3e-5 of a cycle. Plenty.
-        // worlds[11] groups 1-2 — R2 actor ripples. Count is zeroed by the master toggle here
-        // rather than in the shader, so the OFF path costs the frag one compare against 0 and
-        // never enters the loop at all.
-        r[4] = g_actRipOn ? (float)g_actorRippleCount : 0.0f;
-        // ⚠ amp is divided by sqrt(the expected OVERLAP COUNT), and without it the knob is
-        // unusable. MW lays impulses every ~14.2 units of travel while each ring reaches rDie, so a
-        // pixel sits inside roughly rDie/14.2 rings at once — about ten at the default 140. Ten
-        // independent contributions of 0.35 slope is a near-vertical normal, which reads as noise
-        // rather than as a strong wake.
-        //
-        // sqrt and not a straight divide: the rings carry unrelated phases (each has its own
-        // wavelength and its own front position), so they sum in QUADRATURE like any incoherent
-        // superposition — the expected magnitude grows as sqrt(N), not N. Dividing by N would
-        // over-correct and make the wake fade out as the radius knob is raised.
-        //
-        // Done here rather than in the frag so the dev-panel knob stays perceptual: amp means "how
-        // strong is the wake", and changing the RADIUS no longer silently changes the strength too.
-        {
-            const float overlap = std::max(g_actRipRadius / 14.2f, 1.0f);
-            r[5] = g_actRipAmp / std::sqrt(overlap);
-        }
-        r[6] = g_actRipLamMin;
-        r[7] = std::max(g_actRipLamMax, g_actRipLamMin);
-        r[8] = g_actRipRadius;
-        r[9] = std::max(g_actRipDecay, 0.01f);
-        r[10] = std::max(g_actRipLife, 0.01f);
-        r[11] = (float)kActorRippleSlot;
+        // r[4..11] were the R2 ANALYTIC actor-ripple lanes, deleted with that path — see the note
+        // above g_actorRipples. They are left zero rather than repacked: water.frag reads only the
+        // groups it still uses, and renumbering would make every other lane in this function a
+        // moving target for no gain.
         // worlds[12] group 0 — R2b wave-sim domain, so the frag can map a world position to a
         // texel. Eye-relative like everything else the water frag consumes.
         //   x,y = domain origin (eye-relative)   z = 1/unitsPerTexel   w = grid size in texels
@@ -11048,82 +11068,12 @@ namespace {
         w12[12] = g_wakeSlope;
         w12[13] = wakeOn ? 1.0f : 0.0f;
         std::memcpy(wbuf + 12 * 64, w12, 64);
-        // The analytic actor path is MUTUALLY EXCLUSIVE with the sims: they perturb the same normal
-        // from the same impulses, so running them together doubles every wake. A sim wins when one
-        // is up; r[4] is the analytic count, so zeroing it here is the whole switch.
-        if (simOn || wakeOn) { r[4] = 0.0f; }
-
-        // worlds[16..] — the ripple array itself, 4 per matrix. Written CAMERA-RELATIVE to match
-        // every other position the water frag sees: worldXY there is already eye-relative, and a
-        // pair of absolute exterior coordinates (~-12000, -72000) would lose all their low bits
-        // against it ([[project_forge_precision_far_origin]]).
-        // ⚠ PER-RIPPLE WORK BELONGS HERE, NOT IN THE FRAG. The frag's loop is per PIXEL per ripple,
-        // so anything derived from the ripple alone gets recomputed hundreds of thousands of times
-        // for a value that does not change over the surface. Doing the wavelength hash, k, W and
-        // the front radius in the shader cost 13 ms of water pass (0.9 -> 14.6 in the gpu split)
-        // and showed up as frame JITTER, because the spike only lands on frames with ripples in
-        // view. Here it is 64 iterations, once.
-        //
-        // Packs to exactly float4(centre.xy, rc, W), which is why the crest count is FIXED at 2
-        // rather than hashed: with n free the frag would need lambda as a fifth value and the
-        // one-float4-per-ripple layout (4 per matrix) would break. Wavelength still varies per
-        // ripple, which is where the visual variety actually comes from; n only set how many
-        // crests rode inside the envelope. k = 2*pi/lam and W = 0.5*(n+1)*lam, so at n=2 the frag
-        // recovers k = 3*pi/W with one divide and no hash at all.
-        if (g_actorRippleCount) {
-            const float rDie = std::max(g_actRipRadius, 1e-3f);
-            const unsigned mats = (g_actorRippleCount + 3u) / 4u;
-            float rip[16];
-            // Bounding circle over every ripple's OUTER reach, eye-relative. The frag tests this
-            // once and skips the whole loop on a miss.
-            //
-            // This is the difference between a loop that costs what it draws and one that costs
-            // what it MIGHT draw. Measured: water=0.31 ms with no ripples, 32.81 ms with them —
-            // and the annulus reject barely dented it, because a rejecting iteration still pays a
-            // cbuffer load, a dot and a compare, 64 times, for EVERY water pixel on screen. Most
-            // of those pixels are nowhere near a wake. One circle test in front of the loop turns
-            // "64 rejects per pixel" into "1 reject per pixel" everywhere except around the actor.
-            float minX = 1e30f, minY = 1e30f, maxX = -1e30f, maxY = -1e30f;
-            for (unsigned i = 0; i < g_actorRippleCount; ++i) {
-                const float x = g_actorRipples[i * 4 + 0] - eyeAbsX;
-                const float y = g_actorRipples[i * 4 + 1] - eyeAbsY;
-                minX = std::min(minX, x); maxX = std::max(maxX, x);
-                minY = std::min(minY, y); maxY = std::max(maxY, y);
-            }
-            const float bcx = 0.5f * (minX + maxX);
-            const float bcy = 0.5f * (minY + maxY);
-            const float half = std::sqrt(0.25f * ((maxX - minX) * (maxX - minX)
-                                                + (maxY - minY) * (maxY - minY)));
-            // + the largest reach any single ripple can have: rDie plus its widest packet.
-            const float reach = rDie + 1.5f * std::max(g_actRipLamMax, g_actRipLamMin);
-            r[12] = bcx;
-            r[13] = bcy;
-            r[14] = half + reach;
-            r[15] = 0.0f;
-            for (unsigned m = 0; m < mats; ++m) {
-                std::memset(rip, 0, sizeof(rip));
-                for (unsigned j = 0; j < 4u; ++j) {
-                    const unsigned i = m * 4u + j;
-                    if (i >= g_actorRippleCount) { break; }
-                    const float ax  = g_actorRipples[i * 4 + 0];
-                    const float ay  = g_actorRipples[i * 4 + 1];
-                    const float age = std::min(std::max(g_actorRipples[i * 4 + 2], 0.0f), 1.0f);
-                    // Hash the ABSOLUTE centre: it is stable for the ripple's whole life, whereas
-                    // the eye-relative one below moves every frame and would make a ring change
-                    // wavelength as the camera walked.
-                    const float hs = std::sin(ax * 12.9898f + ay * 78.233f) * 43758.5453f;
-                    const float h  = hs - std::floor(hs);
-                    const float lam = g_actRipLamMin
-                                    + h * (std::max(g_actRipLamMax, g_actRipLamMin) - g_actRipLamMin);
-                    const float W  = 1.5f * lam;             // n = 2
-                    rip[j * 4 + 0] = ax - eyeAbsX;
-                    rip[j * 4 + 1] = ay - eyeAbsY;
-                    rip[j * 4 + 2] = (rDie + W) * age;       // rc: the front radius, right now
-                    rip[j * 4 + 3] = W;
-                }
-                std::memcpy(wbuf + (size_t)(kActorRippleSlot + m) * 64, rip, 64);
-            }
-        }
+        // ⚠ THE R2 ANALYTIC ACTOR PATH IS GONE, and worlds[16..] with it. It packed one float4 per
+        // ripple for a per-PIXEL loop in water.frag that measured 0.31 ms of water pass with no wake
+        // in view against 32.81 ms with one, and it was already unreachable: it only ran when both
+        // wave grids were off, which is a state nobody wants. R1's procedural rain field is
+        // untouched — that one is analytic on purpose, because a raindrop field covers the whole
+        // visible sea and a grid there cannot degrade with distance.
         // AFTER the block above, which fills r[12..14] with the bounding circle it computes.
         std::memcpy(wbuf + 11 * 64, r, 64);
     }
@@ -12136,7 +12086,7 @@ namespace {
           // The first shipped default was 0.985, which threw away 84% of the wave energy every
           // second on ripples whose whole life is 3 s — the waves died about as fast as MW made
           // them, which is why the wake read as "very weak" rather than as wrong.
-          t.checkbox("Wake SIM on (off = the analytic per-ripple path, ~30x costlier)", &g_ripSimOn);
+          t.checkbox("FINE grid on (non-dispersive splash; off by default — see the note)", &g_ripSimOn);
           t.sliderF("Wake sim: impulse amplitude (height at the splash centre)", &g_ripSimAmp, 0.0f, 4.0f, 0.05f, "%.2f");
           t.sliderF("Wake sim: impulse radius (TEXELS; 1 texel = 1 world unit)", &g_ripSimRadius, 1.0f, 32.0f, 0.5f, "%.1f");
           t.sliderF("Wake sim: slope gain into the normal", &g_ripSimSlope, 0.0f, 16.0f, 0.25f, "%.2f");
@@ -12168,10 +12118,15 @@ namespace {
           t.checkbox("MGE: FREEZE sources (debug — field must then be static under camera motion)", &g_wakeFreezeSrc);
           t.sliderF("MGE: damping u(t) (MGE used 0.02; raise to shorten the wake)", &g_wakeUdamp, 0.0f, 0.2f, 0.002f, "%.3f");
           t.sliderF("MGE: damping u(t-1) (MGE used 0.02)", &g_wakeVdamp, 0.0f, 0.2f, 0.002f, "%.3f");
-          t.sliderF("Dispersive only: impulse amplitude at a birth", &g_wakeAmp, 0.0f, 4.0f, 0.05f, "%.2f");
-          t.sliderF("Dispersive only: impulse radius (TEXELS)", &g_wakeRadius, 0.5f, 8.0f, 0.25f, "%.2f");
-          t.sliderF("Dispersive only: damping PER SECOND", &g_wakeDamp, 0.0f, 3.0f, 0.01f, "%.2f");
-          t.sliderF("Dispersive only: gravity x (1.0 = physical)", &g_wakeGravity, 0.1f, 4.0f, 0.05f, "%.2f");
+          // The dispersive grid shares the ring source above; these are its own two constants.
+          // Gravity sets the transverse wavelength (2*pi*V^2/g), which is the spacing of the
+          // reverse-curving arcs — the thing a Mach cone cannot draw at all.
+          t.sliderF("Dispersive: damping PER SECOND", &g_wakeDamp, 0.0f, 3.0f, 0.01f, "%.2f");
+          t.sliderF("Dispersive: gravity x (1.0 = physical; sets the arc SPACING)", &g_wakeGravity, 0.1f, 4.0f, 0.05f, "%.2f");
+          // Kelvin's angle does not depend on speed; ours did, because a fast swimmer's wavelength
+          // leaves the kernel's accurate band and the operator degenerates to non-dispersive. This
+          // drives gravity from the source's measured speed to hold the wavelength in band.
+          t.checkbox("Dispersive: LOCK the wedge angle (drive gravity from swim speed)", &g_wakeAngleLock);
           t.checkbox("Water: force reflection fog melt OFF (roughness calibration only)", &g_waterNoFogMelt);
           // SH1 sky-directional ambient (skyamb.h.fsl). STRENGTH 0 is the A/B: every receiver
           // early-outs to flat ambient, so the whole feature toggles against the previous image from
@@ -12776,8 +12731,22 @@ namespace {
             // returns alpha*k with k in rad/texel, so omega² = grav*alpha*k_texel must equal
             // g_SI*k_SI = g_SI*k_texel/metresPerTexel. Everything cancels to this.
             const float mPerTexel = std::max(upt * kMwUnitMetres, 1e-6f);
-            rp->wave[0] = rp1->wave[0] =
-                g_wakeGravity * 9.81f / (kWakeKernelAlpha * mPerTexel);
+            float grav = g_wakeGravity * 9.81f / (kWakeKernelAlpha * mPerTexel);
+            // ⚠ HOLD lambda_t INSIDE THE KERNEL'S BAND, or the angle is not speed-invariant. See
+            // the g_wakeAngleLock block: past ~24 texels the operator stops behaving like |k| and
+            // the pattern collapses to a Mach cone, whose angle narrows with speed. Solving
+            // lambda = 2*pi*V^2/g for g at the clamped lambda handles BOTH ends with one expression
+            // — too long raises gravity, too short lowers it.
+            if (g_wakeAngleLock) {
+                const float vTex = g_wakeSrcSpeed / std::max(upt, 1e-3f);
+                if (vTex > 1e-3f) {
+                    const float twoPiV2 = 6.28318531f * vTex * vTex;
+                    const float lamPhys = twoPiV2 / std::max(grav, 1e-6f);
+                    const float lamFix  = std::min(std::max(lamPhys, kWakeLamLo), kWakeLamHi);
+                    grav = twoPiV2 / lamFix;
+                }
+            }
+            rp->wave[0] = rp1->wave[0] = grav;
             // Clamped before the split: a load screen or an alt-tab must not fast-forward the field
             // through half a second of evolution the instant the player is looking again.
             const float dt = std::min(std::max(dtFrame, 0.0f), 0.05f) * 0.5f;
@@ -12820,7 +12789,7 @@ namespace {
             // sub-steps then zero both ping-pong targets. No extra kernel, no extra dispatch.
             rp->scroll[0] = rp1->scroll[0] = (float)(G.grid * 2);
             rp->scroll[1] = rp1->scroll[1] = (float)(G.grid * 2);
-        } else if (mge) {
+        } else if (mge || dispersive) {
             // MGE's source is a MOVING OBSTACLE, so it is stamped on EVERY sub-step, not injected
             // once at birth — that is what distinguishes a wake from a row of splashes. MW gives us
             // ripple decals rather than actor positions, so the ring centres are every ripple young
@@ -12835,6 +12804,11 @@ namespace {
                                          + 0.065f * std::sin(12.87645f * t);
             const float ringR     = ringTex * pulse;
             const unsigned maxSrc = std::min<unsigned>(g_wakeMaxSrc, RIPPLE_MAX_IMPULSES);
+            // ⚠ SHARED BY BOTH WAKE INTEGRATORS. The dispersive grid needs the moving obstacle even
+            // more than MGE's does: its whole reason to exist is the TRANSVERSE waves, the arcs that
+            // keep pace with the swimmer, and a source that does not move cannot excite them. When
+            // it was first built it had none of this — impulses at births, no tracks, and the scroll
+            // bug — so it has never actually been given a fair test.
             // ⚠ TRACKS, NOT THE RIPPLE LIST. See the WakeTrack declaration: the shipped ripples are
             // selected by camera distance, so pinning them makes the field a function of where the
             // camera is; and ripple decals do not move, so a pinned decal is a stationary obstacle,
@@ -15993,7 +15967,9 @@ namespace ForgeRender {
                                   g_wakeMge ? kRipModeMge : kRipModeWave,
                                   g_eyeAbsShadow[0], g_eyeAbsShadow[1], dtFrame, wakeSteps,
                                   g_wakeMge ? kMgeWakeThreads : kWakeThreads,
-                                  g_wakeRadius, g_wakeAmp,
+                                  // impulse radius/amp are the FINE grid's path only; both wake
+                                  // integrators use the moving ring instead.
+                                  0.0f, 0.0f,
                                   g_wakeMge ? "RIPPLE wake sim (MGE)"
                                             : "RIPPLE wake sim (dispersive)");
             } else {

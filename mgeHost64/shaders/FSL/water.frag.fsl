@@ -331,18 +331,9 @@ float4 PS_MAIN( VSOutput In )
     float  rippleDecay   = max(ripG4.y, 0.0f);      // amplitude falloff over the ring's own RADIUS
     float  rippleSlots   = max(ripG4.z, 1.0f);      // impulses per cell per cycle — the RATE knob
     float  ripplePhase   = ripG4.w;                 // INTEGRATED host-side; period is live
-    // R2 actor ripples, worlds[11] groups 1-2. actRipCount is already zeroed by the host master
-    // toggle, so `count <= 0` is the whole OFF path.
-    float4 actG0         = transpose(gBatch.worlds[11])[1];
-    float4 actG1         = transpose(gBatch.worlds[11])[2];
-    int    actRipCount   = int(actG0.x + 0.5f);
-    float  actRipAmp     = actG0.y;                 // already 1/sqrt(overlap)-scaled host-side
-    // actG0.zw carry lamMin/lamMax, which this shader no longer reads: the wavelength hash moved
-    // host-side and arrives baked into each ripple's W. Left published so the dev panel and the
-    // log describe the same lanes, and so the frag can be put back if the packing ever changes.
-    float  actRipRadius  = max(actG1.x, 0.0f);
-    float  actRipDecay   = max(actG1.y, 0.01f);
-    float4 actG2         = transpose(gBatch.worlds[11])[3];   // (boundsXY, boundsRadius, -)
+    // R2 ANALYTIC actor ripples lived in worlds[11] groups 1-3 and worlds[16..]. Deleted: it was a
+    // per-ripple loop PER PIXEL (0.31 -> 32.81 ms of water pass once a wake came into view) and the
+    // wave grids below replace it at a fixed cost. Those lanes are now zero and unread.
     // R2b wave-sim domain: (originXY eye-relative, texelsPerUnit, gridSize) + (slopeGain, enable).
     float4 simG0         = transpose(gBatch.worlds[12])[0];
     float4 simG1         = transpose(gBatch.worlds[12])[1];
@@ -772,28 +763,6 @@ float4 PS_MAIN( VSOutput In )
     // measured 32.8 ms of water pass against 0.31 ms with no ripples. Almost none of those pixels
     // are anywhere near a wake. One circle test in front of the loop is what makes the cost
     // proportional to the disturbed area instead of to the visible water.
-    float2 actRipD = surfPos.xy - actG2.xy;
-    bool   actRipNear = dot(actRipD, actRipD) < actG2.z * actG2.z;
-    if (actRipCount > 0 && actRipAmp > 0.0f && actRipNear && !flatWater) {
-        float  rDie = max(actRipRadius, 1e-3f);
-        float4 fade = actorRippleFade(rDie, actRipDecay);
-        float3 ar   = float3(0.0f, 0.0f, 0.0f);
-        // Fetched straight out of the constant buffer, 4 ripples per matrix. `transpose(M)[j]` is
-        // the same group convention every other worlds[] reader here uses, and it compiles to four
-        // scalar loads rather than an actual transpose — column j of M, no matrix built.
-        LOOP for (int i = 0; i < actRipCount; ++i) {
-            float4x4 M = gBatch.worlds[16 + (i >> 2)];
-            int      j = i & 3;
-            float4   e = float4(M[0][j], M[1][j], M[2][j], M[3][j]);
-            // e = (centre.xy, rc, W); the wavelength hash and the front radius are already
-            // resolved host-side, so nothing per-ripple is recomputed per pixel here.
-            ar += actorRippleOne(e, surfPos.xy - e.xy, actRipAmp, fade, fpEll);
-        }
-        float2 base2 = normal.xy / max(normal.z, 1e-4f);
-        normal  = normalize(float3(base2 + ar.xy, 1.0f));
-        sigma2 += ar.z;
-    }
-
     // R2b: the wave-sim field. ONE bilinear fetch, whatever the ripple count — which is the entire
     // reason it exists (the analytic loop above cost the water pass 0.31 -> 32.81 ms once a wake
     // was in view, and the spike only landing on wake frames is what read as jitter).

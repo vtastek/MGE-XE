@@ -1056,18 +1056,12 @@ void CS_MAIN(uint3 did : SV_DISPATCHTHREADID)
 
 
 
+
     LOOP for (uint t = tid; t < 1296u; t += 256u)
     {
         int2 lp = int2(int(t % 36u), int(t / 36u));
         int2 gp = org + lp -  10 ;
-        float h = waveFetchPrev(gp + shift, size).x;
-        LOOP for (int i = 0; i < nImp; ++i)
-        {
-            float4 imp = gRippleSimParams.impulses[i];
-            float d = length(float2(gp) - imp.xy);
-            h += imp.w * smoothstep(1.0f, 0.0f, d / max(imp.z, 1e-3f));
-        }
-        g_wave[t] = h;
+        g_wave[t] = waveFetchPrev(gp + shift, size).x;
     }
     GroupMemoryBarrier();
 
@@ -1236,6 +1230,20 @@ void CS_MAIN(uint3 did : SV_DISPATCHTHREADID)
     float4 pc = waveFetchPrev(me + shift, size);
     float v = (pc.y - grav * acc * dt) * damp;
     float h = g_wave[base] + v * dt;
+#line 268 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/ripplewave.comp.fsl"
+    float4 sb = gRippleSimParams.srcBounds;
+    if (nImp > 0 && float(me.x) >= sb.x && float(me.y) >= sb.y
+                 && float(me.x) <= sb.z && float(me.y) <= sb.w)
+    {
+        LOOP for (int i = 0; i < nImp; ++i)
+        {
+            float4 s = gRippleSimParams.impulses[i];
+            float d = length(float2(me) - s.xy);
+            float disp = saturate(2.0f * abs(d / max(s.z, 1e-3f) - 1.0f));
+            h = lerp(-s.w, h, disp);
+            v = lerp(0.0f, v, disp);
+        }
+    }
 
 
     if (abs(h) < 1.0e-6f && abs(v) < 1.0e-6f) { h = 0.0f; v = 0.0f; }

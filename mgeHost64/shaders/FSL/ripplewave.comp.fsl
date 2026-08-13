@@ -74,21 +74,15 @@ void CS_MAIN(SV_DispatchThreadID(uint3) did)
     uint  tid = lt.y * 16u + lt.x;
 
     // ---- fill the tile ------------------------------------------------------------------------
-    // Heights only (the convolution needs no velocity), scrolled, with this frame's births folded
-    // in DURING the load so a new impulse is convolved the same step it appears — and so its
-    // neighbours see it too, which they would not if it were added after the barrier.
+    // Heights only; the convolution needs no velocity. The obstacle is NOT stamped here — it is
+    // pinned on the OUTPUT below, so the next step reads a field that already contains it at its
+    // neighbours too. That also keeps this loop free of the per-source work it used to do, which
+    // ran over all 1296 tile texels rather than the 256 output ones.
     LOOP for (uint t = tid; t < 1296u; t += 256u)
     {
         int2  lp = int2(int(t % 36u), int(t / 36u));
         int2  gp = org + lp - WAVE_P;                 // grid texel, THIS frame's domain
-        float h  = waveFetchPrev(gp + shift, size).x;
-        LOOP for (int i = 0; i < nImp; ++i)
-        {
-            float4 imp = gRippleSimParams.impulses[i];
-            float  d   = length(float2(gp) - imp.xy);
-            h += imp.w * smoothstep(1.0f, 0.0f, d / max(imp.z, 1e-3f));
-        }
-        g_wave[t] = h;
+        g_wave[t] = waveFetchPrev(gp + shift, size).x;
     }
     GroupMemoryBarrier();
 
@@ -257,6 +251,33 @@ void CS_MAIN(SV_DispatchThreadID(uint3) did)
     float4 pc = waveFetchPrev(me + shift, size);
     float  v  = (pc.y - grav * acc * dt) * damp;
     float  h  = g_wave[base] + v * dt;
+
+    // ---- the moving obstacle (shared with ripplemge.comp) ----------------------------------------
+    // ⚠ THE SAME PIN, AND FOR THE SAME REASON, but here it is doing something a Mach cone cannot.
+    // The transverse waves — the arcs that cross the track behind the swimmer and curve the OTHER
+    // way — are the waves that keep PACE with the source. In a non-dispersive medium every
+    // wavelength travels at one speed, so a source that outruns one outruns all of them and there
+    // is no transverse system at all; only the envelope. Here omega^2 = g|k| gives a phase speed
+    // sqrt(g/k) that covers every value, so there is always a wavelength matching the swimmer, and
+    // that is the one which draws them. It needs a source that MOVES, hence the pin rather than an
+    // impulse: an impulse fires once and radiates a circle, and a row of circles is what this whole
+    // grid exists to replace.
+    //
+    // Pinning h to -depth AND v to zero is what makes it a boundary rather than a nudge, and it is
+    // applied to the OUTPUT so the next step's tile already contains it at the neighbours.
+    float4 sb = gRippleSimParams.srcBounds;
+    if (nImp > 0 && float(me.x) >= sb.x && float(me.y) >= sb.y
+                 && float(me.x) <= sb.z && float(me.y) <= sb.w)
+    {
+        LOOP for (int i = 0; i < nImp; ++i)
+        {
+            float4 s    = gRippleSimParams.impulses[i];
+            float  d    = length(float2(me) - s.xy);
+            float  disp = saturate(2.0f * abs(d / max(s.z, 1e-3f) - 1.0f));
+            h = lerp(-s.w, h,    disp);
+            v = lerp(0.0f, v,    disp);
+        }
+    }
 
     // Settle an idle grid to exactly zero rather than letting it ring at 1e-30 forever.
     if (abs(h) < 1.0e-6f && abs(v) < 1.0e-6f) { h = 0.0f; v = 0.0f; }
