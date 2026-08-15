@@ -171,6 +171,37 @@ STRUCT(ResolveParams)
     //
     // Fifth float4 = 80 B against a 256 B cbuffer, so still no allocation change.
     DATA(float4, look, None);
+    // AgX's CONTRAST SIGMOID (step 3b) — x = slope, y = toe power, z = shoulder power, w = unused.
+    //
+    // These replaced a fixed 6th-order polynomial fit, and the point of making them parameters at
+    // all is `y`: the fit's effective toe power is 2.90 where AgX's own is 1.0, and a toe that hard
+    // is a log-log contrast slope of 1.2..1.9 through the entire shadow band — measured, not
+    // guessed. MW's albedo is photographs with the shading already in them and a night exterior or
+    // an interior sits at -2..-6 stops, so the crush landed on all of the content. A fixed fit
+    // cannot express a toe, which is why this is a curve REPLACEMENT and not another knob on top
+    // ([[feedback_model_class_not_knobs]]).
+    //
+    // Ship default 2.40 / 1.30 / 1.00. Setting 2.02 / 2.90 / 2.90 reproduces the retired polynomial
+    // to ~1 code of 255, which makes the parametric form a provable superset — a stronger regression
+    // test than an A/B toggle, because it is the SAME code path producing the old image.
+    DATA(float4, curve, None);
+    // x = toeScale, y = shoulderScale, z = pivotX (0.606061), w = pivotY (0.5).
+    //
+    // ⚠ THE SCALES ARE COMPUTED ON THE HOST, ONCE PER FRAME, AND THAT IS A SAFETY DECISION, not a
+    // micro-optimisation. Their closed form raises `(slope*(lx/ly))^p - 1` to a fractional power,
+    // and that base goes NEGATIVE below slope (1-pivotY)/(1-pivotX) = 1.269231 — a fractional power
+    // of a negative is NaN, and a NaN survives every later multiply including one by zero coverage
+    // ([[project_nan_survives_zero_multiply]]). Computing them uniform-side catches that where the
+    // value is MADE, once, with a finite check and a slope clamp of [1.5, 3.0], instead of hoping
+    // no pixel finds it. The shader saves two pow()s as a side effect.
+    //
+    // The pivot rides along rather than being a shader constant so the boundary above is DERIVED
+    // from it host-side; a hard-coded 1.269 would silently stop being the boundary the day the pivot
+    // moves. z is also exactly where middle grey lands in the normalised log domain (10.0/16.5), so
+    // f(0.18) = w for every setting of `curve` — see agx.h.fsl on why 0.18 is not a witness here.
+    //
+    // Seventh float4 = 112 B against a 256 B cbuffer, so still no allocation change.
+    DATA(float4, curveScale, None);
 };
 
 BEGIN_SRT(ResolveSrtData)

@@ -302,6 +302,7 @@ namespace IPC {
         std::uint32_t reloadShaders = 0;   // one-shot (F8 edge): host rebuilds compute pipelines from disk
         std::uint32_t distLightsToggle = 0; // one-shot (numpad- edge): host flips baked distant-light loop (perf A/B)
         std::uint32_t gpuCapture = 0;      // one-shot (numpad0 edge): N host frames of RenderDoc capture
+        std::uint32_t dumpHdr = 0;         // one-shot (numpad1 edge): dump the LINEAR scene target as .exr + .tga
         // Frame-ahead observability: the client's own last-frame timings, shown live in the
         // host Stats panel. Purely informational — no host behaviour keys off these.
         std::uint32_t frameAhead = 0;      // 1 = deferred-finish pipelining live (default on; numpad-*)
@@ -539,6 +540,16 @@ namespace IPC {
         // rule skyParkEyeDelta above followed, and the reason waterParams could NOT carry this.
         IN std::uint32_t actorRippleCount;
         IN float actorRipples[kMaxActorRipples * 4];   // xy = world XY, z = age 0..1, w = MW scale
+
+        // One-shot (numpad1 edge): dump the host's LINEAR scene target to hdrdump/mge_NNNN.exr plus
+        // the composited BGRA8 frame to mge_NNNN.tga, both in the install dir. Follows devGpuCapture
+        // exactly — same latch, same one-frame arm — because the target it reads (pMSAAColor, fp16,
+        // pre-exposure and pre-curve) exists only inside the host and every other way out of the
+        // process goes through resolve.frag, which exposes, tone-maps, encodes and dithers into 8
+        // bits. An EXR of the raw radiance is what makes MW's sky/sun/interior levels comparable
+        // against real HDRIs instead of eyeballed. Appended at the very end of the IN block so every
+        // existing offset is unchanged — the same rule actorRipples above followed.
+        IN std::uint32_t devDumpHdr;
 
         OUT std::uint32_t bytesWritten;
         OUT double renderMs;             // host-side render+readback time

@@ -66,6 +66,7 @@ namespace {
     bool   g_reloadShadersPending = false; // F8 latched at composite finish, consumed by the next kickoff
     bool   g_distLightsTogglePending = false; // numpad- latched at composite finish; one-shot host dist-light A/B
     unsigned g_gpuCapturePending = 0;  // numpad0 latched at composite finish; N host frames of RenderDoc capture
+    bool g_hdrDumpPending = false;     // numpad1 latched at composite finish; one linear-scene EXR + TGA dump
     bool   g_fpSuppressLive = true;    // FP1b: MW arm suppression; on by default, numpad-/ flips live for the A/B
 
     // T3 (tasks/forge-terrain.md): stop emitting MW's OWN near terrain once the host is drawing the
@@ -4140,6 +4141,15 @@ namespace RenderProcess {
             g_gpuCapturePending = 1u;
             LOG::logline(">> [seam] GPU frame capture requested (numpad 0) — see mgeHost64.log");
         }
+        // Numpad 1: dump the host's LINEAR scene target (fp16, pre-exposure, pre-curve) as an EXR,
+        // plus the composited frame as a TGA, into hdrdump/ in the install dir. Latched on the same
+        // edge and consumed into the same DevInput as numpad 0, for the same reason: the arm has to
+        // reach the host BEFORE the frame it is meant to read. Needs a scene-referred (fp16 + MSAA)
+        // build — at 1x or LDR there is no linear target to dump and the host says so and declines.
+        if (GetAsyncKeyState(VK_NUMPAD1) & 0x0001) {
+            g_hdrDumpPending = true;
+            LOG::logline(">> [seam] linear HDR frame dump requested (numpad 1) — see mgeHost64.log");
+        }
         // FP1b: numpad-/ toggles MW first-person arm suppression live (A/B of MW arms
         // over the host FP pass vs host arms alone). Only takes effect while the FP
         // pass ships (wantsFPSuppression gates on capture + camera validation).
@@ -5280,6 +5290,11 @@ namespace RenderProcess {
         if (g_gpuCapturePending) {
             devInput.gpuCapture = g_gpuCapturePending;
             g_gpuCapturePending = 0;
+        }
+        // Numpad 1: one-shot linear scene-target dump (EXR + TGA). Same latch-then-consume as above.
+        if (g_hdrDumpPending) {
+            devInput.dumpHdr = 1u;
+            g_hdrDumpPending = false;
         }
         // Frame-ahead observability → host Stats panel: last frame's collect wait and
         // mwstart (1-frame skew, panel only) + this frame's dt and the live toggle.

@@ -1003,7 +1003,11 @@ STRUCT(ResolveParams)
     float4 tone;
 #line 173 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/resolve.srt.h"
     float4 look;
-#line 174
+#line 187 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/resolve.srt.h"
+    float4 curve;
+#line 204 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/resolve.srt.h"
+    float4 curveScale;
+#line 205
 };
 
         CBUFFER(ResolveParams) gResolveParams :  register(b0,space3);
@@ -1027,7 +1031,7 @@ float3 inverseTonemap(float3 d)
 #line 43 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/resolve.frag.fsl"
 #line 46 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/resolve.frag.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/agx.h.fsl"
-#line 82 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/agx.h.fsl"
+#line 90 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/agx.h.fsl"
 float3 agxInset(float3 v)
 {
     return float3(
@@ -1044,29 +1048,28 @@ float3 agxOutsetMat(float3 v)
         dot(v, float3(-0.0528968517574562f, 1.15190312990417f, -0.0989611768448433f)),
         dot(v, float3(-0.0529716355144438f, -0.0980434501171241f, 1.15107367264116f)));
 }
-
-
-
-
-
-
-
-
-float3 agxContrast(float3 x)
+#line 151 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/agx.h.fsl"
+float3 agxContrast(float3 x, float4 curve, float4 curveScale)
 {
-    float3 x2 = x * x;
-    float3 x4 = x2 * x2;
-    return 15.5f * x4 * x2
-          - 40.14f * x4 * x
-          + 31.96f * x4
-          - 6.868f * x2 * x
-          + 0.4298f * x2
-          + 0.1191f * x
-          - 0.00232f;
+    float3 px = float3(curveScale.z, curveScale.z, curveScale.z);
+
+
+    float3 hi = step(px, x);
+    float3 S = lerp(float3(-curveScale.x, -curveScale.x, -curveScale.x),
+                     float3( curveScale.y, curveScale.y, curveScale.y), hi);
+    float3 p = lerp(float3(curve.y, curve.y, curve.y),
+                     float3(curve.z, curve.z, curve.z), hi);
+    float3 t = max(curve.x * (x - px) / S, float3(0.0f, 0.0f, 0.0f));
+    return (t / pow(1.0f + pow(t, p), 1.0f / p)) * S + float3(curveScale.w, curveScale.w, curveScale.w);
 }
 
 
-float3 agx(float3 v)
+
+
+
+
+
+float3 agx(float3 v, float4 curve, float4 curveScale)
 {
     v = agxInset(max(v, float3(0.0f, 0.0f, 0.0f)));
 
@@ -1075,9 +1078,9 @@ float3 agx(float3 v)
               float3( (-12.47393f) ,  (-12.47393f) ,  (-12.47393f) ),
               float3( (4.026069f) ,  (4.026069f) ,  (4.026069f) ));
     v = (v -  (-12.47393f) ) * (1.0f / ( (4.026069f)  -  (-12.47393f) ));
-    return agxContrast(v);
+    return agxContrast(v, curve, curveScale);
 }
-#line 151 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/agx.h.fsl"
+#line 202 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/agx.h.fsl"
 float3 agxLook(float3 v, float slope, float power, float sat, float offset)
 {
     v = pow(max(v * slope + offset, float3(0.0f, 0.0f, 0.0f)),
@@ -1274,7 +1277,7 @@ float4 PS_MAIN(PsIn In): SV_TARGET
 
 
 
-            straight = agx(straight);
+            straight = agx(straight, gResolveParams.curve, gResolveParams.curveScale);
             straight = agxLook(straight, gResolveParams.look.x, gResolveParams.look.y,
                                gResolveParams.look.z, gResolveParams.look.w);
             straight = agxOutset(straight);

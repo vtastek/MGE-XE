@@ -644,6 +644,11 @@ namespace IPC {
 			if (params.devGpuCapture) {
 				ForgeRender::armGpuCapture(params.devGpuCapture);
 			}
+			// Same contract, same reason: the dump reads the scene target AFTER this frame's submit,
+			// so the arm has to land before the renderScene that fills it.
+			if (params.devDumpHdr) {
+				ForgeRender::armHdrDump();
+			}
 			// Live render-scale: set this frame's internal render resolution (clamped to the
 			// allocation size host-side). 0,0 ⇒ render at the full allocation. Per-frame viewport
 			// move only — no RT reallocation.

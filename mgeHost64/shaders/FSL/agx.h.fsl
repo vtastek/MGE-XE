@@ -17,8 +17,11 @@
 //   2. LOG2 OVER THE AgX EV RANGE. -12.47393 .. +4.026069, i.e. 10 stops below middle grey and 6.5
 //      above it (log2(0.18) = -2.47393; both bounds are that number offset). 16.5 stops of input
 //      range against the cubic's 2.2 linear ceiling, which is ~1.1 stops above white.
-//   3. THE 6th-ORDER SIGMOID. A polynomial approximation to AgX's tone curve on the normalised log
-//      domain. Monotone on [0,1], with a soft toe and a long shoulder — no clamp, no ceiling.
+//   3. THE PARAMETRIC SIGMOID. AgX's tone curve on the normalised log domain, as slope + toe power
+//      + shoulder power about a fixed pivot. Monotone on [0,1], f(0) = 0 and f(1) = 1 exactly — no
+//      clamp, no ceiling. It replaced a fixed 6th-order polynomial FIT of the same curve, which it
+//      reproduces to 1.1 codes at slope 2.02 / toe 2.90 / shoulder 2.90; see agxContrast() for why
+//      "toe power 2.90" was the whole reason to make it a parameter.
 //   4. THE LOOK (agxLook, below), between the sigmoid and the outset — which is where Blender puts
 //      it, and it matters: the CDL is defined on the tone-mapped log-ish values, not on radiance.
 //   5. OUTSET MATRIX. The inverse of the inset, undoing step 1's desaturation for everything that
@@ -46,12 +49,17 @@
 // top is exactly what makes a hue judgement unattributable. Choose the look FROM here.
 //
 // ⚠ WHERE 0.18 LANDS, because it is the one number that gates a mistranscription. Middle grey
-// (0.18 linear scene) leaves this file at 0.2145 LINEAR DISPLAY, i.e. **0.5005 as an sRGB display
+// (0.18 linear scene) leaves this file at 0.2176 LINEAR DISPLAY, i.e. **0.5039 as an sRGB display
 // code** once resolve.frag's linearToSrgb runs — AgX's signature property, middle grey at half
-// code. 1.0 linear scene lands at 0.7919. The host asserts both at init (forgerender.cpp's AgX
-// self-test) rather than trusting the transcription: every constant below is prior art, and a
-// mistyped polynomial coefficient or a transposed matrix row would otherwise present only as "the
-// colours look a bit off". See [[feedback_prior_art_constants_dont_transfer]].
+// code. 1.0 linear scene lands at 0.7740 at the ship curve. The host asserts both at init
+// (forgerender.cpp's AgX self-test) rather than trusting the transcription: every constant below is
+// prior art, and a transposed matrix row would otherwise present only as "the colours look a bit
+// off". See [[feedback_prior_art_constants_dont_transfer]].
+//
+// ⚠ THE TWO LANDMARKS TEST DIFFERENT THINGS, which is easy to miss now the sigmoid is parametric.
+// 0.18 lands EXACTLY on the curve's pivot (see agxContrast), so f(0.18) = 0.5 for every slope, toe
+// and shoulder — it gates the matrices, the EV bounds and the normalisation, and nothing about the
+// curve's shape. 1.0 sits out on the shoulder and is the one that moves when the curve does.
 //
 // ⚠ ONE STATED APPROXIMATION: step 6's pow(·, 2.2) is AgX's "2.2 exponent reference display" EOTF,
 // and resolve.frag re-encodes with the PIECEWISE sRGB OETF (linearize.h.fsl explains why the
@@ -96,37 +104,80 @@ float3 agxOutsetMat(float3 v)
         dot(v, float3(-0.0529716355144438f, -0.0980434501171241f,  1.15107367264116f)));
 }
 
-// The 6th-order approximation to AgX's default contrast sigmoid, on the normalised [0,1] log domain.
+// AgX's contrast sigmoid, PARAMETRIC, on the normalised [0,1] log domain. It replaced a fixed
+// 6th-order polynomial fit, and the replacement is a SUPERSET rather than a substitution — the fit
+// is reproduced at slope 2.02 / toe 2.90 / shoulder 2.90 to an RMS of 0.0022 and a maximum of 1.1
+// codes of 255 (verified over 1001 samples). Nothing was lost by deleting the polynomial; what was
+// gained is that TOE POWER BECAME A NUMBER, which a fixed fit cannot express at all.
 //
-// It is an APPROXIMATION and overshoots its endpoints slightly — f(0) = -0.00232, f(1) = 0.99858 —
-// which is why every consumer below floors at 0 before a pow(). A negative base under a fractional
-// exponent is NaN, and a NaN survives every subsequent multiply, including one by zero coverage
-// ([[project_nan_survives_zero_multiply]]). The floor is not defensive tidiness; it is the only
-// thing standing between the shoulder's undershoot and a frame of NaNs.
-float3 agxContrast(float3 x)
+// ⚠ WHY THAT MATTERED. Measured straight off the polynomial, the log-log contrast slope (one scene
+// stop -> how many display stops) ran 1.86 / 1.68 / 1.44 / 1.21 / 0.99 at -5..-1 stops from middle
+// grey: contrast well above 1.0 through the WHOLE shadow band. AgX's own toe power is 1.0; the fit's
+// is 2.90, and a toe that hard is the double contrast — MW's diffuse textures are photographs with
+// shading already baked into the albedo, and a night exterior or an interior lives in exactly the
+// -2..-6 band, so the crush landed where all the content is. Ship default (2.40 / 1.30 / 1.00) reads
+// 1.06 / 1.00 / 0.97 / 0.97 / 0.98 across the same band, and moves midtones by <=2.3 codes and
+// highlights by <=8.3. It is a shadow change and very nearly nothing else.
+//
+// THE FORM (three functions, the middle one doing the work):
+//   scale(lx, ly, s, p) = ((s*lx)^-p * ((s*(lx/ly))^p - 1))^(-1/p)   <- host-side, once per frame
+//   hyper(x, p)         = x / (1 + x^p)^(1/p)
+//   f(x)                = hyper(s*(x - px)/S, p)*S + py,  S = +shoulderScale above px, -toeScale below
+// The two scales are what pin f(0) = 0 and f(1) = 1 exactly (the polynomial only managed -0.00232
+// and 0.99858), and the pivot is fixed at px = 0.606061, py = 0.5.
+//
+// ⚠ THE PIVOT IS MIDDLE GREY, WHICH IS WHY 0.18 IS NOT A WITNESS FOR THESE KNOBS.
+// (log2(0.18) - AGX_MIN_EV) / (AGX_MAX_EV - AGX_MIN_EV) = 10.0/16.5 = 0.606061 = px exactly, and
+// f(px) = py by construction for ANY slope/toe/shoulder. The 0.18 landmark therefore gates the
+// matrices and the log domain and says nothing about the curve's shape; 1.0 (the shoulder) is the
+// landmark that moves. The host self-test asserts both, for those two different reasons.
+//
+// ⚠ scale() HAS A DOMAIN AND OUTSIDE IT THE ANSWER IS NaN — `(s*(lx/ly))^p - 1` goes negative and a
+// fractional power of a negative is NaN, which then survives every later multiply including one by
+// zero coverage ([[project_nan_survives_zero_multiply]]). With the pivot fixed, the SHOULDER is the
+// binding constraint: slope > (1-py)/(1-px) = 1.269231 (the toe alone would only need > 0.825), and
+// it explodes approaching it — shoulderScale is 827 at slope 1.270 and 21.1 at 1.300. That guard
+// lives HOST-side and only there: the two scales are uniform, so the host computes them once per
+// frame, clamps slope into [1.5, 3.0] and asserts both scales finite. The NaN is caught where the
+// value is MADE, once, instead of per pixel — and this shader loses two pow()s for it.
+//
+// The argument handed to hyper() is >= 0 in BOTH branches, which is load-bearing for the same
+// reason: below the pivot (x - px) is negative and S is negative, so the quotient is positive; above
+// it both are positive; at the pivot it is exactly 0 and pow(0, p) = 0. There is no path here that
+// raises a negative to a fractional power.
+//
+// curve      = (slope, toePower, shoulderPower, unused)
+// curveScale = (toeScale, shoulderScale, pivotX, pivotY)   <- both scales computed on the host
+float3 agxContrast(float3 x, float4 curve, float4 curveScale)
 {
-    float3 x2 = x * x;
-    float3 x4 = x2 * x2;
-    return  15.5f    * x4 * x2
-          - 40.14f   * x4 * x
-          + 31.96f   * x4
-          -  6.868f  * x2 * x
-          +  0.4298f * x2
-          +  0.1191f * x
-          -  0.00232f;
+    float3 px = float3(curveScale.z, curveScale.z, curveScale.z);
+    // Per CHANNEL, not per wave: which side of the pivot a channel lands on is pixel data. Selects
+    // rather than a branch — this is two ALU picks, and a divergent branch around a pow() is not.
+    float3 hi = step(px, x);                                   // 1 above the pivot, 0 below
+    float3 S  = lerp(float3(-curveScale.x, -curveScale.x, -curveScale.x),
+                     float3( curveScale.y,  curveScale.y,  curveScale.y), hi);
+    float3 p  = lerp(float3(curve.y, curve.y, curve.y),
+                     float3(curve.z, curve.z, curve.z), hi);
+    float3 t  = max(curve.x * (x - px) / S, float3(0.0f, 0.0f, 0.0f));
+    return (t / pow(1.0f + pow(t, p), 1.0f / p)) * S + float3(curveScale.w, curveScale.w, curveScale.w);
 }
 
 // Steps 1-3: linear scene radiance -> the AgX tone-mapped log domain, ~[0,1].
-float3 agx(float3 v)
+//
+// TAKES THE CURVE AS PARAMETERS rather than reading a cbuffer, and that is the same split
+// tonemap.h.fsl and linearize.h.fsl keep: this header has NO SRT dependency, resolve.frag has a
+// private SRT, and the maths must not know about the policy. resolve.frag.fsl is the only caller in
+// the tree.
+float3 agx(float3 v, float4 curve, float4 curveScale)
 {
     v = agxInset(max(v, float3(0.0f, 0.0f, 0.0f)));
-    // Floor before log2. log2(0) is -inf, and an inf that reaches a multiply is the NaN above by a
-    // different road. 1e-10 is log2 = -33.2, i.e. twenty stops below anything AGX_MIN_EV keeps.
+    // Floor before log2. log2(0) is -inf, and an inf that reaches a multiply is a NaN by a different
+    // road. 1e-10 is log2 = -33.2, i.e. twenty stops below anything AGX_MIN_EV keeps.
     v = clamp(log2(max(v, float3(1.0e-10f, 1.0e-10f, 1.0e-10f))),
               float3(AGX_MIN_EV, AGX_MIN_EV, AGX_MIN_EV),
               float3(AGX_MAX_EV, AGX_MAX_EV, AGX_MAX_EV));
     v = (v - AGX_MIN_EV) * (1.0f / (AGX_MAX_EV - AGX_MIN_EV));
-    return agxContrast(v);
+    return agxContrast(v, curve, curveScale);
 }
 
 // Step 4: THE LOOK. ASC CDL — slope/offset/power, then saturation about luma — applied AFTER the

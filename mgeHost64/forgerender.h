@@ -250,6 +250,14 @@ namespace ForgeRender {
     // not attached.
     void armGpuCapture(unsigned frames);
 
+    // Arm ONE dump of the host's LINEAR scene target — hdrdump/mge_NNNN.exr (uncompressed 4xHALF,
+    // the fp16 MSAA colour target resolved, BEFORE the exposure multiply and BEFORE the curve) plus
+    // mge_NNNN.tga (the composited BGRA8 frame). From the client's numpad-1 one-shot or the Tonemap
+    // dev panel. The only way scene-referred radiance leaves this process: every other path out goes
+    // through resolve.frag, which exposes, tone-maps, encodes and dithers into 8 bits. Declines with
+    // a log line on a build that is not scene-referred — there is no linear target to dump there.
+    void armHdrDump();
+
     // Debug: read back the live shared RT centre pixel and printf it (BGRA). Used by the
     // --forge-scene probe to ground-truth the fragment output offline.
     void debugReadbackCenterPixel();

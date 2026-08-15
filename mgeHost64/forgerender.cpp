@@ -34,6 +34,7 @@
 #include <deque>
 #include <string>
 #include <cmath>
+#include <limits>    // std::numeric_limits — agxScaleF returns NaN outside its domain, on purpose
 #include <unordered_map>
 #include <algorithm>
 #include <array>
@@ -632,6 +633,12 @@ namespace {
     // is submitted after the frame fence, so a capture that ended at renderScene's return missed it).
     static unsigned g_rdocArmFrames = 0;      // frames still to capture
     static bool     g_rdocCapturing = false;  // a StartFrameCapture is open
+
+    // Linear scene-target dump (numpad 1 / dev panel), armed for exactly ONE frame. Declared beside
+    // the RenderDoc arm because it is the same pattern for the same reason — the host owns the frame
+    // boundary and the client owns the keyboard — and because the two are the only two ways anything
+    // leaves this process other than the composited 8-bit seam.
+    static bool g_hdrDumpArmed = false;
 }
 
 namespace ForgeRender {
@@ -679,6 +686,16 @@ namespace ForgeRender {
         g_rdocArmFrames = (frames > 8u) ? 8u : frames;   // a capture is ~GBs; 8 is already generous
         LOG::logline(">> [forge] GPU capture ARMED for %u frame(s) -> forge_frame_frameNNN.rdc in the install dir",
                      g_rdocArmFrames); LOG::flush();
+    }
+
+    // Arm ONE linear scene-target dump. Called from the IPC server on the numpad-1 one-shot and from
+    // the Tonemap dev-panel button; the capture itself runs after the next frame's queueSubmit (see
+    // hdrDumpIfArmed). Unlike the RenderDoc arm this needs nothing installed — it is a copy the host
+    // does itself — so the only way it declines is a build with no linear target to read, which it
+    // says at capture time rather than here.
+    void armHdrDump() {
+        g_hdrDumpArmed = true;
+        LOG::logline(">> [forge] HDR dump ARMED — next frame -> hdrdump/mge_NNNN.exr + .tga"); LOG::flush();
     }
 
     bool probe() {
@@ -2965,6 +2982,34 @@ namespace {
     float g_agxSat    = 1.00f;
     float g_agxOffset = 0.00f;
 
+    // THE CURVE ITSELF (step 3b) — slope, TOE power, SHOULDER power of AgX's contrast sigmoid.
+    // Distinct from the four look knobs above in the way that matters: the look is an ASC CDL
+    // stacked on top of the transform and ships as an exact identity, so these three ARE the frame's
+    // contrast operator. There is no separate "contrast stage" to blame.
+    //
+    // ⚠ WHY THESE EXIST AT ALL. Until step 3b the sigmoid was a fixed 6th-order polynomial fit, and
+    // a fit cannot express a toe. Fitting the parametric form to it gives slope 2.02 / toe 2.90 /
+    // shoulder 2.90 (RMS 0.0022, max 1.1 codes of 255 — tight enough that the characterisation is
+    // trustworthy), and AgX's own toe power is 1.0. Toe 2.90 is a FAR harder toe than AgX has, and
+    // measured off the polynomial the log-log contrast slope ran 1.86 / 1.68 / 1.44 / 1.21 / 0.99 at
+    // -5..-1 stops from grey — above 1.0 across the whole shadow band. MW's diffuse maps are
+    // photographs with the shading already baked into the albedo and an interior or a night exterior
+    // lives at -2..-6 stops, so the crush landed on all of the content.
+    //
+    // Ship default 2.40 / 1.30 / 1.00 reads 1.06 / 1.00 / 0.97 / 0.97 / 0.98 across that band, and
+    // the whole change is surgical to the shadows — display-code deltas against the polynomial:
+    //     stops   -6    -5     -4    -3    -2    -1    +0    +1    +2    +3    +4
+    //     delta +9.1 +13.5  +11.7  +7.1  +1.7  -1.5  +0.9  +1.8  -2.3  -6.7  -8.3
+    // Toe 1.0 (true AgX) is one slider away and lifts -5 by another 6 codes; 1.30 was chosen as the
+    // point where the band reads ~1.00 rather than under it.
+    //
+    // ⚠⚠ SETTING 2.02 / 2.90 / 2.90 REPRODUCES THE RETIRED POLYNOMIAL to ~1 code, and that is the
+    // regression test — the same code path making the old image is stronger evidence than a toggle
+    // between two paths. Which is also why the polynomial is GONE rather than kept as an A/B.
+    float g_agxSlope2        = 2.40f;
+    float g_agxToePower      = 1.30f;
+    float g_agxShoulderPower = 1.00f;
+
     // THE ONE FOLDED EXPRESSION. Published to gShadowParams.toneParams.w (liftInPass) and to
     // gResolveParams.tone.y (which curve resolve.frag applies), and consulted by every host site that
     // lifts or un-lifts against the legacy curve. One source, so the pass that applies the curve and
@@ -2986,17 +3031,66 @@ namespace {
     // the bisection's upper bracket. The cubic's equivalent was 2.2; this is 16.29.
     constexpr float kAgxMaxScene = 16.2917408f;
 
-    // The 6th-order sigmoid approximation, on the normalised [0,1] log domain. Mirrors agxContrast().
+    // THE PIVOT, fixed. px is exactly where middle grey lands in the normalised log domain —
+    // (log2(0.18) - kAgxMinEV) / (kAgxMaxEV - kAgxMinEV) = 10.0/16.5 = 0.606061 — which is why
+    // f(0.18) = py for EVERY setting of the three curve knobs, and why the 0.18 self-test landmark
+    // gates the matrices rather than the curve. Mirrors curveScale.zw in resolve.srt.h.
+    constexpr float kAgxPivotX = 0.606061f;
+    constexpr float kAgxPivotY = 0.5f;
+
+    // THE DOMAIN BOUNDARY, DERIVED FROM THE PIVOT and never hard-coded. agxScaleF()'s inner term
+    // `(s*(lx/ly))^p - 1` goes negative — and a fractional power of a negative is NaN — unless
+    // s > lx/ly for both halves. The SHOULDER is the binding one: (1-py)/(1-px) = 1.269231, against
+    // the toe's py/px = 0.825. Written as an expression so the day the pivot moves, this moves with
+    // it instead of quietly ceasing to be the boundary.
+    inline float agxSlopeBoundary() {
+        return std::max((1.0f - kAgxPivotY) / (1.0f - kAgxPivotX), kAgxPivotY / kAgxPivotX);
+    }
+    // ...and the clamp actually applied, with headroom over it. Not merely "above the boundary":
+    // shoulderScale EXPLODES on approach — 827 at slope 1.270, 21.1 at 1.300, 3.25 at 1.500 — so a
+    // slope that only just clears the NaN is still a curve nobody wants. A verified scan of 33 635
+    // parameter sets over slope [1.30, 3.00] x toe/shoulder [0.5, 3.5] passes monotonicity and both
+    // endpoints; the same scan just below the boundary fails every one of 4 805.
+    inline float agxSlopeF() {
+        return std::max(1.5f, std::min(3.0f, g_agxSlope2));
+    }
+
+    // scale(lx, ly, s, p) = ((s*lx)^-p * ((s*(lx/ly))^p - 1))^(-1/p). Uniform, so it is computed
+    // HERE — once per frame for the shader, and per call for the self-test's mirror — and never per
+    // pixel. Returns NaN outside its domain rather than a plausible number; the caller checks.
+    inline float agxScaleF(float lx, float ly, float s, float p) {
+        const float inner = std::pow(s * (lx / ly), p) - 1.0f;
+        if (!(inner > 0.0f)) {
+            return std::numeric_limits<float>::quiet_NaN();
+        }
+        return std::pow(std::pow(s * lx, -p) * inner, -1.0f / p);
+    }
+    struct AgxScales { float toe, shoulder; };
+    inline AgxScales agxScalesF() {
+        const float s = agxSlopeF();
+        AgxScales r;
+        r.toe      = agxScaleF(kAgxPivotX,        kAgxPivotY,        s, g_agxToePower);
+        r.shoulder = agxScaleF(1.0f - kAgxPivotX, 1.0f - kAgxPivotY, s, g_agxShoulderPower);
+        return r;
+    }
+
+    // AgX's contrast sigmoid on the normalised [0,1] log domain, from the live knobs. Mirrors
+    // agxContrast() in agx.h.fsl step for step, including the sign of S, so the host's neutral-axis
+    // mirror keeps agreeing with the shader after a slider moves.
+    //
+    // The argument to the hyperbolic is >= 0 on BOTH sides of the pivot (below it, numerator and
+    // denominator are both negative), which is what keeps a fractional power away from a negative
+    // base here — the NaN risk in this feature lives entirely in agxScaleF, not in this function.
+    inline float agxSigmoidF(float x, float slope, float toeP, float shP, float toeS, float shS) {
+        const bool  hi = (x >= kAgxPivotX);
+        const float S  = hi ?  shS  : -toeS;
+        const float p  = hi ?  shP  :  toeP;
+        const float t  = std::max(slope * (x - kAgxPivotX) / S, 0.0f);
+        return (t / std::pow(1.0f + std::pow(t, p), 1.0f / p)) * S + kAgxPivotY;
+    }
     inline float agxContrastF(float x) {
-        const float x2 = x * x;
-        const float x4 = x2 * x2;
-        return  15.5f    * x4 * x2
-              - 40.14f   * x4 * x
-              + 31.96f   * x4
-              -  6.868f  * x2 * x
-              +  0.4298f * x2
-              +  0.1191f * x
-              -  0.00232f;
+        const AgxScales sc = agxScalesF();
+        return agxSigmoidF(x, agxSlopeF(), g_agxToePower, g_agxShoulderPower, sc.toe, sc.shoulder);
     }
 
     // Neutral-axis AgX with an EXPLICIT look, so the self-test can pin the look to base while the
@@ -3008,9 +3102,11 @@ namespace {
         t = std::max(kAgxMinEV, std::min(kAgxMaxEV, t));
         t = (t - kAgxMinEV) / (kAgxMaxEV - kAgxMinEV);
         float s = agxContrastF(t);
-        // Floor before every pow(): the sigmoid approximation undershoots to -0.00232 at t = 0, and a
-        // negative base under a fractional exponent is NaN — which then survives every later multiply
-        // including one by zero ([[project_nan_survives_zero_multiply]]). Same floors as agx.h.fsl.
+        // Floor before every pow(). The parametric sigmoid no longer undershoots — f(0) = 0 and
+        // f(1) = 1 exactly, where the retired polynomial fit managed -0.00232 and 0.99858 — but the
+        // look's own offset knob can still drive the base negative, and a negative base under a
+        // fractional exponent is NaN, which survives every later multiply including one by zero
+        // ([[project_nan_survives_zero_multiply]]). Same floors as agx.h.fsl.
         s = std::pow(std::max(s * slope + offset, 0.0f), power);
         return std::pow(std::max(s, 0.0f), 2.2f);
     }
@@ -3019,9 +3115,12 @@ namespace {
     }
 
     // THE INVERSE — linear display back to scene radiance. BISECTION, for the same reason
-    // inverseTonemap() bisects and one more: the composition of a clamped log, a polynomial that is
-    // only approximately monotone, and two live-tunable pow()s has no derivative anyone should be
-    // dividing by. Bisection's invariant is only that the answer lies between the brackets.
+    // inverseTonemap() bisects and one more: the composition of a clamped log, a two-sided sigmoid
+    // with three live exponents, and two live-tunable pow()s has no derivative anyone should be
+    // dividing by. Bisection's invariant is only that the answer lies between the brackets — it
+    // needs MONOTONICITY and nothing else, which the 33 635-set scan behind agxSlopeF() establishes
+    // across the whole clamped range (the retired polynomial was only APPROXIMATELY monotone, so
+    // this got stricter, not looser).
     //
     // The bracket is [0, kAgxMaxScene] instead of [0, 2.2] — 24 halvings put the scene-side
     // resolution at ~1e-6, and |d(out)/d(x)| never exceeds ~1 over the range, so the round trip is
@@ -3096,18 +3195,58 @@ namespace {
         }
     }
 
-    // What the three numbers gate, and why each one cannot be faked:
+    // What the numbers gate, and why each one cannot be faked:
     //
+    //  0. THE DOMAIN GATE (step 3b). Both sigmoid scales FINITE, and the clamped slope clear of the
+    //     boundary derived from the pivot. It is first because it is the only failure here that is
+    //     silent: agxScaleF() outside its domain returns NaN, a NaN survives every later multiply
+    //     including one by zero coverage ([[project_nan_survives_zero_multiply]]), and the frame
+    //     that results is not "a bit off", it is gone. Checked at the one place the value is MADE.
     //  1. THE LANDMARKS, at BASE look (so they are properties of the transform and not of a slider).
-    //     0.18 linear scene -> 0.5005 as an sRGB display code, 1.0 -> 0.7919. Middle grey at half
-    //     code is AgX's signature; any coefficient error moves it.
+    //     0.18 linear scene -> 0.5039 as an sRGB display code, 1.0 -> 0.7740 at the ship curve.
+    //     ⚠ THESE TWO TEST DIFFERENT THINGS and that distinction arrived with step 3b: 0.18 lands
+    //     EXACTLY on the sigmoid's pivot (kAgxPivotX = 10.0/16.5), so it reads py for every slope,
+    //     toe and shoulder — it gates the matrices, the EV bounds and the normalisation, and is
+    //     blind to the curve's shape. 1.0 sits out on the shoulder and is the one that moves with
+    //     the knobs. A change to the curve that leaves BOTH untouched has not been tested by either.
     //  2. NEUTRAL DRIFT — the full matrix path against the neutral-axis mirror, swept over all 16.5
     //     stops at both the base and the LIVE look. This is what catches a transposed matrix: the
     //     transpose's row sums are 0.927 / 1.035 / 1.038, so grey stops being grey by ~7%, against
     //     the ~2e-4 the correct rows drift by. It also proves the mirror the servo depends on.
     //  3. INVERSE MAX ERR — agxNeutralF(agxInverseNeutralF(d)) - d, closed against the same mirror
     //     calGainDomain() inverts through, over the same sweep.
+    //  4. POLY ERR (step 3b) — the retired 6th-order fit, evaluated ONLY here, against the
+    //     parametric sigmoid at 2.02 / 2.90 / 2.90. This is what makes replacing it a SUPERSET claim
+    //     instead of a swap: if the new form can still produce the old image, nothing was lost by
+    //     deleting the old code, and the check is stronger than an A/B toggle because it is the SAME
+    //     code path reproducing it. It is also the reason the polynomial survives in this file at
+    //     all — as the reference the replacement is measured against, never as a path a frame can
+    //     take. Expect <= 0.0042 (1.1 codes of 255); the fit's RMS over [0,1] is 0.0022.
     void agxSelfTest() {
+        // (0) THE DOMAIN GATE — run first, and loudly, because everything below it would otherwise
+        // report NaN landmarks and a NaN drift and leave the reader guessing which of five things
+        // broke. The clamp in agxSlopeF() is what should make this unreachable; this is the check
+        // that the clamp and the boundary have not drifted apart.
+        AgxScales   sc        = agxScalesF();
+        float       slopeUsed = agxSlopeF();
+        const float slopeMin  = agxSlopeBoundary();
+        const bool  domainOK  = std::isfinite(sc.toe) && std::isfinite(sc.shoulder)
+                             && (slopeUsed > slopeMin);
+        if (!domainOK) {
+            LOG::logline("!! [tonemap] AgX curve OUT OF DOMAIN: slope %.4f (clamped %.4f, boundary %.6f)"
+                         " toe^%.2f shoulder^%.2f -> toeScale %.4f shoulderScale %.4f — a NaN here becomes"
+                         " a NaN FRAME. Curve knobs REJECTED; falling back to 2.40 / 1.30 / 1.00.",
+                         g_agxSlope2, slopeUsed, slopeMin, g_agxToePower, g_agxShoulderPower,
+                         sc.toe, sc.shoulder);
+            std::printf("[forge] AgX self-test: DOMAIN FAIL — slope %.4f boundary %.6f toeScale %.4f"
+                        " shoulderScale %.4f\n", slopeUsed, slopeMin, sc.toe, sc.shoulder);
+            g_agxSlope2 = 2.40f; g_agxToePower = 1.30f; g_agxShoulderPower = 1.00f;
+            // Re-read, so every number below (and every number LOGGED below) describes the curve
+            // that will actually render rather than the one that was rejected.
+            sc = agxScalesF();
+            slopeUsed = agxSlopeF();
+        }
+
         const float g18[3] = { 0.18f, 0.18f, 0.18f };
         const float g10[3] = { 1.0f, 1.0f, 1.0f };
         float o18[3] = {}, o10[3] = {};
@@ -3137,14 +3276,40 @@ namespace {
                 invErr = std::max(invErr, std::fabs(back - n));
             }
         }
-        LOG::logline(">> [tonemap] AgX: 0.18->%.4f  1.0->%.4f  neutral drift %.5f  inverse max err %.5f"
-                     "  [pass: 0.5005 / 0.7919 / <0.001 / <0.001 — landmarks are sRGB display codes at BASE look]",
-                     code18, code10, drift, invErr);
+        // (4) THE SUPERSET CHECK. The retired polynomial, alive here and nowhere else, against the
+        // parametric sigmoid dialled to the settings that fit it. A failure means the sigmoid's form
+        // or its scale terms drifted from the curve this project actually shipped for months — which
+        // no landmark above would catch, because both landmarks are evaluated at the LIVE knobs.
+        float polyErr = 0.0f;
+        {
+            const float ps = 2.02f, pt = 2.90f, psh = 2.90f;
+            const float pts = agxScaleF(kAgxPivotX,        kAgxPivotY,        ps, pt);
+            const float pss = agxScaleF(1.0f - kAgxPivotX, 1.0f - kAgxPivotY, ps, psh);
+            for (int i = 0; i <= 256; ++i) {
+                const float x  = (float)i / 256.0f;
+                const float x2 = x * x, x4 = x2 * x2;
+                const float ref = 15.5f * x4 * x2 - 40.14f * x4 * x + 31.96f * x4
+                                - 6.868f * x2 * x + 0.4298f * x2 + 0.1191f * x - 0.00232f;
+                polyErr = std::max(polyErr, std::fabs(agxSigmoidF(x, ps, pt, psh, pts, pss) - ref));
+            }
+        }
+
+        LOG::logline(">> [tonemap] AgX: curve %.2f/%.2f/%.2f scales(toe %.4f sh %.4f, boundary %.4f)"
+                     "  0.18->%.4f  1.0->%.4f  neutral drift %.5f  inverse max err %.5f"
+                     "  poly err %.5f"
+                     "  [pass: 0.5039 / 0.7740 / <0.001 / <0.001 / <0.0042 — landmarks are sRGB"
+                     " display codes at BASE look and the SHIP curve; 0.18 is the pivot and is"
+                     " curve-blind; poly err = the retired 6th-order fit reproduced at 2.02/2.9/2.9]",
+                     slopeUsed, g_agxToePower, g_agxShoulderPower, sc.toe, sc.shoulder, slopeMin,
+                     code18, code10, drift, invErr, polyErr);
         // ...and to stdout as well, because `--forge-scene` returns before main.cpp opens the MGE log
         // and this is the gate that has to run BEFORE anything is looked at. Same reason [scenefmt]
         // prints twice.
-        std::printf("[forge] AgX self-test: 0.18->%.4f (expect 0.5005)  1.0->%.4f (expect 0.7919)"
-                    "  neutral drift %.5f  inverse max err %.5f\n", code18, code10, drift, invErr);
+        std::printf("[forge] AgX self-test: curve %.2f/%.2f/%.2f (toeScale %.4f shoulderScale %.4f,"
+                    " boundary %.4f)  0.18->%.4f (expect 0.5039)  1.0->%.4f (expect 0.7740)"
+                    "  neutral drift %.5f  inverse max err %.5f  poly err %.5f (expect <0.0042)\n",
+                    slopeUsed, g_agxToePower, g_agxShoulderPower, sc.toe, sc.shoulder, slopeMin,
+                    code18, code10, drift, invErr, polyErr);
         LOG::flush();
     }
 
@@ -12424,6 +12589,20 @@ namespace {
           // ⚠ Inert unless the scene is scene-referred AND linear — AgX eats linear radiance. The
           // startup log says which curve actually armed.
           t.checkbox("AgX curve (off = legacy semi-HDR cubic, 2.2 clamp)", &g_agxCurve);
+          // THE CURVE — step 3b. With the look at base these three are the ONLY contrast operator in
+          // the frame, and the reason they are knobs is the toe: the 6th-order polynomial they
+          // replaced fits at toe 2.90 where AgX's own toe is 1.0, i.e. a log-log contrast slope of
+          // 1.2..1.9 through the whole shadow band, landing on exactly the -2..-6 stops an interior
+          // or a night exterior lives in. The old polynomial is recorded in the labels because
+          // dialling it back in is the regression test — same code path, old image, ~1 code apart.
+          // ⚠ Slope is clamped to [1.5, 3.0] host-side: below ~1.269 the scale terms are NaN and it
+          // explodes on approach (shoulderScale 827 at 1.270, 21.1 at 1.300).
+          t.sliderF("Curve: slope (2.40 = ship; 2.02 with both powers 2.90 = the old polynomial)",
+                    &g_agxSlope2, 1.5f, 3.0f, 0.02f);
+          t.sliderF("Curve: TOE power — SHADOWS (1.30 = ship, 1.00 = true AgX, 2.90 = old polynomial)",
+                    &g_agxToePower, 0.5f, 3.5f, 0.05f);
+          t.sliderF("Curve: SHOULDER power — HIGHLIGHTS (1.00 = ship / true AgX, 2.90 = old polynomial)",
+                    &g_agxShoulderPower, 0.5f, 3.5f, 0.05f);
           // SHIPPED AT BASE — 1 / 1 / 1 / 0, an exact identity, so what is on screen is the base
           // transform and nothing else. AgX base IS flat and desaturated by design; that is the
           // starting point a look gets chosen FROM, and choosing it with contrast and saturation
@@ -12433,6 +12612,14 @@ namespace {
           t.sliderF("Look: power / contrast (1 = base/neutral, 1.20 = Punchy)", &g_agxPower, 0.5f, 2.0f, 0.05f);
           t.sliderF("Look: saturation (1 = base/neutral, 1.40 = Punchy)", &g_agxSat, 0.0f, 2.0f, 0.05f);
           t.sliderF("Look: offset (lift/crush, 0 = base)", &g_agxOffset, -0.2f, 0.2f, 0.01f);
+          // THE INSTRUMENT THE SLIDERS ABOVE ARE MEASURED WITH — one linear scene-target dump, the
+          // same one-shot numpad 1 arms. It lives in this tab and not under Resolve because judging
+          // a curve against an 8-bit screenshot of its own output is circular: the EXR is the frame
+          // BEFORE the exposure multiply and before the curve, which is the only thing MW's levels
+          // can be compared against a real HDRI in. Sets a flag; the copy runs after the next
+          // frame's submit (the UI runs mid-frame, where touching GPU resources would stall it).
+          t.button("DUMP linear scene frame -> hdrdump/mge_NNNN.exr + .tga (= numpad 1)",
+                   [](void*) { g_hdrDumpArmed = true; });
           t.flush(); }
 
         // -- Tab: Alpha (sorted-alpha takeover debug) --
@@ -13789,6 +13976,354 @@ namespace {
                     resW, resH, (froxelWordsFor(resW, resH) / (kFroxelZSlices * 4u)),
                     kFroxelZSlices, g_live.froxelBufWords);
         return true;
+    }
+
+    // ===== hdrdump: the LINEAR scene target, out of the process ==================================
+    //
+    // WHY IT EXISTS. pMSAAColor holds linear scene radiance BEFORE the exposure multiply and BEFORE
+    // the curve, and until this block there was no way to get it out: every path out of the host
+    // runs through resolve.frag, which exposes, tone-maps, encodes and dithers into a BGRA8 shared
+    // texture. An EXR of the raw fp16 makes MW's sky, sun and interior levels COMPARABLE against
+    // real HDRIs — which is the only way to answer "is this physically sensible" rather than
+    // eyeballing an 8-bit screenshot of a value that has already been through four transforms.
+    // It is the instrument the tonemap knobs are the thing being measured BY.
+    //
+    // ⚠ NOTHING HERE IS CONVERTED. The EXR is 4 x HALF and the source is already half, so the write
+    // is a de-interleave and a channel reorder — bit-exact with the render target. The TGA is 32-bit
+    // uncompressed and TGA's native channel order is BGRA, which is pRT's format, so that one is a
+    // straight memcpy per row. A dump that quietly re-encoded on the way out would be worse than no
+    // dump: the whole point is to be able to trust the numbers.
+    //
+    // ⚠ ALPHA IS A COVERAGE MASK AND THE RGB IS PREMULTIPLIED BY IT
+    // ([[project_forge_premultiplied_pair]]). That is why A is written rather than dropped — at
+    // partial coverage (the horizon fog band, volfog, the sky edge) the stored RGB is scaled, and
+    // only the stored A lets that be undone. The log line says so at every capture.
+
+    // Little-endian raw writes throughout: OpenEXR is a little-endian format and this is x64, so
+    // "write the bytes" IS the encoding. Stated because it is the one assumption that would make a
+    // file that opens and is wrong.
+    struct ExrOut {
+        std::FILE* f = nullptr;
+        void raw(const void* p, size_t n) { std::fwrite(p, 1, n, f); }
+        void u8(uint8_t v)   { raw(&v, 1); }
+        void i32(int32_t v)  { raw(&v, 4); }
+        void u64(uint64_t v) { raw(&v, 8); }
+        void f32(float v)    { raw(&v, 4); }
+        void cstr(const char* s) { raw(s, std::strlen(s) + 1); }   // EXR names are NUL-terminated
+        void attr(const char* name, const char* type, int32_t size) { cstr(name); cstr(type); i32(size); }
+    };
+
+    // Uncompressed scanline EXR, 4 x HALF, from an interleaved RGBA16F readback.
+    //
+    // NO_COMPRESSION is not a shortcut, it is the only option: there is no zlib/deflate anywhere in
+    // this tree (lz4 and zstd are here, and neither is an EXR codec). It is also what makes the
+    // writer this small — with compression 0 every scanline is its own block and the file is a
+    // header, an offset table and the planes.
+    //
+    // ⚠⚠ EXR STORES CHANNELS IN ALPHABETICAL ORDER, SO THE PLANES GO A, B, G, R. This is the single
+    // likeliest way to produce a file that opens, looks plausible and is wrong — a red/blue swap in
+    // an HDRI comparison reads as "MW's sky is oddly warm" rather than as a bug.
+    bool writeExrHalfRGBA(const char* path, uint32_t w, uint32_t h,
+                          const uint8_t* src, uint32_t srcRowPitch,
+                          float exposureE, const char* stateStr) {
+        std::FILE* f = std::fopen(path, "wb");
+        if (!f) { return false; }
+        ExrOut o; o.f = f;
+
+        o.i32(0x01312F76);   // magic (20000630)
+        o.i32(2);            // version 2, no flags: single-part scanline
+
+        // chlist. Per channel: name\0, int32 pixelType (1 = HALF), uint8 pLinear + 3 reserved,
+        // int32 xSampling, int32 ySampling. Terminated by an empty name.
+        static const char* const kChan[4] = { "A", "B", "G", "R" };   // ALPHABETICAL — see above
+        int32_t chSize = 1;
+        for (int c = 0; c < 4; ++c) { chSize += (int32_t)std::strlen(kChan[c]) + 1 + 16; }
+        o.attr("channels", "chlist", chSize);
+        for (int c = 0; c < 4; ++c) {
+            o.cstr(kChan[c]);
+            o.i32(1);                      // HALF
+            o.u8(0); o.u8(0); o.u8(0); o.u8(0);   // pLinear + 3 reserved
+            o.i32(1); o.i32(1);            // x/y sampling
+        }
+        o.u8(0);                           // end of channel list
+
+        o.attr("compression", "compression", 1); o.u8(0);            // NO_COMPRESSION
+        o.attr("dataWindow", "box2i", 16);
+        o.i32(0); o.i32(0); o.i32((int32_t)w - 1); o.i32((int32_t)h - 1);
+        o.attr("displayWindow", "box2i", 16);
+        o.i32(0); o.i32(0); o.i32((int32_t)w - 1); o.i32((int32_t)h - 1);
+        o.attr("lineOrder", "lineOrder", 1); o.u8(0);                // INCREASING_Y
+        o.attr("pixelAspectRatio", "float", 4); o.f32(1.0f);
+        o.attr("screenWindowCenter", "v2f", 8); o.f32(0.0f); o.f32(0.0f);
+        o.attr("screenWindowWidth", "float", 4); o.f32(1.0f);
+        // The STANDARD exposure attribute, carrying the servo's live E. The pixels are PRE-exposure
+        // by construction, so this is the number a viewer needs to reproduce what was on screen —
+        // and the number that makes two dumps taken in different rooms comparable.
+        o.attr("exposure", "float", 4); o.f32(exposureE);
+        // ...and everything else that decides how these numbers should be read, as one custom
+        // string, so a dump found months later is self-describing rather than a mystery.
+        {
+            const int32_t n = (int32_t)std::strlen(stateStr);
+            o.attr("mgeState", "string", n);
+            o.raw(stateStr, (size_t)n);    // EXR strings are length-prefixed, NOT NUL-terminated
+        }
+        o.u8(0);                           // end of header
+
+        // Scanline offset table: one absolute file offset per scanline, all computable up front
+        // because every uncompressed block is the same size.
+        const uint64_t tableStart = (uint64_t)_ftelli64(f);
+        const uint64_t lineBytes  = (uint64_t)w * 4u * 2u;          // 4 channels x half
+        const uint64_t blockBytes = 8u + lineBytes;                 // int32 y + int32 size + data
+        const uint64_t dataStart  = tableStart + (uint64_t)h * 8u;
+        for (uint32_t y = 0; y < h; ++y) { o.u64(dataStart + (uint64_t)y * blockBytes); }
+
+        std::vector<uint8_t> line((size_t)lineBytes);
+        for (uint32_t y = 0; y < h; ++y) {
+            const uint8_t* row = src + (uint64_t)y * srcRowPitch;
+            // De-interleave RGBA16F into the four alphabetical planes. Byte copies of halves: the
+            // source is already the destination's type, so there is no rounding step to get wrong.
+            static const uint32_t kSrcOfs[4] = { 6u, 4u, 2u, 0u };   // A, B, G, R within an RGBA texel
+            for (int c = 0; c < 4; ++c) {
+                uint8_t* dst = &line[(size_t)c * w * 2u];
+                for (uint32_t x = 0; x < w; ++x) {
+                    const uint8_t* s = row + (uint64_t)x * 8u + kSrcOfs[c];
+                    dst[x * 2u + 0u] = s[0];
+                    dst[x * 2u + 1u] = s[1];
+                }
+            }
+            o.i32((int32_t)y);
+            o.i32((int32_t)lineBytes);
+            o.raw(line.data(), line.size());
+        }
+        const bool ok = (std::ferror(f) == 0);
+        std::fclose(f);
+        return ok;
+    }
+
+    // Uncompressed 32-bit TGA from a BGRA8 readback. imageDescriptor 0x28 = 8 alpha bits + TOP-LEFT
+    // origin, which is the readback's own row order — so no vertical flip, and therefore no chance
+    // of one being applied to the EXR and not to this and the pair silently disagreeing.
+    bool writeTga32(const char* path, uint32_t w, uint32_t h, const uint8_t* src, uint32_t srcRowPitch) {
+        std::FILE* f = std::fopen(path, "wb");
+        if (!f) { return false; }
+        uint8_t hdr[18] = {};
+        hdr[2]  = 2;                            // uncompressed true-colour
+        hdr[12] = (uint8_t)(w & 0xFF);  hdr[13] = (uint8_t)((w >> 8) & 0xFF);
+        hdr[14] = (uint8_t)(h & 0xFF);  hdr[15] = (uint8_t)((h >> 8) & 0xFF);
+        hdr[16] = 32;                           // bits per pixel
+        hdr[17] = 0x28;                         // 8 alpha bits | top-left origin
+        std::fwrite(hdr, 1, sizeof(hdr), f);
+        for (uint32_t y = 0; y < h; ++y) {
+            std::fwrite(src + (uint64_t)y * srcRowPitch, 1, (size_t)w * 4u, f);
+        }
+        const bool ok = (std::ferror(f) == 0);
+        std::fclose(f);
+        return ok;
+    }
+
+    // THE CAPTURE. Runs AFTER the frame's queueSubmit, which is what orders it behind the frame's
+    // work — same queue, no barriers, and therefore ZERO cost on the hot path when nothing is armed.
+    // Self-contained: its own cmd pool / cmd / fence / temp target / readback buffers, all torn down
+    // before it returns, following drawTriangleAndVerify()'s idiom rather than reinventing one.
+    void hdrDumpIfArmed() {
+        if (!g_hdrDumpArmed) { return; }
+        g_hdrDumpArmed = false;   // one shot, and cleared FIRST so no failure path can re-arm it
+
+        Renderer* R = g_live.pRenderer;
+        // ⚠ REQUIRES A SCENE-REFERRED BUILD (fp16 + MSAA). At 1x or in LDR the scene renders
+        // straight into the BGRA8 pRT and there is no linear target to read — writing an EXR of
+        // tone-mapped 8-bit values promoted to half would be a file that looks right and means
+        // nothing, so it declines and says why.
+        if (!R || !g_live.pRT || !g_live.pMSAAColor || !g_live.sceneReferred
+            || g_live.sampleCount <= 1
+            || g_live.sceneColorFormat != TinyImageFormat_R16G16B16A16_SFLOAT) {
+            LOG::logline("!! [hdrdump] DECLINED — needs a scene-referred build (fp16 + MSAA). "
+                         "sceneReferred=%d samples=%u msaaRT=%d fp16=%d",
+                         g_live.sceneReferred ? 1 : 0, g_live.sampleCount,
+                         g_live.pMSAAColor ? 1 : 0,
+                         (g_live.sceneColorFormat == TinyImageFormat_R16G16B16A16_SFLOAT) ? 1 : 0);
+            LOG::flush();
+            return;
+        }
+
+        // ⚠ CROP TO THE RENDER RECT, NOT THE ALLOCATION. Every size-dependent RT is allocated at the
+        // ceiling (allocWidth/allocHeight) while the scene draws into a width x height sub-rect of
+        // it — [[project_forge_alloc_vs_render_uv]], the same trap resolve.frag's callsite warns
+        // about twice. The readback is alloc-sized because that is what the copy hands back; the
+        // FILES are render-sized, or a live render-scale would put a band of never-written texels
+        // down two edges of every dump.
+        const uint32_t W = g_live.width, H = g_live.height;
+        const uint32_t texW = g_live.pMSAAColor->mWidth, texH = g_live.pMSAAColor->mHeight;
+        if (W == 0 || H == 0 || W > texW || H > texH) { return; }
+
+        const double t0 = hostNowMs();
+
+        // A non-MSAA fp16 landing pad. CopyTextureRegion cannot read a multisampled resource, so the
+        // MSAA target has to be resolved first — and ResolveSubresource is LEGAL here precisely
+        // because the format is unchanged (the "a resolve cannot format-convert" gate the shader
+        // resolve exists for bites only on conversion).
+        //
+        // ⚠ AND A HARDWARE BOX RESOLVE IS THE RIGHT FILTER FOR A MEASUREMENT. resolve.frag's
+        // Catmull-Rom + inverse-luminance firefly weighting is a DISPLAY reconstruction and is
+        // deliberately not energy-conserving; running the dump through it would bake a look into the
+        // instrument. A box average of the samples is the honest answer to "what radiance did this
+        // pixel receive".
+        RenderTarget* pTmp = nullptr;
+        {
+            RenderTargetDesc d = {};
+            d.mWidth = texW; d.mHeight = texH; d.mDepth = 1; d.mArraySize = 1; d.mMipLevels = 1;
+            d.mSampleCount = SAMPLE_COUNT_1;
+            d.mFormat = TinyImageFormat_R16G16B16A16_SFLOAT;
+            d.mStartState = RESOURCE_STATE_RENDER_TARGET;
+            d.mDescriptors = DESCRIPTOR_TYPE_TEXTURE;
+            d.pName = "hdrDumpResolve";
+            addRenderTarget(R, &d, &pTmp);
+        }
+        if (!pTmp) {
+            LOG::logline("!! [hdrdump] temp resolve target alloc FAILED"); LOG::flush();
+            return;
+        }
+
+        CmdPool* pPool = nullptr; Cmd* pCmd = nullptr; Fence* pFence = nullptr;
+        CmdPoolDesc pd = {}; pd.pQueue = g_live.pQueue;
+        initCmdPool(R, &pd, &pPool);
+        CmdDesc cd = {}; cd.pPool = pPool;
+        initCmd(R, &cd, &pCmd);
+        initFence(R, &pFence);
+
+        if (pPool && pCmd && pFence) {
+            resetCmdPool(R, pPool);
+            beginCmd(pCmd);
+            ID3D12GraphicsCommandList* cl = pCmd->mDx.pCmdList;
+            ID3D12Resource* msaaRes = g_live.pMSAAColor->pTexture->mDx.pResource;
+            ID3D12Resource* tmpRes  = pTmp->pTexture->mDx.pResource;
+
+            // Native barriers: Forge has no RESOLVE_* resource states, which is why the hardware
+            // resolve path below the shader resolve is driven natively too.
+            D3D12_RESOURCE_BARRIER pre[2] = {};
+            pre[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            pre[0].Transition.pResource   = msaaRes;
+            pre[0].Transition.Subresource = 0;
+            pre[0].Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+            pre[0].Transition.StateAfter  = D3D12_RESOURCE_STATE_RESOLVE_SOURCE;
+            pre[1] = pre[0];
+            pre[1].Transition.pResource   = tmpRes;
+            pre[1].Transition.StateAfter  = D3D12_RESOURCE_STATE_RESOLVE_DEST;
+            cl->ResourceBarrier(2, pre);
+
+            cl->ResolveSubresource(tmpRes, 0, msaaRes, 0, DXGI_FORMAT_R16G16B16A16_FLOAT);
+
+            D3D12_RESOURCE_BARRIER post[2] = {};
+            post[0] = pre[0];
+            post[0].Transition.StateBefore = D3D12_RESOURCE_STATE_RESOLVE_SOURCE;
+            post[0].Transition.StateAfter  = D3D12_RESOURCE_STATE_RENDER_TARGET;   // frame invariant
+            post[1] = pre[1];
+            post[1].Transition.StateBefore = D3D12_RESOURCE_STATE_RESOLVE_DEST;
+            post[1].Transition.StateAfter  = D3D12_RESOURCE_STATE_COPY_SOURCE;
+            cl->ResourceBarrier(2, post);
+            endCmd(pCmd);
+
+            QueueSubmitDesc sd = {};
+            sd.mCmdCount = 1; sd.ppCmds = &pCmd; sd.pSignalFence = pFence; sd.mSubmitDone = true;
+            queueSubmit(g_live.pQueue, &sd);
+            waitForFences(R, 1, &pFence);   // also settles the FRAME, being behind it on one queue
+
+            const uint32_t rowAlign = (R->pGpu->mUploadBufferTextureRowAlignment > 1u)
+                                          ? R->pGpu->mUploadBufferTextureRowAlignment : 1u;
+            const uint32_t texAlign = (R->pGpu->mUploadBufferTextureAlignment > 1u)
+                                          ? R->pGpu->mUploadBufferTextureAlignment : 1u;
+            // Pitches come from the TEXTURE's own width, never the render width — a readback of an
+            // alloc-sized target laid out at render-width stride would shear the image.
+            const uint32_t hdrPitch = roundUp(texW * 8u, rowAlign);   // RGBA16F
+            const uint32_t ldrPitch = roundUp(g_live.pRT->mWidth * 4u, rowAlign);   // BGRA8
+
+            auto makeReadback = [&](uint64_t size) -> Buffer* {
+                BufferLoadDesc bd = {};
+                bd.mDesc.mSize = roundUp64(size, texAlign);
+                bd.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_GPU_TO_CPU;
+                bd.mDesc.mFlags = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
+                bd.mDesc.mStartState = RESOURCE_STATE_COPY_DEST;
+                bd.mDesc.mQueueType = QUEUE_TYPE_TRANSFER;
+                Buffer* b = nullptr; bd.ppBuffer = &b;
+                addResource(&bd, nullptr);
+                waitForAllResourceLoads();
+                return b;
+            };
+            Buffer* pHdrRb = makeReadback((uint64_t)hdrPitch * texH);
+            Buffer* pLdrRb = makeReadback((uint64_t)ldrPitch * g_live.pRT->mHeight);
+
+            if (pHdrRb) {
+                TextureCopyDesc c = {};
+                c.pTexture = pTmp->pTexture; c.pBuffer = pHdrRb;
+                c.mTextureState = RESOURCE_STATE_COPY_SOURCE; c.mQueueType = QUEUE_TYPE_GRAPHICS;
+                SyncToken tk = {}; copyResource(&c, &tk); waitForToken(&tk);
+            }
+            if (pLdrRb) {
+                // pRT is left in COMMON by the frame's D3D9Ex handoff, and copyResource does its own
+                // COMMON -> COPY_SOURCE -> COMMON bracket, so the shared resource is handed back in
+                // exactly the state the client expects to find it in.
+                TextureCopyDesc c = {};
+                c.pTexture = g_live.pRT->pTexture; c.pBuffer = pLdrRb;
+                c.mTextureState = RESOURCE_STATE_COMMON; c.mQueueType = QUEUE_TYPE_GRAPHICS;
+                SyncToken tk = {}; copyResource(&c, &tk); waitForToken(&tk);
+            }
+
+            // Output lands next to mgeHost64.log — the host's cwd IS the install dir, so this
+            // follows whatever install is running instead of one developer's hardcoded path (the
+            // same reasoning the RenderDoc capture template uses).
+            CreateDirectoryA("hdrdump", nullptr);
+            static unsigned s_next = 0;
+            char exrPath[MAX_PATH] = {}, tgaPath[MAX_PATH] = {};
+            for (; s_next < 10000u; ++s_next) {
+                std::snprintf(exrPath, sizeof(exrPath), "hdrdump\\mge_%04u.exr", s_next);
+                if (GetFileAttributesA(exrPath) == INVALID_FILE_ATTRIBUTES) { break; }
+            }
+            std::snprintf(tgaPath, sizeof(tgaPath), "hdrdump\\mge_%04u.tga", s_next);
+
+            const float E = (g_live.sceneReferred && g_expEnable) ? (float)g_exposure : 1.0f;
+            const AgxScales sc = agxScalesF();
+            char state[512] = {};
+            std::snprintf(state, sizeof(state),
+                          "MGE XE forge host | LINEAR SCENE RADIANCE, PRE-exposure PRE-curve, "
+                          "PREMULTIPLIED by alpha (coverage) | E=%.4f curve=%s "
+                          "sigmoid=%.3f/%.3f/%.3f scales=%.4f/%.4f look=%.2f/%.2f/%.2f/%.2f "
+                          "samples=%u render=%ux%u alloc=%ux%u apl=%.5f,%.5f,%.5f",
+                          E, agxActive() ? "agx" : "legacy",
+                          agxSlopeF(), g_agxToePower, g_agxShoulderPower, sc.toe, sc.shoulder,
+                          g_agxSlope, g_agxPower, g_agxSat, g_agxOffset,
+                          g_live.sampleCount, W, H, texW, texH,
+                          g_lastApl[0], g_lastApl[1], g_lastApl[2]);
+
+            bool exrOK = false, tgaOK = false;
+            if (pHdrRb && pHdrRb->pCpuMappedAddress) {
+                exrOK = writeExrHalfRGBA(exrPath, W, H,
+                                         (const uint8_t*)pHdrRb->pCpuMappedAddress, hdrPitch,
+                                         E, state);
+            }
+            if (pLdrRb && pLdrRb->pCpuMappedAddress) {
+                tgaOK = writeTga32(tgaPath, W, H,
+                                   (const uint8_t*)pLdrRb->pCpuMappedAddress, ldrPitch);
+            }
+
+            // ⚠ The alpha note is in the log line and not only in the header, because the mistake it
+            // prevents is made while LOOKING at the file: RGB is premultiplied by coverage, so a
+            // partially-covered pixel reads dark and dividing by A is what undoes it.
+            LOG::logline(">> [hdrdump] %s (%ux%u, exr=%s tga=%s) E=%.4f | LINEAR, pre-exposure, "
+                         "pre-curve; RGB is PREMULTIPLIED by alpha (coverage) — divide by A to read "
+                         "radiance at partial coverage | %.1f ms",
+                         exrPath, W, H, exrOK ? "ok" : "FAILED", tgaOK ? "ok" : "FAILED",
+                         E, hostNowMs() - t0);
+            LOG::flush();
+
+            if (pHdrRb) { removeResource(pHdrRb); }
+            if (pLdrRb) { removeResource(pLdrRb); }
+            ++s_next;
+        }
+
+        if (pFence) { exitFence(R, pFence); }
+        if (pCmd)   { exitCmd(R, pCmd); }
+        if (pPool)  { exitCmdPool(R, pPool); }
+        removeRenderTarget(R, pTmp);
     }
 }
 
@@ -20746,10 +21281,22 @@ namespace ForgeRender {
                 // disarms the class-2 lift — a frame where those two disagree renders the sky
                 // through half a transform.
                 // look = AgX's ASC-CDL look (slope, power, saturation, offset), applied between the
-                // sigmoid and the outset matrix. Defaults are Blender's *Punchy*: base AgX is
-                // deliberately flat and desaturated, so shipping base would read as a regression.
-                // A fifth float4 = 80 B against a 256 B cbuffer, so no allocation change.
-                const float p[20] = { (float)g_live.width, (float)g_live.height, diam, radius,
+                // sigmoid and the outset matrix. Ships at BASE (1/1/1/0), an exact identity, so the
+                // frame's shape is the curve below and demonstrably not this.
+                // curve = AgX's CONTRAST SIGMOID (step 3b) — slope, TOE power, SHOULDER power. With
+                // the look at base these three ARE the frame's contrast operator; there is no
+                // separate contrast stage. 2.02 / 2.90 / 2.90 reproduces the retired 6th-order
+                // polynomial to ~1 code, which is what makes this a superset rather than a swap.
+                // curveScale = (toeScale, shoulderScale, pivotX, pivotY). ⚠ THE TWO SCALES ARE
+                // COMPUTED HERE, ONCE PER FRAME, and that is the NaN guard, not a saving: their
+                // closed form raises a possibly-negative base to a fractional power below
+                // slope 1.269231, and a NaN would then survive every multiply in the frame including
+                // one by zero coverage ([[project_nan_survives_zero_multiply]]). agxSlopeF() clamps
+                // to [1.5, 3.0] and the init self-test asserts both scales finite, so the value
+                // reaching the shader has already been checked at the one place it is made.
+                // Seven float4 = 112 B against a 256 B cbuffer, so still no allocation change.
+                const AgxScales curveScale = agxScalesF();
+                const float p[28] = { (float)g_live.width, (float)g_live.height, diam, radius,
                                       g_resolveInvLuma ? 1.0f : 0.0f,
                                       g_live.sceneReferred ? 1.0f : 0.0f,
                                       std::max(0.0f, g_resolveSharp),
@@ -20757,7 +21304,9 @@ namespace ForgeRender {
                                       std::max(0.0f, g_resolveDither), 0.0f, 0.0f, 0.0f,
                                       (g_live.sceneReferred && g_expEnable) ? (float)g_exposure : 1.0f,
                                       agxActive() ? 1.0f : 0.0f, 0.0f, 0.0f,
-                                      g_agxSlope, g_agxPower, g_agxSat, g_agxOffset };
+                                      g_agxSlope, g_agxPower, g_agxSat, g_agxOffset,
+                                      agxSlopeF(), g_agxToePower, g_agxShoulderPower, 0.0f,
+                                      curveScale.toe, curveScale.shoulder, kAgxPivotX, kAgxPivotY };
                 std::memcpy(g_live.pResolveParamsCbv->pCpuMappedAddress, p, sizeof(p));
             }
 
@@ -20906,6 +21455,20 @@ namespace ForgeRender {
         submitDesc.pSignalFence = g_live.pFence;
         submitDesc.mSubmitDone = true;
         queueSubmit(g_live.pQueue, &submitDesc);
+        // The linear scene dump (numpad 1 / dev panel), and this is exactly where it belongs.
+        //
+        // AFTER the frame's queueSubmit, because submitting on the SAME QUEUE is what orders the
+        // resolve+copy behind the frame's work — so the hot path gains no barriers, no fences and no
+        // cost at all when nothing is armed (this is one predictable-false branch).
+        //
+        // BEFORE the shared-fence Signal below, because that signal is the client's permission to
+        // read pRT, and the dump reads pRT too. Placed after it, the two reads would race across
+        // process and API boundaries on a resource whose contract says it is COMMON whenever the
+        // other API may touch it. Placed here, the whole dump — including its blocking fence wait
+        // and its readbacks — has finished before the client is told anything is ready, so it is
+        // inside the same exclusive window the frame's own writes are. It costs the armed frame a
+        // stall, which is the correct price for a one-shot dev capture and is paid by nothing else.
+        hdrDumpIfArmed();
         // Tier 1: NO fence wait here — the wait moved to the top of the NEXT renderScene
         // (settleFrameFence). Instead, signal the SHARED, monotonic D3D12 fence on the same queue,
         // queue-ordered behind the frame we just submitted. That signal is the client's only proof

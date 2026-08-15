@@ -305,7 +305,7 @@ float4 PS_MAIN(PsIn In)
             // Inset -> log2 over 16.5 stops -> sigmoid; then the LOOK, between the sigmoid and the
             // outset, which is where Blender applies it; then out of the AgX domain to linear
             // display. No clamp anywhere in it — the shoulder is the ceiling.
-            straight = agx(straight);
+            straight = agx(straight, gResolveParams.curve, gResolveParams.curveScale);
             straight = agxLook(straight, gResolveParams.look.x, gResolveParams.look.y,
                                gResolveParams.look.z, gResolveParams.look.w);
             straight = agxOutset(straight);

@@ -628,6 +628,7 @@ namespace IPC {
 		params.devReloadShaders = di.reloadShaders;
 		params.devDistLightsToggle = di.distLightsToggle;
 		params.devGpuCapture = di.gpuCapture;
+		params.devDumpHdr = di.dumpHdr;
 		params.devFrameAhead = di.frameAhead;
 		params.devClientWaitMs = di.clientWaitMs;
 		params.devClientDtMs = di.clientDtMs;
