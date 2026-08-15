@@ -28,6 +28,21 @@
 //      the FIRST time and darken them — up to 41/255 at the top end (tonemap(1.0) = 0.84). Lifting
 //      them through the inverse means the final curve hands the authored value back untouched.
 //
+//      ⚠⚠ **AMENDED 2026-08-15 (step 3 / S2): CLASS 2 IS NOW INERT, AND THE THREE PASSES ABOVE ARE
+//      EFFECTIVELY CLASS 3.** liftInPass() returns its argument unchanged whenever the AgX curve is
+//      armed. The lift was never "the sky is a reference" as a principle — it was the INVERSE OF ONE
+//      PARTICULAR CURVE, the semi-HDR cubic in tonemap.h.fsl, and AgX is a different curve. Running
+//      inverseTonemap() into AgX does not preserve anything; it just pre-distorts the sky by the
+//      inverse of a function nothing applies any more. The class survives as a CLASSIFICATION (these
+//      three passes still reproduce MW's authored data, and if a closed-form AgX inverse ever exists
+//      this is where it goes) but the operation is gone, and the fog/interior/underwater NEUTRALITY
+//      CHECK that used to gate it is expected to FAIL under AgX. Do not chase it — it was the test
+//      that the lift worked, and the lift is gone by decision (forge-postprocess.md, S2).
+//
+//      The exposure servo had already broken the round trip a step earlier
+//      (tonemap(E·inverseTonemap(a)) != a for any E != 1) and the decision there was the same one:
+//      the sky JOINS the exposed world. This finishes it.
+//
 //   3. GENUINELY GENERATED RADIANCE WITH ITS OWN INTENSITY KNOB  ->  neither; write it raw
 //      glow.frag (Colour x Intensity x f^2). It is not reproducing anything authored, it WANTS to
 //      exceed 1.0 once there is a container for it, and liftInPass would clamp exactly that away.
@@ -109,6 +124,14 @@ float3 tonemapInPass(float3 c)
 float3 liftInPass(float3 c)
 {
     if (gShadowParams.toneParams.x <= 0.5f) { return c; }
+    // STEP 3 / S2 — THE LIFT IS DEAD UNDER AgX. See the class-2 amendment at the top of this file:
+    // everything below inverts tonemap.h.fsl's cubic specifically, and under AgX nothing applies
+    // that cubic. toneParams.w is the host's folded curve select, the SAME expression resolve.frag
+    // receives as gResolveParams.tone.y — one host expression, two receivers, so the pass that
+    // applies the curve and the passes that pre-compensate for it can never disagree about WHICH
+    // curve. (That lane's previous tenant, the air-fog changeover depth, is documented as retired in
+    // shadowparams.h.fsl.)
+    if (gShadowParams.toneParams.w > 0.5f) { return c; }
     // Step 5. The lift's CONTRACT is unchanged — "make the end of the frame hand this authored value
     // back untouched" — but the end of the frame now runs tonemap(linearToSrgb(x)), so the value that
     // has to reach it through the encode is inverseTonemap(authored), and the authored value must

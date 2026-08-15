@@ -992,7 +992,18 @@ STRUCT(ResolveParams)
     float4 dims;
 #line 114 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/resolve.srt.h"
     float4 opts;
-#line 115
+
+
+
+
+
+
+    float4 dither;
+#line 159 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/resolve.srt.h"
+    float4 tone;
+#line 173 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/resolve.srt.h"
+    float4 look;
+#line 174
 };
 
         CBUFFER(ResolveParams) gResolveParams :  register(b0,space3);
@@ -1015,6 +1026,74 @@ float3 inverseTonemap(float3 d)
 }
 #line 43 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/resolve.frag.fsl"
 #line 46 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/resolve.frag.fsl"
+#line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/agx.h.fsl"
+#line 82 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/agx.h.fsl"
+float3 agxInset(float3 v)
+{
+    return float3(
+        dot(v, float3(0.842479062253094f, 0.0784335999999992f, 0.0792237451477643f)),
+        dot(v, float3(0.0423282422610123f, 0.878468636469772f, 0.0791661274605434f)),
+        dot(v, float3(0.0423756549057051f, 0.0784336f, 0.879142973793104f)));
+}
+
+
+float3 agxOutsetMat(float3 v)
+{
+    return float3(
+        dot(v, float3( 1.19687900512017f, -0.0980208811401368f, -0.0990297440797205f)),
+        dot(v, float3(-0.0528968517574562f, 1.15190312990417f, -0.0989611768448433f)),
+        dot(v, float3(-0.0529716355144438f, -0.0980434501171241f, 1.15107367264116f)));
+}
+
+
+
+
+
+
+
+
+float3 agxContrast(float3 x)
+{
+    float3 x2 = x * x;
+    float3 x4 = x2 * x2;
+    return 15.5f * x4 * x2
+          - 40.14f * x4 * x
+          + 31.96f * x4
+          - 6.868f * x2 * x
+          + 0.4298f * x2
+          + 0.1191f * x
+          - 0.00232f;
+}
+
+
+float3 agx(float3 v)
+{
+    v = agxInset(max(v, float3(0.0f, 0.0f, 0.0f)));
+
+
+    v = clamp(log2(max(v, float3(1.0e-10f, 1.0e-10f, 1.0e-10f))),
+              float3( (-12.47393f) ,  (-12.47393f) ,  (-12.47393f) ),
+              float3( (4.026069f) ,  (4.026069f) ,  (4.026069f) ));
+    v = (v -  (-12.47393f) ) * (1.0f / ( (4.026069f)  -  (-12.47393f) ));
+    return agxContrast(v);
+}
+#line 151 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/agx.h.fsl"
+float3 agxLook(float3 v, float slope, float power, float sat, float offset)
+{
+    v = pow(max(v * slope + offset, float3(0.0f, 0.0f, 0.0f)),
+            float3(power, power, power));
+    float luma = dot(v, float3(0.2126f, 0.7152f, 0.0722f));
+    return luma + sat * (v - luma);
+}
+
+
+float3 agxOutset(float3 v)
+{
+    v = agxOutsetMat(v);
+    return pow(max(v, float3(0.0f, 0.0f, 0.0f)), float3(2.2f, 2.2f, 2.2f));
+}
+#line 47 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/resolve.frag.fsl"
+#line 50 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/resolve.frag.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/linearize.h.fsl"
 #line 39 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/linearize.h.fsl"
 float3 srgbToLinear(float3 c)
@@ -1047,14 +1126,14 @@ float3 mod2xLinear(float3 tLinear)
 {
     return srgbToLinear(2.0f * linearToSrgb(tLinear));
 }
-#line 47 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/resolve.frag.fsl"
+#line 51 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/resolve.frag.fsl"
 
 STRUCT(PsIn)
 {
     DATA(float4, position, SV_Position);
-#line 51
+#line 55
 };
-#line 72 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/resolve.frag.fsl"
+#line 76 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/resolve.frag.fsl"
 float rFilterCubic(float x, float B, float C)
 {
     float y = 0.0f;
@@ -1077,6 +1156,38 @@ float rLuminance(float3 c)
 {
     return dot(c, float3(0.299f, 0.587f, 0.114f));
 }
+#line 141 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/resolve.frag.fsl"
+uint rHashU(uint x)
+{
+
+
+
+    x ^= x >> 16; x *= 0x7feb352du;
+    x ^= x >> 15; x *= 0x846ca68bu;
+    x ^= x >> 16;
+    return x;
+}
+
+
+
+
+float2 rHash2(uint seed)
+{
+    uint h = rHashU(seed);
+    return float2(float(h >> 16u), float(h & 0xFFFFu)) * (1.0f / 65536.0f);
+}
+
+float3 rDitherTPDF(float2 pix, float lsb)
+{
+    uint2 p = uint2(pix);
+    uint s = rHashU(p.x) ^ (p.y * 0x9E3779B9u);
+    float2 dr = rHash2(s);
+    float2 dg = rHash2(s ^ 0x68E31DA4u);
+    float2 db = rHash2(s ^ 0xB5297A4Du);
+
+    float3 n = float3(dr.x + dr.y, dg.x + dg.y, db.x + db.y) - 1.0f;
+    return n * (lsb * (1.0f / 255.0f));
+}
 
 [RootSignature( "RootFlags(ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT)," "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "3" ", offset = 0)," "CBV(b0, numDescriptors = unbounded, space = " "3" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "3" ", offset = 0))," "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "2" ", offset = 0)," "CBV(b0, numDescriptors = unbounded, space = " "2" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "2" ", offset = 0))," "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "1" ", offset = 0)," "CBV(b0, numDescriptors = unbounded, space = " "1" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "1" ", offset = 0))," "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "0" ", offset = 0)," "CBV(b0, numDescriptors = unbounded, space = " "0" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "0" ", offset = 0))," "DescriptorTable(" "SAMPLER(s0, numDescriptors = unbounded, space = " "0" ", offset = 0))," "StaticSampler(s0, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s1, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s2, space = 100," "filter = FILTER_MIN_MAG_LINEAR_MIP_POINT," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s3, space = 100," "filter = FILTER_MIN_MAG_LINEAR_MIP_POINT," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s4, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s5, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s6, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT," "addressU = TEXTURE_ADDRESS_MIRROR, addressV = TEXTURE_ADDRESS_MIRROR, addressW = TEXTURE_ADDRESS_MIRROR)," "StaticSampler(s7, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT, borderColor = STATIC_BORDER_COLOR_TRANSPARENT_BLACK," "addressU = TEXTURE_ADDRESS_BORDER, addressV = TEXTURE_ADDRESS_BORDER, addressW = TEXTURE_ADDRESS_BORDER)," "StaticSampler(s8, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR," "addressU = TEXTURE_ADDRESS_MIRROR, addressV = TEXTURE_ADDRESS_MIRROR, addressW = TEXTURE_ADDRESS_MIRROR)," "StaticSampler(s9, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR, borderColor = STATIC_BORDER_COLOR_TRANSPARENT_BLACK," "addressU = TEXTURE_ADDRESS_BORDER, addressV = TEXTURE_ADDRESS_BORDER, addressW = TEXTURE_ADDRESS_BORDER)," "StaticSampler(s10, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 8," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s11, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 8," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s12, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 8," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s13, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 8," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s14, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 2," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s15, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 2," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s16, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 2," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s17, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 2," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_WRAP)" )]
 float4 PS_MAIN(PsIn In): SV_TARGET
@@ -1090,7 +1201,7 @@ float4 PS_MAIN(PsIn In): SV_TARGET
         float2(-0.3125f, 0.3125f), float2(-0.4375f, -0.0625f),
         float2( 0.1875f, 0.4375f), float2( 0.4375f, -0.4375f)
     };
-#line 118 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/resolve.frag.fsl"
+#line 196 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/resolve.frag.fsl"
     float2 pixelPos = In.position.xy;
     float2 texSize = gResolveParams.dims.xy;
     float filtRad = max(gResolveParams.dims.z, 0.001f) * 0.5f;
@@ -1137,7 +1248,7 @@ float4 PS_MAIN(PsIn In): SV_TARGET
     }
 
     float4 outRgba = sum / max(totalWeight, 1.0e-5f);
-#line 176 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/resolve.frag.fsl"
+#line 254 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/resolve.frag.fsl"
     float aRaw = outRgba.a;
     float3 rgb = outRgba.rgb;
     if (aRaw > 1.0f) { rgb *= 1.0f / aRaw; }
@@ -1146,7 +1257,7 @@ float4 PS_MAIN(PsIn In): SV_TARGET
 
     rgb = max(rgb, float3(0.0f, 0.0f, 0.0f));
     float aOut = saturate(aRaw);
-#line 199 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/resolve.frag.fsl"
+#line 277 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/resolve.frag.fsl"
     if (gResolveParams.opts.y > 0.5f)
     {
         float3 straight = rgb / max(aOut, 1.0e-4f);
@@ -1159,12 +1270,46 @@ float4 PS_MAIN(PsIn In): SV_TARGET
 
 
 
-
-        if (gResolveParams.opts.w > 0.5f)
+        straight *= gResolveParams.tone.x;
+#line 303 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/resolve.frag.fsl"
+        if (gResolveParams.tone.y > 0.5f)
         {
+
+
+
+            straight = agx(straight);
+            straight = agxLook(straight, gResolveParams.look.x, gResolveParams.look.y,
+                               gResolveParams.look.z, gResolveParams.look.w);
+            straight = agxOutset(straight);
+
+
+
             straight = linearToSrgb(straight);
         }
-        rgb = tonemap(straight) * aOut;
+        else
+        {
+
+
+
+
+            if (gResolveParams.opts.w > 0.5f)
+            {
+                straight = linearToSrgb(straight);
+            }
+            straight = tonemap(straight);
+        }
+        rgb = straight * aOut;
+    }
+
+
+
+
+
+
+    if (gResolveParams.dither.x > 0.0f)
+    {
+        rgb = max(rgb + rDitherTPDF(In.position.xy, gResolveParams.dither.x),
+                  float3(0.0f, 0.0f, 0.0f));
     }
 
     return (float4(rgb, aOut));

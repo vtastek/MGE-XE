@@ -112,6 +112,65 @@ STRUCT(ResolveParams)
     //     brightnesses, and `1/(1+luma)` was weighting an encoded number. Neither is a knob change,
     //     so do not re-tune the diameter or C at S1 — that is what makes them attributable at S2.
     DATA(float4, opts, None);
+    // x = OUTPUT DITHER amplitude, in LSB of the 8-bit destination. 0 = off (bit-identical to before
+    //     this lane existed). 1.0 is the textbook TPDF span; 0.5 is the "never touch a value that is
+    //     already exactly on a code" variant — see rDitherTPDF() in resolve.frag for what that buys
+    //     and costs. LIVE, because "is the grain visible" is a question about a screen.
+    // y, z, w = reserved. y is the intended home for a frame counter if the dither is ever animated;
+    //     it is deliberately static today (fixed-pattern noise does not shimmer on a still camera).
+    DATA(float4, dither, None);
+    // x = EXPOSURE E (tasks/forge-postprocess.md step 2 — the exposure servo). A scene-referred
+    //     scale, so it lands inside the un-premultiplied window immediately BEFORE the encode and
+    //     the curve: it multiplies linear radiance, which is the only domain a "stops of exposure"
+    //     number means anything in. One multiply, one site, and every pass in the frame — sky,
+    //     water, reflections, first person — inherits it by being CONTENT in the scene target
+    //     rather than by carrying a lane of its own.
+    //
+    //     1.0 = identity. It is also identically 1.0 whenever opts.y is clear, because the LDR
+    //     partner's byte-for-byte equality with the pre-6a build is load-bearing and adaptation is
+    //     defined on scene-referred radiance anyway.
+    //
+    //     ⚠ IT BREAKS THE CLASS-2 ROUND TRIP, and that was decided rather than overlooked. Sky /
+    //     statics_add / statics_blend write inverseTonemap(authored) so that tonemap() hands MW's
+    //     authored value back unchanged; tonemap(E·inverseTonemap(a)) != a for any E != 1. The
+    //     decision (2026-08-15) is that the sky JOINS the exposed world — a bright sky must be able
+    //     to drive the meter it is most of — and the "old sky is the reference" requirement is
+    //     re-read as a fixed-exposure reference SHOT rather than a runtime constraint.
+    //
+    //     ✅ AND THE LIFT IS GONE (step 3, below). It predicted its own death here and this is it.
+    // y = THE CURVE SELECT (step 3 / S2). 0 = the legacy semi-HDR cubic in tonemap.h.fsl, 1 = AgX
+    //     (agx.h.fsl). AgX is the default; the legacy curve is kept as the A/B and is BYTE-IDENTICAL
+    //     when this lane is 0, which is the regression test that the swap touched nothing else.
+    //
+    //     ⚠ IT ALSO MOVES THE ENCODE, and that is not an option this lane leaves open. The legacy
+    //     curve was FITTED against display-referred input, so opts.w's linearToSrgb runs BEFORE it;
+    //     AgX eats linear scene radiance and returns linear display, so the OETF runs AFTER it. One
+    //     branch owns the whole tail of PS_MAIN for that reason — a cbuffer bit is wave-uniform but
+    //     not compile-time ([[project_uniform_branch_is_not_free]]), so it guards a block and never
+    //     an instruction.
+    //
+    //     ⚠⚠ SECOND RECEIVER: gShadowParams.toneParams.w carries the SAME folded host expression to
+    //     scenecolor.h.fsl's liftInPass(), which is disarmed by it. The class-2 lift is stated in
+    //     terms of the LEGACY curve's inverse (inverseTonemap), so a frame running AgX with the lift
+    //     still in it is not "the sky as a reference", it is broken. The two cannot be allowed to
+    //     disagree, so they are one host expression — the same house rule opts.y follows, for the
+    //     same reason (this pass has a private SRT and cannot see gShadowParams).
+    // z, w = reserved (the servo's own state stays on the host — the shader only ever sees E).
+    DATA(float4, tone, None);
+    // AgX's LOOK TRANSFORM (agxLook) — an ASC CDL applied between the sigmoid and the outset matrix.
+    // x = slope, y = power, z = saturation, w = offset.
+    //
+    // SHIPPED AT **BASE** — 1 / 1 / 1 / 0, which is an exact identity: slope 1 + power 1 + offset 0
+    // make the ASC CDL an identity, and saturation 1 makes the SAT stage one. So the frame's shape
+    // comes entirely from the inset/sigmoid/outset chain and the look is provably not carrying it.
+    //
+    // ⚠ AgX base IS flat and desaturated, by design, and that is the point of shipping it. The
+    // blocker S2 exists to fix is a HUE failure, and contrast + saturation stacked on top of the
+    // curve are exactly the two knobs that make a hue judgement unattributable. Blender's *Punchy*
+    // (power 1.20, saturation 1.40) is two slider drags away when a look is actually being chosen.
+    //
+    // Fifth float4 = 80 B against a 256 B cbuffer, so still no allocation change.
+    DATA(float4, look, None);
 };
 
 BEGIN_SRT(ResolveSrtData)

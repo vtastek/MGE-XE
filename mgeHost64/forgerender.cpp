@@ -697,11 +697,21 @@ namespace ForgeRender {
         return true;
     }
 
+    // Pins the exposure servo off. Defined beside the servo itself, far below — the flag lives in
+    // the anonymous namespace that opens after this block, so it is unreachable from here.
+    void expDisableForProbe();
+
     // Standalone exercise of the M1c opaque scene path (init → uploadGeometry →
     // renderScene) with a dummy triangle mesh, so the host-side printf/asserts are
     // visible in a terminal. Isolates a buildOpaquePath/draw crash from the IPC seam.
     bool sceneProbe() {
         std::setvbuf(stdout, nullptr, _IONBF, 0);
+        // ⚠ THE PROBE ASSERTS EXACT CENTRE PIXELS (`~129` for the SLOT-0 texture guard, `BGRA
+        // 15,15,15,255` for the emissive collapse), and the exposure servo is a FEEDBACK LOOP over
+        // frames — it would make every one of those numbers depend on how many frames the probe
+        // happened to render and on what they contained. Pin it off before init(), so the probe
+        // keeps measuring the shader chain and nothing else.
+        expDisableForProbe();
         std::printf("[forge] scene-probe: init...\n");
         if (!init(640, 360, 4, 16)) {   // exercise the MSAA path (resolve into the shared RT); falls back to 1x if unsupported
             std::printf("[forge] scene-probe: init FAILED\n");
@@ -2908,6 +2918,236 @@ namespace {
                                  : (1.055f * std::pow(c, 1.0f / 2.4f) - 0.055f);
     }
 
+    // --- AgX, THE CURVE THAT REPLACES THE CUBIC (step 3 / S2) ------------------------------------
+    //
+    // ⚠ MIRROR, exactly like tonemapCurve/inverseTonemap above and with the same failure mode: if
+    // agx.h.fsl's constants ever move, these move with them, and forgetting produces a frame that is
+    // subtly wrong everywhere at once rather than a crash. agxSelfTest() below is the guard — it runs
+    // the FULL matrix path in C++ at init and checks it against both the prior art's landmark numbers
+    // and this neutral-axis mirror, so a drift between the two files cannot ship silently.
+    //
+    // ⚠⚠ AND THIS MIRROR IS NEUTRAL-AXIS ONLY, WHICH IS **EXACT** RATHER THAN AN APPROXIMATION.
+    // Everything the host needs the curve for is a grey scalar (a display LEVEL, from the APL
+    // instrument, converted into the domain a gain lives in), and on the neutral axis:
+    //   - the inset and outset matrices have unit row sums, so grey in is grey out (measured drift
+    //     ~1.8e-4, reported by the self-test rather than assumed);
+    //   - the look's SATURATION is identically a no-op — `luma + sat*(v - luma)` with v grey gives
+    //     luma == v for any sat, because the Rec.709 weights sum to 1. That is only true because
+    //     agxLook() takes luma from the SOP OUTPUT (ASC CDL v1.2) rather than from the pre-CDL value
+    //     the widely-copied GLSL snippet uses; see agx.h.fsl.
+    // Slope, power and offset are NOT no-ops, so the mirror reads the live look knobs.
+    //
+    // WHY THE KNOBS ARE DECLARED HERE and not beside the servo globals they belong with: C++ needs
+    // them before agxNeutralF(), which is 7600 lines above that block. The dev panel and the plan
+    // treat them as one group with the exposure servo regardless — they are the same feature.
+
+    // THE CURVE SELECT. Default true: AgX is the ship curve and the cubic is the A/B.
+    bool  g_agxCurve  = true;
+    // THE LOOK, SHIPPED AT **BASE** — 1 / 1 / 1 / 0 (user, 2026-08-15). Blender's *Punchy*
+    // (power 1.20, saturation 1.40) was the first default here, on the argument that AgX base is
+    // deliberately flat and would read as a regression. It was moved to neutral instead, and the
+    // reason is the reason S2 exists: **the recorded blocker is a HUE failure**, and contrast and
+    // saturation on top of the curve are exactly the two knobs that make a hue judgement
+    // unattributable. Shipping base means the first thing anyone looks at is the base transform
+    // doing its job or not — and the fix for "AgX looks flat" is then a decision taken against a
+    // known starting point rather than a default nobody chose.
+    //
+    // ⚠ AT BASE, THE LOOK IS VERY NEARLY AN IDENTITY AND THAT IS DELIBERATE, NOT A BYPASS. Slope 1,
+    // power 1, offset 0 make the ASC CDL exact identity; saturation 1 makes the SAT stage exact
+    // identity. So every pixel's shape comes from the inset/sigmoid/outset chain, which is what is
+    // actually being evaluated. Punchy is four slider drags away when it is wanted.
+    //
+    // ⚠⚠ Prior-art numbers, so they are LIVE sliders and not constants
+    // ([[feedback_prior_art_constants_dont_transfer]]) — that is what let this default move by a
+    // panel drag first and a rebuild second.
+    float g_agxSlope  = 1.00f;
+    float g_agxPower  = 1.00f;
+    float g_agxSat    = 1.00f;
+    float g_agxOffset = 0.00f;
+
+    // THE ONE FOLDED EXPRESSION. Published to gShadowParams.toneParams.w (liftInPass) and to
+    // gResolveParams.tone.y (which curve resolve.frag applies), and consulted by every host site that
+    // lifts or un-lifts against the legacy curve. One source, so the pass that applies the curve and
+    // the passes that pre-compensate for it can never disagree about which curve is running.
+    //
+    // ⚠ GATED ON linearScene AS WELL AS ON THE CHECKBOX, and that is a contract, not caution: AgX
+    // eats LINEAR SCENE RADIANCE. In the gamma build the scene target holds MW-domain values and
+    // feeding those to a log2 curve is meaningless, so the whole feature disarms there and the
+    // display-referred / gamma A/B partners stay byte-identical. HDR+linear has been the default
+    // build since 2026-08-13, so nothing reachable is given up.
+    inline bool agxActive() {
+        return g_agxCurve && g_live.sceneReferred && g_live.linearScene;
+    }
+
+    // The AgX log domain: log2(0.18) - 10 and log2(0.18) + 6.5. Mirrors agx.h.fsl.
+    constexpr float kAgxMinEV = -12.47393f;
+    constexpr float kAgxMaxEV =   4.026069f;
+    // 2^kAgxMaxEV — the scene value at which the log clamps, i.e. the top of the invertible range and
+    // the bisection's upper bracket. The cubic's equivalent was 2.2; this is 16.29.
+    constexpr float kAgxMaxScene = 16.2917408f;
+
+    // The 6th-order sigmoid approximation, on the normalised [0,1] log domain. Mirrors agxContrast().
+    inline float agxContrastF(float x) {
+        const float x2 = x * x;
+        const float x4 = x2 * x2;
+        return  15.5f    * x4 * x2
+              - 40.14f   * x4 * x
+              + 31.96f   * x4
+              -  6.868f  * x2 * x
+              +  0.4298f * x2
+              +  0.1191f * x
+              -  0.00232f;
+    }
+
+    // Neutral-axis AgX with an EXPLICIT look, so the self-test can pin the look to base while the
+    // live path reads the sliders. Scene radiance in, LINEAR DISPLAY out (resolve.frag's
+    // linearToSrgb is what turns that into a display code).
+    inline float agxNeutralLookF(float x, float slope, float power, float sat, float offset) {
+        (void)sat;   // a no-op on the neutral axis by construction — see the block comment above
+        float t = std::log2(std::max(x, 1.0e-10f));
+        t = std::max(kAgxMinEV, std::min(kAgxMaxEV, t));
+        t = (t - kAgxMinEV) / (kAgxMaxEV - kAgxMinEV);
+        float s = agxContrastF(t);
+        // Floor before every pow(): the sigmoid approximation undershoots to -0.00232 at t = 0, and a
+        // negative base under a fractional exponent is NaN — which then survives every later multiply
+        // including one by zero ([[project_nan_survives_zero_multiply]]). Same floors as agx.h.fsl.
+        s = std::pow(std::max(s * slope + offset, 0.0f), power);
+        return std::pow(std::max(s, 0.0f), 2.2f);
+    }
+    inline float agxNeutralF(float x) {
+        return agxNeutralLookF(x, g_agxSlope, g_agxPower, g_agxSat, g_agxOffset);
+    }
+
+    // THE INVERSE — linear display back to scene radiance. BISECTION, for the same reason
+    // inverseTonemap() bisects and one more: the composition of a clamped log, a polynomial that is
+    // only approximately monotone, and two live-tunable pow()s has no derivative anyone should be
+    // dividing by. Bisection's invariant is only that the answer lies between the brackets.
+    //
+    // The bracket is [0, kAgxMaxScene] instead of [0, 2.2] — 24 halvings put the scene-side
+    // resolution at ~1e-6, and |d(out)/d(x)| never exceeds ~1 over the range, so the round trip is
+    // good to ~1e-6. The self-test measures it rather than taking that on trust.
+    //
+    // Below 2^kAgxMinEV (1.7e-4 scene) the curve is flat at 0, so the inverse of 0 is 0 and the
+    // bisection walks straight past the flat segment; above kAgxMaxScene the log clamps and there is
+    // nothing to invert, so the bracket top is returned.
+    inline float agxInverseNeutralLookF(float d, float slope, float power, float sat, float offset) {
+        if (d <= 0.0f) { return 0.0f; }
+        const float hiVal = agxNeutralLookF(kAgxMaxScene, slope, power, sat, offset);
+        if (d >= hiVal) { return kAgxMaxScene; }
+        float lo = 0.0f, hi = kAgxMaxScene;
+        for (int i = 0; i < 24; ++i) {
+            const float mid = 0.5f * (lo + hi);
+            if (agxNeutralLookF(mid, slope, power, sat, offset) < d) { lo = mid; } else { hi = mid; }
+        }
+        return 0.5f * (lo + hi);
+    }
+    inline float agxInverseNeutralF(float d) {
+        return agxInverseNeutralLookF(d, g_agxSlope, g_agxPower, g_agxSat, g_agxOffset);
+    }
+
+    // --- THE CONSTANTS GATE ----------------------------------------------------------------------
+    //
+    // ⚠ EVERY NUMBER IN agx.h.fsl IS TRANSCRIBED PRIOR ART, AND TRANSCRIBED PRIOR ART GETS VERIFIED
+    // NUMERICALLY, NOT TRUSTED ([[feedback_prior_art_constants_dont_transfer]]). A mistyped
+    // polynomial coefficient or — far likelier — a matrix transposed on its way out of a GLSL
+    // column-major `mat3(...)` literal would present as "the colours look a bit off" and nothing
+    // else. So the host carries the FULL matrix path in C++, runs it at init, and prints three
+    // things that cannot all be right by accident.
+    //
+    // The matrices, as ROWS. The published copies are GLSL column-major constructors; these are the
+    // transpose of that layout, which is what makes them rows.
+    const float kAgxInset[9] = {
+        0.842479062253094f,  0.0784335999999992f, 0.0792237451477643f,
+        0.0423282422610123f, 0.878468636469772f,  0.0791661274605434f,
+        0.0423756549057051f, 0.0784336f,          0.879142973793104f
+    };
+    const float kAgxOutset[9] = {
+         1.19687900512017f,   -0.0980208811401368f, -0.0990297440797205f,
+        -0.0528968517574562f,  1.15190312990417f,   -0.0989611768448433f,
+        -0.0529716355144438f, -0.0980434501171241f,  1.15107367264116f
+    };
+
+    // The full three-channel transform, mirroring agx.h.fsl step for step. ONLY the self-test calls
+    // it — the render path never runs AgX on the host — but it is the only thing that can prove the
+    // matrices and the look ordering, so it is not test scaffolding, it is the check itself.
+    void agxFullF(const float in[3], float slope, float power, float sat, float offset, float out[3]) {
+        const float c0 = std::max(in[0], 0.0f);
+        const float c1 = std::max(in[1], 0.0f);
+        const float c2 = std::max(in[2], 0.0f);
+        float v[3];
+        for (int i = 0; i < 3; ++i) {
+            v[i] = kAgxInset[3 * i + 0] * c0 + kAgxInset[3 * i + 1] * c1 + kAgxInset[3 * i + 2] * c2;
+        }
+        for (int i = 0; i < 3; ++i) {
+            float t = std::log2(std::max(v[i], 1.0e-10f));
+            t = std::max(kAgxMinEV, std::min(kAgxMaxEV, t));
+            v[i] = agxContrastF((t - kAgxMinEV) / (kAgxMaxEV - kAgxMinEV));
+        }
+        // The look, between the sigmoid and the outset. SOP first, then SAT on the SOP output.
+        for (int i = 0; i < 3; ++i) {
+            v[i] = std::pow(std::max(v[i] * slope + offset, 0.0f), power);
+        }
+        const float luma = 0.2126f * v[0] + 0.7152f * v[1] + 0.0722f * v[2];
+        for (int i = 0; i < 3; ++i) { v[i] = luma + sat * (v[i] - luma); }
+        for (int i = 0; i < 3; ++i) {
+            const float o = kAgxOutset[3 * i + 0] * v[0] + kAgxOutset[3 * i + 1] * v[1]
+                          + kAgxOutset[3 * i + 2] * v[2];
+            out[i] = std::pow(std::max(o, 0.0f), 2.2f);
+        }
+    }
+
+    // What the three numbers gate, and why each one cannot be faked:
+    //
+    //  1. THE LANDMARKS, at BASE look (so they are properties of the transform and not of a slider).
+    //     0.18 linear scene -> 0.5005 as an sRGB display code, 1.0 -> 0.7919. Middle grey at half
+    //     code is AgX's signature; any coefficient error moves it.
+    //  2. NEUTRAL DRIFT — the full matrix path against the neutral-axis mirror, swept over all 16.5
+    //     stops at both the base and the LIVE look. This is what catches a transposed matrix: the
+    //     transpose's row sums are 0.927 / 1.035 / 1.038, so grey stops being grey by ~7%, against
+    //     the ~2e-4 the correct rows drift by. It also proves the mirror the servo depends on.
+    //  3. INVERSE MAX ERR — agxNeutralF(agxInverseNeutralF(d)) - d, closed against the same mirror
+    //     calGainDomain() inverts through, over the same sweep.
+    void agxSelfTest() {
+        const float g18[3] = { 0.18f, 0.18f, 0.18f };
+        const float g10[3] = { 1.0f, 1.0f, 1.0f };
+        float o18[3] = {}, o10[3] = {};
+        agxFullF(g18, 1.0f, 1.0f, 1.0f, 0.0f, o18);
+        agxFullF(g10, 1.0f, 1.0f, 1.0f, 0.0f, o10);
+        const float code18 = linearToSrgbF(o18[1]);
+        const float code10 = linearToSrgbF(o10[1]);
+
+        float drift = 0.0f, invErr = 0.0f;
+        for (int pass = 0; pass < 2; ++pass) {
+            const float sl = (pass == 0) ? 1.0f : g_agxSlope;
+            const float pw = (pass == 0) ? 1.0f : g_agxPower;
+            const float st = (pass == 0) ? 1.0f : g_agxSat;
+            const float of = (pass == 0) ? 0.0f : g_agxOffset;
+            for (int i = 0; i <= 64; ++i) {
+                // Log-spaced across the whole input range: a linear sweep would spend 90% of its
+                // samples in the shoulder and never test the toe, which is where the clamp lives.
+                const float ev = kAgxMinEV + (kAgxMaxEV - kAgxMinEV) * ((float)i / 64.0f);
+                const float x  = std::exp2(ev);
+                const float g[3] = { x, x, x };
+                float o[3] = {};
+                agxFullF(g, sl, pw, st, of, o);
+                const float n = agxNeutralLookF(x, sl, pw, st, of);
+                for (int c = 0; c < 3; ++c) { drift = std::max(drift, std::fabs(o[c] - n)); }
+                const float back = agxNeutralLookF(agxInverseNeutralLookF(n, sl, pw, st, of),
+                                                  sl, pw, st, of);
+                invErr = std::max(invErr, std::fabs(back - n));
+            }
+        }
+        LOG::logline(">> [tonemap] AgX: 0.18->%.4f  1.0->%.4f  neutral drift %.5f  inverse max err %.5f"
+                     "  [pass: 0.5005 / 0.7919 / <0.001 / <0.001 — landmarks are sRGB display codes at BASE look]",
+                     code18, code10, drift, invErr);
+        // ...and to stdout as well, because `--forge-scene` returns before main.cpp opens the MGE log
+        // and this is the gate that has to run BEFORE anything is looked at. Same reason [scenefmt]
+        // prints twice.
+        std::printf("[forge] AgX self-test: 0.18->%.4f (expect 0.5005)  1.0->%.4f (expect 0.7919)"
+                    "  neutral drift %.5f  inverse max err %.5f\n", code18, code10, drift, invErr);
+        LOG::flush();
+    }
+
     // --- Morrowind.ini [Water] / [Weather], for the unified water fog ----------------------------
     //
     // Read ONCE, from the host's cwd (the install dir — terrain.cpp reads [Game Files] the same
@@ -3438,13 +3678,21 @@ namespace {
         // Zenith and sunCol take NO round trip at all: they were decoded and never lifted, so they
         // are already the linear radiance this wants. Two lanes treated differently is not an
         // inconsistency — it is precisely the lift/no-lift distinction 6a drew, surviving intact.
+        //
+        // ⚠⚠ AND UNDER AgX THE WHOLE BLOCK IS SKIPPED, because there is nothing to undo (step 3 /
+        // S2). This is an UN-LIFT, and it is stated against the lift at the write site — kill the
+        // lift and running the curve forward here stops being an identity and becomes a second,
+        // uncancelled tonemap applied to a light. Gated on exactly the expression the write site
+        // gates on, which is the only thing that keeps the pair inverse.
         const float sunDir[3] = { fd[16], fd[17], fd[18] };
         const float sunCol[3] = { fd[20], fd[21], fd[22] };
         float       horiz[3]  = { fd[28], fd[29], fd[30] };
-        for (int i = 0; i < 3; ++i) {
-            if (g_live.linearScene)   { horiz[i] = linearToSrgbF(horiz[i]); }
-            if (g_live.sceneReferred) { horiz[i] = tonemapCurve(horiz[i]); }
-            if (g_live.linearScene)   { horiz[i] = srgbToLinearF(horiz[i]); }
+        if (g_live.sceneReferred && !agxActive()) {
+            for (int i = 0; i < 3; ++i) {
+                if (g_live.linearScene) { horiz[i] = linearToSrgbF(horiz[i]); }
+                horiz[i] = tonemapCurve(horiz[i]);
+                if (g_live.linearScene) { horiz[i] = srgbToLinearF(horiz[i]); }
+            }
         }
         const float zenith[3] = { fd[68], fd[69], fd[70] };
 
@@ -9757,6 +10005,12 @@ namespace {
     double    g_aplPctAccum[3] = { 0.0, 0.0, 0.0 };     // S3a: p10 / p50 / p90 display levels
     unsigned  g_aplN        = 0;
     float     g_lastApl[4]  = { 0.0f, 0.0f, 0.0f, 0.0f };
+    // ...and THIS FRAME's percentiles, not the window's. The accumulators above are reset every 300
+    // frames for the heartbeat, which is the right statistic for a number a human reads and the
+    // wrong one for a control loop: the exposure servo has to close on the frame it just measured,
+    // and a 300-frame mean would add several seconds of dead time to a loop whose whole content is
+    // a time constant. Display levels 0..255 (p10 / p50 / p90), same units as the target table.
+    float     g_lastAplPct[3] = { 0.0f, 0.0f, 0.0f };
     double    g_lastGpuWaitMs = 0.0;
     // Tier 1 fail-safe: does the CLIENT hold an imported timeline semaphore it will wait before
     // copying the shared RT? Only then may renderScene return without settling its own frame.
@@ -10326,6 +10580,16 @@ namespace {
     // entirely. Live rather than a constant because a prior-art number was tuned in another pass at
     // another resolution — port the mechanism, re-derive the value.
     float    g_resolveSharp    = 0.5f;
+    // OUTPUT DITHER, in LSB of the 8-bit destination. resolve.frag owns the ONLY quantization in the
+    // host frame — everything upstream is fp16 and the seam's B8G8R8A8_UNORM is not negotiable — and
+    // until now that quantization was undithered, which is what a smooth gradient banding into flat
+    // steps actually is. It is not an HDR problem and no amount of upstream precision touches it.
+    //
+    // 1.0 = the textbook TPDF span. 0.5 = the variant that cannot move a value already sitting
+    // exactly on a code, i.e. no speckle on pure black, at the price of leaving the values nearest a
+    // code alone; 0 = off and bit-identical to before the lane existed. See rDitherTPDF() in
+    // resolve.frag.fsl for the derivation of all three. Live, because it is a look A/B.
+    float    g_resolveDither   = 1.0f;
 
     // --- fp16 scene colour (tasks/forge-postprocess.md step 4: the bandwidth probe) ---------------
     // Renders the scene into R16G16B16A16_SFLOAT instead of B8G8R8A8_UNORM, with the shader resolve
@@ -10511,6 +10775,63 @@ namespace {
     float g_calSunGain   = 1.0f;   // sunCol   — host-side, at the one decode site
     float g_calAmbGain   = 1.0f;   // ambCol   — host-side, at the one decode site
     float g_calEmisGain  = 1.0f;   // material emissive — gShadowParams lane, applied in the frags
+
+    // ─── THE EXPOSURE SERVO (tasks/forge-postprocess.md step 2) ──────────────────────────────────
+    // The CAL gains above set the scene's RATIOS (sun:ambient, emissive) — quantities no global
+    // scale can restore. This owns the remaining degree of freedom, LEVEL, and it owns it from here:
+    // any later re-level (a new tonemap curve at step 3, a bloom energy change at step 4) is
+    // re-found automatically instead of being hand-dialled a second time.
+    //
+    // ⚠ THE SETPOINT IS AUTHORED, NOT MEASURED, and that is the whole design. A free-running meter
+    // driving everything to 18% grey lands a cave and a noon exterior on the same number, erasing
+    // precisely the differences the calibration table encodes ("it is a game, we can't do exposure
+    // windows"). Metering picks the PATH; calTarget() picks the DESTINATION.
+    //
+    // ⚠⚠ AND THE DEAD ZONE **IS** THE TARGET RANGE — the same two numbers, not a tolerance bolted
+    // around a setpoint. Inside [lo,hi] the servo holds and the level FLOATS: that is the player
+    // walking from a dark corner to beside a fire and the frame following them, which is what the
+    // user meant by "dynamic adaptation within this interior". Outside it, the servo drives to the
+    // nearest edge. A cave therefore cannot brighten into a house, because the clamp is the range.
+    //
+    // No transition special-case exists and none is wanted: an interior<->exterior step is a ROW
+    // change in calTarget(), the servo sees a level far outside the new envelope, and the same
+    // first-order lag ramps across it over ~tau. That ramp IS the eyes-adjusting effect.
+    bool   g_expEnable   = true;
+    // WHICH STATISTIC THE METER READS — 0 = frame mean, 1 = p90, 2 = geometric mean. A LIVE knob
+    // rather than a constant because the calibration table does not say, and guessing is exactly
+    // what produced the 3.51x error: the first interior run read `mean=23 p10=6 p50=16 p90=50`
+    // against `target 40-50`, and a table written in p90 is already AT its target there while a
+    // table written in the mean is 2x dark. Sweeping this in a parked interior and reading `exp=`
+    // at each stop is the measurement that settles it (plan `:1449`).
+    float  g_expStat     = 0.0f;
+    // ASYMMETRIC BY CONSTRUCTION, like every eye model: brightening is slow (you walk out of a cave
+    // and are dazzled for a moment), darkening is quicker. These are the time constants of a
+    // first-order lag, i.e. the 63% time, so the visible ramp is ~3x these.
+    float  g_expTauRise  = 1.5f;   // seconds, E climbing (frame too dark -> brighten)
+    float  g_expTauFall  = 0.6f;   // seconds, E falling  (frame too bright -> darken)
+    // AUTHORITY LIMIT, and it is NOT the envelope. The envelope is the target range and lives in
+    // calTarget(); this is the guard on how far the servo may ever push, so a pathological frame
+    // (a loading screen, a fullscreen menu tint, a black interior) cannot park E somewhere the next
+    // real frame takes a visible second to walk back from.
+    float  g_expMin      = 0.25f;
+    // ⚠ 8.0, AND IT WENT 8 -> 16 -> 8 ACROSS ONE STEP. Step 3 raised it on the argument that AgX's
+    // input range is 16.5 stops and its shoulder never clips, so a ceiling picked against a curve
+    // that CLAMPED at 2.2 would bind as a clamp rather than as a guard. That argument is about what
+    // the CURVE can hold; this number is about what the SERVO is allowed to do, and those are not the
+    // same question (user, 2026-08-15). 16x of authority means a pathological frame — a loading
+    // screen, a fullscreen menu tint, a black interior — can park E four stops out, and the next real
+    // frame then takes a visible second to walk back. AgX's headroom is the reason the level does not
+    // NEED that much authority, not a reason to grant it.
+    //
+    // Still an AUTHORITY limit and not an envelope (the envelope is calTarget()'s range). If `exp=`
+    // sits pinned at 8.00 on the heartbeat, the clamp is the binding constraint and the answer is the
+    // CAL gains, not a bigger number here. The slider reaches 32 so that question can be ASKED in a
+    // running game without a rebuild.
+    float  g_expMax      = 8.0f;
+    // THE SERVO'S STATE. Published to resolve.frag as gResolveParams.tone.x, and to the heartbeat as
+    // `exp=`. double rather than float because it is integrated one lag step per frame at ~165 Hz.
+    double g_exposure    = 1.0;
+    double g_expLastMs   = 0.0;    // hostNowMs() at the previous readback; 0 = no step yet
 
     // SK2 "ownership tell": the Forge sky takeover is byte-identical to MW's own sky, so there's
     // no way to tell it's live. These tint the Forge sky toward magenta (gFrameData.skyParams,
@@ -12039,11 +12360,79 @@ namespace {
           t.sliderF("Cubic sharpness C (0.5 = Catmull-Rom, 0.4 = SMAA filmic, 0 = no ringing)",
                     &g_resolveSharp, 0.0f, 1.0f, 0.05f);
           t.checkbox("Inverse-luminance firefly weighting", &g_resolveInvLuma);
+          // The ONE quantization in the host frame is this pass's write into the seam's BGRA8, so
+          // this is the only place an output dither can go. 0 = off (banding), 0.5 = never disturbs
+          // a value already on a code (no speckle on pure black), 1.0 = textbook TPDF. Unlike the
+          // two knobs above it does not trade against them — dither is orthogonal to the filter.
+          t.sliderF("Output dither (LSB; 1 = TPDF, 0.5 = black-safe, 0 = off)",
+                    &g_resolveDither, 0.0f, 2.0f, 0.25f);
           // BISECT 2026-08-07: a read-only t.label() line lived here reporting the scene format.
           // t.label() had ZERO other callers in this file — the helper existed but had never been
           // executed — and the build carrying it crashed on a null D3D12 buffer resource in an
           // unrelated subsystem. Removed as the first bisect step; restore only once the crash is
           // understood, and the format is in the log as `>> [scenefmt]` regardless.
+          t.flush(); }
+
+        // -- Tab: Exposure (the servo — tasks/forge-postprocess.md step 2) --
+        // A tab of its own rather than a corner of "Resolve (MSAA)": that tab is about the FILTER
+        // (diameter, sharpness, fireflies, dither), and this is about the LOOK. They share a shader
+        // and nothing else.
+        //
+        // ⚠ NO READOUT HERE, deliberately. `exp=` goes on the `apl:` heartbeat instead, for the same
+        // three reasons the calibration numbers do: apl already lives on that line, the perf harness
+        // runs minimized with nobody at the panel, and t.label() is implicated in the 2026-08-07
+        // null-resource crash (see the Resolve tab — it has had zero callers since).
+        { TabBuilder t; t.panel = g_uiPanel; t.name = "Exposure (adaptation)";
+          // The A/B: untick and E snaps to 1.0, i.e. the frame returns to whatever level the CAL
+          // gains alone produce. That is the whole servo in one checkbox.
+          t.checkbox("Exposure servo (off = fixed E = 1.0)", &g_expEnable);
+          // 0 = frame mean, 1 = p90, 2 = geometric mean. Step 1.0 so it lands exactly on the three
+          // values — a dropdown would be the natural widget, but its pData write is unreliable here
+          // (see the WT2 water-debug note), and this is a knob to be SWEPT, not set once: reading
+          // `exp=` at each stop in a parked interior is the measurement that settles which statistic
+          // the calibration table is written in.
+          t.sliderF("Meter statistic (0 = frame mean, 1 = p90, 2 = geometric mean)",
+                    &g_expStat, 0.0f, 2.0f, 1.0f);
+          // Time constants of the first-order lag, i.e. the 63% time — the visible ramp is ~3x
+          // these. Asymmetric on purpose: dark-adaptation is the slow direction in an eye and in
+          // every film camera operator's habits. If the level PUMPS rather than ramps, tau is
+          // fighting the one-frame readback latency — lengthen it, do not shorten it.
+          t.sliderF("Tau RISE (s) — brightening, the slow direction", &g_expTauRise, 0.1f, 6.0f, 0.1f);
+          t.sliderF("Tau FALL (s) — darkening", &g_expTauFall, 0.1f, 6.0f, 0.1f);
+          // ⚠ The AUTHORITY limit, NOT the adaptation envelope. The envelope is the target range in
+          // calTarget() and it is where the level is allowed to float; these two bound how far the
+          // servo may ever push, so a loading screen or a fullscreen menu tint cannot park E
+          // somewhere the next real frame needs a visible second to walk back from.
+          t.sliderF("E clamp MIN", &g_expMin, 0.05f, 1.0f, 0.05f);
+          t.sliderF("E clamp MAX", &g_expMax, 1.0f, 32.0f, 0.25f);
+          t.flush(); }
+
+        // -- Tab: Tonemap (the curve and its look — tasks/forge-postprocess.md step 3 / S2) --
+        // Separate from "Exposure (adaptation)" for the same reason that one is separate from
+        // "Resolve (MSAA)": the servo owns LEVEL and this owns SHAPE. They share a shader and one
+        // cbuffer and nothing else — and keeping them apart is what makes the A/B honest, since a
+        // curve swap does NOT need a manual re-level (the servo re-converges over ~tau by itself).
+        //
+        // ⚠ NO READOUT HERE, same as the Exposure tab: the curve is on the `apl:` heartbeat as the
+        // third element of `exp=`, and t.label() has had zero callers since the 2026-08-07
+        // null-resource crash.
+        { TabBuilder t; t.panel = g_uiPanel; t.name = "Tonemap (curve + look)";
+          // THE A/B, and it is a strong one: unticking must reproduce today's image EXACTLY, because
+          // the same bit that selects the curve also restores the class-2 lift that the legacy curve
+          // needs (gShadowParams.toneParams.w -> liftInPass). An eyeball A/B against a build without
+          // this feature is weaker than this checkbox, not stronger.
+          // ⚠ Inert unless the scene is scene-referred AND linear — AgX eats linear radiance. The
+          // startup log says which curve actually armed.
+          t.checkbox("AgX curve (off = legacy semi-HDR cubic, 2.2 clamp)", &g_agxCurve);
+          // SHIPPED AT BASE — 1 / 1 / 1 / 0, an exact identity, so what is on screen is the base
+          // transform and nothing else. AgX base IS flat and desaturated by design; that is the
+          // starting point a look gets chosen FROM, and choosing it with contrast and saturation
+          // already applied is how a hue judgement stops being attributable. Blender's *Punchy* is
+          // power 1.20 + saturation 1.40 if that is where it ends up.
+          t.sliderF("Look: slope (exposure of the look, 1 = base)", &g_agxSlope, 0.5f, 2.0f, 0.05f);
+          t.sliderF("Look: power / contrast (1 = base/neutral, 1.20 = Punchy)", &g_agxPower, 0.5f, 2.0f, 0.05f);
+          t.sliderF("Look: saturation (1 = base/neutral, 1.40 = Punchy)", &g_agxSat, 0.0f, 2.0f, 0.05f);
+          t.sliderF("Look: offset (lift/crush, 0 = base)", &g_agxOffset, -0.2f, 0.2f, 0.01f);
           t.flush(); }
 
         // -- Tab: Alpha (sorted-alpha takeover debug) --
@@ -13573,6 +13962,17 @@ namespace ForgeRender {
                 std::printf("[forge] fp16 scene colour requested but MSAA is OFF — staying LDR "
                             "(no internal colour target at 1x)\n");
             }
+            // ...and the CURVE, decided by the same two bits plus its own checkbox. Reported here
+            // rather than folded into the line above because "which curve" is the one thing on the
+            // `apl:` heartbeat that makes every level on it interpretable.
+            std::printf("[forge] tone curve: %s%s\n",
+                        agxActive() ? "AgX" : "legacy semi-HDR cubic",
+                        (g_agxCurve && !agxActive())
+                            ? " (AgX requested but the scene is not scene-referred + LINEAR)" : "");
+            // THE CONSTANTS GATE, and it runs at init so it runs BEFORE anything is looked at.
+            // Unconditional — it must report even when AgX is off, because "off" is usually how a
+            // bad transcription hides.
+            agxSelfTest();
         }
 
         g_live.pPipeline = buildTrianglePipeline(R, g_live.pRT, g_live.pShader);
@@ -13820,10 +14220,102 @@ namespace ForgeRender {
     // 0.04045 and therefore in the linear segment (slope 1/12.92), so the ratio is nothing like a
     // naive `x^2.2` — which is exactly why this is computed with the real pair of functions and not
     // with an exponent someone remembered.
+    // ⚠ AND THE ORDER OF THE TWO INVERSES SWAPS WITH THE CURVE, because the order of the two FORWARD
+    // operations does (step 3 / S2). This is the site that fails SILENTLY: the servo and the `need=`
+    // instrument both read it, so inverting the wrong curve does not misreport a number — it drives
+    // the frame to the wrong level and holds it there.
+    //
+    //   legacy:  gain -> [encode] -> [cubic] -> measured.   So: un-cubic, THEN un-encode.
+    //   AgX:     gain -> [AgX]    -> [encode] -> measured.  So: un-encode, THEN un-AgX.
+    //
+    // AgX's inverse is neutral-axis only, which is exact here: the argument is a display LEVEL, i.e.
+    // a grey scalar, and grey is the one axis the matrices and the saturation leave alone. There is
+    // no linearScene branch in the AgX arm because agxActive() already requires it.
     double calGainDomain(double displayLevel255) {
         const double d = std::max(0.0, std::min(1.0, displayLevel255 / 255.0));
+        if (agxActive()) {
+            return (double)agxInverseNeutralF(srgbToLinearF((float)d));
+        }
         const double preTone = (double)inverseTonemap((float)d);
         return g_live.linearScene ? (double)srgbToLinearF((float)preTone) : preTone;
+    }
+
+    // ─── THE EXPOSURE SERVO ──────────────────────────────────────────────────────────────────────
+    // One step of the loop, called from the readback block once per MEASURED frame. Everything it
+    // consumes already existed and was written for it: calTarget() supplies the authored setpoint by
+    // context, calGainDomain() converts a display level into the domain a gain lives in, and the APL
+    // pass supplies the reading. What was missing was this function and one multiply in resolve.frag.
+    //
+    // ⚠ THE LOOP IS CLOSED, so the correction MULTIPLIES rather than replaces. `lvl` is measured off
+    // the delivered frame, which was already rendered through the CURRENT g_exposure — it is not the
+    // unexposed scene. `want = target/measured` would therefore throw away the exposure that produced
+    // the measurement and the loop would either sit at a fixed point that is wrong by exactly E or
+    // oscillate; `want = E · (target/measured)` is the residual correction, which is what a closed
+    // loop needs. This is the single most common way to get this wrong and it looks identical in the
+    // code until the frame is moving.
+    //
+    // ⚠⚠ AND THE RATIO IS TAKEN IN THE GAIN'S DOMAIN, NOT IN DISPLAY LEVELS. `ct.hi / lvl` is only
+    // the required gain where nothing nonlinear sits between the knob and the reading, and the encode
+    // and the tonemap both do. That is the trap that made the instrument report 4.89x where the true
+    // linear gain was ~8.3x (see calGainDomain above) — turned on a servo instead of on a printout it
+    // would not misreport a number, it would drive to the wrong level and stay there.
+    void exposureServo() {
+        if (!g_expEnable || !g_live.sceneReferred) {
+            return;   // E is published as 1.0 in this case; leave the state where it is
+        }
+        const double now = hostNowMs();
+        const double prev = g_expLastMs;
+        g_expLastMs = now;
+        if (prev <= 0.0) {
+            return;   // first measured frame: establish the clock, take no step
+        }
+        // Clamped hard: an alt-tab, a cell load or a breakpoint can leave a multi-second gap, and
+        // `1 - exp(-dt/tau)` saturates to 1 there, i.e. the lag becomes a SNAP at exactly the moment
+        // the frame is least representative. Ten frames' worth of catch-up is plenty.
+        const double dt = std::max(0.0, std::min(0.1, (now - prev) * 0.001));
+        if (dt <= 0.0) {
+            return;
+        }
+
+        // The meter. Mean and geo arrive as 0..1 luma and are scaled to display levels; p90 is
+        // already a display level, because the histogram bins ARE display levels — which is the unit
+        // the calibration table is stated in, and the reason the histogram was built that way.
+        const double lvl = (g_expStat < 0.5f) ? ((double)(0.299f * g_lastApl[0] + 0.587f * g_lastApl[1]
+                                                        + 0.114f * g_lastApl[2]) * 255.0)
+                         : (g_expStat < 1.5f) ? (double)g_lastAplPct[2]
+                                              : (std::exp((double)g_lastApl[3]) * 255.0);
+        if (lvl < 0.5) {
+            return;   // a black frame carries no information about how bright it should be — HOLD
+        }
+
+        const CalTarget ct = calTarget();
+        const double gm = calGainDomain(lvl);
+        double want = g_exposure;
+        if (gm > 1.0e-9) {
+            if      (lvl < (double)ct.lo) { want = g_exposure * calGainDomain((double)ct.lo) / gm; }
+            else if (lvl > (double)ct.hi) { want = g_exposure * calGainDomain((double)ct.hi) / gm; }
+            // ...and inside [lo,hi] `want` stays put: the dead zone IS the target range, so the
+            // level floats across the envelope instead of being pinned to a point inside it.
+        }
+        want = std::max((double)g_expMin, std::min((double)g_expMax, want));
+
+        // First-order lag toward `want`, asymmetric. Framerate-independent by construction — the
+        // exponential is evaluated at the real dt rather than a per-frame fraction, so the ramp takes
+        // the same wall-clock time at 30 fps and at 165.
+        const double tau = std::max(0.01, (double)((want < g_exposure) ? g_expTauFall : g_expTauRise));
+        g_exposure += (want - g_exposure) * (1.0 - std::exp(-dt / tau));
+        // The state itself, not just the destination — dragging the clamp sliders inward has to bite
+        // NOW rather than over a tau, or the guard is advisory while the frame is out of authority.
+        g_exposure = std::max((double)g_expMin, std::min((double)g_expMax, g_exposure));
+    }
+
+    // sceneProbe() lives in the FIRST ForgeRender block, hundreds of lines above the anonymous
+    // namespace that declares g_expEnable, so it cannot touch the flag directly. Declared there and
+    // defined here rather than moving the global: the probe needs the servo OFF (its call site says
+    // why), and that is one line at each end.
+    void expDisableForProbe() {
+        g_expEnable = false;
+        g_exposure  = 1.0;
     }
     // ...and the LAND cell grid's extent, for the same reason: SH2's height-map rebuild is recorded
     // at the very top of renderScene and has to stamp the grid the terrain residency uploaded into
@@ -14066,8 +14558,16 @@ namespace ForgeRender {
             // S3a percentiles: uints [4..6], NOT asuint'd — they are display levels 0..255, so they
             // are read as integers and averaged as such over the heartbeat window.
             const uint32_t* pu = (const uint32_t*)g_live.pAplReadback->pCpuMappedAddress;
-            for (int i = 0; i < 3; ++i) { g_aplPctAccum[i] += (double)pu[4 + i]; }
+            for (int i = 0; i < 3; ++i) {
+                g_lastAplPct[i]  = (float)pu[4 + i];
+                g_aplPctAccum[i] += (double)pu[4 + i];
+            }
             ++g_aplN;
+            // Close the exposure loop on the frame that just finished. HERE, inside the readback
+            // guard, so the servo only ever steps on a frame that produced a measurement: a paused
+            // host, a menu, or a frame whose APL pass did not run HOLDS E rather than integrating
+            // against a stale reading and drifting away from the scene.
+            exposureServo();
         }
 
         // Per-frame slow-GPU self-report (the 300-frame average can't surface a fresh dense-area
@@ -14316,7 +14816,14 @@ namespace ForgeRender {
             // before every gFrameData copy further down — float 28 is inside all three truncation
             // lengths, so those copies propagate the lift to the mirror, sun and FP views for free.
             // If the neutrality check ever fails, this ordering is the first thing to re-verify.
-            if (g_live.sceneReferred) {
+            //
+            // ⚠ AND UNDER AgX THERE IS NO LIFT AT ALL (step 3 / S2). inverseTonemap inverts the
+            // CUBIC; AgX does not apply the cubic, so lifting here would pre-distort the fog by the
+            // inverse of a function that never runs. The fog joins the exposed, tonemapped world
+            // exactly as the sky did — same decision, same gate, and the interior/underwater fog
+            // NEUTRALITY CHECK is expected to fail under AgX rather than to be chased. Same folded
+            // expression the shaders receive, so the host and the frags cannot disagree.
+            if (g_live.sceneReferred && !agxActive()) {
                 fd[28] = inverseTonemap(fd[28]);
                 fd[29] = inverseTonemap(fd[29]);
                 fd[30] = inverseTonemap(fd[30]);
@@ -14785,12 +15292,15 @@ namespace ForgeRender {
             // would move the A/B partner's image and stop it being a partner.
             cp[kToneFloat + 2] = (g_live.linearScene && g_fogExp)
                                      ? std::max(0.1f, g_fogExpScale) : 0.0f;
-            // RETIRED — this carried the air-fog changeover depth (fog.h.fsl): how far below the
-            // water plane a fragment stopped carrying its own air ramp. No shader reads it now; the
-            // water surface is blended and never re-fogs what is behind it, so nothing has to be
-            // stripped and there is no depth to name. Written as 0 rather than repacked, because
-            // renumbering a published lane costs every reader a rebuild to save four bytes.
-            cp[kToneFloat + 3] = 0.0f;
+            // ...and step 3's CURVE SELECT, into the lane the retired air-fog changeover depth left
+            // empty one commit ago (re-used rather than renumbered — a new lane costs every reader a
+            // rebuild to save four bytes). Read by ONE thing, scenecolor.h.fsl's liftInPass(), which
+            // it DISARMS: the class-2 lift writes inverseTonemap(authored) so the final curve returns
+            // MW's value untouched, and that inverse belongs to the cubic. Under AgX the lift is not
+            // preserving a reference, it is pre-distorting the sky by the inverse of a function that
+            // no longer runs. Same folded expression as gResolveParams.tone.y below — one host
+            // expression, two receivers, so "which curve" cannot be answered two ways in one frame.
+            cp[kToneFloat + 3] = agxActive() ? 1.0f : 0.0f;
             // S3a — the emissive calibration gain, from the same unconditional block and for the
             // identical reason: a receiver reading zero here would erase every self-illuminated
             // surface in the frame, and "the lamps went black" must not be able to depend on whether
@@ -20219,11 +20729,35 @@ namespace ForgeRender {
                 // opts.w = step 5's LINEAR bit — this pass owns the compensating sRGB encode, the
                 // exact inverse of every decode the frame went through, applied immediately before
                 // the curve. Second receiver of the same folded host expression as toneParams.y.
-                const float p[8] = { (float)g_live.width, (float)g_live.height, diam, radius,
-                                     g_resolveInvLuma ? 1.0f : 0.0f,
-                                     g_live.sceneReferred ? 1.0f : 0.0f,
-                                     std::max(0.0f, g_resolveSharp),
-                                     g_live.linearScene ? 1.0f : 0.0f };
+                // dither.x = output dither amplitude in LSB; y/z/w reserved (y is where a frame
+                // counter would go if it is ever animated — it is static today so a still camera
+                // shows fixed-pattern noise rather than a shimmer). The cbuffer is 256 B, so this
+                // third float4 costs no allocation change.
+                // tone.x = the EXPOSURE SERVO's current E (step 2), applied on the un-premultiplied
+                // straight colour immediately before the encode. Gated on sceneReferred as well as
+                // on the enable, and not merely for tidiness: the display-referred partner has no
+                // scene-referred branch to multiply in, and its byte-for-byte equality with the
+                // pre-6a build is what makes it usable as an A/B at all.
+                // tone.y = step 3's CURVE SELECT — 0 = the legacy cubic, 1 = AgX. It also decides
+                // where the sRGB ENCODE runs, because each curve declares the domain it eats: the
+                // cubic was fitted against display-referred input so opts.w's encode precedes it,
+                // AgX eats linear radiance and returns linear display so the encode follows it.
+                // Second receiver of the same folded expression as gShadowParams.toneParams.w, which
+                // disarms the class-2 lift — a frame where those two disagree renders the sky
+                // through half a transform.
+                // look = AgX's ASC-CDL look (slope, power, saturation, offset), applied between the
+                // sigmoid and the outset matrix. Defaults are Blender's *Punchy*: base AgX is
+                // deliberately flat and desaturated, so shipping base would read as a regression.
+                // A fifth float4 = 80 B against a 256 B cbuffer, so no allocation change.
+                const float p[20] = { (float)g_live.width, (float)g_live.height, diam, radius,
+                                      g_resolveInvLuma ? 1.0f : 0.0f,
+                                      g_live.sceneReferred ? 1.0f : 0.0f,
+                                      std::max(0.0f, g_resolveSharp),
+                                      g_live.linearScene ? 1.0f : 0.0f,
+                                      std::max(0.0f, g_resolveDither), 0.0f, 0.0f, 0.0f,
+                                      (g_live.sceneReferred && g_expEnable) ? (float)g_exposure : 1.0f,
+                                      agxActive() ? 1.0f : 0.0f, 0.0f, 0.0f,
+                                      g_agxSlope, g_agxPower, g_agxSat, g_agxOffset };
                 std::memcpy(g_live.pResolveParamsCbv->pCpuMappedAddress, p, sizeof(p));
             }
 
@@ -20755,15 +21289,32 @@ namespace ForgeRender {
                 const double gm = calGainDomain(meanLvl);
                 const double kLo = (gm > 1.0e-9) ? (calGainDomain(ct.lo) / gm) : 0.0;
                 const double kHi = (gm > 1.0e-9) ? (calGainDomain(ct.hi) / gm) : 0.0;
+                // ⚠ `exp=` IS NOT DECORATION, and the line is invalid without it. With a servo
+                // running, every level on this line was measured through an exposure that moves, so
+                // an `apl` recorded here is meaningless unless the E it was taken at is recorded
+                // beside it — the whole calibration table is built out of these lines, and a table
+                // built from readings against an unknown gain is worse than no table. `need`
+                // settling toward 1.00x while `exp` moves is exactly what "the servo is working"
+                // looks like, since `need` is the residual the servo is closing.
+                //
+                // ⚠ AND THE CURVE JOINS THE SAME TUPLE at step 3, by exactly the argument `exp=`
+                // itself is here for: an APL reading taken against an unknown curve is
+                // uninterpretable, and these lines are what the calibration table gets built out of.
+                // It reports the curve that ARMED (agxActive()), not the checkbox — a build where
+                // the scene is not linear says `legacy` truthfully.
                 LOG::logline(">> [forge-hb] apl: mean=(%.4f,%.4f,%.4f) apl=%.4f geo=%.4f"
                              " cast=(%.3f,%.3f,%.3f) n=%u | lvl mean=%.0f p10=%.0f p50=%.0f p90=%.0f"
                              " | target[%s]=%.0f-%.0f need=%.2f-%.2fx(%s)"
-                             " cal=(sun %.2f amb %.2f emis %.2f)",
+                             " exp=%.2f(%s,%s,%s) cal=(sun %.2f amb %.2f emis %.2f)",
                              r, g, b, apl, geo, r * n, g * n, b * n, g_aplN,
                              meanLvl, g_aplPctAccum[0] * inv, g_aplPctAccum[1] * inv,
                              g_aplPctAccum[2] * inv,
                              ct.name, ct.lo, ct.hi, kLo, kHi,
                              g_live.linearScene ? "linear" : "gamma",
+                             g_exposure,
+                             g_expEnable ? "servo" : "OFF",
+                             (g_expStat < 0.5f) ? "mean" : ((g_expStat < 1.5f) ? "p90" : "geo"),
+                             agxActive() ? "agx" : "legacy",
                              g_calSunGain, g_calAmbGain, g_calEmisGain);
             }
             dlLogHeartbeat();
@@ -27623,8 +28174,10 @@ namespace ForgeRender {
         for (int i = 0; i < 3; ++i) {
             col[i] = g_waterIni.underwaterColor[i] * w + g_fogColAuthored[i] * (1.0f - w);
         }
-        // ...and the identical lift-then-decode the fog colour gets at its write site.
-        if (g_live.sceneReferred) {
+        // ...and the identical lift-then-decode the fog colour gets at its write site — including
+        // its death under AgX (step 3 / S2). Same gate, because the two colours are the same kind of
+        // value and a divergence here would put a seam exactly at the waterline.
+        if (g_live.sceneReferred && !agxActive()) {
             for (int i = 0; i < 3; ++i) { col[i] = inverseTonemap(col[i]); }
         }
         decodeAuthoredRGB(col);

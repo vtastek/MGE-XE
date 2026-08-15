@@ -40,6 +40,10 @@
 // curve lives there and the "which pass applies it" policy lives in skydome.h.fsl: this shader has
 // a private SRT and cannot see gShadowParams.
 #include "tonemap.h.fsl"
+// ...and the curve that REPLACES it (step 3 / S2). Both are here because the select is a live
+// cbuffer lane (gResolveParams.tone.y), not a build flag — the legacy cubic is the A/B partner and
+// has to be reachable in the same binary. Same no-SRT split, same reason.
+#include "agx.h.fsl"
 // The scene's transfer function (step 5). Same reasoning as tonemap.h.fsl and the same reason it is
 // a separate file from scenecolor.h.fsl: this pass has a private SRT, so it can have the maths but
 // not the policy. Which encode to apply arrives as a cbuffer lane instead (gResolveParams.opts.w).
@@ -90,6 +94,80 @@ float rFilterCubic(float x, float B, float C)
 float rLuminance(float3 c)
 {
     return dot(c, float3(0.299f, 0.587f, 0.114f));
+}
+
+// ─── OUTPUT DITHER ───────────────────────────────────────────────────────────────────────────────
+//
+// THE LAST 8 BITS ARE THE ONLY 8 BITS. Everything upstream of this shader is fp16 — the scene
+// target, the sky snapshot, the refraction copy, the reflection and its mip pyramid, AO — and then
+// all of it lands in B8G8R8A8_UNORM, because the present seam hands the frame to MW's D3D9 device as
+// D3DFMT_A8R8G8B8 and that format is not negotiable. So there is exactly ONE quantization in the
+// host frame and it is the last line of this function. A gradient that crosses fewer than 256 codes
+// over hundreds of pixels — sky, fog band, water sheen, any large soft falloff — quantizes into flat
+// bands with hard edges, and no amount of precision upstream can help, because the information is
+// destroyed HERE and nowhere else.
+//
+// It also lands 1:1. The render rect is the backbuffer size (2048x1536 at render scale 1.00x, the
+// alloc is the 2x ceiling), so nothing downsamples this write and averages the error away — what is
+// quantized here is what is on the screen. If render scale ever goes above 1, the averaging that
+// follows halves the effective dither amplitude and this knob is where to pay it back.
+//
+// TPDF, NOT UNIFORM. A triangular-PDF dither — the sum of two independent uniforms, spanning ±1 LSB
+// — is the one that makes the quantization error both zero-mean AND statistically independent of the
+// signal. Uniform ±0.5 LSB fixes the mean but leaves the error's VARIANCE modulated by where the
+// signal happens to sit between two codes, which reads as the noise breathing as a gradient sweeps
+// past. One extra bit of noise power buys a defect that does not move with the image.
+//
+// ⚠ RGB ONLY, AND ALPHA IS LEFT EXACT ON PURPOSE. This is NOT the premultiplied-pair rule being
+// broken a fourth time (resolve.srt.h lists the three). That rule governs operations that shift the
+// rgb:a RATIO systematically — weights, clamps, the curve — and it exists because the seam reads the
+// pair as one vector. A dither is not such an operation: the composite `dst = src.rgb + dst*(1-src.a)`
+// is LINEAR in the stored rgb, so a zero-mean sub-LSB perturbation of stored rgb is a zero-mean
+// sub-LSB perturbation of the pixel on screen. That is exactly and only what it is for.
+//
+// Alpha also has a reason of its own to stay exact: coverage is 1.0 over almost the whole frame now
+// that default land and the above-water fill cover it, and TPDF at 1.0 would round half of those
+// pixels down to 254 — leaking 1/255 of MW's own frame through a seam that is meant to be opaque
+// there. Coverage banding is not a visible defect anyway; alpha is a compositing weight, not colour.
+//
+// ⚠ WHAT THE AMPLITUDE COSTS AT PURE BLACK, because it is the one place the textbook value shows.
+// At a true 0.0 with a ±1 LSB triangular noise, P(n > 0.5) = 0.125, so one black pixel in eight
+// rounds up to code 1. The mean lift is 0.05% and invisible as brightness, but on a large flat black
+// area it is sparse single-code speckle. Amplitude 0.5 removes it completely and by construction —
+// |n| never reaches 0.5, so a value already sitting exactly on a code cannot move — while still
+// randomising every value BETWEEN codes, which is where banding actually lives. 1.0 ships as the
+// default because it is the honest one; 0.5 is one slider drag away if the speckle is worse than the
+// bands. This is a look A/B and belongs on a screen.
+uint rHashU(uint x)
+{
+    // lowbias32 (Chris Wellons). Full 32-bit avalanche, five ALU ops, and no sin(): sin-based
+    // hashes lose their low bits at large coordinates on some drivers, and this runs at every pixel
+    // of the delivered frame.
+    x ^= x >> 16; x *= 0x7feb352du;
+    x ^= x >> 15; x *= 0x846ca68bu;
+    x ^= x >> 16;
+    return x;
+}
+
+// Two independent uniforms in [0,1) from ONE hash. Every output bit of a full-avalanche mix depends
+// on every input bit, so the two halves are independent to far more precision than an 8-bit dither
+// can spend — 16 bits each is ~256x finer than the LSB being dithered.
+float2 rHash2(uint seed)
+{
+    uint h = rHashU(seed);
+    return float2(float(h >> 16u), float(h & 0xFFFFu)) * (1.0f / 65536.0f);
+}
+
+float3 rDitherTPDF(float2 pix, float lsb)
+{
+    uint2  p = uint2(pix);
+    uint   s = rHashU(p.x) ^ (p.y * 0x9E3779B9u);   // hash one axis before mixing: (x,y) and (y,x) must differ
+    float2 dr = rHash2(s);
+    float2 dg = rHash2(s ^ 0x68E31DA4u);
+    float2 db = rHash2(s ^ 0xB5297A4Du);
+    // Sum of two independent uniforms, recentred: triangular on [-1, 1], zero mean.
+    float3 n = float3(dr.x + dr.y, dg.x + dg.y, db.x + db.y) - 1.0f;
+    return n * (lsb * (1.0f / 255.0f));
 }
 
 ROOT_SIGNATURE(DefaultRootSignature)
@@ -199,21 +277,67 @@ float4 PS_MAIN(PsIn In)
     if (gResolveParams.opts.y > 0.5f)
     {
         float3 straight = rgb / max(aOut, 1.0e-4f);
-        // STEP 5's COMPENSATING ENCODE, and it belongs INSIDE the un-premultiplied window for the
-        // same reason the curve does: linearToSrgb is non-linear, so encoding the stored (premultiplied)
-        // value would re-tint every pixel whose coverage is neither 0 nor 1 — the horizon fog band
-        // again, the same witness, for the third distinct reason.
+        // THE EXPOSURE SERVO's one multiply (step 2). Position is forced by the same rule the encode
+        // below follows and for the same reason: E is a SCENE-REFERRED scale, so it has to land while
+        // the value is still linear radiance and still un-premultiplied. After the encode it would be
+        // a gamma-space gain (a contrast change, not an exposure change); before the un-premultiply it
+        // would tear the premultiplied pair apart — the fourth version of resolve.srt.h's rule.
         //
-        // ORDER IS FORCED, not a preference. The curve was fitted against DISPLAY-REFERRED input
-        // (tonemap.h.fsl: 0->0, 1->0.84, 2.2->1.0, clamped at 2.2) and every class-2 lift in the
-        // frame is stated in terms of it. Encoding first hands it exactly the domain it was fitted
-        // in, so S1 changes the encoding of the scene and NOTHING about the curve — which is what
-        // lets S2 replace the curve as a separately-measured step.
-        if (gResolveParams.opts.w > 0.5f)
+        // The whole servo is this line plus a loop on the host: E is closed on the APL readback of the
+        // frame that just finished, which ALREADY CONTAINS the E it was rendered with, so the host
+        // correction multiplies the current exposure instead of replacing it.
+        straight *= gResolveParams.tone.x;
+        // THE CURVE, AND WITH IT THE POSITION OF THE ENCODE (step 3 / S2). The two are ONE decision,
+        // not two, because each curve declares the domain it eats:
+        //
+        //   AgX     — LINEAR SCENE RADIANCE in, LINEAR DISPLAY out, so the sRGB OETF runs AFTER it.
+        //   legacy  — fitted against DISPLAY-REFERRED input (tonemap.h.fsl: 0->0, 1->0.84,
+        //             2.2->1.0, clamped at 2.2), so the OETF runs BEFORE it. That ordering is what
+        //             let S1 change the scene's encoding while changing NOTHING about the curve,
+        //             which is in turn what makes this step separately measurable.
+        //
+        // ⚠ ONE BRANCH OVER THE WHOLE TAIL. tone.y is a cbuffer bit — wave-uniform, but not
+        // compile-time, so DXC will not strip what it guards ([[project_uniform_branch_is_not_free]]).
+        // Guarding whole blocks is the house rule and it costs nothing here: both arms run to the
+        // end of the transform.
+        if (gResolveParams.tone.y > 0.5f)
         {
+            // Inset -> log2 over 16.5 stops -> sigmoid; then the LOOK, between the sigmoid and the
+            // outset, which is where Blender applies it; then out of the AgX domain to linear
+            // display. No clamp anywhere in it — the shoulder is the ceiling.
+            straight = agx(straight);
+            straight = agxLook(straight, gResolveParams.look.x, gResolveParams.look.y,
+                               gResolveParams.look.z, gResolveParams.look.w);
+            straight = agxOutset(straight);
+            // ...and the frame's ONE encode, now at the end where AgX's output contract puts it.
+            // Unconditional inside this arm, unlike the legacy one: AgX has no display-referred
+            // reading, so the host only ever arms this curve on a linear scene (see agxActive()).
             straight = linearToSrgb(straight);
         }
-        rgb = tonemap(straight) * aOut;
+        else
+        {
+            // STEP 5's COMPENSATING ENCODE, and it belongs INSIDE the un-premultiplied window for
+            // the same reason the curve does: linearToSrgb is non-linear, so encoding the stored
+            // (premultiplied) value would re-tint every pixel whose coverage is neither 0 nor 1 —
+            // the horizon fog band again, the same witness, for the third distinct reason.
+            if (gResolveParams.opts.w > 0.5f)
+            {
+                straight = linearToSrgb(straight);
+            }
+            straight = tonemap(straight);
+        }
+        rgb = straight * aOut;
+    }
+
+    // Break the one quantization in the frame. LAST, after the curve and the encode — dither has to
+    // be the final thing that happens to a value before it is rounded, or whatever runs after it
+    // re-correlates the error with the signal and the bands come back. See rDitherTPDF() above for
+    // why RGB only and what the amplitude costs at black. The UNORM write clamps the negative half,
+    // which is the right answer: below zero there is no code to dither toward.
+    if (gResolveParams.dither.x > 0.0f)
+    {
+        rgb = max(rgb + rDitherTPDF(In.position.xy, gResolveParams.dither.x),
+                  float3(0.0f, 0.0f, 0.0f));
     }
 
     RETURN(float4(rgb, aOut));

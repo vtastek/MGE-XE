@@ -1087,15 +1087,15 @@ STRUCT(ShadowMaskParams)
     float4 sunOcc;
 #line 235 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
     float4 skyAO2;
-#line 274 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
+#line 284 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
     float4 toneParams;
-#line 288 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
+#line 298 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
     float4 waterFogCol;
-#line 307 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
+#line 317 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
     float4 waterFogPlane;
-#line 324 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
+#line 334 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
     float4 waterFogLight;
-#line 341 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
+#line 351 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
     float4 waterFogExt;
 
 
@@ -1124,9 +1124,9 @@ STRUCT(ShadowMaskParams)
 
 
     float4 waterFogKd;
-#line 389 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
+#line 399 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
     float4 calParams;
-#line 390
+#line 400
 };
 #line 21 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
 #line 58 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
@@ -1790,7 +1790,7 @@ float3 mod2xLinear(float3 tLinear)
 }
 #line 25 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/statics.frag.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/scenecolor.h.fsl"
-#line 98 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/scenecolor.h.fsl"
+#line 113 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/scenecolor.h.fsl"
 float3 tonemapInPass(float3 c)
 {
     return (gShadowParams.toneParams.x > 0.5f) ? c : tonemap(c);
@@ -1805,6 +1805,14 @@ float3 tonemapInPass(float3 c)
 float3 liftInPass(float3 c)
 {
     if (gShadowParams.toneParams.x <= 0.5f) { return c; }
+
+
+
+
+
+
+
+    if (gShadowParams.toneParams.w > 0.5f) { return c; }
 
 
 
