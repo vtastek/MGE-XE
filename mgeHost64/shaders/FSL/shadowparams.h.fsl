@@ -256,7 +256,21 @@ STRUCT(ShadowMaskParams)
     // A/B is a dev-panel tick. Ported value 4.4, from the DX9 path (distantland.cpp:818) — see
     // fog.h.fsl for why that constant is the fog WALL's position and fogStart is then free to be
     // the density.
-    // w spare.
+    // w = UNUSED, and the host writes 0. It carried THE AIR-FOG CHANGEOVER DEPTH (fog.h.fsl): how far
+    // below the water plane a fragment stopped carrying its own air ramp, because the water surface
+    // in front of it would apply that segment instead. Derived rather than dialled — the host
+    // published waterTrueLevel - waterMeshZ, the gap between the plane the test measured against and
+    // the plane the mesh is rasterised on (kWaterMeshSnap - 1 = 4), as a lane so the two could never
+    // drift apart.
+    //
+    // ⚠ THE BOUNDARY ITSELF IS GONE, not just its constant — 2026-08-15. It was a per-PIXEL decision
+    // about a pixel holding both dry beach and seabed, and no value of it could serve both sample
+    // groups. water.frag is a BLENDED surface now, so what is behind it arrives per SAMPLE and never
+    // gets re-fogged; the object shaders take the smooth water SHARE (mwFogAirShare) and there is no
+    // plane in the fog path at all. See tasks/forge-water-blend.md.
+    //
+    // Kept as a reserved lane rather than repacked: renumbering a published float costs every reader
+    // a rebuild to save four bytes.
     DATA(float4,   toneParams, None);
     // --- UNIFIED WATER FOG (waterfog.h.fsl, tasks/forge-water.md) --------------------------------
     // ONE extinction law for the water surface AND for everything submerged under it. Before this

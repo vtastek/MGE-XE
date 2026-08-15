@@ -71,8 +71,12 @@ VSOutput VS_MAIN( VSInput In )
     // happens to be drawn as a quad, so a fog gradient across its own face would be meaningless — and
     // the same reasoning already makes Colour and Intensity flat. centre is camera-relative, so its
     // length is the eye distance directly (eyePos is the origin in the live frame).
-    // centre is camera-relative AND identical at all four corners of the billboard, so the
-    // submerged step cannot be interpolated across this quad — the one place it is safe in a VS.
-    Out.Fog = mwFogAir(mwFogFactor(length(centre)), centre);
+    // centre is camera-relative AND identical at all four corners of the billboard, so the water
+    // share is evaluated once for the whole sprite and there is nothing for the rasteriser to
+    // interpolate. mwFogAirShareAt matches applyFog, so a glow beside a shoreline fades on the same
+    // schedule as the wall it is mounted on. (It is a smooth share now rather than a plane test, so
+    // the per-vertex hazard that used to make this a "one place this is safe in a VS" caveat is gone
+    // — there is no step left to interpolate.)
+    Out.Fog = mwFogAirShareAt(mwFogFactor(length(centre)), centre);
     RETURN(Out);
 }

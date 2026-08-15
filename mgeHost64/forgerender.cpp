@@ -1786,7 +1786,7 @@ namespace {
         // are bound once into pPerFrameSet. Drawn AFTER the distant land (depth-write reverse-Z GEQUAL,
         // cull NONE) into the same colour+depth, then the present-seam composites the whole frame.
         Shader*        pWaterShader = nullptr;
-        Pipeline*      pWaterPipeline = nullptr;           // depth GEQUAL + write, cull NONE, no blend
+        Pipeline*      pWaterPipeline = nullptr;           // depth GEQUAL + write, cull NONE, premultiplied over
         Buffer*        pWaterWorldsBuf = nullptr;          // gBatch: worlds[0..5]=LOD levels, [6]=params, [7]=invVP
         DescriptorSet* pPerBatchSetWater = nullptr;        // gBatch bound to pWaterWorldsBuf, 1 instance
         Buffer*        pWaterInstanceBuf = nullptr;        // per-draw instance VB: DrawIndex=level (kMaxWaterLevels)
@@ -2196,8 +2196,35 @@ namespace {
     // (renderwater.cpp:160-167 on that branch). The reflect plane tracks MW's water level; the mesh
     // offset is a rendering dodge that the shading already compensates for.
     constexpr float kWaterMeshSnap = 5.0f;
+
+    // ─── THE MESH BIAS: A DIAGNOSTIC, NOT A SETTING ──────────────────────────────────────────────
+    // Raises (or lowers) the DRAWN water lattice, and nothing else. Added so the shoreline dark line
+    // can be attributed rather than argued about: "add a water level bias, so I can prove the dark
+    // line becomes invisible if I push water geometry up" (user, 2026-08-15).
+    //
+    // WHAT IT PROVED. The dark line was land that arrived with its air fog STRIPPED — because
+    // fog.h.fsl believed the water covered it — over which no water was actually drawn. That is a
+    // claim about two surfaces disagreeing, and the way to test it was to move ONE of them: push the
+    // mesh up, and if the line vanishes it was uncovered stripped land. It did, and the faint bright
+    // line that replaced it (covered but unstripped: fog²) was the same boundary from the other side.
+    //
+    // ⚠ THAT WHOLE EXPERIMENT IS HISTORY NOW — the strip is gone, and with it the disagreement this
+    // was built to attribute. Nothing strips anything: the water surface is a blended draw and never
+    // re-fogs what is behind it. The bias is KEPT because its other meaning survives intact — it
+    // moves the drawn lattice, which is a rasterisation/z-fighting question and was never about fog.
+    //
+    // ⚠ AND IT IS CHEAP TO BE WRONG ABOUT, which is what makes the experiment safe: 1 MW unit is
+    // ~1.4 cm, so a few units of lift is a few centimetres of waterline climbing the beach — below
+    // perception, and the surface's own fog is correct at any height by construction (it takes
+    // fog(dist) to the displaced vertex). Large values will read as water climbing the shore.
+    //
+    // Reaches only the drawn lattice (the worlds[] build) and the water-height panel readout. The
+    // reflection's mirror and clip planes ride waterMirrorZ/waterTrueLevel and do not move; neither
+    // does waterLevelRel, which is MW's raw level for the water-cut feature.
+    float g_waterMeshBias = 0.0f;
+
     inline float waterMeshZ(float waterLevelAbs, bool underwater) {
-        return waterLevelAbs + (underwater ? kWaterMeshSnap : -kWaterMeshSnap);
+        return waterLevelAbs + (underwater ? kWaterMeshSnap : -kWaterMeshSnap) + g_waterMeshBias;
     }
     // The TRUE water level — the plane the reflection CLIPS against. MGE, scene-walk and
     // scene-walk-v2 all use WaterLevel - 1 and all three matched.
@@ -4859,18 +4886,35 @@ namespace {
     // down the existing shader/pipeline first. Position-only layout (pos float3 + per-instance
     // DrawIndex), depth GEQUAL+write (reverse-Z), cull NONE, no blend.
     bool buildWaterPipeline(Renderer* R) {
-        waitQueueIdle(g_live.pQueue);
-        if (g_live.pWaterPipeline) { removePipeline(R, g_live.pWaterPipeline); g_live.pWaterPipeline = nullptr; }
-        if (g_live.pWaterShader)   { removeShader(R, g_live.pWaterShader);     g_live.pWaterShader = nullptr; }
-
+        // ⚠⚠ LOAD FIRST, DESTROY SECOND — AND THAT ORDER IS WHY THE HOST USED TO DIE ON SHADER EDITS.
+        // This function is the water half of the F8/auto hot-reload, so it runs against a directory
+        // that an external copy is often still writing into. It used to idle the queue, destroy the
+        // running shader and pipeline, and only THEN try to load the new one — so a dxil that was
+        // missing, stale or caught mid-write took the working pipeline with it and returned `false`
+        // with pWaterPipeline left NULL. The reload's caller has no ready-flag for water (unlike glow
+        // and hiz, which disable themselves), so the next frame bound a null pipeline and the device
+        // was removed. Reported as "host keeps dying when I make shader edits, I get results maybe
+        // 50% of the time" — the 50% is the copy race, the dying is this ordering.
+        //
+        // Loading into a local first makes a failed reload a NO-OP: the running pipeline is still
+        // bound, the frame still renders, and the next poll retries once the copy has finished. The
+        // first build from init is unaffected — both pointers are null there, so the swap below is
+        // the same two assignments it always was.
         ShaderLoadDesc wsDesc = {};
         wsDesc.mVert.pFileName = "water.vert";
         wsDesc.mFrag.pFileName = "water.frag";
-        addShader(R, &wsDesc, &g_live.pWaterShader);
-        if (!g_live.pWaterShader) {
-            LOG::logline("!! [forge][water] addShader(water) FAILED (dxil missing?)"); LOG::flush();
+        Shader* newWaterShader = nullptr;
+        addShader(R, &wsDesc, &newWaterShader);
+        if (!newWaterShader) {
+            LOG::logline("!! [forge][water] addShader(water) FAILED (dxil missing or mid-write)"
+                         " — KEEPING the running pipeline, will retry"); LOG::flush();
             return false;
         }
+
+        waitQueueIdle(g_live.pQueue);
+        if (g_live.pWaterPipeline) { removePipeline(R, g_live.pWaterPipeline); g_live.pWaterPipeline = nullptr; }
+        if (g_live.pWaterShader)   { removeShader(R, g_live.pWaterShader);     g_live.pWaterShader = nullptr; }
+        g_live.pWaterShader = newWaterShader;
 
         VertexLayout wvl = {};
         wvl.mBindingCount = 2;
@@ -4898,6 +4942,39 @@ namespace {
         wRaster.mCullMode = CULL_MODE_NONE;    // matches MGE water (P6/P7, double-sided plane)
         wRaster.mFrontFace = FRONT_FACE_CCW;
 
+        // ─── PREMULTIPLIED OVER, AND THE REFRACTION IS THE DESTINATION ───────────────────────────
+        // The water surface used to be an OPAQUE write that fetched what was behind it out of
+        // gRefractColor — a RESOLVE of this same target. That fetch is per-PIXEL, and it is the sole
+        // reason the waterline needed `mwFogAirSplit`: a resolve averages a shoreline pixel's dry and
+        // submerged samples into one colour, so the seabed had to arrive with its air fog already
+        // taken off and something had to guess how much of the pixel that applied to. Five values and
+        // three ramp shapes all drew a line, because no per-pixel number serves both sample groups.
+        //
+        // The blend unit runs PER SAMPLE. Dry-beach samples keep the land colour the object shader
+        // wrote; submerged samples get the water composite. The guess has nowhere left to live.
+        //
+        // ⚠ THIS IS LEGAL BECAUSE THE COMPOSITE IS AFFINE IN `refracted` — see tasks/forge-water-blend.md
+        // for the factorisation. water.frag emits `src = own terms` and `alpha = 1 - k0`, where k0 is
+        // the weight the composite puts on whatever is behind the surface. Same equation, same value;
+        // only the SOURCE of `refracted` moves, from a resolve to the destination.
+        //
+        // ⚠ ALPHA IS A COVERAGE UNION, NOT A SUM — the same idiom skyBlendAdd/skaBlendAdd carry, and
+        // for the same reason. It also makes stage 1 of this change provable: while water.frag still
+        // returns alpha 1, `src.a*(1-dst.a) + dst.a` is exactly 1.0 for ANY dst.a, which is precisely
+        // what the old unblended opaque write put there. So switching the blend on with the shader
+        // untouched is a byte-identical no-op, and any A/B difference at that stage is a plumbing bug
+        // rather than a fog question.
+        BlendStateDesc wBlend = {};
+        wBlend.mSrcFactors[0]      = BC_ONE;                    // premultiplied: src carries its own weight
+        wBlend.mDstFactors[0]      = BC_ONE_MINUS_SRC_ALPHA;    // ...and k0 = 1 - alpha lets the scene through
+        wBlend.mSrcAlphaFactors[0] = BC_ONE_MINUS_DST_ALPHA;    // union, not sum
+        wBlend.mDstAlphaFactors[0] = BC_ONE;
+        wBlend.mBlendModes[0]      = BM_ADD;
+        wBlend.mBlendAlphaModes[0] = BM_ADD;
+        wBlend.mColorWriteMasks[0] = COLOR_MASK_ALL;
+        wBlend.mRenderTargetMask   = BLEND_STATE_TARGET_0;
+        wBlend.mIndependentBlend   = false;
+
         PipelineDesc wPd = {};
         wPd.mType = PIPELINE_TYPE_GRAPHICS;
         GraphicsPipelineDesc& wg = wPd.mGraphicsDesc;
@@ -4910,6 +4987,7 @@ namespace {
         wg.pDepthState = &wDepth;
         wg.pVertexLayout = &wvl;
         wg.pRasterizerState = &wRaster;
+        wg.pBlendState = &wBlend;
         wg.pShaderProgram = g_live.pWaterShader;
         addPipeline(R, &wPd, &g_live.pWaterPipeline);
         if (!g_live.pWaterPipeline) {
@@ -10351,10 +10429,42 @@ namespace {
     // ─── WATER UV-DISTORTION FALLOFF (water.frag, P[2].w) ────────────────────────────────────────
     // The refraction/reflection offset scales with `dist` and so grows without bound; screen space
     // is angular, so it should not. This is the distance at which it has faded to exactly zero,
-    // with the growth capped at half of it. 16384 = 2 MW cells: wave-scale distortion is not
-    // resolvable at 100 m anyway, and near water (inside 1 cell) is untouched. 0 = the old
-    // unbounded behaviour, i.e. the A/B.
-    float g_waterDistortFar = 16384.0f;
+    // with the growth capped at half of it.
+    //
+    // ⚠ A FRACTION OF nearViewRange, NOT A DISTANCE — and 16384 was a number I picked, which is the
+    // tell ([[feedback_prior_art_constants_dont_transfer]]). The right bound is not a look call: the
+    // refraction shows gRefractColor, and gRefractColor only holds MW's NEAR scene, out to
+    // nearViewRange (lodParams.w), past which the distant grid takes over. A tap offset beyond that
+    // is reaching across the handover. Tying it to the same lane makes it follow the user's view
+    // distance instead of needing a second setting that has to be kept in step.
+    // 0 = the old unbounded behaviour, i.e. the A/B.
+    float g_waterDistortFrac = 0.5f;
+
+    // ─── SHORELINE (water.frag, worlds[11] group 1) ──────────────────────────────────────────────
+    // How shallow water hands the pixel over to what is under it. Two axes, and conflating them is
+    // the mistake these defaults were set to correct: DEPTH is an optical fact about water measured
+    // in centimetres, RANGE is a perceptual call about when the softening is worth drawing at all,
+    // measured in metres. 1 MW unit = 1.42 cm.
+    float g_shoreFadeDepth  = 21.0f;    // 30 cm — deepest water that still reads as shallow
+    float g_shoreFadeFar    = 704.0f;   // 10 m  — effect gone by here (NEAR is half of it)
+    float g_shoreWaveBreath = 63.0f;    // 3x the depth: the waterline moves +-15% with the waves
+
+    // ─── THE AIR-FOG CHANGEOVER — DELETED, 2026-08-15 ────────────────────────────────────────────
+    // `g_fogWaterBias` published (gShadowParams.toneParams.w) how far below the water plane a
+    // fragment stopped carrying its own air fog, because the water surface in front of it applied
+    // that segment instead. It was DERIVED rather than tuned — the gap between the plane the shader
+    // tested (waterTrueLevel) and the plane the mesh is rasterised on (waterMeshZ) — and the
+    // derivation was right: `gap = meshBias + changeover - 4` is exactly 0 at the defaults, confirmed
+    // live in both directions.
+    //
+    // What survived the derivation was a one-pixel seam, and no value of this knob could reach it.
+    // The changeover was a per-PIXEL decision about a pixel containing both dry beach and seabed, and
+    // shading writes one colour to every sample it covers — so whichever side it picked, the other
+    // was wrong. The fix was to stop asking: the water surface is a BLENDED draw now, so what is
+    // behind it arrives per SAMPLE through the blend unit and no longer needs its air fog metered in
+    // advance. See tasks/forge-water-blend.md and the share in fog.h.fsl.
+    //
+    // toneParams.w is now unused. Left published as 0 rather than repacked — see the write site.
 
     float g_calSunGain   = 1.0f;   // sunCol   — host-side, at the one decode site
     float g_calAmbGain   = 1.0f;   // ambCol   — host-side, at the one decode site
@@ -11150,10 +11260,22 @@ namespace {
         r[1] = g_rippleDecay;
         r[2] = std::floor(std::max(g_rippleSlots, 1.0f) + 0.5f);   // integral; the shader loops on it
         r[3] = (float)g_ripplePhase;   // < 512, so float32 keeps ~3e-5 of a cycle. Plenty.
-        // r[4..11] were the R2 ANALYTIC actor-ripple lanes, deleted with that path — see the note
-        // above g_actorRipples. They are left zero rather than repacked: water.frag reads only the
-        // groups it still uses, and renumbering would make every other lane in this function a
-        // moving target for no gain.
+        // worlds[11] group 1 — THE SHORELINE, reclaimed from the deleted R2 analytic actor-ripple
+        // lanes (r[4..11]; see the note above g_actorRipples). Four numbers that were #defines in
+        // water.frag until they needed dialling in play, and water.frag is the ONE graphics shader
+        // that hot-reloads — so these cost an F8 to retune instead of a host restart, which is the
+        // whole reason they are worth a lane.
+        //   x = fade DEPTH   (how deep water can be and still show its bottom)
+        //   y = fade NEAR    (full effect closer than this)
+        //   z = fade FAR     (gone by here; hard intersection beyond)
+        //   w = wave BREATH  (x the depth — how much the waterline moves with the waves)
+        // r[8..11] stay zero and unread.
+        r[4] = std::max(g_shoreFadeDepth, 0.0f);
+        // FAR is the slider and NEAR is derived from it, so the pair can never cross and produce a
+        // reversed smoothstep. The ratio is the one the numbers shipped with (5 m of 10 m).
+        r[6] = std::max(g_shoreFadeFar, 1.0f);
+        r[5] = 0.5f * r[6];
+        r[7] = std::max(g_shoreWaveBreath, 0.0f);
         // worlds[12] group 0 — R2b wave-sim domain, so the frag can map a world position to a
         // texel. Eye-relative like everything else the water frag consumes.
         //   x,y = domain origin (eye-relative)   z = 1/unitsPerTexel   w = grid size in texels
@@ -12311,9 +12433,45 @@ namespace {
           t.sliderF("Fog: exp curvature (0 = MW linear; higher = more front-loaded)",
                     &g_fogExpScale, 0.0f, 6.0f, 0.1f);
           // Water's refraction/reflection UV distortion grows with distance because `dist` multiplies
-          // it; this is where it reaches zero (growth caps at half). 0 = unbounded, the old A/B.
-          t.sliderF("Water: distortion fade distance (0 = unbounded/legacy)",
-                    &g_waterDistortFar, 0.0f, 65536.0f, 512.0f);
+          // it; this is where it reaches zero (growth caps at half), as a fraction of nearViewRange —
+          // the range gRefractColor actually holds MW's near scene over. 0 = unbounded, the old A/B.
+          t.sliderF("Water: distortion fade (x nearViewRange; 0 = unbounded/legacy)",
+                    &g_waterDistortFrac, 0.0f, 2.0f, 0.05f, "%.02f");
+          // ─── SHORELINE ───────────────────────────────────────────────────────────────────────
+          // All three ride worlds[11] group 1, which water.frag reads — and water.frag hot-reloads,
+          // so these move live. 1 unit = 1.42 cm; the labels carry the metric reading because the
+          // whole point of the pair is that they are in DIFFERENT units and were confused once.
+          // ⚠ THE RANGES ARE TIGHT AND THE STEPS ARE SMALL ON PURPOSE — "it needs very sensitive
+          // tweaking". The default depth is 21 units, so a slider running to 200 in steps of 1 spends
+          // 90% of its travel past anything usable and cannot resolve a 10% change at the value that
+          // matters. Each of these is bounded at a few times its default and stepped at ~1-2% of it,
+          // which is what makes the useful band most of the bar instead of the first tenth of it.
+          //
+          // 0 depth switches the shoreline blend off entirely (the smoothstep collapses), which is
+          // the A/B for "is the shore doing this or is something else".
+          t.sliderF("Shore: fade DEPTH (units; 21 = 30 cm)",
+                    &g_shoreFadeDepth, 0.0f, 60.0f, 0.25f, "%.02f");
+          // Past this the 30 cm band is sub-pixel and a soft edge reads as a smeared waterline, so
+          // the hard intersection is deliberately the better image. NEAR is half of this, host-side,
+          // so the two can never cross.
+          t.sliderF("Shore: fade RANGE (units; 704 = 10 m, full inside half)",
+                    &g_shoreFadeFar, 0.0f, 2048.0f, 16.0f, "%.0f");
+          // How far the waterline moves with the waves. Shipped at 3x the depth (±15% of it); it is
+          // an absolute here rather than a ratio so it can be pushed independently, at the cost of
+          // having to be re-checked after a big depth change.
+          t.sliderF("Shore: wave BREATH (units of apparent depth)",
+                    &g_shoreWaveBreath, 0.0f, 200.0f, 1.0f, "%.0f");
+          // ("Fog: water changeover depth" was here. It decided where the seabed stopped fogging
+          // itself and the water surface started fogging it — a boundary that no longer exists, since
+          // the blended surface never re-fogs what is behind it. Deleted with g_fogWaterBias.)
+          //
+          // THE MESH ITSELF, as a diagnostic — see g_waterMeshBias for what it is for and what a
+          // positive result looks like. It KEEPS its meaning across the blend change: it moves the
+          // drawn lattice, which is a question about rasterisation and z-fighting, and was never
+          // about fog. 1 unit is ~1.4 cm, so the first few are free.
+          // ⚠ Not a setting. Ship at 0.
+          t.sliderF("Water: MESH height bias (diagnostic; 0 = as drawn)",
+                    &g_waterMeshBias, -8.0f, 16.0f, 0.25f, "%.02f");
           // How dark a surface goes as fog closes in, before it melts — the silhouette knob. 0 = the
           // surface melts straight from its own brightness with no darkening on the way. This sets how
           // dark; the SHAPE below sets where along the distance that darkness is spent, and both are
@@ -14567,6 +14725,11 @@ namespace ForgeRender {
             // would move the A/B partner's image and stop it being a partner.
             cp[kToneFloat + 2] = (g_live.linearScene && g_fogExp)
                                      ? std::max(0.1f, g_fogExpScale) : 0.0f;
+            // RETIRED — this carried the air-fog changeover depth (fog.h.fsl): how far below the
+            // water plane a fragment stopped carrying its own air ramp. No shader reads it now; the
+            // water surface is blended and never re-fogs what is behind it, so nothing has to be
+            // stripped and there is no depth to name. Written as 0 rather than repacked, because
+            // renumbering a published lane costs every reader a rebuild to save four bytes.
             cp[kToneFloat + 3] = 0.0f;
             // S3a — the emissive calibration gain, from the same unconditional block and for the
             // identical reason: a receiver reading zero here would erase every self-illuminated
@@ -18782,12 +18945,13 @@ namespace ForgeRender {
                 p[8]  = waterParams ? waterParams[8]  : 0.0f;  // camFwd.x
                 p[9]  = waterParams ? waterParams[9]  : 0.0f;  // camFwd.y
                 p[10] = waterParams ? waterParams[10] : 1.0f;  // camFwd.z
-                // ⚠ REPURPOSED. This carried a copy of nearViewRange that NO water shader read —
-                // the live one is gFrameData.lodParams.w, which statics.vert gates the hero near-cut
-                // on. It is now the distance at which water's UV distortion has faded to zero; 0
-                // restores the old unbounded behaviour exactly. Group 3 is full, and this was the
-                // only dead lane in it.
-                p[11] = std::max(0.0f, g_waterDistortFar);
+                // ⚠ REPURPOSED, AND THEN REPURPOSED BACK HALFWAY. This carried a copy of
+                // nearViewRange that NO water shader read — the live one is gFrameData.lodParams.w,
+                // which statics.vert gates the hero near-cut on. It is now the FRACTION of that same
+                // nearViewRange at which water's UV distortion has faded to zero, so the lane ends up
+                // carrying the number it was always named after, this time as a multiplier the shader
+                // applies to the live copy. 0 restores the old unbounded behaviour exactly.
+                p[11] = std::max(0.0f, g_waterDistortFrac);
                 p[12] = waterFlagsWord();          // debug view (bits 0-1) + P4 Schlick (bit 2)
                 p[13] = waterAlphaBase(p[1]);      // WT4d sub-texel GGX alpha, wind-scaled
                 p[14] = (float)kReflectSize;       // gReflectMips side, for the reflection LOD
@@ -20584,21 +20748,71 @@ namespace ForgeRender {
     // fsl.py + redeploy first, then trigger this. Queue is idled so no in-flight dispatch uses the
     // old PSO. NOTE: this reloads the mode SHADERS, not the mode TABLE — adding a fifth mode is a
     // host restart.
-    void reloadComputeShaders() {
+    // Returns FALSE if the reload was abandoned before it committed — the caller must then leave the
+    // trigger mtime uncommitted so the next poll retries. See checkShaderHotReload.
+    bool reloadShadersImpl() {
         Renderer* R = g_live.pRenderer;
         if (!R || !g_live.pAOShader[kAOModeGTAO]) {
-            return;
+            return false;
         }
+
+        // ⚠⚠ LOAD FIRST, DESTROY SECOND — the same rule buildWaterPipeline states at length, and this
+        // block was the worse offender. It destroyed every AO/linearize shader AND pipeline up front,
+        // then loaded, and on failure simply `return`ed — leaving pAOPipeline[], pLinearizePipeline
+        // and pAOBlurPipeline all NULL with nothing to restore them. Unlike the hiz / reflect-mip /
+        // shadowmask blocks below, which set a ready-flag false and go inert, these have no such
+        // guard: the next frame dispatched a null pipeline and the device went away.
+        //
+        // Loading into locals costs one extra shader's worth of memory for a few microseconds and
+        // makes an abandoned reload completely invisible — the previous shaders are still bound and
+        // still working.
+        const char* linName = (g_live.sampleCount > 1) ? "linearizedepth_sc4.comp"
+                                                       : "linearizedepth_sc1.comp";
+        Shader* newLin  = nullptr;
+        Shader* newBlur = nullptr;
+        Shader* newAO[kAOModeCount] = {};
+        {
+            ShaderLoadDesc lsd = {};
+            lsd.mComp.pFileName = linName;
+            addShader(R, &lsd, &newLin);
+            for (uint32_t m = 0; m < kAOModeCount; ++m) {
+                ShaderLoadDesc gsd = {};
+                gsd.mComp.pFileName = kAOShaderFiles[m];
+                addShader(R, &gsd, &newAO[m]);
+            }
+            ShaderLoadDesc absd = {};
+            absd.mComp.pFileName = "aoblur.comp";
+            addShader(R, &absd, &newBlur);
+        }
+        bool aoShadersOk = true;
+        for (uint32_t m = 0; m < kAOModeCount; ++m) {
+            if (!newAO[m]) {
+                LOG::logline("!! [forge] hot-reload addShader(%s) FAILED", kAOShaderFiles[m]);
+                aoShadersOk = false;
+            }
+        }
+        if (!newLin || !aoShadersOk || !newBlur) {
+            // Give back whatever DID load; touch nothing that is running.
+            if (newLin)  { removeShader(R, newLin); }
+            if (newBlur) { removeShader(R, newBlur); }
+            for (uint32_t m = 0; m < kAOModeCount; ++m) { if (newAO[m]) { removeShader(R, newAO[m]); } }
+            LOG::logline("!! [forge] hot-reload ABANDONED (dxil missing or mid-write) —"
+                         " previous shaders KEPT, will retry"); LOG::flush();
+            return false;
+        }
+
+        // Committed. Everything below swaps into place and cannot leave a null pipeline bound.
         waitQueueIdle(g_live.pQueue);
 
         for (uint32_t m = 0; m < kAOModeCount; ++m) {
             if (g_live.pAOPipeline[m]) { removePipeline(R, g_live.pAOPipeline[m]); g_live.pAOPipeline[m] = nullptr; }
-            if (g_live.pAOShader[m])   { removeShader(R, g_live.pAOShader[m]);     g_live.pAOShader[m] = nullptr; }
+            if (g_live.pAOShader[m])   { removeShader(R, g_live.pAOShader[m]); }
+            g_live.pAOShader[m] = newAO[m];
         }
         removePipeline(R, g_live.pLinearizePipeline);  g_live.pLinearizePipeline = nullptr;
-        removeShader(R, g_live.pLinearizeShader);      g_live.pLinearizeShader = nullptr;
+        removeShader(R, g_live.pLinearizeShader);      g_live.pLinearizeShader = newLin;
         removePipeline(R, g_live.pAOBlurPipeline);     g_live.pAOBlurPipeline = nullptr;
-        removeShader(R, g_live.pAOBlurShader);         g_live.pAOBlurShader = nullptr;
+        removeShader(R, g_live.pAOBlurShader);         g_live.pAOBlurShader = newBlur;
         // The half-res chain's two shaders reload with the rest. Its DESCRIPTOR SETS are bound to
         // the (unchanged) root signature and stay valid, exactly like the full-res ones.
         if (g_live.pAODownPipeline) { removePipeline(R, g_live.pAODownPipeline); g_live.pAODownPipeline = nullptr; }
@@ -20606,28 +20820,6 @@ namespace ForgeRender {
         if (g_live.pAOUpPipeline)   { removePipeline(R, g_live.pAOUpPipeline);   g_live.pAOUpPipeline = nullptr; }
         if (g_live.pAOUpShader)     { removeShader(R, g_live.pAOUpShader);       g_live.pAOUpShader = nullptr; }
 
-        const char* linName = (g_live.sampleCount > 1) ? "linearizedepth_sc4.comp"
-                                                       : "linearizedepth_sc1.comp";
-        ShaderLoadDesc lsd = {};
-        lsd.mComp.pFileName = linName;
-        addShader(R, &lsd, &g_live.pLinearizeShader);
-        bool aoShadersOk = true;
-        for (uint32_t m = 0; m < kAOModeCount; ++m) {
-            ShaderLoadDesc gsd = {};
-            gsd.mComp.pFileName = kAOShaderFiles[m];
-            addShader(R, &gsd, &g_live.pAOShader[m]);
-            if (!g_live.pAOShader[m]) {
-                LOG::logline("!! [forge] hot-reload addShader(%s) FAILED", kAOShaderFiles[m]);
-                aoShadersOk = false;
-            }
-        }
-        ShaderLoadDesc absd = {};
-        absd.mComp.pFileName = "aoblur.comp";
-        addShader(R, &absd, &g_live.pAOBlurShader);
-        if (!g_live.pLinearizeShader || !aoShadersOk || !g_live.pAOBlurShader) {
-            LOG::logline("!! [forge] hot-reload addShader FAILED (dxil missing on disk?)"); LOG::flush();
-            return;
-        }
         PipelineDesc lpd = {};
         lpd.mType = PIPELINE_TYPE_COMPUTE;
         lpd.mComputeDesc.pShaderProgram = g_live.pLinearizeShader;
@@ -20799,13 +20991,19 @@ namespace ForgeRender {
                 LOG::logline(">> [forge][glow] glow graphics pipeline hot-reloaded (glow.vert + glow.frag)"); LOG::flush();
             }
         }
+        return true;
     }
+
+    // The public entry (F8, via server.cpp). Kept `void` so forgerender.h is untouched — a header
+    // edit here costs a full /t:Rebuild on drvfs, and the bool only matters to the poller below.
+    void reloadComputeShaders() { reloadShadersImpl(); }
 
     // Auto hot-reload: poll the gtao dxil's mtime (CWD = morrowind64, same dir the loader reads from)
     // every ~20 frames; when it changes, an external fsl.py watcher has landed a recompile, so rebuild
     // the compute pipelines. Edit .fsl -> save -> live, no key press. (F8 stays as a manual trigger.)
     void checkShaderHotReload() {
-        static unsigned long long s_lastWrite = 0;
+        static unsigned long long s_lastWrite = 0;   // the mtime we last reloaded SUCCESSFULLY at
+        static unsigned long long s_lastSeen  = 0;   // ...and the one the previous poll observed
         static unsigned s_tick = 0;
         if ((s_tick++ % 20) != 0) {
             return;
@@ -20818,12 +21016,38 @@ namespace ForgeRender {
                                fad.ftLastWriteTime.dwLowDateTime;
         if (s_lastWrite == 0) {
             s_lastWrite = w;   // baseline: don't reload the first time we see the file
+            s_lastSeen  = w;
             return;
         }
-        if (w != s_lastWrite) {
+        if (w == s_lastWrite) {
+            s_lastSeen = w;
+            return;                         // nothing new
+        }
+
+        // ⚠ WAIT FOR THE MTIME TO SETTLE — ONE QUIET POLL — BEFORE ACTING. gtao is only the TRIGGER;
+        // the reload then reads a dozen other dxil files, and firing the instant gtao's mtime moves
+        // means reading them while the writer is still going. The watcher copies gtao LAST precisely
+        // so its deps have landed, but a plain recursive copy of the whole directory has no such
+        // ordering (gtao sorts in the middle of the alphabet, so everything after 'g' is still stale
+        // or half-written when it lands). That is the "I get results maybe 50% of the time": the
+        // reload succeeded, it just read the PREVIOUS water.frag.
+        //
+        // One extra poll (~20 frames, a third of a second) is far below the edit-save-look loop and
+        // costs nothing, and it converts the common case from a coin flip into a certainty.
+        if (w != s_lastSeen) {
+            s_lastSeen = w;                 // still moving — look again next poll
+            return;
+        }
+
+        LOG::logline(">> [forge] gtao dxil changed on disk — auto hot-reload"); LOG::flush();
+
+        // ⚠ COMMIT THE MTIME ONLY ON SUCCESS, so an abandoned reload RETRIES on the next poll instead
+        // of being swallowed. Previously s_lastWrite advanced before the reload ran, so a reload that
+        // caught a file mid-write was the final word on that edit — the shader never went live and
+        // nothing said so. Now the poller keeps trying until the whole set loads cleanly, which is
+        // what makes the settle above a latency optimisation rather than the correctness mechanism.
+        if (reloadShadersImpl()) {
             s_lastWrite = w;
-            LOG::logline(">> [forge] gtao dxil changed on disk — auto hot-reload"); LOG::flush();
-            reloadComputeShaders();
         }
     }
 
@@ -24194,9 +24418,9 @@ namespace ForgeRender {
             p[4] = depthBase[0]; p[5] = depthBase[1]; p[6] = depthBase[2];
             p[7] = underwater ? 1.0f : 0.0f;
             p[8]  = camFwd[0]; p[9] = camFwd[1]; p[10] = camFwd[2];
-            p[11] = std::max(0.0f, g_waterDistortFar);      // UV-distortion fade distance (was a
-                                                            // dead nearViewRange copy; see the live
-                                                            // pass). Matched so the viewer cannot
+            p[11] = std::max(0.0f, g_waterDistortFrac);     // UV-distortion fade, x nearViewRange
+                                                            // (was a dead nearViewRange copy; see the
+                                                            // live pass). Matched so the viewer cannot
                                                             // disagree with the game about water.
             p[12] = waterFlagsWord();          // debug view (bits 0-1) + P4 Schlick (bit 2)
             p[13] = waterAlphaBase(p[1]);      // WT4d sub-texel GGX alpha, wind-scaled

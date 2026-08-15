@@ -52,7 +52,7 @@
 // the water and the SEABED, and the seabed is drawn by opaque/statics/terrain — fogging only the
 // surface would leave the two disagreeing exactly as they do today.
 #include "waterfog.h.fsl"
-#include "fog.h.fsl"      // mwFogAir() — the submerged test, per PIXEL
+#include "fog.h.fsl"      // mwFogAirShare() — the air/water ray split
 
 // ORDER MATTERS, and getting it wrong is why v2 still read as a cutout at mid distance. Extinction
 // applied to the fog TARGET only shows up once fog is complete — by which point the surface has
@@ -206,10 +206,30 @@ float3 applyFog(float3 lit, float3 worldPosRel, float2 pixelXy, float fog)
     // edge in the near scene grew black NaN dots. Found 2026-08-01; the interpolators feeding this
     // are CENTROID now, and this line means the next one that is not cannot reach a pow().
     fog = saturate(fog);
-    // ...and the submerged test HERE rather than in the vertex stage that produced `fog`. A step
-    // function interpolates into a ramp belonging to neither side, which is what put a soft,
-    // wrong-coloured band along every shoreline. This is the same test, evaluated per pixel.
-    fog = mwFogAir(fog, worldPosRel);
+    // ⚠ AND THE PLANE TEST THAT USED TO SIT HERE IS GONE — 2026-08-15. mwFogAir compared this
+    // fragment's z against the drawn water mesh and stripped the whole air ramp below it. Every
+    // spelling of that test drew a line along the shoreline, because every spelling had to decide,
+    // per pixel, something that is true of only part of the pixel:
+    //
+    //   bias 0 / 3        stripped land the water does not cover        -> dark line
+    //   bias 12           left covered land carrying its own ramp       -> bright line
+    //   bias 4, hard      exact in depth, still per-pixel               -> 1px dark, at distance
+    //   + footprint bias  systematically under-stripped by half a pixel -> bright line, at mid
+    //   + coverage weight unbiased, but still a per-pixel guess         -> dark shoreline, at distance
+    //
+    // Five values and three shapes, all of the same defect: a test that has to GUESS how much of this
+    // pixel the water will cover.
+    //
+    // ⚠⚠ AND THE STRIP THAT REPLACED IT IS GONE TOO — the whole `mwFogAirSplit` family, same day,
+    // same defect one level up. It was a smoother guess, and a guess is what could not work: shading
+    // runs ONCE PER PIXEL and writes one colour to every sample it covers, so at a waterline pixel
+    // holding both dry beach and seabed there is no number that serves both groups.
+    //
+    // What removed the question was giving the water surface a different SOURCE. It is a BLENDED draw
+    // now (tasks/forge-water-blend.md), so what is behind it arrives through the blend unit, PER
+    // SAMPLE, and water.frag no longer re-fogs it. Nothing downstream is going to apply this
+    // fragment's air segment a second time, so this fragment simply keeps it — all of it, by the
+    // honest share, with no plane anywhere in the expression.
 
     // ⚠ THE AIR RAMP ONLY OWNS THE PART OF THE RAY THAT IS AIR. This is the line that makes the
     // surface crossing continuous, and leaving it out is what put a hard step there on the first
@@ -236,7 +256,27 @@ float3 applyFog(float3 lit, float3 worldPosRel, float2 pixelXy, float fog)
     // and would have made "feature off" merely close). At waterShare 1 it is 1, i.e. no air fog at
     // all, which is precisely the v1 submerged branch — so that branch is gone, not conditioned:
     // one continuous expression reproduces both of its endpoints and every state between them.
-    float fogAir = saturate(fog + (1.0f - fog) * wf.y);
+    //
+    // ⚠ THIS IS NOW THE ONLY THING DECIDING IT, and the one earlier attempt at that failed for a
+    // reason that has been fixed rather than argued away. On 2026-08-14 this share went in WITHOUT
+    // its other half — water.frag kept melting the finished composite, which re-applied the air
+    // segment the share had just handed to the seabed — and the reports were "the water surface is
+    // not fogged as much as above land fog" and "close to water surface underwater objects are
+    // getting too much fog brightness". Both are double-counting, from opposite ends of the water
+    // share, and the response at the time was to replace the share with a hard gate (mwFogAirSplit)
+    // so the seabed carried NO air fog for the surface to duplicate. That fixed the double-count and
+    // bought the shoreline seam, because the gate had to be evaluated per pixel.
+    //
+    // ⚠⚠ THE OTHER HALF IS NOW REAL, so the share is back and the gate is deleted. water.frag is a
+    // BLENDED surface and fogs only its own contribution; the seabed is the DESTINATION and fogs
+    // itself. There is nothing left to double-count, and the geometrically exact answer is finally
+    // the one that composes correctly.
+    //
+    // At waterShare 0 this is `fog` EXACTLY — not to within a rounding error, which is what makes an
+    // above-water fragment provably unable to leak: waterPathLength returns exactly 0 for a ray with
+    // both ends above the surface, so no shoreline pixel can lose any part of its ramp at any camera
+    // height, grazing angle or distance.
+    float fogAir = mwFogAirShare(fog, wf.y, length(worldPosRel));
 
     // ⚠ ...AND WHILE THE CAMERA IS SUBMERGED, MW'S SCALAR IS NOT AN AIR FOG AT ALL. It changes
     // MEANING at the surface, which no share can express, and that is why this needs a frame test
@@ -322,22 +362,50 @@ float3 applyFog(float3 lit, float3 worldPosRel, float2 pixelXy, float fog)
     // same schedule the sky melt does. It needs no water gate of its own — at waterShare 1,
     // fogAir is 1, `1 - fogAir` is 0 and the ramp is 0, so a fully submerged fragment is not
     // silhouetted against a sky it has no line of sight to. One quantity disarms both halves.
-    lit *= fogExtinction(fogAir, skyBehind);
-
-    // AIR over its share of the ray, then WATER over the rest. No branch and no camera test: the
-    // share carries it, and both of the v1 branches fall out of this one expression at its
-    // endpoints (see the fogAir note above).
+    // ⚠⚠ WATER FIRST, THEN AIR — THE NESTING IS THE ORDER LIGHT ARRIVES IN, and getting it backwards
+    // produced two reports at once on 2026-08-15: "water surface is not fogged enough" and
+    // "underwater objects are getting air fog".
+    //
+    // This used to read `waterFogComposite(lerp(target, lit, fogAir), ...)` — the air fog applied to
+    // `lit`, and the WATER composite wrapped around it. waterFogComposite is
+    // `lerp(behind, waterColor, wf.x)`, so in deep water (wf.x -> 1) it melted the air-fogged colour
+    // the rest of the way to the water colour and ERASED the atmosphere entirely: a seabed carrying
+    // no distance fog at all, sitting behind a water surface that had to account for the whole pixel.
+    // Near the surface wf.x is small, nothing was erased, and the same fragment kept a full air ramp
+    // it should not have had. One wrong nesting, two opposite symptoms.
+    //
+    // Light travels seabed -> water -> surface -> air -> eye, so AIR IS THE OUTERMOST MEDIUM and is
+    // applied last. The water column attenuates and in-scatters over its own segment; the air ramp
+    // then attenuates and melts that result over its own.
+    //
+    // ⚠ IT WAS INVISIBLE UNTIL THE STRIP WENT. `mwFogAirSplit` forced fogAir to 1 for anything the
+    // water covered, which made the inner air lerp an IDENTITY — so the order could not be observed,
+    // and water.frag applied the air segment afterwards on the finished composite, which is the right
+    // order by accident. Removing the strip did not create this bug; it uncovered one that had been
+    // sitting behind an identity operation.
+    //
+    // ⚠ ABOVE WATER THIS IS BIT-IDENTICAL, which is what makes the reorder safe to make in a shared
+    // function: wf is exactly (0, 0) there, so waterFogComposite returns `lit` unchanged (its lerp is
+    // by 0 and waterFogBlend early-outs on L == 0) and the two spellings are the same instructions on
+    // the same values. Only fragments with water in front of them can move.
     //
     // The water half is a COMPOSITE and not a lerp, because a medium that scatters does two separable
     // things to what is behind it — attenuates it and adds to it — and only the attenuation is a
-    // lerp. waterFogComposite reproduces this line exactly at W8 strength 0 (it is handed the lerp
-    // as its own legacy input), so what follows here is unchanged until that lane moves.
+    // lerp. waterFogComposite reproduces the plain fade exactly at W8 strength 0 (it is handed the
+    // lerp as its own legacy input).
+    float3 behind = waterFogComposite(lit, worldPosRel, wf);
+
+    // ...and now the air, over the segment between the eye and whatever interface it reached.
+    // fogExtinction moved down here with it — for an above-water fragment nothing changed (it is the
+    // same multiply on the same value), and for a submerged one skyBehind reads 0 anyway, so this
+    // term is 1 and the move cannot alter it.
+    behind *= fogExtinction(fogAir, skyBehind);
+
     // fogSkyShare(fogAir): the sky substitution arrives only where the fog saturates — see the knee.
     // fogAir and NOT `fog`, so the share follows the same air-only schedule the melt does: a
-    // submerged fragment (fogAir 1) gets share 0, which is right twice over — it has no line of
+    // fully submerged fragment (fogAir 1) gets share 0, which is right twice over — it has no line of
     // sight to the sky, and the water fog owns that ray.
-    return waterFogComposite(lerp(fogSkyTarget(s, fogSkyShare(fogAir)), lit, fogAir),
-                             worldPosRel, wf);
+    return lerp(fogSkyTarget(s, fogSkyShare(fogAir)), behind, fogAir);
 }
 
 #endif // SKY_DOME_H

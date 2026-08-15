@@ -16,7 +16,8 @@
 // Params ride gBatch.worlds[6] (host writes 4 contiguous float4 groups; transpose to read them):
 //   g0 = (waterLevelRel, windFactor, shoreDepthBias, time)
 //   g1 = (depthBaseColor.rgb, underwater)
-//   g2 = (camFwd.xyz, distortFar)      // .w WAS an unread duplicate of nearViewRange
+//   g2 = (camFwd.xyz, distortFrac)     // .w WAS an unread duplicate of nearViewRange; it is now a
+//                                      //    FRACTION of the live one (gFrameData.lodParams.w)
 //   g3 = (waterFlags, alphaBase, reflSize, reflBlurGain)
 // ...and worlds[8..10] carry the W1 surface field's four Blender-style noise textures:
 //   worlds[8] per noise = (scale, detail, roughness, height)
@@ -181,6 +182,24 @@ float fresnelDielectricRough(float cosI, float alpha, float eta)
 // here because the texel-to-world density — period / this — is what every LOD in the file is
 // measured in.
 #define kWaveFieldTexels 1024.0f
+// ─── THE SHORELINE'S NUMBERS ARE IN TWO DIFFERENT UNITS ─────────────────────────────────────────
+// "shoreline depth is mere cms, I would say 30cm max. the distance it should happen is 5m-10m max.
+// after that a hard intersection reads more natural." (user, 2026-08-13)
+//
+// ⚠ DEPTH AND DISTANCE ARE NOT THE SAME AXIS, and reading "5-10 m" as a depth is the mistake this
+// replaces — it produced a fade reaching 7 m DOWN, i.e. water still going transparent over a seabed
+// two storeys below. Wrong by a factor of 33, and in the direction that dissolves the sea.
+//
+//   DEPTH  — how deep the water can be and still show its bottom. Centimetres. This is a real optical
+//            statement about shallow water and it is small.
+//   RANGE  — how far from the eye the effect is worth drawing. Metres. This is a PERCEPTUAL statement:
+//            past it the softening is sub-pixel, and a soft edge drawn at sub-pixel width reads as a
+//            smeared, uncertain waterline where a hard one reads as a crisp real intersection. So the
+//            effect is switched off with distance ON PURPOSE — the hard version is the better image
+//            out there, not a compromise.
+//
+// They are LANES (worlds[11] group 1) and not #defines, because this file hot-reloads and the two
+// axes have to be dialled against each other by eye. 1 MW unit = 1.42 cm; defaults 21 / 704 / 63.
 
 // ⚠ FORGE DECLARES SampleLvlTex2DArray AGAINST Texture3D (d3d.h:490-493) — a Forge bug we must
 // neither inherit nor fork-fix ([[project_forge_fork_merge_trap]]). Local macros instead, mirroring
@@ -208,6 +227,63 @@ float3 reconstructWorld(float4x4 invVP, float2 uv, float deviceZ)
     float ndcY = 1.0f - uv.y * 2.0f;
     float4 p = mul(invVP, float4(ndcX, ndcY, deviceZ, 1.0f));
     return p.xyz / p.w;
+}
+
+// --- THE OCCLUSION GUARD ON A DISTORTED TAP ----------------------------------------------------
+// PORT of scene-walk-v2's `reflectionOcclusionAt` (assets/Data Files/shaders/core/XE Mod Water.fx),
+// which is where this artefact was solved the first time and where the shape of the fix belongs to
+// [[feedback_prior_art_constants_dont_transfer]]'s other half: port the MECHANISM, and here the
+// constants port with it because they are in the same units (MW world units) as they were.
+//
+// THE ARTEFACT. Wave distortion offsets the reflection tap by a few pixels. That is harmless over
+// open water, where the neighbouring pixels of the mirror image look like each other — and it is
+// NOT harmless next to something standing IN the water, because the reflection RT has that object's
+// mirror image in one place and sky in the next. A tap that walks off the mirrored object lands on
+// mirrored SKY, so the water hugging a silhouette lights up with a bright rim that follows the
+// waves. "Bright colours around the silhouettes of objects against water", exactly.
+//
+// THE FIX is not to clamp the offset, it is to notice the tap has hit an OCCLUDER and walk it back
+// to where it started. `waterDist - sceneDist > 0` means the scene at the tap is in FRONT of this
+// water pixel, i.e. the tap has left the water; the smoothstep makes the walk-back gradual so the
+// repair does not draw an edge of its own, which is the whole lesson of the fog wall.
+//
+// `valid` rejects a tap whose scene is beyond the near range: gRefractColor/gSceneLinDepth carry
+// MW's near scene, and past the handover "in front of the water" stops being a statement about an
+// occluder. It costs nothing now that the distortion itself is bounded by a fraction of that same
+// nearViewRange — inside the fade there is no such tap left to reject — but it stays because the
+// fraction is a live knob and can be turned past 1.
+//
+// ⚠⚠ AND IT IS ALSO THE ANSWER TO A ONE-PIXEL RIM THAT SURVIVES WITH THE WAVES SWITCHED OFF, which
+// is a DIFFERENT fault reached through the same signal. Flat normals mean zero distortion, so a rim
+// that persists under bit 14 cannot be a tap that moved. It is the DEPTH BUFFER disagreeing with the
+// COLOUR BUFFER about what is at the pixel:
+//
+//     pRefractColor  is a RESOLVE of the MSAA colour     (forgerender.cpp:18690) — an AVERAGE
+//     pLinearDepth   is SAMPLE 0 of the MSAA depth       (forgerender.cpp:1272)  — a PICK
+//
+// At a silhouette, one pixel is part object and part water. The colour copy says so, in proportion.
+// The depth copy says "object", entirely, because sample 0 happened to land under it — so any test
+// made on the depth is answering for a surface that only covers a quarter of the pixel, and answers
+// with a whole-pixel verdict. That is [[project_forge_msaa_screenspace_lookup]] exactly: the rim
+// reads the OTHER surface. It is one pixel wide because that is how wide a silhouette is.
+//
+// So this returns a WEIGHT and never a verdict. Every caller uses it to fade something out, never to
+// take a branch — a hard test on this signal is the bug, whatever the test is for.
+float occlusionFrom(float waterDist, float sceneDist, float nearRange)
+{
+    float valid = step(sceneDist, nearRange + 64.0f);
+    return valid * smoothstep(-128.0f, 384.0f, waterDist - sceneDist);
+}
+
+// ...and the same question when the depth has not been fetched yet.
+// uvVp is VIEWPORT-relative (0..1 of the drawn image). gSceneLinDepth is ALLOCATION-sized, so the
+// fetch divides by texToVp while reconstructWorld takes the viewport uv unchanged — the same two
+// normalisations PS_MAIN documents at invAlloc, and mixing them up is the trap that block is about.
+float sceneOcclusionAt(float4x4 invVP, float2 uvVp, float2 texToVp, float waterDist, float nearRange)
+{
+    float devZ      = SampleLvlTex2D(gSceneLinDepth, gSamplerPointClamp, uvVp / texToVp, 0.0f).r;
+    float sceneDist = length(reconstructWorld(invVP, uvVp, devZ));
+    return occlusionFrom(waterDist, sceneDist, nearRange);
 }
 
 // W4 — the reflection fetch, smeared along the lobe ellipse's MAJOR axis.
@@ -254,12 +330,21 @@ float4 PS_MAIN( VSOutput In )
     float3 depthBaseColor= P[1].xyz;
     bool   underwater    = P[1].w > 0.5f;
     float3 camFwd        = P[2].xyz;
-    // ⚠ WAS A DEAD DUPLICATE OF nearViewRange. The LIVE copy is gFrameData.lodParams.w (statics.vert
-    // gates the hero near-cut on it); this water-params slot was written every frame and read by
-    // nothing, which is why it is the one free lane in a group the host already calls full.
-    // Now: the distance at which refraction/reflection UV DISTORTION has faded to zero. 0 = the old
-    // unbounded behaviour, i.e. the exact A/B.
-    float  distortFar    = P[2].w;
+    // ⚠ WAS A DEAD DUPLICATE OF nearViewRange, AND IS NOW A FRACTION OF THE LIVE ONE. The live copy
+    // is gFrameData.lodParams.w (statics.vert gates the hero near-cut on it); this water-params slot
+    // was written every frame and read by nothing, which is why it is the one free lane in a group
+    // the host already calls full.
+    //
+    // The distance at which refraction/reflection UV DISTORTION has faded to zero is not a free
+    // look parameter, which is why the 16384 that used to sit here was the wrong KIND of number.
+    // The refraction shows gRefractColor, and gRefractColor only holds MW's NEAR scene — out to
+    // nearViewRange, past which the distant grid takes over. Offsetting a tap past that reaches
+    // across the handover, so the bound belongs to the same lane that sets it and follows the user's
+    // view distance for free. 0 = the old unbounded behaviour, i.e. the exact A/B.
+    //
+    // The 4096 floor is the one forgerender.cpp:14355 already takes on this same lane, for the same
+    // reason: nearViewRange reads 0 in interiors, and 0 here would silently mean "unbounded".
+    float  distortFar    = P[2].w * max(gFrameData.lodParams.w, 4096.0f);
     // Bitfield, not a mode number: bits 0-1 = debug view (0 normal, 1 reflection-only,
     // 2 refraction-only, 3 roughness), bit 2 = P4 roughness-aware Schlick Fresnel, bit 3 = force the
     // reflection's fog melt OFF.
@@ -333,6 +418,15 @@ float4 PS_MAIN( VSOutput In )
     float  rippleLamMax  = max(ripG3.y, rippleLamMin);
     float  rippleRadius  = max(ripG3.z, 0.0f);      // the radius every ring dies at
     float  rippleLife    = max(ripG3.w, 0.01f);     // how long ONE ripple lasts (< period = dead time)
+    // worlds[11] group 1 — THE SHORELINE, on lanes rather than #defines so it can be dialled with
+    // F8 (this file hot-reloads; the constants it replaces cost a host restart each). The host
+    // derives NEAR from FAR so the pair cannot cross, and floors both, so no combination of slider
+    // positions can invert the smoothstep.
+    float4 shoreG        = transpose(gBatch.worlds[11])[1];
+    float  shoreDepthMax = shoreG.x;    // deepest water that still reads as shallow (21 = 30 cm)
+    float  shoreFadeNear = shoreG.y;    // full effect closer than this
+    float  shoreFadeFar  = max(shoreG.z, shoreG.y + 1.0f);   // gone by here; hard intersection past it
+    float  shoreBreath   = shoreG.w;    // how far the waterline moves with the waves
     float4 ripG4         = transpose(gBatch.worlds[11])[0];
     float  rippleCycles  = max(ripG4.x, 1.0f);      // cycles per animation-clock wrap
     float  rippleDecay   = max(ripG4.y, 0.0f);      // amplitude falloff over the ring's own RADIUS
@@ -460,7 +554,43 @@ float4 PS_MAIN( VSOutput In )
     // Through the shared helper (fog.h.fsl) so water cannot end up on a different fog LAW from the
     // world it sits in — the same reason the melt target goes through fogSkyTarget rather than a
     // private fogCol. This is the one per-PIXEL evaluation; the six vertex stages interpolate theirs.
-    float fog = mwFogAir(mwFogFactor(dist), surfPos);   // per-pixel; surfPos is camera-relative
+    // ⚠ NO mwFogAir HERE, AND ASKING FOR IT WAS A CATEGORY ERROR. mwFogAir answers "is this fragment
+    // under the water surface". The water surface is not under the water surface — it IS it, at every
+    // pixel, by construction. The only reason the question ever returned anything but zero is that it
+    // was being asked about `surfPos`, which is the drawn LATTICE, and the lattice is rasterised 4
+    // units below the true plane (waterMeshZ vs waterTrueLevel — the same offset this file spends a
+    // page on at surfPos). So the test was measuring a rendering dodge against a physical plane and
+    // getting a real answer to a question nobody asked. With the changeover now sitting exactly on the
+    // mesh it would return 0 anyway; removing it means it cannot start returning something else the
+    // next time either constant moves.
+    // ⚠ mwFogRamp, NOT mwFogFactor, AND THAT IS A DELETED PREDICATE RATHER THAN A CHEAPER ONE. This
+    // pass reaches here only past `if (underwater) { ... RETURN; }`, so the eye is in air and this
+    // surface has air in front of it — always, by construction. mwFogFactor's camera guard therefore
+    // cannot tell this call anything the branch has not already established, and it reads a DIFFERENT
+    // lane (waterFogPlane.z) than the one that chose the branch (P[1].w). Agreeing costs nothing;
+    // disagreeing returns 1.0, which is the water surface drawn with no air fog at all beside land
+    // that kept its own.
+    // Per-pixel; the six vertex stages interpolate theirs.
+    //
+    // ⚠⚠ AND THIS LINE IS ALREADY CORRECT FOR 3D WAVES — DO NOT ADD A HEIGHT TEST TO IT.
+    // "Even when we add 3D waves (negative positive waves), the water surface will be considered
+    // above and get above water fog. This is only logical." (user, 2026-08-15.) It is, and the reason
+    // it needs no work is that `dist` is `length(In.WorldPos)` — the DISPLACED vertex's own distance,
+    // whatever the wave did to it. A trough is nearer, a crest is further, and each takes the air fog
+    // for the column actually in front of it. The surface is the interface: there is no height at
+    // which it stops having air on this side, so there is no height to test for.
+    //
+    // The temptation, when the mesh starts moving, will be to ask whether a trough has gone "under"
+    // the nominal water level and suppress its fog. That question is meaningless here — the nominal
+    // level is not a medium boundary for the surface, it IS the surface — and acting on it would put
+    // a fog hole in every wave trough.
+    //
+    // ⚠ AND DISPLACEMENT NOW COSTS THE FOG PATH NOTHING AT ALL. It used to matter in one other place:
+    // fog.h.fsl held a plane test (mwWaterSurfaceRelZ) that the OBJECT shaders consulted to decide
+    // whether the mesh covered them, and a moving mesh would have had to move that plane with it. The
+    // object shaders take the smooth water SHARE now, with no plane in the expression, so there is
+    // nothing left in the fog path for waves to keep in step with.
+    float fog = mwFogRamp(dist);
 
     // ─── UV-DISTORTION FALLOFF ───────────────────────────────────────────────────────────────────
     // ⚠ `dist` MULTIPLIES THE DISTORTION, AND THAT IS BACKWARDS. reffactor is a SCREEN-space offset,
@@ -480,6 +610,13 @@ float4 PS_MAIN( VSOutput In )
     //   distortFade — smoothstep to exactly 0 by distortFar, so it DROPS COMPLETELY as asked
     // smoothstep and not a linear fade, for the reason the fog wall taught: a slope discontinuity
     // reads as an edge even when the value is continuous.
+    //
+    // distortFar is now HALF nearViewRange by default (P[2].w, see the param block), which is the
+    // distance past which gRefractColor stops holding MW's near scene. This is the DISTANCE half of
+    // the falloff only; the other half is angular and lives at reffactorR, where the refraction's
+    // share of the offset is weighted by transmission. Distance says "the tap has nothing useful left
+    // to reach", Fresnel says "nothing is looking through the surface here" — two different reasons a
+    // distorted refraction tap is waste, and they bound different pixels.
     float distortMag  = (distortFar > 0.0f) ? min(dist, 0.5f * distortFar) : dist;
     float distortFade = (distortFar > 0.0f)
                             ? (1.0f - smoothstep(0.5f * distortFar, distortFar, dist))
@@ -1225,19 +1362,24 @@ float4 PS_MAIN( VSOutput In )
     // the scene's units, and it is the SAME target the submerged world melts toward in applyFog().
     // The two agreeing is the whole feature.
     //
-    // The retired expression survives ONLY as the off side of the A/B — the same way the pre-WT4d
-    // Fresnel curve does further down, and for the same reason: a toggle whose off state is not the
-    // previous image cannot answer the question it exists for. `wFogOn` gates all three retirements
-    // in this pass (this colour, the depthscale fade below, the teal scattering lerp after the
-    // Fresnel block), so they cannot come apart.
-    // ...and W8 makes even that target a derived quantity rather than a published one: deep water is
-    // the column's own in-scatter with nothing behind it, which converges to sigma_s/sigma_t times
-    // the light that got down there — the single-scattering albedo, i.e. the colour of deep water is
-    // the ratio of the two coefficients and was never something anyone had to pick. waterFogVeil is
-    // the flat authored target again at W8 strength 0.
-    bool   wFogOn    = waterFogActive();
-    float3 deepColor = wFogOn ? waterFogVeil(In.WorldPos)
-                              : depthBaseColor * decodeAuthored(float3(0.1, 0.3, 1.0) * 0.5);
+    // ⚠⚠ AND THE WHOLE `wFogOn` A/B IS RETIRED AS OF THE BLEND CHANGE — 2026-08-15, user's call.
+    // It gated three retirements in this pass (this colour, the depthscale fade below, the teal
+    // scattering lerp after the Fresnel block) so they could not come apart, and it was worth its
+    // keep while "the previous image, byte for byte" was a question anyone still asked.
+    //
+    // What ended it is the move to a BLENDED surface (tasks/forge-water-blend.md). The composite is
+    // now factored into a premultiplied `own + kDst*dst` pair, and a second arm means a second
+    // coefficient chain — two spellings of `kDst` that have to be kept in step by hand, forever, for
+    // an off-side nobody runs. That is the same standing-agreement-by-hand this file's own ONE
+    // FOGGING note says never survives. One chain, one law.
+    //
+    // (The extinction target itself was already derived rather than picked: deep water is the
+    // column's own in-scatter with nothing behind it, i.e. sigma_s/sigma_t — the single-scattering
+    // albedo. `deepColor` is gone with the arm because the refraction tap below is now
+    // unconditional, so nothing ever read the initialiser it existed to be.)
+    //
+    // waterFogActive() still means what it always did for the EXTINCTION — waterFogSample() returns
+    // (0,0) with the feature off, which now reads as "clear water" rather than "the 2026-07 shader".
 
     // FLAT-WATER TEST (bit 14) — the bisect with no interpretation in it.
     //
@@ -1256,64 +1398,238 @@ float4 PS_MAIN( VSOutput In )
     // is about the above-water specular.
     if (flatWater) { normal = float3(0.0f, 0.0f, 1.0f); }
 
+    // --- FRESNEL, EVALUATED HERE RATHER THAN AT THE COMPOSITE -------------------------------------
+    // It used to live 250 lines further down, next to its one consumer. It moved because it has a
+    // SECOND consumer now: the refraction distortion is weighted by TRANSMISSION, and transmission is
+    // 1 - fresnel. Nothing about the value changed — it reads the same N, the same EyeVec and the same
+    // alpha, all of which are final at this point (N is final one line above; alpha is final at the
+    // roughness block) — only the order did.
+    //
+    // The `adjustnormal` flattening that used to open this block is GONE (WT4d/P3). It faded N toward
+    // (0,0,1) with distance and with view angle, which is roughness applied to the wrong quantity: it
+    // deleted the sub-pixel slope variance rather than converting it to lobe width. That variance is
+    // now recovered above and carried in `alpha`, where both the reflection LOD and the specular lobe
+    // read it. N is the honest mip-filtered mean normal.
+    float NoV = saturate(dot(-EyeVec, normal));
+    float fresnel;
+    if (physFresnel) {
+        // The exact interface, air -> water, so eta is the RECIPROCAL of the underwater case. No TIR
+        // on this side (a denser transmitted medium always has a real refracted ray), so what changes
+        // versus Schlick is only the mid-range: exact runs a few percent lower from 50-80 degrees and
+        // reaches 1 slightly later. The roughness ceiling comes free — see fresnelDielectricRough.
+        fresnel = fresnelDielectricRough(NoV, alpha, 1.0f / kWaterIOR);
+    } else if (useSchlick) {
+        // TRUE Schlick with the roughness ceiling (P4). max(1-alpha, F0) stops rough water reaching
+        // full mirror reflectance at grazing angles — THIS is what fixes "distant water is a hard
+        // mirror" at the root, instead of fogging it.
+        //
+        // Expect mid-distance water to read slightly LESS reflective than the old curve. The two
+        // agree almost exactly at the endpoints (head-on 0.020 vs 0.025; grazing 1.0 vs 1.0) but the
+        // old one is ~2x hot through the middle. That correction is intended.
+        float f90 = max(1.0f - alpha, kWaterF0);
+        float m   = 1.0f - NoV;
+        float m5  = m * m; m5 = m5 * m5 * m;
+        fresnel = kWaterF0 + (f90 - kWaterF0) * m5;
+    } else {
+        // The pre-WT4d curve, kept verbatim as the A/B partner — note its leading 0.02 IS this
+        // material's F0 (IOR 1.333 -> 0.0204), which is the clue that the old shader was most of the
+        // way to a BRDF already.
+        fresnel = kWaterF0 + pow(saturate(0.9988f - 0.28f * NoV), 16.0f);
+    }
+
     // Reflection/refraction pixel distortion (wind strength increases it).
     float2 reffactor = distortAmp * normal.xy;
 
+    // ─── THE SHORE WEIGHT, MEASURED BEFORE EITHER TAP MOVES ──────────────────────────────────────
+    // "shore fade needs to cancel reflection and refraction both" — and it can only do that from up
+    // here, because both offsets are applied below and one of them (the reflection's) was never
+    // touched by the shore at all.
+    //
+    // ⚠ IT IS MEASURED UNDISTORTED, WHICH IS ALSO A FIX AND NOT JUST A MOVE. The old shore factor was
+    // read from the depth at `ruv` — the tap position the shore factor is supposed to shrink. A
+    // quantity computed through the distortion it exists to cancel is circular: in shallow water the
+    // tap had already walked somewhere else, so the "depth" it reported belonged to a different
+    // pixel, and the fade it drove was measured against the wrong seabed exactly where it mattered
+    // most. At its own uv the answer is unambiguous — the water fragment passed the depth test, so
+    // whatever the depth buffer holds there is behind it by construction.
+    //
+    // The tap-time re-measure is therefore GONE rather than duplicated: with the offsets cancelled at
+    // the shore, `ruv` converges on `baseUV` and the two measurements agree anyway. One reading, one
+    // meaning, used for the cancel and for the blend.
+    //
+    // CANCELLING BOTH TAPS IS ALSO WHAT MAKES THE HARD INTERSECTION SOFT. The refraction offset was
+    // already shrunk by `saturate(depth/100)`, but that depth is a SLANT distance — at a grazing
+    // shoreline it is large in water that is centimetres deep, so the tap was at full amplitude
+    // precisely along the waterline. Both taps now go to zero on the same signal the blend uses, so
+    // shallow water stops sampling anything but what is directly under it.
+    //
+    // Same occlusion mute as the blend: at a silhouette in deep water the depth read belongs to the
+    // object, so the water reports zero depth and would score a full shore. Zero depth there is not
+    // shallow, it is meaningless — and un-muted it would freeze the distortion in a 1px band along
+    // every rock, which is the same rim wearing a third costume.
+    float shorePre = 0.0f;
+    if (shoreDepthMax > 0.0f) {
+        float  shoreDevZ = SampleLvlTex2D(gSceneLinDepth, gSamplerPointClamp, baseUV, 0.0f).r;
+        float  shoreDist = length(reconstructWorld(invVP, baseUV * texToVp, shoreDevZ));
+        float  shoreDepth = max(shoreDist - dist, 0.0f) + shoreBreath * (0.95f - normal.z);
+        shorePre = (1.0f - smoothstep(0.0f, shoreDepthMax, shoreDepth))
+                 * (1.0f - smoothstep(shoreFadeNear, shoreFadeFar, dist))
+                 * (1.0f - occlusionFrom(dist, shoreDist, gFrameData.lodParams.w));
+    }
+    float shoreCancel = 1.0f - shorePre;
+
+    // ⚠ THE REFRACTION'S OFFSET IS WEIGHTED BY TRANSMISSION; THE REFLECTION'S IS NOT.
+    // These were one number and that was the bug behind half the silhouette rim. `lerp(refracted,
+    // reflected, fresnel)` already says how much of each side the eye gets to see — and at grazing
+    // incidence, which is MOST of the sea, fresnel is at or near 1, so the refraction contributes
+    // essentially nothing to the pixel. Distorting it there buys no visible wobble and costs
+    // everything the distortion costs: a depth probe that reads an unrelated pixel, a shore factor
+    // derived from that wrong depth, and a colour tap free to walk onto whatever is standing in the
+    // water. Weighting by T = 1 - F spends the distortion exactly where the refraction is visible.
+    //
+    // It must NOT be applied to the reflection, and the asymmetry is the physics rather than a
+    // preference: the reflection's weight goes UP as the refraction's goes down. Scaling both by T
+    // would take the wave wobble off the reflection precisely where the water IS its reflection, and
+    // flatten the whole sea into a mirror — the same mistake `adjustnormal` made, in screen space.
+    //
+    // ⚠ AND BOTH ARE NOW SCALED BY `shoreCancel`, WHICH IS NOT THE SAME ASYMMETRY. The Fresnel
+    // weighting above says "spend the distortion where each side is VISIBLE"; the shore cancel says
+    // "there is nothing to distort here", and that is true of both sides at once. In centimetres of
+    // water the reflection carries no information either — the mirror image of a beach seen at
+    // grazing incidence is the beach — so leaving the reflection tap at full amplitude while the
+    // refraction faded left the waterline wobbling in the one term that still had weight.
+    float2 reffactorR = (1.0f - fresnel) * shoreCancel * reffactor;
+
     // --- refraction (depth-gated, distorted) ---
-    float2 distUV   = baseUV + reffactor.yx * invAlloc;
+    float2 distUV   = baseUV + reffactorR.yx * invAlloc;
     float  sceneDevZ= SampleLvlTex2D(gSceneLinDepth, gSamplerPointClamp, distUV, 0.0f).r;
     float3 sceneW   = reconstructWorld(invVP, distUV * texToVp, sceneDevZ);
     float  sceneDist= length(sceneW);
-    float  aboveWater = step(sceneDist + shoreDepthBias, dist);   // 1 = scene in FRONT of water
     float  depth      = max(shoreDepthBias, sceneDist - dist);
+    // ...and the same question asked as a WEIGHT rather than a verdict, off the fetch we already
+    // made. (`aboveWater`, the thresholded form of this signal, went with the legacy arm — it was
+    // the hard silhouette discard, and the walk-back below replaced it.)
+    float  refrOccl   = occlusionFrom(dist, sceneDist, gFrameData.lodParams.w);
 
-    float3 refracted = deepColor;
+    // The two taps the distortion residual differences, and the shoreline transparency weight.
+    float3 refrDist    = float3(0.0f, 0.0f, 0.0f);
+    float3 refrFlat    = float3(0.0f, 0.0f, 0.0f);
     float  shorefactor = 0.0f;
-    // ⚠ THE 4000-UNIT CUTOFF IS A HARD EDGE THAT MOVES WITH THE CAMERA, and it is legacy. `depth` is
-    // a SLANT distance (sceneDist - dist) before the perpendicular conversion below, so the depth at
-    // which a given seabed pixel crosses 4000 depends on the view ANGLE — i.e. on camera altitude.
-    // Past it `refracted` keeps its `deepColor` initialiser, a flat dark constant, so the boundary
-    // reads as "a black waterbed height/distance cutoff that moves with camera z". Exactly that,
-    // reported 2026-08-13.
+
+    // ⚠ THE 4000-UNIT CUTOFF WENT WITH THE LEGACY ARM. It was a hard edge that moved with the camera:
+    // `depth` is a SLANT distance (sceneDist - dist), so the depth at which a given seabed pixel
+    // crossed 4000 depended on the view ANGLE — i.e. on camera altitude — and past it `refracted`
+    // kept a flat dark constant, reading as "a black waterbed height/distance cutoff that moves with
+    // camera z". Exactly that, reported 2026-08-13.
     //
     // The cutoff existed because the legacy fade had no other way to bound deep water. The unified
-    // fog does: `refracted` is attenuated by the real path length through water, which grows without
+    // fog does: the seabed is attenuated by the real path length through water, which grows without
     // limit as the seabed drops away, so deep water goes to the fog target on its own and there is
-    // nothing left for a threshold to protect. Dropped when wFogOn — and kept verbatim when it is
-    // off, so the legacy A/B is byte-identical.
+    // nothing left for a threshold to protect.
     //
-    // `aboveWater < 0.5` STAYS in both: that is not a range limit, it is "is the scene behind this
-    // pixel actually under the surface", and sampling refraction for a rock standing in FRONT of the
-    // water would pull that rock into the water's own colour.
-    if ((wFogOn || depth < 4000.0f) && aboveWater < 0.5f) {
-        float2 ruv = baseUV + saturate(depth / 100.0f) * reffactor.yx * invAlloc;
-        refracted  = SampleLvlTex2D(gRefractColor, gSamplerBilinearClamp, ruv, 0.0f).rgb;
+    // ⚠⚠ `aboveWater < 0.5` IS GONE TOO, AND ITS DEPARTURE IS THE SILHOUETTE FIX.
+    // It read "is the scene behind this pixel actually under the surface", and the fear it answered
+    // was that sampling refraction for a rock standing in FRONT of the water pulls that rock into the
+    // water's colour. Both halves of that turned out to be wrong here:
+    //
+    //   - THE FEAR IS ABOUT THE TAP, NOT THE PIXEL. A water fragment exists because it PASSED the
+    //     depth test, so at its OWN uv the scene is behind it by construction. Only a tap that has
+    //     been MOVED can land on a rock — and moving it back is a repair, where discarding is not.
+    //     sceneOcclusionAt's walk-back does that, so the discard is defending against a case that no
+    //     longer reaches this point.
+    //
+    //   - AND IT FIRES WHERE NOTHING IS WRONG. The verdict comes from sample 0 of the MSAA depth
+    //     while the colour it gates is a full resolve, so at every silhouette there is a band one
+    //     pixel wide where the depth says "rock" for a pixel the colour says is three-quarters water.
+    //     The refraction then kept a flat veil, and that band is the reported rim. It tracked the
+    //     ABSORPTION master, which nothing but waterFogVeil read, and that is how it was identified:
+    //     the leak changed colour with a knob only the deep-water colour saw.
+    //
+    // What replaces it is not a looser threshold, it is no threshold: the tap is walked back toward
+    // the fragment's own uv in proportion to how far into an occluder it reached. At the silhouette
+    // the walk-back is total, the tap is the pixel's own, and the refraction shows the RESOLVED
+    // colour there — which already contains the rock in its correct proportion, because a resolve is
+    // an average. The one-pixel band stops being a special case and becomes ordinary water.
+    //
+    // ─── THE DISTORTION RESIDUAL ─────────────────────────────────────────────────────────────────
+    // ⚠⚠ THIS IS NO LONGER THE REFRACTION — IT IS ONLY WHAT THE OFFSET DOES TO IT. The surface is a
+    // BLENDED draw now (tasks/forge-water-blend.md), so what is behind it arrives through the BLEND
+    // UNIT, per SAMPLE, and the composite below never fetches it. That per-sample delivery is the
+    // whole point: a shoreline pixel's dry and submerged samples are served by different values
+    // instead of by one resolved average that had to be wrong for one of them.
+    //
+    // But the blend unit cannot MOVE the destination, and the wave distortion is exactly a move. So
+    // the offset comes back as a DIFFERENCE of two taps of the same texture at the same resolution —
+    // where the tap lands, minus where the blend already put it:
+    //
+    //     residual = kDst * (refrDist - refrFlat)
+    //
+    // ⚠ AND IT IS EXACTLY ZERO WHEREVER THE OFFSET IS ZERO, which is what keeps the shoreline free of
+    // any resolved quantity at all. `reffactorR` is already cancelled by shoreCancel (shallow water),
+    // by (1 - fresnel) (grazing), by the refrOccl walk-back (silhouettes) and by saturate(depth/100)
+    // — the four places the seam used to live. Where the residual has weight there is no waterline;
+    // where there is a waterline the residual is identically 0 and the pixel is pure blend.
+    //
+    // ⚠ A DIFFERENCE OF TWO SAMPLES IS NORMALLY A TRAP ([[feedback_interpolated_difference_trap]]) and
+    // this one is not, for a specific reason: both taps come from the SAME texture at the SAME mip
+    // and the same filter, so whatever bias the resolve introduced is common to both and subtracts
+    // out. What survives is only the difference the OFFSET made, which is the quantity wanted.
+    {
+        // The walk-back multiplies the offset, not the uv, so it composes with the depth ramp instead
+        // of fighting it: `saturate(depth/100)` already shrinks the tap in shallow water for the
+        // shoreline, and `1 - refrOccl` shrinks it where the tap has left the water. Two independent
+        // reasons to take a shorter step, and the shorter of the two wins on its own.
+        float2 ruv = baseUV + (1.0f - refrOccl) * saturate(depth / 100.0f)
+                            * reffactorR.yx * invAlloc;
+        refrDist = SampleLvlTex2D(gRefractColor, gSamplerBilinearClamp, ruv,    0.0f).rgb;
+        refrFlat = SampleLvlTex2D(gRefractColor, gSamplerBilinearClamp, baseUV, 0.0f).rgb;
 
-        // re-fetch depth at the distorted tap; convert slant → perpendicular via camFwd.
-        sceneDevZ  = SampleLvlTex2D(gSceneLinDepth, gSamplerPointClamp, ruv, 0.0f).r;
-        sceneW     = reconstructWorld(invVP, ruv * texToVp, sceneDevZ);
-        sceneDist  = length(sceneW);
-        depth      = max(shoreDepthBias, sceneDist - dist);
-        float denom = max(abs(dot(EyeVec, camFwd)), 0.25f);
-        depth     /= denom;
-        depth     += 300.0f * (0.95f - normal.z);   // small-scale shoreline animation
+        // (The depth RE-FETCH at the distorted tap went with the legacy arm. Its only consumer was
+        // `depthscale`, which fed the two `!wFogOn` fades — the shoreline blend has read its own
+        // undistorted quantity at `shorePre` since 2026-08. One fewer depth fetch per water pixel.)
 
-        // depthscale STAYS, but only for `shorefactor` — the shoreline smoothing at the very end of
-        // this shader is derived from it and is unrelated to fog (it is a coverage ramp against the
-        // sand, which is why it keeps its own short 500-unit scale).
-        float depthscale = saturate(exp(-depth / 500.0f));
-        shorefactor = pow(depthscale, 5.0f);
-        // ⚠ NO FOG HERE ANY MORE, AND ITS ABSENCE IS THE FIX RATHER THAN AN OMISSION.
-        // gRefractColor is a copy of the colour target taken before the water pass, so the seabed
-        // inside it has ALREADY been through applyFog — including the unified water fog, over the
-        // eye-to-seabed submerged path, which along this ray IS the surface-to-seabed path this
-        // block was measuring. Fading it a second time toward deepColor would fog the same water
-        // twice, and against a different law and a different colour than the seabed carries.
-        // Expect near/shallow water to read markedly CLEARER than it did: exp(-depth/500) e-folded
-        // in ~7 m, and the unified model is tuned in tens of metres.
-        if (!wFogOn) {
-            refracted = lerp(deepColor, refracted, 0.8f * depthscale + 0.2f * shorefactor);
-        }
+        // ─── THE SHORELINE BLEND ─────────────────────────────────────────────────────────────────
+        // "shoreline intersection is visible and hard" — and the reason is that the old factor could
+        // not reach 1, so the water never fully handed the pixel over to what is under it. Three
+        // separate things were holding it down, and only the third was doing a job:
+        //
+        //   1. `depth` is FLOORED at shoreDepthBias (24). That floor exists for the depth COMPARE — a
+        //      z-fight guard between a seabed and a water plane that touch — and it has no business
+        //      being the input to a fade. At the waterline, where the true depth is 0, it reported 24
+        //      and the exponential answered 0.79 instead of 1. The intersection therefore always kept
+        //      at least a fifth of the water's own colour: a hard edge, by construction, at every
+        //      shore, in every weather.
+        //   2. `depth /= dot(EyeVec, camFwd)` is a MIS-PORT. XE Mod Water.fx fed that divide a
+        //      view-Z difference (`sceneDepth - IN.screenpos.w`, both view-space W) and the divide
+        //      converted it to a SLANT distance. Ours is `sceneDist - dist`, two ray LENGTHS, which is
+        //      already the slant — so the divide converts a slant into nothing, inflating depth by up
+        //      to 1/cos and shrinking the fade further toward the edges of the screen.
+        //   3. `300 * (0.95 - normal.z)` is the small-scale shoreline animation and is KEPT. It is
+        //      what makes the waterline breathe with the waves instead of sitting still.
+        //
+        // ⚠ AND THE SHAPE IS A FADE WITH AN END, not an exponential with a tail. `pow(exp(-d/500), 5)`
+        // is `exp(-d/100)` written twice over — it e-folds in 1.4 m and then trails asymptotically,
+        // spending its whole budget in the first centimetres and never quite finishing. A smoothstep
+        // over kShoreFadeDepth is exactly 1 at the intersection, exactly 0 at 30 cm, and C1 at both,
+        // so the shore has no edge at either end of it.
+        //
+        // ⚠ AND IT IS SWITCHED OFF WITH DISTANCE, which is a feature and not a budget saving. Past
+        // ~10 m the whole 30 cm band is sub-pixel, and a soft edge drawn at sub-pixel width is a
+        // smeared, uncertain waterline — worse than the hard intersection it is trying to improve on.
+        // The hard version is the better image out there.
+        //
+        // Measured UP AT `shorePre`, before either tap moved — see the block beside `reffactor` for
+        // why the reading has to happen there and why it is undistorted. It carries the same three
+        // factors this line used to build for itself (depth fade, distance switch-off, occlusion
+        // mute); the only difference is which depth it read, and the undistorted one is the honest
+        // one. A shoreDepthMax of 0 switches the blend off outright — the A/B for "is the shore
+        // doing this, or is something else".
+        shorefactor = shorePre;
+
+        // (The air fog the seabed carries is NOT adjusted here, and that absence is the fix rather
+        // than an omission. The destination went through applyFog with its own air share and its own
+        // water fog over the surface-to-seabed run — see THE AIR SEGMENT at the end for why the two
+        // segments now compose without either side metering the other.)
     }
 	
 	
@@ -1325,23 +1641,17 @@ float4 PS_MAIN( VSOutput In )
     float  NoH = saturate(dot(normal, H));
     float  VoH = saturate(dot(V, H));
 	
-	// THE SCATTERING HACK — RETIRED, and live only as the off side of the A/B (see `wFogOn` up at
-	// deepColor; all three retirements share that one predicate).
+	// THE SCATTERING HACK — DELETED with the legacy arm, 2026-08-15.
 	//
 	// It pulled the refraction HALFWAY toward a fixed teal scaled by the sun's red channel — an
 	// in-scatter stand-in, hand-tuned against a deep-water colour that disagreed with the way the
 	// seabed inside that very refraction sample was being fogged. With one law and one target on
 	// both sides of the surface there is nothing left for it to compensate, and a 0.5 lerp toward a
 	// constant is a large, unconditional desaturation of every water pixel in the frame. What real
-	// in-scatter it was standing in for now comes out of the extinction's own target colour.
+	// in-scatter it was standing in for comes out of the extinction's own target colour.
 	//
-	// (Kept verbatim below, including the Step 5 note it carried: the teal is an authored
-	// display-space tint with its *0.5 folded in, so what converts is the multiplier that was
-	// actually tuned; and gFrameData.sunCol.r is RADIANCE once linear is on, so the term lost ~12%
-	// of its weight at full sun. Both were reasons to re-derive it rather than re-tune it.)
-	if (!wFogOn) {
-		refracted = lerp(refracted, ((1.0 - VoH) * 0.3 + 0.2) * gFrameData.sunCol.r * decodeAuthored(float3(0.2, 0.9, 0.7) * 0.5), 0.5);
-	}
+	// It could not have survived the blend in any case: it was a lerp applied to the refraction
+	// ITSELF, and the refraction is no longer a value this shader holds.
     // --- reflection (WT2 Stage 1: real mirror-view RT, sky-only for now) ---
     // gReflectColor is the mirrored scene in MAIN-screen space (mirror world geom + normal camera),
     // so sample it at THIS fragment's screen UV, distorted by the surface normal (MGE's 2.1x/abs
@@ -1351,8 +1661,24 @@ float4 PS_MAIN( VSOutput In )
     // WT4d/P2: sampled from the PRE-FILTERED pyramid at the roughness LOD, with the TRILINEAR
     // sampler (s4). gSamplerBilinearClamp is MIP_POINT — it selects a mip but SNAPS, so a smoothly
     // varying roughness would band across the surface.
-    float2 reflUV = In.Position.xy * invScreen
-                  + float2(-2.1f * reffactor.x, abs(reffactor.y)) * invScreen;
+    //
+    // ⚠ AND THE OFFSET IS WALKED BACK WHERE IT HITS AN OCCLUDER (sceneOcclusionAt, ported from
+    // scene-walk-v2). This is the tap that draws the bright rim: gReflectColor holds the object's
+    // MIRROR IMAGE at one screen position and mirrored sky a few pixels away, so an offset that
+    // leaves the object's silhouette swaps a dark reflection for a bright one and the rim follows the
+    // waves. The guard asks the depth buffer whether the tap has landed on something in FRONT of this
+    // water pixel and, where it has, returns the tap to the undistorted position — the reflection
+    // goes flat right at the waterline instead of glowing, which is the correct degradation for a
+    // planar mirror that has no information there anyway.
+    //
+    // Measured on the TAP, not on the refraction probe above: the two offsets point in different
+    // directions entirely ((-2.1x, |y|) against (y, x)), so one fetch cannot answer for both and
+    // reusing the other one would guard the wrong pixels.
+    float2 reflBase = In.Position.xy * invScreen;
+    float2 reflOff  = shoreCancel * float2(-2.1f * reffactor.x, abs(reffactor.y)) * invScreen;
+    float  reflOccl = sceneOcclusionAt(invVP, reflBase + reflOff, texToVp, dist,
+                                       gFrameData.lodParams.w);
+    float2 reflUV   = reflBase + (1.0f - reflOccl) * reflOff;
     float4 reflSample = sampleReflectSmear(reflUV, reflLod, smearUV, smearN);
     float3 reflected = reflSample.rgb + fogCol * (1.0f - reflSample.a);
     // Roughness past what the chain can represent -> the sky (see reflSkyMix). Applied BEFORE the
@@ -1423,11 +1749,24 @@ float4 PS_MAIN( VSOutput In )
     // scalar reached a term that was multiplied by zero anyway. Forcing skyBehind = 1 — correct for
     // the horizon, which is what it was for — removed the accident and left the guard genuinely
     // missing. A gate that was doing two jobs only looked like it was doing one.
-    if (!noFogMelt && !waterCameraSubmerged())
-    {
-        reflected *= fogExtinction(fog, 1.0f);
-        reflected  = lerp(fogSkyColorAt(In.Position.xy, fog), reflected, fog);
-    }
+    // ⚠⚠ AND IT IS NOT APPLIED HERE, BECAUSE THERE IS ONLY ONE FOGGING IN THIS SHADER.
+    //
+    //     "ONLY ONE FOGGING IN water.frag, it is just a surface that is always above water and should
+    //      be fogged ONCE after the fresnel composite, not as separate refraction reflection fogging."
+    //     (user, 2026-08-15)
+    //
+    // That is the rule, and it is a statement about what this surface IS rather than a preference
+    // about where to put a term. The water surface is the air/water interface; from this side there
+    // is exactly one air column in front of it, it attenuates and lifts everything the surface sends
+    // back — refracted seabed, reflected sky, the glint off the wave — and a single column applied
+    // once cannot be expressed as two applications to two inputs.
+    //
+    // Every attempt to fog the inputs separately has failed, and each failed differently, which is
+    // how long it took to see they were one mistake: fog² on the refraction when both ran; a surface
+    // clearer than the land beside it when only the reflection ran; a bright waterline when the
+    // amounts were metered to try to agree. Two half-applications have to be kept in agreement
+    // forever by hand, and they never were.
+    // See THE AIR SEGMENT at the end, and [[project_forge_water_one_fogging]].
 
 
     // Dev-panel water debug views (P[3].x). Output an isolated term so the reflection / refraction RT
@@ -1470,7 +1809,13 @@ float4 PS_MAIN( VSOutput In )
         else                            { c = float3(1.0f, 0.0f, 0.0f); }
         RETURN(float4(c, 1.0f));
     }
-    if (waterDbg == 2u) { RETURN(float4(refracted, 1.0f)); }
+    // ⚠ Mode 2 shows the DISTORTED TAP, which is no longer the refraction the composite uses — the
+    // composite gets that from the blend unit, so there is no value here to show. This is the tap the
+    // distortion residual differences, i.e. the thing the offset is aimed at, which is what the view
+    // was ever used to inspect. Opaque alpha, like every debug RETURN in this file: under the
+    // premultiplied blend `alpha = 1` means "show src, ignore the destination", so all ten of them
+    // kept working across the change without being touched.
+    if (waterDbg == 2u) { RETURN(float4(refrDist, 1.0f)); }
     // Mode 3 = ROUGHNESS, false-coloured. Roughness has no silhouette of its own, so a wrong
     // variance is close to undiagnosable from the lit image — this is the same reasoning that gave
     // the sky-height map its debug view.
@@ -1518,39 +1863,35 @@ float4 PS_MAIN( VSOutput In )
                       -EyeVec.z, 1.0f));
     }
 
-    // --- FRESNEL ---------------------------------------------------------------------------------
-    // The `adjustnormal` flattening that used to open this block is GONE (WT4d/P3). It faded N
-    // toward (0,0,1) with distance and with view angle, which is roughness applied to the wrong
-    // quantity: it deleted the sub-pixel slope variance rather than converting it to lobe width.
-    // That variance is now recovered above and carried in `alpha`, where both the reflection LOD and
-    // the specular lobe read it. N is the honest mip-filtered mean normal.
-    float NoV = saturate(dot(-EyeVec, normal));
-    float fresnel;
-    if (physFresnel) {
-        // The exact interface, air -> water, so eta is the RECIPROCAL of the underwater case. No TIR
-        // on this side (a denser transmitted medium always has a real refracted ray), so what changes
-        // versus Schlick is only the mid-range: exact runs a few percent lower from 50-80 degrees and
-        // reaches 1 slightly later. The roughness ceiling comes free — see fresnelDielectricRough.
-        fresnel = fresnelDielectricRough(NoV, alpha, 1.0f / kWaterIOR);
-    } else if (useSchlick) {
-        // TRUE Schlick with the roughness ceiling (P4). max(1-alpha, F0) stops rough water reaching
-        // full mirror reflectance at grazing angles — THIS is what fixes "distant water is a hard
-        // mirror" at the root, instead of fogging it.
-        //
-        // Expect mid-distance water to read slightly LESS reflective than the old curve. The two
-        // agree almost exactly at the endpoints (head-on 0.020 vs 0.025; grazing 1.0 vs 1.0) but the
-        // old one is ~2x hot through the middle. That correction is intended.
-        float f90 = max(1.0f - alpha, kWaterF0);
-        float m   = 1.0f - NoV;
-        float m5  = m * m; m5 = m5 * m5 * m;
-        fresnel = kWaterF0 + (f90 - kWaterF0) * m5;
-    } else {
-        // The pre-WT4d curve, kept verbatim as the A/B partner — note its leading 0.02 IS this
-        // material's F0 (IOR 1.333 -> 0.0204), which is the clue that the old shader was most of the
-        // way to a BRDF already.
-        fresnel = kWaterF0 + pow(saturate(0.9988f - 0.28f * NoV), 16.0f);
-    }
-    float3 result = lerp(refracted, reflected, fresnel);
+    // --- THE COMPOSITE, FACTORED ------------------------------------------------------------------
+    // ⚠⚠ TWO ACCUMULATORS FROM HERE DOWN, AND THE SECOND ONE IS THE WHOLE CHANGE.
+    //
+    //     result  — the composite evaluated with the refraction set to ZERO: what this surface sends
+    //               back on its own account (reflection, glint, and the fog it melts toward).
+    //     kDst    — the weight the composite leaves on whatever is BEHIND the surface.
+    //
+    // The composite is AFFINE in the refraction — every use of it is a lerp or a scale — so
+    // `composite = result + kDst * refraction` holds exactly, and the blend unit can supply the
+    // second term. It is not an approximation of what this shader used to compute; it is the same
+    // expression with one variable delivered by different hardware. See tasks/forge-water-blend.md
+    // for the factorisation written out, and the constant-scene check that pins it.
+    //
+    // ⚠ WHY IT IS WORTH DOING: the blend runs PER SAMPLE. gRefractColor is a RESOLVE, so a shoreline
+    // pixel handed the composite ONE averaged colour covering both dry beach and seabed, and the fog
+    // had to be metered per pixel to suit it — `mwFogAirSplit`, five values, three ramp shapes, a
+    // line every time. There is no per-pixel number that serves both sample groups, and now nothing
+    // has to look for one: the dry samples keep what the object shader wrote and the submerged
+    // samples get the water.
+    //
+    // ⚠ EACH LINE BELOW UPDATES BOTH, AND THEY MUST BE EDITED AS A PAIR. A change to the composite
+    // that touches `result` and not `kDst` silently mis-weights the destination, which is a defect
+    // with no visible edge to find it by — it reads as the water being slightly the wrong colour.
+    //
+    // `fresnel` itself is computed far above, next to the distortion, because the refraction offset
+    // is weighted by 1 - fresnel — see the block at reffactorR for why the two halves are not the
+    // same number. Energy-conserving as it stands: T = 1 - R, with no normalisation to add.
+    float3 result = reflected * fresnel;          // was lerp(refracted, reflected, fresnel)
+    float  kDst   = 1.0f - fresnel;
 
     // --- SUN SPECULAR: GGX, sun as a sphere light (WT4d/P1) --------------------------------------
     // Replaces `pow(vdotr,170) + 0.07*pow(vdotr,4)` — two Phong lobes faking one wide lobe, with two
@@ -1611,7 +1952,13 @@ float4 PS_MAIN( VSOutput In )
     // instead of clipping flat white. Display-referred, it is the identical `tonemap(spec)` as
     // before. Kept as a call rather than deleted outright because the LDR path is still a shipped
     // build and still needs the roll-off.
-    result += tonemapInPass(spec) * fog;
+    // ⚠ NO `* fog` HERE. The glint is part of what this surface sends back, so it goes through the
+    // surface's ONE fogging with everything else — multiplying here as well would be a second
+    // application, which is exactly the rule the composite melt exists to state. (The legacy arm used
+    // to multiply, because its own melt was the raw `lerp(fogCol, result, fog)` it compounded with.)
+    //
+    // A pure OWN term: it adds nothing behind the surface, so kDst does not move.
+    result += tonemapInPass(spec);
 
     // --- water cut feature (vtastek) ---
     float wdist = dist / lerp(1200.0f, 0.0f, saturate((-waterLevelRel) / 7.0f));
@@ -1619,16 +1966,125 @@ float4 PS_MAIN( VSOutput In )
     float wcutdark = smoothstep(0.0889f, 0.101f, wdist);
     wcutdark = wcutdark * (1.0f - wcutdark);
     wcutdark = saturate(wcutdark * 3.0f);
-    result = lerp(refracted, result, wcut);
-    result = lerp(result, result * 0.1f, wcutdark);
-	
+    // lerp(refracted, result, wcut) — the cut hands the pixel back to what is behind it, so the
+    // weight it takes off `result` goes onto kDst.
+    result = result * wcut;
+    kDst   = kDst * wcut + (1.0f - wcut);
+    // lerp(result, result*0.1, wcutdark) is a plain SCALE of the whole composite — refraction
+    // included — so it multiplies both accumulators by the same factor.
+    float wcutDim = 1.0f - 0.9f * wcutdark;
+    result = result * wcutDim;
+    kDst   = kDst   * wcutDim;
 
-    
-	
-	result = lerp(fogCol, result, fog);
-	
-	// shore-line smoothing
-    result = lerp(result, refracted, shorefactor * fog);
+	// ─── SHORE-LINE SMOOTHING ────────────────────────────────────────────────────────────────────
+	// Shallow water is transparent: hand the pixel back to what is under it as the depth goes to zero.
+	//
+	// ⚠ THE `* fog` STAYS GONE, and it is worth restating why now that the melt has moved again. It
+	// was never a statement about shores — it was compensation for ORDER. In the legacy arrangement
+	// the melt ran BEFORE this line, so both sides were already sitting on the fog colour by the time
+	// they were blended and the multiply skipped a blend that could not change anything.
+	//
+	// The melt is DOWNSTREAM of this line, so both sides arrive unfogged and the blend decides the
+	// pixel at every fog level. `* fog` there does something it never used to: in heavy weather it
+	// switches the shore transparency OFF, exposing the ungraded surface — and at a shoreline the view
+	// is grazing, so Fresnel is near 1 and the ungraded surface is a MIRROR OF THE SKY. A strip of
+	// bright reflected sky where the sand should show through, one shore-factor deep.
+	//
+	// How transparent shallow water is has nothing to do with how far away the weather is.
+	//
+	// lerp(result, refracted, shorefactor): the shore hands the pixel to what is behind it, so this is
+	// the second place weight crosses from `result` to `kDst`.
+    result = result * (1.0f - shorefactor);
+    kDst   = kDst   * (1.0f - shorefactor) + shorefactor;
 
-    RETURN(float4(result, 1.0f));
+	// ─── THE AIR SEGMENT: THE ONE FOGGING ────────────────────────────────────────────────────────
+	// THE ONLY PLACE THIS SHADER FOGS ANYTHING, and the last thing that happens to the surface.
+	//
+	//     "ONLY ONE FOGGING IN water.frag, it is just a surface that is always above water and should
+	//      be fogged ONCE after the fresnel composite, not as separate refraction reflection fogging."
+	//     (user, 2026-08-15)
+	//
+	// Between the eye and this surface there is a column of air. It attenuates and lifts everything
+	// the surface sends back on its OWN account — the reflected sky, the sun's glint off the wave.
+	// One medium, one segment, one application. Nothing upstream of here is fogged for it, which is
+	// what makes this exactly-once rather than merely last.
+	//
+	// ⚠⚠ AND IT NO LONGER REACHES THE SEABED, WHICH IS WHAT RETIRED THE STRIP. This used to fog the
+	// finished composite, refraction included — so the seabed had to arrive with its air ramp already
+	// taken off, and `mwFogAirSplit` existed to take it off. That decision was per PIXEL, on a pixel
+	// holding both dry beach and seabed, and there is no value it could return that is right for both
+	// (fog² and bright, or unfogged and dark, or a graded mixture of the two). Five values and three
+	// ramp shapes, a line every time.
+	//
+	// The refraction is now the DESTINATION, and the destination fogged itself: applyFog gave it the
+	// honest air share `fog + (1-fog)*waterShare`, whose air segment IS the eye→surface segment this
+	// line covers, plus its own water fog over the surface→seabed run. Each surface fogs itself once,
+	// nothing meters anything for anything else, and no boundary is consulted anywhere.
+	//
+	// ⚠ THE SKY MELT IS SCALED BY `1 - kDst`, AND LEAVING THAT OUT WOULD RE-INTRODUCE THE DOUBLE.
+	// `lerp(skyTarget, result, fog)` adds `(1-fog)*skyTarget` for the WHOLE pixel — but the
+	// destination already melted its own share toward the same target, so this may only add the share
+	// this surface actually owns. That factor is exactly `1 - kDst`.
+	//
+	// ⚠⚠ THE EXTINCTION GOES THROUGH THE BLEND TOO — `kDst *= E`, and leaving it off `kDst` was a
+	// REAL BUG, reported as "fog water surface, it is not matching land" (user, 2026-08-15).
+	//
+	// The argument for leaving it off was that applyFog had already decided the seabed's own answer:
+	// skyBehind reads 0 below the eye's horizontal, so a submerged fragment gets no extinction. That
+	// conflates two different questions. applyFog declines because on the SEABED'S OWN RAY there is no
+	// sky behind it — true, and irrelevant here. This surface forces skyBehind = 1 because from the
+	// eye the water IS the horizon (see fogExtinction's note), and everything it sends back is behind
+	// that same air column, refraction included.
+	//
+	// The cost of getting it wrong is not subtle: at fog 0.8 the term is a ~20% darkening, so over
+	// water shallow enough to see the bottom (kDst large) the pixel kept only a fraction of it and
+	// read up to ~16% brighter than the land beside it. That is precisely the failure adding this
+	// term fixed in the first place — "WATER WAS BRIGHTER THAN LAND ALL THE WAY IN, AND MATCHED ONLY
+	// AT SATURATION" — reappearing through the one path that stopped applying it.
+	//
+	// It is legal through the blend because it is a plain MULTIPLIER, not a lerp: scaling `kDst` by E
+	// scales the destination by E. With the melt below then taking `1 - kDst` at its POST-E value, the
+	// algebra reproduces the pre-blend image exactly — expand it and every term matches the old
+	// `E*fog*(own + kDst*seabed) + (1-fog)*skyTarget`.
+	//
+	// And it is what makes the surface match the land beside it — `fog` here is mwFogRamp(dist), the
+	// identical scalar the shore two metres away is melting on. That is the property to check first if
+	// this ever moves again.
+	//
+	// EXTINCTION FIRST, THEN THE MELT, off the same helpers every applyFog surface uses
+	// (skydome.h.fsl) — same target, same saturation knee, same silhouette darkening. The waterline is
+	// where a mismatch shows first, because it is the one place two surfaces at the same distance
+	// touch. skyBehind = 1 because the sea is edge-on: both of that gate's geometric signals read 0
+	// exactly where sky IS behind the surface, so `ramp` is the honest gate for this one surface.
+	// noFogMelt is the dev-panel roughness-calibration bit.
+	//
+	// ⚠ AND THE waterCameraSubmerged() GUARD IS GONE. It protected against MW's below-water fog range
+	// reaching an air term — a real hazard everywhere except this line, which only executes with the
+	// eye in air (the `if (underwater) { ... RETURN; }` above). It was one of two redundant copies of
+	// the same contradiction, and between them they could take the air fog off the water surface
+	// entirely on any frame the two underwater lanes fell out of step. One branch decides the medium,
+	// at the top; nothing downstream re-litigates it.
+	if (!noFogMelt) {
+	    float E = fogExtinction(fog, 1.0f);
+	    result *= E;
+	    kDst   *= E;      // ...and the destination with it — see above.
+	    result  = result * fog
+	            + fogSkyColorAt(In.Position.xy, fog) * ((1.0f - fog) * (1.0f - kDst));
+	}
+
+	// ─── THE DISTORTION RESIDUAL, LAST AND UNFOGGED ──────────────────────────────────────────────
+	// The blend will hand us the destination at THIS pixel; the wave says it should have come from
+	// `ruv`. Add the difference, weighted by the same kDst the destination is about to get.
+	//
+	// ⚠ AFTER THE FOG, AND THAT IS NOT AN ORDERING PREFERENCE. Both taps are of gRefractColor, which
+	// is a copy of the colour target — so both already carry their own applyFog, exactly as the
+	// destination does. Fogging their difference here would apply the surface's air column to
+	// something that has already been through one, which is the fog² this whole change removes.
+	result += kDst * (refrDist - refrFlat);
+
+	// ─── PREMULTIPLIED OUT ───────────────────────────────────────────────────────────────────────
+	// `result` is the surface's own contribution, already carrying its own weight (nothing divides
+	// by alpha downstream), and `1 - kDst` is the coverage the blend uses to keep kDst of whatever is
+	// behind. ONE / INV_SRC_ALPHA — see buildWaterPipeline.
+	RETURN(float4(result, 1.0f - kDst));
 }

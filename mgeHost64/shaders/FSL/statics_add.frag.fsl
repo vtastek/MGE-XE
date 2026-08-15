@@ -14,7 +14,7 @@
 // pass's own fog blend already implies.
 
 #include "opaque.srt.h"
-#include "fog.h.fsl"     // mwFogAir() — per-pixel submerged test
+#include "fog.h.fsl"     // mwFogAirShareAt() — the air/water ray split
 #include "tonemap.h.fsl"    // the curve + its inverse
 #include "linearize.h.fsl" // srgbToLinear()/mod2xLinear() — the scene's transfer function (step 5)
 #include "scenecolor.h.fsl" // liftInPass() — class 2: MW's authored GLOW map (step 6a)
@@ -48,5 +48,8 @@ float4 PS_MAIN( VSOutput In )
     // fade is a coverage-like weight, not a colour to convert. A lone glow over black therefore
     // survives the resolve exactly; where several additive layers pile up they now sum in
     // scene-referred space and roll off instead of clipping flat, which is the point of the step.
-    RETURN(float4(liftInPass(tex.rgb) * saturate(mwFogAir(In.Fog, In.WorldPos)), 0.0f));
+    // mwFogAirShareAt, matching applyFog, so this pass and the base pass cannot disagree about how
+    // much air ramp a fragment owns at a waterline pixel — the disagreement is what made the old
+    // leak show up "seen through alpha blending" rather than on the surfaces themselves.
+    RETURN(float4(liftInPass(tex.rgb) * saturate(mwFogAirShareAt(In.Fog, In.WorldPos)), 0.0f));
 }

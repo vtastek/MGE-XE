@@ -76,61 +76,31 @@
 #define MW_FOG_H
 
 #include "waterplane.h.fsl"   // waterCameraSubmerged() — one gShadowParams lane read, no more
+#include "waterfog.h.fsl"     // waterFogSample().y — the WATER SHARE the air ramp is scaled by
 
-// How far BELOW the plane a fragment must sit before it starts counting as submerged. The water mesh
-// rides a few units off the true surface, and the surface itself must keep its air fog — it is seen
-// through air. 8 units is ~11 cm.
-#define MW_FOG_WATER_BIAS 8.0f
-
-// ...and how far below THAT the changeover takes to complete.
-//
-// ⚠ MSAA CANNOT HELP A SHADER-SIDE BRANCH, which is why this exists rather than a wider bias. A
-// hard `if` returns the same answer for every sample in a pixel, so multisampling has nothing to
-// average — the boundary aliases at full pixel granularity no matter how many samples are taken, and
-// widening the bias only MOVES the jagged line. Reported as "subtle aliasing" once the test went
-// per-pixel. The only fix for a step evaluated in the shader is to stop it being a step.
-//
-// smoothstep, not a linear ramp, for the reason the fog wall taught earlier today: a continuous value
-// with a discontinuous SLOPE still reads as an edge. This is C1 at both ends.
-//
-// 96 units is ~1.4 m of depth. It has to be small enough that a shallow beach does not turn into a
-// wide smear (the band's SCREEN width is the depth band divided by the terrain slope, so a flat
-// shore stretches it) and large enough to cover a pixel's worth of depth at grazing angles. If it
-// needs dialling in play it wants a lane — this is a #define like MW_FOG_WATER_BIAS and
-// FOG_SKY_SATURATION_KNEE, so changing it costs a host restart.
-#define MW_FOG_WATER_FEATHER 96.0f
-
-// ⚠ THE SUBMERGED TEST IS NOT IN HERE, AND THAT IS THE POINT — see mwFogAir below. It was, briefly,
-// as an extra `relZ` argument, and it produced "shorelines look vertex interpolated ... leaking
-// underwater colors": a BINARY test evaluated per VERTEX and then interpolated. A triangle
+// ⚠ THE SUBMERGED TEST IS NOT IN HERE, AND THAT IS THE POINT — see mwFogAirShare below. It was,
+// briefly, as an extra `relZ` argument, and it produced "shorelines look vertex interpolated ...
+// leaking underwater colors": a BINARY test evaluated per VERTEX and then interpolated. A triangle
 // straddling the waterline got fog = 1 at one corner and the real ramp at the other, and every pixel
 // between them a linear blend of two answers that were never on the same curve. Interpolating a step
 // function does not approximate it; it invents a ramp that belongs to neither side.
 //
 // This function is now purely the smooth distance ramp, which is what interpolation is FOR.
-float mwFogFactor(float dist)
+// ⚠ THE RAMP ALONE, WITH NO CAMERA TEST, AND IT EXISTS FOR THE WATER SURFACE. "When you are applying
+// fog in water.frag, as surface, you don't have to track underwater above water, as water surface is
+// always above water." (user, 2026-08-14.) Exactly right, and it is not only a simplification:
+//
+// water.frag's above-water path is reached only after `if (underwater) { ... RETURN; }`, so by
+// construction the eye is in air and the surface has air in front of it. Asking mwFogFactor there
+// consults waterCameraSubmerged(), which reads a DIFFERENT lane (waterFogPlane.z) than the one that
+// chose the branch (P[1].w). The two agree in every ordinary frame — and on any frame they did not,
+// the answer would be `1.0`, i.e. the water surface silently drawn with NO AIR FOG AT ALL while the
+// land beside it kept its own. That is precisely the "water surface is not fogged as much as above
+// land fog" failure, sitting latent behind a redundant test.
+//
+// A predicate that can only ever be wrong is worth deleting even when it is almost always right.
+float mwFogRamp(float dist)
 {
-    // ⚠ NO AIR FOG WHILE THE EYE IS UNDER THE SURFACE, AND THE GUARD BELONGS HERE — at the PRODUCER,
-    // not at each consumer. applyFog() has carried its own copy of this test for a while, which
-    // covered the six lit paths and silently missed the three that read In.Fog raw:
-    //
-    //     glow.frag           fg = saturate(In.Fog)                     — additive glow, attenuated
-    //     statics_add         tex.rgb * saturate(In.Fog)                — additive glow map
-    //     statics_multiply    lerp(1, t, saturate(In.Fog))              — multiply stage toward white
-    //
-    // Those are precisely the ADDITIVE and MULTIPLY blend passes, which is why the leak showed up as
-    // "seen through alpha blending". Underwater, MW swaps its whole fog range (distantland.cpp:763:
-    // start -4096, end 2458), so In.Fog is 0.375 at ZERO distance — every additive glow lost 62% of
-    // itself at arm's length, and every multiply stage was pushed 62% toward white, on a scalar that
-    // stopped meaning "air" the moment the camera went under.
-    //
-    // Guarding the producer fixes all ten consumers at once and cannot be missed by the eleventh.
-    // applyFog's own `fogAir = 1` is now redundant — harmless, and left in place because it states
-    // the same intent locally where the water-share algebra can be read beside it.
-    // The CAMERA test is safe at any stage: it is frame-uniform, so every vertex of every triangle
-    // agrees and there is nothing for the rasteriser to blend between.
-    if (waterCameraSubmerged()) { return 1.0f; }
-
     float fogStart = gFrameData.fogParams.x;
     float fogEnd   = gFrameData.fogParams.y;
     float S        = gShadowParams.toneParams.z;
@@ -177,34 +147,109 @@ float mwFogFactor(float dist)
     return 1.0f - t;
 }
 
-
-// ─── THE SUBMERGED TEST, PER PIXEL ────────────────────────────────────────────────────────────────
-// "just put if (world.z < waterlevel) return for global exponential fog, it is not for underwater"
-// (user, 2026-08-13). Applied to an ALREADY-INTERPOLATED fog scalar, in the fragment stage, because
-// the test is a step and a step must not be interpolated (see mwFogFactor).
+// THE RAMP PLUS THE CAMERA GUARD, which is what every stage EXCEPT the water surface wants.
 //
-// WHY THE AIR FOG HAS NO BUSINESS UNDER THE SURFACE. The eye can be in air while the fragment is
-// not, and applyFog divides that ray between the two media by `wf.y`, fogging the air share. That is
-// physically honest and reads wrong, because the air share GROWS WITH CAMERA HEIGHT — len/d =
-// p/(h+p) for a seabed at depth p seen from height h — so climbing piled atmospheric fog onto the
-// seabed. Reported as "distant underwater is still getting the same above fog", and before that as
-// "refraction gets stronger with camera altitude": one cause, two symptoms. One medium per pixel,
-// chosen by where the surface you are looking at actually is.
+// ⚠ NO AIR FOG WHILE THE EYE IS UNDER THE SURFACE, AND THE GUARD BELONGS HERE — at the PRODUCER, not
+// at each consumer. applyFog() carried its own copy of this test for a while, which covered the six
+// lit paths and silently missed the three that read In.Fog raw:
 //
-// Cheaper than the share, too: one compare against a plane, no path length.
+//     glow.frag           fg = saturate(In.Fog)                     — additive glow, attenuated
+//     statics_add         tex.rgb * saturate(In.Fog)                — additive glow map
+//     statics_multiply    lerp(1, t, saturate(In.Fog))              — multiply stage toward white
 //
-// worldPosRel = the fragment's CAMERA-RELATIVE world position, which every lit frag already carries
-// for shadows and point lights.
-float mwFogAir(float fog, float3 worldPosRel)
+// Those are precisely the ADDITIVE and MULTIPLY blend passes, which is why the leak showed up as
+// "seen through alpha blending". Underwater, MW swaps its whole fog range (distantland.cpp:763:
+// start -4096, end 2458), so In.Fog is 0.375 at ZERO distance — every additive glow lost 62% of
+// itself at arm's length, and every multiply stage was pushed 62% toward white, on a scalar that
+// stopped meaning "air" the moment the camera went under.
+//
+// Guarding the producer fixes all ten consumers at once and cannot be missed by the eleventh.
+// The CAMERA test is safe at any stage: it is frame-uniform, so every vertex of every triangle agrees
+// and there is nothing for the rasteriser to blend between.
+//
+// ⚠ THE WATER SURFACE IS THE ONE CALLER THAT MUST NOT USE THIS — see mwFogRamp. It has already
+// branched on the eye being in air, so this test can only ever contradict that branch, never confirm
+// it.
+float mwFogFactor(float dist)
 {
-    if (!waterPlaneValid()) { return fog; }
+    if (waterCameraSubmerged()) { return 1.0f; }
+    return mwFogRamp(dist);
+}
 
-    // Depth below the point where the changeover starts. Positive = submerged.
-    float below = (waterPlaneRelZ() - MW_FOG_WATER_BIAS) - worldPosRel.z;
-    // 0 at the bias line, 1 a feather deeper. `1` is "no air fog", so this LERPS TOWARD 1 rather
-    // than returning it — the shoreline crosses over instead of switching.
-    float t = smoothstep(0.0f, MW_FOG_WATER_FEATHER, below);
-    return lerp(fog, 1.0f, t);
+
+// ─── THE AIR RAMP OVER ITS OWN SHARE OF THE RAY ───────────────────────────────────────────────────
+// The air ramp only owns the part of the ray that is AIR. MW's fog is LINEAR in distance, i.e. a
+// UNIFORM density along the ray, and a uniform density integrated over a fraction of the ray is just
+// that fraction of the optical depth — so the ramp's opacity scales by the air share and nothing has
+// to know where the boundary is:
+//
+//     opacityAir = (1 - fog) * (1 - waterShare)   ->   fogAir = fog + (1 - fog) * waterShare
+//
+// At waterShare 0 this is `fog` EXACTLY — not to within a rounding error, which matters because it
+// is what makes an above-water fragment provably unable to leak (the `1 - (1-fog)*airShare` spelling
+// of the same algebra is off by up to 2^-25). At waterShare 1 it is 1, i.e. no air fog at all.
+//
+// ⚠⚠ THIS REPLACED A PLANE TEST, TWICE, AND THE SECOND TIME IS THE ONE THAT STUCK — 2026-08-15.
+//
+// The history is worth keeping because the same wrong turn is available again. This share is the
+// geometrically honest answer and it was REMOVED on 2026-08-14 in favour of a hard gate
+// (`mwFogAirSplit`) that stripped the air ramp off anything the water mesh covered. The gate was not
+// unreasonable: water.frag applied ONE air fog to its finished composite, refraction included, so
+// anything the seabed also carried was applied twice, and stripping it was the only way to make the
+// pair exclusive.
+//
+// What it cost was a line along every shoreline, in every spelling, because the gate had to be
+// evaluated PER PIXEL and a waterline pixel contains both dry beach and seabed. Shading runs once
+// and writes one colour to every sample it covers:
+//
+//     don't strip        -> the submerged samples are fogged again by the water: fog², BRIGHT
+//     strip              -> the dry samples get no air fog at all:               DARK
+//     coverage-weighted  -> under-fogged land AND over-fogged seabed at once:    a graded seam
+//
+// One error split three ways. Five values and three ramp shapes were tried; each drew a line.
+//
+// ⚠ THE FIX WAS NOT A BETTER TEST, IT WAS REMOVING THE NEED FOR ONE. water.frag is a BLENDED surface
+// now (tasks/forge-water-blend.md): what is behind it arrives through the blend unit, PER SAMPLE, and
+// the surface fogs only its own contribution. Nothing re-applies this fragment's air segment, so
+// there is no double-count to prevent and no boundary to place — the seabed simply keeps the air fog
+// its own ray earned. Above the surface waterPathLength is exactly 0, so the shoreline has nothing
+// left to leak at any camera height, grazing angle or distance.
+//
+// ⚠⚠ AND IT IS THE RAMP AT THE AIR PATH LENGTH, NOT THE OPACITY SCALED BY THE SHARE. The first
+// build wrote the line above literally — `fog + (1-fog)*waterShare` — and that spelling is only
+// exact when MW's ramp passes through the ORIGIN. It does not: `1 - fog(d)` is
+// `saturate((d - fogStart)/span)`, so scaling it by the air fraction subtracts `fogStart*(1-share)`
+// where it should subtract `fogStart`. At clear weather (fogStart 4.2 cells) over deep water that
+// over-fogs the seabed by ~1.7x — a seabed fogged harder than the surface in front of it.
+//
+// The honest question is "how long is the air segment, and what does MW's fog say about THAT
+// distance", which is exact for any ramp shape and needs no assumption about its form:
+//
+//     dAir = dist * (1 - waterShare)          // waterShare is len/d, so this is the air length
+//     opacity ratio = (1 - mwFogRamp(dAir)) / (1 - mwFogRamp(dist))
+//
+// Applied as a RATIO against the caller's own interpolated `fog` rather than by returning
+// mwFogRamp(dAir) outright, because `fog` arrives interpolated across the triangle and recomputing
+// it per pixel would shift every above-water fragment by the interpolation error. The early-out
+// keeps `waterShare == 0` returning `fog` bit for bit, which is the property everything else rests
+// on.
+float mwFogAirShare(float fog, float waterShare, float dist)
+{
+    // Exactly 0 water on this ray -> exactly `fog`. The common case, and the guarantee.
+    if (waterShare <= 0.0f) { return fog; }
+
+    float oTot = 1.0f - mwFogRamp(dist);
+    if (oTot <= 0.0f) { return 1.0f; }   // nothing is fogged at this distance; nothing to divide
+
+    float oAir = 1.0f - mwFogRamp(dist * (1.0f - waterShare));
+    return 1.0f - (1.0f - fog) * saturate(oAir / oTot);
+}
+
+// ...and for callers that have not already paid for a waterFogSample(). Safe from a VERTEX stage:
+// waterFogSample reads gShadowParams lanes and the closed-form column, with no derivative in it.
+float mwFogAirShareAt(float fog, float3 worldPosRel)
+{
+    return mwFogAirShare(fog, waterFogSample(worldPosRel).y, length(worldPosRel));
 }
 
 #endif // MW_FOG_H
