@@ -60,6 +60,14 @@ namespace Terrain {
     const LandCell* cellAt(int32_t x, int32_t y);   // nullptr if that cell has no LAND record
     int32_t         slotAt(int32_t x, int32_t y);   // index into cells(), or -1 (neighbour tables)
 
+    // The slot of the one synthetic DEFAULT cell — a flat sheet at -2048 world units, white vertex
+    // colour, texture id 0 — appended past the real records at the end of the load. It is what MW
+    // itself draws for a cell with no LAND record, and every such grid position points here rather
+    // than owning a copy (a LandCell is ~21.6 KB; there are tens of thousands of empty positions).
+    // ~0u before the load finishes. It is NOT in the (x,y) index: cellAt/slotAt still answer "does a
+    // real LAND record exist here", which is what the eye-cell tripwire below needs them to mean.
+    uint32_t        defaultSlot();
+
     // Inclusive grid extent over every loaded cell (all zero when cellCount() == 0).
     void extent(int32_t& minX, int32_t& minY, int32_t& maxX, int32_t& maxY);
 

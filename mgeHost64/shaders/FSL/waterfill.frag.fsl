@@ -6,9 +6,12 @@
 //     MW = hostRGB + MW * (1 - hostA)
 //
 // so anywhere the host drew NOTHING, MW's own frame shows through at full strength — and MW's frame
-// is drawn by an engine that has its own ideas about water. Above the surface that is merely a
-// horizon band nobody looks at. Below it, it is MW's ABOVE-WATER sky arriving in the middle of an
-// underwater view, un-fogged, with the sun still setting in it.
+// is drawn by an engine that has its own ideas about water. Below the surface that is MW's
+// ABOVE-WATER sky arriving in the middle of an underwater view, un-fogged, with the sun still
+// setting in it. Above the surface it was written off as a horizon band nobody looks at, which it
+// no longer is: with the host owning every LAND-less cell as default land, the band under the sky
+// dome's rim is the last real gap, and it is filled too when the host permits it
+// (holeFillAboveWater, below).
 //
 // Three regions have this shape and they are all the same thing — the depth buffer has no value:
 //   - the band between the sky dome's lower rim and the horizon, which no pass reaches;
@@ -27,16 +30,18 @@
 //     dst = src * (1 - dstAlpha) + dst        (INV_DEST_ALPHA / ONE, colour and alpha alike)
 //
 // which contributes exactly nothing wherever anything was drawn, whatever drew it and whether or not
-// it wrote depth. No double-count is possible by construction, which is the property worth having in
-// a pass that runs over the whole screen.
+// it wrote depth. No double-count is possible by COVERAGE, which is the property worth having in a
+// pass that runs over the whole screen — but coverage is only half of it: the SOURCE has to be
+// background too, or a partly-covered pixel double-counts its own content. See the fogColNear note
+// on `base` below, which is where that went wrong once.
 //
-// The content is the same thing every surface in the frame melts into — the sampled sky
-// (skydome.h.fsl) with the water column composited over it — so a hole is filled with precisely what
-// a surface at that spot would have become. Reuses opaque.srt.h's PerFrame set wholesale, exactly as
-// volfog does: gSkyColor, gShadowParams and gFrameData are all already bound there.
+// The content is fogColNear with the water column composited over it: the far-field limit every
+// surface in the frame melts into, so a hole is filled with precisely what a surface at that spot
+// would have become. Reuses opaque.srt.h's PerFrame set wholesale, exactly as volfog does:
+// gShadowParams and gFrameData are already bound there.
 
 #include "opaque.srt.h"
-#include "skydome.h.fsl"   // fogSkyColor() + waterFogComposite()
+#include "skydome.h.fsl"   // waterFogComposite()
 
 STRUCT(VSOutput)
 {
@@ -44,16 +49,32 @@ STRUCT(VSOutput)
     DATA(float2, Uv,       TEXCOORD0);
 };
 
+// Is the host allowed to fill uncovered pixels ABOVE the surface this frame? gFrameData.lodEye.w,
+// published as (exterior && g_waterFillAbove) — the exterior half because indoors an uncovered pixel
+// may be something MW still owns and painting fog over it would hide it, the knob half because this
+// is the one fill that can dress a failed host draw up as plausible haze.
+bool holeFillAboveWater()
+{
+    return gFrameData.lodEye.w >= 0.5f;
+}
+
 ROOT_SIGNATURE(DefaultRootSignature)
 float4 PS_MAIN(VSOutput In)
 {
     INIT_MAIN;
 
-    // SUBMERGED ONLY. Above water the same holes exist, but what shows through them is MW's own sky
-    // band — which is roughly the right colour, has been there since the takeover began, and is not
-    // this change's business. Filling them would be a large, unrelated, hard-to-attribute shift to
-    // every exterior frame.
-    if (!waterFogCameraSubmerged()) { RETURN(float4(0.0f, 0.0f, 0.0f, 0.0f)); }
+    // The gate, and ONLY the gate, is what this pass ever knew about being above water — the body
+    // below is already right on both sides of the surface. Above water, waterFogSample() returns
+    // (0,0) for an upward ray, so base = fogSkyColor(pix) * saturate(1 - 0) and waterFogComposite
+    // hands it straight back: the fill is exactly fogSkyColor(pix), which where the dome drew
+    // nothing is fogColNear — what a fully-fogged surface at infinity becomes. A DOWNWARD ray above
+    // water crosses the plane, so wf is non-zero and the same line returns deep water. One
+    // expression, both cases; the early-out was narrow, not the maths.
+    //
+    // What is left above water once the host owns the land is the band between the sky dome's lower
+    // rim and the horizon — the one region this file's header lists that has nothing to do with
+    // water. The other two (past the shelf, wherever terrain ends) are default land's job now.
+    if (!waterFogCameraSubmerged() && !holeFillAboveWater()) { RETURN(float4(0.0f, 0.0f, 0.0f, 0.0f)); }
 
     // The ray. No depth is read: there is nothing here to read a depth FOR, which is the whole point.
     // The eye sits at the origin in this camera-relative space, so any point on the ray gives the
@@ -106,8 +127,27 @@ float4 PS_MAIN(VSOutput In)
     // ⚠ AND IT IS A NO-OP AT NORMAL ABSORPTION, which is what makes it safe: a downward ray has
     // wf.x == 1 there, so lerp(base, target, 1) == target whether base was the sky or zero. Only the
     // degenerate low-absorption end moves, and only toward being readable.
+    // ⚠ fogColNear, NOT fogSkyColor(pix) — THE SAMPLED SKY CAN NEVER BELONG IN THIS BASE.
+    // fogSkyColor returns `s.rgb + fogColNear*(1 - s.a)`, where s is the snapshot of the colour
+    // target taken RIGHT AFTER the sky pass. This pass's blend is `dst = src*(1 - dst.a) + dst`,
+    // so `src` must be what lies BEHIND everything already drawn — and `s.rgb` is not behind
+    // anything, it IS the drawn sky, still sitting in dst. gSkyColor is snapshotted before every
+    // later pass and later passes only ADD coverage, so dst.a >= s.a always: wherever the sky has
+    // content, the destination already has that same content. `s.rgb` is therefore redundant here
+    // by construction, and adding it back double-counts the sky at weight (1 - dst.a).
+    //
+    // WITNESS: the sun disc, brighter in the horizon band (user, after the above-water fill landed).
+    // Above the dome's rim the dome is opaque, dst.a == 1, the fill contributes nothing and the sun
+    // is correct. Inside the band the sun is the ONLY thing drawn, so dst.a is the disc's own alpha
+    // `a` — and the fill added `(sun*a + fogColNear*(1-a))*(1-a)` on top of the `sun*a` already
+    // there, making the disc `sun*a*(2-a)`: up to TWICE as bright, with the step landing exactly at
+    // the rim. The moons and stars had the same double exposure for the same reason.
+    //
+    // NO-OP WHEREVER THIS PASS WAS EVER VERIFIED. At a genuine hole s.a == 0 and s.rgb == 0 (the
+    // target clears transparent), so fogSkyColor already reduced to exactly fogColNear. Only pixels
+    // the sky pass PARTLY covered move — which is the artifact and nothing else.
     float2 wf   = waterFogSample(rel);
-    float3 base = fogSkyColor(pix) * saturate(1.0f - wf.y);
+    float3 base = gFrameData.fogColNear.rgb * saturate(1.0f - wf.y);
 
     // Opaque by construction: the blend decides where this lands, not the alpha.
     float3 c = waterFogComposite(base, rel, wf);

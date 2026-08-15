@@ -101,6 +101,10 @@ namespace Terrain {
         std::vector<std::string>                 g_texNames;     // global land-texture table
         std::unordered_map<std::string, uint32_t> g_texIds;      // lowercased name -> global id
         int32_t  g_minX = 0, g_minY = 0, g_maxX = 0, g_maxY = 0;
+        // The ONE synthetic cell every LAND-less grid position renders from (see defaultSlot()).
+        // ~0u until load() appends it; g_cellIndex never points at it, so cellAt/slotAt keep
+        // meaning "a real LAND record exists here".
+        uint32_t g_defaultSlot = ~0u;
 
         std::vector<uint32_t>    g_packHeights;                  // GPU staging: 2 int16 per uint
         std::vector<uint32_t>    g_packColors;                   // GPU staging: 0x00BBGGRR per vertex
@@ -536,6 +540,40 @@ namespace Terrain {
                         (uint32_t)g_cells.size(), g_minX, g_maxX, g_minY, g_maxY,
                         (uint32_t)g_texNames.size() - 1u, (unsigned long long)(bytes >> 20), ms);
 
+            // DEFAULT LAND — the one synthetic cell that fills every grid position with no LAND
+            // record. MW draws those positions as a flat sheet at ESM::Land::DEFAULT_HEIGHT
+            // (-2048 world units), textured _land_default, white vertex colour, normal +Z; we
+            // drew nothing, which is the hole MW's own frame shows through out at sea and in the
+            // gaps the "no terrain" list above names.
+            //
+            // Nothing has to be AUTHORED for that: the zero-initialised LandCell built at the top
+            // of the LAND branch already IS it — height -256 VHGT × kHeightScale 8 = -2048, colour
+            // memset white, and global texture id 0 is _land_default. The cell only has to exist.
+            //
+            // ONE cell, shared. A LandCell is ~21.6 KB and this install has ~42k empty positions
+            // inside the padded grid: materialising one each would be ~900 MB of identical bytes.
+            // The shaders index the world buffers by the instance's SLOT, so many instances can
+            // point at one slot — see the cull-index/slot split in forgerender.cpp.
+            //
+            // Appended AFTER every stat and log line above, deliberately: the extent, the height
+            // range, the cell count and the no-VCLR count all describe the WORLD, and a synthetic
+            // cell at (0,0) with hasColor=0 would corrupt all four. buildGpuPack() picks it up for
+            // free (it walks g_cells), costing one extra slot in heights/colour/VTEX ≈ 26 KB.
+            {
+                LandCell d = {};
+                for (int i = 0; i < kCellVerts * kCellVerts; ++i) { d.height[i] = -256; }
+                std::memset(d.color, 0xFF, sizeof(d.color));
+                d.cellX = 0; d.cellY = 0;
+                d.minHeight = d.maxHeight = -256;
+                d.hasColor = 0;                        // tex[] stays 0 = _land_default
+                g_defaultSlot = (uint32_t)g_cells.size();
+                g_cells.push_back(d);
+                LOG::logline(">> [terrain] default-land slot %u appended (flat %d world units, "
+                             "texture id 0 '%s') — every LAND-less grid position renders from it",
+                             g_defaultSlot, (int)(-256 * kHeightScale), g_texNames[0].c_str());
+                LOG::flush();
+            }
+
             {
                 std::lock_guard<std::mutex> lk(g_mutex);
                 g_loaded = true;
@@ -590,6 +628,8 @@ namespace Terrain {
         auto it = g_cellIndex.find(packKey(x, y));
         return (it == g_cellIndex.end()) ? -1 : (int32_t)it->second;
     }
+
+    uint32_t defaultSlot() { return g_defaultSlot; }
 
     uint64_t residentBytes() { return (uint64_t)g_cells.size() * sizeof(LandCell); }
 

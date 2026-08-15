@@ -5198,9 +5198,18 @@ namespace RenderProcess {
         }
         const float enchantSlot =
             float(resolveTextureSlot(MGE::GeometryCache::enchantGlowTexture()));
+        // [7] = "MW's WeatherController tinted these lights underwater" (sunCol.w, a padding slot no
+        // FSL reads). The host undoes MW's underwater blend on sun/ambient, and that inverse is only
+        // defined where the forward blend was applied — which is a weather operation. A weatherless
+        // interior takes sun/ambient straight from sgSunlight (see the live-light block above), so
+        // MW never tinted them, and un-blending an untinted value lifts red 5x, or clamps all three
+        // to zero in a dark room and freezes the in-scatter at black. Same weather predicate the
+        // interior-ambient and skyZenith paths already gate on. Fog is NOT covered by this flag: MW
+        // overrides fog underwater weather or not, so the host keeps un-blending that lane ungated.
+        const float mwTintsUnderwater = mwb->CellHasWeather() ? 1.0f : 0.0f;
         const float lighting[36] = {
             sunVecEff.x,               sunVecEff.y,               sunVecEff.z,               0.0f,
-            sunColEff.r,               sunColEff.g,               sunColEff.b,               0.0f,
+            sunColEff.r,               sunColEff.g,               sunColEff.b,               mwTintsUnderwater,
             ambColEff.r,               ambColEff.g,               ambColEff.b,               0.0f,
             DistantLand::nearFogCol.r, DistantLand::nearFogCol.g, DistantLand::nearFogCol.b, 0.0f,
             // [18] = smoothed wind magnitude (0 in interiors); [19] = cell epoch. Both land in

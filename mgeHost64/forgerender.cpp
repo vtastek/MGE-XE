@@ -2617,6 +2617,19 @@ namespace {
     // and wherever terrain ends. Fills them with the water column at max depth. Own toggle because
     // it is a whole extra fullscreen pass and a whole extra failure mode; see waterfill.frag.fsl.
     bool               g_waterFillHoles     = true;
+    // ...and the SAME fill, above the surface. The pass early-outed above water because the only
+    // hole left there was the band between the sky dome's lower rim and the horizon, and MW's own
+    // sky band showing through it was roughly the right colour. It is not once the host owns the
+    // land: with default land drawn for every LAND-less cell the remaining band is a genuine gap,
+    // and the shader body already answers it correctly — above water an UPWARD ray has zero
+    // submerged share, so the fill collapses to fogSkyColor(), which where the dome drew nothing is
+    // fogColNear: exactly what a fully-fogged surface at infinity becomes. A DOWNWARD ray above
+    // water crosses the plane and gets deep water, also right. One expression, both cases.
+    //
+    // Its own knob because this is the one change in the set that can HIDE a host draw failure
+    // behind plausible fog: off, a pass that stopped drawing leaves a visible hole; on, it leaves
+    // haze. Default on; this is the negative control.
+    bool               g_waterFillAbove     = true;
     // Blend weight between MW's UnderwaterColor and the weather fog colour. Ini default 0.85 —
     // exposed because it is the one number that decides whether submerged distance reads as WATER
     // or as the sky leaking under the surface, and it is cheap to look at both.
@@ -2683,6 +2696,10 @@ namespace {
     float g_waterLightAbsorb = 1.0f;
     bool  g_uwTintWasUnder = false;     // crossing-edge detection, for the log line only
     bool  g_uwBlendActive  = false;     // this frame's verdict, for the g_fogColAuthored latch
+    // Client lighting[7]: MW's WeatherController is driving the lights, so its underwater tint was
+    // actually applied and the inverse below is defined. False in a weatherless interior — see
+    // unblendUnderwaterTint. Latched here so the crossing diagnostic can print it.
+    bool  g_uwMwTinted     = true;
 
     // The blend's two operands. g_waterIni is declared further down (it is parsed with the rest of
     // the water settings), so these forward the read rather than duplicating the values — one
@@ -2712,29 +2729,54 @@ namespace {
     // to build the water's own fog colour, so an already-tinted input made that lerp resolve to
     // 0.0225·fog + 0.9775·uwCol — very nearly pure UnderwaterColor, which is why submerged
     // distance read as a flat wall of colour.
-    void unblendUnderwaterTint(float* fdc, const float* lighting, bool underwater) {
+    //
+    // `mwTinted` (client lighting[7]) says whether MW actually APPLIED the forward blend to the two
+    // LIGHT lanes, and an inverse is only defined where the forward op ran. MW's underwater tint is
+    // a WeatherController operation; a weatherless interior takes sun/ambient live from sgSunlight
+    // instead, untouched by anything water-related, so submerging there would run the inverse on an
+    // untinted value: red lifted ~5x and hue swung orange in a lit room, and in a darker one every
+    // channel falls below uwCol·w so the max(0,…) clamps all three to EXACTLY zero. At that point
+    // the in-scatter is sigS·kInscatterAmb·0·iAmb — identically zero, unable to respond to depth or
+    // view angle (the "frozen in-scatter" that un-sticks the instant you surface, because this
+    // function early-returns above water). Interiors have no sun either, so ambient is the whole
+    // in-scatter there and this one lane owned the entire symptom.
+    //
+    // fogColNear is NOT gated: MW overrides fog underwater unconditionally, weather or not (the
+    // crossing log shows a water-specific near range appearing on an interior dive), so that lane
+    // keeps its inverse in every cell.
+    void unblendUnderwaterTint(float* fdc, const float* lighting, bool underwater, bool mwTinted) {
         g_uwBlendActive = underwater;
         if (!underwater) {
             g_uwTintWasUnder = false;
             return;
         }
         const float s = std::max(0.0f, std::min(g_waterLightCancel, 1.0f));
-        unblendUnderwaterRGB(lighting + 4,  fdc + 20, s);   // sunCol
-        unblendUnderwaterRGB(lighting + 8,  fdc + 24, s);   // ambCol
+        if (mwTinted) {
+            unblendUnderwaterRGB(lighting + 4, fdc + 20, s);   // sunCol
+            unblendUnderwaterRGB(lighting + 8, fdc + 24, s);   // ambCol
+        }
         unblendUnderwaterRGB(lighting + 12, fdc + 28, s);   // fogColNear
         // g_fogColAuthored gets the same treatment at ITS latch site further down — it is written
         // from `lighting` after this runs, so undoing it here would simply be overwritten.
 
         if (!g_uwTintWasUnder) {
             g_uwTintWasUnder = true;
-            float sun[3], amb[3];
-            unblendUnderwaterRGB(lighting + 4, sun, 1.0f);
-            unblendUnderwaterRGB(lighting + 8, amb, 1.0f);
-            LOG::logline(">> [waterfog] submerged: MW blend w=%.2f uwCol=(%.3f %.3f %.3f) UNDONE — "
-                         "sun (%.3f %.3f %.3f)->(%.3f %.3f %.3f) amb (%.3f %.3f %.3f)->(%.3f %.3f %.3f)",
-                         uwBlendWeight(), uwBlendColor(0), uwBlendColor(1), uwBlendColor(2),
-                         lighting[4], lighting[5], lighting[6],  sun[0], sun[1], sun[2],
-                         lighting[8], lighting[9], lighting[10], amb[0], amb[1], amb[2]);
+            if (mwTinted) {
+                float sun[3], amb[3];
+                unblendUnderwaterRGB(lighting + 4, sun, 1.0f);
+                unblendUnderwaterRGB(lighting + 8, amb, 1.0f);
+                LOG::logline(">> [waterfog] submerged: MW blend w=%.2f uwCol=(%.3f %.3f %.3f) UNDONE — "
+                             "sun (%.3f %.3f %.3f)->(%.3f %.3f %.3f) amb (%.3f %.3f %.3f)->(%.3f %.3f %.3f)",
+                             uwBlendWeight(), uwBlendColor(0), uwBlendColor(1), uwBlendColor(2),
+                             lighting[4], lighting[5], lighting[6],  sun[0], sun[1], sun[2],
+                             lighting[8], lighting[9], lighting[10], amb[0], amb[1], amb[2]);
+            } else {
+                LOG::logline(">> [waterfog] submerged: weatherless cell — MW never tinted sun/amb, "
+                             "light un-blend SKIPPED (sun %.3f %.3f %.3f, amb %.3f %.3f %.3f kept); "
+                             "fog lane still undone",
+                             lighting[4], lighting[5], lighting[6],
+                             lighting[8], lighting[9], lighting[10]);
+            }
         }
     }
 
@@ -12166,6 +12208,11 @@ namespace {
           // so it can never touch anything that was drawn.
           t.checkbox("Water fog: fill UNDRAWN pixels underwater (clear colour / horizon band)",
                      &g_waterFillHoles);
+          // The same fill ABOVE water, exteriors only. OFF puts MW's sky band back under the dome's
+          // rim — and, being the one knob that can dress a missing host draw up as fog, it is how
+          // you tell a legitimately-empty pixel from a pass that quietly stopped drawing.
+          t.checkbox("Water fog: ...and fill UNDRAWN pixels ABOVE water too (exterior only)",
+                     &g_waterFillAbove);
           // PHASE. Water is strongly forward-scattering, so the sun's position matters: the halo
           // looking INTO the sun and the gentler lift looking AWAY are different lobes with
           // different gains, and the pedestal is what is left at 90 degrees (where it also stands in
@@ -12672,7 +12719,8 @@ namespace {
         } else if (g_terrainEyeCellMissing) {
             g_terrainCovColor = float4(1.0f, 0.85f, 0.45f, 1.0f);
             bformat(&g_terrainCovText, "coverage: host terrain owns the near field — no LAND record within "
-                                       "1 cell (usual at the edge of the world; inland it means a gap)");
+                                       "1 cell, DEFAULT LAND drawn there (usual at the edge of the world; "
+                                       "inland it means a gap in the records, not a hole on screen)");
         } else {
             g_terrainCovColor = float4(0.70f, 1.0f, 0.70f, 1.0f);
             bformat(&g_terrainCovText, "coverage: OK — host terrain owns the near field (%u cells resident)",
@@ -14154,8 +14202,15 @@ namespace ForgeRender {
                 // side of the transfer function. Undo it after a decode and the linear-space
                 // subtraction removes the wrong amount at every level. See unblendUnderwaterTint.
                 // fogColNear (28..30) is undone here too, ahead of its own lift further down.
+                // lighting[7] = MW's WeatherController tinted the LIGHT lanes (see the function).
+                // Latched for the crossing log, then the cbuffer lane is zeroed: fdc[23] is sunCol.w,
+                // which no FSL reads today, and leaving a flag there invites a future consumer to
+                // read a boolean where it expected padding.
+                g_uwMwTinted = (lighting[7] != 0.0f);
                 unblendUnderwaterTint(fdc, lighting, (waterEnabled != 0) && waterParams
-                                                                        && waterParams[7] > 0.5f);
+                                                                        && waterParams[7] > 0.5f,
+                                      g_uwMwTinted);
+                fdc[23] = 0.0f;
                 decodeAuthoredRGB(fdc + 20);   // sunCol
                 decodeAuthoredRGB(fdc + 24);   // ambCol
                 // S3a — the calibration gains, and THIS is the site precisely because of the ⚠ above:
@@ -14190,7 +14245,12 @@ namespace ForgeRender {
             // "follows the eye". Write it here from realEye so it's live regardless of exterior.
             {
                 float* fd56 = (float*)g_live.pFrameCbv->pCpuMappedAddress;
-                fd56[56] = lighting[24]; fd56[57] = lighting[25]; fd56[58] = lighting[26]; fd56[59] = 0.0f;
+                // .w = permission for waterfill.frag to run ABOVE water (see g_waterFillAbove).
+                // Exterior-gated: indoors, painting fog over every uncovered pixel would cover
+                // whatever MW still owns there. dlCullAndBuild rewrites this whole float4 in
+                // exteriors and publishes the same expression, so the two agree by construction.
+                fd56[56] = lighting[24]; fd56[57] = lighting[25]; fd56[58] = lighting[26];
+                fd56[59] = (g_dlExterior && g_waterFillAbove) ? 1.0f : 0.0f;
             }
             // P1.5 shadows: this is the client's camera-relative shift eye for THIS frame's
             // items/lights — the absolutize/de-absolutize anchor for lastWorld caster records.
@@ -17224,13 +17284,17 @@ namespace ForgeRender {
             if (g_waterFogUnder != s_lastUnder) {
                 s_lastUnder = g_waterFogUnder;
                 if (lighting) {
+                    // weather=0 says the LIGHT lanes were left alone by unblendUnderwaterTint (MW
+                    // never tinted them) while the fog lane was still undone — so if a weatherless
+                    // interior's fog range does NOT move across this crossing, the assumption that
+                    // MW's fog override is weather-independent is what to overturn, from this line.
                     LOG::logline(">> [waterfog] crossing -> %-5s  sun(%.3f %.3f %.3f) amb(%.3f %.3f %.3f)"
-                                 " fog(%.3f %.3f %.3f) near %.0f..%.0f",
+                                 " fog(%.3f %.3f %.3f) near %.0f..%.0f weather=%d",
                                  g_waterFogUnder ? "UNDER" : "above",
                                  lighting[4],  lighting[5],  lighting[6],
                                  lighting[8],  lighting[9],  lighting[10],
                                  lighting[12], lighting[13], lighting[14],
-                                 lighting[16], lighting[17]);
+                                 lighting[16], lighting[17], g_uwMwTinted ? 1 : 0);
                 }
             }
         }
@@ -19641,12 +19705,17 @@ namespace ForgeRender {
             cmdEndDebugMarker(g_live.pCmd);
         }
         // ===================== W8: UNDERWATER BACKSTOP =====================
-        // Fill whatever the frame never covered, but only while submerged. LAST of the world passes
-        // so every earlier one has already staked its coverage — and still before the first-person
-        // arms, which are drawn a few units from the eye and must not be filled around.
+        // Fill whatever the frame never covered. LAST of the world passes so every earlier one has
+        // already staked its coverage — and still before the first-person arms, which are drawn a
+        // few units from the eye and must not be filled around.
         // No enable test beyond the knob: the shader itself early-outs to zero coverage unless the
-        // camera is under the surface with the water fog live, so this costs one fullscreen triangle
-        // of fully-predicated pixels above water.
+        // camera is submerged with the water fog live, OR the above-water fill is permitted for this
+        // frame (gFrameData.lodEye.w — g_waterFillAbove, exteriors only). This is the master switch
+        // for the pass; g_waterFillAbove is the per-half control inside it.
+        //
+        // Ordering with volfog above is load-bearing and already right: the fill's INV_DEST_ALPHA/ONE
+        // blend puts it BEHIND whatever volfog deposited, so an uncovered pixel reads as fog colour
+        // at infinity with the haze in front of it, not the other way round.
         if (g_waterFillHoles && g_live.pWaterFillPipeline) {
             cmdBeginDebugMarker(g_live.pCmd, 0.2f, 0.5f, 0.8f, "UNDERWATER BACKSTOP");
             BindRenderTargetsDesc wfBind = {};
@@ -22224,14 +22293,27 @@ namespace ForgeRender {
     struct TerrainLodRange { uint32_t firstIndex, indexCount, firstVertex, stride; };
     TerrainLodRange g_terrainLodRange[kTerrainLods] = {};
 
-    // CPU-side cull record per resident cell. Deliberately flat and small — this is walked in full
-    // every frame, and 3.9k cells is nothing next to the statics cull it sits beside.
+    // CPU-side cull record per DRAWN cell. Deliberately flat and small — this is walked in full
+    // every frame, and 46k cells is nothing next to the statics cull it sits beside.
+    //
+    // CULL INDEX AND DATA SLOT ARE DIFFERENT NUMBERS, and that split is the whole of the
+    // default-land change. Every grid position with no LAND record draws MW's default sheet, and
+    // they all read the SAME LandCell (one shared Terrain::defaultSlot() — a LandCell is ~21.6 KB
+    // and there are ~42k of these positions). So an entry owns a unique cull index and a possibly
+    // shared `slot`: the frustum test, the per-view LOD arrays and the neighbour stitch all key off
+    // the index, while everything that reaches the world buffers keys off the slot.
+    //
+    // Entries [0, g_terrainCullReal) are the real records, in Terrain::cells() order and with
+    // slot == index (so the kTerrainMaxInst break drops default cells before real ones); every
+    // entry past that is a default-land position.
     struct TerrainCellCull {
         float    cx, cy, cz, r;      // bounding sphere, ABSOLUTE world
         int32_t  gx, gy;             // cell grid coords
-        uint32_t nbr[4];             // slot+1 of the -X, +X, -Y, +Y neighbour (0 = none)
+        uint32_t slot;               // DATA slot into the world buffers (default cells SHARE one)
+        uint32_t nbr[4];             // CULL INDEX+1 of the -X, +X, -Y, +Y neighbour (0 = none)
     };
     std::vector<TerrainCellCull> g_terrainCull;
+    uint32_t g_terrainCullReal = 0;   // entries [0, this) are real LAND records; the rest are default land
 
     // Per-VIEW cull state. The main view and the water reflection cull the same world against two
     // different frustums inside ONE command buffer, so every buffer the cull writes has to exist
@@ -22796,7 +22878,13 @@ namespace ForgeRender {
         }
         if (!Terrain::buildGpuPack()) { return false; }
 
-        const uint32_t cells = Terrain::cellCount();
+        // `cells` counts the SLOTS in the world buffers: every real LAND record plus the one
+        // synthetic default-land cell Terrain appends past them (Terrain::defaultSlot()). Only the
+        // real prefix goes into the (x,y) grid — the default slot's cellX/cellY are 0,0 and writing
+        // it into the grid would clobber whatever real cell lives at the origin.
+        const uint32_t cells       = Terrain::cellCount();
+        const uint32_t defaultSlot = Terrain::defaultSlot();
+        const uint32_t realCells   = (defaultSlot < cells) ? (cells - 1u) : cells;
         const uint64_t hBytes = (uint64_t)cells * Terrain::kHeightStrideUints * 4ull;
         const uint64_t cBytes = (uint64_t)cells * Terrain::kColorStrideUints  * 4ull;
 
@@ -22821,10 +22909,22 @@ namespace ForgeRender {
         addResource(&cb, nullptr);
 
         // VTEX (remapped to texture SLOTS below) + the world cell-lookup grid.
-        int32_t eMaxX = 0, eMaxY = 0;
-        Terrain::extent(g_terrainGridMinX, g_terrainGridMinY, eMaxX, eMaxY);
-        g_terrainGridSpanX = (uint32_t)(eMaxX - g_terrainGridMinX) + 1u;
-        g_terrainGridSpanY = (uint32_t)(eMaxY - g_terrainGridMinY) + 1u;
+        //
+        // PADDED past the LAND extent by the maximum view distance. Default land has to exist
+        // wherever the player can SEE, not merely where a LAND record does: standing on the last
+        // real cell and looking out, every direction within DrawDist has to answer "flat sheet at
+        // -2048" rather than "nothing", or the horizon reverts to MW's frame showing through. 40 is
+        // Configuration.DL.DrawDist's ceiling in cells, so from any cell with land the whole horizon
+        // is covered. Cost is one uint per position — 269x173 here, ~186 KB.
+        constexpr int32_t kTerrainGridPad = 40;
+        int32_t eMinX = 0, eMinY = 0, eMaxX = 0, eMaxY = 0;
+        Terrain::extent(eMinX, eMinY, eMaxX, eMaxY);
+        g_terrainGridMinX = eMinX - kTerrainGridPad;
+        g_terrainGridMinY = eMinY - kTerrainGridPad;
+        const int32_t gridMaxX = eMaxX + kTerrainGridPad;
+        const int32_t gridMaxY = eMaxY + kTerrainGridPad;
+        g_terrainGridSpanX = (uint32_t)(gridMaxX - g_terrainGridMinX) + 1u;
+        g_terrainGridSpanY = (uint32_t)(gridMaxY - g_terrainGridMinY) + 1u;
         const uint64_t tBytes = (uint64_t)cells * Terrain::kTexStrideUints * 4ull;
         const uint64_t gBytes = (uint64_t)g_terrainGridSpanX * g_terrainGridSpanY * 4ull;
 
@@ -22892,11 +22992,16 @@ namespace ForgeRender {
         }
         Terrain::releaseGpuPack();
 
-        // World cell-lookup grid: local (x,y) -> slot+1, 0 where there is no LAND record.
+        // World cell-lookup grid: local (x,y) -> DATA SLOT + 1. Every position with no LAND record
+        // now answers with the shared default slot rather than 0, so the neighbour walks that read
+        // this table (terrain.vert's wide-normal fetch, terrain.frag's texture-square wrap) find a
+        // flat -2048 sheet next door instead of falling back to clamping against a cell edge that
+        // has a drawn neighbour. 0 survives only OUTSIDE the padded rectangle, where nothing draws.
         {
-            std::vector<uint32_t> grid((size_t)g_terrainGridSpanX * g_terrainGridSpanY, 0u);
+            const uint32_t fill = (defaultSlot < cells) ? (defaultSlot + 1u) : 0u;
+            std::vector<uint32_t> grid((size_t)g_terrainGridSpanX * g_terrainGridSpanY, fill);
             const Terrain::LandCell* ca = Terrain::cells();
-            for (uint32_t s = 0; s < cells; ++s) {
+            for (uint32_t s = 0; s < realCells; ++s) {
                 const uint32_t lx = (uint32_t)(ca[s].cellX - g_terrainGridMinX);
                 const uint32_t ly = (uint32_t)(ca[s].cellY - g_terrainGridMinY);
                 grid[(size_t)ly * g_terrainGridSpanX + lx] = s + 1u;
@@ -22961,48 +23066,96 @@ namespace ForgeRender {
                          kSkyHeightRes, kSkyHeightTexel, kSkyHeightExtent, (int)g_live.skyHeightReady);
         }
 
-        // CPU cull table: one bounding sphere + neighbour slots per cell. Both are static for the
-        // process life (the world does not move), so this is built once, not per frame.
+        // CPU cull table: one bounding sphere + neighbour indices per DRAWN cell — the real LAND
+        // records first, then one entry per empty position in the padded grid, all sharing the
+        // default data slot. Static for the process life (the world does not move), so this is
+        // built once, not per frame.
+        //
+        // `gridToCull` is the second half of the index/slot split, and the reason it has to exist:
+        // the GPU grid above stores slot+1 (many positions holding the same number), while the
+        // neighbour stitch needs a UNIQUE per-entry handle so it can read that neighbour's LOD.
+        // They used to be the same number and are not any more.
         const Terrain::LandCell* cellArr = Terrain::cells();
-        g_terrainCull.resize(cells);
-        for (TerrainView* v : { &g_terrainMain, &g_terrainRefl, &g_terrainSun }) {
-            v->lodOf.assign(cells, 0);
-            v->lodStamp.assign(cells, 0);
-        }
-        for (uint32_t s = 0; s < cells; ++s) {
+        const size_t gridN = (size_t)g_terrainGridSpanX * g_terrainGridSpanY;
+        std::vector<uint32_t> gridToCull(gridN, 0u);      // grid position -> cull index + 1
+        const uint32_t defaultCells = (defaultSlot < cells) ? (uint32_t)(gridN - realCells) : 0u;
+        g_terrainCull.clear();
+        g_terrainCull.reserve(realCells + defaultCells);
+        g_terrainCullReal = realCells;
+
+        const float half = 0.5f * Terrain::kCellSize;
+        for (uint32_t s = 0; s < realCells; ++s) {
             const Terrain::LandCell& c = cellArr[s];
-            TerrainCellCull& t = g_terrainCull[s];
-            const float ox = (float)c.cellX * Terrain::kCellSize;
-            const float oy = (float)c.cellY * Terrain::kCellSize;
+            TerrainCellCull t = {};
             const float zLo = (float)c.minHeight * Terrain::kHeightScale;
             const float zHi = (float)c.maxHeight * Terrain::kHeightScale;
-            const float half = 0.5f * Terrain::kCellSize;
-            t.cx = ox + half;
-            t.cy = oy + half;
+            t.cx = (float)c.cellX * Terrain::kCellSize + half;
+            t.cy = (float)c.cellY * Terrain::kCellSize + half;
             t.cz = 0.5f * (zLo + zHi);
             t.r  = std::sqrt(2.0f * half * half + 0.25f * (zHi - zLo) * (zHi - zLo));
             t.gx = c.cellX; t.gy = c.cellY;
-            const int32_t nx = Terrain::slotAt(c.cellX - 1, c.cellY);
-            const int32_t px = Terrain::slotAt(c.cellX + 1, c.cellY);
-            const int32_t ny = Terrain::slotAt(c.cellX, c.cellY - 1);
-            const int32_t py = Terrain::slotAt(c.cellX, c.cellY + 1);
-            t.nbr[0] = (nx < 0) ? 0u : (uint32_t)nx + 1u;
-            t.nbr[1] = (px < 0) ? 0u : (uint32_t)px + 1u;
-            t.nbr[2] = (ny < 0) ? 0u : (uint32_t)ny + 1u;
-            t.nbr[3] = (py < 0) ? 0u : (uint32_t)py + 1u;
+            t.slot = s;
+            const int32_t lx = c.cellX - g_terrainGridMinX;
+            const int32_t ly = c.cellY - g_terrainGridMinY;
+            if (lx >= 0 && ly >= 0 && (uint32_t)lx < g_terrainGridSpanX && (uint32_t)ly < g_terrainGridSpanY) {
+                gridToCull[(size_t)ly * g_terrainGridSpanX + lx] = (uint32_t)g_terrainCull.size() + 1u;
+            }
+            g_terrainCull.push_back(t);
         }
-        g_terrainMain.visible.reserve(cells);
-        g_terrainRefl.visible.reserve(cells);
-        g_terrainSun.visible.reserve(cells);
+        // Default land: one entry per still-unclaimed position. The sphere is exact — a flat sheet
+        // has zero height range, so the radius is the cell's half-diagonal and nothing more.
+        if (defaultSlot < cells) {
+            const float zFlat = -256.0f * Terrain::kHeightScale;   // ESM::Land::DEFAULT_HEIGHT
+            const float rFlat = std::sqrt(2.0f * half * half);
+            for (uint32_t ly = 0; ly < g_terrainGridSpanY; ++ly) {
+                for (uint32_t lx = 0; lx < g_terrainGridSpanX; ++lx) {
+                    const size_t g = (size_t)ly * g_terrainGridSpanX + lx;
+                    if (gridToCull[g]) { continue; }               // a real record already owns it
+                    TerrainCellCull t = {};
+                    t.gx = (int32_t)lx + g_terrainGridMinX;
+                    t.gy = (int32_t)ly + g_terrainGridMinY;
+                    t.cx = (float)t.gx * Terrain::kCellSize + half;
+                    t.cy = (float)t.gy * Terrain::kCellSize + half;
+                    t.cz = zFlat;
+                    t.r  = rFlat;
+                    t.slot = defaultSlot;
+                    gridToCull[g] = (uint32_t)g_terrainCull.size() + 1u;
+                    g_terrainCull.push_back(t);
+                }
+            }
+        }
+        // Neighbour links, in a second pass because gridToCull is only complete now.
+        for (TerrainCellCull& t : g_terrainCull) {
+            const int32_t lx = t.gx - g_terrainGridMinX;
+            const int32_t ly = t.gy - g_terrainGridMinY;
+            const int32_t dx[4] = { -1, 1, 0, 0 };
+            const int32_t dy[4] = { 0, 0, -1, 1 };
+            for (uint32_t k = 0; k < 4; ++k) {
+                const int32_t nx = lx + dx[k], ny = ly + dy[k];
+                t.nbr[k] = (nx < 0 || ny < 0 || (uint32_t)nx >= g_terrainGridSpanX
+                                             || (uint32_t)ny >= g_terrainGridSpanY)
+                         ? 0u : gridToCull[(size_t)ny * g_terrainGridSpanX + nx];
+            }
+        }
+        // The per-view LOD arrays are indexed by CULL INDEX (the stitch reads a neighbour's entry),
+        // so they size to the cull table, not to the slot count.
+        const uint32_t cullN = (uint32_t)g_terrainCull.size();
+        for (TerrainView* v : { &g_terrainMain, &g_terrainRefl, &g_terrainSun }) {
+            v->lodOf.assign(cullN, 0);
+            v->lodStamp.assign(cullN, 0);
+            v->visible.reserve(kTerrainMaxInst);
+        }
 
         const uint64_t bufBytes = hBytes + cBytes + tBytes + gBytes;
-        std::printf("[forge][terrain] residency: %u cells, %llu MB buffers (heights %llu + colour %llu)\n",
-                    cells, (unsigned long long)(bufBytes >> 20),
+        std::printf("[forge][terrain] residency: %u cells (+%u default), %llu MB buffers (heights %llu + colour %llu)\n",
+                    realCells, defaultCells, (unsigned long long)(bufBytes >> 20),
                     (unsigned long long)(hBytes >> 20), (unsigned long long)(cBytes >> 20));
-        LOG::logline(">> [terrain] residency uploaded: %u cells x[%d..%d] y[%d..%d] (grid %ux%u),"
+        LOG::logline(">> [terrain] residency uploaded: %u LAND cells + %u DEFAULT positions = %u cull entries"
+                     "  x[%d..%d] y[%d..%d] (grid %ux%u, pad %d),"
                      " %llu MB buffers (heights %llu + VCLR %llu + VTEX %llu + grid %llu)",
-                     cells, g_terrainGridMinX, eMaxX, g_terrainGridMinY, eMaxY,
-                     g_terrainGridSpanX, g_terrainGridSpanY,
+                     realCells, defaultCells, cullN,
+                     g_terrainGridMinX, gridMaxX, g_terrainGridMinY, gridMaxY,
+                     g_terrainGridSpanX, g_terrainGridSpanY, (int)kTerrainGridPad,
                      (unsigned long long)(bufBytes >> 20), (unsigned long long)(hBytes >> 20),
                      (unsigned long long)(cBytes >> 20), (unsigned long long)(tBytes >> 20),
                      (unsigned long long)(gBytes >> 20));
@@ -23054,10 +23207,13 @@ namespace ForgeRender {
             if (missing && g_terrainMissingSeen.size() < kMaxMissingLogged) {
                 const int64_t key = ((int64_t)mx << 32) ^ (uint32_t)my;
                 if (g_terrainMissingSeen.emplace(key, 0u).second) {
-                    LOG::logline(">> [terrain] no LAND record for cell (%d,%d) — normally the edge of the "
-                                 "world (only %u cells in the grid rectangle have land); a real gap would "
-                                 "be inland%s",
-                                 mx, my, Terrain::cellCount(),
+                    // g_terrainCullReal, not Terrain::cellCount() — the latter counts the synthetic
+                    // default slot too, and this line is specifically about records with land. The
+                    // cell is still DRAWN (default land fills it); this only says no record exists.
+                    LOG::logline(">> [terrain] no LAND record for cell (%d,%d) — default land is drawn there; "
+                                 "normally the edge of the world (only %u cells in the grid rectangle have "
+                                 "land); a real gap would be inland%s",
+                                 mx, my, g_terrainCullReal,
                                  g_terrainMissingSeen.size() + 1 >= kMaxMissingLogged
                                      ? ". Cap reached, further cells silent." : "");
                 }
@@ -23136,8 +23292,10 @@ namespace ForgeRender {
             for (uint32_t k = 0; k < 4; ++k) {
                 uint32_t ns = stride;
                 if (t.nbr[k]) {
-                    const uint32_t nslot = t.nbr[k] - 1u;
-                    if (V.lodStamp[nslot] == V.cullFrame) { ns = 1u << V.lodOf[nslot]; }
+                    // CULL INDEX, not data slot — the LOD arrays are per drawn cell, and default
+                    // land shares one slot across tens of thousands of them.
+                    const uint32_t nIdx = t.nbr[k] - 1u;
+                    if (V.lodStamp[nIdx] == V.cullFrame) { ns = 1u << V.lodOf[nIdx]; }
                 }
                 nbrStrides |= (ns & 0xFFu) << (k * 8u);
             }
@@ -23151,7 +23309,9 @@ namespace ForgeRender {
             const uint32_t localXY = (uint32_t)(t.gx - g_terrainGridMinX)
                                    | ((uint32_t)(t.gy - g_terrainGridMinY) << 16);
             const uint32_t spanXY  = g_terrainGridSpanX | (g_terrainGridSpanY << 16);
-            const uint32_t inst0[4] = { s, stride, nbrStrides, localXY };
+            // DATA slot here, not the cull index: this is what indexes gTerrainHeights/Color/Tex,
+            // and every default-land instance points at the one shared cell.
+            const uint32_t inst0[4] = { t.slot, stride, nbrStrides, localXY };
             const uint32_t inst1[2] = { spanXY, 0u };
             std::memcpy(row + 0,  originRel, 8);
             std::memcpy(row + 8,  inst0,     16);
@@ -25223,7 +25383,10 @@ namespace ForgeRender {
 
         // --- terrain bounds → camera start (a whole-world overview), then free-fly ---
         float mnX=3.4e38f,mnY=3.4e38f,mnZ=3.4e38f,mxX=-3.4e38f,mxY=-3.4e38f,mxZ=-3.4e38f;
-        for (const TerrainCellCull& m : g_terrainCull) {
+        // REAL cells only — the cull table now carries a 40-cell ring of default land past the LAND
+        // extent, and framing the overview on that would start the viewer 320k units back over empty sea.
+        for (uint32_t i = 0; i < g_terrainCullReal && i < g_terrainCull.size(); ++i) {
+            const TerrainCellCull& m = g_terrainCull[i];
             mnX=(m.cx-m.r<mnX)?m.cx-m.r:mnX; mxX=(m.cx+m.r>mxX)?m.cx+m.r:mxX;
             mnY=(m.cy-m.r<mnY)?m.cy-m.r:mnY; mxY=(m.cy+m.r>mxY)?m.cy+m.r:mxY;
             mnZ=(m.cz-m.r<mnZ)?m.cz-m.r:mnZ; mxZ=(m.cz+m.r>mxZ)?m.cz+m.r:mxZ; }
@@ -26347,7 +26510,11 @@ namespace ForgeRender {
             // the DL path skips. One lane, one owner.
             fd[48] = nearOwn; fd[50] = 0.0f; fd[51] = g_dlNearViewRange;
             fd[52] = fd[24]; fd[53] = fd[25]; fd[54] = fd[26]; fd[55] = 0.0f;  // lodSunAmb = ambCol
-            fd[56] = g_dlEye[0]; fd[57] = g_dlEye[1]; fd[58] = g_dlEye[2]; fd[59] = 0.0f;  // lodEye
+            // lodEye — .w is the above-water hole-fill permission, same expression as the lighting
+            // block's write (this runs after it and rewrites the whole float4). g_dlExterior is
+            // necessarily true here; it stays in the test so the two sites read identically.
+            fd[56] = g_dlEye[0]; fd[57] = g_dlEye[1]; fd[58] = g_dlEye[2];
+            fd[59] = (g_dlExterior && g_waterFillAbove) ? 1.0f : 0.0f;
             fd[116] = 0.0f;   // clustered forward default OFF (froxelDims.x); the froxel fill below sets it when active
 
         }

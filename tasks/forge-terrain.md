@@ -562,3 +562,46 @@ path.** The only distance input shaped like one is `mfd[51]` (`nearViewRange`), 
 and floors to 4096 as a workaround. Two-phase Hi-Z occlusion culling is the right weapon for
 interior walls and already exists — measure it in a big interior before adding a distance cut.
 Track separately from terrain: interiors have no terrain at all.
+
+## T5 — DEFAULT LAND for cells with no LAND record (landed 2026-08-15)
+
+MW draws a cell with no LAND record as a flat sheet at `ESM::Land::DEFAULT_HEIGHT` (-2048 world
+units), textured `_land_default`, white vertex colour (OpenMW `components/esmterrain/storage.cpp`).
+We drew nothing, so MW's own frame showed through the seam out at sea and in the inland gaps the
+loader's "no terrain" list already named — `(-12,0)`, `(-12,1)`, `(-16,8)`, `(-19,9)` among them.
+
+**Nothing had to be authored.** A zero-initialised `LandCell` already IS MW's default, by
+coincidence: `terrain.cpp` fills `height[i] = -256` and memsets `color` white, `kHeightScale` is 8
+(`-256 x 8 = -2048`), and global texture id 0 is `_land_default.tga`. The cell only had to exist.
+
+**One shared slot, not one cell each.** A `LandCell` is ~21.6 KB and this install has ~42k empty
+positions in the padded grid — ~900 MB of identical bytes if materialised. Instead `Terrain::load()`
+appends ONE synthetic cell past the real records (`Terrain::defaultSlot()`, exposed in terrain.h)
+and every empty position points at it. It is appended AFTER every stat and log line, so the extent,
+height range, cell count and no-VCLR count still describe the world; `g_cellIndex` never points at
+it, so `cellAt`/`slotAt` keep meaning "a real record exists here" and the `g_terrainEyeCellMissing`
+tripwire keeps reporting the truth.
+
+**The one structural change: cull index != data slot.** `g_terrainCull`'s index used to be both the
+cull record and the world-buffer slot. `TerrainCellCull` now carries `slot` separately:
+- `inst0[0]` = `t.slot` (indexes gTerrainHeights/Color/Tex; default cells share one).
+- `nbr[k]` = **cull index + 1** (the neighbour stitch reads that neighbour's LOD, which is per drawn
+  cell). A CPU `gridToCull` table is built beside the GPU grid because the two numbers differ now.
+- `lodOf`/`lodStamp` size to `g_terrainCull.size()`, not to the slot count.
+- Real cells stay first in the array (`g_terrainCullReal`), so the `kTerrainMaxInst` break drops
+  default cells before real ones — this is what keeps the sun and reflect views safe.
+The shaders needed NO change: `terrain.vert`/`terrain.frag` already index by `Inst0.x` and reach
+neighbours through `gTerrainCellGrid`, never by cull index.
+
+**Padded grid.** The rectangle grows by `kTerrainGridPad = 40` cells (the `DL.DrawDist` ceiling), so
+from any cell that has land the whole horizon within view distance is default land: 269x173 = 46537
+positions here, 41834 of them default. `g_pTerrainCellGrid` is filled with `defaultSlot+1` instead
+of 0 in every empty position, so the neighbour walks find a flat sheet rather than clamping.
+
+**Cost:** cull table ~2.0 MB, lodOf+lodStamp x3 views ~0.7 MB, grid buffer ~186 KB, one extra slot
+in heights/colour/VTEX (~26 KB). Cull walk 4703 -> 46537 sphere tests per view (distance reject
+first). Default cells sit at the far LOD, 8 triangles each. Interiors unaffected — `dlCullAndBuild`
+returns before `terrainCullAndBuild` and clears `V.cells` first.
+
+**Watch on verify:** the reflection and sun-caster views share `g_terrainCull`, and the cull-index /
+slot split is exactly what would tear cell edges there — the edge stitch is where it would show.
