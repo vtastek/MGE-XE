@@ -9141,7 +9141,10 @@ namespace {
                 d[1].ppTextures = &g_live.pLinearDepth;
                 updateDescriptorSet(R, 0, g_live.pLinearizeSet, 2, d);
             }
-            if (g_live.pAplSet && g_live.pAplOut && g_live.pAplParamsCbv) {
+            // pLinearDepth joins the guard: the set now has a depth slot, and binding three of four
+            // descriptors would leave the sky discriminator reading whatever was last in that heap
+            // slot — an instrument silently metering against a foreign texture.
+            if (g_live.pAplSet && g_live.pAplOut && g_live.pAplParamsCbv && g_live.pLinearDepth) {
                 // pRT — the DELIVERED image, which is what the instrument measures since step 6a
                 // moved the dispatch past the resolve. It wraps the shared cross-process resource,
                 // is created with DESCRIPTOR_TYPE_TEXTURE (so it is SRV-bindable), is always
@@ -9149,15 +9152,22 @@ namespace {
                 // branch went with the move: pMSAAColor now carries scene-referred values whenever
                 // fp16 is on, and averaging those would break every APL number ever recorded.
                 Texture* aplSrc = g_live.pRT->pTexture;
-                DescriptorData d[3] = {};
+                DescriptorData d[4] = {};
                 d[0].mIndex    = SRT_RES_IDX(AplSrtData, PerBatch, gAplParams);
                 d[0].ppBuffers = &g_live.pAplParamsCbv;
                 d[1].mIndex    = SRT_RES_IDX(AplSrtData, PerBatch, gAplColor);
                 d[1].mCount    = 1;                     // REQUIRED for a single texture — see above
                 d[1].ppTextures = &aplSrc;
-                d[2].mIndex    = SRT_RES_IDX(AplSrtData, PerBatch, gAplOut);
-                d[2].ppBuffers = &g_live.pAplOut;
-                updateDescriptorSet(R, 0, g_live.pAplSet, 3, d);
+                // The sky discriminator. pLinearDepth is written EVERY frame (linearize is not
+                // gated on AO — only the horizon-search dispatches are), and it is left in
+                // SHADER_RESOURCE from the AO block onward, which is where the APL dispatch reads
+                // it; the always-on water pass already samples it in the same state.
+                d[2].mIndex    = SRT_RES_IDX(AplSrtData, PerBatch, gAplDepth);
+                d[2].mCount    = 1;
+                d[2].ppTextures = &g_live.pLinearDepth;
+                d[3].mIndex    = SRT_RES_IDX(AplSrtData, PerBatch, gAplOut);
+                d[3].ppBuffers = &g_live.pAplOut;
+                updateDescriptorSet(R, 0, g_live.pAplSet, 4, d);
             }
             // Custom resolve (step 4): the MSAA colour as a Tex2DMS SRV + its params cbuffer. Bound
             // ONCE — neither resource is ever recreated without rebuilding this path, and the live
@@ -10168,6 +10178,7 @@ namespace {
     // not to make, so the reported number is the window mean, exactly like gpu/rec.
     double    g_aplAccum[4] = { 0.0, 0.0, 0.0, 0.0 };   // R, G, B, log-luma
     double    g_aplPctAccum[3] = { 0.0, 0.0, 0.0 };     // S3a: p10 / p50 / p90 display levels
+    double    g_aplCoverAccum  = 0.0;                   // counted / lattice, i.e. 1 - sky fraction
     unsigned  g_aplN        = 0;
     float     g_lastApl[4]  = { 0.0f, 0.0f, 0.0f, 0.0f };
     // ...and THIS FRAME's percentiles, not the window's. The accumulators above are reset every 300
@@ -10941,6 +10952,38 @@ namespace {
     float g_calAmbGain   = 1.0f;   // ambCol   — host-side, at the one decode site
     float g_calEmisGain  = 1.0f;   // material emissive — gShadowParams lane, applied in the frags
 
+    // ─── S3a — THE RATIO ITSELF, AS THE AUTHORED KNOB ────────────────────────────────────────────
+    // The two gains above reach the sun:ambient ratio only TOGETHER and in opposite directions,
+    // which makes them unusable as a control for it: moving either one also moves the sum, so
+    // setting a ratio by hand means chasing the exposure servo the whole way. This is the number
+    // the user owns; the "solve ratio" button turns it into a pair of gains at constant sum.
+    //
+    // ⚠ 1.79 IS calSunAmbTarget() AT ndl = 1 UNDER THE SHIPPED CURVE AND THE 80/128 PAIR, written
+    // out here rather than seeded from it at runtime, because an AUTHORED setpoint that silently
+    // re-derives itself when a curve or a table row is swapped is not authored. The heartbeat prints
+    // the live derived value beside this one (`target=` vs `knob=`), so such a change surfaces as a
+    // disagreement to be RE-AUTHORED instead of as a number that quietly walked.
+    //
+    // ⚠ IT WENT 1.79 -> 2.68 -> 1.79 ACROSS ONE DAY, and the round trip is the lesson, not noise:
+    // "target 70 instead of 80" was applied to the PAIR's shadow end when it meant the frame MEAN.
+    // Those were the same two numbers then, so a level instruction silently became a contrast one
+    // and moved the ratio 50%. They are different numbers now (see the SPLIT), which is what makes
+    // that mistake unrepeatable rather than merely corrected.
+    //
+    // ⚠ ndl DELIBERATELY DOES NOT APPEAR ANYWHERE, and the first live solve is why it must not. The
+    // pair pins (a + s·ndl)/a, so the target scales by 1/ndl: at 80/128 that is 1.79 for a surface
+    // facing the sun and 2.25 for flat ground under a sun 53° up. Solving to the ndl=1 number in a
+    // scene made of ndl≈0.8 surfaces over-lifted ambient (p10 31->43 at fixed exposure) and read as
+    // too bright — the instrument had already said so, printing `at-ndl=0.50` where the ground was
+    // at 0.79. Picking an ndl silently would decide the whole calibration, so the instrument REPORTS
+    // it (`at-ndl=` on the heartbeat) and the ratio is authored here.
+    float g_calRatioTarget = 1.79f;
+    // A PRESS, NEVER A PER-FRAME LOOP. "The setpoint is AUTHORED, not measured. Metering picks the
+    // path, never the destination." An auto-solve every frame would make the ratio measured, which
+    // is the one thing this calibration is not allowed to be. Consumed at the decode site, where the
+    // post-gain colours exist; the widget callback runs mid-frame with neither of them in scope.
+    bool  g_calRatioSolveReq = false;
+
     // ─── THE EXPOSURE SERVO (tasks/forge-postprocess.md step 2) ──────────────────────────────────
     // The CAL gains above set the scene's RATIOS (sun:ambient, emissive) — quantities no global
     // scale can restore. This owns the remaining degree of freedom, LEVEL, and it owns it from here:
@@ -10961,6 +11004,23 @@ namespace {
     // No transition special-case exists and none is wanted: an interior<->exterior step is a ROW
     // change in calTarget(), the servo sees a level far outside the new envelope, and the same
     // first-order lag ramps across it over ~tau. That ramp IS the eyes-adjusting effect.
+    // ─── THE METER MEASURES THE SCENE, NOT THE FRAME (2026-08-16) ────────────────────────────────
+    // Reject sky samples from the APL reduction. ON by default, and it is a correction rather than
+    // an option: MW's sky is REPRODUCED authored data, not a physical radiance, and it covers a
+    // fraction of the frame that depends on where the player is LOOKING. Metering it makes exposure
+    // a function of camera pitch. Measured, two exterior frames seconds apart in one session:
+    //
+    //   mean=104 p10=35 p50=113 p90=160  exp=6.14     <- sky in shot
+    //   mean=41  p10=22 p50=41  p90=60   exp=7.88     <- same scene, pitched down
+    //
+    // p50 barely moves against the mean while p90 collapses 160->60: that is sky leaving frame, and
+    // the servo chased it by 28%. Also the reason the exterior dead zone looked so wide — much of
+    // that float was the sky fraction, not the scene.
+    //
+    // ⚠ TURNING THIS OFF REDEFINES EVERY NUMBER ON THE apl LINE, so the line says which mode it was
+    // taken in (`scene` / `frame`) and prints the sky fraction beside it. Readings across the two
+    // are not comparable, and every calibration target recorded from here on is a SCENE reading.
+    bool   g_aplSkipSky  = true;
     bool   g_expEnable   = true;
     // WHICH STATISTIC THE METER READS — 0 = frame mean, 1 = p90, 2 = geometric mean. A LIVE knob
     // rather than a constant because the calibration table does not say, and guessing is exactly
@@ -12684,6 +12744,28 @@ namespace {
           t.sliderF("CAL sun gain (with CAL ambient: sets the sun:ambient RATIO)",
                     &g_calSunGain,  0.0f, 8.0f, 0.05f);
           t.sliderF("CAL ambient gain", &g_calAmbGain,  0.0f, 8.0f, 0.05f);
+          // THE METER'S POPULATION — scene (sky rejected) or whole frame. Here rather than beside
+          // the exposure knobs because it decides what every calibration number MEANS, not how the
+          // servo chases them. Ticking it off is the A/B that shows how much of the old float was
+          // camera pitch; leave it ON, and treat any reading taken with it off as a different unit.
+          t.checkbox("METER: reject sky (scene APL, not frame APL)", &g_aplSkipSky);
+          // THE RATIO AS A CONTROL, because the two sliders above are not one: they reach it only
+          // together and in opposite directions, so dialling a ratio by hand means fighting the sum
+          // — and therefore the exposure servo — the whole way. Author the ratio here, press solve,
+          // and the sum is held while it is re-split. Read the CURRENT ratio, the derived target and
+          // the ndl it corresponds to off the `[forge-hb][light]` heartbeat, which is where this
+          // instrument lives (the harness runs minimized, with nobody at this panel).
+          // Range tops out well past the ndl=1 value on purpose: the pair scales by 1/ndl, so the
+          // useful settings for real surfaces are all ABOVE it (1.79 sun-facing, 2.25 flat ground
+          // under a sun 53° up). `at-ndl=` on the heartbeat is how to pick one.
+          t.sliderF("CAL sun:ambient RATIO target (1.79 = the ext-day 80/128 pair at ndl=1)",
+                    &g_calRatioTarget, 0.5f, 8.0f, 0.01f);
+          // ⚠ A BUTTON, NEVER AUTOMATIC. A per-frame auto-solve would make the setpoint MEASURED,
+          // and "metering picks the PATH, never the destination" is the rule this whole calibration
+          // is built on. Sets a flag; the solve runs at the decode site, the only place the
+          // post-gain colours exist (the UI runs mid-frame with neither of them in scope).
+          t.button("CAL: SOLVE ratio -> sun/ambient gains (holds the sum; logs [forge-cal])",
+                   [](void*) { g_calRatioSolveReq = true; });
           // The one the 0.5/0.5/2.0 finding actually isolated: those cancel on d and a, so what was
           // approved for interiors was emissive x2 and nothing else. Point lights are untouched by it
           // (they accumulate into d) — a lamp's SPILL is unchanged, the lamp's own glow doubles.
@@ -14328,6 +14410,12 @@ namespace {
 }
 
 namespace ForgeRender {
+    // S3a. Defined below beside calGainDomain (it inverts through it), read above by init's curve
+    // report — declared here at NAMESPACE scope rather than at the call site, because a block-scope
+    // function declaration has external linkage and would name a different entity than the
+    // internal-linkage definition, which is the same trap calTarget's comment records for `extern`.
+    double calSunAmbTarget();
+
     bool init(unsigned width, unsigned height, unsigned sampleCount, unsigned anisoLevel) {
         std::setvbuf(stdout, nullptr, _IONBF, 0);
         if (g_live.pRenderer) {
@@ -14508,6 +14596,15 @@ namespace ForgeRender {
             // Unconditional — it must report even when AgX is off, because "off" is usually how a
             // bad transcription hides.
             agxSelfTest();
+            // S3a — AND THE SUN:AMBIENT TARGET THE SAME CURVE DECIDES, printed beside it for the
+            // reason the curve is printed beside the levels: calSunAmbTarget() inverts the ext-day
+            // pair THROUGH whatever armed above, so a curve swap moves it (1.864 under the retired
+            // polynomial, 1.787 under AgX). The authored knob is printed next to it because it must
+            // NOT track that move silently — a disagreement here is the cue to re-author it, and
+            // `--forge-scene` can therefore check the derived number without a daytime exterior.
+            std::printf("[forge] CAL sun:ambient target %.3f at ndl=1 (ext-day pair through the "
+                        "armed curve) | authored knob %.3f\n",
+                        calSunAmbTarget(), (double)g_calRatioTarget);
         }
 
         g_live.pPipeline = buildTrianglePipeline(R, g_live.pRT, g_live.pShader);
@@ -14712,12 +14809,41 @@ namespace ForgeRender {
     //                             alone, lit is ambient+sun, so the two TOGETHER pin the sun:ambient
     //                             RATIO — the one quantity S3 exists to set, and the reason this row
     //                             is worth more than the others. A frame mean cannot check a pair.
+    //                             ⚠⚠ AND THIS ROW NO LONGER FEEDS THE SERVO — see the SPLIT below.
+    //                             It is region readings and it always was; the servo's exterior
+    //                             envelope is a frame-mean statistic and now lives separately.
     //   interior      40 / 50   — a RANGE of acceptable values (user: "40-50 for regular interiors").
     //                             The first run compared against 50 alone and reported need=3.51x
     //                             where the user's calibration said ~2.5x; against 40 the same frame
     //                             asks 2.81x. Most of that disagreement was the missing lower end.
     //   night         60        — a single value, so far.
     struct CalTarget { float lo; float hi; const char* name; };
+
+    // ─── THE SPLIT: A REGION PAIR AND A FRAME-MEAN ENVELOPE ARE NOT THE SAME NUMBERS ─────────────
+    // These two functions used to return the same row, and that was the last place the calibration
+    // conflated two different statistics. They cannot be one row, because their two readers ask
+    // incompatible questions of it:
+    //
+    //   calTargetExtDay()  80 / 128  — REGION readings off surfaces ("128 for lit parts, 80 for
+    //                                  shadow parts"). Read UNCONDITIONALLY, because the sun:ambient
+    //                                  ratio they pin is a property of the CALIBRATION, not of where
+    //                                  the player is standing — an interior does not suspend it.
+    //   calTarget() ext    60 / 80   — the servo's FRAME-MEAN envelope (user: "60-70-80"), i.e. the
+    //                                  band the delivered mean may float in, centred on 70. A mean
+    //                                  is not a region reading and never was comparable to one.
+    //
+    // ⚠ THE FORCING ARGUMENT, so nobody re-merges them: a mean over a frame full of dark corners
+    // sits far below any surface you would point at, so a row that satisfies the ratio is
+    // automatically the wrong envelope and vice versa. Sharing them made `lo` do two unrelated jobs
+    // — it set the contrast target AND the servo's lower edge — and moving it for one purpose
+    // silently moved the other (2026-08-15: lowering 80->70 to darken the image also widened the
+    // dead zone that was already failing to correct, see below).
+    //
+    // ⚠ AND THE ENVELOPE IS A **SCENE** STATISTIC NOW. 60/80 is only meaningful against a mean with
+    // the sky rejected (g_aplSkipSky); measured against the whole frame it would chase camera pitch.
+    // The two changes are one change and neither is valid alone.
+    CalTarget calTargetExtDay() { return { 80.0f, 128.0f, "ext day shadow/lit" }; }
+
     CalTarget calTarget() {
         // MW's GameHour comes off the water params (g_waterFogHour <- waterParams[11], declared far
         // above with the water-fog state). ⚠ It only refreshes on frames that carry water params, so
@@ -14733,7 +14859,15 @@ namespace ForgeRender {
         if (!g_dlExterior)         { return {  40.0f,  50.0f, "interior 40-50" }; }
         const float h = g_waterFogHour;
         if (h < 6.0f || h > 20.0f) { return {  60.0f,  60.0f, "night" }; }
-        return                              {  80.0f, 128.0f, "ext day shadow/lit" };
+        // ⚠ NOT calTargetExtDay() — see the SPLIT above. This is the frame-mean envelope, 60-80
+        // around 70; that one is the shadow/lit region PAIR, 80/128, and it feeds the ratio only.
+        //
+        // 1.9 stops of dead zone is what 70/128 was, and the log shows exactly what that bought: E
+        // ramped to 4.10 while the frame read 70, the scene brightened to a mean of 109-113, and E
+        // never came back because 109 is inside the band and `need` therefore never reaches 1.00x.
+        // A ~0.5-stop band cannot hide that. It IS a tighter leash on a level that is allowed to
+        // float — deliberately, because the float it was allowed was mostly sky.
+        return                              {  60.0f,  80.0f, "ext day mean 60-80" };
     }
 
     // ⚠ `need` IS A GAIN, AND A GAIN LIVES IN A DOMAIN. The APL instrument measures the DELIVERED
@@ -14773,6 +14907,84 @@ namespace ForgeRender {
         }
         const double preTone = (double)inverseTonemap((float)d);
         return g_live.linearScene ? (double)srgbToLinearF((float)preTone) : preTone;
+    }
+
+    // ─── S3a — THE SUN:AMBIENT RATIO THE ext-day PAIR ENCODES ────────────────────────────────────
+    // The exterior row is a PAIR, and what makes it worth more than the other rows is that its two
+    // ends are the SAME surface under the two lighting terms: shadow is ambient alone, lit is
+    // ambient + sun·ndl. So the pair does not pin a level — it pins a ratio:
+    //
+    //     lit/shadow = (a + s·ndl)/a = 1 + (s/a)·ndl     =>     s/a = (lit/shadow − 1)/ndl
+    //
+    // ...taken in the GAIN's domain and not in display levels, for exactly the reason calGainDomain
+    // exists: a quotient of two display codes is not a quotient of two radiances once an encode and
+    // a tonemap sit between the knob and the reading. Getting that wrong here fails the same silent
+    // way it does in the servo — a plain sRGB decode of the same pair reports 1.69.
+    //
+    // DERIVED, NEVER WRITTEN DOWN, so it tracks both the table and whichever curve is armed — the
+    // same rule calGainDomain() already follows for the servo. Two moves measured:
+    //   curve   AgX replacing the retired polynomial, at 80/128:  1.864 -> 1.787  (4%)
+    //   table   shadow end 80 -> 70, under AgX:                   1.787 -> 2.678  (50%)
+    // i.e. the ratio is nearly curve-INDEPENDENT and strongly table-DEPENDENT, which is exactly the
+    // argument for pinning it separately from the level: the curve can be replaced under it, but the
+    // authored pair decides it, and a 10-code move on ONE end is a 50% move here. (The 70
+    // experiment is reverted — that instruction was about the frame mean, which has its own row.)
+    //
+    // Returned at ndl = 1, i.e. a surface facing the sun. ndl is the free parameter this instrument
+    // exists to avoid choosing: "lit parts = 128" was read off SOME surface and nobody recorded
+    // which, and the answer scales the target by 1/ndl — at the 80/128 pair, 1.79 for a sun-facing
+    // surface but 2.25 for flat ground under a sun 53° up (Seyda Neen, sunDir.z = -0.794). So ndl
+    // appears nowhere in the code — the heartbeat reports the ndl at which today's frame is ALREADY
+    // correct, and the user authors the ratio they want (g_calRatioTarget).
+    //
+    // ⚠ AND THAT GAP IS NOT ACADEMIC — it is what the first live solve cost. Solving to 1.79 (ndl=1)
+    // in a scene whose surfaces sit near ndl 0.8 over-lifted ambient: p10 31->43 at fixed exposure,
+    // which the user read as too bright. The instrument predicted it (`at-ndl=0.50` on a frame whose
+    // ground was at 0.79); nothing but the choice of ndl was wrong.
+    double calSunAmbTarget() {
+        const CalTarget ct = calTargetExtDay();
+        const double lo = calGainDomain((double)ct.lo);
+        const double hi = calGainDomain((double)ct.hi);
+        return (lo > 1.0e-9) ? (hi / lo - 1.0) : 0.0;
+    }
+
+    // The measurement, shared by the heartbeat that REPORTS it and the button that ACTS on it, so
+    // the number printed and the number solved against cannot come apart. Both callers hand it the
+    // POST-GAIN sunCol/ambCol — the values the frame actually renders with — because the CAL gains
+    // are folded in at the one decode site, and solving off pre-gain colours would make every press
+    // undo the last one.
+    struct CalRatio {
+        double sun;     // Rec.601 luma of sunCol, post-gain
+        double amb;     // Rec.601 luma of ambCol, post-gain
+        double ratio;   // sun:ambient as rendered                        (-1 = no ambient to divide by)
+        double atNdl;   // the ndl at which `ratio` ALREADY hits the pair (-1 = no sun)
+        double gSun;    // constant-SUM solve: factor to multiply g_calSunGain by (-1 = unsolvable)
+        double gAmb;    // ...and g_calAmbGain. Computed here, APPLIED only by the button.
+    };
+    CalRatio calRatioMeasure(const float* sunCol, const float* ambCol) {
+        CalRatio r = {};
+        // Rec.601 — the SAME weights the APL instrument uses, so this number is comparable with the
+        // display levels the calibration targets are stated in instead of being a second opinion.
+        r.sun = 0.299 * sunCol[0] + 0.587 * sunCol[1] + 0.114 * sunCol[2];
+        r.amb = 0.299 * ambCol[0] + 0.587 * ambCol[1] + 0.114 * ambCol[2];
+        r.ratio = r.atNdl = r.gSun = r.gAmb = -1.0;
+        // Interiors and night reach here ambient-only (or, with ambient crushed, sun-only). A
+        // quotient there is a number with no meaning, so it is WITHHELD rather than clamped — the
+        // whole point of the line is that it can be read off the log and trusted.
+        const double tgt = (double)g_calRatioTarget;
+        if (r.amb > 1.0e-6) { r.ratio = r.sun / r.amb; }
+        if (r.sun > 1.0e-6) { r.atNdl = calSunAmbTarget() * r.amb / r.sun; }
+        if (r.sun > 1.0e-6 && r.amb > 1.0e-6 && tgt > 1.0e-6) {
+            // ⚠ HOLD THE SUM. That is what keeps this a RATIO change and not a level change: total
+            // light is conserved, so the servo's job is untouched and the two calibrations stay
+            // separable — the same separation the CAL gains keep from the diagnostic dbgScales.
+            const double sum = r.sun + r.amb;
+            const double a   = sum / (1.0 + tgt);
+            const double s   = sum - a;
+            r.gSun = s / r.sun;
+            r.gAmb = a / r.amb;
+        }
+        return r;
     }
 
     // ─── THE EXPOSURE SERVO ──────────────────────────────────────────────────────────────────────
@@ -15084,7 +15296,19 @@ namespace ForgeRender {
         }
         // APL instrument: mean RGB + mean log-luma of the frame that just finished — one frame late,
         // like every other readback settled here, which is irrelevant for a rolling average.
-        if (g_live.pAplReadback && g_live.pAplReadback->pCpuMappedAddress) {
+        // ⚠ AN ALL-SKY FRAME PRODUCES NO MEASUREMENT AT ALL now that sky is rejected — look straight
+        // up and every lattice sample is discarded. gAplOut[7] is the counted total and 0 means the
+        // reduction had nothing to average, so the whole block sits the frame out: no accumulation
+        // (a zero would drag the window's mean down and misreport the scene) and, above all, NO
+        // SERVO STEP. Letting a mean of 0 reach the servo would drive E straight to the clamp on a
+        // frame that contained nothing to expose FOR, and the next real frame would arrive blown
+        // out — the same failure the existing readback guard prevents for a paused host, arriving
+        // through a new door. Guarded here rather than in the servo because this is the site that
+        // knows the reading is empty.
+        const uint32_t aplCounted =
+            (g_live.pAplReadback && g_live.pAplReadback->pCpuMappedAddress)
+                ? ((const uint32_t*)g_live.pAplReadback->pCpuMappedAddress)[7] : 0u;
+        if (g_live.pAplReadback && g_live.pAplReadback->pCpuMappedAddress && aplCounted > 0u) {
             const float* a = (const float*)g_live.pAplReadback->pCpuMappedAddress;
             for (int i = 0; i < 4; ++i) {
                 g_lastApl[i]   = a[i];
@@ -15097,6 +15321,9 @@ namespace ForgeRender {
                 g_lastAplPct[i]  = (float)pu[4 + i];
                 g_aplPctAccum[i] += (double)pu[4 + i];
             }
+            // Counted fraction of the lattice, averaged over the heartbeat window: 1.00 = no sky in
+            // shot, 0.60 = 40% of the frame was sky and is no longer in any of these numbers.
+            g_aplCoverAccum += (double)aplCounted / (double)(128u * 128u);
             ++g_aplN;
             // Close the exposure loop on the frame that just finished. HERE, inside the readback
             // guard, so the servo only ever steps on a frame that produced a measurement: a paused
@@ -15267,6 +15494,38 @@ namespace ForgeRender {
                 }
                 if (g_calAmbGain != 1.0f) {
                     fdc[24] *= g_calAmbGain; fdc[25] *= g_calAmbGain; fdc[26] *= g_calAmbGain;
+                }
+                // S3a — the "solve ratio" press, consumed HERE and nowhere else, because this is the
+                // only point in the frame where the POST-GAIN sun and ambient both exist: the widget
+                // callback runs mid-frame with nothing but the gains themselves in scope, and
+                // solving off pre-gain colours would make each press undo the previous one. It
+                // MULTIPLIES the existing gains for that same reason. The six reads off the mapped
+                // cbuffer are write-combined and therefore slow, which is why they sit behind the
+                // flag and cost nothing on the frames nobody pressed anything.
+                //
+                // Takes effect NEXT frame: this frame's cbuffer has already been handed to draws
+                // that were recorded against it, and re-scaling it underneath them would put one
+                // frame's lighting half a solve out of date.
+                if (g_calRatioSolveReq) {
+                    g_calRatioSolveReq = false;
+                    const CalRatio cr = calRatioMeasure(fdc + 20, fdc + 24);
+                    if (cr.gSun > 0.0 && cr.gAmb > 0.0) {
+                        g_calSunGain *= (float)cr.gSun;
+                        g_calAmbGain *= (float)cr.gAmb;
+                        LOG::logline(">> [forge-cal] solve ratio: %.3f -> %.3f (sum held) |"
+                                     " sun x%.3f -> gain %.3f | amb x%.3f -> gain %.3f",
+                                     cr.ratio, (double)g_calRatioTarget,
+                                     cr.gSun, (double)g_calSunGain,
+                                     cr.gAmb, (double)g_calAmbGain);
+                    } else {
+                        // Pressed in an interior, at night, or with the target zeroed. Named rather
+                        // than silently ignored — a button that does nothing is indistinguishable
+                        // from a button that is broken.
+                        LOG::logline(">> [forge-cal] solve ratio DECLINED: sun=%.4f amb=%.4f"
+                                     " target=%.3f — needs both terms and a target to split between",
+                                     cr.sun, cr.amb, (double)g_calRatioTarget);
+                    }
+                    LOG::flush();
                 }
             }
             // Phase 1a/1b: lighting[24..27] = realEye.xyz + isExterior (appended by the client; the
@@ -21182,8 +21441,9 @@ namespace ForgeRender {
             if (g_live.pAplPipeline && g_live.pAplSet && g_live.pAplOut && g_live.pAplParamsCbv) {
                 const uint32_t aplGrid = 128u;   // 128x128 = 16384 samples; see apl.comp.fsl
                 if (g_live.pAplParamsCbv->pCpuMappedAddress) {
-                    const float p[4] = { (float)g_live.width, (float)g_live.height, (float)aplGrid,
-                                         1.0f / (float)(aplGrid * aplGrid) };
+                    const float p[8] = { (float)g_live.width, (float)g_live.height, (float)aplGrid,
+                                         1.0f / (float)(aplGrid * aplGrid),
+                                         g_aplSkipSky ? 1.0f : 0.0f, 0.0f, 0.0f, 0.0f };
                     std::memcpy(g_live.pAplParamsCbv->pCpuMappedAddress, p, sizeof(p));
                 }
                 RenderTargetBarrier arb = {};
@@ -21624,10 +21884,34 @@ namespace ForgeRender {
             // the world the way the game does (else the viewer's contrast is its own invention).
             {
                 const float* lf = (const float*)g_live.pFrameCbv->pCpuMappedAddress;
+                // S3a — THE RATIO, on the line that already carries the two colours it is made of,
+                // and made of exactly those lanes rather than of a second copy. These are POST-GAIN:
+                // the CAL gains were folded in at the decode site, so this is what the frame renders
+                // with and not what MW sent.
+                //
+                //   ratio   — sun:ambient as rendered. 4.70 in the logged daytime exterior.
+                //   target  — calSunAmbTarget(), DERIVED live off the ext-day pair and the armed
+                //             curve, at ndl = 1. knob is what the solve actually aims at; the two
+                //             disagreeing means the curve moved and the knob wants re-authoring.
+                //   at-ndl  — the ndl at which today's ratio is ALREADY correct. This is the free
+                //             parameter made VISIBLE instead of chosen: 0.38 says the frame is
+                //             mildly off for flat ground and badly off for a sun-facing surface.
+                //   solve   — what the button would do. Printed, never applied.
+                const CalRatio cr = calRatioMeasure(lf + 20, lf + 24);
+                char ratioTxt[24], ndlTxt[24], solveTxt[64];
+                if (cr.ratio >= 0.0) { std::snprintf(ratioTxt, sizeof(ratioTxt), "%.2f", cr.ratio); }
+                else                 { std::snprintf(ratioTxt, sizeof(ratioTxt), "n/a"); }
+                if (cr.atNdl >= 0.0) { std::snprintf(ndlTxt, sizeof(ndlTxt), "%.2f", cr.atNdl); }
+                else                 { std::snprintf(ndlTxt, sizeof(ndlTxt), "n/a"); }
+                if (cr.gSun > 0.0)   { std::snprintf(solveTxt, sizeof(solveTxt),
+                                                     "sun x%.2f amb x%.2f (sum held)", cr.gSun, cr.gAmb); }
+                else                 { std::snprintf(solveTxt, sizeof(solveTxt), "n/a"); }
                 LOG::logline(">> [forge-hb][light] sunDir=(%.4f,%.4f,%.4f) sunCol=(%.4f,%.4f,%.4f) ambCol=(%.4f,%.4f,%.4f)"
-                             " eyeAbs=(%.0f,%.0f,%.0f)",
+                             " eyeAbs=(%.0f,%.0f,%.0f)"
+                             " | ratio=%s target=%.2f(ndl=1) knob=%.2f | at-ndl=%s | solve: %s",
                              lf[16], lf[17], lf[18], lf[20], lf[21], lf[22], lf[24], lf[25], lf[26],
-                             lf[56], lf[57], lf[58]);   // lodEye = ABSOLUTE world eye (viewer start pos)
+                             lf[56], lf[57], lf[58],   // lodEye = ABSOLUTE world eye (viewer start pos)
+                             ratioTxt, calSunAmbTarget(), (double)g_calRatioTarget, ndlTxt, solveTxt);
             }
             LOG::logline(">> [forge-hb] frame=%u drawn=%u skinned=%u(blend=%u zpre=%u) multimap=%u sky=%u alpha=%u(zpre=%u) dynamic=%u meshHigh=%u "
                          "| refl sky=%u near=%u skin=%u mm=%u "
@@ -21865,11 +22149,19 @@ namespace ForgeRender {
                 // uninterpretable, and these lines are what the calibration table gets built out of.
                 // It reports the curve that ARMED (agxActive()), not the checkbox — a build where
                 // the scene is not linear says `legacy` truthfully.
+                // WHICH POPULATION THIS LINE DESCRIBES, on the line itself. `scene` means sky was
+                // rejected and every number here is the world only; `frame` is the old whole-image
+                // reading. sky= is the rejected fraction, and it is what makes two readings
+                // comparable — a scene mean taken at sky=0.45 and one at sky=0.05 sampled very
+                // different parts of the world even though both say `scene`.
+                const double cover = g_aplCoverAccum * inv;
                 LOG::logline(">> [forge-hb] apl: mean=(%.4f,%.4f,%.4f) apl=%.4f geo=%.4f"
-                             " cast=(%.3f,%.3f,%.3f) n=%u | lvl mean=%.0f p10=%.0f p50=%.0f p90=%.0f"
+                             " cast=(%.3f,%.3f,%.3f) n=%u [%s sky=%.0f%%]"
+                             " | lvl mean=%.0f p10=%.0f p50=%.0f p90=%.0f"
                              " | target[%s]=%.0f-%.0f need=%.2f-%.2fx(%s)"
                              " exp=%.2f(%s,%s,%s) cal=(sun %.2f amb %.2f emis %.2f)",
                              r, g, b, apl, geo, r * n, g * n, b * n, g_aplN,
+                             g_aplSkipSky ? "scene" : "frame", 100.0 * (1.0 - cover),
                              meanLvl, g_aplPctAccum[0] * inv, g_aplPctAccum[1] * inv,
                              g_aplPctAccum[2] * inv,
                              ct.name, ct.lo, ct.hi, kLo, kHi,
@@ -21885,6 +22177,7 @@ namespace ForgeRender {
             g_gpuAccum = 0.0;
             g_aplAccum[0] = g_aplAccum[1] = g_aplAccum[2] = g_aplAccum[3] = 0.0;
             g_aplPctAccum[0] = g_aplPctAccum[1] = g_aplPctAccum[2] = 0.0;
+            g_aplCoverAccum = 0.0;
             g_aplN = 0;
         }
         return true;

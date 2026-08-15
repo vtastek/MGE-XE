@@ -984,8 +984,12 @@ STRUCT(AplParams)
 
 
 
+
+
     float4 dims;
-#line 35
+#line 48 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/apl.srt.h"
+    float4 opts;
+#line 49
 };
 
         CBUFFER(AplParams) gAplParams :  register(b0,space2);
@@ -993,6 +997,8 @@ STRUCT(AplParams)
 
 
         Tex2D(float4) gAplColor :  register(t1,space2);
+#line 71 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/apl.srt.h"
+        Tex2D(float) gAplDepth :  register(t2,space2);
 
 
 
@@ -1002,7 +1008,7 @@ STRUCT(AplParams)
 
 
 
-        RWBuffer(uint) gAplOut :  register(u2,space2);
+        RWBuffer(uint) gAplOut :  register(u3,space2);
 #line 29 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/apl.comp.fsl"
 
 
@@ -1042,6 +1048,20 @@ void CS_MAIN( uint3 DispatchThreadID : SV_DISPATCHTHREADID )
 
 
 
+
+
+
+
+
+
+        if (gAplParams.opts.x > 0.5f)
+        {
+            float dz = LoadTex2D(gAplDepth, NO_SAMPLER, p, 0).r;
+            if (dz <= 0.0f) { continue; }
+        }
+
+
+
         float3 c = LoadTex2D(gAplColor, NO_SAMPLER, p, 0).rgb;
 
         c = max(c, 0.0f);
@@ -1073,7 +1093,19 @@ void CS_MAIN( uint3 DispatchThreadID : SV_DISPATCHTHREADID )
 
     if (tid == 0u)
     {
-        float4 m = g_apl[0] * gAplParams.dims.w;
+
+
+
+
+        uint total = 0u;
+        UNROLL for (uint bs = 0u; bs < 256u; ++bs) { total += g_hist[bs]; }
+
+
+
+
+
+        float inv = (total > 0u) ? (1.0f / (float)total) : 0.0f;
+        float4 m = g_apl[0] * inv;
         gAplOut[0] = asuint(m.r);
         gAplOut[1] = asuint(m.g);
         gAplOut[2] = asuint(m.b);
@@ -1082,8 +1114,6 @@ void CS_MAIN( uint3 DispatchThreadID : SV_DISPATCHTHREADID )
 
 
 
-
-        uint total = (uint)(gAplParams.dims.z * gAplParams.dims.z);
         uint t10 = (uint)(0.10f * (float)total);
         uint t50 = (uint)(0.50f * (float)total);
         uint t90 = (uint)(0.90f * (float)total);
@@ -1106,7 +1136,11 @@ void CS_MAIN( uint3 DispatchThreadID : SV_DISPATCHTHREADID )
         gAplOut[4] = p10;
         gAplOut[5] = p50;
         gAplOut[6] = p90;
-        gAplOut[7] = 0u;
+
+
+
+
+        gAplOut[7] = total;
     }
     return;
 }

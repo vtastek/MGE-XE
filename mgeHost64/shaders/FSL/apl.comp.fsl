@@ -68,6 +68,20 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
         uint gy = i / grid;
         int2 p = int2(int((float(gx) + 0.5f) * invGrid * imgSize.x),
                       int((float(gy) + 0.5f) * invGrid * imgSize.y));
+        // SKY REJECTION. Reverse-Z, cleared to 0.0, and the sky pass writes no depth at all — so
+        // depth 0 means "nothing of the world is here" and the pixel is sky. `continue` is safe in
+        // this loop specifically because there is no barrier inside it (the comment on the loop
+        // header is load-bearing for that reason); a divergent early-out here costs the tail only.
+        //
+        // ⚠ REJECTED SAMPLES ARE NOT ZEROS, THEY ARE ABSENT. Accumulating 0 for a sky pixel would
+        // be a different and wrong instrument — it would report a scene that gets DARKER the more
+        // sky is in shot, which is the same camera-pitch dependence with the sign flipped. They are
+        // dropped from the sum, from the histogram, and from the divisor alike.
+        if (gAplParams.opts.x > 0.5f)
+        {
+            float dz = LoadTex2D(gAplDepth, NO_SAMPLER, p, 0).r;
+            if (dz <= 0.0f) { continue; }
+        }
 #if SAMPLE_COUNT > 1
         float3 c = LoadTex2DMS(gAplColor, NO_SAMPLER, p, 0).rgb;
 #else
@@ -102,7 +116,19 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
 
     if (tid == 0u)
     {
-        float4 m = g_apl[0] * gAplParams.dims.w;
+        // THE DIVISOR IS COUNTED, NOT ASSUMED. Every surviving sample was binned exactly once, so
+        // the histogram's own sum IS the counted total — no second reduction, and it cannot
+        // disagree with the sum the percentiles are taken from (which is the failure mode of
+        // tracking the count separately). One serial 256-add pass on the one thread that is awake.
+        uint total = 0u;
+        UNROLL for (uint bs = 0u; bs < 256u; ++bs) { total += g_hist[bs]; }
+
+        // ⚠ A FRAME CAN BE ALL SKY — look straight up — and then there is no scene to meter. Emit
+        // zeros WITH count 0 rather than dividing: the host reads the count and holds the servo,
+        // because the alternative is a mean of 0 driving E to the clamp on a frame that contained
+        // nothing to expose for. This is the one input that could take the whole loop out.
+        float inv = (total > 0u) ? (1.0f / (float)total) : 0.0f;
+        float4 m = g_apl[0] * inv;
         gAplOut[0] = asuint(m.r);
         gAplOut[1] = asuint(m.g);
         gAplOut[2] = asuint(m.b);
@@ -110,9 +136,7 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
 
         // Percentiles, by one serial walk of 256 bins on one thread. A parallel scan would be the
         // reflex and would be slower here: this is 256 adds against the barrier traffic of an
-        // 8-step scan, and the group has nothing else left to do. Every sample was binned exactly
-        // once, so the total is the lattice count and needs no separate reduction.
-        uint total = (uint)(gAplParams.dims.z * gAplParams.dims.z);
+        // 8-step scan, and the group has nothing else left to do.
         uint t10   = (uint)(0.10f * (float)total);
         uint t50   = (uint)(0.50f * (float)total);
         uint t90   = (uint)(0.90f * (float)total);
@@ -135,7 +159,11 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
         gAplOut[4] = p10;
         gAplOut[5] = p50;
         gAplOut[6] = p90;
-        gAplOut[7] = 0u;
+        // How many of the z*z lattice samples were COUNTED. The host turns this into the sky
+        // fraction on the heartbeat, which is the number that makes the rejection auditable: a
+        // reading is only comparable to another taken at a similar fraction, and 0 here is the
+        // all-sky frame the servo must sit out.
+        gAplOut[7] = total;
     }
     RETURN();
 }
