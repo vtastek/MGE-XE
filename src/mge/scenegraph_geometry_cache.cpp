@@ -2615,10 +2615,17 @@ namespace MGE::GeometryCache {
         // `ShadowL2_01`, `ShadowR3S0`. A `strncmp(name, "Shadow", 6)` would delete the shadow wolf.
         // So: strip NetImmerse's "Tri " shape prefix, require "shadow" (+ optional "box"), then
         // allow only digits before the terminator.
+        //
+        // The prefix strip LOOPS. A shape inside an already-"Tri "-named node inherits the prefix
+        // twice — the 25 `td/*anim_death*.nif` blobs are literally `Tri Tri Shadow` under a node
+        // called `Tri Shadow`. That used to be caught by the wrapper NODE's prune, so one strip was
+        // enough; now that the node prune no longer takes the subtree with it (see walk()), the
+        // shape name has to answer for itself. Widening the strip can only add names of the form
+        // "Tri "*"shadow[box][digits]", which are the same family.
         static bool isLegacyShadowGeometry(const char* name) {
             if (!name) { return false; }
             const char* n = name;
-            if (_strnicmp(n, "Tri ", 4) == 0) { n += 4; }   // shapes carry it, the wrapping node does not
+            while (_strnicmp(n, "Tri ", 4) == 0) { n += 4; }   // shapes carry it, wrapping nodes may too
             if (_strnicmp(n, "shadow", 6) != 0) { return false; }
             n += 6;
             if (_strnicmp(n, "box", 3) == 0) { n += 3; }
@@ -2671,10 +2678,28 @@ namespace MGE::GeometryCache {
 
             // Legacy fake-shadow geometry — see isLegacyShadowGeometry. Pruned on EVERY walk, not
             // just the deep one: the whole point is that it must never reach the host, neither as a
-            // draw nor as the shadow caster that cages its own fixture's light. Returning here also
-            // prunes the subtree, which is what removes `Tri ShadowBox` when the wrapping NiNode is
-            // itself named `ShadowBox`.
-            if (isLegacyShadowGeometry(av->getName())) {
+            // draw nor as the shadow caster that cages its own fixture's light.
+            //
+            // ⚠ A SHAPE BY THIS NAME IS THE BLOB. A NODE BY THIS NAME IS ONLY A WRAPPER, and a
+            // wrapper is not a promise about what is inside it. Returning here used to take the
+            // whole subtree, which deleted every mesh whose author parked real geometry under a
+            // node they happened to call `ShadowBox`. Censused with tools/nif-shadowbox-census.py
+            // over 47,415 NIFs: 1,535 shadow-named nodes, of which the subtree prune was doing real
+            // work in exactly ONE mesh and real damage in NINE —
+            //   * 8 silverware candle replacers (L/[LI]ight_Com_Candle_02/03/08/09/10/14/15/16.nif)
+            //     hang their ENTIRE metal body, `Base` -> `Tri Base 0..4`, under `ShadowBox`. That
+            //     is the reported "silver part missing in first person": 35 shapes deleted, the
+            //     additive `Reflection` copy left behind (it lives under `BoneOffset`), so the
+            //     candle kept a metal-coloured ghost and lost its body.
+            //   * 25 td/*anim_death*.nif blobs are `Tri Tri Shadow` — now caught by the shape test
+            //     itself (the looped "Tri " strip above).
+            //   * x32/l/wr_light_wall02.nif's `Shadowbox` holds `Box001`, a blob the name test
+            //     cannot see. It is APP_CULLED, so the ordinary walk already stops above; only the
+            //     deep walk bypasses that, which is precisely where the node prune is kept.
+            // Zero over-prune sites in the vanilla BSAs — this is a modded-mesh class, and it will
+            // keep arriving, because nothing stops an author from naming a node anything.
+            if (isLegacyShadowGeometry(av->getName())
+                && (bypassCullDeep || av->isInstanceOfType(NI::RTTIStaticPtr::NiTriBasedGeom))) {
                 return;
             }
 
