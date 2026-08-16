@@ -8022,15 +8022,21 @@ namespace {
                     return false;
                 }
 
-                // --- alpha SHADOW-RECEIVE depth prepass PSOs (opaque.vert + alphashadowdepth.frag) --
+                // --- alpha SHADOW-RECEIVE depth prepass PSOs (opaque.vert + alphashadowrecv.frag) --
                 // SINGLE-SAMPLE (target = pAlphaShadowDepth, sc1), same GEQUAL+WRITE and cull variants,
                 // but clip on the lower shadow-receive threshold (froxelZ.z). Non-fatal on failure —
                 // alpha shadow reception just stays off (the refresh gate checks these). No 2nd
                 // linearize: the SS depth binds straight into the mask as gShadowLinDepth.
+                //
+                // The frag is alphashadowrecv, NOT the alphashadowdepth the skinned CASTER uses: the
+                // scratch is cleared to far and never meets the world, so the receiver has to test
+                // gSceneLinDepth itself or a sheet the world hides still claims the mask. That test is
+                // screen-space and would clip the light-space caster against garbage, which is why the
+                // two are separate files — see alphashadowrecv.frag.fsl's header.
                 {
                     ShaderLoadDesc asDesc = {};
                     asDesc.mVert.pFileName = "opaque.vert";
-                    asDesc.mFrag.pFileName = "alphashadowdepth.frag";
+                    asDesc.mFrag.pFileName = "alphashadowrecv.frag";
                     addShader(R, &asDesc, &g_live.pAlphaShadowDepthShader);
                     if (g_live.pAlphaShadowDepthShader) {
                         pg.mSampleCount = SAMPLE_COUNT_1;          // scratch is single-sample
@@ -20978,6 +20984,14 @@ namespace ForgeRender {
             // the mask. Overwrite is safe: the opaque colour pass already consumed the old mask, and the
             // only later pass (FP) runs shadow-slot-free lights that never read it. pDepth (0.95 fold-
             // fix) is untouched. Runs independent of g_alphaDepthWrite — reception no longer needs folds.
+            //
+            // ⚠ The scratch is CLEARED TO FAR, so the hardware depth test here compares sheets only
+            // against each other — the world is not in it. alphashadowrecv.frag therefore clips against
+            // gSceneLinDepth by hand: without that, a receiver the world completely hides still claims
+            // its pixels, the mask is rebuilt at a surface that is never drawn, and every alpha layer in
+            // FRONT of it inherits that stranger's shadow (candle smoke behind a wall punching a
+            // smoke-shaped hole in the dust). One value per pixel, many layers per pixel — the loser
+            // always inherits; this only guarantees the winner is at least VISIBLE.
             uint32_t alphaShadowDrawn = 0;
             for (const AlphaCmd& c : s_alphaCmds) { if (c.shadowPipe) { ++alphaShadowDrawn; } }
             if (g_alphaReceiveShadows && alphaShadowDrawn && g_live.shadowReady

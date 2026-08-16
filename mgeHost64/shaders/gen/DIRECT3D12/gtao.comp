@@ -972,7 +972,7 @@ SamplerState gSampler2xWrapClamp : register( s17 , space100 ) ;
 #line 247 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/../../../3rdparty/The-Forge/Common_3/Graphics/FSL/defaults.h"
 
 #line 11 "FSL/shaders.list"
-#line 336 "FSL/shaders.list"
+#line 347 "FSL/shaders.list"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/gtao.comp.fsl"
 #line 40 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/gtao.comp.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/gtao.srt.h"
@@ -1449,4 +1449,4 @@ void CS_MAIN( uint3 DispatchThreadID : SV_DISPATCHTHREADID )
     Write2D(gAOOut, px, aoResolve(1.0f - vis, bentSum, refSum, N));
     return;
 }
-#line 337 "FSL/shaders.list"
+#line 348 "FSL/shaders.list"

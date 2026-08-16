@@ -1,0 +1,94 @@
+// mgeHost64 — alpha SHADOW-RECEIVE depth prepass (fragment stage), MAIN-CAMERA half.
+//
+// Byte-for-byte alphashadowdepth.frag PLUS one thing: a manual test against the opaque scene
+// depth. It exists as a separate file because alphashadowdepth.frag has TWO users and only one
+// of them lives in screen space:
+//
+//   RECEIVER  (this file)              opaque.vert  -> pAlphaShadowDepth, MAIN camera, screen space
+//   CASTER    (alphashadowdepth.frag)  skinned.vert -> pShadowAtlas tile, LIGHT space
+//
+// A screen-space depth load inside the caster would index gSceneLinDepth with ATLAS TILE pixel
+// coordinates and clip point-light shadows against an unrelated surface, so the test cannot be
+// added to the shared file and there is no uniform that separates the two passes (both run in the
+// same frame off the same gFrameData; alphaShadowParams' four lanes are all spoken for).
+//
+// WHY THE TEST. pAlphaShadowDepth is CLEARED TO FAR every frame and holds nothing but alpha
+// sheets — it never sees the world. So the hardware GEQUAL that stops an occluded sheet in the
+// colour pass has nothing to test against here, and a receiver the world completely HIDES still
+// claims its pixels. shadowmask.comp then reconstructs a world position from that texel and
+// OVERWRITES gShadowMask with the visibility of a surface that is never drawn — and every alpha
+// layer at those pixels, including ones nowhere near it, reads that stranger's shadow.
+//
+// Reported as: candle smoke behind a wall punching a smoke-shaped HOLE in the dust in front of it,
+// darker the further the smoke was (deeper behind the wall = deeper in shadow = lower nibble). The
+// hole had the shape of the MESH, not of the visible plume, because the receive threshold defaults
+// to 0 (g_alphaShadowRef, "richest") and so the whole quad — transparent texels included — claimed
+// scratch depth.
+//
+// THE RULE: the scratch pass and the colour pass must agree on VISIBILITY. The colour pass keeps a
+// fragment iff fragZ >= sceneZ (reverse-Z GEQUAL, nearer = larger), so that is exactly what this
+// clips on. A fragment that will not be drawn must not own the mask.
+//
+// Residual, if it ever bites: this fixes the receiver that is INVISIBLE. Two VISIBLE alpha layers
+// still share one mask texel (nearest into the scratch wins) and the loser inherits the winner's
+// shadow — additive draws most of all, since they read the mask but are excluded from the scratch.
+// The general fix is the analogue of shadowreceive.h.fsl's shadowMaskPixel(): bind
+// pAlphaShadowDepth into the graphics SRT and have alpha.frag / multimap_alpha.frag verify the
+// texel is THEIRS before consuming it, falling back to lit. That needs an SRT append plus every
+// PerFrame instance rebound, so it is deliberately not done here.
+//
+// PAIRING HAZARD: shares VSOutput with opaque.vert and must ONLY be paired with it — see
+// [[project_forge_shared_frag_vsoutput]]; a mismatched vert hangs the GPU.
+
+#include "opaque.srt.h"
+#include "texsample.h.fsl"   // sampleBase() — MW address mode + AF level
+
+STRUCT(VSOutput)
+{
+    DATA(float4,      Position, SV_Position);
+    DATA(float3,      Normal,   NORMAL);
+    DATA(float2,      Uv,       TEXCOORD0);
+    DATA(FLAT(uint),  TexIndex, TEXCOORD1);
+    DATA(CENTROID(float), Fog,      TEXCOORD2);
+    DATA(float4,      Color,    COLOR);
+    DATA(float,       AlphaRef, TEXCOORD3);
+    DATA(FLAT(float3),MatDiffuse, TEXCOORD4);
+    DATA(FLAT(float3),MatAmbient, TEXCOORD5);
+    DATA(FLAT(float3),MatEmissive,TEXCOORD6);
+    DATA(FLAT(uint),  VColSource, TEXCOORD7);
+    DATA(float3,      WorldPos,   TEXCOORD8);
+    DATA(FLAT(uint),  OverlayIndex,TEXCOORD9);
+    DATA(FLAT(uint),  ClampMode,  TEXCOORD10);// MW texture address mode (0..3) -> sampleBase()
+};
+
+ROOT_SIGNATURE(DefaultRootSignature)
+void PS_MAIN( VSOutput In )
+{
+    INIT_MAIN;
+
+    // World occlusion, FIRST — it is one load and it saves the texture fetch on every hidden pixel.
+    // gSceneLinDepth is the RAW reverse-Z device depth of the opaque scene (sample 0 of pDepth),
+    // re-linearized at the colour->water seam, so at this point it describes the whole solid world
+    // this pass's sheets are standing behind. Slope tolerance, taken BEFORE any clip so the
+    // derivatives stay in uniform control flow: it errs toward KEEPING the receiver, so a sheet
+    // lying flush on a wall is not erased by rounding. Sky / never-drawn pixels read 0 (far) and an
+    // out-of-bounds load returns 0, both of which keep the fragment.
+    float sceneZ = LoadTex2D(gSceneLinDepth, NO_SAMPLER, int2(In.Position.xy), 0).r;
+    float zTol   = 0.5f * (abs(ddx(In.Position.z)) + abs(ddy(In.Position.z))) + 1e-6f;
+    clip(sceneZ > In.Position.z + zTol ? -1.0f : 1.0f);
+
+    float4 albedo = sampleBase(In.TexIndex, In.ClampMode & 3u, In.Uv, useLowAF(In.AlphaRef, true));  // bit2 = two-sided flag (alpha.frag)
+
+    // Cutout test (a discarded cutout texel is a hole — it must not write depth).
+    clip(albedo.a < In.AlphaRef ? -1.0f : 1.0f);
+
+    // Same output alpha alpha.frag blends with.
+    float vcolA    = (In.VColSource != 0u) ? In.Color.a : 1.0f;
+    float matAlpha = asfloat(In.OverlayIndex);
+    float outA     = albedo.a * vcolA * matAlpha;
+
+    // Shadow-receive threshold (separate, lower than the fold-fix's alphaParams.x): only sheets
+    // opaque enough to be their own shadow receiver write depth here.
+    clip(outA < gFrameData.alphaShadowParams.x ? -1.0f : 1.0f);
+    RETURN();
+}

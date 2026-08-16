@@ -972,7 +972,7 @@ SamplerState gSampler2xWrapClamp : register( s17 , space100 ) ;
 #line 247 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/../../../3rdparty/The-Forge/Common_3/Graphics/FSL/defaults.h"
 
 #line 11 "FSL/shaders.list"
-#line 171 "FSL/shaders.list"
+#line 182 "FSL/shaders.list"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/glow.frag.fsl"
 #line 26 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/glow.frag.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
@@ -1436,4 +1436,4 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
     float fg = saturate(In.Fog);
     return (float4(In.Colour * f * fg, In.Intensity * f * fg));
 }
-#line 172 "FSL/shaders.list"
+#line 183 "FSL/shaders.list"

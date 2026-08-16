@@ -972,7 +972,7 @@ SamplerState gSampler2xWrapClamp : register( s17 , space100 ) ;
 #line 247 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/../../../3rdparty/The-Forge/Common_3/Graphics/FSL/defaults.h"
 
 #line 11 "FSL/shaders.list"
-#line 105 "FSL/shaders.list"
+#line 108 "FSL/shaders.list"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/alphashadowdepth.frag.fsl"
 #line 23 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/alphashadowdepth.frag.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
@@ -1515,4 +1515,4 @@ void PS_MAIN( VSOutput In )
     clip(outA < gFrameData.alphaShadowParams.x ? -1.0f : 1.0f);
     return;
 }
-#line 106 "FSL/shaders.list"
+#line 109 "FSL/shaders.list"

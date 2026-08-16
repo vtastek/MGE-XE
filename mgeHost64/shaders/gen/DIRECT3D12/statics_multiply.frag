@@ -972,7 +972,7 @@ SamplerState gSampler2xWrapClamp : register( s17 , space100 ) ;
 #line 247 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/../../../3rdparty/The-Forge/Common_3/Graphics/FSL/defaults.h"
 
 #line 11 "FSL/shaders.list"
-#line 229 "FSL/shaders.list"
+#line 240 "FSL/shaders.list"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/statics_multiply.frag.fsl"
 #line 25 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/statics_multiply.frag.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
@@ -1912,4 +1912,4 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
     float3 m = lerp(float3(1.0f, 1.0f, 1.0f), t, saturate(mwFogAirShareAt(In.Fog, In.WorldPos)));
     return (float4(m, 1.0f));
 }
-#line 230 "FSL/shaders.list"
+#line 241 "FSL/shaders.list"
