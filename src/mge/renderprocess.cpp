@@ -3136,15 +3136,24 @@ namespace {
                     emitAlphaDraw(*alphaCands[i].si, *alphaCands[i].e, alphaCount);
                 }
             }
-            // Bring-up diagnostic: name the captured set once (what the alpha list actually IS —
-            // if the in-game "sorted" the eye notices isn't in here, it's an AT3 leftover, not a
-            // draw bug). Remove after verify.
-            static bool s_alphaNamed = false;
-            if (!s_alphaNamed) {
-                s_alphaNamed = true;
-                LOG::logline(">> [alpha-cap] %zu blended shapes this frame (%zu captured AT3):",
+            // Bring-up diagnostic: name the set (what the alpha list actually IS — if the
+            // in-game "sorted" the eye notices isn't in here, it's an AT3 leftover, not a draw
+            // bug). Re-arms whenever the COUNT changes, not once per session: the list at the
+            // first frame that has any alpha is the loading-screen scene, and the part being
+            // asked about is routinely an actor that streams in later (the NPC belt did exactly
+            // that — absent from the frame-0 dump, present in every frame after). Session-capped
+            // so a scene whose particle count flickers cannot flood the log.
+            static std::size_t s_lastAlphaCount = (std::size_t)-1;
+            static unsigned    s_alphaDumps = 0;
+            if (alphaCands.size() != s_lastAlphaCount && s_alphaDumps < 20u) {
+                s_lastAlphaCount = alphaCands.size();
+                ++s_alphaDumps;
+                // Printed in DRAW order, which is the sorted order — back to front. An item that
+                // paints over something it should sit behind is one whose row is BELOW the other's
+                // while its depth says it is further away.
+                LOG::logline(">> [alpha-cap] %zu blended shapes this frame (%zu captured AT3), draw order:",
                              alphaCands.size(), g_capRecs.size());
-                const std::size_t nDump = (alphaCands.size() < 16u) ? alphaCands.size() : 16u;
+                const std::size_t nDump = (alphaCands.size() < 24u) ? alphaCands.size() : 24u;
                 for (std::size_t i = 0; i < nDump; ++i) {
                     const auto& c = alphaCands[i];
                     if (c.cap) {
@@ -3945,6 +3954,27 @@ namespace {
                          skip.blendSkin, skip.proxy, skip.palette, (unsigned)fpSet.size(),
                          sqrtf(fpMaxDist2),
                          cd[0], cd[1], cd[2], cd[3], cd[4]);
+            // ...and NAME the set. Counts alone cannot answer either of the two questions this
+            // pass actually gets asked. "Why is part X missing" needs the roster to show X is
+            // absent (a shape pruned in walk() never becomes an entry, so every skip counter
+            // stays 0 while the part is gone — that is exactly how the candle's silver body
+            // hid). "Why is X drawn over the world" needs it to show X is PRESENT, because the
+            // FP pass clears depth and draws last, so anything wrongly in this set paints over
+            // the finished frame no matter where it sits. Roster only on a composition change,
+            // never on the 300-frame tick — it is one line per part.
+            if (composeChanged) {
+                for (std::uint32_t fkey : fpSet) {
+                    auto cit = cacheMap.find(fkey);
+                    if (cit == cacheMap.end()) continue;
+                    const auto& fe = cit->second;
+                    LOG::logline(">> [fp-set] key=%08X %-7s%s%s tex=%s",
+                                 fkey,
+                                 fe.isSkinned ? "skinned" : "rigid",
+                                 fe.blendEnable ? " blend" : "",
+                                 fe.lastFrame != cacheFrame ? " STALE" : "",
+                                 fe.textureName ? fe.textureName : "(none)");
+                }
+            }
         }
         ++s_hb;
         s_lastD = fpDraws; s_lastS = fpSkinned; s_lastA = fpAlpha;

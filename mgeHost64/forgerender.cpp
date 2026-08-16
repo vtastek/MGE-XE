@@ -19805,18 +19805,32 @@ namespace ForgeRender {
                         (uint8_t)(item.mirror ? 1u : 0u),
                         (uint8_t)(additiveB ? 1u : 0u),
                         (uint8_t)((item.blendFlags & IPC::kSkinFlagTwoSided) ? 1u : 0u),
-                        // "Solid body that merely fades" — MW's own three signals, not a guess:
-                        //   NiAlphaProperty blend on, TEST OFF   (a cutout card tests; this doesn't)
-                        //   NiAlphaController present            (alpha is DRIVEN, resting at 1.0)
-                        //   that controller currently at ~1.0    (re-read every frame client-side)
-                        // All three -> it is opaque right now, wrote real prepass depth, and is the
-                        // backmost alpha content, so it composites FIRST. When the death dissolve
-                        // drives matAlpha down, the third test fails on its own and the part moves
-                        // to the translucent group — MW's "opaque until its alpha is triggered".
+                        // ⚠ THIS FLAG ANSWERS ONE QUESTION ONLY: DID THIS PART WRITE DEPTH?
+                        // It is not "is it a solid body" — it decides compositing ORDER, and the
+                        // thing that makes order wrong is depth. A part whose pixels are in pDepth
+                        // was tested against by every alpha draw that came after it, so it MUST
+                        // composite before them; drawn last it paints over content it already
+                        // occluded, at full opacity, with nothing left to stop it.
+                        //
+                        // So it mirrors the Z-PREPASS gate exactly (g_skinAlphaPrepassCmds above) —
+                        // same list, same predicate, one question. It used to ask MW's "solid body
+                        // that merely fades" test instead (blend + TEST OFF + a NiAlphaController
+                        // resting at 1.0), which is the right question for Dagoth Ur and the WRONG
+                        // one here, because the prepass never asked it: the prepass records every
+                        // non-additive blend and lets alphadepth.frag cut per PIXEL. A cutout was
+                        // therefore writing solid depth and then compositing last.
+                        //
+                        // ⚠ THE TEST BIT IS NOT A LICENCE TO DRAW LATE. A cutout's opaque region is
+                        // exactly as opaque as a solid body's — the carving lives in the TEXTURE's
+                        // alpha, so matAlpha is 1.0 by construction and every blend-with-test part
+                        // cleared the threshold. tr_c_nec_robe_01.nif's `Tri Chest 9` (the belt/sash,
+                        // NiAlphaProperty 0x12ED = blend + test GREATER, matAlpha 1.0) wrote real
+                        // depth in the prepass, was excluded here by the test bit, drew LAST, and
+                        // painted solidly over a curtain it sits behind. 449 of 3058 skinned NIFs
+                        // are blend-with-test, so this was the whole class, not one mesh.
                         // An additive glow never occludes and is never in this group.
                         (uint8_t)((!additiveB
-                                   && !(item.blendFlags & IPC::kSkinFlagAlphaTest)
-                                   &&  (item.blendFlags & IPC::kSkinFlagAlphaAnim)
+                                   && g_alphaDepthWrite && !g_alphaDebugNoDepth
                                    && item.matAlpha >= g_alphaDepthRef) ? 1u : 0u),
                         item.viewDepth });
                     continue;
