@@ -130,6 +130,35 @@ namespace IPC {
     // Resolved once at capture (hasTransformAnim), like the LIVE category itself.
     constexpr std::uint32_t kDrawCasterAnimated = 0x2;
 
+    // STENCIL "FAKE HOLE" PORTALS (comGravePit and its ref-65 family). A handful of MW meshes fake
+    // an opening in a solid surface with the stencil buffer: a flat MASK quad over the opening
+    // (stencil ALWAYS -> REPLACE) records where the opening is VISIBLE, then a HULL volume drawn
+    // with the depth TEST OFF (NiZBufferProperty) and stencil EQUAL overwrites the occluder's depth
+    // — but ONLY inside the mask — so the geometry BEHIND the surface (a grave pit below the LAND
+    // heightfield, a room behind a Dwemer grate) is no longer depth-killed by it. The host's pDepth
+    // is D32_SFLOAT with no stencil plane, so the trick is reproduced with a 1-bit gate in an R8
+    // render target: the mask's own depth test writes the gate, the hull's frag discards where the
+    // gate is 0. That is the same two-step, one plane over.
+    //
+    // These three bits mark the members of one portal OBJECT so the host can pull it out of the
+    // GPU-driven indirect groups and draw it INLINE, in role order (masks -> hulls -> rest), which
+    // is the ordering the trick needs and the thing cmdExecuteIndirect cannot express. Being inline
+    // also takes the draws out of the two-phase Hi-Z occlusion test — needed, not incidental: the
+    // hull and the pit interior live BEHIND the very surface they are erasing, so the occlusion test
+    // culls them every time.
+    //
+    // MASK|HULL are the roled helpers; MEMBER is everything else in the same object (the pit dirt,
+    // the surrounding mound). A mask never draws colour — the meshes carry editor colours on them
+    // (comGravePit's is blue, dwrvgratepipe's is literally stencilerror.dds) and they are authored
+    // to be invisible. MASK|HULL are also barred from the shadow-caster lists: a helper volume
+    // casting its own shadow into the pit it opens would be nonsense.
+    //
+    // Riding casterFlags' spare bits — no wire size change (DrawItemWire is a shipped-together 112).
+    constexpr std::uint32_t kDrawPortalMask   = 0x4;
+    constexpr std::uint32_t kDrawPortalHull   = 0x8;
+    constexpr std::uint32_t kDrawPortalMember = 0x10;
+    constexpr std::uint32_t kDrawPortalAny    = kDrawPortalMask | kDrawPortalHull | kDrawPortalMember;
+
     // M1c per-frame draw item: which uploaded mesh (slot) to draw, with its current
     // model->world transform (D3DXMATRIX bytes, row-major — uploaded straight into the
     // host's gObject cbuffer; see opaque.srt.h for the no-transpose convention). The
@@ -152,7 +181,7 @@ namespace IPC {
         // blended over the base by vcol ALPHA (the AlphaGrid). 0 = no decal / non-terrain
         // (the frag's splat is gated off when this is 0, so every other draw is unchanged).
         std::uint32_t overlayTexIndex;
-        std::uint32_t casterFlags; // kDrawCasterLive bit (C4d shadow-caster category)
+        std::uint32_t casterFlags; // kDrawCasterLive bit (C4d shadow-caster category) + kDrawPortal* role
         std::uint32_t clampMode;   // NiTexturingProperty::Map::clampMode, RAW (see kTexClamp*)
     };
 

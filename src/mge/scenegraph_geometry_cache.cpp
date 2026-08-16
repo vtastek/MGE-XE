@@ -164,6 +164,11 @@ namespace MGE::GeometryCache {
         // the per-frame "has your owner been hidden?" pass iterates this instead of the whole
         // cache. Same maintenance contract as the sets above. ⊆ keys(g_cache).
         std::unordered_set<uint32_t>                      g_visKeys;
+        // Keys whose entry carries a stencil PORTAL role (see CachedGeometry::stencilRole). Tinier
+        // than any set above — 141 stencil shapes exist across the whole 40k-NIF install, of which
+        // this rule keeps the ~50 that really drive the buffer — so the per-frame "which objects are
+        // portals?" pass iterates this instead of the cache. Same maintenance contract. ⊆ keys(g_cache).
+        std::unordered_set<uint32_t>                      g_portalRoleKeys;
         // Keys stamped enchantGlow LAST frame, so the next frame's pass can clear them before it
         // re-stamps. Unlike the sets above this is NOT membership derived from capture — it is a
         // per-frame undo list, rebuilt from scratch every frame from the engine's own affected-node
@@ -857,6 +862,17 @@ namespace MGE::GeometryCache {
             return false;
         }
 
+        // Is this NiZBufferProperty switching the depth TEST off? That — not the stencil — is the
+        // mechanism behind the "fake hole" portals: the hull overwrites the occluder's depth, so it
+        // must not be depth-tested against it. NIF 4.0.0.2 has no function field, only the flags
+        // word (bit 0 = test enable, bit 1 = write enable), which is why the flag is the primary
+        // reading and MW's synthesized testFunction is only accepted as a second opinion. Censused
+        // across the install: hulls carry flags=2 (test OFF, write ON), ordinary shapes 1 or 3.
+        bool zTestDisabled(const NI::ZBufferProperty* zp) {
+            return (zp->flags & 0x1u) == 0
+                || zp->testFunction == NI::ZBufferProperty::TestFunction::ALWAYS;
+        }
+
         void extractMaterial(CachedGeometry& e, NI::TriBasedGeometry* geom) {
             e.d3dTexture  = nullptr;
             e.d3dOverlay  = nullptr;
@@ -966,8 +982,27 @@ namespace MGE::GeometryCache {
             // (DRAW_CCW_OR_BOTH / DRAW_CCW / DRAW_CW) is single-sided → CULL_BACK in the
             // alpha pass. (DRAW_CW is reversed single-sided; rare — treated as CULL_BACK
             // for now, revisit if a shape reads inside-out.)
+            // STENCIL "FAKE HOLE" PORTAL role, classified by MECHANISM (see CachedGeometry::
+            // stencilRole). The property here is the ACCUMULATED one, which is the only reason this
+            // works: half the family hangs the stencil on an NiNode with the geometry underneath.
+            //
+            // A hull must ALSO have the depth test switched off, because that — not the stencil — is
+            // what erases the occluder. MW expresses it as an NiZBufferProperty whose test function
+            // is ALWAYS. Requiring it keeps the Morrowind-Enhanced meshes (which use TEST_EQUAL for
+            // an unrelated trick, depth-testing normally) out by construction.
+            e.stencilRole = 0;
             if (ps->stencil) {
-                e.twoSided = (ps->stencil->drawMode == NI::StencilProperty::DRAW_BOTH);
+                const auto* sp = ps->stencil;
+                e.twoSided = (sp->drawMode == NI::StencilProperty::DRAW_BOTH);
+                if (sp->enabled) {
+                    if (sp->testFunc == NI::StencilProperty::TEST_ALWAYS
+                        && sp->passAction == NI::StencilProperty::ACTION_REPLACE) {
+                        e.stencilRole = 1;      // MASK
+                    } else if (sp->testFunc == NI::StencilProperty::TEST_EQUAL
+                               && ps->zBuffer && zTestDisabled(ps->zBuffer)) {
+                        e.stencilRole = 2;      // HULL (stencil EQUAL + depth test OFF)
+                    }
+                }
             }
 
             if (ps->texture) {
@@ -2158,10 +2193,44 @@ namespace MGE::GeometryCache {
         // the residency numbers in the [postload-walk] receipt. Mirrors walk()'s own filters
         // (collision containers hold no render geometry) so the count means the same thing the
         // capture would have. Only ever called on a refused subtree, a handful per cell transition.
+        // Does this subtree hold anything that RENDERS? The NiCollisionSwitch question: the node type
+        // is used for both invisible collision proxies (which must stay pruned — they draw as white
+        // boxes) and for walk-through-but-visible geometry (which must not). Nothing about the node
+        // says which, so ask the geometry: a shape with a base texture, or one carrying an enabled
+        // stencil (a portal mask is deliberately textureless, or wears stencilerror.dds), is content.
+        //
+        // Reads the shape's OWN texturing property rather than the accumulated propertyState, which
+        // is the conservative direction here: propertyState is only valid after an engine update
+        // traversal, and this runs on subtrees the engine has app-culled and may not have updated.
+        // Only ever called on an NiCollisionSwitch under the deep walk — 323 NIFs in 40,095 have one
+        // at all — so the recursion is off every hot path.
+        bool holdsRenderGeometry(const NI::AVObject* av) {
+            if (!av) return false;
+            if (av->isInstanceOfType(NI::RTTIStaticPtr::NiTriBasedGeom)) {
+                for (const auto* n = &av->propertyNode; n && n->data; n = n->next) {
+                    const NI::Property* p = n->data;
+                    if (p->isInstanceOfType(NI::RTTIStaticPtr::NiTexturingProperty)) return true;
+                    if (p->isInstanceOfType(NI::RTTIStaticPtr::NiStencilProperty)
+                        && static_cast<const NI::StencilProperty*>(p)->enabled) return true;
+                }
+                return false;
+            }
+            if (!av->isInstanceOfType(NI::RTTIStaticPtr::NiNode)) return false;
+            const auto* node = static_cast<const NI::Node*>(av);
+            const auto count = node->children.getEndIndex();
+            for (size_t i = 0; i < count; ++i) {
+                if (holdsRenderGeometry(node->children.at(i).get())) return true;
+            }
+            return false;
+        }
+
         uint32_t countCapturableShapes(const NI::AVObject* av) {
             if (!av) return 0;
-            if (av->isInstanceOfType(NI::RTTIStaticPtr::RootCollisionNode)
-             || av->isInstanceOfType(NI::RTTIStaticPtr::NiCollisionSwitch)) return 0;
+            // Mirrors walk()'s prune EXACTLY, including the NiCollisionSwitch narrowing — the count
+            // is only meaningful as "what the capture would have taken", so the two must not drift.
+            if (av->isInstanceOfType(NI::RTTIStaticPtr::RootCollisionNode)) return 0;
+            if (av->isInstanceOfType(NI::RTTIStaticPtr::NiCollisionSwitch)
+                && !holdsRenderGeometry(av)) return 0;
             if (av->isInstanceOfType(NI::RTTIStaticPtr::NiTriBasedGeom)) return 1;
             if (!av->isInstanceOfType(NI::RTTIStaticPtr::NiNode)) return 0;
             const auto* node = static_cast<const NI::Node*>(av);
@@ -2336,6 +2405,24 @@ namespace MGE::GeometryCache {
             }
         }
 
+        // Capture-time PORTAL-OBJECT binding — the grouping key for the stencil "fake hole" portals
+        // (see CachedGeometry::portalOwner). Every shape of one PLACED object resolves to the same
+        // TES3 reference, so the reference pointer IS the object identity; nothing here has to climb
+        // or guess, and the answer is immune to how the artist nested the mesh — which matters,
+        // because the family nests every way there is (see the field comment).
+        //
+        // Null when the shape has no reference (sky, landscape, first-person arms). That is the
+        // fail-SAFE direction: a roled shape that cannot name its object simply never becomes a
+        // portal, and renders exactly as it does today. The alternative — falling back to the
+        // topmost ancestor — would resolve to the CELL ROOT and quietly enrol every shape in the
+        // cell as a portal member.
+        //
+        // Identity only. The pointer is never dereferenced, so unlike switchOwner/visOwner it needs
+        // no vtable guard; purgeAll clears it so a recycled address cannot join two objects.
+        void bindPortalOwner(CachedGeometry& e, NI::AVObject* geom) {
+            e.portalOwner = geom->getTes3Reference(/*searchParents=*/true);
+        }
+
         // Offscreen shadow-caster PRE-DISTANCE predicate — a byte-for-byte mirror of the filter in
         // renderprocess.cpp buildGeometryDrawLists' offscreen re-emit loop, MINUS the per-frame parts
         // (distance, visible-set, suppressedFrame, want-flags), which the consumer keeps. It reads only
@@ -2373,6 +2460,9 @@ namespace MGE::GeometryCache {
             else               g_switchKeys.erase(key);
             if (e.visOwner) g_visKeys.insert(key);
             else            g_visKeys.erase(key);
+            // Portal roles are re-derived by extractMaterial, so membership is refreshed with it.
+            if (e.stencilRole) g_portalRoleKeys.insert(key);
+            else               g_portalRoleKeys.erase(key);
         }
 
         void visitGeometry(NI::TriBasedGeometry* geom, bool inCharacter) {
@@ -2456,6 +2546,9 @@ namespace MGE::GeometryCache {
                 // NiVisController binding (animated hide/show). Sky is exempt for the same reason
                 // as the switch binding: the sky walk has its own visibility rules.
                 if (!g_walkingSky) bindVisOwner(e, geom);
+                // Portal-object identity (stencil "fake hole" grouping key). Sky is exempt for the
+                // same reason as the two bindings above, and carries no TES3 reference anyway.
+                if (!g_walkingSky) bindPortalOwner(e, geom);
                 e.mirrored = computeMirrored(e);                    // winding flip for depth/shadow
             } else {
                 auto& e = it->second;
@@ -2670,9 +2763,25 @@ namespace MGE::GeometryCache {
             // meshes that then draw as white boxes. These node types never hold render geometry, so
             // skip their whole subtree. Only under bypassCullDeep: a normal walk never reaches them
             // (app-cull stops it at the check above), so this adds no cost to the common path.
-            if (bypassCullDeep
-                && (av->isInstanceOfType(NI::RTTIStaticPtr::RootCollisionNode)
-                    || av->isInstanceOfType(NI::RTTIStaticPtr::NiCollisionSwitch))) {
+            //
+            // ⚠ THE TWO NODE TYPES ARE NOT THE SAME CLAIM. `RootCollisionNode` wraps the invisible
+            // collision hull and nothing else — pruning its subtree is exactly right. But
+            // `NiCollisionSwitch` exists to hold geometry that RENDERS AND DOES NOT COLLIDE, which
+            // is precisely what a quad you can walk over needs; comGravePit parks its portal
+            // `stencilMask` under one. Taking both wholesale was the ShadowBox fallacy again (a node
+            // TYPE, like a node NAME, is not a promise about what is inside it): the deep walk
+            // dropped the mask while an ordinary walk kept it, so the portal worked or not depending
+            // on WHICH WALK happened to register the mesh first.
+            //
+            // The original white-box evidence is real, though, so this narrows rather than reverts.
+            // Censused over the install: of 931 NiCollisionSwitch subtrees, 652 hold untextured
+            // geometry only (the white boxes) and 279 hold textured or stencil-roled render
+            // geometry. So descend only into the second kind — the collision proxies stay pruned.
+            if (bypassCullDeep && av->isInstanceOfType(NI::RTTIStaticPtr::RootCollisionNode)) {
+                return;
+            }
+            if (bypassCullDeep && av->isInstanceOfType(NI::RTTIStaticPtr::NiCollisionSwitch)
+                && !holdsRenderGeometry(av)) {
                 return;
             }
 
@@ -4627,6 +4736,7 @@ namespace MGE::GeometryCache {
                     g_fpKeys.erase(it->first);
                     g_switchKeys.erase(it->first);
                     g_visKeys.erase(it->first);
+                    g_portalRoleKeys.erase(it->first);
                     it = g_cache.erase(it);
                 } else {
                     // KEPT: collect near-eye plain-static shadow casters for the Forge feed's
@@ -4788,6 +4898,10 @@ namespace MGE::GeometryCache {
         return g_moverCandidates;
     }
 
+    const std::unordered_set<uint32_t>& portalRoleKeys() {
+        return g_portalRoleKeys;
+    }
+
     const std::vector<uint32_t>& nearStaticCasters() {
         return g_nearStaticCasters;
     }
@@ -4899,6 +5013,7 @@ namespace MGE::GeometryCache {
         g_fpKeys.clear();
         g_switchKeys.clear();        // switchOwner points at engine nodes this purge invalidates
         g_visKeys.clear();           // visOwner likewise
+        g_portalRoleKeys.clear();    // portalOwner is a TES3 reference this purge invalidates
         g_glowKeys.clear();          // undo list for entries this purge just dropped
         g_glowTint.clear();          // keyed on engine nodes this purge invalidates
         g_enchantGlowTex = nullptr;  // engine NiSourceTexture; refreshEnchantGlow re-reads it
@@ -4942,6 +5057,7 @@ namespace MGE::GeometryCache {
             g_fpKeys.erase(key);
             g_switchKeys.erase(key);
             g_visKeys.erase(key);
+            g_portalRoleKeys.erase(key);
             it = g_cache.end();
         }
 

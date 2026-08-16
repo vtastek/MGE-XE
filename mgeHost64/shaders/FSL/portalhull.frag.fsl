@@ -1,0 +1,61 @@
+// mgeHost64 — stencil "fake hole" PORTAL, step 2 of 2: the gated depth erase.
+//
+// See portalgate.frag.fsl for the mesh idiom this reproduces. That pass stamped gPortalGate = 1 at
+// every pixel where the opening is VISIBLE. This one is the HULL: it draws the volume behind the
+// opening with the depth TEST relaxed and the depth WRITE on, so it overwrites the occluder's depth
+// and stops it killing the pit interior — but ONLY where the gate says the opening is open. That
+// discard is MW's `stencil EQUAL ref`, one plane over.
+//
+// The PSO pairs this with CMP_LEQUAL, not the CMP_ALWAYS that MW's NiZBufferProperty literally
+// asks for, and the difference is deliberate. With reverse-Z, LEQUAL means "the farther fragment
+// wins", so among the hull's own overlapping faces the DEEPEST one takes the pixel — which is what
+// the trick needs, because the real interior has to beat the hull afterwards with an ordinary
+// GEQUAL test. MW gets the same effect from the stencil INVERT on its hull (first fragment wins,
+// every later one fails EQUAL); a plain ALWAYS would instead leave the LAST-drawn face there, and
+// with no author order available on this path that face could sit in front of the interior and
+// occlude the very thing the hole exists to show. LEQUAL still beats every occluder the hull cares
+// about: it is BELOW the surface it is erasing, so the occluder is always the nearer of the two.
+//
+// Depth-only pass (mRenderTargetCount = 0): void PS_MAIN + clip + RETURN(), The Forge's own
+// depth-pass pattern. Two compiled variants (portalhull_sc1 / _sc4) because the gate RT shares
+// pDepth's sample count and Tex2DMS needs that count as a literal — the same host-side
+// `sampleCount > 1 ? _sc4 : _sc1` pick that linearizedepth and hizfirst use.
+
+#include "opaque.srt.h"
+
+STRUCT(VSOutput)
+{
+    DATA(float4,      Position, SV_Position);
+    DATA(float3,      Normal,   NORMAL);
+    DATA(float2,      Uv,       TEXCOORD0);
+    DATA(FLAT(uint),  TexIndex, TEXCOORD1);
+    DATA(CENTROID(float), Fog,  TEXCOORD2);
+    DATA(float4,      Color,    COLOR);
+    DATA(float,       AlphaRef, TEXCOORD3);
+    DATA(FLAT(float3),MatDiffuse, TEXCOORD4);
+    DATA(FLAT(float3),MatAmbient, TEXCOORD5);
+    DATA(FLAT(float3),MatEmissive,TEXCOORD6);
+    DATA(FLAT(uint),  VColSource, TEXCOORD7);
+    DATA(float3,      WorldPos,   TEXCOORD8);
+    DATA(FLAT(uint),  OverlayIndex,TEXCOORD9);
+    DATA(FLAT(uint),  ClampMode,  TEXCOORD10);
+};
+
+ROOT_SIGNATURE(DefaultRootSignature)
+void PS_MAIN( VSOutput In )
+{
+    INIT_MAIN;
+    int2 coord = int2(In.Position.xy);
+    // Sample 0 only, per PIXEL. The gate is a coverage question about an OPENING, not a silhouette
+    // that needs sub-pixel accuracy — its edges are buried inside the pit rim / window frame — so
+    // resolving it per sample would buy nothing and cost a per-sample shader.
+#if PORTAL_GATE_SAMPLES > 1
+    float gate = LoadTex2DMS(gPortalGate, NO_SAMPLER, coord, 0).r;
+#else
+    float gate = LoadTex2D(gPortalGate, NO_SAMPLER, coord, 0).r;
+#endif
+    // Unbound / never-stamped reads 0 → discard everywhere → no erasure at all, which is exactly
+    // the pre-portal image. Every failure mode of this feature lands on that side.
+    clip(gate < 0.5f ? -1.0f : 1.0f);
+    RETURN();
+}

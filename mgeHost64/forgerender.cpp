@@ -1294,6 +1294,21 @@ namespace {
         Pipeline*      pOpaquePrepassPipelineNoAT = nullptr;        // FRONT_FACE_CCW
         Pipeline*      pOpaquePrepassPipelineNoATMirror = nullptr;  // FRONT_FACE_CW
 
+        // --- STENCIL "FAKE HOLE" PORTALS (comGravePit and family; IPC::kDrawPortalMask) ----------
+        // MW fakes an opening in a solid surface with a stencil MASK quad plus a depth-test-off
+        // HULL. pDepth has no stencil plane, so the mask's stamp lands in this 1-bit R8 target and
+        // the hull's frag discards on it. Both PSOs run at the TAIL of the Z-prepass, inline, after
+        // the indirect groups — the ordering the trick needs, and cmdExecuteIndirect cannot express
+        // it. Everything here is null when the gate RT failed to build; the draws then fall through
+        // to ordinary opaque state, which is the pre-portal image.
+        RenderTarget*  pPortalGate = nullptr;      // R8_UNORM, MSAA-matched to pDepth
+        Shader*        pPortalGateShader = nullptr;    // opaque.vert + portalgate.frag
+        Shader*        pPortalHullShader = nullptr;    // opaque.vert + portalhull_sc{1,4}.frag
+        Pipeline*      pPortalGatePipeline = nullptr;        // GEQUAL, depth write OFF, -> gate RT
+        Pipeline*      pPortalGatePipelineMirror = nullptr;
+        Pipeline*      pPortalHullPipeline = nullptr;        // LEQUAL + write, depth-only, gated
+        Pipeline*      pPortalHullPipelineMirror = nullptr;
+
         // --- Tier 2 depth-takeover: depth-as-SRV + GTAO compute (AO buffer in isolation) ---
         // First compute pipelines / UAVs / depth->SRV barrier in the host. Two passes:
         //   (1) linearize: resolve sample 0 of pDepth (MSAA-robust) into single-sample pLinearDepth.
@@ -5503,6 +5518,36 @@ namespace {
             return false;
         }
 
+        // STENCIL "FAKE HOLE" PORTAL gate — the 1-bit stand-in for the stencil plane pDepth does
+        // not have (see IPC::kDrawPortalMask and portalgate.frag.fsl). R8_UNORM, and MSAA-matched
+        // to pDepth because the gate pass binds the two together and D3D12 requires every attached
+        // RTV and the DSV to agree on sample count.
+        //
+        // NON-FATAL. If this fails, g_live.pPortalGate stays null, the portal PSOs are never built,
+        // and the portal draws fall back to ordinary opaque state — the pre-portal image, which is
+        // the same place every other failure mode of this feature lands.
+        {
+            RenderTargetDesc gDesc = {};
+            gDesc.mWidth = width;
+            gDesc.mHeight = height;
+            gDesc.mDepth = 1;
+            gDesc.mArraySize = 1;
+            gDesc.mMipLevels = 1;
+            gDesc.mSampleCount = (SampleCount)g_live.sampleCount;
+            gDesc.mFormat = TinyImageFormat_R8_UNORM;
+            // RESTS in RENDER_TARGET, which is where the portal block's closing barrier leaves it
+            // and what the next frame's LOAD_ACTION_CLEAR needs. Starting it in SHADER_RESOURCE
+            // instead would make frame ONE bind an RTV over a resource in the wrong state.
+            gDesc.mStartState = RESOURCE_STATE_RENDER_TARGET;
+            gDesc.mClearValue.r = 0.0f;   // cleared per frame by the gate pass's LOAD_ACTION_CLEAR
+            gDesc.mDescriptors = DESCRIPTOR_TYPE_TEXTURE;
+            gDesc.pName = "portalGate";
+            addRenderTarget(R, &gDesc, &g_live.pPortalGate);
+            if (!g_live.pPortalGate) {
+                std::printf("[forge] addRenderTarget(portalGate) FAILED — stencil portals OFF\n");
+            }
+        }
+
         // MSAA: internal multisampled color target. The scene renders here; it's resolved
         // into the shared single-sample pRT in renderScene. Only when sampleCount > 1 — at 1x
         // the scene renders straight into pRT exactly as before (pMSAAColor stays null).
@@ -6152,6 +6197,83 @@ namespace {
 
             // (First-person shadow reception no longer needs its own depth PSOs — it's a direct
             // cube-atlas test in the FP colour frag, not a screen-space arm-depth prepass.)
+
+            // --- STENCIL "FAKE HOLE" PORTAL PSOs (see the pPortalGate member comment) ------------
+            // Both reuse opaque.vert + the vertex layout above, so SV_Position is bit-identical to
+            // the prepass whose depth they test and to the colour pass that follows with CMP_EQUAL.
+            // Non-fatal throughout: any failure leaves the pipelines null and the portal draws fall
+            // back to ordinary opaque state.
+            if (g_live.pPortalGate) {
+                // (1) GATE. Colour -> the R8 gate, depth test GEQUAL, depth WRITE OFF. The depth
+                // test IS the gate: a mask fragment only reaches the shader where the opening is
+                // visible, which is precisely the condition MW's `stencil ALWAYS -> REPLACE` records.
+                // Write must stay off — see portalgate.frag.fsl.
+                ShaderLoadDesc pgDesc = {};
+                pgDesc.mVert.pFileName = "opaque.vert";
+                pgDesc.mFrag.pFileName = "portalgate.frag";
+                addShader(R, &pgDesc, &g_live.pPortalGateShader);
+
+                // (2) HULL. Depth-only (no colour target), LEQUAL + WRITE — see portalhull.frag.fsl
+                // for why LEQUAL and not the CMP_ALWAYS the NiZBufferProperty literally asks for.
+                // The frag variant follows pDepth's sample count, exactly as linearizedepth and
+                // hizfirst do (the gate RT is MSAA-matched, and Tex2DMS needs a literal count).
+                ShaderLoadDesc phDesc = {};
+                phDesc.mVert.pFileName = "opaque.vert";
+                phDesc.mFrag.pFileName = (g_live.sampleCount > 1) ? "portalhull_sc4.frag"
+                                                                  : "portalhull_sc1.frag";
+                addShader(R, &phDesc, &g_live.pPortalHullShader);
+
+                if (g_live.pPortalGateShader && g_live.pPortalHullShader) {
+                    DepthStateDesc gateDepth = {};
+                    gateDepth.mDepthTest = true;
+                    gateDepth.mDepthWrite = false;
+                    gateDepth.mDepthFunc = CMP_GEQUAL;
+
+                    TinyImageFormat gateFmt = g_live.pPortalGate->mFormat;
+                    PipelineDesc gpd = {};
+                    gpd.mType = PIPELINE_TYPE_GRAPHICS;
+                    GraphicsPipelineDesc& gg = gpd.mGraphicsDesc;
+                    gg.mPrimitiveTopo = PRIMITIVE_TOPO_TRI_LIST;
+                    gg.mRenderTargetCount = 1;
+                    gg.pColorFormats = &gateFmt;
+                    gg.mSampleCount = (SampleCount)g_live.sampleCount;
+                    gg.mSampleQuality = 0;
+                    gg.mDepthStencilFormat = TinyImageFormat_D32_SFLOAT;
+                    gg.pDepthState = &gateDepth;
+                    gg.pVertexLayout = &vl;
+                    gg.pRasterizerState = &rasterDesc;    // CCW (non-mirrored)
+                    gg.pShaderProgram = g_live.pPortalGateShader;
+                    addPipeline(R, &gpd, &g_live.pPortalGatePipeline);
+                    gg.pRasterizerState = &rasterMirror;  // CW (negative-determinant world)
+                    addPipeline(R, &gpd, &g_live.pPortalGatePipelineMirror);
+
+                    DepthStateDesc hullDepth = {};
+                    hullDepth.mDepthTest = true;
+                    hullDepth.mDepthWrite = true;
+                    hullDepth.mDepthFunc = CMP_LEQUAL;    // reverse-Z: the FARTHER fragment wins
+
+                    PipelineDesc hpd = {};
+                    hpd.mType = PIPELINE_TYPE_GRAPHICS;
+                    GraphicsPipelineDesc& hg = hpd.mGraphicsDesc;
+                    hg.mPrimitiveTopo = PRIMITIVE_TOPO_TRI_LIST;
+                    hg.mRenderTargetCount = 0;            // depth-only
+                    hg.pColorFormats = nullptr;
+                    hg.mSampleCount = (SampleCount)g_live.sampleCount;
+                    hg.mSampleQuality = 0;
+                    hg.mDepthStencilFormat = TinyImageFormat_D32_SFLOAT;
+                    hg.pDepthState = &hullDepth;
+                    hg.pVertexLayout = &vl;
+                    hg.pRasterizerState = &rasterDesc;
+                    hg.pShaderProgram = g_live.pPortalHullShader;
+                    addPipeline(R, &hpd, &g_live.pPortalHullPipeline);
+                    hg.pRasterizerState = &rasterMirror;
+                    addPipeline(R, &hpd, &g_live.pPortalHullPipelineMirror);
+                }
+                if (!g_live.pPortalGatePipeline || !g_live.pPortalGatePipelineMirror
+                    || !g_live.pPortalHullPipeline || !g_live.pPortalHullPipelineMirror) {
+                    std::printf("[forge] addPipeline(portal) FAILED — stencil portals OFF\n");
+                }
+            }
         }
 
         // --- P1 shadow-face PSOs: opaque.vert + depthonly.frag (alpha-tested casting free)
@@ -6542,6 +6664,16 @@ namespace {
                 p[np].mIndex = SRT_RES_IDX(SrtData, PerFrame, gSunOcc);
                 p[np].mCount = 1;
                 p[np].ppTextures = &g_live.pSunOcc;
+                ++np;
+            }
+            // Stencil-portal gate. Read by portalhull.frag ONLY, and bound ONLY here — the portal
+            // pass runs inside the Z-prepass, which binds this set. Unbound reads ZERO, and zero
+            // means "discard everything", i.e. no depth erasure at all: the failure direction is the
+            // pre-portal image (same no-fallback arrangement as gRippleField / gWakeField).
+            if (g_live.pPortalGate) {
+                p[np].mIndex = SRT_RES_IDX(SrtData, PerFrame, gPortalGate);
+                p[np].mCount = 1;
+                p[np].ppTextures = &g_live.pPortalGate->pTexture;
                 ++np;
             }
             updateDescriptorSet(R, 0, g_live.pPerFrameSet, np, p);
@@ -16038,6 +16170,11 @@ namespace ForgeRender {
         // and the emissiveHot flips it causes land in the same frame's dirty set.
         invalidateShadowsOnEmissiveKnobChange();
         for (uint32_t i = 0; i < count; ++i) {
+            // Stencil-portal HELPERS never cast. The mask is an invisible quad over the opening and
+            // the hull is a volume that exists only to erase depth — neither is a real surface, and
+            // casting the hull would drop a shadow of the pit's own walls into the pit. Portal
+            // MEMBERS (the interior, the mound) are ordinary geometry and cast normally.
+            if (items[i].casterFlags & (IPC::kDrawPortalMask | IPC::kDrawPortalHull)) continue;
             const float* em = items[i].matEmissive;
             const float emMax = em[0] > em[1] ? (em[0] > em[2] ? em[0] : em[2])
                                               : (em[1] > em[2] ? em[1] : em[2]);
@@ -17889,8 +18026,20 @@ namespace ForgeRender {
         struct ArenaTmp { uint32_t indexCount, firstIndex, firstVertex, local; uint8_t mirror, at, batch; };
         static std::vector<ArenaTmp> s_arena;     // reused across frames (render is single-threaded)
         static std::vector<uint32_t> s_dynamic;   // draw indices i of dynamic-morph parts
+        // STENCIL "FAKE HOLE" PORTALS: draw indices of every member of a portal object, kept in
+        // LIST order — which the client already sorted into masks -> hulls -> rest per object. They
+        // leave the indirect groups entirely and draw inline after them, exactly like s_dynamic.
+        // Two reasons, and both are requirements rather than conveniences:
+        //   * cmdExecuteIndirect cannot express draw ORDER, and this trick is nothing but order —
+        //     the mask must stamp the gate before the hull tests it, and the hull must erase the
+        //     depth before the real interior draws over it.
+        //   * inline draws sit outside the two-phase Hi-Z occlusion test, which would otherwise cull
+        //     the hull and the pit interior every frame: they live BEHIND the very surface the
+        //     portal exists to open, so as far as the occlusion test is concerned they are hidden.
+        static std::vector<uint32_t> s_portal;
         s_arena.clear();
         s_dynamic.clear();
+        s_portal.clear();
         if (s_arena.capacity() < count) s_arena.reserve(count);
         uint64_t nearIndexSum = 0;                // heartbeat: submitted index weight (per pass)
         uint32_t nearATDraws = 0;                 // heartbeat: cutout draws (alpha-tested prepass)
@@ -17901,6 +18050,13 @@ namespace ForgeRender {
             }
             const HostMesh& m = g_meshes[slot];
             nearIndexSum += m.indexCount;
+            // Portal members bypass BOTH the arena groups and the dynamic list (see s_portal).
+            // Gated on the PSOs existing: with no gate RT there is nothing to confine the hull's
+            // erasure, so the whole object stays on the ordinary path and renders as it does today.
+            if ((items[i].casterFlags & IPC::kDrawPortalAny) && g_live.pPortalHullPipeline) {
+                s_portal.push_back(i);
+                continue;
+            }
             if (m.inArena) {
                 ArenaTmp t;
                 t.indexCount  = m.indexCount;
@@ -17918,7 +18074,7 @@ namespace ForgeRender {
                 s_dynamic.push_back(i);   // own VB/IB → inline draw below
             }
         }
-        const uint32_t drawn = (uint32_t)(s_arena.size() + s_dynamic.size());
+        const uint32_t drawn = (uint32_t)(s_arena.size() + s_dynamic.size() + s_portal.size());
         g_lastNearTris    = (uint32_t)(nearIndexSum / 3u);
         g_lastNearATDraws = nearATDraws;
 
@@ -18226,6 +18382,127 @@ namespace ForgeRender {
             // record phase, so there is no second cull and no extra CPU work: this is the SAME
             // g_terrainMain the colour pass draws, one pipeline swap apart.
             terrainRecordDepth(g_live.pCmd);
+
+            // --- STENCIL "FAKE HOLE" PORTALS, prepass half (see s_portal) ------------------------
+            // Three sub-passes over the SAME list, filtered by role, so the object's own draw order
+            // is reconstructed from the role bits rather than from an author index we do not have:
+            //
+            //   gate  masks   -> the R8 gate, depth GEQUAL + write OFF. The depth test decides which
+            //                    pixels get stamped, and that IS MW's stencil gate.
+            //   hull  hulls   -> depth LEQUAL + write, discarding where the gate is 0. This is the
+            //                    erasure: the occluder's depth is replaced by the hull's, but only
+            //                    inside the opening, so a wall in front of it survives untouched.
+            //   rest  members -> the ordinary prepass PSO. The real interior draws over the hull on
+            //                    a plain GEQUAL test, because the hull put the depth out of its way.
+            //
+            // The gate sub-pass is the only thing in the whole prepass that binds a colour target,
+            // so it ends the depth-only pass and rebinds afterwards.
+            if (!s_portal.empty() && g_live.pPortalGatePipeline && g_live.pPortalHullPipeline) {
+                cmdBeginDebugMarker(g_live.pCmd, 0.3f, 0.8f, 0.9f, "PORTALS (prepass)");
+                // One inline draw, arena or own-VB. Portal objects are pulled out of the indirect
+                // groups wholesale, so both kinds land here; the arena case just carries its
+                // first-index / first-vertex offsets into the shared buffers.
+                auto portalDraw = [&](uint32_t i) {
+                    const uint32_t slot  = items[i].slot;
+                    const uint32_t batch = i / kBatchSize;
+                    const uint32_t local = i % kBatchSize;
+                    HostMesh& m = g_meshes[slot];
+                    cmdBindDescriptorSet(g_live.pCmd, batch, g_live.pPerBatchSet);
+                    Buffer*  vbs[2]     = { m.inArena ? g_live.pArenaVB : m.vb,
+                                            g_live.pInstanceBuf[batch] };
+                    uint32_t strides[2] = { vStride, iStride };
+                    cmdBindVertexBuffer(g_live.pCmd, 2, vbs, strides, nullptr);
+                    cmdBindIndexBuffer(g_live.pCmd, m.inArena ? g_live.pArenaIB : m.ib,
+                                       INDEX_TYPE_UINT16, 0);
+                    const uint32_t firstIndex  = m.inArena ? (uint32_t)(m.ibOff / sizeof(uint16_t)) : 0u;
+                    const uint32_t firstVertex = m.inArena
+                        ? (uint32_t)(m.vbOff / sizeof(IPC::GeomVertexWire)) : 0u;
+                    cmdDrawIndexedInstanced(g_live.pCmd, m.indexCount, firstIndex, 1,
+                                            firstVertex, local);
+                };
+                // (1) GATE. Colour target = the gate, cleared here; depth stays pDepth so the mask
+                // can test against the scene it has to see past.
+                {
+                    BindRenderTargetsDesc gbind = {};
+                    gbind.mRenderTargetCount = 1;
+                    gbind.mRenderTargets[0] = { g_live.pPortalGate, LOAD_ACTION_CLEAR };
+                    gbind.mDepthStencil = { g_live.pDepth, LOAD_ACTION_LOAD };
+                    cmdBindRenderTargets(g_live.pCmd, &gbind);
+                    cmdSetViewport(g_live.pCmd, 0.0f, 0.0f, (float)g_live.width,
+                                   (float)g_live.height, 0.0f, 1.0f);
+                    cmdSetScissor(g_live.pCmd, 0, 0, g_live.width, g_live.height);
+                    Pipeline* gateBound = nullptr;
+                    for (uint32_t i : s_portal) {
+                        if (!(items[i].casterFlags & IPC::kDrawPortalMask)) continue;
+                        const uint32_t slot = items[i].slot;
+                        if (slot >= g_meshHigh || !g_meshes[slot].valid) continue;
+                        Pipeline* want = worldMirrored(items[i].world)
+                            ? g_live.pPortalGatePipelineMirror : g_live.pPortalGatePipeline;
+                        if (want != gateBound) {
+                            cmdBindPipeline(g_live.pCmd, want);
+                            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSet);
+                            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
+                            gateBound = want;
+                        }
+                        portalDraw(i);
+                    }
+                }
+                // Gate RT -> SRV so the hull frag can read what was just stamped.
+                {
+                    cmdBindRenderTargets(g_live.pCmd, nullptr);   // end the colour pass first
+                    RenderTargetBarrier gb = {};
+                    gb.pRenderTarget = g_live.pPortalGate;
+                    gb.mCurrentState = RESOURCE_STATE_RENDER_TARGET;
+                    gb.mNewState = RESOURCE_STATE_SHADER_RESOURCE;
+                    cmdResourceBarrier(g_live.pCmd, 0, nullptr, 0, nullptr, 1, &gb);
+                }
+                // (2)+(3) HULLS then MEMBERS, back on the depth-only target.
+                {
+                    BindRenderTargetsDesc pbind2 = {};
+                    pbind2.mRenderTargetCount = 0;
+                    pbind2.mDepthStencil = { g_live.pDepth, LOAD_ACTION_LOAD };
+                    cmdBindRenderTargets(g_live.pCmd, &pbind2);
+                    cmdSetViewport(g_live.pCmd, 0.0f, 0.0f, (float)g_live.width,
+                                   (float)g_live.height, 0.0f, 1.0f);
+                    cmdSetScissor(g_live.pCmd, 0, 0, g_live.width, g_live.height);
+                    Pipeline* bound = nullptr;
+                    for (uint32_t pass = 0; pass < 2; ++pass) {
+                        const uint32_t wantBit = (pass == 0) ? IPC::kDrawPortalHull
+                                                             : IPC::kDrawPortalMember;
+                        for (uint32_t i : s_portal) {
+                            if (!(items[i].casterFlags & wantBit)) continue;
+                            const uint32_t slot = items[i].slot;
+                            if (slot >= g_meshHigh || !g_meshes[slot].valid) continue;
+                            const int mirror = worldMirrored(items[i].world) ? 1 : 0;
+                            const int at     = (items[i].alphaRef > 0.0f) ? 1 : 0;
+                            Pipeline* want;
+                            if (pass == 0) {
+                                want = mirror ? g_live.pPortalHullPipelineMirror
+                                              : g_live.pPortalHullPipeline;
+                            } else {
+                                want = prePSO[mirror][at];
+                            }
+                            if (want != bound) {
+                                cmdBindPipeline(g_live.pCmd, want);
+                                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSet);
+                                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
+                                bound = want;
+                            }
+                            portalDraw(i);
+                        }
+                    }
+                    preBound = nullptr;   // the shared prepass PSO tracker no longer knows what is bound
+                }
+                // Back to RENDER_TARGET for next frame's clear+stamp.
+                {
+                    RenderTargetBarrier gb = {};
+                    gb.pRenderTarget = g_live.pPortalGate;
+                    gb.mCurrentState = RESOURCE_STATE_SHADER_RESOURCE;
+                    gb.mNewState = RESOURCE_STATE_RENDER_TARGET;
+                    cmdResourceBarrier(g_live.pCmd, 0, nullptr, 0, nullptr, 1, &gb);
+                }
+                cmdEndDebugMarker(g_live.pCmd);
+            }
         }
 
         gpuPhaseEnd(kGpuPhasePrepass);
@@ -19781,6 +20058,44 @@ namespace ForgeRender {
             cmdBindVertexBuffer(g_live.pCmd, 2, vbs, strides, nullptr);
             cmdBindIndexBuffer(g_live.pCmd, m.ib, INDEX_TYPE_UINT16, 0);
             cmdDrawIndexedInstanced(g_live.pCmd, m.indexCount, 0, 1, 0, local);
+        }
+
+        // --- STENCIL "FAKE HOLE" PORTALS, colour half (see s_portal) --------------------------
+        // Ordinary CMP_EQUAL colour draws — nothing about the trick lives here, because the hole
+        // was already resolved in the prepass and this pass can only match the depth that came out
+        // of it. Order is therefore irrelevant; only membership is, and these parts are here rather
+        // than in the indirect groups because they were removed from them there.
+        //
+        // MASKS DO NOT DRAW. They are authored invisible — comGravePit's carries an editor blue,
+        // dwrvgratepipe's wears stencilerror.dds — and the mask never wrote depth anyway, so a
+        // colour draw would fail EQUAL and vanish. Skipping it makes the intent explicit instead of
+        // leaning on that. The HULL does draw, matching MW: if its editor pink ever appears, that is
+        // a bug MW would show too, which is a far better failure than a hole to the sky.
+        for (uint32_t i : s_portal) {
+            if (items[i].casterFlags & IPC::kDrawPortalMask) continue;
+            const uint32_t slot  = items[i].slot;
+            if (slot >= g_meshHigh || !g_meshes[slot].valid) continue;
+            const uint32_t batch = i / kBatchSize;
+            const uint32_t local = i % kBatchSize;
+            const int mirror = worldMirrored(items[i].world) ? 1 : 0;
+            if (mirror != boundMirror) {
+                cmdBindPipeline(g_live.pCmd, mirror ? g_live.pOpaquePipelineMirror
+                                                    : g_live.pOpaquePipeline);
+                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSet);
+                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerLightsSet);
+                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
+                boundMirror = mirror;
+            }
+            cmdBindDescriptorSet(g_live.pCmd, batch, g_live.pPerBatchSet);
+            HostMesh& m = g_meshes[slot];
+            Buffer*  vbs[2]     = { m.inArena ? g_live.pArenaVB : m.vb, g_live.pInstanceBuf[batch] };
+            uint32_t strides[2] = { vStride, iStride };
+            cmdBindVertexBuffer(g_live.pCmd, 2, vbs, strides, nullptr);
+            cmdBindIndexBuffer(g_live.pCmd, m.inArena ? g_live.pArenaIB : m.ib, INDEX_TYPE_UINT16, 0);
+            const uint32_t firstIndex  = m.inArena ? (uint32_t)(m.ibOff / sizeof(uint16_t)) : 0u;
+            const uint32_t firstVertex = m.inArena
+                ? (uint32_t)(m.vbOff / sizeof(IPC::GeomVertexWire)) : 0u;
+            cmdDrawIndexedInstanced(g_live.pCmd, m.indexCount, firstIndex, 1, firstVertex, local);
         }
 
         gpuPhaseEnd(kGpuPhaseColorNear);
@@ -23861,6 +24176,16 @@ namespace ForgeRender {
 
     Shader*   g_pTerrainShader     = nullptr;
     Pipeline* g_pTerrainPipeline   = nullptr;
+    // CMP_EQUAL twin of the main colour PSO, used whenever the terrain Z-prepass actually ran this
+    // frame (see terrainPrepassRan). Behaviourally identical to the GEQUAL original in every case
+    // that existed before stencil portals — the prepass wrote terrain's OWN depth, so terrain's
+    // colour fragments are either equal to it or behind it, and GEQUAL/EQUAL agree on both. They
+    // differ in exactly one situation: when something DELIBERATELY erased the stored depth and put
+    // a FARTHER value there. That is the portal hull, and under GEQUAL terrain sailed through it,
+    // re-wrote its own depth and repainted the ground over the hole — depth had the hole, colour
+    // did not. EQUAL makes the erase stick, and matches the contract the opaque colour pass has had
+    // all along (forgerender.cpp: "CMP_EQUAL + depthWrite OFF = true early-Z").
+    Pipeline* g_pTerrainPipelineEQ = nullptr;
     Pipeline* g_pTerrainPipelineMirror = nullptr;   // reflect-geo: CULL_NONE (open sheet, see creation)
     Pipeline* g_pTerrainPipelineWire = nullptr;
     Shader*   g_pTerrainDepthShader   = nullptr;    // terrain.vert ALONE (PS-less) — the Z-prepass entry
@@ -24033,6 +24358,24 @@ namespace ForgeRender {
         g.pShaderProgram      = g_pTerrainShader;
         addPipeline(R, &pd, &g_pTerrainPipeline);
         if (!g_pTerrainPipeline) { std::printf("[forge][terrain] addPipeline FAILED\n"); return false; }
+
+        // ...and its CMP_EQUAL twin (see g_pTerrainPipelineEQ). Depth WRITE off as well: the prepass
+        // already wrote this exact value, so re-writing it is pure traffic. Kept as a SECOND pipeline
+        // rather than flipping the original, because the prepass does not always run — it is skipped
+        // outright in wireframe mode and its PSO is allowed to fail non-fatally — and terrain drawn
+        // with EQUAL against a depth buffer nothing filled would draw NOTHING AT ALL. terrainRecord
+        // picks between them per frame.
+        DepthStateDesc dsEq = ds;
+        dsEq.mDepthFunc = CMP_EQUAL;
+        dsEq.mDepthWrite = false;
+        g.pDepthState = &dsEq;
+        addPipeline(R, &pd, &g_pTerrainPipelineEQ);
+        g.pDepthState = &ds;   // restore for the mirror/wire variants below
+        if (!g_pTerrainPipelineEQ) {
+            // Non-fatal: terrainRecord falls back to the GEQUAL pipeline, i.e. exactly the
+            // pre-portal behaviour (hole in depth, no hole in colour).
+            std::printf("[forge][terrain] addPipeline(EQ) FAILED — portals will not cut terrain\n");
+        }
 
         // Mirror twin for the reflect-geo pass. CULL_MODE_NONE, deliberately, and NOT the CW winding
         // flip statics uses: statics are closed solids, so the mirror always shows their outward
@@ -24859,13 +25202,25 @@ namespace ForgeRender {
     //   psoOverride   — the depth-only (Z-prepass) and moments (sun caster) pipelines. It also
     //     deliberately short-circuits the wireframe toggle: a wireframe SHADOW is not an A/B anyone
     //     wants, it is a hole in the shadow map.
+    // Did the terrain Z-prepass run this frame? The two early-returns in terrainRecordDepth below,
+    // hoisted so the colour draw can ask the same question: only when depth was actually prefilled
+    // is it safe for the colour pass to test CMP_EQUAL against it.
+    bool terrainPrepassRan() {
+        return g_pTerrainDepthPipeline != nullptr && !g_terrainWire;
+    }
+
     void terrainRecord(Cmd* cmd, TerrainView& V, DescriptorSet* frameSet, bool mirror,
                        uint32_t frameSetIndex = 0, Pipeline* psoOverride = nullptr) {
         if (!g_terrainReady || !g_drawTerrain || !V.cells) { return; }
+        // MAIN colour draw only: prefer the EQUAL twin so a stencil portal's depth erase survives
+        // into colour (see g_pTerrainPipelineEQ). The mirror (reflect-geo) and override (Z-prepass,
+        // sun cascade) paths are untouched — neither has a prepass of its own to match against.
+        Pipeline* const mainPso = (g_pTerrainPipelineEQ && terrainPrepassRan())
+                                ? g_pTerrainPipelineEQ : g_pTerrainPipeline;
         Pipeline* pso = psoOverride                                 ? psoOverride
                       : (g_terrainWire && g_pTerrainPipelineWire)   ? g_pTerrainPipelineWire
                       : mirror                                      ? g_pTerrainPipelineMirror
-                                                                    : g_pTerrainPipeline;
+                                                                    : mainPso;
         cmdBindPipeline(cmd, pso);
         cmdBindDescriptorSet(cmd, frameSetIndex, frameSet);
         cmdBindDescriptorSet(cmd, 0, g_live.pPerLightsSetDist ? g_live.pPerLightsSetDist
@@ -30785,6 +31140,7 @@ namespace ForgeRender {
         if (g_pSunShadowTerrainShader)   { removeShader(R, g_pSunShadowTerrainShader);     g_pSunShadowTerrainShader = nullptr; }
         if (g_pTerrainDepthPipeline) { removePipeline(R, g_pTerrainDepthPipeline); g_pTerrainDepthPipeline = nullptr; }
         if (g_pTerrainDepthShader)   { removeShader(R, g_pTerrainDepthShader);     g_pTerrainDepthShader = nullptr; }
+        if (g_pTerrainPipelineEQ)   { removePipeline(R, g_pTerrainPipelineEQ);   g_pTerrainPipelineEQ = nullptr; }
         if (g_pTerrainPipeline)     { removePipeline(R, g_pTerrainPipeline);     g_pTerrainPipeline = nullptr; }
         if (g_pTerrainShader)       { removeShader(R, g_pTerrainShader);         g_pTerrainShader = nullptr; }
         if (g_pTerrainVB)           { removeResource(g_pTerrainVB);              g_pTerrainVB = nullptr; }

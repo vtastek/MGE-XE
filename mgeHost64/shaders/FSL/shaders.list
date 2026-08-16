@@ -38,6 +38,26 @@
 #include "depthonly.frag.fsl"
 #end
 
+// STENCIL "FAKE HOLE" PORTALS (comGravePit and its family). Two stages, both on opaque.vert:
+//   portalgate  stamps a 1-bit R8 gate where a portal MASK quad passes its own depth test
+//   portalhull  erases the occluder's depth, discarding wherever that gate is 0
+// The hull comes in two SAMPLE_COUNT variants because the gate render target shares pDepth's
+// sample count (they are bound together) and Tex2DMS needs the count as a literal — the same
+// _sc1/_sc4 split, and the same host-side pick, that linearizedepth and hizfirst use.
+#frag portalgate.frag
+#include "portalgate.frag.fsl"
+#end
+
+#frag portalhull_sc1.frag
+#define PORTAL_GATE_SAMPLES 1
+#include "portalhull.frag.fsl"
+#end
+
+#frag portalhull_sc4.frag
+#define PORTAL_GATE_SAMPLES 4
+#include "portalhull.frag.fsl"
+#end
+
 // Point-light shadow-caster frag: depthonly.frag + a per-texel EMISSIVE carve (drop glowing
 // texels, keep dark lettering/imperfections). SEPARATE from depthonly.frag so the main Z-prepass
 // keeps CMP_EQUAL parity. Used only by the pShadowPipeline* atlas caster PSOs. Reads opaque.vert's

@@ -1,0 +1,59 @@
+// mgeHost64 — stencil "fake hole" PORTAL, step 1 of 2: stamp the gate.
+//
+// A handful of MW meshes fake an opening in a solid surface with the stencil buffer (comGravePit's
+// grave, dwrvgratepipe's floor grate, imp_gall_port_in's porthole — 44 shapes across 28 files;
+// tools/nif-stencil-census.py). The idiom is two draws:
+//
+//   MASK  a flat quad over the opening, stencil ALWAYS -> REPLACE ref, ORDINARY depth state
+//   HULL  a volume behind it, stencil EQUAL ref, depth TEST OFF (NiZBufferProperty) + write ON
+//
+// The hull's depth-test-off write is what erases the occluder — the LAND heightfield over a grave
+// pit, the wall around a porthole — so the geometry behind it stops being depth-killed. The stencil
+// is what stops that erasure ALSO eating a wall standing between the camera and the opening: the
+// mask only stamps where the mask quad itself is VISIBLE, so an occluded opening stamps nothing.
+//
+// pDepth is D32_SFLOAT with no stencil plane, so the stamp lands in a 1-bit R8 render target
+// instead. THIS pass is the mask: colour write ON (to the gate), depth test GEQUAL, depth write
+// OFF. Nothing here decides visibility — the depth TEST does, and that test is the exact gate the
+// stencil was providing. A fragment that survives to run this shader is, by definition, one where
+// the opening is visible.
+//
+// Why the depth write must stay OFF: the mask must leave the buffer exactly as it found it. If it
+// wrote, it would (a) clobber the occluder's depth at pixels the hull then fails to cover, leaving
+// a hole to the sky, and (b) put its own editor-coloured surface into the depth the colour pass
+// tests CMP_EQUAL against. The mask is authored invisible — comGravePit's is blue, dwrvgratepipe's
+// wears stencilerror.dds — and it never draws colour anywhere but here.
+//
+// Shares opaque.vert (and therefore its VSOutput) with every other near path, so SV_Position is
+// bit-identical to the prepass that filled the depth being tested. See
+// [[project_forge_shared_frag_vsoutput]] for why the whole struct is declared and only part read.
+
+#include "opaque.srt.h"
+
+STRUCT(VSOutput)
+{
+    DATA(float4,      Position, SV_Position);
+    DATA(float3,      Normal,   NORMAL);
+    DATA(float2,      Uv,       TEXCOORD0);
+    DATA(FLAT(uint),  TexIndex, TEXCOORD1);
+    DATA(CENTROID(float), Fog,  TEXCOORD2);
+    DATA(float4,      Color,    COLOR);
+    DATA(float,       AlphaRef, TEXCOORD3);
+    DATA(FLAT(float3),MatDiffuse, TEXCOORD4);
+    DATA(FLAT(float3),MatAmbient, TEXCOORD5);
+    DATA(FLAT(float3),MatEmissive,TEXCOORD6);
+    DATA(FLAT(uint),  VColSource, TEXCOORD7);
+    DATA(float3,      WorldPos,   TEXCOORD8);
+    DATA(FLAT(uint),  OverlayIndex,TEXCOORD9);
+    DATA(FLAT(uint),  ClampMode,  TEXCOORD10);
+};
+
+ROOT_SIGNATURE(DefaultRootSignature)
+float4 PS_MAIN( VSOutput In )
+{
+    INIT_MAIN;
+    // No alpha test on purpose. These masks are solid quads covering the opening; MW stamps the
+    // stencil for every fragment that passes depth, with no reference to texture alpha, and a mask
+    // that stamped less than the hull covers would leave the hull's erasure partly ungated.
+    RETURN(float4(1.0f, 0.0f, 0.0f, 0.0f));
+}

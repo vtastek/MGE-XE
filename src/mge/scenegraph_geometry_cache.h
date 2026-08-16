@@ -248,6 +248,41 @@ namespace MGE::GeometryCache {
         // honour this so a solid alpha mesh (draped altar cloth) doesn't show its back/
         // interior faces through the front. Default false = single-sided (CULL_BACK).
         bool  twoSided;
+        // STENCIL "FAKE HOLE" PORTAL role — 0 none, 1 MASK, 2 HULL. See IPC::kDrawPortalMask.
+        //
+        // Classified BY MECHANISM, never by node name (a node NAME is not a promise — the ShadowBox
+        // prune ate candle bodies on exactly that reasoning). The two roles are:
+        //   MASK  stencil enabled, testFunc ALWAYS, passAction REPLACE — "stamp the opening here,
+        //         but only where this quad is actually VISIBLE". Its own depth test IS the gate.
+        //   HULL  stencil enabled, testFunc EQUAL, AND an inherited NiZBufferProperty with the depth
+        //         test OFF — "overwrite the occluder's depth, but only inside the stamp".
+        //
+        // The Z-test-off requirement is what keeps this narrow. TEST_EQUAL alone also matches the
+        // Morrowind-Enhanced effect meshes (@_NIF/*, OJ/ME/stencils/*), which use the stencil for a
+        // different trick entirely and depth-test normally; classifying those as hulls would hand
+        // them a depth-ERASING draw they never asked for. Erasing depth is the whole mechanism, so
+        // requiring the property that erases it is the honest test.
+        //
+        // Read from the ACCUMULATED propertyState, which is what makes it work at all: half the
+        // family hangs the stencil (and the NiZBufferProperty) on an NiNode — dwrvgratepipe's
+        // `StencilObject`, imp_gall_port_in's — with the real geometry as its children.
+        uint8_t stencilRole;
+        // The placed OBJECT this shape belongs to: the nearest ancestor owning a TES3 reference
+        // (falling back to the topmost reachable ancestor). This is the grouping key that says
+        // "these draws are one portal" — a portal's helpers and its content must leave the GPU-driven
+        // indirect groups together and draw inline in role order.
+        //
+        // It has to be the OBJECT root, not the parent. The family nests every way there is:
+        // comGravePit parks its mask under an NiCollisionSwitch one level BELOW its hull's parent;
+        // dwrvgratepipe puts the mask at the root and the hull's geometry under `StencilObject`;
+        // imp_gall_port_in scatters hull-roled shapes across a NiSwitchNode's OFF / INT-DAY
+        // branches. A parent key splits every one of those into pieces, and a portal split in half
+        // is a mask with no hull — the one composition that must never reach the host.
+        //
+        // Raw engine node used ONLY as an identity key — never dereferenced, so it needs no vtable
+        // guard (unlike switchOwner/visOwner, which are read). Cleared by purgeAll all the same, so
+        // a recycled address cannot silently group two unrelated objects across a cell change.
+        const void* portalOwner = nullptr;
         // Material colours (RGBA) captured from the NI MaterialProperty on the
         // create/material-change path, for the cache-driven color pass
         // (Phase 0.5). Default to white diffuse/ambient, zero emissive when the
@@ -476,6 +511,14 @@ namespace MGE::GeometryCache {
     // Invariant: both sets ⊆ keys(cache()).
     const std::unordered_set<uint32_t>& skyKeys();
     const std::unordered_set<uint32_t>& fpKeys();
+
+    // Keys carrying a stencil "fake hole" PORTAL role (CachedGeometry::stencilRole). Same
+    // incremental-maintenance pattern as the sets above, and by far the smallest of them: the whole
+    // 40k-NIF install holds ~50 shapes that really drive the stencil buffer. The Forge feed reads it
+    // once per draw-list build to work out which PLACED OBJECTS are portals (an object needs BOTH a
+    // mask and a hull to qualify) before it can tell a portal MEMBER from an ordinary static.
+    // Invariant: ⊆ keys(cache()).
+    const std::unordered_set<uint32_t>& portalRoleKeys();
 
     // Near-eye PLAIN-STATIC shadow-caster keys, rebuilt each eviction sweep (30-frame cadence).
     // Movers re-emit offscreen via moverCandidates(); a plain static (lantern, wall fixture) is

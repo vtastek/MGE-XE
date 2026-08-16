@@ -2299,7 +2299,8 @@ namespace {
     // FP1a: `dst` defaults to the main-pass scratch; buildFPDrawLists redirects the
     // identical packing into the FP scratch (same wire format, different host pass).
     void emitStaticDraw(SlotInfo& si, const MGE::GeometryCache::CachedGeometry& e,
-                        std::uint32_t& count, std::vector<std::uint8_t>& dst = g_drawScratch) {
+                        std::uint32_t& count, std::vector<std::uint8_t>& dst = g_drawScratch,
+                        std::uint32_t portalFlags = 0) {
             IPC::DrawItemWire item;
             item.slot = si.slot;
             diagWorldDet("STATIC", e.textureName, e.worldTransformD3D);
@@ -2328,8 +2329,11 @@ namespace {
             item.vColSource = (e.hasVertexColor && e.vColSource != 0) ? e.vColSource : 0u;
             // C4d shadow-caster category: LIVE (NPC/creature parts + held equipment,
             // activators, doors) → the host's dynamic shadow tile, not the cached statics.
+            // …plus the stencil-portal role (IPC::kDrawPortalMask): 0 for every ordinary draw, so
+            // the host's classify sees no change until a portal is actually on screen.
             item.casterFlags = (e.isLive ? IPC::kDrawCasterLive : 0u)
-                             | (e.animated ? IPC::kDrawCasterAnimated : 0u);
+                             | (e.animated ? IPC::kDrawCasterAnimated : 0u)
+                             | portalFlags;
             memcpy(item.world, e.worldTransformD3D, 16 * sizeof(float));
             // CAMERA-RELATIVE rendering: subtract the camera world position from the world
             // translation so vertices reach the shader near the origin. At MW's exterior
@@ -2725,6 +2729,46 @@ namespace {
         // stale-true. Every other suppression keys on this same predicate for the same reason.
         const bool dropMWLand = g_hostOwnsTerrain && RenderProcess::forgeOwnsFrame();
 
+        // STENCIL "FAKE HOLE" PORTALS. Which PLACED OBJECTS are portals? An object qualifies only if
+        // it owns BOTH a mask and a hull — a mask alone has nothing to open, and a HULL alone is the
+        // dangerous half: it is drawn depth-test-off, so with no gate to confine it, it erases the
+        // depth of whatever it rasterizes over. Pair or don't play.
+        //
+        // Built from the cache's tiny roled-key set (~50 shapes install-wide), not the visible set,
+        // so membership is a property of the OBJECT and does not flicker with what is on screen this
+        // frame. Owners are TES3 reference pointers, compared only for identity.
+        static std::unordered_map<const void*, std::uint32_t> s_portalRoles;  // owner -> mask|hull bits
+        static std::unordered_set<const void*> s_portalOwners;
+        s_portalRoles.clear();
+        s_portalOwners.clear();
+        for (std::uint32_t rk : MGE::GeometryCache::portalRoleKeys()) {
+            auto rit = cacheMap.find(rk);
+            if (rit == cacheMap.end()) continue;
+            const auto& re = rit->second;
+            if (!re.portalOwner) continue;                  // no TES3 reference → never a portal
+            s_portalRoles[re.portalOwner] |= (re.stencilRole == 1) ? 1u : 2u;
+        }
+        for (const auto& kv : s_portalRoles) {
+            if (kv.second == 3u) s_portalOwners.insert(kv.first);   // has a mask AND a hull
+        }
+        const bool anyPortals = !s_portalOwners.empty();
+        // Is this entry part of a portal object? Its whole object leaves the GPU-driven indirect
+        // groups together — the trick needs author-role ordering, which cmdExecuteIndirect cannot
+        // express, and needs to escape the Hi-Z occlusion test, which culls anything living behind
+        // the surface it is opening.
+        auto portalOwned = [&](const MGE::GeometryCache::CachedGeometry& e) {
+            return anyPortals && e.portalOwner && s_portalOwners.count(e.portalOwner) != 0;
+        };
+        // Deferred portal draws, emitted after the visible-set loop grouped by owner in role order.
+        struct PortalCand {
+            const void* owner;
+            SlotInfo* si;
+            const MGE::GeometryCache::CachedGeometry* e;
+            std::uint8_t role;    // 0 member, 1 mask, 2 hull
+        };
+        static std::vector<PortalCand> portalCands;
+        portalCands.clear();
+
         // Per-entry dispatch, identical on both paths (see the filter contract above).
         // slot is mutable — the emit helpers update its cached texture SlotInfo.
         auto dispatch = [&](auto& slot, const auto& e) {
@@ -2745,7 +2789,21 @@ namespace {
                 // solid day plane behind the netting) is drawn OPAQUE by MW — emit it on the static
                 // path with slot 0 (host default white) so material/vcol give the solid colour.
                 // Skip the blend path (a textureless alpha shape has no base to composite).
+                // Portal helpers are textureless BY DESIGN — comGravePit's mask and hull are both
+                // bare geometry — which puts them in front of the collision-proxy filter below,
+                // and a dropped mask or hull is the whole feature gone. They are not proxies and
+                // the mesh says so: a roled shape carries a NiStencilProperty driving the stencil
+                // buffer, which no worldPickObjectRoot proxy ever does. So the ROLE, not the
+                // texture, decides here. Untagged portal MEMBERS keep the ordinary filter.
+                if (wantStatic && e.stencilRole && portalOwned(e)) {
+                    portalCands.push_back({ e.portalOwner, &slot, &e, e.stencilRole });
+                    return;
+                }
                 if (e.isPickRoot || e.blendEnable) return;
+                if (wantStatic && portalOwned(e)) {
+                    portalCands.push_back({ e.portalOwner, &slot, &e, e.stencilRole });
+                    return;
+                }
                 if (wantStatic) emitStaticDraw(slot, e, drawCount);
                 return;
             }
@@ -2786,6 +2844,10 @@ namespace {
             }
             if (!e.isLandscape && (e.d3dDark || e.d3dDetail || e.d3dGlow)) {
                 if (wantMM) emitMultiMapDraw(slot, e, multiMapCount);
+            } else if (wantStatic && portalOwned(e)) {
+                // Textured portal members and roled shapes (dwrvgratepipe's mask wears
+                // stencilerror.dds; its hull IS the visible room behind the grate).
+                portalCands.push_back({ e.portalOwner, &slot, &e, e.stencilRole });
             } else if (wantStatic) {
                 emitStaticDraw(slot, e, drawCount);
             }
@@ -2849,6 +2911,83 @@ namespace {
         const std::uint32_t capDeferred = MGE::GeometryCache::captureDeferredLastBuild();
         MGE::GeometryCache::setCaptureBudget(-1);
 
+        // ---- STENCIL "FAKE HOLE" PORTALS: emit the deferred objects, in ROLE order ---------------
+        // masks -> hulls -> the rest, per object. That is the order the trick is built on: the mask
+        // stamps where the opening is VISIBLE (its own depth test is the gate the stencil used to
+        // provide), the hull then overwrites the occluder's depth but only inside that stamp, and
+        // the real content draws over the hull. Order WITHIN "the rest" does not matter — those are
+        // ordinary depth-tested draws and depth resolves them — so this needs no author index.
+        //
+        // The pairing is re-checked HERE, on what was actually DEFERRED, not on what the cache
+        // holds: an object whose mask or hull went down some other path (blended, skinned, multimap)
+        // would otherwise ship a hull with no gate, which erases depth wherever it rasterizes.
+        // Unpaired objects fall back to plain static draws — exactly today's behaviour.
+        std::uint32_t portalObjects = 0, portalMasks = 0, portalHulls = 0, portalMembers = 0;
+        std::uint32_t portalUnpaired = 0;
+        {
+            MGE_ZoneScopedN("geom:portals");
+            static std::unordered_map<const void*, std::uint32_t> s_emitRoles;
+            s_emitRoles.clear();
+            for (const PortalCand& c : portalCands) {
+                if (c.role) s_emitRoles[c.owner] |= (c.role == 1) ? 1u : 2u;
+            }
+            // Stable owner order (first appearance) so the emitted list does not reshuffle
+            // frame-to-frame on unordered_map iteration order.
+            static std::vector<const void*> s_owners;
+            static std::unordered_set<const void*> s_seenOwner;
+            s_owners.clear();
+            s_seenOwner.clear();
+            for (const PortalCand& c : portalCands) {
+                if (s_seenOwner.insert(c.owner).second) s_owners.push_back(c.owner);
+            }
+            for (const void* owner : s_owners) {
+                const bool paired = (s_emitRoles[owner] == 3u);
+                if (paired) ++portalObjects;
+                // Three sweeps per object: role 1, then 2, then 0. The candidate list is small
+                // (one portal object is a handful of shapes), so this stays trivially cheap.
+                for (std::uint8_t want = 1; want <= 3; ++want) {
+                    const std::uint8_t role = (want == 3) ? 0 : want;
+                    for (const PortalCand& c : portalCands) {
+                        if (c.owner != owner || c.role != role) continue;
+                        std::uint32_t flags = 0;
+                        if (paired) {
+                            flags = (role == 1) ? IPC::kDrawPortalMask
+                                  : (role == 2) ? IPC::kDrawPortalHull
+                                                : IPC::kDrawPortalMember;
+                            if (role == 1)      ++portalMasks;
+                            else if (role == 2) ++portalHulls;
+                            else                ++portalMembers;
+                        }
+                        emitStaticDraw(*c.si, *c.e, drawCount, g_drawScratch, flags);
+                    }
+                }
+            }
+            portalUnpaired = (std::uint32_t)(s_owners.size() - portalObjects);
+        }
+        // One line per COMPOSITION change, in the style of [fp-set] / [alpha-cap] — and logged even
+        // when the counts are all ZERO, which is the whole point. Counts alone cannot tell "no
+        // portals in this cell" from "the walk dropped them", and that ambiguity is exactly the
+        // failure mode this change exists to stop being invisible ([[project_shadowbox_name_prune]]
+        // item 4). `deferred` is what separates them: a cell with no portal meshes defers NOTHING,
+        // while a portal whose mask went missing still defers its hull and shows up as
+        // deferred>0 objects=0 unpaired=1.
+        {
+            static std::uint64_t s_lastPortalSig = ~0ull;
+            // Five 12-bit fields — non-overlapping, so a change in any one of them is always a
+            // change in the signature (a portal object never approaches 4096 shapes).
+            auto f12 = [](std::size_t v) { return (std::uint64_t)(v & 0xFFFu); };
+            const std::uint64_t sig = (f12(portalObjects) << 48) | (f12(portalMasks) << 36)
+                                    | (f12(portalHulls)   << 24) | (f12(portalMembers) << 12)
+                                    | f12(portalCands.size());
+            if (sig != s_lastPortalSig) {
+                s_lastPortalSig = sig;
+                LOG::logline(">> [portal] objects=%u masks=%u hulls=%u members=%u "
+                             "(deferred=%u, unpaired=%u)",
+                             portalObjects, portalMasks, portalHulls, portalMembers,
+                             (unsigned)portalCands.size(), portalUnpaired);
+            }
+        }
+
         // Offscreen shadow casters: skinned + multimap NPC parts near the camera but OUTSIDE the
         // frustum were dropped by the visible-set loops above, so their shadows freeze and shed
         // parts as they leave view (the host can only cast what it receives). Re-emit them from
@@ -2901,6 +3040,11 @@ namespace {
                 if (cit == cacheMap.end()) continue;        // set ⊆ cache invariant; guard anyway
                 const auto& e = cit->second;
                 if (s_visLookup.count(mkey)) continue;      // in the visible set → already emitted above
+                // Portal objects ship ONLY through the inline portal block above. Re-emitting a
+                // member here would put the same part in the host's indirect groups AND inline —
+                // a double draw — and a re-emitted MASK or HULL would be a depth-eraser loose in
+                // the GPU-driven path with no gate in front of it.
+                if (portalOwned(e)) continue;
                 if (e.isSky) continue;
                 if (e.isFP) continue;   // FP arms: dedicated host FP pass, never a world caster (FP1a)
                 // FP0: entries the engine appCulled this frame (the 1st-person player's
@@ -3011,6 +3155,7 @@ namespace {
                     if (cit == cacheMap.end()) continue;                      // stale key (evicted since the sweep)
                     const auto& e = cit->second;
                     if (s_visLookup.count(skey)) continue;                    // already emitted in the visible set
+                    if (portalOwned(e)) continue;                            // inline portal block only (see above)
                     if (e.suppressedFrame == cacheFrame) continue;
                     // Precise per-frame classification (the sweep collected a padded superset).
                     if (e.isSky || e.isFP || e.isSkinned || e.isLandscape || e.blendEnable || e.isLive) continue;

@@ -436,6 +436,30 @@ BEGIN_SRT_NO_AB(SrtData)
         // splash below Nyquist. Neither grid can do the other's job; the frag sums their slopes.
         // Same unbound-reads-zero-is-flat-water arrangement. Appended AFTER gRippleField.
         DECL_TEXTURE(PerFrame, Tex2D(float4), gWakeField)
+        // STENCIL "FAKE HOLE" PORTAL gate (see IPC::kDrawPortalMask). One bit per pixel: 1 where a
+        // portal MASK quad passed its own depth test this frame, i.e. where the opening is actually
+        // VISIBLE. portalhull.frag discards on it, which is how the hull's depth-test-off write gets
+        // confined to the opening — the job MW gives the stencil buffer, which pDepth (D32_SFLOAT,
+        // no stencil plane) cannot do.
+        //
+        // The gate RT must share pDepth's sample count to be bound alongside it, so the type forks
+        // on PORTAL_GATE_SAMPLES exactly like linearizedepth.srt.h's gSceneDepth — its own macro
+        // rather than SAMPLE_COUNT so that nothing else on this root signature can ever flip it by
+        // accident. Both branches are ONE SRV slot, so the merged root signature is identical
+        // across the variants.
+        //
+        // ⚠ Read by portalhull.frag ONLY and bound ONLY into the main pPerFrameSet, the same
+        // arrangement as gRippleField/gWakeField above. Unbound reads ZERO — gate 0 = the hull
+        // discards everywhere = no punch at all = exactly the pre-portal image. The fail-safe
+        // direction, and the reason there is no fallback path. Appended AFTER gWakeField.
+#ifndef PORTAL_GATE_SAMPLES
+#define PORTAL_GATE_SAMPLES 1
+#endif
+#if PORTAL_GATE_SAMPLES > 1
+        DECL_TEXTURE(PerFrame, Tex2DMS(float4, PORTAL_GATE_SAMPLES), gPortalGate)
+#else
+        DECL_TEXTURE(PerFrame, Tex2D(float4), gPortalGate)
+#endif
     END_SRT_SET(PerFrame)
     // Point-light cbuffer — rides the otherwise-unused PerDraw set (FSL has exactly four
     // fixed update frequencies: Persistent/PerFrame/PerBatch/PerDraw; a custom set name has
