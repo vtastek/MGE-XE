@@ -1813,7 +1813,8 @@ namespace {
         // are bound once into pPerFrameSet. Drawn AFTER the distant land (depth-write reverse-Z GEQUAL,
         // cull NONE) into the same colour+depth, then the present-seam composites the whole frame.
         Shader*        pWaterShader = nullptr;
-        Pipeline*      pWaterPipeline = nullptr;           // depth GEQUAL + write, cull NONE, premultiplied over
+        Pipeline*      pWaterPipeline = nullptr;           // depth GEQUAL, NO write, cull NONE, premultiplied over
+        Pipeline*      pWaterPipelineZ = nullptr;          // ...and the opaque-era variant that writes it (g_waterZWrite)
         Buffer*        pWaterWorldsBuf = nullptr;          // gBatch: worlds[0..5]=LOD levels, [6]=params, [7]=invVP
         DescriptorSet* pPerBatchSetWater = nullptr;        // gBatch bound to pWaterWorldsBuf, 1 instance
         Buffer*        pWaterInstanceBuf = nullptr;        // per-draw instance VB: DrawIndex=level (kMaxWaterLevels)
@@ -5367,7 +5368,8 @@ namespace {
         }
 
         waitQueueIdle(g_live.pQueue);
-        if (g_live.pWaterPipeline) { removePipeline(R, g_live.pWaterPipeline); g_live.pWaterPipeline = nullptr; }
+        if (g_live.pWaterPipeline)  { removePipeline(R, g_live.pWaterPipeline);  g_live.pWaterPipeline = nullptr; }
+        if (g_live.pWaterPipelineZ) { removePipeline(R, g_live.pWaterPipelineZ); g_live.pWaterPipelineZ = nullptr; }
         if (g_live.pWaterShader)   { removeShader(R, g_live.pWaterShader);     g_live.pWaterShader = nullptr; }
         g_live.pWaterShader = newWaterShader;
 
@@ -5388,10 +5390,14 @@ namespace {
         wvl.mAttribs[1].mLocation = 1;
         wvl.mAttribs[1].mOffset   = 0;
 
+        // ⚠ TEST YES, WRITE NO — the surface is a BLENDED draw and does not own the pixel. See the
+        // g_waterZWrite note for what the write was deleting (every sorted-alpha fragment below the
+        // waterline) and for why no other consumer misses it. The writing variant is built alongside
+        // as the A/B, not as a fallback: both come off the same shader and the same desc.
         DepthStateDesc wDepth = {};
         wDepth.mDepthTest = true;
-        wDepth.mDepthWrite = true;
-        wDepth.mDepthFunc = CMP_GEQUAL;        // reverse-Z: water writes + occludes
+        wDepth.mDepthWrite = false;
+        wDepth.mDepthFunc = CMP_GEQUAL;        // reverse-Z: geometry in front of the water still occludes it
 
         RasterizerStateDesc wRaster = {};
         wRaster.mCullMode = CULL_MODE_NONE;    // matches MGE water (P6/P7, double-sided plane)
@@ -5448,6 +5454,14 @@ namespace {
         if (!g_live.pWaterPipeline) {
             LOG::logline("!! [forge][water] addPipeline(water) FAILED"); LOG::flush();
             return false;
+        }
+
+        // The legacy depth-writing twin. NON-FATAL on failure: the bind site falls back to the
+        // primary, so a failed A/B variant costs the toggle and not the water.
+        wDepth.mDepthWrite = true;
+        addPipeline(R, &wPd, &g_live.pWaterPipelineZ);
+        if (!g_live.pWaterPipelineZ) {
+            LOG::logline("!! [forge][water] addPipeline(water, Z-write A/B) FAILED — toggle disabled");
         }
         return true;
     }
@@ -10922,6 +10936,50 @@ namespace {
     // 0 = the old unbounded behaviour, i.e. the A/B.
     float g_waterDistortFrac = 0.5f;
 
+    // ─── DOES THE WATER SURFACE CLAIM THE PIXEL'S DEPTH? ─────────────────────────────────────────
+    // ⚠ A LEFTOVER FROM THE OPAQUE ERA. The surface used to be an opaque write that fetched what was
+    // behind it out of gRefractColor, and an opaque write owns its pixel — depth included. It is a
+    // BLENDED draw now (tasks/forge-water-blend.md, the "refraction IS the destination" change), and
+    // a translucent surface that only takes 1-k0 of the pixel must not tell everything behind it
+    // that the pixel is finished. The depth write did not move when the blend did.
+    //
+    // What it cost: pDepth's water texels are strictly NEARER than anything submerged, so every
+    // GEQUAL-testing pass drawn after the water phase was killed below the waterline. That is the
+    // whole sorted-alpha stage — reported as "alpha blending hair disappears when underwater",
+    // measured as hair drawn above the line and absent below it IN ONE FRAME, which is a per-pixel
+    // depth test and cannot be a camera-state toggle. It is not the fog and not the fill: the medium
+    // is applied by applyFog() on the fragment's own ray (waterFogSample), so a submerged translucent
+    // arrives correctly attenuated the moment it is allowed to draw at all.
+    //
+    // Nothing else reads it. The colour->water seam takes BOTH full-depth consumers (Hi-Z mip 0 and
+    // the pLinearDepth refresh) before this pass on purpose, volfog intersects the water plane
+    // ANALYTICALLY rather than reading it, waterfill keys on coverage, and the FP pass clears depth.
+    // The only other GEQUAL consumer downstream is the glow billboards, which were being deleted
+    // below the surface for the same reason and should be attenuated, not deleted.
+    //
+    // ⚠ THE RESIDUAL — and it is not academic, it was reported within one build: dropping the write
+    // does not put the fragment UNDER the surface, it puts it OVER. Alpha on the far side of the plane
+    // composites on top of the surface's own term instead of beneath it, so it misses the Fresnel
+    // reflection. From ABOVE that is nearly exact — the surface is mostly transmissive at the angles
+    // where submerged detail is legible at all — and the user confirmed it: "from above water, I can
+    // see alpha blending correctly". From BELOW it is badly wrong, because outside Snell's window the
+    // surface is a TOTAL mirror: "from underwater, above water alpha blending are seen over the
+    // underwater surface".
+    //
+    // So the write is now taken on the CAMERA'S SIDE (see the bind site). Same surface, two different
+    // approximations of it, chosen by which one the medium is closer to.
+    //
+    // The exact fix, when it is worth its cost: draw the alpha stage in TWO passes bracketing water,
+    // each discarding the fragments belonging to the other side of the plane. The discriminator is
+    // per-FRAGMENT and analytic (the surface is a plane; waterFogSample already walks that ray), which
+    // is what it has to be — a half-submerged head is ONE draw with fragments on both sides, so no
+    // per-draw classification can place it. A conservative per-draw bounds test against the plane keeps
+    // the second pass off nearly every draw.
+    //
+    // ON = force the legacy opaque-era behaviour in BOTH directions, kept as the A/B that proves the
+    // mechanism (flip it above water while looking at a submerged head).
+    bool g_waterZWrite = false;
+
     // ─── SHORELINE (water.frag, worlds[11] group 1) ──────────────────────────────────────────────
     // How shallow water hands the pixel over to what is under it. Two axes, and conflating them is
     // the mistake these defaults were set to correct: DEPTH is an optical fact about water measured
@@ -13142,6 +13200,12 @@ namespace {
           // the range gRefractColor actually holds MW's near scene over. 0 = unbounded, the old A/B.
           t.sliderF("Water: distortion fade (x nearViewRange; 0 = unbounded/legacy)",
                     &g_waterDistortFrac, 0.0f, 2.0f, 0.05f, "%.02f");
+          // The opaque-era depth write, kept as the A/B. ON deletes every sorted-alpha fragment on the
+          // far side of the surface (hair, manes, banners, bubbles) — flip it above water while looking
+          // at a submerged head and the hair appears and disappears. OFF still writes it while the
+          // camera is SUBMERGED, where the surface really is close to opaque. See the g_waterZWrite note.
+          t.checkbox("Water: surface WRITES depth ALWAYS (legacy; OFF = only while submerged)",
+                     &g_waterZWrite);
           // ─── SHORELINE ───────────────────────────────────────────────────────────────────────
           // All three ride worlds[11] group 1, which water.frag reads — and water.frag hot-reloads,
           // so these move live. 1 unit = 1.42 cm; the labels carry the metric reading because the
@@ -20361,7 +20425,22 @@ namespace ForgeRender {
             cmdBindRenderTargets(g_live.pCmd, &wbind);
             cmdSetViewport(g_live.pCmd, 0.0f, 0.0f, (float)g_live.width, (float)g_live.height, 0.0f, 1.0f);
             cmdSetScissor(g_live.pCmd, 0, 0, g_live.width, g_live.height);
-            cmdBindPipeline(g_live.pCmd, g_live.pWaterPipeline);
+            // ⚠ THE DEPTH WRITE IS ASYMMETRIC, BECAUSE THE SURFACE IS. Seen from ABOVE it is nearly
+            // transparent, so claiming the pixel deletes submerged translucents that should be showing
+            // through it. Seen from BELOW it is nearly OPAQUE: outside Snell's 48.6-degree window every
+            // ray is totally internally reflected (the same window water.frag's own Fresnel models), so
+            // "the surface finishes this pixel" is a good approximation rather than a wrong one — and
+            // the alternative, letting above-water alpha composite OVER the mirror, is the artifact
+            // reported the moment the write came off unconditionally.
+            //
+            // The exact answer is the same in both directions and neither of these: a fragment on the
+            // far side of the plane belongs UNDER the surface's own term, which means drawing it before
+            // water with a per-FRAGMENT side test (a half-submerged head is one draw on both sides, so
+            // no per-draw sort can place it). Until that exists, side with the medium that is closer to
+            // opaque. Inside the window — straight up from below — this still hides what should show.
+            const bool waterZWrite = g_waterZWrite || underwater;
+            cmdBindPipeline(g_live.pCmd, (waterZWrite && g_live.pWaterPipelineZ)
+                                             ? g_live.pWaterPipelineZ : g_live.pWaterPipeline);
             cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSet);    // gFrameData + gAO + 4 water SRVs
             cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerLightsSet);
             cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
@@ -20416,7 +20495,11 @@ namespace ForgeRender {
         // ===================== AT1: SORTED-ALPHA PASS =====================
         // The scene-1 blended world shapes (banners/tapestries/foliage/glass), drawn AFTER water so
         // the whole opaque+DL+water frame is complete: depth GEQUAL test (no write) makes them
-        // occlude correctly behind Forge walls — the bug this pass exists to fix. The CLIENT ships
+        // occlude correctly behind Forge walls — the bug this pass exists to fix. ⚠ The water SURFACE
+        // is deliberately NOT in that depth (g_waterZWrite): it is a blended draw, and while it was
+        // writing depth it deleted every fragment of this stage that stood below the waterline. The
+        // medium still reaches them — applyFog() integrates the water column on the fragment's own
+        // ray, so a submerged translucent arrives attenuated rather than absent. The CLIENT ships
         // the list back-to-front sorted (MW's sorter criterion), so we draw in received order with
         // a per-draw blend-PSO pick (alpha-over / additive; cull NONE). Sky-pass clone: each
         // item writes its world into pAlphaWorldsBuf[idx] + its instance data into
@@ -30861,6 +30944,7 @@ namespace ForgeRender {
         if (g_live.pWaterNormalVol)         { removeResource(g_live.pWaterNormalVol); }
         if (g_live.pWaterSlopeVar)          { removeResource(g_live.pWaterSlopeVar); }
         if (g_live.pWaterPipeline)          { removePipeline(R, g_live.pWaterPipeline); }
+        if (g_live.pWaterPipelineZ)         { removePipeline(R, g_live.pWaterPipelineZ); }
         if (g_live.pWaterShader)            { removeShader(R, g_live.pWaterShader); }
         // Phase F glow-billboard teardown.
         if (g_live.pGlowPipeline)           { removePipeline(R, g_live.pGlowPipeline); }
