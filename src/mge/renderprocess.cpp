@@ -2325,7 +2325,10 @@ namespace {
             // constant material (vertexMaterialNone), ignoring the VB's colour slot.
             item.matDiffuse[0]  = e.matDiffuse[0];  item.matDiffuse[1]  = e.matDiffuse[1];  item.matDiffuse[2]  = e.matDiffuse[2];
             item.matAmbient[0]  = e.matAmbient[0];  item.matAmbient[1]  = e.matAmbient[1];  item.matAmbient[2]  = e.matAmbient[2];
-            MGE::GeometryCache::emissiveForDraw(e, item.matEmissive);
+            // The AUTHORED emissive rides its own lane and gets decodeAuthored() on the host;
+            // the flux/area GAIN rides its own and deliberately does not. See emissiveForDraw.
+            item.matEmissive[0] = e.matEmissive[0];  item.matEmissive[1] = e.matEmissive[1];  item.matEmissive[2] = e.matEmissive[2];
+            MGE::GeometryCache::emissiveForDraw(e, item.emissiveGain);
             item.vColSource = (e.hasVertexColor && e.vColSource != 0) ? e.vColSource : 0u;
             // C4d shadow-caster category: LIVE (NPC/creature parts + held equipment,
             // activators, doors) → the host's dynamic shadow tile, not the cached statics.
@@ -2488,7 +2491,10 @@ namespace {
             item.world[14] -= DistantLand::eyePos.z;
             item.matDiffuse[0]  = e.matDiffuse[0];  item.matDiffuse[1]  = e.matDiffuse[1];  item.matDiffuse[2]  = e.matDiffuse[2];
             item.matAmbient[0]  = e.matAmbient[0];  item.matAmbient[1]  = e.matAmbient[1];  item.matAmbient[2]  = e.matAmbient[2];
-            MGE::GeometryCache::emissiveForDraw(e, item.matEmissive);
+            // The AUTHORED emissive rides its own lane and gets decodeAuthored() on the host;
+            // the flux/area GAIN rides its own and deliberately does not. See emissiveForDraw.
+            item.matEmissive[0] = e.matEmissive[0];  item.matEmissive[1] = e.matEmissive[1];  item.matEmissive[2] = e.matEmissive[2];
+            MGE::GeometryCache::emissiveForDraw(e, item.emissiveGain);
             item.vColSource = (e.hasVertexColor && e.vColSource != 0) ? e.vColSource : 0u;
             item.alphaRef   = e.alphaTest ? e.alphaRef : 0.0f;   // base-stage alpha test
             item.stageCount = (std::uint32_t)ns;
@@ -2532,7 +2538,10 @@ namespace {
             item.matDiffuse[0]  = e.matDiffuse[0];  item.matDiffuse[1]  = e.matDiffuse[1];  item.matDiffuse[2]  = e.matDiffuse[2];
             item.matAlpha       = e.matDiffuse[3];   // MaterialProperty::alpha (the FFE per-draw fade)
             item.matAmbient[0]  = e.matAmbient[0];  item.matAmbient[1]  = e.matAmbient[1];  item.matAmbient[2]  = e.matAmbient[2];
-            MGE::GeometryCache::emissiveForDraw(e, item.matEmissive);
+            // The AUTHORED emissive rides its own lane and gets decodeAuthored() on the host;
+            // the flux/area GAIN rides its own and deliberately does not. See emissiveForDraw.
+            item.matEmissive[0] = e.matEmissive[0];  item.matEmissive[1] = e.matEmissive[1];  item.matEmissive[2] = e.matEmissive[2];
+            MGE::GeometryCache::emissiveForDraw(e, item.emissiveGain);
             item.vColSource = (e.hasVertexColor && e.vColSource != 0) ? e.vColSource : 0u;
             memcpy(item.world, e.worldTransformD3D, 16 * sizeof(float));
             // CAMERA-RELATIVE: shift translation by -eye (see emitStaticDraw).
@@ -2578,6 +2587,11 @@ namespace {
             item.matAlpha       = rec.matAlpha;
             item.matAmbient[0]  = rec.matAmbient[0];  item.matAmbient[1]  = rec.matAmbient[1];  item.matAmbient[2]  = rec.matAmbient[2];
             item.matEmissive[0] = rec.matEmissive[0]; item.matEmissive[1] = rec.matEmissive[1]; item.matEmissive[2] = rec.matEmissive[2];
+            // Captured DIPs are reconstructed from D3D8 render state, not from the cache, so there is
+            // no fixture/light/area to derive a flux-per-area gain from — 1.0 = no boost. It MUST be
+            // written: `item` is not zero-initialised, and the gain's identity is 1, not 0 (the host's
+            // vert MULTIPLIES by it, so a zero would black this DIP's emissive out entirely).
+            item.emissiveGain[0] = item.emissiveGain[1] = item.emissiveGain[2] = 1.0f;
             item.vColSource = rec.vColSource;
             memcpy(item.world, rec.world, 16 * sizeof(float));
             item.world[12] -= DistantLand::eyePos.x;
@@ -4056,6 +4070,12 @@ namespace {
                     item.matAlpha      = 1.0f;
                     item.matAmbient[0] = item.matAmbient[1] = item.matAmbient[2] = 0.0f;
                     item.matEmissive[0] = item.matEmissive[1] = item.matEmissive[2] = 0.0f;
+                    // ⚠ 1.0, and the `= {}` above is exactly why this line has to exist. The emissive
+                    // gain's identity is 1, not 0, because the host's vert multiplies the selected
+                    // emissive by it — and on the flame branch (vColSource 1) the selected emissive is
+                    // the vertex COLOUR. A zero-initialised gain would therefore render every
+                    // first-person flame particle black, not merely un-boosted.
+                    item.emissiveGain[0] = item.emissiveGain[1] = item.emissiveGain[2] = 1.0f;
                     item.vColSource = emissiveSat ? 1u : 2u;
                     // Quads are already in absolute world space → identity world minus the
                     // camera-relative eye (matches the world captured path + FP emit helpers).
@@ -6974,6 +6994,61 @@ void DrawForgeDevPanel() {
                 kMaxRenderScale);
         ImGui::SameLine();
         ImGui::Text("(%ux%u)", g_rw, g_rh);
+    }
+
+    // EMISSIVE LEVEL (S3 calibration). Multiplies the flux/area gain at draw-list build, so it is
+    // live — the per-entry gain itself is computed once at cache-fill and a constant change there
+    // needs a rebuild AND a full cache re-walk. See emissiveForDraw() for the model.
+    //
+    // 1.0 puts the reference paper lantern at k_eff = 2.2 (what the LDR-era constant always aimed at
+    // and never reached, because area_ref was a 3.1x underestimate — fixed 2026-08-18 from the
+    // measured area=1883.5 logline). 2.05 reaches the MEASURED k_ref of 4.5, which HDR has now made
+    // expressible; that is the number to try first.
+    {
+        float es = MGE::GeometryCache::g_emissiveScale;
+        if (ImGui::SliderFloat("Emissive level (x flux/area gain)", &es, 0.0f, 6.0f, "%.2fx")) {
+            MGE::GeometryCache::g_emissiveScale = es;
+            LOG::logline(">> [emissive] level %.2fx (paper-lantern k_eff %.2f; 2.05x = the measured 4.5)",
+                         es, 2.2f * es);
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip(
+                "Scales every fixture whose emission came from its own light\n"
+                "(emissive = authored x k x lightColour / meshArea). Class RATIOS come from\n"
+                "the meshes and do not move; this is the absolute level only.\n\n"
+                "1.00x = reference paper lantern at k_eff 2.2\n"
+                "2.05x = the MEASURED k_ref of 4.5 (try this first)\n\n"
+                "WARNING: pair with Exposure 'Meter statistic' = p90. A single lantern can be\n"
+                "69%% of a frame's light energy in 0.23%% of its area (measured), so a frame-MEAN\n"
+                "meter chases it and the ROOM goes dark while the lantern looks unchanged.\n"
+                "Vanilla candles are unaffected: their meshes author no emissive material at all,\n"
+                "so they have no gain to scale.");
+
+        // CEILING on k_eff. flux/area double-counts whenever a fixture has several emissive shapes
+        // sharing one light: each claims the FULL flux and divides by its own area, so the smallest
+        // wins hardest. light_de_lantern_02 has 8 emissive shapes — glass k_eff 26, flame 402.
+        float mk = MGE::GeometryCache::g_emissiveMaxK;
+        if (ImGui::SliderFloat("Emissive ceiling (max k_eff)", &mk, 0.0f, 256.0f, "%.0f")) {
+            MGE::GeometryCache::g_emissiveMaxK = mk;
+            LOG::logline(">> [emissive] ceiling k_eff <= %.0f (%s)", mk,
+                         (mk <= 0.0f) ? "OFF - raw flux/area" : "hue-preserving scalar clamp");
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip(
+                "Bounds flux/area's small-area limit, where it stops being trustworthy:\n"
+                " - a fixture with N emissive shapes gives EACH the full flux (light_de_lantern_02\n"
+                "   has 8), so the smallest shape wins hardest;\n"
+                " - a flame BILLBOARD is a sprite standing in for a volume, so its triangle area\n"
+                "   was never an emitting area.\n\n"
+                "DEFAULT 0 = OFF, and it should stay off: this was a band-aid for flux\n"
+                "double-counting, and the fixture GROUPING fixed that properly (glass shade\n"
+                "k_eff 26.05 -> 3.26 on its own). At 32 it was suppressing the flame 12.6x -\n"
+                "k_eff 402 clamped to 32 - i.e. throttling the brightest thing in the room.\n\n"
+                "Measured reference points: paper lantern k_eff 2.2, glass shade 3.3, flame 403.\n"
+                "Check grpArea/pieces in the [emissive] log before reaching for this: pieces=1\n"
+                "on a fixture that plainly has many means the GROUPING is broken instead.\n\n"
+                "Hue-preserving: ONE scalar over all three channels. Per-channel clipping would\n"
+                "snap R:G:B toward 1:1:1 and read as hot cream - the LDR-era bug.");
     }
 
     // Build-shrink toggles (Stages 0-2a). Panel-only, no keys: the free numpad keys collide

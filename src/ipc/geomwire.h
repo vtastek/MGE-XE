@@ -183,6 +183,23 @@ namespace IPC {
         std::uint32_t overlayTexIndex;
         std::uint32_t casterFlags; // kDrawCasterLive bit (C4d shadow-caster category) + kDrawPortal* role
         std::uint32_t clampMode;   // NiTexturingProperty::Map::clampMode, RAW (see kTexClamp*)
+        // EMISSIVE GAIN — the flux/area boost, shipped as its OWN lane and NOT folded into
+        // matEmissive. It is a per-channel RATIO (kEmissiveFlux * ownLight.diffuse / fixtureArea,
+        // see computeEmissiveGain), and matEmissive is an AUTHORED colour that the host's vert puts
+        // through decodeAuthored(). Folding the two together put the ratio inside srgbToLinear,
+        // which is unclamped past 1.0, so a gain g reached the frag as ~g^2.4 (2.11 -> 5.61,
+        // 25.95 -> 2189, a candle flame's 401 -> 1.56e6). Separately: on vColSource 1 the emissive
+        // IS the vertex colour and the frags never read matEmissive at all, so the folded gain was
+        // discarded outright for flames. Both halves are fixed by keeping the ratio in its own
+        // lane and letting opaque.vert / multimap.vert apply it AFTER the decode, to whichever
+        // source vColSource selected. 1,1,1 = no boost (not a lit fixture).
+        //
+        // ⚠ THE IDENTITY IS 1, NOT 0 — this field is NOT zero-init-safe. The host's vert
+        // MULTIPLIES the selected emissive by it, and on vColSource 1 the selected emissive is the
+        // vertex colour, so a `Wire item{}` that never assigns this renders that draw's emissive
+        // BLACK rather than merely un-boosted. Every writer must set it; the two paths with no
+        // fixture to derive a gain from (captured DIPs, FP particle quads) set 1.0 explicitly.
+        float         emissiveGain[3];
     };
 
     // MW's texture address mode, shipped raw (the shader's TEX_* defines use the same 4 values in
@@ -363,6 +380,23 @@ namespace IPC {
         // map's alpha channel. Route C must therefore reproduce MW's full FFE alpha,
         // texA * vcolA * matAlpha, exactly as alpha.frag does. Read only for BLENDED draws.
         float         matAlpha;
+        // EMISSIVE GAIN — the flux/area boost, shipped as its OWN lane and NOT folded into
+        // matEmissive. It is a per-channel RATIO (kEmissiveFlux * ownLight.diffuse / fixtureArea,
+        // see computeEmissiveGain), and matEmissive is an AUTHORED colour that the host's vert puts
+        // through decodeAuthored(). Folding the two together put the ratio inside srgbToLinear,
+        // which is unclamped past 1.0, so a gain g reached the frag as ~g^2.4 (2.11 -> 5.61,
+        // 25.95 -> 2189, a candle flame's 401 -> 1.56e6). Separately: on vColSource 1 the emissive
+        // IS the vertex colour and the frags never read matEmissive at all, so the folded gain was
+        // discarded outright for flames. Both halves are fixed by keeping the ratio in its own
+        // lane and letting opaque.vert / multimap.vert apply it AFTER the decode, to whichever
+        // source vColSource selected. 1,1,1 = no boost (not a lit fixture).
+        //
+        // ⚠ THE IDENTITY IS 1, NOT 0 — this field is NOT zero-init-safe. The host's vert
+        // MULTIPLIES the selected emissive by it, and on vColSource 1 the selected emissive is the
+        // vertex colour, so a `Wire item{}` that never assigns this renders that draw's emissive
+        // BLACK rather than merely un-boosted. Every writer must set it; the two paths with no
+        // fixture to derive a gain from (captured DIPs, FP particle quads) set 1.0 explicitly.
+        float         emissiveGain[3];
     };
     constexpr std::uint32_t kMMDrawFlagBlended = 1u;   // MultiMapDrawWire::drawFlags bit0
     // Enchanted-item glow, Route C's copy of kTexFlagEnchantGlow. Multi-map has no clampMode lane
@@ -520,6 +554,23 @@ namespace IPC {
         // Enhanced Light census says the uvSet-1 shapes are all cached/Route-C-owned anyway.
         std::uint32_t stageCount;  // extra stages actually present, 0..3 (0 = base map only)
         std::uint32_t stages[3];
+        // EMISSIVE GAIN — the flux/area boost, shipped as its OWN lane and NOT folded into
+        // matEmissive. It is a per-channel RATIO (kEmissiveFlux * ownLight.diffuse / fixtureArea,
+        // see computeEmissiveGain), and matEmissive is an AUTHORED colour that the host's vert puts
+        // through decodeAuthored(). Folding the two together put the ratio inside srgbToLinear,
+        // which is unclamped past 1.0, so a gain g reached the frag as ~g^2.4 (2.11 -> 5.61,
+        // 25.95 -> 2189, a candle flame's 401 -> 1.56e6). Separately: on vColSource 1 the emissive
+        // IS the vertex colour and the frags never read matEmissive at all, so the folded gain was
+        // discarded outright for flames. Both halves are fixed by keeping the ratio in its own
+        // lane and letting opaque.vert / multimap.vert apply it AFTER the decode, to whichever
+        // source vColSource selected. 1,1,1 = no boost (not a lit fixture).
+        //
+        // ⚠ THE IDENTITY IS 1, NOT 0 — this field is NOT zero-init-safe. The host's vert
+        // MULTIPLIES the selected emissive by it, and on vColSource 1 the selected emissive is the
+        // vertex colour, so a `Wire item{}` that never assigns this renders that draw's emissive
+        // BLACK rather than merely un-boosted. Every writer must set it; the two paths with no
+        // fixture to derive a gain from (captured DIPs, FP particle quads) set 1.0 explicitly.
+        float         emissiveGain[3];
     };
     constexpr std::uint32_t kAlphaCullTwoSided = 1u;   // bit0
     constexpr std::uint32_t kAlphaCullMirrored = 2u;   // bit1

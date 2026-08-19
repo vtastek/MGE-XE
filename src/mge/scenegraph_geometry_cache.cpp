@@ -750,8 +750,68 @@ namespace MGE::GeometryCache {
         // The RATIOS between fixture classes are already correct — they come from the meshes, not
         // from this number. (Small-area emitters — candle flames — still blow past 2.2 and pin to
         // white by construction; only HDR fixes those.)
-        constexpr float kEmissiveRefK    = 2.2f;    // LDR-limited; measured value is 4.5 (see above)
-        constexpr float kEmissiveRefArea = 600.0f;  // ESTIMATE: paper-lantern emissive area (units^2)
+        // ⚠ area_ref IS NO LONGER AN ESTIMATE — MEASURED 2026-08-18, and the estimate was 3.1x LOW.
+        // The note above says to read `area=` off the [emissive] logline at a real lantern; done:
+        //     >> [emissive] fixture tex=Tx_Misc_lantern_paper_02.tga emissive=(1.00,1.00,1.00)
+        //        light=(0.961,0.549,0.157) d=0.4 r=14.6 tol=14.6 area=1883.5 gain=(0.67,0.38,0.11)
+        // The paper-lantern reference is **1883.5** units^2, not 600. Every consequence of that is
+        // visible in the same log, and the direction is the opposite of "boost":
+        //     paper lantern  area 1883.5 -> k_eff = 1320/1883.5 = 0.70   <-- DIMMED to 70% of authored
+        //     BC mushroom    area 3042.3 -> k_eff = 0.43
+        //     glass lantern  area  159.1 -> k_eff = 8.30
+        //     candle flame   area   10.3 -> k_eff = 128
+        // i.e. the reference fixture the constant was named for was getting 0.70 where the whole
+        // point was 2.2, which is exactly the reported symptom ("paper lanterns are weak"). Class
+        // RATIOS were right all along — they come from the meshes — so this only ever mis-set the
+        // absolute level, which is precisely what the comment above predicted it would do.
+        //
+        // ⚠ RE-DERIVED 2026-08-19, WHEN THE GAIN GOT ITS OWN LINEAR WIRE LANE. Two corrections to
+        // everything above, and the first one is that AREA_REF WAS NEVER THE STALE CONSTANT — it is a
+        // measurement of a mesh (1883.5 units^2 of paper), and how the gain travels down the wire
+        // cannot move it. The stale constant is k_ref, for two independent reasons:
+        //
+        // 1. THE CONSTRAINT THAT PINNED IT AT 2.2 NO LONGER EXISTS. 2.2 was "the largest boost that
+        //    keeps the reference fixture under the knee", the knee being tonemap()'s old polynomial
+        //    reaching 1.0 at c = 2.2. AgX owns the curve now and, measured off a paired EXR/TGA dump
+        //    at E = 5.47, display white arrives at scene luma ~3 rather than 2.2 — with the toe and
+        //    shoulder shaped so that scene 0.9 -> display 0.91 and scene 1.6 -> display ~0.98. The
+        //    headroom the old knee was rationing is simply there now.
+        //
+        // 2. THE GAIN USED TO BE EXPONENTIATED AND IS NOT ANY MORE. Folded into matEmissive, it went
+        //    through the vertex stage's decodeAuthored() — the sRGB EOTF, UNCLAMPED above 1 — so the
+        //    multiplier that actually reached the pixel was srgbToLinear(k*L)/L, a function of the
+        //    LIGHT COLOUR. For this reference fixture that was (5.87, 2.80, 0.62) per channel, not
+        //    2.2: nearly 3x in red, 0.6x in blue, i.e. the boost also warped the hue.
+        //
+        // THE DERIVATION. There is exactly one continuity target that does not inherit that hue error:
+        // the k which reproduces the reference fixture's on-screen LUMINANCE with a NEUTRAL gain.
+        //
+        //     L        = (0.961, 0.549, 0.157)                 luma(L)  = 0.6083
+        //     old gain = 2.2 * L      = (2.114, 1.208, 0.345)
+        //     what the vert produced  = (5.640, 1.540, 0.098)   luma     = 2.3073
+        //     k_new    = 2.3073 / 0.6083 = 3.793
+        //
+        // and it is the ONLY fixture the target is available for: the exponentiation was catastrophic
+        // everywhere else (the glass pot's effective gain was (0.01, 526, 2188), and the candle flame
+        // — vColSource 1 — got NO gain at all, because the frags read In.Color and never
+        // In.MatEmissive). There was no "old look" to preserve for any of them.
+        //
+        // ⚠ THE CITED "MEASURED 4.5" IS NOT SUPPORTED BY THE TEXTURES — checked, and dropped. The fit
+        // it came from assumed the paper is a clipped record of clip(k*L*s), which predicts that R AND
+        // G both pin at the texture's brightest texel. They do not: Tx_misc_lantern_paper_02's peak
+        // texel is sRGB (0.968, 0.825, 0.645) with G nowhere near 1.0 and only 0.023% of R clipped,
+        // and its hue ratio 1:0.85:0.67 is far LESS saturated than the light's 1:0.57:0.16. That is
+        // what an off-white paper diffuser transilluminated by an orange flame looks like — the paper
+        // has its own colour — so the texture cannot pin k in either direction. `_01` reads the same.
+        //
+        // WHAT MOVES, at x1.72 on every fixture: reference lantern display 0.91 -> ~0.98 (still
+        // unclipped), glass pot k_eff 26.05 -> 44.90, candle flame 402.89 -> 693.62, torch 3.30 ->
+        // 5.69. On anything already in AgX's shoulder this is nearly invisible by construction; where
+        // it IS visible is BLOOM, which reads scene-referred radiance with no shoulder in front of it.
+        // That makes k_ref primarily a bloom-coupling knob now, which is worth knowing before it gets
+        // re-tuned by eye against a bloom change.
+        constexpr float kEmissiveRefK    = 3.793f;    // DERIVED: luma continuity across the un-exponentiation
+        constexpr float kEmissiveRefArea = 1883.5f;   // MEASURED (Tx_Misc_lantern_paper_02, area= logline)
         constexpr float kEmissiveFlux    = kEmissiveRefK * kEmissiveRefArea;
 
         // World-space emissive surface area: sum of triangle areas, scaled by the world
@@ -782,17 +842,175 @@ namespace MGE::GeometryCache {
             return static_cast<float>(area) * s * s;
         }
 
+        // ─── FIXTURE GROUPING ────────────────────────────────────────────────────────────────────
+        // A FIXTURE IS ONE EMITTER, even when it is drawn as many pieces. `light_de_lantern_02` is 8
+        // alpha-blended glass facets (each area 159.1) plus a flame billboard (area 10.3), and every
+        // one of them was dividing that light's FULL flux by its own area — so the flux was emitted
+        // once and claimed ten times, and the SMALLEST piece won hardest:
+        //     paper lantern (1 shape) k_eff   2.2   <- the reference
+        //     glass facet   (x8)      k_eff  26.0
+        //     flame quad              k_eff 402.0
+        // Summing the area over a fixture's pieces removes that entirely, and it is the physically
+        // right thing rather than a fudge: the emitting surface is the whole glass shade, not one pane.
+        //
+        // GROUPED BY (own light, texture) — the light identifies the fixture, and the texture keeps
+        // GLASS and FLAME as separate emitters, which they are: a flame really is a small, intense
+        // emitter and a shade really is a large, dim one, and collapsing them into one area would
+        // average away the very ratio the flux/area model exists to produce.
+        //
+        // ⚠ The key is the LIGHT'S IDENTITY (PointLight::source, the NI::PointLight*), NOT a node
+        // name — a node NAME is not a promise ([[project_shadowbox_name_prune]]), and two lanterns of
+        // the same model in one room must not merge. A freed light's address can be recycled, which
+        // would merge two fixtures for as long as both entries live; harmless (it can only make a
+        // fixture dimmer, never nuclear) and it self-corrects on the next capture.
+        //
+        // ⚠⚠ ALL OF THIS RUNS ON THE CACHE PATH, never on the draw path. emissiveForDraw() stays a
+        // pure per-entry read, so no map is touched while draw lists are being built — the worker /
+        // main split that [[project_forge_texslot_race]] records makes that a hard requirement, not a
+        // preference.
+        // ⚠ NO forward declaration of g_emissiveScale / g_emissiveMaxK here. They are defined with
+        // emissiveForDraw() far below, in the ENCLOSING MGE::GeometryCache namespace, and the header
+        // already declares them there — so unqualified lookup from this nested namespace finds them.
+        // Re-declaring them here instead created a SECOND entity in this namespace and every use
+        // became `error C2872: ambiguous symbol`.
+        // ⚠ MEMBERS ARE CACHE KEYS, NOT `CachedGeometry*`. They were pointers — "g_cache is
+        // node-based, so these pointers are stable" — which is true only while the entry LIVES.
+        // purgeAll() clears g_cache without touching this map, so after every cell transition every
+        // group held pointers into freed nodes, and emisRederive() below WRITES three floats through
+        // each member. That is a 12-byte write into a freed heap block, and it landed as an access
+        // violation in whatever the allocator handed that block to next — observed crashing inside an
+        // unrelated `unordered_map::find` in uploadEntry, on interior->exterior, 2026-08-19.
+        //
+        // Keys resolve through g_cache, so a member that is gone is simply not found: the same rule
+        // g_geomRefs already states for stale shape addresses — "a MISSED purge degrades to a harmless
+        // ghost rather than to a use-after-free". The unlink calls below are still the correctness
+        // path (they keep `area` right); this is what makes forgetting one non-fatal.
+        struct EmisGroup {
+            double area = 0.0;                        // summed world-space emissive area of the members
+            std::vector<std::uint32_t> members;       // g_cache keys — see above, NEVER pointers
+        };
+        std::unordered_map<std::uint64_t, EmisGroup> g_emisGroups;
+
+        std::uint64_t emisGroupKey(const void* light, const char* tex) {
+            std::uint64_t h = (std::uint64_t)(std::uintptr_t)light * 0x9E3779B97F4A7C15ull;
+            for (const char* p = tex; p && *p; ++p) {
+                h ^= (std::uint64_t)(unsigned char)(*p);
+                h *= 0x100000001B3ull;
+            }
+            return h | 1ull;   // never 0 — 0 is the "ungrouped" sentinel
+        }
+
+        // Re-derive every member's gain from the group's CURRENT total area. Called whenever the group
+        // grows (a new facet captured) or shrinks (one evicted), so a fixture's brightness does not
+        // depend on how many of its pieces happen to be resident.
+        // A member key that no longer resolves is dropped here rather than dereferenced. With the
+        // unlink sites below all covered this never fires; it exists so that adding a fifth cache-erase
+        // site later costs a slightly-too-large group area (survivors mildly dim, self-correcting on the
+        // next capture) instead of a heap write into freed memory.
+        void emisRederive(EmisGroup& g) {
+            auto& m = g.members;
+            m.erase(std::remove_if(m.begin(), m.end(),
+                                   [](std::uint32_t k) { return g_cache.find(k) == g_cache.end(); }),
+                    m.end());
+            const float a = (float)((g.area > 1.0e-6) ? g.area : 1.0e-6);
+            for (std::uint32_t k : m) {
+                CachedGeometry& e = g_cache.find(k)->second;
+                e.emissiveGain[0] = e.emissiveFlux[0] / a;
+                e.emissiveGain[1] = e.emissiveFlux[1] / a;
+                e.emissiveGain[2] = e.emissiveFlux[2] / a;
+            }
+        }
+
+        // Take an entry out of its group and re-derive the survivors. Called from the cache-erase
+        // sites and from the top of computeEmissiveGain (a re-capture must not double-count its area).
+        // MUST be called at EVERY site that destroys a cache entry, before the entry dies — that is
+        // what keeps the group's summed area equal to the areas actually resident. purgeAll() is the
+        // exception and clears g_emisGroups outright instead (the whole cache goes at once).
+        void emisUngroup(std::uint32_t key, CachedGeometry& e) {
+            if (!e.emissiveGroup) { return; }
+            auto it = g_emisGroups.find(e.emissiveGroup);
+            if (it != g_emisGroups.end()) {
+                EmisGroup& g = it->second;
+                g.area -= (double)e.emissiveArea;
+                auto& m = g.members;
+                m.erase(std::remove(m.begin(), m.end(), key), m.end());
+                if (m.empty()) {
+                    g_emisGroups.erase(it);
+                } else {
+                    if (g.area < 0.0) { g.area = 0.0; }   // float drift can only ever go slightly negative
+                    emisRederive(g);
+                }
+            }
+            e.emissiveGroup = 0;
+            e.emissiveArea  = 0.0f;
+            e.emissiveGain[0] = e.emissiveGain[1] = e.emissiveGain[2] = 1.0f;
+        }
+
         // The shape's OWN light = a point light whose world position lies inside the shape's own
         // world bound — a lantern's NiPointLight sits at the flame, inside its paper. Nearest
         // wins if several qualify. The snapshot is already filtered to lights the engine would
         // actually render (radius > 0 and affectedNodes non-empty — see scenegraph.cpp's walk),
         // so a logically-off lantern can't donate a gain.
+        // WHY did a shape that plainly looks like a fixture not get a gain? Every early return in
+        // computeEmissiveGain is silent, so the log only ever showed SUCCESSES — and the inference
+        // that follows from "candle A logged, candle B did not" is that B's mesh authors no
+        // emissive. That inference was wrong once already, and expensively: these flames are
+        // generated at RUNTIME by an MWSE mod, so there is no disk NIF to check and scanning
+        // light_de_candle_12.nif proved nothing about the flame at all. The gate that actually
+        // rejected a shape has to say so itself.
+        //
+        // One line per texture (interned pointer, same key as the success log), logging builds only.
+        void emisLogReject(const CachedGeometry& e, const char* why,
+                           float r, float tol, float nearestD, float area) {
+            if (!Configuration.LogDistantPipeline) return;
+            static std::unordered_set<const void*> s_loggedRej;
+            static const char kNoTexR[] = "";
+            const void* texKey = e.textureName ? (const void*)e.textureName : (const void*)kNoTexR;
+            if (s_loggedRej.size() >= 64 || !s_loggedRej.insert(texKey).second) return;
+            LOG::logline(">> [emissive] REJECT tex=%s why=%s emissive=(%.2f,%.2f,%.2f) "
+                         "r=%.1f tol=%.1f nearestLight=%.1f area=%.1f vCol=%u blend=%u/%u",
+                         e.textureName ? e.textureName : "(none)", why,
+                         e.matEmissive[0], e.matEmissive[1], e.matEmissive[2],
+                         r, tol, nearestD, area,
+                         (unsigned)e.vColSource, (unsigned)e.srcBlend, (unsigned)e.destBlend);
+        }
+
         void computeEmissiveGain(CachedGeometry& e, const NI::TriBasedGeometry* geom) {
+            // A re-capture must not add its area to the group twice, and every early return below has
+            // to leave the entry ungrouped with gain 1,1,1 — which is exactly what this does.
+            // The cache key IS the shape address (see visitGeometry), so the group needs no extra
+            // plumbing to hold keys rather than pointers.
+            const std::uint32_t emisKey = (std::uint32_t)(std::uintptr_t)geom;
+            emisUngroup(emisKey, e);
+            // Hoisted so the gate-1 diagnostic below can use the same thresholds the real gates do.
+            constexpr float kMaxFixtureBoundRadius = 64.0f;   // ~1.4m across: brazier/chandelier still fit
+            constexpr float kMaxOwnLightDistance   = 32.0f;   // the emitter sits in the fixture body
             if (e.matEmissive[0] <= 0.0f && e.matEmissive[1] <= 0.0f && e.matEmissive[2] <= 0.0f) {
+                // ⚠ Do NOT log every such shape — that is most of the world, and a flat budget would
+                // fill with walls and rocks before the fixture under investigation ever printed (the
+                // exact trap the success log already fell into). A shape is only worth a line if a
+                // point light is INSIDE it, which is the fixture-candidate test; the probe is
+                // logging-builds-only so it costs a release build nothing.
+                if (Configuration.LogDistantPipeline) {
+                    const float rr = geom->worldBoundRadius;
+                    if (rr > 0.0f && rr <= kMaxFixtureBoundRadius) {
+                        float nd2 = 3.0e30f;
+                        for (const auto& pl : g_lightSnapshot) {
+                            const float dx = pl.worldPos[0] - geom->worldBoundOrigin.x;
+                            const float dy = pl.worldPos[1] - geom->worldBoundOrigin.y;
+                            const float dz = pl.worldPos[2] - geom->worldBoundOrigin.z;
+                            const float d2 = dx * dx + dy * dy + dz * dz;
+                            if (d2 < nd2) { nd2 = d2; }
+                        }
+                        if (nd2 <= kMaxOwnLightDistance * kMaxOwnLightDistance) {
+                            emisLogReject(e, "authors-no-emissive", rr, 0.0f, std::sqrt(nd2), 0.0f);
+                        }
+                    }
+                }
                 return;
             }
             const float r = geom->worldBoundRadius;
-            if (!(r > 0.0f)) return;
+            if (!(r > 0.0f)) { emisLogReject(e, "bound-radius<=0", r, 0.0f, 0.0f, 0.0f); return; }
 
             // This models a self-illuminated FIXTURE: a lantern is a ~30cm object with its emitter
             // inside it. Measured, that is bound radius 14.1 units with the light 0.5 units off
@@ -808,44 +1026,149 @@ namespace MGE::GeometryCache {
             // (0.01,0.01,0.00) and those windows stayed dark, while every smaller window in the
             // same scene (gain 1,1,1) glowed correctly.
             //
-            // Gate both, absolutely. Real fixtures are unaffected (their own radius still binds);
-            // architecture is rejected outright rather than merely needing a nearer lantern.
+            // Gate both, absolutely: architecture is rejected outright rather than merely needing a
+            // nearer lantern. (The "their own radius still binds" that used to be claimed here is no
+            // longer true and was never right — see kMinFixtureTol below, where a flame sliver's
+            // 2.6-unit radius was rejecting its own candle's light.)
             // Rejection leaves emissiveGain at 1, so the authored emissive passes through — the
             // correct answer for a shape that has no fixture light of its own.
-            constexpr float kMaxFixtureBoundRadius = 64.0f;   // ~1.4m across: brazier/chandelier still fit
-            constexpr float kMaxOwnLightDistance   = 32.0f;   // the emitter sits in the fixture body
-            if (r > kMaxFixtureBoundRadius) return;           // architecture, not a fixture
-            const float tol = (r < kMaxOwnLightDistance) ? r : kMaxOwnLightDistance;
+            if (r > kMaxFixtureBoundRadius) {                 // architecture, not a fixture
+                emisLogReject(e, "bound-too-big(architecture)", r, kMaxFixtureBoundRadius, 0.0f, 0.0f);
+                return;
+            }
+            // ⚠ A CEILING WAS NOT ENOUGH: min(r, 32) MEASURES THE WRONG OBJECT.
+            //
+            // tol was the EMISSIVE SLIVER'S OWN radius, so a flame billboard (r 2.6 — about 2.6 cm)
+            // demanded that its light sit inside the flame polygon. Two flames generated by the SAME
+            // MWSE mod, same CandleFlameAnimNode, same authored emissive (1,1,1), same r 2.6,
+            // differed only in where the mod parked the light node:
+            //
+            //     r0_candleflame_blu.dds   d=1.3  ->  accepted, gain (1.57, 220.46, 399.97)
+            //     r0_candleflame.dds       d=3.7  ->  REJECTED, no gain at all
+            //
+            // A 1.1-unit difference decided whether a flame was self-illuminated. The fixture is the
+            // CANDLE, whose body is tens of units across; the flame is one sliver of it and its own
+            // radius says nothing about where the wick is relative to the wax.
+            //
+            // 16 units (~16 cm) is the order of the fixture bodies themselves (observed r 6..20) and
+            // twice the largest offset any ACCEPTED fixture showed (7.6, the glass shade). Loosening
+            // is fail-safe in the only direction that matters: fixture grouping sums area over the
+            // pieces sharing a light, so a wrongly-claimed light can only make a fixture DIMMER,
+            // never nuclear. And the case that genuinely went wrong before — a facade-wide window
+            // strip (r=529.6) claiming a street lantern 365 units away — is rejected by
+            // kMaxFixtureBoundRadius above, which is the gate that was actually load-bearing.
+            constexpr float kMinFixtureTol = 16.0f;
+            const float tolRaw = (r < kMaxOwnLightDistance) ? r : kMaxOwnLightDistance;
+            const float tol    = (tolRaw > kMinFixtureTol) ? tolRaw : kMinFixtureTol;
 
             const MGE::SceneGraph::PointLight* own = nullptr;
             float bestD2 = tol * tol;   // doubles as the inside-the-fixture threshold
+            float nearD2 = 3.0e30f;     // nearest light REGARDLESS of tol — for the reject line only
             for (const auto& pl : g_lightSnapshot) {
                 const float dx = pl.worldPos[0] - geom->worldBoundOrigin.x;
                 const float dy = pl.worldPos[1] - geom->worldBoundOrigin.y;
                 const float dz = pl.worldPos[2] - geom->worldBoundOrigin.z;
                 const float d2 = dx * dx + dy * dy + dz * dz;
+                if (d2 < nearD2) { nearD2 = d2; }
                 if (d2 <= bestD2) { bestD2 = d2; own = &pl; }
             }
-            if (!own) return;
-
-            const float area = computeEmissiveArea(geom);
-            if (!(area > 0.0f)) return;
-
-            for (int i = 0; i < 3; ++i) {
-                e.emissiveGain[i] = kEmissiveFlux * own->diffuse[i] / area;
+            if (!own) {
+                // ⚠ THE LIKELIEST REJECTION FOR A FLAME, and the one worth reading the numbers on.
+                // tol is min(r, 32) — the EMISSIVE SHAPE'S OWN radius — so a tiny billboard gets a
+                // tiny search sphere. A flame quad is r~2.6, which demands its light sit within 2.6
+                // units of the quad centre. That holds for a stubby candle and fails for a tall
+                // taper whose light node is at the base while the flame is at the wick. If this line
+                // shows nearestLight >> tol, the tolerance is measuring the wrong object: the
+                // fixture's extent is the parent reference's, not the flame sliver's.
+                emisLogReject(e, "no-light-within-tol", r, tol, std::sqrt(nearD2), 0.0f);
+                return;
             }
 
+            // AREA: the summed polygon area when there is geometry to measure, and the bound's
+            // silhouette when there is not.
+            //
+            // A PARTICLE system has no static triangle list — getActiveTriangleCount() is 0 — so
+            // MW's own torch fire (tx_firealpha10.tga) found its light comfortably (2.8 units against
+            // a tol of 20), carried emissive (1,1,1), and was then thrown out on area<=0. That is a
+            // SECOND and independent reason flames came out dead, and it is the one that hit
+            // TORCHES rather than candles.
+            //
+            // pi*r^2 is the disc the sprite cloud covers. It is deliberately a LOWER bound on the
+            // true summed quad area — overlapping billboards exceed their own silhouette — and
+            // therefore an UPPER bound on the gain, which is the honest direction for a fallback to
+            // err. It lands MW's torch fire at k_eff ~3.3, in family with the paper-lantern
+            // reference's 2.2 rather than with the candle flame's 402.
+            //
+            // ⚠ r is ALREADY world-space (it is compared against light WORLD positions above), so
+            // unlike computeEmissiveArea this must NOT re-apply worldTransform.scale.
+            float area = computeEmissiveArea(geom);
+            const bool areaFromBound = !(area > 0.0f);
+            if (areaFromBound) {
+                area = 3.14159265f * r * r;
+            }
+            if (!(area > 0.0f)) {
+                emisLogReject(e, "area<=0", r, tol, std::sqrt(bestD2), area);
+                return;
+            }
+
+            // JOIN THE FIXTURE'S GROUP. The numerator is this light's flux; the denominator is the
+            // WHOLE fixture's emissive area for this texture, not this one piece's — see EmisGroup.
+            for (int i = 0; i < 3; ++i) {
+                e.emissiveFlux[i] = kEmissiveFlux * own->diffuse[i];
+            }
+            e.emissiveArea  = area;
+            e.emissiveGroup = emisGroupKey(own->source, e.textureName ? e.textureName : "");
+            EmisGroup& grp = g_emisGroups[e.emissiveGroup];
+            grp.area += (double)area;
+            grp.members.push_back(emisKey);
+            emisRederive(grp);   // rewrites THIS member and every sibling already resident
+
             if (Configuration.LogDistantPipeline) {
-                static uint32_t s_logged = 0;
-                if (s_logged < 16) {
-                    ++s_logged;
+                // ⚠ ONE LINE PER TEXTURE, not the first N lines. A flat budget is worthless here and
+                // that cost real time: a FLICKERING light re-captures its flame every few frames, and
+                // 13 of 24 slots went to one blue candle flame re-logging itself while the fixture
+                // actually under investigation never printed at all. textureName is interned
+                // (g_textureNameMap), so the pointer is a stable per-texture key.
+                static std::unordered_set<const void*> s_loggedTex;
+                // Textureless emissive shapes share one slot rather than one each — they are rare and
+                // indistinguishable in the log anyway. (`this` is not available: free function.)
+                static const char kNoTex[] = "";
+                const void* texKey = e.textureName ? (const void*)e.textureName : (const void*)kNoTex;
+                if (s_loggedTex.size() < 64 && s_loggedTex.insert(texKey).second) {
+                    // `area` is this PIECE; `grpArea`/`pieces` are the FIXTURE. gain is derived from the
+                    // fixture, so a lantern's 8th facet re-derives the other 7 and all of them move.
+                    // capGain is what emissiveForDraw() will actually ship with the current knobs — the
+                    // number to compare against a dump, because the raw gain never reaches the frame.
+                    float cg[3] = { e.emissiveGain[0], e.emissiveGain[1], e.emissiveGain[2] };
+                    const float pk = (cg[0] > cg[1]) ? ((cg[0] > cg[2]) ? cg[0] : cg[2])
+                                                     : ((cg[1] > cg[2]) ? cg[1] : cg[2]);
+                    if (g_emissiveMaxK > 0.0f && pk > g_emissiveMaxK) {
+                        const float k = g_emissiveMaxK / pk;
+                        cg[0] *= k; cg[1] *= k; cg[2] *= k;
+                    }
+                    // ⚠ blend/matAlpha are here because a huge emissive can still land as nothing on
+                    // screen: an ALPHA-BLENDED draw contributes `rgb*a + dst*(1-a)`, so a flame sprite
+                    // whose alpha is low delivers a fraction of whatever radiance it was handed. When
+                    // `draw=` is large and the frame is not, this is the next thing to read — and it
+                    // separates "the gain never reached the draw" from "the draw could not deliver it".
                     LOG::logline(">> [emissive] fixture tex=%s emissive=(%.2f,%.2f,%.2f) light=(%.3f,%.3f,%.3f) "
-                                 "d=%.1f r=%.1f tol=%.1f area=%.1f gain=(%.2f,%.2f,%.2f)",
+                                 "d=%.1f r=%.1f tol=%.1f area=%.1f grpArea=%.1f pieces=%u "
+                                 "gain=(%.2f,%.2f,%.2f) -> draw=(%.2f,%.2f,%.2f) [k_eff %.2f cap %.0f x%.2f] "
+                                 "blend=%u/%u matAlpha=%.2f vCol=%u areaSrc=%s",
                                  e.textureName ? e.textureName : "(none)",
                                  e.matEmissive[0], e.matEmissive[1], e.matEmissive[2],
                                  own->diffuse[0], own->diffuse[1], own->diffuse[2],
                                  std::sqrt(bestD2), r, tol, area,
-                                 e.emissiveGain[0], e.emissiveGain[1], e.emissiveGain[2]);
+                                 (float)grp.area, (unsigned)grp.members.size(),
+                                 e.emissiveGain[0], e.emissiveGain[1], e.emissiveGain[2],
+                                 cg[0] * g_emissiveScale, cg[1] * g_emissiveScale, cg[2] * g_emissiveScale,
+                                 kEmissiveFlux / (float)((grp.area > 1e-6) ? grp.area : 1e-6),
+                                 g_emissiveMaxK, g_emissiveScale,
+                                 (unsigned)e.srcBlend, (unsigned)e.destBlend,
+                                 e.matDiffuse[3], (unsigned)e.vColSource,
+                                 // `bound` means this is a particle sprite measured by its
+                                 // silhouette, not by polygons — read k_eff with that in mind.
+                                 areaFromBound ? "bound" : "tri");
                 }
             }
         }
@@ -901,6 +1224,11 @@ namespace MGE::GeometryCache {
             e.matAmbient[0]  = e.matAmbient[1]  = e.matAmbient[2]  = e.matAmbient[3]  = 1.0f;
             e.matEmissive[0] = e.matEmissive[1] = e.matEmissive[2] = e.matEmissive[3] = 0.0f;
             e.emissiveGain[0] = e.emissiveGain[1] = e.emissiveGain[2] = 1.0f;   // no boost
+            // Fixture grouping starts empty. NOT reset via emisUngroup here: this runs on the capture
+            // path BEFORE computeEmissiveGain, which calls emisUngroup itself — clearing the key here
+            // without touching the map would orphan this entry's area inside its old group and every
+            // sibling would go permanently dim.
+            e.emissiveFlux[0] = e.emissiveFlux[1] = e.emissiveFlux[2] = 0.0f;
             // Vertex-colour routing. MGE's rule is PROPERTY-driven: vertex colours are used only
             // when a NiVertexColorProperty says so. A shape carrying a colour ARRAY but no such
             // property falls through as SOURCE_IGNORE, so the material drives diffuse — and with it
@@ -2482,6 +2810,7 @@ namespace MGE::GeometryCache {
             if (it != g_cache.end() && it->second.dataPtr != data) {
                 // Recycled NiTriShape address (or a live setModelData swap): the entry
                 // describes a different mesh — drop it and rebuild through the fresh path.
+                emisUngroup(key, it->second);  // leave the fixture group before the entry dies
                 releaseEntry(it->second);
                 g_cache.erase(it);
                 g_geomRefs.erase(key);   // key leaving the cache → drop the engine ref
@@ -4729,6 +5058,8 @@ namespace MGE::GeometryCache {
                 if (evict) {
                     ++nEvicted;
                     g_evictedKeys.push_back(it->first);   // tell the Forge feed to release the host slot
+                    emisUngroup(it->first, e);           // ...and out of its fixture group, so the
+                                                         // surviving facets re-derive off the smaller area
                     releaseEntry(e);
                     g_geomRefs.erase(it->first);          // key leaving the cache → drop the engine ref
                     g_moverCandidates.erase(it->first);   // key leaving the cache → drop from every
@@ -4960,10 +5291,117 @@ namespace MGE::GeometryCache {
         return g_fpPartRecs;
     }
 
-    void emissiveForDraw(const CachedGeometry& e, float* out) {
-        out[0] = e.matEmissive[0] * e.emissiveGain[0];
-        out[1] = e.matEmissive[1] * e.emissiveGain[1];
-        out[2] = e.matEmissive[2] * e.emissiveGain[2];
+    // LIVE emissive level (dev panel). Applied HERE and not folded into kEmissiveFlux, and the
+    // difference is the whole reason it exists: emissiveGain is computed ONCE per cache entry
+    // (computeEmissiveGain, alongside the VB upload), so a constant change needs a rebuild AND a
+    // full cache re-walk before a single fixture moves. This function runs at draw-list build, every
+    // frame, for every emissive draw — so a multiplier here is live, and the calibration can be
+    // found on a screen in one session instead of across N rebuilds.
+    //
+    // 1.0 ships, which with the measured area_ref puts the reference paper lantern at k_eff = 2.2 —
+    // the value the LDR-era constant was always aiming at and never reached. **2.05 reaches the
+    // measured k_ref of 4.5**, i.e. the value the model was fitted to and that HDR now makes
+    // expressible; that is the number to try first.
+    //
+    // ⚠ IT WILL MOVE THE EXPOSURE SERVO, and in a lantern-lit interior that is the dominant effect
+    // rather than a side effect. Measured on hdrdump/mge_0000.exr (a blue glass lantern on a desk):
+    // the lantern is **69.1% of the frame's total light energy in 0.23% of its area**. Multiply it and
+    // a frame-MEAN meter follows it almost exclusively — at x6.4 it becomes ~96% of the reading, the
+    // servo drops E from 7.26 to ~1.5, and the ROOM goes ~5x darker on screen while the lantern looks
+    // unchanged. The fix is the meter, not this knob: g_expStat = 1 (p90) so a 0.23%-area source
+    // cannot dominate. The host now defaults to p90 for exactly this reason.
+    float g_emissiveScale = 1.0f;
+
+    // ⚠ CEILING ON k_eff, AND IT EXISTS BECAUSE flux/area DOUBLE-COUNTS THE FLUX.
+    //
+    // The model divides a light's flux by ONE shape's area. That is right for a fixture that is one
+    // emissive surface (a paper lantern: a single shape, area 1883.5, k_eff 2.2). It is wrong the
+    // moment a fixture has SEVERAL emissive shapes sharing one light, because each of them then
+    // claims the FULL flux and divides it by its own — smaller — area. Measured on
+    // `light_de_lantern_02.nif`, which has **8 emissive shapes** off one blue light:
+    //
+    //     glass panels   area 159.1  -> k_eff  26.0
+    //     flame billboard area 10.3  -> k_eff 402.0     <-- the same flux, 1/15th the area
+    //
+    // The flux is emitted once and counted eight times, and the SMALLEST shape wins hardest. That is
+    // the whole of "the glass lantern has no business going nuclear" (user, 2026-08-18): the measured
+    // peak was 1212 in blue, ~550x the paper lantern it is calibrated against.
+    //
+    // A second, independent reason the small end is untrustworthy: MW's flame is a BILLBOARD standing
+    // in for a volume, so its triangle area is not an emitting area at all. Below some size the mesh
+    // stops being a measurement of the emitter and the division stops meaning anything. So this is
+    // equivalently an AREA FLOOR (area >= kEmissiveFlux/cap), which is the more honest reading of it.
+    //
+    // The real fix is to share one light's flux across the shapes that claim it, which needs a
+    // group-by-light pass over the cache — a bigger change than a clamp, and one that wants its own
+    // A/B. This ceiling is the honest interim: it bounds the artefact without pretending the model is
+    // right, and it is LIVE so the bound can be found on a screen.
+    //
+    // ⚠⚠ HUE-PRESERVING BY CONSTRUCTION — it scales all three channels by ONE factor. Clamping
+    // channels independently is the "hot cream" bug from the LDR era verbatim: a saturated light has
+    // R:G:B far from 1:1:1, per-channel clipping snaps the ratio toward 1, and an orange lantern
+    // reads as hot cream. The cap is taken on the MAX component (MW light colours have a max channel
+    // near 1, so max(gain) ~= k_eff) and applied as a scalar.
+    //
+    // ⚠ **DEFAULT 0 (OFF) — THE CEILING WAS A BAND-AID AND THE FIXTURE GROUPING RETIRED IT.**
+    //
+    // It shipped at 32 for one build, to bound a lantern reaching 1069 in blue. That was the wrong
+    // level to fix it at, twice over:
+    //   1. The 1069 was a COMPOSITE of ~8 stacked alpha-blended glass layers, and a per-DRAW clamp
+    //      cannot bound a sum of draws. It reduced the peak without addressing the cause.
+    //   2. The cause was flux DOUBLE-COUNTING, now fixed properly by grouping the area over a
+    //      fixture's pieces (see EmisGroup). The glass shade fell 26.05 -> 3.26 k_eff on its own,
+    //      measured across pieces=1..8 in the [emissive] log, with no clamp involved.
+    //
+    // With the real bug gone, the ceiling only suppressed CORRECT behaviour, and the flame is where
+    // that showed: its k_eff is 402.89 and the cap was shipping 32 — a 12.6x suppression of exactly
+    // the emitter that is supposed to be the brightest thing in the room ("flames are not that high
+    // though" — user, 2026-08-18). A flame legitimately earns a huge k_eff: pieces=1, area 10.3, and
+    // it is a genuinely small intense emitter. That is the model working, not failing.
+    //
+    // Kept as a SAFETY VALVE rather than deleted: if a mod ships a one-triangle emissive sliver with a
+    // light inside it, flux/area will hand it a five-figure k_eff, and this is the one-slider answer.
+    // Reach for it only after checking `grpArea`/`pieces` in the log — if pieces is 1 where the fixture
+    // plainly has many, the grouping is what is broken and clamping would hide it again.
+    float g_emissiveMaxK = 0.0f;
+
+    // ⚠ THIS RETURNS THE GAIN, NOT THE PRODUCT, AND THAT IS THE WHOLE POINT.
+    //
+    // It used to return `matEmissive * gain` and the callers shipped it in the wire's matEmissive
+    // lane. That lane is an AUTHORED colour: the host's opaque.vert/multimap.vert push it through
+    // decodeAuthored() (srgbToLinear), because MW's material bytes are display-referred and their
+    // partner in the very next multiply — the base texel — is decoded by the sampler. srgbToLinear
+    // is unclamped above 1.0, so smuggling a RATIO through it exponentiated the ratio:
+    //
+    //     gain 2.11 -> 5.61    3.18 -> 14.7    14.30 -> 526    25.95 -> 2189    401.31 -> 1.56e6
+    //
+    // That is the "nuclear" glass lantern, measured at 1069 in a linear EXR dump: 2189 x its blue
+    // albedo. The grouping fix looked dramatic for the same reason — dropping the gain 25.95 -> 3.18
+    // (7x) dropped delivered radiance 2189 -> 14.7 (149x), because it was moving down a 2.4-power
+    // curve, not a linear one.
+    //
+    // The other half: on vColSource 1 (SRC_EMISSIVE) the emissive IS the vertex colour, and every
+    // paired frag reads In.Color.rgb and never touches MatEmissive — so for candle and torch flames
+    // the product was computed, shipped, and then discarded. Two bugs pulling opposite ways, which
+    // is exactly the contrast that showed up in play: lanterns nuclear, flames dead.
+    //
+    // So the ratio now travels in its own wire lane (DrawItemWire::emissiveGain) and the VERT
+    // applies it after the decode, to whichever source vColSource selected. The authored
+    // matEmissive keeps its own lane and its own decode — the data is there, so it is used.
+    void emissiveForDraw(const CachedGeometry& e, float* outGain) {
+        float g0 = e.emissiveGain[0], g1 = e.emissiveGain[1], g2 = e.emissiveGain[2];
+        const float cap = g_emissiveMaxK;
+        if (cap > 0.0f) {
+            const float peak = (g0 > g1) ? ((g0 > g2) ? g0 : g2) : ((g1 > g2) ? g1 : g2);
+            if (peak > cap) {
+                const float k = cap / peak;   // ONE factor, all three channels — see above
+                g0 *= k; g1 *= k; g2 *= k;
+            }
+        }
+        const float s = g_emissiveScale;
+        outGain[0] = g0 * s;
+        outGain[1] = g1 * s;
+        outGain[2] = g2 * s;
     }
 
     uint64_t currentFrame() {
@@ -5008,6 +5446,14 @@ namespace MGE::GeometryCache {
             releaseEntry(kv.second);
         }
         g_cache.clear();
+        // ⚠ THE FIXTURE GROUPS GO WITH THE CACHE. Every EmisGroup's members are keys into g_cache, so
+        // once it is empty every group is empty by definition — and leaving them behind was the
+        // interior<->exterior crash: the next fixture whose (light address, texture) hashed onto a
+        // surviving group re-derived it, writing three floats through each dead member. Light
+        // addresses recycle across a cell teardown and texture names are interned, so that collision
+        // is ordinary, not exotic. It also left every group's `area` counting corpses, which would
+        // have made re-captured fixtures permanently dim even without the crash.
+        g_emisGroups.clear();
         g_moverCandidates.clear();   // whole cache dropped → no derived membership survives
         g_skyKeys.clear();
         g_fpKeys.clear();
@@ -5049,6 +5495,7 @@ namespace MGE::GeometryCache {
         if (it != g_cache.end() && it->second.dataPtr != data) {
             // A live setModelData swap (the address itself can no longer be recycled onto a new
             // shape — g_geomRefs pins it — but the DATA behind it can still be replaced).
+            emisUngroup(key, it->second);   // out of its fixture group first — this entry is about to die
             releaseEntry(it->second);
             g_cache.erase(it);
             g_geomRefs.erase(key);   // key leaving the cache → drop the engine ref

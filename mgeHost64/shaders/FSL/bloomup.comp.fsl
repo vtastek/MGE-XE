@@ -1,0 +1,103 @@
+// mgeHost64 — bloom pyramid upsample + accumulate: mip i+1 -> INTO mip i.
+// tasks/forge-postprocess.md step 4.
+//
+// The progressive-upsample half of the pyramid (CoD/Jimenez shape): walk back up from the smallest
+// level, and at each step blend the blurrier level above into the level below. RWTex2D
+// read-modify-write, skyheight.srt.h:57's idiom, because the destination already holds what the down
+// chain put there.
+//
+// ⚠⚠ `dst = lerp(dst, up(src), blend)`, **NOT** `dst += up(src)`, and this single line is what makes
+// the thresholdless design work. With an add, blur(const) = 7c over a 7-level chain: a flat overcast
+// sky would bloom to seven times itself and `lerp(scene, 7*scene, 0.06)` hazes the whole frame by
+// 1.36x — exactly the failure the no-threshold decision exists to avoid, and exactly the artefact the
+// legacy `Bloom Fine.fx` needed a fog-distance depth cut to hide. With a lerp every level's kernel
+// stays a partition of unity, so the total pyramid kernel integrates to 1, energy in equals energy
+// out, and blur(const) == const at every level. Verification step 4 (a flat overcast sky must stay
+// flat) and step 7 (`exp=` must not drift) are both tests of THIS line.
+//
+// At blend 0.5 mip 0 ends up 1/2 its own content + 1/4 mip1 + 1/8 mip2 + ... + 1/64 mip6 — a tight
+// core with a wide skirt, which is the shape a bloom is supposed to have.
+//
+// ── THE KERNEL ───────────────────────────────────────────────────────────────────────────────────
+//
+// A separable tent centred on the dst texel's true position in SRC space, which is
+//     srcCoord = (p + 0.5)/2 - 0.5 = p/2 - 0.25,
+// i.e. offset f = -0.25 for even p and +0.25 for odd p from the src texel m = p >> 1. Weight for the
+// tap at src texel m+t is tent(|t - f| / h) with h = radius + 1 and tent(x) = max(0, 1 - x), then the
+// whole set is normalised. 5 taps per axis covers the support for radius <= 2; 25 loads.
+//
+// Two properties are load-bearing and both come from centring on srcCoord rather than on m:
+//   SYMMETRY. The kernel is symmetric about the dst texel's own position, so even and odd dst texels
+//   cannot be displaced in opposite directions. A nearest-centred kernel with asymmetric weights
+//   (which is what folding the half-texel phase into the weights and then widening the taps
+//   produces) shifts alternating texels the opposite way and reads as a COMB.
+//   CONSTANT PRESERVATION. Normalising after the fact makes any radius a partition of unity, which
+//   is the property the lerp above needs at every level.
+//
+// radius 0 => h = 1 => weights (0.25, 0.75) on the two straddled texels, i.e. EXACTLY a bilinear
+// upsample with no smoothing. radius 1 => h = 2, the reference tent — this is the same filter as
+// "bilinear upsample then a [1,2,1] blur", which is the standard reference form; doing it directly on
+// the src grid is what keeps it to 25 loads instead of 9 manual bilinear fetches (36).
+//
+// ⚠ ALL FOUR CHANNELS, IDENTICAL WEIGHTS, and no radiometric term — a pure filter, same as the
+// downsample. The exposure and the threshold were applied once in the prefilter. See bloom.srt.h.
+//
+// 8x8 groups, dst bound re-checked per thread. Src taps clamp to the SRC level's RENDER rect from
+// the cbuffer (GetDimensions returns the ALLOCATION dims and would let the taps reach stale texels).
+
+#include "bloom.srt.h"
+
+ROOT_SIGNATURE(ComputeRootSignature)
+NUM_THREADS(8, 8, 1)
+void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
+{
+    INIT_MAIN;
+    int2 p    = int2(DispatchThreadID.xy);
+    int2 dstN = int2(gBloomParams.dst.xy);
+    if (p.x >= dstN.x || p.y >= dstN.y)
+    {
+        RETURN();
+    }
+
+    int2  m  = p >> 1;                                       // the src texel the dst texel straddles
+    int2  hi = int2(gBloomParams.src.xy) - int2(1, 1);
+    // The half-texel phase: +0.25 on odd dst texels, -0.25 on even ones.
+    float2 f = float2(((p.x & 1) != 0) ? 0.25f : -0.25f,
+                      ((p.y & 1) != 0) ? 0.25f : -0.25f);
+    float  h = max(gBloomParams.filt.z, 0.0f) + 1.0f;         // tent half-width in src texels
+    float  invH = 1.0f / h;
+
+    float wx[5]; float wy[5];
+    float sx = 0.0f; float sy = 0.0f;
+    UNROLL for (int t = -2; t <= 2; ++t)
+    {
+        float a = max(0.0f, 1.0f - abs(float(t) - f.x) * invH);
+        float b = max(0.0f, 1.0f - abs(float(t) - f.y) * invH);
+        wx[t + 2] = a; sx += a;
+        wy[t + 2] = b; sy += b;
+    }
+    float norm = 1.0f / max(sx * sy, 1.0e-6f);
+
+    // Every tap is loaded unconditionally and the out-of-support ones are multiplied by a weight of
+    // exactly 0. No early-out, deliberately: the clamp keeps every tap inside the src level's render
+    // rect, which this frame's prefilter/down chain has certainly written, so there is no
+    // not-a-number for a zero weight to fail to kill ([[project_nan_survives_zero_multiply]]) — and
+    // a branch per tap costs more than the load it skips.
+    float4 c = float4(0.0f, 0.0f, 0.0f, 0.0f);
+    UNROLL for (int j = 0; j < 5; ++j)
+    {
+        UNROLL for (int i = 0; i < 5; ++i)
+        {
+            int2 q = clamp(m + int2(i - 2, j - 2), int2(0, 0), hi);
+            c += (wx[i] * wy[j]) * LoadRWTex2D(gBloomSrc, q);
+        }
+    }
+    c *= norm;
+
+    // Read-modify-write. `blend` is a lerp and not an add — see the header. All four channels take
+    // the same factor, so the premultiplied pair survives the blend intact.
+    float4 cur   = LoadRWTex2D(gBloomDst, p);
+    float  blend = saturate(gBloomParams.filt.w);
+    Write2D(gBloomDst, p, lerp(cur, c, blend));
+    RETURN();
+}

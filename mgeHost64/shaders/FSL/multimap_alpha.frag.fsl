@@ -159,7 +159,10 @@ float4 PS_MAIN( VSOutput In )
                   : (uvSet == 2u) ? In.Uv2 : In.Uv3;
         float4 t = sampleBase(tex, clampMode, uv, useLowAF(alphaRef, false));
         // Step 5: MOD2X's literal 2 is a display-space number (multimap.frag carries the reasoning).
-        if (op == 0u)      { float3 b = t.rgb * albScale; c = b * lit; baseA = t.a; alb = b; }
+        // The emissive gain lands only on CLIPPED texels (scenecolor.h.fsl), and the clipping is
+        // measured on the EXPOSED value — this route's coverage is the same baseA * In.Color.a the
+        // tail returns as outA, available here because baseA is just this stage's t.a.
+        if (op == 0u)      { float3 b = t.rgb * albScale; c = b * (lit + expandExposedEmissiveDelta(emis, b, t.a * In.Color.a)); baseA = t.a; alb = b; }
         else if (op == 1u) { c *= t.rgb;        alb *= t.rgb; }
         else if (op == 2u) { float3 m = mod2xStage(t.rgb); c *= m; alb *= m; }
         else               { c += t.rgb;        alb += t.rgb; }

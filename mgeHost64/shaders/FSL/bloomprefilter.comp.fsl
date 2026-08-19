@@ -1,0 +1,141 @@
+// mgeHost64 — bloom prefilter: pMSAAColor -> pBloomMips mip 0.  tasks/forge-postprocess.md step 4.
+//
+// ⚠ THIS PASS IS THE MSAA RESOLVE, which is why bloom needs no resolve/composite split. A 2x
+// downsample of an MSAA target already averages every sub-sample in a 2x2 pixel footprint; there is
+// nothing a Catmull-Rom reconstruction could hand it that a box average of the same samples does
+// not already contain, because the output grid is half as dense as the thing being reconstructed.
+// Same call reflectmipfirst made at W5, for the same reason.
+//
+// The footprint is 2x2 PIXELS x SAMPLE_COUNT SAMPLES = 8 loads at 2x, 16 at 4x. A plain box, not the
+// [1,3,3,1] tent the reduce below it uses, and that is a deliberate ship-and-measure decision rather
+// than an oversight: reflectmip.comp.fsl:10-27 shows a 2-tap box still passes 0.707 at the fold
+// frequency, so mid-band content folds to low frequency and reads as CRAWL. Here that content has
+// already been through the MSAA sample pattern, which is the sub-pixel prefilter the reflect path
+// did not have. If bloom shimmers when the camera pans slowly across high-contrast foliage, widening
+// this to the same tent is the fix, at 4x the loads — measure first (this file hot-reloads).
+//
+// THREE THINGS HAPPEN HERE AND EXACTLY HERE, in this order:
+//
+//  1. THE KARIS FIREFLY WEIGHT, w = 1/(1 + luma). resolve.frag's own rule, on the premultiplied rgb
+//     for the reason resolve.srt.h gives at length (luminance-weighting a coverage value is
+//     meaningless for STRAIGHT alpha and correct for premultiplied). Including it closes the gap
+//     reflectmip.comp.fsl:34 opens against itself: scene-referred luma is unbounded, so one sample
+//     of the sun disc in a 4-sample pixel otherwise contributes a quarter of a huge number and the
+//     pyramid SPREADS that firefly down every level. ALL FOUR CHANNELS take this weight.
+//
+//  2. THE EXPOSURE MULTIPLY, on **rgb ONLY**. The composite in resolve.frag sits immediately after
+//     `straight *= tone.x`, so the pyramid has to be in the post-exposure domain or the lerp mixes
+//     two different unit systems. Alpha stays pure coverage — see bloom.srt.h for the algebra that
+//     makes this forced rather than stylistic (scale all four and E cancels in the un-premultiply).
+//
+//  3. THE SOFT-KNEE THRESHOLD, also rgb only, also for that reason. Ships at 0 = inert, and the
+//     thresholdless form is the whole point: blur(const) == const, so a flat sky blooms to itself.
+//
+// 8x8 groups. The dst bound is re-checked per thread rather than left to the OOB-write drop, because
+// the dst rect is a RENDER sub-rect of an alloc-sized surface: an overhang write would land INSIDE
+// the resource, in the stale-texel region, and then get read back by the up chain's clamp.
+
+#include "bloom.srt.h"
+
+// Same weights resolve.frag and the APL instrument use. The firefly test, the meter and the bloom
+// must agree on what "bright" means or none of the three measurements compose.
+float bLuminance(float3 c)
+{
+    return dot(c, float3(0.299f, 0.587f, 0.114f));
+}
+
+// Karis/Lottes soft-knee highlight isolation, in post-exposure scene-referred units. Returns the
+// FRACTION of the sample that survives, so 1.0 is "keep everything" and the whole function is a
+// provable no-op at threshold 0: soft = 0, contribution = max(0, luma)/max(luma,eps) = 1.
+//
+// The knee makes the transition quadratic instead of a step, which matters because a hard threshold
+// on a moving image pops — a highlight crossing the cut appears at full strength in one frame.
+float bThresholdFactor(float luma, float threshold, float knee)
+{
+    if (threshold <= 0.0f)
+    {
+        return 1.0f;      // thresholdless: the shipped path, and an exact identity
+    }
+    float k    = max(knee, 1.0e-4f);
+    float soft = clamp(luma - threshold + k, 0.0f, 2.0f * k);
+    soft       = (soft * soft) / (4.0f * k);
+    float keep = max(soft, luma - threshold);
+    return keep / max(luma, 1.0e-4f);
+}
+
+ROOT_SIGNATURE(ComputeRootSignature)
+NUM_THREADS(8, 8, 1)
+void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
+{
+    INIT_MAIN;
+    int2 p    = int2(DispatchThreadID.xy);
+    int2 dstN = int2(gBloomParams.dst.xy);
+    if (p.x >= dstN.x || p.y >= dstN.y)
+    {
+        RETURN();
+    }
+
+    // The SOURCE clamp bound is the scene's RENDER rect, not the allocation — everything outside it
+    // holds last frame's texels ([[project_forge_alloc_vs_render_uv]]).
+    int2  hi        = int2(gBloomParams.src.xy) - int2(1, 1);
+    float invLuma   = gBloomParams.opts.x;
+    float exposure  = gBloomParams.opts.y;
+    float threshold = gBloomParams.filt.x;
+    float knee      = gBloomParams.filt.y;
+
+    // ONE accumulator over all four channels — the filter weight is a filter weight and hits the
+    // whole premultiplied 4-vector (bloom.srt.h).
+    float4 sum   = float4(0.0f, 0.0f, 0.0f, 0.0f);
+    float  wsum  = 0.0f;
+
+    UNROLL for (int j = 0; j < 2; ++j)
+    {
+        UNROLL for (int i = 0; i < 2; ++i)
+        {
+            int2 q = clamp(p * 2 + int2(i, j), int2(0, 0), hi);
+            UNROLL for (int s = 0; s < SAMPLE_COUNT; ++s)
+            {
+#if SAMPLE_COUNT > 1
+                float4 smp = LoadTex2DMS(gBloomSceneTex, NO_SAMPLER, q, s);
+#else
+                float4 smp = LoadTex2D(gBloomSceneTex, NO_SAMPLER, q, 0);
+#endif
+                // A negative radiance is meaningless and the resolve floors it too; do it before the
+                // luma so a ringing sample cannot invent a negative Karis weight.
+                smp = max(smp, float4(0.0f, 0.0f, 0.0f, 0.0f));
+
+                // ── RADIOMETRIC, rgb only ──
+                float3 rgb  = smp.rgb * exposure;
+                float  luma = bLuminance(rgb);
+                rgb        *= bThresholdFactor(luma, threshold, knee);
+
+                // ── FILTER WEIGHT, all four ──
+                float w = 1.0f;
+                if (invLuma > 0.5f)
+                {
+                    w = 1.0f / (1.0f + luma);
+                }
+                sum  += float4(rgb, smp.a) * w;
+                wsum += w;
+            }
+        }
+    }
+
+    float4 outv = sum / max(wsum, 1.0e-5f);
+
+    // ⚠ fp16 RANGE GUARD, AND IT IS NOT A THRESHOLD. The accumulator above is fp32 (registers), the
+    // destination is fp16, and the exposure multiply is applied here: a scene value of ~2100 at the
+    // servo's E clamp of 32 lands past 65504 and the fp32 -> fp16 store yields **+inf, not a clamp**.
+    // In the main colour path an inf stays in the one pixel that made it and AgX's shoulder swallows
+    // it; in a PYRAMID it is far worse, because the very next tent SPREADS it over a neighbourhood and
+    // then over the whole level, and the composite hands a region of inf to the curve.
+    //
+    // 60000 is inside fp16's finite range with headroom, and it can only ever fire where the
+    // alternative is infinity — the down/up tents are normalised, so they cannot grow a value past
+    // this and one guard at mip 0 bounds the entire chain. Radiometrically this is the fp16 container
+    // speaking, not a highlight decision: nothing in MW's frame is 60000x middle grey.
+    outv.rgb = min(outv.rgb, float3(60000.0f, 60000.0f, 60000.0f));
+
+    Write2D(gBloomDst, p, outv);
+    RETURN();
+}

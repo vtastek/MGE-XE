@@ -202,11 +202,45 @@ STRUCT(ResolveParams)
     //
     // Seventh float4 = 112 B against a 256 B cbuffer, so still no allocation change.
     DATA(float4, curveScale, None);
+    // BLOOM (step 4). x = strength k in `lerp(straight, bloomStraight, k)`; y, z = the mip-0 RENDER
+    // extent in texels (the clamp bound for the four manual bilinear Loads); w = reserved.
+    //
+    // ⚠ THE COMPOSITE IS FORCED TO LIVE IN THIS SHADER, and specifically inside the un-premultiplied
+    // window between the exposure multiply and the curve branch. Both halves of that are forced:
+    // bloom is LIGHT, so it has to be inside the curve rather than added to a display-referred image;
+    // and it has to be in STRAIGHT colour for the identical reason the curve does
+    // (tonemap(c*a) != tonemap(c)*a — the third entry in the rule list at the top of this file).
+    //
+    // ⚠ 0 IS AN EXACT IDENTITY **BY BRANCH**, NOT BY ARITHMETIC, and that distinction is the one
+    // thing about this lane worth remembering. `lerp(x, b, 0) == x` holds only for FINITE b, and the
+    // pyramid's mip 0 is not guaranteed finite: it is an fp16 UAV whose contents before the first
+    // dispatch — or in a build where the pyramid failed to allocate and the slot falls back to
+    // pAOBlur — are undefined, and 0 * NaN is NaN ([[project_nan_survives_zero_multiply]]), which
+    // then survives every later multiply including the one by zero coverage. So the composite sits
+    // behind `if (k > 0)`, which makes strength 0 bit-identical to the pre-bloom build by
+    // construction and costs nothing when the feature is off. Uniform branch guarding a BLOCK, which
+    // is this file's house rule anyway ([[project_uniform_branch_is_not_free]]).
+    //
+    // Eighth float4 = 128 B against a 256 B cbuffer, so STILL no allocation change.
+    DATA(float4, bloom, None);
 };
 
 BEGIN_SRT(ResolveSrtData)
     BEGIN_SRT_SET(PerDraw)
         DECL_CBUFFER(PerDraw, CBUFFER(ResolveParams), gResolveParams)
         DECL_TEXTURE(PerDraw, Tex2DMS(float4, SAMPLE_COUNT), gResolveSource)
+        // The bloom pyramid, mip 0 (step 4). APPEND-ONLY, and that matters: FSL assigns per-set
+        // register offsets from ONE running counter, so inserting a resource above gResolveSource
+        // would renumber it and silently repoint the host's SRT_RES_IDX
+        // ([[project_forge_srt_one_per_header]]).
+        //
+        // No sampler joins this set. The upsample to full res is four LoadTex2Ds and weights, which
+        // keeps this private SRT free of sampler plumbing — and a sampler could not have been used
+        // for the clamp anyway, because the bound is the mip-0 RENDER sub-rect and not the surface.
+        //
+        // Bound unconditionally, even when the pyramid failed to build: the fallback is pAOBlur
+        // (RGBA16F, always present) with the strength lane forced to 0, so the slot is never a null
+        // SRV. Same fallback shape as gReflectMips -> pReflectColor.
+        DECL_TEXTURE(PerDraw, Tex2D(float4), gBloomTex)
     END_SRT_SET(PerDraw)
 END_SRT(ResolveSrtData)

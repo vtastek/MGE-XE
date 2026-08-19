@@ -487,6 +487,31 @@
 #include "reflectmip.comp.fsl"
 #end
 
+// Bloom pyramid (tasks/forge-postprocess.md step 4). Same three-stage shape as the two pyramids
+// above, and the prefilter is likewise the MSAA RESOLVE — which is why bloom needed no
+// resolve/composite split: a 2x downsample of an MSAA target already averages the sub-samples, so it
+// reads pMSAAColor directly. Two SAMPLE_COUNT variants for the same reason reflectmipfirst has them
+// (Tex2DMS needs the count as a literal); the down/up passes read the already-resolved pyramid and
+// stay single-variant. All three share the ONE BloomSrtData Persistent set, over 13 instances (1
+// prefilter + 6 down + 6 up), each carrying its own level's render rects in its own cbuffer.
+#comp bloomprefilter_sc1.comp
+#define SAMPLE_COUNT 1
+#include "bloomprefilter.comp.fsl"
+#end
+
+#comp bloomprefilter_sc4.comp
+#define SAMPLE_COUNT 4
+#include "bloomprefilter.comp.fsl"
+#end
+
+#comp bloomdown.comp
+#include "bloomdown.comp.fsl"
+#end
+
+#comp bloomup.comp
+#include "bloomup.comp.fsl"
+#end
+
 // Stage B (B3) GPU statics cull — count -> prefix-sum -> scatter -> execute-indirect (drives the far
 // statics draw; the CPU cull stays for parity until visually verified). All three share compute.rootsig
 // + the CullSrtData PerBatch set. cull.comp = COUNT (survivors atomic-add numSubsets for the CPU parity

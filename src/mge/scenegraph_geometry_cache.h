@@ -295,6 +295,20 @@ namespace MGE::GeometryCache {
         // emissiveForDraw(), NOT folded into matEmissive, so a capture-once material can
         // still pick up a re-derived gain: the draw list is rebuilt every frame.
         float emissiveGain[3];
+        // FIXTURE GROUPING (see computeEmissiveGain / emisRederive). flux/area DOUBLE-COUNTS when a
+        // fixture is several emissive shapes sharing one light: `light_de_lantern_02` is 8
+        // alpha-blended glass facets plus a flame billboard, and each was dividing that light's FULL
+        // flux by its own small area, so the smallest shape won hardest (glass k_eff 26, flame 402
+        // against the paper-lantern reference's 2.2). A fixture is ONE emitter, so the AREA is summed
+        // across the shapes that share one light AND one texture — the texture split is what keeps
+        // "glass" and "flame" as separate emitters, which they physically are.
+        //   emissiveGroup : (own light identity, texture name) key. 0 = ungrouped.
+        //   emissiveArea  : this shape's OWN contribution, so eviction subtracts exactly what it added.
+        //   emissiveFlux  : kEmissiveFlux * lightColour — the numerator, kept per member so every
+        //                   member's gain can be re-derived when the group grows or shrinks.
+        std::uint64_t emissiveGroup;
+        float         emissiveArea;
+        float         emissiveFlux[3];
         // Vertex colour usage. hasVertexColor: the mesh carries per-vertex colours
         // (filled into the non-skinned VB's DIFFUSE slot). vColSource: NI
         // VertexColorProperty::source — 0 ignore (vcol unused, constant material),
@@ -587,11 +601,30 @@ namespace MGE::GeometryCache {
     // frame). Consumers driven by a current-frame visible set don't need this.
     uint64_t currentFrame();
 
-    // The emissive triple a draw should ship: matEmissive times emissiveGain. Every Forge
-    // draw-list builder goes through this so the boost has exactly one definition; the DX9
-    // baseline path reads matEmissive directly and stays vanilla (it is the A/B reference).
+    // The emissive triple a draw should ship: matEmissive times emissiveGain times g_emissiveScale.
+    // Every Forge draw-list builder goes through this so the boost has exactly one definition; the
+    // DX9 baseline path reads matEmissive directly and stays vanilla (it is the A/B reference).
     // `out` receives 3 floats.
-    void emissiveForDraw(const CachedGeometry& e, float* out);
+    // Writes the 3-channel emissive GAIN (post-cap, post-scale) — NOT matEmissive * gain. The
+    // product must be formed on the HOST, after decodeAuthored(), or the ratio gets
+    // exponentiated by the sRGB decode. See the definition for the measured numbers.
+    void emissiveForDraw(const CachedGeometry& e, float* outGain);
+
+    // LIVE emissive level (dev panel slider). Rides HERE rather than in kEmissiveFlux because the
+    // per-entry gain is computed once at cache-fill: a constant needs a rebuild plus a full re-walk,
+    // this needs neither. 1.0 = the reference paper lantern at k_eff 2.2; **2.05 = the measured 4.5**.
+    // ⚠ Pair it with g_expStat = p90 — see the definition for the measured reason (one lantern can be
+    // 69% of a frame's light energy in 0.23% of its area, and a frame-mean meter will chase it).
+    extern float g_emissiveScale;
+
+    // LIVE ceiling on k_eff. **DEFAULT 0 = OFF**, and it stays off: it was a band-aid for flux
+    // double-counting, which the fixture GROUPING (see EmisGroup in the .cpp) fixed properly — the
+    // glass shade fell k_eff 26.05 -> 3.26 by itself. Left in as a safety valve for a mod that ships a
+    // one-triangle emissive sliver with a light inside it. Hue-preserving (one scalar over all three
+    // channels; per-channel clipping snaps R:G:B and reads as hot cream).
+    // ⚠ Check `grpArea`/`pieces` in the [emissive] log before using it — pieces=1 on a fixture that
+    // plainly has many means the GROUPING is broken, and clamping would only hide that again.
+    extern float g_emissiveMaxK;
 
     // Vertex buffer format used by the reflection-moon shapes below (and, until S5b, by
     // each CachedGeometry's DX9 mirror VB).

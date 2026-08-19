@@ -158,6 +158,36 @@ float2 rHash2(uint seed)
     return float2(float(h >> 16u), float(h & 0xFFFFu)) * (1.0f / 65536.0f);
 }
 
+// ─── BLOOM COMPOSITE (tasks/forge-postprocess.md step 4) ─────────────────────────────────────────
+//
+// Bilinear tap of the bloom pyramid's mip 0 at this pixel, returned as PREMULTIPLIED rgb + filtered
+// coverage. Four manual LoadTex2Ds rather than a sampler, for two reasons: this SRT stays free of
+// sampler plumbing, and the clamp bound is the mip-0 RENDER sub-rect rather than the surface extent
+// (the pyramid is alloc-sized like every other screen RT, so a sampler's own clamp would let the
+// footprint reach texels this frame never wrote — [[project_forge_alloc_vs_render_uv]]).
+//
+// Mip-0 texel j covers full-res pixels 2j and 2j+1, so its centre sits at pixel coordinate 2j+1 and
+// the inverse map is `mipCoord = pixelCentre/2 - 0.5`. Getting that half-texel wrong shifts the glow
+// half a mip-0 texel diagonally, which on a lantern at night reads as the halo being off-centre.
+float4 rBloomTap(float2 pixelPos, float2 mipSize)
+{
+    float2 c  = pixelPos * 0.5f - 0.5f;
+    float2 f  = frac(c);
+    float2 b  = floor(c);
+    float2 hi = mipSize - 1.0f;
+    int2 p00 = int2(clamp(b,                       float2(0.0f, 0.0f), hi));
+    int2 p10 = int2(clamp(b + float2(1.0f, 0.0f),  float2(0.0f, 0.0f), hi));
+    int2 p01 = int2(clamp(b + float2(0.0f, 1.0f),  float2(0.0f, 0.0f), hi));
+    int2 p11 = int2(clamp(b + float2(1.0f, 1.0f),  float2(0.0f, 0.0f), hi));
+    float4 s00 = LoadTex2D(gBloomTex, NO_SAMPLER, p00, 0);
+    float4 s10 = LoadTex2D(gBloomTex, NO_SAMPLER, p10, 0);
+    float4 s01 = LoadTex2D(gBloomTex, NO_SAMPLER, p01, 0);
+    float4 s11 = LoadTex2D(gBloomTex, NO_SAMPLER, p11, 0);
+    // ALL FOUR CHANNELS, IDENTICAL WEIGHTS — the pyramid is premultiplied and a bilinear tap is a
+    // filter, so the whole 4-vector takes the same weights. Fourth site for this rule.
+    return lerp(lerp(s00, s10, f.x), lerp(s01, s11, f.x), f.y);
+}
+
 float3 rDitherTPDF(float2 pix, float lsb)
 {
     uint2  p = uint2(pix);
@@ -225,9 +255,33 @@ float4 PS_MAIN(PsIn In)
                     float w = rFilterCubic(sampleDist.x * 2.0f, 0.0f, cubicC) *
                               rFilterCubic(sampleDist.y * 2.0f, 0.0f, cubicC);
 
+                    // ⚠ THE FIREFLY GUARD RESCALES THE SAMPLE, NEVER THE KERNEL WEIGHT.
+                    // `w` above is a Catmull-Rom weight and Catmull-Rom's outer lobe is NEGATIVE
+                    // (rFilterCubic, 1 < x <= 2), so the taps only normalise because their signed sum
+                    // is ~1. Folding 1/(1+L) into `w` makes each tap's weight depend on that tap's
+                    // own brightness, and at extreme local contrast that destroys the sum: a candle
+                    // flame carrying the emissive gain (k_eff ~400) has its BRIGHT centre taps shrunk
+                    // ~270x while a dim neighbour sitting in a negative lobe keeps nearly all of its
+                    // magnitude, so totalWeight reaches zero and then goes NEGATIVE. `sum /
+                    // max(totalWeight, 1e-5)` with a negative sum is then a huge NEGATIVE value that
+                    // the max(rgb, 0) clamp below turns into EXACTLY BLACK — measured as 5 black
+                    // pixels inside the flame core, with 50 more at a near-zero positive normaliser
+                    // (a ~100x overshoot instead). Both scale with the emissive gain, which is what
+                    // made them look like a tonemap NaN; the scene target held finite bright values
+                    // at those pixels and the resolve manufactured the failure.
+                    //
+                    // Karis' scheme is a weighted average IN A COMPRESSIVE SPACE, undone afterwards:
+                    // the rescale belongs to the sample, the kernel keeps its own weights.
+                    //
+                    // ⚠ RGB ONLY. This is a radiometric rescale, not a filter weight, and the two
+                    // halves of resolve.srt.h's premultiplication rule point OPPOSITE ways: a filter
+                    // weight takes all four channels, a radiometric scale takes rgb and leaves
+                    // coverage alone. Applied to all four it made outRgba.a mean coverage/(1+L), and
+                    // the un-premultiply below then divided colour by a number that was no longer a
+                    // coverage at all.
                     if (invLuma > 0.5f)
                     {
-                        w *= 1.0f / (1.0f + rLuminance(smp.rgb));
+                        smp.rgb *= 1.0f / (1.0f + rLuminance(smp.rgb));
                     }
                     // Colour AND coverage take the SAME weight. Anything else tears the
                     // premultiplied pair apart — see resolve.srt.h.
@@ -239,6 +293,24 @@ float4 PS_MAIN(PsIn In)
     }
 
     float4 outRgba = sum / max(totalWeight, 1.0e-5f);
+    // Exact inverse of the guard above: L(c/(1+L)) = L/(1+L), so 1 - that is 1/(1+L) and the
+    // division hands the radiance back untouched on a plateau.
+    //
+    // ⚠ THE OVERSHOOT IS BOUNDED, NOT FLOORED. A compressed luminance of 1 means INFINITE
+    // luminance, and Catmull-Rom's overshoot reaches it at a hard enough edge — measured at the
+    // 1-pixel-wide tip of a candle flame carrying the emissive gain, where the neighbourhood runs
+    // 0.4 to 160 in two pixels. Flooring `1 - L` at an epsilon multiplied the pixel by 1000 and
+    // handed the premultiply clamp below a colour:coverage ratio that no longer meant anything;
+    // it came out EXACTLY BLACK, which is how this arrived looking like a tonemap NaN. Clamping
+    // the compressed luma instead caps recovery at 999 units, and because it is one scalar on all
+    // three channels the hue is untouched.
+    if (invLuma > 0.5f)
+    {
+        float Lc    = rLuminance(max(outRgba.rgb, float3(0.0f, 0.0f, 0.0f)));
+        float LcCap = 0.999f;
+        if (Lc > LcCap) { outRgba.rgb *= LcCap / Lc; Lc = LcCap; }
+        outRgba.rgb *= 1.0f / (1.0f - Lc);
+    }
 
     // CLAMPING MUST RESPECT PREMULTIPLICATION TOO — the same rule as the weights above, and the
     // second place it bites. Catmull-Rom rings in BOTH directions at a hard coverage edge (the
@@ -287,6 +359,39 @@ float4 PS_MAIN(PsIn In)
         // frame that just finished, which ALREADY CONTAINS the E it was rendered with, so the host
         // correction multiplies the current exposure instead of replacing it.
         straight *= gResolveParams.tone.x;
+        // ── BLOOM (step 4) ──
+        // Bright things spill light into their surroundings. Position is forced twice over: INSIDE
+        // the curve because bloom is light and not a display effect, and inside the UN-PREMULTIPLIED
+        // window because the composite is non-linear in coverage the moment it is anything but a
+        // plain add. It also has to be AFTER the exposure multiply above, and the pyramid is built
+        // pre-multiplied by the same E for exactly that reason (bloom.srt.h, opts.y) — mixing a
+        // post-exposure `straight` with a pre-exposure bloom would make the effect's strength a
+        // function of the servo.
+        //
+        // ENERGY-CONSERVING AND THRESHOLDLESS, which is one decision and not two. `lerp` rather than
+        // `+` means energy in equals energy out, so the result is exposure-invariant and a uniformly
+        // bright sky blooms to itself and adds no haze — `blur(const) == const`, which is what the
+        // upsample's lerp accumulation buys (bloomup.comp.fsl). That property is also why the legacy
+        // `Bloom Fine.fx` depth cut was NOT ported: its job was to stop a bright sky washing out the
+        // frame, and this form has no such failure to fix.
+        //
+        // ⚠ THE UN-PREMULTIPLY USES THE **FILTERED** ALPHA, not aOut. That is the correct inverse of
+        // a premultiplied filter, and it is far more stable than the per-pixel coverage would be: a
+        // wide blur's alpha is a neighbourhood-mean coverage, ~1 wherever any neighbour is covered,
+        // and where the host covers nothing the numerator is ~0 too — so the floor UNDER-adds rather
+        // than exploding. Fail-safe in the only direction that matters.
+        //
+        // ⚠ THE BRANCH IS THE IDENTITY GUARANTEE. See gResolveParams.bloom in resolve.srt.h: `lerp(x,
+        // b, 0) == x` only for FINITE b, and an fp16 UAV nobody has dispatched into is not
+        // guaranteed finite. k == 0 must be bit-identical to the pre-bloom build, so the read is
+        // guarded rather than cancelled.
+        float bloomK = gResolveParams.bloom.x;
+        if (bloomK > 0.0f)
+        {
+            float4 bloomPre    = rBloomTap(pixelPos, gResolveParams.bloom.yz);
+            float3 bloomStraight = bloomPre.rgb / max(bloomPre.a, 1.0e-3f);
+            straight = lerp(straight, bloomStraight, bloomK);
+        }
         // THE CURVE, AND WITH IT THE POSITION OF THE ENCODE (step 3 / S2). The two are ONE decision,
         // not two, because each curve declares the domain it eats:
         //

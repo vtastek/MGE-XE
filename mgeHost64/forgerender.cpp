@@ -140,6 +140,11 @@
 // resource names so the merged ComputeRootSignature has no aliasing with aoblur's PerFrame set).
 // Two instances of the one set drive the separable H/V ping-pong. See tasks/forge-sun-shadows.md.
 #include "shaders/FSL/sunblur.srt.h"
+// Bloom pyramid (tasks/forge-postprocess.md step 4): BloomSrtData, Persistent frequency, ONE set over
+// 13 instances driving the prefilter + down + up chain. Same SAMPLE_COUNT note as resolve.srt.h and
+// apl.srt.h — C++ sees the header's #ifndef default, and both prefilter variants declare the same
+// four slots in the same order, so SRT_RES_IDX resolves identically for either.
+#include "shaders/FSL/bloom.srt.h"
 
 // App-layer callback normally provided by WindowsBase.cpp (which we exclude — it
 // drags in the window system). The backend calls this on device-lost. Headless:
@@ -1105,6 +1110,27 @@ namespace {
     // it fixes the moments atlas width, and the atlas is allocated once at init.
     constexpr uint32_t kSunCascades = 2;
 
+    // --- BLOOM pyramid (tasks/forge-postprocess.md step 4) ---------------------------------------
+    // Declared up here, well before the g_bloom* knob block, only because kBloomSetCount sizes the
+    // per-level cbuffer array inside LiveRenderer below — the same reason kSunCascades is up here.
+    //
+    // 7 levels off a HALF-res mip 0, so at a 2048x1536 render rect the chain is 1024x768, 512x384,
+    // 256x192, 128x96, 64x48, 32x24, 16x12 and the coarsest level's texel covers 1/16th of the frame
+    // width. That is the bloom's angular REACH. The count is fixed at the PYRAMID while the ACTIVE
+    // level count is derived per frame from the render rect (bloomLevels(), further down): the reach
+    // then follows the render-scale slider for free instead of shrinking when the slider moves, which
+    // is verification step 6 of the plan.
+    constexpr uint32_t kBloomMipCount = 7;
+    // 13 descriptor-set instances: [0] prefilter (-> mip 0), [1..6] downsample (mip i-1 -> mip i),
+    // [7..12] upsample (mip j+1 -> INTO mip j, j = 0..5). Each instance carries its OWN params
+    // cbuffer, holding that level's src/dst RENDER rects — the one thing GetDimensions cannot supply.
+    constexpr uint32_t kBloomSetCount = 1 + (kBloomMipCount - 1) + (kBloomMipCount - 1);
+    // Set-index helpers, so the build loop and the dispatch loop cannot drift apart. The failure mode
+    // of two hand-written index expressions is a level filtering from the wrong source mip, which
+    // looks like "the glow is the wrong width" rather than like an indexing bug.
+    inline uint32_t bloomSetDown(uint32_t dstMip) { return dstMip; }                    // 1..6
+    inline uint32_t bloomSetUp(uint32_t dstMip)   { return kBloomMipCount + dstMip; }   // 7..12
+
     // Screen-space AO MODE table. Four interchangeable compute shaders behind ONE SRT (AOSrtData)
     // and ONE descriptor set (pGtaoBatchSet) — same root signature, same bindings, same
     // float4(bentNormalWS, visibility) output — so the host just binds pAOPipeline[g_aoMode] and
@@ -1344,8 +1370,34 @@ namespace {
         // hardware resolve runs, which is also the live A/B (g_customResolve).
         Shader*        pResolveShader    = nullptr;   // resolve.vert + resolve_sc{2,4,8}.frag
         Pipeline*      pResolvePipeline  = nullptr;   // fullscreen tri into pRT (single-sample), depth OFF, no blend
-        DescriptorSet* pResolveSet       = nullptr;   // ResolveSrtData PerDraw: cbv + MSAA colour SRV
+        DescriptorSet* pResolveSet       = nullptr;   // ResolveSrtData PerDraw: cbv + MSAA colour SRV + bloom SRV
         Buffer*        pResolveParamsCbv = nullptr;   // ResolveParams (dims + opts), persistent-mapped
+        // --- BLOOM (tasks/forge-postprocess.md step 4) ------------------------------------------
+        // The pyramid pMSAAColor feeds and resolve.frag composites back in. Half of the ALLOCATION,
+        // 7 mips, always fp16 — alloc-sized like every other screen RT so a live render-scale change
+        // needs no reallocation (setRenderSize), and fp16 regardless of sceneColorFormat for
+        // reflectmip.srt.h's two reasons (BGRA8 is not in TypedUAVLoadAdditionalFormats; it decouples
+        // the pyramid from any later format flip).
+        //
+        // NON-FATAL at every step: a pipeline or set failure leaves bloomReady false, the dispatches
+        // never run, and the frame renders exactly as it does today. If the TEXTURE itself fails,
+        // gBloomTex falls back to pAOBlur with the strength lane forced to 0, so the SRV slot is
+        // never null and `lerp(x, junk, 0) == x` bit-exactly (and resolve.frag's guard means it is
+        // not even read). Same fallback shape as gReflectMips -> pReflectColor.
+        Texture*       pBloomMips = nullptr;               // (allocW/2 x allocH/2), kBloomMipCount, RGBA16F, SRV+UAV
+        DescriptorSet* pBloomSet = nullptr;                // BloomSrtData Persistent, kBloomSetCount instances
+        // One tiny cbuffer PER SET INSTANCE, sunblur's pattern. Each holds the src and dst RENDER
+        // rects for its own level — the one thing GetDimensions cannot supply, because it returns the
+        // ALLOCATION dims ([[project_forge_alloc_vs_render_uv]]). Rewritten every frame, so a live
+        // render-scale change is picked up with no reallocation and no descriptor churn.
+        Buffer*        pBloomParamsCbv[kBloomSetCount] = {};
+        Shader*        pBloomPrefilterShader = nullptr;    // bloomprefilter_sc{1,4}.comp (IS the MSAA resolve)
+        Shader*        pBloomDownShader = nullptr;         // bloomdown.comp ([1,3,3,1] tent)
+        Shader*        pBloomUpShader = nullptr;           // bloomup.comp (tent + lerp accumulate)
+        Pipeline*      pBloomPrefilterPipeline = nullptr;
+        Pipeline*      pBloomDownPipeline = nullptr;
+        Pipeline*      pBloomUpPipeline = nullptr;
+        bool           bloomReady = false;                 // gates the dispatch block
         DescriptorSet* pGtaoBatchSet = nullptr;   // AOSrtData PerBatch:  gLinearDepthIn + gAOOut
         DescriptorSet* pAOBlurSet = nullptr;      // AOBlurSrtData PerFrame: gBlurParams + gAOSrc + gBlurDepthIn + gAODst
 
@@ -2172,6 +2224,7 @@ namespace {
            kGpuPhaseColorGlow,  // Phase F distant-light glow billboards (after water, before sorted-alpha)
            kGpuPhaseFroxelNear, // near clustered-lighting froxel clear+assign (before the near colour phase)
            kGpuPhaseVolFog,     // volumetric height fog / sun shafts (after alpha, before the FP arms)
+           kGpuPhaseBloom,      // step 4 bloom pyramid (prefilter + down + up), immediately before Resolve
            kGpuPhaseCount };
 
     // FP1a first-person pass caps: one 64KB world window bounds the rigid list at 1024,
@@ -2194,9 +2247,12 @@ namespace {
     //        no new interpolator and no VSOutput change (multimap.frag / depthonly_mm.frag read
     //        only In.Color.rgb — verified — and stay byte-for-byte unchanged; see the pairing
     //        hazard in [[project_forge_shared_frag_vsoutput]]).
-    // 15 * 4 = 60 bytes.
+    //   [15..17] emissiveGain.rgb (float) — the flux/area emissive boost, a per-channel RATIO
+    //        multimap.vert applies AFTER decodeAuthored, to whichever lane vColSource selected.
+    //        Identity is 1.0, NOT 0 — see the kStaticInstU32 note; all three MM writers fill it.
+    // 18 * 4 = 72 bytes.
     constexpr uint32_t kMaxMultiMap = 1024;
-    constexpr uint32_t kMMInstU32   = 15;
+    constexpr uint32_t kMMInstU32   = 18;
     // Route C blended multi-map (glow windows): own alpha-stage budget, separate from kMaxMultiMap
     // (glow-nights already pin the opaque MM cap). Same kMMInstU32 instance layout.
     constexpr uint32_t kMaxMMAlpha  = 512;
@@ -3619,6 +3675,33 @@ namespace {
     // START is deliberately small. With a POINT tap, a receiver standing on the surface that generated
     // its own texel reads ~0 clearance — the common case — so this only has to clear map quantisation
     // (R16F is ~8 units of ulp at Red Mountain height) and a texel of slop, not a building.
+    // SDR-exposed emissive -> scene radiance (scenecolor.h.fsl::expandExposedEmissive). MW's
+    // emissive textures are already-exposed images, so a large emissive gain applied uniformly
+    // re-expands a flame's clipped core and its never-clipped coloured skirt by the SAME factor and
+    // the shape is lost — measured, 68.8% of r0_candleflame.dds clipped to white and the billboard
+    // rendered as a solid square.
+    //
+    // This is the WHITENESS FALLOFF EXPONENT p. The gain lands in proportion to pow(min(r,g,b), p),
+    // because a clipped highlight is achromatic by construction — so only the texels the encode
+    // actually saturated get their radiance back, and the coloured skirt keeps the exposed look it
+    // already had. 0 = exact bypass (today's image, bit for bit). Higher = the boost confines itself
+    // more tightly to the white core.
+    //
+    // Rides gShadowParams.skyAO2.w, a lane documented spare, so it reaches all four colour frags
+    // with no new plumbing. The exponent shapes how sharply the flux/area emissive gain is handed
+    // to a texel as a function of how close that texel's EXPOSED value (albedo x coverage) came to
+    // the 8-bit ceiling: 0 bypasses the operator, large p confines the gain to the clipped core.
+    //
+    // THREE MEASURES WERE WRONG BEFORE THIS ONE, and the reasons do not overlap:
+    //   luma            — cannot tell white from saturated orange, so a flame reads featureless.
+    //   coverage on the RESULT — the operator's floor is 1/lumaE, BELOW 1, so scaling by coverage
+    //                     on top of it pushed the near-edge emissive under MW's own value and drew
+    //                     a dark ring outside the core.
+    //   per channel     — recovers only the channel that clipped and divides the others by lumaE,
+    //                     turning the orange body of a flame into near-black deep red.
+    // Coverage belongs INSIDE the measure, because rgb x coverage is what MW displayed and
+    // therefore what its encode clipped. See scenecolor.h.fsl.
+    float              g_emisSdrExpand      = 6.0f;
     float              g_skyAOOverhang      = 128.0f;
     float              g_skyAOOverhangFade  = 1024.0f;
     // Never 0: a blocker the size of the meteor genuinely does remove sky, so the correction may only
@@ -3794,7 +3877,8 @@ namespace {
         mp[kSkyAO2Float    + 0] = std::max(0.0f, g_skyAOOverhang);
         mp[kSkyAO2Float    + 1] = std::max(1.0f, g_skyAOOverhangFade);
         mp[kSkyAO2Float    + 2] = std::max(0.0f, std::min(g_skyAOOverhangFloor, 1.0f));
-        mp[kSkyAO2Float    + 3] = 0.0f;
+        // .w was documented spare; it now carries the exposed-value falloff exponent (0 = bypass).
+        mp[kSkyAO2Float    + 3] = std::max(0.0f, std::min(g_emisSdrExpand, 32.0f));
     }
 
     // ...and the LONG-RANGE sun occlusion lanes. Split out for the same reason publishSkyAO is: it
@@ -4464,9 +4548,17 @@ namespace {
     //   [0] DrawIndex (identity, set once)   [1] TexAlpha (tex|alphaRef|vColSource, per-frame)
     //   [2..4] matDiffuse.rgb (float)        [5..7] matAmbient.rgb (float)   [8..10] matEmissive.rgb (float)
     //   [11] OverlayIndex (terrain DECAL_1 bindless slot, 0 = no decal; per-frame)
-    // 12 * 4 = 48 bytes. The material + overlay ride the instance VB (not a new cbuffer/descriptor
+    //   [12..14] emissiveGain.rgb (float) — the flux/area emissive boost, a per-channel RATIO.
+    // 15 * 4 = 60 bytes. The material + overlay ride the instance VB (not a new cbuffer/descriptor
     // set) to avoid the FSL descriptor-offset gotcha that hoisted the sampler — see opaque.srt.h.
-    constexpr uint32_t kStaticInstU32 = 12;
+    //
+    // ⚠ THE GAIN LANES ARE THE ONE GROUP WHOSE IDENTITY IS 1.0, NOT 0. opaque.vert multiplies the
+    // selected emissive by them, so a writer that leaves them zeroed blacks out that pass's
+    // emissives instead of merely ignoring the lane. Every per-frame writer therefore fills them
+    // explicitly — 1.0f on the passes that carry no boost (shadow, sky) and the real gain on the
+    // four that shade emissive (opaque, alpha, FP rigid, FP alpha). The creation-time identity
+    // init seeds 1.0 as well, so a pass added later inherits "no boost" rather than "no emissive".
+    constexpr uint32_t kStaticInstU32 = 15;
 
     // Pack the per-draw instance .y: texIndex in the low 16 bits (slots < kMaxTextures=1024,
     // so ≤10 bits), the alpha-test reference quantised to a byte in bits 16-23, the
@@ -5972,6 +6064,9 @@ namespace {
                 for (uint32_t k = 0; k < kShadowWorldMatrices; ++k) {
                     sinst[k * kStaticInstU32 + 0] = k;   // DrawIndex → gBatch[k] = shadow world window[k]
                     for (uint32_t j = 1; j < kStaticInstU32; ++j) { sinst[k * kStaticInstU32 + j] = 0; }
+                    // Gain lanes: identity 1.0, not the 0 the loop above just wrote (opaque.vert
+                    // MULTIPLIES by these). See the kStaticInstU32 comment.
+                    for (uint32_t j = 12; j < 15; ++j) { ((float*)sinst)[k * kStaticInstU32 + j] = 1.0f; }
                 }
                 std::printf("[forge][shadow] atlas %ux%u D32 + mask %ux%u R32G32B32A32_UINT (caps=0x%X)\n",
                             kShadowAtlasW, kShadowAtlasH, width, height,
@@ -5999,7 +6094,7 @@ namespace {
         vl.mBindings[0].mRate = VERTEX_BINDING_RATE_VERTEX;
         vl.mBindings[1].mStride = kStaticInstU32 * sizeof(uint32_t);   // {DrawIndex, TexAlpha, matDiff3, matAmb3, matEmis3}
         vl.mBindings[1].mRate = VERTEX_BINDING_RATE_INSTANCE;
-        vl.mAttribCount = 10;
+        vl.mAttribCount = 11;
         vl.mAttribs[0].mSemantic = SEMANTIC_POSITION;
         vl.mAttribs[0].mFormat = TinyImageFormat_R32G32B32_SFLOAT;
         vl.mAttribs[0].mBinding = 0;
@@ -6050,6 +6145,11 @@ namespace {
         vl.mAttribs[9].mBinding = 1;
         vl.mAttribs[9].mLocation = 9;
         vl.mAttribs[9].mOffset = 11 * sizeof(uint32_t);
+        vl.mAttribs[10].mSemantic = SEMANTIC_TEXCOORD7;      // EmisGain (per-instance: flux/area emissive ratio)
+        vl.mAttribs[10].mFormat = TinyImageFormat_R32G32B32_SFLOAT;
+        vl.mAttribs[10].mBinding = 1;
+        vl.mAttribs[10].mLocation = 10;
+        vl.mAttribs[10].mOffset = 12 * sizeof(uint32_t);
 
         // COLOUR-pass depth (Phase 1 early-Z): the Z-prepass already wrote every opaque pixel's
         // depth, so the colour pass only MATCHES it — CMP_EQUAL + depthWrite OFF = true early-Z,
@@ -6485,6 +6585,9 @@ namespace {
                 inst[i * kStaticInstU32 + 0] = i;   // [0] identity (DrawIndex)
                 for (uint32_t k = 1; k < kStaticInstU32; ++k)
                     inst[i * kStaticInstU32 + k] = 0;   // [1] TexAlpha + [2..10] material (per-frame)
+                // [12..14] emissiveGain: identity 1.0, NOT the 0 above — the vert multiplies by it.
+                for (uint32_t k = 12; k < 15; ++k)
+                    ((float*)inst)[i * kStaticInstU32 + k] = 1.0f;
             }
         }
         g_live.maxDraws = kMaxDraws;
@@ -7315,8 +7418,12 @@ namespace {
             mvl.mAttribs[11].mSemantic = SEMANTIC_TEXCOORD8;      // MatEmissive (per-instance)
             mvl.mAttribs[11].mFormat = TinyImageFormat_R32G32B32_SFLOAT;
             mvl.mAttribs[11].mBinding = 1; mvl.mAttribs[11].mLocation = 11; mvl.mAttribs[11].mOffset = 11 * sizeof(uint32_t);
-            mvl.mAttribs[12].mSemantic = SEMANTIC_TEXCOORD9;      // MatAlpha (per-instance, Route C)
-            mvl.mAttribs[12].mFormat = TinyImageFormat_R32_SFLOAT;
+            // .x = matAlpha, .yzw = the emissive gain — lanes [14..17], read as ONE float4.
+            // The Forge's ShaderSemantic enum ends at TEXCOORD9 and multimap.vert's VSInput already
+            // uses all ten, so the gain could not have its own element here; widening this one is
+            // both the only option and the cheaper one (no extra layout element, same bytes).
+            mvl.mAttribs[12].mSemantic = SEMANTIC_TEXCOORD9;      // MatAlphaGain (per-instance)
+            mvl.mAttribs[12].mFormat = TinyImageFormat_R32G32B32A32_SFLOAT;
             mvl.mAttribs[12].mBinding = 1; mvl.mAttribs[12].mLocation = 12; mvl.mAttribs[12].mOffset = 14 * sizeof(uint32_t);
 
             DepthStateDesc mmDepth = {};
@@ -8010,6 +8117,161 @@ namespace {
                     std::printf("[forge] custom resolve unavailable (%s) — hardware ResolveSubresource\n",
                                 resolveFrag);
                 }
+            }
+        }
+
+        // --- BLOOM pyramid (tasks/forge-postprocess.md step 4) -----------------------------------
+        // Built HERE, right after the resolve, because the two are one feature: the pyramid's first
+        // pass reads pMSAAColor and resolve.frag composites the result back in, and the descriptor
+        // update further down binds mip 0 into the SAME ResolveSrtData set. Nothing else in the frame
+        // touches it.
+        //
+        // GATED ON sceneReferred, not merely on MSAA, and that is a memory decision as much as a
+        // correctness one. Bloom off a display-referred target is the artefact rather than the effect
+        // (three files record it — see g_bloomEnable), so at LDR it could never run; allocating ~33 MB
+        // of fp16 pyramid for a path that is gated off is pure waste. sceneReferred already folds in
+        // `sampleCount > 1` (see its assignment in init), so pMSAAColor is non-null whenever this is.
+        //
+        // NON-FATAL at every step, hizReady's shape: any failure leaves bloomReady false, the dispatch
+        // block never runs, the strength lane goes to 0, and resolve.frag's guard means the frame is
+        // bit-identical to a build without this feature.
+        if (g_live.sceneReferred && g_live.pMSAAColor) {
+            // HALF of the ALLOCATION, not half of the render rect — alloc-sized like every other
+            // screen RT, so a live render-scale change needs no reallocation (setRenderSize). The
+            // per-frame render sub-rect at each level rides the cbuffers instead.
+            const uint32_t bloomW = std::max(1u, g_live.allocWidth  / 2u);
+            const uint32_t bloomH = std::max(1u, g_live.allocHeight / 2u);
+            TextureDesc bd = {};
+            bd.mWidth = bloomW; bd.mHeight = bloomH; bd.mDepth = 1;
+            bd.mArraySize = 1; bd.mMipLevels = kBloomMipCount;
+            bd.mSampleCount = SAMPLE_COUNT_1;
+            // fp16 REGARDLESS of sceneColorFormat, reflectmip.srt.h's two reasons verbatim:
+            // B8G8R8A8_UNORM is not in D3D12's TypedUAVLoadAdditionalFormats set (so the down/up
+            // passes' UAV loads of a source mip would not be legal at LDR), and it decouples the
+            // pyramid from any later format flip.
+            bd.mFormat = TinyImageFormat_R16G16B16A16_SFLOAT;
+            bd.mStartState = RESOURCE_STATE_SHADER_RESOURCE;   // resting; the build brackets SR<->UAV
+            bd.mDescriptors = (DescriptorType)(DESCRIPTOR_TYPE_TEXTURE | DESCRIPTOR_TYPE_RW_TEXTURE);
+            bd.pName = "bloomMips";
+            TextureLoadDesc bld = {};
+            bld.ppTexture = &g_live.pBloomMips;
+            bld.pDesc = &bd;
+            addResource(&bld, nullptr);
+            waitForAllResourceLoads();
+
+            // One tiny cbuffer per set instance — sunblur's pattern. Each holds ITS OWN level's src
+            // and dst RENDER rects, which is the one thing GetDimensions (the hizreduce trick) cannot
+            // supply: it returns the ALLOCATION dims. Explicit beats deriving the level from a dims
+            // ratio, and 13 x 256 B is 3.3 KB.
+            for (uint32_t s = 0; s < kBloomSetCount; ++s) {
+                BufferLoadDesc bp = {};
+                bp.mDesc.mDescriptors = DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+                bp.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_CPU_TO_GPU;
+                bp.mDesc.mFlags       = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
+                bp.mDesc.mSize        = 256;   // four float4s; 256 B = min CBV
+                bp.mDesc.pName        = "bloomParamsCbv";
+                bp.pData              = nullptr;
+                bp.ppBuffer           = &g_live.pBloomParamsCbv[s];
+                addResource(&bp, nullptr);
+            }
+
+            // The prefilter is SAMPLE_COUNT-variant because it IS the MSAA resolve and Tex2DMS needs
+            // the count as a shader literal (hizfirst / reflectmipfirst's pattern). The down and up
+            // passes only ever read the already-resolved pyramid, so they stay single-variant.
+            ShaderLoadDesc bpf = {};
+            bpf.mComp.pFileName = (g_live.sampleCount > 1) ? "bloomprefilter_sc4.comp"
+                                                           : "bloomprefilter_sc1.comp";
+            addShader(R, &bpf, &g_live.pBloomPrefilterShader);
+            ShaderLoadDesc bdn = {};
+            bdn.mComp.pFileName = "bloomdown.comp";
+            addShader(R, &bdn, &g_live.pBloomDownShader);
+            ShaderLoadDesc bup = {};
+            bup.mComp.pFileName = "bloomup.comp";
+            addShader(R, &bup, &g_live.pBloomUpShader);
+            if (g_live.pBloomPrefilterShader) {
+                PipelineDesc pd = {};
+                pd.mType = PIPELINE_TYPE_COMPUTE;
+                pd.mComputeDesc.pShaderProgram = g_live.pBloomPrefilterShader;
+                addPipeline(R, &pd, &g_live.pBloomPrefilterPipeline);
+            }
+            if (g_live.pBloomDownShader) {
+                PipelineDesc pd = {};
+                pd.mType = PIPELINE_TYPE_COMPUTE;
+                pd.mComputeDesc.pShaderProgram = g_live.pBloomDownShader;
+                addPipeline(R, &pd, &g_live.pBloomDownPipeline);
+            }
+            if (g_live.pBloomUpShader) {
+                PipelineDesc pd = {};
+                pd.mType = PIPELINE_TYPE_COMPUTE;
+                pd.mComputeDesc.pShaderProgram = g_live.pBloomUpShader;
+                addPipeline(R, &pd, &g_live.pBloomUpPipeline);
+            }
+            // EVERY cbuffer, not just the first and last: a null one would be handed straight to
+            // updateDescriptorSet, and one missing level's params is not a degraded bloom, it is a
+            // dispatch reading a src rect of (0,0) and writing nothing while the level below it
+            // filters garbage. Cheap to check where the set is built; invisible if it is not.
+            bool bloomCbvsOk = true;
+            for (uint32_t s = 0; s < kBloomSetCount; ++s) {
+                if (!g_live.pBloomParamsCbv[s]) { bloomCbvsOk = false; }
+            }
+            if (g_live.pBloomMips && bloomCbvsOk
+                && g_live.pBloomPrefilterPipeline && g_live.pBloomDownPipeline
+                && g_live.pBloomUpPipeline) {
+                DescriptorSetDesc bset = SRT_SET_DESC(BloomSrtData, Persistent, kBloomSetCount, 0);
+                addDescriptorSet(R, &bset, &g_live.pBloomSet);
+            }
+            if (g_live.pBloomSet) {
+                // The scene SRV rides EVERY instance and only instance 0 reads it — DXC strips it out
+                // of the down/up variants, exactly as the reduce's unused colour SRV is stripped in
+                // reflectmip. mCount = 1 is REQUIRED on every single-texture bind (SRV and UAV) or the
+                // descriptor count is 0 and the slot binds NOTHING.
+                Texture* sceneTex = g_live.pMSAAColor->pTexture;
+                DescriptorData d[4] = {};
+                d[0].mIndex = SRT_RES_IDX(BloomSrtData, Persistent, gBloomParams);
+                d[1].mIndex = SRT_RES_IDX(BloomSrtData, Persistent, gBloomSceneTex);
+                d[1].mCount = 1; d[1].ppTextures = &sceneTex;
+                d[2].mIndex = SRT_RES_IDX(BloomSrtData, Persistent, gBloomSrc);
+                d[2].mCount = 1; d[2].ppTextures = &g_live.pBloomMips;
+                d[3].mIndex = SRT_RES_IDX(BloomSrtData, Persistent, gBloomDst);
+                d[3].mCount = 1; d[3].ppTextures = &g_live.pBloomMips;
+
+                // [0] PREFILTER: pMSAAColor (SRV) -> mip 0. gBloomSrc is unused by this variant but
+                // must still point somewhere valid, so it takes mip 0 as well.
+                d[0].ppBuffers   = &g_live.pBloomParamsCbv[0];
+                d[2].mUAVMipSlice = 0;
+                d[3].mUAVMipSlice = 0;
+                updateDescriptorSet(R, 0, g_live.pBloomSet, 4, d);
+
+                // [1..6] DOWNSAMPLE: mip m-1 -> mip m.
+                for (uint32_t m = 1; m < kBloomMipCount; ++m) {
+                    const uint32_t si = bloomSetDown(m);
+                    d[0].ppBuffers    = &g_live.pBloomParamsCbv[si];
+                    d[2].mUAVMipSlice = (uint16_t)(m - 1);
+                    d[3].mUAVMipSlice = (uint16_t)m;
+                    updateDescriptorSet(R, si, g_live.pBloomSet, 4, d);
+                }
+                // [7..12] UPSAMPLE: mip j+1 -> ACCUMULATED INTO mip j. Both slots are UAVs of the same
+                // texture at DIFFERENT mip slices, which is why there is no hazard in the up pass
+                // reading its own destination back (reflectmip's reduce does the same thing).
+                for (uint32_t j = 0; j + 1 < kBloomMipCount; ++j) {
+                    const uint32_t si = bloomSetUp(j);
+                    d[0].ppBuffers    = &g_live.pBloomParamsCbv[si];
+                    d[2].mUAVMipSlice = (uint16_t)(j + 1);
+                    d[3].mUAVMipSlice = (uint16_t)j;
+                    updateDescriptorSet(R, si, g_live.pBloomSet, 4, d);
+                }
+                g_live.bloomReady = true;
+            }
+            if (!g_live.bloomReady) {
+                std::printf("[forge][bloom] pyramid unavailable (tex=%d cbvs=%d prefilter=%d down=%d"
+                            " up=%d set=%d) — bloom OFF, frame unchanged\n",
+                            g_live.pBloomMips ? 1 : 0, bloomCbvsOk ? 1 : 0,
+                            g_live.pBloomPrefilterPipeline ? 1 : 0,
+                            g_live.pBloomDownPipeline ? 1 : 0, g_live.pBloomUpPipeline ? 1 : 0,
+                            g_live.pBloomSet ? 1 : 0);
+            } else {
+                std::printf("[forge][bloom] pyramid ready (%ux%u, %u mips, alloc %ux%u)\n",
+                            bloomW, bloomH, kBloomMipCount, g_live.allocWidth, g_live.allocHeight);
             }
         }
 
@@ -9326,13 +9588,36 @@ namespace {
             // knobs ride the cbuffer contents, not the descriptor. Guarded on pMSAAColor for the same
             // reason the pipeline is: MSAA-only pass.
             if (g_live.pResolveSet && g_live.pResolveParamsCbv && g_live.pMSAAColor) {
-                DescriptorData d[2] = {};
+                // ...and since step 4's bloom, the pyramid's mip 0 as a third slot. It is bound
+                // UNCONDITIONALLY, because a descriptor set with an unwritten slot reads whatever was
+                // last in that heap slot — the failure mode this file's other single-texture binds all
+                // carry a note about. When the pyramid did not build, gBloomTex falls back to pAOBlur
+                // (RGBA16F, always present, and the same fallback shape as gReflectMips ->
+                // pReflectColor) and the strength lane is forced to 0, which resolve.frag turns into
+                // an exact identity by BRANCH rather than by arithmetic — `lerp(x, b, 0) == x` only
+                // holds for finite b, and an fp16 UAV nobody dispatched into is not guaranteed finite
+                // ([[project_nan_survives_zero_multiply]]).
+                // ⚠ THE FALLBACK MUST BE RGBA16F **AND** IN SHADER_RESOURCE WHEN THE RESOLVE DRAWS.
+                // pAOBlur is both, and pAO behind it; pRT is neither useful nor safe here even though
+                // it is guaranteed to exist — it is the resolve's own RENDER TARGET, so binding it as
+                // an SRV in the same set is a simultaneous read/write the debug layer flags whether or
+                // not the shader ever samples it.
+                Texture* bloomTex = g_live.pBloomMips ? g_live.pBloomMips
+                                  : (g_live.pAOBlur   ? g_live.pAOBlur : g_live.pAO);
+                DescriptorData d[3] = {};
                 d[0].mIndex     = SRT_RES_IDX(ResolveSrtData, PerDraw, gResolveParams);
                 d[0].ppBuffers  = &g_live.pResolveParamsCbv;
                 d[1].mIndex     = SRT_RES_IDX(ResolveSrtData, PerDraw, gResolveSource);
                 d[1].mCount     = 1;                     // REQUIRED for a single texture — see above
                 d[1].ppTextures = &g_live.pMSAAColor->pTexture;
-                updateDescriptorSet(R, 0, g_live.pResolveSet, 2, d);
+                d[2].mIndex     = SRT_RES_IDX(ResolveSrtData, PerDraw, gBloomTex);
+                d[2].mCount     = 1;
+                d[2].ppTextures = &bloomTex;
+                updateDescriptorSet(R, 0, g_live.pResolveSet, bloomTex ? 3 : 2, d);
+                if (!bloomTex) {
+                    std::printf("[forge][bloom] no fallback texture for gBloomTex — resolve set bound"
+                                " with 2 of 3 slots; bloom strength is forced to 0\n");
+                }
             }
             {
                 // PerDraw set (root 0, distinct from linearize's PerBatch root 1): CBV + SRV + UAV.
@@ -10314,6 +10599,11 @@ namespace {
     // when the next frame reached the tail (MW's inter-frame window shorter than the build).
     double    g_lastHizGpuMs = 0.0;
     unsigned  g_hizOverruns  = 0;
+    // Bloom (step 4): how many pyramid levels the LAST frame actually dispatched, 0 = the pass did not
+    // run. Logged beside `bloom=` in the gpu split, because that millisecond number is meaningless
+    // without it: the level count is derived per frame from the render rect, so the same binary at a
+    // different render scale legitimately reports a different cost.
+    uint32_t  g_lastBloomLevels = 0;
     // Tier 1 (tasks/forge-host-gpu-lane.md): the frame fence is now waited at the TOP of the next
     // renderScene instead of right after our own submit, so frame N's GPU work overlaps the reply,
     // the client's RT copy/blit, MW's remaining frame and frame N+1's setup/cull.
@@ -10919,6 +11209,147 @@ namespace {
     // resolve.frag.fsl for the derivation of all three. Live, because it is a look A/B.
     float    g_resolveDither   = 1.0f;
 
+    // --- BLOOM (tasks/forge-postprocess.md step 4) -----------------------------------------------
+    // The last card on the post-process plan and the one every earlier step was clearing the way for.
+    // Three files recorded the same blocker — scenecolor.h.fsl:5 ("bloom had nothing to bloom from"
+    // while every frag ended `c = tonemap(c)`), linearize.h.fsl:6 (a convolution, and
+    // blur(x^(1/g)) != blur(x)^(1/g), so a true 16:1 highlight ratio reached the blur compressed to
+    // ~3.5:1 and read as flat haze), glow.frag.fsl:8 ("overshoot for bloom waits on the HDR post
+    // path"). All three have landed.
+    //
+    // The top-level A/B, in ONE build: unticking skips the dispatches AND forces the composite's
+    // strength lane to 0, which resolve.frag turns into an exact identity by branch. So the `bloom=`
+    // term in the gpu split can be read on and off in one session, which is the only honest way to
+    // price it.
+    bool     g_bloomEnable = true;
+    // STRENGTH k in `lerp(scene, bloom, k)`. ⚠ A LERP AND NOT AN ADD, which is what makes the whole
+    // thing energy-conserving: energy in equals energy out, the result is exposure-invariant, and a
+    // uniformly bright sky blooms to itself and adds no haze because blur(const) == const. 0 is an
+    // exact identity — verification step 3 is exactly that claim, and it is a real regression test on
+    // the param upload, the extra descriptor and the SRT append.
+    float    g_bloomStrength = 0.06f;
+    // THRESHOLD, in post-exposure scene-referred units. **SHIPS AT 0 — thresholdless**, per the
+    // decision this step was built to. The knob exists so the question can be asked in a running
+    // game, not because a non-zero answer is expected: a threshold is what a bloom needs when the
+    // composite ADDS, because then a bright sky washes the frame and something has to exclude it.
+    // The lerp form has no such failure, which is also why the legacy `Bloom Fine.fx` fog-distance
+    // depth cut was not ported.
+    float    g_bloomThreshold = 0.0f;
+    // Soft-knee width. Inert while the threshold is 0; it is what makes a highlight crossing the cut
+    // ramp in rather than pop in one frame.
+    float    g_bloomKnee = 0.5f;
+    // UPSAMPLE RADIUS, in src texels — the "how wide is the glow" knob. 0 = a pure bilinear upsample
+    // (no smoothing at all), 1 = the reference tent, i.e. the same filter as "bilinear upsample then
+    // a [1,2,1] blur". See bloomup.comp.fsl for the kernel and why it is centred on the dst texel's
+    // true sub-texel position rather than on the nearest src texel.
+    float    g_bloomRadius = 1.0f;
+    // Level CAP for A/B, not the level count. The ACTIVE count is derived per frame from the render
+    // rect (bloomLevels()) so the bloom's angular reach is resolution-independent and follows the
+    // render-scale slider for free; this only clamps it from above, so dragging it down is the "how
+    // much of the reach is the wide skirt actually buying" experiment.
+    float    g_bloomLevelCap = (float)kBloomMipCount;
+    // THE PSF EXPONENT — the up chain's accumulation factor in `dst = lerp(dst, up(src), b)`.
+    //
+    // ⚠ A LERP AND NOT AN ADD, and this knob is where that lives. `dst += up(src)` makes
+    // blur(const) = 7c over a 7-level chain, so a flat overcast sky would bloom to seven times itself
+    // and the composite would haze the whole frame by 1.36x at k = 0.06 — exactly the failure the
+    // thresholdless form exists to avoid, and exactly what the legacy `Bloom Fine.fx` needed a
+    // fog-distance depth cut to hide. A lerp keeps every level a partition of unity, so the total
+    // pyramid kernel integrates to 1 and the composite adds no energy.
+    //
+    // ⚠⚠ AND IT IS THE PHYSICALLY MEANINGFUL KNOB, which is why it stopped being a constant. Octave n
+    // carries weight b^n(1-b) over a radius 2^n, i.e. over a solid angle ~4^n, so the intensity per
+    // solid angle goes as b^n / 4^n. With theta = 2^n that is
+    //         I(theta) ~ theta^(log2(b) - 2),
+    // so **b = 0.5 gives I ~ theta^-3** — which is the falloff Spencer et al. (1995) measured for
+    // human ocular glare, whose PSF is a sum of theta^-2 and theta^-3 terms. The pyramid is therefore
+    // not an approximation of a physical glare kernel, it IS one, and this slider is its exponent:
+    //     0.25 -> theta^-4 (tight, lens-like)   0.5 -> theta^-3 (ocular glare)   0.71 -> theta^-2.5
+    // "Upsample radius" shapes one octave; this shapes how the octaves stack, which is the reach.
+    //
+    // ⚠ DEFAULTS TO THE **LENS** FALLOFF, NOT THE OCULAR ONE (user, 2026-08-19: *"I don't want
+    // haziness to the image, bloom is for the emissives"*). Spencer's theta^-3 is the right kernel
+    // for an EYE, and an eye hazes — that is what veiling glare IS. A camera lens scatters far less
+    // into its wide tail, and at MW's dynamic range the difference is not subtle. Measured on a
+    // dump (E = 5.32) as the veil around a 905-unit emitter, ring medians of bloomed/unbloomed:
+    //
+    //     ring px    4-8    8-16   16-32   32-64  64-128  128-512   mid p50   core
+    //     b=0.50    5.26    9.04    4.28    2.02    1.13     1.02      1.032   0.974
+    //     b=0.25    4.20    4.82    2.16    1.14    1.01     1.01      1.013   0.985
+    //
+    // The near glow survives (still x4.8 one octave out) while the WIDE veil drops ~8x: the energy
+    // beyond octave 2 goes 12.50% -> 1.56%. A x2 lift 64 px from a candle is the "haziness", and it
+    // is also most of the "it makes the image darker" — the veil lifts the mid-tones 3.2% into AgX's
+    // steep region while the emitter cores it robs sit in the shoulder where 2.6% is invisible, so
+    // the frame reads washed rather than brighter. Both halves shrink ~2.5x here.
+    //
+    // ⚠ THE LERP STAYS. It is not what was making the image darker — at b = 0.25 the core gives up
+    // 1.5%, i.e. 0.02 stops, and the lerp is the entire reason the form needs no threshold
+    // (blur(const) == const). Reach was the problem; energy conservation was not.
+    float    g_bloomPsf = 0.25f;
+    // Inverse-luminance (Karis) prefilter weighting, 1/(1 + luma).
+    //
+    // ⚠ **OFF, AND THE REASON IS THAT THIS BLOOM IS PHYSICAL** (user, 2026-08-18: *"physical bloom was
+    // the goal […] bloom is for values display can't show"*). It shipped ON for one build and that was
+    // wrong, by an argument this plan had already written down for a different pass: the HDR EXR dump
+    // deliberately uses a hardware BOX resolve because "resolve.frag's Catmull-Rom + inverse-luminance
+    // firefly weighting is a display reconstruction and is deliberately not energy-conserving"
+    // (forge-postprocess.md:2016). The bloom pyramid is an ENERGY operation, so it takes the
+    // energy-honest resolve for exactly that reason.
+    //
+    // The numbers are not marginal. At scene-referred luma 50 the weight is 1/51, so one lantern
+    // sample in a 16-sample footprint has its contribution cut ~40x — and a candle flame IS only a few
+    // pixels. Karis cannot distinguish "sampling noise" from "a small, genuinely bright light", and at
+    // HDR the second case is the whole point of the feature: a partially-covered sun-disc pixel really
+    // does emit that much light into that solid angle. In LDR the weight spanned only 1.0..0.5 and the
+    // question did not arise, which is why reflectmip.comp.fsl:34 could flag the gap without resolving
+    // it.
+    //
+    // Kept as a checkbox because it is still the instrument for the opposite question: if a lone
+    // specular sparkle on water reads as a hard dot rather than a glow, ticking this ON says whether
+    // it is a single sub-sample. ⚠ Turning it on makes the bloom no longer energy-conserving, so
+    // `exp=` may drift with it on — that is the knob, not a bug.
+    bool     g_bloomInvLuma = false;
+
+    // ⚠ EVERY DISPATCH AND EVERY TAP IS BOUNDED BY THE **RENDER** RECT AT ITS LEVEL, not by the
+    // allocation ([[project_forge_alloc_vs_render_uv]]). pMSAAColor is alloc-sized while the scene
+    // draws into a width x height sub-rect; at render scale 1.00x that is a QUARTER of the allocation
+    // and the rest holds last frame's texels. Level m's render extent is ceil(render / 2^(m+1)), and
+    // repeated ceil-halving equals ceil(w / 2^n), so writing it closed-form makes the chain exact
+    // rather than an accumulation of roundings.
+    //
+    // The min() against the ALLOCATED mip extent is belt-and-braces for a non-power-of-two allocation:
+    // D3D12 FLOOR-halves mip dims while this ceil-halves the render rect, so a pathological alloc
+    // could put the render rect one texel outside the resource. It cannot happen with an even
+    // allocation (which 2 x backbuffer always is), and if it ever did the write would be dropped and
+    // the read would return zero — a dark border. Cheaper to exclude than to diagnose.
+    inline uint32_t bloomLevelDim(uint32_t renderDim, uint32_t allocDim, uint32_t m) {
+        const uint32_t sh = m + 1u;
+        const uint32_t r  = (renderDim + ((1u << sh) - 1u)) >> sh;   // ceil(render / 2^(m+1))
+        const uint32_t a  = std::max(1u, std::max(1u, allocDim / 2u) >> m);
+        return std::max(1u, std::min(r, a));
+    }
+
+    // How many pyramid levels this frame actually uses. DERIVED FROM THE RENDER RECT, which is the
+    // point: the bloom's angular reach then stays put when the render-scale slider moves (each level
+    // is one octave of the frame, not one octave of some fixed pixel count), and a 0.5x frame simply
+    // stops one level earlier. Verification step 6 is this function.
+    //
+    // Stops once a level would be 8 texels or smaller on either axis — below that the tent's clamp
+    // dominates the filter and the level contributes a near-constant, i.e. exactly the flat haze the
+    // thresholdless form exists to avoid.
+    inline uint32_t bloomLevels() {
+        const uint32_t cap = (uint32_t)std::max(1.0f, std::min((float)kBloomMipCount, g_bloomLevelCap));
+        uint32_t n = 1;
+        while (n < cap) {
+            const uint32_t w = bloomLevelDim(g_live.width,  g_live.allocWidth,  n);
+            const uint32_t h = bloomLevelDim(g_live.height, g_live.allocHeight, n);
+            if (std::min(w, h) <= 8u) { break; }
+            ++n;
+        }
+        return n;
+    }
+
     // --- fp16 scene colour (tasks/forge-postprocess.md step 4: the bandwidth probe) ---------------
     // Renders the scene into R16G16B16A16_SFLOAT instead of B8G8R8A8_UNORM, with the shader resolve
     // converting back into the BGRA8 shared RT on the way out. Nothing else changes: no tonemap
@@ -11224,6 +11655,35 @@ namespace {
     // against `target 40-50`, and a table written in p90 is already AT its target there while a
     // table written in the mean is 2x dark. Sweeping this in a parked interior and reading `exp=`
     // at each stop is the measurement that settles it (plan `:1449`).
+    //
+    // ⚠ **TRIED AT 1 (p90) ON 2026-08-18 AND REVERTED THE SAME DAY. Recorded because the reasoning
+    // for the change was right and the change was still wrong, which is the useful part.**
+    //
+    // The motivation was real and is measured: on hdrdump/mge_0000.exr one blue glass lantern is
+    // **69.1% of the frame's total light energy in 0.23% of its area**, and mge_0008 is worse —
+    // **98.5% of the energy in 0.62% of the area**. A frame-MEAN meter is metering the FIXTURE, not
+    // the room (its mean is 137x its own median there), and the emissive rescale amplifies that in
+    // proportion. All of that stands.
+    //
+    // What it got wrong: **the target range in calTarget() was recorded against an unknown statistic,
+    // and p90 is roughly 2x the mean, so switching the meter without re-deriving the target made the
+    // servo INERT.** Every dumped frame came back at E = 1.00 / 1.11 / 1.99 — i.e. the reading now
+    // lands inside or above [lo,hi] and no correction is ever requested. The plan's own note predicts
+    // this exactly ("the first interior run read mean=23 p10=6 p50=16 p90=50 against target 40-50, and
+    // a table written in p90 is already AT its target there"), and says sweeping this in a parked
+    // interior is the measurement that settles it. Changing the default was jumping ahead of that
+    // measurement, and an inert servo is a worse failure than a biased one.
+    //
+    // ⚠⚠ IT ALSO WAS NOT THE RIGHT INSTRUMENT. Bloom was suspected of smearing the fixture across
+    // enough of the frame to set the p90; measured, it moves p90 by only **1.00-1.14x** (and the mean
+    // by 1.0000, as an energy-conserving pass must). So p90 is not being fooled by the veil — it is
+    // simply a different statistic against an unmatched target.
+    //
+    // **THE REAL FIX IS ON THE APL SIDE, BY EXACT ANALOGY WITH g_aplSkipSky ABOVE.** That flag exists
+    // because MW's sky is not a radiance the eye adapts to, so metering it made E a function of camera
+    // PITCH. A lamp is the same class of thing: it is not the room's brightness, and metering it makes
+    // E a function of whether a lamp is on screen. An APL that rejects (or clamps) above-white pixels
+    // is the structural answer, and it keeps the statistic and its recorded target intact.
     float  g_expStat     = 0.0f;
     // ASYMMETRIC BY CONSTRUCTION, like every eye model: brightening is slow (you walk out of a cave
     // and are dazzled for a moment), darkening is quicker. These are the time constants of a
@@ -12794,6 +13254,59 @@ namespace {
           // understood, and the format is in the log as `>> [scenefmt]` regardless.
           t.flush(); }
 
+        // -- Tab: Bloom (tasks/forge-postprocess.md step 4) --
+        // Its own tab beside "Resolve (MSAA)" and "Exposure (adaptation)", on the same split those
+        // two follow: Resolve owns the FILTER, Exposure owns LEVEL, Tonemap owns SHAPE, and this owns
+        // the SPILL. They share a shader and one cbuffer and nothing else.
+        //
+        // Inert unless the scene is scene-referred — bloom off a display-referred target is the
+        // artefact rather than the effect, which is the blocker three separate files recorded (see
+        // g_bloomEnable). The startup log says whether the pyramid built.
+        { TabBuilder t; t.panel = g_uiPanel; t.name = "Bloom";
+          // THE A/B, and a complete one in one build: unticking skips the whole pyramid AND forces the
+          // composite's strength lane to 0, which resolve.frag turns into an exact identity. So
+          // `bloom=` in the gpu split can be read on and off across one frame, which is the only
+          // honest way to price it.
+          t.checkbox("Bloom enable (off = no dispatches, exact identity)", &g_bloomEnable);
+          // STRENGTH k in lerp(scene, bloom, k). ⚠ A LERP, NOT AN ADD — energy in equals energy out,
+          // so the result is exposure-invariant and a uniformly bright sky blooms to ITSELF and adds
+          // no haze (blur(const) == const). 0 is bit-identical to a build without this feature.
+          t.sliderF("Strength k — lerp(scene, bloom, k); 0 = exact identity", &g_bloomStrength, 0.0f, 0.5f, 0.005f);
+          // ⚠ SHIPS AT 0 AND THAT IS THE DESIGN, not an unset default. A threshold is what a bloom
+          // needs when the composite ADDS, because then a bright sky washes the frame and something
+          // has to exclude it; the lerp form has no such failure. It is also why the legacy
+          // `Bloom Fine.fx` fog-distance depth cut was not ported — it fixed a bug that no longer
+          // exists. Moving this off 0 makes the effect non-energy-conserving; that is the experiment.
+          t.sliderF("Threshold (post-exposure units; 0 = thresholdless, the shipped default)",
+                    &g_bloomThreshold, 0.0f, 4.0f, 0.05f);
+          t.sliderF("Knee (soft-knee width; INERT while threshold is 0)", &g_bloomKnee, 0.0f, 2.0f, 0.05f);
+          // The "how wide is the glow" knob at a FIXED level count. 0 = a pure bilinear upsample with
+          // no smoothing, 1 = the reference tent. It trades against the level cap below — both read as
+          // "wider" — so move ONE at a time or neither can be attributed.
+          t.sliderF("Upsample radius (src texels; 0 = bilinear only, 1 = reference tent)",
+                    &g_bloomRadius, 0.0f, 2.0f, 0.1f);
+          // THE PHYSICAL KNOB. The octave stack makes I(theta) ~ theta^(log2(b) - 2), so 0.5 is
+          // theta^-3 — the falloff Spencer et al. measured for human ocular glare (a sum of theta^-2
+          // and theta^-3 terms). Lower = tighter/lens-like, higher = a wider veil. Where "radius"
+          // shapes ONE octave, this shapes how the octaves stack, which is what sets the reach.
+          t.sliderF("PSF exponent b (0.25 = theta^-4 LENS, default; 0.5 = theta^-3 ocular glare)",
+                    &g_bloomPsf, 0.05f, 0.95f, 0.05f);
+          // A CAP, not the count. The active count is derived per frame from the RENDER rect so the
+          // glow's angular width survives the render-scale slider (verification step 6); dragging this
+          // down asks how much of the reach the wide skirt is actually buying. The gpu split reports
+          // what was used as `bloom=<ms>(L<n>)`.
+          t.sliderF("Level cap (auto-derived from the render rect; caps it for A/B)",
+                    &g_bloomLevelCap, 1.0f, (float)kBloomMipCount, 1.0f);
+          // ⚠ OFF, because this bloom is PHYSICAL. Karis weights a sample by 1/(1 + luma), so a
+          // scene-referred lantern at luma 50 is cut ~40x — and Karis cannot tell "sampling noise"
+          // from "a small, genuinely bright light", which at HDR is the entire point of the feature.
+          // The plan already drew this line for the EXR dump (:2016): firefly weighting is a DISPLAY
+          // reconstruction, and the pyramid is an ENERGY operation. On = firefly diagnostic, and it
+          // stops the bloom being energy-conserving, so `exp=` may drift with it ticked.
+          t.checkbox("Inverse-luminance (Karis) prefilter — DIAGNOSTIC; breaks energy conservation",
+                     &g_bloomInvLuma);
+          t.flush(); }
+
         // -- Tab: Exposure (the servo — tasks/forge-postprocess.md step 2) --
         // A tab of its own rather than a corner of "Resolve (MSAA)": that tab is about the FILTER
         // (diameter, sharpness, fireflies, dither), and this is about the LOOK. They share a shader
@@ -12812,7 +13325,12 @@ namespace {
           // (see the WT2 water-debug note), and this is a knob to be SWEPT, not set once: reading
           // `exp=` at each stop in a parked interior is the measurement that settles which statistic
           // the calibration table is written in.
-          t.sliderF("Meter statistic (0 = frame mean, 1 = p90, 2 = geometric mean)",
+          // ⚠ SWEEPING THIS IS STILL AN OWED MEASUREMENT, and moving it is NOT free: the target range
+          // in calTarget() was recorded against an unknown statistic, and p90 is ~2x the mean, so a
+          // switch without re-deriving the target makes the servo INERT (tried 2026-08-18: every frame
+          // came back at E = 1.00-1.99, no correction ever requested). Read `exp=` at each stop in a
+          // parked interior. See the g_expStat declaration for why the fix is on the APL side instead.
+          t.sliderF("Meter statistic (0 = frame mean [default], 1 = p90, 2 = geometric mean)",
                     &g_expStat, 0.0f, 2.0f, 1.0f);
           // Time constants of the first-order lag, i.e. the 63% time — the visible ramp is ~3x
           // these. Asymmetric on purpose: dark-adaptation is the slow direction in an eye and in
@@ -13307,6 +13825,7 @@ namespace {
           // on a tower shaft, or beneath an arch all five azimuths report a steep horizon at once and
           // the point goes near-black — while the sky is open toward the horizon in every direction.
           // FLOOR at 1.0 disables the correction (full trust everywhere) and is the A/B for it.
+          t.sliderF("Emissive: exposed-value falloff p (0 = off; boost only the CLIPPED core)", &g_emisSdrExpand, 0.0f, 16.0f, 0.5f);
           t.sliderF("Sky AO: overhang START (world u of clearance)", &g_skyAOOverhang, 0.0f, 2048.0f, 32.0f, "%.0f");
           t.sliderF("Sky AO: overhang FADE width (world u)", &g_skyAOOverhangFade, 64.0f, 8192.0f, 64.0f, "%.0f");
           t.sliderF("Sky AO: overhang TRUST floor (1 = correction off)", &g_skyAOOverhangFloor, 0.0f, 1.0f, 0.05f);
@@ -17006,6 +17525,13 @@ namespace ForgeRender {
                     ((float*)dins)[dm.matIdx * kStaticInstU32 + 8]  = em;      // .x = emit scale / carve flag
                     ((float*)dins)[dm.matIdx * kStaticInstU32 + 9]  = owner;   // .y = owner slot+1 (0 none, -1 all)
                     ((float*)dins)[dm.matIdx * kStaticInstU32 + 10] = 0.0f;
+                    // No emissive boost in the caster pass, and shadowcaster.frag OVERLOADS
+                    // MatEmissive.x/.y (emit scale / owner slot) — so the gain must be exactly 1.0
+                    // here or the vert would scale those. Written every frame because this index
+                    // is recycled and a previous frame's real gain would otherwise persist.
+                    ((float*)dins)[dm.matIdx * kStaticInstU32 + 12] = 1.0f;
+                    ((float*)dins)[dm.matIdx * kStaticInstU32 + 13] = 1.0f;
+                    ((float*)dins)[dm.matIdx * kStaticInstU32 + 14] = 1.0f;
                 }
             }
 
@@ -17281,6 +17807,10 @@ namespace ForgeRender {
                     ((float*)sins)[g * kStaticInstU32 + 8]  = em;
                     ((float*)sins)[g * kStaticInstU32 + 9]  = owner;
                     ((float*)sins)[g * kStaticInstU32 + 10] = 0.0f;
+                    // 1.0, not 0 — shadowcaster.frag overloads MatEmissive.x/.y. See the dins fill.
+                    ((float*)sins)[g * kStaticInstU32 + 12] = 1.0f;
+                    ((float*)sins)[g * kStaticInstU32 + 13] = 1.0f;
+                    ((float*)sins)[g * kStaticInstU32 + 14] = 1.0f;
                 }
                 g_setupBlkMs[kSetupBlkPackFill] += hostNowMs() - tPkFill0;
                 const double tPkJob0 = hostNowMs();
@@ -17575,6 +18105,13 @@ namespace ForgeRender {
             finst[local * kStaticInstU32 + 8] = items[i].matEmissive[0];
             finst[local * kStaticInstU32 + 9] = items[i].matEmissive[1];
             finst[local * kStaticInstU32 + 10] = items[i].matEmissive[2];
+            // [12..14] the flux/area emissive gain — its OWN lane, because opaque.vert must apply
+            // it AFTER decodeAuthored() and to whichever source vColSource picked. Folded into
+            // matEmissive it was both exponentiated by the sRGB decode and, on vColSource 1,
+            // discarded outright. See IPC::DrawItemWire::emissiveGain.
+            finst[local * kStaticInstU32 + 12] = items[i].emissiveGain[0];
+            finst[local * kStaticInstU32 + 13] = items[i].emissiveGain[1];
+            finst[local * kStaticInstU32 + 14] = items[i].emissiveGain[2];
             // Terrain DECAL_1 overlay slot (0 = no decal → frag splat gated off, non-terrain unchanged).
             inst[local * kStaticInstU32 + 11] = items[i].overlayTexIndex;
         }
@@ -18351,6 +18888,9 @@ namespace ForgeRender {
                     fe[8]  = it.matAmbient[0];  fe[9]  = it.matAmbient[1];  fe[10] = it.matAmbient[2];
                     fe[11] = it.matEmissive[0]; fe[12] = it.matEmissive[1]; fe[13] = it.matEmissive[2];
                     fe[14] = it.matAlpha;   // unused by depthonly_mm.frag; lane must not be stale
+                    // [15..17] the emissive ratio. multimap.vert is SHARED by this prepass and the
+                    // colour pass, and the gain never touches SV_Position, so early-Z stays exact.
+                    fe[15] = it.emissiveGain[0]; fe[16] = it.emissiveGain[1]; fe[17] = it.emissiveGain[2];
 
                     const int mirror = worldMirrored(it.world) ? 1 : 0;
                     if (mirror != boundMMMirror) {
@@ -19676,6 +20216,10 @@ namespace ForgeRender {
                     finst[idx * kStaticInstU32 + 6] = it.uvOffset[1];
                     finst[idx * kStaticInstU32 + 7] = 0.0f;
                     finst[idx * kStaticInstU32 + 11] = it.matAlpha;
+                    // Sky carries no emissive boost; 1.0 is the gain lane's identity (not 0).
+                    finst[idx * kStaticInstU32 + 12] = 1.0f;
+                    finst[idx * kStaticInstU32 + 13] = 1.0f;
+                    finst[idx * kStaticInstU32 + 14] = 1.0f;
 
                     Buffer*  meshVb     = m.inArena ? g_live.pArenaVB : m.vb;
                     Buffer*  meshIb     = m.inArena ? g_live.pArenaIB : m.ib;
@@ -19949,6 +20493,10 @@ namespace ForgeRender {
                 finst[idx * kStaticInstU32 + 6] = it.uvOffset[1];
                 finst[idx * kStaticInstU32 + 7] = 0.0f;
                 finst[idx * kStaticInstU32 + 11] = it.matAlpha;
+                // Sky carries no emissive boost; 1.0 is the gain lane's identity (not 0).
+                finst[idx * kStaticInstU32 + 12] = 1.0f;
+                finst[idx * kStaticInstU32 + 13] = 1.0f;
+                finst[idx * kStaticInstU32 + 14] = 1.0f;
 
                 // Arena (bind-once + offsets) vs dynamic-ring (own VB/IB) source.
                 Buffer*  meshVb     = m.inArena ? g_live.pArenaVB : m.vb;
@@ -20322,6 +20870,7 @@ namespace ForgeRender {
                 fe[8]  = it.matAmbient[0];  fe[9]  = it.matAmbient[1];  fe[10] = it.matAmbient[2];
                 fe[11] = it.matEmissive[0]; fe[12] = it.matEmissive[1]; fe[13] = it.matEmissive[2];
                 fe[14] = it.matAlpha;   // unused by multimap.frag (opaque forces 1.0); kept in sync
+                fe[15] = it.emissiveGain[0]; fe[16] = it.emissiveGain[1]; fe[17] = it.emissiveGain[2];
 
                 const int mirror = worldMirrored(it.world) ? 1 : 0;
                 if (mirror != boundMMMirror) {
@@ -20956,6 +21505,7 @@ namespace ForgeRender {
                 fe[8]  = it.matAmbient[0];  fe[9]  = it.matAmbient[1];  fe[10] = it.matAmbient[2];
                 fe[11] = it.matEmissive[0]; fe[12] = it.matEmissive[1]; fe[13] = it.matEmissive[2];
                 fe[14] = it.matAlpha;   // Route C: the ONE loop whose frag actually reads it
+                fe[15] = it.emissiveGain[0]; fe[16] = it.emissiveGain[1]; fe[17] = it.emissiveGain[2];
 
                 if (!bound) {
                     cmdBindPipeline(g_live.pCmd, g_live.pMultiMapAlphaPipeline);
@@ -21229,6 +21779,9 @@ namespace ForgeRender {
                 finst[idx * kStaticInstU32 + 8]  = it.matEmissive[0];
                 finst[idx * kStaticInstU32 + 9]  = it.matEmissive[1];
                 finst[idx * kStaticInstU32 + 10] = it.matEmissive[2];
+                finst[idx * kStaticInstU32 + 12] = it.emissiveGain[0];   // ratio lane — see opaque.vert
+                finst[idx * kStaticInstU32 + 13] = it.emissiveGain[1];
+                finst[idx * kStaticInstU32 + 14] = it.emissiveGain[2];
                 // matAlpha rides the overlay slot [11] (opaque.vert reads it as a uint;
                 // alpha.frag asfloat's it back — the terrain splat doesn't run in this frag).
                 finst[idx * kStaticInstU32 + 11] = it.matAlpha;
@@ -21523,6 +22076,9 @@ namespace ForgeRender {
                     finst[idx * kStaticInstU32 + 8]  = it.matEmissive[0];
                     finst[idx * kStaticInstU32 + 9]  = it.matEmissive[1];
                     finst[idx * kStaticInstU32 + 10] = it.matEmissive[2];
+                    finst[idx * kStaticInstU32 + 12] = it.emissiveGain[0];   // ratio lane — see opaque.vert
+                    finst[idx * kStaticInstU32 + 13] = it.emissiveGain[1];
+                    finst[idx * kStaticInstU32 + 14] = it.emissiveGain[2];
                     inst[idx * kStaticInstU32 + 11]  = 0;   // no terrain decal on arms
 
                     const uint32_t firstVertex = m.inArena ? (uint32_t)(m.vbOff / sizeof(IPC::GeomVertexWire)) : 0u;
@@ -21723,6 +22279,9 @@ namespace ForgeRender {
                     finst[idx * kStaticInstU32 + 8]  = it.matEmissive[0];
                     finst[idx * kStaticInstU32 + 9]  = it.matEmissive[1];
                     finst[idx * kStaticInstU32 + 10] = it.matEmissive[2];
+                    finst[idx * kStaticInstU32 + 12] = it.emissiveGain[0];   // ratio lane — see opaque.vert
+                    finst[idx * kStaticInstU32 + 13] = it.emissiveGain[1];
+                    finst[idx * kStaticInstU32 + 14] = it.emissiveGain[2];
                     finst[idx * kStaticInstU32 + 11] = it.matAlpha;      // alpha.frag asfloat's it back
                     // AT3 multi-stage — same table, tail indices (see the main alpha loop).
                     if (g_live.pAlphaStagesBuf) {
@@ -21904,20 +22463,12 @@ namespace ForgeRender {
             drawDevUI();
         };
 
-        gpuPhaseBegin(kGpuPhaseResolve);
-        // --- Custom shader resolve (tasks/forge-postprocess.md step 4) ---------------------------
-        // Catmull-Rom reconstruction + inverse-luminance firefly weighting, straight into the shared
-        // RT. Ticking g_customResolve off falls through to the hardware ResolveSubresource below, so
-        // the two are a live A/B in one build — which is the point, since `resolve` in the gpu split
-        // is the only honest measurement of what ~150 MSAA loads/pixel actually costs here.
-        //
-        // It has to exist before HDR can: a hardware resolve cannot format-convert, so the moment
-        // pMSAAColor goes fp16 this is the only path left. See resolve.srt.h.
-        // ⚠ ONCE THE SCENE IS fp16 THE FALLBACK BELOW IS ILLEGAL. ResolveSubresource cannot convert
-        // R16G16B16A16_SFLOAT into the BGRA8 shared RT, so the shader path stops being a preference
-        // and becomes the only legal way to finish a frame. Override the A/B checkbox rather than
-        // letting it emit a call the debug layer rejects (and the release runtime turns into a
-        // removed device), and say so once so "my resolve toggle won't stay off" has an explanation.
+        // ⚠ HOISTED ABOVE kGpuPhaseBloom / kGpuPhaseResolve, deliberately. The bloom block below is
+        // gated on the same `shaderResolve` the resolve is, because it hands its result to that shader
+        // and to nothing else — so the decision has to be made once, before either phase, or the two
+        // gates can disagree and the pyramid gets built for a frame that never composites it. All of
+        // it is pure CPU with no recorded commands, so nothing moves between the GPU timers; a few
+        // microseconds move out of `rec split resolve=`.
         const bool convertingResolve = (g_live.sceneColorFormat != g_live.pRT->mFormat);
         if (convertingResolve && !g_customResolve) {
             static bool s_forcedOnce = false;
@@ -21932,6 +22483,137 @@ namespace ForgeRender {
         const bool shaderResolve = g_customResolve && (g_live.sampleCount > 1)
                                 && g_live.pResolvePipeline && g_live.pResolveSet
                                 && g_live.pResolveParamsCbv && g_live.pMSAAColor;
+
+        // ===================== BLOOM (tasks/forge-postprocess.md step 4) =========================
+        // Bright things spill light into their surroundings, in scene-referred linear space. Runs HERE
+        // — after every pass that writes pMSAAColor (colour, water, glow, sorted alpha, volfog, first
+        // person) and before the resolve reads it — which is the only window where the scene target
+        // holds a finished frame.
+        //
+        // ⚠ THE BARRIER HOIST. pMSAAColor sits in RENDER_TARGET until the resolve flips it to
+        // SHADER_RESOURCE. Rather than flipping it here and back, the bloom block does that transition
+        // ONCE and sets msaaColorInSR; the resolve then skips its own identical barrier and only does
+        // the restore at its tail. One transition, not a round trip — on a target this large that is
+        // not free on hardware that decompresses.
+        //
+        // The pyramid itself takes reflectmip's exact bracket: SR -> UAV, prefilter, then per level a
+        // UAV barrier (current == new lowers to a true D3D12 UAV barrier) and a dispatch, then UAV ->
+        // SR at the end. The up chain's barriers are load-bearing in a way the down chain's are not:
+        // level j reads level j+1 that the PREVIOUS dispatch just wrote.
+        bool msaaColorInSR = false;
+        if (shaderResolve && g_live.sceneReferred && g_live.bloomReady && g_bloomEnable) {
+            gpuPhaseBegin(kGpuPhaseBloom);
+            cmdBeginDebugMarker(g_live.pCmd, 1.0f, 0.85f, 0.4f, "BLOOM (prefilter + down + up pyramid)");
+
+            const uint32_t levels = bloomLevels();
+            // ⚠ THE SAME EXPRESSION THE RESOLVE'S tone.x USES, character for character. The composite
+            // sits immediately after `straight *= tone.x`, so the pyramid has to be pre-multiplied by
+            // the identical E or the lerp mixes two different unit systems and bloom's apparent
+            // strength becomes a function of the servo. Two receivers, ONE source — the house rule
+            // opts.y and tone.y already follow for the same reason.
+            const float bloomE = (g_live.sceneReferred && g_expEnable) ? (float)g_exposure : 1.0f;
+
+            // Level m's RENDER extent. Not the allocation, and not GetDimensions (which returns the
+            // allocation) — see bloomLevelDim.
+            auto lw = [&](uint32_t m) { return bloomLevelDim(g_live.width,  g_live.allocWidth,  m); };
+            auto lh = [&](uint32_t m) { return bloomLevelDim(g_live.height, g_live.allocHeight, m); };
+            auto fill = [&](uint32_t si, uint32_t srcW, uint32_t srcH, uint32_t dstW, uint32_t dstH) {
+                Buffer* b = g_live.pBloomParamsCbv[si];
+                if (!b || !b->pCpuMappedAddress) { return; }
+                float* p = (float*)b->pCpuMappedAddress;
+                p[0]  = (float)srcW; p[1] = (float)srcH; p[2] = 0.0f; p[3] = 0.0f;   // src rect
+                p[4]  = (float)dstW; p[5] = (float)dstH; p[6] = 0.0f; p[7] = 0.0f;   // dst rect
+                p[8]  = std::max(0.0f, g_bloomThreshold);
+                p[9]  = std::max(1.0e-4f, g_bloomKnee);
+                p[10] = std::max(0.0f, g_bloomRadius);
+                p[11] = std::min(std::max(g_bloomPsf, 0.05f), 0.95f);   // PSF exponent; 0.5 = theta^-3
+                p[12] = g_bloomInvLuma ? 1.0f : 0.0f;
+                p[13] = bloomE;
+                p[14] = 0.0f; p[15] = 0.0f;
+            };
+            // [0] prefilter reads the FULL-RES scene render rect and writes mip 0.
+            fill(0, g_live.width, g_live.height, lw(0), lh(0));
+            for (uint32_t m = 1; m < levels; ++m) {
+                fill(bloomSetDown(m), lw(m - 1), lh(m - 1), lw(m), lh(m));
+            }
+            for (uint32_t j = 0; j + 1 < levels; ++j) {
+                fill(bloomSetUp(j), lw(j + 1), lh(j + 1), lw(j), lh(j));
+            }
+
+            {
+                RenderTargetBarrier rb = {};
+                rb.pRenderTarget = g_live.pMSAAColor;
+                rb.mCurrentState = RESOURCE_STATE_RENDER_TARGET;
+                rb.mNewState     = RESOURCE_STATE_SHADER_RESOURCE;
+                cmdResourceBarrier(g_live.pCmd, 0, nullptr, 0, nullptr, 1, &rb);
+                msaaColorInSR = true;   // the resolve's own identical barrier is now skipped
+
+                TextureBarrier tb = {};
+                tb.pTexture      = g_live.pBloomMips;
+                tb.mCurrentState = RESOURCE_STATE_SHADER_RESOURCE;
+                tb.mNewState     = RESOURCE_STATE_UNORDERED_ACCESS;
+                cmdResourceBarrier(g_live.pCmd, 0, nullptr, 1, &tb, 0, nullptr);
+            }
+            auto bloomUavBarrier = [&]() {
+                TextureBarrier tb = {};
+                tb.pTexture      = g_live.pBloomMips;
+                tb.mCurrentState = RESOURCE_STATE_UNORDERED_ACCESS;
+                tb.mNewState     = RESOURCE_STATE_UNORDERED_ACCESS;
+                cmdResourceBarrier(g_live.pCmd, 0, nullptr, 1, &tb, 0, nullptr);
+            };
+
+            cmdBindPipeline(g_live.pCmd, g_live.pBloomPrefilterPipeline);
+            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pBloomSet);
+            cmdDispatch(g_live.pCmd, (lw(0) + 7u) / 8u, (lh(0) + 7u) / 8u, 1);
+            if (levels > 1) {
+                cmdBindPipeline(g_live.pCmd, g_live.pBloomDownPipeline);
+                for (uint32_t m = 1; m < levels; ++m) {
+                    bloomUavBarrier();
+                    cmdBindDescriptorSet(g_live.pCmd, bloomSetDown(m), g_live.pBloomSet);
+                    cmdDispatch(g_live.pCmd, (lw(m) + 7u) / 8u, (lh(m) + 7u) / 8u, 1);
+                }
+                // ...and back UP, coarsest first, each level blended into the one below it. Reverse
+                // order is what makes the pyramid a single wide kernel rather than N independent
+                // blurs, so the loop direction is not a style choice.
+                cmdBindPipeline(g_live.pCmd, g_live.pBloomUpPipeline);
+                for (uint32_t j = levels - 1; j-- > 0; ) {
+                    bloomUavBarrier();
+                    cmdBindDescriptorSet(g_live.pCmd, bloomSetUp(j), g_live.pBloomSet);
+                    cmdDispatch(g_live.pCmd, (lw(j) + 7u) / 8u, (lh(j) + 7u) / 8u, 1);
+                }
+            }
+            {
+                TextureBarrier tb = {};
+                tb.pTexture      = g_live.pBloomMips;
+                tb.mCurrentState = RESOURCE_STATE_UNORDERED_ACCESS;
+                tb.mNewState     = RESOURCE_STATE_SHADER_RESOURCE;   // resolve.frag reads it as an SRV
+                cmdResourceBarrier(g_live.pCmd, 0, nullptr, 1, &tb, 0, nullptr);
+            }
+            cmdEndDebugMarker(g_live.pCmd);
+            gpuPhaseEnd(kGpuPhaseBloom);
+            g_lastBloomLevels = levels;
+        } else {
+            g_lastBloomLevels = 0;
+        }
+
+        gpuPhaseBegin(kGpuPhaseResolve);
+        // --- Custom shader resolve (tasks/forge-postprocess.md step 4) ---------------------------
+        // Catmull-Rom reconstruction + inverse-luminance firefly weighting, straight into the shared
+        // RT. Ticking g_customResolve off falls through to the hardware ResolveSubresource below, so
+        // the two are a live A/B in one build — which is the point, since `resolve` in the gpu split
+        // is the only honest measurement of what ~150 MSAA loads/pixel actually costs here.
+        //
+        // It has to exist before HDR can: a hardware resolve cannot format-convert, so the moment
+        // pMSAAColor goes fp16 this is the only path left. See resolve.srt.h.
+        // ⚠ ONCE THE SCENE IS fp16 THE FALLBACK BELOW IS ILLEGAL. ResolveSubresource cannot convert
+        // R16G16B16A16_SFLOAT into the BGRA8 shared RT, so the shader path stops being a preference
+        // and becomes the only legal way to finish a frame. Override the A/B checkbox rather than
+        // letting it emit a call the debug layer rejects (and the release runtime turns into a
+        // removed device), and say so once so "my resolve toggle won't stay off" has an explanation.
+        //
+        // ⚠ `convertingResolve` / the force-on / `shaderResolve` MOVED UP, above the bloom block —
+        // bloom is gated on the same decision and has to see it before it records anything. Same
+        // expressions, one evaluation.
         if (shaderResolve) {
             ID3D12GraphicsCommandList* cl = g_live.pCmd->mDx.pCmdList;
 
@@ -21980,9 +22662,24 @@ namespace ForgeRender {
                 // one by zero coverage ([[project_nan_survives_zero_multiply]]). agxSlopeF() clamps
                 // to [1.5, 3.0] and the init self-test asserts both scales finite, so the value
                 // reaching the shader has already been checked at the one place it is made.
-                // Seven float4 = 112 B against a 256 B cbuffer, so still no allocation change.
+                // bloom = (strength k, mip-0 render W, mip-0 render H, reserved) — step 4. The pyramid
+                // was built a few lines above this pass and rests in SHADER_RESOURCE; the composite
+                // lerps it into the un-premultiplied straight colour immediately after the exposure
+                // multiply, which is forced twice over (inside the curve because bloom is LIGHT, and
+                // in straight colour because tonemap(c*a) != tonemap(c)*a).
+                //
+                // ⚠ THE STRENGTH IS THE ONE GATE THE SHADER SEES, so everything that can make bloom
+                // unavailable has to fold into it: the enable checkbox, bloomReady, and sceneReferred.
+                // resolve.frag turns 0 into an exact identity by BRANCH rather than by arithmetic,
+                // because `lerp(x, b, 0) == x` only holds for FINITE b and an fp16 UAV nobody
+                // dispatched into is not guaranteed finite ([[project_nan_survives_zero_multiply]]).
+                // ⚠ AND IT MUST AGREE WITH THE DISPATCH GATE ABOVE, or a frame composites a pyramid
+                // nothing filled — hence the same three terms in the same order.
+                const bool  bloomOn = g_live.sceneReferred && g_live.bloomReady && g_bloomEnable;
+                const float bloomK  = bloomOn ? std::max(0.0f, g_bloomStrength) : 0.0f;
+                // Eight float4 = 128 B against a 256 B cbuffer, so still no allocation change.
                 const AgxScales curveScale = agxScalesF();
-                const float p[28] = { (float)g_live.width, (float)g_live.height, diam, radius,
+                const float p[32] = { (float)g_live.width, (float)g_live.height, diam, radius,
                                       g_resolveInvLuma ? 1.0f : 0.0f,
                                       g_live.sceneReferred ? 1.0f : 0.0f,
                                       std::max(0.0f, g_resolveSharp),
@@ -21992,17 +22689,29 @@ namespace ForgeRender {
                                       agxActive() ? 1.0f : 0.0f, 0.0f, 0.0f,
                                       g_agxSlope, g_agxPower, g_agxSat, g_agxOffset,
                                       agxSlopeF(), g_agxToePower, g_agxShoulderPower, 0.0f,
-                                      curveScale.toe, curveScale.shoulder, kAgxPivotX, kAgxPivotY };
+                                      curveScale.toe, curveScale.shoulder, kAgxPivotX, kAgxPivotY,
+                                      bloomK,
+                                      (float)bloomLevelDim(g_live.width,  g_live.allocWidth,  0),
+                                      (float)bloomLevelDim(g_live.height, g_live.allocHeight, 0),
+                                      0.0f };
                 std::memcpy(g_live.pResolveParamsCbv->pCpuMappedAddress, p, sizeof(p));
             }
 
             // Source: MSAA colour RENDER_TARGET -> SHADER_RESOURCE (the APL block's idiom, and it is
             // a Forge-managed target so it takes a Forge barrier).
+            //
+            // ⚠ SKIPPED WHEN THE BLOOM BLOCK ALREADY DID IT. Bloom reads the same target through the
+            // same SHADER_RESOURCE state, so the two would otherwise be a RENDER_TARGET -> SR -> RT ->
+            // SR round trip on a 4096x3072 fp16 MSAA surface — not free on hardware that decompresses.
+            // The RESTORE at this block's tail is unconditional either way, so the resting state is
+            // identical whichever path set it.
             RenderTargetBarrier srb = {};
             srb.pRenderTarget = g_live.pMSAAColor;
             srb.mCurrentState = RESOURCE_STATE_RENDER_TARGET;
             srb.mNewState     = RESOURCE_STATE_SHADER_RESOURCE;
-            cmdResourceBarrier(g_live.pCmd, 0, nullptr, 0, nullptr, 1, &srb);
+            if (!msaaColorInSR) {
+                cmdResourceBarrier(g_live.pCmd, 0, nullptr, 0, nullptr, 1, &srb);
+            }
 
             // Destination: the SHARED resource, driven natively like the hardware path does.
             // ⚠ Only on non-first frames. Frame 0 it was created RENDER_TARGET, which is already the
@@ -22435,7 +23144,7 @@ namespace ForgeRender {
                          g_lastCpuPhaseMs[kGpuPhaseColorAlpha],
                          g_lastCpuPhaseMs[kGpuPhaseResolve],
                          g_lastRecMs - g_lastCpuPhaseMs[kGpuPhaseFrame]);
-            LOG::logline(">> [forge-hb] gpu split: cull=%.2f prepass=%.2f shadow=%.2f (st=%.2f dyn=%.2f sun=%.2f) postdepth=%.2f (lin=%.2f ao=%.2f mask=%.2f) reflect=%.2f color=%.2f water=%.2f resolve=%.2f ms"
+            LOG::logline(">> [forge-hb] gpu split: cull=%.2f prepass=%.2f shadow=%.2f (st=%.2f dyn=%.2f sun=%.2f) postdepth=%.2f (lin=%.2f ao=%.2f mask=%.2f) reflect=%.2f color=%.2f water=%.2f bloom=%.2f(L%u) resolve=%.2f ms"
                          " | hiz=%.2f (prologue, overruns=%u) | shadowCasters=%u maskSlots=%u(dyn=%u)"
                          " | nearTris=%.2fM atDraws=%u"
                          " | terrain=%u/%u cells (nearCut=%u) %.2fM tris (lod %u/%u/%u/%u/%u/%u)%s",
@@ -22448,7 +23157,13 @@ namespace ForgeRender {
                          g_lastGpuPhaseMs[kGpuPhasePostDepth] - g_lastGpuPhaseMs[kGpuPhaseLinearize] - g_lastGpuPhaseMs[kGpuPhaseShadowMask],
                          g_lastGpuPhaseMs[kGpuPhaseShadowMask],
                          g_lastGpuPhaseMs[kGpuPhaseReflect], g_lastGpuPhaseMs[kGpuPhaseColor],
-                         g_lastGpuPhaseMs[kGpuPhaseWater], g_lastGpuPhaseMs[kGpuPhaseResolve],
+                         g_lastGpuPhaseMs[kGpuPhaseWater],
+                         // bloom=<ms>(L<levels>) — step 4. L0 means the pass did not run this frame
+                         // (checkbox off, not scene-referred, or the pyramid failed to build), which is
+                         // the distinction worth logging: a 0.00 with L7 would be a timing problem,
+                         // with L0 it is a gate.
+                         g_lastGpuPhaseMs[kGpuPhaseBloom], g_lastBloomLevels,
+                         g_lastGpuPhaseMs[kGpuPhaseResolve],
                          g_lastHizGpuMs, g_hizOverruns,
                          (unsigned)g_shadowCasters.size(),
                          g_lastShadowActive, g_lastShadowDyn,
@@ -22838,6 +23553,57 @@ namespace ForgeRender {
                 LOG::logline(">> [forge] reflect-mip shaders hot-reloaded (reflectmipfirst + reflectmip)"); LOG::flush();
             } else {
                 LOG::logline("!! [forge] reflect-mip hot-reload FAILED — pyramid DISABLED (dxil missing on disk?)"); LOG::flush();
+            }
+        }
+
+        // BLOOM (step 4): same treatment, and it is the whole reason this pass is compute. Strength,
+        // radius, threshold and the up-chain blend are exactly the knobs that want walking in a
+        // running game — reflectmip.comp made the same call for the same reason. Failure disables the
+        // pyramid (bloomReady false, loud); the resources and the 13 set instances stay valid for a
+        // retry, and resolve.frag's strength lane goes to 0, so the frame is bit-identical to a build
+        // without bloom in the meantime.
+        if (g_live.pBloomPrefilterShader || g_live.pBloomDownShader || g_live.pBloomUpShader) {
+            if (g_live.pBloomUpPipeline)        { removePipeline(R, g_live.pBloomUpPipeline);        g_live.pBloomUpPipeline = nullptr; }
+            if (g_live.pBloomUpShader)         { removeShader(R, g_live.pBloomUpShader);            g_live.pBloomUpShader = nullptr; }
+            if (g_live.pBloomDownPipeline)     { removePipeline(R, g_live.pBloomDownPipeline);      g_live.pBloomDownPipeline = nullptr; }
+            if (g_live.pBloomDownShader)       { removeShader(R, g_live.pBloomDownShader);          g_live.pBloomDownShader = nullptr; }
+            if (g_live.pBloomPrefilterPipeline){ removePipeline(R, g_live.pBloomPrefilterPipeline); g_live.pBloomPrefilterPipeline = nullptr; }
+            if (g_live.pBloomPrefilterShader)  { removeShader(R, g_live.pBloomPrefilterShader);     g_live.pBloomPrefilterShader = nullptr; }
+            ShaderLoadDesc bpf = {};
+            // ⚠ The SAME sampleCount-driven variant pick as the build path — the two MUST agree, or a
+            // hot-reload silently swaps the resolve for a plain copy (or reads a Tex2DMS through a
+            // Tex2D declaration). Exactly the hazard the reflect-mip reload above records.
+            bpf.mComp.pFileName = (g_live.sampleCount > 1) ? "bloomprefilter_sc4.comp"
+                                                           : "bloomprefilter_sc1.comp";
+            addShader(R, &bpf, &g_live.pBloomPrefilterShader);
+            ShaderLoadDesc bdn = {};
+            bdn.mComp.pFileName = "bloomdown.comp";
+            addShader(R, &bdn, &g_live.pBloomDownShader);
+            ShaderLoadDesc bup = {};
+            bup.mComp.pFileName = "bloomup.comp";
+            addShader(R, &bup, &g_live.pBloomUpShader);
+            if (g_live.pBloomPrefilterShader && g_live.pBloomDownShader && g_live.pBloomUpShader) {
+                PipelineDesc pf = {};
+                pf.mType = PIPELINE_TYPE_COMPUTE;
+                pf.mComputeDesc.pShaderProgram = g_live.pBloomPrefilterShader;
+                addPipeline(R, &pf, &g_live.pBloomPrefilterPipeline);
+                PipelineDesc pdn = {};
+                pdn.mType = PIPELINE_TYPE_COMPUTE;
+                pdn.mComputeDesc.pShaderProgram = g_live.pBloomDownShader;
+                addPipeline(R, &pdn, &g_live.pBloomDownPipeline);
+                PipelineDesc pup = {};
+                pup.mType = PIPELINE_TYPE_COMPUTE;
+                pup.mComputeDesc.pShaderProgram = g_live.pBloomUpShader;
+                addPipeline(R, &pup, &g_live.pBloomUpPipeline);
+            }
+            g_live.bloomReady = g_live.pBloomMips && g_live.pBloomSet
+                             && g_live.pBloomPrefilterPipeline && g_live.pBloomDownPipeline
+                             && g_live.pBloomUpPipeline;
+            if (g_live.bloomReady) {
+                LOG::logline(">> [forge][bloom] shaders hot-reloaded (bloomprefilter_sc%c + bloomdown + bloomup)",
+                             (g_live.sampleCount > 1) ? '4' : '1'); LOG::flush();
+            } else {
+                LOG::logline("!! [forge][bloom] hot-reload FAILED — bloom DISABLED (dxil missing on disk?)"); LOG::flush();
             }
         }
 
@@ -31525,6 +32291,20 @@ namespace ForgeRender {
         if (g_live.pResolvePipeline) { removePipeline(R, g_live.pResolvePipeline); g_live.pResolvePipeline = nullptr; }
         if (g_live.pResolveShader)   { removeShader(R, g_live.pResolveShader);     g_live.pResolveShader = nullptr; }
         if (g_live.pResolveParamsCbv){ removeResource(g_live.pResolveParamsCbv);   g_live.pResolveParamsCbv = nullptr; }
+        // Bloom pyramid (step 4) — set -> pipelines -> shaders -> cbuffers -> texture, the same order.
+        // The texture goes LAST because the descriptor set references it.
+        if (g_live.pBloomSet)              { removeDescriptorSet(R, g_live.pBloomSet); g_live.pBloomSet = nullptr; }
+        if (g_live.pBloomUpPipeline)       { removePipeline(R, g_live.pBloomUpPipeline);        g_live.pBloomUpPipeline = nullptr; }
+        if (g_live.pBloomDownPipeline)     { removePipeline(R, g_live.pBloomDownPipeline);      g_live.pBloomDownPipeline = nullptr; }
+        if (g_live.pBloomPrefilterPipeline){ removePipeline(R, g_live.pBloomPrefilterPipeline); g_live.pBloomPrefilterPipeline = nullptr; }
+        if (g_live.pBloomUpShader)         { removeShader(R, g_live.pBloomUpShader);            g_live.pBloomUpShader = nullptr; }
+        if (g_live.pBloomDownShader)       { removeShader(R, g_live.pBloomDownShader);          g_live.pBloomDownShader = nullptr; }
+        if (g_live.pBloomPrefilterShader)  { removeShader(R, g_live.pBloomPrefilterShader);     g_live.pBloomPrefilterShader = nullptr; }
+        for (uint32_t s = 0; s < kBloomSetCount; ++s) {
+            if (g_live.pBloomParamsCbv[s]) { removeResource(g_live.pBloomParamsCbv[s]); g_live.pBloomParamsCbv[s] = nullptr; }
+        }
+        if (g_live.pBloomMips)             { removeResource(g_live.pBloomMips); g_live.pBloomMips = nullptr; }
+        g_live.bloomReady = false;
         if (g_live.pAOParamsCbv)    { removeResource(g_live.pAOParamsCbv); }
         if (g_live.pAOBlur)         { removeResource(g_live.pAOBlur); }
         if (g_live.pAO)             { removeResource(g_live.pAO); }

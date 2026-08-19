@@ -338,7 +338,10 @@ float4 PS_MAIN( VSOutput In )
 
     albedo.rgb *= gFrameData.dbgScales.z;   // dev panel: albedo (texture) intensity modifier
 
-    float3 c = albedo.rgb * lit;
+    // The emissive gain lands only on the texels the SDR encode CLIPPED — see scenecolor.h.fsl.
+    // Coverage is 1: this pass writes opaque pixels (its alpha test is binary and already ran),
+    // so the exposed value the encode clipped is albedo.rgb itself.
+    float3 c = albedo.rgb * (lit + expandExposedEmissiveDelta(emis, albedo.rgb, 1.0f));
     // MW's enchanted-item glow. MW draws the item a second time as base*caustic*DIFFUSE and blends
     // it over the ordinary draw; summed, that is c*(1 + caustic*tint) — so this is multiplicative
     // on the already-shaded colour, which carries the item's base map and its lighting for free.

@@ -1,0 +1,62 @@
+// mgeHost64 — bloom pyramid downsample: mip i-1 -> mip i.  tasks/forge-postprocess.md step 4.
+//
+// [1,3,3,1]/8 per axis, separable, centred on the 2x2 boundary. NOT a 2x2 box, and
+// reflectmip.comp.fsl:10-27 already paid for the reason at length — its measured response table
+// applies here unchanged:
+//        f      0.25    0.30    0.375   0.45
+//   box         0.707   0.588   0.383   0.156
+//   [1,3,3,1]   0.354   0.203   0.056   0.004
+// A 2-tap box is a DECIMATION filter with response |cos(pi*f)|, so at the fold frequency f = 0.25 it
+// still passes 0.707 — seventy percent of the amplitude that must die is copied into the next level,
+// where it lands at low frequency and reads as crawl. Every level adds its own, which is why the
+// artefact grows DOWN the chain. [1,3,3,1] is three 2-tap boxes convolved, |cos(pi*f)|^3, and at
+// f = 0.45 (which folds to 0.05, a slow and highly visible crawl) it passes 1/40th of what the box
+// did. A 4-tap box is not the alternative: it nulls exactly at 0.25 and passes 0.271 at 0.375, i.e.
+// it is better precisely where it does not matter.
+//
+// It matters MORE here than it did for the reflection. A crawling reflection modulates a blur radius
+// on water; a crawling bloom is added to every pixel of the delivered frame.
+//
+// ⚠ ALL FOUR CHANNELS, IDENTICAL WEIGHTS. The source is premultiplied. This is a pure FILTER, so
+// there is no radiometric term in it at all — the exposure and the threshold were applied once, in
+// the prefilter, and applying either again here would compound them per level. See bloom.srt.h.
+//
+// The tent reaches one texel OUTSIDE the 2x2, so unlike a box it needs a clamp — and the clamp bound
+// is the source level's RENDER rect from the cbuffer, not GetDimensions, which returns the
+// ALLOCATION dims. An unclamped read of the alloc region would pull in last frame's texels; an
+// out-of-resource typed-UAV read would return ZERO and darken the border, which is invisible at mip 1
+// and a dark frame around the image by mip 3 where one texel is 1/128th of it and magnifies 16x.
+//
+// 8x8 groups, dst bound re-checked per thread (the dst rect is a render sub-rect of an alloc-sized
+// surface, so an overhang write lands INSIDE the resource rather than being dropped).
+
+#include "bloom.srt.h"
+
+ROOT_SIGNATURE(ComputeRootSignature)
+NUM_THREADS(8, 8, 1)
+void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
+{
+    INIT_MAIN;
+    int2 p    = int2(DispatchThreadID.xy);
+    int2 dstN = int2(gBloomParams.dst.xy);
+    if (p.x >= dstN.x || p.y >= dstN.y)
+    {
+        RETURN();
+    }
+
+    int2  s  = p * 2;
+    int2  hi = int2(gBloomParams.src.xy) - int2(1, 1);
+    float w[4]; w[0] = 1.0f; w[1] = 3.0f; w[2] = 3.0f; w[3] = 1.0f;
+
+    float4 c = float4(0.0f, 0.0f, 0.0f, 0.0f);
+    UNROLL for (int j = 0; j < 4; ++j)
+    {
+        UNROLL for (int i = 0; i < 4; ++i)
+        {
+            int2 q = clamp(s + int2(i - 1, j - 1), int2(0, 0), hi);
+            c += (w[i] * w[j]) * LoadRWTex2D(gBloomSrc, q);
+        }
+    }
+    Write2D(gBloomDst, p, c * (1.0f / 64.0f));
+    RETURN();
+}

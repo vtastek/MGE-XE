@@ -219,7 +219,10 @@ float4 PS_MAIN( VSOutput In )
         // Step 5: MOD is exact under the transfer function (x^g·y^g = (xy)^g) and needs nothing;
         // MOD2X's literal 2 is a DISPLAY-space number and is the one fixed-function op that has to
         // change domain. ADD moves and is meant to — see scenecolor.h.fsl.
-        if (op == 0u)      { float3 b = t.rgb * albScale; c = b * lit; baseA = t.a; alb = b; } // BASE (MOD x DIFFUSE)
+        // The emissive gain lands only on CLIPPED texels (scenecolor.h.fsl), applied HERE and not
+        // after the loop: the base texel is in hand, and the later MOD/MOD2X/ADD stages then
+        // modulate the corrected emissive exactly as they modulate the rest of lit.
+        if (op == 0u)      { float3 b = t.rgb * albScale; c = b * (lit + expandExposedEmissiveDelta(emis, b, 1.0f)); baseA = t.a; alb = b; } // BASE (MOD x DIFFUSE)
         else if (op == 1u) { c *= t.rgb;        alb *= t.rgb; }          // MOD
         else if (op == 2u) { float3 m = mod2xStage(t.rgb); c *= m; alb *= m; }   // MOD2X
         else               { c += t.rgb;        alb += t.rgb; }          // ADD

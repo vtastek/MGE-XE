@@ -22,6 +22,7 @@ STRUCT(VSInput)
     DATA(float3, MatAmbient, TEXCOORD4);    // per-instance: material ambient rgb
     DATA(float3, MatEmissive,TEXCOORD5);    // per-instance: material emissive rgb
     DATA(uint,   OverlayIndex,TEXCOORD6);   // per-instance: terrain DECAL_1 bindless slot (0 = none)
+    DATA(float3, EmisGain,   TEXCOORD7);    // per-instance: emissive flux/area gain — a RATIO, never decoded
 };
 
 STRUCT(VSOutput)
@@ -118,6 +119,39 @@ VSOutput VS_MAIN( VSInput In )
     Out.MatDiffuse  = decodeAuthored(In.MatDiffuse);
     Out.MatAmbient  = decodeAuthored(In.MatAmbient);
     Out.MatEmissive = decodeAuthored(In.MatEmissive);
+    // ── THE GAIN IS A RATIO, AND A RATIO MUST NOT MEET A TRANSFER FUNCTION ──
+    //
+    // In.EmisGain is the client's flux/area emissive boost (kEmissiveFlux * ownLight.diffuse /
+    // fixtureArea — scenegraph_geometry_cache.cpp::computeEmissiveGain). It is a SCALE, so it is
+    // the one per-instance float3 here that must NOT be decoded. It rides its own lane for exactly
+    // that reason: it used to arrive folded into In.MatEmissive by the client, which put it on the
+    // wrong side of the decode above. srgbToLinear is unclamped past 1.0, so a gain g reached the
+    // frag as ~g^2.4 — measured 2.11 -> 5.61, 3.18 -> 14.7, 25.95 -> 2189, and a candle flame's
+    // 401 -> 1.56e6. That is the glass lantern that read 1069 in a linear EXR dump.
+    //
+    // ⚠ IT MULTIPLIES WHICHEVER LANE vColSource MADE THE EMISSIVE. That is the other half of the
+    // same bug: on vColSource 1 (SRC_EMISSIVE) the emissive IS the vertex colour and every paired
+    // frag reads In.Color.rgb, never In.MatEmissive — so a gain folded into matEmissive was
+    // silently discarded for precisely the small hot emitters that most need it (candle and torch
+    // flames). Two bugs pulling opposite ways: lanterns nuclear, flames dead.
+    //
+    // ⚠ HERE AND NOT IN THE FRAG — and yes, opaque.frag says the opposite. Its comment is about its
+    // OWN scalar (calParams.x), which multiplies AFTER the select and therefore has to live where
+    // the select is. This is a different claim: the vert unpacks vColSource a dozen lines above, so
+    // it knows the branch too, and doing it here costs NO new VSOutput field. A frag-side fix needs
+    // one, and this vert's VSOutput is shared by opaque / alpha / depthonly / shadowcaster /
+    // sunshadow / alphadepth / alphashadowdepth / alphashadowrecv / portalgate / portalhull — ten
+    // structs that must ALL gain the field or the GPU hangs ([[project_forge_shared_frag_vsoutput]]).
+    // Scaling Color.rgb is safe because on vColSource 1 it is read ONLY as the emissive addend —
+    // verified in all ten. The shadowcaster's MatEmissive.x/.y overload is safe because every
+    // instance buffer it draws from ships gain 1,1,1.
+    //
+    // ⚠ .rgb ONLY. Alpha is coverage and has no transfer function and no radiometric scale — the
+    // same split the bloom prefilter makes between filter weights and exposure
+    // ([[project_forge_premultiplied_pair]]).
+    float3 emisGain = max(In.EmisGain, float3(0.0f, 0.0f, 0.0f));
+    if (Out.VColSource == 1u) { Out.Color.rgb *= emisGain; }
+    else                      { Out.MatEmissive *= emisGain; }
     Out.OverlayIndex = In.OverlayIndex;   // terrain DECAL_1 slot (0 = no decal)
     Out.DrawIdx      = drawIndex;         // side-table index (alpha.frag -> gAlphaStages)
     // MW near fog (per-vertex, as FFE): dist is camera distance = |worldPos - eye| (the view

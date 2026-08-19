@@ -240,7 +240,12 @@ float4 PS_MAIN( VSOutput In )
     float matAlpha = asfloat(In.OverlayIndex);
     float outA     = albedo.a * vcolA * matAlpha;
 
-    float3 c = albedo.rgb * lit;
+    // The emissive gain lands only on the texels the SDR encode CLIPPED — see scenecolor.h.fsl.
+    // outA goes in as the coverage the MEASURE is taken at, not as a factor on the result:
+    // MW displayed albedo.rgb * outA, so that product is what its 8-bit encode clipped. These
+    // flame textures keep their whole shape in alpha (rgb is a flat bright field), so without
+    // it the transparent corners of the quad get the full gain and the flame renders SQUARE.
+    float3 c = albedo.rgb * (lit + expandExposedEmissiveDelta(emis, albedo.rgb, outA));
     // Change 3: add transmitted (wrap) light, tinted by the sheet's own albedo and scaled by its
     // thinness (1 - final opacity: thinner/more-transparent -> more bleed-through). transStrength
     // (alphaParams.z) drives it live; at 0 the far side is flat MW-dark (parity).

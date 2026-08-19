@@ -923,8 +923,8 @@ inline int2 GetDimensions(TextureCube t, SamplerState smp) { return GetDimension
 
 #endif // _D3D_H
 
-#line 1 "FSL/shaders.list"
-#line 10 "FSL/shaders.list"
+#line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shaders.list"
+#line 10 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shaders.list"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/../../../3rdparty/The-Forge/Common_3/Graphics/FSL/defaults.h"
 #line 25 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/../../../3rdparty/The-Forge/Common_3/Graphics/FSL/defaults.h"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/fsl_srt.h"
@@ -971,8 +971,8 @@ SamplerState gSampler2xClampWrap : register( s16 , space100 ) ;
 SamplerState gSampler2xWrapClamp : register( s17 , space100 ) ;
 #line 247 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/../../../3rdparty/The-Forge/Common_3/Graphics/FSL/defaults.h"
 
-#line 11 "FSL/shaders.list"
-#line 256 "FSL/shaders.list"
+#line 11 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shaders.list"
+#line 256 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shaders.list"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/statics.vert.fsl"
 #line 15 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/statics.vert.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
@@ -1985,6 +1985,33 @@ float3 mod2xStage(float3 t)
 {
     return (gShadowParams.toneParams.y > 0.5f) ? mod2xLinear(t) : (t * 2.0f);
 }
+#line 276 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/scenecolor.h.fsl"
+float3 expandExposedEmissive(float3 emis, float3 albedoRgb, float cov)
+{
+    float p = gShadowParams.skyAO2.w;
+    if (!(p > 0.0f)) { return emis; }
+
+
+
+
+
+    float3 a = max(albedoRgb, float3(0.0f, 0.0f, 0.0f));
+    float w = saturate(max(max(a.r, a.g), a.b) * max(cov, 0.0f));
+    float lumaE = dot(max(emis, float3(0.0f, 0.0f, 0.0f)), float3(0.2126f, 0.7152f, 0.0722f));
+    float fMin = 1.0f / max(lumaE, 1.0f);
+    float f = fMin + (1.0f - fMin) * pow(w, p);
+    return emis * f;
+}
+
+
+
+
+
+
+float3 expandExposedEmissiveDelta(float3 emis, float3 albedoRgb, float cov)
+{
+    return expandExposedEmissive(emis, albedoRgb, cov) - emis;
+}
 #line 21 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/statics.vert.fsl"
 #line 47 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/statics.vert.fsl"
 STRUCT(VSInput)
@@ -2125,4 +2152,4 @@ VSOutput VS_MAIN( VSInput In )
 
     return (Out);
 }
-#line 257 "FSL/shaders.list"
+#line 257 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shaders.list"

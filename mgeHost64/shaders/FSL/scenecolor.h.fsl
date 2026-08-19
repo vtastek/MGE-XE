@@ -179,4 +179,125 @@ float3 mod2xStage(float3 t)
     return (gShadowParams.toneParams.y > 0.5f) ? mod2xLinear(t) : (t * 2.0f);
 }
 
+// ─── AN SDR-EXPOSED EMITTER IS NOT A RADIANCE MAP ────────────────────────────────────────────────
+//
+// MW's emissive textures are ALREADY-EXPOSED images. A flame texture is what a flame LOOKS like once
+// an eye or a camera has compressed it: white-hot core, soft glowing skirt. That skirt is not "less
+// flame" — it is enormous radiance seen through a compressive curve. srgbToLinear above inverts the
+// TRANSFER FUNCTION; nothing inverts the TONE CURVE. So multiplying such a texture by a large
+// emissive gain re-expands core and skirt by the SAME factor, and the ratio between them — which is
+// the entire shape of the flame — is destroyed.
+//
+// MEASURED, on the mod flame that exposed this (textures\r0\r0_candleflame.dds): 78.9% of texels sit
+// above LUMA 0.9, mean luma 0.893 in the faint skirt against 0.893 in the hot core, correlation with
+// alpha 0.14. At gain 387 every texel with a > 1/387 clips to white — 68.8% of that texture — and a
+// soft billboard renders as a SOLID ROUNDED SQUARE.
+//
+// ⚠ LUMA WAS THE WRONG INSTRUMENT AND THOSE NUMBERS LED SOMEWHERE WRONG. A flat luma profile is not a
+// flat IMAGE: luma is dominated by R and G, so a saturated orange (1.0, 0.6, 0.2) and a pure white
+// score almost the same and the flame reads as featureless. It is not — it has a white core, an
+// orange body and a red skirt, and that CHROMA structure is the exposure information. The first
+// version of this operator therefore drove itself from luma * coverage, which failed twice over: it
+// could not tell core from body at all, and folding coverage in faded the emissive faster than the
+// alpha blending it and ringed every silhouette.
+//
+// Its sibling r0_candleflame_blu.dds never showed the square, which is what made this look like a
+// per-asset mystery: two thirds of it is fully transparent, so far less of it was in a position to
+// clip. Same mod, same CandleFlameAnimNode, opposite outcomes from how the two were authored.
+//
+// So the gain must not land uniformly. ONLY THE TEXELS THE ENCODE CLIPPED LOST HEADROOM, AND ONLY
+// THOSE OWE RADIANCE BACK. The coloured parts were never clipped; they already ARE the exposed look
+// and must keep it.
+//
+// ⚠⚠ AND CLIPPING IS PER-CHANNEL, NOT A PROPERTY OF THE TEXEL. Getting this wrong is what put BLACK
+// SPECKLES inside the flame core. The first attempt used a scalar whiteness, w = min(r,g,b), on the
+// reasoning that a blown-out highlight is achromatic. True of the core, but the flame body is
+// SATURATED ORANGE WITH ITS RED CHANNEL ALREADY CLIPPED — measured in the frame at (1.084, 0.270,
+// 0.010) — and min() calls that 0.01, i.e. "not clipped, leave it exposed". It then sat at 1x
+// beside neighbours at 216x and read as a hole. (Measured, not inferred: zero non-finite values in
+// that dump and exactly ONE negative pixel in 3.1M, so neither NaN nor a sign error was involved.)
+// The opposite scalar, max(r,g,b), fails the other way — the body's red is clipped almost everywhere,
+// so it boosts nearly the whole quad and the above-white fraction goes back from 24.5% to 86.6%,
+// which is the square returning.
+//
+// Per channel, all three regions fall out of ONE rule with no special cases:
+//
+//     f_c = fMin + (1 - fMin) * pow(saturate(albedo_c), p)
+//
+//   white core   (1.00, 1.00, 1.00)  -> f = (1, 1, 1)          full gain, stays white-hot
+//   orange body  (1.00, 0.32, 0.03)  -> f = (1, ~0.001, ~0)    red recovers, G/B do not: BRIGHT RED
+//   dim skirt    (0.30, 0.10, 0.02)  -> f = (~0, ~0, ~0)       keeps its exposed look
+//
+// The body is no longer a hole because its clipped channel is restored, and the hue it lands on —
+// red — is exactly what a flame texel whose red ran out of range physically is.
+//
+// It is far sharper in LINEAR than the sRGB numbers suggest, which is what makes a modest exponent
+// enough: an sRGB orange (1.0, 0.6, 0.2) decodes to (1.0, 0.318, 0.033).
+//
+// fMin IS SELF-NORMALISING, and that is the part a fixed knee could not do. The skirt has to come out
+// at "the exposed look", i.e. unit emissive — so the floor is 1/luma(emis), which lands emis * fMin
+// back at magnitude 1 whatever the gain happens to be. A fixed floor cannot: to bring a gain of 245
+// down to 1 needs 0.004, while the same constant applied to a gain of 3 would extinguish it.
+//
+// p is the falloff sharpness (gShadowParams.skyAO2.w; 0 = exact bypass).
+//
+// ⚠ COVERAGE IS DELIBERATELY NOT AN INPUT, AND WAS, AND THAT WAS A BUG. Folding alpha into the
+// measure made the emissive fall off FASTER than the coverage that blends it, so the emissive-lit
+// core faded into the diffuse-lit skirt at a different rate and left a visible RING at the
+// silhouette. Whiteness comes from the texture alone, so it is stable across the silhouette and the
+// alpha blend is left to do the fading it was already doing correctly.
+//
+// ⚠ BRANCH on p, never scale by it. 0 must be an exact bypass rather than `emis * 1.0`, because a NaN
+// upstream survives a multiply by one ([[project_nan_survives_zero_multiply]]).
+//
+// ⚠ SAFE ON NON-EMISSIVE DRAWS with no gate: emis = 0 gives luma 0, max(luma, 1) = 1, fMin = 1, so
+// f = 1 identically and nothing moves. The operator can only ever pull emissive DOWN toward its
+// authored value — it never adds energy, and it never touches a surface that has none.
+// ⚠ THE MEASURE IS THE PREMULTIPLIED VALUE, NOT THE TEXTURE COLOUR. Two revisions of this operator
+// read albedo.rgb alone and both produced a bright SQUARE where the flame should be a teardrop.
+// R0_candleflame.dds (512x1024, DXT5) says why: max(RGB) >= 0.99 across 97% of the texels its ALPHA
+// calls transparent — the RGB plane is a flat bright field and the SHAPE IS ENTIRELY IN ALPHA
+// (mean 0.204; 52% of texels below a = 0.02). MW's particle-flame textures are authored that way as
+// a family. A measure taken from rgb is therefore ~1 over the whole quad, hands the full gain
+// (k_eff 402 for this fixture) to the transparent corners, and a 0.005 alpha times 402 is opaque.
+//
+// Multiplying by coverage inside the saturate fixes it AND is the physically honest form: `rgb * a`
+// is what MW displayed, so `rgb * a` is what the 8-bit encode clipped.
+//
+// It must go INSIDE the measure, never onto the result. An earlier revision multiplied the delta by
+// coverage and ringed the silhouette: f already bottoms out at fMin = 1/lumaE (the "hand the
+// authored exposed value back" floor, which is BELOW 1), so scaling by coverage on top of that
+// drove the near-edge emissive below MW's own value and drew a dark band just outside the core.
+//
+// SCALAR, not per channel. A per-channel factor recovers only the channel that clipped and divides
+// the others by lumaE, which turns the flame's orange body into a near-black deep red — visible as
+// dark speckles among the white-hot core. Whichever channel ran out of range, the TEXEL hit the
+// ceiling, so the whole texel is scaled by one number and the hue is preserved.
+float3 expandExposedEmissive(float3 emis, float3 albedoRgb, float cov)
+{
+    float p = gShadowParams.skyAO2.w;
+    if (!(p > 0.0f)) { return emis; }
+    // The measure is the EXPOSED value — albedo x coverage — because that product is what MW put on
+    // screen and therefore what the 8-bit encode clipped. max() over the channels, because a
+    // highlight runs out of range in whichever channel is largest; and SCALAR, applied to all three
+    // emissive channels alike, so the texel keeps its hue. saturate() matters: albedo can exceed 1
+    // once the dev-panel albedo scale is applied, and pow() past 1 would AMPLIFY, not attenuate.
+    float3 a = max(albedoRgb, float3(0.0f, 0.0f, 0.0f));
+    float  w = saturate(max(max(a.r, a.g), a.b) * max(cov, 0.0f));
+    float  lumaE = dot(max(emis, float3(0.0f, 0.0f, 0.0f)), float3(0.2126f, 0.7152f, 0.0722f));
+    float  fMin  = 1.0f / max(lumaE, 1.0f);
+    float  f = fMin + (1.0f - fMin) * pow(w, p);
+    return emis * f;
+}
+
+// The same operator as the DELTA to add to an ALREADY-ASSEMBLED `lit`. Every colour frag folds emis
+// into lit before it has sampled its albedo, and `lit` is read by debug views in between — so this
+// lets the correction land at the composite (`c = albedo.rgb * lit`) without relocating the material
+// routing or duplicating a texture fetch. Adding `emis * (f - 1)` is identically replacing `emis`
+// with `emis * f`.
+float3 expandExposedEmissiveDelta(float3 emis, float3 albedoRgb, float cov)
+{
+    return expandExposedEmissive(emis, albedoRgb, cov) - emis;
+}
+
 #endif // SCENE_COLOR_H
