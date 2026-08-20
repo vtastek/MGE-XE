@@ -1,0 +1,45 @@
+# Line endings are declared here so they stop being a rule anyone has to remember.
+#
+# WHY THIS FILE EXISTS. The repo was 1774 text files stored LF against 109 stored CRLF,
+# and the CRLF side was eight hand-written sources plus the generated shader HLSL. Every
+# editor and script in this project writes LF, so any scripted patch to one of those eight
+# silently converted the whole file and buried the real change in a whole-file diff — it
+# happened to geomwire.h (33-line change, 602-line diff), it happened to forgerender.cpp
+# (which is why that file is LF today), and it happened again to renderprocess.cpp. A
+# convention re-applied by hand on every edit fails eventually; a declared attribute does
+# not, because git normalises on `add` and a working tree with the wrong endings simply
+# reads as unmodified.
+#
+# It also removes the second half of the trap: with no CRLF text files left, an exact-match
+# patch written with \n can no longer fail to match a file for reasons that look like a
+# wrong pattern.
+#
+# text=auto means git decides text vs binary with its own NUL-byte heuristic, per file, so
+# the .dxil / .nif / .dds / compiled-shader blobs are left byte-exact. The explicit binary
+# lines below are belt and braces for formats we know, not a correction to it.
+
+*               text=auto eol=lf
+
+# Must stay CRLF: cmd.exe has label/goto edge cases with LF batch files.
+*.bat           text eol=crlf
+
+# Must stay LF: run by bash under WSL.
+*.sh            text eol=lf
+
+# Known binaries — pinned rather than left to detection.
+*.dds           binary
+*.nif           binary
+*.dxil          binary
+*.png           binary
+*.ico           binary
+*.ttf           binary
+*.dll           binary
+*.exe           binary
+*.lib           binary
+*.esp           binary
+*.esm           binary
+*.bsa           binary
+*.resources     binary
+
+# The generated shader tree is tool output: fsl.py writes CRLF on every build. Storing it
+# LF is what stops those 101 files re-appearing in `git status` after each compile.
