@@ -82,6 +82,17 @@ float4 PS_MAIN( VSOutput In )
     float amt = gFrameData.skyParams.x;
     if (gFrameData.skyParams.z > 0.5f) { amt *= 0.5f + 0.5f * sin(gFrameData.skyParams.y * 3.0f); }
     c.rgb = lerp(c.rgb, float3(1.0f, 0.0f, 1.0f), amt);
+    // ⚠ P1'S PHOTOMETRIC ANCHOR STOOD HERE AND IS GONE (tasks/forge-physical-sky.md P2).
+    // It multiplied this pass by a host-derived scale that put MW's authored sky at the physical
+    // level for the light MW said it cast. P2 retires the reproduction entirely: skyhw.frag
+    // generates the sky from a Hosek-Wilkie radiance field that also supplies the sun and the
+    // ambient, so there is nothing here left to correct — and correcting a display code was never
+    // going to fix the SHAPE, which is the half P1 could not reach. Deleted rather than left at
+    // 1.0, because a dead knob that still multiplies is how the next reader loses a day.
+    //
+    // ⚠ THIS SHADER IS NOT DEAD. It is the g_skyHw = 0 A/B partner and it draws MW's sky exactly as
+    // it always did; and when moons, stars and nebulae come back next phase, this is the pass they
+    // come back through. gShadowParams.calParams.z is spare again — do not resurrect a scale in it.
     // Class 2 (scenecolor.h.fsl): lift the authored colour so resolve.frag's curve returns it
     // unchanged. LAST, after the dev tint, so what is preserved is exactly what this pass decided to
     // show. On the STRAIGHT colour, before the blend — the SRCALPHA PSO does the premultiply itself,

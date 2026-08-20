@@ -19,6 +19,13 @@
 // binds the SAME pShadowMaskParamsCbv the compute mask uses into PerFrame gShadowParams.
 #include "shadowparams.h.fsl"
 
+// PER-VIEW sky data for the physical (Hosek-Wilkie) sky pass — a STRUCT header, no SRT of its own.
+// It has to be a second cbuffer rather than more lanes in gShadowParams for exactly one reason: it
+// carries THIS view's invViewProj, and gShadowParams is bound by POINTER into every PerFrame set
+// (which is what let P1's anchor reach the mirror for free, and is what makes it useless here — the
+// mirror would reconstruct main-view rays). See skyview.h.fsl.
+#include "skyview.h.fsl"
+
 // Bent-normal strength used to live here as AO_BENT_INTENSITY, a compile-time gain on gAO.rgb. It
 // is gone: the strength is a PRODUCER-side knob now (aocommon.h.fsl's aoBentStrength, a live slider
 // in the AO panel), which is strictly better placed. Compute shaders hot-reload on F8, so it can be
@@ -503,5 +510,17 @@ BEGIN_SRT_NO_AB(SrtData)
     END_SRT_SET(Persistent)
     BEGIN_SRT_SET(PerBatch)
         DECL_CBUFFER(PerBatch, CBUFFER(BatchData), gBatch)
+        // The physical sky's PER-VIEW cbuffer. It rides PerBatch, and that is not an arbitrary
+        // parking spot: PerBatch is the set the sky pass ALREADY switches between main and mirror
+        // (pPerBatchSetSky / pPerBatchSetReflectSky), so "one resource, two views" is the frequency
+        // this belongs at and no new bind point appears in any draw loop.
+        //
+        // Declared AFTER gBatch so gBatch keeps offset 0 and every existing PerBatch bind is
+        // untouched — FSL assigns offsets from ONE running per-set counter, and inserting ahead of
+        // an existing resource silently re-points it. ⚠ Every OTHER PerBatch instance (the opaque
+        // batch windows, the shadow caster pool, water) leaves this slot at its null descriptor,
+        // which is correct and harmless: only skyhw.frag reads it, and it is bound in exactly the
+        // two instances that draw it.
+        DECL_CBUFFER(PerBatch, CBUFFER(SkyViewData), gSkyView)
     END_SRT_SET(PerBatch)
 END_SRT(SrtData)

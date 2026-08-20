@@ -923,8 +923,8 @@ inline int2 GetDimensions(TextureCube t, SamplerState smp) { return GetDimension
 
 #endif // _D3D_H
 
-#line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shaders.list"
-#line 10 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shaders.list"
+#line 1 "FSL/shaders.list"
+#line 10 "FSL/shaders.list"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/../../../3rdparty/The-Forge/Common_3/Graphics/FSL/defaults.h"
 #line 25 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/../../../3rdparty/The-Forge/Common_3/Graphics/FSL/defaults.h"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/fsl_srt.h"
@@ -971,8 +971,8 @@ SamplerState gSampler2xClampWrap : register( s16 , space100 ) ;
 SamplerState gSampler2xWrapClamp : register( s17 , space100 ) ;
 #line 247 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/../../../3rdparty/The-Forge/Common_3/Graphics/FSL/defaults.h"
 
-#line 11 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shaders.list"
-#line 313 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shaders.list"
+#line 11 "FSL/shaders.list"
+#line 322 "FSL/shaders.list"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/resolve.frag.fsl"
 #line 37 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/resolve.frag.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/resolve.srt.h"
@@ -1356,4 +1356,4 @@ float4 PS_MAIN(PsIn In): SV_TARGET
 
     return (float4(rgb, aOut));
 }
-#line 314 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shaders.list"
+#line 323 "FSL/shaders.list"

@@ -1,0 +1,59 @@
+// mgeHost64 — the PER-VIEW sky cbuffer (tasks/forge-physical-sky.md P2).
+//
+// ⚠ THIS FILE DECLARES A STRUCT AND NOTHING ELSE — NO SRT. It is included by opaque.srt.h (which
+// puts gSkyView on the PerBatch set for skyhw.frag) AND by hosekcheck.srt.h (the startup
+// C++/FSL cross-check, a compute shader on a different root signature). Two SRTs in one .srt.h
+// alias each other's registers and it compiles clean because DXC dead-strips the unused one, so a
+// shared cbuffer STRUCT lives in its own header — a struct carries no registers, so sharing it is
+// free. [[project_forge_srt_one_per_header]]
+//
+// ─── WHY A SECOND CBUFFER EXISTS AT ALL, WHEN gShadowParams IS RIGHT THERE ────────────────────────
+// Because of ONE field: invViewProj. gShadowParams already carries the main camera's, and it is
+// bound BY POINTER into every PerFrame set — which is the property that let P1's anchor reach the
+// mirror for free, and is exactly what makes it useless here. The mirror sky pass binds the SAME
+// buffer, so a fullscreen pass reconstructing rays from gShadowParams.invViewProj in the reflect
+// pass would reconstruct MAIN-VIEW rays and paint the main view's sky into the water. The sky was
+// geometry until now, so it inherited its view from the vertex stage and this never came up.
+//
+// TWO INSTANCES, main and reflect, bound through the pPerBatchSetSky / pPerBatchSetReflectSky pair
+// the sky pass already switches between — which is that same one-resource-two-views pattern, already
+// proven by the sky world windows riding it.
+//
+// The Hosek-Wilkie coefficients are IDENTICAL in both instances (they are a function of solar
+// elevation, turbidity and albedo — not of where you are looking), and they ride here anyway rather
+// than in gShadowParams so that everything the sky pass needs arrives through one binding and the
+// mirror cannot be handed half of it.
+#pragma once
+
+// One cooked Hosek-Wilkie configuration + the view that reads it. 64 floats == 256 B.
+STRUCT(SkyViewData)
+{
+    // THIS view's inverse viewProj. Reverse-Z, camera-relative, half-pixel-adjusted — i.e. exactly
+    // the matrix that view rasterises with, inverted, so a difference of two reconstructed points is
+    // the true world-space ray direction for this view (and for the mirror, the REFLECTED ray).
+    DATA(float4x4, invViewProj, None);
+    // The nine analytic coefficients, xyz = the R/G/B channel, one float4 per coefficient index.
+    // Laid out coefficient-major rather than channel-major because the closed form evaluates all
+    // three channels together at one direction — so every read here is a float3 the ALU wants
+    // anyway, and a channel-major layout would gather nine separate scalars per channel instead.
+    DATA(float4, coef[9], None);
+    // xyz = the model's per-channel radiance term (the tenth cooked value).
+    // w   = NATIVE -> SCENE scale, with the night ramp and the sky strength already folded in.
+    //       Native is W/(m^2 sr) per linear sRGB primary; scene is what the rest of the renderer
+    //       works in. One lane, folded host-side, so no shader ever holds a piece of the conversion.
+    //       ⚠ 0 IS A LEGITIMATE VALUE HERE (night, interior, feature off) and the pass must survive
+    //       it as "black sky", NOT as a divide or a guard — unlike calParams.z in P1, which was a
+    //       multiplier whose 0 meant "the binding failed".
+    DATA(float4, radiance, None);
+    // xyz = unit vector TOWARD the sun, world space, MW Z up. The model is parameterised by the
+    //       angle to the sun, so this is not lighting data — it is a coordinate.
+    //       ⚠ gFrameData.sunDir is MW's TRAVEL direction and is the NEGATIVE of this. Converted once
+    //       host-side rather than negated at each use.
+    // w   = the night ramp, 0..1, REPORTED here for debug only — it is already inside radiance.w.
+    DATA(float4, sunDirW, None);
+    // x = 1 while the pass is armed (exterior, model cooked), 0 otherwise. A hard gate rather than a
+    //     zero radiance, so "the sky is legitimately black" and "nothing was published" stay
+    //     distinguishable in a capture.
+    // yzw spare.
+    DATA(float4, params, None);
+};

@@ -177,6 +177,15 @@
 #include "sky.frag.fsl"
 #end
 
+// THE PHYSICAL SKY (tasks/forge-physical-sky.md P2): a fullscreen Hosek-Wilkie radiance field that
+// RETIRES the dome mesh and the painted horizon band. Same fullscreen triangle as volfog/waterfill
+// (shadowatlasview.vert), but blend OFF / depth OFF / alpha 1 — it is the backdrop, drawn FIRST in
+// the colour pass and again in the mirror, and it covers the whole sphere so there is no lower rim.
+// Reads gSkyView off the PerBatch set for THIS view's invViewProj + the frame's cooked coefficients.
+#frag skyhw.frag
+#include "skyhw.frag.fsl"
+#end
+
 // SK V2 viewer sky MESH (--forge-view only): baked MW sky meshes (dome + clouds) + a host-generated
 // sun billboard, all in the StaticElem 20B layout. Binding 1 = per-instance world rows + packed sky
 // params (P0..P3). Reuses opaque.srt.h / DefaultRootSignature + bindless gTextures. Three blend PSOs
@@ -355,6 +364,14 @@
 #comp apl_sc1.comp
 #define SAMPLE_COUNT 1
 #include "apl.comp.fsl"
+#end
+
+// The physical sky's C++/FSL CROSS-CHECK (tasks/forge-physical-sky.md P2, step 3). One dispatch per
+// host session, 64 threads: evaluates hosek.h.fsl at a fixed direction set so the host can compare
+// it against its own C++ evaluation of the same model. The sky and the light are two evaluations of
+// one field, and this is the instrument that says so out loud instead of a comment hoping so.
+#comp hosekcheck.comp
+#include "hosekcheck.comp.fsl"
 #end
 
 // Screen-space AO — FOUR interchangeable modes behind one SRT (AOSrtData) and one descriptor set.

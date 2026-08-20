@@ -1,0 +1,74 @@
+// mgeHost64 — Hosek-Wilkie radiance, SHADER side (tasks/forge-physical-sky.md P2).
+//
+// ⚠⚠ THIS IS THE SECOND OF TWO COPIES OF ONE EXPRESSION. The first is Hosek::evalNative() in
+// mgeHost64/hosek.h, and it feeds the SH — i.e. the LIGHT. This one feeds the PIXELS. A silent
+// divergence between the sky you see and the light it casts is precisely the failure the physical
+// sky exists to remove, so it is not left to discipline:
+//
+//   hosekcheck.comp evaluates THIS function at a fixed direction set once at startup, the host
+//   evaluates Hosek::radiance() at the same set, and the max relative deviation goes on the log as
+//   `[forge-hosek] cross-check`. If you edit one of these two expressions, edit the other.
+//
+// This is the fourth-copy problem publishSkyAmbientSH already names by name; the difference is that
+// this one is INSTRUMENTED rather than merely commented.
+//
+// THE CLOSED FORM (Hosek & Wilkie 2012, "An Analytic Model for Full Spectral Sky-Dome Radiance"),
+// written with the coefficients in the authors' own INDEX order so this diffs line-for-line against
+// their ArHosekSkyModel_GetRadianceInternal — deliberately not re-lettered to the paper's A..I,
+// because the paper's letters and the code's indices do not line up and a reader checking one
+// against the other is exactly who this file has to serve:
+//
+//   L = (1 + c0 * exp(c1 / (cos(theta) + 0.01)))
+//     * (c2 + c3*exp(c4*gamma) + c5*cos^2(gamma) + c6*chi(c8, gamma) + c7*sqrt(cos(theta)))
+//   chi(g, gamma) = (1 + cos^2 gamma) / (1 + g^2 - 2 g cos gamma)^(3/2)
+//
+// theta = the VIEW direction's zenith angle; gamma = the angle between the view direction and the
+// sun. Each c is a float3 across R/G/B.
+//
+// Requires: gSkyView (skyview.h.fsl), bound by whichever SRT includes this.
+#ifndef HOSEK_H_FSL
+#define HOSEK_H_FSL
+
+// Radiance along `dir` (unit, WORLD space, MW Z up) in the model's NATIVE units:
+// W/(m^2 sr) per linear sRGB primary. NOT scene units — the caller applies gSkyView.radiance.w,
+// which is the one place that conversion lives.
+float3 hosekRadiance(float3 dir)
+{
+    // ⚠ THE MODEL DOES NOT MERELY DEGRADE BELOW THE HORIZON, IT INVERTS. c1 is negative, so the
+    // moment cos(theta) drops under -0.01 the exponent flips sign and the first factor runs away to
+    // +inf. Clamping cos(theta) to 0 evaluates the HORIZON there instead — which is also the answer
+    // that keeps the frame honest: gSkyColor is opaque everywhere now (alpha 1), so what sits below
+    // the horizon IS the fog target for everything seen from above, and horizon haze is what a
+    // distant surface should melt into. Returning black there would fade every downhill vista to
+    // black instead, which is the "looking down from a height" control in skydome.h.fsl.
+    float ct = max(0.0f, dir.z);
+
+    float cg = clamp(dot(dir, gSkyView.sunDirW.xyz), -1.0f, 1.0f);
+    float g  = acos(cg);
+
+    float3 c0 = gSkyView.coef[0].xyz;
+    float3 c1 = gSkyView.coef[1].xyz;
+    float3 c2 = gSkyView.coef[2].xyz;
+    float3 c3 = gSkyView.coef[3].xyz;
+    float3 c4 = gSkyView.coef[4].xyz;
+    float3 c5 = gSkyView.coef[5].xyz;
+    float3 c6 = gSkyView.coef[6].xyz;
+    float3 c7 = gSkyView.coef[7].xyz;
+    float3 c8 = gSkyView.coef[8].xyz;
+
+    float3 expM = exp(c4 * g);
+    float  rayM = cg * cg;
+    // The Mie / Henyey-Greenstein lobe. `pow(x, 1.5)` written as x*sqrt(x): the denominator is
+    // strictly positive for |c8| < 1 (which every cooked value is — they run ~0.5..0.7), so the
+    // max() is a floor against float underflow at grazing angles, not a domain guard.
+    float3 den  = 1.0f + c8 * c8 - 2.0f * c8 * cg;
+    float3 den3 = den * sqrt(max(f3(1.0e-8f), den));
+    float3 mieM = (1.0f + rayM) / den3;
+    float  zen  = sqrt(ct);
+
+    float3 L = (1.0f + c0 * exp(c1 / (ct + 0.01f)))
+             * (c2 + c3 * expM + c5 * rayM + c6 * mieM + c7 * zen);
+    return max(f3(0.0f), L * gSkyView.radiance.xyz);
+}
+
+#endif // HOSEK_H_FSL

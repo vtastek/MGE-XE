@@ -182,4 +182,59 @@ namespace MGE::WorldControllerView {
         return true;
     }
 
+    // Is the sun above the horizon right now? MW's own day/night boundary, read from the weather
+    // controller's schedule — the one time signal here that no weather can move.
+    //
+    // ⚠ THIS EXISTS BECAUSE `MWBridge::GetSunVis()` IS NOT A NIGHT TEST AND NEVER WAS. That byte is
+    // reached as shTriSunBase -> property -> material colours, +3 for the alpha channel, i.e. it is
+    // the sun disc's own MATERIAL ALPHA (mwbridge.h names it "sun(glare) alpha value"). MW fades it
+    // to zero whenever the disc is not drawn, and an overcast, rainy, ashy or blizzarding sky is
+    // exactly that — so `sunVis == 0` reads TRUE at noon in the rain. DistantLand::setView has always
+    // used it as its "the sun has set" test, which stayed harmless there only because every DX9
+    // consumer of the corrected sunPos is itself gated on sunVis. The first consumer that is not so
+    // gated — the physical sky's solar elevation — turned a rainstorm into midnight.
+    //
+    // MW chooses which branch of the sun's fixed transit to place the disc on with precisely the
+    // window below, mirrored in OpenMW's WeatherManager (nightStart = sunsetHour + sunsetDuration,
+    // nightEnd = sunriseHour, both then shifted into a 24-hour window beginning at sunrise so the
+    // wrap through midnight needs no special case).
+    //
+    // The three schedule numbers come back through the optional out-params so an instrument can
+    // print the window WITHOUT restating the arithmetic — one copy of the rule, not two.
+    //
+    // Returns false, leaving every out-param untouched, before a world exists or while the schedule
+    // is still zero: callers then keep whatever fallback they had instead of being told "night".
+    inline bool sunAboveHorizon(bool& out, float* hourOut = nullptr,
+                                float* nightEndOut = nullptr, float* nightStartOut = nullptr) {
+        void* wc = worldController();
+        if (!wc) return false;
+        void* wtr = *reinterpret_cast<void**>(static_cast<unsigned char*>(wc) + OFF_weatherController);
+        if (!wtr) return false;
+        void* gvar = *reinterpret_cast<void**>(static_cast<unsigned char*>(wc) + OFF_gvarGameHour);
+        if (!gvar) return false;
+
+        auto weatherFloat = [wtr](size_t offset) {
+            return *reinterpret_cast<float*>(static_cast<unsigned char*>(wtr) + offset);
+        };
+        const float sunrise = weatherFloat(OFF_sunriseHour);
+        const float sunset = weatherFloat(OFF_sunsetHour);
+        const float sunsetDur = weatherFloat(OFF_sunsetDuration);
+        // An all-zero schedule means "not populated yet", not "the sun sets at midnight". Without
+        // this the window degenerates to permanent night and the caller has no way to tell.
+        if (!(sunrise > 0.0f && sunset > sunrise)) return false;
+
+        const float hour = *reinterpret_cast<float*>(static_cast<unsigned char*>(gvar) + OFF_globalValue);
+        const float nightEnd = sunrise;
+        float nightStart = sunset + sunsetDur;
+        float h = hour;
+        if (h < nightEnd) h += 24.0f;
+        if (nightStart < nightEnd) nightStart += 24.0f;
+
+        out = (h < nightStart);
+        if (hourOut) *hourOut = hour;
+        if (nightEndOut) *nightEndOut = nightEnd;
+        if (nightStartOut) *nightStartOut = (nightStart >= 24.0f) ? (nightStart - 24.0f) : nightStart;
+        return true;
+    }
+
 }

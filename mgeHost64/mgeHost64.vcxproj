@@ -670,6 +670,8 @@
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="stbn_mask.h" />
+    <ClInclude Include="hosek.h" />
+    <ClInclude Include="hosek_data.h" />
     <ClInclude Include="forgerender.h" />
     <ClInclude Include="..\src\ipc\bridge.h" />
     <ClInclude Include="..\src\ipc\dlshare.h" />

@@ -5346,6 +5346,156 @@ namespace RenderProcess {
                 }
             }
         }
+        // ─── THE SUN THAT SETS (tasks/forge-physical-sky.md P2) ──────────────────────────────────
+        // ⚠ MW HAS TWO SUNS AND THEY ARE NOT THE SAME SUN. They share an AZIMUTH exactly and run
+        // DIFFERENT ELEVATION ARCS, so the split is signed, varies through the day, and passes
+        // through zero — one frame can therefore "disprove" it by accident. A full session traced
+        // (2026-08-20, the user's own play log; raw disc elevation, i.e. before the set-correction):
+        //
+        //     LIGHT elev   41.09  19.92  13.88  14.24  17.25  21.42  44.72  15.34  17.86
+        //     DISC  elev   69.89  25.96   0.32   1.91  15.09  31.52  73.10   6.78  17.66
+        //     split       +28.80  +6.04 -13.56 -12.33  -2.16 +10.10 +28.38  -8.56  -0.20
+        //
+        // The LIGHT never leaves 13.8..53.1 degrees, which is exactly the range of MW's fixed sun
+        // transit (-400*orbit, 75, 100): its horizontal term can never fall below 75, so the light
+        // is CLAMPED to a shallow arc by construction and physically cannot rise higher or set. The
+        // DISC sweeps 73 degrees on both sides of the horizon. They are two different curves that
+        // happen to CROSS twice a day, and a measurement taken at a crossing (the -0.20 above, from
+        // an hour-4.76 harness run) says nothing about the rest of it.
+        //
+        // For a physical sky the DISC is authoritative: Hosek-Wilkie is parameterised by solar
+        // elevation and its circumsolar brightening has to be centred on the sun you can actually
+        // SEE, or the bright region of the sky sits tens of degrees away from the sun drawn in it.
+        // The `split=` field on the line below keeps this a measured quantity rather than a
+        // remembered one.
+        //
+        // ✅ AND THE SAME TRACE SETTLES THE DUSK QUESTION THIS PORT COULD NOT ANSWER FROM SOURCE.
+        // The raw disc elevation reaches 0.32 degrees and then turns back up (0.32 -> 1.91) — MW
+        // bounces the DISC at the horizon too, and the correction below un-bounces it. Because the
+        // turning point IS the horizon, the correction acts on an elevation of ~0 and the sky does
+        // NOT snap: measured 0.32deg at the last frame before the flip, 1.91deg at the first frame
+        // after. Continuous to within a couple of degrees, which the night ramp then covers.
+        //
+        // ⚠⚠ AND MW'S SUN LIGHT DOES NOT SET — IT BOUNCES AT THE HORIZON. Once the sun goes down MW
+        // mirrors the light direction back above the horizon, deliberately, so night lighting comes
+        // from a plausible direction instead of from underground. Its reported elevation therefore
+        // stays POSITIVE all night, which for a model parameterised by elevation means a DAYTIME sky
+        // at midnight. Reported from play as "MW's sun doesn't set, so it is daytime all the time".
+        //
+        // MGE has always carried the SHAPE of the fix, in two lines of DistantLand::setView — keep
+        // the LIGHT source bouncing exactly as MW intends (that is the look P2's lighting blend
+        // interpolates against, and it must not move) and carry a SECOND direction that actually
+        // sets, by mirroring the disc's z once the sun is down:
+        //     sunVis = GetSunVis() / 255;   if (sunVis == 0) sunPos.z = -sunPos.z;
+        //
+        // ⚠⚠⚠ BUT `sunVis` IS NOT A NIGHT TEST. It is the sun disc's own MATERIAL ALPHA
+        // (MWBridge::eSunVis walks shTriSunBase -> property -> material colours, +3 for the alpha
+        // byte; mwbridge.h calls it "sun(glare) alpha value" and means it literally). MW fades that
+        // alpha to zero whenever it stops drawing the disc — and OVERCAST, RAIN, THUNDER, ASH,
+        // BLIGHT and BLIZZARD are all exactly that. So the test fires at NOON IN THE RAIN, the z
+        // mirrors while the sun is high, and a physical sky parameterised by solar elevation goes to
+        // NIGHT in daylight. Reported from play as "overcast/rainy weathers are also black".
+        //
+        // It stayed invisible in the DX9 path for twenty years because every DX9 consumer of the
+        // corrected sunPos is itself gated on sunVis (distantland.cpp:966 `if (sunVis >= 0.001)`,
+        // :1039 multiplies EV_sunvis in), so the frames where the correction is wrong are precisely
+        // the frames nothing reads it. This is the first consumer that does not gate on sunVis, and
+        // it is therefore the first thing that could ever see the fault.
+        //
+        // THE NIGHT TEST IS THE CLOCK, not anything weather touches:
+        //     nightStart = sunsetHour + sunsetDuration     nightEnd = sunriseHour
+        // which is the very window MW itself uses to pick which branch of the sun's fixed transit to
+        // place the disc on, so the sign we impose and the position MW drew agree by construction.
+        // Read through MGE::WorldControllerView::sunAboveHorizon(), which owns the arithmetic; see
+        // the ⚠ block there for the offsets and the OpenMW cross-reference. An elevation threshold
+        // still cannot substitute, for the original reason: the bounce makes "+5 degrees" mean
+        // either dawn or dusk-plus-five with nothing to separate them.
+        //
+        // The RAW GetSunDir() is re-read here rather than DistantLand::sunPos, so that MGE's own
+        // (wrong) correction is never in the chain — and DistantLand::sunPos is deliberately LEFT
+        // ALONE, because MW's atmospheric-scattering fog adjustment reads its z unguarded
+        // (distantland.cpp:873-885) and writes the result back into MW's scenegraph fog colour,
+        // which this client then ships as fogColNear. Fixing it there would move the F11 DX9
+        // baseline AND the host's fog in one step, on a frame that is supposed to be a control.
+        //
+        // ⚠ SHIPPED AS ELEVATION + AZIMUTH, NOT AS A VECTOR, because the wire has exactly two free
+        // padding floats (sunDir.w and ambCol.w, neither read by any FSL) and a direction needs
+        // three. Two ANGLES are exact and reconstruct without ambiguity, where two of three
+        // components would leave the third's SIGN underdetermined — and the sign of z is precisely
+        // the day/night bit this whole block exists to carry. The host rebuilds
+        // (cos(az)*r, sin(az)*r, z), r = sqrt(1 - z*z).
+        MWBridge* mwb = MWBridge::get();
+        D3DXVECTOR4 sp = DistantLand::sunPos;   // fallback: weatherless cells, pre-load, no schedule
+        bool sunUp = false;
+        float schedHour = 0.0f, schedNightEnd = 0.0f, schedNightStart = 0.0f;
+        const bool haveSched = MGE::WorldControllerView::sunAboveHorizon(
+            sunUp, &schedHour, &schedNightEnd, &schedNightStart);
+        float sunDiscRawZ = std::max(-1.0f, std::min(1.0f, sp.z));
+        if (haveSched && mwb->IsLoaded() && mwb->CellHasWeather()) {
+            D3DXVECTOR3 raw;
+            mwb->GetSunDir(raw.x, raw.y, raw.z);
+            D3DXVec3Normalize(&raw, &raw);
+            sunDiscRawZ = std::max(-1.0f, std::min(1.0f, raw.z));
+            // Make the SIGN agree with the clock, rather than forcing it — `raw.z = sunUp ? |z| :
+            // -|z|` would erase a genuine below-horizon dip in the minutes the schedule still calls
+            // day, which is exactly the region where a step would show.
+            if (sunUp != (raw.z >= 0.0f)) { raw.z = -raw.z; }
+            sp = D3DXVECTOR4(raw.x, raw.y, raw.z, 1.0f);
+        }
+        const float sunDiscZ  = std::max(-1.0f, std::min(1.0f, sp.z));
+        const float sunDiscAz = std::atan2(sp.y, sp.x);
+        {
+            // Both suns and the window that separates day from night, on one line every 900 frames:
+            // the 29-degree elevation split above is a property of MW and this is what keeps it a
+            // MEASURED one. `vis` stays on the line as a WITNESS, not as an input — watching it fall
+            // to 0 while `up=1` is what a rainstorm looks like from here, and it is the reason this
+            // block no longer believes it.
+            //
+            // ⚠ WHAT THIS STILL HAS TO CONFIRM: that the CLOCK boundary lands on the disc's turning
+            // point. MW's own `vis` test empirically did (0.32deg before the flip, 1.91deg after),
+            // and that is why the transition was continuous; the clock is a different boundary and
+            // only coincides if `sunsetHour + sunsetDuration` is where MW bottoms the arc out. If it
+            // is early or late, `disc elev` steps by twice whatever it had left and the sky snaps —
+            // so the flip line wants |elev| within a degree or two of 0 on both sides.
+            // A once-per-900-frames line cannot photograph a transition that lasts one frame, so the
+            // throttle FOLLOWS the question: dense inside a quarter game-hour of either boundary,
+            // and edge-triggered on the sign change itself so the flip frame is in the log whatever
+            // the counter is doing. Everywhere else it stays a background heartbeat.
+            static unsigned s_sunSetLogN = 0;
+            static int s_sunUpPrev = -1;
+            const int upNow = sunUp ? 1 : 0;
+            const bool flipped = (s_sunUpPrev >= 0 && upNow != s_sunUpPrev);
+            s_sunUpPrev = upNow;
+            // The dense window is measured in ELEVATION, not in game hours, for two reasons: it does
+            // not assume the boundary is where the schedule says (which is half of what is being
+            // checked), and it is independent of the TIMESCALE — this install runs at ~1, where a
+            // quarter game-hour is a quarter of a REAL hour and an hour-based window would emit tens
+            // of thousands of lines.
+            const bool nearEdge = (std::abs(sunDiscRawZ) < 0.052f);   // |elevation| < 3 degrees
+            const unsigned every = nearEdge ? 120u : 900u;
+            if (flipped || (s_sunSetLogN++ % every) == 0) {
+                const float elevLight = std::asin(std::max(-1.0f, std::min(1.0f, -sunVecEff.z))) * 57.29578f;
+                const float elevDisc = std::asin(sunDiscZ) * 57.29578f;
+                // `raw` is MW's disc BEFORE the set-correction and `split` is measured against it,
+                // because the two-suns question is about the arcs MW itself runs — folding our own
+                // sign flip into the difference would make the split jump 2x at every dusk and
+                // report the correction back to us as if it were engine behaviour. `raw` reaching 0
+                // at the FLIP line is also exactly the continuity check.
+                const float elevRaw = std::asin(sunDiscRawZ) * 57.29578f;
+                LOG::logline(">> [sun-set]%s hour=%.3f window=[%.2f..%.2f] up=%d sched=%d vis=%.3f"
+                             " | LIGHT -sunVec=(%.3f %.3f %.3f) elev=%.2fdeg"
+                             " | DISC sunPos=(%.3f %.3f %.3f) elev=%.2fdeg raw=%.2fdeg"
+                             " (split=%.2fdeg) -> shipped z=%.4f az=%.2fdeg",
+                             flipped ? " FLIP" : "",
+                             schedHour, schedNightEnd, schedNightStart, upNow,
+                             haveSched ? 1 : 0,
+                             mwb->IsLoaded() ? (mwb->GetSunVis() / 255.0f) : 0.0f,
+                             -sunVecEff.x, -sunVecEff.y, -sunVecEff.z, elevLight,
+                             sp.x, sp.y, sp.z, elevDisc, elevRaw, elevRaw - elevLight,
+                             sunDiscZ, sunDiscAz * 57.29578f);
+            }
+        }
+
         // Host-computed sky dome (C2): the current interpolated ZENITH sky colour MW already blended
         // this frame from the Weather_*_Sky_*_Color ini keys (getCurrentWeatherSkyCol; MW does the
         // time-of-day blend internally). The host colours the dome with a vertical gradient
@@ -5354,7 +5504,6 @@ namespace RenderProcess {
         // Guard on CellHasWeather like DistantLand::update (the weather-struct pointer is only valid
         // then); fall back to the horizon (nearFogCol) so a no-weather cell yields a flat dome. The
         // dome only draws in weather exteriors anyway, so skyZenith is otherwise unconsumed.
-        MWBridge* mwb = MWBridge::get();
         const RGBVECTOR* skyColPtr = mwb->CellHasWeather() ? mwb->getCurrentWeatherSkyCol() : nullptr;
         const float skyZenithR = skyColPtr ? skyColPtr->r : DistantLand::nearFogCol.r;
         const float skyZenithG = skyColPtr ? skyColPtr->g : DistantLand::nearFogCol.g;
@@ -5413,9 +5562,16 @@ namespace RenderProcess {
         // overrides fog underwater weather or not, so the host keeps un-blending that lane ungated.
         const float mwTintsUnderwater = mwb->CellHasWeather() ? 1.0f : 0.0f;
         const float lighting[36] = {
-            sunVecEff.x,               sunVecEff.y,               sunVecEff.z,               0.0f,
+            // [3] = the SUN DISC's elevation sine, MGE's bounce-corrected DistantLand::sunPos.z —
+            // a sun that actually SETS, unlike sunVec.xyz beside it, which keeps bouncing because
+            // that is the lighting MW intends. Its azimuth rides [11]. Both are padding slots no FSL
+            // reads; the host consumes them CPU-side when cooking the physical sky. See above.
+            sunVecEff.x,               sunVecEff.y,               sunVecEff.z,               sunDiscZ,
             sunColEff.r,               sunColEff.g,               sunColEff.b,               mwTintsUnderwater,
-            ambColEff.r,               ambColEff.g,               ambColEff.b,               0.0f,
+            // [11] = the sun DISC's azimuth (radians, atan2(y,x)); pairs with [3] to reconstruct the
+            // whole direction exactly. Two ANGLES rather than two COMPONENTS because the sign of z
+            // is the day/night bit and components would leave it underdetermined.
+            ambColEff.r,               ambColEff.g,               ambColEff.b,               sunDiscAz,
             DistantLand::nearFogCol.r, DistantLand::nearFogCol.g, DistantLand::nearFogCol.b, 0.0f,
             // [18] = smoothed wind magnitude (0 in interiors); [19] = cell epoch. Both land in
             // fogParams.zw, which no shader reads — the host consumes them CPU-side (wind → flicker

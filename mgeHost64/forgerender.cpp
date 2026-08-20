@@ -44,6 +44,11 @@
 // Included with the other standard headers — i.e. BEFORE IMemory.h overrides new/delete.
 #include <thread>
 
+// The physical sky (tasks/forge-physical-sky.md P2). Pure maths + the verbatim Hosek-Wilkie
+// coefficient dataset — no Forge types, no allocations. Included HERE, with the standard headers
+// and BEFORE IMemory.h overrides new/delete, for the same reason <thread> is.
+#include "hosek.h"
+
 #include "OS/Interfaces/IOperatingSystem.h"
 #include "Utilities/Interfaces/IFileSystem.h"
 #include "Utilities/Log/Log.h"
@@ -145,6 +150,11 @@
 // apl.srt.h — C++ sees the header's #ifndef default, and both prefilter variants declare the same
 // four slots in the same order, so SRT_RES_IDX resolves identically for either.
 #include "shaders/FSL/bloom.srt.h"
+// The physical sky's C++/FSL cross-check (tasks/forge-physical-sky.md P2): HosekCheckSrtData,
+// PerBatch frequency, one dispatch per host session. It binds the SAME gSkyView cbuffer the sky
+// pass reads — see hosekcheck.srt.h for why sharing the buffer rather than filling a private copy
+// is what makes the number mean something.
+#include "shaders/FSL/hosekcheck.srt.h"
 
 // App-layer callback normally provided by WindowsBase.cpp (which we exclude — it
 // drags in the window system). The backend calls this on device-lost. Headless:
@@ -1778,6 +1788,33 @@ namespace {
         Buffer*        pSkyWorldsBuf = nullptr;            // gBatch: one 64KB world window, persistent-mapped
         DescriptorSet* pPerBatchSetSky = nullptr;          // gBatch bound to pSkyWorldsBuf, 1 instance
         Buffer*        pSkyInstanceBuf = nullptr;          // per-draw instance VB (kStaticInstU32 slots), CPU-mapped
+
+        // --- P2: THE PHYSICAL SKY (tasks/forge-physical-sky.md) ----------------------------------
+        // A fullscreen Hosek-Wilkie radiance field that retires MW's dome MESH and its painted
+        // horizon band. Same fullscreen triangle as volfog/waterfill (shadowatlasview.vert), but
+        // blend OFF / depth OFF / alpha 1 — it is the backdrop, so it is drawn FIRST in the colour
+        // pass and again at the top of the mirror pass, and it covers the whole sphere.
+        Shader*        pSkyHwShader = nullptr;             // shadowatlasview.vert + skyhw.frag
+        Pipeline*      pSkyHwPipeline = nullptr;           // no blend, no depth, writes alpha 1
+        // ⚠ TWO cbuffers, ONE per VIEW, and that is the whole reason this resource exists. It
+        // carries invViewProj, and gShadowParams — which already has one — is bound by POINTER into
+        // every PerFrame set including the mirror's, so a fullscreen pass reading it in the reflect
+        // pass would reconstruct MAIN-view rays and paint the main view's sky into the water. The
+        // cooked coefficients ride along in both copies (identical; they are a function of sun
+        // elevation, turbidity and albedo, not of the view) so the pass needs exactly one binding.
+        // [0] = main, [1] = reflect; bound into pPerBatchSetSky / pPerBatchSetReflectSky, the pair
+        // the sky pass already switches between.
+        Buffer*        pSkyViewCbv[2] = { nullptr, nullptr };
+
+        // --- P2: the C++/FSL cross-check (hosekcheck.comp) ---------------------------------------
+        // One dispatch per host session. The model is evaluated twice — C++ for the SH (the light),
+        // FSL for the pixels — and this measures that they agree instead of asserting it.
+        Shader*        pHosekCheckShader = nullptr;
+        Pipeline*      pHosekCheckPipeline = nullptr;
+        DescriptorSet* pHosekCheckSet = nullptr;
+        Buffer*        pHosekDirsBuf = nullptr;            // Buffer<float4>[kHosekCheckDirs], the probe set
+        Buffer*        pHosekOutBuf = nullptr;             // RWBuffer<uint>[kHosekCheckDirs*4], GPU only
+        Buffer*        pHosekReadback = nullptr;           // GPU_TO_CPU, persistent-mapped (post-fence read)
 
         // --- FP1a: first-person pass (arms/weapon, after sorted-alpha, fresh depth) ---
         // The arm scene has its OWN camera (fpViewProj crossing) and MW z-clears before
@@ -3897,6 +3934,82 @@ namespace {
         mp[kSunOccFloat + 3] = 0.0f;
     }
 
+    // ─── P2 — THE PHYSICAL SKY'S PER-FRAME STATE ────────────────────────────────────────────────
+    // Declared HERE, well above where it is filled (skyPhysicalMeasure, beside the calibration
+    // functions), because publishSkyAmbientSH below is its first READER and lives in this
+    // anonymous namespace. One frame's worth of state, produced at exactly one site.
+    struct SkyPhysical {
+        Hosek::State st;            // the cooked model — uploaded verbatim to gSkyView
+        float  ambScene[3];         // the SH DC in SCENE units: ambCol's physical value
+        float  sunScene[3];         // E_sun_normal / pi in SCENE units: sunCol's physical value
+        float  sh[4][3];            // [0..2] = the L1 lobe / DC (a direction FACTOR), [3] = DC = 1
+        float  nightRamp;           // 1 = full model, 0 = the sun is down and the model is out
+        float  sceneScale;          // native -> scene, night ramp and sky strength folded in
+        double EskyLux;             // reported: the sky's own horizontal illuminance
+        double EsunLux;             // reported: the sun's DIRECT-NORMAL illuminance
+        double sunShare;            // reported: E_sun_horizontal / E_total. Real clear skies ~0.80
+        double qZenith;             // reported: THE §0 invariant, L_zenith/(E_total/pi). Real ~0.122
+        float  elevLight;           // reported: the LIGHT's elevation (degrees) — MW's other sun, which
+                                    // is ~29 deg off the disc and never goes negative (it bounces)
+        bool   active;              // exterior, armed, model cooked and non-degenerate
+    };
+    SkyPhysical g_skyPhys = {};
+
+    // MUST match HOSEK_CHECK_THREADS in hosekcheck.comp.fsl — the dispatch is one group and the
+    // shader early-outs past this, so a mismatch silently checks fewer directions than it reports.
+    constexpr uint32_t kHosekCheckDirs = 64;
+    // 0 = waiting for a frame with real coefficients, 1 = dispatched (waiting on the fence),
+    // 2 = reported. Runs ONCE per host session: it is a self-test, not an instrument.
+    uint32_t g_hosekCheckState = 0;
+    uint32_t g_hosekCheckArmedFrame = 0;
+    // Has each view's gSkyView ever been filled? ⚠ NOT COSMETIC. The main view's publish rides
+    // inside the `if (pShadowMaskParamsCbv)` block that owns the camera's inverse viewProj, so on
+    // the "shadow resources failed to allocate" path the cbuffer would stay at its zero init — and a
+    // fullscreen OPAQUE pass reading zeroes paints the whole exterior BLACK, which is a far worse
+    // failure than not drawing a sky. The draw sites gate on this, so an unpublished view falls back
+    // to MW's sky mesh instead. Once true it stays true: a frame that skips a publish holds the
+    // previous frame's coefficients, which is the same "prior values survive" contract the whole
+    // lighting block already runs on.
+    bool g_skyViewPub[2] = { false, false };
+
+    // Fill ONE view's gSkyView (skyview.h.fsl). view 0 = main, 1 = reflect; `invVP` is THAT view's
+    // inverse viewProj, which is the only field that differs between them and the entire reason the
+    // cbuffer exists rather than four more lanes in gShadowParams.
+    //
+    // ⚠ WRITE-ONLY, and every field is written every call. These are WRITE-COMBINED upload buffers
+    // ([[project_forge_wc_read_trap]]): reading one back to "only update what changed" would cost
+    // more than writing all 64 floats, and a partially-written struct is how a stale coefficient
+    // outlives the frame that cooked it.
+    void publishSkyView(int view, const float* invVP)
+    {
+        if (view < 0 || view > 1) { return; }
+        Buffer* b = g_live.pSkyViewCbv[view];
+        if (!b || !b->pCpuMappedAddress) { return; }
+        float* v = (float*)b->pCpuMappedAddress;
+        std::memcpy(v, invVP, 16 * sizeof(float));
+        for (int i = 0; i < 9; ++i) {
+            v[16 + 4 * i + 0] = g_skyPhys.st.cfg[0][i];
+            v[16 + 4 * i + 1] = g_skyPhys.st.cfg[1][i];
+            v[16 + 4 * i + 2] = g_skyPhys.st.cfg[2][i];
+            v[16 + 4 * i + 3] = 0.0f;
+        }
+        v[52] = g_skyPhys.st.rad[0];
+        v[53] = g_skyPhys.st.rad[1];
+        v[54] = g_skyPhys.st.rad[2];
+        // The whole native -> scene conversion in ONE lane, night ramp and strength folded in, so no
+        // shader ever holds a piece of it. 0 is a legitimate value (night, interior, feature off) and
+        // skyhw.frag must read it as a black sky — NOT as a failed bind, which is the opposite of
+        // what P1's calParams.z lane meant and is called out in skyview.h.fsl for that reason.
+        v[55] = g_skyPhys.active ? g_skyPhys.sceneScale : 0.0f;
+        v[56] = g_skyPhys.st.toSun[0];
+        v[57] = g_skyPhys.st.toSun[1];
+        v[58] = g_skyPhys.st.toSun[2];
+        v[59] = g_skyPhys.nightRamp;
+        v[60] = g_skyPhys.active ? 1.0f : 0.0f;
+        v[61] = 0.0f; v[62] = 0.0f; v[63] = 0.0f;
+        g_skyViewPub[view] = true;
+    }
+
     void publishSkyAmbientSH(const float* fd, bool exterior) {
         if (!g_live.pShadowMaskParamsCbv || !g_live.pShadowMaskParamsCbv->pCpuMappedAddress) { return; }
         float* mp = (float*)g_live.pShadowMaskParamsCbv->pCpuMappedAddress;
@@ -3922,6 +4035,34 @@ namespace {
             // best and would silently disarm sky AO on any future path where the two gates differ.
             mp[kSkyParamsFloat + 0] = 0.0f;
             g_skyAmbDC[0] = g_skyAmbDC[1] = g_skyAmbDC[2] = 0.0f;
+            return;
+        }
+
+        // ─── P2: THE PHYSICAL SKY OWNS THE PROJECTION WHEN IT IS ARMED ─────────────────────────────
+        // skyPhysicalMeasure already projected the Hosek-Wilkie field (plus the lit ground) into
+        // this exact basis, in the same frame, off the same Fibonacci table — see the ordering note
+        // there for why it is one loop and not four. So there is nothing left to do here but
+        // publish it, and the whole dome-lerp path below becomes the g_skyHw = 0 A/B partner.
+        //
+        // ⚠ THE PUBLISHED VALUE IS STILL A FACTOR WHOSE SPHERICAL MEAN IS 1, and that is deliberate
+        // — skyamb.h.fsl's "this enhances, it does not replace" contract survives intact. The plan's
+        // "stop DC-normalising" is delivered on the OTHER side: the level now reaches gFrameData.
+        // ambCol itself (skyPhysicalMeasure -> the lighting blend at the decode site), which is read
+        // by lodSunAmb, the vertex-lit distant statics and terrain as well — every one of which an
+        // un-normalised SH would have missed, because none of them evaluate skyAmbFactor().
+        //
+        // ⚠ AND THE NIGHT RAMP IS NOT APPLIED HERE. The ramp belongs to the LEVEL (it rides the
+        // lighting blend), and this is a direction. Fading a shape toward nothing has no meaning;
+        // fading it toward MW's flat ambient is what the blend already does by moving ambCol.
+        if (g_skyPhys.active) {
+            for (uint32_t c = 0; c < 3; ++c) {
+                mp[kSkySHFloat + 4 * c + 0] = g_skyPhys.sh[0][c];
+                mp[kSkySHFloat + 4 * c + 1] = g_skyPhys.sh[1][c];
+                mp[kSkySHFloat + 4 * c + 2] = g_skyPhys.sh[2][c];
+                mp[kSkySHFloat + 4 * c + 3] = g_skyPhys.sh[3][c];
+                g_skyAmbDC[c] = g_skyPhys.ambScene[c];
+            }
+            mp[kSkyParamsFloat + 0] = strength;   // y/z/w belong to the AO — see publishSkyAO.
             return;
         }
 
@@ -7808,16 +7949,53 @@ namespace {
                 return false;
             }
 
-            // Sky PerBatch set (1 instance): gBatch = the single sky world window.
+            // P2 — the PER-VIEW sky cbuffers. TWO of them, [0] main and [1] reflect, because they
+            // carry invViewProj and the two views need different ones (skyview.h.fsl). 256 B each,
+            // persistent-mapped, written once per frame beside each view's matrix.
+            for (int v = 0; v < 2; ++v) {
+                BufferLoadDesc svb = {};
+                svb.mDesc.mDescriptors = DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+                svb.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_CPU_TO_GPU;
+                svb.mDesc.mFlags = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
+                svb.mDesc.mSize = 256;              // cbuffer alignment, not sizeof(SkyViewData)
+                svb.mDesc.pName = v ? "skyViewCbvReflect" : "skyViewCbvMain";
+                svb.pData = nullptr;
+                svb.ppBuffer = &g_live.pSkyViewCbv[v];
+                addResource(&svb, nullptr);
+            }
+
+            waitForAllResourceLoads();
+            // Zeroed once, and the zero is DESIGNED: params.x = 0 reads as "not published" and
+            // radiance.w = 0 as a black sky, so a frame that draws before the first publish paints
+            // black rather than whatever the allocator left behind.
+            for (int v = 0; v < 2; ++v) {
+                if (g_live.pSkyViewCbv[v] && g_live.pSkyViewCbv[v]->pCpuMappedAddress) {
+                    std::memset(g_live.pSkyViewCbv[v]->pCpuMappedAddress, 0, 256);
+                }
+            }
+
+            // Sky PerBatch set (1 instance): gBatch = the single sky world window, and (P2) gSkyView
+            // = the MAIN view's sky cbuffer. The reflect twin binds the same two indices to the
+            // reflect resources further down — which is exactly the one-resource-two-views pattern
+            // this set already was, now carrying a second passenger.
             DescriptorSetDesc skbDesc = SRT_SET_DESC(SrtData, PerBatch, 1, 0);
             addDescriptorSet(R, &skbDesc, &g_live.pPerBatchSetSky);
             if (!g_live.pPerBatchSetSky) {
                 return false;
             }
-            DescriptorData skp = {};
-            skp.mIndex = SRT_RES_IDX(SrtData, PerBatch, gBatch);
-            skp.ppBuffers = &g_live.pSkyWorldsBuf;
-            updateDescriptorSet(R, 0, g_live.pPerBatchSetSky, 1, &skp);
+            {
+                DescriptorData skp[2] = {};
+                uint32_t n = 0;
+                skp[n].mIndex = SRT_RES_IDX(SrtData, PerBatch, gBatch);
+                skp[n].ppBuffers = &g_live.pSkyWorldsBuf;
+                ++n;
+                if (g_live.pSkyViewCbv[0]) {
+                    skp[n].mIndex = SRT_RES_IDX(SrtData, PerBatch, gSkyView);
+                    skp[n].ppBuffers = &g_live.pSkyViewCbv[0];
+                    ++n;
+                }
+                updateDescriptorSet(R, 0, g_live.pPerBatchSetSky, n, skp);
+            }
         }
 
         // --- Debug light-origin boxes: LINE_LIST pipeline + dynamic vertex buffer -----------------
@@ -8044,6 +8222,35 @@ namespace {
                 }
             } else {
                 std::printf("[forge] addShader(waterfill) FAILED — underwater backstop disabled\n");
+            }
+
+            // --- P2 THE PHYSICAL SKY (skyhw.frag) -------------------------------------------------
+            // The same fullscreen triangle as volfog/waterfill above, and the SIMPLEST state of the
+            // three: no blend at all, no depth, colour mask ALL. It is the BACKDROP — drawn first
+            // into a just-cleared target in the main pass, and first again in the mirror — so there
+            // is nothing underneath it to blend with and alpha 1 is a straight write.
+            //
+            // ⚠ THAT ALPHA IS A CONTRACT CHANGE, NOT AN INCIDENTAL. gSkyColor (the snapshot every fog
+            // site melts into, skydome.h.fsl) becomes opaque across the whole frame, so
+            // `s.rgb + fogColNear*(1-s.a)` collapses to `s.rgb` everywhere — fog melts into the REAL
+            // sky in every direction instead of into fogColNear below the old dome rim. The negative
+            // control that follows from it (looking down from a height) has to be re-established
+            // rather than assumed, and hosekRadiance clamps to the horizon below the skyline for
+            // exactly that reason. Non-fatal on failure: without the pipeline the pass is skipped and
+            // MW's sky mesh keeps drawing, which is the g_skyHw = 0 image.
+            ShaderLoadDesc hwDesc = {};
+            hwDesc.mVert.pFileName = "shadowatlasview.vert";
+            hwDesc.mFrag.pFileName = "skyhw.frag";
+            addShader(R, &hwDesc, &g_live.pSkyHwShader);
+            if (g_live.pSkyHwShader) {
+                sag.pShaderProgram = g_live.pSkyHwShader;
+                sag.pBlendState = nullptr;                  // no blend: it writes, it does not mix
+                addPipeline(R, &savPd, &g_live.pSkyHwPipeline);
+                if (!g_live.pSkyHwPipeline) {
+                    std::printf("[forge] addPipeline(skyhw) FAILED — physical sky disabled\n");
+                }
+            } else {
+                std::printf("[forge] addShader(skyhw) FAILED — physical sky disabled\n");
             }
         }
 
@@ -8839,7 +9046,14 @@ namespace {
                     p[rn].mCount = 1; p[rn].ppBuffers = &g_live.pAlphaStagesBuf;
                     ++rn;
                 }
-                if (g_live.pShadowMaskParamsCbv) {   // gShadowParams: type-valid bind (reflect never reads it)
+                // gShadowParams — REAL in this set, not merely type-valid: the mirror sky pass
+                // binds it (cmdBindDescriptorSet(pPerFrameSetReflect) in the reflect sky loop) and
+                // skyhw.frag reads toneParams through scenecolor.h.fsl. ⚠ Its invViewProj is the
+                // MAIN view's here and always will be — that is what gSkyView exists to work around,
+                // not something to "fix" by publishing a mirror matrix into this shared buffer. Same buffer
+                // pointer as the main set, which is exactly why the mirrored sky inherits the anchor
+                // for free where gFrameData's six truncated copies would have needed carrying over.
+                if (g_live.pShadowMaskParamsCbv) {
                     p[rn].mIndex = SRT_RES_IDX(SrtData, PerFrame, gShadowParams);
                     p[rn].ppBuffers = &g_live.pShadowMaskParamsCbv;
                     ++rn;
@@ -8862,10 +9076,21 @@ namespace {
                 updateDescriptorSet(R, 0, g_live.pPerFrameSetReflect, rn, p);
             }
             {
-                DescriptorData rbp = {};
-                rbp.mIndex = SRT_RES_IDX(SrtData, PerBatch, gBatch);
-                rbp.ppBuffers = &g_live.pReflectSkyWorldsBuf;
-                updateDescriptorSet(R, 0, g_live.pPerBatchSetReflectSky, 1, &rbp);
+                // ...and the MIRROR half of the P2 pair: gSkyView bound to pSkyViewCbv[1], which is
+                // the ONLY difference between this set and the main one. It is also the whole reason
+                // the cbuffer exists — see skyview.h.fsl. Get this bind wrong and the water shows
+                // the main view's sky, which is exactly the failure the verification list watches for.
+                DescriptorData rbp[2] = {};
+                uint32_t rbn = 0;
+                rbp[rbn].mIndex = SRT_RES_IDX(SrtData, PerBatch, gBatch);
+                rbp[rbn].ppBuffers = &g_live.pReflectSkyWorldsBuf;
+                ++rbn;
+                if (g_live.pSkyViewCbv[1]) {
+                    rbp[rbn].mIndex = SRT_RES_IDX(SrtData, PerBatch, gSkyView);
+                    rbp[rbn].ppBuffers = &g_live.pSkyViewCbv[1];
+                    ++rbn;
+                }
+                updateDescriptorSet(R, 0, g_live.pPerBatchSetReflectSky, rbn, rbp);
             }
 
             // WV2: pPerFrameSetReflectGeo — a THIRD PerFrame set bound to pReflectFrameCbvGeo (the
@@ -9383,6 +9608,88 @@ namespace {
                 if (!g_live.pAplPipeline || !g_live.pAplSet || !g_live.pAplOut) {
                     std::printf("[forge] APL instrument unavailable (shader/pipeline/buffers) — "
                                 "frames render, APL is simply not reported\n");
+                }
+            }
+            // --- P2: the Hosek-Wilkie C++/FSL CROSS-CHECK (tasks/forge-physical-sky.md) ----------
+            // The physical sky evaluates one model TWICE — C++ for the SH (the light) and FSL for
+            // the pixels — and a silent divergence between them is precisely the failure the step
+            // exists to remove. One dispatch per host session, 64 threads, read back after the frame
+            // fence the frame already has. NON-FATAL throughout, same reasoning as the APL block
+            // above: a renderer that refuses to start because its self-test is missing is worse than
+            // an unverified one, and the log says which happened.
+            {
+                ShaderLoadDesc hcd = {};
+                hcd.mComp.pFileName = "hosekcheck.comp";
+                addShader(R, &hcd, &g_live.pHosekCheckShader);
+                if (g_live.pHosekCheckShader) {
+                    PipelineDesc hpd = {};
+                    hpd.mType = PIPELINE_TYPE_COMPUTE;
+                    hpd.mComputeDesc.pShaderProgram = g_live.pHosekCheckShader;
+                    addPipeline(R, &hpd, &g_live.pHosekCheckPipeline);
+                }
+                if (g_live.pHosekCheckPipeline) {
+                    DescriptorSetDesc hset = SRT_SET_DESC(HosekCheckSrtData, PerBatch, 1, 0);
+                    addDescriptorSet(R, &hset, &g_live.pHosekCheckSet);
+
+                    BufferLoadDesc hdb = {};
+                    hdb.mDesc.mDescriptors  = DESCRIPTOR_TYPE_BUFFER;
+                    hdb.mDesc.mMemoryUsage  = RESOURCE_MEMORY_USAGE_CPU_TO_GPU;
+                    hdb.mDesc.mFlags        = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
+                    hdb.mDesc.mFormat       = TinyImageFormat_R32G32B32A32_SFLOAT;  // Buffer<float4>
+                    hdb.mDesc.mElementCount = kHosekCheckDirs;
+                    hdb.mDesc.mStructStride = 0;
+                    hdb.mDesc.mSize         = (uint64_t)kHosekCheckDirs * 16;
+                    hdb.mDesc.pName         = "hosekCheckDirs";
+                    hdb.ppBuffer            = &g_live.pHosekDirsBuf;
+                    addResource(&hdb, nullptr);
+
+                    BufferLoadDesc hob = {};
+                    hob.mDesc.mDescriptors  = DESCRIPTOR_TYPE_RW_BUFFER;
+                    hob.mDesc.mMemoryUsage  = RESOURCE_MEMORY_USAGE_GPU_ONLY;
+                    hob.mDesc.mStructStride = sizeof(uint32_t);
+                    hob.mDesc.mElementCount = kHosekCheckDirs * 4;
+                    hob.mDesc.mSize         = (uint64_t)sizeof(uint32_t) * kHosekCheckDirs * 4;
+                    hob.mDesc.mStartState   = RESOURCE_STATE_UNORDERED_ACCESS;
+                    hob.mDesc.pName         = "hosekCheckOut";
+                    hob.ppBuffer            = &g_live.pHosekOutBuf;
+                    addResource(&hob, nullptr);
+
+                    BufferLoadDesc hrb = {};
+                    hrb.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_GPU_TO_CPU;
+                    hrb.mDesc.mFlags       = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
+                    hrb.mDesc.mSize        = (uint64_t)sizeof(uint32_t) * kHosekCheckDirs * 4;
+                    hrb.mDesc.mStartState  = RESOURCE_STATE_COPY_DEST;
+                    hrb.mDesc.pName        = "hosekCheckReadback";
+                    hrb.ppBuffer           = &g_live.pHosekReadback;
+                    addResource(&hrb, nullptr);
+
+                    waitForAllResourceLoads();
+                    if (g_live.pHosekDirsBuf && g_live.pHosekOutBuf && g_live.pHosekReadback
+                        && g_live.pHosekCheckSet) {
+                        // The probe set, filled ONCE. Deliberately the SAME Fibonacci sphere the SH
+                        // projection integrates over, so the directions the check exercises are the
+                        // directions the light is actually built from — a probe set of round numbers
+                        // would test the arithmetic at points nothing uses.
+                        float* hd = (float*)g_live.pHosekDirsBuf->pCpuMappedAddress;
+                        for (uint32_t i = 0; i < kHosekCheckDirs; ++i) {
+                            float d[3];
+                            Hosek::fibDir((int)i, (int)kHosekCheckDirs, d);
+                            hd[i * 4 + 0] = d[0]; hd[i * 4 + 1] = d[1];
+                            hd[i * 4 + 2] = d[2]; hd[i * 4 + 3] = 0.0f;
+                        }
+                        DescriptorData hp[3] = {};
+                        hp[0].mIndex = SRT_RES_IDX(HosekCheckSrtData, PerBatch, gSkyView);
+                        hp[0].ppBuffers = &g_live.pSkyViewCbv[0];
+                        hp[1].mIndex = SRT_RES_IDX(HosekCheckSrtData, PerBatch, gHosekDirs);
+                        hp[1].ppBuffers = &g_live.pHosekDirsBuf;
+                        hp[2].mIndex = SRT_RES_IDX(HosekCheckSrtData, PerBatch, gHosekOut);
+                        hp[2].ppBuffers = &g_live.pHosekOutBuf;
+                        updateDescriptorSet(R, 0, g_live.pHosekCheckSet, 3, hp);
+                    }
+                }
+                if (!g_live.pHosekCheckPipeline || !g_live.pHosekCheckSet || !g_live.pHosekOutBuf) {
+                    std::printf("[forge] Hosek cross-check unavailable — the physical sky still "
+                                "renders, its C++/FSL agreement is simply UNVERIFIED\n");
                 }
             }
             // AO set: ONE PerDraw set (gAOParams cbuffer + gLinearDepthIn SRV + gAOOut UAV), shared
@@ -11585,6 +11892,22 @@ namespace {
     // setting a ratio by hand means chasing the exposure servo the whole way. This is the number
     // the user owns; the "solve ratio" button turns it into a pair of gains at constant sum.
     //
+    // ⚠⚠ P1 WALKED THE PAIR TO 95/147, THIS KNOB DID NOT FOLLOW, AND P2 WALKED IT BACK. The whole
+    // episode is worth one paragraph because it is the case this knob's rule was written for: a
+    // common gain-domain scale cancels out of a quotient, so the target should not have moved at all
+    // — and at the exact pair 95.13/146.74 it did not (1.787). Rounding to integer display codes
+    // cost 1.3% (95/147 derives 1.811), which was deliberately left VISIBLE as `target=1.81` against
+    // `knob=1.79` rather than re-seeded here. With P2's revert to 80/128 the residual is gone and
+    // `target` reads 1.787 again. Nothing was ever re-authored, which is the point.
+    //
+    // ⚠ AND AT FULL PHYSICAL BLEND THIS KNOB DESCRIBES THE OTHER END OF A LERP. calSunAmbTarget()
+    // states what MW's AUTHORED pair should be calibrated to; the physical pair's ratio is the
+    // atmosphere's (measured 6.06 at the reference configuration, against this 1.79) and is not
+    // free to be set. So at g_skyPhysBlend 1 the `ratio=` reading on the heartbeat is EXPECTED to
+    // sit far above `target=`, and the solve button is measuring something it no longer controls.
+    // That is not a calibration failure — it is what "the sky and the light are the same object"
+    // costs, and the blend lane is where the trade is made.
+    //
     // ⚠ 1.79 IS calSunAmbTarget() AT ndl = 1 UNDER THE SHIPPED CURVE AND THE 80/128 PAIR, written
     // out here rather than seeded from it at runtime, because an AUTHORED setpoint that silently
     // re-derives itself when a curve or a table row is swapped is not authored. The heartbeat prints
@@ -11694,7 +12017,18 @@ namespace {
     // calTarget(); this is the guard on how far the servo may ever push, so a pathological frame
     // (a loading screen, a fullscreen menu tint, a black interior) cannot park E somewhere the next
     // real frame takes a visible second to walk back from.
-    float  g_expMin      = 0.25f;
+    // ⚠⚠ WIDENED FOR THE PHYSICAL SKY (P2): 0.25/8.0 is FIVE STOPS, and a physical day-to-night is
+    // twenty-plus. The old pair was picked when exterior lighting was MW's authored curve, which
+    // never asked for more; with the sun and the ambient coming from an atmosphere that genuinely
+    // goes dark, the rails would have become the thing setting the level at both ends of the day —
+    // and a rail is the one place a servo cannot tell you it is stuck.
+    //
+    // Still an AUTHORITY limit and NOT an envelope (the envelope is calTarget()'s range). Widening
+    // it costs the guard it was for: a pathological frame can now park E much further out, and it
+    // will take longer to walk back. That trade is made deliberately AND INSTRUMENTED — the `apl:`
+    // heartbeat reports rail contact and for how long, so "where does the range actually need to be"
+    // is answered by a measurement instead of by guessing twice.
+    float  g_expMin      = 1.0e-3f;
     // ⚠ 8.0, AND IT WENT 8 -> 16 -> 8 ACROSS ONE STEP. Step 3 raised it on the argument that AgX's
     // input range is 16.5 stops and its shoulder never clips, so a ceiling picked against a curve
     // that CLAMPED at 2.2 would bind as a clamp rather than as a guard. That argument is about what
@@ -11708,11 +12042,29 @@ namespace {
     // sits pinned at 8.00 on the heartbeat, the clamp is the binding constraint and the answer is the
     // CAL gains, not a bigger number here. The slider reaches 32 so that question can be ASKED in a
     // running game without a rebuild.
-    float  g_expMax      = 8.0f;
+    // ⚠⚠ AND THE WIDENING TURNED OUT TO FIX A STANDING BUG, NOT MERELY MAKE ROOM FOR A NEW ONE.
+    // Measured on ibocalibrationinterior, one save, the two clamps back to back:
+    //     g_expMax 8.0   -> exp pinned 7.93-7.99, rail=**MAX**, lvl mean 29, need 1.74-2.64x
+    //     g_expMax 1.0e3 -> exp 14.6 free,        rail=free,     lvl mean 40, need 1.00-1.51x
+    // i.e. that interior had been sitting 0.8 stops BELOW its own authored 40-50 target, held there
+    // by the guard, with the servo asking for 1.74x every frame and being refused. Nothing said so,
+    // because a pinned servo and a converged one look identical on a log that reports only `exp=`.
+    // That is exactly what `rail=` exists for, and it earned its keep on the first run.
+    float  g_expMax      = 1.0e3f;   // see the widening note on g_expMin — P2, and instrumented
     // THE SERVO'S STATE. Published to resolve.frag as gResolveParams.tone.x, and to the heartbeat as
     // `exp=`. double rather than float because it is integrated one lag step per frame at ~165 Hz.
     double g_exposure    = 1.0;
     double g_expLastMs   = 0.0;    // hostNowMs() at the previous readback; 0 = no step yet
+    // ─── RAIL CONTACT (P2) ───────────────────────────────────────────────────────────────────────
+    // "E is pinned, and for how long" is the number that says where the clamp actually needs to be,
+    // and it is not derivable from `exp=` alone: a servo sitting AT its limit and a servo that
+    // happens to want that value look identical on the log. Tracked as a live state plus a
+    // cumulative dwell, because the two answer different questions — "is it stuck right now" and
+    // "did it spend the whole night stuck".
+    //   -1 = against the MINIMUM, 0 = free, +1 = against the MAXIMUM.
+    int    g_expRail       = 0;
+    double g_expRailMs     = 0.0;   // wall time in the CURRENT contact, 0 while free
+    double g_expRailWorstMs = 0.0;  // longest contact this session, either rail
 
     // SK2 "ownership tell": the Forge sky takeover is byte-identical to MW's own sky, so there's
     // no way to tell it's live. These tint the Forge sky toward magenta (gFrameData.skyParams,
@@ -11720,6 +12072,46 @@ namespace {
     // (F7 on). Pulse animates it (MW's sky never pulses) for an unmistakable confirmation. 0 = off.
     float g_skyDebugTint = 0.0f;   // 0 = identical to MW (clean A/B); 1 = full magenta
     bool  g_skyTintPulse = false;  // animate the tint so it's obviously Forge-owned
+
+    // ─── P2 — THE PHYSICAL SKY (tasks/forge-physical-sky.md) ──────────────────────────────────
+    // P1 SCALED MW'S AUTHORED SKY; THIS REPLACES THE REPRODUCTION WITH A GENERATOR, and the anchor
+    // is gone rather than disabled — a dead knob that still multiplies is how the next reader loses
+    // a day. What it corrected is still true and still measured (q = L_sky/(E_total/pi) was 0.265
+    // against 0.122 for real clear skies), but a multiply on a display code could never fix the
+    // other half: MW's 2-colour vertical lerp returns ONE number for a whole elevation ring, where a
+    // real sky brightens up to 5x toward the sun and dips BELOW its zenith 60-90 degrees away.
+    //
+    // ⚠ THERE IS NO SKY TARGET ANY MORE, and that is the point rather than an omission. The same
+    // Hosek-Wilkie field draws the backdrop AND supplies the sun and the ambient that light the
+    // ground; the servo meters that ground; wherever that puts the sky is by definition correct.
+    // Every "what should the sky read" number in P1 was a symptom of the sky and the light being two
+    // objects. [[project_forge_sky_is_a_display_code]]
+    //
+    // ⚠ hosek.h OWNS EVERY CONSTANT. Nothing here is a magic number: turbidity and albedo are the
+    // model's own inputs, and the two lanes below are A/B levers, not tuning. Read the block comment
+    // at the top of hosek.h before touching any of it — in particular the two absolute anchors
+    // (kSceneUnitCd and the sun-beam solve) and WHY the H-W solar-radiance function is not used.
+    bool  g_skyHw        = true;    // master. OFF = MW's sky mesh draws again, lighting reverts (A/B)
+    // ⚠ THE ONE KNOB WITH REAL AUTHORITY THIS PHASE, and it is the model's own parameter rather than
+    // a taste dial: turbidity moves haze, horizon/zenith ratio, circumsolar spread AND the sun's
+    // reddening together, because in the atmosphere they ARE one parameter. P4 makes it
+    // weather-driven and time-varying under MW's single clear preset; until then it is a slider.
+    float g_skyTurbidity = 3.0f;    // 1 = pristine, 10 = thick haze. The reference clear day is 3.
+    // Vvardenfell is ash. 0.1 is a dark ground and it is a real model input, not a fudge: H-W takes
+    // ground albedo because light bounced off the ground and re-scattered is a genuine part of what
+    // the sky's lower half is made of.
+    float g_skyAlbedo    = 0.10f;
+    // The DRAWN sky's own level. 1 = the model's radiance untouched, which is the shipped value and
+    // the only physically meaningful one. It exists so the sky can be dimmed WITHOUT moving the
+    // light (the lighting blend below is the other half), which is what separates "the sky looks
+    // wrong" from "the lighting looks wrong" during a bring-up.
+    float g_skyHwStrength = 1.0f;
+    // ⚠⚠ THE BLEND LANE, AND IT IS NOT OPTIONAL. 0 = today's MW sunCol/ambCol exactly, bit for bit;
+    // 1 = fully physical. This step moves ALL exterior lighting at once — measured at the reference
+    // configuration, the physical sun:ambient ratio is 6.06 against MW's authored 1.79, i.e. shadows
+    // get a great deal darker — and without a lane that walks between the two ends a regression
+    // anywhere in the frame is unbisectable. It is the highest-severity item in the whole step.
+    float g_skyPhysBlend = 1.0f;
 
     // WT2 water debug: output one isolated water term instead of the composited surface, so the
     // reflection / refraction contents are directly inspectable. Driven by two panel CHECKBOXES
@@ -13342,8 +13734,11 @@ namespace {
           // calTarget() and it is where the level is allowed to float; these two bound how far the
           // servo may ever push, so a loading screen or a fullscreen menu tint cannot park E
           // somewhere the next real frame needs a visible second to walk back from.
-          t.sliderF("E clamp MIN", &g_expMin, 0.05f, 1.0f, 0.05f);
-          t.sliderF("E clamp MAX", &g_expMax, 1.0f, 32.0f, 0.25f);
+          // ⚠ RANGES WIDENED WITH THE DEFAULTS (P2). These are AUTHORITY limits, not the target
+          // envelope — if `exp=` sits pinned on a rail on the heartbeat, the answer is the CAL gains
+          // or the calTarget row, not a bigger number here. The `rail=` field is what tells you.
+          t.sliderF("E clamp MIN", &g_expMin, 1.0e-4f, 1.0f, 0.0005f, "%.4f");
+          t.sliderF("E clamp MAX", &g_expMax, 1.0f, 4096.0f, 8.0f, "%.0f");
           t.flush(); }
 
         // -- Tab: Tonemap (the curve and its look — tasks/forge-postprocess.md step 3 / S2) --
@@ -13497,6 +13892,37 @@ namespace {
         { TabBuilder t; t.panel = g_uiPanel; t.name = "Sky & Water";
           t.sliderF("Sky tint (Forge tell)", &g_skyDebugTint, 0.0f, 1.0f, 0.02f);
           t.checkbox("Sky tint pulse", &g_skyTintPulse);
+          // ─── P2: THE PHYSICAL SKY (tasks/forge-physical-sky.md) ───────────────────────────────
+          // A Hosek-Wilkie radiance field, in absolute units, that draws the sky AND supplies the
+          // sun and ambient that light the ground. Read the live numbers back off the
+          // `[forge-hb][sky]` heartbeat — this panel is unattended in the harness, which runs
+          // minimized, and every one of these knobs has a measured consequence there.
+          //
+          // ⚠ MASTER A/B. Off = MW's sky mesh draws again through sky.frag and the lighting reverts,
+          // i.e. the whole step backs out in one click. Exterior only either way.
+          t.checkbox("Sky: PHYSICAL (Hosek-Wilkie; off = MW's sky mesh + MW's lighting)", &g_skyHw);
+          // ⚠⚠ THE LIGHTING BLEND, AND IT IS THE BISECTION TOOL, NOT A LOOK KNOB. 0 = today's MW
+          // sunCol/ambCol bit for bit; 1 = fully physical. This step moves ALL exterior lighting at
+          // once — the physical sun:ambient ratio measures 6.06 at the reference configuration
+          // against MW's authored 1.79, so shadows deepen a great deal — and without this lane a
+          // regression anywhere in the frame is unattributable. Move it, not the CAL gains.
+          t.sliderF("Sky: PHYSICAL LIGHTING blend (0 = MW's sun/ambient exactly, 1 = the model's)",
+                    &g_skyPhysBlend, 0.0f, 1.0f, 0.05f, "%.2f");
+          // ⚠ THE ONE KNOB WITH REAL AUTHORITY THIS PHASE, and it is the model's own parameter
+          // rather than a taste dial: turbidity moves haze, the horizon/zenith ratio, the
+          // circumsolar spread AND the sun's reddening together, because in the atmosphere they ARE
+          // one parameter. P4 makes it weather-driven and time-varying under MW's clear preset.
+          t.sliderF("Sky: turbidity (1 = pristine, 3 = the reference clear day, 10 = thick haze)",
+                    &g_skyTurbidity, 1.0f, 10.0f, 0.1f, "%.1f");
+          // A real model input, not a fudge: light bounced off the ground and re-scattered is a
+          // genuine part of what the sky's lower half is made of. Vvardenfell is ash — 0.1.
+          t.sliderF("Sky: ground albedo (0.10 = Vvardenfell ash)",
+                    &g_skyAlbedo, 0.0f, 0.6f, 0.01f, "%.2f");
+          // The DRAWN sky's own level, WITHOUT touching the light. 1.0 is the model's radiance
+          // untouched and the only physically meaningful value; it exists so "the sky looks wrong"
+          // and "the lighting looks wrong" can be separated during a bring-up.
+          t.sliderF("Sky: drawn strength (1.0 = the model's own radiance; does NOT move the light)",
+                    &g_skyHwStrength, 0.0f, 2.0f, 0.05f, "%.2f");
           t.checkbox("Water: reflection only (raw RT, undistorted)", &g_waterReflOnly);
           t.checkbox("Water: refraction only", &g_waterRefrOnly);
           // WT4d. The ONE roughness knob — see g_waterRoughBase. It drives the reflection mip LOD
@@ -15155,6 +15581,44 @@ namespace ForgeRender {
         // line that says which numbers were picked up goes nowhere, which is how this was caught.
         // cwd is the install dir here (see main.cpp), so the relative open resolves.
         loadWaterIniOnce();
+
+        // ─── P2: THE COEFFICIENT GATE (tasks/forge-physical-sky.md) ──────────────────────────────
+        // ⚠⚠ NOTHING THE PHYSICAL SKY DOES MEANS ANYTHING UNTIL THIS LINE READS OK, which is why it
+        // is the first thing after the log opens. hosek_data.h is 3600 transcribed constants; a
+        // mistyped or transposed one would not fail to build, it would make the sky "look a bit
+        // off" — indistinguishable from every other reason a sky looks a bit off, and one you can
+        // chase for a day. So the dataset is MEASURED rather than trusted: three cooked
+        // configurations and twelve radiances re-derived here and compared against values produced
+        // by the AUTHORS' own implementation. Between them they exercise every path in cook() —
+        // both albedo halves, integer and fractional turbidity, the elevation warp near both ends,
+        // and the `turbidity == 10` early-out's neighbour. [[feedback_prior_art_constants_dont_transfer]]
+        //
+        // 1e-4 is a FLOAT-PRECISION gate: the reference is double-precision and this is float, so
+        // the residual is ~2e-6 in practice. A real transcription error lands orders of magnitude
+        // above it.
+        {
+            const double dev = Hosek::selfTest([](float T, float A, float E, double wc, double wl) {
+                LOG::logline(">> [forge-hosek] self-test T=%.2f alb=%.2f elev=%.4f:"
+                             " coefficients %.3e, radiance %.3e",
+                             (double)T, (double)A, (double)E, wc, wl);
+            });
+            const bool ok = (dev < 1.0e-4);
+            LOG::logline("%s [forge-hosek] coefficient gate %s (worst relative deviation %.3e"
+                         " against the reference implementation)",
+                         ok ? ">>" : "!!", ok ? "OK" : "**FAILED — hosek_data.h is CORRUPT**", dev);
+            // ...and the two absolute anchors, printed once, because they are the only numbers in
+            // the whole model that were not derived from it. sunBeamScale() solves at the reference
+            // configuration against §0.1's measured clear-sky energy split; kSceneUnitCd is what P1
+            // measured one scene unit to be worth, pinned here because P2 now SETS the lighting that
+            // P1 derived it from and re-deriving it would close the loop on itself.
+            LOG::logline(">> [forge-hosek] anchors: sun beam scale %.4f W/m2 (solved at T=%.1f"
+                         " alb=%.2f elev=%.2fdeg for a %.2f sun share) | 1 scene unit = %.0f cd/m2",
+                         Hosek::sunBeamScale(), Hosek::kRefTurbidity, Hosek::kRefAlbedo,
+                         Hosek::kRefElevation * 180.0 / Hosek::kPi, Hosek::kRefSunShare,
+                         Hosek::kSceneUnitCd);
+            LOG::flush();
+        }
+
         Renderer* R = g_live.pRenderer;
 
         // MSAA: validate the requested count against the device for the shared RT format.
@@ -15526,7 +15990,8 @@ namespace ForgeRender {
     // first interior reading came out wrong. Reported as `lo`/`hi` with no average invented between
     // them, because the two ends mean different things in each row:
     //
-    //   exterior day  80 / 128  — a PAIR (user: "128 80 is for exterior day"). Shadow is ambient
+    //   exterior day  80 / 128  — a PAIR (user: "128 80 is for exterior day"; P1 walked it to 95/147
+    //                             and P2 walked it back — see the note below). Shadow is ambient
     //                             alone, lit is ambient+sun, so the two TOGETHER pin the sun:ambient
     //                             RATIO — the one quantity S3 exists to set, and the reason this row
     //                             is worth more than the others. A frame mean cannot check a pair.
@@ -15563,6 +16028,26 @@ namespace ForgeRender {
     // ⚠ AND THE ENVELOPE IS A **SCENE** STATISTIC NOW. 60/80 is only meaningful against a mean with
     // the sky rejected (g_aplSkipSky); measured against the whole frame it would chase camera pitch.
     // The two changes are one change and neither is valid alone.
+    //
+    // ─── ⚠⚠ P1 MOVED BOTH EXTERIOR-DAY ROWS +0.53 STOPS AND P2 MOVED THEM BACK ──────────────────
+    // They are 60/80 and 80/128 again, i.e. exactly what the user authored, and the revert is not a
+    // change of mind about the level — it is the reason for the move going away:
+    //
+    //   P1's argument was that E = 1.735 is the unique exposure at which a physically-correct zenith
+    //   (q = 0.122) reproduces MW's AUTHORED zenith through the AgX stack, and that since the meter
+    //   rejects sky (g_aplSkipSky) the servo would never find that exposure on its own — so the
+    //   setpoint had to be walked to meet it.
+    //
+    //   P2 deletes the premise. There is no authored zenith left to reproduce: the sky is generated
+    //   from a radiance field that ALSO supplies the sun and the ambient the ground is lit by, so
+    //   there is no exposure at which the sky "should" land and nothing for the rows to be derived
+    //   against. What is left is the question these rows always actually answered — what should LAND
+    //   look like — and that is an authored preference, which is what 60/80 and 80/128 are.
+    //
+    // ⚠ A row that moved for a derived reason has to move BACK when the derivation dies, or the
+    // calibration quietly carries half a retired argument forever. The sun:ambient ratio comes back
+    // with it: the +1.3% integer-rounding residual P1 documented (95/147 deriving 1.811 against the
+    // knob's 1.79) is gone, because 80/128 derives 1.787 exactly. Expect `target` ≈ 1.79 again.
     CalTarget calTargetExtDay() { return { 80.0f, 128.0f, "ext day shadow/lit" }; }
 
     CalTarget calTarget() {
@@ -15588,6 +16073,9 @@ namespace ForgeRender {
         // never came back because 109 is inside the band and `need` therefore never reaches 1.00x.
         // A ~0.5-stop band cannot hide that. It IS a tighter leash on a level that is allowed to
         // float — deliberately, because the float it was allowed was mostly sky.
+        // ⚠ BACK AT 60-80 SINCE P2, after P1 walked it to 72-95. See the block above
+        // calTargetExtDay() for why: the derivation that asked for the move is gone with the
+        // authored sky it was stated against.
         return                              {  60.0f,  80.0f, "ext day mean 60-80" };
     }
 
@@ -15667,6 +16155,178 @@ namespace ForgeRender {
         const double lo = calGainDomain((double)ct.lo);
         const double hi = calGainDomain((double)ct.hi);
         return (lo > 1.0e-9) ? (hi / lo - 1.0) : 0.0;
+    }
+
+    // ─── P2 — THE PHYSICAL SKY, MEASURED ONCE PER FRAME ──────────────────────────────────────────
+    // Everything the frame needs out of the Hosek-Wilkie field, computed in ONE place from ONE cook:
+    // the coefficients the shader draws with, the SH-L1 the ambient is shaped by, the ambient's
+    // LEVEL, and the sun. They are one object here for the reason the whole step exists — §0.6 found
+    // three different definitions of "the sky" in the renderer and two of them disagreed.
+    //
+    // ⚠ THE ORDER IS FORCED, and it is why this is one function rather than four:
+    //     cook -> E_sky (upper hemisphere) -> E_sun (the beam, anchored on E_sky) -> ground radiance
+    //     (albedo * total downwelling / pi) -> the SH projection over the FULL sphere.
+    // The ground term needs the sun, the sun needs the sky's irradiance, and the SH needs the
+    // ground. Split across call sites, each split is a chance to read last frame's value.
+    //
+    // ⚠ ONE 128-DIRECTION LOOP DOES BOTH the irradiance and the SH, and it is the SAME Fibonacci
+    // table publishSkyAmbientSH builds — Hosek::fibDir is the shared definition. Two quadratures
+    // over one field is exactly how the sun:sky split would drift by a fraction of a percent that
+    // nobody could ever attribute. Measured against a 400x800 tabulated integral: 0.06% at N = 128.
+
+    // sunDir is MW's TRAVEL direction, so -sunDir points AT the sun and -sunDir.z is the elevation
+    // sine — exactly the ndl of flat ground, which is the same identity calSunAmbTarget works off.
+    void skyPhysicalMeasure(const float* sunDir, float discZ, float discAz)
+    {
+        SkyPhysical p = {};
+        p.nightRamp = 0.0f;
+        p.sceneScale = 0.0f;
+        // The gate. Exterior only — an interior must not acquire a sky — and `g_skyHw` is the
+        // master A/B. No DAY gate here, unlike P1's: night is handled by the RAMP (below), which is
+        // continuous, where a step at 06:00 would have been a visible seam in both the sky and the
+        // light. [[project_forge_no_ini_flips]]
+        if (!g_skyHw || !g_dlExterior || !sunDir) { g_skyPhys = p; return; }
+
+        // ─── THE SUN THE MODEL IS COOKED AT IS THE DISC, NOT THE LIGHT ───────────────────────────
+        // ⚠⚠ MW HAS TWO SUNS AND USING THE WRONG ONE COSTS 29 DEGREES. Measured in-game, one frame:
+        // the LIGHT direction (sgSunlight, which arrives as sunDir here) reads elevation 41.09deg
+        // while the DISC (MW's GetSunDir, what you can actually see in the sky) reads 69.89deg —
+        // same azimuth, 29 degrees apart. Hosek-Wilkie is parameterised by solar elevation and its
+        // circumsolar brightening is centred on the sun, so cooking it at the light's elevation puts
+        // the sky's bright region 29 degrees away from the sun drawn in it.
+        //
+        // ⚠ AND THE DISC IS THE ONE THAT IS ALLOWED TO BE WRONG THE LEAST — which is the whole
+        // reason the match is made to it (user, 2026-08-19): *"people won't notice if direction
+        // changes but they will notice if sundisc in sky position changes"*. A shifted light
+        // direction re-shades surfaces by a few percent and reads as weather; a sky whose bright
+        // region is not where the sun visibly is reads as broken. So the DISC anchors the model and
+        // the light is free to sit wherever MW puts it. Never invert this to "make them agree" by
+        // moving the disc: the disc is the constraint, not the free variable.
+        //
+        // ⚠⚠ AND THE LIGHT DIRECTION DOES NOT SET — IT BOUNCES. MW mirrors it back above the horizon
+        // once the sun goes down (deliberately: night lighting then arrives from a plausible
+        // direction rather than from underground), so its elevation stays POSITIVE all night and a
+        // model driven by it renders a DAYTIME SKY AT MIDNIGHT — reported from play as "MW's sun
+        // doesn't set, so it is daytime all the time", and the reason the night ramp below was
+        // unreachable. The client ships MGE's own bounce-corrected disc instead
+        // (DistantLand::setView: `if (sunVis == 0) sunPos.z = -sunPos.z`), as an elevation sine and
+        // an azimuth, because the wire had two free padding floats and a vector needs three. Two
+        // ANGLES reconstruct exactly; two of three COMPONENTS would leave the sign of z
+        // underdetermined, and that sign IS the day/night bit.
+        //
+        // ⚠ sunDir IS STILL THE LIGHT AND STILL BOUNCES, ON PURPOSE. It keeps driving every lighting
+        // term in the frame — that is MW's intended night look and it is the end of the lerp
+        // g_skyPhysBlend interpolates against, so it must not move. Two suns, two jobs; this
+        // function is the only place that needs the second one.
+        const float discZc = std::max(-1.0f, std::min(1.0f, discZ));
+        const float discR  = std::sqrt(std::max(0.0f, 1.0f - discZc * discZc));
+        float toSun[3] = { discR * std::cos(discAz), discR * std::sin(discAz), discZc };
+        // The LIGHT's own elevation, reported beside the disc's so the 29-degree split — and the
+        // bounce, once the disc goes negative and this one does not — stay visible rather than
+        // becoming a thing someone has to already know.
+        p.elevLight = (float)(std::asin(std::max(-1.0f, std::min(1.0f, -sunDir[2]))) * 180.0 / Hosek::kPi);
+
+        const float len = std::sqrt(toSun[0]*toSun[0] + toSun[1]*toSun[1] + toSun[2]*toSun[2]);
+        if (!(len > 1.0e-6f)) { g_skyPhys = p; return; }
+        toSun[0] /= len; toSun[1] /= len; toSun[2] /= len;
+        const double elev = std::asin(std::max(-1.0f, std::min(1.0f, toSun[2])));
+
+        // The night ramp, and it does two DIFFERENT things with one number — see hosek.h. On the SKY
+        // it is a fade to black (this phase's decision: space between the stars is supposed to be
+        // black, and moons/stars return next phase). On the LIGHTING it fades the physical blend back
+        // toward MW's authored night ambient, because calTarget()'s night row only means anything if
+        // the servo has a lit ground to meter.
+        p.nightRamp = Hosek::nightRamp((float)elev);
+        Hosek::cook((double)g_skyTurbidity, (double)g_skyAlbedo, std::max(0.0, elev), p.st);
+        p.st.toSun[0] = toSun[0]; p.st.toSun[1] = toSun[1]; p.st.toSun[2] = toSun[2];
+
+        // --- the sky's own irradiance, and the sun anchored to it ---------------------------------
+        float Esky[3];
+        Hosek::skyIrradiance(p.st, Esky);
+        float EsunN[3];
+        Hosek::sunIrradianceNormal(std::max(0.0, elev), (double)g_skyTurbidity, EsunN);
+        const float sinE = (float)std::max(0.0, std::sin(std::max(0.0, elev)));
+
+        // --- the GROUND, which is a real part of the sphere the ambient integrates over -----------
+        // Lambertian, lit by everything that comes down: L_g = albedo * (E_sky + E_sun*sin(elev))/pi.
+        // Not a fudge and not the same thing as the model's ground-albedo INPUT (which accounts for
+        // bounce light re-scattered back into the SKY). This is the lower hemisphere's own radiance,
+        // and leaving it black would have tilted every ambient in the game upward.
+        float Lg[3];
+        for (int c = 0; c < 3; ++c) {
+            Lg[c] = (float)g_skyAlbedo * (Esky[c] + EsunN[c] * sinE) / (float)Hosek::kPi;
+        }
+
+        // --- one pass: the SH-L1 projection over the FULL sphere ----------------------------------
+        // Real SH basis, l = 0..1: Y00 = 0.282095, Y1m = 0.488603 * {y, z, x}. Identical maths to
+        // publishSkyAmbientSH's, which is what it still publishes through.
+        constexpr float kY0 = 0.28209479f;
+        constexpr float kY1 = 0.48860251f;
+        const float w = 4.0f * (float)Hosek::kPi / (float)Hosek::kFibDirs;
+        float c00[3] = {}, c1x[3] = {}, c1y[3] = {}, c1z[3] = {};
+        for (int i = 0; i < Hosek::kFibDirs; ++i) {
+            float d[3];
+            Hosek::fibDir(i, Hosek::kFibDirs, d);
+            float L[3];
+            if (d[2] > 0.0f) { Hosek::radiance(p.st, d, L); }
+            else             { L[0] = Lg[0]; L[1] = Lg[1]; L[2] = Lg[2]; }
+            for (int ch = 0; ch < 3; ++ch) {
+                const float Lw = L[ch] * w;
+                c00[ch] += Lw * kY0;
+                c1y[ch] += Lw * kY1 * d[1];
+                c1z[ch] += Lw * kY1 * d[2];
+                c1x[ch] += Lw * kY1 * d[0];
+            }
+        }
+
+        // Cosine convolution (A0 = pi, A1 = 2pi/3) then / pi, so the DC IS the ambient multiplier:
+        // for a constant radiance C the whole thing collapses to exactly C.
+        constexpr float kA0 = 1.0f;
+        constexpr float kA1 = 2.0f / 3.0f;
+        const float toScene = (float)Hosek::kNativeToScene;
+        for (int ch = 0; ch < 3; ++ch) {
+            const float dc = kA0 * kY0 * c00[ch];
+            p.ambScene[ch] = std::max(0.0f, dc * toScene);
+            // ⚠ STILL NORMALISED BY THE DC, AND THE PLAN'S "STOP DC-NORMALISING" IS DELIVERED
+            // ANYWAY — by a better route. The ask was that the sky SET the ambient level instead of
+            // only redistributing it. Publishing an un-normalised SH would have done that for the
+            // SH's own receivers and NOBODY ELSE: ambCol is also read by the distant-land lodSunAmb,
+            // by vertex-lit distant statics and by terrain, none of which evaluate skyamb.h.fsl. So
+            // the level is set where it reaches all of them — ambCol itself, from p.ambScene — and
+            // the SH keeps its "factor whose spherical mean is 1" contract, which is also what keeps
+            // the strength slider a safe A/B. Same outcome, five more consumers, one contract intact.
+            const float inv  = (dc > 1.0e-9f) ? (1.0f / dc) : 0.0f;
+            const float dirK = kA1 * kY1 * inv;
+            p.sh[0][ch] = dirK * c1x[ch];
+            p.sh[1][ch] = dirK * c1y[ch];
+            p.sh[2][ch] = dirK * c1z[ch];
+            p.sh[3][ch] = 1.0f;
+            // sunCol is E_normal/pi because `lit = amb + sun*ndl` IS E/pi (§0.1) — the identity that
+            // makes the shading term and the HDRI measurement the same quantity.
+            p.sunScene[ch] = std::max(0.0f, EsunN[ch] / (float)Hosek::kPi * toScene);
+        }
+
+        // --- what the drawn sky is multiplied by --------------------------------------------------
+        p.sceneScale = toScene * p.nightRamp * std::max(0.0f, g_skyHwStrength);
+
+        // --- the reported numbers, which are the falsification tests, not decoration ---------------
+        // q_zenith is §0's albedo-free invariant and the one number that says whether the model
+        // landed where the measured population lives (0.122, p25..p75 0.093..0.148). It is REPORTED,
+        // never targeted — the moment anything tunes to it, it stops being a test.
+        const double lumSky = (double)Hosek::luma709(Esky);
+        const double lumSun = (double)Hosek::luma709(EsunN);
+        const double EtotW  = lumSky + lumSun * (double)sinE;
+        p.EskyLux  = lumSky * 683.0;
+        p.EsunLux  = lumSun * 683.0;
+        p.sunShare = (EtotW > 1.0e-9) ? (lumSun * (double)sinE / EtotW) : 0.0;
+        {
+            const float zdir[3] = { 0.0f, 0.0f, 1.0f };
+            float Lz[3];
+            Hosek::radiance(p.st, zdir, Lz);
+            p.qZenith = (EtotW > 1.0e-9) ? ((double)Hosek::luma709(Lz) / (EtotW / Hosek::kPi)) : 0.0;
+        }
+        p.active = true;
+        g_skyPhys = p;
     }
 
     // The measurement, shared by the heartbeat that REPORTS it and the button that ACTS on it, so
@@ -15764,6 +16424,17 @@ namespace ForgeRender {
             else if (lvl > (double)ct.hi) { want = g_exposure * calGainDomain((double)ct.hi) / gm; }
             // ...and inside [lo,hi] `want` stays put: the dead zone IS the target range, so the
             // level floats across the envelope instead of being pinned to a point inside it.
+        }
+        // Rail contact, measured on the DESTINATION rather than on the state: `want` is what the
+        // loop asked for, so a clamp here is the servo being refused, while g_exposure hitting a
+        // limit could just be the lag passing through. Recorded before the clamp overwrites it.
+        const int railNow = (want < (double)g_expMin) ? -1 : ((want > (double)g_expMax) ? 1 : 0);
+        if (railNow != 0 && railNow == g_expRail) {
+            g_expRailMs += dt * 1000.0;
+            g_expRailWorstMs = std::max(g_expRailWorstMs, g_expRailMs);
+        } else {
+            g_expRail   = railNow;
+            g_expRailMs = (railNow != 0) ? (dt * 1000.0) : 0.0;
         }
         want = std::max((double)g_expMin, std::min((double)g_expMax, want));
 
@@ -15978,6 +16649,60 @@ namespace ForgeRender {
         // RESOLVED whole-frame GPU execution timestamp, read a frame late.
         g_lastGpuMs = g_lastGpuPhaseMs[kGpuPhaseFrame];
         g_gpuAccum += g_lastGpuMs;
+
+        // ─── P2: THE C++/FSL CROSS-CHECK, REPORTED ONCE ─────────────────────────────────────────
+        // The model is evaluated twice, in two languages, and the two halves feed the sky and the
+        // light respectively. This is the measurement that says they agree — read here because here
+        // is where a readback becomes valid, and reported ONCE because it is a self-test.
+        //
+        // ⚠ NOTHING ELSE IN THE PHYSICAL SKY MEANS ANYTHING UNTIL THIS LINE READS OK. A shader that
+        // has quietly diverged from the host's evaluation produces a sky that looks plausible and
+        // lights the world with a different one, which is the failure the whole step exists to
+        // remove and the one that is invisible by inspection.
+        if (g_hosekCheckState == 1 && g_live.pHosekReadback
+            && g_live.pHosekReadback->pCpuMappedAddress) {
+            const uint32_t* hr = (const uint32_t*)g_live.pHosekReadback->pCpuMappedAddress;
+            double worst = 0.0; uint32_t ran = 0, worstDir = 0;
+            float worstGpu[3] = {}, worstCpu[3] = {};
+            for (uint32_t i = 0; i < kHosekCheckDirs; ++i) {
+                if (hr[i * 4 + 3] != 1u) { continue; }
+                ++ran;
+                float d[3];
+                Hosek::fibDir((int)i, (int)kHosekCheckDirs, d);
+                float cpu[3];
+                Hosek::radiance(g_skyPhys.st, d, cpu);
+                float gpu[3];
+                for (int c = 0; c < 3; ++c) { std::memcpy(&gpu[c], &hr[i * 4 + c], sizeof(float)); }
+                for (int c = 0; c < 3; ++c) {
+                    const double den = std::max(1.0e-4, (double)std::fabs(cpu[c]));
+                    const double rel = std::fabs((double)gpu[c] - (double)cpu[c]) / den;
+                    if (rel > worst) {
+                        worst = rel; worstDir = i;
+                        worstGpu[0] = gpu[0]; worstGpu[1] = gpu[1]; worstGpu[2] = gpu[2];
+                        worstCpu[0] = cpu[0]; worstCpu[1] = cpu[1]; worstCpu[2] = cpu[2];
+                    }
+                }
+            }
+            if (ran == 0u) {
+                LOG::logline("!! [forge-hosek] cross-check DID NOT RUN (0 of %u threads reported) —"
+                             " the physical sky's C++/FSL agreement is UNVERIFIED", kHosekCheckDirs);
+            } else {
+                // 1e-3 is a FLOAT-PRECISION gate, not a tolerance for being a bit wrong: the two
+                // evaluations differ only in fp contraction and in acos/exp implementations, so a
+                // real divergence (a swapped coefficient, a dropped term, a wrong lane) lands orders
+                // of magnitude above it. Anything between the two is worth reading the numbers for,
+                // which is why the worst direction's actual values are printed rather than a verdict.
+                const bool ok = (worst < 1.0e-3);
+                LOG::logline("%s [forge-hosek] cross-check %s: max rel deviation %.3e over %u dirs"
+                             " (frame %u; worst dir %u: gpu %.5f %.5f %.5f vs cpu %.5f %.5f %.5f)",
+                             ok ? ">>" : "!!", ok ? "OK" : "**DIVERGED**", worst, ran,
+                             g_hosekCheckArmedFrame, worstDir,
+                             (double)worstGpu[0], (double)worstGpu[1], (double)worstGpu[2],
+                             (double)worstCpu[0], (double)worstCpu[1], (double)worstCpu[2]);
+            }
+            LOG::flush();
+            g_hosekCheckState = 2;
+        }
 
         // Stage B (B2): GPU cull counters. [0] = frustum survivors (compare to the CPU cull's
         // g_liveLastInst in the heartbeat — they MUST match); [1] = M2 Hi-Z-occluded.
@@ -16350,6 +17075,47 @@ namespace ForgeRender {
             // as encode -> curve -> authored. Reverse the two and the fog comes back wrong by
             // exactly one gamma, which reads as a washed-out horizon rather than as a broken one.
             decodeAuthoredRGB(fd + 28);
+            // ─── P2: THE PHYSICAL SKY, MEASURED AND APPLIED TO THE LIGHT ─────────────────────────
+            // THE one site, inherited from P1's anchor and for the same reason it was the one site:
+            // everything the measurement needs is finished by this line and nothing else in the
+            // frame has read the results yet — sunCol/ambCol are decoded AND post-gain (the CAL
+            // block above), and every truncated gFrameData copy (mirror, sun, first-person) is made
+            // further down, so all of them inherit whatever is written here.
+            //
+            // ⚠ THIS IS THE LINE THAT MOVES ALL EXTERIOR LIGHTING AT ONCE. At the reference
+            // configuration the physical pair is sun:ambient = 6.06 against MW's authored 1.79 —
+            // real clear skies genuinely are that contrasty, and MW's ratio is a display preference
+            // — so shadows get markedly darker the moment the blend leaves 0. That is the single
+            // highest-severity risk in the step and the blend lane is the whole mitigation:
+            // g_skyPhysBlend 0 leaves fd[20..26] BIT-IDENTICAL, so a regression anywhere is
+            // bisectable against one slider inside one session.
+            //
+            // ⚠ THE CAL GAINS DO NOT APPLY TO THE PHYSICAL SIDE, and that is not an oversight.
+            // g_calSunGain/g_calAmbGain calibrate MW's AUTHORED pair toward an authored ratio; a
+            // physical pair has no such freedom — its ratio is the atmosphere's. They are already
+            // folded into fd[20..26] above, so they weight only the blend's MW end, which is exactly
+            // the semantics wanted: at blend 0 the calibrated MW image, at blend 1 the physics.
+            //
+            // ⚠ AND THE NIGHT RAMP RIDES THE BLEND, NOT THE LIGHT. Fading the model out while the
+            // blend stayed at 1 would drive ambCol to zero at dusk and leave the world with no light
+            // at all — and calTarget()'s night row only means something if the servo has a lit
+            // ground to meter. So at night the lighting hands back to MW's authored night ambient
+            // while the SKY (which takes the ramp directly, in gSkyView.radiance.w) goes black. Two
+            // different jobs, one continuous ramp, no step at dawn. See hosek.h.
+            // fd[19] / fd[27] are sunDir.w and ambCol.w — two padding lanes no FSL reads, carrying
+            // MW's SUN DISC as an elevation sine and an azimuth. That is a DIFFERENT sun from
+            // fd[16..18]: the disc sits ~29 degrees off the light direction and, unlike the light,
+            // it actually SETS. Both facts are load-bearing; see skyPhysicalMeasure.
+            skyPhysicalMeasure(fd + 16, fd[19], fd[27]);
+            if (g_skyPhys.active) {
+                const float w = std::max(0.0f, std::min(1.0f, g_skyPhysBlend)) * g_skyPhys.nightRamp;
+                if (w > 0.0f) {
+                    for (int c = 0; c < 3; ++c) {
+                        fd[20 + c] += w * (g_skyPhys.sunScene[c] - fd[20 + c]);
+                        fd[24 + c] += w * (g_skyPhys.ambScene[c] - fd[24 + c]);
+                    }
+                }
+            }
             // ...and a LATCH of the same colour as MW authored it, for the unified water fog, whose
             // target is `UnderwaterColor*w + fogColour*(1-w)` and therefore needs the fog colour
             // BEFORE either conversion. Latched here rather than recovered later by running the
@@ -16780,6 +17546,10 @@ namespace ForgeRender {
                 for (int k = 0; k < 16; ++k) { camInvVP[k] = (k % 5 == 0) ? 1.0f : 0.0f; }
             }
             std::memcpy(cp, camInvVP, 16 * sizeof(float));
+            // P2 — the MAIN view's gSkyView, published from the same inverse and in the same breath,
+            // so the two cannot describe different frames. The mirror's twin is published beside
+            // mirrorVP in the reflect pass, which is the only other place that matrix exists.
+            publishSkyView(0, camInvVP);
             cp[16] = (float)g_live.width;        cp[17] = (float)g_live.height;
             cp[18] = 1.0f / (float)g_live.width; cp[19] = 1.0f / (float)g_live.height;
             // ...and the ALLOCATION size, which is NOT the same number. Every screen-sized RT is
@@ -16827,6 +17597,10 @@ namespace ForgeRender {
             // some other subsystem came up. 1.0 is today's image byte for byte.
             cp[kCalFloat + 0] = std::max(0.0f, g_calEmisGain);
             cp[kCalFloat + 1] = 1.0f;   // reserved: the exposure servo's multiplier
+            // ⚠ kCalFloat + 2 IS SPARE AGAIN. It carried P1's photometric anchor, which sky.frag
+            // multiplied by; P2 retires the anchor outright rather than leaving it at 1.0, because a
+            // dead knob that still multiplies is how the next reader loses a day. The lane is
+            // written 0 so a stale receiver reads a value that is obviously not a scale.
             cp[kCalFloat + 2] = 0.0f;
             cp[kCalFloat + 3] = 0.0f;
         }
@@ -18256,6 +19030,38 @@ namespace ForgeRender {
         // other trigger — the height map changing under it — is handled inside the call above, which
         // is why this one only has to watch the sun. Also almost always a no-op.
         rebuildSunOccMap(/*force*/false);
+
+        // ─── P2: THE C++/FSL CROSS-CHECK, DISPATCHED ONCE ────────────────────────────────────────
+        // Here because here is the last point in the frame with no render target bound, and because
+        // gSkyView has already been published this frame (both the coefficients and the main view's
+        // matrix are written before recording begins). It reads the SAME cbuffer skyhw.frag will
+        // read a few hundred lines below — that sharing is the point, see hosekcheck.srt.h.
+        //
+        // ONE dispatch per host session, on the first frame the model is actually armed. 64 threads;
+        // the copy is 1 KB. Reported by settleFrameFence at the top of the NEXT frame.
+        if (g_hosekCheckState == 0 && g_skyPhys.active && g_skyViewPub[0]
+            && g_live.pHosekCheckPipeline && g_live.pHosekCheckSet && g_live.pHosekOutBuf) {
+            cmdBeginDebugMarker(g_live.pCmd, 0.9f, 0.6f, 0.2f, "Hosek C++/FSL cross-check");
+            cmdBindPipeline(g_live.pCmd, g_live.pHosekCheckPipeline);
+            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pHosekCheckSet);
+            cmdDispatch(g_live.pCmd, 1, 1, 1);
+            if (g_live.pHosekReadback) {
+                BufferBarrier hb = {};
+                hb.pBuffer = g_live.pHosekOutBuf;
+                hb.mCurrentState = RESOURCE_STATE_UNORDERED_ACCESS;
+                hb.mNewState     = RESOURCE_STATE_COPY_SOURCE;
+                cmdResourceBarrier(g_live.pCmd, 1, &hb, 0, nullptr, 0, nullptr);
+                g_live.pCmd->mDx.pCmdList->CopyBufferRegion(
+                    g_live.pHosekReadback->mDx.pResource, 0, g_live.pHosekOutBuf->mDx.pResource, 0,
+                    (UINT64)sizeof(uint32_t) * kHosekCheckDirs * 4);
+                hb.mCurrentState = RESOURCE_STATE_COPY_SOURCE;
+                hb.mNewState     = RESOURCE_STATE_UNORDERED_ACCESS;
+                cmdResourceBarrier(g_live.pCmd, 1, &hb, 0, nullptr, 0, nullptr);
+            }
+            cmdEndDebugMarker(g_live.pCmd);
+            g_hosekCheckState = 1;
+            g_hosekCheckArmedFrame = g_renderFrame;
+        }
 
         gpuPhaseBegin(kGpuPhaseCull);
 
@@ -20094,6 +20900,20 @@ namespace ForgeRender {
             // matrix. 288B covers through skyZenith (float 68..71) so the reflected dome gradient matches.
             std::memcpy(g_live.pReflectFrameCbv->pCpuMappedAddress, fcbvR, 288);
             std::memcpy(g_live.pReflectFrameCbv->pCpuMappedAddress, mirrorVP, 64);
+            // P2 — the MIRROR's gSkyView, from the mirror matrix, at the ONE place that matrix
+            // exists. Reconstructing a ray from inv(mirrorVP) returns the direction in REAL world
+            // space of whatever is drawn at that pixel: mirrorVP maps p -> (p*Mirror)*VP, so its
+            // inverse maps NDC back through Mirror, and a DIFFERENCE of two such points is the
+            // mirrored ray direction — i.e. exactly the reflected ray the water wants. The main
+            // view's matrix would have returned the main view's sky in the water, which is what
+            // gSkyView exists to prevent (skyview.h.fsl) and what the mirror test in the plan checks.
+            {
+                float reflInvVP[16];
+                if (!invert4x4(mirrorVP, reflInvVP)) {
+                    for (int k = 0; k < 16; ++k) { reflInvVP[k] = (k % 5 == 0) ? 1.0f : 0.0f; }
+                }
+                publishSkyView(1, reflInvVP);
+            }
 
             // Into the pass: pReflectColor SHADER_RESOURCE -> RENDER_TARGET, and (W4c) pReflectDepth
             // SHADER_RESOURCE -> DEPTH_WRITE. The depth used to sit in DEPTH_WRITE permanently; it
@@ -20164,8 +20984,35 @@ namespace ForgeRender {
             // (dlReflectGeoCull: nz = -nz, dw = -dw) so the half-space it keeps IS the seabed, i.e.
             // exactly the total-internal-reflection content; only the sky was wrong. Interiors have
             // no sky list and skip this on their own.
+            // --- P2: THE PHYSICAL SKY, MIRROR SIDE ---------------------------------------------
+            // Drawn FIRST, into the just-cleared reflect target and inside the horizon scissor, from
+            // pSkyViewCbv[1] — the mirror's OWN invViewProj. It is opaque, so the reflect RT comes
+            // out alpha 1 wherever the scissor let it draw, and water.frag's
+            // `reflSample.rgb + fogCol*(1 - reflSample.a)` fallback stops firing: the mirror shows a
+            // real reflected sky instead of flat fog colour wherever nothing else drew.
+            // NOT underwater, on the same grounds the MW sky draw below is refused there: the
+            // underside of the surface reflects the SEABED, never the sky.
+            const bool drawReflSkyHw = g_skyPhys.active && g_skyViewPub[1] && !underwaterR
+                                    && g_live.pSkyHwPipeline && g_live.pPerBatchSetReflectSky;
+            if (drawReflSkyHw) {
+                cmdBeginDebugMarker(g_live.pCmd, 0.4f, 0.6f, 1.0f, "Physical sky (mirror)");
+                cmdBindPipeline(g_live.pCmd, g_live.pSkyHwPipeline);
+                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSetReflect);
+                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerLightsSet);
+                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
+                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerBatchSetReflectSky);
+                cmdDraw(g_live.pCmd, 3, 0);
+                cmdEndDebugMarker(g_live.pCmd);
+            }
+
             uint32_t nSkyR = 0, reflSkyDrawn = 0;
-            const bool drawReflSky = skyBlob && skyCount && skyBytes && !underwaterR
+            // ⚠ THE MW SKY LOOP IS GATED ON g_drawSky HERE TOO SINCE P2, and it was not before. The
+            // main loop has always had that gate; the mirror's omission was invisible while both
+            // drew the same dome. It is not invisible now — with the physical sky suppressing MW's
+            // sky in the main view, an ungated mirror would reflect MW's dome over the H-W field and
+            // the water would disagree with the sky above it.
+            const bool drawReflSky = g_drawSky && !drawReflSkyHw
+                                  && skyBlob && skyCount && skyBytes && !underwaterR
                                   && g_live.pSkyPipeline && g_live.pReflectSkyWorldsBuf;
             if (drawReflSky) {
                 const uint32_t haveSkyR = skyBytes / (uint32_t)sizeof(IPC::SkyDrawWire);
@@ -20383,7 +21230,37 @@ namespace ForgeRender {
         // after the per-frame re-upload promotes them) — handle both. Capped at kMaxSkyDraws.
         uint32_t skyDrawn = 0;
         gpuPhaseBegin(kGpuPhaseColorSky);
-        if (g_drawSky && skyBlob && skyCount && skyBytes && g_live.pSkyPipeline && g_live.pSkyWorldsBuf) {
+
+        // --- P2: THE PHYSICAL SKY (skyhw.frag), BEFORE EVERYTHING ---------------------------------
+        // A fullscreen Hosek-Wilkie field with blend and depth OFF, into the target that was just
+        // cleared. It is the BACKDROP: the opaque world's replace-blend draws over it, so it ends up
+        // behind exactly as the dome did — but it covers the whole sphere, so there is no lower rim
+        // for the horizon band to be needed at, and nothing left for waterfill's above-water hole
+        // fill to do out here.
+        //
+        // ⚠ IT SUPPRESSES MW'S SKY LOOP RATHER THAN DRAWING OVER IT. Two skies compositing would put
+        // MW's authored display code back on top of a physical field — the exact confusion §0.6
+        // found three of. The client keeps packing the sky list and the host ignores it: wasteful for
+        // one phase, and the right trade against touching the IPC wire twice (moons, stars and
+        // nebulae come back through that same list next phase).
+        //
+        // ⚠ EXTERIOR-GATED, through g_skyPhys.active. An interior must never acquire a sky, and a
+        // fullscreen opaque write is the one kind of pass where getting that wrong is total.
+        const bool drawSkyHw = g_skyPhys.active && g_skyViewPub[0]
+                            && g_live.pSkyHwPipeline && g_live.pPerBatchSetSky;
+        if (drawSkyHw) {
+            cmdBeginDebugMarker(g_live.pCmd, 0.4f, 0.6f, 1.0f, "Physical sky (Hosek-Wilkie)");
+            cmdBindPipeline(g_live.pCmd, g_live.pSkyHwPipeline);
+            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSet);
+            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerLightsSet);
+            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
+            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerBatchSetSky);
+            cmdDraw(g_live.pCmd, 3, 0);
+            cmdEndDebugMarker(g_live.pCmd);
+        }
+
+        if (!drawSkyHw && g_drawSky && skyBlob && skyCount && skyBytes
+            && g_live.pSkyPipeline && g_live.pSkyWorldsBuf) {
             const uint32_t haveSky = skyBytes / (uint32_t)sizeof(IPC::SkyDrawWire);
             uint32_t nSky = (skyCount < haveSky) ? skyCount : haveSky;
             if (nSky > kMaxSkyDraws) { nSky = kMaxSkyDraws; }
@@ -23041,12 +23918,74 @@ namespace ForgeRender {
                 if (cr.gSun > 0.0)   { std::snprintf(solveTxt, sizeof(solveTxt),
                                                      "sun x%.2f amb x%.2f (sum held)", cr.gSun, cr.gAmb); }
                 else                 { std::snprintf(solveTxt, sizeof(solveTxt), "n/a"); }
+                // ⚠ `target=` STILL DOUBLES AS AN ASSERT, BUT ON A DIFFERENT QUESTION SINCE P2.
+                // While P1's anchor lived, it asserted that scaling the sky had not disturbed the
+                // sun:ambient calibration. Now it says which END OF THE BLEND the frame is on:
+                // calSunAmbTarget() states what MW's AUTHORED pair should be calibrated to (1.79 at
+                // the restored 80/128 rows), and the PHYSICAL pair's ratio is the atmosphere's —
+                // measured 6.06 at the reference configuration. So `ratio=` sitting far above
+                // `target=` at full blend is EXPECTED and is the tell that the physics is armed;
+                // `ratio=` landing on `target=` means the blend is at 0. The physical numbers
+                // themselves are on the [sky] line below, which is where P2 reports.
                 LOG::logline(">> [forge-hb][light] sunDir=(%.4f,%.4f,%.4f) sunCol=(%.4f,%.4f,%.4f) ambCol=(%.4f,%.4f,%.4f)"
                              " eyeAbs=(%.0f,%.0f,%.0f)"
                              " | ratio=%s target=%.2f(ndl=1) knob=%.2f | at-ndl=%s | solve: %s",
                              lf[16], lf[17], lf[18], lf[20], lf[21], lf[22], lf[24], lf[25], lf[26],
                              lf[56], lf[57], lf[58],   // lodEye = ABSOLUTE world eye (viewer start pos)
                              ratioTxt, calSunAmbTarget(), (double)g_calRatioTarget, ndlTxt, solveTxt);
+                // ─── P2 — THE PHYSICAL SKY, AND EVERY NUMBER HERE IS A FALSIFICATION TEST ────────
+                // Nothing on this line is tuned to; all of it is REPORTED, which is the only way the
+                // §0 measurements stay tests rather than targets:
+                //
+                //   q      — L_zenith / (E_total/pi), the albedo-free scale-invariant invariant §0
+                //            is built on. Real clear skies: 0.122 median, p25..p75 0.093..0.148. MW's
+                //            authored sky read 0.265. The model should land INSIDE that band without
+                //            being told to; at the reference configuration it computes 0.100.
+                //   sun%   — E_sun_horizontal / E_total. Real clear skies ~0.80 (p25..p75 0.73..0.84),
+                //            and 0.80 at the reference is not a coincidence — it is the anchor the
+                //            sun's absolute level was solved against (hosek.h). Away from the
+                //            reference it is a genuine prediction, and it should FALL toward dusk.
+                //   sky/sun lx — the sky's horizontal illuminance and the sun's DIRECT-NORMAL
+                //            illuminance. The sun peaks near 109 klx with the sun overhead, against a
+                //            textbook sea-level maximum of ~110. A number far outside that says the
+                //            beam anchor or the transmittance is wrong, not the sky.
+                //   amb/sun — the physical pair in SCENE units, i.e. exactly what was blended into
+                //            gFrameData at the decode site, and their ratio, which is the honest
+                //            version of the `ratio=` above.
+                //   ramp   — the night ramp. It fades the SKY to black and hands the LIGHTING back
+                //            to MW at once, so a value between 0 and 1 is dawn/dusk, not a fault.
+                if (g_skyPhys.active) {
+                    const double ambL = (double)Hosek::luma709(g_skyPhys.ambScene);
+                    const double sunL = (double)Hosek::luma709(g_skyPhys.sunScene);
+                    //   elev / light — MW'S TWO SUNS, side by side. `elev` is the DISC, which is what
+                    //            the model is cooked at and what actually SETS; `light` is the
+                    //            sgSunlight direction that drives every lighting term, sits ~29
+                    //            degrees away from the disc, and BOUNCES back above the horizon at
+                    //            night instead of setting. Expect them to differ all day and to
+                    //            diverge completely after dusk, when `elev` goes negative and
+                    //            `light` does not. ⚠ Step MW's hour across dusk and watch `elev`
+                    //            reach 0: MW flips the disc when its own sunVis byte hits zero, so
+                    //            if that happens AT the horizon the crossing is continuous, and if
+                    //            MW holds sunVis up past it, `elev` STEPS in one frame and the sky
+                    //            snaps. That is the one thing about this port MGE's source cannot
+                    //            settle, so it is on the line instead of in a comment.
+                    LOG::logline(">> [forge-hb][sky] HW T=%.1f alb=%.2f elev=%.2fdeg (light=%.2fdeg)"
+                                 " ramp=%.2f blend=%.2f"
+                                 " | q=%.4f (real 0.122, p25-p75 0.093-0.148) sun%%=%.3f (real ~0.80)"
+                                 " | sky=%.0flx sunNormal=%.0flx"
+                                 " | scene amb=%.4f sun=%.4f ratio=%.2f | unit=%.0fcd/m2",
+                                 (double)g_skyPhys.st.turbidity, (double)g_skyPhys.st.albedo,
+                                 (double)g_skyPhys.st.elevation * 180.0 / Hosek::kPi,
+                                 (double)g_skyPhys.elevLight,
+                                 (double)g_skyPhys.nightRamp, (double)g_skyPhysBlend,
+                                 g_skyPhys.qZenith, g_skyPhys.sunShare,
+                                 g_skyPhys.EskyLux, g_skyPhys.EsunLux,
+                                 ambL, sunL, (ambL > 1.0e-9) ? (sunL / ambL) : 0.0,
+                                 Hosek::kSceneUnitCd);
+                } else {
+                    LOG::logline(">> [forge-hb][sky] HW OFF (%s) — MW's sky mesh and MW's lighting",
+                                 g_skyHw ? "interior / no sun" : "master toggle");
+                }
             }
             LOG::logline(">> [forge-hb] frame=%u drawn=%u skinned=%u(blend=%u zpre=%u) multimap=%u sky=%u alpha=%u(zpre=%u) dynamic=%u meshHigh=%u "
                          "| refl sky=%u near=%u skin=%u mm=%u "
@@ -23296,11 +24235,27 @@ namespace ForgeRender {
                 // comparable — a scene mean taken at sky=0.45 and one at sky=0.05 sampled very
                 // different parts of the world even though both say `scene`.
                 const double cover = g_aplCoverAccum * inv;
+                // ⚠ RAIL CONTACT (P2), and it is NOT decoration either. The clamp was widened from
+                // five stops to twenty for the physical sky's day-night cycle, which trades the
+                // guard it used to be for the range it now needs — and a servo pinned AT its limit
+                // is indistinguishable from one that happens to want that value unless the pinning
+                // is reported. `free` is the healthy state; `MIN 4.2s` means the loop has been
+                // refused for 4.2 seconds and the answer is a CAL gain or a calTarget row, not a
+                // bigger clamp. `worst` is the longest contact this session, so a night spent on the
+                // rail is still visible in the morning.
+                char railTxt[48];
+                if (g_expRail == 0) {
+                    std::snprintf(railTxt, sizeof(railTxt), "free(worst %.1fs)", g_expRailWorstMs * 0.001);
+                } else {
+                    std::snprintf(railTxt, sizeof(railTxt), "**%s %.1fs**(worst %.1fs)",
+                                  (g_expRail < 0) ? "MIN" : "MAX",
+                                  g_expRailMs * 0.001, g_expRailWorstMs * 0.001);
+                }
                 LOG::logline(">> [forge-hb] apl: mean=(%.4f,%.4f,%.4f) apl=%.4f geo=%.4f"
                              " cast=(%.3f,%.3f,%.3f) n=%u [%s sky=%.0f%%]"
                              " | lvl mean=%.0f p10=%.0f p50=%.0f p90=%.0f"
                              " | target[%s]=%.0f-%.0f need=%.2f-%.2fx(%s)"
-                             " exp=%.2f(%s,%s,%s) cal=(sun %.2f amb %.2f emis %.2f)",
+                             " exp=%.3g(%s,%s,%s) rail=%s cal=(sun %.2f amb %.2f emis %.2f)",
                              r, g, b, apl, geo, r * n, g * n, b * n, g_aplN,
                              g_aplSkipSky ? "scene" : "frame", 100.0 * (1.0 - cover),
                              meanLvl, g_aplPctAccum[0] * inv, g_aplPctAccum[1] * inv,
@@ -23311,6 +24266,7 @@ namespace ForgeRender {
                              g_expEnable ? "servo" : "OFF",
                              (g_expStat < 0.5f) ? "mean" : ((g_expStat < 1.5f) ? "p90" : "geo"),
                              agxActive() ? "agx" : "legacy",
+                             railTxt,
                              g_calSunGain, g_calAmbGain, g_calEmisGain);
             }
             dlLogHeartbeat();
@@ -32036,6 +32992,13 @@ namespace ForgeRender {
         if (g_live.pSkyPipeline)            { removePipeline(R, g_live.pSkyPipeline); }
         if (g_live.pSkyPipelineAdd)         { removePipeline(R, g_live.pSkyPipelineAdd); }
         if (g_live.pSkyShader)              { removeShader(R, g_live.pSkyShader); }
+        // P2 physical sky. The two per-view cbuffers are bound into pPerBatchSetSky /
+        // pPerBatchSetReflectSky, so they go after those sets are torn down (this one above, the
+        // reflect one with the rest of the reflect objects).
+        if (g_live.pSkyHwPipeline)          { removePipeline(R, g_live.pSkyHwPipeline); }
+        if (g_live.pSkyHwShader)            { removeShader(R, g_live.pSkyHwShader); }
+        if (g_live.pSkyViewCbv[0])          { removeResource(g_live.pSkyViewCbv[0]); }
+        if (g_live.pSkyViewCbv[1])          { removeResource(g_live.pSkyViewCbv[1]); }
         if (g_live.pDebugLineVB)            { removeResource(g_live.pDebugLineVB); }
         if (g_live.pDebugLinePipeline)      { removePipeline(R, g_live.pDebugLinePipeline); }
         if (g_live.pDebugLineShader)        { removeShader(R, g_live.pDebugLineShader); }
@@ -32286,6 +33249,13 @@ namespace ForgeRender {
         if (g_live.pAplReadback)    { removeResource(g_live.pAplReadback);     g_live.pAplReadback = nullptr; }
         if (g_live.pAplOut)         { removeResource(g_live.pAplOut);          g_live.pAplOut = nullptr; }
         if (g_live.pAplParamsCbv)   { removeResource(g_live.pAplParamsCbv);    g_live.pAplParamsCbv = nullptr; }
+        // P2 Hosek cross-check — same set -> pipeline -> shader -> buffers order.
+        if (g_live.pHosekCheckSet)      { removeDescriptorSet(R, g_live.pHosekCheckSet); g_live.pHosekCheckSet = nullptr; }
+        if (g_live.pHosekCheckPipeline) { removePipeline(R, g_live.pHosekCheckPipeline); g_live.pHosekCheckPipeline = nullptr; }
+        if (g_live.pHosekCheckShader)   { removeShader(R, g_live.pHosekCheckShader);     g_live.pHosekCheckShader = nullptr; }
+        if (g_live.pHosekReadback)      { removeResource(g_live.pHosekReadback);         g_live.pHosekReadback = nullptr; }
+        if (g_live.pHosekOutBuf)        { removeResource(g_live.pHosekOutBuf);           g_live.pHosekOutBuf = nullptr; }
+        if (g_live.pHosekDirsBuf)       { removeResource(g_live.pHosekDirsBuf);          g_live.pHosekDirsBuf = nullptr; }
         // Custom MSAA resolve (step 4) — same set -> pipeline -> shader -> buffer order.
         if (g_live.pResolveSet)      { removeDescriptorSet(R, g_live.pResolveSet); g_live.pResolveSet = nullptr; }
         if (g_live.pResolvePipeline) { removePipeline(R, g_live.pResolvePipeline); g_live.pResolvePipeline = nullptr; }

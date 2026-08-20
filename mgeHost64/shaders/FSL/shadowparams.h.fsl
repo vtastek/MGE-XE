@@ -396,5 +396,15 @@ STRUCT(ShadowMaskParams)
     // handover. Read the note beside g_calSunGain before merging them.
     // yzw spare — y is where the exposure servo's value will land, which is why this is its own
     // float4 rather than the two free lanes of toneParams.
+    //
+    // ⚠ z BRIEFLY CARRIED THE SKY'S PHOTOMETRIC ANCHOR (P1, tasks/forge-physical-sky.md) — a
+    // per-frame scale sky.frag multiplied MW's authored sky by, so the sky sat at the physical level
+    // for the light MW said it cast. P2 retires the reproduction outright: skyhw.frag GENERATES the
+    // sky from a Hosek-Wilkie radiance field that also supplies the sun and the ambient, so there is
+    // no authored sky left to anchor. The host writes 0 there now, which is obviously not a scale —
+    // a lane left at 1.0 would read as a live identity multiply and invite the next reader to "fix"
+    // it. Do NOT resurrect a sky scale here: the physical sky's lanes live in gSkyView
+    // (skyview.h.fsl) on a PER-VIEW cbuffer, precisely because THIS struct is bound by POINTER into
+    // every PerFrame set and so cannot carry anything the mirror needs a different value of.
     DATA(float4,   calParams,       None);
 };

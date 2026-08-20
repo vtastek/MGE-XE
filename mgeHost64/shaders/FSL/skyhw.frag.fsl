@@ -1,0 +1,98 @@
+// mgeHost64 — THE PHYSICAL SKY (tasks/forge-physical-sky.md P2). A fullscreen Hosek-Wilkie field.
+//
+// This retires the dome. MW's sky was a MESH carrying 32 authored per-vertex atmosphere colours and
+// a painted horizon band, and §0 measured what that costs: q = L_sky/(E_total/pi) = 0.265 against
+// 0.122 for real clear skies (+1.13 stops), and a 2-colour vertical lerp that returns ONE number for
+// the whole ring at a given elevation — where a real sky brightens up to 5x toward the sun and dips
+// BELOW its own zenith 60-90 degrees away from it. P1 corrected the level with a multiply. This
+// replaces the reproduction with a GENERATOR, and the level stops being something anyone sets: the
+// same radiance field lights the ground (publishSkyAmbientSH + the physical sun), the exposure servo
+// meters that ground, and wherever that puts the sky is by definition right.
+//
+// ⚠ NO liftInPass(), AND THAT IS THE POINT, NOT AN OMISSION. sky.frag is scenecolor.h.fsl CLASS 2 —
+// it reproduces a value MW authored, so the frame's curve has to hand that value back untouched.
+// This pass is CLASS 1/3: it MAKES UP radiance, in absolute units, with no authored target to
+// preserve. It gets exposed and tone-mapped like every other lit surface, which is the entire
+// difference between "a sky that is a display code" and "a sky that is light".
+//
+// ⚠ FULLSCREEN AND OPAQUE (alpha = 1 everywhere), which changes two contracts on purpose:
+//   - gSkyColor, the snapshot every fog site melts into (skydome.h.fsl), now has alpha 1 across the
+//     whole frame, so `s.rgb + fogColNear*(1-s.a)` collapses to `s.rgb`: fog melts into the REAL
+//     sky in every direction instead of into fogColNear below the dome's old rim. Below the horizon
+//     that copy used to be alpha 0, which is why hosekRadiance clamps to the horizon there rather
+//     than returning black — see the note in hosek.h.fsl.
+//   - the present seam sees full host coverage in exteriors, so MW's own frame stops showing through
+//     the band above the dome rim. waterfill.frag's above-water hole fill becomes a no-op there,
+//     which is what it was written to survive ("the failure mode is the old image, not a wrong one").
+//
+// ⚠ THE RAY IS DIFFERENCED FROM TWO POINTS, AND THAT ARITHMETIC IS LOAD-BEARING — copied verbatim
+// from waterfill.frag for the reason recorded there: under produce-mode-3 park the payload is
+// emitted relative to bakeEye and the view is restamped, so the camera sits at (eyeNow - bakeEye),
+// NOT at the origin. Normalising a single reconstructed point returns a ray tilted by
+// delta_eye/distance — zero standing still, proportional to speed when moving. A difference cancels
+// the origin, so the direction is exact without anyone having to know where the eye is.
+// [[project_park_restamp_eye_origin]]
+//
+// ⚠ AND THE MATRIX IS gSkyView's, NOT gShadowParams'. gShadowParams is bound BY POINTER into every
+// PerFrame set including the mirror's, so its invViewProj is always the MAIN view's — reconstructing
+// from it in the reflect pass would paint the main view's sky into the water. skyview.h.fsl explains
+// why that needed a second cbuffer.
+
+#include "opaque.srt.h"
+#include "hosek.h.fsl"      // hosekRadiance() — the model, second of two copies
+#include "tonemap.h.fsl"    // the curve, for the display-referred (LDR) build
+#include "linearize.h.fsl"  // linearToSrgb(), for the gamma-domain build
+#include "scenecolor.h.fsl" // tonemapInPass()/sceneIsLinear() — which units the target wants
+#include "waterfog.h.fsl"   // the sky is behind water too, exactly as sky.frag has to handle
+
+STRUCT(VSOutput)
+{
+    DATA(float4, Position, SV_Position);
+    DATA(float2, Uv,       TEXCOORD0);
+};
+
+ROOT_SIGNATURE(DefaultRootSignature)
+float4 PS_MAIN(VSOutput In)
+{
+    INIT_MAIN;
+
+    // TWO points on the SAME ray, differenced. 0.25/0.75 rather than 0/1: both stay clear of the
+    // reverse-Z far plane, where w can reach 0. Reverse-Z puts the NEARER sample at the LARGER
+    // device z, so the outward ray runs B -> A.
+    //
+    // In.Uv rather than In.Position.xy * invScreen (which is what waterfill uses): the fullscreen
+    // triangle already carries the normalised screen coordinate, and it is identical to
+    // (pixel + 0.5)/extent by construction. That matters here and did not there — this pass runs at
+    // TWO different resolutions (the main target and the 1024^2 mirror) off one shader, and taking
+    // the extent from a cbuffer would be one more thing that can be the wrong view's.
+    float2 ndc = float2(In.Uv.x * 2.0f - 1.0f, 1.0f - In.Uv.y * 2.0f);
+    float4 hpA = mul(gSkyView.invViewProj, float4(ndc, 0.25f, 1.0f));
+    float4 hpB = mul(gSkyView.invViewProj, float4(ndc, 0.75f, 1.0f));
+    float3 dir = normalize(hpA.xyz / hpA.w - hpB.xyz / hpB.w);
+
+    // Native W/(m^2 sr) -> SCENE units, with the night ramp and the strength lane already folded in
+    // host-side. A zero scale here is LEGITIMATE (night, feature off) and must read as a black sky.
+    float3 L = hosekRadiance(dir) * gSkyView.radiance.w;
+
+    // --- the sky is behind water too (W8) ----------------------------------------------------
+    // Verbatim the gate and the reasoning sky.frag carries: the sky has no POSITION, only a
+    // direction, and waterPathLength is homogeneous in the ray's length for both branches that
+    // matter, so pushing it out 1e5 units is exact rather than a fudge. Gated on the camera being
+    // SUBMERGED — above water a sky ray carries no water by construction.
+    if (waterFogCameraSubmerged()) {
+        float3 skyRel = dir * 1.0e5f;
+        L = waterFogBlend(L, L, skyRel, waterFogSample(skyRel));
+    }
+
+    // Which units does the target want (scenecolor.h.fsl). L is genuine LINEAR radiance, so:
+    // a gamma-domain target needs it encoded, and a display-referred target needs the curve applied
+    // here because nothing downstream will. Both are no-ops on the shipped path (linear + scene-
+    // referred), so this costs nothing and keeps the LDR build from showing a white sky.
+    if (!sceneIsLinear()) { L = linearToSrgb(L); }
+    L = tonemapInPass(L);
+
+    // Alpha 1 unconditionally — see the gSkyColor note in the header. The sky pass PSO for this
+    // draw has blending OFF, so this is a straight write and the value is not premultiplied by
+    // anything.
+    RETURN(float4(L, 1.0f));
+}

@@ -1219,6 +1219,19 @@ void DistantLand::setView(const D3DMATRIX* m) {
 
         // Sun position "bounces" at the horizon to follow night lighting instead of setting
         // Sun visibility goes to zero at night, so use this to correct the sun position so it sets
+        //
+        // WARNING: sunVis is NOT a night test. It is the sun disc's material alpha (see
+        // MWBridge::eSunVis), and MW fades it to zero for OVERCAST/RAIN/THUNDER/ASH/BLIGHT/BLIZZARD
+        // as well, so this correction also fires in broad daylight under bad weather. It survives
+        // here because every DX9 reader of sunPos below is itself gated on sunVis and so never sees
+        // a wrong frame. Do not copy the test to a consumer that isn't: the Forge client's physical
+        // sky did, and turned a rainstorm into midnight. It uses MW's sunrise/sunset schedule
+        // instead — MGE::WorldControllerView::sunAboveHorizon(), which carries the full account.
+        //
+        // Left as-is deliberately. sunPos.z is read UNGUARDED by the atmospheric-scattering fog
+        // adjustment further down (sunaltitude, ~line 873), whose result is written back into MW's
+        // scenegraph fog colour and shipped to the host as fogColNear — so correcting it here would
+        // move the F11 DX9 baseline and the host's fog together, which is a separate change.
         sunVis = mwBridge->GetSunVis() / 255.0f;
         if (sunVis == 0) {
             sunPos.z = -sunPos.z;
