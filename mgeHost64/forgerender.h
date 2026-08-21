@@ -243,6 +243,13 @@ namespace ForgeRender {
     // install never pulls the hooks in). MGE_RDOC=1 in the environment forces true.
     bool enableRdocCapture(bool allowLoad);
 
+    // Apply MGE_HOST_KNOBS="name=value,..." from the environment to the dev knobs, ONCE at
+    // startup. The perf harness runs minimized and nobody is at the dev panel, so without
+    // this an A/B that turns on a checkbox simply cannot be measured by the harness. Unknown
+    // names are logged and ignored — a silently-dropped typo would produce an "A/B" whose two
+    // arms are the same build. See the definition in forgerender.cpp for the knob table.
+    void applyEnvOverrides();
+
     // Arm N whole HOST frames for programmatic RenderDoc capture, from the client's numpad-0
     // one-shot. Bracketed host-side across renderScene boundaries rather than by RenderDoc's own
     // hotkey: the host never Presents (the client does, a frame or two later), so a UI-triggered

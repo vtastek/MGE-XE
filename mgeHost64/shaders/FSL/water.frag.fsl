@@ -387,6 +387,18 @@ float4 PS_MAIN( VSOutput In )
     // A correct HDR reflection shows coloured bands over the sun and specular highlights and NO
     // magenta. See the resolve note in reflectmip.comp.fsl for the other half of this.
     bool   hdrView       = (waterFlags & 131072u) != 0u;
+    // Bit 18: NO REFLECTION — a MEASUREMENT mode, not a look. It zeroes the Fresnel weight and the
+    // sun glint, leaving the pixel as the transmitted path alone: the water column and whatever is
+    // under it. Unlike waterDbg 1/2, which RETURN a raw tap and skip the composite entirely, this
+    // one runs the whole composite with one term removed — so what it leaves is still the shipped
+    // maths, and the difference between a reading taken with it and without it IS the reflection's
+    // share of the water. That is the number the APL split (apl.comp.fsl) exists to divide.
+    //
+    // ⚠ IT IS A PAIR EDIT AND THE PAIR IS WHY IT SITS HERE. `result = reflected*fresnel` and
+    // `kDst = 1 - fresnel` are formed from this one value below, so zeroing it BEFORE they are built
+    // moves both accumulators consistently — the destination gains exactly the weight the mirror
+    // gave up. Zeroing `result` after the fact instead would silently drop energy.
+    bool   noReflect     = (waterFlags & 262144u) != 0u;
     // W4b bits 6-11: reflection smear tap BUDGET (max anisotropy), 0/1 = OFF (a single isotropic
     // fetch at the minor-axis LOD, i.e. the shipped W4 look). Six bits, not four: the requirement is
     // 1/cosI and grazing water — which is most water — needs tens, so a 15 cap WAS the binding
@@ -1316,6 +1328,11 @@ float4 PS_MAIN( VSOutput In )
         float  cosU = dot(-EyeVec, nrm);
         float  fresnelU = physFresnel ? fresnelDielectricRough(cosU, alpha, kWaterIOR)
                                       : pow(saturate(1.12f - 0.65f * cosU), 8.0f);
+        // Bit 18 reaches under the surface too. Here it removes the TIR mirror, which outside
+        // Snell's 48.6-degree window is most of the view — so submerged, this mode is close to
+        // "show me only what came through the window", and the window's rim is where the two
+        // readings differ most.
+        if (noReflect) { fresnelU = 0.0f; }
         float3 resultU  = lerp(refractedU, reflectedU, fresnelU);
 
         // ⚠ AND THE SUN IS ALREADY IN THE REFRACTION — this term was a DOUBLE COUNT, inherited from
@@ -1436,6 +1453,8 @@ float4 PS_MAIN( VSOutput In )
         // way to a BRDF already.
         fresnel = kWaterF0 + pow(saturate(0.9988f - 0.28f * NoV), 16.0f);
     }
+    // Bit 18, applied at the ONE place all three arms have converged, so no arm can miss it.
+    if (noReflect) { fresnel = 0.0f; }
 
     // Reflection/refraction pixel distortion (wind strength increases it).
     float2 reffactor = distortAmp * normal.xy;
@@ -1958,7 +1977,13 @@ float4 PS_MAIN( VSOutput In )
     // to multiply, because its own melt was the raw `lerp(fogCol, result, fog)` it compounded with.)
     //
     // A pure OWN term: it adds nothing behind the surface, so kDst does not move.
-    result += tonemapInPass(spec);
+    //
+    // ⚠ AND BIT 18 HAS TO REACH IT, because the glint IS a reflection — of the sun's disc, off the
+    // same interface. It is not weighted by `fresnel` (it carries its own microfacet F), so zeroing
+    // that value above leaves it standing, and a "no reflection" reading that still contains the
+    // moon's glitter path is measuring the wrong thing. kDst does not move here for the reason the
+    // line above gives, so removing it needs no counterpart.
+    if (!noReflect) { result += tonemapInPass(spec); }
 
     // --- water cut feature (vtastek) ---
     float wdist = dist / lerp(1200.0f, 0.0f, saturate((-waterLevelRel) / 7.0f));

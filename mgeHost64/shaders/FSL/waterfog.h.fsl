@@ -419,16 +419,128 @@ void waterColumn(float3 worldPosRel, float L, bool openEnded, out float3 inscat,
     float3 tauView = sigT * L;
     trans = openEnded ? float3(0.0f, 0.0f, 0.0f) : exp(-tauView);
 
+    // --- W10: THE ISOTROPISATION BELOW IS HALF OF A SIMILARITY TRANSFORM, AND THIS IS THE OTHER
+    // HALF. Setting p -> 1 to stand in for multiple scattering is only legitimate as one side of the
+    // substitution (sigma_s, g) -> (sigma_s*(1-g), 0): an anisotropic medium behaves like an
+    // isotropic one that scatters LESS. Applying it to the phase alone does not approximate water,
+    // it replaces water with a medium that scatters 12.5x harder in every direction — and the
+    // saturated column is exactly where the whole pixel is that quantity.
+    //
+    // ⚠ THE ERROR IS ~8x AND IT WAS MEASURABLE AGAINST THIS FILE'S OWN K_d. The open-ended column
+    // converges to kInscatterSun * sigma_s/sigma_t, i.e. a QUARTER OF THE SINGLE-SCATTERING ALBEDO
+    // omega_0 = 0.195/0.396/0.559 at the shipped medium, so deep water returned 4.9/9.9/14.0% of
+    // the downwelling. Meanwhile K_d two blocks up is derived from sigma_s' = sigma_s*(1-g) with the
+    // medium's real g = 0.92 — the two halves of the same water disagreed by (1-g).
+    //
+    // ⚠ AND THE FIXED FORM IS CHECKABLE AGAINST A DERIVATION IT DOES NOT SHARE. With the transform
+    // applied, the open column returns 0.48/1.24/2.30%, against the analytic diffusion reflectance
+    // of the same medium, R = (1 - sqrt(1-omega'))/(1 + sqrt(1-omega')) = 0.48/1.28/2.41%. Within
+    // 4% in every channel, and nothing was fitted to make that happen: the 1/4 in kInscatterSun is
+    // hgNorm's 4pi over MW's sunCol = E/pi, and it lands on the diffusion answer by itself. Those
+    // are also the percentages ocean optics measures for real water, which is the point — no medium
+    // returns a tenth of what falls on it.
+    //
+    // ⚠ THE WEIGHT MUST BE THE PHASE'S OWN, and that is what keeps the near field untouched. A thin
+    // column (tauS ~ 0.2 — shallow water, the shoreline, anything a few metres deep) is genuinely
+    // single-scattering and keeps the true sigma_s with the true lobe; only the column that had
+    // already been handed p = 1 is handed the medium that goes with it.
+    //
+    // g arrives on the lane rather than as a second copy of 0.92: publishWaterFog sends
+    // kMediumG * strength, so lane 0 is `sigma_s*(1-0) == sigma_s` and reproduces the pre-W10 image
+    // bit for bit, and the medium's asymmetry can never drift between the two files.
+    float3 sigA   = max(sigT - sigS, float3(0.0f, 0.0f, 0.0f));
+    float  tauS   = ((sigS.r + sigS.g + sigS.b) * (1.0f / 3.0f)) * L;
+    float  wSingle= openEnded ? 0.0f : exp(-tauS);
+    float  wIso   = saturate(gShadowParams.waterFogPhase2.z) * (1.0f - wSingle);
+    float3 sigSi  = sigS * (1.0f - gShadowParams.waterFogPhase2.w);
+    // The in-scatter integral runs on the transformed pair; `trans` above does NOT, and that split is
+    // the delta-Eddington convention rather than an oversight. `trans` answers "how much of the
+    // IMAGE behind this water survives", which is a direct-transmission question and is governed by
+    // the beam attenuation c = sigma_t whatever the phase does. Similarity applies to the DIFFUSE
+    // field only.
+    float3 sigSm  = lerp(sigS, sigSi,        wIso);
+    float3 sigTm  = lerp(sigT, sigA + sigSi, wIso);
+    float3 tauViewM = sigTm * L;
+
     // The refracted sun's path length per unit depth, bounded in [1, 1.512] by the Snell window —
     // the identical derivation waterLightTransmit spells out, and the identical constants, because
     // the light reaching a point IN the column and the light reaching a surface UNDER it travelled
     // the same way down.
     float cosAir   = abs(gFrameData.sunDir.z);
     float cosWater = sqrt(max(1.0f - (1.0f - cosAir * cosAir) / (kWaterIOR * kWaterIOR), 0.0f));
-    float slantSun = 1.0f / max(cosWater, kWaterCosCrit);
+    float cosW     = max(cosWater, kWaterCosCrit);
+    float slantSun = 1.0f / cosW;
 
-    float3 iSun = waterInscatterSeg(sigT, kLgt, tauView, L, dNear, dFar, mEff, slantSun,      openEnded);
-    float3 iAmb = waterInscatterSeg(sigT, kLgt, tauView, L, dNear, dFar, mEff, kWaterDiffuse, openEnded);
+    // --- W12: WHAT THE BEAM LOSES CROSSING THE SURFACE, AND WHY ITS ABSENCE WAS A NIGHT BUG -------
+    //
+    // ⚠ kInscatterSun IS CORRECT FOR THE IRRADIANCE IT IS GIVEN, AND IT WAS BEING GIVEN THE WRONG
+    // ONE. The source term for a collimated beam is sigma_s * p * E, where E is the irradiance
+    // PERPENDICULAR TO THE BEAM — and the beam perpendicular to which E is measured changes at the
+    // surface. Take a horizontal patch of area A. It intercepts E0*A*cos(theta_air) of power. Below
+    // the surface that same power travels at theta_water through a cross-section of A*cos(theta_water),
+    // so
+    //
+    //     E_water = E0 * cos(theta_air) / cos(theta_water)     (and cos_air <= cos_water, ALWAYS)
+    //
+    // The beam is DILUTED on entry, by a factor that is 1 at the zenith and 0 at the horizon. It is
+    // the exact counterpart of the n^2 radiance GAIN this file already applies to the ambient
+    // (kInscatterAmb): Snell compresses solid angle — which concentrates radiance — and spreads the
+    // footprint — which dilutes irradiance. The renderer had one half and not the other.
+    //
+    // ⚠ AND IT IS ONLY MISSING FOR THE VOLUME. For a submerged SURFACE the two effects cancel
+    // exactly: the correct irradiance is E_water * cos(theta_water_to_normal), which on a horizontal
+    // seabed is E0 * cos(theta_air) — precisely what waterLightTransmit + the surface's own NdotL
+    // already produce. Horizontal-plane irradiance is conserved through refraction. A volume has no
+    // receiver cosine to cancel it, so this is the one place the factor has to be written down.
+    //
+    // ⚠ THE NET EFFECT ON A SATURATED COLUMN IS cos(theta_air), NOT cos_air/cos_water, and the other
+    // half is already here: `slantSun` makes the downwelling travel depth/cos_water, which attenuates
+    // it more and costs a further cos_water in the depth integral. (cos_air/cos_water) * cos_water =
+    // cos_air. That is the Lambertian-equivalent answer — a deep column behaves as a surface of
+    // albedo R under the horizontal irradiance E0*cos_air — reached from the beam side, which is a
+    // check on both.
+    //
+    // ⚠ WHY IT PRESENTED AS A NIGHT BUG. MW's directional never sets ([[project_mw_two_suns]]) — it
+    // is clamped to >= 13.8 degrees and at night carries a bright blue moonlight. The LAND is saved
+    // from that by its own NdotL; the column had nothing equivalent, so it drank the night
+    // directional at full strength. Measured on the Vos night save: water read 3.17x the land's APL
+    // and 5.6x in blue. At noon cos_air -> 1 and this term does nothing, which is exactly the shape
+    // an error of this kind should have.
+    //
+    // The Fresnel transmittance goes with it, exact and unpolarised rather than the "~6%, folded
+    // into the gain" the old comment claimed — at 20 degrees of elevation the interface reflects
+    // 13%, not 6%, and past 80 it takes a quarter of the beam. Both cosines are already in hand, so
+    // it is four multiplies.
+    // --- W12b: AND IT IS THE REAL SUN'S ELEVATION THAT DECIDES, NOT MW'S -------------------------
+    //
+    // MW HAS TWO SUNS. `gFrameData.sunDir` carries the LIGHT, which is clamped to 13.8-53.1 degrees
+    // and NEVER SETS; the DISC — the thing that is actually in the sky — sweeps +-73 degrees and
+    // crosses the horizon. At midnight on the Vos save the disc sits 28.5 degrees BELOW it while
+    // sunDir still reports 20.6 above, carrying a bright blue moonlight.
+    //
+    // The LAND survives that fiction because albedo and NdotL bound it. A scattering VOLUME has
+    // neither, so it drank the night directional at full beam strength — measured at 3.17x the
+    // land's APL and 5.6x in blue. Below the horizon there is no solar beam to enter the water and
+    // this factor is exactly zero, which falls out of the algebra rather than being special-cased:
+    // cosAir = 0 gives dilution 0 AND total reflection (rs = rp = -1, T = 0).
+    //
+    // The twilight that legitimately remains is DIFFUSE sky, which is the ambient term and is
+    // already carried by the H-W night ramp. The direction driving the phase and the slant stays
+    // MW's, because that is what the rest of the frame is lit by — and where this factor is 0 it
+    // does not matter what it multiplies.
+    //
+    // The host publishes cos(zenith) of the true disc in .y, and a NEGATIVE value means "not
+    // available" (physical sky not cooked), in which case MW's own cosine stands in.
+    float cosEntry = (gShadowParams.waterFogSun.y >= 0.0f) ? gShadowParams.waterFogSun.y : cosAir;
+    float cosWEnt  = max(sqrt(max(1.0f - (1.0f - cosEntry * cosEntry) / (kWaterIOR * kWaterIOR), 0.0f)),
+                         kWaterCosCrit);
+    float rs = (cosEntry - kWaterIOR * cosWEnt) / (cosEntry + kWaterIOR * cosWEnt);
+    float rp = (kWaterIOR * cosEntry - cosWEnt) / (kWaterIOR * cosEntry + cosWEnt);
+    float sunEnter = (cosEntry / cosWEnt) * (1.0f - 0.5f * (rs * rs + rp * rp));
+    sunEnter = lerp(1.0f, sunEnter, saturate(gShadowParams.waterFogSun.x));
+
+    float3 iSun = waterInscatterSeg(sigTm, kLgt, tauViewM, L, dNear, dFar, mEff, slantSun,      openEnded);
+    float3 iAmb = waterInscatterSeg(sigTm, kLgt, tauViewM, L, dNear, dFar, mEff, kWaterDiffuse, openEnded);
 
     float ph = waterPhase(dot(worldPosRel / d, -gFrameData.sunDir.xyz));
 
@@ -458,9 +570,11 @@ void waterColumn(float3 worldPosRel, float L, bool openEnded, out float3 inscat,
     //
     // The strength lane is an A/B, not a knob: `lerp(ph, 1, 0)` is `ph` exactly, so 0 reproduces the
     // previous build bit for bit.
-    float tauS    = ((sigS.r + sigS.g + sigS.b) * (1.0f / 3.0f)) * L;
-    float wSingle = openEnded ? 0.0f : exp(-tauS);
-    ph = lerp(ph, 1.0f, saturate(gShadowParams.waterFogPhase2.z) * (1.0f - wSingle));
+    //
+    // ⚠ `wIso` IS COMPUTED UP AT THE SIMILARITY BLOCK AND SHARED, deliberately: the phase going
+    // isotropic and the medium losing (1-g) are one substitution, and two copies of the weight is
+    // exactly how they would come apart again.
+    ph = lerp(ph, 1.0f, wIso);
 
     // ⚠ WHERE PI IS. Two of them, pulling opposite ways, and until W9b they were being cancelled by
     // a single hand-tuned gain that could only be right for one of the two terms.
@@ -490,8 +604,14 @@ void waterColumn(float3 worldPosRel, float L, bool openEnded, out float3 inscat,
     // presents as "the Fresnel changed" even though the Fresnel curve is untouched.
     // The error was assuming a full-sphere uniform field INSIDE the medium. Refraction is what makes
     // that false, and refraction is already the thing every other constant in this file turns on.
-    inscat = sigS * (kInscatterSun * gFrameData.sunCol.rgb * ph * iSun
-                   + kInscatterAmb * gFrameData.ambCol.rgb * iAmb)
+    // ⚠ sunEnter MULTIPLIES THE SUN TERM ONLY. The ambient arrives as a FIELD, not a beam: its
+    // entry loss is the interface's diffuse transmittance (~0.93 for n = 1.333, a flat 7%) and its
+    // solid-angle bookkeeping is already inside kInscatterAmb, which the energy check confirms —
+    // integrating the in-water cone radiance n^2*L over cos gives back exactly pi*L, the irradiance
+    // that went in. Applying a beam's obliquity to it would be a category error, and at night the
+    // ambient is the term that has to survive for the water to be water at all.
+    inscat = sigSm * (kInscatterSun * gFrameData.sunCol.rgb * ph * iSun * sunEnter
+                    + kInscatterAmb * gFrameData.ambCol.rgb * iAmb)
            * gShadowParams.waterFogScatter.w;
 }
 

@@ -93,6 +93,10 @@ int main(int argc, char** argv) {
 	LOG::open("mgeHost64.log");
 	LOG::logline("Host process started");
 
+	// Dev-knob overrides from the environment, BEFORE init so a knob read during bring-up sees the
+	// override rather than the default. Logged, so a run's log carries the arm it was measured in.
+	ForgeRender::applyEnvOverrides();
+
 	// GPU capture, BEFORE any device creation (renderdoc.dll has to hook d3d12 first). Attach-only
 	// by default: if the RenderDoc UI launched or injected us the dll is already in the process and
 	// numpad 0 works, and if it is not this costs one failed GetModuleHandle — a shipped install

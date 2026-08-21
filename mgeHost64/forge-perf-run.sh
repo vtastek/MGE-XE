@@ -1,7 +1,14 @@
 #!/usr/bin/env bash
 # Forge automated perf harness: launch minimized (auto-loads test scene) -> poll host log for N new
 # 'gpu split' heartbeats -> verify no device-removal -> kill both procs -> report the last N splits.
-# Usage: forge-perf-run.sh [samples=5] [timeout=180] [save.ess] [renderScale]
+# Usage: forge-perf-run.sh [samples=5] [timeout=180] [save.ess] [renderScale] [hostKnobs]
+#
+# hostKnobs (5th arg) is passed through as MGE_HOST_KNOBS="name=value,name=value" and applied by the
+# host at startup (ForgeRender::applyEnvOverrides). It exists because every look knob is a dev-panel
+# widget and this harness runs MINIMIZED on purpose — so without it, any A/B that turns on a
+# checkbox simply cannot be measured here, which is how a brightness complaint and a physical
+# derivation argued past each other for two builds with no shared number. The host LOGS what it
+# applied, so each run's log carries the arm it was measured in.
 #
 # renderScale (4th arg, 1.0-2.0) drives the client's MGE_RENDER_SCALE startup override, which is the
 # ONLY scriptable way to change the internal render resolution — the live knob is a panel slider and
@@ -17,6 +24,7 @@ SAMPLES="${1:-5}"
 TIMEOUT="${2:-180}"
 SAVE="${3:-}"
 SCALE="${4:-}"
+KNOBS="${5:-}"
 LOG="/mnt/c/mgem/morrowind64/mgeHost64.log"
 CFG="/mnt/c/mgem/morrowind64/Data Files/MWSE/config/instant load.json"
 CFGBAK="$(mktemp)"
@@ -91,12 +99,22 @@ echo "[harness] start offset = $startlines lines; want $SAMPLES new 'gpu split' 
 # an already-running WSL session: interop hands Windows children a cached env block, so the stale
 # MGE_RDOC=1 keeps arriving until WSL restarts. Set it deliberately if you want a capture.
 RDOC_STRIP="Remove-Item Env:MGE_RDOC -ErrorAction SilentlyContinue; "
+# Built as ONE prefix rather than a branch per option: with two independent env vars the branchy
+# form needs four arms, and the arm nobody exercises is the one that silently drops a variable.
+ENVSET="$RDOC_STRIP"
 if [ -n "$SCALE" ]; then
   echo "[harness] render scale = ${SCALE}x (MGE_RENDER_SCALE)"
-  powershell.exe -Command "${RDOC_STRIP}\$env:MGE_RENDER_SCALE='$SCALE'; Start-Process -FilePath 'Morrowind.exe' -WorkingDirectory 'C:\\mgem\\morrowind64' -WindowStyle Minimized" >/dev/null 2>&1
-else
-  powershell.exe -Command "${RDOC_STRIP}Start-Process -FilePath 'Morrowind.exe' -WorkingDirectory 'C:\\mgem\\morrowind64' -WindowStyle Minimized" >/dev/null 2>&1
+  ENVSET="${ENVSET}\$env:MGE_RENDER_SCALE='$SCALE'; "
 fi
+# ALWAYS written, even when empty — a stale MGE_HOST_KNOBS left in the user environment would ride
+# along in every run exactly the way MGE_RDOC did for three days, and the arm would be mislabelled.
+if [ -n "$KNOBS" ]; then
+  echo "[harness] host knobs = $KNOBS (MGE_HOST_KNOBS)"
+  ENVSET="${ENVSET}\$env:MGE_HOST_KNOBS='$KNOBS'; "
+else
+  ENVSET="${ENVSET}Remove-Item Env:MGE_HOST_KNOBS -ErrorAction SilentlyContinue; "
+fi
+powershell.exe -Command "${ENVSET}Start-Process -FilePath 'Morrowind.exe' -WorkingDirectory 'C:\\mgem\\morrowind64' -WindowStyle Minimized" >/dev/null 2>&1
 echo "[harness] launched Morrowind; polling..."
 
 t0=$(date +%s)
@@ -137,6 +155,14 @@ tail -n +$((startlines + 1)) "$LOG" | grep -Ei "device removed|FAILED|fatal|cras
 
 echo "=== last splits ==="
 tail -n +$((startlines + 1)) "$LOG" | grep -E "host split:|gpu split:|gpu color sub:|\[dl\] exterior|dist lights " | tail -$((SAMPLES * 4))
+
+# The METERING lines, reported by the harness itself rather than left to a later grep. The knob arm
+# a run was taken in is only recoverable from the log, so the arm and its numbers belong in the same
+# captured output — the alternative is a table of readings whose labels come from memory.
+echo "=== knobs applied ==="
+tail -n +$((startlines + 1)) "$LOG" | grep -E "MGE_HOST_KNOBS|UNKNOWN knob" | tail -8 || echo "  (none — default build)"
+echo "=== apl / apl-split ==="
+tail -n +$((startlines + 1)) "$LOG" | grep -E "\[forge-hb\] apl" | tail -6
 
 # The client side of the same frames. [seam] backbuffer is printed FIRST so every table row carries
 # the resolution it was actually measured at, rather than the one that was asked for.

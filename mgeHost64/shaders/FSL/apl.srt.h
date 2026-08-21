@@ -34,7 +34,11 @@ STRUCT(AplParams)
     // float4 and NOT uint4, deliberately: skyheight.srt.h records that int4/uint4 was kept OUT of
     // the merged compute root signature. These are small integers, exact in float.
     DATA(float4, dims, None);
-    // x = REJECT SKY (0/1). y,z,w spare.
+    // x = REJECT SKY (0/1).
+    // y = the WATER PLANE in camera-relative Z (waterfog.h.fsl's waterFogPlaneRelZ, computed
+    //     host-side from the same two lanes so the instrument and the renderer cannot disagree
+    //     about where the water is).
+    // z = SPLIT THE READING BY MEDIUM (0/1) — see the region block in apl.comp.fsl. w spare.
     //
     // ⚠ THIS FLAG REDEFINES EVERY NUMBER THE INSTRUMENT PRODUCES, which is why it is a published
     // flag and not a compile-time choice: with it on, `apl`, the percentiles and therefore the
@@ -46,6 +50,15 @@ STRUCT(AplParams)
     // seconds apart read mean=104 (p90=160, sky in shot) and mean=41 (p90=60, sky out), swinging E
     // by 28% with the scene unchanged.
     DATA(float4, opts, None);
+    // The MAIN view's inverse view-projection — a byte copy of gShadowParams.invViewProj (floats
+    // 0..15), NOT a freshly inverted matrix. Copied rather than recomputed for the reason the
+    // wf-trace block records: the published inverse and a fresh one are different objects written
+    // at different points in the frame, and a region classifier that disagreed with the water pass
+    // about which pixels are water would be a measuring stick that reports its own skew.
+    //
+    // ⚠ APPENDED, so dims/opts keep their offsets and the host's existing 8-float write is still
+    // the first 32 bytes of the same upload.
+    DATA(float4x4, invViewProj, None);
 };
 
 BEGIN_SRT(AplSrtData)
@@ -69,9 +82,19 @@ BEGIN_SRT(AplSrtData)
         // SKY IS EXACTLY 0.0 HERE, not approximately: pSkyPipeline is built with depth test AND
         // write OFF, and the reverse-Z clear is 0.0, so a pixel showing only sky was never written.
         DECL_TEXTURE(PerBatch, Tex2D(float), gAplDepth)
-        // 8 uints: [0..3] = asuint(mean R, mean G, mean B, mean logLuma), [4..6] = the p10 / p50 /
-        // p90 luma DISPLAY LEVELS (0..255, plain integers, no asuint), [7] = the COUNTED sample
-        // total, i.e. how many of the z*z lattice samples survived sky rejection. uint element type
+        // 24 uints, THREE populations of 8 in the identical layout — [0..7] every counted sample,
+        // [8..15] the LAND half, [16..23] the WATER half:
+        //   +0..+3 = asuint(mean R, mean G, mean B, mean logLuma)
+        //   +4..+6 = the p10 / p50 / p90 luma DISPLAY LEVELS (0..255, plain integers, no asuint)
+        //   +7     = the COUNTED sample total for that population
+        //
+        // ⚠ [0..7] ARE BIT-FOR-BIT WHAT THEY ALWAYS WERE, and that is load-bearing: the exposure
+        // servo reads them, so the split must be an ADDITION to the instrument and never a
+        // redefinition of it. Land + water == total by construction (the land histogram is the
+        // total's minus the water's, bin by bin), so the two halves cannot drift apart from the
+        // number the servo is closing on.
+        //
+        // uint element type
         // + asuint() for the float half, matching gInstOut in cull.srt.h — the merged compute
         // rootsig has no float-typed RWBuffer and this is not the place to introduce one.
         //

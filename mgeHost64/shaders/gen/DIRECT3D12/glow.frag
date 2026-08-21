@@ -1130,7 +1130,16 @@ STRUCT(ShadowMaskParams)
     float4 agxCurve;
     float4 agxCurveScale;
     float4 agxLookParams;
-#line 437
+
+
+
+
+
+
+
+
+    float4 waterFogSun;
+#line 446
 };
 #line 21 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
 #line 27 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"

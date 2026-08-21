@@ -987,9 +987,18 @@ STRUCT(AplParams)
 
 
     float4 dims;
-#line 48 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/apl.srt.h"
+#line 52 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/apl.srt.h"
     float4 opts;
-#line 49
+
+
+
+
+
+
+
+
+    float4x4 invViewProj;
+#line 62
 };
 
         CBUFFER(AplParams) gAplParams :  register(b0,space2);
@@ -997,17 +1006,9 @@ STRUCT(AplParams)
 
 
         Tex2D(float4) gAplColor :  register(t1,space2);
-#line 71 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/apl.srt.h"
+#line 84 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/apl.srt.h"
         Tex2D(float) gAplDepth :  register(t2,space2);
-
-
-
-
-
-
-
-
-
+#line 104 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/apl.srt.h"
         RWBuffer(uint) gAplOut :  register(u3,space2);
 #line 29 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/apl.comp.fsl"
 
@@ -1020,6 +1021,13 @@ groupshared float4 g_apl[256];
 #define srt_g_hist g_hist
 #line 45
 groupshared uint g_hist[256];
+#line 68 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/apl.comp.fsl"
+#define srt_g_aplW g_aplW
+#line 68
+groupshared float4 g_aplW[256];
+#define srt_g_histW g_histW
+#line 69
+groupshared uint g_histW[256];
 
 [RootSignature( "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "3" ", offset = 0)," "CBV(b0, numDescriptors = unbounded, space = " "3" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "3" ", offset = 0))," "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "2" ", offset = 0)," "CBV(b0, numDescriptors = unbounded, space = " "2" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "2" ", offset = 0))," "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "1" ", offset = 0)," "CBV(b0, numDescriptors = unbounded, space = " "1" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "1" ", offset = 0))," "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "0" ", offset = 0)," "CBV(b0, numDescriptors = unbounded, space = " "0" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "0" ", offset = 0))," "DescriptorTable(" "SAMPLER(s0, numDescriptors = unbounded, space = " "0" ", offset = 0))," "StaticSampler(s0, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s1, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s2, space = 100," "filter = FILTER_MIN_MAG_LINEAR_MIP_POINT," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s3, space = 100," "filter = FILTER_MIN_MAG_LINEAR_MIP_POINT," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s4, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s5, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s6, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT," "addressU = TEXTURE_ADDRESS_MIRROR, addressV = TEXTURE_ADDRESS_MIRROR, addressW = TEXTURE_ADDRESS_MIRROR)," "StaticSampler(s7, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT, borderColor = STATIC_BORDER_COLOR_TRANSPARENT_BLACK," "addressU = TEXTURE_ADDRESS_BORDER, addressV = TEXTURE_ADDRESS_BORDER, addressW = TEXTURE_ADDRESS_BORDER)," "StaticSampler(s8, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR," "addressU = TEXTURE_ADDRESS_MIRROR, addressV = TEXTURE_ADDRESS_MIRROR, addressW = TEXTURE_ADDRESS_MIRROR)," "StaticSampler(s9, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR, borderColor = STATIC_BORDER_COLOR_TRANSPARENT_BLACK," "addressU = TEXTURE_ADDRESS_BORDER, addressV = TEXTURE_ADDRESS_BORDER, addressW = TEXTURE_ADDRESS_BORDER)," "StaticSampler(s10, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 8," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s11, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 8," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s12, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 8," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s13, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 8," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s14, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 2," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s15, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 2," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s16, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 2," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s17, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 2," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_WRAP)" )]
 NUM_THREADS(256, 1, 1)
@@ -1033,9 +1041,11 @@ void CS_MAIN( uint3 DispatchThreadID : SV_DISPATCHTHREADID )
     float invGrid = 1.0f / max(gAplParams.dims.z, 1.0f);
 
     float4 acc = float4(0.0f, 0.0f, 0.0f, 0.0f);
+    float4 accW = float4(0.0f, 0.0f, 0.0f, 0.0f);
 
 
     g_hist[tid] = 0u;
+    g_histW[tid] = 0u;
     GroupMemoryBarrier();
 
 
@@ -1045,19 +1055,24 @@ void CS_MAIN( uint3 DispatchThreadID : SV_DISPATCHTHREADID )
         uint gy = i / grid;
         int2 p = int2(int((float(gx) + 0.5f) * invGrid * imgSize.x),
                       int((float(gy) + 0.5f) * invGrid * imgSize.y));
-
-
-
-
-
-
-
-
-
+#line 108 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/apl.comp.fsl"
+        float dz = LoadTex2D(gAplDepth, NO_SAMPLER, p, 0).r;
         if (gAplParams.opts.x > 0.5f)
         {
-            float dz = LoadTex2D(gAplDepth, NO_SAMPLER, p, 0).r;
             if (dz <= 0.0f) { continue; }
+        }
+
+
+
+
+        bool isWater = false;
+        if (gAplParams.opts.z > 0.5f && dz > 0.0f)
+        {
+            float2 uv = (float2(p) + 0.5f) / imgSize;
+            float4 hp = mul(gAplParams.invViewProj,
+                              float4(uv.x * 2.0f - 1.0f, 1.0f - uv.y * 2.0f, dz, 1.0f));
+            float invW = (abs(hp.w) > 1.0e-12f) ? (1.0f / hp.w) : 0.0f;
+            isWater = ((hp.z * invW) < gAplParams.opts.y);
         }
 
 
@@ -1075,9 +1090,17 @@ void CS_MAIN( uint3 DispatchThreadID : SV_DISPATCHTHREADID )
         uint bin = (uint)clamp(luma * 255.0f + 0.5f, 0.0f, 255.0f);
         uint prevCount;
         AtomicAdd(g_hist[bin], 1u, prevCount);
+        if (isWater)
+        {
+            accW.rgb += c;
+            accW.a += log(max(luma, 1.0e-5f));
+            uint prevW;
+            AtomicAdd(g_histW[bin], 1u, prevW);
+        }
     }
 
     g_apl[tid] = acc;
+    g_aplW[tid] = accW;
     GroupMemoryBarrier();
 
 
@@ -1086,8 +1109,9 @@ void CS_MAIN( uint3 DispatchThreadID : SV_DISPATCHTHREADID )
     for (uint s =  256u  / 2u; s > 0u; s >>= 1u)
     {
         float4 v = (tid < s) ? g_apl[tid + s] : float4(0.0f, 0.0f, 0.0f, 0.0f);
+        float4 vW = (tid < s) ? g_aplW[tid + s] : float4(0.0f, 0.0f, 0.0f, 0.0f);
         GroupMemoryBarrier();
-        if (tid < s) { g_apl[tid] = g_apl[tid] + v; }
+        if (tid < s) { g_apl[tid] = g_apl[tid] + v; g_aplW[tid] = g_aplW[tid] + vW; }
         GroupMemoryBarrier();
     }
 
@@ -1098,7 +1122,9 @@ void CS_MAIN( uint3 DispatchThreadID : SV_DISPATCHTHREADID )
 
 
         uint total = 0u;
-        UNROLL for (uint bs = 0u; bs < 256u; ++bs) { total += g_hist[bs]; }
+        uint totalW = 0u;
+        UNROLL for (uint bs = 0u; bs < 256u; ++bs) { total += g_hist[bs]; totalW += g_histW[bs]; }
+        uint totalL = total - totalW;
 
 
 
@@ -1114,28 +1140,67 @@ void CS_MAIN( uint3 DispatchThreadID : SV_DISPATCHTHREADID )
 
 
 
+        float invW = (totalW > 0u) ? (1.0f / (float)totalW) : 0.0f;
+        float invL = (totalL > 0u) ? (1.0f / (float)totalL) : 0.0f;
+        float4 mW = g_aplW[0] * invW;
+        float4 mL = (g_apl[0] - g_aplW[0]) * invL;
+        gAplOut[8] = asuint(mL.r);
+        gAplOut[9] = asuint(mL.g);
+        gAplOut[10] = asuint(mL.b);
+        gAplOut[11] = asuint(mL.a);
+        gAplOut[16] = asuint(mW.r);
+        gAplOut[17] = asuint(mW.g);
+        gAplOut[18] = asuint(mW.b);
+        gAplOut[19] = asuint(mW.a);
+
+
+
+
+
+
+
+
         uint t10 = (uint)(0.10f * (float)total);
         uint t50 = (uint)(0.50f * (float)total);
         uint t90 = (uint)(0.90f * (float)total);
-        uint run = 0u;
-        uint p10 = 255u;
-        uint p50 = 255u;
-        uint p90 = 255u;
-        bool got10 = false;
-        bool got50 = false;
-        bool got90 = false;
+        uint tL10 = (uint)(0.10f * (float)totalL);
+        uint tL50 = (uint)(0.50f * (float)totalL);
+        uint tL90 = (uint)(0.90f * (float)totalL);
+        uint tW10 = (uint)(0.10f * (float)totalW);
+        uint tW50 = (uint)(0.50f * (float)totalW);
+        uint tW90 = (uint)(0.90f * (float)totalW);
+        uint run = 0u; uint runL = 0u; uint runW = 0u;
+        uint p10 = 255u; uint p50 = 255u; uint p90 = 255u;
+        uint pL10 = 255u; uint pL50 = 255u; uint pL90 = 255u;
+        uint pW10 = 255u; uint pW50 = 255u; uint pW90 = 255u;
+        bool got10 = false; bool got50 = false; bool got90 = false;
+        bool gL10 = false; bool gL50 = false; bool gL90 = false;
+        bool gW10 = false; bool gW50 = false; bool gW90 = false;
         LOOP for (uint bi = 0u; bi < 256u; ++bi)
         {
-            run += g_hist[bi];
+            uint hb = g_hist[bi];
+            uint hw = g_histW[bi];
+            run += hb;
+            runW += hw;
+            runL += (hb - hw);
             if (!got10 && run >= t10) { p10 = bi; got10 = true; }
             if (!got50 && run >= t50) { p50 = bi; got50 = true; }
             if (!got90 && run >= t90) { p90 = bi; got90 = true; }
+            if (!gL10 && runL >= tL10) { pL10 = bi; gL10 = true; }
+            if (!gL50 && runL >= tL50) { pL50 = bi; gL50 = true; }
+            if (!gL90 && runL >= tL90) { pL90 = bi; gL90 = true; }
+            if (!gW10 && runW >= tW10) { pW10 = bi; gW10 = true; }
+            if (!gW50 && runW >= tW50) { pW50 = bi; gW50 = true; }
+            if (!gW90 && runW >= tW90) { pW90 = bi; gW90 = true; }
         }
+
 
 
         gAplOut[4] = p10;
         gAplOut[5] = p50;
         gAplOut[6] = p90;
+        gAplOut[12] = pL10; gAplOut[13] = pL50; gAplOut[14] = pL90; gAplOut[15] = totalL;
+        gAplOut[20] = pW10; gAplOut[21] = pW50; gAplOut[22] = pW90; gAplOut[23] = totalW;
 
 
 

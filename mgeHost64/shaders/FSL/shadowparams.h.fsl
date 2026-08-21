@@ -434,4 +434,13 @@ STRUCT(ShadowMaskParams)
     DATA(float4,   agxCurve,        None);
     DATA(float4,   agxCurveScale,   None);
     DATA(float4,   agxLookParams,   None);
+    // W12 — WHAT THE SUN'S BEAM LOSES CROSSING THE SURFACE.
+    //   x = strength of the entry term (0 = the pre-W12 image, bit for bit; 1 = the full factor)
+    //   y,z,w spare.
+    //
+    // The factor itself is derived in waterColumn from sunDir alone, so only the A/B weight has to
+    // travel. APPENDED at the end of the struct on purpose: every offset above it is referenced by
+    // a host constant, and this cbuffer is bound BY POINTER into every PerFrame set, so a field
+    // inserted anywhere else would move a lane that some pass reads by index.
+    DATA(float4,   waterFogSun,     None);
 };

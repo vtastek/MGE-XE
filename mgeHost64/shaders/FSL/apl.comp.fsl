@@ -44,6 +44,30 @@ GroupShared(float4, g_apl[256]);
 // and the thing a single mean can never show. 1 KB of LDS and one atomic per sample.
 GroupShared(uint, g_hist[256]);
 
+// --- THE REGION SPLIT: one reading per MEDIUM, not one per frame ------------------------------
+//
+// The question this exists to answer (user, 2026-08-21): "I want water to be half of the APL of
+// land." That is a comparison between two POPULATIONS of pixels in ONE frame, and it is the only
+// form the comparison can honestly take — two frames taken seconds apart differ in exposure, in
+// weather and in what is on screen, so a water reading from one and a land reading from another
+// share no denominator. Split inside the reduction and both halves are metered through the same E,
+// the same curve and the same lattice, so their RATIO is a property of the renderer rather than of
+// when the shot was taken.
+//
+// WATER IS "THE VIEW RAY CROSSED THE SURFACE", NOT "THE SURFACE IS THE NEAREST THING". A pixel is
+// classified by unprojecting its depth and asking whether what it lands on is BELOW the water
+// plane, because the water surface is an alpha-BLENDED draw that writes no depth from above
+// ([[project_forge_water_zwrite_side]]): the depth under a water pixel is the SEABED. That is not a
+// workaround, it is the better definition — a shallow pool, a sunlit sandbar and the open sea are
+// all "seen through water" and all belong in the water half, and the thing being measured is the
+// whole column plus its surface, which is exactly what the physical model produces.
+//
+// ONLY THE WATER HALF IS ACCUMULATED SEPARATELY. Land is the total minus it, sums and histogram
+// bins alike, which is exact in the sums and exact bin-by-bin in the histogram — so the split
+// cannot fail to add up, and the extra cost is one float4 accumulator and one 1 KB bin array.
+GroupShared(float4, g_aplW[256]);
+GroupShared(uint,   g_histW[256]);
+
 ROOT_SIGNATURE(ComputeRootSignature)
 NUM_THREADS(256, 1, 1)
 void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
@@ -55,10 +79,12 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
     uint   grid    = (uint)gAplParams.dims.z;
     float  invGrid = 1.0f / max(gAplParams.dims.z, 1.0f);
 
-    float4 acc = float4(0.0f, 0.0f, 0.0f, 0.0f);
+    float4 acc  = float4(0.0f, 0.0f, 0.0f, 0.0f);
+    float4 accW = float4(0.0f, 0.0f, 0.0f, 0.0f);
 
     // One bin per thread — exactly 256 of each, so the clear needs no loop and no bounds test.
-    g_hist[tid] = 0u;
+    g_hist[tid]  = 0u;
+    g_histW[tid] = 0u;
     GroupMemoryBarrier();
 
     // Strided walk over the lattice. No barriers in here, so the divergent tail is free.
@@ -77,10 +103,25 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
         // be a different and wrong instrument — it would report a scene that gets DARKER the more
         // sky is in shot, which is the same camera-pitch dependence with the sign flipped. They are
         // dropped from the sum, from the histogram, and from the divisor alike.
+        // Loaded UNCONDITIONALLY now, because the region split needs it whether or not sky is
+        // being rejected — and it is the same texel the rejection was already reading.
+        float dz = LoadTex2D(gAplDepth, NO_SAMPLER, p, 0).r;
         if (gAplParams.opts.x > 0.5f)
         {
-            float dz = LoadTex2D(gAplDepth, NO_SAMPLER, p, 0).r;
             if (dz <= 0.0f) { continue; }
+        }
+        // Camera-relative world Z of whatever this pixel is showing, against the water plane in the
+        // same space. `dz <= 0` is the reverse-Z far plane — nothing was drawn — and unprojecting it
+        // would put the sample at infinity, so it stays LAND rather than being classified off a
+        // meaningless position (it is only reachable at all with sky rejection switched off).
+        bool isWater = false;
+        if (gAplParams.opts.z > 0.5f && dz > 0.0f)
+        {
+            float2 uv   = (float2(p) + 0.5f) / imgSize;
+            float4 hp   = mul(gAplParams.invViewProj,
+                              float4(uv.x * 2.0f - 1.0f, 1.0f - uv.y * 2.0f, dz, 1.0f));
+            float  invW = (abs(hp.w) > 1.0e-12f) ? (1.0f / hp.w) : 0.0f;
+            isWater = ((hp.z * invW) < gAplParams.opts.y);
         }
 #if SAMPLE_COUNT > 1
         float3 c = LoadTex2DMS(gAplColor, NO_SAMPLER, p, 0).rgb;
@@ -98,9 +139,17 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
         uint bin = (uint)clamp(luma * 255.0f + 0.5f, 0.0f, 255.0f);
         uint prevCount;
         AtomicAdd(g_hist[bin], 1u, prevCount);
+        if (isWater)
+        {
+            accW.rgb += c;
+            accW.a   += log(max(luma, 1.0e-5f));
+            uint prevW;
+            AtomicAdd(g_histW[bin], 1u, prevW);
+        }
     }
 
-    g_apl[tid] = acc;
+    g_apl[tid]  = acc;
+    g_aplW[tid] = accW;
     GroupMemoryBarrier();
 
     // Tree reduce. Read into a register, barrier, guarded write, barrier — cullscan.comp.fsl's
@@ -108,9 +157,10 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
     // wraps only the write, never the barrier.
     for (uint s = APL_THREADS / 2u; s > 0u; s >>= 1u)
     {
-        float4 v = (tid < s) ? g_apl[tid + s] : float4(0.0f, 0.0f, 0.0f, 0.0f);
+        float4 v  = (tid < s) ? g_apl[tid + s]  : float4(0.0f, 0.0f, 0.0f, 0.0f);
+        float4 vW = (tid < s) ? g_aplW[tid + s] : float4(0.0f, 0.0f, 0.0f, 0.0f);
         GroupMemoryBarrier();
-        if (tid < s) { g_apl[tid] = g_apl[tid] + v; }
+        if (tid < s) { g_apl[tid] = g_apl[tid] + v; g_aplW[tid] = g_aplW[tid] + vW; }
         GroupMemoryBarrier();
     }
 
@@ -120,8 +170,10 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
         // the histogram's own sum IS the counted total — no second reduction, and it cannot
         // disagree with the sum the percentiles are taken from (which is the failure mode of
         // tracking the count separately). One serial 256-add pass on the one thread that is awake.
-        uint total = 0u;
-        UNROLL for (uint bs = 0u; bs < 256u; ++bs) { total += g_hist[bs]; }
+        uint total  = 0u;
+        uint totalW = 0u;
+        UNROLL for (uint bs = 0u; bs < 256u; ++bs) { total += g_hist[bs]; totalW += g_histW[bs]; }
+        uint totalL = total - totalW;
 
         // ⚠ A FRAME CAN BE ALL SKY — look straight up — and then there is no scene to meter. Emit
         // zeros WITH count 0 rather than dividing: the host reads the count and holds the servo,
@@ -134,31 +186,70 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
         gAplOut[2] = asuint(m.b);
         gAplOut[3] = asuint(m.a);
 
+        // The two halves, each divided by its OWN counted total — the same "a rejected sample is
+        // absent, not zero" rule one level down. A frame with no water at all reports count 0 and
+        // zeroed means, and the host prints no ratio rather than a division by nothing.
+        float  invW = (totalW > 0u) ? (1.0f / (float)totalW) : 0.0f;
+        float  invL = (totalL > 0u) ? (1.0f / (float)totalL) : 0.0f;
+        float4 mW   = g_aplW[0] * invW;
+        float4 mL   = (g_apl[0] - g_aplW[0]) * invL;
+        gAplOut[8]  = asuint(mL.r);
+        gAplOut[9]  = asuint(mL.g);
+        gAplOut[10] = asuint(mL.b);
+        gAplOut[11] = asuint(mL.a);
+        gAplOut[16] = asuint(mW.r);
+        gAplOut[17] = asuint(mW.g);
+        gAplOut[18] = asuint(mW.b);
+        gAplOut[19] = asuint(mW.a);
+
         // Percentiles, by one serial walk of 256 bins on one thread. A parallel scan would be the
         // reflex and would be slower here: this is 256 adds against the barrier traffic of an
         // 8-step scan, and the group has nothing else left to do.
+        // ...for all THREE populations in ONE walk. Three running sums off two bin arrays (land's
+        // bin is the total's minus water's), so the land percentiles cost no third histogram and
+        // cannot describe a different set of pixels than the land MEAN two blocks up.
+#define APL_PCT_STEP(run, tt, pv, gt)  if (!gt && run >= tt) { pv = bi; gt = true; }
         uint t10   = (uint)(0.10f * (float)total);
         uint t50   = (uint)(0.50f * (float)total);
         uint t90   = (uint)(0.90f * (float)total);
-        uint run   = 0u;
-        uint p10   = 255u;
-        uint p50   = 255u;
-        uint p90   = 255u;
-        bool got10 = false;
-        bool got50 = false;
-        bool got90 = false;
+        uint tL10  = (uint)(0.10f * (float)totalL);
+        uint tL50  = (uint)(0.50f * (float)totalL);
+        uint tL90  = (uint)(0.90f * (float)totalL);
+        uint tW10  = (uint)(0.10f * (float)totalW);
+        uint tW50  = (uint)(0.50f * (float)totalW);
+        uint tW90  = (uint)(0.90f * (float)totalW);
+        uint run   = 0u;   uint runL  = 0u;   uint runW  = 0u;
+        uint p10   = 255u; uint p50   = 255u; uint p90   = 255u;
+        uint pL10  = 255u; uint pL50  = 255u; uint pL90  = 255u;
+        uint pW10  = 255u; uint pW50  = 255u; uint pW90  = 255u;
+        bool got10 = false; bool got50 = false; bool got90 = false;
+        bool gL10  = false; bool gL50  = false; bool gL90  = false;
+        bool gW10  = false; bool gW50  = false; bool gW90  = false;
         LOOP for (uint bi = 0u; bi < 256u; ++bi)
         {
-            run += g_hist[bi];
-            if (!got10 && run >= t10) { p10 = bi; got10 = true; }
-            if (!got50 && run >= t50) { p50 = bi; got50 = true; }
-            if (!got90 && run >= t90) { p90 = bi; got90 = true; }
+            uint hb = g_hist[bi];
+            uint hw = g_histW[bi];
+            run  += hb;
+            runW += hw;
+            runL += (hb - hw);
+            APL_PCT_STEP(run,  t10,  p10,  got10)
+            APL_PCT_STEP(run,  t50,  p50,  got50)
+            APL_PCT_STEP(run,  t90,  p90,  got90)
+            APL_PCT_STEP(runL, tL10, pL10, gL10)
+            APL_PCT_STEP(runL, tL50, pL50, gL50)
+            APL_PCT_STEP(runL, tL90, pL90, gL90)
+            APL_PCT_STEP(runW, tW10, pW10, gW10)
+            APL_PCT_STEP(runW, tW50, pW50, gW50)
+            APL_PCT_STEP(runW, tW90, pW90, gW90)
         }
+#undef APL_PCT_STEP
         // Display LEVELS (0..255), not normalised floats — the calibration targets are stated as
         // levels, so this is the one place a raw integer is more readable than a ratio.
         gAplOut[4] = p10;
         gAplOut[5] = p50;
         gAplOut[6] = p90;
+        gAplOut[12] = pL10; gAplOut[13] = pL50; gAplOut[14] = pL90; gAplOut[15] = totalL;
+        gAplOut[20] = pW10; gAplOut[21] = pW50; gAplOut[22] = pW90; gAplOut[23] = totalW;
         // How many of the z*z lattice samples were COUNTED. The host turns this into the sky
         // fraction on the heartbeat, which is the number that makes the rejection auditable: a
         // reading is only comparable to another taken at a similar fraction, and 0 here is the

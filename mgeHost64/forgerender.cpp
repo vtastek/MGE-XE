@@ -2732,6 +2732,54 @@ namespace {
     // fraction, so the crossover is the medium's, not a tuned one; this lane only says whether to
     // believe it. 1 = full (physical), 0 = the pre-W8d build bit for bit.
     float              g_waterPhaseMS       = 1.0f;
+    // W10: how far the MEDIUM follows the phase into the isotropic limit. The two are one
+    // substitution — similarity theory says an anisotropic medium (sigma_s, g) behaves like an
+    // isotropic one with sigma_s*(1-g) — and until now only the phase half was applied, which
+    // turned deep water into a scatterer 12.5x stronger than water.
+    //
+    // ⚠ IT IS AN ~8x BRIGHTNESS ERROR IN THE ONE PLACE THE COLUMN IS THE WHOLE PIXEL. The open-ended
+    // column converges to kInscatterSun * omega_0, so deep water was returning 4.9/9.9/14.0% of the
+    // downwelling — reported as "there is no way it can beat the albedo of land". At night, where
+    // MW's directional is moonlight and heavily blue, that put the sea at 1.7x the land it sits
+    // next to. With the transform it returns 0.48/1.24/2.30%, which is both the diffusion
+    // reflectance of this very medium (within 4%) and what ocean optics measures for real water.
+    //
+    // 1 = the derived transform. 0 = the pre-W10 image bit for bit — the lane the shader reads is
+    // `kMediumG * this`, so 0 publishes g = 0 and `sigma_s*(1-0)` is sigma_s. There is no third
+    // meaning to it: this is an A/B on a substitution, not a brightness dial. If the water then
+    // reads too dark for the cell, the honest lever is the MEDIUM (more particles —
+    // g_waterScatterRatio) or g_waterInscatterGain, which is already labelled an artistic
+    // multiplier.
+    float              g_waterMsSimilarity  = 1.0f;
+    // W12 — THE SUN BEAM'S SURFACE-ENTRY LOSS: cos(theta_air)/cos(theta_water) (the beam is diluted
+    // on entry) times the exact unpolarised Fresnel transmittance. Derived in waterColumn from
+    // sunDir; this is only the A/B weight, so 0 reproduces the pre-W12 image bit for bit.
+    //
+    // It is a FIX, not a dial. Everything about its shape is fixed by Snell: 1 at the zenith, 0 at
+    // the horizon, and therefore invisible at noon and decisive at night — which is the shape the
+    // measurement demanded. If deep water reads too dark after it, the lever is the MEDIUM
+    // (g_waterScatterRatio) or g_waterInscatterGain, never this.
+    float              g_waterSunEnter      = 1.0f;
+    // W12b — WHOSE SUN THE COLUMN'S BEAM BELONGS TO.
+    //
+    // MW HAS TWO SUNS ([[project_mw_two_suns]]): the DISC sweeps +-73 degrees and crosses the
+    // horizon, while the LIGHT that gFrameData.sunDir carries is clamped to 13.8-53.1 degrees and
+    // NEVER SETS. At midnight the physical sky puts the disc 28.5 degrees BELOW the horizon and MW
+    // still hands the renderer a directional at 20.6 degrees carrying a bright blue moonlight.
+    //
+    // The LAND survives that fiction because it is bounded by its own albedo and cosine. A
+    // SCATTERING VOLUME is not: it takes the beam at full strength with no receiver normal, which is
+    // how the Vos night save came to read water at 3.17x the land's APL and 5.6x in blue. Feeding a
+    // gameplay fill light into a beam term is the category error under all of it.
+    //
+    // So the ENTRY factor is evaluated at the DISC's true, unclamped elevation. Below the horizon
+    // there is no solar beam to enter the water and the term is exactly zero — the twilight that
+    // remains is diffuse sky, which is the AMBIENT term and is already carried by the H-W night
+    // ramp. Nothing else changes: the direction that drives the phase and the slant stays MW's,
+    // because that is what the rest of the scene is lit by.
+    //
+    // At day the two elevations agree and this does nothing, which is the shape it has to have.
+    bool               g_waterSunTrueElev   = true;
     // W8d diagnostic. One CSV row per frame of every uniform the in-scatter reads, so a value that
     // arrives a frame late shows up as a PHASE SHIFT against the ones that do not when the camera
     // oscillates. See the trace block in renderScene for the column pairings.
@@ -3946,8 +3994,13 @@ namespace {
     constexpr uint32_t kAgxCurveFloat        = kCalFloat + 4;        // slope / toeP / shoulderP / ARMED
     constexpr uint32_t kAgxScaleFloat        = kAgxCurveFloat + 4;   // toeScale / shScale / pivotX / pivotY
     constexpr uint32_t kAgxLookFloat         = kAgxScaleFloat + 4;   // slope / power / sat / offset
+    // W12: .x = the strength of the sun beam's SURFACE-ENTRY loss in waterColumn (dilution x
+    // Fresnel). Appended at the END, after every other block, because each constant above is an
+    // index into one shared buffer that is bound by pointer into every PerFrame set — a field
+    // inserted anywhere else silently moves a lane somebody reads.
+    constexpr uint32_t kWaterFogSunFloat     = kAgxLookFloat + 4;
     constexpr uint32_t kShadowParamsBytes = 4096;
-    static_assert((kAgxLookFloat + 4) * sizeof(float) <= kShadowParamsBytes,
+    static_assert((kWaterFogSunFloat + 4) * sizeof(float) <= kShadowParamsBytes,
                   "ShadowMaskParams overflows its CBV — too many sun cascades");
     // msmrecv.h.fsl's PCSS works in TEXELS, so SUN_SHADOW_RES has to agree with the atlas the host
     // actually allocated. Same mirroring contract as SUN_CASCADES / kSunCascades.
@@ -9695,10 +9748,12 @@ namespace {
                     BufferLoadDesc aob = {};
                     aob.mDesc.mDescriptors  = DESCRIPTOR_TYPE_RW_BUFFER;
                     aob.mDesc.mMemoryUsage  = RESOURCE_MEMORY_USAGE_GPU_ONLY;
-                    // 8, not 4, since S3a: [0..3] the means, [4..6] the p10/p50/p90 display levels.
+                    // 24, not 8, since the region split: THREE populations of 8 in one layout —
+                    // [0..7] every counted sample (what the exposure servo reads, unchanged),
+                    // [8..15] land, [16..23] water. See apl.srt.h.
                     aob.mDesc.mStructStride = sizeof(uint32_t);
-                    aob.mDesc.mElementCount = 8;
-                    aob.mDesc.mSize         = (uint64_t)sizeof(uint32_t) * 8;
+                    aob.mDesc.mElementCount = 24;
+                    aob.mDesc.mSize         = (uint64_t)sizeof(uint32_t) * 24;
                     aob.mDesc.mStartState   = RESOURCE_STATE_UNORDERED_ACCESS;
                     aob.mDesc.pName         = "aplOut";
                     aob.ppBuffer            = &g_live.pAplOut;
@@ -9707,7 +9762,7 @@ namespace {
                     BufferLoadDesc arb = {};
                     arb.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_GPU_TO_CPU;
                     arb.mDesc.mFlags       = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
-                    arb.mDesc.mSize        = 32;
+                    arb.mDesc.mSize        = 96;   // 24 uints — total / land / water
                     arb.mDesc.mStartState  = RESOURCE_STATE_COPY_DEST;
                     arb.mDesc.pName        = "aplReadback";
                     arb.ppBuffer           = &g_live.pAplReadback;
@@ -11037,6 +11092,19 @@ namespace {
     double    g_aplPctAccum[3] = { 0.0, 0.0, 0.0 };     // S3a: p10 / p50 / p90 display levels
     double    g_aplCoverAccum  = 0.0;                   // counted / lattice, i.e. 1 - sky fraction
     unsigned  g_aplN        = 0;
+    // THE REGION SPLIT'S WINDOW (apl.comp.fsl). Land and water accumulate on their OWN frame
+    // counters, not on g_aplN: a frame whose camera happened to hold no water must not enter the
+    // water mean as a zero, and it must not shrink the divisor of the land mean either. So each
+    // half averages over the frames in which that half actually existed, and the counts say how
+    // many those were — a `wn=` far below `n=` is the reading saying "mostly not looking at water",
+    // which is information about the shot rather than about the renderer.
+    double    g_aplLandAccum[4]  = { 0.0, 0.0, 0.0, 0.0 };
+    double    g_aplWaterAccum[4] = { 0.0, 0.0, 0.0, 0.0 };
+    double    g_aplLandPct[3]    = { 0.0, 0.0, 0.0 };
+    double    g_aplWaterPct[3]   = { 0.0, 0.0, 0.0 };
+    double    g_aplLandFrac      = 0.0;   // land samples / counted samples, window mean
+    unsigned  g_aplLandN         = 0;
+    unsigned  g_aplWaterN        = 0;
     float     g_lastApl[4]  = { 0.0f, 0.0f, 0.0f, 0.0f };
     // ...and THIS FRAME's percentiles, not the window's. The accumulators above are reset every 300
     // frames for the heartbeat, which is the right statistic for a number a human reads and the
@@ -12148,6 +12216,12 @@ namespace {
     // taken in (`scene` / `frame`) and prints the sky fraction beside it. Readings across the two
     // are not comparable, and every calibration target recorded from here on is a SCENE reading.
     bool   g_aplSkipSky  = true;
+    // SPLIT THE READING BY MEDIUM — water pixels (the view ray crossed the surface) against land.
+    // Purely additive: [0..7] of the readback, and therefore the exposure servo, are untouched by
+    // it. On by default because, like g_aplSkipSky, an instrument that ships switched off produces
+    // no numbers, and this one exists to answer a standing question — how bright is the water
+    // against the ground beside it, in one frame, through one exposure.
+    bool   g_aplSplitWater = true;
     bool   g_expEnable   = true;
     // WHICH STATISTIC THE METER READS — 0 = frame mean, 1 = p90, 2 = geometric mean. A LIVE knob
     // rather than a constant because the calibration table does not say, and guessing is exactly
@@ -12474,6 +12548,17 @@ namespace {
     // into the water params (worlds[6] group 3); water.frag branches on it. Both off = normal water.
     bool g_waterReflOnly = false;
     bool g_waterRefrOnly = false;
+    // NO REFLECTION (bit 18) — a MEASUREMENT mode. Zeroes the Fresnel weight and the sun glint, so
+    // the pixel is the transmitted path alone: the column and what is under it. It is not
+    // `g_waterRefrOnly`, which RETURNs a raw scene tap and skips the composite — this runs the whole
+    // composite with one term removed, so the [forge-hb] apl-split reading taken under it is still a
+    // reading of the shipped maths. The DIFFERENCE between the two readings is the mirror's share.
+    //
+    // The reason it had to exist (user, 2026-08-21): "it is night time, sky is black. the bright
+    // blue is scatter." At night the mirror has almost nothing to mirror, so the reflection/scatter
+    // attribution cannot be made by argument from the sky's brightness — it has to be switched off
+    // and measured, on the night save where the claim was made.
+    bool g_waterNoReflect = false;
     bool g_waterRoughView = false;   // WT4d debug view 3: roughness / reflection LOD, false-coloured
     // Reflection HDR RANGE view (bit 17). "Are reflections HDR too" is not answerable from the lit
     // image: a reflection that was clipped to 1.0 and one that was never brighter than 1.0 tonemap to
@@ -13146,7 +13231,9 @@ namespace {
         if (g_waterSnellGain)       { f |= 65536u; }
         // bit 17: reflection HDR RANGE view. Own bit, not a waterDbg mode, for heightView's reason.
         if (g_waterHdrView)         { f |= 131072u; }
-        // Round-trips exactly through the float: integers are exact to 2^24, this word maxes at 262143.
+        // bit 18: NO REFLECTION — the measurement mode. See g_waterNoReflect.
+        if (g_waterNoReflect)       { f |= 262144u; }
+        // Round-trips exactly through the float: integers are exact to 2^24, this word maxes at 524287.
         return (float)f;
     }
     inline float waterAlphaBase(float windFactor) {
@@ -14241,6 +14328,10 @@ namespace {
           // servo chases them. Ticking it off is the A/B that shows how much of the old float was
           // camera pitch; leave it ON, and treat any reading taken with it off as a different unit.
           t.checkbox("METER: reject sky (scene APL, not frame APL)", &g_aplSkipSky);
+          // Additive — it cannot move `apl`, the percentiles or the servo, only add the
+          // [forge-hb] apl-split line. Off is for isolating the classifier's cost, which is
+          // one unproject per lattice sample and has never measured.
+          t.checkbox("METER: split APL by medium (water vs land, own hb line)", &g_aplSplitWater);
           // THE RATIO AS A CONTROL, because the two sliders above are not one: they reach it only
           // together and in opposite directions, so dialling a ratio by hand means fighting the sum
           // — and therefore the exposure servo — the whole way. Author the ratio here, press solve,
@@ -14364,6 +14455,8 @@ namespace {
                     &g_sunDiscExpand, 0.0f, 8.0f, 0.1f, "%.2f");
           t.checkbox("Water: reflection only (raw RT, undistorted)", &g_waterReflOnly);
           t.checkbox("Water: refraction only", &g_waterRefrOnly);
+          t.checkbox("Water: NO REFLECTION (Fresnel 0 + no glint) — for the apl-split reading",
+                     &g_waterNoReflect);
           // WT4d. The ONE roughness knob — see g_waterRoughBase. It drives the reflection mip LOD
           // and the GGX lobe width TOGETHER (they are the same number), so at 0 the surface is a
           // perfect mirror with a delta highlight and the A/B against pre-WT4d water is exact.
@@ -14474,6 +14567,17 @@ namespace {
           // camera". 1 = physical, 0 = the pre-W8d image exactly.
           t.sliderF("Water phase: multiple-scatter isotropisation with depth (0 = single-scatter only)",
                     &g_waterPhaseMS, 0.0f, 1.0f, 0.01f, "%.2f");
+          // W10. The OTHER half of the same substitution: when the phase goes isotropic the medium
+          // has to lose (1 - g) with it, or the column behaves like water that scatters 12.5x
+          // harder. Worth ~8x on deep water and on everything underwater; the near field and the
+          // shoreline are untouched, because a thin column is genuinely single-scattering and takes
+          // neither half. Judge it on DEEP water against the land beside it, not at the waterline.
+          t.checkbox("Water sun: entry factor uses the DISC's TRUE elevation (off = MW's clamped light)",
+                   &g_waterSunTrueElev);
+        t.sliderF("Water sun: surface-entry loss — beam dilution x Fresnel (0 = the pre-W12 image)",
+                  &g_waterSunEnter, 0.0f, 1.0f, 0.01f, "%.2f");
+        t.sliderF("Water phase: isotropise the MEDIUM with it (similarity; 0 = the pre-W10 image)",
+                    &g_waterMsSimilarity, 0.0f, 1.0f, 0.01f, "%.2f");
           // W8d diagnostic. Turn ON, move back and forth, turn OFF: a value that arrives a frame late
           // turns around one row after the ones that do not. Writes morrowind64/waterfog_trace.csv,
           // truncated on every ON. Cheap (buffered fprintf), but it is a file per frame — leave it off.
@@ -16002,6 +16106,75 @@ namespace ForgeRender {
     // internal-linkage definition, which is the same trap calTarget's comment records for `extern`.
     double calSunAmbTarget();
 
+    // --- MGE_HOST_KNOBS: drive the water A/B knobs from the environment ---------------------------
+    //
+    // WHY THIS EXISTS. Every knob in the water argument is a dev-panel widget, and the panel needs
+    // somebody at the keyboard. The perf harness runs MINIMIZED on purpose (it must not steal focus
+    // from a session in progress), so an A/B that requires a checkbox cannot be run by the harness
+    // at all — which is precisely how "still looks brighter to me" and a physical derivation ended
+    // up arguing past each other for two builds with no shared measurement.
+    //
+    // Format: MGE_HOST_KNOBS="name=value,name=value". Unknown names are LOGGED AND IGNORED rather
+    // than silently dropped: a typo'd knob that quietly does nothing produces a run labelled as an
+    // A/B whose two arms are identical, and that is a wrong row in a table rather than a missing one.
+    //
+    // The value reaches here because mgeHost64 is a CHILD of Morrowind.exe, which inherits the
+    // environment of whatever launched it — the same route MGE_RENDER_SCALE already takes to the
+    // client. Read ONCE at startup; the panel still owns these knobs afterwards.
+    void applyEnvOverrides() {
+        const char* env = std::getenv("MGE_HOST_KNOBS");
+        if (!env || !*env) { return; }
+        LOG::logline(">> [forge] MGE_HOST_KNOBS = %s", env);
+        struct FKnob { const char* name; float* p; };
+        struct BKnob { const char* name; bool*  p; };
+        const FKnob fknobs[] = {
+            { "waterInscatterGain", &g_waterInscatterGain },
+            { "waterScatterRatio",  &g_waterScatterRatio  },
+            { "waterMsSimilarity",  &g_waterMsSimilarity  },
+            { "waterSunEnter",      &g_waterSunEnter      },
+            { "waterPhaseMS",       &g_waterPhaseMS       },
+        };
+        const BKnob bknobs[] = {
+            { "waterNoReflect",     &g_waterNoReflect     },
+            { "waterSunTrueElev",   &g_waterSunTrueElev   },
+            { "aplSplitWater",      &g_aplSplitWater      },
+            { "aplSkipSky",         &g_aplSkipSky         },
+        };
+        std::string spec(env);
+        size_t pos = 0;
+        while (pos <= spec.size()) {
+            const size_t comma = spec.find(',', pos);
+            std::string item = spec.substr(pos, (comma == std::string::npos) ? std::string::npos
+                                                                             : (comma - pos));
+            pos = (comma == std::string::npos) ? (spec.size() + 1) : (comma + 1);
+            const size_t eq = item.find('=');
+            if (eq == std::string::npos || eq == 0) { continue; }
+            const std::string key = item.substr(0, eq);
+            const std::string val = item.substr(eq + 1);
+            bool hit = false;
+            for (const FKnob& k : fknobs) {
+                if (key == k.name) {
+                    *k.p = (float)std::atof(val.c_str());
+                    LOG::logline(">> [forge]   %s = %.4f", k.name, (double)*k.p);
+                    hit = true;
+                    break;
+                }
+            }
+            if (!hit) {
+                for (const BKnob& k : bknobs) {
+                    if (key == k.name) {
+                        *k.p = (std::atoi(val.c_str()) != 0);
+                        LOG::logline(">> [forge]   %s = %s", k.name, *k.p ? "true" : "false");
+                        hit = true;
+                        break;
+                    }
+                }
+            }
+            if (!hit) { LOG::logline("!! [forge]   UNKNOWN knob '%s' — ignored", key.c_str()); }
+        }
+        LOG::flush();
+    }
+
     bool init(unsigned width, unsigned height, unsigned sampleCount, unsigned anisoLevel) {
         std::setvbuf(stdout, nullptr, _IONBF, 0);
         if (g_live.pRenderer) {
@@ -17477,6 +17650,22 @@ namespace ForgeRender {
             // shot, 0.60 = 40% of the frame was sky and is no longer in any of these numbers.
             g_aplCoverAccum += (double)aplCounted / (double)(128u * 128u);
             ++g_aplN;
+            // The two halves. Each one is only accumulated on frames where it had samples, so an
+            // all-land frame leaves the water window exactly as it was rather than dragging it to
+            // zero — the same "absent, not zero" rule the reduction applies to sky, one level up.
+            const uint32_t nLand  = pu[15];
+            const uint32_t nWater = pu[23];
+            if (nLand > 0u) {
+                for (int i = 0; i < 4; ++i) { g_aplLandAccum[i] += (double)a[8 + i]; }
+                for (int i = 0; i < 3; ++i) { g_aplLandPct[i]   += (double)pu[12 + i]; }
+                ++g_aplLandN;
+            }
+            if (nWater > 0u) {
+                for (int i = 0; i < 4; ++i) { g_aplWaterAccum[i] += (double)a[16 + i]; }
+                for (int i = 0; i < 3; ++i) { g_aplWaterPct[i]   += (double)pu[20 + i]; }
+                ++g_aplWaterN;
+            }
+            g_aplLandFrac += (double)nLand / (double)aplCounted;
             // Close the exposure loop on the frame that just finished. HERE, inside the readback
             // guard, so the servo only ever steps on a frame that produced a measurement: a paused
             // host, a menu, or a frame whose APL pass did not run HOLDS E rather than integrating
@@ -24147,9 +24336,37 @@ namespace ForgeRender {
             if (g_live.pAplPipeline && g_live.pAplSet && g_live.pAplOut && g_live.pAplParamsCbv) {
                 const uint32_t aplGrid = 128u;   // 128x128 = 16384 samples; see apl.comp.fsl
                 if (g_live.pAplParamsCbv->pCpuMappedAddress) {
-                    const float p[8] = { (float)g_live.width, (float)g_live.height, (float)aplGrid,
-                                         1.0f / (float)(aplGrid * aplGrid),
-                                         g_aplSkipSky ? 1.0f : 0.0f, 0.0f, 0.0f, 0.0f };
+                    // --- THE REGION SPLIT'S TWO INPUTS ---------------------------------------
+                    // The water plane in the SAME camera-relative Z the classifier reconstructs
+                    // into, spelled exactly the way waterfog.h.fsl's waterFogPlaneRelZ() spells it
+                    // (plane.x - lodEye.z) and read from the SAME two cbuffers the renderer reads —
+                    // so "which pixels are water" is one definition, not two that agree today.
+                    //
+                    // The gate is waterFogPlane.w, "this cell HAS a water plane": independent of the
+                    // unified-fog feature toggle AND of which side of the surface the camera is on,
+                    // which is what an instrument needs. Gating on .y instead would have made the
+                    // split vanish the moment someone switched the model off to A/B it — the reading
+                    // would disappear precisely when it is wanted most.
+                    const float* sp = (g_live.pShadowMaskParamsCbv
+                                       && g_live.pShadowMaskParamsCbv->pCpuMappedAddress)
+                                          ? (const float*)g_live.pShadowMaskParamsCbv->pCpuMappedAddress
+                                          : nullptr;
+                    const float* lf = (g_live.pFrameCbv && g_live.pFrameCbv->pCpuMappedAddress)
+                                          ? (const float*)g_live.pFrameCbv->pCpuMappedAddress
+                                          : nullptr;
+                    const bool  splitOn = g_aplSplitWater && sp && lf
+                                          && sp[kWaterFogPlaneFloat + 3] > 0.5f;
+                    const float planeRelZ = (sp && lf) ? (sp[kWaterFogPlaneFloat + 0] - lf[58]) : 0.0f;
+                    float p[24] = { (float)g_live.width, (float)g_live.height, (float)aplGrid,
+                                    1.0f / (float)(aplGrid * aplGrid),
+                                    g_aplSkipSky ? 1.0f : 0.0f,
+                                    planeRelZ,
+                                    splitOn ? 1.0f : 0.0f,
+                                    0.0f };
+                    // floats 8..23 = invViewProj, COPIED from gShadowParams rather than inverted
+                    // again here (apl.srt.h says why). Identity when the buffer is unavailable, which
+                    // with splitOn false is never read.
+                    for (int i = 0; i < 16; ++i) { p[8 + i] = sp ? sp[i] : ((i % 5 == 0) ? 1.0f : 0.0f); }
                     std::memcpy(g_live.pAplParamsCbv->pCpuMappedAddress, p, sizeof(p));
                 }
                 RenderTargetBarrier arb = {};
@@ -24175,7 +24392,7 @@ namespace ForgeRender {
                     bb.mNewState     = RESOURCE_STATE_COPY_SOURCE;
                     cmdResourceBarrier(g_live.pCmd, 1, &bb, 0, nullptr, 0, nullptr);
                     g_live.pCmd->mDx.pCmdList->CopyBufferRegion(
-                        g_live.pAplReadback->mDx.pResource, 0, g_live.pAplOut->mDx.pResource, 0, 32);
+                        g_live.pAplReadback->mDx.pResource, 0, g_live.pAplOut->mDx.pResource, 0, 96);
                     bb.mCurrentState = RESOURCE_STATE_COPY_SOURCE;
                     bb.mNewState     = RESOURCE_STATE_UNORDERED_ACCESS;
                     cmdResourceBarrier(g_live.pCmd, 1, &bb, 0, nullptr, 0, nullptr);
@@ -25146,6 +25363,64 @@ namespace ForgeRender {
                              agxActive() ? "agx" : "legacy",
                              railTxt, (double)g_expMaxNow,
                              g_calSunGain, g_calAmbGain, g_calEmisGain);
+
+                // --- THE REGION SPLIT, ON ITS OWN LINE -------------------------------------
+                //
+                // Its own line and not more fields on the one above, because it answers a
+                // different question and has a different divisor: the line above is ONE
+                // population over g_aplN frames, this is TWO populations over two frame counts
+                // that need not match either it or each other.
+                //
+                // `w/l` IS THE WHOLE INSTRUMENT. Both halves were metered in the same frame,
+                // through the same exposure and the same curve, so their ratio is a property of
+                // the renderer and survives a change of weather, of time of day, or of E — which
+                // is exactly what a single-population reading cannot do. The standing target
+                // (user, 2026-08-21) is 0.50: water at half the APL of the land beside it.
+                //
+                // ⚠ THE RATIO IS OF DISPLAY LEVELS, NOT OF RADIANCE. Every number here is read
+                // off the DELIVERED image, after AgX and after the sRGB encode, and that curve is
+                // strongly compressive — so 0.50 in these units is a much larger ratio upstream,
+                // and no scene-referred coefficient can be read off this line directly. It is a
+                // TARGET to servo the physics onto, not a value to paste into a constant.
+                //
+                // p50/p90 come along because a mean over a region is still a mean: a bay with a
+                // bright specular streak and a dark body has the same mean as a uniform grey one,
+                // and only the spread tells them apart.
+                if (g_aplLandN > 0u || g_aplWaterN > 0u) {
+                    const double li = (g_aplLandN  > 0u) ? (1.0 / (double)g_aplLandN)  : 0.0;
+                    const double wi = (g_aplWaterN > 0u) ? (1.0 / (double)g_aplWaterN) : 0.0;
+                    const double lApl = (0.299 * g_aplLandAccum[0] + 0.587 * g_aplLandAccum[1]
+                                       + 0.114 * g_aplLandAccum[2]) * li;
+                    const double wApl = (0.299 * g_aplWaterAccum[0] + 0.587 * g_aplWaterAccum[1]
+                                       + 0.114 * g_aplWaterAccum[2]) * wi;
+                    const double ratio = (lApl > 1.0e-6) ? (wApl / lApl) : 0.0;
+                    // ⚠ AND THE RATIO PER CHANNEL, because a luma ratio can sit exactly on target
+                    // while the picture is wrong. MW's ground art measures 0.043/0.037/0.017 linear
+                    // — its BLUE albedo is under half its red — and a water column is blue by
+                    // construction (absorption is 4x higher in red, so omega' is blue-dominant
+                    // whatever the medium). The two can agree on luma and still differ by 2x in
+                    // blue, which is what "the bright blue is scatter" describes and what a single
+                    // w/l number structurally cannot show.
+                    double wl[3] = { 0.0, 0.0, 0.0 };
+                    for (int i = 0; i < 3; ++i) {
+                        const double lc = g_aplLandAccum[i] * li;
+                        wl[i] = (lc > 1.0e-6) ? ((g_aplWaterAccum[i] * wi) / lc) : 0.0;
+                    }
+                    LOG::logline(">> [forge-hb] apl-split: LAND lvl=%.1f p50=%.0f p90=%.0f"
+                                 " rgb=(%.4f,%.4f,%.4f) n=%u"
+                                 " | WATER lvl=%.1f p50=%.0f p90=%.0f rgb=(%.4f,%.4f,%.4f) n=%u"
+                                 " | w/l=%.3f (target 0.50) per-ch=(%.2f,%.2f,%.2f)"
+                                 " land=%.0f%% of scene%s",
+                                 lApl * 255.0, g_aplLandPct[1] * li, g_aplLandPct[2] * li,
+                                 g_aplLandAccum[0] * li, g_aplLandAccum[1] * li,
+                                 g_aplLandAccum[2] * li, g_aplLandN,
+                                 wApl * 255.0, g_aplWaterPct[1] * wi, g_aplWaterPct[2] * wi,
+                                 g_aplWaterAccum[0] * wi, g_aplWaterAccum[1] * wi,
+                                 g_aplWaterAccum[2] * wi, g_aplWaterN,
+                                 ratio, wl[0], wl[1], wl[2],
+                                 100.0 * g_aplLandFrac * inv,
+                                 g_waterNoReflect ? " [NO-REFLECT: transmitted path only]" : "");
+                }
             }
             dlLogHeartbeat();
             g_recAccum = 0.0;
@@ -25154,6 +25429,10 @@ namespace ForgeRender {
             g_aplPctAccum[0] = g_aplPctAccum[1] = g_aplPctAccum[2] = 0.0;
             g_aplCoverAccum = 0.0;
             g_aplN = 0;
+            for (int i = 0; i < 4; ++i) { g_aplLandAccum[i] = g_aplWaterAccum[i] = 0.0; }
+            for (int i = 0; i < 3; ++i) { g_aplLandPct[i]   = g_aplWaterPct[i]   = 0.0; }
+            g_aplLandFrac = 0.0;
+            g_aplLandN = g_aplWaterN = 0;
         }
         return true;
     }
@@ -32084,8 +32363,16 @@ namespace ForgeRender {
                 mp[kWaterFogScatterFloat + i] = 0.0f;
                 mp[kWaterFogPhaseFloat + i]   = 0.0f;
                 mp[kWaterFogPhase2Float + i]  = 0.0f;
+                mp[kWaterFogSunFloat + i]     = 0.0f;
                 mp[kWaterFogKdFloat + i]      = 0.0f;
             }
+            // ⚠ ...EXCEPT waterFogSun.y, WHERE 0 IS A MEANINGFUL VALUE AND THE WRONG ONE. Every
+            // other lane here reads as "off" at zero; this one reads as "the sun is exactly on the
+            // horizon", which is a real state with a real (and total) entry loss. The sentinel for
+            // "no answer available" is NEGATIVE — see the publish below — so the disarmed path has
+            // to write that instead, or a reader reached through a bypassed gate gets a confident
+            // wrong number rather than the fallback.
+            mp[kWaterFogSunFloat + 1] = -1.0f;
             return;
         }
 
@@ -32319,7 +32606,26 @@ namespace ForgeRender {
             mp[kWaterFogPhase2Float + 0] = std::max(g_waterPhaseIso, 0.0f);
             mp[kWaterFogPhase2Float + 1] = g_waterPhaseCeil;
             mp[kWaterFogPhase2Float + 2] = std::max(0.0f, std::min(g_waterPhaseMS, 1.0f));
-            mp[kWaterFogPhase2Float + 3] = 0.0f;
+            // W10: the medium's asymmetry, scaled by the A/B. The shader forms sigma_s*(1 - this)
+            // for its isotropic limit, so 0 is exactly sigma_s and reproduces the pre-W10 build.
+            // Sending g rather than the strength is what keeps kMediumG a SINGLE constant: K_d above
+            // and the in-scatter in waterfog.h.fsl are two halves of one medium, and a second copy of
+            // 0.92 in the shader is how they would come apart.
+            mp[kWaterFogSunFloat + 0] = std::max(0.0f, std::min(g_waterSunEnter, 1.0f));
+            // .y = the cos(zenith) the ENTRY factor is evaluated at — the DISC's true elevation,
+            // which only the host knows. NEGATIVE is the sentinel for "not available", and the
+            // shader then falls back to MW's own |sunDir.z|, which it has directly. A sentinel
+            // rather than publishing the fallback here, because reading gFrameData from this site
+            // would couple the water publish to the frame cbuffer's write ORDER — and this function
+            // is deliberately called from a path that runs before that is settled.
+            mp[kWaterFogSunFloat + 1] =
+                (g_waterSunTrueElev && g_skyPhys.active)
+                    ? std::min(1.0f, std::max(0.0f, std::sin(g_skyPhys.elevDisc * 3.14159265358979f / 180.0f)))
+                    : -1.0f;
+            mp[kWaterFogSunFloat + 2] = 0.0f;
+            mp[kWaterFogSunFloat + 3] = 0.0f;
+            mp[kWaterFogPhase2Float + 3] =
+                kMediumG * std::max(0.0f, std::min(g_waterMsSimilarity, 1.0f));
         }
     }
 
