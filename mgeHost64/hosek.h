@@ -342,13 +342,26 @@ namespace Hosek {
     // is ramped OUT rather than extrapolated. 1 = fully physical, 0 = the model contributes nothing.
     //
     // ⚠ THE SAME RAMP DOES TWO DIFFERENT THINGS, AND THAT IS DELIBERATE. On the SKY it is a fade to
-    // black, which is the decision this phase was given: space between the stars is supposed to be
-    // black, and there is nothing to come up until moons and stars return next phase. On the
-    // LIGHTING it fades the physical blend back to MW's authored night ambient — because
-    // `calTarget()`'s night row only means something if the servo has a lit ground to meter, and
-    // "fade the model out" would otherwise read as "delete the world's only light source".
-    constexpr float kNightRampLoDeg = 0.0f;
-    constexpr float kNightRampHiDeg = 5.0f;
+    // black — space between the stars is supposed to be black, and since P2b there IS a star field
+    // to hand over to. On the LIGHTING it fades the physical blend back to MW's authored night
+    // ambient — because `calTarget()`'s night row only means something if the servo has a lit ground
+    // to meter, and "fade the model out" would otherwise read as "delete the world's only light
+    // source".
+    //
+    // ⚠ THE BAND IS BELOW THE HORIZON (P2b), AND IT WAS 0..5 DEGREES. Ramping out across the first
+    // five degrees ABOVE the horizon meant the model was already gone while the sun was still up:
+    // measured in play, elev 0.33 deg read ramp 0.01 against elev 6.80 deg reading 1.00, i.e. the
+    // sky blacked out roughly twenty game-minutes early at each end of the day and came back the
+    // same way. Running the ramp to -4..0 instead lets H-W hold the sky all the way DOWN to the
+    // horizon and fade over the first few degrees beneath it, which is what civil twilight does —
+    // and it hands over to the stars rather than to nothing.
+    //
+    // ⚠ THE **COOK'S** ELEVATION STAYS CLAMPED AT 0 (skyPhysicalMeasure's std::max(0.0, elev)) while
+    // this ramp runs negative. That split is the whole trick: below the horizon the model would be
+    // EXTRAPOLATION, so the sky holds its horizon-elevation colour and fades out, rather than being
+    // asked for a configuration Hosek-Wilkie does not define.
+    constexpr float kNightRampLoDeg = -4.0f;
+    constexpr float kNightRampHiDeg =  0.0f;
     inline float nightRamp(float solarElevationRad)
     {
         const float deg = solarElevationRad * 180.0f / (float)kPi;

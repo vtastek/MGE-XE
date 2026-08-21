@@ -468,7 +468,7 @@ namespace IPC {
     // shapes carry a real bindless slot. srcBlend/destBlend are D3DBLEND_* (translated from
     // NiAlphaProperty); SK1 draws SRCALPHA/INVSRCALPHA, so the host ignores them for now and SK2
     // buckets draws by blend-pair. Drawn FIRST in the host colour pass (depth off) so it sits behind
-    // the opaque world. 116 bytes.
+    // the opaque world. 120 bytes.
     struct SkyDrawWire {
         std::uint32_t slot;
         float         world[16];
@@ -495,6 +495,39 @@ namespace IPC {
         // ships the uniform offset; sky.vert adds it to the baked UV (wrap sampler handles the
         // modulo). Zero for every non-UV-animated sky shape. Appended (offset-stable).
         float         uvOffset[2];
+        // P2b: WHAT THIS SHAPE IS (kSkyClass* below). The sky list is not one thing — it is five
+        // elements wanting three different treatments once the Hosek-Wilkie field owns the
+        // atmosphere, and nothing already on the wire can tell them apart:
+        //   * vColSource answers "where does the colour come from", not "what is this": the dome
+        //     and the stars are both 2, and the moon disc and its shadow layer are both 0.
+        //   * isSunDisc is a single flag with two live consumers (the reflection re-face and the
+        //     proxy's sun reject) and must NOT be widened into this enum — `if (it.isSunDisc)`
+        //     would then fire for every moon.
+        // Set by the client from the base-map name (renderprocess.cpp::classifySky), because that
+        // name is the only thing MW's sky subtree carries that identifies an element. Appended
+        // (offset-stable), and kSkyClassOther is 0 so an unset field means "draw it as authored",
+        // i.e. exactly today's behaviour.
+        std::uint32_t skyClass;
+    };
+
+    // The five sky elements, and OTHER for anything a mod adds. Only three treatments exist host
+    // side (authored / pinned / radiant), but the CLASSES stay distinct because the host's CPU loop
+    // needs DOME apart from CLOUD — the physical sky retires the dome and nothing else.
+    enum SkyClass : std::uint32_t {
+        kSkyClassOther = 0,   // unrecognised: drawn exactly as authored, whatever the sky does
+        kSkyClassDome  = 1,   // the untextured atmosphere gradient — the ONE shape H-W replaces
+        kSkyClassCloud = 2,   // Tx_Sky_<weather> — the layer that makes weather READ as weather
+        kSkyClassSun   = 3,   // tx_sun_05 — an already-exposed glare sprite, not a photosphere
+        kSkyClassMoon  = 4,   // tx_masser_* / tx_secunda_* — the LIT disc, drawn ADDITIVELY
+        kSkyClassStars = 5,   // Tx_Stars*.tga + Tx_Stars_Nebula*.tga
+        // tx_mooncircle_full_M|S — the full circle drawn alpha-OVER UNDER each lit disc, painted
+        // with MW's SKY colour. It is NOT a moon and must not be treated as one: its job is to
+        // OCCLUDE THE STARS behind the moon's dark limb (the stars draw at order 1-7, this at 9/11)
+        // and to make that limb blend into the sky. Pinning it to its authored colour under a
+        // physical sky is exactly wrong — MW's authored night sky is a dark blue and the H-W night
+        // sky is black, so the pinned circle reads as a lit dark side. Verified in play, 2026-08-21:
+        // *"moons look good, dark side is a tad brighter."*
+        kSkyClassMoonShadow = 6,
     };
 
     // Per-frame sky draw cap. SK1 draws only the dome; the full sky subtree is ~15 shapes (SK2).

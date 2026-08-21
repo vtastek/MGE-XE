@@ -1124,9 +1124,13 @@ STRUCT(ShadowMaskParams)
 
 
     float4 waterFogKd;
-#line 409 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
+#line 415 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
     float4 calParams;
-#line 410
+#line 434 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
+    float4 agxCurve;
+    float4 agxCurveScale;
+    float4 agxLookParams;
+#line 437
 };
 #line 20 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowmask.srt.h"
 

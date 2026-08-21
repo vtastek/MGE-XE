@@ -31,7 +31,9 @@
 #include "opaque.srt.h"
 #include "tonemap.h.fsl"    // the curve + its inverse
 #include "linearize.h.fsl" // srgbToLinear()/mod2xLinear() — the scene's transfer function (step 5)
-#include "scenecolor.h.fsl" // liftInPass() — class 2: MW's authored display-referred sky (step 6a)
+#include "scenecolor.h.fsl" // liftInPass() + expandExposedEmissiveP() — see the P2b block below
+#include "agx.h.fsl"        // agxInverseNeutral() — the moon pin's half of the round trip
+#include "hosek.h.fsl"      // hosekRadiance() — the moon's SHADOW layer paints the real sky
 #include "waterfog.h.fsl"   // the sky is behind water too, and nothing else was going to fog it
 
 STRUCT(VSOutput)
@@ -44,7 +46,20 @@ STRUCT(VSOutput)
     DATA(FLAT(uint),  VColSource, TEXCOORD3);
     DATA(FLAT(float), MatAlpha,   TEXCOORD4);
     DATA(float3,      WorldDir,  TEXCOORD5);   // C4: camera-relative world dir (dome gradient)
+    DATA(FLAT(uint),  SkyClass,  TEXCOORD6);   // P2b: IPC::SkyClass (must MATCH sky.vert's output)
 };
+
+// IPC::SkyClass, mirrored. The host packs the wire value into the instance stream verbatim, so
+// these must stay in step with src/ipc/geomwire.h. ⚠ OTHER is 0 and means "draw it as authored",
+// which is also what the host writes for EVERY item whenever the physical sky is not drawing — that
+// is what keeps the g_skyHw = 0 A/B partner byte-identical.
+#define SKY_CLASS_OTHER 0u
+#define SKY_CLASS_DOME  1u
+#define SKY_CLASS_CLOUD 2u
+#define SKY_CLASS_SUN   3u
+#define SKY_CLASS_MOON  4u
+#define SKY_CLASS_STARS 5u
+#define SKY_CLASS_MOONSHADOW 6u
 
 ROOT_SIGNATURE(DefaultRootSignature)
 float4 PS_MAIN( VSOutput In )
@@ -82,6 +97,174 @@ float4 PS_MAIN( VSOutput In )
     float amt = gFrameData.skyParams.x;
     if (gFrameData.skyParams.z > 0.5f) { amt *= 0.5f + 0.5f * sin(gFrameData.skyParams.y * 3.0f); }
     c.rgb = lerp(c.rgb, float3(1.0f, 0.0f, 1.0f), amt);
+
+    // ═══ P2b — FIVE ELEMENTS, THREE TREATMENTS ════════════════════════════════════════════════════
+    //
+    // P2 replaced MW's atmosphere DOME with a Hosek-Wilkie radiance field, and did it by suppressing
+    // MW's whole sky loop — which took the sun, the clouds, the moons, the stars and the nebulae
+    // with it. They come back HERE, through this pass, but they cannot all come back the same way:
+    // the dome is retired, the clouds are authored art that should ride the exposure, and the moons
+    // and the stars want OPPOSITE treatments (a moon must not brighten with exposure; a star must).
+    //
+    //   DOME    — never reaches this shader while the physical sky draws; the host's loop skips it.
+    //             It still arrives (and renders exactly as it always did) when the sky is off.
+    //   CLOUD   — ANCHORED to albedo * E_total/pi. This entry said "left alone" and called itself
+    //             the one prediction rather than a measurement; play falsified it. See the branch.
+    //   OTHER   — left alone, deliberately: a mod's extra sky shape gets MW's own behaviour.
+    //   STARS   — real radiance, additively over the sky (the host picks the PSO). No fade.
+    //   MOON    — the LIT disc, PINNED to its authored display value at any exposure.
+    //   MOONSHDW— the sky-coloured circle UNDER each disc: painted with the REAL sky it occludes.
+    //   SUN     — physically radiant, through the operator that stops a glare sprite becoming a box.
+    //
+    // ⚠ EVERY TREATMENT BELOW IS OFF WHENEVER THE CLASS IS OTHER, and the host writes OTHER for
+    // every item unless the physical sky is actually drawing this frame. So `g_skyHw = 0` is not
+    // "the treatments with a different sky behind them", it is byte-for-byte the pre-P2b image.
+    const uint cls = In.SkyClass;
+
+    if (cls == SKY_CLASS_MOONSHADOW && gShadowParams.toneParams.y > 0.5f) {
+        // ─── THE MOON'S SHADOW LAYER = THE SKY IT STANDS IN FRONT OF ─────────────────────────────
+        // `tx_mooncircle_full_M|S` is NOT a moon. It is a full circle drawn alpha-OVER *underneath*
+        // each lit disc (host [sk-mat]: blend 5/6 at order 9/11, then the disc additively at 5/2),
+        // painted by MW with the SKY colour. It does two jobs: it OCCLUDES THE STARS behind the
+        // moon's dark limb — the stars draw at order 1-7, before it — and it makes that limb blend
+        // into the sky.
+        //
+        // ⚠ PINNING IT WAS WRONG AND PLAY SAID SO: *"moons look good, dark side is a tad brighter."*
+        // Pinned, it reproduces MW's AUTHORED night sky, which is a dark blue; the sky actually
+        // behind it is the H-W field, which at night has ramped to black (`zenith=0.00000` on the
+        // heartbeat). A dark-blue disc on a black sky is a lit dark side. The authored colour was
+        // never the point — "whatever the sky is" was.
+        //
+        // So evaluate the sky. Same model, same coefficients, same scale lane as skyhw.frag, at this
+        // fragment's own direction — which makes the dark limb *exactly* invisible against the sky
+        // instead of approximately, and keeps the star occlusion, because the ALPHA is untouched.
+        // The lit disc then adds itself on top and the pin above is exact wherever the sky is black.
+        c.rgb = hosekRadiance(normalize(In.WorldDir)) * gSkyView.radiance.w;
+    } else if (cls == SKY_CLASS_MOON && gShadowParams.agxCurve.w > 0.5f) {
+        // ─── THE MOON PIN ────────────────────────────────────────────────────────────────────────
+        // *"moons need to preserve their phase. clear night, moons should be at their exposed look,
+        // not dimmer."* A real full moon is ~2500 cd/m² against a sunlit white card's ~30000, so at
+        // NIGHT exposure it clips to white and loses its maria and its terminator. That is genuine
+        // camera behaviour and it is exactly what must not happen here.
+        //
+        //     L_moon = agxInverseNeutral(authored) / E
+        //
+        // After the resolve's `x E` and its AgX, this returns the authored colour for ANY E.
+        //
+        // ⚠ THE PHASE SURVIVES BECAUSE 1/E IS **ONE SCALAR OVER THE WHOLE DISC**. The lit crescent,
+        // the shadowed limb and the tx_mooncircle shadow layer stacked under it are divided by the
+        // same number, so their RATIOS are untouched and the terminator cannot blow out. A
+        // per-element pin would not have this property.
+        //
+        // ⚠ THIS IS NOT scenecolor.h.fsl's DEAD CLASS-2 LIFT, and the next reader will think it is.
+        // That one inverted the LEGACY CUBIC while AgX was armed, and it ignored E entirely
+        // (tonemap(E * inverseTonemap(a)) != a for any E != 1) — two independent reasons it
+        // preserved nothing. This inverts the curve that is ACTUALLY RUNNING (gated on agxCurve.w,
+        // which is the same folded bit that disarms liftInPass) and divides by E: the complete round
+        // trip the lift only half-did. When AgX is NOT armed this branch is skipped and liftInPass
+        // below does the identical job for the cubic, which is what it was written for.
+        //
+        // ⚠ EXACT ONLY WHERE COVERAGE IS 1 AND NOTHING IS BLOOMING ONTO IT. The disc blends
+        // SRCALPHA/INVSRCALPHA over whatever the sky put there, so a semi-transparent rim is a mix
+        // and cannot be pinned by construction; and resolve.frag adds the bloom pyramid AFTER the
+        // exposure multiply, so a bright lantern in frame can still lay light over a moon. Both are
+        // real compositing, not pin failures. The claim is about the moon's own opaque body in a
+        // clear night frame, which is exactly the case the falsification test is run on.
+        //
+        // ⚠ NEAR-GREY ONLY. agxInverseNeutral is the NEUTRAL-AXIS inverse applied per channel: it
+        // does not undo the inset matrix's channel mixing or the look's saturation, so it is exact
+        // for grey and approximate for saturated colour. The moons are near-grey. Do not reach for
+        // this operator to un-AgX something that is not.
+        float E = max(gShadowParams.calParams.y, 1.0e-4f);
+        c.rgb = agxInverseNeutral(c.rgb, gShadowParams.agxCurve, gShadowParams.agxCurveScale,
+                                  gShadowParams.agxLookParams) / E;
+    } else if (cls == SKY_CLASS_SUN && gShadowParams.toneParams.y > 0.5f
+               && dot(gSkyView.sunDisc.xyz, float3(1.0f, 1.0f, 1.0f)) > 0.0f) {
+        // ─── THE SUN, PHYSICALLY RADIANT ─────────────────────────────────────────────────────────
+        // Not pinned: the disc carries the model's own direct-normal solar irradiance spread over
+        // the solid angle MW's quad actually covers (gSkyView.sunDisc.xyz, computed and PRINTED
+        // host-side). Tracking energy rather than peak is what makes it dim at sunset and bright at
+        // noon by itself, and it is what lets it drive the bloom kernel like a real sun.
+        //
+        // ⚠ tx_sun_05 IS AN ALREADY-EXPOSED GLARE SPRITE AND A UNIFORM GAIN RENDERS IT AS A SOLID
+        // BRIGHT SQUARE. Measured (tools/sun-sprite-census.py): max(RGB) >= 0.99 across 99.4% of its
+        // texels and across 100% of the texels its own alpha calls transparent — the RGB plane is a
+        // flat white field and THE ENTIRE SHAPE IS IN ALPHA (mean 0.118; a=1.00 in the core,
+        // 0.485 at r=0.35, 0.054 at r=0.6, 0.001 at r=0.8). It is the same family as
+        // R0_candleflame.dds, so it needs the same operator ([[project_sdr_exposed_not_radiance]]):
+        // the gain lands in proportion to how close the EXPOSED value came to the 8-bit ceiling, so
+        // the core gets its radiance back and the glare skirt keeps the falloff MW's artists drew.
+        //
+        // 31.3% of the sprite is strictly interior to the measure (0.02 < w < 0.99), which is the
+        // fraction any exponent can shape at all — the census reports it precisely so "the exponent
+        // does nothing" and "the exponent is wrong" stay distinguishable.
+        //
+        // ⚠ GAIN FIRST, OPERATOR SECOND. expandExposedEmissiveP's floor is 1/max(luma(emis), 1), so
+        // handing it the AUTHORED value (luma <= 1) makes fMin = 1 and f identically 1 — the
+        // operator becomes a no-op and what is left is exactly the uniform gain it exists to
+        // prevent. It must see the value that already carries the gain.
+        //
+        // ⚠ A ZERO L_sunDisc FALLS BACK TO AUTHORED, and the test is in the branch condition above
+        // rather than inside. L is a MEASUREMENT (E_normal / Omega_sprite off the draw's own
+        // transform and the mesh's bound) and a measurement can decline — a degenerate transform,
+        // or the sun list item arriving a frame before its mesh. Multiplying by zero would draw a
+        // BLACK DISC over the sky, which is worse than every failure it could report; falling
+        // through to liftInPass draws MW's own sun instead, which is merely un-physical.
+        float3 emis = c.rgb * gSkyView.sunDisc.xyz;
+        c.rgb = expandExposedEmissiveP(emis, tex.rgb, c.a, gSkyView.sunDisc.w);
+    } else if (cls == SKY_CLASS_STARS && gShadowParams.toneParams.y > 0.5f) {
+        // ─── THE STARS, EXPOSED UP ───────────────────────────────────────────────────────────────
+        // *"as long as nebulas and stars keep their look, space between them can go dark. stars can
+        // expose up instead of fade, we can do that."*
+        //
+        // ONE radiance, no fade curve, and the reason there is no fade to retire is worth stating:
+        // MW's daylight star fade is a TEXTURE-STAGE CONSTANT ALPHA (a second stage modulating
+        // alpha against a TFACTOR — OpenMW reproduces it as AtmosphereNightUpdater::setFade). The
+        // sky wire carries ONE base map and the MaterialProperty alpha, and the in-game [sk-mat]
+        // census reads a = 1.000 on every item — so that fade was never captured and these stars
+        // have been drawing UN-faded all along. Which is exactly why they must not blend alpha-OVER
+        // the sky: a star with coverage 1 would REPLACE the noon sky with a white dot, and no
+        // exposure could hide it. The host puts them on the ADDITIVE PSO instead, and then one
+        // radiance settles day and night at once:
+        //   day   — the physical sky under them is ~0.08 scene; this is a few percent of that, i.e.
+        //           under a display code once AgX has compressed it. They are "below the floor".
+        //   night — the same physical sky has ramped to black, so this is ALL there is, and the
+        //           servo's night exposure brings it up. The space between stars goes to 0, which is
+        //           physically right and is what makes P2's black night a feature.
+        //
+        // ⚠ STAR VISIBILITY IS NOW A PROPERTY OF THE WHOLE FRAME. A lantern in view drops E and the
+        // stars dim with it. That is real camera behaviour and it is wanted, but it is a behaviour
+        // change with NO KNOB. The moons are immune by construction, which is the point of pinning
+        // them. Nebula and star CONTENT is untouched — only the level.
+        c.rgb *= gSkyView.elemRadiance.x;
+    } else if (cls == SKY_CLASS_CLOUD && gShadowParams.toneParams.y > 0.5f) {
+        // ─── THE CLOUDS, ANCHORED ────────────────────────────────────────────────────────────────
+        // P2b shipped these "left alone", on the reasoning that anchoring the dome and not the
+        // clouds lands them at the 3-5x a sunlit cumulus physically runs. That was flagged in this
+        // file as the one entry that was a PREDICTION rather than a measurement, and play falsified
+        // it: *"clouds are a lot brighter compared to MW."*
+        //
+        // The prediction was not wrong about DAY — it never accounted for NIGHT, which is where the
+        // reference save loads. There the sky has ramped to black while the servo runs E = 14-27 to
+        // meter a dark ground, and an authored cloud at ~0.4 linear lands near display 240. Nothing
+        // about "3-5x the blue sky" applies when the blue sky is zero.
+        //
+        // So the layer joins the radiance field like everything else: a fully-lit texel is
+        // albedo * E_total/pi (gSkyView.elemRadiance.y, host-derived, night ramp folded in), and the
+        // authored image modulates it. Day lands at albedo/q times the zenith — the physical band,
+        // printed on the heartbeat — and night goes dark WITH the sky, while still occluding the
+        // stars, because this touches rgb and never alpha.
+        c.rgb *= gSkyView.elemRadiance.y;
+    } else {
+        // CLOUD / DOME / OTHER, and every class at all when the physical sky is not drawing.
+        // Class 2 (scenecolor.h.fsl): lift the authored colour so resolve.frag's curve returns it
+        // unchanged. LAST, after the dev tint, so what is preserved is exactly what this pass
+        // decided to show. On the STRAIGHT colour, before the blend — the SRCALPHA PSO does the
+        // premultiply itself, and lifting a premultiplied value would put the curve on the wrong
+        // side of the coverage multiply (the same trap resolve.srt.h documents three times over).
+        // Inert under AgX by design; see scenecolor.h.fsl's amended class-2 note.
+        c.rgb = liftInPass(c.rgb);
+    }
     // ⚠ P1'S PHOTOMETRIC ANCHOR STOOD HERE AND IS GONE (tasks/forge-physical-sky.md P2).
     // It multiplied this pass by a host-derived scale that put MW's authored sky at the physical
     // level for the light MW said it cast. P2 retires the reproduction entirely: skyhw.frag
@@ -90,15 +273,10 @@ float4 PS_MAIN( VSOutput In )
     // going to fix the SHAPE, which is the half P1 could not reach. Deleted rather than left at
     // 1.0, because a dead knob that still multiplies is how the next reader loses a day.
     //
-    // ⚠ THIS SHADER IS NOT DEAD. It is the g_skyHw = 0 A/B partner and it draws MW's sky exactly as
-    // it always did; and when moons, stars and nebulae come back next phase, this is the pass they
-    // come back through. gShadowParams.calParams.z is spare again — do not resurrect a scale in it.
-    // Class 2 (scenecolor.h.fsl): lift the authored colour so resolve.frag's curve returns it
-    // unchanged. LAST, after the dev tint, so what is preserved is exactly what this pass decided to
-    // show. On the STRAIGHT colour, before the blend — the SRCALPHA PSO does the premultiply itself,
-    // and lifting a premultiplied value would put the curve on the wrong side of the coverage
-    // multiply (the same trap resolve.srt.h documents three times over).
-    c.rgb = liftInPass(c.rgb);
+    // ⚠ THIS SHADER IS NOT DEAD, AND SINCE P2b IT IS NOT ONLY THE A/B PARTNER EITHER. It is the pass
+    // the moons, the stars, the nebulae, the clouds and the sun all come back through — the physical
+    // sky owns the atmosphere DOME and nothing else. gShadowParams.calParams.z is spare; .y is now
+    // the exposure servo's E, read by the moon pin above. Do not resurrect a sky scale in either.
 
     // --- W8: THE SKY IS BEHIND WATER TOO -----------------------------------------------------
     // Reported from underwater: "you see the clear color, horizon band, sun setting underwater".

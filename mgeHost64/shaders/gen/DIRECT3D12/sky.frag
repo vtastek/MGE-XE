@@ -1124,14 +1124,18 @@ STRUCT(ShadowMaskParams)
 
 
     float4 waterFogKd;
-#line 409 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
+#line 415 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
     float4 calParams;
-#line 410
+#line 434 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
+    float4 agxCurve;
+    float4 agxCurveScale;
+    float4 agxLookParams;
+#line 437
 };
 #line 21 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
 #line 27 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyview.h.fsl"
-#line 29 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyview.h.fsl"
+#line 30 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyview.h.fsl"
 STRUCT(SkyViewData)
 {
 
@@ -1162,7 +1166,11 @@ STRUCT(SkyViewData)
 
 
     float4 params;
-#line 59
+#line 74 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyview.h.fsl"
+    float4 sunDisc;
+#line 96 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyview.h.fsl"
+    float4 elemRadiance;
+#line 97
 };
 #line 28 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
 #line 65 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
@@ -1570,10 +1578,9 @@ float3 mod2xStage(float3 t)
 {
     return (gShadowParams.toneParams.y > 0.5f) ? mod2xLinear(t) : (t * 2.0f);
 }
-#line 276 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/scenecolor.h.fsl"
-float3 expandExposedEmissive(float3 emis, float3 albedoRgb, float cov)
+#line 282 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/scenecolor.h.fsl"
+float3 expandExposedEmissiveP(float3 emis, float3 albedoRgb, float cov, float p)
 {
-    float p = gShadowParams.skyAO2.w;
     if (!(p > 0.0f)) { return emis; }
 
 
@@ -1590,6 +1597,13 @@ float3 expandExposedEmissive(float3 emis, float3 albedoRgb, float cov)
 
 
 
+float3 expandExposedEmissive(float3 emis, float3 albedoRgb, float cov)
+{
+    return expandExposedEmissiveP(emis, albedoRgb, cov, gShadowParams.skyAO2.w);
+}
+
+
+
 
 
 
@@ -1598,6 +1612,142 @@ float3 expandExposedEmissiveDelta(float3 emis, float3 albedoRgb, float cov)
     return expandExposedEmissive(emis, albedoRgb, cov) - emis;
 }
 #line 35 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/sky.frag.fsl"
+#line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/agx.h.fsl"
+#line 90 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/agx.h.fsl"
+float3 agxInset(float3 v)
+{
+    return float3(
+        dot(v, float3(0.842479062253094f, 0.0784335999999992f, 0.0792237451477643f)),
+        dot(v, float3(0.0423282422610123f, 0.878468636469772f, 0.0791661274605434f)),
+        dot(v, float3(0.0423756549057051f, 0.0784336f, 0.879142973793104f)));
+}
+
+
+float3 agxOutsetMat(float3 v)
+{
+    return float3(
+        dot(v, float3( 1.19687900512017f, -0.0980208811401368f, -0.0990297440797205f)),
+        dot(v, float3(-0.0528968517574562f, 1.15190312990417f, -0.0989611768448433f)),
+        dot(v, float3(-0.0529716355144438f, -0.0980434501171241f, 1.15107367264116f)));
+}
+#line 151 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/agx.h.fsl"
+float3 agxContrast(float3 x, float4 curve, float4 curveScale)
+{
+    float3 px = float3(curveScale.z, curveScale.z, curveScale.z);
+
+
+    float3 hi = step(px, x);
+    float3 S = lerp(float3(-curveScale.x, -curveScale.x, -curveScale.x),
+                     float3( curveScale.y, curveScale.y, curveScale.y), hi);
+    float3 p = lerp(float3(curve.y, curve.y, curve.y),
+                     float3(curve.z, curve.z, curve.z), hi);
+    float3 t = max(curve.x * (x - px) / S, float3(0.0f, 0.0f, 0.0f));
+    return (t / pow(1.0f + pow(t, p), 1.0f / p)) * S + float3(curveScale.w, curveScale.w, curveScale.w);
+}
+#line 211 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/agx.h.fsl"
+float3 agxInverseNeutral(float3 d, float4 curve, float4 curveScale, float4 look)
+{
+    float3 v = pow(max(d, float3(0.0f, 0.0f, 0.0f)), float3(1.0f / 2.2f, 1.0f / 2.2f, 1.0f / 2.2f));
+
+
+
+    float invPow = 1.0f / max(look.y, 1.0e-4f);
+    v = (pow(max(v, float3(0.0f, 0.0f, 0.0f)), float3(invPow, invPow, invPow)) - look.w)
+      / max(look.x, 1.0e-4f);
+
+
+
+
+    float3 py = float3(curveScale.w, curveScale.w, curveScale.w);
+    float3 hi = step(py, v);
+    float3 S = lerp(float3(-curveScale.x, -curveScale.x, -curveScale.x),
+                     float3( curveScale.y, curveScale.y, curveScale.y), hi);
+    float3 p = lerp(float3(curve.y, curve.y, curve.y),
+                     float3(curve.z, curve.z, curve.z), hi);
+    float3 y = clamp((v - py) / S, float3(0.0f, 0.0f, 0.0f),
+                      float3(1.0f - 1.0e-5f, 1.0f - 1.0e-5f, 1.0f - 1.0e-5f));
+    float3 t = y / pow(max(1.0f - pow(y, p), float3(1.0e-12f, 1.0e-12f, 1.0e-12f)),
+                        float3(1.0f, 1.0f, 1.0f) / p);
+    float3 x = clamp(t * S / max(curve.x, 1.0e-4f) + float3(curveScale.z, curveScale.z, curveScale.z),
+                      float3(0.0f, 0.0f, 0.0f), float3(1.0f, 1.0f, 1.0f));
+
+    return exp2(x * ( (4.026069f)  -  (-12.47393f) ) +  (-12.47393f) );
+}
+
+
+
+
+
+
+
+float3 agx(float3 v, float4 curve, float4 curveScale)
+{
+    v = agxInset(max(v, float3(0.0f, 0.0f, 0.0f)));
+
+
+    v = clamp(log2(max(v, float3(1.0e-10f, 1.0e-10f, 1.0e-10f))),
+              float3( (-12.47393f) ,  (-12.47393f) ,  (-12.47393f) ),
+              float3( (4.026069f) ,  (4.026069f) ,  (4.026069f) ));
+    v = (v -  (-12.47393f) ) * (1.0f / ( (4.026069f)  -  (-12.47393f) ));
+    return agxContrast(v, curve, curveScale);
+}
+#line 277 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/agx.h.fsl"
+float3 agxLook(float3 v, float slope, float power, float sat, float offset)
+{
+    v = pow(max(v * slope + offset, float3(0.0f, 0.0f, 0.0f)),
+            float3(power, power, power));
+    float luma = dot(v, float3(0.2126f, 0.7152f, 0.0722f));
+    return luma + sat * (v - luma);
+}
+
+
+float3 agxOutset(float3 v)
+{
+    v = agxOutsetMat(v);
+    return pow(max(v, float3(0.0f, 0.0f, 0.0f)), float3(2.2f, 2.2f, 2.2f));
+}
+#line 36 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/sky.frag.fsl"
+#line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/hosek.h.fsl"
+#line 35 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/hosek.h.fsl"
+float3 hosekRadiance(float3 dir)
+{
+
+
+
+
+
+
+
+    float ct = max(0.0f, dir.z);
+
+    float cg = clamp(dot(dir, gSkyView.sunDirW.xyz), -1.0f, 1.0f);
+    float g = acos(cg);
+
+    float3 c0 = gSkyView.coef[0].xyz;
+    float3 c1 = gSkyView.coef[1].xyz;
+    float3 c2 = gSkyView.coef[2].xyz;
+    float3 c3 = gSkyView.coef[3].xyz;
+    float3 c4 = gSkyView.coef[4].xyz;
+    float3 c5 = gSkyView.coef[5].xyz;
+    float3 c6 = gSkyView.coef[6].xyz;
+    float3 c7 = gSkyView.coef[7].xyz;
+    float3 c8 = gSkyView.coef[8].xyz;
+
+    float3 expM = exp(c4 * g);
+    float rayM = cg * cg;
+
+
+
+    float3 den = 1.0f + c8 * c8 - 2.0f * c8 * cg;
+    float3 den3 = den * sqrt(max(f3(1.0e-8f), den));
+    float3 mieM = (1.0f + rayM) / den3;
+    float zen = sqrt(ct);
+
+    float3 L = (1.0f + c0 * exp(c1 / (ct + 0.01f)))
+             * (c2 + c3 * expM + c5 * rayM + c6 * mieM + c7 * zen);
+    return max(f3(0.0f), L * gSkyView.radiance.xyz);
+}
+#line 37 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/sky.frag.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/waterfog.h.fsl"
 #line 40 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/waterfog.h.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/phase.h.fsl"
@@ -1878,7 +2028,7 @@ float waterFogVolStrength()
 {
     return gShadowParams.waterFogExt.w;
 }
-#line 36 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/sky.frag.fsl"
+#line 38 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/sky.frag.fsl"
 
 STRUCT(VSOutput)
 {
@@ -1890,9 +2040,10 @@ STRUCT(VSOutput)
     DATA(FLAT(uint), VColSource, TEXCOORD3);
     DATA(FLAT(float), MatAlpha, TEXCOORD4);
     DATA(float3, WorldDir, TEXCOORD5);
-#line 47
+    DATA(FLAT(uint), SkyClass, TEXCOORD6);
+#line 50
 };
-
+#line 64 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/sky.frag.fsl"
 [RootSignature( "RootFlags(ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT)," "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "3" ", offset = 0)," "CBV(b0, numDescriptors = unbounded, space = " "3" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "3" ", offset = 0))," "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "2" ", offset = 0)," "CBV(b0, numDescriptors = unbounded, space = " "2" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "2" ", offset = 0))," "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "1" ", offset = 0)," "CBV(b0, numDescriptors = unbounded, space = " "1" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "1" ", offset = 0))," "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "0" ", offset = 0)," "CBV(b0, numDescriptors = unbounded, space = " "0" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "0" ", offset = 0))," "DescriptorTable(" "SAMPLER(s0, numDescriptors = unbounded, space = " "0" ", offset = 0))," "StaticSampler(s0, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s1, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s2, space = 100," "filter = FILTER_MIN_MAG_LINEAR_MIP_POINT," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s3, space = 100," "filter = FILTER_MIN_MAG_LINEAR_MIP_POINT," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s4, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s5, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s6, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT," "addressU = TEXTURE_ADDRESS_MIRROR, addressV = TEXTURE_ADDRESS_MIRROR, addressW = TEXTURE_ADDRESS_MIRROR)," "StaticSampler(s7, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT, borderColor = STATIC_BORDER_COLOR_TRANSPARENT_BLACK," "addressU = TEXTURE_ADDRESS_BORDER, addressV = TEXTURE_ADDRESS_BORDER, addressW = TEXTURE_ADDRESS_BORDER)," "StaticSampler(s8, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR," "addressU = TEXTURE_ADDRESS_MIRROR, addressV = TEXTURE_ADDRESS_MIRROR, addressW = TEXTURE_ADDRESS_MIRROR)," "StaticSampler(s9, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR, borderColor = STATIC_BORDER_COLOR_TRANSPARENT_BLACK," "addressU = TEXTURE_ADDRESS_BORDER, addressV = TEXTURE_ADDRESS_BORDER, addressW = TEXTURE_ADDRESS_BORDER)," "StaticSampler(s10, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 8," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s11, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 8," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s12, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 8," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s13, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 8," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s14, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 2," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s15, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 2," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s16, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 2," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s17, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 2," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_WRAP)" )]
 float4 PS_MAIN( VSOutput In ): SV_TARGET
 {
@@ -1929,9 +2080,39 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
     float amt = gFrameData.skyParams.x;
     if (gFrameData.skyParams.z > 0.5f) { amt *= 0.5f + 0.5f * sin(gFrameData.skyParams.y * 3.0f); }
     c.rgb = lerp(c.rgb, float3(1.0f, 0.0f, 1.0f), amt);
-#line 101 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/sky.frag.fsl"
-    c.rgb = liftInPass(c.rgb);
-#line 132 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/sky.frag.fsl"
+#line 122 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/sky.frag.fsl"
+    const uint cls = In.SkyClass;
+
+    if (cls ==  6u  && gShadowParams.toneParams.y > 0.5f) {
+#line 142 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/sky.frag.fsl"
+        c.rgb = hosekRadiance(normalize(In.WorldDir)) * gSkyView.radiance.w;
+    } else if (cls ==  4u  && gShadowParams.agxCurve.w > 0.5f) {
+#line 178 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/sky.frag.fsl"
+        float E = max(gShadowParams.calParams.y, 1.0e-4f);
+        c.rgb = agxInverseNeutral(c.rgb, gShadowParams.agxCurve, gShadowParams.agxCurveScale,
+                                  gShadowParams.agxLookParams) / E;
+    } else if (cls ==  3u  && gShadowParams.toneParams.y > 0.5f
+               && dot(gSkyView.sunDisc.xyz, float3(1.0f, 1.0f, 1.0f)) > 0.0f) {
+#line 213 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/sky.frag.fsl"
+        float3 emis = c.rgb * gSkyView.sunDisc.xyz;
+        c.rgb = expandExposedEmissiveP(emis, tex.rgb, c.a, gSkyView.sunDisc.w);
+    } else if (cls ==  5u  && gShadowParams.toneParams.y > 0.5f) {
+#line 239 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/sky.frag.fsl"
+        c.rgb *= gSkyView.elemRadiance.x;
+    } else if (cls ==  2u  && gShadowParams.toneParams.y > 0.5f) {
+#line 257 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/sky.frag.fsl"
+        c.rgb *= gSkyView.elemRadiance.y;
+    } else {
+
+
+
+
+
+
+
+        c.rgb = liftInPass(c.rgb);
+    }
+#line 310 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/sky.frag.fsl"
     if (waterFogCameraSubmerged()) {
         float3 skyRel = normalize(In.WorldDir) * 1.0e5f;
         c.rgb = waterFogBlend(c.rgb, c.rgb, skyRel, waterFogSample(skyRel));

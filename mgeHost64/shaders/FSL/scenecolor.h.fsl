@@ -273,9 +273,14 @@ float3 mod2xStage(float3 t)
 // the others by lumaE, which turns the flame's orange body into a near-black deep red — visible as
 // dark speckles among the white-hot core. Whichever channel ran out of range, the TEXEL hit the
 // ceiling, so the whole texel is scaled by one number and the hue is preserved.
-float3 expandExposedEmissive(float3 emis, float3 albedoRgb, float cov)
+// ⚠ THE EXPONENT IS A PARAMETER HERE AND A LANE IN THE WRAPPER BELOW, because P2b gave the SUN
+// DISC its own. tx_sun_05.dds is the same kind of image as the flames — measured: max(RGB) >= 0.99
+// over 99.4% of its texels and over 100% of the ones its alpha calls transparent, mean alpha 0.118,
+// a radial profile that runs a=1.00 in the core to a=0.001 at r=0.8 — so it needs this operator.
+// But it is a GLARE SPRITE, not a lamp: it wants a falloff chosen from ITS profile, and sharing the
+// material path's lane would make one slider move two unrelated things. Same code, two exponents.
+float3 expandExposedEmissiveP(float3 emis, float3 albedoRgb, float cov, float p)
 {
-    float p = gShadowParams.skyAO2.w;
     if (!(p > 0.0f)) { return emis; }
     // The measure is the EXPOSED value — albedo x coverage — because that product is what MW put on
     // screen and therefore what the 8-bit encode clipped. max() over the channels, because a
@@ -288,6 +293,13 @@ float3 expandExposedEmissive(float3 emis, float3 albedoRgb, float cov)
     float  fMin  = 1.0f / max(lumaE, 1.0f);
     float  f = fMin + (1.0f - fMin) * pow(w, p);
     return emis * f;
+}
+
+// The MATERIAL emissive path's binding of the above: the exponent comes from the lane every colour
+// frag already reads. Unchanged behaviour for every existing caller.
+float3 expandExposedEmissive(float3 emis, float3 albedoRgb, float cov)
+{
+    return expandExposedEmissiveP(emis, albedoRgb, cov, gShadowParams.skyAO2.w);
 }
 
 // The same operator as the DELTA to add to an ALREADY-ASSEMBLED `lit`. Every colour frag folds emis

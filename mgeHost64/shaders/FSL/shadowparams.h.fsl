@@ -394,8 +394,14 @@ STRUCT(ShadowMaskParams)
     // ⚠ NOT dbgScales. That one is a diagnostic whose PARTIAL reach (four passes) is the feature —
     // it shows what Forge does not draw. A calibration has to be total or it steps at the near/far
     // handover. Read the note beside g_calSunGain before merging them.
-    // yzw spare — y is where the exposure servo's value will land, which is why this is its own
-    // float4 rather than the two free lanes of toneParams.
+    // y = THE EXPOSURE SERVO'S VALUE, E — live since P2b, and this is the lane the comment above
+    //     reserved for it. Written from the SAME folded expression the resolve reads
+    //     (`(sceneReferred && expEnable) ? g_exposure : 1.0`), from one host site, precisely so the
+    //     pass that MULTIPLIES by E and the pass that DIVIDES by it can never disagree about which E
+    //     — a moon pinned against a different E than the resolve applies drifts with the servo, and
+    //     the drift would be slow enough to read as "the moons look a bit off tonight".
+    //     ⚠ ALWAYS >= a tiny floor, never 0: it is a divisor now.
+    // zw spare.
     //
     // ⚠ z BRIEFLY CARRIED THE SKY'S PHOTOMETRIC ANCHOR (P1, tasks/forge-physical-sky.md) — a
     // per-frame scale sky.frag multiplied MW's authored sky by, so the sky sat at the physical level
@@ -407,4 +413,25 @@ STRUCT(ShadowMaskParams)
     // (skyview.h.fsl) on a PER-VIEW cbuffer, precisely because THIS struct is bound by POINTER into
     // every PerFrame set and so cannot carry anything the mirror needs a different value of.
     DATA(float4,   calParams,       None);
+    // --- P2b: THE ARMED DISPLAY CURVE, so a colour pass can UNDO it ------------------------------
+    // The moon pin needs agxInverseNeutral() (agx.h.fsl), and that needs the same three float4s
+    // resolve.frag's own private cbuffer carries. They are duplicated HERE rather than reached for
+    // there because gResolveParams is a different SRT that a colour frag cannot see, and because
+    // gShadowParams is bound by pointer into every PerFrame set — one host write, every consumer.
+    //
+    // ⚠ WRITTEN FROM THE SAME HOST EXPRESSIONS AS gResolveParams.curve/curveScale/look. Two copies
+    // of a curve is exactly how a pass ends up inverting a curve nothing applies; the host writes
+    // both from one place for that reason, and the self-test's CLOSED-FORM gate is what proves the
+    // inverse still matches the forward after a slider moves.
+    //
+    // agxCurve      = (slope, toePower, shoulderPower, ARMED) — .w mirrors toneParams.w so a reader
+    //                 that has only this float4 can still tell whether AgX is the running curve.
+    // agxCurveScale = (toeScale, shoulderScale, pivotX, pivotY) — both scales computed host-side,
+    //                 because agxScaleF() returns NaN outside its domain and a NaN survives every
+    //                 later multiply including one by zero ([[project_nan_survives_zero_multiply]]).
+    // agxLookParams = (slope, power, sat, offset), in agxLook()'s own argument order. sat is carried
+    //                 for completeness and is identically a no-op on the neutral axis.
+    DATA(float4,   agxCurve,        None);
+    DATA(float4,   agxCurveScale,   None);
+    DATA(float4,   agxLookParams,   None);
 };

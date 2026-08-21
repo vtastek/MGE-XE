@@ -162,6 +162,81 @@ float3 agxContrast(float3 x, float4 curve, float4 curveScale)
     return (t / pow(1.0f + pow(t, p), 1.0f / p)) * S + float3(curveScale.w, curveScale.w, curveScale.w);
 }
 
+// THE CLOSED-FORM INVERSE OF THE NEUTRAL AXIS — linear DISPLAY back to linear SCENE RADIANCE.
+// tasks/forge-physical-sky.md P2b, and it exists for exactly one caller: the MOON PIN.
+//
+// A moon has to keep its authored display value at ANY exposure, or a full moon clips to white at
+// night exposure and loses its maria and its terminator. That means `scene = agxInverse(authored)/E`
+// evaluated PER PIXEL — and the host's inverse is a 24-step BISECTION (forgerender.cpp), which is
+// not shippable per pixel.
+//
+// It is available in closed form because the forward neutral path is a composition of individually
+// invertible steps, run in this order and undone in the reverse one:
+//
+//   d  ->  pow(d, 1/2.2)                                       undo the 2.2 reference-display EOTF
+//      ->  (pow(., 1/power) - offset) / slope                  undo the look's SOP
+//      ->  y = (. - py)/S ;  t = y / (1 - y^p)^(1/p) ;         undo the parametric sigmoid
+//          x = t*S/slope_c + px
+//      ->  exp2(x*(MAX_EV - MIN_EV) + MIN_EV)                  undo the log normalise
+//
+// The sigmoid step is the only one worth showing the algebra for. Forward it is
+// `hyper(t,p) = t/(1+t^p)^(1/p)`, so with y = hyper(t,p):  y^p (1 + t^p) = t^p
+// => t^p (1 - y^p) = y^p  =>  t = y / (1 - y^p)^(1/p).  Three pow()s and a divide.
+//
+// ⚠ IT IS THE **NEUTRAL-AXIS** INVERSE, APPLIED PER CHANNEL. The forward path runs the inset
+// matrix, mixes channels, and applies the look's SATURATION — none of which this undoes. It is
+// therefore EXACT for grey (row sums 1.000136/0.999963/0.999952, and sat is identically a no-op on
+// the neutral axis by agxLook's SOP-then-SAT ordering) and APPROXIMATE for saturated colour. The
+// moons are near-grey, which is why the one caller can have it. Do NOT reach for this to "un-AgX"
+// an arbitrary colour.
+//
+// ⚠ AND IT IS NOT A RESURRECTION OF scenecolor.h.fsl's DEAD CLASS-2 LIFT. That one inverted the
+// LEGACY CUBIC while AgX was armed, and it ignored exposure entirely — two independent reasons it
+// preserved nothing. This inverts the curve that actually runs AND the caller divides by E, which
+// is the complete round trip the lift only half-did.
+//
+// ⚠ NUMERICALLY GATED, NOT TRUSTED. forgerender.cpp's AgX self-test runs this same closed form
+// against the 24-step bisection over the same 16.5-stop sweep and prints the max deviation
+// ("CLOSED-FORM ERR"). Derived maths gets verified ([[feedback_prior_art_constants_dont_transfer]]);
+// if the two disagree the moons are wrong and NOTHING ELSE IN THE FRAME WOULD SAY SO.
+//
+// The clamps are all range guards, none of them shape the answer inside the invertible band:
+//   y is clamped BELOW 1 because y -> 1 is t -> infinity, i.e. the ends of the log domain;
+//   x is clamped to [0,1] because outside it the log was clamped forward and there is nothing to
+//     invert — the bisection returns its bracket ends there for the same reason.
+//
+// curve      = (slope, toePower, shoulderPower, unused)     — as agxContrast
+// curveScale = (toeScale, shoulderScale, pivotX, pivotY)    — as agxContrast
+// look       = (slope, power, sat, offset)                  — as agxLook's arguments, in that order
+float3 agxInverseNeutral(float3 d, float4 curve, float4 curveScale, float4 look)
+{
+    float3 v = pow(max(d, float3(0.0f, 0.0f, 0.0f)), float3(1.0f / 2.2f, 1.0f / 2.2f, 1.0f / 2.2f));
+
+    // The look, undone. sat is absent by construction (no-op on the neutral axis); slope and power
+    // are floored rather than trusted — a zero on either is a divide and this runs per pixel.
+    float invPow = 1.0f / max(look.y, 1.0e-4f);
+    v = (pow(max(v, float3(0.0f, 0.0f, 0.0f)), float3(invPow, invPow, invPow)) - look.w)
+      / max(look.x, 1.0e-4f);
+
+    // The sigmoid, undone. Which side of the pivot a channel is on is decided by the OUTPUT here
+    // (v >= pivotY), which is the exact mirror of agxContrast deciding it on the input (x >= pivotX)
+    // — the curve is monotone, so the two tests select the same branch.
+    float3 py = float3(curveScale.w, curveScale.w, curveScale.w);
+    float3 hi = step(py, v);
+    float3 S  = lerp(float3(-curveScale.x, -curveScale.x, -curveScale.x),
+                     float3( curveScale.y,  curveScale.y,  curveScale.y), hi);
+    float3 p  = lerp(float3(curve.y, curve.y, curve.y),
+                     float3(curve.z, curve.z, curve.z), hi);
+    float3 y  = clamp((v - py) / S, float3(0.0f, 0.0f, 0.0f),
+                      float3(1.0f - 1.0e-5f, 1.0f - 1.0e-5f, 1.0f - 1.0e-5f));
+    float3 t  = y / pow(max(1.0f - pow(y, p), float3(1.0e-12f, 1.0e-12f, 1.0e-12f)),
+                        float3(1.0f, 1.0f, 1.0f) / p);
+    float3 x  = clamp(t * S / max(curve.x, 1.0e-4f) + float3(curveScale.z, curveScale.z, curveScale.z),
+                      float3(0.0f, 0.0f, 0.0f), float3(1.0f, 1.0f, 1.0f));
+
+    return exp2(x * (AGX_MAX_EV - AGX_MIN_EV) + AGX_MIN_EV);
+}
+
 // Steps 1-3: linear scene radiance -> the AgX tone-mapped log domain, ~[0,1].
 //
 // TAKES THE CURVE AS PARAMETERS rather than reading a cbuffer, and that is the same split

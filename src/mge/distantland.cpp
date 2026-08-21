@@ -1367,14 +1367,22 @@ bool DistantLand::inspectIndexedPrimitive(int sceneCount, const RenderedState* r
     // it required USE_ATM_SCATTER, which is off in most configs, so it almost never fired.
     if (recordMWCount == 0 && rs->blendEnable && sceneCount == 0 && mwBridge->CellHasWeather()) {
         // Pass through — MW draws it. ONE exception: the sun disc. The Forge host draws the sun too,
-        // and where its semi-transparent lower dome band lets MW bleed through the composite, MW's
-        // sun ADDS to the host's — a bright horizontal seam across the disc at the fog line (the
-        // "double sun", reported 2026-07-23). Reject MW's copy by exact D3D9-texture identity
-        // (tx_sun_05, published by the sky-list build) so the host's sun is the only one. Pointer
-        // match — never a fade quad / loading bar, which is why this is safe where a broad
+        // so MW's copy is a SECOND sun over the host's and has to go. Reject it by exact D3D9-texture
+        // identity (tx_sun_05, published by the sky-list build) so the host's is the only one.
+        // Pointer match — never a fade quad / loading bar, which is why this is safe where a broad
         // suppression here is NOT (see the S4a warning below). Only under Forge ownership; vanilla
         // (F11 off) keeps MW's sun. g_sunDX9Texture is null until the first sky build, so the sun
         // survives one frame at cell load — negligible.
+        //
+        // ⚠ THE ORIGINAL REASON FOR THIS REJECT IS STALE, THE REJECT IS NOT (P2/P2b). It was written
+        // against the "double sun" of 2026-07-23, a bright horizontal seam across the disc where the
+        // host dome's semi-transparent lower band let MW bleed through the composite. There is no
+        // semi-transparent band any more: the physical sky (skyhw.frag) is an OPAQUE full-screen
+        // backdrop, so nothing of MW's can show through the composite at all. What kept this branch
+        // alive through P2 — where the host briefly drew NO sun, since suppressing MW's entire sky
+        // loop also suppressed the host's copy of it — was an accident of that suppression; P2b
+        // draws the sun again, from the same sky list, and the premise "the host draws the sun too"
+        // is true once more. Do not delete this on the grounds that the band is gone.
         if (RenderProcess::forgeOwnsFrame() && rs->texture
             && rs->texture == RenderProcess::sunDX9Texture()) {
             return false;

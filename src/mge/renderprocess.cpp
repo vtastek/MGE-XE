@@ -3549,6 +3549,66 @@ namespace {
         return count;
     }
 
+    // P2b — WHICH OF THE FIVE SKY ELEMENTS IS THIS.
+    //
+    // The base-map NAME is the only thing MW's sky subtree carries that identifies an element, and
+    // it is a reliable one: the shapes are engine-built from a fixed texture set. Verified against
+    // the in-game `[sk-diag]` census (14 shapes, exterior, clear):
+    //
+    //   (none)                  vc=32  order=0      -> DOME    the untextured atmosphere gradient
+    //   Tx_Stars*.tga           vc=6..85 order=1..7 -> STARS   incl. Tx_Stars_Nebula*_02.tga
+    //   tx_sun_05.dds           vc=4   order=8      -> SUN
+    //   tx_mooncircle_full_M|S  vc=4   order=9,11   -> MOON    the shadow layer under each disc
+    //   tx_masser_*/tx_secunda_*vc=4   order=10,12  -> MOON    the lit disc
+    //   Tx_Sky_Clear.dds        vc=65  order=13     -> CLOUD   Tx_Sky_<weather> per preset
+    //
+    // ⚠ THE NAMES ARRIVE IN MIXED FORM — bare (`Tx_Stars.tga`) and path-prefixed
+    // (`Data Files\Textures\tx_sun_05.dds`) in the SAME census — so every test is a
+    // case-insensitive SUBSTRING over the whole string, never a prefix or an equality.
+    //
+    // ⚠ ORDER MATTERS ONCE, and only once: nothing else here can match a moon, but "secunda"
+    // contains "cun" and not "sun", so the SUN test is safe wherever it sits. The moons are still
+    // tested first because that is the ordering the reader will assume is load-bearing.
+    //
+    // ⚠ "sky_" IS ONLY SAFE BECAUSE THIS FUNCTION IS SKY-ONLY. Bloodmoon's whole architecture and
+    // terrain set is named `TX_Sky_*` (Tx_Sky_FA_Pine_01, Tx_Sky_crops_01, ...). Those are world
+    // meshes and never reach this function — it is called from the sky-list build, over entries the
+    // scene walk already flagged isSky. Do not lift this test anywhere else.
+    IPC::SkyClass classifySky(const char* texName, bool hasTexture,
+                              std::uint32_t vertexCount, std::uint32_t triangleCount) {
+        // The dome is the ONE shape with no base map, which is also exactly what makes it the one
+        // the Hosek-Wilkie field can replace: it carries no MW art, only a baked gradient.
+        if (!hasTexture || !texName) { return IPC::kSkyClassDome; }
+
+        // case-insensitive substring (|32 lowercases ASCII letters; both strings are ASCII).
+        auto has = [](const char* hay, const char* needle) -> bool {
+            for (const char* h = hay; *h; ++h) {
+                const char* a = h;
+                const char* b = needle;
+                while (*b && *a && ((*a | 32) == (*b | 32))) { ++a; ++b; }
+                if (!*b) { return true; }
+            }
+            return false;
+        };
+
+        if (has(texName, "stars") || has(texName, "nebula")) { return IPC::kSkyClassStars; }
+        // ⚠ MOONCIRCLE IS TESTED BEFORE THE MOONS AND IS A DIFFERENT CLASS. The moon arrives as a
+        // STACK — `tx_mooncircle_full_M` alpha-over at order 9, then `tx_masser_*` ADDITIVELY at
+        // order 10 (host [sk-mat], 2026-08-21: blend 5/6 then 5/2). The circle is painted with MW's
+        // SKY colour and exists to occlude the stars behind the dark limb; the disc is the moon. One
+        // class for both would pin the circle to MW's authored night sky, which is a dark blue over
+        // an H-W night sky that is black — reported in play as a dark side that is "a tad brighter".
+        if (has(texName, "mooncircle")) { return IPC::kSkyClassMoonShadow; }
+        if (has(texName, "masser") || has(texName, "secunda")) {
+            return IPC::kSkyClassMoon;
+        }
+        // The sun keeps the vc==4 && tri==2 quad guard the billboard fix has always applied — it is
+        // the shape that gets RE-FACED to the camera, and re-facing anything else would deform it.
+        if (vertexCount == 4 && triangleCount == 2 && has(texName, "sun")) { return IPC::kSkyClassSun; }
+        if (has(texName, "sky_")) { return IPC::kSkyClassCloud; }
+        return IPC::kSkyClassOther;
+    }
+
     // SK1 sky takeover: gather this frame's sky parts into g_skyScratch as SkyDrawWire[]. Source is
     // the WHOLE geometry cache (sky shapes are NOT in DistantLand::visibleCacheKeys — that's the MSOC
     // world-object drawn set), filtered to isSky entries that have a host slot. SK1 emits ONLY the
@@ -3641,9 +3701,17 @@ namespace {
                     if (!e.isSky) continue;
                     const bool stale  = (e.lastFrame != cacheFrame);
                     const bool noSlot = (g_keySlot.find(skey) == g_keySlot.end());
-                    LOG::logline(">> [sk-diag]   key=%08X tex=%s order=%u vc=%u %s%s",
+                    // P2b: the CLASS beside the name, so this table is the one place the
+                    // classifier can be read against the texture that produced it (verification
+                    // step 2 — read once, never again). Same call the packer makes.
+                    static const char* kClsName[] = { "OTHER", "DOME", "CLOUD", "SUN", "MOON",
+                                                      "STARS", "MOONSHADOW" };
+                    const IPC::SkyClass dcls = classifySky(e.textureName, e.d3dTexture != nullptr,
+                                                           e.vertexCount, e.triangleCount);
+                    LOG::logline(">> [sk-diag]   key=%08X tex=%s order=%u vc=%u cls=%s %s%s",
                                  skey, e.textureName ? e.textureName : "(none)",
                                  (unsigned)e.skyOrder, e.vertexCount,
+                                 kClsName[(unsigned)dcls <= 6u ? (unsigned)dcls : 0u],
                                  stale ? "STALE " : "fresh ", noSlot ? "NOSLOT" : "slot-ok");
                 }
             }
@@ -3679,6 +3747,12 @@ namespace {
                 // it's just never selected now.
                 item.vColSource = (e.hasVertexColor && e.vColSource != 0) ? e.vColSource : 0u;
             }
+            // P2b: WHAT IS THIS SHAPE. One classification, two consumers — the host's per-class
+            // treatment and the sun-disc billboard fix immediately below, which used to run its own
+            // copy of the "sun" substring test.
+            const IPC::SkyClass cls = classifySky(e.textureName, e.d3dTexture != nullptr,
+                                                  e.vertexCount, e.triangleCount);
+            item.skyClass = (std::uint32_t)cls;
             memcpy(item.world, e.worldTransformD3D, 16 * sizeof(float));
             // SK2 billboard fix (SUN ONLY): the sun disc hangs under a NiBillboardNode that MW
             // re-faces to the camera each frame via rotateToCamera — but that runs AFTER our
@@ -3691,14 +3765,13 @@ namespace {
             // ("tx_sun_05" — the moons are tx_masser/tx_secunda/tx_mooncircle, no "sun"). Rebuild a
             // camera-facing basis: preserve position (translation) + per-axis size; orient model
             // +X -> camera right, +Y -> camera up (spherical / full-facing → always round = vanilla).
-            bool isSunDisc = false;
-            if (e.d3dTexture && e.textureName && e.vertexCount == 4 && e.triangleCount == 2) {
-                // case-insensitive substring "sun" (|32 lowercases ASCII letters; loop guard keeps
-                // the p[1]/p[2] look-ahead inside the null-terminated string).
-                for (const char* p = e.textureName; p[0] && p[1] && p[2]; ++p) {
-                    if ((p[0] | 32) == 's' && (p[1] | 32) == 'u' && (p[2] | 32) == 'n') { isSunDisc = true; break; }
-                }
-            }
+            // ⚠ isSunDisc STAYS A SINGLE FLAG and is NOT widened into skyClass. It has two live
+            // consumers that mean "the sun and nothing else" — the reflection re-face
+            // (forgerender.cpp) and g_sunDX9Texture, which the proxy rejects MW's own sun draw by —
+            // and `if (it.isSunDisc)` would fire for every moon the moment it became an enum. The
+            // predicate is unchanged: classifySky applies the same vc==4 && tri==2 && has-texture
+            // guard the inline test did.
+            const bool isSunDisc = (cls == IPC::kSkyClassSun);
             if (isSunDisc) {
                 const D3DXMATRIX& V = DistantLand::mwView;  // row-vector view: columns = world camera axes
                 const float* m = item.world;

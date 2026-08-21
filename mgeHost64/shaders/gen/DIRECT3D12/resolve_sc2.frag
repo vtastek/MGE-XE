@@ -1066,6 +1066,35 @@ float3 agxContrast(float3 x, float4 curve, float4 curveScale)
     float3 t = max(curve.x * (x - px) / S, float3(0.0f, 0.0f, 0.0f));
     return (t / pow(1.0f + pow(t, p), 1.0f / p)) * S + float3(curveScale.w, curveScale.w, curveScale.w);
 }
+#line 211 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/agx.h.fsl"
+float3 agxInverseNeutral(float3 d, float4 curve, float4 curveScale, float4 look)
+{
+    float3 v = pow(max(d, float3(0.0f, 0.0f, 0.0f)), float3(1.0f / 2.2f, 1.0f / 2.2f, 1.0f / 2.2f));
+
+
+
+    float invPow = 1.0f / max(look.y, 1.0e-4f);
+    v = (pow(max(v, float3(0.0f, 0.0f, 0.0f)), float3(invPow, invPow, invPow)) - look.w)
+      / max(look.x, 1.0e-4f);
+
+
+
+
+    float3 py = float3(curveScale.w, curveScale.w, curveScale.w);
+    float3 hi = step(py, v);
+    float3 S = lerp(float3(-curveScale.x, -curveScale.x, -curveScale.x),
+                     float3( curveScale.y, curveScale.y, curveScale.y), hi);
+    float3 p = lerp(float3(curve.y, curve.y, curve.y),
+                     float3(curve.z, curve.z, curve.z), hi);
+    float3 y = clamp((v - py) / S, float3(0.0f, 0.0f, 0.0f),
+                      float3(1.0f - 1.0e-5f, 1.0f - 1.0e-5f, 1.0f - 1.0e-5f));
+    float3 t = y / pow(max(1.0f - pow(y, p), float3(1.0e-12f, 1.0e-12f, 1.0e-12f)),
+                        float3(1.0f, 1.0f, 1.0f) / p);
+    float3 x = clamp(t * S / max(curve.x, 1.0e-4f) + float3(curveScale.z, curveScale.z, curveScale.z),
+                      float3(0.0f, 0.0f, 0.0f), float3(1.0f, 1.0f, 1.0f));
+
+    return exp2(x * ( (4.026069f)  -  (-12.47393f) ) +  (-12.47393f) );
+}
 
 
 
@@ -1084,7 +1113,7 @@ float3 agx(float3 v, float4 curve, float4 curveScale)
     v = (v -  (-12.47393f) ) * (1.0f / ( (4.026069f)  -  (-12.47393f) ));
     return agxContrast(v, curve, curveScale);
 }
-#line 202 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/agx.h.fsl"
+#line 277 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/agx.h.fsl"
 float3 agxLook(float3 v, float slope, float power, float sat, float offset)
 {
     v = pow(max(v * slope + offset, float3(0.0f, 0.0f, 0.0f)),

@@ -25,7 +25,8 @@
 // mirror cannot be handed half of it.
 #pragma once
 
-// One cooked Hosek-Wilkie configuration + the view that reads it. 64 floats == 256 B.
+// One cooked Hosek-Wilkie configuration + the view that reads it, and (P2b) the two sky ELEMENTS
+// whose radiance the model has to set rather than MW. 72 floats == 288 B; the CBV is 512 B.
 STRUCT(SkyViewData)
 {
     // THIS view's inverse viewProj. Reverse-Z, camera-relative, half-pixel-adjusted — i.e. exactly
@@ -56,4 +57,41 @@ STRUCT(SkyViewData)
     //     distinguishable in a capture.
     // yzw spare.
     DATA(float4, params, None);
+    // ─── P2b: THE SUN DISC, AS RADIANCE ───────────────────────────────────────────────────────────
+    // xyz = L_sunDisc, the disc's PEAK radiance in SCENE units, per channel: E_normal / Omega_sprite,
+    //       where E_normal is the model's own direct-normal solar irradiance and Omega_sprite is the
+    //       solid angle MW'S QUAD actually covers — computed host-side from the draw's world
+    //       transform and the mesh's model-space bound, and PRINTED, because it is NOT the sun's
+    //       6.8e-5 sr. MW's is a big glare sprite; the ratio is a finding, not a constant.
+    //       Per CHANNEL so the disc reddens at sunset the way the transmittance says it should —
+    //       which, with the energy tracking E_normal, is what makes it dim at dusk and bright at
+    //       noon BY ITSELF. That self-regulation is the whole reason this is physical and not pinned.
+    // w   = the disc's OWN whiteness-falloff exponent for expandExposedEmissiveP(). ⚠ NOT
+    //       gShadowParams.skyAO2.w: that lane is the material-emissive path's and this is a glare
+    //       sprite; sharing it would make one slider move two unrelated things. 0 = exact bypass,
+    //       which is a UNIFORM gain and renders the sprite as a bright SQUARE
+    //       ([[project_sdr_exposed_not_radiance]]) — it is a diagnostic setting, not a default.
+    DATA(float4, sunDisc, None);
+    // ─── P2b: THE TWO ELEMENTS WHOSE LEVEL THE MODEL SETS RATHER THAN MW ──────────────────────────
+    // x = THE STAR LAYER's radiance in SCENE units. Stars are drawn ADDITIVELY over the physical sky
+    //     (see forgerender.cpp's sky loop), so this ONE number decides day and night at once and no
+    //     fade curve is involved: by day the sky under them drowns them, by night the physical sky
+    //     has ramped to black and the same radiance is all there is, so the servo's night exposure
+    //     brings it up. That asymmetry is the camera behaviour the user asked for ("stars can expose
+    //     up instead of fade"), and it is why the space between them goes correctly black.
+    //     ⚠ IT DOES **NOT** RIDE gSkyHwStrength, unlike everything else here. That lane is the
+    //     ATMOSPHERE's A/B level; a star is not atmosphere, and coupling them made the tuned value
+    //     depend on where an unrelated slider happened to sit.
+    // y = THE CLOUD LAYER's radiance for a fully-lit (authored 1.0) texel, SCENE units:
+    //     albedo_cloud * E_total/pi, with the night ramp and the sky strength folded in.
+    //     ⚠ THIS IS AN ANCHOR, NOT A DIM. MW's cloud layer is authored display data, and P2 dropped
+    //     the sky ~1.1 stops beneath it without touching it — so the clouds kept riding the exposure
+    //     on their own. At night that is severe: the sky is black, the servo runs E = 14-27 to meter
+    //     a dark ground, and an authored cloud at ~0.4 linear lands near display 240. Reported in
+    //     play, 2026-08-21: *"clouds are a lot brighter compared to MW."* Deriving the level from
+    //     the light the frame is actually casting fixes both ends at once — the ratio to the zenith
+    //     is albedo/q (~6.4x at the reference, the physical band), and at night the ramp takes it to
+    //     0 so the clouds go dark WITH the sky while still occluding the stars through their alpha.
+    // zw spare.
+    DATA(float4, elemRadiance, None);
 };

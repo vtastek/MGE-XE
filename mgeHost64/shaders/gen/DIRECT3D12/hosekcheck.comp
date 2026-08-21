@@ -978,7 +978,7 @@ SamplerState gSampler2xWrapClamp : register( s17 , space100 ) ;
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/hosekcheck.srt.h"
 #line 14 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/hosekcheck.srt.h"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyview.h.fsl"
-#line 29 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyview.h.fsl"
+#line 30 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyview.h.fsl"
 STRUCT(SkyViewData)
 {
 
@@ -1009,7 +1009,11 @@ STRUCT(SkyViewData)
 
 
     float4 params;
-#line 59
+#line 74 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyview.h.fsl"
+    float4 sunDisc;
+#line 96 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyview.h.fsl"
+    float4 elemRadiance;
+#line 97
 };
 #line 15 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/hosekcheck.srt.h"
 

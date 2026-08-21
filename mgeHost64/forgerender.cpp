@@ -3253,6 +3253,43 @@ namespace {
         return agxInverseNeutralLookF(d, g_agxSlope, g_agxPower, g_agxSat, g_agxOffset);
     }
 
+    // THE SAME INVERSE, IN CLOSED FORM — the exact mirror of agx.h.fsl's agxInverseNeutral(), which
+    // is what the MOON PIN runs per pixel (tasks/forge-physical-sky.md P2b).
+    //
+    // The bisection above is not shippable per pixel, and it does not have to be: the forward
+    // neutral path is a composition of individually invertible steps. Undo the 2.2 EOTF, undo the
+    // look's SOP, invert the sigmoid — hyper(t,p) = t/(1+t^p)^(1/p) gives t = y/(1-y^p)^(1/p) — then
+    // un-normalise and exp2. Four pow()s.
+    //
+    // ⚠ IT EXISTS HERE PURELY SO THE SELF-TEST CAN GATE IT. The render path never runs AgX on the
+    // host; this is the C++ transcription of the shader's maths, held against the bisection over the
+    // same sweep so a mistyped exponent or a mirrored branch shows up as a number at init instead of
+    // as moons that are quietly the wrong brightness — which nothing else in the frame would say.
+    // [[feedback_prior_art_constants_dont_transfer]]
+    inline float agxInverseNeutralClosedLookF(float d, float slope, float power, float sat, float offset) {
+        (void)sat;   // identically a no-op on the neutral axis, exactly as in the forward direction
+        const AgxScales sc     = agxScalesF();
+        const float     slopeC = agxSlopeF();
+
+        float v = std::pow(std::max(d, 0.0f), 1.0f / 2.2f);
+        const float invPow = 1.0f / std::max(power, 1.0e-4f);
+        v = (std::pow(std::max(v, 0.0f), invPow) - offset) / std::max(slope, 1.0e-4f);
+
+        // Which side of the pivot, decided on the OUTPUT (v >= pivotY) — the exact mirror of
+        // agxSigmoidF deciding it on the input (x >= pivotX). The curve is monotone, so the two
+        // tests select the same branch.
+        const bool  hi = (v >= kAgxPivotY);
+        const float S  = hi ?  sc.shoulder      : -sc.toe;
+        const float p  = hi ?  g_agxShoulderPower : g_agxToePower;
+        float y = (v - kAgxPivotY) / S;
+        y = std::max(0.0f, std::min(y, 1.0f - 1.0e-5f));   // y -> 1 is t -> infinity, i.e. the ends
+        const float t = y / std::pow(std::max(1.0f - std::pow(y, p), 1.0e-12f), 1.0f / p);
+        float x = t * S / std::max(slopeC, 1.0e-4f) + kAgxPivotX;
+        x = std::max(0.0f, std::min(x, 1.0f));             // outside [0,1] the forward log clamped
+
+        return std::exp2(x * (kAgxMaxEV - kAgxMinEV) + kAgxMinEV);
+    }
+
     // --- THE CONSTANTS GATE ----------------------------------------------------------------------
     //
     // ⚠ EVERY NUMBER IN agx.h.fsl IS TRANSCRIBED PRIOR ART, AND TRANSCRIBED PRIOR ART GETS VERIFIED
@@ -3324,7 +3361,12 @@ namespace {
     //     the ~2e-4 the correct rows drift by. It also proves the mirror the servo depends on.
     //  3. INVERSE MAX ERR — agxNeutralF(agxInverseNeutralF(d)) - d, closed against the same mirror
     //     calGainDomain() inverts through, over the same sweep.
-    //  4. POLY ERR (step 3b) — the retired 6th-order fit, evaluated ONLY here, against the
+    //  4. CLOSED-FORM ERR (P2b) — agx.h.fsl's agxInverseNeutral(), transcribed into C++ and held
+    //     against the bisection over the same sweep. This is the ONE gate with no visual backstop:
+    //     the closed form runs PER PIXEL in sky.frag's moon pin, and if it is wrong the moons are
+    //     quietly the wrong brightness and every other thing in the frame looks fine. Derived maths
+    //     gets verified numerically, never trusted.
+    //  5. POLY ERR (step 3b) — the retired 6th-order fit, evaluated ONLY here, against the
     //     parametric sigmoid at 2.02 / 2.90 / 2.90. This is what makes replacing it a SUPERSET claim
     //     instead of a swap: if the new form can still produce the old image, nothing was lost by
     //     deleting the old code, and the check is stronger than an A/B toggle because it is the SAME
@@ -3364,7 +3406,7 @@ namespace {
         const float code18 = linearToSrgbF(o18[1]);
         const float code10 = linearToSrgbF(o10[1]);
 
-        float drift = 0.0f, invErr = 0.0f;
+        float drift = 0.0f, invErr = 0.0f, closedErr = 0.0f, closedGap = 0.0f;
         for (int pass = 0; pass < 2; ++pass) {
             const float sl = (pass == 0) ? 1.0f : g_agxSlope;
             const float pw = (pass == 0) ? 1.0f : g_agxPower;
@@ -3380,12 +3422,35 @@ namespace {
                 agxFullF(g, sl, pw, st, of, o);
                 const float n = agxNeutralLookF(x, sl, pw, st, of);
                 for (int c = 0; c < 3; ++c) { drift = std::max(drift, std::fabs(o[c] - n)); }
-                const float back = agxNeutralLookF(agxInverseNeutralLookF(n, sl, pw, st, of),
-                                                  sl, pw, st, of);
+                const float bisect = agxInverseNeutralLookF(n, sl, pw, st, of);
+                const float back = agxNeutralLookF(bisect, sl, pw, st, of);
                 invErr = std::max(invErr, std::fabs(back - n));
+                // (4) THE CLOSED FORM (P2b) — the shader's own maths, gated against the bisection.
+                // Measured the SAME way invErr is, i.e. as a round trip through the forward curve,
+                // so the two numbers are directly comparable and a reader does not have to know
+                // which of them is the reference. The raw gap between the two inverses is reported
+                // beside it, RELATIVE, because the bisection's own resolution is ~1e-6 on a bracket
+                // of 16.29 and an absolute gap would look alarming in the deep toe for that reason
+                // alone.
+                //
+                // ⚠ THE d == 0 SAMPLE IS EXCLUDED FROM THE GAP, AND IT IS NOT A FUDGE — it is the
+                // one point where the two have DIFFERENT CONVENTIONS for the same correct answer.
+                // The forward curve is exactly 0 at the bottom of the log domain, so the bisection
+                // short-circuits to 0 while the closed form returns exp2(AGX_MIN_EV) = 1.7e-4, the
+                // scene value that maps there. Both invert black to black; including the point
+                // reported a 1.76 relative "gap" that is entirely that convention and nothing else,
+                // which is exactly the kind of number that sends the next reader hunting. The ROUND
+                // TRIP above still covers this sample, and it is the gate.
+                const float closed = agxInverseNeutralClosedLookF(n, sl, pw, st, of);
+                closedErr = std::max(closedErr,
+                                     std::fabs(agxNeutralLookF(closed, sl, pw, st, of) - n));
+                if (n > 0.0f) {
+                    closedGap = std::max(closedGap,
+                                         std::fabs(closed - bisect) / std::max(bisect, 1.0e-4f));
+                }
             }
         }
-        // (4) THE SUPERSET CHECK. The retired polynomial, alive here and nowhere else, against the
+        // (5) THE SUPERSET CHECK. The retired polynomial, alive here and nowhere else, against the
         // parametric sigmoid dialled to the settings that fit it. A failure means the sigmoid's form
         // or its scale terms drifted from the curve this project actually shipped for months — which
         // no landmark above would catch, because both landmarks are evaluated at the LIVE knobs.
@@ -3405,20 +3470,24 @@ namespace {
 
         LOG::logline(">> [tonemap] AgX: curve %.2f/%.2f/%.2f scales(toe %.4f sh %.4f, boundary %.4f)"
                      "  0.18->%.4f  1.0->%.4f  neutral drift %.5f  inverse max err %.5f"
+                     "  CLOSED-FORM ERR %.5f (gap vs bisection %.5f rel)"
                      "  poly err %.5f"
-                     "  [pass: 0.5039 / 0.7740 / <0.001 / <0.001 / <0.0042 — landmarks are sRGB"
-                     " display codes at BASE look and the SHIP curve; 0.18 is the pivot and is"
-                     " curve-blind; poly err = the retired 6th-order fit reproduced at 2.02/2.9/2.9]",
+                     "  [pass: 0.5039 / 0.7740 / <0.001 / <0.001 / <0.001 / <0.0042 — landmarks are"
+                     " sRGB display codes at BASE look and the SHIP curve; 0.18 is the pivot and is"
+                     " curve-blind; CLOSED-FORM is the per-pixel inverse the MOON PIN runs"
+                     " (agx.h.fsl) and NOTHING ELSE IN THE FRAME would report it wrong;"
+                     " poly err = the retired 6th-order fit reproduced at 2.02/2.9/2.9]",
                      slopeUsed, g_agxToePower, g_agxShoulderPower, sc.toe, sc.shoulder, slopeMin,
-                     code18, code10, drift, invErr, polyErr);
+                     code18, code10, drift, invErr, closedErr, closedGap, polyErr);
         // ...and to stdout as well, because `--forge-scene` returns before main.cpp opens the MGE log
         // and this is the gate that has to run BEFORE anything is looked at. Same reason [scenefmt]
         // prints twice.
         std::printf("[forge] AgX self-test: curve %.2f/%.2f/%.2f (toeScale %.4f shoulderScale %.4f,"
                     " boundary %.4f)  0.18->%.4f (expect 0.5039)  1.0->%.4f (expect 0.7740)"
-                    "  neutral drift %.5f  inverse max err %.5f  poly err %.5f (expect <0.0042)\n",
+                    "  neutral drift %.5f  inverse max err %.5f  closed-form err %.5f (expect"
+                    " <0.001; gap vs bisection %.5f rel)  poly err %.5f (expect <0.0042)\n",
                     slopeUsed, g_agxToePower, g_agxShoulderPower, sc.toe, sc.shoulder, slopeMin,
-                    code18, code10, drift, invErr, polyErr);
+                    code18, code10, drift, invErr, closedErr, closedGap, polyErr);
         LOG::flush();
     }
 
@@ -3868,8 +3937,17 @@ namespace {
     // the vertex colour, which only the frag can tell apart from a modulating one. So it rides here,
     // for the same reason toneParams does — gShadowParams is bound by pointer into every PerFrame set.
     constexpr uint32_t kCalFloat             = kWaterFogKdFloat + 4;
+    // P2b: the ARMED DISPLAY CURVE, duplicated out of gResolveParams so a COLOUR pass can undo it.
+    // The moon pin runs agxInverseNeutral() per pixel and needs the same three float4s the resolve
+    // applies; gResolveParams is a different SRT that a colour frag cannot see, and this cbuffer is
+    // bound by pointer into every PerFrame set. Written from the SAME host expressions as the
+    // resolve's copy, at one site, because two copies of a curve is exactly how a pass ends up
+    // inverting a curve nothing applies. See shadowparams.h.fsl.
+    constexpr uint32_t kAgxCurveFloat        = kCalFloat + 4;        // slope / toeP / shoulderP / ARMED
+    constexpr uint32_t kAgxScaleFloat        = kAgxCurveFloat + 4;   // toeScale / shScale / pivotX / pivotY
+    constexpr uint32_t kAgxLookFloat         = kAgxScaleFloat + 4;   // slope / power / sat / offset
     constexpr uint32_t kShadowParamsBytes = 4096;
-    static_assert((kCalFloat + 4) * sizeof(float) <= kShadowParamsBytes,
+    static_assert((kAgxLookFloat + 4) * sizeof(float) <= kShadowParamsBytes,
                   "ShadowMaskParams overflows its CBV — too many sun cascades");
     // msmrecv.h.fsl's PCSS works in TEXELS, so SUN_SHADOW_RES has to agree with the atlas the host
     // actually allocated. Same mirroring contract as SUN_CASCADES / kSunCascades.
@@ -3951,6 +4029,20 @@ namespace {
         double qZenith;             // reported: THE §0 invariant, L_zenith/(E_total/pi). Real ~0.122
         float  elevLight;           // reported: the LIGHT's elevation (degrees) — MW's other sun, which
                                     // is ~29 deg off the disc and never goes negative (it bounces)
+        float  elevDisc;            // reported: the DISC's elevation (degrees), UNCLAMPED. st.elevation
+                                    // is the COOKED one and is clamped at 0, so it cannot show the
+                                    // twilight crossing the night ramp now runs across (-4..0 deg)
+        double zenithScene;         // reported: the DRAWN zenith's luma in SCENE units (ramp folded
+                                    // in), i.e. the level the star radiance has to sit under by day
+        // --- P2b: THE SUN DISC AS A RADIANCE, measured from MW's OWN quad --------------------------
+        float  sunDiscL[3];         // E_normal / Omega_sprite, SCENE units, per channel
+        float  sunDiscOmega;        // Omega_sprite, STERADIANS — the finding, not a constant
+        float  sunDiscHalfDeg;      // the sprite's angular RADIUS in degrees (the legible form)
+        float  sunDiscExpand;       // the disc's OWN whiteness-falloff exponent (NOT skyAO2.w)
+        float  starScene;           // the star layer's radiance in SCENE units (NOT strength-scaled)
+        float  cloudScene;          // a fully-lit cloud texel's radiance, SCENE units: albedo*E_tot/pi
+        double cloudOverZenith;     // reported: the ratio the anchor implies, = albedo / q
+        bool   sunDiscFound;        // a SUN-class item with an uploaded mesh was in this frame's list
         bool   active;              // exterior, armed, model cooked and non-degenerate
     };
     SkyPhysical g_skyPhys = {};
@@ -4007,6 +4099,21 @@ namespace {
         v[59] = g_skyPhys.nightRamp;
         v[60] = g_skyPhys.active ? 1.0f : 0.0f;
         v[61] = 0.0f; v[62] = 0.0f; v[63] = 0.0f;
+        // P2b — the two sky ELEMENTS whose radiance the model sets rather than MW (skyview.h.fsl).
+        // Identical in both views, like the coefficients: a moon's radiance does not depend on which
+        // camera is looking at it. They ride here anyway, for the reason the coefficients do — the
+        // sky pass gets everything it needs through ONE binding and the mirror cannot be handed half.
+        // ⚠ FROM g_skyPhys, NOT FROM THE KNOBS. This function is declared far ABOVE the sky knob
+        // block (it is publishSkyAmbientSH's neighbour, and that has to sit beside the SH), so the
+        // sliders are not in scope here — and that accident enforces the better shape anyway: the
+        // measurement folds every knob in at its one site and this stays a pure publisher.
+        v[64] = g_skyPhys.sunDiscL[0];
+        v[65] = g_skyPhys.sunDiscL[1];
+        v[66] = g_skyPhys.sunDiscL[2];
+        v[67] = g_skyPhys.sunDiscExpand;
+        v[68] = g_skyPhys.starScene;
+        v[69] = g_skyPhys.cloudScene;
+        v[70] = 0.0f; v[71] = 0.0f;
         g_skyViewPub[view] = true;
     }
 
@@ -7950,14 +8057,15 @@ namespace {
             }
 
             // P2 — the PER-VIEW sky cbuffers. TWO of them, [0] main and [1] reflect, because they
-            // carry invViewProj and the two views need different ones (skyview.h.fsl). 256 B each,
-            // persistent-mapped, written once per frame beside each view's matrix.
+            // carry invViewProj and the two views need different ones (skyview.h.fsl). 512 B each
+            // (P2b's sun-disc and star lanes took the struct past 256), persistent-mapped, written
+            // once per frame beside each view's matrix.
             for (int v = 0; v < 2; ++v) {
                 BufferLoadDesc svb = {};
                 svb.mDesc.mDescriptors = DESCRIPTOR_TYPE_UNIFORM_BUFFER;
                 svb.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_CPU_TO_GPU;
                 svb.mDesc.mFlags = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
-                svb.mDesc.mSize = 256;              // cbuffer alignment, not sizeof(SkyViewData)
+                svb.mDesc.mSize = 512;              // cbuffer alignment, not sizeof(SkyViewData)
                 svb.mDesc.pName = v ? "skyViewCbvReflect" : "skyViewCbvMain";
                 svb.pData = nullptr;
                 svb.ppBuffer = &g_live.pSkyViewCbv[v];
@@ -7970,7 +8078,7 @@ namespace {
             // black rather than whatever the allocator left behind.
             for (int v = 0; v < 2; ++v) {
                 if (g_live.pSkyViewCbv[v] && g_live.pSkyViewCbv[v]->pCpuMappedAddress) {
-                    std::memset(g_live.pSkyViewCbv[v]->pCpuMappedAddress, 0, 256);
+                    std::memset(g_live.pSkyViewCbv[v]->pCpuMappedAddress, 0, 512);
                 }
             }
 
@@ -11886,6 +11994,75 @@ namespace {
     float g_calAmbGain   = 1.0f;   // ambCol   — host-side, at the one decode site
     float g_calEmisGain  = 1.0f;   // material emissive — gShadowParams lane, applied in the frags
 
+    // ─── THE MW EXPOSURE REFERENCE ───────────────────────────────────────────────────────────────
+    // *"exteriors are exposed good in MW. So baseline should be that."* — user, 2026-08-21.
+    //
+    // MW has no exposure servo and no tone curve. Its delivered level for a surface is literally
+    //     display = texCode * (ambCode + sunCode * N.L)
+    // computed in GAMMA space, so MW's entire time-of-day curve — sunrise, an overcast noon, the
+    // two-hour transitions it interpolates over, every weather — is its two authored weather
+    // colours and nothing else. That makes MW's exposure trivially trackable: latch those colours
+    // and calTarget()'s setpoint follows MW at every hour, for free, with no bucket and no clock.
+    //
+    // Latched as ONE luma each, because only their ratio to a fixed reference is ever used.
+    // ⚠ CODES, NOT RADIANCE. The comparison is against MW's DELIVERED image and MW delivers in code
+    // space; decoding first would compare our linear light against MW's gamma light and land the
+    // sunset roughly as far the wrong way as it currently is the right way.
+    // Initialised to the day anchor so a frame that arrives before any lighting does (the scene
+    // probe, the viewer) reports the row the anchor was authored against rather than a black one.
+    float g_mwAmbCode = 0.552182f;   // luma of [Weather Clear] Ambient Day Color 137,140,160
+    float g_mwSunCode = 0.986772f;   // luma of [Weather Clear] Sun Day Color     255,252,238
+
+    // ⚠ THE SUN TERM CARRIES N.L, AND LEAVING IT OUT WAS THE FIRST VERSION'S REAL ERROR. The model
+    // stated three lines up is `ambCode + sunCode * N.L` and the first cut implemented
+    // `ambCode + 0.4 * sunCode` — the N.L quietly approximated away as a constant. That is exactly
+    // the term that makes a low sun dim: MW lights the ground with a directional, and a directional
+    // at 14 deg delivers a third of what one at 53 deg does to the same horizontal ground. Without
+    // it the setpoint at dawn was 0.68x day where MW's own geometry says 0.39x, which is most of
+    // *"still too bright sunset and sunrise"*.
+    //
+    // The frame mean is modelled as HORIZONTAL GROUND, so N.L = sin(light elevation). That is a
+    // statement about landscape frames, not a universal one — a sphere of all orientations would
+    // give a constant 1/4 regardless of elevation, and the truth is between the two — but a
+    // Vvardenfell exterior is mostly terrain, and terrain is closer to a plane than to a sphere.
+    // ⚠ MW's LIGHT ELEVATION, NOT THE DISC'S. They are different suns: the light is clamped to
+    // 13.8-53.1 deg and never sets, while the disc sweeps +-73 and is what the player SEES
+    // ([[project_mw_two_suns]]). MW lights with the former, so the reference must too — which is
+    // also why sin() never reaches 0 here and the night keeps a directional term.
+    //
+    // kappa_0 — the frame's unshadowed horizontal-ground fraction, i.e. everything about the
+    // directional's reach that ISN'T geometry. THE one dial with authority over how far the setpoint
+    // falls at dusk and at night, and it leaves NOON EXACTLY WHERE IT IS, because the day anchor
+    // below is derived from the same number. Up = dimmer dusk/night; down = flatter day-to-night.
+    float g_calSunWeight = 0.5f;
+    // The anchor: Morrowind.ini [Weather Clear] Ambient Day 137,140,160 and Sun Day 255,252,238 —
+    // the configuration the accepted 60-80 row was authored against — with MW's light at its own
+    // upper clamp, which is where it sits at noon.
+    constexpr float kCalMwAmbDay    = 0.552182f;
+    constexpr float kCalMwSunDay    = 0.986772f;
+    constexpr float kCalDayElevSin  = 0.799685f;   // sin(53.1 deg)
+    // ⚠ AN EXPRESSION, NOT A LITERAL, so that moving kappa_0 cannot silently move the day row with
+    // it. Ratio 1 must keep meaning "a clear noon" whatever the dial is set to.
+    float calMwDayRef() {
+        return kCalMwAmbDay + g_calSunWeight * kCalDayElevSin * kCalMwSunDay;
+    }
+    // ...and the level that anchor maps to. The GEOMETRIC centre of 60-80, so that a half-width of
+    // sqrt(80/60) returns {60.0, 80.0} to the last digit at ratio 1. The signed-off row is
+    // reproduced exactly; everything else in the day is that row times MW's own ratio.
+    constexpr float kCalMwDayCentre = 69.28203f;   // sqrt(60*80)
+    // A floor, so a pathological weather (or a frame with no lighting at all) cannot walk the
+    // setpoint to zero and take E with it. Well below MW's darkest authored night.
+    constexpr float kCalMwMinCentre = 10.0f;
+    // The band's half-width as a RATIO. sqrt(80/60) = the day row exactly. Live, because the one
+    // open question this scheme raises is whether a tracking setpoint still needs the wide dead zone
+    // the fixed night row had: the bucket variation it was covering is gone (the setpoint moves with
+    // the light now), but the scene-content variation at night — a torch against an open field — is
+    // not, and a mean over a frame whose p10/p90 span 0..91 is noisy. Widen if `exp=` hunts.
+    float g_calBandHalf = 1.154701f;
+    // OFF = the previous bucket rows (twilight-ramped night/day, clock fallback), kept whole below
+    // as the A/B. This changes the setpoint at every hour except noon, so it gets a switch.
+    bool  g_calFollowMw = true;
+
     // ─── S3a — THE RATIO ITSELF, AS THE AUTHORED KNOB ────────────────────────────────────────────
     // The two gains above reach the sun:ambient ratio only TOGETHER and in opposite directions,
     // which makes them unusable as a control for it: moving either one also moves the sum, so
@@ -12051,6 +12228,44 @@ namespace {
     // because a pinned servo and a converged one look identical on a log that reports only `exp=`.
     // That is exactly what `rail=` exists for, and it earned its keep on the first run.
     float  g_expMax      = 1.0e3f;   // see the widening note on g_expMin — P2, and instrumented
+
+    // ─── THE NIGHT CEILING, AND WHY NIGHT NEEDS ONE THAT DAY DOES NOT ────────────────────────────
+    // *"it starts good but after a while, exposure climbs."* — user, 2026-08-21.
+    //
+    // The servo has no wind-up: it moves only while the level is OUTSIDE calTarget()'s band, and it
+    // stops the moment the level enters it. So a sustained climb has exactly one meaning — the land
+    // is metering below the floor (17) and the loop is walking E up to put it there. That is the
+    // servo working correctly, and it is still the wrong outcome, because of what rides along:
+    //
+    //   E is a GLOBAL multiplier. Every absolute radiance in the frame — the stars, the night
+    //   clouds, lantern emissives — is displayed at `code(S * E)`. So when the servo lifts E to
+    //   rescue a dark ground, it also brightens everything that was never dark, and any level tuned
+    //   against yesterday's E is wrong today. That is why the star lane has needed re-tuning at
+    //   every single step of this phase: not because the value was wrong, but because the exposure
+    //   it was stated against kept moving underneath it.
+    //
+    // ⚠ A CEILING IS THE ONE CONTROL THAT BREAKS THAT COUPLING, and it is the physically honest one:
+    // a real camera has a maximum usable gain, and past it a dark scene is simply dark. Pinning the
+    // night's maximum amplification makes every other night knob a fixed quantity again — the star
+    // and cloud lanes finally mean a display level rather than "a display level at whatever E the
+    // servo happened to park at".
+    //
+    // ⚠⚠ AND THAT ARGUMENT EXPIRED WITH THE ROW IT WAS STATED AGAINST, 2026-08-21. It was written
+    // while calTarget()'s night row was an invented 17-45 that the land could not reach, so the
+    // servo asked to lift every frame and this ceiling was the only thing refusing it — *"expect
+    // rail=MAX all night, that is the design"*. The setpoint is now MW's own authored night
+    // (mwRefLevel), the light is also MW's own authored night, and a loop whose setpoint agrees
+    // with its plant solves for E ~ 1. So this should never bind again, and `rail=MAX` at night is
+    // back to meaning what it means everywhere else in this file: the clamp is setting the level,
+    // and the answer is upstream. Kept as the guard it was originally, not as a mechanism.
+    //
+    // Lerped to g_expMax along the same night ramp as everything else, so day keeps its full
+    // authority and there is no step at the handover; and gated on g_skyPhys.active, so interiors
+    // (which have their own 40-50 row and genuinely need the authority) are untouched.
+    float  g_expMaxNight = 8.0f;
+    // The ceiling actually applied on the last servo step, for the heartbeat. `rail=MAX` is
+    // meaningless without it now that the limit moves with the sun.
+    float  g_expMaxNow   = 1.0e3f;
     // THE SERVO'S STATE. Published to resolve.frag as gResolveParams.tone.x, and to the heartbeat as
     // `exp=`. double rather than float because it is integrated one lag step per frame at ~165 Hz.
     double g_exposure    = 1.0;
@@ -12112,6 +12327,145 @@ namespace {
     // get a great deal darker — and without a lane that walks between the two ends a regression
     // anywhere in the frame is unbisectable. It is the highest-severity item in the whole step.
     float g_skyPhysBlend = 1.0f;
+
+    // ─── THE NIGHT AMBIENT TRIM ──────────────────────────────────────────────────────────────────
+    // *"Just a bit darker ambient for clear night for the moonlit look."* — user, 2026-08-21, in the
+    // same breath as *"exteriors are exposed good in MW. So baseline should be that."*
+    //
+    // ⚠ THIS REPLACES A BLANKET SCALE THAT TOOK SUN **AND** AMBIENT TO 0.12, and the deletion is the
+    // point rather than a retune. That knob existed to push the night land far under calTarget()'s
+    // floor so the servo would pin E against a ceiling and stop drifting — a real problem, solved in
+    // the wrong place. The drift came from a night setpoint that was INVENTED (17-45) rather than
+    // referred to anything, and the fix for an unanchored setpoint is to anchor it, not to darken
+    // the world until it falls off the bottom of the band. calTarget() now follows MW's own authored
+    // lighting, so the night lands where MW puts it and there is nothing left for a blanket scale to
+    // correct. [[g_mwAmbCode]]
+    //
+    // WHAT IS LEFT IS THE ONE THING EXPOSURE CANNOT DO. MW's authored clear night is ambient
+    // (32,35,42) against directional (59,97,176) — decoded, luma 0.0167 against 0.124, so the
+    // "moonlight" is already the dominant term and the ambient is roughly a quarter of what the
+    // ground receives. Trimming ONLY the ambient deepens every shadow without touching the key
+    // light. That RATIO is the moonlit look, and no value of E can produce it, because E multiplies
+    // both terms together.
+    //
+    // ⚠ AND IT IS FOLDED INTO calTarget() AS WELL AS INTO THE LIGHT, WHICH IS WHY IT DARKENS
+    // ANYTHING AT ALL. A closed loop cancels any uniform change to the level it meters: trim the
+    // light while the setpoint holds still and the servo simply lifts E back to the same image.
+    // Trimming the setpoint by the same factor is what makes the night land ~0.13 stops darker; the
+    // light-side trim on its own delivers the ratio. Two effects, one number, both wanted.
+    //
+    // ⚠ NO WEATHER GATE, AND "CLEAR NIGHT" STILL COMES OUT DARKER, because MW already authored that
+    // difference: [Weather Clear] Ambient Night is 32,35,42 where [Weather Overcast] is 57,60,66 —
+    // a clouded night already carries 1.8x the ambient. A flat multiplier preserves MW's own weather
+    // spread instead of overwriting it with a second one.
+    //
+    // Lerped to 1.0 along the same night ramp as everything else, so day is untouched and there is
+    // no step at the handover; gated on g_skyPhys.active so interiors and the master A/B stay
+    // bit-identical.
+    float g_nightAmbScale = 0.65f;
+
+    // THE one expression for it, because two sites must agree exactly or the trim is either
+    // cancelled by the servo (setpoint short) or double-counted (light short): the lighting blend
+    // applies it to ambCol, calTarget() applies it to the setpoint.
+    float nightAmbScaleNow() {
+        if (!g_skyPhys.active) { return 1.0f; }
+        const float t = std::max(0.0f, std::min(1.0f, g_skyPhys.nightRamp));
+        return g_nightAmbScale + (1.0f - g_nightAmbScale) * t;
+    }
+
+    // MW'S OWN DELIVERED LEVEL for this frame's authored lighting, in MW's code space, with the
+    // night ambient trim folded in. This is the whole of the exterior setpoint rule; calTarget()
+    // only scales it against the day anchor, and the heartbeat only prints it. ONE expression, three
+    // readers, because a setpoint and the trim that moves it cannot be allowed to disagree.
+    // ⚠ THE TRIM CROSSES THE TRANSFER FUNCTION HERE, not around it: the trim is a scale on LIGHT
+    // (linear) and this level lives in CODES, so it is decode -> scale -> re-encode. Applying 0.65
+    // straight to the code would take ~0.62 stops off the ambient instead of ~0.62 of it.
+    float mwRefLevel() {
+        const float ambCode = linearToSrgbF(srgbToLinearF(g_mwAmbCode) * nightAmbScaleNow());
+        // sin(N.L) off MW's LIGHT elevation. Falls back to the day anchor's own sine when the model
+        // is not cooked, so "no physical sky" reports the row rather than an accidental midnight.
+        const float sinEl = g_skyPhys.active
+            ? std::max(0.0f, std::sin(g_skyPhys.elevLight * (float)(Hosek::kPi / 180.0)))
+            : kCalDayElevSin;
+        return ambCode + g_calSunWeight * sinEl * g_mwSunCode;
+    }
+
+    // ─── P2b: THE TWO ELEMENT LANES THE MODEL HAS TO SET ─────────────────────────────────────────
+    //
+    // THE STARS. One radiance, in SCENE units, drawn ADDITIVELY over the physical sky — so this
+    // single number decides both day invisibility and night visibility and there is no fade curve
+    // anywhere. It is DERIVED, not tasted:
+    //   * the reference clear day's zenith is L = (2.106, 3.705, 7.530) native (hosek.h's own
+    //     kRefCases[0] probe at cosTheta 1), luma 3.641, i.e. 3.641 * kNativeToScene = 0.0785 scene;
+    //   * AgX's response there is ~49 display codes per NAT of scene radiance, so one code of
+    //     display change costs ~2% of the level underneath it;
+    //   * 3% of the day zenith therefore moves a daytime pixel by about one code — "below the
+    //     floor" — while at night the sky beneath has ramped to black and the servo's night exposure
+    //     (roughly 4-5x the day's, from calTarget's night row against the ext-day row) brings
+    //     the same radiance up to something around display 50 on black.
+    // 0.03 * 0.0785 = 0.0024. Rounded to 0.0025 because the third digit is noise against a servo.
+    // ⚠ REPORTED ON THE HEARTBEAT BESIDE THE LIVE ZENITH, because the ratio is the thing that
+    // matters and the zenith moves with turbidity and elevation while this does not.
+    // ⚠ 0.0025 WAS THE DERIVED VALUE AND IT WAS TOO DARK IN PLAY (2026-08-21: *"can see stars, they
+    // are faint but maxing out they look good"*). The derivation was not wrong about the DAY — it
+    // was answering a constraint that does not exist. MW CULLS THE WHOLE NIGHT-SKY SUBTREE IN
+    // DAYLIGHT: the host's own [sk-mat] census reads a 3-item day stack (dome, sun, cloud) against a
+    // 15-item night one, so there is no noon frame for a star to be visible in and nothing to hide
+    // under. What is left is the night appearance alone, and at the servo's measured night exposure
+    // (E = 14-27 on the reference save) 0.039 is what reads right. The remaining constraint is
+    // DAWN/DUSK, where MW still ships the stars and the sky is coming up — the heartbeat prints this
+    // as a percentage of the LIVE zenith precisely so that window can be judged.
+    // ⚠ 0.039 IN TURN WAS TUNED UNDER AN EXPOSURE THAT THEN MOVED. The night target row went from a
+    // 60/60 point to a 17-45 band, which lands night E about 0.56 stops lower, so the same lane read
+    // that much dimmer — and 0.039 had been the slider's own ceiling at the time. Raised to the value
+    // asked for after the row change ("max night cloud and stars"), with the ceiling lifted well
+    // clear so the next answer is not the top of the slider again.
+    float g_skyStarRadiance = 0.15f;
+
+    // THE CLOUD ANCHOR, as a physical albedo rather than a scale. A thick sunlit cloud is close to
+    // Lambertian at albedo ~0.8, so its radiance is albedo * E_total/pi — the same E_total the frame
+    // is already casting with. The implied ratio to the zenith is albedo/q, which the heartbeat
+    // prints; at the reference q = 0.124 that is 6.4x, inside the physical band a sunlit cumulus
+    // occupies. Lower it if the silver linings read hot.
+    float g_skyCloudAlbedo = 0.80f;
+
+    // ...and the clouds' NIGHT floor, in absolute scene units, because the anchor above cannot reach
+    // night and pretending otherwise shipped a black cloud layer.
+    //
+    // ⚠ THE ANCHOR RIDES sceneScale, WHICH CARRIES THE NIGHT RAMP, SO AT NIGHT IT IS albedo x ZERO.
+    // Reported 2026-08-21: *"now clouds too dark. albedo didn't change it visibly."* — and the second
+    // half of that sentence is the diagnosis, not a separate complaint: a slider that does nothing is
+    // a slider being multiplied by zero.
+    //
+    // ⚠ AND THE PHYSICAL TERM CANNOT FIX IT, which is why this is a knob and not a derivation. What
+    // lights a cloud at night is moonlight: a full moon delivers ~0.25 lux, i.e. E/pi = 0.0796 cd/m2,
+    // i.e. **2.5e-6 scene units**. At any exposure this renderer will ever run (E <= 30) that is
+    // display code ZERO. It is the same wall the star radiance hit — real night sky luminances are
+    // six orders of magnitude below daylight and our exposure range spans two or three — so this
+    // takes the same shape the stars did: an authored stand-in, stated in scene units, with the
+    // physics it stands in for written down beside it.
+    //
+    // ADDITIVE, not a floor-max: it is a second light source, and at day the anchor (~0.5) swamps it
+    // to within 4%. Does NOT ride g_skyHwStrength, for the reason the star lane does not — that lane
+    // is the atmosphere's A/B level and a tuned constant must not depend on where it happens to sit.
+    // 0.02 was a first estimate against an assumed authored texel and it read too dark; 0.15 is the
+    // value asked for in play. Ceiling lifted with it, for the same reason the star lane's was.
+    float g_skyCloudNight = 0.15f;
+
+    // THE SUN DISC. A multiplier on the DERIVED L_sunDisc (E_normal / Omega_sprite), not the value
+    // itself — 1.0 is "believe the physics", and anything else is a stated departure from it. It
+    // exists because Omega_sprite is computed from a mesh bound (see sunDiscMeasure) and a bound is
+    // the one input here that could be wrong without saying so.
+    float g_sunDiscGain = 1.0f;
+    // ...and the disc's OWN whiteness-falloff exponent for expandExposedEmissiveP. NOT
+    // g_emisSdrExpand: that one shapes lamps and flames, this one shapes a glare sprite, and one
+    // slider moving both would be a trap. Measured off tools/sun-sprite-census.py — 31.3% of
+    // tx_sun_05 is strictly interior to the operator's measure, the core (w > 0.9) is 4.5% and the
+    // skirt (0.02 < w < 0.5) is 23.8%, and at p = 2 the operator hands the core ~18x the skirt's
+    // gain, which is the "bright disc inside its authored halo" reading rather than a white box.
+    // 0 = exact bypass = a uniform gain = the bright SQUARE this whole operator exists to prevent;
+    // it is a diagnostic setting, not a default.
+    float g_sunDiscExpand = 2.0f;
 
     // WT2 water debug: output one isolated water term instead of the composited surface, so the
     // reflection / refraction contents are directly inspectable. Driven by two panel CHECKBOXES
@@ -13739,6 +14093,35 @@ namespace {
           // or the calTarget row, not a bigger number here. The `rail=` field is what tells you.
           t.sliderF("E clamp MIN", &g_expMin, 1.0e-4f, 1.0f, 0.0005f, "%.4f");
           t.sliderF("E clamp MAX", &g_expMax, 1.0f, 4096.0f, 8.0f, "%.0f");
+          // ⚠ A SAFETY NOW, NOT THE DESIGN — and `rail=MAX` at night is a WARNING again. It was
+          // load-bearing while the night setpoint was an invented row that the land could never
+          // reach; with the setpoint referred to MW's own authored night the servo solves for E ~ 1
+          // and this ceiling should never be touched. If it is, the land is far darker than MW's
+          // night and the answer is upstream of here.
+          // Ramps up to the MAX above as the sun rises; exterior + physical sky only.
+          t.sliderF("E clamp MAX at NIGHT (pins what the star/cloud lanes are tuned against)",
+                    &g_expMaxNight, 1.0f, 64.0f, 0.5f, "%.1f");
+          // ⚠ THE SETPOINT RULE ITSELF, and the top-level A/B for this change. ON = the exterior
+          // setpoint tracks MW's own authored lighting at every hour (mwRefLevel), which reproduces
+          // the signed-off 60-80 row exactly at a clear noon and halves it at dawn and dusk. OFF =
+          // the previous bucket rows, whole, including the twilight-ramped night/day lerp and the
+          // clock fallback. Interiors are unaffected either way — they have their own row.
+          t.checkbox("Setpoint: FOLLOW MW's authored lighting (off = the old bucket rows)",
+                     &g_calFollowMw);
+          // The dead zone, as a ratio around the setpoint. sqrt(80/60) reproduces the day row
+          // exactly. This is the open question in the scheme: the bucket variation the old wide
+          // night row was covering is gone (the setpoint moves with the light now), but the
+          // scene-content variation at night is not, and a frame mean whose p10/p90 span 0..91 is a
+          // noisy thing to servo on. Widen if `exp=` hunts at night; narrow if the level floats.
+          t.sliderF("Setpoint: dead-zone half-width (ratio; 1.155 = the 60-80 row)",
+                    &g_calBandHalf, 1.02f, 2.00f, 0.005f, "%.3f");
+          // ⚠ THE DUSK/NIGHT DARKNESS DIAL, AND IT LEAVES NOON EXACTLY WHERE IT IS. It is the
+          // directional's share of the frame mean (kappa_0), and the day anchor is derived from the
+          // same number — so ratio 1 keeps meaning "a clear noon" at every setting, and all this
+          // moves is how far the setpoint falls when MW's light drops toward its 13.8 deg clamp.
+          // Up = dimmer dusk and night; down = flatter day-to-night. 0.5 ships.
+          t.sliderF("Setpoint: directional share kappa_0 (how far dusk/night fall; noon is fixed)",
+                    &g_calSunWeight, 0.0f, 1.5f, 0.01f, "%.2f");
           t.flush(); }
 
         // -- Tab: Tonemap (the curve and its look — tasks/forge-postprocess.md step 3 / S2) --
@@ -13923,6 +14306,62 @@ namespace {
           // and "the lighting looks wrong" can be separated during a bring-up.
           t.sliderF("Sky: drawn strength (1.0 = the model's own radiance; does NOT move the light)",
                     &g_skyHwStrength, 0.0f, 2.0f, 0.05f, "%.2f");
+          // ─── P2b: THE ELEMENTS ─────────────────────────────────────────────────────────────────
+          // ⚠ THESE THREE DO NOTHING WHILE THE PHYSICAL SKY IS OFF. Every per-class treatment is
+          // armed by one host expression (skyElemPhys) that requires the H-W field to be drawing
+          // AND the scene to be linear+scene-referred, which is what keeps the master A/B exact.
+          //
+          // The star radiance is DERIVED (3% of the reference clear day's zenith, 0.0785 scene), and
+          // the heartbeat prints it beside the LIVE zenith as a percentage for exactly this slider:
+          // day invisibility and night visibility are one number, so the ratio is what to judge, not
+          // the value. Too high and stars show at noon; too low and they vanish at midnight.
+          // ⚠ NIGHT IS THE ONLY CASE THIS HAS TO SATISFY, which is not what the first derivation
+          // assumed: MW culls the whole night-sky subtree in daylight (a 3-item day stack against a
+          // 15-item night one, host [sk-mat]), so there is no noon sky for a star to be too bright
+          // in. The window that CAN go wrong is dawn/dusk, where MW still ships the stars while the
+          // sky is coming up — the heartbeat's "% of zenith" is the readout for exactly that.
+          // Independent of the sky strength slider above, on purpose (a star is not atmosphere).
+          t.sliderF("Sky: STAR radiance (scene units; judged at NIGHT, watch the dawn % on the hb)",
+                    &g_skyStarRadiance, 0.0f, 0.40f, 0.005f, "%.3f");
+          // The clouds' ANCHOR, as a physical albedo: L_cloud = albedo * E_total/pi, so the layer is
+          // lit by the same irradiance as everything else instead of riding the exposure on its own.
+          // The heartbeat prints the ratio to the zenith it implies (albedo/q, ~6.4x at the
+          // reference). Lower it if the silver linings read hot; it is not a dimmer, it is an albedo.
+          t.sliderF("Sky: CLOUD albedo (anchors the layer to E_total/pi; hb prints albedo/q)",
+                    &g_skyCloudAlbedo, 0.0f, 1.5f, 0.02f, "%.2f");
+          // ⚠ THE ALBEDO ABOVE DOES NOTHING AT NIGHT, BY CONSTRUCTION: it multiplies E_total/pi
+          // through sceneScale, which carries the night ramp, so after dusk it is albedo x zero.
+          // This is the term that survives there. It is authored rather than derived because the
+          // physics is unreachable — a full moon lights a cloud to ~2.5e-6 scene units, which is
+          // display code 0 at any exposure this renderer runs. Same wall the stars hit, same shape.
+          t.sliderF("Sky: CLOUD night level (scene units; the albedo above is inert after dusk)",
+                    &g_skyCloudNight, 0.0f, 0.40f, 0.005f, "%.3f");
+          // ⚠ THE ONE CONTROL HERE THAT CHANGES CONTRAST RATHER THAN LEVEL, which is why it is the
+          // one that can make a night read as MOONLIT. It trims MW's authored night AMBIENT and
+          // leaves the night directional — the moonlight — alone, so every shadow deepens. Exposure
+          // cannot do this at any setting, because E multiplies both terms together.
+          //
+          // It also lands ~0.13 stops of actual darkening, and only because calTarget() folds the
+          // same number into the setpoint (see mwRefLevel): trim the light while the setpoint holds
+          // still and the servo just lifts E back to the identical image.
+          //
+          // 1.0 = MW's authored night verbatim, which is the baseline the user asked for
+          // (*"exteriors are exposed good in MW"*). 0.65 ships. No weather gate — MW already
+          // authors a clouded night at 1.8x a clear one, and a flat multiplier preserves that.
+          t.sliderF("Night: MW AMBIENT trim (moonlit contrast; directional untouched)",
+                    &g_nightAmbScale, 0.20f, 1.0f, 0.01f, "%.2f");
+          // 1.0 = believe the physics. It exists because L_sunDisc is E_normal / Omega_sprite and
+          // Omega comes from a MESH BOUND — the one input here that could be wrong without saying
+          // so. Check `sunDisc omega=` on the heartbeat before reaching for this.
+          t.sliderF("Sky: SUN DISC gain (1.0 = E_normal / Omega_sprite, i.e. the physics)",
+                    &g_sunDiscGain, 0.0f, 4.0f, 0.05f, "%.2f");
+          // ⚠ 0 IS THE BRIGHT-SQUARE SETTING, and it is here to be SEEN once. tx_sun_05 is an
+          // already-exposed glare sprite whose whole shape lives in ALPHA (99.4% of its RGB is
+          // clipped white — tools/sun-sprite-census.py), so a uniform gain re-expands core and skirt
+          // alike and renders a soft sprite as a solid box. Anything above 0 confines the gain to
+          // the texels the 8-bit encode actually saturated; 2.0 gives the core ~18x the skirt.
+          t.sliderF("Sky: SUN DISC falloff p (0 = uniform gain = the bright SQUARE; 2 = ship)",
+                    &g_sunDiscExpand, 0.0f, 8.0f, 0.1f, "%.2f");
           t.checkbox("Water: reflection only (raw RT, undistorted)", &g_waterReflOnly);
           t.checkbox("Water: refraction only", &g_waterRefrOnly);
           // WT4d. The ONE roughness knob — see g_waterRoughBase. It drives the reflection mip LOD
@@ -16063,8 +16502,121 @@ namespace ForgeRender {
         // overstates `need` in a cave by exactly the amount the cave is meant to be darker. A cave
         // should therefore land BELOW 1.00x on this line and that is correct, not a miscalibration.
         if (!g_dlExterior)         { return {  40.0f,  50.0f, "interior 40-50" }; }
+
+        // ⚠ READ THE MW-REFERRED BLOCK FURTHER DOWN FIRST. Everything between here and it documents
+        // the exterior BUCKET ROWS, which are now the g_calFollowMw-off fallback rather than the
+        // shipped rule. The history is kept whole because it is what the new rule is anchored to and
+        // measured against — not because it is still the code path in force.
+        //
+        // ─── NIGHT: 30-45, AND IT WAS 60/60 ──────────────────────────────────────────────────────
+        // *"wilderness APL can be low like a cave."* — user, 2026-08-21, after a night save read as
+        // over-lit. It is a statement about the ORDERING OF TWO ROWS and the old rows had it
+        // inverted. In the domain the servo actually works in (calGainDomain, i.e. what a gain has
+        // to multiply, not display levels):
+        //
+        //     interior / cave   40-50   ->  scene 0.0163 .. 0.0248
+        //     night  (was)      60/60   ->  scene 0.0355          <- BRIGHTER than a lit interior
+        //     night  (now)      17-45   ->  scene 0.0044 .. 0.0203
+        //
+        // So a moonless wilderness was delivered **0.52 stops above the top of the interior band**,
+        // and the interior row's own note says a cave is allowed to land BELOW its lower edge. A
+        // wilderness at night has less light in it than a house with a lamp in it; the servo was
+        // told the opposite.
+        //
+        // ⚠ AND 60/60 IS A POINT, SO THERE WAS NO DEAD ZONE AT ALL. Every night frame was outside
+        // the band by construction, so the servo corrected every frame and drove the delivered mean
+        // to exactly 60 whatever the scene contained — which is not exposure, it is normalisation.
+        // Measured on the reference save: mean 49 / 55 / 64 at E = 17.3 / 26.8 / 14.0, chasing.
+        //
+        // The top edge sits at the interior row's midpoint — a bright moonlit exterior may
+        // legitimately reach interior levels — and on the three measured frames above, all of which
+        // sit ABOVE it, that edge alone lands the night image 0.81 stops darker.
+        //
+        // ⚠ THE FLOOR IS 17 AND IT IS A FLOOR, NOT A TARGET. *"APL can go even lower for truly dark
+        // scenes, 17 is a good number."* — user, 2026-08-21. It changes NOTHING about the frames
+        // measured so far (they all read 49-64, i.e. above the band): what it governs is the case
+        // that has no light in it at all, where the servo would otherwise keep lifting until
+        // something appeared. 17 is where it stops trying.
+        //
+        // ⚠ 2.19 STOPS OF DEAD ZONE, WHICH IS WIDE, AND DELIBERATELY. This file records the failure
+        // mode (a 1.9-stop band let E ramp to 4.10 and never come back, because the drifted level was
+        // still inside it), so the width is a real cost and not an oversight. It is accepted because
+        // the BUCKET is that wide: "night, exterior" spans a lantern held at arm's length and an open
+        // moonless field, and those genuinely are two stops apart. A band narrower than the variation
+        // it covers does not stabilise exposure, it makes the servo chase the player's torch.
+        //
+        // ⚠ THE BOUNDARY IS THE SUN, NOT THE CLOCK, and that part is not a preference — it is what
+        // makes the row change safe. Stepping between a 30-45 night and a 60-80 day at a fixed hour
+        // would put a ~1.2-stop lurch at 06:00 and 20:00 (the old pair stepped 0.35 and hid it).
+        // g_skyPhys.nightRamp is already a smooth 0..1 over solar elevation -4..0 deg, already
+        // continuous, and already the number that means "how much daylight is there" — the same ramp
+        // that hands the sky and the lighting over. Lerping the row along it means the target moves
+        // exactly as fast as the thing it is a target FOR.
+        //
+        // ⚠ IT FALLS BACK TO THE CLOCK when the physical sky is not running (master A/B off, or the
+        // model failed to cook). nightRamp is 0 in both cases, and a 0 that means "no model" is not
+        // a 0 that means "night" — reading it as one would put the night row on a noon frame.
+        // ─── EXTERIOR: THE SETPOINT IS MW'S OWN DELIVERED LEVEL ─────────────────────────────────
+        // *"exteriors are exposed good in MW. So baseline should be that."* — user, 2026-08-21,
+        // after advancing the clock with MWSE. The measurement that came with it: at a sun DISC
+        // elevation of 0.65 deg the rows below were already returning `ext day mean 60-80`, because
+        // nightRamp saturates at 1 the moment the disc clears the horizon — so the servo drove E to
+        // 26-32 and delivered a frame mean of 63-75. MW delivers a sunrise at roughly HALF its noon
+        // level. Dawn and dusk were ~0.85 stops bright, which is *"sunsets are pretty bright"*.
+        //
+        // ⚠ THE ROWS BELOW ARE NOT WRONG, THEY ARE UNANCHORED, and that is the actual defect. Each
+        // is a bucket with a number in it, and a bucket cannot express "dusk" — so the interpolant
+        // had to be borrowed from the sky's twilight ramp, which is a -4..0 deg HANDOVER and was
+        // never a statement about how much light the frame contains.
+        //
+        // MW answers that question exactly, for free, at every hour and in every weather, because MW
+        // has no exposure and no tone curve: its delivered level is texCode * (ambCode + sunCode *
+        // N.L) in GAMMA space, so its whole time-of-day curve IS its two authored weather colours.
+        // Track those and the setpoint tracks MW. Anchored so the signed-off row is reproduced
+        // exactly at the configuration it was authored against (Clear Ambient/Sun Day -> ratio 1 ->
+        // {60, 80} to the last digit); everything else is that row times MW's own ratio:
+        //
+        //     Clear sunrise  0.391x  ->  27   (light at its 13.95 deg clamp; was delivering 63-75)
+        //     Clear night    0.210x  ->  14.5 (light 30.2 deg, ambient trim folded in)
+        //
+        // ⚠ THOSE TWO RATIOS ARE MOSTLY GEOMETRY, NOT COLOUR, which is the correction the first cut
+        // missed: MW's sunrise ambient is only 0.46x its day ambient, but the directional at 13.95
+        // deg also delivers 0.30x what it does at 53 deg to the same horizontal ground. Drop N.L and
+        // dawn lands at 0.68x instead of 0.39x — nearly a stop, and it was the whole of *"still too
+        // bright sunset and sunrise"*.
+        //
+        // ⚠ AND THE PREDICTED EXPOSURE IS THE SECOND CHECK: at night the setpoint and the light are
+        // now both MW's authored night, so the servo solves for E ~ 1 — which in this unit
+        // convention is precisely "reproduce MW". A closed loop that lands on unity is a loop whose
+        // setpoint agrees with its plant.
+        //
+        // ⚠ THE CAL GAINS ARE DELIBERATELY ABSENT from this expression. They are a uniform scale on
+        // the light, and a closed loop cancels a uniform scale — so they set the sun:ambient RATIO
+        // and never the level, which is already true today against the fixed rows. Putting them in
+        // the setpoint would hand them back the level they are not supposed to move.
+        if (g_calFollowMw) {
+            const float ratio = mwRefLevel() / calMwDayRef();
+            const float c     = std::max(kCalMwMinCentre, kCalMwDayCentre * ratio);
+            // The ratio belongs on the log line — it is the whole state of this rule, and without it
+            // `target[...]=33-44` is a number with no story. A function-local static is safe here for
+            // the same reason the rest of this file's instrumentation is: calTarget() is called from
+            // the render thread's servo step and from the heartbeat printer on that same thread, and
+            // both would format the identical value anyway.
+            static char name[48];
+            std::snprintf(name, sizeof(name), "MW-referred %.2fx day", (double)ratio);
+            return { c / g_calBandHalf, c * g_calBandHalf, name };
+        }
+        // ─── THE FALLBACK ROWS (g_calFollowMw off) — kept whole as the A/B ───────────────────────
+        if (g_skyPhys.active) {
+            const float t  = std::max(0.0f, std::min(1.0f, g_skyPhys.nightRamp));
+            const float lo = 17.0f + (60.0f - 17.0f) * t;
+            const float hi = 45.0f + (80.0f - 45.0f) * t;
+            return { lo, hi, (t <= 0.001f) ? "night 17-45"
+                           : (t >= 0.999f) ? "ext day mean 60-80"
+                                           : "twilight (sun-blended)" };
+        }
         const float h = g_waterFogHour;
-        if (h < 6.0f || h > 20.0f) { return {  60.0f,  60.0f, "night" }; }
+        if (h < 6.0f || h > 20.0f) { return {  17.0f,  45.0f, "night 17-45 (clock)" }; }
         // ⚠ NOT calTargetExtDay() — see the SPLIT above. This is the frame-mean envelope, 60-80
         // around 70; that one is the shadow/lit region PAIR, 80/128, and it feeds the ratio only.
         //
@@ -16308,6 +16860,17 @@ namespace ForgeRender {
 
         // --- what the drawn sky is multiplied by --------------------------------------------------
         p.sceneScale = toScene * p.nightRamp * std::max(0.0f, g_skyHwStrength);
+        // P2b — the STAR layer's radiance.
+        // ⚠ NO NIGHT RAMP. The ramp fades the ATMOSPHERE out; the stars are what it fades out TO,
+        // and multiplying them by it would take the whole night sky to black together — which is
+        // the P2 behaviour this step exists to end.
+        // ⚠ AND NO g_skyHwStrength EITHER, which it DID carry until the first play session. That
+        // lane is the atmosphere's A/B level; a star is not atmosphere. Coupling them meant the
+        // tuned star value silently depended on where the sky slider sat — the session that tuned
+        // this was running strength 2.0 (recovered from the heartbeat's own zenith: 0.11736 against
+        // the model's 0.05869), so the number that looked right was twice the number in the slider.
+        // Decoupled, the tuned value is portable.
+        p.starScene  = std::max(0.0f, g_skyStarRadiance);
 
         // --- the reported numbers, which are the falsification tests, not decoration ---------------
         // q_zenith is §0's albedo-free invariant and the one number that says whether the model
@@ -16324,9 +16887,142 @@ namespace ForgeRender {
             float Lz[3];
             Hosek::radiance(p.st, zdir, Lz);
             p.qZenith = (EtotW > 1.0e-9) ? ((double)Hosek::luma709(Lz) / (EtotW / Hosek::kPi)) : 0.0;
+            // ...and the same zenith in the units the frame is drawn in, ramp and strength folded
+            // in. P2b's star lane is stated as a level, and a level only means something beside the
+            // thing it has to hide under.
+            p.zenithScene = (double)Hosek::luma709(Lz) * (double)p.sceneScale;
         }
+        p.elevDisc = (float)(elev * 180.0 / Hosek::kPi);
+        // --- P2b: THE CLOUD ANCHOR ----------------------------------------------------------------
+        // A fully-lit cloud texel is a near-Lambertian surface under everything coming down:
+        // L = albedo * E_total / pi, with E_total the SAME horizontal irradiance every other number
+        // here is derived from. So the clouds stop being authored display data riding the exposure on
+        // their own and become part of the one radiance field — which is the whole thesis of this
+        // plan applied to the one element P2b deliberately left alone and play falsified.
+        //
+        // ⚠ IT TAKES sceneScale, SO IT TAKES THE NIGHT RAMP. That is the half that fixes the reported
+        // symptom: at night the sky ramps to black while the servo runs E = 14-27 to meter a dark
+        // ground, and an authored cloud left at its own level lands near display 240 on that black.
+        // Riding the ramp, the clouds go dark WITH the sky — and they still occlude the stars, because
+        // their ALPHA is untouched and a black cloud over a star is a black cloud.
+        //
+        // ⚠ WHICH IS ALSO WHY IT NEEDS g_skyCloudNight ADDED TO IT. Taking the ramp means this term
+        // is identically ZERO at night, and a black cloud layer is not what "dark with the sky"
+        // meant — it also made the albedo slider inert, which is how it was caught. The night term
+        // is authored rather than derived because the physics it stands in for (moonlight, ~2.5e-6
+        // scene) is six orders of magnitude below anything this exposure range can show; see the
+        // knob's own note.
+        p.cloudScene = std::max(0.0f, g_skyCloudAlbedo) * (float)(EtotW / Hosek::kPi) * p.sceneScale
+                     + std::max(0.0f, g_skyCloudNight);
+        p.cloudOverZenith = (p.qZenith > 1.0e-9) ? ((double)g_skyCloudAlbedo / p.qZenith) : 0.0;
         p.active = true;
         g_skyPhys = p;
+    }
+
+    // ─── P2b — THE SUN DISC'S SOLID ANGLE, AND THEREFORE ITS RADIANCE ────────────────────────────
+    //
+    // The disc is drawn as PHYSICAL RADIANCE, not pinned to its authored look, so that it dims at
+    // sunset and brightens at noon on its own and drives the bloom kernel like a real sun. That
+    // needs L = E_normal / Omega — and the Omega is MW'S SPRITE'S, not the sun's.
+    //
+    // ⚠⚠ Omega_sprite IS NOT 6.8e-5 sr. The real solar disc subtends ~0.53 degrees; MW draws a big
+    // soft GLARE sprite instead, and using the sun's own solid angle would hand that sprite four or
+    // five orders of magnitude too much radiance. So it is MEASURED, here, from the draw MW actually
+    // submitted — and PRINTED, because the ratio to 6.8e-5 is a FINDING about MW's art, not a
+    // constant anyone should assume.
+    //
+    // The measurement uses the mesh's own model-space bounding sphere (HostMesh::localRadius,
+    // computed at upload from the real vertices) rather than an assumed unit quad, which is the one
+    // input that could otherwise be silently wrong. Omega is the exact spherical-cap form
+    // 2*pi*(1 - cos(theta)) rather than the small-angle pi*r^2/d^2: same cost, no approximation to
+    // remember, and it stays sane if a mod ships a huge sun.
+    //
+    // ⚠ NO NIGHT RAMP HERE, deliberately. MW already hides its own sun by driving the disc's
+    // MATERIAL ALPHA (sunVis) to zero, so coverage handles the setting sun; multiplying by the ramp
+    // as well would fade the disc out while it is still visibly in the sky. The model's elevation is
+    // clamped at 0 for the cook, so a setting sun gets the horizon's transmittance — reddest and
+    // dimmest — which is the behaviour wanted.
+    //
+    // Runs AFTER skyPhysicalMeasure (it reads p.sunScene) and BEFORE publishSkyView (which ships
+    // the result), from the same frame's sky blob.
+    void sunDiscMeasure(const void* skyBlob, unsigned skyCount, unsigned skyBytes)
+    {
+        g_skyPhys.sunDiscFound   = false;
+        g_skyPhys.sunDiscOmega   = 0.0f;
+        g_skyPhys.sunDiscHalfDeg = 0.0f;
+        g_skyPhys.sunDiscExpand  = std::max(0.0f, g_sunDiscExpand);
+        g_skyPhys.sunDiscL[0] = g_skyPhys.sunDiscL[1] = g_skyPhys.sunDiscL[2] = 0.0f;
+        if (!g_skyPhys.active || !skyBlob || !skyCount || !skyBytes) { return; }
+
+        const uint32_t have = skyBytes / (uint32_t)sizeof(IPC::SkyDrawWire);
+        uint32_t n = (skyCount < have) ? skyCount : have;
+        if (n > kMaxSkyDraws) { n = kMaxSkyDraws; }
+        const IPC::SkyDrawWire* items = (const IPC::SkyDrawWire*)skyBlob;
+
+        for (uint32_t k = 0; k < n; ++k) {
+            const IPC::SkyDrawWire& it = items[k];
+            if (it.skyClass != IPC::kSkyClassSun) { continue; }
+            const uint32_t slot = it.slot;
+            if (slot >= g_meshHigh || !g_meshes[slot].valid) { continue; }
+            const HostMesh& m = g_meshes[slot];
+            const float* w = it.world;   // row-vector D3D: rows 0-2 = basis, row 3 = translation
+
+            // The quad's world half-extent. The client re-faces the sun to the camera by rebuilding
+            // the basis as (sx * right, sy * up, -sz * forward), so the two in-plane basis lengths
+            // ARE the quad's world scale; the mesh bound converts them into a radius.
+            const float sx = std::sqrt(w[0]*w[0] + w[1]*w[1] + w[2]*w[2]);
+            const float sy = std::sqrt(w[4]*w[4] + w[5]*w[5] + w[6]*w[6]);
+            const float rw = m.localRadius * 0.5f * (sx + sy);
+
+            // ...and its distance. The sky is shipped CAMERA-RELATIVE, so the transformed centre is
+            // already the vector from the eye.
+            const float cx = w[12] + (w[0]*m.localCenter[0] + w[4]*m.localCenter[1] + w[8]*m.localCenter[2]);
+            const float cy = w[13] + (w[1]*m.localCenter[0] + w[5]*m.localCenter[1] + w[9]*m.localCenter[2]);
+            const float cz = w[14] + (w[2]*m.localCenter[0] + w[6]*m.localCenter[1] + w[10]*m.localCenter[2]);
+            const float d  = std::sqrt(cx*cx + cy*cy + cz*cz);
+            if (!(d > 1.0e-3f) || !(rw > 1.0e-6f)) { continue; }
+
+            const float theta = std::atan2(rw, d);                       // angular RADIUS
+            const float omega = 2.0f * (float)Hosek::kPi * (1.0f - std::cos(theta));
+            if (!(omega > 1.0e-12f)) { continue; }
+
+            const float gain = std::max(0.0f, g_sunDiscGain) * std::max(0.0f, g_skyHwStrength);
+            for (int c = 0; c < 3; ++c) {
+                // sunScene IS E_normal/pi (the `lit = amb + sun*ndl` identity), so E_normal is
+                // pi times it. Per channel, so the disc reddens with the transmittance.
+                g_skyPhys.sunDiscL[c] = gain * g_skyPhys.sunScene[c] * (float)Hosek::kPi / omega;
+            }
+            g_skyPhys.sunDiscOmega   = omega;
+            g_skyPhys.sunDiscHalfDeg = theta * 180.0f / (float)Hosek::kPi;
+            g_skyPhys.sunDiscFound   = true;
+            break;   // one sun
+        }
+
+        // THE FINDING, printed ONCE and then only on a real change. Omega is the number that decides
+        // whether the sprite reads as a sun or as a lamp, and it is derived from a mesh bound — so it
+        // is stated out loud rather than trusted quietly.
+        //
+        // ⚠ A 5% THRESHOLD MADE THIS A PER-FRAME LOG. Measured over one session: Omega swings
+        // 0.219 .. 0.356 sr (half-angle 15.2 .. 19.4 deg) because MW SCALES the sun billboard with
+        // its own glare/weather state every frame, so "changed by 5%" is the normal condition, not
+        // an event. The heartbeat carries the live value; this line only has to fire when the ART
+        // changes. 2x, i.e. a different sprite or a different mesh bound.
+        {
+            static float s_lastOmega = -1.0f;
+            const float om = g_skyPhys.sunDiscOmega;
+            if (g_skyPhys.sunDiscFound
+                && (s_lastOmega < 0.0f || om > 2.0f * s_lastOmega || om < 0.5f * s_lastOmega)) {
+                s_lastOmega = om;
+                LOG::logline(">> [sun-disc] Omega_sprite=%.3e sr (half-angle %.3f deg, %.0fx the real"
+                             " sun's 6.80e-05 sr) -> L=(%.1f %.1f %.1f) scene  [gain %.2f x strength"
+                             " %.2f, expand p=%.2f]",
+                             (double)om, (double)g_skyPhys.sunDiscHalfDeg, (double)(om / 6.80e-05f),
+                             (double)g_skyPhys.sunDiscL[0], (double)g_skyPhys.sunDiscL[1],
+                             (double)g_skyPhys.sunDiscL[2], (double)g_sunDiscGain,
+                             (double)g_skyHwStrength, (double)g_sunDiscExpand);
+                LOG::flush();
+            }
+        }
     }
 
     // The measurement, shared by the heartbeat that REPORTS it and the button that ACTS on it, so
@@ -16417,6 +17113,15 @@ namespace ForgeRender {
         }
 
         const CalTarget ct = calTarget();
+        // The authority ceiling in force RIGHT NOW. Night gets a lower one (see g_expMaxNight) and
+        // it rides the same ramp calTarget()'s row does, so the band and the ceiling can never
+        // describe different times of day. Read once here and used for the rail test AND both
+        // clamps below — three sites that must agree or `rail=` reports on a limit that is not the
+        // one being applied.
+        const double expMaxNow = (g_skyPhys.active)
+            ? (double)(g_expMaxNight + (g_expMax - g_expMaxNight)
+                                     * std::max(0.0f, std::min(1.0f, g_skyPhys.nightRamp)))
+            : (double)g_expMax;
         const double gm = calGainDomain(lvl);
         double want = g_exposure;
         if (gm > 1.0e-9) {
@@ -16428,7 +17133,7 @@ namespace ForgeRender {
         // Rail contact, measured on the DESTINATION rather than on the state: `want` is what the
         // loop asked for, so a clamp here is the servo being refused, while g_exposure hitting a
         // limit could just be the lag passing through. Recorded before the clamp overwrites it.
-        const int railNow = (want < (double)g_expMin) ? -1 : ((want > (double)g_expMax) ? 1 : 0);
+        const int railNow = (want < (double)g_expMin) ? -1 : ((want > expMaxNow) ? 1 : 0);
         if (railNow != 0 && railNow == g_expRail) {
             g_expRailMs += dt * 1000.0;
             g_expRailWorstMs = std::max(g_expRailWorstMs, g_expRailMs);
@@ -16436,7 +17141,7 @@ namespace ForgeRender {
             g_expRail   = railNow;
             g_expRailMs = (railNow != 0) ? (dt * 1000.0) : 0.0;
         }
-        want = std::max((double)g_expMin, std::min((double)g_expMax, want));
+        want = std::max((double)g_expMin, std::min(expMaxNow, want));
 
         // First-order lag toward `want`, asymmetric. Framerate-independent by construction — the
         // exponential is evaluated at the real dt rather than a per-frame fraction, so the ramp takes
@@ -16445,7 +17150,8 @@ namespace ForgeRender {
         g_exposure += (want - g_exposure) * (1.0 - std::exp(-dt / tau));
         // The state itself, not just the destination — dragging the clamp sliders inward has to bite
         // NOW rather than over a tau, or the guard is advisory while the frame is out of authority.
-        g_exposure = std::max((double)g_expMin, std::min((double)g_expMax, g_exposure));
+        g_exposure = std::max((double)g_expMin, std::min(expMaxNow, g_exposure));
+        g_expMaxNow = (float)expMaxNow;   // heartbeat: WHICH ceiling `rail=` is reporting against
     }
 
     // sceneProbe() lives in the FIRST ForgeRender block, hundreds of lines above the anonymous
@@ -16915,9 +17621,34 @@ namespace ForgeRender {
                 // which no FSL reads today, and leaving a flag there invites a future consumer to
                 // read a boolean where it expected padding.
                 g_uwMwTinted = (lighting[7] != 0.0f);
-                unblendUnderwaterTint(fdc, lighting, (waterEnabled != 0) && waterParams
-                                                                        && waterParams[7] > 0.5f,
-                                      g_uwMwTinted);
+                // The submerged verdict, hoisted to a name because TWO things now depend on it and
+                // they must depend on the SAME one — see the latch immediately below.
+                const bool uwNow = (waterEnabled != 0) && waterParams && waterParams[7] > 0.5f;
+                // ...and the MW EXPOSURE REFERENCE off the same authored pair, BEFORE the decode
+                // below, because the setpoint it feeds is compared against MW's own gamma-space
+                // delivery (see g_mwAmbCode). Read from `lighting` rather than from the cbuffer:
+                // the mapped upload buffer is write-combined and reading one back is a documented
+                // trap ([[project_forge_wc_read_trap]]).
+                //
+                // ⚠ HELD, NOT UPDATED, WHILE SUBMERGED. There MW multiplies sunCol/ambCol by its
+                // water tint, and unblendUnderwaterTint (next line) takes that back out of the light
+                // the renderer actually uses — the tint spans 0.19..0.32 on sun alone — so a
+                // reference read off the tinted source would ask the servo to darken a dive the
+                // renderer had just un-darkened. Holding the last surface value is the approximation;
+                // a dive that spans dusk holds a stale reference, which is the accepted edge.
+                //
+                // ⚠⚠ AND THE GUARD MUST BE `uwNow`, NOT `g_uwMwTinted`. That flag means "MW's
+                // WeatherController is driving the lights", which is TRUE IN EVERY EXTERIOR — gating
+                // on it left this latch dead in exactly the place it exists for, and the reference
+                // sat on its Clear-Day initialiser all day and all night. It was invisible by day for
+                // the worst possible reason: the initialiser IS the day anchor, so the one condition
+                // under which a dead latch reports the right answer is the one condition anybody
+                // checks first. Shipped and caught in play, 2026-08-21.
+                if (!uwNow) {
+                    g_mwSunCode = 0.2126f * lighting[4] + 0.7152f * lighting[5] + 0.0722f * lighting[6];
+                    g_mwAmbCode = 0.2126f * lighting[8] + 0.7152f * lighting[9] + 0.0722f * lighting[10];
+                }
+                unblendUnderwaterTint(fdc, lighting, uwNow, g_uwMwTinted);
                 fdc[23] = 0.0f;
                 decodeAuthoredRGB(fdc + 20);   // sunCol
                 decodeAuthoredRGB(fdc + 24);   // ambCol
@@ -17107,6 +17838,11 @@ namespace ForgeRender {
             // fd[16..18]: the disc sits ~29 degrees off the light direction and, unlike the light,
             // it actually SETS. Both facts are load-bearing; see skyPhysicalMeasure.
             skyPhysicalMeasure(fd + 16, fd[19], fd[27]);
+            // P2b: ...and the SUN DISC's own radiance, off the same cook and THIS frame's sky list.
+            // It reads g_skyPhys.sunScene, so it must follow the line above; it is read by
+            // publishSkyView further down, so it must precede that. Both halves are why it is called
+            // here rather than from either of them.
+            sunDiscMeasure(skyBlob, skyCount, skyBytes);
             if (g_skyPhys.active) {
                 const float w = std::max(0.0f, std::min(1.0f, g_skyPhysBlend)) * g_skyPhys.nightRamp;
                 if (w > 0.0f) {
@@ -17114,6 +17850,20 @@ namespace ForgeRender {
                         fd[20 + c] += w * (g_skyPhys.sunScene[c] - fd[20 + c]);
                         fd[24 + c] += w * (g_skyPhys.ambScene[c] - fd[24 + c]);
                     }
+                }
+                // ...and THEN the night AMBIENT trim, on whatever the blend produced. AFTER, not
+                // before, and deliberately not folded into w: at night w is 0, so the pair above is
+                // MW's authored night lighting verbatim, and this trims one half of it. Riding the
+                // same ramp means it reaches 1.0 exactly where the physical model takes over, so it
+                // can never scale a physically-derived value.
+                //
+                // ⚠ AMBIENT ONLY — fd[24..26] and NOT fd[20..22]. The directional at night is MW's
+                // moonlight, and it is the key light the moonlit look is built ON; taking both down
+                // together (which is what the retired blanket scale did) darkens the frame without
+                // ever deepening a shadow. See g_nightAmbScale.
+                const float ls = nightAmbScaleNow();
+                if (ls != 1.0f) {
+                    for (int c = 0; c < 3; ++c) { fd[24 + c] *= ls; }
                 }
             }
             // ...and a LATCH of the same colour as MW authored it, for the unified water fog, whose
@@ -17596,13 +18346,42 @@ namespace ForgeRender {
             // surface in the frame, and "the lamps went black" must not be able to depend on whether
             // some other subsystem came up. 1.0 is today's image byte for byte.
             cp[kCalFloat + 0] = std::max(0.0f, g_calEmisGain);
-            cp[kCalFloat + 1] = 1.0f;   // reserved: the exposure servo's multiplier
+            // P2b — THE EXPOSURE, into the lane that was reserved for it. Same folded expression the
+            // resolve reads (gResolveParams.tone.x below), written from here so the pass that
+            // MULTIPLIES by E and sky.frag's moon pin, which DIVIDES by it, can never disagree about
+            // which E: a moon pinned against a stale or different exposure drifts with the servo,
+            // slowly enough to read as "the moons look a bit off tonight" rather than as a bug.
+            // ⚠ FLOORED, never 0 — it is a divisor now.
+            cp[kCalFloat + 1] = std::max(1.0e-4f,
+                                         (g_live.sceneReferred && g_expEnable) ? (float)g_exposure : 1.0f);
             // ⚠ kCalFloat + 2 IS SPARE AGAIN. It carried P1's photometric anchor, which sky.frag
             // multiplied by; P2 retires the anchor outright rather than leaving it at 1.0, because a
             // dead knob that still multiplies is how the next reader loses a day. The lane is
             // written 0 so a stale receiver reads a value that is obviously not a scale.
             cp[kCalFloat + 2] = 0.0f;
             cp[kCalFloat + 3] = 0.0f;
+            // P2b — THE ARMED CURVE, for the one consumer that has to run it BACKWARDS (the moon
+            // pin, sky.frag). Same three expressions gResolveParams.curve/curveScale/look are
+            // written from, in the same frame, from this one block; .w of the first mirrors
+            // toneParams.w so a reader holding only this float4 still knows whether AgX is running.
+            // ⚠ agxScalesF() is the guarded source for the two sigmoid scales — agxScaleF returns
+            // NaN outside its domain and a NaN survives every later multiply including one by zero
+            // ([[project_nan_survives_zero_multiply]]), which is why they are computed host-side.
+            {
+                const AgxScales sc = agxScalesF();
+                cp[kAgxCurveFloat + 0] = agxSlopeF();
+                cp[kAgxCurveFloat + 1] = g_agxToePower;
+                cp[kAgxCurveFloat + 2] = g_agxShoulderPower;
+                cp[kAgxCurveFloat + 3] = agxActive() ? 1.0f : 0.0f;
+                cp[kAgxScaleFloat + 0] = sc.toe;
+                cp[kAgxScaleFloat + 1] = sc.shoulder;
+                cp[kAgxScaleFloat + 2] = kAgxPivotX;
+                cp[kAgxScaleFloat + 3] = kAgxPivotY;
+                cp[kAgxLookFloat  + 0] = g_agxSlope;
+                cp[kAgxLookFloat  + 1] = g_agxPower;
+                cp[kAgxLookFloat  + 2] = g_agxSat;
+                cp[kAgxLookFloat  + 3] = g_agxOffset;
+            }
         }
         // SH1 sky-directional ambient. Published from HERE — unconditionally, every frame, right
         // after the frame cbuffer's sky/sun colours were written above — rather than from
@@ -21008,10 +21787,16 @@ namespace ForgeRender {
             uint32_t nSkyR = 0, reflSkyDrawn = 0;
             // ⚠ THE MW SKY LOOP IS GATED ON g_drawSky HERE TOO SINCE P2, and it was not before. The
             // main loop has always had that gate; the mirror's omission was invisible while both
-            // drew the same dome. It is not invisible now — with the physical sky suppressing MW's
-            // sky in the main view, an ungated mirror would reflect MW's dome over the H-W field and
-            // the water would disagree with the sky above it.
-            const bool drawReflSky = g_drawSky && !drawReflSkyHw
+            // drew the same dome. It is not invisible now — with the physical sky owning the dome in
+            // the main view, an ungated mirror would reflect MW's dome over the H-W field and the
+            // water would disagree with the sky above it.
+            //
+            // P2b: and it is no longer exclusive with the physical sky, for the reason the main pass
+            // gives at length — the dome is ONE class, and the mirror needs the sun, the clouds and
+            // the moons in it as much as the sky above does. Same per-item skip, same skyElemPhys
+            // narrowing, so the two views cannot disagree about what the sky contains.
+            const bool skyElemPhysR = drawReflSkyHw && g_live.sceneReferred && g_live.linearScene;
+            const bool drawReflSky = g_drawSky
                                   && skyBlob && skyCount && skyBytes && !underwaterR
                                   && g_live.pSkyPipeline && g_live.pReflectSkyWorldsBuf;
             if (drawReflSky) {
@@ -21027,13 +21812,17 @@ namespace ForgeRender {
                 Pipeline* curReflSky = g_live.pSkyPipeline;
                 for (uint32_t k = 0; k < nSkyR; ++k) {
                     const IPC::SkyDrawWire& it = skyItemsR[k];
+                    if (drawReflSkyHw && it.skyClass == IPC::kSkyClassDome) { continue; }
+                    const uint32_t cls = skyElemPhysR ? it.skyClass : (uint32_t)IPC::kSkyClassOther;
                     const uint32_t slot = it.slot;
                     if (slot >= g_meshHigh || !g_meshes[slot].valid) continue;
                     HostMesh& m = g_meshes[slot];
                     if (m.skinned || m.multimap) continue;
                     const uint32_t idx = reflSkyDrawn;
                     Pipeline* want = g_live.pSkyPipeline;
-                    if (it.srcBlend == kD3DBLEND_SRCALPHA && it.destBlend == kD3DBLEND_ONE) {
+                    if (cls == IPC::kSkyClassStars) {
+                        want = g_live.pSkyPipelineAdd;   // see the main pass for why
+                    } else if (it.srcBlend == kD3DBLEND_SRCALPHA && it.destBlend == kD3DBLEND_ONE) {
                         want = g_live.pSkyPipelineAdd;
                     }
                     if (want != curReflSky) { cmdBindPipeline(g_live.pCmd, want); curReflSky = want; }
@@ -21058,10 +21847,11 @@ namespace ForgeRender {
                     finst[idx * kStaticInstU32 + 2] = it.matColor[0];
                     finst[idx * kStaticInstU32 + 3] = it.matColor[1];
                     finst[idx * kStaticInstU32 + 4] = it.matColor[2];
-                    // SK3 cloud scroll (mirror): same matAmbient-lane transport as the main sky pass.
+                    // SK3 cloud scroll (mirror): same matAmbient-lane transport as the main sky pass,
+                    // and P2b's sky class rides .z of it exactly as it does there.
                     finst[idx * kStaticInstU32 + 5] = it.uvOffset[0];
                     finst[idx * kStaticInstU32 + 6] = it.uvOffset[1];
-                    finst[idx * kStaticInstU32 + 7] = 0.0f;
+                    finst[idx * kStaticInstU32 + 7] = (float)cls;
                     finst[idx * kStaticInstU32 + 11] = it.matAlpha;
                     // Sky carries no emissive boost; 1.0 is the gain lane's identity (not 0).
                     finst[idx * kStaticInstU32 + 12] = 1.0f;
@@ -21238,11 +22028,13 @@ namespace ForgeRender {
         // for the horizon band to be needed at, and nothing left for waterfill's above-water hole
         // fill to do out here.
         //
-        // ⚠ IT SUPPRESSES MW'S SKY LOOP RATHER THAN DRAWING OVER IT. Two skies compositing would put
-        // MW's authored display code back on top of a physical field — the exact confusion §0.6
-        // found three of. The client keeps packing the sky list and the host ignores it: wasteful for
-        // one phase, and the right trade against touching the IPC wire twice (moons, stars and
-        // nebulae come back through that same list next phase).
+        // ⚠ IT REPLACES ONE SHAPE, NOT THE LIST — amended by P2b, which is the correction worth
+        // reading. This block used to suppress MW's whole sky loop, on the grounds that two skies
+        // compositing would put MW's authored display code back on top of a physical field (§0.6's
+        // exact confusion). The grounds were right and the scope was wrong: the loop also carries
+        // the sun, the cloud layer, the moons, the stars and the nebulae, and suppressing it left
+        // exteriors as a bare gradient with none of them. Only kSkyClassDome is skipped now; see the
+        // loop below.
         //
         // ⚠ EXTERIOR-GATED, through g_skyPhys.active. An interior must never acquire a sky, and a
         // fullscreen opaque write is the one kind of pass where getting that wrong is total.
@@ -21259,7 +22051,25 @@ namespace ForgeRender {
             cmdEndDebugMarker(g_live.pCmd);
         }
 
-        if (!drawSkyHw && g_drawSky && skyBlob && skyCount && skyBytes
+        // --- P2b: MW'S SKY LOOP RUNS AGAIN, AND SKIPS ONLY THE DOME --------------------------------
+        // P2 made these two mutually exclusive, and the cost was not the one the comment above
+        // predicted: suppressing the whole list to retire ONE shape also retired the sun, the cloud
+        // layer, the moons, the stars and the nebulae. `sky=0` on the heartbeat said so plainly.
+        // The physical field draws FIRST (above, blend off, alpha 1) and this loop composites the
+        // rest over it — skyOrder already sorts back-to-front, and the gSkyColor snapshot is still
+        // taken after the whole pass, so every consumer of "what the sky pass drew" follows for free.
+        //
+        // ⚠ THE PHYSICAL SKY OWNS THE ATMOSPHERE DOME AND NOTHING ELSE. Two skies compositing is
+        // still the failure to avoid — MW's authored display code over a physical field is exactly
+        // the confusion §0.6 found three of — but that is one CLASS, not one list.
+        //
+        // ⚠ skyElemPhys IS THE ONE EXPRESSION THAT ARMS EVERY P2b TREATMENT, and it is deliberately
+        // narrower than drawSkyHw: the per-class radiance treatments are stated in LINEAR SCENE
+        // units, so on a gamma or display-referred build they would be meaningless. Where it is
+        // false the loop ships kSkyClassOther for every item and picks every PSO exactly as before,
+        // which is what keeps `g_skyHw = 0` (and the gamma A/B partner) byte-identical.
+        const bool skyElemPhys = drawSkyHw && g_live.sceneReferred && g_live.linearScene;
+        if (g_drawSky && skyBlob && skyCount && skyBytes
             && g_live.pSkyPipeline && g_live.pSkyWorldsBuf) {
             const uint32_t haveSky = skyBytes / (uint32_t)sizeof(IPC::SkyDrawWire);
             uint32_t nSky = (skyCount < haveSky) ? skyCount : haveSky;
@@ -21300,17 +22110,35 @@ namespace ForgeRender {
                         const IPC::SkyDrawWire& si = skyItems[d];
                         const bool add = (si.srcBlend == kD3DBLEND_SRCALPHA && si.destBlend == kD3DBLEND_ONE);
                         const bool over = (si.srcBlend == kD3DBLEND_SRCALPHA && si.destBlend == kD3DBLEND_INVSRCALPHA);
-                        LOG::logline(">> [sk-mat]   #%u tex=%u blend=%u/%u(%s) vc=%u mat=(%.3f %.3f %.3f) a=%.3f%s",
+                        // P2b: the CLASS byte, and what P2b will DO with it. This is verification
+                        // step 2 — a table read once to prove the classifier, then never again —
+                        // and it says the treatment out loud rather than leaving the reader to
+                        // re-derive it from the class. Pairs with the client's [sk-diag] cls= field
+                        // by draw index.
+                        static const char* kClsName[] = { "OTHER", "DOME", "CLOUD", "SUN", "MOON",
+                                                          "STARS", "MOONSHADOW" };
+                        static const char* kClsWhat[] = { "authored", "H-W REPLACES IT", "ANCHORED",
+                                                          "radiant", "PINNED", "radiant+additive",
+                                                          "= the physical sky" };
+                        const uint32_t ci = (si.skyClass <= 6u) ? si.skyClass : 0u;
+                        LOG::logline(">> [sk-mat]   #%u tex=%u blend=%u/%u(%s) vc=%u mat=(%.3f %.3f %.3f) a=%.3f"
+                                     " cls=%s(%s)%s",
                                      d, si.texIndex, si.srcBlend, si.destBlend,
                                      add ? "ADD" : (over ? "over" : "UNHANDLED->over"),
                                      si.vColSource, si.matColor[0], si.matColor[1], si.matColor[2],
-                                     si.matAlpha, si.isSunDisc ? "  <-- SUN" : "");
+                                     si.matAlpha, kClsName[ci],
+                                     skyElemPhys ? kClsWhat[ci] : "physical sky OFF -> authored",
+                                     si.isSunDisc ? "  <-- SUN" : "");
                     }
                     LOG::flush();
                 }
             }
             for (uint32_t k = 0; k < nSky; ++k) {
                 const IPC::SkyDrawWire& it = skyItems[k];
+                // The ONE shape the Hosek-Wilkie field replaces. Skipped only while that field is
+                // actually drawn — with the physical sky off, MW's dome is the sky again.
+                if (drawSkyHw && it.skyClass == IPC::kSkyClassDome) { continue; }
+                const uint32_t cls = skyElemPhys ? it.skyClass : (uint32_t)IPC::kSkyClassOther;
                 const uint32_t slot = it.slot;
                 if (slot >= g_meshHigh || !g_meshes[slot].valid) {
                     if (logSkips) {
@@ -21336,7 +22164,19 @@ namespace ForgeRender {
                 // alpha-over and log once (surfaces e.g. an unexpected moon-shadow blend). The
                 // skyOrder sort groups like blends, so rebinds are rare.
                 Pipeline* want = g_live.pSkyPipeline;
-                if (it.srcBlend == kD3DBLEND_SRCALPHA && it.destBlend == kD3DBLEND_ONE) {
+                if (cls == IPC::kSkyClassStars) {
+                    // ⚠ THE STARS ARE FORCED ADDITIVE, AND IT IS THE OTHER HALF OF "EXPOSE UP".
+                    // MW's daylight star fade is a texture-stage constant alpha (OpenMW reproduces
+                    // it as AtmosphereNightUpdater::setFade) and the sky wire carries only the base
+                    // map plus the MaterialProperty alpha — which the [sk-mat] census reads as
+                    // 1.000 on every item. So that fade was never captured, and blending a star
+                    // alpha-OVER at coverage 1 would REPLACE the noon sky with a white dot that no
+                    // exposure could hide. Additively, the same radiance is buried by a bright sky
+                    // and revealed by a black one, which is the behaviour that was asked for.
+                    // The additive PSO's alpha is a coverage UNION, not a sum (skyBlendAdd), so the
+                    // present-seam composite is unaffected.
+                    want = g_live.pSkyPipelineAdd;
+                } else if (it.srcBlend == kD3DBLEND_SRCALPHA && it.destBlend == kD3DBLEND_ONE) {
                     want = g_live.pSkyPipelineAdd;
                 } else if (!(it.srcBlend == kD3DBLEND_SRCALPHA && it.destBlend == kD3DBLEND_INVSRCALPHA)) {
                     static bool warnedSkyBlend = false;
@@ -21368,7 +22208,11 @@ namespace ForgeRender {
                 // unused by sky draws until now); sky.vert adds .xy to the baked UV.
                 finst[idx * kStaticInstU32 + 5] = it.uvOffset[0];
                 finst[idx * kStaticInstU32 + 6] = it.uvOffset[1];
-                finst[idx * kStaticInstU32 + 7] = 0.0f;
+                // P2b: the sky CLASS rides .z of that same lane — a plain float, never a bit-cast
+                // (a class index's bit pattern is a DENORMAL and flush-to-zero would silently make
+                // every element OTHER). sky.vert rounds it back to a uint. See sky.vert.fsl for why
+                // this lane and not two more bits of the packed word.
+                finst[idx * kStaticInstU32 + 7] = (float)cls;
                 finst[idx * kStaticInstU32 + 11] = it.matAlpha;
                 // Sky carries no emissive boost; 1.0 is the gain lane's identity (not 0).
                 finst[idx * kStaticInstU32 + 12] = 1.0f;
@@ -23969,19 +24813,53 @@ namespace ForgeRender {
                     //            MW holds sunVis up past it, `elev` STEPS in one frame and the sky
                     //            snaps. That is the one thing about this port MGE's source cannot
                     //            settle, so it is on the line instead of in a comment.
-                    LOG::logline(">> [forge-hb][sky] HW T=%.1f alb=%.2f elev=%.2fdeg (light=%.2fdeg)"
-                                 " ramp=%.2f blend=%.2f"
+                    //   elev is the UNCLAMPED disc elevation and goes NEGATIVE at dusk; the cook's
+                    //            own elevation is clamped at 0 and is printed beside it as `cook=`,
+                    //            because the two parting company below the horizon is exactly the
+                    //            P2b twilight design (the model holds its horizon colour while the
+                    //            ramp, which runs -4..0 deg, fades it out) and not a bug to chase.
+                    //   stars / sun disc — P2b's two element lanes, each printed next to the thing
+                    //            it has to be judged against: the star radiance against the DRAWN
+                    //            zenith it must hide under by day, and the sun's L against the solid
+                    //            angle MW's sprite actually covers (which is NOT the sun's 6.8e-5 sr
+                    //            — the ratio is a finding about MW's art).
+                    LOG::logline(">> [forge-hb][sky] HW T=%.1f alb=%.2f elev=%.2fdeg (cook=%.2f light=%.2fdeg)"
+                                 " ramp=%.2f blend=%.2f nightAmb=%.2f"
                                  " | q=%.4f (real 0.122, p25-p75 0.093-0.148) sun%%=%.3f (real ~0.80)"
                                  " | sky=%.0flx sunNormal=%.0flx"
-                                 " | scene amb=%.4f sun=%.4f ratio=%.2f | unit=%.0fcd/m2",
+                                 " | scene amb=%.4f sun=%.4f ratio=%.2f | unit=%.0fcd/m2"
+                                 " | mwRef amb=%.3f sun=%.3f nl=%.3f m=%.3f (%.3fx day -> setpoint %.1f)"
+                                 " | zenith=%.5f stars=%.5f (%.1f%% of zenith)"
+                                 " cloud=%.5f (%.1fx zenith, albedo %.2f / q)"
+                                 " | sunDisc %s omega=%.3e sr (%.2fdeg, %.0fx solar) L=%.1f p=%.2f",
                                  (double)g_skyPhys.st.turbidity, (double)g_skyPhys.st.albedo,
+                                 (double)g_skyPhys.elevDisc,
                                  (double)g_skyPhys.st.elevation * 180.0 / Hosek::kPi,
                                  (double)g_skyPhys.elevLight,
                                  (double)g_skyPhys.nightRamp, (double)g_skyPhysBlend,
+                                 (double)nightAmbScaleNow(),
                                  g_skyPhys.qZenith, g_skyPhys.sunShare,
                                  g_skyPhys.EskyLux, g_skyPhys.EsunLux,
                                  ambL, sunL, (ambL > 1.0e-9) ? (sunL / ambL) : 0.0,
-                                 Hosek::kSceneUnitCd);
+                                 Hosek::kSceneUnitCd,
+                                 (double)g_mwAmbCode, (double)g_mwSunCode,
+                                 (double)(g_skyPhys.active
+                                     ? std::max(0.0f, std::sin(g_skyPhys.elevLight
+                                                               * (float)(Hosek::kPi / 180.0)))
+                                     : kCalDayElevSin),
+                                 (double)mwRefLevel(), (double)(mwRefLevel() / calMwDayRef()),
+                                 (double)(kCalMwDayCentre * mwRefLevel() / calMwDayRef()),
+                                 g_skyPhys.zenithScene,
+                                 (double)g_skyPhys.starScene,
+                                 (g_skyPhys.zenithScene > 1.0e-9)
+                                     ? 100.0 * (double)g_skyPhys.starScene / g_skyPhys.zenithScene : 0.0,
+                                 (double)g_skyPhys.cloudScene, g_skyPhys.cloudOverZenith,
+                                 (double)g_skyCloudAlbedo,
+                                 g_skyPhys.sunDiscFound ? "ok" : "ABSENT",
+                                 (double)g_skyPhys.sunDiscOmega, (double)g_skyPhys.sunDiscHalfDeg,
+                                 (double)(g_skyPhys.sunDiscOmega / 6.80e-05f),
+                                 (double)Hosek::luma709(g_skyPhys.sunDiscL),
+                                 (double)g_sunDiscExpand);
                 } else {
                     LOG::logline(">> [forge-hb][sky] HW OFF (%s) — MW's sky mesh and MW's lighting",
                                  g_skyHw ? "interior / no sun" : "master toggle");
@@ -24255,7 +25133,7 @@ namespace ForgeRender {
                              " cast=(%.3f,%.3f,%.3f) n=%u [%s sky=%.0f%%]"
                              " | lvl mean=%.0f p10=%.0f p50=%.0f p90=%.0f"
                              " | target[%s]=%.0f-%.0f need=%.2f-%.2fx(%s)"
-                             " exp=%.3g(%s,%s,%s) rail=%s cal=(sun %.2f amb %.2f emis %.2f)",
+                             " exp=%.3g(%s,%s,%s) rail=%s(ceil %.3g) cal=(sun %.2f amb %.2f emis %.2f)",
                              r, g, b, apl, geo, r * n, g * n, b * n, g_aplN,
                              g_aplSkipSky ? "scene" : "frame", 100.0 * (1.0 - cover),
                              meanLvl, g_aplPctAccum[0] * inv, g_aplPctAccum[1] * inv,
@@ -24266,7 +25144,7 @@ namespace ForgeRender {
                              g_expEnable ? "servo" : "OFF",
                              (g_expStat < 0.5f) ? "mean" : ((g_expStat < 1.5f) ? "p90" : "geo"),
                              agxActive() ? "agx" : "legacy",
-                             railTxt,
+                             railTxt, (double)g_expMaxNow,
                              g_calSunGain, g_calAmbGain, g_calEmisGain);
             }
             dlLogHeartbeat();
