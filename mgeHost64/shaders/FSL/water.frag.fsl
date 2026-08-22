@@ -153,7 +153,39 @@ float fresnelDielectric(float cosI, float eta)
 // incidence (cLo > 1) folds to 0 degrees by symmetry, and a node past grazing (cHi < 0) is grazing.
 float fresnelDielectricRough(float cosI, float alpha, float eta)
 {
-    float d    = 1.7320508f * (alpha * 0.70710678f);   // sqrt(3) * per-axis RMS slope
+    // ⚠ W17: THE NODE IS AN ANGLE AND alpha IS A SLOPE, AND AT GRAZING THE TWO STOP BEING THE SAME
+    // NUMBER. The comment above is right that "at the slopes water actually has, slope and angle are
+    // the same number to better than a percent" — but `alpha` is not only the wave field's slope. It
+    // is `sqrt(alphaBase^2 + sigma2)`, and sigma2 is the FILTERED-NORMAL variance over the pixel
+    // footprint, which at grazing incidence is an enormously elongated ellipse
+    // ([[project_anisotropic_footprint_filter]]). Underwater, grazing is where the whole
+    // total-internal-reflection region lives, so alpha routinely leaves the small-angle regime there
+    // and nothing bounded it.
+    //
+    // Past alpha ~1.28 the raw expression gives d > pi/2, cos(d) goes NEGATIVE, and the outer node
+    // `cosI*cd + sinI*sd` stops being a perturbation of theta_i at all — it rotates a direction
+    // clean out of TIR. Worked at cosI = 0.3 (deep TIR, F must be 1) with d = 2.0 rad: the node
+    // lands at 0.742, PAST the critical 0.6612, returns F = 0.076, and the average drops to 0.846.
+    // A sixth of `refractedU` — the above-water world, sampled along the UNREFRACTED view ray, i.e.
+    // the sky — then leaks into a surface that is supposed to be a perfect mirror, shaped by the
+    // local normal because alpha is. "TIR parts underwater has bright blue reflections, normals
+    // shaped", at any depth, which is where the depth dependence of W14/W15 stopped.
+    //
+    // So: convert the slope to an angle properly (atan, which IS what the derivation wanted) and
+    // bound the node at grazing. sqrt(3)*sigma <= pi/2 caps sigma at 0.9069 rad; a microfacet tilted
+    // further than 90 degrees is edge-on and contributes nothing, so there is nothing past the cap
+    // to represent. Identical to the old expression to within a percent everywhere the old comment
+    // claimed it was valid.
+    //
+    // ⚠ WHAT THIS DOES NOT FIX: the residual F < 1 in TIR is PHYSICAL — a genuinely rough surface
+    // does transmit through microfacets tilted toward the eye, and at the cap it is still ~0.16.
+    // What that fraction multiplies is not: `refractedU` is a screen-space tap along the view ray,
+    // so a grazing microfacet's transmission is fetched from straight ahead instead of from near the
+    // horizon (this file's own note at the fetch: "the window's rim shows sky from ~48 degrees up
+    // where it should show the horizon"). Bounding the node removes the NONSENSE; the wrong-
+    // direction tap is a separate, known defect and needs the reprojection that note describes.
+    float sigA = min(atan(alpha * 0.70710678f), 0.9069f);   // per-axis RMS slope -> angle, capped
+    float d    = 1.7320508f * sigA;                          // sqrt(3) * sigma, <= pi/2
     float sinI = sqrt(saturate(1.0f - cosI * cosI));
     float cd   = cos(d);
     float sd   = sin(d);
@@ -299,9 +331,64 @@ float sceneOcclusionAt(float4x4 invVP, float2 uvVp, float2 texToVp, float waterD
 //
 // ⚠ ALL FOUR CHANNELS TAKE THE SAME WEIGHT. gReflectMips is PREMULTIPLIED — rgb and coverage are one
 // vector and an alpha-weighted average of them rebuilds the horizon fringe ([[project_forge_premultiplied_pair]]).
+// --- W20: A DISTORTED TAP MUST BE CLAMPED TO THE RENDERED SUB-RECT, NOT TO THE RESOURCE --------
+//
+// ⚠ THE SCREEN-SIZED RTs ARE ALLOCATED AT THE RENDER-SCALE CEILING (2x backbuffer) AND DRAWN INTO A
+// SUB-VIEWPORT, so at scale 1.0 the live image is the TOP-LEFT QUARTER of the texture
+// (shadowparams.h.fsl, screenAlloc). Everything past uv 0.5 is memory nobody wrote this frame.
+//
+// A sampler's clamp addressing does NOT protect that: it clamps to the RESOURCE, [0,1], and the
+// resource is four times the image. So a refraction tap perturbed by `reffactor` at the edge of the
+// live viewport walks straight out of the drawn region and returns whatever the padding holds —
+// stale content repeated along the border, or the clear. Reported as "top part is repeating pixels,
+// bottom is outside of reflection which is a fog like color ... it can be seen in refraction only
+// and no reflection", which is exactly the set of modes that show `refractedU` alone.
+//
+// The bound is the RENDER size expressed in ALLOC uv — `screenParams.xy * screenAlloc.zw` — inset by
+// half a texel so bilinear cannot reach past it either. Clamping rather than discarding because the
+// tap is a DISTORTION of a valid sample: the honest degradation at the border is "the wave stops
+// displacing", not "there is nothing here".
+//
+// ⚠ NOT FOR gReflectColor / gReflectMips. Those are the 1024 full-VIEWPORT target: the whole image
+// maps to the whole resource, uv 0..1 is entirely valid, and clamping them to this bound would crop
+// the mirror to a quarter of itself. Only the alloc-sized taps (invAlloc) belong here.
+float2 clampAllocUV(float2 uv)
+{
+    float2 ia = gShadowParams.screenAlloc.zw;
+    float2 h  = 0.5f * ia;
+    return clamp(uv, h, gShadowParams.screenParams.xy * ia - h);
+}
+
 float4 sampleReflectSmear(float2 uv, float lod, float2 stepUV, uint taps)
 {
     if (taps < 2u) { return SampleLvlTex2D(gReflectMips, gSamplerTrilinearClamp, uv, lod); }
+
+    // ⚠ W19: THE SMEAR MUST NOT REACH PAST THE IMAGE, AND A CLAMP SAMPLER DOES NOT REFUSE — IT
+    // INVENTS. `stepUV` is `max(lobeMajor - tapRad, 0) * smearPx * invScreen`, and at grazing
+    // lobeMajor = lobeMinor/cosI is enormous, so the tap set can be a large fraction of the target.
+    // Every tap past the edge comes back as the LAST VALID ROW, at full Gaussian weight, over and
+    // over: a vertical streak of REPEATED PIXELS with real content and alpha 1, so nothing
+    // downstream can tell it is fabricated. Reported exactly that way — "this is about vertical
+    // smear, smear taps. top part is repeating pixels".
+    //
+    // Zeroing the out-of-range taps instead would be honest about the missing data but turns the
+    // sample into mostly hole fill right where the streak is worst, i.e. it trades a fabricated
+    // streak for a flat one. Narrowing the tap set is better: the smear is an ANISOTROPIC FILTER
+    // and a filter that cannot reach its full extent should shrink, not extrapolate. t runs over
+    // [-1, 1], so bounding |stepUV| by the distance to the nearest edge keeps EVERY tap inside the
+    // image, degrades continuously (the streak shortens as it approaches the border and stops at
+    // it), and never fetches a texel that is not there.
+    //
+    // ⚠ THIS DOES NOT COVER THE OTHER HALF OF THE SAME REPORT — "bottom is outside of reflection
+    // which is a fog like color". That band is INSIDE the target: it is above the horizon scissor,
+    // which is cleared and never drawn, so its alpha is a genuine 0 and the caller's hole fill is
+    // doing what it should. Bounding the extent cannot help there; the fix would be to publish
+    // reflScissorTop and bound against the DRAWN region rather than the resource.
+    float2 lim = min(uv, 1.0f - uv);                 // distance to the nearest edge, per axis
+    float2 sa  = abs(stepUV);
+    float  kx  = (sa.x > 1.0e-8f) ? (lim.x / sa.x) : 1.0e30f;
+    float  ky  = (sa.y > 1.0e-8f) ? (lim.y / sa.y) : 1.0e30f;
+    stepUV *= saturate(min(kx, ky));
 
     float4 acc  = float4(0.0f, 0.0f, 0.0f, 0.0f);
     float  wsum = 0.0f;
@@ -1208,7 +1295,10 @@ float4 PS_MAIN( VSOutput In )
         // The feature-off spelling keeps BOTH old laws verbatim, and that asymmetry is the point:
         // this is the A/B, and an A/B is only worth having if the off side is bit-exact.
         bool   uwUnified = waterFogCameraSubmerged();
-        float2 uwWf      = waterFogSample(In.WorldPos);   // .x == waterFogFactor, and .y feeds W8
+        // ⚠ waterFogSampleSubmerged, NOT waterFogSample: the ray from a submerged eye to the SURFACE is
+        // entirely in water by construction, and the mesh renders 6 units off the plane, so the
+        // generic four-case path length cuts this column by h/(h+6). See W14 in waterfog.h.fsl.
+        float2 uwWf      = waterFogSampleSubmerged(In.WorldPos);   // .x == the factor, .y feeds W8
         // ⚠ STAYS THE AUTHORED TARGET, AND NOT waterFogVeil, EVEN UNDER W8. The two uses below are
         // HOLE-FILLERS, not fog: what to put where the reflection target has nothing drawn, and what
         // a fully rough surface converges to. Neither is an integral over a ray. Feeding them the
@@ -1222,11 +1312,101 @@ float4 PS_MAIN( VSOutput In )
         float  uwFog     = uwUnified ? uwTrans : saturate(exp(-dist / 4096.0f));
         float3 nrm       = -normal;
 
+        // --- W16: THE ROUGH-SURFACE TARGET AND THE HOLE FILL MUST BE A RADIANCE ------------------
+        //
+        // ⚠ uwFogCol IS AN AUTHORED DISPLAY CODE AND EVERYTHING AROUND IT IS NOW PHYSICS. It is
+        // MW's `UnderwaterColor*w + fogColor*(1-w)`, decoded — a colour someone picked for a
+        // fixed-function tint, not a radiance. The column beside it is derived from sigma_s, the
+        // light and the medium. At the shipped medium, in linear scene units:
+        //
+        //     day    uwFogCol (0.0046, 0.0151, 0.0219)  vs  column (0.0053, 0.0135, 0.0232)  ~1x
+        //     NIGHT  uwFogCol (0.0031, 0.0126, 0.0186)  vs  column (0.00007, 0.0007, 0.0007) 26-44x
+        //
+        // By day they agree, which is why this survived every daytime pass. At night the constant
+        // is up to FORTY-FOUR TIMES the water it sits in — and W13 widened the gap by another 4x by
+        // making the column right. Every pixel that converges to it is a bright pixel with nothing
+        // physical behind it, and it arrives through the two ROUGHNESS-gated paths below.
+        //
+        // ⚠ AND IT IS INVISIBLE TO waterDbg 1, WHICH IS WHY "it is not in reflection" AND "the bug
+        // is in the reflection" ARE BOTH TRUE. uwFogCol is not in gReflectColor at all: one path is
+        // the hole fill for where that target has nothing drawn, the other is the handover a rough
+        // surface makes when the mip chain is spent. Neither is in the raw tap that debug view
+        // returns. waterDbg 3 below now shows the composited value instead.
+        //
+        // What a fully rough mirror shows is the AVERAGE OF THE HEMISPHERE IT FACES, and on this
+        // side of the surface that hemisphere is water. At grazing — which is exactly where
+        // reflSkyMix is large — the reflected ray is a grazing DESCENDING one, so what it averages
+        // is the deep column: the same value the water beside the surface is already showing. Use
+        // that, and a rough far surface blends into its surroundings instead of standing out
+        // against them, which is the whole complaint.
+        //
+        // ⚠ THE REFLECTED DIRECTION, NOT THE VIEW ONE, AND THAT IS WHAT MAKES IT ADMISSIBLE. The
+        // open-ended column REQUIRES a descending ray (waterFogVeil's precondition: an ascending
+        // one ends at the surface a short way off and would divide by the clamp, returning a column
+        // tens of times too bright). The view ray here ascends; its mirror descends. The physically
+        // right vector is also the only legal one. Written as the explicit reflection rather than
+        // reflect() so the sign convention is on the page: nrm faces the eye, EyeVec points away
+        // from it, and looking straight up returns straight down.
+        //
+        // ⚠ NOT THE SKY SH, AND THE REASON IS WHICH HEMISPHERE THIS IS. Above water the handover
+        // target is the sky because that IS what a rough upward mirror averages, and the sky's SH
+        // irradiance is the right instrument for it. Underwater the hemisphere a grazing mirror
+        // faces is WATER — the sky reaches it only through Snell's cone, and inside that cone
+        // Fresnel is ~0.02 so the mirror is not what carries it. The averaged radiance of water is
+        // something this file already computes exactly, so taking it from the column keeps ONE
+        // definition of what water looks like instead of introducing a second that can drift.
+        //
+        // ⚠ RAISING reflBlurGain OR THE SMEAR BUDGET USED TO TURN THE ENTIRE SURFACE INTO THE
+        // CONSTANT, and that is the cleanest proof of which term it is: both push reflLodRaw up,
+        // `over` follows, reflSkyMix goes to 1 everywhere at once and every surface pixel converges
+        // to the same authored value. Reported exactly that way.
+        //
+        // One direction, not an integral over the lobe: post-W13 the phase is isotropic
+        // (`ph = lerp(ph, 1, wIso)` at lane 1), so the open-ended column varies with direction only
+        // through mEff in its own limit. A cone average would be a refinement of a term that is
+        // already 44x closer than what it replaces.
+        //
+        // dNear inside the column is the EYE's depth, not the surface's — the mirror ray really
+        // starts at the interface. It costs exp(-K_d*h) of downwelling, which is under 2% at the
+        // depths where any of this is visible, and it keeps waterColumn's single definition of
+        // where the eye is.
+        // ⚠ W21: THE MACRO PLANE, NOT THE WAVE NORMAL — AND THE GUARD THAT USED THE WAVE NORMAL WAS
+        // ITSELF THE BUG. W16 mirrored EyeVec about `nrm` and refused the result when it came out
+        // ASCENDING, falling back to uwFogCol. At grazing — which is where nearly all of the
+        // underwater surface is — the wave normal's in-plane part DOMINATES the dot product:
+        // |nrm.xy| reaches ~0.15 while EyeVec.z is ~0.05, so `dot(EyeVec, nrm)` goes POSITIVE for
+        // roughly half the wave phase, the mirrored ray points up, and the fallback handed back
+        // exactly the bright authored constant the whole block exists to replace. Normal-shaped,
+        // roughness-scaled, worst near the surface, and a flat blue — every symptom reported, caused
+        // by the escape hatch rather than by the maths it was guarding.
+        //
+        // There was never a reason to perturb this direction. `uwDeep` is a HEMISPHERE AVERAGE; it
+        // is what the mirror converges to once roughness has erased all detail, so it must not carry
+        // per-wave detail itself — a deep-column average that shimmers with the wave phase is wrong
+        // twice over. Mirroring about the macro plane (n = ±z) is the right geometry AND is
+        // unconditionally valid: underwater EyeVec.z > 0, so flipping its sign always descends,
+        // which is precisely waterFogVeil's precondition. The guard disappears because the
+        // configuration it feared can no longer arise.
+        //
+        // EyeVec is unit and only its z sign changes, so rdir is unit. Exactly horizontal gives
+        // mEff = 0, where the open-ended limit is e0/max(r, ...) with r = sigma_t' > 0 — finite, no
+        // clamp reached.
+        float3 uwDeep = uwFogCol;
+        {
+            float  volS = waterFogVolStrength();
+            if (volS > 0.0f) {
+                float3 rdir = float3(EyeVec.x, EyeVec.y, -abs(EyeVec.z));
+                float3 dIns, dTr;
+                waterColumn(rdir, 0.0f, true, dIns, dTr);
+                uwDeep = lerp(uwFogCol, dIns, volS);
+            }
+        }
+
         // Distortion factor: 2x the above-water one (MGE's underwater constant).
         float2 reffactorU = 2.0f * distortAmp * nrm.xy;   // 2x = MGE's underwater constant
 
         // Refraction — alloc-sized RT, so pixel offsets scale by invAlloc (see the block above).
-        float2 ruvU = baseUV + (-2.0f * reffactorU) * invAlloc;
+        float2 ruvU = clampAllocUV(baseUV + (-2.0f * reffactorU) * invAlloc);
         float3 refractedU = SampleLvlTex2D(gRefractColor, gSamplerBilinearClamp, ruvU, 0.0f).rgb;
 
         // ⚠ RADIANCE IS NOT INVARIANT ACROSS A REFRACTIVE BOUNDARY — L/n² is, and THIS is why the
@@ -1280,14 +1460,42 @@ float4 PS_MAIN( VSOutput In )
         float2 reflUVU = In.Position.xy * invScreen
                        + float2(-2.1f * reffactorU.x, abs(reffactorU.y)) * invScreen;
         float4 reflSampleU = sampleReflectSmear(reflUVU, reflLod, smearUV, smearN);
-        float3 reflectedU  = reflSampleU.rgb + uwFogCol * (1.0f - reflSampleU.a);
+        float3 reflectedU  = reflSampleU.rgb + uwDeep * (1.0f - reflSampleU.a);
         // Same cap-and-converge as the above-water path, but toward the WATER target rather than the
         // sky one: looking UP at the underside, what a rough surface averages is the seabed-and-
         // water world the reflect pass drew for this case, and the ambient that world melts into is
         // now waterFogColor() (it used to be fogColNear, which is what the original comment here
         // said and what made this the one lane still reading atmosphere-coloured underwater).
         // fogSkyColor() would be wrong either way — there is no sky on this side of the surface.
-        if (reflSkyMix > 0.0f) { reflectedU = lerp(reflectedU, uwFogCol, reflSkyMix); }
+        // --- W18: A CONSTANT HANDOVER TARGET STANDS OUT WHATEVER ITS VALUE ----------------------
+        //
+        // W16 replaced uwFogCol with the physical column, and the report came back unchanged in
+        // KIND: "it is a solid color with different brightness, it stands out." That is the shape of
+        // the defect, not its level. A flat fill across the part of the frame where reflSkyMix is
+        // large reads as a patch however well its value is derived — and underwater reflSkyMix is
+        // large over MOST of the view, because grazing makes lobeMajor = lobeMinor/cosI enormous and
+        // alphaBase 0.05 already spends the chain (reported: "increase roughness to 0.05 and they
+        // are back", "close to surface, they are back").
+        //
+        // What a fully rough mirror shows is the average of the hemisphere it faces — and THE
+        // REFLECT PYRAMID ALREADY HOLDS THAT AVERAGE. Its deepest level is the mirrored world
+        // integrated over the whole target. Taking the handover from there makes it content-derived:
+        // it cannot disagree with the sharp sample beside it, because it IS that image, and it
+        // varies where the image varies instead of being one number across the frame.
+        //
+        // ⚠ THE "SWIMMING BILINEAR DIAMONDS" kReflectMipUsable EXISTS TO AVOID ARE AN ARTIFACT OF
+        // MAGNIFYING A TINY MIP WHERE DETAIL IS EXPECTED. As the ASYMPTOTE of a roughness blend the
+        // same texels are the correct answer — a fully rough surface has no detail to lose, and what
+        // is left is exactly an average. The cap on the SHARP sample stays; only the thing it hands
+        // over to changes.
+        //
+        // uwDeep survives for the part of that average nothing drew: the reflect pass renders no sky
+        // on this side of the surface, so the pyramid's alpha carries real holes and they still need
+        // a value in the right units (W16).
+        float4 reflAvgU = SampleLvlTex2D(gReflectMips, gSamplerTrilinearClamp, reflUVU,
+                                         (float)kReflectMipMax);
+        float3 uwRough  = reflAvgU.rgb + uwDeep * (1.0f - reflAvgU.a);
+        if (reflSkyMix > 0.0f) { reflectedU = lerp(reflectedU, uwRough, reflSkyMix); }
 
         // ⚠ AND THE REFLECTION TAKES THE COLUMN — the last term in the frame that did not, and the
         // reason the underwater surface refused to saturate with distance while a rock behind it did.
@@ -1307,6 +1515,13 @@ float4 PS_MAIN( VSOutput In )
         // other. Legacy input is the unfogged value, because that is what this term was — so W8
         // strength 0 leaves it exactly as it is today.
         reflectedU = waterFogBlend(reflectedU, reflectedU, In.WorldPos, uwWf);
+
+        // The gap between the two debug views: 1 returns the RAW reflect tap and 2 returns the
+        // refraction before the composite, so the hole fill, the rough handover and the column —
+        // every term W14/W15/W16 touch — were visible in neither. This is the mirror as the Fresnel
+        // mix actually receives it. (Above water, mode 3 is the height field; underwater there is
+        // no height field to show and this is the more useful question.)
+        if (waterDbg == 3u) { RETURN(float4(reflectedU, 1.0f)); }
 
         if (waterDbg == 1u) {   // undistorted, as above
             float4 rawReflU = SampleLvlTex2D(gReflectColor, gSamplerBilinearClamp,
@@ -1520,7 +1735,7 @@ float4 PS_MAIN( VSOutput In )
     float2 reffactorR = (1.0f - fresnel) * shoreCancel * reffactor;
 
     // --- refraction (depth-gated, distorted) ---
-    float2 distUV   = baseUV + reffactorR.yx * invAlloc;
+    float2 distUV   = clampAllocUV(baseUV + reffactorR.yx * invAlloc);
     float  sceneDevZ= SampleLvlTex2D(gSceneLinDepth, gSamplerPointClamp, distUV, 0.0f).r;
     float3 sceneW   = reconstructWorld(invVP, distUV * texToVp, sceneDevZ);
     float  sceneDist= length(sceneW);
@@ -1598,8 +1813,8 @@ float4 PS_MAIN( VSOutput In )
         // of fighting it: `saturate(depth/100)` already shrinks the tap in shallow water for the
         // shoreline, and `1 - refrOccl` shrinks it where the tap has left the water. Two independent
         // reasons to take a shorter step, and the shorter of the two wins on its own.
-        float2 ruv = baseUV + (1.0f - refrOccl) * saturate(depth / 100.0f)
-                            * reffactorR.yx * invAlloc;
+        float2 ruv = clampAllocUV(baseUV + (1.0f - refrOccl) * saturate(depth / 100.0f)
+                                          * reffactorR.yx * invAlloc);
         refrDist = SampleLvlTex2D(gRefractColor, gSamplerBilinearClamp, ruv,    0.0f).rgb;
         refrFlat = SampleLvlTex2D(gRefractColor, gSamplerBilinearClamp, baseUV, 0.0f).rgb;
 

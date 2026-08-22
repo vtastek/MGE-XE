@@ -175,6 +175,44 @@ float waterFogFactor(float3 worldPosRel)
     return waterFogSample(worldPosRel).x;
 }
 
+// --- W14: THE SAME TWO NUMBERS FOR THE SURFACE ITSELF, SEEN FROM BELOW ------------------------
+//
+// ⚠ THE WATER MESH IS NOT DRAWN ON THE WATER PLANE, AND THAT IS DELIBERATE. The host snaps it
+// kWaterMeshSnap = 5 units to the far side of MW's level so the near plane cannot clip through the
+// surface the camera is standing in (`waterMeshZ`, forgerender.cpp), while the fog plane sits at
+// `waterTrueLevel` = level - 1. Submerged, the mesh therefore renders SIX UNITS ABOVE the plane
+// this file measures every depth against. That offset is a rendering fact about the mesh. It is
+// not a fact about the water.
+//
+// Hand it to waterPathLength and EVERY surface fragment reads as being above the surface, so the
+// generic four-case logic takes its "the ray EXITS the water" branch and returns the distance to
+// where the ray crosses the FLAT PLANE. For a fragment sitting 6 units above that plane that
+// distance is
+//
+//     d * h / (h + 6)          h = the eye's own depth below the plane
+//
+// which is right for a cliff seen from below and nonsense for the surface, whose ray never leaves
+// the water at all. And it fails worst exactly where it shows most. At h = 3 units the column is
+// cut to a THIRD, and the far surface — which at grazing incidence is pure total internal
+// reflection, i.e. ALL mirror — then keeps 16x more of that mirror through `trans` in blue and
+// 480x in red. Reported as "when camera is very close to underwater surface, far underwater
+// reflection gets bright"; at h = 51 units the factor is 0.89 and the same scene looks fine, which
+// is why it survived the earlier underwater pass.
+//
+// So: the whole ray, which is what the caller has always claimed — waterFogFactor's own comment
+// two lines up says "a ray that is entirely in water by construction". It just asked the function
+// that does not know that.
+//
+// ⚠ NOT A FIX TO waterPathLength. Its four cases are correct for arbitrary geometry and the
+// exiting branch is load-bearing for everything above the surface seen from below. What was wrong
+// was asking a boundary-crossing question about the boundary.
+float2 waterFogSampleSubmerged(float3 worldPosRel)
+{
+    if (!waterFogActive()) { return float2(0.0f, 0.0f); }
+    float d = length(worldPosRel);
+    return float2(1.0f - exp(-gShadowParams.waterFogCol.w * d), 1.0f);
+}
+
 // The one target every submerged fragment melts toward. Already in the scene's units — the host
 // lifts and decodes it at the boundary exactly as it does fogColNear.
 //
@@ -340,6 +378,12 @@ void waterLightTransmit(float3 worldPosRel, out float3 tSun, out float3 tAmb)
 // component-wise select below rather than an `if`. It reduces EXACTLY to the old expression when
 // kLight == sigT, which is what the strength lane's 0 publishes.
 //
+// ⚠ `mEff` IS SUPPLIED BY THE CALLER AS (dFar - dNear)/L, NOT AS THE RAY'S GEOMETRIC SLOPE, and
+// that is load-bearing rather than incidental. Everything below assumes e1 == e0*exp(-r*L); the
+// caller CLAMPS dFar at the surface, and a rate taken from the geometry instead of from the two
+// depths actually passed in makes the numerator stop vanishing with the denominator. See W15 in
+// waterColumn for what that measured.
+//
 // The guard is on the DIMENSIONLESS r*L, not on r: r now carries units (1/world-unit, ~1e-3 here),
 // so a fixed threshold on it would be an arbitrary fraction of the real rate. r*L is what actually
 // governs both the cancellation in (e0 - e1) and the accuracy of the limit.
@@ -415,6 +459,34 @@ void waterColumn(float3 worldPosRel, float L, bool openEnded, out float3 inscat,
     float mEff  = -worldPosRel.z / d;
     float dNear = waterFogEyeDepth();
     float dFar  = max(dNear + mEff * L, 0.0f);
+    // --- W15: THE RATE MUST BE THE ONE THE ENDPOINTS ACTUALLY IMPLY --------------------------
+    //
+    // ⚠ `max(..., 0)` ABOVE IS WHAT BREAKS waterInscatterSeg's REMOVABLE SINGULARITY, and it does
+    // it silently. That whole construction rests on one identity:
+    //
+    //     e1 == e0 * exp(-r*L)          r = sigma_t + kLight*slant*mEff
+    //
+    // which holds only while `dFar - dNear == mEff*L`. The moment the clamp bites, the numerator
+    // (e0 - e1) STOPS vanishing with r while the denominator still does — so where the integrand
+    // is merely CONSTANT the code divides a finite number by ~0. Measured on the submerged surface
+    // at eye depth 2: in-scatter 266 against a true 9.9 at d = 10 (27x), and NEGATIVE at d = 5.
+    //
+    // It bites here every frame, not occasionally. The water mesh renders 6 units off the plane
+    // (see W14), so for the surface `dNear + mEff*L` is exactly -6 at EVERY depth and distance, and
+    // the clamp is always doing something. The ring where r crosses zero sits at d ~ 1.2*(h + 6).
+    //
+    // ⚠ AND CLAMPING IS THE RIGHT ANSWER — the far end really is AT the surface, depth 0. What is
+    // wrong is deriving `r` from a geometric mEff that no longer describes the two endpoints being
+    // evaluated. So derive it from them: with mEffSeg = (dFar - dNear)/L the identity is exact BY
+    // CONSTRUCTION for any endpoints whatsoever, clamped or not, and the limit branch is reachable
+    // again. It also states the physically true thing about this ray — "the light goes from depth
+    // dNear at the eye to depth dFar at the far end over length L" — which is what makes the mesh's
+    // 6-unit offset stop mattering at all rather than merely stop exploding.
+    //
+    // Where nothing was clamped this is algebraically mEff, so it is a no-op on every other caller
+    // up to one float divide's rounding. openEnded passes L = 0 and has no far end; it keeps the
+    // geometric rate, which is the only thing its e0/r limit can use.
+    float mEffSeg = (L > 0.0f) ? ((dFar - dNear) / L) : mEff;
 
     float3 tauView = sigT * L;
     trans = openEnded ? float3(0.0f, 0.0f, 0.0f) : exp(-tauView);
@@ -440,18 +512,60 @@ void waterColumn(float3 worldPosRel, float L, bool openEnded, out float3 inscat,
     // are also the percentages ocean optics measures for real water, which is the point — no medium
     // returns a tenth of what falls on it.
     //
-    // ⚠ THE WEIGHT MUST BE THE PHASE'S OWN, and that is what keeps the near field untouched. A thin
-    // column (tauS ~ 0.2 — shallow water, the shoreline, anything a few metres deep) is genuinely
-    // single-scattering and keeps the true sigma_s with the true lobe; only the column that had
-    // already been handed p = 1 is handed the medium that goes with it.
+    // --- W13: AND THE WEIGHT MUST NOT BE THE RAY'S. THIS IS WHERE W10 WENT WRONG ----------------
+    //
+    // W10 shipped `wIso = strength * (1 - exp(-tauS))`, on the argument that a thin column is
+    // genuinely single-scattering and should keep the true sigma_s with the true lobe, while only
+    // the saturated column gets the reduced medium. That argument is about the PHASE and it is
+    // sound. Applied to sigma_s it is not, because it makes THE MEDIUM A FUNCTION OF PATH LENGTH —
+    // i.e. of whatever the ray happened to hit. Which is the exact defect the W8 header at the top
+    // of this file exists to remove ("the quantity is fragment-indexed, and a fog colour must not
+    // be"), reintroduced forty lines further down.
+    //
+    // ⚠ AND IT IS NOT MERELY INELEGANT, IT IS NON-PHYSICAL, WITH A ONE-LINE PROOF. For a FIXED
+    // medium the in-scatter is I(L) = INTEGRAL[0..L] S(s) exp(-sigma_t s) ds with S >= 0, so it is
+    // NON-DECREASING IN L. Always. Every extra metre of water adds light and none of it can be
+    // taken back. A model whose in-scatter FALLS with distance is not mistuned; it is a model that
+    // changed media half way along the ray.
+    //
+    // Ours fell. Sweeping L at the shipped medium and night density (kView = 1.56/1024 * 1.6):
+    //
+    //     channel   peak      at L           deep limit   ratio
+    //     R         0.1181    540 u (8 m)    0.0190       6.20x
+    //     G         0.1969    800 u (11 m)   0.0498       3.96x
+    //     B         0.2666    950 u (14 m)   0.0920       2.90x
+    //
+    // A bright band at ~10 m falling away to a deep field 3-6x darker, and REDDER at the peak
+    // (R:B = 0.44) than in the distance (0.21). Reported from play, verbatim: "bright scatter on
+    // underwater objects ... but deep color is darker blue ... there should be no separation like
+    // this for scatter for foreground and background".
+    //
+    // THE HUMP IS THE PRE-W10 ERROR, RELOCATED. Between the view saturating (1/sigma_t ~ 275-600
+    // units) and tauS reaching 1 (~1200 units) the column is already opaque while wIso is still
+    // near 0, so that band returns the FULL single-scattering albedo omega_0 = 0.195/0.396/0.559 —
+    // the 4.9/9.9/14.0% the block above identifies as the bug. W10 took it out of the far field and
+    // left it standing in the mid field, where it is more visible rather than less.
+    //
+    // So the substitution is applied AS A SUBSTITUTION: unconditionally, to the medium, with the
+    // lane as its only weight. wIso is a property of the water and not of the pixel, I(L) is
+    // monotone again by construction, and the far field — the one limit that was ever checked
+    // against a derivation it does not share — is untouched.
+    //
+    // ⚠ WHAT THIS COSTS, SAID PLAINLY: the near field loses the sun's forward lobe and drops ~11x.
+    // That is the known price of similarity at low optical depth, and it is not recoverable by
+    // reweighting — ANY scheme that scatters at the true rate near and converges to omega' far has
+    // the hump above, because the true rate integrated over 1/sigma_t IS omega_0, and omega_0 is
+    // 3-6x omega'. Recovering a near-field lobe takes a residual PHASE, not a weight: the
+    // delta-Eddington pair (sigma_s*(1-g^2), g' = g/(1+g)) satisfies the same invariant
+    // sigma_s*(1-g) and is also L-INDEPENDENT. That is the next model, not a knob on this one.
     //
     // g arrives on the lane rather than as a second copy of 0.92: publishWaterFog sends
     // kMediumG * strength, so lane 0 is `sigma_s*(1-0) == sigma_s` and reproduces the pre-W10 image
-    // bit for bit, and the medium's asymmetry can never drift between the two files.
+    // bit for bit, and the medium's asymmetry can never drift between the two files. The phase lane
+    // (phase2.z) is the same kind of A/B: 0 is the true medium with the true lobe, 1 is the whole
+    // substitution. Both ends are constant in L, so both ends are monotone.
     float3 sigA   = max(sigT - sigS, float3(0.0f, 0.0f, 0.0f));
-    float  tauS   = ((sigS.r + sigS.g + sigS.b) * (1.0f / 3.0f)) * L;
-    float  wSingle= openEnded ? 0.0f : exp(-tauS);
-    float  wIso   = saturate(gShadowParams.waterFogPhase2.z) * (1.0f - wSingle);
+    float  wIso   = saturate(gShadowParams.waterFogPhase2.z);
     float3 sigSi  = sigS * (1.0f - gShadowParams.waterFogPhase2.w);
     // The in-scatter integral runs on the transformed pair; `trans` above does NOT, and that split is
     // the delta-Eddington convention rather than an oversight. `trans` answers "how much of the
@@ -539,8 +653,8 @@ void waterColumn(float3 worldPosRel, float L, bool openEnded, out float3 inscat,
     float sunEnter = (cosEntry / cosWEnt) * (1.0f - 0.5f * (rs * rs + rp * rp));
     sunEnter = lerp(1.0f, sunEnter, saturate(gShadowParams.waterFogSun.x));
 
-    float3 iSun = waterInscatterSeg(sigTm, kLgt, tauViewM, L, dNear, dFar, mEff, slantSun,      openEnded);
-    float3 iAmb = waterInscatterSeg(sigTm, kLgt, tauViewM, L, dNear, dFar, mEff, kWaterDiffuse, openEnded);
+    float3 iSun = waterInscatterSeg(sigTm, kLgt, tauViewM, L, dNear, dFar, mEffSeg, slantSun,      openEnded);
+    float3 iAmb = waterInscatterSeg(sigTm, kLgt, tauViewM, L, dNear, dFar, mEffSeg, kWaterDiffuse, openEnded);
 
     float ph = waterPhase(dot(worldPosRel / d, -gFrameData.sunDir.xyz));
 
@@ -560,10 +674,13 @@ void waterColumn(float3 worldPosRel, float L, bool openEnded, out float3 inscat,
     // residual anisotropy by g again — the diffusion limit, where the radiance field is isotropic and
     // p -> 1. The fill's column runs tauS ~ 10. It was being handed a first-bounce lobe.
     //
-    // exp(-tauS) is exactly the single-scattered FRACTION, so it is the weight, not a fitted curve:
-    // near geometry keeps its full sun lobe (tauS ~ 0.2 -> 82% of it), the saturated background goes
-    // isotropic, and the crossover is derived from the medium rather than tuned. openEnded is L ->
-    // infinity, hence no single-scattered fraction at all.
+    // ⚠ AND THE CROSSOVER IS NOT WHERE THE FIX GOES — see W13 above. exp(-tauS) genuinely IS the
+    // single-scattered fraction and W10 used it as the weight; what it cannot be is a weight on
+    // sigma_s, because the phase going isotropic and the medium losing (1-g) are ONE substitution,
+    // and a substitution that varies along the ray makes the water a different water for every
+    // pixel — non-monotone in-scatter, a bright band at ~10 m, the reported foreground/background
+    // separation. So the phase isotropises WITH the medium, at the constant lane weight, and the
+    // near field's lobe is spent rather than kept. A residual phase buys it back; a weight cannot.
     //
     // Note that 1.0 IS isotropic in these units — hgNorm carries the 4pi, so the pedestal and the
     // lobes are already normalised against an isotropic scatterer of value 1. Nothing is rescaled.
