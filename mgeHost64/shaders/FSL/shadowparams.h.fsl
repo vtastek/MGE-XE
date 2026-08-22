@@ -443,4 +443,20 @@ STRUCT(ShadowMaskParams)
     // a host constant, and this cbuffer is bound BY POINTER into every PerFrame set, so a field
     // inserted anywhere else would move a lane that some pass reads by index.
     DATA(float4,   waterFogSun,     None);
+    // W22 — THE REFRACTION DISTORTION'S ANGULAR FORM.
+    //   x = angMix: 0 = the legacy `(windFactor*dist + 0.1)` amplitude, bit for bit; 1 = the
+    //       angular one, `(1 - 1/n) * focalPx`, which is CONSTANT in pixels with distance.
+    //   y = gain, a multiplier on whichever amplitude x selects (1 = as derived).
+    //   z = W22h: how much of the refraction is taken as the surface's OWN term rather than as the
+    //       blend's destination once the offset exceeds ~1 px. 0 = the pure residual (today, bit for
+    //       bit); 1 = the destination is released where the offset has weight, so no cancellation
+    //       has to be exact and no resolve-operator mismatch can leave a rim at a silhouette.
+    //   w spare.
+    //
+    // Only the A/B weight and the gain travel: focalPx is measured in the shader from
+    // length(ddy(rayDir)) and n is a shader constant, so there is nothing here for the host to get
+    // out of step with. APPENDED after waterFogSun for the reason that field states — every offset
+    // above is a host constant into a cbuffer bound BY POINTER into every PerFrame set, so a field
+    // inserted anywhere else moves a lane somebody reads by index.
+    DATA(float4,   waterDistort,    None);
 };

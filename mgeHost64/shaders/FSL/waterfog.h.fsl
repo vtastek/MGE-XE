@@ -67,6 +67,17 @@ float waterFogPlaneRelZ()
 //     0.5 * (1 - 0.6612) * 1.333^2  =  0.1694 * 1.7769  =  0.3010
 #define kInscatterAmb  (0.5f * (1.0f - kWaterCosCrit) * kWaterIOR * kWaterIOR)
 
+// --- W22: THE SMALL-ANGLE REFRACTIVE DEVIATION PER UNIT SURFACE SLOPE ---------------------------
+// Snell to first order in the tilt. A surface normal tilted by `slope` from vertical bends the view
+// ray by a fixed fraction of that tilt, and the fraction depends only on which side you are on:
+//     air -> water   delta = (1 - 1/n) * slope = 0.2498 * slope
+//     water -> air   delta = (n - 1)   * slope = 0.3333 * slope
+// Their ratio is exactly n, which is why the underwater site's amplitude factor is kWaterIOR and
+// not MGE's authored 2. These are ANGLES: a pixel offset needs one more multiply, by the focal
+// length in pixels, and that is measured at the point of use (water.frag) rather than carried.
+#define kRefrDevAir    (1.0f - 1.0f / kWaterIOR)
+#define kRefrDevWater  (kWaterIOR - 1.0f)
+
 // Depth of this fragment BELOW the surface, world units; 0 for anything above it.
 float waterFogDepthBelow(float3 worldPosRel)
 {

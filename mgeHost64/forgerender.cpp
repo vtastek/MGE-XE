@@ -3999,8 +3999,14 @@ namespace {
     // index into one shared buffer that is bound by pointer into every PerFrame set — a field
     // inserted anywhere else silently moves a lane somebody reads.
     constexpr uint32_t kWaterFogSunFloat     = kAgxLookFloat + 4;
+    // W22: .x = how much of the refraction distortion is the ANGULAR amplitude rather than the
+    // legacy distance-multiplied one, .y = a gain over it. Appended after W12 for the same reason
+    // W12 was appended after everything else. NOT a lane in the water param block p[0..15] — that
+    // block is full (see the publish at the worlds[] write), and stealing from it would move a
+    // shoreline or a fade that another expression reads by index.
+    constexpr uint32_t kWaterDistortFloat    = kWaterFogSunFloat + 4;
     constexpr uint32_t kShadowParamsBytes = 4096;
-    static_assert((kWaterFogSunFloat + 4) * sizeof(float) <= kShadowParamsBytes,
+    static_assert((kWaterDistortFloat + 4) * sizeof(float) <= kShadowParamsBytes,
                   "ShadowMaskParams overflows its CBV — too many sun cascades");
     // msmrecv.h.fsl's PCSS works in TEXELS, so SUN_SHADOW_RES has to agree with the atlas the host
     // actually allocated. Same mirroring contract as SUN_CASCADES / kSunCascades.
@@ -11986,7 +11992,54 @@ namespace {
     // is reaching across the handover. Tying it to the same lane makes it follow the user's view
     // distance instead of needing a second setting that has to be kept in step.
     // 0 = the old unbounded behaviour, i.e. the A/B.
-    float g_waterDistortFrac = 0.5f;
+    //
+    // ⚠ W22c: 0.5 -> 1.0. The resource this bounds — gRefractColor's near scene — is valid all the
+    // way to nearViewRange, so a fade completing at HALF of it was spending the outer half of a
+    // valid range on nothing. The 2x margin existed to hide a distance-multiplied offset that had
+    // no business growing; W22 deleted the growth, and W22b's Fresnel mask took over the
+    // look-masking per angle — level views of far water ARE grazing views, and F kills them without
+    // any help from distance, while the looking-DOWN case that the fade used to erase is exactly
+    // the one where the refraction is visible and wanted. What is left is a resource bound, so it
+    // belongs at the resource's edge. The legacy amplitude keeps the old range inside the shader
+    // (kDistortLegacyHalf), so the angMix = 0 arm is still the pre-W22 image.
+    float g_waterDistortFrac = 1.0f;
+
+    // ─── W22: THE DISTORTION'S AMPLITUDE, ANGULAR vs LEGACY (gShadowParams.waterDistort) ─────────
+    // The block above capped the TOP of the distance ramp and left the ramp itself, which is the
+    // wrong half: the near field is the end a player looks at, and there the legacy amplitude is
+    // 1.4-4.0 px, so `distortAmp * normal.xy` at any wave slope that still looks like water lands
+    // at HALF A PIXEL. The distortion was never missing — it was quantised away.
+    //
+    // A wave tilt refracts the view ray by an ANGLE, and an angle is a constant pixel count through
+    // the focal length however far away the water is:
+    //     offset_px = delta * focalPx,   delta_above = (1 - 1/n) * slope = 0.2498 * slope
+    //                                    delta_below = (n - 1)   * slope = 0.3333 * slope
+    // At 1080p/60 deg vertical, focalPx ~ 935, so slope 0.1 is 23 px above and 31 px below — the
+    // range at which the effect is visible at all. focalPx is MEASURED in the shader from
+    // length(ddy(rayDir)), so no lane and no host-side FOV bookkeeping is involved.
+    //
+    // ⚠ 0 REPRODUCES TODAY BYTE FOR BIT, which is the whole point of shipping it as a mix rather
+    // than a replacement: every judgement about the new look is then a two-key A/B against the
+    // running build instead of against a memory.
+    float g_waterDistortAngular = 1.0f;
+    // A gain over whichever amplitude the mix selects. 1.0 is the derived physical value; this
+    // exists because "how strong should the refraction read" is a look call sitting on top of a
+    // derivation, and folding the two into one slider is how the derivation stops being checkable.
+    float g_waterDistortGain    = 1.0f;
+    // ─── W22h: THE REFRACTION AS AN OWN TERM RATHER THAN THE BLEND'S DESTINATION ─────────────────
+    // The blend delivers the destination AT THIS PIXEL and cannot move it, so the residual has to
+    // cancel it by subtraction — and that cancellation is only as exact as `refrFlat` matching what
+    // the blend adds. Under MSAA it cannot: the destination is resolved by resolve_scN.frag
+    // (Catmull-Rom, negative lobes, Karis compression, a clamp) and refrFlat by a hardware box
+    // resolve. Two operators, agreeing on smooth content, parting company at every silhouette —
+    // which is where the edge artifacts were reported, on fish and on rocks and nowhere on the open
+    // seabed, because only a silhouette has a step for them to disagree about.
+    //
+    // 1 = where the offset exceeds ~1 px, take the refraction as the surface's OWN term and drop the
+    // destination's weight to match, so nothing has to cancel. 0 = the pure-residual path, bit for
+    // bit. The per-SAMPLE destination the blend was adopted for is kept where it earns its keep —
+    // the shoreline, where shoreCancel has already taken the offset to zero.
+    float g_waterRefrOwn        = 1.0f;
 
     // ─── DOES THE WATER SURFACE CLAIM THE PIXEL'S DEPTH? ─────────────────────────────────────────
     // ⚠ A LEFTOVER FROM THE OPAQUE ERA. The surface used to be an opaque write that fetched what was
@@ -12548,6 +12601,11 @@ namespace {
     // into the water params (worlds[6] group 3); water.frag branches on it. Both off = normal water.
     bool g_waterReflOnly = false;
     bool g_waterRefrOnly = false;
+    // W22f DIAGNOSTIC — see waterFlagsWord bit 19. Composites kDst*(dest - refrFlat); black = the
+    // residual's premise holds. Not a look knob; leave it off.
+    bool g_waterDestProbe = false;
+    // W22f DIAGNOSTIC — see waterFlagsWord bit 20. Shows the refrFlat tap itself, opaque.
+    bool g_waterFlatProbe = false;
     // NO REFLECTION (bit 18) — a MEASUREMENT mode. Zeroes the Fresnel weight and the sun glint, so
     // the pixel is the transmitted path alone: the column and what is under it. It is not
     // `g_waterRefrOnly`, which RETURNs a raw scene tap and skips the composite — this runs the whole
@@ -13233,7 +13291,21 @@ namespace {
         if (g_waterHdrView)         { f |= 131072u; }
         // bit 18: NO REFLECTION — the measurement mode. See g_waterNoReflect.
         if (g_waterNoReflect)       { f |= 262144u; }
-        // Round-trips exactly through the float: integers are exact to 2^24, this word maxes at 524287.
+        // bit 19: DESTINATION PROBE. The refraction residual rests on ONE assumption — that the
+        // blend's destination at this pixel is the same value `refrFlat` samples out of
+        // gRefractColor. Everything else about the composite is algebra that follows from it, so
+        // when the image disagrees with the algebra, this is the term to measure rather than
+        // reason about. It returns `-kDst * refrFlat` at the residual's own weight, so what the
+        // blend composites is kDst * (dest - refrFlat): BLACK means the assumption holds and the
+        // fault is elsewhere; anything visible IS the uncancelled term, drawn where it lives.
+        if (g_waterDestProbe)       { f |= 524288u; }
+        // bit 20: SHOW refrFlat RAW, opaque. The pair to bit 19 and the one that turns its answer
+        // into a measurement: bit 19 proved dest and refrFlat disagree over the fish, this shows
+        // WHERE gRefractColor's copy of the fish actually is. If it sits on the real fish the
+        // disagreement is in weight, not position; if it lags behind it, the copy is a frame stale
+        // and the offset on screen IS the lag — which is also why the defect is fish and not rocks.
+        if (g_waterFlatProbe)       { f |= 1048576u; }
+        // Round-trips exactly through the float: integers are exact to 2^24, this word maxes at 2097151.
         return (float)f;
     }
     inline float waterAlphaBase(float windFactor) {
@@ -14455,6 +14527,14 @@ namespace {
                     &g_sunDiscExpand, 0.0f, 8.0f, 0.1f, "%.2f");
           t.checkbox("Water: reflection only (raw RT, undistorted)", &g_waterReflOnly);
           t.checkbox("Water: refraction only", &g_waterRefrOnly);
+          // W22f: the destination probe. BLACK = the blend's destination and the refrFlat tap agree,
+          // so the distortion residual cancels exactly and a ghost must come from somewhere else.
+          // Anything visible is the uncancelled term itself, shown at its own weight and position.
+          t.checkbox("Water: DEST PROBE (kDst*(dest-refrFlat); black = OK)", &g_waterDestProbe);
+          // W22f: the refrFlat tap itself, opaque, undistorted. Compare where a MOVING object sits
+          // here against where it sits in the normal view — same place means the copy is current,
+          // behind means gRefractColor lags the destination and the gap is the lag.
+          t.checkbox("Water: SHOW refrFlat (the tap, raw)", &g_waterFlatProbe);
           t.checkbox("Water: NO REFLECTION (Fresnel 0 + no glint) — for the apl-split reading",
                      &g_waterNoReflect);
           // WT4d. The ONE roughness knob — see g_waterRoughBase. It drives the reflection mip LOD
@@ -14821,11 +14901,29 @@ namespace {
           // bit-exact A/B). Density still comes from fogStart, i.e. from MW's weather.
           t.sliderF("Fog: exp curvature (0 = MW linear; higher = more front-loaded)",
                     &g_fogExpScale, 0.0f, 6.0f, 0.1f);
-          // Water's refraction/reflection UV distortion grows with distance because `dist` multiplies
-          // it; this is where it reaches zero (growth caps at half), as a fraction of nearViewRange —
-          // the range gRefractColor actually holds MW's near scene over. 0 = unbounded, the old A/B.
-          t.sliderF("Water: distortion fade (x nearViewRange; 0 = unbounded/legacy)",
+          // Where the ANGULAR distortion's tap fades to zero, as a fraction of nearViewRange — the
+          // range gRefractColor actually holds MW's near scene over, and therefore the only thing
+          // this bound legitimately protects. It is NOT a look control any more: Fresnel masks the
+          // refraction per angle (W22b), which is why 1.0 — the resource's own edge — is the
+          // default rather than a 2x margin on top of it. The legacy amplitude keeps the old half
+          // range whatever this reads, so the A/B arm does not move with it. 0 = unbounded.
+          t.sliderF("Water: distortion fade (x nearViewRange; 0 = unbounded)",
                     &g_waterDistortFrac, 0.0f, 2.0f, 0.05f, "%.02f");
+          // W22 — the amplitude itself. 0 = the legacy distance-multiplied one, bit for bit; 1 = the
+          // angular one, a constant pixel offset per unit wave slope. The test is to look UP from
+          // underwater: at 0 the surface is still, at 1 it wobbles. Grazing open sea is the
+          // falsification test — if a bigger offset smears there, then (1 - fresnel) is not bounding
+          // the far field the way this change assumes it is.
+          t.sliderF("Water: distortion ANGULAR (0 = legacy distance ramp, the A/B)",
+                    &g_waterDistortAngular, 0.0f, 1.0f, 0.05f, "%.02f");
+          t.sliderF("Water: distortion gain (1 = as derived)",
+                    &g_waterDistortGain, 0.0f, 4.0f, 0.05f, "%.02f");
+          // W22h. 0 = the refraction comes from the blend's destination and the offset is a residual
+          // that must cancel it (today, bit for bit, and the arm the edge artifacts live in).
+          // 1 = past ~1 px of offset the refraction is the surface's own tap and the destination is
+          // released, so there is nothing to cancel and no resolve-operator mismatch to leave a rim.
+          t.sliderF("Water: refraction as OWN term (0 = blend residual, the A/B)",
+                    &g_waterRefrOwn, 0.0f, 1.0f, 0.05f, "%.02f");
           // The opaque-era depth write, kept as the A/B. ON deletes every sorted-alpha fragment on the
           // far side of the surface (hair, manes, banners, bubbles) — flip it above water while looking
           // at a submerged head and the hair appears and disappears. OFF still writes it while the
@@ -16133,6 +16231,9 @@ namespace ForgeRender {
             { "waterMsSimilarity",  &g_waterMsSimilarity  },
             { "waterSunEnter",      &g_waterSunEnter      },
             { "waterPhaseMS",       &g_waterPhaseMS       },
+            { "waterDistortAngular", &g_waterDistortAngular },
+            { "waterDistortGain",    &g_waterDistortGain    },
+            { "waterRefrOwn",        &g_waterRefrOwn        },
         };
         const BKnob bknobs[] = {
             { "waterNoReflect",     &g_waterNoReflect     },
@@ -18571,6 +18672,16 @@ namespace ForgeRender {
                 cp[kAgxLookFloat  + 2] = g_agxSat;
                 cp[kAgxLookFloat  + 3] = g_agxOffset;
             }
+            // W22 — the refraction distortion's amplitude select + gain. From the UNCONDITIONAL
+            // block, not publishWaterFog: that one early-returns whenever the unified extinction
+            // model is disarmed, and the distortion is not part of that model — it runs whenever
+            // water is drawn at all. A reader finding 0 here would silently get the legacy
+            // amplitude, which is a look regression that would only show up as "the wobble comes
+            // and goes with an unrelated checkbox".
+            cp[kWaterDistortFloat + 0] = std::max(0.0f, std::min(g_waterDistortAngular, 1.0f));
+            cp[kWaterDistortFloat + 1] = std::max(0.0f, g_waterDistortGain);
+            cp[kWaterDistortFloat + 2] = std::max(0.0f, std::min(g_waterRefrOwn, 1.0f));
+            cp[kWaterDistortFloat + 3] = 0.0f;
         }
         // SH1 sky-directional ambient. Published from HERE — unconditionally, every frame, right
         // after the frame cbuffer's sky/sun colours were written above — rather than from

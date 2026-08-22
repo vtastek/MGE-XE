@@ -486,6 +486,10 @@ float4 PS_MAIN( VSOutput In )
     // moves both accumulators consistently — the destination gains exactly the weight the mirror
     // gave up. Zeroing `result` after the fact instead would silently drop energy.
     bool   noReflect     = (waterFlags & 262144u) != 0u;
+    // W22f bit 19 — the destination probe. See its use at the very end of the above-water path.
+    bool   destProbe     = (waterFlags & 524288u) != 0u;
+    // W22f bit 20 — show the refrFlat tap itself, opaque. Its pair; see the use beside destProbe.
+    bool   flatProbe     = (waterFlags & 1048576u) != 0u;
     // W4b bits 6-11: reflection smear tap BUDGET (max anisotropy), 0/1 = OFF (a single isotropic
     // fetch at the minor-axis LOD, i.e. the shipped W4 look). Six bits, not four: the requirement is
     // 1/cosI and grazing water — which is most water — needs tens, so a 15 cap WAS the binding
@@ -633,6 +637,25 @@ float4 PS_MAIN( VSOutput In )
     rayD           = (dot(rayD, In.WorldPos) < 0.0f) ? -rayD : rayD;
     float3 rayDir  = normalize(rayD);
 
+    // ─── FOCAL LENGTH IN RENDER PIXELS, MEASURED (W22) ───────────────────────────────────────────
+    // The angular distortion needs radians-per-pixel, and rayDir already IS the per-pixel view
+    // direction — so its screen derivative is that number, with no FOV lane, no projection-matrix
+    // unpick and nothing for the host to keep in step with when render scale or aspect moves.
+    //
+    // ⚠ ddy AND NOT ddx: the vertical axis is the one the projection's FOV is defined on, and it is
+    // the axis that does not change meaning with aspect ratio.
+    //
+    // ⚠ AND IT MUST BE COMPUTED HERE, NOT AT THE DISTORTION BLOCK. rayUv is In.Position.xy scaled,
+    // a pure function of screen position, so this derivative is continuous across every quad
+    // INCLUDING the water mesh's silhouette — an attribute-based one would not be. More importantly
+    // this line sits in uniform control flow: `underwater` below is a dynamic branch and a
+    // derivative inside one is undefined. Same hazard the wave-normal block documents.
+    //
+    // The guard is for the degenerate case only (a ray field that did not vary); 1000 is a
+    // plausible 1080p focal length, so the fallback is a working image rather than a black one.
+    float invFocal = length(ddy(rayDir));
+    float focalPx  = (invFocal > 1e-7f) ? (1.0f / invFocal) : 1000.0f;
+
     // t along the ray to the true plane. Valid when the ray actually descends toward it (matching
     // signs) and is not running parallel; the mesh's own position is the fallback, which is the
     // pre-fix behaviour and the right thing to degrade to at the horizon and in the ±snap dead band
@@ -716,14 +739,86 @@ float4 PS_MAIN( VSOutput In )
     // share of the offset is weighted by transmission. Distance says "the tap has nothing useful left
     // to reach", Fresnel says "nothing is looking through the surface here" — two different reasons a
     // distorted refraction tap is waste, and they bound different pixels.
-    float distortMag  = (distortFar > 0.0f) ? min(dist, 0.5f * distortFar) : dist;
+    // ⚠ W22c — THE TWO ARMS FADE OVER DIFFERENT RANGES, AND THE KNOB NOW DESCRIBES THE LIVE ONE.
+    // "with fresnel, you can ease on dist. fresnel will naturally mask distance at level views, but
+    // looking down case can keep the distortion" (user, 2026-08-22) — and that is exactly right,
+    // because the two bounds answer different questions and only one of them is about distance:
+    //   * A LEVEL view of far water is a GRAZING view of it, by geometry. F is at or near 1 there,
+    //     so W22b's mask already drives the tap to zero — per pixel, at the correct angle, with no
+    //     distance term involved.
+    //   * LOOKING DOWN at far water is a near-NORMAL view of it. From 1000 units up, water 3000 out
+    //     sits at 72 degrees, F = 0.17 — 83% transmission, the seabed plainly visible. The old fade
+    //     had already zeroed the distortion there, which is the one case where it is most wanted.
+    // So the distance term goes back to being the ONE thing it can legitimately claim: the tap must
+    // not reach past what gRefractColor holds. That resource is valid out to nearViewRange, and
+    // distortFar is now exactly that (P[2].w default 1.0). The extra 2x margin it used to carry was
+    // hiding a distance-multiplied offset that had no business growing; W22 deleted the growth and
+    // W22b took over the look-masking, so the margin is protecting against nothing.
+    //
+    // The LEGACY arm keeps its historical range via kDistortLegacyHalf, so angMix = 0 stays the
+    // pre-W22 reference image rather than pre-W22-with-a-different-fade — an A/B arm that has
+    // drifted is worse than no A/B arm, because it still looks like one.
+    #define kDistortLegacyHalf 0.5f
+    float distortFarL = kDistortLegacyHalf * distortFar;
+    float distortMag  = (distortFarL > 0.0f) ? min(dist, 0.5f * distortFarL) : dist;
+    float distortFadeL = (distortFarL > 0.0f)
+                            ? (1.0f - smoothstep(0.5f * distortFarL, distortFarL, dist))
+                            : 1.0f;
+    // The ANGULAR arm's fade, over the outer half of gRefractColor's real extent.
     float distortFade = (distortFar > 0.0f)
                             ? (1.0f - smoothstep(0.5f * distortFar, distortFar, dist))
                             : 1.0f;
     // The whole legacy expression, gathered so both the above- and below-water sites scale
     // identically instead of drifting — they already disagreed by a factor of 2 on purpose (MGE's
     // underwater constant) and that factor is preserved at its own site.
-    float distortAmp  = (windFactor * distortMag + 0.1f) * distortFade;
+    float distortAmpLegacy = (windFactor * distortMag + 0.1f) * distortFadeL;
+
+    // ─── W22: THE AMPLITUDE BECOMES ANGULAR ──────────────────────────────────────────────────────
+    // ⚠ THE BLOCK ABOVE ONLY FIXED HALF OF WHAT ITS OWN COMMENT DIAGNOSED. It capped the top of the
+    // distance ramp and left the ramp — and the ramp's low end is the end a player looks at. The
+    // measured amplitudes, at windFactor = 0.013 (the host default):
+    //     shore, water 300u away, above    distortAmp 4.0 px  -> (1-F)*shoreCancel*4.0*0.1 ~ 0.4 px
+    //     eye 100u under, looking up       distortAmp 1.4 px  -> 4*1.4*0.1              ~ 0.56 px
+    //     open sea at the cap, above       distortAmp 23.4 px -> (1-F~0.05)*23.4*0.1    ~ 0.1 px
+    // Sub-pixel across the entire useful range, and it STAYS sub-pixel for any slope that still
+    // looks like water (0.3 gives 1.2 px). The distortion was not missing. It was quantised away.
+    //
+    // The angular form is what the old comment was reaching for. A wave tilt refracts the view ray
+    // by an angle, and an angle is a fixed pixel count through the focal length whatever the
+    // distance:
+    //     offset_px = delta * focalPx
+    //     delta_above = (1 - 1/n) * slope = 0.2498 * slope   (air -> water)
+    //     delta_below = (n - 1)   * slope = 0.3333 * slope   (water -> air)
+    // At focalPx ~ 935 and slope 0.1 that is 23 px above / 31 px below — in range to be SEEN, and
+    // it scales into that range across the whole plausible slope band instead of out of it.
+    //
+    // ⚠ ONE QUANTITY CHANGES AND NOTHING ELSE DOES. The .yx swizzle, the -2.0 composition, the
+    // (1-fresnel) and shoreCancel weights and the clampAllocUV bounds all stay exactly as they are.
+    // angMix = 0 reproduces the running build bit for bit, which is what makes every judgement
+    // about the new look a two-key A/B rather than a memory test.
+    //
+    // ⚠ WHAT BOUNDS IT, since nothing new was added to:
+    //   * Far field — a constant pixel offset at 5000u would tap an unrelated seabed pixel, but
+    //     (1 - fresnel) there is 0.02-0.05, so the effective offset falls to ~1 px on its own. The
+    //     Fresnel weighting at reffactorR was added for exactly this and now does double duty. This
+    //     is the load-bearing assumption of the whole change: grazing open sea is its falsification
+    //     test, and if that smears, the assumption is what is wrong.
+    //   * Shallow water — shoreCancel already drives both taps to zero at the waterline.
+    //   * distortFar/distortFade STAY. They bound the tap against gRefractColor's near scene, which
+    //     is a RESOURCE fact and not a look parameter. They will now rarely bite, which is correct:
+    //     a bound that never fires is not a dead bound, it is a bound on a case that stopped
+    //     happening.
+    //   * clampAllocUV (W20) BECOMES LOAD-BEARING. Offsets go from ~0.5 px to ~30 px, so edge taps
+    //     will genuinely reach the un-written padding that clamp addressing would otherwise invent
+    //     content from ([[project_sampler_clamp_invents]]). Already in place at all three sites.
+    float angMix      = saturate(gShadowParams.waterDistort.x);
+    float distortGain = max(gShadowParams.waterDistort.y, 0.0f);
+    float distortAmpAng = kRefrDevAir * focalPx * distortFade;
+    float distortAmp    = lerp(distortAmpLegacy, distortAmpAng, angMix) * distortGain;
+    // The above/below asymmetry. MGE's underwater site hard-codes 2x; the physical ratio of the two
+    // deviations is (n-1)/(1-1/n) = n, so the mix carries that factor across with the amplitude
+    // rather than leaving a legacy constant multiplying a derived number.
+    float distortUWFactor = lerp(2.0f, kWaterIOR, angMix);
 
     // Absolute world XY for WORLD-ANCHORED normal sampling (the frame is camera-relative; lodEye is
     // the real absolute eye). Without this the normals swim with the camera.
@@ -1402,11 +1497,64 @@ float4 PS_MAIN( VSOutput In )
             }
         }
 
-        // Distortion factor: 2x the above-water one (MGE's underwater constant).
-        float2 reffactorU = 2.0f * distortAmp * nrm.xy;   // 2x = MGE's underwater constant
+        // --- SNELL'S WINDOW, EVALUATED HERE BECAUSE THE OFFSET NEEDS IT --------------------------
+        // ⚠ THE OLD CURVE HAD NO CRITICAL ANGLE IN IT, and that is the whole reported bug: the window
+        // was drawn as a 79-degree cone instead of a 48.6-degree one and filled with refracted sky at
+        // 84-95% weight out to its rim, where the surface is physically a perfect mirror of the
+        // seabed. See fresnelDielectric's header for the measured table. The exact interface puts the
+        // edge where the medium puts it, and fresnelDielectricRough softens it by the surface's OWN
+        // slope distribution rather than by a smoothstep — so calm water gets a crisp rim and choppy
+        // water a broken one, from the same `alpha` the reflection LOD reads.
+        //
+        // It USED to sit at the composite, 130 lines below, which was enough while it only chose how
+        // much of each side to show. W22b makes it choose how far the refraction tap REACHES as well,
+        // and that happens up here — so it moves to its earliest use rather than being evaluated
+        // twice. One curve, one evaluation: a second copy of a Fresnel is exactly how a pass ends up
+        // masking with a curve that no longer matches the one it mixes with.
+        //
+        // eta = kWaterIOR (not its reciprocal): we are INSIDE the water looking out.
+        float  cosU = dot(-EyeVec, nrm);
+        float  fresnelU = physFresnel ? fresnelDielectricRough(cosU, alpha, kWaterIOR)
+                                      : pow(saturate(1.12f - 0.65f * cosU), 8.0f);
+        // Bit 18 reaches under the surface too. Here it removes the TIR mirror, which outside
+        // Snell's 48.6-degree window is most of the view — so submerged, this mode is close to
+        // "show me only what came through the window", and the window's rim is where the two
+        // readings differ most. It also hands the refraction its FULL offset back, correctly: in
+        // that mode the refraction IS the image.
+        if (noReflect) { fresnelU = 0.0f; }
+
+        // Distortion factor, stronger than the above-water one because the deviation genuinely is:
+        // MGE authored 2x, and (n-1)/(1-1/n) = n = 1.333 is the physical ratio. distortUWFactor
+        // crossfades between them with the same angMix that selects the amplitude, so the pair can
+        // never end up half legacy and half derived.
+        float2 reffactorU = distortUWFactor * distortAmp * nrm.xy;
+
+        // ⚠ W22b — AND THE REFRACTION'S OFFSET IS WEIGHTED BY TRANSMISSION ON THIS SIDE TOO. The
+        // above-water path has done this since reffactorR and states the rule in full: `lerp(
+        // refracted, reflected, F)` already decides how much of each side the eye gets, so distorting
+        // the side it cannot see buys no wobble and costs everything the distortion costs — a tap
+        // free to walk onto unrelated content. This side never applied it, and this is where the
+        // argument is STRONGEST rather than weakest:
+        //   * Above water F only APPROACHES 1 at grazing. Below it, past the 48.6-degree critical
+        //     angle, F is EXACTLY 1 — real total internal reflection — over most of the view. The
+        //     refraction there is multiplied by a hard zero, so where its tap landed was never
+        //     observable in the first place.
+        //   * The underwater offset is the biggest in the frame: distortUWFactor (1.333) times the
+        //     amplitude times the -2.0 composition below is 2.67x the above-water reach, and W22
+        //     raised the amplitude ~50x. An unmasked tap at the window's RIM now reaches tens of
+        //     pixels into a region whose refraction is already nearly extinguished.
+        // Costs nothing where the window is open (F ~ 0.02 at normal incidence, so the mask is
+        // ~ 0.98) and closes the tap exactly as the window closes.
+        //
+        // ⚠ AND IT MUST NOT TOUCH THE REFLECTION, which is why this is a SECOND variable and not a
+        // scale on the first. The reflection's weight goes UP as the refraction's goes down, and
+        // below the surface that is the TIR mirror — nearly the whole view. Scaling its offset by
+        // 1 - F would take the wave wobble off the one term that owns the image. Same asymmetry and
+        // the same reason as the above-water pair; see the block at reffactorR.
+        float2 reffactorUR = (1.0f - fresnelU) * reffactorU;
 
         // Refraction — alloc-sized RT, so pixel offsets scale by invAlloc (see the block above).
-        float2 ruvU = clampAllocUV(baseUV + (-2.0f * reffactorU) * invAlloc);
+        float2 ruvU = clampAllocUV(baseUV + (-2.0f * reffactorUR) * invAlloc);
         float3 refractedU = SampleLvlTex2D(gRefractColor, gSamplerBilinearClamp, ruvU, 0.0f).rgb;
 
         // ⚠ RADIANCE IS NOT INVARIANT ACROSS A REFRACTIVE BOUNDARY — L/n² is, and THIS is why the
@@ -1531,23 +1679,9 @@ float4 PS_MAIN( VSOutput In )
         if (waterDbg == 2u) { RETURN(float4(refractedU, 1.0f)); }
 
         // --- SNELL'S WINDOW ----------------------------------------------------------------------
-        // ⚠ THE OLD CURVE HAD NO CRITICAL ANGLE IN IT, and that is the whole reported bug: the window
-        // was drawn as a 79-degree cone instead of a 48.6-degree one and filled with refracted sky at
-        // 84-95% weight out to its rim, where the surface is physically a perfect mirror of the
-        // seabed. See fresnelDielectric's header for the measured table. The exact interface puts the
-        // edge where the medium puts it, and fresnelDielectricRough softens it by the surface's OWN
-        // slope distribution rather than by a smoothstep — so calm water gets a crisp rim and choppy
-        // water a broken one, from the same `alpha` the reflection LOD reads.
-        //
-        // eta = kWaterIOR (not its reciprocal): we are INSIDE the water looking out.
-        float  cosU = dot(-EyeVec, nrm);
-        float  fresnelU = physFresnel ? fresnelDielectricRough(cosU, alpha, kWaterIOR)
-                                      : pow(saturate(1.12f - 0.65f * cosU), 8.0f);
-        // Bit 18 reaches under the surface too. Here it removes the TIR mirror, which outside
-        // Snell's 48.6-degree window is most of the view — so submerged, this mode is close to
-        // "show me only what came through the window", and the window's rim is where the two
-        // readings differ most.
-        if (noReflect) { fresnelU = 0.0f; }
+        // fresnelU is computed UP AT THE DISTORTION BLOCK, not here, because the refraction's tap
+        // OFFSET is weighted by it (W22b) and the offset is applied long before this mix. The
+        // derivation moved with it. This line is what it was always for.
         float3 resultU  = lerp(refractedU, reflectedU, fresnelU);
 
         // ⚠ AND THE SUN IS ALREADY IN THE REFRACTION — this term was a DOUBLE COUNT, inherited from
@@ -1739,11 +1873,77 @@ float4 PS_MAIN( VSOutput In )
     float  sceneDevZ= SampleLvlTex2D(gSceneLinDepth, gSamplerPointClamp, distUV, 0.0f).r;
     float3 sceneW   = reconstructWorld(invVP, distUV * texToVp, sceneDevZ);
     float  sceneDist= length(sceneW);
-    float  depth      = max(shoreDepthBias, sceneDist - dist);
+    // ⚠ W22e — `depth` AND ITS RAMP ARE GONE. `saturate(depth / 100.0f)` used to scale the tap
+    // below, and it is the last surviving instance of a mistake this file has already fixed twice
+    // elsewhere: it reads the depth buffer as "how deep is the water" when what the depth buffer
+    // answers is "how far away is the nearest thing behind the surface". A fish is not the seabed.
+    //
+    // Reported as "fish has their silhouettes frozen, about 1px edges … the edges don't distort,
+    // whole background seabed distorts", which is that ramp exactly: over open water the probe finds
+    // the seabed hundreds of units down and the ramp saturates at 1, so the seabed gets the full
+    // offset; over a submerged actor it finds the actor twenty units down and the ramp collapses to
+    // ~0.2, so the actor and its outline sit still inside water that is visibly moving. The hard
+    // edge is the silhouette itself, where the probe steps off the fish onto the seabed.
+    //
+    // ⚠ AND THE SHORE BLOCK ABOVE ALREADY WROTE THE DIAGNOSIS DOWN — for a different consumer.
+    // shorePre carries an occlusion mute because "at a silhouette in deep water the depth read
+    // belongs to the object, so the water reports zero depth … un-muted it would freeze the
+    // distortion in a 1px band along every rock". That mute was added to the shore WEIGHT. The tap's
+    // own depth ramp never got one, so the defect simply moved house.
+    //
+    // It is removed rather than muted, because it was doing nothing the tuned guard is not:
+    //   * `shoreCancel` already multiplies reffactorR and is the shallow-water cancel — measured
+    //     UNDISTORTED (non-circular), distance-faded, occlusion-muted, and it reaches exactly 0 at
+    //     the waterline. The offset still goes to zero in centimetres of water, by that route.
+    //   * This ramp could not reach 0 there anyway: `depth` was FLOORED at shoreDepthBias (24), so
+    //     the waterline scored 0.24, not 0. It failed at its stated job.
+    //   * And the same paragraph above indicts it on a second count: the quantity is a SLANT
+    //     distance, "large in water that is centimetres deep" at a grazing shoreline, so it was at
+    //     full amplitude precisely along the waterline.
+    //   * `1 - refrOccl` still guards the case that IS real — a tap that reached something in FRONT
+    //     of the water. That is keyed on `waterDist - sceneDist` and is unaffected.
+    // What is left is a guard that suppressed distortion on submerged objects, which are the one
+    // class of content whose distortion is most visible and most wanted.
+    //
+    // ⚠ shoreDepthBias (P[0].z) now has NO reader. Left published rather than ripped out, so the
+    // param layout at the top of this file stays true; it is a dead lane and should be reclaimed
+    // deliberately, not as a side effect of this fix.
     // ...and the same question asked as a WEIGHT rather than a verdict, off the fetch we already
     // made. (`aboveWater`, the thresholded form of this signal, went with the legacy arm — it was
     // the hard silhouette discard, and the walk-back below replaced it.)
-    float  refrOccl   = occlusionFrom(dist, sceneDist, gFrameData.lodParams.w);
+    // ⚠ W22g — THE TAP'S WALK-BACK GETS ITS OWN DOMAIN, BECAUSE occlusionFrom's STARTS 128 UNITS
+    // TOO EARLY FOR THIS CALLER. The walk-back exists for exactly one situation, stated at the
+    // `aboveWater` removal below: a tap that has been MOVED can land on a rock standing IN FRONT of
+    // the water, and the repair is to shorten the step. "In front" means sceneDist < dist.
+    //
+    // occlusionFrom ramps from `dist - sceneDist = -128`, so it is already 0.21 for anything a mere
+    // 20 units BEHIND the surface — a fish, a submerged rock, a sunken crate. Those are not in front
+    // of the water, they are the very content the refraction exists to show, and shortening the step
+    // over them does not repair anything. It makes the tap position DISCONTINUOUS across their
+    // silhouettes: the pixels whose probe lands on the object take a shorter step than the pixels
+    // beside them whose probe lands on the seabed, so the image tears exactly along the outline.
+    //
+    // Reported as edge pixels on fish AND on rocks, and — the detail that identifies it — NOT on the
+    // open seabed, "because there is nothing behind seabed to show silhouettes". A term keyed on a
+    // depth STEP can only act where there is a depth step. Smooth content has none, which is why the
+    // seabed distorts cleanly while every silhouette in front of it does not.
+    //
+    // So the ramp starts at 0: only geometry genuinely on the camera's side of the surface shortens
+    // the tap. smoothstep is C1 at its lower edge, so nothing hardens at the crossing.
+    //
+    // ⚠ AND THE `valid` STEP GOES WITH IT. occlusionFrom's own header ends "this returns a WEIGHT and
+    // never a verdict … a hard test on this signal is the bug, whatever the test is for" — and then
+    // the function opens with `step(sceneDist, nearRange + 64)`. A hard test on a sample-0 depth
+    // flips over a whole pixel at any silhouette whose far side is past the near range. Same
+    // question, asked as a fade.
+    //
+    // ⚠ NOT A CHANGE TO occlusionFrom ITSELF. Its other two callers want the wider domain: shorePre
+    // MUTES on it precisely so that a depth read belonging to a near object cannot score a full
+    // shore, and that mute needs to fire on things BEHIND the surface. Narrowing the shared function
+    // would fix this tap and re-open the freeze through the shore weight instead.
+    float  refrNear   = gFrameData.lodParams.w;
+    float  refrOccl   = (1.0f - smoothstep(refrNear, refrNear + 128.0f, sceneDist))
+                      * smoothstep(0.0f, 384.0f, dist - sceneDist);
 
     // The two taps the distortion residual differences, and the shoreline transparency weight.
     float3 refrDist    = float3(0.0f, 0.0f, 0.0f);
@@ -1800,8 +2000,9 @@ float4 PS_MAIN( VSOutput In )
     //
     // ⚠ AND IT IS EXACTLY ZERO WHEREVER THE OFFSET IS ZERO, which is what keeps the shoreline free of
     // any resolved quantity at all. `reffactorR` is already cancelled by shoreCancel (shallow water),
-    // by (1 - fresnel) (grazing), by the refrOccl walk-back (silhouettes) and by saturate(depth/100)
-    // — the four places the seam used to live. Where the residual has weight there is no waterline;
+    // by (1 - fresnel) (grazing) and by the refrOccl walk-back (a tap that reached in FRONT of the
+    // water) — the places the seam used to live. (A fourth, saturate(depth/100), was removed in
+    // W22e: it cancelled on submerged OBJECTS, which is not a seam and not shallow water.) Where the residual has weight there is no waterline;
     // where there is a waterline the residual is identically 0 and the pixel is pure blend.
     //
     // ⚠ A DIFFERENCE OF TWO SAMPLES IS NORMALLY A TRAP ([[feedback_interpolated_difference_trap]]) and
@@ -1809,12 +2010,12 @@ float4 PS_MAIN( VSOutput In )
     // and the same filter, so whatever bias the resolve introduced is common to both and subtracts
     // out. What survives is only the difference the OFFSET made, which is the quantity wanted.
     {
-        // The walk-back multiplies the offset, not the uv, so it composes with the depth ramp instead
-        // of fighting it: `saturate(depth/100)` already shrinks the tap in shallow water for the
-        // shoreline, and `1 - refrOccl` shrinks it where the tap has left the water. Two independent
-        // reasons to take a shorter step, and the shorter of the two wins on its own.
-        float2 ruv = clampAllocUV(baseUV + (1.0f - refrOccl) * saturate(depth / 100.0f)
-                                          * reffactorR.yx * invAlloc);
+        // The walk-back multiplies the offset, not the uv, so it composes with the other cancels
+        // instead of fighting them: shoreCancel (folded into reffactorR) shrinks the tap in shallow
+        // water for the shoreline, and `1 - refrOccl` shrinks it where the tap has left the water.
+        // Two independent reasons to take a shorter step, and the shorter of the two wins on its
+        // own. (The third, `saturate(depth/100)`, is gone — see W22e at the `depth` site.)
+        float2 ruv = clampAllocUV(baseUV + (1.0f - refrOccl) * reffactorR.yx * invAlloc);
         refrDist = SampleLvlTex2D(gRefractColor, gSamplerBilinearClamp, ruv,    0.0f).rgb;
         refrFlat = SampleLvlTex2D(gRefractColor, gSamplerBilinearClamp, baseUV, 0.0f).rgb;
 
@@ -1914,12 +2115,37 @@ float4 PS_MAIN( VSOutput In )
                                        gFrameData.lodParams.w);
     float2 reflUV   = reflBase + (1.0f - reflOccl) * reflOff;
     float4 reflSample = sampleReflectSmear(reflUV, reflLod, smearUV, smearN);
-    float3 reflected = reflSample.rgb + fogCol * (1.0f - reflSample.a);
+
+    // ⚠ W22d — THE HOLE FILL WAS THE LAST TERM ON THIS SIDE STILL USING THE PRIVATE FLAT fogCol.
+    // Reported as "the hole fill only works underwater, with cam above holes are back", and that is
+    // exactly the shape of it: underwater the fill is uwDeep, the physical column W16/W18 derived,
+    // so a hole there melts into the water it is surrounded by and disappears. Above water it was
+    // gFrameData.fogColNear — ONE authored colour for the whole frame. Every hole in the mirror
+    // therefore read as the same flat patch whatever the sky above it was doing, which is a hole
+    // however carefully its value was chosen ([[project_forge_water_field_bomb]]'s lesson, and W18's:
+    // a constant handover target stands out whatever its value).
+    //
+    // The holes are real and unavoidable: gReflectColor is a 1024² mirrored-scene render with a
+    // horizon scissor, so everything above the reflected horizon is cleared and never drawn, and
+    // its alpha is a genuine 0. The question was only ever what to put there.
+    //
+    // ⚠ AND THE ANSWER WAS ALREADY DECIDED TWICE IN THE TEN LINES BELOW THIS ONE. The roughness
+    // handover goes to fogSkyColor(); the air-fog melt goes "toward the SAME sampled target as the
+    // world (skydome.h.fsl), not a private fogCol". Both migrated off the flat constant; the hole
+    // fill did not come with them. It is the same question — "what is behind the mirror where the
+    // mirror has nothing" — and it now gets the same answer, sampled per pixel.
+    //
+    // Hoisted into a local rather than called twice: one sky fetch instead of two, and the claim
+    // that the fill and the handover share a target becomes structural instead of a coincidence
+    // two separate expressions have to keep agreeing on. At reflSkyMix = 1 the lerp lands exactly
+    // on the fill, which is the correct limit — a fully rough mirror IS its far field.
+    float3 reflHole  = fogSkyColor(In.Position.xy);
+    float3 reflected = reflSample.rgb + reflHole * (1.0f - reflSample.a);
     // Roughness past what the chain can represent -> the sky (see reflSkyMix). Applied BEFORE the
     // fog melt below, and toward the SAME target, so the two compose instead of competing: a rough
     // near surface reaches the sky by roughness, a smooth far one by fog, and both by both.
     if (reflSkyMix > 0.0f) {
-        reflected = lerp(reflected, fogSkyColor(In.Position.xy), reflSkyMix);
+        reflected = lerp(reflected, reflHole, reflSkyMix);
     }
     // WT4d/P3: the `reflected * 0.96` distance darkening that used to sit here is GONE. It was
     // DIMMING applied to a SAMPLING problem — distant water stayed a hard mirror because the normal
@@ -2320,11 +2546,90 @@ float4 PS_MAIN( VSOutput In )
 	// is a copy of the colour target — so both already carry their own applyFog, exactly as the
 	// destination does. Fogging their difference here would apply the surface's air column to
 	// something that has already been through one, which is the fog² this whole change removes.
-	result += kDst * (refrDist - refrFlat);
+	// ⚠⚠ W22h — WHERE THE OFFSET HAS WEIGHT, STOP ASKING THE BLEND FOR THE REFRACTION.
+	// User, 2026-08-22: "water is using blending, so blending will show the undistorted fish, while
+	// distorted sample won't. disparity is the edge artifacts. maybe it should be two pass? So
+	// backbuffer holds distorted image before water surface is drawn at all."
+	//
+	// That is the defect stated exactly. The blend unit delivers the destination AT THIS PIXEL and
+	// cannot move it, so the undistorted image is always present in the output; the residual's job is
+	// to cancel it and substitute the displaced one. Cancelling by subtraction only works to the
+	// extent that `refrFlat` is bit-for-bit what the blend is about to add — and everything that can
+	// make those two disagree disagrees WORST at a silhouette, where the two images differ most:
+	//   * MSAA. The destination is per-SAMPLE and resolved at the end of the frame by
+	//     resolve_scN.frag (Catmull-Rom over a neighbourhood, negative lobes, Karis 1/(1+luma), a
+	//     clamp), while refrFlat is a hardware ResolveSubresource — a plain box average. Two
+	//     different operators either side of the subtraction. They agree on smooth content and part
+	//     company on edges.
+	//   * Any sub-texel disagreement between the tap and the pixel, which is invisible on smooth
+	//     content and a full edge-worth of error on a sharp one.
+	// Measured with the DEST PROBE (bit 19): kDst*(dest - refrFlat) is not black over a submerged
+	// object, so the premise the whole residual rests on is false in exactly the place it shows.
+	//
+	// The two-pass version — pre-displace the backbuffer, then blend the surface over an already
+	// correct destination — is the same idea and it is right, but it costs a mask pass, a
+	// full-screen displace pass and a second rasterisation of the water mesh, because nothing knows
+	// which pixels are water until the water has been drawn once.
+	//
+	// The same property is available for free by moving the refraction from the DESTINATION to the
+	// surface's OWN term and taking the destination's weight off in step:
+	//     result += kDst * (refrDist - (1 - w) * refrFlat)
+	//     alpha   = 1 - kDst * (1 - w)
+	// w = 0 is today, bit for bit. w = 1 never reads the destination at all, so no operator, filter
+	// or alignment difference can leave a residue — the refraction is simply the tap, at its own
+	// weight, and the "backbuffer holds the distorted image" property is obtained without a pass to
+	// hold it in.
+	//
+	// ⚠ AND THE TWO REGIMES ARE ALREADY DISJOINT, which is what makes w a ramp and not a compromise.
+	// This file states it a few hundred lines up: "Where the residual has weight there is no
+	// waterline; where there is a waterline the residual is identically 0 and the pixel is pure
+	// blend." The per-SAMPLE destination is what the blend was adopted for, and it earns that at the
+	// shoreline, where a pixel is part dry beach and part seabed — and there shoreCancel has already
+	// driven the offset to zero. So ramping w on the offset's own magnitude keeps the per-sample
+	// path exactly where it pays and leaves it exactly where it cannot.
+	//
+	// Ramp over 0.5..2 px: below half a pixel the residual is doing nothing anyway and there is no
+	// reason to give up per-sample delivery for it.
+	float2 offPx  = (1.0f - refrOccl) * reffactorR;
+	float  wOwn   = saturate(gShadowParams.waterDistort.z)
+	              * smoothstep(0.5f, 2.0f, length(offPx));
+	float  kDstBl = kDst * (1.0f - wOwn);          // what the blend is still asked for
+	result += kDst * (refrDist - (1.0f - wOwn) * refrFlat);
+
+	// ─── W22f: THE ONE ASSUMPTION, MEASURED ──────────────────────────────────────────────────────
+	// Everything above is algebra on top of a single premise: that the destination the blend is
+	// about to hand us at THIS pixel is the same value `refrFlat` just sampled out of gRefractColor.
+	// If it is, `+kDst*dest` and `-kDst*refrFlat` annihilate and the pixel ends up at kDst*refrDist,
+	// i.e. the refraction moved by the wave and nothing else.
+	//
+	// When the image disagrees with algebra that checks out on paper, the premise is what to
+	// MEASURE rather than reason about further ([[feedback_verify_the_right_artifact]]). Returning
+	// -kDst*refrFlat at the residual's own weight makes the blend composite exactly
+	//     kDst * (dest - refrFlat)
+	// so the screen shows the difference itself, at its real weight and in its real place:
+	//   BLACK          — the premise holds; a ghost is coming from somewhere that is not this term.
+	//   ANYTHING ELSE  — that IS the uncancelled term, and its shape says what dest contains that
+	//                    the tap does not (or vice versa: a signed difference, so it can go either
+	//                    way and the sign is informative).
+	// Placed after the residual line and not instead of it so the two cannot drift: this reads the
+	// same kDst and the same refrFlat the live path just used.
+	if (destProbe) { RETURN(float4(-kDst * refrFlat, 1.0f - kDst)); }
+
+	// ...and its pair, which turns that answer into a measurement. The dest probe establishes THAT
+	// dest and refrFlat disagree; this shows WHERE the tap's copy of a moving object actually is.
+	// Alpha 1, so the destination is discarded and this is the tap alone, UNDISTORTED (baseUV, not
+	// ruv — the distorted one is already available as waterDbg 2).
+	//
+	// The reading to take: find something that MOVES underwater and compare its position here with
+	// its position in the normal view. Same place ⇒ the copy is current and the disagreement is in
+	// weight, not position. Behind it ⇒ gRefractColor lags the destination, the on-screen gap IS
+	// the lag, and that also explains the defect's most distinctive property — it is fish and not
+	// rocks, because a static object has the same position in both and cancels perfectly.
+	if (flatProbe) { RETURN(float4(refrFlat, 1.0f)); }
 
 	// ─── PREMULTIPLIED OUT ───────────────────────────────────────────────────────────────────────
 	// `result` is the surface's own contribution, already carrying its own weight (nothing divides
 	// by alpha downstream), and `1 - kDst` is the coverage the blend uses to keep kDst of whatever is
 	// behind. ONE / INV_SRC_ALPHA — see buildWaterPipeline.
-	RETURN(float4(result, 1.0f - kDst));
+	RETURN(float4(result, 1.0f - kDstBl));
 }

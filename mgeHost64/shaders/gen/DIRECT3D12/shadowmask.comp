@@ -1139,7 +1139,9 @@ STRUCT(ShadowMaskParams)
 
 
     float4 waterFogSun;
-#line 446
+#line 461 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
+    float4 waterDistort;
+#line 462
 };
 #line 20 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowmask.srt.h"
 
