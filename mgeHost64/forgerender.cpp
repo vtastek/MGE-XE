@@ -141,6 +141,10 @@
 // R2 actor-ripple wave sim SRT (RippleSimSrtData, Persistent frequency). ripplesim.comp +
 // ripplenormal.comp both include it. Model, sizing and the ping-pong rationale: ripplesim.srt.h.
 #include "shaders/FSL/ripplesim.srt.h"
+// W23: tiling caustics (CausticSrtData, Persistent frequency). Shares the merged
+// ComputeRootSignature; caustic.comp + causticresolve.comp both include it. Why a photon SCATTER
+// rather than a forward 1/|det J| map, and why its mean is 1.0 by construction: caustic.srt.h.
+#include "shaders/FSL/caustic.srt.h"
 // Sun shadows Phase B2: the moments-map blur SRT (SunBlurSrtData, PerFrame frequency — its own
 // resource names so the merged ComputeRootSignature has no aliasing with aoblur's PerFrame set).
 // Two instances of the one set drive the separable H/V ping-pong. See tasks/forge-sun-shadows.md.
@@ -1141,6 +1145,24 @@ namespace {
     inline uint32_t bloomSetDown(uint32_t dstMip) { return dstMip; }                    // 1..6
     inline uint32_t bloomSetUp(uint32_t dstMip)   { return kBloomMipCount + dstMip; }   // 7..12
 
+    // W23/W24 caustics: how many instances of the ONE CausticSrtData::Persistent set exist, and what
+    // each of them is for. Declared up here — well before the g_caustic* knob block — only because it
+    // sizes the cbuffer array inside LiveRenderer below, the same reason kBloomSetCount and
+    // kSunCascades are up here.
+    //
+    // ⚠ ONE INSTANCE PER DISPATCH IS A CORRECTNESS REQUIREMENT, NOT TIDINESS, and RippleGrid::cbv[2]
+    // below says why in full: cmdDispatch RECORDS, it does not execute, so two recorded dispatches
+    // sharing one persistently-mapped cbuffer both read whatever the CPU left in it last. The three
+    // scatters splat different source grids into different slices and the two resolves re-prime the
+    // accumulator with different values, so all five parameter blocks must survive to submit.
+    enum CausticSet : uint32_t {
+        kCausticSetStatic = 0,   // static scatter AND static resolve (one parameter block serves both)
+        kCausticSetRipple,       // dynamic scatter, fine ripple grid -> slices 4,5
+        kCausticSetWake,         // dynamic scatter, wake grid        -> slice  6
+        kCausticSetDynResolve,   // resolve over slices 4..6, re-priming them to CAUSTIC_WFIX
+        kCausticSetCount
+    };
+
     // Screen-space AO MODE table. Four interchangeable compute shaders behind ONE SRT (AOSrtData)
     // and ONE descriptor set (pGtaoBatchSet) — same root signature, same bindings, same
     // float4(bentNormalWS, visibility) output — so the host just binds pAOPipeline[g_aoMode] and
@@ -2039,6 +2061,40 @@ namespace {
         Pipeline*      pRippleNormalPipeline = nullptr;
         bool           reflectMipReady = false;            // gates the per-frame pyramid build
 
+        // --- W23: TILING CAUSTICS (caustic.srt.h) ------------------------------------------------
+        // Same eager-from-buildOpaquePath, NON-FATAL shape as the ripple grids: if any of this fails
+        // to build, causticReady stays false, the strength lane publishes 0, and the consumer's
+        // whole block is skipped — the pre-W23 image, with no fallback path to maintain.
+        Texture*       pCausticMap = nullptr;        // Tex2DArray, one slice per depth, (gain - 1)
+        Buffer*        pCausticAccum = nullptr;      // RWBuffer(uint), TOTAL_SLICES planes of RES*RES
+        // ⚠ ONE CBUFFER PER DISPATCH, not one shared. Same correctness requirement RippleGrid::cbv[2]
+        // documents: cmdDispatch RECORDS, it does not execute, so two recorded dispatches sharing one
+        // mapped cbuffer BOTH read whatever the CPU left behind after the last write. The five
+        // dispatches here fall into four parameter sets:
+        //   [0] static scatter + static resolve   base 0, span 4, clear 0
+        //   [1] ripple scatter                    base 4, span 2, the fine grid's domain
+        //   [2] wake scatter                      base 6, span 1, the wake grid's domain
+        //   [3] dynamic resolve                   base 4, span 3, clear CAUSTIC_WFIX
+        // The descriptor set has one instance per entry, which is also what lets gCausticDynField
+        // point at a different wave field in [1] and [2] with no branch in the shader.
+        Buffer*        pCausticCbv[kCausticSetCount] = {};
+        DescriptorSet* pCausticSet = nullptr;
+        Shader*        pCausticShader = nullptr;         // caustic.comp        (static scatter)
+        Shader*        pCausticDynShader = nullptr;      // causticdyn.comp     (dynamic scatter)
+        Shader*        pCausticResolveShader = nullptr;  // causticresolve.comp (normalise + re-prime)
+        Pipeline*      pCausticPipeline = nullptr;
+        Pipeline*      pCausticDynPipeline = nullptr;
+        Pipeline*      pCausticResolvePipeline = nullptr;
+        bool           causticReady = false;
+        bool           causticInSrv = false;         // tracks the map's UAV<->SRV state across frames
+        uint32_t       causticSlice = 0;             // round-robin cursor over the STATIC depth slices
+        // W24: has a dynamic RESOLVE ever run? The accumulator is zero-initialised at creation, and
+        // the dynamic slices' identity prefill is produced BY the resolve — so on the very first
+        // armed frame those planes hold 0, i.e. gain 0, i.e. black. Publishing strength 0 until one
+        // resolve has been through costs exactly one frame of "no dynamic caustics" and removes the
+        // alternative, which is a fill pass that exists only to run once.
+        bool           causticDynPrimed = false;
+
         // --- Buffer consolidation: one shared mega VB + IB for STATIC non-skinned parts ----
         // Kills the per-draw VB/IB binds (the DX9-shaped bottleneck): bind these ONCE, draw each
         // part with firstVertex(BaseVertexLocation)/firstIndex offsets into them. Free-list
@@ -2262,6 +2318,7 @@ namespace {
            kGpuPhaseFroxelNear, // near clustered-lighting froxel clear+assign (before the near colour phase)
            kGpuPhaseVolFog,     // volumetric height fog / sun shafts (after alpha, before the FP arms)
            kGpuPhaseBloom,      // step 4 bloom pyramid (prefilter + down + up), immediately before Resolve
+           kGpuPhaseCaustic,    // W23/W24 caustic scatters + resolves (pure compute, beside the ripple sim)
            kGpuPhaseCount };
 
     // FP1a first-person pass caps: one 64KB world window bounds the rigid list at 1024,
@@ -4005,8 +4062,24 @@ namespace {
     // block is full (see the publish at the worlds[] write), and stealing from it would move a
     // shoreline or a fade that another expression reads by index.
     constexpr uint32_t kWaterDistortFloat    = kWaterFogSunFloat + 4;
+    // W23: caustics — strength, 1/tileUnits, and the log-depth slice map (z*log2(d)+w). Appended
+    // after W22 for the reason every field down here carries.
+    constexpr uint32_t kWaterCausticFloat    = kWaterDistortFloat + 4;
+    // W23 second lane: .x = the dispersion offset in SLICES. The map is single-channel (n enters
+    // the refraction only through c = 1 - 1/n, which multiplies DEPTH), so the fringe is a small
+    // offset along the depth axis the consumer already interpolates. Appended for the same reason.
+    constexpr uint32_t kWaterCaustic2Float   = kWaterCausticFloat + 4;
+    // W24: the two DYNAMIC caustic domains and their strengths. Three more appended float4s, and
+    // appended for the reason every block above states — this buffer is bound BY POINTER into every
+    // PerFrame set and each constant here is a bare index into it, so an insertion anywhere but the
+    // end moves a lane some other pass reads.
+    //   Rip/Wake = (originXY eye-relative, 1/worldUnitsPerTexel, gridTexels)
+    //   Dyn      = (rippleStrength, wakeStrength, rippleSliceZ, rippleSliceW)
+    constexpr uint32_t kWaterCausticRipFloat  = kWaterCaustic2Float + 4;
+    constexpr uint32_t kWaterCausticWakeFloat = kWaterCausticRipFloat + 4;
+    constexpr uint32_t kWaterCausticDynFloat  = kWaterCausticWakeFloat + 4;
     constexpr uint32_t kShadowParamsBytes = 4096;
-    static_assert((kWaterDistortFloat + 4) * sizeof(float) <= kShadowParamsBytes,
+    static_assert((kWaterCausticDynFloat + 4) * sizeof(float) <= kShadowParamsBytes,
                   "ShadowMaskParams overflows its CBV — too many sun cascades");
     // msmrecv.h.fsl's PCSS works in TEXELS, so SUN_SHADOW_RES has to agree with the atlas the host
     // actually allocated. Same mirroring contract as SUN_CASCADES / kSunCascades.
@@ -5888,6 +5961,8 @@ namespace {
     // (the triangle path stays usable).
     bool createFroxelResources(Renderer* R);   // clustered forward (defined later; called from buildOpaquePath)
     bool createRippleSimResources(Renderer* R);// R2 actor-ripple wave sim (same pattern)
+    bool createCausticResources(Renderer* R);  // W23 tiling caustics (same pattern)
+    void bindCausticField(Renderer* R, DescriptorSet* set, uint32_t index);   // W23, all 7 sets
     bool buildOpaquePath(Renderer* R, uint32_t width, uint32_t height) {
         // Depth target (reverse-Z not needed for M1c; standard LEQUAL + clear to 1.0).
         RenderTargetDesc dDesc = {};
@@ -6918,6 +6993,8 @@ namespace {
         // into pPerFrameSet below. Non-fatal — on failure froxelReady stays false and the frags brute-loop.
         createFroxelResources(R);
         createRippleSimResources(R);
+        // W23. Before the pPerFrameSet updates below, so the SRV can bind this frame.
+        createCausticResources(R);
         // NiUVController takeover: the gUVAnim table — a persistent-mapped typed-buffer SRV
         // (Buffer<float4>[kMaxUVAnim]) the draw loops fill via uvAnimIdFor. Created before the
         // PerFrame set updates so every SrtData PerFrame instance can bind it. Zeroed once so
@@ -7087,6 +7164,7 @@ namespace {
                 ++np;
             }
             updateDescriptorSet(R, 0, g_live.pPerFrameSet, np, p);
+            bindCausticField(R, g_live.pPerFrameSet, 0);              // W23
         }
         {
             DescriptorData p[2] = {};
@@ -7122,6 +7200,7 @@ namespace {
                         ++dn;
                     }
                     updateDescriptorSet(R, f, g_live.pShadowFaceSet, dn, d);
+                    bindCausticField(R, g_live.pShadowFaceSet, f);    // W23
                 }
             } else {
                 std::printf("[forge][shadow] addDescriptorSet(face set) FAILED — shadows disabled\n");
@@ -9241,6 +9320,7 @@ namespace {
                     ++rn;
                 }
                 updateDescriptorSet(R, 0, g_live.pPerFrameSetReflect, rn, p);
+                bindCausticField(R, g_live.pPerFrameSetReflect, 0);   // W23
             }
             {
                 // ...and the MIRROR half of the P2 pair: gSkyView bound to pSkyViewCbv[1], which is
@@ -9362,6 +9442,7 @@ namespace {
                     ++rn;
                 }
                 updateDescriptorSet(R, 0, g_live.pPerFrameSetReflectGeo, rn, p);
+                bindCausticField(R, g_live.pPerFrameSetReflectGeo, 0);   // W23
             }
 
             // SUN shadow: pPerFrameSetSun — a PerFrame set bound to pSunFrameCbv (gFrameData copy,
@@ -9428,6 +9509,7 @@ namespace {
                         ++sn;
                     }
                     updateDescriptorSet(R, c, g_live.pPerFrameSetSun, sn, p);
+                    bindCausticField(R, g_live.pPerFrameSetSun, c);   // W23
                 }
             }
 
@@ -9492,6 +9574,7 @@ namespace {
                         ++kn;
                     }
                     updateDescriptorSet(R, 0, g_live.pPerFrameSetSkyHeight, kn, p);
+                    bindCausticField(R, g_live.pPerFrameSetSkyHeight, 0);   // W23
                 }
             }
 
@@ -10640,6 +10723,7 @@ namespace {
                     ++fpn;
                 }
                 updateDescriptorSet(R, 0, g_live.pPerFrameSetFP, fpn, p);
+                bindCausticField(R, g_live.pPerFrameSetFP, 0);   // W23
 
                 DescriptorData lp[2] = {};
                 lp[0].mIndex = SRT_RES_IDX(SrtData, PerDraw, gLights);
@@ -10712,6 +10796,11 @@ namespace {
         // per-mesh VB/IB) and draw with byte offsets. Skinned + multimap + dynamic-morph parts
         // are NOT in the arena (vb/ib above). Exactly one of: inArena | skinned | multimap | dynamic.
         bool     inArena;
+        // Bytes of D3D12 buffer this slot OWNS outright (0 for arena parts, which own none). Stored
+        // rather than recomputed from vertexCount/indexCount at release time, because a re-upload
+        // can change the shape between alloc and free — recomputing would drift g_meshBufBytes by
+        // the difference, and a drifting budget is worse than no budget. See kMeshBufMaxBytes.
+        uint64_t bufBytes;
         uint64_t vbOff;         // byte offset into pArenaVB (valid when inArena)
         uint64_t ibOff;         // byte offset into pArenaIB (valid when inArena)
         // --- dynamic (re-uploaded / animated) path ---
@@ -10803,6 +10892,35 @@ namespace {
     bool                  g_casterSlotsUnsorted = false;   // an append happened → re-sort at compaction
     uint32_t  g_renderFrame = 0;   // monotonic, ++ per renderScene; drives the dynamic-promote streak
     uint32_t  g_dynamicCount = 0;  // meshes currently in the upload-heap ring (should stay tiny)
+
+    // ─── PER-MESH BUFFER BUDGET ──────────────────────────────────────────────────────────────────
+    // ⚠ THIS EXISTS BECAUSE A FAILED ALLOCATION KILLS THE HOST, and it is the same lesson the arena
+    // hard caps carry (see kArenaVBMaxBytes): The-Forge's addBuffer null-derefs a failed
+    // CreateCommittedResource — it does `GetGPUVirtualAddress(pBuffer->mDx.pResource)` at
+    // Direct3D12.c:3521 whether or not the resource was created, so the process AVs INSIDE the call.
+    // That means a null check on the returned Buffer* is useless: there is no "returned" to check.
+    // The only defence is never to ASK for memory we cannot be given.
+    //
+    // The arena got that defence in 2026-07-10 ("the interior black screens"). The per-mesh path —
+    // skinned, multimap and the dynamic-morph ring, i.e. every ACTOR — did not, and on 2026-08-24 it
+    // took the host down mid-swim with 256 movers resident: a few-hundred-KB GPU_ONLY buffer was
+    // refused and Forge dereferenced the null. Sizes are bounded by the upload blob (~1 MB), so it
+    // was not a runaway request; it was simply the end of the memory.
+    //
+    // The cap is a hard byte ceiling on what the non-arena path may hold at once, enforced BEFORE
+    // the allocation is attempted. Over it, the part routes into the SAME skippedParts path the
+    // arena uses: loud log, part missing, host alive. A missing actor is a bug report; a dead host
+    // is the end of the session.
+    //
+    // 768 MB against the arena's 3 GB + 768 MB. Actors are a small fraction of resident geometry —
+    // the measured working set here runs 15 MB of arena VB against a few MB of skinned — so this is
+    // roughly two orders of headroom over normal play and still leaves the 8 GB class of card room
+    // for textures, the shadow atlases and DXVK's own allocations. It is a BACKSTOP, not a budget to
+    // run against: if `meshBuf=` in the pools heartbeat ever approaches it, the leak is upstream.
+    uint64_t  g_meshBufBytes = 0;                          // live total held by non-arena parts
+    uint64_t  g_meshBufPeak  = 0;                          // high-water, for the heartbeat
+    uint64_t  g_meshBufRefusals = 0;                       // parts refused at the cap this session
+    constexpr uint64_t kMeshBufMaxBytes = 768ull << 20;    // 768 MB
     // Split the host render cost into CPU command-recording (the per-draw bind+draw loop) vs
     // GPU execution (submit→fence). If record >> gpu, the renderer is CPU-bound on per-draw
     // binds (D3D9-style) and the DX12 win needs buffer consolidation / batched draws.
@@ -12914,6 +13032,220 @@ namespace {
     // resolve to 10-22 texels and the impulse spacing to 14 — comfortably above the floor.
     // 1024 texels then covers 1024 units (~14.5 m) around the camera, which is the range over which
     // a wake is actually legible; beyond it R1's analytic rain still owns the surface.
+    // ─── W23: TILING CAUSTICS ────────────────────────────────────────────────────────────────────
+    // Mirrored in caustic.h.fsl, which both the generator and the consumer include. Nothing can
+    // static_assert across the FSL boundary, so the creation log line prints the pair and that is
+    // the check.
+    constexpr uint32_t kCausticRes    = 512;   // texels per tile side  (CAUSTIC_RES)
+    constexpr uint32_t kCausticSlices = 4;     // depth slices          (CAUSTIC_SLICES)
+    constexpr uint32_t kCausticThreads = 8;    // must match CAUSTIC_THREADS / CAUSTICR_THREADS
+    // The HEXAGONAL source lattice (CAUSTIC_SRC_X / CAUSTIC_SRC_Y). Decoupled from the RES x RES
+    // destination, and NOT square: a hex lattice only beats a square one if the rows are compressed
+    // to sqrt(3)/2 as well as offset by half, so Y = X * 2/sqrt(3) = 295.6 -> 296. Even (the
+    // half-row offset has to tile) and a multiple of 8 (the thread group). See caustic.srt.h.
+    // How many of the depth slices are rebuilt each frame, round-robin. ⚠ THIS IS WHAT PAYS FOR THE
+    // 512 MAP. Cost goes as RES^2 (a beam's footprint is scale-invariant in TEXELS, so cells per
+    // splat does not move and only the splat count does), so 512 is 4x what 256 was — and a slice
+    // that is one frame stale is displaced by about one texel, because the fastest wave component
+    // in the set travels ~68 units/s. Nobody can see that; everybody can see 2 cm texels.
+    constexpr uint32_t kCausticSlicesPerFrameMax = kCausticSlices;
+    // The time wrap, seconds. ⚠ IT IS NOT JUST A PRECISION GUARD — the field's omegas are SNAPPED to
+    // whole multiples of 2*pi/this in-shader so that the wrap is seamless. Un-snapped, the whole map
+    // teleported to a new phase on this exact beat. Matching water.frag's period so the two fields
+    // cannot beat against each other at some long period nobody would ever attribute.
+    constexpr double kCausticWrapSeconds = 20.0;
+    constexpr uint32_t kCausticSrcX   = 512;
+    constexpr uint32_t kCausticSrcY   = 592;
+    static_assert(kCausticSrcY % 2 == 0, "hex source rows must tile");
+    static_assert(kCausticSrcX % kCausticThreads == 0 && kCausticSrcY % kCausticThreads == 0,
+                  "caustic source grid must be a whole number of thread groups");
+    // Slice depths, world units. GEOMETRIC, which is why the consumer's slice map is in log depth:
+    // the caustic pattern changes fastest in the first metre and barely at all past ten, so equal
+    // ratios put the slices where the change is rather than where the numbers are. 1 unit = 1.42 cm,
+    // so these are 0.45 m / 1.0 m / 2.3 m / 5.1 m.
+    //
+    // ⚠ THE LADDER IS NOT FREE TO CHOOSE — it has to bracket where this surface actually FOCUSES,
+    // and the first version's did not. A wave of slope s and wavenumber K folds the refraction map
+    // at depth 1/(c*s*K); with the default roughness that is ~65 units here, so the useful band is
+    // roughly a third of that to ten times it. The old ladder ran to 640 with a surface whose folds
+    // all happened inside the first slice, which is why every slice past the first was many folds
+    // deep in chaos — that, and point splatting, is what "deteriorates to noise with depth" was.
+    // Expressed against the fold depth: these four sit at 0.5x / 1.1x / 2.4x / 5.5x it.
+    constexpr float kCausticDepths[kCausticSlices] = { 32.0f, 72.0f, 160.0f, 360.0f };
+
+    // ─── W24: THE DYNAMIC LAYERS' SLICES ─────────────────────────────────────────────────────────
+    // Mirrored in caustic.h.fsl (CAUSTIC_RIPPLE_BASE / CAUSTIC_RIPPLE_SLICES / CAUSTIC_WAKE_SLICE /
+    // CAUSTIC_TOTAL_SLICES / CAUSTIC_WAKE_DEPTH). Appended ABOVE the static slices so every static
+    // index — and therefore every static accumulator plane, since the plane index IS the slice — is
+    // bit-for-bit where it was. That is what makes "dynamic strength 0 is pixel-identical to the W23
+    // build" checkable rather than merely plausible.
+    constexpr uint32_t kCausticRippleBase   = 4;
+    constexpr uint32_t kCausticRippleSlices = 2;
+    constexpr uint32_t kCausticWakeSlice    = 6;
+    constexpr uint32_t kCausticTotalSlices  = 7;
+    static_assert(kCausticRippleBase == kCausticSlices, "dynamic slices must sit ABOVE the static ones");
+    static_assert(kCausticWakeSlice == kCausticRippleBase + kCausticRippleSlices, "slice layout");
+    static_assert(kCausticTotalSlices == kCausticWakeSlice + 1, "slice layout");
+    // RIPPLE depths. Deliberately SHALLOWER than the static ladder's 32..360: an actor's splash is a
+    // near-field event and the camera that has to be convinced by it is the first-person/swimming
+    // one, 30 cm away. 24 is roughly the shallowest water anything wades in; 120 is where a ripple's
+    // own wavelength (10-22 units) has folded and further depth stops changing the pattern.
+    constexpr float kCausticRippleDepths[kCausticRippleSlices] = { 24.0f, 120.0f };
+    // WAKE — ONE reference depth, because wake wavelengths (90-200 units) do not fold until ~700-950
+    // units of water. The whole playable range is PRE-FOCUS, where the deviation is linear in depth,
+    // so the consumer scales one tap by depth/this and the reference cancels out of the ratio. Which
+    // is exactly why it is a constant and not a slider. Mirrored as CAUSTIC_WAKE_DEPTH.
+    constexpr float kCausticWakeDepth = 256.0f;
+    // The RIPPLE map's world domain, as a count of fine-grid texels. HALF the fine grid's 1024 reach
+    // on purpose: 1 unit/texel of near-field detail is what swimming needs, and a ripple caustic past
+    // ~512 units (7 m) is behind fog and behind the fade anyway. Taken from the CENTRE of the fine
+    // grid, so the caustic map's texel lattice is a sub-lattice of the wave field's and every tap is
+    // an exact integer load rather than a bilinear fetch.
+    constexpr uint32_t kCausticRippleWindow = 512;
+    static_assert(kCausticRippleWindow == kCausticRes, "ripple source is 1:1 with the destination");
+    // The WAKE map walks the wake grid at stride 2, so it covers the WHOLE 1024-texel grid (8192
+    // world units at the default 8 u/texel) at 16 units per destination texel. Nyquist is
+    // comfortable: wake wavelengths are 11-25 field texels, so sampling every second one loses
+    // nothing, and 16-unit destination texels still give 6-12 texels per wave.
+    constexpr uint32_t kCausticWakeStride = 2;
+
+    bool  g_causticOn        = true;
+    float g_causticStrength  = 1.0f;    // 0 = the pre-W23 image; the consumer's block is gated on it
+    // World units across one tile, and therefore also the REPEAT PERIOD. 1024 units is ~14.6 m.
+    // Repetition wants this large; texel density at a fixed CAUSTIC_RES wants it small — they are
+    // one knob seen from opposite ends, which is why the real answer to repetition is the dynamic
+    // layer and not this slider.
+    //
+    // ⚠ IT ALSO MOVES THE FOCUS DEPTH, AND THAT IS COMPENSATED AT THE PUBLISH. The wavevectors are
+    // fixed integers on the lattice, so world wavenumber K = 2*pi*|n|/tile falls as the tile grows,
+    // and the depth at which the map folds is 1/(c*slope*K) — proportional to tile/slope. Left
+    // alone, doubling the tile would double every fold depth and drop the whole ladder into the
+    // pre-focus regime, i.e. the caustics would quietly wash out and the tile slider would get
+    // blamed for the wrong thing. The effective slope is therefore scaled by tile/kCausticTileRef,
+    // which holds slope*K — and so the ladder — exactly fixed. See the cbuffer fill.
+    float g_causticTileUnits = 1024.0f;
+    // The tile the slope knob is calibrated at. Only ratios of it are ever used.
+    constexpr float kCausticTileRef = 512.0f;
+    // RMS surface slope of the generating wave field. ⚠ THE LOOK KNOB, because it is what decides
+    // WHERE THE MAP FOLDS: focus depth is 1/(c * slope * K), so this slides the whole caustic
+    // progression up and down the depth ladder above. Too low and nothing focuses inside the ladder
+    // (a gentle brightness wobble, no filaments); too high and every slice is many folds past focus,
+    // which is chaos rather than caustics. 0.25 is a choppy-but-not-breaking sea and puts first
+    // focus at ~65 units, i.e. between the first two slices.
+    // ⚠ SINCE W25 IT IS READ AT WAVE AMPLITUDE 1, not absolutely: the generator runs at this times
+    // waterBaseSlopeGain(), so the water's own normal intensity carries the caustic with it. This
+    // stays the LOOK knob; it is now a look at a stated reference rather than in a vacuum.
+    float g_causticSlopeRms  = 0.25f;
+    // Sub-beams per source cell, per axis. NOT a noise knob — the field is deterministic (each beam
+    // covers its own cell by construction, see caustic.srt.h). It refines the one place a single
+    // beam is too crude: across a hard fold, where the cell's image is curved and a LINEAR footprint
+    // cannot describe it. 1 is right until filaments start looking faceted. Cost is ~x(n^2) beams
+    // against ~x(1/n^2) cells each, so it is closer to free than it looks — but measure `caustic=`.
+    float g_causticSubBeams  = 1.0f;
+    // Depth slices rebuilt per frame (1..kCausticSlices), round-robin. 2 = each slice refreshed
+    // every other frame, ~1 texel of lag; 4 = every slice every frame, at 4x the atomics.
+    float g_causticSlicesPerFrame = 2.0f;
+    // Gain over the sun's own angular size (0.53 deg, /n in water), which softens every beam by
+    // depth*0.00347 world units. This is why real deep caustics are soft, and it is already in the
+    // physics — the knob is for taste, not for hiding sampling artefacts.
+    float g_causticSoften    = 1.0f;
+    // Animation rate over the PHYSICAL deep-water dispersion (omega = sqrt(g*K), g = 686 u/s^2).
+    // 1.0 is the real thing: long waves crawl, short ones scurry.
+    float g_causticSpeed     = 1.0f;
+    // EMA weight for the new frame. ⚠ DEFAULTS TO 1.0 = OFF, where the point-splat version needed
+    // 0.25 just to be watchable. A beam splat has no Poisson noise to average away, so an EMA here
+    // buys nothing and costs a smear on a moving pattern. Kept only for residual stepping at high
+    // animation rates.
+    float g_causticEma       = 1.0f;
+    // Gain over the PHYSICAL per-channel spread in (1 - 1/n). ⚠ 1 IS INVISIBLE BY CONSTRUCTION,
+    // not by accident: the real spread is 1.8%, and 1.8% of a displacement of tens of units is under
+    // a tenth of a texel at any tile size we would use. So a visible fringe is ALWAYS an
+    // exaggeration here and the only question is whether it is shaped right — 20 puts blue about
+    // two texels off green at the middle slice, which is a fringe you can see without it reading as
+    // a registration error.
+    float g_causticDispGain  = 20.0f;
+    // ─── W25: THE SURFACE THE CAUSTIC IS CAST BY ──────────────────────────────────────
+    // water.frag builds the visible normal out of THREE slope terms, each with its own gain:
+    //
+    //   base texture slope * waveAmp  +  ripple field * ripSimSlope  +  wake field * wakeSlope
+    //        (water.frag.fsl:966)              (:1153)                       (:1177)
+    //
+    // The caustic map has exactly those three layers, and since W24 two of them already ride the
+    // SAME number the frag does (fillDyn's slopeGain). ⚠ THIS IS THE THIRD, AND IT WAS THE ODD ONE
+    // OUT — the calm-water layer was cast by a surface nobody could see. Pulling the wave amplitude
+    // to zero left a flat mirror still covered in caustics, and there was no way to look at the
+    // ripple and wake layers on their own.
+    //
+    // ⚠ A RATIO AGAINST THE STATE g_causticSlopeRms WAS CALIBRATED IN, NEVER AN ABSOLUTE SLOPE. The
+    // generator's field is 20 cosines over a ~27-107 unit band; the normal map's own slope variance
+    // (g_waveSrcSigma2, measured at load) runs all the way down to its ~2 unit texel. Those are not
+    // the same quantity, and equating them would be exactly the mistake in
+    // [[feedback_prior_art_constants_dont_transfer]]. What the two DO share is linearity — both
+    // scale with the amplitude of the field they are built from — so the RATIO transfers even
+    // though the value does not. It is 1.0 at the defaults, which is what makes this an identity
+    // until somebody moves a slider, and it is why a future wind sub-simulation gets the caustic
+    // for free the moment it drives the normal intensity: there is nothing else to wire.
+    inline float waterBaseSlopeGain() {
+        // The flat test forces normal = +Z and water.frag drops the ripple and wake terms with it
+        // (`flatWater`), so it is not "no waves", it is "no surface" — every layer goes. The other
+        // half of that is at the caustic gate; this half has to agree with it.
+        if (g_waterFlatTest)        { return 0.0f; }
+        // W1's procedural field REPLACES the normal outright (water.frag.fsl:1047) and never reads
+        // waveAmp at all — on that path the amplitude lives in the four noise HEIGHT sliders.
+        // Deliberately NOT mirrored host-side: that field's slope variance is a per-pixel,
+        // footprint-dependent fBM sum (wavefield.h.fsl:390-395), and a second copy of that formula
+        // over here is a copy that goes stale silently. It is a default-off A/B path, so it
+        // publishes the calibration reference and the caustic does not follow the noise sliders.
+        if (g_waterProceduralWaves) { return 1.0f; }
+        return std::max(0.0f, g_waterWaveAmp);
+    }
+    // The slope the GENERATOR actually runs at: the authored knob, scaled by the tile so that
+    // slope*K — and therefore every fold depth, and therefore the meaning of the depth ladder —
+    // stays put when the tile moves, and scaled by the surface gain above so the map is cast by the
+    // water you are looking at. Both the generator and the dispersion magnitude read it, so the two
+    // cannot disagree about how rough the surface is.
+    // ⚠ THE 0.01 LOWER CLAMP IS GONE. It kept the generator out of a degenerate corner back when
+    // the only input was an authored knob with a 0.05 slider floor; the tie needs the range monotone
+    // all the way down, and zero is handled one level up instead — statArmed skips the dispatch and
+    // the strength lane publishes 0. An almost-flat surface now makes an almost-absent caustic, and
+    // a flat one makes none at all.
+    inline float causticEffectiveSlope() {
+        const float t = std::max(g_causticTileUnits, 1.0f) / kCausticTileRef;
+        return std::min(g_causticSlopeRms * t * waterBaseSlopeGain(), 4.0f);
+    }
+    // MW's live windFactor (waterParams[1]), cached where the other water lanes are. The caustic
+    // consumer folds it into the DEPTH SLICE rather than into the strength: slope and depth enter
+    // the refraction as the product c*D*grad(h), so to the map a rougher surface IS deeper water.
+    float g_causticWindNow   = 0.013f;
+
+    // ─── W24: DYNAMIC CAUSTICS ───────────────────────────────────────────────────────────────────
+    // Strengths, and they are the A/B: 0 in either publishes 0 in that layer's lane, which disarms
+    // the consumer's block outright and skips the scatter dispatch, so the image is the W23 one
+    // exactly. Not a fade toward a still-running term.
+    float g_causticRippleStr = 1.0f;
+    float g_causticWakeStr   = 1.0f;
+    // A multiplier over the slope gain each layer inherits from its own wave grid (g_ripSimSlope /
+    // g_wakeSlope). ⚠ 1.0 IS THE CORRECT DEFAULT AND IT IS NOT A TASTE CALL: the caustic must be
+    // cast by the surface you can SEE, so the steepness driving the refraction has to be the same
+    // number water.frag perturbs its normal with. This exists to explore, not to be left off 1.
+    float g_causticDynSlope  = 1.0f;
+    // The CALM THRESHOLDS, and between them they are the cost model. A beam whose displacement is
+    // under this many destination texels AND whose q*|H| is under the second number returns without
+    // touching memory, so the dispatch costs five texture loads per cell over calm water and a full
+    // splat only over disturbed water. Raising them makes calm cheaper and eats the faintest
+    // ripples; the defaults are a twentieth of a texel and a 2% Jacobian perturbation, both of which
+    // are below what survives the consumer's own fade.
+    float g_causticCalmDisp  = 0.05f;
+    float g_causticCalmHess  = 0.02f;
+    // The RIPPLE map's reach, as an integer stride through the fine grid. ⚠ AN INTEGER, AND THAT IS
+    // STRUCTURAL, NOT A UI CONVENIENCE: the identity prefill is exact only because the destination
+    // lattice is a SUB-LATTICE of the wave field's, one beam born per destination texel. A
+    // fractional reach would need bilinear source taps and would make "a uniform lattice of calm
+    // beams sums to a uniform field" false, which is the whole cost model. 1 = 512 units at 1
+    // unit/texel (the default: near-field detail, which is what swimming and first person need);
+    // 2 = the fine grid's full 1024 units at 2 units/texel.
+    float g_causticRippleStride = 1.0f;
+
     constexpr uint32_t kRippleGrid       = 1024;   // texels per side
     constexpr float    kRippleUnitsPerTexel = 1.0f;
     constexpr uint32_t kRippleThreads    = 8;      // must match RIPPLE_THREADS in the .comp
@@ -12933,12 +13265,20 @@ namespace {
     // Sub-steps are FIXED at 2 in the dispatch, deliberately not a knob: two is what ties the
     // ping-pong parity to the per-sub-step params buffers, and that pairing is what makes the
     // impulse injection land in the first step only. Four would re-inject.
-    // ⚠ DEFAULT OFF since the MGE port landed, and not because it looks bad. Its speed/decay are
-    // per STEP, so its wave speed is proportional to the frame rate — 330 units/s at 165 Hz, which
-    // no swimmer can outrun. That guarantees a subcritical source and therefore concentric circles,
-    // and those circles sit in the near field right on top of the wake grid's cone. One checkbox
-    // brings it back for the A/B.
-    bool  g_ripSimOn     = false;   // master; false falls back to the analytic path above
+    // ⚠ DEFAULT ON since W24, and the reason it was OFF is still true — it just stopped being the
+    // deciding factor. The old note, kept because it is the thing to remember when this grid's WAKE
+    // looks wrong: its speed/decay are per STEP, so its wave speed is proportional to the frame rate
+    // (330 units/s at 165 Hz), which no swimmer can outrun. That guarantees a SUBCRITICAL source and
+    // therefore concentric circles rather than a cone, and those circles sit in the near field right
+    // on top of the wake grid's own wedge. It is off-by-default material as a WAKE.
+    //
+    // What changed is that it is no longer only a wake. W24's ripple CAUSTIC layer splats this field
+    // and nothing else does, so with this off that layer does nothing at any strength — and the
+    // near-field splash caustic is the case the whole layer exists for (first person, swimming, the
+    // camera 30 cm from the disturbance). Concentric circles are the correct shape for a SPLASH;
+    // they are only the wrong shape for a moving source, which is what the dispersive grid beside it
+    // is for. So both grids run, each doing the thing it is right for.
+    bool  g_ripSimOn     = true;    // master; false falls back to the analytic path above
 
     // ---- R2c: the DISPERSIVE wake grid — the one that actually makes a Kelvin wedge -------------
     // ⚠ THE GRID ABOVE CANNOT PRODUCE A WEDGE AT ANY SETTING, and that is not a tuning failure.
@@ -14689,7 +15029,11 @@ namespace {
                     &g_waterLightAbsorb, 0.0f, 1.0f, 0.05f, "%.2f");
           t.checkbox("Water: PROCEDURAL surface field (W1 noise; OFF = W2 texture + anisotropic taps)",
                      &g_waterProceduralWaves);
-          t.sliderF("Water: wave amplitude (W2; scales normals AND roughness together)",
+          // ⚠ W25: IT ALSO DRIVES THE CALM-WATER CAUSTIC. The static caustic layer's generator
+          // slope is causticSlopeRms * THIS, so the map is cast by the surface you can see — and 0
+          // here is how you switch the calm layer off and look at the ripple and wake caustics on
+          // their own. See waterBaseSlopeGain().
+          t.sliderF("Water: wave amplitude (normals + roughness + CALM caustics)",
                     &g_waterWaveAmp, 0.0f, 4.0f, 0.05f, "%.2f");
           // W3 BOMB knobs. Live rather than compiled in, because "does the tile still read" is a
           // question you answer by flying over open water, and a rebuild-relaunch-fly loop per value
@@ -14775,7 +15119,10 @@ namespace {
           // The bisect. Flat normal + directional sun = translation-invariant, so strafing must leave
           // the specular PIXEL-IDENTICAL. If it still moves, the wave field is innocent and the fault
           // is in V/L/the lobe; if it is rock solid, the field is the whole story.
-          t.checkbox("Water: FLAT-WATER TEST (force normal +Z; strafing must not move the specular)",
+          // ⚠ W25: IT ALSO DISARMS ALL THREE CAUSTIC LAYERS. A flat surface refracts nothing, so
+          // a caustic that survived this would be a pattern proving itself fake — which makes this
+          // one checkbox the whole-system check, not just the specular one.
+          t.checkbox("Water: FLAT-WATER TEST (normal +Z; kills specular motion AND caustics)",
                      &g_waterFlatTest);
           // Spans NEGATIVE as well as positive: magnitude sets the ramp's range (and with it the
           // contour spacing), sign flips crests and troughs — which is the direct check that the
@@ -14808,7 +15155,11 @@ namespace {
           // The first shipped default was 0.985, which threw away 84% of the wave energy every
           // second on ripples whose whole life is 3 s — the waves died about as fast as MW made
           // them, which is why the wake read as "very weak" rather than as wrong.
-          t.checkbox("FINE grid on (non-dispersive splash; off by default — see the note)", &g_ripSimOn);
+          // ⚠ THIS CHECKBOX ALSO GATES THE W24 RIPPLE CAUSTIC LAYER further down the tab. That layer
+          // splats gRippleField, which only ripplesim.comp writes — so with this off its strength
+          // slider does nothing at any value. MGE_HOST_KNOBS name: `ripSimOn`.
+          t.checkbox("FINE grid on (non-dispersive splash; also gates the RIPPLE caustic layer)",
+                     &g_ripSimOn);
           t.sliderF("Wake sim: impulse amplitude (height at the splash centre)", &g_ripSimAmp, 0.0f, 4.0f, 0.05f, "%.2f");
           t.sliderF("Wake sim: impulse radius (TEXELS; 1 texel = 1 world unit)", &g_ripSimRadius, 1.0f, 32.0f, 0.5f, "%.1f");
           t.sliderF("Wake sim: slope gain into the normal", &g_ripSimSlope, 0.0f, 16.0f, 0.25f, "%.2f");
@@ -14817,7 +15168,10 @@ namespace {
           // R2c. The fine grid above CANNOT make a wedge at any setting on this panel — it has no
           // dispersion, so a swimmer in it leaves nested circles or a Mach cone. This second grid is
           // where the wedge comes from; turn the two on and off independently to see which is which.
-          t.checkbox("WAKE grid on (the V comes from THIS one, not the fine grid above)", &g_wakeOn);
+          // Gates the W24 WAKE caustic layer too, for the same reason the fine grid gates the ripple
+          // one. MGE_HOST_KNOBS name: `wakeOn`. On by default, so that layer is live out of the box.
+          t.checkbox("WAKE grid on (the V comes from THIS one, not the fine grid above; gates the WAKE caustic layer)",
+                     &g_wakeOn);
           t.checkbox("Wake integrator = MGE's own sim (off = the dispersive |k| grid)", &g_wakeMge);
           t.sliderF("Wake: world units per TEXEL (moves with the integrator; clears the field)", &g_wakeUnitsPerTexel, 1.0f, 24.0f, 0.5f, "%.1f");
           t.sliderF("Wake: slope gain into the normal", &g_wakeSlope, 0.0f, 16.0f, 0.25f, "%.2f");
@@ -14924,6 +15278,99 @@ namespace {
           // released, so there is nothing to cancel and no resolve-operator mismatch to leave a rim.
           t.sliderF("Water: refraction as OWN term (0 = blend residual, the A/B)",
                     &g_waterRefrOwn, 0.0f, 1.0f, 0.05f, "%.02f");
+          // ─── W23 CAUSTICS ─────────────────────────────────────────────────────────────────────
+          // Both compute shaders HOT-RELOAD (F8), which is why the pattern's own constants live in
+          // caustic.comp.fsl and only the framing lives here.
+          t.checkbox("Caustics: enable", &g_causticOn);
+          // Strength 0 disarms the consumer's whole block, so this is the A/B and not a fade to a
+          // still-running term.
+          t.sliderF("Caustics: strength (0 = off, the A/B)", &g_causticStrength, 0.0f, 3.0f, 0.05f, "%.02f");
+          // The one number to try first if the pattern reads as too coarse or too obviously tiled:
+          // it moves cell SIZE and tile PERIOD together, because at a fixed 256 texels they are the
+          // same knob seen from two ends.
+          t.sliderF("Caustics: tile (world units)", &g_causticTileUnits, 128.0f, 2048.0f, 32.0f, "%.0f");
+          // (A consumer-side anti-tile domain warp lived here briefly and was removed: hiding the
+          // repeat by shearing the lookup traded a periodic artefact for a smeared one, and the
+          // smear read worse. The tile gets broken by the DYNAMIC layer instead.)
+          // ⚠ THE LOOK KNOB, and the one to reach for before any other. It is not a brightness: it
+          // decides WHERE THE MAP FOLDS (focus depth = 1/(c*slope*K)), so it slides the whole caustic
+          // progression along the depth ladder. Too low and nothing focuses inside the ladder — a
+          // gentle wobble with no filaments; too high and every slice is many folds past focus,
+          // which is chaos rather than caustics.
+          t.sliderF("Caustics: surface RMS slope AT wave amplitude 1 (the LOOK knob)",
+                    &g_causticSlopeRms, 0.05f, 0.60f, 0.01f, "%.02f");
+          // NOT a noise knob — the field is deterministic, because each beam is deposited over the
+          // ellipse its own refraction produced rather than as a point. This refines the one case a
+          // single beam cannot describe: a cell straddling a hard fold, whose image is curved where
+          // the footprint is linear. Raise it only if filaments start looking faceted.
+          t.sliderF("Caustics: sub-beams per cell (fold detail)", &g_causticSubBeams, 1.0f, 4.0f, 1.0f, "%.0f");
+          // ⚠ THE COST KNOB, and what pays for the 512 map. Cost is linear in this and quadratic in
+          // CAUSTIC_RES. 2 = each slice refreshed every other frame, about one texel of lag on the
+          // fastest wave component; 4 = every slice every frame at twice the atomics for something
+          // nobody can see.
+          t.sliderF("Caustics: slices rebuilt per frame (COST)", &g_causticSlicesPerFrame, 1.0f, 4.0f, 1.0f, "%.0f");
+          // Gain over the sun's own angular size (0.53 deg, /n in water) — already in the physics as
+          // depth*0.00347, which is why deep caustics come out soft without anything being blurred.
+          t.sliderF("Caustics: sun-disc soften (1 = physical)", &g_causticSoften, 0.0f, 6.0f, 0.25f, "%.02f");
+          // 1.0 = the real deep-water dispersion, omega = sqrt(g*K): long waves crawl, short ones
+          // scurry. That relation is most of what makes a surface read as water rather than as a
+          // scrolling texture, so this is a rate, not a shape.
+          t.sliderF("Caustics: animation rate (1 = physical)", &g_causticSpeed, 0.0f, 3.0f, 0.05f, "%.02f");
+          // ⚠ 1.0 = OFF, and that is the right default. A beam splat is deterministic — there is no
+          // Poisson noise here to average away, which is exactly what the point-splat version needed
+          // its 0.25 for. Below 1 this only smears a moving pattern.
+          t.sliderF("Caustics: temporal EMA (1 = none — leave it)", &g_causticEma, 0.05f, 1.0f, 0.05f, "%.02f");
+          // Gain over the PHYSICAL 1.8% spread in (1 - 1/n). 1 is the measured dispersion and is
+          // nearly invisible; the ask was "some soft fringe", not the real one.
+          // ⚠ 1 IS INVISIBLE BY CONSTRUCTION — the true spread is 1.8%, which is under a tenth of a
+          // texel of separation. Any fringe you can see here is an exaggeration; 20 puts blue ~2
+          // texels off green at the middle slice. 0 collapses the three taps back to one.
+          t.sliderF("Caustics: dispersion gain (1 = physical = invisible)", &g_causticDispGain, 0.0f, 60.0f, 1.0f, "%.01f");
+          // ─── W24 DYNAMIC CAUSTICS ─────────────────────────────────────────────────────────────
+          // The layer that BREAKS THE TILE, by being the actual disturbance rather than a repeating
+          // pattern: the same beam kernel fed by the live ripple and wake fields, splatted into a
+          // camera-anchored map with no period at all. Both strengths are the A/B — 0 publishes 0
+          // in that layer's lane, which disarms the consumer's block AND skips the dispatch, so the
+          // image is the W23 one exactly.
+          //
+          // ⚠ THE RIPPLE LAYER FOLLOWS THE FINE GRID'S OWN CHECKBOX. It reads gRippleField, which
+          // only ripplesim.comp writes, so unticking "FINE grid on" above makes this slider do
+          // nothing at any value — which is a state worth knowing about before concluding the layer
+          // is broken. Both default ON since W24.
+          t.sliderF("Caustics: RIPPLE strength — needs 'FINE grid on' above",
+                    &g_causticRippleStr, 0.0f, 3.0f, 0.05f, "%.02f");
+          t.sliderF("Caustics: WAKE strength — needs 'WAKE grid on' above (on by default)",
+                    &g_causticWakeStr, 0.0f, 3.0f, 0.05f, "%.02f");
+          // ⚠ 1.0 IS CORRECT, NOT A TASTE DEFAULT. Each dynamic layer inherits the slope gain
+          // water.frag perturbs its normal with for that same grid, because the caustic must be
+          // cast by the surface you can SEE. This multiplies both; it is here to explore the
+          // sensitivity, not to be left somewhere else.
+          t.sliderF("Caustics: dynamic slope gain (1 = the surface you can see)",
+                    &g_causticDynSlope, 0.0f, 4.0f, 0.05f, "%.02f");
+          // ⚠ W25 — HOW TO ISOLATE A LAYER, spelled out here because the levers are three
+          // different sliders in two different sections and that is exactly the thing nobody finds.
+          // All three caustic layers are now cast by the SAME slope gains water.frag builds the
+          // visible normal from, so the honest way to isolate one is to flatten the others' surface
+          // rather than to dim their caustic:
+          //   calm water  -> "Water: wave amplitude" (above, in the surface section)
+          //   splashes    -> "Wake sim: slope gain into the normal"
+          //   wakes       -> "Wake: slope gain into the normal"
+          // and "Water: FLAT-WATER TEST" takes all three at once, which is the one-switch check
+          // that what is on screen is refracted and not painted on.
+          t.label("Isolate a caustic layer with its SURFACE slope gain, not its strength:");
+          t.label("  calm = Water wave amplitude | splash = Wake sim slope | wake = Wake slope");
+          // Reach vs detail on the ripple map, as an INTEGER stride through the fine grid — integer
+          // because the identity prefill is exact only while the destination lattice is a
+          // sub-lattice of the wave field's. 1 = 512 units at 1 unit/texel (near-field detail, what
+          // swimming and first person need); 2 = the full 1024 units at 2 units/texel.
+          t.sliderF("Caustics: ripple reach (1 = 512 units @ 1 u/texel, 2 = 1024 @ 2)",
+                    &g_causticRippleStride, 1.0f, 2.0f, 1.0f, "%.0f");
+          // ⚠ THE COST MODEL, both of them together. A beam under BOTH thresholds returns without
+          // touching memory, so calm water costs five texture loads per cell and disturbed water
+          // costs a full splat — which is what makes a dynamic layer affordable at all. Raise them
+          // to make calm cheaper at the price of the faintest ripples.
+          t.sliderF("Caustics: CALM threshold, displacement (texels)", &g_causticCalmDisp, 0.0f, 0.5f, 0.01f, "%.03f");
+          t.sliderF("Caustics: CALM threshold, q*|H| (Jacobian)", &g_causticCalmHess, 0.0f, 0.2f, 0.005f, "%.03f");
           // The opaque-era depth write, kept as the A/B. ON deletes every sorted-alpha fragment on the
           // far side of the surface (hair, manes, banners, bubbles) — flip it above water while looking
           // at a submerged head and the hair appears and disappears. OFF still writes it while the
@@ -15273,6 +15720,13 @@ namespace {
             if (m.vb) { removeResource(m.vb); m.vb = nullptr; }
             if (m.ib) { removeResource(m.ib); m.ib = nullptr; }
         }
+        // Hand the budget back EXACTLY what this slot took (m.bufBytes, recorded at alloc), not what
+        // its current vertexCount implies — a re-upload can change the shape in between, and a
+        // budget that drifts is a budget that eventually refuses everything or protects nothing.
+        // Clamped rather than trusted: an underflow here would wrap to 16 exabytes and disable the
+        // cap silently, which is the one failure mode this whole mechanism exists to prevent.
+        g_meshBufBytes = (g_meshBufBytes > m.bufBytes) ? (g_meshBufBytes - m.bufBytes) : 0ull;
+        m.bufBytes = 0;
         m.dynamic = false;
         m.ring = 0;
         // NiUVController takeover: the key track dies with the mesh buffers (re-uploads
@@ -15378,6 +15832,199 @@ namespace {
         LOG::logline(">> [ripple] %s grid ready: %ux%u @ %.2f units/texel (%.0f world units)",
                      tag, size, size, unitsPerTexel, size * unitsPerTexel);
         return true;
+    }
+
+    // W23: the tiling caustic map. Two compute pipelines, one uint counter, one array texture.
+    // Same eager-from-buildOpaquePath, NON-FATAL, returns-bool shape as createRippleSimResources
+    // below — anything that fails leaves causticReady false, the strength lane publishes 0, and the
+    // consumer skips its whole block. There is no fallback path to keep working.
+    bool createCausticResources(Renderer* R) {
+        if (g_live.pCausticPipeline) { return g_live.causticReady; }
+
+        {
+            ShaderLoadDesc cs = {};
+            cs.mComp.pFileName = "caustic.comp";
+            addShader(R, &cs, &g_live.pCausticShader);
+            ShaderLoadDesc ds = {};
+            ds.mComp.pFileName = "causticdyn.comp";
+            addShader(R, &ds, &g_live.pCausticDynShader);
+            ShaderLoadDesc rs = {};
+            rs.mComp.pFileName = "causticresolve.comp";
+            addShader(R, &rs, &g_live.pCausticResolveShader);
+            if (!g_live.pCausticShader || !g_live.pCausticDynShader || !g_live.pCausticResolveShader) {
+                std::printf("[forge][caustic] addShader FAILED - caustics disabled\n"); return false;
+            }
+            PipelineDesc cp = {}; cp.mType = PIPELINE_TYPE_COMPUTE;
+            cp.mComputeDesc.pShaderProgram = g_live.pCausticShader;
+            addPipeline(R, &cp, &g_live.pCausticPipeline);
+            PipelineDesc dp = {}; dp.mType = PIPELINE_TYPE_COMPUTE;
+            dp.mComputeDesc.pShaderProgram = g_live.pCausticDynShader;
+            addPipeline(R, &dp, &g_live.pCausticDynPipeline);
+            PipelineDesc rp = {}; rp.mType = PIPELINE_TYPE_COMPUTE;
+            rp.mComputeDesc.pShaderProgram = g_live.pCausticResolveShader;
+            addPipeline(R, &rp, &g_live.pCausticResolvePipeline);
+            if (!g_live.pCausticPipeline || !g_live.pCausticDynPipeline
+                || !g_live.pCausticResolvePipeline) {
+                std::printf("[forge][caustic] addPipeline FAILED - caustics disabled\n"); return false;
+            }
+        }
+
+        // The map. addTexture-shaped (DESCRIPTOR_TYPE_TEXTURE | RW), NOT addRenderTarget: nothing
+        // rasterises into this, compute writes it and colour frags sample it. fp16 because it stores
+        // (gain - 1), a signed value that a fold drives well past 1.
+        //
+        // ⚠ ONE CHANNEL, and the dispersion fringe survives it. n(lambda) enters the refraction only
+        // through c = 1 - 1/n, which multiplies the DEPTH and nothing else, so red's caustic is this
+        // same pattern at a slightly shallower effective depth — the consumer recovers the whole
+        // fringe from the depth lerp it is already doing (caustic.srt.h). R16 rather than RGBA16
+        // makes the whole map 512 KB.
+        {
+            TextureDesc td = {};
+            td.mWidth = kCausticRes; td.mHeight = kCausticRes; td.mDepth = 1;
+            // W24: SEVEN slices, not four. Static 0..3, ripple 4..5, wake 6 — one texture because
+            // that is one SRV, one UAV<->SRV barrier and one bindCausticField into all seven
+            // PerFrame sets, where three textures would be three of each for no gain.
+            td.mArraySize = kCausticTotalSlices; td.mMipLevels = 1;
+            td.mSampleCount = SAMPLE_COUNT_1;
+            td.mFormat = TinyImageFormat_R16_SFLOAT;
+            td.mStartState = RESOURCE_STATE_UNORDERED_ACCESS;
+            td.mDescriptors = (DescriptorType)(DESCRIPTOR_TYPE_TEXTURE | DESCRIPTOR_TYPE_RW_TEXTURE);
+            td.pName = "causticMap";
+            TextureLoadDesc tld = {};
+            tld.ppTexture = &g_live.pCausticMap;
+            tld.pDesc = &td;
+            addResource(&tld, nullptr);
+        }
+
+        // The beam counter: SLICES*RES*RES uints, ONE plane now that the map is single-channel.
+        // GPU-only and never read back - the resolve consumes it and zeroes it in the same dispatch,
+        // so it needs clearing only once, which addResource's zero-initialised allocation provides.
+        {
+            const uint64_t entries = (uint64_t)kCausticTotalSlices * kCausticRes * kCausticRes;
+            BufferLoadDesc ab = {};
+            ab.mDesc.mDescriptors  = (DescriptorType)(DESCRIPTOR_TYPE_RW_BUFFER | DESCRIPTOR_TYPE_BUFFER);
+            ab.mDesc.mMemoryUsage  = RESOURCE_MEMORY_USAGE_GPU_ONLY;
+            ab.mDesc.mFormat       = TinyImageFormat_R32_UINT;
+            ab.mDesc.mStartState   = RESOURCE_STATE_UNORDERED_ACCESS;
+            ab.mDesc.mFirstElement = 0;
+            ab.mDesc.mElementCount = entries;
+            ab.mDesc.mStructStride = sizeof(uint32_t);
+            ab.mDesc.mSize         = entries * sizeof(uint32_t);
+            ab.mDesc.pName         = "causticAccum";
+            ab.ppBuffer            = &g_live.pCausticAccum;
+            addResource(&ab, nullptr);
+        }
+
+        // ONE PER DISPATCH — see the pCausticCbv declaration. cmdDispatch records rather than
+        // executes, so a shared mapped cbuffer would hand every recorded dispatch the LAST block the
+        // CPU wrote, and the symptom of that is not a crash: the ripple scatter would splat the
+        // wake's domain into the wake's slices, twice, and the static map would come out empty.
+        for (uint32_t i = 0; i < kCausticSetCount; ++i) {
+            char nm[32];
+            std::snprintf(nm, sizeof(nm), "causticParams%u", i);
+            BufferLoadDesc pb = {};
+            pb.mDesc.mDescriptors = DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+            pb.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_CPU_TO_GPU;
+            pb.mDesc.mFlags       = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
+            pb.mDesc.mSize        = sizeof(CausticParams);
+            pb.mDesc.pName        = nm;
+            pb.ppBuffer           = &g_live.pCausticCbv[i];
+            addResource(&pb, nullptr);
+        }
+
+        waitForAllResourceLoads();
+        bool cbvOk = true;
+        for (uint32_t i = 0; i < kCausticSetCount; ++i) { cbvOk = cbvOk && g_live.pCausticCbv[i]; }
+        if (!g_live.pCausticMap || !g_live.pCausticAccum || !cbvOk) {
+            std::printf("[forge][caustic] resource alloc FAILED - caustics disabled\n"); return false;
+        }
+
+        {
+            DescriptorSetDesc sd = SRT_SET_DESC(CausticSrtData, Persistent, kCausticSetCount, 0);
+            addDescriptorSet(R, &sd, &g_live.pCausticSet);
+            if (!g_live.pCausticSet) {
+                std::printf("[forge][caustic] addDescriptorSet FAILED\n"); return false;
+            }
+            // gCausticDynField is bound STATICALLY, and per instance: the ripple sets point at the
+            // fine grid's tex[0] and the wake set at the wake grid's. That is what makes ripple vs
+            // wake purely a cbuffer question in causticdyn.comp — no resource branch, no SM6.6
+            // dynamic resource indexing.
+            //
+            // ⚠ SAFE TO BIND ONCE AND NEVER AGAIN, for two reasons that both have to hold.
+            // createRippleSimResources runs immediately BEFORE this function, so tex[0] exists.
+            // And every frame either advanceRippleGrid or parkRippleGrid runs for each grid, and
+            // both leave tex[0] in SHADER_RESOURCE before this block records — so there is no frame
+            // on which the dyn scatter could read a texture still in UNORDERED_ACCESS.
+            //
+            // A grid that failed to build leaves tex[0] null; the fallback keeps the slot pointing
+            // at SOMETHING valid (the map itself is the wrong type, so the other grid, or nothing).
+            // Its layer never dispatches in that case — the strength lane publishes 0 — so what the
+            // slot holds is only about keeping the descriptor table legal for the debug layer.
+            Texture* fine = g_live.rippleFine.ready ? g_live.rippleFine.tex[0] : g_live.rippleWake.tex[0];
+            Texture* wake = g_live.rippleWake.ready ? g_live.rippleWake.tex[0] : g_live.rippleFine.tex[0];
+            for (uint32_t i = 0; i < kCausticSetCount; ++i) {
+                DescriptorData d[4] = {};
+                uint32_t n = 0;
+                d[n].mIndex     = SRT_RES_IDX(CausticSrtData, Persistent, gCausticParams);
+                d[n].ppBuffers  = &g_live.pCausticCbv[i];  ++n;
+                d[n].mIndex     = SRT_RES_IDX(CausticSrtData, Persistent, gCausticAccum);
+                d[n].ppBuffers  = &g_live.pCausticAccum;   ++n;
+                d[n].mIndex     = SRT_RES_IDX(CausticSrtData, Persistent, gCausticOut);
+                d[n].ppTextures = &g_live.pCausticMap;     ++n;
+                Texture** fld = (i == kCausticSetWake) ? &wake : &fine;
+                if (*fld) {
+                    d[n].mIndex     = SRT_RES_IDX(CausticSrtData, Persistent, gCausticDynField);
+                    d[n].ppTextures = fld;                 ++n;
+                }
+                updateDescriptorSet(R, i, g_live.pCausticSet, n, d);
+            }
+        }
+
+        g_live.causticReady = true;
+        // This line is the CROSS-BOUNDARY CHECK. kCausticRes/kCausticSlices are mirrored in
+        // caustic.h.fsl and nothing can static_assert between C++ and FSL, so the pair is printed
+        // where a mismatch shows up as a garbage map rather than as silence.
+        LOG::logline(">> [caustic] map ready: %ux%u x %u slices R16F (CAUSTIC_RES/CAUSTIC_TOTAL_SLICES "
+                     "must match), hex source %ux%u (CAUSTIC_SRC_X/Y), tile %.0f units, "
+                     "depths %.0f/%.0f/%.0f/%.0f",
+                     kCausticRes, kCausticRes, kCausticTotalSlices, kCausticSrcX, kCausticSrcY,
+                     (double)g_causticTileUnits,
+                     (double)kCausticDepths[0], (double)kCausticDepths[1],
+                     (double)kCausticDepths[2], (double)kCausticDepths[3]);
+        // W24, the other half of the cross-boundary check: the slice LAYOUT. A mismatch here reads
+        // as "the dynamic caustics are drawn onto a static depth slice", i.e. a pattern that moves
+        // with a swimmer appearing at the wrong depth on top of the tiling one — which nobody would
+        // diagnose as an index. Ripple/wake readiness is logged with it because a dead wave grid is
+        // the one thing that silently makes a whole layer do nothing.
+        LOG::logline(">> [caustic] dynamic layers: ripple slices %u..%u depths %.0f/%.0f (fine grid %s), "
+                     "wake slice %u ref depth %.0f (wake grid %s) "
+                     "[CAUSTIC_RIPPLE_BASE/_SLICES/CAUSTIC_WAKE_SLICE/CAUSTIC_WAKE_DEPTH must match]",
+                     kCausticRippleBase, kCausticRippleBase + kCausticRippleSlices - 1,
+                     (double)kCausticRippleDepths[0], (double)kCausticRippleDepths[1],
+                     g_live.rippleFine.ready ? "ready" : "MISSING - ripple layer disabled",
+                     kCausticWakeSlice, (double)kCausticWakeDepth,
+                     g_live.rippleWake.ready ? "ready" : "MISSING - wake layer disabled");
+        return true;
+    }
+
+    // W23: bind the caustic map into ONE PerFrame set instance.
+    //
+    // ⚠ THERE ARE SEVEN PerFrame SETS AND EVERY ONE OF THEM GETS THIS. gRippleField's precedent is
+    // the opposite — bound into the main set only, because water.frag is its sole reader and lives
+    // only there. This map's reader is waterLightTransmit(), which is called by opaque, terrain,
+    // alpha, multimap and multimap_alpha, and those run in the reflect and first-person passes as
+    // well as the main one. A set that skipped it would render the same submerged rock with
+    // caustics directly and without them in the mirror.
+    //
+    // Safe to call unconditionally: it no-ops unless the map built, and an unbound slot reads ZERO,
+    // which for this map means gain 1.0 — the pre-W23 image, not a black one. See the lane note in
+    // opaque.srt.h for why that inversion had to be built in rather than relied on.
+    void bindCausticField(Renderer* R, DescriptorSet* set, uint32_t index) {
+        if (!set || !g_live.causticReady || !g_live.pCausticMap) { return; }
+        DescriptorData d = {};
+        d.mIndex = SRT_RES_IDX(SrtData, PerFrame, gCausticField);
+        d.mCount = 1; d.ppTextures = &g_live.pCausticMap;
+        updateDescriptorSet(R, index, set, 1, &d);
     }
 
     // R2 actor-wake wave sims: the three compute pipelines, then BOTH grids. Same eager-from-
@@ -16234,12 +16881,41 @@ namespace ForgeRender {
             { "waterDistortAngular", &g_waterDistortAngular },
             { "waterDistortGain",    &g_waterDistortGain    },
             { "waterRefrOwn",        &g_waterRefrOwn        },
+            // W25: the NORMAL INTENSITY, and it is here because it is now the caustic's calm-water
+            // lever as well as the surface's — `waterWaveAmp=0` is how the harness isolates the
+            // ripple and wake layers with no checkbox to click.
+            { "waterWaveAmp",        &g_waterWaveAmp        },
+            { "causticStrength",     &g_causticStrength     },
+            { "causticTileUnits",    &g_causticTileUnits    },
+            { "causticSlopeRms",     &g_causticSlopeRms     },
+            { "causticSubBeams",     &g_causticSubBeams     },
+            { "causticSlicesPerFrame", &g_causticSlicesPerFrame },
+            { "causticSoften",       &g_causticSoften       },
+            { "causticSpeed",        &g_causticSpeed        },
+            { "causticEma",          &g_causticEma          },
+            { "causticDispGain",     &g_causticDispGain     },
+            { "causticRippleStr",    &g_causticRippleStr    },
+            { "causticWakeStr",      &g_causticWakeStr      },
+            { "causticDynSlope",     &g_causticDynSlope     },
+            { "causticRippleStride", &g_causticRippleStride },
+            { "causticCalmDisp",     &g_causticCalmDisp     },
+            { "causticCalmHess",     &g_causticCalmHess     },
         };
         const BKnob bknobs[] = {
             { "waterNoReflect",     &g_waterNoReflect     },
             { "waterSunTrueElev",   &g_waterSunTrueElev   },
             { "aplSplitWater",      &g_aplSplitWater      },
             { "aplSkipSky",         &g_aplSkipSky         },
+            { "causticOn",          &g_causticOn          },
+            // W24: the two wave sims themselves, because the dynamic caustic layers are DOWNSTREAM
+            // of them — a layer whose field nobody steps is a layer that does nothing at any
+            // strength, and the minimized harness cannot reach either checkbox. Both default ON
+            // since W24b, so these are here to turn a layer OFF for an A/B rather than on.
+            { "ripSimOn",           &g_ripSimOn           },
+            { "wakeOn",             &g_wakeOn             },
+            // W25: the flat test now disarms ALL THREE caustic layers, which makes it the one-switch
+            // proof that what is on screen is being cast by the surface and not painted on.
+            { "waterFlatTest",      &g_waterFlatTest      },
         };
         std::string spec(env);
         size_t pos = 0;
@@ -18682,6 +19358,59 @@ namespace ForgeRender {
             cp[kWaterDistortFloat + 1] = std::max(0.0f, g_waterDistortGain);
             cp[kWaterDistortFloat + 2] = std::max(0.0f, std::min(g_waterRefrOwn, 1.0f));
             cp[kWaterDistortFloat + 3] = 0.0f;
+            // W23 — caustics. From the same unconditional block and for the same reason: the map is
+            // a MULTIPLIER on sunlight, so a receiver reading a stale or partial lane is a
+            // brightness error on every submerged surface, and that must not depend on some other
+            // subsystem being up. Strength 0 disarms the consumer's whole block.
+            {
+                // ⚠ W25: AND ON THE SURFACE'S OWN SLOPE GAIN. Gain 0 — wave amplitude at zero, or
+                // the flat test — is a mirror, and a mirror casts no caustic, so the lane goes to 0
+                // and the consumer skips its whole static block: bit-exact, not a fade toward a
+                // still-running term. The DISPATCH side reads the same helper (statArmed, in the
+                // caustic block far below), so the two cannot drift apart.
+                const bool on = g_causticOn && g_live.causticReady && waterBaseSlopeGain() > 0.0f;
+                cp[kWaterCausticFloat + 0] = on ? std::max(0.0f, g_causticStrength) : 0.0f;
+                cp[kWaterCausticFloat + 1] = 1.0f / std::max(g_causticTileUnits, 1.0f);
+                // sliceIndex = z*log2(depth) + w, pinned so slice 0 lands on kCausticDepths[0] and
+                // the last slice on the last depth. Solved here rather than in the shader so the
+                // spacing cannot be described two ways.
+                const float d0 = kCausticDepths[0];
+                const float dN = kCausticDepths[kCausticSlices - 1];
+                const float zc = (float)(kCausticSlices - 1)
+                               / std::max(std::log2(dN / d0), 1.0e-3f);
+                cp[kWaterCausticFloat + 2] = zc;
+                // ⚠ WIND RIDES THE BIAS, NOT THE STRENGTH, and that is the physically right lane for
+                // it. Slope and depth enter the refraction as the PRODUCT c*D*grad(h), so a rougher
+                // surface is — to this map, exactly — deeper water. Shifting the slice index makes
+                // wind change the pattern into a finer, more folded one the way it actually does;
+                // scaling the strength would only have made the same pattern louder. Bounded to two
+                // octaves each way so a freak weather value cannot walk the whole ladder off its end.
+                const float windRatio = std::max(0.25f,
+                                        std::min(g_causticWindNow / kWaterWindRef, 4.0f));
+                cp[kWaterCausticFloat + 3] = zc * (std::log2(windRatio) - std::log2(d0));
+                // The dispersion offset for BLUE, as a UV shift per unit depth along the sun
+                // bearing. ⚠ THIS REPLACED A DEPTH-AXIS OFFSET, which was algebraically right and
+                // visually wrong: n enters only through c = 1 - 1/n, which multiplies depth, so red
+                // IS this pattern at a shallower effective depth — but recovering that from the
+                // stored slices needs them close enough to be a translation, and 1.17 octaves apart
+                // the map re-folds completely. Shifting the blend fraction crossfaded two
+                // decorrelated patterns: chromatic noise, not a fringe.
+                //
+                // The real displacement is (c_B - c_G)*D*grad(h) world units along the surface
+                // gradient. Magnitude is physical and rides slopeRms, so rougher water disperses
+                // more; the direction is the sun bearing, standing in for grad(h) because that is
+                // where the pattern already shifts with depth and a wind sea's slope is locally
+                // coherent with it. Red takes -0.441x of this in the shader, which is the true
+                // (c_R-c_G)/(c_B-c_G) — n(lambda) is not symmetric about green.
+                cp[kWaterCaustic2Float + 0] =
+                        (1.0f - 1.0f / 1.3330f) * 0.009207f
+                        * causticEffectiveSlope()
+                        * std::max(0.0f, g_causticDispGain)
+                        / std::max(g_causticTileUnits, 1.0f);
+                cp[kWaterCaustic2Float + 1] = 0.0f;
+                cp[kWaterCaustic2Float + 2] = 0.0f;
+                cp[kWaterCaustic2Float + 3] = 0.0f;
+            }
         }
         // SH1 sky-directional ambient. Published from HERE — unconditionally, every frame, right
         // after the frame cbuffer's sky/sun colours were written above — rather than from
@@ -20383,6 +21112,342 @@ namespace ForgeRender {
             }
         }
 
+        // ---- W23/W24: the caustic maps ----------------------------------------------------------
+        // In the pure-compute section beside the ripple advance and for the same reason: the colour
+        // pass below must sample a map that is complete THIS frame. And AFTER the ripple advance,
+        // not before — the dynamic layers splat the wave fields this frame's step just produced, and
+        // reading them a dispatch earlier would put the caustics one frame of camera and actor
+        // motion away from the disturbance that casts them.
+        //
+        // ⚠ FIVE DISPATCHES, ONE BARRIER BETWEEN TWO GROUPS. Three scatters accumulate into
+        // disjoint plane ranges of one counter, then two resolves read, normalise and RE-PRIME it —
+        // so the buffer leaves each frame already in next frame's starting state, with no clear pass
+        // and no cmdFillBuffer. The single UAV barrier between the groups is what makes that legal;
+        // without it a resolve could read a partially accumulated counter and overwrite it under a
+        // scatter thread still adding to it. The scatters need no barrier BETWEEN them because they
+        // touch disjoint planes, and neither do the two resolves.
+        //
+        // ⚠ "RE-PRIME", NOT "CLEAR", and that word is the W24 cost model. The static planes go back
+        // to 0. The dynamic planes go back to CAUSTIC_WFIX, which — because the dynamic source grid
+        // is 1:1 with the destination — is exactly the calm answer already written down. A beam over
+        // undisturbed water then costs zero atomics instead of a full Gaussian splat arranged to
+        // cancel. See causticdyn.comp.fsl.
+        {
+            // ── The DYNAMIC DOMAINS, computed once and used three times: by the two scatter
+            // cbuffers, and by the consumer lanes below. One computation, because a generator and a
+            // consumer that describe the same window with two expressions eventually describe two
+            // windows, and the symptom is caustics that slide against the wake that casts them.
+            //
+            // THE DESTINATION LATTICE IS A SUB-LATTICE OF THE WAVE FIELD'S. Destination texel (i,j)
+            // is born at field texel (i*stride + offset), an integer, which is what makes all five
+            // Hessian taps exact loads instead of bilinear fetches — and what makes the identity
+            // prefill exact, since there is then exactly one beam per destination texel.
+            const int   rStride = (int)std::max(1.0f, std::min(std::floor(g_causticRippleStride + 0.5f), 2.0f));
+            const int   rOff    = std::max(0, ((int)kRippleGrid - (int)kCausticRes * rStride) / 2);
+            const float rUpt    = std::max(g_live.rippleFine.unitsPerTexel, 0.25f);
+            const int   wStride = (int)kCausticWakeStride;
+            const int   wOff    = std::max(0, ((int)kWakeGrid - (int)kCausticRes * wStride) / 2);
+            const float wUpt    = std::max(g_live.rippleWake.unitsPerTexel, 0.25f);
+
+            // World position that destination texel 0's LEFT EDGE maps to, which is the form the
+            // consumer wants (uv 0 = the edge, exactly as water.frag's wave-field origins are).
+            // Field texel k's CENTRE is at fieldOrigin + (k+0.5)*upt and destination texel i is born
+            // at field texel (i*stride + off), so texel i's centre is at
+            //     fieldOrigin + (off + 0.5 + i*stride)*upt
+            // and the left edge of texel 0 is half a DESTINATION texel below that.
+            auto dynOrigin = [](float fieldOrigin, int off, int stride, float upt) {
+                return fieldOrigin + ((float)off + 0.5f - 0.5f * (float)stride) * upt;
+            };
+            const float rOriginX = dynOrigin(g_live.rippleFine.originX, rOff, rStride, rUpt);
+            const float rOriginY = dynOrigin(g_live.rippleFine.originY, rOff, rStride, rUpt);
+            const float wOriginX = dynOrigin(g_live.rippleWake.originX, wOff, wStride, wUpt);
+            const float wOriginY = dynOrigin(g_live.rippleWake.originY, wOff, wStride, wUpt);
+            const float rTpu = 1.0f / (rUpt * (float)rStride);   // destination texels per world unit
+            const float wTpu = 1.0f / (wUpt * (float)wStride);
+
+            // ── WHICH LAYERS ARE ARMED. A layer needs the master caustic gate, a non-zero strength
+            // (that is the A/B), its grid to exist, its SIM to be running, and WATER IN THE FRAME.
+            // The last two are the same requirement seen twice: a field nobody stepped is a field of
+            // zeros or a field of last-visit's wake, and spending five taps per cell plus a resolve
+            // to discover that is pure waste on every interior. ⚠ waterParams/waterEnabled through
+            // ripWaterNow, NOT g_waterFogOn — that global is assigned in the water block far below,
+            // so reading it here would gate this frame's map on last frame's water.
+            // ⚠ W25: THE FLAT TEST KILLS EVERY LAYER, not just the static one. It forces
+            // normal = +Z and water.frag drops the ripple and wake terms with it, so there is no
+            // surface left to refract through — a caustic that survived it would be the pattern
+            // proving itself fake.
+            const bool causticGate = g_live.causticReady && g_causticOn && g_causticStrength > 0.0f
+                                   && !g_waterFlatTest;
+            // The STATIC (calm-water) layer, on the same surface slope gain the strength lane
+            // published from. At gain 0 the generator would spend its 0.19 ms building a field of
+            // zeros for a consumer that is already skipping it — and skipping it here is what makes
+            // "turn the calm water off and look at the wake alone" cost nothing.
+            const bool statArmed = causticGate && waterBaseSlopeGain() > 0.0f;
+            const bool ripArmed  = causticGate && ripWaterNow && g_live.rippleFine.ready
+                                 && g_ripSimOn && g_causticRippleStr > 0.0f;
+            const bool wakeArmed = causticGate && ripWaterNow && g_live.rippleWake.ready
+                                 && g_wakeOn && g_causticWakeStr > 0.0f;
+            // "Is there caustic work to record this frame", which is a DIFFERENT question from the
+            // gate now that any single layer can be off on its own. All three off and the block
+            // below is skipped whole, barrier pair included.
+            const bool causticArmed = statArmed || ripArmed || wakeArmed;
+
+            // ── THE CONSUMER LANES, written UNCONDITIONALLY and from HERE rather than from the
+            // shadowparams block a couple of thousand lines above. Two reasons, and both are hard
+            // requirements. The origins do not EXIST up there: advanceRippleGrid commits this
+            // frame's texel-snapped domain in the block immediately above this one, so a lane
+            // published earlier would describe last frame's window while the map describes this
+            // one — the caustics would lag the camera by exactly one scroll. And a lane that is
+            // only written on the armed path is a lane that goes stale the first time somebody
+            // unticks a checkbox, which for a MULTIPLIER on sunlight is a brightness error on every
+            // submerged surface.
+            if (g_live.pShadowMaskParamsCbv && g_live.pShadowMaskParamsCbv->pCpuMappedAddress) {
+                float* sp = (float*)g_live.pShadowMaskParamsCbv->pCpuMappedAddress;
+                // EYE-RELATIVE, like every other spatial anchor the water frags consume: the frame
+                // is camera-relative and forming an absolute coordinate in the shader would spend
+                // precision only to subtract it again.
+                sp[kWaterCausticRipFloat  + 0] = rOriginX - g_eyeAbsShadow[0];
+                sp[kWaterCausticRipFloat  + 1] = rOriginY - g_eyeAbsShadow[1];
+                sp[kWaterCausticRipFloat  + 2] = rTpu;
+                sp[kWaterCausticRipFloat  + 3] = (float)kCausticRes;
+                sp[kWaterCausticWakeFloat + 0] = wOriginX - g_eyeAbsShadow[0];
+                sp[kWaterCausticWakeFloat + 1] = wOriginY - g_eyeAbsShadow[1];
+                sp[kWaterCausticWakeFloat + 2] = wTpu;
+                sp[kWaterCausticWakeFloat + 3] = (float)kCausticRes;
+                // ⚠ GATED ON causticDynPrimed. The dynamic slices' identity prefill is produced BY
+                // the resolve, and the accumulator starts zero-initialised — so before the first
+                // dynamic resolve has run those planes hold 0, which for a map storing (gain - 1)
+                // means gain 0, i.e. BLACK submerged geometry. One frame of "no dynamic caustics"
+                // is the whole price of not having a fill pass that exists to run once.
+                const bool dynLive = g_live.causticDynPrimed;
+                sp[kWaterCausticDynFloat + 0] = (ripArmed  && dynLive)
+                                              ? std::max(0.0f, g_causticRippleStr) : 0.0f;
+                sp[kWaterCausticDynFloat + 1] = (wakeArmed && dynLive)
+                                              ? std::max(0.0f, g_causticWakeStr) : 0.0f;
+                // The ripple layer's LOG-depth slice map, pinned so slice 0 lands on the first
+                // depth and the last on the last — the same solve the static ladder gets, and here
+                // for the same reason: the pattern changes fastest in the shallows.
+                const float rd0 = kCausticRippleDepths[0];
+                const float rdN = kCausticRippleDepths[kCausticRippleSlices - 1];
+                const float rzc = (float)(kCausticRippleSlices - 1)
+                                / std::max(std::log2(rdN / rd0), 1.0e-3f);
+                sp[kWaterCausticDynFloat + 2] = rzc;
+                sp[kWaterCausticDynFloat + 3] = -rzc * std::log2(rd0);
+            }
+
+            if (causticArmed) {
+              gpuPhaseBegin(kGpuPhaseCaustic);
+              // ── (0) THE STATIC TILING MAP's parameter block. Unchanged from W23 apart from the
+              // two lanes that now say which slice group it owns — base 0, span CAUSTIC_SLICES,
+              // which is what it always implicitly was.
+              float* cp = (float*)g_live.pCausticCbv[kCausticSetStatic]->pCpuMappedAddress;
+              if (cp) {
+                // WRAPPED HOST-SIDE, in double, exactly like the water field's time: hostNowMs() is
+                // steady_clock-since-BOOT, so seconds is ~1e5-1e6 and a float32 cast quantises it
+                // into visible steps (a 60 ms ULP against omega 15 rad/s is a 0.9 radian jump).
+                //
+                // ⚠ AND THE WRAP ITSELF IS ONLY INVISIBLE BECAUSE THE OMEGAS ARE SNAPPED TO IT. A
+                // wrap returns t to zero; it returns the FIELD to zero only if every component
+                // completes a whole number of cycles in that time, and omega = sqrt(g*K) has no
+                // reason to. Un-snapped, the entire map jumped to a new phase every 20 s. See
+                // misc.y below and the note in caustic.srt.h.
+                cp[0] = (float)std::fmod(hostNowMs() * 0.001, kCausticWrapSeconds);
+                cp[1] = std::max(g_causticTileUnits, 1.0f);
+                cp[2] = std::max(1.0f, std::min(g_causticSubBeams, 4.0f));
+                cp[3] = std::max(0.01f, std::min(g_causticEma, 1.0f));
+                for (uint32_t i = 0; i < 4; ++i) {
+                    cp[4 + i] = (i < kCausticSlices) ? kCausticDepths[i] : 0.0f;
+                }
+                // c = 1 - 1/n at the REFERENCE wavelength (green, 589 nm) and nothing else: the map
+                // is single-channel and the consumer recovers red and blue as a depth-axis offset,
+                // so this is the only place n enters the generator.
+                cp[8]  = 1.0f - 1.0f / 1.3330f;
+                // ⚠ SCALED BY THE TILE. Fold depth is 1/(c*slope*K) and K ~ 1/tile, so slope must
+                // rise with the tile to keep the depth ladder where it was. Without this the tile
+                // slider silently retunes the depth behaviour — see the g_causticTileUnits note.
+                cp[9]  = causticEffectiveSlope();
+                // The sun's angular RADIUS in water, as a half-width per unit depth: 0.53 deg
+                // diameter / 2 / n = 0.00347 rad, halved again for the Gaussian sigma of a disc.
+                cp[10] = 0.001735f * std::max(0.0f, g_causticSoften);
+                cp[11] = std::max(0.0f, g_causticSpeed);
+                // misc.x — the round-robin cursor; the shader adds its own z and wraps at misc.w.
+                cp[12] = (float)g_live.causticSlice;
+                // misc.y — the wrap frequency. Every omega is snapped to a multiple of this so the
+                // time wrap above returns the field to its own starting state instead of to a new
+                // one. Half a step of rounding is 0.9-1.6% on these omegas, which the dispersion
+                // relation does not miss; a jump every 20 s is not something anyone misses either.
+                cp[13] = (float)(6.283185307179586 / kCausticWrapSeconds);
+                cp[14] = 0.0f;                             // misc.z — clear value: the static
+                                                           // planes really are cleared to zero
+                cp[15] = (float)kCausticSlices;            // misc.w — this group's span
+                cp[16] = 0.0f; cp[17] = 0.0f; cp[18] = 0.0f; cp[19] = 0.0f;   // dynField: unused
+                cp[20] = 0.0f;                             // dynOut.x — the static group's base
+                cp[21] = 0.0f; cp[22] = 0.0f; cp[23] = 0.0f;
+                cp[24] = 0.0f; cp[25] = 0.0f; cp[26] = 0.0f; cp[27] = 0.0f;   // dynCfg: unused
+              }
+
+              // ── (1)(2) THE DYNAMIC parameter blocks. One lambda, because ripple and wake differ
+              // ONLY in these numbers — the shader is one shader and the field is a descriptor-set
+              // instance, so anything that is the same for both must be written in one place or the
+              // two layers drift apart in exactly the ways nobody looks for.
+              auto fillDyn = [&](uint32_t set, const float* depths, uint32_t span, uint32_t base,
+                                 float upt, int stride, int off, float slopeGain, uint32_t fieldGrid) {
+                  float* d = (float*)g_live.pCausticCbv[set]->pCpuMappedAddress;
+                  if (!d) { return; }
+                  d[0] = 0.0f; d[1] = 0.0f; d[2] = 0.0f;
+                  d[3] = 1.0f;                              // cfg.w — EMA off; the resolve reads it
+                  for (uint32_t i = 0; i < 4; ++i) { d[4 + i] = (i < span) ? depths[i] : 0.0f; }
+                  d[8]  = 1.0f - 1.0f / 1.3330f;            // wave.x — c, the same n as the static map
+                  d[9]  = 0.0f;                             // wave.y — RMS slope: the field IS the slope
+                  d[10] = 0.001735f * std::max(0.0f, g_causticSoften);   // wave.z — sun disc
+                  d[11] = 0.0f;
+                  d[12] = 0.0f;                             // misc.x — no round-robin: every dynamic
+                                                            //          slice is rebuilt every frame
+                  d[13] = 0.0f;
+                  d[14] = 0.0f;                             // misc.z — the scatter never clears
+                  d[15] = (float)span;                      // misc.w — slices this dispatch loops
+                  d[16] = upt;
+                  d[17] = (float)stride;
+                  d[18] = (float)off;
+                  d[19] = (float)off;
+                  d[20] = (float)base;
+                  // ⚠ THE SAME SLOPE GAIN water.frag USES FOR THIS GRID. The caustic has to be cast
+                  // by the surface you can see, so the steepness driving the refraction must be the
+                  // steepness the normal map shows; g_causticDynSlope is an exploration multiplier
+                  // over it and is 1 by default for that reason.
+                  d[21] = slopeGain * std::max(0.0f, g_causticDynSlope);
+                  d[22] = (float)fieldGrid;
+                  d[23] = 0.0f;
+                  d[24] = std::max(0.0f, g_causticCalmDisp);
+                  d[25] = std::max(0.0f, g_causticCalmHess);
+                  d[26] = 0.0f; d[27] = 0.0f;
+              };
+              if (ripArmed) {
+                  fillDyn(kCausticSetRipple, kCausticRippleDepths, kCausticRippleSlices,
+                          kCausticRippleBase, rUpt, rStride, rOff, g_ripSimSlope, kRippleGrid);
+              }
+              if (wakeArmed) {
+                  const float wakeDepth = kCausticWakeDepth;
+                  fillDyn(kCausticSetWake, &wakeDepth, 1u,
+                          kCausticWakeSlice, wUpt, wStride, wOff, g_wakeSlope, kWakeGrid);
+              }
+
+              // ── (3) THE DYNAMIC RESOLVE's parameter block. Its whole job is the three lanes that
+              // differ from the static resolve's: base 4, span 3, and a clear value of CAUSTIC_WFIX
+              // instead of 0 — the identity prefill.
+              const bool dynAny = ripArmed || wakeArmed;
+              if (dynAny) {
+                  float* d = (float*)g_live.pCausticCbv[kCausticSetDynResolve]->pCpuMappedAddress;
+                  if (d) {
+                      std::memset(d, 0, sizeof(CausticParams));
+                      d[3]  = 1.0f;                                  // cfg.w — EMA off
+                      d[14] = (float)CAUSTIC_WFIX;                   // misc.z — the identity prefill
+                      d[15] = (float)(kCausticTotalSlices - kCausticRippleBase);   // misc.w — span 3
+                      d[20] = (float)kCausticRippleBase;             // dynOut.x — base
+                  }
+              }
+
+              // ⚠ THE DISPATCHES DO NOT SHARE A GRID. The static scatter runs one thread per
+              // HEXAGONAL SOURCE cell (SRC_X x SRC_Y, deliberately not square — caustic.srt.h), the
+              // dynamic scatters one per DESTINATION texel (the 1:1 lattice the prefill needs), and
+              // the resolves one per (destination texel, slice). Handing any of them another's grid
+              // leaves a band of the map either never written or never re-primed.
+              const uint32_t gsx = kCausticSrcX / kCausticThreads;
+              const uint32_t gsy = kCausticSrcY / kCausticThreads;
+              const uint32_t g   = (kCausticRes + kCausticThreads - 1) / kCausticThreads;
+              // ⚠ THE STATIC Z EXTENT IS HOW MANY SLICES ARE REBUILT THIS FRAME, NOT HOW MANY EXIST,
+              // and its scatter and resolve must agree on it: the resolve reads and re-primes exactly
+              // what the scatter filled. A resolve over more slices than the scatter touched would
+              // publish an all-zero map for the extra ones — gain 0, i.e. BLACK submerged geometry,
+              // since the map stores gain-1 — and a resolve over fewer would leave a counter
+              // accumulating forever.
+              const uint32_t nsl = (uint32_t)std::max(1.0f,
+                                   std::min(g_causticSlicesPerFrame, (float)kCausticSlices));
+              BufferBarrier  ab = {}; ab.pBuffer = g_live.pCausticAccum;
+              ab.mCurrentState = RESOURCE_STATE_UNORDERED_ACCESS;
+              ab.mNewState     = RESOURCE_STATE_UNORDERED_ACCESS;
+
+              // ⚠ W25: SCATTER AND RESOLVE ARE GATED TOGETHER, never one without the other — the
+              // note above nsl is the reason, and it holds just as hard when the answer is
+              // "neither". Skipped, the static slices simply keep the last map they were given;
+              // nobody reads them, because the strength lane went to 0 in the same frame from the
+              // same helper. The round-robin cursor is held with them so the ladder resumes where
+              // it stopped rather than jumping a slice per skipped frame.
+              if (statArmed) {
+                  cmdBeginDebugMarker(g_live.pCmd, 0.3f, 0.8f, 1.0f, "CAUSTIC scatter (static)");
+                  cmdBindPipeline(g_live.pCmd, g_live.pCausticPipeline);
+                  cmdBindDescriptorSet(g_live.pCmd, kCausticSetStatic, g_live.pCausticSet);
+                  cmdDispatch(g_live.pCmd, gsx, gsy, nsl);
+                  cmdEndDebugMarker(g_live.pCmd);
+              }
+
+              if (dynAny) {
+                  cmdBindPipeline(g_live.pCmd, g_live.pCausticDynPipeline);
+                  if (ripArmed) {
+                      cmdBeginDebugMarker(g_live.pCmd, 0.4f, 0.9f, 1.0f, "CAUSTIC scatter (ripple)");
+                      cmdBindDescriptorSet(g_live.pCmd, kCausticSetRipple, g_live.pCausticSet);
+                      cmdDispatch(g_live.pCmd, g, g, 1);
+                      cmdEndDebugMarker(g_live.pCmd);
+                  }
+                  if (wakeArmed) {
+                      cmdBeginDebugMarker(g_live.pCmd, 0.5f, 0.9f, 1.0f, "CAUSTIC scatter (wake)");
+                      cmdBindDescriptorSet(g_live.pCmd, kCausticSetWake, g_live.pCausticSet);
+                      cmdDispatch(g_live.pCmd, g, g, 1);
+                      cmdEndDebugMarker(g_live.pCmd);
+                  }
+              }
+
+              cmdResourceBarrier(g_live.pCmd, 1, &ab, 0, nullptr, 0, nullptr);
+
+              if (statArmed) {
+                  cmdBeginDebugMarker(g_live.pCmd, 0.3f, 1.0f, 0.8f, "CAUSTIC resolve (static)");
+                  cmdBindPipeline(g_live.pCmd, g_live.pCausticResolvePipeline);
+                  cmdBindDescriptorSet(g_live.pCmd, kCausticSetStatic, g_live.pCausticSet);
+                  cmdDispatch(g_live.pCmd, g, g, nsl);
+                  cmdEndDebugMarker(g_live.pCmd);
+              }
+
+              if (dynAny) {
+                  // ⚠ OVER ALL THREE DYNAMIC SLICES, even a layer that did not scatter this frame.
+                  // A slice whose scatter was skipped still holds its identity prefill, so this
+                  // publishes gain 1 for it — which is exactly what "that layer is off" should look
+                  // like. Narrowing the span to only the armed layer's slices would be a false
+                  // economy: the OTHER layer's map would then freeze at whatever it last held rather
+                  // than going to the identity, so unticking one checkbox would leave its caustics
+                  // on screen.
+                  cmdBeginDebugMarker(g_live.pCmd, 0.4f, 1.0f, 0.8f, "CAUSTIC resolve (dynamic)");
+                  cmdBindDescriptorSet(g_live.pCmd, kCausticSetDynResolve, g_live.pCausticSet);
+                  cmdDispatch(g_live.pCmd, g, g, kCausticTotalSlices - kCausticRippleBase);
+                  cmdEndDebugMarker(g_live.pCmd);
+                  g_live.causticDynPrimed = true;
+              }
+
+              if (statArmed) {
+                  g_live.causticSlice = (g_live.causticSlice + nsl) % kCausticSlices;
+              }
+
+              // The map is written as a UAV and read as an SRV by the colour frags, so it has to
+              // change state before the colour pass — and back again before the next frame's
+              // scatter. Both halves are here rather than split, so the pair cannot drift.
+              TextureBarrier tb = {}; tb.pTexture = g_live.pCausticMap;
+              tb.mCurrentState = RESOURCE_STATE_UNORDERED_ACCESS;
+              tb.mNewState     = RESOURCE_STATE_SHADER_RESOURCE;
+              cmdResourceBarrier(g_live.pCmd, 0, nullptr, 1, &tb, 0, nullptr);
+              g_live.causticInSrv = true;
+              gpuPhaseEnd(kGpuPhaseCaustic);
+            } else if (g_live.causticReady && g_live.causticInSrv) {
+              // Disarmed this frame, but the texture is still in SHADER_RESOURCE from the last armed
+              // one. Put it back so the next armed frame's scatter finds it where it expects. Same
+              // shape as parkRippleGrid, and for the same reason: a state that only the ARMED path
+              // maintains is a state that breaks the first time somebody unticks a checkbox.
+              TextureBarrier tb = {}; tb.pTexture = g_live.pCausticMap;
+              tb.mCurrentState = RESOURCE_STATE_SHADER_RESOURCE;
+              tb.mNewState     = RESOURCE_STATE_UNORDERED_ACCESS;
+              cmdResourceBarrier(g_live.pCmd, 0, nullptr, 1, &tb, 0, nullptr);
+              g_live.causticInSrv = false;
+            }
+        }
+
         gpuPhaseBegin(kGpuPhaseFroxelNear);
         {
             auto froxBarrierN = [&](ResourceState from, ResourceState to) {
@@ -21315,6 +22380,9 @@ namespace ForgeRender {
         // is the water fog's time-of-day density, and because the water block is already gated on
         // the cell having water, which is exactly when that density matters.
         if (waterParams) { g_waterFogHour = waterParams[11]; }
+        // W23: MW's windFactor, for the caustic slice bias. Cached here with the other water lanes
+        // rather than read at the publish, which runs in a different function.
+        if (waterParams) { g_causticWindNow = waterParams[1]; }
         // R1: MW's live precipitation counters. Zeroed with the water block rather than latched —
         // the client already zeroes them in interiors, and a latched counter would keep raining on
         // the next puddle the player finds indoors.
@@ -25244,6 +26312,7 @@ namespace ForgeRender {
                 const uint64_t ibUsed = g_arenaIB.total - g_arenaIB.freeBytes;
                 LOG::logline(">> [forge-hb] pools: arenaVB=%llu/%llu MB (%.0f%%, cap %llu, frag=%zu)"
                              " arenaIB=%llu/%llu MB (%.0f%%, cap %llu, frag=%zu) grows=%llu"
+                             " | meshBuf=%llu/%llu MB (peak %llu, refused %llu)"
                              " | skipped=%llu parts (%llu KB VB / %llu KB IB) | uniqueTex/300f=%u",
                              (unsigned long long)(vbUsed >> 20), (unsigned long long)(g_arenaVB.total >> 20),
                              g_arenaVB.total ? 100.0 * (double)vbUsed / (double)g_arenaVB.total : 0.0,
@@ -25252,6 +26321,16 @@ namespace ForgeRender {
                              g_arenaIB.total ? 100.0 * (double)ibUsed / (double)g_arenaIB.total : 0.0,
                              (unsigned long long)(kArenaIBMaxBytes >> 20), g_arenaIB.regions.size(),
                              (unsigned long long)g_arenaGrowCount,
+                             // meshBuf= — what the NON-arena parts (skinned, multimap, morph rings,
+                             // i.e. every actor) hold in D3D12 buffers, against the hard cap that
+                             // keeps a refused allocation from AVing the host (kMeshBufMaxBytes).
+                             // `refused` is the number that matters: any non-zero means parts are
+                             // being dropped to stay alive, and the cap or the churn wants looking
+                             // at. In normal play this sits in single-digit MB.
+                             (unsigned long long)(g_meshBufBytes >> 20),
+                             (unsigned long long)(kMeshBufMaxBytes >> 20),
+                             (unsigned long long)(g_meshBufPeak >> 20),
+                             (unsigned long long)g_meshBufRefusals,
                              (unsigned long long)g_skippedPartsTotal,
                              (unsigned long long)(g_skippedVBTotal >> 10),
                              (unsigned long long)(g_skippedIBTotal >> 10),
@@ -25289,7 +26368,7 @@ namespace ForgeRender {
                          g_lastCpuPhaseMs[kGpuPhaseColorAlpha],
                          g_lastCpuPhaseMs[kGpuPhaseResolve],
                          g_lastRecMs - g_lastCpuPhaseMs[kGpuPhaseFrame]);
-            LOG::logline(">> [forge-hb] gpu split: cull=%.2f prepass=%.2f shadow=%.2f (st=%.2f dyn=%.2f sun=%.2f) postdepth=%.2f (lin=%.2f ao=%.2f mask=%.2f) reflect=%.2f color=%.2f water=%.2f bloom=%.2f(L%u) resolve=%.2f ms"
+            LOG::logline(">> [forge-hb] gpu split: cull=%.2f prepass=%.2f shadow=%.2f (st=%.2f dyn=%.2f sun=%.2f) postdepth=%.2f (lin=%.2f ao=%.2f mask=%.2f) reflect=%.2f color=%.2f water=%.2f caustic=%.2f bloom=%.2f(L%u) resolve=%.2f ms"
                          " | hiz=%.2f (prologue, overruns=%u) | shadowCasters=%u maskSlots=%u(dyn=%u)"
                          " | nearTris=%.2fM atDraws=%u"
                          " | terrain=%u/%u cells (nearCut=%u) %.2fM tris (lod %u/%u/%u/%u/%u/%u)%s",
@@ -25303,6 +26382,13 @@ namespace ForgeRender {
                          g_lastGpuPhaseMs[kGpuPhaseShadowMask],
                          g_lastGpuPhaseMs[kGpuPhaseReflect], g_lastGpuPhaseMs[kGpuPhaseColor],
                          g_lastGpuPhaseMs[kGpuPhaseWater],
+                         // caustic=<ms> — W23/W24. The whole pure-compute block: static scatter +
+                         // whichever dynamic scatters were armed + both resolves. 0.00 means the
+                         // block did not run at all (caustics off, or strength 0), which is the
+                         // distinction worth logging; the DYNAMIC half is proportional to the
+                         // DISTURBED AREA, so this number is expected to move with swimmers and rain
+                         // and to sit at its static floor on calm water.
+                         g_lastGpuPhaseMs[kGpuPhaseCaustic],
                          // bloom=<ms>(L<levels>) — step 4. L0 means the pass did not run this frame
                          // (checkbox off, not scene-referred, or the pyramid failed to build), which is
                          // the distinction worth logging: a 0.00 with L7 would be a timing problem,
@@ -25859,6 +26945,65 @@ namespace ForgeRender {
             } else {
                 g_live.shadowReady = false;
                 LOG::logline("!! [forge][shadow] shadowmask hot-reload FAILED — shadows DISABLED"); LOG::flush();
+            }
+        }
+
+        // W23: rebuild the two caustic compute shaders on the same trigger. The PATTERN of the map
+        // is the whole iteration surface here — wavevectors, amplitudes, rates, the dispersion
+        // spread — and none of it can be judged except by looking, so hot-reload is not a
+        // convenience, it is the only way to tune this without a host restart per attempt.
+        //
+        // ⚠ LOAD FIRST, DESTROY SECOND ([[feedback_load_first_destroy_second]]). The shadowmask block
+        // above destroys up front and survives only because it has a ready-flag to fall back on; this
+        // one loads into locals and commits nothing until BOTH shaders and BOTH pipelines exist, so
+        // an abandoned reload leaves the previous pair bound and still working. A missing file on
+        // this path would otherwise dispatch a null pipeline and take the device with it.
+        if (g_live.pCausticShader && g_live.pCausticDynShader && g_live.pCausticResolveShader) {
+            Shader* newC = nullptr; Shader* newCD = nullptr; Shader* newCR = nullptr;
+            ShaderLoadDesc cd = {}; cd.mComp.pFileName = "caustic.comp";
+            addShader(R, &cd, &newC);
+            ShaderLoadDesc dd = {}; dd.mComp.pFileName = "causticdyn.comp";
+            addShader(R, &dd, &newCD);
+            ShaderLoadDesc rd = {}; rd.mComp.pFileName = "causticresolve.comp";
+            addShader(R, &rd, &newCR);
+            Pipeline* newCP = nullptr; Pipeline* newCDP = nullptr; Pipeline* newCRP = nullptr;
+            if (newC && newCD && newCR) {
+                PipelineDesc cp = {}; cp.mType = PIPELINE_TYPE_COMPUTE;
+                cp.mComputeDesc.pShaderProgram = newC;
+                addPipeline(R, &cp, &newCP);
+                PipelineDesc dp = {}; dp.mType = PIPELINE_TYPE_COMPUTE;
+                dp.mComputeDesc.pShaderProgram = newCD;
+                addPipeline(R, &dp, &newCDP);
+                PipelineDesc rp = {}; rp.mType = PIPELINE_TYPE_COMPUTE;
+                rp.mComputeDesc.pShaderProgram = newCR;
+                addPipeline(R, &rp, &newCRP);
+            }
+            // ALL THREE OR NONE. They share causticsplat.h.fsl, so an edit to the beam kernel changes
+            // every one of them at once — committing a partial set would run two different
+            // normalisations against one accumulator, and a mean that is 1.0 in one plane and not in
+            // another is exactly the thing the exposure servo would chase.
+            if (newCP && newCDP && newCRP) {
+                removePipeline(R, g_live.pCausticPipeline);
+                removePipeline(R, g_live.pCausticDynPipeline);
+                removePipeline(R, g_live.pCausticResolvePipeline);
+                removeShader(R, g_live.pCausticShader);
+                removeShader(R, g_live.pCausticDynShader);
+                removeShader(R, g_live.pCausticResolveShader);
+                g_live.pCausticShader = newC;   g_live.pCausticPipeline = newCP;
+                g_live.pCausticDynShader = newCD; g_live.pCausticDynPipeline = newCDP;
+                g_live.pCausticResolveShader = newCR; g_live.pCausticResolvePipeline = newCRP;
+                LOG::logline(">> [forge][caustic] caustic.comp + causticdyn.comp + causticresolve.comp "
+                             "hot-reloaded");
+                LOG::flush();
+            } else {
+                if (newCP)  { removePipeline(R, newCP); }
+                if (newCDP) { removePipeline(R, newCDP); }
+                if (newCRP) { removePipeline(R, newCRP); }
+                if (newC)   { removeShader(R, newC); }
+                if (newCD)  { removeShader(R, newCD); }
+                if (newCR)  { removeShader(R, newCR); }
+                LOG::logline("!! [forge][caustic] hot-reload ABANDONED — previous shaders kept");
+                LOG::flush();
             }
         }
 
@@ -33899,6 +35044,31 @@ namespace ForgeRender {
                 if (m.uploadStreak >= kDynPromoteStreak) {
                     // PROMOTE: a proven per-frame morph. Free the static GPU_ONLY buffers, build
                     // the persistent-mapped ring (one-time fence here only), then memcpy.
+                    //
+                    // ⚠ THE BUDGET IS CHECKED FOR THE WHOLE RING, BEFORE THE FIRST ALLOCATION —
+                    // kGeomRing copies of BOTH buffers, which is 6 allocations and the most
+                    // expensive single act in this function. Checking per-allocation inside the loop
+                    // would let the ring fail HALF-BUILT at the cap, and the half that succeeded
+                    // would still have had to ask D3D12 for the half that could not (the AV this
+                    // whole mechanism exists to avoid — see kMeshBufMaxBytes).
+                    //
+                    // ⚠ AND IT IS CHECKED BEFORE releaseMeshBuffers, so a refusal leaves the slot's
+                    // existing STATIC buffers intact: the mesh keeps drawing, just without promoting
+                    // to the fast morph path. Releasing first and then refusing would turn "this
+                    // actor stops animating smoothly" into "this actor disappears".
+                    const uint64_t ringBytes = (vbBytes + ibBytes) * (uint64_t)kGeomRing;
+                    // What the budget will hold once THIS slot's current buffers are released a few
+                    // lines down. Clamped, not subtracted: an underflow would wrap to 16 exabytes
+                    // and refuse every promotion for the rest of the session, which is a subtler
+                    // failure than the crash this is preventing.
+                    const uint64_t liveOther = (g_meshBufBytes > m.bufBytes)
+                                             ? (g_meshBufBytes - m.bufBytes) : 0ull;
+                    if (liveOther + ringBytes > kMeshBufMaxBytes) {
+                        ++g_meshBufRefusals;
+                        m.uploadStreak = 0;   // don't re-attempt the promotion every frame
+                        ++built;
+                        continue;
+                    }
                     releaseMeshBuffers(m);
                     bool ringOk = true;
                     for (uint32_t r = 0; r < kGeomRing; ++r) {
@@ -33907,6 +35077,7 @@ namespace ForgeRender {
                         dv.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_CPU_TO_GPU;
                         dv.mDesc.mFlags       = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
                         dv.mDesc.mSize        = vbBytes;
+                        // (budget checked once for the whole ring, above the loop)
                         dv.mDesc.pName        = "geomVBdyn";
                         dv.pData              = nullptr;
                         dv.ppBuffer           = &m.dynVb[r];
@@ -33923,6 +35094,14 @@ namespace ForgeRender {
                         addResource(&di, nullptr);
                     }
                     waitForAllResourceLoads();   // one-time, on promotion only
+                    // Charged BEFORE the null sweep below, so that if some of the six did come back
+                    // null the release path still hands back everything that was asked for. The
+                    // sweep's own failure is now believed to be unreachable (the budget refuses
+                    // first), but it stays: it is the only thing that would catch a refusal this
+                    // cap did not predict, and it costs six pointer tests once per promotion.
+                    m.bufBytes = ringBytes;
+                    g_meshBufBytes += ringBytes;
+                    if (g_meshBufBytes > g_meshBufPeak) { g_meshBufPeak = g_meshBufBytes; }
                     for (uint32_t r = 0; r < kGeomRing; ++r) {
                         if (!m.dynVb[r] || !m.dynIb[r]) { ringOk = false; }
                     }
@@ -34016,6 +35195,20 @@ namespace ForgeRender {
                 m.vb = m.ib = nullptr;
                 anyArena = true;
             } else {
+                // ⚠ ASK THE BUDGET BEFORE ASKING D3D12. addBuffer AVs on a refused allocation
+                // (kMeshBufMaxBytes has the full story), so this check is the only thing standing
+                // between "GPU memory ran out" and "the host process is gone". Refuse into the same
+                // skippedParts path the arena uses: the part is COUNTED AS CONSUMED because a client
+                // re-send cannot conjure memory, and an uncounted part makes the client re-send the
+                // whole chunk forever.
+                if (g_meshBufBytes + vbBytes + ibBytes > kMeshBufMaxBytes) {
+                    ++g_meshBufRefusals;
+                    ++built;
+                    ++skippedParts;
+                    skippedVB += vbBytes;
+                    skippedIB += ibBytes;
+                    continue;
+                }
                 m.inArena = false;
                 BufferLoadDesc vbDesc = {};
                 vbDesc.mDesc.mDescriptors  = DESCRIPTOR_TYPE_VERTEX_BUFFER;
@@ -34036,6 +35229,9 @@ namespace ForgeRender {
                 ibDesc.pData               = indices;
                 ibDesc.ppBuffer            = &m.ib;
                 addResource(&ibDesc, nullptr);
+                m.bufBytes = vbBytes + ibBytes;
+                g_meshBufBytes += m.bufBytes;
+                if (g_meshBufBytes > g_meshBufPeak) { g_meshBufPeak = g_meshBufBytes; }
                 anyStatic = true;
             }
 
@@ -34588,6 +35784,21 @@ namespace ForgeRender {
         if (g_live.pFroxelAssignPipeline) { removePipeline(R, g_live.pFroxelAssignPipeline); }
         if (g_live.pFroxelClearShader)    { removeShader(R, g_live.pFroxelClearShader); }
         if (g_live.pFroxelAssignShader)   { removeShader(R, g_live.pFroxelAssignShader); }
+        // W23 caustics. ⚠ THE RIPPLE BLOCK ABOVE HAS NO TEARDOWN AT ALL — every ripple texture, set,
+        // pipeline and shader leaks at exit — and that is a precedent to break rather than copy. Same
+        // order as the froxel block: descriptor set, then resources, then pipelines, then shaders.
+        if (g_live.pCausticSet)             { removeDescriptorSet(R, g_live.pCausticSet); }
+        if (g_live.pCausticMap)             { removeResource(g_live.pCausticMap); }
+        if (g_live.pCausticAccum)           { removeResource(g_live.pCausticAccum); }
+        for (uint32_t i = 0; i < kCausticSetCount; ++i) {
+            if (g_live.pCausticCbv[i])      { removeResource(g_live.pCausticCbv[i]); }
+        }
+        if (g_live.pCausticPipeline)        { removePipeline(R, g_live.pCausticPipeline); }
+        if (g_live.pCausticDynPipeline)     { removePipeline(R, g_live.pCausticDynPipeline); }
+        if (g_live.pCausticResolvePipeline) { removePipeline(R, g_live.pCausticResolvePipeline); }
+        if (g_live.pCausticShader)          { removeShader(R, g_live.pCausticShader); }
+        if (g_live.pCausticDynShader)       { removeShader(R, g_live.pCausticDynShader); }
+        if (g_live.pCausticResolveShader)   { removeShader(R, g_live.pCausticResolveShader); }
         if (g_live.pUVAnimBuf)            { removeResource(g_live.pUVAnimBuf); }
         if (g_live.pMSAAColor)      { removeRenderTarget(R, g_live.pMSAAColor); }
         if (g_live.pDepth)          { removeRenderTarget(R, g_live.pDepth); }

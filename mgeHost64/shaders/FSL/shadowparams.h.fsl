@@ -459,4 +459,71 @@ STRUCT(ShadowMaskParams)
     // above is a host constant into a cbuffer bound BY POINTER into every PerFrame set, so a field
     // inserted anywhere else moves a lane somebody reads by index.
     DATA(float4,   waterDistort,    None);
+    // W23 — CAUSTICS (caustic.srt.h, consumed in waterLightTransmit).
+    //   x = strength. 0 = the pre-W23 image exactly; the consumer's whole block is behind `x > 0`.
+    //   y = 1 / tileWorldUnits, so the consumer multiplies rather than divides.
+    //   z,w = the LOG-depth slice map: sliceIndex = z*log2(depth) + w, clamped to [0, SLICES-1].
+    //       The slice depths are geometric (32/96/256/640), so a linear map would spend three
+    //       quarters of its range between the last two and jump through the shallow ones — which is
+    //       exactly where the depth evolution is fastest and most recognisable. Solved host-side
+    //       from the first and last slice depth so the two cannot disagree about the spacing.
+    // Appended after waterDistort for the reason every field down here carries: this cbuffer is
+    // bound BY POINTER into every PerFrame set and each offset above is a host constant, so a field
+    // inserted anywhere else moves a lane somebody reads by index.
+    DATA(float4,   waterCaustic,    None);
+    // W23 — CAUSTICS, second lane.
+    //   x = the DISPERSION offset for BLUE, as a UV shift PER UNIT DEPTH along the sun bearing.
+    //       ⚠ This was a depth-axis offset first, and that was algebraically right and visually
+    //       wrong. n(lambda) enters the refraction only through c = 1 - 1/n, which multiplies the
+    //       DEPTH and nothing else, so red's caustic really is this pattern at a slightly shallower
+    //       effective depth — but reading it that way needs the stored slices close enough that the
+    //       pattern between them is a TRANSLATION, and ours are 1.17 octaves apart, across which the
+    //       map completely re-folds. Offsetting the blend fraction crossfaded two decorrelated
+    //       patterns: chromatic noise of the right magnitude and the wrong kind.
+    //       Now it is the real thing, (c_B - c_G)*D*grad(h), with the sun bearing standing in for
+    //       grad(h) (which lives at the beam's source and no destination texel knows). Red takes
+    //       -0.441x of this — the true (c_R-c_G)/(c_B-c_G), since n is not symmetric about green.
+    //       Magnitude rides slopeRms host-side, so rougher water disperses more; the GAIN is an
+    //       exaggeration by necessity, because the true 1.8% spread is under a tenth of a texel.
+    //   yzw = spare. (A consumer-side domain warp lived in y/z briefly, to hide the tile. It was
+    //         removed: hiding a repeat by shearing the lookup trades a periodic artefact for a
+    //         smeared one, and the smear was the worse of the two. The tile gets broken properly by
+    //         the DYNAMIC caustic layer instead — ripples and wakes splatted into a second,
+    //         camera-anchored map that has no period at all.)
+    // Appended after waterCaustic for the reason every field down here carries: this cbuffer is
+    // bound BY POINTER into every PerFrame set and each offset above is a host constant, so a field
+    // inserted anywhere else moves a lane somebody reads by index.
+    DATA(float4,   waterCaustic2,   None);
+    // ─── W24 — THE DYNAMIC CAUSTIC LAYERS (causticdyn.comp.fsl) ─────────────────────────────────
+    // Two camera-anchored maps splatted from the LIVE wave fields, composited over the tiling one by
+    // MULTIPLICATION. That is first-order exact and not a fudge: total displacement is the sum of
+    // the layers' displacements, so J = I + A + B ~= (I+A)(I+B), and determinants multiply — which
+    // means the GAINS multiply. Independent mean-1 fields multiply to a mean-1 field, so the
+    // exposure servo does not move (`w/l` in the APL split is the check).
+    //
+    // ⚠ THE DOMAINS ARE WORLD-ANCHORED AND FINITE, which is the whole difference from the tiling
+    // map: there is no wrap, so a fragment outside the window gets the identity and the consumer
+    // fades the last eighth in. Same arrangement water.frag makes for the wave fields themselves.
+    //   xy = domain origin, EYE-RELATIVE (the frame is camera-relative; an absolute origin here
+    //        would lose precision far from the world origin and make the caustics swim)
+    //   z  = 1 / (world units per destination texel)
+    //   w  = the map's size in texels (CAUSTIC_RES)
+    // Both are zeroed when their layer is off, and the STRENGTH below is what actually disarms the
+    // consumer — a zero domain would divide, a zero strength branches out.
+    DATA(float4,   waterCausticRip,  None);
+    DATA(float4,   waterCausticWake, None);
+    // x = RIPPLE strength, y = WAKE strength. 0 in either disarms that layer's whole block and
+    //     leaves its factor at exactly 1.0 — which is what makes "dynamic off is pixel-identical to
+    //     the W23 build" a claim that can be checked rather than argued.
+    // z,w = the RIPPLE layer's LOG-depth slice map, exactly as waterCaustic.zw is for the static
+    //     one: sliceIndex = z*log2(depth) + w over its two depths, solved host-side from the first
+    //     and the last so the spacing cannot be described two ways.
+    //
+    // ⚠ THE WAKE LAYER HAS NO SLICE MAP AND NEEDS NO LANE FOR ONE. It is generated at a single
+    // reference depth (CAUSTIC_WAKE_DEPTH, shared with the host through caustic.h.fsl) because wake
+    // wavelengths of 90-200 units do not fold until ~700-950 units of water: the whole playable
+    // range is PRE-FOCUS, where the deviation is LINEAR in depth. `dev * clamp(depth /
+    // CAUSTIC_WAKE_DEPTH, 0, 4)` is therefore exact to first order for one tap, and the reference
+    // depth cancels out of that expression — which is why it is a constant and not a knob.
+    DATA(float4,   waterCausticDyn,  None);
 };

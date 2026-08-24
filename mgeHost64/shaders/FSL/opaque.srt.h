@@ -467,6 +467,26 @@ BEGIN_SRT_NO_AB(SrtData)
 #else
         DECL_TEXTURE(PerFrame, Tex2D(float4), gPortalGate)
 #endif
+        // W23: the TILING CAUSTIC map (caustic.srt.h), one array slice per depth. Read by
+        // waterLightTransmit() in waterfog.h.fsl, which is the single place the sun is attenuated on
+        // submerged geometry — so folding it in there reaches opaque/terrain/alpha/multimap/statics
+        // with no call-site churn at all.
+        //
+        // ⚠⚠ STORED AS (gain - 1): ZERO IS THE IDENTITY HERE, AND THAT INVERTS THE HOUSE RULE.
+        // Everywhere else on this set the convention is "unbound reads zero = the pre-feature image",
+        // and it works because those terms are ADDITIVE or are slopes. This one MULTIPLIES sunlight,
+        // so an unbound read of 0 would not mean "no caustics", it would mean "no sun" — every
+        // submerged surface black. There are seven PerFrame sets that shade submerged geometry and
+        // this is bound into a subset of them, so that is not a hypothetical. Subtracting 1 at the
+        // resolve and adding it back at the consumer keeps the convention pointing the right way:
+        // unbound -> 0 -> gain 1.0 -> exactly the pre-W23 image.
+        //
+        // Sampled with gSamplerBilinearWrap: the map TILES by construction (integer wavevectors on
+        // the 2*pi/tile lattice), so REPEAT addressing is exact rather than a papered seam. The array
+        // index is not filtered by the sampler, so the consumer lerps two slices by hand.
+        // Appended AFTER gPortalGate — append only, FSL assigns descriptor offsets from one running
+        // counter and an insertion silently re-points every later binding.
+        DECL_TEXTURE(PerFrame, Tex2DArray(float), gCausticField)
     END_SRT_SET(PerFrame)
     // Point-light cbuffer — rides the otherwise-unused PerDraw set (FSL has exactly four
     // fixed update frequencies: Persistent/PerFrame/PerBatch/PerDraw; a custom set name has

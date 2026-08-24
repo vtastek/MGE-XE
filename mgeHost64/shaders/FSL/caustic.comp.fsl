@@ -1,0 +1,171 @@
+// mgeHost64 — W23: the caustic BEAM SPLAT. See caustic.srt.h for why this is a scatter, why the
+// splat is an anisotropic Gaussian rather than a point, and why the source grid is hexagonal.
+//
+// One thread per (source cell, depth slice). Each thread refracts the beam crossing its cell through
+// the tiling height field and deposits it on that slice's depth plane as the ELLIPSE the refraction
+// actually produced:
+//
+//     dst   = x + c*D*grad(h)                 c = 1 - 1/n     (the small-angle deviation)
+//     J     = I + c*D*H(h)                    H = the Hessian of h
+//     Sigma = sigma_src^2 * J*J^T  +  sigma_min^2 * I
+//
+// A Hessian is symmetric, so J is symmetric and J*J^T is just J*J — no transpose is formed. The
+// second term is the floor: the sun's own angular size (which grows with depth, and is why real deep
+// caustics are soft) plus a sub-texel floor so a perfectly focused beam lands as a texel and not as
+// a delta that the destination grid cannot represent.
+//
+// ⚠ NO JITTER, AND THAT IS DELIBERATE — it is the difference between this and a photon map. A point
+// splat MUST be jittered, because emitting from cell centres makes the source a lattice and a
+// lattice refracted through a smooth field is still a lattice. A BEAM splat must not be: its
+// footprint already covers the cell it came from, exactly and by construction, so the sum over all
+// cells is a quadrature of the irradiance integral rather than a sample of it. The field is
+// therefore DETERMINISTIC — there is no Poisson noise to average away, which is why the EMA defaults
+// to off and why raising the beam count does not "reduce noise", it only refines the places where a
+// single linear footprint is too crude to describe a hard fold.
+
+// The beam kernel itself lives in causticsplat.h.fsl, shared with causticdyn.comp — the mean-1.0
+// normalisation is in there and must not exist twice (see that file's header). This shader owns the
+// SURFACE: the tiling cosine sum, its gradient and its Hessian.
+#include "causticsplat.h.fsl"
+
+#define CAUSTIC_THREADS 8
+#define CAUSTIC_TWOPI   6.28318531f
+
+// Gravity in MORROWIND UNITS per second squared. 1 unit = 1/64 yard = 0.014288 m, so 9.81 m/s^2 is
+// 686 u/s^2. It is here because the animation runs on the real deep-water dispersion relation,
+// omega = sqrt(g*K) ([[project_kelvin_wedge_dispersion]]) — long waves crawl and short ones scurry,
+// which is most of what makes a water surface read as water rather than as a scrolling texture. A
+// table of hand-picked rates cannot produce that; it has to come from K.
+#define CAUSTIC_GRAV    686.0f
+
+ROOT_SIGNATURE(ComputeRootSignature)
+NUM_THREADS(CAUSTIC_THREADS, CAUSTIC_THREADS, 1)
+void CS_MAIN(SV_DispatchThreadID(uint3) did)
+{
+    INIT_MAIN;
+    // NB: every RETURN() MUST start its own line — fsl.py only rewrites a line-leading RETURN.
+    if (did.x >= (uint)CAUSTIC_SRC_X || did.y >= (uint)CAUSTIC_SRC_Y
+        || did.z >= (uint)CAUSTIC_SLICES) {
+        RETURN();
+    }
+
+    const int  R = CAUSTIC_RES;
+
+    // WHICH slice this thread owns. The dispatch's z extent is how many slices are being rebuilt
+    // THIS frame (1..CAUSTIC_SLICES), not how many exist — the host round-robins them to pay for the
+    // 512 map. So the slice is a cursor plus our own z, wrapped; did.z is NOT the slice.
+    //
+    // W24: the group's BASE and SPAN come from the cbuffer rather than being CAUSTIC_SLICES, because
+    // the resolve now serves two groups and its slice expression has to be the same one as this. For
+    // the static group base is 0 and span is CAUSTIC_SLICES, so this is what it always was.
+    uint  span    = max((uint)gCausticParams.misc.w, 1u);
+    uint  slice   = (uint)gCausticParams.dynOut.x
+                  + (((uint)gCausticParams.misc.x + did.z) % span);
+
+    // ⚠ THE RATE IS APPLIED TO OMEGA, NOT TO TIME, and that is what keeps the wrap seamless — see
+    // caustic.srt.h. Scaling t here by a non-integer rate would put the jump straight back.
+    float t       = gCausticParams.cfg.x;
+    float rate    = max(gCausticParams.wave.w, 0.0f);
+    float w0      = max(gCausticParams.misc.y, 1.0e-6f);
+    float tileU   = max(gCausticParams.cfg.y, 1.0f);
+    int   sub     = (int)clamp(gCausticParams.cfg.z, 1.0f, 4.0f);
+    float depth   = gCausticParams.depths[slice - (uint)gCausticParams.dynOut.x];
+    float cRef    = max(gCausticParams.wave.x, 1e-4f);
+    float slope   = max(gCausticParams.wave.y, 1e-4f);
+    float sunTan  = max(gCausticParams.wave.z, 0.0f);
+
+    float toTexel = (float)R / tileU;       // world units -> destination texels
+    float q       = cRef * depth;           // the world length that multiplies grad and Hessian
+
+    // Per-component slope amplitude. The weights are a taper, not a spectrum; dividing by
+    // sqrt(0.5 * sum(w^2)) = 2.61265 makes the RMS of the summed slope field come out at exactly
+    // `slope` whatever the taper is, so the look knob means what it says whatever is in this table.
+    //
+    // ⚠ TWENTY, NOT EIGHT, AND THE REASON IS THE TILING. Eight components sum to a recognisable
+    // interference figure, and a recognisable figure is what lets the eye match one tile against the
+    // next — the repeat was being SEEN through the pattern's structure, not through its period.
+    // Twenty leaves nothing to match. Directions are spread over the full circle and no two vectors
+    // are collinear, so no pair reinforces into a visible grain.
+    const float3 W[CAUSTIC_WAVES] = {
+        float3(  9.0f,   8.0f, 1.00f), float3(-11.0f,   7.0f, 0.97f),
+        float3(  4.0f, -13.0f, 0.96f), float3(-13.0f,  -6.0f, 0.94f),
+        float3( 14.0f,  -6.0f, 0.92f), float3( 12.0f,  10.0f, 0.91f),
+        float3( -8.0f,  14.0f, 0.90f), float3( -5.0f,  17.0f, 0.87f),
+        float3( 19.0f,  -9.0f, 0.82f), float3( 15.0f, -17.0f, 0.80f),
+        float3( 20.0f,  11.0f, 0.80f), float3( -7.0f,  22.0f, 0.79f),
+        float3(-21.0f, -10.0f, 0.79f), float3( 24.0f,   5.0f, 0.77f),
+        float3(-11.0f, -23.0f, 0.76f), float3(-16.0f,  21.0f, 0.74f),
+        float3( 28.0f, -12.0f, 0.70f), float3(-31.0f,  14.0f, 0.66f),
+        float3( 22.0f,  26.0f, 0.66f), float3( -9.0f,  37.0f, 0.62f)
+    };
+    float sNorm = slope * (1.0f / 2.61265f);
+
+    // The hexagonal source cell this thread owns, in TILE coordinates (0..1). Odd rows step half a
+    // cell across; the row spacing is already compressed by CAUSTIC_SRC_Y > CAUSTIC_SRC_X, which is
+    // the half of the hex construction that actually buys the smaller gaps (caustic.srt.h).
+    float xoff = ((did.y & 1u) != 0u) ? 0.5f : 0.0f;
+
+    // One beam covers one hex cell; sub-beams split it. sigma_src is the Gaussian that stands for a
+    // cell of that area, in DESTINATION texels — the source and destination grids are decoupled, so
+    // this conversion is RES / sqrt(SRC_X*SRC_Y) and not 1.
+    float invSub  = 1.0f / (float)sub;
+    float sigSrc  = 0.5f * (float)R * invSub
+                  / sqrt((float)CAUSTIC_SRC_X * (float)CAUSTIC_SRC_Y);
+    float sigSrc2 = sigSrc * sigSrc;
+
+    // The floor on every beam: the sun's angular radius carried down `depth` of water, plus a third
+    // of a texel so a perfect focus is still representable on this grid.
+    float sigSun  = depth * sunTan * toTexel;
+    float sigMin2 = sigSun * sigSun + 0.1089f;
+
+    // Beam weight. Every source cell must deliver the same total whatever the grids are, so the
+    // per-texel mean of the finished map is exactly CAUSTIC_WFIX.
+    float wBeam = (float)CAUSTIC_WFIX * ((float)R * (float)R)
+                / ((float)CAUSTIC_SRC_X * (float)CAUSTIC_SRC_Y * (float)(sub * sub));
+
+    for (int sy = 0; sy < sub; ++sy)
+    {
+        for (int sx = 0; sx < sub; ++sx)
+        {
+            float2 cell = float2((float)did.x + xoff + ((float)sx + 0.5f) * invSub,
+                                 (float)did.y          + ((float)sy + 0.5f) * invSub);
+            float2 p    = float2(cell.x * (1.0f / (float)CAUSTIC_SRC_X),
+                                 cell.y * (1.0f / (float)CAUSTIC_SRC_Y));   // tile units, 0..1
+
+            // --- the surface: world slope and world Hessian, from the same eight sincos ----------
+            float2 g = float2(0.0f, 0.0f);
+            float3 H = float3(0.0f, 0.0f, 0.0f);      // Hxx, Hxy, Hyy  (symmetric, so three terms)
+            UNROLL
+            for (int i = 0; i < CAUSTIC_WAVES; ++i)
+            {
+                float2 n   = float2(W[i].x, W[i].y);
+                float  ln  = length(n);
+                float2 kd  = n / ln;                          // unit direction
+                float  Kw  = CAUSTIC_TWOPI * ln / tileU;      // WORLD wavenumber, 1/unit
+                float  s   = sNorm * W[i].z;                  // slope amplitude, dimensionless
+                // Deep-water dispersion, snapped to a whole number of cycles over the host's time
+                // wrap so the wrap cannot show. Half a step of rounding = 0.9-1.6% on these omegas.
+                float  om  = round(sqrt(CAUSTIC_GRAV * Kw) * rate / w0) * w0;
+                float  th  = CAUSTIC_TWOPI * dot(n, p) + om * t;
+                float  sn  = sin(th);
+                float  cs  = cos(th);
+                g -= s * kd * sn;
+                float hc = s * Kw * cs;
+                H -= float3(kd.x * kd.x, kd.x * kd.y, kd.y * kd.y) * hc;
+            }
+
+            // --- where the beam lands, and the ellipse it lands as -------------------------------
+            float2 src = float2(p.x * (float)R, p.y * (float)R);       // destination texels
+            float2 dst = src + g * (q * toTexel);
+
+            float3 Jm = float3(1.0f + q * H.x, q * H.y, 1.0f + q * H.z);
+
+            // WRAP, and no withdrawal: the tiling map is world-periodic (a beam leaving one edge is
+            // identical to one entering the other, which is a LATTICE property of the integer
+            // wavevectors — see caustic.srt.h), and its accumulator is cleared to 0, so every beam
+            // deposits onto an empty plane with nothing to take back.
+            causticSplatBeam(dst, Jm, sigSrc2, sigMin2, wBeam, slice, 1, 0u, 0u);
+        }
+    }
+    RETURN();
+}

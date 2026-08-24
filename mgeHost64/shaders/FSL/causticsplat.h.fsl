@@ -1,0 +1,136 @@
+// mgeHost64 — W23/W24: THE BEAM KERNEL, lifted out of caustic.comp.fsl so the static tiling
+// generator and the dynamic ripple/wake generator deposit through exactly the same code.
+//
+// WHY IT IS A PLAIN FUNCTION AND NOT A RESOURCE PARAMETER. Both callers write the SAME
+// gCausticAccum, declared in the SAME SRT, so the accumulator is simply in scope here — no resource
+// has to be passed. That matters: resources as function parameters are illegal before SM 6.6, and
+// this shader model is not that. What the callers differ in is arithmetic (where the beam lands,
+// how big its ellipse is, which slice, whether the destination wraps), and arithmetic is what a
+// parameter list is for.
+//
+// WHY IT IS SHARED AT ALL, given that two copies would have compiled. Because the mean-1.0 contract
+// (caustic.srt.h) lives inside this function and nowhere else: the two-pass normalisation by the
+// weights ACTUALLY EVALUATED is what makes truncation misplace energy rather than lose it, and the
+// dynamic layers multiply into the static one at the consumer. Two independently-drifting copies of
+// that would show up as an exposure shift the servo chases, four subsystems away from the edit.
+//
+// The physical object is in caustic.srt.h; the short version is
+//
+//     dst   = x + c*D*grad(h)                          the small-angle refraction
+//     J     = I + c*D*H(h)                             H = the Hessian of h, so J is SYMMETRIC
+//     Sigma = sigma_src^2 * J*J  +  sigma_min^2 * I    no transpose: a Hessian is symmetric
+//
+// and this function takes `dst` and J (as its three distinct entries) already formed.
+#pragma once
+
+#include "caustic.srt.h"
+
+// Kernel truncation. 2.6 sigma keeps 96.6% of a 2D Gaussian's mass, and the rest is not lost — the
+// kernel is renormalised by what it actually evaluated. The CAP bounds the worst case: a beam at the
+// deepest slice wants ~8 texels of half-extent, and 6 is where the cost stops being worth the last
+// few percent of skirt on the faintest slice in the ladder.
+#define CAUSTIC_KERNEL_SIGMAS 2.6f
+#define CAUSTIC_KERNEL_CAP    6
+#define CAUSTIC_KERNEL_CUT    0.015625f    // 1/64 of the peak; below this a cell cannot round to a
+                                           // meaningful fixed-point contribution anyway
+
+// Deposit one beam.
+//   dst        — where it lands, in DESTINATION TEXELS. Texel k is at coordinate k.
+//   Jm         — (Jxx, Jxy, Jyy). Symmetric, so three entries describe all four.
+//   sigSrc2    — the source cell's own footprint variance, in destination texels squared.
+//   sigMin2    — the floor: the sun's angular size carried down `depth`, plus a sub-texel term so a
+//                perfect focus is representable on this grid rather than being a delta.
+//   wBeam      — total fixed-point weight this beam must deliver. ALL of it lands, whatever the
+//                kernel's shape or truncation.
+//   slice      — the array slice / accumulator plane.
+//   doWrap     — 1: the destination is world-PERIODIC (the static tiling map), so a cell leaving one
+//                edge is identical to one entering the other and `mod RES` is exact.
+//                0: the destination is a CAMERA-ANCHORED WINDOW (the dynamic maps), where wrapping
+//                would put a phantom wake on the far side of the domain. Out-of-range cells are
+//                DROPPED and the kernel renormalises over the survivors, so the beam still delivers
+//                its full weight; the resulting few-texel edge bias sits well inside the consumer's
+//                outer-1/8 fade.
+//   withdrawIdx/withdrawAmt — W24's identity prefill. The dynamic accumulator is left holding
+//                CAUSTIC_WFIX per texel by the previous resolve, which is exactly the weight of the
+//                beam born in that texel; a beam that is about to splat for real must first take its
+//                own prefill back. AtomicAdd of the two's-complement negative, which is exact
+//                because the FINAL total is never negative (each texel is withdrawn at most once, by
+//                its own beam, and was prefilled once). withdrawAmt 0 = no withdrawal, which is the
+//                static path.
+//
+// ⚠ THE WITHDRAWAL HAPPENS AFTER PASS 1, NOT BEFORE. If the kernel evaluated to nothing (every cell
+// out of range under doWrap 0) the beam deposits nothing, and a withdrawal already committed would
+// then be energy destroyed with no matching deposit. Ordering it behind the sumW test makes
+// "withdraw" and "deposit" a pair that either both happen or neither does.
+void causticSplatBeam(float2 dst, float3 Jm, float sigSrc2, float sigMin2, float wBeam,
+                      uint slice, int doWrap, uint withdrawIdx, uint withdrawAmt)
+{
+    const int R = CAUSTIC_RES;
+
+    float Sxx = sigSrc2 * (Jm.x * Jm.x + Jm.y * Jm.y) + sigMin2;
+    float Sxy = sigSrc2 * (Jm.y * (Jm.x + Jm.z));
+    float Syy = sigSrc2 * (Jm.y * Jm.y + Jm.z * Jm.z) + sigMin2;
+
+    float det = max(Sxx * Syy - Sxy * Sxy, 1e-8f);
+    float Ixx =  Syy / det;
+    float Ixy = -Sxy / det;
+    float Iyy =  Sxx / det;
+
+    int2 c0 = int2((int)floor(dst.x + 0.5f), (int)floor(dst.y + 0.5f));
+    int  rx = clamp((int)ceil(CAUSTIC_KERNEL_SIGMAS * sqrt(Sxx)), 1, CAUSTIC_KERNEL_CAP);
+    int  ry = clamp((int)ceil(CAUSTIC_KERNEL_SIGMAS * sqrt(Syy)), 1, CAUSTIC_KERNEL_CAP);
+
+    // Pass 1: the kernel's own total. Normalising by what was EVALUATED rather than by the analytic
+    // integral is what makes truncation misplace energy instead of losing it, which is the mean-1.0
+    // contract the exposure servo depends on (caustic.srt.h).
+    float sumW = 0.0f;
+    for (int yy = -ry; yy <= ry; ++yy)
+    {
+        for (int xx = -rx; xx <= rx; ++xx)
+        {
+            int px = c0.x + xx;
+            int py = c0.y + yy;
+            if (doWrap == 0 && (px < 0 || px >= R || py < 0 || py >= R)) { continue; }
+            float2 u = float2((float)px - dst.x, (float)py - dst.y);
+            float  e = u.x * (Ixx * u.x + Ixy * u.y) + u.y * (Ixy * u.x + Iyy * u.y);
+            float  w = exp(-0.5f * e);
+            sumW += (w > CAUSTIC_KERNEL_CUT) ? w : 0.0f;
+        }
+    }
+    if (sumW <= 0.0f) { return; }
+    float scale = wBeam / max(sumW, 1e-6f);
+
+    // W24: take the prefill back, now that the deposit is certain to happen.
+    if (withdrawAmt != 0u)
+    {
+        uint prevW;
+        AtomicAdd(gCausticAccum[withdrawIdx], 0u - withdrawAmt, prevW);
+    }
+
+    // Pass 2: deposit. Under doWrap the modulo is exact because the field tiles; the +R before it is
+    // what makes a negative index correct, since HLSL's % keeps the sign of the dividend.
+    for (int yy2 = -ry; yy2 <= ry; ++yy2)
+    {
+        for (int xx2 = -rx; xx2 <= rx; ++xx2)
+        {
+            int px2 = c0.x + xx2;
+            int py2 = c0.y + yy2;
+            if (doWrap == 0 && (px2 < 0 || px2 >= R || py2 < 0 || py2 >= R)) { continue; }
+            float2 u = float2((float)px2 - dst.x, (float)py2 - dst.y);
+            float  e = u.x * (Ixx * u.x + Ixy * u.y) + u.y * (Ixy * u.x + Iyy * u.y);
+            float  w = exp(-0.5f * e);
+            if (w > CAUSTIC_KERNEL_CUT)
+            {
+                uint contrib = (uint)(w * scale + 0.5f);
+                if (contrib > 0u)
+                {
+                    int x = (doWrap != 0) ? ((px2 % R + R) % R) : px2;
+                    int y = (doWrap != 0) ? ((py2 % R + R) % R) : py2;
+                    uint idx = (slice * (uint)R + (uint)y) * (uint)R + (uint)x;
+                    uint prev;
+                    AtomicAdd(gCausticAccum[idx], contrib, prev);
+                }
+            }
+        }
+    }
+}

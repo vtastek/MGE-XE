@@ -595,3 +595,23 @@
 #comp ripplenormal.comp
 #include "ripplenormal.comp.fsl"
 #end
+
+// W23: TILING CAUSTICS. A photon SCATTER (not a forward 1/|det J| map — see caustic.srt.h for why
+// the fold is the whole effect and only scattering gets it), then a resolve that normalises to a
+// mean of exactly 1.0 and clears the counter on its way out.
+#comp caustic.comp
+#include "caustic.comp.fsl"
+#end
+
+#comp causticresolve.comp
+#include "causticresolve.comp.fsl"
+#end
+
+// W24: DYNAMIC CAUSTICS — the same beam kernel (causticsplat.h.fsl, shared with caustic.comp) fed by
+// the LIVE ripple and wake fields instead of by a tiling cosine sum, into slices 4-6. One shader for
+// both layers: which field, which domain and which slices are entirely a descriptor-set instance and
+// its cbuffer. Cost is proportional to the DISTURBED AREA, not to the grid, because the resolve
+// leaves an identity prefill that a calm beam simply does not touch.
+#comp causticdyn.comp
+#include "causticdyn.comp.fsl"
+#end

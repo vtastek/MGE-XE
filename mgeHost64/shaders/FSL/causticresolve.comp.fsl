@@ -1,0 +1,83 @@
+// mgeHost64 — W23: the caustic RESOLVE. Counter -> map, and the counter is cleared on the way out.
+//
+// One thread per (texel, slice), reading and clearing exactly ONE accumulator entry and writing
+// exactly ONE output texel. That one-to-one shape is load-bearing in two ways:
+//
+//   * IT IS WHY THE CLEAR NEEDS NO PASS OF ITS OWN. A thread rewrites only what it has just read,
+//     and nothing else reads it, so the buffer leaves this dispatch already primed for next frame.
+//
+// ⚠ W24: "CLEARED" MEANS misc.z, WHICH IS NOT ALWAYS ZERO. For the static slices it is 0 and this
+// pass is the plain clear it always was. For the DYNAMIC slices it is CAUSTIC_WFIX — the IDENTITY
+// PREFILL, and the single line that makes a calm dynamic map cost nothing: a source grid 1:1 with
+// the destination means CAUSTIC_WFIX per texel already IS the answer for undisturbed water, so a
+// beam that has nothing to say simply says nothing and its prefill stands. See causticdyn.comp.fsl.
+// This dispatch is therefore not merely tidying up after itself; it is producing next frame's
+// starting state, and a resolve that skipped a dynamic slice would leave that slice BLACK.
+//   * IT IS WHY THE EMA CAN BE IN PLACE. gCausticOut is read back and written at the same texel by
+//     the same thread, so there is no ping-pong pair and no parity to track.
+//
+// ⚠ THERE IS NO BLUR HERE, AND THERE MUST NOT BE ONE. Smoothing is not this pass's job — it is the
+// generator's, and it does it correctly: each beam is deposited over the ELLIPSE its own refraction
+// produced, so the map is smooth where the light is actually spread out and sharp where it is
+// actually concentrated (caustic.srt.h). A blur here would be a uniform smear that cannot tell those
+// two cases apart, and it would soften the filaments — the one part of a caustic that must stay
+// sharp. It would also break the shape above, since a neighbour's texel would be zeroed underneath a
+// thread still reading it.
+//
+// ⚠ MEAN 1.0 IS THE CONTRACT, and the normalisation is what enforces it. Every source cell deposited
+// CAUSTIC_WFIX * RES^2/(SRC_X*SRC_Y) of weight and all of it landed in this slice (the splat wraps,
+// so none is lost), across SRC_X*SRC_Y cells and RES^2 texels — so the per-texel mean is exactly
+// CAUSTIC_WFIX, with no measurement and no reduction needed. Dividing by it makes the mean 1 BY
+// CONSTRUCTION rather than by tuning. That is the property that lets caustics enter the exposure
+// loop without moving it; see caustic.srt.h.
+//
+// ⚠ STORED AS (gain - 1) SO THAT ZERO IS THE IDENTITY. The house convention is "unbound reads zero =
+// the pre-feature image", and for a MULTIPLICATIVE term that inverts: 0 would mean "black", not
+// "off". Subtracting 1 here and adding it back at the consumer keeps the convention pointing the
+// right way even in a pass that forgot to bind the map.
+
+#include "caustic.srt.h"
+
+#define CAUSTICR_THREADS 8
+
+ROOT_SIGNATURE(ComputeRootSignature)
+NUM_THREADS(CAUSTICR_THREADS, CAUSTICR_THREADS, 1)
+void CS_MAIN(SV_DispatchThreadID(uint3) did)
+{
+    INIT_MAIN;
+    // The slice group this dispatch owns: BASE + a cursor wrapped at SPAN. Two groups exist (static
+    // 0..CAUSTIC_SLICES-1, dynamic CAUSTIC_RIPPLE_BASE..CAUSTIC_TOTAL_SLICES-1), each with its own
+    // descriptor-set instance and therefore its own cbuffer, so one dispatch cannot resolve into the
+    // other's slices however the cursor moves.
+    const uint span = max((uint)gCausticParams.misc.w, 1u);
+    // NB: every RETURN() MUST start its own line — fsl.py only rewrites a line-leading RETURN.
+    if (did.x >= (uint)CAUSTIC_RES || did.y >= (uint)CAUSTIC_RES || did.z >= span) {
+        RETURN();
+    }
+
+    // Same indirection the scatter uses, and it MUST match: the resolve reads and re-primes exactly
+    // the accumulator entries the scatter just filled. Resolving a slice the scatter did not touch
+    // would publish an all-zero map for it (gain 0 = black submerged geometry, since the map stores
+    // gain-1), and leaving one unresolved would let its counter accumulate forever.
+    const uint slice = (uint)gCausticParams.dynOut.x
+                     + (((uint)gCausticParams.misc.x + did.z) % span);
+    const uint R   = (uint)CAUSTIC_RES;
+    const uint idx = (slice * R + did.y) * R + did.x;
+
+    float gain = (float)gCausticAccum[idx] * (1.0f / (float)CAUSTIC_WFIX);
+    gCausticAccum[idx] = (uint)gCausticParams.misc.z;   // next frame's starting state — see the header
+
+    // OPTIONAL TEMPORAL EMA. A beam splat is DETERMINISTIC — there is no Poisson noise here to
+    // average away, which is why this defaults to 1.0 (off) where the point-splat version needed
+    // 0.25 just to be watchable. It is kept only as a way to soften residual stepping if the
+    // animation rate is ever pushed high enough to show it, and it costs a smear of the moving
+    // pattern when used, so 1.0 is the right default and not laziness.
+    float a = saturate(gCausticParams.cfg.w);
+    if (a < 1.0f) {
+        float prev = LoadRWTex3D(gCausticOut, int3((int)did.x, (int)did.y, (int)slice)) + 1.0f;
+        gain = lerp(prev, gain, a);
+    }
+
+    Write3D(gCausticOut, int3((int)did.x, (int)did.y, (int)slice), gain - 1.0f);
+    RETURN();
+}

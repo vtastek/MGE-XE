@@ -67,6 +67,48 @@ float waterFogPlaneRelZ()
 //     0.5 * (1 - 0.6612) * 1.333^2  =  0.1694 * 1.7769  =  0.3010
 #define kInscatterAmb  (0.5f * (1.0f - kWaterCosCrit) * kWaterIOR * kWaterIOR)
 
+// W23: the caustic map's slice count, needed by the consumer at the bottom of waterLightTransmit.
+#include "caustic.h.fsl"
+// ⚠ FORGE DECLARES SampleLvlTex2DArray AGAINST Texture3D (d3d.h:490-493) — a Forge bug we must
+// neither inherit nor fork-fix ([[project_forge_fork_merge_trap]]). Local macro instead, the same
+// workaround water.frag makes for the same bug, under its own name so the two cannot collide when
+// one file transitively includes the other.
+// SampleLevel and not the implicit-LOD form: this is reached past `if (depth <= 0) return`, which is
+// non-uniform control flow, where an implicit derivative is illegal.
+#define SampleCausticArray(N, S, C, L) N.SampleLevel(S, C, L)
+
+// One depth-interpolated read of the caustic map. Factored out because the DISPERSION FRINGE takes
+// three of them at three offset UVs, and the slice pair / blend fraction are identical for all three
+// — only the position moves. Explicit LOD for the reason the macro above states.
+float causticFetch(float2 uv, float s0, float s1, float sf)
+{
+    float a0 = SampleCausticArray(gCausticField, gSamplerBilinearWrap, float3(uv, s0), 0.0f);
+    float a1 = SampleCausticArray(gCausticField, gSamplerBilinearWrap, float3(uv, s1), 0.0f);
+    return lerp(a0, a1, sf);
+}
+
+// W24: one read of a DYNAMIC slice. CLAMP, not wrap — the dynamic maps are camera-anchored windows
+// rather than tiles, and a wrapping sampler would fold the far edge of the domain onto the near one
+// and put a phantom wake behind the viewer ([[project_sampler_clamp_invents]] is the same trap seen
+// from the other side: a clamp sampler INVENTS an edge row, so the consumer must fade before it
+// reaches one — which is what causticDynEdge below is for).
+float causticDynFetch(float2 uv, float slice)
+{
+    return SampleCausticArray(gCausticField, gSamplerBilinearClamp, float3(uv, slice), 0.0f);
+}
+
+// The dynamic domain fade. Identical shape to the one water.frag applies to the wave fields
+// themselves: without it the layer is CUT at the boundary — a hard straight edge across open water
+// that slides with the camera, which is far more conspicuous than the missing caustics it hides. The
+// outer eighth also swallows the few-texel edge bias the generator's dropped destination cells leave
+// (causticsplat.h.fsl).
+float causticDynEdge(float2 uv)
+{
+    if (uv.x < 0.0f || uv.x > 1.0f || uv.y < 0.0f || uv.y > 1.0f) { return 0.0f; }
+    float2 e = min(uv, 1.0f - uv);
+    return saturate(min(e.x, e.y) * 8.0f);
+}
+
 // --- W22: THE SMALL-ANGLE REFRACTIVE DEVIATION PER UNIT SURFACE SLOPE ---------------------------
 // Snell to first order in the tilt. A surface normal tilted by `slope` from vertical bends the view
 // ray by a fixed fraction of that tilt, and the fraction depends only on which side you are on:
@@ -327,6 +369,206 @@ void waterLightTransmit(float3 worldPosRel, out float3 tSun, out float3 tAmb)
 
     tSun = lerp(tSun, exp(-k * pathSun),                 strength);
     tAmb = lerp(tAmb, exp(-k * depth * kWaterDiffuse),   strength);
+
+    // ─── W23: CAUSTICS ───────────────────────────────────────────────────────────────────────────
+    // Folded into tSun HERE rather than at the five call sites, because this function already IS the
+    // single place the sun is attenuated on submerged geometry: opaque.frag, terrain.frag,
+    // alpha.frag, multimap.frag and multimap_alpha.frag all call it identically, and statics come
+    // through opaque. One edit, six shaders, no call-site churn.
+    //
+    // ⚠⚠ AND IT LANDS IN THE RIGHT PLACE BY AN EXISTING DECISION, NOT BY LUCK. opaque.frag already
+    // documents that this call must sit BEFORE the point-light loop — "A torch carried underwater is
+    // not dimmed by the column above it" — so `tSun` at this moment is the SUN TERM ALONE. Caustics
+    // therefore modulate sunlight only: a shadowed fragment correctly receives none (its NdotL and
+    // shadow term multiply this), and torches are untouched. Nothing had to move for that to be
+    // true, and nothing may move without breaking it.
+    //
+    // ⚠ MULTIPLICATIVE, MEAN 1.0. The map is built by photon scatter precisely so its mean is 1 by
+    // construction (caustic.srt.h) — caustics redistribute the sun on the seabed, they do not add
+    // any. If `w/l` in the APL split ever moves when this is switched on, something downstream has
+    // broken that property and the servo will chase it.
+    //
+    // ⚠ +1 BECAUSE THE MAP STORES (gain - 1). Unbound reads ZERO, and for a term that MULTIPLIES the
+    // sun, zero would mean darkness rather than "off" — five of the seven PerFrame sets that shade
+    // submerged geometry do not bind it. See the lane note in opaque.srt.h.
+    float causStr = gShadowParams.waterCaustic.x;
+    if (causStr > 0.0f) {
+        // WORLD-ANCHORED, like every other field in this renderer: the frame is camera-relative and
+        // lodEye is the real absolute eye, so without this the caustics swim with the camera. Same
+        // conversion water.frag makes for its wave field.
+        float2 worldXY = gFrameData.lodEye.xy + worldPosRel.xy;
+
+        // THE SUN'S ELEVATION, TO FIRST ORDER: the whole pattern translates by depth*tan(theta_water)
+        // along the sun's horizontal bearing. Free, and it is the term that matters — a low sun puts
+        // the caustics visibly off to one side of what casts them. The pattern's SHEAR with elevation
+        // is second order and is deliberately NOT modelled; see caustic.srt.h.
+        // cosWater is already in hand from the refraction above, and it is floored at kWaterCosCrit,
+        // so this tangent cannot run away at grazing sun.
+        //
+        // ⚠⚠ THE SIGN IS NEGATIVE, AND IT WAS POSITIVE UNTIL W24 FOUND IT. gFrameData.sunDir is the
+        // TRAVEL direction (opaque.srt.h: "to-sun is -sunDir"), so a photon entering the surface at
+        // P descends `depth` while moving horizontally by +bearing*depth*tanW — it lands DOWN-SUN of
+        // where it entered. Read backwards, which is what a seabed fragment has to do: the fragment
+        // at `worldXY` was lit by the surface patch at `worldXY - bearing*depth*tanW`. So the lookup
+        // steps back UP-SUN, and the term below is what a fragment ADDS to its own position.
+        //
+        // ⚠ AND THIS IS WHY IT SURVIVED W23. The error was 2*depth*tanW — at 100 units of water under
+        // a 45 deg sun, ~125 world units — but the only thing being sampled was the TILING map,
+        // which is statistically isotropic and repeats: sliding it 125 units the wrong way is
+        // indistinguishable from sliding it 125 units the right way. There was no reference in the
+        // image to check the sign against. The WAKE is that reference. A Kelvin wedge is a coherent,
+        // localised, recognisable structure that sits at a known place, and the first time one was
+        // fed through this term the answer was "sun direction and wake don't match". A term whose
+        // sign only becomes checkable once a STRUCTURED field runs through it is a term to re-derive
+        // rather than to eyeball, which is what the note above it always half-said.
+        float  tanW  = sqrt(max(1.0f - cosWater * cosWater, 0.0f)) / max(cosWater, kWaterCosCrit);
+        float2 sunXY = gFrameData.sunDir.xy;
+        float  sunL  = length(sunXY);
+        float2 bearing = (sunL > 1e-4f) ? (sunXY / sunL) : float2(1.0f, 0.0f);
+        float2 shift = (sunL > 1e-4f) ? bearing * (-depth * tanW) : float2(0.0f, 0.0f);
+
+        float2 uv = (worldXY + shift) * gShadowParams.waterCaustic.y;   // y = 1 / tileWorldUnits
+
+        // W24: the three layers compose by MULTIPLICATION, so the product starts at the identity and
+        // each layer that is armed multiplies into it. See the waterCausticRip note in
+        // shadowparams.h.fsl for why a product is the physically right composite and not a fudge:
+        // displacements add, so Jacobians multiply to first order, so GAINS multiply. Independent
+        // mean-1 fields multiply to a mean-1 field, which is what keeps the exposure servo still.
+        float3 caustic = float3(1.0f, 1.0f, 1.0f);
+
+        // DEPTH SLICE. The slice depths are geometric, so the blend runs in LOG depth — a linear
+        // blend would spend three quarters of its range between the last two slices and switch
+        // abruptly through the shallow ones, which is exactly where the depth evolution is fastest
+        // and most recognisable. The host folds WIND into the bias term (.w) rather than into the
+        // strength, because slope and depth enter the refraction as a PRODUCT (c*D*grad h): a rougher
+        // surface is, to the map, deeper water. So wind makes the pattern finer and more folded, the
+        // way it actually behaves, instead of merely making the same pattern louder.
+        float  sIdx = gShadowParams.waterCaustic.z * log2(max(depth, 1.0f))
+                    + gShadowParams.waterCaustic.w;
+
+        // ⚠ FADE, DO NOT CLAMP — this is the bug the first version had. Clamping sIdx to the last
+        // slice does not end the effect, it PINS it: past the deepest slice every fragment keeps
+        // sampling the same pattern at full strength, and the caustics then stop dead wherever that
+        // slice's contribution happens to end. What the depth limit means physically is that the
+        // caustic CONTRAST has decayed — many folds past focus, plus the sun's own angular size, and
+        // the pattern has washed out — so the thing that has to go to zero is the deviation, not the
+        // index.
+        //
+        // ⚠ AND FADING THE DEVIATION IS ALSO WHAT KEEPS THE MEAN AT 1.0. The map stores (gain - 1),
+        // so scaling it toward zero walks the gain toward 1 — no light is added or removed at any
+        // point in the fade. Fading `causStr` instead would do the same thing here, but fading the
+        // SAMPLE is the form that stays correct if anything is ever composited on top.
+        float  fade = saturate(sIdx + 1.0f)
+                    * (1.0f - saturate(sIdx - (float)(CAUSTIC_SLICES - 1)));
+
+        if (fade > 0.0f) {
+            float s0 = clamp(floor(sIdx), 0.0f, (float)(CAUSTIC_SLICES - 1));
+            float s1 = min(s0 + 1.0f, (float)(CAUSTIC_SLICES - 1));
+            float sf = saturate(sIdx - s0);
+
+            // ⚠ THE DISPERSION FRINGE IS A SPATIAL OFFSET, AND THE FIRST VERSION'S WAS NOT. That
+            // one read the three channels at three offset fractions along the DEPTH axis, on the
+            // grounds that c = 1 - 1/n multiplies depth and nothing else — so red's caustic is this
+            // pattern at a slightly shallower effective depth. The algebra is right and the
+            // implementation was still wrong, because it needs adjacent slices to be close enough
+            // that the pattern between them is approximately a TRANSLATION. Ours are 1.17 octaves
+            // apart, across which the map completely re-folds, so shifting the blend fraction
+            // crossfades two DECORRELATED patterns. That produces chromatic noise of the right
+            // magnitude and entirely the wrong kind — not a fringe along a filament, which is
+            // exactly what "not as colorful as expected" was reporting.
+            //
+            // The real chromatic displacement is (c_lambda - c_green)*D*grad(h): a shift along the
+            // surface gradient at the beam's SOURCE, which no destination texel knows. The sun
+            // bearing stands in for that direction — it is where the whole pattern already
+            // translates with depth, and a wind-driven surface's slope is locally coherent with it,
+            // so the fringes align rather than scattering. The magnitude is physical (and rides
+            // slopeRms host-side, so rougher water disperses more); the GAIN is not, and cannot be:
+            // the true spread is 1.8%, which at any tile size we would use is under a tenth of a
+            // texel. Any visible fringe here is an exaggeration, so the only question is which
+            // exaggeration is shaped correctly.
+            //
+            // ⚠ ASYMMETRIC, because n(lambda) is. (c_R-c_G)/c_G = -0.00406 and (c_B-c_G)/c_G =
+            // +0.00921 at 656/589/486 nm, so red's offset is -0.441x blue's, not -1x. The host
+            // publishes blue's; red takes the ratio. Getting this symmetric would put the green
+            // channel off-centre in the fringe and read as a tint rather than a spectrum.
+            float2 duv = bearing * (gShadowParams.waterCaustic2.x * depth);
+            float3 dev;
+            if (dot(duv, duv) > 1.0e-14f) {
+                dev.r = causticFetch(uv - 0.4409f * duv, s0, s1, sf);
+                dev.g = causticFetch(uv,                 s0, s1, sf);
+                dev.b = causticFetch(uv + duv,           s0, s1, sf);
+            } else {
+                // Gain 0. A uniform branch is not free ([[project_forge_uniform_branch_is_not_free]])
+                // but this one is coherent across the whole draw and saves two thirds of the taps.
+                dev = causticFetch(uv, s0, s1, sf).xxx;
+            }
+
+            // Each channel is an independent sample of a mean-1 field, so the mean survives the
+            // offset — no channel gains or loses energy, the fringe only moves it sideways.
+            caustic = 1.0f + dev * fade;
+        }
+
+        // ─── W24: THE DYNAMIC LAYERS ─────────────────────────────────────────────────────────────
+        // Both are camera-anchored windows on the LIVE wave fields, so they have no period at all —
+        // which is the point: the tiling map above repeats every tileWorldUnits by the same lattice
+        // condition that makes it seamless, and no consumer-side trick fixes that. These break it by
+        // being the actual disturbance.
+        //
+        // EYE-RELATIVE, not absolute. The origins are published against gFrameData.lodEye for the
+        // reason every field in this renderer is: worldPosRel is already the eye-relative position
+        // and forming an absolute coordinate here would spend precision to immediately subtract it
+        // again ([[project_forge_precision_far_origin]]).
+        //
+        // THE SAME `shift` as the static layer. The sun's elevation translates the whole pattern by
+        // depth*tan(theta_water) along its bearing whatever generated it, so all three layers move
+        // together and a low sun does not slide them apart.
+        float2 dynPos = worldPosRel.xy + shift;
+
+        // RIPPLE — two depths, blended in LOG depth for the reason the static ladder is: the
+        // evolution is fastest in the shallows, which is exactly where a swimmer's own splash is.
+        float ripStr = gShadowParams.waterCausticDyn.x;
+        if (ripStr > 0.0f) {
+            float2 ruv = (dynPos - gShadowParams.waterCausticRip.xy)
+                       * (gShadowParams.waterCausticRip.z / max(gShadowParams.waterCausticRip.w, 1.0f));
+            float redge = causticDynEdge(ruv);
+            if (redge > 0.0f) {
+                float rIdx = gShadowParams.waterCausticDyn.z * log2(max(depth, 1.0f))
+                           + gShadowParams.waterCausticDyn.w;
+                // FADE THE DEVIATION, DO NOT CLAMP THE INDEX — the same bug the static ladder had
+                // once. Clamping pins the pattern at the last slice instead of ending it; fading the
+                // sample walks the gain toward 1, which adds and removes no light anywhere.
+                float rf = saturate(rIdx + 1.0f)
+                         * (1.0f - saturate(rIdx - (float)(CAUSTIC_RIPPLE_SLICES - 1)));
+                if (rf > 0.0f) {
+                    float r0 = clamp(floor(rIdx), 0.0f, (float)(CAUSTIC_RIPPLE_SLICES - 1));
+                    float r1 = min(r0 + 1.0f, (float)(CAUSTIC_RIPPLE_SLICES - 1));
+                    float rd = lerp(causticDynFetch(ruv, (float)CAUSTIC_RIPPLE_BASE + r0),
+                                    causticDynFetch(ruv, (float)CAUSTIC_RIPPLE_BASE + r1),
+                                    saturate(rIdx - r0));
+                    caustic *= 1.0f + rd * (rf * redge * ripStr);
+                }
+            }
+        }
+
+        // WAKE — ONE slice, scaled by depth. Wake wavelengths of 90-200 units do not fold until
+        // ~700-950 units of water, so the whole playable range is pre-focus and the deviation is
+        // LINEAR in depth: one tap times depth/CAUSTIC_WAKE_DEPTH is exact to first order where a
+        // second slice would buy nothing. Capped at 4x so a freak depth cannot extrapolate a linear
+        // model past the fold it does not model.
+        float wakeStr = gShadowParams.waterCausticDyn.y;
+        if (wakeStr > 0.0f) {
+            float2 wuv = (dynPos - gShadowParams.waterCausticWake.xy)
+                       * (gShadowParams.waterCausticWake.z / max(gShadowParams.waterCausticWake.w, 1.0f));
+            float wedge = causticDynEdge(wuv);
+            if (wedge > 0.0f) {
+                float wd = causticDynFetch(wuv, (float)CAUSTIC_WAKE_SLICE);
+                float wscale = clamp(depth * (1.0f / CAUSTIC_WAKE_DEPTH), 0.0f, 4.0f);
+                caustic *= 1.0f + wd * (wedge * wakeStr * wscale);
+            }
+        }
+
+        tSun *= lerp(float3(1.0f, 1.0f, 1.0f), caustic, saturate(causStr));
+    }
 }
 
 // --- W8: THE COLUMN SCATTERS, IT DOES NOT JUST ABSORB -----------------------------------------

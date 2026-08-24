@@ -1,0 +1,148 @@
+// mgeHost64 — W24: DYNAMIC CAUSTICS. The same beam splat as caustic.comp, driven by the LIVE wave
+// fields instead of by a tiling cosine sum, so the caustics belong to the disturbance that made
+// them and the map has no period at all.
+//
+// WHY THIS EXISTS. W23's map is seamless because its wavevectors are integer multiples of
+// 2*pi/tile — and that same condition makes it repeat exactly every `tileWorldUnits`. Nothing
+// consumer-side fixes that (a domain warp was tried and removed: it trades a periodic artefact for a
+// smeared one, and the smear reads worse). The real answer is the one the technique is FOR: splat
+// the actual surface. Two live wave fields are already GPU-resident — the fine ripple grid at
+// 1 unit/texel and the dispersive wake grid at 8 — so feeding them through the identical kernel
+// costs no new simulation and gives a layer that follows a swimmer's splash and a boat's wedge.
+//
+// ⚠⚠ THE IDENTITY PREFILL IS WHAT MAKES THIS AFFORDABLE, and it is the one idea in this file.
+// Calm water would otherwise cost a full Gaussian splat per source cell doing nothing at all — a
+// flat field is not a cheap field, it is the same 25 atomics per cell arranged to cancel. Instead:
+//
+//   * the RESOLVE leaves the dynamic accumulator holding CAUSTIC_WFIX per texel (misc.z) rather
+//     than 0. Because the source grid here is 1:1 with the destination, that is EXACTLY the weight
+//     of the beam born in that texel — a uniform lattice of undisturbed beams sums to a uniform
+//     field either way, so a prefilled plane already IS the calm answer;
+//   * a DISTURBED beam withdraws its own cell's prefill (AtomicAdd of the two's-complement
+//     negative; modular arithmetic is exact because the final total is never negative) and then
+//     splats normally;
+//   * a CALM beam returns immediately. Zero atomics, zero bandwidth.
+//
+// The BOOKKEEPING is therefore exact and the mean stays 1.0 — the property the exposure servo
+// depends on ([[project_forge_apl_region_split]]). What is approximated is only the KERNEL SHAPE of
+// a calm beam, as a delta rather than as its sub-texel Gaussian, and that can only matter in a ~1
+// texel band at the calm/disturbed boundary — where the disturbed kernel is a near-delta anyway.
+//
+// ⚠ AND IT NEEDS NO SCROLL HANDLING, unlike the wave sim it reads. The dynamic map is rebuilt from
+// scratch every frame, so there is no history to shift when the camera moves. The domain follows the
+// field's own texel-snapped origin for free.
+//
+// ⚠ THE DESTINATION DOES NOT WRAP. The static map is world-periodic and `mod RES` is exact there;
+// this one is a camera-anchored window, where wrapping would put a phantom wake on the opposite side
+// of the domain. Out-of-range cells are dropped and the kernel renormalises over the survivors, so
+// every beam still delivers its full weight — see causticsplat.h.fsl.
+//
+// ⚠ ONE SHADER FOR BOTH LAYERS. Ripple and wake differ ONLY in cbuffer contents: which field is
+// bound to gCausticDynField (a descriptor-set instance, not a branch), the integer stride/offset
+// into it, the slope gain, the slice base, and how many depth slices to loop. The slices are an
+// INNER loop and the dispatch is z=1, because slope and Hessian do not depend on depth — five field
+// taps serve every slice of the layer.
+
+#include "causticsplat.h.fsl"
+
+#define CAUSTICD_THREADS 8
+
+// The wave field's stored slope is dh per TEXEL and it is the NEGATIVE gradient: ripplenormal.comp
+// writes (hL - hR)*0.5, i.e. minus the central difference, because water.frag wants a normal's xy
+// directly. The refraction wants grad(h) itself, hence the sign here. Getting this backwards mirrors
+// the whole pattern about the disturbance, which is subtle enough on a splash and obvious on a wake.
+float2 causticDynSlope(int2 p, int grid, float texPerUnit, float gain)
+{
+    int2 c = int2(clamp(p.x, 0, grid - 1), clamp(p.y, 0, grid - 1));
+    float4 f = LoadTex2D(gCausticDynField, NO_SAMPLER, c, 0);
+    return -f.zw * (texPerUnit * gain);
+}
+
+ROOT_SIGNATURE(ComputeRootSignature)
+NUM_THREADS(CAUSTICD_THREADS, CAUSTICD_THREADS, 1)
+void CS_MAIN(SV_DispatchThreadID(uint3) did)
+{
+    INIT_MAIN;
+    // NB: every RETURN() MUST start its own line — fsl.py only rewrites a line-leading RETURN.
+    if (did.x >= (uint)CAUSTIC_RES || did.y >= (uint)CAUSTIC_RES) {
+        RETURN();
+    }
+
+    const int R = CAUSTIC_RES;
+
+    float upt    = max(gCausticParams.dynField.x, 1.0e-3f);   // field world units per texel
+    int   stride = max((int)gCausticParams.dynField.y, 1);    // field texels per destination texel
+    int2  off    = int2((int)gCausticParams.dynField.z, (int)gCausticParams.dynField.w);
+    uint  base   = (uint)gCausticParams.dynOut.x;
+    float gain   = gCausticParams.dynOut.y;
+    int   grid   = max((int)gCausticParams.dynOut.z, 2);
+    uint  span   = clamp((uint)gCausticParams.misc.w, 1u, 4u);
+    float cRef   = max(gCausticParams.wave.x, 1e-4f);
+    float sunTan = max(gCausticParams.wave.z, 0.0f);
+
+    float tpu     = 1.0f / upt;                      // FIELD texels per world unit
+    float toTexel = tpu / (float)stride;             // world units -> DESTINATION texels
+
+    // This cell's texel in the wave field. The destination lattice is a sub-lattice of the field's,
+    // which is what makes all five taps exact integer loads instead of bilinear fetches.
+    int2 ft = int2((int)did.x, (int)did.y) * stride + off;
+
+    // --- the surface: world slope and world Hessian, from five taps -----------------------------
+    // .zw is dh per FIELD texel, so a world slope needs texels-per-unit (water.frag:1152 makes the
+    // same conversion for the same reason). The Hessian is then a central difference of that slope
+    // over one field texel each way — the FINEST spacing available, which is what a fold needs.
+    float2 s0 = causticDynSlope(ft,                  grid, tpu, gain);
+    float2 sX = causticDynSlope(ft + int2( 1, 0),    grid, tpu, gain);
+    float2 sx = causticDynSlope(ft + int2(-1, 0),    grid, tpu, gain);
+    float2 sY = causticDynSlope(ft + int2( 0, 1),    grid, tpu, gain);
+    float2 sy = causticDynSlope(ft + int2( 0,-1),    grid, tpu, gain);
+
+    float Hxx = (sX.x - sx.x) * tpu * 0.5f;
+    float Hyy = (sY.y - sy.y) * tpu * 0.5f;
+    // SYMMETRISED. A Hessian is symmetric by construction but a sampled one is not, and the beam
+    // covariance below is formed as J*J on the assumption that it is — an asymmetric J would need a
+    // transpose that is not taken, so the ellipse would come out subtly wrong rather than loudly so.
+    float Hxy = ((sX.y - sx.y) + (sY.x - sy.x)) * tpu * 0.25f;
+
+    // The deepest slice bounds every shallower one (q is linear in depth), so one test in front of
+    // the loop rejects a calm cell for the whole layer.
+    float dMax = 0.0f;
+    for (uint dm = 0u; dm < span; ++dm) { dMax = max(dMax, gCausticParams.depths[dm]); }
+
+    float hMag  = max(abs(Hxx), max(abs(Hxy), abs(Hyy)));
+    float gMag  = length(s0);
+    float calmD = max(gCausticParams.dynCfg.x, 0.0f);
+    float calmH = max(gCausticParams.dynCfg.y, 0.0f);
+    if (gMag * cRef * dMax * toTexel < calmD && hMag * cRef * dMax < calmH) {
+        RETURN();
+    }
+
+    // One beam per destination texel, so sigma_src is the Gaussian standing for a UNIT cell: 0.5.
+    const float sigSrc2 = 0.25f;
+
+    for (uint sl = 0u; sl < span; ++sl)
+    {
+        float depth = gCausticParams.depths[sl];
+        float q     = cRef * depth;
+
+        // Per-slice calm test as well as the layer-wide one above: a shallow slice under a gentle
+        // ripple genuinely is the identity, and skipping it there is the difference between paying
+        // for one slice and paying for two.
+        if (gMag * q * toTexel < calmD && hMag * q < calmH) { continue; }
+
+        uint  slice = base + sl;
+        float sigSun  = depth * sunTan * toTexel;
+        float sigMin2 = sigSun * sigSun + 0.1089f;
+
+        // dst is in DESTINATION TEXELS and texel k sits at coordinate k, so the undisplaced beam
+        // lands exactly on its own texel — which is precisely what the prefill it is withdrawing
+        // represents.
+        float2 dst = float2((float)did.x, (float)did.y) + s0 * (q * toTexel);
+        float3 Jm  = float3(1.0f + q * Hxx, q * Hxy, 1.0f + q * Hyy);
+
+        uint wIdx = (slice * (uint)R + did.y) * (uint)R + did.x;
+        causticSplatBeam(dst, Jm, sigSrc2, sigMin2, (float)CAUSTIC_WFIX, slice, 0,
+                         wIdx, (uint)CAUSTIC_WFIX);
+    }
+    RETURN();
+}

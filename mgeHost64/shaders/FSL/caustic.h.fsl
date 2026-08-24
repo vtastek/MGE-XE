@@ -1,0 +1,61 @@
+// mgeHost64 — W23: the caustic map's SHAPE, shared by the generator and the consumer.
+//
+// Constants only, deliberately: caustic.srt.h declares the compute SRT and a colour frag must not
+// pull that in (one SRT per header, [[project_forge_srt_one_per_header]]), but both sides have to
+// agree on how many depth slices the array has or the consumer's slice index runs off the end. So
+// the two numbers that BOTH sides need live here and nothing else does.
+//
+// Mirrored host-side by kCausticRes / kCausticSlices in forgerender.cpp. Nothing can static_assert
+// across the FSL boundary, so the host logs the pair at creation and that log line is the check.
+#pragma once
+
+// 512 and not 256. At 256 over a 512-unit tile one texel is 2 units — and a texel 2 units across,
+// on a seabed 100 units away through a 935-pixel focal length, covers ~19 SCREEN pixels. That is
+// what "a bit low res" was: the map, not the pattern. Cost goes as RES^2 (the beam footprint is
+// scale-invariant in texels, so cells-per-splat does not move and only the splat COUNT does), which
+// is paid for by updating a subset of the depth slices each frame — see kCausticSlicesPerFrame.
+#ifndef CAUSTIC_RES
+#define CAUSTIC_RES    512
+#endif
+#ifndef CAUSTIC_SLICES
+#define CAUSTIC_SLICES 4
+#endif
+
+// ─── W24: THE DYNAMIC LAYERS' SLICES ────────────────────────────────────────────────────────────
+//
+// The same 512² array carries three layers, and they share one texture for one reason: seven slices
+// is one SRV, one UAV<->SRV barrier and one bindCausticField into all seven PerFrame sets, where
+// three textures would be three of each. Nothing else about them is shared — different source
+// grids, different world domains, different clear values.
+//
+// ⚠ THE STATIC SLICES MUST STAY AT 0..CAUSTIC_SLICES-1. The static generator round-robins its
+// cursor modulo CAUSTIC_SLICES and the consumer's log-depth index is pinned to that range, so the
+// dynamic layers are APPENDED above them and every static index is untouched. That is what makes
+// "dynamic strength 0 is pixel-identical to the pre-W24 build" a thing that can be checked.
+//
+// ⚠ AND THE ACCUMULATOR PLANES FOLLOW THE SAME INDEX. accum index = (slice*RES + y)*RES + x, so
+// growing the buffer from 4 planes to 7 cannot move a static entry. Only the tail is new.
+//
+// RIPPLE gets TWO depths because the near field is where the depth evolution is visible and where
+// the camera actually is (first person, swimming). WAKE gets ONE: wake wavelengths are 90-200 units
+// and do not fold until ~700-950 units of depth, so the whole playable range is PRE-FOCUS, where
+// the deviation is linear in depth and one reference slice scaled by depth is exact to first order.
+#ifndef CAUSTIC_RIPPLE_BASE
+#define CAUSTIC_RIPPLE_BASE   4
+#endif
+#ifndef CAUSTIC_RIPPLE_SLICES
+#define CAUSTIC_RIPPLE_SLICES 2
+#endif
+#ifndef CAUSTIC_WAKE_SLICE
+#define CAUSTIC_WAKE_SLICE    6
+#endif
+#ifndef CAUSTIC_TOTAL_SLICES
+#define CAUSTIC_TOTAL_SLICES  7
+#endif
+
+// The WAKE layer's single reference depth, in world units. Shared with the consumer, which scales
+// the deviation by depth/this — the reference cancels out of that ratio to first order, which is
+// exactly why one slice suffices and why this is a constant rather than a slider.
+#ifndef CAUSTIC_WAKE_DEPTH
+#define CAUSTIC_WAKE_DEPTH 256.0f
+#endif
