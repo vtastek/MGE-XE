@@ -462,11 +462,13 @@ STRUCT(ShadowMaskParams)
     // W23 — CAUSTICS (caustic.srt.h, consumed in waterLightTransmit).
     //   x = strength. 0 = the pre-W23 image exactly; the consumer's whole block is behind `x > 0`.
     //   y = 1 / tileWorldUnits, so the consumer multiplies rather than divides.
-    //   z,w = the LOG-depth slice map: sliceIndex = z*log2(depth) + w, clamped to [0, SLICES-1].
-    //       The slice depths are geometric (32/96/256/640), so a linear map would spend three
-    //       quarters of its range between the last two and jump through the shallow ones — which is
-    //       exactly where the depth evolution is fastest and most recognisable. Solved host-side
-    //       from the first and last slice depth so the two cannot disagree about the spacing.
+    //   z,w = the LOG-depth slice map: sliceIndex = z*log2(depth) + w, FADED (not clamped) outside
+    //       [0, SLICES-1]. The slice depths are geometric (W26: 32/80/200/500/1250), so a linear map
+    //       would spend three quarters of its range between the last two and jump through the
+    //       shallow ones — which is exactly where the depth evolution is fastest and most
+    //       recognisable. Solved host-side from the first and last slice depth so the two cannot
+    //       disagree about the spacing, which also means the ladder's TOP entry is where the static
+    //       caustics end: 3125 units (45 m) as of W26, where blue is down to 6% of the surface.
     // Appended after waterDistort for the reason every field down here carries: this cbuffer is
     // bound BY POINTER into every PerFrame set and each offset above is a host constant, so a field
     // inserted anywhere else moves a lane somebody reads by index.
@@ -485,11 +487,27 @@ STRUCT(ShadowMaskParams)
     //       -0.441x of this — the true (c_R-c_G)/(c_B-c_G), since n is not symmetric about green.
     //       Magnitude rides slopeRms host-side, so rougher water disperses more; the GAIN is an
     //       exaggeration by necessity, because the true 1.8% spread is under a tenth of a texel.
-    //   yzw = spare. (A consumer-side domain warp lived in y/z briefly, to hide the tile. It was
-    //         removed: hiding a repeat by shearing the lookup trades a periodic artefact for a
-    //         smeared one, and the smear was the worse of the two. The tile gets broken properly by
-    //         the DYNAMIC caustic layer instead — ripples and wakes splatted into a second,
-    //         camera-anchored map that has no period at all.)
+    //   y = W26 — the CAMERA-DISTANCE fade, as the FRACTION of max(lodParams.w, 4096) the caustics
+    //       fade out over: causticDistFrac * waterDistortFrac. The consumer rebuilds the distance
+    //       the way water.frag.fsl:768 does and fades over 0.5*dFar -> dFar.
+    //       ⚠ A FRACTION AND NOT A DISTANCE, ON PURPOSE. What hides the tiling layer's repeat is
+    //       water.frag's UV distortion, and that fades on exactly this schedule — so the caustic has
+    //       to end where the thing hiding it ends ("in the distance the caustics become apparent").
+    //       Publishing a baked distance would drift from it the moment nearViewRange moved; sharing
+    //       the fraction means the two expressions cannot disagree, and waterDistortFrac = 0 ("the
+    //       distortion is unbounded") reads correctly as "no caustic distance fade" as well.
+    //       0 therefore means NO FADE, not "faded out" — the consumer branches on dFar > 0.
+    //   z = W26 — the WAKE layer's max depth in world units (default CAUSTIC_WAKE_MAXDEPTH = 350,
+    //       i.e. 5 m); the deviation is scaled by min(depth, this)/CAUSTIC_WAKE_DEPTH and faded to
+    //       nothing over this -> 1.5x this.
+    //   w = W26 — the RIPPLE layer's max depth, same arrangement (default CAUSTIC_RIPPLE_MAXDEPTH =
+    //       70, i.e. 1 m). ⚠ BOTH ARE CLAMPED POSITIVE HOST-SIDE: the consumer's smoothstep(m, 1.5m,
+    //       depth) divides by 0.5*m, so a zero here would be a NaN on every submerged fragment.
+    //       (A consumer-side domain warp lived in y/z briefly, to hide the tile. It was removed:
+    //       hiding a repeat by shearing the lookup trades a periodic artefact for a smeared one, and
+    //       the smear was the worse of the two. The tile gets broken properly by the DYNAMIC caustic
+    //       layer instead — ripples and wakes splatted into a second, camera-anchored map that has
+    //       no period at all — and, since W26, by ENDING where the distortion that hides it ends.)
     // Appended after waterCaustic for the reason every field down here carries: this cbuffer is
     // bound BY POINTER into every PerFrame set and each offset above is a host constant, so a field
     // inserted anywhere else moves a lane somebody reads by index.
@@ -522,8 +540,30 @@ STRUCT(ShadowMaskParams)
     // ⚠ THE WAKE LAYER HAS NO SLICE MAP AND NEEDS NO LANE FOR ONE. It is generated at a single
     // reference depth (CAUSTIC_WAKE_DEPTH, shared with the host through caustic.h.fsl) because wake
     // wavelengths of 90-200 units do not fold until ~700-950 units of water: the whole playable
-    // range is PRE-FOCUS, where the deviation is LINEAR in depth. `dev * clamp(depth /
-    // CAUSTIC_WAKE_DEPTH, 0, 4)` is therefore exact to first order for one tap, and the reference
-    // depth cancels out of that expression — which is why it is a constant and not a knob.
+    // range is PRE-FOCUS, where the deviation is LINEAR in depth. `dev * depth /
+    // CAUSTIC_WAKE_DEPTH` is therefore exact to first order for one tap, and the reference depth
+    // cancels out of that expression — which is why it is a constant and not a knob.
+    //
+    // ⚠ W26: THE DEPTH SCALE IS WINDOWED, AND THE WINDOW LIVES IN waterCaustic2.z. What licenses
+    // "linear in depth" is being pre-focus, and that argument expires — past ~5 m the expression is
+    // amplifying a pattern stored at 256 units rather than describing the wake, which is what
+    // "looks aliased after 5 m" was. The old `clamp(..., 0, 4)` was not that bound: it only binds
+    // past 1024 units, so it let the deviation grow to 4x while the structure stayed put.
     DATA(float4,   waterCausticDyn,  None);
+    // ─── W26a — HOW DEEP THE CAUSTIC PATTERN PHYSICALLY SURVIVES ────────────────────────────────
+    // x = d0, world units: the consumer scales the composited deviation by exp(-(depth/d0)^1.27).
+    //     0 disarms the decay. yzw spare.
+    //
+    // ⚠ THIS IS THE ANSWER TO "CAUSTICS SHOULD REACH ANY DEPTH LIGHT REACHES", AND THE ANSWER IS
+    // THAT LIGHT AND STRUCTURE DO NOT REACH THE SAME DISTANCE. At the shipped extinction defaults a
+    // seabed at 806 units still gets 49% of the surface's blue light — but the light arriving there
+    // has been forward-scattered into a beam ~37 world units wide, and a pattern whose filaments are
+    // ~17 units across does not survive that. Measured contrast against an unblurred field: 53% at
+    // 200 units, 19% at 500, 10% at 800, 2% at 1250. The caustic is gone by ~800 units (11 m) in
+    // this water while the LIGHT goes on for another 40 m, and the two were being confused.
+    //
+    // d0 = (L / k)^(2/3), k = sqrt(sigma_s*<theta^2>/3) from the water model and L the pattern's own
+    // structure scale, which rides the caustic tile. Deriving it rather than tabling it is what
+    // makes the reach follow the water: raise the murk and the caustics stop shallower, on their own.
+    DATA(float4,   waterCaustic3,    None);
 };

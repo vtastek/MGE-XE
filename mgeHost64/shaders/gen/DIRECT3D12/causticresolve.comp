@@ -994,6 +994,7 @@ STRUCT(CausticParams)
 
     float4 cfg;
 
+
     float4 depths;
 
 
@@ -1004,9 +1005,9 @@ STRUCT(CausticParams)
 
 
     float4 wave;
-#line 177 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/caustic.srt.h"
+#line 178 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/caustic.srt.h"
     float4 misc;
-#line 192 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/caustic.srt.h"
+#line 193 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/caustic.srt.h"
     float4 dynField;
 
 
@@ -1025,7 +1026,11 @@ STRUCT(CausticParams)
 
 
     float4 dynCfg;
-#line 210
+#line 223 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/caustic.srt.h"
+    float4 depths2;
+#line 252 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/caustic.srt.h"
+    float4 medium;
+#line 253
 };
 
         CBUFFER(CausticParams) gCausticParams :  register(b0,space0);
@@ -1037,7 +1042,7 @@ STRUCT(CausticParams)
 
 
         RWTex2DArray(float) gCausticOut :  register(u2,space0);
-#line 238 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/caustic.srt.h"
+#line 281 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/caustic.srt.h"
         Tex2D(float4) gCausticDynField :  register(t3,space0);
 #line 40 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/causticresolve.comp.fsl"
 

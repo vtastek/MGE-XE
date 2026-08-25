@@ -148,7 +148,8 @@ STRUCT(CausticParams)
     // w = temporal EMA weight for the new frame (1 = none; the field is deterministic, so this is
     //     for hiding residual stepping, not for hiding noise)
     DATA(float4, cfg,    None);
-    // Per-slice depth in world units. CAUSTIC_SLICES entries used; the rest are ignored.
+    // Per-slice depth in world units. The FIRST FOUR; W26's fifth static slice lives in depths2 at
+    // the end of this struct, because a float4 holds four floats and this one is full.
     DATA(float4, depths, None);
     // x = c = 1 - 1/n at the reference wavelength (green). The ONLY place n enters the generator;
     //     red and blue are recovered by the consumer as a depth-axis offset (see the note above).
@@ -207,6 +208,48 @@ STRUCT(CausticParams)
     //     The BOOKKEEPING stays exact either way, which is what keeps the mean at 1.0.
     // zw = spare.
     DATA(float4, dynCfg,   None);
+    // ─── W26: SLICE DEPTHS 4..7 ─────────────────────────────────────────────────────────────────
+    // The static ladder grew to five entries and `depths` above holds four. APPENDED AT THE END for
+    // the reason the W24 block a few lines up states in full — every lane in this struct is written
+    // by a host expression that names it POSITIONALLY (cp[0]..cp[27]) and four descriptor-set
+    // instances share the layout, so an insertion anywhere else silently re-points one dispatch's
+    // parameters at another's. Putting the tail here also leaves room out to eight slices without a
+    // second layout change.
+    //
+    // ⚠ ONLY caustic.comp READS IT: `li < 4 ? depths[li] : depths2[li - 4]`. causticdyn.comp walks
+    // depths[0..span-1] with span <= 2 and causticresolve.comp reads no depth at all, so neither
+    // changes — but fillDyn must still ZERO these lanes, because a persistently-mapped cbuffer keeps
+    // whatever was last written to it.
+    DATA(float4, depths2,  None);
+    // ─── W26b: THE MEDIUM, AS A LOW-PASS ON THE SURFACE THIS SLICE IS CAST BY ───────────────────
+    // x = k in sigma_scat = k * depth^1.5, world units — the small-angle multiple-scattering width
+    //     of a pencil beam after `depth` of water, derived host-side from the water's OWN sigma_s.
+    //     yzw spare.
+    //
+    // ⚠ IT DAMPS THE SURFACE SPECTRUM, IT DOES NOT BLUR THE MAP, and the two are the same physics
+    // at the only place it is affordable. A beam that has spread to width sigma no longer samples a
+    // point of the surface, it samples an AVERAGE over sigma — and averaging a sinusoid of
+    // wavenumber K against a Gaussian of width sigma multiplies it by exp(-K^2*sigma^2/2), which is
+    // just that Gaussian's transform. So the per-component damp below IS the beam spread, applied
+    // where it costs one exp instead of a 44-texel convolution the splat kernel cannot reach
+    // (CAUSTIC_KERNEL_CAP is 6; that attempt cost 5x and delivered a 13-texel box).
+    //
+    // ⚠ EXACT PRE-FOLD, AND BETTER THAN EXACT PAST IT. While the map is x + c*D*grad(h) with a small
+    // displacement, structure scale is preserved, so damping the input and blurring the output are
+    // the same operation. Past folding they diverge — and there the source taper is the RIGHT one,
+    // because the fine components past their own fold depth contribute chaos, and this removes the
+    // chaos rather than smearing it afterwards.
+    //
+    // MEASURED, on the real 20-component field (pattern half-life at best lag; contrast with the
+    // model's lattice floor removed):
+    //     depth 200:  75 ms -> >900 ms,  contrast 0.69 -> 0.89
+    //     depth 300:  48 ms -> >900 ms,  contrast 0.50 -> 1.02
+    //     depth 500:  29 ms -> >900 ms,  contrast 0.35 -> 0.59
+    //     depth 800:  18 ms ->      --,  contrast 0.30 -> 0.00  (nothing survives, correctly)
+    // Calmer AND more legible, which is why it answers "animates too fast" and "loses its shape"
+    // with one term: what was there before was overlapping folded speckle from components whose
+    // caustics the water had already destroyed.
+    DATA(float4, medium,   None);
 };
 
 BEGIN_SRT(CausticSrtData)

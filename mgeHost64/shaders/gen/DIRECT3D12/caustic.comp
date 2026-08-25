@@ -996,6 +996,7 @@ STRUCT(CausticParams)
 
     float4 cfg;
 
+
     float4 depths;
 
 
@@ -1006,9 +1007,9 @@ STRUCT(CausticParams)
 
 
     float4 wave;
-#line 177 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/caustic.srt.h"
+#line 178 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/caustic.srt.h"
     float4 misc;
-#line 192 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/caustic.srt.h"
+#line 193 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/caustic.srt.h"
     float4 dynField;
 
 
@@ -1027,7 +1028,11 @@ STRUCT(CausticParams)
 
 
     float4 dynCfg;
-#line 210
+#line 223 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/caustic.srt.h"
+    float4 depths2;
+#line 252 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/caustic.srt.h"
+    float4 medium;
+#line 253
 };
 
         CBUFFER(CausticParams) gCausticParams :  register(b0,space0);
@@ -1039,7 +1044,7 @@ STRUCT(CausticParams)
 
 
         RWTex2DArray(float) gCausticOut :  register(u2,space0);
-#line 238 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/caustic.srt.h"
+#line 281 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/caustic.srt.h"
         Tex2D(float4) gCausticDynField :  register(t3,space0);
 #line 27 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/causticsplat.h.fsl"
 #line 65 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/causticsplat.h.fsl"
@@ -1124,7 +1129,7 @@ void CS_MAIN(uint3 did : SV_DISPATCHTHREADID)
     INIT_MAIN;
 
     if (did.x >= (uint) 512  || did.y >= (uint) 592
-        || did.z >= (uint) 4 ) {
+        || did.z >= (uint) 5 ) {
         return;
     }
 
@@ -1148,13 +1153,27 @@ void CS_MAIN(uint3 did : SV_DISPATCHTHREADID)
     float w0 = max(gCausticParams.misc.y, 1.0e-6f);
     float tileU = max(gCausticParams.cfg.y, 1.0f);
     int sub = (int)clamp(gCausticParams.cfg.z, 1.0f, 4.0f);
-    float depth = gCausticParams.depths[slice - (uint)gCausticParams.dynOut.x];
+
+
+
+
+
+
+    uint li = slice - (uint)gCausticParams.dynOut.x;
+    float depth = (li < 4u) ? gCausticParams.depths [li & 3u]
+                              : gCausticParams.depths2[li & 3u];
+
+
+    float scatK = max(gCausticParams.medium.x, 0.0f);
     float cRef = max(gCausticParams.wave.x, 1e-4f);
     float slope = max(gCausticParams.wave.y, 1e-4f);
     float sunTan = max(gCausticParams.wave.z, 0.0f);
 
     float toTexel = (float)R / tileU;
     float q = cRef * depth;
+
+
+    float sigScat = scatK * depth * sqrt(max(depth, 0.0f));
 
 
 
@@ -1191,9 +1210,7 @@ void CS_MAIN(uint3 did : SV_DISPATCHTHREADID)
     float sigSrc = 0.5f * (float)R * invSub
                   / sqrt((float) 512  * (float) 592 );
     float sigSrc2 = sigSrc * sigSrc;
-
-
-
+#line 141 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/caustic.comp.fsl"
     float sigSun = depth * sunTan * toTexel;
     float sigMin2 = sigSun * sigSun + 0.1089f;
 
@@ -1221,7 +1238,14 @@ void CS_MAIN(uint3 did : SV_DISPATCHTHREADID)
                 float ln = length(n);
                 float2 kd = n / ln;
                 float Kw =  6.28318531f  * ln / tileU;
-                float s = sNorm * W[i].z;
+
+
+
+
+
+
+                float ks = Kw * sigScat;
+                float s = sNorm * W[i].z * exp(-0.5f * ks * ks);
 
 
                 float om = round(sqrt( 686.0f  * Kw) * rate / w0) * w0;

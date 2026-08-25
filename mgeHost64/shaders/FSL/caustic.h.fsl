@@ -17,13 +17,36 @@
 #ifndef CAUSTIC_RES
 #define CAUSTIC_RES    512
 #endif
+// ⚠ W26: FIVE, AND THE FIFTH IS ABOUT REACH, NOT DETAIL. The consumer fades the deviation out one
+// slice past the last one, so the ladder's top entry IS where caustics stop — and with the W23
+// ladder that was 806 units (11.5 m), where the downwelling coefficient still delivers 49% of the
+// surface's blue light to the seabed. Caustics ending in the middle of plainly lit water is a hard
+// edge nothing in the physics asked for. The host ladder now runs 32..1250, so the fade-out lands
+// at 3125 units (45 m) where blue is down to 6%.
+//
+// ⚠ AND IT IS A FIFTH SLICE RATHER THAN A WIDER FOUR. Reaching 45 m on four slices needs 1.66-octave
+// spacing, and the deepest of those would sit at ~1000 units where the generator's own sun-disc blur
+// is still under a texel — i.e. a near-sharp pattern held out to 45 m, which is the "the pattern
+// stops evolving" failure the consumer's FADE-DO-NOT-CLAMP note already warns about wearing a
+// different hat. A real slice at 1250 is generated WITH its correct 1.1-texel softening.
+//
+// ⚠ COST IS NOT UNCHANGED, WHICH IS WHAT THIS COMMENT USED TO CLAIM. The dispatch is: n slices per
+// frame whatever the ladder's length, so only the round-robin PERIOD moves (2 -> 2.5 frames, ~1.25
+// texels of lag on the fastest component). But a DEEPER slice costs more to splat — the beam lands
+// c*D*grad(h) from its own cell, ~39 destination texels RMS at 1250 units against ~11 at 360, so
+// neighbouring threads scatter to unrelated cache lines and the accumulator's atomics stop
+// coalescing. The 13x13 kernel cap bounds the CELL COUNT and bounds nothing else. Measured with the
+// whole ladder rebuilt in one frame: 1.09 ms for 32/72/160/360, 3.14 ms for 32/80/200/500/1250, so
+// the shipping 2 slices/frame went 0.55 -> 1.26 ms. See kCausticDepths in forgerender.cpp for the
+// numbers, why `caustic=` in the heartbeat cannot see any of it, and where to buy it back.
+// The other price is one more 512² plane in the map and one in the accumulator.
 #ifndef CAUSTIC_SLICES
-#define CAUSTIC_SLICES 4
+#define CAUSTIC_SLICES 5
 #endif
 
 // ─── W24: THE DYNAMIC LAYERS' SLICES ────────────────────────────────────────────────────────────
 //
-// The same 512² array carries three layers, and they share one texture for one reason: seven slices
+// The same 512² array carries three layers, and they share one texture for one reason: eight slices
 // is one SRV, one UAV<->SRV barrier and one bindCausticField into all seven PerFrame sets, where
 // three textures would be three of each. Nothing else about them is shared — different source
 // grids, different world domains, different clear values.
@@ -34,23 +57,29 @@
 // "dynamic strength 0 is pixel-identical to the pre-W24 build" a thing that can be checked.
 //
 // ⚠ AND THE ACCUMULATOR PLANES FOLLOW THE SAME INDEX. accum index = (slice*RES + y)*RES + x, so
-// growing the buffer from 4 planes to 7 cannot move a static entry. Only the tail is new.
+// growing the buffer from 5 planes to 8 cannot move a static entry. Only the tail is new.
+//
+// ⚠ W26 MOVED THE DYNAMIC BASE, AND THAT IS THE COST OF INSERTING A STATIC SLICE — the invariant
+// above is "the static slices own 0..CAUSTIC_SLICES-1", not "the dynamic ones never move", so a
+// fifth static slice pushes ripple to 5..6 and wake to 7. Nothing has to be migrated: every plane
+// is rebuilt or re-primed by its own group's resolve before anything reads it, and the host's
+// static_asserts are written relatively so they keep checking the layout rather than the numbers.
 //
 // RIPPLE gets TWO depths because the near field is where the depth evolution is visible and where
 // the camera actually is (first person, swimming). WAKE gets ONE: wake wavelengths are 90-200 units
 // and do not fold until ~700-950 units of depth, so the whole playable range is PRE-FOCUS, where
 // the deviation is linear in depth and one reference slice scaled by depth is exact to first order.
 #ifndef CAUSTIC_RIPPLE_BASE
-#define CAUSTIC_RIPPLE_BASE   4
+#define CAUSTIC_RIPPLE_BASE   5
 #endif
 #ifndef CAUSTIC_RIPPLE_SLICES
 #define CAUSTIC_RIPPLE_SLICES 2
 #endif
 #ifndef CAUSTIC_WAKE_SLICE
-#define CAUSTIC_WAKE_SLICE    6
+#define CAUSTIC_WAKE_SLICE    7
 #endif
 #ifndef CAUSTIC_TOTAL_SLICES
-#define CAUSTIC_TOTAL_SLICES  7
+#define CAUSTIC_TOTAL_SLICES  8
 #endif
 
 // The WAKE layer's single reference depth, in world units. Shared with the consumer, which scales
@@ -58,4 +87,29 @@
 // exactly why one slice suffices and why this is a constant rather than a slider.
 #ifndef CAUSTIC_WAKE_DEPTH
 #define CAUSTIC_WAKE_DEPTH 256.0f
+#endif
+
+// ─── W26: HOW DEEP EACH DYNAMIC LAYER IS ALLOWED TO REACH, IN WORLD UNITS ───────────────────────
+//
+// ⚠ THESE ARE THE MODEL'S VALIDITY, NOT A LADDER'S END, and that is why they are world units rather
+// than the slice-index arithmetic they replace. The wake's deviation is scaled by depth on the
+// first-order argument that wake wavelengths (90-200 units) do not fold until ~700-950 units of
+// water — past ~5 m that stops being "linear in depth" and becomes an EXTRAPOLATION of a pattern
+// stored at 256 units, which is exactly what "looks aliased after 5 m" was reporting. A puddle
+// splash is smaller still: a ripple is 10-22 units of wavelength born by an actor's foot, and its
+// caustic has no business being legible a metre and a half down.
+//
+// 1 unit = 1.43 cm, so 350 = 5 m and 70 = 1 m. Each layer fades to nothing over the NEXT HALF of
+// its window (7.5 m / 1.5 m), so the window is ONE number and the fade follows it — see the consumer
+// in waterfog.h.fsl. Both are the DEFAULTS of host knobs (causticWakeMaxDepth /
+// causticRippleMaxDepth), which read these macros directly rather than mirroring them.
+//
+// ⚠ WATER SHALLOWER THAN THE WINDOW IS BIT-IDENTICAL. The wake's old `clamp(depth/256, 0, 4)` only
+// binds past 1024 units, and at 350 the expression already reads 1.367 — so this deletes the
+// 350->1024 growth region and nothing else. That region is precisely the range that was reported.
+#ifndef CAUSTIC_WAKE_MAXDEPTH
+#define CAUSTIC_WAKE_MAXDEPTH   350.0f
+#endif
+#ifndef CAUSTIC_RIPPLE_MAXDEPTH
+#define CAUSTIC_RIPPLE_MAXDEPTH 70.0f
 #endif

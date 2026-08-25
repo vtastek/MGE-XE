@@ -69,13 +69,27 @@ void CS_MAIN(SV_DispatchThreadID(uint3) did)
     float w0      = max(gCausticParams.misc.y, 1.0e-6f);
     float tileU   = max(gCausticParams.cfg.y, 1.0f);
     int   sub     = (int)clamp(gCausticParams.cfg.z, 1.0f, 4.0f);
-    float depth   = gCausticParams.depths[slice - (uint)gCausticParams.dynOut.x];
+    // W26: the ladder is FIVE entries and a float4 holds four, so the tail lives in `depths2`. The
+    // index is the slice's position WITHIN its group (which for the static group is the slice
+    // itself), and the split is a select rather than a branch — both sides are cbuffer loads with no
+    // side effect. ⚠ THE COMPONENT IS `li & 3`, NOT `li - 4`: a select evaluates both arms, and
+    // `li - 4u` on an unsigned li of 0 is 4294967292, which is an out-of-range vector subscript on
+    // the arm that is not taken. Masking is in range for every li this layout can produce (0..7).
+    uint  li      = slice - (uint)gCausticParams.dynOut.x;
+    float depth   = (li < 4u) ? gCausticParams.depths [li & 3u]
+                              : gCausticParams.depths2[li & 3u];
+    // W26b — the medium's beam spread at THIS slice's depth, world units. See caustic.srt.h: it
+    // enters as a low-pass on the surface spectrum, one exp per component, in the loop below.
+    float scatK   = max(gCausticParams.medium.x, 0.0f);
     float cRef    = max(gCausticParams.wave.x, 1e-4f);
     float slope   = max(gCausticParams.wave.y, 1e-4f);
     float sunTan  = max(gCausticParams.wave.z, 0.0f);
 
     float toTexel = (float)R / tileU;       // world units -> destination texels
     float q       = cRef * depth;           // the world length that multiplies grad and Hessian
+    // The beam's own width by the time it gets here. WORLD units, because it is compared against
+    // wavenumbers that are also per-world-unit.
+    float sigScat = scatK * depth * sqrt(max(depth, 0.0f));
 
     // Per-component slope amplitude. The weights are a taper, not a spectrum; dividing by
     // sqrt(0.5 * sum(w^2)) = 2.61265 makes the RMS of the summed slope field come out at exactly
@@ -115,6 +129,15 @@ void CS_MAIN(SV_DispatchThreadID(uint3) did)
 
     // The floor on every beam: the sun's angular radius carried down `depth` of water, plus a third
     // of a texel so a perfect focus is still representable on this grid.
+    //
+    // ⚠ THE MEDIUM'S OWN BEAM SPREAD IS NOT HERE, AND IT WAS TRIED HERE FIRST. Forward scattering
+    // widens a beam as depth^1.5 and is the only blur that outgrows the refraction displacement, so
+    // it belongs in this sum on paper — but CAUSTIC_KERNEL_CAP is 6 texels of half-extent, and the
+    // spread wants 44 at the bottom of the ladder. A sigma the kernel cannot cover is renormalised
+    // over the 13x13 it CAN, which turns a 44-texel Gaussian into a 13-texel BOX: it cost 5x and
+    // still left the deepest slice with a 16 ms half-life. Widening the cap is r^2. What the spread
+    // actually does to a mean-1 field is take CONTRAST out of it, and contrast is a scalar the
+    // consumer can apply for free — so it lives in waterfog.h.fsl as a depth decay instead.
     float sigSun  = depth * sunTan * toTexel;
     float sigMin2 = sigSun * sigSun + 0.1089f;
 
@@ -142,7 +165,14 @@ void CS_MAIN(SV_DispatchThreadID(uint3) did)
                 float  ln  = length(n);
                 float2 kd  = n / ln;                          // unit direction
                 float  Kw  = CAUSTIC_TWOPI * ln / tileU;      // WORLD wavenumber, 1/unit
-                float  s   = sNorm * W[i].z;                  // slope amplitude, dimensionless
+                // ⚠ W26b — DAMPED BY WHAT THE BEAM CAN STILL RESOLVE, AND DELIBERATELY NOT
+                // RENORMALISED. exp(-K^2*sigma^2/2) is the beam's own footprint seen in Fourier;
+                // restoring the lost RMS afterwards would push the fine components' energy into the
+                // coarse ones and put back exactly the structure this is removing. The slope knob
+                // therefore means what it says AT THE SURFACE and less with depth, which is the
+                // physical statement, not a drift.
+                float  ks  = Kw * sigScat;
+                float  s   = sNorm * W[i].z * exp(-0.5f * ks * ks);
                 // Deep-water dispersion, snapped to a whole number of cycles over the host's time
                 // wrap so the wrap cannot show. Half a step of rounding = 0.9-1.6% on these omegas.
                 float  om  = round(sqrt(CAUSTIC_GRAV * Kw) * rate / w0) * w0;

@@ -391,8 +391,54 @@ void waterLightTransmit(float3 worldPosRel, out float3 tSun, out float3 tAmb)
     // ⚠ +1 BECAUSE THE MAP STORES (gain - 1). Unbound reads ZERO, and for a term that MULTIPLIES the
     // sun, zero would mean darkness rather than "off" — five of the seven PerFrame sets that shade
     // submerged geometry do not bind it. See the lane note in opaque.srt.h.
+    //
+    // ⚠ W26 — AND IT ALSO FADES WITH CAMERA DISTANCE, ON THE SURFACE DISTORTION'S OWN SCHEDULE.
+    // "Refraction distortion hides the repetitiveness of the caustics, so in the distance the
+    // caustics become apparent." That is exactly right and it names its own fix: the thing that
+    // breaks up the tiling layer's repeat is water.frag's UV distortion, which fades out over
+    // 0.5*distortFar -> distortFar (water.frag.fsl:768). Past that the warp is gone and the tile is
+    // naked, so the caustic has to end where the thing hiding it ends.
+    //
+    // ⚠ REBUILT FROM THE SAME TWO INPUTS, NOT PUBLISHED AS A DISTANCE. distortFar is
+    // waterDistortFrac * max(lodParams.w, 4096) and lodParams.w is nearViewRange, which moves with
+    // the user's view distance — a distance baked host-side would drift the moment that changed.
+    // waterCaustic2.y carries the FRACTION (causticDistFrac * waterDistortFrac), so the two
+    // expressions cannot disagree, and waterDistortFrac = 0 — "the distortion is unbounded" —
+    // correctly reads here as "no caustic distance fade" rather than as "no caustics".
+    //
+    // ⚠ HOISTED ABOVE THE BLOCK BECAUSE IT IS ALSO A PERF WIN. Folding it into the gate skips 3-9
+    // texture taps per fragment on every submerged surface past distortFar, which today pays for
+    // caustics nobody can resolve at that distance anyway.
     float causStr = gShadowParams.waterCaustic.x;
-    if (causStr > 0.0f) {
+    float dFar    = gShadowParams.waterCaustic2.y * max(gFrameData.lodParams.w, 4096.0f);
+    float dfade   = (dFar > 0.0f)
+                        ? 1.0f - smoothstep(0.5f * dFar, dFar, length(worldPosRel))
+                        : 1.0f;
+    // ⚠ W26a — THE MEDIUM'S OWN DEPTH DECAY, AND IT IS NOT A LADDER FADE. Forward scattering
+    // spreads a beam as depth^1.5 while the refraction displacement it has to compete with only
+    // grows as depth^1, so past some depth the pattern is blurred faster than it is created and its
+    // CONTRAST collapses — which is the real reason caustics do not follow a diver down. Nothing in
+    // the generator modelled that: its only depth-dependent blur was the sun disc, which grows as
+    // depth^1 too, so the map was as sharp at 1250 units as at 32 and the deepest slice's pattern
+    // had a half-life of 6.4 ms, under a frame. That is what "animates too fast and loses its
+    // shape" was: a temporal alias, not a look.
+    //
+    // It belongs HERE and not in the splat because a blur of a mean-1 field only ever takes
+    // CONTRAST out of it, and contrast is one scalar on the deviation — where the same physics in
+    // the beam kernel wants a 44-texel sigma that CAUSTIC_KERNEL_CAP (6) cannot cover, costs 5x and
+    // still leaves a 13-texel box. Measured against the blurred field, the surviving contrast fits
+    // exp(-(depth/d0)^1.27) to within a few percent from 32 to 1800 units. The exponent is 1.27 and
+    // not the 3 a single-scale field would give because this field has a BROAD spectrum: the blur
+    // eats the filaments first and the coarse dapple last.
+    //
+    // d0 is published from the water's OWN sigma_s, so murkier water loses its caustics shallower
+    // and clear water keeps them deeper, with no second ladder to keep in step. 0 disarms it.
+    float cd0    = gShadowParams.waterCaustic3.x;
+    // ⚠ max(depth, 0) IS LOAD-BEARING: pow() of a negative base is NaN, and a NaN here would
+    // multiply sunlight on every submerged fragment and survive any later multiply by zero
+    // ([[project_nan_survives_zero_multiply]]), so no strength knob could clear it.
+    float cdecay = (cd0 > 0.0f) ? exp(-pow(max(depth, 0.0f) / cd0, 1.27f)) : 1.0f;
+    if (causStr * dfade * cdecay > 0.0f) {
         // WORLD-ANCHORED, like every other field in this renderer: the frame is camera-relative and
         // lodEye is the real absolute eye, so without this the caustics swim with the camera. Same
         // conversion water.frag makes for its wave field.
@@ -491,12 +537,54 @@ void waterLightTransmit(float3 worldPosRel, out float3 tSun, out float3 tAmb)
             // +0.00921 at 656/589/486 nm, so red's offset is -0.441x blue's, not -1x. The host
             // publishes blue's; red takes the ratio. Getting this symmetric would put the green
             // channel off-centre in the fringe and read as a tint rather than a spectrum.
-            float2 duv = bearing * (gShadowParams.waterCaustic2.x * depth);
+            // ⚠⚠ W26c — THE FRINGE IS A GRADIENT EXTRAPOLATION, NOT THREE WIDE TAPS, AND THE
+            // DIFFERENCE IS WHY NO GAIN EVER LOOKED RIGHT. Sampling the map at three offsets makes
+            // the fringe's AMPLITUDE and its CLEANLINESS the same knob, and they want opposite
+            // things:
+            //
+            //   * small offset  -> the three taps are 0.90-1.00 correlated, so they return nearly
+            //                      the same number and the result is WHITE. ("at 4 more like
+            //                      whitish")
+            //   * large offset  -> the taps run past the map's own correlation length (~6-8 texels)
+            //                      and stop describing one filament. Measured at gain 20: the R->B
+            //                      span is 3.3 texels at depth 200 but 13.3 at depth 800, where the
+            //                      taps correlate at -0.14 and only 42% of the colour variance
+            //                      still tracks the local gradient. The rest is chromatic noise.
+            //                      ("at 20 it looked green and blue")
+            //
+            // ⚠ AND THE SPAN SCALES WITH DEPTH, so there is no gain that is right for the ladder:
+            // whatever value makes the shallow slices show a fringe makes the deep ones splotchy.
+            // The lopsided hue was the last tell — R sits at -0.4409*duv and B at +duv, so R stays
+            // glued to G while B decorrelates first, and the colour swings on a yellow<->blue axis
+            // instead of through a spectrum.
+            //
+            // So: probe the map at a FIXED, well-conditioned distance, take the directional
+            // derivative, and extrapolate the channels off it. The requested offset then scales the
+            // colour without ever moving a tap, so `b - r` is proportional to the local gradient BY
+            // CONSTRUCTION at every depth and every gain — one side of a filament is blue and the
+            // other red, always, which is the gradient that was missing. Still three taps.
+            float2 duv  = bearing * (gShadowParams.waterCaustic2.x * depth);
+            float  want = length(duv);
             float3 dev;
-            if (dot(duv, duv) > 1.0e-14f) {
-                dev.r = causticFetch(uv - 0.4409f * duv, s0, s1, sf);
-                dev.g = causticFetch(uv,                 s0, s1, sf);
-                dev.b = causticFetch(uv + duv,           s0, s1, sf);
+            if (want > 1.0e-9f) {
+                // One texel. Far enough that the difference is well above R16F quantisation, close
+                // enough that the two probes stay on the same filament (0.93 correlated at the
+                // middle slice) — which is the whole point of not letting the gain move them.
+                float2 pv = (duv / want) * (1.0f / (float)CAUSTIC_RES);
+                float  g0 = causticFetch(uv,      s0, s1, sf);
+                float  gp = causticFetch(uv + pv, s0, s1, sf);
+                float  gm = causticFetch(uv - pv, s0, s1, sf);
+                // Central difference: mean ZERO over the tile, which is what keeps each channel's
+                // mean at 1.0 the way three independent samples of a mean-1 field did.
+                float  sw = 0.5f * (gp - gm) * (want * (float)CAUSTIC_RES);
+                // ⚠ THE MAP STORES (gain - 1), SO THE GAIN FLOOR IS dev = -1. An extrapolation is
+                // unbounded by nature and a hard gain would otherwise drive a channel to negative
+                // light. Clamping the SWING (not the channels) keeps the red:blue ratio exact.
+                float  maxSw = 0.9f * (1.0f + g0);
+                sw = clamp(sw, -maxSw, maxSw);
+                dev.g = g0;
+                dev.b = g0 + sw;
+                dev.r = g0 - 0.4409f * sw;
             } else {
                 // Gain 0. A uniform branch is not free ([[project_forge_uniform_branch_is_not_free]])
                 // but this one is coherent across the whole draw and saves two thirds of the taps.
@@ -537,8 +625,21 @@ void waterLightTransmit(float3 worldPosRel, out float3 tSun, out float3 tAmb)
                 // FADE THE DEVIATION, DO NOT CLAMP THE INDEX — the same bug the static ladder had
                 // once. Clamping pins the pattern at the last slice instead of ending it; fading the
                 // sample walks the gain toward 1, which adds and removes no light anywhere.
+                //
+                // ⚠ W26: THE UPPER FADE IS A WORLD WINDOW NOW, NOT AN INDEX ONE. The two are not the
+                // same question and only one of them was ever asked: "1 m is more than enough" for a
+                // rain ripple is a statement about the DISTURBANCE, and the index fade answered
+                // "where does the ladder run out", which reached 599 units (8.6 m) for a puddle
+                // splash. z carries the window (default 70 = 1 m) and the fade runs over the next
+                // half of it, so this is gone by 1.5 m.
+                //
+                // ⚠ AND THE SHALLOW FADE-IN STAYS AN INDEX FADE, deliberately. It is about the
+                // ladder's BOTTOM — water thinner than the first slice, where the layer has nothing
+                // to interpolate from — which is a different question again. Two fades doing one job
+                // is how a calibration stops being falsifiable; these do two jobs.
+                float rMax = gShadowParams.waterCaustic2.w;
                 float rf = saturate(rIdx + 1.0f)
-                         * (1.0f - saturate(rIdx - (float)(CAUSTIC_RIPPLE_SLICES - 1)));
+                         * (1.0f - smoothstep(rMax, 1.5f * rMax, depth));
                 if (rf > 0.0f) {
                     float r0 = clamp(floor(rIdx), 0.0f, (float)(CAUSTIC_RIPPLE_SLICES - 1));
                     float r1 = min(r0 + 1.0f, (float)(CAUSTIC_RIPPLE_SLICES - 1));
@@ -553,8 +654,18 @@ void waterLightTransmit(float3 worldPosRel, out float3 tSun, out float3 tAmb)
         // WAKE — ONE slice, scaled by depth. Wake wavelengths of 90-200 units do not fold until
         // ~700-950 units of water, so the whole playable range is pre-focus and the deviation is
         // LINEAR in depth: one tap times depth/CAUSTIC_WAKE_DEPTH is exact to first order where a
-        // second slice would buy nothing. Capped at 4x so a freak depth cannot extrapolate a linear
-        // model past the fold it does not model.
+        // second slice would buy nothing.
+        //
+        // ⚠ W26: THE CAP BECAME A WINDOW, AND THE OLD ONE WAS NOT A MODEL BOUND. `clamp(depth/256,
+        // 0, 4)` only binds past 1024 units, so between ~5 m and ~15 m a pattern stored at 256 units
+        // was being amplified up to 4x and then held there forever — the deviation grew while the
+        // structure did not, which is what "looks aliased after 5 m" was. What the first-order
+        // argument actually licenses is a WINDOW: inside it, scale by depth; past it, stop. z
+        // carries the window (default 350 = 5 m) and the fade runs over the next half of it.
+        //
+        // ⚠ WATER SHALLOWER THAN THE WINDOW IS BIT-IDENTICAL — min() is the identity below wMax and
+        // smoothstep is exactly 0 there, so this deletes the 350->1024 growth region and nothing
+        // else. That is precisely the range that was reported.
         float wakeStr = gShadowParams.waterCausticDyn.y;
         if (wakeStr > 0.0f) {
             float2 wuv = (dynPos - gShadowParams.waterCausticWake.xy)
@@ -562,12 +673,19 @@ void waterLightTransmit(float3 worldPosRel, out float3 tSun, out float3 tAmb)
             float wedge = causticDynEdge(wuv);
             if (wedge > 0.0f) {
                 float wd = causticDynFetch(wuv, (float)CAUSTIC_WAKE_SLICE);
-                float wscale = clamp(depth * (1.0f / CAUSTIC_WAKE_DEPTH), 0.0f, 4.0f);
+                float wMax = gShadowParams.waterCaustic2.z;
+                float wscale = min(depth, wMax) * (1.0f / CAUSTIC_WAKE_DEPTH)
+                             * (1.0f - smoothstep(wMax, 1.5f * wMax, depth));
                 caustic *= 1.0f + wd * (wedge * wakeStr * wscale);
             }
         }
 
-        tSun *= lerp(float3(1.0f, 1.0f, 1.0f), caustic, saturate(causStr));
+        // ⚠ W26: THE DISTANCE FADE IS APPLIED ONCE, HERE, AND IT SCALES THE COMPOSITE'S DEVIATION.
+        // Same reason every other fade in this block scales the deviation rather than the index or
+        // the strength: `lerp(1, caustic, t)` walks the GAIN to 1, so the fade adds and removes no
+        // light at any distance, and the mean-1 contract the whole map is built on survives it. All
+        // three layers ride it together, which is correct — they are hidden by the same distortion.
+        tSun *= lerp(float3(1.0f, 1.0f, 1.0f), caustic, saturate(causStr) * dfade * cdecay);
     }
 }
 
