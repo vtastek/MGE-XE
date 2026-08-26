@@ -79,6 +79,29 @@ void CS_MAIN(SV_DispatchThreadID(uint3) did)
     uint  span   = clamp((uint)gCausticParams.misc.w, 1u, 4u);
     float cRef   = max(gCausticParams.wave.x, 1e-4f);
     float sunTan = max(gCausticParams.wave.z, 0.0f);
+    // W27b — the SOURCE low-pass, in FIELD texels. See the Hxx/Hyy/Hxy block below; the host note on
+    // g_causticDynHess carries the derivation. gCausticParams.medium.x is deliberately NOT read
+    // here — W27 tried the medium's spread as a kernel widening and it made the layers dark rather
+    // than soft (forgerender.cpp, fillDyn). A caustic must be low-passed at its SOURCE or not at all.
+    int hm = clamp((int)gCausticParams.dynOut.w, 1, 4);
+    // ─── W29: SUB-BEAMS, THE REFERENCE'S OWN ANSWER TO VISIBLE ELLIPSES ─────────────────────────
+    // Job Talle's caustic write-up (the technique this file implements) states the failure mode
+    // exactly: "At low splat counts, the ellipses become visible... increasing the number of splats
+    // makes the ellipses disappear in the pattern they create", and "I don't cast them from a square
+    // grid, but rather from a hexagonal grid... it makes the gaps between the landed ellipses
+    // smaller."
+    //
+    // ⚠ THIS LAYER WAS RUNNING AT BOTH OF THOSE WORST CASES AT ONCE, and not by accident. The static
+    // map casts 512x592 HEX source cells into 512x512 texels — 1.156 beams per texel, staggered. This
+    // one cast 512x512 SQUARE — exactly 1.000 per texel, aligned — because that 1:1 lattice is the
+    // PRECONDITION for the identity prefill that makes calm water free. The optimisation bought its
+    // speed with the one parameter the reference says controls whether you can see the ellipses.
+    //
+    // Sub-beams buy the density back without giving up the prefill: the cell still owns exactly
+    // CAUSTIC_WFIX of weight and still withdraws it exactly once, it is simply delivered by N smaller
+    // beams spread across the cell instead of one at its centre. Calm cells are untouched — they
+    // early-out above and never reach this.
+    uint  nSub = clamp((uint)gCausticParams.cfg.z, 1u, 4u);
 
     float tpu     = 1.0f / upt;                      // FIELD texels per world unit
     float toTexel = tpu / (float)stride;             // world units -> DESTINATION texels
@@ -90,22 +113,46 @@ void CS_MAIN(SV_DispatchThreadID(uint3) did)
     // --- the surface: world slope and world Hessian, from five taps -----------------------------
     // .zw is dh per FIELD texel, so a world slope needs texels-per-unit (water.frag:1152 makes the
     // same conversion for the same reason). The Hessian is then a central difference of that slope
-    // over one field texel each way — the FINEST spacing available, which is what a fold needs.
+    // over `hm` field texels each way.
+    //
+    // ⚠⚠ hm IS THE NOISE KNOB, AND +-1 IS NOT "THE FINEST SPACING AVAILABLE, WHICH IS WHAT A FOLD
+    // NEEDS" — that was W24's note and it is the bug. A +-m second difference has response
+    // |2-2cos(m*k*dx)|/(m*dx)^2, which at m=1 rises MONOTONICALLY with k and peaks at the wave
+    // grid's own Nyquist. So the Hessian is dominated by whatever sits at grid scale, and q*H with
+    // q = c*D = 64 turns that into per-texel speckle no destination resolution can fix. m=2 is zero
+    // at that mode EXACTLY and passes the wake's 11-25 texel wavelengths at 90-98%.
+    //
+    // ⚠ THE SLOPE TAP IS NOT WIDENED, ONLY THE STENCIL. s0 is a direct load and carries the
+    // refraction's displacement; widening it would smear the pattern's POSITION, which is a
+    // different and worse thing than declining to measure its curvature at grid scale.
     float2 s0 = causticDynSlope(ft,                  grid, tpu, gain);
-    float2 sX = causticDynSlope(ft + int2( 1, 0),    grid, tpu, gain);
-    float2 sx = causticDynSlope(ft + int2(-1, 0),    grid, tpu, gain);
-    float2 sY = causticDynSlope(ft + int2( 0, 1),    grid, tpu, gain);
-    float2 sy = causticDynSlope(ft + int2( 0,-1),    grid, tpu, gain);
+    float2 sX = causticDynSlope(ft + int2( hm, 0),   grid, tpu, gain);
+    float2 sx = causticDynSlope(ft + int2(-hm, 0),   grid, tpu, gain);
+    float2 sY = causticDynSlope(ft + int2( 0, hm),   grid, tpu, gain);
+    float2 sy = causticDynSlope(ft + int2( 0,-hm),   grid, tpu, gain);
 
-    float Hxx = (sX.x - sx.x) * tpu * 0.5f;
-    float Hyy = (sY.y - sy.y) * tpu * 0.5f;
+    // ⚠ THE 1/(2*hm) IS NOT OPTIONAL. A central difference is (f(+m) - f(-m)) / (2*m*dx); dropping
+    // the m would scale the whole Hessian by hm and move every fold depth with the stencil width,
+    // so the knob would read as a strength slider and get blamed for the wrong thing.
+    float hnorm = tpu * 0.5f / (float)hm;
+    float Hxx = (sX.x - sx.x) * hnorm;
+    float Hyy = (sY.y - sy.y) * hnorm;
     // SYMMETRISED. A Hessian is symmetric by construction but a sampled one is not, and the beam
     // covariance below is formed as J*J on the assumption that it is — an asymmetric J would need a
     // transpose that is not taken, so the ellipse would come out subtly wrong rather than loudly so.
-    float Hxy = ((sX.y - sx.y) + (sY.x - sy.x)) * tpu * 0.25f;
+    float Hxy = ((sX.y - sx.y) + (sY.x - sy.x)) * (hnorm * 0.5f);
 
-    // The deepest slice bounds every shallower one (q is linear in depth), so one test in front of
-    // the loop rejects a calm cell for the whole layer.
+    // The CALM EARLY-OUT. The deepest slice bounds every shallower one (q is linear in depth), so
+    // one test in front of the loop rejects a calm cell for the whole layer.
+    //
+    // ⚠⚠ DEFAULT-OFF (calmD = calmH = 0), AND IT IS UNSOUND AT ANY NONZERO VALUE. Skipping keeps
+    // the texel's identity prefill, which is a DELTA; splatting spreads over the kernel floor
+    // sigSrc2 + sigMin2 and leaves only 45-58% at home even at zero displacement with J = I. Both
+    // uniform populations sum to exactly 1.0, so the error is a STEP at every calm/splat BOUNDARY —
+    // 0.83 | 1.17 across a straight edge, 0.45 with a 1.11 halo for a lone splatter. A decaying
+    // ripple ring is nothing but boundary, which is why this read as beading at the fade. See
+    // forgerender.cpp g_causticCalmDisp for the full derivation; the knobs survive only to price
+    // the early-out (+0.20 ms to run every beam).
     float dMax = 0.0f;
     for (uint dm = 0u; dm < span; ++dm) { dMax = max(dMax, gCausticParams.depths[dm]); }
 
@@ -125,24 +172,53 @@ void CS_MAIN(SV_DispatchThreadID(uint3) did)
         float depth = gCausticParams.depths[sl];
         float q     = cRef * depth;
 
-        // Per-slice calm test as well as the layer-wide one above: a shallow slice under a gentle
-        // ripple genuinely is the identity, and skipping it there is the difference between paying
-        // for one slice and paying for two.
+        // Per-slice calm test, same contract and same caveat as the layer-wide one above: it buys
+        // one slice instead of two over calm water, and it beads at the boundary for exactly the
+        // same reason, so it is off by default with it.
         if (gMag * q * toTexel < calmD && hMag * q < calmH) { continue; }
 
         uint  slice = base + sl;
         float sigSun  = depth * sunTan * toTexel;
         float sigMin2 = sigSun * sigSun + 0.1089f;
 
-        // dst is in DESTINATION TEXELS and texel k sits at coordinate k, so the undisplaced beam
-        // lands exactly on its own texel — which is precisely what the prefill it is withdrawing
-        // represents.
-        float2 dst = float2((float)did.x, (float)did.y) + s0 * (q * toTexel);
-        float3 Jm  = float3(1.0f + q * Hxx, q * Hxy, 1.0f + q * Hyy);
+        // dst is in DESTINATION TEXELS and texel k sits at coordinate k, so an undisplaced beam born
+        // at the cell centre lands exactly on its own texel — which is what the prefill it withdraws
+        // represents. The sub-beams below are born spread ACROSS that cell instead.
+        float2 base2 = float2((float)did.x, (float)did.y) + s0 * (q * toTexel);
+        float3 Jm    = float3(1.0f + q * Hxx, q * Hxy, 1.0f + q * Hyy);
+        uint   wIdx  = (slice * (uint)R + did.y) * (uint)R + did.x;
 
-        uint wIdx = (slice * (uint)R + did.y) * (uint)R + did.x;
-        causticSplatBeam(dst, Jm, sigSrc2, sigMin2, (float)CAUSTIC_WFIX, slice, 0,
-                         wIdx, (uint)CAUSTIC_WFIX);
+        // ⚠ WEIGHT IS SPLIT, NOT REPEATED. N sub-beams of CAUSTIC_WFIX/N sum to exactly the weight
+        // this cell has always owned, so the mean-1 contract is untouched at any N — and the prefill
+        // is withdrawn ONCE (on sub-beam 0), because there is still only one prefill to take back.
+        // ⚠ AND sigSrc IS SPLIT WITH IT: a beam standing for 1/N of a unit cell has 1/N the area and
+        // therefore 1/N the variance, so sigSrc2 goes 0.25 -> 0.25/N. Leaving it at 0.25 would make N
+        // sub-beams N times as wide in total as the one they replace — a blur, not more samples.
+        float wSub  = (float)CAUSTIC_WFIX / (float)nSub;
+        float ssub2 = sigSrc2 / (float)nSub;
+
+        // ⚠ HEX, NOT A FINER SQUARE GRID. Sub-beams on a regular sub-lattice would just reproduce the
+        // same aligned-gap problem one level down. Odd destination ROWS are shifted half a sub-step,
+        // which is the row stagger that makes the union of all births a triangular lattice — the
+        // hexagonal casting the reference credits for closing the gaps (and the same sqrt(3)/2 idea
+        // the static map's 512x592 source encodes).
+        float rowHex = ((did.y & 1u) != 0u) ? 0.5f : 0.0f;
+
+        LOOP for (uint sb = 0u; sb < nSub; ++sb)
+        {
+            // N points on a ring inside the cell, plus the row stagger. r = 0.26 keeps every birth
+            // inside its own texel (|off| <= 0.26 + 0.13 < 0.5) so no cell ever donates weight to a
+            // neighbour's bookkeeping.
+            float2 off = float2(0.0f, 0.0f);
+            if (nSub > 1u) {
+                float ang = 6.28318531f * ((float)sb + 0.5f) / (float)nSub;
+                off = float2(cos(ang), sin(ang)) * 0.26f;
+            }
+            off.x += rowHex * 0.26f;
+
+            causticSplatBeam(base2 + off, Jm, ssub2, sigMin2, wSub, slice, 0,
+                             wIdx, (sb == 0u) ? (uint)CAUSTIC_WFIX : 0u);
+        }
     }
     RETURN();
 }

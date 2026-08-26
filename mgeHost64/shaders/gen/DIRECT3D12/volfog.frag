@@ -1150,9 +1150,11 @@ STRUCT(ShadowMaskParams)
     float4 waterCausticWake;
 #line 552 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
     float4 waterCausticDyn;
-#line 568 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
+#line 573 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
     float4 waterCaustic3;
-#line 569
+#line 586 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
+    float4 waterCut;
+#line 587
 };
 #line 21 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
 #line 27 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
@@ -2023,12 +2025,12 @@ void waterLightTransmit(float3 worldPosRel, out float3 tSun, out float3 tAmb)
 #line 507 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/waterfog.h.fsl"
         float fade = saturate(sIdx + 1.0f)
                     * (1.0f - saturate(sIdx - (float)( 5  - 1)));
-
-        if (fade > 0.0f) {
+#line 521 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/waterfog.h.fsl"
+        if (fade > 0.0f && gShadowParams.waterCaustic3.y > 0.0f) {
             float s0 = clamp(floor(sIdx), 0.0f, (float)( 5  - 1));
             float s1 = min(s0 + 1.0f, (float)( 5  - 1));
             float sf = saturate(sIdx - s0);
-#line 566 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/waterfog.h.fsl"
+#line 577 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/waterfog.h.fsl"
             float2 duv = bearing * (gShadowParams.waterCaustic2.x * depth);
             float want = length(duv);
             float3 dev;
@@ -2061,7 +2063,7 @@ void waterLightTransmit(float3 worldPosRel, out float3 tSun, out float3 tAmb)
 
             caustic = 1.0f + dev * fade;
         }
-#line 613 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/waterfog.h.fsl"
+#line 624 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/waterfog.h.fsl"
         float2 dynPos = worldPosRel.xy + shift;
 
 
@@ -2074,7 +2076,7 @@ void waterLightTransmit(float3 worldPosRel, out float3 tSun, out float3 tAmb)
             if (redge > 0.0f) {
                 float rIdx = gShadowParams.waterCausticDyn.z * log2(max(depth, 1.0f))
                            + gShadowParams.waterCausticDyn.w;
-#line 640 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/waterfog.h.fsl"
+#line 651 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/waterfog.h.fsl"
                 float rMax = gShadowParams.waterCaustic2.w;
                 float rf = saturate(rIdx + 1.0f)
                          * (1.0f - smoothstep(rMax, 1.5f * rMax, depth));
@@ -2084,11 +2086,21 @@ void waterLightTransmit(float3 worldPosRel, out float3 tSun, out float3 tAmb)
                     float rd = lerp(causticDynFetch(ruv, (float) 5  + r0),
                                     causticDynFetch(ruv, (float) 5  + r1),
                                     saturate(rIdx - r0));
-                    caustic *= 1.0f + rd * (rf * redge * ripStr);
+
+
+
+
+
+
+
+
+
+
+                    caustic *= max(1.0f + rd * (rf * redge * ripStr), 0.0f);
                 }
             }
         }
-#line 669 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/waterfog.h.fsl"
+#line 690 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/waterfog.h.fsl"
         float wakeStr = gShadowParams.waterCausticDyn.y;
         if (wakeStr > 0.0f) {
             float2 wuv = (dynPos - gShadowParams.waterCausticWake.xy)
@@ -2099,7 +2111,18 @@ void waterLightTransmit(float3 worldPosRel, out float3 tSun, out float3 tAmb)
                 float wMax = gShadowParams.waterCaustic2.z;
                 float wscale = min(depth, wMax) * (1.0f /  256.0f )
                              * (1.0f - smoothstep(wMax, 1.5f * wMax, depth));
-                caustic *= 1.0f + wd * (wedge * wakeStr * wscale);
+
+
+
+
+                wscale = lerp(wscale, 1.0f, saturate(gShadowParams.waterCaustic3.z));
+
+
+
+
+
+
+                caustic *= max(1.0f + wd * (wedge * wakeStr * wscale), 0.0f);
             }
         }
 
@@ -2111,7 +2134,7 @@ void waterLightTransmit(float3 worldPosRel, out float3 tSun, out float3 tAmb)
         tSun *= lerp(float3(1.0f, 1.0f, 1.0f), caustic, saturate(causStr) * dfade * cdecay);
     }
 }
-#line 761 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/waterfog.h.fsl"
+#line 793 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/waterfog.h.fsl"
 float3 waterInscatterSeg(float3 sigT, float3 kLight, float3 tauView, float L,
                          float dNear, float dFar, float mEff, float slant, bool openEnded)
 {
@@ -2151,7 +2174,7 @@ float waterPhase(float cosT)
                          gShadowParams.waterFogPhase.z, gShadowParams.waterFogPhase.w,
                          gShadowParams.waterFogPhase2.y);
 }
-#line 816 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/waterfog.h.fsl"
+#line 848 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/waterfog.h.fsl"
 void waterColumn(float3 worldPosRel, float L, bool openEnded, out float3 inscat, out float3 trans)
 {
     float3 sigT = gShadowParams.waterFogExt.rgb;
@@ -2169,12 +2192,12 @@ void waterColumn(float3 worldPosRel, float L, bool openEnded, out float3 inscat,
     float mEff = -worldPosRel.z / d;
     float dNear = waterFogEyeDepth();
     float dFar = max(dNear + mEff * L, 0.0f);
-#line 860 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/waterfog.h.fsl"
+#line 892 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/waterfog.h.fsl"
     float mEffSeg = (L > 0.0f) ? ((dFar - dNear) / L) : mEff;
 
     float3 tauView = sigT * L;
     trans = openEnded ? float3(0.0f, 0.0f, 0.0f) : exp(-tauView);
-#line 938 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/waterfog.h.fsl"
+#line 970 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/waterfog.h.fsl"
     float3 sigA = max(sigT - sigS, float3(0.0f, 0.0f, 0.0f));
     float wIso = saturate(gShadowParams.waterFogPhase2.z);
     float3 sigSi = sigS * (1.0f - gShadowParams.waterFogPhase2.w);
@@ -2195,7 +2218,7 @@ void waterColumn(float3 worldPosRel, float L, bool openEnded, out float3 inscat,
     float cosWater = sqrt(max(1.0f - (1.0f - cosAir * cosAir) / ( 1.333f  *  1.333f ), 0.0f));
     float cosW = max(cosWater,  0.6612f );
     float slantSun = 1.0f / cosW;
-#line 1019 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/waterfog.h.fsl"
+#line 1051 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/waterfog.h.fsl"
     float cosEntry = (gShadowParams.waterFogSun.y >= 0.0f) ? gShadowParams.waterFogSun.y : cosAir;
     float cosWEnt = max(sqrt(max(1.0f - (1.0f - cosEntry * cosEntry) / ( 1.333f  *  1.333f ), 0.0f)),
                          0.6612f );
@@ -2208,9 +2231,9 @@ void waterColumn(float3 worldPosRel, float L, bool openEnded, out float3 inscat,
     float3 iAmb = waterInscatterSeg(sigTm, kLgt, tauViewM, L, dNear, dFar, mEffSeg,  1.2039f , openEnded);
 
     float ph = waterPhase(dot(worldPosRel / d, -gFrameData.sunDir.xyz));
-#line 1065 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/waterfog.h.fsl"
+#line 1097 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/waterfog.h.fsl"
     ph = lerp(ph, 1.0f, wIso);
-#line 1101 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/waterfog.h.fsl"
+#line 1133 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/waterfog.h.fsl"
     inscat = sigSm * ( 0.25f  * gFrameData.sunCol.rgb * ph * iSun * sunEnter
                     +  (0.5f * (1.0f - 0.6612f ) * 1.333f * 1.333f )  * gFrameData.ambCol.rgb * iAmb)
            * gShadowParams.waterFogScatter.w;
@@ -2242,7 +2265,7 @@ float3 waterFogComposite(float3 behind, float3 worldPosRel, float2 wf)
 {
     return waterFogBlend(lerp(behind, waterFogColor(worldPosRel), wf.x), behind, worldPosRel, wf);
 }
-#line 1145 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/waterfog.h.fsl"
+#line 1177 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/waterfog.h.fsl"
 float3 waterFogVeil(float3 worldPosRel)
 {
     float3 legacy = waterFogColor(worldPosRel);

@@ -1064,7 +1064,10 @@ void CS_MAIN(uint3 did : SV_DISPATCHTHREADID)
     {
         float4 imp = gRippleSimParams.impulses[i];
         float d = length(float2(id) - imp.xy);
-        h.x += imp.w * smoothstep(1.0f, 0.0f, d / max(imp.z, 1e-3f));
+        float r = max(imp.z, 1e-3f);
+#line 94 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/ripplesim.comp.fsl"
+        h.x += imp.w * (smoothstep(1.0f, 0.0f, d / r)
+                      - 0.25f * smoothstep(1.0f, 0.0f, d / (2.0f * r)));
     }
 
 
@@ -1073,6 +1076,30 @@ void CS_MAIN(uint3 did : SV_DISPATCHTHREADID)
     float avg = 0.25f * (hL + hR + hT + hB);
     h.y += avg - h.x;
     h.y *= decay;
+#line 124 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/ripplesim.comp.fsl"
+    float gd = clamp(gRippleSimParams.scroll.z, 0.0f, 1.0f / 64.0f);
+    if (gd > 0.0f) {
+        float vL = rippleFetchPrev(src + int2(-1, 0), size).y;
+        float vR = rippleFetchPrev(src + int2( 1, 0), size).y;
+        float vT = rippleFetchPrev(src + int2( 0, 1), size).y;
+        float vB = rippleFetchPrev(src + int2( 0, -1), size).y;
+        float vLL = rippleFetchPrev(src + int2(-2, 0), size).y;
+        float vRR = rippleFetchPrev(src + int2( 2, 0), size).y;
+        float vTT = rippleFetchPrev(src + int2( 0, 2), size).y;
+        float vBB = rippleFetchPrev(src + int2( 0, -2), size).y;
+        float vLT = rippleFetchPrev(src + int2(-1, 1), size).y;
+        float vLB = rippleFetchPrev(src + int2(-1, -1), size).y;
+        float vRT = rippleFetchPrev(src + int2( 1, 1), size).y;
+        float vRB = rippleFetchPrev(src + int2( 1, -1), size).y;
+        float vC = rippleFetchPrev(src, size).y;
+        float l0 = vL + vR + vT + vB - 4.0f * vC;
+        float lL = vLL + vC + vLB + vLT - 4.0f * vL;
+        float lR = vRR + vC + vRB + vRT - 4.0f * vR;
+        float lT = vTT + vC + vLT + vRT - 4.0f * vT;
+        float lB = vBB + vC + vLB + vRB - 4.0f * vB;
+        h.y -= gd * (lL + lR + lT + lB - 4.0f * l0);
+    }
+
     h.x += h.y * min(speed, 2.0f);
 
 

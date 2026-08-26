@@ -507,7 +507,18 @@ void waterLightTransmit(float3 worldPosRel, out float3 tSun, out float3 tAmb)
         float  fade = saturate(sIdx + 1.0f)
                     * (1.0f - saturate(sIdx - (float)(CAUSTIC_SLICES - 1)));
 
-        if (fade > 0.0f) {
+        // ⚠ W27c — THE STATIC LAYER HAS ITS OWN GATE NOW, and it is not causStr. causStr is the
+        // MASTER over all three layers; folding "the surface has no waves" into it meant that
+        // flattening the calm water to isolate a wake turned the WAKE off too, which is the exact
+        // opposite of the isolation the panel advertises. waterCaustic3.y is 0 only at amplitude 0
+        // (or the flat test), where the static generator is not dispatched at all and these slices
+        // would be read STALE. Below that endpoint the amplitude acts continuously on the
+        // generator's own slope instead — see causticEffectiveSlope() host-side.
+        //
+        // Skipping leaves `caustic` at the identity it was initialised to, and the dynamic layers
+        // multiply into it exactly as they would have. Uniform across the draw, so the branch is
+        // coherent and saves the three map taps outright.
+        if (fade > 0.0f && gShadowParams.waterCaustic3.y > 0.0f) {
             float s0 = clamp(floor(sIdx), 0.0f, (float)(CAUSTIC_SLICES - 1));
             float s1 = min(s0 + 1.0f, (float)(CAUSTIC_SLICES - 1));
             float sf = saturate(sIdx - s0);
@@ -646,7 +657,17 @@ void waterLightTransmit(float3 worldPosRel, out float3 tSun, out float3 tAmb)
                     float rd = lerp(causticDynFetch(ruv, (float)CAUSTIC_RIPPLE_BASE + r0),
                                     causticDynFetch(ruv, (float)CAUSTIC_RIPPLE_BASE + r1),
                                     saturate(rIdx - r0));
-                    caustic *= 1.0f + rd * (rf * redge * ripStr);
+                    // ⚠ THE GAIN FLOOR IS ZERO, AND ONLY THE DYNAMIC LAYERS CAN BREACH IT. The map
+                    // stores (gain - 1), so `rd` bottoms out at -1 (gain 0, no light). The static
+                    // layer is safe by construction — `fade` is at most 1, so `1 + dev*fade` cannot
+                    // go below 0 — and so is the master, which is applied through `saturate(causStr)`.
+                    // These two are not: their strengths run to 3, so `1 + rd*3` turns NEGATIVE
+                    // wherever the deviation is under -1/3, which in a caustic is most of the dark
+                    // area between the filaments. Negative gain on a term that MULTIPLIES SUNLIGHT is
+                    // negative light: "wake caustics strength, when high, it goes black. it only
+                    // affects the sun light, then it must be going negative." Exactly that.
+                    // Same guard, same reason, as the `maxSw` clamp on the dispersion swing above.
+                    caustic *= max(1.0f + rd * (rf * redge * ripStr), 0.0f);
                 }
             }
         }
@@ -676,7 +697,18 @@ void waterLightTransmit(float3 worldPosRel, out float3 tSun, out float3 tAmb)
                 float wMax = gShadowParams.waterCaustic2.z;
                 float wscale = min(depth, wMax) * (1.0f / CAUSTIC_WAKE_DEPTH)
                              * (1.0f - smoothstep(wMax, 1.5f * wMax, depth));
-                caustic *= 1.0f + wd * (wedge * wakeStr * wscale);
+                // ⚠ W27e DIAGNOSTIC (waterCaustic3.z, 0 by default = untouched). Near the surface
+                // the law above is 0.1-0.4x BY DESIGN, which by eye is the same picture as an empty
+                // slice. Pinning it to 1 shows what the slice actually holds, so the two can be told
+                // apart in one flip instead of by inference.
+                wscale = lerp(wscale, 1.0f, saturate(gShadowParams.waterCaustic3.z));
+                // The gain floor again — see the ripple block above. The wake reaches it sooner in
+                // DEEP water, because `wscale` is min(depth,wMax)/256 and only approaches 1 there;
+                // near the surface it is 0.1-0.4, which scales the deviation down far enough that
+                // even strength 3 cannot drive the product past -1. So "it goes black" is a
+                // deep-water symptom, which is also where the wake layer is meant to be doing its
+                // work.
+                caustic *= max(1.0f + wd * (wedge * wakeStr * wscale), 0.0f);
             }
         }
 

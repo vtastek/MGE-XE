@@ -565,5 +565,23 @@ STRUCT(ShadowMaskParams)
     // d0 = (L / k)^(2/3), k = sqrt(sigma_s*<theta^2>/3) from the water model and L the pattern's own
     // structure scale, which rides the caustic tile. Deriving it rather than tabling it is what
     // makes the reach follow the water: raise the murk and the caustics stop shallower, on their own.
+    // W27c — y = THE STATIC (calm-water) LAYER'S GATE, 1 or 0. Split out of waterCaustic.x, which
+    // is the MASTER over all three layers: carrying "the surface has no waves" in the master meant
+    // that flattening the calm water to isolate a wake switched the wake off with it. A mirror casts
+    // no CALM-water caustic, but a swimmer still deforms the surface at amplitude 0 — water.frag ADDS
+    // the ripple and wake slopes to the base normal, so they survive a flat base field. zw spare.
     DATA(float4,   waterCaustic3,    None);
+    // ─── W28b: THE WATER CUT'S OWN LANE ─────────────────────────────────────────────────────────
+    // x = the GLASS BOX'S HEIGHT in world units. The cut is a box around the eye: waterDistort.w is
+    //     its horizontal size, which never varies, and this is its height. The cut is on while the
+    //     eye is within this far above the water and off above it, at full size either way — so a
+    //     thin box is crossed in a frame or two and the hole appears AT ONCE rather than growing in.
+    // ⚠ THIS IS THE ONLY THING THAT DECIDES THE SWITCH-ON HEIGHT, and keeping that away from the
+    //   radius is the whole lesson of W28/W28b. A strength fade makes the cut PARTIAL, and a partial
+    //   cut is a blend of the surface with what is behind it, so it keeps a fraction of the
+    //   surface's REFLECTION — which the premise of the cut says is not there. A radius floor is
+    //   worse: the disc opened on the water plane has radius sqrt(R^2 - above^2) and is empty until
+    //   R exceeds the eye's height, so a floor silently BECOMES the switch-on height. Size and
+    //   activation are separate questions. The cut's strength is 0 or 1, never between. yzw spare.
+    DATA(float4,   waterCut,         None);
 };

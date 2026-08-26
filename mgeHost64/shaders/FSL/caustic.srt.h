@@ -197,8 +197,14 @@ STRUCT(CausticParams)
     //     water.frag uses for that grid (g_ripSimSlope / g_wakeSlope). The caustic has to be cast
     //     by the surface you can see; a separate gain here would put the filaments under a
     //     disturbance of a different steepness than the normal map shows.
-    // z = the field's grid size in texels, for clamping the +-1 taps at the border.
-    // w = spare.
+    // z = the field's grid size in texels, for clamping the stencil taps at the border.
+    // w = W27b: the HESSIAN STENCIL half-width in FIELD texels (1-3, default 2). Not a smoothing
+    //     preference — a +-m second difference's response is |2-2cos(m*k*dx)|/(m*dx)^2, which at
+    //     m=1 PEAKS at the wave grid's own Nyquist, so the Hessian is driven hardest by exactly the
+    //     grid-scale content the map cannot represent. The dispersive wake grid TRAPS that content
+    //     (group velocity (1/2)*sqrt(g/k) -> 0 as k rises, so the shortest waves are the slowest and
+    //     never leave), which is why the wake was the layer reported as noisy. m=2 is exactly zero
+    //     there and passes 11-25 texel wavelengths at 90-98%.
     DATA(float4, dynOut,   None);
     // x = the CALM threshold on displacement, in destination texels.
     // y = the CALM threshold on q*|H|, dimensionless.

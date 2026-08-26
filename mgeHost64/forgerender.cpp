@@ -4086,8 +4086,11 @@ namespace {
     // W26a: d0, the depth at which the caustic PATTERN stops surviving the medium's own forward
     // scattering. Appended for the reason every block above states.
     constexpr uint32_t kWaterCaustic3Float    = kWaterCausticDynFloat + 4;
+    // W28c: the water cut's own float4. waterDistort.w carries the box's horizontal SIZE; x here is
+    // its HEIGHT, which is the only thing deciding when the cut switches on. yzw spare.
+    constexpr uint32_t kWaterCutFloat         = kWaterCaustic3Float + 4;
     constexpr uint32_t kShadowParamsBytes = 4096;
-    static_assert((kWaterCaustic3Float + 4) * sizeof(float) <= kShadowParamsBytes,
+    static_assert((kWaterCutFloat + 4) * sizeof(float) <= kShadowParamsBytes,
                   "ShadowMaskParams overflows its CBV — too many sun cascades");
     // msmrecv.h.fsl's PCSS works in TEXELS, so SUN_SHADOW_RES has to agree with the atlas the host
     // actually allocated. Same mirroring contract as SUN_CASCADES / kSunCascades.
@@ -12166,6 +12169,45 @@ namespace {
     // bit. The per-SAMPLE destination the blend was adopted for is kept where it earns its keep —
     // the shoreline, where shoreCancel has already taken the offset to zero.
     float g_waterRefrOwn        = 1.0f;
+    // ─── W28: THE WATER CUT'S RADIUS, WORLD UNITS ────────────────────────────────────────────────
+    // The cut is the disc of surface removed around the camera while the eye is within ~7 units
+    // ABOVE the waterline — the wading case, where the surface is seen so close to edge-on that it
+    // smears over the near field instead of showing what is under it. (Fully submerged never reaches
+    // it: water.frag's underwater arm returns ~700 lines earlier.)
+    //
+    // ⚠ FIXED, AND THAT IS THE POINT OF THE KNOB. It used to be `dist / lerp(1200, 0, above/7)`,
+    // which is ONE expression doing TWO jobs: the same lerp that faded the cut out as the eye rose
+    // also SHRANK it, from 120 units at the waterline to nothing at 7. So the cut never had a radius
+    // to speak of — it had a radius that was a function of how nearly it had stopped applying, and
+    // "how big is the hole" could not be asked separately from "when does it stop".
+    // [[feedback_one_knob_two_jobs]]. The radius is now this number at every height in the band and
+    // the fade is its own term. 120 reproduces the old value AT THE WATERLINE, so the moment the cut
+    // matters most is unchanged; every height above it gets a bigger hole than before.
+    float g_waterCutRadius      = 120.0f;
+    // ⚠⚠ W28c — THE CUT IS A GLASS BOX, AND THIS IS ITS HEIGHT. The model, in the author's words:
+    // "think of a camera in a glass box but its height is tiny, so it gets submerged instantly...
+    // we expect it to appear suddenly."
+    //
+    // That settles a shape three revisions failed to guess. The box has a horizontal SIZE
+    // (g_waterCutRadius) that never changes, and a HEIGHT — this — that is small enough that the eye
+    // crosses it in a frame or two. So the hole does not grow, shrink, or fade in: the box is either
+    // dry or submerged, and the transition is a couple of frames wide because the box is thin, not
+    // because anything is being interpolated.
+    //
+    // Everything that went wrong before was a consequence of trying to make the SIZE carry the
+    // transition. W28's flat radius + strength fade made the cut PARTIAL, and a partial cut is a
+    // blend of the surface with what is behind it, so the disc kept a fraction of the surface's
+    // REFLECTION ("refraction appears and then reflections fade"). W28b's shrink-with-a-floor made
+    // the floor decide the SWITCH-ON HEIGHT instead, because the disc on the water plane has radius
+    // sqrt(R^2 - above^2) and is empty until R exceeds the eye's height — so a 40-unit floor turned
+    // the hole on 40 units up ("there is always a tiny size hole, the hole appears early in camera
+    // z's descent"). Neither is a tuning miss; both are the same error, which is that SIZE and
+    // ACTIVATION are different questions ([[feedback_one_knob_two_jobs]]).
+    //
+    // Here they are separate by construction: size is the radius, activation is this height, and the
+    // cut's strength is never anything but 0 or 1. 4 units is ~6 cm — a couple of frames at wading
+    // speed. A starting value to tune, not a derived one.
+    float g_waterCutHeight      = 4.0f;
 
     // ─── DOES THE WATER SURFACE CLAIM THE PIXEL'S DEPTH? ─────────────────────────────────────────
     // ⚠ A LEFTOVER FROM THE OPAQUE ERA. The surface used to be an opaque write that fetched what was
@@ -13173,11 +13215,33 @@ namespace {
     // an exact integer load rather than a bilinear fetch.
     constexpr uint32_t kCausticRippleWindow = 512;
     static_assert(kCausticRippleWindow == kCausticRes, "ripple source is 1:1 with the destination");
-    // The WAKE map walks the wake grid at stride 2, so it covers the WHOLE 1024-texel grid (8192
-    // world units at the default 8 u/texel) at 16 units per destination texel. Nyquist is
-    // comfortable: wake wavelengths are 11-25 field texels, so sampling every second one loses
-    // nothing, and 16-unit destination texels still give 6-12 texels per wave.
-    constexpr uint32_t kCausticWakeStride = 2;
+    // The WAKE map walks the wake grid at this stride, and this is the DEFAULT's home — the live
+    // value is g_causticWakeStride below.
+    //
+    // ⚠ W27: ONE, NOT TWO, AND THE OLD NYQUIST ARGUMENT COUNTED THE WRONG SIGNAL. Stride 2 covered
+    // the whole 1024-texel grid (8192 world units at 8 u/texel) at 16 units per destination texel,
+    // and the note that used to sit here defended it by counting texels per WAVE — 6-12, entirely
+    // comfortable. But this map does not store the wave, it stores the CAUSTIC the wave casts, and
+    // a filament is ~16.7 units wide (kFilamentRef, measured). At 16 u/texel the destination's
+    // Nyquist is 32 units, so it cannot represent a filament AT ALL and what it held was the
+    // aliased residue of one. That is what "wake caustics are noisy" was, and it is why turning the
+    // wake up read as blotches rather than as caustics.
+    //
+    // ⚠ AND THE HESSIAN WAS MEASURED FINER THAN THE MAP COULD WRITE DOWN. causticdyn.comp takes its
+    // central difference at +-1 FIELD texel, which at stride 2 is +-8 units — HALF a destination
+    // texel. A second difference amplifies whatever sits at its stencil scale as 1/delta^2, so all
+    // the field content between 16 and 32 units arrived at full strength in Jm = I + q*H with
+    // q = c*D = 0.25*256 = 64, and none of it could be stored. Per-texel speckle by construction,
+    // and worst exactly where the wake grid's own FD scheme piles energy: the 2-delta mode, which
+    // under omega = sqrt(g|k|) is the slowest mode there is and so never leaves the domain.
+    //
+    // Stride 1 answers both with one number. The destination becomes 8 u/texel (a filament is 2.1
+    // texels instead of 1.0) AND the +-1 field tap becomes exactly ONE destination texel, so the
+    // stencil measures the scale the map is allowed to carry. Same 512^2 dispatch, same five taps,
+    // same cost. The window halves, 8192 -> 4096 units (+-2048), which is already inside the camera
+    // fade: dFar = causticDistFrac * waterDistortFrac * max(nearViewRange, 4096) with both fractions
+    // at 1, so every caustic is already fading from ~2048 units out.
+    constexpr uint32_t kCausticWakeStride = 1;
 
     bool  g_causticOn        = true;
     float g_causticStrength  = 1.0f;    // 0 = the pre-W23 image; the consumer's block is gated on it
@@ -13212,6 +13276,24 @@ namespace {
     // cannot describe it. 1 is right until filaments start looking faceted. Cost is ~x(n^2) beams
     // against ~x(1/n^2) cells each, so it is closer to free than it looks — but measure `caustic=`.
     float g_causticSubBeams  = 1.0f;
+    // ⚠⚠ W29 — THE DYNAMIC LAYERS' OWN SUB-BEAM COUNT, AND THEY NEEDED IT MORE THAN THE STATIC MAP.
+    // The reference this technique comes from (Job Talle, "Caustics & card dioramas") names the
+    // failure mode precisely: "At low splat counts, the ellipses become visible... increasing the
+    // number of splats makes the ellipses disappear in the pattern they create", and it casts from a
+    // HEXAGONAL grid because "it makes the gaps between the landed ellipses smaller".
+    //
+    // The static map already honours both: 512x592 hex source cells into 512x512 texels = 1.156
+    // beams per texel, staggered. The dynamic layers were casting 512x512 SQUARE — exactly 1.000 per
+    // texel, perfectly aligned, the lowest count the technique admits on the grid shape it warns
+    // about. That is not an oversight: the 1:1 lattice is the PRECONDITION for the identity prefill
+    // that makes calm water cost nothing, so the optimisation paid for its speed with the one
+    // parameter that decides whether the ellipses are visible.
+    //
+    // Sub-beams buy the density back and keep the prefill: the cell still owns exactly CAUSTIC_WFIX
+    // and still withdraws it once, delivered by N smaller beams spread across the cell (weight AND
+    // source variance both split by N) with a half-step row stagger that makes the union of births
+    // triangular. Calm cells early-out before any of it, so the fast path is unchanged.
+    float g_causticDynSubBeams = 2.0f;
     // Depth slices rebuilt per frame (1..kCausticSlices), round-robin. ⚠ IT IS A RATE, NOT A
     // FRACTION: n slices are rebuilt whatever the ladder's length, so W26's fifth slice moved the
     // round-robin PERIOD (2 -> 2.5 frames at the default) and not the cost. 2 = ~1.25 texels of lag
@@ -13390,12 +13472,56 @@ namespace {
     // the consumer's block outright and skips the scatter dispatch, so the image is the W23 one
     // exactly. Not a fade toward a still-running term.
     float g_causticRippleStr = 1.0f;
-    float g_causticWakeStr   = 1.0f;
+    // ⚠ 2.0, NOT 1.0, AND IT IS A LOOK CALL RATHER THAN A DERIVATION ("wake is kind of faint, I
+    // would go 2.0 for it"). It is safe to raise now in a way it was not before W28d: the consumer
+    // clamps the composite gain at 0, so a strength this high can no longer drive sunlight negative.
+    // Note the wake also carries min(depth,350)/256, so 2.0 near the surface is still only 0.2-0.8
+    // of the stored deviation — the number is large because the depth law is small where you swim.
+    float g_causticWakeStr   = 2.0f;
     // A multiplier over the slope gain each layer inherits from its own wave grid (g_ripSimSlope /
     // g_wakeSlope). ⚠ 1.0 IS THE CORRECT DEFAULT AND IT IS NOT A TASTE CALL: the caustic must be
     // cast by the surface you can SEE, so the steepness driving the refraction has to be the same
     // number water.frag perturbs its normal with. This exists to explore, not to be left off 1.
     float g_causticDynSlope  = 1.0f;
+    // ─── W27b: THE HESSIAN STENCIL, AS THE SOURCE LOW-PASS ───────────────────────────────────────
+    // Half-width in FIELD TEXELS of the central difference causticdyn.comp takes to get the surface
+    // Hessian. It was +-1 from W24, and that is where the wake's noise actually lives.
+    //
+    // ⚠ A +-m SECOND DIFFERENCE HAS RESPONSE |2-2cos(m*k*dx)|/(m*dx)^2. At m=1 that rises
+    // MONOTONICALLY with k and is LARGEST at the grid's own Nyquist (4/dx^2) — so whatever
+    // grid-scale content the field carries dominates the Hessian, and `Jm = I + q*H` with q = 64
+    // turns it into per-texel speckle. W27 fixed the DESTINATION lattice and the report came back
+    // "still noisy", which is the other half: a finer destination cannot help when the quantity
+    // being written is driven by the SOURCE's finest mode.
+    //
+    // ⚠ AND THE WAKE GRID TRAPS THAT MODE, WHICH IS WHY IT IS THE NOISY LAYER. Under omega =
+    // sqrt(g|k|) the group velocity is (1/2)*sqrt(g/k), so the SHORTEST waves are the SLOWEST: what
+    // gets excited at grid scale never propagates away and just accumulates. The fine grid's
+    // non-dispersive Laplacian moves every wavelength at one speed, so its Nyquist content leaves;
+    // that is the physical reason the two layers were reported differently.
+    //
+    // m = 2 ANNIHILATES the 2*dx mode EXACTLY (cos(2*pi) - 1 = 0) while passing the wake's own
+    // 11-25 texel wavelengths at 90-98% (sinc^2(m*k*dx/2)). Not a blur of the answer — a stencil
+    // that declines to measure a scale the field has no business carrying. 1 = the W24-W27a
+    // behaviour, kept as the A/B.
+    // ⚠ EVEN VALUES ONLY, IF THE POINT IS NYQUIST. The response |2-2cos(m*k*dx)|/(m*dx)^2 is exactly
+    // ZERO at the grid's Nyquist for EVEN m (cos(m*pi) = +1) and 4/(m*dx)^2 for ODD m — so 2 and 4
+    // null it outright, while 3 merely attenuates it 9x relative to 1 and blurs three times as wide
+    // for the privilege. 4 additionally nulls the 4-texel mode. 2 is the one to use.
+    //
+    // ⚠ AND THIS ONLY STOPS THE CAUSTIC MEASURING THE GRID SCALE — it does nothing about the wake
+    // grid ACCUMULATING it, which is a property of the simulation and needs g_wakeVisc. Reaching for
+    // this knob against "it aliases more the longer I watch" treats the symptom.
+    float g_causticDynHess   = 2.0f;
+    // ⚠ W27e — A DIAGNOSTIC, NOT A LOOK KNOB. The wake layer is stored at ONE reference depth and
+    // the consumer scales it by min(depth,wMax)/256, because a pre-focus deviation really is linear
+    // in depth. The consequence is that near the surface — where a swimmer is, and where anyone
+    // testing "does my wake cast a caustic" is looking — the layer is scaled to 0.1-0.4x ON PURPOSE.
+    // That is indistinguishable by eye from an EMPTY MAP, which is exactly the ambiguity that cost
+    // this session several rounds. 1 pins the scale to 1.0 so the slice's own content is shown
+    // whatever the depth: if the wake appears, the generator is fine and the depth law was hiding
+    // it; if nothing appears, the map is empty and the fault is upstream. Leave it at 0 to play.
+    float g_causticWakePin   = 0.0f;
     // ─── W26: WHERE EACH LAYER STOPS ─────────────────────────────────────────────────────────────
     // How deep each dynamic layer reaches, in WORLD UNITS, fading to nothing over the next half of
     // its own window. Defaulted straight from the shared macros rather than mirrored — the consumer
@@ -13418,14 +13544,33 @@ namespace {
     // 0 = no distance fade at all — and g_waterDistortFrac = 0, "the distortion is unbounded", means
     // the same thing here, correctly.
     float g_causticDistFrac  = 1.0f;
-    // The CALM THRESHOLDS, and between them they are the cost model. A beam whose displacement is
-    // under this many destination texels AND whose q*|H| is under the second number returns without
-    // touching memory, so the dispatch costs five texture loads per cell over calm water and a full
-    // splat only over disturbed water. Raising them makes calm cheaper and eats the faintest
-    // ripples; the defaults are a twentieth of a texel and a 2% Jacobian perturbation, both of which
-    // are below what survives the consumer's own fade.
-    float g_causticCalmDisp  = 0.05f;
-    float g_causticCalmHess  = 0.02f;
+    // The CALM THRESHOLDS. Nonzero, they are the dynamic layers' whole cost model: a beam whose
+    // displacement is under this many destination texels AND whose q*|H| is under the second number
+    // returns without touching memory, so the dispatch costs five texture loads per cell over calm
+    // water and a full splat only over disturbed water. Measured price of switching that off:
+    // +0.20 ms on the whole ladder.
+    //
+    // ⚠⚠ DEFAULT 0 IS A CORRECTNESS DEFAULT, NOT A TASTE ONE: A CALM BEAM IS NOT THE IDENTITY, AND
+    // THE PREFILL IS. The early-out's premise is that a beam which barely moves may as well keep the
+    // CAUSTIC_WFIX its texel was prefilled with. But the prefill is a DELTA — all of a texel's
+    // weight on that one texel — while causticSplatBeam (causticsplat.h.fsl) has a hard kernel floor
+    // of sigSrc2 + sigMin2, so even a beam at ZERO displacement with J = I spreads over
+    // sigma = 0.48-0.60 destination texels and keeps only 45-58% of its own weight at home. The two
+    // are not interchangeable: they differ by up to 3.5x at a point.
+    //
+    // That is invisible in either UNIFORM regime — all-calm sums to exactly 1.0, all-splatting sums
+    // to exactly 1.0 — and it is a STEP FUNCTION at every boundary between them, which is exactly
+    // where a decaying wave field lives. Simulated across a straight calm/splat edge: 0.83 | 1.17
+    // at nSub 1, 0.91 | 1.09 at nSub 2; a lone splatter in calm water reads 0.45 with a 1.11 halo.
+    // That is the reported "cellular automata / beading", and it is why it appeared AT THE FADE,
+    // grew as the rings decayed, and was untouched by impulse radius, hyperviscosity, the Hessian
+    // stencil, the destination stride and sub-beams — none of those is the mixed population.
+    //
+    // ⚠ NO NONZERO VALUE IS SAFE; this is structural, not tuning. Lowering the threshold does not
+    // shrink the step, it only moves where the boundary falls. Kept as knobs because they are still
+    // the honest way to price the early-out, but a nonzero default beads by construction.
+    float g_causticCalmDisp  = 0.0f;
+    float g_causticCalmHess  = 0.0f;
     // The RIPPLE map's reach, as an integer stride through the fine grid. ⚠ AN INTEGER, AND THAT IS
     // STRUCTURAL, NOT A UI CONVENIENCE: the identity prefill is exact only because the destination
     // lattice is a SUB-LATTICE of the wave field's, one beam born per destination texel. A
@@ -13434,6 +13579,20 @@ namespace {
     // unit/texel (the default: near-field detail, which is what swimming and first person need);
     // 2 = the fine grid's full 1024 units at 2 units/texel.
     float g_causticRippleStride = 1.0f;
+    // The WAKE map's reach, under the same integer rule and for the same structural reason. 1 =
+    // 4096 units at 8 units/texel, the W27 default, and it is not a preference: it is the only
+    // stride at which the destination can hold a caustic filament and the Hessian's stencil is one
+    // destination texel — see kCausticWakeStride for both halves of that. 2 = the wake grid's full
+    // 8192 units at 16 units/texel, i.e. the W26 build, kept as the A/B for the reach-vs-resolution
+    // trade rather than removed.
+    float g_causticWakeStride = (float)kCausticWakeStride;
+    // Both dynamic strides go through HERE and nowhere else. The clamp is trivial and that is
+    // exactly why it wants a name: it is evaluated by the frame fill and by the creation log, and
+    // two copies of a trivial expression is how a generator and its own report end up describing
+    // different lattices — the failure this file already warns about for the domain itself.
+    inline int causticDynStride(float knob) {
+        return (int)std::max(1.0f, std::min(std::floor(knob + 0.5f), 2.0f));
+    }
 
     constexpr uint32_t kRippleGrid       = 1024;   // texels per side
     constexpr float    kRippleUnitsPerTexel = 1.0f;
@@ -13445,12 +13604,46 @@ namespace {
     // ripple life; the waves died about as fast as they were made and the wake read as "very weak".
     // 0.995 leaves roughly half a second's worth of ringing, which is what a wake actually does.
     float g_ripSimDecay  = 0.995f;
-    // Amplitude and radius are a PAIR, because the slope a bump produces goes as amp/radius. Radius
-    // is also what makes the wake continuous rather than beaded: MW lays impulses every ~14.2 units
-    // (measured), so a radius below ~7 texels leaves visible gaps between consecutive splashes.
-    float g_ripSimAmp    = 1.2f;    // impulse height at the centre of a birth splat
-    float g_ripSimRadius = 10.0f;   // impulse radius in TEXELS (1 texel = 1 world unit)
+    // Amplitude and radius are a PAIR, because the slope a bump produces goes as amp/radius.
+    //
+    // ⚠⚠ W28i — RADIUS MUST BE >= THE IMPULSE SPACING, NOT HALF OF IT. The note that used to sit
+    // here said "a radius below ~7 texels leaves visible gaps between consecutive splashes", and 7
+    // is sp/2 = where consecutive circles TOUCH. Touching is where scalloping is WORST, not where it
+    // stops: two bumps that meet exactly at their zero crossings sum to a crest-and-nothing ridge.
+    // MEASURED on the shipped profile (h += amp * smoothstep(1, 0, d/r), MW's sp = 14.2 units):
+    //
+    //     r texels     7      10      14      18      21      28
+    //     modulation  100%    59%    2.1%    6.7%    1.6%    0.5%
+    //
+    // At the shipped 10 the ridge peaked at 2.5x its own troughs — a train of discrete blobs, which
+    // is what "9-12+ are the cellular automata look" is a picture of: the outer arcs had broken into
+    // regularly spaced beads (measured at ~31 px of regular periodicity in ripples.png) while rings
+    // 4-8, nearer the source and dominated by fresher overlapping splats, stayed continuous.
+    //
+    // 14 is the first radius that fills the troughs (2.1%), and it does NOT inflate the ridge: the
+    // sum peak is 1.000 at both 10 and 14 — the extra radius goes into the gaps, not into the crest.
+    // Amp rises with it to hold amp/radius, i.e. the SLOPE, exactly where it was: 1.2 * 14/10 = 1.68.
+    // A gentler bump also has less curvature, which is the same lever the innermost rings need.
+    float g_ripSimAmp    = 1.68f;   // impulse height at the centre of a birth splat
+    float g_ripSimRadius = 14.0f;   // impulse radius in TEXELS (1 texel = 1 world unit)
     float g_ripSimSlope  = 3.0f;    // slope gain into water.frag's normal
+    // ⚠⚠ W28k — GRID-SCALE DAMPING FOR THE FINE GRID, per STEP (this grid's whole scheme is
+    // per-step). g_ripSimDecay above is UNIFORM in k, and that is not enough, because the thing
+    // being DRAWN is not the thing that decays: both consumers read the field's .zw SLOPE, and slope
+    // is amplitude TIMES wavenumber. A uniform decay takes the same fraction off every wavelength's
+    // amplitude while leaving grid-scale residue with ~30x the slope of a resolved wave at the same
+    // amplitude — so past the point where a ring has visibly gone, what is still drawn is whatever
+    // residue has the highest k. That is the beading and the aliasing in the outer rings.
+    //
+    // ⚠ W28j TRIED A MAGNITUDE GATE INSTEAD AND MADE IT WORSE. A floor on |slope| is a per-texel
+    // threshold on a continuous field: it chops every ring wherever its slope crosses the line, so
+    // the rings break into beads and the crossing radius just moves inward ("6-11 rings are artifacty
+    // now"). A gate cannot tell a faint RESOLVED wave from sharp residue — only the wavenumber can,
+    // so the removal has to be spectral. Reverted; this is its replacement.
+    //
+    // grad^4, same operator and clamp as the wake grid's (W28h). 0.002/step at ~160 steps/s empties
+    // the grid scale in a fraction of a second and costs a 12-texel wave ~2%/s. 0 = off.
+    float g_ripGridDamp  = 0.002f;  // per STEP; clamped to the 1/64 monotonicity ceiling in-shader
     // Sub-steps are FIXED at 2 in the dispatch, deliberately not a knob: two is what ties the
     // ping-pong parity to the per-sub-step params buffers, and that pairing is what makes the
     // impulse injection land in the first step only. Four would re-inject.
@@ -13714,6 +13907,24 @@ namespace {
     // It costs nothing: the trail is then 6.7 s long, and at swim speed that is ~700 units inside a
     // 8192-unit domain.
     float g_wakeDamp     = 0.15f;   // 1/s
+    // ⚠ W28h — GRID-SCALE DAMPING RATE, 1/s. The uniform `g_wakeDamp` above cannot do this job at
+    // any value: it is k-independent, and under omega^2 = g|k| the group velocity is (1/2)sqrt(g/k),
+    // so the SHORTEST waves are the SLOWEST and grid-scale excitation never leaves the domain. Turn
+    // the uniform damp up far enough to clear it and the wake goes with it.
+    //
+    // ⚠⚠ AND IT IS grad^4, NOT grad^2, AFTER W28e SHIPPED THE LATTER AND WAS WRONG. A plain
+    // Laplacian was checked against the two ENDPOINTS (Nyquist and a 25-texel wake wave) and never
+    // in the middle, where at nu = 2 it left 13.5% of a 6-texel wave and 31% of an 8-texel one per
+    // second — the wake's own mid-scale structure erased, leaving long waves plus the source's
+    // blocky footprint. Reported as "lost gradient look, it became like a cellular automata cell
+    // look", which is what that is. grad^4's eigenvalue is the SQUARE of grad^2's, so the same
+    // Nyquist attack costs the resolved band ~25x less.
+    //
+    // ⚠ THE UNITS ARE AN e-FOLDING RATE, deliberately: the shader forms visc4 = rate*dt/64, which
+    // makes the corner mode's per-step factor exactly (1 - rate*dt) and its one-second survival
+    // e^-rate. So 3.0 means "grid-scale content decays with a 1/3 s time constant", at any frame
+    // rate, and there is nothing to tune by eye. 0 is the pre-W28e build exactly.
+    float g_wakeGridDamp = 3.0f;    // 1/s, e-folding rate of grid-scale content
     // ⚠ Not the fine grid's 3.0, and the difference is physical rather than taste. The frag converts
     // height-per-texel to world slope with texels-per-unit, so at 8 units/texel this grid's slope is
     // divided by 8 where the fine grid's is divided by 1 — and its waves are genuinely ~4x longer,
@@ -15352,6 +15563,14 @@ namespace {
           t.sliderF("Wake sim: impulse amplitude (height at the splash centre)", &g_ripSimAmp, 0.0f, 4.0f, 0.05f, "%.2f");
           t.sliderF("Wake sim: impulse radius (TEXELS; 1 texel = 1 world unit)", &g_ripSimRadius, 1.0f, 32.0f, 0.5f, "%.1f");
           t.sliderF("Wake sim: slope gain into the normal", &g_ripSimSlope, 0.0f, 16.0f, 0.25f, "%.2f");
+          // ⚠ THE FINE GRID'S ANTI-ALIASING KNOB — the same job g_wakeGridDamp does for the wake
+          // grid, and a different question from the decay above. Decay is uniform in k and cannot
+          // remove grid-scale residue preferentially; what is DRAWN is the SLOPE, and slope is
+          // amplitude times wavenumber, so residue at the grid scale outlives the wave that made it.
+          // grad^4, ~900:1 selective. Raise it if the outer rings still show beading; too high and
+          // the sharpest real ripples soften. 0 = off.
+          t.sliderF("Ripple sim: GRID-SCALE damping (grad^4, per step)",
+                    &g_ripGridDamp, 0.0f, 0.015f, 0.0005f, "%.4f");
           t.sliderF("Wake sim: velocity decay PER STEP (0.995 = 0.55/s; 120 steps/s)", &g_ripSimDecay, 0.95f, 1.0f, 0.0005f, "%.4f");
           t.sliderF("Wake sim: wave speed (CFL — above 2.0 the grid diverges)", &g_ripSimSpeed, 0.1f, 2.0f, 0.05f, "%.2f");
           // R2c. The fine grid above CANNOT make a wedge at any setting on this panel — it has no
@@ -15387,6 +15606,15 @@ namespace {
           // Gravity sets the transverse wavelength (2*pi*V^2/g), which is the spacing of the
           // reverse-curving arcs — the thing a Mach cone cannot draw at all.
           t.sliderF("Dispersive: damping PER SECOND", &g_wakeDamp, 0.0f, 3.0f, 0.01f, "%.2f");
+          // ⚠ THE ANTI-ALIASING KNOB, and a different question from the damping above: that one is
+          // uniform in k and cannot preferentially remove the grid scale, because this grid TRAPS
+          // its shortest waves (group velocity -> 0 as k rises). This is grad^4, so it is ~900x
+          // harder on a 2-texel mode than on a 12-texel one — sharp enough to clear the grid scale
+          // while the wake keeps its gradients. The number is the e-FOLDING RATE of grid-scale
+          // content in 1/s, so 3 means a 1/3-second time constant whatever the frame rate.
+          // 0 = the pre-W28e build.
+          t.sliderF("Dispersive: grid-scale damping RATE 1/s (grad^4; keeps the wake's gradients)",
+                    &g_wakeGridDamp, 0.0f, 20.0f, 0.5f, "%.1f");
           t.sliderF("Dispersive: gravity x (1.0 = physical; sets the arc SPACING)", &g_wakeGravity, 0.1f, 4.0f, 0.05f, "%.2f");
           // Kelvin's angle does not depend on speed; ours did, because a fast swimmer's wavelength
           // leaves the kernel's accurate band and the operator degenerates to non-dispersive. This
@@ -15467,6 +15695,19 @@ namespace {
           // released, so there is nothing to cancel and no resolve-operator mismatch to leave a rim.
           t.sliderF("Water: refraction as OWN term (0 = blend residual, the A/B)",
                     &g_waterRefrOwn, 0.0f, 1.0f, 0.05f, "%.02f");
+          // ⚠ A RADIUS IN WORLD UNITS, AND IT NO LONGER RIDES THE FADE. 1 unit = 1.43 cm, so 120 is
+          // ~1.7 m. 0 disables the cut outright. The old form tied the size to the fade-out, so the
+          // hole shrank as it faded; this is the size at every height in the band, with the fade a
+          // separate term. The cut also shows the UNDISTORTED destination now — see water.frag.
+          t.sliderF("Water: CUT radius (units; 120 = 1.7 m, 0 = off)",
+                    &g_waterCutRadius, 0.0f, 400.0f, 5.0f, "%.0f");
+          // ⚠ THE GLASS BOX'S HEIGHT — i.e. HOW SUDDENLY, not how big. The cut is on while the eye
+          // is within this far above the water and off above it, at full size either way; small
+          // values are what make the hole appear at once instead of growing in. It is the ONLY thing
+          // that decides the switch-on height, which is the whole point: the radius decides size and
+          // nothing else. 4 units is ~6 cm, a couple of frames at wading speed.
+          t.sliderF("Water: CUT box HEIGHT (units; small = appears suddenly)",
+                    &g_waterCutHeight, 0.0f, 40.0f, 1.0f, "%.0f");
           // ─── W23 CAUSTICS ─────────────────────────────────────────────────────────────────────
           // Both compute shaders HOT-RELOAD (F8), which is why the pattern's own constants live in
           // caustic.comp.fsl and only the framing lives here.
@@ -15493,6 +15734,15 @@ namespace {
           // single beam cannot describe: a cell straddling a hard fold, whose image is curved where
           // the footprint is linear. Raise it only if filaments start looking faceted.
           t.sliderF("Caustics: sub-beams per cell (fold detail)", &g_causticSubBeams, 1.0f, 4.0f, 1.0f, "%.0f");
+          // ⚠ THE DYNAMIC LAYERS' OWN COUNT, and the one that matters. The static map already casts
+          // 1.156 beams/texel from a HEX source; the ripple and wake layers cast 1.000 from a SQUARE
+          // one, which is the lowest count the technique admits on the grid shape its own reference
+          // warns about ("at low splat counts, the ellipses become visible"). Raise this until the
+          // individual ellipses stop reading as blobs. Weight and source variance are split across
+          // the sub-beams, so the mean-1 contract and the total footprint are identical at any value
+          // — it costs splat time on DISTURBED cells only and nothing at all on calm water.
+          t.sliderF("Caustics: DYNAMIC sub-beams per cell (ripple + wake; 1 = the old square lattice)",
+                    &g_causticDynSubBeams, 1.0f, 4.0f, 1.0f, "%.0f");
           // ⚠ THE COST KNOB, and what pays for the 512 map. Cost is linear in this and quadratic in
           // CAUSTIC_RES — and it is a RATE, so W26's fifth slice lengthened the round-robin period
           // rather than the bill. 2 = each slice refreshed every 2.5 frames, about 1.25 texels of
@@ -15542,6 +15792,22 @@ namespace {
           // sensitivity, not to be left somewhere else.
           t.sliderF("Caustics: dynamic slope gain (1 = the surface you can see)",
                     &g_causticDynSlope, 0.0f, 4.0f, 0.05f, "%.02f");
+          // ⚠ THE NOISE KNOB, and it works by REFUSING TO MEASURE rather than by blurring. A +-1
+          // second difference responds most strongly at the wave grid's own Nyquist — which the
+          // dispersive wake grid traps, because its group velocity goes to zero as k rises. 2 kills
+          // that mode exactly and keeps the wake's real wavelengths. 1 = the pre-W27b behaviour.
+          // ⚠ EVEN VALUES NULL NYQUIST EXACTLY; ODD ONES ONLY ATTENUATE IT (4/(m*dx)^2 survives). 2 is
+          // the setting; 4 also nulls the 4-texel mode at twice the blur. And this only stops the
+          // caustic MEASURING the grid scale — what stops the wake grid ACCUMULATING it is the
+          // VISCOSITY knob in the dispersive-wake section above.
+          t.sliderF("Caustics: Hessian stencil, FIELD texels (EVEN nulls Nyquist; 2 is the setting)",
+                    &g_causticDynHess, 1.0f, 4.0f, 1.0f, "%.0f");
+          // ⚠ DIAGNOSTIC. The wake slice is stored at 256 units and scaled by depth/256, so in the
+          // shallows it is deliberately 0.1-0.4x — which looks exactly like an empty map. Pin it to
+          // see what the slice actually holds. Answers "is it broken or is it just scaled down" in
+          // one flip; it is NOT a look setting and belongs back at 0.
+          t.sliderF("Caustics: DEBUG pin wake depth-scale to 1 (0 = physical)",
+                    &g_causticWakePin, 0.0f, 1.0f, 1.0f, "%.0f");
           // ─── W26 WHERE EACH LAYER STOPS ───────────────────────────────────────────────────────
           // World units, 1 unit = 1.43 cm. Each layer fades to nothing over the NEXT HALF of its
           // window, so one number sets both the reach and the fade. ⚠ THESE ARE THE MODEL'S
@@ -15570,6 +15836,11 @@ namespace {
           //   wakes       -> "Wake: slope gain into the normal"
           // and "Water: FLAT-WATER TEST" takes all three at once, which is the one-switch check
           // that what is on screen is refracted and not painted on.
+          // ⚠ W27c MADE THIS RECIPE TRUE. Until then "Water: wave amplitude" at 0 published a zero
+          // MASTER caustic strength, which gated the consumer's whole block — so the one lever
+          // advertised for isolating the calm layer switched the wake and ripple layers off with it
+          // ("wave amplitude is affecting wake ripples too. we were supposed to isolate it"). The
+          // static layer now has its own lane and the amplitude reaches nothing else.
           t.label("Isolate a caustic layer with its SURFACE slope gain, not its strength:");
           t.label("  calm = Water wave amplitude | splash = Wake sim slope | wake = Wake slope");
           // Reach vs detail on the ripple map, as an INTEGER stride through the fine grid — integer
@@ -15578,6 +15849,13 @@ namespace {
           // swimming and first person need); 2 = the full 1024 units at 2 units/texel.
           t.sliderF("Caustics: ripple reach (1 = 512 units @ 1 u/texel, 2 = 1024 @ 2)",
                     &g_causticRippleStride, 1.0f, 2.0f, 1.0f, "%.0f");
+          // The same trade on the WAKE map, and here 1 is structural rather than a taste: at 2 the
+          // destination is 16 units per texel against a ~16.7-unit filament, so it cannot store a
+          // caustic, and the Hessian's +-1 field tap is then half a destination texel — a second
+          // difference reading detail the map is not allowed to write down, which is per-texel
+          // speckle by construction. 2 reproduces the W26 image, which is what it is here for.
+          t.sliderF("Caustics: wake reach (1 = 4096 units @ 8 u/texel; 2 = 8192 @ 16 = the W26 mush)",
+                    &g_causticWakeStride, 1.0f, 2.0f, 1.0f, "%.0f");
           // ⚠ THE COST MODEL, both of them together. A beam under BOTH thresholds returns without
           // touching memory, so calm water costs five texture loads per cell and disturbed water
           // costs a full splat — which is what makes a dynamic layer affordable at all. Raise them
@@ -16228,6 +16506,30 @@ namespace {
                      g_live.rippleFine.ready ? "ready" : "MISSING - ripple layer disabled",
                      kCausticWakeSlice, (double)kCausticWakeDepth, (double)g_causticWakeMaxDepth,
                      g_live.rippleWake.ready ? "ready" : "MISSING - wake layer disabled");
+        // W27 — EACH DYNAMIC MAP'S OWN DESTINATION LATTICE, which until now was nowhere in the log.
+        // The two [ripple] lines above report the WAVE GRIDS (1024 u and 8192 u); the caustic
+        // windows are a stride through them and are a different number, so "the wake covers 8192
+        // units" was there to be read off the wrong line. It matters because the resolution/window
+        // trade IS the W27 finding: at 16 units per destination texel the map cannot represent a
+        // ~16.7-unit filament at all, so what it stores is aliased residue — and that is not
+        // something anyone can check without the units-per-texel written down. Printed from
+        // causticDynStride() so it reports the lattice the fill will actually build.
+        //
+        // ⚠ THE STRIDES ARE LIVE KNOBS, so this line is the value at CREATION — the env/default
+        // one. Move a stride slider afterwards and the log is describing the map you started with.
+        {
+            const int   rS = causticDynStride(g_causticRippleStride);
+            const int   wS = causticDynStride(g_causticWakeStride);
+            const float rU = std::max(g_live.rippleFine.unitsPerTexel, 0.25f) * (float)rS;
+            const float wU = std::max(g_live.rippleWake.unitsPerTexel, 0.25f) * (float)wS;
+            LOG::logline(">> [caustic] dynamic lattices at creation: ripple stride %d = %.2f u/texel"
+                         " -> %.0f unit window | wake stride %d = %.2f u/texel -> %.0f unit window"
+                         " (a filament is ~%.1f u: a window is only worth its reach while a texel"
+                         " is under half of that)",
+                         rS, (double)rU, (double)(rU * (float)kCausticRes),
+                         wS, (double)wU, (double)(wU * (float)kCausticRes),
+                         (double)(16.7f * (std::max(g_causticTileUnits, 1.0f) / 1024.0f)));
+        }
         return true;
     }
 
@@ -16420,6 +16722,11 @@ namespace {
             const float dt = std::min(std::max(dtFrame, 0.0f), 0.05f) * 0.5f;
             rp->wave[1] = rp1->wave[1] = dt;
             rp->wave[2] = rp1->wave[2] = std::exp(-std::max(g_wakeDamp, 0.0f) * dt);
+            // W28h — the grid-scale e-folding rate, 1/s. The SHADER forms rate*dt/64 and clamps it,
+            // deliberately: dt is already clamped in there against the symplectic-Euler bound, and
+            // forming the group on this side would use a different dt from the one the integrator
+            // actually ran with.
+            rp->wave[3] = rp1->wave[3] = std::max(0.0f, g_wakeGridDamp);
         } else if (mge) {
             // MGE's second-order form, with `a` derived from the wave SPEED so the knob stays in
             // world units per second — the quantity that decides whether the swimmer outruns its
@@ -16439,6 +16746,9 @@ namespace {
         }
         rp->scroll[0] = (float)shiftX;
         rp->scroll[1] = (float)shiftY;
+        // W28k — the fine grid's grad^4 coefficient, per step. In scroll.z because sim.z is already
+        // this grid's decay; written to BOTH sub-step blocks so every step damps identically.
+        rp->scroll[2] = rp1->scroll[2] = std::max(0.0f, g_ripGridDamp);
         // rp1 keeps scroll 0 and impulseCount 0: the domain moves once per frame and the impulse is
         // already in the field by the time the second step runs.
 
@@ -17105,6 +17415,8 @@ namespace ForgeRender {
             { "waterDistortAngular", &g_waterDistortAngular },
             { "waterDistortGain",    &g_waterDistortGain    },
             { "waterRefrOwn",        &g_waterRefrOwn        },
+            { "waterCutRadius",      &g_waterCutRadius      },
+            { "waterCutHeight",      &g_waterCutHeight      },
             // W25: the NORMAL INTENSITY, and it is here because it is now the caustic's calm-water
             // lever as well as the surface's — `waterWaveAmp=0` is how the harness isolates the
             // ripple and wake layers with no checkbox to click.
@@ -17113,6 +17425,7 @@ namespace ForgeRender {
             { "causticTileUnits",    &g_causticTileUnits    },
             { "causticSlopeRms",     &g_causticSlopeRms     },
             { "causticSubBeams",     &g_causticSubBeams     },
+            { "causticDynSubBeams",  &g_causticDynSubBeams  },
             { "causticSlicesPerFrame", &g_causticSlicesPerFrame },
             { "causticSoften",       &g_causticSoften       },
             { "causticDepthDecay",   &g_causticDepthDecay   },
@@ -17123,6 +17436,8 @@ namespace ForgeRender {
             { "causticRippleStr",    &g_causticRippleStr    },
             { "causticWakeStr",      &g_causticWakeStr      },
             { "causticDynSlope",     &g_causticDynSlope     },
+            { "causticDynHess",      &g_causticDynHess      },
+            { "causticWakePin",      &g_causticWakePin      },
             // W26: the three "where does it stop" knobs. causticDistFrac is the one the harness
             // wants for the perf check — 0 turns the distance gate off, so `caustic=` and the tap
             // count with and without it are an A/B on one env var.
@@ -17130,6 +17445,15 @@ namespace ForgeRender {
             { "causticRippleMaxDepth", &g_causticRippleMaxDepth },
             { "causticDistFrac",       &g_causticDistFrac       },
             { "causticRippleStride", &g_causticRippleStride },
+            // W27: the resolution/window trade on the wake map, env-driven so the minimized harness
+            // can A/B 8 u/texel against the W26 16 without a rebuild. The echo below is also how the
+            // wake window gets reported — the creation log prints the grid, not the stride.
+            { "causticWakeStride",   &g_causticWakeStride   },
+            // W28e: the wake sim's k^2 viscosity. Env-driven because the defect it fixes is
+            // PROGRESSIVE — it only shows after the field has been running a while — so measuring it
+            // means a long unattended run, which is exactly what the minimized harness is for.
+            { "wakeGridDamp",        &g_wakeGridDamp        },
+            { "ripGridDamp",         &g_ripGridDamp         },
             { "causticCalmDisp",     &g_causticCalmDisp     },
             { "causticCalmHess",     &g_causticCalmHess     },
         };
@@ -19589,18 +19913,39 @@ namespace ForgeRender {
             cp[kWaterDistortFloat + 0] = std::max(0.0f, std::min(g_waterDistortAngular, 1.0f));
             cp[kWaterDistortFloat + 1] = std::max(0.0f, g_waterDistortGain);
             cp[kWaterDistortFloat + 2] = std::max(0.0f, std::min(g_waterRefrOwn, 1.0f));
-            cp[kWaterDistortFloat + 3] = 0.0f;
+            // W28 — the water cut's radius, world units. In the DISTORT float4 deliberately: the
+            // cut's other half is a refraction-offset cancel (water.frag folds it into reffactorR
+            // beside shoreCancel), so it belongs with the numbers that shape that offset.
+            cp[kWaterDistortFloat + 3] = std::max(0.0f, g_waterCutRadius);
+            // W28c — the cut's own float4: x = the glass box's HEIGHT, yzw spare.
+            cp[kWaterCutFloat + 0] = std::max(0.0f, g_waterCutHeight);
+            cp[kWaterCutFloat + 1] = 0.0f;
+            cp[kWaterCutFloat + 2] = 0.0f;
+            cp[kWaterCutFloat + 3] = 0.0f;
             // W23 — caustics. From the same unconditional block and for the same reason: the map is
             // a MULTIPLIER on sunlight, so a receiver reading a stale or partial lane is a
             // brightness error on every submerged surface, and that must not depend on some other
             // subsystem being up. Strength 0 disarms the consumer's whole block.
             {
-                // ⚠ W25: AND ON THE SURFACE'S OWN SLOPE GAIN. Gain 0 — wave amplitude at zero, or
-                // the flat test — is a mirror, and a mirror casts no caustic, so the lane goes to 0
-                // and the consumer skips its whole static block: bit-exact, not a fade toward a
-                // still-running term. The DISPATCH side reads the same helper (statArmed, in the
-                // caustic block far below), so the two cannot drift apart.
-                const bool on = g_causticOn && g_live.causticReady && waterBaseSlopeGain() > 0.0f;
+                // ⚠⚠ W27c — THIS LANE IS THE MASTER AND IT MUST NOT CARRY THE SURFACE SLOPE GAIN.
+                // It used to read `waterBaseSlopeGain() > 0`, and the note here described the
+                // consequence as "the consumer skips its whole STATIC block". It does not: causStr
+                // gates the ENTIRE caustic block, all three layers (waterfog.h.fsl). So wave
+                // amplitude 0 — which the panel advertises as the way to isolate the calm layer and
+                // look at a wake alone — silently turned the WAKE AND RIPPLE caustics off with it.
+                // Reported as "wave amplitude is affecting wake ripples too, we were supposed to
+                // isolate it", and the recipe was doing the exact opposite of what it promised.
+                //
+                // The physical claim was only ever true of the STATIC layer: a mirror casts no
+                // CALM-WATER caustic. It is false for the dynamic ones, because a swimmer still
+                // deforms the surface at wave amplitude 0 — water.frag ADDS the ripple and wake
+                // slopes to the base normal (slopes add, normals do not), so they survive a flat
+                // base field intact. Only `flatWater` removes them, which is why the flat test
+                // stays here and the amplitude does not.
+                //
+                // The static half moves to its own lane below (waterCaustic3.y), so each layer is
+                // now switched off by the thing that actually silences it.
+                const bool on = g_causticOn && g_live.causticReady && !g_waterFlatTest;
                 cp[kWaterCausticFloat + 0] = on ? std::max(0.0f, g_causticStrength) : 0.0f;
                 cp[kWaterCausticFloat + 1] = 1.0f / std::max(g_causticTileUnits, 1.0f);
                 // sliceIndex = z*log2(depth) + w, pinned so slice 0 lands on kCausticDepths[0] and
@@ -19707,9 +20052,37 @@ namespace ForgeRender {
                          (double)std::exp(-std::pow(500.0f  / cDecayD0, 1.27f)),
                          (double)std::exp(-std::pow(1250.0f / cDecayD0, 1.27f)));
                 }
-                cp[kWaterCaustic3Float + 1] = 0.0f;
-                cp[kWaterCaustic3Float + 2] = 0.0f;
+                // W27c — THE STATIC LAYER'S OWN GATE, split out of causStr above. 0 makes the
+                // consumer skip the calm-water block and leave the composite at the identity, which
+                // is what "flatten the calm water and look at the wake" was always supposed to mean.
+                //
+                // ⚠ IT IS A GATE, NOT A GAIN, and the difference is deliberate. Between 0 and 1 the
+                // amplitude already acts CONTINUOUSLY through causticEffectiveSlope(), which scales
+                // the generator's slope — so a half-amplitude surface casts a genuinely weaker,
+                // less-folded caustic rather than the same pattern dimmed. All this lane has to do
+                // is handle the endpoint, where the generator is not dispatched at all (statArmed)
+                // and its slices would otherwise be read STALE.
+                cp[kWaterCaustic3Float + 1] = (waterBaseSlopeGain() > 0.0f) ? 1.0f : 0.0f;
+                // W27e — the wake depth-scale pin. See g_causticWakePin: a diagnostic that makes
+                // "the map is empty" and "the map is scaled to nothing" tell themselves apart.
+                cp[kWaterCaustic3Float + 2] = std::max(0.0f, std::min(g_causticWakePin, 1.0f));
                 cp[kWaterCaustic3Float + 3] = 0.0f;
+                // W27c VERIFICATION — the four lanes that decide whether each layer reaches the
+                // screen, printed together. "Wave amplitude still kills the wake" is a claim about
+                // exactly these numbers, and reading them is the only way to say whether the defect
+                // is host-side (a lane published 0) or shader-side (a lane published non-zero and
+                // ignored). Every 600 frames, so it costs nothing on the hot path.
+                if ((g_renderFrame % 600u) == 0u) {
+                    LOG::logline(">> [caustic-lanes] master=%.3f staticGate=%.0f ripple=%.3f "
+                                 "wake=%.3f | waveAmp=%.2f baseSlopeGain=%.2f effSlope=%.3f "
+                                 "flatTest=%d",
+                                 (double)cp[kWaterCausticFloat + 0],
+                                 (double)cp[kWaterCaustic3Float + 1],
+                                 (double)cp[kWaterCausticDynFloat + 0],
+                                 (double)cp[kWaterCausticDynFloat + 1],
+                                 (double)g_waterWaveAmp, (double)waterBaseSlopeGain(),
+                                 (double)causticEffectiveSlope(), g_waterFlatTest ? 1 : 0);
+                }
             }
         }
         // SH1 sky-directional ambient. Published from HERE — unconditionally, every frame, right
@@ -21442,10 +21815,10 @@ namespace ForgeRender {
             // is born at field texel (i*stride + offset), an integer, which is what makes all five
             // Hessian taps exact loads instead of bilinear fetches — and what makes the identity
             // prefill exact, since there is then exactly one beam per destination texel.
-            const int   rStride = (int)std::max(1.0f, std::min(std::floor(g_causticRippleStride + 0.5f), 2.0f));
+            const int   rStride = causticDynStride(g_causticRippleStride);
             const int   rOff    = std::max(0, ((int)kRippleGrid - (int)kCausticRes * rStride) / 2);
             const float rUpt    = std::max(g_live.rippleFine.unitsPerTexel, 0.25f);
-            const int   wStride = (int)kCausticWakeStride;
+            const int   wStride = causticDynStride(g_causticWakeStride);
             const int   wOff    = std::max(0, ((int)kWakeGrid - (int)kCausticRes * wStride) / 2);
             const float wUpt    = std::max(g_live.rippleWake.unitsPerTexel, 0.25f);
 
@@ -21464,6 +21837,7 @@ namespace ForgeRender {
             const float wOriginY = dynOrigin(g_live.rippleWake.originY, wOff, wStride, wUpt);
             const float rTpu = 1.0f / (rUpt * (float)rStride);   // destination texels per world unit
             const float wTpu = 1.0f / (wUpt * (float)wStride);
+
 
             // ── WHICH LAYERS ARE ARMED. A layer needs the master caustic gate, a non-zero strength
             // (that is the A/B), its grid to exist, its SIM to be running, and WATER IN THE FRAME.
@@ -21603,7 +21977,11 @@ namespace ForgeRender {
                                  float upt, int stride, int off, float slopeGain, uint32_t fieldGrid) {
                   float* d = (float*)g_live.pCausticCbv[set]->pCpuMappedAddress;
                   if (!d) { return; }
-                  d[0] = 0.0f; d[1] = 0.0f; d[2] = 0.0f;
+                  d[0] = 0.0f; d[1] = 0.0f;
+                  // W29 — cfg.z, the sub-beam count. The static block writes the same lane from
+                  // g_causticSubBeams; this is the dynamic layers' own, because they start from a
+                  // 1.000 beams/texel square lattice and the static map from 1.156 on hex.
+                  d[2] = std::max(1.0f, std::min(g_causticDynSubBeams, 4.0f));
                   d[3] = 1.0f;                              // cfg.w — EMA off; the resolve reads it
                   for (uint32_t i = 0; i < 4; ++i) { d[4 + i] = (i < span) ? depths[i] : 0.0f; }
                   d[8]  = 1.0f - 1.0f / 1.3330f;            // wave.x — c, the same n as the static map
@@ -21626,7 +22004,11 @@ namespace ForgeRender {
                   // over it and is 1 by default for that reason.
                   d[21] = slopeGain * std::max(0.0f, g_causticDynSlope);
                   d[22] = (float)fieldGrid;
-                  d[23] = 0.0f;
+                  // W27b — THE HESSIAN STENCIL, IN FIELD TEXELS, and it is the source low-pass the
+                  // note below asked for. See g_causticDynHess: at +-1 the second difference's
+                  // response PEAKS at the field's own Nyquist, which for a dispersive grid is the
+                  // one mode that never leaves.
+                  d[23] = std::max(1.0f, std::min(std::floor(g_causticDynHess + 0.5f), 4.0f));
                   d[24] = std::max(0.0f, g_causticCalmDisp);
                   d[25] = std::max(0.0f, g_causticCalmHess);
                   d[26] = 0.0f; d[27] = 0.0f;
@@ -21634,12 +22016,32 @@ namespace ForgeRender {
                   // always zero here; it is written rather than skipped because the cbuffer is
                   // persistently mapped and keeps whatever was last put in it.
                   d[28] = 0.0f; d[29] = 0.0f; d[30] = 0.0f; d[31] = 0.0f;
-                  // ⚠ W26b's low-pass is ZERO here, and that is not an omission. It damps the
-                  // surface PER COMPONENT, and these two layers splat from a SAMPLED wave field
-                  // rather than from an analytic sum — there are no components to weight. It costs
-                  // them little: both are windowed shallow (350 / 70 units), where the beam has
-                  // spread 13 and 1.2 units, so the damp their own wavelengths would take is 0.65
-                  // to 0.94. If it ever matters, the field itself is what has to be low-passed.
+                  // ⚠⚠ ZERO, AND W27b PUT IT BACK — THE SPREAD MUST NOT ENTER THE SPLAT KERNEL.
+                  // W27 briefly wrote causticScatterK() here, reasoning that the beam ARRIVES
+                  // SPREAD over sigma = k*D^1.5 however the surface is written down, and that for
+                  // these layers that sigma (0.7-0.8 destination texels) is small enough to fit in
+                  // the kernel where W26b had shown it cannot for the static map (24 texels against
+                  // CAUSTIC_KERNEL_CAP 6). SHIPPED AND REPORTED BACK: "now too faint... increasing
+                  // strength makes it look darker, actually it is just dark, no bright from it."
+                  //
+                  // That is not a tuning miss, it is the mechanism, and W26b already contains it. A
+                  // caustic's histogram is SKEWED — narrow intense filaments over broad shallow
+                  // darks, mean 1. Blurring collapses the peaks (they are the fine structure) and
+                  // barely moves the darks, so what survives sits mostly BELOW 1; and the consumer
+                  // scales the DEVIATION (`caustic *= 1 + rd*str`), so turning the layer up drives
+                  // an already-negative deviation further down. Hence "more strength = darker".
+                  // Second bias on top: inside a disturbed patch the widened beams push weight out
+                  // into the CALM surround, which keeps its own prefill, so the wake carries a local
+                  // deficit while the matching surplus smears where nobody is looking.
+                  //
+                  // ⚠ THE ASYMMETRY W27 MISSED. A source low-pass and an output blur are NOT the
+                  // same operation on a caustic, and W26b measured which way: damping the SOURCE
+                  // RAISED contrast (0.69 -> 0.89 at depth 200) because it removes components before
+                  // they fold into chaos. A blur of the finished map can only LOWER it. "Same
+                  // physics, opposite door" was false — there is only one door.
+                  //
+                  // The original note here ended "if it ever matters, the field itself is what has
+                  // to be low-passed", and that was right. dynOut.w now carries exactly that.
                   d[32] = 0.0f; d[33] = 0.0f; d[34] = 0.0f; d[35] = 0.0f;
               };
               if (ripArmed) {
@@ -21729,6 +22131,26 @@ namespace ForgeRender {
               }
 
               if (dynAny) {
+                  // ⚠⚠ BIND THE RESOLVE PIPELINE HERE, NOT ONLY IN THE STATIC BRANCH ABOVE. This
+                  // dispatch used to inherit whatever the `statArmed` block left bound, which is a
+                  // dependency on a NEIGHBOURING BRANCH HAVING RUN — and the two are gated on
+                  // different things (statArmed is the surface slope gain, dynAny is the two wave
+                  // sims), so there is a live combination where the second runs and the first does
+                  // not: WAVE AMPLITUDE 0.
+                  //
+                  // What happened there: the last pipeline bound was pCausticDynPipeline (the
+                  // SCATTER, bound a few lines up), so the "resolve" dispatch re-ran the scatter
+                  // with the resolve's cbuffer. That block is memset to zero, so gain 0 -> every
+                  // beam calm-exits -> nothing written. gCausticOut is never updated and the
+                  // accumulator is never re-primed to CAUSTIC_WFIX, so the dynamic map FREEZES at
+                  // whatever it last held while the consumer's camera-anchored window keeps moving.
+                  //
+                  // Reported as, in order: "wave amplitude is affecting wake ripples too", "wake
+                  // frozen and follows camera", and "even 0.05 is enough" — 0.05 is enough because
+                  // it makes statArmed true, and the fix was ever only a side effect of that branch.
+                  // Latent since W24: until W27c the consumer skipped every layer at amplitude 0, so
+                  // nobody could see the frozen map.
+                  cmdBindPipeline(g_live.pCmd, g_live.pCausticResolvePipeline);
                   // ⚠ OVER ALL THREE DYNAMIC SLICES, even a layer that did not scatter this frame.
                   // A slice whose scatter was skipped still holds its identity prefill, so this
                   // publishes gain 1 for it — which is exactly what "that layer is off" should look

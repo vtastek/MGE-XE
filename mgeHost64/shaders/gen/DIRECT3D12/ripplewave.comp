@@ -1229,8 +1229,34 @@ void CS_MAIN(uint3 did : SV_DISPATCHTHREADID)
 
     float4 pc = waveFetchPrev(me + shift, size);
     float v = (pc.y - grav * acc * dt) * damp;
+#line 285 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/ripplewave.comp.fsl"
+    float visc4 = clamp(gRippleSimParams.wave.w * dt * (1.0f / 64.0f), 0.0f, 1.0f / 64.0f);
+    if (visc4 > 0.0f) {
+        float c = pc.y;
+        float xm = waveFetchPrev(me + shift + int2(-1, 0), size).y;
+        float xp = waveFetchPrev(me + shift + int2( 1, 0), size).y;
+        float ym = waveFetchPrev(me + shift + int2( 0, -1), size).y;
+        float yp = waveFetchPrev(me + shift + int2( 0, 1), size).y;
+        float xmm = waveFetchPrev(me + shift + int2(-2, 0), size).y;
+        float xpp = waveFetchPrev(me + shift + int2( 2, 0), size).y;
+        float ymm = waveFetchPrev(me + shift + int2( 0, -2), size).y;
+        float ypp = waveFetchPrev(me + shift + int2( 0, 2), size).y;
+        float mm = waveFetchPrev(me + shift + int2(-1, -1), size).y;
+        float mp = waveFetchPrev(me + shift + int2(-1, 1), size).y;
+        float pm = waveFetchPrev(me + shift + int2( 1, -1), size).y;
+        float pp = waveFetchPrev(me + shift + int2( 1, 1), size).y;
+
+
+        float l0 = xm + xp + ym + yp - 4.0f * c;
+        float lxm = xmm + c + mm + mp - 4.0f * xm;
+        float lxp = xpp + c + pm + pp - 4.0f * xp;
+        float lym = ymm + c + mm + pm - 4.0f * ym;
+        float lyp = ypp + c + mp + pp - 4.0f * yp;
+        v -= visc4 * (lxm + lxp + lym + lyp - 4.0f * l0);
+    }
+
     float h = g_wave[base] + v * dt;
-#line 268 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/ripplewave.comp.fsl"
+#line 325 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/ripplewave.comp.fsl"
     float4 sb = gRippleSimParams.srcBounds;
     if (nImp > 0 && float(me.x) >= sb.x && float(me.y) >= sb.y
                  && float(me.x) <= sb.z && float(me.y) <= sb.w)
@@ -1239,7 +1265,10 @@ void CS_MAIN(uint3 did : SV_DISPATCHTHREADID)
         {
             float4 s = gRippleSimParams.impulses[i];
             float d = length(float2(me) - s.xy);
-            float disp = saturate(2.0f * abs(d / max(s.z, 1e-3f) - 1.0f));
+#line 350 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/ripplewave.comp.fsl"
+            float tw = max(0.5f * s.z, 2.0f);
+            float tt = saturate(abs(d - s.z) / tw);
+            float disp = tt * tt * (3.0f - 2.0f * tt);
             h = lerp(-s.w, h, disp);
             v = lerp(0.0f, v, disp);
         }

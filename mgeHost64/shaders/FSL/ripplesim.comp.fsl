@@ -60,7 +60,39 @@ void CS_MAIN(SV_DispatchThreadID(uint3) did)
     {
         float4 imp = gRippleSimParams.impulses[i];
         float  d   = length(float2(id) - imp.xy);
-        h.x += imp.w * smoothstep(1.0f, 0.0f, d / max(imp.z, 1e-3f));
+        float  r   = max(imp.z, 1e-3f);
+        // ⚠⚠ W30: THE IMPULSE IS VOLUME-NEUTRAL, AND WITHOUT THAT NOTHING IT INJECTS EVER LEAVES.
+        // This used to be a bare positive bump, `imp.w * smoothstep(1, 0, d/r)`, which adds NET
+        // VOLUME to the field — and the scheme conserves that volume exactly, forever:
+        //
+        //     v += avg - h    is a discrete Laplacian, whose row-sum is ZERO, so sum(avg - h) = 0
+        //                     and therefore sum(v) is invariant under the wave term;
+        //     v *= decay      damps v, but v started at zero and impulses never touch it, so
+        //                     sum(v) is identically 0 for all time;
+        //     h += v * speed  therefore changes sum(h) by exactly nothing.
+        //
+        // The DC mode is in the KERNEL of the entire operator and the damping only ever sees v.
+        // Measured on the exact update rule: sum(h) held at 310.345 at t = 2, 4, 6, 8 and 10 s while
+        // max|h| fell from 0.111 to 0.011. The waves radiate away and decay; the VOLUME stays put.
+        //
+        // What is left behind is a static, lumpy pedestal shaped like the sum of every impulse
+        // footprint ever laid — an actor's walked path as a row of permanent bumps. A pedestal has
+        // slope, and slope is all either consumer reads, so it is drawn forever. It has no fade
+        // point because it has no decay term: "the problem is drawing them beyond fade point,
+        // something is making them linger."
+        //
+        // ⚠ AND IT CANNOT BE FIXED DOWNSTREAM. Impulse radius changes the bump's shape, not its
+        // volume; hyperviscosity acts on v through grad^4, and a smooth static pedestal has
+        // essentially zero fourth derivative; a slope threshold gates the symptom per texel and
+        // beads the live rings instead (W28j). The injection is the only place this exists.
+        //
+        // The fix is to inject a displacement rather than a quantity of water: a central bump minus
+        // a wider, shallower bowl carrying exactly the same volume. For this profile the volume goes
+        // as rho^2, so the bowl at radius 2r needs weight (r/2r)^2 = 1/4 and the pair sums to zero —
+        // which is also what a real splash does, since the water pushed up has to come from
+        // somewhere. Verified in the same simulation: sum(h) = 0.005 instead of 310.345.
+        h.x += imp.w * (smoothstep(1.0f, 0.0f, d / r)
+                      - 0.25f * smoothstep(1.0f, 0.0f, d / (2.0f * r)));
     }
 
     // v += laplacian; v *= decay; h += v * speed.
@@ -69,6 +101,49 @@ void CS_MAIN(SV_DispatchThreadID(uint3) did)
     float avg = 0.25f * (hL + hR + hT + hB);
     h.y += avg - h.x;
     h.y *= decay;
+
+    // ─── W28k: HYPERVISCOSITY (grad^4) ON THE FINE GRID TOO ─────────────────────────────────────
+    // ⚠⚠ `decay` IS UNIFORM IN k, AND THAT IS NOT ENOUGH, because the thing being DRAWN is not the
+    // thing that decays. Both consumers — water.frag's normal and causticdyn.comp — read the field's
+    // .zw SLOPE, and slope is amplitude TIMES wavenumber. So a uniform decay takes the same fraction
+    // off every wavelength's AMPLITUDE while leaving grid-scale residue with ~30x the slope of a
+    // resolved wave at the same amplitude. Past the point where a ring has visibly gone, what is
+    // still on screen is whatever residue has the highest k: the beading and the aliasing.
+    //
+    // ⚠ AND THE ANSWER IS k-SELECTIVE, NOT MAGNITUDE-SELECTIVE. W28j tried a floor on |slope| at the
+    // write and made it WORSE — a per-texel threshold on a continuous field chops every ring wherever
+    // its slope crosses the line, so the rings broke into beads and the crossing radius simply moved
+    // inward ("6-11 rings are artifacty now"). That is a cellular-automaton rule, which is the very
+    // mechanism the artefact was. A gate cannot distinguish a faint RESOLVED wave from sharp residue;
+    // only the wavenumber can, so the removal has to be spectral.
+    //
+    // grad^4, eigenvalue L^2 where L = 2cos(kx)+2cos(ky)-4: 64 at the Nyquist corner against 0.07 at
+    // 12 texels, ~900:1. Same operator and same clamp as ripplewave.comp (W28h); per-STEP here
+    // because everything in this grid's scheme is per-step. 1/64 is the monotonicity ceiling — past
+    // it the term stops damping and alternates sign at the mode it exists to remove. 0 = off.
+    float gd = clamp(gRippleSimParams.scroll.z, 0.0f, 1.0f / 64.0f);
+    if (gd > 0.0f) {
+        float vL  = rippleFetchPrev(src + int2(-1,  0), size).y;
+        float vR  = rippleFetchPrev(src + int2( 1,  0), size).y;
+        float vT  = rippleFetchPrev(src + int2( 0,  1), size).y;
+        float vB  = rippleFetchPrev(src + int2( 0, -1), size).y;
+        float vLL = rippleFetchPrev(src + int2(-2,  0), size).y;
+        float vRR = rippleFetchPrev(src + int2( 2,  0), size).y;
+        float vTT = rippleFetchPrev(src + int2( 0,  2), size).y;
+        float vBB = rippleFetchPrev(src + int2( 0, -2), size).y;
+        float vLT = rippleFetchPrev(src + int2(-1,  1), size).y;
+        float vLB = rippleFetchPrev(src + int2(-1, -1), size).y;
+        float vRT = rippleFetchPrev(src + int2( 1,  1), size).y;
+        float vRB = rippleFetchPrev(src + int2( 1, -1), size).y;
+        float vC  = rippleFetchPrev(src, size).y;
+        float l0  = vL + vR + vT + vB - 4.0f * vC;
+        float lL  = vLL + vC + vLB + vLT - 4.0f * vL;
+        float lR  = vRR + vC + vRB + vRT - 4.0f * vR;
+        float lT  = vTT + vC + vLT + vRT - 4.0f * vT;
+        float lB  = vBB + vC + vLB + vRB - 4.0f * vB;
+        h.y -= gd * (lL + lR + lT + lB - 4.0f * l0);
+    }
+
     h.x += h.y * min(speed, 2.0f);
 
     // Kill denormal-scale residue so an idle grid settles to exactly zero instead of ringing at

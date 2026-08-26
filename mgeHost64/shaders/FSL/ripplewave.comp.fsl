@@ -250,6 +250,63 @@ void CS_MAIN(SV_DispatchThreadID(uint3) did)
 
     float4 pc = waveFetchPrev(me + shift, size);
     float  v  = (pc.y - grav * acc * dt) * damp;
+
+    // ─── W28h: HYPERVISCOSITY (grad^4) — REMOVE THE GRID SCALE WITHOUT TOUCHING THE WAKE ────────
+    // ⚠ `damp` above is UNIFORM IN k: it takes the same fraction out of a 200-unit wake wave and out
+    // of a 2-texel one. Harmless in a non-dispersive medium, where everything moves at one speed and
+    // short-wavelength junk leaves the domain on its own. Not here: with omega^2 = g|k| the group
+    // velocity is (1/2)sqrt(g/k), so the SHORTEST waves are the SLOWEST and grid-scale excitation
+    // never propagates out — its share of the field only grows, which is what "as time goes on the
+    // wake caustics become aliased and aliased" was.
+    //
+    // ⚠⚠ AND IT MUST BE k^4, NOT k^2. W28e used a plain Laplacian and it was measured against the
+    // two ENDPOINTS only — Nyquist and a 25-texel wake wave — which is precisely the mistake this
+    // codebase keeps making. In the MIDDLE it was catastrophic: at nu = 2 a 6-texel (48-unit) wave
+    // retained 13.5% of itself per second and an 8-texel one 31%. That is the wake's own mid-scale
+    // structure being erased, leaving only the longest waves plus the source's blocky footprint —
+    // reported exactly as "lost gradient look, it became like a cellular automata cell look".
+    //
+    // grad^4 has eigenvalue L^2 where L = 2cos(kx)+2cos(ky)-4, so its selectivity is the SQUARE of
+    // the Laplacian's: 64 at the Nyquist corner against 0.07 at 12 texels, ~900:1. At matched
+    // Nyquist attack that is the difference between 89% and 99.6% survival for the resolved band.
+    //
+    //     lambda (texels)      2      4      8     12     25
+    //     grad^2 survives/s  17.6%  42.0%  77.6%  89.0%  97.3%
+    //     grad^4 survives/s  42.0%  80.5%  98.2%  99.6% 100.0%
+    //
+    // ⚠ THE KNOB IS A RATE, IN 1/s, AND THAT IS WHY IT IS DIVIDED BY 64 HERE. With
+    // visc4 = rate*dt/64 the corner mode's per-step factor is exactly (1 - rate*dt), so over a
+    // second it is e^-rate: the slider IS the e-folding rate of grid-scale content, in physical
+    // units, independent of frame rate. Nothing else in this term needs tuning by eye.
+    // ⚠ MONOTONICITY, NOT MERELY STABILITY: past visc4*64 = 1 the factor goes NEGATIVE and the term
+    // stops damping and starts alternating sign at the very mode it exists to remove. 1/64 is both
+    // the ceiling and the maximum useful value — at it, the corner is annihilated in ONE step.
+    // Clamped here as well as host-side because the grid is PERSISTENT state.
+    float visc4 = clamp(gRippleSimParams.wave.w * dt * (1.0f / 64.0f), 0.0f, 1.0f / 64.0f);
+    if (visc4 > 0.0f) {
+        float c   = pc.y;
+        float xm  = waveFetchPrev(me + shift + int2(-1,  0), size).y;
+        float xp  = waveFetchPrev(me + shift + int2( 1,  0), size).y;
+        float ym  = waveFetchPrev(me + shift + int2( 0, -1), size).y;
+        float yp  = waveFetchPrev(me + shift + int2( 0,  1), size).y;
+        float xmm = waveFetchPrev(me + shift + int2(-2,  0), size).y;
+        float xpp = waveFetchPrev(me + shift + int2( 2,  0), size).y;
+        float ymm = waveFetchPrev(me + shift + int2( 0, -2), size).y;
+        float ypp = waveFetchPrev(me + shift + int2( 0,  2), size).y;
+        float mm  = waveFetchPrev(me + shift + int2(-1, -1), size).y;
+        float mp  = waveFetchPrev(me + shift + int2(-1,  1), size).y;
+        float pm  = waveFetchPrev(me + shift + int2( 1, -1), size).y;
+        float pp  = waveFetchPrev(me + shift + int2( 1,  1), size).y;
+        // The Laplacian at the centre and at its four neighbours: grad^4 is grad^2 of grad^2, which
+        // is a 13-point stencil. Thirteen taps against the 441 the |k| kernel already spends.
+        float l0  = xm + xp + ym + yp - 4.0f * c;
+        float lxm = xmm + c + mm + mp - 4.0f * xm;
+        float lxp = xpp + c + pm + pp - 4.0f * xp;
+        float lym = ymm + c + mm + pm - 4.0f * ym;
+        float lyp = ypp + c + mp + pp - 4.0f * yp;
+        v -= visc4 * (lxm + lxp + lym + lyp - 4.0f * l0);
+    }
+
     float  h  = g_wave[base] + v * dt;
 
     // ---- the moving obstacle (shared with ripplemge.comp) ----------------------------------------
@@ -273,7 +330,26 @@ void CS_MAIN(SV_DispatchThreadID(uint3) did)
         {
             float4 s    = gRippleSimParams.impulses[i];
             float  d    = length(float2(me) - s.xy);
-            float  disp = saturate(2.0f * abs(d / max(s.z, 1e-3f) - 1.0f));
+            // ⚠⚠ W28g — THE SOURCE IS BAND-LIMITED HERE, WHICH IS WHERE IT BELONGS. The pin used to
+            // be `saturate(2*abs(d/r - 1))`: a piecewise-LINEAR V with a kink at the ring and two
+            // more at the band edges. A C0 kink has a 1/k^2 spectral tail, so this injected
+            // grid-scale energy on EVERY sub-step — into modes whose group velocity is zero under
+            // omega^2 = g|k| and which therefore never leave the domain. That is a continuous
+            // source of exactly the content the field cannot carry, and no amount of downstream
+            // damping is the right answer to it (W28e's viscosity is the downstream answer, and it
+            // is fighting this).
+            //
+            // Two changes, and they are one idea: the taper is never allowed to be sub-grid, and it
+            // is C1 rather than C0 (1/k^3 tail). Smoothing alone is not enough — a smooth notch only
+            // two texels wide is NARROWER in support and therefore broader in k, so the width floor
+            // has to come with it.
+            //
+            // ⚠ The ring itself is untouched: full pinning still lands at d = s.z and the profile
+            // still reaches 1 at the band edge, so the wake's radius and depth — which is what sets
+            // the wedge — are exactly as before for any source of radius >= 4 texels.
+            float  tw   = max(0.5f * s.z, 2.0f);          // taper half-width, TEXELS, never sub-grid
+            float  tt   = saturate(abs(d - s.z) / tw);
+            float  disp = tt * tt * (3.0f - 2.0f * tt);   // C1: 1/k^3 instead of the kink's 1/k^2
             h = lerp(-s.w, h,    disp);
             v = lerp(0.0f, v,    disp);
         }

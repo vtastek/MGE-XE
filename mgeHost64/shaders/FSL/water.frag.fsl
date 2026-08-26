@@ -671,6 +671,84 @@ float4 PS_MAIN( VSOutput In )
     float  dist    = length(surfPos);
     float3 EyeVec  = truePlaneOn ? rayDir
                                  : ((dist > 1e-4f) ? surfPos / dist : float3(0, 0, 1));
+    // ─── W28: THE WATER CUT (vtastek) — EVALUATED HERE, APPLIED IN TWO PLACES ────────────────────
+    // The disc of surface removed around the camera while the eye is within ~7 units ABOVE the
+    // waterline: at that height the surface is seen so near edge-on that it smears across the near
+    // field instead of showing what is under it. (Submerged never gets here — the underwater arm
+    // returns ~700 lines below.) waterLevelRel is `waterLevelAbs - eyeAbsZ`, so NEGATIVE above the
+    // water and `-waterLevelRel` is the eye's height over it.
+    //
+    // ⚠ IT MOVED UP HERE FROM THE COMPOSITE, AND THAT MOVE IS THE FEATURE. Sitting at the bottom it
+    // could only hand the finished pixel back to the destination — and the destination it handed it
+    // to was the DISTORTED one, because the refraction offset had been decided 600 lines earlier. So
+    // a hole cut in the surface still refracted as though the surface were there. Evaluated here it
+    // can cancel the offset itself (folded into reffactorR beside shoreCancel), and then the cancel
+    // does the whole job on its own: with the offset at zero `refrDist == refrFlat`, the residual
+    // `kDst*(refrDist - (1-wOwn)*refrFlat)` collapses to nothing and `wOwn` ramps to 0, so the pixel
+    // is delivered by the BLEND — per-sample, undistorted, no operator mismatch at all. Removing the
+    // surface and removing its refraction is one statement, made once.
+    //
+    // ⚠ FIXED RADIUS. The old form was `dist / lerp(1200, 0, above/7)`, one expression doing two
+    // jobs: the lerp that faded the cut out as the eye rose also SHRANK it (120 units at the
+    // waterline, 0 at 7). The size and the fade are separate questions and now have separate terms —
+    // the radius is waterDistort.w at every height in the band, and wcutFade is the fade.
+    // [[feedback_one_knob_two_jobs]]. The old inner/outer ratios are kept exactly (0.900/1.000 for
+    // the cut, 0.889/1.010 for the dark rim), so at the waterline this is the shipped look.
+    // ⚠⚠ W28c — THE CUT IS AN INVISIBLE SPHERE ON THE EYE, AND ITS SHADOW ON THE WATER IS A DISC.
+    // Author's model, after three revisions guessed at the shape: "think of a camera in a glass box
+    // but its height is tiny, so it gets submerged instantly... we expect it to appear suddenly" —
+    // "a sphere would be better for the geometric representation, so it is invisible but cuts the
+    // water."
+    //
+    // ⚠ THE SPHERE IS ALREADY WHAT THE TEST SAYS, and that is worth stating because it does not look
+    // like solid geometry. `dist` is the RANGE from the eye to this water fragment, so `dist < R` is
+    // literally "this fragment is inside a sphere of radius R centred on the camera" — no
+    // projection, no plane maths. Its intersection with the water plane is therefore a disc of
+    // radius sqrt(R^2 - above^2), which is the hole, and the smoothstep across 0.9R..R is that
+    // sphere's own silhouette softened by one texel's worth for antialiasing.
+    //
+    // So there are exactly two numbers and they answer two different questions:
+    //   SIZE       — waterDistort.w, the sphere's radius. Never varies.
+    //   ACTIVATION — waterCut.x, the height above the water at which the sphere is switched on.
+    //                Small => the eye crosses it in a frame or two => the hole appears AT ONCE.
+    // The cut's strength is 0 or 1 and nothing else, ever.
+    //
+    // ⚠ AND THE TWO MODELS ARE ONE KNOB APART. A sphere with no gate switches on when the eye first
+    // comes within R of the surface, and the disc then GROWS from a point — which is precisely the
+    // "appears early, tiny hole" complaint at R = 120. Setting the activation height >= R makes the
+    // gate looser than the sphere, so the sphere alone governs and the pure-geometry behaviour is
+    // back. Below R, the gate decides and the hole is sudden. One number spans both.
+    //
+    // ⚠ THE TWO EARLIER SHAPES WERE THE SAME MISTAKE TWICE, both trying to make SIZE carry the
+    // transition. A flat radius with a strength fade (W28) makes the cut PARTIAL — and a partial cut
+    // is a blend of the surface with what is behind it, so the disc kept a fraction of the surface's
+    // REFLECTION ("refraction appears and then reflections fade... which shouldn't have any
+    // reflection"). A shrinking radius with a floor (W28b) makes the FLOOR decide the switch-on
+    // height, because the disc this opens on the water plane has radius sqrt(R^2 - above^2) and is
+    // EMPTY until R exceeds the eye's height above the water — so a 40-unit floor turned the hole on
+    // 40 units up instead of ~6.6 ("there is always a tiny size hole, the hole appears early in
+    // camera z's descent"). Size and activation are different questions and need different terms.
+    //
+    // ⚠ AND IT IS A REAL CUT ALREADY, which answers "maybe we can cut the water geometry for real?".
+    // Inside the disc wcut is 0, so `result` is zeroed and kDst goes to 1: the blend delivers 100% of
+    // what is behind, and on this path the surface does not write depth either (g_waterZWrite is
+    // camera-side and OFF above water). That is bit-for-bit what a hole in the mesh would produce,
+    // without a second mesh, a stencil or a discard. What was wrong was never the mechanism — it was
+    // the shape of the activation.
+    //
+    // ⚠ `above` AND `wcutH` ARE BOTH UNIFORM over the draw, so this branch is coherent: no
+    // divergence, and the suddenness is purely temporal — there is no spatial edge to alias.
+    float  wcutR    = max(gShadowParams.waterDistort.w, 0.0f);
+    float  wcutH    = max(gShadowParams.waterCut.x, 0.0f);
+    float  wcutAbove = max(-waterLevelRel, 0.0f);          // eye height above the water, units
+    float  wcut     = 1.0f;      // 1 = surface intact. Multiplies `result` and the refraction offset.
+    float  wcutdark = 0.0f;      // the dark rim at the lip, a x*(1-x) band across the transition.
+    if (wcutR > 0.0f && wcutAbove < wcutH) {
+        float wd = smoothstep(0.889f * wcutR, 1.010f * wcutR, dist);
+        wcut     = smoothstep(0.900f * wcutR, 1.000f * wcutR, dist);
+        wcutdark = saturate(wd * (1.0f - wd) * 3.0f);
+    }
+
 
     // Forge-frame near fog scalar (1 = clear, 0 = full fogColNear), matching opaque.frag.
     // Through the shared helper (fog.h.fsl) so water cannot end up on a different fog LAW from the
@@ -1866,7 +1944,13 @@ float4 PS_MAIN( VSOutput In )
     // water the reflection carries no information either — the mirror image of a beach seen at
     // grazing incidence is the beach — so leaving the reflection tap at full amplitude while the
     // refraction faded left the waterline wobbling in the one term that still had weight.
-    float2 reffactorR = (1.0f - fresnel) * shoreCancel * reffactor;
+    // ⚠ `wcut` JOINS shoreCancel AS A THIRD CANCEL, and it is the same kind of statement: a place
+    // where the tap must not step. Where the surface has been cut away there is no interface left to
+    // refract through, so the offset goes to zero with it and the cut shows the destination straight.
+    // Folding it HERE rather than at the composite is what makes that exact — reffactorR is what
+    // `ruv`, the depth probe `distUV`, and `wOwn` are all built from, so one multiply takes the
+    // distortion out of every one of them at once instead of three places agreeing to.
+    float2 reffactorR = (1.0f - fresnel) * shoreCancel * wcut * reffactor;
 
     // --- refraction (depth-gated, distorted) ---
     float2 distUV   = clampAllocUV(baseUV + reffactorR.yx * invAlloc);
@@ -2427,11 +2511,9 @@ float4 PS_MAIN( VSOutput In )
     if (!noReflect) { result += tonemapInPass(spec); }
 
     // --- water cut feature (vtastek) ---
-    float wdist = dist / lerp(1200.0f, 0.0f, saturate((-waterLevelRel) / 7.0f));
-    float wcut = smoothstep(0.09f, 0.1f, wdist);
-    float wcutdark = smoothstep(0.0889f, 0.101f, wdist);
-    wcutdark = wcutdark * (1.0f - wcutdark);
-    wcutdark = saturate(wcutdark * 3.0f);
+    // W28: `wcut` and `wcutdark` are computed near the top of the shader now, because the cut also
+    // has to cancel the refraction offset and that decision is made 600 lines above this line. What
+    // is left here is the half that was always here: handing the pixel back to the destination.
     // lerp(refracted, result, wcut) — the cut hands the pixel back to what is behind it, so the
     // weight it takes off `result` goes onto kDst.
     result = result * wcut;

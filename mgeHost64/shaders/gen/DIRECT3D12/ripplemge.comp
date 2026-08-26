@@ -1075,11 +1075,10 @@ void CS_MAIN(uint3 did : SV_DISPATCHTHREADID)
         {
             float4 s = gRippleSimParams.impulses[i];
             float d = length(float2(id) - s.xy);
-
-
-
-
-            float disp = saturate(2.0f * abs(d / max(s.z, 1e-3f) - 1.0f));
+#line 129 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/ripplemge.comp.fsl"
+            float tw = max(0.5f * s.z, 2.0f);
+            float tt = saturate(abs(d - s.z) / tw);
+            float disp = tt * tt * (3.0f - 2.0f * tt);
             uNext = lerp(-s.w, uNext, disp);
             uStore = lerp(-s.w, uStore, disp);
         }
