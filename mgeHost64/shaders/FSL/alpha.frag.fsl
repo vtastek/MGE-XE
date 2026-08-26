@@ -124,6 +124,10 @@ float4 PS_MAIN( VSOutput In )
     // W7b — absorption on the way IN, before the point-light loop adds into `d` (waterfog.h.fsl,
     // and see opaque.frag for why point lights are excluded). Lockstep with opaque.frag.
     { float3 tSun, tAmb; waterLightTransmit(In.WorldPos, tSun, tAmb); d *= tSun; a *= tAmb; }
+    // W32 — a submerged lamp is a caustic PROJECTOR (waterfog.h.fsl). Hoisted out of the loop: above
+    // water this is ONE cbuffer compare for the whole fragment instead of one call per light, and
+    // above water is where all the point-light iterations are.
+    bool causProj = causticProjectorActive(In.WorldPos);
     // NO AO on the ambient either — the same argument as the bent normal above, carried to its
     // conclusion. gAO is built from the Z-prepass and alpha sheets are not in it, so aoSample at
     // this pixel is the OPAQUE SURFACE BEHIND the sheet. Multiplying by it does not darken the
@@ -177,10 +181,25 @@ float4 PS_MAIN( VSOutput In )
 
             float  ndlp    = dot(N, toLight) * invDist;
             float  lambert = twoSidedLight ? abs(ndlp) : saturate(ndlp);   // two-sided lights the far face
-            d += lambert * att * lightCol;
+            // W32 — the mirror gobo. A mean-1 MULTIPLIER on the direct term, never a second light:
+            // the reflected flux is extra energy, and adding it would move the frame's level and
+            // put the exposure servo to work.
+            // ⚠ THE MULTIPLY IS INSIDE THE BRANCH, NOT A `* 1.0` OUTSIDE IT — see opaque.frag.fsl:
+            // leaving the original expressions textually untouched is what makes "strength 0 is
+            // bit-identical" a property of the code rather than a bet on the compiler.
+            // ⚠ AND THE FAR-FACE TRANSMISSION TAKES THE SAME GAIN: it is the SAME light arriving at
+            // the SAME fragment, only leaving by the other face, so the surface pattern that shaped
+            // it on the way in is unchanged.
+            float3 lightAdd = lambert * att * lightCol;
+            float3 transAdd = saturate(dot(-N, toLight) * invDist) * att * lightCol;
+            if (causProj) {
+                float g = causticProjector(In.WorldPos, posR.xyz);
+                lightAdd *= g; transAdd *= g;
+            }
+            d += lightAdd;
             // Change 3: this light transmitting through the far face — back-facing lambert, reusing
             // the same att (incl. the shadow nibble above, so transmitted light is occluded too).
-            transLit += saturate(dot(-N, toLight) * invDist) * att * lightCol;
+            transLit += transAdd;
         }
     }
     d *= gFrameData.dbgScales.y;

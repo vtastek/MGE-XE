@@ -209,6 +209,10 @@ float4 PS_MAIN( VSOutput In )
     // to the sun and ambient terms only, before the point lights below add into `result`.
     float3 tSunW, tAmbW;
     waterLightTransmit(In.WorldPos, tSunW, tAmbW);
+    // W32 — a submerged lamp is a caustic PROJECTOR (waterfog.h.fsl). Hoisted out of BOTH light
+    // loops below: above water this is one cbuffer compare for the whole fragment instead of one
+    // call per light. The seabed is terrain, so this is the surface the whole feature is aimed at.
+    bool causProj = causticProjectorActive(In.WorldPos);
     float3 result = albedo
                   * (gFrameData.sunCol.rgb * saturate(dot(-gFrameData.sunDir.xyz, normal)) * sunVis
                         * tSunW
@@ -311,7 +315,12 @@ float4 PS_MAIN( VSOutput In )
                     att *= float(nib) * (1.0f / 15.0f);
                 }
                 float lambert = saturate(dot(normal, toL) * invD);
-                pointDiffuse += lambert * att * lcol;
+                // W32 — the mirror gobo: a mean-1 multiplier on the direct term, not a second light.
+                // Multiply INSIDE the branch, so at strength 0 the original expression is textually
+                // untouched and the A/B is bit-exact (see opaque.frag.fsl).
+                float3 lightAdd = lambert * att * lcol;
+                if (causProj) { lightAdd *= causticProjector(In.WorldPos, posR.xyz); }
+                pointDiffuse += lightAdd;
             }
         }
     }
@@ -362,7 +371,12 @@ float4 PS_MAIN( VSOutput In )
                 float att  = 1.0f / max(fo.z * d2 + fo.y * d + fo.x, 1e-4f);
                 att *= 1.0f - smoothstep(POINT_LIGHT_TAIL * reach, reach, d);
                 float lambert = saturate(dot(normal, toL) * invD);
-                pointDiffuse += lambert * att * lcol;
+                // W32 — the mirror gobo: a mean-1 multiplier on the direct term, not a second light.
+                // Multiply INSIDE the branch, so at strength 0 the original expression is textually
+                // untouched and the A/B is bit-exact (see opaque.frag.fsl).
+                float3 lightAdd = lambert * att * lcol;
+                if (causProj) { lightAdd *= causticProjector(In.WorldPos, posR.xyz); }
+                pointDiffuse += lightAdd;
             }
         }
     }

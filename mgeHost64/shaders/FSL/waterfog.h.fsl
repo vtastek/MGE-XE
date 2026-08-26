@@ -721,6 +721,325 @@ void waterLightTransmit(float3 worldPosRel, out float3 tSun, out float3 tAmb)
     }
 }
 
+// ─── W32: A SUBMERGED LAMP IS A CAUSTIC PROJECTOR, AND IT CASTS BY REFLECTION ───────────────────
+//
+// "If a light source is placed underwater, that's meant to be a caustics projector." Right, and the
+// mechanism is NOT the one waterLightTransmit above models.
+//
+// A caustic needs an INTERFACE between the source and the receiver. A lamp underwater and a rock
+// underwater have no surface between them, so the DIRECT path carries no caustic at all — the same
+// geometry opaque.frag.fsl already argues for absorption ("a torch carried underwater is not dimmed
+// by the column above it — its path is light->fragment, not surface->fragment"). What a submerged
+// lamp does is shine UP: past the critical angle, asin(1/1.333) = 48.6 deg, every ray is TOTALLY
+// internally reflected at 100% efficiency back down onto the seabed. The rippled surface is a
+// wobbling MIRROR, and that is the pool-light-at-night look.
+//
+// ⚠ AND THE MIRROR IS 8x STRONGER THAN THE SUN'S REFRACTION, which is why it reads so hard:
+//
+//     refraction (the sun)          1 - 1/n = 0.2498 of surface slope   (kRefrDevAir)
+//     reflection (a submerged lamp) 2.0                                 (mirror law)
+//
+// Ratio 8.006. Same ripple, eight times the deflection — so a lamp's caustics stay crisp and
+// high-contrast exactly where the sun's have washed out.
+//
+// ⚠⚠ THE CONSEQUENCE IS THAT NO NEW MAP IS NEEDED, AND THAT IS THE WHOLE FEATURE. The static ladder
+// is generated at q = c*D over D = 32..1250, i.e. q = 8..312 units of displacement. For the mirror
+// q = 2*l, so the five shipped slices ALREADY span mirror path lengths l = 4..156 units, with the
+// existing one-slice fade carrying it to 390. Nothing is added to the generator, no slice is added
+// to the array, and no GPU work is created outside the consumer's own taps.
+//
+// ⚠ SO `shift` IS REPLACED, NOT REUSED. The static consumer above translates by depth*tanW along the
+// sun's bearing because the map is a NADIR-propagated caustic and the sun is not at the nadir. The
+// same reasoning applies here — the map is reusable for any direction — but here the crossing point
+// is known EXACTLY (step 2 below), so this takes the exact surface intersection instead of a
+// first-order translation of it.
+//
+// KNOWN APPROXIMATION, STATED: past the critical angle the mirror rays are oblique (>= 48.6 deg), so
+// the true pattern is STRETCHED along the bearing. Not modelled — the same second-order shear the
+// sun path deliberately drops (caustic.srt.h).
+//
+// ⚠ MEAN-1 MULTIPLIER, NOT A SECOND LIGHT — AND THE THREE CHANNELS REACH THAT ANSWER TWO WAYS.
+// The TIR channel's flux is physically EXTRA light: it went up and came back, so adding it as a
+// second contribution from the mirrored position would change scene energy and put the exposure
+// servo to work. The two REFRACTING channels carry no extra light at all — theirs is the very light
+// the direct term already delivers, merely patterned by the surface it crossed — so for them a
+// multiplier is not a compromise, it is the whole and exact statement. Both arguments land on a
+// mean-1 GAIN on the direct term: the gobo the request asks for, energy-neutral by construction,
+// consistent with the contract every other caustic layer honours. A true second bounce is a
+// follow-up, not this.
+//
+// ⚠ ENERGY-NEUTRAL IN RADIANCE IS NOT ENERGY-NEUTRAL ON SCREEN. These add CONTRAST, and the delivered
+// image is read through AgX, which is concave — so E[f(X)] < f(E[X]) and the measured apl LEVEL drops
+// even though no light was added or removed. The tell is that p50 moves while p90 does not; see
+// [[feedback_mean1_is_not_display_mean1]] before reading a level A/B as a leak.
+
+bool causticProjectorActive(float3 worldPosRel)
+{
+    if (!waterFogActive()) { return false; }
+    // ⚠ W34 — WHICH LANES CAN REACH THIS FRAGMENT DEPENDS ON WHICH SIDE OF THE SURFACE IT IS ON, AND
+    // A SUBMERGED FRAGMENT CAN NOW BE SERVED BY TWO OF THEM. Below the surface it can be lit through
+    // the surface by a lamp under it (.x, the TIR mirror) or by one above it (.z, refracted in);
+    // above the surface only a submerged lamp can reach it through the surface (.y). Still one
+    // compare's worth of work for the whole draw either way.
+    if (waterFogDepthBelow(worldPosRel) > 0.0f) {
+        return gShadowParams.waterCausticProj.x > 0.0f
+            || gShadowParams.waterCausticProj.z > 0.0f;
+    }
+    return gShadowParams.waterCausticProj.y > 0.0f;
+}
+
+// The mean-1 gain a point light puts on this fragment THROUGH THE WATER SURFACE. EXACTLY 1.0 when
+// the feature is off, when light and fragment are on the same side of the surface with no interface
+// between them, or when the geometry has no crossing — so a caller's `*` is the identity and the A/B
+// at strength 0 is bit-exact.
+//
+// ─── THE THREE CHANNELS, AND THEY ARE ONE CONSTRUCTION ──────────────────────────────────────────
+//
+// A caustic needs an INTERFACE between the source and the receiver, so what a light does to a
+// fragment is decided entirely by which sides of the surface the two are on:
+//
+//   lamp UNDER, fragment UNDER   W32 .x  TOTAL INTERNAL REFLECTION      2.0            mirror image
+//   lamp UNDER, fragment ABOVE   W33 .y  refracts OUT into the air      kRefrDevWater  apparent depth
+//   lamp ABOVE, fragment UNDER   W34 .z  refracts IN, onto the bottom   kRefrDevAir    apparent height
+//   lamp ABOVE, fragment ABOVE     —     no surface between them        —              identity
+//
+// ⚠ W34 IS THE SUN'S OWN MECHANISM FROM A POINT SOURCE, AND THE ARITHMETIC SAYS SO OUT LOUD: its
+// deviation per unit surface slope is kRefrDevAir, the same constant the sun path uses, so its
+// D_eff/pathLength ratio is EXACTLY 1 and it indexes the ladder the way the ladder was built to be
+// indexed. It is the caustic everybody can name — the pattern on the floor of a lit pool — and it is
+// what "some lights are placed above water but still meant to be caustic projectors" is asking for.
+//
+// ⚠ NO SPHERE-PLANE INTERSECTION TEST IS NEEDED, AND THAT IS BETTER THAN HAVING ONE. "Does this
+// light's reach touch the water" is the CONSERVATIVE form of a question we can answer EXACTLY per
+// fragment: a straight line from a point above the plane to a point below it crosses the plane, full
+// stop, and the caller's own `dist2 >= reach*reach` early-out has already established that this light
+// reaches this fragment. So the intersection is implicit, exact, and free. (The host still COUNTS
+// the sphere-plane hits, but only as a diagnostic — see [caustic-lanes] — so that "my lamp casts
+// nothing" can be told apart from "no lamp was ever in play".)
+//
+// ⚠ AND IT NEEDS NOTHING FROM THE FIXTURE. These are often FIXTURELESS lights — bare authored
+// markers with no mesh, placed at whatever height spread the illumination nicely — so their offset
+// above the water carries no physical intent and must not be second-guessed. The construction is
+// pure geometry and works at any height; a lamp 200 units up simply lands on a deeper slice.
+//
+// ⚠ ONE VIRTUAL SOURCE RULE COVERS ALL THREE. Place the image of the light such that a STRAIGHT line
+// from it to the fragment crosses the surface at the point that actually cast that fragment's light:
+//   * same medium, reflected  -> the MIRROR image, w + d.
+//   * seen from air into water -> apparent depth  d/n   (the pool looks shallower than it is)
+//   * seen from water into air -> apparent height h*n   (which is why the sky crowds into the Snell
+//                                 cone when you look up from underwater)
+// The last two are reciprocal, as they must be, and the plane crossing is then ONE expression for
+// all three because the image and the fragment always end up on opposite sides of the plane.
+//
+// ⚠ AND ALL THREE MEET AT GAIN 1.0 ON THE WATERLINE. At worldPosRel.z == w the crossing parameter t
+// is 1 in every branch, so pathLength is 0, so the ladder's own fade-in walks the gain to exactly 1
+// from every side. The seams are C0 with nothing to cross-fade — the same property, for the same
+// reason, that the note at the top of this file makes about the fog itself.
+//
+// ⚠ LEAKS ARE ALREADY HANDLED, BY THE THING THAT HANDLES THEM FOR THE LIGHT ITSELF. This is a
+// MULTIPLIER on `lambert * att * lightCol`, and `att` has already been through the point-light
+// shadow nibble by the time it gets here — so a fragment the lamp cannot actually see contributes
+// zero and the gobo multiplies zero. A caustic can never appear anywhere the light does not. (The
+// residual is lights with no shadow slot, which spill on their own account; that is the existing
+// slot budget, not something this adds.)
+//
+// ⚠ THE INFINITE-PLANE LIMITATION IS INHERITED, NOT ADDED. The crossing point is computed against an
+// unbounded plane, so a dry floor that happens to sit below the water level is treated as submerged
+// — exactly as waterFogDepthBelow and the unified fog already treat it. If caustics appear somewhere
+// dry, the fog is wrong there too and that is the bug to chase; this only makes it easier to see.
+//
+// Both positions are CAMERA-RELATIVE, which is the space every colour frag's WorldPos and every
+// entry of gLights.lights[] is already in, so nothing has to be converted and no precision is spent
+// forming an absolute coordinate to immediately subtract it again
+// ([[project_forge_precision_far_origin]]).
+float causticProjector(float3 worldPosRel, float3 lightPosRel)
+{
+    float w = waterFogPlaneRelZ();
+    bool  fragBelow  = waterFogDepthBelow(worldPosRel) > 0.0f;
+    bool  lightBelow = lightPosRel.z < w;
+    // NO INTERFACE BETWEEN THEM. A lamp in the air lighting a wall in the air never crosses the
+    // surface, so there is nothing to focus its light and nothing here to model. (What such a lamp
+    // CAN do is glint off the surface onto the wall, which is a specular reflection off a rough
+    // mirror rather than a caustic through a lens — a different mechanism, and not this one.)
+    if (!fragBelow && !lightBelow) { return 1.0f; }
+
+    // Distance of the LIGHT from the plane, whichever side it is on. Guards the divide below, whose
+    // denominator this bounds: |P.z - virt.z| >= lampOff / n in every branch. A lamp sitting exactly
+    // ON the surface has no column to cast through.
+    float lampOff = abs(lightPosRel.z - w);
+    if (lampOff <= 1.0e-4f) { return 1.0f; }
+
+    float strength = fragBelow ? (lightBelow ? gShadowParams.waterCausticProj.x
+                                             : gShadowParams.waterCausticProj.z)
+                               : gShadowParams.waterCausticProj.y;
+    if (strength <= 0.0f) { return 1.0f; }
+
+    // 1. THE VIRTUAL SOURCE — see the rule above. Mirror when the light is reflected back at the
+    //    fragment's own side; otherwise the refracted image as seen from the medium the FRAGMENT is
+    //    in, which is what makes a straight line to it cross the surface in the right place.
+    float virtZ;
+    if (lightBelow) {
+        virtZ = fragBelow ? (w + lampOff)                 // TIR mirror image, above the surface
+                          : (w - lampOff / kWaterIOR);    // apparent DEPTH, still below it
+    } else {
+        virtZ = w + lampOff * kWaterIOR;                  // apparent HEIGHT, further up than the lamp
+    }
+    float3 virtPos = float3(lightPosRel.xy, virtZ);
+
+    // 2. WHERE THAT RAY CROSSES THE SURFACE. ONE expression for all three channels: the image and the
+    //    fragment always end up on OPPOSITE sides of the plane, so t lands in (0, 1) either way and
+    //    no clamp is standing in for a case that cannot happen. The signs cancel when both the
+    //    numerator and the denominator are negative, which is the two image-above cases.
+    float3 toFrag = worldPosRel - virtPos;
+    float  t      = (w - virtPos.z) / (worldPosRel.z - virtPos.z);
+    float2 surfXY = virtPos.xy + t * toFrag.xy;
+
+    // 3. PATH LENGTH, surface crossing -> fragment. Real propagation distance, and the medium it runs
+    //    through is decided by which side the FRAGMENT is on — S is on the surface, so the segment
+    //    S->P lies wholly in the fragment's own medium. That is what step 6 keys the blur off.
+    float  segLen = length(toFrag);
+    float  pathL  = (1.0f - t) * segLen;
+    if (pathL <= 0.0f) { return 1.0f; }
+
+    // 4. THE CRITICAL-ANGLE GATE — THE TIR CHANNEL ONLY, AND IT IS A FEATURE RATHER THAN A CUTOFF.
+    //    cosInc is the ray's angle from the surface normal; TIR happens only OUTSIDE the Snell cone,
+    //    i.e. below kWaterCosCrit. So a submerged lamp has a DARK DISC directly above it and its
+    //    caustic ring starts outside that — the pool-light signature, and the thing to look for when
+    //    checking the mechanism is the mirror rather than a copy of the sun path. Softened over the
+    //    last 15% of the cosine because Fresnel rises steeply but continuously to 1 at the critical
+    //    angle; a hard step there would draw a circle nothing in the physics has.
+    //
+    // ⚠ NEITHER REFRACTING CHANNEL HAS SUCH A GATE, AND NEITHER MAY BE GIVEN ONE. Going water->air,
+    //   every ray that reached an above-water fragment escaped, so its water-side angle is inside the
+    //   cone BY CONSTRUCTION. Going air->water there is no TIR at all — that only happens dense-to-
+    //   rare. The tempting extra is a Fresnel fade at grazing, and it is wrong twice over: what ships
+    //   here is a mean-1 gobo, so it says nothing about how MUCH light arrives, and 100% of what does
+    //   arrive came through the surface and is patterned. Worse, grazing exit is exactly the geometry
+    //   of light rippling on a wall AT the waterline — the most recognisable caustic there is — so a
+    //   fade there would delete the picture these channels exist to draw.
+    float  tir = 1.0f;
+    if (fragBelow && lightBelow) {
+        float cosInc = abs(toFrag.z) / max(segLen, 1.0e-4f);
+        tir = 1.0f - smoothstep(kWaterCosCrit * 0.85f, kWaterCosCrit, cosInc);
+        if (tir <= 0.0f) { return 1.0f; }
+    }
+
+    // 5. THE EFFECTIVE DEPTH THAT INDEXES THE SHIPPED LADDER. The map's slice at depth D holds a
+    //    displacement q = kRefrDevAir * D, so any channel is read at D_eff = (its own deviation per
+    //    unit surface slope / kRefrDevAir) * pathL:
+    //      TIR mirror   2.0            -> 8.006 * pathL   (reaches    4..156  units)
+    //      refract out  kRefrDevWater  -> n     * pathL   (reaches   24..936  units)
+    //      refract in   kRefrDevAir    -> 1.0   * pathL   (reaches   32..1250 units)
+    //    ⚠ THE LAST RATIO IS EXACTLY 1 AND THAT IS THE CHECK, NOT A COINCIDENCE: air->water is the
+    //    SUN's own deviation, so this channel indexes the ladder the way the ladder was built to be
+    //    indexed, and its reach is the ladder's own 32..1250 depth range verbatim.
+    //    Wind rides waterCaustic.w exactly as it does for the sun — slope and path enter as a
+    //    product, so a rougher surface is a deeper effective water to this map on every channel.
+    float  devPerSlope = fragBelow ? (lightBelow ? 2.0f : kRefrDevAir) : kRefrDevWater;
+    float  dEff = (devPerSlope / kRefrDevAir) * pathL;
+    float  sIdx = gShadowParams.waterCaustic.z * log2(max(dEff, 1.0f))
+                + gShadowParams.waterCaustic.w;
+    float  fade = saturate(sIdx + 1.0f)
+                * (1.0f - saturate(sIdx - (float)(CAUSTIC_SLICES - 1)));
+
+    // 6. ⚠⚠ THE FOLD USES D_eff, THE BLUR USES pathL, AND MIXING THEM UP COSTS A FACTOR OF EIGHT.
+    // cdecay is the MEDIUM's contrast decay — a physical path blur over real distance travelled
+    // through real water. Feeding it dEff would over-blur the mirror channel by 8x and delete the
+    // very sharpness that is its whole signature. Feeding the ladder pathL would under-fold it by 8x
+    // and give back the sun's pattern. Two different quantities that happen to share a unit.
+    //
+    // ⚠ AND IT IS SKIPPED ON THE REFRACT-OUT CHANNEL, because THAT path is through AIR. Nothing in
+    // cd0 is about air: it is derived from the WATER's own sigma_s, and applying it to an air path
+    // would make a cave ceiling lose its caustics on a schedule set by how murky the pool is. The
+    // test is `fragBelow` and not the channel, because S sits on the surface — so the segment S->P is
+    // in water exactly when the fragment is.
+    float  cdecay = 1.0f;
+    if (fragBelow) {
+        float cd0 = gShadowParams.waterCaustic3.x;
+        // max() for the reason the sun path states: pow() of a negative base is NaN, and a NaN here
+        // multiplies a light and survives every later multiply by zero
+        // ([[project_nan_survives_zero_multiply]]).
+        cdecay = (cd0 > 0.0f) ? exp(-pow(max(pathL, 0.0f) / cd0, 1.27f)) : 1.0f;
+    }
+
+    float  k = saturate(strength) * tir * cdecay;
+    if (k <= 0.0f) { return 1.0f; }
+
+    // The three layers compose by multiplication, starting at the identity, exactly as the sun's do:
+    // displacements add, so Jacobians multiply to first order, so GAINS multiply, and independent
+    // mean-1 fields multiply to a mean-1 field.
+    float caustic = 1.0f;
+
+    // STATIC (calm-water) LAYER — same slices, same log-depth blend, same gate. No `shift`: step 2
+    // above IS the shift, done exactly, so the lookup is at the surface point that actually cast this
+    // fragment's light. WORLD-anchored like every other field here, which is what makes the pattern
+    // stay on the surface when the camera moves.
+    if (fade > 0.0f && gShadowParams.waterCaustic3.y > 0.0f) {
+        float2 uv = (gFrameData.lodEye.xy + surfXY) * gShadowParams.waterCaustic.y;
+        float  s0 = clamp(floor(sIdx), 0.0f, (float)(CAUSTIC_SLICES - 1));
+        float  s1 = min(s0 + 1.0f, (float)(CAUSTIC_SLICES - 1));
+        float  sf = saturate(sIdx - s0);
+        // No dispersion fringe: it is a directional derivative along the SUN's bearing, and neither
+        // channel has the sun's direction to take it along. n(lambda) cannot enter a MIRROR at all,
+        // and on the refract-out channel it enters at 1.333x the sun's 1.8% — still far under a
+        // texel at any tile size we would use, which is the same reason the sun's fringe is an
+        // authored exaggeration rather than a measurement.
+        caustic = 1.0f + causticFetch(uv, s0, s1, sf) * fade;
+    }
+
+    // ─── THE DYNAMIC LAYERS, AND THIS IS THE "DYNAMIC CAUSTICS" HALF OF THE ASK ──────────────────
+    // It comes free: the ripple and wake fields are already live and already sampled at a surface
+    // point, so a splash beside the lamp moves its caustics with no new generator work. Their windows
+    // (70 / 350 units of D_eff) put the live contribution inside pathL <~ 44 units — which is the
+    // MODEL's bound, not a budget: a 10-22 unit rain ripple has nothing to say further out.
+    // Eye-relative, so surfXY goes in as-is, unlike the world-anchored static tile above.
+    float ripStr = gShadowParams.waterCausticDyn.x;
+    if (ripStr > 0.0f) {
+        float2 ruv = (surfXY - gShadowParams.waterCausticRip.xy)
+                   * (gShadowParams.waterCausticRip.z / max(gShadowParams.waterCausticRip.w, 1.0f));
+        float redge = causticDynEdge(ruv);
+        if (redge > 0.0f) {
+            float rIdx = gShadowParams.waterCausticDyn.z * log2(max(dEff, 1.0f))
+                       + gShadowParams.waterCausticDyn.w;
+            float rMax = gShadowParams.waterCaustic2.w;
+            float rf = saturate(rIdx + 1.0f)
+                     * (1.0f - smoothstep(rMax, 1.5f * rMax, dEff));
+            if (rf > 0.0f) {
+                float r0 = clamp(floor(rIdx), 0.0f, (float)(CAUSTIC_RIPPLE_SLICES - 1));
+                float r1 = min(r0 + 1.0f, (float)(CAUSTIC_RIPPLE_SLICES - 1));
+                float rd = lerp(causticDynFetch(ruv, (float)CAUSTIC_RIPPLE_BASE + r0),
+                                causticDynFetch(ruv, (float)CAUSTIC_RIPPLE_BASE + r1),
+                                saturate(rIdx - r0));
+                // The gain floor, for the reason the sun path states: the map stores (gain - 1), the
+                // dynamic strengths run to 3, and a negative gain on a term that MULTIPLIES a light
+                // is negative light.
+                caustic *= max(1.0f + rd * (rf * redge * ripStr), 0.0f);
+            }
+        }
+    }
+
+    float wakeStr = gShadowParams.waterCausticDyn.y;
+    if (wakeStr > 0.0f) {
+        float2 wuv = (surfXY - gShadowParams.waterCausticWake.xy)
+                   * (gShadowParams.waterCausticWake.z / max(gShadowParams.waterCausticWake.w, 1.0f));
+        float wedge = causticDynEdge(wuv);
+        if (wedge > 0.0f) {
+            float wd   = causticDynFetch(wuv, (float)CAUSTIC_WAKE_SLICE);
+            float wMax = gShadowParams.waterCaustic2.z;
+            float wscale = min(dEff, wMax) * (1.0f / CAUSTIC_WAKE_DEPTH)
+                         * (1.0f - smoothstep(wMax, 1.5f * wMax, dEff));
+            wscale = lerp(wscale, 1.0f, saturate(gShadowParams.waterCaustic3.z));
+            caustic *= max(1.0f + wd * (wedge * wakeStr * wscale), 0.0f);
+        }
+    }
+
+    // ⚠ FADE THE DEVIATION, NOT THE STRENGTH, so the gain walks to 1 and no light is added or removed
+    // at any point in the fade — the mean-1 contract the whole map is built on. Same form as the sun
+    // path's final lerp, and the reason WATER lvl in the apl split must not move between
+    // causticProjStr 0 and 1.
+    return lerp(1.0f, caustic, k);
+}
+
 // --- W8: THE COLUMN SCATTERS, IT DOES NOT JUST ABSORB -----------------------------------------
 //
 // WHY THE MODEL ABOVE HAD TO CHANGE, in the reporter's words: "this needs to be volumetric, or I see

@@ -4089,8 +4089,13 @@ namespace {
     // W28c: the water cut's own float4. waterDistort.w carries the box's horizontal SIZE; x here is
     // its HEIGHT, which is the only thing deciding when the cut switches on. yzw spare.
     constexpr uint32_t kWaterCutFloat         = kWaterCaustic3Float + 4;
+    // W32: .x = the strength of the TIR-mirror caustic a light BELOW the water surface projects onto
+    // the world below it (waterfog.h.fsl, causticProjector), with the master caustic gate folded in
+    // so the consumer cannot read the ladder while it is unready. Appended for the reason every
+    // block above states. yzw spare.
+    constexpr uint32_t kWaterCausticProjFloat = kWaterCutFloat + 4;
     constexpr uint32_t kShadowParamsBytes = 4096;
-    static_assert((kWaterCutFloat + 4) * sizeof(float) <= kShadowParamsBytes,
+    static_assert((kWaterCausticProjFloat + 4) * sizeof(float) <= kShadowParamsBytes,
                   "ShadowMaskParams overflows its CBV — too many sun cascades");
     // msmrecv.h.fsl's PCSS works in TEXELS, so SUN_SHADOW_RES has to agree with the atlas the host
     // actually allocated. Same mirroring contract as SUN_CASCADES / kSunCascades.
@@ -12351,6 +12356,59 @@ namespace {
     // OFF = the previous bucket rows (twilight-ramped night/day, clock fallback), kept whole below
     // as the A/B. This changes the setpoint at every hour except noon, so it gets a switch.
     bool  g_calFollowMw = true;
+    // ─── ...AND THE SAME FOR INTERIORS, WHICH IS THE FIX FOR "THIS INTERIOR LOOKS NUCLEAR" ──────
+    // *"let's fix APL, this interior looks nuclear compared to base game."* — user, 2026-08-27. The
+    // measurement behind it, straight off the log archive, and it is not subtle:
+    //
+    //     MW-referred EXTERIORS      exp = 2.2 .. 5.0
+    //     fixed-bucket INTERIORS     exp = 31 .. 476
+    //
+    // Ten to a hundred times the gain, to land both at a comparable apl. E is a CAMERA setting; a
+    // hundredfold swing in it between a street and the building beside it is not a camera, it is a
+    // normaliser erasing the difference MW authored. And at E in the tens the tone curve's toe is
+    // bypassed entirely: the blacks lift, everything piles into the mid-tones, and a dark cell reads
+    // flat and washed rather than dark. That is what "nuclear" is.
+    //
+    // ⚠ THE CODE ALREADY PREDICTED THIS, TWICE. calTarget's own note says "NO CAVE BUCKET, and the
+    // table has one... every interior is reported against 40-50 — which overstates `need` in a cave
+    // by exactly the amount the cave is meant to be darker." And the exterior rule's note says why a
+    // bucket cannot be rescued: "THE ROWS BELOW ARE NOT WRONG, THEY ARE UNANCHORED... a bucket cannot
+    // express 'dusk'." A bucket cannot express "a flooded underworks" either.
+    //
+    // ⚠ NO NEW CONSTANTS, DELIBERATELY. This runs the interior's authored light through the SAME
+    // anchor the exterior rule uses (calMwDayRef -> kCalMwDayCentre), so a cell lit as brightly as
+    // MW's clear noon targets the signed-off day row and a darker one targets proportionally less.
+    // A second anchor would be a second thing to keep in step, and the whole point of the MW-referred
+    // rule is that there is one reference and it is MW.
+    //
+    // ⚠ WHAT IT DOES NOT MODEL, STATED: MW's delivered interior level also contains its POINT LIGHTS,
+    // which are not in any authored cell colour. So this tracks the cell's FLOOR, not its mean — and
+    // that is the right half to track, because the floor is what the servo was lifting. A torch pool
+    // is then as much brighter than the floor as MW made it, instead of being normalised against it.
+    // ⚠⚠ THE RULE ALONE IS NOT ENOUGH, AND THIS CELL IS WHY: IT AUTHORS NOTHING TO REFERENCE.
+    // Vivec Telvanni underworks reports `mwRef amb=0.000 sun=0.000`, and it is not a wiring gap —
+    // the client's own live-vs-captured oracle prints `interior live: sun=(0.000) sunAmb=(0.000)
+    // cellAmb=(0.000)` AND `captured: ... ambCol=(0.000)`, two independent reads agreeing. The cell
+    // genuinely authors NO ambient and NO sunlight; it is lit 100% by its point lights. So the ratio
+    // is 0 and the whole setpoint is whatever the FLOOR says.
+    //
+    // Which makes the floor the load-bearing number for exactly the cells this was meant to fix, and
+    // it must therefore be a STATED value rather than an exterior constant reached by accident:
+    //
+    //     *"but I know it is meant to be a darker area. we are not shying away for low APL, 17 is
+    //      perfectly good for a dark interior."* — user, 2026-08-27
+    //
+    // 17 it is, and it is an authored preference in exactly the sense the exterior rows are ("what
+    // should LAND look like ... is an authored preference"). A cell that DOES author ambient scales
+    // up from here through the same anchor — amb 0.5 / sun 0.3 lands at ~48, i.e. the old bucket is
+    // roughly preserved for a well-lit interior while a dark one is finally allowed to be dark.
+    //
+    // ⚠ ITS OWN FLOOR, NOT kCalMwMinCentre. That one is the EXTERIOR's guard against a pathological
+    // weather walking the setpoint to zero, and it sits well below MW's darkest authored night on
+    // purpose. Raising it to 17 to serve interiors would move exterior night with it — two different
+    // questions, two different numbers, and merging them is how a calibration stops being readable.
+    float g_calInteriorFloor = 17.0f;
+    bool  g_calFollowMwInterior = true;
 
     // ─── S3a — THE RATIO ITSELF, AS THE AUTHORED KNOB ────────────────────────────────────────────
     // The two gains above reach the sun:ambient ratio only TOGETHER and in opposite directions,
@@ -12683,6 +12741,27 @@ namespace {
             ? std::max(0.0f, std::sin(g_skyPhys.elevLight * (float)(Hosek::kPi / 180.0)))
             : kCalDayElevSin;
         return ambCode + g_calSunWeight * sinEl * g_mwSunCode;
+    }
+
+    // ...AND THE SAME QUESTION FOR AN INTERIOR, WHICH IS WHERE THE SETPOINT WAS NEVER ASKED IT.
+    //
+    // MW's interior cells author their OWN Ambient and Sunlight colours, and the client latches both
+    // into g_mwAmbCode / g_mwSunCode every frame exactly as it does for the weather outside (see the
+    // latch at the `lighting` read) — so the data this needs has been on the wire the whole time and
+    // nothing new has to be sent for it.
+    //
+    // ⚠ sinEl DROPS OUT, AND THAT IS THE ONLY DIFFERENCE. An interior's Sunlight is a plain
+    // directional with no elevation and no day/night ramp; there is no sun to take a sine of, and
+    // g_skyPhys is not even cooked in here (the heartbeat prints "HW OFF (interior / no sun)"). The
+    // mean-cosine over the surfaces it hits is what g_calSunWeight already carries, so it applies at
+    // full weight rather than through an elevation the cell does not have.
+    //
+    // ⚠ AND NO NIGHT AMBIENT TRIM. That trim is a statement about moonlight ([[project_forge_night_ambient_trim]])
+    // and an interior has no sky to be moonlit by. nightAmbScaleNow() returns 1 with the sky model
+    // off anyway, so this is documenting the intent rather than changing the value — but a later
+    // interior that DOES cook a sky must not silently start trimming its cell ambient.
+    float mwRefLevelInterior() {
+        return g_mwAmbCode + g_calSunWeight * g_mwSunCode;
     }
 
     // ─── P2b: THE TWO ELEMENT LANES THE MODEL HAS TO SET ─────────────────────────────────────────
@@ -13544,6 +13623,53 @@ namespace {
     // 0 = no distance fade at all — and g_waterDistortFrac = 0, "the distortion is unbounded", means
     // the same thing here, correctly.
     float g_causticDistFrac  = 1.0f;
+    // ─── W32: A SUBMERGED LAMP IS A CAUSTIC PROJECTOR ────────────────────────────────────────────
+    // "If a light source is placed underwater, that's meant to be a caustics projector." It is, and
+    // by a DIFFERENT mechanism than the sun's: light going UP from a submerged lamp hits the
+    // underside of the surface past the critical angle (48.6 deg) and is TOTALLY internally
+    // reflected, at 100%, back down onto the seabed. The rippled surface is a wobbling mirror.
+    //
+    // ⚠ IT IS 8x STRONGER THAN THE SUN'S, and that ratio is the whole reason it reads so hard —
+    // refraction deflects (1 - 1/n) = 0.2498 per unit surface slope, a mirror deflects 2.0, ratio
+    // 8.006. It is also why NOTHING NEW HAD TO BE GENERATED: the shipped ladder holds displacements
+    // q = 8..312 units, and for the mirror q = 2*pathLength, so those five slices already span
+    // mirror paths of 4..156 units with the existing fade carrying them to 390.
+    //
+    // A mean-1 GAIN on the direct term, never a second light: the reflected flux is genuinely extra
+    // energy and adding it would move the frame's level and set the exposure servo working. 0 is the
+    // A/B and is bit-identical to the pre-W32 build. See causticProjector in waterfog.h.fsl.
+    float g_causticProjStr   = 1.0f;
+    // ─── W33: THE OTHER HALF OF THAT LAMP'S OUTPUT, WHICH LIGHTS WHAT IS ABOVE THE WATER ────────
+    // *"caustics are visible underwater. but I want them for above water too."* Same lamp, same
+    // surface, the complementary half of its upward output: rays leaving it WITHIN 48.6 deg of
+    // vertical refract OUT into the air instead of being reflected back down, so W32's dark Snell
+    // disc is exactly the cone whose light is up here. That is the pool-house look — the rippling
+    // pattern on the wall and ceiling beside a lit pool, which is the caustic most people can name.
+    //
+    // Deflection kRefrDevWater = 0.3333 per unit slope (6x weaker than the mirror, 1.333x the sun's,
+    // and their ratio is exactly n), so q = 0.3333*pathLength puts the shipped q = 8..312 ladder over
+    // AIR paths of 24..936 units — 0.34 m to 13.4 m above the surface, fading out near 33 m. Reuses
+    // the same slices as everything else; still no generator work.
+    //
+    // ⚠ NO MEDIUM DECAY UP HERE: that path is through air, and cd0 is derived from the WATER's own
+    // sigma_s. See causticProjector. 0 gives back exactly the W32 build.
+    float g_causticProjAbove = 1.0f;
+    // ─── W34: A LAMP *ABOVE* THE WATER IS ALSO A PROJECTOR, AND IT IS THE SUN'S OWN MECHANISM ───
+    // *"some lights are placed above water but still meant to be caustic projectors."* They are, and
+    // this is the channel that does it: the lamp's light refracts DOWN INTO the water and focuses on
+    // the bottom. Deviation kRefrDevAir — the SAME constant the sun path uses — so its D_eff is
+    // exactly the path length and it indexes the ladder over 32..1250 units, the ladder's own depth
+    // range verbatim. This is the caustic everybody can name: the pattern on the floor of a lit pool.
+    //
+    // ⚠ NO SPHERE-PLANE TEST GATES IT, DELIBERATELY. "Does this light's reach touch the water" is the
+    // CONSERVATIVE form of a question the shader answers EXACTLY per fragment — a straight line from
+    // above the plane to below it crosses the plane, and the light loop's own reach early-out has
+    // already established the light gets there. The sphere-plane count below is a DIAGNOSTIC only.
+    //
+    // ⚠ AND IT NEEDS NOTHING FROM THE FIXTURE: these are typically FIXTURELESS lights, bare authored
+    // markers placed at whatever height spread the light nicely, so their offset above the surface
+    // carries no intent to honour. Pure geometry works at any height. 0 = off.
+    float g_causticProjFromAir = 1.0f;
     // The CALM THRESHOLDS. Nonzero, they are the dynamic layers' whole cost model: a beam whose
     // displacement is under this many destination texels AND whose q*|H| is under the second number
     // returns without touching memory, so the dispatch costs five texture loads per cell over calm
@@ -15007,6 +15133,17 @@ namespace {
           // clock fallback. Interiors are unaffected either way — they have their own row.
           t.checkbox("Setpoint: FOLLOW MW's authored lighting (off = the old bucket rows)",
                      &g_calFollowMw);
+          // The same rule for INTERIORS, and the reason it is a separate switch is that it is a
+          // separate claim: outside, the reference is the weather; inside, it is the CELL's own
+          // authored Ambient/Sunlight. OFF restores the flat "interior 40-50" bucket, which is the
+          // A/B for "this interior looks nuclear" — see g_calFollowMwInterior for the exp=2..5
+          // (exterior) against exp=31..476 (interior) measurement that motivated it.
+          t.checkbox("Cal: interiors follow MW's authored CELL light (off = flat 40-50 bucket)",
+                     &g_calFollowMwInterior);
+          // The floor is the WHOLE setpoint for any cell that authors no ambient — which is not an
+          // edge case: this is how a lamp-lit basement is authored. See g_calInteriorFloor.
+          t.sliderF("Cal: interior setpoint FLOOR (a cell that authors no ambient reads this)",
+                    &g_calInteriorFloor, 5.0f, 50.0f, 0.5f, "%.1f");
           // The dead zone, as a ratio around the setpoint. sqrt(80/60) reproduces the day row
           // exactly. This is the open question in the scheme: the bucket variation the old wide
           // night row was covering is gone (the setpoint moves with the light now), but the
@@ -15826,6 +15963,35 @@ namespace {
           // past the fade the consumer skips 3-9 taps per submerged fragment.
           t.sliderF("Caustics: distance fade x the DISTORTION's own range (1 = with it)",
                     &g_causticDistFrac, 0.0f, 2.0f, 0.05f, "%.02f");
+          // ─── W32 SUBMERGED-LAMP PROJECTOR ─────────────────────────────────────────────────────
+          // A light BELOW the surface casts by REFLECTION, not refraction: past 48.6 deg every ray
+          // going up is totally internally reflected back down, so the rippled surface is a mirror
+          // and the lamp is a gobo projector. 8x the sun's deflection per unit slope, which is why
+          // the pattern stays crisp where the sun's has washed out — and why the shipped ladder
+          // already covers it (q = 2*pathLength puts mirror paths of 4..156 units on slices built
+          // for q = 8..312). A mean-1 multiplier on the direct term, so 0 is a bit-exact A/B and
+          // no value of it moves the frame's light level.
+          // ⚠ THE TEST CASE NEEDS NO CONTENT HUNTING: a torch carried underwater IS a submerged
+          //   light. Look for a DARK DISC under the lamp with the pattern starting outside it —
+          //   that hole is the Snell cone, and it is the signature that says this is the mirror
+          //   channel and not a copy of the sun path.
+          t.sliderF("Caustics: SUBMERGED LAMP projector (0 = off, the A/B)",
+                    &g_causticProjStr, 0.0f, 1.0f, 0.05f, "%.02f");
+          // W33 — the complementary half. Rays leaving the lamp INSIDE the Snell cone escape into the
+          // air instead of reflecting back down, so this draws the pattern on walls, ceilings and
+          // anything else standing above the water. 0.3333 per unit slope against the mirror's 2.0,
+          // which puts the same five slices over air paths of 24..936 units. The two never overlap:
+          // a fragment is on one side of the surface or the other, and they meet at gain 1.0 exactly
+          // on the waterline.
+          t.sliderF("Caustics: submerged lamp, ABOVE-water half (refracted out)",
+                    &g_causticProjAbove, 0.0f, 1.0f, 0.05f, "%.02f");
+          // W34 — the third channel, and the one most authored lights actually need: a lamp sitting
+          // ABOVE the water refracts down INTO it and focuses on the bottom. Deviation kRefrDevAir,
+          // i.e. the sun's own constant, so this reads the ladder over its native 32..1250 units.
+          // No sphere-plane test: the per-fragment geometry answers the same question exactly, and
+          // the [caustic-lanes] log counts the sphere hits so a null result stays diagnosable.
+          t.sliderF("Caustics: lamp ABOVE water onto the bottom (refracted in)",
+                    &g_causticProjFromAir, 0.0f, 1.0f, 0.05f, "%.02f");
           // ⚠ W25 — HOW TO ISOLATE A LAYER, spelled out here because the levers are three
           // different sliders in two different sections and that is exactly the thing nobody finds.
           // All three caustic layers are now cast by the SAME slope gains water.frag builds the
@@ -17444,6 +17610,13 @@ namespace ForgeRender {
             { "causticWakeMaxDepth",   &g_causticWakeMaxDepth   },
             { "causticRippleMaxDepth", &g_causticRippleMaxDepth },
             { "causticDistFrac",       &g_causticDistFrac       },
+            // W32: the submerged-lamp projector. Env-driven because the checks that matter are the
+            // bit-identity A/B at 0 and the mean-1 check (WATER lvl in the apl split must not move
+            // between 0 and 1), both of which the minimized harness has to run without a click.
+            { "causticProjStr",        &g_causticProjStr        },
+            { "causticProjAbove",      &g_causticProjAbove      },
+            { "causticProjFromAir",    &g_causticProjFromAir    },
+            { "calInteriorFloor",      &g_calInteriorFloor      },
             { "causticRippleStride", &g_causticRippleStride },
             // W27: the resolution/window trade on the wake map, env-driven so the minimized harness
             // can A/B 8 u/texel against the W26 16 without a rebuild. The echo below is also how the
@@ -17472,6 +17645,14 @@ namespace ForgeRender {
             // W25: the flat test now disarms ALL THREE caustic layers, which makes it the one-switch
             // proof that what is on screen is being cast by the surface and not painted on.
             { "waterFlatTest",      &g_waterFlatTest      },
+            // The interior setpoint rule, env-driven because its whole A/B is a LEVEL and the
+            // minimized harness is the only way to measure one without a hand on the exposure.
+            { "calFollowMwInterior", &g_calFollowMwInterior },
+            // The servo itself. OFF pins E to exactly 1.0, which in this unit convention is the
+            // "reproduce MW" arm — the only way to measure what the plant delivers with no gain on
+            // it, and therefore the only way to say what an interior setpoint SHOULD be rather than
+            // guessing one. See the interior calibration work in tasks/lighting.md.
+            { "expEnable",           &g_expEnable           },
         };
         std::string spec(env);
         size_t pos = 0;
@@ -18007,7 +18188,19 @@ namespace ForgeRender {
         // distinguishes a cave from a house, so every interior is reported against 40-50 — which
         // overstates `need` in a cave by exactly the amount the cave is meant to be darker. A cave
         // should therefore land BELOW 1.00x on this line and that is correct, not a miscalibration.
-        if (!g_dlExterior)         { return {  40.0f,  50.0f, "interior 40-50" }; }
+        if (!g_dlExterior) {
+            // See g_calFollowMwInterior. Same anchor as the exterior rule, same floor, same band
+            // half-width — the ONLY thing that changes is that the reference is now this cell's own
+            // authored light instead of a number that was true of no cell in particular.
+            if (g_calFollowMwInterior) {
+                const float ratio = mwRefLevelInterior() / calMwDayRef();
+                const float c     = std::max(g_calInteriorFloor, kCalMwDayCentre * ratio);
+                static char iname[48];
+                std::snprintf(iname, sizeof(iname), "MW-referred %.2fx day (interior)", (double)ratio);
+                return { c / g_calBandHalf, c * g_calBandHalf, iname };
+            }
+            return {  40.0f,  50.0f, "interior 40-50" };
+        }
 
         // ⚠ READ THE MW-REFERRED BLOCK FURTHER DOWN FIRST. Everything between here and it documents
         // the exterior BUCKET ROWS, which are now the g_calFollowMw-off fallback rather than the
@@ -20067,21 +20260,80 @@ namespace ForgeRender {
                 // "the map is empty" and "the map is scaled to nothing" tell themselves apart.
                 cp[kWaterCaustic3Float + 2] = std::max(0.0f, std::min(g_causticWakePin, 1.0f));
                 cp[kWaterCaustic3Float + 3] = 0.0f;
+                // W32 — the submerged-lamp projector's strength, WITH THE GENERATOR'S OWN ARMING
+                // CONDITION FOLDED IN. It reads the same static/ripple/wake slices the sun path
+                // does, so it must go dark under exactly the conditions that stop those slices from
+                // being rebuilt — and that is `causticGate` (causticReady && causticOn &&
+                // causticStrength > 0 && !flatTest), not merely `on`.
+                //
+                // ⚠ g_causticStrength IS IN HERE, AND IT IS NOT A CONVENIENCE. That knob is the SUN
+                // caustic's strength AND the generator's arm: at 0 the dispatch is skipped entirely
+                // (statArmed/ripArmed/wakeArmed all ride causticGate), so the array holds whatever
+                // was last written. A projector reading it would be a stale pattern nailed to the
+                // world, and it would look most convincing exactly when it is most wrong. One lane
+                // carries all of it because a second gate is a second thing that can be published
+                // wrong.
+                const bool projOn = on && g_causticStrength > 0.0f;
+                cp[kWaterCausticProjFloat + 0] = projOn ? std::max(0.0f, g_causticProjStr)   : 0.0f;
+                // W33 — the ABOVE-water (refract-out) half, same gate for the same reason: it reads
+                // the same slices, so it must go dark when they stop being rebuilt.
+                cp[kWaterCausticProjFloat + 1] = projOn ? std::max(0.0f, g_causticProjAbove) : 0.0f;
+                // W34 — the ABOVE-water LAMP refracting down onto the bottom, same gate again.
+                cp[kWaterCausticProjFloat + 2] = projOn ? std::max(0.0f, g_causticProjFromAir) : 0.0f;
+                cp[kWaterCausticProjFloat + 3] = 0.0f;
                 // W27c VERIFICATION — the four lanes that decide whether each layer reaches the
                 // screen, printed together. "Wave amplitude still kills the wake" is a claim about
                 // exactly these numbers, and reading them is the only way to say whether the defect
                 // is host-side (a lane published 0) or shader-side (a lane published non-zero and
                 // ignored). Every 600 frames, so it costs nothing on the hot path.
                 if ((g_renderFrame % 600u) == 0u) {
+                    // W32 — HOW MANY OF THIS FRAME'S UPLOADED LIGHTS ARE ACTUALLY UNDER THE SURFACE.
+                    // Without it a null result is undiagnosable: "no caustics from my torch" reads
+                    // identically whether the projector is disarmed, the geometry rejected every
+                    // light, or there was simply no submerged light in the set. Counted off the
+                    // light cbuffer this frame's frags will loop, against the plane spelled exactly
+                    // the way waterFogPlaneRelZ() spells it — so this counts what the shader counts.
+                    uint32_t nUnder = 0, nTouch = 0;
+                    {
+                        const float* lcv = (g_live.pLightCbv && g_live.pLightCbv->pCpuMappedAddress)
+                                               ? (const float*)g_live.pLightCbv->pCpuMappedAddress
+                                               : nullptr;
+                        const float* fcv = (g_live.pFrameCbv && g_live.pFrameCbv->pCpuMappedAddress)
+                                               ? (const float*)g_live.pFrameCbv->pCpuMappedAddress
+                                               : nullptr;
+                        const bool haveWater = (waterEnabled != 0) && waterParams != nullptr;
+                        if (lcv && fcv && haveWater) {
+                            const float planeRel = waterTrueLevel(waterParams[0]) - fcv[58];
+                            const uint32_t nL = (uint32_t)lcv[0];
+                            const float reachK = lcv[1];   // == lightParams.y, the frag's own reach
+                            for (uint32_t i = 0; i < nL && i < kMaxPointLights; ++i) {
+                                const float lz = lcv[4 + i * 12 + 2];
+                                if (lz < planeRel) { ++nUnder; continue; }
+                                // ⚠ W34 — THE SPHERE-PLANE INTERSECTION, AND IT IS A DIAGNOSTIC, NOT
+                                // A GATE. The shader answers the same question EXACTLY per fragment
+                                // (a straight line from above the plane to below it crosses it), so
+                                // using this to gate would only be a coarser version of a test that
+                                // is already free. What it is for is telling "my above-water lamp
+                                // casts nothing" apart from "no above-water lamp was ever in play" —
+                                // which for FIXTURELESS lights, with no mesh to look for in the
+                                // scene, is otherwise not answerable from the outside at all.
+                                if (lz - lcv[4 + i * 12 + 3] * reachK < planeRel) { ++nTouch; }
+                            }
+                        }
+                    }
                     LOG::logline(">> [caustic-lanes] master=%.3f staticGate=%.0f ripple=%.3f "
-                                 "wake=%.3f | waveAmp=%.2f baseSlopeGain=%.2f effSlope=%.3f "
-                                 "flatTest=%d",
+                                 "wake=%.3f proj=%.3f/%.3f/%.3f | waveAmp=%.2f baseSlopeGain=%.2f effSlope=%.3f "
+                                 "flatTest=%d lights=%u under/%u airTouchingWater/%u total",
                                  (double)cp[kWaterCausticFloat + 0],
                                  (double)cp[kWaterCaustic3Float + 1],
                                  (double)cp[kWaterCausticDynFloat + 0],
                                  (double)cp[kWaterCausticDynFloat + 1],
+                                 (double)cp[kWaterCausticProjFloat + 0],
+                                 (double)cp[kWaterCausticProjFloat + 1],
+                                 (double)cp[kWaterCausticProjFloat + 2],
                                  (double)g_waterWaveAmp, (double)waterBaseSlopeGain(),
-                                 (double)causticEffectiveSlope(), g_waterFlatTest ? 1 : 0);
+                                 (double)causticEffectiveSlope(), g_waterFlatTest ? 1 : 0,
+                                 nUnder, nTouch, g_lastLightCount);
                 }
             }
         }
@@ -27000,8 +27252,23 @@ namespace ForgeRender {
                                  (double)Hosek::luma709(g_skyPhys.sunDiscL),
                                  (double)g_sunDiscExpand);
                 } else {
-                    LOG::logline(">> [forge-hb][sky] HW OFF (%s) — MW's sky mesh and MW's lighting",
-                                 g_skyHw ? "interior / no sun" : "master toggle");
+                    // ⚠ THE MW REFERENCE HAS TO BE PRINTED HERE TOO, AND UNTIL NOW IT WAS NOT. The
+                    // exterior branch above reports `mwRef amb=.. sun=.. -> setpoint ..`, which is
+                    // the whole state of the setpoint rule; this branch reported nothing, so an
+                    // interior's authored light was latched every frame and never once shown. That
+                    // is exactly why "this interior looks nuclear" had no number attached to it for
+                    // as long as it did: the input to the rule was invisible from the outside, and a
+                    // calibration whose input you cannot read is not falsifiable.
+                    // Printed whatever g_calFollowMwInterior is set to, so the A/B has both arms.
+                    const float iref = mwRefLevelInterior();
+                    const float irat = iref / calMwDayRef();
+                    LOG::logline(">> [forge-hb][sky] HW OFF (%s) — MW's sky mesh and MW's lighting"
+                                 " | mwRef amb=%.3f sun=%.3f m=%.3f (%.3fx day -> setpoint %.1f)"
+                                 " followMwInterior=%d",
+                                 g_skyHw ? "interior / no sun" : "master toggle",
+                                 (double)g_mwAmbCode, (double)g_mwSunCode, (double)iref, (double)irat,
+                                 (double)std::max(g_calInteriorFloor, kCalMwDayCentre * irat),
+                                 g_calFollowMwInterior ? 1 : 0);
                 }
             }
             LOG::logline(">> [forge-hb] frame=%u drawn=%u skinned=%u(blend=%u zpre=%u) multimap=%u sky=%u alpha=%u(zpre=%u) dynamic=%u meshHigh=%u "

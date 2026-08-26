@@ -584,4 +584,35 @@ STRUCT(ShadowMaskParams)
     //   R exceeds the eye's height, so a floor silently BECOMES the switch-on height. Size and
     //   activation are separate questions. The cut's strength is 0 or 1, never between. yzw spare.
     DATA(float4,   waterCut,         None);
+    // ─── W32: A SUBMERGED LAMP IS A CAUSTIC PROJECTOR ───────────────────────────────────────────
+    // x = the strength of the TIR-mirror caustic gobo a light BELOW the surface casts on the world
+    //     below it (waterfog.h.fsl, causticProjector). 0 = the feature is off and the image is
+    //     bit-identical to the pre-W32 build: the helper returns exactly 1.0 and every call site
+    //     multiplies by a literal one.
+    // y = W33, the same lamp's ABOVE-water half. Rays leaving it INSIDE the 48.6 deg Snell cone
+    //     refract OUT instead of reflecting back down, so this is the pattern on walls and ceilings
+    //     beside the water — the pool-house look. Deflection kRefrDevWater (0.3333) against the
+    //     mirror's 2.0, which reads the same slices over air paths of 24..936 units. 0 gives back
+    //     exactly the W32 build.
+    // z = W34, a lamp sitting ABOVE the water refracting DOWN INTO it, focusing on the bottom. This
+    //     is the SUN's own mechanism from a point source — deviation kRefrDevAir, the sun's constant,
+    //     so D_eff is exactly the path length and the reach is the ladder's own 32..1250 units. It is
+    //     the caustic everybody can name, and it is what most authored (often FIXTURELESS) lights
+    //     beside water actually need. 0 = off.
+    // ⚠ THE LANE IS PICKED BY WHICH SIDES THE LIGHT AND THE FRAGMENT ARE ON, and only one can ever
+    //   apply to a given pair: lamp under + frag under = x, lamp under + frag above = y, lamp above +
+    //   frag under = z, and both above has no surface between them at all. All three meet at gain 1.0
+    //   exactly on the waterline, so every seam is C0 with nothing to cross-fade.
+    // ⚠ IT ALSO CARRIES THE MASTER GATE. The projector reads the SAME static/ripple/wake slices the
+    //   sun path does, so it must not run while the map is unready or the flat test is on. The host
+    //   folds `on` (causticOn && causticReady && !flatTest) into this lane rather than making the
+    //   consumer read two, because a second gate is a second thing that can be published wrong.
+    // ⚠ NOT A PER-LIGHT LANE, AND THERE IS NOWHERE TO PUT ONE. PointLightWire::color[3] LOOKS free
+    //   (every frag reads only .rgb) but carries packLightIdFlags(), which the host shadow manager
+    //   reads back out of the cbuffer. None is needed: "this light is underwater" falls out of
+    //   posR.z against waterFogPlaneRelZ(), both already camera-relative.
+    // w spare. Appended at the END for the reason every field down here states: this cbuffer is
+    // bound BY POINTER into every PerFrame set, so an insertion anywhere else moves a lane somebody
+    // reads.
+    DATA(float4,   waterCausticProj, None);
 };

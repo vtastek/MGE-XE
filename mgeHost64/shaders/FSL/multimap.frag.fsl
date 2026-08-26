@@ -93,6 +93,10 @@ float4 PS_MAIN( VSOutput In )
     // W7b — absorption on the way IN, before the point-light loop adds into `d` (waterfog.h.fsl,
     // and see opaque.frag for why point lights are excluded). Lockstep with opaque.frag.
     { float3 tSun, tAmb; waterLightTransmit(In.WorldPos, tSun, tAmb); d *= tSun; a *= tAmb; }
+    // W32 — a submerged lamp is a caustic PROJECTOR (waterfog.h.fsl). Hoisted out of the loop: above
+    // water this is ONE cbuffer compare for the whole fragment instead of one call per light, and
+    // above water is where all the point-light iterations are.
+    bool causProj = causticProjectorActive(In.WorldPos);
     // Tier 3: GTAO modulates AMBIENT only — gated by the "AO enable" tick (debugParams.w bit0).
     if ((aoFlags & 1u) != 0u) { a *= aoSample.a; }
     a *= gFrameData.dbgScales.x;   // dev panel: ambient intensity modifier (lockstep w/ opaque.frag)
@@ -179,7 +183,17 @@ float4 PS_MAIN( VSOutput In )
                 }
 
                 float  lambert = saturate(dot(N, toLight) * invDist);
-                d += lambert * att * lightCol;
+                // W32 — the mirror gobo. A mean-1 MULTIPLIER on the direct term, never a second
+                // light: the reflected flux is extra energy, and adding it would move the frame's
+                // level and put the exposure servo to work.
+                // ⚠ THE MULTIPLY IS INSIDE THE BRANCH, NOT A `* 1.0` OUTSIDE IT. causProj is false
+                // whenever the feature cannot act, and leaving the original expression textually
+                // untouched is what makes "strength 0 is bit-identical to the pre-W32 build" a
+                // property of the code rather than a bet on the compiler not reassociating a
+                // four-term product.
+                float3 lightAdd = lambert * att * lightCol;
+                if (causProj) { lightAdd *= causticProjector(In.WorldPos, posR.xyz); }
+                d += lightAdd;
             }
         }
     }
