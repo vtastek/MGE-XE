@@ -389,7 +389,12 @@ VSOutput VS_MAIN( VSInput In )
     // its alpha test on it — a grass subset that shipped without the bit would cast a SOLID BOX
     // shadow the size of its quads. Grass is a cutout by definition, whatever the NIF said, so the
     // question is answered here rather than trusted from the bake.
-    Out.Flags    = (uint)(In.InstParams.y + 0.5f) | 0x2u;
+    // ⚠ BIT8 IS THE GRASS CASTER MARK, and it is set here because this is the only vertex shader
+    // that feeds the grass lane. sunshadow_statics.frag is SHARED with the distant statics, and it
+    // uses this bit to thin grass's cast shadow stochastically without touching theirs. Bits 1-5 and
+    // 6-7 are the bake's (cutout / UV controller / night / day / heroBlend / layer op) and 16+ is the
+    // shadow slot, so bit8 is free.
+    Out.Flags    = (uint)(In.InstParams.y + 0.5f) | 0x2u | 0x100u;
 
     float dist = length(worldPos.xyz - gFrameData.eyePos.xyz);
     Out.Fog    = mwFogFactor(dist);   // ramp only — the submerged test is PER PIXEL (mwFogAir)

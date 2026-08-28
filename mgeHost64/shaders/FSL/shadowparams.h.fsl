@@ -683,6 +683,12 @@ STRUCT(ShadowMaskParams)
     // z = grass receives clustered POINT LIGHTS, 0/1. Affordable where the PCSS receiver was
     //     not, because an empty froxel costs nothing and a daylit exterior is nearly all empty
     //     froxels — see pointlights.h.fsl. Measure it at NIGHT, not at midday.
-    // w = spare.
+    // w = grass cast-shadow OPACITY, 0..1. 1 = the solid silhouette every other static casts;
+    //     below that, sunshadow_statics.frag drops that fraction of grass's caster fragments
+    //     (dithered on UV, which is mesh data and so cannot swim as the camera moves) and the
+    //     map records PARTIAL occlusion, which the moments blur and cascade 0's PCSS filter
+    //     into a partial shadow. ⚠ It has to be stochastic: measured on this bake's
+    //     groundcover the alpha is BINARY (84% at 0, 16% at 255, ~0.1% between), so raising
+    //     the caster's alpha reference instead would thin it by 0.0%.
     DATA(float4,   grassParams5,     None);
 };

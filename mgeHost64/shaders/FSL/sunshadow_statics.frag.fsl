@@ -14,6 +14,18 @@
 #include "opaque.srt.h"      // gStaticsArrays[], gSamplerAnisotropic, gFrameData
 #include "msmpack.h.fsl"     // PackMoments()
 
+// Stable dither for the grass caster's stochastic thinning. Keyed on UV — MESH data, so it cannot
+// move with the camera. That matters more than it looks: the cascades are camera-centred, so a
+// pattern keyed on the shadow-map pixel would swim across the world as you walk and the thinned
+// shadow would crawl. UV is world-locked by construction. Same FNV-ish mixer the CPU scatter uses.
+float grassShadowDither(float2 uv)
+{
+    uint2 q = (uint2)(abs(frac(uv)) * 4096.0f);
+    uint  h = q.x * 73856093u ^ q.y * 19349663u;
+    h ^= h >> 13; h *= 0x85EBCA6Bu; h ^= h >> 16;
+    return (float)(h >> 8) * (1.0f / 16777216.0f);
+}
+
 STRUCT(VSOutput)
 {
     DATA(float4,           Position,    SV_Position);
@@ -43,6 +55,24 @@ PsOut PS_MAIN( VSOutput In )
         uint layer  = In.TexIndex & 0xFFFFu;
         float4 tex = SampleTex2DArray(gStaticsArrays[bucket], gSamplerAnisotropic, float3(In.Uv, (float)layer));
         if (tex.a < (133.0f / 255.0f)) { discard; }
+    }
+
+    // ⚠ GRASS CASTS A THINNED, STOCHASTIC SHADOW (Flags bit8, set only by grass.vert). A dense
+    // sward casting a SOLID silhouette carpets the ground it grows out of in flat darkness, which
+    // is not what a grass canopy does — real grass transmits, and you see light and shadow THROUGH
+    // it. So a fraction (1 - opacity) of the caster's fragments are dropped and the shadow map
+    // records partial occlusion, which the moments blur and cascade 0's PCSS then filter into a
+    // genuinely partial shadow.
+    //
+    // ⚠ IT HAS TO BE STOCHASTIC, because there is nothing to threshold. Measured over this bake's
+    // groundcover atlases the alpha is BINARY — 84% at exactly 0, 16% at exactly 255, and ~0.1% in
+    // between — so raising the caster's alpha reference from 133 to 200 removes 0.0% of the casting
+    // area. The obvious "thin it by cutting higher" does literally nothing on this art.
+    //
+    // Only the GRASS lane sets bit8, so every distant static still casts exactly as before.
+    if ((In.Flags & 0x100u) != 0u) {
+        float op = gShadowParams.grassParams5.w;
+        if (op < 0.999f && grassShadowDither(In.Uv) >= op) { discard; }
     }
 
     // Depth GROWS away from the sun (the ortho is reverse-Z), matching msmrecv.h.fsl's receiver.

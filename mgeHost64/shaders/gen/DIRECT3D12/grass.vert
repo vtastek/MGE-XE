@@ -1164,17 +1164,9 @@ STRUCT(ShadowMaskParams)
     float4 grassParams3;
 #line 677 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
     float4 grassParams4;
-
-
-
-
-
-
-
-
-
+#line 693 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
     float4 grassParams5;
-#line 688
+#line 694
 };
 #line 21 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
 #line 27 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
@@ -2594,7 +2586,12 @@ VSOutput VS_MAIN( VSInput In )
 
 
 
-    Out.Flags = (uint)(In.InstParams.y + 0.5f) | 0x2u;
+
+
+
+
+
+    Out.Flags = (uint)(In.InstParams.y + 0.5f) | 0x2u | 0x100u;
 
     float dist = length(worldPos.xyz - gFrameData.eyePos.xyz);
     Out.Fog = mwFogFactor(dist);

@@ -11533,6 +11533,14 @@ namespace {
     // entire grass colour draw. The cost is quadratic in the range because it is the CASTER COUNT that
     // scales, so halving it to 1024 is a ~4x cut on the extra geometry while keeping the shadows in
     // the band where a blade is actually several shadow-map texels wide and the effect reads.
+    // How SOLID grass's own cast shadow is. A dense sward casting a solid silhouette carpets the
+    // ground it grows out of in flat darkness, which is not what a canopy does — real grass
+    // transmits, and you see light and shadow through it. Below 1 the caster drops that fraction
+    // of its fragments and the map records partial occlusion. ⚠ Stochastic and not an alpha-ref
+    // change because the groundcover alpha is BINARY: 84% at exactly 0, 16% at exactly 255, so
+    // moving the reference from 133 to 200 removes 0.0% of the casting area. See
+    // sunshadow_statics.frag.
+    float g_grassShadowOpacity = 0.5f;
     bool  g_grassShadows     = true;
     float g_grassShadowRange = 1024.0f;   // world units; grass shadows are a near-field effect
     // Live A/B for the whole G1a claim: ON restores the near cut + cell ownership the statics lane
@@ -15246,6 +15254,9 @@ namespace {
           t.sliderF("Grass: alpha reference (MGE 128/255)", &g_grassAlphaRef, 0.05f, 0.95f, 0.01f);
           t.checkbox("Grass: cast sun shadows (perf — measure it)", &g_grassShadows);
           t.sliderF("Grass: shadow-cast range (world units)", &g_grassShadowRange, 256.0f, 8192.0f, 128.0f);
+          // 1 = the solid silhouette; below that the caster thins stochastically so light comes
+          // through the canopy. The alpha is binary, so an alpha-ref change cannot do this.
+          t.sliderF("Grass: cast-shadow opacity (1 = solid)", &g_grassShadowOpacity, 0.0f, 1.0f, 0.05f);
           // ⚠ THE TRAP, as a switch. ON gives the grass lane the statics lane's near cut + cell
           // ownership, which deletes every blade inside MW's loaded-cell slab — i.e. punches a hole
           // in the grass exactly around the player. Grass has no near path to hand over to (the
@@ -17936,6 +17947,7 @@ namespace ForgeRender {
             { "grassWindGain",       &g_grassWindGain       },
             { "grassAlphaRef",       &g_grassAlphaRef       },
             { "grassShadowRange",    &g_grassShadowRange    },
+            { "grassShadowOpacity",  &g_grassShadowOpacity  },
             // The enhanced-shader polish: the underwater current (its own strength, deliberately not
             // slaved to |wind|) and the sink LOD. Env-driven for the same reason as the rest —
             // "does the seaweed still lean in a gale" is a question the minimized harness has to be
@@ -36041,7 +36053,7 @@ namespace ForgeRender {
         mp[kGrassParams5Float + 0] = std::max(0.0f, std::min(g_grassRootAO, 1.0f));
         mp[kGrassParams5Float + 1] = (g_grassRootAOHeight > 1.0f) ? (1.0f / g_grassRootAOHeight) : 1.0f;
         mp[kGrassParams5Float + 2] = g_grassPointLights ? 1.0f : 0.0f;
-        mp[kGrassParams5Float + 3] = 0.0f;
+        mp[kGrassParams5Float + 3] = std::max(0.0f, std::min(g_grassShadowOpacity, 1.0f));
     }
 
     // SH2 (tasks/lighting.md) — rebuild the top-down world HEIGHT map.
