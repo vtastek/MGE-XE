@@ -11475,9 +11475,14 @@ namespace {
     // PER-BLADE VARIATION. One texture and one authored vertex colour per mesh means a palette draws
     // as one repeated colour at one repeated size; these give it a spread. Spatially COHERENT (see
     // g_grassPatchScale) — white noise per blade averages back to the flat field a few metres out.
-    float g_grassScaleVar    = 0.25f;     // patch-scale spread about the bake's own scaleMin..Max
-    float g_grassTintValue   = 0.14f;     // albedo (value) spread, mean-preserving
-    float g_grassTintHue     = 0.10f;     // dry<->lush spread, mean-preserving
+    // All three at 0.5 — the conservative 0.25/0.14/0.10 they shipped at were too subtle to read
+    // in the field. Every one is MEAN-PRESERVING (linear in an input whose mean is 0.5, identity
+    // AT 0.5), so raising them widens the distribution without moving the field's average
+    // brightness, cast or height — which is what keeps them off the exposure servo's back at any
+    // value. The rebuild log reports the spread each window actually produced.
+    float g_grassScaleVar    = 0.50f;     // patch-scale spread about the bake's own scaleMin..Max
+    float g_grassTintValue   = 0.50f;     // albedo (value) spread, mean-preserving
+    float g_grassTintHue     = 0.50f;     // dry<->lush spread, mean-preserving
     float g_grassPatchScale  = 1400.0f;   // world units per noise cell — the size of a drift
     float g_grassPatchGrain  = 0.30f;     // how much of the variation is per-blade rather than drift
     // RECEIVING the sun shadow was 76% OF THE ENTIRE GRASS DRAW (4.63 ms of 5.57; 1.11 ms without
@@ -15215,9 +15220,9 @@ namespace {
           // The two tint spreads publish per frame, so they move live; the three below them reshape
           // the window and cost a ~3 ms rebuild each time they change. Same trade as the density
           // knob, and the same reason: a matrix is baked, a cbuffer lane is not.
-          t.sliderF("Grass: albedo (value) spread", &g_grassTintValue, 0.0f, 0.5f, 0.01f);
-          t.sliderF("Grass: hue spread (dry <-> lush)", &g_grassTintHue, 0.0f, 0.5f, 0.01f);
-          t.sliderF("Grass: scale spread (patches of taller/shorter)", &g_grassScaleVar, 0.0f, 0.8f, 0.02f);
+          t.sliderF("Grass: albedo (value) spread", &g_grassTintValue, 0.0f, 1.0f, 0.02f);
+          t.sliderF("Grass: hue spread (dry <-> lush)", &g_grassTintHue, 0.0f, 1.0f, 0.02f);
+          t.sliderF("Grass: scale spread (patches of taller/shorter)", &g_grassScaleVar, 0.0f, 1.0f, 0.02f);
           t.sliderF("Grass: patch size (world units per drift)", &g_grassPatchScale, 200.0f, 6000.0f, 100.0f);
           t.sliderF("Grass: grain (0 = pure drift, 1 = pure per-blade)", &g_grassPatchGrain, 0.0f, 1.0f, 0.05f);
           t.sliderF("Grass: draw range (world units)", &g_grassRange, 1024.0f, 24576.0f, 256.0f);
