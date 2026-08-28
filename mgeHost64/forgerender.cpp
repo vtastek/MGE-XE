@@ -33931,7 +33931,15 @@ namespace ForgeRender {
                             }
                         }
                     }
-                    tileDiscs.assign((size_t)td * td, {});
+                    // ⚠ clear(), NOT assign(): assign destroys all td*td inner vectors and
+                    // constructs fresh empty ones, so every one of them frees and then re-allocates
+                    // its heap buffer — PER CELL. At the r=2 window a raised draw range produces
+                    // that is 25 x 1024 = 25,600 destroy/construct cycles and all the malloc traffic
+                    // behind them, in a function that runs on the RENDER THREAD. clear() keeps each
+                    // inner vector's capacity, so after the first cell of a rebuild the buckets are
+                    // reused and the allocator is never touched again.
+                    if (tileDiscs.size() != (size_t)td * td) { tileDiscs.resize((size_t)td * td); }
+                    for (std::vector<uint32_t>& tb : tileDiscs) { tb.clear(); }
                     const float ox = (float)cx * grassfmt::kCellSize;
                     const float oy = (float)cy * grassfmt::kCellSize;
                     for (uint32_t d = 0; d < (uint32_t)discX.size(); ++d) {
@@ -33965,6 +33973,21 @@ namespace ForgeRender {
                         const uint32_t tx = ti % td, ty = ti / td;
                         const float ox = (float)cx * grassfmt::kCellSize + (float)tx * tileSz;
                         const float oy = (float)cy * grassfmt::kCellSize + (float)ty * tileSz;
+
+                        // ⚠ THE DRIFT IS SAMPLED PER TILE, NOT PER BLADE, and that is the whole
+                        // point of it being a DRIFT. Three two-octave value noises is 24 lattice
+                        // hashes; evaluating them per blade very nearly DOUBLED this function's
+                        // per-blade cost (115 ns -> 205 ns measured), and it bought nothing: the
+                        // wavelength is g_grassPatchScale (1400 units) against a 256-unit tile, so
+                        // every blade in a tile was paying for 24 hashes to land within a few percent
+                        // of its neighbours. Sampled at the tile origin the field is still 5+ samples
+                        // per wavelength — far above what a gradient this smooth can resolve — and
+                        // the per-blade GRAIN below is what carries blade-to-blade difference anyway.
+                        const float pinv = (g_grassPatchScale > 1.0f) ? (1.0f / g_grassPatchScale) : 0.0f;
+                        const float tpx = ox * pinv, tpy = oy * pinv;
+                        const float dScale = grassValNoise(tpx, tpy);
+                        const float dHue   = grassValNoise(tpx + 37.2f, tpy - 18.9f);
+                        const float dVal   = grassValNoise(tpx - 61.5f, tpy + 92.4f);
 
                         for (uint32_t k = 0; k < n; ++k) {
                             const uint32_t h0 = grassHash((uint32_t)cx, (uint32_t)cy,
@@ -34042,23 +34065,22 @@ namespace ForgeRender {
                             const float yaw   = grassHash01(h4) * 6.28318531f;
 
                             // ── PER-BLADE VARIATION ──────────────────────────────────────────────
-                            // Three fields, each a spatial DRIFT with a per-blade grain mixed in at
-                            // g_grassPatchGrain. Three independent noises rather than one, so a
-                            // patch can be tall without also being pale — one field would lock the
-                            // three together and read as a single lighting artefact rather than as
-                            // varied growth. The drift lattice is on absolute world coordinates, so
-                            // it is continuous across cell borders and identical on every rebuild.
-                            const float pinv = (g_grassPatchScale > 1.0f) ? (1.0f / g_grassPatchScale) : 0.0f;
-                            const float px = wx * pinv, py = wy * pinv;
+                            // The tile's three DRIFT samples (hoisted above) with a per-blade grain
+                            // mixed in at g_grassPatchGrain. Three independent fields rather than
+                            // one, so a patch can be tall without also being pale — a single field
+                            // would lock the three together and read as one lighting artefact rather
+                            // than as varied growth. The drift lattice is on absolute world
+                            // coordinates, so it is continuous across cell borders and identical on
+                            // every rebuild; only the cheap grain hash is per blade.
                             const float grain = (g_grassPatchGrain < 0.0f) ? 0.0f
                                               : (g_grassPatchGrain > 1.0f ? 1.0f : g_grassPatchGrain);
                             auto mixField = [&](float drift, uint32_t salt) -> float {
                                 const float g = grassHash01(grassHash(h0, salt, ti, k));
                                 return drift * (1.0f - grain) + g * grain;
                             };
-                            const float vScale = mixField(grassValNoise(px, py), 0x7FEB352Du);
-                            const float vHue   = mixField(grassValNoise(px + 37.2f, py - 18.9f), 0x846CA68Bu);
-                            const float vVal   = mixField(grassValNoise(px - 61.5f, py + 92.4f), 0xD2A98F1Bu);
+                            const float vScale = mixField(dScale, 0x7FEB352Du);
+                            const float vHue   = mixField(dHue,   0x846CA68Bu);
+                            const float vVal   = mixField(dVal,   0xD2A98F1Bu);
 
                             // The bake's own per-blade spread, then the patch gradient on top of it.
                             // The bake's is uncorrelated (0.90..1.30 salt-and-pepper), which is why
