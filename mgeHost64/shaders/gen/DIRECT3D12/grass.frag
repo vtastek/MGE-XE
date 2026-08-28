@@ -1162,11 +1162,11 @@ STRUCT(ShadowMaskParams)
     float4 grassParams2;
 #line 664 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
     float4 grassParams3;
-#line 677 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
+#line 679 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
     float4 grassParams4;
-#line 693 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
+#line 695 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
     float4 grassParams5;
-#line 694
+#line 696
 };
 #line 21 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
 #line 27 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
@@ -2961,14 +2961,16 @@ PSOut PS_MAIN( VSOutput In )
     if (cov == 0u) { discard; }
 #line 111 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/grass.frag.fsl"
     float3 nFace = normalize(In.WorldNormal);
+#line 131 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/grass.frag.fsl"
+    float3 shadowPos = In.WorldPos - float3(0.0f, 0.0f, gShadowParams.grassParams4.w);
 
     float sunVis = 1.0f;
     uint smode = (uint)(gShadowParams.grassParams4.z + 0.5f);
     if (smode > 0u) {
-        sunVis = sunShadowVisibilityMode(In.WorldPos, nFace, (smode == 1u) ? 1 : 0);
+        sunVis = sunShadowVisibilityMode(shadowPos, nFace, (smode == 1u) ? 1 : 0);
     }
     float3 result = tex.rgb * (In.Color.rgb + In.SunLight * sunVis);
-#line 130 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/grass.frag.fsl"
+#line 150 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/grass.frag.fsl"
     if (gShadowParams.grassParams5.z > 0.5f) {
         result += tex.rgb * evalPointLightNearFar(In.WorldPos, nFace, In.Position.xy);
     }

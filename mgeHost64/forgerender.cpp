@@ -11540,6 +11540,15 @@ namespace {
     // change because the groundcover alpha is BINARY: 84% at exactly 0, 16% at exactly 255, so
     // moving the reference from 133 to 200 removes 0.0% of the casting area. See
     // sunshadow_statics.frag.
+    // ⚠ HOW FAR BELOW ITSELF GRASS READS THE SUN SHADOW, in world units. The receiver is a
+    // projection along the sun, so a fragment sampling at its own position lands in the shadow
+    // map displaced from the ground beneath it by height*tan(zenith) — under a low sun a blade
+    // standing squarely inside a tree's shadow comes back LIT while the ground it grows out of is
+    // dark, and the pattern the earth carries simply does not read through the field. Dropping the
+    // sample by about the mean blade height cancels that term and puts the whole field on the
+    // GROUND's shadow, so it runs continuously from the earth up into the grass. 0 = sample at the
+    // blade (the old behaviour, and the A/B).
+    float g_grassShadowDrop  = 40.0f;
     float g_grassShadowOpacity = 0.5f;
     bool  g_grassShadows     = true;
     float g_grassShadowRange = 1024.0f;   // world units; grass shadows are a near-field effect
@@ -15257,6 +15266,9 @@ namespace {
           // 1 = the solid silhouette; below that the caster thins stochastically so light comes
           // through the canopy. The alpha is binary, so an alpha-ref change cannot do this.
           t.sliderF("Grass: cast-shadow opacity (1 = solid)", &g_grassShadowOpacity, 0.0f, 1.0f, 0.05f);
+          // Reads the shadow for the GROUND under the blade, not for the blade — 0 restores the
+          // old sample-at-the-fragment behaviour.
+          t.sliderF("Grass: sun-shadow sample drop (world units)", &g_grassShadowDrop, 0.0f, 200.0f, 5.0f);
           // ⚠ THE TRAP, as a switch. ON gives the grass lane the statics lane's near cut + cell
           // ownership, which deletes every blade inside MW's loaded-cell slab — i.e. punches a hole
           // in the grass exactly around the player. Grass has no near path to hand over to (the
@@ -17948,6 +17960,7 @@ namespace ForgeRender {
             { "grassAlphaRef",       &g_grassAlphaRef       },
             { "grassShadowRange",    &g_grassShadowRange    },
             { "grassShadowOpacity",  &g_grassShadowOpacity  },
+            { "grassShadowDrop",     &g_grassShadowDrop     },
             // The enhanced-shader polish: the underwater current (its own strength, deliberately not
             // slaved to |wind|) and the sink LOD. Env-driven for the same reason as the rest —
             // "does the seaweed still lean in a gale" is a question the minimized harness has to be
@@ -36049,7 +36062,7 @@ namespace ForgeRender {
         mp[kGrassParams4Float + 0] = std::max(0.0f, std::min(g_grassTintValue, 1.0f));
         mp[kGrassParams4Float + 1] = std::max(0.0f, std::min(g_grassTintHue, 1.0f));
         mp[kGrassParams4Float + 2] = std::max(0.0f, std::min(g_grassShadowRecvMode, 2.0f));
-        mp[kGrassParams4Float + 3] = 0.0f;
+        mp[kGrassParams4Float + 3] = std::max(0.0f, g_grassShadowDrop);
         mp[kGrassParams5Float + 0] = std::max(0.0f, std::min(g_grassRootAO, 1.0f));
         mp[kGrassParams5Float + 1] = (g_grassRootAOHeight > 1.0f) ? (1.0f / g_grassRootAOHeight) : 1.0f;
         mp[kGrassParams5Float + 2] = g_grassPointLights ? 1.0f : 0.0f;

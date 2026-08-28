@@ -673,7 +673,9 @@ STRUCT(ShadowMaskParams)
     //     fragment — and PCSS is ~28 taps. Measured at 2,928 clumps: 4.63 ms with PCSS, 1.11 ms with
     //     no receiver at all, i.e. the receiver was 76% of the whole grass draw. Mode 1 keeps the
     //     shadow and spends one tap on it; see grass.frag for why a blade cannot show a penumbra.
-    // w = spare.
+    // w = SHADOW SAMPLE DROP in world units — how far below the fragment grass reads the sun
+    //     shadow, so the field carries the GROUND's shadow instead of one displaced by its
+    //     own height times tan(zenith). ~= mean blade height. 0 = sample at the blade.
     DATA(float4,   grassParams4,     None);
     // x = CONTACT-AO strength at the root, 0..1, scaled per blade by its own tile's canopy
     //     density (the third 8-bit field in the instance's variation code). AMBIENT ONLY —

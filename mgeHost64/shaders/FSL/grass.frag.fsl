@@ -110,10 +110,30 @@ PSOut PS_MAIN( VSOutput In )
     // black the moment you walk around the clump.
     float3 nFace  = normalize(In.WorldNormal);
 
+    // ⚠ THE SHADOW IS SAMPLED FOR THE GROUND THE BLADE STANDS ON, NOT FOR THE BLADE. A blade is up
+    // to ~150 world units tall and it SWAYS, and the receiver is a projection along the sun — so
+    // sampling at the fragment's own position lands in the shadow map displaced from the ground
+    // beneath it by height * tan(zenith). Under a low sun that is metres: a blade standing squarely
+    // inside a tree's shadow samples lit space above it and comes back bright, while the ground it
+    // grows out of is dark. The shadow then does NOT read through the field — the ground carries the
+    // pattern and the grass ignores it — and what little it does carry SWIMS, because the sample
+    // rides the wind displacement.
+    //
+    // Dropping the sample by a constant along world Z shifts the lookup along the sun projection by
+    // exactly drop*tan(zenith), which is the same term that displaced it — so a drop of about the
+    // mean blade height puts the whole field on the GROUND's shadow and the pattern runs continuously
+    // from the earth up into the grass, which is what a thin canopy does.
+    //
+    // A constant rather than the true per-blade root because there is nowhere to put the root:
+    // VSOutput is byte-locked to statics.vert's (the shadow caster pairs with it), and moving the
+    // lookup to the vertex stage would make it run in the CASTER pass too — sampling the moments map
+    // while that pass is writing it.
+    float3 shadowPos = In.WorldPos - float3(0.0f, 0.0f, gShadowParams.grassParams4.w);
+
     float  sunVis = 1.0f;
     uint   smode  = (uint)(gShadowParams.grassParams4.z + 0.5f);
     if (smode > 0u) {
-        sunVis = sunShadowVisibilityMode(In.WorldPos, nFace, (smode == 1u) ? 1 : 0);
+        sunVis = sunShadowVisibilityMode(shadowPos, nFace, (smode == 1u) ? 1 : 0);
     }
     float3 result = tex.rgb * (In.Color.rgb + In.SunLight * sunVis);
 
