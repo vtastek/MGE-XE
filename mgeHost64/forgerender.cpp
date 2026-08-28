@@ -24,6 +24,9 @@
 // Host-owned terrain (tasks/forge-terrain.md). POD-only surface by design: terrain.cpp is built on
 // the host's DEFAULT MSVC ABI, so nothing it allocates may cross into this TU's IMemory allocator.
 #include "terrain.h"
+// grass.bin's on-disk layout, shared verbatim with the tool that writes it (mgeBake64). Header-only
+// POD + constants, so there is nothing to link and no ABI surface.
+#include "../mgeBake64/grassformat.h"
 
 #include <cstdio>
 #include <cstdlib>   // std::atof — Morrowind.ini [Water]/[Weather] parse (loadWaterIniOnce)
@@ -36,6 +39,7 @@
 #include <cmath>
 #include <limits>    // std::numeric_limits — agxScaleF returns NaN outside its domain, on purpose
 #include <unordered_map>
+#include <unordered_set>
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -1614,6 +1618,53 @@ namespace {
         DescriptorSet* pSunCullSet       = nullptr; // CullSrtData PerBatch bound to the sun buffers
         bool           sunCullReady      = false;
         bool           sunArgsInDrawState = false;
+        // --- G1 GRASS: a cull lane of its OWN (tasks/forge-grass.md) -------------------------------
+        // Grass is baked into the same distant-statics library as everything else, so this shares
+        // cull.comp/cullscan/cullscatter, the mega VB/IB and gStaticsArrays verbatim. What it does
+        // NOT share is the INPUT ARRAYS, and there are two independent reasons, either sufficient:
+        //
+        //  1. ⚠ THE NEAR CUT WOULD PUNCH A HOLE AROUND THE PLAYER. cellown.h.fsl deletes instances
+        //     whose bound sphere lies inside MW's loaded-cell slab, because MW's own near path draws
+        //     them there. Grass has NO near path — the groundcover ESP is deliberately not in the
+        //     load order (bake with it, play without it), so MW has never heard of these placements.
+        //     Sharing the camera cull would delete grass exactly where it matters most. Fixed the way
+        //     dispatchSunCull already does it: its own CullParams with cellOwn and nearCut zeroed.
+        //  2. ⚠ THE INDIRECT-COMMAND WALL. Every statics pass issues cullSubsetCount (~10,910)
+        //     commands whether or not they are empty (cmdExecuteIndirect with no count buffer), and
+        //     that is already paid seven times over. Grass has the OPPOSITE ratio to statics — 27
+        //     subsets against 830k placements — so it gets a small PRIVATE subset table and adds
+        //     tens of commands per pass, not another 10,910.
+        //
+        // pGrassCullInst holds ONLY grass, and the main pCullInstBuf holds only non-grass: the split
+        // is a partition, not a copy, so the total instance memory is unchanged and the main cull's
+        // thread count drops by the grass share (two thirds of the exterior placements).
+        Buffer*        pGrassCullInst    = nullptr; // GPU_ONLY SRV: g_grassInst (96B/inst)
+        Buffer*        pGrassSubsetBuf   = nullptr; // GPU_ONLY SRV: g_grassSubsets (20B/subset)
+        Buffer*        pGrassCullParamsCbv = nullptr;
+        Buffer*        pGrassCullCount   = nullptr; // uint[4]: [0] = Σ survivors (ring-overflow watch)
+        Buffer*        pGrassCullReadback = nullptr; // GPU_TO_CPU, persistent-mapped (post-fence read)
+        Buffer*        pGrassSubsetCount = nullptr;
+        Buffer*        pGrassSubsetOffset = nullptr;
+        Buffer*        pGrassSubsetCursor = nullptr;
+        Buffer*        pGrassSubsetCountZero = nullptr; // CPU_TO_GPU zeros[grassSubsetCount]
+        Buffer*        pGrassArgs        = nullptr; // RW|INDIRECT
+        Buffer*        pGrassInstOut     = nullptr; // RW|VERTEX: survivor rows (20 uint/inst)
+        DescriptorSet* pGrassCullSet     = nullptr; // CullSrtData PerBatch bound to the grass buffers
+        bool           grassCullReady    = false;
+        bool           grassArgsInDrawState = false;
+        // ...and the SUN-CASTER clone of the same lane (G1e). Separate because the caster's frustum
+        // is the sun ortho box and its range is its own (a blade of grass casts a shadow for a few
+        // metres; carrying the whole draw range into the cascade is pure cost).
+        Buffer*        pGrassSunCullParamsCbv = nullptr;
+        Buffer*        pGrassSunCullCount   = nullptr;
+        Buffer*        pGrassSunSubsetCount = nullptr;
+        Buffer*        pGrassSunSubsetOffset = nullptr;
+        Buffer*        pGrassSunSubsetCursor = nullptr;
+        Buffer*        pGrassSunArgs        = nullptr;
+        Buffer*        pGrassSunInstOut     = nullptr;
+        DescriptorSet* pGrassSunCullSet     = nullptr;
+        bool           grassSunCullReady    = false;
+        bool           grassSunArgsInDrawState = false;
         // --- Follow-on 3: shadow-light occlusion cull (one dispatch/frame, 1-frame readback) -------
         // Tests each shadow slot's influence sphere vs the PREVIOUS frame's Hi-Z pyramid (the SAME
         // test as cull.comp); a fully-occluded slot ORs its bit into pLightOccBits[0]. The host reads
@@ -4094,8 +4145,23 @@ namespace {
     // so the consumer cannot read the ladder while it is unready. Appended for the reason every
     // block above states. yzw spare.
     constexpr uint32_t kWaterCausticProjFloat = kWaterCutFloat + 4;
+    // G1: the two grass float4s (wind vector + clock + sway gain; fade band + alpha reference).
+    // Appended for the reason every block above states — this cbuffer is bound BY POINTER into every
+    // PerFrame set, so an insertion anywhere else moves a lane somebody reads.
+    constexpr uint32_t kGrassParamsFloat      = kWaterCausticProjFloat + 4;
+    constexpr uint32_t kGrassParams2Float     = kGrassParamsFloat + 4;
+    constexpr uint32_t kGrassParams3Float     = kGrassParams2Float + 4;
+    // G3: the per-blade albedo/hue variation spreads (grass.vert::grassTint).
+    constexpr uint32_t kGrassParams4Float     = kGrassParams3Float + 4;
+    // G5c: contact AO (root darkening) + the point-light arm.
+    constexpr uint32_t kGrassParams5Float     = kGrassParams4Float + 4;
+    // The grass motion clock's wrap period, in MW simulation SECONDS. 4 is not a taste value: it is
+    // the shortest period over which all four of grass.vert's motion rates (pi, 1.5*pi for the wind
+    // term; 0.5*pi, 1.5*pi for the underwater one) complete whole cycles, which is what makes the
+    // wrap invisible. Changing a rate means re-deriving this. [[project_wrapped_time_needs_snapped_omega]]
+    constexpr double   kGrassWindPeriod       = 4.0;
     constexpr uint32_t kShadowParamsBytes = 4096;
-    static_assert((kWaterCausticProjFloat + 4) * sizeof(float) <= kShadowParamsBytes,
+    static_assert((kGrassParams5Float + 4) * sizeof(float) <= kShadowParamsBytes,
                   "ShadowMaskParams overflows its CBV — too many sun cascades");
     // msmrecv.h.fsl's PCSS works in TEXELS, so SUN_SHADOW_RES has to agree with the atlas the host
     // actually allocated. Same mirroring contract as SUN_CASCADES / kSunCascades.
@@ -11356,6 +11422,145 @@ namespace {
     // they gate the host render blocks; MGE's counterparts are gated separately on the client (F-keys).
     bool g_drawSky       = true;
     bool g_drawDLStatics = true;
+    // ─── G1 GRASS (tasks/forge-grass.md) ─────────────────────────────────────────────────────────
+    // Grass has been missing since S4a deleted MGE's DX9 colour layer; the placements were resident
+    // on the host the whole time and thrown away by a single `rangeEndIdx = 0xFFFFFFFF` skip. These
+    // are the runtime levers for the lane that draws them. Every one is reachable from
+    // MGE_HOST_KNOBS as well as the panel, because the perf harness runs minimized and cannot click.
+    bool  g_drawGrass        = true;
+    // DENSITY, and it is a PREFIX, not a per-instance test. g_grassInst is hash-shuffled once at
+    // load, so any prefix of it is a spatially uniform random subset of the whole field — which
+    // means density can be a dispatch COUNT instead of a branch in a shared shader. Three
+    // consequences, all of them the point: it is stable under motion (the order never changes, so
+    // nothing pops), raising it strictly ADDS blades rather than swapping which ones survive, and it
+    // scales the cull's cost and its 96 B/instance read with it instead of paying full price to
+    // reject. 1.0 = every baked placement (the bake's own GrassDens already decimated once).
+    float g_grassDensity     = 1.0f;
+    // DRAW RANGE. MGE culled grass at min(fogEnd, nearViewRange) with a hard plane; this is a free
+    // knob because grass is its own cull lane with its own tier range. The fade below eats the
+    // last stretch of it.
+    float g_grassRange       = 8192.0f;   // world units (one MW cell)
+    float g_grassFadeFrac    = 0.25f;     // fraction of the range spent dissolving (0 = MGE's pop)
+    float g_grassWindGain    = 1.0f;      // sway amplitude; 0 = the field stands still (isolation A/B)
+    float g_grassAlphaRef    = 128.0f / 255.0f;   // ONE reference — see shadowparams.h.fsl grassParams2.z
+    // ⚠ UNDERWATER MOTION IS DIRECTIONLESS, and this is its own strength because that is the point:
+    // wind does not reach below the surface, so submerged growth must not lean along windVec and a
+    // gale must not bend the seaweed. grass.vert drives it from counter-phased rotation instead.
+    // 0 stills submerged plants while the shore grass keeps blowing — the A/B for this half alone.
+    float g_grassCurrent     = 6.0f;
+    // The enhanced shader's distance LOD: sink the blade into the ground rather than cut it, so far
+    // grass gets SHORTER instead of vanishing. 0 leaves the coverage dissolve as the only LOD.
+    float g_grassSinkDepth   = 100.0f;    // world units at the far end of the fade band
+    float g_grassSinkJitter  = 0.30f;     // per-blade raggedness, as a fraction of that band
+    // G3 SCATTER knobs — the two rejections the density field can do and the authored placements
+    // could only ever express by hand-painting around every object.
+    bool  g_grassAvoidStatics = true;     // don't grow blades inside rocks, walls, roads
+    float g_grassAvoidScale   = 0.45f;    // fraction of a static's bound-sphere radius that carves.
+                                          // ⚠ A bound sphere is much bigger than the mesh in it, so
+                                          // 1.0 would strip whole courtyards; this is a knob because
+                                          // the right value is a look, not a derivation.
+    float g_grassMaxSlopeDeg  = 40.0f;    // blades stop where the ground stops being ground
+    // ⚠ A CARVE IS THE WRONG SHAPE FOR THE ARTISTIC INTENT. What the placements were reaching for is
+    // grass growing UP AGAINST a rock, and the authors had no way to say it: the CS brush places a
+    // reference at one fixed scale, so a blade near a boulder is a full-size blade intersecting it
+    // and the only remedy anyone had was to not place it. Deleting the blade is a faithful copy of
+    // that limitation, not of the intent — it rings every rock with bald ground.
+    //
+    // So the disc SHRINKS instead of cutting: a blade's scale falls off toward the disc centre and it
+    // is dropped only when it would be too small to read. Small grass tucked at the base of a rock is
+    // both what the artists wanted and, incidentally, more blades than the carve allowed.
+    // 0 = the hard carve this replaced (the A/B); 1 = full shrink.
+    float g_grassAvoidSoften  = 1.0f;
+    float g_grassAvoidMinScale = 0.35f;   // below this the shrunk blade is dropped instead
+    // PER-BLADE VARIATION. One texture and one authored vertex colour per mesh means a palette draws
+    // as one repeated colour at one repeated size; these give it a spread. Spatially COHERENT (see
+    // g_grassPatchScale) — white noise per blade averages back to the flat field a few metres out.
+    float g_grassScaleVar    = 0.25f;     // patch-scale spread about the bake's own scaleMin..Max
+    float g_grassTintValue   = 0.14f;     // albedo (value) spread, mean-preserving
+    float g_grassTintHue     = 0.10f;     // dry<->lush spread, mean-preserving
+    float g_grassPatchScale  = 1400.0f;   // world units per noise cell — the size of a drift
+    float g_grassPatchGrain  = 0.30f;     // how much of the variation is per-blade rather than drift
+    // RECEIVING the sun shadow was 76% OF THE ENTIRE GRASS DRAW (4.63 ms of 5.57; 1.11 ms without
+    // it). PCSS is ~28 taps and the grass pass cannot reject an occluded fragment before the shader
+    // — it exports SV_Coverage and discards — so it pays them once per overdrawn layer of a dense
+    // field. 0 = no receiver (grass under a tree sits in full sun), 1 = one-tap moments, 2 = the
+    // full PCSS receiver every hard surface uses. 1 is the default because the penumbra PCSS buys
+    // has nowhere to land on a two-pixel blade. See grass.frag.
+    float g_grassShadowRecvMode = 1.0f;
+    // CONTACT AO. What makes a sward sit ON the ground is darkness at its own roots, and that
+    // needs no depth buffer: it is a ramp on height up the blade, scaled by how many neighbours
+    // the scatter put in the same 256-unit tile. Screen-space AO could not see this occluder at
+    // all — the blades doing the occluding are sub-pixel — and grass is not in the depth prepass
+    // anyway (that is near geometry + terrain only), so it neither casts into nor receives GTAO.
+    float g_grassRootAO       = 0.45f;    // darkening at the root of a FULL canopy tile
+    float g_grassRootAOHeight = 40.0f;    // model-space units over which it lifts to full
+    float g_grassAOFullTile   = 14.0f;    // blades in a source tile that count as a full canopy
+    // POINT LIGHTS. A campfire or lantern on a grassy verge used to light the ground and leave
+    // the grass black. Cheap for a reason that does NOT generalise: an empty froxel costs
+    // nothing, and a daylit exterior is nearly all empty froxels. The case to measure is a
+    // lantern-lit NIGHT exterior, where clusters are populated and grass overdraw multiplies it.
+    bool  g_grassPointLights  = true;
+    // ⚠ GRASS IS THE ONE STATIC TYPE DRAWN AT THE CAMERA, AND THE 512 CAP WAS COSTING IT THREE MIPS.
+    // kStaticsTexCap (512) is a DISTANT-statics number and a good one — nothing in that library is
+    // ever
+    // nearer than the near/far handover. Grass is the exception by construction: the whole point of
+    // G1 is that it draws from the player's feet outward. Measured on this bake, the groundcover
+    // ships six 4096-square DXT5 ATLASES (five square, one 4096x2048) holding ~40 hand-packed cards
+    // apiece, so a card is ~512 texels of the sheet. At the 512 cap the whole sheet became 512, which
+    // is 64 TEXELS PER CARD — magnified maybe five times on a blade a metre away. That is the
+    // reported "looks low res, as if it is skipping mips": it was skipping three.
+    //
+    // 2048 costs one mip on those atlases (~256 texels/card) for ~40 MB of the ~160 MB that native
+    // 4096 would take. A knob because that trade is a look-and-VRAM judgement, not a derivation; the
+    // build logs the bytes either way so the choice can be made from a number.
+    // A float so it joins the MGE_HOST_KNOBS table (read once at startup, which is exactly when
+    // the residency is built — there is nothing to change later; the arrays are uploaded once).
+    float g_grassTexCap = 2048.0f;
+    // The authored vertex-colour flag (red: 0 = rigid prop, 1 = foliage). ON because this bake
+    // measurably carries it — every grass vertex is (0,255,255,255) or (255,255,255,255), uniform
+    // per subset. OFF for a pack that never painted the channel, which is stock's behaviour.
+    bool  g_grassVColFlag    = true;
+    // CASTING is a perf question, not a correctness one, so it lands behind its own switch and its
+    // own range. The caster reuses grass.vert, which is what guarantees the shadow carries the
+    // IDENTICAL wind displacement — a caster that does not sway with its blade detaches from it.
+    // CASTING. ON, and the RANGE is what makes it affordable — see tasks/forge-grass.md G6. At the
+    // 2048 this used to default to, casting measured +1.4 to +3.0 ms on the sun pass, more than the
+    // entire grass colour draw. The cost is quadratic in the range because it is the CASTER COUNT that
+    // scales, so halving it to 1024 is a ~4x cut on the extra geometry while keeping the shadows in
+    // the band where a blade is actually several shadow-map texels wide and the effect reads.
+    bool  g_grassShadows     = true;
+    float g_grassShadowRange = 1024.0f;   // world units; grass shadows are a near-field effect
+    // Live A/B for the whole G1a claim: ON restores the near cut + cell ownership the statics lane
+    // uses, which is exactly the hole-around-the-player trap. Kept as a switch because "the fix is
+    // load-bearing" is a claim that should be demonstrable in one frame, not argued from a comment.
+    bool  g_grassNearCut     = false;
+    // The grass survivor ring, and it is EXACTLY kLiveMaxInst on purpose: cullscan.comp and
+    // cullscatter.comp carry `#define kMaxInst 65536u` as their overflow guard, and those two are
+    // shared VERBATIM with the statics lanes — whose DXIL is the artifact the "grass off is
+    // bit-identical to today" check reads. A larger grass ring would need that define to become a
+    // CullParams lane, i.e. an edit to a shader on the identity check, so G1 takes the ceiling
+    // rather than the edit. It is not a tight one: 65,536 is 8x MGE's entire MaxGrassElements cap,
+    // and the measured worst case in this install (usage.data: 830,457 grass placements over 700
+    // cells, densest cell 9,087) puts ~6k blades in a 75-degree frustum at one cell of range and
+    // ~24k at two. Overflow is REPORTED off the count readback rather than left silent, because
+    // cullscatter's guard just drops the row. To lift it later: widen the guard to a param, raise
+    // this, done. Declared here rather than with the DL block so drawDevUI and the post-fence
+    // readback can see it — the same arrangement kSkyStaticsRowCap uses, and static_asserted
+    // against kLiveMaxInst where that is declared.
+    constexpr uint32_t kGrassMaxInst = 65536;
+    uint32_t  g_grassInstCount     = 0;   // resident grass placements (g_grassInst.size())
+    uint32_t  g_grassSubsetCount   = 0;   // grass subset table size (the indirect command count)
+    uint32_t  g_grassLastSurvivors = 0;   // prev-frame GPU survivor readback (observability)
+    uint32_t  g_grassLastDispatch  = 0;   // instances actually dispatched (the density prefix)
+    bool      g_grassOverflowSeen  = false;   // ring hit its ceiling at least once this session
+    // A plain-memory SNAPSHOT of the CullParams the camera grass lane published this frame (the
+    // cbuffer itself is write-combined and must not be read back). The heartbeat re-runs cull.comp's
+    // own range + frustum test against it on a strided sample of the instance array, so "the lane
+    // drew nothing" arrives with the reason attached instead of as a number to go and chase. Without
+    // it, an empty field, a wrong eye, a collapsed frustum and a broken buffer upload all look
+    // identical from the outside. [[feedback_verify_the_right_artifact]]
+    float     g_grassCullDbg[128] = {};
+    bool      g_grassCullDbgOk    = false;
     // Host-owned terrain (tasks/forge-terrain.md) — the world's ONE surface since T4, near and far,
     // main view and reflection. The DL world bake it replaced (294 chunk meshes at 915 tris/cell
     // under a 44-texel-per-cell atlas) is gone, so this toggle no longer has an A/B partner: turning
@@ -11619,6 +11824,14 @@ namespace {
     unsigned char g_terrainCovBuf[192] = {};
     bstring       g_terrainCovText = bfromarr(g_terrainCovBuf);
     float4        g_terrainCovColor = { 0.70f, 1.0f, 0.70f, 1.0f };
+    // G1 grass readout, beside the grass sliders. Says how many blades were DISPATCHED (the density
+    // prefix) against how many SURVIVED, and turns red at the ring ceiling — the one failure mode
+    // that is otherwise mute, because cullscatter drops overflow rows silently and the field just
+    // thins out. Also the place the wind is legible: a wind of (0,0) with the sway gain up is a
+    // wire problem, not a shader one, and the two are indistinguishable from the picture.
+    unsigned char g_grassBuf[192] = {};
+    bstring       g_grassText = bfromarr(g_grassBuf);
+    float4        g_grassColor = { 0.70f, 1.0f, 0.70f, 1.0f };
     // IR4 water-height readout, on the Reflection tab. Morrowind carries THREE different ideas of
     // where the water is and they do not agree; the reflection has to pick one, so put all of them on
     // screen next to the sliders instead of leaving it to be re-derived from the source every time.
@@ -14555,8 +14768,13 @@ namespace {
     // exactly as it did before; only the extra swing is withheld. Both ends live (radii print in the log).
     float g_flickAmpRadMin   = 150.0f;  // Radius at/below which excitation adds NO amplitude (candle).
     float g_flickAmpRadMax   = 300.0f;  // Radius at/above which excitation adds FULL amplitude (lantern/torch).
-    float g_flickWind        = 0.0f;    // THIS frame's smoothed wind magnitude from the client (lighting[18];
-                                        // 0 in interiors — the exterior gate lives client-side).
+    // THIS frame's smoothed wind VECTOR from the client (lighting[36..37]; (0,0) in interiors — the
+    // exterior gate lives client-side). G1 moved the wire quantity from the magnitude to the vector:
+    // the flame flicker only ever wanted |wind| (it is isotropic), but grass needs the direction, and
+    // shipping both would let the two disagree about what the wind is doing. g_flickWind below is
+    // derived from this, at the read site, so there is exactly one wind on the wire.
+    float g_grassWind[2]     = { 0.0f, 0.0f };
+    float g_flickWind        = 0.0f;    // |g_grassWind| — the flame-flicker drive (see above).
     // A slot's motion drive (0..1): its smoothed travel speed against the full-drive reference.
     static float motionDrive(const ShadowSlot& sl) {
         return (g_flickMotionRef > 1e-3f) ? std::min(1.0f, sl.fSpeed / g_flickMotionRef) : 0.0f;
@@ -14981,6 +15199,55 @@ namespace {
           t.checkbox("Terrain: wireframe (LOD + stitch inspection)", &g_terrainWire);
           t.dynamicText("", &g_terrainCovText, &g_terrainCovColor);
           t.checkbox("Draw: distant statics", &g_drawDLStatics);
+          // ─── G1 GRASS (tasks/forge-grass.md) ────────────────────────────────────────────────
+          // Grass has been absent since S4a; the placements were resident on the host the whole
+          // time. These sit on the Draw/AB tab because every one of them is a measurement lever.
+          t.checkbox("Draw: GRASS (host-owned; off = today's image)", &g_drawGrass);
+          t.sliderF("Grass: density (per-blade hash — raising it only ADDS blades)", &g_grassDensity, 0.0f, 1.0f, 0.02f);
+          t.checkbox("Grass: avoid statics (no blades inside rocks/walls)", &g_grassAvoidStatics);
+          t.sliderF("Grass: static carve radius (x bound sphere)", &g_grassAvoidScale, 0.0f, 1.0f, 0.05f);
+          // The proximity response. 0 restores the hard carve — the A/B for the whole idea that
+          // grass belongs AGAINST a rock at a smaller size rather than deleted near it.
+          t.sliderF("Grass: near-static SHRINK (0 = hard carve instead)", &g_grassAvoidSoften, 0.0f, 1.0f, 0.05f);
+          t.sliderF("Grass: smallest blade kept beside a static", &g_grassAvoidMinScale, 0.05f, 1.0f, 0.05f);
+          t.sliderF("Grass: max ground slope (deg)", &g_grassMaxSlopeDeg, 0.0f, 90.0f, 1.0f);
+          // ─── PER-BLADE VARIATION ───────────────────────────────────────────────────────────
+          // The two tint spreads publish per frame, so they move live; the three below them reshape
+          // the window and cost a ~3 ms rebuild each time they change. Same trade as the density
+          // knob, and the same reason: a matrix is baked, a cbuffer lane is not.
+          t.sliderF("Grass: albedo (value) spread", &g_grassTintValue, 0.0f, 0.5f, 0.01f);
+          t.sliderF("Grass: hue spread (dry <-> lush)", &g_grassTintHue, 0.0f, 0.5f, 0.01f);
+          t.sliderF("Grass: scale spread (patches of taller/shorter)", &g_grassScaleVar, 0.0f, 0.8f, 0.02f);
+          t.sliderF("Grass: patch size (world units per drift)", &g_grassPatchScale, 200.0f, 6000.0f, 100.0f);
+          t.sliderF("Grass: grain (0 = pure drift, 1 = pure per-blade)", &g_grassPatchGrain, 0.0f, 1.0f, 0.05f);
+          t.sliderF("Grass: draw range (world units)", &g_grassRange, 1024.0f, 24576.0f, 256.0f);
+          t.sliderF("Grass: fade band (fraction of range; 0 = MGE's hard pop)", &g_grassFadeFrac, 0.0f, 1.0f, 0.05f);
+          t.sliderF("Grass: wind sway gain (0 = stands still)", &g_grassWindGain, 0.0f, 3.0f, 0.05f);
+          // ⚠ UNDERWATER motion is DIRECTIONLESS and has its own strength — wind does not reach
+          // below the surface, so a gale must not bend the seaweed. 0 stills submerged plants only.
+          t.sliderF("Grass: UNDERWATER current (directionless; 0 = still)", &g_grassCurrent, 0.0f, 24.0f, 0.5f);
+          t.sliderF("Grass: LOD sink depth (far grass gets SHORTER, not gone)", &g_grassSinkDepth, 0.0f, 300.0f, 5.0f);
+          t.sliderF("Grass: LOD sink raggedness (fraction of the fade band)", &g_grassSinkJitter, 0.0f, 1.0f, 0.05f);
+          t.checkbox("Grass: honour the authored vcol flag (off = rocks sway too)", &g_grassVColFlag);
+          // The pass's dominant per-pixel cost was the RECEIVER, not the geometry: 76% of the grass
+          // draw. 0 = none, 1 = one tap, 2 = the full PCSS every hard surface gets.
+          t.sliderF("Grass: sun-shadow receiver (0 none / 1 one-tap / 2 PCSS)", &g_grassShadowRecvMode, 0.0f, 2.0f, 1.0f);
+          // Contact AO — the "grass sits on the ground" cue, and the reason casting shadows is not
+          // worth its measured 1.4-3.0 ms. Free: one lerp in the vertex stage.
+          t.sliderF("Grass: contact AO at the root (ambient only)", &g_grassRootAO, 0.0f, 1.0f, 0.05f);
+          t.sliderF("Grass: contact-AO height (model units)", &g_grassRootAOHeight, 5.0f, 150.0f, 5.0f);
+          t.sliderF("Grass: blades/tile counting as a full canopy", &g_grassAOFullTile, 1.0f, 40.0f, 1.0f);
+          t.checkbox("Grass: receive clustered POINT LIGHTS", &g_grassPointLights);
+          t.sliderF("Grass: alpha reference (MGE 128/255)", &g_grassAlphaRef, 0.05f, 0.95f, 0.01f);
+          t.checkbox("Grass: cast sun shadows (perf — measure it)", &g_grassShadows);
+          t.sliderF("Grass: shadow-cast range (world units)", &g_grassShadowRange, 256.0f, 8192.0f, 128.0f);
+          // ⚠ THE TRAP, as a switch. ON gives the grass lane the statics lane's near cut + cell
+          // ownership, which deletes every blade inside MW's loaded-cell slab — i.e. punches a hole
+          // in the grass exactly around the player. Grass has no near path to hand over to (the
+          // groundcover ESP is not in the load order), so this is always wrong; it is here so the
+          // claim can be seen rather than read.
+          t.checkbox("Grass: near cut + cell ownership (WRONG — shows the G1a hole)", &g_grassNearCut);
+          t.dynamicText("", &g_grassText, &g_grassColor);
           t.checkbox("Statics: GPU cull (B3 draw)", &g_gpuStaticsCull);
           t.dropdown("Statics: facing (dark/bright A/B)", &g_staticsFacing, kStaticsFacingNames, 4);
           t.checkbox("Statics: Hi-Z occlusion (M2)", &g_hizOcclusion);
@@ -16275,6 +16542,30 @@ namespace {
             g_terrainCovColor = float4(0.70f, 1.0f, 0.70f, 1.0f);
             bformat(&g_terrainCovText, "coverage: OK — host terrain owns the near field (%u cells resident)",
                     Terrain::cellCount());
+        }
+
+        // G1 grass readout. Four numbers and a wind, in the order they can fail: is there a lane at
+        // all, how much of it did we dispatch, how much survived, and did the ring hold.
+        if (!g_live.grassCullReady) {
+            g_grassColor = float4(0.75f, 0.75f, 0.75f, 1.0f);
+            bformat(&g_grassText, "grass: no lane (%s)",
+                    g_grassInstCount ? "cull alloc failed" : "no grass placements in this bake");
+        } else if (!g_drawGrass) {
+            g_grassColor = float4(0.75f, 0.75f, 0.75f, 1.0f);
+            bformat(&g_grassText, "grass: draw OFF — %u placements resident, nothing dispatched",
+                    g_grassInstCount);
+        } else if (g_grassLastSurvivors > kGrassMaxInst) {
+            g_grassColor = float4(1.0f, 0.45f, 0.45f, 1.0f);
+            bformat(&g_grassText, "grass: RING FULL — %u survivors > %u rows, blades DROPPED. "
+                                  "Lower density or range.", g_grassLastSurvivors, kGrassMaxInst);
+        } else {
+            g_grassColor = float4(0.70f, 1.0f, 0.70f, 1.0f);
+            bformat(&g_grassText, "grass: %u/%u dispatched -> %u drawn (%.0f%% of ring) | "
+                                  "wind (%.2f, %.2f) |w|=%.2f%s",
+                    g_grassLastDispatch, g_grassInstCount, g_grassLastSurvivors,
+                    100.0 * (double)g_grassLastSurvivors / (double)kGrassMaxInst,
+                    g_grassWind[0], g_grassWind[1], g_flickWind,
+                    g_grassNearCut ? "  [NEAR CUT ON — expect a hole at the camera]" : "");
         }
 
         // Phase 0: refresh the live-stats text from this frame's counters (Forge bformat pattern).
@@ -17629,6 +17920,44 @@ namespace ForgeRender {
             { "ripGridDamp",         &g_ripGridDamp         },
             { "causticCalmDisp",     &g_causticCalmDisp     },
             { "causticCalmHess",     &g_causticCalmHess     },
+            // G1 grass. All four are here because every question G1 has to answer is a MEASUREMENT
+            // the minimized harness must be able to take without a hand on the panel: what does the
+            // field cost at density d and range r (the two perf levers), does the wind actually move
+            // (grassWindGain=0 stands it still, which is the isolation arm), and what does casting
+            // add. See tasks/forge-grass.md.
+            { "grassDensity",        &g_grassDensity        },
+            { "grassRange",          &g_grassRange          },
+            { "grassFadeFrac",       &g_grassFadeFrac       },
+            { "grassWindGain",       &g_grassWindGain       },
+            { "grassAlphaRef",       &g_grassAlphaRef       },
+            { "grassShadowRange",    &g_grassShadowRange    },
+            // The enhanced-shader polish: the underwater current (its own strength, deliberately not
+            // slaved to |wind|) and the sink LOD. Env-driven for the same reason as the rest —
+            // "does the seaweed still lean in a gale" is a question the minimized harness has to be
+            // able to ask by setting one number to 0.
+            { "grassCurrent",        &g_grassCurrent        },
+            { "grassSinkDepth",      &g_grassSinkDepth      },
+            { "grassSinkJitter",     &g_grassSinkJitter     },
+            // G3: the scatter's two rejections. Both change the FIELD, so setting either forces a
+            // window rebuild — which is the only way an A/B on them is visible without walking a
+            // whole cell first.
+            { "grassAvoidScale",     &g_grassAvoidScale     },
+            { "grassMaxSlopeDeg",    &g_grassMaxSlopeDeg    },
+            // G3 variation + proximity. grassTexCap is here rather than on the panel because it
+            // is consumed ONCE, when the texture residency is built at the first exterior — a
+            // slider for it would be a control that silently does nothing after the first cell.
+            { "grassTexCap",         &g_grassTexCap         },
+            { "grassAvoidSoften",    &g_grassAvoidSoften    },
+            { "grassAvoidMinScale",  &g_grassAvoidMinScale  },
+            { "grassScaleVar",       &g_grassScaleVar       },
+            { "grassTintValue",      &g_grassTintValue      },
+            { "grassTintHue",        &g_grassTintHue        },
+            { "grassPatchScale",     &g_grassPatchScale     },
+            { "grassPatchGrain",     &g_grassPatchGrain     },
+            { "grassShadowRecvMode", &g_grassShadowRecvMode },
+            { "grassRootAO",         &g_grassRootAO         },
+            { "grassRootAOHeight",   &g_grassRootAOHeight   },
+            { "grassAOFullTile",     &g_grassAOFullTile     },
         };
         const BKnob bknobs[] = {
             { "waterNoReflect",     &g_waterNoReflect     },
@@ -17653,6 +17982,17 @@ namespace ForgeRender {
             // it, and therefore the only way to say what an interior setpoint SHOULD be rather than
             // guessing one. See the interior calibration work in tasks/lighting.md.
             { "expEnable",           &g_expEnable           },
+            // G1: the master A/B ("grass off must be bit-identical to today") and the one that
+            // demonstrates the G1a near-cut trap — grassNearCut=1 re-arms the statics lane's cut and
+            // ownership on the grass lane, which is the hole around the player, on purpose.
+            { "grassOn",             &g_drawGrass           },
+            { "grassShadows",        &g_grassShadows        },
+            { "grassNearCut",        &g_grassNearCut        },
+            // 0 = ignore the authored red channel and treat every subset as foliage (stock's
+            // behaviour). The A/B that shows the rocks and stiff shrubs swaying like wheat.
+            { "grassVColFlag",       &g_grassVColFlag       },
+            { "grassAvoidStatics",   &g_grassAvoidStatics   },
+            { "grassPointLights",    &g_grassPointLights    },
         };
         std::string spec(env);
         size_t pos = 0;
@@ -18906,6 +19246,9 @@ namespace ForgeRender {
     void renderSunShadow();   // SUN shadow: DL statics → MSM moments map (forge-sun-shadows.md Phase A)
     void blurSunMoments();    // SUN shadow: separable Gaussian over the moments — what makes MSM soft
     void dispatchSunCull();   // SUN shadow A2: second statics cull (sun ortho box, nearCut=0, Hi-Z off)
+    void dispatchGrassCull(); // G1a: the grass cull lane (own instance array + subset table)
+    void drawGrass();         // G1: the grass colour draw, inside the DL block
+    void publishGrassParams(float* mp, double simTimeSeconds);   // G1: gShadowParams grass lanes
     void rebuildSkyHeightMap();  // SH2: clear + statics raster + terrain compute, when the eye leaves its snap cell
     void rebuildSunOccMap(bool force);   // ...and the sun-BLOCKED height derived from it (sun motion / forced)
     void dlDrawHeroBlend();                                                 // Phase 4 post-water hero blend pass
@@ -18913,6 +19256,8 @@ namespace ForgeRender {
     void dlDrawGlowBillboards();                                            // Phase F glow billboards: per-frame fill + draw
     bool dlCreateLiveRings(Renderer* R);   // statics instance/arg rings (forward: --forge-view eager init)
     void buildStaticsGrid();               // live cull grid (forward: --forge-view eager init)
+    bool loadGrassField();                 // G3: grass.bin + nifmap.txt -> the resident density field
+    void updateGrassField(Renderer* R);    // G3: rebuild + upload the blade window on a cell change
     bool createShadowLightCullResources(Renderer* R);   // Follow-on 3: lazy from the shadow manager
     void dlLogHeartbeat();
     void dlLogGpuSlow(double gpuMs, double recMs, unsigned drawn);   // per-frame GPU spike (reads DL counts)
@@ -19115,6 +19460,24 @@ namespace ForgeRender {
             const uint32_t* rb = (const uint32_t*)g_live.pCullCountReadback->pCpuMappedAddress;
             g_lastGpuCullCount = rb[0];
             g_lastGpuOccluded  = rb[1];
+        }
+        // G1: the grass lane's survivor count, and its RING-OVERFLOW TRIPWIRE. [0] is the frustum
+        // survivor count BEFORE the Hi-Z test, so it reads high — a warning is worth checking and
+        // silence is a real all-clear. Worth saying out loud because the failure is otherwise mute:
+        // cullscatter drops rows past its kMaxInst guard with a bare `continue`, so at the ceiling
+        // the field just thins, which looks exactly like the density knob or like that hillside
+        // having less grass on it. Once per session — a full ring stays full for many frames.
+        if (g_live.pGrassCullReadback && g_live.pGrassCullReadback->pCpuMappedAddress) {
+            g_grassLastSurvivors = *(const uint32_t*)g_live.pGrassCullReadback->pCpuMappedAddress;
+            if (g_grassLastSurvivors > kGrassMaxInst && !g_grassOverflowSeen) {
+                g_grassOverflowSeen = true;
+                std::printf("[forge][grass] ring OVERFLOW: %u survivors > %u rows — blades are being "
+                            "DROPPED. Lower 'Grass: density' (now %.2f) or 'Grass: range' (now %.0f).\n",
+                            g_grassLastSurvivors, kGrassMaxInst, g_grassDensity, g_grassRange);
+                LOG::logline("!! [forge][grass] ring OVERFLOW: %u survivors > %u rows (density %.2f,"
+                             " range %.0f) — blades dropped",
+                             g_grassLastSurvivors, kGrassMaxInst, g_grassDensity, g_grassRange);
+            }
         }
         // SH2: the sky-height cull's survivor count. Only a rebuild frame writes this buffer, so the
         // value latches the LAST rebuild and holds — which is what the panel wants to report.
@@ -19443,9 +19806,15 @@ namespace ForgeRender {
             g_eyeAbsShadow[0] = lighting[24];
             g_eyeAbsShadow[1] = lighting[25];
             g_eyeAbsShadow[2] = lighting[26];
-            // lighting[18] = the client's SMOOTHED wind magnitude (0 in interiors — it gates on IsExterior
-            // there). CPU-side only: it drives the flame-flicker rate, so a gale makes torch shadows dance.
-            g_flickWind = lighting[18];
+            // lighting[36..37] = the client's SMOOTHED wind VECTOR ((0,0) in interiors — it gates on
+            // IsExterior there). G1 moved this lane from the magnitude to the vector: the flame
+            // flicker only ever needed |wind| (it is isotropic) but grass needs the direction, and
+            // shipping both would be two wires that can disagree. The magnitude is DERIVED here, so
+            // there stays exactly one wind in the process and g_flickWind keeps its meaning
+            // unchanged — it drives the flame-flicker rate, so a gale makes torch shadows dance.
+            g_grassWind[0] = lighting[36];
+            g_grassWind[1] = lighting[37];
+            g_flickWind = std::sqrt(g_grassWind[0] * g_grassWind[0] + g_grassWind[1] * g_grassWind[1]);
             // Cell-change shadow eviction (see g_shadowCellEpoch): a load door recycles NiPointLight
             // addresses AND swaps the resident geometry, so an old slot could keep sampling the prior
             // cell's cached tile while old-cell caster records still draw into new-cell atlases. On any
@@ -20344,6 +20713,14 @@ namespace ForgeRender {
         // client isExterior (dlSetFrameEye, called above with the same lighting block), and it is the
         // only gate: interiors publish strength 0 and every receiver early-outs.
         publishSkyAmbientSH((const float*)g_live.pFrameCbv->pCpuMappedAddress, g_dlExterior);
+        // G1: the grass lanes of the same cbuffer, from the same place and for the same reason — the
+        // wind clock and the fade band are per-frame quantities that no other pass owns, and hanging
+        // them off the grass DRAW would leave the sun-caster pass reading last frame's wind (which is
+        // exactly how a shadow detaches from its blade). g_uvAnimSimT is MW's raw simulation seconds,
+        // frozen in menus like the rest of the sim clock; publishGrassParams does the 2*pi wrap.
+        if (g_live.pShadowMaskParamsCbv && g_live.pShadowMaskParamsCbv->pCpuMappedAddress) {
+            publishGrassParams((float*)g_live.pShadowMaskParamsCbv->pCpuMappedAddress, g_uvAnimSimT);
+        }
         // Panel readout. The gate is one float and disarms every receiver silently, so say out loud
         // whether it fired and what sky is being projected — a DC that moves with the weather is the
         // proof the SH is rebuilt per frame rather than latched at load.
@@ -21631,6 +22008,11 @@ namespace ForgeRender {
         const double tCull0 = hostNowMs();   // end of per-draw setup, start of the DL cull
         g_lastSetupDrawMemcpyMs = tCull0 - tDrawMemcpy0;
         dlLiveCullAndBuild(R, rzViewProj);
+        // G3: regenerate the resident grass window if the eye has left its cell (or a knob that
+        // shapes the field moved). HERE, and not in the record phase, because it uploads through the
+        // resource loader — and after dlLiveCullAndBuild because it reads lodEye from the frame CBV
+        // that call publishes, and carves around the statics that call made resident.
+        updateGrassField(R);
         // WV2 perf: hoist the reflect-geo CPU cull off the record phase — run it here (pre-beginCmd, like
         // the main cull; counts in the `cull` metric, not `record`). Fills the reflection rings + writes
         // pReflectFrameCbvGeo; the reflect PASS then only records the draws (gated by g_reflGeoReady).
@@ -21922,6 +22304,12 @@ namespace ForgeRender {
         // SUN shadow A2: the second statics cull (sun ortho box, nearCut=0, Hi-Z off) → pSunArgs/
         // pSunInstOut for renderSunShadow. Pure compute here (no RT bound), same phase as the camera cull.
         dispatchSunCull();
+
+        // G1a: and the grass lane(s), same phase and same three pipelines, over the grass instance
+        // array. Runs unconditionally with the other culls rather than lazily from the draw, so the
+        // SUN caster's survivors are ready before renderSunShadow — which runs before the DL colour
+        // block that consumes the camera lane's.
+        dispatchGrassCull();
 
         gpuPhaseEnd(kGpuPhaseCull);
 
@@ -28771,6 +29159,8 @@ namespace ForgeRender {
     // cmdExecuteIndirect. See [[project_forge_dl_statics_format]].
     constexpr uint32_t kStaticsBuckets    = MAX_STATICS_BUCKETS;  // gStaticsArrays element count (128)
     constexpr uint32_t kStaticsTexCap     = 512;   // cap the long side: extract that mip + chain (raw copy)
+    // The GRASS texture cap (g_grassTexCap) is declared with the other grass knobs above — it has
+    // to precede the MGE_HOST_KNOBS table, which is earlier in this file than the statics block.
     // Mips a w x h texture would have with a complete chain down to 1x1.
     inline uint32_t fullMipCount(uint32_t w, uint32_t h) {
         uint32_t n = 1;
@@ -28822,6 +29212,17 @@ namespace ForgeRender {
     Pipeline* g_pSunShadowStaticsPipeline = nullptr;
     Shader*   g_pSkyHeightStaticsShader   = nullptr;   // SH2 stage B: statics.vert + skyheight_statics.frag
     Pipeline* g_pSkyHeightStaticsPipeline = nullptr;
+    // G1 GRASS: grass.vert + grass.frag, the SAME vertex layout and depth rules as the statics
+    // pipeline above, but CULL_MODE_NONE — grass LODs are crossed quads and grass.vert lights both
+    // faces, so back-culling would delete half of every blade.
+    Shader*   g_pGrassShader   = nullptr;
+    Pipeline* g_pGrassPipeline = nullptr;
+    // ...and its sun caster (G1e): grass.vert paired with the EXISTING sunshadow_statics.frag. That
+    // pairing is the whole reason grass.vert emits statics.vert's VSOutput field for field, and it is
+    // what guarantees the shadow carries the identical wind displacement rather than detaching from
+    // the blade that cast it.
+    Shader*   g_pGrassSunShadowShader   = nullptr;
+    Pipeline* g_pGrassSunShadowPipeline = nullptr;
     // LIVE path: front face = CCW, per the MGE oracle — XE Main.fx Pass P4ext (the distant-statics
     // exterior pass) sets CullMode = CW, i.e. D3D9 culls the CW-wound triangles, so the FRONT faces are
     // CCW. (An explicit override; D3D9's default is D3DCULL_CCW.) The D3D12 equivalent is
@@ -28944,6 +29345,10 @@ namespace ForgeRender {
                                    // occupying it costs nothing — the stride is unchanged.
     };
     std::vector<GpuCullInstance>  g_cullInst;
+    // Parallel to g_cullInst: the DL_STATIC_* type of each instance's def. One byte per instance, and
+    // the grass scatter is what needs it — a TREE's bound sphere is hundreds of units wide, so
+    // carving grass out of it would ring every trunk with bald ground.
+    std::vector<uint8_t>          g_cullInstType;
 
     // --- Dynamic visibility groups -------------------------------------------------------------
     // A stronghold that isn't built yet, a Raven Rock at colony stage 1, a quest-toggled ruin: the DL
@@ -29080,6 +29485,20 @@ namespace ForgeRender {
     static_assert(kSkyStaticsRowCap == kLiveMaxInst, "sky-height row cap must mirror kLiveMaxInst");
     constexpr uint32_t kLiveMaxSubsets = 16384;        // per-frame indirect-arg cap (ring size)
     constexpr float    kLiveGridCell   = 8192.0f;      // uniform-grid cell (one MW cell) for the cull
+
+    // ─── G1 GRASS ────────────────────────────────────────────────────────────────────────────────
+    // (kGrassMaxInst and the observability counters are declared far above, beside the grass knobs,
+    // where drawDevUI and the post-fence readback can see them — same arrangement as
+    // kSkyStaticsRowCap. The static_assert tying the ring to kLiveMaxInst is below.)
+    static_assert(kGrassMaxInst == kLiveMaxInst, "grass ring must mirror kLiveMaxInst — the cull "
+                                                 "shaders' kMaxInst guard is what actually bounds it");
+    // The grass half of the ws0 placements, split out of g_cullInst at load. HASH-SHUFFLED — see
+    // buildStaticsGrid for why the order is the density knob.
+    std::vector<GpuCullInstance>  g_grassInst;
+    std::vector<StaticsSubsetGPU> g_grassSubsets;   // compact grass subset table (~27 entries)
+    // def ordinal -> its offset in g_grassSubsets. Built with the table in buildStaticsGrid, read by
+    // the density-field scatter every time it rebuilds a window.
+    std::vector<uint32_t>         g_grassFirstSubset;
     Buffer*   g_pStaticsInstRing = nullptr;            // CPU_TO_GPU per-frame instance stream (80 B/inst)
     Buffer*   g_pStaticsArgsRing = nullptr;            // CPU_TO_GPU per-frame IndirectDrawIndexArguments[]
     // WV2 (real reflection): a SECOND set of statics rings + land-visible list, filled by a SEPARATE
@@ -30503,6 +30922,82 @@ namespace ForgeRender {
             }
         }
 
+        // G1 GRASS: grass.vert + grass.frag. Same vertex layout, same reverse-Z GEQUAL depth-write,
+        // same colour target and sample count as the statics pipeline — grass IS opaque geometry
+        // (its cutout is resolved by SV_Coverage, not by blending), so it belongs in the depth-
+        // writing pass and nowhere near the sorted-alpha one.
+        //
+        // ⚠ CULL_MODE_NONE, and this is the one rasterizer state that differs. MGE draws its distant
+        // statics single-sided because their foliage LODs are crossed quads seen from outside; grass
+        // is crossed quads seen from INSIDE the clump, from every angle, and XE Mod Grass.fx lights
+        // it two-sided for exactly that reason. Back-culling here would delete one face of every
+        // blade — visible as grass that thins out when you turn around.
+        //
+        // Non-fatal: on failure g_pGrassPipeline stays null and the grass draw is skipped.
+        {
+            ShaderLoadDesc gsd = {};
+            gsd.mVert.pFileName = "grass.vert";
+            gsd.mFrag.pFileName = "grass.frag";
+            addShader(R, &gsd, &g_pGrassShader);
+            if (g_pGrassShader) {
+                RasterizerStateDesc rsG = rs; rsG.mCullMode = CULL_MODE_NONE;
+                PipelineDesc gpd = {};
+                gpd.mType = PIPELINE_TYPE_GRAPHICS;
+                GraphicsPipelineDesc& gg = gpd.mGraphicsDesc;
+                gg.mPrimitiveTopo      = PRIMITIVE_TOPO_TRI_LIST;
+                gg.mRenderTargetCount  = 1;
+                gg.pColorFormats       = &g_live.sceneColorFormat;
+                gg.mSampleCount        = (SampleCount)g_live.sampleCount;
+                gg.mSampleQuality      = 0;
+                gg.mDepthStencilFormat = TinyImageFormat_D32_SFLOAT;
+                gg.pDepthState         = &ds;
+                gg.pVertexLayout       = &vl;
+                gg.pRasterizerState    = &rsG;
+                gg.pShaderProgram      = g_pGrassShader;
+                addPipeline(R, &gpd, &g_pGrassPipeline);
+                if (!g_pGrassPipeline) { std::printf("[forge][grass] addPipeline(grass) FAILED\n"); }
+            } else {
+                std::printf("[forge][grass] addShader(grass) FAILED — grass disabled\n");
+            }
+
+            // G1e caster: grass.vert into the MSM moments atlas through the EXISTING
+            // sunshadow_statics.frag. Two-sided again (a shadow cast by one face of a crossed quad
+            // and not the other is a shadow with a hole in it).
+            // ⚠ That frag alpha-tests at ITS constant, 133/255, against grass's 128/255 knob — a 2%
+            // thinner silhouette in a map whose texel is a foot wide. Deliberately not forked for
+            // that: a second frag would be a second place the cutout rule lives, and the whole
+            // reason this pairing works is that grass.vert emits statics.vert's VSOutput. grass.vert
+            // FORCES flags bit1 so the test actually runs — a grass subset that shipped without the
+            // bake's hasAlpha bit would otherwise cast a solid box the size of its quads.
+            ShaderLoadDesc gss = {};
+            gss.mVert.pFileName = "grass.vert";
+            gss.mFrag.pFileName = "sunshadow_statics.frag";
+            addShader(R, &gss, &g_pGrassSunShadowShader);
+            if (g_pGrassSunShadowShader) {
+                TinyImageFormat sunFmt = TinyImageFormat_R16G16B16A16_UNORM;
+                RasterizerStateDesc rsGS = rs; rsGS.mCullMode = CULL_MODE_NONE;
+                PipelineDesc gspd = {};
+                gspd.mType = PIPELINE_TYPE_GRAPHICS;
+                GraphicsPipelineDesc& gsg = gspd.mGraphicsDesc;
+                gsg.mPrimitiveTopo      = PRIMITIVE_TOPO_TRI_LIST;
+                gsg.mRenderTargetCount  = 1;
+                gsg.pColorFormats       = &sunFmt;
+                gsg.mSampleCount        = SAMPLE_COUNT_1;
+                gsg.mSampleQuality      = 0;
+                gsg.mDepthStencilFormat = TinyImageFormat_D32_SFLOAT;
+                gsg.pDepthState         = &ds;
+                gsg.pVertexLayout       = &vl;
+                gsg.pRasterizerState    = &rsGS;
+                gsg.pShaderProgram      = g_pGrassSunShadowShader;
+                addPipeline(R, &gspd, &g_pGrassSunShadowPipeline);
+                if (!g_pGrassSunShadowPipeline) {
+                    std::printf("[forge][grass] addPipeline(grass sun caster) FAILED — casting off\n");
+                }
+            } else {
+                std::printf("[forge][grass] addShader(grass sun caster) FAILED — casting off\n");
+            }
+        }
+
         // SH2 stage B: DL statics → the sky-height map, from a top-down ortho. Same vertex layout as
         // the sun caster above, but:
         //   * R16_FLOAT colour target, no depth attachment at all,
@@ -31679,6 +32174,29 @@ namespace ForgeRender {
         if (g_staticsTexReady) { return true; }
         if (!g_staticsLoaded || !g_live.pPersistentSet || !g_live.pStaticsWhiteArray) { return false; }
         const std::string texDir = "Data Files\\distantland\\statics\\textures\\";
+        // ...and the SOURCE tree, as a fallback. The LOD library is an OPTIMISATION — a pre-shrunk
+        // copy the bake makes — not the authority; the authority is the texture the mesh names, which
+        // lives here. When the library has no copy, read the real one.
+        //
+        // ⚠ WITHOUT THIS, A MISSING LOD TEXTURE IS SILENTLY WHITE. `missing` below routes the subset
+        // to bucket 0, which is the reserved 4x4 white array, and the only report was a std::printf
+        // that never reaches mgeHost64.log. G1 walked straight into it: the bake carries grass
+        // geometry and 830,457 placements but NOT ONE of the 27 grass textures (there is no `rem\`
+        // folder under statics\textures at all), so the whole field drew as white cards — correctly
+        // lit, correctly swaying, and completely untextured, with nothing anywhere saying why.
+        //
+        // The source DDS are ideal for this loader, which is the other half of why the fallback is
+        // right rather than merely expedient: it does a RAW mip-extract (the largest mip with long
+        // side <= kStaticsTexCap plus the chain below it — no decode, resize or re-encode), and the
+        // groundcover textures ship 1024² DXT5 with full 11-level chains. The cap steps them to 512²
+        // and takes the tail, which is what the bake would have written anyway.
+        const std::string srcTexDir = "Data Files\\textures\\";
+        uint32_t fromSource = 0;
+        // Read a statics texture, library first, source second. Returns which tree answered.
+        auto readStaticsTex = [&](const std::string& nm, std::vector<uint8_t>& out) -> bool {
+            if (dlReadWholeFile((texDir + nm).c_str(), out)) { return true; }
+            return dlReadWholeFile((srcTexDir + nm).c_str(), out);
+        };
 
         struct UTexPlan { TinyImageFormat fmt; uint32_t cw, ch, capStep, availMips, bucket, layer; };
         std::unordered_map<std::string, UTexPlan> plan;        // unique name -> plan (zero = white/bucket 0)
@@ -31692,17 +32210,41 @@ namespace ForgeRender {
                                                      g_live.pStaticsWhiteArray, 2 });   // [0] = white
         std::vector<std::vector<std::string>> bucketMembers; bucketMembers.emplace_back();
 
+        // Which texture NAMES belong to grass — they get g_grassTexCap instead of kStaticsTexCap
+        // (see that constant for why grass is the exception). Resolved from the def type rather than
+        // from the path, so a pack that does not file its art under `grass\` still gets it right; a
+        // name shared with a non-grass static simply lands on the larger cap, which costs memory and
+        // nothing else. g_staticsDefs and g_staticsSubsetTex are both filled by loadDistantStatics,
+        // which is this function's precondition.
+        std::unordered_set<std::string> grassTex;
+        for (const StaticsDefCPU& d : g_staticsDefs) {
+            if (d.type != (uint8_t)DL_STATIC_GRASS) { continue; }
+            for (uint32_t s = d.firstSubset; s < d.firstSubset + d.numSubsets; ++s) {
+                if (s < g_staticsSubsetTex.size() && !g_staticsSubsetTex[s].empty()) {
+                    grassTex.insert(g_staticsSubsetTex[s]);
+                }
+            }
+        }
+
         // Pass 1: header scan -> bucket plan (dedup by name).
-        uint32_t missing = 0, overflow = 0;
+        uint32_t missing = 0, overflow = 0, grassKept = 0;
+        uint64_t grassBytes = 0;
         for (const std::string& nm : g_staticsSubsetTex) {
             if (nm.empty() || plan.find(nm) != plan.end()) { continue; }
             std::vector<uint8_t> hdr;
-            DdsInfo info = dlReadWholeFile((texDir + nm).c_str(), hdr)
-                         ? parseDds(hdr.data(), (uint32_t)hdr.size()) : DdsInfo{};
+            const bool inLib = dlReadWholeFile((texDir + nm).c_str(), hdr);
+            if (!inLib && dlReadWholeFile((srcTexDir + nm).c_str(), hdr)) { ++fromSource; }
+            DdsInfo info = hdr.empty() ? DdsInfo{} : parseDds(hdr.data(), (uint32_t)hdr.size());
             if (!info.ok) { plan[nm] = UTexPlan{}; ++missing; continue; }   // -> white (bucket 0)
+            const bool isGrass = (grassTex.find(nm) != grassTex.end());
+            const uint32_t cap = isGrass ? (uint32_t)std::max(1.0f, g_grassTexCap) : kStaticsTexCap;
             uint32_t k = 0, w = info.width, h = info.height;
-            while ((w > kStaticsTexCap || h > kStaticsTexCap) && (k + 1) < info.mipLevels) {
+            while ((w > cap || h > cap) && (k + 1) < info.mipLevels) {
                 w = (w > 1) ? w >> 1 : 1; h = (h > 1) ? h >> 1 : 1; ++k;    // clamp to leave >=1 mip
+            }
+            if (isGrass) {
+                ++grassKept;
+                grassBytes += (uint64_t)ddsTightMipBytes(info.fmt, w, h) * 4ull / 3ull;   // + the mip tail
             }
             UTexPlan up; up.fmt = info.fmt; up.cw = w; up.ch = h; up.capStep = k;
             up.availMips = info.mipLevels - k;
@@ -31778,7 +32320,7 @@ namespace ForgeRender {
             for (uint32_t layer = 0; layer < (uint32_t)bucketMembers[b].size(); ++layer) {
                 const std::string& nm = bucketMembers[b][layer];
                 std::vector<uint8_t> dds;
-                if (!dlReadWholeFile((texDir + nm).c_str(), dds)) { continue; }
+                if (!readStaticsTex(nm, dds)) { continue; }   // library, then the source tree
                 DdsInfo info = parseDds(dds.data(), (uint32_t)dds.size());
                 if (!info.ok) { continue; }
                 const UTexPlan& up = plan[nm];
@@ -31827,8 +32369,37 @@ namespace ForgeRender {
                 mw = (mw > 1) ? mw >> 1 : 1; mh = (mh > 1) ? mh >> 1 : 1;
             }
         }
-        std::printf("[forge][dl] statics textures: %zu buckets, %u uploaded, %u missing, %u overflow, ~%lluMB resident\n",
-                    g_staticsBuckets.size() - 1, uploaded, missing, overflow, (unsigned long long)(vram >> 20));
+        std::printf("[forge][dl] statics textures: %zu buckets, %u uploaded, %u missing, %u overflow,"
+                    " %u from source, ~%lluMB resident\n",
+                    g_staticsBuckets.size() - 1, uploaded, missing, overflow, fromSource,
+                    (unsigned long long)(vram >> 20));
+        // ...and to the LOG, not just stdout. `missing` is the count of subsets now drawing as the
+        // reserved WHITE array, and it was reported ONLY through std::printf — which nothing
+        // captures, so mgeHost64.log had no trace of it. That is how G1's entire grass field came up
+        // untextured with no diagnostic anywhere: 27 textures the bake never wrote, silently white.
+        // A count is not enough either, so NAME the first few — "27 missing" does not tell you it is
+        // all of one folder, and that is the fact that identifies the cause.
+        LOG::logline(">> [statics-tex] %zu buckets, %u uploaded, %u MISSING (-> white), %u overflow,"
+                     " %u read from the SOURCE tree, ~%llu MB",
+                     g_staticsBuckets.size() - 1, uploaded, missing, overflow, fromSource,
+                     (unsigned long long)(vram >> 20));
+        // Grass's own line, because grass is the one type on a different cap and the whole point of
+        // that cap is a VRAM-vs-sharpness trade somebody has to make from a number.
+        LOG::logline(">> [statics-tex] grass: %u textures at cap %u, ~%llu MB of the above",
+                     grassKept, (uint32_t)g_grassTexCap, (unsigned long long)(grassBytes >> 20));
+        if (missing) {
+            std::string names; uint32_t shown = 0;
+            for (const auto& kv : plan) {
+                if (kv.second.bucket != 0u || kv.first.empty()) { continue; }
+                if (shown++) { names += ", "; }
+                names += kv.first;
+                if (shown >= 8) { names += ", ..."; break; }
+            }
+            LOG::logline("!! [statics-tex] MISSING textures draw as WHITE. Not in the LOD library"
+                         " (Data Files\\distantland\\statics\\textures\\) and not in the source tree"
+                         " (Data Files\\textures\\): %s", names.c_str());
+        }
+        LOG::flush();
         g_staticsTexReady = true;
         return true;
     }
@@ -32292,7 +32863,7 @@ namespace ForgeRender {
         float staticsT[3] = { 0, 0, 0 };
         g_staticsLiveOk = buildStaticsPath(R) && loadDistantStatics(R) && buildStaticsTextureArrays(R)
                         && dlCreateLiveRings(R);
-        if (g_staticsLiveOk) { buildStaticsGrid(); pickStaticsTarget(staticsT); }
+        if (g_staticsLiveOk) { buildStaticsGrid(); loadGrassField(); pickStaticsTarget(staticsT); }
         else { std::printf("[forge][view] statics unavailable — land only\n"); }
         g_dlLiveInit = true;
         // Inspection mode: the viewer has no near scene, so the two near-handover mechanisms only carve
@@ -32724,6 +33295,53 @@ namespace ForgeRender {
                      " suppressed=%u clipped=%u residentDrawn=%u",
                      (int)dlCellOwnActive(), g_nearCellX, g_nearCellY, g_nearCellMask,
                      g_nearCellReach, g_dlOwnSuppressed, g_dlOwnClipped, g_dlOwnResidentDrawn);
+        // G1 grass. `dispatched` is the density prefix (a knob), `drawn` the frustum+range survivors
+        // (the scene), and `ring` how close the second is to the ceiling past which cullscatter
+        // starts dropping rows in silence. wind is the client's smoothed vector — it being (0,0) in
+        // an exterior is a WIRE fault, and it looks identical on screen to a broken sway term.
+        if (g_live.grassCullReady) {
+            LOG::logline(">> [forge-hb][grass] %s dispatched=%u/%u drawn=%u (%.0f%% of %u ring)"
+                         " subsets=%u range=%.0f fade=%.2f density=%.2f wind=(%.2f,%.2f)"
+                         " sway=%.2f shadows=%d%s",
+                         g_drawGrass ? "ON" : "OFF", g_grassLastDispatch, g_grassInstCount,
+                         g_grassLastSurvivors,
+                         100.0 * (double)g_grassLastSurvivors / (double)kGrassMaxInst, kGrassMaxInst,
+                         g_grassSubsetCount, g_grassRange, g_grassFadeFrac, g_grassDensity,
+                         g_grassWind[0], g_grassWind[1], g_grassWindGain, (int)g_grassShadows,
+                         g_grassNearCut ? " [NEAR-CUT ON: hole at the camera is EXPECTED]" : "");
+            // ...and the CPU's own answer to the same question, so a disagreement names itself.
+            // cull.comp's range + frustum test, re-run over a 1-in-64 stride of the same array with
+            // the same published params, and the count of which gate each rejection died at. A
+            // strided sample is ~13k tests (microseconds) and is unbiased here BECAUSE the array is
+            // hash-shuffled — any stride of it is a uniform sample of the whole field, which is the
+            // same property the density knob rides on.
+            if (g_grassCullDbgOk && g_grassLastDispatch) {
+                const float* cp = g_grassCullDbg;
+                uint32_t nTest = 0, nPass = 0, nRange = 0, nNear = 0, nFrus = 0, nVis = 0;
+                for (uint32_t i = 0; i < g_grassLastDispatch; i += 64) {
+                    const GpuCullInstance& gi = g_grassInst[i];
+                    ++nTest;
+                    if (!dlVisEnabled(gi.visIndex)) { ++nVis; continue; }
+                    const float dx = gi.posX - cp[24], dy = gi.posY - cp[25], cz = gi.posZ - cp[26];
+                    const float d2 = dx*dx + dy*dy, dN2 = d2 + cz*cz;
+                    if (dN2 < cp[31]) { ++nNear; continue; }
+                    if (d2 > cp[28])  { ++nRange; continue; }
+                    bool in = true;
+                    for (int p = 0; p < 6 && in; ++p) {
+                        if (cp[p*4+0]*dx + cp[p*4+1]*dy + cp[p*4+2]*cz + cp[p*4+3] < -gi.effR) { in = false; }
+                    }
+                    if (!in) { ++nFrus; continue; }
+                    ++nPass;
+                }
+                LOG::logline(">> [forge-hb][grass] cpu-check: sample=%u pass=%u (~%u full)"
+                             " | rejected by range=%u nearcut=%u frustum=%u vis=%u"
+                             " | eye=(%.0f,%.0f,%.0f) range2=%.3g nearCut2=%.3g misc=(%.0f,%.0f,%.0f,%.2f)"
+                             " cellOwn.w=%.1f hiz=%.1f",
+                             nTest, nPass, nPass * 64u, nRange, nNear, nFrus, nVis,
+                             cp[24], cp[25], cp[26], cp[28], cp[31],
+                             cp[32], cp[33], cp[34], cp[35], cp[127], cp[55]);
+            }
+        }
     }
 
     // Build a uniform grid (cell = one MW cell) over the resident exterior placements: gridCell ->
@@ -32736,7 +33354,35 @@ namespace ForgeRender {
         // Precompute the canonical per-instance cull struct (same iteration as the grid). Mirrors the
         // exact tier/effR rule the old per-frame hot loop used (dlshare.h:184) so survivors are
         // byte-identical; only the per-frame distance + frustum tests + -eye stay in the loop.
-        g_cullInst.assign((size_t)g_ws0Count, GpuCullInstance{});
+        //
+        // G1: the ws0 placements are PARTITIONED here, not copied — grass into g_grassInst with its
+        // own subset numbering, everything else into g_cullInst. Grass used to sit in g_cullInst
+        // carrying rangeEndIdx = 0xFFFFFFFF, i.e. every lane loaded its 96 bytes and threw it away;
+        // on this install that is two thirds of 1,230,438 placements, so the split hands the main
+        // cull a 3x smaller array as a side effect of giving grass a real one.
+        g_cullInst.clear();  g_cullInst.reserve((size_t)g_ws0Count);
+        g_cullInstType.clear(); g_cullInstType.reserve((size_t)g_ws0Count);
+        g_grassInst.clear(); g_grassInst.reserve((size_t)g_ws0Count / 2);
+        // The grass SUBSET table, and the reason grass needs its own: a cmdExecuteIndirect over the
+        // shared table issues one command per subset in the whole library (~10,910) whether or not it
+        // is empty, and grass occupies 27 of them. Remap each grass def's subset range into this
+        // compact table; the remap is a full lookup rather than an offset because nothing in the bake
+        // format promises the grass defs are contiguous (they happen to be, 4642..4667, but a
+        // re-order in a future MGEgui would turn that assumption into silent garbage geometry).
+        g_grassSubsets.clear();
+        // A member, not a local: the density-field scatter needs the same def -> compact-subset
+        // remap every frame it rebuilds a window, long after this function has returned.
+        std::vector<uint32_t>& grassFirst = g_grassFirstSubset;
+        grassFirst.assign(g_staticsDefs.size(), 0xFFFFFFFFu);
+        for (size_t d = 0; d < g_staticsDefs.size(); ++d) {
+            const StaticsDefCPU& def = g_staticsDefs[d];
+            if (def.type != DL_STATIC_GRASS) { continue; }
+            grassFirst[d] = (uint32_t)g_grassSubsets.size();
+            for (uint32_t k = 0; k < def.numSubsets; ++k) {
+                const uint32_t sid = def.firstSubset + k;
+                if (sid < g_staticsSubsets.size()) { g_grassSubsets.push_back(g_staticsSubsets[sid]); }
+            }
+        }
         // Per-group instance tally, for the flip log ("group 6 -> HIDDEN (32 instances)"). Without a
         // count, "the town is gone" is unfalsifiable — it could equally be a cull bug.
         g_visGatedInstances = 0;
@@ -32751,7 +33397,9 @@ namespace ForgeRender {
         const uint8_t* rec = &g_usageData[g_ws0Off];
         for (uint32_t i = 0; i < g_ws0Count; ++i, rec += 34) {
             float pos[3]; std::memcpy(pos, rec + 6, 12);
-            GpuCullInstance& gi = g_cullInst[i];
+            GpuCullInstance gi = GpuCullInstance{};
+            bool isGrass = false;
+            uint8_t instType = (uint8_t)DL_STATIC_AUTO;
             {
                 uint32_t staticRef; std::memcpy(&staticRef, rec, 4);
                 // usage.data offset 4: the dynamic-vis group this placement is gated on (0 = always
@@ -32796,9 +33444,18 @@ namespace ForgeRender {
                     gi.posY = mc[0]*w[1] + mc[1]*w[5] + mc[2]*w[9]  + w[13];
                     gi.posZ = mc[0]*w[2] + mc[1]*w[6] + mc[2]*w[10] + w[14];
                     gi.firstSubset = def.firstSubset; gi.numSubsets = def.numSubsets;
+                    instType = def.type;
                     float tierR = (def.type == DL_STATIC_BUILDING) ? gi.effR * 2.0f : gi.effR;
                     switch (def.type) {
-                        case DL_STATIC_GRASS:    gi.rangeEndIdx = 0xFFFFFFFFu; break;  // skip
+                        // G1: grass leaves this array entirely (see the partition note above) and is
+                        // re-numbered into the compact grass subset table. Tier 0 because the grass
+                        // lane has exactly one range — ranges.x — and no LOD ladder to climb.
+                        case DL_STATIC_GRASS:
+                            isGrass = true;
+                            gi.rangeEndIdx = 0;
+                            gi.firstSubset = grassFirst[staticRef];
+                            if (gi.firstSubset == 0xFFFFFFFFu) { isGrass = false; gi.rangeEndIdx = 0xFFFFFFFFu; }
+                            break;
                         case DL_STATIC_NEAR:     gi.rangeEndIdx = 0; break;
                         case DL_STATIC_FAR:      gi.rangeEndIdx = 1; break;
                         case DL_STATIC_VERY_FAR: gi.rangeEndIdx = 2; break;
@@ -32806,6 +33463,14 @@ namespace ForgeRender {
                     }
                 }
             }
+            // GRASS leaves here. It joins no grid: the grid exists to make the CPU cell-walk cheap,
+            // and grass has no CPU cull — the lane is GPU-only, a flat dispatch over the array, with
+            // no reflection path and no A/B fallback to keep a walk alive for.
+            if (isGrass) { g_grassInst.push_back(gi); continue; }
+            const uint32_t ci_inst = (uint32_t)g_cullInst.size();
+            g_cullInst.push_back(gi);
+            g_cullInstType.push_back(instType);
+
             // Grid cell from the ORIGIN, not the bound centre: kLiveGridCell IS one MW cell at the same
             // origin, and MW files a reference under the cell its POSITION falls in — so origin-keying
             // is what makes c.gx/c.gy answer "is MW's copy of this loaded?". The cull shaders derive the
@@ -32827,13 +33492,50 @@ namespace ForgeRender {
                 ci = it->second;
             }
             LiveGridCell& c = g_liveGrid[ci];
-            c.inst.push_back(i);
+            c.inst.push_back(ci_inst);
             // AABB over the SPHERE CENTRES — the points the per-instance test actually measures, so the
             // coarse cell reject stays a true bound of them (it is padded by a whole cell besides).
             c.minx = std::min(c.minx, gi.posX); c.maxx = std::max(c.maxx, gi.posX);
             c.miny = std::min(c.miny, gi.posY); c.maxy = std::max(c.maxy, gi.posY);
             c.minz = std::min(c.minz, gi.posZ); c.maxz = std::max(c.maxz, gi.posZ);
         }
+
+        // ─── G1: SHUFFLE THE GRASS ARRAY, ONCE ───────────────────────────────────────────────────
+        // This is what makes the density knob a dispatch COUNT rather than a per-instance test in a
+        // shader the statics lanes share. After this permutation any PREFIX of g_grassInst is a
+        // spatially uniform random sample of the whole field, so `dispatch(count * density)` thins
+        // the meadow evenly instead of clipping it to the first cells parsed.
+        //
+        // ⚠ THE PERMUTATION MUST BE FIXED, not re-rolled per session or per density. A blade's place
+        // in the array IS its survival rank, so a stable order means raising the knob strictly ADDS
+        // blades (nothing swaps, nothing pops) and lowering it strictly removes them — and it means
+        // the same install always draws the same field, which is what makes a screenshot A/B honest.
+        // Hence an explicit LCG seeded by a constant rather than std::random_device or std::shuffle
+        // with a default-constructed engine, both of which are free to differ between runs or
+        // toolchains.
+        //
+        // Locality is not sacrificed for anything that matters: cull.comp loads the whole 96 B
+        // CullInstance before its first test, so the dispatch is a linear read of the prefix either
+        // way — coalesced, bandwidth-bound, and unaffected by whether neighbouring lanes happen to
+        // land in the same map cell.
+        {
+            uint32_t rng = 0x9E3779B9u;   // any fixed odd seed; the constant itself means nothing
+            for (size_t n = g_grassInst.size(); n > 1; --n) {
+                rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5;   // xorshift32
+                const size_t j = rng % n;
+                std::swap(g_grassInst[n - 1], g_grassInst[j]);
+            }
+        }
+        g_grassInstCount   = (uint32_t)g_grassInst.size();
+        g_grassSubsetCount = (uint32_t)g_grassSubsets.size();
+        std::printf("[forge][grass] %u placements over %u subsets (%.1f%% of ws0; %.1f MB resident)\n",
+                    g_grassInstCount, g_grassSubsetCount,
+                    g_ws0Count ? (100.0 * g_grassInstCount / g_ws0Count) : 0.0,
+                    (double)(g_grassInstCount * sizeof(GpuCullInstance)) / (1024.0 * 1024.0));
+        LOG::logline(">> [forge][grass] %u placements over %u subsets (%.1f%% of ws0), statics lane now %zu",
+                     g_grassInstCount, g_grassSubsetCount,
+                     g_ws0Count ? (100.0 * g_grassInstCount / g_ws0Count) : 0.0, g_cullInst.size());
+
         std::printf("[forge][dl] live grid: %zu cells over %u placements\n", g_liveGrid.size(), g_ws0Count);
         std::printf("[forge][dl] visgroups: %u groups, %u gated instances\n",
                     g_visGroupCount, g_visGatedInstances);
@@ -32860,6 +33562,661 @@ namespace ForgeRender {
             LOG::logline(">> [forge][dl] visgroups hidden now: %u/%u groups, %u/%u instances [%s]",
                          hiddenGroups, g_visGroupCount, hiddenInst, g_visGatedInstances, list.c_str());
         }
+    }
+
+    // ═══ G3: THE GRASS DENSITY FIELD ═════════════════════════════════════════════════════════════
+    //
+    // Grass placements no longer exist. Measured against the real LAND heightfield, an authored
+    // blade carries exactly one bit — "a blade here, of family F": z is a constant +16 sink,
+    // pitch/roll ARE the terrain normal (tilt - slope = +0.3 deg median), yaw is uniform, scale is
+    // uniform [0.9,1.3], and the median cell uses its whole mesh palette. So mgeBake64 reduces them
+    // to per-cell 32x32 tile counts (5.44M placements -> 6.96 MB) and the host scatters them back.
+    // tasks/dl-gen-ownership.md carries the measurements.
+    //
+    // Two things fall out for free that the authored data could only express by hand-painting around
+    // every object, which is most of what those 5.44M references WERE:
+    //   - slope rejection, from the same normal that orients the blade;
+    //   - statics rejection, from the bound spheres already resident for the cell.
+    //
+    // The scatter is CPU-side and feeds the EXISTING grass cull/draw unchanged — no shader moves, so
+    // G1's "grass off is bit-identical" DXIL proof still holds. It runs on the eye CELL changing, not
+    // per frame, and only over a window sized from the draw range: at the default 8192 that is 3x3
+    // cells (~12k blades), against 5.44M placements resident before.
+    // Same packing g_liveGridIndex uses, so a grass cell and a statics cell hash to the same key.
+    static inline uint64_t dlCellKey(int32_t ix, int32_t iy) {
+        return ((uint64_t)(uint32_t)ix << 32) | (uint32_t)iy;
+    }
+    struct GrassPaletteCPU {
+        std::vector<uint32_t> def;      // static-def ordinal per entry (0xFFFFFFFF = unresolved)
+        std::vector<uint32_t> cum;      // cumulative weights; cum.back() is the total
+    };
+    struct GrassPlaneCPU {
+        int16_t        cx, cy;
+        uint16_t       pal;
+        uint32_t       blades;          // sum of counts[], so a window's size is known BEFORE building it
+        const uint8_t* counts;          // -> g_grassFieldRaw, tileDim*tileDim bytes
+    };
+    std::vector<uint8_t>         g_grassFieldRaw;      // resident grass.bin (~7 MB)
+    std::vector<GrassPaletteCPU> g_grassFieldPal;
+    std::vector<GrassPlaneCPU>   g_grassFieldPlanes;
+    std::unordered_map<uint64_t, std::vector<uint32_t>> g_grassFieldByCell;
+    uint32_t g_grassFieldTileDim   = 0;
+    float    g_grassFieldSinkZ     = 16.0f;
+    float    g_grassFieldScaleMin  = 0.90f;
+    float    g_grassFieldScaleMax  = 1.30f;
+    float    g_grassFieldTiltJit   = 5.0f;
+    uint64_t g_grassFieldBlades    = 0;                // header total, for the log
+    uint32_t g_grassFieldUnresolved = 0;               // mesh names with no static_meshes ordinal
+    bool     g_grassFieldReady     = false;
+
+    // Window state. The rebuild trigger watches the knobs as well as the cell, or an A/B would only
+    // take effect after walking a whole cell — which is not an A/B anyone can use.
+    int32_t  g_grassWinCX = INT32_MIN, g_grassWinCY = INT32_MIN;
+    int32_t  g_grassWinRadius   = -1;
+    float    g_grassWinDensity  = -1.0f, g_grassWinSlopeDeg = -1.0f, g_grassWinAvoid = -1.0f;
+    // The knobs that reshape the field rather than just recolour it: soften/floor change which blades
+    // exist, and the variation knobs change the matrices. The tint SPREADS are not here — those live
+    // in the cbuffer and take effect the same frame, which is what makes them usable as an A/B.
+    float    g_grassWinSoften = -1.0f, g_grassWinMinScale = -1.0f;
+    float    g_grassWinScaleVar = -1.0f, g_grassWinPatch = -1.0f, g_grassWinGrain = -1.0f;
+    float    g_grassWinAOTile = -1.0f;   // the canopy-density normaliser is BAKED into world[3]
+    bool     g_grassWinValid    = false;
+    uint32_t g_grassWinCells = 0, g_grassWinRejSlope = 0, g_grassWinRejStatic = 0, g_grassWinRejNoLand = 0;
+    uint32_t g_grassWinShrunk = 0;    // blades kept but scaled down by a nearby static
+    // What the variation ACTUALLY produced, measured over the window that was just built. A knob
+    // that silently does nothing looks exactly like a knob whose effect is too subtle to see, and
+    // the two want opposite responses — so the field reports its own spread rather than being taken
+    // on trust. [[feedback_verify_the_right_artifact]]
+    float    g_grassWinScaleMin = 0.0f, g_grassWinScaleMax = 0.0f;
+    float    g_grassWinHueSpan = 0.0f, g_grassWinValSpan = 0.0f;
+    uint32_t g_grassWinOverflow = 0;
+    float    g_grassWinAutoThin = 1.0f;   // < 1 when the window had to be thinned to fit the ring
+    double   g_grassWinMs = 0.0;
+
+    // Deterministic per-blade hash. Every derived quantity — jitter, yaw, scale, mesh pick, the
+    // density test — comes from this keyed by (cell, plane, tile, slot), so a blade is identical
+    // every frame, every session and on both sides of a window rebuild. Any per-frame variation here
+    // would read as shimmer, and shimmer in a field this dense is the loudest possible bug.
+    static inline uint32_t grassHash(uint32_t a, uint32_t b, uint32_t c, uint32_t d) {
+        uint32_t h = 2166136261u;
+        h = (h ^ a) * 16777619u; h ^= h >> 15;
+        h = (h ^ b) * 16777619u; h ^= h >> 13;
+        h = (h ^ c) * 16777619u; h ^= h >> 16;
+        h = (h ^ d) * 16777619u; h ^= h >> 11;
+        return h;
+    }
+    static inline float grassHash01(uint32_t h) { return (float)(h >> 8) * (1.0f / 16777216.0f); }
+
+    // Two-octave value noise on ABSOLUTE world XY, in [0,1]. This is what makes the per-blade
+    // variation read as DRIFTS of drier and lusher growth rather than as static: white noise per
+    // blade integrates back to the flat mean over any patch bigger than a blade, so it changes the
+    // texture of the field and not its colour. The octaves are 1x and 3.1x — a non-integer ratio, so
+    // the two never line up and the sum has no visible grid.
+    //
+    // It runs on the CPU, off exact absolute coordinates, which is the reason it is here and not in
+    // grass.vert: a shader would have to reconstruct the absolute position from a camera-relative
+    // one, and reconstruction is only exact modulo a small number (see grassAbsMod2). A drift 1400
+    // units wide cannot be built out of a value known modulo 2.
+    static inline float grassValNoise(float x, float y) {
+        auto lattice = [](int32_t ix, int32_t iy) -> float {
+            return grassHash01(grassHash((uint32_t)ix, (uint32_t)iy, 0x27D4EB2Fu, 0x165667B1u));
+        };
+        auto octave = [&](float px, float py) -> float {
+            const float fx = std::floor(px), fy = std::floor(py);
+            const int32_t ix = (int32_t)fx, iy = (int32_t)fy;
+            const float tx = px - fx, ty = py - fy;
+            const float sx = tx * tx * (3.0f - 2.0f * tx);   // smoothstep: C1, so no lattice creases
+            const float sy = ty * ty * (3.0f - 2.0f * ty);
+            const float a = lattice(ix, iy),     b = lattice(ix + 1, iy);
+            const float c = lattice(ix, iy + 1), d = lattice(ix + 1, iy + 1);
+            const float ab = a + (b - a) * sx, cd = c + (d - c) * sx;
+            return ab + (cd - ab) * sy;
+        };
+        return octave(x, y) * 0.65f + octave(x * 3.1f + 11.7f, y * 3.1f - 4.3f) * 0.35f;
+    }
+
+    // Height at a LAND vertex, walking into the neighbouring cell when the index leaves this one.
+    // Clamping at the border instead would flatten the normal in the outermost 128 units of every
+    // cell — a visible seam of upright blades on sloping ground, 4012 times over.
+    static bool grassVertHeight(int32_t cx, int32_t cy, int32_t vx, int32_t vy, float& out) {
+        while (vx < 0)  { vx += Terrain::kCellQuads; --cx; }
+        while (vx > Terrain::kCellQuads) { vx -= Terrain::kCellQuads; ++cx; }
+        while (vy < 0)  { vy += Terrain::kCellQuads; --cy; }
+        while (vy > Terrain::kCellQuads) { vy -= Terrain::kCellQuads; ++cy; }
+        const Terrain::LandCell* c = Terrain::cellAt(cx, cy);
+        if (!c) { return false; }
+        out = (float)c->height[vy * Terrain::kCellVerts + vx] * Terrain::kHeightScale;
+        return true;
+    }
+
+    // Bilinear height + central-difference normal at an absolute world (x,y).
+    static bool grassGroundAt(float wx, float wy, float& z, float n[3]) {
+        const int32_t cx = (int32_t)std::floor(wx / Terrain::kCellSize);
+        const int32_t cy = (int32_t)std::floor(wy / Terrain::kCellSize);
+        const float fx = (wx - (float)cx * Terrain::kCellSize) / Terrain::kVertSpacing;
+        const float fy = (wy - (float)cy * Terrain::kCellSize) / Terrain::kVertSpacing;
+        int32_t x0 = (int32_t)fx, y0 = (int32_t)fy;
+        if (x0 < 0) { x0 = 0; } if (x0 > Terrain::kCellQuads - 1) { x0 = Terrain::kCellQuads - 1; }
+        if (y0 < 0) { y0 = 0; } if (y0 > Terrain::kCellQuads - 1) { y0 = Terrain::kCellQuads - 1; }
+        const float tx = fx - (float)x0, ty = fy - (float)y0;
+        float h00, h10, h01, h11;
+        if (!grassVertHeight(cx, cy, x0,     y0,     h00)) { return false; }
+        if (!grassVertHeight(cx, cy, x0 + 1, y0,     h10)) { return false; }
+        if (!grassVertHeight(cx, cy, x0,     y0 + 1, h01)) { return false; }
+        if (!grassVertHeight(cx, cy, x0 + 1, y0 + 1, h11)) { return false; }
+        z = (h00 * (1.0f - tx) + h10 * tx) * (1.0f - ty) + (h01 * (1.0f - tx) + h11 * tx) * ty;
+
+        const int32_t xi = (int32_t)(fx + 0.5f), yi = (int32_t)(fy + 0.5f);
+        float hxm, hxp, hym, hyp;
+        if (!grassVertHeight(cx, cy, xi - 1, yi, hxm) || !grassVertHeight(cx, cy, xi + 1, yi, hxp) ||
+            !grassVertHeight(cx, cy, xi, yi - 1, hym) || !grassVertHeight(cx, cy, xi, yi + 1, hyp)) {
+            n[0] = 0.0f; n[1] = 0.0f; n[2] = 1.0f;
+            return true;
+        }
+        const float dzdx = (hxp - hxm) / (2.0f * Terrain::kVertSpacing);
+        const float dzdy = (hyp - hym) / (2.0f * Terrain::kVertSpacing);
+        float len = std::sqrt(dzdx * dzdx + dzdy * dzdy + 1.0f);
+        n[0] = -dzdx / len; n[1] = -dzdy / len; n[2] = 1.0f / len;
+        return true;
+    }
+
+    // Read nifmap.txt (model path per line, line N = distant static id N) and grass.bin, and join
+    // them. The join is by NAME on purpose: static_meshes is indexed by ordinal and stores no names,
+    // and the ordinal is only whatever order the NIF pass happened to load in — baking grass.bin
+    // against ordinals would let a re-bake silently repaint the world with the wrong plants.
+    bool loadGrassField() {
+        g_grassFieldReady = false;
+        g_grassFieldPlanes.clear(); g_grassFieldPal.clear(); g_grassFieldByCell.clear();
+        g_grassFieldUnresolved = 0;
+
+        if (!dlReadWholeFile("Data Files\\distantland\\statics\\grass.bin", g_grassFieldRaw) ||
+            g_grassFieldRaw.size() < sizeof(grassfmt::Header)) {
+            std::printf("[forge][grass] grass.bin missing — no distant grass\n");
+            LOG::logline(">> [forge][grass] grass.bin missing — run mgeBake64 --grass");
+            return false;
+        }
+        grassfmt::Header h{};
+        std::memcpy(&h, g_grassFieldRaw.data(), sizeof(h));
+        if (std::memcmp(h.magic, grassfmt::kMagic, 4) != 0 || h.version != grassfmt::kVersion) {
+            std::printf("[forge][grass] grass.bin bad magic/version\n");
+            return false;
+        }
+        const uint32_t td = h.tileDim;
+        if (td == 0 || td > 64) { std::printf("[forge][grass] grass.bin tileDim %u\n", td); return false; }
+
+        std::vector<uint8_t> nifmap;
+        if (!dlReadWholeFile("Data Files\\distantland\\statics\\nifmap.txt", nifmap)) {
+            std::printf("[forge][grass] nifmap.txt missing — re-run the distant land wizard\n");
+            LOG::logline(">> [forge][grass] nifmap.txt missing — grass meshes cannot be resolved; "
+                         "re-run the MGE XE distant land wizard");
+            return false;
+        }
+        std::unordered_map<std::string, uint32_t> nameToDef;
+        {
+            uint32_t id = 0;
+            std::string line;
+            for (size_t i = 0; i <= nifmap.size(); ++i) {
+                const char c = (i < nifmap.size()) ? (char)nifmap[i] : '\n';
+                if (c == '\n' || c == '\r') {
+                    if (!line.empty()) { nameToDef[line] = id++; line.clear(); }
+                    continue;
+                }
+                line.push_back((c >= 'A' && c <= 'Z') ? (char)(c - 'A' + 'a') : c);
+            }
+        }
+
+        // mesh table -> def ordinals
+        std::vector<uint32_t> meshDef;
+        {
+            const uint8_t* p = g_grassFieldRaw.data() + h.meshTableOff;
+            const uint8_t* end = g_grassFieldRaw.data() + g_grassFieldRaw.size();
+            for (uint32_t i = 0; i < h.meshCount; ++i) {
+                if (p + 2 > end) { std::printf("[forge][grass] mesh table truncated\n"); return false; }
+                uint16_t len; std::memcpy(&len, p, 2); p += 2;
+                if (p + len > end) { std::printf("[forge][grass] mesh table truncated\n"); return false; }
+                std::string nm((const char*)p, len); p += len;
+                auto it = nameToDef.find(nm);
+                if (it == nameToDef.end()) { meshDef.push_back(0xFFFFFFFFu); ++g_grassFieldUnresolved; }
+                else { meshDef.push_back(it->second); }
+            }
+        }
+
+        // palettes -> def ordinals + cumulative weights, dropping unresolved entries
+        {
+            const uint8_t* p = g_grassFieldRaw.data() + h.paletteOff;
+            const uint8_t* end = g_grassFieldRaw.data() + g_grassFieldRaw.size();
+            g_grassFieldPal.resize(h.paletteCount);
+            for (uint32_t i = 0; i < h.paletteCount; ++i) {
+                if (p + 2 > end) { std::printf("[forge][grass] palette table truncated\n"); return false; }
+                uint16_t n; std::memcpy(&n, p, 2); p += 2;
+                if (p + (size_t)n * 3 > end) { std::printf("[forge][grass] palette truncated\n"); return false; }
+                const uint8_t* idx = p;         p += (size_t)n * 2;
+                const uint8_t* wts = p;         p += n;
+                GrassPaletteCPU& pal = g_grassFieldPal[i];
+                uint32_t acc = 0;
+                for (uint16_t k = 0; k < n; ++k) {
+                    uint16_t m; std::memcpy(&m, idx + (size_t)k * 2, 2);
+                    const uint32_t d = (m < meshDef.size()) ? meshDef[m] : 0xFFFFFFFFu;
+                    if (d == 0xFFFFFFFFu) { continue; }
+                    acc += wts[k];
+                    pal.def.push_back(d);
+                    pal.cum.push_back(acc);
+                }
+            }
+        }
+
+        // planes -> per-cell index
+        {
+            const uint32_t stride = grassfmt::planeStride(td);
+            const uint8_t* base = g_grassFieldRaw.data() + h.planeOff;
+            if ((uint64_t)h.planeOff + (uint64_t)stride * h.planeCount > g_grassFieldRaw.size()) {
+                std::printf("[forge][grass] plane array overruns the file\n"); return false;
+            }
+            g_grassFieldPlanes.reserve(h.planeCount);
+            for (uint32_t i = 0; i < h.planeCount; ++i) {
+                const uint8_t* p = base + (size_t)i * stride;
+                grassfmt::PlaneHeader ph{}; std::memcpy(&ph, p, sizeof(ph));
+                GrassPlaneCPU pl{};
+                pl.cx = ph.cx; pl.cy = ph.cy; pl.pal = ph.paletteId; pl.blades = ph.blades;
+                pl.counts = p + sizeof(grassfmt::PlaneHeader);
+                const uint32_t slot = (uint32_t)g_grassFieldPlanes.size();
+                g_grassFieldPlanes.push_back(pl);
+                g_grassFieldByCell[dlCellKey(ph.cx, ph.cy)].push_back(slot);
+            }
+        }
+
+        g_grassFieldTileDim  = td;
+        g_grassFieldSinkZ    = h.sinkZ;
+        g_grassFieldScaleMin = h.scaleMin;
+        g_grassFieldScaleMax = h.scaleMax;
+        g_grassFieldTiltJit  = h.tiltJitterDeg;
+        g_grassFieldBlades   = h.totalBlades;
+        g_grassFieldReady    = true;
+        g_grassWinValid      = false;
+
+        std::printf("[forge][grass] field: %u planes over %zu cells, %u palettes, %u meshes "
+                    "(%u unresolved), %llu blades authored, tile %u u\n",
+                    h.planeCount, g_grassFieldByCell.size(), h.paletteCount, h.meshCount,
+                    g_grassFieldUnresolved, (unsigned long long)h.totalBlades,
+                    (uint32_t)(grassfmt::kCellSize / td));
+        LOG::logline(">> [forge][grass] field %u planes / %zu cells / %u meshes (%u unresolved), "
+                     "%llu blades authored", h.planeCount, g_grassFieldByCell.size(), h.meshCount,
+                     g_grassFieldUnresolved, (unsigned long long)h.totalBlades);
+        if (g_grassFieldUnresolved) {
+            LOG::logline(">> [forge][grass] ⚠ %u grass meshes are in grass.bin but not in nifmap.txt "
+                         "— the bake and the field are out of step; re-run both",
+                         g_grassFieldUnresolved);
+        }
+        return true;
+    }
+
+    // Regenerate the resident blade window around cell (ecx,ecy). Pure function of the field, the
+    // heightfield, the resident statics and the knobs — no frame state, no randomness.
+    void rebuildGrassWindow(int32_t ecx, int32_t ecy, int32_t radius) {
+        const double t0 = hostNowMs();
+        const uint32_t td   = g_grassFieldTileDim;
+        const float tileSz  = grassfmt::kCellSize / (float)td;
+        float density = (g_grassDensity < 0.0f) ? 0.0f : (g_grassDensity > 1.0f ? 1.0f : g_grassDensity);
+        const float cosMax  = std::cos(g_grassMaxSlopeDeg * 3.14159265f / 180.0f);
+        const float tiltJit = std::tan(g_grassFieldTiltJit * 3.14159265f / 180.0f);
+
+        g_grassInst.clear();
+        g_grassWinCells = g_grassWinRejSlope = g_grassWinRejStatic = g_grassWinRejNoLand = 0;
+        g_grassWinOverflow = 0; g_grassWinShrunk = 0;
+        float sMin = 1e9f, sMax = -1e9f, hLo = 1e9f, hHi = -1e9f, vLo = 1e9f, vHi = -1e9f;
+        g_grassWinAutoThin = 1.0f;
+
+        // ⚠ Size the window BEFORE building it. Measured over this bake, the worst 3x3 window is
+        // 53,889 blades — 82% of the ring — and the worst 5x5 is 127,063, i.e. 194% of it. So a
+        // raised draw range WILL overflow, and clipping at the ring would empty whichever corner of
+        // the field happened to be generated last. Thinning instead degrades the whole window evenly,
+        // and because density is a per-blade hash the thinning is stable: the blades that survive at
+        // 0.6 are a superset of those that survive at 0.4, so walking into a dense region fades
+        // rather than reshuffles. The plane headers carry the counts, so this costs a lookup.
+        {
+            uint64_t authored = 0;
+            for (int32_t dy = -radius; dy <= radius; ++dy) {
+                for (int32_t dx = -radius; dx <= radius; ++dx) {
+                    auto pit = g_grassFieldByCell.find(dlCellKey(ecx + dx, ecy + dy));
+                    if (pit == g_grassFieldByCell.end()) { continue; }
+                    for (uint32_t s : pit->second) { authored += g_grassFieldPlanes[s].blades; }
+                }
+            }
+            const double want = (double)authored * (double)density;
+            const double cap  = (double)kGrassMaxInst * 0.95;
+            if (want > cap && want > 0.0) {
+                g_grassWinAutoThin = (float)(cap / want);
+                density *= g_grassWinAutoThin;
+            }
+        }
+
+        // Avoidance discs, bucketed per tile so a blade tests ~0-3 of them instead of every static in
+        // the cell. A town cell holds hundreds; the per-blade loop would otherwise be the whole cost.
+        std::vector<float>    discX, discY, discZ, discR2, discHZ;
+        std::vector<std::vector<uint32_t>> tileDiscs;
+
+        for (int32_t dy = -radius; dy <= radius; ++dy) {
+            for (int32_t dx = -radius; dx <= radius; ++dx) {
+                const int32_t cx = ecx + dx, cy = ecy + dy;
+                auto pit = g_grassFieldByCell.find(dlCellKey(cx, cy));
+                if (pit == g_grassFieldByCell.end()) { continue; }
+                ++g_grassWinCells;
+
+                // Gather the statics that could carve this cell — its own and its 8 neighbours, since
+                // a bound sphere centred just over the border still reaches in.
+                if (g_grassAvoidStatics) {
+                    discX.clear(); discY.clear(); discZ.clear(); discR2.clear(); discHZ.clear();
+                    for (int32_t ny = -1; ny <= 1; ++ny) {
+                        for (int32_t nx = -1; nx <= 1; ++nx) {
+                            auto git = g_liveGridIndex.find(dlCellKey(cx + nx, cy + ny));
+                            if (git == g_liveGridIndex.end()) { continue; }
+                            for (uint32_t ii : g_liveGrid[git->second].inst) {
+                                if (ii >= g_cullInst.size()) { continue; }
+                                // Trees are exempt. Their bound sphere is the whole canopy, hundreds
+                                // of units wide, and grass belongs UNDER a tree — carving it would
+                                // ring every trunk with bald ground.
+                                if (ii < g_cullInstType.size() &&
+                                    g_cullInstType[ii] == (uint8_t)DL_STATIC_TREE) { continue; }
+                                const GpuCullInstance& gi = g_cullInst[ii];
+                                const float r = gi.effR * g_grassAvoidScale;
+                                if (r < tileSz * 0.05f) { continue; }   // too small to carve anything
+                                discX.push_back(gi.posX); discY.push_back(gi.posY);
+                                discZ.push_back(gi.posZ); discR2.push_back(r * r);
+                                discHZ.push_back(gi.effR);
+                            }
+                        }
+                    }
+                    tileDiscs.assign((size_t)td * td, {});
+                    const float ox = (float)cx * grassfmt::kCellSize;
+                    const float oy = (float)cy * grassfmt::kCellSize;
+                    for (uint32_t d = 0; d < (uint32_t)discX.size(); ++d) {
+                        const float r = std::sqrt(discR2[d]);
+                        int32_t t0x = (int32_t)std::floor((discX[d] - r - ox) / tileSz);
+                        int32_t t1x = (int32_t)std::floor((discX[d] + r - ox) / tileSz);
+                        int32_t t0y = (int32_t)std::floor((discY[d] - r - oy) / tileSz);
+                        int32_t t1y = (int32_t)std::floor((discY[d] + r - oy) / tileSz);
+                        if (t1x < 0 || t1y < 0 || t0x >= (int32_t)td || t0y >= (int32_t)td) { continue; }
+                        if (t0x < 0) { t0x = 0; } if (t0y < 0) { t0y = 0; }
+                        if (t1x > (int32_t)td - 1) { t1x = (int32_t)td - 1; }
+                        if (t1y > (int32_t)td - 1) { t1y = (int32_t)td - 1; }
+                        for (int32_t ty = t0y; ty <= t1y; ++ty) {
+                            for (int32_t tx = t0x; tx <= t1x; ++tx) {
+                                tileDiscs[(size_t)ty * td + tx].push_back(d);
+                            }
+                        }
+                    }
+                }
+
+                for (uint32_t planeSlot : pit->second) {
+                    const GrassPlaneCPU& pl = g_grassFieldPlanes[planeSlot];
+                    if (pl.pal >= g_grassFieldPal.size()) { continue; }
+                    const GrassPaletteCPU& pal = g_grassFieldPal[pl.pal];
+                    if (pal.def.empty()) { continue; }
+                    const uint32_t total = pal.cum.back();
+
+                    for (uint32_t ti = 0; ti < td * td; ++ti) {
+                        const uint32_t n = pl.counts[ti];
+                        if (!n) { continue; }
+                        const uint32_t tx = ti % td, ty = ti / td;
+                        const float ox = (float)cx * grassfmt::kCellSize + (float)tx * tileSz;
+                        const float oy = (float)cy * grassfmt::kCellSize + (float)ty * tileSz;
+
+                        for (uint32_t k = 0; k < n; ++k) {
+                            const uint32_t h0 = grassHash((uint32_t)cx, (uint32_t)cy,
+                                                          (planeSlot << 12) ^ ti, k);
+                            // Density is a per-blade test keyed by the same hash, NOT a prefix of a
+                            // shuffled array: the generated order is tile-major, so a prefix would
+                            // thin the field from one corner. Keyed this way a blade always makes
+                            // the same decision, so raising the knob strictly adds and lowering it
+                            // strictly removes — nothing swaps and nothing pops.
+                            if (density < 1.0f && grassHash01(h0) >= density) { continue; }
+
+                            const uint32_t h1 = grassHash(h0, 0x51ED2701u, ti, k);
+                            const uint32_t h2 = grassHash(h0, 0xB5297A4Du, ti, k);
+                            const float wx = ox + grassHash01(h1) * tileSz;
+                            const float wy = oy + grassHash01(h2) * tileSz;
+
+                            float gz, gn[3];
+                            if (!grassGroundAt(wx, wy, gz, gn)) { ++g_grassWinRejNoLand; continue; }
+                            if (gn[2] < cosMax) { ++g_grassWinRejSlope; continue; }
+                            const float wz = gz + g_grassFieldSinkZ;
+
+                            // ── STATIC PROXIMITY: SHRINK, don't carve ────────────────────────────
+                            // The nearest disc (as a fraction of its own radius) sets how much this
+                            // blade is scaled down; only a blade that would end up below the floor is
+                            // dropped. See g_grassAvoidSoften for why deleting was the wrong shape.
+                            // The whole loop must find the MINIMUM now rather than break on the first
+                            // hit — a blade between a rock and a wall belongs to the closer one.
+                            float avoidShrink = 1.0f;
+                            if (g_grassAvoidStatics && !tileDiscs.empty()) {
+                                float nearT = 1.0f;
+                                for (uint32_t d : tileDiscs[ti]) {
+                                    const float ddx = wx - discX[d], ddy = wy - discY[d];
+                                    const float d2 = ddx * ddx + ddy * ddy;
+                                    if (d2 >= discR2[d]) { continue; }
+                                    // A bridge or a balcony overhead must not carve the ground under
+                                    // it, so the disc only bites near its own height.
+                                    if (std::fabs(wz - discZ[d]) > discHZ[d]) { continue; }
+                                    const float t = std::sqrt(d2 / discR2[d]);
+                                    if (t < nearT) { nearT = t; }
+                                }
+                                if (nearT < 1.0f) {
+                                    // Ragged, per-blade: ±30% on the falloff so the shrink boundary
+                                    // is not a machined circle and neighbours disagree about how far
+                                    // in they will grow. This is the "scaled down RANDOMLY" half —
+                                    // without it every blade at a given radius is the same size and
+                                    // the rock gets a visible contour ring instead of a verge.
+                                    const uint32_t h7 = grassHash(h0, 0xC2B2AE35u, ti, k);
+                                    float rt = nearT * (0.70f + 0.60f * grassHash01(h7));
+                                    if (rt > 1.0f) { rt = 1.0f; }
+                                    avoidShrink = 1.0f - g_grassAvoidSoften * (1.0f - rt);
+                                    if (avoidShrink < g_grassAvoidMinScale) {
+                                        ++g_grassWinRejStatic; continue;
+                                    }
+                                    if (avoidShrink < 0.995f) { ++g_grassWinShrunk; }
+                                }
+                            }
+
+                            if (g_grassInst.size() >= kGrassMaxInst) { ++g_grassWinOverflow; continue; }
+
+                            // mesh pick, weighted by the palette's measured mix
+                            const uint32_t h3 = grassHash(h0, 0x68E31DA4u, ti, k);
+                            const uint32_t pick = total ? (h3 % total) : 0u;
+                            size_t e = 0;
+                            while (e + 1 < pal.cum.size() && pal.cum[e] <= pick) { ++e; }
+                            const uint32_t dref = pal.def[e];
+                            if (dref >= g_staticsDefs.size()) { continue; }
+                            const StaticsDefCPU& def = g_staticsDefs[dref];
+                            const uint32_t first = (dref < g_grassFirstSubset.size())
+                                                 ? g_grassFirstSubset[dref] : 0xFFFFFFFFu;
+                            if (first == 0xFFFFFFFFu) { continue; }
+
+                            const uint32_t h4 = grassHash(h0, 0x2545F491u, ti, k);
+                            const uint32_t h5 = grassHash(h0, 0x9E3779B1u, ti, k);
+                            const uint32_t h6 = grassHash(h0, 0x85EBCA6Bu, ti, k);
+                            const float yaw   = grassHash01(h4) * 6.28318531f;
+
+                            // ── PER-BLADE VARIATION ──────────────────────────────────────────────
+                            // Three fields, each a spatial DRIFT with a per-blade grain mixed in at
+                            // g_grassPatchGrain. Three independent noises rather than one, so a
+                            // patch can be tall without also being pale — one field would lock the
+                            // three together and read as a single lighting artefact rather than as
+                            // varied growth. The drift lattice is on absolute world coordinates, so
+                            // it is continuous across cell borders and identical on every rebuild.
+                            const float pinv = (g_grassPatchScale > 1.0f) ? (1.0f / g_grassPatchScale) : 0.0f;
+                            const float px = wx * pinv, py = wy * pinv;
+                            const float grain = (g_grassPatchGrain < 0.0f) ? 0.0f
+                                              : (g_grassPatchGrain > 1.0f ? 1.0f : g_grassPatchGrain);
+                            auto mixField = [&](float drift, uint32_t salt) -> float {
+                                const float g = grassHash01(grassHash(h0, salt, ti, k));
+                                return drift * (1.0f - grain) + g * grain;
+                            };
+                            const float vScale = mixField(grassValNoise(px, py), 0x7FEB352Du);
+                            const float vHue   = mixField(grassValNoise(px + 37.2f, py - 18.9f), 0x846CA68Bu);
+                            const float vVal   = mixField(grassValNoise(px - 61.5f, py + 92.4f), 0xD2A98F1Bu);
+
+                            // The bake's own per-blade spread, then the patch gradient on top of it.
+                            // The bake's is uncorrelated (0.90..1.30 salt-and-pepper), which is why
+                            // it reads as one uniform height however wide the range: it is the DRIFT
+                            // that the eye picks up as variety.
+                            float scale = g_grassFieldScaleMin +
+                                (g_grassFieldScaleMax - g_grassFieldScaleMin) * grassHash01(h5);
+                            scale *= 1.0f + (vScale * 2.0f - 1.0f) * g_grassScaleVar;
+                            scale *= avoidShrink;
+                            if (scale < 1e-3f) { continue; }
+                            if (scale < sMin) { sMin = scale; }  if (scale > sMax) { sMax = scale; }
+                            if (vHue < hLo) { hLo = vHue; }      if (vHue > hHi) { hHi = vHue; }
+                            if (vVal < vLo) { vLo = vVal; }      if (vVal > vHi) { vHi = vVal; }
+
+                            // Up = the terrain normal plus a few degrees of jitter. The measurement
+                            // that justifies this is tilt - terrain_slope = +0.3 deg median with
+                            // p5..p95 of -4.8..+5.5: the authored blades ARE normal-aligned, and the
+                            // spread is jitter, not a second signal.
+                            float up[3] = {
+                                gn[0] + (grassHash01(h6) * 2.0f - 1.0f) * tiltJit,
+                                gn[1] + (grassHash01(grassHash(h6, 7u, ti, k)) * 2.0f - 1.0f) * tiltJit,
+                                gn[2]
+                            };
+                            float ul = std::sqrt(up[0]*up[0] + up[1]*up[1] + up[2]*up[2]);
+                            if (ul < 1e-6f) { up[0] = 0; up[1] = 0; up[2] = 1; ul = 1.0f; }
+                            up[0] /= ul; up[1] /= ul; up[2] /= ul;
+
+                            // An arbitrary tangent, then yaw about `up`.
+                            float t0v[3] = { 0.0f, 0.0f, 1.0f };
+                            if (std::fabs(up[2]) > 0.99f) { t0v[0] = 1.0f; t0v[2] = 0.0f; }
+                            float xa[3] = { t0v[1]*up[2] - t0v[2]*up[1],
+                                            t0v[2]*up[0] - t0v[0]*up[2],
+                                            t0v[0]*up[1] - t0v[1]*up[0] };
+                            float xl = std::sqrt(xa[0]*xa[0] + xa[1]*xa[1] + xa[2]*xa[2]);
+                            if (xl < 1e-6f) { xa[0] = 1.0f; xa[1] = 0.0f; xa[2] = 0.0f; xl = 1.0f; }
+                            xa[0] /= xl; xa[1] /= xl; xa[2] /= xl;
+                            float ya[3] = { up[1]*xa[2] - up[2]*xa[1],
+                                            up[2]*xa[0] - up[0]*xa[2],
+                                            up[0]*xa[1] - up[1]*xa[0] };
+                            const float cy_ = std::cos(yaw), sy_ = std::sin(yaw);
+
+                            GpuCullInstance gi = GpuCullInstance{};
+                            // Row-vector convention (p' = p*world): the rows ARE the basis vectors,
+                            // matching buildStaticsGrid's S*Rz*Ry*Rx*T product.
+                            gi.world[0]  = ( xa[0]*cy_ + ya[0]*sy_) * scale;
+                            gi.world[1]  = ( xa[1]*cy_ + ya[1]*sy_) * scale;
+                            gi.world[2]  = ( xa[2]*cy_ + ya[2]*sy_) * scale;
+                            gi.world[4]  = (-xa[0]*sy_ + ya[0]*cy_) * scale;
+                            gi.world[5]  = (-xa[1]*sy_ + ya[1]*cy_) * scale;
+                            gi.world[6]  = (-xa[2]*sy_ + ya[2]*cy_) * scale;
+                            gi.world[8]  = up[0] * scale;
+                            gi.world[9]  = up[1] * scale;
+                            gi.world[10] = up[2] * scale;
+                            gi.world[12] = wx; gi.world[13] = wy; gi.world[14] = wz;
+                            gi.world[15] = 1.0f;
+
+                            // ⚠ world[3] IS THE MATRIX'S COLUMN-3 ROW-0 ENTRY, STRUCTURALLY ZERO FOR
+                            // AN AFFINE TRANSFORM, AND IT IS BORROWED HERE. cullscatter copies the
+                            // four rows through verbatim, so this rides to grass.vert as W0.w for
+                            // free — but grass.vert's row combination is a float4 add, so the
+                            // payload lands in worldPos.w and MUST be overwritten with 1 before the
+                            // projection. That is done there, on the line after the combination.
+                            // Only the GRASS ring is written this way; buildStaticsGrid still ships a
+                            // clean zero for every other static, and no other shader reads this ring.
+                            // THREE 8-bit fields, h<<16 | v<<8 | d: 2^24-1 is the last integer float32
+                            // holds exactly, and every shader-side divisor is then a power of two, so
+                            // the unpack is bit-exact rather than merely close.
+                            //
+                            // The third field is this blade's CANOPY DENSITY — the authored blade
+                            // count of its own 256-unit source tile, normalised. It is what lets the
+                            // contact-AO term know how much company a blade has: the occluder at the
+                            // root of a sward IS the neighbours, and only the scatter has ever counted
+                            // them. It reads the AUTHORED count, not the thinned one, so the density
+                            // and auto-thin knobs change how many blades there are without also
+                            // changing how dark each one is at its base.
+                            const float dens = (g_grassAOFullTile > 0.5f)
+                                             ? std::min(1.0f, (float)n / g_grassAOFullTile) : 1.0f;
+                            auto q8 = [](float v) -> uint32_t {
+                                const int q = (int)(v * 255.0f + 0.5f);
+                                return (uint32_t)((q < 0) ? 0 : (q > 255 ? 255 : q));
+                            };
+                            gi.world[3] = (float)((q8(vHue) << 16) | (q8(vVal) << 8) | q8(dens));
+
+                            const float* w = gi.world;
+                            const float* mc = def.centre;
+                            gi.posX = mc[0]*w[0] + mc[1]*w[4] + mc[2]*w[8]  + w[12];
+                            gi.posY = mc[0]*w[1] + mc[1]*w[5] + mc[2]*w[9]  + w[13];
+                            gi.posZ = mc[0]*w[2] + mc[1]*w[6] + mc[2]*w[10] + w[14];
+                            gi.effR        = def.radius * scale;
+                            gi.rangeEndIdx = 0;                 // the grass lane has exactly one range
+                            gi.firstSubset = first;
+                            gi.numSubsets  = def.numSubsets;
+                            gi.visIndex    = 0;
+                            g_grassInst.push_back(gi);
+                        }
+                    }
+                }
+            }
+        }
+
+        g_grassInstCount = (uint32_t)g_grassInst.size();
+        g_grassWinScaleMin = (sMax >= sMin) ? sMin : 0.0f;
+        g_grassWinScaleMax = (sMax >= sMin) ? sMax : 0.0f;
+        g_grassWinHueSpan  = (hHi >= hLo) ? (hHi - hLo) : 0.0f;
+        g_grassWinValSpan  = (vHi >= vLo) ? (vHi - vLo) : 0.0f;
+        g_grassWinMs = hostNowMs() - t0;
+    }
+
+    // Called pre-beginCmd (where GPU uploads are legal). Almost always a no-op: it rebuilds only
+    // when the eye leaves its cell or a knob that shapes the field moves.
+    void updateGrassField(Renderer* R) {
+        if (!g_grassFieldReady || !g_drawGrass || !g_dlExterior) { return; }
+        if (!g_live.pGrassCullInst) { return; }
+        if (!g_live.pFrameCbv || !g_live.pFrameCbv->pCpuMappedAddress) { return; }
+
+        const float* mfd = (const float*)g_live.pFrameCbv->pCpuMappedAddress;
+        const int32_t ecx = (int32_t)std::floor(mfd[56] / grassfmt::kCellSize);
+        const int32_t ecy = (int32_t)std::floor(mfd[57] / grassfmt::kCellSize);
+        // Exactly the cells the draw range can reach and no more. ⚠ No slack ring: a blade `range`
+        // away is by definition within ceil(range/cellSize) cells of the eye's cell whatever corner
+        // the eye stands in, so a +1 buys nothing and costs (2r+3)²/(2r+1)² blades — at the default
+        // range that is 25 cells instead of 9, and the measured worst 5x5 window is 194% of the ring.
+        int32_t radius = (int32_t)std::ceil(std::max(0.0f, g_grassRange) / grassfmt::kCellSize);
+        if (radius < 1) { radius = 1; }
+        const float density  = (g_grassDensity < 0.0f) ? 0.0f : (g_grassDensity > 1.0f ? 1.0f : g_grassDensity);
+
+        if (g_grassWinValid && ecx == g_grassWinCX && ecy == g_grassWinCY &&
+            radius == g_grassWinRadius && density == g_grassWinDensity &&
+            g_grassMaxSlopeDeg == g_grassWinSlopeDeg &&
+            (g_grassAvoidStatics ? g_grassAvoidScale : -1.0f) == g_grassWinAvoid &&
+            g_grassAvoidSoften == g_grassWinSoften && g_grassAvoidMinScale == g_grassWinMinScale &&
+            g_grassScaleVar == g_grassWinScaleVar && g_grassPatchScale == g_grassWinPatch &&
+            g_grassPatchGrain == g_grassWinGrain && g_grassAOFullTile == g_grassWinAOTile) {
+            return;
+        }
+
+        rebuildGrassWindow(ecx, ecy, radius);
+
+        if (g_grassInstCount) {
+            const uint64_t bytes = (uint64_t)sizeof(GpuCullInstance) * g_grassInstCount;
+            BufferUpdateDesc u = {};
+            u.pBuffer = g_live.pGrassCullInst; u.mDstOffset = 0; u.mSize = bytes;
+            beginUpdateResource(&u);
+            std::memcpy(u.pMappedData, g_grassInst.data(), (size_t)bytes);
+            endUpdateResource(&u);
+            flushTextureUploads(R);
+        }
+
+        g_grassWinCX = ecx; g_grassWinCY = ecy; g_grassWinRadius = radius;
+        g_grassWinDensity = density; g_grassWinSlopeDeg = g_grassMaxSlopeDeg;
+        g_grassWinAvoid = g_grassAvoidStatics ? g_grassAvoidScale : -1.0f;
+        g_grassWinSoften = g_grassAvoidSoften; g_grassWinMinScale = g_grassAvoidMinScale;
+        g_grassWinScaleVar = g_grassScaleVar; g_grassWinPatch = g_grassPatchScale;
+        g_grassWinGrain = g_grassPatchGrain; g_grassWinAOTile = g_grassAOFullTile;
+        g_grassWinValid = true;
+
+        LOG::logline(">> [forge][grass] window (%d,%d) r=%d: %u blades over %u cells in %.2f ms "
+                     "(rejected %u slope, %u statics, %u no-land; %u shrunk; autothin %.2f%s)"
+                     " | scale %.2f..%.2f  hue span %.2f  val span %.2f",
+                     ecx, ecy, radius, g_grassInstCount, g_grassWinCells, g_grassWinMs,
+                     g_grassWinRejSlope, g_grassWinRejStatic, g_grassWinRejNoLand,
+                     g_grassWinShrunk, g_grassWinAutoThin, g_grassWinOverflow ? "; RING FULL" : "",
+                     g_grassWinScaleMin, g_grassWinScaleMax, g_grassWinHueSpan, g_grassWinValSpan);
     }
 
     // Create the persistent per-frame instance + indirect-arg rings (CPU_TO_GPU, mapped). Replaces
@@ -33006,7 +34363,8 @@ namespace ForgeRender {
     bool dlCreateCullResources(Renderer* R) {
         if (g_live.pCullPipeline) { return true; }
         if (g_cullInst.empty())   { return false; }
-        g_live.cullInstCount = (uint32_t)g_cullInst.size();   // == g_ws0Count
+        // == g_ws0Count minus the grass share, which buildStaticsGrid partitioned into g_grassInst.
+        g_live.cullInstCount = (uint32_t)g_cullInst.size();
 
         // (1) Resident instance SRV (GPU_ONLY structured buffer, uploaded once from g_cullInst).
         //     Structured SRV over an UPLOAD heap is illegal in D3D12 (silent device-remove) → GPU_ONLY.
@@ -33400,6 +34758,216 @@ namespace ForgeRender {
             }
         }
 
+        // ─── G1 GRASS: the fourth (and fifth) instantiation of the same three shaders ─────────────
+        // Unlike the sun and sky-height clones above, this one brings its OWN gCullInst and
+        // gStaticsSubsets as well as its own outputs — that is the whole point of the lane (see the
+        // g_live declarations). Everything else is shared verbatim: the three pipelines, the
+        // gCullCount zero-staging, the Hi-Z pyramid binding.
+        // Non-fatal throughout: on any failure grassCullReady stays false and the grass draw is
+        // simply skipped, which is exactly today's picture.
+        // G3: the gate is the SUBSET table, not the instance array. Instances are generated from the
+        // density field on the eye's cell changing, so the array is empty here and stays empty until
+        // the first window build — gating on it would mean never creating the buffers at all.
+        if (!g_grassSubsets.empty()) {
+            const uint32_t gSub = (uint32_t)g_grassSubsets.size();
+
+            // Allocated at the ring's full capacity and REWRITTEN per window, rather than sized to a
+            // resident placement list. 6.3 MB, against 942 MB for lush3's placements at 96 B each.
+            BufferLoadDesc gib = {};
+            gib.mDesc.mDescriptors  = DESCRIPTOR_TYPE_BUFFER;
+            gib.mDesc.mMemoryUsage  = RESOURCE_MEMORY_USAGE_GPU_ONLY;
+            gib.mDesc.mStructStride = sizeof(GpuCullInstance);
+            gib.mDesc.mElementCount = kGrassMaxInst;
+            gib.mDesc.mSize         = (uint64_t)sizeof(GpuCullInstance) * kGrassMaxInst;
+            gib.mDesc.mStartState   = RESOURCE_STATE_SHADER_RESOURCE;
+            gib.mDesc.pName         = "grassCullInst";
+            gib.pData               = nullptr;
+            gib.ppBuffer            = &g_live.pGrassCullInst;
+            addResource(&gib, nullptr);
+
+            BufferLoadDesc gsb = {};
+            gsb.mDesc.mDescriptors  = DESCRIPTOR_TYPE_BUFFER;
+            gsb.mDesc.mMemoryUsage  = RESOURCE_MEMORY_USAGE_GPU_ONLY;
+            gsb.mDesc.mStructStride = sizeof(StaticsSubsetGPU);
+            gsb.mDesc.mElementCount = gSub;
+            gsb.mDesc.mSize         = (uint64_t)sizeof(StaticsSubsetGPU) * gSub;
+            gsb.mDesc.mStartState   = RESOURCE_STATE_SHADER_RESOURCE;
+            gsb.mDesc.pName         = "grassSubsetBuf";
+            gsb.pData               = g_grassSubsets.data();
+            gsb.ppBuffer            = &g_live.pGrassSubsetBuf;
+            addResource(&gsb, nullptr);
+
+            // Per-subset uint UAVs, sized to the GRASS table (27 entries, not 10,910).
+            auto addGrassSubsetUav = [&](Buffer** out, const char* name) {
+                BufferLoadDesc bd = {};
+                bd.mDesc.mDescriptors  = DESCRIPTOR_TYPE_RW_BUFFER;
+                bd.mDesc.mMemoryUsage  = RESOURCE_MEMORY_USAGE_GPU_ONLY;
+                bd.mDesc.mStructStride = sizeof(uint32_t);
+                bd.mDesc.mElementCount = gSub;
+                bd.mDesc.mSize         = (uint64_t)sizeof(uint32_t) * gSub;
+                bd.mDesc.mStartState   = RESOURCE_STATE_UNORDERED_ACCESS;
+                bd.mDesc.pName         = name;
+                bd.ppBuffer            = out;
+                addResource(&bd, nullptr);
+            };
+            auto addGrassArgs = [&](Buffer** out, const char* name) {
+                BufferLoadDesc bd = {};
+                bd.mDesc.mDescriptors  = (DescriptorType)(DESCRIPTOR_TYPE_RW_BUFFER | DESCRIPTOR_TYPE_INDIRECT_BUFFER);
+                bd.mDesc.mMemoryUsage  = RESOURCE_MEMORY_USAGE_GPU_ONLY;
+                bd.mDesc.mStructStride = sizeof(uint32_t);
+                bd.mDesc.mElementCount = gSub * 5u;
+                bd.mDesc.mSize         = (uint64_t)sizeof(uint32_t) * gSub * 5u;
+                bd.mDesc.mStartState   = RESOURCE_STATE_UNORDERED_ACCESS;
+                bd.mDesc.pName         = name;
+                bd.ppBuffer            = out;
+                addResource(&bd, nullptr);
+            };
+            auto addGrassInstOut = [&](Buffer** out, const char* name) {
+                BufferLoadDesc bd = {};
+                bd.mDesc.mDescriptors  = (DescriptorType)(DESCRIPTOR_TYPE_RW_BUFFER | DESCRIPTOR_TYPE_VERTEX_BUFFER);
+                bd.mDesc.mMemoryUsage  = RESOURCE_MEMORY_USAGE_GPU_ONLY;
+                bd.mDesc.mStructStride = sizeof(uint32_t);
+                bd.mDesc.mElementCount = kGrassMaxInst * 20u;
+                bd.mDesc.mSize         = (uint64_t)sizeof(uint32_t) * kGrassMaxInst * 20u;
+                bd.mDesc.mStartState   = RESOURCE_STATE_UNORDERED_ACCESS;
+                bd.mDesc.pName         = name;
+                bd.ppBuffer            = out;
+                addResource(&bd, nullptr);
+            };
+            auto addGrassParamsCbv = [&](Buffer** out, const char* name) {
+                BufferLoadDesc bd = {};
+                bd.mDesc.mDescriptors = DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+                bd.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_CPU_TO_GPU;
+                bd.mDesc.mFlags       = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
+                bd.mDesc.mSize        = 512;                  // matches the camera CullParams
+                bd.mDesc.pName        = name;
+                bd.ppBuffer           = out;
+                addResource(&bd, nullptr);
+            };
+            auto addGrassCount = [&](Buffer** out, const char* name) {
+                BufferLoadDesc bd = {};
+                bd.mDesc.mDescriptors  = DESCRIPTOR_TYPE_RW_BUFFER;
+                bd.mDesc.mMemoryUsage  = RESOURCE_MEMORY_USAGE_GPU_ONLY;
+                bd.mDesc.mStructStride = sizeof(uint32_t);
+                bd.mDesc.mElementCount = 4;
+                bd.mDesc.mSize         = (uint64_t)sizeof(uint32_t) * 4;
+                bd.mDesc.mStartState   = RESOURCE_STATE_UNORDERED_ACCESS;
+                bd.mDesc.pName         = name;
+                bd.ppBuffer            = out;
+                addResource(&bd, nullptr);
+            };
+
+            addGrassParamsCbv(&g_live.pGrassCullParamsCbv, "grassCullParamsCbv");
+            addGrassCount(&g_live.pGrassCullCount, "grassCullCount");
+            addGrassSubsetUav(&g_live.pGrassSubsetCount,  "grassSubsetCount");
+            addGrassSubsetUav(&g_live.pGrassSubsetOffset, "grassSubsetOffset");
+            addGrassSubsetUav(&g_live.pGrassSubsetCursor, "grassSubsetCursor");
+            addGrassArgs(&g_live.pGrassArgs, "grassCullArgs");
+            addGrassInstOut(&g_live.pGrassInstOut, "grassCullInstOut");
+
+            // The grass table is 27 entries, so it cannot borrow pSubsetCountZero (sized to 10,910
+            // — the CopyBufferRegion would be fine but reading a shared reset source at the wrong
+            // size is exactly the kind of thing that works until somebody shrinks the other one).
+            BufferLoadDesc gzb = {};
+            gzb.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_CPU_TO_GPU;
+            gzb.mDesc.mFlags       = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
+            gzb.mDesc.mSize        = (uint64_t)sizeof(uint32_t) * gSub;
+            gzb.mDesc.pName        = "grassSubsetCountZero";
+            gzb.ppBuffer           = &g_live.pGrassSubsetCountZero;
+            addResource(&gzb, nullptr);
+
+            // Survivor count back to the CPU. This is the RING-OVERFLOW TRIPWIRE, and it is the
+            // reason grass gets a readback where the sun cull does not: cullscatter drops rows past
+            // kMaxInst with a bare `continue`, so at the ceiling grass simply thins out with no
+            // other symptom — indistinguishable from the density knob, from a cull bug, or from
+            // "that hillside has less grass on it".
+            BufferLoadDesc grb = {};
+            grb.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_GPU_TO_CPU;
+            grb.mDesc.mFlags       = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
+            grb.mDesc.mSize        = 16;
+            grb.mDesc.mStartState  = RESOURCE_STATE_COPY_DEST;
+            grb.mDesc.pName        = "grassCullReadback";
+            grb.ppBuffer           = &g_live.pGrassCullReadback;
+            addResource(&grb, nullptr);
+
+            // G1e sun caster: the same clone again, sharing gCullInst/gStaticsSubsets with the
+            // camera grass lane and differing only in params + outputs.
+            addGrassParamsCbv(&g_live.pGrassSunCullParamsCbv, "grassSunCullParamsCbv");
+            addGrassCount(&g_live.pGrassSunCullCount, "grassSunCullCount");
+            addGrassSubsetUav(&g_live.pGrassSunSubsetCount,  "grassSunSubsetCount");
+            addGrassSubsetUav(&g_live.pGrassSunSubsetOffset, "grassSunSubsetOffset");
+            addGrassSubsetUav(&g_live.pGrassSunSubsetCursor, "grassSunSubsetCursor");
+            addGrassArgs(&g_live.pGrassSunArgs, "grassSunCullArgs");
+            addGrassInstOut(&g_live.pGrassSunInstOut, "grassSunCullInstOut");
+
+            waitForAllResourceLoads();
+            if (g_live.pGrassSubsetCountZero && g_live.pGrassSubsetCountZero->pCpuMappedAddress) {
+                std::memset(g_live.pGrassSubsetCountZero->pCpuMappedAddress, 0,
+                            (size_t)sizeof(uint32_t) * gSub);
+            }
+
+            // Bind one CullSrtData PerBatch set per grass lane. `inst`/`subsets` are the GRASS
+            // buffers here, which is the only structural difference from the sun/sky clones.
+            auto bindGrassSet = [&](DescriptorSet** set, Buffer** params, Buffer** count,
+                                    Buffer** sCount, Buffer** sOff, Buffer** sCur,
+                                    Buffer** args, Buffer** instOut) -> bool {
+                DescriptorSetDesc dsd = SRT_SET_DESC(CullSrtData, PerBatch, 1, 0);
+                addDescriptorSet(R, &dsd, set);
+                if (!*set) { return false; }
+                DescriptorData d[10] = {};
+                uint32_t n = 0;
+                d[n].mIndex = SRT_RES_IDX(CullSrtData, PerBatch, gCullParams);
+                d[n].ppBuffers = params; ++n;
+                d[n].mIndex = SRT_RES_IDX(CullSrtData, PerBatch, gCullInst);
+                d[n].mCount = 1; d[n].ppBuffers = &g_live.pGrassCullInst; ++n;
+                d[n].mIndex = SRT_RES_IDX(CullSrtData, PerBatch, gCullCount);
+                d[n].mCount = 1; d[n].ppBuffers = count; ++n;
+                d[n].mIndex = SRT_RES_IDX(CullSrtData, PerBatch, gStaticsSubsets);
+                d[n].mCount = 1; d[n].ppBuffers = &g_live.pGrassSubsetBuf; ++n;
+                d[n].mIndex = SRT_RES_IDX(CullSrtData, PerBatch, gSubsetCount);
+                d[n].mCount = 1; d[n].ppBuffers = sCount; ++n;
+                d[n].mIndex = SRT_RES_IDX(CullSrtData, PerBatch, gSubsetOffset);
+                d[n].mCount = 1; d[n].ppBuffers = sOff; ++n;
+                d[n].mIndex = SRT_RES_IDX(CullSrtData, PerBatch, gSubsetCursor);
+                d[n].mCount = 1; d[n].ppBuffers = sCur; ++n;
+                d[n].mIndex = SRT_RES_IDX(CullSrtData, PerBatch, gArgs);
+                d[n].mCount = 1; d[n].ppBuffers = args; ++n;
+                d[n].mIndex = SRT_RES_IDX(CullSrtData, PerBatch, gInstOut);
+                d[n].mCount = 1; d[n].ppBuffers = instOut; ++n;
+                d[n].mIndex = SRT_RES_IDX(CullSrtData, PerBatch, gCullHiz);
+                d[n].mCount = 1;
+                d[n].ppTextures = g_live.pHiz ? &g_live.pHiz : &g_live.pLinearDepth; ++n;
+                updateDescriptorSet(R, 0, *set, n, d);
+                return true;
+            };
+
+            if (g_live.pGrassCullInst && g_live.pGrassSubsetBuf && g_live.pGrassCullParamsCbv
+                && g_live.pGrassCullCount && g_live.pGrassSubsetCount && g_live.pGrassSubsetOffset
+                && g_live.pGrassSubsetCursor && g_live.pGrassArgs && g_live.pGrassInstOut
+                && g_live.pGrassSubsetCountZero) {
+                g_live.grassCullReady = bindGrassSet(&g_live.pGrassCullSet,
+                    &g_live.pGrassCullParamsCbv, &g_live.pGrassCullCount,
+                    &g_live.pGrassSubsetCount, &g_live.pGrassSubsetOffset, &g_live.pGrassSubsetCursor,
+                    &g_live.pGrassArgs, &g_live.pGrassInstOut);
+            }
+            if (g_live.grassCullReady && g_live.pGrassSunCullParamsCbv && g_live.pGrassSunCullCount
+                && g_live.pGrassSunSubsetCount && g_live.pGrassSunSubsetOffset
+                && g_live.pGrassSunSubsetCursor && g_live.pGrassSunArgs && g_live.pGrassSunInstOut) {
+                g_live.grassSunCullReady = bindGrassSet(&g_live.pGrassSunCullSet,
+                    &g_live.pGrassSunCullParamsCbv, &g_live.pGrassSunCullCount,
+                    &g_live.pGrassSunSubsetCount, &g_live.pGrassSunSubsetOffset,
+                    &g_live.pGrassSunSubsetCursor, &g_live.pGrassSunArgs, &g_live.pGrassSunInstOut);
+            }
+            std::printf("[forge][cull] GRASS cull %s: %u instances over %u subsets"
+                        " (ring %u rows = %.1f MB, caster %s)\n",
+                        g_live.grassCullReady ? "ready (G1a)" : "alloc FAILED — grass will not draw",
+                        (uint32_t)g_grassInst.size(), gSub, kGrassMaxInst,
+                        (double)((uint64_t)kGrassMaxInst * kStaticsInstStride) / (1024.0 * 1024.0),
+                        g_live.grassSunCullReady ? "ready" : "unavailable");
+        } else {
+            std::printf("[forge][cull] GRASS: no grass placements in this bake — lane idle\n");
+        }
+
         std::printf("[forge][cull] Stage B ready: %u instances (struct=%zuB) gpuDraw=%d subsets=%u\n",
                     g_live.cullInstCount, sizeof(GpuCullInstance), (int)g_live.gpuStaticsReady, subsetCount);
         return true;
@@ -33492,6 +35060,11 @@ namespace ForgeRender {
                             && buildStaticsTextureArrays(R) && dlCreateLiveRings(R);
             if (g_staticsLiveOk) {
                 buildStaticsGrid();
+                // G3: the grass DENSITY FIELD, in place of the placements usage.data no longer
+                // carries. Must follow buildStaticsGrid — it joins on that function's def -> compact
+                // grass-subset remap. Non-fatal: without it g_grassFieldReady stays false and the
+                // grass lane simply draws nothing, exactly as an install with no grass bake does.
+                loadGrassField();
                 // Stage B (B2): upload g_cullInst + create the GPU cull pipeline (validation only;
                 // non-fatal — the CPU cull stays authoritative until B3's draw cutover).
                 dlCreateCullResources(R);
@@ -34105,6 +35678,43 @@ namespace ForgeRender {
                 }
             }
         }
+
+        // G1: grass, from its own cull lane, inside the same DL block and with the same RT + depth
+        // bound. AFTER the statics draw rather than before, on the ordinary early-Z argument: grass
+        // is a cutout that fails a lot of its fragments, so letting the opaque world lay down depth
+        // first kills the blades hidden behind a wall before their alpha is ever fetched.
+        drawGrass();
+
+        cmdEndDebugMarker(g_live.pCmd);
+    }
+
+    // G1: the grass colour draw. Its own pipeline (CULL_NONE — two-sided crossed quads) over its own
+    // indirect args and instance ring, which is ~27 commands rather than the statics lane's 10,910.
+    // Everything else is the statics binding set verbatim: the mega VB/IB and the bindless statics
+    // texture arrays, because grass IS a distant static as far as the bake is concerned.
+    void drawGrass() {
+        if (!g_drawGrass || !g_pGrassPipeline || !g_live.grassCullReady) { return; }
+        if (!g_live.grassArgsInDrawState || !g_grassSubsetCount) { return; }
+        // ...and that the cull actually RAN this frame. grassArgsInDrawState only says the buffer is
+        // in INDIRECT state, which it stays across a frame where the lane never dispatched (an
+        // interior, density 0) — and then these args still describe the last cell's grass.
+        if (!g_grassLastDispatch) { return; }
+        cmdBeginDebugMarker(g_live.pCmd, 0.35f, 0.75f, 0.3f, "GRASS");
+        cmdBindPipeline(g_live.pCmd, g_pGrassPipeline);
+        cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSet);
+        // Grass lights from the sun + sky ambient only (see grass.frag), so which gLights set is
+        // bound never reaches a fetch — but the root signature still wants the slot filled, and
+        // binding the distant set keeps this draw's state identical to the statics draw above it.
+        cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerLightsSetDist ? g_live.pPerLightsSetDist
+                                                                     : g_live.pPerLightsSet);
+        cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
+        cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerBatchSet);
+        Buffer*  gvbs[2]     = { g_pStaticsVB, g_live.pGrassInstOut };
+        uint32_t gstrides[2] = { 20, kStaticsInstStride };
+        cmdBindVertexBuffer(g_live.pCmd, 2, gvbs, gstrides, nullptr);
+        cmdBindIndexBuffer(g_live.pCmd, g_pStaticsIB, INDEX_TYPE_UINT16, 0);
+        cmdExecuteIndirect(g_live.pCmd, INDIRECT_DRAW_INDEX, g_grassSubsetCount,
+                           g_live.pGrassArgs, 0, nullptr, 0);
         cmdEndDebugMarker(g_live.pCmd);
     }
 
@@ -34193,6 +35803,218 @@ namespace ForgeRender {
         bufBarrier(g_live.pSunInstOut, RESOURCE_STATE_UNORDERED_ACCESS, RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);
         g_live.sunArgsInDrawState = true;
         cmdEndDebugMarker(g_live.pCmd);
+    }
+
+    // ─── G1a: THE GRASS CULL LANE ────────────────────────────────────────────────────────────────
+    //
+    // Fourth and fifth instantiations of cull.comp -> cullscan.comp -> cullscatter.comp, over the
+    // GRASS instance array and the GRASS subset table (see the g_live declarations for why grass
+    // cannot share the statics ones). Both lanes are built by one function because they differ in
+    // four numbers: the frustum, the range, the Hi-Z arm, and which output buffers they fill.
+    //
+    // ⚠ THE TWO OVERRIDES THAT MATTER, and they are the same two in both lanes:
+    //   ranges.w  = 0  — no near cut.
+    //   cellOwn.w = 0  — no near/far ownership.
+    // Together they are the fix for the hole this feature would otherwise open around the player.
+    // cellown.h.fsl deletes an instance whose bound sphere lies inside MW's loaded-cell slab on the
+    // grounds that MW's near path is drawing it — true of every distant static, false of every blade
+    // of grass, because the groundcover ESP is not in the load order and MW has never heard of these
+    // placements. Sharing the statics cull would delete grass in precisely the 8192 units around the
+    // camera where it is the entire point of the feature. g_grassNearCut re-arms both as a live A/B,
+    // so the claim is demonstrable in one frame rather than argued from this comment.
+    //
+    // Density is NOT a shader test: g_grassInst is hash-shuffled at load, so `instCount` below is a
+    // prefix and the knob scales the dispatch. See buildStaticsGrid.
+    void dispatchGrassCullLane(bool sunLane) {
+        Buffer* paramsCbv = sunLane ? g_live.pGrassSunCullParamsCbv : g_live.pGrassCullParamsCbv;
+        Buffer* countBuf  = sunLane ? g_live.pGrassSunCullCount     : g_live.pGrassCullCount;
+        Buffer* subCount  = sunLane ? g_live.pGrassSunSubsetCount   : g_live.pGrassSubsetCount;
+        Buffer* subOff    = sunLane ? g_live.pGrassSunSubsetOffset  : g_live.pGrassSubsetOffset;
+        Buffer* subCur    = sunLane ? g_live.pGrassSunSubsetCursor  : g_live.pGrassSubsetCursor;
+        Buffer* argsBuf   = sunLane ? g_live.pGrassSunArgs          : g_live.pGrassArgs;
+        Buffer* instOut   = sunLane ? g_live.pGrassSunInstOut       : g_live.pGrassInstOut;
+        DescriptorSet* set = sunLane ? g_live.pGrassSunCullSet      : g_live.pGrassCullSet;
+        bool&   inDraw    = sunLane ? g_live.grassSunArgsInDrawState : g_live.grassArgsInDrawState;
+        if (!set || !paramsCbv || !paramsCbv->pCpuMappedAddress) { return; }
+        if (!g_live.pCullParamsCbv || !g_live.pCullParamsCbv->pCpuMappedAddress) { return; }
+        if (!g_live.pFrameCbv || !g_live.pFrameCbv->pCpuMappedAddress) { return; }
+
+        // Same clone contract as dispatchSunCull: copy the camera params WHOLE (inheriting the eye,
+        // the Hi-Z pyramid state and the dynamic visibility mask), then override only what differs.
+        //
+        // Built in NORMAL memory and blitted once, rather than read-modify-written in place. Both
+        // cbuffers are CPU_TO_GPU persistent maps, i.e. WRITE-COMBINED: a scattered read-modify-write
+        // there is the WC-read trap ([[project_forge_wc_read_trap]]), and this way the whole exchange
+        // is one streaming read plus one streaming write. It also leaves `lp` as a plain-memory
+        // SNAPSHOT of exactly what the GPU was told, which is what the heartbeat's cross-check reads
+        // — asking the WC cbuffer would be both slow and, at 300-frame intervals, pointlessly so.
+        const float* cam = (const float*)g_live.pCullParamsCbv->pCpuMappedAddress;
+        float lp[128];
+        std::memcpy(lp, cam, 512);
+        float* gp = lp;
+
+        // G3: the whole generated window, not a density prefix. Density is now a per-blade hash test
+        // applied when the window is BUILT (see rebuildGrassWindow) — the generated order is
+        // tile-major, so a prefix of it would thin the field from one corner instead of evenly.
+        const uint32_t instCount = g_grassInstCount;
+        if (instCount == 0u) { return; }
+        g_grassLastDispatch = instCount;
+
+        gp[32] = (float)instCount;              // misc.x = the resident window's blade count
+        gp[33] = (float)g_grassSubsetCount;     // misc.y = the GRASS subset table's size
+        gp[35] = 0.0f;                          // misc.w = no minimum-radius floor
+
+        if (sunLane) {
+            // The caster's frustum is the outermost sun cascade's ortho box, exactly as
+            // dispatchSunCull builds it — one cull feeds every cascade because the inner boxes are
+            // concentric subsets of it.
+            const float* mfd = (const float*)g_live.pFrameCbv->pCpuMappedAddress;
+            float xa[3], ya[3], za[3];
+            sunLightBasis(&mfd[16], xa, ya, za);
+            const float range = g_sunShadowRange, depthHalf = 2.0f * g_sunShadowRange;
+            gp[0]=-xa[0];  gp[1]=-xa[1];  gp[2]=-xa[2];  gp[3]=range;
+            gp[4]= xa[0];  gp[5]= xa[1];  gp[6]= xa[2];  gp[7]=range;
+            gp[8]=-ya[0];  gp[9]=-ya[1];  gp[10]=-ya[2]; gp[11]=range;
+            gp[12]=ya[0];  gp[13]=ya[1];  gp[14]=ya[2];  gp[15]=range;
+            gp[16]=-za[0]; gp[17]=-za[1]; gp[18]=-za[2]; gp[19]=depthHalf;
+            gp[20]=za[0];  gp[21]=za[1];  gp[22]=za[2];  gp[23]=depthHalf;
+            // ...but NOT the sun cull's "ranges huge". A blade of grass casts a shadow a few metres
+            // long; carrying the full draw range into the cascade would submit tens of thousands of
+            // casters whose shadows are smaller than a shadow-map texel. Its own range, its own knob.
+            const float sr = std::max(0.0f, std::min(g_grassShadowRange, g_grassRange));
+            gp[28] = gp[29] = gp[30] = sr * sr;
+            gp[31] = 0.0f;     // nearCut² = 0
+            gp[55] = 0.0f;     // hizParams.w = 0 → Hi-Z off (that pyramid is the CAMERA's)
+        } else {
+            // Camera lane: the inherited planes are already the camera's. Every grass instance was
+            // written with rangeEndIdx = 0, so ranges.x is the ONE range this lane has.
+            const float r = std::max(0.0f, g_grassRange);
+            gp[28] = gp[29] = gp[30] = r * r;
+            // The near cut, normally (nearViewRange - 768)², is 0 here. See the ⚠ up top.
+            gp[31] = g_grassNearCut ? cam[31] : 0.0f;
+        }
+        // ...and ownership, off in both lanes for the same reason. (The A/B re-arms it in the camera
+        // lane only: a caster has no near-path partner to hand over to in the first place.)
+        gp[127] = (!sunLane && g_grassNearCut) ? lp[127] : 0.0f;
+
+        // Publish, and keep the camera lane's copy for the heartbeat cross-check.
+        std::memcpy(paramsCbv->pCpuMappedAddress, lp, 512);
+        if (!sunLane) { std::memcpy(g_grassCullDbg, lp, sizeof(g_grassCullDbg)); g_grassCullDbgOk = true; }
+
+        ID3D12GraphicsCommandList* cl = g_live.pCmd->mDx.pCmdList;
+        auto bufBarrier = [&](Buffer* buf, ResourceState from, ResourceState to) {
+            BufferBarrier bb = {}; bb.pBuffer = buf; bb.mCurrentState = from; bb.mNewState = to;
+            cmdResourceBarrier(g_live.pCmd, 1, &bb, 0, nullptr, 0, nullptr);
+        };
+        auto uavBarrier = [&](Buffer* buf) { bufBarrier(buf, RESOURCE_STATE_UNORDERED_ACCESS,
+                                                        RESOURCE_STATE_UNORDERED_ACCESS); };
+
+        // Reset the counters. gCullCount comes from the SHARED zero staging; gSubsetCount from the
+        // grass-sized one (the shared buffer describes 10,910 subsets, this table has 27).
+        bufBarrier(countBuf, RESOURCE_STATE_UNORDERED_ACCESS, RESOURCE_STATE_COPY_DEST);
+        cl->CopyBufferRegion(countBuf->mDx.pResource, 0, g_live.pCullCountZero->mDx.pResource, 0,
+                             2 * sizeof(uint32_t));
+        bufBarrier(countBuf, RESOURCE_STATE_COPY_DEST, RESOURCE_STATE_UNORDERED_ACCESS);
+        bufBarrier(subCount, RESOURCE_STATE_UNORDERED_ACCESS, RESOURCE_STATE_COPY_DEST);
+        cl->CopyBufferRegion(subCount->mDx.pResource, 0, g_live.pGrassSubsetCountZero->mDx.pResource, 0,
+                             (uint64_t)sizeof(uint32_t) * g_grassSubsetCount);
+        bufBarrier(subCount, RESOURCE_STATE_COPY_DEST, RESOURCE_STATE_UNORDERED_ACCESS);
+        if (inDraw) {
+            bufBarrier(argsBuf, RESOURCE_STATE_INDIRECT_ARGUMENT, RESOURCE_STATE_UNORDERED_ACCESS);
+            bufBarrier(instOut, RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER, RESOURCE_STATE_UNORDERED_ACCESS);
+            inDraw = false;
+        }
+
+        cmdBeginDebugMarker(g_live.pCmd, 0.4f, 0.8f, 0.3f, sunLane ? "GRASS CULL (sun)" : "GRASS CULL");
+        cmdBindPipeline(g_live.pCmd, g_live.pCullPipeline);
+        cmdBindDescriptorSet(g_live.pCmd, 0, set);
+        cmdDispatch(g_live.pCmd, (instCount + 63u) / 64u, 1, 1);
+        uavBarrier(subCount);
+        cmdBindPipeline(g_live.pCmd, g_live.pCullScanPipeline);
+        cmdBindDescriptorSet(g_live.pCmd, 0, set);
+        cmdDispatch(g_live.pCmd, 1, 1, 1);
+        uavBarrier(subOff);
+        uavBarrier(subCur);
+        uavBarrier(argsBuf);
+        cmdBindPipeline(g_live.pCmd, g_live.pCullScatterPipeline);
+        cmdBindDescriptorSet(g_live.pCmd, 0, set);
+        cmdDispatch(g_live.pCmd, (instCount + 63u) / 64u, 1, 1);
+        uavBarrier(instOut);
+        bufBarrier(argsBuf, RESOURCE_STATE_UNORDERED_ACCESS, RESOURCE_STATE_INDIRECT_ARGUMENT);
+        bufBarrier(instOut, RESOURCE_STATE_UNORDERED_ACCESS, RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);
+        inDraw = true;
+
+        // The RING-OVERFLOW TRIPWIRE (camera lane only — the caster's ring is the same size and its
+        // range is far shorter, so it cannot be the one to fill first). gCullCount[0] is the count of
+        // frustum survivors BEFORE the Hi-Z test, so this reads high rather than low: a warning it
+        // raises is worth checking, and one it does not raise is a real all-clear.
+        if (!sunLane && g_live.pGrassCullReadback) {
+            bufBarrier(countBuf, RESOURCE_STATE_UNORDERED_ACCESS, RESOURCE_STATE_COPY_SOURCE);
+            cl->CopyBufferRegion(g_live.pGrassCullReadback->mDx.pResource, 0,
+                                 countBuf->mDx.pResource, 0, 2 * sizeof(uint32_t));
+            bufBarrier(countBuf, RESOURCE_STATE_COPY_SOURCE, RESOURCE_STATE_UNORDERED_ACCESS);
+        }
+        cmdEndDebugMarker(g_live.pCmd);
+    }
+
+    void dispatchGrassCull() {
+        // FIRST, before every guard: this is what drawGrass and the sun-caster draw key on. A stale
+        // non-zero would make an interior, or a density of 0, or a frame where the lane never ran,
+        // re-issue the PREVIOUS exterior frame's indirect args — grass from another cell, drawn out
+        // of a buffer nothing refilled.
+        g_grassLastDispatch = 0;
+        if (!g_drawGrass || !g_live.grassCullReady || !g_live.pCullPipeline) { return; }
+        if (!g_dlExterior || !g_dlLiveInit || !g_staticsLiveOk || !g_grassInstCount) { return; }
+        dispatchGrassCullLane(/*sunLane*/false);
+        if (g_grassShadows && g_live.grassSunCullReady && g_pGrassSunShadowPipeline) {
+            dispatchGrassCullLane(/*sunLane*/true);
+        }
+    }
+
+    // Publish the per-frame grass lanes of gShadowParams (see shadowparams.h.fsl). Called from the
+    // frame setup, beside the other publishers, so grass.vert/grass.frag read one consistent set.
+    //
+    // ⚠ THE MOTION CLOCK IS WRAPPED IN DOUBLE, BEFORE THE FLOAT CAST, AND TO kGrassWindPeriod — see
+    // that constant for why the period is what it is. It is wrapped at all for the reason
+    // timeParams.x is: an ever-growing seconds count quantizes badly in float32 and makes the motion
+    // judder ([[project_wrapped_time_needs_snapped_omega]]).
+    void publishGrassParams(float* mp, double simTimeSeconds) {
+        if (!mp) { return; }
+        double w = std::fmod(simTimeSeconds, kGrassWindPeriod);
+        if (w < 0.0) { w += kGrassWindPeriod; }
+        mp[kGrassParamsFloat + 0] = g_grassWind[0];
+        mp[kGrassParamsFloat + 1] = g_grassWind[1];
+        mp[kGrassParamsFloat + 2] = (float)w;
+        mp[kGrassParamsFloat + 3] = std::max(0.0f, g_grassWindGain);
+        // The fade band, expressed as (start, 1/width) so the shader is one multiply-add. A zero or
+        // negative width publishes slope 0, which the shader reads as "no fade" — MGE's hard edge,
+        // kept reachable because it is the A/B partner for the dissolve. The SINK shares this band
+        // (grassParams3.w carries its width) so the two halves of the LOD act over one stretch.
+        const float range = std::max(0.0f, g_grassRange);
+        const float frac  = (g_grassFadeFrac < 0.0f) ? 0.0f : (g_grassFadeFrac > 1.0f ? 1.0f : g_grassFadeFrac);
+        const float width = range * frac;
+        mp[kGrassParams2Float + 0] = range - width;
+        mp[kGrassParams2Float + 1] = (width > 1.0f) ? (1.0f / width) : 0.0f;
+        mp[kGrassParams2Float + 2] = std::max(0.0f, std::min(g_grassAlphaRef, 1.0f));
+        mp[kGrassParams2Float + 3] = std::max(0.0f, g_grassCurrent);
+        mp[kGrassParams3Float + 0] = std::max(0.0f, g_grassSinkDepth);
+        // The sink's per-blade jitter, as a FRACTION of the band rather than the reference's fixed
+        // 1900 units: the band is a knob here and a jitter wider than it would pull blades in front
+        // of the fade's start, where they would sink with nothing dissolving them.
+        mp[kGrassParams3Float + 1] = width * std::max(0.0f, std::min(g_grassSinkJitter, 1.0f));
+        mp[kGrassParams3Float + 2] = g_grassVColFlag ? 1.0f : 0.0f;
+        mp[kGrassParams3Float + 3] = (width > 1.0f) ? width : 1.0f;
+        // The albedo/hue spreads live in the CBUFFER and not in the instance stream on purpose: the
+        // per-blade noise is baked into the window, but how far it swings is published per frame, so
+        // both knobs A/B instantly instead of costing a 3 ms window rebuild each time they move.
+        mp[kGrassParams4Float + 0] = std::max(0.0f, std::min(g_grassTintValue, 1.0f));
+        mp[kGrassParams4Float + 1] = std::max(0.0f, std::min(g_grassTintHue, 1.0f));
+        mp[kGrassParams4Float + 2] = std::max(0.0f, std::min(g_grassShadowRecvMode, 2.0f));
+        mp[kGrassParams4Float + 3] = 0.0f;
+        mp[kGrassParams5Float + 0] = std::max(0.0f, std::min(g_grassRootAO, 1.0f));
+        mp[kGrassParams5Float + 1] = (g_grassRootAOHeight > 1.0f) ? (1.0f / g_grassRootAOHeight) : 1.0f;
+        mp[kGrassParams5Float + 2] = g_grassPointLights ? 1.0f : 0.0f;
+        mp[kGrassParams5Float + 3] = 0.0f;
     }
 
     // SH2 (tasks/lighting.md) — rebuild the top-down world HEIGHT map.
@@ -35134,6 +36956,28 @@ namespace ForgeRender {
             cmdBindVertexBuffer(g_live.pCmd, 2, svbs, sstrides, nullptr);
             cmdBindIndexBuffer(g_live.pCmd, g_pStaticsIB, INDEX_TYPE_UINT16, 0);
             cmdExecuteIndirect(g_live.pCmd, INDIRECT_DRAW_INDEX, argCount, argsBuf, 0, nullptr, 0);
+
+            // G1e: grass casters into the same tile, from the grass SUN lane. The pipeline pairs
+            // grass.vert with the very sunshadow_statics.frag bound just above — which is the point:
+            // the caster runs the IDENTICAL wind displacement as the colour draw, off the same
+            // gShadowParams.grassParams published once per frame, so the shadow stays attached to
+            // the blade instead of sliding out from under it.
+            // ⚠ ONLY the outermost cascade would be worth submitting on cost grounds, but the cull
+            // range (g_grassShadowRange, a couple of thousand units) already confines the survivors
+            // to the near cascade's box, so the far cascade's draw is nearly empty by construction
+            // and the branch is not worth the second PSO bind path.
+            if (g_grassShadows && g_pGrassSunShadowPipeline && g_live.grassSunArgsInDrawState
+                && g_grassSubsetCount && g_grassLastDispatch) {
+                cmdBindPipeline(g_live.pCmd, g_pGrassSunShadowPipeline);
+                Buffer*  gvbs[2]     = { g_pStaticsVB, g_live.pGrassSunInstOut };
+                uint32_t gstrides[2] = { 20, kStaticsInstStride };
+                cmdBindVertexBuffer(g_live.pCmd, 2, gvbs, gstrides, nullptr);
+                cmdExecuteIndirect(g_live.pCmd, INDIRECT_DRAW_INDEX, g_grassSubsetCount,
+                                   g_live.pGrassSunArgs, 0, nullptr, 0);
+                // No state restore needed: the next cascade re-binds the statics PSO, VB and IB at
+                // the top of this loop (they moved in here when terrainRecord started binding its
+                // own lattice), and terrainRecord below binds everything it needs itself.
+            }
 
             // ...and the landscape, into the same tile. Same cells for every cascade (one cull), each
             // projected by that cascade's own ortho VP through pPerFrameSetSun instance c. The null
@@ -36585,6 +38429,10 @@ namespace ForgeRender {
         if (g_pStaticsPipeline) { removePipeline(R, g_pStaticsPipeline); g_pStaticsPipeline = nullptr; }
         if (g_pSunShadowStaticsPipeline) { removePipeline(R, g_pSunShadowStaticsPipeline); g_pSunShadowStaticsPipeline = nullptr; }
         if (g_pSunShadowStaticsShader)   { removeShader(R, g_pSunShadowStaticsShader); g_pSunShadowStaticsShader = nullptr; }
+        if (g_pGrassPipeline)          { removePipeline(R, g_pGrassPipeline);          g_pGrassPipeline = nullptr; }
+        if (g_pGrassSunShadowPipeline) { removePipeline(R, g_pGrassSunShadowPipeline); g_pGrassSunShadowPipeline = nullptr; }
+        if (g_pGrassSunShadowShader)   { removeShader(R, g_pGrassSunShadowShader);     g_pGrassSunShadowShader = nullptr; }
+        if (g_pGrassShader)            { removeShader(R, g_pGrassShader);              g_pGrassShader = nullptr; }
         if (g_pStaticsBlendShader) { removeShader(R, g_pStaticsBlendShader); g_pStaticsBlendShader = nullptr; }
         if (g_pStaticsShader)   { removeShader(R, g_pStaticsShader);   g_pStaticsShader = nullptr; }
         g_staticsSubsets.clear(); g_staticsDefs.clear(); g_staticsSubsetTex.clear();
@@ -36644,6 +38492,34 @@ namespace ForgeRender {
         if (g_live.pSkyArgs)           { removeResource(g_live.pSkyArgs);            g_live.pSkyArgs = nullptr; }
         if (g_live.pSkyInstOut)        { removeResource(g_live.pSkyInstOut);         g_live.pSkyInstOut = nullptr; }
         g_live.skyCullReady = false; g_live.skyArgsInDrawState = false;
+        // G1: the grass lanes. Same clone, same teardown — plus the two INPUT buffers, which the sun
+        // and sky clones do not own (they borrow the statics ones).
+        if (g_live.pGrassCullSet)      { removeDescriptorSet(R, g_live.pGrassCullSet); g_live.pGrassCullSet = nullptr; }
+        if (g_live.pGrassSunCullSet)   { removeDescriptorSet(R, g_live.pGrassSunCullSet); g_live.pGrassSunCullSet = nullptr; }
+        if (g_live.pGrassCullInst)     { removeResource(g_live.pGrassCullInst);     g_live.pGrassCullInst = nullptr; }
+        if (g_live.pGrassSubsetBuf)    { removeResource(g_live.pGrassSubsetBuf);    g_live.pGrassSubsetBuf = nullptr; }
+        if (g_live.pGrassCullParamsCbv){ removeResource(g_live.pGrassCullParamsCbv); g_live.pGrassCullParamsCbv = nullptr; }
+        if (g_live.pGrassCullCount)    { removeResource(g_live.pGrassCullCount);    g_live.pGrassCullCount = nullptr; }
+        if (g_live.pGrassCullReadback) { removeResource(g_live.pGrassCullReadback); g_live.pGrassCullReadback = nullptr; }
+        if (g_live.pGrassSubsetCount)  { removeResource(g_live.pGrassSubsetCount);  g_live.pGrassSubsetCount = nullptr; }
+        if (g_live.pGrassSubsetOffset) { removeResource(g_live.pGrassSubsetOffset); g_live.pGrassSubsetOffset = nullptr; }
+        if (g_live.pGrassSubsetCursor) { removeResource(g_live.pGrassSubsetCursor); g_live.pGrassSubsetCursor = nullptr; }
+        if (g_live.pGrassSubsetCountZero) { removeResource(g_live.pGrassSubsetCountZero); g_live.pGrassSubsetCountZero = nullptr; }
+        if (g_live.pGrassArgs)         { removeResource(g_live.pGrassArgs);         g_live.pGrassArgs = nullptr; }
+        if (g_live.pGrassInstOut)      { removeResource(g_live.pGrassInstOut);      g_live.pGrassInstOut = nullptr; }
+        if (g_live.pGrassSunCullParamsCbv) { removeResource(g_live.pGrassSunCullParamsCbv); g_live.pGrassSunCullParamsCbv = nullptr; }
+        if (g_live.pGrassSunCullCount)   { removeResource(g_live.pGrassSunCullCount);   g_live.pGrassSunCullCount = nullptr; }
+        if (g_live.pGrassSunSubsetCount) { removeResource(g_live.pGrassSunSubsetCount); g_live.pGrassSunSubsetCount = nullptr; }
+        if (g_live.pGrassSunSubsetOffset){ removeResource(g_live.pGrassSunSubsetOffset);g_live.pGrassSunSubsetOffset = nullptr; }
+        if (g_live.pGrassSunSubsetCursor){ removeResource(g_live.pGrassSunSubsetCursor);g_live.pGrassSunSubsetCursor = nullptr; }
+        if (g_live.pGrassSunArgs)        { removeResource(g_live.pGrassSunArgs);        g_live.pGrassSunArgs = nullptr; }
+        if (g_live.pGrassSunInstOut)     { removeResource(g_live.pGrassSunInstOut);     g_live.pGrassSunInstOut = nullptr; }
+        g_live.grassCullReady = false;    g_live.grassArgsInDrawState = false;
+        g_live.grassSunCullReady = false; g_live.grassSunArgsInDrawState = false;
+        g_grassInst.clear();    g_grassInst.shrink_to_fit();
+        g_grassSubsets.clear(); g_grassSubsets.shrink_to_fit();
+        g_grassInstCount = g_grassSubsetCount = 0;
+        g_grassLastSurvivors = g_grassLastDispatch = 0; g_grassOverflowSeen = false;
         // The map itself outlives this teardown (it is allocated with the opaque path), but its
         // CONTENTS do not: the statics that fed it are gone. Invalidate so the next exterior frame
         // rebuilds rather than shading through a map of a world that is no longer loaded.

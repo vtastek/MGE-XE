@@ -615,4 +615,74 @@ STRUCT(ShadowMaskParams)
     // bound BY POINTER into every PerFrame set, so an insertion anywhere else moves a lane somebody
     // reads.
     DATA(float4,   waterCausticProj, None);
+    // ─── G1: GRASS ──────────────────────────────────────────────────────────────────────────────
+    // xy = MW's WIND VECTOR, EWMA-smoothed client-side and shipped whole (lighting[36..37]). The
+    //      client used to ship only |wind| (for the flame flicker); grass needs the DIRECTION, so
+    //      the vector is the wire quantity now and the host derives the magnitude back off it.
+    // z  = the wind CLOCK: MW SIMULATION seconds wrapped to [0, 4).
+    //      ⚠ THE WRAP AND THE MOTION RATES ARE ONE DECISION. A wrapped clock is seamless only when
+    //      every rate turns a WHOLE number of cycles over the wrap period. grass.vert's wind term
+    //      runs at pi and 1.5*pi rad/s and its underwater term at 0.5*pi and 1.5*pi, so the shortest
+    //      period all four close on is 4 seconds (2, 3, 1 and 3 turns respectively). timeParams.x
+    //      cannot be reused: it wraps at 12.5 s (one V cycle of the ghostfence scroll), a multiple of
+    //      none of them, so every wrap would step the whole field at once.
+    //      ⚠ This is also why grass.vert spells pi exactly where the reference shader wrote 3.14 —
+    //      with the truncated constant none of those rates closes and the wrap is a visible jump.
+    //      [[project_wrapped_time_needs_snapped_omega]]
+    // w  = sway GAIN, over BOTH the wind and the underwater terms. 1 = the reference's amplitude;
+    //      0 = the field stands perfectly still, which is the isolation lever that separates a
+    //      motion problem from a placement or lighting one.
+    DATA(float4,   grassParams,      None);
+    // x  = fade START distance (world units); coverage is full inside it.
+    // y  = 1 / (fadeEnd - fadeStart), or 0 to disable the fade (a hard cull edge — MGE's pop).
+    //      ⚠ THE FADE RIDES THE A2C COVERAGE, NOT THE COLOUR. Grass is a cutout, so thinning the
+    //      sample mask dissolves the blades, where dimming them would lay a grey haze over ground
+    //      that is meant to be showing through.
+    // z  = the alpha reference, and it is ONE number where MGE had two. MGE discarded at 64/255 and
+    //      centred its fixed-RATE coverage ramp at 128/255; a2c.h.fsl's ramp is fwidth-normalised,
+    //      so it is one pixel wide about the reference by construction — the 50% contour IS the
+    //      silhouette and a second, lower kill threshold has nothing left to do (the mask already
+    //      reads 0 well below it). statics.frag's 133/255 is not inherited either: that is the
+    //      distant-statics number, and grass is authored against 128.
+    // w  = UNDERWATER CURRENT strength, in the same units the wind term's lean comes out in.
+    //      Its own knob and NOT derived from |wind|, because that is the whole point: wind does not
+    //      reach below the surface, so a gale must not bend the seaweed. 0 stills submerged growth
+    //      while leaving the shore grass blowing, which is the A/B for this half on its own.
+    DATA(float4,   grassParams2,     None);
+    // The enhanced shader's distance LOD, which SINKS a blade into the ground as it recedes rather
+    // than cutting it — distant grass gets shorter instead of vanishing, and grass.frag's coverage
+    // dissolve finishes off whatever is still poking out.
+    // x  = sink DEPTH in world units at the far end of the band (0 disables the sink entirely,
+    //      leaving the coverage dissolve as the only LOD — the A/B).
+    // y  = how far the per-blade noise may pull a blade's sink distance TOWARD the camera, in world
+    //      units. This is what stops the LOD edge being a clean circle centred on the player.
+    // z  = the vertex-colour FLAG arm, 0..1. 1 = honour the authored red channel (0 = rigid prop,
+    //      1 = foliage); 0 = treat every subset as foliage, which is stock's behaviour and the
+    //      fallback for a groundcover pack that never painted the channel.
+    // w  = the sink band's WIDTH in world units; it starts where the coverage fade starts
+    //      (grassParams2.x) so the two halves of the LOD act over the same stretch.
+    DATA(float4,   grassParams3,     None);
+    // x = per-blade VALUE (albedo) spread, 0..1 — 0 is the flat field, ~0.15 is a normal sward.
+    // y = per-blade HUE spread along the dry<->lush axis, 0..1. Both are mean-preserving: they widen
+    //     the distribution about the authored colour and never move its centre, so neither can drag
+    //     the exposure servo. See grass.vert::grassTint, which also documents why the axis is one
+    //     dry<->lush line rather than a hue rotation.
+    // z = grass sun-shadow RECEIVER MODE: 0 = none, 1 = one-tap moments (default), 2 = full PCSS.
+    //     Its own arm because grass.frag's receiver call is paid once per OVERDRAWN LAYER of a dense
+    //     field — the pass exports SV_Coverage and discards, so it cannot early-reject an occluded
+    //     fragment — and PCSS is ~28 taps. Measured at 2,928 clumps: 4.63 ms with PCSS, 1.11 ms with
+    //     no receiver at all, i.e. the receiver was 76% of the whole grass draw. Mode 1 keeps the
+    //     shadow and spends one tap on it; see grass.frag for why a blade cannot show a penumbra.
+    // w = spare.
+    DATA(float4,   grassParams4,     None);
+    // x = CONTACT-AO strength at the root, 0..1, scaled per blade by its own tile's canopy
+    //     density (the third 8-bit field in the instance's variation code). AMBIENT ONLY —
+    //     a low sun shines THROUGH a field horizontally and lights the roots directly, so
+    //     darkening the sun half would black out exactly the grass that should blaze at dawn.
+    // y = 1 / the model-space height over which that darkening lifts to full.
+    // z = grass receives clustered POINT LIGHTS, 0/1. Affordable where the PCSS receiver was
+    //     not, because an empty froxel costs nothing and a daylit exterior is nearly all empty
+    //     froxels — see pointlights.h.fsl. Measure it at NIGHT, not at midday.
+    // w = spare.
+    DATA(float4,   grassParams5,     None);
 };

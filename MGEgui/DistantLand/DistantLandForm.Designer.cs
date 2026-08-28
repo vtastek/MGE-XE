@@ -83,6 +83,7 @@ namespace MGEgui.DistantLand {
             this.cbStatActivators = new System.Windows.Forms.CheckBox();
             this.cbStatIncludeMisc = new System.Windows.Forms.CheckBox();
             this.cbStatFixMips = new System.Windows.Forms.CheckBox();
+            this.cbStatProcGrass = new System.Windows.Forms.CheckBox();
             this.lStatDesc = new System.Windows.Forms.Label();
             this.bStatOverrideList = new System.Windows.Forms.Button();
             this.bStatExportStatics = new System.Windows.Forms.Button();
@@ -758,6 +759,7 @@ namespace MGEgui.DistantLand {
             this.flowLayoutStaticsOptions.Controls.Add(this.cbStatActivators);
             this.flowLayoutStaticsOptions.Controls.Add(this.cbStatIncludeMisc);
             this.flowLayoutStaticsOptions.Controls.Add(this.cbStatFixMips);
+            this.flowLayoutStaticsOptions.Controls.Add(this.cbStatProcGrass);
             this.flowLayoutStaticsOptions.FlowDirection = System.Windows.Forms.FlowDirection.TopDown;
             this.flowLayoutStaticsOptions.Location = new System.Drawing.Point(296, 50);
             this.flowLayoutStaticsOptions.Name = "flowLayoutStaticsOptions";
@@ -826,6 +828,16 @@ namespace MGEgui.DistantLand {
             this.cbStatFixMips.TabIndex = 10;
             this.cbStatFixMips.Text = "Fix incomplete source mipmaps";
             this.cbStatFixMips.UseVisualStyleBackColor = true;
+            //
+            // cbStatProcGrass
+            //
+            this.cbStatProcGrass.AutoSize = true;
+            this.cbStatProcGrass.Location = new System.Drawing.Point(3, 168);
+            this.cbStatProcGrass.Name = "cbStatProcGrass";
+            this.cbStatProcGrass.Size = new System.Drawing.Size(180, 19);
+            this.cbStatProcGrass.TabIndex = 11;
+            this.cbStatProcGrass.Text = "Procedural grass (density field)";
+            this.cbStatProcGrass.UseVisualStyleBackColor = true;
             //
             // lStatDesc
             // 
@@ -1048,6 +1060,7 @@ namespace MGEgui.DistantLand {
         private System.Windows.Forms.CheckBox cbStatActivators;
         private System.Windows.Forms.CheckBox cbStatIncludeMisc;
         private System.Windows.Forms.CheckBox cbStatFixMips;
+        private System.Windows.Forms.CheckBox cbStatProcGrass;
         private System.Windows.Forms.CheckBox cbStatIntWater;
         private System.Windows.Forms.CheckBox cbStatOverrideList;
         private System.Windows.Forms.Button bStatOverrideList;

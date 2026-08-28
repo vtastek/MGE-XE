@@ -5581,19 +5581,29 @@ namespace RenderProcess {
         const float skyZenithR = skyColPtr ? skyColPtr->r : DistantLand::nearFogCol.r;
         const float skyZenithG = skyColPtr ? skyColPtr->g : DistantLand::nearFogCol.g;
         const float skyZenithB = skyColPtr ? skyColPtr->b : DistantLand::nearFogCol.b;
-        // Wind magnitude (lighting[18]) — drives the host's flame-flicker rate: a windy exterior makes
-        // torch/candle shadows dance harder. MW's wind vector is very noisy, so smooth it the same way
-        // DistantLand::update does (EWMA f=0.02) and ship the magnitude only (the flicker is isotropic).
-        // Exterior + weather-cell gated CLIENT-side (IsExterior is authoritative here), so an interior
-        // always ships 0 and the host needs no exterior gate of its own.
+        // Wind VECTOR (lighting[36..37]). Two consumers now, and that is why the whole vector ships
+        // rather than the magnitude it used to: the host's flame-flicker rate wants |wind| only (the
+        // flicker is isotropic), but G1 grass sways ALONG the wind, so it needs the direction. The
+        // host derives the magnitude back off this — one wind on the wire, so the flicker and the
+        // grass cannot end up describing different weather. MW's raw vector is very noisy, so it is
+        // smoothed the same way DistantLand::update does (EWMA f=0.02).
+        // Exterior + weather-cell gated CLIENT-side (IsExterior is authoritative here), so an
+        // interior always ships (0,0) and the host needs no exterior gate of its own.
+        //
+        // ⚠ The EWMA state must NOT be reset when the gate closes: walking into an inn for ten
+        // seconds and back out would otherwise restart the filter from zero, and the field would
+        // spend the next few seconds accelerating from dead calm into whatever the weather is.
+        // Freezing it (the `if` guards the update, not the state) means the wind is simply where it
+        // was, which is also what MW's own weather does across a load door.
         static float s_smoothWind[2] = {};
-        float windMag = 0.0f;
         if (isExterior && mwb->CellHasWeather() && !mwb->IsMenu()) {
             const float* wind = mwb->GetWindVector();
             s_smoothWind[0] += 0.02f * (wind[0] - s_smoothWind[0]);
             s_smoothWind[1] += 0.02f * (wind[1] - s_smoothWind[1]);
-            windMag = std::sqrt(s_smoothWind[0] * s_smoothWind[0] + s_smoothWind[1] * s_smoothWind[1]);
         }
+        const bool  windLive = isExterior && mwb->CellHasWeather() && !mwb->IsMenu();
+        const float windVecX = windLive ? s_smoothWind[0] : 0.0f;
+        const float windVecY = windLive ? s_smoothWind[1] : 0.0f;
         // Glow in the Dahrk distant windows (lighting[35]): hours into the period where GitD shows a
         // window mesh's lit "on" child (>0 lit, <0 dark). The host adds a per-instance stagger and
         // uses the sign to pick the night or day variant of a distant window subset. Before a world
@@ -5634,7 +5644,7 @@ namespace RenderProcess {
         // interior-ambient and skyZenith paths already gate on. Fog is NOT covered by this flag: MW
         // overrides fog underwater weather or not, so the host keeps un-blending that lane ungated.
         const float mwTintsUnderwater = mwb->CellHasWeather() ? 1.0f : 0.0f;
-        const float lighting[36] = {
+        const float lighting[40] = {
             // [3] = the SUN DISC's elevation sine, MGE's bounce-corrected DistantLand::sunPos.z —
             // a sun that actually SETS, unlike sunVec.xyz beside it, which keeps bouncing because
             // that is the lighting MW intends. Its azimuth rides [11]. Both are padding slots no FSL
@@ -5646,10 +5656,11 @@ namespace RenderProcess {
             // is the day/night bit and components would leave it underdetermined.
             ambColEff.r,               ambColEff.g,               ambColEff.b,               sunDiscAz,
             DistantLand::nearFogCol.r, DistantLand::nearFogCol.g, DistantLand::nearFogCol.b, 0.0f,
-            // [18] = smoothed wind magnitude (0 in interiors); [19] = cell epoch. Both land in
-            // fogParams.zw, which no shader reads — the host consumes them CPU-side (wind → flicker
-            // rate; epoch change → evict all shadow slots + caster records).
-            DistantLand::fogNearStart, DistantLand::fogNearEnd,   windMag,                   float(g_cellEpoch),
+            // [18] RETIRED (was the smoothed wind MAGNITUDE — G1 moved the wind to [36..37] as a
+            // vector and the host derives |wind| from it); [19] = cell epoch. Both land in
+            // fogParams.zw, which no shader reads — the host consumes them CPU-side (epoch change →
+            // evict all shadow slots + caster records).
+            DistantLand::fogNearStart, DistantLand::fogNearEnd,   0.0f,                      float(g_cellEpoch),
             // CAMERA-RELATIVE: WorldPos reaches the shader already relative to the eye, so the
             // eyePos used for the per-vertex fog distance |worldPos - eyePos| is the origin (0).
             0.0f,                      0.0f,                      0.0f,                      0.0f,
@@ -5677,6 +5688,11 @@ namespace RenderProcess {
             // so a non-const alias writes the two slots after the aggregate is computed).
             // [35] GitD night signal -> FrameData.timeParams.z (statics.vert day/night window clip).
             mwb->simulationTime(),     0.0f,                      0.0f,               glowMargin,
+            // [36..37] G1: MW's WIND VECTOR, EWMA-smoothed above. Drives the host grass lane's four
+            // wind harmonics (gShadowParams.grassParams.xy) AND — via the magnitude the host derives
+            // from it — the flame-flicker rate that [18] used to carry. One wind, one wire.
+            // [38..39] spare.
+            windVecX,                  windVecY,                  0.0f,                      0.0f,
         };
 
         // Part A: aggregate this frame's per-category upload cost, publish the total to the host

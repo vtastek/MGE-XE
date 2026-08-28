@@ -1,0 +1,404 @@
+// mgeHost64 — G1 host-owned GRASS (vertex stage, GPU-driven).
+//
+// Grass placements are baked into the SAME distant-land library every other distant static lives in
+// (static_meshes + usage.data, StaticType::Grass), so this shares the whole resident geometry path:
+// binding 0 is the 20-byte MGE StaticElem vertex, binding 1 is the per-instance world-rows stream a
+// cull scatter filled, textures come out of the bindless bucketed gStaticsArrays. What it does NOT
+// share is the CULL — grass runs its own lane over its own instance array, for the two reasons in
+// tasks/forge-grass.md (no near path to hand over to, and the opposite subset:instance ratio).
+//
+// ⚠ VSOutput IS statics.vert's, FIELD FOR FIELD, CENTROID MODIFIERS INCLUDED. That is not tidiness:
+// it is what lets the sun-shadow caster pass pair THIS vertex shader with the existing
+// sunshadow_statics.frag and get a shadow that carries the identical wind displacement. A caster
+// that does not sway with its blade detaches from it, and a frag whose input signature does not
+// match its paired vert's output hangs the GPU ([[project_forge_shared_frag_vsoutput]]).
+//
+// PORTED FROM THE *ENHANCED* SHADER: `core-mods/XE Mod Grass.fx` (shipped inside the install's
+// shaders.7z), not the stock `core/XE Mod Grass.fx`. It differs from stock in four ways that all
+// matter, and the Horizon Zero Dawn foliage work is where the lighting half comes from (Guerrilla,
+// "Between Tech and Art: The Vegetation of Horizon Zero Dawn", GDC 2017):
+//   1. WRAP LIGHTING + BACKLIGHT instead of a bare two-sided lambert (see grassWrapLighting).
+//   2. The vertex colour's RED channel is an authored STIFFNESS/FOLIAGE flag, and it drives both
+//      the displacement weight and which lighting model runs (see the ⚠ on soft below).
+//   3. A different motion model: a strong constant LEAN into the wind with fine flutter on top,
+//      where stock summed four coherent travelling harmonics.
+//   4. Distance LOD by SINKING the blade into the ground rather than by cutting it (see sink).
+//
+// NOT ported: the player-stomp term (out of scope for G1 — no footPos on the wire), the DX9 shadow
+// map lookups (the host has its own MSM receiver, applied in grass.frag), and MGE's fixed 8192
+// element cap. Divergences from the reference are marked ⚠ individually.
+
+#include "opaque.srt.h"
+#include "fog.h.fsl"        // mwFogFactor() — ONE fog law for every stage
+#include "skyamb.h.fsl"     // skyAmbFactor() — SH-L1 sky ambient (SH1) + sky AO (SH2)
+#include "tonemap.h.fsl"    // (scenecolor.h.fsl's prerequisite; the curve is never called in a VS)
+#include "linearize.h.fsl"  // srgbToLinear() — the scene's transfer function
+
+#define GRASS_PI 3.14159265f
+
+// Guerrilla's wrapped-diffuse constants, kept as authored (they are a LOOK, not a measurement).
+#define GRASS_WRAP_W     0.6f    // how far past the terminator light wraps
+#define GRASS_WRAP_N     1.5f    // falloff sharpness of the wrapped lobe
+#define GRASS_BACKLIGHT  0.4f    // translucency: light coming through the back of a blade
+
+STRUCT(VSInput)
+{
+    DATA(float4, Position, POSITION);    // FLOAT16_4 model pos (w = 1); .z is the blade HEIGHT
+    DATA(float4, Normal,   NORMAL);      // UBYTE4N: xyz encoded normal, w = emissive (unused here)
+    DATA(float4, Color,    COLOR);       // D3DCOLOR — .r is the authored foliage flag, see below
+    DATA(float2, Uv,       TEXCOORD0);   // FLOAT16_2 base-map UV
+    // Per-instance (binding 1), written by cullscatter.comp into the GRASS instance ring.
+    DATA(float4, W0, TEXCOORD1);
+    DATA(float4, W1, TEXCOORD2);
+    DATA(float4, W2, TEXCOORD3);
+    DATA(float4, W3, TEXCOORD4);         // .xyz = translation, CAMERA-RELATIVE (scatter shifted by -eye)
+    DATA(float4, InstParams, TEXCOORD5); // x = texSlot, y = flags, z = per-instance hash, w = slab (always 0)
+};
+
+// Byte-identical to statics.vert's VSOutput — see the note up top for why that is load-bearing.
+STRUCT(VSOutput)
+{
+    DATA(float4,           Position, SV_Position);
+    DATA(float2,           Uv,       TEXCOORD0);
+    DATA(CENTROID(float4), Color,    COLOR);       // rgb = ambient (never shadowed); a = DISTANCE FADE
+    DATA(CENTROID(float),  Fog,      TEXCOORD1);
+    DATA(FLAT(uint),       TexIndex, TEXCOORD2);
+    DATA(FLAT(uint),       Flags,    TEXCOORD3);
+    DATA(float3,           WorldPos, TEXCOORD4);
+    DATA(float3,           WorldNormal, TEXCOORD5);
+    DATA(CENTROID(float3), SunLight, TEXCOORD6);   // the shadowable sun half of the lighting
+    DATA(float,            Clip,     SV_ClipDistance0);
+};
+
+// ⚠ ABSOLUTE WORLD POSITION, IN A FORM THAT SURVIVES float32 AT VVARDENFELL'S SCALE.
+//
+// The motion terms are functions of WHERE THE BLADE IS, so they need absolute coordinates — a
+// camera-relative position would slide the whole wind field along with the player and the meadow
+// would visibly shear as you walk. But the instance stream is camera-relative and absolute
+// Morrowind coordinates reach ~200,000: `worldRel + lodEye` in float32 has ~0.015 units of
+// resolution there, and the rounding of that sum CHANGES AS THE CAMERA MOVES, so every phase built
+// from it would flicker ([[project_forge_precision_far_origin]]).
+//
+// So the position is rebuilt from two pieces that are each exact, in a modulus the consumers cannot
+// tell from the true value. THE MODULUS IS 2, NOT 1, and that is the whole point:
+//
+// ⚠ MOD 1 WAS A HALF-CYCLE ERROR ON THE SECOND HARMONIC — the camera-motion jitter. Reconstructing
+// with frac() delivers s = S − N where S is the true sum and N is an integer that MOVES: N is
+// floor(worldRel) + floor(eye) per component, and those two step at different camera positions, so
+// N flips ±1 several times per world unit of travel, differently for every blade. harmonic.x runs
+// at −2*pi*s and does not care (an integer shift is a whole number of cycles). harmonic.y runs at
+// −3*pi*s, whose period in s is 2/3: an ODD N is 1.5 cycles, i.e. THE SIGN FLIPS. So walking moved
+// every blade's second harmonic between +1 and −1 of its own amplitude, at a rate set by how fast
+// the camera crossed unit boundaries. That is exactly the reported "camera moves and the grass goes
+// jittery", and it is why standing still looked fine.
+//
+// Mod 2 makes N even, and an even shift is a whole number of cycles for BOTH rates (2 and 3
+// respectively). x − 2*floor(0.5*x) is exact in float32 for any x whose ulp is below the result's
+// (worldRel < 8192 → ulp 2^-10; the result lands on that same grid inside [0,2)), so blade-to-blade
+// and vertex-to-vertex relationships survive bit for bit.
+//
+// The eye half is reduced the same way and the two reductions CANCEL EXACTLY, which is worth being
+// explicit about because it is what makes the whole scheme work at 200,000 units out. lodEye's own
+// ulp there is 0.031, and cullscatter built worldPosRel by subtracting THAT SAME float — so the
+// eye's quantisation enters worldPosRel with one sign and this term with the other and leaves
+// nothing behind. x - 2*floor(0.5*x) is exact for both (the result lands on the operand's own
+// grid inside [0,2), and it is a true positive modulo for negative coordinates too), so publishing
+// a host-reduced eye would buy precision that is already there.
+float3 grassAbsMod2(float3 worldPosRel)
+{
+    float3 w = worldPosRel        - 2.0f * floor(0.5f * worldPosRel);
+    float3 e = gFrameData.lodEye.xyz - 2.0f * floor(0.5f * gFrameData.lodEye.xyz);
+    return w + e;
+}
+
+// `core-mods/XE Mod Grass.fx::grassDisplacement`, minus the stomp.
+//
+// ⚠ NOT THE STOCK FOUR-HARMONIC MODEL. Read what the constants do: the sin() amplitudes are ~0.5-1
+// and they are added to `bi` (16 and 8) before abs(), so each harmonic is a large CONSTANT with a
+// ~3% ripple on it. Multiplied by `2*wind + 0.1`, that is a strong steady LEAN into the wind plus
+// fine flutter — the shape real grass holds in a breeze — where stock produced pure oscillation
+// about the upright. The `+0.03*v` / `+0.044*v` terms let a stronger wind add a little more chop.
+//
+// The spatial term is (x+y+z) at one cycle per unit, so the ripple decorrelates between neighbouring
+// VERTICES: the blade flutters and distorts rather than bending as a rigid unit. That is the intent.
+//
+// h is the vertex's MODEL-space z, so saturate(0.02*h) pins the roots (h = 0) and reaches full
+// displacement by 50 units up the blade.
+// ⚠ THE TWO RATES ARE WHY grassAbsMod2 REDUCES MODULO 2 AND NOT 1. Read them as periods in `s`:
+// −2*pi is one cycle per unit, −3*pi is one cycle per 2/3 of a unit. The smallest shift both can
+// absorb without changing value is 2. Adding a harmonic here means re-deriving that modulus (and
+// kGrassWindPeriod, for the same reason on the time axis).
+float2 grassWindDisplacement(float3 absFrac, float h)
+{
+    float2 wind = gShadowParams.grassParams.xy;
+    float  v    = length(wind);
+    float  t    = gShadowParams.grassParams.z;      // wrapped to [0, 4) — see shadowparams.h.fsl
+    float2 displace = 2.0f * wind + 0.1f;           // the 0.1 is the reference's dead-calm idle drift
+
+    // ⚠ EXACT pi WHERE THE REFERENCE WROTE 3.14. The 0.05% spatial-frequency difference is invisible;
+    // what it buys is that the temporal rates below become exactly pi and 1.5*pi, which is what makes
+    // the 4-second clock wrap seamless. With 3.14 the field would step at every wrap.
+    const float cg = GRASS_PI;
+    float s = absFrac.x + absFrac.y + absFrac.z + t * 0.5f;
+
+    float2 harmonics;
+    harmonics.x = abs((0.5f + 0.030f * v) * sin(-2.0f * cg * s) + 16.0f);
+    harmonics.y = abs((1.0f + 0.044f * v) * sin(-3.0f * cg * s) + 8.0f);
+
+    return saturate(0.02f * h) * harmonics * displace;
+}
+
+// ⚠ UNDERWATER GRASS MOVES WITHOUT A DIRECTION, and that is a statement about the medium, not a
+// style choice: wind does not reach below the surface. What moves submerged growth is the water
+// itself, which has no single heading a blade can lean into — so the wind term above, whose whole
+// structure is a steady lean ALONG windVec, is simply the wrong model down there. Left alone it
+// also produces the giveaway that a windy day bends the seaweed exactly as hard as the shore grass.
+//
+// So the submerged motion is built out of ROTATION instead of a lean: two counter-phased circles at
+// different rates, which sum to a wandering path with no preferred direction and no net drift. The
+// per-instance phase makes neighbouring plants disagree, so a bed of weed churns rather than
+// pulsing as one body. Amplitude comes from its own knob and NOT from |wind|.
+//
+// Rates are 1 and 3 turns per wrap, so this shares the wind term's 4-second clock exactly.
+float2 grassCurrentDisplacement(float h, float phase)
+{
+    float t  = gShadowParams.grassParams.z;
+    float a1 = (0.5f * GRASS_PI) * t + phase;          // 1 turn per wrap
+    float a2 = (1.5f * GRASS_PI) * t - phase * 1.7f;   // 3 turns per wrap, counter-phased
+    float2 drift = float2(cos(a1), sin(a1)) * 0.75f
+                 + float2(cos(a2), sin(a2)) * 0.25f;
+    return saturate(0.02f * h) * drift * gShadowParams.grassParams2.w;
+}
+
+// The reference's quartic value noise, used to ragged the LOD edge.
+float grassBNoise(float x)
+{
+    float i = floor(x);
+    float f = frac(x);
+    float s = sign(frac(x * 0.5f) - 0.5f);
+    float k = frac(i * 0.1731f);
+    return s * f * (f - 1.0f) * ((16.0f * k - 4.0f) * f * (f - 1.0f) - 1.0f);
+}
+
+// Guerrilla's wrapped diffuse with a translucency term (HZD vegetation). Two things it fixes over a
+// bare lambert, both specific to foliage: light WRAPS past the terminator because a leaf is thin and
+// scatters internally, and light coming from BEHIND transmits through rather than leaving the blade
+// black. The `(n+1)/(2*(1+w))` factor is the energy normalisation for the wrapped lobe — without it
+// widening the wrap silently brightens the whole field.
+float grassWrapLighting(float ndl)
+{
+    const float w = GRASS_WRAP_W;
+    const float n = GRASS_WRAP_N;
+    float wrapped = pow(saturate((ndl + w) / (1.0f + w)), n) * (n + 1.0f) / (2.0f * (1.0f + w));
+    return wrapped + max(0.0f, -ndl) * GRASS_BACKLIGHT;
+}
+
+// Per-blade ALBEDO VARIATION. The bake hands every blade of a given mesh the identical texture and
+// the identical vertex colour (G/B/A are 255 across all 3,149 grass vertices — see the flag note in
+// VS_MAIN), so a field drawn from one palette is one colour repeated tens of thousands of times.
+// That is what reads as a monotone mat instead of ground cover, and no amount of geometry variety
+// fixes it while the colour is constant.
+//
+// The two inputs arrive as a spatially COHERENT drift with a per-blade grain mixed in
+// (rebuildGrassWindow builds them; the drift is the larger part). The coherence is the point: white
+// noise per blade averages straight back to the flat colour a few metres out, where a drift reads
+// as patches of drier and lusher growth, which is what a real sward does.
+//
+// ⚠ THE HUE AXIS IS DRY <-> LUSH, NOT A HUE ROTATION. Rotating hue in RGB walks grass through
+// colours no plant has; the variation actually wanted here is one axis — carotenoid straw up,
+// chlorophyll green down. And it is MEAN-PRESERVING by construction: both terms are linear in an
+// input whose mean is 0.5, and at 0.5 the tint is exactly 1, so the knobs move the SPREAD and can
+// never shift the field's average brightness or cast out from under the exposure servo
+// ([[project_forge_exposure_couples_every_level]]).
+float3 grassTint(float hue, float val)
+{
+    float2 amt  = gShadowParams.grassParams4.xy;    // x = value spread, y = hue spread
+    float3 axis = float3(0.85f, 0.20f, -0.55f);     // + = straw, - = blue-green
+    float3 t = 1.0f + (hue * 2.0f - 1.0f) * amt.y * axis;
+    return max(float3(0.0f, 0.0f, 0.0f), t * (1.0f + (val * 2.0f - 1.0f) * amt.x));
+}
+
+ROOT_SIGNATURE(DefaultRootSignature)
+VSOutput VS_MAIN( VSInput In )
+{
+    INIT_MAIN;
+    VSOutput Out;
+
+    // worldPos = pos * M with M as 4 ROWS — the same explicit row combination statics.vert uses, and
+    // convention-proof regardless of HLSL matrix packing. CAMERA-RELATIVE (the scatter shifted W3).
+    float4 worldPos = In.Position.x * In.W0 + In.Position.y * In.W1
+                    + In.Position.z * In.W2 + In.Position.w * In.W3;
+
+    // ── PER-BLADE VARIATION CODE, CARRIED IN W0.w ─────────────────────────────────────────────
+    // ⚠ THIS IS A BORROWED LANE AND IT HAS TO BE PAID FOR ON THE NEXT LINE. The instance stream's
+    // four rows are an AFFINE matrix, so column 3 is structurally (0,0,0,1) and W0.w is a hard zero
+    // that cullscatter copies through for free — but the row combination above is a float4 add, so a
+    // payload there lands in worldPos.w and would divide straight into the projection. Restoring
+    // w = 1 is what makes the lane free rather than catastrophic; the shadow caster shares this
+    // vertex shader, so it inherits both halves. Only the GRASS ring is ever written this way
+    // (rebuildGrassWindow) — the statics ring still ships a clean zero. [[feedback_bind_borrowed_from_another_branch]]
+    //
+    // THREE 8-bit fields — hue | value | canopy density — packed as h<<16 | v<<8 | d. 2^24-1 is the
+    // last integer float32 represents exactly, so the triple is lossless, and every divisor here is a
+    // POWER OF TWO so each step is an exponent shift and the unpack is bit-exact. 256 levels is far
+    // more than three deliberately subtle variations can show.
+    float  varCode = In.W0.w;
+    worldPos.w = 1.0f;
+    float  varHue  = floor(varCode * (1.0f / 65536.0f));
+    float  varRest = varCode - varHue * 65536.0f;
+    float  varVal  = floor(varRest * (1.0f / 256.0f));
+    float  varDens = (varRest - varVal * 256.0f) * (1.0f / 255.0f);
+    varHue *= (1.0f / 255.0f);
+    varVal *= (1.0f / 255.0f);
+
+    // ⚠ THE AUTHORED FOLIAGE FLAG. Remiros paints the vertex colour's RED channel and nothing else:
+    // measured across all 3,149 grass vertices in this bake, every one is either (0,255,255,255) or
+    // (255,255,255,255) — G, B and A are 255 everywhere, red is 0 or 255 and never between, and it
+    // is uniform per subset. That is a deliberate per-mesh flag, not baked AO and not a tint.
+    // 7 of the 27 grass subsets carry 0: the rock props and the stiff shrubs scattered in with the
+    // groundcover, i.e. the pieces that must NOT bend and must NOT be lit as thin translucent cards.
+    //
+    // The STOCK shader "deliberately ignores vertex colour due to problem with some grass mods", and
+    // that is exactly why stock makes those rocks sway like wheat. The enhanced shader reads it, so
+    // we read it — but through a host arm (grassParams3.z, knob `grassVColFlag`), because stock's
+    // complaint is real for OTHER packs: a groundcover mod that never touched the channel ships it
+    // black, and honouring that would freeze its entire field. 0 disarms the flag and treats every
+    // subset as foliage, which is exactly stock's behaviour.
+    float soft = lerp(1.0f, In.Color.r, gShadowParams.grassParams3.z);
+
+    // ── MOTION ────────────────────────────────────────────────────────────────────────────────
+    float3 absFrac = grassAbsMod2(worldPos.xyz);
+    // ⚠ THE AIR/WATER CHOICE IS MADE FROM THE ROOT, NOT THE VERTEX. A blade straddling the waterline
+    // must pick ONE motion for its whole self; deciding per vertex would drive the submerged half
+    // and the emergent half in different directions and tear the blade apart. W3.z IS the root (the
+    // instance's camera-relative translation), so the whole blade agrees by construction.
+    // waterFogPlane.w is the GEOMETRY gate — "this cell has a water plane" — deliberately not the
+    // water-fog feature toggle, which would make a rendering option change how plants move.
+    float waterRelZ  = gShadowParams.waterFogPlane.x - gFrameData.lodEye.z;
+    float submerged  = step(0.5f, gShadowParams.waterFogPlane.w)
+                     * (1.0f - smoothstep(-64.0f, 64.0f, In.W3.z - waterRelZ));
+
+    float2 windDisp    = grassWindDisplacement(absFrac, In.Position.z);
+    // Per-instance phase for the current: InstParams.z is already a stable hash of the instance's
+    // ABSOLUTE placement origin (cullscatter computes it from wr3.xy, where the precision is exact),
+    // so it costs nothing and cannot flicker. It rides in the stream for the GitD window stagger,
+    // which grass has no use for.
+    float2 currentDisp = grassCurrentDisplacement(In.Position.z, In.InstParams.z * 12.566f);
+
+    worldPos.xy += soft * gShadowParams.grassParams.w * lerp(windDisp, currentDisp, submerged);
+
+    // ── DISTANCE LOD: SINK, don't cut ─────────────────────────────────────────────────────────
+    // The enhanced shader's LOD, and it is a nicer idea than a cull plane: the blade sinks into the
+    // ground as it recedes, so distant grass gets SHORTER instead of vanishing. Paired with
+    // grass.frag's coverage dissolve over the same band, the far edge shortens and then thins out.
+    //
+    // ⚠ THE NOISE IS PER-BLADE, NOT PER-VERTEX. The reference evaluates it at the vertex position at
+    // one cycle per world unit and scales the result by 1900 units of distance — which on a
+    // hundred-unit blade is a hundred cycles, i.e. every vertex sinking by a different random amount
+    // and the mesh shredding. The INTENT is plainly a ragged fade edge rather than a clean circle
+    // around the camera, so it is evaluated once per instance here, off the root.
+    // [[feedback_prior_art_constants_dont_transfer]]
+    //
+    // ⚠ AND IT IS KEYED ON THE INSTANCE, NOT ON A RECONSTRUCTED POSITION — the second half of the
+    // camera-motion jitter. grassBNoise is built out of floor() and frac(x*0.5): an integer shift of
+    // its argument does not shift the noise, it REPLACES it. Feeding it a frac()-reconstructed root
+    // therefore re-rolled every blade's sink jitter as the camera crossed unit boundaries, and a
+    // blade inside the fade band visibly bobbed. InstParams.z is hashed by cullscatter from the
+    // instance's ABSOLUTE origin and is constant for the whole session, so this cannot move at all.
+    // The 977 spreads [-0.5,0.5] across enough integer cells for the noise's own structure to show.
+    {
+        float  jitter   = saturate(grassBNoise(In.InstParams.z * 977.0f));
+        float  sinkFrom = gShadowParams.grassParams2.x;                     // = fade start
+        float  sinkTo   = sinkFrom + gShadowParams.grassParams3.w;          // = the fade band's end
+        float  d        = length(worldPos.xyz) - gShadowParams.grassParams3.y * jitter;
+        worldPos.z -= gShadowParams.grassParams3.x * smoothstep(sinkFrom, sinkTo, d);
+    }
+
+    Out.WorldPos = worldPos.xyz;
+    Out.Position = mul(gFrameData.viewProj, worldPos);
+
+    // ── LIGHTING ──────────────────────────────────────────────────────────────────────────────
+    // Decompress + world-transform the normal as a direction (no post-normalise, matching MGE —
+    // distant statics carry uniform scale).
+    float3 n      = normalize(2.0f * In.Normal.xyz - 1.0f);
+    float3 nWorld = n.x * In.W0.xyz + n.y * In.W1.xyz + n.z * In.W2.xyz;
+
+    // Foliage is lit TWO-SIDED: grass LODs are crossed quads seen from inside the clump and from
+    // every angle, so `-sign(dot(eyevec, N))` flips the normal to whichever side the camera is on
+    // and a blade never goes black merely for facing away. worldPos is already camera-relative, so
+    // it IS the eye vector. Rigid props (soft == 0) keep their real normal and a plain lambert —
+    // a rock lit from its back face is just wrong.
+    float  facing  = -sign(dot(worldPos.xyz, nWorld));
+    float  ndlHard = dot(nWorld, -gFrameData.sunDir.xyz);
+    float  lambert;
+    float3 nFace;
+    if (soft > 0.5f) {
+        lambert = grassWrapLighting(ndlHard * facing);
+        nFace   = nWorld * facing;
+    } else {
+        lambert = ndlHard;
+        nFace   = nWorld;
+    }
+    lambert = max(0.0f, lambert);
+
+    // Split exactly the way statics.vert splits: ambient in Color (never shadowed), the sun term in
+    // its own interpolator so grass.frag can attenuate it by the MSM sun visibility.
+    //
+    // Note the vertex colour is NOT used as a colour here — only as the flag above. It carries no
+    // albedo in this bake (G/B/A are 255 everywhere), and the reference does not multiply by it
+    // either; the texture carries the colour and the vertex stream carries the shape.
+    // ── CONTACT AO: the sward is dark at its own base ─────────────────────────────────────────
+    // What makes grass sit ON the ground rather than float over it is occlusion at the roots, and it
+    // does not need a depth buffer to compute. A blade deep inside a canopy sees little sky; the tip
+    // sees all of it. That is a function of HEIGHT UP THE BLADE, which this stage already has —
+    // In.Position.z is the same model-space z the wind weight rides on — so the whole term is one
+    // lerp and cannot be noisy, cannot flicker, and costs nothing per pixel.
+    //
+    // ⚠ AMBIENT ONLY, which is the project's standing AO rule ([[project_scenewalk_forward_ssao_oracle]])
+    // and matters more here than usual: a low sun shines THROUGH a field horizontally and lights the
+    // roots directly. Darkening the sun half would black out exactly the grass that should be blazing
+    // at dawn. It is also not applied to grass.frag's point lights — a campfire sits ON the ground,
+    // so the base is where it is brightest and an occlusion term there would be backwards.
+    //
+    // varDens is the blade count of this blade's own 256-unit source tile, so a thick patch is darker
+    // at the base than a sparse one — the occluder is the NEIGHBOURS, and only the scatter knows how
+    // many there are. Screen-space AO could never see this: the blades doing the occluding are
+    // sub-pixel.
+    float rootAO = lerp(1.0f - saturate(gShadowParams.grassParams5.x * varDens), 1.0f,
+                        saturate(In.Position.z * gShadowParams.grassParams5.y));
+
+    // The tint is an ALBEDO term, so it multiplies BOTH halves of the split — grass.frag recombines
+    // them as tex.rgb * (ambient + sun*vis), and tinting only one half would make a blade change
+    // colour as a cloud shadow crossed it.
+    float3 tint     = grassTint(varHue, varVal);
+    float3 ambient  = tint * rootAO * gFrameData.lodSunAmb.rgb * skyAmbFactor(nFace, worldPos.xyz);
+    Out.SunLight    = tint * gFrameData.sunCol.rgb * lambert;
+    Out.WorldNormal = nFace;   // the FACING normal — what the shadow receiver and the AO want too
+
+    // DISTANCE FADE (Color.a) — the second half of the LOD, spent on grass.frag's A2C coverage so
+    // the field dissolves where MGE cut it at a hard plane. Horizontal distance, matching the tier
+    // test the cull uses (a 3D distance would fade the field out beneath an airborne camera while
+    // the cull still kept it).
+    float distXY = length(worldPos.xy);
+    float fade   = saturate(1.0f - (distXY - gShadowParams.grassParams2.x) * gShadowParams.grassParams2.y);
+    Out.Color    = float4(ambient, fade);
+
+    Out.Uv       = In.Uv;
+    Out.TexIndex = (uint)(In.InstParams.x + 0.5f);
+    // ⚠ FORCE THE CUTOUT BIT. Flags bit1 is the bake's hasAlpha, and sunshadow_statics.frag gates
+    // its alpha test on it — a grass subset that shipped without the bit would cast a SOLID BOX
+    // shadow the size of its quads. Grass is a cutout by definition, whatever the NIF said, so the
+    // question is answered here rather than trusted from the bake.
+    Out.Flags    = (uint)(In.InstParams.y + 0.5f) | 0x2u;
+
+    float dist = length(worldPos.xyz - gFrameData.eyePos.xyz);
+    Out.Fog    = mwFogFactor(dist);   // ramp only — the submerged test is PER PIXEL (mwFogAir)
+
+    // Below-water clip (reflect-geo pass only); pass-all (0,0,0,1) in every other frame cbuffer.
+    // Grass has no near/far handover slab to select against — the grass cull runs with ownership
+    // disarmed, so cullscatter writes InstParams.w = 0 for every blade — which is why this is the
+    // water clip outright and not statics.vert's select.
+    Out.Clip = dot(gFrameData.gReflWaterClip.xyz, worldPos.xyz) + gFrameData.gReflWaterClip.w;
+
+    RETURN(Out);
+}

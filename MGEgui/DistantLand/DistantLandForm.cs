@@ -208,6 +208,12 @@ namespace MGEgui.DistantLand {
         private static INIFile.INIVariableDef iniMiscObj = new INIFile.INIVariableDef("MiscObj", iniDLWizardSets, "Include misc objects", INIFile.INIBoolType.Text, "True");
         private static INIFile.INIVariableDef iniUseStatOvr = new INIFile.INIVariableDef("UseStatOvr", iniDLWizardSets, "Use static overrides", INIFile.INIBoolType.Text, "True");
         private static INIFile.INIVariableDef iniFixMips = new INIFile.INIVariableDef("FixMips", iniDLWizardSets, "Fix incomplete source mipmaps", INIFile.INIBoolType.OnOff, "On");
+        // Procedural grass: keep grass MESHES in the library but leave their PLACEMENTS out of
+        // usage.data, because mgeBake64 --grass has already reduced them to a per-cell density
+        // field (Data Files\distantland\statics\grass.bin). Off by default until the Forge host
+        // reads that file -- with it on and the host not yet wired, a bake has no grass at all.
+        // See tasks/dl-gen-ownership.md.
+        private static INIFile.INIVariableDef iniProcGrass = new INIFile.INIVariableDef("ProcGrass", iniDLWizardSets, "Procedural grass", INIFile.INIBoolType.OnOff, "Off");
 
         // set of keys to read at form creation
         private static INIFile.INIVariableDef[] iniDLWizardVars = {
@@ -227,7 +233,8 @@ namespace MGEgui.DistantLand {
             iniActivators, 
             iniMiscObj, 
             iniUseStatOvr,
-            iniFixMips
+            iniFixMips,
+            iniProcGrass
         };
 
         // set of keys to write after plugin selection
@@ -263,7 +270,8 @@ namespace MGEgui.DistantLand {
             iniActivators, 
             iniMiscObj, 
             iniUseStatOvr,
-            iniFixMips
+            iniFixMips,
+            iniProcGrass
         };
 
         // configuration of setup steps
@@ -336,6 +344,7 @@ namespace MGEgui.DistantLand {
             cbStatIncludeMisc.Checked = (iniFile.getKeyValue("MiscObj") == 1);
             cbStatOverrideList.Checked = (iniFile.getKeyValue("UseStatOvr") == 1);
             cbStatFixMips.Checked = (iniFile.getKeyValue("FixMips") == 1);
+            cbStatProcGrass.Checked = (iniFile.getKeyValue("ProcGrass") == 1);
 
             lbStatOverrideList.Items.Clear();
             lbStatOverrideList.BeginUpdate();
@@ -398,6 +407,7 @@ namespace MGEgui.DistantLand {
             iniFile.setKey("MiscObj", cbStatIncludeMisc.Checked);
             iniFile.setKey("UseStatOvr", cbStatOverrideList.Checked);
             iniFile.setKey("FixMips", cbStatFixMips.Checked);
+            iniFile.setKey("ProcGrass", cbStatProcGrass.Checked);
 
             var tempList = new List<string>();
             foreach (OverrideListItem item in lbStatOverrideList.Items) {
@@ -582,6 +592,7 @@ namespace MGEgui.DistantLand {
             public bool Activators;
             public bool Misc;
             public bool FixMips;
+            public bool ProcGrass;
         }
 
         private void GrassDensityThreshold(float GrassDensity, KeyValuePair<string, Dictionary<string, StaticReference>> cellStatics, KeyValuePair<string, StaticReference> pair, Random rnd, List<StaticToRemove> UsedStaticsToRemove) {
@@ -749,6 +760,9 @@ namespace MGEgui.DistantLand {
             LightDefs.Clear();
             UsedLightsList.Clear();
             lightsSkippedFlagged = 0;
+            GrassObjectIds.Clear();
+            GrassModelsUsed.Clear();
+            grassRefsDiverted = 0;
 
             if (args.UseOverrideList && args.OverrideFiles.Count > 0) {
                 ParseOverrideFiles(args.OverrideFiles, overrideList, namedObjectDisables, interiorEnables, dynamicVisDataSet, staticsWarnings);
@@ -774,6 +788,39 @@ namespace MGEgui.DistantLand {
             // runs before the cell parse, so the placements copy the already-transformed values.
             ApplyLtbdMods(staticsWarnings);
             dlLtbdModded = ltbdTransformed; dlLtbdActive = ltbdActive; dlLtbdScale = ltbdScale;
+
+            // Classify grass BEFORE the cell parse. It has to happen here, not after: the whole
+            // point is that grass references never enter UsedStaticsList, and by the time the parse
+            // has finished the memory has already been spent -- 12M placements at ~190 bytes each is
+            // what exhausted the 32-bit heap in the first place.
+            // The rule mirrors mgeBake64's exactly (see mgeBake64/grassbake.cpp): a model under
+            // grass\ is grass unless an override says otherwise, and an override naming any other
+            // explicit type is the modder's opt-out for grass that must sit exactly where it was
+            // placed.
+            if (args.ProcGrass) {
+                foreach (var pair in StaticsList) {
+                    string model = pair.Value.Model;
+                    bool isGrass;
+                    StaticOverride so;
+                    if (overrideList.TryGetValue(model, out so)) {
+                        if (so.Ignore) {
+                            continue;   // dropped by the NIF pass anyway; leave it on the old path
+                        }
+                        if (so.Type == StaticType.Grass) {
+                            isGrass = true;
+                        } else if (so.Type != StaticType.Auto) {
+                            isGrass = false;    // precision placement opt-out
+                        } else {
+                            isGrass = model.StartsWith("grass\\");
+                        }
+                    } else {
+                        isGrass = model.StartsWith("grass\\");
+                    }
+                    if (isGrass) {
+                        GrassObjectIds.Add(pair.Key);
+                    }
+                }
+            }
 
             backgroundWorker.ReportProgress(1, strings["StaticsGenerate1"]);
             UsedStaticsList.Add("", new Dictionary<string, StaticReference>());
@@ -802,6 +849,18 @@ namespace MGEgui.DistantLand {
                     if (!UsedNifList.Contains(nif_name)) {
                         UsedNifList.Add(nif_name);
                     }
+                }
+            }
+            // Grass placements were diverted to the density field, so no entry in UsedStaticsList
+            // names their meshes any more -- fold them back in explicitly or static_meshes ships
+            // without a single grass mesh and the host has nothing to scatter.
+            // Sorted, not HashSet order: the library's ordinals are what nifmap.txt publishes, and a
+            // re-bake that shuffles them for no reason makes every diff between two bakes unreadable.
+            var grassModelsSorted = new List<string>(GrassModelsUsed);
+            grassModelsSorted.Sort(StringComparer.Ordinal);
+            foreach (string nif_name in grassModelsSorted) {
+                if (!UsedNifList.Contains(nif_name)) {
+                    UsedNifList.Add(nif_name);
                 }
             }
 
@@ -917,6 +976,19 @@ namespace MGEgui.DistantLand {
                 NifMap[name] = count++;
             }
 
+            // static_meshes is written in exactly this order and stores no model names, so its
+            // ordinals are only meaningful next to this list. The Forge host needs it to resolve
+            // grass.bin's mesh paths; anything else keyed by ordinal can use it too.
+            try {
+                using (var nm = new StreamWriter(File.Create(Statics.fn_nifmap), Statics.ESPEncoding)) {
+                    foreach (string name in UsedNifList) {
+                        nm.WriteLine(name);
+                    }
+                }
+            } catch (Exception ex) {
+                staticsWarnings.Add("Could not write " + Statics.fn_nifmap + "\n    " + ex.ToString());
+            }
+
             // Determine floating point grass density
             var UsedStaticsToRemove = new List<StaticToRemove>();
             float GrassDensity = (float)udStatGrassDensity.Value / 100.0f;
@@ -1008,6 +1080,9 @@ namespace MGEgui.DistantLand {
             dlLightsBaked = mainLights.Count;
             dlLightsMeshless = lightsMeshless;
             dlLightsSkipped = lightsSkippedFlagged;
+            dlProcGrass = args.ProcGrass;
+            dlGrassDiverted = grassRefsDiverted;
+            dlGrassModels = GrassModelsUsed.Count;
 
             if (!File.Exists(Statics.fn_statmesh)) {
                 return;
@@ -1103,6 +1178,7 @@ namespace MGEgui.DistantLand {
         private List<string> dlMipFixedPaths;
         private List<string> dlBsaSkippedPaths;
         private int dlLightsBaked, dlLightsMeshless, dlLightsSkipped;
+        private long dlGrassDiverted; private int dlGrassModels; private bool dlProcGrass;
         private int dlLtbdModded; private bool dlLtbdActive; private float dlLtbdScale;
 
         void workerFCreateStatics(object sender, System.ComponentModel.RunWorkerCompletedEventArgs e) {
@@ -1180,6 +1256,13 @@ namespace MGEgui.DistantLand {
             summary += "\r\n\r\nDistant statics textures: " + dlSliced + " sliced, " + dlResampled + " resampled, " + dlMagenta + " magenta (non-DDS), " + dlMipFixed + " mip-fixed"
                      + "\r\nDistant textures stage: " + dlStaticsTexMs + " ms";
             summary += "\r\nBaked distant lights: " + dlLightsBaked + " (" + dlLightsMeshless + " meshless, " + dlLightsSkipped + " skipped negative/off-by-default)";
+            if (dlProcGrass) {
+                // This count must equal mgeBake64 --grass's blade total for the same plugin list;
+                // if it does not, the two halves disagree about what grass is and the field will
+                // not line up with the library.
+                summary += "\r\nProcedural grass: " + dlGrassDiverted + " placements diverted to grass.bin, "
+                         + dlGrassModels + " meshes kept in the library";
+            }
             if (dlLtbdActive) {
                 summary += "\r\nLetThereBeDarkness: " + dlLtbdModded + " light types adjusted (radius scale " + dlLtbdScale + "%)";
             }
@@ -1332,7 +1415,7 @@ namespace MGEgui.DistantLand {
             + ": To use a ':' (colon) character as a part of object edid, and not a comment, you must precede it by '\\'. Then to use also a '\\' character in edid, you must precede it by another '\\' (this only applies to other than main sections)\r\n"
             + "\r\n"
             + ": NOTE: This file needs UTF-8 character encoding for non-ASCII characters that can be used in name of file or entity or interior\r\n"
-            + ": If you don't see here '«»' something like '<<>>' then your text editor's current character encoding is not set to UTF-8\r\n");
+            + ": If you don't see here 'ï¿½ï¿½' something like '<<>>' then your text editor's current character encoding is not set to UTF-8\r\n");
             sw.Write(": This list was generated with 'min. static size' = ");
             sw.WriteLine(args.MinSize);
             sw.WriteLine();
@@ -1919,6 +2002,17 @@ namespace MGEgui.DistantLand {
         private int lightsSkippedFlagged = 0;
         private readonly Dictionary<string, bool> DisableScripts = new Dictionary<string, bool>();
 
+        /* Procedural grass (tasks/dl-gen-ownership.md).
+           Object ids whose placements are NOT stored in usage.data because mgeBake64 --grass has
+           already reduced them to a per-cell density field. Their MESHES still have to reach
+           static_meshes, so the models they use are collected here and folded into UsedNifList --
+           without that the library would lose every grass mesh and the host would have nothing to
+           scatter. Populated only when the wizard's "Procedural grass" box is ticked; empty
+           otherwise, so the old path is untouched byte for byte. */
+        private readonly HashSet<string> GrassObjectIds = new HashSet<string>();
+        private readonly HashSet<string> GrassModelsUsed = new HashSet<string>();
+        private long grassRefsDiverted = 0;
+
         /* Statics tab definitions */
 
         public enum StaticType {
@@ -2402,7 +2496,19 @@ namespace MGEgui.DistantLand {
 
         private void bStatRun_Click(object sender, EventArgs e) {
             if (StaticsExist) {
-                Directory.Delete(Statics.fn_statics, true);
+                // âš  Everything in this folder is ours EXCEPT grass.bin, which mgeBake64 --grass
+                // writes. A recursive delete took it with it, and the failure was silent: the bake
+                // succeeds, the host logs "grass.bin missing", and the world simply has no grass.
+                string keep = Path.GetFullPath(Statics.fn_grassbin);
+                foreach (string f in Directory.GetFiles(Statics.fn_statics)) {
+                    if (String.Equals(Path.GetFullPath(f), keep, StringComparison.OrdinalIgnoreCase)) {
+                        continue;
+                    }
+                    File.Delete(f);
+                }
+                foreach (string d in Directory.GetDirectories(Statics.fn_statics)) {
+                    Directory.Delete(d, true);
+                }
             }
             ushort temp = (ushort)udStatMinSize.Value;
             var csa = new CreateStaticsArgs();
@@ -2414,6 +2520,7 @@ namespace MGEgui.DistantLand {
             csa.Misc = cbStatIncludeMisc.Checked;
             csa.UseOverrideList = cbStatOverrideList.Checked;
             csa.FixMips = cbStatFixMips.Checked;
+            csa.ProcGrass = cbStatProcGrass.Checked;
             csa.OverrideFiles = new List<string>();
             csa.OverrideFiles.Add(Statics.fn_dlDefaultOverride);
             foreach (OverrideListItem item in lbStatOverrideList.Items) {
@@ -2744,7 +2851,15 @@ namespace MGEgui.DistantLand {
                                         AddLightReference(sr, referenceDeleted, isInterior, cellName, cellX, cellY, masters, mastID, refID, namedObjectDisables);
                                         Static stat;
                                         StaticsList.TryGetValue(sr.Name, out stat);
-                                        if (stat != null && (stat.VisIndex > 0 || !namedObjectDisables.ContainsKey(sr.Name) || !namedObjectDisables[sr.Name])) {
+                                        // Procedural grass: record the mesh, drop the placement. Exteriors only --
+                                        // mgeBake64 --grass bakes exterior cells, so interior grass must stay on the
+                                        // placement path or it would be lost by both halves.
+                                        bool divertGrass = !isInterior && GrassObjectIds.Count > 0 && GrassObjectIds.Contains(sr.Name);
+                                        if (divertGrass && stat != null && !referenceDeleted) {
+                                            GrassModelsUsed.Add(stat.Model);
+                                            ++grassRefsDiverted;
+                                        }
+                                        if (!divertGrass && stat != null && (stat.VisIndex > 0 || !namedObjectDisables.ContainsKey(sr.Name) || !namedObjectDisables[sr.Name])) {
                                             sr.SetID(stat, StaticMap);
                                             string worldspace = isInterior ? cellName : "";
                                             string referenceFullyQualified = masters[mastID] + "\u0001" + (isInterior ? "" : cellX + "\u0002" + cellY + "\u0001") + refID;
@@ -2805,7 +2920,13 @@ namespace MGEgui.DistantLand {
                             AddLightReference(sr, referenceDeleted, isInterior, cellName, cellX, cellY, masters, mastID, refID, namedObjectDisables);
                             Static stat;
                             StaticsList.TryGetValue(sr.Name, out stat);
-                            if (stat != null && (stat.VisIndex > 0 || !namedObjectDisables.ContainsKey(sr.Name) || !namedObjectDisables[sr.Name])) {
+                            // Procedural grass -- see the matching diversion in the FRMR case above.
+                            bool divertGrass = !isInterior && GrassObjectIds.Count > 0 && GrassObjectIds.Contains(sr.Name);
+                            if (divertGrass && stat != null && !referenceDeleted) {
+                                GrassModelsUsed.Add(stat.Model);
+                                ++grassRefsDiverted;
+                            }
+                            if (!divertGrass && stat != null && (stat.VisIndex > 0 || !namedObjectDisables.ContainsKey(sr.Name) || !namedObjectDisables[sr.Name])) {
                                 sr.SetID(stat, StaticMap);
                                 string worldspace = isInterior ? cellName : "";
                                 string referenceFullyQualified = masters[mastID] + "\u0001" + (isInterior ? "" : cellX + "\u0002" + cellY + "\u0001") + refID;
@@ -2970,8 +3091,8 @@ namespace MGEgui.DistantLand {
         /* Finish tab methods */
 
         private void setFinishDesc(int stage) {
-            const string spc = "   ";
-            const string mark = "» ";
+            const string spc = "ï¿½ï¿½ï¿½";
+            const string mark = "ï¿½ï¿½";
             var text = new StringBuilder();
 
             if (SetupFlags["ChkLandTex"]) {

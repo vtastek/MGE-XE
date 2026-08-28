@@ -75,3 +75,38 @@ uint a2cCoverageMask(float alpha, float alphaRef)
     if (n >= (uint)(samples))   { return ~0u; }
     return (1u << n) - 1u;
 }
+
+// Same mask, with an extra COVERAGE scale in [0,1] — the G1 grass distance fade.
+//
+// WHY THE FADE MULTIPLIES THE COVERAGE AND NOT THE ALPHA. Scaling alpha before the test moves the
+// contour to alpha == ref/scale, which erodes the blade inward from wherever its alpha ramp happens
+// to be. Grass alpha is very nearly binary (a leaf mask is 0 or 255 over most of its area), so that
+// erodes almost nothing and then drops the whole blade at once when scale falls below ref — MGE's
+// hard pop, moved a few metres. Scaling the COVERAGE instead thins the sample MASK: the blade keeps
+// its shape and loses samples, which under MSAA reads as it becoming sparse and then gone. That is
+// what a receding grass field is supposed to do.
+//
+// ⚠ THE ORIGINAL ABOVE IS LEFT BYTE-IDENTICAL ON PURPOSE, rather than being expressed as a call to
+// this one with scale = 1. Its callers (statics.frag, depthonly.frag, the shadow frags) are on the
+// "grass off must be bit-identical to today" check, which is verified by diffing their DXIL — and a
+// refactor that is only *provably* equivalent after DXC's constant folding turns a one-look proof
+// into an argument. Two short bodies is the cheaper price.
+uint a2cCoverageMaskFaded(float alpha, float alphaRef, float coverScale)
+{
+    float aw = fwidth(alpha);   // unconditionally, before any branch (see above)
+
+    float samples = A2C_SAMPLES;
+    if (samples < 1.5f || alphaRef <= 0.0f)
+    {
+        // No MSAA to spend on the fade: it degrades to the binary test plus a hard cut where the
+        // scale reaches zero. Still monotone, still no crawl — just not antialiased.
+        return (alpha < alphaRef || coverScale <= 0.0f) ? 0u : ~0u;
+    }
+
+    float cov = saturate((alpha - alphaRef) / max(aw, 1.0e-5f) + 0.5f) * saturate(coverScale);
+
+    uint n = (uint)(cov * samples + 0.5f);
+    if (n == 0u)                { return 0u; }
+    if (n >= (uint)(samples))   { return ~0u; }
+    return (1u << n) - 1u;
+}

@@ -281,6 +281,20 @@
 #include "statics_add.frag.fsl"
 #end
 
+// G1 host-owned GRASS. Same resident library, vertex format and instance-stream shape as the distant
+// statics above (grass IS a distant-static type in the bake) — what differs is the CULL LANE feeding
+// it and these two stages: four-harmonic wind displacement in the vert, two-sided sun + ambient with
+// backscatter, and a distance fade spent on the A2C coverage. grass.vert's VSOutput is statics.vert's
+// field for field, which is what lets the sun-caster pass pair it with sunshadow_statics.frag above
+// and get a shadow carrying the identical displacement. See tasks/forge-grass.md.
+#vert grass.vert
+#include "grass.vert.fsl"
+#end
+
+#frag grass.frag
+#include "grass.frag.fsl"
+#end
+
 // Forge water takeover (WT1): host-generated geo-clipmap water. Position-only verts + per-instance
 // clipmap level; reuses opaque.srt.h / DefaultRootSignature (worlds+params ride gBatch, 4 water SRVs
 // appended to the PerFrame set). Depth-write reverse-Z GEQUAL, cull NONE, frag outputs alpha=1.

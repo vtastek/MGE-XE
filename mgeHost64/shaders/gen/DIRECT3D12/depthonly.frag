@@ -1156,7 +1156,25 @@ STRUCT(ShadowMaskParams)
     float4 waterCut;
 #line 617 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
     float4 waterCausticProj;
-#line 618
+#line 635 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
+    float4 grassParams;
+#line 651 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
+    float4 grassParams2;
+#line 664 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
+    float4 grassParams3;
+#line 677 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
+    float4 grassParams4;
+
+
+
+
+
+
+
+
+
+    float4 grassParams5;
+#line 688
 };
 #line 21 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
 #line 27 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
@@ -1573,6 +1591,26 @@ uint a2cCoverageMask(float alpha, float alphaRef)
 
 
 
+
+    uint n = (uint)(cov * samples + 0.5f);
+    if (n == 0u) { return 0u; }
+    if (n >= (uint)(samples)) { return ~0u; }
+    return (1u << n) - 1u;
+}
+#line 94 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/a2c.h.fsl"
+uint a2cCoverageMaskFaded(float alpha, float alphaRef, float coverScale)
+{
+    float aw = fwidth(alpha);
+
+    float samples =  (gFrameData.alphaShadowParams.w) ;
+    if (samples < 1.5f || alphaRef <= 0.0f)
+    {
+
+
+        return (alpha < alphaRef || coverScale <= 0.0f) ? 0u : ~0u;
+    }
+
+    float cov = saturate((alpha - alphaRef) / max(aw, 1.0e-5f) + 0.5f) * saturate(coverScale);
 
     uint n = (uint)(cov * samples + 0.5f);
     if (n == 0u) { return 0u; }

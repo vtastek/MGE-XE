@@ -1,0 +1,169 @@
+#ifndef POINT_LIGHTS_H
+#define POINT_LIGHTS_H
+
+// Clustered forward POINT-LIGHT diffuse, factored out of statics.frag so a fourth surface does not
+// mean a fourth transcription of it.
+//
+// ⚠ statics.frag AND distantland.frag STILL CARRY THEIR OWN INLINE COPIES of this body, and that is
+// deliberate rather than an oversight: both are covered by bit-identity proofs against their shipped
+// DXIL, so migrating them is a change that has to be re-proven, not a tidy-up. This header is the one
+// definition NEW callers use; the old two should move onto it the next time either is touched for
+// another reason. If you edit the maths here, edit it in all three.
+//
+// The froxel gate is the same one distantland.frag uses: loop only this fragment's froxel when
+// clustering is active (froxelDims.x > 0), otherwise walk the brute gLights set with synthesised
+// full-word bitmasks so the two paths agree bit for bit. Slice metric = length(worldPosRel), matching
+// froxelassign.comp.
+//
+// ⚠ WHY THIS IS AFFORDABLE ON GRASS WHEN PCSS WAS NOT. Both are per-fragment work on a pass that
+// cannot early-reject an occluded fragment, so both are paid once per overdrawn layer — but the
+// resemblance stops there. PCSS costs its ~28 taps on EVERY fragment in the frame, which is how it
+// reached 76% of the grass draw. This loop costs approximately nothing where the froxel is empty,
+// which in a daylit exterior is nearly every pixel, and is paid only where a light actually is —
+// exactly where the result is wanted. The case that CAN make it expensive is a lantern-lit night
+// exterior, where clusters are populated and grass overdraw multiplies the iteration count. Measure
+// there, not at midday. [[feedback_expensive_filter_on_a_receiver_that_cannot_show_it]]
+//
+// worldPosRel = camera-relative fragment position (what every Forge frag interpolates).
+// N           = the world normal to light against, already normalized. Foliage callers should pass
+//               the FACING normal (flipped toward the eye), or a blade lights from one side only.
+// screenXY    = SV_Position.xy, for the froxel tile lookup.
+// Returns the summed diffuse; the caller multiplies by its own albedo.
+float3 evalPointLightDiffuse(float3 worldPosRel, float3 N, float2 screenXY)
+{
+    uint   nL     = (uint)gLights.lightParams.x;
+    float  reachK = gLights.lightParams.y;
+    float3 pointDiffuse = float3(0.0f, 0.0f, 0.0f);
+    int    tilesX = (int)gFrameData.froxelDims.x;
+    bool   clustered = (tilesX > 0);
+    uint   base = 0u;
+    if (clustered)
+    {
+        int   tilesY = (int)gFrameData.froxelDims.y;
+        int   NZ     = (int)gFrameData.froxelDims.z;
+        float tile   = gFrameData.froxelDims.w;
+        int tx = clamp((int)(screenXY.x / tile), 0, tilesX - 1);
+        int ty = clamp((int)(screenXY.y / tile), 0, tilesY - 1);
+        float dd = length(worldPosRel);
+        int zs = clamp((int)((log(max(dd, 1.0f)) - gFrameData.froxelZ.x) * gFrameData.froxelZ.y * (float)NZ), 0, NZ - 1);
+        base = (((uint)ty * (uint)tilesX + (uint)tx) * (uint)NZ + (uint)zs) * 4u;
+    }
+    for (uint wi = 0u; wi < 4u; ++wi)
+    {
+        uint bits;
+        if (clustered) {
+            bits = gFroxelMask[base + wi];
+        } else {
+            uint lo = wi * 32u;
+            uint cnt = (lo >= nL) ? 0u : min(32u, nL - lo);
+            bits = (cnt >= 32u) ? 0xFFFFFFFFu : ((1u << cnt) - 1u);
+        }
+        while (bits != 0u)
+        {
+            uint i = wi * 32u + firstbitlow(bits);
+            bits = bits & (bits - 1u);
+            if (i >= nL) { continue; }
+            float4 posR = gLights.lights[i * 3u + 0u];
+            float3 lcol = gLights.lights[i * 3u + 1u].rgb;
+            float3 fo   = gLights.lights[i * 3u + 2u].xyz;   // k0, k1, k2
+            float  reach = posR.w * reachK;
+            float3 toL  = posR.xyz - worldPosRel;
+            float  d2   = dot(toL, toL);
+            if (d2 >= reach * reach) { continue; }
+            float invD = rsqrt(max(d2, 1e-8f));
+            float d    = d2 * invD;
+            float att  = 1.0f / max(fo.z * d2 + fo.y * d + fo.x, 1e-4f);
+            att *= 1.0f - smoothstep(POINT_LIGHT_TAIL * reach, reach, d);
+            float lambert = saturate(dot(N, toL) * invD);
+            pointDiffuse += lambert * att * lcol;
+        }
+    }
+    return pointDiffuse;
+}
+
+// NEAR + DISTANT, picked per fragment. THIS is what a host-owned surface in the near field needs,
+// and reading only the distant list is a specific, already-diagnosed bug rather than a shortfall.
+//
+// ⚠ THE NEAR/FAR DEDUP DELIBERATELY DELETES THE LIGHTS NEAREST THE CAMERA FROM THE DISTANT LIST.
+// Phase E drops any baked light whose whole reach sphere lies inside gFrameData.lodParams.x of the
+// eye, on the assumption that near geometry owns those pixels. Terrain hit this exactly: "the ground
+// went dark under every lamp in town while the same lamp lit it fine from a distance" (terrain.frag).
+// Grass is in the identical position — it draws from the player's feet outward and has no near path
+// — so a distant-only loop is silent precisely where a lantern, a campfire or a carried torch is,
+// which is the only place anyone would look for the effect. The near list is also the ONLY one
+// carrying DYNAMIC lights at all: a torch, a spell, a lamp on a walking NPC.
+//
+// A PICK, NOT A SUM. Past the handoff the two lists overlap — MW streams every active-cell light,
+// while the dedup drops only those lying WHOLLY inside the ball — so adding them would double-light
+// every lamp in the band. The boundary is the dedup's OWN radius and therefore seamless by
+// construction: a light dropped from the distant list had its entire reach inside the ball, so it
+// cannot reach any fragment on the far side, and both lists agree AT the boundary.
+//
+// ⚠ NO PER-LIGHT SHADOW MASK ON THE NEAR ARM, and that is a hard constraint, not a saving.
+// terrain.frag reads gShadowMask here and says why it may: "only legal because terrain now writes the
+// Z-prepass — before that these pixels sat at the far plane and the mask was meaningless." Grass does
+// NOT write the prepass, so at a grass pixel that mask describes whatever stands BEHIND the grass.
+// Reading it would make blades flicker between lit and shadowed along every silhouette they cross.
+// The cost of leaving it out is real and worth stating: a lamp behind a wall will spill onto grass in
+// front of it. Fixing that properly means the prepass entry (tasks/forge-grass.md G5c), not a mask
+// read here.
+float3 evalPointLightNearFar(float3 worldPosRel, float3 N, float2 screenXY)
+{
+    if (length(worldPosRel) >= gFrameData.lodParams.x)
+    {
+        return evalPointLightDiffuse(worldPosRel, N, screenXY);
+    }
+
+    // NEAR live lights, clustered through the NEAR grid (froxelDimsNear + gFroxelMaskNear), which is
+    // where froxelassign.comp bins them. Same body as the distant arm above; the buffers differ.
+    uint   nL     = (uint)gLightsNear.lightParams.x;
+    float  reachK = gLightsNear.lightParams.y;
+    float3 pointDiffuse = float3(0.0f, 0.0f, 0.0f);
+    int    tilesX = (int)gLightsNear.froxelDimsNear.x;
+    bool   clustered = (tilesX > 0);
+    uint   base = 0u;
+    if (clustered)
+    {
+        int   tilesY = (int)gLightsNear.froxelDimsNear.y;
+        int   NZ     = (int)gLightsNear.froxelDimsNear.z;
+        float tile   = gLightsNear.froxelDimsNear.w;
+        int tx = clamp((int)(screenXY.x / tile), 0, tilesX - 1);
+        int ty = clamp((int)(screenXY.y / tile), 0, tilesY - 1);
+        float dd = length(worldPosRel);
+        int zs = clamp((int)((log(max(dd, 1.0f)) - gLightsNear.froxelZNear.x) * gLightsNear.froxelZNear.y * (float)NZ), 0, NZ - 1);
+        base = (((uint)ty * (uint)tilesX + (uint)tx) * (uint)NZ + (uint)zs) * 4u;
+    }
+    for (uint wi = 0u; wi < 4u; ++wi)
+    {
+        uint bits;
+        if (clustered) {
+            bits = gFroxelMaskNear[base + wi];
+        } else {
+            uint lo = wi * 32u;
+            uint cnt = (lo >= nL) ? 0u : min(32u, nL - lo);
+            bits = (cnt >= 32u) ? 0xFFFFFFFFu : ((1u << cnt) - 1u);
+        }
+        while (bits != 0u)
+        {
+            uint i = wi * 32u + firstbitlow(bits);
+            bits = bits & (bits - 1u);
+            if (i >= nL) { continue; }
+            float4 posR = gLightsNear.lights[i * 3u + 0u];
+            float3 lcol = gLightsNear.lights[i * 3u + 1u].rgb;
+            float4 fo   = gLightsNear.lights[i * 3u + 2u];   // xyz = k0,k1,k2 ; w = shadow slot+1
+            float  reach = posR.w * reachK;
+            float3 toL  = posR.xyz - worldPosRel;
+            float  d2   = dot(toL, toL);
+            if (d2 >= reach * reach) { continue; }
+            float invD = rsqrt(max(d2, 1e-8f));
+            float d    = d2 * invD;
+            float att  = 1.0f / max(fo.z * d2 + fo.y * d + fo.x, 1e-4f);
+            att *= 1.0f - smoothstep(POINT_LIGHT_TAIL * reach, reach, d);
+            float lambert = saturate(dot(N, toL) * invD);
+            pointDiffuse += lambert * att * lcol;
+        }
+    }
+    return pointDiffuse;
+}
+
+#endif // POINT_LIGHTS_H

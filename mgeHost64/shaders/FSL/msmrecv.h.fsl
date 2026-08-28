@@ -357,10 +357,23 @@ float sunShadowVolumetric(float3 p)
 // usually forgives a filter. It did not survive looking at it: a coarser cascade does not soften the
 // blockiness, it just draws the same axis-aligned iso-contours on an 8-unit world grid instead of a
 // 2-unit one, so the artefact scaled up with the texels rather than fading out.
+//
+// ⚠ `cheap` FORCES THE ONE-TAP PATH FOR A RECEIVER THAT CANNOT SHOW A PENUMBRA. The paragraph above
+// is about HARD SURFACES, and it stands for them. It does not transfer to grass: PCSS exists to give
+// a contact-hardening gradient across a surface, and a grass blade is two pixels wide and stochastic
+// — there is nothing for that gradient to land on. What a blade needs from the receiver is one bit,
+// "is this clump in shade", which one bilinear moment tap answers. Spending the frame's most
+// expensive filter on the surface least able to display it is what made the grass pass 4x its own
+// weight (measured: 4.63 ms -> 1.11 ms with the receiver removed entirely).
+float sunCascadeShadowMode(int c, float3 p, float3 worldPosRel, float zBias, float slopeBias, int cheap)
+{
+    if (cheap == 0 && gShadowParams.sunPcf1.z > 0.5f) { return sunPcssOcclusion(c, p, worldPosRel, slopeBias); }
+    return sunCascadeOcclusion(c, p, zBias);
+}
+
 float sunCascadeShadow(int c, float3 p, float3 worldPosRel, float zBias, float slopeBias)
 {
-    if (gShadowParams.sunPcf1.z > 0.5f) { return sunPcssOcclusion(c, p, worldPosRel, slopeBias); }
-    return sunCascadeOcclusion(c, p, zBias);
+    return sunCascadeShadowMode(c, p, worldPosRel, zBias, slopeBias, 0);
 }
 
 // THE receiver entry point. worldPosRel = the fragment's CAMERA-RELATIVE world position (what every
@@ -373,7 +386,12 @@ float sunCascadeShadow(int c, float3 p, float3 worldPosRel, float zBias, float s
 //
 // Everything early-outs to 1.0 (fully lit, zero cost beyond the branch) when the feature is off — so
 // a fragment no source covers is never darkened.
-float sunShadowVisibility(float3 worldPosRel, float3 N)
+// `cheap` != 0 forces the one-tap cascade evaluator (see sunCascadeShadowMode). Everything else
+// — cascade select, normal offset, hand-off band, bleed reduction, the long-range map — is
+// SHARED, which is the point of routing it through here rather than giving grass its own copy:
+// two receivers that disagree about where a shadow ends put a seam between the grass and the
+// ground it grows out of.
+float sunShadowVisibilityMode(float3 worldPosRel, float3 N, int cheap)
 {
     float strength = gShadowParams.sunParams.x;
     if (strength <= 0.0f) { return 1.0f; }
@@ -416,8 +434,8 @@ float sunShadowVisibility(float3 worldPosRel, float3 N)
     float  NdotL     = saturate(dot(N, -gFrameData.sunDir.xyz));
     float  slopeBias = gShadowParams.sunPcf1.y * min(sqrt(1.0f - NdotL * NdotL) / max(NdotL, 0.1f), 10.0f);
 
-    float occlusion = sunCascadeShadow(sel, worldPosRel + N * (noff * texel[sel]), worldPosRel,
-                                       bias, slopeBias);
+    float occlusion = sunCascadeShadowMode(sel, worldPosRel + N * (noff * texel[sel]), worldPosRel,
+                                           bias, slopeBias, cheap);
 
     // Hand-off band. Inside it, cross-fade into the next (coarser) cascade — or, for the OUTERMOST
     // cascade, into the long-range map, which is literally what lies beyond it. That last case used
@@ -429,8 +447,8 @@ float sunShadowVisibility(float3 worldPosRel, float3 N)
     bool  toMap = (sel + 1 >= SUN_CASCADES);
     if (t > 0.0f && !toMap)
     {
-        float occNext = sunCascadeShadow(sel + 1, worldPosRel + N * (noff * texel[sel + 1]),
-                                         worldPosRel, bias, slopeBias);
+        float occNext = sunCascadeShadowMode(sel + 1, worldPosRel + N * (noff * texel[sel + 1]),
+                                             worldPosRel, bias, slopeBias, cheap);
         occlusion = lerp(occlusion, occNext, t);
     }
 
@@ -453,6 +471,13 @@ float sunShadowVisibility(float3 worldPosRel, float3 N)
     if (t > 0.0f && toMap) { occlusion = lerp(occlusion, mapOcc, t); }
 
     return 1.0f - occlusion * strength;
+}
+
+// THE receiver entry point every hard surface calls — unchanged behaviour, and the only reason it is
+// a wrapper is so grass can pick the cheap evaluator without any other frag's signature moving.
+float sunShadowVisibility(float3 worldPosRel, float3 N)
+{
+    return sunShadowVisibilityMode(worldPosRel, N, 0);
 }
 
 #endif // MSM_RECV_H

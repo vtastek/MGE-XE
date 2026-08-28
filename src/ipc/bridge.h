@@ -349,8 +349,16 @@ namespace IPC {
         // which drives the UV scroll of UV-animated distant statics (ghostfence). It must be MW's sim
         // clock, not the host's: sim time does not advance in menus, and it is the exact value MGE's
         // DX9 path feeds its `time` shader uniform (distantland.cpp SetFloat(ehTime, simulationTime())),
-        // so both renderers scroll in step under an F11 A/B. 36 floats total.
-        IN float lighting[36];
+        // so both renderers scroll in step under an F11 A/B.
+        // G1 appends a 10th float4: [36..37] = MW's WIND VECTOR, EWMA-smoothed client-side, for the
+        // host grass lane's four wind harmonics (gShadowParams.grassParams.xy). [18] used to carry
+        // sqrt(x²+y²) of the same smoothed pair for the flame flicker and now ships 0 — the host
+        // derives the magnitude from this vector instead, so there is exactly one wind on the wire
+        // and the flicker and the grass can never disagree about it. [38..39] spare. 40 floats total.
+        // ⚠ Growing this array MOVES EVERY FIELD BELOW IT, and there is no version or size assert on
+        // this struct (see waterParams below). mgecore.dll and mgeHost64.exe ship — and must be
+        // DEPLOYED — together.
+        IN float lighting[40];
         IN VecId drawList;               // chunked byte vec of DrawItemWire[]; Invalid ⇒ triangle
         IN std::uint32_t drawCount;
         IN std::uint32_t drawBytes;

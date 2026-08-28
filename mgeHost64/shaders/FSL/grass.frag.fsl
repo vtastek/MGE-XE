@@ -1,0 +1,150 @@
+// mgeHost64 — G1 host-owned GRASS (fragment stage).
+//
+// Pairs with grass.vert (whose VSOutput is statics.vert's, field for field — see the note there).
+// The lit colour arrives per-vertex, split into an ambient half (Color.rgb) and a shadowable sun
+// half (SunLight), exactly as the distant statics do; this stage samples the cutout, builds the A2C
+// coverage, applies the MSM sun visibility to the sun half only, and fogs.
+//
+// ⚠ THIS PASS WRITES ITS OWN SV_Coverage. Like statics.frag and unlike opaque.frag, grass has no
+// Z-prepass entry to inherit a mask from through CMP_EQUAL, so the mask is produced here.
+//
+// Port of XE Mod Grass.fx::GrassPS. Divergences, all deliberate:
+//   * ONE alpha reference (grassParams2.z, 128/255) instead of MGE's discard-at-64 + coverage-at-128
+//     pair — see shadowparams.h.fsl for why the fwidth-normalised ramp makes the second one moot.
+//   * the host's fog and sky ambient rather than MGE's fogApply/sunAmb.
+//   * a distance FADE spent on the coverage, where MGE cut at a hard plane.
+//   * point lights ARE looped (G5c), which G1 deferred. The break it fixes is plain once you look
+//     for it: a campfire or lantern on a grassy verge lit the ground and left the grass black, which
+//     reads as the grass not belonging to the scene. Affordable for a reason that does NOT
+//     generalise to every per-fragment cost on this pass — see pointlights.h.fsl, and see the sun
+//     receiver below for the one that was not affordable.
+
+#include "opaque.srt.h"
+#include "a2c.h.fsl"        // a2cCoverageMaskFaded() — SHARED cutout coverage, plus the G1 fade
+#include "msmrecv.h.fsl"    // sunShadowVisibility() — MSM sun-shadow receiver
+#include "tonemap.h.fsl"    // tonemap() — the shared semi-HDR curve
+#include "linearize.h.fsl"  // srgbToLinear() — the scene's transfer function
+#include "scenecolor.h.fsl" // tonemapInPass() — class 1: the curve moved to resolve.frag
+#include "skydome.h.fsl"    // applyFog() — extinguish into a silhouette, then melt into the sky
+#include "pointlights.h.fsl" // evalPointLightNearFar() — SHARED clustered froxel loop, both lists
+
+// MUST stay byte-identical to grass.vert.fsl's VSOutput (== statics.vert's).
+STRUCT(VSOutput)
+{
+    DATA(float4,           Position, SV_Position);
+    DATA(float2,           Uv,       TEXCOORD0);
+    DATA(CENTROID(float4), Color,    COLOR);       // rgb = ambient, a = distance fade
+    DATA(CENTROID(float),  Fog,      TEXCOORD1);
+    DATA(FLAT(uint),       TexIndex, TEXCOORD2);
+    DATA(FLAT(uint),       Flags,    TEXCOORD3);
+    DATA(float3,           WorldPos, TEXCOORD4);
+    DATA(float3,           WorldNormal, TEXCOORD5);
+    DATA(CENTROID(float3), SunLight, TEXCOORD6);
+};
+
+STRUCT(PSOut)
+{
+    DATA(float4, Color,    SV_Target0);
+    DATA(uint,   Coverage, SV_Coverage);
+};
+
+ROOT_SIGNATURE(DefaultRootSignature)
+PSOut PS_MAIN( VSOutput In )
+{
+    INIT_MAIN;
+    uint bucket = In.TexIndex >> 16;
+    uint layer  = In.TexIndex & 0xFFFFu;
+    float3 uvw  = float3(In.Uv, (float)layer);
+
+    // ⚠ AF IS CAPPED AT 2x FOR GRASS, UNCONDITIONALLY — this is not the shared "alpha draws at 2x"
+    // toggle (gFrameData.alphaParams.y), which grass used to branch on and no longer does.
+    //
+    // Three reasons it is a cap rather than an option, and the third is the one that changed:
+    //   1. Grass gains the least of anything in the frame from 8x anisotropy. AF buys sharpness on a
+    //      surface whose UV footprint is ELONGATED — a ground plane at a grazing angle. A grass card
+    //      is a vertical quad facing roughly toward a standing eye, so its footprint is close to
+    //      isotropic and the extra taps resolve detail that sits below the alpha test's threshold
+    //      anyway.
+    //   2. It is the single most fetch-heavy surface in the frame: a two-sided cutout, several
+    //      overdrawn layers deep at every pixel, and (like the shadow receiver above) on a pass that
+    //      cannot early-reject an occluded fragment. Every tap is paid per layer.
+    //   3. G4 raised the grass texture cap from 512 to 2048, which multiplied the resident grass set
+    //      by 16x in texels (~4 MB -> 64 MB). Sharper source art makes an 8x AF footprint traverse a
+    //      much larger working set, so the sampling cost went UP exactly when the texture budget did.
+    //      Capping AF is what keeps that resolution affordable.
+    //
+    // Dropping the branch also drops a per-frame uniform branch, which is not free even when every
+    // lane agrees on it ([[project_uniform_branch_is_not_free]]). Statics textures are all sampled
+    // WRAP (the LOD bake has no per-map clamp mode), so WrapWrap is the only variant grass needs.
+    float4 tex = SampleTex2DArray(gStaticsArrays[bucket], gSampler2xWrapWrap, uvw);
+
+    // ⚠ BEFORE ANY DISCARD: a2cCoverageMaskFaded takes a derivative, which needs the whole 2x2 quad
+    // intact. Color.a is the vertex-stage distance fade; it thins the sample mask rather than
+    // dimming the colour, so a receding field goes sparse instead of hazy.
+    uint cov = a2cCoverageMaskFaded(tex.a, gShadowParams.grassParams2.z, In.Color.a);
+    if (cov == 0u) { discard; }
+
+    // The sun half only. Ambient is never shadowed, which is what keeps a shaded blade sitting in
+    // sky light instead of going black; vis == 1 reproduces the unsplit colour exactly.
+    //
+    // ⚠ THIS IS THE MOST EXPENSIVE LINE IN THE GRASS PASS AND IT RUNS ON EVERY OVERDRAWN FRAGMENT.
+    // sunShadowVisibility is PCSS: 12 blocker taps, and 16 more of PCF wherever a blocker is found.
+    // The pass cannot reject an occluded fragment before the shader, because this stage exports
+    // SV_Coverage AND discards — so the hardware must run the shader to know the fragment's coverage,
+    // and grass in a dense field is several layers deep at every pixel. Multiplying ~28 taps by that
+    // depth is where the measured cost lives.
+    //
+    // So grass takes the ONE-TAP evaluator (mode 1) rather than PCSS. That is not a downgrade it has
+    // to live with: PCSS buys a contact-hardening penumbra GRADIENT, and a blade two pixels wide has
+    // nowhere to put one — what grass needs from the receiver is "is this clump in shade", which one
+    // bilinear moment tap answers. Cascade select, normal offset, hand-off band and the long-range
+    // map are all still the shared ones, so grass and the ground it grows out of agree about where a
+    // shadow ends. Mode 2 restores the full PCSS receiver for the A/B; 0 removes it entirely.
+    //
+    // The gate is a per-frame UNIFORM branch, which is not free in general
+    // ([[project_uniform_branch_is_not_free]] — a branch every lane agrees on still costs the fetch
+    // setup) but is unambiguously worth it around a 28-tap block. 1 = lit, which is exactly what an
+    // unshadowed grass.frag computed before the receiver existed.
+    // The FACING normal grass.vert flipped toward the eye. Hoisted above both consumers: the shadow
+    // receiver and the point-light loop want the same one, and a blade lit from a single side goes
+    // black the moment you walk around the clump.
+    float3 nFace  = normalize(In.WorldNormal);
+
+    float  sunVis = 1.0f;
+    uint   smode  = (uint)(gShadowParams.grassParams4.z + 0.5f);
+    if (smode > 0u) {
+        sunVis = sunShadowVisibilityMode(In.WorldPos, nFace, (smode == 1u) ? 1 : 0);
+    }
+    float3 result = tex.rgb * (In.Color.rgb + In.SunLight * sunVis);
+
+    // Point lights, off the same camera-relative sets every other host surface reads.
+    //
+    // ⚠ NOT modulated by the root-AO term grass.vert applies to ambient. A campfire sits ON the
+    // ground, so the base of the sward is exactly where it is brightest; an occlusion term there
+    // would be backwards. See the note in grass.vert.
+    // ⚠ NEAR **AND** DISTANT, picked per fragment. A distant-only loop is silent exactly where the
+    // lights people notice are: the near/far dedup deletes any baked light whose whole reach lies
+    // within lodParams.x of the eye from the distant list, and the near list is the only one carrying
+    // dynamic lights at all. Grass draws from the player's feet outward, so distant-only meant "no
+    // point lights on grass" in every case anyone would test. Terrain hit the identical bug.
+    if (gShadowParams.grassParams5.z > 0.5f) {
+        result += tex.rgb * evalPointLightNearFar(In.WorldPos, nFace, In.Position.xy);
+    }
+
+    result = tonemapInPass(result);
+    result = applyFog(result, In.WorldPos, In.Position.xy, In.Fog);
+
+    PSOut Out;
+    Out.Coverage = cov;   // every exit carries the same mask — the debug views stay the same shape
+
+    // F12 distance grayscale parity with statics.frag / distantland.frag / opaque.frag.
+    uint dbg = (uint)(gFrameData.debugParams.x + 0.5f);
+    if (dbg == 1u || dbg == 2u) {
+        float dist = length(In.WorldPos - gFrameData.eyePos.xyz);
+        float g = saturate(dist * (1.0f / 8192.0f));
+        Out.Color = float4(g, g, g, 1.0f);
+        RETURN(Out);
+    }
+    Out.Color = float4(result, 1.0f);
+    RETURN(Out);
+}

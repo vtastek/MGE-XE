@@ -212,6 +212,13 @@ namespace MGEgui {
         public const string fn_statics = fn_dl + @"\statics";
         public const string fn_usagedata = fn_dl + @"\statics\usage.data";
         public const string fn_statmesh = fn_dl + @"\statics\static_meshes";
+        // Model path per line, line N = distant static id N -- the join key between grass.bin (which
+        // names meshes by path, so a re-bake that reorders the library cannot silently repaint the
+        // world) and static_meshes (which is indexed by ordinal and stores no names at all).
+        public const string fn_nifmap = fn_dl + @"\statics\nifmap.txt";
+        // Written by mgeBake64 --grass, NOT by this tool. Named here only so the statics wipe can
+        // step around it.
+        public const string fn_grassbin = fn_dl + @"\statics\grass.bin";
         public const string fn_heroanim = fn_dl + @"\statics\hero_anim.data";
         public const string fn_lightsdata = fn_dl + @"\lights.data";
         public const string fn_stattex = fn_dl + @"\statics\textures";
