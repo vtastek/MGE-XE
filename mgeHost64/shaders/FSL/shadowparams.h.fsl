@@ -693,4 +693,41 @@ STRUCT(ShadowMaskParams)
     //     groundcover the alpha is BINARY (84% at 0, 16% at 255, ~0.1% between), so raising
     //     the caster's alpha reference instead would thin it by 0.0%.
     DATA(float4,   grassParams5,     None);
+    // ─── G7: GRASS PLASTICITY — the crush field's consumer lanes (grasscrush.srt.h) ────────────
+    // xy = the crush domain's origin, EYE-RELATIVE, in world units. grass.vert samples at the blade
+    //      ROOT (In.W3.xy), which is camera-relative like everything else in the instance stream, so
+    //      an absolute origin here would cost a subtraction of two ~200,000-unit floats to get back
+    //      to a number a few hundred units wide ([[project_forge_precision_far_origin]]).
+    // z  = 1 / (unitsPerTexel * grid), i.e. world units -> [0,1] uv across the whole domain.
+    // w  = (crushOriginZ - lodEye.z): the snapped Z the field's .x is stored RELATIVE TO, expressed
+    //      camera-relative for the same reason xy is. Snapped to a 512-unit grid so the re-bias fires
+    //      only on a boundary crossing — see grasscrush.srt.h for why absolute Z cannot be stored in
+    //      an fp16 texture at Vvardenfell's scale.
+    DATA(float4,   grassParams6,     None);
+    // x = BEND GAIN over the fold. 1 = a fully crushed blade lies flat (theta = pi/2); below that it
+    //     is only pressed over. The fold is length-preserving by construction (sin/cos), so this
+    //     moves the ANGLE and never the blade's length.
+    // y = SINK fraction: extra retraction at full crush, as a fraction of the blade's own height, so
+    //     the folded mat sits below the body pressing it rather than draping over it.
+    // z = the master ARM, 0/1. grass.vert branches on it rather than multiplying by it — a cbuffer
+    //     lane is wave-uniform at runtime but is NOT a compile-time constant, so a multiply would
+    //     still pay the texture fetch on every grass vertex of every frame, in the caster pass too
+    //     ([[project_uniform_branch_is_not_free]]). 0 restores the pre-G7 image exactly.
+    // w spare. Appended at the END for the reason every field down here states.
+    DATA(float4,   grassParams7,     None);
+    // G7e/f — THE SPRINGBACK, as the STEP RESPONSE OF A DAMPED SECOND-ORDER SYSTEM. The field's .w is
+    // a RELEASE ENVELOPE (1 while a crusher sits on the texel, falling linearly to 0 as the imprint
+    // heals), so u = 1 - w is normalised time since release and the whole thing evaluates in the
+    // vertex shader with no state and no second texture. See grass.vert's fold.
+    // x = PLASTIC fraction: how much of the press is still there once the spring has settled. This is
+    //     also what sets the spring's AMPLITUDE, because the elastic part is the rest of it
+    //     (cHeld - plastic*cHeld) — the two are one number, not two.
+    // y = damped angular frequency wd, PER UNIT u (= wd * healTime), so the shader never needs
+    //     healTime.
+    // z = the decay rate zeta*wn, per unit u. The ratio z/y is the damping ratio's contribution.
+    // w = zeta*wn / wd — the coefficient on the sin term of the step response. ⚠ That term is what
+    //     makes the release start from REST: without it the response is a bare exp*cos whose
+    //     derivative at t = 0 is -1/tau, i.e. the blade JERKS the instant it is freed instead of
+    //     accelerating out of a standstill, which is the difference between a spring and a snap.
+    DATA(float4,   grassParams8,     None);
 };

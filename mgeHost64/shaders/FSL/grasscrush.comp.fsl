@@ -1,0 +1,103 @@
+// mgeHost64 — G7 crush field, pass 1 of 3: SCROLL + RECOVER + SEED. Model + why: grasscrush.srt.h.
+//
+// One thread per texel. Reads last frame's published field at the SCROLLED source texel, re-biases
+// its .x from the previous frame's origin to this one's, adds this frame's springback, and writes the
+// result into the accumulator as an ordered-uint sort key. The splat then only ever has to lower it.
+//
+// Compute, so it hot-reloads on F8 — which matters here more than usual, and for the same reason
+// ripplesim.comp's header gives: tuning a crush profile means watching a body lie in grass, and a
+// graphics-pipeline shader would cost a host restart per attempt.
+//
+// ⚠⚠ OUT OF THE PREVIOUS DOMAIN RETURNS THE SENTINEL, NOT ZERO, and the distinction is the whole
+// difference between this and rippleFetchPrev. Zero is the correct identity for a WAVE field —
+// undisturbed water is flat water. Here zero would be a clearance of `crushOriginZ + 0`, i.e. a
+// FLOOR-LEVEL CRUSH across the entire strip the camera just exposed: walk east and every blade
+// entering the domain from the east would already be flat. "Nothing here" is the sentinel and nothing
+// else. (The stored .w = 0 says the same thing for a texel that IS inside the old domain but was
+// never crushed.)
+//
+// ⚠ SHIFT THE FETCH, NOT THE DATA — the same trick advanceRippleGrid uses. Every read is offset by
+// the same whole-texel scroll, so the domain moves for free: it is a change of address, not work, and
+// no copy pass exists.
+
+#include "grasscrushkey.h.fsl"   // the ordered-uint key (which includes grasscrush.srt.h)
+
+#define GRASSCRUSH_THREADS 8
+
+// The scrolled fetch: .x = last frame's clearance in ABSOLUTE world Z, .y = its release envelope.
+// Outside the previous domain, or on a texel whose envelope has run out, the answer is the sentinel
+// with a dead envelope — see the ⚠ above for why that is not zero.
+//
+// ⚠ THE VALIDITY TEST IS "> 0", NOT "> 0.5". .w is a continuous release envelope now, not a flag, so
+// a texel halfway through healing carries 0.4 and is still very much crushed. Testing against 0.5
+// would delete every imprint at the midpoint of its own recovery.
+float2 grassCrushFetchPrev(int2 c, int size, float prevOriginZ)
+{
+    if (c.x < 0 || c.y < 0 || c.x >= size || c.y >= size) { return float2(GRASS_CRUSH_SENTINEL, 0.0f); }
+    float4 prev = LoadRWTex2D(gGrassCrushField, c);
+    if (prev.w <= 0.0f) { return float2(GRASS_CRUSH_SENTINEL, 0.0f); }
+    return float2(prev.x + prevOriginZ, prev.w);
+}
+
+ROOT_SIGNATURE(ComputeRootSignature)
+NUM_THREADS(GRASSCRUSH_THREADS, GRASSCRUSH_THREADS, 1)
+void CS_MAIN(SV_DispatchThreadID(uint3) did)
+{
+    INIT_MAIN;
+
+    int  size = int(gGrassCrushParams.domain.w);
+    int2 id   = int2(did.xy);
+    // NB: every RETURN() MUST start its own line (fsl.py only rewrites a line-leading RETURN).
+    if (id.x >= size || id.y >= size)
+    {
+        RETURN();
+    }
+
+    int2  shift       = int2(gGrassCrushParams.sim.xy);
+    float healStep    = gGrassCrushParams.sim.z;
+    float prevOriginZ = gGrassCrushParams.bias.y;
+
+    float2 prev  = grassCrushFetchPrev(id + shift, size, prevOriginZ);
+    float  zPrev = prev.x;
+
+    // ⚠ THE HEAL IS THE SLOW HALF OF THE ASYMMETRY, AND IT NO LONGER MOVES THE CLEARANCE AT ALL.
+    // Raising .x at a fixed rate in world units per second was a conveyor belt — one speed the whole
+    // way, no acceleration, no overshoot — and it made the recovery four times slower for a 251-unit
+    // blade than a 60-unit one, since what a blade responds to is clearance over ITS OWN HEIGHT.
+    // What heals now is the RELEASE ENVELOPE, and the blade's response to it is a closed form in
+    // grass.vert. See grasscrush.srt.h, "THE SPRINGBACK".
+    //
+    // Retired HERE rather than at the splat so a crusher still standing on this texel simply stores
+    // 1.0 over the top again — a stationary actor's imprint neither deepens nor heals, which is what
+    // standing in grass looks like.
+    // ⚠ THE STEP DOUBLES IN THE DWELL REGION, AND THAT IS fp16'S EXPONENT RATHER THAN A FUDGE. The
+    // clock runs [0,2]: [1,2] is the dwell (the blade has not started coming back yet) and [0,1] is
+    // the springback. fp16's ulp is 2^-11 in [0.5,1) and 2^-10 in [1,2), so a step that is one ulp
+    // down here is HALF an ulp up there and would be swallowed whole by the round-trip through the
+    // texture — the clock would stall at whatever charge it reached and the imprint would never begin
+    // to heal at all. Walking the value in its own representable steps is the only thing that works,
+    // and the host passes the dwell region its own rate for that reason.
+    float step = (prev.y >= 1.0f) ? gGrassCrushParams.dwell.y : healStep;
+    float env  = max(prev.y - step, 0.0f);
+
+    uint i = uint(id.y) * uint(size) + uint(id.x);
+    uint n = uint(size) * uint(size);
+    // The clearance is carried forward UNCHANGED: it is where the occupant pressed this texel to, and
+    // it stays there until the envelope retires the texel outright.
+    gGrassCrushAccum[i]        = grassCrushKey(zPrev);
+    gGrassCrushAccum[2u * n + i] = asuint(env);
+
+    // ⚠ LANE 1: LAST FRAME'S CLEARANCE, SCROLLED, WITHOUT THE SPRINGBACK — the splat's only way to
+    // know where the press is descending FROM. It cannot read the field texture for this: the texture
+    // is at the previous frame's addresses (that is what `shift` is for) and pass 3 writes the very
+    // texels other threads would be reading, which is an unsynchronised read/write across a single
+    // dispatch. This pass is the one place the fetch is safe, and it has already paid for it above —
+    // so it parks the answer rather than making anyone else go looking.
+    //
+    // The springback is deliberately NOT included: it is a separate, opposite motion, and folding it
+    // in here would let a healing texel's own recovery shorten the distance the press has left to
+    // travel. Lane 0 carries the recovery; lane 1 is a pure "where was it".
+    gGrassCrushAccum[n + i] = grassCrushKey(zPrev);
+
+    RETURN();
+}

@@ -1166,7 +1166,31 @@ STRUCT(ShadowMaskParams)
     float4 grassParams4;
 #line 695 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
     float4 grassParams5;
-#line 696
+
+
+
+
+
+
+
+
+
+
+    float4 grassParams6;
+
+
+
+
+
+
+
+
+
+
+    float4 grassParams7;
+#line 732 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
+    float4 grassParams8;
+#line 733
 };
 #line 21 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
 #line 27 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
@@ -1467,6 +1491,8 @@ STRUCT(LightData)
         Tex2D(float4) gPortalGate :  register(t60,space1);
 #line 489 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
         Tex2DArray(float) gCausticField :  register(t61,space1);
+#line 503 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+        Tex2D(float4) gGrassCrush :  register(t62,space1);
 
 
 
@@ -1483,7 +1509,7 @@ STRUCT(LightData)
 
 
         CBUFFER(LightData) gLightsNear :  register(b1,space3);
-#line 520 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+#line 534 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
         Tex2D(float4) gTextures[ 880 ] :  register(t0,space0);
 
 
@@ -1494,7 +1520,7 @@ STRUCT(LightData)
 
         Tex2DArray(float4) gFlipArrays[ 16 ] :  register(t1008,space0);
         CBUFFER(BatchData) gBatch :  register(b0,space2);
-#line 544 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+#line 558 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
         CBUFFER(SkyViewData) gSkyView :  register(b1,space2);
 #line 12 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/multimap.frag.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/texsample.h.fsl"

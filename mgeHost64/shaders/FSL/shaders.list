@@ -629,3 +629,20 @@
 #comp causticdyn.comp
 #include "causticdyn.comp.fsl"
 #end
+
+// G7 GRASS PLASTICITY — the crush field (tasks/forge-grass.md, grasscrush.srt.h). Three compute
+// passes over one 512² clearance-height map: scroll+recover+seed, an AtomicMin scatter of every
+// skinned bone's disc, then a resolve that publishes the height and derives the lay direction from
+// its own gradient. All three are COMPUTE so they hot-reload on F8 — tuning a crush profile means
+// watching a body lie in grass, and a graphics-pipeline shader would cost a host restart per try.
+#comp grasscrush.comp
+#include "grasscrush.comp.fsl"
+#end
+
+#comp grasscrushsplat.comp
+#include "grasscrushsplat.comp.fsl"
+#end
+
+#comp grasscrushresolve.comp
+#include "grasscrushresolve.comp.fsl"
+#end

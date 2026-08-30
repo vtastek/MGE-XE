@@ -559,6 +559,28 @@ namespace IPC {
         // existing offset is unchanged — the same rule actorRipples above followed.
         IN std::uint32_t devDumpHdr;
 
+        // G7 GRASS PLASTICITY: the PLAYER's crush point. xyz = the player's world position (MW's own
+        // reference point, i.e. the feet), w = 1 when that position is meaningful and 0 otherwise —
+        // an interior, a menu, or a client that has nothing to say.
+        //
+        // ⚠ w IS A PRESENCE FLAG AND NOT A RADIUS, deliberately. How wide the player's disc should
+        // be is a LOOK, and it is already a host knob (grassCrushPlayerRadius) sitting beside every
+        // other crush dial. Shipping a radius here as well would put the same tuning number on both
+        // sides of an IPC boundary, where the only thing two copies of a knob reliably do is
+        // disagree. The client says WHERE; the host says HOW WIDE.
+        //
+        // ⚠ WHY THIS IS ON THE WIRE AT ALL, given that the host already harvests a crush disc from
+        // every bone of every skinned draw: IN FIRST PERSON THE PLAYER HAS NO SKINNED DRAWS. The
+        // body is simply not submitted, so the one actor whose missing footprint is most obvious —
+        // the one you are standing in — would be the only one that never pressed the grass. In third
+        // person this is harmless double cover, because the field is built by `min` and a second
+        // disc over the same ground changes nothing.
+        //
+        // Appended at the very end of the IN block so every existing offset is unchanged — the same
+        // rule actorRipples and devDumpHdr above followed. ⚠ The struct is shared BY LAYOUT across
+        // x86/x64, so mgecore.dll and mgeHost64.exe must be rebuilt and deployed together.
+        IN float playerCrush[4];
+
         OUT std::uint32_t bytesWritten;
         OUT double renderMs;             // host-side render+readback time
 

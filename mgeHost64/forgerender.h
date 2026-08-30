@@ -95,6 +95,13 @@ namespace ForgeRender {
     // at the fire-time camera height — see bridge.h's skyParkEyeDelta. Call before renderScene.
     void setSkyParkEyeDelta(const float d[4]);
 
+    // G7 grass plasticity: the PLAYER's crush disc for this frame — xyz = world position (MW's own
+    // reference point, i.e. the feet), w = radius in world units; w <= 0 means "no player disc".
+    // Every other crusher is harvested host-side from the skinned bone walk; the player has to ride
+    // the wire because in FIRST PERSON there is no skinned draw to harvest, which is precisely the
+    // view where a missing footprint is most obvious. Call before renderScene.
+    void setPlayerCrush(const float c[4]);
+
     // True if the M1c opaque scene path (depth RT + opaque pipeline + descriptor sets)
     // built successfully in init(). False ⇒ renderScene returns false and the seam
     // falls back to the triangle. The server logs this so the buffered host stdout

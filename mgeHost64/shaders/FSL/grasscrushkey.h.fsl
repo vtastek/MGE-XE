@@ -1,0 +1,21 @@
+// mgeHost64 — G7: the crush field's ORDERED-UINT KEY. Shader-only, and separate from
+// grasscrush.srt.h for exactly one reason: that header is included by forgerender.cpp (for
+// GrassCrushParams and SRT_RES_IDX) and these two functions are HLSL intrinsics a C++ compiler
+// cannot parse. The constants they use stay in the SRT header, where both sides can read them.
+//
+// ⚠ WHY AN INTEGER MIN IS A FLOAT MIN. For NON-NEGATIVE IEEE-754 floats the bit pattern is monotone
+// under unsigned integer compare — sign bit clear, exponent above mantissa, both stored biased-
+// unsigned — so `InterlockedMin` over `asuint(z + BIAS)` returns exactly the smallest z. That is the
+// whole trick that lets thousands of unordered bone discs scatter into one field with no sort, no
+// per-texel lock and no ordering guarantee: `min` is commutative and idempotent, so the answer does
+// not depend on which disc got there first or how many times it arrived.
+//
+// BIAS is what keeps the operand non-negative, which is the one precondition. Morrowind's deepest
+// geometry is a few thousand units below zero and 32768 clears that by an order of magnitude; the
+// max() is belt-and-braces against a wild value rather than a case that happens.
+#pragma once
+
+#include "grasscrush.srt.h"
+
+uint  grassCrushKey(float z)  { return asuint(max(z + GRASS_CRUSH_ZBIAS, 0.0f)); }
+float grassCrushUnkey(uint k) { return asfloat(k) - GRASS_CRUSH_ZBIAS; }

@@ -79,6 +79,9 @@ namespace IPC {
 		std::uint32_t m_clientSyncsOnFence = 0;
 		// Mode-3 park sky re-anchor delta — see setSkyParkEyeDelta. 0 on the serial paths.
 		float m_skyParkEyeDelta[4] = {};
+		// G7: the player's grass-crush disc — see setPlayerCrush / bridge.h playerCrush. w = 0 by
+		// default, which the host reads as "no player disc this frame".
+		float m_playerCrush[4] = {};
 
 		// Dev FSL hot-reload watcher: a child launched alongside the host and killed with it, opt-in
 		// per install via an untracked mgeXE_fslwatch.txt next to Morrowind.exe (see startWatcher —
@@ -431,6 +434,17 @@ namespace IPC {
 		// Defaults zero, which is the correct value for every serial path.
 		void setSkyParkEyeDelta(float x, float y, float z) {
 			m_skyParkEyeDelta[0] = x; m_skyParkEyeDelta[1] = y; m_skyParkEyeDelta[2] = z;
+		}
+
+		// G7: the player's grass-crush point (world position + a PRESENCE flag, not a radius — the
+		// radius is a host knob; see bridge.h), stamped into every subsequent render RPC. A setter
+		// for the same reason setSkyParkEyeDelta is one — renderSceneKickoff's signature is already
+		// 30 arguments wide — and needed at all because IN FIRST PERSON THE PLAYER HAS NO SKINNED
+		// DRAWS for the host to harvest a disc from. present = false (the default) is the right
+		// answer in interiors and menus.
+		void setPlayerCrush(float x, float y, float z, bool present) {
+			m_playerCrush[0] = x; m_playerCrush[1] = y;
+			m_playerCrush[2] = z; m_playerCrush[3] = present ? 1.0f : 0.0f;
 		}
 
 		WakeReason waitForCompletion(DWORD ms = MaxWait);

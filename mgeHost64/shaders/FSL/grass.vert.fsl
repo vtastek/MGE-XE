@@ -24,9 +24,16 @@
 //      where stock summed four coherent travelling harmonics.
 //   4. Distance LOD by SINKING the blade into the ground rather than by cutting it (see sink).
 //
-// NOT ported: the player-stomp term (out of scope for G1 — no footPos on the wire), the DX9 shadow
-// map lookups (the host has its own MSM receiver, applied in grass.frag), and MGE's fixed 8192
-// element cap. Divergences from the reference are marked ⚠ individually.
+// NOT ported: the DX9 shadow map lookups (the host has its own MSM receiver, applied in grass.frag)
+// and MGE's fixed 8192 element cap. Divergences from the reference are marked ⚠ individually.
+//
+// ⚠ THE PLAYER-STOMP TERM IS GONE AND HAS BEEN REPLACED, NOT RESTORED (G7). This header used to say
+// the stomp was "out of scope for G1 — no footPos on the wire"; the wire now carries one, but the
+// stomp is still not what runs here. What runs is a world-locked CRUSH FIELD — a clearance-height
+// texture every skinned bone and the player press into, with instant-down / slow-up plasticity —
+// and grass.vert's half of it is the FOLD at the bottom of the motion block. The reference's radial
+// XY shove could not do the job in four independent ways (one point, sideways only, no shape, no
+// memory); grasscrush.srt.h has the argument in full.
 
 #include "opaque.srt.h"
 #include "fog.h.fsl"        // mwFogFactor() — ONE fog law for every stage
@@ -193,6 +200,22 @@ float grassWrapLighting(float ndl)
     return wrapped + max(0.0f, -ndl) * GRASS_BACKLIGHT;
 }
 
+// G7 — rotate a direction by the blade's own FOLD: an angle theta about the horizontal axis
+// perpendicular to the lay direction. Rodrigues with a = (-lay.y, lay.x, 0), reduced by hand because
+// a.z is identically zero. `lay` must be unit length, which is what the normalise at the sample site
+// guarantees (a bilinear tap between a laid texel and an empty one is shorter than 1).
+//
+// ⚠ THIS IS WHY A LAID BLADE STILL LIGHTS. Displacing the vertex without rotating the normal leaves a
+// flat mat still shaded as though it stood upright — edge-on to the sky, dark, and lit by the sun
+// from the wrong side. Rotating nFace by the same angle turns the blade's face toward the sky as it
+// goes down, which is exactly what makes a crushed patch read as pressed rather than as missing.
+float3 grassFoldRotate(float3 v, float2 lay, float s, float c)
+{
+    float3 cr = float3(lay * v.z, -dot(lay, v.xy));      // a x v
+    float  dt = lay.x * v.y - lay.y * v.x;               // a . v
+    return v * c + cr * s + float3(-lay.y, lay.x, 0.0f) * (dt * (1.0f - c));
+}
+
 // Per-blade ALBEDO VARIATION. The bake hands every blade of a given mesh the identical texture and
 // the identical vertex colour (G/B/A are 255 across all 3,149 grass vertices — see the flag note in
 // VS_MAIN), so a field drawn from one palette is one colour repeated tens of thousands of times.
@@ -266,6 +289,144 @@ VSOutput VS_MAIN( VSInput In )
     // subset as foliage, which is exactly stock's behaviour.
     float soft = lerp(1.0f, In.Color.r, gShadowParams.grassParams3.z);
 
+    // ── G7: THE CRUSH FIELD ───────────────────────────────────────────────────────────────────
+    // ⚠ ONE SAMPLE, AT THE ROOT (In.W3.xy) — the same "the root decides, the vertex responds" split
+    // the air/water choice above already makes, and for the same reason: a blade must fold as ONE
+    // body. Sampling per vertex would give the tip a different clearance from the root and shear the
+    // blade in half. The RESPONSE is per vertex, and that is what folds a blade progressively rather
+    // than translating it rigidly.
+    //
+    // ⚠ A REAL BRANCH, NOT A MULTIPLY BY ZERO. A cbuffer lane is wave-uniform at RUNTIME but is not a
+    // compile-time constant, so DXC will not strip what it guards — `crush * 0` would still pay the
+    // texture fetch on every grass vertex of every frame, in the colour pass AND the caster pass,
+    // forever. [[project_uniform_branch_is_not_free]]
+    float  crushC   = 0.0f;
+    float2 crushLay = float2(0.0f, 0.0f);
+    float  crushH   = 0.0f;
+    // The SAME recovery without the ring - its ENVELOPE. Everything that asks "how pinned is this
+    // blade" reads THIS and never crushC, so nothing downstream inherits the oscillation. See the
+    // wind term for why that distinction is the difference between two motions adding and one
+    // motion modulating the other.
+    float  crushPin = 0.0f;
+    // ⚠ THE CARD'S OWN FULL HEIGHT IN WORLD UNITS, RIDING IN W2.w. The instance rows are an AFFINE
+    // matrix, so column 3 is structurally (0,0,0,1) and W2.w is a hard zero the scatter copies
+    // through for free — the same borrowed lane W0.w's variation code uses, and it is paid for the
+    // same way (the row combination is a float4 add, so the payload lands in worldPos.w and the
+    // line after it forces w = 1). The host fills it in rebuildGrassWindow as the def's model-space
+    // top times the per-blade scale, and the model top is read straight out of static_meshes'
+    // per-subset AABB, so it is exact rather than estimated.
+    float  bladeH   = max(In.W2.w, 1.0e-3f);
+    if (gShadowParams.grassParams7.z > 0.5f) {
+        float2 cuv = (In.W3.xy - gShadowParams.grassParams6.xy) * gShadowParams.grassParams6.z;
+        // Outside the (2048-unit by default) domain there is no answer, and a CLAMP sampler would
+        // invent one by smearing the edge row across the whole world. Skipped outright instead.
+        if (cuv.x >= 0.0f && cuv.x <= 1.0f && cuv.y >= 0.0f && cuv.y <= 1.0f) {
+            float4 cf = SampleLvlTex2D(gGrassCrush, gSamplerBilinearClamp, cuv, 0);
+            // .w is VALIDITY, and an unbound texture reads 0 = no crush = the pre-G7 image. See
+            // grasscrush.srt.h for why "no crush" cannot be encoded as a large .x.
+            if (cf.w > 0.0f) {
+                // Camera-relative throughout: grassParams6.w is (crushOriginZ - lodEye.z), so this
+                // never forms an absolute Morrowind Z and never spends the precision to subtract it
+                // again ([[project_forge_precision_far_origin]]).
+                float crushRelZ = cf.x + gShadowParams.grassParams6.w;
+                float avail     = crushRelZ - In.W3.z;    // headroom over THIS root
+                // ⚠⚠ THE ARM IS THE VERTEX'S WORLD HEIGHT ABOVE ITS OWN ROOT, NOT In.Position.z,
+                // AND THE DIFFERENCE IS AN INVERTED BLADE. In.Position.z is MODEL space; the fold
+                // below displaces in WORLD units; and the instance rows carry a per-blade UNIFORM
+                // SCALE (this bake ships 0.22 .. 1.81, and G3's near-static shrink makes the small
+                // end common). Folding a scale-0.22 blade — 22 world units tall — by a 100-unit
+                // model arm drove its tip ~78 units BELOW its own root: the card came out upside
+                // down. The same error under-folded the 1.81 blades, so the tall ones barely moved
+                // and went on hiding the thing the field exists to reveal.
+                //
+                // worldPos.z is still the raw row combination here (the wind only displaces xy, and
+                // the fold and the LOD sink are both below), so this difference IS the vertex's own
+                // vertical extent — scale, terrain tilt and all — with nothing to reconstruct.
+                // Clamped at 0 so a vertex authored below its origin is pinned rather than flipped.
+                crushH = max(worldPos.z - In.W3.z, 0.0f);
+                // ⚠⚠ ONE ANGLE FOR THE WHOLE CARD, AND THE DENOMINATOR IS THE CARD'S HEIGHT, NOT THE
+                // VERTEX'S. This used to divide by crushH — the vertex's own arm — which makes theta
+                // a function of how high up the card you are, and that is a CURL, not a fold. The
+                // shape it produced is the reported one: the base stays vertical, the tip lies over,
+                // and the card's MIDDLE stays up, so a body on the ground was still hidden to
+                // roughly its own chest height however far the reach was widened. No knob could fix
+                // it either, because reach and angle are different axes and only reach had a slider.
+                //
+                // Dividing by the CARD's height makes theta uniform over every vertex of the card,
+                // which is exactly "the bottom line is the pivot": the whole quad swings by one
+                // angle about its base, and at c = 1 every vertex lands on the base plane —
+                // PERFECTLY FLAT — instead of a curl whose midpoint never gets there.
+                //
+                // It is also the honest reading of what this field promises. The design says a blade
+                // folds until its TIP sits at the clearance, and cos(theta) = avail / height is that
+                // sentence: only the tip's own arm answers it, and every other vertex has to inherit
+                // the answer rather than re-derive it from its own.
+                //
+                // ⚠ soft gates it, exactly as it gates the wind: the 7 rigid subsets in this bake
+                // (rock props, stiff shrubs) must not fold under a body any more than they bend in a
+                // gale. The root (crushH = 0) is still pinned whatever the field says, because the
+                // DISPLACEMENT below is proportional to crushH even though the ANGLE is not.
+                float cHeld = saturate(1.0f - avail / bladeH);
+
+                // ── G7e: THE SPRINGBACK, AS A CLOSED FORM ─────────────────────────────────────
+                // ⚠ .w IS A CLOCK, NOT A FLAG. It is the RELEASE ENVELOPE — pinned at 1 while a
+                // crusher stands on this texel, falling linearly to 0 over healTime once nothing
+                // does — so u below is normalised time since release. That one number is enough to
+                // evaluate the whole response here, with no velocity stored anywhere, no second
+                // texture and no per-blade state. grasscrush.srt.h has the argument.
+                //
+                // ⚠⚠ THE DECOMPOSITION IS THE WHOLE THING, AND THE FIRST ATTEMPT HAD IT BACKWARDS.
+                // That version made the PLASTIC decay the main motion (a slow 1-u ramp) and hung a
+                // small ring off it as a perturbation. Run the numbers and it never springs: with a
+                // ring amplitude of 0.35 the fold only ever moved between 0.74*cHeld and 1.07*cHeld,
+                // because the ring dies out inside the first eighth of the heal, during which 1-u is
+                // still ~0.9 and the blade is still lying flat. A jiggle on a mat, not a spring —
+                // reported as "only working in one direction, the energy doesn't dissipate".
+                //
+                // Real released grass is the other way round: the ELASTIC recovery is nearly all the
+                // motion and it is FAST (flat to upright in a couple of tenths, overshooting past
+                // upright and ringing down), and what is left afterwards is a small PLASTIC residue
+                // that relaxes slowly. So:
+                //
+                //   cRest = plastic * cHeld * (1 - u)          the slow residue, dying over the heal
+                //   c     = cRest + (cHeld - plastic*cHeld) * e(u)
+                //
+                // with e the STEP RESPONSE of a damped second-order system: 1 at release, ringing
+                // down to 0. The elastic amplitude is therefore (1 - plastic) * cHeld — the plastic
+                // fraction sets BOTH how much stays down and how far the spring has to travel, which
+                // is one number and not two, because they are the same split of the same press.
+                //
+                // ⚠ THE sin TERM IS NOT DECORATION. A bare exp(-at)*cos(wt) has derivative -a at
+                // t = 0, i.e. the blade JERKS the instant it is freed. The real step response carries
+                // (a/wd)*sin(wd t) alongside it, which makes the derivative zero at release: the
+                // blade accelerates out of a standstill. That is the difference between a spring
+                // letting go and a snap.
+                //
+                // ⚠ AND IT IS ALL SCALED BY cHeld, WHICH IS WHAT KEEPS THE SKIRT QUIET. A texel that
+                // was barely pressed rings barely; only what was pushed flat whips back hard. Nothing
+                // has to know where the press ended and the skirt began.
+                float u      = saturate(1.0f - cf.w);
+                float cRest0 = gShadowParams.grassParams8.x * cHeld;
+                float ph     = u * gShadowParams.grassParams8.y;
+                float envd   = exp(-u * gShadowParams.grassParams8.z);
+                float e      = envd * (cos(ph) + gShadowParams.grassParams8.w * sin(ph));
+                float slow   = cRest0 * (1.0f - u);
+                // The recovery's ENVELOPE: the identical expression with the ringing factor replaced
+                // by the exponential that bounds it. Monotone, and free - envd is already computed.
+                crushPin = soft * saturate(slow + (cHeld - cRest0) * envd);
+                // ⚠ NEGATIVE crushC IS LEGAL AND IS THE POINT: e goes negative on the first swing, so
+                // c drops BELOW the resting fold and through zero, and a negative fold bends the
+                // blade the other way along the lay direction — a blade whipping past upright. The
+                // clamp is a rail against a mistuned damping ratio, not the mechanism.
+                crushC = soft * clamp(slow + (cHeld - cRest0) * e, -0.5f, 1.0f);
+                // Bilinear between a laid texel and an empty one is shorter than unit length, and
+                // the fold below is only length-preserving for a UNIT lay — hence the renormalise.
+                float layLen = length(cf.yz);
+                crushLay = (layLen > 1e-4f) ? (cf.yz / layLen) : float2(0.0f, 0.0f);
+            }
+        }
+    }
+
     // ── MOTION ────────────────────────────────────────────────────────────────────────────────
     float3 absFrac = grassAbsMod2(worldPos.xyz);
     // ⚠ THE AIR/WATER CHOICE IS MADE FROM THE ROOT, NOT THE VERTEX. A blade straddling the waterline
@@ -285,7 +446,61 @@ VSOutput VS_MAIN( VSInput In )
     // which grass has no use for.
     float2 currentDisp = grassCurrentDisplacement(In.Position.z, In.InstParams.z * 12.566f);
 
-    worldPos.xy += soft * gShadowParams.grassParams.w * lerp(windDisp, currentDisp, submerged);
+    // ⚠ WIND IS GATED BY HOW PINNED THE BLADE IS. Flattened grass must stop swaying, or the mat under
+    // a corpse shimmers with the breeze while lying under a body — which reads as the grass not
+    // touching the thing on top of it, i.e. it undoes the whole effect.
+    //
+    // ⚠⚠ BUT THE GATE IS crushPin, NOT crushC, AND THAT IS THE DIFFERENCE BETWEEN ADDING AND
+    // MODULATING. crushC RINGS: gating the wind on it multiplies the breeze by an oscillation at the
+    // spring's own frequency, so the sway swells and dies in lockstep with the bounce. Two motions
+    // that share an amplitude are not two motions — the eye reads one HANDING OVER to the other, and
+    // that seam is what got reported.
+    //
+    // crushPin is the same recovery with the ring taken out, so it only ever answers "is this blade
+    // still lying down". The wind fades back in over the ELASTIC time constant — the same fraction of
+    // a second in which the blade physically stands up — and then runs at full amplitude while the
+    // spring's remaining swings ADD on top of it. Both terms displace worldPos.xy, which is all
+    // "additive" has to mean here: nothing cross-fades, so there is no handover to see.
+    worldPos.xy += soft * (1.0f - crushPin) * gShadowParams.grassParams.w
+                 * lerp(windDisp, currentDisp, submerged);
+
+    // ── G7: THE FOLD ──────────────────────────────────────────────────────────────────────────
+    // ⚠ LENGTH IS PRESERVED BY THE sin/cos PAIR — this is a FOLD, not a shrink. A blade laid flat
+    // travels its own height horizontally and loses its own height vertically, which is what bending
+    // at the root does; scaling z instead would make a crushed patch look mown rather than pressed.
+    // grassCrushSink then adds a modest extra retraction at full crush, so the folded mat sits BELOW
+    // the corpse's own height instead of draping over it.
+    //
+    // ⚠ THE SUN CASTER SHARES THIS VERTEX SHADER (see the note at the top of this file), so the cast
+    // shadow folds with the blade for free and the flattened patch reads in shadow too. That is the
+    // same property that keeps the wind-swayed shadow attached to its blade.
+    // ⚠ `!= 0`, NOT `> 0`: a NEGATIVE crushC is the springback whipping the blade past upright, and
+    // gating on `> 0` would silently delete the entire overshoot half of the motion.
+    float crushSin = 0.0f, crushCos = 1.0f;
+    if (crushC != 0.0f) {
+        float theta = crushC * (0.5f * GRASS_PI) * gShadowParams.grassParams7.x;
+        crushSin = sin(theta);
+        crushCos = cos(theta);
+        worldPos.xy += crushLay * crushH * crushSin;
+        // ⚠ THE SINK RAMPS AS c², NOT c. Light contact should BEND — grass parting around a walking
+        // leg — and only a real press should bury. A linear sink makes every lightly-brushed blade
+        // start sliding into the ground, which reads as the field melting rather than being touched.
+        // Squared, the two regimes separate: at c = 0.3 the sink is a tenth of the knob, at c = 1 it
+        // is all of it. And burying matters more than folding does, because a card folded flat is
+        // still a card LYING ACROSS THE GROUND YOU WANTED TO SEE.
+        // ⚠ AND THE SINK IS PER CARD, NOT PER VERTEX. Scaled by crushH it was zero at the base and
+        // largest at the tip, which on a card that is already flat is a HINGE: the far edge drops
+        // through the ground while the near edge stays on it, and the mat tilts instead of settling.
+        // Against bladeH the whole card sinks as one body, which is what "pressed into the ground"
+        // looks like — and it is the same quantity the angle above is measured against, so the two
+        // halves of the fold finally agree on what "the blade" is.
+        // ⚠ THE SINK TAKES THE POSITIVE PART ONLY. c² is positive for a negative c, so an
+        // un-clamped square would bury a blade that is springing BACKWARDS past upright — the one
+        // moment it should be at its highest.
+        float crushDown = max(crushC, 0.0f);
+        worldPos.z  -= crushH * (1.0f - crushCos)
+                     + bladeH * gShadowParams.grassParams7.y * crushDown * crushDown;
+    }
 
     // ── DISTANCE LOD: SINK, don't cut ─────────────────────────────────────────────────────────
     // The enhanced shader's LOD, and it is a nicer idea than a cull plane: the blade sinks into the
@@ -322,6 +537,9 @@ VSOutput VS_MAIN( VSInput In )
     // distant statics carry uniform scale).
     float3 n      = normalize(2.0f * In.Normal.xyz - 1.0f);
     float3 nWorld = n.x * In.W0.xyz + n.y * In.W1.xyz + n.z * In.W2.xyz;
+    // G7 — rotate the normal by the SAME fold, BEFORE the two-sided facing test below, so the test
+    // sees the laid blade rather than the upright one it no longer is. See grassFoldRotate.
+    if (crushC != 0.0f) { nWorld = grassFoldRotate(nWorld, crushLay, crushSin, crushCos); }
 
     // Foliage is lit TWO-SIDED: grass LODs are crossed quads seen from inside the clump and from
     // every angle, so `-sign(dot(eyevec, N))` flips the normal to whichever side the camera is on
@@ -364,7 +582,17 @@ VSOutput VS_MAIN( VSInput In )
     // at the base than a sparse one — the occluder is the NEIGHBOURS, and only the scatter knows how
     // many there are. Screen-space AO could never see this: the blades doing the occluding are
     // sub-pixel.
-    float rootAO = lerp(1.0f - saturate(gShadowParams.grassParams5.x * varDens), 1.0f,
+    // ⚠ AND IT IS RELEASED BY THE CRUSH (G7). The occluder this term models is the NEIGHBOURS — a
+    // blade deep inside a canopy sees little sky. A crushed patch has no canopy left: the neighbours
+    // are lying down too. Without the (1 - crushC) the ramp is a gradient PAINTED ON THE BLADE by
+    // model height, so folding the card flat lays the whole dark-to-bright sweep out sideways on the
+    // ground — the reported "root darkening extends, ugly splotchy grass". Releasing it means a
+    // pressed mat reads as exposed ground cover, which is what a pressed mat is.
+    // ⚠ crushPin here too, for the same reason and with a louder symptom: keyed on the ringing crushC
+    // this is a BRIGHTNESS that pulses at the spring frequency, and a patch of grass flickering two
+    // or three times a second is far more visible than the geometry that would be causing it.
+    float rootAO = lerp(1.0f - saturate(gShadowParams.grassParams5.x * varDens) * (1.0f - crushPin),
+                        1.0f,
                         saturate(In.Position.z * gShadowParams.grassParams5.y));
 
     // The tint is an ALBEDO term, so it multiplies BOTH halves of the split — grass.frag recombines

@@ -5896,6 +5896,28 @@ namespace RenderProcess {
             }
         }
 
+        // G7 GRASS PLASTICITY: the player's crush disc. The host builds a world-locked clearance
+        // field that every skinned bone presses into — a corpse flattens its own silhouette, an NPC
+        // presses at the ankles — but the PLAYER has to ride the wire, because IN FIRST PERSON MW
+        // submits no skinned draws for the body at all. That is exactly the view where a missing
+        // footprint is most obvious, and it is the one case the host's own harvest cannot see.
+        //
+        // MW's reference point is the actor's FEET, which is the surface we want: the field stores
+        // "how low is the lowest occupant surface", and for a walking player that is the ground it
+        // is standing on. Radius 0 (the default) means "no disc" — interiors and menus, where there
+        // is no grass to press. Harmless double cover in third person: the field is built by `min`,
+        // so a second disc over the same ground changes nothing.
+        // ⚠ THE CLIENT SAYS WHERE, THE HOST SAYS HOW WIDE. The disc radius is a look and it is
+        // already a host knob beside every other crush dial; a second copy here would be the same
+        // tuning number on both sides of an IPC boundary.
+        if (g_client) {
+            const bool crushHere = isExterior && !mwb->IsMenu();
+            g_client->setPlayerCrush(crushHere ? mwb->PlayerPositionX() : 0.0f,
+                                     crushHere ? mwb->PlayerPositionY() : 0.0f,
+                                     crushHere ? mwb->PlayerPositionZ() : 0.0f,
+                                     crushHere);
+        }
+
         // Statics near/far handover: hand the host MW's ACTIVE exterior cell set plus how far
         // MW's own cull reaches, so it can clip its distant-statics LOD proxies at the same plane
         // the NEAR path stops at (both drawing = the handover z-fight; neither = a hole). MW culls

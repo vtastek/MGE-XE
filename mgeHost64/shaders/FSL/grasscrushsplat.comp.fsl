@@ -1,0 +1,147 @@
+// mgeHost64 — G7 crush field, pass 2 of 3: THE SCATTER. Model + why: grasscrush.srt.h.
+//
+// ONE THREAD GROUP PER CRUSHER, its 64 threads walking that crusher's texel footprint and lowering
+// each covered texel with an AtomicMin. Overlap between crushers is free and UNORDERED BY
+// CONSTRUCTION: `min` is idempotent and commutative, so two bones over the same texel, or the same
+// bone splatted twice, produce exactly the field one of them alone would. That is what lets the host
+// harvest be sloppy about duplicates for correctness and dedupe purely to save work.
+//
+// ⚠ THE FOOTPRINT IS A DOME WITH A SKIRT, AND IT USED TO BE A FLAT DISC. The argument for the disc
+// was that a skeleton is a point cloud of low surfaces whose union IS the silhouette — true of the
+// silhouette, false of everything around it, and the failure was specific: big animals read well and
+// humanoid NPCs did not, because a standing biped's bones are a VERTICAL LINE and the pressed patch
+// is only ever as wide as the bone cloud's XY extent. Widening the disc did not help either; a wider
+// flat disc is a crop circle. grasscrush.srt.h has the full argument. What each crusher writes now:
+//
+//     clearance(d) = c.z - DROP + SLOPE * max(0, d - c.w),   for d <= c.w + FALLOFF
+//
+// DROP is the limb's radius: a bone translation is a joint CENTRE and this field means the lowest
+// occupant SURFACE. SLOPE is the skirt — a body wading through grass parts blades it never touches,
+// and the taper self-limits, since a clearance above a blade's own height folds it by nothing.
+// FALLOFF = 0 restores the flat disc exactly, which is the A/B.
+//
+// ⚠ AND IT IS WHY NOBODY HAS TO ASK WHETHER THE ACTOR IS DEAD. A prone skeleton is a LOW skeleton —
+// every bone within ~15 units of the ground — so a corpse presses its whole outline flat while a
+// standing NPC's ankles press at the feet and its pelvis at ~70 barely brushes the canopy. One rule,
+// both cases, no death state on the wire.
+
+#include "grasscrushkey.h.fsl"   // the ordered-uint key (which includes grasscrush.srt.h)
+
+// FSL's d3d.h declares AtomicAdd/Or/And/Xor but no buffer AtomicMin (only AtomicMin3D, for textures).
+// The host is D3D12-only and the accumulator is an R32_UINT typed UAV, on which InterlockedMin is a
+// core intrinsic — the same route AtomicAdd takes for gCausticAccum in causticsplat.h.fsl.
+#ifndef AtomicMin
+#define AtomicMin(DEST, VALUE, ORIGINAL_VALUE) InterlockedMin(DEST, VALUE, ORIGINAL_VALUE)
+#endif
+#ifndef AtomicMax
+#define AtomicMax(DEST, VALUE, ORIGINAL_VALUE) InterlockedMax(DEST, VALUE, ORIGINAL_VALUE)
+#endif
+
+#define GRASSCRUSH_SPLAT_THREADS 8
+
+ROOT_SIGNATURE(ComputeRootSignature)
+NUM_THREADS(GRASSCRUSH_SPLAT_THREADS, GRASSCRUSH_SPLAT_THREADS, 1)
+void CS_MAIN(SV_DispatchThreadID(uint3) did)
+{
+    INIT_MAIN;
+
+    // Group / lane indices out of the dispatch id, the same way ripplewave.comp derives them:
+    // nothing in this codebase declares a second entry-point semantic, and the dispatch is
+    // (crusherCount, 1, 1) groups of 8x8, so the shift and the mask are exact.
+    uint crusher = did.x >> 3u;
+    uint2 lt     = uint2(did.x & 7u, did.y);
+
+    uint nCrush = uint(gGrassCrushParams.sim.w);
+    // NB: every RETURN() MUST start its own line (fsl.py only rewrites a line-leading RETURN).
+    if (crusher >= nCrush)
+    {
+        RETURN();
+    }
+
+    // Stride 2: [2k] = xyz position + w radius, [2k+1].x = weight (see grasscrush.srt.h).
+    float4 c    = gGrassCrushers[2u * crusher];
+    float  wgt  = gGrassCrushers[2u * crusher + 1u].x;
+    float  upt  = gGrassCrushParams.domain.z;
+    int    size = int(gGrassCrushParams.domain.w);
+    float  drop  = gGrassCrushParams.shape.x;
+    float  slope = gGrassCrushParams.shape.y;
+    float  decay = gGrassCrushParams.shape.w;
+
+    // Texel coordinates of the crusher's centre. The domain origin is snapped to whole texels
+    // host-side and both operands are absolute world floats of the same magnitude, so the subtraction
+    // is exact (Sterbenz) even 200,000 units from the origin.
+    float2 ctr    = (c.xy - gGrassCrushParams.domain.xy) / upt;
+    // The CONTACT radius (c.w, per crusher) and the OUTER radius the skirt reaches. The outer radius
+    // is what the walk covers, and it is clipped to whatever the texel cap actually allows so the
+    // circle test and the bounding box agree — otherwise a capped crusher would leave a hard square
+    // corner where the box ran out before the circle did.
+    float  rIn    = c.w;
+    float  rOut   = c.w + gGrassCrushParams.shape.z;
+    int    rInt   = int(min(ceil(rOut / upt), gGrassCrushParams.bias.z));
+    if (rInt < 0)
+    {
+        RETURN();
+    }
+    rOut = min(rOut, float(rInt) * upt);
+
+    int2 base = int2((int)floor(ctr.x), (int)floor(ctr.y));
+    int  span = 2 * rInt;
+    uint n    = uint(size) * uint(size);
+
+    // The whole bounding box, strided by the group's 8x8 shape so a large disc simply loops. The
+    // radius is capped (bias.z) rather than unbounded: a crusher's cost is quadratic in its radius
+    // and the harvest is per BONE, so one bad radius would be paid 4096 times over.
+    LOOP for (int ty = int(lt.y); ty <= span; ty += GRASSCRUSH_SPLAT_THREADS)
+    {
+        LOOP for (int tx = int(lt.x); tx <= span; tx += GRASSCRUSH_SPLAT_THREADS)
+        {
+            int2 p = base + int2(tx - rInt, ty - rInt);
+            if (p.x < 0 || p.y < 0 || p.x >= size || p.y >= size) { continue; }
+            // Texel k covers [k, k+1) in domain coordinates, so its centre is at k + 0.5. Distance is
+            // taken in WORLD units, not texels, because the profile above is written in world units
+            // and the units/texel knob is live.
+            float2 d  = ((float2(p) + f2(0.5f)) - ctr) * upt;
+            float  d2 = dot(d, d);
+            if (d2 > rOut * rOut) { continue; }
+            float  t  = c.z - drop + slope * max(0.0f, sqrt(d2) - rIn);
+
+            // ⚠ THE PRESS EASES TOWARD ITS TARGET INSTEAD OF LANDING ON IT, because a one-frame press
+            // is invisible: the eye is shown grass that is already down, never grass going down, and
+            // that reads as a bald patch rather than as something a body did.
+            //
+            // ⚠ AND IT IS STILL A `min`. The eased value is MONOTONE in t, so min-over-crushers of the
+            // eased values equals the eased value of min-over-crushers: two bones over one texel still
+            // commute and still need no ordering. That is the property the whole design rests on.
+            //
+            // The clamp to PRESS_START is what keeps a virgin texel honest — lane 1 reads the 60000
+            // sentinel there, and an un-clamped ease would spend a minute descending from it. Above a
+            // blade's own height the start is indistinguishable from infinity anyway.
+            uint idx  = uint(p.y) * uint(size) + uint(p.x);
+            float zPrev = grassCrushUnkey(gGrassCrushAccum[n + idx]);
+            float zL = (zPrev > t)
+                     ? (t + min(zPrev - t, GRASS_CRUSH_PRESS_START) * decay)
+                     : t;
+            uint prev;
+            AtomicMin(gGrassCrushAccum[idx], grassCrushKey(zL), prev);
+
+            // ⚠ AND CHARGE THE DWELL. The clock runs [0,2]: 1 is "held, recovery about to start" and
+            // everything above it is a SET the blade has taken and has to let go of before it moves
+            // at all. Contact lays that down over time and scales it by the crusher's weight, so a
+            // heavy thing resting a while leaves grass that stays flat after it goes while a foot
+            // passing through does not. The cap is the weight itself, so a light crusher can never
+            // charge a deep set however long it lingers.
+            //
+            // ⚠ AtomicMax OVER THE ORDERED-UINT ENCODING, not a plain store. Every value here is
+            // >= 1, so the float bit pattern is monotone and an integer max IS a float max — which
+            // keeps this scatter commutative like the clearance one beside it: the heaviest,
+            // longest-resting crusher over a texel wins it, in any order, with no lock. A plain
+            // store would let two crushers of different weights fight and flicker.
+            float prevCharge = max(asfloat(gGrassCrushAccum[2u * n + idx]) - 1.0f, 0.0f);
+            float charge = min(prevCharge + gGrassCrushParams.dwell.x * wgt, wgt);
+            uint prevE;
+            AtomicMax(gGrassCrushAccum[2u * n + idx], asuint(1.0f + charge), prevE);
+        }
+    }
+
+    RETURN();
+}

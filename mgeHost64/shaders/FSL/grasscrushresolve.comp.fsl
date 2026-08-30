@@ -1,0 +1,91 @@
+// mgeHost64 — G7 crush field, pass 3 of 3: THE RESOLVE. Model + why: grasscrush.srt.h.
+//
+// One thread per texel. Reads its own accumulator entry and its four neighbours, and writes the
+// texture grass.vert samples: .x = clearance relative to this frame's snapped crushOriginZ,
+// .yz = lay direction, .w = validity.
+//
+// ⚠⚠ THE LAY DIRECTION IS FREE, AND IT FALLS OUT OF THE GRADIENT FOR THE SAME REASON ripplenormal.comp
+// gets slopes out of heights. grad(z) points toward INCREASING clearance, i.e. AWAY FROM THE PRESS —
+// so a blade at the edge of a body lays outward, which is what a body pushing through grass does. No
+// per-crusher direction is stored, no direction is on the wire, and a texel under three overlapping
+// bones needs no blending rule: the field's own shape already carries the answer.
+//
+// ⚠ THE GRADIENT IS CLAMPED BEFORE IT IS DIFFERENCED (bias.w), and without that it is useless. A
+// texel on the rim of a silhouette has real neighbours on one side and 60000-unit SENTINELS on the
+// other, so an unclamped difference is ~60000 in one axis and 0 in the other — every rim texel in the
+// field would report the same axis-aligned direction after normalise, and the mat would lay in four
+// directions like a compass rose. Clamping each neighbour to `self + K` first makes the difference
+// report the real local slope of the press and lets an empty neighbourhood read as "no preferred
+// direction" rather than as a saturated one.
+//
+// ⚠ ZERO LAY IS A LEGITIMATE ANSWER, not a failure. Deep inside a corpse's silhouette every neighbour
+// is at the same clearance, so the gradient vanishes and grass.vert's fold degenerates to a straight
+// vertical compression — which is exactly what grass under the middle of a body does. The normalise
+// is guarded so that case produces (0,0) rather than a NaN that would poison a vertex position.
+
+#include "grasscrushkey.h.fsl"   // the ordered-uint key (which includes grasscrush.srt.h)
+
+#define GRASSCRUSHR_THREADS 8
+
+float grassCrushLoad(int2 c, int size)
+{
+    int2 p = clamp(c, i2(0), i2(size - 1));
+    return grassCrushUnkey(gGrassCrushAccum[uint(p.y) * uint(size) + uint(p.x)]);
+}
+
+ROOT_SIGNATURE(ComputeRootSignature)
+NUM_THREADS(GRASSCRUSHR_THREADS, GRASSCRUSHR_THREADS, 1)
+void CS_MAIN(SV_DispatchThreadID(uint3) did)
+{
+    INIT_MAIN;
+
+    int  size = int(gGrassCrushParams.domain.w);
+    int2 id   = int2(did.xy);
+    // NB: every RETURN() MUST start its own line (fsl.py only rewrites a line-leading RETURN).
+    if (id.x >= size || id.y >= size)
+    {
+        RETURN();
+    }
+
+    float zC  = grassCrushLoad(id, size);
+    // The release envelope: 1 while something is standing here, falling to 0 as the imprint heals.
+    // It is the CLOCK grass.vert evaluates its springback from, and it is also what retires a texel —
+    // see grasscrush.srt.h, "THE SPRINGBACK".
+    float env = asfloat(gGrassCrushAccum[2u * uint(size) * uint(size)
+                                         + uint(id.y) * uint(size) + uint(id.x)]);
+
+    // Nothing here. .w = 0 is what grass.vert tests, and it is also what an UNBOUND texture reads —
+    // so a pass that forgot to bind the field gets the pre-G7 image rather than a floor-level crush.
+    //
+    // ⚠⚠ AND .x IS +REL_MAX, NOT ZERO, BECAUSE grass.vert SAMPLES THIS BILINEARLY. A tap that
+    // straddles the edge of a pressed patch blends BOTH channels, so what .x holds on the empty side
+    // decides what the halo around every imprint looks like. Zero would mean "clearance = the snapped
+    // crushOriginZ", which is an arbitrary height up to 512 units below the eye — so the ring around
+    // each imprint would be crushed HARDER than the imprint itself, by an amount that changes as the
+    // player walks up a hill. +REL_MAX is "clearance far above anything", so the blend fades the
+    // crush OUT across that texel, which is both the right direction and independent of where the
+    // camera happens to be standing.
+    if (zC >= GRASS_CRUSH_SENTINEL - 1.0f || env <= 0.0f)
+    {
+        Write2D(gGrassCrushField, id, float4(GRASS_CRUSH_REL_MAX, 0.0f, 0.0f, 0.0f));
+        RETURN();
+    }
+
+    float k  = gGrassCrushParams.bias.w;
+    float zL = min(grassCrushLoad(id + int2(-1,  0), size), zC + k);
+    float zR = min(grassCrushLoad(id + int2( 1,  0), size), zC + k);
+    float zB = min(grassCrushLoad(id + int2( 0, -1), size), zC + k);
+    float zT = min(grassCrushLoad(id + int2( 0,  1), size), zC + k);
+
+    float2 g   = float2(zR - zL, zT - zB);
+    float  gl  = length(g);
+    float2 lay = (gl > 1.0e-4f) ? (g / gl) : float2(0.0f, 0.0f);
+
+    // Relative to THIS frame's snapped origin, clamped into the fp16 window the texture can carry
+    // meaningfully. See grasscrush.srt.h for why the origin is snapped rather than tracking the eye.
+    float rel = clamp(zC - gGrassCrushParams.bias.x, -GRASS_CRUSH_REL_MAX, GRASS_CRUSH_REL_MAX);
+
+    Write2D(gGrassCrushField, id, float4(rel, lay.x, lay.y, env));
+
+    RETURN();
+}

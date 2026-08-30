@@ -487,6 +487,20 @@ BEGIN_SRT_NO_AB(SrtData)
         // Appended AFTER gPortalGate — append only, FSL assigns descriptor offsets from one running
         // counter and an insertion silently re-points every later binding.
         DECL_TEXTURE(PerFrame, Tex2DArray(float), gCausticField)
+        // G7: the GRASS CRUSH field (grasscrush.srt.h) — a world-locked clearance-height map that
+        // says, per texel, how low the lowest occupant surface over it is. .x = clearance relative to
+        // a snapped crushOriginZ, .yz = lay direction, .w = validity.
+        //
+        // ⚠ Read by grass.vert ONLY, and bound into exactly the two PerFrame sets a grass draw ever
+        // uses: the main set and every cascade instance of pPerFrameSetSun (the caster shares the
+        // vertex shader, which is what keeps the shadow attached to the folded blade). Left UNBOUND
+        // everywhere else, which reads ZERO — and zero is .w = 0 = no crush = exactly the pre-G7
+        // image. The convention points the right way here without the gain-1 inversion gCausticField
+        // needed, because validity is its own channel rather than inferred from a magnitude; see
+        // grasscrush.srt.h for why that had to be so.
+        // Appended AFTER gCausticField — append only, FSL assigns descriptor offsets from one running
+        // counter and an insertion silently re-points every later binding.
+        DECL_TEXTURE(PerFrame, Tex2D(float4), gGrassCrush)
     END_SRT_SET(PerFrame)
     // Point-light cbuffer — rides the otherwise-unused PerDraw set (FSL has exactly four
     // fixed update frequencies: Persistent/PerFrame/PerBatch/PerDraw; a custom set name has

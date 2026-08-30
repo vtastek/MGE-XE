@@ -974,7 +974,7 @@ SamplerState gSampler2xWrapClamp : register( s17 , space100 ) ;
 #line 11 "FSL/shaders.list"
 #line 291 "FSL/shaders.list"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/grass.vert.fsl"
-#line 31 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/grass.vert.fsl"
+#line 38 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/grass.vert.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
 #line 20 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
@@ -1166,7 +1166,31 @@ STRUCT(ShadowMaskParams)
     float4 grassParams4;
 #line 695 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
     float4 grassParams5;
-#line 696
+
+
+
+
+
+
+
+
+
+
+    float4 grassParams6;
+
+
+
+
+
+
+
+
+
+
+    float4 grassParams7;
+#line 732 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
+    float4 grassParams8;
+#line 733
 };
 #line 21 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
 #line 27 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
@@ -1467,6 +1491,8 @@ STRUCT(LightData)
         Tex2D(float4) gPortalGate :  register(t60,space1);
 #line 489 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
         Tex2DArray(float) gCausticField :  register(t61,space1);
+#line 503 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+        Tex2D(float4) gGrassCrush :  register(t62,space1);
 
 
 
@@ -1483,7 +1509,7 @@ STRUCT(LightData)
 
 
         CBUFFER(LightData) gLightsNear :  register(b1,space3);
-#line 520 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+#line 534 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
         Tex2D(float4) gTextures[ 880 ] :  register(t0,space0);
 
 
@@ -1494,9 +1520,9 @@ STRUCT(LightData)
 
         Tex2DArray(float4) gFlipArrays[ 16 ] :  register(t1008,space0);
         CBUFFER(BatchData) gBatch :  register(b0,space2);
-#line 544 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+#line 558 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
         CBUFFER(SkyViewData) gSkyView :  register(b1,space2);
-#line 32 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/grass.vert.fsl"
+#line 39 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/grass.vert.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/fog.h.fsl"
 #line 78 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/fog.h.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/waterplane.h.fsl"
@@ -2211,7 +2237,7 @@ float mwFogAirShareAt(float fog, float3 worldPosRel)
 {
     return mwFogAirShare(fog, waterFogSample(worldPosRel).y, length(worldPosRel));
 }
-#line 33 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/grass.vert.fsl"
+#line 40 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/grass.vert.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyamb.h.fsl"
 #line 83 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyamb.h.fsl"
 float skyAOVisibility(float3 worldAbs)
@@ -2327,7 +2353,7 @@ float3 skyAmbFactor(float3 N, float3 worldPosRel)
 
     return lerp(float3(1.0f, 1.0f, 1.0f), max(f, float3(0.0f, 0.0f, 0.0f)), s) * ao;
 }
-#line 34 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/grass.vert.fsl"
+#line 41 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/grass.vert.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/tonemap.h.fsl"
 #line 32 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/tonemap.h.fsl"
 float3 tonemap(float3 c)
@@ -2342,7 +2368,7 @@ float3 inverseTonemap(float3 d)
     float3 s = sqrt(max(1.0f - clamp(d, 0.0f, 1.0f), 0.0f));
     return (1.0f - s) * (1.7636304f + s * (-0.4027722f + s * 0.4084603f));
 }
-#line 35 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/grass.vert.fsl"
+#line 42 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/grass.vert.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/linearize.h.fsl"
 #line 39 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/linearize.h.fsl"
 float3 srgbToLinear(float3 c)
@@ -2375,7 +2401,7 @@ float3 mod2xLinear(float3 tLinear)
 {
     return srgbToLinear(2.0f * linearToSrgb(tLinear));
 }
-#line 36 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/grass.vert.fsl"
+#line 43 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/grass.vert.fsl"
 
 
 
@@ -2396,7 +2422,7 @@ STRUCT(VSInput)
     DATA(float4, W2, TEXCOORD3);
     DATA(float4, W3, TEXCOORD4);
     DATA(float4, InstParams, TEXCOORD5);
-#line 56
+#line 63
 };
 
 
@@ -2412,16 +2438,16 @@ STRUCT(VSOutput)
     DATA(float3, WorldNormal, TEXCOORD5);
     DATA(CENTROID(float3), SunLight, TEXCOORD6);
     DATA(float, Clip, SV_ClipDistance0);
-#line 71
+#line 78
 };
-#line 107 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/grass.vert.fsl"
+#line 114 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/grass.vert.fsl"
 float3 grassAbsMod2(float3 worldPosRel)
 {
     float3 w = worldPosRel - 2.0f * floor(0.5f * worldPosRel);
     float3 e = gFrameData.lodEye.xyz - 2.0f * floor(0.5f * gFrameData.lodEye.xyz);
     return w + e;
 }
-#line 131 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/grass.vert.fsl"
+#line 138 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/grass.vert.fsl"
 float2 grassWindDisplacement(float3 absFrac, float h)
 {
     float2 wind = gShadowParams.grassParams.xy;
@@ -2441,7 +2467,7 @@ float2 grassWindDisplacement(float3 absFrac, float h)
 
     return saturate(0.02f * h) * harmonics * displace;
 }
-#line 163 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/grass.vert.fsl"
+#line 170 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/grass.vert.fsl"
 float2 grassCurrentDisplacement(float h, float phase)
 {
     float t = gShadowParams.grassParams.z;
@@ -2474,7 +2500,23 @@ float grassWrapLighting(float ndl)
     float wrapped = pow(saturate((ndl + w) / (1.0f + w)), n) * (n + 1.0f) / (2.0f * (1.0f + w));
     return wrapped + max(0.0f, -ndl) *  0.4f ;
 }
-#line 213 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/grass.vert.fsl"
+
+
+
+
+
+
+
+
+
+
+float3 grassFoldRotate(float3 v, float2 lay, float s, float c)
+{
+    float3 cr = float3(lay * v.z, -dot(lay, v.xy));
+    float dt = lay.x * v.y - lay.y * v.x;
+    return v * c + cr * s + float3(-lay.y, lay.x, 0.0f) * (dt * (1.0f - c));
+}
+#line 236 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/grass.vert.fsl"
 float3 grassTint(float hue, float val)
 {
     float2 amt = gShadowParams.grassParams4.xy;
@@ -2493,7 +2535,7 @@ VSOutput VS_MAIN( VSInput In )
 
     float4 worldPos = In.Position.x * In.W0 + In.Position.y * In.W1
                     + In.Position.z * In.W2 + In.Position.w * In.W3;
-#line 245 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/grass.vert.fsl"
+#line 268 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/grass.vert.fsl"
     float varCode = In.W0.w;
     worldPos.w = 1.0f;
     float varHue = floor(varCode * (1.0f / 65536.0f));
@@ -2502,8 +2544,65 @@ VSOutput VS_MAIN( VSInput In )
     float varDens = (varRest - varVal * 256.0f) * (1.0f / 255.0f);
     varHue *= (1.0f / 255.0f);
     varVal *= (1.0f / 255.0f);
-#line 267 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/grass.vert.fsl"
+#line 290 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/grass.vert.fsl"
     float soft = lerp(1.0f, In.Color.r, gShadowParams.grassParams3.z);
+#line 303 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/grass.vert.fsl"
+    float crushC = 0.0f;
+    float2 crushLay = float2(0.0f, 0.0f);
+    float crushH = 0.0f;
+
+
+
+
+    float crushPin = 0.0f;
+
+
+
+
+
+
+
+    float bladeH = max(In.W2.w, 1.0e-3f);
+    if (gShadowParams.grassParams7.z > 0.5f) {
+        float2 cuv = (In.W3.xy - gShadowParams.grassParams6.xy) * gShadowParams.grassParams6.z;
+
+
+        if (cuv.x >= 0.0f && cuv.x <= 1.0f && cuv.y >= 0.0f && cuv.y <= 1.0f) {
+            float4 cf = SampleLvlTex2D(gGrassCrush, gSamplerBilinearClamp, cuv, 0);
+
+
+            if (cf.w > 0.0f) {
+
+
+
+                float crushRelZ = cf.x + gShadowParams.grassParams6.w;
+                float avail = crushRelZ - In.W3.z;
+#line 346 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/grass.vert.fsl"
+                crushH = max(worldPos.z - In.W3.z, 0.0f);
+#line 369 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/grass.vert.fsl"
+                float cHeld = saturate(1.0f - avail / bladeH);
+#line 408 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/grass.vert.fsl"
+                float u = saturate(1.0f - cf.w);
+                float cRest0 = gShadowParams.grassParams8.x * cHeld;
+                float ph = u * gShadowParams.grassParams8.y;
+                float envd = exp(-u * gShadowParams.grassParams8.z);
+                float e = envd * (cos(ph) + gShadowParams.grassParams8.w * sin(ph));
+                float slow = cRest0 * (1.0f - u);
+
+
+                crushPin = soft * saturate(slow + (cHeld - cRest0) * envd);
+
+
+
+
+                crushC = soft * clamp(slow + (cHeld - cRest0) * e, -0.5f, 1.0f);
+
+
+                float layLen = length(cf.yz);
+                crushLay = (layLen > 1e-4f) ? (cf.yz / layLen) : float2(0.0f, 0.0f);
+            }
+        }
+    }
 
 
     float3 absFrac = grassAbsMod2(worldPos.xyz);
@@ -2523,9 +2622,22 @@ VSOutput VS_MAIN( VSInput In )
 
 
     float2 currentDisp = grassCurrentDisplacement(In.Position.z, In.InstParams.z * 12.566f);
-
-    worldPos.xy += soft * gShadowParams.grassParams.w * lerp(windDisp, currentDisp, submerged);
-#line 309 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/grass.vert.fsl"
+#line 464 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/grass.vert.fsl"
+    worldPos.xy += soft * (1.0f - crushPin) * gShadowParams.grassParams.w
+                 * lerp(windDisp, currentDisp, submerged);
+#line 479 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/grass.vert.fsl"
+    float crushSin = 0.0f, crushCos = 1.0f;
+    if (crushC != 0.0f) {
+        float theta = crushC * (0.5f *  3.14159265f ) * gShadowParams.grassParams7.x;
+        crushSin = sin(theta);
+        crushCos = cos(theta);
+        worldPos.xy += crushLay * crushH * crushSin;
+#line 500 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/grass.vert.fsl"
+        float crushDown = max(crushC, 0.0f);
+        worldPos.z -= crushH * (1.0f - crushCos)
+                     + bladeH * gShadowParams.grassParams7.y * crushDown * crushDown;
+    }
+#line 524 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/grass.vert.fsl"
     {
         float jitter = saturate(grassBNoise(In.InstParams.z * 977.0f));
         float sinkFrom = gShadowParams.grassParams2.x;
@@ -2544,6 +2656,9 @@ VSOutput VS_MAIN( VSInput In )
     float3 nWorld = n.x * In.W0.xyz + n.y * In.W1.xyz + n.z * In.W2.xyz;
 
 
+    if (crushC != 0.0f) { nWorld = grassFoldRotate(nWorld, crushLay, crushSin, crushCos); }
+
+
 
 
 
@@ -2560,8 +2675,9 @@ VSOutput VS_MAIN( VSInput In )
         nFace = nWorld;
     }
     lambert = max(0.0f, lambert);
-#line 367 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/grass.vert.fsl"
-    float rootAO = lerp(1.0f - saturate(gShadowParams.grassParams5.x * varDens), 1.0f,
+#line 594 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/grass.vert.fsl"
+    float rootAO = lerp(1.0f - saturate(gShadowParams.grassParams5.x * varDens) * (1.0f - crushPin),
+                        1.0f,
                         saturate(In.Position.z * gShadowParams.grassParams5.y));
 
 

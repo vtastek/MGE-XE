@@ -664,6 +664,10 @@ namespace IPC {
 			// Mode-3 park: the delta the sky payload was pre-cancelled by, so the reflect pass can
 			// put its sky mirror plane at the FIRE-time camera height (see bridge.h).
 			ForgeRender::setSkyParkEyeDelta(params.skyParkEyeDelta);
+			// G7: the player's grass-crush disc. The host harvests every other crusher from the
+			// skinned bone walk; the player rides the wire because in FIRST PERSON there is no
+			// skinned draw to harvest (bridge.h playerCrush).
+			ForgeRender::setPlayerCrush(params.playerCrush);
 			ok = ForgeRender::renderScene(params.viewProj, params.lighting, drawPtr, params.drawCount, bytes,
 				skinnedPtr, params.skinnedCount, skinnedBytes,
 				multiMapPtr, params.multiMapCount, multiMapBytes,

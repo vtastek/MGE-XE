@@ -1166,7 +1166,31 @@ STRUCT(ShadowMaskParams)
     float4 grassParams4;
 #line 695 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
     float4 grassParams5;
-#line 696
+
+
+
+
+
+
+
+
+
+
+    float4 grassParams6;
+
+
+
+
+
+
+
+
+
+
+    float4 grassParams7;
+#line 732 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
+    float4 grassParams8;
+#line 733
 };
 #line 20 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowmask.srt.h"
 

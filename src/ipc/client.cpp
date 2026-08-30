@@ -645,6 +645,9 @@ namespace IPC {
 		params.clientSyncsOnFence = m_clientSyncsOnFence;
 		// Mode-3 park: the delta the sky payload was pre-cancelled by, for the reflect mirror plane.
 		std::memcpy(params.skyParkEyeDelta, m_skyParkEyeDelta, sizeof(params.skyParkEyeDelta));
+		// G7: the player's grass-crush disc. Needed because the player has NO skinned draws in first
+		// person, which is exactly where a missing footprint shows (bridge.h playerCrush).
+		std::memcpy(params.playerCrush, m_playerCrush, sizeof(params.playerCrush));
 		params.bytesWritten = 0;
 		params.renderMs = 0.0;
 		params.frameFenceValue = 0;

@@ -149,6 +149,11 @@
 // ComputeRootSignature; caustic.comp + causticresolve.comp both include it. Why a photon SCATTER
 // rather than a forward 1/|det J| map, and why its mean is 1.0 by construction: caustic.srt.h.
 #include "shaders/FSL/caustic.srt.h"
+// G7: the grass CRUSH FIELD (GrassCrushSrtData, Persistent frequency). Shares the merged
+// ComputeRootSignature; all three of grasscrush/grasscrushsplat/grasscrushresolve include it. What
+// the field stores (a CLEARANCE HEIGHT, not a stomp amount) and why that single choice covers
+// corpses, standing NPCs and dropped items with no case analysis: grasscrush.srt.h.
+#include "shaders/FSL/grasscrush.srt.h"
 // Sun shadows Phase B2: the moments-map blur SRT (SunBlurSrtData, PerFrame frequency — its own
 // resource names so the merged ComputeRootSignature has no aliasing with aoblur's PerFrame set).
 // Two instances of the one set drive the separable H/V ping-pong. See tasks/forge-sun-shadows.md.
@@ -2146,6 +2151,55 @@ namespace {
         // alternative, which is a fill pass that exists only to run once.
         bool           causticDynPrimed = false;
 
+        // --- G7: THE GRASS CRUSH FIELD (grasscrush.srt.h) ----------------------------------------
+        // A world-locked CLEARANCE-HEIGHT map: per texel, the world Z of the lowest occupant surface
+        // over it. Grass folds until its tip sits at that height, which turns "a corpse lying in
+        // grass is invisible" into "the body presses its own silhouette flat" with no death state on
+        // the wire and no per-actor case analysis. Same eager-from-buildOpaquePath, NON-FATAL shape
+        // as the ripple grids and the caustic map above: anything that fails to build leaves
+        // grassCrushReady false, the arm lane publishes 0, and grass.vert's whole block is branched
+        // over — the pre-G7 image, with no fallback path to maintain.
+        //
+        // ⚠ NO PING-PONG, unlike RippleGrid, and it is not an oversight: the read and the write are
+        // DIFFERENT RESOURCES at every step. Pass 1 reads this texture and writes the accumulator,
+        // pass 2 scatters into the accumulator, pass 3 reads the accumulator and writes this texture.
+        // One texture, one buffer, no parity and no per-orientation descriptor sets.
+        Texture*       pGrassCrushField = nullptr;   // grid², RGBA16F: relZ / lay.xy / validity
+        Buffer*        pGrassCrushAccum = nullptr;   // RWBuffer(uint), grid² ordered-uint sort keys
+        Buffer*        pGrassCrushersBuf = nullptr;  // Buffer(float4), kMaxGrassCrushers discs
+        // ONE cbuffer for all three dispatches, and here that is CORRECT where RippleGrid::cbv[2] and
+        // pCausticCbv[4] were not: the three passes read the SAME block (domain, scroll, origins,
+        // crusher count). cmdDispatch records rather than executes, so what matters is that no two
+        // recorded dispatches need DIFFERENT contents — and none of these do.
+        Buffer*        pGrassCrushCbv = nullptr;
+        DescriptorSet* pGrassCrushSet = nullptr;
+        Shader*        pGrassCrushShader = nullptr;         // grasscrush.comp        (scroll+seed)
+        Shader*        pGrassCrushSplatShader = nullptr;    // grasscrushsplat.comp   (AtomicMin)
+        Shader*        pGrassCrushResolveShader = nullptr;  // grasscrushresolve.comp (publish+lay)
+        Pipeline*      pGrassCrushPipeline = nullptr;
+        Pipeline*      pGrassCrushSplatPipeline = nullptr;
+        Pipeline*      pGrassCrushResolvePipeline = nullptr;
+        bool           grassCrushReady = false;
+        uint32_t       grassCrushGrid = 0;            // texels per side (read once, at creation)
+        float          grassCrushUnits = 0.0f;        // world units per texel this field was built at
+        // Domain origin in WORLD units, snapped to whole texels — the snap is what makes the scroll
+        // an integer texel shift, i.e. an exact copy rather than a resample. Same discipline as
+        // RippleGrid, and for the same reason.
+        float          grassCrushOriginX = 0.0f;
+        float          grassCrushOriginY = 0.0f;
+        // The Z the published .x is stored RELATIVE TO, snapped to kGrassCrushZSnap so the re-bias
+        // fires on a boundary crossing rather than every frame (grasscrush.srt.h).
+        float          grassCrushOriginZ = 0.0f;
+        float          grassCrushPrevOriginZ = 0.0f;
+        bool           grassCrushOriginValid = false;
+        bool           grassCrushCleared = false;     // false ⇒ scroll the whole domain out of range
+        // The field is written by compute through a UAV and read by grass.vert through an SRV, so it
+        // has to be transitioned each way around the dispatches. Tracked rather than assumed because
+        // the passes are skipped entirely on interiors and on frames with the knob off, and a texture
+        // left in UNORDERED_ACCESS while a vertex shader samples it is exactly the state error the
+        // debug layer catches and the fast build does not.
+        bool           grassCrushInSrv = false;
+
         // --- Buffer consolidation: one shared mega VB + IB for STATIC non-skinned parts ----
         // Kills the per-draw VB/IB binds (the DX9-shaped bottleneck): bind these ONCE, draw each
         // part with firstVertex(BaseVertexLocation)/firstIndex offsets into them. Free-list
@@ -2370,6 +2424,7 @@ namespace {
            kGpuPhaseVolFog,     // volumetric height fog / sun shafts (after alpha, before the FP arms)
            kGpuPhaseBloom,      // step 4 bloom pyramid (prefilter + down + up), immediately before Resolve
            kGpuPhaseCaustic,    // W23/W24 caustic scatters + resolves (pure compute, beside the ripple sim)
+           kGpuPhaseGrassCrush, // G7 crush field: seed + scatter + resolve (pure compute, same block)
            kGpuPhaseCount };
 
     // FP1a first-person pass caps: one 64KB world window bounds the rigid list at 1024,
@@ -4155,13 +4210,19 @@ namespace {
     constexpr uint32_t kGrassParams4Float     = kGrassParams3Float + 4;
     // G5c: contact AO (root darkening) + the point-light arm.
     constexpr uint32_t kGrassParams5Float     = kGrassParams4Float + 4;
+    // G7: the crush field's consumer lanes (domain + the fold's shape). Appended for the reason
+    // every block above states — this cbuffer is bound BY POINTER into every PerFrame set, so an
+    // insertion anywhere else silently moves a lane somebody reads.
+    constexpr uint32_t kGrassParams6Float     = kGrassParams5Float + 4;
+    constexpr uint32_t kGrassParams7Float     = kGrassParams6Float + 4;
+    constexpr uint32_t kGrassParams8Float     = kGrassParams7Float + 4;
     // The grass motion clock's wrap period, in MW simulation SECONDS. 4 is not a taste value: it is
     // the shortest period over which all four of grass.vert's motion rates (pi, 1.5*pi for the wind
     // term; 0.5*pi, 1.5*pi for the underwater one) complete whole cycles, which is what makes the
     // wrap invisible. Changing a rate means re-deriving this. [[project_wrapped_time_needs_snapped_omega]]
     constexpr double   kGrassWindPeriod       = 4.0;
     constexpr uint32_t kShadowParamsBytes = 4096;
-    static_assert((kGrassParams5Float + 4) * sizeof(float) <= kShadowParamsBytes,
+    static_assert((kGrassParams8Float + 4) * sizeof(float) <= kShadowParamsBytes,
                   "ShadowMaskParams overflows its CBV — too many sun cascades");
     // msmrecv.h.fsl's PCSS works in TEXELS, so SUN_SHADOW_RES has to agree with the atlas the host
     // actually allocated. Same mirroring contract as SUN_CASCADES / kSunCascades.
@@ -6045,6 +6106,10 @@ namespace {
     bool createRippleSimResources(Renderer* R);// R2 actor-ripple wave sim (same pattern)
     bool createCausticResources(Renderer* R);  // W23 tiling caustics (same pattern)
     void bindCausticField(Renderer* R, DescriptorSet* set, uint32_t index);   // W23, all 7 sets
+    bool createGrassCrushResources(Renderer* R); // G7 grass crush field (same non-fatal pattern)
+    // G7: bound into ONLY the two PerFrame sets a grass draw ever uses (main + every sun cascade),
+    // unlike bindCausticField's seven — grass.vert is the sole reader and it lives only there.
+    void bindGrassCrushField(Renderer* R, DescriptorSet* set, uint32_t index);
     bool buildOpaquePath(Renderer* R, uint32_t width, uint32_t height) {
         // Depth target (reverse-Z not needed for M1c; standard LEQUAL + clear to 1.0).
         RenderTargetDesc dDesc = {};
@@ -7077,6 +7142,9 @@ namespace {
         createRippleSimResources(R);
         // W23. Before the pPerFrameSet updates below, so the SRV can bind this frame.
         createCausticResources(R);
+        // G7. Same placement and the same reason: bindGrassCrushField runs from the PerFrame updates
+        // below (and from the sun-cascade set built later), so the texture has to exist by now.
+        createGrassCrushResources(R);
         // NiUVController takeover: the gUVAnim table — a persistent-mapped typed-buffer SRV
         // (Buffer<float4>[kMaxUVAnim]) the draw loops fill via uvAnimIdFor. Created before the
         // PerFrame set updates so every SrtData PerFrame instance can bind it. Zeroed once so
@@ -7247,6 +7315,7 @@ namespace {
             }
             updateDescriptorSet(R, 0, g_live.pPerFrameSet, np, p);
             bindCausticField(R, g_live.pPerFrameSet, 0);              // W23
+            bindGrassCrushField(R, g_live.pPerFrameSet, 0);           // G7
         }
         {
             DescriptorData p[2] = {};
@@ -9592,6 +9661,9 @@ namespace {
                     }
                     updateDescriptorSet(R, c, g_live.pPerFrameSetSun, sn, p);
                     bindCausticField(R, g_live.pPerFrameSetSun, c);   // W23
+                    // G7: the caster shares grass.vert, so every cascade instance needs the
+                    // field too — a shadow that did not fold would detach from its blade.
+                    bindGrassCrushField(R, g_live.pPerFrameSetSun, c);// G7
                 }
             }
 
@@ -11569,6 +11641,193 @@ namespace {
     // this, done. Declared here rather than with the DL block so drawDevUI and the post-fence
     // readback can see it — the same arrangement kSkyStaticsRowCap uses, and static_asserted
     // against kLiveMaxInst where that is declared.
+    // ─── G7 GRASS PLASTICITY: THE CRUSH FIELD ────────────────────────────────────────────────────
+    //
+    // ⚠ THIS IS A GAMEPLAY FIX, NOT A LOOK. Host-owned grass is denser and taller than MGE's ever
+    // was and nothing in the world displaces it, so a dead body lying in a sward is invisible —
+    // including a quest body that in vanilla lies in plain view. See grasscrush.srt.h for the model
+    // and for why MGE's one-point, sideways-only, shapeless, memoryless stomp cannot do this job.
+    //
+    // OFF is the A/B and it must be BIT-IDENTICAL to today: grass.vert branches on the arm lane
+    // rather than multiplying by it, so with this false not one texture fetch is paid.
+    bool  g_grassCrush        = true;
+    // Grid size in texels, read ONCE at resource creation — a slider for it would be a control that
+    // silently does nothing after the first exterior, the same arrangement grassTexCap has. A float
+    // so it joins the MGE_HOST_KNOBS table.
+    float g_grassCrushGrid    = 512.0f;
+    // World units per texel. 512 x 4 = a 2048-unit domain, i.e. +-1024 units around the eye — which
+    // is the reach, and it is deliberately near-field: a corpse 1024 units away is not the case this
+    // exists for, and doubling the reach at fixed resolution halves the silhouette's sharpness.
+    // ⚠ Changing it invalidates the field (a different metric means the stored texels mean something
+    // else), so the setter clears `grassCrushCleared` and the next frame starts fresh.
+    float g_grassCrushUnits   = 16.0f;
+    // ─── THE SPRINGBACK ──────────────────────────────────────────────────────────────────────────
+    // ⚠ THIS KNOB CHANGED AXIS AND UNITS (was `grassCrushRecover`, world units per second). Raising
+    // the stored CLEARANCE at a fixed rate is a conveyor belt, not a spring: one speed the whole way,
+    // no acceleration, no overshoot, an abrupt stop. It was also blade-height dependent for no reason
+    // anyone chose — 12 u/s takes four times as long to release a 251-unit blade as a 60-unit one,
+    // because what a blade responds to is clearance over ITS OWN HEIGHT. So the heal moved onto the
+    // field's .w, which is now a RELEASE ENVELOPE rather than a 0/1 flag, and this is how many
+    // SECONDS a full imprint takes to disappear — the same duration for every blade, and duration is
+    // what a viewer perceives. grasscrush.srt.h has the argument.
+    float g_grassCrushHealTime = 12.0f;
+    // ⚠ THE ELASTIC HALF IS THE MAIN MOTION, AND THE FIRST BUILD HAD THE SPLIT BACKWARDS. It made the
+    // plastic decay the whole journey and hung a small ring off it, which at 0.35 amplitude moved the
+    // fold only between 0.74x and 1.07x of the press — the ring dies inside the first eighth of the
+    // heal, and the blade is still lying flat throughout it. That is a jiggle on a mat, and it is
+    // what "only working in one direction, the energy doesn't dissipate" was describing.
+    //
+    // PLASTIC is how much of the press is still there once the spring has settled. It also sets the
+    // spring's AMPLITUDE, because the elastic part is everything else — the two are one number, not
+    // two, since they are the same split of the same press. This residue is what then relaxes over
+    // healTime; the fast half is done long before that.
+    // ⚠ PLOT THE RESPONSE BEFORE CHANGING EITHER OF THESE. Whether the curve crosses zero — i.e.
+    // whether the blade ever bends the OTHER way — is the whole feature, and nothing on the face of
+    // the numbers tells you which side of it a pair lands on:
+    //   plastic 0.35 / damp 0.30 -> min c = +0.099   never reaches upright; still one-directional
+    //   plastic 0.25 / damp 0.22 -> min c = -0.126   -11 deg, ~3 swings, settles in about a second
+    //   plastic 0.10 / damp 0.20 -> min c = -0.381   -34 deg at 0.8 s, ~5 swings, settles by 6.5 s
+    // The last is what ships (with a 1.6 s period): a big, lazy, pronounced spring. The -0.5 rail in
+    // grass.vert is still clear of it, but only just — go much lower on plastic and the whip clips.
+    float g_grassCrushPlastic = 0.10f;
+    // The swing period in SECONDS (the damped period, i.e. what you would count), and the DAMPING
+    // RATIO. Low damping = several visible swings; 1.0 = critically damped, no overshoot at all,
+    // which is the A/B for the spring half.
+    float g_grassCrushRingPeriod = 1.60f;
+    float g_grassCrushDamping    = 0.20f;
+    // The CONTACT disc a single bone presses flat = boneRadius + margin, in world units. This is the
+    // tight silhouette — the part of the press a body is actually touching.
+    // ⚠ WIDENING THIS IS NOT THE DIAL FOR LEGIBILITY, and that was learned the hard way: a wider FLAT
+    // disc is a crop circle, with a hard rim at whatever radius it is given and everything inside it
+    // pressed equally hard whether a body is there or not. The dial for legibility is the FALLOFF
+    // below, which tapers instead of stamping. See grasscrush.srt.h, "THE PROFILE OF ONE CRUSHER".
+    float g_grassCrushMargin  = 12.0f;
+    // ⚠ ONE KNOB, TWO HALVES OF ONE JOB: how far a limb reaches in XY, and how far its SURFACE sits
+    // below the bone. A bone translation is a joint CENTRE — a point on the limb's centre line — and
+    // the field means the lowest occupant SURFACE, so the clearance under a joint is its translation
+    // minus this. A prone corpse's spine sits ~12 units up with its underside on the ground; without
+    // the drop the grass beneath it was pressed to 12 and stood up THROUGH the body.
+    float g_grassCrushBoneRadius = 14.0f;
+    // ─── THE SKIRT: what makes a standing humanoid legible ───────────────────────────────────────
+    // Beyond the contact radius the clearance RISES linearly at this slope, out to `falloff` world
+    // units. This is the half that was missing in the first build, and its absence had a specific,
+    // reproducible signature: BIG ANIMALS READ WELL AND HUMANOID NPCS DID NOT. The pressed patch is
+    // only ever as wide as the bone cloud's XY extent, a guar's bones spread over 200 x 80 units and
+    // a standing biped's are a vertical LINE over one 30 x 30 footprint — so the NPC got a ~50-unit
+    // clearing at the ankles with full-height grass at its rim, standing in front of its own legs.
+    // A body wading through grass parts the blades it never touches, and the taper self-limits: once
+    // the clearance climbs past a blade's own height that blade is folded by nothing at all, so the
+    // skirt fades out on its own instead of ending at a rim.
+    // ⚠ falloff = 0 restores the flat disc EXACTLY, and that is the A/B for this change.
+    // ⚠ HIGH REACH + LOW SLOPE, tuned in-game and adopted as the default. Those two pull in opposite
+    // directions on the same quantity — the clearance at the rim is slope x falloff — and the pair
+    // that reads best is a BROAD, SHALLOW bowl rather than a narrow steep one: the eye reads a wide
+    // gentle thinning as a body pressing through a sward, and a tight steep one as a hole cut in it.
+    // ⚠ The rim is where the taper STOPS, not where it reaches zero. It only fades out on its own
+    // where slope x falloff exceeds a blade's own height (this bake reaches 251), so a low slope
+    // leaves a residual fold at the rim by construction. At 0.45 x 102 = 46 units that residue is
+    // small against the canopy and the union of a skeleton's discs is irregular enough to hide the
+    // contour; push the slope lower still and the ring is what will show up first.
+    float g_grassCrushSlope   = 0.45f;
+    // 102 is not an arbitrary "high": it is the largest falloff kGrassCrushMaxTexRadius could
+    // actually deliver at the previous cap (26 contact + 102 = 128 = 32 texels), i.e. the most reach
+    // the build this was approved on was capable of. The cap and the slider now sit ABOVE it so the
+    // control has real travel left instead of silently saturating mid-slider.
+    float g_grassCrushFalloff = 102.0f;
+    // ⚠ THE PRESS EASES RATHER THAN LANDING, seconds to close ~63% of the remaining distance. A `min`
+    // straight to the target lands the whole press in ONE FRAME, and a one-frame press is invisible:
+    // the eye is never shown grass GOING down, only grass that is already down, which reads as a bald
+    // patch that was always there rather than as something a body did. Fast enough that the quest
+    // case is unaffected (a body is flat within a few frames of entering the skinned list), slow
+    // enough to be legible. 0 = instant, i.e. the original behaviour.
+    float g_grassCrushPressTime = 0.10f;
+    // The fold's shape. Bend 1.0 = a fully crushed blade lies flat (theta = pi/2).
+    // ⚠ SINK IS NO LONGER LOAD-BEARING, AND ITS DEFAULT CAME BACK DOWN 0.5 -> 0.03 BECAUSE THE FOLD
+    // WAS FIXED UNDER IT. G7a raised it to 0.5 on the reasoning that "a folded card still lies across
+    // the ground you wanted to see" — true, but the reason nothing was lying down was that the fold
+    // was a CURL, not a fold: theta was divided by each VERTEX's own arm, so the base stayed vertical
+    // and only the tip went over. G7c gives the whole card one angle and it genuinely goes flat, so
+    // the sink no longer has to reveal anything.
+    // It also changed UNITS: it now scales with the CARD's height rather than the vertex's, and 0.5
+    // of a 251-unit blade is 125 units of burial — the entire mat, gone. What is left here is a
+    // settle: enough that a fully crushed card sits UNDER the terrain instead of coplanar with it
+    // (which would z-fight on flat ground), and, ramping as c², nothing at all until full crush.
+    float g_grassCrushBend    = 1.0f;
+    float g_grassCrushSink    = 0.03f;
+    // ⚠ THE PLAYER RIDES THE WIRE, NOT THE SKINNED BLOB, and that is not redundancy: IN FIRST PERSON
+    // THE PLAYER HAS NO SKINNED DRAWS AT ALL, which is precisely where a missing stomp is most
+    // obvious. In third person it is harmless double cover — a `min` is idempotent.
+    float g_grassCrushPlayerRadius = 24.0f;
+    // ─── THE DWELL: why a released blade does not move at once ───────────────────────────────────
+    // Grass held under a load takes a SET, and the set takes time to let go of. The clock therefore
+    // runs [0,2] rather than [0,1]: everything above 1 is dwell, in which the blade is still fully
+    // pressed and nothing is recovering. The vertex shader needs no case for it — u = saturate(1 - w)
+    // is already 0 for every w >= 1.
+    // How long a full set takes to let go, in SECONDS. ⚠ Capped in FRAMES by fp16 the same way the
+    // heal is (one ulp in [1,2) is 1/1024), so ~6.2 s at 165 Hz — which makes 6.0 the largest value
+    // that is HONEST on a 165 Hz display: 6.5 would silently deliver 6.21. That is why the slider
+    // stops where it does, and why going further needs a channel with more mantissa rather than a
+    // smaller floor.
+    float g_grassCrushDwellTime  = 6.0f;
+    // How long CONTINUOUS contact takes to lay a full set down, in seconds. This is the "pressed
+    // duration" half, and it is what separates a trail from a resting place: at 1 s a foot passing
+    // over a texel (0.1-0.3 s of contact) charges 10-30% and holds for under two seconds, while
+    // standing still charges the lot and holds for the full dwell.
+    float g_grassCrushChargeTime = 1.0f;
+    // The "weight" half, and it is openly a PROXY: the part's own model bounding radius over this
+    // reference. A guar's body mesh is large, a boot is small, and the AtomicMax means the biggest
+    // part covering a texel sets its dwell — so a standing NPC's feet inherit the chest's weight
+    // rather than the boot's. Weight both scales the charge RATE and caps it, so a light crusher can
+    // never charge a deep set however long it lingers. 0 disables the influence (all full weight).
+    float g_grassCrushWeightRef  = 80.0f;
+    // Cost bounds. The cap is on DISCS, not actors: a bone palette is per PART, so an armoured NPC
+    // ships the same skeleton twenty times over (deduped on a 4-unit key before it reaches here).
+    constexpr uint32_t kMaxGrassCrushers = 4096;
+    // The largest texel radius one crusher may claim. A crusher's cost is quadratic in its radius
+    // and this is paid up to kMaxGrassCrushers times, so an unbounded radius would be a cliff.
+    // ⚠ RAISED 16 -> 32 WITH THE SKIRT, THEN 32 -> 40: the walk has to cover contact + falloff, and a
+    // cap below that clips the taper into exactly the hard rim the skirt exists to remove. 32 was
+    // also A KNOB THAT SILENTLY STOPPED WORKING — it clamped rOut at 128 world units, so every
+    // grassCrushFalloff above 102 did nothing at all while the slider went on to 192. 40 (160 units)
+    // sits above the falloff slider's new 128 ceiling, so the control can no longer lie about what it
+    // is doing. Cost is quadratic in this, which is why it is a cap and not a knob.
+    constexpr float    kGrassCrushMaxTexRadius = 40.0f;
+    // How far above its own clearance a neighbour may count when the resolve differences them for
+    // the lay direction. See grasscrushresolve.comp: unclamped, every rim texel differences against
+    // a 60000-unit sentinel and the whole field lays in four axis-aligned directions.
+    constexpr float    kGrassCrushLayClamp = 48.0f;
+    // ⚠ DERIVED FROM THE SHADER HEADER, NOT RESTATED. grasscrush.srt.h is on this file's include list
+    // (that is how GrassCrushParams and SRT_RES_IDX get here), so these three can be taken straight
+    // off its macros — and that is the point: nothing can static_assert across a C++/FSL boundary,
+    // and a mismatch on the bias or the sentinel would read as "the whole field is crushed to the
+    // floor" rather than as an error. One definition, no copy, nothing to keep in sync.
+    // The Z snap is the window the published .x is clamped to: snapped rather than tracking the eye
+    // so the re-bias fires only on a boundary crossing and fp16 rounding cannot accumulate.
+    constexpr float    kGrassCrushZSnap    = GRASS_CRUSH_REL_MAX;
+    constexpr float    kGrassCrushZBias    = GRASS_CRUSH_ZBIAS;
+    constexpr float    kGrassCrushSentinel = GRASS_CRUSH_SENTINEL;
+    // This frame's discs, EIGHT floats each: xyz = ABSOLUTE world position, w = radius in world
+    // units, then weight + 3 spare. Harvested from the skinned bone walk (which already reads every
+    // bone's world translation for the caster bound), plus the player from the wire.
+    // ⚠ WEIGHT DRIVES THE DWELL ONLY, NEVER THE FOOTPRINT. Scaling the radius by it instead would be
+    // one knob doing two jobs, and the contact silhouette is not negotiable for a legibility
+    // parameter ([[feedback_one_knob_two_jobs]]).
+    std::vector<float> g_grassCrushers;
+    uint32_t  g_grassCrushLastCount = 0;   // observability: discs shipped last frame, after dedupe
+    uint32_t  g_grassCrushLastBones = 0;   // bones seen before dedupe — the ratio IS the dedupe win
+    // ⚠ THE HARVEST RIDES A WALK THAT IS ITSELF GATED. It lives inside the shadow scheduler's
+    // `if (g_live.shadowReady)` block, so a host whose point-shadow path failed to build would never
+    // clear this vector and the dispatch would splat LAST GOOD FRAME's skeletons forever. Stamped
+    // with the frame it was filled on, and the dispatch ignores anything staler than that.
+    uint32_t  g_grassCrushHarvestFrame = 0xFFFFFFFFu;
+    // Did the three dispatches actually run this frame? The consumer's ARM lane keys on it, so a
+    // frame that skipped the field (interior, knob off, no grass) publishes "no crush" rather than
+    // pointing grass at a domain the camera has since walked out of.
+    bool      g_grassCrushRan = false;
+    // The player's feet + a radius, straight off the wire (bridge.h playerCrush). w <= 0 ⇒ no player
+    // this frame (interior, menu, or a client that predates the field).
+    float     g_playerCrush[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+
     constexpr uint32_t kGrassMaxInst = 65536;
     uint32_t  g_grassInstCount     = 0;   // resident grass placements (g_grassInst.size())
     uint32_t  g_grassSubsetCount   = 0;   // grass subset table size (the indirect command count)
@@ -11854,6 +12113,13 @@ namespace {
     unsigned char g_grassBuf[192] = {};
     bstring       g_grassText = bfromarr(g_grassBuf);
     float4        g_grassColor = { 0.70f, 1.0f, 0.70f, 1.0f };
+    // G7 crush readout, beside the crush sliders. The two numbers that matter are the DEDUPE RATIO
+    // (bones seen vs discs shipped — an armoured NPC ships one skeleton per body part, so a ratio
+    // near 1 means the dedupe is not working) and whether the disc cap was hit, which is otherwise
+    // mute: the splat simply stops at kMaxGrassCrushers and part of a crowd quietly does not press.
+    unsigned char g_grassCrushBuf[192] = {};
+    bstring       g_grassCrushText = bfromarr(g_grassCrushBuf);
+    float4        g_grassCrushColor = { 0.70f, 1.0f, 0.70f, 1.0f };
     // IR4 water-height readout, on the Reflection tab. Morrowind carries THREE different ideas of
     // where the water is and they do not agree; the reflection has to pick one, so put all of them on
     // screen next to the sliders instead of leaving it to be re-derived from the source every time.
@@ -15275,6 +15541,35 @@ namespace {
           // groundcover ESP is not in the load order), so this is always wrong; it is here so the
           // claim can be seen rather than read.
           t.checkbox("Grass: near cut + cell ownership (WRONG — shows the G1a hole)", &g_grassNearCut);
+          // ─── G7 PLASTICITY: the crush field ────────────────────────────────────────────────
+          // ⚠ This is the fix for a GAMEPLAY bug, not a look: a corpse in host-owned grass is
+          // invisible, quest bodies included. OFF is the A/B and must be today's image exactly.
+          t.checkbox("Grass: CRUSH field (bodies/actors press grass flat)", &g_grassCrush);
+          // The dial to try FIRST if a body is still occluded: the 12-unit silhouette is the
+          // physically right answer and not necessarily the legible one at range.
+          t.sliderF("Grass crush: margin around a bone (world units)", &g_grassCrushMargin, 0.0f, 64.0f, 2.0f);
+          t.sliderF("Grass crush: bone radius = XY reach AND drop below the joint", &g_grassCrushBoneRadius, 2.0f, 64.0f, 2.0f);
+          t.sliderF("Grass crush: SKIRT reach beyond contact (0 = flat disc, the A/B)", &g_grassCrushFalloff, 0.0f, 128.0f, 4.0f);
+          t.sliderF("Grass crush: skirt slope (clearance gained per unit out; low = broad + shallow)", &g_grassCrushSlope, 0.1f, 3.0f, 0.05f);
+          t.sliderF("Grass crush: press time (s; 0 = lands in one frame, invisible)", &g_grassCrushPressTime, 0.0f, 1.0f, 0.01f);
+          // The SLOW half of the plasticity. The press itself is instant and always will be — that
+          // asymmetry is what makes a body you have never approached already flat when you see it.
+          t.sliderF("Grass crush: HEAL TIME (s for a full imprint to vanish; 0 = permanent)", &g_grassCrushHealTime, 0.0f, 15.0f, 0.5f);
+          t.sliderF("Grass crush: DWELL time (s for a full set to let go = the delay before it springs)", &g_grassCrushDwellTime, 0.0f, 6.0f, 0.25f);
+          t.sliderF("Grass crush: CHARGE time (s of contact to lay a full set down)", &g_grassCrushChargeTime, 0.1f, 10.0f, 0.25f);
+          t.sliderF("Grass crush: weight reference (mesh radius = full weight; 0 = weight off)", &g_grassCrushWeightRef, 0.0f, 200.0f, 5.0f);
+          t.sliderF("Grass crush: PLASTIC residue (what stays down; 1 - this = spring amplitude)", &g_grassCrushPlastic, 0.0f, 1.0f, 0.05f);
+          t.sliderF("Grass crush: spring period (s per swing)", &g_grassCrushRingPeriod, 0.05f, 2.0f, 0.05f);
+          t.sliderF("Grass crush: DAMPING ratio (low = more swings; 1 = no overshoot, the A/B)", &g_grassCrushDamping, 0.05f, 1.0f, 0.05f);
+          t.sliderF("Grass crush: bend gain (1 = a crushed blade lies flat)", &g_grassCrushBend, 0.0f, 2.0f, 0.05f);
+          // ⚠ THE ONE THAT ACTUALLY REVEALS. A folded card still lies across the ground; sink is what
+          // buries it. Ramps as c² so light contact bends and only a real press digs in.
+          t.sliderF("Grass crush: SINK at full crush (x CARD height — a settle, not the reveal)", &g_grassCrushSink, 0.0f, 0.5f, 0.01f);
+          t.sliderF("Grass crush: PLAYER disc radius (first person too)", &g_grassCrushPlayerRadius, 0.0f, 96.0f, 4.0f);
+          // ⚠ Moving this invalidates the stored field (the texels would keep their values and mean
+          // something else), so the next frame starts fresh — imprints in view are lost once.
+          t.sliderF("Grass crush: units/texel (domain = 512 x this)", &g_grassCrushUnits, 1.0f, 16.0f, 0.5f);
+          t.dynamicText("", &g_grassCrushText, &g_grassCrushColor);
           t.dynamicText("", &g_grassText, &g_grassColor);
           t.checkbox("Statics: GPU cull (B3 draw)", &g_gpuStaticsCull);
           t.dropdown("Statics: facing (dark/bright A/B)", &g_staticsFacing, kStaticsFacingNames, 4);
@@ -16596,6 +16891,32 @@ namespace {
                     g_grassNearCut ? "  [NEAR CUT ON — expect a hole at the camera]" : "");
         }
 
+        // G7 crush readout. Same "in the order it can fail" shape: did the field build, is it armed,
+        // did the harvest find anybody, and did the disc cap hold.
+        if (!g_live.grassCrushReady) {
+            g_grassCrushColor = float4(1.0f, 0.45f, 0.45f, 1.0f);
+            bformat(&g_grassCrushText, "crush: FIELD FAILED TO BUILD — grass will never be pressed"
+                                       " (see [grasscrush] in the log)");
+        } else if (!g_grassCrush) {
+            g_grassCrushColor = float4(0.75f, 0.75f, 0.75f, 1.0f);
+            bformat(&g_grassCrushText, "crush: OFF — bodies do not displace grass (the pre-G7 image)");
+        } else if (g_grassCrushLastCount >= kMaxGrassCrushers) {
+            g_grassCrushColor = float4(1.0f, 0.45f, 0.45f, 1.0f);
+            bformat(&g_grassCrushText, "crush: DISC CAP HIT — %u discs from %u bones; some actors"
+                                       " are NOT pressing. Raise kMaxGrassCrushers or the dedupe key.",
+                    g_grassCrushLastCount, g_grassCrushLastBones);
+        } else {
+            g_grassCrushColor = float4(0.70f, 1.0f, 0.70f, 1.0f);
+            bformat(&g_grassCrushText, "crush: %u discs from %u bones (%.1fx dedupe) | %ux%u @ %.1f u"
+                                       " = %.0f u domain | player %s",
+                    g_grassCrushLastCount, g_grassCrushLastBones,
+                    g_grassCrushLastCount ? (double)g_grassCrushLastBones / (double)g_grassCrushLastCount
+                                          : 0.0,
+                    g_live.grassCrushGrid, g_live.grassCrushGrid, (double)g_live.grassCrushUnits,
+                    (double)((float)g_live.grassCrushGrid * g_live.grassCrushUnits),
+                    (g_playerCrush[3] > 0.0f) ? "on the wire" : "MISSING (old client, or interior)");
+        }
+
         // Phase 0: refresh the live-stats text from this frame's counters (Forge bformat pattern).
         bformat(&g_statsText,
                 "near opaque %u | skinned %u | multimap %u\n"
@@ -17390,6 +17711,446 @@ namespace {
         cmdEndDebugMarker(g_live.pCmd);
     }
 
+    // ═══ G7: THE GRASS CRUSH FIELD ═══════════════════════════════════════════════════════════════
+    //
+    // Three compute pipelines, one texture, one accumulator, one crusher buffer, one cbuffer, one
+    // descriptor set. Mirrors createRippleSimResources' shape — eager from buildOpaquePath, NON-FATAL,
+    // returns bool — because the failure contract is the same: anything that does not build leaves
+    // grassCrushReady false, the arm lane publishes 0, and grass.vert branches over the whole block.
+    bool createGrassCrushResources(Renderer* R) {
+        if (g_live.pGrassCrushPipeline) { return g_live.grassCrushReady; }
+
+        {
+            ShaderLoadDesc ss = {};
+            ss.mComp.pFileName = "grasscrush.comp";
+            addShader(R, &ss, &g_live.pGrassCrushShader);
+            ShaderLoadDesc ps = {};
+            ps.mComp.pFileName = "grasscrushsplat.comp";
+            addShader(R, &ps, &g_live.pGrassCrushSplatShader);
+            ShaderLoadDesc rs = {};
+            rs.mComp.pFileName = "grasscrushresolve.comp";
+            addShader(R, &rs, &g_live.pGrassCrushResolveShader);
+            if (!g_live.pGrassCrushShader || !g_live.pGrassCrushSplatShader
+                || !g_live.pGrassCrushResolveShader) {
+                std::printf("[forge][grasscrush] addShader FAILED - crush field disabled\n");
+                return false;
+            }
+            PipelineDesc sp = {}; sp.mType = PIPELINE_TYPE_COMPUTE;
+            sp.mComputeDesc.pShaderProgram = g_live.pGrassCrushShader;
+            addPipeline(R, &sp, &g_live.pGrassCrushPipeline);
+            PipelineDesc pp = {}; pp.mType = PIPELINE_TYPE_COMPUTE;
+            pp.mComputeDesc.pShaderProgram = g_live.pGrassCrushSplatShader;
+            addPipeline(R, &pp, &g_live.pGrassCrushSplatPipeline);
+            PipelineDesc rp = {}; rp.mType = PIPELINE_TYPE_COMPUTE;
+            rp.mComputeDesc.pShaderProgram = g_live.pGrassCrushResolveShader;
+            addPipeline(R, &rp, &g_live.pGrassCrushResolvePipeline);
+            if (!g_live.pGrassCrushPipeline || !g_live.pGrassCrushSplatPipeline
+                || !g_live.pGrassCrushResolvePipeline) {
+                std::printf("[forge][grasscrush] addPipeline FAILED - crush field disabled\n");
+                return false;
+            }
+        }
+
+        // The grid is read ONCE, here — see g_grassCrushGrid. Rounded to a multiple of the dispatch's
+        // 8x8 thread group so no texel of the domain is left un-seeded (an un-seeded texel keeps
+        // whatever the allocation left in it, and a persistent field never forgets a bad value).
+        uint32_t grid = (uint32_t)std::max(64.0f, std::min(g_grassCrushGrid, 2048.0f));
+        grid = ((grid + 7u) / 8u) * 8u;
+        g_live.grassCrushGrid  = grid;
+        g_live.grassCrushUnits = std::max(g_grassCrushUnits, 0.25f);
+
+        // The published field. addTexture-shaped (TEXTURE | RW), NOT addRenderTarget: nothing
+        // rasterises into this — compute writes it and one vertex shader samples it. RGBA16F because
+        // .x is a SIGNED height relative to a snapped origin and .yz is a signed direction; a UNORM
+        // could carry neither. 512² x 8 B = 2 MB.
+        {
+            TextureDesc td = {};
+            td.mWidth = grid; td.mHeight = grid; td.mDepth = 1;
+            td.mArraySize = 1; td.mMipLevels = 1;
+            td.mSampleCount = SAMPLE_COUNT_1;
+            td.mFormat = TinyImageFormat_R16G16B16A16_SFLOAT;
+            td.mStartState = RESOURCE_STATE_UNORDERED_ACCESS;
+            td.mDescriptors = (DescriptorType)(DESCRIPTOR_TYPE_TEXTURE | DESCRIPTOR_TYPE_RW_TEXTURE);
+            td.pName = "grassCrushField";
+            TextureLoadDesc tld = {};
+            tld.ppTexture = &g_live.pGrassCrushField;
+            tld.pDesc = &td;
+            addResource(&tld, nullptr);
+        }
+
+        // The ordered-uint accumulator. GPU-only and never read back: pass 1 seeds every entry from
+        // the previous field, so it needs no clear at all — the seed IS the clear, and it carries the
+        // scroll and the springback with it for free.
+        //
+        // ⚠ THREE LANES, HENCE 3 x grid². Lane 0 (entry i) is the target the passes min into; lane 1
+        // (entry grid² + i) is last frame's published clearance, parked there by the seed so the
+        // splat can rate-limit its descent; lane 2 (entry 2*grid² + i) is the release envelope the
+        // springback runs off — the seed retires a frame's worth of it, the splat pins it back to 1
+        // wherever a crusher covers. The splat cannot fetch that itself: the field texture is
+        // SCROLLED, and pass 3 writes the very texels other threads would be reading — an
+        // unsynchronised read/write across one dispatch. The seed is the one pass where the fetch is
+        // safe and it has already paid for it. 512² x 3 x 4 B = 3 MB.
+        {
+            const uint64_t entries = (uint64_t)grid * grid * 3;
+            BufferLoadDesc ab = {};
+            ab.mDesc.mDescriptors  = (DescriptorType)(DESCRIPTOR_TYPE_RW_BUFFER | DESCRIPTOR_TYPE_BUFFER);
+            ab.mDesc.mMemoryUsage  = RESOURCE_MEMORY_USAGE_GPU_ONLY;
+            ab.mDesc.mFormat       = TinyImageFormat_R32_UINT;
+            ab.mDesc.mStartState   = RESOURCE_STATE_UNORDERED_ACCESS;
+            ab.mDesc.mFirstElement = 0;
+            ab.mDesc.mElementCount = (uint32_t)entries;
+            ab.mDesc.mStructStride = sizeof(uint32_t);
+            ab.mDesc.mSize         = entries * sizeof(uint32_t);
+            ab.mDesc.pName         = "grassCrushAccum";
+            ab.ppBuffer            = &g_live.pGrassCrushAccum;
+            addResource(&ab, nullptr);
+        }
+
+        // The crushers. CPU_TO_GPU + persistently mapped: it is rewritten wholesale every frame from
+        // the skinned bone walk, which is a few thousand float4s at most.
+        // ⚠ A BUFFER AND NOT A CBUFFER ARRAY. 4096 float4s is exactly 64 KB, which is the entire D3D12
+        // cbuffer limit with nothing left over for the params block that has to sit beside it.
+        {
+            BufferLoadDesc cb = {};
+            cb.mDesc.mDescriptors  = DESCRIPTOR_TYPE_BUFFER;
+            cb.mDesc.mMemoryUsage  = RESOURCE_MEMORY_USAGE_CPU_TO_GPU;
+            cb.mDesc.mFlags        = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
+            cb.mDesc.mFormat       = TinyImageFormat_R32G32B32A32_SFLOAT;   // typed Buffer<float4>
+            cb.mDesc.mFirstElement = 0;
+            cb.mDesc.mElementCount = kMaxGrassCrushers * 2;   // stride 2: pos+radius, then weight
+            // 0, not 16 — a TYPED buffer takes its element size from mFormat, and a non-zero stride
+            // is what makes it a structured view instead. Same shape as pUVAnimBuf, which is the
+            // existing Buffer(float4) SRV in this file.
+            cb.mDesc.mStructStride = 0;
+            cb.mDesc.mSize         = (uint64_t)kMaxGrassCrushers * 32;
+            cb.mDesc.pName         = "grassCrushers";
+            cb.ppBuffer            = &g_live.pGrassCrushersBuf;
+            addResource(&cb, nullptr);
+        }
+
+        {
+            BufferLoadDesc pb = {};
+            pb.mDesc.mDescriptors = DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+            pb.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_CPU_TO_GPU;
+            pb.mDesc.mFlags       = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
+            pb.mDesc.mSize        = sizeof(GrassCrushParams);
+            pb.mDesc.pName        = "grassCrushParams";
+            pb.ppBuffer           = &g_live.pGrassCrushCbv;
+            addResource(&pb, nullptr);
+        }
+
+        waitForAllResourceLoads();
+        if (!g_live.pGrassCrushField || !g_live.pGrassCrushAccum
+            || !g_live.pGrassCrushersBuf || !g_live.pGrassCrushCbv) {
+            std::printf("[forge][grasscrush] resource alloc FAILED - crush field disabled\n");
+            return false;
+        }
+
+        // ONE set instance for all three dispatches — see the pGrassCrushCbv declaration: they read
+        // the same parameter block, so there is nothing for a second instance to carry.
+        {
+            DescriptorSetDesc sd = SRT_SET_DESC(GrassCrushSrtData, Persistent, 1, 0);
+            addDescriptorSet(R, &sd, &g_live.pGrassCrushSet);
+            if (!g_live.pGrassCrushSet) {
+                std::printf("[forge][grasscrush] addDescriptorSet FAILED\n"); return false;
+            }
+            DescriptorData d[4] = {};
+            d[0].mIndex     = SRT_RES_IDX(GrassCrushSrtData, Persistent, gGrassCrushParams);
+            d[0].ppBuffers  = &g_live.pGrassCrushCbv;
+            d[1].mIndex     = SRT_RES_IDX(GrassCrushSrtData, Persistent, gGrassCrushers);
+            d[1].ppBuffers  = &g_live.pGrassCrushersBuf;
+            d[2].mIndex     = SRT_RES_IDX(GrassCrushSrtData, Persistent, gGrassCrushAccum);
+            d[2].ppBuffers  = &g_live.pGrassCrushAccum;
+            d[3].mIndex     = SRT_RES_IDX(GrassCrushSrtData, Persistent, gGrassCrushField);
+            d[3].ppTextures = &g_live.pGrassCrushField;
+            updateDescriptorSet(R, 0, g_live.pGrassCrushSet, 4, d);
+        }
+
+        g_live.grassCrushReady = true;
+        // ⚠ THE CROSS-BOUNDARY CHECK, and the two constants on it are the ones that cannot be
+        // static_asserted: GRASS_CRUSH_ZBIAS and GRASS_CRUSH_SENTINEL live in grasscrush.srt.h and a
+        // C++/FSL mismatch on either reads as "the entire field is crushed to the floor", which
+        // nobody would diagnose as a constant. Printed where a diff is one glance.
+        LOG::logline(">> [grasscrush] field ready: %ux%u @ %.2f units/texel (%.0f world units across,"
+                     " +-%.0f around the eye) | %u crusher cap, contact r=%.0f (bone %.0f + margin"
+                     " %.0f, drop %.0f) + skirt %.0f u at slope %.2f | press %.2f s, heal %.1f s,"
+                     " dwell %.1f s (charge %.1f s, weightRef %.0f) | spring: plastic %.2f,"
+                     " %.2f s/swing, damping %.2f"
+                     " | zBias %.0f sentinel %.0f (GRASS_CRUSH_ZBIAS /"
+                     " GRASS_CRUSH_SENTINEL in grasscrush.srt.h must match)",
+                     grid, grid, (double)g_live.grassCrushUnits,
+                     (double)(grid * g_live.grassCrushUnits),
+                     (double)(0.5f * grid * g_live.grassCrushUnits),
+                     kMaxGrassCrushers,
+                     (double)(g_grassCrushBoneRadius + g_grassCrushMargin),
+                     (double)g_grassCrushBoneRadius, (double)g_grassCrushMargin,
+                     (double)g_grassCrushBoneRadius,
+                     (double)g_grassCrushFalloff, (double)g_grassCrushSlope,
+                     (double)g_grassCrushPressTime, (double)g_grassCrushHealTime,
+                     (double)g_grassCrushDwellTime, (double)g_grassCrushChargeTime,
+                     (double)g_grassCrushWeightRef,
+                     (double)g_grassCrushPlastic, (double)g_grassCrushRingPeriod,
+                     (double)g_grassCrushDamping,
+                     (double)kGrassCrushZBias, (double)kGrassCrushSentinel);
+        return true;
+    }
+
+    // G7: bind the crush field into ONE PerFrame set instance.
+    //
+    // ⚠ TWO SETS, NOT SEVEN, and that is the gRippleField precedent rather than bindCausticField's.
+    // grass.vert is the only reader in the process, and a grass draw is issued in exactly two places:
+    // the main colour pass (pPerFrameSet) and the sun-shadow caster loop (pPerFrameSetSun, once per
+    // cascade). The reflect, first-person and sky-height passes never draw grass at all, so a
+    // binding there would be a descriptor nobody indexes.
+    //
+    // Safe to call unconditionally: it no-ops unless the field built, and an unbound slot reads ZERO,
+    // which for this map means .w = 0 = no crush = the pre-G7 image. Validity in its own channel is
+    // what buys that; see the note in opaque.srt.h.
+    void bindGrassCrushField(Renderer* R, DescriptorSet* set, uint32_t index) {
+        if (!set || !g_live.grassCrushReady || !g_live.pGrassCrushField) { return; }
+        DescriptorData d = {};
+        d.mIndex = SRT_RES_IDX(SrtData, PerFrame, gGrassCrush);
+        d.mCount = 1; d.ppTextures = &g_live.pGrassCrushField;
+        updateDescriptorSet(R, index, set, 1, &d);
+    }
+
+    // Move the crush field into SHADER_RESOURCE without stepping it. Needed on every frame where the
+    // three dispatches are skipped (interior, knob off, no grass) but the texture is still in its
+    // UAV creation state while the PerFrame binding says otherwise. grass.vert branches on the arm
+    // lane so it never actually samples on those frames — but a texture left in UNORDERED_ACCESS
+    // under an SRV binding is a state error whatever the shader does with it, and the validation
+    // build is the only one that says so.
+    void parkGrassCrushField() {
+        if (!g_live.grassCrushReady || g_live.grassCrushInSrv) { return; }
+        TextureBarrier fwd = {};
+        fwd.pTexture      = g_live.pGrassCrushField;
+        fwd.mCurrentState = RESOURCE_STATE_UNORDERED_ACCESS;
+        fwd.mNewState     = RESOURCE_STATE_SHADER_RESOURCE;
+        cmdResourceBarrier(g_live.pCmd, 0, nullptr, 1, &fwd, 0, nullptr);
+        g_live.grassCrushInSrv = true;
+    }
+
+    // Advance the crush field by one frame: seed (scroll + recover), scatter, resolve.
+    //
+    // ⚠ RECORDED BEFORE THE SUN-SHADOW AND COLOUR PASSES, in the pure-compute block beside the ripple
+    // advance and the caustic maps, and for the same reason they are there: both consumers must
+    // sample a field that is complete THIS frame. The caster pass shares grass.vert, so a field that
+    // landed after it would fold the blade and not its shadow.
+    //
+    // `dt` is real elapsed seconds, clamped by the caller — a load screen or an alt-tab must not
+    // fast-forward every imprint in the world through half a second of healing.
+    // `exterior` is passed rather than read off g_dlExterior: that global is DEFINED with the DL
+    // block thousands of lines below this point, and a second forward extern for it here is what
+    // MSVC's C7631 refuses (internal linkage, declared before its definition, in a TU that already
+    // carries one such declaration further down). The caller has it in scope; hand it over.
+    void dispatchGrassCrush(float eyeAbsX, float eyeAbsY, float eyeAbsZ, float dt, bool exterior) {
+        g_grassCrushLastCount = 0;
+        g_grassCrushRan = false;
+        if (!g_live.grassCrushReady || !g_grassCrush) { parkGrassCrushField(); return; }
+        // No grass in the frame means nothing reads the field, and the whole point of a persistent
+        // field is that it can be resumed: leaving it alone (rather than clearing it) is why walking
+        // into a hut and out again does not erase the imprints in the meadow. The domain origin is
+        // deliberately NOT committed on a skipped frame — the same correctness requirement
+        // advanceRippleGrid's early-out documents, since the scroll that compensates for camera
+        // motion is applied BY the dispatch.
+        if (!exterior || !g_drawGrass) { parkGrassCrushField(); return; }
+        if (!g_live.pGrassCrushCbv || !g_live.pGrassCrushCbv->pCpuMappedAddress
+            || !g_live.pGrassCrushersBuf || !g_live.pGrassCrushersBuf->pCpuMappedAddress) {
+            parkGrassCrushField();
+            return;
+        }
+
+        // A live units/texel change invalidates the stored field: the texels would keep their values
+        // and mean something else. Cheap to honour — `cleared` false makes the seed scroll the whole
+        // domain out of range, which IS the clear path.
+        const float upt = std::max(g_grassCrushUnits, 0.25f);
+        if (g_live.grassCrushUnits != upt) {
+            g_live.grassCrushUnits = upt;
+            g_live.grassCrushCleared = false;
+        }
+
+        cmdBeginDebugMarker(g_live.pCmd, 0.4f, 0.85f, 0.35f, "GRASS CRUSH field");
+
+        // Back to UAV for the compute below.
+        if (g_live.grassCrushInSrv) {
+            TextureBarrier back = {};
+            back.pTexture      = g_live.pGrassCrushField;
+            back.mCurrentState = RESOURCE_STATE_SHADER_RESOURCE;
+            back.mNewState     = RESOURCE_STATE_UNORDERED_ACCESS;
+            cmdResourceBarrier(g_live.pCmd, 0, nullptr, 1, &back, 0, nullptr);
+            g_live.grassCrushInSrv = false;
+        }
+
+        const uint32_t grid  = g_live.grassCrushGrid;
+        const float    halfW = 0.5f * (float)grid * upt;
+        const float    newOX = std::floor((eyeAbsX - halfW) / upt) * upt;
+        const float    newOY = std::floor((eyeAbsY - halfW) / upt) * upt;
+        int shiftX = 0, shiftY = 0;
+        const bool hadDomain = g_live.grassCrushOriginValid;
+        if (hadDomain) {
+            shiftX = (int)std::lround((newOX - g_live.grassCrushOriginX) / upt);
+            shiftY = (int)std::lround((newOY - g_live.grassCrushOriginY) / upt);
+            // A jump larger than the grid (cell change, fast travel, coc) shares no texels with the
+            // old field, so shifting is pointless. Treat it as a fresh start — and a fresh start is
+            // right in substance too: the imprints belonged to somewhere else.
+            if (std::abs(shiftX) >= (int)grid || std::abs(shiftY) >= (int)grid) {
+                g_live.grassCrushCleared = false;
+                shiftX = shiftY = 0;
+            }
+        }
+        g_live.grassCrushOriginX = newOX;
+        g_live.grassCrushOriginY = newOY;
+        g_live.grassCrushOriginValid = true;
+
+        // The Z the field is stored relative to, snapped so the re-bias is rare. ⚠ The seed pass
+        // needs BOTH origins: the stored .x is relative to whichever origin WROTE it, so converting
+        // it to an absolute height takes the previous one, and storing it again takes this one. Read
+        // before the assignment, and only trusted when the field actually holds a previous frame.
+        const float newOZ = std::floor(eyeAbsZ / kGrassCrushZSnap) * kGrassCrushZSnap;
+        g_live.grassCrushPrevOriginZ = hadDomain ? g_live.grassCrushOriginZ : newOZ;
+        g_live.grassCrushOriginZ = newOZ;
+
+        // ── THE CRUSHERS ─────────────────────────────────────────────────────────────────────────
+        // The bone discs were harvested in the skinned walk far above (it already reads every bone's
+        // world translation for the caster bound); the player is appended here from the wire, because
+        // IN FIRST PERSON THE PLAYER HAS NO SKINNED DRAWS AT ALL and that is exactly the case where a
+        // missing imprint is most obvious. Double cover in third person is harmless — `min` is
+        // idempotent.
+        {
+            float* cb = (float*)g_live.pGrassCrushersBuf->pCpuMappedAddress;
+            // Only THIS frame's harvest counts — see g_grassCrushHarvestFrame.
+            uint32_t n = (g_grassCrushHarvestFrame == g_renderFrame)
+                       ? (uint32_t)(g_grassCrushers.size() / 8) : 0u;
+            if (n > kMaxGrassCrushers) { n = kMaxGrassCrushers; }
+            if (n) { std::memcpy(cb, g_grassCrushers.data(), (size_t)n * 8 * sizeof(float)); }
+            if (g_playerCrush[3] > 0.0f && n < kMaxGrassCrushers) {
+                cb[n * 8 + 0] = g_playerCrush[0];
+                cb[n * 8 + 1] = g_playerCrush[1];
+                cb[n * 8 + 2] = g_playerCrush[2];
+                cb[n * 8 + 3] = g_playerCrush[3];
+                // The player is a full-weight crusher by fiat: there is no mesh on the wire to
+                // measure, and in first person there is no skinned draw to measure either.
+                cb[n * 8 + 4] = 1.0f;
+                cb[n * 8 + 5] = 0.0f; cb[n * 8 + 6] = 0.0f; cb[n * 8 + 7] = 0.0f;
+                ++n;
+            }
+            g_grassCrushLastCount = n;
+        }
+
+        {
+            GrassCrushParams* p = (GrassCrushParams*)g_live.pGrassCrushCbv->pCpuMappedAddress;
+            std::memset(p, 0, sizeof(*p));
+            p->domain[0] = newOX;
+            p->domain[1] = newOY;
+            p->domain[2] = upt;
+            p->domain[3] = (float)grid;
+            // FIRST FRAME (or after a teleport, or after the units slider moved): scroll by more than
+            // the grid so every seed fetch falls outside the previous domain and returns the SENTINEL.
+            // The existing out-of-bounds path IS the clear — no extra kernel and no extra dispatch,
+            // exactly the trick advanceRippleGrid uses. ⚠ And it returns the SENTINEL rather than
+            // zero, which for a clearance field is the whole difference between "nothing here" and
+            // "the ground is crushed flat everywhere" (grasscrush.comp.fsl).
+            if (!g_live.grassCrushCleared) {
+                p->sim[0] = p->sim[1] = (float)(grid * 2);
+            } else {
+                p->sim[0] = (float)shiftX;
+                p->sim[1] = (float)shiftY;
+            }
+            // The heal STEP: what fraction of the release envelope this frame retires. Same dt clamp
+            // the press uses — a load screen or an alt-tab must not fast-forward the world's imprints.
+            // ⚠ AND A FLOOR OF ONE fp16 ULP, WHICH IS NOT A ROUNDING DETAIL. .w lives in an fp16
+            // texture whose ulp just below 1.0 is 1/2048, so a step smaller than that is swallowed by
+            // the round-to-nearest on the way back into the texture and the envelope STALLS — the
+            // imprint never heals at all, at a heal time that merely looks long.
+            // ⚠ THE FLOOR ALSO CAPS THE HEAL, so it is not free to be generous with. It was 1/1024
+            // "for margin", which silently capped the effective heal at 1024 frames — 6.2 s on a
+            // 165 Hz display, less than half of what a 12 s setting asks for. One ulp is exactly
+            // representable (w - ulp lands on the fp16 grid, so it always advances), and it doubles
+            // the usable range to 2048 frames: 12.4 s at 165 Hz, 34 s at 60.
+            // ⚠ The cap is in FRAMES, so it is refresh-rate dependent. If a longer heal is ever
+            // wanted on a fast display, the fix is a channel with more mantissa, not a smaller floor.
+            {
+                const float dtC = std::min(std::max(dt, 0.0f), 0.1f);
+                p->sim[2] = (g_grassCrushHealTime > 1.0e-3f)
+                          ? std::max(dtC / g_grassCrushHealTime, 1.0f / 2048.0f) : 0.0f;
+            }
+            p->sim[3] = (float)g_grassCrushLastCount;
+            p->bias[0] = g_live.grassCrushOriginZ;
+            p->bias[1] = g_live.grassCrushCleared ? g_live.grassCrushPrevOriginZ
+                                                  : g_live.grassCrushOriginZ;
+            // The dwell (G7i). ⚠ The dwell step is floored at ONE fp16 ulp IN [1,2), which is 1/1024 —
+            // twice the recovery region's floor, because that is exactly how fp16's exponent steps
+            // across 1.0. Below it the clock stalls in the dwell and the imprint never heals at all.
+            {
+                const float dtC = std::min(std::max(dt, 0.0f), 0.1f);
+                p->dwell[0] = (g_grassCrushChargeTime > 1.0e-3f) ? (dtC / g_grassCrushChargeTime) : 1.0f;
+                p->dwell[1] = (g_grassCrushDwellTime  > 1.0e-3f)
+                            ? std::max(dtC / g_grassCrushDwellTime, 1.0f / 1024.0f) : 1.0f;
+                p->dwell[2] = g_grassCrushWeightRef;
+                p->dwell[3] = 0.0f;
+            }
+            p->bias[2] = kGrassCrushMaxTexRadius;
+            p->bias[3] = kGrassCrushLayClamp;
+            // The crusher profile: a dome of DROP under the contact radius, then a SKIRT rising at
+            // SLOPE for FALLOFF world units. grasscrush.srt.h has the argument; the short version is
+            // that a flat disc is only ever as wide as the bone cloud, which is a vertical line for a
+            // standing humanoid, and widening a flat disc gives a crop circle rather than a press.
+            p->shape[0] = std::max(0.0f, g_grassCrushBoneRadius);
+            p->shape[1] = std::max(0.0f, g_grassCrushSlope);
+            p->shape[2] = std::max(0.0f, g_grassCrushFalloff);
+            // exp(-dt / tau): the fraction of the remaining distance the press KEEPS this frame. tau
+            // <= 0 means "land it in one frame", which is the pre-skirt behaviour and the A/B.
+            // The same dt clamp the springback uses, and for the same reason — a load screen or an
+            // alt-tab must not fast-forward the world's imprints through half a second.
+            {
+                const float dtC = std::min(std::max(dt, 0.0f), 0.1f);
+                p->shape[3] = (g_grassCrushPressTime > 1.0e-4f)
+                            ? std::exp(-dtC / g_grassCrushPressTime) : 0.0f;
+            }
+        }
+
+        const uint32_t groups = (grid + 7u) / 8u;
+        BufferBarrier  ab = {}; ab.pBuffer = g_live.pGrassCrushAccum;
+        ab.mCurrentState = RESOURCE_STATE_UNORDERED_ACCESS;
+        ab.mNewState     = RESOURCE_STATE_UNORDERED_ACCESS;
+
+        // (1) Seed: one thread per texel. Reads the field at the scrolled source texel, re-biases,
+        //     recovers, writes the ordered-uint key.
+        cmdBindPipeline(g_live.pCmd, g_live.pGrassCrushPipeline);
+        cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pGrassCrushSet);
+        cmdDispatch(g_live.pCmd, groups, groups, 1);
+
+        // (2) Scatter: one GROUP per crusher, AtomicMin over its footprint. The barrier between is a
+        //     genuine read-after-write on the accumulator — the seed must have landed everywhere
+        //     before any disc lowers a texel, or a seed thread could overwrite a splat.
+        if (g_grassCrushLastCount) {
+            cmdResourceBarrier(g_live.pCmd, 1, &ab, 0, nullptr, 0, nullptr);
+            cmdBindPipeline(g_live.pCmd, g_live.pGrassCrushSplatPipeline);
+            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pGrassCrushSet);
+            cmdDispatch(g_live.pCmd, g_grassCrushLastCount, 1, 1);
+        }
+
+        // (3) Resolve: one thread per texel; self + 4 neighbours -> height + lay direction.
+        cmdResourceBarrier(g_live.pCmd, 1, &ab, 0, nullptr, 0, nullptr);
+        cmdBindPipeline(g_live.pCmd, g_live.pGrassCrushResolvePipeline);
+        cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pGrassCrushSet);
+        cmdDispatch(g_live.pCmd, groups, groups, 1);
+
+        g_live.grassCrushCleared = true;
+        g_grassCrushRan = true;
+
+        // Hand the field to grass.vert (colour pass AND sun caster).
+        {
+            TextureBarrier fwd = {};
+            fwd.pTexture      = g_live.pGrassCrushField;
+            fwd.mCurrentState = RESOURCE_STATE_UNORDERED_ACCESS;
+            fwd.mNewState     = RESOURCE_STATE_SHADER_RESOURCE;
+            cmdResourceBarrier(g_live.pCmd, 0, nullptr, 1, &fwd, 0, nullptr);
+            g_live.grassCrushInSrv = true;
+        }
+        cmdEndDebugMarker(g_live.pCmd);
+    }
+
     bool createFroxelResources(Renderer* R) {
         if (g_live.pFroxelAssignPipeline) { return g_live.froxelReady; }
 
@@ -17988,6 +18749,30 @@ namespace ForgeRender {
             { "grassRootAO",         &g_grassRootAO         },
             { "grassRootAOHeight",   &g_grassRootAOHeight   },
             { "grassAOFullTile",     &g_grassAOFullTile     },
+            // G7 crush field. Every one of these is here rather than only on the panel because the
+            // acceptance test is a QUEST BODY in grass, and both questions it asks — "is the body
+            // visible" and "what did the field cost" — have to be answerable from a run the harness
+            // started, with no hand on a slider. grassCrushMargin especially: it is the dial to
+            // widen FIRST if the silhouette is physically right but still not legible at range.
+            // ⚠ grassCrushGrid is read ONCE, at resource creation, so setting it here is the only
+            // way to change it at all — the panel deliberately has no slider for it.
+            { "grassCrushGrid",      &g_grassCrushGrid      },
+            { "grassCrushUnits",     &g_grassCrushUnits     },
+            { "grassCrushHealTime",  &g_grassCrushHealTime  },
+            { "grassCrushDwellTime", &g_grassCrushDwellTime },
+            { "grassCrushChargeTime",&g_grassCrushChargeTime},
+            { "grassCrushWeightRef", &g_grassCrushWeightRef },
+            { "grassCrushPlastic",   &g_grassCrushPlastic   },
+            { "grassCrushRingPeriod",&g_grassCrushRingPeriod},
+            { "grassCrushDamping",   &g_grassCrushDamping   },
+            { "grassCrushMargin",    &g_grassCrushMargin    },
+            { "grassCrushBoneRadius",&g_grassCrushBoneRadius},
+            { "grassCrushSlope",     &g_grassCrushSlope     },
+            { "grassCrushFalloff",   &g_grassCrushFalloff   },
+            { "grassCrushPressTime", &g_grassCrushPressTime },
+            { "grassCrushBend",      &g_grassCrushBend      },
+            { "grassCrushSink",      &g_grassCrushSink      },
+            { "grassCrushPlayerRadius", &g_grassCrushPlayerRadius },
         };
         const BKnob bknobs[] = {
             { "waterNoReflect",     &g_waterNoReflect     },
@@ -18023,6 +18808,9 @@ namespace ForgeRender {
             { "grassVColFlag",       &g_grassVColFlag       },
             { "grassAvoidStatics",   &g_grassAvoidStatics   },
             { "grassPointLights",    &g_grassPointLights    },
+            // G7: the master A/B. 0 must restore today's grass EXACTLY — grass.vert branches on the
+            // arm rather than multiplying by it, so with this off not one texture fetch is paid.
+            { "grassCrush",          &g_grassCrush          },
         };
         std::string spec(env);
         size_t pos = 0;
@@ -18381,6 +19169,18 @@ namespace ForgeRender {
         g_skyParkEyeDelta[0] = d[0];
         g_skyParkEyeDelta[1] = d[1];
         g_skyParkEyeDelta[2] = d[2];
+    }
+
+    // G7: the player's crush point. ⚠ The wire's w is a PRESENCE FLAG, not a radius — see bridge.h.
+    // The radius comes from this side's own knob, so it sits with every other crush dial instead of
+    // being a tuning number duplicated across an IPC boundary. Clamped because it lands straight in
+    // a compute dispatch's disc list and a wild radius is paid quadratically over its footprint.
+    void setPlayerCrush(const float c[4]) {
+        g_playerCrush[0] = c[0];
+        g_playerCrush[1] = c[1];
+        g_playerCrush[2] = c[2];
+        g_playerCrush[3] = (c[3] > 0.5f)
+                         ? std::max(0.0f, std::min(g_grassCrushPlayerRadius, 256.0f)) : 0.0f;
     }
 
     void setClientSyncsOnFence(bool syncs) {
@@ -19279,6 +20079,7 @@ namespace ForgeRender {
     void dispatchGrassCull(); // G1a: the grass cull lane (own instance array + subset table)
     void drawGrass();         // G1: the grass colour draw, inside the DL block
     void publishGrassParams(float* mp, double simTimeSeconds);   // G1: gShadowParams grass lanes
+    void publishGrassCrushParams(float* mp);                     // G7: the crush field's own lanes
     void rebuildSkyHeightMap();  // SH2: clear + statics raster + terrain compute, when the eye leaves its snap cell
     void rebuildSunOccMap(bool force);   // ...and the sun-BLOCKED height derived from it (sun motion / forced)
     void dlDrawHeroBlend();                                                 // Phase 4 post-water hero blend pass
@@ -20920,7 +21721,53 @@ namespace ForgeRender {
             // now — it runs after the prepass has already counted).
             g_skinAlphaPrepassCmds.clear();
             g_lastSkinAlphaPrepassDrawn = 0;
-            if (g_shadowSkinnedCasters && skinnedBlob && skinnedCount && skinnedBytes) {
+            // ─── G7: THE CRUSHER HARVEST RIDES THIS WALK ─────────────────────────────────────
+            // The data is already resident and already read: this loop reads every bone's world
+            // translation (m[12..14]) for the caster bound. Emitting a disc per bone here costs one
+            // extra pass over numbers already in cache, where a second walk of the skinned blob
+            // would re-parse the whole thing.
+            //
+            // ⚠ THE GATE IS WIDENED, and it has to be: the walk used to be `if (g_shadowSkinnedCasters
+            // && ...)`, so turning sun shadows off would silently turn the crush field off too — two
+            // unrelated features on one switch. The caster PUSH stays behind the original flag.
+            g_grassCrushers.clear();
+            g_grassCrushLastBones = 0;
+            g_grassCrushHarvestFrame = g_renderFrame;
+            const bool crushHarvest = g_grassCrush && g_live.grassCrushReady
+                                   && g_dlExterior && g_drawGrass;
+            // Reject far bones before they cost anything. Bones are camera-relative and the domain is
+            // centred on the eye, so the whole test is a box on |rel.xy| — and it throws away every
+            // actor in the cell but the handful near the player, which is the entire population the
+            // field can represent.
+            const float crushReach = crushHarvest
+                ? (0.5f * (float)g_live.grassCrushGrid * g_live.grassCrushUnits
+                   + g_grassCrushBoneRadius + g_grassCrushMargin + g_grassCrushFalloff)
+                : 0.0f;
+            const float crushDiscR = std::max(0.0f, g_grassCrushBoneRadius)
+                                   + std::max(0.0f, g_grassCrushMargin);
+            // DEDUPE on a 4-unit quantised key. ⚠ A BONE PALETTE IS PER PART, so an armoured NPC
+            // ships the SAME skeleton once per body part — twenty-odd times — and every one of them
+            // would splat the identical set of discs. `min` makes that harmless for correctness and
+            // expensive for nothing, and the disc cap is what it would actually eat.
+            // Open-addressed, generation-stamped so no per-frame clear is needed; the key is an
+            // EXACT 21-bits-per-axis pack rather than a hash, so a collision cannot silently drop a
+            // real disc ([[project_texture_hash_collisions]]).
+            //
+            // ⚠ THE KEY IS XY ONLY, AND THE COLUMN COLLAPSES TO ITS LOWEST BONE. It used to include Z,
+            // which kept every bone of a vertical stack — and a standing humanoid IS a vertical stack:
+            // forty-odd bones over one footprint, each splatting the same footprint at a different
+            // height. Every crusher shares one radius and one profile, so the lowest bone in a column
+            // is BELOW the others everywhere in it, and `min` was discarding the rest anyway. Keeping
+            // only the lowest is not an approximation of that, it is the same field for a third of the
+            // discs — which is what pays for the skirt's much larger footprint.
+            constexpr uint32_t kCrushSeenSlots = 8192;   // power of two, >= 2x the disc cap
+            static uint64_t s_crushSeenKey[kCrushSeenSlots] = {};
+            static uint32_t s_crushSeenGen[kCrushSeenSlots] = {};
+            static uint32_t s_crushSeenIdx[kCrushSeenSlots] = {};   // which disc owns this XY cell
+            static uint32_t s_crushGen = 0;
+            ++s_crushGen;
+            if (crushHarvest) { g_grassCrushers.reserve((size_t)kMaxGrassCrushers * 8); }
+            if ((g_shadowSkinnedCasters || crushHarvest) && skinnedBlob && skinnedCount && skinnedBytes) {
                 const uint8_t* sp   = (const uint8_t*)skinnedBlob;
                 const uint8_t* sEnd = sp + skinnedBytes;
                 uint32_t idx = 0;
@@ -20964,8 +21811,75 @@ namespace ForgeRender {
                     // casts nearly nothing. Registering it (rather than skipping) is also what keeps
                     // idx walking in step with the prepass's instance slots.
                     sc.alphaCast = skinIsBlended(item);
-                    g_skinnedCasters.push_back(sc);
+                    if (g_shadowSkinnedCasters) { g_skinnedCasters.push_back(sc); }
                     ++idx;
+
+                    // G7: one crush disc per bone, deduped, absolutised. The bone's own Z is the
+                    // clearance — see grasscrush.srt.h for why a point cloud of flat discs at bone
+                    // height is the right shape and why no death state is needed to read it.
+                    if (crushHarvest && g_grassCrushers.size() < (size_t)kMaxGrassCrushers * 8) {
+                        // The WEIGHT proxy: this part's own model bounding radius against the
+                        // reference. Openly a guess (the user's phrase was "can be guessed from bone
+                        // volume") — a guar's body mesh is large and a boot is small — and the
+                        // AtomicMax in the splat means the biggest part covering a texel is the one
+                        // that sets its dwell, so a standing NPC's feet inherit the chest's weight
+                        // rather than the boot's. Ref 0 disables the influence outright.
+                        const float crushW = (g_grassCrushWeightRef > 1.0f)
+                            ? std::min(1.0f, std::max(0.10f,
+                                  g_meshes[mslot].localRadius / g_grassCrushWeightRef))
+                            : 1.0f;
+                        for (uint32_t bb = 0; bb < bones; ++bb) {
+                            const float* m = (const float*)(palette + (size_t)bb * 64);
+                            if (std::fabs(m[12]) > crushReach || std::fabs(m[13]) > crushReach) {
+                                continue;
+                            }
+                            ++g_grassCrushLastBones;
+                            const int qx = (int)std::floor(m[12] * 0.25f);
+                            const int qy = (int)std::floor(m[13] * 0.25f);
+                            const uint64_t key =
+                                  ((uint64_t)((qx + 0x100000) & 0x1FFFFF))
+                                | ((uint64_t)((qy + 0x100000) & 0x1FFFFF) << 21);
+                            uint32_t h = (uint32_t)((key * 0x9E3779B97F4A7C15ull) >> 51)
+                                       & (kCrushSeenSlots - 1u);
+                            uint32_t owner = 0xFFFFFFFFu;
+                            for (uint32_t probe = 0; probe < kCrushSeenSlots; ++probe) {
+                                if (s_crushSeenGen[h] != s_crushGen) { break; }
+                                if (s_crushSeenKey[h] == key) { owner = s_crushSeenIdx[h]; break; }
+                                h = (h + 1u) & (kCrushSeenSlots - 1u);
+                            }
+                            if (owner != 0xFFFFFFFFu) {
+                                // This XY cell already has a disc. Keep whichever bone is LOWER — its
+                                // profile lies under the other's everywhere in a footprint they share,
+                                // so the higher one contributes nothing a `min` would not discard.
+                                float* d = &g_grassCrushers[(size_t)owner * 8];
+                                const float z = m[14] + g_eyeAbsShadow[2];
+                                if (z < d[2]) {
+                                    d[0] = m[12] + g_eyeAbsShadow[0];
+                                    d[1] = m[13] + g_eyeAbsShadow[1];
+                                    d[2] = z;
+                                }
+                                // Weight is a MAX over the cell, not the lowest bone's: a heavy part
+                                // overlapping a light one should charge the dwell like the heavy one,
+                                // which is the same rule the splat's AtomicMax applies across texels.
+                                if (crushW > d[4]) { d[4] = crushW; }
+                                continue;
+                            }
+                            if (g_grassCrushers.size() >= (size_t)kMaxGrassCrushers * 8) { break; }
+                            // Claim the slot only now that the disc is certain to exist — the index
+                            // recorded here has to be one the fixup above can dereference.
+                            s_crushSeenGen[h] = s_crushGen;
+                            s_crushSeenKey[h] = key;
+                            s_crushSeenIdx[h] = (uint32_t)(g_grassCrushers.size() / 8);
+                            g_grassCrushers.push_back(m[12] + g_eyeAbsShadow[0]);
+                            g_grassCrushers.push_back(m[13] + g_eyeAbsShadow[1]);
+                            g_grassCrushers.push_back(m[14] + g_eyeAbsShadow[2]);
+                            g_grassCrushers.push_back(crushDiscR);
+                            g_grassCrushers.push_back(crushW);
+                            g_grassCrushers.push_back(0.0f);
+                            g_grassCrushers.push_back(0.0f);
+                            g_grassCrushers.push_back(0.0f);
+                        }
+                    }
                 }
             }
             g_setupBlkMs[kSetupBlkSkinned] += hostNowMs() - tBlkSkin0;
@@ -22858,6 +23772,36 @@ namespace ForgeRender {
               tb.mNewState     = RESOURCE_STATE_UNORDERED_ACCESS;
               cmdResourceBarrier(g_live.pCmd, 0, nullptr, 1, &tb, 0, nullptr);
               g_live.causticInSrv = false;
+            }
+        }
+
+        // ---- G7: the GRASS CRUSH field ----------------------------------------------------------
+        // In the same pure-compute section as the ripple sims and the caustic maps, and for the same
+        // reason all three are here: the passes that read it must sample a field that is complete
+        // THIS frame. ⚠ And it has to be before the SUN SHADOW pass as well as before the colour
+        // pass — the grass caster shares grass.vert, so a field that landed later would fold the
+        // blade and leave its shadow standing.
+        {
+            // Its own clock. The ripple block's dtFrame is scoped to that block, and copying a
+            // wall-clock delta between two subsystems is exactly how two of them end up disagreeing
+            // about how much time passed. Clamped, because a load screen or an alt-tab must not
+            // fast-forward every imprint in the world through half a second of healing.
+            static double s_crushLastMs = -1.0;
+            const double  nowMs = hostNowMs();
+            if (s_crushLastMs < 0.0) { s_crushLastMs = nowMs; }
+            const float dtCrush = (float)((nowMs - s_crushLastMs) * 0.001);
+            s_crushLastMs = nowMs;
+            // gpuPhaseBegin/End are renderScene-local lambdas (they capture this frame's query
+            // slots), so the timestamp pair brackets the CALL rather than living inside the free
+            // function — which also makes the phase cover the skipped-frame path honestly at 0.00.
+            gpuPhaseBegin(kGpuPhaseGrassCrush);
+            dispatchGrassCrush(g_eyeAbsShadow[0], g_eyeAbsShadow[1], g_eyeAbsShadow[2], dtCrush,
+                               g_dlExterior);
+            gpuPhaseEnd(kGpuPhaseGrassCrush);
+            // UNCONDITIONALLY, armed or not — see publishGrassCrushParams for why a lane only the
+            // armed path maintains is a lane that goes stale the first time a checkbox moves.
+            if (g_live.pShadowMaskParamsCbv && g_live.pShadowMaskParamsCbv->pCpuMappedAddress) {
+                publishGrassCrushParams((float*)g_live.pShadowMaskParamsCbv->pCpuMappedAddress);
             }
         }
 
@@ -27796,7 +28740,7 @@ namespace ForgeRender {
                          g_lastCpuPhaseMs[kGpuPhaseColorAlpha],
                          g_lastCpuPhaseMs[kGpuPhaseResolve],
                          g_lastRecMs - g_lastCpuPhaseMs[kGpuPhaseFrame]);
-            LOG::logline(">> [forge-hb] gpu split: cull=%.2f prepass=%.2f shadow=%.2f (st=%.2f dyn=%.2f sun=%.2f) postdepth=%.2f (lin=%.2f ao=%.2f mask=%.2f) reflect=%.2f color=%.2f water=%.2f caustic=%.2f bloom=%.2f(L%u) resolve=%.2f ms"
+            LOG::logline(">> [forge-hb] gpu split: cull=%.2f prepass=%.2f shadow=%.2f (st=%.2f dyn=%.2f sun=%.2f) postdepth=%.2f (lin=%.2f ao=%.2f mask=%.2f) reflect=%.2f color=%.2f water=%.2f caustic=%.2f grasscrush=%.2f(%u) bloom=%.2f(L%u) resolve=%.2f ms"
                          " | hiz=%.2f (prologue, overruns=%u) | shadowCasters=%u maskSlots=%u(dyn=%u)"
                          " | nearTris=%.2fM atDraws=%u"
                          " | terrain=%u/%u cells (nearCut=%u) %.2fM tris (lod %u/%u/%u/%u/%u/%u)%s",
@@ -27817,6 +28761,12 @@ namespace ForgeRender {
                          // DISTURBED AREA, so this number is expected to move with swimmers and rain
                          // and to sit at its static floor on calm water.
                          g_lastGpuPhaseMs[kGpuPhaseCaustic],
+                         // grasscrush=<ms>(<discs>) — G7. Three dispatches over a 512² field: two
+                         // full-grid passes whose cost is fixed, and a scatter whose cost is
+                         // proportional to the DISC COUNT in brackets beside it. A 0.00 with a
+                         // non-zero count would be a timing problem; a 0.00 with (0) is the block
+                         // not running at all — interior, knob off, or nobody near the player.
+                         g_lastGpuPhaseMs[kGpuPhaseGrassCrush], g_grassCrushLastCount,
                          // bloom=<ms>(L<levels>) — step 4. L0 means the pass did not run this frame
                          // (checkbox off, not scene-referred, or the pyramid failed to build), which is
                          // the distinction worth logging: a 0.00 with L7 would be a timing problem,
@@ -28431,6 +29381,66 @@ namespace ForgeRender {
                 if (newCD)  { removeShader(R, newCD); }
                 if (newCR)  { removeShader(R, newCR); }
                 LOG::logline("!! [forge][caustic] hot-reload ABANDONED — previous shaders kept");
+                LOG::flush();
+            }
+        }
+
+        // G7: the three crush-field shaders, on the same trigger and with the same LOAD FIRST,
+        // DESTROY SECOND discipline ([[feedback_load_first_destroy_second]]). Hot-reload is not a
+        // convenience here either: the crush PROFILE — how wide a disc reads, what the lay gradient
+        // does at a silhouette edge, whether a standing NPC's ankles look right — can only be judged
+        // by watching a body lie in grass, and a host restart per attempt would make that untunable.
+        //
+        // ALL THREE OR NONE. They share grasscrush.srt.h, so an edit to the key encoding or the
+        // sentinel changes every one of them at once; committing a partial set would run one pass
+        // against another pass's idea of what a uint in that buffer means, and the symptom would be
+        // a field crushed to the floor rather than an error.
+        if (g_live.pGrassCrushShader && g_live.pGrassCrushSplatShader
+            && g_live.pGrassCrushResolveShader) {
+            Shader* newG = nullptr; Shader* newGS = nullptr; Shader* newGR = nullptr;
+            ShaderLoadDesc gd = {}; gd.mComp.pFileName = "grasscrush.comp";
+            addShader(R, &gd, &newG);
+            ShaderLoadDesc sd = {}; sd.mComp.pFileName = "grasscrushsplat.comp";
+            addShader(R, &sd, &newGS);
+            ShaderLoadDesc rd2 = {}; rd2.mComp.pFileName = "grasscrushresolve.comp";
+            addShader(R, &rd2, &newGR);
+            Pipeline* newGP = nullptr; Pipeline* newGSP = nullptr; Pipeline* newGRP = nullptr;
+            if (newG && newGS && newGR) {
+                PipelineDesc gp = {}; gp.mType = PIPELINE_TYPE_COMPUTE;
+                gp.mComputeDesc.pShaderProgram = newG;
+                addPipeline(R, &gp, &newGP);
+                PipelineDesc sp2 = {}; sp2.mType = PIPELINE_TYPE_COMPUTE;
+                sp2.mComputeDesc.pShaderProgram = newGS;
+                addPipeline(R, &sp2, &newGSP);
+                PipelineDesc rp2 = {}; rp2.mType = PIPELINE_TYPE_COMPUTE;
+                rp2.mComputeDesc.pShaderProgram = newGR;
+                addPipeline(R, &rp2, &newGRP);
+            }
+            if (newGP && newGSP && newGRP) {
+                removePipeline(R, g_live.pGrassCrushPipeline);
+                removePipeline(R, g_live.pGrassCrushSplatPipeline);
+                removePipeline(R, g_live.pGrassCrushResolvePipeline);
+                removeShader(R, g_live.pGrassCrushShader);
+                removeShader(R, g_live.pGrassCrushSplatShader);
+                removeShader(R, g_live.pGrassCrushResolveShader);
+                g_live.pGrassCrushShader = newG;         g_live.pGrassCrushPipeline = newGP;
+                g_live.pGrassCrushSplatShader = newGS;   g_live.pGrassCrushSplatPipeline = newGSP;
+                g_live.pGrassCrushResolveShader = newGR; g_live.pGrassCrushResolvePipeline = newGRP;
+                // ⚠ THROW THE FIELD AWAY. A reload usually means the ENCODING or the meaning of a
+                // stored texel just changed, and this is persistent state — keeping it would fold
+                // grass against numbers written by the previous shader. One frame of "no crush".
+                g_live.grassCrushCleared = false;
+                LOG::logline(">> [forge][grasscrush] grasscrush.comp + grasscrushsplat.comp + "
+                             "grasscrushresolve.comp hot-reloaded (field cleared)");
+                LOG::flush();
+            } else {
+                if (newGP)  { removePipeline(R, newGP); }
+                if (newGSP) { removePipeline(R, newGSP); }
+                if (newGRP) { removePipeline(R, newGRP); }
+                if (newG)   { removeShader(R, newG); }
+                if (newGS)  { removeShader(R, newGS); }
+                if (newGR)  { removeShader(R, newGR); }
+                LOG::logline("!! [forge][grasscrush] hot-reload ABANDONED — previous shaders kept");
                 LOG::flush();
             }
         }
@@ -29217,7 +30227,11 @@ namespace ForgeRender {
     // stores it right after the radius); radius is measured about IT, not about the placement origin,
     // so any consumer that treats the origin as the sphere centre is wrong by |centre| — see
     // buildStaticsGrid, which resolves it to world space once.
-    struct StaticsDefCPU { uint32_t firstSubset, numSubsets; float radius; float centre[3]; uint8_t type; };
+    // topZ = the def's model-space TOP (max subset aabbMax.z), i.e. how far the piece rises above the
+    // placement origin before the instance scale. Read straight out of static_meshes' per-subset AABB,
+    // which the parse used to skip. G7's crush fold needs it: the whole card must swing by ONE angle
+    // about its base, and that angle is set by where the TIP is, not by where each vertex is.
+    struct StaticsDefCPU { uint32_t firstSubset, numSubsets; float radius; float centre[3]; float topZ; uint8_t type; };
 
     Buffer*   g_pStaticsVB       = nullptr;   // mega per-vertex (GPU_ONLY, stride 20)
     Buffer*   g_pStaticsIB       = nullptr;   // mega 16-bit index (GPU_ONLY)
@@ -31254,10 +32268,16 @@ namespace ForgeRender {
             uint8_t  stype   = *(p + 4 + 4 + 12);                       // StaticType (dlformat.h)
             p += 4 + 4 + 12 + 1;                          // numSubsets + radius + center + type
             StaticsDefCPU def; def.firstSubset = (uint32_t)g_staticsSubsets.size(); def.numSubsets = numSubsets;
-            def.radius = sradius; def.type = stype;
+            def.radius = sradius; def.type = stype; def.topZ = 0.0f;
             def.centre[0] = scentre[0]; def.centre[1] = scentre[1]; def.centre[2] = scentre[2];
             for (uint32_t ss = 0; ss < numSubsets; ++ss) {
                 if (p + 44 > end) { p = end; break; }
+                // ⚠ THE AABB IS READ NOW RATHER THAN SKIPPED, for one float: aabbMax.z, the model
+                // top. It is at +28 (r 4, c 12, amin 12) and .z is 8 into it. Taking the MAX over the
+                // def's subsets is right because the def is what an instance places — a grass clump
+                // is several quads under one origin and the fold has to be told the tallest.
+                float amaxZ = 0.0f; std::memcpy(&amaxZ, p + 4 + 12 + 12 + 8, 4);
+                if (amaxZ > def.topZ) { def.topZ = amaxZ; }
                 p += 4 + 12 + 12 + 12;                    // subset sphere + aabbMin + aabbMax
                 int verts = 0, faces = 0;
                 std::memcpy(&verts, p, 4); std::memcpy(&faces, p + 4, 4); p += 8;
@@ -33658,6 +34678,7 @@ namespace ForgeRender {
     // the two want opposite responses — so the field reports its own spread rather than being taken
     // on trust. [[feedback_verify_the_right_artifact]]
     float    g_grassWinScaleMin = 0.0f, g_grassWinScaleMax = 0.0f;
+    float    g_grassWinBladeMin = 0.0f, g_grassWinBladeMax = 0.0f;   // W2.w range (the G7 fold arm)
     float    g_grassWinHueSpan = 0.0f, g_grassWinValSpan = 0.0f;
     uint32_t g_grassWinOverflow = 0;
     float    g_grassWinAutoThin = 1.0f;   // < 1 when the window had to be thinned to fit the ring
@@ -33894,6 +34915,11 @@ namespace ForgeRender {
         g_grassWinCells = g_grassWinRejSlope = g_grassWinRejStatic = g_grassWinRejNoLand = 0;
         g_grassWinOverflow = 0; g_grassWinShrunk = 0;
         float sMin = 1e9f, sMax = -1e9f, hLo = 1e9f, hHi = -1e9f, vLo = 1e9f, vHi = -1e9f;
+        // Observability for the G7 fold: the BLADE HEIGHT range this window actually shipped in W2.w.
+        // The crush angle is headroom / this, so a def whose AABB read as zero would silently fold
+        // every blade flat and a def that read too tall would never fold at all — both invisible in
+        // the image as anything but "the crush is wrong", which is a bad way to find a parse bug.
+        float bMin = 1e9f, bMax = -1e9f;
         g_grassWinAutoThin = 1.0f;
 
         // ⚠ Size the window BEFORE building it. Measured over this bake, the worst 3x3 window is
@@ -34159,6 +35185,19 @@ namespace ForgeRender {
                             gi.world[8]  = up[0] * scale;
                             gi.world[9]  = up[1] * scale;
                             gi.world[10] = up[2] * scale;
+                            // ⚠ world[11] IS W2.w: STRUCTURALLY ZERO FOR AN AFFINE TRANSFORM, AND
+                            // BORROWED HERE FOR THE BLADE'S FULL WORLD HEIGHT. Same lane discipline
+                            // as world[3] below — cullscatter copies the rows through verbatim, and
+                            // grass.vert's row combination is a float4 add, so this lands in
+                            // worldPos.w and is overwritten with 1 on the line after it.
+                            // G7's fold needs it because a card must swing by ONE angle about its
+                            // base: dividing the headroom by the VERTEX's own arm gives a curl whose
+                            // middle never lies down, which is what left a body on the ground still
+                            // hidden to chest height. It rides the Z-AXIS row deliberately — a
+                            // height is a Z quantity, and the two travel together if either moves.
+                            gi.world[11] = def.topZ * scale;
+                            if (gi.world[11] < bMin) { bMin = gi.world[11]; }
+                            if (gi.world[11] > bMax) { bMax = gi.world[11]; }
                             gi.world[12] = wx; gi.world[13] = wy; gi.world[14] = wz;
                             gi.world[15] = 1.0f;
 
@@ -34209,6 +35248,8 @@ namespace ForgeRender {
         g_grassInstCount = (uint32_t)g_grassInst.size();
         g_grassWinScaleMin = (sMax >= sMin) ? sMin : 0.0f;
         g_grassWinScaleMax = (sMax >= sMin) ? sMax : 0.0f;
+        g_grassWinBladeMin = (bMax >= bMin) ? bMin : 0.0f;
+        g_grassWinBladeMax = (bMax >= bMin) ? bMax : 0.0f;
         g_grassWinHueSpan  = (hHi >= hLo) ? (hHi - hLo) : 0.0f;
         g_grassWinValSpan  = (vHi >= vLo) ? (vHi - vLo) : 0.0f;
         g_grassWinMs = hostNowMs() - t0;
@@ -34264,11 +35305,12 @@ namespace ForgeRender {
 
         LOG::logline(">> [forge][grass] window (%d,%d) r=%d: %u blades over %u cells in %.2f ms "
                      "(rejected %u slope, %u statics, %u no-land; %u shrunk; autothin %.2f%s)"
-                     " | scale %.2f..%.2f  hue span %.2f  val span %.2f",
+                     " | scale %.2f..%.2f  hue span %.2f  val span %.2f  bladeH %.0f..%.0f",
                      ecx, ecy, radius, g_grassInstCount, g_grassWinCells, g_grassWinMs,
                      g_grassWinRejSlope, g_grassWinRejStatic, g_grassWinRejNoLand,
                      g_grassWinShrunk, g_grassWinAutoThin, g_grassWinOverflow ? "; RING FULL" : "",
-                     g_grassWinScaleMin, g_grassWinScaleMax, g_grassWinHueSpan, g_grassWinValSpan);
+                     g_grassWinScaleMin, g_grassWinScaleMax, g_grassWinHueSpan, g_grassWinValSpan,
+                     (double)g_grassWinBladeMin, (double)g_grassWinBladeMax);
     }
 
     // Create the persistent per-frame instance + indirect-arg rings (CPU_TO_GPU, mapped). Replaces
@@ -36067,6 +37109,71 @@ namespace ForgeRender {
         mp[kGrassParams5Float + 1] = (g_grassRootAOHeight > 1.0f) ? (1.0f / g_grassRootAOHeight) : 1.0f;
         mp[kGrassParams5Float + 2] = g_grassPointLights ? 1.0f : 0.0f;
         mp[kGrassParams5Float + 3] = std::max(0.0f, std::min(g_grassShadowOpacity, 1.0f));
+        // ⚠ grassParams6/7 (G7's crush lanes) are NOT written here. They describe the domain the
+        // compute passes committed this frame, and this publisher runs in the shadow scheduler —
+        // thousands of lines before the dispatch. See publishGrassCrushParams.
+    }
+
+    // G7 — the crush field's two consumer lanes. Split out of publishGrassParams rather than inlined
+    // because the numbers come from a DIFFERENT place: everything above is a knob, these describe the
+    // domain the compute passes actually committed this frame.
+    //
+    // ⚠ THIS RUNS EVERY FRAME, ARMED OR NOT. A lane that is only written on the armed path goes stale
+    // the first time somebody unticks a checkbox, and a stale DOMAIN is worse than a stale strength:
+    // grass would keep sampling a window the camera has walked out of and fold against imprints that
+    // are no longer under it. The arm is a lane of its own (grassParams7.z) precisely so the geometry
+    // lanes can stay unconditional.
+    //
+    // ⚠⚠ AND IT IS CALLED FROM THE DISPATCH SITE, NOT FROM publishGrassParams. That publisher runs
+    // inside the shadow scheduler, thousands of lines EARLIER in the frame than the compute block
+    // that commits the domain — so a lane written there would describe LAST frame's window while the
+    // field describes this one, and the crush would lag the camera by exactly one scroll. This is the
+    // same requirement the caustic consumer lanes state at length, and the same fix: publish from
+    // where the number is decided.
+    void publishGrassCrushParams(float* mp) {
+        if (!mp) { return; }
+        // ⚠ g_grassCrushRan, not just "is the field ready". A frame that SKIPPED the dispatch did not
+        // commit a domain, so its stored origins describe wherever the camera was when it last ran —
+        // and arming the consumer against those would fold grass in one place because a body was
+        // pressing somewhere else. It also covers the first frame, where the texture still holds
+        // whatever the allocation left in it: one frame of "no crush" is the whole price of not
+        // having a fill pass that exists to run once (the trade causticDynPrimed makes).
+        const bool live = g_grassCrushRan && g_grassCrush && g_live.grassCrushReady
+                       && g_live.grassCrushGrid;
+        const float upt  = std::max(g_live.grassCrushUnits, 0.25f);
+        const float span = (float)g_live.grassCrushGrid * upt;
+        // EYE-RELATIVE, like every other spatial anchor the world shaders consume: grass.vert samples
+        // at In.W3.xy, which is camera-relative, so an absolute origin would only be subtracted again
+        // at Vvardenfell's scale ([[project_forge_precision_far_origin]]).
+        mp[kGrassParams6Float + 0] = g_live.grassCrushOriginX - g_eyeAbsShadow[0];
+        mp[kGrassParams6Float + 1] = g_live.grassCrushOriginY - g_eyeAbsShadow[1];
+        mp[kGrassParams6Float + 2] = (span > 1.0f) ? (1.0f / span) : 0.0f;
+        mp[kGrassParams6Float + 3] = g_live.grassCrushOriginZ - g_eyeAbsShadow[2];
+        mp[kGrassParams7Float + 0] = std::max(0.0f, std::min(g_grassCrushBend, 2.0f));
+        mp[kGrassParams7Float + 1] = std::max(0.0f, std::min(g_grassCrushSink, 1.5f));
+        mp[kGrassParams7Float + 2] = live ? 1.0f : 0.0f;
+        mp[kGrassParams7Float + 3] = 0.0f;
+        // G7e/f — the springback, as the step response of a damped second-order system, expressed PER
+        // UNIT u (normalised time since release) rather than per second, so the shader never has to
+        // be told healTime: it only ever sees .w.
+        //
+        // The user-facing pair is the DAMPED period (what you would actually count) and the damping
+        // ratio, so wd comes straight off the period and the decay rate is derived:
+        //   wd = 2pi / period ;  wn = wd / sqrt(1 - z²) ;  decay = z * wn = wd * z / sqrt(1 - z²).
+        // z is clamped below 1 because at exactly 1 the damped frequency is zero — critical damping
+        // is the LIMIT of this form, not a member of it, and the expression divides by that root.
+        {
+            const float healT = std::max(g_grassCrushHealTime, 1.0e-3f);
+            const float z     = std::max(0.02f, std::min(g_grassCrushDamping, 0.99f));
+            const float wd    = 6.28318531f / std::max(g_grassCrushRingPeriod, 1.0e-3f);
+            const float decay = wd * z / std::sqrt(1.0f - z * z);
+            mp[kGrassParams8Float + 0] = std::max(0.0f, std::min(g_grassCrushPlastic, 1.0f));
+            mp[kGrassParams8Float + 1] = wd * healT;
+            mp[kGrassParams8Float + 2] = decay * healT;
+            // The sin coefficient, decay/wd. It is what makes the release start from REST instead of
+            // jerking — see the ⚠ in grass.vert and in shadowparams.h.fsl.
+            mp[kGrassParams8Float + 3] = decay / wd;
+        }
     }
 
     // SH2 (tasks/lighting.md) — rebuild the top-down world HEIGHT map.
@@ -38742,6 +39849,18 @@ namespace ForgeRender {
         if (g_live.pCausticShader)          { removeShader(R, g_live.pCausticShader); }
         if (g_live.pCausticDynShader)       { removeShader(R, g_live.pCausticDynShader); }
         if (g_live.pCausticResolveShader)   { removeShader(R, g_live.pCausticResolveShader); }
+        // G7 crush field. Same order, same reason as the caustic block above it.
+        if (g_live.pGrassCrushSet)             { removeDescriptorSet(R, g_live.pGrassCrushSet); }
+        if (g_live.pGrassCrushField)           { removeResource(g_live.pGrassCrushField); }
+        if (g_live.pGrassCrushAccum)           { removeResource(g_live.pGrassCrushAccum); }
+        if (g_live.pGrassCrushersBuf)          { removeResource(g_live.pGrassCrushersBuf); }
+        if (g_live.pGrassCrushCbv)             { removeResource(g_live.pGrassCrushCbv); }
+        if (g_live.pGrassCrushPipeline)        { removePipeline(R, g_live.pGrassCrushPipeline); }
+        if (g_live.pGrassCrushSplatPipeline)   { removePipeline(R, g_live.pGrassCrushSplatPipeline); }
+        if (g_live.pGrassCrushResolvePipeline) { removePipeline(R, g_live.pGrassCrushResolvePipeline); }
+        if (g_live.pGrassCrushShader)          { removeShader(R, g_live.pGrassCrushShader); }
+        if (g_live.pGrassCrushSplatShader)     { removeShader(R, g_live.pGrassCrushSplatShader); }
+        if (g_live.pGrassCrushResolveShader)   { removeShader(R, g_live.pGrassCrushResolveShader); }
         if (g_live.pUVAnimBuf)            { removeResource(g_live.pUVAnimBuf); }
         if (g_live.pMSAAColor)      { removeRenderTarget(R, g_live.pMSAAColor); }
         if (g_live.pDepth)          { removeRenderTarget(R, g_live.pDepth); }
