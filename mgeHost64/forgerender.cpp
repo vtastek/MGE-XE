@@ -15166,7 +15166,15 @@ namespace {
     // (OFF → old whole-mesh drop, for A/B). g_shadowEmissiveTexel = the per-texel emitted-luminance
     // threshold the frag reads via gFrameData.atlasDbg.z (0 → carve off, every emissive texel casts).
     bool  g_shadowEmissiveCast  = true;
-    float g_shadowEmissiveTexel = 0.35f;
+    // ⚠ 0.35 -> 0.10, AND IT IS THE SAME MISTAKE g_shadowEmissiveSkip ABOVE ALREADY RECORDS, one
+    // level down. The frag compares the TEXTURE's own luminance (MatEmissive.x * tex.rgb, and .x is
+    // 1 on a hot caster), so 0.35 only carves texels brighter than mid-grey — which is MW's white
+    // paper convention and little else. A lantern whose glass is authored a dim tinted orange sits
+    // under it, is not carved, casts, and BLACK-CAGES ITS OWN LIGHT: the fixture goes dark. Reported
+    // exactly that way. The threshold is a NOISE FLOOR and not a fixture test — owner-keying is the
+    // real safety, and a mesh with no enclosed light resolves owner=0 and casts fully opaque whatever
+    // this says — which is what makes it safe to put the floor down where dim glass actually lives.
+    float g_shadowEmissiveTexel = 0.10f;
     // C3b-owner: the carve is a SELF-shadow fix, so it must only apply to the light it protects. A
     // lantern's glow must not black-cage ITS OWN light — but from ANY OTHER light the fixture is just
     // an object, and its glowing texels should cast like the opaque geometry they are (a lit lantern
