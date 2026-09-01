@@ -16,7 +16,7 @@
 // at any render scale and the numbers stay comparable when SSAA changes.
 //
 // WHERE IT READS. Since step 6a this runs AFTER the resolve, on pRT — the DELIVERED, display-
-// referred, single-sample image — in every configuration. That is deliberate: pMSAAColor now holds
+// referred, single-sample image — in every configuration. That is deliberate: pSceneColor now holds
 // scene-referred radiance whenever fp16 is on, and averaging those values would silently redefine
 // every APL number ever recorded. Measuring what is delivered is also what the instrument was
 // always a proxy for, and it makes the reading independent of which pass applied the tonemap.
@@ -75,7 +75,8 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
     INIT_MAIN;
     uint tid = DispatchThreadID.x;
 
-    float2 imgSize = gAplParams.dims.xy;
+    float2 imgSize = gAplParams.dims.xy;      // gAplColor  (pRT)          — the OUTPUT rect
+    float2 srcSize = gAplParams.srcDims.xy;   // gAplDepth (pLinearDepth) — the INPUT rect
     uint   grid    = (uint)gAplParams.dims.z;
     float  invGrid = 1.0f / max(gAplParams.dims.z, 1.0f);
 
@@ -92,8 +93,15 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
     {
         uint gx = i % grid;
         uint gy = i / grid;
-        int2 p = int2(int((float(gx) + 0.5f) * invGrid * imgSize.x),
-                      int((float(gy) + 0.5f) * invGrid * imgSize.y));
+        // ONE NORMALISED LATTICE POSITION, TWO INTEGER COORDINATES (M1 4b). The colour and the depth
+        // are written at DIFFERENT extents the moment an upscaler runs — pRT at the OUTPUT rect,
+        // pLinearDepth at the INPUT rect — so the same integer pixel cannot address both. Deriving
+        // each from the shared normalised position rather than scaling one into the other keeps them
+        // exact on both axes even though the input rect is rounded to even, so the two ratios differ
+        // in the last bits. See srcDims in apl.srt.h for what indexing the depth with `p` cost.
+        float2 lat = (float2(float(gx), float(gy)) + 0.5f) * invGrid;
+        int2 p  = int2(int(lat.x * imgSize.x), int(lat.y * imgSize.y));
+        int2 pd = int2(int(lat.x * srcSize.x), int(lat.y * srcSize.y));
         // SKY REJECTION. Reverse-Z, cleared to 0.0, and the sky pass writes no depth at all — so
         // depth 0 means "nothing of the world is here" and the pixel is sky. `continue` is safe in
         // this loop specifically because there is no barrier inside it (the comment on the loop
@@ -105,7 +113,7 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
         // dropped from the sum, from the histogram, and from the divisor alike.
         // Loaded UNCONDITIONALLY now, because the region split needs it whether or not sky is
         // being rejected — and it is the same texel the rejection was already reading.
-        float dz = LoadTex2D(gAplDepth, NO_SAMPLER, p, 0).r;
+        float dz = LoadTex2D(gAplDepth, NO_SAMPLER, pd, 0).r;
         if (gAplParams.opts.x > 0.5f)
         {
             if (dz <= 0.0f) { continue; }
@@ -117,7 +125,11 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
         bool isWater = false;
         if (gAplParams.opts.z > 0.5f && dz > 0.0f)
         {
-            float2 uv   = (float2(p) + 0.5f) / imgSize;
+            // ⚠ THE DEPTH'S OWN SPACE. `dz` came from pd, so the NDC this unprojects has to be
+            // pd's, not p's. NDC is resolution-independent, so with the rects equal this is the
+            // identical position it always was — but with them split, mixing the two would place the
+            // sample somewhere the depth never described and classify land as water near the edges.
+            float2 uv   = (float2(pd) + 0.5f) / srcSize;
             float4 hp   = mul(gAplParams.invViewProj,
                               float4(uv.x * 2.0f - 1.0f, 1.0f - uv.y * 2.0f, dz, 1.0f));
             float  invW = (abs(hp.w) > 1.0e-12f) ? (1.0f / hp.w) : 0.0f;

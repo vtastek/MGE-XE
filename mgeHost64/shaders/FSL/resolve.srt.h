@@ -1,7 +1,7 @@
 // mgeHost64 — custom MSAA resolve SRT.  tasks/forge-postprocess.md step 4.
 //
 // WHY THIS PASS EXISTS AT ALL. A hardware ResolveSubresource cannot format-convert, so the moment
-// pMSAAColor goes fp16 (step 6, HDR) the fixed-function resolve is *gone* — RGBA16F MSAA ->
+// pSceneColor goes fp16 (step 6, HDR) the fixed-function resolve is *gone* — RGBA16F MSAA ->
 // BGRA8_UNORM is not a legal resolve. The shader resolve is therefore not a quality bolt-on, it is
 // HDR's delivery mechanism, and it is built FIRST, in LDR, with today's colours, so its cost can be
 // measured against the 0.14-0.18 ms fixed-function baseline before anything about the look changes.
@@ -11,9 +11,17 @@
 // Ported from MJP's MSAAFilter 2.0 Resolve.hlsl; the SRT/vert shape follows The-Forge's own
 // Examples_3/Visibility_Buffer/src/Shaders/FSL/Resolve.srt.h, which is the same pass upstream.
 //
-// gResolveSource is Tex2DMS, so this header is compiled once per SAMPLE_COUNT — the linearizedepth
-// /apl idiom. There is no SAMPLE_COUNT == 1 variant on purpose: at 1x the scene renders straight
-// into pRT and there is no resolve to do.
+// gResolveSource is Tex2DMS above 1x, so this header is compiled once per SAMPLE_COUNT — the
+// linearizedepth/apl idiom, and bloom.srt.h's exact sc1/scN split beside it.
+//
+// ⚠ THERE IS NOW A SAMPLE_COUNT == 1 VARIANT (M0, tasks/forge-upscale.md), and the note that used to
+// stand here — "at 1x the scene renders straight into pRT and there is no resolve to do" — is only
+// half true and the half that survives is the half about ANTIALIASING. At 1x + fp16 the scene lands
+// in a single-sample scene-referred staging target, so this pass still has to run and is the ONLY
+// thing that can deliver the frame: a hardware resolve cannot convert fp16 -> BGRA8. What it stops
+// doing is reconstructing sub-samples it does not have — one sample at offset (0,0), so the
+// Catmull-Rom neighbourhood collapses to near-identity and the pass reduces to exposure, the bloom
+// composite, the curve, the sRGB encode and the dither. All of that was already sample-count-blind.
 //
 // ⚠ ALPHA IS LOAD-BEARING and the reference throws it away (`return float4(output, 1.0f)`).
 // pRT's alpha is the PRESENT-SEAM COVERAGE MASK feeding an ONE/INVSRCALPHA composite over MW's
@@ -55,10 +63,17 @@
 
 STRUCT(ResolveParams)
 {
-    // x, y = RENDER size in pixels, NOT the allocation size. The colour target is ALLOC-sized while
-    //        the scene renders into a width x height sub-rect ([[project_forge_alloc_vs_render_uv]]);
-    //        this is the clamp bound, so the filter footprint can never reach into texels the scene
-    //        never wrote. Same trap the APL instrument documents.
+    // x, y = the SOURCE's WRITTEN extent in pixels, NOT the allocation size. The colour target is
+    //        ALLOC-sized while the scene renders into a sub-rect
+    //        ([[project_forge_alloc_vs_render_uv]]); this is the clamp bound, so the filter footprint
+    //        can never reach into texels the frame never wrote. Same trap the APL instrument
+    //        documents.
+    //
+    //        ⚠ IT IS THE **OUTPUT** RECT ON AN UPSCALED FRAME (M1 step 4b). It reads as "the render
+    //        rect" and was the input rect for the whole life of this pass, but the question it
+    //        actually answers is "how much of gResolveSource did somebody write", and when the
+    //        upscaler ran the answer is its own output extent. The host writes whichever rect
+    //        matches the resource it bound; the two are equal whenever no upscaler ran.
     // z = filter diameter in pixels (MJP's ResolveFilterDiameter; he ships 2.0, exposes up to 6.0).
     // w = integer sample radius as a float — round(z/2), MJP's MSAAFilter.cpp:290. Handed in rather
     //     than recomputed so the loop bound is one cbuffer read. LIVE (dev panel), because ~200 MSAA
@@ -203,7 +218,27 @@ STRUCT(ResolveParams)
     // Seventh float4 = 112 B against a 256 B cbuffer, so still no allocation change.
     DATA(float4, curveScale, None);
     // BLOOM (step 4). x = strength k in `lerp(straight, bloomStraight, k)`; y, z = the mip-0 RENDER
-    // extent in texels (the clamp bound for the four manual bilinear Loads); w = reserved.
+    // extent in texels (the clamp bound for the four manual bilinear Loads).
+    //
+    // ⚠ y AND z ARE THE **DELIVERED** RECT'S mip 0 SINCE M1 4c, not the raster rect's. The host
+    // derives one `delivered*` per frame — the output rect when an upscaler ran, the raster rect
+    // otherwise — and the pyramid, this clamp and `dims.xy` above all read it, which is what makes
+    // the three agree by construction instead of by three matching ternaries.
+    //
+    // w = RESERVED, written 1.0f. RETIRED IN M1 4c (tasks/forge-upscale.md).
+    //
+    //     For one step it was the SOURCE SCALE for the bloom tap — OUTPUT pixel -> INPUT pixel, i.e.
+    //     `inputRect / outputRect` — because 4b moved gResolveSource to the upscaler's output while
+    //     leaving the bloom pyramid at the RASTER rect. That mapping was correct and it was still not
+    //     the fix: `bloomLevels()` derived the pyramid's LEVEL COUNT from the raster rect as well, so
+    //     the input-scale slider was changing the bloom's angular REACH (measured, `bloom 0.11(L7) ->
+    //     0.05(L6)` at scale 0.5). No tap coordinate can repair a pyramid that spans the wrong image.
+    //     4c moves the pyramid onto the delivered rect, the tap becomes 1:1 again, and this lane and
+    //     its ±1-input-row X/Y-ratio residual both go away.
+    //
+    //     ⚠ IT IS WRITTEN 1.0f AND NOT 0.0f, deliberately, even though the shader no longer reads it:
+    //     a lane accidentally re-introduced into a multiply is then an IDENTITY rather than a black
+    //     bloom. When a dead value is free, pick the one whose resurrection is harmless.
     //
     // ⚠ THE COMPOSITE IS FORCED TO LIVE IN THIS SHADER, and specifically inside the un-premultiplied
     // window between the exposure multiply and the curve branch. Both halves of that are forced:
@@ -228,7 +263,14 @@ STRUCT(ResolveParams)
 BEGIN_SRT(ResolveSrtData)
     BEGIN_SRT_SET(PerDraw)
         DECL_CBUFFER(PerDraw, CBUFFER(ResolveParams), gResolveParams)
+#if SAMPLE_COUNT > 1
         DECL_TEXTURE(PerDraw, Tex2DMS(float4, SAMPLE_COUNT), gResolveSource)
+#else
+        // M0: single-sample staging target. A Tex2DMS declared with SAMPLE_COUNT 1 is not the same
+        // type as a Tex2D and would not bind against a non-MSAA resource — bloom.srt.h splits the
+        // same slot the same way for the same reason.
+        DECL_TEXTURE(PerDraw, Tex2D(float4), gResolveSource)
+#endif
         // The bloom pyramid, mip 0 (step 4). APPEND-ONLY, and that matters: FSL assigns per-set
         // register offsets from ONE running counter, so inserting a resource above gResolveSource
         // would renumber it and silently repoint the host's SRT_RES_IDX

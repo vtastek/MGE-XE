@@ -648,6 +648,9 @@ namespace IPC {
 		// G7: the player's grass-crush disc. Needed because the player has NO skinned draws in first
 		// person, which is exactly where a missing footprint shows (bridge.h playerCrush).
 		std::memcpy(params.playerCrush, m_playerCrush, sizeof(params.playerCrush));
+		// S1 atmosphere: MW's live weather as parameters (bridge.h WeatherWire). valid == 0 is the
+		// interior / no-weather row and the host reads nothing else when it sees that.
+		params.weather = m_weather;
 		params.bytesWritten = 0;
 		params.renderMs = 0.0;
 		params.frameFenceValue = 0;

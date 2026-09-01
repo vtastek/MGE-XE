@@ -1,0 +1,63 @@
+// mgeHost64 — THE ATMOSPHERE LUTs, LOOKED AT (F12 modes 15 and 16; tasks/forge-atmosphere.md S2a).
+//
+// ⚠ WHY A DEBUG VIEW SHIPS IN THE SAME STEP AS THE LUTS, rather than being added when something goes
+// wrong. S2a's whole deliverable is "the chain runs, dark" — nothing samples the LUTs yet, so the
+// ONLY evidence they are correct is a cost on the gpu split and this picture. Without it a
+// transmittance LUT full of NaNs, one whose (r, mu) mapping is transposed, and one that is simply
+// perfect all produce the identical frame, and the mistake surfaces two sub-steps later as "the sky
+// looks a bit wrong" — which is indistinguishable from every other reason a sky looks a bit wrong.
+// The same argument skyheightview.frag.fsl makes for the sky-AO height map, and it was right there.
+//
+// Reuses shadowatlasview.vert (fullscreen triangle) + the opaque.srt.h PerFrame set, where both LUTs
+// are already bound for the sky pass. Non-destructive corner overlay; alpha = 1.
+//
+//   mode 15  the SKY-VIEW LUT, tone-mapped for viewing. Should look like a sky flattened out: the
+//            bright horizon band running along the middle of the v axis (that is where the
+//            parameterisation splits), the sun's glare at one end of u, the lit ground below.
+//            ⚠ IT MUST MOVE WITH THE SUN. A static picture under a moving sun means the params
+//            cbuffer is not reaching the dispatch, which is the failure mode a still frame hides.
+//   mode 16  the TRANSMITTANCE LUT. A smooth wash from white (straight up, nothing in the way) to
+//            deep red-black (along the horizon, where the path is longest and blue is scattered out
+//            hardest). Banding, a hard edge, or a channel that does not order R > G > B toward the
+//            dark end means the (r, mu) mapping is wrong.
+
+#include "opaque.srt.h"
+
+STRUCT(VSOutput)
+{
+    DATA(float4, Position, SV_Position);
+    DATA(float2, Uv,       TEXCOORD0);
+};
+
+ROOT_SIGNATURE(DefaultRootSignature)
+float4 PS_MAIN( VSOutput In )
+{
+    INIT_MAIN;
+    float2 uv = saturate(In.Uv);
+
+    // debugParams.x carries the F12 mode; 15 = sky-view, anything else routed here = transmittance.
+    float3 v;
+    if (gFrameData.debugParams.x < 15.5f)
+    {
+        // Radiance in native units, which run 0..~30 for a clear sky. A plain gamma encode would
+        // clip the circumsolar glare to white and hide exactly the structure worth checking, so this
+        // is a Reinhard + gamma: it keeps the horizon band and the sun's lobe separable in one image.
+        v = max(SampleLvlTex2D(gAtmosSkyView, gSamplerBilinearClamp, uv, 0).rgb, f3(0.0f));
+        v = v / (v + f3(1.0f));
+        v = pow(v, f3(1.0f / 2.2f));
+    }
+    else
+    {
+        // Transmittance is already 0..1 by construction, so it is shown RAW. Any value outside that
+        // range is itself the finding — and a raw view is the only one that can show it.
+        v = saturate(SampleLvlTex2D(gAtmosTransmittance, gSamplerBilinearClamp, uv, 0).rgb);
+    }
+
+    // A one-texel frame, so an overlay that is silently not drawing is distinguishable from one
+    // drawing black. The LUTs are legitimately near-black in places (a horizon transmittance, a
+    // night sky) and "nothing happened" must not look like one of them.
+    float2 d = min(uv, f2(1.0f) - uv);
+    if (min(d.x, d.y) < 0.004f) { v = float3(0.9f, 0.5f, 0.1f); }
+
+    RETURN(float4(v, 1.0f));
+}

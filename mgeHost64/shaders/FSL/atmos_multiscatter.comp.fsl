@@ -1,0 +1,236 @@
+// mgeHost64 — LUT 2 of 3: MULTIPLE SCATTERING (tasks/forge-atmosphere.md S2a).
+//
+// Single scattering alone is a sky that is far too dark and far too saturated: it is the light that
+// bounced ONCE, and the real atmosphere bounces a lot — which is most of what makes a clear zenith
+// the blue it is rather than near-black, and essentially ALL of what makes an overcast sky bright at
+// all. Bruneton computed the higher orders offline into a 4D table. Hillaire's contribution, and the
+// reason this phase can rebuild every frame, is the observation that the higher orders are very
+// nearly ISOTROPIC and can be collapsed into a 2D (altitude, sun angle) term with an ANALYTIC
+// infinite-bounce sum:
+//
+//     F_ms = 1 / (1 - f)          where f is the fraction re-scattered per bounce
+//
+// That closed form is what replaces the recursion — this LUT integrates ONE bounce and then sums the
+// rest algebraically, which is why 32x32 texels and a handful of directions are enough.
+//
+// ⚠ THE MEDIUM IS NOT DEFINED HERE — atmosphere.h.fsl owns it (see the warning at its top).
+//
+// ⚠ AND ITS ALTITUDE AXIS IS 32 TEXELS OVER 100 km — 3.2 km PER TEXEL, WHICH IS WIDER THAN THE
+// WHOLE DECK. That is a known limit S4a does NOT close, and it is stated here because it is the
+// first thing to suspect if the overcast level reads oddly. The deck (1.0-2.2 km in the gate's
+// configuration) falls between the LUT's first two rows, so the sky-view march reads an in-cloud
+// multiscatter term INTERPOLATED between a ground-level sample and one above the lid — both of them
+// correct, neither of them inside the cloud. Widening the r axis, or making it non-linear near the
+// ground, would change the CLEAR sky too and would therefore have to be its own step with its own
+// A/B; the parameterisation is Hillaire's and it is tuned for an 8 km scale height, not for a 1.2 km
+// slab sitting in the bottom 2% of the range.
+//
+// ⚠ AND THE SUM DIVERGES IF f REACHES 1. Physically f < 1 always (a bounce cannot return more than
+// it received), but a thick, near-non-absorbing aerosol — Foggy at ssa 0.98, Blizzard at 0.95, both
+// real rows in the S1 table — pushes it close, and float arithmetic does the rest. The clamp below
+// is not a tolerance, it is the guard between "a bright whiteout" and "a NaN that propagates through
+// the sky-view LUT into the ambient and out into every lit surface in the frame".
+//
+// ⚠⚠ AND S4a WALKS STRAIGHT AT THAT CLAMP. A cloud deck is CONSERVATIVE — single-scattering albedo
+// 0.9999, because a water cloud is bright precisely because it does not absorb — so `fms` under a
+// full lid is driven hard toward 1 and the clamp turns into a hard ceiling of F = 50 rather than a
+// guard that never fires. If the S4a overcast-level gate row misses, THE FIX IS NOT TO RETUNE THIS
+// CLAMP: measure convergence against the direction and step counts first (both are cbuffer knobs for
+// exactly this reason), and if the 2-order isotropic approximation is genuinely inadequate for cloud
+// — Hillaire says it is — a two-stream Eddington source for the DECK ONLY is the bounded fallback.
+// That would be a second model, and therefore its own decision, not something to slip in here.
+
+#include "atmosphere.srt.h"
+#include "atmosphere.h.fsl"   // THE MEDIUM — one copy, see the warning at its top
+
+// ⚠ THESE TWO ARE THE PHASE'S REAL COST DIAL, AND THAT IS A MEASUREMENT RATHER THAN AN ASSUMPTION.
+// The plan expected the SKY-VIEW march to be the budget; it is not. Measured on the harness scene:
+// raising the transmittance LUT from 40 to 128 steps cost +0.01 ms, and HALVING the sky-view march
+// from 32 steps to 16 saved 0.01 ms — while the whole four-pass chain sits at 0.37 ms. Nearly all of
+// it is here, because this pass is 32x32 texels x 64 directions x 20 steps = 1.3M marched samples,
+// each with a transmittance fetch and two ray-sphere tests, against the sky-view LUT's 0.66M.
+//
+// So the direction count is driven from the cbuffer (marchP.z) rather than being baked in — the
+// harness runs minimized and cannot click, and a cost dial nobody can reach unattended is one that
+// never gets measured. The step count below is the BASE budget; S4a's segmented schedule adds the
+// deck's own steps on top of it whenever a ray actually crosses the lid, so a clear sky still marches
+// exactly ATMOS_MS_STEPS times and pays nothing for a deck that is not there.
+#define ATMOS_MS_MAX_SQRT_DIRS 8      // 8x8 = 64 directions; the cbuffer picks 2..8
+#define ATMOS_MS_STEPS         20
+
+ROOT_SIGNATURE(ComputeRootSignature)
+NUM_THREADS(8, 8, 1)
+void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
+{
+    INIT_MAIN;
+
+    int2 px = int2(DispatchThreadID.xy);
+    int  w  = (int)gAtmosParams.lutDims2.x;
+    int  h  = (int)gAtmosParams.lutDims2.y;
+    if (px.x >= w || px.y >= h)
+    {
+        RETURN();
+    }
+
+    float2 uv = (float2(px) + f2(0.5f)) / float2(float(w), float(h));
+    float r, muSun;
+    atmosMultiScatterParams(gAtmosParams, uv, r, muSun);
+
+    float Rg = gAtmosParams.planet.x;
+    float Rt = gAtmosParams.planet.y;
+    // The sun placed in a canonical frame: only the ANGLE between the sun and a direction matters to
+    // an isotropic term, so the azimuth is free and this LUT has no third axis.
+    float3 sunDir = float3(sqrt(max(0.0f, 1.0f - muSun * muSun)), 0.0f, muSun);
+    float3 origin = float3(0.0f, 0.0f, r);
+
+    // L2 = the second-order in-scatter (what one bounce of the single-scattered field delivers back)
+    // fms = the fraction re-scattered per bounce, i.e. the ratio the geometric series runs on.
+    float3 L2  = f3(0.0f);
+    float3 fms = f3(0.0f);
+
+    // ⚠ THE WEIGHT IS DERIVED FROM THE LIVE COUNT, NOT FROM THE MAXIMUM. A sphere quadrature whose
+    // weight and whose sample count disagree does not get noisier — it gets BIASED, by exactly the
+    // ratio between them, and a uniformly-too-bright sky is the one error that looks like a
+    // calibration question rather than a bug. ([[feedback_skip_optimisation_must_match_kernel]])
+    int   nDirs = (int)clamp(gAtmosParams.marchP.z, 2.0f, float(ATMOS_MS_MAX_SQRT_DIRS));
+    const float sphereWeight = 4.0f * ATMOS_PI / float(nDirs * nDirs);
+
+    for (int di = 0; di < nDirs; ++di)
+    {
+        for (int dj = 0; dj < nDirs; ++dj)
+        {
+            // A uniform sphere lattice: cos(theta) uniform IS uniform in solid angle, so every
+            // direction carries the same weight and the integral is a plain sum — the same property
+            // scenecal.h's Fibonacci table is chosen for.
+            float u0 = (float(di) + 0.5f) / float(nDirs);
+            float u1 = (float(dj) + 0.5f) / float(nDirs);
+            float cosT = 1.0f - 2.0f * u0;
+            float sinT = sqrt(max(0.0f, 1.0f - cosT * cosT));
+            float phi  = 2.0f * ATMOS_PI * u1;
+            float3 rd  = float3(sinT * cos(phi), sinT * sin(phi), cosT);
+
+            // How far this ray runs: to the ground if it hits, otherwise to the top.
+            float tGround = atmosRaySphere(origin, rd, Rg);
+            float tTop    = atmosRaySphere(origin, rd, Rt);
+            bool  hitG    = (tGround > 0.0f);
+            float tMax    = hitG ? tGround : max(tTop, 0.0f);
+            if (tMax <= 0.0f) { continue; }
+
+            // ⚠⚠ THE STEP BUDGET IS SEGMENTED AT THE DECK, AND OF THE THREE MARCHES THIS IS THE
+            // ONE THAT COULD NOT SEE IT AT ALL. 20 uniform steps over a ray that runs to the top of
+            // the atmosphere is ~25 km per step against a 1.2 km lid — the slab falls between two
+            // samples and contributes nothing. And it fails in the worst direction: a lid is bright
+            // BECAUSE of multiple scattering, so an MS LUT blind to the slab returns a DARK overcast,
+            // which is what everyone expects an overcast sky to look like. It would have passed an
+            // eyeball test while being the opposite of the physics.
+            float4 planT; float3 planN;
+            int nSteps = atmosMarchPlan(gAtmosParams, origin, rd, tMax,
+                                        ATMOS_MS_STEPS, int(gAtmosParams.marchP.w),
+                                        ATMOS_MARCH_UNIFORM, planT, planN);
+
+            float3 throughput = f3(1.0f);
+            float3 lSum = f3(0.0f);
+            float3 fSum = f3(0.0f);
+            // The phase function is ISOTROPIC here on purpose: the whole approximation is that after
+            // the first bounce the field has lost its directionality, and using the real HG lobe
+            // would be claiming a directionality the 2D table has no axis to store. The cloud's
+            // scattering joins the same sum for the same reason — its forward lobe is a statement
+            // about the FIRST bounce, and this LUT is everything after it.
+            const float isoPhase = ATMOS_INV_4PI;
+
+            for (int s = 0; s < nSteps; ++s)
+            {
+                float ta, tb;
+                atmosMarchStep(planT, planN, s, tMax, ATMOS_MARCH_UNIFORM, ta, tb);
+                float dt = tb - ta;
+                float t  = ta + dt * 0.5f;
+                float3 p = origin + rd * t;
+                float  ri = length(p);
+                float  hi = ri - Rg;
+
+                float3 scaR, scaM, scaC, extAir, extCloud;
+                atmosMediumAt(gAtmosParams, hi, scaR, scaM, scaC, extAir, extCloud);
+                float3 sca = scaR + scaM + scaC;
+                float3 ext = extAir + extCloud;
+
+                float3 stepT = exp(-ext * dt);
+                // Sun visibility along this sample's own shadow ray. A ground hit means the sample
+                // sits in the planet's own shadow — the term that makes the night side dark and, at
+                // twilight, makes the EARTH'S SHADOW a real edge in the sky rather than a fade.
+                float  muS = dot(normalize(p), sunDir);
+                float3 sunT = f3(0.0f);
+                if (atmosRaySphere(p, sunDir, Rg) < 0.0f)
+                {
+                    float2 tuv = atmosTransmittanceUv(gAtmosParams, ri, muS);
+                    sunT = SampleLvlTex2D(gAtmosTransmittance, gSamplerBilinearClamp, tuv, 0).rgb;
+                }
+
+                // Energy-conserving integration of a constant source over the step (Hillaire): the
+                // analytic integral of S*(1-exp(-ext*dt))/ext, which is exact for a step over which
+                // the medium is treated as constant and is what keeps a coarse march unbiased
+                // instead of merely noisy.
+                float3 sInt = (f3(1.0f) - stepT) / max(ext, f3(1.0e-9f));
+
+                lSum += throughput * (sca * isoPhase * sunT) * sInt * gAtmosParams.solar.xyz;
+                // fSum accumulates the re-scattered FRACTION: the same integral with the source set
+                // to 1 instead of to the sun, i.e. "if this volume were lit by unit radiance from
+                // everywhere, how much would it send on".
+                //
+                // ⚠⚠ THE ISOTROPIC PHASE BELONGS HERE TOO, AND OMITTING IT IS NOT A SMALL ERROR.
+                // Caught by the S2b gate on its first run: without it `f` is 4*pi ~= 12.6 times too
+                // large, which saturates the clamp below, so the geometric series sums to 50 instead
+                // of ~1.06 and THE WHOLE SKY COMES OUT ~47x TOO BRIGHT — measured zenith 127656
+                // cd/m2 against a clear-sky band of 2000-8000, E_sky 675 klx against ~14.
+                //
+                // ⚠ AND THE SUN WAS PERFECTLY FINE THROUGHOUT (103 klx direct-normal, inside the
+                // band), which is exactly why the gate has TWO tables. The beam does not pass
+                // through this LUT at all, so every sun-side check passed while the sky was two
+                // orders of magnitude out — and q and sun%, being scale-free, could not see it
+                // either. It took the NIT row, in absolute cd/m2, to catch it.
+                fSum += throughput * sca * sInt * isoPhase;
+
+                throughput *= stepT;
+            }
+
+            // The ground closes the loop: light that reached the surface comes back up Lambertian and
+            // is available to be scattered again. Leaving it out is what makes a naive multiscatter
+            // term too dark over bright terrain — and the ground albedo is a real boundary condition
+            // of the medium (g_skyAlbedo), not a fudge.
+            if (hitG)
+            {
+                float3 pg   = origin + rd * tMax;
+                float3 ng   = normalize(pg);
+                float  muSg = dot(ng, sunDir);
+                if (muSg > 0.0f)
+                {
+                    float2 tuv = atmosTransmittanceUv(gAtmosParams, Rg, muSg);
+                    float3 gT  = SampleLvlTex2D(gAtmosTransmittance, gSamplerBilinearClamp, tuv, 0).rgb;
+                    lSum += throughput * gT * muSg * gAtmosParams.solar.xyz
+                          * (gAtmosParams.planet.z / ATMOS_PI);
+                }
+            }
+
+            L2  += lSum * sphereWeight;
+            fms += fSum * sphereWeight;
+        }
+    }
+
+    // ⚠ THE GUARD THAT MATTERS. f < 1 physically; the clamp is what stops a thick non-absorbing row
+    // (Foggy, Blizzard) from turning the geometric sum into a division by ~0 and pushing an Inf into
+    // the sky-view LUT — from where it would reach the SH, the ambient, and every lit surface.
+    float3 f = min(fms, f3(0.98f));
+    float3 F = f3(1.0f) / max(f3(1.0f) - f, f3(0.02f));
+
+    // ⚠ ALPHA CARRIES THE **UNCLAMPED** f, AND IT IS THERE TO ANSWER ONE QUESTION: IS THE CLAMP A
+    // GUARD THAT NEVER FIRES, OR A CEILING THE ANSWER IS SITTING ON? Those two look identical from
+    // outside — the LUT returns a finite, plausible number either way — and the difference decides
+    // whether an overcast level miss is the CLOUD MODEL or this one line.
+    // [[project_forge_exposure_rail_instrument]] is the same lesson: a pinned servo looks converged.
+    // Nothing shades with it; atmos_sh.comp reads it at the deck's altitude for the gate. Unclamped
+    // on purpose — min(fms, 0.98) read back as 0.98 cannot distinguish 0.981 from 0.9999.
+    float fRaw = dot(fms, float3(0.2126f, 0.7152f, 0.0722f));
+
+    Write2D(gAtmosOutA, px, float4(L2 * F, fRaw));
+
+    RETURN();
+}

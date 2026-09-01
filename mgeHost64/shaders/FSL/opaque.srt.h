@@ -26,6 +26,14 @@
 // mirror would reconstruct main-view rays). See skyview.h.fsl.
 #include "skyview.h.fsl"
 
+// THE ATMOSPHERE's parameter block (tasks/forge-atmosphere.md S2c). The STRUCT only — atmosphere.h.fsl
+// carries the medium itself and is HLSL bodies, while this header is compiled as C++ by the host.
+// skyhw.frag needs both: the params to deparameterise a direction into a sky-view uv, and the medium
+// to do it. Sited here rather than on the sky pass's own set because S3's applyFog() reads the same
+// two through the SAME PerFrame set — aerial perspective is the same integral as the sky, which is
+// the whole reason the fog and the horizon stop being two colours.
+#include "atmosparams.h.fsl"
+
 // Bent-normal strength used to live here as AO_BENT_INTENSITY, a compile-time gain on gAO.rgb. It
 // is gone: the strength is a PRODUCER-side knob now (aocommon.h.fsl's aoBentStrength, a live slider
 // in the AO panel), which is strictly better placed. Compute shaders hot-reload on F8, so it can be
@@ -148,7 +156,28 @@ STRUCT(FrameData)
     // clustering OFF => both frags fall back to the brute gLights loop (near/opaque paths never read
     // these). Slice metric = length(worldPosRel), matching froxelassign.comp exactly.
     DATA(float4, froxelDims, None);   // x=tilesX, y=tilesY, z=NZslices, w=tileSize(px); x<=0 => brute loop
-    DATA(float4, froxelZ,    None);   // x=log(d0), y=invLogRange (1/log(d1/d0)); zw unused
+    // ⚠ .zw ARE THE TWO FOG LOOK LANES, AND THEY LIVE IN A FROXEL ROW BECAUSE FrameData IS EXACTLY
+    // FULL — alphaShadowParams ends at 512B, which IS the host CBV, so there is no room to append and
+    // these two zeroed spares are what is left. Named here rather than smuggled: both are ARTIST
+    // knobs, both default to a value that reproduces the previous image exactly, and both exist
+    // because the constants they replace were `#define`s in skydome.h.fsl / fog.h.fsl that reach
+    // opaque/statics/terrain/alpha/multimap — none of which hot-reload — so dialling either one cost
+    // a HOST RESTART. skydome.h.fsl's own comment asked for this ("move it to a lane if it needs
+    // dialling in play"); it needs dialling in play.
+    //
+    //   z = THE SKY-TARGET SATURATION KNEE (skydome.h.fsl's fogSkyShare). Below it the fog target is
+    //       flat fogColNear; above it the sampled sky fades in. 0.85 = the shipped look. LOWER brings
+    //       the sky in earlier and closes the gap between a fogged static (which melts to MW's flat
+    //       colour) and the water's reflection-hole fill (fogSkyColor, share 1.0, no knee) sitting
+    //       right beside it in the mirror — reported as "static reflections are fogged brighter blue
+    //       while statics assume MW fog color". 1.0 = never sample the sky at all.
+    //   w = NEAR-FIELD HAZE DENSITY, per world unit (fog.h.fsl's mwFogRamp). MW's ramp is exactly 1
+    //       (clear) for everything closer than fogStart — ~490 m in clear weather at 16 cells — so
+    //       there is a large dead zone with NO fog at all, reported as "close fog being ignored".
+    //       This is a Beer-Lambert term that starts at the EYE and multiplies the ramp, so it fills
+    //       the dead zone without moving the fog wall (where the ramp is already ~0). 0 = off, and
+    //       off is bit-identical.
+    DATA(float4, froxelZ,    None);   // x=log(d0), y=invLogRange (1/log(d1/d0)); z=sky knee, w=near haze
     // 496B, float indices 124..127. The LAST float4 in FrameData — 512B == the 512B host CBV.
     //   x (124) alpha SHADOW-RECEIVE threshold: the opacity at/above which an alpha sheet writes into
     //           the dedicated shadow-receive depth (alphashadowdepth.frag) so it receives its own
@@ -501,6 +530,57 @@ BEGIN_SRT_NO_AB(SrtData)
         // Appended AFTER gCausticField — append only, FSL assigns descriptor offsets from one running
         // counter and an insertion silently re-points every later binding.
         DECL_TEXTURE(PerFrame, Tex2D(float4), gGrassCrush)
+        // ─── THE ATMOSPHERE (tasks/forge-atmosphere.md S2c) ──────────────────────────────────────
+        // The SKY-VIEW LUT — the sky's radiance in every direction from the camera, rebuilt every
+        // frame by atmos_skyview.comp. skyhw.frag samples this instead of evaluating a closed form,
+        // and atmos_sh.comp projects THE SAME TEXTURE into the SH that lights the world: the sky you
+        // see and the light it casts are one object, so they cannot drift apart the way two
+        // evaluations of one model could. That is the whole of what S2 buys structurally.
+        //
+        // An unbound read is (0,0,0,0) = a black sky. Distinguishable from a legitimately black sky
+        // only through gSkyView.params.x, which is the hard "the pass is armed" gate and the reason
+        // that lane exists.
+        // Appended AFTER gGrassCrush — append only, FSL assigns descriptor offsets from one running
+        // counter and an insertion silently re-points every later binding.
+        DECL_TEXTURE(PerFrame, Tex2D(float4), gAtmosSkyView)
+        // ...and the TRANSMITTANCE LUT. Read by the F12 15/16 debug view, and — from S3 — by every
+        // consumer that needs the sun's colour AT A POINT rather than at the camera: the aerial
+        // perspective march, and S4's cloud lighting, which needs the beam at cloud altitude. It
+        // rides the same set as the sky-view LUT because those two are always wanted together and a
+        // second binding site for one of them is a second place to get the pair half-right.
+        DECL_TEXTURE(PerFrame, Tex2D(float4), gAtmosTransmittance)
+        // ...and the medium's own parameters, needed to turn a world direction into a uv in it (the
+        // LUT is parameterised by zenith angle and azimuth-relative-to-the-sun, not by direction).
+        // The SAME cbuffer the LUT cooks read, bound here as well rather than copied — for the reason
+        // hosekcheck.srt.h gave about sharing gSkyView: a consumer reading its own private copy would
+        // prove the arithmetic and say nothing about whether the parameters reaching the frag are the
+        // ones the LUTs were built from, which is half of what can go wrong.
+        DECL_CBUFFER(PerFrame, CBUFFER(AtmosphereParams), gAtmosParams)
+        // ─── M1 MOTION VECTORS (tasks/forge-upscale.md) ──────────────────────────────────────────
+        // Camera-only screen-space motion, in RENDER-rect PIXELS, previous-minus-current. Written by
+        // motionvectors.comp at the colour->water seam.
+        //
+        // ⚠ READ BY THE F12 DEBUG VIEW (mvview.frag) AND BY NOTHING ELSE — for now. It is bound here
+        // rather than given the debug view a private SRT because that is the pattern every other
+        // looked-at buffer in this renderer already follows (gShadowMask, gAtmosSkyView, gSkyHeight),
+        // and a debug view on a private set would be a second place the resource has to be wired.
+        //
+        // ⚠ ONE FRAME'S CONTENT IS ONE FRAME'S CONTENT. The colour frags run BEFORE the dispatch that
+        // fills this, so any colour-pass reader would see LAST frame's vectors. mvview.frag is drawn
+        // in the post-everything overlay block, after the dispatch, and is therefore current — do not
+        // move a reader of this slot earlier without re-checking that.
+        //
+        // Appended AFTER gAtmosParams — append only, FSL assigns descriptor offsets from one running
+        // counter and an insertion silently re-points every later binding.
+        // Unbound in the sets that never display it, which reads (0,0) = "nothing moved" — the same
+        // benign default gGrassCrush documents, and the correct one for a vector field.
+        DECL_TEXTURE(PerFrame, Tex2D(float2), gMotionVectors)
+        // ...and the REACTIVE MASK beside it (F12 mode 18). Same append-only rule, same reason, and
+        // it rides the same set as the vectors because the two are always wanted together: the mask
+        // says which of those vectors to disbelieve, and a second binding site for one of them is a
+        // second place to get the pair half-right. Unbound reads 0 = "trust every vector", which is
+        // the pre-mask behaviour and the correct benign default.
+        DECL_TEXTURE(PerFrame, Tex2D(float),  gReactiveMask)
     END_SRT_SET(PerFrame)
     // Point-light cbuffer — rides the otherwise-unused PerDraw set (FSL has exactly four
     // fixed update frequencies: Persistent/PerFrame/PerBatch/PerDraw; a custom set name has

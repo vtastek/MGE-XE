@@ -1,0 +1,169 @@
+// mgeHost64 — spatial upscale: Catmull-Rom with an anti-ringing clamp.
+// tasks/forge-upscale.md M1 step 4b. Resource contract + the knobs: upscale.srt.h.
+//
+// The INPUT sub-rect of pSceneColor resampled into the OUTPUT sub-rect of the backend's own target.
+// This is the PASSTHROUGH backend of the IUpscaler seam — "passthrough" meaning it passes the frame
+// through without a TEMPORAL reconstruction, not that it copies. It is the permanent fallback for
+// the AMD / Intel / GTX-1080 tiers, so a bilinear blit here would be permanent softness for those
+// users; a 4x4 cubic costs 16 loads on a pass that runs once per output pixel and buys back most of
+// what a bilinear stretch throws away.
+//
+// ─── WHY THIS FILTER, AND NOT THE FIVE-TAP ONE ───────────────────────────────────────────────────
+//
+// resolve.frag.fsl explains at length that `SampleTextureCatmullRom5` (SMAA filmic reprojection)
+// could not be used THERE because its inputs are MSAA sub-samples at irregular in-pixel positions
+// with no sampler and no regular grid — and it closes with "if a bloom/DoF upsample or a TAA history
+// reprojection ever lands, THAT is where the 5-tap form belongs". This pass is that case, and the
+// 5-tap form is still not used, for a different reason: it needs a SAMPLER, and a sampler's clamp is
+// the SURFACE extent, not the render sub-rect. The whole point of the clamp here is that the
+// allocation is four times the rect and everything outside it is last frame
+// ([[project_forge_alloc_vs_render_uv]]). 16 Loads with an explicit clamp is the correct shape; the
+// bilinear trick would trade 11 fetches for a stale-texel rim at the frame's edge.
+//
+// The WEIGHT function is shared in spirit with resolve.frag's `rFilterCubic` — same Mitchell family,
+// same B = 0 / C parameterisation, so the two filters in the frame speak one vocabulary. It is a
+// LOCAL COPY rather than a shared header for the reason aoupscale.comp.fsl's copies of aoMinDiff /
+// aoPlaneWeight are: those headers are written against another pass's cbuffer names. Keep them in
+// step.
+//
+// ─── THE THREE TRAPS THIS PASS HAS TO RESPECT, ALL OF WHICH THE TREE HAS BEEN BITTEN BY ──────────
+//
+// 1. THE PREMULTIPLIED PAIR — FIFTH STATEMENT OF THE RULE ([[project_forge_premultiplied_pair]]).
+//    pSceneColor's rgb is already scaled by its coverage; (rgb, a) is ONE 4-vector, not two signals.
+//    A RESAMPLE IS A FILTER, so every tap weight hits ALL FOUR CHANNELS IDENTICALLY. Split them and
+//    the witness is a darker seam along the horizon fog band and anything melting into it — the only
+//    place in the frame where alpha is neither 0 nor 1, which is exactly why the bug hides. Same
+//    rule, same witness, in resolve.srt.h, bloom.srt.h and reflectmip.srt.h.
+//
+//    The anti-ringing clamp below is bound-per-channel over the SAME tap set with the SAME weights,
+//    which is the aoupscale.comp.fsl idiom — not a per-channel filter.
+//
+// 2. THE ANTI-RINGING CLAMP IS REQUIRED, NOT OPTIONAL. Catmull-Rom's outer lobe is negative, and
+//    this source is SCENE-REFERRED and unbounded. resolve.srt.h says it one pass downstream: "a
+//    bright HDR sample rings much further below zero than a [0,1] one ever could", and the rgb floor
+//    then clips that undershoot ASYMMETRICALLY, keeping the overshoot side's energy. The result is
+//    clamped into the min/max of the nearest 2x2 taps — the standard FSR/TAA anti-ringing box, and
+//    the same one aoupscale applies for the same reason at a quarter of the dynamic range.
+//
+// 3. ALLOC vs RENDER RECT ([[project_forge_alloc_vs_render_uv]]). Every tap clamps to the INPUT
+//    sub-rect and never to the allocation — the texels outside it are LAST FRAME'S. A 4x4 footprint
+//    always reaches past the edge at the frame's border, so this is not an edge case, it is every
+//    frame's outermost pixel row.
+//
+// ⚠ NOT A CONCERN HERE, STATED SO NOBODY ADDS IT: there is no firefly / inverse-luminance weighting
+// in this pass. That is a DISPLAY reconstruction and it belongs where the display reconstruction
+// happens (resolve.frag). Karis-weighting a resample would make each tap's weight depend on that
+// tap's own brightness, and Catmull-Rom's signed weights only normalise because their sum is ~1 —
+// the exact failure resolve.frag.fsl carries a paragraph about, where the normaliser reached zero
+// inside a candle flame and the frame got BLACK pixels out of finite input.
+
+#include "upscale.srt.h"
+
+// Mitchell-Netravali, evaluated on |x| in SOURCE TEXELS with the family's natural support of 2.
+// ⚠ NOTE THE DIFFERENT CALLING CONVENTION FROM resolve.frag's rFilterCubic, which is handed an
+// ALREADY-RESCALED distance (`sampleDist * 2`, because there the kernel radius is a live knob). Here
+// the footprint is fixed at the filter's own support, so x arrives unscaled. Same function, and the
+// same C means the same thing in both.
+float upFilterCubic(float x, float B, float C)
+{
+    float y  = 0.0f;
+    float x2 = x * x;
+    float x3 = x2 * x;
+    if (x < 1.0f)
+    {
+        y = (12.0f - 9.0f * B - 6.0f * C) * x3 + (-18.0f + 12.0f * B + 6.0f * C) * x2 + (6.0f - 2.0f * B);
+    }
+    else if (x <= 2.0f)
+    {
+        y = (-B - 6.0f * C) * x3 + (6.0f * B + 30.0f * C) * x2 + (-12.0f * B - 48.0f * C) * x + (8.0f * B + 24.0f * C);
+    }
+    return y / 6.0f;
+}
+
+ROOT_SIGNATURE(ComputeRootSignature)
+NUM_THREADS(8, 8, 1)
+void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
+{
+    INIT_MAIN;
+
+    int2 px    = int2(DispatchThreadID.xy);
+    int2 outD  = int2(gUpscaleParams.outRect.xy);
+    // The 8x8 group does not divide the output rect, and the overhang threads would write into the
+    // alloc region OUTSIDE it — which is the stale-texel border, one pass upstream of where the
+    // resolve would find it.
+    if (px.x >= outD.x || px.y >= outD.y)
+    {
+        RETURN();
+    }
+
+    float2 inD = gUpscaleParams.inRect.xy;
+
+    // Output pixel CENTRE -> continuous SOURCE coordinate, per axis:
+    //     src = (px + 0.5) * (in / out) - 0.5
+    // The two half-pixels are not decoration and they do not cancel: the first puts us at the centre
+    // of the output texel, the last converts a normalised position back into a texel-CENTRE-indexed
+    // source coordinate. Drop either and the whole image shifts by half an output pixel, which is
+    // invisible as blur in a still frame and shows up as the APL check in the 4b verification moving
+    // — the delivered framing changes ([[project_forge_halfpixel_align]] is the same arithmetic in
+    // the other direction).
+    //
+    // Per-axis, NOT one scalar ratio: the input rect is rounded to even host-side, so inW/outW and
+    // inH/outH can differ in the last bits and a shared scale would tilt the image by a sub-pixel
+    // amount that grows with distance from the origin.
+    float2 c = (float2(px) + 0.5f) * (inD * gUpscaleParams.outRect.zw) - 0.5f;
+    float2 b = floor(c);
+    float2 f = c - b;
+
+    float cubicC   = gUpscaleParams.opts.x;   // Mitchell C at B = 0; 0.5 = Catmull-Rom
+    float antiRing = gUpscaleParams.opts.y;
+
+    // ONE accumulator over all four channels — trap 1 at the top of this file.
+    float4 sum  = float4(0.0f, 0.0f, 0.0f, 0.0f);
+    float  wsum = 0.0f;
+    // The anti-ringing box: the nearest 2x2 taps, i.e. the four the result is INTERPOLATING between.
+    // Wider and it stops bounding the overshoot; narrower and there is nothing to bound it with.
+    float4 boxMin = float4( 1e30f,  1e30f,  1e30f,  1e30f);
+    float4 boxMax = float4(-1e30f, -1e30f, -1e30f, -1e30f);
+
+    UNROLL for (int j = -1; j <= 2; ++j)
+    UNROLL for (int i = -1; i <= 2; ++i)
+    {
+        float2 d = abs(float2(float(i), float(j)) - f);   // tap distance from c, in SOURCE texels
+        // Separable, so one 1-D evaluation per axis. Signed: the outer lobe is negative, and that
+        // negative lobe IS the sharpness — the anti-ringing clamp below is what makes it safe, not a
+        // reason to remove it.
+        float w = upFilterCubic(d.x, 0.0f, cubicC) * upFilterCubic(d.y, 0.0f, cubicC);
+
+        // Trap 3: clamp to the INPUT RENDER RECT. The coordinate is clamped, not the tap dropped, so
+        // the weights still sum to a partition of unity at the border.
+        int2   sp = int2(clamp(b + float2(float(i), float(j)), float2(0.0f, 0.0f), inD - 1.0f));
+        float4 s  = LoadTex2D(gUpscaleSrc, NO_SAMPLER, sp, 0);
+
+        sum  += s * w;
+        wsum += w;
+
+        if (i >= 0 && i <= 1 && j >= 0 && j <= 1)
+        {
+            boxMin = min(boxMin, s);
+            boxMax = max(boxMax, s);
+        }
+    }
+
+    // Mitchell(B=0) is a partition of unity for every C (resolve.srt.h records the verification:
+    // |sum(w) - 1| < 1e-15 across c and f), so this division is an identity in exact arithmetic. It
+    // is kept because it costs one reciprocal and it is the difference between "the filter is
+    // energy-preserving by construction" and "the filter is energy-preserving as long as nobody
+    // changes the tap set".
+    float4 outColor = sum / max(wsum, 1.0e-5f);
+
+    // Trap 2. All four channels together — a clamp that bounds rgb's ring while letting alpha keep
+    // its own is resolve.srt.h's failure #2 (a BRIGHTER seam at the horizon band) wearing this
+    // pass's clothes.
+    if (antiRing > 0.5f)
+    {
+        outColor = clamp(outColor, boxMin, boxMax);
+    }
+
+    Write2D(gUpscaleDst, px, outColor);
+    RETURN();
+}

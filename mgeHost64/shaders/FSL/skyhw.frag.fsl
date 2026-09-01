@@ -1,13 +1,25 @@
-// mgeHost64 — THE PHYSICAL SKY (tasks/forge-physical-sky.md P2). A fullscreen Hosek-Wilkie field.
+// mgeHost64 — THE PHYSICAL SKY: a fullscreen sample of the ATMOSPHERE's sky-view LUT.
+// tasks/forge-atmosphere.md S2c (was forge-physical-sky.md P2, a Hosek-Wilkie closed form).
 //
 // This retires the dome. MW's sky was a MESH carrying 32 authored per-vertex atmosphere colours and
 // a painted horizon band, and §0 measured what that costs: q = L_sky/(E_total/pi) = 0.265 against
 // 0.122 for real clear skies (+1.13 stops), and a 2-colour vertical lerp that returns ONE number for
 // the whole ring at a given elevation — where a real sky brightens up to 5x toward the sun and dips
-// BELOW its own zenith 60-90 degrees away from it. P1 corrected the level with a multiply. This
-// replaces the reproduction with a GENERATOR, and the level stops being something anyone sets: the
-// same radiance field lights the ground (publishSkyAmbientSH + the physical sun), the exposure servo
-// meters that ground, and wherever that puts the sky is by definition right.
+// BELOW its own zenith 60-90 degrees away from it. P1 corrected the level with a multiply. P2
+// replaced the reproduction with a GENERATOR, and the level stopped being something anyone sets.
+//
+// ⚠ S2 REPLACED THE GENERATOR WITH A MEDIUM, AND THE CHANGE HERE IS ONE SAMPLE, WHICH IS THE POINT.
+// Hosek-Wilkie is a fit to CLEAR skies, ABOVE the horizon, returning radiance for a DIRECTION rather
+// than along a RAY — so it could not do overcast, could not do twilight, could not do night, and,
+// being a dome rather than a medium, could never make the sky and the fog the same colour by
+// construction. All four were reported from play as separate defects. A participating medium closes
+// them structurally instead of by tuning, and what arrives HERE is simply a texture sample: the
+// sky-view LUT (atmos_skyview.comp), rebuilt every frame from MW's own live weather.
+//
+// ⚠⚠ AND THE SAME TEXTURE IS THE LIGHT. atmos_sh.comp projects THIS LUT into the SH that lights the
+// world. The sky that used to be evaluated twice — C++ for the light, FSL for the pixels, kept
+// honest by a startup cross-check — is now evaluated once and MEASURED. There is no second copy left
+// to diverge, which is why hosek.h, hosek.h.fsl and hosekcheck.* are gone rather than retained.
 //
 // ⚠ NO liftInPass(), AND THAT IS THE POINT, NOT AN OMISSION. sky.frag is scenecolor.h.fsl CLASS 2 —
 // it reproduces a value MW authored, so the frame's curve has to hand that value back untouched.
@@ -19,8 +31,8 @@
 //   - gSkyColor, the snapshot every fog site melts into (skydome.h.fsl), now has alpha 1 across the
 //     whole frame, so `s.rgb + fogColNear*(1-s.a)` collapses to `s.rgb`: fog melts into the REAL
 //     sky in every direction instead of into fogColNear below the dome's old rim. Below the horizon
-//     that copy used to be alpha 0, which is why hosekRadiance clamps to the horizon there rather
-//     than returning black — see the note in hosek.h.fsl.
+//     that copy used to be alpha 0, which is why the closed form had to CLAMP to the horizon there;
+//     the medium returns the lit ground instead, and it is a better fog target than the clamp was.
 //   - the present seam sees full host coverage in exteriors, so MW's own frame stops showing through
 //     the band above the dome rim. waterfill.frag's above-water hole fill becomes a no-op there,
 //     which is what it was written to survive ("the failure mode is the old image, not a wrong one").
@@ -39,7 +51,7 @@
 // why that needed a second cbuffer.
 
 #include "opaque.srt.h"
-#include "hosek.h.fsl"      // hosekRadiance() — the model, second of two copies
+#include "atmosphere.h.fsl" // THE MEDIUM — one copy. See the warning at the top of that file.
 #include "tonemap.h.fsl"    // the curve, for the display-referred (LDR) build
 #include "linearize.h.fsl"  // linearToSrgb(), for the gamma-domain build
 #include "scenecolor.h.fsl" // tonemapInPass()/sceneIsLinear() — which units the target wants
@@ -70,9 +82,35 @@ float4 PS_MAIN(VSOutput In)
     float4 hpB = mul(gSkyView.invViewProj, float4(ndc, 0.75f, 1.0f));
     float3 dir = normalize(hpA.xyz / hpA.w - hpB.xyz / hpB.w);
 
-    // Native W/(m^2 sr) -> SCENE units, with the night ramp and the strength lane already folded in
-    // host-side. A zero scale here is LEGITIMATE (night, feature off) and must read as a black sky.
-    float3 L = hosekRadiance(dir) * gSkyView.radiance.w;
+    // ─── ONE SAMPLE OF THE MEDIUM ────────────────────────────────────────────────────────────
+    // The LUT is parameterised by the view's ZENITH ANGLE and its AZIMUTH RELATIVE TO THE SUN — the
+    // medium is horizontally homogeneous, so those two coordinates carry the whole field and 192x108
+    // texels are enough for a full-screen sky. atmosSkyViewUvFromDir does the projection, and it
+    // lives in atmosphere.h.fsl beside the mapping the LUT was WRITTEN with, so the two cannot
+    // disagree — which is the same "one definition" argument the whole file rests on.
+    //
+    // The camera radius rides gSkyView.sunDirW.w: the LUT was cooked at a specific altitude and the
+    // deparameterisation needs that same radius, which this frag has no world position to derive.
+    //
+    // ⚠ BELOW THE HORIZON THIS IS A REAL ANSWER NOW, AND THAT IS A BEHAVIOUR CHANGE THIS PHASE OWNS.
+    // Hosek INVERTED beneath the horizon (its c1 goes negative, so the exponent ran to +inf) and had
+    // to be clamped to the horizon ring — which incidentally made that ring the fog target for
+    // everything seen from above. The medium keeps integrating, hits the ground, and returns what
+    // the ground actually looks like from here. gSkyColor is opaque everywhere, so this IS what
+    // distant surfaces melt into: the control is "look down from a height" (skydome.h.fsl), and it
+    // must show a horizon-haze-coloured ground rather than fading a downhill vista to black.
+    float2 svUv = atmosSkyViewUvFromDir(gAtmosParams, gSkyView.sunDirW.w, dir);
+    float3 Lnative = SampleLvlTex2D(gAtmosSkyView, gSamplerBilinearClamp, svUv, 0).rgb;
+
+    // Native W/(m^2 sr) -> SCENE units, with the strength lane already folded in host-side. A zero
+    // scale here is LEGITIMATE (interior, feature off) and must read as a black sky.
+    //
+    // ⚠ THE NIGHT RAMP IS NO LONGER IN THIS LANE (S2e). It used to fade the drawn sky to black
+    // because the closed form was undefined below the horizon; the medium computes twilight — ozone
+    // is what makes it violet/indigo rather than muddy brown — and carries a moon and an airglow
+    // floor, so there is nothing left for a fade to stand in for. The ramp's OTHER job, handing the
+    // LIGHTING back to MW's authored night, is untouched and still runs host-side.
+    float3 L = max(Lnative, f3(0.0f)) * gSkyView.radiance.w;
 
     // --- the sky is behind water too (W8) ----------------------------------------------------
     // Verbatim the gate and the reasoning sky.frag carries: the sky has no POSITION, only a

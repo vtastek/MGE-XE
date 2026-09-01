@@ -3,6 +3,7 @@
 #include "proxydx/d3d9header.h"
 #include "mge/dlmath.h"
 #include "ipc/hostframetimings.h"   // IPC::HostFrameTimings (RenderFrameParameters OUT block)
+#include "ipc/weatherwire.h"       // IPC::WeatherWire (RenderFrameParameters IN block)
 
 #include <cstddef>
 #include <cstdint>
@@ -551,7 +552,7 @@ namespace IPC {
 
         // One-shot (numpad1 edge): dump the host's LINEAR scene target to hdrdump/mge_NNNN.exr plus
         // the composited BGRA8 frame to mge_NNNN.tga, both in the install dir. Follows devGpuCapture
-        // exactly — same latch, same one-frame arm — because the target it reads (pMSAAColor, fp16,
+        // exactly — same latch, same one-frame arm — because the target it reads (pSceneColor, fp16,
         // pre-exposure and pre-curve) exists only inside the host and every other way out of the
         // process goes through resolve.frag, which exposes, tone-maps, encodes and dithers into 8
         // bits. An EXR of the raw radiance is what makes MW's sky/sun/interior levels comparable
@@ -580,6 +581,16 @@ namespace IPC {
         // rule actorRipples and devDumpHdr above followed. ⚠ The struct is shared BY LAYOUT across
         // x86/x64, so mgecore.dll and mgeHost64.exe must be rebuilt and deployed together.
         IN float playerCrush[4];
+
+        // S1 ATMOSPHERE: MW's live weather, as parameters. ipc/weatherwire.h says what each lane
+        // is and — more importantly — which two of them are references that must never drive a
+        // pixel. valid == 0 is the interior / no-weather answer and zeroes the rest.
+        //
+        // Appended at the very end of the IN block so every existing offset is unchanged — the same
+        // rule actorRipples, devDumpHdr and playerCrush above followed. ⚠ The struct is shared BY
+        // LAYOUT across x86/x64, so mgecore.dll and mgeHost64.exe must be rebuilt and deployed
+        // together.
+        IN WeatherWire weather;
 
         OUT std::uint32_t bytesWritten;
         OUT double renderMs;             // host-side render+readback time

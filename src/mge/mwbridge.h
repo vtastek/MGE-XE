@@ -81,6 +81,19 @@ public:
         float     landFogDay, landFogNight;       // Weather 0xf4 / 0xf8
         float     windSpeed;                      // Weather 0x100
         const char* cloudTexture;                 // Weather 0x104 (never freed by us)
+        // The SAME five authored scalars, read off the NEXT weather through the same Weather
+        // offsets. Nothing new is poked: it is one more base pointer through the identical struct,
+        // so Prime Directive 6 is untouched.
+        //
+        // ⚠ WITHOUT THESE A WEATHER CHANGE IS A STEP. MW blends its COLOURS across a transition but
+        // reads these scalars off `currentWeather` only, so cloud cover, fog depth and wind all jump
+        // at the instant the swap happens. That is invisible while they only feed particle counts,
+        // and it is exactly the discontinuity the atmosphere work exists to remove — so the client
+        // interpolates cur->next by `transition` before shipping (see IPC::WeatherWire).
+        // Equal to the cur* values when there is no next weather.
+        float     nextCloudsMaxPercent, nextCloudsSpeed;
+        float     nextLandFogDay, nextLandFogNight;
+        float     nextWindSpeed;
         // The sky meshes whose per-vertex colours MW rebakes in place each frame. Handed back
         // untyped so this header keeps its "no SharedSE NI headers" promise; the geometry
         // cache casts them (it already owns that idiom).

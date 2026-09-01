@@ -459,6 +459,16 @@ bool MWBridge::getWeatherState(WeatherState& out) {
     out.windSpeed        = read_float(cur + 0x100);
     out.cloudTexture     = reinterpret_cast<const char*>(cur + 0x104);   // inline char[260]
 
+    // The same five off the NEXT weather, so the client can interpolate rather than step at the
+    // swap (see the header). `next` is null whenever no transition is running, and then the pair is
+    // degenerate — cur == next — which makes the lerp a no-op at every value of `transition`.
+    const DWORD nxt = next ? next : cur;
+    out.nextCloudsMaxPercent = read_float(nxt + 0xf0);
+    out.nextLandFogDay       = read_float(nxt + 0xf4);
+    out.nextLandFogNight     = read_float(nxt + 0xf8);
+    out.nextCloudsSpeed      = read_float(nxt + 0xfc);
+    out.nextWindSpeed        = read_float(nxt + 0x100);
+
     out.triAtmosphere    = reinterpret_cast<void*>(read_dword(wc + 0x7c));
     out.triCloudsCurrent = reinterpret_cast<void*>(read_dword(wc + 0x80));
     return true;

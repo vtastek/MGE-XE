@@ -75,7 +75,34 @@ int main(int argc, char** argv) {
 		if (argc >= 3 && std::strcmp(argv[2], "rdoc") == 0) {
 			ForgeRender::enableRdocCapture(true);  // loads renderdoc.dll BEFORE device init
 		}
-		return ForgeRender::sceneProbe() ? 0 : 1;
+		// `--forge-scene 1x` / `2x` / `4x` / `8x` picks the MSAA arm. Since M0
+		// (tasks/forge-upscale.md) the sample count selects between two genuinely different
+		// pipelines — 1x now has its own scene-referred staging target and its own resolve_sc1
+		// variant — and the probe's flat fullscreen triangle has no edge for AA to act on, so the
+		// arms must agree pixel for pixel. That equality is the M0 gate and it needs no Morrowind.
+		unsigned probeSamples = 4;
+		if (argc >= 3) {
+			if (std::strcmp(argv[2], "1x") == 0)      { probeSamples = 1; }
+			else if (std::strcmp(argv[2], "2x") == 0) { probeSamples = 2; }
+			else if (std::strcmp(argv[2], "4x") == 0) { probeSamples = 4; }
+			else if (std::strcmp(argv[2], "8x") == 0) { probeSamples = 8; }
+		}
+		// ⚠ THE PROBE NEEDS THE ENV KNOBS TOO, and it returns long before the call below that
+		// normally applies them. Without this, `MGE_HOST_KNOBS=upscaleEnable=1 --forge-scene 1x`
+		// silently runs the DEFAULT arm and reports it as the overridden one — a run labelled as an
+		// A/B whose two arms are identical, which is precisely the failure the knob table's own
+		// header says it exists to prevent. Found running M1 4b's verification steps 3 and 5, both
+		// of which are probe runs with an env knob set.
+		//
+		// A SECOND CALL rather than moving the one below, deliberately: that one runs AFTER
+		// LOG::open, and its `>> [forge] MGE_HOST_KNOBS = ...` line is what makes a normal run's log
+		// carry the arm it was measured in. Hoisting it would drop that line from every real session
+		// to serve the probe. The probe has no MGE log at all (it returns before LOG::open, which is
+		// also why `[scenefmt]` is printf'd), so its evidence is stdout — which is why the upscale
+		// backend's ready / DECLINED lines go to both. Applying twice is harmless: the parse writes
+		// the same values into the same knobs.
+		ForgeRender::applyEnvOverrides();
+		return ForgeRender::sceneProbe(probeSamples) ? 0 : 1;
 	}
 
 	// Standalone terrain census (tasks/forge-terrain.md T0): parse every plugin's LAND/LTEX

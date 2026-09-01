@@ -1,11 +1,16 @@
-// mgeHost64 — the PER-VIEW sky cbuffer (tasks/forge-physical-sky.md P2).
+// mgeHost64 — the PER-VIEW sky cbuffer (tasks/forge-atmosphere.md S2c; was forge-physical-sky.md P2).
 //
-// ⚠ THIS FILE DECLARES A STRUCT AND NOTHING ELSE — NO SRT. It is included by opaque.srt.h (which
-// puts gSkyView on the PerBatch set for skyhw.frag) AND by hosekcheck.srt.h (the startup
-// C++/FSL cross-check, a compute shader on a different root signature). Two SRTs in one .srt.h
-// alias each other's registers and it compiles clean because DXC dead-strips the unused one, so a
-// shared cbuffer STRUCT lives in its own header — a struct carries no registers, so sharing it is
-// free. [[project_forge_srt_one_per_header]]
+// ⚠ THIS FILE DECLARES A STRUCT AND NOTHING ELSE — NO SRT. It is included by opaque.srt.h, which
+// puts gSkyView on the PerBatch set for skyhw.frag. Two SRTs in one .srt.h alias each other's
+// registers and it compiles clean because DXC dead-strips the unused one, so a shared cbuffer STRUCT
+// lives in its own header — a struct carries no registers, so sharing it is free.
+// [[project_forge_srt_one_per_header]]
+//
+// ⚠ S2 EMPTIED THE BIG HALF OF THIS STRUCT, AND THE REASON IT STILL EXISTS IS UNCHANGED. It used to
+// carry 36 floats of cooked Hosek-Wilkie coefficients, because a closed form has to be handed its
+// configuration. The atmosphere is a LUT — the sky pass samples gAtmosSkyView and needs no
+// coefficients at all — so those nine float4s are gone. What survives is the ONE field this cbuffer
+// was created for and which nothing else can supply: THIS view's invViewProj. See below.
 //
 // ─── WHY A SECOND CBUFFER EXISTS AT ALL, WHEN gShadowParams IS RIGHT THERE ────────────────────────
 // Because of ONE field: invViewProj. gShadowParams already carries the main camera's, and it is
@@ -19,38 +24,43 @@
 // the sky pass already switches between — which is that same one-resource-two-views pattern, already
 // proven by the sky world windows riding it.
 //
-// The Hosek-Wilkie coefficients are IDENTICAL in both instances (they are a function of solar
-// elevation, turbidity and albedo — not of where you are looking), and they ride here anyway rather
-// than in gShadowParams so that everything the sky pass needs arrives through one binding and the
-// mirror cannot be handed half of it.
+// The remaining scalar lanes are IDENTICAL in both instances (a radiance scale and a moon's level do
+// not depend on which camera is looking), and they ride here anyway rather than in gShadowParams so
+// that everything the sky pass needs arrives through one binding and the mirror cannot be handed
+// half of it.
 #pragma once
 
-// One cooked Hosek-Wilkie configuration + the view that reads it, and (P2b) the two sky ELEMENTS
-// whose radiance the model has to set rather than MW. 72 floats == 288 B; the CBV is 512 B.
+// The view that reads the atmosphere, its unit conversion, and (P2b) the sky ELEMENTS whose radiance
+// the model sets rather than MW. 36 floats == 144 B; the CBV is 512 B.
 STRUCT(SkyViewData)
 {
     // THIS view's inverse viewProj. Reverse-Z, camera-relative, half-pixel-adjusted — i.e. exactly
     // the matrix that view rasterises with, inverted, so a difference of two reconstructed points is
     // the true world-space ray direction for this view (and for the mirror, the REFLECTED ray).
     DATA(float4x4, invViewProj, None);
-    // The nine analytic coefficients, xyz = the R/G/B channel, one float4 per coefficient index.
-    // Laid out coefficient-major rather than channel-major because the closed form evaluates all
-    // three channels together at one direction — so every read here is a float3 the ALU wants
-    // anyway, and a channel-major layout would gather nine separate scalars per channel instead.
-    DATA(float4, coef[9], None);
-    // xyz = the model's per-channel radiance term (the tenth cooked value).
-    // w   = NATIVE -> SCENE scale, with the night ramp and the sky strength already folded in.
-    //       Native is W/(m^2 sr) per linear sRGB primary; scene is what the rest of the renderer
-    //       works in. One lane, folded host-side, so no shader ever holds a piece of the conversion.
-    //       ⚠ 0 IS A LEGITIMATE VALUE HERE (night, interior, feature off) and the pass must survive
-    //       it as "black sky", NOT as a divide or a guard — unlike calParams.z in P1, which was a
+    // xyz = SPARE. This held the model's per-channel radiance term; the medium states its own level.
+    // w   = NATIVE -> SCENE scale, with the sky strength already folded in. Native is
+    //       W/(m^2 sr) per linear sRGB primary; scene is what the rest of the renderer works in. One
+    //       lane, folded host-side, so no shader ever holds a piece of the conversion.
+    //       ⚠ 0 IS A LEGITIMATE VALUE HERE (interior, feature off) and the pass must survive it as
+    //       "black sky", NOT as a divide or a guard — unlike calParams.z in P1, which was a
     //       multiplier whose 0 meant "the binding failed".
+    //       ⚠ AND THE NIGHT RAMP IS **NOT** IN IT ANY MORE (S2e). The ramp used to fade the drawn
+    //       sky to black because Hosek-Wilkie was undefined below the horizon; a medium computes
+    //       twilight instead of fading it, so the SKY half of the ramp's two jobs is retired here.
+    //       Its LIGHTING half — handing the physical blend back to MW's authored night, which
+    //       calTarget()'s night row is calibrated against — survives untouched, host-side.
     DATA(float4, radiance, None);
     // xyz = unit vector TOWARD the sun, world space, MW Z up. The model is parameterised by the
     //       angle to the sun, so this is not lighting data — it is a coordinate.
     //       ⚠ gFrameData.sunDir is MW's TRAVEL direction and is the NEGATIVE of this. Converted once
     //       host-side rather than negated at each use.
-    // w   = the night ramp, 0..1, REPORTED here for debug only — it is already inside radiance.w.
+    // w   = the CAMERA'S RADIUS in the medium's own coordinates (metres from the planet centre).
+    //       ⚠ THE SKY PASS NEEDS THIS AND CANNOT DERIVE IT. The sky-view LUT is parameterised at the
+    //       altitude it was cooked for, so deparameterising a direction into a uv needs the same
+    //       radius the cook used — and the frag has no world position, only a direction. It rides
+    //       here rather than being recomputed from an eye height that the park restamp is allowed to
+    //       move ([[project_park_restamp_eye_origin]]).
     DATA(float4, sunDirW, None);
     // x = 1 while the pass is armed (exterior, model cooked), 0 otherwise. A hard gate rather than a
     //     zero radiance, so "the sky is legitimately black" and "nothing was published" stay

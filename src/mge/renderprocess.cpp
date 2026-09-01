@@ -4363,11 +4363,13 @@ namespace RenderProcess {
             // P1 shadows added 10 (shadow mask — the host panel's face-id/atlas checkboxes
             // pick what it displays); shadow observability added 11 (shadow-atlas static) +
             // 12 (shadow-atlas dynamic) fullscreen atlas blits; sun shadows added 13 (moments
-            // cascade atlas); SH2 sky AO added 14 (the top-down world height map) — cycle is %15.
+            // cascade atlas); SH2 sky AO added 14 (the top-down world height map); S2a added the two
+            // atmosphere LUT overlays 15/16 and did NOT move this modulus, which made them
+            // unreachable until M1 found it; M1 added 17 (motion vectors) and 18 (reactive mask) — cycle is %19.
             // THIS MODULUS AND THE HOST'S kDebugModeNames MUST MOVE IN THE SAME COMMIT: the host
             // indexes that array with the value we send here, and a mode with no name is a garbage
             // char* straight into ImGui's dev panel (an instant AV, recorded in forgerender.cpp).
-            g_debugMode = (g_debugMode + 1) % 15;
+            g_debugMode = (g_debugMode + 1) % 19;
             const char* name = (g_debugMode == 1) ? "DEPTH" : (g_debugMode == 2) ? "SCATTER"
                              : (g_debugMode == 3) ? "AO" : (g_debugMode == 4) ? "BENT NORMAL"
                              : (g_debugMode == 5) ? "ALBEDO" : (g_debugMode == 6) ? "LIT"
@@ -4377,7 +4379,14 @@ namespace RenderProcess {
                              : (g_debugMode == 11) ? "SHADOW ATLAS (STATIC)"
                              : (g_debugMode == 12) ? "SHADOW ATLAS (DYN)"
                              : (g_debugMode == 13) ? "SUN MOMENTS"
-                             : (g_debugMode == 14) ? "SKY HEIGHT MAP" : "NORMAL";
+                             : (g_debugMode == 14) ? "SKY HEIGHT MAP"
+                             // 15/16 existed in the host from S2a and were UNREACHABLE: the modulus
+                             // above stayed at 15 and the host's kDebugModeNames stayed at 15 entries,
+                             // so setDebugMode() clamped both to 14. Corrected alongside mode 17.
+                             : (g_debugMode == 15) ? "ATMOS SKY-VIEW LUT"
+                             : (g_debugMode == 16) ? "ATMOS TRANSMITTANCE LUT"
+                             : (g_debugMode == 17) ? "MOTION VECTORS"
+                             : (g_debugMode == 18) ? "REACTIVE MASK" : "NORMAL";
             LOG::logline(">> [seam] debug mode %d (%s)", g_debugMode, name);
         }
         // F9 toggles the in-host dev overlay.
@@ -5916,6 +5925,57 @@ namespace RenderProcess {
                                      crushHere ? mwb->PlayerPositionY() : 0.0f,
                                      crushHere ? mwb->PlayerPositionZ() : 0.0f,
                                      crushHere);
+        }
+
+        // S1 ATMOSPHERE — MW'S WEATHER REACHES THE HOST (tasks/forge-atmosphere.md).
+        //
+        // ⚠ THIS IS THE MISSING WIRE, not a new feature. MGE has read the weather controller for
+        // years and thrown all of it away but two particle counts (see the waterParams block
+        // above); the physical sky therefore generates a CLEAR sky from a fixed turbidity slider no
+        // matter what the game thinks the weather is, which is the single defect behind "overcast
+        // sky is gray from the clouds texture, horizon has hosek's bluer sky". Nothing here changes
+        // a pixel — the host reports the row and does not yet render from it.
+        //
+        // ⚠ THE AUTHORED SCALARS ARE INTERPOLATED HERE, ON PURPOSE. MW blends its weather COLOURS
+        // across a transition but reads cloud cover, fog depth and wind off `currentWeather` alone,
+        // so those three step at the instant of the swap. The lerp needs BOTH Weather objects and
+        // only this side has them (the wire carries one row), so it happens here. The weather INDEX
+        // pair rides untouched — the host's per-weather physics table is lerped by the same
+        // `transition` on the far side, which is what makes a weather change a continuous walk
+        // through parameter space rather than a cross-fade between two pictures.
+        //
+        // Gated on a real exterior weather cell and not on a menu: `valid = 0` is the interior
+        // answer and zeroes the row, the same idiom the sun, the sky-AO and the sky ambient lanes
+        // already use, so the host needs no exterior gate of its own and a stale exterior row can
+        // never rain indoors.
+        if (g_client) {
+            IPC::WeatherWire ww = {};
+            MWBridge::WeatherState ws;
+            if (isExterior && mwb->CellHasWeather() && mwb->getWeatherState(ws)) {
+                const float t = std::max(0.0f, std::min(1.0f, ws.transition));
+                const auto mix = [t](float a, float b) { return a + t * (b - a); };
+                ww.valid            = 1;
+                ww.cur              = ws.curWeather;
+                ww.next             = ws.nextWeather;
+                ww.transition       = t;
+                ww.cloudsMaxPercent = mix(ws.cloudsMaxPercent, ws.nextCloudsMaxPercent);
+                ww.cloudsSpeed      = mix(ws.cloudsSpeed,      ws.nextCloudsSpeed);
+                ww.windSpeed        = mix(ws.windSpeed,        ws.nextWindSpeed);
+                ww.landFogDay       = mix(ws.landFogDay,       ws.nextLandFogDay);
+                ww.landFogNight     = mix(ws.landFogNight,     ws.nextLandFogNight);
+                ww.thunderFlash     = ws.thunderFlash;
+                ww.sunglareVis      = ws.sunglareVis;
+                ww.sunOccluded      = ws.sunOccluded ? 1 : 0;
+                // ⚠ REFERENCES, NEVER DRIVERS — see bridge.h. MW's authored display codes, already
+                // blended for the hour and the transition, ride so the host can REPORT how far the
+                // generated atmosphere has drifted from MW's intent. A shader reading these is the
+                // bug [[project_forge_sky_is_a_display_code]] describes.
+                ww.skyColRef[0] = ws.skyCol.r; ww.skyColRef[1] = ws.skyCol.g; ww.skyColRef[2] = ws.skyCol.b;
+                ww.fogColRef[0] = ws.fogCol.r; ww.fogColRef[1] = ws.fogCol.g; ww.fogColRef[2] = ws.fogCol.b;
+            } else {
+                ww.cur = ww.next = -1;
+            }
+            g_client->setWeather(ww);
         }
 
         // Statics near/far handover: hand the host MW's ACTIVE exterior cell set plus how far

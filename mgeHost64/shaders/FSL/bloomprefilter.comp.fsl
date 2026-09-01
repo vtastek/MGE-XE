@@ -1,4 +1,4 @@
-// mgeHost64 — bloom prefilter: pMSAAColor -> pBloomMips mip 0.  tasks/forge-postprocess.md step 4.
+// mgeHost64 — bloom prefilter: pSceneColor -> pBloomMips mip 0.  tasks/forge-postprocess.md step 4.
 //
 // ⚠ THIS PASS IS THE MSAA RESOLVE, which is why bloom needs no resolve/composite split. A 2x
 // downsample of an MSAA target already averages every sub-sample in a 2x2 pixel footprint; there is
@@ -83,16 +83,79 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
     float threshold = gBloomParams.filt.x;
     float knee      = gBloomParams.filt.y;
 
+    // ── AN AREA-AVERAGE RESAMPLE, NOT A FIXED 2x2 BOX (M1 4c follow-up, tasks/forge-upscale.md) ──
+    //
+    // ⚠ THE SRC AND DST RECTS NO LONGER DIFFER BY EXACTLY 2. This pass reads the RASTER rect — the
+    // raw scene, pre-upscale — while mip 0 is sized from the DELIVERED rect, so the ratio is
+    // `2 x inputScale` and lands anywhere in (0, 2]. That mismatch is the entire point of the step:
+    //
+    //   bloom is an ENERGY operation and must take the ENERGY-HONEST source. 4c briefly fed it the
+    //   upscaler's output, which made mip 0 `box2(CatmullRom_up2(raw))` — an up-then-immediately-down
+    //   round trip that cannot add information and does not preserve PEAKS, through a filter carrying
+    //   a non-energy-conserving anti-ringing clamp. The user's report was that bloom "loses its
+    //   impact hard" at scale < 1 on a candle-lit interior, which is exactly the signature: a candle's
+    //   punch is its PEAK (the near glow), while only the wide skirt rides on total energy, and the
+    //   round trip preserves the second while flattening the first.
+    //
+    //   The tree had already made this call twice in the same direction — the HDR EXR dump takes a
+    //   hardware BOX resolve because the shader resolve "is a display reconstruction and is
+    //   deliberately not energy-conserving", and g_bloomInvLuma ships OFF for the same reason. An
+    //   upscaler IS a display reconstruction.
+    //
+    // A BOX over the covered footprint is the right operator and not merely the cheap one: it is the
+    // area average, so it is a partition of unity at every ratio (energy in = energy out, which is
+    // what the whole thresholdless lerp design rests on), and it DEGENERATES CORRECTLY at both ends —
+    //
+    //   ratio == 2  (inputScale 1.0)  -> exactly the old 2x2 box, weights exactly 1.0, third tap
+    //                                    exactly 0.0 and skipped. NUMERICALLY IDENTICAL, see below.
+    //   ratio == 1  (inputScale 0.5)  -> a 1:1 COPY. No filter at all, maximum peak retention —
+    //                                    where 4c had a 2x up + 2x down round trip of the same count.
+    //   ratio  < 1  (inputScale 0.33) -> a single tap, i.e. nearest. Blocky, and honest: there is
+    //                                    less source than target and the pyramid blurs it anyway.
+    //
+    // ⚠ RATIO CANNOT EXCEED 2. src <= delivered (alloc >= out >= in) and dst = ceil(delivered/2), so
+    // src/dst <= 2 — which is what bounds the footprint at 3 source texels per axis. A 3x3 window is
+    // therefore not a guess, it is the closed bound.
+    //
+    // ⚠⚠ WHY ratio == 2 IS BIT-IDENTICAL AND NOT MERELY EQUIVALENT. The default frame must not move
+    // and the claim has to survive the compiler. At ratio 2: `lo = 2p` exactly (2.0 is exact, and so
+    // is the product for any p this side of 2^23), `hiF = 2p+2`, `k0 = 2p`. Then
+    //     j=0: min(2p+2, 2p+1) - max(2p, 2p)   = 1.0   exactly
+    //     j=1: min(2p+2, 2p+2) - max(2p, 2p+1) = 1.0   exactly
+    //     j=2: min(2p+2, 2p+3) - max(2p, 2p+2) = 0.0   -> SKIPPED
+    // every term being an integer well inside float's exact range, so the subtractions are exact.
+    // The two surviving taps are visited in the SAME ORDER as the old loop, carry weight exactly
+    // 1.0, and `x * 1.0f` is exact — so `sum` and `wsum` accumulate bit-for-bit what they did.
+    //
+    // ⚠⚠⚠ THE ZERO-WEIGHT TAP IS SKIPPED BY BRANCH, NOT MULTIPLIED BY ZERO. `0 * NaN = NaN`
+    // ([[project_nan_survives_zero_multiply]]) and it would then survive every later tent and the
+    // composite. The house rule in this tree is a branch, and it is also what keeps the ratio-2
+    // accumulation order identical to the old loop rather than merely summing the same values.
+    float2 srcN  = gBloomParams.src.xy;
+    float2 ratio = srcN / max(float2(dstN), float2(1.0f, 1.0f));
+    float2 lo    = float2(p) * ratio;
+    float2 hiF   = lo + ratio;
+    int2   k0    = int2(floor(lo));
+
     // ONE accumulator over all four channels — the filter weight is a filter weight and hits the
-    // whole premultiplied 4-vector (bloom.srt.h).
+    // whole premultiplied 4-vector (bloom.srt.h). The area weight is a filter weight too.
     float4 sum   = float4(0.0f, 0.0f, 0.0f, 0.0f);
     float  wsum  = 0.0f;
 
-    UNROLL for (int j = 0; j < 2; ++j)
+    UNROLL for (int j = 0; j < 3; ++j)
     {
-        UNROLL for (int i = 0; i < 2; ++i)
+        int   ky = k0.y + j;
+        float wy = min(hiF.y, float(ky + 1)) - max(lo.y, float(ky));
+        if (wy > 0.0f)
         {
-            int2 q = clamp(p * 2 + int2(i, j), int2(0, 0), hi);
+        UNROLL for (int i = 0; i < 3; ++i)
+        {
+            int   kx = k0.x + i;
+            float wx = min(hiF.x, float(kx + 1)) - max(lo.x, float(kx));
+            if (wx > 0.0f)
+            {
+            float area = wx * wy;
+            int2 q = clamp(int2(kx, ky), int2(0, 0), hi);
             UNROLL for (int s = 0; s < SAMPLE_COUNT; ++s)
             {
 #if SAMPLE_COUNT > 1
@@ -109,15 +172,17 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
                 float  luma = bLuminance(rgb);
                 rgb        *= bThresholdFactor(luma, threshold, knee);
 
-                // ── FILTER WEIGHT, all four ──
-                float w = 1.0f;
+                // ── FILTER WEIGHT, all four ── (the footprint area, and Karis if it is armed)
+                float w = area;
                 if (invLuma > 0.5f)
                 {
-                    w = 1.0f / (1.0f + luma);
+                    w = area / (1.0f + luma);
                 }
                 sum  += float4(rgb, smp.a) * w;
                 wsum += w;
             }
+            }
+        }
         }
     }
 

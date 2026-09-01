@@ -233,6 +233,7 @@
          Forge's no-exceptions/IMemory one) so its containers stay on the CRT allocator; it talks
          to forgerender.cpp through terrain.h's POD-only surface. -->
     <ClCompile Include="terrain.cpp" />
+    <ClCompile Include="atmosphere.cpp" />
     <ClCompile Include="vkrender.cpp" />
     <!-- Vendored Intel MOC for host-side occlusion testing. Per-ISA .cpp files
          get elevated /arch flags; the dispatcher (MaskedOcclusionCulling.cpp)
@@ -255,6 +256,16 @@
        MSVC ABI. forgerender.cpp is the glue and shares this ABI. -->
   <ItemGroup>
     <ClCompile Include="forgerender.cpp">
+      <ExcludedFromBuild Condition="'$(Platform)'=='Win32'">true</ExcludedFromBuild>
+      <ExceptionHandling>false</ExceptionHandling>
+      <RuntimeTypeInfo>false</RuntimeTypeInfo>
+      <SDLCheck>false</SDLCheck>
+      <PreprocessorDefinitions>_HAS_EXCEPTIONS=0;D3D12_AGILITY_SDK=1;D3D12_AGILITY_SDK_VERSION=715;_CRT_SECURE_NO_WARNINGS;_CRT_NONSTDC_NO_DEPRECATE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+    <!-- The IUpscaler seam + its passthrough backend (tasks/forge-upscale.md M1 step 4b). Same
+         Forge ABI as forgerender.cpp because it talks to IGraphics/IResourceLoader directly and
+         includes IMemory.h. -->
+    <ClCompile Include="upscale.cpp">
       <ExcludedFromBuild Condition="'$(Platform)'=='Win32'">true</ExcludedFromBuild>
       <ExceptionHandling>false</ExceptionHandling>
       <RuntimeTypeInfo>false</RuntimeTypeInfo>
@@ -670,10 +681,12 @@
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="stbn_mask.h" />
-    <ClInclude Include="hosek.h" />
-    <ClInclude Include="hosek_data.h" />
+    <ClInclude Include="atmosphere.h" />
+    <ClInclude Include="scenecal.h" />
     <ClInclude Include="forgerender.h" />
+    <ClInclude Include="upscale.h" />
     <ClInclude Include="..\src\ipc\bridge.h" />
+    <ClInclude Include="..\src\ipc\weatherwire.h" />
     <ClInclude Include="..\src\ipc\dlshare.h" />
     <ClInclude Include="..\src\ipc\server.h" />
     <ClInclude Include="..\src\ipc\vec.h" />

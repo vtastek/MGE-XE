@@ -33,7 +33,7 @@
 #include "linearize.h.fsl" // srgbToLinear()/mod2xLinear() — the scene's transfer function (step 5)
 #include "scenecolor.h.fsl" // liftInPass() + expandExposedEmissiveP() — see the P2b block below
 #include "agx.h.fsl"        // agxInverseNeutral() — the moon pin's half of the round trip
-#include "hosek.h.fsl"      // hosekRadiance() — the moon's SHADOW layer paints the real sky
+#include "atmosphere.h.fsl" // THE MEDIUM — the moon's SHADOW layer paints the real sky (S2c)
 #include "waterfog.h.fsl"   // the sky is behind water too, and nothing else was going to fog it
 
 STRUCT(VSOutput)
@@ -135,11 +135,21 @@ float4 PS_MAIN( VSOutput In )
         // heartbeat). A dark-blue disc on a black sky is a lit dark side. The authored colour was
         // never the point — "whatever the sky is" was.
         //
-        // So evaluate the sky. Same model, same coefficients, same scale lane as skyhw.frag, at this
-        // fragment's own direction — which makes the dark limb *exactly* invisible against the sky
-        // instead of approximately, and keeps the star occlusion, because the ALPHA is untouched.
-        // The lit disc then adds itself on top and the pin above is exact wherever the sky is black.
-        c.rgb = hosekRadiance(normalize(In.WorldDir)) * gSkyView.radiance.w;
+        // So evaluate the sky. THE SAME SAMPLE skyhw.frag takes, at this fragment's own direction —
+        // which makes the dark limb *exactly* invisible against the sky instead of approximately,
+        // and keeps the star occlusion, because the ALPHA is untouched. The lit disc then adds
+        // itself on top and the pin above is exact wherever the sky is black.
+        //
+        // ⚠ S2 MADE THIS BETTER WITHOUT TOUCHING THE ARGUMENT. Under Hosek the sky behind the moon
+        // had RAMPED TO BLACK by night (`zenith=0.00000` on the heartbeat), so "paint the real sky"
+        // resolved to "paint black" and only worked because the disc's own pin sat on top of it. The
+        // medium computes a real night sky — moonlit, airglow-floored, Rayleigh-blue — so this now
+        // paints the colour that is genuinely there, and the limb blends into a sky rather than into
+        // a hole. Same one line, and that is the point: one definition of the sky, sampled twice.
+        float2 mUv = atmosSkyViewUvFromDir(gAtmosParams, gSkyView.sunDirW.w,
+                                           normalize(In.WorldDir));
+        c.rgb = max(SampleLvlTex2D(gAtmosSkyView, gSamplerBilinearClamp, mUv, 0).rgb, f3(0.0f))
+              * gSkyView.radiance.w;
     } else if (cls == SKY_CLASS_MOON && gShadowParams.agxCurve.w > 0.5f) {
         // ─── THE MOON PIN ────────────────────────────────────────────────────────────────────────
         // *"moons need to preserve their phase. clear night, moons should be at their exposed look,

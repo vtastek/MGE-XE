@@ -972,19 +972,14 @@ SamplerState gSampler2xWrapClamp : register( s17 , space100 ) ;
 #line 247 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/../../../3rdparty/The-Forge/Common_3/Graphics/FSL/defaults.h"
 
 #line 11 "FSL/shaders.list"
-#line 535 "FSL/shaders.list"
+#line 611 "FSL/shaders.list"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/bloomprefilter.comp.fsl"
 #line 38 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/bloomprefilter.comp.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/bloom.srt.h"
 #line 87 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/bloom.srt.h"
 STRUCT(BloomParams)
 {
-
-
-
-
-
-
+#line 111 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/bloom.srt.h"
     float4 src;
 
 
@@ -992,17 +987,17 @@ STRUCT(BloomParams)
 
 
     float4 dst;
-#line 127 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/bloom.srt.h"
+#line 143 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/bloom.srt.h"
     float4 filt;
-#line 150 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/bloom.srt.h"
+#line 166 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/bloom.srt.h"
     float4 opts;
-#line 151
+#line 167
 };
 
         CBUFFER(BloomParams) gBloomParams :  register(b0,space0);
 
         Tex2DMS(float4, 4 ) gBloomSceneTex :  register(t1,space0);
-#line 166 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/bloom.srt.h"
+#line 182 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/bloom.srt.h"
         RTex2D(float4) gBloomSrc :  register(u2,space0);
         RWTex2D(float4) gBloomDst :  register(u3,space0);
 #line 39 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/bloomprefilter.comp.fsl"
@@ -1052,22 +1047,37 @@ void CS_MAIN( uint3 DispatchThreadID : SV_DISPATCHTHREADID )
     float exposure = gBloomParams.opts.y;
     float threshold = gBloomParams.filt.x;
     float knee = gBloomParams.filt.y;
+#line 134 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/bloomprefilter.comp.fsl"
+    float2 srcN = gBloomParams.src.xy;
+    float2 ratio = srcN / max(float2(dstN), float2(1.0f, 1.0f));
+    float2 lo = float2(p) * ratio;
+    float2 hiF = lo + ratio;
+    int2 k0 = int2(floor(lo));
 
 
 
     float4 sum = float4(0.0f, 0.0f, 0.0f, 0.0f);
     float wsum = 0.0f;
 
-    UNROLL for (int j = 0; j < 2; ++j)
+    UNROLL for (int j = 0; j < 3; ++j)
     {
-        UNROLL for (int i = 0; i < 2; ++i)
+        int ky = k0.y + j;
+        float wy = min(hiF.y, float(ky + 1)) - max(lo.y, float(ky));
+        if (wy > 0.0f)
         {
-            int2 q = clamp(p * 2 + int2(i, j), int2(0, 0), hi);
+        UNROLL for (int i = 0; i < 3; ++i)
+        {
+            int kx = k0.x + i;
+            float wx = min(hiF.x, float(kx + 1)) - max(lo.x, float(kx));
+            if (wx > 0.0f)
+            {
+            float area = wx * wy;
+            int2 q = clamp(int2(kx, ky), int2(0, 0), hi);
             UNROLL for (int s = 0; s <  4 ; ++s)
             {
 
                 float4 smp = LoadTex2DMS(gBloomSceneTex, NO_SAMPLER, q, s);
-#line 105 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/bloomprefilter.comp.fsl"
+#line 168 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/bloomprefilter.comp.fsl"
                 smp = max(smp, float4(0.0f, 0.0f, 0.0f, 0.0f));
 
 
@@ -1076,22 +1086,24 @@ void CS_MAIN( uint3 DispatchThreadID : SV_DISPATCHTHREADID )
                 rgb *= bThresholdFactor(luma, threshold, knee);
 
 
-                float w = 1.0f;
+                float w = area;
                 if (invLuma > 0.5f)
                 {
-                    w = 1.0f / (1.0f + luma);
+                    w = area / (1.0f + luma);
                 }
                 sum += float4(rgb, smp.a) * w;
                 wsum += w;
             }
+            }
+        }
         }
     }
 
     float4 outv = sum / max(wsum, 1.0e-5f);
-#line 137 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/bloomprefilter.comp.fsl"
+#line 202 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/bloomprefilter.comp.fsl"
     outv.rgb = min(outv.rgb, float3(60000.0f, 60000.0f, 60000.0f));
 
     Write2D(gBloomDst, p, outv);
     return;
 }
-#line 536 "FSL/shaders.list"
+#line 612 "FSL/shaders.list"

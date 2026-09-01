@@ -1,0 +1,180 @@
+// mgeHost64 — CAMERA-ONLY MOTION VECTORS (compute).  tasks/forge-upscale.md M1.
+//
+// Read motionvectors.srt.h first — the space, the bakeEye hazard and the jitter convention are all
+// documented there, and none of them is visible in the arithmetic below.
+//
+// Per pixel: unproject the device depth into this frame's camera-relative space, project that same
+// point through LAST frame's camera, and write the screen-space difference.
+//
+// UNITS: PIXELS of the RENDER rect, and the vector points BACKWARD IN TIME — `previous - current`,
+// which is the convention DLSS, FSR2 and XeSS all take. +x right, +y down, matching the sub-pixel
+// jitter's sense. Stored in R16G16_SFLOAT: floating point, so the RELATIVE precision is constant
+// and the sub-pixel motions that dominate a walking camera keep ~3 decimal digits, while the large
+// vectors that lose absolute precision are the ones an accumulator distrusts anyway.
+
+#include "motionvectors.srt.h"
+
+// FSL's d3d.h declares AtomicAdd/Or/And/Xor but no buffer AtomicMin/Max. The host is D3D12-only and
+// gMvStats is an R32_UINT typed UAV, on which InterlockedMin/Max are core intrinsics — the same
+// route grasscrushsplat.comp.fsl already takes, verbatim.
+#ifndef AtomicMin
+#define AtomicMin(DEST, VALUE, ORIGINAL_VALUE) InterlockedMin(DEST, VALUE, ORIGINAL_VALUE)
+#endif
+#ifndef AtomicMax
+#define AtomicMax(DEST, VALUE, ORIGINAL_VALUE) InterlockedMax(DEST, VALUE, ORIGINAL_VALUE)
+#endif
+
+ROOT_SIGNATURE(ComputeRootSignature)
+NUM_THREADS(8, 8, 1)
+void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
+{
+    INIT_MAIN;
+    int2   px   = int2(DispatchThreadID.xy);
+    float2 dims = gMvParams.screenParams.xy;
+
+    // BOUNDS-CHECKED, unlike linearizedepth beside it, and for a reason rather than by habit: the
+    // targets here are ALLOC-sized while the dispatch covers the RENDER rect rounded up to a group,
+    // so the tail threads are in-bounds for the resource and OUTSIDE the frame. Their writes would
+    // not be dropped — they would fill the border with vectors reconstructed from never-rendered
+    // depth, which is exactly the kind of thing a debug view shows and then has to be explained.
+    // ⚠ RETURN() ON ITS OWN LINE. fsl.py rewrites RETURN as a STATEMENT and does not see one buried
+    // inside a braced one-liner — `{ RETURN(); }` survives transpilation verbatim and DXC then fails
+    // with "expected expression" pointing at the closing paren, which reads like an HLSL syntax error
+    // in a line that is valid HLSL. Cost one build to find; the other early-out below is spelled the
+    // same way for the same reason.
+    if (px.x >= int(dims.x) || px.y >= int(dims.y))
+    {
+        RETURN();
+    }
+
+    float dz = LoadTex2D(gMvDepth, NO_SAMPLER, px, 0).r;
+
+    // Pixel centre -> NDC. Character for character the mapping shadowmask.comp's reconstructWorldPx
+    // uses, because it must be: that shader and this one unproject the SAME depth buffer with the
+    // SAME matrix, and a half-pixel disagreement between them would be a shadow that is correct and
+    // a motion vector that is half a pixel wrong, with nothing to point at.
+    float2 uv  = (float2(px) + 0.5f) * gMvParams.screenParams.zw;
+    // render/alloc, for the one place this pass SAMPLES rather than Loads (the previous depth).
+    float2 frac_ = gMvParams.screenParams.xy * gMvParams.allocParams.xy;
+    float2 ndc = float2(uv.x * 2.0f - 1.0f, 1.0f - uv.y * 2.0f);
+
+    // ⚠ NO SPECIAL CASE FOR THE SKY, AND NONE IS NEEDED. Reverse-Z far (dz == 0, the per-frame
+    // clear, which is what every sky and un-drawn pixel carries) is NOT infinity here: the frame has
+    // a FINITE far plane (DrawDist x cellSize), so this unprojects to a real point at that distance
+    // and reprojects to the rotation-only motion the sky actually has. A translation of a few tens
+    // of units against a far plane in the hundreds of thousands is ~1e-4 rad, i.e. correctly
+    // negligible. An infinite far plane would make w == 0 here and would need the special case.
+    float4 wp  = mul(gMvParams.invViewProj, float4(ndc, dz, 1.0f));
+    float3 rel = wp.xyz / wp.w;
+
+    float2 mv       = float2(0.0f, 0.0f);
+    float  reactive = 0.0f;
+    if (gMvParams.opts.x > 0.5f)
+    {
+        float4 pc = mul(gMvParams.prevViewProjRel, float4(rel, 1.0f));
+        // w <= 0 means the surface was BEHIND the previous camera — newly disoccluded by a turn, and
+        // there is no previous screen position to name. Zero (== "did not move") is the safe answer:
+        // it makes an accumulator reuse history at this pixel, where a garbage vector would make it
+        // fetch from an arbitrary one. The reactive mask and the accumulator's own depth rejection
+        // are what clean this up properly.
+        if (pc.w > 1.0e-6f)
+        {
+            float2 pndc = pc.xy / pc.w;
+            float2 puv  = float2(pndc.x * 0.5f + 0.5f, 0.5f - pndc.y * 0.5f);
+            mv = puv * dims - (float2(px) + 0.5f);   // previous - current, in pixels
+
+            // ─── THE REACTIVE MASK (motionvectors.srt.h carries the whole argument) ─────────────
+            // Ask the PREVIOUS frame's depth buffer whether anything was actually at the distance
+            // this pixel claims to have come from.
+            if (gMvParams.reactive.z > 0.0f)
+            {
+                if (any(puv < f2(0.0f)) || any(puv > f2(1.0f)))
+                {
+                    // Off-screen last frame: there IS no history to reuse here, which is the
+                    // strongest possible case for being reactive.
+                    reactive = 1.0f;
+                }
+                else
+                {
+                    // ⚠ ALLOC-relative UV — puv is a RENDER-rect [0,1] and the texture is
+                    // alloc-sized. See allocParams.
+                    float sampled  = SampleLvlTex2D(gMvPrevDepth, gSamplerPointClamp,
+                                                    puv * frac_, 0).r;
+                    float expected = pc.z / pc.w;   // reverse-Z device depth in the PREVIOUS frame
+
+                    // ⚠ RELATIVE, NOT ABSOLUTE. Reverse-Z device depth goes as ~near/distance, so a
+                    // fixed epsilon means centimetres up close and kilometres at the far plane — it
+                    // would mark the entire near field and nothing beyond it. Dividing by the depth
+                    // turns this into a constant RELATIVE distance error, which is the scale-free
+                    // quantity and is why the thresholds are unitless.
+                    //
+                    // ⚠⚠ BUT THE DENOMINATOR MUST BE FLOORED AT A REAL DISTANCE, NOT AT AN EPSILON,
+                    // AND THE SKY IS WHERE THAT BITES. This read `/ max(expected, 1e-6)`, and at the
+                    // far plane BOTH depths are ~0: a difference of 1e-7 between two skies became a
+                    // relative error of 0.1, sailing past the 0.02 onset and marking sky reactive.
+                    // Worse, it did so with a hard CONTOUR where `expected` crossed the 1e-6 clamp —
+                    // reported from play as "sky has a line", which is what an arbitrary epsilon in a
+                    // denominator looks like when it becomes the dominant term.
+                    //
+                    // The floor is a DEPTH, so it has a physical meaning: 1e-4 in reverse-Z device
+                    // units is ~near/1e-4, i.e. tens of thousands of world units out. Past that,
+                    // "how far did this surface move relative to its distance" stops being a question
+                    // worth asking — nothing that far away moves independently of the camera in any
+                    // way a temporal accumulator could resolve, and the sky, at literal infinity,
+                    // moves by rotation alone, which the camera-only vector already describes exactly.
+                    //
+                    // max(expected, sampled), not just expected: the disocclusion case (sky last
+                    // frame, geometry now) has sampled == 0 and must still normalise by the real
+                    // depth, or it would divide by the floor and under-report a genuine reveal.
+                    float denom = max(max(expected, sampled), 1.0e-4f);
+                    float err   = abs(expected - sampled) / denom;
+
+                    float t0 = gMvParams.reactive.x;
+                    float t1 = max(gMvParams.reactive.y, t0 + 1.0e-4f);
+                    reactive = saturate((err - t0) / (t1 - t0));
+                }
+                reactive *= gMvParams.reactive.z;
+            }
+        }
+        else
+        {
+            // Behind the previous camera. The vector is zero (above), but the mask must NOT be:
+            // "I have no idea where this came from" is exactly what reactive means.
+            reactive = gMvParams.reactive.z;
+        }
+    }
+
+    Write2D(gMvOut, px, mv);
+    Write2D(gMvReactive, px, reactive);
+
+    // ─── THE FIELD MEASURES ITSELF ───────────────────────────────────────────────────────────────
+    // See gMvStats in the SRT for why: the acceptance test for this pass is "the static world reads
+    // ZERO while the camera is still", and by eye a uniform DC offset over a moving field is
+    // indistinguishable from a moving field. min |mv| is the offset's magnitude.
+    //
+    // ⚠ ONE ATOMIC SET PER PIXEL AND NO WAVE REDUCTION, deliberately. This is a diagnostic that runs
+    // on the frames someone is looking at a diagnostic, the contention is spread over 1.7M pixels
+    // hitting 4 addresses, and a groupshared pre-reduce would be a second implementation of the
+    // statistic to keep in agreement with the first. If it ever shows on `mv=`, reduce it then —
+    // with the un-reduced version still there to check the reduced one against.
+    {
+        float  m  = length(mv);
+        uint   mu = asuint(m);   // monotonic for non-negative floats — see the SRT
+        uint   prev;
+        AtomicMax(gMvStats[0], mu, prev);
+        AtomicMin(gMvStats[1], mu, prev);
+        if (m < 0.01f)
+        {
+            AtomicAdd(gMvStats[2], 1u, prev);
+        }
+        AtomicAdd(gMvStats[3], 1u, prev);
+        // ...and the mask's coverage, so "how much of the frame is reactive" is a number rather
+        // than a colour. A mask covering most of the screen is not a mask, it is the upscaler
+        // turned off — and that failure looks like "slightly soft", not like an error.
+        if (reactive > 0.5f)
+        {
+            AtomicAdd(gMvStats[4], 1u, prev);
+        }
+    }
+    RETURN();
+}

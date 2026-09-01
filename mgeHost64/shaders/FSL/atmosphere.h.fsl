@@ -1,0 +1,479 @@
+// mgeHost64 — THE MEDIUM. ONE COPY. (tasks/forge-atmosphere.md S2)
+//
+// ⚠⚠ READ THIS FIRST: THIS FILE EXISTS SO THAT THERE IS EXACTLY ONE OF IT.
+// The sky it replaces was written twice — `Hosek::evalNative()` in C++ fed the light,
+// `hosekRadiance()` in FSL fed the pixels — and the two were kept honest by a startup cross-check
+// whose whole job was to notice when someone edited one and not the other. That is the "fourth copy"
+// hazard the physical-sky work names by name, and S2 does not instrument it, it DELETES it: the
+// density profiles, the phase functions, the ray-march and the LUT (de)parameterisations live here
+// and nowhere else, every atmosphere shader includes this, and the LIGHT is read back off the same
+// GPU LUTs the pixels are drawn from (atmos_sh.comp). There is no second evaluation to diverge.
+//
+// If you find yourself about to write a scattering coefficient, a scale height or a phase function
+// anywhere else in the tree: don't. Add it here and include this.
+//
+// ─── THE MODEL ───────────────────────────────────────────────────────────────────────────────────
+// Bruneton, "Precomputed Atmospheric Scattering" (2008/2017), in Hillaire's per-frame LUT packaging
+// ("A Scalable and Production Ready Sky and Atmosphere Rendering Technique", 2020). Three LUTs, all
+// compute, all rebuilt EVERY FRAME — which is the load-bearing choice and not a performance note:
+// it is what lets the medium's parameters move CONTINUOUSLY, and a weather sub-simulation is exactly
+// a continuous walk through parameter space. Bruneton's original offline precompute would have
+// forced weather to be a cross-fade between frozen presets, which is the thing S1 measured itself
+// against ("VERDICT: WALK", never STEP).
+//
+//   transmittance  256x64   how much survives from a point to space along a direction
+//   multiscatter   32x32    the isotropic multiple-scattering term (2-order approximation)
+//   sky-view       192x108  the sky's radiance in every direction from the camera
+//
+// ─── UNITS ───────────────────────────────────────────────────────────────────────────────────────
+// METRES and 1/m throughout, and RADIANCE in W/(m^2 sr) per linear sRGB primary — the same "native"
+// convention scenecal.h states and the Hosek dataset was measured to satisfy, so one constant
+// (kNativeToScene) converts the whole thing to scene units and no shader holds a piece of it.
+// A Morrowind unit is ~1.4 cm; that conversion happens HOST-side, once (Atmosphere::kMwUnitToMetre).
+//
+// ⚠ THE Z AXIS IS UP. Morrowind is Z-up and so is every direction here. Hillaire's and Bruneton's
+// published code is Y-up; the geometry below is written in terms of the ZENITH COSINE rather than a
+// component name wherever it can be, and where it cannot, `dir.z` is the zenith cosine.
+#ifndef ATMOSPHERE_H_FSL
+#define ATMOSPHERE_H_FSL
+
+#include "atmosparams.h.fsl"   // AtmosphereParams — the struct, C++-safe on its own
+
+#define ATMOS_PI      3.14159265358979323846f
+#define ATMOS_INV_4PI 0.07957747154594767f
+
+// ⚠⚠ THE CAMERA MAY NEVER SIT EXACTLY ON THE GROUND, AND THIS IS A FLOAT32 FACT RATHER THAN A
+// TASTE. Every ray-sphere test here computes `dot(ro,ro) - R*R`, and at planet scale both terms are
+// ~4.05e13 while a float32 mantissa carries 24 bits — so the difference is exact only to about
+// ±2.4e6. At r == Rg the true value is 0, which means that subtraction returns NOISE OF EITHER
+// SIGN, and the sign decides whether a ray one degree ABOVE the horizon is reported as hitting the
+// ground ten metres away. Half the horizon texels then march ten metres and return bare ground.
+//
+// Pushing the camera 10 m up makes the true difference ~1.3e8, fifty times the rounding error, and
+// the test becomes unambiguous. Hillaire ships the identical constant for the identical reason.
+// It is 10 m against an 8 km scale height, so it changes no radiance anyone can measure.
+#define ATMOS_GROUND_EPS_M 10.0f
+
+// ─── THE CLOUD DECK'S VERTICAL PROFILE (S4a) ─────────────────────────────────────────────────────
+// ⚠⚠ PARTIAL COVER IN A HORIZONTALLY-HOMOGENEOUS MEDIUM IS A MEAN FIELD AND NOTHING ELSE. There is
+// no x/y here — there cannot be, the whole LUT chain is built on the medium depending only on
+// altitude — so `cloudCoverage 0.4` is A UNIFORMLY THINNER LID, never broken cumulus with blue
+// between it. That is the one place this model is deliberately approximate, and it is stated here
+// rather than in a commit message because broken cloud is precisely what S4b's volumetric pass is
+// for. The host squares the cover up before it becomes an optical depth (kCloudCoverExponent) so a
+// light cover does not grey the whole sky the way a linear mean field would.
+//
+// THE SHAPE IS SMOOTH AT BOTH BOUNDARIES, AND THAT IS QUADRATURE RATHER THAN TASTE. A box would put
+// a step discontinuity in the integrand of three marches that are all tuned for smooth exponentials;
+// both shapes below reach zero with zero slope, so a step that straddles the edge sees a ramp
+// instead of a cliff. `cloudType` blends them:
+//
+//   0 (stratus)       a soft-shouldered SLAB — flat through the core, mean 0.80 over the layer
+//   1 (cumulonimbus)  a RAISED COSINE — centre-weighted, mean 0.50 over the layer
+//
+// ⚠ THE TWO MEANS ARE EXACT AND THE HOST KNOWS THEM (kCloudProfileMeanFlat / ...Bell in
+// atmosphere.h). packParams() divides the target optical depth by the mean, so tau is tau whatever
+// the shape and whatever the thickness — which is what makes "a deck of optical depth 24" a
+// checkable statement instead of a coefficient nobody can compare to a textbook. Change the shoulder
+// below and you must change kCloudProfileShoulder with it; that pair is the one place two numbers
+// here have to agree.
+#define ATMOS_CLOUD_SHOULDER 0.60f    // MUST match Atmosphere::kCloudProfileShoulder
+
+float atmosCloudProfile(AtmosphereParams P, float h)
+{
+    // Outside the deck |x| >= 1 and both shapes are zero there, so the clamp IS the bounds test —
+    // branchless, because this runs per march step in the multiscatter pass's 1.3M-sample loop.
+    float x  = (h - P.profGeom.z) / max(P.profGeom.w, 1.0f);
+    float ax = min(abs(x), 1.0f);
+    // The stratus slab, written out rather than as smoothstep(1, shoulder, ax): a smoothstep with
+    // its edges REVERSED is well defined in HLSL and undefined in GLSL, and this file's arithmetic
+    // is checked against a textbook rather than against one compiler's reading of a corner case.
+    // 1 inside the core, a Hermite shoulder out to |x| = 1, zero slope at both ends. Mean over the
+    // layer = shoulder + (1 - shoulder)/2 = (1 + shoulder)/2, exactly.
+    float ts   = saturate((1.0f - ax) / (1.0f - ATMOS_CLOUD_SHOULDER));
+    float flat = ts * ts * (3.0f - 2.0f * ts);
+    float bell = 0.5f + 0.5f * cos(ATMOS_PI * ax);       // convective: a raised cosine, mean 1/2
+    return lerp(flat, bell, saturate(P.cloud.w));
+}
+
+// The deck alone. Exists because atmos_transmittance is allowed to split its integral by SPECIES
+// (see the note at that march) and must not re-derive the profile to do it — this is the same
+// atmosCloudProfile() atmosMediumAt() calls, and there is no second copy.
+void atmosCloudAt(AtmosphereParams P, float h, out(float3) sca, out(float3) ext)
+{
+    float dC = atmosCloudProfile(P, h);
+    sca = f3(P.cloud.x * dC);
+    ext = f3(P.cloud.y * dC);
+}
+
+// ─── THE MEDIUM AT AN ALTITUDE ───────────────────────────────────────────────────────────────────
+// Two exponentials, a tent and a lid. The tent is the entire reason twilight goes violet/indigo
+// instead of muddy brown: ozone absorbs where Rayleigh does not, at 25 km, along a path a low sun
+// spends most of its length in — and Hosek-Wilkie has no ozone term at all, which is why it could
+// only ever go brown down there. The lid is S4a's addition and it is why weather finally does
+// something: at `cover 0` every cloud term below is EXACTLY zero and the clear sky is bit for bit
+// what it was before the deck existed.
+//
+// ⚠ SCATTERING COMES BACK PER SPECIES, AND THAT DELETED A SECOND COPY OF THE PROFILES. This used to
+// return the SUM, so atmos_skyview — the one march whose species need different phase functions —
+// re-derived Rayleigh's and Mie's densities inline from the same scale heights. That was a second
+// copy of the profiles inside the chain whose premise is that there is exactly one. The cloud
+// species would have made it a third. Now each march sums what it needs and the phase split is free.
+void atmosMediumAt(AtmosphereParams P, float h,
+                   out(float3) scaR, out(float3) scaM, out(float3) scaC,
+                   out(float3) extAir, out(float3) extCloud)
+{
+    float dR = exp(-max(h, 0.0f) / max(P.rayleigh.w, 1.0f));
+    float dM = exp(-max(h, 0.0f) / max(P.mieSca.w,  1.0f));
+    // The stratospheric tent: 1 at the centre, 0 at centre +- width. Linear, exactly as Bruneton's
+    // ozone profile is — it is a two-segment linear density and not a Gaussian.
+    float dO = max(0.0f, 1.0f - abs(h - P.profGeom.x) / max(P.profGeom.y, 1.0f));
+
+    scaR = P.rayleigh.xyz * dR;
+    scaM = P.mieSca.xyz   * dM;
+    // ⚠ THE AIR'S EXTINCTION IS RETURNED SEPARATELY FROM THE DECK'S, AND THE ORDER OF THE THREE
+    // TERMS IS UNCHANGED. Adding the cloud into this sum instead would have re-associated it, and a
+    // clear-sky A/B that differs in the last ulp is an A/B nobody can read.
+    extAir = scaR + P.mieExt.xyz * dM + P.ozone.xyz * dO;
+    atmosCloudAt(P, h, scaC, extCloud);
+}
+
+// ─── PHASE FUNCTIONS ─────────────────────────────────────────────────────────────────────────────
+float atmosPhaseRayleigh(float cosT)
+{
+    return (3.0f / (16.0f * ATMOS_PI)) * (1.0f + cosT * cosT);
+}
+// Henyey-Greenstein. Written with the 3/2 power as x*sqrt(x) for the same reason hosek.h.fsl does:
+// the denominator is strictly positive for |g| < 1, so the max() is an underflow floor rather than
+// a domain guard.
+float atmosPhaseMie(float cosT, float g)
+{
+    float g2  = g * g;
+    float den = 1.0f + g2 - 2.0f * g * cosT;
+    den = max(den, 1.0e-6f);
+    return ((1.0f - g2) / (4.0f * ATMOS_PI)) / (den * sqrt(den));
+}
+
+// ─── GEOMETRY ────────────────────────────────────────────────────────────────────────────────────
+// Nearest POSITIVE intersection of a ray with a sphere centred on the origin. -1 = no hit ahead.
+// `ro` is relative to the planet centre, so |ro| is the radius — that is the whole coordinate system
+// the LUTs live in, and it is why nothing here needs a world position.
+float atmosRaySphere(float3 ro, float3 rd, float rad)
+{
+    float b = dot(ro, rd);
+    float c = dot(ro, ro) - rad * rad;
+    float disc = b * b - c;
+    if (disc < 0.0f) { return -1.0f; }
+    float s  = sqrt(disc);
+    float t0 = -b - s;
+    float t1 = -b + s;
+    if (t1 < 0.0f) { return -1.0f; }
+    return (t0 < 0.0f) ? t1 : t0;
+}
+
+// The zenith cosine at which the horizon sits, seen from radius r. Below this a ray hits the ground.
+float atmosHorizonCos(float r, float Rg)
+{
+    float s = Rg / max(r, 1.0f);
+    return -sqrt(max(0.0f, 1.0f - s * s));
+}
+
+// ─── THE SEGMENTED MARCH (S4a) ───────────────────────────────────────────────────────────────────
+//
+// ⚠⚠ ALL THREE MARCHES IN THIS CHAIN WERE TUNED FOR SMOOTH EXPONENTIALS, AND A 1.2 km LID IS NOT
+// ONE. Measured against the profiles they run on:
+//
+//   transmittance  128 UNIFORM steps   ~4 km per step on a long ray   marginal, bad when grazing
+//   multiscatter    20 UNIFORM steps   ~25 km per step                THE DECK IS INVISIBLE
+//   sky-view        32 QUADRATIC steps ~0.9 km near the deck          marginal, worse grazing
+//
+// ⚠⚠ AND THE MULTISCATTER ONE FAILS IN THE WORST POSSIBLE DIRECTION. A lid is bright BECAUSE OF
+// multiple scattering; an MS LUT that cannot see the slab returns a DARK lid — which is exactly what
+// everyone expects an overcast sky to be, so the failure would have passed an eyeball test while
+// being the opposite of the physics. Only the absolute nit row catches that, which is how the 47x
+// sky and the 8.8x horizon both got through.
+//
+// So the fix is a QUADRATURE change and not a second model: split the ray at the deck's two
+// boundaries and give the middle segment its own step budget. The medium is still evaluated per step
+// by atmosMediumAt() inside the loop — the field discipline is untouched.
+//
+// ⚠ AND AT `cover 0` THE SCHEDULE REDUCES TO ITS PRE-S4a EXPRESSION, NODE FOR NODE. atmosDeckSpan()
+// declines, the plan returns the base step count, and atmosMarchStep()'s no-deck arm computes
+// exactly what each march wrote inline before. That is what makes "the clear sky is untouched" a
+// checkable claim rather than an assertion.
+#define ATMOS_MARCH_UNIFORM 0
+#define ATMOS_MARCH_QUAD    1
+
+// The deck's chord along a ray, in ray parameter t. false = this ray never reaches the lid, which is
+// EVERY ray whenever the deck is disarmed (beta_ext == 0) or the weather is clear.
+bool atmosDeckSpan(AtmosphereParams P, float3 ro, float3 rd, float tMax,
+                   out(float) tIn, out(float) tOut)
+{
+    tIn  = 0.0f;
+    tOut = -1.0f;
+    float hw = P.profGeom.w;
+    if (P.cloud.y <= 0.0f || hw <= 0.0f || tMax <= 0.0f) { return false; }
+
+    float rHi = P.planet.x + P.profGeom.z + hw;
+    float rLo = P.planet.x + P.profGeom.z - hw;
+    float b  = dot(ro, rd);
+    float cH = dot(ro, ro) - rHi * rHi;
+    float dH = b * b - cH;
+    // A ray that misses the outer shell is OUTSIDE it: if it were inside, cH would be negative and
+    // the discriminant could not be. So this is the complete "no deck ahead" test.
+    if (dH <= 0.0f) { return false; }
+    float sH = sqrt(dH);
+    float t0 = max(0.0f, -b - sH);
+    float t1 = min(tMax, -b + sH);
+
+    // ⚠ A RAY THAT STARTS BELOW THE DECK MUST CLEAR THE INNER SHELL FIRST, and a ray leaves a sphere
+    // exactly once — so this one line is the EXACT entry for every camera the game has. From inside
+    // the deck or above it the hull is kept instead: it hands the deck budget a little of the clear
+    // gap under the lid, which costs steps and cannot cost accuracy. Splitting that case into two
+    // intervals would double the schedule's segment count to buy a few samples back.
+    float cL = dot(ro, ro) - rLo * rLo;
+    if (cL < 0.0f)
+    {
+        float sL = sqrt(max(0.0f, b * b - cL));
+        t0 = max(t0, -b + sL);
+    }
+    if (t1 <= t0) { return false; }
+    tIn  = t0;
+    tOut = t1;
+    return true;
+}
+
+// Plans a march. Returns the TOTAL step count; `planT` = (tIn, tOut, uIn, uOut) and `planN` =
+// (nBefore, nDeck, nAfter). `baseSteps == 0` plans the deck ALONE, which is what the transmittance
+// LUT's species-split integral asks for.
+int atmosMarchPlan(AtmosphereParams P, float3 ro, float3 rd, float tMax,
+                   int baseSteps, int deckSteps, int mode,
+                   out(float4) planT, out(float3) planN)
+{
+    planT = f4(0.0f);
+    planN = float3(float(baseSteps), 0.0f, 0.0f);
+
+    float tIn, tOut;
+    if (deckSteps <= 0 || !atmosDeckSpan(P, ro, rd, tMax, tIn, tOut))
+    {
+        return baseSteps;                 // the pre-S4a schedule, node for node
+    }
+
+    // The deck's boundaries expressed in the march's OWN parameter, so the two segments outside it
+    // keep the spacing they were tuned for — quadratic front-loading for the sky-view's grazing
+    // rays, uniform where the integrand is not monotone.
+    float uIn  = saturate(tIn  / tMax);
+    float uOut = saturate(tOut / tMax);
+    if (mode == ATMOS_MARCH_QUAD)
+    {
+        uIn  = sqrt(uIn);
+        uOut = sqrt(uOut);
+    }
+
+    int n0 = 0;
+    int n2 = 0;
+    if (baseSteps > 0)
+    {
+        // The base budget goes to the two outside segments in proportion to how much of the native
+        // parameter each holds. An empty segment gets nothing; a non-empty one gets at least one
+        // step, because a segment with zero steps is a length of atmosphere that is simply not
+        // integrated.
+        float outside = max(uIn + (1.0f - uOut), 1.0e-6f);
+        n0 = (uIn  > 1.0e-5f)        ? max(1, int(float(baseSteps) * uIn / outside + 0.5f)) : 0;
+        n2 = (uOut < 1.0f - 1.0e-5f) ? max(1, baseSteps - n0)                               : 0;
+    }
+
+    planT = float4(tIn, tOut, uIn, uOut);
+    planN = float3(float(n0), float(deckSteps), float(n2));
+    return n0 + deckSteps + n2;
+}
+
+// The s-th step's span under a plan. Every march then owns its own quadrature rule over [t0, t1] —
+// midpoint, trapezoid, whatever it had — because the schedule is the only thing S4a needed to change.
+void atmosMarchStep(float4 planT, float3 planN, int s, float tMax, int mode,
+                    out(float) t0, out(float) t1)
+{
+    int n0 = int(planN.x);
+    int nD = int(planN.y);
+    float u0, u1;
+
+    if (nD <= 0)
+    {
+        // ⚠ THE NO-DECK ARM, AND IT IS WRITTEN THE WAY THE THREE MARCHES WROTE IT INLINE. `s/N` then
+        // squared then scaled, in that order, is what atmos_skyview computed before this helper
+        // existed — so the clear sky's sample positions are identical floats, not merely close ones.
+        u0 = float(s)     / float(max(n0, 1));
+        u1 = float(s + 1) / float(max(n0, 1));
+    }
+    else if (s < n0)
+    {
+        u0 = planT.z * (float(s)     / float(n0));
+        u1 = planT.z * (float(s + 1) / float(n0));
+    }
+    else if (s < n0 + nD)
+    {
+        // ⚠ INSIDE THE DECK THE SPACING IS LINEAR IN DISTANCE, not in the march's native parameter.
+        // A slab is not an exponential: the quadratic front-loading the open sky wants would spend
+        // half the deck budget in the first tenth of the lid and then step over its far side.
+        int k = s - n0;
+        t0 = planT.x + (planT.y - planT.x) * (float(k)     / float(nD));
+        t1 = planT.x + (planT.y - planT.x) * (float(k + 1) / float(nD));
+        return;
+    }
+    else
+    {
+        int n2 = max(int(planN.z), 1);
+        int k  = s - n0 - nD;
+        u0 = planT.w + (1.0f - planT.w) * (float(k)     / float(n2));
+        u1 = planT.w + (1.0f - planT.w) * (float(k + 1) / float(n2));
+    }
+
+    t0 = (mode == ATMOS_MARCH_QUAD) ? (u0 * u0 * tMax) : (u0 * tMax);
+    t1 = (mode == ATMOS_MARCH_QUAD) ? (u1 * u1 * tMax) : (u1 * tMax);
+}
+
+// ─── LUT (DE)PARAMETERISATION ────────────────────────────────────────────────────────────────────
+// Bruneton's half-texel-inset unit range. Without it the first and last texel of every LUT are
+// evaluated half a texel outside the domain they are meant to cover, which shows up as a bright
+// seam exactly at the horizon — the one place the whole image is most sensitive.
+float atmosUnitFromUv(float u, float n)  { return (u - 0.5f / n) / max(1.0f - 1.0f / n, 1.0e-6f); }
+float atmosUvFromUnit(float x, float n)  { return 0.5f / n + x * (1.0f - 1.0f / n); }
+
+// --- transmittance: (r, mu) <-> uv, Bruneton's mapping verbatim -------------------------------
+// The parameterisation is in the DISTANCE TO THE TOP OF THE ATMOSPHERE rather than in mu directly,
+// which is what puts texels where the function actually changes (near the horizon) instead of
+// spreading them evenly over an angle.
+float2 atmosTransmittanceUv(AtmosphereParams P, float r, float mu)
+{
+    float Rg = P.planet.x;
+    float Rt = P.planet.y;
+    float H   = sqrt(max(0.0f, Rt * Rt - Rg * Rg));
+    float rho = sqrt(max(0.0f, r * r - Rg * Rg));
+    float d   = max(0.0f, -r * mu + sqrt(max(0.0f, r * r * (mu * mu - 1.0f) + Rt * Rt)));
+    float dMin = Rt - r;
+    float dMax = rho + H;
+    float xMu = (dMax - dMin > 1.0e-3f) ? saturate((d - dMin) / (dMax - dMin)) : 0.0f;
+    float xR  = saturate(rho / max(H, 1.0e-3f));
+    return float2(atmosUvFromUnit(xMu, P.lutDims.z), atmosUvFromUnit(xR, P.lutDims.w));
+}
+
+void atmosTransmittanceParams(AtmosphereParams P, float2 uv, out(float) r, out(float) mu)
+{
+    float Rg = P.planet.x;
+    float Rt = P.planet.y;
+    float xMu = atmosUnitFromUv(uv.x, P.lutDims.z);
+    float xR  = atmosUnitFromUv(uv.y, P.lutDims.w);
+    float H   = sqrt(max(0.0f, Rt * Rt - Rg * Rg));
+    float rho = H * saturate(xR);
+    r = sqrt(rho * rho + Rg * Rg);
+    float dMin = Rt - r;
+    float dMax = rho + H;
+    float d = dMin + saturate(xMu) * (dMax - dMin);
+    mu = (d < 1.0e-3f) ? 1.0f : clamp((H * H - rho * rho - d * d) / (2.0f * r * d), -1.0f, 1.0f);
+}
+
+// --- multiscatter: (r, muSun) <-> uv ----------------------------------------------------------
+// Hillaire's mapping: linear in the sun's zenith cosine and linear in altitude. The term it stores
+// is ISOTROPIC by construction (that is the approximation), so it has no view direction to carry and
+// two axes are all it needs.
+float2 atmosMultiScatterUv(AtmosphereParams P, float r, float muSun)
+{
+    float xS = saturate(muSun * 0.5f + 0.5f);
+    float xR = saturate((r - P.planet.x) / max(P.planet.y - P.planet.x, 1.0f));
+    return float2(atmosUvFromUnit(xS, P.lutDims2.x), atmosUvFromUnit(xR, P.lutDims2.y));
+}
+
+void atmosMultiScatterParams(AtmosphereParams P, float2 uv, out(float) r, out(float) muSun)
+{
+    float xS = atmosUnitFromUv(uv.x, P.lutDims2.x);
+    float xR = atmosUnitFromUv(uv.y, P.lutDims2.y);
+    muSun = clamp(saturate(xS) * 2.0f - 1.0f, -1.0f, 1.0f);
+    r     = P.planet.x + saturate(xR) * (P.planet.y - P.planet.x);
+}
+
+// --- sky-view: (viewZenithCos, lightViewCos) <-> uv, Hillaire's mapping -----------------------
+// ⚠ THE V AXIS IS SPLIT AT THE HORIZON AND SQUARED ON BOTH SIDES, and that is the single most
+// load-bearing line in the file. A linear-in-angle mapping spends the same number of texels on the
+// empty 40 degrees around the zenith as on the two degrees where the horizon's brightness triples;
+// the split puts resolution where the derivative is, which is what makes a 192x108 LUT enough for a
+// full-screen sky. The u axis is squared for the same reason, toward the sun.
+//
+// ⚠ AND THE LOWER HALF IS REAL, NOT A CLAMP. Hosek INVERTED below the horizon (its c1 goes negative,
+// so the exponent runs to +inf) and had to be frozen at the horizon ring; a medium simply keeps
+// integrating, hits the ground, and returns what the ground actually looks like from here. That is
+// the "look down from a height" control in skydome.h.fsl, and this is where it stops being a seam.
+void atmosSkyViewParams(AtmosphereParams P, float2 uv, float r,
+                        out(float) viewZenithCos, out(float) lightViewCos)
+{
+    float u = atmosUnitFromUv(uv.x, P.lutDims.x);
+    float v = atmosUnitFromUv(uv.y, P.lutDims.y);
+    u = saturate(u);
+    v = saturate(v);
+
+    float Rg = P.planet.x;
+    float cosBeta = sqrt(max(0.0f, r * r - Rg * Rg)) / max(r, 1.0f);
+    float beta    = acos(clamp(cosBeta, -1.0f, 1.0f));
+    float zenithHorizonAngle = ATMOS_PI - beta;
+
+    if (v < 0.5f)
+    {
+        float c = 1.0f - 2.0f * v;
+        c = 1.0f - c * c;
+        viewZenithCos = cos(zenithHorizonAngle * c);
+    }
+    else
+    {
+        float c = v * 2.0f - 1.0f;
+        c = c * c;
+        viewZenithCos = cos(zenithHorizonAngle + beta * c);
+    }
+    float c2 = u * u;
+    lightViewCos = -(c2 * 2.0f - 1.0f);
+}
+
+float2 atmosSkyViewUv(AtmosphereParams P, float r, float viewZenithCos, float lightViewCos)
+{
+    float Rg = P.planet.x;
+    float cosBeta = sqrt(max(0.0f, r * r - Rg * Rg)) / max(r, 1.0f);
+    float beta    = acos(clamp(cosBeta, -1.0f, 1.0f));
+    float zenithHorizonAngle = ATMOS_PI - beta;
+    float viewZenithAngle = acos(clamp(viewZenithCos, -1.0f, 1.0f));
+
+    float v;
+    if (viewZenithAngle < zenithHorizonAngle)
+    {
+        float c = (zenithHorizonAngle > 1.0e-4f) ? (viewZenithAngle / zenithHorizonAngle) : 0.0f;
+        c = sqrt(max(0.0f, 1.0f - c));
+        v = (1.0f - c) * 0.5f;
+    }
+    else
+    {
+        float c = (beta > 1.0e-4f) ? ((viewZenithAngle - zenithHorizonAngle) / beta) : 0.0f;
+        v = sqrt(saturate(c)) * 0.5f + 0.5f;
+    }
+    float u = sqrt(saturate(-lightViewCos * 0.5f + 0.5f));
+    return float2(atmosUvFromUnit(saturate(u), P.lutDims.x),
+                  atmosUvFromUnit(saturate(v), P.lutDims.y));
+}
+
+// The world direction -> sky-view uv bridge. The medium is horizontally homogeneous, so its radiance
+// depends on the view direction only through the zenith angle and the AZIMUTH RELATIVE TO THE SUN —
+// which is why two axes suffice and why the LUT is this small.
+float2 atmosSkyViewUvFromDir(AtmosphereParams P, float r, float3 dir)
+{
+    float3 toSun = P.sunDir.xyz;
+    // The sun's azimuth, projected out of the zenith. A sun exactly overhead has no azimuth; the
+    // fallback keeps the u axis defined rather than producing NaNs at local noon.
+    float3 sunH = toSun - float3(0.0f, 0.0f, 1.0f) * toSun.z;
+    float  sunHLen = length(sunH);
+    float3 dirH = dir - float3(0.0f, 0.0f, 1.0f) * dir.z;
+    float  dirHLen = length(dirH);
+    float lightViewCos = 1.0f;
+    if (sunHLen > 1.0e-4f && dirHLen > 1.0e-4f)
+    {
+        lightViewCos = clamp(dot(sunH / sunHLen, dirH / dirHLen), -1.0f, 1.0f);
+    }
+    return atmosSkyViewUv(P, r, clamp(dir.z, -1.0f, 1.0f), lightViewCos);
+}
+
+#endif // ATMOSPHERE_H_FSL

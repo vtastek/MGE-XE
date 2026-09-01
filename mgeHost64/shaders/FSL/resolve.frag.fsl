@@ -217,10 +217,22 @@ float4 PS_MAIN(PsIn In)
         float2(-0.125f, -0.375f), float2( 0.375f, -0.125f),
         float2(-0.375f,  0.125f), float2( 0.125f,  0.375f)
     };
-#else
+#elif SAMPLE_COUNT == 2
     float2 subOffsets[2] = {
         float2( 0.25f,  0.25f), float2(-0.25f, -0.25f)
     };
+#else
+    // M0: one sample, AT THE PIXEL CENTRE. The whole reconstruction above is built on the sub-sample
+    // term (see note 1 at the top of this file); with a single sample there is no sub-pixel structure
+    // to reconstruct and the honest offset is exactly zero. The consequence, spelled out because it
+    // reads like a bug otherwise: |sampleOffset| is then an integer, so with the shipped diameter 2
+    // (filtRad 1) only the centre tap and the four axis neighbours are inside the kernel, and the
+    // neighbours land at rescaled x = 2 where rFilterCubic is identically 0. The pass is a
+    // pass-through, which is the correct answer to "resolve one sample" and leaves the rest of
+    // PS_MAIN — exposure, bloom, the curve, the encode, the dither — doing all of the work.
+    // Widening the diameter still does something here (it becomes a plain cubic downsample-in-place),
+    // so the knob is not dead, just no longer an AA control.
+    float2 subOffsets[1] = { float2(0.0f, 0.0f) };
 #endif
 
     float2 pixelPos = In.position.xy;
@@ -249,7 +261,11 @@ float4 PS_MAIN(PsIn In)
                 float2 sampleDist = abs(sampleOffset + subOffsets[s]) / filtRad;
                 if (all(sampleDist <= float2(1.0f, 1.0f)))
                 {
+#if SAMPLE_COUNT > 1
                     float4 smp = max(LoadTex2DMS(gResolveSource, NO_SAMPLER, loadPos, s), float4(0.0f, 0.0f, 0.0f, 0.0f));
+#else
+                    float4 smp = max(LoadTex2D(gResolveSource, NO_SAMPLER, loadPos, 0), float4(0.0f, 0.0f, 0.0f, 0.0f));
+#endif
 
                     // rescaleCubic: [-2,2] -> [-1,1]. Separable, so one 1-D evaluation per axis.
                     float w = rFilterCubic(sampleDist.x * 2.0f, 0.0f, cubicC) *
@@ -333,7 +349,7 @@ float4 PS_MAIN(PsIn In)
     float aOut = saturate(aRaw);
 
     // THE TONEMAP, last operation in the frame (step 6a). When opts.y is set the colour frags left
-    // the curve to us and pMSAAColor holds scene-referred radiance; when it is clear they already
+    // the curve to us and pSceneColor holds scene-referred radiance; when it is clear they already
     // applied it and this must be a no-op, byte for byte.
     //
     // ⚠ UN-PREMULTIPLIED, and this is the THIRD time this pass has had to learn it (resolve.srt.h
@@ -388,6 +404,17 @@ float4 PS_MAIN(PsIn In)
         float bloomK = gResolveParams.bloom.x;
         if (bloomK > 0.0f)
         {
+            // ⚠ NO RESCALE — THE TAP IS 1:1, AND SINCE M1 4c IT IS 1:1 BY CONSTRUCTION. gResolveSource
+            // is whatever the frame delivers, and the bloom pyramid is now built at the extent of that
+            // SAME image (forgerender.cpp's `delivered*` hoist), so `pixelPos` indexes mip 0 directly
+            // on an upscaled frame exactly as it always did on a 1x one.
+            //
+            // 4b carried a `* gResolveParams.bloom.w` here — an OUTPUT -> INPUT map — because the
+            // pyramid was still built from the RASTER rect. That was registration-correct and still
+            // wrong, for a reason no coordinate could reach: the pyramid's LEVEL COUNT came from the
+            // raster rect too, so the input-scale slider was changing the bloom's angular REACH
+            // (measured, L7 -> L6 at scale 0.5). Moving the pyramid fixes both and deletes this
+            // multiply. bloom.w is reserved again, written 1.0f — see resolve.srt.h.
             float4 bloomPre    = rBloomTap(pixelPos, gResolveParams.bloom.yz);
             float3 bloomStraight = bloomPre.rgb / max(bloomPre.a, 1.0e-3f);
             straight = lerp(straight, bloomStraight, bloomK);

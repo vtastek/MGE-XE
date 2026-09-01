@@ -239,6 +239,7 @@
     <ClInclude Include="src\exports.def" />
     <ClInclude Include="src\ipc\bridge.h" />
     <ClInclude Include="src\ipc\client.h" />
+    <ClInclude Include="src\ipc\weatherwire.h" />
     <ClInclude Include="src\ipc\dlshare.h" />
     <ClInclude Include="src\ipc\vecwrap.h" />
     <ClInclude Include="src\ipc\vecbase.h" />

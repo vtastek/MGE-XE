@@ -1,7 +1,7 @@
 // mgeHost64 — WHAT UNITS DOES THE SCENE TARGET WANT, AND HOW DOES A PASS GET INTO THEM.
 // tasks/forge-postprocess.md step 6a.
 //
-// Until step 6a every colour frag ended `c = tonemap(c)`, so pMSAAColor held DISPLAY-REFERRED values
+// Until step 6a every colour frag ended `c = tonemap(c)`, so pSceneColor held DISPLAY-REFERRED values
 // whatever its format — which is why the fp16 probe looked identical and why bloom had nothing to
 // bloom from. The curve now runs ONCE, at the very end, inside resolve.frag, and the scene target
 // carries radiance.

@@ -20,9 +20,16 @@ PsIn VS_MAIN( SV_VertexID(uint) VertexID )
     INIT_MAIN;
     PsIn Out;
     // (0,0) (2,0) (0,2) in UV -> the standard oversized triangle covering the whole VIEWPORT.
-    // Viewport, not target: pRT is alloc-sized and the resolve is issued under a width x height
-    // viewport at (0,0), so SV_Position.xy comes back as render-space pixel coordinates that index
-    // pMSAAColor 1:1.
+    // Viewport, not target: pRT is alloc-sized and the resolve is issued under an OUTPUT-rect
+    // viewport at (0,0), so SV_Position.xy comes back as output-space pixel coordinates.
+    //
+    // ⚠ THOSE INDEX gResolveSource 1:1, AND THAT SURVIVED THE UPSCALER (M1 4b) rather than being
+    // broken by it. The frag reads whatever the frame should READ — pSceneColor when nothing
+    // upscaled, the upscaler's OUTPUT-res target when something did — and an output pixel indexes
+    // either at 1:1, because both are written at the extent this viewport covers. The clamp bound
+    // (gResolveParams.dims.xy) follows the same rule. It is worth saying explicitly because the
+    // sentence that stood here named pSceneColor as if it were the only possible source, and 4b is
+    // exactly the change that made a differently-sized second source possible.
     float2 uv = float2(float((VertexID << 1) & 2), float(VertexID & 2));
     Out.position = float4(uv.x * 2.0f - 1.0f, 1.0f - uv.y * 2.0f, 0.0f, 1.0f);
     RETURN(Out);

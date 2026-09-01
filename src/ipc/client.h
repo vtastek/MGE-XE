@@ -82,6 +82,10 @@ namespace IPC {
 		// G7: the player's grass-crush disc — see setPlayerCrush / bridge.h playerCrush. w = 0 by
 		// default, which the host reads as "no player disc this frame".
 		float m_playerCrush[4] = {};
+		// S1 ATMOSPHERE: MW's live weather as parameters — see setWeather / bridge.h WeatherWire.
+		// Zero-initialised, and `valid` 0 is exactly the "interior / no weather" answer, so a client
+		// that never calls the setter ships a row the host correctly ignores.
+		WeatherWire m_weather = {};
 
 		// Dev FSL hot-reload watcher: a child launched alongside the host and killed with it, opt-in
 		// per install via an untracked mgeXE_fslwatch.txt next to Morrowind.exe (see startWatcher —
@@ -446,6 +450,14 @@ namespace IPC {
 			m_playerCrush[0] = x; m_playerCrush[1] = y;
 			m_playerCrush[2] = z; m_playerCrush[3] = present ? 1.0f : 0.0f;
 		}
+
+		// S1 ATMOSPHERE: this frame's weather row, stamped into every subsequent render RPC. A
+		// setter for the same reason the two above are setters — renderSceneKickoff's signature is
+		// already 30 arguments wide — and the whole row travels as ONE struct so a lane can never be
+		// half-updated. Call clearWeather() (or ship valid = 0) in interiors and menus; the default
+		// is already that.
+		void setWeather(const WeatherWire& w) { m_weather = w; }
+		void clearWeather() { m_weather = WeatherWire{}; }
 
 		WakeReason waitForCompletion(DWORD ms = MaxWait);
 

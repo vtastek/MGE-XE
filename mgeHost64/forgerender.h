@@ -11,6 +11,9 @@
 // Forward-declared, not included: ipc/hostframetimings.h pulls <cstdint>, and this header is
 // deliberately dependency-free (see above). forgerender.cpp includes the real definition.
 namespace IPC { struct HostFrameTimings; }
+// Same rule for the S1 weather row: ipc/weatherwire.h is itself dependency-free (<cstdint> only),
+// but forgerender.cpp is the TU that includes it, not this header.
+namespace IPC { struct WeatherWire; }
 
 namespace ForgeRender {
     // D1 probe: bring the full Forge stack up (mem/filesystem/log → GPU config →
@@ -101,6 +104,12 @@ namespace ForgeRender {
     // the wire because in FIRST PERSON there is no skinned draw to harvest, which is precisely the
     // view where a missing footprint is most obvious. Call before renderScene.
     void setPlayerCrush(const float c[4]);
+
+    // S1 ATMOSPHERE: MW's live weather for this frame (ipc/weatherwire.h). The host turns
+    // cur/next/transition into a MEDIUM through its per-weather physics table (mgeHost64/
+    // atmosphere.h) — the only place in the renderer where a weather index becomes physics. An
+    // invalid row (interior, menu, no world) parks the medium at Clear. Call before renderScene.
+    void setWeather(const IPC::WeatherWire& w);
 
     // True if the M1c opaque scene path (depth RT + opaque pipeline + descriptor sets)
     // built successfully in init(). False ⇒ renderScene returns false and the seam
@@ -236,7 +245,51 @@ namespace ForgeRender {
 
     // Standalone scene-path exercise (init → uploadGeometry → renderScene with a dummy
     // mesh) so host-side printf/asserts are visible in a terminal. Run via --forge-scene.
-    bool sceneProbe();
+    //
+    // `samples` is the MSAA count to bring the probe up at, and it is a real second arm rather
+    // than a convenience (M0, tasks/forge-upscale.md): since 1x acquired its own scene-referred
+    // staging target and its own resolve variant, "1x" and "4x" are two different pipelines
+    // through the same shaders. The probe draws a FLAT FULLSCREEN triangle, which has no edge for
+    // antialiasing to act on, so the two arms must deliver IDENTICAL centre pixels — that equality
+    // is the M0 gate, and it is checkable without launching Morrowind. `--forge-scene 1x`.
+    bool sceneProbe(unsigned samples = 4);
+
+    // M1: arm the motion-vector pass for the probe, and report what the field came out as.
+    // sceneProbe() lives in the first ForgeRender block, above the anonymous namespace that owns
+    // g_mvEnable, so these are declared here and defined beside the globals — expDisableForProbe()'s
+    // exact arrangement, and for the same reason.
+    //
+    // ⚠ THE PROBE IS THE RIGHT HOME FOR THIS PASS'S CORE INVARIANT. Its camera is identity and does
+    // not move between renderScene calls, so "a still camera produces ZERO motion" is checkable
+    // there, headlessly, every run — and that is the plan's acceptance test for the pass, the one
+    // that is otherwise by eye and the one the bakeEye origin error is specifically able to survive.
+    void mvEnableForProbe();
+    void mvReportForProbe();
+
+    // M1 4b: the UPSCALE SEAM's probe stage (tasks/forge-upscale.md). Same arrangement and the same
+    // reason as the two above — sceneProbe() lives above the anonymous namespace that owns g_live
+    // and the g_upscale* knobs.
+    //
+    // ⚠ IT EXISTS BECAUSE EVERY OTHER PROBE FRAME RUNS AT in == out AND THEREFORE PROVES NOTHING
+    // ABOUT THIS SEAM. init() seeds all three rects equal and the probe never calls setRenderSize,
+    // so the upscaler takes its identity fast path — returns the source, records nothing — on every
+    // frame. Narrow() calls setRenderSize the way the CLIENT does, so the input-rect derivation is
+    // the thing under test rather than something poked around; Report() then says whether the pass
+    // actually recorded.
+    //
+    // ⚠⚠ WHAT THIS CANNOT TEST is the filter's REGISTRATION. The probe's triangle is flat and
+    // fullscreen, and a constant field is invariant under any partition-of-unity kernel — which
+    // Mitchell(B=0) is for every C — so a half-pixel error would still return the same centre pixel.
+    // That is what the in-game APL check is for; do not read a green probe as covering it.
+    //
+    // ⚠⚠⚠ Narrow() DRIVES setRenderSize EVEN WITH NO BACKEND ARMED, and that case is an ASSERTION,
+    // not a skip: the input rect must come back EXACTLY equal to the output rect. Its first version
+    // returned early there, which left the scale knob-without-a-consumer — the one state that
+    // actually shipped broken, and reached the game as "scale shrinks the view" — as the one state
+    // nothing headless exercised. Reproduce with MGE_HOST_KNOBS=upscaleInputScale=0.5 and NO
+    // upscaleEnable: the stage must print `UPSCALE invariant OK`.
+    bool upscaleProbeNarrow();
+    void upscaleProbeReport();
 
     // Arm PIX programmatic GPU capture — MUST be called before sceneProbe()/init() so
     // WinPixGpuCapturer.dll hooks d3d12 device creation. sceneProbe wraps one renderScene.

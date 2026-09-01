@@ -1,0 +1,113 @@
+// mgeHost64 — LUT 1 of 3: TRANSMITTANCE (tasks/forge-atmosphere.md S2a).
+//
+// For every (altitude, view zenith cosine) pair, how much of a beam survives the trip from that
+// point to the top of the atmosphere along that direction. Everything else in the chain is built on
+// this: the sun's colour at the ground is one lookup, the sun's colour at cloud altitude will be
+// another, and the sky-view march reads it once per step.
+//
+// ⚠ THE MEDIUM IS NOT DEFINED HERE. Every coefficient, profile and mapping comes from
+// atmosphere.h.fsl — see the warning at the top of that file. This is the integral and nothing else.
+//
+// 256x64, one thread per texel, 40 analytic steps. The step count is high for a LUT this small
+// because transmittance is the one term with no smoothing anywhere downstream: an error here is a
+// multiplicative error on the sun, which is ~80% of a clear day's light.
+
+#include "atmosphere.srt.h"
+#include "atmosphere.h.fsl"   // THE MEDIUM — one copy, see the warning at its top
+
+#define ATMOS_TRANSMITTANCE_STEPS 128
+
+ROOT_SIGNATURE(ComputeRootSignature)
+NUM_THREADS(8, 8, 1)
+void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
+{
+    INIT_MAIN;
+
+    int2 px = int2(DispatchThreadID.xy);
+    int  w  = (int)gAtmosParams.lutDims.z;
+    int  h  = (int)gAtmosParams.lutDims.w;
+    // RETURN() on its own line: fsl.py's rewrite is line-based and a one-liner `{ RETURN(); }`
+    // transpiles to `return ()`.
+    if (px.x >= w || px.y >= h)
+    {
+        RETURN();
+    }
+
+    float2 uv = (float2(px) + f2(0.5f)) / float2(float(w), float(h));
+    float r, mu;
+    atmosTransmittanceParams(gAtmosParams, uv, r, mu);
+
+    // How far the ray runs before it leaves the atmosphere. The parameterisation guarantees this
+    // ray does NOT hit the ground (that is what the (r, mu) mapping is built around), so the top of
+    // the atmosphere is the only exit.
+    float Rt = gAtmosParams.planet.y;
+    float d  = max(0.0f, -r * mu + sqrt(max(0.0f, r * r * (mu * mu - 1.0f) + Rt * Rt)));
+
+    // Trapezoid, uniform in path length, with the endpoints half-weighted.
+    //
+    // ⚠ UNIFORM HERE, QUADRATIC IN atmos_skyview.comp, AND THE DIFFERENCE IS NOT AN INCONSISTENCY.
+    // The sky-view march front-loads its samples because the density along a grazing ray falls
+    // monotonically away from the camera, so the near field is where the whole integrand lives. That
+    // reasoning does NOT hold here: this LUT's parameterisation deliberately includes rays with mu
+    // slightly negative, which DESCEND toward their tangent point before climbing back out — their
+    // density peaks in the MIDDLE of the path, and front-loading would under-sample exactly that
+    // peak. Uniform is the right quadrature for an integrand that is not monotone, and the step
+    // count is raised instead to cover the grazing case.
+    //
+    // ⚠ AND THE COUNT IS HIGH ON PURPOSE. Transmittance is the one term with no smoothing anywhere
+    // downstream: an error here is a MULTIPLICATIVE error on the sun, which is ~80% of a clear day's
+    // light, and it also reaches the sky through every march step's sun-visibility lookup. 256x64
+    // texels once per frame is cheap enough that there is nothing to trade.
+    float3 depth = f3(0.0f);
+    float  dt    = d / float(ATMOS_TRANSMITTANCE_STEPS);
+    for (int i = 0; i <= ATMOS_TRANSMITTANCE_STEPS; ++i)
+    {
+        float t  = float(i) * dt;
+        // Law of cosines: the radius at distance t along a ray leaving radius r at cosine mu.
+        float ri = sqrt(max(0.0f, r * r + t * t + 2.0f * r * t * mu));
+        float3 scaR, scaM, scaC, extAir, extCloud;
+        atmosMediumAt(gAtmosParams, ri - gAtmosParams.planet.x, scaR, scaM, scaC, extAir, extCloud);
+        float wgt = (i == 0 || i == ATMOS_TRANSMITTANCE_STEPS) ? 0.5f : 1.0f;
+        depth += extAir * wgt;
+    }
+    depth *= dt;
+
+    // ─── THE DECK, AS ITS OWN INTEGRAL OVER ITS OWN CHORD (S4a) ───────────────────────────────
+    // ⚠⚠ SPLITTING BY SPECIES IS EXACT HERE AND NOWHERE ELSE IN THE CHAIN. Optical depth is a plain
+    // integral — no throughput, no ordering, nothing multiplied by what came before it — so
+    // ∫(air + cloud) ds is ∫air ds + ∫cloud ds, term for term. Two things follow, and both of them
+    // are the reason this march is shaped differently from the other two:
+    //
+    //   1. THE 128-STEP AIR MARCH ABOVE DID NOT HAVE TO CHANGE AT ALL, so the clear sky's
+    //      transmittance LUT is BIT FOR BIT what it was before the deck existed. That is the
+    //      foundation every other S4a gate row rests on, and a warped schedule could only have got
+    //      close to it.
+    //   2. A 1.2 km lid gets a march sized for a 1.2 km lid instead of the ~4 km steps a uniform
+    //      128-step walk to the top of the atmosphere can offer it.
+    //
+    // The radiance marches cannot do this: their integrand is multiplied by a throughput that
+    // depends on everything nearer the camera, so their species share one ordered walk and they go
+    // through atmosMarchPlan/Step instead.
+    {
+        float3 ro = float3(0.0f, 0.0f, r);
+        float3 rd = float3(sqrt(max(0.0f, 1.0f - mu * mu)), 0.0f, mu);
+        float4 planT; float3 planN;
+        int nDeck = atmosMarchPlan(gAtmosParams, ro, rd, d,
+                                   0, int(gAtmosParams.marchP.w), ATMOS_MARCH_UNIFORM,
+                                   planT, planN);
+        float cloudDepth = 0.0f;
+        for (int k = 0; k < nDeck; ++k)
+        {
+            float ta, tb;
+            atmosMarchStep(planT, planN, k, d, ATMOS_MARCH_UNIFORM, ta, tb);
+            float tm = 0.5f * (ta + tb);
+            float ri = sqrt(max(0.0f, r * r + tm * tm + 2.0f * r * tm * mu));
+            cloudDepth += atmosCloudProfile(gAtmosParams, ri - gAtmosParams.planet.x) * (tb - ta);
+        }
+        depth += f3(gAtmosParams.cloud.y * cloudDepth);
+    }
+
+    Write2D(gAtmosOutA, px, float4(exp(-depth), 1.0f));
+
+    RETURN();
+}

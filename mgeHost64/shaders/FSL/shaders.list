@@ -119,7 +119,7 @@
 #end
 
 // Alpha SHADOW-RECEIVE depth prepass — twin of alphadepth.frag at a separate, lower opacity
-// threshold (froxelZ.z), rendered into the dedicated pAlphaShadowDepth so a near-opaque sheet
+// threshold (alphaShadowParams.x), rendered into the dedicated pAlphaShadowDepth so a near-opaque sheet
 // (paper curtain) receives its own point-light shadow without weakening the 0.95 fold-fix.
 // THIS one is the CASTER half (skinned.vert -> shadow atlas, LIGHT space); the main-camera
 // receiver runs alphashadowrecv.frag below, which adds a screen-space world-occlusion clip that
@@ -177,11 +177,12 @@
 #include "sky.frag.fsl"
 #end
 
-// THE PHYSICAL SKY (tasks/forge-physical-sky.md P2): a fullscreen Hosek-Wilkie radiance field that
-// RETIRES the dome mesh and the painted horizon band. Same fullscreen triangle as volfog/waterfill
-// (shadowatlasview.vert), but blend OFF / depth OFF / alpha 1 — it is the backdrop, drawn FIRST in
-// the colour pass and again in the mirror, and it covers the whole sphere so there is no lower rim.
-// Reads gSkyView off the PerBatch set for THIS view's invViewProj + the frame's cooked coefficients.
+// THE PHYSICAL SKY (tasks/forge-atmosphere.md S2c): a fullscreen sample of the ATMOSPHERE's sky-view
+// LUT, retiring the dome mesh, the painted horizon band and — since S2 — the Hosek-Wilkie closed form
+// that stood in for a medium. Same fullscreen triangle as volfog/waterfill (shadowatlasview.vert),
+// but blend OFF / depth OFF / alpha 1 — it is the backdrop, drawn FIRST in the colour pass and again
+// in the mirror, and it covers the whole sphere so there is no lower rim. Reads gSkyView off the
+// PerBatch set for THIS view's invViewProj, and gAtmosSkyView/gAtmosParams off PerFrame.
 #frag skyhw.frag
 #include "skyhw.frag.fsl"
 #end
@@ -309,16 +310,27 @@
 // CUSTOM MSAA RESOLVE (tasks/forge-postprocess.md step 4): filtered Catmull-Rom reconstruction with
 // inverse-luminance firefly weighting, replacing cl->ResolveSubresource. It has to exist before HDR
 // can, because a hardware resolve cannot format-convert — fp16 MSAA -> BGRA8 shared RT is not a
-// legal ResolveSubresource, so step 3's "flip pMSAAColor and change nothing else" probe is not
+// legal ResolveSubresource, so step 3's "flip pSceneColor and change nothing else" probe is not
 // actually executable and this is its prerequisite. Built LDR-first so its cost is measurable in
 // isolation against the 0.14-0.18 ms fixed-function baseline (live A/B in the dev panel).
 //
 // PRIVATE vert/frag pairing (no shared-frag hazard) + its own ResolveSrtData PerDraw set, following
 // The-Forge's own Examples_3/Visibility_Buffer resolve. One frag variant per sample count, the
-// linearizedepth/apl idiom — Tex2DMS needs SAMPLE_COUNT as a literal. NO sc1 variant: at 1x the
-// scene renders straight into pRT and there is nothing to resolve.
+// linearizedepth/apl idiom — Tex2DMS needs SAMPLE_COUNT as a literal.
+//
+// ⚠ THERE IS AN sc1 VARIANT NOW (M0, tasks/forge-upscale.md), and the note that stood here — "no sc1
+// variant: at 1x the scene renders straight into pRT" — stopped being true when the 1x path got its
+// own scene-referred staging target. At 1x + fp16 this pass is the only thing that can deliver a
+// frame at all. It does no antialiasing there (one sample, offset (0,0), kernel collapses to
+// identity); it does the fp16 -> BGRA8 convert, exposure, bloom, AgX, the encode and the dither.
+// Same Tex2DMS/Tex2D split bloomprefilter_sc{1,4} already carries.
 #vert resolve.vert
 #include "resolve.vert.fsl"
+#end
+
+#frag resolve_sc1.frag
+#define SAMPLE_COUNT 1
+#include "resolve.frag.fsl"
 #end
 
 #frag resolve_sc2.frag
@@ -334,6 +346,42 @@
 #frag resolve_sc8.frag
 #define SAMPLE_COUNT 8
 #include "resolve.frag.fsl"
+#end
+
+// M1 CAMERA-ONLY MOTION VECTORS (tasks/forge-upscale.md): one compute dispatch at the colour->water
+// seam reconstructs where every pixel's surface was on the previous frame's screen, from the depth
+// buffer and two camera matrices. NO per-draw velocity output and no change to any colour frag —
+// that is the simplification the whole milestone rests on.
+//
+// ⚠ ONE VARIANT, NO SAMPLE_COUNT SPLIT, because it reads pLinearDepth rather than pDepth — and
+// pLinearDepth's name lies in our favour: linearizedepth's actual job is the MSAA resolve + SRV
+// exposure, and what it stores is the raw reverse-Z DEVICE depth, single-sample, at full R32F.
+#comp motionvectors.comp
+#include "motionvectors.comp.fsl"
+#end
+
+// ...and the vectors LOOKED AT (F12 mode 17). Ships in the same step as the pass for the reason
+// atmosview does: nothing consumes motion vectors yet, so this picture is the only evidence they
+// are right. Fullscreen (modes 11-16's corner overlay cannot show a vector field), reusing
+// shadowatlasview.vert + the opaque.srt.h PerFrame set where gMotionVectors is bound.
+#frag mvview.frag
+#include "mvview.frag.fsl"
+#end
+
+// M1 step 4b — THE UPSCALER SEAM'S FIRST BACKEND (tasks/forge-upscale.md): pSceneColor's INPUT
+// sub-rect resampled into a separate alloc-sized target's OUTPUT sub-rect, Catmull-Rom with an
+// anti-ringing clamp. The permanent fallback for the AMD / Intel / GTX-1080 tiers, which is why it
+// is a real reconstruction and not a blit.
+//
+// ⚠ ONE VARIANT, NO SAMPLE_COUNT SPLIT, AND IT MUST NEVER GROW ONE. An upscaler REPLACES MSAA —
+// they are mutually exclusive by construction, and resolve_sc4.frag binds a Tex2DMS where the
+// single-sample upscaled output would go, which is a TYPE mismatch and not a quality question. The
+// host refuses to create the backend at sampleCount > 1 and logs the refusal.
+//
+// COMPUTE, so it hot-reloads with F8 — the same call bloom and reflectmip made, and the FILTER is
+// exactly the thing that wants walking in a running game.
+#comp upscale.comp
+#include "upscale.comp.fsl"
 #end
 
 // Debug line (--forge-view only): solid-colour world-space line list for distance reference rings.
@@ -380,12 +428,40 @@
 #include "apl.comp.fsl"
 #end
 
-// The physical sky's C++/FSL CROSS-CHECK (tasks/forge-physical-sky.md P2, step 3). One dispatch per
-// host session, 64 threads: evaluates hosek.h.fsl at a fixed direction set so the host can compare
-// it against its own C++ evaluation of the same model. The sky and the light are two evaluations of
-// one field, and this is the instrument that says so out loud instead of a comment hoping so.
-#comp hosekcheck.comp
-#include "hosekcheck.comp.fsl"
+// ─── THE ATMOSPHERE (tasks/forge-atmosphere.md S2) ────────────────────────────────────────────────
+// Bruneton's participating medium in Hillaire's per-frame LUT packaging, replacing the Hosek-Wilkie
+// closed form (whose C++/FSL cross-check used to sit here — deleted with the model it guarded, S2f).
+// All four share compute.rootsig + one AtmosphereSrtData PerBatch set over four instances, and all
+// four are COMPUTE so they hot-reload on F8: tuning an atmosphere means watching a sunset, and a
+// graphics-pipeline shader would cost a host restart per try.
+//
+// ⚠ THE ORDER IS A DEPENDENCY CHAIN AND THE HOST DISPATCHES THEM IN IT: transmittance feeds
+// multiscatter, both feed sky-view, and all three feed the SH measurement.
+#comp atmos_transmittance.comp
+#include "atmos_transmittance.comp.fsl"
+#end
+
+#comp atmos_multiscatter.comp
+#include "atmos_multiscatter.comp.fsl"
+#end
+
+#comp atmos_skyview.comp
+#include "atmos_skyview.comp.fsl"
+#end
+
+// ...and THE MEASUREMENT, which is also THE GATE (S2b). Projects the LIVE sky-view LUT into SH-L1
+// over the full sphere and computes E_sky / E_sun / the zenith and horizon probes in the same pass,
+// so the LIGHT is a measurement of the DRAWN SKY rather than a parallel derivation of it. That is
+// what deletes the two-copies problem instead of instrumenting it.
+#comp atmos_sh.comp
+#include "atmos_sh.comp.fsl"
+#end
+
+// ...and the LUTs' DEBUG VIEW (F12 mode 15 sky-view / 16 transmittance). Reuses shadowatlasview.vert
+// (fullscreen tri). Ships WITH the chain rather than after it, for the reason the file states: in
+// S2a nothing samples the LUTs, so this picture is the only evidence they are right.
+#frag atmosview.frag
+#include "atmosview.frag.fsl"
 #end
 
 // Screen-space AO — FOUR interchangeable modes behind one SRT (AOSrtData) and one descriptor set.
@@ -521,7 +597,7 @@
 // Bloom pyramid (tasks/forge-postprocess.md step 4). Same three-stage shape as the two pyramids
 // above, and the prefilter is likewise the MSAA RESOLVE — which is why bloom needed no
 // resolve/composite split: a 2x downsample of an MSAA target already averages the sub-samples, so it
-// reads pMSAAColor directly. Two SAMPLE_COUNT variants for the same reason reflectmipfirst has them
+// reads pSceneColor directly. Two SAMPLE_COUNT variants for the same reason reflectmipfirst has them
 // (Tex2DMS needs the count as a literal); the down/up passes read the already-resolved pyramid and
 // stay single-variant. All three share the ONE BloomSrtData Persistent set, over 13 instances (1
 // prefilter + 6 down + 6 up), each carrying its own level's render rects in its own cbuffer.

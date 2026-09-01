@@ -1,0 +1,130 @@
+// mgeHost64 — THE MOTION VECTORS, LOOKED AT (F12 mode 17).  tasks/forge-upscale.md M1.
+//
+// ⚠ SHIPS IN THE SAME STEP AS THE VECTORS, not when something goes wrong, and that is the whole
+// argument for it. Nothing CONSUMES motion vectors yet — the upscaler does not exist — so this
+// picture is the only evidence the pass is correct. Without it, a field that is subtly wrong by one
+// frame of camera translation (the bakeEye hazard motionvectors.srt.h documents at length) and a
+// field that is perfect produce the IDENTICAL frame, and the mistake surfaces a milestone later as
+// "DLSS looks smeary", which is indistinguishable from every other reason DLSS looks smeary. Same
+// argument atmosview.frag.fsl and skyheightview.frag.fsl make, and it was right both times.
+//
+// ─── HOW TO READ IT, AND WHAT THE TEST IS ────────────────────────────────────────────────────────
+//
+//   GREY, flat and uniform  = exactly zero. This is what the WHOLE STATIC WORLD must be when the
+//                             camera is not moving. Not "nearly grey" — the encoding gives exact
+//                             zero its own colour precisely so that "small" and "none" cannot be
+//                             confused, which is the confusion the bakeEye bug hides in.
+//   HUE                     = direction of travel (where the pixel CAME FROM: the vector points
+//                             backward in time). Red/orange = it came from the right, cyan = from
+//                             the left, and so on round the wheel.
+//   BRIGHTNESS              = magnitude, LOG-scaled over the 0..scale range, so a third of a pixel
+//                             and thirty pixels are both visible in one image. A linear ramp would
+//                             show the sub-pixel motion that matters most as black.
+//
+// ⚠⚠ THE TEST THAT ACTUALLY CATCHES THE bakeEye BUG IS TO STRAFE AND ROTATE AT SPEED. Its error is
+// Δeye/distance: identically zero standing still, and largest close in and fast. A still camera and
+// a slow walk both look perfect with it present. What it looks like when it IS present: the field
+// keeps a uniform DC offset that does not go to grey when you stop translating, and near geometry
+// disagrees with far geometry about the direction of a pure rotation.
+//
+// A correct field, moving forward: a smooth radial pattern flowing OUT from the point you are moving
+// toward, brightest at the screen edges and at near geometry, dimmest at the centre and on the sky.
+// A correct field, pure yaw: a near-uniform horizontal flow, with the SKY MOVING JUST AS FAST as the
+// ground — rotation is distance-independent, and a sky that moves differently to the ground under
+// pure rotation means the far-plane reconstruction is wrong.
+//
+// Reuses shadowatlasview.vert (fullscreen triangle) + the opaque.srt.h PerFrame set, where
+// gMotionVectors is bound. FULL-screen rather than the corner overlay modes 11-16 use: a vector
+// field has to be read as a whole, and a quarter of one shows nothing.
+
+#include "opaque.srt.h"
+
+STRUCT(VSOutput)
+{
+    DATA(float4, Position, SV_Position);
+    DATA(float2, Uv,       TEXCOORD0);
+};
+
+// Hue -> RGB, the standard 6-segment form. Hue only: the encoding spends saturation and value on
+// magnitude, so a full-saturation wheel is what direction gets.
+float3 mvHue(float h)
+{
+    float3 k = frac(f3(h) + float3(1.0f, 2.0f / 3.0f, 1.0f / 3.0f));
+    return saturate(abs(k * 6.0f - f3(3.0f)) - f3(1.0f));
+}
+
+ROOT_SIGNATURE(DefaultRootSignature)
+float4 PS_MAIN( VSOutput In )
+{
+    INIT_MAIN;
+    float2 uv = saturate(In.Uv);
+
+    // ⚠ ALLOC-relative UV, RENDER-rect content. gMotionVectors is alloc-sized like every screen
+    // target and the dispatch filled only the width x height sub-rect, so a full-screen [0,1] sample
+    // would show the frame squeezed into a corner with never-written border round it. Scale the UV
+    // by the render fraction — the same alloc-vs-render trap [[project_forge_alloc_vs_render_uv]]
+    // names, here in its display form.
+    float2 frac_ = gShadowParams.screenParams.xy * gShadowParams.screenAlloc.zw;   // render / alloc
+    // ─── MODE 18: THE REACTIVE MASK ──────────────────────────────────────────────────────────────
+    // Same shader, because the two views answer one question between them — "where did this pixel
+    // come from" and "should you believe that" — and splitting them would be two places to get the
+    // alloc-vs-render sampling wrong.
+    //
+    // BLACK = trusted (the vector is used). WHITE = fully reactive (the vector is disbelieved and
+    // the current frame is weighted instead). ⚠ WHAT TO LOOK FOR IS COVERAGE, NOT PRETTINESS: moving
+    // NPCs, grass, the water surface and a rim along every silhouette the camera just uncovered
+    // should light up, everything else black. A mostly-white frame is the upscaler switched off, and
+    // it looks like "slightly soft" rather than like a fault — the heartbeat's `reactive=` is the
+    // honest reading.
+    if (gFrameData.debugParams.x > 17.5f)
+    {
+        float  r  = SampleLvlTex2D(gReactiveMask, gSamplerPointClamp, uv * frac_, 0).r;
+        float3 rv = f3(r);
+        // The same one-texel frame as below, so "not drawing" stays distinguishable from "drawing
+        // zero" — and on THIS view zero is black, which is exactly what an unbound texture reads.
+        float2 rd = min(uv, f2(1.0f) - uv);
+        if (min(rd.x, rd.y) < 0.002f) { rv = float3(0.9f, 0.5f, 0.1f); }
+        RETURN(float4(rv, 1.0f));
+    }
+
+    float2 mv = SampleLvlTex2D(gMotionVectors, gSamplerPointClamp, uv * frac_, 0).xy;
+
+    float  m = length(mv);
+    float3 v;
+    // EXACT zero gets its own flat grey. The `== 0` is deliberate and is not a tolerance: the claim
+    // under test is that a still camera produces EXACTLY zero, and a tolerance here would hide the
+    // very small non-zero DC offset that a residual origin error produces. If the world reads grey
+    // when you stop, the origin folding is right.
+    if (m == 0.0f)
+    {
+        // Mid grey, and 0.5 is the literal 8-bit code because this pass writes straight into pRT
+        // AFTER the resolve — no exposure, no curve, no encode is applied downstream. (The first
+        // build drew into the scene target instead and had everything here multiplied by the
+        // exposure servo's E and pushed through AgX; see the pipeline's construction.)
+        v = f3(0.5f);
+    }
+    else
+    {
+        // scale = the magnitude that saturates the display, in pixels. Fixed rather than
+        // auto-ranged: an auto-ranged view renormalises every frame, so the picture looks the same
+        // whether you are strolling or sprinting, and the one thing this view has to show is HOW
+        // MUCH things moved.
+        const float scale = 32.0f;
+        float t = log2(1.0f + m) / log2(1.0f + scale);     // sub-pixel motion stays visible
+        // atan2 -> [0,1). y is DOWN in this field's convention, so the wheel turns the way the
+        // screen does.
+        float h = atan2(mv.y, mv.x) * (0.5f / 3.14159265f) + 0.5f;
+        // Floor keeps a tiny vector's HUE readable instead of fading it to black — and it is
+        // deliberately well clear of the zero-grey above, so "barely moving" and "not moving" are
+        // two different pictures rather than two shades of the same one.
+        v = mvHue(h) * saturate(t) * 0.9f + f3(0.10f);
+    }
+
+    // A one-texel frame, so "the overlay is not drawing" is distinguishable from "the overlay is
+    // drawing zero" — which here are the two answers the view exists to tell apart. Same guard, same
+    // colour, as atmosview.frag.fsl.
+    float2 d = min(uv, f2(1.0f) - uv);
+    if (min(d.x, d.y) < 0.002f) { v = float3(0.9f, 0.5f, 0.1f); }
+
+    RETURN(float4(v, 1.0f));
+}

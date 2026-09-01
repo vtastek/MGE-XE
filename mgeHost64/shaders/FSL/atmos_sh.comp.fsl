@@ -1,0 +1,210 @@
+// mgeHost64 — THE MEASUREMENT, AND THE GATE (tasks/forge-atmosphere.md S2b).
+//
+// ⚠⚠ THIS PASS IS WHY S2 HAS NO SECOND COPY OF THE SKY.
+// The physical sky it replaces evaluated ONE model TWICE — C++ for the light, FSL for the pixels —
+// and shipped a startup cross-check whose entire job was to notice when the two drifted. This pass
+// deletes the drift instead of instrumenting it: it projects the LIVE sky-view LUT, the one the
+// pixels are literally drawn from, into SH and into three scalar probes, and the host reads the
+// result back. The light is therefore a MEASUREMENT OF THE DRAWN SKY, not a parallel derivation of
+// it, and the two cannot disagree because there is only one of them.
+//
+// It is also the S2 GATE. On the first armed frame the host forces the reference configuration
+// (Clear, albedo 0.10, sun 41.34 deg), dispatches this, and checks what comes back against the
+// measured clear-sky bands. That is deliberately an END-TO-END check: if the LUT parameterisation is
+// wrong, or the unit constant is wrong, or a descriptor is bound to the wrong texture, THE GATE
+// FAILS. A CPU reference integrator would have passed happily while the GPU path was broken — and it
+// would have re-created the two-copies problem this phase exists to delete.
+//
+// ─── WHAT IT PRODUCES ────────────────────────────────────────────────────────────────────────────
+//   SH-L1 over the FULL SPHERE, lower hemisphere included. The sky-view LUT already contains the lit
+//   ground below the horizon (atmos_skyview.comp shades it), so "the sphere" is the whole
+//   environment and not just the dome — exactly what the CPU projection integrated, and for the same
+//   reason: leaving the ground black tilts every ambient in the game upward.
+//
+//   ⚠ SH-L1, NOT L2, AND THAT IS A DELIBERATE DEVIATION FROM THE SKETCH. The receiver
+//   (skyamb.h.fsl, via publishSkyAmbientSH) is L1 today. Changing the ambient's angular BASIS in the
+//   same step that changes its SOURCE would make a gate failure unbisectable — two suspects, one
+//   symptom. L2 is a real improvement and it is a step of its own, after this one has passed.
+//
+//   E_sky   — the sky's own cosine-weighted upper-hemisphere irradiance
+//   E_sun   — the direct beam, E_TOA x transmittance, WITH NO SOLVED SCALE ANYWHERE IN IT
+//   L_zenith, L_horizon — the two probes that make the nit row checkable per channel
+//
+// ⚠ THE QUADRATURE IS scenecal.h's FIBONACCI SPHERE, REPRODUCED EXACTLY. Same golden angle, same
+// half-offset, same N. Not for elegance: the host's own numbers (and every historical measurement
+// this is compared against) came off that table, and two quadratures over one field disagree by a
+// fraction of a percent that nobody can ever attribute afterwards.
+
+#include "atmosphere.srt.h"
+#include "atmosphere.h.fsl"   // THE MEDIUM — one copy, see the warning at its top
+
+#define ATMOS_SH_THREADS 128
+
+GroupShared(float4, g_sh0[ATMOS_SH_THREADS]);   // Y00 lobe
+GroupShared(float4, g_shX[ATMOS_SH_THREADS]);   // Y1 . x
+GroupShared(float4, g_shY[ATMOS_SH_THREADS]);   // Y1 . y
+GroupShared(float4, g_shZ[ATMOS_SH_THREADS]);   // Y1 . z
+GroupShared(float4, g_esk[ATMOS_SH_THREADS]);   // cosine-weighted UPPER-hemisphere irradiance
+
+ROOT_SIGNATURE(ComputeRootSignature)
+NUM_THREADS(ATMOS_SH_THREADS, 1, 1)
+void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
+{
+    INIT_MAIN;
+
+    uint tid = DispatchThreadID.x;
+
+    float r  = gAtmosParams.planet.w;
+    // Real SH basis, l = 0..1. Y00 = 0.282095, Y1m = 0.488603 * {y, z, x} — identical constants to
+    // the host's projection, which is what publishSkyAmbientSH still publishes through.
+    const float kY0 = 0.28209479f;
+    const float kY1 = 0.48860251f;
+    const float w   = 4.0f * ATMOS_PI / float(ATMOS_SH_THREADS);
+
+    // scenecal.h's fibDir(), transcribed. z uniform over [-1,1] IS uniform in solid angle, so every
+    // sample carries the same weight and the integral is a plain sum.
+    const float kGolden = 2.39996322972865332f;
+    float dz = 1.0f - (2.0f * float(tid) + 1.0f) / float(ATMOS_SH_THREADS);
+    float dr = sqrt(max(0.0f, 1.0f - dz * dz));
+    float phi = kGolden * float(tid);
+    float3 dir = float3(dr * cos(phi), dr * sin(phi), dz);
+
+    float2 uv = atmosSkyViewUvFromDir(gAtmosParams, r, dir);
+    float3 L  = SampleLvlTex2D(gAtmosSkyView, gSamplerBilinearClamp, uv, 0).rgb;
+    L = max(L, f3(0.0f));
+
+    float3 Lw = L * w;
+    g_sh0[tid] = float4(Lw * kY0,        0.0f);
+    g_shX[tid] = float4(Lw * kY1 * dir.x, 0.0f);
+    g_shY[tid] = float4(Lw * kY1 * dir.y, 0.0f);
+    g_shZ[tid] = float4(Lw * kY1 * dir.z, 0.0f);
+    // The sky's own irradiance on flat ground: upper hemisphere only, cosine-weighted. This is the
+    // quantity the sun share is stated against and the one §0.1's albedo-free invariant uses.
+    g_esk[tid] = float4((dir.z > 0.0f) ? (Lw * dir.z) : f3(0.0f), 0.0f);
+    GroupMemoryBarrier();
+
+    // Tree reduce. Read into a register, barrier, guarded write, barrier — cullscan/apl's idiom, and
+    // for its reason: EVERY thread must reach EVERY barrier, so the guard wraps only the write.
+    for (uint s = ATMOS_SH_THREADS / 2u; s > 0u; s >>= 1u)
+    {
+        float4 a0 = (tid < s) ? g_sh0[tid + s] : f4(0.0f);
+        float4 aX = (tid < s) ? g_shX[tid + s] : f4(0.0f);
+        float4 aY = (tid < s) ? g_shY[tid + s] : f4(0.0f);
+        float4 aZ = (tid < s) ? g_shZ[tid + s] : f4(0.0f);
+        float4 aE = (tid < s) ? g_esk[tid + s] : f4(0.0f);
+        GroupMemoryBarrier();
+        if (tid < s)
+        {
+            g_sh0[tid] = g_sh0[tid] + a0;
+            g_shX[tid] = g_shX[tid] + aX;
+            g_shY[tid] = g_shY[tid] + aY;
+            g_shZ[tid] = g_shZ[tid] + aZ;
+            g_esk[tid] = g_esk[tid] + aE;
+        }
+        GroupMemoryBarrier();
+    }
+
+    if (tid == 0u)
+    {
+        // --- the SH, raw. The host applies the cosine convolution and the DC normalisation, exactly
+        // where it did before, so the "a factor whose spherical mean is 1" contract skyamb.h.fsl
+        // runs on survives this change untouched.
+        gAtmosShOut[0]  = asuint(g_sh0[0].r);
+        gAtmosShOut[1]  = asuint(g_sh0[0].g);
+        gAtmosShOut[2]  = asuint(g_sh0[0].b);
+        gAtmosShOut[3]  = asuint(g_shX[0].r);
+        gAtmosShOut[4]  = asuint(g_shX[0].g);
+        gAtmosShOut[5]  = asuint(g_shX[0].b);
+        gAtmosShOut[6]  = asuint(g_shY[0].r);
+        gAtmosShOut[7]  = asuint(g_shY[0].g);
+        gAtmosShOut[8]  = asuint(g_shY[0].b);
+        gAtmosShOut[9]  = asuint(g_shZ[0].r);
+        gAtmosShOut[10] = asuint(g_shZ[0].g);
+        gAtmosShOut[11] = asuint(g_shZ[0].b);
+
+        // --- E_sky, native units (W/m^2 per primary) --------------------------------------------
+        gAtmosShOut[12] = asuint(g_esk[0].r);
+        gAtmosShOut[13] = asuint(g_esk[0].g);
+        gAtmosShOut[14] = asuint(g_esk[0].b);
+
+        // --- E_sun, DIRECT-NORMAL. ⚠ NO SOLVED SCALE. This is E_TOA times the transmittance the
+        // medium itself computes, which is what makes the 94 klx a PREDICTION rather than the
+        // restatement of an anchor it used to be. Below the horizon the beam is zero — a medium is
+        // allowed to say that, where Hosek had to be clamped and ramped.
+        float muSun = gAtmosParams.sunDir.w;
+        float3 Esun = f3(0.0f);
+        if (muSun > 0.0f)
+        {
+            float2 tuv = atmosTransmittanceUv(gAtmosParams, r, muSun);
+            Esun = SampleLvlTex2D(gAtmosTransmittance, gSamplerBilinearClamp, tuv, 0).rgb
+                 * gAtmosParams.solar.xyz;
+        }
+        gAtmosShOut[15] = asuint(Esun.r);
+        gAtmosShOut[16] = asuint(Esun.g);
+        gAtmosShOut[17] = asuint(Esun.b);
+
+        // --- the two probes the NIT row is read off, PER CHANNEL ---------------------------------
+        // ⚠ PER CHANNEL, NOT AS A LUMA, and that is the whole point of the row. q and sun% are
+        // scale-free by construction — they would pass unchanged if the sky were ten times too
+        // bright — and a luma gate cannot tell a zenith that is the right brightness and the wrong
+        // COLOUR from a correct one. The success criterion for this phase is chromatic.
+        float3 zen = SampleLvlTex2D(gAtmosSkyView, gSamplerBilinearClamp,
+                                    atmosSkyViewUvFromDir(gAtmosParams, r,
+                                                          float3(0.0f, 0.0f, 1.0f)), 0).rgb;
+        // The horizon probe sits 1 degree UP, away from the sun's azimuth. Not on the horizon
+        // exactly: the LUT's v axis splits there, so the horizon texel itself straddles the
+        // discontinuity the parameterisation is built around, and a probe on the seam measures the
+        // seam. Away from the sun so it reads the horizon HAZE rather than the circumsolar glare,
+        // which is the quantity "horizon brighter than zenith" is a statement about.
+        float3 sunH = gAtmosParams.sunDir.xyz
+                    - float3(0.0f, 0.0f, 1.0f) * gAtmosParams.sunDir.z;
+        float sunHLen = length(sunH);
+        float3 away = (sunHLen > 1.0e-4f) ? (-sunH / sunHLen) : float3(1.0f, 0.0f, 0.0f);
+        float3 hdir = normalize(away * cos(0.01745f) + float3(0.0f, 0.0f, 1.0f) * sin(0.01745f));
+        float3 hor = SampleLvlTex2D(gAtmosSkyView, gSamplerBilinearClamp,
+                                    atmosSkyViewUvFromDir(gAtmosParams, r, hdir), 0).rgb;
+        gAtmosShOut[18] = asuint(zen.r);
+        gAtmosShOut[19] = asuint(zen.g);
+        gAtmosShOut[20] = asuint(zen.b);
+        gAtmosShOut[21] = asuint(hor.r);
+        gAtmosShOut[22] = asuint(hor.g);
+        gAtmosShOut[23] = asuint(hor.b);
+
+        // --- THE FOG TARGET BELOW THE HORIZON, a probe S2c OWES THE FRAME ------------------------
+        // skyhw.frag is fullscreen and OPAQUE, so gSkyColor - the snapshot every fog site melts into
+        // (skydome.h.fsl) - now has alpha 1 BELOW the horizon as well as above it. Hosek could not
+        // answer down there and was CLAMPED to the horizon ring, which incidentally made that ring
+        // the melt target for every downward-looking pixel; the medium answers with the planet's lit
+        // GROUND instead. That is a different colour at a different level, it reaches the water
+        // surface, the reflection hole fill and every downhill vista, and S2c shipped it measured by
+        // nothing. This probe is that measurement: 10 degrees BELOW the horizon, away from the sun -
+        // the direction a water pixel's own fog target is sampled from.
+        float3 bdir = normalize(away * cos(0.17453f) - float3(0.0f, 0.0f, 1.0f) * sin(0.17453f));
+        float3 blw = SampleLvlTex2D(gAtmosSkyView, gSamplerBilinearClamp,
+                                    atmosSkyViewUvFromDir(gAtmosParams, r, bdir), 0).rgb;
+        gAtmosShOut[25] = asuint(blw.r);
+        gAtmosShOut[26] = asuint(blw.g);
+        gAtmosShOut[27] = asuint(blw.b);
+
+        // --- THE MULTISCATTER SERIES' RATIO, AT THE DECK (S4a) -----------------------------------
+        // ⚠ THE ONE NUMBER THAT SEPARATES "THE CLOUD MODEL IS WRONG" FROM "THE CLAMP IS LOAD-BEARING".
+        // atmos_multiscatter sums the higher orders as F = 1/(1-f) and guards it with
+        // f = min(fms, 0.98), F <= 50. For clear air fms is ~0.05 and the guard never fires. A cloud
+        // deck is CONSERVATIVE (ssa 0.9999 — a water cloud is bright because it scatters, not because
+        // it glows), which drives fms toward 1 and walks the sum straight into that ceiling.
+        //
+        // Both cases return a finite, plausible-looking LUT, so nothing downstream can tell them
+        // apart. This reads the raw, UNCLAMPED f back at the deck's own altitude and hands it to the
+        // gate, which is the difference between reporting a measurement and reporting a hypothesis.
+        float rDeck = gAtmosParams.planet.x + gAtmosParams.profGeom.z;
+        float2 fuv  = atmosMultiScatterUv(gAtmosParams, rDeck, gAtmosParams.sunDir.w);
+        float  fRaw = SampleLvlTex2D(gAtmosMultiScatter, gSamplerBilinearClamp, fuv, 0).a;
+        gAtmosShOut[28] = asuint(fRaw);
+
+        // The "this dispatch actually ran" tell. A readback of zeros and a readback of a sky that
+        // genuinely integrates to zero are the same 96 bytes without it, and one of those is a bug.
+        gAtmosShOut[24] = 1u;
+    }
+
+    RETURN();
+}

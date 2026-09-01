@@ -115,22 +115,37 @@ float3 fogSkyTarget(float4 s, float skyShare)
 // fogColNear — bit-identical to the pre-feature image, which is the same negative control the
 // strength knob gives, now also reached by distance.
 //
-// A #define and not a lane, matching FOG_SKY_HORIZON_RAMP below: this is a shaping constant on a
-// ramp, not a per-frame quantity, and every free lane in gShadowParams belongs to a different
-// subsystem. ⚠ It therefore costs a HOST RESTART to retune (skydome.h.fsl reaches opaque/statics/
-// terrain/alpha/multimap, none of which hot-reload) — move it to a lane if it needs dialling in play.
+// ⚠ IT WAS A #define AND IT IS A LANE NOW — gFrameData.froxelZ.z, defaulting to the same 0.85. The
+// note that stood here said "move it to a lane if it needs dialling in play", and it does: it is the
+// one constant standing between a fogged static and the reflection-hole beside it agreeing, and
+// every pass it reaches (opaque/statics/terrain/alpha/multimap) loads at host startup.
 //
 // MW's fog is LINEAR in distance, so a knee on opacity IS a knee on distance: 0.85 hands the sky the
 // last ~15% of the ramp.
-#define FOG_SKY_SATURATION_KNEE 0.85f
-
-// `fogAir` is MW's scalar: 1 = clear, 0 = fully fogged. Opacity is its complement.
-// At fogAir 0 this returns exactly 1, so "at full fog the surface BECOMES the sky" is preserved to
-// the bit — the property this whole helper exists to deliver is untouched at the only place it was
-// ever true.
+// ⚠ IT IS A LANE NOW (gFrameData.froxelZ.z), AND THE COMMENT ABOVE ASKED FOR EXACTLY THAT. The
+// default the host ships is 0.85, so nothing moves until somebody turns the slider; what changes is
+// that turning it no longer costs a host restart, which is what kept this constant from ever being
+// dialled against the thing it actually controls.
+//
+// ⚠⚠ AND WHAT IT CONTROLS IS THE REPORTED DISPARITY, WHICH IS AN ASYMMETRY AND NOT A LEVEL. Every
+// surface that goes through applyFog() takes this knee, so below it its fog target is flat
+// fogColNear. But fogSkyColor() — the water's reflection-hole fill and volfog's haze — is the
+// far-field spelling and passes share 1.0, i.e. NO KNEE, so it gets the sampled sky in full. Those
+// two sit side by side inside the mirror: a reflected static melting toward MW's authored fog colour
+// against a hole filled with the real sky. In clear weather the horizon sky measures ~90500 cd/m2
+// against fogColNear's ~31700 — a 2.9x step, which is "static reflections are fogged brighter blue
+// while statics assume MW fog color" exactly.
+//
+// LOWERING THE KNEE CLOSES THAT GAP by letting the sky into the target earlier, so the two sides
+// converge. It is deliberately left as a knob rather than re-pitched to a number: the right value is
+// a look judgement about a fantasy game's authored fog, not something a physical argument settles,
+// and the person who can see both surfaces at once should be the one turning it.
 float fogSkyShare(float fogAir)
 {
-    return smoothstep(FOG_SKY_SATURATION_KNEE, 1.0f, 1.0f - fogAir);
+    // Clamped, not trusted: a knee at or above 1 would make smoothstep's two edges equal, which is a
+    // division by zero in every spelling of it, and the lane is reachable from an env string.
+    float knee = clamp(gFrameData.froxelZ.z, 0.0f, 0.999f);
+    return smoothstep(knee, 1.0f, 1.0f - fogAir);
 }
 
 // What fog lerps toward, for callers that have no surface of their own (volfog's haze, the water

@@ -1,26 +1,26 @@
 // mgeHost64 — bloom pyramid compute SRT.  tasks/forge-postprocess.md step 4.
 //
 // WHY IT CAN EXIST NOW AND COULD NOT BEFORE. Three separate files record the same blocker:
-//   scenecolor.h.fsl:5  — until step 6a every colour frag ended `c = tonemap(c)`, so pMSAAColor held
+//   scenecolor.h.fsl:5  — until step 6a every colour frag ended `c = tonemap(c)`, so pSceneColor held
 //                         DISPLAY-referred values and "bloom had nothing to bloom from".
 //   linearize.h.fsl:6   — bloom is a CONVOLUTION and blur(x^(1/g)) != blur(x)^(1/g), so a true 16:1
 //                         highlight ratio reached the blur compressed to ~3.5:1 and read as flat
 //                         haze rather than light spilling off something bright.
 //   glow.frag.fsl:8     — the distant-light glow billboards already write un-clipped radiance and
 //                         were explicitly waiting on "the HDR post path".
-// All three have landed: pMSAAColor is R16G16B16A16_SFLOAT, scene-referred, linear, premultiplied.
+// All three have landed: pSceneColor is R16G16B16A16_SFLOAT, scene-referred, linear, premultiplied.
 //
 // ⚠ THERE IS NO RESOLVE/COMPOSITE SPLIT, and forge-postprocess.md said in three places that bloom
 // would need one. It does not. The split exists to hand bloom a resolved, single-sample, linear
 // image — but bloom's FIRST pass is a DOWNSAMPLE, and a downsample of an MSAA target already IS a
-// resolve (reflectmipfirst was extended to exactly this at W5). So bloomprefilter reads pMSAAColor
+// resolve (reflectmipfirst was extended to exactly this at W5). So bloomprefilter reads pSceneColor
 // directly and emits half-res mip 0 in one dispatch, resolve.frag keeps its whole existing tail and
 // gains one texture read. What the split would have cost at 4096x3072 is one extra full-res fp16
 // WRITE (~96 MB) plus one extra full-res READ for an image nothing else needs; what it buys is
 // nothing a 2x downsample can tell apart from a box average.
 //
 // THREE PASSES, ONE SET, reflectmip's variant shape:
-//   bloomprefilter_sc{1,4}.comp — pMSAAColor (Tex2DMS) -> mip 0. 2x2 pixel footprint x SAMPLE_COUNT
+//   bloomprefilter_sc{1,4}.comp — pSceneColor (Tex2DMS) -> mip 0. 2x2 pixel footprint x SAMPLE_COUNT
 //                                 samples. THIS PASS IS THE RESOLVE.
 //   bloomdown.comp              — mip i-1 -> mip i, [1,3,3,1] separable tent.
 //   bloomup.comp                — mip i+1 -> ACCUMULATED INTO mip i, symmetric tent, RWTex2D
@@ -37,7 +37,7 @@
 //
 // ── THE TWO TRAPS ────────────────────────────────────────────────────────────────────────────────
 //
-// 1. ALLOC vs RENDER RECT ([[project_forge_alloc_vs_render_uv]]). pMSAAColor is ALLOC-sized while the
+// 1. ALLOC vs RENDER RECT ([[project_forge_alloc_vs_render_uv]]). pSceneColor is ALLOC-sized while the
 //    scene draws into a width x height sub-rect; at render scale 1.00x that is a QUARTER of the
 //    allocation and the rest holds last frame's texels. Every dispatch covers, and every tap clamps
 //    to, the RENDER sub-rect at its own level — ceil(width / 2^(n+1)). Repeated ceil-halving equals
@@ -49,7 +49,7 @@
 //    frame. Explicit beats deriving the level from a dims ratio.
 //
 // 2. THE PREMULTIPLIED PAIR ([[project_forge_premultiplied_pair]] — this pass is the FOURTH place
-//    the rule has had to be stated). pMSAAColor's rgb is already scaled by its coverage.
+//    the rule has had to be stated). pSceneColor's rgb is already scaled by its coverage.
 //
 //    ⚠⚠ THE RULE SPLITS IN TWO HERE, and getting the split wrong is silent:
 //
@@ -87,10 +87,26 @@
 STRUCT(BloomParams)
 {
     // xy = the SRC extent for THIS level, in texels of the source surface, as a RENDER rect — not
-    //      the allocation. Prefilter: the full-res scene rect (g_live.width/height). Down/up: the
-    //      source mip's own ceil-halved rect. It is the inclusive clamp bound minus one, i.e. every
-    //      tap does clamp(q, 0, src.xy - 1), so no filter footprint can reach a texel this frame
-    //      never wrote. GetDimensions cannot answer this — see the header note.
+    //      the allocation. Prefilter: the RASTER rect (pSceneColor's own written extent). Down/up:
+    //      the source mip's own ceil-halved rect. It is the inclusive clamp bound minus one, i.e.
+    //      every tap does clamp(q, 0, src.xy - 1), so no filter footprint can reach a texel this
+    //      frame never wrote. GetDimensions cannot answer this — see the header note.
+    //
+    //      ⚠ FOR THE PREFILTER, src AND dst NO LONGER DIFFER BY EXACTLY 2 (M1 4c follow-up,
+    //      tasks/forge-upscale.md). src is the RASTER rect while dst is sized from the DELIVERED
+    //      rect, so `src/dst` is `2 x inputScale` and the pass is an AREA-AVERAGE RESAMPLE rather
+    //      than a fixed 2x2 box. That split is deliberate and it is two different questions:
+    //
+    //        the pyramid's EXTENT follows the DELIVERED image, so its angular REACH does not change
+    //        when a resolution slider moves (the defect 4c fixed: L7 -> L6 at inputScale 0.5);
+    //
+    //        the pyramid's DATA comes from the RAW SCENE, because bloom is an ENERGY operation and
+    //        an upscaler is a DISPLAY RECONSTRUCTION carrying a non-energy-conserving anti-ringing
+    //        clamp. Feeding bloom the upscaled frame cost the glow its punch on candle flames — see
+    //        bloomprefilter.comp.fsl, and the same argument the HDR EXR dump's box resolve and
+    //        `invLuma` shipping OFF are both made of.
+    //
+    //      At inputScale 1.0 the ratio is exactly 2 and the resample is bit-for-bit the old box.
     // zw = reserved.
     DATA(float4, src, None);
     // xy = the DST extent for THIS level, same convention. The dispatch is sized from it AND every
@@ -154,9 +170,9 @@ BEGIN_SRT(BloomSrtData)
     BEGIN_SRT_SET(Persistent)
         DECL_CBUFFER (Persistent, CBUFFER(BloomParams), gBloomParams)
 #if SAMPLE_COUNT > 1
-        DECL_TEXTURE (Persistent, Tex2DMS(float4, SAMPLE_COUNT), gBloomSceneTex)  // pMSAAColor (prefilter only)
+        DECL_TEXTURE (Persistent, Tex2DMS(float4, SAMPLE_COUNT), gBloomSceneTex)  // pSceneColor (prefilter only)
 #else
-        DECL_TEXTURE (Persistent, Tex2D(float4), gBloomSceneTex)                  // pMSAAColor (prefilter only)
+        DECL_TEXTURE (Persistent, Tex2D(float4), gBloomSceneTex)                  // pSceneColor (prefilter only)
 #endif
         // The pyramid, twice. gBloomSrc is the level being READ (mip i-1 for the down pass, mip i+1
         // for the up pass); gBloomDst is the level being written. Declared RWTex2D rather than

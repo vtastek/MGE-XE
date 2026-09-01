@@ -99,6 +99,36 @@
 // land fog" failure, sitting latent behind a redundant test.
 //
 // A predicate that can only ever be wrong is worth deleting even when it is almost always right.
+// ─── THE NEAR FIELD, WHICH MW'S RAMP LEAVES COMPLETELY EMPTY ─────────────────────────────────────
+// ⚠ BOTH CURVES ABOVE ARE EXACTLY 1 — perfectly clear — FOR EVERYTHING NEARER THAN fogStart, and in
+// clear weather at a 16-cell draw distance fogStart is 4.2 cells, i.e. about 490 metres. So the
+// entire near and middle field of every outdoor shot has NO ATMOSPHERE IN IT AT ALL: a wall ten
+// metres away and a hillside four hundred metres away are composited with identical air between
+// them and the eye. Reported from play as "close fog being ignored", and it is not a bug in either
+// curve — it is MW's own data, which describes a CURTAIN at the world's edge and says nothing about
+// the air in front of it.
+//
+// ⚠ THIS IS A LOOSELY PROCEDURAL FILL, NOT AN AERIAL-PERSPECTIVE MODEL, and the distinction is the
+// whole reason it is three lines. A real answer integrates the medium along the ray and arrives with
+// S3; this multiplies the ramp by a Beer-Lambert term that starts AT THE EYE, so:
+//
+//   - it is 1 at distance 0, so nothing touching the camera changes;
+//   - it is smooth and monotone from there, so there is no second corner to see;
+//   - it multiplies rather than adds, so at the far end — where the ramp is already ~0 — it cannot
+//     move the fog WALL, which is the one thing MW's data is actually authoritative about;
+//   - at density 0 it is exactly 1.0 and the two curves above are bit-identical to what they were.
+//
+// It is a LOOK knob on a fantasy game's authored fog and it is meant to be turned by eye.
+float mwFogNearHaze(float dist)
+{
+    // gFrameData.froxelZ.w — density per world unit. A Morrowind unit is ~1.4 cm, so a useful range
+    // is small: 1e-5 puts ~10% opacity at 7000 units (~100 m), which is roughly where a humid day
+    // starts to read. Clamped non-negative because the lane is reachable from an env string and a
+    // negative density is an exponential GAIN.
+    float k = max(gFrameData.froxelZ.w, 0.0f);
+    return (k > 0.0f) ? exp(-k * max(dist, 0.0f)) : 1.0f;
+}
+
 float mwFogRamp(float dist)
 {
     float fogStart = gFrameData.fogParams.x;
@@ -140,11 +170,11 @@ float mwFogRamp(float dist)
         // ported 4.4 form 87%), converging back onto the linear ramp's density by the far third.
         float x = S * t * t;
         float e = exp(-S);
-        return saturate((exp(-x) - e) / (1.0f - e));
+        return saturate(mwFogNearHaze(dist) * (exp(-x) - e) / (1.0f - e));
     }
 
     // MW's linear ramp — algebraically the exact expression every call site carried before.
-    return 1.0f - t;
+    return saturate(mwFogNearHaze(dist) * (1.0f - t));
 }
 
 // THE RAMP PLUS THE CAMERA GUARD, which is what every stage EXCEPT the water surface wants.

@@ -668,6 +668,10 @@ namespace IPC {
 			// skinned bone walk; the player rides the wire because in FIRST PERSON there is no
 			// skinned draw to harvest (bridge.h playerCrush).
 			ForgeRender::setPlayerCrush(params.playerCrush);
+			// S1 atmosphere: MW's live weather row. The host turns cur/next/transition into physics
+			// through its own per-weather table (atmosphere.h) — this is the ONLY place a weather
+			// index crosses the wire, and the only place it becomes a medium.
+			ForgeRender::setWeather(params.weather);
 			ok = ForgeRender::renderScene(params.viewProj, params.lighting, drawPtr, params.drawCount, bytes,
 				skinnedPtr, params.skinnedCount, skinnedBytes,
 				multiMapPtr, params.multiMapCount, multiMapBytes,

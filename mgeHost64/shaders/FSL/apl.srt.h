@@ -59,6 +59,26 @@ STRUCT(AplParams)
     // ⚠ APPENDED, so dims/opts keep their offsets and the host's existing 8-float write is still
     // the first 32 bytes of the same upload.
     DATA(float4x4, invViewProj, None);
+    // xy = THE DEPTH TEXTURE'S VALID EXTENT — the INPUT rect, where the scene actually rasterised.
+    //      zw spare.
+    //
+    // ⚠ IT EXISTS BECAUSE dims.xy IS NO LONGER BOTH ANSWERS (M1 4b, tasks/forge-upscale.md). This
+    // pass reads TWO resources at one lattice position: gAplColor is pRT, written at the OUTPUT
+    // rect, and gAplDepth is pLinearDepth, written at the INPUT rect. Those were the same number for
+    // the whole life of this instrument — the note on gAplDepth below used to assert it — and an
+    // upscaler is precisely what makes them differ.
+    //
+    // The failure is worth recording because it is silent and it corrupts the SERVO rather than the
+    // picture: indexing the depth with an output coordinate reads outside the written region, where
+    // reverse-Z's cleared 0.0 means "sky", so sky rejection throws those samples away and the
+    // reading describes only the top-left quadrant of the frame. Measured at input scale 0.5:
+    // `scene sky` 26% -> 81% and `exp` 0.0914 -> 0.0403, i.e. more than a stop, with the rendered
+    // image itself perfectly correct.
+    //
+    // ⚠ APPENDED AFTER THE MATRIX, so dims / opts / invViewProj all keep their offsets and the
+    // host's existing write is still the first 96 bytes of the same upload. 112 B against a 256 B
+    // cbuffer, so no allocation change.
+    DATA(float4, srcDims, None);
 };
 
 BEGIN_SRT(AplSrtData)
@@ -76,11 +96,16 @@ BEGIN_SRT(AplSrtData)
         // UNCONDITIONALLY every frame — "linearize always runs; only the GTAO dispatches are gated"
         // (forgerender.cpp) — so this instrument does not acquire a hidden dependency on AO being
         // enabled, which would have made the metering change under a knob that has nothing to do
-        // with it. Same valid extent as pRT (both are read at g_live.width/height), so one integer
-        // pixel coordinate addresses both and no second size has to be published.
+        // with it.
         //
         // SKY IS EXACTLY 0.0 HERE, not approximately: pSkyPipeline is built with depth test AND
         // write OFF, and the reverse-Z clear is 0.0, so a pixel showing only sky was never written.
+        //
+        // ⚠⚠ AND THAT IS ALSO WHY ITS EXTENT HAS TO BE PUBLISHED SEPARATELY. This slot's valid
+        // region is the INPUT rect (srcDims.xy), NOT dims.xy — see srcDims above. A sentence stood
+        // here claiming "same valid extent as pRT ... so one integer pixel coordinate addresses both
+        // and no second size has to be published", and M1 4b is what made it false: an out-of-rect
+        // read lands on the reverse-Z clear, which this pass cannot tell from real sky.
         DECL_TEXTURE(PerBatch, Tex2D(float), gAplDepth)
         // 24 uints, THREE populations of 8 in the identical layout — [0..7] every counted sample,
         // [8..15] the LAND half, [16..23] the WATER half:

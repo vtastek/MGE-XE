@@ -1,0 +1,47 @@
+// mgeHost64 — the ATMOSPHERE's PARAMETER BLOCK (tasks/forge-atmosphere.md S2).
+//
+// ⚠ THIS FILE DECLARES A STRUCT AND NOTHING ELSE, AND THE SPLIT IS NOT COSMETIC. `atmosphere.srt.h`
+// and `opaque.srt.h` are both compiled BY THE HOST AS C++ (defaults.h supplies C++ definitions of
+// STRUCT/DATA/BEGIN_SRT so SRT_RES_IDX resolves in forgerender.cpp), so anything they include has to
+// be C++-legal. `atmosphere.h.fsl` — the medium itself — is full of HLSL function bodies and is not.
+// So the struct lives here, the physics lives there, and a shader that needs both includes both.
+// Exactly the arrangement skyview.h.fsl already documents, and for exactly the same reason.
+#pragma once
+
+// ─── THE PARAMETER BLOCK ─────────────────────────────────────────────────────────────────────────
+// A STRUCT AND NOTHING ELSE — no SRT here, for the reason skyview.h.fsl gives: two SRTs in one
+// header alias each other's registers and DXC dead-strips the evidence. Filled host-side by
+// Atmosphere::packParams(), which is the only place a weather Params becomes coefficients.
+// [[project_forge_srt_one_per_header]]
+STRUCT(AtmosphereParams)
+{
+    DATA(float4, rayleigh,  None);  // xyz = beta_R scattering (1/m at sea level), w = scale height (m)
+    DATA(float4, mieSca,    None);  // xyz = beta_M SCATTERING (1/m, tinted),      w = scale height (m)
+    DATA(float4, mieExt,    None);  // xyz = beta_M EXTINCTION (1/m, grey),        w = HG asymmetry g
+    DATA(float4, ozone,     None);  // xyz = beta_O3 absorption (1/m at the tent's peak), w spare
+    DATA(float4, profGeom,  None);  // THE TWO NON-EXPONENTIAL PROFILES' GEOMETRY, metres:
+                                    // x = ozone tent centre,      y = ozone tent half-width
+                                    // z = cloud deck centre,      w = cloud deck half-thickness
+    DATA(float4, planet,    None);  // x = Rg, y = Rt (m), z = ground albedo, w = camera radius (m)
+    DATA(float4, sunDir,    None);  // xyz = unit vector TOWARD the sun (world, Z up), w = its z
+    DATA(float4, solar,     None);  // xyz = E_TOA per primary (W/m^2), w spare
+    DATA(float4, moonDir,   None);  // xyz = unit vector TOWARD the moon, w = its E_TOA-equivalent
+    DATA(float4, nightP,    None);  // x = airglow radiance (native), yzw spare
+    DATA(float4, marchP,    None);  // x = sky-view steps, y = MS steps, z = MS directions (sqrt),
+                                    // w = the DECK's own step budget (S4a; 0 disarms the deck)
+    DATA(float4, lutDims,   None);  // xy = sky-view WxH, zw = transmittance WxH
+    DATA(float4, lutDims2,  None);  // xy = multiscatter WxH, zw spare
+    // ─── THE CLOUD DECK (S4a) ────────────────────────────────────────────────────────────────
+    // ⚠ A FOURTH DENSITY PROFILE, NOT A LAYER MODEL. The deck is one more species inside
+    // atmosMediumAt(), so the lid, the extinguished beam and the flat bright overcast sky all fall
+    // out of the SAME march that already produces the clear sky — there is no second model to keep
+    // in sync, which is the discipline atmosphere.h.fsl exists to enforce. Its GEOMETRY lives in
+    // profGeom.zw beside the ozone tent's, because both are bounded profiles of the same shape.
+    //
+    // GREY on purpose: a water cloud's droplets are hundreds of times the wavelength, so its
+    // extinction is spectrally flat. Every colour an overcast sky has comes from the air above and
+    // below it, which the other three species already carry.
+    DATA(float4, cloud,     None);  // x = beta_sca (1/m), y = beta_ext (1/m), z = HG g,
+                                    // w = the profile's shape blend (0 stratus slab .. 1 raised cos)
+};
+

@@ -48,10 +48,23 @@
 // Included with the other standard headers — i.e. BEFORE IMemory.h overrides new/delete.
 #include <thread>
 
-// The physical sky (tasks/forge-physical-sky.md P2). Pure maths + the verbatim Hosek-Wilkie
-// coefficient dataset — no Forge types, no allocations. Included HERE, with the standard headers
-// and BEFORE IMemory.h overrides new/delete, for the same reason <thread> is.
-#include "hosek.h"
+// The renderer's absolute-unit CALIBRATION LAYER and the ATMOSPHERE it feeds. Pure maths, no Forge
+// types, no allocations. Included HERE, with the standard headers and BEFORE IMemory.h overrides
+// new/delete, for the same reason <thread> is.
+//
+// ⚠ scenecal.h's twelve constants used to live in hosek.h and NOT ONE OF THEM WAS EVER HOSEK'S —
+// kSceneUnitCd, the native->scene conversion, the reference configuration, the Fibonacci
+// quadrature, luma709, pi. They were relocated FIRST, on their own, behaviour-free, so that
+// replacing the sky model could not be confused with moving the calibration (tasks/forge-
+// atmosphere.md S2f). hosek.h and hosek_data.h are gone; the medium is atmosphere.h + the LUTs.
+#include "scenecal.h"
+#include "atmosphere.h"   // MW's weather -> one participating medium (tasks/forge-atmosphere.md)
+// M1 step 4b: THE UPSCALER SEAM (tasks/forge-upscale.md). Declarations only — IUpscaler, its input
+// struct and the two factory functions; every Forge type it names is forward-declared, so this
+// include drags no Forge header through and is safe on either side of IMemory.h. It sits here with
+// the other host-owned modules because that is what it is: forgerender.cpp knows the SEAM, and
+// nothing about which backend is behind it.
+#include "upscale.h"
 
 #include "OS/Interfaces/IOperatingSystem.h"
 #include "Utilities/Interfaces/IFileSystem.h"
@@ -163,11 +176,18 @@
 // apl.srt.h — C++ sees the header's #ifndef default, and both prefilter variants declare the same
 // four slots in the same order, so SRT_RES_IDX resolves identically for either.
 #include "shaders/FSL/bloom.srt.h"
-// The physical sky's C++/FSL cross-check (tasks/forge-physical-sky.md P2): HosekCheckSrtData,
-// PerBatch frequency, one dispatch per host session. It binds the SAME gSkyView cbuffer the sky
-// pass reads — see hosekcheck.srt.h for why sharing the buffer rather than filling a private copy
-// is what makes the number mean something.
-#include "shaders/FSL/hosekcheck.srt.h"
+// M1 camera-only motion vectors (tasks/forge-upscale.md): MotionVectorSrtData, Persistent frequency,
+// ONE instance. No SAMPLE_COUNT variants — it reads pLinearDepth (already single-sample, and holding
+// RAW device depth despite the name) rather than pDepth, which is what spares it the sc1/sc4 split
+// linearizedepth carries. The space it reconstructs into, and the bakeEye origin hazard that makes
+// `prevViewProj` more than "last frame's matrix", are documented at length in the header.
+#include "shaders/FSL/motionvectors.srt.h"
+// THE ATMOSPHERE's LUT chain (tasks/forge-atmosphere.md S2): AtmosphereSrtData, PerBatch frequency,
+// ONE set over four instances (transmittance / multiscatter / sky-view / the SH measurement). Shares
+// the merged ComputeRootSignature. This REPLACED hosekcheck.srt.h — the C++/FSL cross-check that
+// guarded the Hosek closed form is gone with the model, because there is no longer a second
+// evaluation to guard: atmos_sh.comp measures the very texture the pixels are drawn from.
+#include "shaders/FSL/atmosphere.srt.h"
 
 // App-layer callback normally provided by WindowsBase.cpp (which we exclude — it
 // drags in the window system). The backend calls this on device-lost. Headless:
@@ -667,6 +687,38 @@ namespace {
     // boundary and the client owns the keyboard — and because the two are the only two ways anything
     // leaves this process other than the composited 8-bit seam.
     static bool g_hdrDumpArmed = false;
+    // UNATTENDED CAPTURE. `dumpAtFrame` (MGE_HOST_KNOBS): arm the HDR/LDR dump once, when
+    // g_renderFrame first reaches this value. 0 = off, which is every normal session.
+    //
+    // ⚠ IT EXISTS FOR THE SAME REASON MGE_HOST_KNOBS DOES — the harness runs MINIMIZED, so the two
+    // existing triggers (numpad 1, the Tonemap panel button) are both unreachable, and "show me what
+    // it looks like in all ten weathers" is therefore a question the automated rig could not answer
+    // at all. A FRAME NUMBER and not a timer: frames only tick while the world is rendering, so it
+    // counts gameplay rather than loading, which is the quantity a settle delay is actually about.
+    float g_dumpAtFrame = 0.0f;
+
+    // A UNIFORM multiplier on the medium's sea-level Mie coefficient, applied in packParams() — the
+    // one site where a Params becomes coefficients. 1.0 is the shipped atmosphere. See the long note
+    // at its use in atmosphere.h for why this is a calibration of a constant rather than a look knob,
+    // and why the value that survives belongs folded into kMieScatterSeaLevel with this deleted.
+    float g_atmosMieMul = 1.0f;
+
+    // ─── S4a: THE CLOUD DECK's A/B GATE ──────────────────────────────────────────────────────────
+    // ⚠⚠ 0 IS THE PRE-S4a SKY, EXACTLY. The deck's beta_sca/beta_ext are multiplied by this in
+    // packParams(), so 0 makes every cloud term in atmosMediumAt() identically zero and the medium
+    // reduces, term for term, to the two exponentials and the ozone tent S2 shipped. That is the
+    // control arm for every measurement in this phase and it is one token away in MGE_HOST_KNOBS.
+    //
+    // ⚠ IT SHIPS AT 1 AND IT IS NOT A LOOK SLIDER — same treatment `atmosMieMul` documents for
+    // itself. The plan's C1 landed it at 0 so the byte-identity check had a default to be checked
+    // against; the phase's whole point is the deck, so the default that leaves the tree is ON, and
+    // the knob is deleted once S4a is accepted. [[project_forge_no_ini_flips]]
+    float g_atmosDeck = 1.0f;
+    // The deck's own step budget, marchP.w — the QUADRATURE half of the phase, kept on its own knob
+    // so "is it the optics or the quadrature" is a one-token bisection rather than a rebuild. 0
+    // disarms the deck in every march whatever the coefficients say. Costs nothing on a clear sky:
+    // a ray that never crosses the lid never gets the extra segment.
+    float g_atmosDeckSteps = 12.0f;
 }
 
 namespace ForgeRender {
@@ -749,7 +801,7 @@ namespace ForgeRender {
     // Standalone exercise of the M1c opaque scene path (init → uploadGeometry →
     // renderScene) with a dummy triangle mesh, so the host-side printf/asserts are
     // visible in a terminal. Isolates a buildOpaquePath/draw crash from the IPC seam.
-    bool sceneProbe() {
+    bool sceneProbe(unsigned samples) {
         std::setvbuf(stdout, nullptr, _IONBF, 0);
         // ⚠ THE PROBE ASSERTS EXACT CENTRE PIXELS (`~129` for the SLOT-0 texture guard, `BGRA
         // 15,15,15,255` for the emissive collapse), and the exposure servo is a FEEDBACK LOOP over
@@ -757,8 +809,19 @@ namespace ForgeRender {
         // happened to render and on what they contained. Pin it off before init(), so the probe
         // keeps measuring the shader chain and nothing else.
         expDisableForProbe();
+        // M1: arm the motion-vector pass. BEFORE init, so the resources are built with it on, and
+        // unconditionally rather than behind a knob — the invariant it checks ("a static camera
+        // produces zero motion") is the pass's contract, not an option, and a check that has to be
+        // switched on is a check nobody runs. mvReportForProbe() asserts it at the end.
+        mvEnableForProbe();
         std::printf("[forge] scene-probe: init...\n");
-        if (!init(640, 360, 4, 16)) {   // exercise the MSAA path (resolve into the shared RT); falls back to 1x if unsupported
+        // Default 4: exercise the MSAA path (resolve into the shared RT); falls back to 1x if the
+        // device refuses the count. `--forge-scene 1x` takes the OTHER arm — M0's single-sample
+        // scene-referred staging target + resolve_sc1. See the header for why that is a real test:
+        // the probe's triangle is flat and fullscreen, so the two arms must agree pixel for pixel.
+        const unsigned probeSamples = (samples >= 1u) ? samples : 1u;
+        std::printf("[forge] scene-probe: sampleCount=%u arm\n", probeSamples);
+        if (!init(640, 360, probeSamples, 16)) {
             std::printf("[forge] scene-probe: init FAILED\n");
             return false;
         }
@@ -941,9 +1004,74 @@ namespace ForgeRender {
             std::printf("[forge] scene-probe: multi-map renderScene returned %d (multiMapDrawn=%u) -> expect CENTRE ~248\n",
                         (int)ok, lastMultiMapDrawn());
             debugReadbackCenterPixel();
+
+            // ─── TWO SETTLING FRAMES, FOR THE REACTIVE MASK'S ASSERTION ──────────────────────────
+            // ⚠ THE PROBE'S CAMERA IS STATIC BUT ITS SCENE IS NOT, and the first version of the
+            // mask assertion caught exactly that: it reported reactive=25.00%, which is not noise
+            // and not a threshold problem — it is CORRECT. The dummy SKINNED triangle spans
+            // (0,0)-(100,0)-(0,100), i.e. the whole top-right NDC quadrant under the identity
+            // viewProj, and render #3 above drops the skinned list entirely. A quarter of the frame
+            // genuinely changed depth between two frames, and the mask flagged a quarter of the
+            // frame. The instrument was right and the assertion's premise was wrong.
+            //
+            // That is worth keeping as evidence rather than tuning away: it is the only place in the
+            // tree where the mask has been shown to RESPOND to something, as opposed to being
+            // correctly silent. So: repeat render #3 unchanged, twice, and assert on THAT — a frame
+            // whose predecessor is identical must produce an empty mask. Two rather than one because
+            // the statistics readback is one frame late by construction, so the reported frame and
+            // its predecessor both have to be inside the settled run.
+            std::printf("[forge] scene-probe: 2 settling frames (identical draw list) for the "
+                        "reactive-mask assertion\n");
+            for (int settle = 0; settle < 2; ++settle) {
+                renderScene(vp, lt, nullptr, 0, 0,
+                            nullptr, 0, 0,
+                            &mm, 1, (unsigned)sizeof(mm),
+                            nullptr, 0, 0);
+            }
         }
 
         debugReadbackAO();   // Tier 2 diag: ground-truth pAO contents (GTAO write vs graphics read)
+        // M1: the motion-vector field's own statistics, and the static-camera assertion. Read one
+        // frame late by construction (the stats readback is staged inside the dispatch's own
+        // bracket), which the four renderScene calls above have covered.
+        mvReportForProbe();
+
+        // ─── M1 4b: THE UPSCALE SEAM, EXERCISED (tasks/forge-upscale.md) ─────────────────────────
+        //
+        // ⚠ EVERY FRAME ABOVE THIS POINT RAN AT in == out AND THEREFORE PROVED NOTHING ABOUT THE
+        // SEAM. init() seeds all three rects equal and the probe never calls setRenderSize, so the
+        // upscaler took its identity fast path — returned the source, recorded nothing — every time.
+        // That equality IS a real regression test — the shipped default now ARMS the backend, so the
+        // claim it checks is that arming alone changes no pixel — but it is the weak half of 4b's
+        // acceptance, and running only it would be exactly the "an A/B whose two arms are identical"
+        // failure the knob table's own header warns about.
+        //
+        // So: narrow the rect the way the client does, re-render, and read the centre back. This is
+        // the only no-Morrowind test of the pass, and it covers precisely the parts of the seam that
+        // are NOT the filter — the pass records, it writes the backend's own target, the resolve
+        // binds descriptor-set instance 1, that instance's clamp is the OUTPUT rect, and the frame is
+        // still DELIVERED. Each of those failing produces a wrong centre pixel: a never-written
+        // target is not 15,15,15, a mis-bound instance samples the wrong resource, and a resolve
+        // clamped to a rect nothing wrote smears the last written column across the frame.
+        //
+        // The limits of this stage are stated on upscaleProbeNarrow()'s declaration; the short
+        // version is that a FLAT field cannot see a half-pixel error.
+        //
+        // AFTER mvReportForProbe(), deliberately: the mask assertion needs two frames at a settled
+        // rect, and a resize mid-run is precisely the discontinuity it exists to flag.
+        if (upscaleProbeNarrow()) {
+            // Two frames: the first re-rasterises the scene into the narrowed rect, the second
+            // renders one whose inputs are already all at that rect. The readback is of the SECOND,
+            // so a one-frame-stale resource cannot be what produced the answer.
+            for (int f = 0; f < 2; ++f) {
+                ok = renderScene(vp, lt, &item, 1, (unsigned)sizeof(item),
+                                 skDraw, 1, (unsigned)sizeof(skDraw),
+                                 nullptr, 0, 0,
+                                 nullptr, 0, 0);
+            }
+            upscaleProbeReport();
+            debugReadbackCenterPixel();
+        }
 
         shutdown();
         std::printf("[forge] scene-probe complete — %s\n", ok ? "OK" : "FAILED");
@@ -1133,20 +1261,143 @@ namespace {
     // it fixes the moments atlas width, and the atlas is allocated once at init.
     constexpr uint32_t kSunCascades = 2;
 
+    // ⚠ DECLARED UP HERE, well away from the other post-process knobs, for the same reason
+    // kBloomMipCount / kSunCascades / kCausticSetCount are: the code that READS them is earlier in
+    // this file than the knob block. buildOpaquePath creates the backend, and it sits ~4000 lines
+    // above where a g_upscale* block would naturally live beside g_bloom*. Moving the reader is not
+    // an option — the backend has to be built where the resolve's descriptor sets are built, because
+    // one of those sets binds its output.
+    // --- M1 step 4b: THE UPSCALER (tasks/forge-upscale.md) ---------------------------------------
+    // Two knobs, and they answer different questions, which is why they are not one.
+    //
+    // ⚠ READ AT INIT, NOT LIVE. It decides whether the backend and its ~56 MB alloc-sized fp16 target
+    // are CREATED AT ALL — the same call the bloom pyramid makes about its ~33 MB.
+    //
+    // ⚠⚠ SHIPS **ON** SINCE 2026-09-01, and what that buys is the SLIDER, not upscaling.
+    // `g_upscaleInputScale` still defaults to 1.0, and at 1.0 `evaluate()` returns the scene target
+    // unchanged having recorded NOTHING (upscale.h) — no dispatch, no barrier, `upscaled` false, the
+    // resolve on set instance 0, `bloom.w` an exact 1.0f. So the delivered frame is bit-identical to
+    // the feature being absent; the ONLY cost of arming is the ~56 MB allocation, and the ONLY thing
+    // that changes is that the panel's input-scale slider now has a consumer and therefore does
+    // something. It was init-time-and-off precisely because the alternative was a slider that
+    // narrowed the raster with nothing to widen it back, which is the defect upscaleScale() now
+    // makes structurally impossible.
+    //
+    // `MGE_HOST_KNOBS=upscaleEnable=0` still reproduces the pre-4b build exactly — allocation
+    // included — which is what verification step 1 tests and what to reach for when bisecting.
+    //
+    // It is also forced OFF, loudly, by any of the guards at the creation site: sampleCount > 1 (an
+    // upscaler REPLACES MSAA, and resolve_sc4.frag binds a Tex2DMS where the single-sample upscaled
+    // output would go — a TYPE mismatch, not a quality question), no pSceneColor / not scene-referred
+    // (there is no source to read and shaderResolve is already false there), or a backend init that
+    // failed. Every one of those logs a DECLINED line naming which fired, because **a silently-absent
+    // upscaler is indistinguishable from a working one at scale 1.0**.
+    bool     g_upscaleEnable = true;
+    // THE INPUT SCALE — input rect = output rect x this. LIVE, and it REPLACES 4a's
+    // `static constexpr kHostInputScale` at the one site that ever read it, setRenderSize().
+    //
+    // A FREE SLIDER RATHER THAN DLSS'S QUALITY-MODE RATIOS, on purpose: 4b is a test step and its
+    // whole job is to sweep the thing 4a could not move, and `NGX_DLSS_GET_OPTIMAL_SETTINGS` will
+    // supply the real per-mode ratios in 4d — inheriting them now would be
+    // [[feedback_prior_art_constants_dont_transfer]] before the fact.
+    //
+    // ⚠ 1.0 IS AN EXACT IDENTITY AND PROVES NOTHING ABOUT THE SEAM. evaluate() returns the source
+    // unchanged when in == out, having recorded nothing (upscale.h), so the identity is free by
+    // CONSTRUCTION — which is the only kind worth having, and also the reason the real 4b test is run
+    // at 0.5. The floor is 0.33 because below a third the input rect stops being able to carry the
+    // frame at all; the ceiling is 1.0 because alloc >= out >= in is the model.
+    float    g_upscaleInputScale = 1.0f;
+    // THE PASSTHROUGH'S SPATIAL FILTER, live (M1 4c follow-up). Shipped values unchanged — 0.5 is
+    // Catmull-Rom, 1.0 is the anti-ringing clamp ON — so the default frame is exactly what 4b and 4c
+    // measured. They exist as knobs because 4c put this filter UPSTREAM OF THE BLOOM PYRAMID, and
+    // the first thing reported from the game afterwards was that bloom "loses its impact hard" at
+    // scale < 1 on a candle-lit interior. The clamp is the suspect worth arming: it is required for
+    // correctness (an unbounded scene-referred source through a filter with negative lobes) and it
+    // is also NOT energy-conserving, which is the property bloom cares about. See upscale.h.
+    float    g_upscaleSharpness = 0.5f;
+    float    g_upscaleAntiRing  = 1.0f;
+    // WHICH BACKEND IS LIVE — and, because of the gate in upscaleScale() below, THE ARMED WITNESS
+    // ITSELF rather than a label. Set from pUpscaler->name() at the one site that succeeds in arming
+    // one, and nulled on every path that does not: a guard that declined, a failed init/bind, and
+    // teardown. nullptr therefore means exactly "no upscale pass will run this frame", which is the
+    // condition the input rect has to be derived from.
+    const char* g_upscaleName = nullptr;
+    // ...and whether the LAST frame actually upscaled. Set from the ONE authoritative test (the
+    // pointer evaluate() returned), never re-derived from the rects — a second copy of that test is
+    // a second place to get it wrong.
+    bool     g_lastUpscaleRan = false;
+    // THE CLAMP, once. setRenderSize derives the input rect through it and the `[rect]` log reports
+    // it; two copies of the expression is two chances for the log to describe a rect the renderer
+    // did not use, which on this particular line would be worse than not logging at all.
+    //
+    // ⚠⚠ AND IT RETURNS AN EXACT 1.0 UNLESS A BACKEND IS ARMED. That guard is the function's reason
+    // to exist, not a tidy-up. The knob NARROWS the raster and the upscale pass is the only thing
+    // that WIDENS it back, and 4b shipped the two gated on DIFFERENT conditions — the scale live and
+    // unconditional here, the pass on `g_upscaleEnable && pUpscaler` in the frame. Hold one without
+    // the other and the scene rasterises into a 0.5x sub-rect which is then delivered through a
+    // full-size resolve viewport whose source clamp is the INPUT rect: the picture lands in the
+    // top-left quadrant at 1:1 and the other three quarters smear from its edge rows. Reported from
+    // the game as "scale shrinks the view — bloom correct though", and the bloom half is the
+    // confirmation, not a puzzle: at bloom.w = 1.0 the pyramid registers 1:1 with that same
+    // sub-rect, so the glow sits correctly ON the shrunken picture.
+    //
+    // Every way in was reachable and none was exotic:
+    //   - the dev-panel slider with the feature off — and that is the ONLY control a player can
+    //     actually touch, since `upscaleEnable` is init-time and deliberately has no checkbox;
+    //   - MSAA on, where the guard REFUSES the backend (resolve_sc4.frag binds a Tex2DMS) under a
+    //     comment promising it "falls back to today's frame". It did not: the rect had already
+    //     narrowed, and a refusal that leaves the input rect narrowed is the fallback being the bug
+    //     ([[feedback_guard_fallback_is_the_bug]]);
+    //   - a failed init/bind, same shape;
+    //   - the first frame of every session, before the LAZY buildOpaquePath has armed anything.
+    //
+    // So the invariant is ENFORCED at the one site that authors the rect instead of asserted at the
+    // four sites that must not violate it: **the input rect may narrow only while something exists
+    // to widen it back.** Which is 4a's own rule restored — its kHostInputScale was pinned at 1.0
+    // under the note that "a knob nothing can consume is a knob that only breaks things", and 4b
+    // built the consumer without teaching the knob to check that the consumer was there.
+    //
+    // No mid-frame rect mutation is needed to recover: the client restamps setRenderSize EVERY frame
+    // (ipc/server.cpp), so the frame after the lazy arm is the one that derives the narrowed rect.
+    inline float upscaleScale() {
+        if (!g_upscaleEnable || g_upscaleName == nullptr) { return 1.0f; }
+        return (g_upscaleInputScale < 0.33f) ? 0.33f
+             : ((g_upscaleInputScale > 1.0f) ? 1.0f : g_upscaleInputScale);
+    }
+    // Defined further down, beside setRenderSize; declared here because the backend's arm site in
+    // buildOpaquePath — thousands of lines above it — has to re-emit the line. See its definition.
+    void logRectLine();
+
+
     // --- BLOOM pyramid (tasks/forge-postprocess.md step 4) ---------------------------------------
     // Declared up here, well before the g_bloom* knob block, only because kBloomSetCount sizes the
     // per-level cbuffer array inside LiveRenderer below — the same reason kSunCascades is up here.
     //
-    // 7 levels off a HALF-res mip 0, so at a 2048x1536 render rect the chain is 1024x768, 512x384,
+    // 7 levels off a HALF-res mip 0, so at a 2048x1536 delivered rect the chain is 1024x768, 512x384,
     // 256x192, 128x96, 64x48, 32x24, 16x12 and the coarsest level's texel covers 1/16th of the frame
     // width. That is the bloom's angular REACH. The count is fixed at the PYRAMID while the ACTIVE
-    // level count is derived per frame from the render rect (bloomLevels(), further down): the reach
-    // then follows the render-scale slider for free instead of shrinking when the slider moves, which
-    // is verification step 6 of the plan.
+    // level count is derived per frame from the DELIVERED rect (bloomLevels(), further down): the
+    // reach then follows the render-scale slider for free instead of shrinking when the slider moves.
+    //
+    // ⚠ **DELIVERED**, NOT RASTER, SINCE M1 4c — and the difference is a whole OCTAVE. Until 4c this
+    // read g_live.width, so at 1680x1050 out it returned 7 while inputScale 0.5 (raster 840x524)
+    // returned 6: measured in the heartbeat as `bloom 0.11(L7) -> 0.05(L6)`. A resolution slider was
+    // changing the bloom's angular reach — a LOOK change caused by an upscaler — and no tap rescale
+    // could fix it, because what was wrong is the pyramid's EXTENT and not the coordinate. The
+    // invariant this comment always claimed was written when there was ONE rect; with two, the rect
+    // it has to follow is the image the resolve actually delivers.
     constexpr uint32_t kBloomMipCount = 7;
     // 13 descriptor-set instances: [0] prefilter (-> mip 0), [1..6] downsample (mip i-1 -> mip i),
     // [7..12] upsample (mip j+1 -> INTO mip j, j = 0..5). Each instance carries its OWN params
     // cbuffer, holding that level's src/dst RENDER rects — the one thing GetDimensions cannot supply.
+    //
+    // ⚠ 4c BRIEFLY MADE THIS 14, and the fourteenth is GONE again — which is the clearest single
+    // statement of what the follow-up decided. It was a second prefilter instance binding the
+    // UPSCALER'S OUTPUT, needed only while bloom read the upscaled frame. Bloom now reads
+    // pSceneColor at every scale (the prefilter resamples the RASTER rect into a mip 0 sized from
+    // the DELIVERED rect — bloomprefilter.comp.fsl), so there is only ever ONE source and the second
+    // instance has nothing to bind. It also takes the MSAA type hazard with it: gBloomSceneTex is
+    // pSceneColor, so it is a Tex2DMS exactly when the pass is the SAMPLE_COUNT > 1 variant, always.
     constexpr uint32_t kBloomSetCount = 1 + (kBloomMipCount - 1) + (kBloomMipCount - 1);
     // Set-index helpers, so the build loop and the dispatch loop cannot drift apart. The failure mode
     // of two hand-written index expressions is a level filtering from the wrong source mip, which
@@ -1273,15 +1524,38 @@ namespace {
         CmdPool*        pAuxCmdPool = nullptr;
         Cmd*            pAuxCmd = nullptr;
         Fence*          pAuxFence = nullptr;
-        uint32_t        width = 0, height = 0;         // CURRENT render size (<= alloc); per-frame viewport
+        // --- THE THREE RECTS (tasks/forge-upscale.md M1 step 4a) ---------------------------------
+        // alloc >= out >= in, and they answer three different questions:
+        //   alloc — what every screen-sized target is ALLOCATED at (ceiling render-scale x
+        //           backbuffer). Fixed at init; nothing per-frame may exceed it.
+        //   out   — the rect the client COMPOSITES: the delivered image inside pRT. This is what
+        //           setRenderSize() is handed, because renderprocess.cpp stretches exactly the
+        //           [0, g_rw/g_w] sub-rect to the backbuffer. Viewport of every draw INTO pRT.
+        //   in    — where the scene actually RASTERISES. Viewport of every scene pass and the basis
+        //           of every screen-space dispatch, invScreen, froxel tile, Hi-Z level, AO pass,
+        //           jitter NDC and motion-vector parameter.
+        // ⚠ `width/height` IS `in`. That is what 105 of its 119 readers already meant, so the field
+        // keeps the short name and the seven DELIVERY sites took the new one — the split is where
+        // the readers already were, not a rename of the majority. They are equal until an upscaler
+        // exists to make them differ (kHostInputScale is 1.0 in 4a).
+        uint32_t        width = 0, height = 0;         // INPUT: scene raster rect (<= out)
+        uint32_t        outWidth = 0, outHeight = 0;   // OUTPUT: delivered rect inside pRT (<= alloc)
         uint32_t        allocWidth = 0, allocHeight = 0; // fixed RT allocation size (ceiling scale x backbuffer)
         bool            firstFrame = true;
 
         // MSAA: requested sample count (1 = off, validated against the device in init).
-        // >1 ⇒ the scene renders into pMSAAColor (+ MSAA pDepth) and resolves into the
+        // >1 ⇒ the scene renders into pSceneColor (+ MSAA pDepth) and resolves into the
         // shared single-sample pRT before the D3D9 handoff (the shared RT can't be MSAA).
         uint32_t        sampleCount = 1;
-        RenderTarget*   pMSAAColor = nullptr;     // internal MSAA color (null when sampleCount==1)
+        // THE INTERNAL SCENE COLOUR TARGET — the surface the frame is BUILT on, as opposed to pRT,
+        // which is what it is DELIVERED in. Non-null whenever the two differ, which is now either of
+        // two independent reasons and NOT just MSAA:
+        //   (1) sampleCount > 1  — pRT is the shared cross-process resource and cannot be MSAA;
+        //   (2) sceneReferred    — pRT is BGRA8 and cannot hold radiance (M0, tasks/forge-upscale.md).
+        // ⚠ IT WAS CALLED pMSAAColor AND IT IS NOT AN MSAA FLAG. Renamed behaviour-free ahead of M0
+        // precisely because the old name invited `pMSAAColor != nullptr` to be read as "MSAA is on" —
+        // a comment in the bloom block did exactly that. Ask sampleCount when you mean sample count.
+        RenderTarget*   pSceneColor = nullptr;     // null only when the scene renders straight into pRT
         uint32_t        anisoLevel = 0;           // texture sampler max anisotropy (0 = linear); Phase 2
 
         // --- SCENE COLOUR FORMAT (tasks/forge-postprocess.md step 4: the fp16 bandwidth probe) ------
@@ -1290,25 +1564,36 @@ namespace {
         // delivery format because of it.
         //
         // Everything that shares a PSO must share this format, and that set is bigger than it looks:
-        // pSkyPipeline draws into pMSAAColor in the main pass AND into pReflectColor in the mirror
+        // pSkyPipeline draws into pSceneColor in the main pass AND into pReflectColor in the mirror
         // pass, so the reflection RT is NOT a free choice — it moves with the scene. The copy/resolve
         // destinations follow for the same reason (a resolve's src and dst formats must match):
-        //   pMSAAColor, pReflectColor, pRefractColor, pSkyColor, pReflectSkyColor.
+        //   pSceneColor, pReflectColor, pRefractColor, pSkyColor, pReflectSkyColor.
         // pRT / pSharedRes stay B8G8R8A8 — that is the cross-process contract, and converting into it
         // is precisely what the shader resolve exists to do.
         //
-        // ⚠ REQUIRES MSAA. At sampleCount==1 the scene renders STRAIGHT into pRT (there is no internal
-        // colour target and no resolve pass to convert in), so there is nowhere for a wider format to
-        // live. Step 6 has to decide whether the 1x path gets its own staging target or whether HDR
-        // simply requires MSAA; until then this silently stays LDR at 1x rather than failing.
+        // ⚠ IT USED TO REQUIRE MSAA, AND NO LONGER DOES (M0, tasks/forge-upscale.md). The old note here
+        // read "at sampleCount==1 the scene renders STRAIGHT into pRT, so there is nowhere for a wider
+        // format to live; step 6 has to decide whether the 1x path gets its own staging target or
+        // whether HDR simply requires MSAA". It gets its own staging target. pSceneColor is now
+        // created for EITHER reason (MSAA, or scene-referred), the resolve grew a SAMPLE_COUNT 1
+        // variant, and 1x is a first-class path rather than a silent downgrade to LDR.
+        //
+        // WHY THE ANSWER CAME OUT THAT WAY. A temporal upscaler eats single-sample linear HDR — MSAA
+        // and DLSS/FSR2 are mutually exclusive by construction — so "HDR requires MSAA" would have
+        // made the upscaler and the tone curve mutually exclusive too. The staging target costs one
+        // fp16 alloc at 1x and closes a standing TODO in the same move.
         TinyImageFormat sceneColorFormat = TinyImageFormat_B8G8R8A8_UNORM;
 
         // ...and what the target's CONTENTS MEAN, which step 6a made a separate question from what
-        // they are stored as — but NOT a separate switch. `sceneReferred` is the folded
-        // `g_hdrSceneColor && sampleCount > 1` decided in the same breath as the format above, and
-        // it is the ONLY place either half is evaluated: every receiver (the colour frags via
-        // gShadowParams.toneParams.x, resolve.frag via gResolveParams.opts.y) reads this bit and
-        // never asks about a format or a sample count.
+        // they are stored as — but NOT a separate switch. `sceneReferred` IS `g_hdrSceneColor`,
+        // decided in the same breath as the format above, and it is the ONLY place that request is
+        // evaluated: every receiver (the colour frags via gShadowParams.toneParams.x, resolve.frag
+        // via gResolveParams.opts.y) reads this bit and never asks about a format or a sample count.
+        //
+        // ⚠ M0 DROPPED THE `&& sampleCount > 1` HALF (tasks/forge-upscale.md). It was never about
+        // sample count — it was "is there an internal target to be wide", and now there always is
+        // when this is set. The dependency runs the other way round: pSceneColor is created BECAUSE
+        // this is true. Anything still reading sampleCount to infer the colour domain is a bug.
         //
         // The two must move together. Scene-referred values exceed 1.0 by construction — that is the
         // whole point, it is what bloom reads and what a lantern rolls off from — and writing them
@@ -1383,6 +1668,38 @@ namespace {
         // Sequenced between the Z-prepass and the colour pass in renderScene. Tier 2 feeds ONLY the
         // F12 debug views (modes 3/4); Tier 3 will read pAO in the colour frags.
         Texture*       pLinearDepth = nullptr;    // single-sample R32F resolved DEVICE depth (SRV+UAV)
+
+        // --- M1 CAMERA-ONLY MOTION VECTORS (tasks/forge-upscale.md) --------------------------------
+        // R16G16_SFLOAT screen-space motion in RENDER-rect PIXELS, previous-minus-current. One
+        // compute dispatch at the colour->water seam, reading pLinearDepth (which holds RAW device
+        // depth despite its name) and two camera matrices. See motionvectors.srt.h for the space and
+        // for the bakeEye hazard, which is the whole difficulty of this pass.
+        Texture*       pMotionVectors = nullptr;
+        Shader*        pMvShader = nullptr;
+        Pipeline*      pMvPipeline = nullptr;
+        DescriptorSet* pMvSet = nullptr;
+        Buffer*        pMvParamsCbv = nullptr;
+        // THE FIELD'S OWN STATISTICS (motionvectors.srt.h gMvStats): 4 uints, max/min |mv| as
+        // asuint plus two counters. pMvStatsReset is a 16-byte UPLOAD buffer holding the per-frame
+        // reset values, copied in before the dispatch — a CopyBufferRegion rather than a clear
+        // dispatch or a ClearUnorderedAccessViewUint, because it needs no shader and no CPU-visible
+        // descriptor handle. pMvStatsReadback is read one frame late, exactly like pAplReadback.
+        Buffer*        pMvStats = nullptr;
+        Buffer*        pMvStatsReset = nullptr;
+        Buffer*        pMvStatsReadback = nullptr;
+        // M1 step 3: the REACTIVE MASK and the one input it needs. pMvPrevDepth is last frame's
+        // pLinearDepth, copied at the tail of the dispatch; pMvReactive is the R8 mask. See
+        // motionvectors.srt.h for why the mask is DERIVED from a reprojection-consistency test
+        // rather than drawn by the dynamic lanes — the stencil bit the plan assumed does not exist
+        // in this renderer, and the alternative was six shaders and a replayed draw loop.
+        Texture*       pMvPrevDepth = nullptr;
+        Texture*       pMvReactive = nullptr;
+        bool           mvReady = false;
+        // ...and the vectors LOOKED AT (F12 mode 17). Its own shader + PSO, drawn fullscreen in the
+        // post-everything overlay block. NON-FATAL and independent of mvReady: a failed debug view
+        // must not take the pass with it.
+        Shader*        pMvViewShader = nullptr;
+        Pipeline*      pMvViewPipeline = nullptr;
         Texture*       pAO = nullptr;             // RGBA16F AO (rgb = bent normal, a = visibility) (SRV+UAV)
         Texture*       pAOBlur = nullptr;         // RGBA16F bilateral-blurred AO (the frags' gAO) (SRV+UAV)
         Shader*        pLinearizeShader = nullptr;
@@ -1413,8 +1730,19 @@ namespace {
         Pipeline*      pResolvePipeline  = nullptr;   // fullscreen tri into pRT (single-sample), depth OFF, no blend
         DescriptorSet* pResolveSet       = nullptr;   // ResolveSrtData PerDraw: cbv + MSAA colour SRV + bloom SRV
         Buffer*        pResolveParamsCbv = nullptr;   // ResolveParams (dims + opts), persistent-mapped
+        // --- M1 step 4b: THE UPSCALER (tasks/forge-upscale.md) -----------------------------------
+        // The only thing the renderer holds is the SEAM's pointer — no target, no pipeline, no set.
+        // All of that belongs to the backend (upscale.cpp), which is the property that makes 4d's
+        // NGX backend a drop-in rather than a second set of hooks into this file.
+        //
+        // ⚠ null WHENEVER THE FEATURE IS OFF OR DECLINED, and that is not merely a flag:
+        // createPassthroughUpscaler is not even called unless g_upscaleEnable survives the guards, so
+        // the ~56 MB alloc-sized fp16 target costs nothing under `upscaleEnable=0` or behind a
+        // refusal (MSAA). It IS allocated in the shipped default now, which arms the backend so the
+        // panel's input-scale slider has a consumer; at scale 1.0 that allocation is its whole cost.
+        IUpscaler*     pUpscaler = nullptr;
         // --- BLOOM (tasks/forge-postprocess.md step 4) ------------------------------------------
-        // The pyramid pMSAAColor feeds and resolve.frag composites back in. Half of the ALLOCATION,
+        // The pyramid pSceneColor feeds and resolve.frag composites back in. Half of the ALLOCATION,
         // 7 mips, always fp16 — alloc-sized like every other screen RT so a live render-scale change
         // needs no reallocation (setRenderSize), and fp16 regardless of sceneColorFormat for
         // reflectmip.srt.h's two reasons (BGRA8 is not in TypedUAVLoadAdditionalFormats; it decouples
@@ -1884,15 +2212,36 @@ namespace {
         // the sky pass already switches between.
         Buffer*        pSkyViewCbv[2] = { nullptr, nullptr };
 
-        // --- P2: the C++/FSL cross-check (hosekcheck.comp) ---------------------------------------
-        // One dispatch per host session. The model is evaluated twice — C++ for the SH (the light),
-        // FSL for the pixels — and this measures that they agree instead of asserting it.
-        Shader*        pHosekCheckShader = nullptr;
-        Pipeline*      pHosekCheckPipeline = nullptr;
-        DescriptorSet* pHosekCheckSet = nullptr;
-        Buffer*        pHosekDirsBuf = nullptr;            // Buffer<float4>[kHosekCheckDirs], the probe set
-        Buffer*        pHosekOutBuf = nullptr;             // RWBuffer<uint>[kHosekCheckDirs*4], GPU only
-        Buffer*        pHosekReadback = nullptr;           // GPU_TO_CPU, persistent-mapped (post-fence read)
+        // --- S2: THE ATMOSPHERE's LUT chain (tasks/forge-atmosphere.md) --------------------------
+        // Four compute passes over ONE SRT, four set instances. The three textures are RGBA16F and
+        // are rebuilt EVERY frame — which is the load-bearing choice, not a performance note: it is
+        // what lets the medium's parameters move CONTINUOUSLY, and a weather sub-simulation is
+        // exactly a continuous walk through parameter space. Bruneton's original offline precompute
+        // would have forced weather to be a cross-fade between frozen presets. ~310 KB of VRAM.
+        //
+        // ⚠ THIS REPLACED THE HOSEK C++/FSL CROSS-CHECK THAT USED TO LIVE HERE, and the replacement
+        // is not like-for-like: there is no longer a second evaluation to cross-check. atmos_sh.comp
+        // measures the very sky-view LUT the pixels are sampled from, so the LIGHT is a measurement
+        // OF THE DRAWN SKY rather than a parallel derivation of it. The drift the check existed to
+        // catch is deleted rather than instrumented.
+        Texture*       pAtmosTransmittance = nullptr;      // kAtmosTransW x kAtmosTransH RGBA16F
+        Texture*       pAtmosMultiScatter  = nullptr;      // kAtmosMsRes^2 RGBA16F
+        Texture*       pAtmosSkyView       = nullptr;      // kAtmosSkyW x kAtmosSkyH RGBA16F
+        Buffer*        pAtmosParamsCbv     = nullptr;      // gAtmosParams (13 float4)
+        Shader*        pAtmosTransShader   = nullptr;
+        Shader*        pAtmosMsShader      = nullptr;
+        Shader*        pAtmosSkyShader     = nullptr;
+        Shader*        pAtmosShShader      = nullptr;
+        Pipeline*      pAtmosTransPipeline = nullptr;
+        Pipeline*      pAtmosMsPipeline    = nullptr;
+        Pipeline*      pAtmosSkyPipeline   = nullptr;
+        Pipeline*      pAtmosShPipeline    = nullptr;
+        DescriptorSet* pAtmosSet           = nullptr;      // ONE set, 4 instances (atmosphere.srt.h)
+        Buffer*        pAtmosShOut         = nullptr;      // RWBuffer<uint>[kAtmosShUints], GPU only
+        Buffer*        pAtmosShReadback    = nullptr;      // GPU_TO_CPU, persistent-mapped (post-fence)
+        Shader*        pAtmosViewShader    = nullptr;      // shadowatlasview.vert + atmosview.frag
+        Pipeline*      pAtmosViewPipeline  = nullptr;      // F12 15 / 16
+        bool           atmosReady          = false;
 
         // --- FP1a: first-person pass (arms/weapon, after sorted-alpha, fresh depth) ---
         // The arm scene has its OWN camera (fpViewProj crossing) and MW z-clears before
@@ -1957,7 +2306,7 @@ namespace {
         Pipeline*      pAlphaPrepassPipelineBackMirror = nullptr; // cull BACK, FRONT_FACE_CW
         // Alpha SHADOW-RECEIVE depth: a DEDICATED single-sample D32 scratch (SRV-readable as R32F,
         // like pShadowAtlas). The same alpha geometry is re-rendered here at the LOWER shadow-receive
-        // threshold (froxelZ.z) via alphashadowdepth.frag, decoupled from the 0.95 fold-fix pDepth;
+        // threshold (alphaShadowParams.x) via alphashadowdepth.frag, decoupled from the 0.95 fold-fix pDepth;
         // the alpha shadow-mask refresh reconstructs from it so near-opaque sheets receive their own
         // point-light shadow. Rests SHADER_RESOURCE; flips to DEPTH_WRITE only while being drawn.
         RenderTarget*  pAlphaShadowDepth = nullptr;
@@ -2216,6 +2565,45 @@ namespace {
     };
     LiveRenderer g_live;
 
+    // The `[rect]` line, factored out because TWO places have to be able to emit it (M1 4b).
+    //
+    // ⚠ THE BACKEND'S NAME IS ON IT, and it is not decoration: at scale 1.0 an absent upscaler and a
+    // working one produce the identical frame — the identity fast path working as designed — so this
+    // log is the ONLY thing that can tell "the backend declined at startup" from "the backend is
+    // fine and the scale is 1".
+    //
+    // ⚠⚠ WHICH IS EXACTLY WHY IT NEEDS A SECOND CALLER. setRenderSize runs during the CLIENT
+    // HANDSHAKE; the backend is created in buildOpaquePath, which is LAZY — deferred to the first
+    // renderScene so geometry upload runs on a clean resource loader. So the first `[rect]` line of
+    // every session is printed before any backend can exist and says `upscaler=none` **while the
+    // backend is about to arm**. Measured in the first 4b harness run: `in=840x524 out=1680x1050
+    // inputScale=0.500 upscaler=none` two lines above `backend 'passthrough' ready`. A field that
+    // is not merely missing but actively WRONG is worse than no field, so the arm site re-emits it.
+    //
+    // ⚠ inputScale IS THE EFFECTIVE ONE — upscaleScale(), which returns 1.0 whenever no backend is
+    // armed, because this line's job is to describe the rect the renderer USED. A knob that is being
+    // ignored is then a silent difference between what was set and what is drawn, so it is named:
+    // `upscaler=none` says the feature is absent, and the INERT note says the slider was moved
+    // anyway. That pairing is the whole diagnosis of "scale shrinks the view" on one line.
+    void logRectLine() {
+        char knobNote[48];
+        knobNote[0] = '\0';
+        if (g_upscaleName == nullptr && g_upscaleInputScale < 0.999f) {
+            std::snprintf(knobNote, sizeof(knobNote), " (knob %.3f INERT)",
+                          (double)g_upscaleInputScale);
+        } else if (upscaleScale() < 0.999f && g_live.width == g_live.outWidth) {
+            // The one transient: the backend armed mid-frame, so the scale is live but the rect it
+            // narrows is still the one the last setRenderSize authored. Named rather than smoothed
+            // over, because `in == out` beside `inputScale=0.500` otherwise reads as a bug.
+            std::snprintf(knobNote, sizeof(knobNote), " (rect PENDING)");
+        }
+        LOG::logline(">> [rect] in=%ux%u out=%ux%u alloc=%ux%u inputScale=%.3f%s upscaler=%s",
+                     g_live.width, g_live.height, g_live.outWidth, g_live.outHeight,
+                     g_live.allocWidth, g_live.allocHeight, (double)upscaleScale(), knobNote,
+                     g_upscaleName ? g_upscaleName : "none");
+        LOG::flush();
+    }
+
     // Mega-arena INITIAL sizes. Holds the resident static-opaque working set (engine ~100m +
     // MGE LOD ~16 cells). Showcase-scale interiors can need several times this, so on
     // arena-full the arena GROWS by doubling (growArenaBuffer: new buffer, GPU copy-in-place,
@@ -2425,6 +2813,26 @@ namespace {
            kGpuPhaseBloom,      // step 4 bloom pyramid (prefilter + down + up), immediately before Resolve
            kGpuPhaseCaustic,    // W23/W24 caustic scatters + resolves (pure compute, beside the ripple sim)
            kGpuPhaseGrassCrush, // G7 crush field: seed + scatter + resolve (pure compute, same block)
+           // S2a: the atmosphere's four-dispatch LUT chain, at the top of the frame beside the
+           // sky-height and sun-occlusion rebuilds. ⚠ ADDED IN S2a RATHER THAN WHEN IT GOT
+           // EXPENSIVE, which is the point: nothing samples the LUTs in S2a, so a cost line is one
+           // of only two pieces of evidence the chain ran at all (the other is the F12 view). A
+           // pass whose cost first appears three sub-steps later has no baseline to be compared to.
+           kGpuPhaseAtmos,
+           // M1: the camera-only motion-vector dispatch (tasks/forge-upscale.md), at the
+           // colour->water seam. ⚠ BRACKETED WHEN IT LANDS, not when it gets expensive — the same
+           // call kGpuPhaseAtmos records above it, and kGpuPhaseShadowSun's note is the cautionary
+           // tale: a pass with no timer of its own turns the next unexplained spike into a
+           // subtraction between two other numbers. It is also the baseline the DLSS comparison will
+           // be measured against, and a baseline nobody recorded is not one.
+           kGpuPhaseMotionVec,
+           // M1 step 4b: the UPSCALE pass (tasks/forge-upscale.md), immediately before the bloom
+           // block. ⚠ ON THE LINE FROM THE FIRST BUILD, the same call kGpuPhaseAtmos and
+           // kGpuPhaseMotionVec record above it — a pass whose cost first appears three sub-steps
+           // later has no baseline to be compared against, and this one's whole verification rests
+           // on `gpu=` DROPPING while `upscale=` APPEARS. Without both halves visible, "the input
+           // rect really shrank" and "the viewport was merely clamped" are the same log.
+           kGpuPhaseUpscale,
            kGpuPhaseCount };
 
     // FP1a first-person pass caps: one 64KB world window bounds the rigid list at 1024,
@@ -3184,6 +3592,29 @@ namespace {
     // Below the eye's horizontal plane saturate(dir.z) is 0 and this is inert at ANY strength, which
     // is why the ground, the sea and everything under the horizon cannot move: the negative control.
     float              g_fogSkyStrength  = 1.0f;
+    // ─── THE TWO FOG LOOK LANES (gFrameData.froxelZ.zw) ──────────────────────────────────────────
+    // ⚠ BOTH DEFAULT TO THE SHIPPED IMAGE, so this pair changes nothing until somebody turns a
+    // slider. They exist because the two constants they replace were `#define`s in headers that
+    // reach opaque/statics/terrain/alpha/multimap — none of which hot-reload — so dialling either
+    // cost a full host restart, which is why neither had ever been dialled against the thing it
+    // controls. skydome.h.fsl's own note asked for the first one by name.
+    //
+    // ⚠ AND THEY ARE LOOK KNOBS, DELIBERATELY. Morrowind's fog is authored, not measured, and both
+    // of the defects these address are visible-in-play judgements about an artist-driven game rather
+    // than gaps against a physical reference. Neither is trying to be right; both are trying to let
+    // the person looking at the screen close a gap they can see.
+    //
+    // THE KNEE. Below it applyFog()'s target is flat fogColNear; above it the sampled sky fades in.
+    // fogSkyColor() — the water's reflection-hole fill — has NO knee (share 1.0), so a reflected
+    // static melting toward MW's authored colour sits directly against a hole filled with the real
+    // sky: ~31700 vs ~90500 cd/m2 in clear weather, a 2.9x step, reported as "static reflections are
+    // fogged brighter blue while statics assume MW fog color". LOWER closes it.
+    float              g_fogSkyKnee      = 0.85f;
+    // THE NEAR HAZE, density per world unit. MW's ramp is exactly clear inside fogStart — ~490 m in
+    // clear weather at 16 cells — so the whole near and middle field has no air in it, reported as
+    // "close fog being ignored". A Beer-Lambert term from the EYE fills that dead zone without
+    // moving the fog wall. 0 = off = bit-identical. 1e-5 is ~10% opacity at 100 m.
+    float              g_fogNearHaze     = 0.0f;
 
     // --- LIFTING AUTHORED FOG INTO SCENE-REFERRED UNITS (step 6a) --------------------------------
     // A C++ mirror of tonemap.h.fsl's curve, and its inverse. It exists for exactly one input:
@@ -4292,7 +4723,17 @@ namespace {
     // functions), because publishSkyAmbientSH below is its first READER and lives in this
     // anonymous namespace. One frame's worth of state, produced at exactly one site.
     struct SkyPhysical {
-        Hosek::State st;            // the cooked model — uploaded verbatim to gSkyView
+        // ─── S2: WHAT USED TO BE A COOKED MODEL IS NOW A CONFIGURATION OF A MEDIUM ───────────────
+        // This held `Hosek::State` — 30 coefficients that WERE the sky, uploaded verbatim to
+        // gSkyView and evaluated a second time in FSL. There is nothing to cook any more: the medium
+        // is three LUTs the GPU rebuilds each frame, and what the host has to know about them is
+        // only where the sun is and how far up the camera stands. The LIGHT below no longer comes
+        // from a CPU integral of a closed form either — it is READ BACK from atmos_sh.comp, which
+        // measures the same texture the pixels come from.
+        float  toSun[3];            // unit vector TOWARD the sun (world, MW Z up) — the DISC's
+        float  cameraRadiusM;       // metres from the planet centre; the LUTs' altitude coordinate
+        float  turbidity;           // reported only — the S1 medium's aerosol scale, for the log
+        float  albedo;              // the ground boundary condition the multiscatter LUT bounces off
         float  ambScene[3];         // the SH DC in SCENE units: ambCol's physical value
         float  sunScene[3];         // E_sun_normal / pi in SCENE units: sunCol's physical value
         float  sh[4][3];            // [0..2] = the L1 lobe / DC (a direction FACTOR), [3] = DC = 1
@@ -4307,8 +4748,22 @@ namespace {
         float  elevDisc;            // reported: the DISC's elevation (degrees), UNCLAMPED. st.elevation
                                     // is the COOKED one and is clamped at 0, so it cannot show the
                                     // twilight crossing the night ramp now runs across (-4..0 deg)
-        double zenithScene;         // reported: the DRAWN zenith's luma in SCENE units (ramp folded
-                                    // in), i.e. the level the star radiance has to sit under by day
+        double zenithScene;         // reported: the DRAWN zenith's luma in SCENE units, i.e. the
+                                    // level the star radiance has to sit under by day
+        float  zenithNative[3];     // reported PER CHANNEL: the zenith in native units, which is one
+                                    // multiply from cd/m2 — the NIT row of the S2b gate, and the one
+                                    // reading a luma cannot make (a zenith at the right BRIGHTNESS
+                                    // and the wrong COLOUR passes every scale-free test there is)
+        float  horizonNative[3];    // ...and the horizon probe, so "horizon brighter than zenith"
+                                    // is a comparison rather than an impression
+        float  belowNative[3];      // ⚠ NOT A SKY READING. 10 deg BELOW the horizon: the value every
+                                    // DOWNWARD pixel's fog melts into now that skyhw.frag is opaque
+                                    // there. It is printed beside the scene-referred fogColNear the
+                                    // land melts into, because those two being different colours in
+                                    // one frame is a reportable defect and nothing else measures it.
+        double ev100;               // reported: Sunny-16's own number. A clear noon must land on 15,
+                                    // with no camera model implemented and no behaviour changed —
+                                    // a prediction nobody tuned to is the only kind that can fail
         // --- P2b: THE SUN DISC AS A RADIANCE, measured from MW's OWN quad --------------------------
         float  sunDiscL[3];         // E_normal / Omega_sprite, SCENE units, per channel
         float  sunDiscOmega;        // Omega_sprite, STERADIANS — the finding, not a constant
@@ -4322,13 +4777,78 @@ namespace {
     };
     SkyPhysical g_skyPhys = {};
 
-    // MUST match HOSEK_CHECK_THREADS in hosekcheck.comp.fsl — the dispatch is one group and the
-    // shader early-outs past this, so a mismatch silently checks fewer directions than it reports.
-    constexpr uint32_t kHosekCheckDirs = 64;
-    // 0 = waiting for a frame with real coefficients, 1 = dispatched (waiting on the fence),
-    // 2 = reported. Runs ONCE per host session: it is a self-test, not an instrument.
-    uint32_t g_hosekCheckState = 0;
-    uint32_t g_hosekCheckArmedFrame = 0;
+    // ─── S2: THE ATMOSPHERE'S LUT DIMENSIONS ─────────────────────────────────────────────────────
+    // Hillaire's published sizes. They are small because the PARAMETERISATIONS are chosen to put
+    // texels where the derivative is — the sky-view LUT's v axis splits at the horizon and is
+    // squared on both sides (atmosphere.h.fsl), so the two degrees either side of the skyline, where
+    // a sky's brightness triples, get as many texels as the empty forty around the zenith. A
+    // linear-in-angle mapping at this resolution would band visibly at the horizon.
+    //
+    // ⚠ THESE ARE PUBLISHED INTO THE PARAMS CBUFFER AND THE SHADERS READ THEM FROM THERE. Nothing
+    // hardcodes a dimension, because the (de)parameterisation needs the size and a shader holding
+    // its own copy is the two-copies problem in miniature.
+    constexpr uint32_t kAtmosTransW  = 256;
+    constexpr uint32_t kAtmosTransH  = 64;
+    constexpr uint32_t kAtmosMsRes   = 32;
+    constexpr uint32_t kAtmosSkyW    = 192;
+    constexpr uint32_t kAtmosSkyH    = 108;
+    // MUST match ATMOS_SH_THREADS in atmos_sh.comp.fsl — the dispatch is ONE group and the shader's
+    // Fibonacci direction depends on the count, so a mismatch does not fail, it silently integrates
+    // a different sphere. It is also scenecal.h's kFibDirs, which is the whole point: the historical
+    // measurements this is compared against came off that table.
+    constexpr uint32_t kAtmosShThreads = 128;
+    static_assert(kAtmosShThreads == (uint32_t)SceneCal::kFibDirs,
+                  "atmos_sh.comp integrates SceneCal's Fibonacci sphere — the counts must agree");
+    // The readback's uint layout, mirroring atmos_sh.comp.fsl's stores. Named rather than numbered,
+    // because a readback whose fields are addressed by literal offsets is a struct nobody can edit.
+    enum {
+        kAtmosShC00 = 0,      // 3 floats: the Y00 lobe, per channel
+        kAtmosShC1x = 3,      // 3 floats: the Y1 . x lobe
+        kAtmosShC1y = 6,
+        kAtmosShC1z = 9,
+        kAtmosShEsky = 12,    // 3 floats: cosine-weighted UPPER-hemisphere irradiance, native units
+        kAtmosShEsun = 15,    // 3 floats: DIRECT-NORMAL solar irradiance — a PREDICTION, not a solve
+        kAtmosShZenith = 18,  // 3 floats: L at the zenith, native units
+        kAtmosShHorizon = 21, // 3 floats: L one degree above the horizon, away from the sun
+        kAtmosShRan = 24,     // 1 uint: the "this dispatch actually ran" tell
+        kAtmosShBelow = 25,   // 3 floats: L 10 deg BELOW the horizon, away from the sun. NOT a sky
+                              // reading - it is the FOG TARGET every downward pixel melts into now
+                              // that skyhw.frag is opaque below the horizon (see atmos_sh.comp.fsl).
+                              // ⚠ Sits ABOVE kAtmosShRan, so the float drain below cannot pick it up
+                              // in the same loop and copies it separately - see the drain.
+        // S4a: the multiscatter geometric series' raw, UNCLAMPED ratio f, read back at the DECK's own
+        // altitude. atmos_multiscatter sums the higher orders as F = 1/(1-f) behind
+        // f = min(fms, 0.98); clear air runs f ~0.05 and the guard never fires, but a conservative
+        // cloud drives f toward 1 and walks straight into it. A clamped LUT and an unclamped one look
+        // identical from outside — both finite, both plausible — so this is the only thing that can
+        // say whether an overcast level miss is the CLOUD MODEL or that one line.
+        // ⚠ Sits ABOVE kAtmosShRan for the same reason kAtmosShBelow does: the float drain below
+        // stops at the "ran" tell so it cannot pick up a uint COUNT and print it as a denormal.
+        kAtmosShMsF = 28,     // 1 float
+        kAtmosShUints = 32,   // padded
+    };
+    // The gate + readback state machine. 0 = waiting for an armed frame, 1 = the GATE frame is in
+    // flight (reference parameters forced), 2 = the gate has been reported and the lane is live.
+    // ⚠ The gate runs ONCE per host session and the LUTs keep rebuilding from live weather after it
+    // — the reference forcing is one frame's cbuffer, not a mode.
+    uint32_t g_atmosGateState = 0;
+    uint32_t g_atmosGateFrame = 0;
+    // Has a readback ever landed? Until it has, the ambient holds MW's value (blend 0) — a DEFINED
+    // state, not a zero. There is no readback on the first two frames by construction.
+    bool     g_atmosShValid   = false;
+    // The last landed measurement, decoded from the readback's uints into floats ONCE at drain time.
+    // Held rather than re-read, because the readback buffer is GPU_TO_CPU and skyPhysicalMeasure
+    // runs at a completely different point in the frame — reading it there would race the copy.
+    float    g_atmosShLast[kAtmosShUints] = {};
+    // Was the SH dispatch armed this frame? The drain has to know: a frame that did NOT dispatch
+    // leaves the previous frame's bytes in the readback, and consuming those twice would silently
+    // double-count nothing at all — harmless — but the `ran` tell would also be stale, which is the
+    // one thing that must stay honest.
+    bool     g_atmosShArmed   = false;
+    // The shader's "this dispatch actually ran" tell, held for the gate report. ⚠ NOT COSMETIC: a
+    // readback of zeros and a sky that genuinely integrates to zero are the same 128 bytes, and one
+    // of those is a bug that would publish a black ambient and look exactly like midnight.
+    uint32_t g_atmosShLastRan = 0;
     // Has each view's gSkyView ever been filled? ⚠ NOT COSMETIC. The main view's publish rides
     // inside the `if (pShadowMaskParamsCbv)` block that owns the camera's inverse viewProj, so on
     // the "shadow resources failed to allocate" path the cbuffer would stay at its zero init — and a
@@ -4354,26 +4874,33 @@ namespace {
         if (!b || !b->pCpuMappedAddress) { return; }
         float* v = (float*)b->pCpuMappedAddress;
         std::memcpy(v, invVP, 16 * sizeof(float));
-        for (int i = 0; i < 9; ++i) {
-            v[16 + 4 * i + 0] = g_skyPhys.st.cfg[0][i];
-            v[16 + 4 * i + 1] = g_skyPhys.st.cfg[1][i];
-            v[16 + 4 * i + 2] = g_skyPhys.st.cfg[2][i];
-            v[16 + 4 * i + 3] = 0.0f;
-        }
-        v[52] = g_skyPhys.st.rad[0];
-        v[53] = g_skyPhys.st.rad[1];
-        v[54] = g_skyPhys.st.rad[2];
-        // The whole native -> scene conversion in ONE lane, night ramp and strength folded in, so no
-        // shader ever holds a piece of it. 0 is a legitimate value (night, interior, feature off) and
-        // skyhw.frag must read it as a black sky — NOT as a failed bind, which is the opposite of
-        // what P1's calParams.z lane meant and is called out in skyview.h.fsl for that reason.
-        v[55] = g_skyPhys.active ? g_skyPhys.sceneScale : 0.0f;
-        v[56] = g_skyPhys.st.toSun[0];
-        v[57] = g_skyPhys.st.toSun[1];
-        v[58] = g_skyPhys.st.toSun[2];
-        v[59] = g_skyPhys.nightRamp;
-        v[60] = g_skyPhys.active ? 1.0f : 0.0f;
-        v[61] = 0.0f; v[62] = 0.0f; v[63] = 0.0f;
+        // ⚠ S2 DELETED 36 FLOATS FROM THIS STRUCT — the nine cooked Hosek coefficients and the
+        // model's radiance term. A closed form has to be handed its configuration; a LUT does not,
+        // and the sky pass now samples gAtmosSkyView instead. Every field below shifted down by 36,
+        // and skyview.h.fsl is the layout's one authority.
+        v[16] = 0.0f; v[17] = 0.0f; v[18] = 0.0f;    // spare (was the model's radiance term)
+        // The whole native -> scene conversion in ONE lane, the strength folded in, so no shader ever
+        // holds a piece of it. 0 is a legitimate value (interior, feature off) and skyhw.frag must
+        // read it as a black sky — NOT as a failed bind, which is the opposite of what P1's
+        // calParams.z lane meant and is called out in skyview.h.fsl for that reason.
+        //
+        // ⚠ THE NIGHT RAMP IS NO LONGER IN THIS LANE (S2e). It used to fade the drawn sky to black
+        // because the closed form was undefined below the horizon; the medium computes twilight and
+        // carries a moon and an airglow floor, so the SKY half of the ramp's two jobs is retired.
+        // The LIGHTING half — handing the physical blend back to MW's authored night, which
+        // calTarget()'s night row is calibrated against — is untouched and still applied where the
+        // lighting blend is decoded. Splitting them wrong is what would move the night calibration
+        // silently, which is why they are split HERE, at the two sites, rather than in the ramp.
+        v[19] = g_skyPhys.active ? g_skyPhys.sceneScale : 0.0f;
+        v[20] = g_skyPhys.toSun[0];
+        v[21] = g_skyPhys.toSun[1];
+        v[22] = g_skyPhys.toSun[2];
+        // The camera's radius in the medium's own metres. The sky-view LUT is parameterised at the
+        // altitude it was cooked for, and skyhw.frag has only a direction — no world position — so
+        // the radius has to ride here or the deparameterisation reads the wrong row of the LUT.
+        v[23] = g_skyPhys.cameraRadiusM;
+        v[24] = g_skyPhys.active ? 1.0f : 0.0f;
+        v[25] = 0.0f; v[26] = 0.0f; v[27] = 0.0f;
         // P2b — the two sky ELEMENTS whose radiance the model sets rather than MW (skyview.h.fsl).
         // Identical in both views, like the coefficients: a moon's radiance does not depend on which
         // camera is looking at it. They ride here anyway, for the reason the coefficients do — the
@@ -4382,13 +4909,13 @@ namespace {
         // block (it is publishSkyAmbientSH's neighbour, and that has to sit beside the SH), so the
         // sliders are not in scope here — and that accident enforces the better shape anyway: the
         // measurement folds every knob in at its one site and this stays a pure publisher.
-        v[64] = g_skyPhys.sunDiscL[0];
-        v[65] = g_skyPhys.sunDiscL[1];
-        v[66] = g_skyPhys.sunDiscL[2];
-        v[67] = g_skyPhys.sunDiscExpand;
-        v[68] = g_skyPhys.starScene;
-        v[69] = g_skyPhys.cloudScene;
-        v[70] = 0.0f; v[71] = 0.0f;
+        v[28] = g_skyPhys.sunDiscL[0];
+        v[29] = g_skyPhys.sunDiscL[1];
+        v[30] = g_skyPhys.sunDiscL[2];
+        v[31] = g_skyPhys.sunDiscExpand;
+        v[32] = g_skyPhys.starScene;
+        v[33] = g_skyPhys.cloudScene;
+        v[34] = 0.0f; v[35] = 0.0f;
         g_skyViewPub[view] = true;
     }
 
@@ -6169,10 +6696,17 @@ namespace {
             }
         }
 
-        // MSAA: internal multisampled color target. The scene renders here; it's resolved
-        // into the shared single-sample pRT in renderScene. Only when sampleCount > 1 — at 1x
-        // the scene renders straight into pRT exactly as before (pMSAAColor stays null).
-        if (g_live.sampleCount > 1) {
+        // THE INTERNAL SCENE COLOUR TARGET. The scene renders here; the resolve pass converts it into
+        // the shared single-sample pRT in renderScene.
+        //
+        // ⚠ TWO INDEPENDENT REASONS TO EXIST, and M0 (tasks/forge-upscale.md) added the second:
+        //   (1) sampleCount > 1 — pRT is the shared cross-process resource and cannot be MSAA;
+        //   (2) sceneReferred   — pRT is BGRA8 and cannot hold radiance.
+        // Either one alone is sufficient, and the sample count of the target follows sampleCount
+        // either way, so reason (2) at 1x makes a plain single-sample fp16 RT. When NEITHER holds
+        // (LDR, no MSAA) this stays null and the scene renders straight into pRT exactly as before —
+        // that path is still live and is what worldViewer() runs on.
+        if (g_live.sampleCount > 1 || g_live.sceneReferred) {
             RenderTargetDesc cDesc = {};
             cDesc.mWidth = width;
             cDesc.mHeight = height;
@@ -6190,19 +6724,31 @@ namespace {
             cDesc.mClearValue.b = 0.0f;
             cDesc.mClearValue.a = 0.0f;   // transparent bg: resolves into pRT's coverage-mask alpha
             cDesc.mDescriptors = DESCRIPTOR_TYPE_TEXTURE;
-            cDesc.pName = "sceneMSAAColor";
-            addRenderTarget(R, &cDesc, &g_live.pMSAAColor);
-            if (!g_live.pMSAAColor) {
-                std::printf("[forge] addRenderTarget(MSAA color %ux) FAILED\n", g_live.sampleCount);
+            cDesc.pName = "sceneColor";
+            addRenderTarget(R, &cDesc, &g_live.pSceneColor);
+            if (!g_live.pSceneColor) {
+                std::printf("[forge] addRenderTarget(scene color %ux) FAILED\n", g_live.sampleCount);
                 return false;
             }
         }
         // The sample count is CLIENT-driven (Configuration.AALevel) and was never logged, so "is MSAA
-        // even on?" could only be inferred from the ini. State it.
-        LOG::logline(">> [msaa] sampleCount=%u (%s) %ux%u", g_live.sampleCount,
-                     (g_live.sampleCount > 1) ? "MSAA color RT + resolve" : "OFF — single-sample, no resolve",
-                     width, height);
+        // even on?" could only be inferred from the ini. State it — and say which of M0's two reasons
+        // put a scene target there, because "1x with a staging target" and "1x straight into pRT" are
+        // now different pipelines and the log is the only place that distinction is visible.
+        const char* msaaWhat = (g_live.sampleCount > 1)
+            ? (g_live.sceneReferred ? "MSAA color RT (fp16) + shader resolve"
+                                    : "MSAA color RT + resolve")
+            : (g_live.sceneReferred ? "OFF — single-sample fp16 staging RT + shader resolve"
+                                    : "OFF — single-sample, straight into pRT, no resolve");
+        LOG::logline(">> [msaa] sampleCount=%u (%s) %ux%u",
+                     g_live.sampleCount, msaaWhat, width, height);
         LOG::flush();
+        // ...and to STDOUT, for the reason the [scenefmt] block above gives: `--forge-scene` returns
+        // before main.cpp opens the MGE log, so LOG::logline is dropped there — and this is now the
+        // one line that says which of M0's two single-sample pipelines a run took. The probe is the
+        // gate for that decision, so it has to be able to see it.
+        std::printf("[forge] scene target: sampleCount=%u (%s) %ux%u\n",
+                    g_live.sampleCount, msaaWhat, width, height);
 
         // --- Tier 2: single-sample linear depth + AO targets (SRV+UAV). Created here so the
         // graphics PerFrame set (below) can bind pAO as its gAO SRV. Both start UNORDERED_ACCESS
@@ -6469,6 +7015,79 @@ namespace {
                 sop.pData = nullptr;
                 sop.ppBuffer = &g_live.pSunOccParamsCbv;
                 addResource(&sop, nullptr);
+
+                // --- S2: THE ATMOSPHERE's LUTs, CREATED HERE AND NOT WITH THEIR PIPELINES -------
+                // ⚠⚠ THE POSITION OF THIS BLOCK IS LOAD-BEARING AND IT COST A BLACK SKY.
+                // These three textures are bound into the graphics PerFrame sets, and those sets are
+                // filled a few hundred lines below — but WELL BEFORE the compute block where the
+                // atmosphere's pipelines are built. Created down there, every `if (g_live.pAtmosSkyView)`
+                // bind guard ran against a null pointer, the SRV was never bound, and skyhw.frag
+                // sampled an unbound texture: zeros, i.e. A BLACK SKY.
+                //
+                // ⚠ AND IT WAS INVISIBLE TO EVERY NUMBER THE HOST PRINTS, which is the part worth
+                // remembering. The gate, the nit row, the SH, the ambient and the sun all come from
+                // atmos_sh.comp's READBACK, which reads the LUT through the COMPUTE set — a set
+                // built later, after the textures exist, and therefore bound correctly. So the
+                // heartbeat reported a bright, correctly-coloured, in-band sky while the frame drew
+                // black. A readback cannot verify a binding it does not use.
+                //
+                // So: RESOURCES here, beside pSunOcc and for the same reason it sits here; pipelines
+                // and descriptor sets stay in the compute block. That split is the rule this file
+                // already follows — see the sky-height / sun-occlusion pair.
+                //
+                // RGBA16F, not RGBA8 or R11G11B10: these hold RADIANCE in absolute units, which runs
+                // 0..~30 for a clear sky and down to ~1e-3 for a horizon transmittance. Four orders
+                // of magnitude a normalised format cannot hold — and the moment a LUT needs a scale
+                // factor to fit its format, that factor is a second place the unit lives. 310 KB.
+                {
+                    auto addLut = [&](uint32_t w, uint32_t h, const char* name, Texture** dst) {
+                        TextureDesc td = {};
+                        td.mWidth = w; td.mHeight = h; td.mDepth = 1;
+                        td.mArraySize = 1; td.mMipLevels = 1;
+                        td.mSampleCount = SAMPLE_COUNT_1; td.mSampleQuality = 0;
+                        td.mFormat = TinyImageFormat_R16G16B16A16_SFLOAT;
+                        td.mStartState = RESOURCE_STATE_SHADER_RESOURCE;
+                        td.mDescriptors = (DescriptorType)(DESCRIPTOR_TYPE_TEXTURE | DESCRIPTOR_TYPE_RW_TEXTURE);
+                        td.pName = name;
+                        TextureLoadDesc tl = {};
+                        tl.ppTexture = dst;
+                        tl.pDesc = &td;
+                        addResource(&tl, nullptr);
+                    };
+                    addLut(kAtmosTransW, kAtmosTransH, "atmosTransmittance", &g_live.pAtmosTransmittance);
+                    addLut(kAtmosMsRes,  kAtmosMsRes,  "atmosMultiScatter",  &g_live.pAtmosMultiScatter);
+                    addLut(kAtmosSkyW,   kAtmosSkyH,   "atmosSkyView",       &g_live.pAtmosSkyView);
+
+                    BufferLoadDesc apc = {};
+                    apc.mDesc.mDescriptors = DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+                    apc.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_CPU_TO_GPU;
+                    apc.mDesc.mFlags = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
+                    apc.mDesc.mSize = 512;                 // AtmosphereParams (13 float4 = 208 B)
+                    apc.mDesc.pName = "atmosParamsCbv";
+                    apc.pData = nullptr;
+                    apc.ppBuffer = &g_live.pAtmosParamsCbv;
+                    addResource(&apc, nullptr);
+
+                    BufferLoadDesc aso = {};
+                    aso.mDesc.mDescriptors  = DESCRIPTOR_TYPE_RW_BUFFER;
+                    aso.mDesc.mMemoryUsage  = RESOURCE_MEMORY_USAGE_GPU_ONLY;
+                    aso.mDesc.mStructStride = sizeof(uint32_t);
+                    aso.mDesc.mElementCount = kAtmosShUints;
+                    aso.mDesc.mSize         = (uint64_t)sizeof(uint32_t) * kAtmosShUints;
+                    aso.mDesc.mStartState   = RESOURCE_STATE_UNORDERED_ACCESS;
+                    aso.mDesc.pName         = "atmosShOut";
+                    aso.ppBuffer            = &g_live.pAtmosShOut;
+                    addResource(&aso, nullptr);
+
+                    BufferLoadDesc asr = {};
+                    asr.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_GPU_TO_CPU;
+                    asr.mDesc.mFlags       = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
+                    asr.mDesc.mSize        = (uint64_t)sizeof(uint32_t) * kAtmosShUints;
+                    asr.mDesc.mStartState  = RESOURCE_STATE_COPY_DEST;
+                    asr.mDesc.pName        = "atmosShReadback";
+                    asr.ppBuffer           = &g_live.pAtmosShReadback;
+                    addResource(&asr, nullptr);
+                }
             }
 
             waitForAllResourceLoads();
@@ -7200,7 +7819,8 @@ namespace {
             // (pAOBlur), not raw pAO; pAOBlur's per-frame UAV<->SHADER_RESOURCE ping-pong (renderScene)
             // leaves it SHADER_RESOURCE before the colour pass samples it. (Raw pAO still feeds the
             // blur as an SRV, and the DebugTextures/readback paths still inspect pAO directly.)
-            DescriptorData p[18] = {};   // was 9; +gSunMoments, +gAlphaStages, +gSkyHeight, +gSunOcc (and headroom)
+            DescriptorData p[22] = {};   // was 9; +gSunMoments, +gAlphaStages, +gSkyHeight, +gSunOcc,
+                                         // +gAtmosSkyView, +gAtmosParams (and headroom)
             p[0].mIndex = SRT_RES_IDX(SrtData, PerFrame, gFrameData);
             p[0].ppBuffers = &g_live.pFrameCbv;
             p[1].mIndex = SRT_RES_IDX(SrtData, PerFrame, gAO);
@@ -7301,6 +7921,32 @@ namespace {
                 p[np].mIndex = SRT_RES_IDX(SrtData, PerFrame, gSunOcc);
                 p[np].mCount = 1;
                 p[np].ppTextures = &g_live.pSunOcc;
+                ++np;
+            }
+            // ─── S2: THE ATMOSPHERE, bound beside the sun occlusion it will eventually replace half of ───
+            // gAtmosSkyView is the sky's radiance in every direction from the camera; gAtmosParams is what
+            // turns a world direction into a uv in it. skyhw.frag reads both, and S3's applyFog() will read
+            // the same pair through this same set — aerial perspective is the same integral as the sky,
+            // which is the whole reason the fog and the horizon stop being two colours.
+            //
+            // ⚠ BOUND EVERYWHERE, INCLUDING PASSES THAT NEVER SAMPLE IT. An unbound SRV reads undefined heap
+            // memory rather than nulls, and a CBV descriptor that was never written is not a zeroed struct —
+            // it is whatever sat at that heap offset, which the shader would read as a planet radius.
+            if (g_live.pAtmosSkyView) {
+                p[np].mIndex = SRT_RES_IDX(SrtData, PerFrame, gAtmosSkyView);
+                p[np].mCount = 1;
+                p[np].ppTextures = &g_live.pAtmosSkyView;
+                ++np;
+            }
+            if (g_live.pAtmosTransmittance) {
+                p[np].mIndex = SRT_RES_IDX(SrtData, PerFrame, gAtmosTransmittance);
+                p[np].mCount = 1;
+                p[np].ppTextures = &g_live.pAtmosTransmittance;
+                ++np;
+            }
+            if (g_live.pAtmosParamsCbv) {
+                p[np].mIndex = SRT_RES_IDX(SrtData, PerFrame, gAtmosParams);
+                p[np].ppBuffers = &g_live.pAtmosParamsCbv;
                 ++np;
             }
             // Stencil-portal gate. Read by portalhull.frag ONLY, and bound ONLY here — the portal
@@ -8546,6 +9192,88 @@ namespace {
                 std::printf("[forge] addShader(skyheightview) FAILED — F12 14 disabled\n");
             }
 
+            // S2a: THE ATMOSPHERE LUTs, LOOKED AT (F12 mode 15 sky-view / 16 transmittance). Same
+            // fullscreen-triangle vert, frag reads the two LUTs off the PerFrame set.
+            //
+            // ⚠ IT SHIPS WITH THE CHAIN RATHER THAN WHEN SOMETHING GOES WRONG, and that is the
+            // argument S2a rests on: in S2a nothing SAMPLES the LUTs, so the only evidence they are
+            // correct is a cost on the gpu split and this picture. A transmittance LUT full of NaNs
+            // and a perfect one produce the identical frame otherwise, and the mistake would surface
+            // two sub-steps later as "the sky looks a bit wrong". Non-fatal.
+            ShaderLoadDesc avDesc = {};
+            avDesc.mVert.pFileName = "shadowatlasview.vert";
+            avDesc.mFrag.pFileName = "atmosview.frag";
+            addShader(R, &avDesc, &g_live.pAtmosViewShader);
+            if (g_live.pAtmosViewShader) {
+                sag.pShaderProgram = g_live.pAtmosViewShader;
+                addPipeline(R, &savPd, &g_live.pAtmosViewPipeline);
+                if (!g_live.pAtmosViewPipeline) {
+                    std::printf("[forge] addPipeline(atmosview) FAILED\n");
+                }
+            } else {
+                std::printf("[forge] addShader(atmosview) FAILED — F12 15/16 disabled\n");
+            }
+
+            // M1: THE MOTION VECTORS, LOOKED AT (F12 mode 17). Same fullscreen-triangle vert, frag
+            // reads gMotionVectors off the PerFrame set. Drawn FULL-screen rather than as the corner
+            // overlay modes 11-16 use — a vector field has to be read as a whole, and a quarter of
+            // one shows nothing.
+            //
+            // Ships with the pass for the same reason atmosview did: nothing CONSUMES motion vectors
+            // yet, so this picture is the only evidence they are right. A field that is wrong by one
+            // frame of camera translation — the bakeEye hazard motionvectors.srt.h documents — and a
+            // perfect one produce the identical frame otherwise, and the mistake would surface a
+            // milestone later as "DLSS looks smeary". Non-fatal.
+            //
+            // ⚠⚠ AND IT DRAWS INTO pRT, AFTER THE RESOLVE — NOT into the scene target like the
+            // overlays above it. That is a correctness requirement, not a preference, and it was
+            // found by looking at the first build: since step 6a the scene target is SCENE-REFERRED
+            // and resolve.frag owns the tonemap, so ANY pass that writes display colours into
+            // colorTarget has them multiplied by the exposure servo's E and pushed through AgX on
+            // the way out. At the measured E of ~0.09 that is a debug view rendered at a tenth of
+            // its brightness with its encoding crushed — reported from play as "exposure makes it
+            // dark". A data view has to land on the DELIVERED image, where nothing further happens
+            // to it.
+            //
+            // ⚠ THE SAME DEFECT APPLIES TO F12 11-16 (shadow atlas, sun moments, sky height, the two
+            // atmosphere LUTs). They all draw into colorTarget with a scene-format PSO and are all
+            // being re-tonemapped. Not fixed here — each needs its own pRT-format pipeline and this
+            // is not the milestone for it — but recorded in tasks/forge-upscale.md so it is a known
+            // defect rather than a mystery someone re-derives.
+            //
+            // Hence its own PipelineDesc rather than `savPd`: pRT's format, SAMPLE_COUNT_1 (pRT is
+            // single-sample by construction — it is the shared cross-process resource), no depth.
+            // The resolve pipeline is built exactly this way and for exactly this reason.
+            ShaderLoadDesc mvvDesc = {};
+            mvvDesc.mVert.pFileName = "shadowatlasview.vert";
+            mvvDesc.mFrag.pFileName = "mvview.frag";
+            addShader(R, &mvvDesc, &g_live.pMvViewShader);
+            if (g_live.pMvViewShader) {
+                DepthStateDesc mvvDepth = {};
+                mvvDepth.mDepthTest  = false;
+                mvvDepth.mDepthWrite = false;
+                RasterizerStateDesc mvvRaster = {};
+                mvvRaster.mCullMode = CULL_MODE_NONE;
+                PipelineDesc mvvPd = {};
+                mvvPd.mType = PIPELINE_TYPE_GRAPHICS;
+                GraphicsPipelineDesc& mvvg = mvvPd.mGraphicsDesc;
+                mvvg.mPrimitiveTopo     = PRIMITIVE_TOPO_TRI_LIST;
+                mvvg.mRenderTargetCount = 1;
+                mvvg.pColorFormats      = &g_live.pRT->mFormat;   // the DELIVERED image, never the scene
+                mvvg.mSampleCount       = SAMPLE_COUNT_1;
+                mvvg.mSampleQuality     = 0;
+                mvvg.pDepthState        = &mvvDepth;
+                mvvg.pVertexLayout      = nullptr;
+                mvvg.pRasterizerState   = &mvvRaster;
+                mvvg.pShaderProgram     = g_live.pMvViewShader;
+                addPipeline(R, &mvvPd, &g_live.pMvViewPipeline);
+                if (!g_live.pMvViewPipeline) {
+                    std::printf("[forge] addPipeline(mvview) FAILED\n");
+                }
+            } else {
+                std::printf("[forge] addShader(mvview) FAILED — F12 17 disabled\n");
+            }
+
             // VOLUMETRIC height fog: same fullscreen-triangle vert, same PerFrame set, but BLENDED
             // rather than overwriting. The frag returns PREMULTIPLIED (inscatter, coverage) and the
             // blend is standard source-over on BOTH channels:
@@ -8632,8 +9360,10 @@ namespace {
             // `s.rgb + fogColNear*(1-s.a)` collapses to `s.rgb` everywhere — fog melts into the REAL
             // sky in every direction instead of into fogColNear below the old dome rim. The negative
             // control that follows from it (looking down from a height) has to be re-established
-            // rather than assumed, and hosekRadiance clamps to the horizon below the skyline for
-            // exactly that reason. Non-fatal on failure: without the pipeline the pass is skipped and
+            // rather than assumed. The closed form CLAMPED to the horizon below the skyline for that
+            // reason; the medium returns the lit ground instead, which is a better fog target than
+            // the clamp was and is the one behaviour S2c deliberately changes. Non-fatal on failure:
+            // without the pipeline the pass is skipped and
             // MW's sky mesh keeps drawing, which is the g_skyHw = 0 image.
             ShaderLoadDesc hwDesc = {};
             hwDesc.mVert.pFileName = "shadowatlasview.vert";
@@ -8661,12 +9391,23 @@ namespace {
         // Two things differ from savPd and both matter: mSampleCount is 1 (this draws INTO the
         // resolved single-sample pRT, not the MSAA target), and there is no depth state at all.
         //
-        // MSAA-only and NON-FATAL: at 1x the scene renders straight into pRT and there is nothing to
-        // resolve; on any failure g_customResolve simply never engages and the hardware resolve runs.
-        if (g_live.sampleCount > 1) {
+        // ⚠ NO LONGER MSAA-ONLY (M0, tasks/forge-upscale.md). The gate is "does an internal scene
+        // target exist", which is now MSAA *or* scene-referred — and at 1x + fp16 this pass is the
+        // ONLY way a frame gets delivered at all, because a hardware resolve cannot convert and there
+        // is no straight-into-pRT path left to fall back to. What it stops being at 1x is an
+        // antialiasing filter: with one sample per pixel the Catmull-Rom neighbourhood degenerates
+        // to near-identity (see resolve_sc1's sub-offset), and what the pass is FOR is the fp16 ->
+        // BGRA8 convert plus exposure, the bloom composite, AgX, the sRGB encode and the output
+        // dither — every one of which is sample-count-independent and already in the shader.
+        //
+        // Still NON-FATAL in the MSAA case (on failure g_customResolve never engages and the hardware
+        // resolve runs); at 1x + fp16 a failure is caught at the resolve site, which logs and delivers
+        // a stale frame rather than losing the device.
+        if (g_live.pSceneColor) {
             const char* resolveFrag = (g_live.sampleCount == 8) ? "resolve_sc8.frag"
                                     : (g_live.sampleCount == 4) ? "resolve_sc4.frag"
-                                    : (g_live.sampleCount == 2) ? "resolve_sc2.frag" : nullptr;
+                                    : (g_live.sampleCount == 2) ? "resolve_sc2.frag"
+                                    : (g_live.sampleCount == 1) ? "resolve_sc1.frag" : nullptr;
             if (!resolveFrag) {
                 // 16x (or anything else the client can ask for) has no variant — not a failure, the
                 // hardware resolve covers it. Say so, because "my resolve slider does nothing" is
@@ -8705,7 +9446,23 @@ namespace {
                     addPipeline(R, &rsPd, &g_live.pResolvePipeline);
                 }
                 if (g_live.pResolvePipeline) {
-                    DescriptorSetDesc rsSet = SRT_SET_DESC(ResolveSrtData, PerDraw, 1, 0);
+                    // ⚠ TWO INSTANCES SINCE M1 4b (tasks/forge-upscale.md), and this is the whole
+                    // mechanism by which the resolve reads the right thing:
+                    //   [0] gResolveSource = pSceneColor            (no upscaler ran)
+                    //   [1] gResolveSource = the backend's output   (an upscaler ran)
+                    // Both are built ONCE at path-build time and the frame picks between them with
+                    // `cmdBindDescriptorSet(cmd, upscaled ? 1 : 0, ...)`. No mid-frame
+                    // updateDescriptorSet, no SRT change, and no new resource type — an SRV binds
+                    // either texture, because both are single-sample RGBA16F.
+                    //
+                    // ⚠⚠ AT sampleCount > 1 INSTANCE [1] IS NEVER BOUND AND MUST NOT BE. The frag is
+                    // resolve_sc4 there, whose gResolveSource is a Tex2DMS — binding a single-sample
+                    // texture through it is a TYPE mismatch. That is enforced upstream (the backend
+                    // refuses to exist above 1x and says so in the log), but the set is still
+                    // allocated with 2 instances in every configuration so the shape does not depend
+                    // on the sample count; the second instance is simply left unwritten and unbound,
+                    // which costs one descriptor-table slot.
+                    DescriptorSetDesc rsSet = SRT_SET_DESC(ResolveSrtData, PerDraw, 2, 0);
                     addDescriptorSet(R, &rsSet, &g_live.pResolveSet);
 
                     BufferLoadDesc rcb = {};
@@ -8724,22 +9481,140 @@ namespace {
             }
         }
 
+        // --- M1 step 4b: THE UPSCALER BACKEND (tasks/forge-upscale.md) ---------------------------
+        // Built HERE, between the resolve's set and the bloom pyramid, because those are the two
+        // things it sits between in the frame and the two things whose descriptors depend on it.
+        //
+        // ⚠ EVERY GUARD LOGS, AND EVERY GUARD FALLS BACK TO TODAY'S FRAME. A silently-absent
+        // upscaler is indistinguishable from a working one at scale 1.0 — the identity fast path is
+        // free BY CONSTRUCTION (upscale.h), so there is no artefact to notice and no cost to miss.
+        // The log is the only instrument, which is why each refusal names itself.
+        //
+        //   sampleCount > 1  — REFUSED. An upscaler REPLACES MSAA, and this is not a quality
+        //                      judgement: resolve_sc4.frag binds gResolveSource as a Tex2DMS, and
+        //                      the upscaled output is single-sample. A type mismatch, not a
+        //                      trade-off.
+        //   !pSceneColor / !sceneReferred — no source to read. shaderResolve is already false here,
+        //                      so the frame does not reach the composite this feature lives in.
+        //   init() failed    — g_upscaleEnable is forced OFF and the frame runs exactly as 4a.
+        //
+        // The backend allocates ~56 MB (alloc-sized RGBA16F) and NOTHING is allocated when the
+        // feature is off or a guard refuses — the same call the bloom pyramid makes about its ~33 MB.
+        // The shipped default DOES arm it (the slider needs a consumer, see g_upscaleEnable), so this
+        // block normally runs; verification step 1 is now the claim that arming alone changes no
+        // pixel, and `upscaleEnable=0` is what reproduces the pre-4b allocation profile.
+        if (g_upscaleEnable) {
+            const char* declined = nullptr;
+            if (g_live.sampleCount > 1) {
+                declined = "sampleCount > 1 (an upscaler REPLACES MSAA; resolve_sc4.frag binds a "
+                           "Tex2DMS where the single-sample upscaled output would go)";
+            } else if (!g_live.pSceneColor || !g_live.sceneReferred) {
+                declined = "no scene-referred colour target (nothing to upscale; the shader resolve "
+                           "is already inactive in this configuration)";
+            }
+            if (declined) {
+                g_upscaleEnable = false;
+                // ⚠ BOTH, and the second one is not bookkeeping: g_upscaleName is what upscaleScale()
+                // reads to decide whether the input rect may narrow at all, and it is what `[rect]`
+                // prints. If this path is ever re-entered after a successful arm — a rebuild with
+                // MSAA newly on is the shape — leaving the old name standing would keep claiming a
+                // backend that is no longer going to run.
+                g_upscaleName = nullptr;
+                LOG::logline("!! [upscale] DECLINED — %s. Frame renders exactly as it does without "
+                             "this feature; no target allocated.", declined);
+                LOG::flush();
+                std::printf("[forge][upscale] DECLINED — %s\n", declined);
+            } else {
+                g_live.pUpscaler = createPassthroughUpscaler();
+                bool ok = g_live.pUpscaler
+                       && g_live.pUpscaler->init(R, g_live.allocWidth, g_live.allocHeight,
+                                                 g_live.sceneColorFormat);
+                // ⚠ THE INPUT BIND HAPPENS ONCE, HERE, and never inside a recorded frame. Every
+                // other descriptor write in this renderer is made at path-build time on the host
+                // thread; a per-frame updateDescriptorSet on a set the GPU may still be reading is
+                // exactly the hazard the texture-residency races were.
+                //
+                // ⚠⚠ ONLY pColor IS ACTUALLY BOUND TODAY, and the other three are null RIGHT HERE
+                // rather than merely unread: pMotionVectors / pMvReactive are created ~1400 lines
+                // FURTHER DOWN this same function. That is harmless in 4b (the passthrough declares
+                // them and touches neither) and it is stated rather than tidied because it is a real
+                // constraint on 4d: **the NGX backend's bind cannot stay at this point in the
+                // build** — it has to move below the MV resources, or take a second bindInputs once
+                // they exist. Filling the struct now is what makes that visible instead of leaving
+                // 4d to discover it against a black upscaled frame.
+                if (ok) {
+                    UpscaleInputs bind = {};
+                    bind.pColor         = g_live.pSceneColor->pTexture;
+                    bind.pDepth         = g_live.pLinearDepth;
+                    bind.pMotionVectors = g_live.pMotionVectors;   // null here — see above
+                    bind.pReactive      = g_live.pMvReactive;      // null here — see above
+                    ok = g_live.pUpscaler->bindInputs(R, bind);
+                }
+                if (ok) {
+                    g_upscaleName = g_live.pUpscaler->name();
+                    LOG::logline(">> [upscale] backend '%s' ready — output %ux%u RGBA16F "
+                                 "(alloc-sized, SRV+UAV), input scale %.3f. ⚠ scale 1.0 is an exact "
+                                 "identity by CONSTRUCTION (evaluate returns the source, having "
+                                 "recorded nothing), so it proves nothing about this seam — test at "
+                                 "0.5.",
+                                 g_upscaleName, g_live.allocWidth, g_live.allocHeight,
+                                 (double)g_upscaleInputScale);
+                    LOG::flush();
+                    std::printf("[forge][upscale] backend '%s' ready (%ux%u RGBA16F, scale %.3f)\n",
+                                g_upscaleName, g_live.allocWidth, g_live.allocHeight,
+                                (double)g_upscaleInputScale);
+                    // ⚠ RE-EMIT `[rect]`. The line setRenderSize printed during the client handshake
+                    // said `upscaler=none`, because this lazy build had not run yet — a field that
+                    // is WRONG rather than missing, and on the one line an unattended run has to
+                    // read to know whether the feature is live. See logRectLine.
+                    //
+                    // ⚠⚠ AND IT ONLY RE-LOGS; IT MUST NOT RE-DERIVE THE RECT. Calling setRenderSize
+                    // here to make the rect narrow one frame sooner was tried and reverted: the
+                    // client restamps setRenderSize EVERY frame (ipc/server.cpp:655), so it buys a
+                    // single frame in the game — and it costs the whole scene-probe, which never
+                    // calls setRenderSize precisely so its LinDepth/AO/mv stages run at in == out
+                    // and narrows only at its own UPSCALE stage at the end. Narrowing here instead
+                    // put every one of those readbacks OUTSIDE the written sub-rect, and the depth
+                    // one came back as -1.9e38. Same defect class as the APL instrument bug: an
+                    // out-of-rect read of a target whose valid extent just changed under it.
+                    //
+                    // So the rect stays whatever the last setRenderSize made it and this line says
+                    // `rect PENDING` for the one frame where the scale is live but not yet applied.
+                    logRectLine();
+                } else {
+                    if (g_live.pUpscaler) {
+                        g_live.pUpscaler->shutdown(R);
+                        destroyUpscaler(g_live.pUpscaler);
+                        g_live.pUpscaler = nullptr;
+                    }
+                    g_upscaleEnable = false;
+                    g_upscaleName = nullptr;
+                    LOG::logline("!! [upscale] DECLINED — backend init/bind FAILED. Upscaling forced "
+                                 "OFF; the frame renders exactly as it does without this feature.");
+                    LOG::flush();
+                    std::printf("[forge][upscale] DECLINED — backend init FAILED\n");
+                }
+            }
+        }
+
         // --- BLOOM pyramid (tasks/forge-postprocess.md step 4) -----------------------------------
         // Built HERE, right after the resolve, because the two are one feature: the pyramid's first
-        // pass reads pMSAAColor and resolve.frag composites the result back in, and the descriptor
+        // pass reads pSceneColor and resolve.frag composites the result back in, and the descriptor
         // update further down binds mip 0 into the SAME ResolveSrtData set. Nothing else in the frame
         // touches it.
         //
         // GATED ON sceneReferred, not merely on MSAA, and that is a memory decision as much as a
         // correctness one. Bloom off a display-referred target is the artefact rather than the effect
         // (three files record it — see g_bloomEnable), so at LDR it could never run; allocating ~33 MB
-        // of fp16 pyramid for a path that is gated off is pure waste. sceneReferred already folds in
-        // `sampleCount > 1` (see its assignment in init), so pMSAAColor is non-null whenever this is.
+        // of fp16 pyramid for a path that is gated off is pure waste. sceneReferred is now exactly
+        // what MAKES pSceneColor exist at 1x (M0, tasks/forge-upscale.md), so the second term stays
+        // non-null whenever the first is true — the implication survived the change, but it runs the
+        // other way round now and is no longer routed through the sample count.
         //
         // NON-FATAL at every step, hizReady's shape: any failure leaves bloomReady false, the dispatch
         // block never runs, the strength lane goes to 0, and resolve.frag's guard means the frame is
         // bit-identical to a build without this feature.
-        if (g_live.sceneReferred && g_live.pMSAAColor) {
+        if (g_live.sceneReferred && g_live.pSceneColor) {
             // HALF of the ALLOCATION, not half of the render rect — alloc-sized like every other
             // screen RT, so a live render-scale change needs no reallocation (setRenderSize). The
             // per-frame render sub-rect at each level rides the cbuffers instead.
@@ -8829,7 +9704,7 @@ namespace {
                 // of the down/up variants, exactly as the reduce's unused colour SRV is stripped in
                 // reflectmip. mCount = 1 is REQUIRED on every single-texture bind (SRV and UAV) or the
                 // descriptor count is 0 and the slot binds NOTHING.
-                Texture* sceneTex = g_live.pMSAAColor->pTexture;
+                Texture* sceneTex = g_live.pSceneColor->pTexture;
                 DescriptorData d[4] = {};
                 d[0].mIndex = SRT_RES_IDX(BloomSrtData, Persistent, gBloomParams);
                 d[1].mIndex = SRT_RES_IDX(BloomSrtData, Persistent, gBloomSceneTex);
@@ -8839,7 +9714,7 @@ namespace {
                 d[3].mIndex = SRT_RES_IDX(BloomSrtData, Persistent, gBloomDst);
                 d[3].mCount = 1; d[3].ppTextures = &g_live.pBloomMips;
 
-                // [0] PREFILTER: pMSAAColor (SRV) -> mip 0. gBloomSrc is unused by this variant but
+                // [0] PREFILTER: pSceneColor (SRV) -> mip 0. gBloomSrc is unused by this variant but
                 // must still point somewhere valid, so it takes mip 0 as well.
                 d[0].ppBuffers   = &g_live.pBloomParamsCbv[0];
                 d[2].mUAVMipSlice = 0;
@@ -9022,7 +9897,7 @@ namespace {
 
                 // --- alpha SHADOW-RECEIVE depth prepass PSOs (opaque.vert + alphashadowrecv.frag) --
                 // SINGLE-SAMPLE (target = pAlphaShadowDepth, sc1), same GEQUAL+WRITE and cull variants,
-                // but clip on the lower shadow-receive threshold (froxelZ.z). Non-fatal on failure —
+                // but clip on the lower shadow-receive threshold (alphaShadowParams.x). Non-fatal on failure —
                 // alpha shadow reception just stays off (the refresh gate checks these). No 2nd
                 // linearize: the SS depth binds straight into the mask as gShadowLinDepth.
                 //
@@ -9322,7 +10197,7 @@ namespace {
             rcd.mWidth = kReflectSize; rcd.mHeight = kReflectSize; rcd.mDepth = 1;
             rcd.mArraySize = 1; rcd.mMipLevels = 1;
             rcd.mSampleCount = (SampleCount)g_live.sampleCount;
-            // NOT a free choice: pSkyPipeline (and the DL/near colour PSOs) draw into pMSAAColor in
+            // NOT a free choice: pSkyPipeline (and the DL/near colour PSOs) draw into pSceneColor in
             // the main pass and into THIS target in the mirror pass, so one PSO spans both and their
             // colour formats must agree. "HDR water is forced, not optional" in forge-postprocess.md
             // turns out to be a PSO-sharing fact, not just a look preference.
@@ -9419,7 +10294,7 @@ namespace {
             if (!g_live.pPerFrameSetReflect || !g_live.pPerBatchSetReflectSky) { return false; }
             {
                 Texture* vol = g_live.pWaterNormalVol ? g_live.pWaterNormalVol : g_live.pDefaultWhite;
-                DescriptorData p[14] = {};   // was 9; +gSkyHeight, +gSunOcc (and headroom)
+                DescriptorData p[18] = {};   // was 9; +gSkyHeight, +gSunOcc, +the atmosphere pair (and headroom)
                 p[0].mIndex = SRT_RES_IDX(SrtData, PerFrame, gFrameData);
                 p[0].ppBuffers = &g_live.pReflectFrameCbv;
                 p[1].mIndex = SRT_RES_IDX(SrtData, PerFrame, gAO);
@@ -9465,6 +10340,32 @@ namespace {
                     p[rn].mCount = 1; p[rn].ppTextures = &g_live.pSunOcc;
                     ++rn;
                 }
+                // ─── S2: THE ATMOSPHERE, bound beside the sun occlusion it will eventually replace half of ───
+                // gAtmosSkyView is the sky's radiance in every direction from the camera; gAtmosParams is what
+                // turns a world direction into a uv in it. skyhw.frag reads both, and S3's applyFog() will read
+                // the same pair through this same set — aerial perspective is the same integral as the sky,
+                // which is the whole reason the fog and the horizon stop being two colours.
+                //
+                // ⚠ BOUND EVERYWHERE, INCLUDING PASSES THAT NEVER SAMPLE IT. An unbound SRV reads undefined heap
+                // memory rather than nulls, and a CBV descriptor that was never written is not a zeroed struct —
+                // it is whatever sat at that heap offset, which the shader would read as a planet radius.
+                if (g_live.pAtmosSkyView) {
+                    p[rn].mIndex = SRT_RES_IDX(SrtData, PerFrame, gAtmosSkyView);
+                    p[rn].mCount = 1;
+                    p[rn].ppTextures = &g_live.pAtmosSkyView;
+                    ++rn;
+                }
+                if (g_live.pAtmosTransmittance) {
+                    p[rn].mIndex = SRT_RES_IDX(SrtData, PerFrame, gAtmosTransmittance);
+                    p[rn].mCount = 1;
+                    p[rn].ppTextures = &g_live.pAtmosTransmittance;
+                    ++rn;
+                }
+                if (g_live.pAtmosParamsCbv) {
+                    p[rn].mIndex = SRT_RES_IDX(SrtData, PerFrame, gAtmosParams);
+                    p[rn].ppBuffers = &g_live.pAtmosParamsCbv;
+                    ++rn;
+                }
                 if (g_live.pSkyColor) {    // gSkyColor: type-valid bind (sky.frag never fogs)
                     p[rn].mIndex = SRT_RES_IDX(SrtData, PerFrame, gSkyColor);
                     p[rn].mCount = 1; p[rn].ppTextures = &g_live.pSkyColor;
@@ -9499,7 +10400,7 @@ namespace {
             if (!g_live.pPerFrameSetReflectGeo) { return false; }
             {
                 Texture* vol = g_live.pWaterNormalVol ? g_live.pWaterNormalVol : g_live.pDefaultWhite;
-                DescriptorData p[18] = {};   // was 13; +gSkyHeight, +gSunOcc (and headroom)
+                DescriptorData p[22] = {};   // was 13; +gSkyHeight, +gSunOcc, +the atmosphere pair (and headroom)
                 p[0].mIndex = SRT_RES_IDX(SrtData, PerFrame, gFrameData);
                 p[0].ppBuffers = &g_live.pReflectFrameCbvGeo;
                 p[1].mIndex = SRT_RES_IDX(SrtData, PerFrame, gAO);
@@ -9581,6 +10482,32 @@ namespace {
                     p[rn].mCount = 1; p[rn].ppTextures = &g_live.pSunOcc;
                     ++rn;
                 }
+                // ─── S2: THE ATMOSPHERE, bound beside the sun occlusion it will eventually replace half of ───
+                // gAtmosSkyView is the sky's radiance in every direction from the camera; gAtmosParams is what
+                // turns a world direction into a uv in it. skyhw.frag reads both, and S3's applyFog() will read
+                // the same pair through this same set — aerial perspective is the same integral as the sky,
+                // which is the whole reason the fog and the horizon stop being two colours.
+                //
+                // ⚠ BOUND EVERYWHERE, INCLUDING PASSES THAT NEVER SAMPLE IT. An unbound SRV reads undefined heap
+                // memory rather than nulls, and a CBV descriptor that was never written is not a zeroed struct —
+                // it is whatever sat at that heap offset, which the shader would read as a planet radius.
+                if (g_live.pAtmosSkyView) {
+                    p[rn].mIndex = SRT_RES_IDX(SrtData, PerFrame, gAtmosSkyView);
+                    p[rn].mCount = 1;
+                    p[rn].ppTextures = &g_live.pAtmosSkyView;
+                    ++rn;
+                }
+                if (g_live.pAtmosTransmittance) {
+                    p[rn].mIndex = SRT_RES_IDX(SrtData, PerFrame, gAtmosTransmittance);
+                    p[rn].mCount = 1;
+                    p[rn].ppTextures = &g_live.pAtmosTransmittance;
+                    ++rn;
+                }
+                if (g_live.pAtmosParamsCbv) {
+                    p[rn].mIndex = SRT_RES_IDX(SrtData, PerFrame, gAtmosParams);
+                    p[rn].ppBuffers = &g_live.pAtmosParamsCbv;
+                    ++rn;
+                }
                 // gSkyColor: the MIRROR's own sky copy, and this is the one bind in the set that must
                 // NOT be the main-view texture. This set draws the reflected terrain and statics, whose
                 // fog melts toward the sky at their position in the 1024² mirror RT; handing them the
@@ -9609,7 +10536,7 @@ namespace {
                 if (!g_live.pPerFrameSetSun) { return false; }
                 Texture* vol = g_live.pWaterNormalVol ? g_live.pWaterNormalVol : g_live.pDefaultWhite;
                 for (uint32_t c = 0; c < kSunCascades; ++c) {
-                    DescriptorData p[16] = {};   // was 11; +gSkyHeight, +gSunOcc (and headroom)
+                    DescriptorData p[20] = {};   // was 11; +gSkyHeight, +gSunOcc, +the atmosphere pair (and headroom)
                     p[0].mIndex = SRT_RES_IDX(SrtData, PerFrame, gFrameData);
                     p[0].ppBuffers = &g_live.pSunFrameCbv[c];
                     p[1].mIndex = SRT_RES_IDX(SrtData, PerFrame, gAO);
@@ -9654,6 +10581,32 @@ namespace {
                         p[sn].mCount = 1; p[sn].ppTextures = &g_live.pSunOcc;
                         ++sn;
                     }
+                    // ─── S2: THE ATMOSPHERE, bound beside the sun occlusion it will eventually replace half of ───
+                    // gAtmosSkyView is the sky's radiance in every direction from the camera; gAtmosParams is what
+                    // turns a world direction into a uv in it. skyhw.frag reads both, and S3's applyFog() will read
+                    // the same pair through this same set — aerial perspective is the same integral as the sky,
+                    // which is the whole reason the fog and the horizon stop being two colours.
+                    //
+                    // ⚠ BOUND EVERYWHERE, INCLUDING PASSES THAT NEVER SAMPLE IT. An unbound SRV reads undefined heap
+                    // memory rather than nulls, and a CBV descriptor that was never written is not a zeroed struct —
+                    // it is whatever sat at that heap offset, which the shader would read as a planet radius.
+                    if (g_live.pAtmosSkyView) {
+                        p[sn].mIndex = SRT_RES_IDX(SrtData, PerFrame, gAtmosSkyView);
+                        p[sn].mCount = 1;
+                        p[sn].ppTextures = &g_live.pAtmosSkyView;
+                        ++sn;
+                    }
+                    if (g_live.pAtmosTransmittance) {
+                        p[sn].mIndex = SRT_RES_IDX(SrtData, PerFrame, gAtmosTransmittance);
+                        p[sn].mCount = 1;
+                        p[sn].ppTextures = &g_live.pAtmosTransmittance;
+                        ++sn;
+                    }
+                    if (g_live.pAtmosParamsCbv) {
+                        p[sn].mIndex = SRT_RES_IDX(SrtData, PerFrame, gAtmosParams);
+                        p[sn].ppBuffers = &g_live.pAtmosParamsCbv;
+                        ++sn;
+                    }
                     if (g_live.pSkyColor) { // type-valid bind (a caster pass computes no fog)
                         p[sn].mIndex = SRT_RES_IDX(SrtData, PerFrame, gSkyColor);
                         p[sn].mCount = 1; p[sn].ppTextures = &g_live.pSkyColor;
@@ -9681,7 +10634,7 @@ namespace {
                 addDescriptorSet(R, &khDesc, &g_live.pPerFrameSetSkyHeight);
                 if (g_live.pPerFrameSetSkyHeight) {
                     Texture* khVol = g_live.pWaterNormalVol ? g_live.pWaterNormalVol : g_live.pDefaultWhite;
-                    DescriptorData p[16] = {};   // +gSunOcc (and headroom)
+                    DescriptorData p[20] = {};   // +gSunOcc, +the atmosphere pair (and headroom)
                     p[0].mIndex = SRT_RES_IDX(SrtData, PerFrame, gFrameData);
                     p[0].ppBuffers = &g_live.pSkyHeightFrameCbv;
                     p[1].mIndex = SRT_RES_IDX(SrtData, PerFrame, gAO);
@@ -9720,6 +10673,32 @@ namespace {
                     if (g_live.pSunOcc) {
                         p[kn].mIndex = SRT_RES_IDX(SrtData, PerFrame, gSunOcc);
                         p[kn].mCount = 1; p[kn].ppTextures = &g_live.pSunOcc;
+                        ++kn;
+                    }
+                    // ─── S2: THE ATMOSPHERE, bound beside the sun occlusion it will eventually replace half of ───
+                    // gAtmosSkyView is the sky's radiance in every direction from the camera; gAtmosParams is what
+                    // turns a world direction into a uv in it. skyhw.frag reads both, and S3's applyFog() will read
+                    // the same pair through this same set — aerial perspective is the same integral as the sky,
+                    // which is the whole reason the fog and the horizon stop being two colours.
+                    //
+                    // ⚠ BOUND EVERYWHERE, INCLUDING PASSES THAT NEVER SAMPLE IT. An unbound SRV reads undefined heap
+                    // memory rather than nulls, and a CBV descriptor that was never written is not a zeroed struct —
+                    // it is whatever sat at that heap offset, which the shader would read as a planet radius.
+                    if (g_live.pAtmosSkyView) {
+                        p[kn].mIndex = SRT_RES_IDX(SrtData, PerFrame, gAtmosSkyView);
+                        p[kn].mCount = 1;
+                        p[kn].ppTextures = &g_live.pAtmosSkyView;
+                        ++kn;
+                    }
+                    if (g_live.pAtmosTransmittance) {
+                        p[kn].mIndex = SRT_RES_IDX(SrtData, PerFrame, gAtmosTransmittance);
+                        p[kn].mCount = 1;
+                        p[kn].ppTextures = &g_live.pAtmosTransmittance;
+                        ++kn;
+                    }
+                    if (g_live.pAtmosParamsCbv) {
+                        p[kn].mIndex = SRT_RES_IDX(SrtData, PerFrame, gAtmosParams);
+                        p[kn].ppBuffers = &g_live.pAtmosParamsCbv;
                         ++kn;
                     }
                     if (g_live.pSkyColor) {   // type-valid fill (a height raster computes no fog)
@@ -9959,6 +10938,172 @@ namespace {
             DescriptorSetDesc lset = SRT_SET_DESC(LinDepthSrtData, PerBatch, 1, 0);
             addDescriptorSet(R, &lset, &g_live.pLinearizeSet);
 
+            // --- M1 CAMERA-ONLY MOTION VECTORS (tasks/forge-upscale.md) ---------------------------
+            // Built HERE, beside linearize, because that is where its INPUT is made: this pass reads
+            // pLinearDepth, not pDepth, which is what spares it the sc1/sc4 split (see
+            // motionvectors.srt.h). Alloc-sized like every other screen target, dispatched over the
+            // render sub-rect.
+            //
+            // NON-FATAL throughout, hizReady's shape: any failure leaves mvReady false, the dispatch
+            // never runs, and the frame is bit-identical to a build without the feature. Nothing
+            // consumes the vectors yet, so there is nothing for a failure to break — which is exactly
+            // why this is the right milestone to build it in.
+            {
+                TextureDesc md = {};
+                md.mWidth = width; md.mHeight = height; md.mDepth = 1;
+                md.mArraySize = 1; md.mMipLevels = 1;
+                md.mSampleCount = SAMPLE_COUNT_1;
+                // fp16 x2: floating point, so the RELATIVE precision is constant across the range —
+                // the sub-pixel motions that dominate a walking camera keep ~3 decimal digits, and
+                // the large vectors that lose absolute precision are the ones any accumulator
+                // distrusts anyway. It is also the format every upscaler asks for.
+                md.mFormat = TinyImageFormat_R16G16_SFLOAT;
+                // RESTS in SHADER_RESOURCE: the debug view samples it, and a frame where the dispatch
+                // is skipped then shows the previous frame's vectors rather than an invalid resource.
+                md.mStartState = RESOURCE_STATE_SHADER_RESOURCE;
+                md.mDescriptors = (DescriptorType)(DESCRIPTOR_TYPE_TEXTURE | DESCRIPTOR_TYPE_RW_TEXTURE);
+                md.pName = "motionVectors";
+                TextureLoadDesc mld = {};
+                mld.ppTexture = &g_live.pMotionVectors;
+                mld.pDesc = &md;
+                addResource(&mld, nullptr);
+
+                // LAST frame's device depth. Same format and size as pLinearDepth because it is a
+                // straight CopyResource of it — no reinterpretation, so nothing here can disagree
+                // with what the reconstruction read.
+                TextureDesc pd = {};
+                pd.mWidth = width; pd.mHeight = height; pd.mDepth = 1;
+                pd.mArraySize = 1; pd.mMipLevels = 1;
+                pd.mSampleCount = SAMPLE_COUNT_1;
+                pd.mFormat = TinyImageFormat_R32_SFLOAT;
+                pd.mStartState = RESOURCE_STATE_SHADER_RESOURCE;
+                pd.mDescriptors = DESCRIPTOR_TYPE_TEXTURE;
+                pd.pName = "mvPrevDepth";
+                TextureLoadDesc pld = {};
+                pld.ppTexture = &g_live.pMvPrevDepth;
+                pld.pDesc = &pd;
+                addResource(&pld, nullptr);
+
+                // The mask. R8_UNORM: it is a 0..1 weight, one byte is plenty, and every upscaler
+                // takes it in that form.
+                TextureDesc rd = {};
+                rd.mWidth = width; rd.mHeight = height; rd.mDepth = 1;
+                rd.mArraySize = 1; rd.mMipLevels = 1;
+                rd.mSampleCount = SAMPLE_COUNT_1;
+                rd.mFormat = TinyImageFormat_R8_UNORM;
+                rd.mStartState = RESOURCE_STATE_SHADER_RESOURCE;
+                rd.mDescriptors = (DescriptorType)(DESCRIPTOR_TYPE_TEXTURE | DESCRIPTOR_TYPE_RW_TEXTURE);
+                rd.pName = "mvReactive";
+                TextureLoadDesc rld = {};
+                rld.ppTexture = &g_live.pMvReactive;
+                rld.pDesc = &rd;
+                addResource(&rld, nullptr);
+                waitForAllResourceLoads();
+
+                ShaderLoadDesc msd = {};
+                msd.mComp.pFileName = "motionvectors.comp";
+                addShader(R, &msd, &g_live.pMvShader);
+                if (g_live.pMvShader) {
+                    PipelineDesc mpd = {};
+                    mpd.mType = PIPELINE_TYPE_COMPUTE;
+                    mpd.mComputeDesc.pShaderProgram = g_live.pMvShader;
+                    addPipeline(R, &mpd, &g_live.pMvPipeline);
+                }
+                if (g_live.pMvPipeline) {
+                    DescriptorSetDesc mset = SRT_SET_DESC(MotionVectorSrtData, Persistent, 1, 0);
+                    addDescriptorSet(R, &mset, &g_live.pMvSet);
+
+                    BufferLoadDesc mcb = {};
+                    mcb.mDesc.mDescriptors = DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+                    mcb.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_CPU_TO_GPU;
+                    mcb.mDesc.mFlags       = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
+                    mcb.mDesc.mSize        = 256;   // cbuffer alignment, not sizeof(MvParams) (160)
+                    mcb.mDesc.pName        = "mvParams";
+                    mcb.ppBuffer           = &g_live.pMvParamsCbv;
+                    addResource(&mcb, nullptr);
+
+                    BufferLoadDesc msb = {};
+                    msb.mDesc.mDescriptors  = DESCRIPTOR_TYPE_RW_BUFFER;
+                    msb.mDesc.mMemoryUsage  = RESOURCE_MEMORY_USAGE_GPU_ONLY;
+                    msb.mDesc.mFormat       = TinyImageFormat_R32_UINT;   // typed UAV: InterlockedMin/Max
+                    msb.mDesc.mStructStride = sizeof(uint32_t);
+                    msb.mDesc.mElementCount = 5;
+                    msb.mDesc.mSize         = sizeof(uint32_t) * 5;
+                    msb.mDesc.mStartState   = RESOURCE_STATE_UNORDERED_ACCESS;
+                    msb.mDesc.pName         = "mvStats";
+                    msb.ppBuffer            = &g_live.pMvStats;
+                    addResource(&msb, nullptr);
+
+                    // The reset pattern, written ONCE at creation and copied in every frame:
+                    // max = 0, min = 0xFFFFFFFF (asuint(+inf) and above — any real |mv| is smaller),
+                    // and the two counters at 0.
+                    static const uint32_t kMvReset[5] = { 0u, 0xFFFFFFFFu, 0u, 0u, 0u };
+                    BufferLoadDesc mrb = {};
+                    mrb.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_CPU_TO_GPU;
+                    mrb.mDesc.mFlags       = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
+                    mrb.mDesc.mSize        = sizeof(kMvReset);
+                    mrb.mDesc.mStartState  = RESOURCE_STATE_GENERIC_READ;
+                    mrb.mDesc.pName        = "mvStatsReset";
+                    mrb.ppBuffer           = &g_live.pMvStatsReset;
+                    addResource(&mrb, nullptr);
+                    waitForAllResourceLoads();
+                    if (g_live.pMvStatsReset && g_live.pMvStatsReset->pCpuMappedAddress) {
+                        std::memcpy(g_live.pMvStatsReset->pCpuMappedAddress, kMvReset, sizeof(kMvReset));
+                    }
+
+                    BufferLoadDesc mrr = {};
+                    mrr.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_GPU_TO_CPU;
+                    mrr.mDesc.mFlags       = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
+                    mrr.mDesc.mSize        = sizeof(uint32_t) * 5;
+                    mrr.mDesc.mStartState  = RESOURCE_STATE_COPY_DEST;
+                    mrr.mDesc.pName        = "mvStatsReadback";
+                    mrr.ppBuffer           = &g_live.pMvStatsReadback;
+                    addResource(&mrr, nullptr);
+                }
+                if (g_live.pMvSet && g_live.pMvParamsCbv && g_live.pLinearDepth && g_live.pMvStats
+                    && g_live.pMvPrevDepth && g_live.pMvReactive) {
+                    DescriptorData md3[6] = {};
+                    md3[0].mIndex = SRT_RES_IDX(MotionVectorSrtData, Persistent, gMvParams);
+                    md3[0].mCount = 1; md3[0].ppBuffers = &g_live.pMvParamsCbv;
+                    md3[1].mIndex = SRT_RES_IDX(MotionVectorSrtData, Persistent, gMvDepth);
+                    md3[1].mCount = 1; md3[1].ppTextures = &g_live.pLinearDepth;
+                    md3[2].mIndex = SRT_RES_IDX(MotionVectorSrtData, Persistent, gMvOut);
+                    md3[2].mCount = 1; md3[2].ppTextures = &g_live.pMotionVectors;
+                    md3[3].mIndex = SRT_RES_IDX(MotionVectorSrtData, Persistent, gMvStats);
+                    md3[3].mCount = 1; md3[3].ppBuffers = &g_live.pMvStats;
+                    md3[4].mIndex = SRT_RES_IDX(MotionVectorSrtData, Persistent, gMvPrevDepth);
+                    md3[4].mCount = 1; md3[4].ppTextures = &g_live.pMvPrevDepth;
+                    md3[5].mIndex = SRT_RES_IDX(MotionVectorSrtData, Persistent, gMvReactive);
+                    md3[5].mCount = 1; md3[5].ppTextures = &g_live.pMvReactive;
+                    updateDescriptorSet(R, 0, g_live.pMvSet, 6, md3);
+                    g_live.mvReady = true;
+
+                    // ...and into the MAIN graphics PerFrame set, for the F12 mode-17 view. ONLY
+                    // that one: the reflect / reflect-geo / sun / FP / sky-height instances never
+                    // display it, and an unbound slot reads (0,0) = "nothing moved", which is the
+                    // benign default the SRT documents. gGrassCrush is bound the same way and for
+                    // the same reason — bind where it is read, not everywhere it is declared.
+                    if (g_live.pPerFrameSet) {
+                        DescriptorData mvp = {};
+                        mvp.mIndex = SRT_RES_IDX(SrtData, PerFrame, gMotionVectors);
+                        mvp.mCount = 1; mvp.ppTextures = &g_live.pMotionVectors;
+                        DescriptorData rmp = {};
+                        rmp.mIndex = SRT_RES_IDX(SrtData, PerFrame, gReactiveMask);
+                        rmp.mCount = 1; rmp.ppTextures = &g_live.pMvReactive;
+                        DescriptorData both[2] = { mvp, rmp };
+                        updateDescriptorSet(R, 0, g_live.pPerFrameSet, 2, both);
+                    }
+                }
+                if (!g_live.mvReady) {
+                    std::printf("[forge] motion vectors unavailable (shader=%d pipe=%d set=%d cbv=%d)"
+                                " - F12 mode 17 will show nothing\n",
+                                g_live.pMvShader ? 1 : 0, g_live.pMvPipeline ? 1 : 0,
+                                g_live.pMvSet ? 1 : 0, g_live.pMvParamsCbv ? 1 : 0);
+                }
+                LOG::logline(">> [mv] motion vectors %s (R16G16_SFLOAT %ux%u alloc; dispatch = render rect)",
+                             g_live.mvReady ? "ready" : "UNAVAILABLE", width, height);
+            }
+
             // --- APL instrument (tasks/forge-postprocess.md step 2) ---
             // ONE variant since step 6a moved the dispatch after the resolve: it now reads pRT, the
             // delivered single-sample image, in every configuration — so unlike linearize above it
@@ -10016,86 +11161,111 @@ namespace {
                                 "frames render, APL is simply not reported\n");
                 }
             }
-            // --- P2: the Hosek-Wilkie C++/FSL CROSS-CHECK (tasks/forge-physical-sky.md) ----------
-            // The physical sky evaluates one model TWICE — C++ for the SH (the light) and FSL for
-            // the pixels — and a silent divergence between them is precisely the failure the step
-            // exists to remove. One dispatch per host session, 64 threads, read back after the frame
-            // fence the frame already has. NON-FATAL throughout, same reasoning as the APL block
-            // above: a renderer that refuses to start because its self-test is missing is worse than
-            // an unverified one, and the log says which happened.
+            // --- S2: THE ATMOSPHERE's LUT CHAIN (tasks/forge-atmosphere.md) ---------------------
+            // Three RGBA16F LUTs, one params CBV, four compute pipelines and ONE descriptor set over
+            // four instances. NON-FATAL throughout, same reasoning as the APL block above: a renderer
+            // that refuses to start because a pass failed to build is worse than one that logs it and
+            // renders the previous image. atmosReady stays false, the sky lane publishes 0, and the
+            // exterior falls back to MW's own sky mesh — the identical state `g_skyHw = 0` produces.
+            //
+            // ⚠ THE TEXTURES AND THE PARAMS CBV ARE **NOT** CREATED HERE — they are created far above,
+            // beside pSunOcc, and the split is not tidiness. They are bound into the graphics
+            // PerFrame sets, which are filled BEFORE this block runs; created here, every
+            // `if (g_live.pAtmosSkyView)` bind guard would test a null pointer, the SRV would never
+            // be bound, and skyhw.frag would sample zeros — A BLACK SKY. See the block up there for
+            // why that failure is invisible to every number the host prints.
             {
-                ShaderLoadDesc hcd = {};
-                hcd.mComp.pFileName = "hosekcheck.comp";
-                addShader(R, &hcd, &g_live.pHosekCheckShader);
-                if (g_live.pHosekCheckShader) {
-                    PipelineDesc hpd = {};
-                    hpd.mType = PIPELINE_TYPE_COMPUTE;
-                    hpd.mComputeDesc.pShaderProgram = g_live.pHosekCheckShader;
-                    addPipeline(R, &hpd, &g_live.pHosekCheckPipeline);
-                }
-                if (g_live.pHosekCheckPipeline) {
-                    DescriptorSetDesc hset = SRT_SET_DESC(HosekCheckSrtData, PerBatch, 1, 0);
-                    addDescriptorSet(R, &hset, &g_live.pHosekCheckSet);
+                ShaderLoadDesc atd = {}; atd.mComp.pFileName = "atmos_transmittance.comp";
+                addShader(R, &atd, &g_live.pAtmosTransShader);
+                ShaderLoadDesc amd = {}; amd.mComp.pFileName = "atmos_multiscatter.comp";
+                addShader(R, &amd, &g_live.pAtmosMsShader);
+                ShaderLoadDesc asd = {}; asd.mComp.pFileName = "atmos_skyview.comp";
+                addShader(R, &asd, &g_live.pAtmosSkyShader);
+                ShaderLoadDesc ahd = {}; ahd.mComp.pFileName = "atmos_sh.comp";
+                addShader(R, &ahd, &g_live.pAtmosShShader);
+                auto mkPipe = [&](Shader* sh, Pipeline** dst) {
+                    if (!sh) { return; }
+                    PipelineDesc pd = {};
+                    pd.mType = PIPELINE_TYPE_COMPUTE;
+                    pd.mComputeDesc.pShaderProgram = sh;
+                    addPipeline(R, &pd, dst);
+                };
+                mkPipe(g_live.pAtmosTransShader, &g_live.pAtmosTransPipeline);
+                mkPipe(g_live.pAtmosMsShader,    &g_live.pAtmosMsPipeline);
+                mkPipe(g_live.pAtmosSkyShader,   &g_live.pAtmosSkyPipeline);
+                mkPipe(g_live.pAtmosShShader,    &g_live.pAtmosShPipeline);
 
-                    BufferLoadDesc hdb = {};
-                    hdb.mDesc.mDescriptors  = DESCRIPTOR_TYPE_BUFFER;
-                    hdb.mDesc.mMemoryUsage  = RESOURCE_MEMORY_USAGE_CPU_TO_GPU;
-                    hdb.mDesc.mFlags        = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
-                    hdb.mDesc.mFormat       = TinyImageFormat_R32G32B32A32_SFLOAT;  // Buffer<float4>
-                    hdb.mDesc.mElementCount = kHosekCheckDirs;
-                    hdb.mDesc.mStructStride = 0;
-                    hdb.mDesc.mSize         = (uint64_t)kHosekCheckDirs * 16;
-                    hdb.mDesc.pName         = "hosekCheckDirs";
-                    hdb.ppBuffer            = &g_live.pHosekDirsBuf;
-                    addResource(&hdb, nullptr);
+                // FOUR INSTANCES of ONE set. They differ only in which texture gAtmosOutA points at
+                // and which LUTs are readable — see atmosphere.srt.h for why the output is one slot
+                // rather than three.
+                DescriptorSetDesc ads = SRT_SET_DESC(AtmosphereSrtData, PerBatch, 4, 0);
+                addDescriptorSet(R, &ads, &g_live.pAtmosSet);
 
-                    BufferLoadDesc hob = {};
-                    hob.mDesc.mDescriptors  = DESCRIPTOR_TYPE_RW_BUFFER;
-                    hob.mDesc.mMemoryUsage  = RESOURCE_MEMORY_USAGE_GPU_ONLY;
-                    hob.mDesc.mStructStride = sizeof(uint32_t);
-                    hob.mDesc.mElementCount = kHosekCheckDirs * 4;
-                    hob.mDesc.mSize         = (uint64_t)sizeof(uint32_t) * kHosekCheckDirs * 4;
-                    hob.mDesc.mStartState   = RESOURCE_STATE_UNORDERED_ACCESS;
-                    hob.mDesc.pName         = "hosekCheckOut";
-                    hob.ppBuffer            = &g_live.pHosekOutBuf;
-                    addResource(&hob, nullptr);
-
-                    BufferLoadDesc hrb = {};
-                    hrb.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_GPU_TO_CPU;
-                    hrb.mDesc.mFlags       = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
-                    hrb.mDesc.mSize        = (uint64_t)sizeof(uint32_t) * kHosekCheckDirs * 4;
-                    hrb.mDesc.mStartState  = RESOURCE_STATE_COPY_DEST;
-                    hrb.mDesc.pName        = "hosekCheckReadback";
-                    hrb.ppBuffer           = &g_live.pHosekReadback;
-                    addResource(&hrb, nullptr);
-
-                    waitForAllResourceLoads();
-                    if (g_live.pHosekDirsBuf && g_live.pHosekOutBuf && g_live.pHosekReadback
-                        && g_live.pHosekCheckSet) {
-                        // The probe set, filled ONCE. Deliberately the SAME Fibonacci sphere the SH
-                        // projection integrates over, so the directions the check exercises are the
-                        // directions the light is actually built from — a probe set of round numbers
-                        // would test the arithmetic at points nothing uses.
-                        float* hd = (float*)g_live.pHosekDirsBuf->pCpuMappedAddress;
-                        for (uint32_t i = 0; i < kHosekCheckDirs; ++i) {
-                            float d[3];
-                            Hosek::fibDir((int)i, (int)kHosekCheckDirs, d);
-                            hd[i * 4 + 0] = d[0]; hd[i * 4 + 1] = d[1];
-                            hd[i * 4 + 2] = d[2]; hd[i * 4 + 3] = 0.0f;
-                        }
-                        DescriptorData hp[3] = {};
-                        hp[0].mIndex = SRT_RES_IDX(HosekCheckSrtData, PerBatch, gSkyView);
-                        hp[0].ppBuffers = &g_live.pSkyViewCbv[0];
-                        hp[1].mIndex = SRT_RES_IDX(HosekCheckSrtData, PerBatch, gHosekDirs);
-                        hp[1].ppBuffers = &g_live.pHosekDirsBuf;
-                        hp[2].mIndex = SRT_RES_IDX(HosekCheckSrtData, PerBatch, gHosekOut);
-                        hp[2].ppBuffers = &g_live.pHosekOutBuf;
-                        updateDescriptorSet(R, 0, g_live.pHosekCheckSet, 3, hp);
+                if (g_live.pAtmosTransPipeline && g_live.pAtmosMsPipeline && g_live.pAtmosSkyPipeline
+                    && g_live.pAtmosShPipeline && g_live.pAtmosSet && g_live.pAtmosParamsCbv
+                    && g_live.pAtmosTransmittance && g_live.pAtmosMultiScatter && g_live.pAtmosSkyView
+                    && g_live.pAtmosShOut && g_live.pAtmosShReadback) {
+                    // ⚠ mCount = 1 ON EVERY SINGLE-TEXTURE BIND, SRV AND UAV ALIKE. Without it the
+                    // descriptor count is 0 and the slot binds NOTHING — the UAV write vanishes and
+                    // the SRV read returns garbage, both silently. This file's other single-texture
+                    // binds all carry the same note, and it is the single most repeated bring-up bug
+                    // in the host.
+                    //
+                    // ⚠ AND EVERY SLOT IS BOUND IN EVERY INSTANCE, INCLUDING THE ONES A PASS IGNORES.
+                    // An unwritten descriptor is undefined heap memory rather than a null read, so a
+                    // "harmless" unbound SRV is a LUT-shaped view of whatever texture happened to sit
+                    // at that heap offset. Binding it type-valid costs nothing.
+                    for (uint32_t inst = 0; inst < 4; ++inst) {
+                        Texture* outTex = (inst == 0) ? g_live.pAtmosTransmittance
+                                        : (inst == 1) ? g_live.pAtmosMultiScatter
+                                        : (inst == 2) ? g_live.pAtmosSkyView
+                                                      : g_live.pAtmosSkyView;   // SH pass writes no texture
+                        DescriptorData d[6] = {};
+                        d[0].mIndex = SRT_RES_IDX(AtmosphereSrtData, PerBatch, gAtmosParams);
+                        d[0].ppBuffers = &g_live.pAtmosParamsCbv;
+                        d[1].mIndex = SRT_RES_IDX(AtmosphereSrtData, PerBatch, gAtmosTransmittance);
+                        d[1].mCount = 1; d[1].ppTextures = &g_live.pAtmosTransmittance;
+                        d[2].mIndex = SRT_RES_IDX(AtmosphereSrtData, PerBatch, gAtmosMultiScatter);
+                        d[2].mCount = 1; d[2].ppTextures = &g_live.pAtmosMultiScatter;
+                        d[3].mIndex = SRT_RES_IDX(AtmosphereSrtData, PerBatch, gAtmosOutA);
+                        d[3].mCount = 1; d[3].ppTextures = &outTex;
+                        d[4].mIndex = SRT_RES_IDX(AtmosphereSrtData, PerBatch, gAtmosShOut);
+                        d[4].ppBuffers = &g_live.pAtmosShOut;
+                        d[5].mIndex = SRT_RES_IDX(AtmosphereSrtData, PerBatch, gAtmosSkyView);
+                        d[5].mCount = 1; d[5].ppTextures = &g_live.pAtmosSkyView;
+                        updateDescriptorSet(R, inst, g_live.pAtmosSet, 6, d);
                     }
+                    g_live.atmosReady = true;
                 }
-                if (!g_live.pHosekCheckPipeline || !g_live.pHosekCheckSet || !g_live.pHosekOutBuf) {
-                    std::printf("[forge] Hosek cross-check unavailable — the physical sky still "
-                                "renders, its C++/FSL agreement is simply UNVERIFIED\n");
+                if (!g_live.atmosReady) {
+                    std::printf("[forge][atmos] LUT chain unavailable (shader/pipeline/resource) — "
+                                "the exterior sky falls back to MW's own mesh\n");
+                    LOG::logline("!! [forge][atmos] LUT chain FAILED to build — no physical sky");
+                }
+
+                // ─── THE ONE CONSTANT THE MEDIUM CANNOT MAKE UP, PRINTED WITH ITS CORROBORATIONS ──
+                // ⚠⚠ THIS IS WHERE THE PHASE'S HONESTY LIVES. E_TOA is integrated once from a Planck
+                // source against the CIE observer (atmosphere.cpp) and is NEVER FITTED — which is
+                // exactly what turns S2b's gate from an identity into a test. Hosek SOLVED its beam
+                // scale so the reference sun share came out at 0.80 by construction; here the beam is
+                // E_TOA x transmittance with no free parameter, so `sun%`, `q` and the 94 klx can all
+                // genuinely miss.
+                //
+                // The three numbers beside it are falsification tests nothing is tuned to: the source's
+                // luminous efficacy (a ~5800 K body must land near 93 lm/W), the extraterrestrial
+                // illuminance (published 127-134 klx), and the observer fit's own normalisation
+                // (integral of ybar over 360..830 nm, whose CIE table value is 106.86 — a check on the
+                // FIT rather than on the sun).
+                {
+                    const Atmosphere::SolarReport sr = Atmosphere::solarReport();
+                    LOG::logline(">> [forge-atmos] E_TOA = (%.2f, %.2f, %.2f) W/m2 per sRGB primary"
+                                 " | %.0f lx (published 127000-134000) | efficacy %.1f lm/W (a %.0fK"
+                                 " body: ~93) | xy=(%.4f, %.4f) | observer norm %.2f (CIE 106.86)"
+                                 " | 1 scene unit = %.0f cd/m2 (PINNED)",
+                                 (double)sr.rgb[0], (double)sr.rgb[1], (double)sr.rgb[2],
+                                 sr.lux, sr.efficacyLmW, sr.tempK, sr.chromX, sr.chromY,
+                                 sr.ybarIntegral, SceneCal::kSceneUnitCd);
+                    LOG::flush();
                 }
             }
             // AO set: ONE PerDraw set (gAOParams cbuffer + gLinearDepthIn SRV + gAOOut UAV), shared
@@ -10276,7 +11446,7 @@ namespace {
                 // moved the dispatch past the resolve. It wraps the shared cross-process resource,
                 // is created with DESCRIPTOR_TYPE_TEXTURE (so it is SRV-bindable), is always
                 // single-sample, and has existed since init(). The old "MSAA colour when AA is on"
-                // branch went with the move: pMSAAColor now carries scene-referred values whenever
+                // branch went with the move: pSceneColor now carries scene-referred values whenever
                 // fp16 is on, and averaging those would break every APL number ever recorded.
                 Texture* aplSrc = g_live.pRT->pTexture;
                 DescriptorData d[4] = {};
@@ -10298,9 +11468,9 @@ namespace {
             }
             // Custom resolve (step 4): the MSAA colour as a Tex2DMS SRV + its params cbuffer. Bound
             // ONCE — neither resource is ever recreated without rebuilding this path, and the live
-            // knobs ride the cbuffer contents, not the descriptor. Guarded on pMSAAColor for the same
+            // knobs ride the cbuffer contents, not the descriptor. Guarded on pSceneColor for the same
             // reason the pipeline is: MSAA-only pass.
-            if (g_live.pResolveSet && g_live.pResolveParamsCbv && g_live.pMSAAColor) {
+            if (g_live.pResolveSet && g_live.pResolveParamsCbv && g_live.pSceneColor) {
                 // ...and since step 4's bloom, the pyramid's mip 0 as a third slot. It is bound
                 // UNCONDITIONALLY, because a descriptor set with an unwritten slot reads whatever was
                 // last in that heap slot — the failure mode this file's other single-texture binds all
@@ -10322,11 +11492,31 @@ namespace {
                 d[0].ppBuffers  = &g_live.pResolveParamsCbv;
                 d[1].mIndex     = SRT_RES_IDX(ResolveSrtData, PerDraw, gResolveSource);
                 d[1].mCount     = 1;                     // REQUIRED for a single texture — see above
-                d[1].ppTextures = &g_live.pMSAAColor->pTexture;
+                d[1].ppTextures = &g_live.pSceneColor->pTexture;
                 d[2].mIndex     = SRT_RES_IDX(ResolveSrtData, PerDraw, gBloomTex);
                 d[2].mCount     = 1;
                 d[2].ppTextures = &bloomTex;
                 updateDescriptorSet(R, 0, g_live.pResolveSet, bloomTex ? 3 : 2, d);
+                // ...and INSTANCE 1: the same set with the UPSCALER'S OUTPUT in the source slot
+                // (M1 4b). Built once, right here, beside the instance it is the alternative to, so
+                // the two can never drift apart — every other slot is identical by construction
+                // because it is the same DescriptorData array with one pointer changed.
+                //
+                // ⚠ THE FRAME PICKS BETWEEN THEM WITH cmdBindDescriptorSet's INDEX, nothing else.
+                // No mid-frame updateDescriptorSet, no second SRT, no second pipeline: an SRV binds
+                // either texture, because at 1x both are single-sample RGBA16F. That is the entire
+                // cost of making the resolve able to read an upscaled frame.
+                //
+                // Only when a backend exists at all — which is only at sampleCount == 1, where the
+                // frag is resolve_sc1 and gResolveSource is a plain Tex2D. Above 1x this instance
+                // stays unwritten AND unbound (the backend refused to exist, so `upscaled` can never
+                // be true), which is what keeps a single-sample texture away from a Tex2DMS
+                // declaration.
+                if (g_live.pUpscaler && g_live.pUpscaler->outputTexture()) {
+                    Texture* upsTex = g_live.pUpscaler->outputTexture();
+                    d[1].ppTextures = &upsTex;
+                    updateDescriptorSet(R, 1, g_live.pResolveSet, bloomTex ? 3 : 2, d);
+                }
                 if (!bloomTex) {
                     std::printf("[forge][bloom] no fallback texture for gBloomTex — resolve set bound"
                                 " with 2 of 3 slots; bloom strength is forced to 0\n");
@@ -10786,7 +11976,7 @@ namespace {
                 Texture* vol  = g_live.pWaterNormalVol ? g_live.pWaterNormalVol : g_live.pDefaultWhite;
                 Texture* refr = g_live.pRefractColor   ? g_live.pRefractColor   : g_live.pDefaultWhite;
                 Texture* lin  = g_live.pLinearDepth    ? g_live.pLinearDepth    : g_live.pDefaultWhite;
-                DescriptorData p[20] = {};   // was 15; +gSkyHeight, +gSunOcc (and headroom)
+                DescriptorData p[24] = {};   // was 15; +gSkyHeight, +gSunOcc, +the atmosphere pair (and headroom)
                 p[0].mIndex = SRT_RES_IDX(SrtData, PerFrame, gFrameData);
                 p[0].ppBuffers = &g_live.pFPFrameCbv;
                 p[1].mIndex = SRT_RES_IDX(SrtData, PerFrame, gAO);
@@ -10865,6 +12055,32 @@ namespace {
                 if (g_live.pSunOcc) {
                     p[fpn].mIndex = SRT_RES_IDX(SrtData, PerFrame, gSunOcc);
                     p[fpn].mCount = 1; p[fpn].ppTextures = &g_live.pSunOcc;
+                    ++fpn;
+                }
+                // ─── S2: THE ATMOSPHERE, bound beside the sun occlusion it will eventually replace half of ───
+                // gAtmosSkyView is the sky's radiance in every direction from the camera; gAtmosParams is what
+                // turns a world direction into a uv in it. skyhw.frag reads both, and S3's applyFog() will read
+                // the same pair through this same set — aerial perspective is the same integral as the sky,
+                // which is the whole reason the fog and the horizon stop being two colours.
+                //
+                // ⚠ BOUND EVERYWHERE, INCLUDING PASSES THAT NEVER SAMPLE IT. An unbound SRV reads undefined heap
+                // memory rather than nulls, and a CBV descriptor that was never written is not a zeroed struct —
+                // it is whatever sat at that heap offset, which the shader would read as a planet radius.
+                if (g_live.pAtmosSkyView) {
+                    p[fpn].mIndex = SRT_RES_IDX(SrtData, PerFrame, gAtmosSkyView);
+                    p[fpn].mCount = 1;
+                    p[fpn].ppTextures = &g_live.pAtmosSkyView;
+                    ++fpn;
+                }
+                if (g_live.pAtmosTransmittance) {
+                    p[fpn].mIndex = SRT_RES_IDX(SrtData, PerFrame, gAtmosTransmittance);
+                    p[fpn].mCount = 1;
+                    p[fpn].ppTextures = &g_live.pAtmosTransmittance;
+                    ++fpn;
+                }
+                if (g_live.pAtmosParamsCbv) {
+                    p[fpn].mIndex = SRT_RES_IDX(SrtData, PerFrame, gAtmosParams);
+                    p[fpn].ppBuffers = &g_live.pAtmosParamsCbv;
                     ++fpn;
                 }
                 // gSkyColor: the arms run opaque.frag, which now fogs through it. The arm camera is
@@ -12005,7 +13221,7 @@ namespace {
     // stays OFF (separate wrap term; redundant with two-sided lighting). Live toggles, Alpha tab.
     bool  g_alphaTwoSidedLight    = true;
     float g_alphaTransmitStrength = 0.0f;
-    // Separate opacity threshold for alpha SHADOW RECEPTION (froxelZ.z), DECOUPLED from the fold-fix
+    // Separate opacity threshold for alpha SHADOW RECEPTION (alphaShadowParams.x), DECOUPLED from the fold-fix
     // "depth-write opacity" (g_alphaDepthRef, 0.95): a paper curtain is ~0.6-0.9 opaque and should
     // receive its own shadow, but the fold-fix must stay high so semi-transparent surfaces don't
     // depth-kill each other. Sheets at/above this write into the dedicated pAlphaShadowDepth that
@@ -12333,6 +13549,113 @@ namespace {
     // resolve.frag.fsl for the derivation of all three. Live, because it is a look A/B.
     float    g_resolveDither   = 1.0f;
 
+    // --- M1 TEMPORAL JITTER (tasks/forge-upscale.md) ---------------------------------------------
+    // A sub-pixel offset added to the projection, different every frame, walking a low-discrepancy
+    // sequence. On its own it does NOTHING useful — it makes the image shimmer. It is the INPUT a
+    // temporal upscaler reconstructs from: the accumulator gets a different sample position each
+    // frame and can therefore recover detail one sample per pixel never carried.
+    //
+    // ⚠ SHIPS AT 0 = OFF, and 0 is bit-identical to the build before this lane existed (the offset
+    // is added to the same dx/dy the half-pixel correction already applied, so amplitude 0 adds
+    // literally zero). Nothing accumulates yet, so turning it on before M1's upscaler lands buys
+    // crawling foliage and nothing else. That IS the isolation test the plan asks for: at step 2 the
+    // image must shimmer SUB-PIXEL and the `atmos=`/gate rows must not move at all.
+    //
+    // Amplitude in PIXELS, peak-to-peak. 1.0 spreads samples over exactly one pixel, which is the
+    // textbook choice and what DLSS/FSR2 expect; smaller trades reconstruction for less crawl.
+    float    g_jitterAmp    = 0.0f;
+    // Sequence length. Halton is aperiodic, so this is where we CHOOSE to wrap — and wrapping is
+    // wanted: a phase count the accumulator's history depth is a multiple of converges to an even
+    // sample distribution instead of drifting through one forever. 8 is the standard 1:1 figure;
+    // an upscaler at input scale s wants ~8/s² and that is the number to raise this to when the
+    // DLSS backend lands, NOT a value to guess now.
+    float    g_jitterPhases = 8.0f;
+
+    // THIS FRAME's offset, in pixels, +x right / +y down — the same sense the half-pixel term uses.
+    // Computed ONCE per RENDERED frame (advanceJitter, at the top of renderScene) and then read by
+    // every view that registers against the main screen. Not recomputed per call: the main pass and
+    // the FP pass are the same screen in the same frame and a second draw from the sequence would
+    // put the arms half a pixel away from the world behind them.
+    //
+    // ⚠ RENDERED frames, not PRODUCED ones. Park mode (produce mode 3) and frame-ahead both
+    // re-render a parked payload at a new camera, so the sequence has to advance where the raster
+    // happens — [[project_forge_park_mode]], and the plan's own risk list says the same thing about
+    // the history.
+    float    g_jitterPx[2]  = { 0.0f, 0.0f };
+    uint32_t g_jitterIndex  = 0;
+
+    // --- M1 CAMERA-ONLY MOTION VECTORS (tasks/forge-upscale.md) ----------------------------------
+    // Ships OFF: nothing consumes the vectors until the upscaler lands, and a dispatch whose output
+    // no one reads is pure cost. It costs one 8x8 compute pass over the render rect plus, when water
+    // and volumetric fog are both off, one extra depth re-linearize it has to force (the seam refresh
+    // is otherwise gated on those two consumers, and the pre-colour snapshot is missing every DL
+    // static — see motionvectors.srt.h).
+    bool     g_mvEnable = false;
+    // M1 step 3, THE REACTIVE MASK — a RELATIVE depth error, so the thresholds are unitless and hold
+    // at every distance (motionvectors.comp explains why an absolute epsilon cannot).
+    // 0.02 = 2% of the distance: comfortably above the reprojection's own round-off and below any
+    // real independent motion. Fully reactive by 8%. Re-derive these against the field statistics
+    // rather than inheriting them — [[feedback_prior_art_constants_dont_transfer]] — the numbers a
+    // reference implementation ships were tuned on its own depth range.
+    float    g_mvReactiveT0   = 0.02f;
+    float    g_mvReactiveT1   = 0.08f;
+    // Output gain. 0 = the mask is identically zero, which is the bit-identity arm AND the isolation
+    // arm for "is the mask making this worse".
+    float    g_mvReactiveGain = 1.0f;
+    // ⚠ THE F12 VIEW FORCES THE PASS ON. Wiring "show me the motion vectors" to a mode that leaves
+    // the producing dispatch disabled is [[feedback_isolation_lever_killed_its_own_subject]] exactly:
+    // the lever would kill its own subject and the view would show a stale or empty buffer that reads
+    // as "the vectors are broken". mvActive folds the two.
+
+    // The previous RENDERED frame's camera, kept for the reprojection. Two halves, and BOTH are
+    // required — see motionvectors.srt.h for why the second one is the whole difficulty:
+    //   g_prevViewProj — last frame's rzViewProj, exactly as rendered (its own half-pixel AND its own
+    //                    jitter included, because the image it maps to was rasterised with them).
+    //   g_prevBakeEye  — the ABSOLUTE world eye that last frame's payload was built relative to
+    //                    (lighting[24..26]). In produce mode 3 this is NOT last frame's camera
+    //                    position and NOT this frame's bake eye; it is the origin last frame's
+    //                    matrix expects, and reprojecting without it is wrong by a whole frame of
+    //                    camera motion. Kept as DOUBLE: the values are absolute world coordinates in
+    //                    the tens of thousands and the difference that matters is tens of units, so
+    //                    the subtraction is done in double even though the wire delivers float32.
+    float    g_prevViewProj[16] = {};
+    double   g_prevBakeEye[3]   = { 0.0, 0.0, 0.0 };
+    // 0 = there is no previous frame to reproject into (first frame, a resize, a device reset). The
+    // shader writes zeros then, which is the honest answer: an accumulator told "nothing moved"
+    // reuses history it should not, but one handed a garbage vector fetches from an arbitrary place.
+    bool     g_prevViewProjValid = false;
+    // ⚠ AND A SEPARATE FLAG FOR THE PREVIOUS DEPTH, which is NOT the same question. pMvPrevDepth is
+    // created with undefined contents and is only filled by the dispatch's own tail — so on the
+    // frame after the pass is TOGGLED ON mid-session, g_prevViewProjValid is long since true while
+    // the depth texture still holds whatever the allocator handed us. One frame of a garbage mask,
+    // on exactly the action (flipping the knob) that an A/B invites you to repeat.
+    bool     g_mvPrevDepthValid = false;
+    // Heartbeat only: did the dispatch actually run this frame. "The vectors look wrong" and "the
+    // pass never ran" are the same picture, and a minimized run has no other way to tell them apart.
+    bool     g_lastMvRan = false;
+    // ...and the ORIGIN DELTA the dispatch actually folded in, stashed at fill time.
+    // ⚠ IT CANNOT BE RECOMPUTED AT HEARTBEAT TIME. The end-of-frame snapshot overwrites
+    // g_prevBakeEye before the heartbeat runs, so a delta computed there is identically zero — which
+    // would make the log report "the origins agree" on every frame including the ones where they do
+    // not, i.e. the instrument would confirm the bug it exists to expose. Report what was USED.
+    double   g_lastMvDelta[3] = { 0.0, 0.0, 0.0 };
+    // ...and what that delta is WORTH, in pixels at a reference point: the distance between the
+    // folded reprojection and the naive one. See the fill site — this is the bug's magnitude, and
+    // logging it is the only way an unattended run can see a defect that is zero whenever the camera
+    // is still.
+    float    g_lastMvOriginFixPx = 0.0f;
+    float    g_lastMvRefDist     = 0.0f;
+    // ⚠⚠ AND THE PEAK OVER THE HEARTBEAT WINDOW, WHICH IS THE NUMBER THAT ACTUALLY ANSWERS THE
+    // QUESTION. The instantaneous values above are sampled on ONE frame in 300, and a player is
+    // stationary for most of any 300 frames — so the first live readings were `dBake=(+0.000,
+    // +0.000, +0.000)` and `0.000 px` taken while the bakeEye had visibly moved a unit between
+    // heartbeats. An instrument built to measure "how bad is this AT SPEED" that samples an
+    // arbitrary frame will report the still ones, i.e. it reports zero precisely when there is
+    // something to see. Track the max and reset it at each heartbeat.
+    double   g_mvDeltaMaxLen  = 0.0;   // largest |bakeEye_now - bakeEye_prev| in the window, units
+    float    g_mvFoldMaxPx    = 0.0f;  // ...and the fold's worth at the reference point, px
+    float    g_mvFoldMaxAt1k  = 0.0f;  // ...scaled to 1000 u, the comparable figure
+
     // --- BLOOM (tasks/forge-postprocess.md step 4) -----------------------------------------------
     // The last card on the post-process plan and the one every earlier step was clearing the way for.
     // Three files recorded the same blocker — scenecolor.h.fsl:5 ("bloom had nothing to bloom from"
@@ -12367,10 +13690,10 @@ namespace {
     // a [1,2,1] blur". See bloomup.comp.fsl for the kernel and why it is centred on the dst texel's
     // true sub-texel position rather than on the nearest src texel.
     float    g_bloomRadius = 1.0f;
-    // Level CAP for A/B, not the level count. The ACTIVE count is derived per frame from the render
-    // rect (bloomLevels()) so the bloom's angular reach is resolution-independent and follows the
-    // render-scale slider for free; this only clamps it from above, so dragging it down is the "how
-    // much of the reach is the wide skirt actually buying" experiment.
+    // Level CAP for A/B, not the level count. The ACTIVE count is derived per frame from the
+    // DELIVERED rect (bloomLevels(), M1 4c) so the bloom's angular reach is resolution-independent
+    // and survives the render-scale slider; this only clamps it from above, so dragging it down is
+    // the "how much of the reach is the wide skirt actually buying" experiment.
     float    g_bloomLevelCap = (float)kBloomMipCount;
     // THE PSF EXPONENT — the up chain's accumulation factor in `dst = lerp(dst, up(src), b)`.
     //
@@ -12436,7 +13759,7 @@ namespace {
     bool     g_bloomInvLuma = false;
 
     // ⚠ EVERY DISPATCH AND EVERY TAP IS BOUNDED BY THE **RENDER** RECT AT ITS LEVEL, not by the
-    // allocation ([[project_forge_alloc_vs_render_uv]]). pMSAAColor is alloc-sized while the scene
+    // allocation ([[project_forge_alloc_vs_render_uv]]). pSceneColor is alloc-sized while the scene
     // draws into a width x height sub-rect; at render scale 1.00x that is a QUARTER of the allocation
     // and the rest holds last frame's texels. Level m's render extent is ceil(render / 2^(m+1)), and
     // repeated ceil-halving equals ceil(w / 2^n), so writing it closed-form makes the chain exact
@@ -12454,20 +13777,27 @@ namespace {
         return std::max(1u, std::min(r, a));
     }
 
-    // How many pyramid levels this frame actually uses. DERIVED FROM THE RENDER RECT, which is the
-    // point: the bloom's angular reach then stays put when the render-scale slider moves (each level
-    // is one octave of the frame, not one octave of some fixed pixel count), and a 0.5x frame simply
-    // stops one level earlier. Verification step 6 is this function.
+    // How many pyramid levels this frame actually uses. DERIVED FROM THE **DELIVERED** RECT — the
+    // extent of the image the resolve reads, i.e. the OUTPUT rect on an upscaled frame and the raster
+    // rect otherwise — and TAKEN AS AN ARGUMENT rather than read out of g_live, so there is no second
+    // answer to "which rect" hiding inside this function (M1 4c).
+    //
+    // That is the whole point of it: the bloom's angular reach stays put when the render-scale slider
+    // moves, because each level is one octave OF THE FRAME rather than one octave of some fixed pixel
+    // count. ⚠ Until 4c it read g_live.width — the RASTER rect — so an upscaled frame genuinely did
+    // stop one level earlier: `bloom 0.11(L7) -> 0.05(L6)` at inputScale 0.5, an octave of glow reach
+    // deleted by a resolution slider. The old comment claimed this invariant while measuring the
+    // wrong rect, which is what made the defect invisible.
     //
     // Stops once a level would be 8 texels or smaller on either axis — below that the tent's clamp
     // dominates the filter and the level contributes a near-constant, i.e. exactly the flat haze the
     // thresholdless form exists to avoid.
-    inline uint32_t bloomLevels() {
+    inline uint32_t bloomLevels(uint32_t deliveredW, uint32_t deliveredH) {
         const uint32_t cap = (uint32_t)std::max(1.0f, std::min((float)kBloomMipCount, g_bloomLevelCap));
         uint32_t n = 1;
         while (n < cap) {
-            const uint32_t w = bloomLevelDim(g_live.width,  g_live.allocWidth,  n);
-            const uint32_t h = bloomLevelDim(g_live.height, g_live.allocHeight, n);
+            const uint32_t w = bloomLevelDim(deliveredW, g_live.allocWidth,  n);
+            const uint32_t h = bloomLevelDim(deliveredH, g_live.allocHeight, n);
             if (std::min(w, h) <= 8u) { break; }
             ++n;
         }
@@ -12805,6 +14135,13 @@ namespace {
     // sunset roughly as far the wrong way as it currently is the right way.
     // Initialised to the day anchor so a frame that arrives before any lighting does (the scene
     // probe, the viewer) reports the row the anchor was authored against rather than a black one.
+    // What the LAND melts into: gFrameData.fogColNear.rgb AFTER the scene-referred lift and the
+    // authored decode, i.e. the exact triple applyFog() hands back at full fog. Mirrored here so the
+    // [sky] heartbeat can print it beside the medium's below-horizon answer, which is what the WATER
+    // and every downward pixel melt into. Two fog targets in one frame is a defect you cannot see in
+    // a log unless both are on the same line.
+    float g_fogNearScene[3] = { 0.0f, 0.0f, 0.0f };
+
     float g_mwAmbCode = 0.552182f;   // luma of [Weather Clear] Ambient Day Color 137,140,160
     float g_mwSunCode = 0.986772f;   // luma of [Weather Clear] Sun Day Color     255,252,238
 
@@ -13156,10 +14493,11 @@ namespace {
     // Every "what should the sky read" number in P1 was a symptom of the sky and the light being two
     // objects. [[project_forge_sky_is_a_display_code]]
     //
-    // ⚠ hosek.h OWNS EVERY CONSTANT. Nothing here is a magic number: turbidity and albedo are the
-    // model's own inputs, and the two lanes below are A/B levers, not tuning. Read the block comment
-    // at the top of hosek.h before touching any of it — in particular the two absolute anchors
-    // (kSceneUnitCd and the sun-beam solve) and WHY the H-W solar-radiance function is not used.
+    // ⚠ scenecal.h AND atmosphere.h OWN EVERY CONSTANT. Nothing here is a magic number: albedo is
+    // the medium's own ground boundary condition and the two lanes below are A/B levers, not tuning.
+    // Read scenecal.h before touching any of it — in particular kSceneUnitCd, which is PINNED and is
+    // what every absolute lane in the renderer is stated against, and atmosphere.cpp's note on why
+    // E_TOA is integrated rather than fitted.
     bool  g_skyHw        = true;    // master. OFF = MW's sky mesh draws again, lighting reverts (A/B)
     // ⚠ THE ONE KNOB WITH REAL AUTHORITY THIS PHASE, and it is the model's own parameter rather than
     // a taste dial: turbidity moves haze, horizon/zenith ratio, circumsolar spread AND the sun's
@@ -13175,6 +14513,59 @@ namespace {
     // light (the lighting blend below is the other half), which is what separates "the sky looks
     // wrong" from "the lighting looks wrong" during a bring-up.
     float g_skyHwStrength = 1.0f;
+
+    // ─── S2: THE ATMOSPHERE'S OWN KNOBS ──────────────────────────────────────────────────────────
+    //
+    // ⚠ g_skyTurbidity ABOVE IS RETIRED BY S2 AND IS NO LONGER READ BY THE SKY. The medium takes
+    // Rayleigh, Mie and ozone directly from `atmosphereAt()` — MW's live weather through the S1
+    // table — so a turbidity slider would be a SECOND, DISAGREEING way to say the same thing, and
+    // whichever one the sky happened to read would silently decide the other's meaning. It survives
+    // as a variable only because the retired Hosek-era `[sky]` heartbeat lane still prints it while
+    // the two models' log lines sit side by side; the panel slider is gone.
+    //
+    // g_skyAlbedo STAYS, and it is not a look knob either: it is the medium's GROUND BOUNDARY
+    // CONDITION, and the multiscatter LUT integrates the light that bounces off it back up into the
+    // air. Vvardenfell is ash — 0.10.
+    //
+    // THE MARCH BUDGETS are the only real cost dial in the phase. The sky-view LUT's step count is
+    // the one that matters (192x108 texels x N steps); the multiscatter pass is 32x32 and its cost
+    // is noise at any setting worth using.
+    float g_atmosSkySteps  = 32.0f;   // sky-view march steps per texel
+    // ⚠ THE ACTUAL COST DIAL, AND IT IS NOT THE ONE THE PLAN EXPECTED. Measured on the harness
+    // scene: the transmittance LUT at 40 vs 128 steps differs by 0.01 ms, and HALVING the sky-view
+    // march saves 0.01 ms — while the whole chain sits at 0.37 ms. Nearly all of it is the
+    // multiscatter pass, which is 32x32 texels x nDirs^2 directions x 20 steps and is therefore
+    // QUADRATIC in this number. 8 is Hillaire's published value and the shipped default; 4 quarters
+    // the pass's work. Lowering it makes the sky's multiple-scattering term noisier, which is the
+    // term the S2b gate's whole nit row is a statement about — so this is a budget lever to reach
+    // for after the gate is settled, not before.
+    float g_atmosMsDirs    = 8.0f;    // sqrt of the multiscatter direction count (2..8)
+    // ⚠ THE AIRGLOW FLOOR IS WHAT STOPS "THE SUN IS DOWN" FROM MEANING "THERE ARE NO PHOTONS" (S2e).
+    // A medium is perfectly happy to return exactly zero once nothing illuminates it, and zero is a
+    // number the exposure servo cannot meter — it would ramp E to its ceiling against a black frame.
+    // The real quantity (airglow + zodiacal light + unresolved starlight) is ~1e-4 cd/m2, which is
+    // far below anything this exposure range can show, so this is authored at the level where the
+    // night sky reads as sky rather than as a hole. Same wall the star and cloud-night lanes hit,
+    // same shape, and stated in the same native units the rest of the medium works in.
+    float g_atmosAirglow   = 2.0e-4f;
+    // ⚠⚠ THE MOON IS A SECOND SOURCE IN THE SAME INTEGRAL, NOT A SECOND MODEL (S2e). Its irradiance
+    // enters atmos_skyview.comp exactly where the sun's does, so moonlight is Rayleigh-scattered
+    // into a blue night sky by the identical arithmetic that makes the day sky blue. That is a thing
+    // a "fade to black" ramp could never produce, and it is why night stops being black structurally
+    // rather than by a lift.
+    //
+    // The physical ratio is ~1/400,000 of sunlight at full moon. Stated as a FRACTION of E_TOA
+    // rather than as an absolute so it tracks the one constant the phase is anchored on, and set
+    // ABOVE the physical value on purpose: at 1/400,000 the moonlit sky is ~0.003 cd/m2, which the
+    // servo can only reach by running an exposure that would turn the star field into a wall of
+    // noise. This is the authored stand-in for a night-adapted eye, and it is a lane of its own so
+    // that the fudge is VISIBLE rather than buried in a scale somewhere.
+    float g_atmosMoonScale = 1.0e-5f;
+    bool  g_atmosMoonOn    = true;
+    // The S2b GATE's arming lane. OFF skips the reference-configuration dispatch entirely — which is
+    // the setting for a session that does not want one frame of forced parameters at startup, and
+    // NOT the setting for a bring-up. It defaults ON because a gate nobody runs is a gate nobody has.
+    bool  g_atmosGate      = true;
     // ⚠⚠ THE BLEND LANE, AND IT IS NOT OPTIONAL. 0 = today's MW sunCol/ambCol exactly, bit for bit;
     // 1 = fully physical. This step moves ALL exterior lighting at once — measured at the reference
     // configuration, the physical sun:ambient ratio is 6.06 against MW's authored 1.79, i.e. shadows
@@ -13239,7 +14630,7 @@ namespace {
         // sin(N.L) off MW's LIGHT elevation. Falls back to the day anchor's own sine when the model
         // is not cooked, so "no physical sky" reports the row rather than an accidental midnight.
         const float sinEl = g_skyPhys.active
-            ? std::max(0.0f, std::sin(g_skyPhys.elevLight * (float)(Hosek::kPi / 180.0)))
+            ? std::max(0.0f, std::sin(g_skyPhys.elevLight * (float)(SceneCal::kPi / 180.0)))
             : kCalDayElevSin;
         return ambCode + g_calSunWeight * sinEl * g_mwSunCode;
     }
@@ -13270,8 +14661,12 @@ namespace {
     // THE STARS. One radiance, in SCENE units, drawn ADDITIVELY over the physical sky — so this
     // single number decides both day invisibility and night visibility and there is no fade curve
     // anywhere. It is DERIVED, not tasted:
-    //   * the reference clear day's zenith is L = (2.106, 3.705, 7.530) native (hosek.h's own
-    //     kRefCases[0] probe at cosTheta 1), luma 3.641, i.e. 3.641 * kNativeToScene = 0.0785 scene;
+    //   * the reference clear day's zenith was L = (2.106, 3.705, 7.530) native under the retired
+    //     closed form, luma 3.641, i.e. 3.641 * kNativeToScene = 0.0785 scene. ⚠ THE MEDIUM MOVES
+    //     THIS, ON PURPOSE AND BY ABOUT 15%: the old model computed q = 0.100 at the reference where
+    //     real clear skies sit at 0.122, so anything landing inside the measured band MUST shift the
+    //     zenith. The heartbeat prints the star lane as a LIVE % of the drawn zenith for exactly
+    //     this reason — the ratio is what to judge, and the derivation below is the ratio's origin;
     //   * AgX's response there is ~49 display codes per NAT of scene radiance, so one code of
     //     display change costs ~2% of the level underneath it;
     //   * 3% of the day zenith therefore moves a daytime pixel by about one code — "below the
@@ -15318,10 +16713,20 @@ namespace {
     // That is exactly what adding mode 13 in Phase A did: the client's cycle went to %14, this table
     // stayed at 13. ADD THE NAME IN THE SAME COMMIT AS THE MODE. setDebugMode() clamps as the
     // backstop, so a future client-side mode degrades to "clamped and visible" instead of a crash.
+    //
+    // ⚠⚠ AND IT HAD ALREADY DRIFTED, IN THE DIRECTION THE NOTE ABOVE DOES NOT WARN ABOUT. Modes 15
+    // and 16 (the atmosphere sky-view / transmittance overlays) were added to the RENDERER in S2a
+    // but never to this table, and the client's cycle stayed at `% 15`. setDebugMode()'s clamp then
+    // did its job perfectly and made them UNREACHABLE — two debug views that existed, compiled,
+    // drew, and could not be selected by any means. Found while adding mode 17 (M1 motion vectors);
+    // the table and the client modulus are corrected here in the same commit the new mode lands in,
+    // which is exactly what the paragraph above asks for and what nobody did last time.
     const char* const kDebugModeNames[] = { "0 normal", "1 depth", "2 scatter", "3 AO", "4 bent-normal",
                                             "5 albedo", "6 lit", "7 ambient", "8 world-normal", "9 light-count",
                                             "10 shadow-mask", "11 shadow-atlas (static)", "12 shadow-atlas (dyn)",
-                                            "13 sun moments (cascade atlas)", "14 sky height map" };
+                                            "13 sun moments (cascade atlas)", "14 sky height map",
+                                            "15 atmos sky-view LUT", "16 atmos transmittance LUT",
+                                            "17 motion vectors", "18 reactive mask" };
     constexpr uint32_t kDebugModeCount = (uint32_t)(sizeof(kDebugModeNames) / sizeof(kDebugModeNames[0]));
 
     // The dev panel outgrew a flat widget list (~250 entries → unreadable). TabBuilder groups them
@@ -15616,11 +17021,78 @@ namespace {
           // two knobs above it does not trade against them — dither is orthogonal to the filter.
           t.sliderF("Output dither (LSB; 1 = TPDF, 0.5 = black-safe, 0 = off)",
                     &g_resolveDither, 0.0f, 2.0f, 0.25f);
+          // -- M1 TEMPORAL JITTER (tasks/forge-upscale.md) --
+          // Lives on this tab because it is the OTHER half of the same question the resolve answers:
+          // where do the samples land. The resolve reconstructs from sub-samples MSAA placed inside
+          // one frame; this places one sample per frame and leaves the reconstruction to an
+          // accumulator that does not exist yet.
+          // ⚠ 0 IS THE SHIPPED DEFAULT AND IT IS BIT-IDENTICAL. Until the upscaler lands, moving
+          // this off 0 buys crawling foliage and nothing else — it is here so the jitter can be
+          // verified ALONE (the plan's step 2), not because it improves anything on its own.
+          t.sliderF("Temporal jitter (px, 0 = off; needs an upscaler to be worth anything)",
+                    &g_jitterAmp, 0.0f, 1.5f, 0.05f);
+          t.sliderF("Jitter sequence length (Halton 2,3 phases)",
+                    &g_jitterPhases, 1.0f, 32.0f, 1.0f);
+          // M1 motion vectors. Off by default because nothing reads them yet; F12 mode 17 forces the
+          // pass on regardless, so the view can never be looking at a lane its own selection
+          // disabled ([[feedback_isolation_lever_killed_its_own_subject]]).
+          t.checkbox("Motion vectors (camera-only; F12 mode 17 forces this on)", &g_mvEnable);
+          // The reactive mask's two thresholds are a RELATIVE depth error, so they are unitless and
+          // hold at every distance. Walk them against `reactive=` on the heartbeat, not by eye:
+          // a mask covering the screen is the upscaler switched off and it looks like "soft".
+          t.sliderF("Reactive: onset (relative depth error)",  &g_mvReactiveT0, 0.0f, 0.20f, 0.005f);
+          t.sliderF("Reactive: full (relative depth error)",   &g_mvReactiveT1, 0.0f, 0.50f, 0.005f);
+          t.sliderF("Reactive: gain (0 = mask off, the A/B)",  &g_mvReactiveGain, 0.0f, 1.0f, 0.05f);
           // BISECT 2026-08-07: a read-only t.label() line lived here reporting the scene format.
           // t.label() had ZERO other callers in this file — the helper existed but had never been
           // executed — and the build carrying it crashed on a null D3D12 buffer resource in an
           // unrelated subsystem. Removed as the first bisect step; restore only once the crash is
           // understood, and the format is in the log as `>> [scenefmt]` regardless.
+          t.flush(); }
+
+        // -- Tab: Upscale (tasks/forge-upscale.md M1 step 4b) --
+        // ITS OWN TAB rather than more rows on "Resolve (MSAA)", on the same split that tab's own
+        // header already draws: Resolve owns the FILTER, Exposure owns LEVEL, Tonemap owns SHAPE,
+        // Bloom owns the SPILL — and this owns RESOLUTION. 4d adds backend select, quality mode,
+        // sharpness and a history reset, which is four more rows that have nothing to do with a
+        // Catmull-Rom reconstruction of MSAA sub-samples.
+        //
+        // ⚠ THE PANEL STILL CANNOT ARM THE FEATURE, ONLY DRIVE IT — but as of 2026-09-01 the backend
+        // ARMS BY DEFAULT, so in the ordinary case there is nothing left to arm and this slider does
+        // what it says. `upscaleEnable` is read at INIT (it decides whether the backend and its
+        // ~56 MB target are created at all), so there is still no checkbox: a checkbox that silently
+        // does nothing is worse than none. `MGE_HOST_KNOBS=upscaleEnable=0` is the off switch, and
+        // the startup log says whether the backend armed or which guard declined it.
+        //
+        // ⚠⚠ THE ONE CASE WHERE IT IS STILL INERT IS **MSAA ON**, where the guard refuses the backend
+        // (resolve_sc4.frag binds a Tex2DMS), which is why the label names it. Until upscaleScale()
+        // grew its armed gate, dragging this with no backend narrowed the raster with nothing to
+        // widen it back and the frame shrank into the top-left quadrant. It is now inert in that
+        // state rather than destructive — and an inert control that does not say what it needs is
+        // the next version of the same complaint.
+        { TabBuilder t; t.panel = g_uiPanel; t.name = "Upscale";
+          // THE INPUT SCALE, live, and the ONE knob 4a could not move.
+          // ⚠ 1.0 IS AN EXACT IDENTITY BY CONSTRUCTION, NOT BY MEASUREMENT — evaluate() returns the
+          // scene target unchanged, having recorded nothing, so at 1.0 there is no dispatch, no
+          // barrier, and no filter that has to be argued to be an identity. Which is also why sitting
+          // at 1.0 proves nothing about this seam: drag it to 0.5 and read `[rect]` and `upscale=`.
+          // Range is [0.33, 1.0] because alloc >= out >= in is the model and below a third the input
+          // rect stops being able to carry the frame; setRenderSize re-clamps and rounds to EVEN, so
+          // a value between two even rects lands on one of them rather than on an odd column the
+          // half-res AO and bloom chains would have to know about.
+          t.sliderF("Input scale (1.0 = exact identity; INERT while MSAA is on — the backend "
+                    "refuses there)",
+                    &g_upscaleInputScale, 0.33f, 1.0f, 0.01f);
+          // THE SPATIAL FILTER, and these two are here for a measurement rather than for taste.
+          // Since 4c the bloom pyramid reads this pass's OUTPUT, so this filter is upstream of an
+          // ENERGY operation — and the anti-ringing clamp is not energy-conserving. Drag the input
+          // scale to 0.5, boost bloom's strength so the effect is above the flicker, then toggle the
+          // clamp: if the glow comes back, the clamp is what is eating it.
+          // ⚠ 0 IS A DIAGNOSTIC ARM, NOT A SETTING. Catmull-Rom's outer lobe is negative and this
+          // source is unbounded, so expect visible ringing around bright edges with it off.
+          t.sliderF("Sharpness — Mitchell C at B=0; 0.5 = Catmull-Rom", &g_upscaleSharpness, 0.0f, 1.0f, 0.05f);
+          t.sliderF("Anti-ring clamp (1 = on; 0 = DIAGNOSTIC, expect ringing)",
+                    &g_upscaleAntiRing, 0.0f, 1.0f, 1.0f);
           t.flush(); }
 
         // -- Tab: Bloom (tasks/forge-postprocess.md step 4) --
@@ -15929,16 +17401,48 @@ namespace {
           // regression anywhere in the frame is unattributable. Move it, not the CAL gains.
           t.sliderF("Sky: PHYSICAL LIGHTING blend (0 = MW's sun/ambient exactly, 1 = the model's)",
                     &g_skyPhysBlend, 0.0f, 1.0f, 0.05f, "%.2f");
-          // ⚠ THE ONE KNOB WITH REAL AUTHORITY THIS PHASE, and it is the model's own parameter
-          // rather than a taste dial: turbidity moves haze, the horizon/zenith ratio, the
-          // circumsolar spread AND the sun's reddening together, because in the atmosphere they ARE
-          // one parameter. P4 makes it weather-driven and time-varying under MW's clear preset.
-          t.sliderF("Sky: turbidity (1 = pristine, 3 = the reference clear day, 10 = thick haze)",
-                    &g_skyTurbidity, 1.0f, 10.0f, 0.1f, "%.1f");
-          // A real model input, not a fudge: light bounced off the ground and re-scattered is a
-          // genuine part of what the sky's lower half is made of. Vvardenfell is ash — 0.1.
-          t.sliderF("Sky: ground albedo (0.10 = Vvardenfell ash)",
+          // ⚠⚠ THE TURBIDITY SLIDER IS GONE, AND ITS ABSENCE IS THE DELIVERABLE (S2). It used to be
+          // "the one knob with real authority", because Hosek-Wilkie had exactly one atmospheric
+          // parameter and MW's weather had never been connected to it. The medium takes Rayleigh,
+          // Mie, absorption, asymmetry, scale height, per-primary tint and ozone straight from
+          // `atmosphereAt()` — MW's live weather through the S1 table — so a turbidity slider would
+          // now be a SECOND, DISAGREEING way to say the same thing, and whichever one the sky
+          // happened to read would silently decide what the other meant. Weather is the knob.
+          //
+          // The ground albedo STAYS, and it is not a taste dial either: it is the medium's ground
+          // BOUNDARY CONDITION, and the multiscatter LUT integrates the light that bounces off it
+          // back up into the air. Vvardenfell is ash — 0.10.
+          t.sliderF("Sky: ground albedo (the medium's ground boundary; 0.10 = Vvardenfell ash)",
                     &g_skyAlbedo, 0.0f, 0.6f, 0.01f, "%.2f");
+          // ─── S2: THE MEDIUM'S OWN CONTROLS ─────────────────────────────────────────────────────
+          // The march budget is the phase's only real cost dial. 192x108 texels x N steps, on the
+          // `atmos=` lane of the gpu split; the budget for the whole four-pass chain is 0.25 ms.
+          t.sliderF("Atmos: sky-view march steps (measured: NOT where the cost is)",
+                    &g_atmosSkySteps, 8.0f, 64.0f, 1.0f, "%.0f");
+          // ⚠ THE REAL COST DIAL, and it is QUADRATIC — the multiscatter pass runs nDirs^2
+          // directions per texel and measures as nearly the whole `atmos=` lane. But it is also the
+          // term that sets how bright the sky is, which is exactly what the S2b gate's nit row is
+          // measuring, so this is a lever for after the gate settles rather than before.
+          t.sliderF("Atmos: multiscatter directions, sqrt (THE cost dial; 8 = Hillaire's value)",
+                    &g_atmosMsDirs, 2.0f, 8.0f, 1.0f, "%.0f");
+          // ⚠ WHAT STOPS "THE SUN IS DOWN" FROM MEANING "THERE ARE NO PHOTONS". A medium is happy to
+          // return exactly zero, and zero is a level the exposure servo cannot meter — it would ramp
+          // E to its ceiling against a black frame. The real quantity (airglow + zodiacal light +
+          // unresolved starlight) is ~1e-4 cd/m2, far below anything this exposure range shows, so
+          // this is authored at the level where the night sky reads as sky rather than as a hole.
+          t.sliderF("Atmos: airglow floor (native radiance; the night sky's own emission)",
+                    &g_atmosAirglow, 0.0f, 2.0e-3f, 5.0e-5f, "%.5f");
+          // ⚠⚠ A SECOND SOURCE IN THE SAME INTEGRAL, NOT A NIGHT MODE. The moon enters
+          // atmos_skyview.comp exactly where the sun does, so moonlight is Rayleigh-scattered into a
+          // BLUE night sky by the identical arithmetic that makes the day sky blue — which is what a
+          // "fade to black" ramp could never produce, and is why night stops being black
+          // structurally rather than by a lift. Set well above the physical 1/400,000 on purpose:
+          // at the true ratio the moonlit sky is ~0.003 cd/m2 and the servo could only reach it by
+          // running an exposure that turns the star field into a wall of noise. Its own lane so the
+          // stand-in is VISIBLE rather than buried inside a scale somewhere.
+          t.checkbox("Atmos: MOON as a second scattering source (S2e)", &g_atmosMoonOn);
+          t.sliderF("Atmos: moon irradiance (fraction of E_TOA; physical full moon ~2.5e-6)",
+                    &g_atmosMoonScale, 0.0f, 1.0e-4f, 2.0e-6f, "%.7f");
           // The DRAWN sky's own level, WITHOUT touching the light. 1.0 is the model's radiance
           // untouched and the only physically meaningful value; it exists so "the sky looks wrong"
           // and "the lighting looks wrong" can be separated during a bring-up.
@@ -16398,6 +17902,20 @@ namespace {
           // Watch it by looking DOWN from a height as well as up — the ground and the sea must not
           // move at ANY strength, because saturate(dir.z) is 0 below the eye's horizontal plane.
           t.sliderF("Fog: sample the SKY (0 = flat fog, the A/B)", &g_fogSkyStrength, 0.0f, 1.0f, 0.05f);
+          // ⚠ THE KNEE, AND IT IS THE REFLECTION-vs-STATIC DISPARITY KNOB. Below it a fogged surface
+          // melts toward MW's flat fogColNear; the water's reflection-hole fill takes the sky with no
+          // knee at all, so the two disagree by the full fogColNear-to-sky gap (2.9x in clear
+          // weather) right where they sit side by side inside the mirror. Lower to close it; 1 =
+          // never sample the sky. Watch a shoreline with statics reflected in it.
+          t.sliderF("Fog: sky-target KNEE (lower = sky enters earlier, closes the reflection gap)",
+                    &g_fogSkyKnee, 0.0f, 0.999f, 0.01f);
+          // ⚠ THE NEAR FIELD. MW's ramp is perfectly clear inside fogStart (~490 m in clear weather
+          // at 16 cells), so nothing between the camera and the middle distance has any air in front
+          // of it. This is a Beer-Lambert haze from the eye that fills that dead zone; it multiplies
+          // the ramp, so it cannot move the fog wall. 0 = off, bit-identical. Small numbers: 1e-5 is
+          // ~10% opacity at 100 m.
+          t.sliderF("Fog: NEAR haze density /unit (0 = MW's empty near field)",
+                    &g_fogNearHaze, 0.0f, 5.0e-5f, 1.0e-6f, "%.7f");
           // EXPONENTIAL vs MW's LINEAR ramp. Only bites in the linear-colour build (the publish is
           // gated on it too), so in the gamma A/B partner this tick does nothing and correctly so.
           t.checkbox("Fog: EXPONENTIAL (Beer-Lambert; off = MW's linear ramp)", &g_fogExp);
@@ -16962,8 +18480,10 @@ namespace {
         bind.mRenderTargetCount = 1;
         bind.mRenderTargets[0] = { g_live.pRT, LOAD_ACTION_LOAD };
         cmdBindRenderTargets(g_live.pCmd, &bind);
-        cmdSetViewport(g_live.pCmd, 0.0f, 0.0f, (float)g_live.width, (float)g_live.height, 0.0f, 1.0f);
-        cmdSetScissor(g_live.pCmd, 0, 0, g_live.width, g_live.height);
+        // ⚠ THE OUTPUT RECT — this draws into pRT, so it is a DELIVERY site. The panel has to land
+        // inside the sub-rect the client composites, not inside the scene's raster rect.
+        cmdSetViewport(g_live.pCmd, 0.0f, 0.0f, (float)g_live.outWidth, (float)g_live.outHeight, 0.0f, 1.0f);
+        cmdSetScissor(g_live.pCmd, 0, 0, g_live.outWidth, g_live.outHeight);
         cmdDrawUserInterface(g_live.pCmd);
         cmdBindRenderTargets(g_live.pCmd, nullptr);
     }
@@ -18285,7 +19805,7 @@ namespace {
 
     // ===== hdrdump: the LINEAR scene target, out of the process ==================================
     //
-    // WHY IT EXISTS. pMSAAColor holds linear scene radiance BEFORE the exposure multiply and BEFORE
+    // WHY IT EXISTS. pSceneColor holds linear scene radiance BEFORE the exposure multiply and BEFORE
     // the curve, and until this block there was no way to get it out: every path out of the host
     // runs through resolve.frag, which exposes, tone-maps, encodes and dithers into a BGRA8 shared
     // texture. An EXR of the raw fp16 makes MW's sky, sun and interior levels COMPARABLE against
@@ -18435,21 +19955,26 @@ namespace {
         g_hdrDumpArmed = false;   // one shot, and cleared FIRST so no failure path can re-arm it
 
         Renderer* R = g_live.pRenderer;
-        // ⚠ REQUIRES A SCENE-REFERRED BUILD (fp16 + MSAA). At 1x or in LDR the scene renders
-        // straight into the BGRA8 pRT and there is no linear target to read — writing an EXR of
-        // tone-mapped 8-bit values promoted to half would be a file that looks right and means
-        // nothing, so it declines and says why.
-        if (!R || !g_live.pRT || !g_live.pMSAAColor || !g_live.sceneReferred
-            || g_live.sampleCount <= 1
+        // ⚠ REQUIRES A SCENE-REFERRED BUILD (fp16). In LDR the scene renders straight into the BGRA8
+        // pRT and there is no linear target to read — writing an EXR of tone-mapped 8-bit values
+        // promoted to half would be a file that looks right and means nothing, so it declines and
+        // says why.
+        //
+        // ⚠ MSAA IS NO LONGER PART OF THE REQUIREMENT (M0, tasks/forge-upscale.md). 1x + fp16 is a
+        // real configuration now, and it is the one an upscaler runs in — an instrument that declined
+        // exactly there would be missing from every session it is most wanted in. The sample count
+        // only decides whether the landing pad is filled by a resolve or a copy, below.
+        if (!R || !g_live.pRT || !g_live.pSceneColor || !g_live.sceneReferred
             || g_live.sceneColorFormat != TinyImageFormat_R16G16B16A16_SFLOAT) {
-            LOG::logline("!! [hdrdump] DECLINED — needs a scene-referred build (fp16 + MSAA). "
-                         "sceneReferred=%d samples=%u msaaRT=%d fp16=%d",
+            LOG::logline("!! [hdrdump] DECLINED — needs a scene-referred build (fp16). "
+                         "sceneReferred=%d samples=%u sceneRT=%d fp16=%d",
                          g_live.sceneReferred ? 1 : 0, g_live.sampleCount,
-                         g_live.pMSAAColor ? 1 : 0,
+                         g_live.pSceneColor ? 1 : 0,
                          (g_live.sceneColorFormat == TinyImageFormat_R16G16B16A16_SFLOAT) ? 1 : 0);
             LOG::flush();
             return;
         }
+        const bool dumpMsaa = (g_live.sampleCount > 1);
 
         // ⚠ CROP TO THE RENDER RECT, NOT THE ALLOCATION. Every size-dependent RT is allocated at the
         // ceiling (allocWidth/allocHeight) while the scene draws into a width x height sub-rect of
@@ -18458,7 +19983,7 @@ namespace {
         // FILES are render-sized, or a live render-scale would put a band of never-written texels
         // down two edges of every dump.
         const uint32_t W = g_live.width, H = g_live.height;
-        const uint32_t texW = g_live.pMSAAColor->mWidth, texH = g_live.pMSAAColor->mHeight;
+        const uint32_t texW = g_live.pSceneColor->mWidth, texH = g_live.pSceneColor->mHeight;
         if (W == 0 || H == 0 || W > texW || H > texH) { return; }
 
         const double t0 = hostNowMs();
@@ -18500,30 +20025,37 @@ namespace {
             resetCmdPool(R, pPool);
             beginCmd(pCmd);
             ID3D12GraphicsCommandList* cl = pCmd->mDx.pCmdList;
-            ID3D12Resource* msaaRes = g_live.pMSAAColor->pTexture->mDx.pResource;
-            ID3D12Resource* tmpRes  = pTmp->pTexture->mDx.pResource;
+            ID3D12Resource* sceneRes = g_live.pSceneColor->pTexture->mDx.pResource;
+            ID3D12Resource* tmpRes   = pTmp->pTexture->mDx.pResource;
 
             // Native barriers: Forge has no RESOLVE_* resource states, which is why the hardware
             // resolve path below the shader resolve is driven natively too.
             D3D12_RESOURCE_BARRIER pre[2] = {};
             pre[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-            pre[0].Transition.pResource   = msaaRes;
+            pre[0].Transition.pResource   = sceneRes;
             pre[0].Transition.Subresource = 0;
             pre[0].Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
-            pre[0].Transition.StateAfter  = D3D12_RESOURCE_STATE_RESOLVE_SOURCE;
+            // M0: at 1x the source is not multisampled, so the landing pad is filled by a COPY. Same
+            // formats, same dimensions, so CopyResource is legal and — unlike the resolve — it is
+            // exact. The box-average argument below is about MSAA sub-samples; with one sample there
+            // is nothing to average and nothing to bias.
+            pre[0].Transition.StateAfter  = dumpMsaa ? D3D12_RESOURCE_STATE_RESOLVE_SOURCE
+                                                     : D3D12_RESOURCE_STATE_COPY_SOURCE;
             pre[1] = pre[0];
             pre[1].Transition.pResource   = tmpRes;
-            pre[1].Transition.StateAfter  = D3D12_RESOURCE_STATE_RESOLVE_DEST;
+            pre[1].Transition.StateAfter  = dumpMsaa ? D3D12_RESOURCE_STATE_RESOLVE_DEST
+                                                     : D3D12_RESOURCE_STATE_COPY_DEST;
             cl->ResourceBarrier(2, pre);
 
-            cl->ResolveSubresource(tmpRes, 0, msaaRes, 0, DXGI_FORMAT_R16G16B16A16_FLOAT);
+            if (dumpMsaa) { cl->ResolveSubresource(tmpRes, 0, sceneRes, 0, DXGI_FORMAT_R16G16B16A16_FLOAT); }
+            else          { cl->CopyResource(tmpRes, sceneRes); }
 
             D3D12_RESOURCE_BARRIER post[2] = {};
             post[0] = pre[0];
-            post[0].Transition.StateBefore = D3D12_RESOURCE_STATE_RESOLVE_SOURCE;
+            post[0].Transition.StateBefore = pre[0].Transition.StateAfter;
             post[0].Transition.StateAfter  = D3D12_RESOURCE_STATE_RENDER_TARGET;   // frame invariant
             post[1] = pre[1];
-            post[1].Transition.StateBefore = D3D12_RESOURCE_STATE_RESOLVE_DEST;
+            post[1].Transition.StateBefore = pre[1].Transition.StateAfter;
             post[1].Transition.StateAfter  = D3D12_RESOURCE_STATE_COPY_SOURCE;
             cl->ResourceBarrier(2, post);
             endCmd(pCmd);
@@ -18613,11 +20145,21 @@ namespace {
             // ⚠ The alpha note is in the log line and not only in the header, because the mistake it
             // prevents is made while LOOKING at the file: RGB is premultiplied by coverage, so a
             // partially-covered pixel reads dark and dividing by A is what undoes it.
-            LOG::logline(">> [hdrdump] %s (%ux%u, exr=%s tga=%s) E=%.4f | LINEAR, pre-exposure, "
-                         "pre-curve; RGB is PREMULTIPLIED by alpha (coverage) — divide by A to read "
-                         "radiance at partial coverage | %.1f ms",
+            // ⚠ THE WEATHER IS ON THIS LINE, and it is not decoration. A sweep that renames these
+            // files by the weather it ASKED for is asserting something it did not check; the pairing
+            // has to be provable from the run's own log, or a mislabelled picture becomes evidence.
+            const Atmosphere::Live& dlv = Atmosphere::live();
+            char wx[96] = "interior/none";
+            if (dlv.valid) {
+                std::snprintf(wx, sizeof(wx), "%s(%d)->%s(%d) t=%.3f",
+                              Atmosphere::weatherName(dlv.cur), dlv.cur,
+                              Atmosphere::weatherName(dlv.next), dlv.next, (double)dlv.transition);
+            }
+            LOG::logline(">> [hdrdump] %s (%ux%u, exr=%s tga=%s) E=%.4f weather=%s | LINEAR, "
+                         "pre-exposure, pre-curve; RGB is PREMULTIPLIED by alpha (coverage) — divide "
+                         "by A to read radiance at partial coverage | %.1f ms",
                          exrPath, W, H, exrOK ? "ok" : "FAILED", tgaOK ? "ok" : "FAILED",
-                         E, hostNowMs() - t0);
+                         E, wx, hostNowMs() - t0);
             LOG::flush();
 
             if (pHdrRb) { removeResource(pHdrRb); }
@@ -18661,6 +20203,46 @@ namespace ForgeRender {
         struct FKnob { const char* name; float* p; };
         struct BKnob { const char* name; bool*  p; };
         const FKnob fknobs[] = {
+            // S2 THE ATMOSPHERE — first in the table because the S2b gate runs unattended and these
+            // are the three lanes an unattended session has to be able to move: the march budget
+            // (the `atmos=` cost dial), and the two night lanes, whose whole point is that they are
+            // judged at midnight and the harness cannot click a checkbox at midnight either.
+            { "dumpAtFrame",        &g_dumpAtFrame        },
+            // M1 step 4b THE UPSCALER (tasks/forge-upscale.md). ⚠ THE ONLY WAY THE HARNESS CAN RUN
+            // THE REAL 4b TEST. Scale 1.0 is an exact identity by construction, so it proves nothing
+            // about the seam; the test that does — `[rect] in=840x525 out=1680x1050`, APL within ~1%
+            // of the 1.0 run, and `gpu=` dropping while `upscale=` appears — needs the slider at 0.5,
+            // and the perf harness runs MINIMIZED with nobody at the panel.
+            { "upscaleInputScale",  &g_upscaleInputScale  },
+            // M1 step 4c BLOOM, and these two are here because the 4c question — "does the bloom
+            // change when the upscale slider moves" — CANNOT BE ATTRIBUTED WITHOUT THEM. Bloom now
+            // reads the DELIVERED image, so at scale < 1 its source is an upscaled frame: any change
+            // in the delivered picture could be the bloom following a different source, or the
+            // upscaler's effect on the scene underneath it. Separating those needs an arm with bloom
+            // OFF at both scales, and until now every bloom knob was panel-only while the harness
+            // runs MINIMIZED — the exact shape this table's header describes.
+            //
+            //   bloomStrength = 0  is the EXACT identity arm (resolve.frag guards the composite
+            //                      behind `if (k > 0)`, by branch and not by arithmetic), so it is
+            //                      the isolation lever rather than a dimmer.
+            //   bloomLevelCap      is the REACH dial, i.e. the thing 4c is ABOUT: it clamps the
+            //                      level count from above, so pinning it equal across two scales
+            //                      proves a difference is not the octave count.
+            { "bloomStrength",      &g_bloomStrength      },
+            { "bloomLevelCap",      &g_bloomLevelCap      },
+            // ...and the upscaler's own filter, so the "is the anti-ringing clamp eating the bloom"
+            // arm can be taken unattended as well as by hand. See upscale.h.
+            { "upscaleSharpness",   &g_upscaleSharpness   },
+            { "upscaleAntiRing",    &g_upscaleAntiRing    },
+            { "fogSkyKnee",         &g_fogSkyKnee         },
+            { "fogNearHaze",        &g_fogNearHaze        },
+            { "atmosMieMul",        &g_atmosMieMul        },
+            { "atmosDeck",          &g_atmosDeck          },
+            { "atmosDeckSteps",     &g_atmosDeckSteps     },
+            { "atmosSkySteps",      &g_atmosSkySteps      },
+            { "atmosMsDirs",        &g_atmosMsDirs        },
+            { "atmosAirglow",       &g_atmosAirglow       },
+            { "atmosMoonScale",     &g_atmosMoonScale     },
             { "waterInscatterGain", &g_waterInscatterGain },
             { "waterScatterRatio",  &g_waterScatterRatio  },
             { "waterMsSimilarity",  &g_waterMsSimilarity  },
@@ -18705,6 +20287,16 @@ namespace ForgeRender {
             { "causticProjAbove",      &g_causticProjAbove      },
             { "causticProjFromAir",    &g_causticProjFromAir    },
             { "calInteriorFloor",      &g_calInteriorFloor      },
+            // M1 temporal jitter (tasks/forge-upscale.md). Env-driven because the FIRST question it
+            // has to answer is a bit-identity one — does amplitude 0 leave the frame exactly where
+            // it was — and the second is "did the jitter leak into a view it must not move", which
+            // is read off the `atmos=` / gate rows in an unattended log. Neither is a thing anyone
+            // can click a checkbox for during a minimized run.
+            { "jitterAmp",             &g_jitterAmp             },
+            { "mvReactiveT0",          &g_mvReactiveT0          },
+            { "mvReactiveT1",          &g_mvReactiveT1          },
+            { "mvReactiveGain",        &g_mvReactiveGain        },
+            { "jitterPhases",          &g_jitterPhases          },
             { "causticRippleStride", &g_causticRippleStride },
             // W27: the resolution/window trade on the wake map, env-driven so the minimized harness
             // can A/B 8 u/texel against the W26 16 without a rebuild. The echo below is also how the
@@ -18783,6 +20375,21 @@ namespace ForgeRender {
             { "grassCrushPlayerRadius", &g_grassCrushPlayerRadius },
         };
         const BKnob bknobs[] = {
+            // M1 motion vectors — env-driven so an unattended run can turn the dispatch on and read
+            // `[forge-hb] mv:` back without anyone at the panel. tasks/forge-upscale.md.
+            { "mvEnable",            &g_mvEnable            },
+            // M1 step 4b: the master arm. ⚠ READ AT INIT — it decides whether the backend and its
+            // ~56 MB target are CREATED, so it does nothing if flipped later, which is exactly why it
+            // belongs here rather than only on the panel. Ships **ON** (the panel's input-scale
+            // slider needs a consumer); set it to **0** to reproduce the pre-4b build with nothing
+            // extra allocated, which is verification step 1 and the first thing to try when
+            // bisecting anything post-process.
+            { "upscaleEnable",       &g_upscaleEnable       },
+            { "atmosMoonOn",        &g_atmosMoonOn        },
+            // ⚠ THE GATE'S OWN ARM. OFF skips the one reference-configuration frame at startup —
+            // which is the setting for a session that wants its first frame to be live weather, and
+            // NOT the setting for a bring-up. A gate nobody runs is a gate nobody has.
+            { "atmosGate",          &g_atmosGate          },
             { "waterNoReflect",     &g_waterNoReflect     },
             { "waterSunTrueElev",   &g_waterSunTrueElev   },
             { "aplSplitWater",      &g_aplSplitWater      },
@@ -18874,42 +20481,23 @@ namespace ForgeRender {
         // cwd is the install dir here (see main.cpp), so the relative open resolves.
         loadWaterIniOnce();
 
-        // ─── P2: THE COEFFICIENT GATE (tasks/forge-physical-sky.md) ──────────────────────────────
-        // ⚠⚠ NOTHING THE PHYSICAL SKY DOES MEANS ANYTHING UNTIL THIS LINE READS OK, which is why it
-        // is the first thing after the log opens. hosek_data.h is 3600 transcribed constants; a
-        // mistyped or transposed one would not fail to build, it would make the sky "look a bit
-        // off" — indistinguishable from every other reason a sky looks a bit off, and one you can
-        // chase for a day. So the dataset is MEASURED rather than trusted: three cooked
-        // configurations and twelve radiances re-derived here and compared against values produced
-        // by the AUTHORS' own implementation. Between them they exercise every path in cook() —
-        // both albedo halves, integer and fractional turbidity, the elevation warp near both ends,
-        // and the `turbidity == 10` early-out's neighbour. [[feedback_prior_art_constants_dont_transfer]]
+        // ─── THE COEFFICIENT GATE IS GONE WITH THE MODEL IT GUARDED (S2f) ────────────────────────
+        // What stood here was a 3600-constant self-test: hosek_data.h was transcribed prior art, a
+        // mistyped constant in it would not fail to build, and the symptom would have been "the sky
+        // looks a bit off" — indistinguishable from every other reason a sky looks a bit off. So the
+        // dataset was MEASURED against the authors' own implementation at startup.
         //
-        // 1e-4 is a FLOAT-PRECISION gate: the reference is double-precision and this is float, so
-        // the residual is ~2e-6 in practice. A real transcription error lands orders of magnitude
-        // above it.
-        {
-            const double dev = Hosek::selfTest([](float T, float A, float E, double wc, double wl) {
-                LOG::logline(">> [forge-hosek] self-test T=%.2f alb=%.2f elev=%.4f:"
-                             " coefficients %.3e, radiance %.3e",
-                             (double)T, (double)A, (double)E, wc, wl);
-            });
-            const bool ok = (dev < 1.0e-4);
-            LOG::logline("%s [forge-hosek] coefficient gate %s (worst relative deviation %.3e"
-                         " against the reference implementation)",
-                         ok ? ">>" : "!!", ok ? "OK" : "**FAILED — hosek_data.h is CORRUPT**", dev);
-            // ...and the two absolute anchors, printed once, because they are the only numbers in
-            // the whole model that were not derived from it. sunBeamScale() solves at the reference
-            // configuration against §0.1's measured clear-sky energy split; kSceneUnitCd is what P1
-            // measured one scene unit to be worth, pinned here because P2 now SETS the lighting that
-            // P1 derived it from and re-deriving it would close the loop on itself.
-            LOG::logline(">> [forge-hosek] anchors: sun beam scale %.4f W/m2 (solved at T=%.1f"
-                         " alb=%.2f elev=%.2fdeg for a %.2f sun share) | 1 scene unit = %.0f cd/m2",
-                         Hosek::sunBeamScale(), Hosek::kRefTurbidity, Hosek::kRefAlbedo,
-                         Hosek::kRefElevation * 180.0 / Hosek::kPi, Hosek::kRefSunShare,
-                         Hosek::kSceneUnitCd);
-            LOG::flush();
-        }
+        // The medium has no transcribed dataset to guard. Its coefficients are eleven published
+        // optical properties of air, dust and ozone (atmosphere.h) that a reader can check against a
+        // textbook by eye, and its one unverifiable constant — E_TOA — is INTEGRATED here rather than
+        // transcribed, and prints three independent corroborations when it is (see the
+        // `[forge-atmos] E_TOA` line raised at LUT-chain creation).
+        //
+        // ⚠ THE GATE DID NOT DISAPPEAR, IT MOVED AND GOT HARDER. S2b runs the LIVE LUT chain at the
+        // reference configuration on the first armed frame and checks END-TO-END illuminance and
+        // luminance, where this one compared radiance at 64 directions against a CPU twin. A CPU
+        // twin could pass while the GPU path was broken; the new one cannot, because it IS the GPU
+        // path. See atmosReportGate().
 
         Renderer* R = g_live.pRenderer;
 
@@ -19025,10 +20613,15 @@ namespace ForgeRender {
 
         // Decide the SCENE colour format now — before any render target or pipeline is built, since
         // both bake it in. See the sceneColorFormat declaration for which resources have to follow it
-        // and why the reflection RT is one of them. MSAA-gated: at 1x there is no internal colour
-        // target to be wide, so the request is dropped rather than half-applied.
+        // and why the reflection RT is one of them.
+        //
+        // ⚠ NO LONGER MSAA-GATED (M0, tasks/forge-upscale.md). It used to read
+        // `g_hdrSceneColor && (sampleCount > 1)` because at 1x there was no internal colour target to
+        // be wide. There is one now — buildOpaquePath creates pSceneColor for EITHER reason, and the
+        // ordering that made the old gate necessary still holds in the other direction: this line
+        // runs first and is what tells buildOpaquePath to make the target at all.
         if (g_live.pRT) {
-            const bool wantHdr = g_hdrSceneColor && (g_live.sampleCount > 1);
+            const bool wantHdr = g_hdrSceneColor;
             g_live.sceneColorFormat = wantHdr ? TinyImageFormat_R16G16B16A16_SFLOAT
                                               : g_live.pRT->mFormat;
             // Step 6a: the SAME expression also decides the target's units. One evaluation, stored
@@ -19055,13 +20648,9 @@ namespace ForgeRender {
                         g_live.linearScene ? "LINEAR" : "gamma (MW authored)");
             if (g_linearScene && !wantHdr) {
                 std::printf("[forge] linear scene requested but the target is display-referred "
-                            "(needs g_hdrSceneColor + MSAA) — staying in MW's gamma domain\n");
+                            "(needs g_hdrSceneColor) — staying in MW's gamma domain\n");
             }
             LOG::flush();
-            if (g_hdrSceneColor && g_live.sampleCount <= 1) {
-                std::printf("[forge] fp16 scene colour requested but MSAA is OFF — staying LDR "
-                            "(no internal colour target at 1x)\n");
-            }
             // ...and the CURVE, decided by the same two bits plus its own checkbox. Reported here
             // rather than folded into the line above because "which curve" is the one thing on the
             // `apl:` heartbeat that makes every level on it interpretable.
@@ -19116,10 +20705,14 @@ namespace ForgeRender {
         // loader, and isolates any opaque-path issue to the F11 scene path.
 
         // The size passed to init() is the ALLOCATION size (ceiling render-scale x backbuffer).
-        // All size-dependent RTs are built at this size; the current render size (g_live.width/
-        // height) starts equal and is narrowed per-frame by setRenderSize for live supersampling.
+        // All size-dependent RTs are built at this size; the output and input rects start equal to
+        // it and are narrowed per-frame by setRenderSize for live supersampling.
+        // ⚠ ALL THREE, or the first frame delivers into a 0x0 viewport: setRenderSize is what
+        // normally authors out/in, and it has not run yet when the bring-up path draws.
         g_live.allocWidth = width;
         g_live.allocHeight = height;
+        g_live.outWidth = width;
+        g_live.outHeight = height;
         g_live.width = width;
         g_live.height = height;
         g_live.firstFrame = true;
@@ -19132,21 +20725,86 @@ namespace ForgeRender {
         return true;
     }
 
-    // Live render-scale: set the current render resolution for the next renderScene, clamped to
-    // the allocation size. 0 ⇒ full allocation. Cheap (two clamps); everything size-derived in
-    // renderScene reads g_live.width/height, so a change takes effect on the very next frame with
-    // no reallocation. The depth/color RTs are cleared full-alloc each frame and the scene only
-    // draws the sub-viewport, so the out-of-viewport border stays at the clear value (transparent
-    // color, reverse-Z far depth) — the client copies only the sub-rect and Hi-Z of the far border
-    // is conservative (never over-occludes).
+    // ⚠ 4a's `static constexpr float kHostInputScale = 1.0f` STOOD HERE, and 4b is what removed it.
+    // Its comment said "a knob nothing can consume is a knob that only breaks things" and that
+    // nothing may move it until the resolve's source fetch is rescaled. Both halves are discharged:
+    // the consumer exists (the IUpscaler seam, upscale.h) and the rescale turned out NOT to belong in
+    // the resolve at all — the upscaler writes an OUTPUT-res target and the host binds THAT as
+    // gResolveSource, so the existing 1:1 map is already correct and the rescale lives in the upscale
+    // pass, which is exactly what the seam is for. The live knob is g_upscaleInputScale.
+
+
+    // Live render-scale: set the rect for the next renderScene, clamped to the allocation size.
+    // 0 ⇒ full allocation. Cheap (a few clamps); everything size-derived in renderScene reads
+    // g_live.width/height or g_live.outWidth/outHeight, so a change takes effect on the very next
+    // frame with no reallocation. The depth/color RTs are cleared full-alloc each frame and the
+    // scene only draws the sub-viewport, so the out-of-viewport border stays at the clear value
+    // (transparent color, reverse-Z far depth) — the client copies only the sub-rect and Hi-Z of
+    // the far border is conservative (never over-occludes).
+    //
+    // ⚠ THE ARGUMENT IS THE OUTPUT RECT, and always has been. The client hands us g_rw/g_rh and
+    // composites exactly the [0, g_rw/g_w] sub-rect of pRT (renderprocess.cpp), so its meaning is
+    // "what gets DELIVERED", never "where the scene rasterises". This is the one place the two are
+    // told apart — the input rect is DERIVED here and received nowhere.
     void setRenderSize(unsigned w, unsigned h) {
+        const uint32_t prevOutW = g_live.outWidth, prevOutH = g_live.outHeight;
+        const uint32_t prevInW  = g_live.width,    prevInH  = g_live.height;
+
         if (w == 0 || h == 0) {
-            g_live.width = g_live.allocWidth;
-            g_live.height = g_live.allocHeight;
-            return;
+            g_live.outWidth  = g_live.allocWidth;
+            g_live.outHeight = g_live.allocHeight;
+        } else {
+            g_live.outWidth  = (w < g_live.allocWidth)  ? (uint32_t)w : g_live.allocWidth;
+            g_live.outHeight = (h < g_live.allocHeight) ? (uint32_t)h : g_live.allocHeight;
         }
-        g_live.width  = (w < g_live.allocWidth)  ? (uint32_t)w : g_live.allocWidth;
-        g_live.height = (h < g_live.allocHeight) ? (uint32_t)h : g_live.allocHeight;
+        // The allocation is the hard clamp (it is the only one backed by real memory); >= 1 keeps a
+        // degenerate scale from producing a zero-width viewport, which D3D12 rejects rather than
+        // ignores. The scale is clamped to [0.33, 1.0] HERE rather than trusted from the knob, so an
+        // env override or a stale slider cannot author a rect the alloc >= out >= in model forbids.
+        //
+        // ⚠ ROUNDED TO EVEN, AND THAT ONE LINE REMOVES A WHOLE QUESTION. Half-res AO and the bloom
+        // chain both HALVE the input rect. Ceil-halving is exact as arithmetic (repeated ceil-halving
+        // equals ceil(w / 2^n) — bloom.srt.h records the proof), but an ODD input rect makes the
+        // half-res dispatch cover a fractional column: its last texel maps to one real source texel
+        // and one that was never written, and the upsample then reads a stale texel at the frame's
+        // edge. Every scale that produces an odd number is one rounding away from a scale that does
+        // not, so this rounds instead of teaching four downstream passes about parity.
+        const float scale = upscaleScale();
+        uint32_t inW = g_live.outWidth;
+        uint32_t inH = g_live.outHeight;
+        if (scale < 1.0f) {
+            inW = (uint32_t)((float)g_live.outWidth  * scale + 0.5f) & ~1u;
+            inH = (uint32_t)((float)g_live.outHeight * scale + 0.5f) & ~1u;
+        }
+        // ⚠⚠ THE ROUNDING IS INSIDE THE `scale < 1` BRANCH, AND THAT IS NOT TIDINESS. Applied
+        // unconditionally it takes an ODD output rect — 1365 wide, say — to 1364 AT SCALE 1.0, which
+        // makes in != out with the slider sitting at 1.0. The frame would then deliver a 1365-wide
+        // viewport from a 1364-wide source with the last column clamped: a permanent one-pixel smear
+        // on odd resolutions, for a feature the player never touched. The identity case must be
+        // EXACTLY the output rect, untouched.
+        // ⚠ AND THIS GOT MORE LOAD-BEARING, NOT LESS, when the backend started arming by default:
+        // "scale 1.0" is now the state almost every session runs in, so an odd output rect reaches
+        // this line on real hardware rather than only under a knob nobody set.
+        //
+        // An odd input rect at scale 1.0 is then still possible — but it always was, since 4a, and
+        // the half-res chains have lived with it. What this removes is an odd rect that the UPSCALER
+        // produced, which is the new case and the one nobody has looked at.
+        // ⚠ THE FLOOR IS 2, NOT 1, AND THAT IS THE SAME DECISION AS THE MASK ABOVE. `>= 1` was
+        // enough while the rect was never rounded — D3D12 rejects a zero-width viewport but accepts
+        // an odd one — and clamping to 1 here would hand back exactly the odd rect the mask just
+        // removed, on the one input (a degenerate output rect) where nobody would look.
+        g_live.width  = (inW < g_live.allocWidth)  ? (inW  >= 2u ? inW  : 2u) : g_live.allocWidth;
+        g_live.height = (inH < g_live.allocHeight) ? (inH  >= 2u ? inH  : 2u) : g_live.allocHeight;
+
+        // Say BOTH rects, once per change. They are equal in 4a and the entire point of the step is
+        // that they no longer have to be; a divergence whose only symptom is a misplaced or
+        // half-drawn frame is diagnosable from an unattended log ONLY if the log carries both
+        // numbers — the lesson `mv: OFF` taught earlier in this milestone. Gated on an actual change
+        // so a per-frame restamp of the same size cannot spam it.
+        if (g_live.width != prevInW || g_live.height != prevInH
+            || g_live.outWidth != prevOutW || g_live.outHeight != prevOutH) {
+            logRectLine();
+        }
     }
 
     void setNearCells(int centreX, int centreY, unsigned loadedMask, float reach) {
@@ -19189,6 +20847,75 @@ namespace ForgeRender {
         g_playerCrush[2] = c[2];
         g_playerCrush[3] = (c[3] > 0.5f)
                          ? std::max(0.0f, std::min(g_grassCrushPlayerRadius, 256.0f)) : 0.0f;
+    }
+
+    // S1 ATMOSPHERE — THE WHOLE VERIFICATION SURFACE OF THIS PHASE, because nothing else in it
+    // renders. Every number on the line is either MW's (reported so the coupling rules S3 and S4
+    // need can be read off a real storm instead of guessed) or the medium's (reported so the
+    // transition can be watched WALKING rather than cross-fading).
+    //
+    // ⚠ Read through atmosphereAt() like every other consumer, at the eye. Reaching for the global
+    // row here — the one place where it would be harmless — is how the sampler discipline starts
+    // eroding, and the heartbeat is the site most likely to be copied.
+    void logAtmosphereRow(const char* why) {
+        const Atmosphere::Live& lv = Atmosphere::live();
+        if (!lv.valid) {
+            LOG::logline(">> [forge-hb][atmos] %s: no live weather (interior / menu / no world)"
+                         " — medium parked at Clear", why);
+            return;
+        }
+        // The ABSOLUTE world eye (gFrameData.lodEye, stashed at decode) — the position S6's map
+        // will actually be sampled at. One frame stale at the `edge` call site, which is
+        // irrelevant for a field whose features are kilometres wide.
+        const Atmosphere::Params p = Atmosphere::atmosphereAt(g_eyeAbsShadow[0], g_eyeAbsShadow[1]);
+        // ...and what the deck's five carried lanes actually BECOME (S4a). Reported beside the row
+        // rather than derived from it a second time: deckReport() runs the same arithmetic
+        // packParams() does and nothing shades with it. Before S4a the five lanes on the line above
+        // were read by no shader at all, which is precisely how a total overcast came to dim the sun
+        // by 1.6% for the whole of S1-S3.
+        const Atmosphere::DeckReport dk = Atmosphere::deckReport(p, g_atmosDeck);
+        LOG::logline(">> [forge-hb][atmos] %s: %s(%d) -> %s(%d) t=%.3f"
+                     " | air ray=%.2fx mie=%.2fx abs=%.2f g=%.2f h=%.2fkm tint=(%.2f,%.2f,%.2f) o3=%.2fx"
+                     " | deck cover=%.2f type=%.2f base=%.2fkm thick=%.2fkm precip=%.2f"
+                     " -> tau=%.2f ext=%.3e/m ssa=%.4f g=%.2f (x%.2f, %.0f steps)"
+                     " | MW clouds=%.3f speed=%.3f wind=%.3f fog day=%.3f night=%.3f"
+                     " | thunder=%.3f glare=%.3f occluded=%d"
+                     " | ref sky=(%.3f,%.3f,%.3f) fog=(%.3f,%.3f,%.3f)",
+                     why,
+                     Atmosphere::weatherName(lv.cur), lv.cur,
+                     Atmosphere::weatherName(lv.next), lv.next, (double)lv.transition,
+                     (double)p.rayleighScale, (double)p.mieScale, (double)p.mieAbsorption,
+                     (double)p.mieG, (double)p.mieHeightKm,
+                     (double)p.mieTint[0], (double)p.mieTint[1], (double)p.mieTint[2],
+                     (double)p.ozoneScale,
+                     (double)p.cloudCoverage, (double)p.cloudType, (double)p.cloudBottomKm,
+                     (double)p.cloudThicknessKm, (double)p.precipitation,
+                     (double)dk.tau, (double)dk.ext, (double)dk.ssa, (double)dk.g,
+                     (double)g_atmosDeck, (double)g_atmosDeckSteps,
+                     (double)p.mwCloudsMaxPercent, (double)p.mwCloudsSpeed, (double)p.mwWindSpeed,
+                     (double)p.mwLandFogDay, (double)p.mwLandFogNight,
+                     (double)lv.thunderFlash, (double)lv.sunglareVis, lv.sunOccluded ? 1 : 0,
+                     (double)lv.skyColRef[0], (double)lv.skyColRef[1], (double)lv.skyColRef[2],
+                     (double)lv.fogColRef[0], (double)lv.fogColRef[1], (double)lv.fogColRef[2]);
+    }
+
+    // S1 ATMOSPHERE: MW's live weather row, straight off the wire. One line of work here on purpose
+    // — the decode, the per-weather table and the transition lerp all live in atmosphere.h, because
+    // the moment any of that leaks into this file a weather index has a second place to become
+    // physics.
+    //
+    // ⚠ The EDGE is logged as well as the heartbeat, and the heartbeat alone would not be enough to
+    // verify this phase. It fires 1 frame in 300 — every ~5 s — while the thing that has to be
+    // proven is that the pair (cur, next) changing does NOT step the medium. Printing the row at the
+    // instant the pair flips puts the two sides of the discontinuity next to each other in the log,
+    // where a step is a diff and not an impression.
+    void setWeather(const IPC::WeatherWire& w) {
+        const Atmosphere::Live prev = Atmosphere::live();
+        Atmosphere::setWeather(w);
+        const Atmosphere::Live& now = Atmosphere::live();
+        if (now.valid != prev.valid || now.cur != prev.cur || now.next != prev.next) {
+            logAtmosphereRow("edge");
+        }
     }
 
     void setClientSyncsOnFence(bool syncs) {
@@ -19241,8 +20968,9 @@ namespace ForgeRender {
         bind.mRenderTargetCount = 1;
         bind.mRenderTargets[0] = { g_live.pRT, LOAD_ACTION_CLEAR };
         cmdBindRenderTargets(g_live.pCmd, &bind);
-        cmdSetViewport(g_live.pCmd, 0.0f, 0.0f, (float)g_live.width, (float)g_live.height, 0.0f, 1.0f);
-        cmdSetScissor(g_live.pCmd, 0, 0, g_live.width, g_live.height);
+        // ⚠ THE OUTPUT RECT — straight into pRT, so it must fill what the client composites.
+        cmdSetViewport(g_live.pCmd, 0.0f, 0.0f, (float)g_live.outWidth, (float)g_live.outHeight, 0.0f, 1.0f);
+        cmdSetScissor(g_live.pCmd, 0, 0, g_live.outWidth, g_live.outHeight);
         cmdBindPipeline(g_live.pCmd, g_live.pPipeline);
         cmdDraw(g_live.pCmd, 3, 0);
         cmdBindRenderTargets(g_live.pCmd, nullptr);
@@ -19598,10 +21326,17 @@ namespace ForgeRender {
     // The ground term needs the sun, the sun needs the sky's irradiance, and the SH needs the
     // ground. Split across call sites, each split is a chance to read last frame's value.
     //
-    // ⚠ ONE 128-DIRECTION LOOP DOES BOTH the irradiance and the SH, and it is the SAME Fibonacci
-    // table publishSkyAmbientSH builds — Hosek::fibDir is the shared definition. Two quadratures
-    // over one field is exactly how the sun:sky split would drift by a fraction of a percent that
-    // nobody could ever attribute. Measured against a 400x800 tabulated integral: 0.06% at N = 128.
+    // ⚠⚠ S2 MOVED THE INTEGRAL ONTO THE GPU, AND THAT IS THE PHASE'S STRUCTURAL POINT. This used to
+    // run a 128-direction CPU quadrature over a closed form the SHADER evaluated independently — two
+    // evaluations of one field, kept honest by a startup cross-check. Now atmos_sh.comp projects the
+    // LIVE sky-view LUT (the texture the pixels are drawn from) and the host reads the result back
+    // post-fence, so the ORDER above collapses to "configure the medium, read what it measured".
+    // There is no second copy left to diverge, which is why hosek.h and hosekcheck.* are deleted
+    // rather than retained behind a knob.
+    //
+    // ⚠ THE GPU WALKS SceneCal's FIBONACCI SPHERE, SAME GOLDEN ANGLE, SAME N. Not for elegance: every
+    // historical measurement this is compared against came off that table, and two quadratures over
+    // one field disagree by a fraction of a percent nobody can attribute afterwards.
 
     // sunDir is MW's TRAVEL direction, so -sunDir points AT the sun and -sunDir.z is the elevation
     // sine — exactly the ndl of flat ground, which is the same identity calSunAmbTarget works off.
@@ -19653,143 +21388,172 @@ namespace ForgeRender {
         // The LIGHT's own elevation, reported beside the disc's so the 29-degree split — and the
         // bounce, once the disc goes negative and this one does not — stay visible rather than
         // becoming a thing someone has to already know.
-        p.elevLight = (float)(std::asin(std::max(-1.0f, std::min(1.0f, -sunDir[2]))) * 180.0 / Hosek::kPi);
+        p.elevLight = (float)(std::asin(std::max(-1.0f, std::min(1.0f, -sunDir[2]))) * 180.0 / SceneCal::kPi);
 
         const float len = std::sqrt(toSun[0]*toSun[0] + toSun[1]*toSun[1] + toSun[2]*toSun[2]);
         if (!(len > 1.0e-6f)) { g_skyPhys = p; return; }
         toSun[0] /= len; toSun[1] /= len; toSun[2] /= len;
         const double elev = std::asin(std::max(-1.0f, std::min(1.0f, toSun[2])));
 
-        // The night ramp, and it does two DIFFERENT things with one number — see hosek.h. On the SKY
-        // it is a fade to black (this phase's decision: space between the stars is supposed to be
-        // black, and moons/stars return next phase). On the LIGHTING it fades the physical blend back
-        // toward MW's authored night ambient, because calTarget()'s night row only means anything if
-        // the servo has a lit ground to meter.
-        p.nightRamp = Hosek::nightRamp((float)elev);
-        Hosek::cook((double)g_skyTurbidity, (double)g_skyAlbedo, std::max(0.0, elev), p.st);
-        p.st.toSun[0] = toSun[0]; p.st.toSun[1] = toSun[1]; p.st.toSun[2] = toSun[2];
+        // (the night ramp is computed below, and S2e kept only its LIGHTING half — see scenecal.h)
+        // ⚠ THE NIGHT RAMP SURVIVES, AND ONLY HALF OF IT (S2e). It used to do two different jobs
+        // with one number: fade the SKY to black, and hand the LIGHTING back to MW's authored night.
+        // The medium removes the first reason entirely — a sun below the horizon is a legal
+        // configuration for a participating medium, so twilight is COMPUTED (ozone is what makes it
+        // violet/indigo rather than muddy brown; Hosek had no ozone term at all) — but the second
+        // reason is untouched: calTarget()'s night row and the moonlit trim are calibrated against
+        // MW's own night, and deleting the ramp wholesale would move that calibration silently.
+        // So it is kept, it is no longer folded into sceneScale, and it is applied at the LIGHTING
+        // blend alone. See publishSkyView, which is the site that stopped carrying it.
+        p.nightRamp = SceneCal::nightRamp((float)elev);
+        p.toSun[0] = toSun[0]; p.toSun[1] = toSun[1]; p.toSun[2] = toSun[2];
+        p.albedo    = g_skyAlbedo;
+        p.turbidity = Atmosphere::atmosphereAt(g_eyeAbsShadow[0], g_eyeAbsShadow[1]).mieScale;
 
-        // --- the sky's own irradiance, and the sun anchored to it ---------------------------------
-        float Esky[3];
-        Hosek::skyIrradiance(p.st, Esky);
-        float EsunN[3];
-        Hosek::sunIrradianceNormal(std::max(0.0, elev), (double)g_skyTurbidity, EsunN);
+        // ─── WHERE THE CAMERA STANDS IN THE MEDIUM ───────────────────────────────────────────────
+        // The LUTs are in METRES from the planet centre and MW is in ~1.4 cm units, and the whole
+        // conversion is this one line — Atmosphere::kMwUnitToMetre, which is the only place the two
+        // unit systems meet. Clamped to a non-negative altitude: MW has cells well below its own sea
+        // level, and a camera at a negative radius would deparameterise into a row of the
+        // transmittance LUT that does not exist.
+        //
+        // ⚠ THE EYE IS THE ABSOLUTE ONE. Under produce-mode-3 park the frame is emitted relative to
+        // bakeEye and the view is restamped, so a camera-relative height would read 0 standing still
+        // and drift with motion ([[project_park_restamp_eye_origin]]). g_eyeAbsShadow is the
+        // absolute world eye the shadow and atmosphere lanes already share.
+        // ⚠ THE FLOOR IS 10 m, NOT 0, AND IT IS A FLOAT32 REQUIREMENT (atmosphere.h.fsl's
+        // ATMOS_GROUND_EPS_M). Every ray-sphere test in the medium computes `dot(ro,ro) - R*R`, and
+        // at planet scale both terms are ~4.05e13 against a 24-bit mantissa — so at exactly r == Rg
+        // that subtraction returns noise of either sign, and the sign decides whether a ray one
+        // degree ABOVE the horizon is reported as hitting the ground. A sea-level camera is the
+        // worst case and MW's harness scene sits at 48 m, so this only ever bites at the waterline —
+        // which is most of the coastline.
+        const float altM = std::max((float)Atmosphere::kGroundEpsM,
+                                    g_eyeAbsShadow[2] * Atmosphere::kMwUnitToMetre);
+        p.cameraRadiusM = Atmosphere::kGroundRadiusM + altM;
+
+        // ─── THE LIGHT IS NOW A READBACK, NOT AN INTEGRAL ────────────────────────────────────────
+        // ⚠⚠ THIS IS THE STRUCTURAL CHANGE S2 EXISTS FOR, AND IT IS WORTH SAYING PLAINLY. What stood
+        // here was ~60 lines: cook the model, integrate its irradiance over 128 directions, anchor
+        // the sun to that irradiance, shade a ground, project the whole thing into SH. Every one of
+        // those was a SECOND evaluation of a field the shader evaluated independently, and the
+        // arrangement needed a startup cross-check whose entire job was to notice when the two
+        // drifted apart. It is gone. atmos_sh.comp projects the LIVE sky-view LUT — the texture the
+        // pixels are literally sampled from — and the host reads the answer back. The light is a
+        // MEASUREMENT OF THE DRAWN SKY.
+        //
+        // ⚠ ONE FRAME OF LATENCY, AND IT IS BUDGETED RATHER THAN HIDDEN. The readback lands after
+        // the fence, so the ambient the frame renders with was measured from the previous frame's
+        // LUTs. The sun moves ~0.004 degrees per frame and the exposure servo's time constant is far
+        // longer than a frame, so nothing downstream can resolve it.
+        //
+        // ⚠ AND UNTIL THE FIRST READBACK LANDS, THE AMBIENT HOLDS MW'S VALUE. Not zero — a DEFINED
+        // state. `active` stays false for the two frames before the first result, so the lighting
+        // blend sits at MW's authored end exactly as it does in an interior, which is a state every
+        // consumer already handles. A zero here would black the world for two frames at every load.
+        if (!g_atmosShValid) { g_skyPhys = p; return; }
+
+        const float* rb = g_atmosShLast;      // native units throughout — see scenecal.h
+
+        float Esky[3] = { rb[kAtmosShEsky + 0], rb[kAtmosShEsky + 1], rb[kAtmosShEsky + 2] };
+        float EsunN[3] = { rb[kAtmosShEsun + 0], rb[kAtmosShEsun + 1], rb[kAtmosShEsun + 2] };
         const float sinE = (float)std::max(0.0, std::sin(std::max(0.0, elev)));
 
-        // --- the GROUND, which is a real part of the sphere the ambient integrates over -----------
-        // Lambertian, lit by everything that comes down: L_g = albedo * (E_sky + E_sun*sin(elev))/pi.
-        // Not a fudge and not the same thing as the model's ground-albedo INPUT (which accounts for
-        // bounce light re-scattered back into the SKY). This is the lower hemisphere's own radiance,
-        // and leaving it black would have tilted every ambient in the game upward.
-        float Lg[3];
-        for (int c = 0; c < 3; ++c) {
-            Lg[c] = (float)g_skyAlbedo * (Esky[c] + EsunN[c] * sinE) / (float)Hosek::kPi;
-        }
-
-        // --- one pass: the SH-L1 projection over the FULL sphere ----------------------------------
-        // Real SH basis, l = 0..1: Y00 = 0.282095, Y1m = 0.488603 * {y, z, x}. Identical maths to
-        // publishSkyAmbientSH's, which is what it still publishes through.
-        constexpr float kY0 = 0.28209479f;
-        constexpr float kY1 = 0.48860251f;
-        const float w = 4.0f * (float)Hosek::kPi / (float)Hosek::kFibDirs;
-        float c00[3] = {}, c1x[3] = {}, c1y[3] = {}, c1z[3] = {};
-        for (int i = 0; i < Hosek::kFibDirs; ++i) {
-            float d[3];
-            Hosek::fibDir(i, Hosek::kFibDirs, d);
-            float L[3];
-            if (d[2] > 0.0f) { Hosek::radiance(p.st, d, L); }
-            else             { L[0] = Lg[0]; L[1] = Lg[1]; L[2] = Lg[2]; }
-            for (int ch = 0; ch < 3; ++ch) {
-                const float Lw = L[ch] * w;
-                c00[ch] += Lw * kY0;
-                c1y[ch] += Lw * kY1 * d[1];
-                c1z[ch] += Lw * kY1 * d[2];
-                c1x[ch] += Lw * kY1 * d[0];
-            }
-        }
-
-        // Cosine convolution (A0 = pi, A1 = 2pi/3) then / pi, so the DC IS the ambient multiplier:
-        // for a constant radiance C the whole thing collapses to exactly C.
+        // The SH, cosine-convolved (A0 = pi, A1 = 2pi/3) then / pi, so the DC IS the ambient
+        // multiplier: for a constant radiance C the whole thing collapses to exactly C. Identical
+        // arithmetic to the CPU projection this replaced — what changed is where the radiance came
+        // from, and that is the entire diff.
         constexpr float kA0 = 1.0f;
         constexpr float kA1 = 2.0f / 3.0f;
-        const float toScene = (float)Hosek::kNativeToScene;
+        const float toScene = (float)SceneCal::kNativeToScene;
         for (int ch = 0; ch < 3; ++ch) {
-            const float dc = kA0 * kY0 * c00[ch];
+            const float dc = kA0 * 0.28209479f * rb[kAtmosShC00 + ch];
             p.ambScene[ch] = std::max(0.0f, dc * toScene);
-            // ⚠ STILL NORMALISED BY THE DC, AND THE PLAN'S "STOP DC-NORMALISING" IS DELIVERED
-            // ANYWAY — by a better route. The ask was that the sky SET the ambient level instead of
-            // only redistributing it. Publishing an un-normalised SH would have done that for the
-            // SH's own receivers and NOBODY ELSE: ambCol is also read by the distant-land lodSunAmb,
-            // by vertex-lit distant statics and by terrain, none of which evaluate skyamb.h.fsl. So
-            // the level is set where it reaches all of them — ambCol itself, from p.ambScene — and
-            // the SH keeps its "factor whose spherical mean is 1" contract, which is also what keeps
-            // the strength slider a safe A/B. Same outcome, five more consumers, one contract intact.
+            // ⚠ STILL NORMALISED BY THE DC, and skyamb.h.fsl's "this enhances, it does not replace"
+            // contract survives S2 intact. The level reaches gFrameData.ambCol itself (p.ambScene,
+            // below at the decode site), which is what lodSunAmb, the vertex-lit distant statics and
+            // terrain all read — none of them evaluate skyAmbFactor(), so an un-normalised SH would
+            // have set the level for the SH's own receivers and nobody else.
             const float inv  = (dc > 1.0e-9f) ? (1.0f / dc) : 0.0f;
-            const float dirK = kA1 * kY1 * inv;
-            p.sh[0][ch] = dirK * c1x[ch];
-            p.sh[1][ch] = dirK * c1y[ch];
-            p.sh[2][ch] = dirK * c1z[ch];
+            const float dirK = kA1 * 0.48860251f * inv;
+            p.sh[0][ch] = dirK * rb[kAtmosShC1x + ch];
+            p.sh[1][ch] = dirK * rb[kAtmosShC1y + ch];
+            p.sh[2][ch] = dirK * rb[kAtmosShC1z + ch];
             p.sh[3][ch] = 1.0f;
             // sunCol is E_normal/pi because `lit = amb + sun*ndl` IS E/pi (§0.1) — the identity that
             // makes the shading term and the HDRI measurement the same quantity.
-            p.sunScene[ch] = std::max(0.0f, EsunN[ch] / (float)Hosek::kPi * toScene);
+            p.sunScene[ch] = std::max(0.0f, EsunN[ch] / (float)SceneCal::kPi * toScene);
         }
 
         // --- what the drawn sky is multiplied by --------------------------------------------------
-        p.sceneScale = toScene * p.nightRamp * std::max(0.0f, g_skyHwStrength);
+        // ⚠ NO NIGHT RAMP, unlike every version before S2e. The ramp faded the sky to black because
+        // the closed form had nothing to say below the horizon; the medium does, so the DRAWN sky
+        // keeps its own level all the way through twilight and into the night. The ramp still rides
+        // the LIGHTING blend, which is the job it was calibrated for.
+        p.sceneScale = toScene * std::max(0.0f, g_skyHwStrength);
         // P2b — the STAR layer's radiance.
-        // ⚠ NO NIGHT RAMP. The ramp fades the ATMOSPHERE out; the stars are what it fades out TO,
-        // and multiplying them by it would take the whole night sky to black together — which is
-        // the P2 behaviour this step exists to end.
-        // ⚠ AND NO g_skyHwStrength EITHER, which it DID carry until the first play session. That
-        // lane is the atmosphere's A/B level; a star is not atmosphere. Coupling them meant the
-        // tuned star value silently depended on where the sky slider sat — the session that tuned
-        // this was running strength 2.0 (recovered from the heartbeat's own zenith: 0.11736 against
-        // the model's 0.05869), so the number that looked right was twice the number in the slider.
-        // Decoupled, the tuned value is portable.
+        // ⚠ NO g_skyHwStrength, which it DID carry until the first play session. That lane is the
+        // atmosphere's A/B level; a star is not atmosphere. Coupling them meant the tuned star value
+        // silently depended on where the sky slider sat.
         p.starScene  = std::max(0.0f, g_skyStarRadiance);
 
         // --- the reported numbers, which are the falsification tests, not decoration ---------------
-        // q_zenith is §0's albedo-free invariant and the one number that says whether the model
-        // landed where the measured population lives (0.122, p25..p75 0.093..0.148). It is REPORTED,
-        // never targeted — the moment anything tunes to it, it stops being a test.
-        const double lumSky = (double)Hosek::luma709(Esky);
-        const double lumSun = (double)Hosek::luma709(EsunN);
+        // ⚠⚠ AND THEY ARE PREDICTIONS NOW, WHICH THEY WERE NOT BEFORE. Hosek's `sunBeamScale()`
+        // SOLVED a scale so that `E_sun/E_total == kRefSunShare == 0.80` held at the reference
+        // configuration by construction — so `sun%=0.80` was an identity restating an anchor, and
+        // the 94 klx beside it was the same solve seen from another angle. Under the medium the beam
+        // is E_TOA x transmittance with NO free scale anywhere in it, so all three of sun%, q and the
+        // klx can now MISS. That is the point of S2b's gate, and if one does miss the honest lever
+        // is the medium's aerosol optical depth — which moves the beam and the sky together, as it
+        // physically must — and never kSceneUnitCd.
+        const double lumSky = (double)SceneCal::luma709(Esky);
+        const double lumSun = (double)SceneCal::luma709(EsunN);
         const double EtotW  = lumSky + lumSun * (double)sinE;
         p.EskyLux  = lumSky * 683.0;
         p.EsunLux  = lumSun * 683.0;
         p.sunShare = (EtotW > 1.0e-9) ? (lumSun * (double)sinE / EtotW) : 0.0;
-        {
-            const float zdir[3] = { 0.0f, 0.0f, 1.0f };
-            float Lz[3];
-            Hosek::radiance(p.st, zdir, Lz);
-            p.qZenith = (EtotW > 1.0e-9) ? ((double)Hosek::luma709(Lz) / (EtotW / Hosek::kPi)) : 0.0;
-            // ...and the same zenith in the units the frame is drawn in, ramp and strength folded
-            // in. P2b's star lane is stated as a level, and a level only means something beside the
-            // thing it has to hide under.
-            p.zenithScene = (double)Hosek::luma709(Lz) * (double)p.sceneScale;
+        for (int c = 0; c < 3; ++c) {
+            p.zenithNative[c]  = rb[kAtmosShZenith + c];
+            p.horizonNative[c] = rb[kAtmosShHorizon + c];
+            p.belowNative[c]   = rb[kAtmosShBelow + c];
         }
-        p.elevDisc = (float)(elev * 180.0 / Hosek::kPi);
+        {
+            const double Lz = (double)SceneCal::luma709(p.zenithNative);
+            p.qZenith = (EtotW > 1.0e-9) ? (Lz / (EtotW / SceneCal::kPi)) : 0.0;
+            p.zenithScene = Lz * (double)p.sceneScale;
+        }
+        // ─── SUNNY 16, RIDING ALONG FREE ─────────────────────────────────────────────────────────
+        // EV100 = log2(L * S / K) with S = 100 and K = 12.5, L in cd/m2. At the reference clear noon
+        // this must land on EV 15 — the textbook value — with no camera model implemented and no
+        // behaviour changed anywhere. It is here for the same reason sun% now is: a number nobody
+        // tuned to is the only kind that can falsify anything, and this one costs a log2.
+        //
+        // ⚠ IT IS A REPORTED NUMBER AND NOTHING READS IT. The full physical camera (ISO / aperture /
+        // shutter driving the servo) is a named follow-on phase and is deliberately not built here —
+        // it is only meaningful once the sun and the sky have been certified, which is what S2
+        // delivers.
+        {
+            // The scene's average luminance, taken as E_total/pi x a mid-grey 18% reflector: the
+            // standard definition behind Sunny 16, and the same E_total every other number here is
+            // derived from.
+            const double Lavg = (EtotW / SceneCal::kPi) * 0.18 * 683.0;
+            p.ev100 = (Lavg > 1.0e-9) ? std::log2(Lavg * 100.0 / 12.5) : 0.0;
+        }
+        p.elevDisc = (float)(elev * 180.0 / SceneCal::kPi);
         // --- P2b: THE CLOUD ANCHOR ----------------------------------------------------------------
         // A fully-lit cloud texel is a near-Lambertian surface under everything coming down:
         // L = albedo * E_total / pi, with E_total the SAME horizontal irradiance every other number
-        // here is derived from. So the clouds stop being authored display data riding the exposure on
-        // their own and become part of the one radiance field — which is the whole thesis of this
-        // plan applied to the one element P2b deliberately left alone and play falsified.
+        // here is derived from.
         //
-        // ⚠ IT TAKES sceneScale, SO IT TAKES THE NIGHT RAMP. That is the half that fixes the reported
-        // symptom: at night the sky ramps to black while the servo runs E = 14-27 to meter a dark
-        // ground, and an authored cloud left at its own level lands near display 240 on that black.
-        // Riding the ramp, the clouds go dark WITH the sky — and they still occlude the stars, because
-        // their ALPHA is untouched and a black cloud over a star is a black cloud.
-        //
-        // ⚠ WHICH IS ALSO WHY IT NEEDS g_skyCloudNight ADDED TO IT. Taking the ramp means this term
-        // is identically ZERO at night, and a black cloud layer is not what "dark with the sky"
-        // meant — it also made the albedo slider inert, which is how it was caught. The night term
-        // is authored rather than derived because the physics it stands in for (moonlight, ~2.5e-6
-        // scene) is six orders of magnitude below anything this exposure range can show; see the
-        // knob's own note.
-        p.cloudScene = std::max(0.0f, g_skyCloudAlbedo) * (float)(EtotW / Hosek::kPi) * p.sceneScale
+        // ⚠ IT TOOK THE NIGHT RAMP THROUGH sceneScale, AND SINCE S2e IT NO LONGER CAN — because
+        // sceneScale has stopped carrying one. That turns out to be the RIGHT answer rather than a
+        // regression to patch: the ramp was standing in for "the sky went black and the clouds must
+        // go with it", and the sky does not go black any more. The medium's own twilight and night
+        // levels now dim the clouds, through E_total, continuously — which is what "dark with the
+        // sky" always meant. g_skyCloudNight survives as the floor beneath that, for the same reason
+        // the airglow lane exists: full moonlight on a cloud is ~2.5e-6 scene units, which is display
+        // code 0 at any exposure this renderer runs.
+        p.cloudScene = std::max(0.0f, g_skyCloudAlbedo) * (float)(EtotW / SceneCal::kPi) * p.sceneScale
                      + std::max(0.0f, g_skyCloudNight);
         p.cloudOverZenith = (p.qZenith > 1.0e-9) ? ((double)g_skyCloudAlbedo / p.qZenith) : 0.0;
         p.active = true;
@@ -19860,17 +21624,17 @@ namespace ForgeRender {
             if (!(d > 1.0e-3f) || !(rw > 1.0e-6f)) { continue; }
 
             const float theta = std::atan2(rw, d);                       // angular RADIUS
-            const float omega = 2.0f * (float)Hosek::kPi * (1.0f - std::cos(theta));
+            const float omega = 2.0f * (float)SceneCal::kPi * (1.0f - std::cos(theta));
             if (!(omega > 1.0e-12f)) { continue; }
 
             const float gain = std::max(0.0f, g_sunDiscGain) * std::max(0.0f, g_skyHwStrength);
             for (int c = 0; c < 3; ++c) {
                 // sunScene IS E_normal/pi (the `lit = amb + sun*ndl` identity), so E_normal is
                 // pi times it. Per channel, so the disc reddens with the transmittance.
-                g_skyPhys.sunDiscL[c] = gain * g_skyPhys.sunScene[c] * (float)Hosek::kPi / omega;
+                g_skyPhys.sunDiscL[c] = gain * g_skyPhys.sunScene[c] * (float)SceneCal::kPi / omega;
             }
             g_skyPhys.sunDiscOmega   = omega;
-            g_skyPhys.sunDiscHalfDeg = theta * 180.0f / (float)Hosek::kPi;
+            g_skyPhys.sunDiscHalfDeg = theta * 180.0f / (float)SceneCal::kPi;
             g_skyPhys.sunDiscFound   = true;
             break;   // one sun
         }
@@ -20039,6 +21803,108 @@ namespace ForgeRender {
         g_expEnable = false;
         g_exposure  = 1.0;
     }
+    // M1, same arrangement and same reason (see forgerender.h): arm the motion-vector pass for the
+    // probe, then report the field's own statistics.
+    // M1 4b: narrow the probe's input rect through the CLIENT'S OWN ENTRY POINT. setRenderSize takes
+    // the OUTPUT rect and derives the input rect from the scale, so going through it is what puts the
+    // derivation under test instead of poking g_live.width. Returns false when there is nothing left
+    // to test downstream — no backend armed, or a scale that is already 1.
+    //
+    // ⚠⚠ IT DRIVES setRenderSize UNCONDITIONALLY, AND THAT IS THE WHOLE REASON THIS FUNCTION EXISTS
+    // IN ITS SECOND FORM. The first version returned early on `!pUpscaler` — so the one configuration
+    // that actually shipped broken, a scale knob set with NO backend to consume it, was the one
+    // configuration nothing headless ever exercised. It reached the game instead, as "scale shrinks
+    // the view": the raster narrowed, nothing widened it back, and the frame landed in the top-left
+    // quadrant of a full-size resolve viewport. An early-out on the untested state is not a skip, it
+    // is a hole shaped exactly like the bug ([[feedback_verify_the_right_artifact]]).
+    //
+    // So the unarmed case is now an ASSERTION rather than a skip: the input rect must come back
+    // EXACTLY equal to the output rect, because upscaleScale() is required to return 1.0 whenever
+    // g_upscaleName is null. Run it with `MGE_HOST_KNOBS=upscaleInputScale=0.5` and NO upscaleEnable.
+    bool upscaleProbeNarrow() {
+        const uint32_t outW = g_live.outWidth, outH = g_live.outHeight;
+        const bool armed = (g_live.pUpscaler != nullptr) && (g_upscaleName != nullptr);
+        std::printf("[forge] scene-probe: UPSCALE stage — driving setRenderSize(%u,%u) at "
+                    "inputScale=%.3f, backend=%s\n",
+                    outW, outH, (double)g_upscaleInputScale, armed ? g_upscaleName : "none");
+        setRenderSize(outW, outH);
+        std::printf("[forge] scene-probe: rects now in=%ux%u out=%ux%u alloc=%ux%u\n",
+                    g_live.width, g_live.height, g_live.outWidth, g_live.outHeight,
+                    g_live.allocWidth, g_live.allocHeight);
+
+        const bool split = (g_live.width != outW) || (g_live.height != outH);
+        if (!armed) {
+            // THE INVARIANT: the input rect may narrow only while something exists to widen it back.
+            if (split) {
+                std::printf("!! [forge] scene-probe: UPSCALE INVARIANT VIOLATED — the input rect "
+                            "narrowed to %ux%u with NO backend armed. The frame will render into a "
+                            "sub-rect and be delivered through a full-size resolve viewport: the "
+                            "picture lands in the top-left corner. This is the 'scale shrinks the "
+                            "view' regression.\n", g_live.width, g_live.height);
+            } else {
+                std::printf("[forge] scene-probe: UPSCALE invariant OK — knob %.3f is INERT with no "
+                            "backend, in == out, the frame is exactly the un-upscaled one\n",
+                            (double)g_upscaleInputScale);
+            }
+            return false;   // nothing downstream to test; the assertion above is the whole stage
+        }
+        if (!split) {
+            // Not a failure of the pass — a failure to SET UP the test, which is a different thing
+            // and has to read differently or a green run means nothing.
+            std::printf("[forge] scene-probe: UPSCALE stage INCONCLUSIVE — the rects did not split "
+                        "(in == out), so the identity fast path would still run\n");
+            return false;
+        }
+        return true;
+    }
+
+    void upscaleProbeReport() {
+        std::printf("[forge] scene-probe: upscale ran=%s -> CENTRE must still be 15,15,15,255 "
+                    "(a flat field through a partition-of-unity filter is itself)\n",
+                    g_lastUpscaleRan ? "YES" : "NO — the pass did not record; see the log above");
+    }
+
+    void mvEnableForProbe() {
+        g_mvEnable = true;
+    }
+    void mvReportForProbe() {
+        if (!g_live.mvReady) {
+            std::printf("[forge] scene-probe: motion vectors NOT READY - nothing to report\n");
+            return;
+        }
+        if (!g_live.pMvStatsReadback || !g_live.pMvStatsReadback->pCpuMappedAddress) {
+            std::printf("[forge] scene-probe: mv stats readback unavailable\n");
+            return;
+        }
+        const uint32_t* st = (const uint32_t*)g_live.pMvStatsReadback->pCpuMappedAddress;
+        const uint32_t total = st[3];
+        if (total == 0u) {
+            std::printf("[forge] scene-probe: mv stats EMPTY (the dispatch never ran)\n");
+            return;
+        }
+        float mx = 0.0f, mn = 0.0f;
+        std::memcpy(&mx, &st[0], sizeof(float));
+        std::memcpy(&mn, &st[1], sizeof(float));
+        const bool   haveMin  = (st[1] != 0xFFFFFFFFu);
+        const double stillPct = 100.0 * (double)st[2] / (double)total;
+        // ⚠ THE ASSERTION, and it is this pass's whole contract. The probe's camera is IDENTITY on
+        // every renderScene call, so nothing in the world moved and nothing on screen may either.
+        // A failure here is a field that invents motion out of a static frame — which is exactly
+        // what a wrong origin fold produces — caught without launching Morrowind and without anyone
+        // having to decide what a picture looks like.
+        const double reactPct = 100.0 * (double)st[4] / (double)total;
+        // ⚠ TWO ASSERTIONS, NOT ONE, and the second is the reactive mask's contract. The probe's
+        // camera is identity on every call, so nothing moved and nothing was disoccluded — the mask
+        // must therefore be EMPTY. A static frame that marks itself reactive means the thresholds
+        // are catching the reprojection's own round-off, which in play would quietly mark most of
+        // the screen and switch the upscaler off while looking merely "soft".
+        const bool pass = (stillPct > 99.9) && (mx < 0.01f) && (reactPct < 0.1);
+        std::printf("[forge] scene-probe: mv field max=%.4f px min=%.4f px still(<0.01px)=%.1f%% "
+                    "reactive=%.2f%% of %u px -> %s (a static camera MUST be ~100%% still and "
+                    "~0%% reactive)\n",
+                    (double)mx, (double)(haveMin ? mn : 0.0f), stillPct, reactPct, total,
+                    pass ? "PASS" : "**FAIL**");
+    }
     // ...and the LAND cell grid's extent, for the same reason: SH2's height-map rebuild is recorded
     // at the very top of renderScene and has to stamp the grid the terrain residency uploaded into
     // its params cbuffer. Defined with the terrain globals far below.
@@ -20090,6 +21956,8 @@ namespace ForgeRender {
     void publishGrassCrushParams(float* mp);                     // G7: the crush field's own lanes
     void rebuildSkyHeightMap();  // SH2: clear + statics raster + terrain compute, when the eye leaves its snap cell
     void rebuildSunOccMap(bool force);   // ...and the sun-BLOCKED height derived from it (sun motion / forced)
+    void atmosDispatch();                // S2: the atmosphere's four-pass LUT chain, every frame
+    void atmosReportGate(bool deckArm);  // S2b/S4a: the GATE, reported from settleFrameFence
     void dlDrawHeroBlend();                                                 // Phase 4 post-water hero blend pass
     bool buildGlowPath(Renderer* R);                                        // Phase F glow billboards: build (idempotent)
     void dlDrawGlowBillboards();                                            // Phase F glow billboards: per-frame fill + draw
@@ -20101,27 +21969,116 @@ namespace ForgeRender {
     void dlLogHeartbeat();
     void dlLogGpuSlow(double gpuMs, double recMs, unsigned drawn);   // per-frame GPU spike (reads DL counts)
 
-    // REVERSE-Z + HALF-PIXEL fixups on a client row-major viewProj, shared by the main
+    // Halton, the textbook radical-inverse form. Two coprime bases give a 2-D low-discrepancy
+    // sequence: successive points fill the unit square evenly at EVERY prefix length, which is the
+    // property a jitter needs and a random pair does not have — random samples clump, and a clump is
+    // a frame's worth of the accumulator learning nothing.
+    //
+    // i is 1-BASED. halton(0, b) is exactly 0 for every base, i.e. the centre sample, which as a
+    // first jitter would waste one frame of the sequence reproducing the unjittered image.
+    float haltonRadical(uint32_t i, uint32_t base) {
+        float f = 1.0f, r = 0.0f;
+        while (i > 0u) {
+            f /= (float)base;
+            r += f * (float)(i % base);
+            i /= base;
+        }
+        return r;
+    }
+
+    // Draw THIS frame's sub-pixel offset. Called exactly once per RENDERED frame, from the top of
+    // renderScene beside ++g_renderFrame — see g_jitterPx for why "rendered" is the load-bearing
+    // word and why it is not recomputed at each use site.
+    void advanceJitter() {
+        if (!(g_jitterAmp > 0.0f)) {
+            // Hard zero rather than a small number: this is the bit-identity arm, and the whole
+            // claim is that the offset added below is LITERALLY 0.0f. Also resets the index, so
+            // toggling the knob off and on restarts the sequence at a known place instead of
+            // resuming mid-walk — which matters when someone is A/B-ing two amplitudes.
+            g_jitterPx[0] = g_jitterPx[1] = 0.0f;
+            g_jitterIndex = 0;
+            return;
+        }
+        uint32_t phases = (uint32_t)(g_jitterPhases + 0.5f);
+        if (phases < 1u)  { phases = 1u; }
+        if (phases > 64u) { phases = 64u; }
+        const uint32_t i = (g_jitterIndex % phases) + 1u;   // 1-based: see haltonRadical
+        ++g_jitterIndex;
+        // [0,1) -> [-0.5, 0.5) * amplitude, so amplitude 1.0 spans exactly one pixel. Centring is not
+        // cosmetic: an uncentred sequence biases the whole image toward the bottom-right by half its
+        // amplitude — a FIXED shift, invisible as a shimmer and very visible as a misregistration
+        // against MW's own layers, which is the exact defect the half-pixel term above exists to
+        // remove.
+        //
+        // ⚠ THE `- 0.5f` DOES NOT ZERO THE MEAN EXACTLY, and the residual is worth knowing rather
+        // than assuming away. A Halton prefix is only asymptotically uniform: over the first 8
+        // points base 2 averages 0.4453125, so x carries a standing -0.0547 px offset at amplitude
+        // 1, while base 3 averages exactly 0.5 and y carries none. Left as the plain -0.5 because
+        // that is what every reference implementation (and every upscaler's own docs) uses, and the
+        // offset we hand the upscaler is the one we actually applied either way; 1/18 of a pixel is
+        // also an order of magnitude under the half-pixel term sitting beside it. Subtracting the
+        // period's true mean would fix it and would make the jitter a function of `phases`, which is
+        // a worse trade — but if a fixed sub-pixel shift is ever chased, look here first.
+        g_jitterPx[0] = (haltonRadical(i, 2u) - 0.5f) * g_jitterAmp;
+        g_jitterPx[1] = (haltonRadical(i, 3u) - 0.5f) * g_jitterAmp;
+    }
+
+    // THE SCREEN-SPACE SUB-PIXEL OFFSET, in NDC, for every view that registers against the main
+    // screen. ONE definition, three callers, and that is the point.
+    //
+    //   HALF-PIXEL: MW's own layers are drawn by DXVK as D3D9 (half-pixel rasterization offset);
+    //   Forge is D3D12 (none) → a ~1px whole-image shift in the composite. Re-introduce the D3D9
+    //   offset: NDC dx = -1/width, dy = +1/height. kHalfPixelSign flips the whole correction in one
+    //   place for F5/F6 A/B. ([[project_forge_halfpixel_align]])
+    //
+    //   JITTER (M1): g_jitterPx, ADDED to the same lane. NDC spans 2 over `width` pixels, so one
+    //   pixel is 2/width and the half-pixel term above is 1/width — the two units agree, which is
+    //   why this is an addition and not a second mechanism.
+    //   ⚠ ADD, NEVER REPLACE. Dropping the half-pixel term to "make room" for the jitter would
+    //   re-open the composite misalignment the term exists to cancel, and the symptom (a 1px
+    //   whole-image shift against MW's UI) reads nothing like a jitter bug.
+    //
+    // ⚠⚠ WHICH VIEWS GET THIS IS NOT A JUDGEMENT CALL — IT IS ALREADY DECIDED BY THE HALF-PIXEL
+    // TERM, and the two sets are necessarily identical. A view carries the half-pixel offset exactly
+    // when its target is registered against the MAIN SCREEN, and a view must carry the jitter for
+    // the same reason: pReflectColor is "the mirrored scene in MAIN-screen space" and water.frag
+    // samples it at `In.Position.xy * invScreen` — this fragment's own, JITTERED, screen UV. Render
+    // the mirror unjittered and the reflection slides against the water by the jitter every frame,
+    // which is a shimmer the upscaler would have no way to resolve.
+    //
+    // ⚠ The plan (tasks/forge-upscale.md) said "main and FP views only, not the reflect VP". That is
+    // right for the SHADOW atlas and wrong for the reflection, and the code says which: the shadow
+    // atlas explicitly carries NO half-pixel offset ("the atlas never composites against a D3D9
+    // layer") because it is sampled by a world-space projection, while both mirror matrices carry
+    // their own copy of this exact term precisely because they are sampled by screen UV. Follow the
+    // half-pixel term and the set comes out right.
+    void projPixelOffset(float& dx, float& dy) {
+        const float kHalfPixelSign = -1.0f;  // -1 pushes Forge toward bottom-right (cancels the D3D9/D3D12 top-left mismatch)
+        const float invW = 1.0f / (float)g_live.width;
+        const float invH = 1.0f / (float)g_live.height;
+        // +x right, +y down in PIXELS for the jitter; NDC y points up, hence the sign flip on dy —
+        // the same sense kHalfPixelSign already encodes for the half-pixel push to bottom-right.
+        dx = kHalfPixelSign * (-invW) + 2.0f * g_jitterPx[0] * invW;
+        dy = kHalfPixelSign * ( invH) - 2.0f * g_jitterPx[1] * invH;
+    }
+
+    // REVERSE-Z + HALF-PIXEL (+ M1 JITTER) fixups on a client row-major viewProj, shared by the main
     // scene and the FP pass (FP1a) so both land in the exact same clip convention.
     //   REVERSE-Z: post-multiply by Z_rev (maps clip z' = w - z, near->1 / far->0). On a
     //   row-major matrix that ONLY touches column 2: m[i*4+2] := m[i*4+3] - m[i*4+2]. The
     //   shader reads the cbuffer column-major (== the transpose) so mul(viewProj, worldPos)
     //   applies viewProj*Z_rev in row-vector terms — exactly reverse-Z, no shader change.
     //   Pairs with depth clear 0.0 + CMP_GEQUAL.
-    //   HALF-PIXEL: MW's own layers are drawn by DXVK as D3D9 (half-pixel rasterization
-    //   offset); Forge is D3D12 (none) → a ~1px whole-image shift in the composite.
-    //   Re-introduce the D3D9 offset: NDC dx = -1/width, dy = +1/height, added as d*col3
-    //   to the matching col so the shift scales with w (post-divide constant).
-    //   kHalfPixelSign flips the whole correction in one place for F5/F6 A/B.
+    //   SUB-PIXEL: dx/dy from projPixelOffset (half-pixel + jitter), added as d*col3 to the matching
+    //   col so the shift scales with w (post-divide constant).
     void applyProjFixups(float dst[16], const float* viewProj) {
         std::memcpy(dst, viewProj, 16 * sizeof(float));
         dst[2]  = dst[3]  - dst[2];
         dst[6]  = dst[7]  - dst[6];
         dst[10] = dst[11] - dst[10];
         dst[14] = dst[15] - dst[14];
-        const float kHalfPixelSign = -1.0f;  // -1 pushes Forge toward bottom-right (cancels the D3D9/D3D12 top-left mismatch)
-        const float dx = kHalfPixelSign * (-1.0f / (float)g_live.width);
-        const float dy = kHalfPixelSign * ( 1.0f / (float)g_live.height);
+        float dx, dy;
+        projPixelOffset(dx, dy);
         dst[0]  += dx * dst[3];
         dst[4]  += dx * dst[7];
         dst[8]  += dx * dst[11];
@@ -20161,7 +22118,7 @@ namespace ForgeRender {
                                              : D3D12_RESOURCE_STATE_COPY_DEST;
         cl->ResourceBarrier(2, pre);
         // Take the format from the SOURCE rather than naming it. src and dst are both scene-format
-        // targets (pMSAAColor→pSkyColor, pReflectColor→pReflectSkyColor), and hard-coding BGRA8 here
+        // targets (pSceneColor→pSkyColor, pReflectColor→pReflectSkyColor), and hard-coding BGRA8 here
         // is one of the five places the fp16 flip would otherwise break silently.
         //
         // ⚠ FROM THE FORGE OBJECT, *NOT* `srcRes->GetDesc().Format`. That was the first attempt and it
@@ -20239,58 +22196,74 @@ namespace ForgeRender {
         g_lastGpuMs = g_lastGpuPhaseMs[kGpuPhaseFrame];
         g_gpuAccum += g_lastGpuMs;
 
-        // ─── P2: THE C++/FSL CROSS-CHECK, REPORTED ONCE ─────────────────────────────────────────
-        // The model is evaluated twice, in two languages, and the two halves feed the sky and the
-        // light respectively. This is the measurement that says they agree — read here because here
-        // is where a readback becomes valid, and reported ONCE because it is a self-test.
+        // ─── S2: THE ATMOSPHERE'S MEASUREMENT, DRAINED ──────────────────────────────────────────
+        // Read HERE because here is where a readback becomes valid. This is not an instrument — it
+        // is the LIGHT: the SH, the ambient's level and the sun all come off these 128 bytes now.
         //
-        // ⚠ NOTHING ELSE IN THE PHYSICAL SKY MEANS ANYTHING UNTIL THIS LINE READS OK. A shader that
-        // has quietly diverged from the host's evaluation produces a sky that looks plausible and
-        // lights the world with a different one, which is the failure the whole step exists to
-        // remove and the one that is invisible by inspection.
-        if (g_hosekCheckState == 1 && g_live.pHosekReadback
-            && g_live.pHosekReadback->pCpuMappedAddress) {
-            const uint32_t* hr = (const uint32_t*)g_live.pHosekReadback->pCpuMappedAddress;
-            double worst = 0.0; uint32_t ran = 0, worstDir = 0;
-            float worstGpu[3] = {}, worstCpu[3] = {};
-            for (uint32_t i = 0; i < kHosekCheckDirs; ++i) {
-                if (hr[i * 4 + 3] != 1u) { continue; }
-                ++ran;
-                float d[3];
-                Hosek::fibDir((int)i, (int)kHosekCheckDirs, d);
-                float cpu[3];
-                Hosek::radiance(g_skyPhys.st, d, cpu);
-                float gpu[3];
-                for (int c = 0; c < 3; ++c) { std::memcpy(&gpu[c], &hr[i * 4 + c], sizeof(float)); }
-                for (int c = 0; c < 3; ++c) {
-                    const double den = std::max(1.0e-4, (double)std::fabs(cpu[c]));
-                    const double rel = std::fabs((double)gpu[c] - (double)cpu[c]) / den;
-                    if (rel > worst) {
-                        worst = rel; worstDir = i;
-                        worstGpu[0] = gpu[0]; worstGpu[1] = gpu[1]; worstGpu[2] = gpu[2];
-                        worstCpu[0] = cpu[0]; worstCpu[1] = cpu[1]; worstCpu[2] = cpu[2];
-                    }
+        // ⚠⚠ AND THAT IS THE STRUCTURAL CHANGE S2 EXISTS FOR. What stood here was a self-test whose
+        // whole job was to notice when the C++ evaluation of the sky and the FSL evaluation of the
+        // sky had drifted apart, because the light came from one and the pixels from the other. The
+        // drift is gone rather than instrumented: atmos_sh.comp projects the very sky-view LUT the
+        // pixels are sampled from, so the light IS a measurement of the drawn sky and there is no
+        // second copy left to diverge. hosek.h, hosek.h.fsl and hosekcheck.* are deleted with it.
+        //
+        // ⚠ ONE FRAME OF LATENCY, BUDGETED. The frame renders with the ambient measured from the
+        // previous frame's LUTs. The sun moves ~0.004 degrees per frame and the exposure servo's time
+        // constant is far longer, so nothing downstream can resolve it.
+        if (g_atmosShArmed && g_live.pAtmosShReadback
+            && g_live.pAtmosShReadback->pCpuMappedAddress) {
+            const uint32_t* ar = (const uint32_t*)g_live.pAtmosShReadback->pCpuMappedAddress;
+            g_atmosShLastRan = ar[kAtmosShRan];
+            // Decoded ONCE, here, into a held copy. skyPhysicalMeasure runs at a completely
+            // different point in the frame and reading the GPU_TO_CPU buffer there would race the
+            // copy that fills it.
+            for (uint32_t i = 0; i < (uint32_t)kAtmosShRan; ++i) {
+                std::memcpy(&g_atmosShLast[i], &ar[i], sizeof(float));
+            }
+            // ...and the below-horizon probe, which sits PAST the "ran" tell and is therefore not
+            // covered by the loop above. Copied here rather than by widening the loop: slot 24 is a
+            // uint COUNT and reinterpreting it as a float would put a denormal on the [sky] line.
+            for (uint32_t i = 0; i < 3u; ++i) {
+                std::memcpy(&g_atmosShLast[kAtmosShBelow + i], &ar[kAtmosShBelow + i], sizeof(float));
+            }
+            // ...and S4a's multiscatter-ratio instrument, which sits past the tell for the same reason.
+            std::memcpy(&g_atmosShLast[kAtmosShMsF], &ar[kAtmosShMsF], sizeof(float));
+            // ⚠ "ran" IS NOT COSMETIC. A readback of zeros and a sky that genuinely integrates to
+            // zero are the same 128 bytes; without the tell, a dispatch that silently did nothing
+            // would publish a black ambient and look exactly like midnight. Only a reported run
+            // arms the lane, so the untouched case holds MW's authored lighting instead.
+            // ⚠ THE GATE FRAME'S MEASUREMENT IS NOT THE FRAME'S LIGHT, and that distinction is
+            // worth two lines. The gate FORCES the reference configuration into the params cbuffer
+            // for exactly one frame — Clear, albedo 0.10, sun at 41.34 degrees — so its readback
+            // describes a sky nobody is standing under. Arming the light from it would light the
+            // world with the reference atmosphere for a frame, at load, which is a small wrong
+            // thing that would look exactly like a large one if it ever coincided with a bug.
+            // The gate reads the bytes, reports, and the light waits one more frame for a
+            // measurement taken under the weather that is actually outside.
+            const bool gateBytes = (g_atmosGateState == 1 || g_atmosGateState == 3);
+            if (g_atmosShLastRan == 1u && !gateBytes) {
+                if (!g_atmosShValid) {
+                    LOG::logline(">> [forge-atmos] first SH measurement landed (frame %u):"
+                                 " the sky-view LUT is now driving the ambient AND the sun."
+                                 " The light is a measurement of the DRAWN sky.", g_renderFrame);
+                    LOG::flush();
                 }
+                g_atmosShValid = true;
+            } else if (g_atmosShLastRan != 1u && gateBytes) {
+                LOG::logline("!! [forge-atmos] the SH/gate dispatch DID NOT RUN (ran=%u) — the"
+                             " atmosphere's light is UNVERIFIED and the ambient is holding MW's",
+                             g_atmosShLastRan);
+                LOG::flush();
             }
-            if (ran == 0u) {
-                LOG::logline("!! [forge-hosek] cross-check DID NOT RUN (0 of %u threads reported) —"
-                             " the physical sky's C++/FSL agreement is UNVERIFIED", kHosekCheckDirs);
-            } else {
-                // 1e-3 is a FLOAT-PRECISION gate, not a tolerance for being a bit wrong: the two
-                // evaluations differ only in fp contraction and in acos/exp implementations, so a
-                // real divergence (a swapped coefficient, a dropped term, a wrong lane) lands orders
-                // of magnitude above it. Anything between the two is worth reading the numbers for,
-                // which is why the worst direction's actual values are printed rather than a verdict.
-                const bool ok = (worst < 1.0e-3);
-                LOG::logline("%s [forge-hosek] cross-check %s: max rel deviation %.3e over %u dirs"
-                             " (frame %u; worst dir %u: gpu %.5f %.5f %.5f vs cpu %.5f %.5f %.5f)",
-                             ok ? ">>" : "!!", ok ? "OK" : "**DIVERGED**", worst, ran,
-                             g_hosekCheckArmedFrame, worstDir,
-                             (double)worstGpu[0], (double)worstGpu[1], (double)worstGpu[2],
-                             (double)worstCpu[0], (double)worstCpu[1], (double)worstCpu[2]);
+            // ...and if this was a GATE frame, report it. Twice per host session now: the clear
+            // reference, then the lid. State 2 re-arms atmosDispatch for the second configuration.
+            if (g_atmosGateState == 1) {
+                atmosReportGate(false);
+                g_atmosGateState = 2;
+            } else if (g_atmosGateState == 3) {
+                atmosReportGate(true);
+                g_atmosGateState = 4;
             }
-            LOG::flush();
-            g_hosekCheckState = 2;
         }
 
         // Stage B (B2): GPU cull counters. [0] = frustum survivors (compare to the CPU cull's
@@ -20483,6 +22456,14 @@ namespace ForgeRender {
         }
         ++g_renderFrame;   // drives the dynamic-promote consecutive-frame streak in uploadGeometry
         g_uvAnimCount = 0; // fresh gUVAnim table this frame (memoized ids re-assign on demand)
+        // M1: draw this frame's sub-pixel jitter (tasks/forge-upscale.md). HERE, beside
+        // ++g_renderFrame, because the sequence must advance once per RENDERED frame — park mode and
+        // frame-ahead both re-render a parked payload at a new camera, and a sequence keyed to
+        // produced frames would repeat a phase across two rasters or skip one entirely. Every view
+        // that reads g_jitterPx below — main, FP, both water mirrors — is inside this call and so
+        // sees one value. No-op while g_jitterAmp is 0, which is the shipped default.
+        advanceJitter();
+        g_lastMvRan = false;   // M1: set by the motion-vector dispatch at the colour->water seam
 
         const uint32_t n = (drawCount < g_live.maxDraws) ? drawCount : g_live.maxDraws;
         const uint32_t haveBytes = drawBytes / (uint32_t)sizeof(IPC::DrawItemWire);
@@ -20729,6 +22710,11 @@ namespace ForgeRender {
             // as encode -> curve -> authored. Reverse the two and the fog comes back wrong by
             // exactly one gamma, which reads as a washed-out horizon rather than as a broken one.
             decodeAuthoredRGB(fd + 28);
+            // The land's fog target, in the units the frame actually renders in. Captured HERE and
+            // not recomputed later: the lift is gated (AgX skips it) and the decode is a second
+            // stage, so any second spelling of this would be a copy that can drift from the one the
+            // shaders read. See the [sky] heartbeat for what it is compared against.
+            g_fogNearScene[0] = fd[28]; g_fogNearScene[1] = fd[29]; g_fogNearScene[2] = fd[30];
             // ─── P2: THE PHYSICAL SKY, MEASURED AND APPLIED TO THE LIGHT ─────────────────────────
             // THE one site, inherited from P1's anchor and for the same reason it was the one site:
             // everything the measurement needs is finished by this line and nothing else in the
@@ -20755,7 +22741,9 @@ namespace ForgeRender {
             // at all — and calTarget()'s night row only means something if the servo has a lit
             // ground to meter. So at night the lighting hands back to MW's authored night ambient
             // while the SKY (which takes the ramp directly, in gSkyView.radiance.w) goes black. Two
-            // different jobs, one continuous ramp, no step at dawn. See hosek.h.
+            // different jobs, one continuous ramp, no step at dawn. ⚠ S2e RETIRED THE SKY HALF:
+            // the medium computes twilight rather than fading out of it, so gSkyView.radiance.w no
+            // longer carries the ramp and only this lighting site does. See scenecal.h::nightRamp.
             // fd[19] / fd[27] are sunDir.w and ambCol.w — two padding lanes no FSL reads, carrying
             // MW's SUN DISC as an elevation sine and an azimuth. That is a DIFFERENT sun from
             // fd[16..18]: the disc sits ~29 degrees off the light direction and, unlike the light,
@@ -20892,6 +22880,21 @@ namespace ForgeRender {
                                                              // bit4 (two-sided flip) retired — see alpha.frag
             // dbgScales (float index 44..47): dev panel intensity modifiers.
             dp[44] = g_ambScale; dp[45] = g_litScale; dp[46] = g_albedoScale; dp[47] = g_overallScale;
+            // ─── THE TWO FOG LOOK LANES (froxelZ.zw, float 122/123) ──────────────────────────
+            // ⚠ PUBLISHED HERE, WITH THE REST OF THE FRAME'S FOG STATE, AND UNCONDITIONALLY. They
+            // physically sit in the froxel row because FrameData is exactly full at its 512B CBV,
+            // but they are not froxel data and the froxel fill must not own them: that fill runs
+            // only when clustering is active, so it would leave them stale on any frame that
+            // brute-loops — and, more to the point, it is skipped for the REFLECT pass entirely.
+            //
+            // ⚠⚠ AND THE REFLECT PASS IS THE WHOLE POINT. pReflectFrameCbvGeo is a full
+            // kFrameDataBytes memcpy of this buffer that then overrides viewProj, the clip plane,
+            // froxelDims.x and fogParams.zw — it does not touch 122/123, so writing them HERE is
+            // what makes the mirror and the main view agree about the fog target. Publishing them
+            // at the froxel site instead would have given the reflection a knee of whatever was
+            // left in that row, which is exactly the class of bug the reported disparity is.
+            dp[122] = std::max(0.0f, std::min(g_fogSkyKnee, 0.999f));
+            dp[123] = std::max(0.0f, g_fogNearHaze);
             // skyParams (float index 60..63): SK2 "ownership tell" — sky.frag tints the Forge sky
             // toward magenta by dp[60], optionally pulsing (dp[62]) over host time dp[61]. 0 = no-op.
             dp[60] = g_skyDebugTint;
@@ -23098,37 +25101,22 @@ namespace ForgeRender {
         // is why this one only has to watch the sun. Also almost always a no-op.
         rebuildSunOccMap(/*force*/false);
 
-        // ─── P2: THE C++/FSL CROSS-CHECK, DISPATCHED ONCE ────────────────────────────────────────
-        // Here because here is the last point in the frame with no render target bound, and because
-        // gSkyView has already been published this frame (both the coefficients and the main view's
-        // matrix are written before recording begins). It reads the SAME cbuffer skyhw.frag will
-        // read a few hundred lines below — that sharing is the point, see hosekcheck.srt.h.
+        // ─── S2: THE ATMOSPHERE's LUT CHAIN, REBUILT EVERY FRAME ─────────────────────────────────
+        // Here because here is the last point in the frame with no render target bound, and beside
+        // the two rebuilds above because all three are pure compute over textures nothing else has
+        // touched yet. This one is NOT throttled, unlike its two neighbours, and that is the design:
+        // the LUTs are what let the medium's parameters move CONTINUOUSLY, and a weather
+        // sub-simulation is exactly a continuous walk through parameter space. Throttling them would
+        // put the walk back on a cross-fade between frozen presets, which is the state S1 measured
+        // itself against ("VERDICT: WALK", never STEP).
         //
-        // ONE dispatch per host session, on the first frame the model is actually armed. 64 threads;
-        // the copy is 1 KB. Reported by settleFrameFence at the top of the NEXT frame.
-        if (g_hosekCheckState == 0 && g_skyPhys.active && g_skyViewPub[0]
-            && g_live.pHosekCheckPipeline && g_live.pHosekCheckSet && g_live.pHosekOutBuf) {
-            cmdBeginDebugMarker(g_live.pCmd, 0.9f, 0.6f, 0.2f, "Hosek C++/FSL cross-check");
-            cmdBindPipeline(g_live.pCmd, g_live.pHosekCheckPipeline);
-            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pHosekCheckSet);
-            cmdDispatch(g_live.pCmd, 1, 1, 1);
-            if (g_live.pHosekReadback) {
-                BufferBarrier hb = {};
-                hb.pBuffer = g_live.pHosekOutBuf;
-                hb.mCurrentState = RESOURCE_STATE_UNORDERED_ACCESS;
-                hb.mNewState     = RESOURCE_STATE_COPY_SOURCE;
-                cmdResourceBarrier(g_live.pCmd, 1, &hb, 0, nullptr, 0, nullptr);
-                g_live.pCmd->mDx.pCmdList->CopyBufferRegion(
-                    g_live.pHosekReadback->mDx.pResource, 0, g_live.pHosekOutBuf->mDx.pResource, 0,
-                    (UINT64)sizeof(uint32_t) * kHosekCheckDirs * 4);
-                hb.mCurrentState = RESOURCE_STATE_COPY_SOURCE;
-                hb.mNewState     = RESOURCE_STATE_UNORDERED_ACCESS;
-                cmdResourceBarrier(g_live.pCmd, 1, &hb, 0, nullptr, 0, nullptr);
-            }
-            cmdEndDebugMarker(g_live.pCmd);
-            g_hosekCheckState = 1;
-            g_hosekCheckArmedFrame = g_renderFrame;
-        }
+        // ⚠ THE ORDER IS A DEPENDENCY CHAIN AND EVERY LINK NEEDS ITS OWN UAV->SRV BARRIER:
+        // transmittance feeds multiscatter, both feed sky-view, all three feed the SH measurement.
+        // Without the barriers the passes are free to overlap and each would read the PREVIOUS
+        // frame's LUT — which would look almost right, all the time, and be wrong under a moving sun.
+        gpuPhaseBegin(kGpuPhaseAtmos);
+        atmosDispatch();
+        gpuPhaseEnd(kGpuPhaseAtmos);
 
         gpuPhaseBegin(kGpuPhaseCull);
 
@@ -23841,13 +25829,18 @@ namespace ForgeRender {
         }
         gpuPhaseEnd(kGpuPhaseFroxelNear);
 
-        // Color target: the MSAA color when antialiasing is on (resolved into pRT at the end),
-        // else the shared pRT directly. The MSAA target is left in RENDER_TARGET between frames
+        // Color target: the internal scene target when there is one (resolved into pRT at the end),
+        // else the shared pRT directly. The scene target is left in RENDER_TARGET between frames
         // (transitioned back after the resolve), so it needs no begin barrier — only the direct
         // pRT path transitions COMMON (steady state) -> RENDER_TARGET (first frame it was
         // created RENDER_TARGET). Depth was created DEPTH_WRITE and stays there.
-        RenderTarget* colorTarget = (g_live.sampleCount > 1) ? g_live.pMSAAColor : g_live.pRT;
-        if (g_live.sampleCount == 1 && !g_live.firstFrame) {
+        //
+        // ⚠ ASKS FOR THE TARGET, NOT FOR THE SAMPLE COUNT (M0, tasks/forge-upscale.md). This read
+        // `(sampleCount > 1) ? pSceneColor : pRT` while MSAA was the only reason a scene target
+        // existed. Scene-referred is now a second, independent reason, so the question "where does
+        // the frame get built" has exactly one honest form and it is this one.
+        RenderTarget* colorTarget = g_live.pSceneColor ? g_live.pSceneColor : g_live.pRT;
+        if (!g_live.pSceneColor && !g_live.firstFrame) {
             RenderTargetBarrier toRT = {};
             toRT.pRenderTarget = g_live.pRT;
             toRT.mCurrentState = RESOURCE_STATE_COMMON;
@@ -25400,8 +27393,11 @@ namespace ForgeRender {
             mirrorVP[10] = mirrorVP[11] - mirrorVP[10];
             mirrorVP[14] = mirrorVP[15] - mirrorVP[14];
             {
-                const float dx = -1.0f * (-1.0f / (float)g_live.width);
-                const float dy = -1.0f * ( 1.0f / (float)g_live.height);
+                // M1: projPixelOffset, NOT an inlined copy of the half-pixel expression. This target
+                // is sampled at the water fragment's own screen UV, so it has to carry whatever
+                // sub-pixel offset the main view carried — including the jitter. See projPixelOffset.
+                float dx, dy;
+                projPixelOffset(dx, dy);
                 mirrorVP[0]  += dx * mirrorVP[3];  mirrorVP[4]  += dx * mirrorVP[7];
                 mirrorVP[8]  += dx * mirrorVP[11]; mirrorVP[12] += dx * mirrorVP[15];
                 mirrorVP[1]  += dy * mirrorVP[3];  mirrorVP[5]  += dy * mirrorVP[7];
@@ -26521,11 +28517,24 @@ namespace ForgeRender {
         //      the day DL statics gain a prepass entry of their own.)
         bool hizMip0Filled = false;
         const bool doHizMip0 = g_live.hizReady && g_hizPrologue;
+        // M1 MOTION VECTORS. ⚠ THE F12 VIEW FORCES THE PASS ON — a "show me the motion vectors" mode
+        // that leaves the producing dispatch disabled would be
+        // [[feedback_isolation_lever_killed_its_own_subject]] to the letter: the lever kills its own
+        // subject and the resulting stale buffer reads as "the vectors are broken".
+        const bool mvActive = (g_mvEnable || g_debugMode == 17u || g_debugMode == 18u)
+                           && g_live.mvReady && aoBlockRan && g_live.pLinearizeSet;
         // Gate on aoBlockRan, not on the pipeline alone: that block is what leaves pLinearDepth in
-        // SHADER_RESOURCE, and the SR->UAV flip below is only valid if it ran. Also gate on the two
+        // SHADER_RESOURCE, and the SR->UAV flip below is only valid if it ran. Also gate on the
         // consumers actually running — with water off (F7) and volfog off nothing reads it again.
+        //
+        // ⚠ MOTION VECTORS ARE A THIRD CONSUMER, AND THEY NEED THE REFRESH RATHER THAN MERELY
+        // BENEFITING FROM IT. pLinearDepth's pre-colour snapshot is the Z-PREPASS only; DL statics
+        // are drawn straight into the colour pass and never reach it. Reprojecting that snapshot
+        // gives every distant building the SKY's motion, which is the far plane's — a smooth, plausible,
+        // completely wrong field over exactly the geometry a long view distance is for.
         const bool doSeamLinearize = aoBlockRan && g_live.pLinearizeSet
-                                  && ((g_live.waterReady && waterEnabled && g_drawWater) || g_volFog);
+                                  && ((g_live.waterReady && waterEnabled && g_drawWater) || g_volFog
+                                      || mvActive);
         if (doHizMip0 || doSeamLinearize) {
             cmdBindRenderTargets(g_live.pCmd, nullptr);
             {
@@ -26592,6 +28601,300 @@ namespace ForgeRender {
                 }
                 cmdResourceBarrier(g_live.pCmd, 0, nullptr, nt, tb, 1, &rtb);
             }
+
+            // --- M1 CAMERA-ONLY MOTION VECTORS (tasks/forge-upscale.md) ---------------------------
+            // HERE, and the placement is forced from both sides rather than chosen:
+            //   * it needs FULL scene depth as an SRV, and this bracket is the only point in the
+            //     frame where that exists — the comment at the top of the seam says so ("this exact
+            //     seam is the only place both can be taken");
+            //   * it cannot run later, because the FIRST-PERSON pass CLEARS pDepth (LOAD_ACTION_CLEAR,
+            //     "MW's z-clear before FP"). After that point the depth buffer holds the arms and
+            //     nothing else, so a post-everything MV pass would reproject the world from a depth
+            //     buffer the world is no longer in.
+            //
+            // ⚠ WHAT THIS MEANS FOR THE PASSES AFTER IT — stated because it is a real limitation and
+            // not an oversight. Water, sorted alpha, glow, volumetric fog and the FP arms all draw
+            // AFTER this, so their pixels carry the motion of whatever is BEHIND them. That is
+            // precisely the set the reactive mask owns (M1 step 3 lists exactly these lanes), so the
+            // two partition the frame with no gap — and per-object vectors for them are M2. The one
+            // to watch is the water surface, which is large, world-static, and would reconstruct well
+            // if it had its own depth here.
+            if (mvActive && g_live.pMvParamsCbv && g_live.pMvParamsCbv->pCpuMappedAddress) {
+                float* mp = (float*)g_live.pMvParamsCbv->pCpuMappedAddress;
+                // [0..15] invViewProj — COPIED from the gShadowParams lane rather than inverted
+                // again here (apl.srt.h's reason: a second inversion proves its own arithmetic and
+                // says nothing about whether the matrix reaching the dispatch is the one the DEPTH
+                // BUFFER was rasterised with). Identity if that buffer is somehow unavailable, which
+                // with opts.x below is a frame of zero vectors rather than a garbage field.
+                const float* sp = (g_live.pShadowMaskParamsCbv
+                                   && g_live.pShadowMaskParamsCbv->pCpuMappedAddress)
+                                      ? (const float*)g_live.pShadowMaskParamsCbv->pCpuMappedAddress
+                                      : nullptr;
+                for (int i = 0; i < 16; ++i) { mp[i] = sp ? sp[i] : ((i % 5 == 0) ? 1.0f : 0.0f); }
+
+                // [16..31] prevViewProjRel = Translate(bakeEye_now - bakeEye_prev) * viewProj_prev.
+                //
+                // ⚠⚠ THIS PRODUCT IS THE WHOLE POINT OF THE PASS AND THE ONE THING THAT CANNOT BE
+                // SIMPLIFIED TO "last frame's matrix". invViewProj above reconstructs into THIS
+                // frame's payload space (world - bakeEye_now); viewProj_prev expects LAST frame's
+                // (world - bakeEye_prev). In produce mode 3 (PARK, the default) those origins differ
+                // by a frame of camera motion every frame. Feeding the raw previous matrix is the
+                // identical defect as [[project_park_restamp_eye_origin]]: error Delta-eye/distance,
+                // EXACTLY ZERO STANDING STILL, worst close in and at speed.
+                //
+                // Row-major, row-vector convention (the house convention: upload D3DX bytes as-is,
+                // the shader reads column-major == the transpose and uses mul(M, v)). T is identity
+                // with the translation in row 3, so T*VP keeps rows 0..2 of VP verbatim and row 3
+                // becomes d . VP + VP_row3 — the same shape renderprocess.cpp's own viewRel restamp
+                // uses, which is not a coincidence: it is the same origin change, inverted.
+                //
+                // ⚠ THE DIFFERENCE IN DOUBLE. Both bake eyes are absolute Morrowind world
+                // coordinates and can reach six figures, while the difference that matters is tens
+                // of units. The subtraction of two nearby floats is exact (Sterbenz), so what double
+                // actually buys is the ACCUMULATION below — d . VP with VP entries that are large
+                // and a d that is small is where a float32 running sum would quietly round the
+                // signal away. [[project_forge_precision_far_origin]] is the same lesson one scale up.
+                // g_eyeAbsShadow IS this frame's bakeEye — it is assigned straight from
+                // lighting[24..26] where the frame's lighting block is decoded, and that is the
+                // client's `bakeEye`, the origin the whole payload is relative to. Reused rather
+                // than stashed a second time: two copies of one wire value are two things that can
+                // disagree, and the shadow system already depends on this one being right.
+                const double dx = (double)g_eyeAbsShadow[0] - g_prevBakeEye[0];
+                const double dy = (double)g_eyeAbsShadow[1] - g_prevBakeEye[1];
+                const double dz = (double)g_eyeAbsShadow[2] - g_prevBakeEye[2];
+                g_lastMvDelta[0] = dx; g_lastMvDelta[1] = dy; g_lastMvDelta[2] = dz;
+                const float* pv = g_prevViewProj;
+                for (int i = 0; i < 12; ++i) { mp[16 + i] = pv[i]; }
+                for (int c = 0; c < 4; ++c) {
+                    mp[16 + 12 + c] = (float)(dx * (double)pv[0 + c]
+                                            + dy * (double)pv[4 + c]
+                                            + dz * (double)pv[8 + c]
+                                            + (double)pv[12 + c]);
+                }
+
+                // [32..35] screenParams: the RENDER rect and its reciprocal, never the allocation
+                // ([[project_forge_alloc_vs_render_uv]]) — this is the pixel<->NDC mapping and it has
+                // to be the one the raster used.
+                mp[32] = (float)g_live.width;         mp[33] = (float)g_live.height;
+                mp[34] = 1.0f / (float)g_live.width;  mp[35] = 1.0f / (float)g_live.height;
+                // [36..39] reactive: t0, t1, gain, reserved.
+                mp[36] = std::max(0.0f, g_mvReactiveT0);
+                mp[37] = std::max(mp[36] + 1.0e-4f, g_mvReactiveT1);
+                // ...and the gain carries the previous-depth validity: 0 means "compare against
+                // nothing", which the shader turns into an all-zero mask — the pre-mask behaviour,
+                // and the right answer for a frame with no history rather than a frame of noise.
+                mp[38] = g_mvPrevDepthValid ? std::max(0.0f, g_mvReactiveGain) : 0.0f;
+                mp[39] = 0.0f;
+                // [40..43] allocParams: 1/ALLOCATION. ⚠ NOT 1/render — the previous-depth SAMPLE is
+                // into an alloc-sized texture ([[project_forge_alloc_vs_render_uv]]).
+                mp[40] = 1.0f / (float)std::max(1u, g_live.allocWidth);
+                mp[41] = 1.0f / (float)std::max(1u, g_live.allocHeight);
+                mp[42] = 0.0f; mp[43] = 0.0f;
+                // [44..47] opts.x = previous frame valid.
+                mp[44] = (g_prevViewProjValid && sp) ? 1.0f : 0.0f;
+                mp[45] = 0.0f; mp[46] = 0.0f; mp[47] = 0.0f;
+
+                // ─── THE HAZARD, MADE INTO A NUMBER ──────────────────────────────────────────────
+                // The bakeEye origin error is invisible standing still and scales with camera speed,
+                // which is the worst possible shape for a defect: the natural way to check a
+                // motion-vector field is to hold the camera steady, and that is precisely the
+                // condition under which the bug does not exist. [[project_park_restamp_eye_origin]]
+                // cost five wrong theories for exactly this reason.
+                //
+                // So: run the SAME reconstruct-and-reproject on the CPU for one reference pixel — the
+                // screen centre at mid depth — TWICE. Once through the matrix actually uploaded
+                // (origin folded in) and once through the raw previous matrix (the naive version, the
+                // bug). The difference is how many pixels wrong this frame WOULD have been, and it is
+                // logged on the heartbeat.
+                //
+                // ⚠ This is not a test of the shader; it is a test of the fold, which is the part
+                // that is hard to see and easy to get subtly wrong (a transpose, a sign, the wrong
+                // pair of eyes). A reading that stays 0.00 while `dBake` is non-zero means the fold
+                // is not reaching the matrix. A reading that GROWS with speed means it is working and
+                // is telling you the size of the bug it is preventing.
+                {
+                    // Row-vector times row-major 4x4, the house convention.
+                    auto rowMul = [](const float v[4], const float* M, float out[4]) {
+                        for (int c = 0; c < 4; ++c) {
+                            out[c] = v[0] * M[0 + c] + v[1] * M[4 + c]
+                                   + v[2] * M[8 + c] + v[3] * M[12 + c];
+                        }
+                    };
+
+                    // ─── IS THE FOLD THE MATRIX IT CLAIMS TO BE? ─────────────────────────────────
+                    // Everything else here measures the fold's SIZE. Nothing measures its SHAPE, and
+                    // a transposed product or a translation written into the wrong row would still
+                    // produce a plausible number that scaled with camera speed — while being wrong.
+                    // Worse, at walking pace the whole correction is ~0.17 px at 1000 u, so a fold
+                    // with the SIGN INVERTED (which doubles the error instead of cancelling it)
+                    // is invisible in the field statistics, in the picture, and in every reading
+                    // above. It is only visible against its own definition.
+                    //
+                    // So state the definition and check it: prevViewProjRel must satisfy
+                    //     p * M  ==  (p + delta) * VP_prev
+                    // for any p. One arbitrary non-degenerate point settles it — the identity is
+                    // linear, so a matrix that passes at one general point passes everywhere.
+                    // ~30 flops a frame, and it converts a silent structural error into a line.
+                    {
+                        const float tp[4]  = { 137.0f, -91.0f, 53.0f, 1.0f };
+                        const float shf[4] = { tp[0] + (float)dx, tp[1] + (float)dy,
+                                               tp[2] + (float)dz, 1.0f };
+                        float viaFold[4], viaDef[4];
+                        rowMul(tp,  mp + 16,        viaFold);
+                        rowMul(shf, g_prevViewProj, viaDef);
+                        float resid = 0.0f, scale = 1.0e-6f;
+                        for (int c = 0; c < 4; ++c) {
+                            resid = std::max(resid, std::fabs(viaFold[c] - viaDef[c]));
+                            scale = std::max(scale, std::fabs(viaDef[c]));
+                        }
+                        const float rel = resid / scale;
+                        // 1e-5 relative: the two sides differ only by float32 rounding of a handful
+                        // of madds over matrix entries that reach the far plane. A LAYOUT error is
+                        // not a near miss — it lands orders of magnitude above this.
+                        static bool s_foldOnce = false;
+                        if (rel > 1.0e-5f) {
+                            LOG::logline("!! [mv] ORIGIN FOLD IS NOT ITS OWN DEFINITION: "
+                                         "p*M vs (p+d)*VP_prev differ by %.3e relative (d=%.4f, "
+                                         "%.4f, %.4f). The matrix product is wrong — a transpose, a "
+                                         "row/column swap, or a sign. Every other reading in this log "
+                                         "would still look plausible.", (double)rel, dx, dy, dz);
+                            LOG::flush();
+                        } else if (!s_foldOnce) {
+                            s_foldOnce = true;
+                            LOG::logline(">> [mv] origin fold verified against its definition: "
+                                         "p*M == (p+d)*VP_prev to %.2e relative. Checked every frame "
+                                         "from here on; only failures are logged.", (double)rel);
+                            LOG::flush();
+                        }
+                    }
+                    const float ndc[4] = { 0.0f, 0.0f, 0.5f, 1.0f };   // screen centre, mid depth
+                    float rel4[4];
+                    rowMul(ndc, mp, rel4);
+                    if (std::fabs(rel4[3]) > 1.0e-9f) {
+                        const float rel[4] = { rel4[0] / rel4[3], rel4[1] / rel4[3],
+                                               rel4[2] / rel4[3], 1.0f };
+                        float a[4], b[4];
+                        rowMul(rel, mp + 16,        a);   // folded (what ships)
+                        rowMul(rel, g_prevViewProj, b);   // naive  (the bug)
+                        if (a[3] > 1.0e-6f && b[3] > 1.0e-6f) {
+                            const float ax = (a[0] / a[3]) * 0.5f * (float)g_live.width;
+                            const float ay = (a[1] / a[3]) * 0.5f * (float)g_live.height;
+                            const float bx = (b[0] / b[3]) * 0.5f * (float)g_live.width;
+                            const float by = (b[1] / b[3]) * 0.5f * (float)g_live.height;
+                            g_lastMvOriginFixPx = std::sqrt((ax - bx) * (ax - bx)
+                                                          + (ay - by) * (ay - by));
+                            g_lastMvRefDist = std::sqrt(rel[0] * rel[0] + rel[1] * rel[1]
+                                                      + rel[2] * rel[2]);
+                            const double dLen = std::sqrt(dx * dx + dy * dy + dz * dz);
+                            if (dLen > g_mvDeltaMaxLen) {
+                                // Tracked TOGETHER, as one observation, rather than as two
+                                // independent maxima: the pair "this much origin change was worth
+                                // that many pixels" is what makes the reading interpretable, and two
+                                // separately-maximised numbers could come from different frames and
+                                // silently describe a frame that never happened.
+                                g_mvDeltaMaxLen = dLen;
+                                g_mvFoldMaxPx   = g_lastMvOriginFixPx;
+                                g_mvFoldMaxAt1k = (float)((double)g_lastMvOriginFixPx
+                                                        * (double)g_lastMvRefDist / 1000.0);
+                            }
+                        }
+                    }
+                }
+
+                TextureBarrier mvb[2] = {};
+                mvb[0].pTexture      = g_live.pMotionVectors;
+                mvb[0].mCurrentState = RESOURCE_STATE_SHADER_RESOURCE;
+                mvb[0].mNewState     = RESOURCE_STATE_UNORDERED_ACCESS;
+                mvb[1].pTexture      = g_live.pMvReactive;
+                mvb[1].mCurrentState = RESOURCE_STATE_SHADER_RESOURCE;
+                mvb[1].mNewState     = RESOURCE_STATE_UNORDERED_ACCESS;
+                cmdResourceBarrier(g_live.pCmd, 0, nullptr, 2, mvb, 0, nullptr);
+
+                // Reset the statistics accumulator: a 16-byte copy from a persistent upload buffer
+                // holding {0, 0xFFFFFFFF, 0, 0}. No clear shader, no CPU-visible descriptor handle.
+                if (g_live.pMvStats && g_live.pMvStatsReset) {
+                    BufferBarrier sb = {};
+                    sb.pBuffer = g_live.pMvStats;
+                    sb.mCurrentState = RESOURCE_STATE_UNORDERED_ACCESS;
+                    sb.mNewState     = RESOURCE_STATE_COPY_DEST;
+                    cmdResourceBarrier(g_live.pCmd, 1, &sb, 0, nullptr, 0, nullptr);
+                    g_live.pCmd->mDx.pCmdList->CopyBufferRegion(
+                        g_live.pMvStats->mDx.pResource, 0,
+                        g_live.pMvStatsReset->mDx.pResource, 0, sizeof(uint32_t) * 5);
+                    sb.mCurrentState = RESOURCE_STATE_COPY_DEST;
+                    sb.mNewState     = RESOURCE_STATE_UNORDERED_ACCESS;
+                    cmdResourceBarrier(g_live.pCmd, 1, &sb, 0, nullptr, 0, nullptr);
+                }
+
+                gpuPhaseBegin(kGpuPhaseMotionVec);
+                cmdBeginDebugMarker(g_live.pCmd, 0.9f, 0.3f, 0.9f, "MOTION VECTORS (camera-only reprojection)");
+                cmdBindPipeline(g_live.pCmd, g_live.pMvPipeline);
+                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pMvSet);
+                cmdDispatch(g_live.pCmd, (g_live.width + 7u) / 8u, (g_live.height + 7u) / 8u, 1);
+                cmdEndDebugMarker(g_live.pCmd);
+
+                mvb[0].mCurrentState = RESOURCE_STATE_UNORDERED_ACCESS;
+                mvb[0].mNewState     = RESOURCE_STATE_SHADER_RESOURCE;   // resting; the view samples it
+                mvb[1].mCurrentState = RESOURCE_STATE_UNORDERED_ACCESS;
+                mvb[1].mNewState     = RESOURCE_STATE_SHADER_RESOURCE;
+                cmdResourceBarrier(g_live.pCmd, 0, nullptr, 2, mvb, 0, nullptr);
+
+                // ─── CARRY THIS FRAME'S DEPTH FORWARD, for next frame's mask ─────────────────────
+                // ⚠ AFTER the dispatch, never before: the dispatch is still READING pMvPrevDepth as
+                // LAST frame's depth, and copying over it first would hand every pixel this frame's
+                // own depth to compare against — which agrees everywhere, so the mask would read a
+                // confident, uniform ZERO. A silent, plausible, completely wrong answer, and this
+                // ordering is the whole of what prevents it.
+                //
+                // A straight CopyResource of pLinearDepth: same format, same size, no
+                // reinterpretation, so next frame's comparison cannot disagree with what this
+                // frame's reconstruction read. pLinearDepth is in SHADER_RESOURCE here — the seam
+                // block's closing barrier put it there.
+                if (g_live.pMvPrevDepth && g_live.pLinearDepth) {
+                    TextureBarrier cb[2] = {};
+                    cb[0].pTexture      = g_live.pLinearDepth;
+                    cb[0].mCurrentState = RESOURCE_STATE_SHADER_RESOURCE;
+                    cb[0].mNewState     = RESOURCE_STATE_COPY_SOURCE;
+                    cb[1].pTexture      = g_live.pMvPrevDepth;
+                    cb[1].mCurrentState = RESOURCE_STATE_SHADER_RESOURCE;
+                    cb[1].mNewState     = RESOURCE_STATE_COPY_DEST;
+                    cmdResourceBarrier(g_live.pCmd, 0, nullptr, 2, cb, 0, nullptr);
+                    g_live.pCmd->mDx.pCmdList->CopyResource(
+                        g_live.pMvPrevDepth->mDx.pResource, g_live.pLinearDepth->mDx.pResource);
+                    g_mvPrevDepthValid = true;   // there is now a real previous depth to compare to
+                    cb[0].mCurrentState = RESOURCE_STATE_COPY_SOURCE;
+                    cb[0].mNewState     = RESOURCE_STATE_SHADER_RESOURCE;
+                    cb[1].mCurrentState = RESOURCE_STATE_COPY_DEST;
+                    cb[1].mNewState     = RESOURCE_STATE_SHADER_RESOURCE;
+                    cmdResourceBarrier(g_live.pCmd, 0, nullptr, 2, cb, 0, nullptr);
+                }
+                // ⚠ THE PHASE CLOSES *HERE*, AFTER THE DEPTH COPY — not after the dispatch. That copy
+                // is ~14 MB of traffic and it is not overhead: the mask cannot work without it. Timed
+                // from the dispatch alone the pass reads 0.12 ms against ~0.30 ms whole-frame, so
+                // half of it would have been unattributed. A number that names a pass and silently
+                // excludes part of it is worse than no number — it is exactly the subtraction that
+                // made kGpuPhaseShadowSun necessary, one pass along.
+                gpuPhaseEnd(kGpuPhaseMotionVec);
+
+                // Stage the statistics for a read ONE FRAME LATE — pAplReadback's exact arrangement,
+                // and for the same reason: reading this frame's buffer would mean fencing the frame
+                // we are still recording.
+                if (g_live.pMvStats && g_live.pMvStatsReadback) {
+                    BufferBarrier sb = {};
+                    sb.pBuffer = g_live.pMvStats;
+                    sb.mCurrentState = RESOURCE_STATE_UNORDERED_ACCESS;
+                    sb.mNewState     = RESOURCE_STATE_COPY_SOURCE;
+                    cmdResourceBarrier(g_live.pCmd, 1, &sb, 0, nullptr, 0, nullptr);
+                    g_live.pCmd->mDx.pCmdList->CopyBufferRegion(
+                        g_live.pMvStatsReadback->mDx.pResource, 0,
+                        g_live.pMvStats->mDx.pResource, 0, sizeof(uint32_t) * 5);
+                    sb.mCurrentState = RESOURCE_STATE_COPY_SOURCE;
+                    sb.mNewState     = RESOURCE_STATE_UNORDERED_ACCESS;
+                    cmdResourceBarrier(g_live.pCmd, 1, &sb, 0, nullptr, 0, nullptr);
+                }
+                g_lastMvRan = true;
+            }
+
             // Re-bind the colour pass (LOAD/LOAD) so the water-off path below is unaffected.
             BindRenderTargetsDesc hbind = {};
             hbind.mRenderTargetCount = 1;
@@ -27842,6 +30145,33 @@ namespace ForgeRender {
             cmdBindRenderTargets(g_live.pCmd, nullptr);
         }
 
+        // --- S2a: THE ATMOSPHERE LUTs, LOOKED AT (F12 mode 15 sky-view / 16 transmittance) ------
+        // Same non-destructive corner overlay as the sky-height view above, and shipped for the same
+        // reason: an atmosphere LUT has no silhouette of its own, so when it is wrong the symptom is
+        // "the sky feels off", which is close to undiagnosable from the lit image. In S2a it is
+        // stronger than that — nothing SAMPLED the LUTs yet, so this picture and the `atmos=` cost
+        // were the only two pieces of evidence the chain ran at all.
+        //
+        // The sky-view LUT is 16:9 by construction; the transmittance is 4:1. Drawn at the LUT's own
+        // aspect so the horizon band and the (r, mu) grid are not sheared into something a reader
+        // would have to mentally undo.
+        if ((g_debugMode == 15 || g_debugMode == 16) && g_live.pAtmosViewPipeline
+            && g_live.pAtmosSkyView && g_live.pAtmosTransmittance) {
+            const float wide = (float)std::min<uint32_t>(768u, g_live.width / 2u);
+            const float tall = (g_debugMode == 15) ? (wide * (float)kAtmosSkyH / (float)kAtmosSkyW)
+                                                   : (wide * (float)kAtmosTransH / (float)kAtmosTransW);
+            BindRenderTargetsDesc avbind = {};
+            avbind.mRenderTargetCount = 1;
+            avbind.mRenderTargets[0] = { colorTarget, LOAD_ACTION_LOAD };
+            cmdBindRenderTargets(g_live.pCmd, &avbind);
+            cmdSetViewport(g_live.pCmd, 8.0f, 8.0f, wide, tall, 0.0f, 1.0f);
+            cmdSetScissor(g_live.pCmd, 8, 8, (uint32_t)wide, (uint32_t)tall);
+            cmdBindPipeline(g_live.pCmd, g_live.pAtmosViewPipeline);
+            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSet);
+            cmdDraw(g_live.pCmd, 3, 0);
+            cmdBindRenderTargets(g_live.pCmd, nullptr);
+        }
+
         // --- APL instrument (tasks/forge-postprocess.md step 2) -------------------------------
         // MOVED AFTER THE RESOLVE by step 6a, and the move is not a tidy-up: it is what keeps the
         // step-5 baseline table comparable. Read before the resolve, the instrument would start
@@ -27853,7 +30183,7 @@ namespace ForgeRender {
         // It also collapses the two paths it used to have. pRT is single-sample by construction (it
         // is the shared cross-process resource), so the MSAA and 1x cases now take the SAME source,
         // the SAME non-MS `apl_sc1` variant and the SAME descriptor — the sc4 variant and the
-        // pMSAAColor branch are both gone. What it loses with them is the sub-sample edge bias
+        // pSceneColor branch are both gone. What it loses with them is the sub-sample edge bias
         // apl.comp.fsl documents; the resolved image has no sub-samples to be biased by.
         //
         // POSITION: still the last thing before drawDevUI(), which is the property that actually
@@ -27867,10 +30197,13 @@ namespace ForgeRender {
         // NOT folded into the resolve's own barriers: that block also drives the cross-process
         // handoff to D3D9Ex natively, and it is not the place to save one barrier.
         //
-        // ⚠ width/height, NOT allocWidth/allocHeight. pRT is ALLOC-sized while the scene lands in a
-        // width x height viewport inside it ([[project_forge_alloc_vs_render_uv]]); sampling the
-        // allocation would average in never-rendered texels and the number would move whenever
-        // render scale changed, which is exactly when it must NOT.
+        // ⚠ THE OUTPUT RECT — not the allocation, and not the input either. pRT is ALLOC-sized
+        // while the DELIVERED image lands in an outWidth x outHeight viewport inside it
+        // ([[project_forge_alloc_vs_render_uv]]); sampling the allocation would average in
+        // never-rendered texels and the number would move whenever render scale changed, which is
+        // exactly when it must NOT. And it is the OUTPUT rather than the input because APL measures
+        // what was delivered: the resolve has already written pRT by this point, so the scene's
+        // raster rect is not what is in front of this sampler. Equal in 4a, not equal later.
         //
         // ⚠ It now sits INSIDE kGpuPhaseResolve rather than between the colour phases and it, so
         // `resolve` in the gpu split carries one 256-thread dispatch it did not carry before. That
@@ -27901,7 +30234,7 @@ namespace ForgeRender {
                     const bool  splitOn = g_aplSplitWater && sp && lf
                                           && sp[kWaterFogPlaneFloat + 3] > 0.5f;
                     const float planeRelZ = (sp && lf) ? (sp[kWaterFogPlaneFloat + 0] - lf[58]) : 0.0f;
-                    float p[24] = { (float)g_live.width, (float)g_live.height, (float)aplGrid,
+                    float p[28] = { (float)g_live.outWidth, (float)g_live.outHeight, (float)aplGrid,
                                     1.0f / (float)(aplGrid * aplGrid),
                                     g_aplSkipSky ? 1.0f : 0.0f,
                                     planeRelZ,
@@ -27911,6 +30244,23 @@ namespace ForgeRender {
                     // again here (apl.srt.h says why). Identity when the buffer is unavailable, which
                     // with splitOn false is never read.
                     for (int i = 0; i < 16; ++i) { p[8 + i] = sp ? sp[i] : ((i % 5 == 0) ? 1.0f : 0.0f); }
+                    // floats 24..27 = srcDims: the DEPTH's valid extent, i.e. the INPUT rect.
+                    //
+                    // ⚠ THIS PASS READS TWO RESOURCES AT DIFFERENT EXTENTS (M1 4b). gAplColor is pRT
+                    // at the OUTPUT rect — dims.xy above — and gAplDepth is pLinearDepth at the
+                    // INPUT rect. They were the same number for the whole life of this instrument,
+                    // and an upscaler is exactly what splits them. Indexing the depth with an output
+                    // coordinate reads outside the written region, where reverse-Z's cleared 0.0
+                    // reads as SKY, so sky rejection throws the samples away and the instrument
+                    // describes only the top-left quadrant.
+                    //
+                    // Measured at input scale 0.5 before the fix: `scene sky` 26% -> 81%,
+                    // `exp` 0.0914 -> 0.0403. ⚠ THE PICTURE WAS CORRECT AND THE METER WAS NOT —
+                    // which is the worse failure of the two, because the servo then drives E off it.
+                    p[24] = (float)g_live.width;
+                    p[25] = (float)g_live.height;
+                    p[26] = 0.0f;
+                    p[27] = 0.0f;
                     std::memcpy(g_live.pAplParamsCbv->pCpuMappedAddress, p, sizeof(p));
                 }
                 RenderTargetBarrier arb = {};
@@ -27942,6 +30292,46 @@ namespace ForgeRender {
                     cmdResourceBarrier(g_live.pCmd, 1, &bb, 0, nullptr, 0, nullptr);
                 }
             }
+
+            // --- M1: THE MOTION VECTORS, LOOKED AT (F12 mode 17; tasks/forge-upscale.md) --------
+            // FULL-screen, not a corner overlay: a vector field is read as a whole and a quarter of
+            // one shows nothing. DESTRUCTIVE — it replaces the delivered frame rather than
+            // annotating it, which is the right trade for a mode whose whole job is to make one
+            // buffer legible.
+            //
+            // ⚠ INTO pRT, AFTER THE RESOLVE. Drawn into the scene target instead it would be
+            // multiplied by the exposure servo's E and pushed through AgX by resolve.frag — at the
+            // measured E of ~0.09, a tenth of its intended brightness with its encoding crushed.
+            // That is what the first build did and what it looked like in play. See the pipeline's
+            // construction for the same note and for the sibling overlays that still have it.
+            //
+            // ⚠ AND AFTER THE APL DISPATCH, NEVER BEFORE. APL averages pRT to drive the exposure
+            // servo; a fullscreen debug view in that average would feed itself back into E — a
+            // control loop closed around the diagnostic. It is the same argument this block already
+            // makes about the ImGui panel, only stronger, and it is why this sits between the two
+            // rather than at the head of the lambda.
+            //
+            // pMotionVectors rests in SHADER_RESOURCE, so no barrier is needed: the dispatch's tail
+            // returns it there, and on a frame where the dispatch was skipped it holds the previous
+            // field rather than an invalid resource. Mode 17 forces the dispatch on anyway (mvActive).
+            if ((g_debugMode == 17u || g_debugMode == 18u)
+                && g_live.pMvViewPipeline && g_live.pMotionVectors) {
+                BindRenderTargetsDesc mvbind = {};
+                mvbind.mRenderTargetCount = 1;
+                mvbind.mRenderTargets[0] = { g_live.pRT, LOAD_ACTION_LOAD };
+                cmdBindRenderTargets(g_live.pCmd, &mvbind);
+                // ⚠ THE OUTPUT RECT — pRT again. mvview.frag scales its own sample by
+                // screenParams.xy * screenAlloc.zw (input/alloc), which stays correct; once the two
+                // rects differ the field is simply STRETCHED across the delivered rect, which for a
+                // debug view is the right answer.
+                cmdSetViewport(g_live.pCmd, 0.0f, 0.0f, (float)g_live.outWidth, (float)g_live.outHeight, 0.0f, 1.0f);
+                cmdSetScissor(g_live.pCmd, 0, 0, g_live.outWidth, g_live.outHeight);
+                cmdBindPipeline(g_live.pCmd, g_live.pMvViewPipeline);
+                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSet);
+                cmdDraw(g_live.pCmd, 3, 0);
+                cmdBindRenderTargets(g_live.pCmd, nullptr);
+            }
+
             drawDevUI();
         };
 
@@ -27962,32 +30352,177 @@ namespace ForgeRender {
             }
             g_customResolve = true;
         }
-        const bool shaderResolve = g_customResolve && (g_live.sampleCount > 1)
+        // ⚠ THE GATE IS "IS THERE A SCENE TARGET TO RESOLVE FROM", not "is MSAA on" (M0,
+        // tasks/forge-upscale.md). pSceneColor was already in this conjunction; the `sampleCount > 1`
+        // term beside it was the same question asked a second, now-wrong way.
+        const bool shaderResolve = g_customResolve
                                 && g_live.pResolvePipeline && g_live.pResolveSet
-                                && g_live.pResolveParamsCbv && g_live.pMSAAColor;
+                                && g_live.pResolveParamsCbv && g_live.pSceneColor;
+
+        // ⚠ THE BARRIER HOIST, NOW A LAMBDA WITH THREE CALLERS (M1 4b). pSceneColor sits in
+        // RENDER_TARGET until something flips it to SHADER_RESOURCE for reading, and the restore at
+        // the resolve's tail is unconditional either way. Until 4b there were two readers and the
+        // bloom block owned the flip with a `bool msaaColorInSR` the resolve checked; a THIRD reader
+        // — the upscale pass, which now runs FIRST — turns that flag into an ordering constraint
+        // spread across three blocks, i.e. exactly the kind of implicit coupling that breaks the day
+        // somebody reorders the passes.
+        //
+        // Idempotent, so every reader simply calls it and the first call is the one that records the
+        // barrier. One transition, not a round trip — on a 3360x2100 fp16 surface that is not free on
+        // hardware that decompresses — and the ordering is now stated by the code rather than by the
+        // sequence the blocks happen to appear in.
+        //
+        // ⚠ HOISTING IT INTO THE UPSCALE BLOCK ADDS NOTHING, EVEN WHEN THE UPSCALER THEN TAKES ITS
+        // IDENTITY PATH AND RECORDS NO WORK — which is what keeps `upscaleEnable=1` at scale 1.0
+        // bit-identical to `upscaleEnable=0`, command for command. The RESTORE at the resolve's tail
+        // is unconditional and applies to pSceneColor whether or not the resolve READ it (on an
+        // upscaled frame it read the backend's target instead), so this transition is required on
+        // every frame where shaderResolve holds. Exactly one, always, wherever it is recorded from.
+        bool msaaColorInSR = false;
+        auto sceneColorToSR = [&]() {
+            if (msaaColorInSR) { return; }
+            RenderTargetBarrier rb = {};
+            rb.pRenderTarget = g_live.pSceneColor;
+            rb.mCurrentState = RESOURCE_STATE_RENDER_TARGET;
+            rb.mNewState     = RESOURCE_STATE_SHADER_RESOURCE;
+            cmdResourceBarrier(g_live.pCmd, 0, nullptr, 0, nullptr, 1, &rb);
+            msaaColorInSR = true;
+        };
+
+        // ===================== UPSCALE (tasks/forge-upscale.md M1 step 4b) =======================
+        // pSceneColor's INPUT rect -> the backend's own OUTPUT-rect target. Runs HERE, immediately
+        // BEFORE the bloom block, and the position is the point of the step:
+        //
+        //     scene passes -> pSceneColor        (INPUT rect)
+        //     pSceneColor  -> SHADER_RESOURCE    (the hoist above)
+        //     UPSCALE:  pSceneColor -> pOut      (OUTPUT rect)   <- here
+        //     BLOOM:    pSceneColor -> pyramid   (INPUT rect; 4c moves it to pOut)
+        //     RESOLVE:  pOut or pSceneColor -> pRT (OUTPUT rect viewport, already 4a's)
+        //
+        // Upscale FIRST so that 4c is a SOURCE SWAP and nothing else — the pass whose output bloom
+        // will read has already run by the time bloom records, so moving bloom onto it is one
+        // pointer, not a reorder.
+        //
+        // ⚠ THE RETURNED POINTER IS THE ONE AUTHORITATIVE ANSWER to "did an upscaler run", and every
+        // downstream decision hangs off it: which resolve set instance to bind, what the resolve's
+        // source clamp is, and what the bloom tap is scaled by. evaluate() returns pSceneColor
+        // unchanged — having recorded NOTHING — whenever in == out or it refuses internally, so the
+        // identity is free by CONSTRUCTION (upscale.h). Re-deriving the same test from the rects
+        // anywhere else would be a second place to get it wrong.
+        bool upscaled = false;
+        if (shaderResolve && g_live.pUpscaler && g_upscaleEnable) {
+            sceneColorToSR();
+            gpuPhaseBegin(kGpuPhaseUpscale);
+            UpscaleInputs ui = {};
+            ui.pColor         = g_live.pSceneColor->pTexture;
+            // Declared and filled, unread by the passthrough — 4d needs the shape to already be
+            // right, and a field first filled in the step that consumes it is a field whose plumbing
+            // has never been exercised (upscale.h says the same thing from the other side).
+            ui.pDepth         = g_live.pLinearDepth;
+            ui.pMotionVectors = g_live.pMotionVectors;
+            ui.pReactive      = g_live.pMvReactive;
+            ui.inW    = g_live.width;      ui.inH    = g_live.height;
+            ui.outW   = g_live.outWidth;   ui.outH   = g_live.outHeight;
+            ui.allocW = g_live.allocWidth; ui.allocH = g_live.allocHeight;
+            ui.jitterX  = g_jitterPx[0];
+            ui.jitterY  = g_jitterPx[1];
+            // ⚠ 4d MUST HAND THIS THE **PREVIOUS** FRAME'S E. The servo meters the DELIVERED image,
+            // so an exposure derived from upscaler output closes a loop around the upscaler
+            // ([[project_forge_exposure_rail_instrument]]). It is this frame's value today because
+            // nothing reads it; that is a thing to change with the backend, not before it.
+            ui.exposure = (g_live.sceneReferred && g_expEnable) ? (float)g_exposure : 1.0f;
+            // History discontinuity. Declared, unread in 4b — the passthrough has no history. The
+            // first rendered frame is the one case the host can already answer honestly, and it is
+            // the same flag the motion-vector pass uses for the same reason.
+            ui.reset    = !g_prevViewProjValid;
+            // The spatial filter, live. A backend with no spatial filter ignores both.
+            ui.sharpness = g_upscaleSharpness;
+            ui.antiRing  = g_upscaleAntiRing;
+
+            // The resource itself is not kept: it was bound into resolve set instance 1 once, at
+            // path-build time, so all the frame needs from this call is WHETHER it ran.
+            Texture* out = g_live.pUpscaler->evaluate(g_live.pCmd, ui);
+            upscaled = (out != nullptr && out != ui.pColor);
+            gpuPhaseEnd(kGpuPhaseUpscale);
+        }
+        g_lastUpscaleRan = upscaled;
+
+        // ===================== THE DELIVERED IMAGE (M1 4c) =======================================
+        // ONE derivation of "which image is this frame actually delivering", read by everything
+        // downstream of the upscale pass. Until 4c the resolve derived a private copy of this and
+        // bloom never asked the question at all, which is precisely how the two ended up describing
+        // different rects.
+        //
+        //   BLOOM    — bloomLevels() and lw/lh: the pyramid's EXTENT, and ONLY its extent
+        //   RESOLVE  — gResolveParams.dims.xy, the source clamp for the reconstruction's Loads
+        //   RESOLVE  — gResolveParams.bloom.yz, the mip-0 clamp for the bloom tap
+        //
+        // This is what makes the bloom tap 1:1 BY CONSTRUCTION rather than by arithmetic: the pyramid
+        // is built at the extent of the image the resolve reads, whatever that image turns out to be,
+        // so there is no output -> input map left to get wrong (4b's `bloom.w`, retired below). It is
+        // also the bloom block's own house rule — "two receivers, ONE source" — applied to the rect
+        // instead of to the exposure.
+        //
+        // ⚠ EXTENT ONLY, FOR BLOOM — NOT ITS SOURCE, AND THE TWO ARE DIFFERENT QUESTIONS. 4c first
+        // moved both, so the pyramid was built FROM the upscaled frame as well as AT its size, and
+        // that cost the glow its punch (bloom is an ENERGY operation; an upscaler is a display
+        // reconstruction — tasks/forge-upscale.md). The prefilter now resamples the RASTER rect into
+        // a mip 0 sized from `delivered`, so the reach follows the delivered image while the DATA
+        // stays the sharpest that exists.
+        //
+        // ⚠ IT COVERS THE ONE CASE THE UPSCALE GATE DOES NOT. evaluate() can refuse INTERNALLY — a
+        // rect violating alloc >= out >= in, or a colour texture that moved since bindInputs — and it
+        // then returns the SOURCE while in != out. `upscaled` is false there, so both readers follow
+        // the INPUT rect and still AGREE WITH EACH OTHER: the frame is a small picture in the corner
+        // (that is the refusal, and it logs), not additionally mis-registered on top of it.
+        //
+        // ⚠⚠ THERE IS NO `deliveredTex` LOCAL, ON PURPOSE. The only pass that still CHOOSES between
+        // two textures is the resolve, and which one it reads is carried by the descriptor-set INDEX
+        // it binds (`upscaled ? 1 : 0`), written once at path-build time. A Texture* here would be a
+        // second, silent copy of that same decision. Bloom no longer chooses at all — it always
+        // reads pSceneColor.
+        const uint32_t deliveredW = upscaled ? g_live.outWidth  : g_live.width;
+        const uint32_t deliveredH = upscaled ? g_live.outHeight : g_live.height;
 
         // ===================== BLOOM (tasks/forge-postprocess.md step 4) =========================
         // Bright things spill light into their surroundings, in scene-referred linear space. Runs HERE
-        // — after every pass that writes pMSAAColor (colour, water, glow, sorted alpha, volfog, first
+        // — after every pass that writes pSceneColor (colour, water, glow, sorted alpha, volfog, first
         // person) and before the resolve reads it — which is the only window where the scene target
         // holds a finished frame.
         //
-        // ⚠ THE BARRIER HOIST. pMSAAColor sits in RENDER_TARGET until the resolve flips it to
-        // SHADER_RESOURCE. Rather than flipping it here and back, the bloom block does that transition
-        // ONCE and sets msaaColorInSR; the resolve then skips its own identical barrier and only does
-        // the restore at its tail. One transition, not a round trip — on a target this large that is
-        // not free on hardware that decompresses.
+        // ⚠ IT IS SIZED FROM THE **DELIVERED** RECT AND FED FROM THE **RASTER** ONE, and those two
+        // being different questions is the whole of M1 4c plus its follow-up.
+        //
+        //   EXTENT (bloomLevels, lw/lh) = DELIVERED. The pyramid's extent IS its angular reach, so
+        //   deriving the level count from the raster rect let an input-scale slider delete an octave
+        //   of glow — measured, `bloom 0.11(L7) -> 0.05(L6)` at 0.5. A resolution slider must not
+        //   change the look, and no tap rescale can repair it (4b's `bloom.w` kept the glow
+        //   REGISTERED and could not touch the reach, because the extent was what was wrong).
+        //
+        //   SOURCE = pSceneColor, THE RAW SCENE, at every scale. 4c briefly pointed this at the
+        //   upscaler's output too, which made mip 0 an up-then-down round trip through a filter with
+        //   a non-energy-conserving anti-ringing clamp. Reported from the game as bloom "losing its
+        //   impact hard" at scale < 1 on a candle-lit interior, and the diagnosis is the house rule
+        //   this tree has already applied twice: **bloom is an ENERGY operation and takes the
+        //   energy-honest source; an upscaler is a display reconstruction** (the same argument the
+        //   HDR EXR dump's box resolve and g_bloomInvLuma=off are both made of).
+        //
+        // The prefilter therefore area-resamples raster -> delivered/2, which is exactly the old 2x2
+        // box at inputScale 1.0 and a 1:1 copy at 0.5 (bloomprefilter.comp.fsl). At 1.0 every number
+        // in this block is the one it has always been.
         //
         // The pyramid itself takes reflectmip's exact bracket: SR -> UAV, prefilter, then per level a
         // UAV barrier (current == new lowers to a true D3D12 UAV barrier) and a dispatch, then UAV ->
         // SR at the end. The up chain's barriers are load-bearing in a way the down chain's are not:
         // level j reads level j+1 that the PREVIOUS dispatch just wrote.
-        bool msaaColorInSR = false;
         if (shaderResolve && g_live.sceneReferred && g_live.bloomReady && g_bloomEnable) {
             gpuPhaseBegin(kGpuPhaseBloom);
             cmdBeginDebugMarker(g_live.pCmd, 1.0f, 0.85f, 0.4f, "BLOOM (prefilter + down + up pyramid)");
 
-            const uint32_t levels = bloomLevels();
+            // The DELIVERED rect, not the raster rect — see the hoist above. At inputScale 1.0
+            // delivered == width == outWidth, so this is the same count it has always been and 4c
+            // cannot move the default frame.
+            const uint32_t levels = bloomLevels(deliveredW, deliveredH);
             // ⚠ THE SAME EXPRESSION THE RESOLVE'S tone.x USES, character for character. The composite
             // sits immediately after `straight *= tone.x`, so the pyramid has to be pre-multiplied by
             // the identical E or the lerp mixes two different unit systems and bloom's apparent
@@ -27995,10 +30530,11 @@ namespace ForgeRender {
             // opts.y and tone.y already follow for the same reason.
             const float bloomE = (g_live.sceneReferred && g_expEnable) ? (float)g_exposure : 1.0f;
 
-            // Level m's RENDER extent. Not the allocation, and not GetDimensions (which returns the
-            // allocation) — see bloomLevelDim.
-            auto lw = [&](uint32_t m) { return bloomLevelDim(g_live.width,  g_live.allocWidth,  m); };
-            auto lh = [&](uint32_t m) { return bloomLevelDim(g_live.height, g_live.allocHeight, m); };
+            // Level m's extent within the DELIVERED rect. Not the allocation, and not GetDimensions
+            // (which returns the allocation) — see bloomLevelDim. The allocation bound still applies:
+            // the pyramid is alloc/2-sized and alloc >= out >= in, so the delivered rect always fits.
+            auto lw = [&](uint32_t m) { return bloomLevelDim(deliveredW, g_live.allocWidth,  m); };
+            auto lh = [&](uint32_t m) { return bloomLevelDim(deliveredH, g_live.allocHeight, m); };
             auto fill = [&](uint32_t si, uint32_t srcW, uint32_t srcH, uint32_t dstW, uint32_t dstH) {
                 Buffer* b = g_live.pBloomParamsCbv[si];
                 if (!b || !b->pCpuMappedAddress) { return; }
@@ -28013,7 +30549,11 @@ namespace ForgeRender {
                 p[13] = bloomE;
                 p[14] = 0.0f; p[15] = 0.0f;
             };
-            // [0] prefilter reads the FULL-RES scene render rect and writes mip 0.
+            // [0] THE PREFILTER, and this one line is where the two rects meet: it reads the full
+            // RASTER rect (the raw scene) and writes a mip 0 sized from the DELIVERED rect. The
+            // shader derives its resample ratio as src/dst — exactly 2 at inputScale 1.0, so this is
+            // bit-for-bit the old 2x2 box there, and 1 at 0.5, where it becomes a straight copy.
+            // No second set instance and no source choice: gBloomSceneTex is always pSceneColor.
             fill(0, g_live.width, g_live.height, lw(0), lh(0));
             for (uint32_t m = 1; m < levels; ++m) {
                 fill(bloomSetDown(m), lw(m - 1), lh(m - 1), lw(m), lh(m));
@@ -28023,12 +30563,7 @@ namespace ForgeRender {
             }
 
             {
-                RenderTargetBarrier rb = {};
-                rb.pRenderTarget = g_live.pMSAAColor;
-                rb.mCurrentState = RESOURCE_STATE_RENDER_TARGET;
-                rb.mNewState     = RESOURCE_STATE_SHADER_RESOURCE;
-                cmdResourceBarrier(g_live.pCmd, 0, nullptr, 0, nullptr, 1, &rb);
-                msaaColorInSR = true;   // the resolve's own identical barrier is now skipped
+                sceneColorToSR();   // idempotent — the upscale block above may already have done it
 
                 TextureBarrier tb = {};
                 tb.pTexture      = g_live.pBloomMips;
@@ -28086,7 +30621,7 @@ namespace ForgeRender {
         // is the only honest measurement of what ~150 MSAA loads/pixel actually costs here.
         //
         // It has to exist before HDR can: a hardware resolve cannot format-convert, so the moment
-        // pMSAAColor goes fp16 this is the only path left. See resolve.srt.h.
+        // pSceneColor goes fp16 this is the only path left. See resolve.srt.h.
         // ⚠ ONCE THE SCENE IS fp16 THE FALLBACK BELOW IS ILLEGAL. ResolveSubresource cannot convert
         // R16G16B16A16_SFLOAT into the BGRA8 shared RT, so the shader path stops being a preference
         // and becomes the only legal way to finish a frame. Override the A/B checkbox rather than
@@ -28161,7 +30696,29 @@ namespace ForgeRender {
                 const float bloomK  = bloomOn ? std::max(0.0f, g_bloomStrength) : 0.0f;
                 // Eight float4 = 128 B against a 256 B cbuffer, so still no allocation change.
                 const AgxScales curveScale = agxScalesF();
-                const float p[32] = { (float)g_live.width, (float)g_live.height, diam, radius,
+                // ⚠ dims.xy IS THE SOURCE'S **WRITTEN** EXTENT, WHICH IS THE OUTPUT RECT ON AN
+                // UPSCALED FRAME (M1 4b). The field's job never changed — it is the clamp bound for
+                // the reconstruction's Loads, i.e. "how much of gResolveSource did somebody write" —
+                // but the resource bound there did: on an upscaled frame it is the backend's
+                // output-res target, so the input rect would clamp the filter to the top-left
+                // quadrant and the rest of the frame would smear the last written column.
+                // The two are equal whenever no upscaler ran, which is why this was invisible in 4a.
+                //
+                // ⚠ IT READS deliveredW/H RATHER THAN RE-DERIVING THE TERNARY (M1 4c). This pass and
+                // the bloom pyramid have to describe the SAME image, and the only way to guarantee
+                // that is for both to read the same two variables — see the hoist above the bloom
+                // block. Re-deriving it here is how 4b could leave bloom at a rect the resolve had
+                // already moved off.
+                // ...and bloom.w, WHICH IS RETIRED AS OF M1 4c and written an exact 1.0f. It was
+                // 4b's OUTPUT -> INPUT map for the bloom tap, needed only while the pyramid was built
+                // from the RASTER rect; the pyramid now spans the DELIVERED rect, so the tap is 1:1
+                // by construction and there is nothing left to map. The ±1-input-row residual that
+                // came with taking the X ratio for both axes retires with it.
+                //
+                // ⚠ 1.0f AND NOT 0.0f, even though nothing reads it. A lane re-introduced into a
+                // multiply would then be an IDENTITY rather than a black bloom — the cheaper failure
+                // by a wide margin, and the only reason to prefer one dead value over another.
+                const float p[32] = { (float)deliveredW, (float)deliveredH, diam, radius,
                                       g_resolveInvLuma ? 1.0f : 0.0f,
                                       g_live.sceneReferred ? 1.0f : 0.0f,
                                       std::max(0.0f, g_resolveSharp),
@@ -28173,27 +30730,31 @@ namespace ForgeRender {
                                       agxSlopeF(), g_agxToePower, g_agxShoulderPower, 0.0f,
                                       curveScale.toe, curveScale.shoulder, kAgxPivotX, kAgxPivotY,
                                       bloomK,
-                                      (float)bloomLevelDim(g_live.width,  g_live.allocWidth,  0),
-                                      (float)bloomLevelDim(g_live.height, g_live.allocHeight, 0),
-                                      0.0f };
+                                      (float)bloomLevelDim(deliveredW, g_live.allocWidth,  0),
+                                      (float)bloomLevelDim(deliveredH, g_live.allocHeight, 0),
+                                      1.0f };
                 std::memcpy(g_live.pResolveParamsCbv->pCpuMappedAddress, p, sizeof(p));
             }
 
             // Source: MSAA colour RENDER_TARGET -> SHADER_RESOURCE (the APL block's idiom, and it is
             // a Forge-managed target so it takes a Forge barrier).
             //
-            // ⚠ SKIPPED WHEN THE BLOOM BLOCK ALREADY DID IT. Bloom reads the same target through the
-            // same SHADER_RESOURCE state, so the two would otherwise be a RENDER_TARGET -> SR -> RT ->
-            // SR round trip on a 4096x3072 fp16 MSAA surface — not free on hardware that decompresses.
-            // The RESTORE at this block's tail is unconditional either way, so the resting state is
-            // identical whichever path set it.
+            // ⚠ SKIPPED WHEN AN EARLIER BLOCK ALREADY DID IT — THREE READERS SINCE M1 4b (upscale,
+            // bloom, this). All three read the same target through the same SHADER_RESOURCE state, so
+            // without the hoist this would be a RENDER_TARGET -> SR -> RT -> SR round trip on a
+            // 3360x2100 fp16 surface, which is not free on hardware that decompresses. sceneColorToSR
+            // is idempotent, so this is a plain call rather than a flag test. The RESTORE below is
+            // unconditional either way, so the resting state is identical whichever block set it.
+            //
+            // ⚠⚠ AND IT IS pSceneColor THAT IS RESTORED, NOT gResolveSource. On an upscaled frame the
+            // pass read the BACKEND'S target instead, and that one is left in SHADER_RESOURCE by
+            // evaluate() — it is a compute UAV that transitions itself inside its own bracket, so it
+            // needs, and must not get, a restore here.
             RenderTargetBarrier srb = {};
-            srb.pRenderTarget = g_live.pMSAAColor;
+            srb.pRenderTarget = g_live.pSceneColor;
             srb.mCurrentState = RESOURCE_STATE_RENDER_TARGET;
             srb.mNewState     = RESOURCE_STATE_SHADER_RESOURCE;
-            if (!msaaColorInSR) {
-                cmdResourceBarrier(g_live.pCmd, 0, nullptr, 0, nullptr, 1, &srb);
-            }
+            sceneColorToSR();
 
             // Destination: the SHARED resource, driven natively like the hardware path does.
             // ⚠ Only on non-first frames. Frame 0 it was created RENDER_TARGET, which is already the
@@ -28212,14 +30773,24 @@ namespace ForgeRender {
             BindRenderTargetsDesc rbind = {};
             rbind.mRenderTargetCount = 1;
             // DONTCARE: the draw covers every pixel of the viewport. Outside it the target keeps its
-            // previous contents, exactly as in the 1x path where the scene also renders into a
-            // width x height rect of an alloc-sized RT.
+            // previous contents, exactly as in the 1x path where the scene also renders into an
+            // outWidth x outHeight rect of an alloc-sized RT.
             rbind.mRenderTargets[0] = { g_live.pRT, LOAD_ACTION_DONTCARE };
             cmdBindRenderTargets(g_live.pCmd, &rbind);
-            cmdSetViewport(g_live.pCmd, 0.0f, 0.0f, (float)g_live.width, (float)g_live.height, 0.0f, 1.0f);
-            cmdSetScissor(g_live.pCmd, 0, 0, g_live.width, g_live.height);
+            // ⚠ THE OUTPUT RECT — this is THE delivery draw, the one that writes pRT, and it has
+            // been the output rect since 4a. gResolveParams.dims above is a DIFFERENT question (the
+            // SOURCE clamp) that happens to have the same answer on an upscaled frame, because the
+            // upscaler's target is written at exactly this extent. On a non-upscaled frame dims is
+            // the input rect and they are equal for the older reason: nothing split them.
+            cmdSetViewport(g_live.pCmd, 0.0f, 0.0f, (float)g_live.outWidth, (float)g_live.outHeight, 0.0f, 1.0f);
+            cmdSetScissor(g_live.pCmd, 0, 0, g_live.outWidth, g_live.outHeight);
             cmdBindPipeline(g_live.pCmd, g_live.pResolvePipeline);
-            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pResolveSet);
+            // ⚠ THE ONE LINE THAT MAKES THE RESOLVE READ THE UPSCALED FRAME (M1 4b). Instance 0 binds
+            // pSceneColor, instance 1 the backend's output; both were built at path-build time, so
+            // this is an index and not a descriptor write. `upscaled` came from comparing evaluate()'s
+            // returned pointer against the source — the single authoritative test — and never from
+            // re-asking whether the rects differ.
+            cmdBindDescriptorSet(g_live.pCmd, upscaled ? 1u : 0u, g_live.pResolveSet);
             cmdDraw(g_live.pCmd, 3, 0);
             cmdBindRenderTargets(g_live.pCmd, nullptr);
             cmdEndDebugMarker(g_live.pCmd);
@@ -28248,7 +30819,7 @@ namespace ForgeRender {
             // else) rather than an illegal resolve. The format check is what keeps a non-fatal
             // pipeline failure non-fatal.
             ID3D12GraphicsCommandList* cl = g_live.pCmd->mDx.pCmdList;
-            ID3D12Resource* msaaRes = g_live.pMSAAColor->pTexture->mDx.pResource;
+            ID3D12Resource* msaaRes = g_live.pSceneColor->pTexture->mDx.pResource;
             ID3D12Resource* dstRes  = g_live.pSharedRes;
 
             D3D12_RESOURCE_BARRIER pre[2] = {};
@@ -28293,19 +30864,40 @@ namespace ForgeRender {
             toCommon.Transition.StateAfter  = D3D12_RESOURCE_STATE_COMMON;   // hand off to D3D9Ex
             cl->ResourceBarrier(1, &toCommon);
         } else {
-            // No MSAA: APL + dev overlay into pRT (still RENDER_TARGET), then hand back to COMMON for
-            // StretchRect. At 1x the scene rendered straight into pRT, so this is the same read the
-            // instrument always did here — the move only changed the MSAA path.
-            // ALSO the degraded fp16 case (MSAA on, converting, shader resolve unavailable): pRT never
-            // receives the scene this frame, so the seam shows a stale image with the overlay on top.
-            // Visibly wrong and diagnosable from the log, which beats losing the device.
-            if (g_live.sampleCount > 1) {
+            // NO SCENE TARGET: APL + dev overlay into pRT (still RENDER_TARGET), then hand back to
+            // COMMON for StretchRect. The scene rendered straight into pRT, so this is the same read
+            // the instrument always did here — step 6a's move only changed the resolving paths.
+            // ALSO the degraded fp16 case (a scene target exists, the frame is converting, and the
+            // shader resolve is unavailable): pRT never receives the scene this frame, so the seam
+            // shows a stale image with the overlay on top. Visibly wrong and diagnosable from the
+            // log, which beats losing the device.
+            //
+            // ⚠ THE DEGRADED TEST IS pSceneColor, NOT sampleCount (M0, tasks/forge-upscale.md). At
+            // 1x + fp16 the frame is just as undeliverable as at 4x + fp16 and for the same reason,
+            // and asking about MSAA here would have made that case fail SILENTLY.
+            if (g_live.pSceneColor) {
                 static bool s_noPathOnce = false;
                 if (!s_noPathOnce) {
                     s_noPathOnce = true;
-                    LOG::logline(">> [resolve] MSAA %ux + fp16 scene but NO shader resolve pipeline — "
-                                 "frame NOT delivered (stale composite)", g_live.sampleCount);
+                    LOG::logline(">> [resolve] sampleCount=%u + fp16 scene but NO shader resolve "
+                                 "pipeline — frame NOT delivered (stale composite)",
+                                 g_live.sampleCount);
                     LOG::flush();
+                }
+                // ⚠ AND pRT IS STILL IN COMMON ON THIS BRANCH. The begin-of-frame COMMON ->
+                // RENDER_TARGET at the top of the colour block is skipped whenever a scene target
+                // exists (the resolving paths do their own), so on the degraded path nothing has
+                // moved pRT out of COMMON — and measureAndOverlay() below both binds it as an RTV
+                // and closes with a RENDER_TARGET -> COMMON transition whose StateBefore would be a
+                // lie. Latent since the MSAA+fp16 degrade was written; M0 only widened which
+                // configurations can reach it. A stale frame is meant to be a diagnosable
+                // non-event, not a debug-layer error on top of the failure it is reporting.
+                if (!g_live.firstFrame) {
+                    RenderTargetBarrier toRT = {};
+                    toRT.pRenderTarget = g_live.pRT;
+                    toRT.mCurrentState = RESOURCE_STATE_COMMON;
+                    toRT.mNewState     = RESOURCE_STATE_RENDER_TARGET;
+                    cmdResourceBarrier(g_live.pCmd, 0, nullptr, 0, nullptr, 1, &toRT);
                 }
             }
             measureAndOverlay();
@@ -28345,6 +30937,13 @@ namespace ForgeRender {
         // and its readbacks — has finished before the client is told anything is ready, so it is
         // inside the same exclusive window the frame's own writes are. It costs the armed frame a
         // stall, which is the correct price for a one-shot dev capture and is paid by nothing else.
+        // ...and the unattended arm, one shot, checked HERE so it lands in exactly the same place
+        // in the frame a keypress would have: after queueSubmit, before the shared-fence signal.
+        // Zeroed before arming so a failed capture cannot re-fire every frame for the rest of the run.
+        if (g_dumpAtFrame > 0.0f && g_renderFrame >= (uint32_t)g_dumpAtFrame) {
+            g_dumpAtFrame = 0.0f;
+            armHdrDump();
+        }
         hdrDumpIfArmed();
         // Tier 1: NO fence wait here — the wait moved to the top of the NEXT renderScene
         // (settleFrameFence). Instead, signal the SHARED, monotonic D3D12 fence on the same queue,
@@ -28477,6 +31076,26 @@ namespace ForgeRender {
             g_hizValid = true;
         }
 
+        // --- M1: SNAPSHOT THIS FRAME'S CAMERA FOR NEXT FRAME'S REPROJECTION -----------------------
+        // ⚠ UNCONDITIONAL, and deliberately NOT tucked inside the Hi-Z block above even though that
+        // block snapshots the very same matrix two lines earlier. The Hi-Z snapshot is gated on the
+        // pyramid having been built; if the motion vectors borrowed it they would silently reproject
+        // into a matrix from an arbitrary older frame the moment the pyramid was skipped, and the
+        // symptom — a field that is right most of the time — is the worst kind to debug.
+        //
+        // ⚠ RENDERED FRAMES, NOT PRODUCED ONES, which is why it is here rather than anywhere the
+        // client's frame counter is touched. Park mode and frame-ahead both re-render a parked
+        // payload at a new camera; "previous frame" has to mean the previous RASTER, or the
+        // reprojection targets an image that was never drawn. Same rule the jitter sequence follows.
+        //
+        // The matrix is stored exactly as rendered — its own half-pixel offset AND its own jitter —
+        // because the image it will be used to address was rasterised with both.
+        std::memcpy(g_prevViewProj, rzViewProj, sizeof(g_prevViewProj));
+        g_prevBakeEye[0] = (double)g_eyeAbsShadow[0];
+        g_prevBakeEye[1] = (double)g_eyeAbsShadow[1];
+        g_prevBakeEye[2] = (double)g_eyeAbsShadow[2];
+        g_prevViewProjValid = true;
+
         g_live.firstFrame = false;
         g_lastDrawn = drawn;
         g_lastSkinnedDrawn = skinnedDrawn;
@@ -28544,12 +31163,21 @@ namespace ForgeRender {
                 //
                 //   q      — L_zenith / (E_total/pi), the albedo-free scale-invariant invariant §0
                 //            is built on. Real clear skies: 0.122 median, p25..p75 0.093..0.148. MW's
-                //            authored sky read 0.265. The model should land INSIDE that band without
-                //            being told to; at the reference configuration it computes 0.100.
-                //   sun%   — E_sun_horizontal / E_total. Real clear skies ~0.80 (p25..p75 0.73..0.84),
-                //            and 0.80 at the reference is not a coincidence — it is the anchor the
-                //            sun's absolute level was solved against (hosek.h). Away from the
-                //            reference it is a genuine prediction, and it should FALL toward dusk.
+                //            authored sky read 0.265, and the RETIRED closed form computed 0.100 at
+                //            the reference — outside the band on the other side. The medium should
+                //            land INSIDE it without being told to, which S2b's gate is what checks.
+                //            ⚠ A MOVED ZENITH IS THE FIX, NOT A REGRESSION. Landing inside the band
+                //            from 0.100 necessarily shifts the drawn zenith by ~15%; what may not
+                //            move is the LIGHT (ambScene, sunScene and their ratio), which are
+                //            integrals over the whole sphere that a zenith/horizon redistribution
+                //            barely touches. Anyone reading a moved zenith as a continuity failure
+                //            will "fix" the one number this phase exists to correct.
+                //   sun%   — E_sun_horizontal / E_total. Real clear skies ~0.80 (p25..p75 0.73..0.84).
+                //            ⚠⚠ THIS IS A PREDICTION EVERYWHERE SINCE S2, INCLUDING AT THE REFERENCE.
+                //            The retired model SOLVED its beam scale so 0.80 held there by
+                //            construction — the number was an identity restating an anchor. The
+                //            medium's beam is E_TOA x transmittance with no free scale, so it can
+                //            now miss at the reference too, and it should still FALL toward dusk.
                 //   sky/sun lx — the sky's horizontal illuminance and the sun's DIRECT-NORMAL
                 //            illuminance. The sun peaks near 109 klx with the sun overhead, against a
                 //            textbook sea-level maximum of ~110. A number far outside that says the
@@ -28560,8 +31188,8 @@ namespace ForgeRender {
                 //   ramp   — the night ramp. It fades the SKY to black and hands the LIGHTING back
                 //            to MW at once, so a value between 0 and 1 is dawn/dusk, not a fault.
                 if (g_skyPhys.active) {
-                    const double ambL = (double)Hosek::luma709(g_skyPhys.ambScene);
-                    const double sunL = (double)Hosek::luma709(g_skyPhys.sunScene);
+                    const double ambL = (double)SceneCal::luma709(g_skyPhys.ambScene);
+                    const double sunL = (double)SceneCal::luma709(g_skyPhys.sunScene);
                     //   elev / light — MW'S TWO SUNS, side by side. `elev` is the DISC, which is what
                     //            the model is cooked at and what actually SETS; `light` is the
                     //            sgSunlight direction that drives every lighting term, sits ~29
@@ -28574,39 +31202,72 @@ namespace ForgeRender {
                     //            MW holds sunVis up past it, `elev` STEPS in one frame and the sky
                     //            snaps. That is the one thing about this port MGE's source cannot
                     //            settle, so it is on the line instead of in a comment.
-                    //   elev is the UNCLAMPED disc elevation and goes NEGATIVE at dusk; the cook's
-                    //            own elevation is clamped at 0 and is printed beside it as `cook=`,
-                    //            because the two parting company below the horizon is exactly the
-                    //            P2b twilight design (the model holds its horizon colour while the
-                    //            ramp, which runs -4..0 deg, fades it out) and not a bug to chase.
+                    //   elev is the UNCLAMPED disc elevation and goes NEGATIVE at dusk. There is no
+                    //            `cook=` companion any more and that absence IS a result: the closed
+                    //            form had to be clamped at 0 because it was undefined below the
+                    //            horizon, so the two numbers parted company at dusk. A medium takes
+                    //            a negative elevation as an ordinary configuration and computes
+                    //            twilight, so there is only one elevation left to print.
+                    //   ⚠ nits — S2's new row, and it is per CHANNEL for a reason. q and sun% are
+                    //            scale-free BY CONSTRUCTION: they would read exactly the same if the
+                    //            whole sky were ten times too bright, or the right brightness and
+                    //            the wrong colour. A zenith in cd/m2 is checkable against published
+                    //            sky measurements, and the phase's success criterion is chromatic.
+                    //   ⚠ fogTarget — the row this session added, and it is a COMPARISON, not a
+                    //            reading. `below` is the medium 10 deg under the horizon: what the
+                    //            WATER, the reflection hole fill and every downhill vista melt into
+                    //            now that skyhw.frag is opaque there. `land` is fogColNear, what
+                    //            everything ABOVE the horizon melts into below applyFog's 0.85
+                    //            saturation knee, i.e. almost the whole visible world. They are the
+                    //            same quantity for two surfaces standing side by side, so a large
+                    //            gap between them IS the "fog discrepancy" defect, on one line.
+                    //   ⚠ ev — Sunny 16, riding along free. A textbook clear noon is EV 15, nothing
+                    //            is tuned to it and nothing reads it. It is on the line because a
+                    //            number nobody targeted is the only kind that can falsify anything.
                     //   stars / sun disc — P2b's two element lanes, each printed next to the thing
                     //            it has to be judged against: the star radiance against the DRAWN
                     //            zenith it must hide under by day, and the sun's L against the solid
                     //            angle MW's sprite actually covers (which is NOT the sun's 6.8e-5 sr
                     //            — the ratio is a finding about MW's art).
-                    LOG::logline(">> [forge-hb][sky] HW T=%.1f alb=%.2f elev=%.2fdeg (cook=%.2f light=%.2fdeg)"
-                                 " ramp=%.2f blend=%.2f nightAmb=%.2f"
-                                 " | q=%.4f (real 0.122, p25-p75 0.093-0.148) sun%%=%.3f (real ~0.80)"
-                                 " | sky=%.0flx sunNormal=%.0flx"
+                    LOG::logline(">> [forge-hb][sky] MEDIUM mie=%.2fx (cal x%.2f) alb=%.2f elev=%.2fdeg (light=%.2fdeg)"
+                                 " ramp=%.2f blend=%.2f nightAmb=%.2f alt=%.0fm"
+                                 " | q=%.4f (real 0.122, p25-p75 0.093-0.148) sun%%=%.3f (real ~0.80,"
+                                 " a PREDICTION since S2)"
+                                 " | sky=%.0flx sunNormal=%.0flx ev100=%.2f (clear noon: 15)"
+                                 " | nits zenith=(%.0f,%.0f,%.0f) horizon=(%.0f,%.0f,%.0f) cd/m2"
+                                 " | fogTarget below=(%.0f,%.0f,%.0f) land=(%.0f,%.0f,%.0f) cd/m2"
                                  " | scene amb=%.4f sun=%.4f ratio=%.2f | unit=%.0fcd/m2"
                                  " | mwRef amb=%.3f sun=%.3f nl=%.3f m=%.3f (%.3fx day -> setpoint %.1f)"
                                  " | zenith=%.5f stars=%.5f (%.1f%% of zenith)"
                                  " cloud=%.5f (%.1fx zenith, albedo %.2f / q)"
                                  " | sunDisc %s omega=%.3e sr (%.2fdeg, %.0fx solar) L=%.1f p=%.2f",
-                                 (double)g_skyPhys.st.turbidity, (double)g_skyPhys.st.albedo,
+                                 (double)g_skyPhys.turbidity, (double)g_atmosMieMul,
+                                 (double)g_skyPhys.albedo,
                                  (double)g_skyPhys.elevDisc,
-                                 (double)g_skyPhys.st.elevation * 180.0 / Hosek::kPi,
                                  (double)g_skyPhys.elevLight,
                                  (double)g_skyPhys.nightRamp, (double)g_skyPhysBlend,
                                  (double)nightAmbScaleNow(),
+                                 (double)(g_skyPhys.cameraRadiusM - Atmosphere::kGroundRadiusM),
                                  g_skyPhys.qZenith, g_skyPhys.sunShare,
-                                 g_skyPhys.EskyLux, g_skyPhys.EsunLux,
+                                 g_skyPhys.EskyLux, g_skyPhys.EsunLux, g_skyPhys.ev100,
+                                 (double)g_skyPhys.zenithNative[0] * 683.0,
+                                 (double)g_skyPhys.zenithNative[1] * 683.0,
+                                 (double)g_skyPhys.zenithNative[2] * 683.0,
+                                 (double)g_skyPhys.horizonNative[0] * 683.0,
+                                 (double)g_skyPhys.horizonNative[1] * 683.0,
+                                 (double)g_skyPhys.horizonNative[2] * 683.0,
+                                 (double)g_skyPhys.belowNative[0] * 683.0,
+                                 (double)g_skyPhys.belowNative[1] * 683.0,
+                                 (double)g_skyPhys.belowNative[2] * 683.0,
+                                 (double)g_fogNearScene[0] * SceneCal::kSceneUnitCd,
+                                 (double)g_fogNearScene[1] * SceneCal::kSceneUnitCd,
+                                 (double)g_fogNearScene[2] * SceneCal::kSceneUnitCd,
                                  ambL, sunL, (ambL > 1.0e-9) ? (sunL / ambL) : 0.0,
-                                 Hosek::kSceneUnitCd,
+                                 SceneCal::kSceneUnitCd,
                                  (double)g_mwAmbCode, (double)g_mwSunCode,
                                  (double)(g_skyPhys.active
                                      ? std::max(0.0f, std::sin(g_skyPhys.elevLight
-                                                               * (float)(Hosek::kPi / 180.0)))
+                                                               * (float)(SceneCal::kPi / 180.0)))
                                      : kCalDayElevSin),
                                  (double)mwRefLevel(), (double)(mwRefLevel() / calMwDayRef()),
                                  (double)(kCalMwDayCentre * mwRefLevel() / calMwDayRef()),
@@ -28619,7 +31280,7 @@ namespace ForgeRender {
                                  g_skyPhys.sunDiscFound ? "ok" : "ABSENT",
                                  (double)g_skyPhys.sunDiscOmega, (double)g_skyPhys.sunDiscHalfDeg,
                                  (double)(g_skyPhys.sunDiscOmega / 6.80e-05f),
-                                 (double)Hosek::luma709(g_skyPhys.sunDiscL),
+                                 (double)SceneCal::luma709(g_skyPhys.sunDiscL),
                                  (double)g_sunDiscExpand);
                 } else {
                     // ⚠ THE MW REFERENCE HAS TO BE PRINTED HERE TOO, AND UNTIL NOW IT WAS NOT. The
@@ -28640,6 +31301,11 @@ namespace ForgeRender {
                                  (double)std::max(g_calInteriorFloor, kCalMwDayCentre * irat),
                                  g_calFollowMwInterior ? 1 : 0);
                 }
+                // The medium MW's weather currently describes. Sits with the [sky] line because
+                // since S2 the two ARE the same object: the row below is what the LUTs above were
+                // built from, so a sky that looks wrong and a weather row that reads wrong are one
+                // diagnosis rather than two.
+                logAtmosphereRow("hb");
             }
             LOG::logline(">> [forge-hb] frame=%u drawn=%u skinned=%u(blend=%u zpre=%u) multimap=%u sky=%u alpha=%u(zpre=%u) dynamic=%u meshHigh=%u "
                          "| refl sky=%u near=%u skin=%u mm=%u "
@@ -28731,6 +31397,126 @@ namespace ForgeRender {
                          g_lastCullExamined ? (g_lastCullMs * 1000.0 / (g_lastCullExamined / 1000.0)) : 0.0,
                          g_lastGpuCullCount, (g_lastGpuCullCount == g_liveLastInst) ? "MATCH" : "MISMATCH",
                          g_lastGpuOccluded);
+            // M1 jitter, ONLY when armed (tasks/forge-upscale.md). Its own line rather than a field
+            // on the one above, so the fixed-format split stays fixed-format and so the line's mere
+            // PRESENCE says the lane is live. "Is the jitter actually moving" is otherwise
+            // unanswerable from a minimized run: a sub-pixel offset is invisible in every number the
+            // heartbeat already prints, and a jitter stuck on one phase looks exactly like a
+            // working one in the log while reconstructing nothing.
+            // M1 motion vectors, ONLY when the pass is live. Same reasoning as the jitter line
+            // below: presence says the lane ran, and "the field looks wrong" and "the dispatch never
+            // happened" are otherwise the same picture from a minimized run. `valid` is what the
+            // shader gates on — it is 0 for exactly one frame after a start or a discontinuity, and
+            // a `valid=0` that persists means the end-of-frame snapshot is not being reached.
+            // ⚠ SILENCE IS NOT A READING. When the pass is off this block used to print NOTHING, so
+            // a session spent standing still and spinning on the spot to test it produced an empty
+            // log and neither side could tell whether the vectors were fine or the lane had simply
+            // never run. That happened: a redeploy restarts the host, which resets g_debugMode to 0,
+            // and reaching mode 17 again costs seventeen F12 presses. Say it once per run instead —
+            // an instrument that is absent exactly when someone is trying to use it is the same
+            // defect as one that samples the wrong frame, wearing different clothes.
+            if (!g_mvEnable && g_debugMode != 17u && g_debugMode != 18u) {
+                static bool s_mvOffOnce = false;
+                if (!s_mvOffOnce) {
+                    s_mvOffOnce = true;
+                    LOG::logline(">> [forge-hb] mv: OFF (ready=%d) — no vectors, no field stats. Arm it "
+                                 "with the 'Motion vectors' checkbox on the dev panel's Resolve tab, "
+                                 "or MGE_HOST_KNOBS=mvEnable=1. F12 mode 17 also forces it on, but "
+                                 "that is 17 presses from a fresh host and the NUMBERS are what "
+                                 "settle a still-vs-spin test — the picture is only the intuition.",
+                                 g_live.mvReady ? 1 : 0);
+                    LOG::flush();
+                }
+            }
+            if (g_mvEnable || g_debugMode == 17u || g_debugMode == 18u) {
+                LOG::logline(">> [forge-hb] mv: ran=%d ready=%d valid=%d bakeEye=(%.1f, %.1f, %.1f) "
+                             "dBake=(%+.3f, %+.3f, %+.3f) rect=%ux%u out=%ux%u",
+                             g_lastMvRan ? 1 : 0, g_live.mvReady ? 1 : 0,
+                             g_prevViewProjValid ? 1 : 0,
+                             (double)g_eyeAbsShadow[0], (double)g_eyeAbsShadow[1], (double)g_eyeAbsShadow[2],
+                             g_lastMvDelta[0], g_lastMvDelta[1], g_lastMvDelta[2],
+                             g_live.width, g_live.height, g_live.outWidth, g_live.outHeight);
+                // ⚠ REPORTED TWICE, AND THE SECOND NUMBER IS THE USABLE ONE. The reference point
+                // (screen centre, device depth 0.5) lands only ~8 units out under reverse-Z, which
+                // makes it a very SENSITIVE canary and a very misleading absolute: the origin error
+                // is Delta-eye/distance, so a reading taken a few units from the camera is two
+                // orders of magnitude larger than the same error on real geometry. `@1000u` divides
+                // that dependence out — error x distance is the invariant — and is the figure to
+                // compare between frames, between speeds and against "does this matter".
+                // ⚠ THE PEAK IS THE HEADLINE, the instantaneous value is the footnote — see
+                // g_mvDeltaMaxLen for why an arbitrary-frame sample reports zero exactly when there
+                // is something to measure. `@1000u` divides out the reference point's distance
+                // (~8 u under reverse-Z, a sensitive canary and a misleading absolute) because the
+                // origin error is Delta-eye/distance; that is the figure to compare between speeds.
+                //
+                // ⚠ A `peak dBake` OF EXACTLY 0.000 OVER A WHOLE WINDOW IS NOT PROOF THE CAMERA WAS
+                // STILL. bakeEye arrives as float32 ABSOLUTE world coordinates and Morrowind's map
+                // reaches six figures — at x=120000 the ULP is ~0.008 u, so two consecutive frames
+                // of slow motion can round to the same float and difference to a hard zero. Below
+                // roughly 0.05 u/frame this lane is quantisation, not signal. It does not matter for
+                // the vectors (the resulting error is ~1e-4 px at 1000 u) but it is why the reading
+                // is sometimes an exact zero rather than a small number.
+                // ─── AND WHAT THE FIELD ITSELF SAYS (gMvStats, one frame late) ────────────────
+                // ⚠ min |mv| IS THE ONE TO READ. A uniform DC offset — the bakeEye signature — lifts
+                // the WHOLE field, so the quietest pixel in the frame stops being quiet, and min is
+                // exactly the offset's size. max only reports how fast the camera was going, and by
+                // eye a lifted field and a moving field are the same picture. That indistinguishable
+                // -by-eye property is why this readback exists at all.
+                //
+                // HOW TO READ IT: stand still. `still%` should go to ~100 and `min` to ~0. Under
+                // PURE ROTATION there is legitimately no still pixel, so min is large and still% is
+                // 0 — that is correct, not a fault. Translating, min is the smallest true motion in
+                // frame (distant geometry), which is small but not zero.
+                if (g_live.pMvStatsReadback && g_live.pMvStatsReadback->pCpuMappedAddress) {
+                    const uint32_t* st = (const uint32_t*)g_live.pMvStatsReadback->pCpuMappedAddress;
+                    const uint32_t total = st[3];
+                    if (total > 0u) {
+                        float mx = 0.0f, mn = 0.0f;
+                        std::memcpy(&mx, &st[0], sizeof(float));
+                        std::memcpy(&mn, &st[1], sizeof(float));
+                        // min stays at the 0xFFFFFFFF sentinel if the reduction never ran; that bit
+                        // pattern is a NaN, so it is spelled out rather than printed as a float.
+                        char mnTxt[32];
+                        if (st[1] == 0xFFFFFFFFu) { std::snprintf(mnTxt, sizeof(mnTxt), "n/a"); }
+                        else                      { std::snprintf(mnTxt, sizeof(mnTxt), "%.4f", (double)mn); }
+                        LOG::logline(">> [forge-hb] mv field: max=%.3f px min=%s px still(<0.01px)=%.1f%% "
+                                     "reactive=%.1f%% of %u px | STILL CAMERA => still%%~100 and "
+                                     "min~0; PURE ROTATION has no still pixel (min large, "
+                                     "still%%=0) and that is correct; a min that will not go to 0 "
+                                     "when you stop IS the DC offset.",
+                                     (double)mx, mnTxt,
+                                     100.0 * (double)st[2] / (double)total,
+                                     100.0 * (double)st[4] / (double)total, total);
+                        // ⚠ A MASK THAT COVERS THE SCREEN IS NOT A MASK, IT IS THE UPSCALER SWITCHED
+                        // OFF — and that failure mode reads as "slightly soft", never as an error.
+                        // Standing still it should be ~0; walking, single-digit percent (moving
+                        // things plus the disocclusion rim). Persistently high means the thresholds
+                        // are catching the reprojection's own round-off rather than real motion.
+                        if (st[3] > 0u && (100.0 * (double)st[4] / (double)total) > 40.0) {
+                            LOG::logline("!! [mv] reactive mask covers %.1f%% of the frame — that is "
+                                         "not a mask, it is the upscaler turned off. Raise "
+                                         "mvReactiveT0 (now %.3f) until a still camera reads ~0%%.",
+                                         100.0 * (double)st[4] / (double)total,
+                                         (double)g_mvReactiveT0);
+                        }
+                    }
+                }
+                LOG::logline(">> [forge-hb] mv origin-fold: PEAK %.3f px (= %.4f px @1000u) at "
+                             "|dBake| %.4f u over the window | this frame %.3f px (ref dist %.0f u). "
+                             "A peak of 0.000 with |dBake| > 0.05 = the fold is not reaching the matrix.",
+                             (double)g_mvFoldMaxPx, (double)g_mvFoldMaxAt1k, g_mvDeltaMaxLen,
+                             (double)g_lastMvOriginFixPx, (double)g_lastMvRefDist);
+                g_mvDeltaMaxLen = 0.0; g_mvFoldMaxPx = 0.0f; g_mvFoldMaxAt1k = 0.0f;
+            }
+            if (g_jitterAmp > 0.0f) {
+                LOG::logline(">> [forge-hb] jitter: amp=%.2fpx phases=%u idx=%u -> (%+.3f, %+.3f) px "
+                             "[NDC %+.5f, %+.5f on a %ux%u rect]",
+                             (double)g_jitterAmp, (unsigned)(g_jitterPhases + 0.5f), g_jitterIndex,
+                             (double)g_jitterPx[0], (double)g_jitterPx[1],
+                             (double)(2.0f * g_jitterPx[0] / (float)g_live.width),
+                             (double)(-2.0f * g_jitterPx[1] / (float)g_live.height),
+                             g_live.width, g_live.height);
+            }
             // CPU record split: WHERE inside record (tRec0..tRec1) the CPU ms are spent recording
             // commands. Same phase brackets as the gpu split; "other" = record − Frame bracket
             // (pre-phase barriers, query resolve, endCmd). shadow further split static vs dyn —
@@ -28748,9 +31534,21 @@ namespace ForgeRender {
                          g_lastCpuPhaseMs[kGpuPhaseColorAlpha],
                          g_lastCpuPhaseMs[kGpuPhaseResolve],
                          g_lastRecMs - g_lastCpuPhaseMs[kGpuPhaseFrame]);
-            LOG::logline(">> [forge-hb] gpu split: cull=%.2f prepass=%.2f shadow=%.2f (st=%.2f dyn=%.2f sun=%.2f) postdepth=%.2f (lin=%.2f ao=%.2f mask=%.2f) reflect=%.2f color=%.2f water=%.2f caustic=%.2f grasscrush=%.2f(%u) bloom=%.2f(L%u) resolve=%.2f ms"
+            // The upscale term's bracket: the INPUT rect it actually resampled from, or "off" when
+            // no pass ran. Two states that look identical in the timing alone — the feature absent,
+            // and the feature present at scale 1.0 (the identity fast path) — read differently here.
+            char upscaleRectText[32];
+            if (g_lastUpscaleRan) {
+                std::snprintf(upscaleRectText, sizeof(upscaleRectText), "%ux%u",
+                              g_live.width, g_live.height);
+            } else {
+                std::snprintf(upscaleRectText, sizeof(upscaleRectText), "%s",
+                              g_upscaleName ? "1:1" : "off");
+            }
+            LOG::logline(">> [forge-hb] gpu split: cull=%.2f prepass=%.2f shadow=%.2f (st=%.2f dyn=%.2f sun=%.2f) postdepth=%.2f (lin=%.2f ao=%.2f mask=%.2f) reflect=%.2f color=%.2f water=%.2f caustic=%.2f grasscrush=%.2f(%u) mv=%.2f upscale=%.2f(%s) bloom=%.2f(L%u) resolve=%.2f ms"
                          " | hiz=%.2f (prologue, overruns=%u) | shadowCasters=%u maskSlots=%u(dyn=%u)"
                          " | nearTris=%.2fM atDraws=%u"
+                         " | atmos=%.2f (LUT chain, every frame)"
                          " | terrain=%u/%u cells (nearCut=%u) %.2fM tris (lod %u/%u/%u/%u/%u/%u)%s",
                          g_lastGpuPhaseMs[kGpuPhaseCull],
                          g_lastGpuPhaseMs[kGpuPhasePrepass], g_lastGpuPhaseMs[kGpuPhaseShadow],
@@ -28775,6 +31573,23 @@ namespace ForgeRender {
                          // non-zero count would be a timing problem; a 0.00 with (0) is the block
                          // not running at all — interior, knob off, or nobody near the player.
                          g_lastGpuPhaseMs[kGpuPhaseGrassCrush], g_grassCrushLastCount,
+                         // mv=<ms> — M1 camera-only motion vectors, one 8x8 dispatch over the render
+                         // rect at the colour->water seam. 0.00 means the pass did not run (off, and
+                         // it ships off because nothing consumes the vectors yet) — `[forge-hb] mv:`
+                         // beside it says which. This is the baseline the DLSS win gets measured
+                         // against, and it also carries the extra depth re-linearize the pass forces
+                         // when water and volumetric fog are both off, which lands in `lin` above.
+                         g_lastGpuPhaseMs[kGpuPhaseMotionVec],
+                         // upscale=<ms>(<in>x<in>) — M1 step 4b. ⚠ IT IS HALF OF A TWO-PART CLAIM
+                         // and neither half means anything alone. `upscale=` appearing says the pass
+                         // ran; `gpu=` DROPPING at the same time is what proves the input rect really
+                         // shrank rather than the viewport merely being clamped — a quarter-res scene
+                         // raster has to show up in `color`, `postdepth` and `reflect` too. A
+                         // 0.00 with a rect that is not the output rect would be a timing problem; a
+                         // 0.00 at in == out is the IDENTITY FAST PATH, which records nothing on
+                         // purpose and is the correct reading of the shipped default.
+                         g_lastGpuPhaseMs[kGpuPhaseUpscale],
+                         upscaleRectText,
                          // bloom=<ms>(L<levels>) — step 4. L0 means the pass did not run this frame
                          // (checkbox off, not scene-referred, or the pyramid failed to build), which is
                          // the distinction worth logging: a 0.00 with L7 would be a timing problem,
@@ -28785,6 +31600,14 @@ namespace ForgeRender {
                          (unsigned)g_shadowCasters.size(),
                          g_lastShadowActive, g_lastShadowDyn,
                          (double)g_lastNearTris / 1e6, g_lastNearATDraws,
+                         // atmos=<ms> — S2. The whole four-dispatch LUT chain: transmittance,
+                         // multiscatter, sky-view and the SH measurement, rebuilt EVERY frame. It is
+                         // on the line from the FIRST build rather than from the first complaint,
+                         // because a pass whose cost first appears three sub-steps later has no
+                         // baseline to be compared against. Budget: <= 0.25 ms. A 0.00 means the
+                         // chain did not run at all — interior, master toggle off, or a build
+                         // failure — which is the distinction worth logging.
+                         g_lastGpuPhaseMs[kGpuPhaseAtmos],
                          g_lastTerrainCells, g_lastTerrainInRange, g_lastTerrainNearCut,
                          (double)g_lastTerrainTris / 1e6,
                          g_lastTerrainLodHist[0], g_lastTerrainLodHist[1], g_lastTerrainLodHist[2],
@@ -29252,6 +32075,56 @@ namespace ForgeRender {
             }
         }
 
+        // M1 MOTION VECTORS: same treatment (tasks/forge-upscale.md). Compute, so it hot-reloads —
+        // and this pass wants it more than most: its correctness is a matrix derivation whose only
+        // symptom is a picture, and iterating a derivation across full host restarts is how a wrong
+        // sign survives an afternoon. Failure sets mvReady false and goes inert; the resources and
+        // the descriptor set stay valid for a retry, and the dispatch simply stops running — which
+        // is bit-identical to a build without the feature, since nothing consumes the vectors yet.
+        //
+        // ⚠ NO SAMPLE_COUNT VARIANT TO KEEP IN SYNC, unlike the two blocks above — this pass reads
+        // pLinearDepth (already single-sample) rather than pDepth. That is one fewer way for a
+        // hot-reload to silently disagree with the build path, and it was a reason to read the
+        // resolved depth rather than the raw one.
+        if (g_live.pMvShader) {
+            if (g_live.pMvPipeline) { removePipeline(R, g_live.pMvPipeline); g_live.pMvPipeline = nullptr; }
+            removeShader(R, g_live.pMvShader); g_live.pMvShader = nullptr;
+            ShaderLoadDesc msd = {};
+            msd.mComp.pFileName = "motionvectors.comp";
+            addShader(R, &msd, &g_live.pMvShader);
+            if (g_live.pMvShader) {
+                PipelineDesc mpd = {};
+                mpd.mType = PIPELINE_TYPE_COMPUTE;
+                mpd.mComputeDesc.pShaderProgram = g_live.pMvShader;
+                addPipeline(R, &mpd, &g_live.pMvPipeline);
+            }
+            g_live.mvReady = g_live.pMvPipeline && g_live.pMvSet && g_live.pMvParamsCbv
+                          && g_live.pMotionVectors;
+            LOG::logline(g_live.mvReady
+                             ? ">> [forge] motionvectors.comp hot-reloaded"
+                             : "!! [forge] motionvectors hot-reload FAILED — pass DISABLED (dxil missing on disk?)");
+            LOG::flush();
+        }
+
+        // M1 step 4b THE UPSCALER: same treatment, and it is the whole reason THIS pass is compute
+        // too. The filter — the Mitchell C, the anti-ringing box, the half-pixel map — is the
+        // hot-iteration surface, and this backend is the PERMANENT reconstruction for every GPU that
+        // will never run NGX, so it will be iterated on. Delegated to the backend rather than opened
+        // up here: the shader and pipeline are its private business, and the seam is what this file
+        // knows (upscale.h).
+        //
+        // Failure leaves the pass inert — the TARGET and the descriptor set survive, so nothing
+        // dangles, and the host's pointer comparison then simply never sees an upscaled frame, which
+        // is the same frame a build without this feature renders.
+        if (g_live.pUpscaler) {
+            if (!g_live.pUpscaler->reload(R)) {
+                LOG::logline("!! [upscale] pass DISABLED until the next successful reload — frames "
+                             "deliver at the INPUT rect meanwhile, which at inputScale < 1 is a "
+                             "SMALLER image in the same window. Not a subtle symptom, on purpose.");
+                LOG::flush();
+            }
+        }
+
         // BLOOM (step 4): same treatment, and it is the whole reason this pass is compute. Strength,
         // radius, threshold and the up-chain blend are exactly the knobs that want walking in a
         // running game — reflectmip.comp made the same call for the same reason. Failure disables the
@@ -29617,7 +32490,11 @@ namespace ForgeRender {
             removeResource(pTexRb);
         }
 
-        const uint32_t W = g_live.width, H = g_live.height;
+        // ⚠ THE OUTPUT RECT — the readback below copies pRT, so the pitch and the centre-pixel
+        // index have to be taken in the DELIVERED rect. Taking them in the input rect would put the
+        // "centre pixel" somewhere off-centre the moment the two differ, which is exactly the class
+        // of bug --forge-scene exists to catch.
+        const uint32_t W = g_live.outWidth, H = g_live.outHeight;
         const uint32_t rowAlign = (R->pGpu->mUploadBufferTextureRowAlignment > 1u) ? R->pGpu->mUploadBufferTextureRowAlignment : 1u;
         const uint32_t texAlign = (R->pGpu->mUploadBufferTextureAlignment > 1u) ? R->pGpu->mUploadBufferTextureAlignment : 1u;
         const uint32_t rowPitch = roundUp(W * 4u, rowAlign);
@@ -33688,6 +36565,13 @@ namespace ForgeRender {
         fd[20]=1.0f;   fd[21]=0.96f;  fd[22]=0.86f; fd[23]=0;        // sunCol
         fd[24]=0.34f;  fd[25]=0.38f;  fd[26]=0.46f; fd[27]=0;        // ambCol
         fd[28]=0.60f;  fd[29]=0.66f;  fd[30]=0.78f; fd[31]=0;        // fogColNear
+        // ⚠ THE FOG LOOK LANES (froxelZ.zw, 122/123) ZEROED EXPLICITLY. Neither of these standalone
+        // paths fills the froxel row, and mwFogNearHaze() reads .w on EVERY fogged fragment — an
+        // upload heap is not zero-initialised, so leaving it would put an arbitrary extinction
+        // density on the probe's fog and make the tool disagree with the game for no visible reason.
+        // .z is inert here (fd[31] = 0 turns the sky target off entirely) but is set for the same
+        // reason: a lane a shader reads unconditionally gets written unconditionally.
+        fd[122]=0.85f; fd[123]=0.0f;
         fd[32]=0.30f*zf; fd[33]=0.95f*zf; fd[34]=0; fd[35]=0;        // fogParams (start, end)
         fd[36]=eye[0]; fd[37]=eye[1]; fd[38]=eye[2]; fd[39]=0;       // eyePos
         fd[40]=0; fd[41]=1.0f/(float)W; fd[42]=1.0f/(float)H; fd[43]=0; // debugParams
@@ -34157,6 +37041,9 @@ namespace ForgeRender {
             fd[20]=kViewerSunCol[0]; fd[21]=kViewerSunCol[1]; fd[22]=kViewerSunCol[2]; fd[23]=0;
             fd[24]=kViewerAmbient[0]; fd[25]=kViewerAmbient[1]; fd[26]=kViewerAmbient[2]; fd[27]=0;
             fd[28]=kViewerFog[0]; fd[29]=kViewerFog[1]; fd[30]=kViewerFog[2]; fd[31]=0;
+            // Same as the statics probe: 122/123 are read unconditionally by the fog helpers and
+            // this path never fills the froxel row they live in. See opaque.srt.h.
+            fd[122]=0.85f; fd[123]=0.0f;
             fd[32]=kFogStart; fd[33]=kFogEnd; fd[34]=0; fd[35]=0;  // fogParams (start, end) — tied to draw distance
             fd[36]=0; fd[37]=0; fd[38]=0; fd[39]=0;                // eyePos = 0 (camera-relative frame)
             fd[40]=0; fd[41]=1.0f/(float)W; fd[42]=1.0f/(float)H; fd[43]=0;
@@ -34179,11 +37066,11 @@ namespace ForgeRender {
 
             resetCmdPool(R, g_live.pCmdPool);
             beginCmd(g_live.pCmd);
-            // MSAA (sampleCount > 1): draw into g_live.pMSAAColor and ResolveSubresource into the
+            // MSAA (sampleCount > 1): draw into g_live.pSceneColor and ResolveSubresource into the
             // acquired backbuffer at the end — the same shape as the live path (which resolves into
             // the shared RT). At 1x we render STRAIGHT into the backbuffer as before. Either way bb
             // comes back from acquire in PRESENT state and goes back to PRESENT before queuePresent.
-            RenderTarget* viewTarget = (g_live.sampleCount > 1) ? g_live.pMSAAColor : bb;
+            RenderTarget* viewTarget = (g_live.sampleCount > 1) ? g_live.pSceneColor : bb;
             RenderTargetBarrier toRT = {};
             toRT.pRenderTarget = bb; toRT.mCurrentState = RESOURCE_STATE_PRESENT; toRT.mNewState = RESOURCE_STATE_RENDER_TARGET;
             cmdResourceBarrier(g_live.pCmd, 0, nullptr, 0, nullptr, 1, &toRT);
@@ -34218,9 +37105,9 @@ namespace ForgeRender {
             cmdBindRenderTargets(g_live.pCmd, nullptr);
             if (g_live.sampleCount > 1) {
                 // Resolve the multisampled colour into the acquired backbuffer (same call the live
-                // path makes into the shared RT). pMSAAColor is left in RENDER_TARGET between frames.
+                // path makes into the shared RT). pSceneColor is left in RENDER_TARGET between frames.
                 ID3D12GraphicsCommandList* cl = g_live.pCmd->mDx.pCmdList;
-                ID3D12Resource* msaaRes = g_live.pMSAAColor->pTexture->mDx.pResource;
+                ID3D12Resource* msaaRes = g_live.pSceneColor->pTexture->mDx.pResource;
                 ID3D12Resource* bbRes   = bb->pTexture->mDx.pResource;
                 D3D12_RESOURCE_BARRIER pre[2] = {};
                 pre[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -34238,7 +37125,7 @@ namespace ForgeRender {
                 // Legal only because worldViewer() forces the scene format back to LDR before init —
                 // this destination is the viewer's own BGRA8 swapchain and a resolve cannot convert.
                 cl->ResolveSubresource(bbRes, 0, msaaRes, 0,
-                                       (DXGI_FORMAT)TinyImageFormat_ToDXGI_FORMAT(g_live.pMSAAColor->mFormat));
+                                       (DXGI_FORMAT)TinyImageFormat_ToDXGI_FORMAT(g_live.pSceneColor->mFormat));
 
                 D3D12_RESOURCE_BARRIER post[2] = {};
                 post[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -36370,7 +39257,12 @@ namespace ForgeRender {
                 }
                 // gFrameData froxel fields: froxelDims @ float 116 (464B), froxelZ @ 120 (480B).
                 mfd[116] = (float)tilesX; mfd[117] = (float)tilesY; mfd[118] = (float)kFroxelZSlices; mfd[119] = (float)tile;
-                mfd[120] = logd0; mfd[121] = invLog; mfd[122] = 0.0f; mfd[123] = 0.0f;
+                // ⚠ .zw ARE NOT TOUCHED HERE. They are the two FOG LOOK LANES (opaque.srt.h), and
+                // they are published unconditionally with the rest of the frame's fog state — this
+                // branch runs only when clustering is active, so owning them here would leave them
+                // stale on every frame that brute-loops, and would never reach the REFLECT cbuffer
+                // at all. That set is the one the reported disparity is actually about.
+                mfd[120] = logd0; mfd[121] = invLog;
 
                 g_live.froxelActive     = true;
                 g_live.froxelNumWords   = numWords;
@@ -37546,6 +40438,442 @@ namespace ForgeRender {
         republish();
     }
 
+    // ═══ S2 — THE ATMOSPHERE'S LUT CHAIN, AND THE GATE (tasks/forge-atmosphere.md) ═══════════════
+    //
+    // Four compute dispatches at the top of the frame, before the cull, with no render target bound.
+    // ~310 KB of RGBA16F rebuilt from scratch every single frame, and the "every frame" is the whole
+    // design rather than an oversight: Bruneton precomputed his tables offline, which would have made
+    // Morrowind's weather a cross-fade between frozen presets. Rebuilding lets the medium's
+    // parameters WALK, and a weather sub-simulation is exactly a walk through parameter space.
+    //
+    // ⚠ THE HOST'S ONLY JOB HERE IS TO SAY WHAT THE MEDIUM IS. Not what the sky looks like — the
+    // shader integrates that, and atmos_sh.comp measures the result. This function packs a Params
+    // (which came from the S1 table, which is the one place a weather index becomes physics), fires
+    // four dispatches in dependency order, and copies 128 bytes back. There is no sky model on this
+    // side of the boundary any more, which is the structural change S2 exists for.
+    void atmosDispatch()
+    {
+        g_atmosShArmed = false;
+        if (!g_live.atmosReady) { return; }
+        if (!g_live.pAtmosParamsCbv || !g_live.pAtmosParamsCbv->pCpuMappedAddress) { return; }
+
+        // ⚠ INTERIORS PUBLISH NOTHING AND DISPATCH NOTHING — the idiom the sun, sky-AO and
+        // sky-ambient lanes already use, and the S1 interior control (`medium parked at Clear`) is
+        // the measurement that says the weather lane agrees about where the camera is. An interior
+        // that quietly kept a sky resident would be a sky an interior could acquire, which is the
+        // one failure mode a fullscreen opaque pass makes total.
+        if (!g_dlExterior || !g_skyHw) {
+            // ⚠ AND THE MEASUREMENT IS DROPPED, NOT LATCHED. Without this, walking out of a cell at
+            // dusk would light the first exterior frame from whatever the sky measured when you
+            // walked IN — possibly hours of game time earlier. Clearing it hands that frame back to
+            // MW's authored lighting instead, which is the blend-0 end every consumer already
+            // handles and is the same "a defined state, not a zero" rule the bootstrap follows.
+            // Costs one extra frame of MW ambient on a cell transition, which is a fade anyway.
+            g_atmosShValid = false;
+            return;
+        }
+
+        // ─── THE MEDIUM, READ THROUGH THE ONE SAMPLER ────────────────────────────────────────────
+        // ⚠ atmosphereAt() AND NOTHING ELSE, at the eye. Reaching for the global row here — the one
+        // place it would be harmless today — is how the sampler discipline erodes, and S6 turns on
+        // whether every call site already passes a position. atmosphere.h says so at length.
+        Atmosphere::Params row = Atmosphere::atmosphereAt(g_eyeAbsShadow[0], g_eyeAbsShadow[1]);
+
+        // Where the sun is, and how far up the camera stands. Both come from g_skyPhys, which is the
+        // one place MW's two suns are reconciled ([[project_mw_two_suns]]) — the DISC anchors the
+        // sky, the LIGHT keeps driving the shading, and this pass wants the disc.
+        float toSun[3] = { g_skyPhys.toSun[0], g_skyPhys.toSun[1], g_skyPhys.toSun[2] };
+        float camRadius = g_skyPhys.cameraRadiusM;
+        float albedo    = std::max(0.0f, std::min(1.0f, g_skyAlbedo));
+        if (!(camRadius > Atmosphere::kGroundRadiusM * 0.5f)) {
+            // The first frames, before skyPhysicalMeasure has run once. Stand at sea level rather
+            // than at the planet's centre — a radius of 0 deparameterises into a LUT row that does
+            // not exist, and the resulting NaN would propagate into the ambient and out into every
+            // lit surface in the frame.
+            camRadius = Atmosphere::kGroundRadiusM + (float)Atmosphere::kGroundEpsM;
+        }
+        const float sunLen = std::sqrt(toSun[0]*toSun[0] + toSun[1]*toSun[1] + toSun[2]*toSun[2]);
+        if (!(sunLen > 1.0e-4f)) { toSun[0] = 0.0f; toSun[1] = 0.0f; toSun[2] = 1.0f; }
+
+        // ─── THE MOON AS A SECOND SOURCE (S2e) ───────────────────────────────────────────────────
+        // ⚠ NOT A NIGHT MODE — a second entry into the SAME integral. MW gives the host no moon
+        // direction on the wire, and inventing an orbit would be a second celestial model to keep in
+        // sync with the one MW draws. So the moon is placed OPPOSITE THE SUN, which is where a full
+        // moon actually is, and its irradiance is a fraction of E_TOA. That makes moonlight
+        // Rayleigh-scatter into a blue night sky through the identical arithmetic that makes the day
+        // sky blue — which a "fade to black" ramp could never produce, and is why night stops being
+        // black structurally rather than by a lift.
+        //
+        // ⚠ AND IT IS OFF WHILE THE SUN IS UP, which is not an optimisation: MW's own moons are drawn
+        // by its sky loop and are visible by day, so a second scattering source at noon would brighten
+        // the day sky by a term nobody asked for. It arms as the sun goes down.
+        float toMoon[3] = { -toSun[0], -toSun[1], -toSun[2] };
+        float moonE = 0.0f;
+        if (g_atmosMoonOn && toSun[2] < 0.02f) {
+            const float* Etoa = Atmosphere::solarIrradianceTOA();
+            // Ramped in over the same few degrees the night ramp covers, so the moon does not switch
+            // on in one frame at the exact instant the sun crosses the horizon.
+            const float t = std::max(0.0f, std::min(1.0f, (0.02f - toSun[2]) / 0.06f));
+            moonE = SceneCal::luma709(Etoa) * std::max(0.0f, g_atmosMoonScale) * t * t * (3.0f - 2.0f * t);
+        }
+
+        // ─── THE GATE (S2b) ──────────────────────────────────────────────────────────────────────
+        // ⚠⚠ THE REFERENCE CONFIGURATION IS FORCED FOR EXACTLY ONE FRAME, AND IT IS MEASURED THROUGH
+        // THE LIVE CHAIN. That is the design's centrepiece and it is worth stating why it is not a
+        // CPU reference integrator: a CPU integrator would re-create the two-copies problem this
+        // phase exists to delete, AND it could pass while the GPU path was broken. Running the real
+        // dispatches with the reference parameters means that if the LUT parameterisation is wrong,
+        // or the unit constant is wrong, or a descriptor is bound to the wrong texture, THE GATE
+        // FAILS. The LUTs rebuild next frame from live weather anyway, so there is nothing to restore.
+        // ⚠ TWO FORCED CONFIGURATIONS NOW, ON TWO CONSECUTIVE ARMED FRAMES (S4a). The first is the
+        // clear reference S2 has always measured; the second is THE SAME AIR WITH A FULL LID OVER
+        // IT (Atmosphere::overcastGateRow), so the clear sky and the deck are both certified in one
+        // unattended run and the only difference between the two readings is the cloud model. Until
+        // this phase there was no way to produce an overcast at all, which is why the plan's own
+        // "overcast ~1000-2000 cd/m2 flat" nit row sat untested for the whole of S2.
+        //   state 0 -> force CLEAR    -> 1 (bytes in flight) -> report -> 2
+        //   state 2 -> force OVERCAST -> 3 (bytes in flight) -> report -> 4 (done)
+        const bool gateClear = (g_atmosGate && g_atmosGateState == 0 && g_live.pAtmosShPipeline);
+        const bool gateDeck  = (g_atmosGate && g_atmosGateState == 2 && g_live.pAtmosShPipeline);
+        const bool gateFrame = gateClear || gateDeck;
+        if (gateFrame) {
+            row = gateDeck ? Atmosphere::overcastGateRow()   // row 0's air under a full lid
+                           : Atmosphere::referenceRow();     // kWeatherTable[0]: Clear, not a look
+            albedo    = (float)SceneCal::kRefAlbedo;
+            camRadius = Atmosphere::kGroundRadiusM + (float)Atmosphere::kGroundEpsM;  // sea level
+            const float e = (float)SceneCal::kRefElevation;
+            toSun[0] = std::cos(e); toSun[1] = 0.0f; toSun[2] = std::sin(e);
+            moonE = 0.0f;
+            // ⚠ THE DECK KNOB IS **NOT** FORCED ON FOR THE SECOND FRAME. A gate that armed its own
+            // subject would certify a lid the running build does not draw whenever somebody set
+            // atmosDeck=0 to take the A/B arm — the shape of [[feedback_guard_fallback_is_the_bug]].
+            // The report says SKIPPED in that case instead, and names the knob.
+        }
+
+        const float lutDims[6] = {
+            (float)kAtmosSkyW,   (float)kAtmosSkyH,
+            (float)kAtmosTransW, (float)kAtmosTransH,
+            (float)kAtmosMsRes,  (float)kAtmosMsRes,
+        };
+        // ⚠ WRITE-ONLY, EVERY FIELD EVERY FRAME. This is a WRITE-COMBINED upload buffer
+        // ([[project_forge_wc_read_trap]]): reading it back to "only update what changed" would cost
+        // more than writing all 52 floats, and a partially-written struct is how a stale coefficient
+        // outlives the frame that produced it.
+        Atmosphere::packParams(row, albedo, toSun, camRadius - Atmosphere::kGroundRadiusM,
+                               toMoon, moonE, std::max(0.0f, g_atmosAirglow), g_atmosMieMul,
+                               g_atmosDeck, g_atmosSkySteps, 20.0f, g_atmosMsDirs,
+                               g_atmosDeckSteps, lutDims,
+                               (float*)g_live.pAtmosParamsCbv->pCpuMappedAddress);
+
+        cmdBeginDebugMarker(g_live.pCmd, 0.35f, 0.6f, 0.95f, "ATMOSPHERE LUTs");
+
+        auto toUav = [&](Texture* t) {
+            TextureBarrier tb = {};
+            tb.pTexture = t;
+            tb.mCurrentState = RESOURCE_STATE_SHADER_RESOURCE;
+            tb.mNewState = RESOURCE_STATE_UNORDERED_ACCESS;
+            cmdResourceBarrier(g_live.pCmd, 0, nullptr, 1, &tb, 0, nullptr);
+        };
+        auto toSrv = [&](Texture* t) {
+            TextureBarrier tb = {};
+            tb.pTexture = t;
+            tb.mCurrentState = RESOURCE_STATE_UNORDERED_ACCESS;
+            tb.mNewState = RESOURCE_STATE_SHADER_RESOURCE;
+            cmdResourceBarrier(g_live.pCmd, 0, nullptr, 1, &tb, 0, nullptr);
+        };
+
+        // 1. TRANSMITTANCE (256x64). Reads nothing; everything else is built on it.
+        toUav(g_live.pAtmosTransmittance);
+        cmdBindPipeline(g_live.pCmd, g_live.pAtmosTransPipeline);
+        cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pAtmosSet);
+        cmdDispatch(g_live.pCmd, (kAtmosTransW + 7u) / 8u, (kAtmosTransH + 7u) / 8u, 1);
+        toSrv(g_live.pAtmosTransmittance);   // ⚠ the barrier IS the dependency — see the note above
+
+        // 2. MULTIPLE SCATTERING (32x32). Reads the transmittance LUT.
+        toUav(g_live.pAtmosMultiScatter);
+        cmdBindPipeline(g_live.pCmd, g_live.pAtmosMsPipeline);
+        cmdBindDescriptorSet(g_live.pCmd, 1, g_live.pAtmosSet);
+        cmdDispatch(g_live.pCmd, (kAtmosMsRes + 7u) / 8u, (kAtmosMsRes + 7u) / 8u, 1);
+        toSrv(g_live.pAtmosMultiScatter);
+
+        // 3. SKY-VIEW (192x108). Reads both. This is the one the pixels come from AND the one the
+        //    light comes from — see atmos_sh.comp below.
+        toUav(g_live.pAtmosSkyView);
+        cmdBindPipeline(g_live.pCmd, g_live.pAtmosSkyPipeline);
+        cmdBindDescriptorSet(g_live.pCmd, 2, g_live.pAtmosSet);
+        cmdDispatch(g_live.pCmd, (kAtmosSkyW + 7u) / 8u, (kAtmosSkyH + 7u) / 8u, 1);
+        toSrv(g_live.pAtmosSkyView);
+
+        // 4. THE MEASUREMENT (one group of 128). Projects the sky-view LUT into SH-L1 over the full
+        //    sphere and computes the scalar probes in the same pass.
+        if (g_live.pAtmosShPipeline && g_live.pAtmosShOut && g_live.pAtmosShReadback) {
+            cmdBindPipeline(g_live.pCmd, g_live.pAtmosShPipeline);
+            cmdBindDescriptorSet(g_live.pCmd, 3, g_live.pAtmosSet);
+            cmdDispatch(g_live.pCmd, 1, 1, 1);
+            BufferBarrier bb = {};
+            bb.pBuffer = g_live.pAtmosShOut;
+            bb.mCurrentState = RESOURCE_STATE_UNORDERED_ACCESS;
+            bb.mNewState     = RESOURCE_STATE_COPY_SOURCE;
+            cmdResourceBarrier(g_live.pCmd, 1, &bb, 0, nullptr, 0, nullptr);
+            g_live.pCmd->mDx.pCmdList->CopyBufferRegion(
+                g_live.pAtmosShReadback->mDx.pResource, 0, g_live.pAtmosShOut->mDx.pResource, 0,
+                (UINT64)sizeof(uint32_t) * kAtmosShUints);
+            bb.mCurrentState = RESOURCE_STATE_COPY_SOURCE;
+            bb.mNewState     = RESOURCE_STATE_UNORDERED_ACCESS;
+            cmdResourceBarrier(g_live.pCmd, 1, &bb, 0, nullptr, 0, nullptr);
+            g_atmosShArmed = true;
+        }
+
+        cmdEndDebugMarker(g_live.pCmd);
+
+        if (gateFrame) {
+            g_atmosGateState = gateDeck ? 3u : 1u;
+            g_atmosGateFrame = g_renderFrame;
+        }
+    }
+
+    // ─── S2b/S4a — THE GATE, REPORTED ────────────────────────────────────────────────────────────
+    // Called from settleFrameFence, which is where a readback becomes valid. TWO ARMS, run on two
+    // consecutive forced frames, and five tables between them:
+    //
+    //   CLEAR  (deckArm = false, Atmosphere::referenceRow)
+    //     PHYSICS    the medium is a real atmosphere     q in the measured clear band, sun% ~ 0.80,
+    //                                                    direct-normal ~ 94 klx
+    //     NITS       the sky reads in real luminance     zenith 2000-8000 cd/m2, hor/zen 2-4x
+    //
+    //   OVERCAST (deckArm = true, Atmosphere::overcastGateRow — row 0's AIR under a full lid)
+    //     LEVEL      the lid is bright and FLAT          zenith 1000-2000 cd/m2, hor/zen 0.5-2x
+    //     LIGHT      the beam dies, the diffuse does not beam <= 5 klx, E_sky 10-25 klx
+    //     CONVERGE   the drawn sky meets MW's painted     zenith ~ albedo*E_tot/pi
+    //                cloud layer, which nobody tuned
+    //
+    // ⚠ THE OVERCAST ARM EXISTS BECAUSE S2 COULD NOT PRODUCE AN OVERCAST AT ALL. Its "~1000-2000
+    // cd/m2 flat" row sat in the plan untested for a whole phase, because `cloudCoverage` reached the
+    // host, was interpolated, was printed — and was read by no shader. S4a is what makes the row
+    // testable, and the CONVERGE row is what says whether a LEVEL miss is the model or the band.
+    //
+    // ⚠ THE NIT ROW IS NOT REDUNDANT WITH THE PHYSICS ROW, and that is why both exist. q and sun% are
+    // scale-free BY CONSTRUCTION — they would pass unchanged if the whole sky were ten times too
+    // bright — so they cannot see the one failure this phase's success criterion cares about. A
+    // zenith luminance in cd/m2 is directly checkable against published sky measurements, and it is
+    // reported PER CHANNEL because a zenith at the right brightness and the wrong colour is exactly
+    // what a luma gate cannot distinguish from a correct one.
+    //
+    // ⚠⚠ AND IF A ROW MISSES, THE LEVER IS THE MEDIUM'S AEROSOL OPTICAL DEPTH — which moves the beam
+    // and the sky together, as it physically must — NOT kSceneUnitCd and NOT E_TOA. Re-pinning the
+    // scene unit would move every absolute lane in the renderer at once under the guise of a sky
+    // change ([[project_forge_exposure_couples_every_level]]); fitting E_TOA would turn the whole
+    // gate back into the identity it was under Hosek. Report the gap and have the conversation.
+    void atmosReportGate(bool deckArm)
+    {
+        const float* rb = g_atmosShLast;
+        float Esky[3] = { rb[kAtmosShEsky + 0], rb[kAtmosShEsky + 1], rb[kAtmosShEsky + 2] };
+        float Esun[3] = { rb[kAtmosShEsun + 0], rb[kAtmosShEsun + 1], rb[kAtmosShEsun + 2] };
+        float zen[3]  = { rb[kAtmosShZenith + 0], rb[kAtmosShZenith + 1], rb[kAtmosShZenith + 2] };
+        float hor[3]  = { rb[kAtmosShHorizon + 0], rb[kAtmosShHorizon + 1], rb[kAtmosShHorizon + 2] };
+
+        const double sinE   = std::sin(SceneCal::kRefElevation);
+        const double lumSky = (double)SceneCal::luma709(Esky);
+        const double lumSun = (double)SceneCal::luma709(Esun);
+        const double EtotW  = lumSky + lumSun * sinE;
+        const double sunPct = (EtotW > 1.0e-9) ? (lumSun * sinE / EtotW) : 0.0;
+        const double q      = (EtotW > 1.0e-9)
+                            ? ((double)SceneCal::luma709(zen) / (EtotW / SceneCal::kPi)) : 0.0;
+        const double sunKlx = lumSun * 683.0 / 1000.0;
+        // Native W/(m^2 sr) -> cd/m2 is one multiply by the photometric constant. Per channel, then
+        // as a luma, because both readings answer different halves of the nit row.
+        double zenCd[3], horCd[3];
+        for (int c = 0; c < 3; ++c) {
+            zenCd[c] = (double)zen[c] * 683.0;
+            horCd[c] = (double)hor[c] * 683.0;
+        }
+        const double zenLumCd = (double)SceneCal::luma709(zen) * 683.0;
+        const double horLumCd = (double)SceneCal::luma709(hor) * 683.0;
+        const double horOverZen = (zenLumCd > 1.0e-6) ? (horLumCd / zenLumCd) : 0.0;
+        // Sunny 16, riding along free. A textbook clear noon is EV 15. Nothing is tuned to it and
+        // nothing reads it — it is here because a number nobody targeted is the only kind that can
+        // falsify anything, and it costs a log2.
+        const double Lavg  = (EtotW / SceneCal::kPi) * 0.18 * 683.0;
+        const double ev100 = (Lavg > 1.0e-9) ? std::log2(Lavg * 100.0 / 12.5) : 0.0;
+        const bool okRan = (g_atmosShLastRan != 0u);
+
+        // ─── THE ENERGY BUDGET, AND IT IS THE ONE ROW NO CALIBRATION CAN ARGUE WITH ──────────────
+        // ⚠⚠ EVERY OTHER ROW HERE IS A COMPARISON AGAINST A MEASURED BAND, so every one of them can
+        // be met by an honest disagreement about what the band should be. This one is a CONSERVATION
+        // LAW: a passive medium cannot deliver more light to the ground than arrives at the top of
+        // the atmosphere, at any calibration, under any weather, for any value of any knob. Over
+        // 100% is not "out of band", it is impossible — and it is the only row that can say so.
+        //
+        // It should sit WELL under 100%: the real atmosphere back-scatters to space and absorbs in
+        // ozone and aerosol, so a clear sky delivers ~75-85%.
+        //
+        // ⚠ IT IS STATED AGAINST THE HOST'S OWN E_TOA (atmosphere.cpp's Planck integral, never
+        // fitted) rather than against a published figure, so the row tests the chain and not the
+        // constant. Added in S4a because a τ sweep put E_sky at 4.6x the incoming flux and NOTHING
+        // in the gate could see it — the level row said "OUT", which is what it also says for a
+        // sky that is merely mistuned. [[feedback_over_determined_gate_bands]]
+        const double EtoaLx = (double)SceneCal::luma709(Atmosphere::solarIrradianceTOA()) * 683.0;
+        const double EinLx  = EtoaLx * sinE;                       // horizontal, at the top
+        const double EoutLx = (lumSky + lumSun * sinE) * 683.0;    // horizontal, at the ground
+        const double budget = (EinLx > 1.0e-9) ? (EoutLx / EinLx) : 0.0;
+        const bool   okBudget = (budget <= 1.0);
+
+        if (!deckArm) {
+            const bool okQ   = (q >= SceneCal::kQZenithLo && q <= SceneCal::kQZenithHi);
+            const bool okSun = (sunPct >= SceneCal::kSunShareLo && sunPct <= SceneCal::kSunShareHi);
+            const bool okKlx = (sunKlx >= 80.0 && sunKlx <= 108.0);
+            const bool okZen = (zenLumCd >= 2000.0 && zenLumCd <= 8000.0);
+            // ⚠⚠ A BAND, NOT AN INEQUALITY, AND THAT REPLACEMENT IS ITS OWN FINDING. The row used to
+            // read `horizon > zenith`, which is true of every clear sky ever measured and was
+            // therefore satisfied by a horizon at 8.8x the zenith against a real 2-4x — for the whole
+            // of S2. An inequality gate row cannot see a MAGNITUDE, and the magnitude was the defect.
+            // [[feedback_inequality_gate_hides_magnitude]]
+            //
+            // ⚠ AND A MISS HERE IS NOT S4a's. The over-bright horizon is a CLEAR-weather aerosol
+            // finding (the same one atmosMieMul was cut for), it predates the deck by a phase, and
+            // S4a deliberately does not touch the aerosol calibration — mixing the two would make
+            // both unbisectable. Fixing the row while the file was open is the whole of what S4a
+            // owes it.
+            const bool okHor = (horOverZen >= 2.0 && horOverZen <= 4.0);
+            const bool all   = okQ && okSun && okKlx && okZen && okHor && okRan && okBudget;
+
+            LOG::logline("%s [forge-atmos] gate %s @ reference (Clear, albedo %.2f, sun %.2fdeg, frame %u)"
+                         " — the beam is a PREDICTION now, not a solve",
+                         all ? ">>" : "!!", all ? "PASS" : "**MISSED**",
+                         SceneCal::kRefAlbedo, SceneCal::kRefElevation * 180.0 / SceneCal::kPi,
+                         g_atmosGateFrame);
+            LOG::logline("%s [forge-atmos] gate PHYSICS: q_zenith %.4f [%s, band %.3f-%.3f]"
+                         " | sun%% %.3f [%s, band %.2f-%.2f] | direct-normal %.1f klx [%s, ~94 expected]"
+                         " | E_sky %.0f lx E_sun %.0f lx | ran=%u",
+                         (okQ && okSun && okKlx) ? ">>" : "!!",
+                         q, okQ ? "OK" : "OUT", SceneCal::kQZenithLo, SceneCal::kQZenithHi,
+                         sunPct, okSun ? "OK" : "OUT", SceneCal::kSunShareLo, SceneCal::kSunShareHi,
+                         sunKlx, okKlx ? "OK" : "OUT",
+                         lumSky * 683.0, lumSun * 683.0, g_atmosShLastRan);
+            LOG::logline("%s [forge-atmos] gate NITS: zenith (%.0f, %.0f, %.0f) cd/m2 luma %.0f"
+                         " [%s, clear band 2000-8000] | horizon (%.0f, %.0f, %.0f) luma %.0f"
+                         " | hor/zen %.2fx [%s, BAND 2.0-4.0 — was an inequality, which passed 8.8x"
+                         " for the whole of S2] | Sunny-16 EV100 %.2f (textbook clear noon: 15)",
+                         (okZen && okHor) ? ">>" : "!!",
+                         zenCd[0], zenCd[1], zenCd[2], zenLumCd, okZen ? "OK" : "OUT",
+                         horCd[0], horCd[1], horCd[2], horLumCd,
+                         horOverZen, okHor ? "OK" : "OUT",
+                         ev100);
+            LOG::logline("%s [forge-atmos] gate ENERGY: %.0f lx reaches the ground (sky %.0f + beam"
+                         " %.0f) against %.0f lx arriving at the top -> %.1f%% [%s]. A passive medium"
+                         " cannot exceed 100%% at ANY calibration; a real clear sky lands at 75-85%%"
+                         " after back-scatter to space and ozone absorption. This is the only row"
+                         " here that is a conservation law rather than a band.",
+                         okBudget ? ">>" : "!!", EoutLx, lumSky * 683.0, lumSun * sinE * 683.0,
+                         EinLx, budget * 100.0,
+                         okBudget ? "OK" : "**IMPOSSIBLE — energy is being created**");
+            if (!all) {
+                LOG::logline("!! [forge-atmos] ⚠ DO NOT re-pin kSceneUnitCd (%.0f cd/m2) and DO NOT fit"
+                             " E_TOA to close this. The honest lever is the medium's AEROSOL OPTICAL"
+                             " DEPTH — it moves the beam and the sky together, as it physically must."
+                             " [[project_forge_exposure_couples_every_level]]",
+                             SceneCal::kSceneUnitCd);
+            }
+            LOG::flush();
+            return;
+        }
+
+        // ═══ S4a — THE LID ═══════════════════════════════════════════════════════════════════════
+        // Row 0's air with a full deck over it, so every number below is a statement about the CLOUD
+        // MODEL and nothing else. Until this phase nothing could produce an overcast to check.
+        const Atmosphere::Params ovc = Atmosphere::overcastGateRow();
+        const Atmosphere::DeckReport dk = Atmosphere::deckReport(ovc, g_atmosDeck);
+        if (!(dk.ext > 0.0f)) {
+            LOG::logline(">> [forge-atmos] gate OVERCAST **SKIPPED** — atmosDeck=%.2f disarms the deck"
+                         " (tau %.2f). This is the A/B control arm and it is the pre-S4a sky exactly;"
+                         " set atmosDeck=1 to certify the lid.", (double)g_atmosDeck, (double)dk.tau);
+            LOG::flush();
+            return;
+        }
+
+        // ⚠ THE CONVERGENCE ROW IS THE ONE NOBODY TUNED TO, AND IT IS ALSO THE CONSISTENCY CHECK
+        // BETWEEN THE OTHER TWO. Under a lid the sky IS a diffuse source: L_zenith should come out at
+        // roughly albedo x E_tot / pi, which is exactly what MW's painted cloud layer is anchored to
+        // through `cloudScene`. So this row predicts, from first principles and with nothing fitted,
+        // that the drawn zenith and the painted layer CONVERGE under cover — and it simultaneously
+        // ties the level row and the E_sky row together, because L = albedo*E/pi is the only way
+        // those two can both be right. If the level says OUT and this says OK, the band is what is
+        // wrong, not the model. [[feedback_inequality_gate_hides_magnitude]] in the other direction.
+        const double cloudL   = (double)std::max(0.0f, g_skyCloudAlbedo) * (EtotW / SceneCal::kPi);
+        const double cloudCd  = cloudL * 683.0;
+        const double converge = (cloudCd > 1.0e-6) ? (zenLumCd / cloudCd) : 0.0;
+
+        const double EskyKlx = lumSky * 683.0 / 1000.0;
+        const bool okZenO = (zenLumCd >= 1000.0 && zenLumCd <= 2000.0);
+        const bool okFlat = (horOverZen >= 0.5 && horOverZen <= 2.0);
+        const bool okBeam = (sunKlx <= 5.0);
+        const bool okEsky = (EskyKlx >= 10.0 && EskyKlx <= 25.0);
+        const bool okConv = (converge >= 0.5 && converge <= 2.0);
+        const bool allO   = okZenO && okFlat && okBeam && okEsky && okConv && okRan && okBudget;
+
+        LOG::logline("%s [forge-atmos] gate OVERCAST %s @ row-0 air + FULL LID"
+                     " (cover 1.00, stratus, %.0f-%.0f m, tau %.1f, ssa %.4f, g %.2f, ext %.3e/m,"
+                     " deck x%.2f, %.0f deck steps, albedo %.2f, sun %.2fdeg, frame %u)",
+                     allO ? ">>" : "!!", allO ? "PASS" : "**MISSED**",
+                     (double)dk.baseM, (double)dk.topM, (double)dk.tau, (double)dk.ssa,
+                     (double)dk.g, (double)dk.ext, (double)g_atmosDeck, (double)g_atmosDeckSteps,
+                     SceneCal::kRefAlbedo, SceneCal::kRefElevation * 180.0 / SceneCal::kPi,
+                     g_atmosGateFrame);
+        LOG::logline("%s [forge-atmos] gate OVERCAST LEVEL: zenith (%.0f, %.0f, %.0f) cd/m2 luma %.0f"
+                     " [%s, band 1000-2000] | hor/zen %.2fx [%s, band 0.50-2.00 — a lid has no"
+                     " gradient; Clear reads 8.8x] | horizon (%.0f, %.0f, %.0f) luma %.0f",
+                     (okZenO && okFlat) ? ">>" : "!!",
+                     zenCd[0], zenCd[1], zenCd[2], zenLumCd, okZenO ? "OK" : "OUT",
+                     horOverZen, okFlat ? "OK" : "OUT",
+                     horCd[0], horCd[1], horCd[2], horLumCd);
+        LOG::logline("%s [forge-atmos] gate OVERCAST LIGHT: direct-normal %.2f klx [%s, <=5 — a real"
+                     " overcast transmits a few %%; Clear reads ~108] | E_sky %.2f klx [%s, band"
+                     " 10-25] | sun%% %.4f | q_zenith %.3f (a UNIFORM sky is 1.0, CIE overcast 1.28)"
+                     " | EV100 %.2f | ran=%u",
+                     (okBeam && okEsky) ? ">>" : "!!",
+                     sunKlx, okBeam ? "OK" : "OUT", EskyKlx, okEsky ? "OK" : "OUT",
+                     sunPct, q, ev100, g_atmosShLastRan);
+        // ⚠ THE CLAMP, READ RATHER THAN ASSUMED. 0.98 is where min(fms, 0.98) pins; at or above
+        // it the geometric sum is sitting ON its ceiling (F = 50) and the LEVEL row is a statement
+        // about that one line rather than about the cloud's optics.
+        const double msF    = (double)g_atmosShLast[kAtmosShMsF];
+        const bool   pinned = (msF >= 0.98);
+        LOG::logline("%s [forge-atmos] gate OVERCAST MS SERIES: f=%.5f at the deck (%.0f m) -> F=%.1f"
+                     " [%s]. Clear air runs f~0.05 and the clamp never fires; a conservative lid"
+                     " (ssa %.4f) drives f toward 1 and the sum sits on its ceiling. A pinned clamp"
+                     " and a working guard return the same finite LUT, which is why this is measured"
+                     " instead of assumed.",
+                     pinned ? "!!" : ">>", msF, (double)dk.baseM,
+                     1.0 / std::max(1.0e-3, 1.0 - std::min(msF, 0.98)),
+                     pinned ? "**PINNED — the 2-order isotropic sum is OUT OF ITS DOMAIN**"
+                            : "free, the guard is a guard",
+                     (double)dk.ssa);
+        LOG::logline("%s [forge-atmos] gate OVERCAST ENERGY: %.0f lx reaches the ground against"
+                     " %.0f lx arriving at the top -> %.1f%% [%s]. A real overcast at tau %.0f"
+                     " transmits ~%.0f%% (two-stream, 1/(1+0.75(1-g)tau) at g %.2f).",
+                     okBudget ? ">>" : "!!", EoutLx, EinLx, budget * 100.0,
+                     okBudget ? "OK" : "**IMPOSSIBLE — energy is being created**",
+                     (double)dk.tau,
+                     100.0 / (1.0 + 0.75 * (1.0 - (double)dk.g) * (double)dk.tau), (double)dk.g);
+        LOG::logline("%s [forge-atmos] gate OVERCAST CONVERGENCE: drawn zenith %.0f cd/m2 vs the"
+                     " painted layer's albedo*E_tot/pi = %.0f cd/m2 -> %.2fx [%s, band 0.50-2.00]."
+                     " Nobody tuned to this: under a lid the sky IS a diffuse source, so the two"
+                     " must meet — and it is also the only row that can say whether a LEVEL miss is"
+                     " the model or the band, because L = albedo*E/pi ties LEVEL to E_sky.",
+                     okConv ? ">>" : "!!", zenLumCd, cloudCd, converge, okConv ? "OK" : "OUT");
+        if (!allO) {
+            LOG::logline("!! [forge-atmos] ⚠ THE LEVER IS THE DECK's tau / ssa / g (atmosphere.h),"
+                         " NOT kSceneUnitCd and NOT E_TOA. And if the LEVEL row is the one that"
+                         " missed while CONVERGENCE passed, measure convergence against atmosMsDirs"
+                         " and atmosDeckSteps BEFORE touching anything: the multiscatter clamp"
+                         " (f = min(fms, 0.98), F <= 50) is the one place a conservative lid can"
+                         " saturate, and retuning that clamp is NOT the fix — see the warning at the"
+                         " top of atmos_multiscatter.comp.fsl. The MS SERIES row above says whether"
+                         " it is pinned.");
+        }
+        LOG::flush();
+    }
+
     // SUN shadow (forge-sun-shadows.md, Phase A / Step A1): render the DL-statics MSM moments map.
     // DL statics are the primary sun-caster proxy — host-resident, world-space, so they cast into the
     // near scene incl. from off-screen. A1 draws the SAME camera-culled statics set as dlLiveRecord
@@ -38701,8 +42029,11 @@ namespace ForgeRender {
         mirrorGeoVP[10] = mirrorGeoVP[11] - mirrorGeoVP[10];
         mirrorGeoVP[14] = mirrorGeoVP[15] - mirrorGeoVP[14];
         {
-            const float dx = -1.0f * (-1.0f / (float)g_live.width);
-            const float dy = -1.0f * ( 1.0f / (float)g_live.height);
+            // M1: same shared offset as the main view and the sky mirror — see projPixelOffset for
+            // why the reflection MUST track the jitter (water.frag samples this at the fragment's
+            // own jittered screen UV).
+            float dx, dy;
+            projPixelOffset(dx, dy);
             mirrorGeoVP[0]  += dx * mirrorGeoVP[3];  mirrorGeoVP[4]  += dx * mirrorGeoVP[7];
             mirrorGeoVP[8]  += dx * mirrorGeoVP[11]; mirrorGeoVP[12] += dx * mirrorGeoVP[15];
             mirrorGeoVP[1]  += dy * mirrorGeoVP[3];  mirrorGeoVP[5]  += dy * mirrorGeoVP[7];
@@ -39780,6 +43111,7 @@ namespace ForgeRender {
         if (g_live.pStbn)           { removeResource(g_live.pStbn); g_live.pStbn = nullptr; }
         if (g_live.pGtaoBatchSet)   { removeDescriptorSet(R, g_live.pGtaoBatchSet); }
         if (g_live.pLinearizeSet)   { removeDescriptorSet(R, g_live.pLinearizeSet); }
+        if (g_live.pMvSet)          { removeDescriptorSet(R, g_live.pMvSet); }
         if (g_live.pAOBlurPipeline) { removePipeline(R, g_live.pAOBlurPipeline); }
         for (uint32_t m = 0; m < kAOModeCount; ++m) {
             if (g_live.pAOPipeline[m]) { removePipeline(R, g_live.pAOPipeline[m]); }
@@ -39799,17 +43131,50 @@ namespace ForgeRender {
         if (g_live.pAplOut)         { removeResource(g_live.pAplOut);          g_live.pAplOut = nullptr; }
         if (g_live.pAplParamsCbv)   { removeResource(g_live.pAplParamsCbv);    g_live.pAplParamsCbv = nullptr; }
         // P2 Hosek cross-check — same set -> pipeline -> shader -> buffers order.
-        if (g_live.pHosekCheckSet)      { removeDescriptorSet(R, g_live.pHosekCheckSet); g_live.pHosekCheckSet = nullptr; }
-        if (g_live.pHosekCheckPipeline) { removePipeline(R, g_live.pHosekCheckPipeline); g_live.pHosekCheckPipeline = nullptr; }
-        if (g_live.pHosekCheckShader)   { removeShader(R, g_live.pHosekCheckShader);     g_live.pHosekCheckShader = nullptr; }
-        if (g_live.pHosekReadback)      { removeResource(g_live.pHosekReadback);         g_live.pHosekReadback = nullptr; }
-        if (g_live.pHosekOutBuf)        { removeResource(g_live.pHosekOutBuf);           g_live.pHosekOutBuf = nullptr; }
-        if (g_live.pHosekDirsBuf)       { removeResource(g_live.pHosekDirsBuf);          g_live.pHosekDirsBuf = nullptr; }
+        // S2: the ATMOSPHERE's LUT chain (this replaced the Hosek cross-check's teardown). The set
+        // goes before the resources bound into it, which is the order every other block here uses.
+        if (g_live.pAtmosSet)           { removeDescriptorSet(R, g_live.pAtmosSet);       g_live.pAtmosSet = nullptr; }
+        if (g_live.pAtmosViewPipeline)  { removePipeline(R, g_live.pAtmosViewPipeline);   g_live.pAtmosViewPipeline = nullptr; }
+        if (g_live.pMvViewPipeline)     { removePipeline(R, g_live.pMvViewPipeline);      g_live.pMvViewPipeline = nullptr; }
+        if (g_live.pMvPipeline)         { removePipeline(R, g_live.pMvPipeline);          g_live.pMvPipeline = nullptr; }
+        if (g_live.pAtmosViewShader)    { removeShader(R, g_live.pAtmosViewShader);       g_live.pAtmosViewShader = nullptr; }
+        if (g_live.pMvViewShader)       { removeShader(R, g_live.pMvViewShader);          g_live.pMvViewShader = nullptr; }
+        if (g_live.pMvShader)           { removeShader(R, g_live.pMvShader);              g_live.pMvShader = nullptr; }
+        if (g_live.pAtmosShPipeline)    { removePipeline(R, g_live.pAtmosShPipeline);     g_live.pAtmosShPipeline = nullptr; }
+        if (g_live.pAtmosSkyPipeline)   { removePipeline(R, g_live.pAtmosSkyPipeline);    g_live.pAtmosSkyPipeline = nullptr; }
+        if (g_live.pAtmosMsPipeline)    { removePipeline(R, g_live.pAtmosMsPipeline);     g_live.pAtmosMsPipeline = nullptr; }
+        if (g_live.pAtmosTransPipeline) { removePipeline(R, g_live.pAtmosTransPipeline);  g_live.pAtmosTransPipeline = nullptr; }
+        if (g_live.pAtmosShShader)      { removeShader(R, g_live.pAtmosShShader);         g_live.pAtmosShShader = nullptr; }
+        if (g_live.pAtmosSkyShader)     { removeShader(R, g_live.pAtmosSkyShader);        g_live.pAtmosSkyShader = nullptr; }
+        if (g_live.pAtmosMsShader)      { removeShader(R, g_live.pAtmosMsShader);         g_live.pAtmosMsShader = nullptr; }
+        if (g_live.pAtmosTransShader)   { removeShader(R, g_live.pAtmosTransShader);      g_live.pAtmosTransShader = nullptr; }
+        if (g_live.pAtmosShReadback)    { removeResource(g_live.pAtmosShReadback);        g_live.pAtmosShReadback = nullptr; }
+        if (g_live.pAtmosShOut)         { removeResource(g_live.pAtmosShOut);             g_live.pAtmosShOut = nullptr; }
+        if (g_live.pAtmosParamsCbv)     { removeResource(g_live.pAtmosParamsCbv);         g_live.pAtmosParamsCbv = nullptr; }
+        if (g_live.pAtmosSkyView)       { removeResource(g_live.pAtmosSkyView);           g_live.pAtmosSkyView = nullptr; }
+        if (g_live.pAtmosMultiScatter)  { removeResource(g_live.pAtmosMultiScatter);      g_live.pAtmosMultiScatter = nullptr; }
+        if (g_live.pAtmosTransmittance) { removeResource(g_live.pAtmosTransmittance);     g_live.pAtmosTransmittance = nullptr; }
+        g_live.atmosReady = false;
         // Custom MSAA resolve (step 4) — same set -> pipeline -> shader -> buffer order.
         if (g_live.pResolveSet)      { removeDescriptorSet(R, g_live.pResolveSet); g_live.pResolveSet = nullptr; }
         if (g_live.pResolvePipeline) { removePipeline(R, g_live.pResolvePipeline); g_live.pResolvePipeline = nullptr; }
         if (g_live.pResolveShader)   { removeShader(R, g_live.pResolveShader);     g_live.pResolveShader = nullptr; }
         if (g_live.pResolveParamsCbv){ removeResource(g_live.pResolveParamsCbv);   g_live.pResolveParamsCbv = nullptr; }
+        // M1 step 4b: the upscaler. TWO calls, and they are not the same thing — shutdown() releases
+        // the GPU resources through the renderer, destroyUpscaler() frees the object off the tf_
+        // allocator it was made on. Splitting them is what keeps `new`/`delete` (which IMemory.h
+        // poisons in this TU) out of the seam entirely.
+        //
+        // ⚠ LOAD FIRST, DESTROY SECOND does not apply here but its cousin does: the RESOLVE SET
+        // above references this backend's output texture, so it is torn down AFTER that set, which is
+        // the order this block already sits in ([[feedback_load_first_destroy_second]]).
+        if (g_live.pUpscaler) {
+            g_live.pUpscaler->shutdown(R);
+            destroyUpscaler(g_live.pUpscaler);
+            g_live.pUpscaler = nullptr;
+        }
+        g_upscaleName = nullptr;
+        g_lastUpscaleRan = false;
         // Bloom pyramid (step 4) — set -> pipelines -> shaders -> cbuffers -> texture, the same order.
         // The texture goes LAST because the descriptor set references it.
         if (g_live.pBloomSet)              { removeDescriptorSet(R, g_live.pBloomSet); g_live.pBloomSet = nullptr; }
@@ -39828,6 +43193,13 @@ namespace ForgeRender {
         if (g_live.pAOBlur)         { removeResource(g_live.pAOBlur); }
         if (g_live.pAO)             { removeResource(g_live.pAO); }
         if (g_live.pLinearDepth)    { removeResource(g_live.pLinearDepth); }
+        if (g_live.pMotionVectors)  { removeResource(g_live.pMotionVectors); }
+        if (g_live.pMvParamsCbv)    { removeResource(g_live.pMvParamsCbv); }
+        if (g_live.pMvStats)        { removeResource(g_live.pMvStats); }
+        if (g_live.pMvStatsReset)   { removeResource(g_live.pMvStatsReset); }
+        if (g_live.pMvStatsReadback){ removeResource(g_live.pMvStatsReadback); }
+        if (g_live.pMvPrevDepth)    { removeResource(g_live.pMvPrevDepth); }
+        if (g_live.pMvReactive)     { removeResource(g_live.pMvReactive); }
         // Clustered forward: froxel grids (distant + near). Must be freed here — the mask is sized
         // from the render resolution, so a re-init (resolution change) reallocates it; without this
         // teardown every resize leaked the old masks/params/pipelines (they were only null'd by the
@@ -39870,7 +43242,7 @@ namespace ForgeRender {
         if (g_live.pGrassCrushSplatShader)     { removeShader(R, g_live.pGrassCrushSplatShader); }
         if (g_live.pGrassCrushResolveShader)   { removeShader(R, g_live.pGrassCrushResolveShader); }
         if (g_live.pUVAnimBuf)            { removeResource(g_live.pUVAnimBuf); }
-        if (g_live.pMSAAColor)      { removeRenderTarget(R, g_live.pMSAAColor); }
+        if (g_live.pSceneColor)      { removeRenderTarget(R, g_live.pSceneColor); }
         if (g_live.pDepth)          { removeRenderTarget(R, g_live.pDepth); }
         if (g_live.pAuxFence)   { waitForFences(R, 1, &g_live.pAuxFence); exitFence(R, g_live.pAuxFence); }
         if (g_live.pAuxCmd)     { exitCmd(R, g_live.pAuxCmd); }
