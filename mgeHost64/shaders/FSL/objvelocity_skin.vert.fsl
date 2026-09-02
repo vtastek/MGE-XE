@@ -1,0 +1,94 @@
+// mgeHost64 — MB-1b OBJECT VELOCITY, SKINNED (vertex stage).
+//
+// The rigid half (objvelocity.vert) reads a world matrix out of a batch indexed by the draw. A
+// skinned part has no world matrix: its position is the top-4 weighted blend of BONE matrices, so
+// it needs a second vertex stage rather than a relaxed filter on the first. Everything downstream
+// is unchanged — this pairs with the SAME objvelocity.frag, emits the SAME CurClip/PrevClip pair,
+// and writes the SAME UAV under the SAME early depth test. Read objvelocity.srt.h for the overwrite
+// ordering, and objvelocity.vert.fsl for why BOTH clip positions are carried instead of reusing
+// SV_Position for the current one (the answer is a difference of two nearly-equal quantities whose
+// correct value is exactly zero, so both halves must come through identical arithmetic).
+//
+// ⚠⚠ THE FOUR SKINNING LINES BELOW ARE COPIED FROM skinned.vert.fsl:84-92 CHARACTER FOR CHARACTER,
+// AND THAT IS NOW LOAD-BEARING RATHER THAN TIDY. Before EARLY_FRAGMENT_TESTS the depth test ran
+// after the shader and rejected nothing this pass wrote, so a last-bit disagreement with the
+// prepass was invisible. It runs first now: GEQUAL absorbs a fragment that lands a hair NEARER than
+// the prepass wrote and REJECTS one that lands a hair farther, so reordering the sum, folding the
+// weights differently, or hoisting the palette fetches costs roughly half the actor's pixels to
+// holes — a speckled NPC whose gaps quietly fall back to the camera-only vector. Same four terms,
+// same order, same cbuffer packing, or the mover develops holes.
+//
+// The PREVIOUS half carries no such constraint: nothing depth-tests it. It is the one asymmetry
+// between the two blocks and it is deliberate.
+
+#include "objvelocity.srt.h"
+
+STRUCT(VSInput)
+{
+    // ⚠ IPC::SkinnedVertexWire, stride 52 — and this pass reads only three of its five fields.
+    // Normal (@12) and Uv (@44) are not declared: a motion vector needs a position and the bones
+    // that move it, and an attribute a shader does not read is one more thing that has to keep
+    // agreeing with a layout for no benefit.
+    DATA(float3, Position, POSITION);    // @0
+    DATA(float4, Weights,  TEXCOORD0);   // @24
+    DATA(uint4,  BoneIdx,  TEXCOORD1);   // @40  R8G8B8A8_UINT: .x = low byte, pairing with Weights.x
+    // Per-instance: this part's palette offset within BOTH bone windows. One lane, not two — see
+    // gObjVelBonesPrev in the SRT for why the previous palette needs no base of its own.
+    DATA(uint,   Base,     TEXCOORD2);
+};
+
+STRUCT(VSOutput)
+{
+    DATA(float4, Position, SV_Position);
+    // Byte-for-byte the signature objvelocity.frag declares. A frag reading an output its vert does
+    // not emit hangs the GPU ([[project_forge_shared_frag_vsoutput]]), so these two names, types and
+    // semantics are a contract with that file, not a local choice.
+    DATA(float4, PrevClip, TEXCOORD0);
+    DATA(float4, CurClip,  TEXCOORD1);
+};
+
+ROOT_SIGNATURE(DefaultRootSignature)
+VSOutput VS_MAIN( VSInput In )
+{
+    INIT_MAIN;
+    VSOutput Out;
+
+    float4 pos = float4(In.Position, 1.0f);
+
+    // ── THIS frame's pose. Reproduces skinned.vert exactly; see the header note. ──────────────
+    float4x4 b0 = gObjVelBonesCur.bones[In.Base + In.BoneIdx.x];
+    float4x4 b1 = gObjVelBonesCur.bones[In.Base + In.BoneIdx.y];
+    float4x4 b2 = gObjVelBonesCur.bones[In.Base + In.BoneIdx.z];
+    float4x4 b3 = gObjVelBonesCur.bones[In.Base + In.BoneIdx.w];
+
+    float4 worldPos = In.Weights.x * mul(b0, pos)
+                    + In.Weights.y * mul(b1, pos)
+                    + In.Weights.z * mul(b2, pos)
+                    + In.Weights.w * mul(b3, pos);
+
+    Out.Position = mul(gObjVelParams.viewProj, worldPos);
+    Out.CurClip  = Out.Position;   // the SAME value — see the VSOutput note in objvelocity.vert.fsl
+
+    // ── LAST frame's pose, seen by LAST frame's camera. ───────────────────────────────────────
+    // The host rebased every one of these matrices by -dBake at upload, so both palettes live in
+    // THIS frame's camera-relative space and the only difference between them is how the skeleton
+    // moved — which, for a walking NPC, is the whole of what MB-1a could not draw.
+    //
+    // ⚠ THE SAME `Base`. The previous palette is packed at the same offset as the current one by
+    // construction (the host writes both windows from one cursor in one walk); WHERE last frame's
+    // palette actually sat is a host-side question, answered by HostMesh::prevBoneBase before these
+    // bytes are written.
+    float4x4 p0 = gObjVelBonesPrev.bones[In.Base + In.BoneIdx.x];
+    float4x4 p1 = gObjVelBonesPrev.bones[In.Base + In.BoneIdx.y];
+    float4x4 p2 = gObjVelBonesPrev.bones[In.Base + In.BoneIdx.z];
+    float4x4 p3 = gObjVelBonesPrev.bones[In.Base + In.BoneIdx.w];
+
+    float4 prevWorldPos = In.Weights.x * mul(p0, pos)
+                        + In.Weights.y * mul(p1, pos)
+                        + In.Weights.z * mul(p2, pos)
+                        + In.Weights.w * mul(p3, pos);
+
+    Out.PrevClip = mul(gObjVelParams.prevViewProjRel, prevWorldPos);
+
+    RETURN(Out);
+}

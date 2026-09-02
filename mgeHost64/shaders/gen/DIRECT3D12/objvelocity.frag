@@ -972,687 +972,134 @@ SamplerState gSampler2xWrapClamp : register( s17 , space100 ) ;
 #line 247 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/../../../3rdparty/The-Forge/Common_3/Graphics/FSL/defaults.h"
 
 #line 11 "FSL/shaders.list"
-#line 368 "FSL/shaders.list"
-#line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/mvview.frag.fsl"
-#line 40 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/mvview.frag.fsl"
-#line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
-#line 20 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
-#line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
-#line 26 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
-STRUCT(ShadowMaskParams)
-{
-    float4x4 invViewProj;
-
-
-
-
-
-
-    float4 screenParams;
-    float4 maskParams;
-    float4 slotPosRad[ 32 ];
-    float4 slotTile[ 32 ];
-
-
-
-
-    float4 biasParams;
-
-
-
-    uint4 slotBits;
-
-
-    float4 slotFlick[ 32 ];
-
-
-
-
-
-
-
-
-
-
-    float4x4 sunViewProj[ 2 ];
-#line 75 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
-    float4 sunParams;
-
-
-    float4 sunCascadeTexel;
-#line 94 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
-    float4 sunPcf0;
-
-
-
-
-
-
-    float4 sunPcf1;
-
-
-
-
-
-
-
-    float4 volFog0;
-
-
-
-
-
-
-    float4 volFog1;
-
-
-
-
-    float4 volFog2;
-
-
-
-
-
-
-    float4 volFog3;
-#line 151 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
-    float4 volFog4;
-
-
-
-
-
-
-
-    float4 screenAlloc;
-#line 171 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
-    float4 shAr;
-    float4 shAg;
-    float4 shAb;
-#line 186 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
-    float4 skyParams;
-
-
-
-
-
-
-
-
-
-
-    float4 skyAOMap;
-#line 219 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
-    float4 sunOcc;
-#line 235 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
-    float4 skyAO2;
-#line 284 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
-    float4 toneParams;
-#line 298 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
-    float4 waterFogCol;
-#line 317 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
-    float4 waterFogPlane;
-#line 334 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
-    float4 waterFogLight;
-#line 351 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
-    float4 waterFogExt;
-
-
-
-
-
-
-
-
-    float4 waterFogScatter;
-
-    float4 waterFogPhase;
-
-
-
-
-
-
-
-
-
-    float4 waterFogPhase2;
-
-
-
-
-
-    float4 waterFogKd;
-#line 415 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
-    float4 calParams;
-#line 434 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
-    float4 agxCurve;
-    float4 agxCurveScale;
-    float4 agxLookParams;
-
-
-
-
-
-
-
-
-    float4 waterFogSun;
-#line 461 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
-    float4 waterDistort;
-#line 475 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
-    float4 waterCaustic;
-#line 514 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
-    float4 waterCaustic2;
-#line 531 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
-    float4 waterCausticRip;
-    float4 waterCausticWake;
-#line 552 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
-    float4 waterCausticDyn;
-#line 573 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
-    float4 waterCaustic3;
-#line 586 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
-    float4 waterCut;
-#line 617 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
-    float4 waterCausticProj;
-#line 635 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
-    float4 grassParams;
-#line 651 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
-    float4 grassParams2;
-#line 664 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
-    float4 grassParams3;
-#line 679 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
-    float4 grassParams4;
-#line 695 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
-    float4 grassParams5;
-
-
-
-
-
-
-
-
-
-
-    float4 grassParams6;
-
-
-
-
-
-
-
-
-
-
-    float4 grassParams7;
-#line 732 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
-    float4 grassParams8;
-#line 733
-};
-#line 21 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
-#line 27 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
-#line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyview.h.fsl"
-#line 35 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyview.h.fsl"
-STRUCT(SkyViewData)
+#line 739 "FSL/shaders.list"
+#line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/objvelocity.frag.fsl"
+#line 12 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/objvelocity.frag.fsl"
+#line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/objvelocity.srt.h"
+#line 35 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/objvelocity.srt.h"
+STRUCT(ObjVelParams)
 {
 
 
 
-    float4x4 invViewProj;
-#line 53 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyview.h.fsl"
-    float4 radiance;
 
-
-
-
-
-
-
-
-
-
-    float4 sunDirW;
-
-
-
-
-    float4 params;
-#line 84 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyview.h.fsl"
-    float4 sunDisc;
-#line 106 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyview.h.fsl"
-    float4 elemRadiance;
-#line 107
-};
-#line 28 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
-#line 35 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
-#line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/atmosparams.h.fsl"
-#line 16 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/atmosparams.h.fsl"
-STRUCT(AtmosphereParams)
-{
-    float4 rayleigh;
-    float4 mieSca;
-    float4 mieExt;
-    float4 ozone;
-    float4 profGeom;
-
-
-    float4 planet;
-    float4 sunDir;
-    float4 solar;
-    float4 moonDir;
-    float4 nightP;
-    float4 marchP;
-
-    float4 lutDims;
-    float4 lutDims2;
-
-
-
-
-
-
-
-
-
-
-    float4 cloud;
-
-#line 46
-};
-#line 36 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
-#line 73 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
-STRUCT(FrameData)
-{
     float4x4 viewProj;
 
 
 
-    float4 sunDir;
-    float4 sunCol;
-    float4 ambCol;
-    float4 fogColNear;
-    float4 fogParams;
-    float4 eyePos;
-
-
-    float4 debugParams;
 
 
 
-    float4 dbgScales;
+    float4x4 prevViewProjRel;
+    float4 screenParams;
 
 
 
-
-
-
-
-
-    float4 lodParams;
-
-    float4 lodSunAmb;
-
-
-
-
-    float4 lodEye;
-
-
-
-
-    float4 skyParams;
-
-
-
-
-
-
-    float4 gReflWaterClip;
-
-
-
-
-    float4 skyZenith;
-
-
-
-    float4 atlasDbg;
-
-
-
-    float4 alphaParams;
-#line 144 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
-    float4 timeParams;
-
-
-
-
-
-
-    float4 uvOffsets[8];
-
-
-
-
-
-
-    float4 froxelDims;
-#line 180 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
-    float4 froxelZ;
-#line 194 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
-    float4 alphaShadowParams;
-#line 195
+    float4 opts;
+#line 54
 };
 
-STRUCT(BatchData)
+STRUCT(ObjVelBatch)
 {
-    float4x4 worlds[ 1024 ];
-#line 200
+
+
+
+
+
+
+    float4x4 worlds[ 256 ];
+
+
+
+    float4x4 prevWorlds[ 256 ];
+#line 69
 };
-#line 221 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
-STRUCT(LightData)
+#line 94 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/objvelocity.srt.h"
+STRUCT(ObjVelBones)
 {
-    float4 lightParams;
-    float4 lights[ 128  * 3];
 
 
 
 
 
-
-
-
-
-    float4 froxelDimsNear;
-    float4 froxelZNear;
-#line 236
+    float4x4 bones[ 1024 ];
+#line 102
 };
 
-        CBUFFER(FrameData) gFrameData :  register(b0,space1);
+        CBUFFER(ObjVelParams) gObjVelParams :  register(b0,space3);
+        CBUFFER(ObjVelBatch) gObjVelBatch :  register(b1,space3);
 
 
 
+        WTex2D(float2) gObjVelOut :  register(u2,space3);
 
 
-        Tex2D(float4) gAO :  register(t1,space1);
-#line 272 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
-        Tex2DArray(float4) gWaterNormalVol :  register(t2,space1);
-        Tex2D(float4) gRefractColor :  register(t3,space1);
-        Tex2D(float4) gSceneLinDepth :  register(t4,space1);
-        Tex2D(float4) gReflectColor :  register(t5,space1);
 
 
 
 
+        RWBuffer(uint) gObjVelFrags :  register(u3,space3);
 
 
-        Tex2D(uint4) gShadowMask :  register(t6,space1);
 
 
 
 
-        Tex2D(float) gShadowAtlas :  register(t7,space1);
-        Tex2D(float) gShadowAtlasDyn :  register(t8,space1);
 
 
 
+        CBUFFER(ObjVelBones) gObjVelBonesCur :  register(b4,space3);
+#line 145 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/objvelocity.srt.h"
+        CBUFFER(ObjVelBones) gObjVelBonesPrev :  register(b5,space3);
+#line 13 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/objvelocity.frag.fsl"
 
-        Tex2D(float4) gSunMoments :  register(t9,space1);
-
-
-
-
-
-        Tex2D(float) gSunDepth :  register(t10,space1);
-
-
-
-
-
-        Buffer(uint) gFroxelMask :  register(t11,space1);
-
-
-
-
-
-
-
-        Buffer(uint) gFroxelMaskNear :  register(t12,space1);
-
-
-
-
-
-
-        Buffer(float4) gUVAnim :  register(t13,space1);
-
-
-
-
-
-
-
-
-        CBUFFER(ShadowMaskParams) gShadowParams :  register(b14,space1);
-
-
-
-
-
-
-
-
-        Buffer(uint4) gAlphaStages :  register(t15,space1);
-
-
-
-
-
-
-
-
-
-        Buffer(uint) gTerrainHeights :  register(t16,space1);
-        Buffer(uint) gTerrainColor :  register(t17,space1);
-
-
-
-
-
-
-
-
-
-        Buffer(uint) gTerrainTex :  register(t18,space1);
-        Buffer(uint) gTerrainCellGrid :  register(t19,space1);
-
-
-
-
-
-        Tex2DArray(float4) gTerrainArrays[ 32 ] :  register(t20,space1);
-
-
-
-
-
-
-
-
-
-
-        Tex2D(float) gSkyHeight :  register(t52,space1);
-
-
-
-
-
-
-
-        Tex2D(float) gSunOcc :  register(t53,space1);
-#line 404 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
-        Tex2D(float4) gSkyColor :  register(t54,space1);
-#line 417 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
-        Tex2D(float4) gReflectMips :  register(t55,space1);
-#line 440 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
-        Tex2DArray(float) gWaterSlopeVar :  register(t56,space1);
-#line 457 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
-        Tex2D(float) gReflectDepth :  register(t57,space1);
-
-
-
-
-
-
-
-
-
-        Tex2D(float4) gRippleField :  register(t58,space1);
-
-
-
-
-
-
-        Tex2D(float4) gWakeField :  register(t59,space1);
-#line 497 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
-        Tex2D(float4) gPortalGate :  register(t60,space1);
-#line 518 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
-        Tex2DArray(float) gCausticField :  register(t61,space1);
-#line 532 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
-        Tex2D(float4) gGrassCrush :  register(t62,space1);
-#line 545 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
-        Tex2D(float4) gAtmosSkyView :  register(t63,space1);
-
-
-
-
-
-        Tex2D(float4) gAtmosTransmittance :  register(t64,space1);
-
-
-
-
-
-
-        CBUFFER(AtmosphereParams) gAtmosParams :  register(b65,space1);
-#line 577 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
-        Tex2D(float2) gMotionVectors :  register(t66,space1);
-
-
-
-
-
-        Tex2D(float) gReactiveMask :  register(t67,space1);
-
-
-
-
-        CBUFFER(LightData) gLights :  register(b0,space3);
-
-
-
-
-
-
-
-
-
-
-        CBUFFER(LightData) gLightsNear :  register(b1,space3);
-#line 614 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
-        Tex2D(float4) gTextures[ 880 ] :  register(t0,space0);
-
-
-
-        Tex2DArray(float4) gStaticsArrays[ 128 ] :  register(t880,space0);
-
-
-
-        Tex2DArray(float4) gFlipArrays[ 16 ] :  register(t1008,space0);
-        CBUFFER(BatchData) gBatch :  register(b0,space2);
-#line 638 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
-        CBUFFER(SkyViewData) gSkyView :  register(b1,space2);
-#line 41 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/mvview.frag.fsl"
-
-STRUCT(VSOutput)
+STRUCT(PSInput)
 {
     DATA(float4, Position, SV_Position);
-    DATA(float2, Uv, TEXCOORD0);
-#line 46
+    DATA(float4, PrevClip, TEXCOORD0);
+    DATA(float4, CurClip, TEXCOORD1);
+#line 19
 };
-
-
-
-float3 mvHue(float h)
-{
-    float3 k = frac(f3(h) + float3(1.0f, 2.0f / 3.0f, 1.0f / 3.0f));
-    return saturate(abs(k * 6.0f - f3(3.0f)) - f3(1.0f));
-}
-
+#line 41 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/objvelocity.frag.fsl"
+EARLY_FRAGMENT_TESTS
 [RootSignature( "RootFlags(ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT)," "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "3" ", offset = 0)," "CBV(b0, numDescriptors = unbounded, space = " "3" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "3" ", offset = 0))," "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "2" ", offset = 0)," "CBV(b0, numDescriptors = unbounded, space = " "2" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "2" ", offset = 0))," "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "1" ", offset = 0)," "CBV(b0, numDescriptors = unbounded, space = " "1" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "1" ", offset = 0))," "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "0" ", offset = 0)," "CBV(b0, numDescriptors = unbounded, space = " "0" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "0" ", offset = 0))," "DescriptorTable(" "SAMPLER(s0, numDescriptors = unbounded, space = " "0" ", offset = 0))," "StaticSampler(s0, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s1, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s2, space = 100," "filter = FILTER_MIN_MAG_LINEAR_MIP_POINT," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s3, space = 100," "filter = FILTER_MIN_MAG_LINEAR_MIP_POINT," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s4, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s5, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s6, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT," "addressU = TEXTURE_ADDRESS_MIRROR, addressV = TEXTURE_ADDRESS_MIRROR, addressW = TEXTURE_ADDRESS_MIRROR)," "StaticSampler(s7, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT, borderColor = STATIC_BORDER_COLOR_TRANSPARENT_BLACK," "addressU = TEXTURE_ADDRESS_BORDER, addressV = TEXTURE_ADDRESS_BORDER, addressW = TEXTURE_ADDRESS_BORDER)," "StaticSampler(s8, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR," "addressU = TEXTURE_ADDRESS_MIRROR, addressV = TEXTURE_ADDRESS_MIRROR, addressW = TEXTURE_ADDRESS_MIRROR)," "StaticSampler(s9, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR, borderColor = STATIC_BORDER_COLOR_TRANSPARENT_BLACK," "addressU = TEXTURE_ADDRESS_BORDER, addressV = TEXTURE_ADDRESS_BORDER, addressW = TEXTURE_ADDRESS_BORDER)," "StaticSampler(s10, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 8," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s11, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 8," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s12, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 8," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s13, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 8," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s14, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 2," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s15, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 2," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s16, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 2," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s17, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 2," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_WRAP)" )]
-float4 PS_MAIN( VSOutput In ): SV_TARGET
+void PS_MAIN( PSInput In )
 {
-    //INIT_MAIN;
-    float2 uv = saturate(In.Uv);
+    INIT_MAIN;
+
+    float2 dims = gObjVelParams.screenParams.xy;
+    int2 px = int2(In.Position.xy);
+
+    float2 mv = float2(0.0f, 0.0f);
 
 
 
 
 
-
-    float2 frac_ = gShadowParams.screenParams.xy * gShadowParams.screenAlloc.zw;
-#line 79 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/mvview.frag.fsl"
-    if (gFrameData.debugParams.x > 17.5f)
-    {
-        float r = SampleLvlTex2D(gReactiveMask, gSamplerPointClamp, uv * frac_, 0).r;
-        float3 rv = f3(r);
-
-
-        float2 rd = min(uv, f2(1.0f) - uv);
-        if (min(rd.x, rd.y) < 0.002f) { rv = float3(0.9f, 0.5f, 0.1f); }
-        return (float4(rv, 1.0f));
-    }
-
-    float2 mv = SampleLvlTex2D(gMotionVectors, gSamplerPointClamp, uv * frac_, 0).xy;
-
-    float m = length(mv);
-    float3 v;
-#line 118 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/mvview.frag.fsl"
-    if (m < 0.01f)
+    if (gObjVelParams.opts.x > 0.5f && In.PrevClip.w > 1.0e-6f && In.CurClip.w > 1.0e-6f)
     {
 
 
 
 
-        v = f3(0.5f);
-    }
-    else
-    {
+        float2 pndc = In.PrevClip.xy / In.PrevClip.w;
+        float2 cndc = In.CurClip.xy / In.CurClip.w;
+        float2 puv = float2(pndc.x * 0.5f + 0.5f, 0.5f - pndc.y * 0.5f);
+        float2 cuv = float2(cndc.x * 0.5f + 0.5f, 0.5f - cndc.y * 0.5f);
 
-
-
-
-        const float scale = 32.0f;
-        float t = log2(1.0f + m) / log2(1.0f + scale);
-
-
-        float h = atan2(mv.y, mv.x) * (0.5f / 3.14159265f) + 0.5f;
-
-
-
-        v = mvHue(h) * saturate(t) * 0.9f + f3(0.10f);
+        mv = (puv - cuv) * dims;
     }
 
 
 
 
-    float2 d = min(uv, f2(1.0f) - uv);
-    if (min(d.x, d.y) < 0.002f) { v = float3(0.9f, 0.5f, 0.1f); }
 
-    return (float4(v, 1.0f));
+
+    Write2D(gObjVelOut, px, mv);
+
+    uint prevCount;
+    AtomicAdd(gObjVelFrags[0], 1u, prevCount);
+
+    return;
 }
-#line 369 "FSL/shaders.list"
+#line 740 "FSL/shaders.list"

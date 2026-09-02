@@ -722,3 +722,39 @@
 #comp grasscrushresolve.comp
 #include "grasscrushresolve.comp.fsl"
 #end
+
+// MB-1 OBJECT VELOCITY (tasks/forge-postprocess.md — motion blur). A mover-only redraw that
+// OVERWRITES the camera-only field in pMotionVectors for the one population depth reprojection
+// cannot describe: things that moved under their own power. Graphics, not compute, because it needs
+// the rasterizer and the depth test — so it does NOT hot-reload; kill mgeHost64 to pick up an edit.
+//
+// ⚠ No SAMPLE_COUNT split and none is needed: it binds NO colour target (mRenderTargetCount = 0) and
+// writes its result through a UAV, so the scene's sample count never reaches this pipeline. The
+// depth format does, and that is D32_SFLOAT in every arm.
+#vert objvelocity.vert
+#include "objvelocity.vert.fsl"
+#end
+
+#frag objvelocity.frag
+#include "objvelocity.frag.fsl"
+#end
+
+// MB-1b: the SKINNED half of the same pass. A second VERT, not a variant of the first — a skinned
+// part's position comes from a bone palette, not a world matrix — pairing with the SAME
+// objvelocity.frag above, which reads only CurClip/PrevClip and already carries
+// EARLY_FRAGMENT_TESTS. Graphics, so it does NOT hot-reload; kill mgeHost64 to pick up an edit.
+#vert objvelocity_skin.vert
+#include "objvelocity_skin.vert.fsl"
+#end
+
+// ...and the statistics of the FINISHED field, measured AFTER the object-velocity overwrite. The
+// producing shader's own gMvStats describe an intermediate that no longer exists once a second
+// writer lands on the same texture; this one describes what F12 mode 17 actually draws. Its headline
+// counter is `nonzero` (m != 0 EXACTLY) — which STARTED as mvview.frag's grey-branch predicate and
+// is now deliberately stricter than it (the view moved to a 0.01 px tolerance because the exact test
+// was unreachable in this engine). Kept exact because it is the only readout that can prove the
+// parked-camera lane reaches the GPU: 0.000% on a bit-identical frame. It also carries that frame's
+// parked flag back out in slot [6], so the percentage and its precondition describe ONE frame.
+#comp mvfieldstats.comp
+#include "mvfieldstats.comp.fsl"
+#end

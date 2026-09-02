@@ -1,0 +1,68 @@
+// mgeHost64 — STATISTICS OF THE FINISHED MOTION-VECTOR FIELD (compute).
+//
+// Read mvfieldstats.srt.h first: why this exists as a separate pass, and why the headline counter is
+// `nonzero` rather than the tolerance-based `still` the producing shader already carries.
+
+#include "mvfieldstats.srt.h"
+
+#ifndef AtomicMin
+#define AtomicMin(DEST, VALUE, ORIGINAL_VALUE) InterlockedMin(DEST, VALUE, ORIGINAL_VALUE)
+#endif
+#ifndef AtomicMax
+#define AtomicMax(DEST, VALUE, ORIGINAL_VALUE) InterlockedMax(DEST, VALUE, ORIGINAL_VALUE)
+#endif
+
+ROOT_SIGNATURE(ComputeRootSignature)
+NUM_THREADS(8, 8, 1)
+void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
+{
+    INIT_MAIN;
+    int2   px   = int2(DispatchThreadID.xy);
+    float2 dims = gMvFsParams.screenParams.xy;
+
+    // Bounds-checked for motionvectors.comp's reason, verbatim: the targets are ALLOC-sized while
+    // the dispatch covers the RENDER rect rounded up to a group, so the tail threads are in-bounds
+    // for the resource and OUTSIDE the frame. Counting them would fold never-written border texels
+    // into a percentage that is supposed to describe the picture.
+    // ⚠ RETURN() ON ITS OWN LINE — fsl.py rewrites it as a STATEMENT and does not see one buried in
+    // a braced one-liner.
+    if (px.x >= int(dims.x) || px.y >= int(dims.y))
+    {
+        RETURN();
+    }
+
+    // The parked flag, echoed out so the readback carries its own interpretation (mvfieldstats.srt.h
+    // says why it cannot be read beside the percentage instead). One thread, a plain store, no
+    // atomic — every other thread that could reach this line would write the same value.
+    if (px.x == 0 && px.y == 0)
+    {
+        gMvFsOut[6] = (gMvFsParams.screenParams.z > 0.5f) ? 1u : 0u;
+    }
+
+    float2 mv  = LoadTex2D(gMvFsField, NO_SAMPLER, px, 0).xy;
+    float  rea = LoadTex2D(gMvFsReactive, NO_SAMPLER, px, 0).r;
+    float  m   = length(mv);
+    uint   mu  = asuint(m);
+    uint   prev;
+
+    AtomicMax(gMvFsOut[0], mu, prev);
+    AtomicMin(gMvFsOut[1], mu, prev);
+    if (m < 0.01f)  { AtomicAdd(gMvFsOut[2], 1u, prev); }
+    AtomicAdd(gMvFsOut[3], 1u, prev);
+    if (rea > 0.5f) { AtomicAdd(gMvFsOut[4], 1u, prev); }
+
+    // ⚠ THE STRICT ONE, AND IT NO LONGER MATCHES THE PICTURE — IT OUTLIVED IT ON PURPOSE.
+    // `!= 0.0f` and not `> epsilon`. This counter was added when mvview.frag's grey branch was
+    // `m == 0.0f` exactly, so the two were one predicate; the view has since moved to `m < 0.01f`
+    // (the exact test proved unreachable — MW's camera matrix is not bit-stable standing still), and
+    // `still(<0.01px)` above is the one that matches what mode 17 draws now.
+    //
+    // This one stays BECAUSE it is stricter than any picture. It is the only readout that can answer
+    // "did the parked short circuit actually reach the GPU", which a tolerance-based counter cannot:
+    // ~1e-3 px of reconstruction round-off is `still` by that test and NON-ZERO by this one. On a
+    // frame `mv camera:` calls `parked(bit-identical)=1` this must read **0.000%** — that is the
+    // acceptance test for MB-2 step 0's dead-store fix, and reading the source instead of this
+    // number is how the dead store survived three weeks.
+    if (m != 0.0f)  { AtomicAdd(gMvFsOut[5], 1u, prev); }
+    RETURN();
+}

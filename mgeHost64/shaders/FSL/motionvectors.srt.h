@@ -117,7 +117,17 @@ STRUCT(MvParams)
     // reset, a resolution change, a teleport). Zero vectors are the honest answer there: an
     // accumulator told "nothing moved" reuses history it should not, but an accumulator handed a
     // garbage vector fetches from an arbitrary place, and only one of those degrades gracefully.
-    // y, z, w reserved.
+    //
+    // y = THE CAMERA IS PARKED, tested BIT-IDENTICALLY. **NOT reserved** — this comment said it was
+    // long after the lane was in use, which is drift that costs a diagnosis: the shader reads it
+    // (motionvectors.comp.fsl carries the argument for why exact equality is the only test that
+    // justifies the conclusion) and the host writes it from a 16-float compare against last frame's
+    // matrix. ⚠ For three weeks the host then CLEARED it one statement later as part of a
+    // reserved-lane sweep, so this lane was 0 in every shipped frame while the heartbeat reported
+    // it set. Fixed in MB-2 step 0; the counter that proves it is `mv final: nonzero%` going to
+    // 0.000% on a frame the log calls parked.
+    //
+    // z, w reserved.
     DATA(float4, opts, None);
 };
 

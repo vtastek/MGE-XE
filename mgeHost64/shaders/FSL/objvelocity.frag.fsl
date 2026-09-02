@@ -1,0 +1,81 @@
+// mgeHost64 — MB-1 OBJECT VELOCITY (fragment stage).
+//
+// Writes pMotionVectors for the pixels a MOVING object owns, overwriting what the camera-only
+// reprojection put there. Read objvelocity.srt.h for the ordering contract and objvelocity.vert.fsl
+// for why only the previous clip position is interpolated.
+//
+// UNITS: identical to motionvectors.comp — RENDER-rect PIXELS, previous minus current, +x right,
+// +y down. Not "similar to": the two producers fill the SAME texture, and a convention that differs
+// between them would put moving objects in a different sign or scale from the world behind them,
+// which reads as a blur that trails the wrong way rather than as an error.
+
+#include "objvelocity.srt.h"
+
+STRUCT(PSInput)
+{
+    DATA(float4, Position, SV_Position);
+    DATA(float4, PrevClip, TEXCOORD0);
+    DATA(float4, CurClip,  TEXCOORD1);
+};
+
+// ⚠⚠⚠ THIS ATTRIBUTE IS THE WHOLE PASS. WITHOUT IT THE DEPTH TEST DOES NOTHING HERE.
+//
+// A pixel shader that writes a UAV has SIDE EFFECTS, so D3D12 moves the depth test AFTER the shader
+// (late-Z) unless told otherwise. The test then discards the fragment's render-target output — of
+// which this pass has none — while the `Write2D` below has ALREADY HAPPENED. Every occluded triangle
+// therefore wrote its velocity over whatever was in front of it, and the last draw at a pixel won.
+//
+// It presents as depth ordering being ignored, which is what it is, but NOT as a depth-state bug:
+// the state is correct, the DSV is bound, `DepthEnable` is TRUE. Proven by setting the compare
+// function to CMP_NEVER, where nothing at all may pass — 845,138 fragments still wrote. That is the
+// measurement which separates "the comparison rejects nothing" from "the comparison happens too
+// late", and no A/B between comparison functions could have done it, because every one of them runs
+// after the write.
+//
+// Reported from play as "the bed renders over the NPC", "their left arm is cut by the bed" and
+// "their torso is missing" — three descriptions of one late test.
+//
+// EARLY_FRAGMENT_TESTS forces the test back in front of the shader, so an occluded fragment never
+// executes and never writes. The cost is the shader's ability to affect depth, which this pass does
+// not want: mDepthWrite is false and there is no SV_Depth.
+EARLY_FRAGMENT_TESTS
+ROOT_SIGNATURE(DefaultRootSignature)
+void PS_MAIN( PSInput In )
+{
+    INIT_MAIN;
+
+    float2 dims = gObjVelParams.screenParams.xy;
+    int2   px   = int2(In.Position.xy);
+
+    float2 mv = float2(0.0f, 0.0f);
+
+    // opts.x == 0 is the first frame, a camera cut or a teleport: there is no previous camera to
+    // reproject through, and zero — "did not move" — is the answer that leaves the accumulator
+    // reusing history here rather than fetching from an arbitrary pixel. Same choice, same reason,
+    // as the w <= 0 branch in motionvectors.comp.
+    if (gObjVelParams.opts.x > 0.5f && In.PrevClip.w > 1.0e-6f && In.CurClip.w > 1.0e-6f)
+    {
+        // ⚠ BOTH SIDES THROUGH IDENTICAL ARITHMETIC. Not SV_Position for the current half — see the
+        // VSOutput note in objvelocity.vert.fsl. The answer here is exactly zero whenever nothing
+        // moved, and a difference of two nearly-equal numbers derived two different ways reports the
+        // gap between the derivations instead of the motion.
+        float2 pndc = In.PrevClip.xy / In.PrevClip.w;
+        float2 cndc = In.CurClip.xy  / In.CurClip.w;
+        float2 puv  = float2(pndc.x * 0.5f + 0.5f, 0.5f - pndc.y * 0.5f);
+        float2 cuv  = float2(cndc.x * 0.5f + 0.5f, 0.5f - cndc.y * 0.5f);
+        // previous - current, in RENDER-rect pixels — motionvectors.comp's exact convention.
+        mv = (puv - cuv) * dims;
+    }
+
+    // ⚠ NO EARLY-OUT ON A SMALL VECTOR, and that is deliberate. A mover that happens to be still
+    // this frame must still overwrite the camera field with ITS answer — which for a stationary
+    // object under a moving camera is NOT zero, and for a moving object under a still camera IS the
+    // thing we came for. Skipping the write would leave the reprojected value standing, and the
+    // reprojected value is right for exactly the pixels this pass is not for.
+    Write2D(gObjVelOut, px, mv);
+    // Survived the depth test and wrote. See gObjVelFrags in the SRT for what this is for.
+    uint prevCount;
+    AtomicAdd(gObjVelFrags[0], 1u, prevCount);
+
+    RETURN();
+}

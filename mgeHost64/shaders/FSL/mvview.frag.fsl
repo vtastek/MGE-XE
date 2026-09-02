@@ -91,11 +91,31 @@ float4 PS_MAIN( VSOutput In )
 
     float  m = length(mv);
     float3 v;
-    // EXACT zero gets its own flat grey. The `== 0` is deliberate and is not a tolerance: the claim
-    // under test is that a still camera produces EXACTLY zero, and a tolerance here would hide the
-    // very small non-zero DC offset that a residual origin error produces. If the world reads grey
-    // when you stop, the origin folding is right.
-    if (m == 0.0f)
+    // ⚠⚠ THIS WAS `m == 0.0f` AND THE EXACT TEST WAS UNREACHABLE — measured, not assumed.
+    //
+    // The original claim was "a still camera produces EXACTLY zero, and a tolerance here would hide
+    // a small DC offset". The first half is false in this engine, for two independent reasons that
+    // were separated by instrumenting them:
+    //   * MW's camera matrix is NEVER bit-stable when the player stands still. Three consecutive
+    //     parked frames measured worst matrix deltas of 4.3e-4, 2.9e-11 and 1.5e-3 — so most frames
+    //     the camera really did move a hair, and a small vector is the CORRECT answer, not an error.
+    //   * On the frame where the matrix was stable to 2.9e-11, the field still read max 0.0020 px.
+    //     That part IS round-off: reconstruct-with-invViewProj then reproject is the identity on
+    //     paper and not in float32.
+    // Together they left 99.98% of a parked frame non-zero, so the exact branch essentially never
+    // ran and the view showed a speckled field for a scene that was, to every consumer, still.
+    // Reported from play as "pixel artifacts ... concentrated at a cross shape in the middle".
+    //
+    // ⚠ THE DC-OFFSET DIAGNOSTIC DID NOT GO AWAY — IT MOVED SOMEWHERE STRICTER. `mv final:` reports
+    // `nonzero%` and `max` over the finished field, and `mv camera:` reports whether the two camera
+    // matrices were bit-identical and by how much they differed. Those answer the exact question
+    // exactly, in numbers, which a picture never could: a uniform DC offset and a moving field look
+    // identical on screen, which is the whole reason those counters exist.
+    //
+    // So the grey branch now means what the eye needs it to mean — BELOW WHAT ANY CONSUMER CAN ACT
+    // ON — and it deliberately uses the SAME 0.01 px as the `still` counter, so "the screen is grey"
+    // and "still = 100%" are the same statement rather than two that can disagree.
+    if (m < 0.01f)
     {
         // Mid grey, and 0.5 is the literal 8-bit code because this pass writes straight into pRT
         // AFTER the resolve — no exposure, no curve, no encode is applied downstream. (The first

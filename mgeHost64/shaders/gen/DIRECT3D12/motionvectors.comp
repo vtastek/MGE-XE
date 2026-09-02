@@ -1003,20 +1003,16 @@ STRUCT(MvParams)
 
 
     float4 allocParams;
-
-
-
-
-
+#line 131 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/motionvectors.srt.h"
     float4 opts;
-#line 122
+#line 132
 };
 
         CBUFFER(MvParams) gMvParams :  register(b0,space0);
 
         Tex2D(float) gMvDepth :  register(t1,space0);
         WTex2D(float2) gMvOut :  register(u2,space0);
-#line 150 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/motionvectors.srt.h"
+#line 160 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/motionvectors.srt.h"
         RWBuffer(uint) gMvStats :  register(u3,space0);
 
 
@@ -1059,7 +1055,9 @@ void CS_MAIN( uint3 DispatchThreadID : SV_DISPATCHTHREADID )
 
     float2 mv = float2(0.0f, 0.0f);
     float reactive = 0.0f;
-    if (gMvParams.opts.x > 0.5f)
+#line 107 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/motionvectors.comp.fsl"
+    const bool cameraParked = (gMvParams.opts.y > 0.5f);
+    if (gMvParams.opts.x > 0.5f && !cameraParked)
     {
         float4 pc = mul(gMvParams.prevViewProjRel, float4(rel, 1.0f));
 
@@ -1091,7 +1089,7 @@ void CS_MAIN( uint3 DispatchThreadID : SV_DISPATCHTHREADID )
                     float sampled = SampleLvlTex2D(gMvPrevDepth, gSamplerPointClamp,
                                                     puv * frac_, 0).r;
                     float expected = pc.z / pc.w;
-#line 129 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/motionvectors.comp.fsl"
+#line 165 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/motionvectors.comp.fsl"
                     float denom = max(max(expected, sampled), 1.0e-4f);
                     float err = abs(expected - sampled) / denom;
 
@@ -1112,7 +1110,7 @@ void CS_MAIN( uint3 DispatchThreadID : SV_DISPATCHTHREADID )
 
     Write2D(gMvOut, px, mv);
     Write2D(gMvReactive, px, reactive);
-#line 160 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/motionvectors.comp.fsl"
+#line 196 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/motionvectors.comp.fsl"
     {
         float m = length(mv);
         uint mu = asuint(m);

@@ -69,7 +69,43 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
 
     float2 mv       = float2(0.0f, 0.0f);
     float  reactive = 0.0f;
-    if (gMvParams.opts.x > 0.5f)
+    // ⚠⚠ THE PARKED-CAMERA SHORT CIRCUIT, AND IT IS EXACTNESS, NOT AN OPTIMISATION.
+    //
+    // This pass reconstructs a world point with invViewProj and re-projects it with
+    // prevViewProjRel. When the camera did not move those are the SAME matrix, so the round trip is
+    // algebraically the identity — and in float32 it is not: `viewProj * invViewProj` differs from I
+    // in the last bits, so EVERY pixel comes back off by ~1e-3 px instead of the exact zero the
+    // arithmetic promises. Measured parked in Balmora: **99.983% of the frame non-zero, max 0.0087
+    // px**, while the tolerance-based `still(<0.01px)` counter beside it read a confident 100.0%.
+    //
+    // ⚠ WHAT THE RESIDUE ACTUALLY COSTS, RESTATED FOR THE TREE AS IT IS NOW. The original wording
+    // here rested on mvview.frag testing `m == 0.0f` EXACTLY, and that test is gone: the view's grey
+    // branch is `m < 0.01f`, because the exact one proved unreachable in this engine (MW's camera
+    // matrix is not bit-stable when the player stands still — measured deltas 4.3e-4, 2.9e-11,
+    // 1.5e-3 on three consecutive parked frames). So the residue no longer shows up in the DEBUG
+    // VIEW at all.
+    //
+    // It shows up in the CONSUMER instead, which is the stricter place and the reason this branch
+    // still earns its lines: MB-2's gather steps along `mv`, so ~1e-3 px of round-off on a parked
+    // frame is a sub-pixel smear over a still image. MB-2 carries a velocity FLOOR for exactly the
+    // frames this branch cannot catch (the majority — the camera really did move a hair), and this
+    // branch is what makes the bit-identical minority exactly right rather than merely under the
+    // floor.
+    //
+    // opts.y is set by the host ONLY when prevViewProjRel is BIT-IDENTICAL to this frame's viewProj
+    // — not "close", not "within a tolerance". Under that condition the true vector is identically
+    // zero for every pixel, so writing zero is the exact answer and not a clamp of a small one. The
+    // reactive mask goes to zero with it, and correctly: a camera that did not move cannot have
+    // disoccluded anything, so there is no history for any pixel to distrust.
+    //
+    // ⚠⚠ AND FOR ITS FIRST THREE WEEKS THIS BRANCH NEVER RAN. The host computed opts.y, logged it,
+    // and then cleared it as part of a "clear the reserved lanes" line four statements later — so
+    // `parked(bit-identical)=1` appeared on the heartbeat while the GPU read 0. Fixed with MB-2 step
+    // 0 (forgerender.cpp, the reserved-lane clear now runs BEFORE the lanes that are written).
+    // The consequence-level test, and the only one that could have caught it: on a frame the log
+    // calls parked, `mv final: nonzero%` must read **0.000%**.
+    const bool cameraParked = (gMvParams.opts.y > 0.5f);
+    if (gMvParams.opts.x > 0.5f && !cameraParked)
     {
         float4 pc = mul(gMvParams.prevViewProjRel, float4(rel, 1.0f));
         // w <= 0 means the surface was BEHIND the previous camera — newly disoccluded by a turn, and

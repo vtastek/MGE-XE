@@ -1,0 +1,69 @@
+// mgeHost64 — MB-1 OBJECT VELOCITY (vertex stage).
+//
+// Read objvelocity.srt.h first: the overwrite ordering, the missing render target and why the depth
+// test is what makes the UAV write safe are all documented there.
+//
+// Per vertex: project the model position through THIS frame's world*viewProj (which must reproduce
+// opaque.vert bit-for-bit, or the depth test speckles) and through LAST frame's pose and camera.
+// The fragment stage divides and differences.
+
+#include "objvelocity.srt.h"
+
+STRUCT(VSInput)
+{
+    DATA(float3, Position,  POSITION);
+    DATA(uint,   DrawIndex, TEXCOORD1);   // per-instance: index into gObjVelBatch
+};
+
+STRUCT(VSOutput)
+{
+    DATA(float4, Position, SV_Position);
+    // BOTH clip positions, interpolated with perspective correction and divided in the frag.
+    //
+    // ⚠⚠ AND *BOTH*, EVEN THOUGH SV_Position ALREADY CARRIES THE CURRENT ONE. That was the first
+    // version and it was wrong in a way that only shows on a still frame: the vector here is a
+    // DIFFERENCE OF TWO NEARLY-EQUAL QUANTITIES whose correct answer is EXACTLY ZERO, and computing
+    // the two halves by two different routes — one from my interpolated attribute, one from the
+    // rasterizer's own window coordinate — leaves the gap between those routes as the answer.
+    // Reported from play as "the no-motion image has little gray dots".
+    //
+    // Carried as a pair, the cancellation is exact by construction: when neither the camera nor the
+    // object moved, CurClip and PrevClip are the SAME vertex values, interpolated with the SAME
+    // weights and divided by the SAME w, so `prevUV - curUV` is identically 0 — not 0 to within
+    // rounding. The rasterizer's SV_Position never enters the subtraction; it is used only to
+    // address the pixel being written.
+    //
+    // Same shape as [[feedback_interpolated_difference_trap]] one domain over: that one was two
+    // separately-FILTERED texture samples, this is two separately-DERIVED screen positions. The rule
+    // is the same — do the subtraction where both operands came through identical arithmetic.
+    DATA(float4, PrevClip, TEXCOORD0);
+    DATA(float4, CurClip,  TEXCOORD1);
+};
+
+ROOT_SIGNATURE(DefaultRootSignature)
+VSOutput VS_MAIN( VSInput In )
+{
+    INIT_MAIN;
+    VSOutput Out;
+
+    uint idx = In.DrawIndex;
+    float4 p = float4(In.Position, 1.0f);
+
+    // ⚠ THESE TWO LINES ARE COPIED FROM opaque.vert ON PURPOSE — same expression, same order, same
+    // cbuffer packing. The colour pass matches the prepass's depth with CMP_EQUAL precisely because
+    // it shares a vertex shader; this pass cannot share one (it needs the previous pose), so the
+    // arithmetic is reproduced instead and the depth test is relaxed to GEQUAL to absorb whatever
+    // the compiler does differently. Change either line and the mover's velocity develops holes.
+    float4 worldPos = mul(gObjVelBatch.worlds[idx], p);
+    Out.Position = mul(gObjVelParams.viewProj, worldPos);
+    Out.CurClip  = Out.Position;   // the SAME value — see the VSOutput note on why it is carried
+
+    // The same model point under LAST frame's pose, seen by LAST frame's camera. Both matrices are
+    // in this frame's camera-relative space (the host de-absolutizes prevWorld and folds the eye
+    // shift into prevViewProjRel), so the difference below is the object's motion plus the camera's
+    // — which is what a motion vector is.
+    float4 prevWorldPos = mul(gObjVelBatch.prevWorlds[idx], p);
+    Out.PrevClip = mul(gObjVelParams.prevViewProjRel, prevWorldPos);
+
+    RETURN(Out);
+}
