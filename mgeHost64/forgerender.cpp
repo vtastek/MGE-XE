@@ -1293,6 +1293,76 @@ namespace {
     // failed. Every one of those logs a DECLINED line naming which fired, because **a silently-absent
     // upscaler is indistinguishable from a working one at scale 1.0**.
     bool     g_upscaleEnable = true;
+    // --- M1 step 4d: WHICH BACKEND TO ASK FOR (tasks/forge-upscale.md) ---------------------------
+    // `passthrough` (the 4b Catmull-Rom) or `ngx` (DLSS Super Resolution). Read at INIT, beside
+    // g_upscaleEnable and for the same reason: it decides which object is CREATED.
+    //
+    // ⚠ IT DEFAULTS TO `passthrough`, AND THAT IS NOT TIMIDITY. Two reasons, and the second is the
+    // durable one:
+    //   1. a broken NGX must not be able to take the frame down on a machine that was fine
+    //      yesterday — the whole guard shape 4b established, one step further out;
+    //   2. the AMD / Intel / GTX-1080 tiers this project promises to keep running have no NGX at
+    //      all, and the passthrough is their PERMANENT path, not a fallback they hit on an error.
+    // Auto-select-by-vendor (ask the adapter, prefer NGX where it exists) is 4e; until then the
+    // opt-in is `MGE_HOST_KNOBS=upscaleBackend=ngx`.
+    //
+    // ⚠⚠ AN UNRECOGNISED VALUE IS A REFUSAL THAT LOGS, NOT A SILENT FALLBACK TO THE DEFAULT. A
+    // typo'd backend name that quietly renders the passthrough is a session labelled "DLSS" whose
+    // frame is a Catmull-Rom, which is the same wrong-row-in-a-table failure the knob table's own
+    // header describes for a typo'd knob name.
+    char     g_upscaleBackend[16] = "passthrough";
+    // WHETHER THE ARMED BACKEND ACCUMULATES OVER TIME, set at the arm site from the backend that
+    // actually came up. It is the JITTER'S GATE and nothing else reads it.
+    //
+    // ⚠⚠ THE GATE IS AT THE **PRODUCER**, which is the whole lesson of
+    // [[feedback_knob_gated_apart_from_its_consumer]] — the same defect shape as "scale shrinks the
+    // view" one milestone earlier. Jitter has exactly ONE consumer, a temporal accumulator, and
+    // arming it without one buys crawling foliage and nothing else; leaving it at 0 with DLSS live
+    // gives DLSS nothing to reconstruct from. Two knobs gated on different conditions is how the
+    // rect ended up narrowed with nothing to widen it back, so the amplitude is derived through
+    // jitterAmp() below rather than read raw at the three sites that want it.
+    bool     g_upscaleTemporal = false;
+    // ⚠ THE ISOLATION ESCAPE HATCH, and it exists because the gate above would otherwise KILL ITS
+    // OWN SUBJECT ([[feedback_isolation_lever_killed_its_own_subject]]). M1 step 1's verification is
+    // "jitter alone, no upscaler: the image must shimmer sub-pixel and the atmos/gate rows must not
+    // move" — a test that is only runnable with no temporal backend armed, i.e. exactly the state
+    // the gate suppresses. `MGE_HOST_KNOBS=jitterForce=1` restores it.
+    bool     g_jitterForce = false;
+    // WHICH RECT THE MOTION VECTORS ARE AT — see UpscaleInputs::mvAtInputRect. Ours are written at
+    // the INPUT rect, so this ships true and maps to DLSS's MVLowRes create flag. It is a knob only
+    // because it is the one convention 4d could not settle by reading, and because it is INVISIBLE
+    // at DLAA (in == out) and therefore first shows up as a smear the moment Quality is selected.
+    bool     g_upscaleMvLowRes = true;
+    // THE TWO OPTIONAL INPUTS — see UpscaleInputs::useSuppliedExposure / useReactiveMask. They are
+    // the ONLY two inputs a temporal backend can run without, which is what made them the bisection
+    // the first 4d bring-up needed: colour, depth and motion vectors are required, so when DLSS hung
+    // the GPU there were exactly two things to turn off, and turning them off needed no rebuild.
+    //
+    // ⚠⚠ AND THE BISECTION FOUND SOMETHING, WHICH IS WHY THIS SHIPS **false** RATHER THAN true.
+    // MEASURED 2026-09-02, `--forge-scene 1x` at DLAA, reproducible in both the validation and the
+    // fast build:
+    //     exposure SUPPLIED, mask off  -> DXGI_ERROR_DEVICE_HUNG inside NGX_D3D12_EVALUATE_DLSS_EXT
+    //     exposure AUTO,     mask off  -> runs; centre 15,15,15,255
+    //     exposure AUTO,     mask ON   -> runs; centre 15,15,15,255
+    // So it is the 1x1 R32_FLOAT exposure texture specifically, not the mask and not the reactive
+    // lane. The D3D12 debug layer reports NOTHING — the fault is inside NGX's own dispatch — and it
+    // survives making the per-frame copy conditional, so it is the resource or how DLSS reads it,
+    // not the update. Still open; it is the first item of 4d-2 and tasks/forge-upscale.md carries
+    // the full reproduction.
+    //
+    // ⚠ AUTO EXPOSURE IS NOT A HACK AROUND IT, and that distinction matters for whether this is
+    // shippable. DLSS's AutoExposure meters the frame for ITS OWN network and that value never
+    // leaves DLSS — it does not touch `g_exposure`, which is metered off pRT AFTER the resolve. So
+    // it is not a second adaptation loop competing with the servo, and it is not trap 7's hazard
+    // (that was about feeding DLSS an exposure DERIVED from DLSS output; here we feed it none). It
+    // is a supported NVIDIA configuration and the one every integration without an exposure buffer
+    // uses. What is lost is a hint, not a lane.
+    //
+    // The previous-frame plumbing that trap 7 asked for is BUILT AND CORRECT regardless
+    // (g_upscalePrevExposure) — what is missing is the transport into DLSS, so the day the hang is
+    // understood this is a one-token flip rather than new wiring.
+    bool     g_upscaleSuppliedExposure = false;
+    bool     g_upscaleNgxReactive      = true;
     // THE INPUT SCALE — input rect = output rect x this. LIVE, and it REPLACES 4a's
     // `static constexpr kHostInputScale` at the one site that ever read it, setRenderSize().
     //
@@ -1307,6 +1377,117 @@ namespace {
     // at 0.5. The floor is 0.33 because below a third the input rect stops being able to carry the
     // frame at all; the ceiling is 1.0 because alloc >= out >= in is the model.
     float    g_upscaleInputScale = 1.0f;
+    // --- M1 step 4d-3: THE MODE. A FIXED LIST, LIVE, AND "OFF" IS ONE OF ITS ENTRIES ------------
+    // ⚠⚠ THIS REPLACED THE FREE SLIDER AS THE PANEL CONTROL, and the reason is a measured defect,
+    // not ergonomics — though it is better ergonomics too, and it is how every game presents this.
+    // DLSS's modes each report their own ACCEPTED [min,max] render rect; those bands have HOLES
+    // between them, and UltraPerformance is not a band at all (min == max == optimal, one fixed
+    // rect). A free slider can therefore be dragged to values no DLSS mode will take. Measured in
+    // game 2026-09-02: ELEVEN `OUTSIDE the range DLSS reports` warnings in a single session — one
+    // of them missing Performance's floor by a single pixel, because the host rounds to even and
+    // DLSS's minimum height was odd. See upscale.h.
+    //
+    // So the MODE is the control and the RECT is derived from it, by asking the backend
+    // (queryModeRects) rather than by multiplying a ratio. `kUpscaleModeOff` is an entry in the list
+    // rather than a separate checkbox, because "off" is the same question as "which mode" and two
+    // controls that can disagree about whether the feature is running is the shape this milestone
+    // has already paid for twice.
+    //
+    // ⚠ LIVE, unlike `upscaleEnable`. That one is init-time because it decides whether the backend
+    // and its ~56 MB target are ALLOCATED; this one decides whether the allocated backend RUNS this
+    // frame, which is free to change per frame. Off restores the un-upscaled frame exactly: the
+    // rect goes back to in == out, evaluate is never called, the resolve binds set instance 0, and
+    // the jitter and motion-vector passes disarm with it.
+    uint32_t g_upscaleMode = kUpscaleModeDLAA;
+    // The published per-mode rect table (upscale.h::queryModeRects). ⚠ WRITTEN ON THE RENDER THREAD,
+    // READ BY setRenderSize ON THE IPC THREAD, which is why it is a published table and not a call:
+    // NGX is not thread-safe, so the rect authority cannot ask the SDK at the moment it needs the
+    // answer. Word-sized reads of a table that changes only when the OUTPUT rect changes; the client
+    // restamps setRenderSize every frame, so the worst case is one frame on the previous table —
+    // the same lazy-arm shape `rect PENDING` already describes.
+    uint32_t g_upscaleModeInW[kUpscaleModeCount] = {};
+    uint32_t g_upscaleModeInH[kUpscaleModeCount] = {};
+    bool     g_upscaleModeTableValid = false;
+    uint32_t g_upscaleModeTableOutW = 0, g_upscaleModeTableOutH = 0;
+    // Set when the mode changes, consumed by the next evaluate as a history reset. Off -> DLAA does
+    // NOT change the rects, so the feature is not rebuilt and DLSS would otherwise reconstruct from
+    // an accumulator whose history is a stack of frames it did not produce.
+    bool     g_upscaleModeChanged = false;
+    // ─── THE DLSS MODEL / RENDER PRESET, LIVE (the "DLSS4 vs DLSS5 model" selector) ─────────────
+    // ⚠⚠ IT IS HERE BECAUSE RESHADE AND OPTISCALER PHYSICALLY CANNOT REACH IT. Those tools inject
+    // into the GAME process and hook the NGX calls it makes; ours are in mgeHost64.exe under D3D12,
+    // a different process they never attach to. (It is also why they classify this as a "Vulkan"
+    // game — what they CAN see is Morrowind.exe presenting through DXVK.) The SDK's per-mode hint
+    // parameters are the supported way an application picks its model, so the control lives in our
+    // own panel and needs no third-party tool.
+    //
+    // ⚠ A CREATE-TIME HINT: changing it tears down and rebuilds the DLSS feature, which is a visible
+    // hitch of a few ms. That is fine for a look A/B and wrong for anything on a hot path, which is
+    // why it is a dropdown rather than something a script could sweep.
+    uint32_t g_upscalePreset = kUpscalePresetDefault;
+
+    // ─── THE HOST OVERLAY WINDOW (M1 4d follow-up) ───────────────────────────────────────────────
+    // ⚠⚠ ITS ONLY JOB IS TO GIVE ReShade A SWAPCHAIN. This host renders offscreen into a shared
+    // texture and hands the client an NT handle; it presents nothing and owns no window. That is
+    // deliberate and is why frame generation was excluded from the vendored SDK. But it also means
+    // an injected overlay — ReShade, and through it the RenoDX DLSS5 addon — has nowhere to draw:
+    // ReShade builds its runtime on SWAPCHAIN CREATION and renders its UI in Present, so with
+    // neither it loads, hooks, and then sits mute.
+    //
+    // Verified before this was written, by listing the live host's modules mid-session:
+    //     d3d12.dll             C:\mgem\mwdlss\d3d12.dll            (ReShade 6.8.0)
+    //     renodx-dlss5.addon64  C:\mgem\mwdlss\renodx-dlss5.addon64
+    // Both already in the process, both already hooking our device — the addon even pre-loads
+    // nvngx_dlssnr.dll at device init. The ONLY missing piece was a surface, which is what this is.
+    //
+    // ⚠ THE OVERLAY APPEARS IN **THIS** WINDOW, NOT IN THE GAME. The game's frame is composited by
+    // the client from the shared texture and never passes through this swapchain. So this is a small
+    // second window that exists to be clicked in — settings here, game there. Presenting the game's
+    // frame into it as a preview is possible (pRT is BGRA8) but needs a scaling blit, and is not
+    // what unblocks the addon, so it is not done here.
+    //
+    // ⚠ OPT-IN and OFF by default: it costs a window, a swapchain, and one extra submit+present per
+    // frame, for a feature only a dev with an injected overlay wants.
+    bool         g_hostWindow = false;
+    HWND         g_hostHwnd = nullptr;
+    SwapChain*   g_pHostSwapChain = nullptr;
+    // Matches the swapchain's image count: the ring exists to let the submit for frame N stay in
+    // flight while frame N+1 records, so it has to be at least as deep as the back buffers it
+    // presents into.
+    constexpr uint32_t kHostWndRing = 2;
+    CmdPool*     g_pHostWndPool[kHostWndRing]  = {};
+    Cmd*         g_pHostWndCmd[kHostWndRing]   = {};
+    Fence*       g_pHostWndFence[kHostWndRing] = {};
+    bool         g_hostWndSubmitted[kHostWndRing] = {};
+    uint32_t     g_hostWndSlot = 0;
+    bool         g_hostWindowReady = false;
+    // The window and its message pump own a thread of their own — see hostWindowThreadMain for why
+    // that is a correctness requirement and not tidiness.
+    std::thread       g_hostWndThread;
+    std::atomic<bool> g_hostWndCreated{false};
+    DWORD             g_hostWndThreadId = 0;
+    unsigned long     g_hostWndCreateError = 0;
+    constexpr UINT    kHostWndQuitMsg = WM_APP + 1;
+    // ⚠ A GLOBAL HOTKEY, because the overlay window is otherwise UNREACHABLE. MW runs
+    // `Borderless Window=True` at the full desktop size, so a 960x540 window sits behind it, unseen
+    // and un-clickable — and an injected overlay (OptiScaler measurably, ReShade by the same rule)
+    // only accepts input while ITS window is the FOREGROUND one. Ctrl+Alt+Insert brings this one
+    // forward and gives it focus; then the overlay's own key works. Mnemonic on purpose:
+    // Ctrl+Alt+Insert to reach it, Insert to open it.
+    constexpr int     kHostWndHotkeyId = 1;
+    bool              g_hostWndHotkey = false;
+    // The window is created at 960x540 — big enough for ReShade's UI, small enough to sit beside a
+    // 1680x1050 game window without being in the way.
+    constexpr uint32_t kHostWindowW = 960;
+    constexpr uint32_t kHostWindowH = 540;
+    // ⚠ WHY THE ARM FAILED, KEPT SO THE PANEL CAN SAY IT. The status line used to have one
+    // "NO BACKEND" state and it GUESSED the cause — it told the player to set
+    // `upscaleBackend=ngx`. Reported from the game 2026-09-02 against an install where that knob
+    // was already set and the real cause was MSAA: the log said `DECLINED — sampleCount > 1` while
+    // the panel, two inches from the player's eyes, gave advice that could not possibly help. An
+    // instrument that names the wrong cause is worse than one that says nothing, and this is the
+    // same rule the log's own DECLINED lines already follow. nullptr = never declined.
+    const char* g_upscaleDeclineReason = nullptr;
     // THE PASSTHROUGH'S SPATIAL FILTER, live (M1 4c follow-up). Shipped values unchanged — 0.5 is
     // Catmull-Rom, 1.0 is the anti-ringing clamp ON — so the default frame is exactly what 4b and 4c
     // measured. They exist as knobs because 4c put this filter UPSTREAM OF THE BLOOM PYRAMID, and
@@ -1326,6 +1507,14 @@ namespace {
     // pointer evaluate() returned), never re-derived from the rects — a second copy of that test is
     // a second place to get it wrong.
     bool     g_lastUpscaleRan = false;
+    // M1 4d: the PREVIOUS frame's exposure, snapshotted at the tail of the upscale block and handed
+    // to the backend at the head of the next one. See the fill site for why a same-frame E would
+    // close a loop around the upscaler.
+    float    g_upscalePrevExposure = 1.0f;
+    // ...and the previous frame's cell centre, for the history-reset test. Own copies rather than a
+    // shared "did the cell change" flag: nothing else in the frame asks this question, and a flag
+    // two consumers clear is a flag one of them misses.
+    int32_t  g_upscalePrevCellX = 0, g_upscalePrevCellY = 0;
     // THE CLAMP, once. setRenderSize derives the input rect through it and the `[rect]` log reports
     // it; two copies of the expression is two chances for the log to describe a rect the renderer
     // did not use, which on this particular line would be worse than not logging at all.
@@ -1364,9 +1553,74 @@ namespace {
         return (g_upscaleInputScale < 0.33f) ? 0.33f
              : ((g_upscaleInputScale > 1.0f) ? 1.0f : g_upscaleInputScale);
     }
+
+    // ─── IS THE PASS GOING TO RUN THIS FRAME ─────────────────────────────────────────────────────
+    // ONE definition, and everything that has to agree about it reads THIS rather than re-deriving
+    // it: the rect authority (setRenderSize), the jitter producer, the motion-vector gate, the
+    // frame's evaluate call and the `[rect]` line. Three terms, and each is a different question:
+    //   g_upscaleEnable  — was the backend ALLOCATED (init-time)
+    //   g_upscaleName    — did it successfully ARM (a guard may have declined it)
+    //   g_upscaleMode    — is the player asking for it RIGHT NOW (live)
+    // 4b shipped the first two gated apart from the rect and it reached the game as "scale shrinks
+    // the view" ([[feedback_knob_gated_apart_from_its_consumer]]); adding a live third term without
+    // folding it in here would be the same defect a third time.
+    inline bool upscaleActive() {
+        return g_upscaleEnable && g_upscaleName != nullptr
+            && g_upscaleMode != (uint32_t)kUpscaleModeOff
+            && g_upscaleMode < (uint32_t)kUpscaleModeCount;
+    }
+    // ...and whether the ACTIVE pass is a temporal one, which is the jitter's and the motion-vector
+    // pass's gate. A spatial backend running at Quality still wants neither.
+    inline bool upscaleTemporalActive() {
+        return g_upscaleTemporal && upscaleActive();
+    }
+    // THE INPUT RECT FOR THE CURRENT MODE, derived from the published table when the backend could
+    // answer and from the fallback ratios when it could not (the passthrough). Returns the OUTPUT
+    // rect unchanged whenever the pass is not going to run — which is the invariant the whole 4b
+    // "scale shrinks the view" post-mortem is about: **the input rect may narrow only while
+    // something exists to widen it back.**
+    inline void upscaleInputRect(uint32_t outW, uint32_t outH, uint32_t* pInW, uint32_t* pInH) {
+        *pInW = outW; *pInH = outH;
+        if (!upscaleActive() || outW == 0u || outH == 0u) { return; }
+        // ⚠ THE DEV OVERRIDE WINS, AND IT IS NAMED WHEREVER IT BITES. `upscaleInputScale` is no
+        // longer a player control — it is the env/probe knob that sweeps rects the mode list cannot
+        // express, which is exactly what the scene probe's UPSCALE stage needs. Precedence is stated
+        // rather than emergent: override, then the published table, then the ratio.
+        if (g_upscaleInputScale < 0.999f) {
+            const float s = upscaleScale();
+            *pInW = (uint32_t)((float)outW * s + 0.5f) & ~1u;
+            *pInH = (uint32_t)((float)outH * s + 0.5f) & ~1u;
+            return;
+        }
+        if (g_upscaleModeTableValid && g_upscaleModeTableOutW == outW
+            && g_upscaleModeTableOutH == outH
+            && g_upscaleModeInW[g_upscaleMode] != 0u && g_upscaleModeInH[g_upscaleMode] != 0u) {
+            // ⚠ TAKEN VERBATIM, ODD NUMBERS INCLUDED. The backend got these from the SDK and DLSS's
+            // optimal height at 1680x1050 Performance is 525 — rounding it to even is the one-pixel
+            // range miss that this whole change exists to remove. The half-res AO and bloom chains
+            // have handled odd input rects since 4a; DLSS running outside its stated range is the
+            // worse of the two problems by a wide margin.
+            *pInW = g_upscaleModeInW[g_upscaleMode];
+            *pInH = g_upscaleModeInH[g_upscaleMode];
+            return;
+        }
+        // The fallback: a backend with no per-mode opinion, or the first frame before the table has
+        // been published. Rounded to EVEN here because nothing authoritative asked for an odd rect.
+        const float r = kUpscaleModeRatio[g_upscaleMode];
+        if (r < 0.999f) {
+            *pInW = (uint32_t)((float)outW * r + 0.5f) & ~1u;
+            *pInH = (uint32_t)((float)outH * r + 0.5f) & ~1u;
+        }
+    }
     // Defined further down, beside setRenderSize; declared here because the backend's arm site in
     // buildOpaquePath — thousands of lines above it — has to re-emit the line. See its definition.
     void logRectLine();
+    // M1 step 4d, and declared up here for the same reason: THE EFFECTIVE jitter amplitude and the
+    // effective phase count, both gated on a temporal backend being armed, both defined beside
+    // g_jitterAmp thousands of lines below and both read by the arm site's log. See their
+    // definitions for why the gate is at the producer.
+    float    jitterAmp();
+    uint32_t jitterPhases();
 
 
     // --- BLOOM pyramid (tasks/forge-postprocess.md step 4) ---------------------------------------
@@ -2588,19 +2842,29 @@ namespace {
     void logRectLine() {
         char knobNote[48];
         knobNote[0] = '\0';
-        if (g_upscaleName == nullptr && g_upscaleInputScale < 0.999f) {
-            std::snprintf(knobNote, sizeof(knobNote), " (knob %.3f INERT)",
-                          (double)g_upscaleInputScale);
-        } else if (upscaleScale() < 0.999f && g_live.width == g_live.outWidth) {
+        if (g_upscaleName == nullptr && g_upscaleMode != (uint32_t)kUpscaleModeOff) {
+            std::snprintf(knobNote, sizeof(knobNote), " (mode INERT: no backend)");
+        } else if (upscaleActive() && g_live.width == g_live.outWidth
+                   && g_upscaleMode != (uint32_t)kUpscaleModeDLAA
+                   && g_upscaleMode != (uint32_t)kUpscaleModeOff) {
             // The one transient: the backend armed mid-frame, so the scale is live but the rect it
             // narrows is still the one the last setRenderSize authored. Named rather than smoothed
             // over, because `in == out` beside `inputScale=0.500` otherwise reads as a bug.
             std::snprintf(knobNote, sizeof(knobNote), " (rect PENDING)");
         }
-        LOG::logline(">> [rect] in=%ux%u out=%ux%u alloc=%ux%u inputScale=%.3f%s upscaler=%s",
+        // ⚠ THE MODE IS ON IT SINCE 4d-3, and `inputScale` is now a DERIVED number rather than the
+        // control: the rect comes from the mode's SDK-reported rect, so printing the knob alone
+        // would describe an authority that no longer authors anything. Both are here because they
+        // answer different questions — the mode is what was ASKED for, the ratio is what the rects
+        // actually came out as, and a disagreement between them is exactly the kind of thing this
+        // line exists to make visible.
+        LOG::logline(">> [rect] in=%ux%u out=%ux%u alloc=%ux%u ratio=%.3f mode=%s%s upscaler=%s",
                      g_live.width, g_live.height, g_live.outWidth, g_live.outHeight,
-                     g_live.allocWidth, g_live.allocHeight, (double)upscaleScale(), knobNote,
-                     g_upscaleName ? g_upscaleName : "none");
+                     g_live.allocWidth, g_live.allocHeight,
+                     g_live.outWidth ? (double)g_live.width / (double)g_live.outWidth : 1.0,
+                     kUpscaleModeNames[g_upscaleMode < (uint32_t)kUpscaleModeCount
+                                       ? g_upscaleMode : 0u],
+                     knobNote, g_upscaleName ? g_upscaleName : "none");
         LOG::flush();
     }
 
@@ -9506,8 +9770,17 @@ namespace {
         if (g_upscaleEnable) {
             const char* declined = nullptr;
             if (g_live.sampleCount > 1) {
-                declined = "sampleCount > 1 (an upscaler REPLACES MSAA; resolve_sc4.frag binds a "
-                           "Tex2DMS where the single-sample upscaled output would go)";
+                // ⚠ PHRASED FOR SOMEONE LOOKING AT THE PANEL, because since 4d-3 this string is
+                // ALSO the dev panel's status line and not only a log entry. It has to carry the
+                // technical reason (a type mismatch, not a quality judgement) AND the one action
+                // that fixes it — the first in-game report of this said "I see no backend warning"
+                // against an install whose only problem was MSAA being on, and the panel at the
+                // time offered advice about an env var that was already set.
+                declined = "MSAA is ON. An upscaler REPLACES MSAA and cannot run beside it "
+                           "(resolve_sc4.frag binds a Tex2DMS where the single-sample upscaled "
+                           "output would go — a type mismatch, not a trade-off). Set "
+                           "'Antialiasing Level=None' in mge3/MGE.ini, or turn AA off in "
+                           "MGEXEgui, and restart.";
             } else if (!g_live.pSceneColor || !g_live.sceneReferred) {
                 declined = "no scene-referred colour target (nothing to upscale; the shader resolve "
                            "is already inactive in this configuration)";
@@ -9519,48 +9792,82 @@ namespace {
                 // prints. If this path is ever re-entered after a successful arm — a rebuild with
                 // MSAA newly on is the shape — leaving the old name standing would keep claiming a
                 // backend that is no longer going to run.
+                //
+                // ⚠ THREE NOW, SINCE 4d — and the third has the same argument as the second, one
+                // consumer further out. This path IS re-enterable after a successful arm (the
+                // rebuild-with-MSAA-newly-on shape named above), and g_upscaleTemporal is what
+                // jitterAmp() and mvActive read: left standing it would keep the jitter armed and
+                // the motion-vector dispatch forced on for a backend that has just been refused.
                 g_upscaleName = nullptr;
+                g_upscaleTemporal = false;
+                g_upscaleDeclineReason = declined;
                 LOG::logline("!! [upscale] DECLINED — %s. Frame renders exactly as it does without "
                              "this feature; no target allocated.", declined);
                 LOG::flush();
                 std::printf("[forge][upscale] DECLINED — %s\n", declined);
             } else {
-                g_live.pUpscaler = createPassthroughUpscaler();
+                // ─── WHICH BACKEND (M1 step 4d) ───────────────────────────────────────────────
+                // The knob names one, and an unrecognised name is a REFUSAL rather than a silent
+                // fall back to the default: a run labelled "DLSS" whose frame is a Catmull-Rom is a
+                // wrong row in a table, and this milestone's whole instrument argument is that the
+                // log has to be able to tell the two apart.
+                //
+                // ⚠ ALLOCATING THE NGX OBJECT TOUCHES NO NVIDIA CODE. `init()` is where NGX is
+                // entered and where every refusal (no NVIDIA adapter, driver too old, missing
+                // nvngx_dlss.dll) is caught and named — see upscale_ngx.cpp. So the two branches
+                // here are symmetric and the failure handling below is shared.
+                const bool wantNgx = (std::strcmp(g_upscaleBackend, "ngx") == 0);
+                const bool knownBackend = wantNgx
+                                       || (std::strcmp(g_upscaleBackend, "passthrough") == 0);
+                if (!knownBackend) {
+                    LOG::logline("!! [upscale] unknown upscaleBackend '%s' — expected 'passthrough' "
+                                 "or 'ngx'. NOT falling back silently; upscaling is OFF for this "
+                                 "session so the log and the frame agree.", g_upscaleBackend);
+                    LOG::flush();
+                    std::printf("[forge][upscale] DECLINED — unknown backend '%s'\n",
+                                g_upscaleBackend);
+                }
+                g_live.pUpscaler = !knownBackend ? nullptr
+                                 : (wantNgx ? createNgxUpscaler() : createPassthroughUpscaler());
                 bool ok = g_live.pUpscaler
                        && g_live.pUpscaler->init(R, g_live.allocWidth, g_live.allocHeight,
                                                  g_live.sceneColorFormat);
-                // ⚠ THE INPUT BIND HAPPENS ONCE, HERE, and never inside a recorded frame. Every
-                // other descriptor write in this renderer is made at path-build time on the host
-                // thread; a per-frame updateDescriptorSet on a set the GPU may still be reading is
-                // exactly the hazard the texture-residency races were.
+                // ⚠⚠ THE INPUT BIND IS NO LONGER HERE, AND THAT MOVE IS THE 4d CORRECTNESS FIX 4b
+                // WROTE ITSELF A NOTE ABOUT. What stood here bound pColor and passed NULL for
+                // pMotionVectors / pMvReactive, because those are created ~1600 lines FURTHER DOWN
+                // this same function. Harmless while the passthrough was the only backend (it
+                // declares them and touches neither); fatal for NGX, which cannot run without them
+                // and would have reported "motionVectors=NULL" for a backend it had just called
+                // ready.
                 //
-                // ⚠⚠ ONLY pColor IS ACTUALLY BOUND TODAY, and the other three are null RIGHT HERE
-                // rather than merely unread: pMotionVectors / pMvReactive are created ~1400 lines
-                // FURTHER DOWN this same function. That is harmless in 4b (the passthrough declares
-                // them and touches neither) and it is stated rather than tidied because it is a real
-                // constraint on 4d: **the NGX backend's bind cannot stay at this point in the
-                // build** — it has to move below the MV resources, or take a second bindInputs once
-                // they exist. Filling the struct now is what makes that visible instead of leaving
-                // 4d to discover it against a black upscaled frame.
-                if (ok) {
-                    UpscaleInputs bind = {};
-                    bind.pColor         = g_live.pSceneColor->pTexture;
-                    bind.pDepth         = g_live.pLinearDepth;
-                    bind.pMotionVectors = g_live.pMotionVectors;   // null here — see above
-                    bind.pReactive      = g_live.pMvReactive;      // null here — see above
-                    ok = g_live.pUpscaler->bindInputs(R, bind);
-                }
+                // So the arm is SPLIT, and the split follows what each half actually depends on:
+                //   HERE            — create + init. Needs the ALLOCATION rect and the scene format,
+                //                     both of which exist now, and it must happen before the
+                //                     resolve's descriptor-set instance 1 binds outputTexture()
+                //                     (~1600 lines below, but inside a nested scope this block
+                //                     cannot be moved into).
+                //   AFTER THE MV    — bindInputs. Needs every input resource to exist.
+                //   RESOURCES         Search `[upscale] inputs bound`.
+                //
+                // Moving the WHOLE block down instead was the first thing tried and does not work:
+                // the resolve's instance-1 bind sits between the MV resources and the end of that
+                // nested scope, so the backend would be created after the thing that binds its
+                // output. Two blocks, each where its dependencies are.
                 if (ok) {
                     g_upscaleName = g_live.pUpscaler->name();
-                    LOG::logline(">> [upscale] backend '%s' ready — output %ux%u RGBA16F "
+                    // ⚠ NOT ARMED YET — `g_upscaleName` is set here because upscaleScale() reads it
+                    // to decide whether the input rect may narrow, and the rect derivation has to
+                    // agree with the backend that is going to exist. The bind still has to succeed;
+                    // if it does not, the block below undoes both.
+                    LOG::logline(">> [upscale] backend '%s' created — output %ux%u RGBA16F "
                                  "(alloc-sized, SRV+UAV), input scale %.3f. ⚠ scale 1.0 is an exact "
-                                 "identity by CONSTRUCTION (evaluate returns the source, having "
-                                 "recorded nothing), so it proves nothing about this seam — test at "
-                                 "0.5.",
+                                 "identity by CONSTRUCTION **for the passthrough** (evaluate returns "
+                                 "the source, having recorded nothing) — but NOT for a temporal "
+                                 "backend, where in == out is DLAA and must still run.",
                                  g_upscaleName, g_live.allocWidth, g_live.allocHeight,
                                  (double)g_upscaleInputScale);
                     LOG::flush();
-                    std::printf("[forge][upscale] backend '%s' ready (%ux%u RGBA16F, scale %.3f)\n",
+                    std::printf("[forge][upscale] backend '%s' created (%ux%u RGBA16F, scale %.3f)\n",
                                 g_upscaleName, g_live.allocWidth, g_live.allocHeight,
                                 (double)g_upscaleInputScale);
                     // ⚠ RE-EMIT `[rect]`. The line setRenderSize printed during the client handshake
@@ -9589,10 +9896,18 @@ namespace {
                     }
                     g_upscaleEnable = false;
                     g_upscaleName = nullptr;
-                    LOG::logline("!! [upscale] DECLINED — backend init/bind FAILED. Upscaling forced "
-                                 "OFF; the frame renders exactly as it does without this feature.");
+                    g_upscaleTemporal = false;   // every path that clears one clears the other
+                    g_upscaleDeclineReason = "the backend failed to create or initialise — the "
+                                             "named reason is in mgeHost64.log just above the "
+                                             "DECLINED line (no NVIDIA GPU, a driver too old, or "
+                                             "nvngx_dlss.dll missing beside mgeHost64.exe)";
+                    LOG::logline("!! [upscale] DECLINED — backend '%s' create/init FAILED. Upscaling "
+                                 "forced OFF; the frame renders exactly as it does without this "
+                                 "feature. The named reason is on the lines above this one.",
+                                 g_upscaleBackend);
                     LOG::flush();
-                    std::printf("[forge][upscale] DECLINED — backend init FAILED\n");
+                    std::printf("[forge][upscale] DECLINED — backend '%s' init FAILED\n",
+                                g_upscaleBackend);
                 }
             }
         }
@@ -11102,6 +11417,82 @@ namespace {
                 }
                 LOG::logline(">> [mv] motion vectors %s (R16G16_SFLOAT %ux%u alloc; dispatch = render rect)",
                              g_live.mvReady ? "ready" : "UNAVAILABLE", width, height);
+            }
+
+            // --- M1 step 4d: THE UPSCALER'S INPUT BIND (tasks/forge-upscale.md) -------------------
+            // The second half of the arm. The backend was CREATED ~1600 lines above, beside the
+            // resolve's pipeline; its inputs are bound HERE, because this is the first point in
+            // buildOpaquePath where all four of them exist — pMotionVectors and pMvReactive were
+            // created six lines up.
+            //
+            // ⚠ 4b'S OWN NOTE PREDICTED THIS EXACT EDIT and it is worth keeping the reason visible
+            // rather than only the result: the old bind passed NULL for the two MV textures and
+            // called the backend ready. The passthrough declares them and reads neither, so it was
+            // harmless; a temporal backend cannot run without them, and the failure would have been
+            // a black or ghosting upscaled frame rather than a message. Filling the struct honestly
+            // at a site where half of it was null is what made the constraint visible.
+            //
+            // ⚠⚠ ONCE, AT PATH-BUILD TIME, ON THE HOST THREAD, OUTSIDE COMMAND RECORDING — which is
+            // where every other descriptor write in this renderer happens, and the whole reason
+            // bindInputs exists as a separate call (upscale.h). A per-frame updateDescriptorSet on a
+            // set the GPU may still be reading is exactly the hazard the texture-residency races
+            // were.
+            if (g_live.pUpscaler) {
+                UpscaleInputs bind = {};
+                bind.pColor         = g_live.pSceneColor ? g_live.pSceneColor->pTexture : nullptr;
+                bind.pDepth         = g_live.pLinearDepth;
+                // ⚠ GATED ON mvReady, NOT MERELY ON THE POINTER. The MV textures are allocated
+                // before the shader and pipeline that fill them, so `pMotionVectors != nullptr` is
+                // not the same claim as "something writes it". A texture that exists and is never
+                // dispatched into is the WORST input a temporal upscaler can be given — it is not a
+                // missing input the backend can detect, it is a plausible field of resting values.
+                // Handing null instead makes the backend refuse, by name, at the one place that can.
+                bind.pMotionVectors = g_live.mvReady ? g_live.pMotionVectors : nullptr;
+                bind.pReactive      = g_live.mvReady ? g_live.pMvReactive : nullptr;
+                if (g_live.pUpscaler->bindInputs(R, bind)) {
+                    // ⚠ AND THIS IS WHERE THE JITTER ARMS. The gate lives at the PRODUCER
+                    // (jitterAmp(), beside g_jitterAmp) rather than at the three sites that read the
+                    // offset, because jitter has exactly ONE consumer and 4b already paid for
+                    // gating a knob apart from its consumer — "scale shrinks the view"
+                    // ([[feedback_knob_gated_apart_from_its_consumer]]). A temporal backend with no
+                    // jitter reconstructs nothing; jitter with no temporal backend is shimmer.
+                    // Neither state is reachable now: this one flag decides both.
+                    //
+                    // The passthrough is a SPATIAL filter and accumulates nothing, so it does not
+                    // arm it — which is what keeps the shipped default bit-identical.
+                    g_upscaleTemporal = (std::strcmp(g_upscaleName, "ngx-dlss") == 0);
+                    LOG::logline(">> [upscale] inputs bound — backend '%s' ARMED. temporal=%s "
+                                 "(jitter %s: amp %.2f px over %u phases)",
+                                 g_upscaleName, g_upscaleTemporal ? "YES" : "no",
+                                 (jitterAmp() > 0.0f) ? "ON" : "off", (double)jitterAmp(),
+                                 jitterPhases());
+                    LOG::flush();
+                } else {
+                    // A bind that fails after a successful init is the backend saying a REQUIRED
+                    // input is missing (NGX with no motion vectors, say). Tear the whole thing down
+                    // rather than leave an armed name over a backend that cannot run: g_upscaleName
+                    // is what upscaleScale() reads to decide the input rect may narrow, so leaving
+                    // it standing is precisely the "narrowed with nothing to widen it back"
+                    // regression ([[feedback_guard_fallback_is_the_bug]]).
+                    g_live.pUpscaler->shutdown(R);
+                    destroyUpscaler(g_live.pUpscaler);
+                    g_live.pUpscaler = nullptr;
+                    g_upscaleEnable = false;
+                    g_upscaleName = nullptr;
+                    g_upscaleTemporal = false;
+                    g_upscaleDeclineReason = "a required input resource is missing (colour, depth "
+                                             "or motion vectors) — see mgeHost64.log";
+                    LOG::logline("!! [upscale] DECLINED — bindInputs FAILED (a required input "
+                                 "resource is missing). Upscaling forced OFF; the frame renders "
+                                 "exactly as it does without this feature.");
+                    LOG::flush();
+                    std::printf("[forge][upscale] DECLINED — bindInputs FAILED\n");
+                    // Re-emit, because the `[rect]` line the create site printed named a backend
+                    // that is now gone. A stale field on the one line an unattended run reads is
+                    // worse than no field — the same argument that put a second caller on this
+                    // function in 4b.
+                    logRectLine();
+                }
             }
 
             // --- APL instrument (tasks/forge-postprocess.md step 2) ---
@@ -13333,6 +13724,14 @@ namespace {
     // (bones seen vs discs shipped — an armoured NPC ships one skeleton per body part, so a ratio
     // near 1 means the dedupe is not working) and whether the disc cap was hit, which is otherwise
     // mute: the splat simply stops at kMaxGrassCrushers and part of a crowd quietly does not press.
+    // M1 4d-3: the Upscale tab's live status line. ⚠ IT EXISTS BECAUSE "IS DLSS ON" WAS ONLY
+    // ANSWERABLE FROM THE LOG, which is the wrong place for a control the player can now move: at
+    // DLAA the frame is the same SIZE whether the pass ran or not, so nothing on screen distinguishes
+    // "DLSS is reconstructing" from "the backend declined at startup and you are looking at native".
+    // The dropdown says what was ASKED for; this says what is HAPPENING.
+    unsigned char g_upscaleStatusBuf[512] = {};
+    bstring       g_upscaleStatusText = bfromarr(g_upscaleStatusBuf);
+    float4        g_upscaleStatusColor = { 0.70f, 1.0f, 0.70f, 1.0f };
     unsigned char g_grassCrushBuf[192] = {};
     bstring       g_grassCrushText = bfromarr(g_grassCrushBuf);
     float4        g_grassCrushColor = { 0.70f, 1.0f, 0.70f, 1.0f };
@@ -13563,13 +13962,74 @@ namespace {
     //
     // Amplitude in PIXELS, peak-to-peak. 1.0 spreads samples over exactly one pixel, which is the
     // textbook choice and what DLSS/FSR2 expect; smaller trades reconstruction for less crawl.
-    float    g_jitterAmp    = 0.0f;
-    // Sequence length. Halton is aperiodic, so this is where we CHOOSE to wrap — and wrapping is
-    // wanted: a phase count the accumulator's history depth is a multiple of converges to an even
-    // sample distribution instead of drifting through one forever. 8 is the standard 1:1 figure;
-    // an upscaler at input scale s wants ~8/s² and that is the number to raise this to when the
-    // DLSS backend lands, NOT a value to guess now.
-    float    g_jitterPhases = 8.0f;
+    //
+    // ⚠⚠ SINCE 4d THIS IS NOT THE AMPLITUDE THE RENDERER USES — `jitterAmp()` below is, and it
+    // returns 0 unless a temporal backend is armed. Read the raw global only to display or set it.
+    // The default moved from 0 to 1.0 at the same time, and the two changes are one decision: the
+    // slider used to ship at 0 because "turning it on before M1's upscaler lands buys crawling
+    // foliage and nothing else", i.e. it was gated by hand, on the honour system, on a global
+    // nothing enforced. With the gate at the producer that reason is discharged — DLSS off is still
+    // exactly zero jitter — and the remaining question is what the value should be the moment a
+    // temporal backend DOES arm. 1.0 is that answer, and shipping it 0 would mean the first DLSS
+    // frame anyone sees is one with nothing to reconstruct from.
+    float    g_jitterAmp    = 1.0f;
+    // Sequence length, and 0 = AUTO. Halton is aperiodic, so this is where we CHOOSE to wrap — and
+    // wrapping is wanted: a phase count the accumulator's history depth is a multiple of converges
+    // to an even sample distribution instead of drifting through one forever.
+    //
+    // ⚠ 8 WAS THE 1:1 FIGURE AND IT IS NOT A CONSTANT — it is `8 x (output pixels / input pixels)`,
+    // which is 8 at DLAA and ~18 at Quality (67% linear = 44.4% of the pixels). Inheriting the 8
+    // would be [[feedback_prior_art_constants_dont_transfer]] with the derivation sitting right
+    // there: the sequence has to cover every output sample position, and there are more of them per
+    // input sample as the rect narrows. So the DEFAULT is now the derivation rather than the
+    // reference implementation's 1:1 number, and it follows the input-scale slider for free instead
+    // of being a second thing to remember to move. A positive value is an explicit override, for
+    // the A/B.
+    float    g_jitterPhases = 0.0f;
+
+    // ─── THE EFFECTIVE AMPLITUDE — THE GATE, AT THE PRODUCER ─────────────────────────────────────
+    // ⚠⚠ ONE FUNCTION, THREE CALLERS (advanceJitter, the arm log, the heartbeat), and it exists for
+    // exactly the reason upscaleScale() does one screen up: **jitter has precisely one consumer, a
+    // temporal accumulator, and the knob and the consumer must not be gated on different
+    // conditions.** 4b shipped that mistake in the other direction and it reached the game as
+    // "scale shrinks the view" ([[feedback_knob_gated_apart_from_its_consumer]]) — the input rect
+    // narrowed by a live knob while the pass that widens it back was gated on something else. Here
+    // the two failure modes are symmetric and both are silent-ish:
+    //   amplitude > 0, no accumulator  -> the image SHIMMERS and nothing is gained;
+    //   amplitude 0, accumulator armed -> DLSS reconstructs from one sample position forever, which
+    //                                     reads as "DLSS is soft", not as a misconfiguration.
+    // Enforcing it at the site that AUTHORS the offset makes both unreachable, instead of asserting
+    // it at the sites that must not violate it.
+    //
+    // ⚠ AND THE ESCAPE HATCH IS NOT OPTIONAL. M1 step 1's verification is jitter ALONE, with no
+    // upscaler — the exact state this gate suppresses — so a gate with no override would be
+    // [[feedback_isolation_lever_killed_its_own_subject]]: the lever kills its own subject and the
+    // step can no longer be tested. `MGE_HOST_KNOBS=jitterForce=1` restores it, and says in its own
+    // name that it is a measurement rather than a setting.
+    float jitterAmp() {
+        // ⚠ upscaleTemporalActive(), NOT g_upscaleTemporal — the mode is LIVE, so "a temporal
+        // backend was armed at startup" is not the same claim as "it is running this frame". Setting
+        // the mode to Off has to take the jitter with it or the player gets a shimmering native
+        // image and no accumulator, which is the exact failure this gate exists to prevent.
+        if (!upscaleTemporalActive() && !g_jitterForce) { return 0.0f; }
+        return (g_jitterAmp > 0.0f) ? g_jitterAmp : 0.0f;
+    }
+    // 8 x (output pixels / input pixels), or the explicit override. Derived from the LIVE rects, so
+    // moving the input-scale slider moves the sequence length with it — see g_jitterPhases.
+    uint32_t jitterPhases() {
+        if (g_jitterPhases > 0.5f) {
+            const uint32_t p = (uint32_t)(g_jitterPhases + 0.5f);
+            return (p < 1u) ? 1u : ((p > 64u) ? 64u : p);
+        }
+        const double inPx  = (double)g_live.width    * (double)g_live.height;
+        const double outPx = (double)g_live.outWidth * (double)g_live.outHeight;
+        if (!(inPx > 0.0) || !(outPx > 0.0)) { return 8u; }
+        const double p = 8.0 * outPx / inPx + 0.5;
+        // The 64 ceiling is the same one advanceJitter always applied: past it the sequence is
+        // longer than any accumulator's history and the wrap stops buying the even distribution it
+        // is there for. It bites at ~0.35 linear scale, i.e. below UltraPerformance.
+        return (p < 1.0) ? 1u : ((p > 64.0) ? 64u : (uint32_t)p);
+    }
 
     // THIS FRAME's offset, in pixels, +x right / +y down — the same sense the half-pixel term uses.
     // Computed ONCE per RENDERED frame (advanceJitter, at the top of renderScene) and then read by
@@ -13583,6 +14043,9 @@ namespace {
     // the history.
     float    g_jitterPx[2]  = { 0.0f, 0.0f };
     uint32_t g_jitterIndex  = 0;
+    // Latch for the heartbeat's "knob set but gated" line — see its emit site for why that one is
+    // said once per session while the live one repeats.
+    bool     g_jitterGateReported = false;
 
     // --- M1 CAMERA-ONLY MOTION VECTORS (tasks/forge-upscale.md) ----------------------------------
     // Ships OFF: nothing consumes the vectors until the upscaler lands, and a dispatch whose output
@@ -17029,14 +17492,24 @@ namespace {
           // ⚠ 0 IS THE SHIPPED DEFAULT AND IT IS BIT-IDENTICAL. Until the upscaler lands, moving
           // this off 0 buys crawling foliage and nothing else — it is here so the jitter can be
           // verified ALONE (the plan's step 2), not because it improves anything on its own.
-          t.sliderF("Temporal jitter (px, 0 = off; needs an upscaler to be worth anything)",
+          // ⚠ SINCE 4d THIS SLIDER IS INERT UNLESS A TEMPORAL BACKEND IS ARMED, and that is the
+          // point rather than a limitation: the effective amplitude comes from jitterAmp(), which
+          // returns 0 with no accumulator to feed. Dragging it on the passthrough or with the
+          // upscaler off changes nothing, which is the correct behaviour — it used to change the
+          // image into a shimmering version of itself for no gain. The label says so, because an
+          // inert control that does not say what it needs is the next version of the complaint the
+          // input-scale slider already carries.
+          t.sliderF("Temporal jitter (px; INERT unless a temporal backend is armed — see Upscale)",
                     &g_jitterAmp, 0.0f, 1.5f, 0.05f);
-          t.sliderF("Jitter sequence length (Halton 2,3 phases)",
-                    &g_jitterPhases, 1.0f, 32.0f, 1.0f);
-          // M1 motion vectors. Off by default because nothing reads them yet; F12 mode 17 forces the
-          // pass on regardless, so the view can never be looking at a lane its own selection
-          // disabled ([[feedback_isolation_lever_killed_its_own_subject]]).
-          t.checkbox("Motion vectors (camera-only; F12 mode 17 forces this on)", &g_mvEnable);
+          // 0 = AUTO = 8 x (output px / input px), i.e. 8 at DLAA and ~18 at Quality. A positive
+          // value pins it — the arm for "is the derivation right", not a thing to set by taste.
+          t.sliderF("Jitter sequence length (Halton 2,3 phases; 0 = AUTO from the rects)",
+                    &g_jitterPhases, 0.0f, 32.0f, 1.0f);
+          // M1 motion vectors. Off by default because nothing reads them unless an upscaler is
+          // armed; F12 mode 17 AND a temporal backend both force the pass on regardless, so neither
+          // a view nor a reconstruction can ever be looking at a lane its own selection disabled
+          // ([[feedback_isolation_lever_killed_its_own_subject]]).
+          t.checkbox("Motion vectors (camera-only; F12 mode 17 and DLSS force this on)", &g_mvEnable);
           // The reactive mask's two thresholds are a RELATIVE depth error, so they are unitless and
           // hold at every distance. Walk them against `reactive=` on the heartbeat, not by eye:
           // a mask covering the screen is the upscaler switched off and it looks like "soft".
@@ -17080,9 +17553,50 @@ namespace {
           // rect stops being able to carry the frame; setRenderSize re-clamps and rounds to EVEN, so
           // a value between two even rects lands on one of them rather than on an odd column the
           // half-res AO and bloom chains would have to know about.
-          t.sliderF("Input scale (1.0 = exact identity; INERT while MSAA is on — the backend "
-                    "refuses there)",
-                    &g_upscaleInputScale, 0.33f, 1.0f, 0.01f);
+          // ⚠⚠ SINCE 4d THIS SLIDER IS ALSO THE QUALITY-MODE SELECTOR, and there is deliberately no
+          // second control for that. The host authors exactly ONE rect (upscaleScale() ->
+          // setRenderSize), so a discrete mode picker would be a second author of the same number
+          // and the two could disagree — the defect class this milestone has now paid for twice.
+          // The NGX backend instead DERIVES which DLSS mode the rect corresponds to and tells DLSS,
+          // then logs what DLSS says that mode's optimal rect would have been beside the one we
+          // actually used. The ratios, for setting it by hand:
+          //   1.00 = DLAA   0.67 = Quality   0.58 = Balanced   0.50 = Performance   0.33 = Ultra
+          // ⚠ 1.0 IS AN EXACT IDENTITY BY CONSTRUCTION **ONLY FOR THE PASSTHROUGH** — evaluate()
+          // there returns the scene target unchanged, having recorded nothing. For a temporal
+          // backend 1.0 is DLAA and the pass very much runs, which is why the first 4d test is
+          // taken at 1.0 and the first 4b test could not be.
+          // ─── THE CONTROL: A FIXED LIST, LIVE, WITH "OFF" IN IT ──────────────────────────
+          // ⚠⚠ THIS REPLACED A FREE 0.33-1.0 SLIDER, and not for taste. DLSS's modes each report
+          // their own ACCEPTED render-rect range, those ranges have HOLES between them, and
+          // UltraPerformance is a single FIXED rect rather than a range at all — so a free slider
+          // has settings no DLSS mode will take. One in-game session produced ELEVEN `OUTSIDE the
+          // range DLSS reports` warnings, including a rect that missed Performance's floor by ONE
+          // pixel. The mode is now the control and the SDK supplies the rect.
+          //
+          // ⚠ "Off" IS AN ENTRY, NOT A SEPARATE CHECKBOX. Two controls that can disagree about
+          // whether the feature is running is the defect shape this milestone has already paid for
+          // twice; "off" is the same question as "which mode", so it is the same control.
+          // Switching to Off restores the un-upscaled frame exactly — full-res raster, no pass
+          // recorded, resolve on set instance 0, and the jitter and motion-vector passes disarm
+          // with it. Switching back resets DLSS's history, because the accumulator it would
+          // otherwise continue from is a run of frames it did not produce.
+          t.dropdown("Mode (live)", &g_upscaleMode, kUpscaleModeNames, (uint32_t)kUpscaleModeCount);
+          // WHAT IS ACTUALLY HAPPENING, as opposed to what was asked for. At DLAA the delivered
+          // frame is the same size either way, so without this line "DLSS is on" and "the backend
+          // declined at startup" look identical on screen. Filled every frame in renderScene.
+          // ─── THE MODEL, and the reason it is in OUR panel rather than ReShade's ───────────
+          // ⚠ ReShade / OptiScaler / any in-game DLSS overlay hooks the GAME process. DLSS here runs
+          // in mgeHost64.exe under D3D12 — a different process — so those tools cannot see it at
+          // all, and what they DO see (Morrowind.exe presenting through DXVK) is why they report
+          // this as a Vulkan game. This dropdown is the supported route: the SDK's own per-mode
+          // render-preset hint.
+          // ⚠⚠ CHANGING IT REBUILDS THE DLSS FEATURE — expect a brief hitch. K is the current
+          // transformer default and J is its near-twin (less ghosting, more flicker), which is the
+          // A/B worth taking by eye. The legacy CNN presets are absent on purpose: preset E HANGS
+          // THE GPU on runtime 310.8.0, measured — see upscale.h.
+          t.dropdown("Model / render preset (rebuilds DLSS)", &g_upscalePreset,
+                     kUpscalePresetNames, (uint32_t)kUpscalePresetCount);
+          t.dynamicText("", &g_upscaleStatusText, &g_upscaleStatusColor);
           // THE SPATIAL FILTER, and these two are here for a measurement rather than for taste.
           // Since 4c the bloom pyramid reads this pass's OUTPUT, so this filter is upstream of an
           // ENERGY operation — and the anti-ringing clamp is not energy-conserving. Drag the input
@@ -17093,6 +17607,19 @@ namespace {
           t.sliderF("Sharpness — Mitchell C at B=0; 0.5 = Catmull-Rom", &g_upscaleSharpness, 0.0f, 1.0f, 0.05f);
           t.sliderF("Anti-ring clamp (1 = on; 0 = DIAGNOSTIC, expect ringing)",
                     &g_upscaleAntiRing, 0.0f, 1.0f, 1.0f);
+          // M1 4d. ⚠ NEITHER OF THE TWO KNOBS ABOVE REACHES THE NGX BACKEND, and that is settled by
+          // reading rather than by taste: nvsdk_ngx_defs.h marks DLSS's sharpening flag
+          // SR_DEPRECATED_SHARPENING, "Sharpness is not supported". They stay what upscale.h says
+          // they are — the PASSTHROUGH's spatial filter — so on a DLSS session they are inert, the
+          // same way `reset` is inert on the passthrough.
+          //
+          // The MV-rect convention IS live here, because it is the one thing 4d could not settle by
+          // reading and because it cannot be seen at DLAA: at in == out the flag has nothing to
+          // scale. If DLAA is clean and Quality smears with motion, this is the first switch to
+          // move. There is deliberately no backend picker — `upscaleBackend` is read at INIT, and a
+          // checkbox that silently does nothing after startup is worse than none.
+          t.checkbox("Motion vectors are at the INPUT rect (DLSS MVLowRes; invisible at DLAA)",
+                     &g_upscaleMvLowRes);
           t.flush(); }
 
         // -- Tab: Bloom (tasks/forge-postprocess.md step 4) --
@@ -20175,6 +20702,16 @@ namespace {
 }
 
 namespace ForgeRender {
+
+// M1 4d follow-up: the ReShade/overlay surface. Declared up here because init() calls all three and
+// sits above their definitions in this same namespace — the arrangement logRectLine already uses one
+// namespace over. ⚠ They must be declared HERE and not beside logRectLine: that block is the
+// anonymous namespace, and a declaration there with the definition here is two different functions
+// as far as the linker is concerned.
+void createHostWindow(Renderer* R);
+void presentHostWindow();
+void destroyHostWindow(Renderer* R);
+
     // S3a. Defined below beside calGainDomain (it inverts through it), read above by init's curve
     // report — declared here at NAMESPACE scope rather than at the call site, because a block-scope
     // function declaration has external linkage and would name a different entity than the
@@ -20202,6 +20739,15 @@ namespace ForgeRender {
         LOG::logline(">> [forge] MGE_HOST_KNOBS = %s", env);
         struct FKnob { const char* name; float* p; };
         struct BKnob { const char* name; bool*  p; };
+        // M1 4d added the third kind. `upscaleBackend` names a backend, and a float or a bool
+        // cannot: 0/1 would be a mapping nobody can read off a command line, and 4e adds `auto` as
+        // a third value, which a bool has nowhere to put. One entry today; the table exists so the
+        // second one is an entry rather than a redesign.
+        struct SKnob { const char* name; char* p; size_t cap; };
+        // ...and a uint kind, added with the 4d-3 mode list. `upscaleMode` is an INDEX into a fixed
+        // list, which a float cannot carry honestly (0.9 is not a mode) and a bool cannot carry at
+        // all now that Off is one entry among six.
+        struct UKnob { const char* name; uint32_t* p; uint32_t max; };
         const FKnob fknobs[] = {
             // S2 THE ATMOSPHERE — first in the table because the S2b gate runs unattended and these
             // are the three lanes an unattended session has to be able to move: the march budget
@@ -20296,6 +20842,9 @@ namespace ForgeRender {
             { "mvReactiveT0",          &g_mvReactiveT0          },
             { "mvReactiveT1",          &g_mvReactiveT1          },
             { "mvReactiveGain",        &g_mvReactiveGain        },
+            // ⚠ 0 = AUTO since 4d, which is the shipped default: 8 x (output px / input px), i.e.
+            // 8 at DLAA and ~18 at Quality. A positive value pins it, for the A/B that asks whether
+            // the derivation is right — which is the only reason to set it at all now.
             { "jitterPhases",          &g_jitterPhases          },
             { "causticRippleStride", &g_causticRippleStride },
             // W27: the resolution/window trade on the wake map, env-driven so the minimized harness
@@ -20385,6 +20934,24 @@ namespace ForgeRender {
             // extra allocated, which is verification step 1 and the first thing to try when
             // bisecting anything post-process.
             { "upscaleEnable",       &g_upscaleEnable       },
+            // The ReShade/overlay surface. Read at INIT (it decides whether a window and swapchain
+            // are created at all), which is why it is here and has no panel checkbox — the panel it
+            // would live on is drawn into the game's frame, not this window.
+            { "hostWindow",          &g_hostWindow          },
+            // M1 4d. ⚠ jitterForce IS A MEASUREMENT, NOT A SETTING: it bypasses the producer gate
+            // in jitterAmp() so M1 step 1's isolation test — jitter alone, no upscaler, the image
+            // must shimmer sub-pixel while the atmos/gate rows do not move — stays runnable in a
+            // build where the gate would otherwise suppress exactly that state.
+            { "jitterForce",         &g_jitterForce         },
+            // ...and the one motion-vector convention 4d could not settle by reading. It ships true
+            // (our vectors are written at the INPUT rect) and it is INVISIBLE at DLAA, so if DLAA is
+            // clean and Quality smears, this is the first thing to flip.
+            { "upscaleMvLowRes",     &g_upscaleMvLowRes     },
+            // The two optional DLSS inputs. 0 on either is an isolation arm — the only two things a
+            // temporal backend can be asked to run without, so between them they localise a fault
+            // that names no resource of its own.
+            { "upscaleNgxExposure",  &g_upscaleSuppliedExposure },
+            { "upscaleNgxReactive",  &g_upscaleNgxReactive      },
             { "atmosMoonOn",        &g_atmosMoonOn        },
             // ⚠ THE GATE'S OWN ARM. OFF skips the one reference-configuration frame at startup —
             // which is the setting for a session that wants its first frame to be live weather, and
@@ -20427,6 +20994,26 @@ namespace ForgeRender {
             // arm rather than multiplying by it, so with this off not one texture fetch is paid.
             { "grassCrush",          &g_grassCrush          },
         };
+        const UKnob uknobs[] = {
+            // 0 Off, 1 DLAA, 2 Quality, 3 Balanced, 4 Performance, 5 UltraPerformance. LIVE on the
+            // panel; here because the minimized perf harness cannot open a dropdown, and the A/B
+            // this milestone actually needs — DLSS off vs DLAA vs Quality at the same camera — is
+            // three runs of one token.
+            { "upscaleMode", &g_upscaleMode, (uint32_t)kUpscaleModeCount - 1u },
+            // 0 Default, 1 K, 2 J, 3 L, 4 M. ⚠ The legacy CNN presets E and F are NOT selectable:
+            // preset E hangs the GPU on runtime 310.8.0 (see upscale.h). K vs J is the A/B that
+            // remains, and it is one token.
+            { "upscalePreset", &g_upscalePreset, (uint32_t)kUpscalePresetCount - 1u },
+        };
+        const SKnob sknobs[] = {
+            // M1 4d: `passthrough` (default) or `ngx`. Read at INIT — it decides which object is
+            // CREATED — so it belongs here rather than only on the panel, and there is deliberately
+            // no panel control for the same reason `upscaleEnable` has none: a widget that silently
+            // does nothing after startup is worse than none. An unrecognised value REFUSES rather
+            // than falling back, so a typo cannot produce a run labelled DLSS that rendered a
+            // Catmull-Rom.
+            { "upscaleBackend", g_upscaleBackend, sizeof(g_upscaleBackend) },
+        };
         std::string spec(env);
         size_t pos = 0;
         while (pos <= spec.size()) {
@@ -20452,6 +21039,59 @@ namespace ForgeRender {
                     if (key == k.name) {
                         *k.p = (std::atoi(val.c_str()) != 0);
                         LOG::logline(">> [forge]   %s = %s", k.name, *k.p ? "true" : "false");
+                        hit = true;
+                        break;
+                    }
+                }
+            }
+            if (!hit) {
+                for (const UKnob& k : uknobs) {
+                    if (key == k.name) {
+                        const long v = std::atol(val.c_str());
+                        // CLAMPED, and an out-of-range value is reported rather than wrapped: a
+                        // mode index nobody can see is a run labelled "Performance" that rendered
+                        // something else.
+                        const uint32_t c = (v < 0) ? 0u
+                                         : ((uint32_t)v > k.max ? k.max : (uint32_t)v);
+                        if ((long)c != v) {
+                            LOG::logline("!! [forge]   %s=%ld out of range [0..%u] — clamped to %u",
+                                         k.name, v, k.max, c);
+                        }
+                        *k.p = c;
+                        LOG::logline(">> [forge]   %s = %u (%s)", k.name, c,
+                                     (k.p == &g_upscaleMode)   ? kUpscaleModeNames[c]
+                                   : (k.p == &g_upscalePreset) ? kUpscalePresetNames[c] : "");
+                        hit = true;
+                        break;
+                    }
+                }
+            }
+            if (!hit) {
+                for (const SKnob& k : sknobs) {
+                    if (key == k.name) {
+                        // Truncating rather than rejecting an over-long value is safe HERE and only
+                        // here: every consumer of a string knob compares against a known name, so a
+                        // truncated value matches nothing and takes that knob's own unrecognised
+                        // path, which logs. It cannot silently become a different valid value.
+                        std::snprintf(k.p, k.cap, "%s", val.c_str());
+                        LOG::logline(">> [forge]   %s = %s", k.name, k.p);
+                        hit = true;
+                        break;
+                    }
+                }
+            }
+            // ⚠ NOT EVERY KNOB IN THIS STRING IS *THIS* TABLE'S. main.cpp reads MGE_HOST_KNOBS a
+            // second time, BEFORE the renderer exists, because its two knobs decide which DLLs are
+            // resident at device-creation time — far too early for a table that lives inside
+            // ForgeRender. Without this list they were reported "UNKNOWN … ignored" in the same log
+            // that, four lines above, shows them having done their job. A warning that contradicts
+            // the evidence beside it is worse than no warning: it teaches you to distrust the log.
+            if (!hit) {
+                static const char* const kOwnedByMain[] = { "proxyDlls", "preloadNgx" };
+                for (const char* n : kOwnedByMain) {
+                    if (key == n) {
+                        LOG::logline(">> [forge]   %s — handled in main.cpp before device creation "
+                                     "(see the [proxy] lines at the top of this log)", n);
                         hit = true;
                         break;
                     }
@@ -20721,6 +21361,10 @@ namespace ForgeRender {
         // pRT's B8G8R8A8 (no MSAA UI pipeline). Failure here is non-fatal — the scene still renders.
         initDevUI(R, width, height, (uint32_t)g_live.pRT->mFormat);
 
+        // The ReShade/overlay surface, if asked for. AFTER everything above, because it needs the
+        // renderer and the present queue; non-fatal if it fails.
+        createHostWindow(R);
+
         std::printf("[forge] live init OK\n");
         return true;
     }
@@ -20733,6 +21377,288 @@ namespace ForgeRender {
     // gResolveSource, so the existing 1:1 map is already correct and the rescale lives in the upscale
     // pass, which is exactly what the seam is for. The live knob is g_upscaleInputScale.
 
+
+    // ─── THE OVERLAY WINDOW: CREATE ──────────────────────────────────────────────────────────────
+    // Called from init(), AFTER the renderer and queue exist (the swapchain needs both) and after
+    // the env knobs have been read. Non-fatal throughout: any failure leaves g_hostWindowReady false
+    // and the host renders exactly as it does without the feature — the same shape every other
+    // optional block in this file uses.
+    LRESULT CALLBACK hostWndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
+        // ⚠ WM_CLOSE IS SWALLOWED. Closing this window must not look like "quit the renderer" — it
+        // is a settings surface for a process the player did not start and cannot meaningfully end
+        // on its own. Hide it instead; the host exits with the game as it always has.
+        if (msg == WM_CLOSE) { ShowWindow(h, SW_HIDE); return 0; }
+        // Ctrl+Alt+Insert: SUMMON. Un-hides (WM_CLOSE above is a hide, and without this there is no
+        // way back), un-minimises, raises, and takes focus.
+        //
+        // ⚠ SetForegroundWindow ALONE IS NOT ENOUGH and silently returns FALSE: a process that is
+        // not already the foreground one is refused unless it "received the last input event" — and
+        // the input event here went to the GAME, which is the whole problem. Attaching this thread's
+        // input queue to the foreground thread's for the duration is the documented way through;
+        // detached again immediately, because leaving two threads' input queues joined makes each
+        // one's focus changes the other's.
+        if (msg == WM_HOTKEY && (int)w == kHostWndHotkeyId) {
+            ShowWindow(h, SW_SHOW);
+            if (IsIconic(h)) { ShowWindow(h, SW_RESTORE); }
+            const HWND  fg    = GetForegroundWindow();
+            const DWORD fgTid = fg ? GetWindowThreadProcessId(fg, nullptr) : 0;
+            const DWORD myTid = GetCurrentThreadId();
+            const bool  attach = (fgTid != 0 && fgTid != myTid);
+            if (attach) { AttachThreadInput(myTid, fgTid, TRUE); }
+            BringWindowToTop(h);
+            SetForegroundWindow(h);
+            SetFocus(h);
+            if (attach) { AttachThreadInput(myTid, fgTid, FALSE); }
+            return 0;
+        }
+        // Teardown, posted by destroyHostWindow from the render thread. DestroyWindow MUST run on
+        // the thread that created the window, so it is asked for rather than called.
+        if (msg == kHostWndQuitMsg) { UnregisterHotKey(h, kHostWndHotkeyId); DestroyWindow(h); return 0; }
+        if (msg == WM_DESTROY)      { PostQuitMessage(0); return 0; }
+        return DefWindowProcW(h, msg, w, l);
+    }
+
+    // ─── THE OVERLAY WINDOW LIVES ON ITS OWN THREAD ──────────────────────────────────────────────
+    // ⚠⚠ THE PUMP MUST NOT BE INSIDE THE FRAME. It was: presentHostWindow() drained the queue once
+    // per host frame, which sounds equivalent and is not — the host only renders while the CLIENT is
+    // feeding it, so the moment the game stops producing frames the pump stops with it. That is
+    // exactly the moment the window needs input: you alt-tab TO the overlay, the game loses focus,
+    // and if it then stops rendering the window is left with a queue nobody drains — the picture is
+    // still on screen (the last present is still there) so it looks alive, while every keystroke
+    // piles up unread. An injected overlay's hotkey (ReShade's HOME, OptiScaler's INSERT) arrives as
+    // a WM_KEYDOWN through the WndProc it subclassed, so "the HUD draws but the hotkey does nothing"
+    // is the exact signature of a dead pump. It also cured a second latent bug: Windows declares any
+    // window hung whose queue goes unread for ~5s, which a loading screen alone could cause.
+    //
+    // A window belongs to the thread that CREATED it — messages are delivered to that thread's
+    // queue — so decoupling the pump means creating the window here too. Presenting its swapchain
+    // from the render thread is unaffected: DXGI has no such affinity.
+    void hostWindowThreadMain() {
+        g_hostWndThreadId = GetCurrentThreadId();
+
+        WNDCLASSEXW wc = {};
+        wc.cbSize = sizeof(wc);
+        wc.lpfnWndProc = hostWndProc;
+        wc.hInstance = GetModuleHandleW(nullptr);
+        // ⚠ CAST, because this project builds MBCS so IDC_ARROW expands to the ANSI
+        // MAKEINTRESOURCE. It is an INTEGER resource id in both encodings, so reinterpreting it for
+        // the W entry point is correct rather than merely convenient.
+        wc.hCursor = LoadCursorW(nullptr, (LPCWSTR)IDC_ARROW);
+        wc.lpszClassName = L"mgeHost64Overlay";
+        RegisterClassExW(&wc);   // ERROR_CLASS_ALREADY_EXISTS on a re-init is fine and expected
+        RECT r = { 0, 0, (LONG)kHostWindowW, (LONG)kHostWindowH };
+        AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
+        g_hostHwnd = CreateWindowExW(0, wc.lpszClassName,
+                                     L"MGE XE — host overlay (ReShade / OptiScaler / DLSS settings)",
+                                     WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT,
+                                     r.right - r.left, r.bottom - r.top,
+                                     nullptr, nullptr, wc.hInstance, nullptr);
+        if (g_hostHwnd) {
+            // SW_SHOWNOACTIVATE: appear without stealing focus from the game at startup. The
+            // summon hotkey below is how it is reached afterwards.
+            ShowWindow(g_hostHwnd, SW_SHOWNOACTIVATE);
+            // ⚠ REGISTERED ON THIS THREAD, because WM_HOTKEY is posted to the registering THREAD's
+            // queue — this is the one with a pump. Failure is logged rather than ignored: it means
+            // something else already owns the combination, and a summon key that silently does
+            // nothing is indistinguishable from the overlay bug it exists to work around.
+            g_hostWndHotkey = RegisterHotKey(g_hostHwnd, kHostWndHotkeyId,
+                                             MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, VK_INSERT) != 0;
+            if (!g_hostWndHotkey) { g_hostWndCreateError = GetLastError(); }
+        } else {
+            g_hostWndCreateError = GetLastError();
+        }
+        // Published AFTER the handle is written; the render thread's acquire-load pairs with this.
+        g_hostWndCreated.store(true, std::memory_order_release);
+        if (!g_hostHwnd) { return; }
+
+        // ⚠ GetMessageW, not PeekMessage-in-a-spin: this thread must SLEEP between messages. A poll
+        // loop here would burn a core for a debug surface.
+        MSG msg;
+        while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+    }
+
+    void createHostWindow(Renderer* R) {
+        if (!g_hostWindow || !R || !g_live.pQueue) { return; }
+
+        g_hostWndCreated.store(false, std::memory_order_relaxed);
+        g_hostWndThread = std::thread(hostWindowThreadMain);
+        // Bounded wait: the swapchain below needs the HWND, and a window thread that never reports
+        // must not hang host startup. 2s is far beyond a CreateWindowExW that is going to succeed.
+        for (int i = 0; i < 1000 && !g_hostWndCreated.load(std::memory_order_acquire); ++i) {
+            Sleep(2);
+        }
+        if (!g_hostWndCreated.load(std::memory_order_acquire) || !g_hostHwnd) {
+            LOG::logline("!! [hostwnd] CreateWindow FAILED (error %lu) — no overlay surface",
+                         (unsigned long)g_hostWndCreateError);
+            LOG::flush();
+            if (g_hostWndThread.joinable()) { g_hostWndThread.join(); }
+            return;
+        }
+
+        SwapChainDesc sd = {};
+        sd.mWindowHandle.type = WINDOW_HANDLE_TYPE_WIN32;
+        sd.mWindowHandle.window = g_hostHwnd;
+        sd.ppPresentQueues = &g_live.pQueue;
+        sd.mPresentQueueCount = 1;
+        sd.mImageCount = 2;
+        sd.mWidth = kHostWindowW;
+        sd.mHeight = kHostWindowH;
+        sd.mColorFormat = TinyImageFormat_B8G8R8A8_UNORM;
+        sd.mColorClearValue = { { 0.05f, 0.06f, 0.08f, 1.0f } };
+        // ⚠ VSYNC OFF. This swapchain is presented once per HOST frame, so vsync here would pace the
+        // renderer to the monitor — throttling the game's frame production through a debug window.
+        sd.mEnableVsync = false;
+        sd.mUseFlipSwapEffect = true;
+        addSwapChain(R, &sd, &g_pHostSwapChain);
+        if (!g_pHostSwapChain) {
+            LOG::logline("!! [hostwnd] addSwapChain FAILED — the window exists but ReShade gets no "
+                         "runtime, so its overlay stays absent");
+            LOG::flush();
+            return;
+        }
+        // Its own pool/cmd/fence: the frame's primary command list is in flight when this records,
+        // and a shared allocator cannot be reset under a submission it already fed (the same reason
+        // pAuxCmdPool exists).
+        CmdPoolDesc pd = {};
+        pd.pQueue = g_live.pQueue;
+        // ⚠ ONE SET PER SWAPCHAIN IMAGE, not one set full stop. With a single allocator the only way
+        // to make resetting it safe is to wait for the GPU immediately after presenting — which
+        // turns the host's frame into "record, then block until the whole frame has EXECUTED", and
+        // the frame-ahead overlap this renderer is built around disappears. Measured 2026-09-02:
+        // that wait moved the host split's `total` from 2.5ms to 22.5ms, i.e. exactly the GPU time.
+        // A ring of kHostWndRing sets waits instead on the set from kHostWndRing frames ago, which
+        // has almost always signalled already, so the invariant ("never reset an allocator whose
+        // commands are still executing") is kept without the stall.
+        g_hostWindowReady = true;
+        for (uint32_t i = 0; i < kHostWndRing; ++i) {
+            initCmdPool(R, &pd, &g_pHostWndPool[i]);
+            CmdDesc cd = {};
+            cd.pPool = g_pHostWndPool[i];
+            initCmd(R, &cd, &g_pHostWndCmd[i]);
+            initFence(R, &g_pHostWndFence[i]);
+            g_hostWndSubmitted[i] = false;
+            if (!g_pHostWndPool[i] || !g_pHostWndCmd[i] || !g_pHostWndFence[i]) {
+                g_hostWindowReady = false;
+            }
+        }
+        LOG::logline(">> [hostwnd] %s — %ux%u, hwnd=%p, pump on thread %lu, summon hotkey "
+                     "Ctrl+Alt+Insert %s. ⚠ It exists to give an injected overlay (ReShade, "
+                     "OptiScaler) a swapchain to build a runtime on; the GAME's frame does NOT pass "
+                     "through it. ⚠⚠ AN OVERLAY ONLY TAKES INPUT WHILE THIS WINDOW IS THE "
+                     "FOREGROUND ONE — measured, from OptiScaler's own per-frame health line "
+                     "(focused:no => mode:none, polled:no). With MW borderless-fullscreen this "
+                     "window is behind it and unreachable, which is what the summon hotkey is for: "
+                     "Ctrl+Alt+Insert to bring it forward, THEN the overlay's own key (HOME for "
+                     "ReShade, INSERT for OptiScaler).",
+                     g_hostWindowReady ? "ready" : "PARTIAL (present will be skipped)",
+                     kHostWindowW, kHostWindowH, (void*)g_hostHwnd,
+                     (unsigned long)g_hostWndThreadId,
+                     g_hostWndHotkey ? "REGISTERED"
+                                     : "FAILED to register (already taken by another process)");
+        LOG::flush();
+        std::printf("[forge][hostwnd] %s %ux%u\n", g_hostWindowReady ? "ready" : "PARTIAL",
+                    kHostWindowW, kHostWindowH);
+    }
+
+    // ─── THE OVERLAY WINDOW: PRESENT, ONCE PER HOST FRAME ────────────────────────────────────────
+    // ⚠ NO MESSAGE PUMP HERE, deliberately — it used to be, and that was the bug. The pump lives on
+    // the window's own thread (hostWindowThreadMain), because a queue drained only while the client
+    // is feeding frames is a queue that stops exactly when the window is asked for input.
+    void presentHostWindow() {
+        if (!g_hostWindowReady || !g_pHostSwapChain) { return; }
+        Renderer* R = g_live.pRenderer;
+        const uint32_t s = g_hostWndSlot;
+        g_hostWndSlot = (g_hostWndSlot + 1u) % kHostWndRing;
+        CmdPool* pool  = g_pHostWndPool[s];
+        Cmd*     cmd   = g_pHostWndCmd[s];
+        Fence*   fence = g_pHostWndFence[s];
+
+        uint32_t idx = 0;
+        acquireNextImage(R, g_pHostSwapChain, nullptr, fence, &idx);
+        // ⚠ acquireNextImage RETURNS UINT32_MAX ON FAILURE (Direct3D12.c:5898) — it does not leave
+        // the index alone. Indexing ppRenderTargets with it reads a quarter of the address space
+        // past the array, so the bound is checked before the pointer is, not after.
+        if (idx >= g_pHostSwapChain->mImageCount) { return; }
+        RenderTarget* rt = g_pHostSwapChain->ppRenderTargets[idx];
+        if (!rt) { return; }
+
+        // ⚠ WAITED HERE, BEFORE THE RESET — not after the present. This slot's commands are from
+        // kHostWndRing frames ago and have almost always finished, so this is a signalled-fence
+        // check rather than a stall; waiting after the present instead is a full GPU drain on the
+        // renderer's own queue and costs the frame-ahead overlap (see createHostWindow). The
+        // invariant it protects is the same either way: resetting an allocator whose commands the
+        // GPU is still executing is the classic use-after-free in this API.
+        if (g_hostWndSubmitted[s]) { waitForFences(R, 1, &fence); }
+
+        resetCmdPool(R, pool);
+        beginCmd(cmd);
+        RenderTargetBarrier b = {};
+        b.pRenderTarget = rt;
+        b.mCurrentState = RESOURCE_STATE_PRESENT;
+        b.mNewState     = RESOURCE_STATE_RENDER_TARGET;
+        cmdResourceBarrier(cmd, 0, nullptr, 0, nullptr, 1, &b);
+        // A clear and nothing else. ReShade's overlay is drawn by ReShade, in its Present hook,
+        // on top of whatever this leaves — so the host does not need to render anything at all
+        // for the UI to appear. A flat field is also the honest picture: this window is not
+        // showing the game.
+        BindRenderTargetsDesc bind = {};
+        bind.mRenderTargetCount = 1;
+        bind.mRenderTargets[0] = { rt, LOAD_ACTION_CLEAR };
+        cmdBindRenderTargets(cmd, &bind);
+        cmdBindRenderTargets(cmd, nullptr);
+        b.mCurrentState = RESOURCE_STATE_RENDER_TARGET;
+        b.mNewState     = RESOURCE_STATE_PRESENT;
+        cmdResourceBarrier(cmd, 0, nullptr, 0, nullptr, 1, &b);
+        endCmd(cmd);
+
+        QueueSubmitDesc sub = {};
+        sub.mCmdCount = 1;
+        sub.ppCmds = &cmd;
+        sub.pSignalFence = fence;
+        sub.mSubmitDone = true;
+        queueSubmit(g_live.pQueue, &sub);
+        g_hostWndSubmitted[s] = true;
+        QueuePresentDesc pres = {};
+        pres.pSwapChain = g_pHostSwapChain;
+        pres.mIndex = (uint8_t)idx;
+        pres.mSubmitDone = true;
+        queuePresent(g_live.pQueue, &pres);
+        // Left IN FLIGHT on purpose. The wait for this slot happens at the top of the call that
+        // reuses it, kHostWndRing frames from now.
+    }
+
+    void destroyHostWindow(Renderer* R) {
+        // ⚠ EVERY RING SLOT MAY STILL BE IN FLIGHT now that the present no longer waits, so drain
+        // the ones that were submitted before freeing anything they reference.
+        for (uint32_t i = 0; i < kHostWndRing; ++i) {
+            if (g_pHostWndFence[i] && g_hostWndSubmitted[i]) { waitForFences(R, 1, &g_pHostWndFence[i]); }
+            g_hostWndSubmitted[i] = false;
+        }
+        for (uint32_t i = 0; i < kHostWndRing; ++i) {
+            if (g_pHostWndFence[i]) { exitFence(R, g_pHostWndFence[i]); g_pHostWndFence[i] = nullptr; }
+            if (g_pHostWndCmd[i])   { exitCmd(R, g_pHostWndCmd[i]);     g_pHostWndCmd[i] = nullptr; }
+            if (g_pHostWndPool[i])  { exitCmdPool(R, g_pHostWndPool[i]); g_pHostWndPool[i] = nullptr; }
+        }
+        g_hostWndSlot = 0;
+        // ⚠ SWAPCHAIN FIRST, WINDOW SECOND. DXGI holds the HWND for as long as the swapchain does.
+        if (g_pHostSwapChain) { removeSwapChain(R, g_pHostSwapChain); g_pHostSwapChain = nullptr; }
+        // ⚠ ASKED FOR, NOT CALLED: DestroyWindow only works on the thread that created the window,
+        // and that is no longer this one. The WndProc destroys it, WM_DESTROY posts WM_QUIT, and the
+        // pump falls out of GetMessageW — which is what join() below is waiting for.
+        if (g_hostHwnd) {
+            PostMessageW(g_hostHwnd, kHostWndQuitMsg, 0, 0);
+        } else if (g_hostWndThreadId) {
+            PostThreadMessageW(g_hostWndThreadId, WM_QUIT, 0, 0);
+        }
+        if (g_hostWndThread.joinable()) { g_hostWndThread.join(); }
+        g_hostHwnd = nullptr;
+        g_hostWndThreadId = 0;
+        g_hostWndCreated.store(false, std::memory_order_relaxed);
+        g_hostWindowReady = false;
+    }
 
     // Live render-scale: set the rect for the next renderScene, clamped to the allocation size.
     // 0 ⇒ full allocation. Cheap (a few clamps); everything size-derived in renderScene reads
@@ -20769,13 +21695,15 @@ namespace ForgeRender {
         // and one that was never written, and the upsample then reads a stale texel at the frame's
         // edge. Every scale that produces an odd number is one rounding away from a scale that does
         // not, so this rounds instead of teaching four downstream passes about parity.
-        const float scale = upscaleScale();
+        // ⚠⚠ THE RECT NOW COMES FROM THE **MODE**, NOT FROM A SCALE (4d-3). upscaleInputRect folds
+        // every term that decides it — is the backend allocated, did it arm, is the player asking
+        // for it, what rect did the SDK say that mode wants — into one place, and returns the output
+        // rect unchanged whenever the pass will not run. That is the invariant the "scale shrinks
+        // the view" post-mortem is entirely about, now enforced by construction at the one site that
+        // authors the rect rather than asserted at the sites that must not violate it.
         uint32_t inW = g_live.outWidth;
         uint32_t inH = g_live.outHeight;
-        if (scale < 1.0f) {
-            inW = (uint32_t)((float)g_live.outWidth  * scale + 0.5f) & ~1u;
-            inH = (uint32_t)((float)g_live.outHeight * scale + 0.5f) & ~1u;
-        }
+        upscaleInputRect(g_live.outWidth, g_live.outHeight, &inW, &inH);
         // ⚠⚠ THE ROUNDING IS INSIDE THE `scale < 1` BRANCH, AND THAT IS NOT TIDINESS. Applied
         // unconditionally it takes an ODD output rect — 1365 wide, say — to 1364 AT SCALE 1.0, which
         // makes in != out with the slider sitting at 1.0. The frame would then deliver a 1365-wide
@@ -21823,7 +22751,11 @@ namespace ForgeRender {
     // g_upscaleName is null. Run it with `MGE_HOST_KNOBS=upscaleInputScale=0.5` and NO upscaleEnable.
     bool upscaleProbeNarrow() {
         const uint32_t outW = g_live.outWidth, outH = g_live.outHeight;
-        const bool armed = (g_live.pUpscaler != nullptr) && (g_upscaleName != nullptr);
+        // ⚠ upscaleActive(), NOT merely "a backend exists" — since 4d-3 the mode is live and Off is
+        // one of its entries, so a probe that only asked whether a backend was ARMED would report
+        // `upscale ran=NO` for a deliberate Off as though the pass had failed. The stage's whole
+        // job is to tell a refusal from a configuration.
+        const bool armed = (g_live.pUpscaler != nullptr) && upscaleActive();
         std::printf("[forge] scene-probe: UPSCALE stage — driving setRenderSize(%u,%u) at "
                     "inputScale=%.3f, backend=%s\n",
                     outW, outH, (double)g_upscaleInputScale, armed ? g_upscaleName : "none");
@@ -21851,17 +22783,32 @@ namespace ForgeRender {
         if (!split) {
             // Not a failure of the pass — a failure to SET UP the test, which is a different thing
             // and has to read differently or a green run means nothing.
-            std::printf("[forge] scene-probe: UPSCALE stage INCONCLUSIVE — the rects did not split "
-                        "(in == out), so the identity fast path would still run\n");
-            return false;
+            //
+            // ⚠ AND SINCE 4d IT IS ONLY INCONCLUSIVE FOR A **SPATIAL** BACKEND. The identity fast
+            // path is the passthrough's property, not the seam's: for a temporal backend in == out
+            // is DLAA and the pass runs, so the stage is a real test there and the report below is
+            // the assertion. Saying "inconclusive" for a configuration that did do something would
+            // be the probe describing a frame that did not happen.
+            if (!g_upscaleTemporal) {
+                std::printf("[forge] scene-probe: UPSCALE stage INCONCLUSIVE — the rects did not "
+                            "split (in == out) and backend '%s' is SPATIAL, so its identity fast "
+                            "path would still run\n", armed ? g_upscaleName : "none");
+                return false;
+            }
+            std::printf("[forge] scene-probe: UPSCALE stage at in == out with TEMPORAL backend "
+                        "'%s' — this is DLAA and the pass MUST run. A flat field is still itself, "
+                        "so the centre assertion holds unchanged\n", g_upscaleName);
         }
         return true;
     }
 
     void upscaleProbeReport() {
-        std::printf("[forge] scene-probe: upscale ran=%s -> CENTRE must still be 15,15,15,255 "
-                    "(a flat field through a partition-of-unity filter is itself)\n",
-                    g_lastUpscaleRan ? "YES" : "NO — the pass did not record; see the log above");
+        std::printf("[forge] scene-probe: upscale ran=%s (backend '%s'%s) -> CENTRE must still be "
+                    "15,15,15,255 (a flat field through a partition-of-unity filter is itself, and "
+                    "a temporal accumulator of one flat field is that field)\n",
+                    g_lastUpscaleRan ? "YES" : "NO — the pass did not record; see the log above",
+                    g_upscaleName ? g_upscaleName : "none",
+                    g_upscaleTemporal ? ", TEMPORAL" : "");
     }
 
     void mvEnableForProbe() {
@@ -21990,7 +22937,10 @@ namespace ForgeRender {
     // renderScene beside ++g_renderFrame — see g_jitterPx for why "rendered" is the load-bearing
     // word and why it is not recomputed at each use site.
     void advanceJitter() {
-        if (!(g_jitterAmp > 0.0f)) {
+        // ⚠ THROUGH jitterAmp(), NOT g_jitterAmp — the gate is at this producer, and this is the
+        // producer. See jitterAmp() for why the knob and its one consumer may not be gated apart.
+        const float amp = jitterAmp();
+        if (!(amp > 0.0f)) {
             // Hard zero rather than a small number: this is the bit-identity arm, and the whole
             // claim is that the offset added below is LITERALLY 0.0f. Also resets the index, so
             // toggling the knob off and on restarts the sequence at a known place instead of
@@ -21999,9 +22949,7 @@ namespace ForgeRender {
             g_jitterIndex = 0;
             return;
         }
-        uint32_t phases = (uint32_t)(g_jitterPhases + 0.5f);
-        if (phases < 1u)  { phases = 1u; }
-        if (phases > 64u) { phases = 64u; }
+        const uint32_t phases = jitterPhases();
         const uint32_t i = (g_jitterIndex % phases) + 1u;   // 1-based: see haltonRadical
         ++g_jitterIndex;
         // [0,1) -> [-0.5, 0.5) * amplitude, so amplitude 1.0 spans exactly one pixel. Centring is not
@@ -22019,8 +22967,8 @@ namespace ForgeRender {
         // also an order of magnitude under the half-pixel term sitting beside it. Subtracting the
         // period's true mean would fix it and would make the jitter a function of `phases`, which is
         // a worse trade — but if a fixed sub-pixel shift is ever chased, look here first.
-        g_jitterPx[0] = (haltonRadical(i, 2u) - 0.5f) * g_jitterAmp;
-        g_jitterPx[1] = (haltonRadical(i, 3u) - 0.5f) * g_jitterAmp;
+        g_jitterPx[0] = (haltonRadical(i, 2u) - 0.5f) * amp;
+        g_jitterPx[1] = (haltonRadical(i, 3u) - 0.5f) * amp;
     }
 
     // THE SCREEN-SPACE SUB-PIXEL OFFSET, in NDC, for every view that registers against the main
@@ -22462,6 +23410,53 @@ namespace ForgeRender {
         // produced frames would repeat a phase across two rasters or skip one entirely. Every view
         // that reads g_jitterPx below — main, FP, both water mirrors — is inside this call and so
         // sees one value. No-op while g_jitterAmp is 0, which is the shipped default.
+        // M1 4d-3: PUBLISH THE PER-MODE RECT TABLE, on the RENDER thread, before anything reads it.
+        // ⚠ HERE AND NOT IN setRenderSize, because that runs on the CLIENT/IPC thread and NGX is not
+        // thread-safe (upscale.h::queryModeRects says so at length). The table only changes when the
+        // OUTPUT rect does, so this is a compare-and-skip on every ordinary frame; the client
+        // restamps setRenderSize every frame, so a resolution change costs one frame on the previous
+        // table and corrects itself immediately.
+        if (g_live.pUpscaler
+            && (!g_upscaleModeTableValid || g_upscaleModeTableOutW != g_live.outWidth
+                || g_upscaleModeTableOutH != g_live.outHeight)) {
+            uint32_t tw[kUpscaleModeCount] = {};
+            uint32_t th[kUpscaleModeCount] = {};
+            if (g_live.pUpscaler->queryModeRects(g_live.outWidth, g_live.outHeight,
+                                                 tw, th, (uint32_t)kUpscaleModeCount)) {
+                for (uint32_t i = 0; i < (uint32_t)kUpscaleModeCount; ++i) {
+                    g_upscaleModeInW[i] = tw[i];
+                    g_upscaleModeInH[i] = th[i];
+                }
+                g_upscaleModeTableValid = true;
+            } else {
+                // The backend has no per-mode opinion (the passthrough). Marked INVALID rather than
+                // filled from the ratios, so upscaleInputRect takes its documented fallback branch
+                // instead of reading a table that only looks authoritative.
+                g_upscaleModeTableValid = false;
+            }
+            g_upscaleModeTableOutW = g_live.outWidth;
+            g_upscaleModeTableOutH = g_live.outHeight;
+        }
+        // ...and notice a live mode change, so the accumulator can be told. Compared here rather
+        // than written by the panel because the panel writes the uint directly (that is what a
+        // dropdown does) and a control that has to remember to raise a flag is a control that
+        // eventually forgets.
+        {
+            static uint32_t sPrevMode = kUpscaleModeDLAA;
+            if (sPrevMode != g_upscaleMode) {
+                if (g_upscaleName) {
+                    LOG::logline(">> [upscale] mode %s -> %s (live)",
+                                 kUpscaleModeNames[sPrevMode < (uint32_t)kUpscaleModeCount
+                                                   ? sPrevMode : 0u],
+                                 kUpscaleModeNames[g_upscaleMode < (uint32_t)kUpscaleModeCount
+                                                   ? g_upscaleMode : 0u]);
+                    LOG::flush();
+                }
+                sPrevMode = g_upscaleMode;
+                g_upscaleModeChanged = true;
+            }
+        }
+
         advanceJitter();
         g_lastMvRan = false;   // M1: set by the motion-vector dispatch at the colour->water seam
 
@@ -28521,7 +29516,19 @@ namespace ForgeRender {
         // that leaves the producing dispatch disabled would be
         // [[feedback_isolation_lever_killed_its_own_subject]] to the letter: the lever kills its own
         // subject and the resulting stale buffer reads as "the vectors are broken".
-        const bool mvActive = (g_mvEnable || g_debugMode == 17u || g_debugMode == 18u)
+        //
+        // ⚠⚠ AND SO DOES A TEMPORAL UPSCALER (M1 4d), FOR A STRICTER REASON THAN THE VIEW'S. The
+        // debug view forcing the pass on is about not lying to the person looking at it; DLSS
+        // forcing it on is a CORRECTNESS requirement, because `g_mvEnable` ships **off** ("nothing
+        // consumes the vectors until the upscaler lands") and a temporal reconstruction handed a
+        // motionVectors texture nobody dispatched into reads the LAST frame the pass did run — or,
+        // on a session where it never ran, the resting contents. That is not a missing input DLSS
+        // can detect: it is a plausible, smoothly-varying, completely wrong field, and its symptom
+        // is smearing that looks like a convention error in the vectors rather than like an absent
+        // pass. This is the same shape as the jitter gate one screen up: a producer and its
+        // consumer must not be armed by different switches.
+        const bool mvActive = (g_mvEnable || upscaleTemporalActive()
+                               || g_debugMode == 17u || g_debugMode == 18u)
                            && g_live.mvReady && aoBlockRan && g_live.pLinearizeSet;
         // Gate on aoBlockRan, not on the pipeline alone: that block is what leaves pLinearDepth in
         // SHADER_RESOURCE, and the SR->UAV flip below is only valid if it ran. Also gate on the
@@ -30410,7 +31417,7 @@ namespace ForgeRender {
         // identity is free by CONSTRUCTION (upscale.h). Re-deriving the same test from the rects
         // anywhere else would be a second place to get it wrong.
         bool upscaled = false;
-        if (shaderResolve && g_live.pUpscaler && g_upscaleEnable) {
+        if (shaderResolve && g_live.pUpscaler && upscaleActive()) {
             sceneColorToSR();
             gpuPhaseBegin(kGpuPhaseUpscale);
             UpscaleInputs ui = {};
@@ -30426,15 +31433,69 @@ namespace ForgeRender {
             ui.allocW = g_live.allocWidth; ui.allocH = g_live.allocHeight;
             ui.jitterX  = g_jitterPx[0];
             ui.jitterY  = g_jitterPx[1];
-            // ⚠ 4d MUST HAND THIS THE **PREVIOUS** FRAME'S E. The servo meters the DELIVERED image,
-            // so an exposure derived from upscaler output closes a loop around the upscaler
-            // ([[project_forge_exposure_rail_instrument]]). It is this frame's value today because
-            // nothing reads it; that is a thing to change with the backend, not before it.
-            ui.exposure = (g_live.sceneReferred && g_expEnable) ? (float)g_exposure : 1.0f;
-            // History discontinuity. Declared, unread in 4b — the passthrough has no history. The
-            // first rendered frame is the one case the host can already answer honestly, and it is
-            // the same flag the motion-vector pass uses for the same reason.
-            ui.reset    = !g_prevViewProjValid;
+            // ⚠⚠ THE **PREVIOUS** FRAME'S E, WHICH IS THE 4d TRAP THE 4b COMMENT HERE PREDICTED.
+            // The servo meters the DELIVERED image (exposureServo, from the APL readback), so on an
+            // upscaled frame it is metering DLSS's output. Handing that same E back to DLSS as its
+            // exposure hint closes an algebraic loop AROUND the upscaler inside one frame: E
+            // describes the picture DLSS made using E. Snapshotting after the evaluate below turns
+            // that into a one-frame lag, which is what a servo already is
+            // ([[project_forge_exposure_rail_instrument]] — watch `rail=free`).
+            //
+            // ⚠ IT IS ONLY A HINT EITHER WAY. The colour handed to DLSS is NOT pre-exposed —
+            // pSceneColor is scene-referred and E is applied downstream in resolve.frag — so this
+            // number tells the network roughly how bright the scene is, and nothing in the frame is
+            // scaled by it. A one-frame-old value is therefore cheap; a same-frame one is a loop.
+            ui.exposure = g_upscalePrevExposure;
+            // History discontinuity. Declared and unread in 4b (the passthrough has no history);
+            // READ by the NGX backend, where it is DLSS's InReset.
+            //
+            // ⚠ THREE CAUSES, AND ONLY THE FIRST WAS WIRED IN 4b. A temporal accumulator's history
+            // is a claim that the previous frame's pixels can be reprojected onto this one, and
+            // that claim fails whenever the camera did not MOVE but JUMPED:
+            //   - no previous frame at all (the same flag the MV pass uses, for the same reason);
+            //   - a cell change — the world under the camera was replaced, and the MV field is
+            //     camera-only so it cannot express that;
+            //   - a camera CUT: a teleport, a door, a fast-travel arrival. Detected as a bake-eye
+            //     delta far larger than any one frame of walking or riding could produce. The
+            //     threshold is generous on purpose — a missed reset costs a few frames of smear
+            //     that resolve themselves, while a spurious one costs the history on a frame that
+            //     did not need it, and at 165 fps a false positive every so often is invisible
+            //     while a missed teleport is a visible drag of the old cell across the new one.
+            //     g_lastMvDelta is this frame's |bakeEye - prevBakeEye| in DOUBLE, already computed
+            //     for the motion-vector origin fold — reused rather than recomputed, because two
+            //     copies of one wire value are two things that can disagree.
+            {
+                const bool cellChanged = (g_nearCellX != g_upscalePrevCellX)
+                                      || (g_nearCellY != g_upscalePrevCellY);
+                const double dx = g_lastMvDelta[0], dy = g_lastMvDelta[1], dz = g_lastMvDelta[2];
+                // 2048 MW units ≈ one and a bit cells, and ~13x the fastest scripted movement in a
+                // single frame at 30 fps. Squared, to keep a sqrt off the frame path.
+                const bool cameraCut = (dx * dx + dy * dy + dz * dz) > (2048.0 * 2048.0);
+                // ⚠ A MODE CHANGE IS THE FOURTH CAUSE, and it is the one the rects cannot signal:
+                // Off -> DLAA leaves in == out, so the feature is NOT rebuilt and DLSS would carry
+                // on from an accumulator whose history is a run of frames it never produced.
+                const bool modeChanged = g_upscaleModeChanged;
+                g_upscaleModeChanged = false;
+                ui.reset = !g_prevViewProjValid || cellChanged || cameraCut || modeChanged;
+                if (ui.reset && upscaleTemporalActive() && g_prevViewProjValid) {
+                    LOG::logline(">> [upscale] history RESET (%s%s%s) — the accumulator is discarded "
+                                 "for this frame",
+                                 cellChanged ? "cell change" : "",
+                                 cameraCut ? (cellChanged ? " + camera cut" : "camera cut") : "",
+                                 modeChanged ? ((cellChanged || cameraCut) ? " + mode change"
+                                                                           : "mode change") : "");
+                }
+                g_upscalePrevCellX = g_nearCellX;
+                g_upscalePrevCellY = g_nearCellY;
+            }
+            // WHICH RECT THE MOTION VECTORS ARE AT. Ours are dispatched over the render rect and
+            // written at INPUT resolution — see the knob for why this is a field rather than a
+            // constant the backend asserts for itself.
+            ui.mvAtInputRect = g_upscaleMvLowRes;
+            // The two optional inputs, and therefore the bisection when a temporal backend faults.
+            ui.useSuppliedExposure = g_upscaleSuppliedExposure;
+            ui.useReactiveMask     = g_upscaleNgxReactive;
+            ui.preset              = g_upscalePreset;
             // The spatial filter, live. A backend with no spatial filter ignores both.
             ui.sharpness = g_upscaleSharpness;
             ui.antiRing  = g_upscaleAntiRing;
@@ -30446,6 +31507,60 @@ namespace ForgeRender {
             gpuPhaseEnd(kGpuPhaseUpscale);
         }
         g_lastUpscaleRan = upscaled;
+        // ─── THE PANEL'S LIVE STATUS LINE (4d-3) ─────────────────────────────────────────────────
+        // Written from the ONE authoritative answer — the pointer evaluate() returned — for the same
+        // reason every other reader hangs off it: a second derivation is a second thing that can
+        // disagree with the frame. Three states, and they are genuinely different situations rather
+        // than three phrasings of one:
+        //   no backend   — it declined at startup or was never allocated; the dropdown is inert and
+        //                  says so, which is the complaint an inert control that stays silent earns.
+        //   Off          — armed and deliberately not running. The A/B arm, not a failure.
+        //   running      — with the backend, the mode, and BOTH rects, because "is it upscaling" and
+        //                  "from what to what" are the two things a screenshot cannot tell you.
+        if (!g_upscaleName) {
+            g_upscaleStatusColor = float4(1.0f, 0.55f, 0.55f, 1.0f);
+            if (g_upscaleDeclineReason) {
+                // ⚠ THE REASON THE ARM ACTUALLY GAVE, not a guess at it. See
+                // g_upscaleDeclineReason for the report that made this necessary.
+                bformat(&g_upscaleStatusText,
+                        "NO BACKEND — DECLINED: %s", g_upscaleDeclineReason);
+            } else {
+                bformat(&g_upscaleStatusText,
+                        "NO BACKEND — none was requested. Arm one at startup with "
+                        "MGE_HOST_KNOBS=upscaleBackend=ngx (read once, at init).");
+            }
+        } else if (!upscaleActive()) {
+            g_upscaleStatusColor = float4(0.75f, 0.75f, 0.75f, 1.0f);
+            bformat(&g_upscaleStatusText,
+                    "OFF — backend '%s' is armed but idle. Rendering native %ux%u; jitter and the "
+                    "motion-vector pass are disarmed with it.",
+                    g_upscaleName, g_live.outWidth, g_live.outHeight);
+        } else if (upscaled) {
+            g_upscaleStatusColor = float4(0.70f, 1.0f, 0.70f, 1.0f);
+            bformat(&g_upscaleStatusText,
+                    "ACTIVE — '%s' %s [%s]: rendering %ux%u -> delivering %ux%u (%.0f%% linear)%s",
+                    g_upscaleName, kUpscaleModeNames[g_upscaleMode],
+                    kUpscalePresetNames[g_upscalePreset < (uint32_t)kUpscalePresetCount
+                                        ? g_upscalePreset : 0u],
+                    g_live.width, g_live.height, g_live.outWidth, g_live.outHeight,
+                    100.0 * (double)g_live.width / (double)(g_live.outWidth ? g_live.outWidth : 1u),
+                    g_upscaleTemporal ? ", temporal" : ", spatial");
+        } else {
+            // Asked for, armed, and yet nothing ran — evaluate() refused internally. That is a real
+            // state with real causes (a rect violating alloc >= out >= in, a colour texture that
+            // moved, a backend disabled after a GPU fault) and every one of them logs its reason.
+            g_upscaleStatusColor = float4(1.0f, 0.80f, 0.45f, 1.0f);
+            bformat(&g_upscaleStatusText,
+                    "REFUSED — '%s' is armed and set to %s, but recorded nothing this frame. The "
+                    "reason is in mgeHost64.log; the frame is the un-upscaled one.",
+                    g_upscaleName, kUpscaleModeNames[g_upscaleMode]);
+        }
+        // THE ONE-FRAME LAG, ARMED HERE. Snapshotting AFTER the evaluate is what makes `ui.exposure`
+        // above the PREVIOUS frame's E rather than this one's — see the note there for why a
+        // same-frame value would be a loop closed around the upscaler. Updated unconditionally, so
+        // a frame on which the pass did not run still advances the snapshot and the value never
+        // becomes arbitrarily stale.
+        g_upscalePrevExposure = (g_live.sceneReferred && g_expEnable) ? (float)g_exposure : 1.0f;
 
         // ===================== THE DELIVERED IMAGE (M1 4c) =======================================
         // ONE derivation of "which image is this frame actually delivering", read by everything
@@ -30957,6 +32072,11 @@ namespace ForgeRender {
             g_live.pQueue->mDx.pQueue->Signal(g_live.pSharedFence, g_live.sharedFenceValue);
         }
         g_framePending = true;
+        // ⚠ AFTER the shared-fence signal, deliberately. That signal is the client's permission to
+        // read pRT, and the overlay window has nothing to do with the delivered frame — putting its
+        // submit and present ahead of the signal would add a debug window's latency to every game
+        // frame. No-op unless the window was created.
+        presentHostWindow();
         g_live.pCmd = pCmdChunkA;   // O1: restore the primary cmd for next frame / other paths
         // O1 win metric: how long CPU record (of B) ran while the GPU was already executing A.
         g_lastGpuOverlapMs = splitSubmit ? (tRec1 - tSubmitA) : 0.0;
@@ -31508,10 +32628,33 @@ namespace ForgeRender {
                              (double)g_lastMvOriginFixPx, (double)g_lastMvRefDist);
                 g_mvDeltaMaxLen = 0.0; g_mvFoldMaxPx = 0.0f; g_mvFoldMaxAt1k = 0.0f;
             }
-            if (g_jitterAmp > 0.0f) {
-                LOG::logline(">> [forge-hb] jitter: amp=%.2fpx phases=%u idx=%u -> (%+.3f, %+.3f) px "
+            // ⚠ THE **EFFECTIVE** AMPLITUDE, not the knob. Gating on the raw global would print a
+            // jitter line every heartbeat of every session now that the slider ships at 1.0, while
+            // the offset actually applied was zero — a row that describes a frame that never
+            // happened, on the one instrument an unattended run has. `gated` names the state.
+            // ⚠ THE GATED CASE IS SAID **ONCE**, NOT EVERY HEARTBEAT — measured 2026-09-02, a
+            // single passthrough session emitted 114 identical all-zero rows. That inverts the
+            // line's whole reason to exist ("its PRESENCE says the lane is live") and buries the
+            // rows that carry information, on the one instrument an unattended run has. But it is
+            // still worth saying once: a knob that is set and doing nothing is the inert-control
+            // complaint the panel label also answers, and silence would leave "I dragged the jitter
+            // slider and nothing happened" undiagnosable.
+            if (jitterAmp() <= 0.0f && g_jitterAmp > 0.0f) {
+                if (!g_jitterGateReported) {
+                    g_jitterGateReported = true;
+                    LOG::logline(">> [forge-hb] jitter: knob is %.2f px but GATED OFF — no temporal "
+                                 "backend is armed, so the applied offset is exactly 0. Arm one with "
+                                 "MGE_HOST_KNOBS=upscaleBackend=ngx, or jitterForce=1 to run the "
+                                 "step-1 isolation test without an upscaler. Said once per session.",
+                                 (double)g_jitterAmp);
+                }
+            } else if (jitterAmp() > 0.0f) {
+                g_jitterGateReported = false;   // re-arm, so a later gating is reported again
+                LOG::logline(">> [forge-hb] jitter: amp=%.2fpx%s phases=%u idx=%u -> (%+.3f, %+.3f) px "
                              "[NDC %+.5f, %+.5f on a %ux%u rect]",
-                             (double)g_jitterAmp, (unsigned)(g_jitterPhases + 0.5f), g_jitterIndex,
+                             (double)jitterAmp(),
+                             g_jitterForce ? " (FORCED, no temporal backend)" : "",
+                             jitterPhases(), g_jitterIndex,
                              (double)g_jitterPx[0], (double)g_jitterPx[1],
                              (double)(2.0f * g_jitterPx[0] / (float)g_live.width),
                              (double)(-2.0f * g_jitterPx[1] / (float)g_live.height),
@@ -31534,16 +32677,34 @@ namespace ForgeRender {
                          g_lastCpuPhaseMs[kGpuPhaseColorAlpha],
                          g_lastCpuPhaseMs[kGpuPhaseResolve],
                          g_lastRecMs - g_lastCpuPhaseMs[kGpuPhaseFrame]);
-            // The upscale term's bracket: the INPUT rect it actually resampled from, or "off" when
-            // no pass ran. Two states that look identical in the timing alone — the feature absent,
-            // and the feature present at scale 1.0 (the identity fast path) — read differently here.
-            char upscaleRectText[32];
+            // The upscale term's bracket: WHICH BACKEND and the INPUT rect it actually read from,
+            // or "off" when no pass ran. Two states that look identical in the timing alone — the
+            // feature absent, and the passthrough at scale 1.0 taking its identity fast path — read
+            // differently here.
+            //
+            // ⚠ THE BACKEND NAME IS ON IT SINCE 4d, and it is not decoration for the same reason it
+            // is on the `[rect]` line: at DLAA the rects are equal, so "ngx-dlss 1680x1050" and
+            // "passthrough 1:1" are the two readings that tell a DLSS session from a Catmull-Rom
+            // one, and nothing else on this line can. A backend that silently declined at startup
+            // otherwise produces a heartbeat indistinguishable from a working one.
+            char upscaleRectText[96];
+            // ⚠ A NON-RUN IS NO LONGER CALLED "1:1", and that wording was a wart worth removing:
+            // for the PASSTHROUGH 1:1 correctly means the identity fast path, but a temporal backend
+            // has no such path — so `ngx-dlss 1:1` read as "running at native" when it actually
+            // meant "did not run at all". The three states are now named as themselves.
             if (g_lastUpscaleRan) {
-                std::snprintf(upscaleRectText, sizeof(upscaleRectText), "%ux%u",
+                std::snprintf(upscaleRectText, sizeof(upscaleRectText), "%s %s %ux%u",
+                              g_upscaleName ? g_upscaleName : "?",
+                              kUpscaleModeNames[g_upscaleMode < (uint32_t)kUpscaleModeCount
+                                                ? g_upscaleMode : 0u],
                               g_live.width, g_live.height);
+            } else if (!g_upscaleName) {
+                std::snprintf(upscaleRectText, sizeof(upscaleRectText), "no backend");
+            } else if (!upscaleActive()) {
+                std::snprintf(upscaleRectText, sizeof(upscaleRectText), "%s OFF", g_upscaleName);
             } else {
-                std::snprintf(upscaleRectText, sizeof(upscaleRectText), "%s",
-                              g_upscaleName ? "1:1" : "off");
+                std::snprintf(upscaleRectText, sizeof(upscaleRectText), "%s REFUSED",
+                              g_upscaleName);
             }
             LOG::logline(">> [forge-hb] gpu split: cull=%.2f prepass=%.2f shadow=%.2f (st=%.2f dyn=%.2f sun=%.2f) postdepth=%.2f (lin=%.2f ao=%.2f mask=%.2f) reflect=%.2f color=%.2f water=%.2f caustic=%.2f grasscrush=%.2f(%u) mv=%.2f upscale=%.2f(%s) bloom=%.2f(L%u) resolve=%.2f ms"
                          " | hiz=%.2f (prologue, overruns=%u) | shadowCasters=%u maskSlots=%u(dyn=%u)"
@@ -43175,6 +44336,13 @@ namespace ForgeRender {
         }
         g_upscaleName = nullptr;
         g_lastUpscaleRan = false;
+        // ⚠ AND THE TEMPORAL FLAG, WHICH IS NOT BOOKKEEPING — it is what jitterAmp() and mvActive
+        // read. Left standing across a teardown it would arm the jitter and force the motion-vector
+        // dispatch on for a backend that no longer exists: a shimmering image plus a dispatch nobody
+        // consumes, i.e. exactly the state the producer gate was added to make unreachable. It is
+        // cleared HERE, beside g_upscaleName, because every path that clears one must clear the
+        // other — they answer the same question.
+        g_upscaleTemporal = false;
         // Bloom pyramid (step 4) — set -> pipelines -> shaders -> cbuffers -> texture, the same order.
         // The texture goes LAST because the descriptor set references it.
         if (g_live.pBloomSet)              { removeDescriptorSet(R, g_live.pBloomSet); g_live.pBloomSet = nullptr; }
@@ -43244,6 +44412,9 @@ namespace ForgeRender {
         if (g_live.pUVAnimBuf)            { removeResource(g_live.pUVAnimBuf); }
         if (g_live.pSceneColor)      { removeRenderTarget(R, g_live.pSceneColor); }
         if (g_live.pDepth)          { removeRenderTarget(R, g_live.pDepth); }
+        // The overlay window first: its swapchain references the present queue and its command
+        // pool the device, so it goes before anything below tears those down.
+        destroyHostWindow(R);
         if (g_live.pAuxFence)   { waitForFences(R, 1, &g_live.pAuxFence); exitFence(R, g_live.pAuxFence); }
         if (g_live.pAuxCmd)     { exitCmd(R, g_live.pAuxCmd); }
         if (g_live.pAuxCmdPool) { exitCmdPool(R, g_live.pAuxCmdPool); }

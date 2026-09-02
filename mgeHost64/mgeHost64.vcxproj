@@ -94,20 +94,20 @@
   </ImportGroup>
   <PropertyGroup Label="UserMacros" />
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
-    <IncludePath>$(ProjectDir);$(SolutionDir)src;$(SolutionDir)3rdparty\msoc;$(SolutionDir)3rdparty\The-Forge\Common_3;$(VULKAN_SDK)\Include;$(IncludePath);C:\Program Files (x86)\Microsoft DirectX SDK (June 2010)\include</IncludePath>
+    <IncludePath>$(ProjectDir);$(SolutionDir)src;$(SolutionDir)3rdparty\msoc;$(SolutionDir)3rdparty\The-Forge\Common_3;$(SolutionDir)3rdparty\DLSS\include;$(VULKAN_SDK)\Include;$(IncludePath);C:\Program Files (x86)\Microsoft DirectX SDK (June 2010)\include</IncludePath>
     <LibraryPath>$(VULKAN_SDK)\Lib;$(LibraryPath);C:\Program Files (x86)\Microsoft DirectX SDK (June 2010)\Lib\x64</LibraryPath>
     <OutDir>$(SolutionDir)bin\MSVC-$(Configuration)\</OutDir>
     <IntDir>$(SolutionDir)bin\MSVC-$(Configuration)\mgeHost64\</IntDir>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
     <LibraryPath>$(VULKAN_SDK)\Lib;$(LibraryPath);C:\Program Files (x86)\Microsoft DirectX SDK (June 2010)\Lib\x64</LibraryPath>
-    <IncludePath>$(ProjectDir);$(SolutionDir)src;$(SolutionDir)3rdparty\msoc;$(SolutionDir)3rdparty\The-Forge\Common_3;$(VULKAN_SDK)\Include;$(IncludePath);C:\Program Files (x86)\Microsoft DirectX SDK (June 2010)\include</IncludePath>
+    <IncludePath>$(ProjectDir);$(SolutionDir)src;$(SolutionDir)3rdparty\msoc;$(SolutionDir)3rdparty\The-Forge\Common_3;$(SolutionDir)3rdparty\DLSS\include;$(VULKAN_SDK)\Include;$(IncludePath);C:\Program Files (x86)\Microsoft DirectX SDK (June 2010)\include</IncludePath>
     <OutDir>$(SolutionDir)bin\MSVC-$(Configuration)\</OutDir>
     <IntDir>$(SolutionDir)bin\MSVC-$(Configuration)\mgeHost64\</IntDir>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release-Fast|x64'">
     <LibraryPath>$(VULKAN_SDK)\Lib;$(LibraryPath);C:\Program Files (x86)\Microsoft DirectX SDK (June 2010)\Lib\x64</LibraryPath>
-    <IncludePath>$(ProjectDir);$(SolutionDir)src;$(SolutionDir)3rdparty\msoc;$(SolutionDir)3rdparty\The-Forge\Common_3;$(VULKAN_SDK)\Include;$(IncludePath);C:\Program Files (x86)\Microsoft DirectX SDK (June 2010)\include</IncludePath>
+    <IncludePath>$(ProjectDir);$(SolutionDir)src;$(SolutionDir)3rdparty\msoc;$(SolutionDir)3rdparty\The-Forge\Common_3;$(SolutionDir)3rdparty\DLSS\include;$(VULKAN_SDK)\Include;$(IncludePath);C:\Program Files (x86)\Microsoft DirectX SDK (June 2010)\include</IncludePath>
     <OutDir>$(SolutionDir)bin\MSVC-$(Configuration)\</OutDir>
     <IntDir>$(SolutionDir)bin\MSVC-$(Configuration)\mgeHost64\</IntDir>
   </PropertyGroup>
@@ -157,8 +157,8 @@
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <!-- PDB name only, not the build machine's path to it — see MGE-XE.vcxproj. -->
       <AdditionalOptions>/PDBALTPATH:$(TargetName).pdb %(AdditionalOptions)</AdditionalOptions>
-      <AdditionalDependencies>d3dx9.lib;vulkan-1.lib;winmm.lib;amd_ags_x64.lib;nvapi64.lib;dxcompiler.lib;WinPixEventRuntime.lib;%(AdditionalDependencies)</AdditionalDependencies>
-      <AdditionalLibraryDirectories>$(SolutionDir)3rdparty\The-Forge\Common_3\Graphics\ThirdParty\OpenSource\ags\ags_lib\lib;$(SolutionDir)3rdparty\The-Forge\Common_3\Graphics\ThirdParty\OpenSource\nvapi\amd64;$(SolutionDir)3rdparty\The-Forge\Common_3\Graphics\ThirdParty\OpenSource\DirectXShaderCompiler\lib\x64;$(SolutionDir)3rdparty\The-Forge\Common_3\Graphics\ThirdParty\OpenSource\winpixeventruntime\bin;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalDependencies>d3dx9.lib;vulkan-1.lib;winmm.lib;amd_ags_x64.lib;nvapi64.lib;dxcompiler.lib;WinPixEventRuntime.lib;nvsdk_ngx_d.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalLibraryDirectories>$(SolutionDir)3rdparty\The-Forge\Common_3\Graphics\ThirdParty\OpenSource\ags\ags_lib\lib;$(SolutionDir)3rdparty\The-Forge\Common_3\Graphics\ThirdParty\OpenSource\nvapi\amd64;$(SolutionDir)3rdparty\The-Forge\Common_3\Graphics\ThirdParty\OpenSource\DirectXShaderCompiler\lib\x64;$(SolutionDir)3rdparty\The-Forge\Common_3\Graphics\ThirdParty\OpenSource\winpixeventruntime\bin;$(SolutionDir)3rdparty\DLSS\lib\Windows_x86_64\vs2013\x64;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
     </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
@@ -172,7 +172,7 @@
            checks from it, and it makes the validation-only struct members (Queue::pRenderer,
            Renderer::pDebugValidation) appear consistently across every TU. Defining
            ENABLE_GRAPHICS_VALIDATION alone leaves those structs half-configured (C2039). -->
-      <PreprocessorDefinitions>_CONSOLE;MGE64_HOST;NOMINMAX;FORGE_DEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>_CONSOLE;MGE64_HOST;NOMINMAX;FORGE_DEBUG;_ALLOW_MSC_VER_MISMATCH;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpp17</LanguageStandard>
       <MultiProcessorCompilation>true</MultiProcessorCompilation>
@@ -184,8 +184,8 @@
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <!-- PDB name only, not the build machine's path to it — see MGE-XE.vcxproj. -->
       <AdditionalOptions>/PDBALTPATH:$(TargetName).pdb %(AdditionalOptions)</AdditionalOptions>
-      <AdditionalDependencies>d3dx9.lib;vulkan-1.lib;winmm.lib;amd_ags_x64.lib;nvapi64.lib;dxcompiler.lib;WinPixEventRuntime.lib;%(AdditionalDependencies)</AdditionalDependencies>
-      <AdditionalLibraryDirectories>$(SolutionDir)3rdparty\The-Forge\Common_3\Graphics\ThirdParty\OpenSource\ags\ags_lib\lib;$(SolutionDir)3rdparty\The-Forge\Common_3\Graphics\ThirdParty\OpenSource\nvapi\amd64;$(SolutionDir)3rdparty\The-Forge\Common_3\Graphics\ThirdParty\OpenSource\DirectXShaderCompiler\lib\x64;$(SolutionDir)3rdparty\The-Forge\Common_3\Graphics\ThirdParty\OpenSource\winpixeventruntime\bin;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalDependencies>d3dx9.lib;vulkan-1.lib;winmm.lib;amd_ags_x64.lib;nvapi64.lib;dxcompiler.lib;WinPixEventRuntime.lib;nvsdk_ngx_d.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalLibraryDirectories>$(SolutionDir)3rdparty\The-Forge\Common_3\Graphics\ThirdParty\OpenSource\ags\ags_lib\lib;$(SolutionDir)3rdparty\The-Forge\Common_3\Graphics\ThirdParty\OpenSource\nvapi\amd64;$(SolutionDir)3rdparty\The-Forge\Common_3\Graphics\ThirdParty\OpenSource\DirectXShaderCompiler\lib\x64;$(SolutionDir)3rdparty\The-Forge\Common_3\Graphics\ThirdParty\OpenSource\winpixeventruntime\bin;$(SolutionDir)3rdparty\DLSS\lib\Windows_x86_64\vs2013\x64;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
     </Link>
   </ItemDefinitionGroup>
   <!-- Identical to Release|x64 EXCEPT the PreprocessorDefinitions omit FORGE_DEBUG, so The
@@ -199,7 +199,7 @@
       <FunctionLevelLinking>true</FunctionLevelLinking>
       <IntrinsicFunctions>true</IntrinsicFunctions>
       <SDLCheck>true</SDLCheck>
-      <PreprocessorDefinitions>_CONSOLE;MGE64_HOST;NOMINMAX;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>_CONSOLE;MGE64_HOST;NOMINMAX;_ALLOW_MSC_VER_MISMATCH;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpp17</LanguageStandard>
       <MultiProcessorCompilation>true</MultiProcessorCompilation>
@@ -211,8 +211,8 @@
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <!-- PDB name only, not the build machine's path to it — see MGE-XE.vcxproj. -->
       <AdditionalOptions>/PDBALTPATH:$(TargetName).pdb %(AdditionalOptions)</AdditionalOptions>
-      <AdditionalDependencies>d3dx9.lib;vulkan-1.lib;winmm.lib;amd_ags_x64.lib;nvapi64.lib;dxcompiler.lib;WinPixEventRuntime.lib;%(AdditionalDependencies)</AdditionalDependencies>
-      <AdditionalLibraryDirectories>$(SolutionDir)3rdparty\The-Forge\Common_3\Graphics\ThirdParty\OpenSource\ags\ags_lib\lib;$(SolutionDir)3rdparty\The-Forge\Common_3\Graphics\ThirdParty\OpenSource\nvapi\amd64;$(SolutionDir)3rdparty\The-Forge\Common_3\Graphics\ThirdParty\OpenSource\DirectXShaderCompiler\lib\x64;$(SolutionDir)3rdparty\The-Forge\Common_3\Graphics\ThirdParty\OpenSource\winpixeventruntime\bin;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalDependencies>d3dx9.lib;vulkan-1.lib;winmm.lib;amd_ags_x64.lib;nvapi64.lib;dxcompiler.lib;WinPixEventRuntime.lib;nvsdk_ngx_d.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalLibraryDirectories>$(SolutionDir)3rdparty\The-Forge\Common_3\Graphics\ThirdParty\OpenSource\ags\ags_lib\lib;$(SolutionDir)3rdparty\The-Forge\Common_3\Graphics\ThirdParty\OpenSource\nvapi\amd64;$(SolutionDir)3rdparty\The-Forge\Common_3\Graphics\ThirdParty\OpenSource\DirectXShaderCompiler\lib\x64;$(SolutionDir)3rdparty\The-Forge\Common_3\Graphics\ThirdParty\OpenSource\winpixeventruntime\bin;$(SolutionDir)3rdparty\DLSS\lib\Windows_x86_64\vs2013\x64;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
@@ -260,7 +260,7 @@
       <ExceptionHandling>false</ExceptionHandling>
       <RuntimeTypeInfo>false</RuntimeTypeInfo>
       <SDLCheck>false</SDLCheck>
-      <PreprocessorDefinitions>_HAS_EXCEPTIONS=0;D3D12_AGILITY_SDK=1;D3D12_AGILITY_SDK_VERSION=715;_CRT_SECURE_NO_WARNINGS;_CRT_NONSTDC_NO_DEPRECATE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>_HAS_EXCEPTIONS=0;D3D12_AGILITY_SDK=1;D3D12_AGILITY_SDK_VERSION=715;_CRT_SECURE_NO_WARNINGS;_CRT_NONSTDC_NO_DEPRECATE;_ALLOW_MSC_VER_MISMATCH;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
     <!-- The IUpscaler seam + its passthrough backend (tasks/forge-upscale.md M1 step 4b). Same
          Forge ABI as forgerender.cpp because it talks to IGraphics/IResourceLoader directly and
@@ -270,7 +270,25 @@
       <ExceptionHandling>false</ExceptionHandling>
       <RuntimeTypeInfo>false</RuntimeTypeInfo>
       <SDLCheck>false</SDLCheck>
-      <PreprocessorDefinitions>_HAS_EXCEPTIONS=0;D3D12_AGILITY_SDK=1;D3D12_AGILITY_SDK_VERSION=715;_CRT_SECURE_NO_WARNINGS;_CRT_NONSTDC_NO_DEPRECATE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>_HAS_EXCEPTIONS=0;D3D12_AGILITY_SDK=1;D3D12_AGILITY_SDK_VERSION=715;_CRT_SECURE_NO_WARNINGS;_CRT_NONSTDC_NO_DEPRECATE;_ALLOW_MSC_VER_MISMATCH;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+    <!-- The NGX / DLSS backend behind the same seam (M1 step 4d). Identical Forge ABI to
+         upscale.cpp; it additionally includes 3rdparty/DLSS's headers and links nvsdk_ngx_s.lib
+         (see the x64 IncludePath / AdditionalDependencies above). x64 ONLY, and not merely because
+         Win32 is excluded from the whole host: NVIDIA ships no 32-bit NGX library at all. -->
+    <!-- The three msvcr120 CRT symbols NVIDIA's vs2013 NGX library imports and the UCRT does
+         not provide (M1 step 4d). Deliberately NOT built with the Forge ABI settings the two
+         upscale TUs carry: it includes no Forge header, only <cstdio>. See the file for why the
+         4d plan expected not to need it. -->
+    <ClCompile Include="ngx_msvcr120_shim.cpp">
+      <ExcludedFromBuild Condition="'$(Platform)'=='Win32'">true</ExcludedFromBuild>
+    </ClCompile>
+    <ClCompile Include="upscale_ngx.cpp">
+      <ExcludedFromBuild Condition="'$(Platform)'=='Win32'">true</ExcludedFromBuild>
+      <ExceptionHandling>false</ExceptionHandling>
+      <RuntimeTypeInfo>false</RuntimeTypeInfo>
+      <SDLCheck>false</SDLCheck>
+      <PreprocessorDefinitions>_HAS_EXCEPTIONS=0;D3D12_AGILITY_SDK=1;D3D12_AGILITY_SDK_VERSION=715;_CRT_SECURE_NO_WARNINGS;_CRT_NONSTDC_NO_DEPRECATE;_ALLOW_MSC_VER_MISMATCH;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
     <ClCompile Include="..\3rdparty\The-Forge\Common_3\Graphics\Direct3D12\Direct3D12.c">
       <ExcludedFromBuild Condition="'$(Platform)'=='Win32'">true</ExcludedFromBuild>
@@ -279,7 +297,7 @@
       <SDLCheck>false</SDLCheck>
       <WarningLevel>TurnOffAllWarnings</WarningLevel>
       <TreatWarningAsError>false</TreatWarningAsError>
-      <PreprocessorDefinitions>_HAS_EXCEPTIONS=0;D3D12_AGILITY_SDK=1;D3D12_AGILITY_SDK_VERSION=715;_CRT_SECURE_NO_WARNINGS;_CRT_NONSTDC_NO_DEPRECATE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>_HAS_EXCEPTIONS=0;D3D12_AGILITY_SDK=1;D3D12_AGILITY_SDK_VERSION=715;_CRT_SECURE_NO_WARNINGS;_CRT_NONSTDC_NO_DEPRECATE;_ALLOW_MSC_VER_MISMATCH;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
     <ClCompile Include="..\3rdparty\The-Forge\Common_3\Graphics\Direct3D12\Direct3D12Hooks.c">
       <ExcludedFromBuild Condition="'$(Platform)'=='Win32'">true</ExcludedFromBuild>
@@ -288,7 +306,7 @@
       <SDLCheck>false</SDLCheck>
       <WarningLevel>TurnOffAllWarnings</WarningLevel>
       <TreatWarningAsError>false</TreatWarningAsError>
-      <PreprocessorDefinitions>_HAS_EXCEPTIONS=0;D3D12_AGILITY_SDK=1;D3D12_AGILITY_SDK_VERSION=715;_CRT_SECURE_NO_WARNINGS;_CRT_NONSTDC_NO_DEPRECATE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>_HAS_EXCEPTIONS=0;D3D12_AGILITY_SDK=1;D3D12_AGILITY_SDK_VERSION=715;_CRT_SECURE_NO_WARNINGS;_CRT_NONSTDC_NO_DEPRECATE;_ALLOW_MSC_VER_MISMATCH;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
     <ClCompile Include="..\3rdparty\The-Forge\Common_3\Graphics\Direct3D12\Direct3D12_cxx.cpp">
       <ExcludedFromBuild Condition="'$(Platform)'=='Win32'">true</ExcludedFromBuild>
@@ -297,7 +315,7 @@
       <SDLCheck>false</SDLCheck>
       <WarningLevel>TurnOffAllWarnings</WarningLevel>
       <TreatWarningAsError>false</TreatWarningAsError>
-      <PreprocessorDefinitions>_HAS_EXCEPTIONS=0;D3D12_AGILITY_SDK=1;D3D12_AGILITY_SDK_VERSION=715;_CRT_SECURE_NO_WARNINGS;_CRT_NONSTDC_NO_DEPRECATE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>_HAS_EXCEPTIONS=0;D3D12_AGILITY_SDK=1;D3D12_AGILITY_SDK_VERSION=715;_CRT_SECURE_NO_WARNINGS;_CRT_NONSTDC_NO_DEPRECATE;_ALLOW_MSC_VER_MISMATCH;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
     <ClCompile Include="..\3rdparty\The-Forge\Common_3\Graphics\Direct3D12\Direct3D12Raytracing.c">
       <ExcludedFromBuild Condition="'$(Platform)'=='Win32'">true</ExcludedFromBuild>
@@ -306,7 +324,7 @@
       <SDLCheck>false</SDLCheck>
       <WarningLevel>TurnOffAllWarnings</WarningLevel>
       <TreatWarningAsError>false</TreatWarningAsError>
-      <PreprocessorDefinitions>_HAS_EXCEPTIONS=0;D3D12_AGILITY_SDK=1;D3D12_AGILITY_SDK_VERSION=715;_CRT_SECURE_NO_WARNINGS;_CRT_NONSTDC_NO_DEPRECATE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>_HAS_EXCEPTIONS=0;D3D12_AGILITY_SDK=1;D3D12_AGILITY_SDK_VERSION=715;_CRT_SECURE_NO_WARNINGS;_CRT_NONSTDC_NO_DEPRECATE;_ALLOW_MSC_VER_MISMATCH;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
     <ClCompile Include="..\3rdparty\The-Forge\Common_3\Graphics\GraphicsConfig.cpp">
       <ExcludedFromBuild Condition="'$(Platform)'=='Win32'">true</ExcludedFromBuild>
@@ -315,7 +333,7 @@
       <SDLCheck>false</SDLCheck>
       <WarningLevel>TurnOffAllWarnings</WarningLevel>
       <TreatWarningAsError>false</TreatWarningAsError>
-      <PreprocessorDefinitions>_HAS_EXCEPTIONS=0;D3D12_AGILITY_SDK=1;D3D12_AGILITY_SDK_VERSION=715;_CRT_SECURE_NO_WARNINGS;_CRT_NONSTDC_NO_DEPRECATE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>_HAS_EXCEPTIONS=0;D3D12_AGILITY_SDK=1;D3D12_AGILITY_SDK_VERSION=715;_CRT_SECURE_NO_WARNINGS;_CRT_NONSTDC_NO_DEPRECATE;_ALLOW_MSC_VER_MISMATCH;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
     <ClCompile Include="..\3rdparty\The-Forge\Common_3\Resources\ResourceLoader\ResourceLoader.cpp">
       <ExcludedFromBuild Condition="'$(Platform)'=='Win32'">true</ExcludedFromBuild>
@@ -324,7 +342,7 @@
       <SDLCheck>false</SDLCheck>
       <WarningLevel>TurnOffAllWarnings</WarningLevel>
       <TreatWarningAsError>false</TreatWarningAsError>
-      <PreprocessorDefinitions>_HAS_EXCEPTIONS=0;D3D12_AGILITY_SDK=1;D3D12_AGILITY_SDK_VERSION=715;_CRT_SECURE_NO_WARNINGS;_CRT_NONSTDC_NO_DEPRECATE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>_HAS_EXCEPTIONS=0;D3D12_AGILITY_SDK=1;D3D12_AGILITY_SDK_VERSION=715;_CRT_SECURE_NO_WARNINGS;_CRT_NONSTDC_NO_DEPRECATE;_ALLOW_MSC_VER_MISMATCH;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
     <ClCompile Include="..\3rdparty\The-Forge\Common_3\Utilities\MemoryTracking\MemoryTracking.c">
       <ExcludedFromBuild Condition="'$(Platform)'=='Win32'">true</ExcludedFromBuild>
@@ -333,7 +351,7 @@
       <SDLCheck>false</SDLCheck>
       <WarningLevel>TurnOffAllWarnings</WarningLevel>
       <TreatWarningAsError>false</TreatWarningAsError>
-      <PreprocessorDefinitions>_HAS_EXCEPTIONS=0;D3D12_AGILITY_SDK=1;D3D12_AGILITY_SDK_VERSION=715;_CRT_SECURE_NO_WARNINGS;_CRT_NONSTDC_NO_DEPRECATE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>_HAS_EXCEPTIONS=0;D3D12_AGILITY_SDK=1;D3D12_AGILITY_SDK_VERSION=715;_CRT_SECURE_NO_WARNINGS;_CRT_NONSTDC_NO_DEPRECATE;_ALLOW_MSC_VER_MISMATCH;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
     <ClCompile Include="..\3rdparty\The-Forge\Common_3\Utilities\Log\Log.c">
       <ExcludedFromBuild Condition="'$(Platform)'=='Win32'">true</ExcludedFromBuild>
@@ -344,7 +362,7 @@
       <TreatWarningAsError>false</TreatWarningAsError>
       <!-- Distinct obj name: Forge Log.c vs host log.cpp both emit Log.obj otherwise. -->
       <ObjectFileName>$(IntDir)ForgeLog.obj</ObjectFileName>
-      <PreprocessorDefinitions>_HAS_EXCEPTIONS=0;D3D12_AGILITY_SDK=1;D3D12_AGILITY_SDK_VERSION=715;_CRT_SECURE_NO_WARNINGS;_CRT_NONSTDC_NO_DEPRECATE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>_HAS_EXCEPTIONS=0;D3D12_AGILITY_SDK=1;D3D12_AGILITY_SDK_VERSION=715;_CRT_SECURE_NO_WARNINGS;_CRT_NONSTDC_NO_DEPRECATE;_ALLOW_MSC_VER_MISMATCH;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
     <ClCompile Include="..\3rdparty\The-Forge\Common_3\Utilities\FileSystem\FileSystem.c">
       <ExcludedFromBuild Condition="'$(Platform)'=='Win32'">true</ExcludedFromBuild>
@@ -353,7 +371,7 @@
       <SDLCheck>false</SDLCheck>
       <WarningLevel>TurnOffAllWarnings</WarningLevel>
       <TreatWarningAsError>false</TreatWarningAsError>
-      <PreprocessorDefinitions>_HAS_EXCEPTIONS=0;D3D12_AGILITY_SDK=1;D3D12_AGILITY_SDK_VERSION=715;_CRT_SECURE_NO_WARNINGS;_CRT_NONSTDC_NO_DEPRECATE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>_HAS_EXCEPTIONS=0;D3D12_AGILITY_SDK=1;D3D12_AGILITY_SDK_VERSION=715;_CRT_SECURE_NO_WARNINGS;_CRT_NONSTDC_NO_DEPRECATE;_ALLOW_MSC_VER_MISMATCH;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
     <ClCompile Include="..\3rdparty\The-Forge\Common_3\Utilities\Threading\ThreadSystem.c">
       <ExcludedFromBuild Condition="'$(Platform)'=='Win32'">true</ExcludedFromBuild>
@@ -362,7 +380,7 @@
       <SDLCheck>false</SDLCheck>
       <WarningLevel>TurnOffAllWarnings</WarningLevel>
       <TreatWarningAsError>false</TreatWarningAsError>
-      <PreprocessorDefinitions>_HAS_EXCEPTIONS=0;D3D12_AGILITY_SDK=1;D3D12_AGILITY_SDK_VERSION=715;_CRT_SECURE_NO_WARNINGS;_CRT_NONSTDC_NO_DEPRECATE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>_HAS_EXCEPTIONS=0;D3D12_AGILITY_SDK=1;D3D12_AGILITY_SDK_VERSION=715;_CRT_SECURE_NO_WARNINGS;_CRT_NONSTDC_NO_DEPRECATE;_ALLOW_MSC_VER_MISMATCH;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
     <ClCompile Include="..\3rdparty\The-Forge\Common_3\Utilities\Timer.c">
       <ExcludedFromBuild Condition="'$(Platform)'=='Win32'">true</ExcludedFromBuild>
@@ -371,7 +389,7 @@
       <SDLCheck>false</SDLCheck>
       <WarningLevel>TurnOffAllWarnings</WarningLevel>
       <TreatWarningAsError>false</TreatWarningAsError>
-      <PreprocessorDefinitions>_HAS_EXCEPTIONS=0;D3D12_AGILITY_SDK=1;D3D12_AGILITY_SDK_VERSION=715;_CRT_SECURE_NO_WARNINGS;_CRT_NONSTDC_NO_DEPRECATE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>_HAS_EXCEPTIONS=0;D3D12_AGILITY_SDK=1;D3D12_AGILITY_SDK_VERSION=715;_CRT_SECURE_NO_WARNINGS;_CRT_NONSTDC_NO_DEPRECATE;_ALLOW_MSC_VER_MISMATCH;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
     <ClCompile Include="..\3rdparty\The-Forge\Common_3\Utilities\Math\Algorithms.c">
       <ExcludedFromBuild Condition="'$(Platform)'=='Win32'">true</ExcludedFromBuild>
@@ -380,7 +398,7 @@
       <SDLCheck>false</SDLCheck>
       <WarningLevel>TurnOffAllWarnings</WarningLevel>
       <TreatWarningAsError>false</TreatWarningAsError>
-      <PreprocessorDefinitions>_HAS_EXCEPTIONS=0;D3D12_AGILITY_SDK=1;D3D12_AGILITY_SDK_VERSION=715;_CRT_SECURE_NO_WARNINGS;_CRT_NONSTDC_NO_DEPRECATE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>_HAS_EXCEPTIONS=0;D3D12_AGILITY_SDK=1;D3D12_AGILITY_SDK_VERSION=715;_CRT_SECURE_NO_WARNINGS;_CRT_NONSTDC_NO_DEPRECATE;_ALLOW_MSC_VER_MISMATCH;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
     <ClCompile Include="..\3rdparty\The-Forge\Common_3\Utilities\Math\StbDs.c">
       <ExcludedFromBuild Condition="'$(Platform)'=='Win32'">true</ExcludedFromBuild>
@@ -389,7 +407,7 @@
       <SDLCheck>false</SDLCheck>
       <WarningLevel>TurnOffAllWarnings</WarningLevel>
       <TreatWarningAsError>false</TreatWarningAsError>
-      <PreprocessorDefinitions>_HAS_EXCEPTIONS=0;D3D12_AGILITY_SDK=1;D3D12_AGILITY_SDK_VERSION=715;_CRT_SECURE_NO_WARNINGS;_CRT_NONSTDC_NO_DEPRECATE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>_HAS_EXCEPTIONS=0;D3D12_AGILITY_SDK=1;D3D12_AGILITY_SDK_VERSION=715;_CRT_SECURE_NO_WARNINGS;_CRT_NONSTDC_NO_DEPRECATE;_ALLOW_MSC_VER_MISMATCH;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
     <ClCompile Include="..\3rdparty\The-Forge\Common_3\Utilities\ThirdParty\OpenSource\bstrlib\bstrlib.c">
       <ExcludedFromBuild Condition="'$(Platform)'=='Win32'">true</ExcludedFromBuild>
@@ -398,7 +416,7 @@
       <SDLCheck>false</SDLCheck>
       <WarningLevel>TurnOffAllWarnings</WarningLevel>
       <TreatWarningAsError>false</TreatWarningAsError>
-      <PreprocessorDefinitions>_HAS_EXCEPTIONS=0;D3D12_AGILITY_SDK=1;D3D12_AGILITY_SDK_VERSION=715;_CRT_SECURE_NO_WARNINGS;_CRT_NONSTDC_NO_DEPRECATE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>_HAS_EXCEPTIONS=0;D3D12_AGILITY_SDK=1;D3D12_AGILITY_SDK_VERSION=715;_CRT_SECURE_NO_WARNINGS;_CRT_NONSTDC_NO_DEPRECATE;_ALLOW_MSC_VER_MISMATCH;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
     <ClCompile Include="..\3rdparty\The-Forge\Common_3\OS\CPUConfig.cpp">
       <ExcludedFromBuild Condition="'$(Platform)'=='Win32'">true</ExcludedFromBuild>
@@ -407,7 +425,7 @@
       <SDLCheck>false</SDLCheck>
       <WarningLevel>TurnOffAllWarnings</WarningLevel>
       <TreatWarningAsError>false</TreatWarningAsError>
-      <PreprocessorDefinitions>_HAS_EXCEPTIONS=0;D3D12_AGILITY_SDK=1;D3D12_AGILITY_SDK_VERSION=715;_CRT_SECURE_NO_WARNINGS;_CRT_NONSTDC_NO_DEPRECATE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>_HAS_EXCEPTIONS=0;D3D12_AGILITY_SDK=1;D3D12_AGILITY_SDK_VERSION=715;_CRT_SECURE_NO_WARNINGS;_CRT_NONSTDC_NO_DEPRECATE;_ALLOW_MSC_VER_MISMATCH;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
     <ClCompile Include="..\3rdparty\The-Forge\Common_3\OS\Windows\WindowsLog.c">
       <ExcludedFromBuild Condition="'$(Platform)'=='Win32'">true</ExcludedFromBuild>
@@ -416,7 +434,7 @@
       <SDLCheck>false</SDLCheck>
       <WarningLevel>TurnOffAllWarnings</WarningLevel>
       <TreatWarningAsError>false</TreatWarningAsError>
-      <PreprocessorDefinitions>_HAS_EXCEPTIONS=0;D3D12_AGILITY_SDK=1;D3D12_AGILITY_SDK_VERSION=715;_CRT_SECURE_NO_WARNINGS;_CRT_NONSTDC_NO_DEPRECATE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>_HAS_EXCEPTIONS=0;D3D12_AGILITY_SDK=1;D3D12_AGILITY_SDK_VERSION=715;_CRT_SECURE_NO_WARNINGS;_CRT_NONSTDC_NO_DEPRECATE;_ALLOW_MSC_VER_MISMATCH;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
     <ClCompile Include="..\3rdparty\The-Forge\Common_3\OS\Windows\WindowsThread.c">
       <ExcludedFromBuild Condition="'$(Platform)'=='Win32'">true</ExcludedFromBuild>
@@ -425,7 +443,7 @@
       <SDLCheck>false</SDLCheck>
       <WarningLevel>TurnOffAllWarnings</WarningLevel>
       <TreatWarningAsError>false</TreatWarningAsError>
-      <PreprocessorDefinitions>_HAS_EXCEPTIONS=0;D3D12_AGILITY_SDK=1;D3D12_AGILITY_SDK_VERSION=715;_CRT_SECURE_NO_WARNINGS;_CRT_NONSTDC_NO_DEPRECATE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>_HAS_EXCEPTIONS=0;D3D12_AGILITY_SDK=1;D3D12_AGILITY_SDK_VERSION=715;_CRT_SECURE_NO_WARNINGS;_CRT_NONSTDC_NO_DEPRECATE;_ALLOW_MSC_VER_MISMATCH;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
     <ClCompile Include="..\3rdparty\The-Forge\Common_3\OS\Windows\WindowsTime.c">
       <ExcludedFromBuild Condition="'$(Platform)'=='Win32'">true</ExcludedFromBuild>
@@ -434,7 +452,7 @@
       <SDLCheck>false</SDLCheck>
       <WarningLevel>TurnOffAllWarnings</WarningLevel>
       <TreatWarningAsError>false</TreatWarningAsError>
-      <PreprocessorDefinitions>_HAS_EXCEPTIONS=0;D3D12_AGILITY_SDK=1;D3D12_AGILITY_SDK_VERSION=715;_CRT_SECURE_NO_WARNINGS;_CRT_NONSTDC_NO_DEPRECATE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>_HAS_EXCEPTIONS=0;D3D12_AGILITY_SDK=1;D3D12_AGILITY_SDK_VERSION=715;_CRT_SECURE_NO_WARNINGS;_CRT_NONSTDC_NO_DEPRECATE;_ALLOW_MSC_VER_MISMATCH;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
     <ClCompile Include="..\3rdparty\The-Forge\Common_3\OS\Windows\WindowsFileSystem.cpp">
       <ExcludedFromBuild Condition="'$(Platform)'=='Win32'">true</ExcludedFromBuild>
@@ -443,7 +461,7 @@
       <SDLCheck>false</SDLCheck>
       <WarningLevel>TurnOffAllWarnings</WarningLevel>
       <TreatWarningAsError>false</TreatWarningAsError>
-      <PreprocessorDefinitions>_HAS_EXCEPTIONS=0;D3D12_AGILITY_SDK=1;D3D12_AGILITY_SDK_VERSION=715;_CRT_SECURE_NO_WARNINGS;_CRT_NONSTDC_NO_DEPRECATE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>_HAS_EXCEPTIONS=0;D3D12_AGILITY_SDK=1;D3D12_AGILITY_SDK_VERSION=715;_CRT_SECURE_NO_WARNINGS;_CRT_NONSTDC_NO_DEPRECATE;_ALLOW_MSC_VER_MISMATCH;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
     <ClCompile Include="..\3rdparty\The-Forge\Common_3\OS\Windows\WindowsStackTraceDump.cpp">
       <ExcludedFromBuild Condition="'$(Platform)'=='Win32'">true</ExcludedFromBuild>
@@ -463,7 +481,7 @@
       <SDLCheck>false</SDLCheck>
       <WarningLevel>TurnOffAllWarnings</WarningLevel>
       <TreatWarningAsError>false</TreatWarningAsError>
-      <PreprocessorDefinitions>_HAS_EXCEPTIONS=0;D3D12_AGILITY_SDK=1;D3D12_AGILITY_SDK_VERSION=715;_CRT_SECURE_NO_WARNINGS;_CRT_NONSTDC_NO_DEPRECATE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>_HAS_EXCEPTIONS=0;D3D12_AGILITY_SDK=1;D3D12_AGILITY_SDK_VERSION=715;_CRT_SECURE_NO_WARNINGS;_CRT_NONSTDC_NO_DEPRECATE;_ALLOW_MSC_VER_MISMATCH;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
     <!-- Archive/pipeline-cache compression (FileSystem.c references zstd + lz4). -->
     <ClCompile Include="..\3rdparty\The-Forge\Common_3\Utilities\ThirdParty\OpenSource\lz4\lz4.c">
@@ -473,7 +491,7 @@
       <SDLCheck>false</SDLCheck>
       <WarningLevel>TurnOffAllWarnings</WarningLevel>
       <TreatWarningAsError>false</TreatWarningAsError>
-      <PreprocessorDefinitions>_HAS_EXCEPTIONS=0;D3D12_AGILITY_SDK=1;D3D12_AGILITY_SDK_VERSION=715;_CRT_SECURE_NO_WARNINGS;_CRT_NONSTDC_NO_DEPRECATE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>_HAS_EXCEPTIONS=0;D3D12_AGILITY_SDK=1;D3D12_AGILITY_SDK_VERSION=715;_CRT_SECURE_NO_WARNINGS;_CRT_NONSTDC_NO_DEPRECATE;_ALLOW_MSC_VER_MISMATCH;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
     <ClCompile Include="..\3rdparty\The-Forge\Common_3\Utilities\ThirdParty\OpenSource\zstd\common\debug.c">
       <ExcludedFromBuild Condition="'$(Platform)'=='Win32'">true</ExcludedFromBuild>
@@ -482,7 +500,7 @@
       <SDLCheck>false</SDLCheck>
       <WarningLevel>TurnOffAllWarnings</WarningLevel>
       <TreatWarningAsError>false</TreatWarningAsError>
-      <PreprocessorDefinitions>_HAS_EXCEPTIONS=0;D3D12_AGILITY_SDK=1;D3D12_AGILITY_SDK_VERSION=715;_CRT_SECURE_NO_WARNINGS;_CRT_NONSTDC_NO_DEPRECATE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>_HAS_EXCEPTIONS=0;D3D12_AGILITY_SDK=1;D3D12_AGILITY_SDK_VERSION=715;_CRT_SECURE_NO_WARNINGS;_CRT_NONSTDC_NO_DEPRECATE;_ALLOW_MSC_VER_MISMATCH;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
     <ClCompile Include="..\3rdparty\The-Forge\Common_3\Utilities\ThirdParty\OpenSource\zstd\common\entropy_common.c">
       <ExcludedFromBuild Condition="'$(Platform)'=='Win32'">true</ExcludedFromBuild>
@@ -491,7 +509,7 @@
       <SDLCheck>false</SDLCheck>
       <WarningLevel>TurnOffAllWarnings</WarningLevel>
       <TreatWarningAsError>false</TreatWarningAsError>
-      <PreprocessorDefinitions>_HAS_EXCEPTIONS=0;D3D12_AGILITY_SDK=1;D3D12_AGILITY_SDK_VERSION=715;_CRT_SECURE_NO_WARNINGS;_CRT_NONSTDC_NO_DEPRECATE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>_HAS_EXCEPTIONS=0;D3D12_AGILITY_SDK=1;D3D12_AGILITY_SDK_VERSION=715;_CRT_SECURE_NO_WARNINGS;_CRT_NONSTDC_NO_DEPRECATE;_ALLOW_MSC_VER_MISMATCH;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
     <ClCompile Include="..\3rdparty\The-Forge\Common_3\Utilities\ThirdParty\OpenSource\zstd\common\error_private.c">
       <ExcludedFromBuild Condition="'$(Platform)'=='Win32'">true</ExcludedFromBuild>
@@ -500,7 +518,7 @@
       <SDLCheck>false</SDLCheck>
       <WarningLevel>TurnOffAllWarnings</WarningLevel>
       <TreatWarningAsError>false</TreatWarningAsError>
-      <PreprocessorDefinitions>_HAS_EXCEPTIONS=0;D3D12_AGILITY_SDK=1;D3D12_AGILITY_SDK_VERSION=715;_CRT_SECURE_NO_WARNINGS;_CRT_NONSTDC_NO_DEPRECATE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>_HAS_EXCEPTIONS=0;D3D12_AGILITY_SDK=1;D3D12_AGILITY_SDK_VERSION=715;_CRT_SECURE_NO_WARNINGS;_CRT_NONSTDC_NO_DEPRECATE;_ALLOW_MSC_VER_MISMATCH;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
     <ClCompile Include="..\3rdparty\The-Forge\Common_3\Utilities\ThirdParty\OpenSource\zstd\common\fse_decompress.c">
       <ExcludedFromBuild Condition="'$(Platform)'=='Win32'">true</ExcludedFromBuild>
@@ -509,7 +527,7 @@
       <SDLCheck>false</SDLCheck>
       <WarningLevel>TurnOffAllWarnings</WarningLevel>
       <TreatWarningAsError>false</TreatWarningAsError>
-      <PreprocessorDefinitions>_HAS_EXCEPTIONS=0;D3D12_AGILITY_SDK=1;D3D12_AGILITY_SDK_VERSION=715;_CRT_SECURE_NO_WARNINGS;_CRT_NONSTDC_NO_DEPRECATE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>_HAS_EXCEPTIONS=0;D3D12_AGILITY_SDK=1;D3D12_AGILITY_SDK_VERSION=715;_CRT_SECURE_NO_WARNINGS;_CRT_NONSTDC_NO_DEPRECATE;_ALLOW_MSC_VER_MISMATCH;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
     <ClCompile Include="..\3rdparty\The-Forge\Common_3\Utilities\ThirdParty\OpenSource\zstd\common\pool.c">
       <ExcludedFromBuild Condition="'$(Platform)'=='Win32'">true</ExcludedFromBuild>
@@ -518,7 +536,7 @@
       <SDLCheck>false</SDLCheck>
       <WarningLevel>TurnOffAllWarnings</WarningLevel>
       <TreatWarningAsError>false</TreatWarningAsError>
-      <PreprocessorDefinitions>_HAS_EXCEPTIONS=0;D3D12_AGILITY_SDK=1;D3D12_AGILITY_SDK_VERSION=715;_CRT_SECURE_NO_WARNINGS;_CRT_NONSTDC_NO_DEPRECATE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>_HAS_EXCEPTIONS=0;D3D12_AGILITY_SDK=1;D3D12_AGILITY_SDK_VERSION=715;_CRT_SECURE_NO_WARNINGS;_CRT_NONSTDC_NO_DEPRECATE;_ALLOW_MSC_VER_MISMATCH;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
     <ClCompile Include="..\3rdparty\The-Forge\Common_3\Utilities\ThirdParty\OpenSource\zstd\common\threading.c">
       <ExcludedFromBuild Condition="'$(Platform)'=='Win32'">true</ExcludedFromBuild>
@@ -527,7 +545,7 @@
       <SDLCheck>false</SDLCheck>
       <WarningLevel>TurnOffAllWarnings</WarningLevel>
       <TreatWarningAsError>false</TreatWarningAsError>
-      <PreprocessorDefinitions>_HAS_EXCEPTIONS=0;D3D12_AGILITY_SDK=1;D3D12_AGILITY_SDK_VERSION=715;_CRT_SECURE_NO_WARNINGS;_CRT_NONSTDC_NO_DEPRECATE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>_HAS_EXCEPTIONS=0;D3D12_AGILITY_SDK=1;D3D12_AGILITY_SDK_VERSION=715;_CRT_SECURE_NO_WARNINGS;_CRT_NONSTDC_NO_DEPRECATE;_ALLOW_MSC_VER_MISMATCH;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
     <ClCompile Include="..\3rdparty\The-Forge\Common_3\Utilities\ThirdParty\OpenSource\zstd\common\xxhash.c">
       <ExcludedFromBuild Condition="'$(Platform)'=='Win32'">true</ExcludedFromBuild>
@@ -536,7 +554,7 @@
       <SDLCheck>false</SDLCheck>
       <WarningLevel>TurnOffAllWarnings</WarningLevel>
       <TreatWarningAsError>false</TreatWarningAsError>
-      <PreprocessorDefinitions>_HAS_EXCEPTIONS=0;D3D12_AGILITY_SDK=1;D3D12_AGILITY_SDK_VERSION=715;_CRT_SECURE_NO_WARNINGS;_CRT_NONSTDC_NO_DEPRECATE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>_HAS_EXCEPTIONS=0;D3D12_AGILITY_SDK=1;D3D12_AGILITY_SDK_VERSION=715;_CRT_SECURE_NO_WARNINGS;_CRT_NONSTDC_NO_DEPRECATE;_ALLOW_MSC_VER_MISMATCH;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
     <ClCompile Include="..\3rdparty\The-Forge\Common_3\Utilities\ThirdParty\OpenSource\zstd\common\zstd_common.c">
       <ExcludedFromBuild Condition="'$(Platform)'=='Win32'">true</ExcludedFromBuild>
@@ -545,7 +563,7 @@
       <SDLCheck>false</SDLCheck>
       <WarningLevel>TurnOffAllWarnings</WarningLevel>
       <TreatWarningAsError>false</TreatWarningAsError>
-      <PreprocessorDefinitions>_HAS_EXCEPTIONS=0;D3D12_AGILITY_SDK=1;D3D12_AGILITY_SDK_VERSION=715;_CRT_SECURE_NO_WARNINGS;_CRT_NONSTDC_NO_DEPRECATE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>_HAS_EXCEPTIONS=0;D3D12_AGILITY_SDK=1;D3D12_AGILITY_SDK_VERSION=715;_CRT_SECURE_NO_WARNINGS;_CRT_NONSTDC_NO_DEPRECATE;_ALLOW_MSC_VER_MISMATCH;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
     <ClCompile Include="..\3rdparty\The-Forge\Common_3\Utilities\ThirdParty\OpenSource\zstd\decompress\huf_decompress.c">
       <ExcludedFromBuild Condition="'$(Platform)'=='Win32'">true</ExcludedFromBuild>
@@ -554,7 +572,7 @@
       <SDLCheck>false</SDLCheck>
       <WarningLevel>TurnOffAllWarnings</WarningLevel>
       <TreatWarningAsError>false</TreatWarningAsError>
-      <PreprocessorDefinitions>_HAS_EXCEPTIONS=0;D3D12_AGILITY_SDK=1;D3D12_AGILITY_SDK_VERSION=715;_CRT_SECURE_NO_WARNINGS;_CRT_NONSTDC_NO_DEPRECATE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>_HAS_EXCEPTIONS=0;D3D12_AGILITY_SDK=1;D3D12_AGILITY_SDK_VERSION=715;_CRT_SECURE_NO_WARNINGS;_CRT_NONSTDC_NO_DEPRECATE;_ALLOW_MSC_VER_MISMATCH;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
     <ClCompile Include="..\3rdparty\The-Forge\Common_3\Utilities\ThirdParty\OpenSource\zstd\decompress\zstd_ddict.c">
       <ExcludedFromBuild Condition="'$(Platform)'=='Win32'">true</ExcludedFromBuild>
@@ -563,7 +581,7 @@
       <SDLCheck>false</SDLCheck>
       <WarningLevel>TurnOffAllWarnings</WarningLevel>
       <TreatWarningAsError>false</TreatWarningAsError>
-      <PreprocessorDefinitions>_HAS_EXCEPTIONS=0;D3D12_AGILITY_SDK=1;D3D12_AGILITY_SDK_VERSION=715;_CRT_SECURE_NO_WARNINGS;_CRT_NONSTDC_NO_DEPRECATE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>_HAS_EXCEPTIONS=0;D3D12_AGILITY_SDK=1;D3D12_AGILITY_SDK_VERSION=715;_CRT_SECURE_NO_WARNINGS;_CRT_NONSTDC_NO_DEPRECATE;_ALLOW_MSC_VER_MISMATCH;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
     <ClCompile Include="..\3rdparty\The-Forge\Common_3\Utilities\ThirdParty\OpenSource\zstd\decompress\zstd_decompress.c">
       <ExcludedFromBuild Condition="'$(Platform)'=='Win32'">true</ExcludedFromBuild>
@@ -572,7 +590,7 @@
       <SDLCheck>false</SDLCheck>
       <WarningLevel>TurnOffAllWarnings</WarningLevel>
       <TreatWarningAsError>false</TreatWarningAsError>
-      <PreprocessorDefinitions>_HAS_EXCEPTIONS=0;D3D12_AGILITY_SDK=1;D3D12_AGILITY_SDK_VERSION=715;_CRT_SECURE_NO_WARNINGS;_CRT_NONSTDC_NO_DEPRECATE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>_HAS_EXCEPTIONS=0;D3D12_AGILITY_SDK=1;D3D12_AGILITY_SDK_VERSION=715;_CRT_SECURE_NO_WARNINGS;_CRT_NONSTDC_NO_DEPRECATE;_ALLOW_MSC_VER_MISMATCH;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
     <ClCompile Include="..\3rdparty\The-Forge\Common_3\Utilities\ThirdParty\OpenSource\zstd\decompress\zstd_decompress_block.c">
       <ExcludedFromBuild Condition="'$(Platform)'=='Win32'">true</ExcludedFromBuild>
@@ -581,7 +599,7 @@
       <SDLCheck>false</SDLCheck>
       <WarningLevel>TurnOffAllWarnings</WarningLevel>
       <TreatWarningAsError>false</TreatWarningAsError>
-      <PreprocessorDefinitions>_HAS_EXCEPTIONS=0;D3D12_AGILITY_SDK=1;D3D12_AGILITY_SDK_VERSION=715;_CRT_SECURE_NO_WARNINGS;_CRT_NONSTDC_NO_DEPRECATE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>_HAS_EXCEPTIONS=0;D3D12_AGILITY_SDK=1;D3D12_AGILITY_SDK_VERSION=715;_CRT_SECURE_NO_WARNINGS;_CRT_NONSTDC_NO_DEPRECATE;_ALLOW_MSC_VER_MISMATCH;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
     <!-- Dev overlay (Forge IUI/IFont). UI.cpp carries the FORGE_HOST_EXTERNAL_INPUT shim so the
          headless host injects forwarded mouse instead of reading gainput (no window). The shim also
@@ -602,7 +620,7 @@
       <SDLCheck>false</SDLCheck>
       <WarningLevel>TurnOffAllWarnings</WarningLevel>
       <TreatWarningAsError>false</TreatWarningAsError>
-      <PreprocessorDefinitions>_HAS_EXCEPTIONS=0;D3D12_AGILITY_SDK=1;D3D12_AGILITY_SDK_VERSION=715;_CRT_SECURE_NO_WARNINGS;_CRT_NONSTDC_NO_DEPRECATE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>_HAS_EXCEPTIONS=0;D3D12_AGILITY_SDK=1;D3D12_AGILITY_SDK_VERSION=715;_CRT_SECURE_NO_WARNINGS;_CRT_NONSTDC_NO_DEPRECATE;_ALLOW_MSC_VER_MISMATCH;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
     <ClCompile Include="..\3rdparty\The-Forge\Common_3\Application\Fonts\stbtt.cpp">
       <ExcludedFromBuild Condition="'$(Platform)'=='Win32'">true</ExcludedFromBuild>
@@ -611,7 +629,7 @@
       <SDLCheck>false</SDLCheck>
       <WarningLevel>TurnOffAllWarnings</WarningLevel>
       <TreatWarningAsError>false</TreatWarningAsError>
-      <PreprocessorDefinitions>_HAS_EXCEPTIONS=0;D3D12_AGILITY_SDK=1;D3D12_AGILITY_SDK_VERSION=715;_CRT_SECURE_NO_WARNINGS;_CRT_NONSTDC_NO_DEPRECATE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>_HAS_EXCEPTIONS=0;D3D12_AGILITY_SDK=1;D3D12_AGILITY_SDK_VERSION=715;_CRT_SECURE_NO_WARNINGS;_CRT_NONSTDC_NO_DEPRECATE;_ALLOW_MSC_VER_MISMATCH;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
     <ClCompile Include="..\3rdparty\The-Forge\Common_3\Application\ThirdParty\OpenSource\imgui\imgui.cpp">
       <ExcludedFromBuild Condition="'$(Platform)'=='Win32'">true</ExcludedFromBuild>
@@ -620,7 +638,7 @@
       <SDLCheck>false</SDLCheck>
       <WarningLevel>TurnOffAllWarnings</WarningLevel>
       <TreatWarningAsError>false</TreatWarningAsError>
-      <PreprocessorDefinitions>_HAS_EXCEPTIONS=0;D3D12_AGILITY_SDK=1;D3D12_AGILITY_SDK_VERSION=715;_CRT_SECURE_NO_WARNINGS;_CRT_NONSTDC_NO_DEPRECATE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>_HAS_EXCEPTIONS=0;D3D12_AGILITY_SDK=1;D3D12_AGILITY_SDK_VERSION=715;_CRT_SECURE_NO_WARNINGS;_CRT_NONSTDC_NO_DEPRECATE;_ALLOW_MSC_VER_MISMATCH;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
     <ClCompile Include="..\3rdparty\The-Forge\Common_3\Application\ThirdParty\OpenSource\imgui\imgui_demo.cpp">
       <ExcludedFromBuild Condition="'$(Platform)'=='Win32'">true</ExcludedFromBuild>
@@ -629,7 +647,7 @@
       <SDLCheck>false</SDLCheck>
       <WarningLevel>TurnOffAllWarnings</WarningLevel>
       <TreatWarningAsError>false</TreatWarningAsError>
-      <PreprocessorDefinitions>_HAS_EXCEPTIONS=0;D3D12_AGILITY_SDK=1;D3D12_AGILITY_SDK_VERSION=715;_CRT_SECURE_NO_WARNINGS;_CRT_NONSTDC_NO_DEPRECATE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>_HAS_EXCEPTIONS=0;D3D12_AGILITY_SDK=1;D3D12_AGILITY_SDK_VERSION=715;_CRT_SECURE_NO_WARNINGS;_CRT_NONSTDC_NO_DEPRECATE;_ALLOW_MSC_VER_MISMATCH;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
     <ClCompile Include="..\3rdparty\The-Forge\Common_3\Application\ThirdParty\OpenSource\imgui\imgui_draw.cpp">
       <ExcludedFromBuild Condition="'$(Platform)'=='Win32'">true</ExcludedFromBuild>
@@ -638,7 +656,7 @@
       <SDLCheck>false</SDLCheck>
       <WarningLevel>TurnOffAllWarnings</WarningLevel>
       <TreatWarningAsError>false</TreatWarningAsError>
-      <PreprocessorDefinitions>_HAS_EXCEPTIONS=0;D3D12_AGILITY_SDK=1;D3D12_AGILITY_SDK_VERSION=715;_CRT_SECURE_NO_WARNINGS;_CRT_NONSTDC_NO_DEPRECATE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>_HAS_EXCEPTIONS=0;D3D12_AGILITY_SDK=1;D3D12_AGILITY_SDK_VERSION=715;_CRT_SECURE_NO_WARNINGS;_CRT_NONSTDC_NO_DEPRECATE;_ALLOW_MSC_VER_MISMATCH;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
     <ClCompile Include="..\3rdparty\The-Forge\Common_3\Application\ThirdParty\OpenSource\imgui\imgui_tables.cpp">
       <ExcludedFromBuild Condition="'$(Platform)'=='Win32'">true</ExcludedFromBuild>
@@ -647,7 +665,7 @@
       <SDLCheck>false</SDLCheck>
       <WarningLevel>TurnOffAllWarnings</WarningLevel>
       <TreatWarningAsError>false</TreatWarningAsError>
-      <PreprocessorDefinitions>_HAS_EXCEPTIONS=0;D3D12_AGILITY_SDK=1;D3D12_AGILITY_SDK_VERSION=715;_CRT_SECURE_NO_WARNINGS;_CRT_NONSTDC_NO_DEPRECATE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>_HAS_EXCEPTIONS=0;D3D12_AGILITY_SDK=1;D3D12_AGILITY_SDK_VERSION=715;_CRT_SECURE_NO_WARNINGS;_CRT_NONSTDC_NO_DEPRECATE;_ALLOW_MSC_VER_MISMATCH;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
     <ClCompile Include="..\3rdparty\The-Forge\Common_3\Application\ThirdParty\OpenSource\imgui\imgui_widgets.cpp">
       <ExcludedFromBuild Condition="'$(Platform)'=='Win32'">true</ExcludedFromBuild>
@@ -656,7 +674,7 @@
       <SDLCheck>false</SDLCheck>
       <WarningLevel>TurnOffAllWarnings</WarningLevel>
       <TreatWarningAsError>false</TreatWarningAsError>
-      <PreprocessorDefinitions>_HAS_EXCEPTIONS=0;D3D12_AGILITY_SDK=1;D3D12_AGILITY_SDK_VERSION=715;_CRT_SECURE_NO_WARNINGS;_CRT_NONSTDC_NO_DEPRECATE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>_HAS_EXCEPTIONS=0;D3D12_AGILITY_SDK=1;D3D12_AGILITY_SDK_VERSION=715;_CRT_SECURE_NO_WARNINGS;_CRT_NONSTDC_NO_DEPRECATE;_ALLOW_MSC_VER_MISMATCH;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
     <!-- CameraMatrix (used by FontSystem world-space text). Input-clean TU. -->
     <ClCompile Include="..\3rdparty\The-Forge\Common_3\Application\CameraController.cpp">
@@ -666,7 +684,7 @@
       <SDLCheck>false</SDLCheck>
       <WarningLevel>TurnOffAllWarnings</WarningLevel>
       <TreatWarningAsError>false</TreatWarningAsError>
-      <PreprocessorDefinitions>_HAS_EXCEPTIONS=0;D3D12_AGILITY_SDK=1;D3D12_AGILITY_SDK_VERSION=715;_CRT_SECURE_NO_WARNINGS;_CRT_NONSTDC_NO_DEPRECATE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>_HAS_EXCEPTIONS=0;D3D12_AGILITY_SDK=1;D3D12_AGILITY_SDK_VERSION=715;_CRT_SECURE_NO_WARNINGS;_CRT_NONSTDC_NO_DEPRECATE;_ALLOW_MSC_VER_MISMATCH;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
     <!-- Headless-host stubs for the OS/profiler symbols UI.cpp references but the host doesn't link. -->
     <ClCompile Include="forge_host_stubs.cpp">
@@ -676,7 +694,7 @@
       <SDLCheck>false</SDLCheck>
       <WarningLevel>TurnOffAllWarnings</WarningLevel>
       <TreatWarningAsError>false</TreatWarningAsError>
-      <PreprocessorDefinitions>_HAS_EXCEPTIONS=0;D3D12_AGILITY_SDK=1;D3D12_AGILITY_SDK_VERSION=715;_CRT_SECURE_NO_WARNINGS;_CRT_NONSTDC_NO_DEPRECATE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>_HAS_EXCEPTIONS=0;D3D12_AGILITY_SDK=1;D3D12_AGILITY_SDK_VERSION=715;_CRT_SECURE_NO_WARNINGS;_CRT_NONSTDC_NO_DEPRECATE;_ALLOW_MSC_VER_MISMATCH;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
   </ItemGroup>
   <ItemGroup>

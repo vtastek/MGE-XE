@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
+#include <cstdarg>
 
 // DirectX 12 Agility SDK loader exports. The OS d3d12.dll looks these up in the host
 // EXE at startup; without them it ignores the D3D12Core.dll we ship beside the exe and
@@ -22,7 +23,142 @@ extern "C" {
 
 
 
+// ─── OPT-IN: LET AN API PROXY IN THE EXE'S OWN FOLDER LOAD (ReShade, OptiScaler, …) ─────────────
+//
+// ⚠⚠ WHY THIS FUNCTION HAS TO EXIST AT ALL. The Forge loads the two graphics DLLs with an EXPLICIT
+// system-directory-only search:
+//
+//     gD3D12dll = LoadLibraryExA("d3d12.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
+//     gDXGIdll  = LoadLibraryExA("dxgi.dll",  NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
+//                                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^ Direct3D12.c
+//
+// so a proxy DLL sitting beside mgeHost64.exe is bypassed by construction and can NEVER be reached.
+// Measured 2026-09-02: an install with ReShade 6.8.0 installed as `d3d12.dll` right next to the host
+// produced not one line of ReShade output across many host runs, because the host never opened that
+// file.
+//
+// ⚠ WHY THE FIX IS HERE AND NOT IN The Forge. Patching Direct3D12.c would work and would be one
+// word, but it is a VENDORED third-party file and every such edit is a merge conflict forever
+// ([[project_forge_fork_merge_trap]]). Windows resolves an already-loaded module by its BASE NAME
+// before it consults any search path, so loading `d3d12.dll` ourselves FIRST — with the default
+// search order, which does include the application directory — means The Forge's later
+// SYSTEM32-only call finds the module already present and returns that same handle. The proxy wins
+// without one line of The Forge changing.
+//
+// ⚠⚠ OPT-IN, AND IT STAYS OPT-IN. This injects arbitrary third-party code into the render host, and
+// the host is the process that owns the frame: a bad proxy takes the renderer down rather than
+// degrading. It is also useless by default — nothing ships a proxy in that folder — so the cost of
+// having it on would be pure risk for no gain.
+//
+// ⚠ IT LOGS WHICH FILE ACTUALLY WON, by full path. "Did my proxy load" is otherwise exactly as
+// unanswerable as "is DLSS running" was, and for the same reason: success and failure look
+// identical from outside.
+//
+// Read straight from the environment rather than through the knob table, because that table lives
+// in the renderer and this has to run BEFORE the renderer exists — which is the whole point.
+// The report, held until mgeHost64.log exists. See the note at the printf below.
+static char gProxyReport[4][512] = {};
+static int  gProxyReportCount = 0;
+static void proxyReport(const char* fmt, ...) {
+	if (gProxyReportCount < 4) {
+		va_list a;
+		va_start(a, fmt);
+		std::vsnprintf(gProxyReport[gProxyReportCount], sizeof(gProxyReport[0]), fmt, a);
+		va_end(a);
+		++gProxyReportCount;
+	}
+}
+// Emitted by main() the moment LOG::open has run. ⚠ THIS FUNCTION IS THE FIX FOR A REAL BLIND SPOT,
+// not tidiness: the client spawns the host with CREATE_NO_WINDOW (ipc/client.cpp), so the host has
+// NO CONSOLE in a real game session and everything this file printf'd went nowhere. The first
+// attempt to use the proxy hook in game was therefore unanswerable — the one line that says whether
+// it loaded was written to a stream that does not exist. Same lesson as the upscale backend's own
+// logging, one process-lifecycle stage earlier.
+static void flushProxyReport() {
+	for (int i = 0; i < gProxyReportCount; ++i) {
+		LOG::logline("%s", gProxyReport[i]);
+	}
+	if (gProxyReportCount) {
+		LOG::flush();
+	}
+}
+
+static void preloadGraphicsProxies() {
+	const char* env = std::getenv("MGE_HOST_KNOBS");
+	if (!env || !std::strstr(env, "proxyDlls=1")) {
+		// ⚠ SAID OUT LOUD. "The knob is off" and "the knob is on and the load failed" produce the
+		// same silence otherwise, and that ambiguity cost a whole round trip the first time.
+		proxyReport(">> [proxy] disabled (MGE_HOST_KNOBS has no proxyDlls=1) — the graphics DLLs "
+		            "come from The Forge's System32-only load, as they always have");
+		return;
+	}
+	// ─── AND THE NGX RUNTIMES, WHEN ASKED ───────────────────────────────────────────────────────
+	// ⚠⚠ THIS IS AN **ORDERING** FIX, and the ordering is the whole defect. An injected NGX overlay
+	// (RenoDX's DLSS5 addon, and tools of that shape generally) scans the process for already-loaded
+	// `nvngx_*` modules AT DEVICE INIT and installs its hooks on what it finds — once. This host
+	// initialises NGX LAZILY, in buildOpaquePath on the first renderScene, which is long after the
+	// device exists. So the scan runs against a process that has not touched NGX yet.
+	//
+	// Measured 2026-09-02, straight from the addon's own log:
+	//     NGX module scan (loaded copies):
+	//     <nothing>
+	// and on a later device, only `nvngx_dlssnr.dll` — the one the addon itself had pre-loaded.
+	// `nvngx_dlss.dll`, the super-resolution runtime this host actually uses, was never in the list.
+	// The addon was therefore hooking nothing, which is exactly the reported symptom: the overlay
+	// appears, its settings move, and the picture does not change.
+	//
+	// Loading the runtimes here — before the device, before any hook scan — puts them in the list.
+	// It does not disturb NGX's own loading: it LoadLibrary's them by the same base name later and
+	// Windows returns the module already resident, the same mechanism the d3d12 proxy above relies
+	// on. Missing files are skipped in silence by design; a machine without frame generation has no
+	// `nvngx_dlssg.dll` and that is not a problem to report.
+	if (std::strstr(env, "preloadNgx=1")) {
+		static const wchar_t* const kNgx[] = {
+			L"nvngx_dlss.dll",     // super resolution — the one this host uses
+			L"nvngx_dlssnr.dll",   // ray reconstruction / neural rendering
+			L"nvngx_dlssg.dll",    // frame generation; unused here, loaded only to be scannable
+		};
+		int loaded = 0;
+		for (const wchar_t* n : kNgx) {
+			if (HMODULE m = LoadLibraryW(n)) {
+				wchar_t p2[MAX_PATH] = L"";
+				GetModuleFileNameW(m, p2, MAX_PATH);
+				proxyReport(">> [proxy] preloaded %ls -> %ls", n, p2);
+				++loaded;
+			}
+		}
+		proxyReport(">> [proxy] NGX preload: %d module(s) resident BEFORE device creation, so an "
+		            "injected overlay's module scan can see them. 0 here means none were found "
+		            "beside the exe.", loaded);
+	}
+
+	static const wchar_t* const kNames[] = { L"d3d12.dll", L"dxgi.dll" };
+	for (const wchar_t* name : kNames) {
+		// Default search order: the EXE's directory is consulted before System32, which is exactly
+		// the behaviour The Forge opted out of.
+		HMODULE h = LoadLibraryW(name);
+		if (!h) {
+			proxyReport("!! [proxy] LoadLibrary(%ls) FAILED (error %lu) — the host falls back to "
+			            "The Forge's System32 load", name, (unsigned long)GetLastError());
+			continue;
+		}
+		wchar_t path[MAX_PATH] = L"";
+		GetModuleFileNameW(h, path, MAX_PATH);
+		// ⚠ BUFFERED, NOT LOGGED HERE — mgeHost64.log is opened a few lines into main() and this
+		// has to run before the renderer, so LOG::write would silently no-op on a closed handle.
+		// printf alone was the first attempt and it was WRONG for the case that matters: the client
+		// spawns this process with CREATE_NO_WINDOW, so a game session has no stdout to read.
+		// flushProxyReport() puts these in the log the moment it exists.
+		proxyReport(">> [proxy] %ls -> %ls", name, path);
+		std::printf("[proxy] %ls -> %ls\n", name, path);
+	}
+	std::fflush(stdout);
+}
+
 int main(int argc, char** argv) {
+	// BEFORE every entry point below, because all of them reach the renderer and the renderer is
+	// what loads the graphics DLLs. See preloadGraphicsProxies.
+	preloadGraphicsProxies();
 
 	// Standalone Forge bring-up probe (Milestone D1): run `mgeHost64.exe --forge-probe`
 	// to validate the vendored Forge (D3D12) build initialises a device, with no
@@ -119,6 +255,8 @@ int main(int argc, char** argv) {
 
 	LOG::open("mgeHost64.log");
 	LOG::logline("Host process started");
+	// What the pre-main proxy preload did, now that there is somewhere to say it.
+	flushProxyReport();
 
 	// Dev-knob overrides from the environment, BEFORE init so a knob read during bring-up sees the
 	// override rather than the default. Logged, so a run's log carries the arm it was measured in.

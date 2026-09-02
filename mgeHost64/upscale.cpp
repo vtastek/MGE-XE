@@ -294,6 +294,19 @@ namespace
 
         const char* name() const override { return "passthrough"; }
 
+        // ⚠ THE PASSTHROUGH HAS NO PER-MODE OPINION, and saying so is the honest answer rather than
+        // echoing the fallback ratios back at the host. It is a Catmull-Rom resample: it will
+        // reconstruct from ANY input rect equally well (or equally badly), so there is no
+        // driver-reported [min,max] to consult and no rect it would refuse. Returning false makes
+        // the host use kUpscaleModeRatio, which is exactly right HERE and exactly wrong for NGX —
+        // which is the whole distinction this call exists to draw.
+        bool queryModeRects(uint32_t outW, uint32_t outH,
+                            uint32_t* inW, uint32_t* inH, uint32_t count) override
+        {
+            (void)outW; (void)outH; (void)inW; (void)inH; (void)count;
+            return false;
+        }
+
     private:
         bool ready() const
         {
@@ -331,6 +344,43 @@ namespace
         bool           mRectComplained = false;
     };
 }
+
+// The fixed list, spelled once. The dev panel's dropdown indexes straight into it, so a name added
+// here without a matching UpscaleMode enumerator (or the reverse) is a control that selects the
+// wrong mode — they are edited together or not at all.
+const char* const kUpscaleModeNames[kUpscaleModeCount] = {
+    "Off (no pass; the A/B arm)",
+    "DLAA (native res, temporal AA)",
+    "Quality",
+    "Balanced",
+    "Performance",
+    "Ultra Performance",
+};
+
+// ⚠ FALLBACK ONLY — see the declaration in upscale.h. These are DLSS's published OPTIMAL ratios,
+// which is NOT the same thing as what a mode will accept; a backend that can answer for itself must
+// be asked instead. Off and DLAA are both 1.0 because both rasterise at the output rect: the
+// difference between them is whether the PASS RUNS, not what it renders.
+const float kUpscaleModeRatio[kUpscaleModeCount] = {
+    1.0f,        // Off
+    1.0f,        // DLAA
+    0.6667f,     // Quality
+    0.5800f,     // Balanced
+    0.5000f,     // Performance
+    0.3333f,     // Ultra Performance
+};
+
+// ⚠ ORDER MATCHES UpscalePreset, and the dropdown indexes straight into it. The letters are kept in
+// the labels because that is what NVIDIA's own documentation, the DLSS overlay and every forum post
+// call them — a label that said only "best quality" would be unmatchable against anything written
+// down elsewhere.
+const char* const kUpscalePresetNames[kUpscalePresetCount] = {
+    "Default (DLSS picks: K / M / L)",
+    "K - transformer, best quality",
+    "J - transformer, less ghosting",
+    "L - transformer, Ultra Perf default",
+    "M - transformer, Perf default",
+};
 
 IUpscaler* createPassthroughUpscaler()
 {

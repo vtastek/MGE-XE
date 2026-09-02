@@ -21,11 +21,18 @@
 // same six calls, not a second set of hooks into the renderer. It is also what lets the passthrough
 // be TESTED — a backend that reads renderer globals can only be run inside a frame.
 //
-// ⚠ `evaluate()` RETURNS `inputs.pColor` UNCHANGED WHEN `in == out`, HAVING RECORDED NOTHING.
-// Identity is then bit-identical and free BY CONSTRUCTION rather than by measurement, which is the
-// only kind of identity worth having here. The consequence has to be said out loud because it is the
-// thing that makes a 4b test meaningless if it is forgotten: **scale 1.0 proves nothing about the
-// seam.** The real test is run at 0.5.
+// ⚠ THE PASSTHROUGH'S `evaluate()` RETURNS `inputs.pColor` UNCHANGED WHEN `in == out`, HAVING
+// RECORDED NOTHING. Identity is then bit-identical and free BY CONSTRUCTION rather than by
+// measurement, which is the only kind of identity worth having here. The consequence has to be said
+// out loud because it is the thing that makes a 4b test meaningless if it is forgotten: **scale 1.0
+// proves nothing about the seam.** The real test is run at 0.5.
+//
+// ⚠⚠ AND IT IS A PROPERTY OF A **SPATIAL FILTER**, NOT OF THIS SEAM — 4d corrected that. A
+// resample at 1:1 is its own input, so the passthrough may skip it; a TEMPORAL reconstruction at
+// 1:1 is DLAA, which is the whole point of running it. `createNgxUpscaler()` therefore has no
+// identity early-out at all, and inheriting one would have made the first thing 4d tried do nothing
+// while looking exactly like a working identity. If a third backend is ever written, the question
+// "is my in == out case a no-op" is one it has to answer for itself.
 //
 // ⚠ THE HOST DECIDES WHETHER THE FRAME WAS UPSCALED BY COMPARING POINTERS, not by re-deriving the
 // rects. `evaluate()` returns "what the frame should READ", so `returned != inputs.pColor` is the
@@ -69,6 +76,47 @@ struct Renderer;
 struct Cmd;
 struct Texture;
 
+// ─── THE RENDER PRESET (the "DLSS4 / DLSS5 model" selector) ─────────────────────────────────────
+// ⚠⚠ THIS EXISTS BECAUSE THE OBVIOUS ROUTE CANNOT WORK IN THIS ARCHITECTURE. ReShade, OptiScaler and
+// every other in-game DLSS settings overlay injects into the GAME process and hooks the NGX calls it
+// makes. Ours are not there: Morrowind.exe presents through DXVK (which is why those tools report
+// this as a "Vulkan" game), while DLSS runs in **mgeHost64.exe under D3D12**, a separate process
+// they never attach to. No amount of configuring them reaches it.
+//
+// So the preset is exposed HERE instead, through the SDK's own per-mode hint parameters
+// (`NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_*`), which is the supported way an application picks
+// its model and needs no third-party tool at all.
+//
+// ⚠ IT IS A **CREATE-TIME** HINT, so changing it rebuilds the feature — same as the flags. A preset
+// changed without a rebuild would leave DLSS reconstructing with one model while the panel claims
+// another.
+enum UpscalePreset : uint32_t
+{
+    // Let DLSS choose. Today that means K for DLAA/Quality/Balanced, M for Performance and L for
+    // Ultra Performance — all transformer-based — but NVIDIA can and does change the default over
+    // the air, which is exactly why "Default" is its own entry rather than a synonym for K.
+    kUpscalePresetDefault = 0,
+    kUpscalePresetK,          // transformer, best quality at a higher cost; the current default
+    kUpscalePresetJ,          // like K, slightly less ghosting, slightly more flicker
+    kUpscalePresetL,          // the Ultra-Performance default
+    kUpscalePresetM,          // the Performance default
+    kUpscalePresetCount
+};
+// ⚠⚠ E AND F (THE LEGACY CNN MODELS) ARE DELIBERATELY ABSENT, AND THAT IS A MEASURED DECISION, NOT
+// TIDINESS. They were in this list for one build as the transformer-vs-CNN A/B — the header only
+// marks them "Deprecated", which reads like "old but working". Tested against runtime 310.8.0 on
+// 2026-09-02: preset E **HANGS THE GPU** (`DXGI_ERROR_DEVICE_HUNG` inside
+// NGX_D3D12_EVALUATE_DLSS_EXT), because a deprecated preset's weights are simply not in a modern
+// runtime — the feature creates happily and the evaluate faults.
+//
+// A dropdown entry that takes the device down is worse than no entry: every other refusal in this
+// milestone degrades to the un-upscaled frame, and this one costs the session. The header's own
+// wording is the general rule — A/B/C/D are "removed, use J or K"; G/H/I/N/O "do not use, reverts to
+// default behavior" — so the five above are the whole usable set, and a future SDK adding one is an
+// entry here plus a test, in that order.
+
+extern const char* const kUpscalePresetNames[kUpscalePresetCount];
+
 // Everything a temporal upscaler can want, filled by the host every frame whether the current
 // backend reads it or not (see the note above on why the unread fields are here).
 struct UpscaleInputs
@@ -103,9 +151,38 @@ struct UpscaleInputs
     // the DELIVERED image, so handing DLSS an exposure derived from DLSS output closes a loop around
     // the upscaler ([[project_forge_exposure_rail_instrument]]).
     float exposure = 1.0f;
-    // History discontinuity — a camera cut, a cell change, a device reset. Declared, unread in 4b
-    // (the passthrough has no history to reset).
+    // History discontinuity — a camera cut, a cell change, a device reset. Declared and unread in
+    // 4b (the passthrough has no history to reset); READ BY THE NGX BACKEND since 4d.
     bool reset = false;
+    // ⚠ WHICH RECT THE MOTION VECTORS ARE AT, and it is a FIELD rather than a constant inside the
+    // backend because it is the one convention in this struct that could not be settled by reading.
+    // Ours are dispatched over the render rect and written at INPUT resolution, like every other
+    // screen target here — so `true` is the truth today, and it maps to DLSS's
+    // `MVLowRes` create flag. The SDK headers never say which sense is their default, and at DLAA
+    // (in == out) the flag cannot matter at all, so a wrong answer here is invisible in the very
+    // configuration 4d brings up first and then shows as a smear the moment Quality is selected.
+    // Carrying it on the wire makes it a one-token A/B (`upscaleMvLowRes=0`) instead of a rebuild.
+    bool mvAtInputRect = true;
+    // ⚠ THE TWO **OPTIONAL** INPUTS, EACH WITH ITS OWN SWITCH, and they are on the wire rather than
+    // inside the backend because they are the only two inputs a temporal backend can run WITHOUT.
+    // That makes them the bisection this milestone needs: colour, depth and motion vectors are
+    // required, so if a backend faults there is exactly one pair of things that can be turned off to
+    // localise it, and turning them off must not need a rebuild.
+    //
+    // `useSuppliedExposure = false` means "let the upscaler meter the frame itself" (DLSS's
+    // AutoExposure). ⚠ It is NOT the better setting in this renderer even though it is simpler: the
+    // exposure servo already meters the DELIVERED image against an authored setpoint (scenecal), and
+    // two adaptation loops on one image is one more than the picture can have. It is a diagnostic
+    // arm and a fallback, not a mode.
+    bool useSuppliedExposure = true;
+    // `useReactiveMask = false` drops the M1 step 3 mask. The mask's own gain-0 arm already exists
+    // (`mvReactiveGain=0`) but that produces an all-zero mask, which is a different thing from
+    // handing the upscaler NO mask at all — one is a texture full of zeros, the other is a null
+    // pointer, and they exercise different code inside the backend.
+    bool useReactiveMask = true;
+    // Which reconstruction model to ask for — see UpscalePreset. A backend with no such concept
+    // ignores it, the way the passthrough ignores `reset`.
+    uint32_t preset = kUpscalePresetDefault;
     // --- SPATIAL FILTER PARAMETERS (M1 4c follow-up) ---------------------------------------------
     // They arrive HERE, as parameters, rather than as globals in the backend, because that is this
     // header's whole contract: "it owns nothing the renderer owns — every input arrives as a
@@ -132,7 +209,41 @@ struct UpscaleInputs
     float antiRing = 1.0f;
 };
 
-// The seam. Six calls, and a backend is nothing but an implementation of them.
+// ─── THE QUALITY LADDER, AS A FIXED LIST ─────────────────────────────────────────────────────────
+// ⚠⚠ THIS REPLACED A FREE 0.33-1.0 SLIDER, AND THE REASON IS A MEASURED DEFECT RATHER THAN TASTE.
+// DLSS's modes are not points on a continuum: each one reports its own ACCEPTED [min,max] render
+// rect, those bands have HOLES between them, and one of them (UltraPerformance) is not a band at
+// all — it reports min == max == optimal, a single fixed rect. A free slider therefore has settings
+// no DLSS mode will accept. Measured in game 2026-09-02: eleven `OUTSIDE the range DLSS reports`
+// warnings in one session, including a rect that missed Performance's floor by ONE pixel because
+// the host rounds to even and DLSS's minimum height was odd.
+//
+// So the mode is the CONTROL and the rect is DERIVED from it, by asking the SDK — which is also the
+// order every game presents this in. `kUpscaleModeOff` is a first-class member of the list, not a
+// separate checkbox, because "off" is the same question as "which mode".
+enum UpscaleMode : uint32_t
+{
+    kUpscaleModeOff = 0,      // in == out, no pass recorded; the A/B arm
+    kUpscaleModeDLAA,         // in == out, and the pass STILL RUNS (temporal antialiasing)
+    kUpscaleModeQuality,
+    kUpscaleModeBalanced,
+    kUpscaleModePerformance,
+    kUpscaleModeUltraPerf,
+    kUpscaleModeCount
+};
+
+// The names the dev panel's dropdown shows, indexed by UpscaleMode. Defined in upscale.cpp so there
+// is one spelling of them.
+extern const char* const kUpscaleModeNames[kUpscaleModeCount];
+
+// The FALLBACK ratios, used only when the backend cannot report per-mode rects (the passthrough) or
+// before the SDK has been asked. ⚠ These are DLSS's published LINEAR ratios and they are the modes'
+// OPTIMAL points, NOT what a mode will accept — that distinction is the whole reason queryModeRects
+// exists ([[feedback_prior_art_constants_dont_transfer]]). Never use these when the backend can
+// answer for itself.
+extern const float kUpscaleModeRatio[kUpscaleModeCount];
+
+// The seam. Backends implement these; everything else is the host's.
 class IUpscaler
 {
 public:
@@ -175,11 +286,37 @@ public:
     // For the log lines and the `[rect]` heartbeat. A silently-absent upscaler is indistinguishable
     // from a working one at scale 1.0, which is exactly why the name is on the wire.
     virtual const char* name() const = 0;
+
+    // ─── PUBLISH THE INPUT RECT EACH MODE WANTS, FOR THIS OUTPUT RECT ────────────────────────────
+    // Fills `inW[mode]` / `inH[mode]` for every UpscaleMode. Returns false if the backend has no
+    // per-mode opinion, in which case the host falls back to kUpscaleModeRatio.
+    //
+    // ⚠⚠ CALLED ON THE **RENDER** THREAD, AND THAT IS THE WHOLE REASON IT IS A PUBLISH RATHER THAN A
+    // QUESTION THE HOST ASKS WHEN IT NEEDS THE ANSWER. The host authors the rect in setRenderSize,
+    // which runs on the CLIENT/IPC thread on every frame's restamp, and nvsdk_ngx.h opens with
+    // "Methods in this library are NOT thread safe" — so an NGX call from there would be a data race
+    // with evaluate(). The backend therefore publishes a table when the OUTPUT rect changes, and
+    // setRenderSize reads the published copy. A resolution change costs one frame of the previous
+    // table, which the client's per-frame restamp corrects immediately — the same lazy-arm shape the
+    // `rect PENDING` line already describes.
+    //
+    // ⚠ A mode the backend cannot serve must be reported as 0x0, NOT silently as the output rect —
+    // the host greys it out rather than rendering something the backend will refuse.
+    virtual bool queryModeRects(uint32_t outW, uint32_t outH,
+                                uint32_t* inW, uint32_t* inH, uint32_t count) = 0;
 };
 
 // The 4b backend: a Catmull-Rom resample with an anti-ringing clamp, and the permanent fallback for
 // every GPU that will never run NGX.
 IUpscaler* createPassthroughUpscaler();
+
+// The 4d backend: NVIDIA DLSS Super Resolution through NGX (upscale_ngx.cpp). Allocating it is
+// free of NGX — `init()` is where NGX is touched, and it returns false, having logged a NAMED
+// refusal, on a non-NVIDIA adapter, a driver too old, or a missing `nvngx_dlss.dll`. The host then
+// falls back to the passthrough, which is why that backend is permanent rather than scaffolding.
+//
+// ⚠ IT DOES NOT SHORT-CIRCUIT AT `in == out` — DLAA is that case. See the seam note above.
+IUpscaler* createNgxUpscaler();
 
 // Free the object itself. Separate from shutdown() because IMemory.h poisons `delete` in every TU
 // that includes it — the allocation and the free both have to live on the tf_ allocator, and keeping

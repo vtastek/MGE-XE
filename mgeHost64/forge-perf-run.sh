@@ -20,17 +20,29 @@
 # interior did not reproduce, because the harness had drifted onto an exterior save.) Passing a save
 # pins it via the mod's own overrideFile config; the previous config is restored on exit.
 set -u
+# WHICH INSTALL. Defaults to the dev deploy target; MGE_INSTALL names another directory under
+# C:\mgem (e.g. MGE_INSTALL=mwdlss). Added 2026-09-02 because a ~90ms/frame regression reproduced
+# ONLY in the mwdlss install — the one this harness could not point at — so the single environment
+# that showed the bug was the single one with no way to measure it.
+INSTALL="${MGE_INSTALL:-morrowind64}"
+DIR="/mnt/c/mgem/$INSTALL"
+WINDIR="C:\\mgem\\$INSTALL"
+if [ ! -d "$DIR" ]; then
+  echo "[harness] ERROR: no such install: $DIR" >&2
+  exit 1
+fi
+echo "[harness] install = $INSTALL"
 SAMPLES="${1:-5}"
 TIMEOUT="${2:-180}"
 SAVE="${3:-}"
 SCALE="${4:-}"
 KNOBS="${5:-}"
-LOG="/mnt/c/mgem/morrowind64/mgeHost64.log"
-CFG="/mnt/c/mgem/morrowind64/Data Files/MWSE/config/instant load.json"
+LOG="$DIR/mgeHost64.log"
+CFG="$DIR/Data Files/MWSE/config/instant load.json"
 CFGBAK="$(mktemp)"
 
 if [ -n "$SAVE" ]; then
-  if [ ! -f "/mnt/c/mgem/morrowind64/Saves/$SAVE" ]; then
+  if [ ! -f "$DIR/Saves/$SAVE" ]; then
     echo "[harness] ERROR: save not found: Saves/$SAVE" >&2
     exit 1
   fi
@@ -65,10 +77,10 @@ done
 # Archive whatever is in the logs before launching. The host TRUNCATES mgeHost64.log at startup, so
 # a harness run silently destroys the log of whatever came before it — including a play session the
 # user has just reported a bug from. Cost is a file copy; the alternative is unreproducible evidence.
-ARCHIVE="/mnt/c/mgem/morrowind64/logarchive"
+ARCHIVE="$DIR/logarchive"
 mkdir -p "$ARCHIVE"
 stamp=$(date +%Y%m%d-%H%M%S)
-for f in "$LOG" /mnt/c/mgem/morrowind64/mgeXE.log; do
+for f in "$LOG" "$DIR/mgeXE.log"; do
   [ -s "$f" ] && cp "$f" "$ARCHIVE/$(basename "$f" .log)-$stamp.log" 2>/dev/null
 done
 # Keep the 20 most recent of each; these run to tens of MB.
@@ -81,7 +93,7 @@ startlines=0
 # bottleneck" — only the client's render=[host=] / overlap= pair says how much of the host frame the
 # client actually waited for. mgecore does NOT truncate mgeXE.log, so this offset is what separates
 # this run from the session before it.
-CLOG="/mnt/c/mgem/morrowind64/mgeXE.log"
+CLOG="$DIR/mgeXE.log"
 cstartlines=0
 [ -f "$CLOG" ] && cstartlines=$(wc -l < "$CLOG")
 echo "[harness] start offset = $startlines lines; want $SAMPLES new 'gpu split' samples (timeout ${TIMEOUT}s)"
@@ -114,7 +126,7 @@ if [ -n "$KNOBS" ]; then
 else
   ENVSET="${ENVSET}Remove-Item Env:MGE_HOST_KNOBS -ErrorAction SilentlyContinue; "
 fi
-powershell.exe -Command "${ENVSET}Start-Process -FilePath 'Morrowind.exe' -WorkingDirectory 'C:\\mgem\\morrowind64' -WindowStyle Minimized" >/dev/null 2>&1
+powershell.exe -Command "${ENVSET}Start-Process -FilePath 'Morrowind.exe' -WorkingDirectory '$WINDIR' -WindowStyle Minimized" >/dev/null 2>&1
 echo "[harness] launched Morrowind; polling..."
 
 t0=$(date +%s)
