@@ -1992,6 +1992,11 @@ namespace {
         Shader*        pObjVelShader = nullptr;
         Pipeline*      pObjVelPipeline = nullptr;         // FRONT_FACE_CCW
         Pipeline*      pObjVelPipelineMirror = nullptr;   // FRONT_FACE_CW (negative-determinant world)
+        // ...and the same two at the MULTIMAP vertex stride (GeomVertexWireMM, 60 bytes). A glow
+        // map is what puts a part on that path, which is why a glowing weapon did not blur while
+        // the plain one beside it did. Same shader — only mBindings[0].mStride differs.
+        Pipeline*      pObjVelPipelineMM = nullptr;
+        Pipeline*      pObjVelPipelineMMMirror = nullptr;
         DescriptorSet* pObjVelSet = nullptr;
         Buffer*        pObjVelParamsCbv = nullptr;        // gObjVelParams
         Buffer*        pObjVelBatchCbv = nullptr;         // gObjVelBatch (worlds + prevWorlds)
@@ -11703,6 +11708,35 @@ namespace {
                         ovRasterMirror.mFrontFace = FRONT_FACE_CW;
                         og.pRasterizerState = &ovRasterMirror;
                         addPipeline(R, &ovp, &g_live.pObjVelPipelineMirror);
+
+                        // ─── THE MULTIMAP PAIR: THE SAME SHADER AT A DIFFERENT **STRIDE** ────────
+                        // ⚠⚠ MULTIMAP PARTS WERE SKIPPED BY THIS PASS FOR TWO BUILDS, and the
+                        // reported symptom named the cause exactly: *"NPC weapons... I think because
+                        // the weapon has glow maps. other weapons have blur."* A glow map puts a
+                        // part on the MULTIMAP path, `if (m.skinned || m.multimap) continue;` dropped
+                        // it, and it kept the camera-only vector — so on a still camera a glowing
+                        // weapon sat perfectly sharp while the plain weapon beside it blurred.
+                        //
+                        // ⚠ THE REASON IT WAS SKIPPED IS A STRIDE, NOT A MATERIAL. That `continue`
+                        // lumped `multimap` in beside `skinned` and the comment justified only the
+                        // skinned half ("skinned parts never appear in items[]") — which is true, and
+                        // says nothing whatever about multimap, which DOES appear in items[]. What
+                        // actually blocks it is that a multimap mesh is IPC::GeomVertexWireMM
+                        // (stride 60: four UV sets) while this layout declares GeomVertexWire, so
+                        // drawing one through the pipeline above would fetch positions at 36-byte
+                        // intervals out of a 60-byte-stride buffer and fling garbage geometry.
+                        //
+                        // And that is the ENTIRE difference. objvelocity.vert reads exactly one
+                        // per-vertex attribute — POSITION, at offset 0, which both layouts share —
+                        // and objvelocity.frag reads none at all: it writes velocity from the two
+                        // clip positions and never samples a texture, so dark/detail/glow stages are
+                        // irrelevant to it by construction. One more PSO per winding, same shader,
+                        // same depth state, same instance binding; only mBindings[0].mStride moves.
+                        ovl.mBindings[0].mStride = sizeof(IPC::GeomVertexWireMM);
+                        og.pRasterizerState = &ovRaster;
+                        addPipeline(R, &ovp, &g_live.pObjVelPipelineMM);
+                        og.pRasterizerState = &ovRasterMirror;
+                        addPipeline(R, &ovp, &g_live.pObjVelPipelineMMMirror);
                     }
 
                     // --- MB-1b: the SKINNED lane's own vertex stage ---------------------------
@@ -14990,6 +15024,11 @@ namespace {
     // parts ship in their own blob and are handled by MB-1b's own counters); skipCap = the batch
     // window filled.
     uint32_t g_objVelDrawn = 0, g_objVelSkipPair = 0, g_objVelSkipKind = 0, g_objVelSkipCap = 0;
+    // How many of `drawn` were MULTIMAP parts. Its own counter because it is the whole of the
+    // glow-mapped-weapon fix and "the pass drew more things" is not evidence that it drew THESE
+    // things — a rigid-mover count that rises could be a door. mm=0 with a glowing weapon in
+    // frame means the multimap PSOs did not build and the old skip is still firing.
+    uint32_t g_objVelDrawnMM = 0;
     // ⚠ `examined` and `static` EXIST BECAUSE THE FIRST RUN COULD NOT BE READ. It reported
     // drawn=0 skip(pair=0 skinned=0 cap=0) — every counter zero, which is equally consistent with
     // "the scene holds no movers" and "the loop never executed", and those need completely
@@ -25378,6 +25417,51 @@ void destroyHostWindow(Renderer* R);
         // invalidateShadowsOnEmissiveKnobChange). Before the caster refresh so a skip-threshold move
         // and the emissiveHot flips it causes land in the same frame's dirty set.
         invalidateShadowsOnEmissiveKnobChange();
+        // ─── MB-1c: PREVIOUS-POSE BOOKKEEPING FOR THE **MULTIMAP** LANE ─────────────────────────
+        // ⚠⚠ MULTIMAP PARTS ARE A THIRD POPULATION, NOT A VARIANT OF THE FIRST. They arrive in
+        // their OWN wire array (`mmItems` / IPC::MultiMapDrawWire) exactly as skinned parts arrive
+        // in their own blob — they are NOT in items[] — so refreshCasterRecord below never sees
+        // them and `prevWorld` / `lastWorldFrame` were never maintained for their slots. The object
+        // velocity pass therefore could not draw them however its filters were written.
+        //
+        // ⚠ WHICH IS WHY A GLOW-MAPPED WEAPON DID NOT BLUR. Reported from play as *"NPC weapons... I
+        // think because the weapon has glow maps. other weapons have blur."* A glow map is exactly
+        // what routes a part down the multimap path, so an enchanted weapon kept the camera-only
+        // vector and sat sharp while the plain weapon in the other hand streaked correctly.
+        //
+        // ⚠ AND THE FIRST FIX FOR IT WAS INERT. The rigid walk carries `if (m.skinned || m.multimap)
+        // continue;`, which reads like the gate that dropped them; admitting multimap there and
+        // giving it a matching-stride PSO changed nothing, because no items[] entry ever references
+        // a multimap mesh — that clause is defensive, and its counter reads 0 in every scene. The
+        // gate was never a filter, it was an ABSENCE. Cost one build to learn: **when a filter is
+        // suspected, confirm the population reaches the filter at all.**
+        //
+        // Three lines, and they are refreshCasterRecord's three verbatim — same carry-before-
+        // overwrite, same DIFFERENT-frame guard (a slot refreshed twice in one frame must not
+        // shadow itself and zero its own velocity), same absolute fold (+eyeAbsShadow) that the
+        // objvel walk undoes at the point of use. MM slots are disjoint from rigid ones (the colour
+        // loop requires g_meshes[slot].multimap, this one does too), so reusing HostMesh's fields
+        // cannot collide.
+        if (multiMapBlob && multiMapCount && multiMapBytes) {
+            const uint32_t haveMM = multiMapBytes / (uint32_t)sizeof(IPC::MultiMapDrawWire);
+            const uint32_t nMM    = (multiMapCount < haveMM) ? multiMapCount : haveMM;
+            const IPC::MultiMapDrawWire* mmPose = (const IPC::MultiMapDrawWire*)multiMapBlob;
+            for (uint32_t k = 0; k < nMM; ++k) {
+                const IPC::MultiMapDrawWire& mi = mmPose[k];
+                const uint32_t ms = mi.slot;
+                if (ms >= g_meshHigh || !g_meshes[ms].valid || !g_meshes[ms].multimap) { continue; }
+                HostMesh& mhm = g_meshes[ms];
+                if (mhm.lastWorldFrame != 0 && mhm.lastWorldFrame != g_renderFrame) {
+                    std::memcpy(mhm.prevWorld, mhm.lastWorld, 64);
+                    mhm.prevWorldFrame = mhm.lastWorldFrame;
+                }
+                std::memcpy(mhm.lastWorld, mi.world, 64);
+                mhm.lastWorld[12] = mi.world[12] + g_eyeAbsShadow[0];
+                mhm.lastWorld[13] = mi.world[13] + g_eyeAbsShadow[1];
+                mhm.lastWorld[14] = mi.world[14] + g_eyeAbsShadow[2];
+                mhm.lastWorldFrame = g_renderFrame;
+            }
+        }
         for (uint32_t i = 0; i < count; ++i) {
             // Stencil-portal HELPERS never cast. The mask is an invisible quad over the opening and
             // the hull is a volume that exists only to erase depth — neither is a real surface, and
@@ -31227,10 +31311,11 @@ void destroyHostWindow(Renderer* R);
                 // race that looks exactly like a jittery previous transform.
                 if (g_live.objVelReady && g_objVelEnable) {
                     gpuPhaseBegin(kGpuPhaseObjVel);
-                    struct ObjVelRec { Buffer* vb; Buffer* ib; uint32_t indexCount, firstVertex, firstIndex, idx; int mirror; };
+                    struct ObjVelRec { Buffer* vb; Buffer* ib; uint32_t indexCount, firstVertex, firstIndex, idx; int mirror; int mm; };
                     static std::vector<ObjVelRec> s_objVel;   // single-threaded record (renderScene)
                     s_objVel.clear();
                     uint32_t ovSkipCap = 0, ovSkipPair = 0, ovSkipKind = 0, ovSkipStatic = 0, ovStill = 0;
+                    uint32_t ovDrawnMM = 0, ovExaminedMM = 0;
 
                     float* obatch = (float*)g_live.pObjVelBatchCbv->pCpuMappedAddress;
                     for (uint32_t i = 0; i < count && s_objVel.size() < kObjVelBatch; ++i) {
@@ -31252,6 +31337,17 @@ void destroyHostWindow(Renderer* R);
                         // reads ~0 and its being zero says nothing about actors. MB-1b's second
                         // walk over that blob is below, with its own cursor, its own bone windows
                         // and its own vertex shader.
+                        // ⚠ NEITHER OF THESE POPULATIONS IS ACTUALLY IN items[], AND THIS CLAUSE IS
+                        // DEFENSIVE RATHER THAN SELECTIVE — its counter reads 0 in every scene
+                        // measured. Skinned parts arrive in their own blob and multimap parts in
+                        // `mmItems`; each therefore needs its own WALK, not a relaxed filter here.
+                        // MB-1b added the skinned walk below; MB-1c adds the multimap one after it.
+                        //
+                        // ⚠⚠ THIS LINE LOOKED LIKE THE BUG AND WAS NOT. Admitting `multimap` here
+                        // (with a matching-stride PSO, which the pass now carries anyway) changed
+                        // nothing at all, because no items[] entry ever references a multimap mesh.
+                        // A filter can only be the cause if the population reaches it — check that
+                        // FIRST, or a whole build goes into relaxing a gate that was never shut.
                         if (m.skinned || m.multimap) { ++ovSkipKind; continue; }
                         // ⚠ THE MOVER FILTER, AND IT IS A FILTER ON COST, NOT ON CORRECTNESS. A
                         // static's velocity from this pass and from the reprojection agree, so
@@ -31362,12 +31458,101 @@ void destroyHostWindow(Renderer* R);
                             ++ovStill;
                         }
 
+                        // ⚠ THE ARENA DIVIDE IS SAFE FOR MULTIMAP WITHOUT A SECOND CASE, and that
+                        // is worth stating rather than leaving to look like an oversight: a multimap
+                        // mesh is NEVER in the arena (the upload takes the per-mesh branch on
+                        // `!isSkinned && !isMultiMap`, because a wide stride cannot share a pool
+                        // sized in GeomVertexWire), so `inArena` is false for every one of them and
+                        // the GeomVertexWire divisor above is unreachable in that case. They draw
+                        // from their own vb/ib at offset 0, exactly as the colour pass draws them.
                         const uint32_t firstVertex = m.inArena ? (uint32_t)(m.vbOff / sizeof(IPC::GeomVertexWire)) : 0u;
                         const uint32_t firstIndex  = m.inArena ? (uint32_t)(m.ibOff / sizeof(uint16_t)) : 0u;
                         s_objVel.push_back({ meshVb, meshIb, m.indexCount, firstVertex, firstIndex, idx,
-                                             worldMirrored(it.world) ? 1 : 0 });
+                                             worldMirrored(it.world) ? 1 : 0, /*mm=*/0 });
                     }
                     if (s_objVel.size() >= kObjVelBatch) { ovSkipCap = 1; }
+
+                    // ═══ MB-1c: THE MULTIMAP LANE ═══════════════════════════════════════════════
+                    // A THIRD RECORD LOOP over `mmItems`, and it is the same kind of thing MB-1b is:
+                    // multimap parts never enter items[] either — a glow/dark/detail part arrives in
+                    // its own wire array (IPC::MultiMapDrawWire) — so no filter in the loop above
+                    // could ever have reached them.
+                    //
+                    // ⚠⚠ THIS IS THE GLOW-MAPPED-WEAPON FIX. *"NPC weapons... I think because the
+                    // weapon has glow maps. other weapons have blur."* A glow map routes a part down
+                    // the multimap path; that path had no object-velocity producer, so an enchanted
+                    // weapon kept the camera-only vector and stayed sharp while the plain weapon in
+                    // the other hand blurred correctly. The observation named the cause exactly.
+                    //
+                    // ⚠ UNLIKE MB-1b, THIS NEEDS NO NEW VERTEX SHADER. A multimap part is RIGID —
+                    // its position is a world matrix, not a bone blend — so objvelocity.vert is
+                    // already the right program and it reads exactly one per-vertex attribute,
+                    // POSITION at offset 0, which GeomVertexWireMM shares with GeomVertexWire. The
+                    // only thing that differs is the vertex STRIDE (60 vs 36), which is a PSO
+                    // property: hence the MM pipeline pair and nothing else. Same batch cbuffer,
+                    // same instance buffer, same descriptor set, same depth state.
+                    //
+                    // The pairing key, the absolute rebase and the still-snap are the rigid lane's,
+                    // for the rigid lane's reasons — see the long notes above; every one of them
+                    // applies here unchanged because the pose bookkeeping (added beside
+                    // refreshCasterRecord) writes the identical fields in the identical way.
+                    if (multiMapBlob && multiMapCount && multiMapBytes
+                        && g_live.pObjVelPipelineMM && g_live.pObjVelPipelineMMMirror) {
+                        const uint32_t haveMM = multiMapBytes / (uint32_t)sizeof(IPC::MultiMapDrawWire);
+                        const uint32_t nMM    = (multiMapCount < haveMM) ? multiMapCount : haveMM;
+                        const IPC::MultiMapDrawWire* mmIt = (const IPC::MultiMapDrawWire*)multiMapBlob;
+                        for (uint32_t k = 0; k < nMM && s_objVel.size() < kObjVelBatch; ++k) {
+                            const IPC::MultiMapDrawWire& it = mmIt[k];
+                            ++ovExaminedMM;
+                            const uint32_t slot = it.slot;
+                            if (slot >= g_meshHigh || !g_meshes[slot].valid
+                                || !g_meshes[slot].multimap) { continue; }
+                            HostMesh& m = g_meshes[slot];
+                            if (!m.everMoved && !m.isLive && !g_objVelAllItems) { ++ovSkipStatic; continue; }
+                            if (m.prevWorldFrame == 0 || m.lastWorldFrame != g_renderFrame
+                                || m.prevWorldFrame + 1u != m.lastWorldFrame) {
+                                ++ovSkipPair; continue;
+                            }
+                            // Never in the arena (the upload's `!isSkinned && !isMultiMap` branch),
+                            // so it is always its own vb/ib drawn from offset 0.
+                            if (!m.vb || !m.ib) { continue; }
+
+                            const uint32_t idx = (uint32_t)s_objVel.size();
+                            std::memcpy(obatch + (size_t)idx * 16, it.world, 64);
+                            float* pw = obatch + (size_t)(kObjVelBatch + idx) * 16;
+                            std::memcpy(pw, m.prevWorld, 64);
+                            pw[12] = m.prevWorld[12] - g_eyeAbsShadow[0];
+                            pw[13] = m.prevWorld[13] - g_eyeAbsShadow[1];
+                            pw[14] = m.prevWorld[14] - g_eyeAbsShadow[2];
+
+                            // The still-snap, for the rigid lane's reason exactly: the absolute round
+                            // trip is lossy, so a stationary part's rebased pose differs from the pose
+                            // it is drawn with in the low bits, and MB-2 integrates ALONG that
+                            // difference. Same bytes => bit-identical clip positions => exact zero.
+                            bool unmoved = true;
+                            for (int e = 0; e < 12; ++e) {
+                                if (pw[e] != it.world[e]) { unmoved = false; break; }
+                            }
+                            if (unmoved) {
+                                const float eyeMag = std::max(std::max(std::fabs(g_eyeAbsShadow[0]),
+                                                                       std::fabs(g_eyeAbsShadow[1])),
+                                                              std::fabs(g_eyeAbsShadow[2]));
+                                const float eps = std::max(eyeMag, 1.0f) * 4.0f * 1.1920929e-7f;
+                                for (int e = 12; e < 15; ++e) {
+                                    if (std::fabs(pw[e] - it.world[e]) > eps) { unmoved = false; break; }
+                                }
+                            }
+                            if (unmoved) {
+                                std::memcpy(pw, it.world, 64);
+                                ++ovStill;
+                            }
+
+                            s_objVel.push_back({ m.vb, m.ib, m.indexCount, 0u, 0u, idx,
+                                                 worldMirrored(it.world) ? 1 : 0, /*mm=*/1 });
+                            ++ovDrawnMM;
+                        }
+                        if (s_objVel.size() >= kObjVelBatch) { ovSkipCap = 1; }
+                    }
 
                     // ═══ MB-1b: THE SKINNED LANE ════════════════════════════════════════════════
                     // A SECOND RECORD LOOP, not a relaxed filter on the first, and the reason is
@@ -31674,18 +31859,30 @@ void destroyHostWindow(Renderer* R);
                         if (!s_objVel.empty()) {
                             cmdBindPipeline(g_live.pCmd, g_live.pObjVelPipeline);
                             cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pObjVelSet);
-                            const uint32_t ovStrides[2] = { (uint32_t)sizeof(IPC::GeomVertexWire),
-                                                            (uint32_t)sizeof(uint32_t) };
-                            int oMirror = 0;
+                            const uint32_t ovStridePlain[2] = { (uint32_t)sizeof(IPC::GeomVertexWire),
+                                                                (uint32_t)sizeof(uint32_t) };
+                            const uint32_t ovStrideMM[2]    = { (uint32_t)sizeof(IPC::GeomVertexWireMM),
+                                                                (uint32_t)sizeof(uint32_t) };
+                            // ⚠ TWO STATE AXES NOW, AND **BOTH** MUST TRIGGER A REBIND. The winding
+                            // was the only one until multimap parts were admitted; missing the second
+                            // would bind a 60-byte-stride mesh through the 36-byte layout and fling
+                            // its triangles across the screen. `oMM` starts at 0 to match the
+                            // unconditional non-MM bind immediately above, so the first MM record
+                            // rebinds correctly rather than relying on the list's order.
+                            int oMirror = 0, oMM = 0;
                             for (const ObjVelRec& r : s_objVel) {
-                                if (r.mirror != oMirror) {
-                                    cmdBindPipeline(g_live.pCmd, r.mirror ? g_live.pObjVelPipelineMirror
-                                                                          : g_live.pObjVelPipeline);
+                                if (r.mirror != oMirror || r.mm != oMM) {
+                                    Pipeline* ovpipe = r.mm
+                                        ? (r.mirror ? g_live.pObjVelPipelineMMMirror : g_live.pObjVelPipelineMM)
+                                        : (r.mirror ? g_live.pObjVelPipelineMirror   : g_live.pObjVelPipeline);
+                                    cmdBindPipeline(g_live.pCmd, ovpipe);
                                     cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pObjVelSet);
                                     oMirror = r.mirror;
+                                    oMM     = r.mm;
                                 }
                                 Buffer* ovbs[2] = { r.vb, g_live.pObjVelInstanceBuf };
-                                cmdBindVertexBuffer(g_live.pCmd, 2, ovbs, ovStrides, nullptr);
+                                cmdBindVertexBuffer(g_live.pCmd, 2, ovbs,
+                                                    r.mm ? ovStrideMM : ovStridePlain, nullptr);
                                 cmdBindIndexBuffer(g_live.pCmd, r.ib, INDEX_TYPE_UINT16, 0);
                                 cmdDrawIndexedInstanced(g_live.pCmd, r.indexCount, r.firstIndex, 1,
                                                         r.firstVertex, r.idx);
@@ -31741,9 +31938,13 @@ void destroyHostWindow(Renderer* R);
                     g_objVelDrawn      = (uint32_t)s_objVel.size();
                     g_objVelSkipPair   = ovSkipPair;
                     g_objVelSkipKind   = ovSkipKind;
+                    g_objVelDrawnMM    = ovDrawnMM;
                     g_objVelSkipCap    = ovSkipCap;
                     g_objVelSkipStatic = ovSkipStatic;
-                    g_objVelExamined   = count;
+                    // items[] plus the multimap array — `examined` names every population this
+                    // pass WALKS, so a lane that walks and finds nothing is distinguishable from
+                    // a lane that is not walked at all. (The skinned lane keeps its own line.)
+                    g_objVelExamined   = count + ovExaminedMM;
                     g_objVelStill      = ovStill;
                     // ⚠ THE SIZE OF THE MB-1b GAP, AS A NUMBER. Skinned parts never enter items[],
                     // so `kind` above reads 0 no matter how much of the frame is skinned — it cannot
@@ -31763,6 +31964,7 @@ void destroyHostWindow(Renderer* R);
                     gpuPhaseEnd(kGpuPhaseObjVel);
                 } else {
                     g_objVelDrawn = g_objVelSkipPair = g_objVelSkipKind = g_objVelSkipCap = 0;
+                    g_objVelDrawnMM = 0;
                     g_objVelSkipStatic = g_objVelExamined = 0;
                     g_objVelSkinDrawn = g_objVelSkinSkipPair = g_objVelSkinSkipBones = 0;
                     g_objVelSkinSkipCap = g_objVelSkinSkipBlend = g_objVelSkinSkipKind = 0;
@@ -34788,12 +34990,18 @@ void destroyHostWindow(Renderer* R);
                 // ordering bug looks like from here. `skipKind` is skinned/multimap parts seen in
                 // items[] and reads ~0 by construction — skinned parts arrive in their own blob, so
                 // it never said anything about actors; the skinned line below is where they live.
-                LOG::logline(">> [forge-hb] objvel: on=%d ready=%d examined=%u drawn=%u/%u"
+                // ⚠ `mm=` IS THE GLOW-MAPPED-WEAPON FIX, AS A NUMBER. Multimap parts were skipped
+                // by this lane for two builds — the symptom was an enchanted weapon staying sharp
+                // while the plain one in the other hand blurred — and "drawn went up" is not
+                // evidence they are the parts now being drawn, because a door would raise it too.
+                // mm=0 with something glowing in frame means the MM pipelines did not build and the
+                // old skip is still firing; `kind=` should fall by roughly the amount mm= rises.
+                LOG::logline(">> [forge-hb] objvel: on=%d ready=%d examined=%u drawn=%u/%u (mm=%u)"
                              " still=%u skinnedInFrame=%u skip(static=%u pair=%u kind=%u cap=%u)"
                              " gpu=%.3f ms",
                              g_objVelEnable ? 1 : 0, g_live.objVelReady ? 1 : 0,
-                             g_objVelExamined, g_objVelDrawn, kObjVelBatch, g_objVelStill,
-                             g_objVelSkinnedInFrame,
+                             g_objVelExamined, g_objVelDrawn, kObjVelBatch, g_objVelDrawnMM,
+                             g_objVelStill, g_objVelSkinnedInFrame,
                              g_objVelSkipStatic, g_objVelSkipPair, g_objVelSkipKind,
                              g_objVelSkipCap, g_lastGpuPhaseMs[kGpuPhaseObjVel]);
                 // MB-1b, THE SKINNED LANE — and `drawn/inFrame` IS the deliverable, as a number:
@@ -46772,6 +46980,8 @@ void destroyHostWindow(Renderer* R);
         if (g_live.pObjVelSkinInstanceBuf){ removeResource(g_live.pObjVelSkinInstanceBuf);   g_live.pObjVelSkinInstanceBuf = nullptr; }
         g_live.objVelSkinReady = false;
         if (g_live.pObjVelPipelineMirror) { removePipeline(R, g_live.pObjVelPipelineMirror); g_live.pObjVelPipelineMirror = nullptr; }
+        if (g_live.pObjVelPipelineMM)     { removePipeline(R, g_live.pObjVelPipelineMM);       g_live.pObjVelPipelineMM = nullptr; }
+        if (g_live.pObjVelPipelineMMMirror) { removePipeline(R, g_live.pObjVelPipelineMMMirror); g_live.pObjVelPipelineMMMirror = nullptr; }
         if (g_live.pObjVelPipeline)       { removePipeline(R, g_live.pObjVelPipeline);      g_live.pObjVelPipeline = nullptr; }
         if (g_live.pObjVelShader)         { removeShader(R, g_live.pObjVelShader);          g_live.pObjVelShader = nullptr; }
         if (g_live.pObjVelParamsCbv)      { removeResource(g_live.pObjVelParamsCbv);        g_live.pObjVelParamsCbv = nullptr; }
