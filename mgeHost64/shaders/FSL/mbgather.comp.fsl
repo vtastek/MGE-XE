@@ -1,0 +1,202 @@
+// mgeHost64 — MB-2 pass 3: THE GATHER.  Read motionblur.srt.h first; it carries the whole argument.
+//
+// A 1D line integral along this pixel's velocity: the shutter was open for `shutter/360` of a frame,
+// the pixel moved `v` in a frame, so what landed on it is the average of the scene along a segment
+// of length `|v| * shutter/360` centred on where it is now.
+//
+// ⚠⚠ ONE PASS ALONG ONE DIRECTION, AND IT MUST STAY THAT WAY. Separating this into X-then-Y — the
+// obvious next optimisation, and the one the dilation legitimately takes — turns a diagonal streak
+// into an axis-aligned box. `max` is separable; a line integral is not a convolution and has no
+// separable form. STRAFE to test it: a screenshot taken walking forward has every streak radial from
+// screen centre and cannot tell the two apart.
+//
+// ⚠ EVERY FETCH IS AN INTEGER LOAD, NOT A SAMPLE. Two reasons, and the second is the load-bearing
+// one: (1) the adaptive tap count puts the taps at most ~1.25 px apart, so a bilinear filter would
+// add almost nothing; (2) every screen target here is ALLOC-sized with the frame in a sub-rect, so a
+// hardware CLAMP address mode clamps to never-written border rather than to the frame
+// ([[project_forge_alloc_vs_render_uv]]). Loads clamp in PIXEL space, against the rect the host put
+// in the cbuffer, which is the only bound that is actually right.
+//
+// ⚠ THE COLOUR IS PREMULTIPLIED (rgb already scaled by coverage) and this is a FILTER, so every
+// weight hits all four channels identically. Not a radiometric scale; see motionblur.srt.h.
+//
+// ⚠⚠ SINGLE EXIT, AND IT IS STRUCTURAL. Every early case here — out of rect, below the velocity
+// floor, a sub-pixel streak — wants to be a RETURN() and is instead a branch that leaves `outv` as
+// the centre pixel, because the statistics at the tail tree-reduce in groupshared and EVERY thread
+// must reach EVERY GroupMemoryBarrier. A divergent return before a barrier is undefined behaviour of
+// the kind that works on the hardware it was written on (cullscan / apl / atmos_sh all carry this
+// note). The out-of-rect threads still compute; they simply do not WRITE and contribute 0.
+
+#include "motionblur.srt.h"
+#include "mbcommon.h.fsl"
+
+#ifndef AtomicMax
+#define AtomicMax(DEST, VALUE, ORIGINAL_VALUE) InterlockedMax(DEST, VALUE, ORIGINAL_VALUE)
+#endif
+
+GroupShared(uint, g_mbHit[64]);    // pixels blurred
+GroupShared(uint, g_mbTaps[64]);   // their tap counts, summed
+GroupShared(uint, g_mbLen[64]);    // their streak lengths, asuint, max-reduced
+
+ROOT_SIGNATURE(ComputeRootSignature)
+NUM_THREADS(8, 8, 1)
+void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
+{
+    INIT_MAIN;
+
+    int2   p         = int2(DispatchThreadID.xy);
+    float2 delivered = gMbParams.rects.xy;
+    float2 mvRect    = gMbParams.rects.zw;
+    int2   deliverN  = int2(delivered);
+
+    // The dispatch covers the delivered rect rounded up to an 8x8 group, so the tail threads are
+    // in-bounds for the resource and OUTSIDE the frame. They must not WRITE — the resolve reads this
+    // target clamped to the same rect, and a texel written outside it is one nobody will ever read —
+    // but they must still run, for the barrier reason above. Their loads are clamped into the rect,
+    // so they read valid data and simply throw it away.
+    bool inRect = (p.x < deliverN.x) && (p.y < deliverN.y);
+    int2 pc     = clamp(p, int2(0, 0), max(deliverN - int2(1, 1), int2(0, 0)));
+
+    float4 centre = LoadTex2D(gMbColor, NO_SAMPLER, pc, 0);
+    float4 outv   = centre;
+
+    int   K        = int(gMbParams.tile.x);
+    int2  tiles    = int2(gMbParams.tile.yz);
+    float outScale = gMbParams.tile.w;
+    float shutter  = gMbParams.blur.x;
+    uint  maxTaps  = uint(gMbParams.blur.y);
+    float floorPx  = gMbParams.blur.z;
+    float softZ    = gMbParams.blur.w;
+
+    // This pixel's own velocity, and the fastest thing within one tile of it.
+    int2   vq    = mbVelocityTexel(float2(pc), delivered, mvRect);
+    float2 vSelf = LoadTex2D(gMbVelocity, NO_SAMPLER, vq, 0).xy * outScale;
+    int2   tq    = clamp(pc / max(K, 1), int2(0, 0), max(tiles - int2(1, 1), int2(0, 0)));
+    float2 vTile = LoadRWTex2D(gMbTileIn, tq);
+
+    // ⚠ WHICHEVER IS LARGER, and that choice is what lets a blur cross a silhouette: a static pixel
+    // beside a fast mover takes the mover's velocity, so the streak reaches it instead of stopping
+    // at the mover's edge. It is also exactly where the missing velocity-agreement weights would
+    // act — see motionblur.srt.h for what their absence costs and what MB-3 adds.
+    float2 v     = (dot(vTile, vTile) > dot(vSelf, vSelf)) ? vTile : vSelf;
+    float  speed = length(v);
+
+    // The displacement during the exposure. `v` is per FRAME, so this is framerate-independent by
+    // construction — which is the whole of the fix for the DX9 filter's raw `blur_scale = 0.1`.
+    float2 d   = v * shutter;
+    float  len = length(d);
+
+    // ⚠ CLAMPED TO K, AND K IS THE TILE SIZE. NeighborMax searched exactly one tile in each
+    // direction, so no pixel has been told about motion further away than K; a longer streak would
+    // run into pixels whose tile never heard of it and end in a hard edge. The streak spans +-len/2,
+    // so this leaves a factor of two in hand.
+    if (len > float(K))
+    {
+        d   = d * (float(K) / max(len, 1.0e-6f));
+        len = float(K);
+    }
+
+    // ── THE VELOCITY FLOOR, AND IT IS AN EXACT PASS-THROUGH ──────────────────────────────────────
+    // ⚠⚠ MANDATORY. Only a BIT-IDENTICAL camera frame reaches exact zero, and MW's camera matrix is
+    // bit-stable on a MINORITY of parked frames (measured worst deltas 4.3e-4, 2.9e-11, 1.5e-3
+    // across three consecutive still frames — on most of them the camera really did move a hair and
+    // the small vector is the CORRECT answer, which is precisely why it cannot be fixed upstream).
+    // Without this every still frame gets a sub-pixel smear, and a still image that softens is the
+    // most visible failure available to this pass.
+    //
+    // The test is on the FIELD's magnitude, not on the shutter-scaled streak, so the threshold means
+    // the same thing at every shutter angle: "the vectors here say nothing moved". Below it `outv`
+    // stays the source pixel VERBATIM — a copy, not a one-tap filter — so a still frame is
+    // bit-identical to the un-blurred one and `mbEnable` can be A/B'd against a screenshot.
+    bool blurred = (speed >= floorPx) && (len >= 1.0e-4f);
+
+    // ── THE ADAPTIVE TAP COUNT, WHICH THE DX9 FILTER COMPUTED AND THEN NEVER USED ────────────────
+    // One tap per pixel of streak, floored at 3 (below that the box is not a box) and capped by the
+    // knob. A 4 px streak costs 4 taps; only genuinely fast motion pays the maximum. The original
+    // derived exactly this number and then ran its loop to MAX_SAMPLES, so it was a fixed 9-tap that
+    // oversampled every slow pixel and undersampled every fast one.
+    uint taps = clamp(uint(ceil(len)), 3u, max(maxTaps, 3u));
+
+    if (blurred)
+    {
+        // A per-pixel offset inside the tap spacing. Turns the banding of a low tap count into grain.
+        float  jitter  = mbDither(float2(pc)) - 0.5f;
+        float  dCentre = LoadTex2D(gMbDepth, NO_SAMPLER, vq, 0).r;
+        float4 sum     = f4(0.0f);
+        float  wsum    = 0.0f;
+
+        // ── THE SHUTTER INTEGRAL: A BOX, NOT A TENT ──────────────────────────────────────────────
+        // The shutter is open or it is not; every instant during the exposure contributed equally, so
+        // the physically correct kernel along the streak is uniform. A cone/tent weight here would be
+        // a LOOK choice masquerading as a filter, and it would also hide the thing MB-3 needs to be
+        // able to see: without agreement weights, an over-blurred static pixel is supposed to look
+        // wrong.
+        //
+        // The only modulation is the depth weight, which answers a different question — whether the
+        // sample is somewhere the centre's motion could plausibly have swept over.
+        LOOP for (uint i = 0u; i < taps; ++i)
+        {
+            // t in (-0.5, 0.5): the fraction of the exposure this tap represents.
+            float  t   = (float(i) + 0.5f + jitter) / float(taps) - 0.5f;
+            float2 sp  = float2(pc) + d * t;
+            int2   spi = clamp(int2(sp + f2(0.5f)), int2(0, 0), max(deliverN - int2(1, 1), int2(0, 0)));
+
+            // The depth field is at the INPUT rect — the same mapping the velocity fetch uses, so the
+            // two can never describe different pixels.
+            int2  dq = mbVelocityTexel(float2(spi), delivered, mvRect);
+            float ds = LoadTex2D(gMbDepth, NO_SAMPLER, dq, 0).r;
+
+            float w = mbDepthWeight(dCentre, ds, softZ);
+            sum  += LoadTex2D(gMbColor, NO_SAMPLER, spi, 0) * w;
+            wsum += w;
+        }
+
+        // ⚠ THE FALLBACK IS THE CENTRE PIXEL, BY BRANCH. Every tap can legitimately be rejected — a
+        // pixel at the very edge of a fast foreground object, where the whole streak lands on
+        // geometry in front of it — and `sum / 0` is inf or NaN, which would survive every later
+        // multiply including one by zero coverage ([[project_nan_survives_zero_multiply]]). This
+        // tree's house rule for a zero-weight case is a branch, not an epsilon in a denominator.
+        outv = (wsum > 1.0e-5f) ? (sum / wsum) : centre;
+    }
+
+    if (inRect)
+    {
+        Write2D(gMbOut, p, outv);
+    }
+
+    // ── THE STATISTICS ───────────────────────────────────────────────────────────────────────────
+    // Reduced in groupshared and committed with ONE atomic set per group — an instrument that costs
+    // enough to move the millisecond beside it is not an instrument. See motionblur.srt.h.
+    uint tid   = (DispatchThreadID.y & 7u) * 8u + (DispatchThreadID.x & 7u);
+    bool count = inRect && blurred;
+    g_mbHit[tid]  = count ? 1u : 0u;
+    g_mbTaps[tid] = count ? taps : 0u;
+    g_mbLen[tid]  = count ? asuint(len) : 0u;
+    GroupMemoryBarrier();
+
+    // Tree reduce, atmos_sh's shape: read into a register, barrier, guarded write, barrier. The
+    // guard wraps only the WRITE so every thread still reaches every barrier.
+    for (uint s = 32u; s > 0u; s >>= 1u)
+    {
+        uint h = (tid < s) ? g_mbHit[tid + s]  : 0u;
+        uint k = (tid < s) ? g_mbTaps[tid + s] : 0u;
+        uint l = (tid < s) ? g_mbLen[tid + s]  : 0u;
+        GroupMemoryBarrier();
+        if (tid < s)
+        {
+            g_mbHit[tid]  = g_mbHit[tid] + h;
+            g_mbTaps[tid] = g_mbTaps[tid] + k;
+            g_mbLen[tid]  = max(g_mbLen[tid], l);
+        }
+        GroupMemoryBarrier();
+    }
+
+    if (tid == 0u && g_mbHit[0] > 0u)
+    {
+        uint prev;
+        AtomicAdd(gMbStats[0], g_mbHit[0],  prev);
+        AtomicAdd(gMbStats[1], g_mbTaps[0], prev);
+        AtomicMax(gMbStats[2], g_mbLen[0],  prev);
+    }
+    RETURN();
+}

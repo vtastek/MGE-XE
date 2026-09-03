@@ -198,6 +198,10 @@
 // separate pass because the producing shader's own gMvStats stop describing the frame the moment a
 // SECOND writer lands on the same texture — see the header.
 #include "shaders/FSL/mvfieldstats.srt.h"
+// MB-2, THE FILTER: MotionBlurSrtData, Persistent, FOUR instances (tile max, neighbour max, and the
+// gather off each of the two possible colour sources). One SRT for all three compute passes — DXC
+// strips whichever half a given pass never touches, exactly as bloom's does.
+#include "shaders/FSL/motionblur.srt.h"
 
 // App-layer callback normally provided by WindowsBase.cpp (which we exclude — it
 // drags in the window system). The backend calls this on device-lost. Headless:
@@ -1669,6 +1673,19 @@ namespace {
     inline uint32_t bloomSetDown(uint32_t dstMip) { return dstMip; }                    // 1..6
     inline uint32_t bloomSetUp(uint32_t dstMip)   { return kBloomMipCount + dstMip; }   // 7..12
 
+    // MB-2: the TILE SIZE's range, and the smaller number is what the two tile surfaces are SIZED
+    // from. K is a live knob (it is simultaneously the dilation's granularity and the maximum blur
+    // length — see motionblur.srt.h), so the allocation has to hold the grid for the SMALLEST K that
+    // can ever be dialled in; every larger K uses a sub-rect of it, exactly as every screen target
+    // holds the render rect in a corner of the allocation.
+    //
+    // ⚠ THE MINIMUM IS NOT 1. At K = 1 the tile grid IS the frame, the "dilation" is a 3x3 blur of a
+    // full-resolution velocity field, and the surfaces would need to be full-size — 8x the memory for
+    // a setting that does nothing a K of 8 does not do better. 8 is also the group width, so the tile
+    // max's 8x8 group covers a whole tile in one stride at the floor.
+    constexpr uint32_t kMbTileKMin = 8;
+    constexpr uint32_t kMbTileKMax = 64;
+
     // W23/W24 caustics: how many instances of the ONE CausticSrtData::Persistent set exist, and what
     // each of them is for. Declared up here — well before the g_caustic* knob block — only because it
     // sizes the cbuffer array inside LiveRenderer below, the same reason kBloomSetCount and
@@ -2078,6 +2095,57 @@ namespace {
         Pipeline*      pBloomDownPipeline = nullptr;
         Pipeline*      pBloomUpPipeline = nullptr;
         bool           bloomReady = false;                 // gates the dispatch block
+
+        // --- MB-2 MOTION BLUR (tasks/forge-postprocess.md) ---------------------------------------
+        // The consumer of MB-1's velocity field. Three compute passes between the upscale and the
+        // bloom block — see motionblur.srt.h for the whole argument.
+        //
+        // ⚠ IT WRITES ITS OWN TARGET rather than filtering pSceneColor in place, and that is forced
+        // twice over: a compute pass that reads and writes one texture is a hazard no barrier can
+        // express, and pSceneColor may be MSAA, which cannot be UAV-written at all. The resolve then
+        // reads THIS instead of the upscale output on frames the pass ran — a descriptor-set INDEX,
+        // the same mechanism M1 4b already uses to choose between pSceneColor and the upscaler.
+        //
+        // ⚠ ~56 MB at 3360x2100 fp16, the same as the upscaler's target, and it is allocated whenever
+        // the path builds rather than when the knob is on. `mbEnable` is a LIVE A/B (the whole point
+        // is to flip it against a screenshot), so gating the allocation on it would make the knob
+        // inert after startup — the failure mode `upscaleEnable` has a paragraph about.
+        //
+        // The two tile surfaces are alloc/kMbTileKMin, so ANY runtime K fits without reallocation:
+        // 420x263 x RG16F = 442 KB each. Both REST in UNORDERED_ACCESS and are read through
+        // RTex2D — bloom's gBloomSrc/gBloomDst arrangement, which is what keeps a surface written by
+        // one dispatch and read by the next out of any SRV/UAV state ping-pong.
+        //
+        // NON-FATAL at every step, bloomReady's shape: any failure leaves mbReady false, no dispatch
+        // runs, the resolve binds the instance it would have bound anyway, and the frame is
+        // bit-identical to a build without the feature.
+        Texture*       pMotionBlur = nullptr;     // alloc-sized RGBA16F, the blurred delivered image
+        Texture*       pMbTile = nullptr;         // (alloc/kMbTileKMin) RG16F, per-tile max |v|
+        Texture*       pMbNeighbor = nullptr;     // same, max over the 3x3 tile neighbourhood
+        Buffer*        pMbParamsCbv = nullptr;    // ONE cbuffer; all four set instances bind it
+        // The gather's own statistics: [0] pixels blurred, [1] sum of their tap counts, [2] longest
+        // streak (asuint). Cleared from pMbStatsReset before the dispatch and copied to
+        // pMbStatsReadback after — pAplReadback's arrangement, read ONE FRAME LATE for its reason.
+        // ⚠ NO mDescriptors ON THE STAGING PAIR. A buffer that is only ever a CopyBufferRegion
+        // source or destination must not name a descriptor type: with no format, stride or element
+        // count to build a view FROM, addBuffer dereferences a resource it never created and kills
+        // the host between two log lines ([[project_forge_addbuffer_null_deref_av]] reached from the
+        // other direction — a malformed request rather than a refused allocation). mvfieldstats'
+        // pair beside it is the working shape.
+        Buffer*        pMbStats = nullptr;
+        Buffer*        pMbStatsReset = nullptr;
+        Buffer*        pMbStatsReadback = nullptr;
+        Shader*        pMbTileShader = nullptr;
+        Shader*        pMbNeighborShader = nullptr;
+        Shader*        pMbGatherShader = nullptr;
+        Pipeline*      pMbTilePipeline = nullptr;
+        Pipeline*      pMbNeighborPipeline = nullptr;
+        Pipeline*      pMbGatherPipeline = nullptr;
+        // FOUR instances: [0] tile max, [1] neighbour max, [2] gather off pSceneColor,
+        // [3] gather off the upscaler's output. The last two differ by ONE pointer.
+        DescriptorSet* pMbSet = nullptr;
+        bool           mbReady = false;           // gates the dispatch block
+
         DescriptorSet* pGtaoBatchSet = nullptr;   // AOSrtData PerBatch:  gLinearDepthIn + gAOOut
         DescriptorSet* pAOBlurSet = nullptr;      // AOBlurSrtData PerFrame: gBlurParams + gAOSrc + gBlurDepthIn + gAODst
 
@@ -3214,6 +3282,17 @@ namespace {
            // with how much of the screen a MOVING object covers. Summed, a crowd walking into frame
            // would read as the reprojection getting slower, which is the one thing it cannot do.
            kGpuPhaseObjVel,
+           // MB-2: the MOTION BLUR filter — all three passes (tile max, neighbour max, gather) in
+           // ONE bracket, because they are one feature with one on/off and no useful intermediate
+           // reading; the dilation is ~2% of the cost by construction and splitting it would be
+           // three timers describing one decision.
+           //
+           // ⚠ ITS OWN ENUM ENTRY, and that is not tidiness. cmdBeginQuery writes a timestamp to
+           // slot i, so TWO begin/end pairs on ONE index do not accumulate — the second overwrites
+           // the first. MB-1a learned that by folding kGpuPhaseObjVel into kGpuPhaseMotionVec and
+           // getting a number that described the depth copy alone. The budget context: the whole
+           // MB-1 producer costs 0.030 ms, and the gather is where this milestone's budget goes.
+           kGpuPhaseMotionBlur,
            kGpuPhaseCount };
 
     // FP1a first-person pass caps: one 64KB world window bounds the rigid list at 1024,
@@ -9843,7 +9922,13 @@ namespace {
                     // allocated with 2 instances in every configuration so the shape does not depend
                     // on the sample count; the second instance is simply left unwritten and unbound,
                     // which costs one descriptor-table slot.
-                    DescriptorSetDesc rsSet = SRT_SET_DESC(ResolveSrtData, PerDraw, 2, 0);
+                    // ⚠ THREE SINCE MB-2, and the third follows the same rule as the second:
+                    //   [2] gResolveSource = pMotionBlur   (the motion blur pass ran)
+                    // It supersedes BOTH of the others when it is bound, because the blur's input was
+                    // already whichever of them this frame delivered — so "which image" is answered
+                    // once, at the LAST pass that rewrote it, rather than by the resolve trying to
+                    // reason about two independent flags.
+                    DescriptorSetDesc rsSet = SRT_SET_DESC(ResolveSrtData, PerDraw, 3, 0);
                     addDescriptorSet(R, &rsSet, &g_live.pResolveSet);
 
                     BufferLoadDesc rcb = {};
@@ -12392,6 +12477,244 @@ namespace {
                 d[3].ppBuffers = &g_live.pAplOut;
                 updateDescriptorSet(R, 0, g_live.pAplSet, 4, d);
             }
+            // ─── MB-2: THE MOTION BLUR FILTER (tasks/forge-postprocess.md) ───────────────────────
+            // Built HERE, immediately BEFORE the resolve's set instances, and the ordering is forced
+            // from both sides: this block needs pMotionVectors, pLinearDepth, pSceneColor and the
+            // upscaler (all created above), and the resolve's THIRD instance needs pMotionBlur, which
+            // is created here. Putting it after would leave that instance with nothing to bind.
+            //
+            // ⚠ SINGLE-SAMPLE ONLY, and it is a hard gate rather than a preference. The gather reads
+            // its colour source as a plain Tex2D; at sampleCount > 1 that source would be the MSAA
+            // pSceneColor, which is a Tex2DMS — a TYPE mismatch, not a quality one. The upscaler
+            // refuses to exist above 1x for exactly the same reason, and since M0 the 1x path is fp16
+            // and is the normal configuration ([[project_forge_upscale_m0]]), so this costs nothing
+            // in practice. It also cannot be worked around by moving the pass after the resolve: the
+            // resolve owns exposure, AgX and the encode, and a blur is an ENERGY operation that has
+            // to run on energy-honest data ([[feedback_energy_op_takes_the_energy_honest_source]]).
+            //
+            // NON-FATAL throughout, bloomReady's shape: any failure leaves mbReady false, no dispatch
+            // runs, the resolve binds the instance it would have bound anyway, and the frame is
+            // bit-identical to a build without the feature.
+            if (g_live.sceneReferred && g_live.pSceneColor && g_live.sampleCount == 1
+                && g_live.pMotionVectors && g_live.pLinearDepth) {
+                // ALLOC-sized, like every other screen target, so a live render-scale change needs no
+                // reallocation — the delivered sub-rect rides the cbuffer instead.
+                TextureDesc od = {};
+                od.mWidth = g_live.allocWidth; od.mHeight = g_live.allocHeight; od.mDepth = 1;
+                od.mArraySize = 1; od.mMipLevels = 1;
+                od.mSampleCount = SAMPLE_COUNT_1;
+                // RGBA16F, matching pSceneColor and the upscaler's output — this pass sits between
+                // them in one unit system (scene-referred, linear, PREMULTIPLIED) and must not be the
+                // place a format changes.
+                od.mFormat = TinyImageFormat_R16G16B16A16_SFLOAT;
+                // RESTS in SHADER_RESOURCE: the resolve samples it, and a frame where the dispatch is
+                // skipped then leaves a valid resource in the slot rather than one mid-transition.
+                od.mStartState = RESOURCE_STATE_SHADER_RESOURCE;
+                od.mDescriptors = (DescriptorType)(DESCRIPTOR_TYPE_TEXTURE | DESCRIPTOR_TYPE_RW_TEXTURE);
+                od.pName = "motionBlur";
+                TextureLoadDesc old_ = {};
+                old_.ppTexture = &g_live.pMotionBlur;
+                old_.pDesc = &od;
+                addResource(&old_, nullptr);
+
+                // The two tile surfaces. Sized for the SMALLEST K so any runtime K fits; both REST in
+                // UNORDERED_ACCESS and are never transitioned, because both are written by one
+                // dispatch and read by the next through an RTex2D (a UAV read) — bloom's
+                // gBloomSrc/gBloomDst arrangement, which removes the state ping-pong entirely and
+                // leaves plain UAV barriers as the only synchronisation.
+                const uint32_t tileW = std::max(1u, (g_live.allocWidth  + kMbTileKMin - 1u) / kMbTileKMin);
+                const uint32_t tileH = std::max(1u, (g_live.allocHeight + kMbTileKMin - 1u) / kMbTileKMin);
+                TextureDesc td = {};
+                td.mWidth = tileW; td.mHeight = tileH; td.mDepth = 1;
+                td.mArraySize = 1; td.mMipLevels = 1;
+                td.mSampleCount = SAMPLE_COUNT_1;
+                // RG16F: the same format and the same units as the field it reduces. A tile stores a
+                // VECTOR and not a magnitude — the gather needs a direction, and a tile that kept only
+                // a length would have discarded the half of the answer the line integral runs along.
+                td.mFormat = TinyImageFormat_R16G16_SFLOAT;
+                td.mStartState = RESOURCE_STATE_UNORDERED_ACCESS;
+                td.mDescriptors = DESCRIPTOR_TYPE_RW_TEXTURE;
+                td.pName = "mbTileMax";
+                TextureLoadDesc tld = {};
+                tld.ppTexture = &g_live.pMbTile;
+                tld.pDesc = &td;
+                addResource(&tld, nullptr);
+                td.pName = "mbNeighborMax";
+                TextureLoadDesc nld = {};
+                nld.ppTexture = &g_live.pMbNeighbor;
+                nld.pDesc = &td;
+                addResource(&nld, nullptr);
+
+                // ONE cbuffer for all four instances: every pass reads the same rects, the same K and
+                // the same knobs, so a per-instance copy would be four places for one set of numbers
+                // to drift. (Bloom needs 13 because each of ITS levels has different rects.)
+                BufferLoadDesc mcb = {};
+                mcb.mDesc.mDescriptors = DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+                mcb.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_CPU_TO_GPU;
+                mcb.mDesc.mFlags       = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
+                mcb.mDesc.mSize        = 256;   // four float4s; 256 B = min CBV
+                mcb.mDesc.pName        = "motionBlurParams";
+                mcb.ppBuffer           = &g_live.pMbParamsCbv;
+                addResource(&mcb, nullptr);
+
+                // The gather's statistics, and its reset/readback staging pair.
+                static const uint32_t kMbReset[3] = { 0u, 0u, 0u };
+                BufferLoadDesc msb = {};
+                msb.mDesc.mDescriptors  = DESCRIPTOR_TYPE_RW_BUFFER;
+                msb.mDesc.mMemoryUsage  = RESOURCE_MEMORY_USAGE_GPU_ONLY;
+                msb.mDesc.mFormat       = TinyImageFormat_R32_UINT;
+                msb.mDesc.mStructStride = sizeof(uint32_t);
+                msb.mDesc.mElementCount = 3;
+                msb.mDesc.mSize         = sizeof(kMbReset);
+                msb.mDesc.mStartState   = RESOURCE_STATE_UNORDERED_ACCESS;
+                msb.mDesc.pName         = "mbStats";
+                msb.ppBuffer            = &g_live.pMbStats;
+                addResource(&msb, nullptr);
+
+                // ⚠ NO mDescriptors ON EITHER OF THESE — see the declaration. It is what the working
+                // pair in the mvfieldstats block does, and the reason is a host that dies silently.
+                BufferLoadDesc mrb = {};
+                mrb.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_CPU_TO_GPU;
+                mrb.mDesc.mFlags       = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
+                mrb.mDesc.mSize        = sizeof(kMbReset);
+                mrb.mDesc.mStartState  = RESOURCE_STATE_GENERIC_READ;
+                mrb.mDesc.pName        = "mbStatsReset";
+                mrb.ppBuffer           = &g_live.pMbStatsReset;
+                addResource(&mrb, nullptr);
+
+                BufferLoadDesc mrr = {};
+                mrr.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_GPU_TO_CPU;
+                mrr.mDesc.mFlags       = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
+                mrr.mDesc.mSize        = sizeof(kMbReset);
+                mrr.mDesc.mStartState  = RESOURCE_STATE_COPY_DEST;
+                mrr.mDesc.pName        = "mbStatsReadback";
+                mrr.ppBuffer           = &g_live.pMbStatsReadback;
+                addResource(&mrr, nullptr);
+                waitForAllResourceLoads();
+
+                if (g_live.pMbStatsReset && g_live.pMbStatsReset->pCpuMappedAddress) {
+                    std::memcpy(g_live.pMbStatsReset->pCpuMappedAddress, kMbReset, sizeof(kMbReset));
+                }
+
+                ShaderLoadDesc mts = {};
+                mts.mComp.pFileName = "mbtilemax.comp";
+                addShader(R, &mts, &g_live.pMbTileShader);
+                ShaderLoadDesc mns = {};
+                mns.mComp.pFileName = "mbneighbormax.comp";
+                addShader(R, &mns, &g_live.pMbNeighborShader);
+                ShaderLoadDesc mgs = {};
+                mgs.mComp.pFileName = "mbgather.comp";
+                addShader(R, &mgs, &g_live.pMbGatherShader);
+                if (g_live.pMbTileShader) {
+                    PipelineDesc pd = {};
+                    pd.mType = PIPELINE_TYPE_COMPUTE;
+                    pd.mComputeDesc.pShaderProgram = g_live.pMbTileShader;
+                    addPipeline(R, &pd, &g_live.pMbTilePipeline);
+                }
+                if (g_live.pMbNeighborShader) {
+                    PipelineDesc pd = {};
+                    pd.mType = PIPELINE_TYPE_COMPUTE;
+                    pd.mComputeDesc.pShaderProgram = g_live.pMbNeighborShader;
+                    addPipeline(R, &pd, &g_live.pMbNeighborPipeline);
+                }
+                if (g_live.pMbGatherShader) {
+                    PipelineDesc pd = {};
+                    pd.mType = PIPELINE_TYPE_COMPUTE;
+                    pd.mComputeDesc.pShaderProgram = g_live.pMbGatherShader;
+                    addPipeline(R, &pd, &g_live.pMbGatherPipeline);
+                }
+
+                if (g_live.pMotionBlur && g_live.pMbTile && g_live.pMbNeighbor && g_live.pMbParamsCbv
+                    && g_live.pMbStats && g_live.pMbStatsReset && g_live.pMbStatsReadback
+                    && g_live.pMbTilePipeline && g_live.pMbNeighborPipeline && g_live.pMbGatherPipeline) {
+                    DescriptorSetDesc mset = SRT_SET_DESC(MotionBlurSrtData, Persistent, 4, 0);
+                    addDescriptorSet(R, &mset, &g_live.pMbSet);
+                }
+                if (g_live.pMbSet) {
+                    // ⚠ EVERY SLOT IS BOUND IN EVERY INSTANCE. A descriptor set with an unwritten
+                    // slot reads whatever was last in that heap slot — the failure mode this file's
+                    // other single-texture binds all carry a note about — and mCount = 1 is REQUIRED
+                    // on each single-texture bind or the count is 0 and the slot binds NOTHING.
+                    // Slots a given pass never touches are pointed at something valid and inert;
+                    // DXC has already stripped them out of that pass's bytecode.
+                    Texture* sceneTex = g_live.pSceneColor->pTexture;
+                    Texture* upsTex   = (g_live.pUpscaler && g_live.pUpscaler->outputTexture())
+                                            ? g_live.pUpscaler->outputTexture() : sceneTex;
+                    DescriptorData d[8] = {};
+                    d[0].mIndex = SRT_RES_IDX(MotionBlurSrtData, Persistent, gMbParams);
+                    d[0].ppBuffers = &g_live.pMbParamsCbv;
+                    d[1].mIndex = SRT_RES_IDX(MotionBlurSrtData, Persistent, gMbVelocity);
+                    d[1].mCount = 1; d[1].ppTextures = &g_live.pMotionVectors;
+                    d[2].mIndex = SRT_RES_IDX(MotionBlurSrtData, Persistent, gMbDepth);
+                    d[2].mCount = 1; d[2].ppTextures = &g_live.pLinearDepth;
+                    d[3].mIndex = SRT_RES_IDX(MotionBlurSrtData, Persistent, gMbColor);
+                    d[3].mCount = 1; d[3].ppTextures = &sceneTex;
+                    d[4].mIndex = SRT_RES_IDX(MotionBlurSrtData, Persistent, gMbTileIn);
+                    d[4].mCount = 1; d[4].ppTextures = &g_live.pMbNeighbor;
+                    d[5].mIndex = SRT_RES_IDX(MotionBlurSrtData, Persistent, gMbTileOut);
+                    d[5].mCount = 1; d[5].ppTextures = &g_live.pMbTile;
+                    d[6].mIndex = SRT_RES_IDX(MotionBlurSrtData, Persistent, gMbOut);
+                    d[6].mCount = 1; d[6].ppTextures = &g_live.pMotionBlur;
+                    d[7].mIndex = SRT_RES_IDX(MotionBlurSrtData, Persistent, gMbStats);
+                    d[7].mCount = 1; d[7].ppBuffers = &g_live.pMbStats;
+
+                    // [0] TILE MAX: velocity -> pMbTile. gMbTileIn is unread by this pass and points
+                    // at pMbNeighbor rather than at pMbTile — a DIFFERENT resource, so the set never
+                    // names one surface as both an RTex2D and a WTex2D even in a slot nothing reads.
+                    updateDescriptorSet(R, 0, g_live.pMbSet, 8, d);
+
+                    // [1] NEIGHBOUR MAX: pMbTile -> pMbNeighbor. The two tile slots swap.
+                    d[4].ppTextures = &g_live.pMbTile;
+                    d[5].ppTextures = &g_live.pMbNeighbor;
+                    updateDescriptorSet(R, 1, g_live.pMbSet, 8, d);
+
+                    // [2] GATHER off pSceneColor (no upscaler ran), [3] GATHER off the upscaler's
+                    // output. ⚠ ONE POINTER APART, built side by side at path-build time so they
+                    // cannot drift, and chosen per frame by cmdBindDescriptorSet's INDEX — the exact
+                    // mechanism M1 4b gave the resolve, for the exact reason: a mid-frame
+                    // updateDescriptorSet is a second author of one decision.
+                    // gMbTileOut is unread by the gather and stays pointed at pMbNeighbor (which is
+                    // in UNORDERED_ACCESS, so the descriptor is valid even though nothing writes it).
+                    d[4].ppTextures = &g_live.pMbNeighbor;
+                    d[5].ppTextures = &g_live.pMbNeighbor;
+                    d[3].ppTextures = &sceneTex;
+                    updateDescriptorSet(R, 2, g_live.pMbSet, 8, d);
+                    d[3].ppTextures = &upsTex;
+                    updateDescriptorSet(R, 3, g_live.pMbSet, 8, d);
+
+                    g_live.mbReady = true;
+                }
+                if (!g_live.mbReady) {
+                    // ⚠ LOG::logline AND NOT std::printf, unlike the bloom block above. printf goes
+                    // to a console the perf harness never sees — it runs MINIMIZED — so a feature
+                    // that failed to build would be invisible in exactly the runs that measure it.
+                    // (`mb=(NOT BUILT)` on the gpu split is the other half of the same answer.)
+                    LOG::logline("!! [forge][mb] motion blur unavailable (out=%d tile=%d nb=%d cbv=%d"
+                                 " stats=%d tilePipe=%d nbPipe=%d gatherPipe=%d set=%d) — pass OFF,"
+                                 " frame unchanged",
+                                 g_live.pMotionBlur ? 1 : 0, g_live.pMbTile ? 1 : 0,
+                                 g_live.pMbNeighbor ? 1 : 0, g_live.pMbParamsCbv ? 1 : 0,
+                                 g_live.pMbStats ? 1 : 0,
+                                 g_live.pMbTilePipeline ? 1 : 0, g_live.pMbNeighborPipeline ? 1 : 0,
+                                 g_live.pMbGatherPipeline ? 1 : 0, g_live.pMbSet ? 1 : 0);
+                } else {
+                    // ⚠ THE KNOBS ARE NOT ON THIS LINE, and that is not an omission: they are declared
+                    // ~2500 lines below this function and are LIVE, so a value printed at build time
+                    // would describe a configuration the first frame may already have left. The
+                    // `mb=` bracket on the gpu split reports what the pass actually ran at.
+                    LOG::logline(">> [forge][mb] motion blur ready (target %ux%u RGBA16F, tiles"
+                                 " %ux%u for K >= %u) — the consumer of MB-1's field",
+                                 g_live.allocWidth, g_live.allocHeight, tileW, tileH, kMbTileKMin);
+                }
+            } else {
+                LOG::logline("!! [forge][mb] motion blur NOT BUILT (sceneReferred=%d sceneColor=%d"
+                             " samples=%u mv=%d depth=%d) — needs a single-sample scene-referred"
+                             " path and MB-1's field",
+                             g_live.sceneReferred ? 1 : 0, g_live.pSceneColor ? 1 : 0,
+                             g_live.sampleCount, g_live.pMotionVectors ? 1 : 0,
+                             g_live.pLinearDepth ? 1 : 0);
+            }
+
             // Custom resolve (step 4): the MSAA colour as a Tex2DMS SRV + its params cbuffer. Bound
             // ONCE — neither resource is ever recreated without rebuilding this path, and the live
             // knobs ride the cbuffer contents, not the descriptor. Guarded on pSceneColor for the same
@@ -12442,6 +12765,23 @@ namespace {
                     Texture* upsTex = g_live.pUpscaler->outputTexture();
                     d[1].ppTextures = &upsTex;
                     updateDescriptorSet(R, 1, g_live.pResolveSet, bloomTex ? 3 : 2, d);
+                }
+                // ...and INSTANCE 2: the MOTION BLUR's output (MB-2). Same set, same one pointer
+                // changed, built beside the two it is the alternative to.
+                //
+                // ⚠ IT IS THE LAST WORD, NOT A THIRD OPTION TO WEIGH. The blur reads whichever image
+                // this frame delivered (pSceneColor or the upscaler's output — that choice is made
+                // by which gather instance it binds) and writes the SAME rect, so when it ran there
+                // is exactly one correct source and it is this one. The frame therefore tests
+                // `mbRan` FIRST and only then `upscaled`; asking the two questions in the other order
+                // would let an upscaled+blurred frame resolve the un-blurred image.
+                //
+                // Only ever written at sampleCount == 1 — mbReady is gated on it, because gMbColor
+                // is a plain Tex2D and pSceneColor is a Tex2DMS above 1x. Above 1x this instance
+                // stays unwritten AND unbound, exactly like instance 1.
+                if (g_live.pMotionBlur) {
+                    d[1].ppTextures = &g_live.pMotionBlur;
+                    updateDescriptorSet(R, 2, g_live.pResolveSet, bloomTex ? 3 : 2, d);
                 }
                 if (!bloomTex) {
                     std::printf("[forge][bloom] no fallback texture for gBloomTex — resolve set bound"
@@ -14951,6 +15291,88 @@ namespace {
     // it is a single sub-sample. ⚠ Turning it on makes the bloom no longer energy-conserving, so
     // `exp=` may drift with it on — that is the knob, not a bug.
     bool     g_bloomInvLuma = false;
+
+    // ─── MB-2 MOTION BLUR (tasks/forge-postprocess.md) ───────────────────────────────────────────
+    // ⚠ SHIPS **ON**, which is the opposite of how MB-1 shipped and deliberately so. MB-1 was a
+    // producer nothing consumed, so off was the honest default; this is the consumer, the point of
+    // the milestone is to SEE it, and `mbEnable = 0` is the A/B arm. Off must be a BYTE-IDENTICAL
+    // no-op — no dispatch, and the resolve binds exactly the instance it binds today — which is
+    // verification step 1 and is proved rather than assumed.
+    bool     g_mbEnable = true;
+    // THE SHUTTER ANGLE, in degrees, and this is the whole of the fix for the DX9 filter's
+    // `blur_scale = 0.1`. That was a raw multiplier on a per-FRAME displacement, so a blur tuned at
+    // 60 fps was half as long at 30 — the look changed with the framerate, which is the one thing a
+    // camera setting must not do. An angle is framerate-independent by construction: the shutter was
+    // open for `angle/360` of the frame, the pixel moved `v` during the frame, so the streak is
+    // `v * angle/360` whatever the frame took.
+    // 180 is the film convention (half the frame) and is what ships. 360 is a full frame — the
+    // "everything smears" arm, useful for finding a wrong out/in rect scale, which shows as a length
+    // wrong by exactly that ratio.
+    float    g_mbShutter = 180.0f;
+    // The CAP on the adaptive tap count. The count itself is one tap per pixel of streak, so this
+    // only binds on genuinely fast motion; at K = 20 it also sets the worst-case tap SPACING
+    // (20/16 = 1.25 px), which is what decides whether a long streak reads as a smear or as beads.
+    uint32_t g_mbMaxTaps = 16;
+    // THE TILE SIZE, and it is two things at once **by construction rather than by overloading**:
+    // the dilation's granularity AND the maximum blur length. NeighborMax searches one tile in each
+    // direction, so K is exactly how far a pixel can be told about motion — a longer streak would
+    // end in a hard edge at the tiles that never heard of it. Larger K = longer possible streaks at
+    // LOWER dilation cost (9/K^2 per pixel), which is the whole reason the tile form beats the DX9
+    // filter's fixed-radius cross.
+    uint32_t g_mbTileK = 20;
+    // ⚠⚠ THE VELOCITY FLOOR, IN DELIVERED PIXELS, AND IT IS MANDATORY RATHER THAN AN OPTIMISATION.
+    // Only a BIT-IDENTICAL camera frame reaches exact zero (motionvectors.comp's parked short
+    // circuit, whose lane MB-2 step 0 had to un-break), and MW's camera matrix is bit-stable on a
+    // MINORITY of parked frames — measured worst deltas 4.3e-4, 2.9e-11 and 1.5e-3 across three
+    // consecutive still frames. On most still frames the camera really did move a hair, so the small
+    // vector is the CORRECT answer and there is nothing upstream to fix. Without a floor every still
+    // frame gets a sub-pixel smear, and a still image that softens is the most visible failure this
+    // pass has.
+    //
+    // A knob rather than a constant because it is a THRESHOLD, and this tree has paid for a hidden
+    // one before ([[feedback_inequality_gate_hides_magnitude]]). 0.5 px is comfortably above every
+    // residue measured (0.01 px worst, camera pass; 2.5e-5 px, object velocity) and comfortably
+    // below anything an eye can see move.
+    float    g_mbMinPx = 0.5f;
+    // The soft depth comparison's extent, as a FRACTION of the centre pixel's view distance.
+    // ⚠ FRACTIONAL, NOT ABSOLUTE, and that is forced by the depth this pass actually gets: raw
+    // reverse-Z device depth, where an absolute epsilon means a different distance at every range.
+    // 0.1 = "a sample 10% nearer than me contributes nothing". See mbDepthWeight for the identity
+    // that makes a relative test computable straight off the device values with no constants.
+    float    g_mbSoftZ = 0.1f;
+    // Whether the pass ran this frame — written from the ONE gate, read by the resolve's set index
+    // and by the heartbeat. Same rule as g_lastUpscaleRan beside it: a second derivation of "did it
+    // run" is a second thing that can disagree with the frame.
+    bool     g_lastMbRan = false;
+    // What the pass actually used, for the heartbeat's bracket. The K it RAN at, not the knob: the
+    // knob is clamped to [kMbTileKMin, kMbTileKMax] and a line reporting the unclamped value would
+    // describe a configuration that never existed.
+    uint32_t g_lastMbTilesX = 0, g_lastMbTilesY = 0, g_lastMbK = 0;
+    // The DELIVERED pixel count the gather covered, so `blurred%` has a denominator that came from
+    // the same frame as its numerator. Deriving it at print time from outWidth/width would re-ask
+    // "did an upscaler run" in a third place.
+    uint64_t g_lastMbPixels = 0;
+    // ─── THE BUSIEST FRAME SINCE THE LAST HEARTBEAT, AND WHY A PEAK RATHER THAN A SAMPLE ─────────
+    // ⚠⚠ THE SAME DEFECT MB-2 STEP 0 PAID FOR, ONE LEVEL DOWN, AND IT SHOWED UP IN THE FIRST RUN
+    // THAT COULD SEE IT. With the velchurn fixture armed (it rotates in bursts, so most frames are
+    // parked), eight sampled heartbeats caught exactly ONE moving frame — `blurred=0.684%` — while
+    // `mb=` on the gpu split ranged 0.22 to **2.09 ms** across the same window. The millisecond that
+    // needs explaining and the percentage that would explain it were never from the same frame, so
+    // the pass's whole cost law was unattributable from the log.
+    //
+    // A fixed-period heartbeat cannot sample a bursty condition; that is not a resolution problem to
+    // be fixed by sampling more often. So the readback is inspected EVERY frame (a persistently
+    // mapped 12-byte pointer) and the BUSIEST frame's numbers are latched whole — percentage, taps
+    // and streak length together, because those three describe one frame and a max taken per-field
+    // would describe a frame that never existed.
+    //
+    // `frames` is what stops the latch lying by silence: 0/N means nothing blurred at all in the
+    // window, which is a real and different answer from "the pass is broken".
+    double   g_mbPeakPct    = 0.0;
+    double   g_mbPeakTaps   = 0.0;
+    float    g_mbPeakLen    = 0.0f;
+    uint32_t g_mbBlurFrames = 0;
+    uint32_t g_mbRanFrames  = 0;
 
     // ⚠ EVERY DISPATCH AND EVERY TAP IS BOUNDED BY THE **RENDER** RECT AT ITS LEVEL, not by the
     // allocation ([[project_forge_alloc_vs_render_uv]]). pSceneColor is alloc-sized while the scene
@@ -18363,6 +18785,60 @@ namespace {
                      &g_upscaleMvLowRes);
           t.flush(); }
 
+        // -- Tab: Motion blur (MB-2, tasks/forge-postprocess.md) --
+        // Its own tab between "Upscale" and "Bloom", which is exactly where the pass sits in the
+        // frame. It reads the DELIVERED image (whatever the upscale block produced) and hands the
+        // resolve a different texture; bloom is untouched beside it and still takes the raw scene.
+        { TabBuilder t; t.panel = g_uiPanel; t.name = "Motion blur";
+          // THE A/B, and a complete one in one build: unticking skips all three dispatches AND makes
+          // the resolve bind the instance it would have bound without this feature, so the frame is
+          // byte-identical rather than approximately unchanged. `mb=` in the gpu split can therefore
+          // be read on and off across one frame, which is the only honest way to price it.
+          t.checkbox("Motion blur enable (off = no dispatches, byte-identical frame)", &g_mbEnable);
+          // THE SHUTTER ANGLE, and the reason it is an angle rather than a strength multiplier.
+          // The DX9 filter's `blur_scale` multiplied a per-FRAME displacement, so a blur tuned at
+          // 60 fps was half as long at 30 — a look that changes with the framerate, which is the one
+          // thing a camera setting must not do. `angle/360` is the fraction of the frame the shutter
+          // was open, so the streak is framerate-independent by construction.
+          // 180 is the film convention and ships; 360 is the "everything smears" arm, and it is also
+          // the setting to use when checking the out/in rect scale, because a wrong ratio shows as a
+          // length wrong by exactly that ratio and is easiest to see when the length is large.
+          t.sliderF("Shutter angle (deg; 180 = half a frame, the film convention)",
+                    &g_mbShutter, 0.0f, 360.0f, 5.0f);
+          // ⚠⚠ THE FLOOR IS NOT AN OPTIMISATION AND MUST NOT BE DRAGGED TO 0. Only a BIT-IDENTICAL
+          // camera frame produces exact zeros, and MW's camera matrix is bit-stable on a MINORITY of
+          // parked frames (measured worst deltas 4.3e-4, 2.9e-11, 1.5e-3 across three consecutive
+          // still frames) — so on most still frames the field carries a real sub-pixel vector that is
+          // the CORRECT answer and would smear a still image. Below the floor the pass copies the
+          // source pixel verbatim, so a parked camera is bit-identical to mbEnable off.
+          // 0 is the DIAGNOSTIC arm: it makes the residue visible, which is how you check that a
+          // still frame's softness is this and not something upstream.
+          t.sliderF("Velocity floor (delivered px; 0 = DIAGNOSTIC, expect a still frame to soften)",
+                    &g_mbMinPx, 0.0f, 4.0f, 0.05f);
+          // A CAP on the adaptive count, not the count. One tap per pixel of streak is what runs, so
+          // this only binds on fast motion — and with the K below it sets the worst-case tap spacing
+          // (K/taps), which is what decides whether a long streak reads as a smear or as beads.
+          t.sliderU("Max taps (the count is adaptive: one per px of streak, min 3)",
+                    &g_mbMaxTaps, 3u, 32u, 1u);
+          // ⚠ TWO THINGS AT ONCE **BY CONSTRUCTION**, which is the opposite of the one-knob-two-jobs
+          // defect: NeighborMax searches one tile in each direction, so K is simultaneously the
+          // dilation's granularity and exactly how far a pixel can be told about motion — i.e. the
+          // maximum streak length. Larger K = longer possible streaks at LOWER dilation cost (the
+          // neighbour pass is 9/K^2 per pixel), which is the whole reason the tile form beats the
+          // DX9 filter's fixed-radius cross.
+          t.sliderU("Tile size K (delivered px) — also the MAXIMUM blur length",
+                    &g_mbTileK, kMbTileKMin, kMbTileKMax, 1u);
+          // The soft depth comparison, as a FRACTION of the centre pixel's distance rather than an
+          // absolute — the pass gets raw reverse-Z device depth, where an absolute epsilon means a
+          // different distance at every range.
+          // ⚠ IT IS WHAT KEEPS A BACKGROUND FROM BLURRING OVER A FOREGROUND. Dragging it to 0 rejects
+          // every tap that is not at exactly the centre's depth, so a moving surface stops blurring
+          // over itself; dragging it up lets the streak cross depth discontinuities freely, which
+          // reads as haloing around near geometry.
+          t.sliderF("Soft depth extent (fraction of centre distance; 0.1 = 10% nearer is rejected)",
+                    &g_mbSoftZ, 0.0f, 1.0f, 0.01f);
+          t.flush(); }
+
         // -- Tab: Bloom (tasks/forge-postprocess.md step 4) --
         // Its own tab beside "Resolve (MSAA)" and "Exposure (adaptation)", on the same split those
         // two follow: Resolve owns the FILTER, Exposure owns LEVEL, Tonemap owns SHAPE, and this owns
@@ -21663,11 +22139,24 @@ void destroyHostWindow(Renderer* R);
             { "grassCrushBend",      &g_grassCrushBend      },
             { "grassCrushSink",      &g_grassCrushSink      },
             { "grassCrushPlayerRadius", &g_grassCrushPlayerRadius },
+            // MB-2. All three are here as well as on the panel because the two verifications that
+            // matter most are a MEASUREMENT and a RECT, and both have to be runnable from a minimized
+            // harness with nobody at a slider: `mb=` on the gpu split against mbShutter, and the
+            // out/in scale against upscaleMode=2 (at 1x that scale is 1.0 and proves nothing).
+            { "mbShutter",           &g_mbShutter           },
+            { "mbMinPx",             &g_mbMinPx             },
+            { "mbSoftZ",             &g_mbSoftZ             },
         };
         const BKnob bknobs[] = {
             // M1 motion vectors — env-driven so an unattended run can turn the dispatch on and read
             // `[forge-hb] mv:` back without anyone at the panel. tasks/forge-upscale.md.
             { "mvEnable",            &g_mvEnable            },
+            // MB-2's master A/B. ⚠ SHIPS **ON** — this is the consumer, and the point of the
+            // milestone is to see it — so this token is how a run turns it OFF. `mbEnable=0` must be
+            // a BYTE-IDENTICAL no-op (no dispatch; the resolve binds the instance it binds today),
+            // which is verification step 1 and the first thing to try when bisecting anything
+            // post-upscale.
+            { "mbEnable",            &g_mbEnable            },
             { "objVelEnable",        &g_objVelEnable        },
             { "objVelAllItems",      &g_objVelAllItems      },
             { "objVelSkinned",       &g_objVelSkinnedLane   },
@@ -21751,6 +22240,11 @@ void destroyHostWindow(Renderer* R);
             // preset E hangs the GPU on runtime 310.8.0 (see upscale.h). K vs J is the A/B that
             // remains, and it is one token.
             { "upscalePreset", &g_upscalePreset, (uint32_t)kUpscalePresetCount - 1u },
+            // MB-2. K is clamped again at dispatch time to [kMbTileKMin, kMbTileKMax] — the table's
+            // max only stops a typo from being accepted silently, and the dispatch's clamp is what
+            // keeps the tile grid inside the surfaces it was allocated for.
+            { "mbTileK",   &g_mbTileK,   kMbTileKMax },
+            { "mbMaxTaps", &g_mbMaxTaps, 64u },
         };
         const SKnob sknobs[] = {
             // M1 4d: `passthrough` (default) or `ngx`. Read at INIT — it decides which object is
@@ -33034,6 +33528,178 @@ void destroyHostWindow(Renderer* R);
         const uint32_t deliveredW = upscaled ? g_live.outWidth  : g_live.width;
         const uint32_t deliveredH = upscaled ? g_live.outHeight : g_live.height;
 
+        // ===================== MB-2: MOTION BLUR (tasks/forge-postprocess.md) ====================
+        // AFTER the upscale, BEFORE bloom, on the DELIVERED image and still PRE-TONEMAP — the resolve
+        // owns exposure, AgX and the encode — so the blur stays an ENERGY operation on energy-honest
+        // data ([[feedback_energy_op_takes_the_energy_honest_source]]).
+        //
+        // ⚠ AFTER THE UPSCALE, AND NOT BEFORE IT, FOR THE UPSCALER'S SAKE. A temporal backend fed a
+        // pre-blurred frame spends its detail reconstruction on smeared pixels and its history
+        // rejection fighting a blur that moves every frame. DLSS gets the sharp image; the blur is
+        // applied to what DLSS delivered.
+        //
+        // ⚠⚠ AND THE BLOOM BLOCK BELOW IS DELIBERATELY LEFT ALONE. Its source stays pSceneColor (the
+        // raster rect, the raw scene) and its extent stays `delivered`. Re-pointing it at the blurred
+        // frame is exactly the move that cost a candle 83% of its punch the last time SOURCE and
+        // EXTENT were changed together — and the two effects are separable anyway: one is a shutter
+        // integral, the other is lens spill.
+        //
+        // THE ONE PIECE OF ARITHMETIC THAT IS WRONG BY DEFAULT: the vectors are at the INPUT rect in
+        // INPUT-rect pixels, and this pass works in DELIVERED pixels. `tile.w` carries the ratio, and
+        // at 1x it is exactly 1.0 and PROVES NOTHING — the same trap
+        // [[project_forge_upscale_seam_4b]] records for the resolve. Test at upscaleMode=2.
+        bool mbRan = false;
+        if (shaderResolve && g_live.mbReady && g_mbEnable && deliveredW > 0u && deliveredH > 0u) {
+            // The colour source must be readable. On an upscaled frame the gather reads the backend's
+            // target, which evaluate() already left in SHADER_RESOURCE; on a native frame it reads
+            // pSceneColor, which needs the hoist. Idempotent, so this is a plain call.
+            sceneColorToSR();
+
+            const uint32_t K = std::min(std::max(g_mbTileK, kMbTileKMin), kMbTileKMax);
+            const uint32_t tilesX = (deliveredW + K - 1u) / K;
+            const uint32_t tilesY = (deliveredH + K - 1u) / K;
+
+            if (g_live.pMbParamsCbv->pCpuMappedAddress) {
+                float* mp = (float*)g_live.pMbParamsCbv->pCpuMappedAddress;
+                // ⚠ THE RESERVED LANES FIRST, THEN THE LANES THAT ARE WRITTEN. MB-2 step 0 exists
+                // because a "clear the reserved lanes" line sat AFTER a block that wrote one of them
+                // and silently ate it for three weeks, while the heartbeat went on reporting the
+                // value the CPU had computed. A clear that runs before every write cannot do that,
+                // and neither can the next lane added below it.
+                mp[12] = 0.0f; mp[13] = 0.0f; mp[14] = 0.0f; mp[15] = 0.0f;
+                // rects: the DELIVERED rect, then the MOTION-VECTOR (input) rect.
+                mp[0] = (float)deliveredW;   mp[1] = (float)deliveredH;
+                mp[2] = (float)g_live.width; mp[3] = (float)g_live.height;
+                // tile: K, the grid, and the INPUT -> DELIVERED pixel scale.
+                mp[4] = (float)K;
+                mp[5] = (float)tilesX;
+                mp[6] = (float)tilesY;
+                mp[7] = (float)deliveredW / (float)std::max(1u, g_live.width);
+                // blur: shutter fraction, tap cap, the velocity floor, the soft-depth extent.
+                mp[8]  = std::max(0.0f, g_mbShutter) / 360.0f;
+                mp[9]  = (float)std::max(3u, g_mbMaxTaps);
+                mp[10] = std::max(0.0f, g_mbMinPx);
+                mp[11] = std::max(1.0e-4f, g_mbSoftZ);
+            }
+
+            // ⚠ THE STATISTICS BUFFER IS CLEARED **OUTSIDE** THE PHASE BRACKET, and so is its
+            // readback below. Two barriers and a 12-byte copy are not free, and an instrument folded
+            // into the timer it exists to explain makes `mb=` describe the instrument as well as the
+            // pass. [[feedback_phase_timer_can_bracket_a_strangers_pass]] is the same mistake one
+            // level up — there the stranger was somebody else's DLSS, here it would be our own probe.
+            if (g_live.pMbStats && g_live.pMbStatsReset) {
+                BufferBarrier bb = {};
+                bb.pBuffer = g_live.pMbStats;
+                bb.mCurrentState = RESOURCE_STATE_UNORDERED_ACCESS;
+                bb.mNewState     = RESOURCE_STATE_COPY_DEST;
+                cmdResourceBarrier(g_live.pCmd, 1, &bb, 0, nullptr, 0, nullptr);
+                g_live.pCmd->mDx.pCmdList->CopyBufferRegion(
+                    g_live.pMbStats->mDx.pResource, 0,
+                    g_live.pMbStatsReset->mDx.pResource, 0, sizeof(uint32_t) * 3);
+                bb.mCurrentState = RESOURCE_STATE_COPY_DEST;
+                bb.mNewState     = RESOURCE_STATE_UNORDERED_ACCESS;
+                cmdResourceBarrier(g_live.pCmd, 1, &bb, 0, nullptr, 0, nullptr);
+            }
+
+            gpuPhaseBegin(kGpuPhaseMotionBlur);
+            cmdBeginDebugMarker(g_live.pCmd, 0.8f, 0.4f, 0.9f, "MOTION BLUR (tile + neighbour + gather)");
+
+            // pMotionBlur rests in SHADER_RESOURCE (the resolve samples it) and is written as a UAV
+            // here. The two tile surfaces never leave UNORDERED_ACCESS at all — they are read through
+            // RTex2D, bloom's arrangement — so the only synchronisation the chain needs is a UAV
+            // barrier between dispatches, which is what `current == new` lowers to.
+            {
+                TextureBarrier tb = { g_live.pMotionBlur, RESOURCE_STATE_SHADER_RESOURCE,
+                                      RESOURCE_STATE_UNORDERED_ACCESS };
+                cmdResourceBarrier(g_live.pCmd, 0, nullptr, 1, &tb, 0, nullptr);
+            }
+
+            // (1) TILE MAX. ONE GROUP PER TILE — the dispatch is sized in TILES, and the shader
+            // derives its lane from the dispatch id (ripplewave's idiom). That is what makes the pass
+            // cost exactly 1.0 taps per delivered pixel whatever K is.
+            cmdBindPipeline(g_live.pCmd, g_live.pMbTilePipeline);
+            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pMbSet);
+            cmdDispatch(g_live.pCmd, tilesX, tilesY, 1);
+            {
+                TextureBarrier tb = { g_live.pMbTile, RESOURCE_STATE_UNORDERED_ACCESS,
+                                      RESOURCE_STATE_UNORDERED_ACCESS };
+                cmdResourceBarrier(g_live.pCmd, 0, nullptr, 1, &tb, 0, nullptr);
+            }
+
+            // (2) NEIGHBOUR MAX, one thread per tile over the 3x3 neighbourhood. This is what lets a
+            // streak reach past a mover's silhouette, and it is also what BOUNDS the streak: a tile
+            // only hears about motion within +-K, which is why the gather clamps to K.
+            cmdBindPipeline(g_live.pCmd, g_live.pMbNeighborPipeline);
+            cmdBindDescriptorSet(g_live.pCmd, 1, g_live.pMbSet);
+            cmdDispatch(g_live.pCmd, (tilesX + 7u) / 8u, (tilesY + 7u) / 8u, 1);
+            {
+                TextureBarrier tb = { g_live.pMbNeighbor, RESOURCE_STATE_UNORDERED_ACCESS,
+                                      RESOURCE_STATE_UNORDERED_ACCESS };
+                cmdResourceBarrier(g_live.pCmd, 0, nullptr, 1, &tb, 0, nullptr);
+            }
+
+            // (3) THE GATHER. Instance 3 reads the upscaler's output, instance 2 pSceneColor — one
+            // pointer apart, both built at path-build time, chosen by the SAME `upscaled` flag every
+            // other downstream decision hangs off.
+            cmdBindPipeline(g_live.pCmd, g_live.pMbGatherPipeline);
+            cmdBindDescriptorSet(g_live.pCmd, upscaled ? 3u : 2u, g_live.pMbSet);
+            cmdDispatch(g_live.pCmd, (deliveredW + 7u) / 8u, (deliveredH + 7u) / 8u, 1);
+
+            {
+                TextureBarrier tb = { g_live.pMotionBlur, RESOURCE_STATE_UNORDERED_ACCESS,
+                                      RESOURCE_STATE_SHADER_RESOURCE };
+                cmdResourceBarrier(g_live.pCmd, 0, nullptr, 1, &tb, 0, nullptr);
+            }
+            cmdEndDebugMarker(g_live.pCmd);
+            gpuPhaseEnd(kGpuPhaseMotionBlur);
+
+            // Stage the counters for a read ONE FRAME LATE — pAplReadback's exact arrangement, and
+            // for its reason: reading this frame's buffer means fencing the frame we are still
+            // recording. Outside the phase bracket, like the clear above.
+            if (g_live.pMbStats && g_live.pMbStatsReadback) {
+                BufferBarrier bb = {};
+                bb.pBuffer = g_live.pMbStats;
+                bb.mCurrentState = RESOURCE_STATE_UNORDERED_ACCESS;
+                bb.mNewState     = RESOURCE_STATE_COPY_SOURCE;
+                cmdResourceBarrier(g_live.pCmd, 1, &bb, 0, nullptr, 0, nullptr);
+                g_live.pCmd->mDx.pCmdList->CopyBufferRegion(
+                    g_live.pMbStatsReadback->mDx.pResource, 0,
+                    g_live.pMbStats->mDx.pResource, 0, sizeof(uint32_t) * 3);
+                bb.mCurrentState = RESOURCE_STATE_COPY_SOURCE;
+                bb.mNewState     = RESOURCE_STATE_UNORDERED_ACCESS;
+                cmdResourceBarrier(g_live.pCmd, 1, &bb, 0, nullptr, 0, nullptr);
+            }
+
+            mbRan = true;
+            g_lastMbTilesX = tilesX;
+            g_lastMbTilesY = tilesY;
+            g_lastMbK      = K;
+            g_lastMbPixels = (uint64_t)deliveredW * (uint64_t)deliveredH;
+
+            // ─── THE BUSIEST-FRAME LATCH ────────────────────────────────────────────────────────
+            // Reads whatever completed copy the readback currently holds — an older frame's,
+            // unfenced, exactly as the heartbeat does — and keeps it if that frame blurred more of
+            // the screen than any other since the last heartbeat. See g_mbPeakPct: the heartbeat
+            // alone caught one moving frame in eight against a `mb=` that spanned 0.22-2.09 ms.
+            //
+            // Latched WHOLE, not field by field: percentage, taps and length come from one frame, so
+            // a per-field max would report a frame that never happened.
+            ++g_mbRanFrames;
+            if (g_live.pMbStatsReadback && g_live.pMbStatsReadback->pCpuMappedAddress) {
+                const uint32_t* ps = (const uint32_t*)g_live.pMbStatsReadback->pCpuMappedAddress;
+                if (ps[0] > 0u) {
+                    ++g_mbBlurFrames;
+                    const double pct = 100.0 * (double)ps[0] / (double)g_lastMbPixels;
+                    if (pct > g_mbPeakPct) {
+                        g_mbPeakPct  = pct;
+                        g_mbPeakTaps = (double)ps[1] / (double)ps[0];
+                        std::memcpy(&g_mbPeakLen, &ps[2], sizeof(float));
+                    }
+                }
+            }
+        }
+        g_lastMbRan = mbRan;
+
         // ===================== BLOOM (tasks/forge-postprocess.md step 4) =========================
         // Bright things spill light into their surroundings, in scene-referred linear space. Runs HERE
         // — after every pass that writes pSceneColor (colour, water, glow, sorted alpha, volfog, first
@@ -33340,7 +34006,14 @@ void destroyHostWindow(Renderer* R);
             // this is an index and not a descriptor write. `upscaled` came from comparing evaluate()'s
             // returned pointer against the source — the single authoritative test — and never from
             // re-asking whether the rects differ.
-            cmdBindDescriptorSet(g_live.pCmd, upscaled ? 1u : 0u, g_live.pResolveSet);
+            //
+            // ⚠⚠ AND SINCE MB-2, INSTANCE 2 — pMotionBlur — WINS OVER BOTH, WHICH IS WHY IT IS TESTED
+            // FIRST. The blur read whichever of the other two this frame delivered and wrote the same
+            // rect, so when it ran there is exactly one correct source. Asking `upscaled` first would
+            // resolve the UN-blurred image on every upscaled frame — a bug that is invisible at 1x
+            // (where `upscaled` is false and the ternary falls through to 2 anyway) and appears only
+            // once DLSS is armed, which is precisely the shape M1 4b's rect bugs had.
+            cmdBindDescriptorSet(g_live.pCmd, mbRan ? 2u : (upscaled ? 1u : 0u), g_live.pResolveSet);
             cmdDraw(g_live.pCmd, 3, 0);
             cmdBindRenderTargets(g_live.pCmd, nullptr);
             cmdEndDebugMarker(g_live.pCmd);
@@ -34145,6 +34818,49 @@ void destroyHostWindow(Renderer* R);
                                  " (parkedFrames above says how often the condition fires; 0/N there"
                                  " means the bit-identity branch is unreachable in this scene)");
                 }
+                // ─── MB-2: WHAT THE GATHER ACTUALLY DID ─────────────────────────────────────────
+                // ⚠ `blurred%` IS THE VELOCITY FLOOR'S ACCEPTANCE TEST, and it is here rather than
+                // left to the eye for the reason MB-2 step 0 has just finished paying for: a claim
+                // that is read instead of measured survives for weeks. Parked on static geometry it
+                // must read **0.000%** — every pixel below the floor is copied verbatim, so a still
+                // frame is bit-identical to `mbEnable=0`. Anything else IS the smear, as a number.
+                //
+                // It is also the only thing that explains `mb=` on the gpu split. The gather's cost
+                // is (blurred pixels) x (their taps), so a millisecond that moved is one of those two
+                // moving, and avgTaps says which: more of the screen in motion, or the same motion
+                // gone faster. maxLen is the longest streak in delivered px — if it sits pinned at K
+                // the clamp is binding and the streaks are being cut short.
+                if (g_lastMbRan && g_live.pMbStatsReadback
+                    && g_live.pMbStatsReadback->pCpuMappedAddress && g_lastMbPixels > 0u) {
+                    const uint32_t* ms = (const uint32_t*)g_live.pMbStatsReadback->pCpuMappedAddress;
+                    float mlen = 0.0f;
+                    std::memcpy(&mlen, &ms[2], sizeof(float));
+                    LOG::logline(">> [forge-hb] mb: blurred=%.3f%% of %llu px avgTaps=%.1f maxLen=%.2f px"
+                                 " (K=%u shutter=%.0fdeg floor=%.2fpx)  [blurred%% MUST be 0.000%% on a"
+                                 " parked camera — below the floor a pixel is copied VERBATIM, so a"
+                                 " still frame is bit-identical to mbEnable=0; maxLen pinned at K"
+                                 " means the clamp is cutting streaks short]",
+                                 100.0 * (double)ms[0] / (double)g_lastMbPixels,
+                                 (unsigned long long)g_lastMbPixels,
+                                 ms[0] ? (double)ms[1] / (double)ms[0] : 0.0,
+                                 (double)mlen, g_lastMbK, (double)g_mbShutter, (double)g_mbMinPx);
+                    // ⚠⚠ AND THE BUSIEST FRAME, WHICH IS THE ONE THAT EXPLAINS `mb=`. The line above
+                    // is a SAMPLE and the pass's load is BURSTY — a camera is parked far more often
+                    // than it is turning — so the sampled frame is usually a parked one while the
+                    // millisecond on the gpu split came from a moving one. Measured: eight sampled
+                    // heartbeats caught ONE moving frame (0.684%) across a window where `mb=` ranged
+                    // 0.22 to 2.09 ms. Same defect as MB-2 step 0's parked lane, one level down.
+                    //
+                    // `frames=0/N` is a real answer, not a missing one: nothing moved in the window.
+                    LOG::logline(">> [forge-hb] mb peak: blurred=%.3f%% avgTaps=%.1f maxLen=%.2f px"
+                                 " on the BUSIEST of %u/%u frames that blurred anything  [this is the"
+                                 " frame `mb=` is priced by — cost is (blurred px) x (their taps);"
+                                 " the sampled line above is usually a PARKED frame]",
+                                 g_mbPeakPct, g_mbPeakTaps, (double)g_mbPeakLen,
+                                 g_mbBlurFrames, g_mbRanFrames);
+                    g_mbPeakPct = 0.0; g_mbPeakTaps = 0.0; g_mbPeakLen = 0.0f;
+                    g_mbBlurFrames = 0; g_mbRanFrames = 0;
+                }
                 // ⚠ REPORTED TWICE, AND THE SECOND NUMBER IS THE USABLE ONE. The reference point
                 // (screen centre, device depth 0.5) lands only ~8 units out under reverse-Z, which
                 // makes it a very SENSITIVE canary and a very misleading absolute: the origin error
@@ -34295,7 +35011,20 @@ void destroyHostWindow(Renderer* R);
                 std::snprintf(upscaleRectText, sizeof(upscaleRectText), "%s REFUSED",
                               g_upscaleName);
             }
-            LOG::logline(">> [forge-hb] gpu split: cull=%.2f prepass=%.2f shadow=%.2f (st=%.2f dyn=%.2f sun=%.2f) postdepth=%.2f (lin=%.2f ao=%.2f mask=%.2f) reflect=%.2f color=%.2f water=%.2f caustic=%.2f grasscrush=%.2f(%u) mv=%.2f upscale=%.2f(%s) bloom=%.2f(L%u) resolve=%.2f ms"
+            // The motion-blur term's bracket: the tile GRID and the K it actually ran at, or "off"
+            // when no dispatch happened. Two states that are identical in the timing alone — the knob
+            // off, and the pass failing to build — read differently here, which is the same argument
+            // the upscale bracket beside it is made of.
+            char mbText[64];
+            if (g_lastMbRan) {
+                std::snprintf(mbText, sizeof(mbText), "K%u %ux%u tiles",
+                              g_lastMbK, g_lastMbTilesX, g_lastMbTilesY);
+            } else if (!g_live.mbReady) {
+                std::snprintf(mbText, sizeof(mbText), "NOT BUILT");
+            } else {
+                std::snprintf(mbText, sizeof(mbText), "off");
+            }
+            LOG::logline(">> [forge-hb] gpu split: cull=%.2f prepass=%.2f shadow=%.2f (st=%.2f dyn=%.2f sun=%.2f) postdepth=%.2f (lin=%.2f ao=%.2f mask=%.2f) reflect=%.2f color=%.2f water=%.2f caustic=%.2f grasscrush=%.2f(%u) mv=%.2f upscale=%.2f(%s) mb=%.2f(%s) bloom=%.2f(L%u) resolve=%.2f ms"
                          " | hiz=%.2f (prologue, overruns=%u) | shadowCasters=%u maskSlots=%u(dyn=%u)"
                          " | nearTris=%.2fM atDraws=%u"
                          " | atmos=%.2f (LUT chain, every frame)"
@@ -34340,6 +35069,14 @@ void destroyHostWindow(Renderer* R);
                          // purpose and is the correct reading of the shipped default.
                          g_lastGpuPhaseMs[kGpuPhaseUpscale],
                          upscaleRectText,
+                         // mb=<ms>(K<k> <gx>x<gy> tiles) — MB-2, all three passes in one bracket.
+                         // ⚠ THE DILATION IS ~2% OF THIS NUMBER BY CONSTRUCTION (1.0 taps/px for the
+                         // tile max, 9/K^2 for the neighbour pass), so a `mb=` that moves is the
+                         // GATHER moving, and the gather's cost is proportional to how much of the
+                         // screen is moving fast enough to clear the velocity floor. Standing still
+                         // it should approach the floor's early-out cost; the budget context is that
+                         // the whole MB-1 producer costs 0.030 ms.
+                         g_lastGpuPhaseMs[kGpuPhaseMotionBlur], mbText,
                          // bloom=<ms>(L<levels>) — step 4. L0 means the pass did not run this frame
                          // (checkbox off, not scene-referred, or the pyramid failed to build), which is
                          // the distinction worth logging: a 0.00 with L7 would be a timing problem,
@@ -34924,6 +35661,57 @@ void destroyHostWindow(Renderer* R);
             } else {
                 LOG::logline("!! [forge][bloom] hot-reload FAILED — bloom DISABLED (dxil missing on disk?)"); LOG::flush();
             }
+        }
+
+        // MB-2 MOTION BLUR: same treatment, and being able to do this is HALF the reason all three of
+        // its passes are compute. Shutter angle, tap count and K are knobs whose right value is a
+        // judgement made while moving, not a number derivable at a desk, and iterating them across
+        // full host restarts is how a look gets settled by whoever runs out of patience first.
+        //
+        // Failure sets mbReady false and goes inert: the three targets and the four set instances
+        // stay valid for a retry, the dispatches stop, the resolve binds instance 1 or 0 exactly as
+        // it did before this feature existed, and the frame is bit-identical to `mbEnable = 0`.
+        //
+        // ⚠ NO SAMPLE_COUNT VARIANT TO KEEP IN SYNC — the pass only exists at sampleCount == 1 (the
+        // gather's colour source is a plain Tex2D), so unlike bloom and reflect-mip there is no
+        // second file name here that could silently disagree with the build path.
+        if (g_live.pMbTileShader || g_live.pMbNeighborShader || g_live.pMbGatherShader) {
+            if (g_live.pMbGatherPipeline)   { removePipeline(R, g_live.pMbGatherPipeline);   g_live.pMbGatherPipeline = nullptr; }
+            if (g_live.pMbGatherShader)     { removeShader(R, g_live.pMbGatherShader);       g_live.pMbGatherShader = nullptr; }
+            if (g_live.pMbNeighborPipeline) { removePipeline(R, g_live.pMbNeighborPipeline); g_live.pMbNeighborPipeline = nullptr; }
+            if (g_live.pMbNeighborShader)   { removeShader(R, g_live.pMbNeighborShader);     g_live.pMbNeighborShader = nullptr; }
+            if (g_live.pMbTilePipeline)     { removePipeline(R, g_live.pMbTilePipeline);     g_live.pMbTilePipeline = nullptr; }
+            if (g_live.pMbTileShader)       { removeShader(R, g_live.pMbTileShader);         g_live.pMbTileShader = nullptr; }
+            ShaderLoadDesc mts = {};
+            mts.mComp.pFileName = "mbtilemax.comp";
+            addShader(R, &mts, &g_live.pMbTileShader);
+            ShaderLoadDesc mns = {};
+            mns.mComp.pFileName = "mbneighbormax.comp";
+            addShader(R, &mns, &g_live.pMbNeighborShader);
+            ShaderLoadDesc mgs = {};
+            mgs.mComp.pFileName = "mbgather.comp";
+            addShader(R, &mgs, &g_live.pMbGatherShader);
+            if (g_live.pMbTileShader && g_live.pMbNeighborShader && g_live.pMbGatherShader) {
+                PipelineDesc pt = {};
+                pt.mType = PIPELINE_TYPE_COMPUTE;
+                pt.mComputeDesc.pShaderProgram = g_live.pMbTileShader;
+                addPipeline(R, &pt, &g_live.pMbTilePipeline);
+                PipelineDesc pn = {};
+                pn.mType = PIPELINE_TYPE_COMPUTE;
+                pn.mComputeDesc.pShaderProgram = g_live.pMbNeighborShader;
+                addPipeline(R, &pn, &g_live.pMbNeighborPipeline);
+                PipelineDesc pg = {};
+                pg.mType = PIPELINE_TYPE_COMPUTE;
+                pg.mComputeDesc.pShaderProgram = g_live.pMbGatherShader;
+                addPipeline(R, &pg, &g_live.pMbGatherPipeline);
+            }
+            g_live.mbReady = g_live.pMotionBlur && g_live.pMbTile && g_live.pMbNeighbor
+                          && g_live.pMbSet && g_live.pMbTilePipeline && g_live.pMbNeighborPipeline
+                          && g_live.pMbGatherPipeline;
+            LOG::logline(g_live.mbReady
+                             ? ">> [forge][mb] shaders hot-reloaded (mbtilemax + mbneighbormax + mbgather)"
+                             : "!! [forge][mb] hot-reload FAILED — motion blur DISABLED (dxil missing on disk?)");
+            LOG::flush();
         }
 
         // P1 shadows: rebuild shadowmask.comp on the same trigger (its bias/debug logic is THE
@@ -45987,6 +46775,24 @@ void destroyHostWindow(Renderer* R);
         }
         if (g_live.pBloomMips)             { removeResource(g_live.pBloomMips); g_live.pBloomMips = nullptr; }
         g_live.bloomReady = false;
+        // MB-2. Set first, then pipelines, then shaders, then resources — the same order every block
+        // above uses, so nothing is destroyed while something that names it is still alive.
+        if (g_live.pMbSet)              { removeDescriptorSet(R, g_live.pMbSet);      g_live.pMbSet = nullptr; }
+        if (g_live.pMbGatherPipeline)   { removePipeline(R, g_live.pMbGatherPipeline);   g_live.pMbGatherPipeline = nullptr; }
+        if (g_live.pMbNeighborPipeline) { removePipeline(R, g_live.pMbNeighborPipeline); g_live.pMbNeighborPipeline = nullptr; }
+        if (g_live.pMbTilePipeline)     { removePipeline(R, g_live.pMbTilePipeline);     g_live.pMbTilePipeline = nullptr; }
+        if (g_live.pMbGatherShader)     { removeShader(R, g_live.pMbGatherShader);       g_live.pMbGatherShader = nullptr; }
+        if (g_live.pMbNeighborShader)   { removeShader(R, g_live.pMbNeighborShader);     g_live.pMbNeighborShader = nullptr; }
+        if (g_live.pMbTileShader)       { removeShader(R, g_live.pMbTileShader);         g_live.pMbTileShader = nullptr; }
+        if (g_live.pMbStatsReadback)    { removeResource(g_live.pMbStatsReadback);       g_live.pMbStatsReadback = nullptr; }
+        if (g_live.pMbStatsReset)       { removeResource(g_live.pMbStatsReset);          g_live.pMbStatsReset = nullptr; }
+        if (g_live.pMbStats)            { removeResource(g_live.pMbStats);               g_live.pMbStats = nullptr; }
+        if (g_live.pMbParamsCbv)        { removeResource(g_live.pMbParamsCbv);           g_live.pMbParamsCbv = nullptr; }
+        if (g_live.pMbNeighbor)         { removeResource(g_live.pMbNeighbor);            g_live.pMbNeighbor = nullptr; }
+        if (g_live.pMbTile)             { removeResource(g_live.pMbTile);                g_live.pMbTile = nullptr; }
+        if (g_live.pMotionBlur)         { removeResource(g_live.pMotionBlur);            g_live.pMotionBlur = nullptr; }
+        g_live.mbReady = false;
+        g_lastMbRan = false;
         if (g_live.pAOParamsCbv)    { removeResource(g_live.pAOParamsCbv); }
         if (g_live.pAOBlur)         { removeResource(g_live.pAOBlur); }
         if (g_live.pAO)             { removeResource(g_live.pAO); }

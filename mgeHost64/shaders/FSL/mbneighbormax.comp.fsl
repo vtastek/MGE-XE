@@ -1,0 +1,58 @@
+// mgeHost64 — MB-2 pass 2: the 3x3 NEIGHBOUR MAX over the tile grid.  Read motionblur.srt.h first.
+//
+// One thread per TILE, nine reads, 9/K^2 = 0.02 taps per delivered pixel at K = 20. This is the pass
+// that lets a blur extend PAST a mover's silhouette: a pixel is told about the fastest thing within
+// one tile of it, so a static pixel next to a fast object still knows a streak may reach it. Without
+// it a mover's blur stops dead at its own edge and reads as a hard-cut ghost.
+//
+// ⚠ AND IT IS ALSO THE BOUND ON HOW LONG A STREAK MAY BE. A tile only ever hears about motion within
+// +-K of itself, so the gather clamps its displacement to K — that clamp is not a taste knob, it is
+// exactly the reach this 3x3 search buys, with a factor of two in hand because a streak spans
+// +-len/2. Raising K raises the maximum streak AND the dilation's cost as 9/K^2, i.e. it gets
+// CHEAPER per pixel as it gets longer, which is the whole reason the tile form is worth having.
+//
+// ⚠ THE 3x3 IS SEPARABLE TOO AND IS DELIBERATELY NOT SPLIT. Splitting it would cost an extra
+// dispatch, an extra target and an extra barrier to save 3 taps out of 9 on 0.25% of the pixels.
+// The dilation's cost is dominated 45:1 by pass 1; there is nothing here to win.
+
+#include "motionblur.srt.h"
+#include "mbcommon.h.fsl"
+
+ROOT_SIGNATURE(ComputeRootSignature)
+NUM_THREADS(8, 8, 1)
+void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
+{
+    INIT_MAIN;
+
+    int2 t     = int2(DispatchThreadID.xy);
+    int2 tiles = int2(gMbParams.tile.yz);
+
+    // The tile grid is not a whole number of 8x8 groups, so the overhang threads are in-bounds for
+    // the RESOURCE (which is alloc/K-sized) and outside the GRID. Writing them would seed the gather
+    // with never-computed texels along two edges of the screen.
+    // ⚠ RETURN() ON ITS OWN LINE — fsl.py rewrites it as a STATEMENT and does not see one buried in
+    // a braced one-liner.
+    if (t.x >= tiles.x || t.y >= tiles.y)
+    {
+        RETURN();
+    }
+
+    float2 best  = f2(0.0f);
+    float  bestL = -1.0f;
+
+    UNROLL for (int j = -1; j <= 1; ++j)
+    {
+        UNROLL for (int i = -1; i <= 1; ++i)
+        {
+            // Clamped to the GRID, so an edge tile sees its own row/column twice rather than a texel
+            // nobody wrote. Duplication is harmless under a max; a stale texel is not.
+            int2   q  = clamp(t + int2(i, j), int2(0, 0), tiles - int2(1, 1));
+            float2 v  = LoadRWTex2D(gMbTileIn, q);
+            float  l2 = dot(v, v);
+            if (l2 > bestL) { bestL = l2; best = v; }
+        }
+    }
+
+    Write2D(gMbTileOut, t, best);
+    RETURN();
+}

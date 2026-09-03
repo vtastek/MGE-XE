@@ -1,0 +1,63 @@
+// mgeHost64 — MB-2 shared helpers.  Read motionblur.srt.h first; it carries the whole argument.
+//
+// ⚠ A PLAIN HEADER, NOT A SECOND .srt.h. It declares no resources and therefore no registers, which
+// is the condition under which sharing between shaders is free ([[project_forge_srt_one_per_header]]
+// — two SRTs in one header alias each other's bindings and it only compiles because DXC dead-strips
+// the unused one). aohalfres.srt.h already sets this precedent for a shared STRUCT.
+#pragma once
+
+// ── THE ONE MAPPING BETWEEN THE TWO RECTS ────────────────────────────────────────────────────────
+// A DELIVERED pixel to the INPUT texel that holds its velocity. Written once, used by both the tile
+// max and the gather, because the whole failure mode this guards against is the two doing it
+// differently and only at scales other than 1.0 — where nobody looks first.
+//
+// The clamp is to the INPUT RENDER rect, not to the resource: pMotionVectors is alloc-sized with the
+// field written into a sub-rect ([[project_forge_alloc_vs_render_uv]]).
+int2 mbVelocityTexel(float2 deliveredPx, float2 deliveredRect, float2 mvRect)
+{
+    float2 n = (deliveredPx + f2(0.5f)) / max(deliveredRect, f2(1.0f));
+    int2   q = int2(n * mvRect);
+    return clamp(q, int2(0, 0), int2(mvRect) - int2(1, 1));
+}
+
+// ── THE DEPTH WEIGHT, WITH THE REVERSE-Z SIGN PUT RIGHT ──────────────────────────────────────────
+//
+// The DX9 original is `saturate(1 - (za - zb) / soft_z_extent)` over a LINEAR, monotone-INCREASING
+// depth. gMbDepth is raw reverse-Z DEVICE depth, where **bigger means CLOSER** — so the ported
+// expression has the sign inverted and blurs the background over the foreground, which is the one
+// artefact a motion blur must never produce.
+//
+// Rather than linearise (which would need projection constants this SRT does not carry, and a second
+// place for them to disagree with the ones the AO pass uses), do the comparison in a form that is
+// ALREADY scale-free. Under any perspective reverse-Z projection view-z is proportional to 1/d, so
+//
+//     (z_sample - z_centre) / z_centre  ==  d_centre / d_sample - 1
+//
+// — a RELATIVE depth difference, positive when the sample is FARTHER, computed from the device values
+// with no constants at all. The extent knob is then a fraction ("10% nearer") and means the same
+// thing at 200 units and at 200 000, which an absolute epsilon in device depth emphatically does not.
+//
+// Returns 1 when the sample is at or behind the centre (the centre's motion may legitimately smear
+// over it) and falls to 0 as the sample comes forward past the extent.
+//
+// ⚠ BOTH DEPTHS ARE FLOORED. Reverse-Z far is an exact 0 (it is the per-frame clear, and every sky
+// pixel carries it), so an unguarded divide is inf, and inf/inf where both are far is NaN — which
+// would then survive every later multiply INCLUDING one by zero weight
+// ([[project_nan_survives_zero_multiply]]). With the floor, two far pixels give the ratio 1, i.e.
+// "same depth", which is exactly right.
+float mbDepthWeight(float dCentre, float dSample, float extent)
+{
+    float rel = max(dCentre, 1.0e-7f) / max(dSample, 1.0e-7f) - 1.0f;
+    return saturate(1.0f + rel / max(extent, 1.0e-4f));
+}
+
+// Interleaved-gradient noise, Jimenez 2014. A per-pixel offset in [0,1) for the tap positions, which
+// turns the banding of a short tap count into noise the eye reads as grain.
+//
+// ⚠ SPATIAL ONLY — no frame index, deliberately. Nothing downstream of this pass accumulates over
+// time (DLSS runs BEFORE it, on the sharp frame, by design), so a temporally-varying offset would
+// have nothing to average it away and would read as the streaks BOILING. A fixed pattern is stable.
+float mbDither(float2 px)
+{
+    return frac(52.9829189f * frac(dot(px, float2(0.06711056f, 0.00583715f))));
+}

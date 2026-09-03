@@ -758,3 +758,28 @@
 #comp mvfieldstats.comp
 #include "mvfieldstats.comp.fsl"
 #end
+
+// ─── MB-2: THE MOTION BLUR FILTER (tasks/forge-postprocess.md) ──────────────────────────────────
+// MB-1 produced the field; these three consume it. Read motionblur.srt.h for the whole argument —
+// the rect mapping, the reverse-Z depth sign, and what the deliberately-absent velocity-agreement
+// weights cost.
+//
+// ⚠ ALL THREE ARE COMPUTE, and that is two decisions in one. Shutter angle, tap count and K are
+// exactly the knobs that want walking in a running game, and compute hot-reloads with F8. It also
+// puts the pass out of reach of the late-Z trap that cost MB-1a three rounds: a UAV-writing PIXEL
+// shader has side effects, so D3D12 runs it BEFORE the depth test.
+//
+// ⚠ THE DILATION SPLITS AND THE GATHER DOES NOT, and that is not a cost decision either way. `max`
+// is separable; a line integral along an arbitrary direction is not a convolution and has no
+// separable form. X-then-Y here turns a diagonal streak into an axis-aligned box.
+#comp mbtilemax.comp
+#include "mbtilemax.comp.fsl"
+#end
+
+#comp mbneighbormax.comp
+#include "mbneighbormax.comp.fsl"
+#end
+
+#comp mbgather.comp
+#include "mbgather.comp.fsl"
+#end

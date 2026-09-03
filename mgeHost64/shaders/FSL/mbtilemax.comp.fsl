@@ -1,0 +1,98 @@
+// mgeHost64 — MB-2 pass 1: the KxK TILE MAX.  Read motionblur.srt.h first.
+//
+// One THREAD GROUP per tile, 8x8 threads striding the tile, then a tree reduce in groupshared. That
+// arrangement is what makes the pass cost exactly **1.0 taps per delivered pixel whatever K is** —
+// every source texel is read once, by exactly one thread.
+//
+// ⚠ WHY NOT ONE THREAD PER TILE, LOOPING KxK. Same total texel count, and it was the first shape
+// written. At K = 20 on 2560x1600 that is 128x80 = 10 240 threads, ~320 waves, each doing 400
+// dependent loads — the work is right and the LATENCY HIDING is not: a handful of waves per SM with
+// nothing else resident. The group form runs 655 360 threads at ~6 taps each and lets the scheduler
+// do its job. `max` being separable is what makes the reduce legal at all, and this is where the
+// separability is spent — see motionblur.srt.h for why the GATHER must not spend it the same way.
+//
+// ⚠ THE COMPARISON IS ON |v|^2, NOT |v|. sqrt is monotonic, so the winner is identical and the root
+// is a per-tap cost for nothing. The VECTOR is what is kept, not the magnitude: the gather needs a
+// direction, and a tile that stored only a length would have thrown away the half of the answer the
+// line integral is along.
+
+#include "motionblur.srt.h"
+#include "mbcommon.h.fsl"
+
+GroupShared(float2, g_mbTile[64]);
+
+ROOT_SIGNATURE(ComputeRootSignature)
+NUM_THREADS(8, 8, 1)
+void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
+{
+    INIT_MAIN;
+
+    // Group and lane from the dispatch id alone — ripplewave.comp's idiom, and for its reason:
+    // nothing in this codebase declares a second entry-point semantic, and the grid is a whole
+    // number of 8x8 groups by construction (the dispatch is sized in TILES), so the shift and the
+    // mask are exact.
+    uint2 lane = DispatchThreadID.xy & 7u;
+    uint2 tile = DispatchThreadID.xy >> 3u;
+    uint  tid  = lane.y * 8u + lane.x;
+
+    float2 delivered = gMbParams.rects.xy;
+    float2 mvRect    = gMbParams.rects.zw;
+    int    K         = int(gMbParams.tile.x);
+    int2   tiles     = int2(gMbParams.tile.yz);
+    float  outScale  = gMbParams.tile.w;
+
+    // ⚠ EVERY THREAD REACHES EVERY BARRIER. The out-of-range tiles are not returned early — they
+    // reduce a zero vector and skip only the WRITE. cullscan / apl / atmos_sh all carry this note;
+    // a divergent RETURN() before a GroupMemoryBarrier is undefined behaviour, and it is the kind
+    // that works on the hardware it was written on.
+    bool inGrid = (int(tile.x) < tiles.x) && (int(tile.y) < tiles.y);
+
+    float2 best  = f2(0.0f);
+    float  bestL = -1.0f;
+
+    // The tile's origin in DELIVERED pixels. The last tile in a row or column is PARTIAL whenever K
+    // does not divide the rect, so the bound is the rect and not the tile — reading past it would
+    // fold never-written alloc border into a maximum the gather then steers by.
+    int2 org = int2(tile) * K;
+    for (int y = int(lane.y); y < K; y += 8)
+    {
+        int py = org.y + y;
+        if (py >= int(delivered.y)) { continue; }
+        for (int x = int(lane.x); x < K; x += 8)
+        {
+            int px = org.x + x;
+            if (px >= int(delivered.x)) { continue; }
+
+            // ⚠ THE SCALE IS APPLIED HERE, ONCE, so the tile pyramid and the gather share ONE unit
+            // system (DELIVERED pixels). Storing input-rect pixels and scaling later would put the
+            // conversion in two places, and the two only disagree at scales other than 1.0.
+            int2   q  = mbVelocityTexel(float2(float(px), float(py)), delivered, mvRect);
+            float2 v  = LoadTex2D(gMbVelocity, NO_SAMPLER, q, 0).xy * outScale;
+            float  l2 = dot(v, v);
+            if (l2 > bestL) { bestL = l2; best = v; }
+        }
+    }
+
+    g_mbTile[tid] = best;
+    GroupMemoryBarrier();
+
+    // Tree reduce, atmos_sh's shape: read into a register, barrier, guarded write, barrier. The
+    // guard wraps only the WRITE so every thread still reaches every barrier.
+    for (uint s = 32u; s > 0u; s >>= 1u)
+    {
+        float2 other = (tid < s) ? g_mbTile[tid + s] : f2(0.0f);
+        GroupMemoryBarrier();
+        if (tid < s)
+        {
+            float2 mine = g_mbTile[tid];
+            if (dot(other, other) > dot(mine, mine)) { g_mbTile[tid] = other; }
+        }
+        GroupMemoryBarrier();
+    }
+
+    if (tid == 0u && inGrid)
+    {
+        Write2D(gMbTileOut, int2(tile), g_mbTile[0]);
+    }
+    RETURN();
+}
