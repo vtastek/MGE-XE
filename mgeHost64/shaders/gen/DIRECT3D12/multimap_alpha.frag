@@ -2771,6 +2771,88 @@ float3 enchantGlow(float3 N, float3 worldPos, bool glowing)
     return SampleTex2D(gTextures[slot], gSamplerAnisoClampClamp, uv).rgb * enchantTint() * k;
 }
 #line 23 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/multimap_alpha.frag.fsl"
+#line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/fpshadow.h.fsl"
+#line 21 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/fpshadow.h.fsl"
+float fpShadowLitAt(int2 tp, int2 tmin, int2 tmax, float thresh, uint dynSlot)
+{
+    tp = clamp(tp, tmin, tmax);
+    float stored = LoadTex2D(gShadowAtlas, NO_SAMPLER, tp, 0).r;
+    if (dynSlot != 0u) { stored = max(stored, LoadTex2D(gShadowAtlasDyn, NO_SAMPLER, tp, 0).r); }
+    return (stored > thresh) ? 0.0f : 1.0f;
+}
+
+
+
+float fpShadowBilinear(float2 ap, int2 tmin, int2 tmax, float thresh, uint dynSlot)
+{
+    float2 p = ap - 0.5f;
+    int2 b = int2(floor(p));
+    float2 f = p - float2(b);
+    float s00 = fpShadowLitAt(b + int2(0, 0), tmin, tmax, thresh, dynSlot);
+    float s10 = fpShadowLitAt(b + int2(1, 0), tmin, tmax, thresh, dynSlot);
+    float s01 = fpShadowLitAt(b + int2(0, 1), tmin, tmax, thresh, dynSlot);
+    float s11 = fpShadowLitAt(b + int2(1, 1), tmin, tmax, thresh, dynSlot);
+    return lerp(lerp(s00, s10, f.x), lerp(s01, s11, f.x), f.y);
+}
+
+
+
+
+
+
+float fpShadowVisibility(float3 P, float3 N, uint slot)
+{
+    float4 posRad = gShadowParams.slotPosRad[slot];
+    float4 tile = gShadowParams.slotTile[slot];
+    float rangeK = gShadowParams.maskParams.x;
+    float nearZ = gShadowParams.maskParams.y;
+    float range = rangeK * posRad.w;
+    float farZ = 2.0f * posRad.w;
+
+    float3 ad0 = abs(P - posRad.xyz);
+    float ma0 = max(ad0.x, max(ad0.y, ad0.z));
+    if (ma0 <= nearZ || ma0 >= range) { return 1.0f; }
+
+    uint dynSlot = (gShadowParams.slotBits.y >> slot) & 1u;
+    float uvScale = gShadowParams.slotFlick[slot].z;
+    uvScale = (uvScale > 0.01f) ? uvScale : 1.0f;
+
+
+
+    float3 Ldir = posRad.xyz - P;
+    float ndotl = dot(N, Ldir * rsqrt(max(dot(Ldir, Ldir), 1e-8f)));
+    float sinT = sqrt(saturate(1.0f - ndotl * ndotl));
+    float texelW = 2.0f * ma0 / max(tile.z * uvScale, 1.0f);
+    float3 Poff = P + N * (gShadowParams.biasParams.y * sinT * texelW);
+
+    float3 d = Poff - posRad.xyz;
+    float3 ad = abs(d);
+
+    uint face; float ma; float u; float v;
+    if (ad.x >= ad.y && ad.x >= ad.z) { ma = ad.x; face = d.x > 0.0f ? 0u : 1u;
+                                        u = d.x > 0.0f ? -d.z : d.z; v = -d.y; }
+    else if (ad.y >= ad.z) { ma = ad.y; face = d.y > 0.0f ? 2u : 3u;
+                                        u = d.x; v = d.y > 0.0f ? d.z : -d.z; }
+    else { ma = ad.z; face = d.z > 0.0f ? 4u : 5u;
+                                        u = d.z > 0.0f ? d.x : -d.x; v = -d.y; }
+    if (ma <= nearZ || ma >= range) { return 1.0f; }
+
+    float refZ = nearZ * (farZ - ma) / (ma * (farZ - nearZ));
+    float thresh = refZ * (1.0f + gShadowParams.maskParams.z)
+                 + gShadowParams.biasParams.x + 1e-6f;
+
+    float2 faceOrg = float2(tile.x + float(face % 3u) * tile.z,
+                            tile.y + float(face / 3u) * tile.z);
+    int2 tmin = int2(faceOrg);
+    int2 tmax = tmin + int2((int)tile.z - 1, (int)tile.z - 1);
+    float2 fuv = float2(u, v) / ma * (0.5f * uvScale) + 0.5f;
+    float2 ap = faceOrg + fuv * tile.z;
+
+    float vis = fpShadowBilinear(ap, tmin, tmax, thresh, dynSlot);
+    vis = lerp(1.0f, vis, saturate(tile.w));
+    return vis;
+}
+#line 24 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/multimap_alpha.frag.fsl"
 
 STRUCT(VSOutput)
 {
@@ -2788,7 +2870,7 @@ STRUCT(VSOutput)
     DATA(float3, WorldPos, TEXCOORD8);
     DATA(FLAT(uint4), Stages, TEXCOORD9);
     DATA(FLAT(uint), Packed, TEXCOORD10);
-#line 40
+#line 41
 };
 
 [RootSignature( "RootFlags(ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT)," "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "3" ", offset = 0)," "CBV(b0, numDescriptors = unbounded, space = " "3" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "3" ", offset = 0))," "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "2" ", offset = 0)," "CBV(b0, numDescriptors = unbounded, space = " "2" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "2" ", offset = 0))," "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "1" ", offset = 0)," "CBV(b0, numDescriptors = unbounded, space = " "1" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "1" ", offset = 0))," "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "0" ", offset = 0)," "CBV(b0, numDescriptors = unbounded, space = " "0" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "0" ", offset = 0))," "DescriptorTable(" "SAMPLER(s0, numDescriptors = unbounded, space = " "0" ", offset = 0))," "StaticSampler(s0, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s1, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s2, space = 100," "filter = FILTER_MIN_MAG_LINEAR_MIP_POINT," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s3, space = 100," "filter = FILTER_MIN_MAG_LINEAR_MIP_POINT," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s4, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s5, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s6, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT," "addressU = TEXTURE_ADDRESS_MIRROR, addressV = TEXTURE_ADDRESS_MIRROR, addressW = TEXTURE_ADDRESS_MIRROR)," "StaticSampler(s7, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT, borderColor = STATIC_BORDER_COLOR_TRANSPARENT_BLACK," "addressU = TEXTURE_ADDRESS_BORDER, addressV = TEXTURE_ADDRESS_BORDER, addressW = TEXTURE_ADDRESS_BORDER)," "StaticSampler(s8, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR," "addressU = TEXTURE_ADDRESS_MIRROR, addressV = TEXTURE_ADDRESS_MIRROR, addressW = TEXTURE_ADDRESS_MIRROR)," "StaticSampler(s9, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR, borderColor = STATIC_BORDER_COLOR_TRANSPARENT_BLACK," "addressU = TEXTURE_ADDRESS_BORDER, addressV = TEXTURE_ADDRESS_BORDER, addressW = TEXTURE_ADDRESS_BORDER)," "StaticSampler(s10, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 8," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s11, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 8," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s12, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 8," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s13, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 8," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s14, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 2," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s15, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 2," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s16, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 2," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s17, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 2," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_WRAP)" )]
@@ -2872,12 +2954,20 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
                 uint slotP1 = (uint)gLights.lights[i * 3u + 2u].w;
                 if (slotP1 != 0u)
                 {
-                    uint4 mw = LoadTex2D(gShadowMask, NO_SAMPLER, int2(In.Position.xy), 0).xyzw;
-                    uint s = slotP1 - 1u;
-                    uint lane = s >> 3u;
-                    uint word = lane == 0u ? mw.x : (lane == 1u ? mw.y : (lane == 2u ? mw.z : mw.w));
-                    uint nib = (word >> ((s & 7u) * 4u)) & 0xFu;
-                    att *= float(nib) * (1.0f / 15.0f);
+#line 136 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/multimap_alpha.frag.fsl"
+                    if (gFrameData.alphaShadowParams.y > 0.5f)
+                    {
+                        att *= fpShadowVisibility(In.WorldPos, normalize(In.Normal), slotP1 - 1u);
+                    }
+                    else
+                    {
+                        uint4 mw = LoadTex2D(gShadowMask, NO_SAMPLER, int2(In.Position.xy), 0).xyzw;
+                        uint s = slotP1 - 1u;
+                        uint lane = s >> 3u;
+                        uint word = lane == 0u ? mw.x : (lane == 1u ? mw.y : (lane == 2u ? mw.z : mw.w));
+                        uint nib = (word >> ((s & 7u) * 4u)) & 0xFu;
+                        att *= float(nib) * (1.0f / 15.0f);
+                    }
                 }
 
                 float lambert = saturate(dot(N, toLight) * invDist);
@@ -2975,7 +3065,7 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
         float g = float(mw.x & 0xFu) * (1.0f / 15.0f);
         return (float4(g, g, g, 1.0f));
     }
-#line 240 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/multimap_alpha.frag.fsl"
+#line 260 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/multimap_alpha.frag.fsl"
     float outA = baseA * In.Color.a;
     return (float4(c, outA));
 }

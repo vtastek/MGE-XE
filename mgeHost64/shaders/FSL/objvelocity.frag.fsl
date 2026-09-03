@@ -73,6 +73,28 @@ void PS_MAIN( PSInput In )
     // thing we came for. Skipping the write would leave the reprojected value standing, and the
     // reprojected value is right for exactly the pixels this pass is not for.
     Write2D(gObjVelOut, px, mv);
+
+    // ═══ MB-1e: STAMP THE ARM'S DEPTH ═══════════════════════════════════════════════════════════
+    // FIRST-PERSON INSTANCE ONLY (opts.y). gObjVelDepthOut is pLinearDepth — raw reverse-Z DEVICE
+    // depth, where BIGGER MEANS CLOSER — which MB-2's gather reads as gMbDepth and which has no
+    // arms in it, so over an arm pixel its soft-depth weight compares the wall behind the arm and
+    // goes inert. 1.0 is the near plane: unconditionally true here, because the FP pass draws after
+    // a depth CLEAR and the arms are therefore in front of everything by construction. Not the
+    // arm's own projected depth — see the SRT note; the arm camera's near/far is not the world's
+    // and the two orderings invert when a world surface comes very close.
+    //
+    // ⚠ THE WORLD INSTANCE MUST NEVER TAKE THIS BRANCH. It would replace every mover's device depth
+    // with the near plane, which water, the APL sky discriminator and next frame's reprojection all
+    // read. The flag is a cbuffer value, so the branch is uniform across the draw and the untaken
+    // side costs nothing.
+    //
+    // ⚠ SAFE BECAUSE OF EARLY_FRAGMENT_TESTS, exactly as the velocity write above is: an occluded
+    // arm fragment never runs, so only the arm pixel actually in front writes here.
+    if (gObjVelParams.opts.y > 0.5f)
+    {
+        Write2D(gObjVelDepthOut, px, 1.0f);
+    }
+
     // Survived the depth test and wrote. See gObjVelFrags in the SRT for what this is for.
     uint prevCount;
     AtomicAdd(gObjVelFrags[0], 1u, prevCount);

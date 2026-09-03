@@ -181,6 +181,13 @@ namespace ForgeRender {
         const void*  alphaBlob = nullptr;
         unsigned     alphaCount = 0;
         unsigned     alphaBytes = 0;
+        // FP1e: multi-map FP parts (a glass weapon's glow map, a detail-mapped gauntlet) —
+        // IPC::MultiMapDrawWire[], the world multi-map list's exact wire format, drawn opaque in
+        // the FP pass with its own GEQUAL + depth-write PSO pair and its OWN world/instance
+        // windows (the world MM fill is a destructive memcpy earlier in the same command list).
+        const void*  mmBlob = nullptr;
+        unsigned     mmCount = 0;
+        unsigned     mmBytes = 0;
     };
 
     bool renderScene(const float* viewProj, const float* lighting, const void* drawBlob,

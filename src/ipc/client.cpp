@@ -608,7 +608,10 @@ namespace IPC {
 			params.fpAlphaList = fp->alphaList;
 			params.fpAlphaCount = fp->alphaCount;
 			params.fpAlphaBytes = fp->alphaBytes;
-			params.fpEnabled = (fp->drawCount + fp->skinnedCount + fp->alphaCount) > 0 ? 1u : 0u;
+			params.fpMMList = fp->mmList;
+			params.fpMMCount = fp->mmCount;
+			params.fpMMBytes = fp->mmBytes;
+			params.fpEnabled = (fp->drawCount + fp->skinnedCount + fp->alphaCount + fp->mmCount) > 0 ? 1u : 0u;
 		} else {
 			std::memset(params.fpViewProj, 0, 16 * sizeof(float));
 			params.fpDrawList = InvalidVector;
@@ -617,6 +620,8 @@ namespace IPC {
 			params.fpSkinnedCount = params.fpSkinnedBytes = 0;
 			params.fpAlphaList = InvalidVector;
 			params.fpAlphaCount = params.fpAlphaBytes = 0;
+			params.fpMMList = InvalidVector;
+			params.fpMMCount = params.fpMMBytes = 0;
 			params.fpEnabled = 0;
 		}
 		const DevInput di = devInput ? *devInput : DevInput{};

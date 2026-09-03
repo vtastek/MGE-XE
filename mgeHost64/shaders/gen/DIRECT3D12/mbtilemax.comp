@@ -988,13 +988,13 @@ STRUCT(MotionBlurParams)
     float4 rects;
 #line 109 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/motionblur.srt.h"
     float4 tile;
-#line 124 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/motionblur.srt.h"
+#line 131 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/motionblur.srt.h"
     float4 blur;
 
 
 
     float4 opts;
-#line 129
+#line 136
 };
 
         CBUFFER(MotionBlurParams) gMbParams :  register(b0,space0);
@@ -1029,7 +1029,7 @@ STRUCT(MotionBlurParams)
 
 
         WTex2D(float4) gMbOut :  register(u6,space0);
-#line 188 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/motionblur.srt.h"
+#line 195 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/motionblur.srt.h"
         RWBuffer(uint) gMbStats :  register(u7,space0);
 #line 20 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/mbtilemax.comp.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/mbcommon.h.fsl"

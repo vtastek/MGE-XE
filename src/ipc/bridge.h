@@ -326,6 +326,9 @@ namespace IPC {
         VecId alphaList = InvalidVector;      // FP1c
         std::uint32_t alphaCount = 0;
         std::uint32_t alphaBytes = 0;
+        VecId mmList = InvalidVector;         // FP1e: MultiMapDrawWire[] (glow/dark/detail arms)
+        std::uint32_t mmCount = 0;
+        std::uint32_t mmBytes = 0;
     };
 
     struct RenderFrameParameters {
@@ -591,6 +594,22 @@ namespace IPC {
         // LAYOUT across x86/x64, so mgecore.dll and mgeHost64.exe must be rebuilt and deployed
         // together.
         IN WeatherWire weather;
+
+        // FP1e: multi-map FP parts — MultiMapDrawWire[], the world multi-map list's exact wire
+        // format, drawn by the host FP pass with its own GEQUAL + depth-WRITE PSO pair (the world
+        // MM colour PSO tests CMP_EQUAL against an MM Z-prepass the FP pass does not run, so it
+        // would fail at every pixel there). A glass weapon carries a glow map with no enchantment
+        // involved, and these parts used to be dropped client-side — which cost the weapon its
+        // PIXELS, not merely its blur, because MW's own arm root is force-culled by
+        // wantsFPSuppression. 0 ⇒ no multi-map FP parts this frame.
+        //
+        // Appended at the very end of the IN block so every existing offset is unchanged — the same
+        // rule actorRipples, devDumpHdr, playerCrush and weather above followed. ⚠ The struct is
+        // shared BY LAYOUT across x86/x64, so mgecore.dll and mgeHost64.exe must be rebuilt and
+        // deployed together.
+        IN VecId fpMMList;
+        IN std::uint32_t fpMMCount;
+        IN std::uint32_t fpMMBytes;
 
         OUT std::uint32_t bytesWritten;
         OUT double renderMs;             // host-side render+readback time

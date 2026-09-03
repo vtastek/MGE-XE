@@ -995,8 +995,13 @@ STRUCT(ObjVelParams)
 
 
 
+
+
+
+
+
     float4 opts;
-#line 54
+#line 59
 };
 
 STRUCT(ObjVelBatch)
@@ -1012,9 +1017,9 @@ STRUCT(ObjVelBatch)
 
 
     float4x4 prevWorlds[ 256 ];
-#line 69
+#line 74
 };
-#line 94 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/objvelocity.srt.h"
+#line 99 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/objvelocity.srt.h"
 STRUCT(ObjVelBones)
 {
 
@@ -1023,7 +1028,7 @@ STRUCT(ObjVelBones)
 
 
     float4x4 bones[ 1024 ];
-#line 102
+#line 107
 };
 
         CBUFFER(ObjVelParams) gObjVelParams :  register(b0,space3);
@@ -1049,8 +1054,10 @@ STRUCT(ObjVelBones)
 
 
         CBUFFER(ObjVelBones) gObjVelBonesCur :  register(b4,space3);
-#line 145 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/objvelocity.srt.h"
+#line 150 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/objvelocity.srt.h"
         CBUFFER(ObjVelBones) gObjVelBonesPrev :  register(b5,space3);
+#line 172 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/objvelocity.srt.h"
+        WTex2D(float) gObjVelDepthOut :  register(u6,space3);
 #line 11 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/objvelocity.vert.fsl"
 
 STRUCT(VSInput)

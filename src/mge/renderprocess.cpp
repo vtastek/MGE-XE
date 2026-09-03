@@ -464,6 +464,7 @@ namespace {
     std::optional<IPC::VecView<IPC::GeomChunk>> g_fpDrawVec;        // persistent per-frame FP rigid draw-list vec (FP1a)
     std::optional<IPC::VecView<IPC::GeomChunk>> g_fpSkinnedVec;     // persistent per-frame FP skinned draw-list vec (FP1a)
     std::optional<IPC::VecView<IPC::GeomChunk>> g_fpAlphaVec;       // persistent per-frame FP alpha draw-list vec (FP1c)
+    std::optional<IPC::VecView<IPC::GeomChunk>> g_fpMultiMapVec;    // persistent per-frame FP multi-map draw-list vec (FP1e)
     std::vector<std::uint8_t>                 g_pendingBlob;        // packed parts awaiting flush
     std::uint32_t                             g_pendingParts = 0;
     // Cache key -> host slot, plus per-key cached bindless texture slots so the
@@ -509,6 +510,7 @@ namespace {
     std::vector<std::uint8_t>                 g_fpDrawScratch;      // packed FP rigid DrawItemWire[] this frame (FP1a)
     std::vector<std::uint8_t>                 g_fpSkinnedScratch;   // packed FP [SkinnedDrawWire][palette]* this frame (FP1a)
     std::vector<std::uint8_t>                 g_fpAlphaScratch;     // packed FP AlphaDrawWire[] this frame (FP1c, back-to-front)
+    std::vector<std::uint8_t>                 g_fpMultiMapScratch;  // packed FP MultiMapDrawWire[] this frame (FP1e)
     std::vector<std::uint8_t>                 g_multiMapScratch;    // packed MultiMapDrawWire[] this frame (Tier 4)
     std::vector<std::uint8_t>                 g_lightScratch;       // packed PointLightWire[] this frame
 
@@ -627,7 +629,8 @@ namespace {
         std::uint32_t drawCount = 0, skinnedCount = 0, multiMapCount = 0,
                       lightCount = 0, skyCount = 0, alphaCount = 0;
         IPC::FPFrame fpFrame;                 // shipped VERBATIM at fire — self-consistent
-        std::uint32_t fpDraws = 0, fpSkinnedDraws = 0, fpAlphaDraws = 0;   // (pose N, arm-cam N) bundle
+        std::uint32_t fpDraws = 0, fpSkinnedDraws = 0, fpAlphaDraws = 0,
+                      fpMMDraws = 0;                    // (pose N, arm-cam N) bundle
         bool fpHave = false;
         std::uint32_t capturedEmitted = 0;    // AT3 captured count at build (g_capturedEmitted snapshot)
         double tBuildEnd = 0.0, buildMs = 0.0;   // telemetry (parkAge at fire)
@@ -1635,6 +1638,15 @@ namespace {
         } else {
             g_fpAlphaVec.emplace(std::move(*fav));
         }
+        // FP1e: multi-map FP parts (a glass weapon's glow map, an enchanted gauntlet's detail map)
+        // ride their own tiny MultiMapDrawWire[] vec — the same wire format as the world multi-map
+        // list, drawn by the host FP pass with its own GEQUAL+write PSO pair.
+        auto fmv = g_client->allocVecBlocking<IPC::GeomChunk>(1, 1, 1);
+        if (!fmv) {
+            LOG::logline("!! [seam] FP multi-map draw-list vec alloc failed — FP multi-map (FP1e) disabled");
+        } else {
+            g_fpMultiMapVec.emplace(std::move(*fmv));
+        }
 
         // AT3 captured-alpha geometry vec: one 1-chunk (1MB) vec carrying [captured verts][captured
         // indices] — 20000 verts (720KB) + 60000 uint16 (120KB) = 840KB fits one chunk (see
@@ -2460,8 +2472,12 @@ namespace {
     // ascending — MW assigns the D3D stage index = texCoordSet, not the map slot).
     // Stage textures resolve through resolveTextureSlot directly (multi-map items
     // are rare — a handful per frame — not worth SlotInfo fields for 4 maps).
+    // FP1e: `dst` defaults to the main-pass scratch; buildFPFrame redirects the identical
+    // packing into the FP multi-map scratch (same wire format, drawn by the host FP pass) —
+    // the same redirection emitStaticDraw/emitSkinnedDraw/emitAlphaDraw already take.
     void emitMultiMapDraw(SlotInfo& si, const MGE::GeometryCache::CachedGeometry& e,
-                          std::uint32_t& count, bool blended = false) {
+                          std::uint32_t& count, std::vector<std::uint8_t>& dst = g_multiMapScratch,
+                          bool blended = false) {
             // Build the ordered stage list, replicating buildCacheStages. A present map is usable
             // only if the wide VB carries the UV set it samples (uv < uvSetCount) — cacheMapActive.
             // Base is pushed unconditionally (e.d3dTexture); the others gated by cacheMapActive.
@@ -2506,10 +2522,14 @@ namespace {
                 diagTexSlot(s == 0 ? "MM0" : "MMn", st[s].name, tex, true, e.enchantGlow);
                 item.stages[s] = IPC::packMMStage(tex, st[s].uv, st[s].op, st[s].clamp);
             }
-            const std::size_t at = g_multiMapScratch.size();
-            g_multiMapScratch.resize(at + sizeof(item));
-            memcpy(g_multiMapScratch.data() + at, &item, sizeof(item));
-            if (isPlayerOwned(e)) {
+            const std::size_t at = dst.size();
+            dst.resize(at + sizeof(item));
+            memcpy(dst.data() + at, &item, sizeof(item));
+            // Scratch id 2 IS g_multiMapScratch (see the park-lag patch loop), so an offset
+            // recorded from another scratch would patch a stranger's matrix — guard the push the
+            // way emitStaticDraw/emitAlphaDraw do. The arms are camera-welded anyway: the FP
+            // payload ships with the ARM camera and needs no player park-lag correction.
+            if (isPlayerOwned(e) && &dst == &g_multiMapScratch) {
                 g_playerPatch.push_back({ 2, (std::uint32_t)(at + offsetof(IPC::MultiMapDrawWire, world)
                                                                 + 12 * sizeof(float)), 1 });
             }
@@ -2836,7 +2856,7 @@ namespace {
                     const float wz = cx * w[2] + cy * w[6] + cz * w[10] + w[14] - DistantLand::eyePos.z;
                     alphaCands.push_back({ wx * fwdX + wy * fwdY + wz * fwdZ, &slot, &e, nullptr });
                 } else if (wantMM && multiMap) {
-                    emitMultiMapDraw(slot, e, multiMapCount, /*blended=*/true);
+                    emitMultiMapDraw(slot, e, multiMapCount, g_multiMapScratch, /*blended=*/true);
                 } else {
                     return;   // feature off — leave MW's DIP (AT3 white) as the fallback, no dedup
                 }
@@ -3935,14 +3955,16 @@ namespace {
     // projection — its FOV/near/far differ from the world camera's). Returns true
     // when the FP pass has something to ship this frame.
     bool buildFPFrame(IPC::FPFrame& fp, std::uint32_t& fpDraws, std::uint32_t& fpSkinned,
-                      std::uint32_t& fpAlpha) {
+                      std::uint32_t& fpAlpha, std::uint32_t& fpMM) {
         MGE_ZoneScopedN("build:fp");
         fpDraws = 0;
         fpSkinned = 0;
         fpAlpha = 0;
+        fpMM = 0;
         g_fpDrawScratch.clear();
         g_fpSkinnedScratch.clear();
         g_fpAlphaScratch.clear();
+        g_fpMultiMapScratch.clear();
         if (!RenderProcess::wantsFPCapture() || !g_fpDrawVec || !g_fpSkinnedVec) {
             return false;
         }
@@ -4015,18 +4037,48 @@ namespace {
         // i.e. across the room), whereas a number in the heartbeat cannot. Arms-on-the-arm reads
         // as a few tens of units; anything larger is the artifact, in units, every frame.
         float fpMaxDist2 = 0.0f;
+        // Of the multi-map parts shipped, how many are Route C (blended). Its own number because
+        // "the blade draws" and "the hilt draws" are different questions — see the walk below.
+        std::uint32_t fpMMBlend = 0;
         for (std::uint32_t fkey : fpSet) {
             auto cit = cacheMap.find(fkey);
             if (cit == cacheMap.end()) continue;   // set ⊆ cache invariant; guard anyway
             const auto& e = cit->second;
             if (!e.isFP) continue;
             if (e.lastFrame != cacheFrame) { ++skip.stale; continue; }
-            // Multi-map FP parts would need the wide-VB multimap pipeline in the FP pass;
-            // none expected on arms — skip rather than bind the wrong vertex layout.
-            if (e.d3dDark || e.d3dDetail || e.d3dGlow) { ++skip.multimap; continue; }
             auto ks = g_keySlot.find(fkey);
             if (ks == g_keySlot.end()) { ++skip.noslot; continue; }   // not uploaded yet (first sight)
-            if (e.blendEnable && !e.isSkinned) {
+            // FP1e: multi-map FP parts (dark/detail/glow siblings) ride their OWN list and the
+            // host's FP multi-map PSO pair. Classified exactly as buildGeometryDrawLists' dispatch
+            // classifies them, and the ORDER of the three tests below IS that dispatch's order: a
+            // SKINNED part takes the skinned path whatever sibling maps it carries (the cache walk
+            // uploads it as a skinned mesh, never as a wide-VB multi-map one, so the host would
+            // reject it), and a TEXTURELESS part has no base stage to composite.
+            //
+            // ⚠ THIS GATE USED TO DROP EVERY ONE OF THEM — "none expected on arms". A glass weapon
+            // carries a glow map with no enchantment involved, so the assumption was simply wrong,
+            // and the cost was not a missing effect but MISSING PIXELS: wantsFPSuppression culls
+            // MW's whole arm root, so a part the FP pass declines is a part NOBODY draws. Same
+            // shape as MB-1c, one population along. [[feedback_confirm_population_reaches_the_filter]]
+            const bool isMM = !e.isSkinned && e.d3dTexture
+                            && (e.d3dDark || e.d3dDetail || e.d3dGlow);
+            // ⚠ AND THE **BLENDED** ONES RIDE THE SAME LIST, TAGGED. The first FP1e build dropped
+            // them ("nothing on the arms is expected here") and the very next look in game came back
+            // as *"weapon is partial, only hilt is rendering"* — because a glass dagger's BLADE is a
+            // blended multi-map part (`[fp-set] key=37E7C8E0 rigid blend tex=tx_w_crystal_blade_.tga`)
+            // while its hilt and fittings are opaque ones. Two drops in a row from the same habit of
+            // predicting what an arm carries; the counter is what named it in one line both times.
+            //
+            // Route C's own list, exactly as the world does it: same scratch, same wire, the
+            // kMMDrawFlagBlended bit in drawFlags, and the HOST splits on that flag into an opaque
+            // record list and an alpha-stage one. So this costs no second vec and no wire field.
+            // Emitted INLINE and unsorted, which is also what the world dispatch does — with more
+            // than one blended MM part on a weapon their relative order would be arbitrary, and
+            // that is a limitation shared with the world path rather than a new one.
+            if (isMM) {
+                emitMultiMapDraw(ks->second, e, fpMM, g_fpMultiMapScratch, e.blendEnable);
+                if (e.blendEnable) { ++fpMMBlend; }
+            } else if (e.blendEnable && !e.isSkinned) {
                 if (!e.d3dTexture) { ++skip.blendless; continue; }   // no base to composite
                 // Depth key: bound-center view depth against the ARM camera (pos/dir from
                 // getRenderCameraState above) — MW's sorter criterion, FP camera's frame.
@@ -4038,8 +4090,7 @@ namespace {
                 s_fpAlphaCands.push_back({ wx * dir[0] + wy * dir[1] + wz * dir[2],
                                            &ks->second, &e });
                 continue;
-            }
-            if (e.isSkinned) {
+            } else if (e.isSkinned) {
                 // Skinned blends stay dropped (as in FP1a) — the skinned pipeline has no
                 // blend state, so drawing them opaquely would be wrong, not better.
                 if (e.blendEnable) { ++skip.blendSkin; continue; }
@@ -4175,19 +4226,23 @@ namespace {
         // and "rotate until the arm drops, then read the last line" is the whole diagnostic.
         // Timed lines still come through so a steady state is confirmable.
         static unsigned s_hb = 0;
-        static std::uint32_t s_lastD = 0xFFFFFFFFu, s_lastS = 0, s_lastA = 0;
+        static std::uint32_t s_lastD = 0xFFFFFFFFu, s_lastS = 0, s_lastA = 0, s_lastM = 0;
         // maxDist joins the change test: the counts were constant all along while parts moved, so
         // composition alone could never have caught this. A 32-unit bucket keeps it from chattering.
         static std::uint32_t s_lastBucket = 0xFFFFFFFFu;
         const std::uint32_t distBucket = (std::uint32_t)(sqrtf(fpMaxDist2) / 32.0f);
         const bool composeChanged = (fpDraws != s_lastD || fpSkinned != s_lastS || fpAlpha != s_lastA
-                                     || distBucket != s_lastBucket);
+                                     || fpMM != s_lastM || distBucket != s_lastBucket);
         s_lastBucket = distBucket;
         if (composeChanged || s_hb % 300 == 0) {
-            LOG::logline(">> [fp] draws=%u skinned=%u alpha=%u | skips stale=%u mm=%u noslot=%u "
+            // mmDrawn is the FP1e lane and `blend=` its Route C half; mm= stays the SKIP counter it
+            // always was, so the fix reads as `mm=0 mmDrawn=5(blend=1)` rather than as a number that
+            // merely moved. mm= should now be 0 in every scene — a multi-map FP part has a lane
+            // whatever it is, so a nonzero value there means a NEW cause, not this one.
+            LOG::logline(">> [fp] draws=%u skinned=%u alpha=%u mmDrawn=%u(blend=%u) | skips stale=%u mm=%u noslot=%u "
                          "blendless=%u blendskin=%u proxy=%u palette=%u | set=%u maxDist=%.0f | "
                          "cam fov=%.1f near=%.1f far=%.1f vp=%.0fx%.0f",
-                         fpDraws, fpSkinned, fpAlpha,
+                         fpDraws, fpSkinned, fpAlpha, fpMM, fpMMBlend,
                          skip.stale, skip.multimap, skip.noslot, skip.blendless,
                          skip.blendSkin, skip.proxy, skip.palette, (unsigned)fpSet.size(),
                          sqrtf(fpMaxDist2),
@@ -4215,7 +4270,7 @@ namespace {
             }
         }
         ++s_hb;
-        s_lastD = fpDraws; s_lastS = fpSkinned; s_lastA = fpAlpha;
+        s_lastD = fpDraws; s_lastS = fpSkinned; s_lastA = fpAlpha; s_lastM = fpMM;
 
         // Continuous arm-camera validation: diff the latched native-arm-scene matrices
         // (see noteFPZClear/noteFPSceneTransform) against what we built. The latch is
@@ -4916,7 +4971,8 @@ namespace RenderProcess {
                             std::uint32_t multiMapCount, std::uint32_t lightCount,
                             std::uint32_t skyCount, std::uint32_t alphaCount,
                             IPC::FPFrame& fpFrame, std::uint32_t fpDraws,
-                            std::uint32_t fpSkinnedDraws, std::uint32_t fpAlphaDraws, bool fpHave,
+                            std::uint32_t fpSkinnedDraws, std::uint32_t fpAlphaDraws,
+                            std::uint32_t fpMMDraws, bool fpHave,
                             const float bakeEye[3], bool parkFired,
                             double dtPresent, double tStart, double tBuild);   // fwd (defined below)
 
@@ -4975,7 +5031,7 @@ namespace RenderProcess {
         // Phase 2 makes this GPU-resident so it goes to 0).
         std::uint32_t drawCount, skinnedCount, multiMapCount, lightCount, skyCount, alphaCount;
         IPC::FPFrame fpFrame;
-        std::uint32_t fpDraws = 0, fpSkinnedDraws = 0, fpAlphaDraws = 0;
+        std::uint32_t fpDraws = 0, fpSkinnedDraws = 0, fpAlphaDraws = 0, fpMMDraws = 0;
         bool fpHave = false;
         {
             MGE_ZoneScopedN("Forge build draw lists");
@@ -4988,7 +5044,7 @@ namespace RenderProcess {
             // FP1a: before the geom flush below so first-sight arm meshes (captured by
             // this frame's FP walk) ship in the same flush the pass draws from.
             markWorkerPhase(WK_BUILD_FP);
-            fpHave = buildFPFrame(fpFrame, fpDraws, fpSkinnedDraws, fpAlphaDraws);
+            fpHave = buildFPFrame(fpFrame, fpDraws, fpSkinnedDraws, fpAlphaDraws, fpMMDraws);
         }
         const double tBuild = nowMs();
 
@@ -4999,7 +5055,7 @@ namespace RenderProcess {
         const float bakeEye[3] = { DistantLand::eyePos.x, DistantLand::eyePos.y, DistantLand::eyePos.z };
         flushAssignAndKick(device, frame, drawCount, skinnedCount, multiMapCount, lightCount,
                            skyCount, alphaCount, fpFrame, fpDraws, fpSkinnedDraws, fpAlphaDraws,
-                           fpHave, bakeEye, /*parkFired=*/false, dtPresent, tStart, tBuild);
+                           fpMMDraws, fpHave, bakeEye, /*parkFired=*/false, dtPresent, tStart, tBuild);
     }
 
     // The shared-memory half of the produce: gate → flushGeometry → flushTextures → vec
@@ -5015,7 +5071,8 @@ namespace RenderProcess {
                             std::uint32_t multiMapCount, std::uint32_t lightCount,
                             std::uint32_t skyCount, std::uint32_t alphaCount,
                             IPC::FPFrame& fpFrame, std::uint32_t fpDraws,
-                            std::uint32_t fpSkinnedDraws, std::uint32_t fpAlphaDraws, bool fpHave,
+                            std::uint32_t fpSkinnedDraws, std::uint32_t fpAlphaDraws,
+                            std::uint32_t fpMMDraws, bool fpHave,
                             const float bakeEye[3], bool parkFired,
                             double dtPresent, double tStart, double tBuild) {
         // Drive the host renderer into the shared RT. Async — the host fence-waits before
@@ -5224,6 +5281,13 @@ namespace RenderProcess {
                 fpFrame.alphaCount = fpAlphaDraws;
                 fpFrame.alphaBytes = (std::uint32_t)g_fpAlphaScratch.size();
             }
+            // FP1e: the multi-map FP parts (glow/dark/detail siblings on a held weapon).
+            if (fpMMDraws > 0 && g_fpMultiMapVec
+                && g_fpMultiMapVec->assign_bytes(g_fpMultiMapScratch.data(), (std::uint32_t)g_fpMultiMapScratch.size())) {
+                fpFrame.mmList  = g_fpMultiMapVec->id();
+                fpFrame.mmCount = fpMMDraws;
+                fpFrame.mmBytes = (std::uint32_t)g_fpMultiMapScratch.size();
+            }
         }
 
         // AT3 captured-alpha: ship the geometry buildGeometryDrawLists left in the scratch
@@ -5274,7 +5338,8 @@ namespace RenderProcess {
         // MW presents is a frame with no arms in it, while the composite stops advancing. That is
         // the reported freeze — the world stops, the arms vanish, and MW goes on animating a
         // first-person skeleton nobody draws. A frame holding nothing but arms is a real frame.
-        const bool haveFP = fpHave && (fpDraws > 0 || fpSkinnedDraws > 0 || fpAlphaDraws > 0);
+        const bool haveFP = fpHave && (fpDraws > 0 || fpSkinnedDraws > 0 || fpAlphaDraws > 0
+                                       || fpMMDraws > 0);
         if (!haveDraw && skinnedId == IPC::InvalidVector && multiMapId == IPC::InvalidVector
             && skyId == IPC::InvalidVector && alphaId == IPC::InvalidVector && !haveFP) {
             // Silent until now, which is why an empty-payload skip and a genuinely stalled produce
@@ -5284,7 +5349,7 @@ namespace RenderProcess {
             if (g_seamSkipRun == 1 || (g_seamSkipRun % 60) == 0) {
                 LOG::logline(">> [seam] skip %u: no payload (draw=%u skin=%u mm=%u sky=%u alpha=%u fp=%u)",
                              g_seamSkipRun, drawCount, skinnedCount, multiMapCount, skyCount,
-                             alphaCount, fpDraws + fpSkinnedDraws + fpAlphaDraws);
+                             alphaCount, fpDraws + fpSkinnedDraws + fpAlphaDraws + fpMMDraws);
             }
             return;
         }
@@ -6108,7 +6173,7 @@ namespace RenderProcess {
         const double t0 = nowMs();
         std::uint32_t drawCount, skinnedCount, multiMapCount, lightCount, skyCount, alphaCount;
         IPC::FPFrame fpFrame;
-        std::uint32_t fpDraws = 0, fpSkinnedDraws = 0, fpAlphaDraws = 0;
+        std::uint32_t fpDraws = 0, fpSkinnedDraws = 0, fpAlphaDraws = 0, fpMMDraws = 0;
         bool fpHave = false;
         {
             MGE_ZoneScopedN("Forge build draw lists");
@@ -6119,7 +6184,7 @@ namespace RenderProcess {
             markWorkerPhase(WK_BUILD_SKY);
             skyCount = buildSkyDrawList();
             markWorkerPhase(WK_BUILD_FP);
-            fpHave = buildFPFrame(fpFrame, fpDraws, fpSkinnedDraws, fpAlphaDraws);
+            fpHave = buildFPFrame(fpFrame, fpDraws, fpSkinnedDraws, fpAlphaDraws, fpMMDraws);
         }
         g_park.epoch           = g_cellEpoch;
         g_park.bake3rd         = MWBridge::get()->is3rdPerson();
@@ -6136,6 +6201,7 @@ namespace RenderProcess {
         g_park.fpDraws         = fpDraws;
         g_park.fpSkinnedDraws  = fpSkinnedDraws;
         g_park.fpAlphaDraws    = fpAlphaDraws;
+        g_park.fpMMDraws       = fpMMDraws;
         g_park.fpHave          = fpHave;
         g_park.capturedEmitted = g_capturedEmitted;
         g_park.tBuildEnd       = nowMs();
@@ -6431,7 +6497,8 @@ namespace RenderProcess {
         flushAssignAndKick(device, frame, g_park.drawCount, g_park.skinnedCount,
                            g_park.multiMapCount, g_park.lightCount, g_park.skyCount,
                            g_park.alphaCount, g_park.fpFrame, g_park.fpDraws,
-                           g_park.fpSkinnedDraws, g_park.fpAlphaDraws, g_park.fpHave,
+                           g_park.fpSkinnedDraws, g_park.fpAlphaDraws, g_park.fpMMDraws,
+                           g_park.fpHave,
                            g_park.bakeEye, /*parkFired=*/true, dtPresent, tStart, tStart);
         g_park.valid = false;   // consumed (fired, or skipped as empty — rebuilt this frame either way)
         // [park] telemetry from the stamps flushAssignAndKick just wrote (0 on an empty-payload
@@ -7164,6 +7231,7 @@ namespace RenderProcess {
         g_fpDrawVec.reset();
         g_fpSkinnedVec.reset();
         g_fpAlphaVec.reset();
+        g_fpMultiMapVec.reset();
         g_texVec.reset();
         g_pendingBlob.clear();
         g_pendingBlob.shrink_to_fit();
@@ -7185,6 +7253,8 @@ namespace RenderProcess {
         g_fpSkinnedScratch.shrink_to_fit();
         g_fpAlphaScratch.clear();
         g_fpAlphaScratch.shrink_to_fit();
+        g_fpMultiMapScratch.clear();
+        g_fpMultiMapScratch.shrink_to_fit();
         g_texPendingBlob.clear();
         g_texPendingBlob.shrink_to_fit();
         g_pendingParts = 0;

@@ -2030,6 +2030,31 @@ namespace {
         // the rigid lane's identity stream, where instance k is also batch index k.
         Buffer*        pObjVelSkinInstanceBuf = nullptr;
         bool           objVelSkinReady = false;
+        // ═══ MB-1d: THE FIRST-PERSON LANE ═══════════════════════════════════════════════════════
+        // A SECOND INSTANCE of the SAME PerDraw set, with its own params + batch + bone cbuffers,
+        // and nothing else new: no shader, no PSO, no SRT change. objvelocity.vert already computes
+        // exactly what FP needs — feed it the ARM camera pair and the ARM poses and it produces arm
+        // velocity — and FP multimap parts are dropped both client- and host-side, so the two
+        // strides the existing PSOs carry (GeomVertexWire 36, SkinnedVertexWire 52) are the two
+        // strides FP has.
+        //
+        // ⚠⚠ THE SECOND INSTANCE IS REQUIRED, NOT TIDINESS. The world objvel pass consumed
+        // pObjVelParamsCbv / pObjVelBatchCbv / the bone windows EARLIER IN THE SAME COMMAND LIST,
+        // and every one of those fills is a CPU-side memcpy into persistently-mapped upload memory.
+        // Refilling them here for the FP draws would rewrite the bytes the world draws — already
+        // recorded, not yet executed — are going to read at submit time. The world movers would
+        // silently take the arms' matrices. One SRT, more instances: pMbSet (4) and pResolveSet (3)
+        // are the same arrangement for the same reason.
+        //
+        // ⚠ pObjVelInstanceBuf IS SHARED, and that is safe for the opposite reason: it is the
+        // static identity stream (oinst[k] = k), written once at build time and never touched at
+        // record time. FP records use the same dense 0..N-1 indices, so it binds verbatim.
+        Buffer*        pObjVelParamsCbvFP = nullptr;      // gObjVelParams  (ARM viewProj + its prevRel)
+        Buffer*        pObjVelBatchCbvFP = nullptr;       // gObjVelBatch   (FP worlds + prevWorlds)
+        Buffer*        pObjVelBonesCurCbvFP = nullptr;    // gObjVelBonesCur  (FP palettes, this frame)
+        Buffer*        pObjVelBonesPrevCbvFP = nullptr;   // gObjVelBonesPrev (FP palettes, rebased)
+        Buffer*        pObjVelSkinInstanceBufFP = nullptr;
+        bool           objVelFPReady = false;
         // MB-1: statistics of the FINISHED field, measured after the overwrite. 6 uints; reset by
         // a copy from a tiny upload buffer and read back one frame late, exactly like pMvStats.
         Shader*        pMvFsShader = nullptr;
@@ -2664,6 +2689,15 @@ namespace {
         Pipeline*      pFPOpaquePipelineMirror = nullptr;  // … FRONT_FACE_CW
         Pipeline*      pFPSkinnedPipeline = nullptr;       // skinned colour, GEQUAL + WRITE, CCW
         Pipeline*      pFPSkinnedPipelineMirror = nullptr; // … FRONT_FACE_CW
+        // FP1e multi-map arms (a glass weapon's glow map). OWN world + instance windows, for
+        // MB-1d's reason: the world MM fill is a destructive CPU memcpy into mapped memory
+        // EARLIER IN THE SAME COMMAND LIST, so sharing pMMWorldsBuf/pInstanceBufMM would have this
+        // fill overwrite matrices the world MM draws were already recorded against.
+        Buffer*        pFPMMWorldsBuf = nullptr;            // gBatch: one 64KB world window (FP multi-map)
+        DescriptorSet* pPerBatchSetFPMM = nullptr;          // gBatch bound to pFPMMWorldsBuf, 1 instance
+        Buffer*        pFPInstanceBufMM = nullptr;          // FP multi-map per-draw instance VB (kMMInstU32)
+        Pipeline*      pFPMultiMapPipeline = nullptr;       // multi-map colour, GEQUAL + WRITE, CCW
+        Pipeline*      pFPMultiMapPipelineMirror = nullptr; // … FRONT_FACE_CW
 
         // --- AT1: sorted-alpha pass (alpha-blended world shapes, after water) ---------
         // The scene-1 blended set (banners/tapestries/foliage/glass) MW used to draw over the
@@ -3179,6 +3213,13 @@ namespace {
     // pose from the static field around it by a constant. The pairing key (prevBoneFrame ==
     // g_renderFrame - 1) is what guarantees the buffer being read belongs to that eye.
     float g_objVelBoneRet[2][kObjVelBones * 16] = {};
+    // MB-1d: the SAME retention, for the FIRST-PERSON skinned lane. A separate array rather than a
+    // shared one with a reserved range, because the two walks pack off two independent cursors that
+    // both start at 0 — sharing would have the FP walk overwrite the world walk's history at the
+    // very offsets it is about to read. (HostMesh::prevBoneBase is the per-slot index INTO one of
+    // these; FP slots and world slots are disjoint — they come from different cache keys — so the
+    // one field serves both without a second copy.)
+    float g_fpObjVelBoneRet[2][kObjVelBones * 16] = {};
     // Bit 30 of the packed word = BLENDED (must match SKIN_BLEND_BIT in skinned.vert.fsl). Set it
     // ONLY where the draw will be consumed by alpha.frag / alphashadowdepth.frag: it makes
     // skinned.vert forward matAlpha through OverlayIndex, which opaque.frag would read as a
@@ -3294,6 +3335,17 @@ namespace {
            // with how much of the screen a MOVING object covers. Summed, a crowd walking into frame
            // would read as the reprojection getting slower, which is the one thing it cannot do.
            kGpuPhaseObjVel,
+           // MB-1d: the FIRST-PERSON object-velocity replay, recorded inside the FP pass after the
+           // arms are drawn — the only point in the frame where the depth buffer describes them.
+           //
+           // ⚠ ITS OWN ENTRY, and this is the third time that sentence is written in this enum
+           // because it is the third time the mistake was available: cmdBeginQuery writes a
+           // timestamp to slot `i`, so a SECOND begin/end pair on kGpuPhaseObjVel would simply
+           // overwrite the first and `objvel=` would report the FP lane alone while claiming to
+           // report both. It is also the honest split — the world lane's cost scales with how much
+           // screen a moving object covers, and this one is a fixed handful of arm parts a few
+           // units from the eye, i.e. a large pixel count that never varies.
+           kGpuPhaseObjVelFP,
            // MB-2: the MOTION BLUR filter — all three passes (tile max, neighbour max, gather) in
            // ONE bracket, because they are one feature with one on/off and no useful intermediate
            // reading; the dilation is ~2% of the cost by construction and splitting it would be
@@ -9131,8 +9183,28 @@ namespace {
                 addPipeline(R, &mmPd, &g_live.pMultiMapReflectPipeline);
                 mg.pRasterizerState = &mmRasterMirror;
                 addPipeline(R, &mmPd, &g_live.pMultiMapReflectPipelineMirror);
+                // FP1e: the FIRST-PERSON multi-map pair, which needs its own PSOs for exactly the
+                // reason the reflect pair does — the FP pass clears depth on bind and runs no MM
+                // Z-prepass, so the colour pair's CMP_EQUAL would fail at EVERY pixel and draw
+                // nothing at all. Same shader, same layout, same formats; only the depth state
+                // differs, which is how pFPOpaquePipeline relates to pOpaquePipeline. (Identical
+                // to the reflect pair as written today, and kept separate anyway: the reflect pass
+                // owns its own state, and a silent coupling would one day take the arms' weapon
+                // out with a reflection change.)
+                //
+                // ⚠ THE CCW BIND RESETS THE RASTERIZER FIRST. The reflect MIRROR addPipeline above
+                // leaves mmRasterMirror current, so a CCW pipeline created without this line would
+                // silently be a second CW one and the arms' weapon would cull its front faces.
+                mg.pRasterizerState = &mmRaster;
+                addPipeline(R, &mmPd, &g_live.pFPMultiMapPipeline);
+                mg.pRasterizerState = &mmRasterMirror;
+                addPipeline(R, &mmPd, &g_live.pFPMultiMapPipelineMirror);
                 mg.pRasterizerState = &mmRaster;    // restore for any later use of mmPd
                 mg.pDepthState = &mmDepth;
+                if (!g_live.pFPMultiMapPipeline || !g_live.pFPMultiMapPipelineMirror) {
+                    std::printf("[forge] addPipeline(multimap FP) FAILED\n");
+                    return false;
+                }
                 if (!g_live.pMultiMapReflectPipeline || !g_live.pMultiMapReflectPipelineMirror) {
                     std::printf("[forge] addPipeline(multimap reflect) FAILED\n");
                     return false;
@@ -11836,7 +11908,16 @@ namespace {
                     }
 
                     if (g_live.pObjVelPipeline && g_live.pObjVelPipelineMirror) {
-                        DescriptorSetDesc ovset = SRT_SET_DESC(ObjVelocitySrtData, PerDraw, 1, 0);
+                        // ⚠ **TWO** INSTANCES. [0] = the world lanes (rigid + multimap + skinned),
+                        // [1] = MB-1d's first-person lanes. Not two DescriptorSets: one set with two
+                        // instances, chosen at record time by cmdBindDescriptorSet's INDEX, which is
+                        // the arrangement pMbSet (4) and pResolveSet (3) already use — and the reason
+                        // is theirs too. The FP replay is recorded ~1800 lines after the world one in
+                        // the SAME command list, and every cbuffer fill here is a CPU memcpy into
+                        // persistently-mapped memory: refilling instance [0] for FP would rewrite the
+                        // bytes the already-recorded world draws read at submit. A mid-frame
+                        // updateDescriptorSet is a second author of one decision.
+                        DescriptorSetDesc ovset = SRT_SET_DESC(ObjVelocitySrtData, PerDraw, 2, 0);
                         addDescriptorSet(R, &ovset, &g_live.pObjVelSet);
 
                         BufferLoadDesc ovpb = {};
@@ -11892,6 +11973,34 @@ namespace {
                         ovsi.ppBuffer           = &g_live.pObjVelSkinInstanceBuf;
                         addResource(&ovsi, nullptr);
 
+                        // ═══ MB-1d: THE FIRST-PERSON MIRROR OF ALL FOUR ═══════════════════════
+                        // Same descriptors, same sizes, same names + "FP". The sizes are the
+                        // SHADER's, not the lane's: gObjVelBatch is declared OBJVEL_BATCH(256) wide
+                        // and gObjVelBonesCur/Prev OBJVEL_BONES(1024) deep, and a CBV must cover the
+                        // struct it is bound as however few of its slots the FP lane fills (8 rigid
+                        // + 6 skinned, measured). pObjVelFrags is NOT mirrored — one counter across
+                        // both lanes is the honest total, and it is reset and read back once.
+                        BufferLoadDesc ovpbF = ovpb;
+                        ovpbF.mDesc.pName = "objVelParamsFP";
+                        ovpbF.ppBuffer    = &g_live.pObjVelParamsCbvFP;
+                        addResource(&ovpbF, nullptr);
+
+                        BufferLoadDesc ovbbF = ovbb;
+                        ovbbF.mDesc.pName = "objVelBatchFP";
+                        ovbbF.ppBuffer    = &g_live.pObjVelBatchCbvFP;
+                        addResource(&ovbbF, nullptr);
+
+                        ovbn.mDesc.pName        = "objVelBonesCurFP";
+                        ovbn.ppBuffer           = &g_live.pObjVelBonesCurCbvFP;
+                        addResource(&ovbn, nullptr);
+                        ovbn.mDesc.pName        = "objVelBonesPrevFP";
+                        ovbn.ppBuffer           = &g_live.pObjVelBonesPrevCbvFP;
+                        addResource(&ovbn, nullptr);
+
+                        ovsi.mDesc.pName        = "objVelSkinInstanceVBFP";
+                        ovsi.ppBuffer           = &g_live.pObjVelSkinInstanceBufFP;
+                        addResource(&ovsi, nullptr);
+
                         BufferLoadDesc ovf = {};
                         ovf.mDesc.mDescriptors  = DESCRIPTOR_TYPE_RW_BUFFER;
                         ovf.mDesc.mMemoryUsage  = RESOURCE_MEMORY_USAGE_GPU_ONLY;
@@ -11940,7 +12049,7 @@ namespace {
                         for (uint32_t k = 0; k < kObjVelBatch; ++k) { oinst[k] = k; }
                         std::memset(g_live.pObjVelParamsCbv->pCpuMappedAddress, 0, 256);
 
-                        DescriptorData ovd[6] = {};
+                        DescriptorData ovd[7] = {};
                         ovd[0].mIndex = SRT_RES_IDX(ObjVelocitySrtData, PerDraw, gObjVelParams);
                         ovd[0].mCount = 1; ovd[0].ppBuffers = &g_live.pObjVelParamsCbv;
                         ovd[1].mIndex = SRT_RES_IDX(ObjVelocitySrtData, PerDraw, gObjVelBatch);
@@ -11954,26 +12063,79 @@ namespace {
                         // PerDraw table serves both pipelines and the skinned draws need no rebind
                         // beyond the pipeline switch.
                         uint32_t ovdN = 4;
+                        // ⚠ A FLAG, NOT `ovdN == 6`. gObjVelDepthOut is appended below and moves
+                        // ovdN, and DescriptorData's ppTextures/ppBuffers are a UNION — so testing
+                        // the slot's pointer or the final count to decide "were the bone windows
+                        // bound" would, with the bone windows absent, hand the FP instance's bone
+                        // pointer to the DEPTH slot. Ask the question that was actually asked.
+                        bool ovdHaveBones = false;
                         if (g_live.pObjVelBonesCurCbv && g_live.pObjVelBonesPrevCbv) {
                             ovd[4].mIndex = SRT_RES_IDX(ObjVelocitySrtData, PerDraw, gObjVelBonesCur);
                             ovd[4].mCount = 1; ovd[4].ppBuffers = &g_live.pObjVelBonesCurCbv;
                             ovd[5].mIndex = SRT_RES_IDX(ObjVelocitySrtData, PerDraw, gObjVelBonesPrev);
                             ovd[5].mCount = 1; ovd[5].ppBuffers = &g_live.pObjVelBonesPrevCbv;
                             ovdN = 6;
+                            ovdHaveBones = true;
+                        }
+                        // MB-1e: gObjVelDepthOut = pLinearDepth. Bound in BOTH instances because
+                        // every slot of a descriptor-set instance must be written — an unwritten
+                        // slot reads whatever the heap last held. Only the FP instance ever WRITES
+                        // it: the frag gates the store on opts.y, which is 0 here (op[37] at the
+                        // world fill) and 1 in the FP fill. That gate is the safety, not this
+                        // binding — the world lane stamping the near plane over every mover's
+                        // device depth is what it prevents.
+                        if (g_live.pLinearDepth) {
+                            ovd[ovdN].mIndex = SRT_RES_IDX(ObjVelocitySrtData, PerDraw, gObjVelDepthOut);
+                            ovd[ovdN].mCount = 1; ovd[ovdN].ppTextures = &g_live.pLinearDepth;
+                            ++ovdN;
                         }
                         updateDescriptorSet(R, 0, g_live.pObjVelSet, ovdN, ovd);
                         g_live.objVelReady = true;
-                        g_live.objVelSkinReady = (ovdN == 6)
+                        g_live.objVelSkinReady = ovdHaveBones
                                                && g_live.pObjVelSkinPipeline
                                                && g_live.pObjVelSkinPipelineMirror
                                                && g_live.pObjVelSkinInstanceBuf;
+
+                        // ═══ MB-1d: INSTANCE [1], THE FIRST-PERSON TABLE ══════════════════════
+                        // Four pointers apart from instance [0] — the params, the batch and the two
+                        // bone windows swap to the FP copies; gObjVelOut and gObjVelFrags stay the
+                        // same resources, because the whole point is that this lane writes the SAME
+                        // velocity texture and is counted in the SAME fragment total.
+                        //
+                        // ⚠ EVERY SLOT IS WRITTEN IN THIS INSTANCE TOO. A descriptor set instance
+                        // with an unwritten slot reads whatever the heap slot last held — pMbSet's
+                        // note is the long version — and the FP rigid pipeline never touching the
+                        // bone windows is exactly the kind of "it is never read" that stops being
+                        // true the moment the skinned FP pipeline binds the same table.
+                        if (g_live.pObjVelParamsCbvFP && g_live.pObjVelBatchCbvFP) {
+                            std::memset(g_live.pObjVelParamsCbvFP->pCpuMappedAddress, 0, 256);
+                            ovd[0].ppBuffers = &g_live.pObjVelParamsCbvFP;
+                            ovd[1].ppBuffers = &g_live.pObjVelBatchCbvFP;
+                            if (ovdHaveBones && g_live.pObjVelBonesCurCbvFP
+                                && g_live.pObjVelBonesPrevCbvFP) {
+                                ovd[4].ppBuffers = &g_live.pObjVelBonesCurCbvFP;
+                                ovd[5].ppBuffers = &g_live.pObjVelBonesPrevCbvFP;
+                            }
+                            // ovd[6] (gObjVelDepthOut) is the SAME pLinearDepth in this instance —
+                            // it is the FP lane that is meant to write it; see the note above.
+                            updateDescriptorSet(R, 1, g_live.pObjVelSet, ovdN, ovd);
+                            // The FP lane's rigid half needs only the batch + params; its skinned
+                            // half additionally needs the two FP bone windows AND the FP instance
+                            // stream, and it is gated on objVelSkinReady for the PIPELINES, which
+                            // it shares. Split the same way the world lane is, so a missing FP bone
+                            // window costs the arms their skinned velocity and not their rigid one.
+                            g_live.objVelFPReady = true;
+                        }
                     }
                     LOG::logline(">> [objvel] object velocity %s (max %u movers/frame, GEQUAL vs the "
                                  "Z-prepass, UAV write, no colour target); skinned lane %s "
-                                 "(max %u parts, %u bone matrices in ONE 64 KB window)",
+                                 "(max %u parts, %u bone matrices in ONE 64 KB window); "
+                                 "first-person lane %s (set instance 1; rigid<=%u skinned<=%u)",
                                  g_live.objVelReady ? "ready" : "UNAVAILABLE", kObjVelBatch,
                                  g_live.objVelSkinReady ? "ready" : "UNAVAILABLE",
-                                 kObjVelSkinned, kObjVelBones);
+                                 kObjVelSkinned, kObjVelBones,
+                                 g_live.objVelFPReady ? "ready" : "UNAVAILABLE",
+                                 kMaxFPDraws, kMaxFPSkinned);
                     if (g_live.objVelReady && !g_live.objVelSkinReady) {
                         std::printf("[forge] object velocity SKINNED lane unavailable (shader=%d "
                                     "pipe=%d mirror=%d cur=%d prev=%d inst=%d) - actors keep the "
@@ -13223,6 +13385,30 @@ namespace {
             fib.ppBuffer = &g_live.pFPInstanceBuf;
             addResource(&fib, nullptr);
 
+            // FP1e: the FP multi-map world window + per-draw instance VB. kBatchBytes (a full
+            // 64KB CBV) like every other gBatch binding in this file — the list is capped at
+            // kMaxFPDraws, but gBatch is DECLARED as the full 1024-matrix window and binding a
+            // short CBV to it is exactly the kind of thing the debug layer objects to.
+            BufferLoadDesc fmw = {};
+            fmw.mDesc.mDescriptors = DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+            fmw.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_CPU_TO_GPU;
+            fmw.mDesc.mFlags = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
+            fmw.mDesc.mSize = kBatchBytes;
+            fmw.mDesc.pName = "fpMMWorldsCbv";
+            fmw.pData = nullptr;
+            fmw.ppBuffer = &g_live.pFPMMWorldsBuf;
+            addResource(&fmw, nullptr);
+
+            BufferLoadDesc fmi = {};
+            fmi.mDesc.mDescriptors = DESCRIPTOR_TYPE_VERTEX_BUFFER;
+            fmi.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_CPU_TO_GPU;
+            fmi.mDesc.mFlags = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
+            fmi.mDesc.mSize = (uint64_t)kMaxFPDraws * kMMInstU32 * sizeof(uint32_t);
+            fmi.mDesc.pName = "instanceVBFPMM";
+            fmi.pData = nullptr;
+            fmi.ppBuffer = &g_live.pFPInstanceBufMM;
+            addResource(&fmi, nullptr);
+
             BufferLoadDesc fbb = {};
             fbb.mDesc.mDescriptors = DESCRIPTOR_TYPE_UNIFORM_BUFFER;
             fbb.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_CPU_TO_GPU;
@@ -13259,6 +13445,7 @@ namespace {
             waitForAllResourceLoads();
             const bool fpBufsOk = g_live.pFPFrameCbv && g_live.pFPLightCbv && g_live.pFPWorldsBuf
                 && g_live.pFPInstanceBuf && g_live.pFPBonesBuf && g_live.pFPInstanceBufSkin
+                && g_live.pFPMMWorldsBuf && g_live.pFPInstanceBufMM
                 && g_live.pFPMaskAllLit;
             if (fpBufsOk) {
                 std::memset(g_live.pFPLightCbv->pCpuMappedAddress, 0, kLightCbvBytes);
@@ -13271,6 +13458,8 @@ namespace {
                 addDescriptorSet(R, &fpwDesc, &g_live.pPerBatchSetFP);
                 DescriptorSetDesc fpsDesc = SRT_SET_DESC(SrtData, PerBatch, 1, 0);
                 addDescriptorSet(R, &fpsDesc, &g_live.pPerBatchSetFPSkin);
+                DescriptorSetDesc fpmDesc = SRT_SET_DESC(SrtData, PerBatch, 1, 0);
+                addDescriptorSet(R, &fpmDesc, &g_live.pPerBatchSetFPMM);   // FP1e
                 if (g_live.pDistLightCbv) {
                     DescriptorSetDesc dlDesc = SRT_SET_DESC(SrtData, PerDraw, 1, 0);
                     addDescriptorSet(R, &dlDesc, &g_live.pPerLightsSetDist);
@@ -13430,6 +13619,12 @@ namespace {
                 bs.mIndex = SRT_RES_IDX(SrtData, PerBatch, gBatch);
                 bs.ppBuffers = &g_live.pFPBonesBuf;
                 updateDescriptorSet(R, 0, g_live.pPerBatchSetFPSkin, 1, &bs);
+                if (g_live.pPerBatchSetFPMM) {   // FP1e
+                    DescriptorData bm = {};
+                    bm.mIndex = SRT_RES_IDX(SrtData, PerBatch, gBatch);
+                    bm.ppBuffers = &g_live.pFPMMWorldsBuf;
+                    updateDescriptorSet(R, 0, g_live.pPerBatchSetFPMM, 1, &bm);
+                }
                 std::printf("[forge] FP pass ready (maxDraws=%u maxSkinned=%u)\n",
                             kMaxFPDraws, kMaxFPSkinned);
             } else {
@@ -13666,6 +13861,13 @@ namespace {
     inline double hostNowMs();               // defined below (rate-limits the table-full log)
     uint32_t g_uvAnimCount = 0;      // ids handed out this frame (reset with g_renderFrame)
     double   g_uvAnimSimT  = 0.0;    // MW sim time (lighting[32]) — frozen in menus, like MW
+    // MB-2c: THIS FRAME'S SIM DELTA, AND THE ONE ANSWER TO "IS THE GAME PAUSED". Derived once per
+    // frame from g_uvAnimSimT (see the MB-2c block in renderScene), clamped to [0, 0.1]. Read by
+    // the light-flicker system — which is where this derivation used to live — and by the motion
+    // blur's pause hold. ONE definition, because two would be two things that can disagree about
+    // whether the world is moving, and a blur that disagrees with the flames is worse than either.
+    float    g_simDt       = 0.0f;
+    bool     g_simFrozen   = false;  // g_simDt == 0 exactly: a menu, a save-load pause
     float    g_uploadKB    = 0.0f;   // Part A: client's host-geom reship cost THIS frame (lighting[33], KB)
     float    g_uploadParts = 0.0f;   // Part A: parts reshipped this frame (lighting[34])
     float    g_uploadKBEma = 0.0f;   // smoothed for a steady panel readout
@@ -15071,6 +15273,110 @@ namespace {
     uint32_t g_objVelSkinDrawn = 0, g_objVelSkinSkipPair = 0, g_objVelSkinSkipBones = 0,
              g_objVelSkinSkipCap = 0, g_objVelSkinSkipBlend = 0, g_objVelSkinSkipKind = 0,
              g_objVelSkinStill = 0, g_objVelSkinBonesUsed = 0;
+    // ═══ MB-1d: THE FIRST-PERSON LANE (arms + weapons) ═══════════════════════════════════════
+    // A FOURTH population, and the reason it is fourth rather than a filter relaxation is the one
+    // MB-1c paid a build to learn: FP parts arrive in IPC::FPScene and are excluded from items[],
+    // the skinned blob AND mmItems by the client (renderprocess.cpp's `if (e.isFP)` guards), so no
+    // existing walk could reach them however its gates were written.
+    //
+    // ⚠⚠ WHAT WAS ON SCREEN BEFORE THIS. The camera-only pass reads pLinearDepth, whose last write
+    // is the colour->water seam; the FP pass runs ~2000 lines later and CLEARS pDepth. So over arm
+    // pixels pMotionVectors held the velocity of the WORLD BEHIND THE ARMS — and the arms are
+    // rigidly attached to the camera, whose true screen velocity on a turn is ~0 against a world's
+    // that is large. Both halves were wrong in the most visible way available: the arms SMEARED on
+    // a camera turn (they should stay sharp) and a weapon SWING produced NO smear at all.
+    //
+    // ⚠ THE ARMS STAYING SHARP IS NOT A KNOB, it is what the arithmetic produces. On a turn the
+    // arm's camera-relative world matrix rotates AND the FP viewProj rotates, and the two cancel in
+    // CurClip - PrevClip. That cancellation IS the acceptance test (F12 mode 17: arms flat grey
+    // while the world streams) — there is no plausible-but-wrong answer to mistake it for.
+    bool     g_objVelFPLane = true;
+    // ...and its counters, in the shape verification 1 asks for:
+    //   drawn/inFrame — `rigid=0` with arms on screen means the WALK is not reaching them, which is
+    //                   the exact number MB-1c's `mm=0` existed to make visible.
+    //   skipPair      — no N-1 pose for this slot. Small and nonzero is healthy (a part entering
+    //                   the frame, a weapon just drawn); large against a small drawn is the pose
+    //                   bookkeeping not running.
+    //   skipKind      — slot not uploaded / wrong mesh class.
+    //   still         — drawn with prevWorld snapped to world: an exact zero, not a residue.
+    // FP1e added a THIRD stride here: FP multi-map parts used to be dropped by the CLIENT, and now
+    // that they draw (a glass weapon's glow map), they must move too — the objvel MM PSO pair
+    // already exists for the world lane, so this is a third walk and a pipeline pick, nothing more.
+    uint32_t g_objVelFPDrawn = 0, g_objVelFPInFrame = 0, g_objVelFPStill = 0,
+             g_objVelFPSkipPair = 0, g_objVelFPSkipKind = 0, g_objVelFPSkipCap = 0;
+    uint32_t g_objVelFPMMDrawn = 0, g_objVelFPMMInFrame = 0, g_objVelFPMMStill = 0,
+             g_objVelFPMMSkipPair = 0, g_objVelFPMMSkipKind = 0;
+    uint32_t g_objVelFPSkinDrawn = 0, g_objVelFPSkinInFrame = 0, g_objVelFPSkinStill = 0,
+             g_objVelFPSkinSkipPair = 0, g_objVelFPSkinSkipKind = 0, g_objVelFPSkinSkipBlend = 0,
+             g_objVelFPSkinSkipBones = 0, g_objVelFPSkinSkipCap = 0, g_objVelFPBonesUsed = 0;
+    // Did the replay actually record this frame. "The arms look wrong" and "the pass never ran" are
+    // the same picture, and a minimized harness has no other way to separate them.
+    bool     g_objVelFPRan = false;
+    // Why it did not, when it did not — one reason code rather than five booleans to cross-check:
+    // 0 = ran, 1 = knob off, 2 = not ready, 3 = the camera pass did not run this frame (nothing to
+    // overwrite), 4 = no previous FP camera (first FP frame, or the previous frame had no arms),
+    // 5 = nothing paired.
+    uint32_t g_objVelFPWhyNot = 0;
+    // ═══ THE CAMERA-TURN IDENTITY, AS A NUMBER ══════════════════════════════════════════════
+    // MB-1d's acceptance test is "turn the camera with the arms idle: the arms must go FLAT GREY in
+    // mode 17 while the world streams with colour". That is decisive precisely because there is no
+    // plausible-but-wrong answer — any error in the FP camera pair, the origin fold or the pose
+    // bookkeeping breaks it visibly — but it needs a person at a screen, and the harness runs
+    // MINIMIZED. So run the same identity on the CPU, on one real point of one real arm part, and
+    // report it:
+    //
+    //   armPx   = |the vector THIS LANE writes there| — must be ~0 whatever the camera did.
+    //   turnPx  = |the vector that pixel would carry if the arm were WORLD-STATIC| — the same
+    //             point held still and seen by last frame's arm camera, which is exactly the
+    //             camera-only answer, i.e. the number that used to be over those pixels.
+    //
+    // ⚠ THE TWO ARE ONE OBSERVATION, NOT TWO MAXIMA. Tracked as a pair off the frame with the
+    // largest worldPx (i.e. the frame the camera actually turned on), because separately-maximised
+    // numbers can come from different frames and would describe a frame that never happened — the
+    // mistake `mvFoldMaxPx` records having already been made once, one pass along. A window peak
+    // rather than a sample, because a camera is parked far more often than it is turning and a
+    // fixed-period heartbeat reports the still frames [[feedback_periodic_heartbeat_cannot_sample_bursty_condition]].
+    float    g_objVelFPIdArmPx    = 0.0f;   // window peak's arm-lane magnitude (the one that must be ~0)
+    float    g_objVelFPIdTurnPx  = 0.0f;   // ...and the camera-only magnitude ON THAT SAME FRAME
+    uint32_t g_objVelFPIdSamples  = 0;      // frames the identity was evaluated on, this window
+    // ⚠ AND AN AGGREGATE BESIDE THE PEAK, because a peak over 300 frames is ONE frame and a camera
+    // CUT (cell load, teleport, a menu closing) puts a whole screen width into it — on which the
+    // arm number means nothing, since there is no previous pose worth differencing. The sums are
+    // taken over the frames where the camera actually moved a little (worldPx > 1 px) and their
+    // RATIO is the reading that survives an outlier. Peak and mean disagreeing is itself the
+    // diagnosis: mean small + peak large = a cut in the window; both large = the lane is wrong.
+    double   g_objVelFPIdSumArm   = 0.0;
+    double   g_objVelFPIdSumTurn = 0.0;
+    // ...and the THIRD LEG of the triangle: the same point's LAST pose through THIS frame's camera,
+    // i.e. how far the POSE alone moved it. It is what makes the other two readable — for a
+    // camera-attached part the pose term and the camera term must be equal and opposite, so
+    // `pose ~ turn` with `arm ~ 0` is cancellation, while `arm ~ pose + turn` is the two ADDING,
+    // which is a sign or pairing error and not animation.
+    double   g_objVelFPIdSumPose  = 0.0;
+    float    g_objVelFPIdPosePx   = 0.0f;   // the peak frame's pose term
+    // ═══ AND THE TEST THAT DOES NOT NEED IDLE ARMS ══════════════════════════════════════════
+    // ⚠⚠ "arm ~ 0" IS ONLY THE TEST WHEN THE ARMS ARE IDLE, AND MORROWIND'S NEVER ARE — the
+    // weapon bobs and swings continuously, and on a swing a large arm velocity is the FEATURE.
+    // Worse, "the motion was tangential" does not separate a camera-attached part from a swinging
+    // one: a swing is mostly tangential too. So the first framing of this test could not have
+    // produced a pass in any scene the harness can reach.
+    //
+    // The scene-independent statement is about DIRECTION, not magnitude. The arm's screen velocity
+    // is the sum of two contributions — the pose term and the camera term — and the whole claim of
+    // MB-1d is that the camera term is SUBTRACTED:
+    //
+    //     cancelling  =>  arm ~ |pose - turn|      (the vectors oppose: the camera is removed)
+    //     compounding =>  arm ~  pose + turn       (a stale, wrong-signed or WORLD camera)
+    //
+    // Those two predictions are far apart whenever the camera moved at all, and the triangle
+    // inequality guarantees arm lies between them — so which one it hugs is a clean verdict that
+    // holds while the arms swing, and it fails loudly for exactly the errors that matter (the FP
+    // camera pair not reaching the draws, the origin fold inverted, descriptor instance 0 bound).
+    // Accumulated as per-frame residuals, because |mean(a) - mean(b)| is not mean(|a - b|).
+    double   g_objVelFPIdResCancel = 0.0;   // sum |arm - |pose-turn||
+    double   g_objVelFPIdResAdd    = 0.0;   // sum |arm - (pose+turn)|
+    uint32_t g_objVelFPIdMoved    = 0;      // frames counted into the sums
+    uint32_t g_objVelFPIdPeakFrame = 0;     // g_renderFrame the peak came from
     // ⚠⚠ THE LARGEST PER-BONE TRANSLATION DELTA AN *ACCEPTED* PAIR CARRIES, world units, this
     // frame. This is the number that says the pairing key is doing its job, and it is lane-specific
     // in a way nothing else here is.
@@ -15209,6 +15515,24 @@ namespace {
     // shader writes zeros then, which is the honest answer: an accumulator told "nothing moved"
     // reuses history it should not, but one handed a garbage vector fetches from an arbitrary place.
     bool     g_prevViewProjValid = false;
+    // ═══ MB-1d: THE PREVIOUS FRAME'S **ARM** CAMERA ═════════════════════════════════════════
+    // The FP pass renders with its own viewProj (the arm camera's FOV/near/far), so the world pair
+    // above cannot describe it: reprojecting an arm vertex through the WORLD's previous matrix
+    // would give it the world's parallax and none of its own.
+    //
+    // Stored exactly as rendered — post-applyProjFixups, so its own reverse-Z flip, its own
+    // half-pixel offset and its own jitter — for the reason g_prevViewProj gives: the image this
+    // matrix will be used to address was rasterised with all three.
+    //
+    // ⚠ A FRAME STAMP, NOT A BOOL, and that is the whole of the validity question. The FP pass is
+    // absent whenever the player is in third person, in a menu, or has nothing in hand, so "there
+    // is a previous FP camera" is not the same question as "there was a previous frame". The stamp
+    // must read exactly g_renderFrame - 1: that pins the pair to consecutive RASTERS, which is also
+    // what makes g_prevBakeEye — stamped unconditionally at the end of every frame — the right
+    // origin to fold in. A gap of two frames would pair an arm camera with a bake eye from between
+    // them, which is [[project_park_restamp_eye_origin]] wearing a different hat.
+    float    g_fpPrevViewProj[16] = {};
+    uint32_t g_fpPrevViewProjFrame = 0;   // g_renderFrame the matrix above was rendered with; 0 = none
     // ⚠ AND A SEPARATE FLAG FOR THE PREVIOUS DEPTH, which is NOT the same question. pMvPrevDepth is
     // created with undefined contents and is only filled by the dispatch's own tail — so on the
     // frame after the pass is TOGGLED ON mid-session, g_prevViewProjValid is long since true while
@@ -15471,6 +15795,11 @@ namespace {
     float    g_mbPeakLen    = 0.0f;
     uint32_t g_mbBlurFrames = 0;
     uint32_t g_mbRanFrames  = 0;
+    // MB-2c: frames the pass was SKIPPED and pMotionBlur held instead, because MW's sim clock was
+    // frozen (a menu). Counted separately from `ran` on purpose — "the blur is on screen" and "the
+    // blur did work this frame" become different questions the moment a hold exists, and a held
+    // frame reporting as `ran` would make the heartbeat claim GPU work that was never recorded.
+    uint32_t g_mbHeldFrames = 0;
 
     // ⚠ EVERY DISPATCH AND EVERY TAP IS BOUNDED BY THE **RENDER** RECT AT ITS LEVEL, not by the
     // allocation ([[project_forge_alloc_vs_render_uv]]). pSceneColor is alloc-sized while the scene
@@ -18771,6 +19100,10 @@ namespace {
           // has one": off, every skinned part — i.e. every NPC and creature — is back on the
           // camera-only vector, which is exactly what MB-1a shipped.
           t.checkbox("  \\- ...and SKINNED parts (actors; MB-1b)", &g_objVelSkinnedLane);
+          // MB-1d. OFF is the "before" picture and it is the arm that makes the acceptance test
+          // readable: with this off, turning the camera SMEARS the arms (they carry the world's
+          // vector); with it on they must go flat grey in mode 17 while the world streams.
+          t.checkbox("  \\- ...and the FIRST-PERSON arms/weapon (MB-1d)", &g_objVelFPLane);
           // The reactive mask's two thresholds are a RELATIVE depth error, so they are unitless and
           // hold at every distance. Walk them against `reactive=` on the heartbeat, not by eye:
           // a mask covering the screen is the upscaler switched off and it looks like "soft".
@@ -22274,6 +22607,7 @@ void destroyHostWindow(Renderer* R);
             { "objVelEnable",        &g_objVelEnable        },
             { "objVelAllItems",      &g_objVelAllItems      },
             { "objVelSkinned",       &g_objVelSkinnedLane   },
+            { "objVelFP",            &g_objVelFPLane        },
             { "objVelSkinIgnoreGen", &g_objVelSkinIgnoreGen },
 
             // M1 step 4b: the master arm. ⚠ READ AT INIT — it decides whether the backend and its
@@ -25234,6 +25568,36 @@ void destroyHostWindow(Renderer* R);
             // (lighting[35] was an unused tail slot) and no cbuffer growth (timeParams.z was 0).
             fd[82] = lighting[35];
         }
+
+        // ═══ MB-2c: IS THE GAME PAUSED? — ONE DEFINITION, FOR THE WHOLE FRAME ═══════════════════
+        // MW freezes its SIMULATION clock behind a menu, and lighting[32] IS that clock (bridge.h:
+        // "sim time does not advance in menus"). So a sim delta of exactly 0 is the pause signal,
+        // and it needs no new wire field, no menu flag and no host-side heuristic.
+        //
+        // ⚠ HOISTED OUT OF THE FLICKER BLOCK RATHER THAN COPIED. That block derived the same
+        // boolean and its comment is the whole argument, already made and already tested in play:
+        // "On wall clock the flame kept burning behind an open menu... Sim time freezes there, so
+        // dt is exactly 0 and the shadows hold." A second derivation is a second thing that can
+        // disagree — precisely the argument this file already makes about prevViewProjRel — so the
+        // flicker block now READS this instead of computing its own.
+        //
+        // ⚠ UNCONDITIONAL, AND AFTER the `if (lighting)` block on purpose. On a frame with no
+        // lighting row g_uvAnimSimT is unchanged, the delta is exactly 0, and the answer is
+        // "frozen" — the same answer the flicker block's own static reached there, so the hoist
+        // changes nothing about its behaviour.
+        //
+        // ⚠ FLOOR 0, NOT 0.001 — the flicker block's note again: a floor would creep every
+        // integrator forward on every frozen menu frame, which is the bug it exists to avoid. Zero
+        // is a first-class value here.
+        {
+            static double s_prevSimT = -1.0;
+            const double nowSimT = g_uvAnimSimT;
+            g_simDt = (s_prevSimT >= 0.0) ? (float)(nowSimT - s_prevSimT) : (1.0f / 60.0f);
+            s_prevSimT = nowSimT;
+            g_simDt = std::min(std::max(g_simDt, 0.0f), 0.1f);   // a hitch/alt-tab must not fast-forward
+            g_simFrozen = (g_simDt <= 0.0f);
+        }
+
         // F12 debug view: debugParams.x at float index 40 (160B = viewProj 16f + 6×float4 24f).
         // 0=normal (frag is byte-for-byte unchanged), 1=depth world-distance grayscale,
         // 3=AO, 4=bent normal (both sample gAO at SV_Position * debugParams.yz = invScreen).
@@ -25579,6 +25943,84 @@ void destroyHostWindow(Renderer* R);
                 mhm.lastWorld[12] = max_;
                 mhm.lastWorld[13] = may_;
                 mhm.lastWorld[14] = maz_;
+                mhm.lastWorldFrame = g_renderFrame;
+            }
+        }
+        // ─── MB-1d: PREVIOUS-POSE BOOKKEEPING FOR THE **FIRST-PERSON** RIGID LANE ───────────────
+        // A FOURTH population, arriving in IPC::FPScene, and the client excludes it from items[],
+        // the skinned blob and mmItems alike (`if (e.isFP)` at renderprocess.cpp's dispatch, caster
+        // walk and both near/far static walks). refreshCasterRecord below therefore never sees an
+        // FP slot and prevWorld / lastWorldFrame were never maintained for one — the same ABSENCE
+        // multimap parts had, one population along.
+        //
+        // ⚠ HERE, BESIDE THE MULTIMAP BLOCK AND *UNCONDITIONALLY*, not down in the FP pass with the
+        // replay. Bookkeeping gated on the lane's own knob would mean toggling objVelFP off and on
+        // leaves a frame of stale records behind it — and the two world lanes both keep their pose
+        // records unconditionally (refreshCasterRecord, and the MM block above), so an FP lane that
+        // did otherwise would be the odd one out for no gain.
+        //
+        // ⚠⚠ NO CANDIDACY FILTER, AND THAT IS DELIBERATE. The rigid lane's `everMoved || isLive`
+        // exists because there are thousands of statics against dozens of movers; FP is 8 rigid
+        // parts against a kMaxFPDraws of 128. More to the point, BOTH those flags are written only
+        // inside refreshCasterRecord — the one function FP parts never reach — so a filter on them
+        // would read "not live, never moved" for every arm and switch the lane off while looking
+        // like a filter. That is exactly the trap MB-1c hit and it is not worth re-entering for a
+        // saving of eight draws. Draw them all; the still-snap below turns a motionless part into an
+        // exact zero for free. [[feedback_confirm_population_reaches_the_filter]]
+        //
+        // Three lines, refreshCasterRecord's three verbatim: carry-before-overwrite guarded on a
+        // DIFFERENT frame (a slot refreshed twice in one frame must not shadow itself and zero its
+        // own velocity), then lastWorld stored ABSOLUTE (+g_eyeAbsShadow), which the replay undoes
+        // at the point of use. FP worlds are camera-relative under the SAME DistantLand::eyePos
+        // shift as the main pass (emitStaticDraw is shared by both build paths), so the fold is
+        // identical — and FP slots come from the same g_keySlot pool keyed per cache entry, so an
+        // FP slot is never also a world slot and reusing HostMesh's fields cannot collide.
+        if (fp && fp->drawBlob && fp->drawCount && fp->drawBytes) {
+            const uint32_t haveFPP = fp->drawBytes / (uint32_t)sizeof(IPC::DrawItemWire);
+            uint32_t nFPP = (fp->drawCount < haveFPP) ? fp->drawCount : haveFPP;
+            if (nFPP > kMaxFPDraws) { nFPP = kMaxFPDraws; }
+            const IPC::DrawItemWire* fpPose = (const IPC::DrawItemWire*)fp->drawBlob;
+            for (uint32_t k = 0; k < nFPP; ++k) {
+                const IPC::DrawItemWire& fi = fpPose[k];
+                const uint32_t fs = fi.slot;
+                if (fs >= g_meshHigh || !g_meshes[fs].valid
+                    || g_meshes[fs].skinned || g_meshes[fs].multimap) { continue; }
+                HostMesh& fhm = g_meshes[fs];
+                if (fhm.lastWorldFrame != 0 && fhm.lastWorldFrame != g_renderFrame) {
+                    std::memcpy(fhm.prevWorld, fhm.lastWorld, 64);
+                    fhm.prevWorldFrame = fhm.lastWorldFrame;
+                }
+                std::memcpy(fhm.lastWorld, fi.world, 64);
+                fhm.lastWorld[12] = fi.world[12] + g_eyeAbsShadow[0];
+                fhm.lastWorld[13] = fi.world[13] + g_eyeAbsShadow[1];
+                fhm.lastWorld[14] = fi.world[14] + g_eyeAbsShadow[2];
+                fhm.lastWorldFrame = g_renderFrame;
+            }
+        }
+        // ─── FP1e: THE SAME BOOKKEEPING FOR THE FIRST-PERSON **MULTI-MAP** PARTS ────────────────
+        // A FIFTH population — the intersection of the two absences above (an FP part that is also
+        // a multi-map part), arriving in FPScene::mmBlob. Identical three lines, identical reasons;
+        // the only difference is which wire array they are read out of, and that MM slots are
+        // disjoint from rigid ones on both sides (this loop requires g_meshes[ms].multimap, the FP
+        // rigid loop above requires !multimap).
+        if (fp && fp->mmBlob && fp->mmCount && fp->mmBytes) {
+            const uint32_t haveFPM = fp->mmBytes / (uint32_t)sizeof(IPC::MultiMapDrawWire);
+            uint32_t nFPM = (fp->mmCount < haveFPM) ? fp->mmCount : haveFPM;
+            if (nFPM > kMaxFPDraws) { nFPM = kMaxFPDraws; }
+            const IPC::MultiMapDrawWire* fpmPose = (const IPC::MultiMapDrawWire*)fp->mmBlob;
+            for (uint32_t k = 0; k < nFPM; ++k) {
+                const IPC::MultiMapDrawWire& mi = fpmPose[k];
+                const uint32_t ms = mi.slot;
+                if (ms >= g_meshHigh || !g_meshes[ms].valid || !g_meshes[ms].multimap) { continue; }
+                HostMesh& mhm = g_meshes[ms];
+                if (mhm.lastWorldFrame != 0 && mhm.lastWorldFrame != g_renderFrame) {
+                    std::memcpy(mhm.prevWorld, mhm.lastWorld, 64);
+                    mhm.prevWorldFrame = mhm.lastWorldFrame;
+                }
+                std::memcpy(mhm.lastWorld, mi.world, 64);
+                mhm.lastWorld[12] = mi.world[12] + g_eyeAbsShadow[0];
+                mhm.lastWorld[13] = mi.world[13] + g_eyeAbsShadow[1];
+                mhm.lastWorld[14] = mi.world[14] + g_eyeAbsShadow[2];
                 mhm.lastWorldFrame = g_renderFrame;
             }
         }
@@ -26489,18 +26931,17 @@ void destroyHostWindow(Renderer* R);
             // cadence made it a jump rather than a drift, since 8 frames of flame land in one refresh.
             // Sim time freezes there, so dt is exactly 0 and the shadows hold. It also freezes on a
             // save-load pause and cannot run backwards past the clamp.
-            static double s_flickPrevSim = -1.0;
-            const double  flickNowSim = g_uvAnimSimT;
-            float flickDt = (s_flickPrevSim >= 0.0) ? (float)(flickNowSim - s_flickPrevSim) : (1.0f / 60.0f);
-            s_flickPrevSim = flickNowSim;
-            // Floor is 0, NOT 0.001: a floor would creep the flame forward every frozen menu frame,
-            // which is the bug. Zero is a first-class value here — see flickAdvance.
-            flickDt = std::min(std::max(flickDt, 0.0f), 0.1f);
+            //
+            // ⚠ THE DERIVATION MOVED; THE REASONING DID NOT. g_simDt / g_simFrozen are computed
+            // once per frame beside g_uvAnimSimT (the MB-2c block there) and read here, so the
+            // motion blur's pause hold and this system can never disagree about whether the game is
+            // paused. The clamp, the zero floor and the meaning are the ones this block established.
+            const float flickDt = g_simDt;
             // Frozen frame. The two consumers below that DIVIDE by dt (the motion-speed EWMA and the
             // classifier's rate normalisation) must be skipped, not fed 0 — an inf/NaN would poison
             // fErratic permanently and misclassify the light for the rest of the session. The phase
             // integrators are safe (they add 0) and are left unguarded.
-            const bool flickAdvance = (flickDt > 0.0f);
+            const bool flickAdvance = !g_simFrozen;
             // Global flame phase at the BASE rate. Slots integrate their own (motion/wind speed them up);
             // this is the base a newly-assigned slot inherits so its wobble starts mid-flame, not from 0.
             static double s_flickPhaseGlobal = 0.0;
@@ -27465,7 +27906,7 @@ void destroyHostWindow(Renderer* R);
         // manager above) with every falloff.w zeroed, so opaque.frag never consults the
         // main scene's screen-space shadow mask for FP pixels (see pFPLightCbv comment).
         const bool fpActive = fp && fp->viewProj && g_live.pPerFrameSetFP
-                           && (fp->drawCount + fp->skinnedCount) > 0;
+                           && (fp->drawCount + fp->skinnedCount + fp->mmCount) > 0;
         // FP shadow reception (DIRECT ATLAS): the arms sample the cube shadow atlas straight from
         // their interpolated world pos + vertex normal (opaque.frag's fpShadowVisibility) — no
         // screen-space mask, no depth reconstruction (the old scratch-mask mangled isolated arm
@@ -27475,12 +27916,21 @@ void destroyHostWindow(Renderer* R);
         const bool fpWantShadow = fpActive && g_fpReceiveShadows && g_live.shadowReady
                                && g_live.pShadowMaskParamsCbv
                                && g_live.pShadowAtlas && g_live.pShadowAtlasDyn;
+        // MB-1d: the ARM camera, kept at FUNCTION scope. The FP object-velocity replay is recorded
+        // ~5600 lines below and needs the very matrix the arms were rasterised with — jitter,
+        // half-pixel and reverse-Z flip included — and the alternative (reading the first 16 floats
+        // back out of pFPFrameCbv) is a load from write-combined upload memory
+        // ([[project_forge_wc_read_trap]]) to recover a value we already had.
+        float fpRzSaved[16] = {};
+        bool  fpRzValid = false;
         if (fpActive) {
             std::memcpy(g_live.pFPFrameCbv->pCpuMappedAddress,
                         g_live.pFrameCbv->pCpuMappedAddress, 512);
             float fpRz[16];
             applyProjFixups(fpRz, fp->viewProj);
             std::memcpy(g_live.pFPFrameCbv->pCpuMappedAddress, fpRz, 16 * sizeof(float));
+            std::memcpy(fpRzSaved, fpRz, sizeof(fpRzSaved));
+            fpRzValid = true;
             // FP direct-atlas shadow flag (alphaShadowParams.y, float index 125). 1 → opaque.frag's
             // FP path samples the cube atlas; 0 → it would read the (wrong-for-arms) screen mask.
             ((float*)g_live.pFPFrameCbv->pCpuMappedAddress)[125] = fpWantShadow ? 1.0f : 0.0f;
@@ -33063,7 +33513,22 @@ void destroyHostWindow(Renderer* R);
         // Hi-Z mip 0, linearize and water already ran. Rigid parts use the sky-pass
         // pattern (own world window + instance VB, arena-or-own mesh source); skinned
         // parts use the main skinned pattern with the ONE dedicated FP bone window.
-        uint32_t fpRigidDrawn = 0, fpSkinnedDrawn = 0, fpAlphaDrawn = 0;
+        uint32_t fpRigidDrawn = 0, fpSkinnedDrawn = 0, fpAlphaDrawn = 0, fpMMDrawn = 0;
+        // MB-1d: clear the first-person velocity counters HERE, before the pass that fills them, so
+        // a frame with no arms at all (third person, a menu, an empty hand) reports zeros rather
+        // than the last FP frame's numbers. ⚠ A TRAILING CLEAR WOULD BE THE OTHER BUG: written
+        // after the block, it would erase the very values the block just produced — which is
+        // [[feedback_clear_reserved_lanes_before_writing_them]] verbatim, and that one survived
+        // three weeks with the log cheerfully reporting the flag it had already eaten.
+        g_objVelFPRan = false;
+        g_objVelFPWhyNot = 6u;   // no FP pass this frame
+        g_objVelFPDrawn = g_objVelFPInFrame = g_objVelFPStill = 0;
+        g_objVelFPSkipPair = g_objVelFPSkipKind = g_objVelFPSkipCap = 0;
+        g_objVelFPSkinDrawn = g_objVelFPSkinInFrame = g_objVelFPSkinStill = 0;
+        g_objVelFPSkinSkipPair = g_objVelFPSkinSkipKind = g_objVelFPSkinSkipBlend = 0;
+        g_objVelFPSkinSkipBones = g_objVelFPSkinSkipCap = g_objVelFPBonesUsed = 0;
+        g_objVelFPMMDrawn = g_objVelFPMMInFrame = g_objVelFPMMStill = 0;
+        g_objVelFPMMSkipPair = g_objVelFPMMSkipKind = 0;
         gpuPhaseBegin(kGpuPhaseColorFP);
         if (fpActive && g_live.pFPOpaquePipeline && g_live.pFPSkinnedPipeline) {
             // FP2-lite: FILL the FP world/instance/bone buffers ONCE and record each draw, so the
@@ -33071,10 +33536,15 @@ void destroyHostWindow(Renderer* R);
             // skip logic lives in one place, and both passes reference identical instance slots.
             struct FPRigidRec { Buffer* vb; Buffer* ib; uint32_t indexCount, firstVertex, firstIndex, idx; int mirror; };
             struct FPSkinRec  { Buffer* vb; Buffer* ib; uint32_t indexCount, instance; int mirror; };
+            struct FPMMRec    { Buffer* vb; Buffer* ib; uint32_t indexCount, idx; int mirror; };
             static std::vector<FPRigidRec> s_fpRigid;   // single-threaded record (renderScene)
             static std::vector<FPSkinRec>  s_fpSkin;
+            static std::vector<FPMMRec>    s_fpMM;       // FP1e opaque multi-map (hilt, fittings)
+            static std::vector<FPMMRec>    s_fpMMAlpha;  // FP1e Route C: blended multi-map (the blade)
             s_fpRigid.clear();
             s_fpSkin.clear();
+            s_fpMM.clear();
+            s_fpMMAlpha.clear();
             // Every `continue` below drops an arm part, and all of them were silent — the old
             // rigid=%u/%u line said parts were lost but never which gate ate them, so a client-side
             // and a host-side loss looked identical from the logs. Named counters + a bone total,
@@ -33171,6 +33641,65 @@ void destroyHostWindow(Renderer* R);
                 }
             }
 
+            // --- FP1e multi-map parts (MultiMapDrawWire[]) — FILL + RECORD ---
+            // The world MM colour loop's fill, verbatim, into the FP's OWN windows: world into
+            // pFPMMWorldsBuf[idx], the packed stage/material instance into pFPInstanceBufMM[idx],
+            // drawn with firstInstance = idx so Meta.DrawIndex selects gBatch.worlds[idx].
+            //
+            // ⚠ ITS OWN WINDOWS, NOT THE WORLD'S. The world MM fill is a destructive CPU memcpy
+            // into persistently-mapped memory earlier in THIS SAME command list — reusing
+            // pMMWorldsBuf here would rewrite matrices the world MM draws are already recorded
+            // against, and the corruption would land on the world, not on the arms.
+            if (fp->mmBlob && fp->mmCount && fp->mmBytes
+                && g_live.pFPMultiMapPipeline && g_live.pPerBatchSetFPMM) {
+                const uint32_t haveFPM = fp->mmBytes / (uint32_t)sizeof(IPC::MultiMapDrawWire);
+                uint32_t nFPM = (fp->mmCount < haveFPM) ? fp->mmCount : haveFPM;
+                if (nFPM > kMaxFPDraws) { nFPM = kMaxFPDraws; }   // the instance VB's own cap
+                const IPC::MultiMapDrawWire* fpmItems = (const IPC::MultiMapDrawWire*)fp->mmBlob;
+                for (uint32_t k = 0; k < nFPM; ++k) {
+                    const IPC::MultiMapDrawWire& it = fpmItems[k];
+                    // ⚠ ROUTE C RIDES THIS SAME LIST, AND THE FLAG IS THE SPLIT. A glass dagger's
+                    // BLADE is a blended multi-map part while its hilt is an opaque one, so a build
+                    // that dropped the blended half rendered "only the hilt". Both halves fill the
+                    // SAME windows off the SAME running index below — one fill, two record lists —
+                    // and only the pipeline and the point in the pass differ.
+                    const bool mmBlended = (it.drawFlags & IPC::kMMDrawFlagBlended) != 0u;
+                    const uint32_t slot = it.slot;
+                    if (slot >= g_meshHigh || !g_meshes[slot].valid) { ++fpSkipSlot; continue; }
+                    HostMesh& mm = g_meshes[slot];
+                    if (!mm.multimap) { ++fpSkipKind; continue; }   // wide GeomVertexWireMM only
+                    if (!mm.vb || !mm.ib) { ++fpSkipBuf; continue; }
+                    const uint32_t idx = fpMMDrawn;
+
+                    uint8_t* mdst = (uint8_t*)g_live.pFPMMWorldsBuf->pCpuMappedAddress;
+                    std::memcpy(mdst + (size_t)idx * 64, it.world, 64);
+
+                    uint32_t* minst = (uint32_t*)g_live.pFPInstanceBufMM->pCpuMappedAddress;
+                    uint32_t* e = minst + (size_t)idx * kMMInstU32;
+                    const uint32_t sc  = (it.stageCount > 4u) ? 4u : it.stageCount;
+                    float ar = it.alphaRef < 0.0f ? 0.0f : (it.alphaRef > 1.0f ? 1.0f : it.alphaRef);
+                    const uint32_t aref = (uint32_t)(ar * 255.0f + 0.5f) & 0xFFu;
+                    const uint32_t vcs  = it.vColSource & 0x3u;
+                    const uint32_t uvId = mm.uvKeys ? uvAnimIdFor(mm) : 0u;
+                    const uint32_t glow = (it.drawFlags & IPC::kMMDrawFlagEnchantGlow) ? (1u << 15) : 0u;
+                    e[0] = (idx & 0x3FFu) | (sc << 10u) | (vcs << 13u) | glow | (aref << 16u) | (uvId << 24u);
+                    e[1] = it.stages[0]; e[2] = it.stages[1]; e[3] = it.stages[2]; e[4] = it.stages[3];
+                    float* fe = (float*)e;
+                    fe[5]  = it.matDiffuse[0];  fe[6]  = it.matDiffuse[1];  fe[7]  = it.matDiffuse[2];
+                    fe[8]  = it.matAmbient[0];  fe[9]  = it.matAmbient[1];  fe[10] = it.matAmbient[2];
+                    fe[11] = it.matEmissive[0]; fe[12] = it.matEmissive[1]; fe[13] = it.matEmissive[2];
+                    fe[14] = it.matAlpha;   // unused by multimap.frag (opaque forces 1.0); in sync
+                    fe[15] = it.emissiveGain[0]; fe[16] = it.emissiveGain[1]; fe[17] = it.emissiveGain[2];
+
+                    // The mirror lane is meaningless for the blended half — pMultiMapAlphaPipeline
+                    // is CULL_MODE_NONE (thin glass, winding-irrelevant) and has no mirror variant —
+                    // so it is recorded but never read there.
+                    (mmBlended ? s_fpMMAlpha : s_fpMM).push_back(
+                        { mm.vb, mm.ib, mm.indexCount, idx, worldMirrored(it.world) ? 1 : 0 });
+                    ++fpMMDrawn;
+                }
+            }
+
             // FP shadow reception is now a DIRECT cube-atlas test inside the colour frag
             // (opaque.frag's fpShadowVisibility, gated by the FP alphaShadowParams.y flag) — no
             // depth prepass and no mask refresh here. The arms read their OWN visibility from the
@@ -33237,6 +33766,69 @@ void destroyHostWindow(Renderer* R);
                     cmdBindVertexBuffer(g_live.pCmd, 2, vbs, strides, nullptr);
                     cmdBindIndexBuffer(g_live.pCmd, r.ib, INDEX_TYPE_UINT16, 0);
                     cmdDrawIndexedInstanced(g_live.pCmd, r.indexCount, 0, 1, 0, r.instance);
+                }
+            }
+
+            if (!s_fpMM.empty()) {
+                // FP1e. Pipeline FIRST, then the sets — the rigid block's note is the long
+                // version, and it applies verbatim: a frame with ONLY multi-map FP parts (no
+                // rigid, no skinned) would otherwise inherit whatever pipeline type was last
+                // bound, which in an interior with no water is a COMPUTE one.
+                //
+                // ⚠ pFPMultiMapPipeline, NOT pMultiMapPipeline: the world MM colour PSO is
+                // CMP_EQUAL + no depth write because it rides the MM Z-prepass, and this pass has
+                // none — that pair would fail EQUAL at every pixel and draw nothing at all.
+                cmdBindPipeline(g_live.pCmd, g_live.pFPMultiMapPipeline);
+                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSetFP);
+                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerLightsSetFP);
+                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
+                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerBatchSetFPMM);   // the FP MM window
+                int cmMirror = 0;
+                for (const FPMMRec& r : s_fpMM) {
+                    if (r.mirror != cmMirror) {
+                        cmdBindPipeline(g_live.pCmd, r.mirror ? g_live.pFPMultiMapPipelineMirror
+                                                              : g_live.pFPMultiMapPipeline);
+                        // The world MM loop re-binds all four sets after a winding switch; do the
+                        // same rather than assume a PSO swap preserves the root tables.
+                        cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSetFP);
+                        cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerLightsSetFP);
+                        cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
+                        cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerBatchSetFPMM);
+                        cmMirror = r.mirror;
+                    }
+                    Buffer*  vbs[2]     = { r.vb, g_live.pFPInstanceBufMM };
+                    uint32_t strides[2] = { (uint32_t)sizeof(IPC::GeomVertexWireMM),
+                                            (uint32_t)(kMMInstU32 * sizeof(uint32_t)) };
+                    cmdBindVertexBuffer(g_live.pCmd, 2, vbs, strides, nullptr);
+                    cmdBindIndexBuffer(g_live.pCmd, r.ib, INDEX_TYPE_UINT16, 0);
+                    cmdDrawIndexedInstanced(g_live.pCmd, r.indexCount, 0, 1, 0, r.idx);
+                }
+            }
+
+            // --- FP1e Route C: BLENDED multi-map FP parts (a glass dagger's crystal blade) ---
+            // ⚠ THE MAIN ROUTE C PSO, UNCHANGED, AND THAT IS THE WHOLE POINT. pMultiMapAlphaPipeline
+            // is GEQUAL + depth-write OFF + CULL_NONE + SRCALPHA blend — which against the FP depth
+            // the opaque arms just wrote is exactly the contract, the same argument FP1c makes for
+            // reusing the sorted-alpha PSOs. (Contrast the OPAQUE multi-map pair, which could NOT be
+            // reused: that one tests CMP_EQUAL against an MM Z-prepass this pass does not run.)
+            //
+            // Drawn AFTER the opaque arms and BEFORE the FP alpha list, so the torch flame and
+            // enchant sparks composite over the blade rather than under it.
+            if (!s_fpMMAlpha.empty() && g_live.pMultiMapAlphaPipeline && g_live.pPerBatchSetFPMM) {
+                // Pipeline FIRST, then the sets — the rigid block's note is the long version.
+                cmdBindPipeline(g_live.pCmd, g_live.pMultiMapAlphaPipeline);
+                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSetFP);
+                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerLightsSetFP);
+                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
+                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerBatchSetFPMM);   // the FP MM window
+                for (const FPMMRec& r : s_fpMMAlpha) {
+                    // No winding switch: CULL_MODE_NONE, so there is nothing to flip.
+                    Buffer*  vbs[2]     = { r.vb, g_live.pFPInstanceBufMM };
+                    uint32_t strides[2] = { (uint32_t)sizeof(IPC::GeomVertexWireMM),
+                                            (uint32_t)(kMMInstU32 * sizeof(uint32_t)) };
+                    cmdBindVertexBuffer(g_live.pCmd, 2, vbs, strides, nullptr);
+                    cmdBindIndexBuffer(g_live.pCmd, r.ib, INDEX_TYPE_UINT16, 0);
+                    cmdDrawIndexedInstanced(g_live.pCmd, r.indexCount, 0, 1, 0, r.idx);
                 }
             }
 
@@ -33346,24 +33938,691 @@ void destroyHostWindow(Renderer* R);
             }
             cmdBindRenderTargets(g_live.pCmd, nullptr);
 
+            // ═══════════════════════════════════════════════════════════════════════════════════
+            // MB-1d: FIRST-PERSON OBJECT VELOCITY (arms + weapons)
+            // ═══════════════════════════════════════════════════════════════════════════════════
+            // ⚠⚠ **HERE**, AND NOWHERE ELSE IN THE FRAME. The camera-only pass and the world
+            // object-velocity pass both sit at the colour→water seam because that is the last point
+            // at which pDepth describes the WORLD. This pass has the opposite constraint: the FP
+            // block above bound pDepth with LOAD_ACTION_CLEAR ("MW's z-clear before FP") and then
+            // drew the arms into it, so this — after the FP colour draws, before the phase closes —
+            // is the ONLY point in the frame at which the depth buffer describes the ARMS. Nothing
+            // reads pDepth after the FP pass, so there is no one downstream to disturb.
+            //
+            // ⚠ WHAT WAS ON SCREEN WITHOUT IT. pLinearDepth's last write is the seam re-linearize
+            // (two in-file comments state as an invariant that it can never move later), so over arm
+            // pixels pMotionVectors carried the velocity of the WORLD BEHIND THE ARMS. The arms are
+            // rigidly attached to the camera: their true screen velocity on a turn is ~0 while the
+            // world's is large. The arms smeared when they should have stayed sharp, and a weapon
+            // SWING produced no smear at all because nothing wrote object velocity for FP.
+            //
+            // ⚠ NO SHADER, NO PSO, NO SRT CHANGE, and that is a finding rather than a shortcut.
+            // objvelocity.vert already computes `mul(worlds[idx], p)` against gObjVelParams.viewProj
+            // and `mul(prevWorlds[idx], p)` against prevViewProjRel: feed it the ARM camera pair and
+            // the ARM poses and it produces arm velocity. The camera-attachment cancellation is
+            // automatic — on a turn the arm's camera-relative world matrix rotates AND the FP
+            // viewProj rotates, and the two cancel in the subtraction, which is exactly the property
+            // the CurClip/PrevClip pair was built for. And because FP multimap parts are dropped
+            // client-side (`e.d3dDark || e.d3dDetail || e.d3dGlow`) and host-side (the fill loops
+            // above skip `m.multimap`), FP needs only the two strides the objvel PSOs already have.
+            if (g_objVelFPLane && g_live.objVelFPReady && g_live.objVelReady && g_objVelEnable
+                && g_lastMvRan && g_live.pObjVelBatchCbvFP->pCpuMappedAddress
+                && g_live.pObjVelParamsCbvFP->pCpuMappedAddress
+                && g_fpPrevViewProjFrame != 0 && g_fpPrevViewProjFrame + 1u == g_renderFrame) {
+                // ⚠ GATED ON g_lastMvRan, NOT MERELY ON THE PIPELINES. This lane OVERWRITES pixels
+                // in pMotionVectors; if the camera pass did not run this frame the texture holds an
+                // older frame's field, and painting fresh arm vectors into a stale world would be
+                // worse than leaving it alone — a coherent-looking frame with one correct object in
+                // it. Same argument objVelReady's gate on mvReady already makes, one frame down.
+                //
+                // ⚠ AND ON THE ARM CAMERA BEING **LAST FRAME'S**. g_fpPrevViewProjFrame is stamped
+                // only on frames that actually rendered arms, so third person, a menu or an empty
+                // hand leaves it behind; requiring exactly g_renderFrame - 1 pins the pair to
+                // consecutive rasters, which is also what makes g_prevBakeEye (stamped every frame)
+                // the right origin to fold in below.
+                gpuPhaseBegin(kGpuPhaseObjVelFP);
+
+                // ─── THE FP CAMERA PAIR ─────────────────────────────────────────────────────────
+                float* ofp = (float*)g_live.pObjVelParamsCbvFP->pCpuMappedAddress;
+                // [0..15] THIS frame's arm viewProj — the same fpRz the arms were rasterised with,
+                // so the GEQUAL test below compares like with like.
+                std::memcpy(ofp, fpRzSaved, 64);
+                // [16..31] fpPrevViewProjRel = Translate(bakeEye_now - bakeEye_prev) * fpViewProj_prev.
+                //
+                // ⚠⚠ THE ORIGIN FOLD IS THE SAME ONE, AND THE DELTA IS THE SAME DELTA. FP worlds are
+                // camera-relative under the *same* DistantLand::eyePos shift as the main pass —
+                // emitStaticDraw/emitSkinnedDraw are shared by the world and FP build paths and
+                // subtract that one eye — so the correction is identical and the delta is read from
+                // g_lastMvDelta, which the camera pass stashed at fill time. Deriving a second copy
+                // here would be a second place for the fold to go wrong, and a disagreement would
+                // show as arms whose velocity is offset from the world's by a constant.
+                //
+                // Row-major, row-vector convention: T is identity with the translation in row 3, so
+                // T*VP keeps rows 0..2 verbatim and row 3 becomes d·VP + VP_row3. The accumulation
+                // is in double for the reason the camera pass gives — d is tens of units against VP
+                // entries that reach the far plane.
+                {
+                    const double dx = g_lastMvDelta[0];
+                    const double dy = g_lastMvDelta[1];
+                    const double dz = g_lastMvDelta[2];
+                    const float* fpv = g_fpPrevViewProj;
+                    for (int i = 0; i < 12; ++i) { ofp[16 + i] = fpv[i]; }
+                    for (int c = 0; c < 4; ++c) {
+                        ofp[16 + 12 + c] = (float)(dx * (double)fpv[0 + c]
+                                                 + dy * (double)fpv[4 + c]
+                                                 + dz * (double)fpv[8 + c]
+                                                 + (double)fpv[12 + c]);
+                    }
+                }
+                ofp[32] = (float)g_live.width;
+                ofp[33] = (float)g_live.height;
+                ofp[34] = 1.0f / (float)g_live.width;
+                ofp[35] = 1.0f / (float)g_live.height;
+                // opts.x = "there was a previous frame". The gate above already required it, so this
+                // is 1 by construction — written rather than assumed, because a zero here is a
+                // whole-lane no-op and an unwritten lane reads whatever the last frame left.
+                ofp[36] = 1.0f;
+                // MB-1e: opts.y = "stamp the arm-depth constant into gObjVelDepthOut". THE ONLY
+                // instance that sets it — the world fill writes op[37] = 0 — because the same
+                // store from the world lane would replace every mover's device depth with the near
+                // plane. See objvelocity.frag's note.
+                ofp[37] = 1.0f;
+                ofp[38] = ofp[39] = 0.0f;
+
+                // `mm` is the FP1e stride axis, the world lane's ObjVelRec::mm verbatim: a
+                // multi-map mesh is 60 bytes per vertex against the rigid 36, and the stride is a
+                // PSO property — so the replay must switch pipeline AND vertex stride on it.
+                struct FPVelRec  { Buffer* vb; Buffer* ib; uint32_t indexCount, firstVertex, firstIndex, idx; int mirror, mm; };
+                struct FPVelSkinRec { Buffer* vb; Buffer* ib; uint32_t indexCount, inst; int mirror; };
+                static std::vector<FPVelRec>     s_fpVel;       // single-threaded record (renderScene)
+                static std::vector<FPVelSkinRec> s_fpVelSkin;
+                s_fpVel.clear();
+                s_fpVelSkin.clear();
+                uint32_t fvPair = 0, fvKind = 0, fvCap = 0, fvStill = 0;
+                // MB-1d identity probe: the FIRST accepted rigid part whose bound centre actually
+                // projects INSIDE the arm frustum. ⚠ NOT simply the first accepted part — that was
+                // the first version and it measured nothing at all. The FP pass does no culling, so
+                // its list carries parts below and behind the camera (the one at index 0 in the test
+                // scene projects to y/w = -4.9, five screen-heights under the view); a probe pinned
+                // to index 0 therefore sat off-frame every frame, and an unbounded x/w is what put
+                // five- and six-figure "pixel" counts into the first readings.
+                bool fvIdDone = false;
+                uint32_t fvsPair = 0, fvsKind = 0, fvsBlend = 0, fvsBones = 0, fvsCap = 0,
+                         fvsStill = 0, fvsUsed = 0;
+
+                // ─── THE RIGID WALK ─────────────────────────────────────────────────────────────
+                // ⚠ NO CANDIDACY FILTER. See the pose-bookkeeping block beside the multimap one:
+                // `everMoved` / `isLive` are written only by refreshCasterRecord, which FP parts
+                // never reach, so a filter on them would read "not live, never moved" for every arm
+                // and switch this lane off while looking like a filter. The cost argument that
+                // justifies the world lane's filter does not exist here either — 8 rigid parts
+                // against a cap of 128 — and the still-snap below makes a motionless part free.
+                float* fbatch = (float*)g_live.pObjVelBatchCbvFP->pCpuMappedAddress;
+                if (fp->drawBlob && fp->drawCount && fp->drawBytes) {
+                    const uint32_t haveFPV = fp->drawBytes / (uint32_t)sizeof(IPC::DrawItemWire);
+                    uint32_t nFPV = (fp->drawCount < haveFPV) ? fp->drawCount : haveFPV;
+                    if (nFPV > kMaxFPDraws) { nFPV = kMaxFPDraws; }
+                    const IPC::DrawItemWire* fvItems = (const IPC::DrawItemWire*)fp->drawBlob;
+                    for (uint32_t k = 0; k < nFPV && s_fpVel.size() < kObjVelBatch; ++k) {
+                        const IPC::DrawItemWire& it = fvItems[k];
+                        const uint32_t slot = it.slot;
+                        if (slot >= g_meshHigh || !g_meshes[slot].valid) { ++fvKind; continue; }
+                        HostMesh& m = g_meshes[slot];
+                        if (m.skinned || m.multimap) { ++fvKind; continue; }
+                        // ⚠ THE PAIRING KEY, THE RIGID LANE'S VERBATIM. lastWorldFrame == this frame
+                        // pins the near end to now, which makes prevWorldFrame + 1 == lastWorldFrame
+                        // mean exactly "the previous frame" rather than merely "two consecutive
+                        // frames, sometime". A part that fails it keeps the camera-only vector for
+                        // one frame, which is visually inert.
+                        if (m.prevWorldFrame == 0 || m.lastWorldFrame != g_renderFrame
+                            || m.prevWorldFrame + 1u != m.lastWorldFrame) {
+                            ++fvPair; continue;
+                        }
+                        Buffer* meshVb = m.inArena ? g_live.pArenaVB : m.vb;
+                        Buffer* meshIb = m.inArena ? g_live.pArenaIB : m.ib;
+                        if (!meshVb || !meshIb) { ++fvKind; continue; }
+
+                        const uint32_t idx = (uint32_t)s_fpVel.size();
+                        // worlds[idx] = the CAMERA-RELATIVE transform this draw actually used, and
+                        // prevWorlds[idx] = last frame's ABSOLUTE record brought back into this
+                        // frame's camera-relative space — the rigid lane's arrangement exactly,
+                        // because the FP bookkeeping stores the record the same way.
+                        std::memcpy(fbatch + (size_t)idx * 16, it.world, 64);
+                        float* pw = fbatch + (size_t)(kObjVelBatch + idx) * 16;
+                        std::memcpy(pw, m.prevWorld, 64);
+                        pw[12] = m.prevWorld[12] - g_eyeAbsShadow[0];
+                        pw[13] = m.prevWorld[13] - g_eyeAbsShadow[1];
+                        pw[14] = m.prevWorld[14] - g_eyeAbsShadow[2];
+
+                        // The still-snap, for the rigid lane's reason exactly: the +eye/-eye round
+                        // trip is lossy at |eye| ~ 2.2e4, so a motionless part's rebased pose differs
+                        // from the pose it is drawn with in the low bits, and MB-2 integrates ALONG
+                        // that difference. Same bytes ⇒ bit-identical clip positions ⇒ exact zero.
+                        bool unmoved = true;
+                        for (int e = 0; e < 12; ++e) {
+                            if (pw[e] != it.world[e]) { unmoved = false; break; }
+                        }
+                        if (unmoved) {
+                            const float eyeMag = std::max(std::max(std::fabs(g_eyeAbsShadow[0]),
+                                                                   std::fabs(g_eyeAbsShadow[1])),
+                                                          std::fabs(g_eyeAbsShadow[2]));
+                            const float eps = std::max(eyeMag, 1.0f) * 4.0f * 1.1920929e-7f;   // 4 ULP
+                            for (int e = 12; e < 15; ++e) {
+                                if (std::fabs(pw[e] - it.world[e]) > eps) { unmoved = false; break; }
+                            }
+                        }
+                        if (unmoved) { std::memcpy(pw, it.world, 64); ++fvStill; }
+
+                        // ─── THE CAMERA-TURN IDENTITY, RUN ON THE FIRST ACCEPTED PART ───────
+                        // See g_objVelFPIdArmPx. ONE point — the part's model-space bound centre —
+                        // pushed through the FP camera pair TWICE, with the same row-vector
+                        // arithmetic the shader uses:
+                        //
+                        //   armPx  = |now through NOW's camera  −  the PREVIOUS POSE through the
+                        //            PREVIOUS camera|  — the vector this lane actually writes.
+                        //   turnPx = |now through NOW's camera  −  the SAME POINT HELD STILL in
+                        //            world space through the PREVIOUS camera| — what that pixel
+                        //            would carry if the arm were world-static, i.e. the camera-only
+                        //            answer, i.e. THE NUMBER THAT USED TO BE THERE.
+                        //
+                        // ⚠⚠ BOTH THROUGH THE **FP** CAMERA, and the first version of this check
+                        // got that wrong in a way worth recording: it took turnPx through the WORLD
+                        // camera pair, and an arm sits INSIDE the world camera's near plane (which
+                        // is the entire reason MW draws the arms in a separate scene). Both halves
+                        // then divided by a near-zero w, blew up together to five and six figures,
+                        // and their RATIO went to ~1 — a reading that looks exactly like "the lane
+                        // is writing the world's motion" while measuring nothing but a degenerate
+                        // projection. Sharing one camera and one current position makes the two
+                        // numbers differ ONLY by the thing under test.
+                        //
+                        // ⚠ AND AN ON-SCREEN GUARD, for the same reason: a point outside the
+                        // frustum has an unbounded x/w and would own the peak forever.
+                        if (!fvIdDone) {
+                            auto rowMul = [](const float v[4], const float* M, float out[4]) {
+                                for (int c = 0; c < 4; ++c) {
+                                    out[c] = v[0] * M[0 + c] + v[1] * M[4 + c]
+                                           + v[2] * M[8 + c] + v[3] * M[12 + c];
+                                }
+                            };
+                            auto pxDelta = [&](const float a[4], const float b[4]) {
+                                const float ax = (a[0] / a[3]) * 0.5f * (float)g_live.width;
+                                const float ay = (a[1] / a[3]) * 0.5f * (float)g_live.height;
+                                const float bx = (b[0] / b[3]) * 0.5f * (float)g_live.width;
+                                const float by = (b[1] / b[3]) * 0.5f * (float)g_live.height;
+                                return std::sqrt((ax - bx) * (ax - bx) + (ay - by) * (ay - by));
+                            };
+                            const float p4[4] = { m.localCenter[0], m.localCenter[1],
+                                                  m.localCenter[2], 1.0f };
+                            float wpNow[4], wpPrev[4], curC[4], prevC[4], heldC[4], poseC[4];
+                            rowMul(p4,     it.world,  wpNow);    // the arm point, this frame
+                            rowMul(p4,     pw,        wpPrev);   // ...and last frame's, rebased
+                            rowMul(wpNow,  ofp,       curC);     // through THIS frame's arm camera
+                            rowMul(wpPrev, ofp + 16,  prevC);    // last pose, last camera (folded)
+                            rowMul(wpNow,  ofp + 16,  heldC);    // SAME point, last camera: the turn
+                            rowMul(wpPrev, ofp,       poseC);    // last pose, THIS camera: the pose
+                            // On screen and in front, in every one of the three projections — the
+                            // identity is only meaningful where the arm is actually drawn.
+                            auto onScreen = [](const float c[4]) {
+                                return c[3] > 1.0e-3f && std::fabs(c[0]) <= c[3]
+                                                      && std::fabs(c[1]) <= c[3];
+                            };
+                            // ⚠ ONE-SHOT DUMP, because the guard rejecting EVERY frame and the
+                            // guard being wrong look identical from a counter. Printed once per
+                            // session, on the first evaluated part, with every intermediate: the
+                            // model point, where it lands in camera-relative world, and all three
+                            // clip positions. If w is tiny the probe sits on the eye; if |x| > w it
+                            // is merely off-frame and the guard is too strict.
+                            static bool s_fpIdDumped = false;
+                            if (!s_fpIdDumped && onScreen(curC) && onScreen(prevC) && onScreen(heldC)) {
+                                s_fpIdDumped = true;
+                                LOG::logline(">> [objvel-fp probe] slot=%u local=(%.2f, %.2f, %.2f) r=%.2f"
+                                             " | wpNow=(%.2f, %.2f, %.2f) wpPrev=(%.2f, %.2f, %.2f)"
+                                             " | curC=(%.3f, %.3f, %.3f, %.3f)"
+                                             " prevC=(%.3f, %.3f, %.3f, %.3f)"
+                                             " heldC=(%.3f, %.3f, %.3f, %.3f)",
+                                             slot, (double)m.localCenter[0], (double)m.localCenter[1],
+                                             (double)m.localCenter[2], (double)m.localRadius,
+                                             (double)wpNow[0], (double)wpNow[1], (double)wpNow[2],
+                                             (double)wpPrev[0], (double)wpPrev[1], (double)wpPrev[2],
+                                             (double)curC[0], (double)curC[1], (double)curC[2], (double)curC[3],
+                                             (double)prevC[0], (double)prevC[1], (double)prevC[2], (double)prevC[3],
+                                             (double)heldC[0], (double)heldC[1], (double)heldC[2], (double)heldC[3]);
+                                LOG::flush();
+                            }
+                            if (onScreen(curC) && onScreen(prevC) && onScreen(heldC)
+                                && onScreen(poseC)) {
+                                fvIdDone = true;   // one probe per frame; the rest of the walk skips it
+                                const float armPx  = pxDelta(prevC, curC);
+                                const float turnPx = pxDelta(heldC, curC);
+                                const float posePx = pxDelta(poseC, curC);
+                                ++g_objVelFPIdSamples;
+                                if (turnPx > g_objVelFPIdTurnPx) {
+                                    g_objVelFPIdTurnPx   = turnPx;
+                                    g_objVelFPIdArmPx     = armPx;
+                                    g_objVelFPIdPosePx    = posePx;
+                                    g_objVelFPIdPeakFrame = g_renderFrame;
+                                }
+                                // ⚠⚠ NO "IS IT CAMERA-ATTACHED" GATE, AND THE ONE THAT WAS HERE IS
+                                // WORTH RECORDING AS A DEAD END. The plan's test says "turn the
+                                // camera WITH THE ARMS IDLE", and Morrowind's first-person arms are
+                                // never idle — the weapon bobs and swings continuously. The attempt
+                                // to recover the idle case automatically was to keep only frames
+                                // whose pose delta was TANGENTIAL (on a sphere about the eye, which
+                                // is the only thing a camera rotation can produce). It does not
+                                // work: a weapon SWING is mostly tangential too, so the filter kept
+                                // swings, starved the sample to 3-9 frames of 52, and still could
+                                // not tell "rotated with the camera" from "swung". A gate that
+                                // cannot fail for the reason it exists is not a gate.
+                                //
+                                // The verdict below needs none of it — see g_objVelFPIdResCancel:
+                                // it asks about DIRECTION (does the camera term subtract?) rather
+                                // than magnitude, and that question is answerable while the arm is
+                                // swinging.
+                                if (turnPx > 1.0f) {
+                                    g_objVelFPIdSumArm   += (double)armPx;
+                                    g_objVelFPIdSumTurn += (double)turnPx;
+                                    g_objVelFPIdSumPose  += (double)posePx;
+                                    g_objVelFPIdResCancel += std::fabs((double)armPx
+                                                          - std::fabs((double)posePx - (double)turnPx));
+                                    g_objVelFPIdResAdd    += std::fabs((double)armPx
+                                                          - ((double)posePx + (double)turnPx));
+                                    ++g_objVelFPIdMoved;
+                                }
+                            }
+                        }
+
+                        const uint32_t firstVertex = m.inArena ? (uint32_t)(m.vbOff / sizeof(IPC::GeomVertexWire)) : 0u;
+                        const uint32_t firstIndex  = m.inArena ? (uint32_t)(m.ibOff / sizeof(uint16_t)) : 0u;
+                        s_fpVel.push_back({ meshVb, meshIb, m.indexCount, firstVertex, firstIndex,
+                                            idx, worldMirrored(it.world) ? 1 : 0, /*mm=*/0 });
+                    }
+                    if (s_fpVel.size() >= kObjVelBatch) { fvCap = 1; }
+                }
+
+                // ─── THE MULTI-MAP WALK (FP1e) ──────────────────────────────────────────────────
+                // The rigid walk's clauses, clause for clause, over the FP multi-map wire array —
+                // the same relationship the world lane's MM walk has to its rigid one, and for the
+                // same reason: a multi-map part is RIGID (a world matrix, not a bone blend), so
+                // objvelocity.vert is already the right program and POSITION sits at offset 0 in
+                // GeomVertexWireMM exactly as it does in GeomVertexWire. Only the stride differs.
+                //
+                // ⚠ NO CANDIDACY FILTER, for the FP lane's reason: everMoved/isLive are written
+                // only inside refreshCasterRecord, which no FP part ever reaches, so a filter on
+                // them would read "not live, never moved" for every one and switch the lane off
+                // while looking like a filter. [[feedback_confirm_population_reaches_the_filter]]
+                //
+                // ⚠ INTO THE SAME BATCH (fbatch) AND THE SAME idx SPACE as the rigid walk above —
+                // one cbuffer, one instance stream, `s_fpVel.size()` as the running index — which
+                // is what lets the two lanes interleave in one record list and switch PSO per draw.
+                // ⚠ SNAPSHOT THE RIGID COUNT BEFORE THIS WALK APPENDS TO THE SAME LIST. Both lanes
+                // share s_fpVel (one batch cbuffer, one idx space), so `s_fpVel.size()` after this
+                // point is rigid + MM — publishing it as `rigid=` would have the weapon's parts
+                // reported as arm parts and hide an MM lane that never ran.
+                const uint32_t fvRigidDrawn = (uint32_t)s_fpVel.size();
+                uint32_t fvmPair = 0, fvmKind = 0, fvmStill = 0, fvmDrawn = 0;
+                if (fp->mmBlob && fp->mmCount && fp->mmBytes
+                    && g_live.pObjVelPipelineMM && g_live.pObjVelPipelineMMMirror) {
+                    const uint32_t haveFPM = fp->mmBytes / (uint32_t)sizeof(IPC::MultiMapDrawWire);
+                    uint32_t nFPM = (fp->mmCount < haveFPM) ? fp->mmCount : haveFPM;
+                    if (nFPM > kMaxFPDraws) { nFPM = kMaxFPDraws; }
+                    const IPC::MultiMapDrawWire* fmItems = (const IPC::MultiMapDrawWire*)fp->mmBlob;
+                    for (uint32_t k = 0; k < nFPM && s_fpVel.size() < kObjVelBatch; ++k) {
+                        const IPC::MultiMapDrawWire& it = fmItems[k];
+                        const uint32_t slot = it.slot;
+                        if (slot >= g_meshHigh || !g_meshes[slot].valid
+                            || !g_meshes[slot].multimap) { ++fvmKind; continue; }
+                        HostMesh& m = g_meshes[slot];
+                        if (m.prevWorldFrame == 0 || m.lastWorldFrame != g_renderFrame
+                            || m.prevWorldFrame + 1u != m.lastWorldFrame) {
+                            ++fvmPair; continue;
+                        }
+                        // Never in the arena (the upload's `!isSkinned && !isMultiMap` branch), so
+                        // always its own vb/ib drawn from offset 0.
+                        if (!m.vb || !m.ib) { ++fvmKind; continue; }
+
+                        const uint32_t idx = (uint32_t)s_fpVel.size();
+                        std::memcpy(fbatch + (size_t)idx * 16, it.world, 64);
+                        float* pw = fbatch + (size_t)(kObjVelBatch + idx) * 16;
+                        std::memcpy(pw, m.prevWorld, 64);
+                        pw[12] = m.prevWorld[12] - g_eyeAbsShadow[0];
+                        pw[13] = m.prevWorld[13] - g_eyeAbsShadow[1];
+                        pw[14] = m.prevWorld[14] - g_eyeAbsShadow[2];
+
+                        // The still-snap, the rigid lane's derivation verbatim: the +eye/-eye round
+                        // trip is lossy at |eye| ~ 2.2e4, and MB-2 integrates ALONG the residue.
+                        bool unmoved = true;
+                        for (int e = 0; e < 12; ++e) {
+                            if (pw[e] != it.world[e]) { unmoved = false; break; }
+                        }
+                        if (unmoved) {
+                            const float eyeMag = std::max(std::max(std::fabs(g_eyeAbsShadow[0]),
+                                                                   std::fabs(g_eyeAbsShadow[1])),
+                                                          std::fabs(g_eyeAbsShadow[2]));
+                            const float eps = std::max(eyeMag, 1.0f) * 4.0f * 1.1920929e-7f;   // 4 ULP
+                            for (int e = 12; e < 15; ++e) {
+                                if (std::fabs(pw[e] - it.world[e]) > eps) { unmoved = false; break; }
+                            }
+                        }
+                        if (unmoved) { std::memcpy(pw, it.world, 64); ++fvmStill; }
+
+                        s_fpVel.push_back({ m.vb, m.ib, m.indexCount, 0u, 0u, idx,
+                                            worldMirrored(it.world) ? 1 : 0, /*mm=*/1 });
+                        ++fvmDrawn;
+                    }
+                    if (s_fpVel.size() >= kObjVelBatch) { fvCap = 1; }
+                }
+
+                // ─── THE SKINNED WALK ───────────────────────────────────────────────────────────
+                // ⚠⚠ ITS OWN CURSOR, AND IT MUST NEVER CALL skinPackNext. Six walks over the FP
+                // skinned blob now exist and the shared packing cursor's invariant — no part ever
+                // draws with another part's palette — rests on them staying bit-identical. This walk
+                // has different skip rules (it drops blended parts and parts with no previous pose),
+                // so it packs into its OWN windows off its OWN cursor and touches none of that. The
+                // FP colour walk above runs its own `fpPackCur` for the same reason.
+                if (g_live.objVelSkinReady && g_objVelSkinnedLane
+                    && g_live.pObjVelBonesCurCbvFP && g_live.pObjVelBonesPrevCbvFP
+                    && g_live.pObjVelSkinInstanceBufFP
+                    && fp->skinnedBlob && fp->skinnedCount && fp->skinnedBytes) {
+                    float* curBones  = (float*)g_live.pObjVelBonesCurCbvFP->pCpuMappedAddress;
+                    float* prevBones = (float*)g_live.pObjVelBonesPrevCbvFP->pCpuMappedAddress;
+                    uint32_t* sinst  = (uint32_t*)g_live.pObjVelSkinInstanceBufFP->pCpuMappedAddress;
+                    // Parity, because this walk WRITES the retention while READING last frame's out
+                    // of it — MB-1b's note is the long version. A separate array from the world
+                    // lane's: the two cursors both start at 0, so one shared array would have the FP
+                    // walk overwrite the world walk's history at exactly the offsets it reads.
+                    float*       retCur  = g_fpObjVelBoneRet[g_renderFrame & 1u];
+                    const float* retPrev = g_fpObjVelBoneRet[(g_renderFrame - 1u) & 1u];
+                    // The dBake origin correction: the retained palette is camera-relative to LAST
+                    // frame's bake eye while fpPrevViewProjRel expects THIS frame's (it folds the
+                    // same delta into itself), so every previous bone's translation row needs
+                    // -dBake. Parked it is exactly 0.0f and `x - 0.0f` is exactly x, which is what
+                    // lets the still-snap below stay an exact comparison.
+                    const float dBake[3] = { (float)g_lastMvDelta[0],
+                                             (float)g_lastMvDelta[1],
+                                             (float)g_lastMvDelta[2] };
+
+                    const uint8_t* sp   = (const uint8_t*)fp->skinnedBlob;
+                    const uint8_t* sEnd = sp + fp->skinnedBytes;
+                    uint32_t cursor = 0;   // OUR cursor into OUR windows — never skinPackNext
+                    for (uint32_t k = 0; k < fp->skinnedCount; ++k) {
+                        if (sp + sizeof(IPC::SkinnedDrawWire) > sEnd) { break; }
+                        IPC::SkinnedDrawWire item;
+                        std::memcpy(&item, sp, sizeof(item));
+                        const uint8_t* palette = sp + sizeof(item);
+                        const uint32_t bones = (item.numBones < kMaxBonesPerPart)
+                                             ? item.numBones : kMaxBonesPerPart;
+                        const uint64_t paletteBytes = (uint64_t)item.numBones * 64;
+                        if (palette + paletteBytes > sEnd) { break; }   // truncated palette
+                        sp = palette + paletteBytes;                    // advance regardless
+
+                        const uint32_t slot = item.slot;
+                        if (slot >= g_meshHigh || !g_meshes[slot].valid
+                            || !g_meshes[slot].skinned) { ++fvsKind; continue; }
+                        if (bones == 0) { ++fvsKind; continue; }
+                        // Blended skinned parts are not drawn — the world skinned lane's reason
+                        // (no texture, no alpha to cut with, so a sheer part would overwrite
+                        // whatever is behind it across its whole quad). ⚠ THIS COUNTER SHOULD READ
+                        // 0 FOREVER: the CLIENT already drops blended skinned FP parts
+                        // (`if (e.blendEnable) ++skip.blendSkin`), so none reach the host at all.
+                        // Kept as the same defensive clause the other lanes carry, and counted so
+                        // that "0" is an observation rather than an assumption.
+                        if (skinIsBlended(item)) { ++fvsBlend; continue; }
+                        // ⚠ kMaxFPSkinned, NOT kObjVelSkinned, AND THE DIFFERENCE IS CORRECTNESS.
+                        // The FP COLOUR pass stops at kMaxFPSkinned and a part it never drew has no
+                        // depth of its own in pDepth — under reverse-Z the untouched clear is 0.0,
+                        // which GEQUAL passes for everything, so an undrawn part would paint its
+                        // velocity straight over whatever is actually visible there. This lane must
+                        // never reach further into the blob than the pass it is describing.
+                        if (s_fpVelSkin.size() >= kMaxFPSkinned) { fvsCap = 1; continue; }
+                        // SKIPPED AND COUNTED, NEVER WRAPPED: a wrapped base hands a part another
+                        // part's skeleton, which is the worst failure this pass has.
+                        if (cursor + bones > kObjVelBones) { ++fvsBones; continue; }
+
+                        HostMesh& m = g_meshes[slot];
+                        if (!m.vb || !m.ib) { ++fvsKind; continue; }
+                        const uint32_t base = cursor;
+                        cursor += bones;
+
+                        std::memcpy(curBones + (size_t)base * 16, palette, (size_t)bones * 64);
+                        std::memcpy(retCur   + (size_t)base * 16, palette, (size_t)bones * 64);
+
+                        // The pairing key, MB-1b's clause for clause: a duplicate sighting in the
+                        // SAME frame would overwrite the base the first sighting recorded (and is
+                        // therefore counted, not assumed away); no record at all; a generation that
+                        // is not exactly the previous frame; a changed bone count (a different mesh
+                        // in a recycled slot); a base that no longer fits the window.
+                        bool paired = true;
+                        bool dupThisFrame = false;
+                        if (m.prevBoneFrame == g_renderFrame)          { paired = false; dupThisFrame = true; }
+                        else if (m.prevBoneFrame == 0)                 { paired = false; }
+                        else if (m.prevBoneFrame + 1u != g_renderFrame){ paired = false; }
+                        else if (m.prevBoneCount != bones)             { paired = false; }
+                        else if (m.prevBoneBase + bones > kObjVelBones){ paired = false; }
+                        const uint32_t prevBase = m.prevBoneBase;
+                        // Recorded BEFORE the early-out, and even for a part not drawn: a part that
+                        // cannot pair this frame must still be able to pair on the next one. A
+                        // duplicate leaves the FIRST sighting's record standing.
+                        if (!dupThisFrame) {
+                            m.prevBoneBase  = base;
+                            m.prevBoneCount = bones;
+                            m.prevBoneFrame = g_renderFrame;
+                        }
+                        if (!paired) { ++fvsPair; continue; }
+
+                        const float* src = retPrev + (size_t)prevBase * 16;
+                        float*       dst = prevBones + (size_t)base * 16;
+                        const float* cur = curBones + (size_t)base * 16;
+                        for (uint32_t b = 0; b < bones; ++b) {
+                            const float* sb = src + (size_t)b * 16;
+                            float*       db = dst + (size_t)b * 16;
+                            std::memcpy(db, sb, 64);
+                            db[12] = sb[12] - dBake[0];
+                            db[13] = sb[13] - dBake[1];
+                            db[14] = sb[14] - dBake[2];
+                        }
+                        // And if nothing moved, the two palettes must be the SAME BYTES — MB-1a's
+                        // still-snap one level down. Parked, dBake is exactly zero and this compare
+                        // is exact; when the camera HAS moved the tolerance is a few ULP at the
+                        // magnitude the subtraction actually worked at.
+                        const float dMag = std::max(std::max(std::fabs(dBake[0]), std::fabs(dBake[1])),
+                                                    std::fabs(dBake[2]));
+                        const float eps  = std::max(dMag, 1.0f) * 4.0f * 1.1920929e-7f;   // 4 ULP
+                        bool unmoved = true;
+                        for (uint32_t e = 0; e < bones * 16u && unmoved; ++e) {
+                            if ((e & 15u) >= 12u && (e & 15u) <= 14u) {
+                                if (std::fabs(dst[e] - cur[e]) > eps) { unmoved = false; }
+                            } else if (dst[e] != cur[e]) {
+                                unmoved = false;
+                            }
+                        }
+                        if (unmoved) { std::memcpy(dst, cur, (size_t)bones * 64); ++fvsStill; }
+
+                        const uint32_t inst = (uint32_t)s_fpVelSkin.size();
+                        sinst[inst] = base;
+                        s_fpVelSkin.push_back({ m.vb, m.ib, m.indexCount, inst,
+                                                item.mirror ? 1 : 0 });
+                    }
+                    fvsUsed = cursor;
+                }
+
+                // ─── THE REPLAY ─────────────────────────────────────────────────────────────────
+                if (!s_fpVel.empty() || !s_fpVelSkin.empty()) {
+                    // pMotionVectors is resting in SHADER_RESOURCE (the world objvel pass put it
+                    // back there). The round trip is simultaneously the state change and the SYNC
+                    // POINT against everything that has read it since.
+                    //
+                    // MB-1e: pLinearDepth rides the same pair. It rests in SHADER_RESOURCE (its
+                    // last write was the seam re-linearize, and two in-file comments state as an
+                    // invariant that that can never move later), so the round trip is again both
+                    // the state change and the sync point against everything that has read it.
+                    //
+                    // ⚠ ORDERING IS ALREADY RIGHT AND MUST STAY SO. pMvPrevDepth is COPIED from
+                    // pLinearDepth back at the MV pass, BEFORE this write — so next frame's
+                    // reactive-mask history stays arm-free and self-consistent, and the arms never
+                    // appear as "geometry that vanished" to the reprojection.
+                    TextureBarrier fvb[2] = {};
+                    fvb[0].pTexture      = g_live.pMotionVectors;
+                    fvb[0].mCurrentState = RESOURCE_STATE_SHADER_RESOURCE;
+                    fvb[0].mNewState     = RESOURCE_STATE_UNORDERED_ACCESS;
+                    uint32_t nFvb = 1;
+                    if (g_live.pLinearDepth) {
+                        fvb[1].pTexture      = g_live.pLinearDepth;
+                        fvb[1].mCurrentState = RESOURCE_STATE_SHADER_RESOURCE;
+                        fvb[1].mNewState     = RESOURCE_STATE_UNORDERED_ACCESS;
+                        nFvb = 2;
+                    }
+                    cmdResourceBarrier(g_live.pCmd, 0, nullptr, nFvb, fvb, 0, nullptr);
+
+                    // ⚠ LOAD_ACTION_LOAD, NEVER CLEAR. The FP colour block bound this same buffer
+                    // with LOAD_ACTION_CLEAR to reproduce MW's z-clear; re-binding it that way here
+                    // would erase the arm depth this pass exists to test against, and every fragment
+                    // would then pass GEQUAL — including the ones hidden behind a nearer arm part.
+                    BindRenderTargetsDesc fbindV = {};
+                    fbindV.mRenderTargetCount = 0;   // UAV write; see objvelocity.srt.h
+                    fbindV.mDepthStencil = { g_live.pDepth, LOAD_ACTION_LOAD };
+                    cmdBindRenderTargets(g_live.pCmd, &fbindV);
+                    cmdSetViewport(g_live.pCmd, 0.0f, 0.0f, (float)g_live.width, (float)g_live.height, 0.0f, 1.0f);
+                    cmdSetScissor(g_live.pCmd, 0, 0, g_live.width, g_live.height);
+
+                    cmdBeginDebugMarker(g_live.pCmd, 0.9f, 0.6f, 0.2f, "OBJECT VELOCITY — FIRST PERSON");
+                    const uint32_t fvStride[2] = { (uint32_t)sizeof(IPC::GeomVertexWire),
+                                                   (uint32_t)sizeof(uint32_t) };
+                    if (!s_fpVel.empty()) {
+                        // ⚠ PIPELINE FIRST, THEN THE SET — and this block is inside the very pass
+                        // whose comment is the long version of why. cmdBindDescriptorSet routes to
+                        // the GRAPHICS or the COMPUTE root table by whichever pipeline is CURRENTLY
+                        // bound, and the pipeline current here is one of the FP colour ones, so the
+                        // order is merely correct rather than load-bearing today — it becomes
+                        // load-bearing the moment anything compute is recorded between them.
+                        //
+                        // ⚠ AND THE **INDEX IS 1**. Instance 0 is the world table; binding it here
+                        // would hand these draws the world's viewProj and the world's batch, i.e.
+                        // arms wearing some door's matrix — which is precisely what binding the FP
+                        // colour sets to the compute root table once did to the arms themselves.
+                        cmdBindPipeline(g_live.pCmd, g_live.pObjVelPipeline);
+                        cmdBindDescriptorSet(g_live.pCmd, 1, g_live.pObjVelSet);
+                        // FP1e: TWO state axes, and BOTH must trigger a rebind — the world lane's
+                        // note is the long version. `fMM` starts at 0 to match the unconditional
+                        // non-MM bind immediately above, so the first MM record rebinds correctly
+                        // however the list happens to be ordered.
+                        const uint32_t fvStrideMM[2] = { (uint32_t)sizeof(IPC::GeomVertexWireMM),
+                                                         (uint32_t)sizeof(uint32_t) };
+                        int fMirror = 0, fMM = 0;
+                        for (const FPVelRec& r : s_fpVel) {
+                            if (r.mirror != fMirror || r.mm != fMM) {
+                                Pipeline* fvpipe = r.mm
+                                    ? (r.mirror ? g_live.pObjVelPipelineMMMirror : g_live.pObjVelPipelineMM)
+                                    : (r.mirror ? g_live.pObjVelPipelineMirror   : g_live.pObjVelPipeline);
+                                cmdBindPipeline(g_live.pCmd, fvpipe);
+                                cmdBindDescriptorSet(g_live.pCmd, 1, g_live.pObjVelSet);
+                                fMirror = r.mirror;
+                                fMM     = r.mm;
+                            }
+                            // The SHARED identity instance stream — it is written once at build time
+                            // (oinst[k] = k) and never touched at record time, so the world lane's
+                            // recorded draws and these cannot disturb each other through it.
+                            Buffer* fvbs[2] = { r.vb, g_live.pObjVelInstanceBuf };
+                            cmdBindVertexBuffer(g_live.pCmd, 2, fvbs, r.mm ? fvStrideMM : fvStride, nullptr);
+                            cmdBindIndexBuffer(g_live.pCmd, r.ib, INDEX_TYPE_UINT16, 0);
+                            cmdDrawIndexedInstanced(g_live.pCmd, r.indexCount, r.firstIndex, 1,
+                                                    r.firstVertex, r.idx);
+                        }
+                    }
+                    if (!s_fpVelSkin.empty()) {
+                        cmdBindPipeline(g_live.pCmd, g_live.pObjVelSkinPipeline);
+                        cmdBindDescriptorSet(g_live.pCmd, 1, g_live.pObjVelSet);
+                        const uint32_t fsStrides[2] = { (uint32_t)sizeof(IPC::SkinnedVertexWire),
+                                                        (uint32_t)sizeof(uint32_t) };
+                        int fsMirror = 0;
+                        for (const FPVelSkinRec& r : s_fpVelSkin) {
+                            if (r.mirror != fsMirror) {
+                                cmdBindPipeline(g_live.pCmd, r.mirror ? g_live.pObjVelSkinPipelineMirror
+                                                                      : g_live.pObjVelSkinPipeline);
+                                cmdBindDescriptorSet(g_live.pCmd, 1, g_live.pObjVelSet);
+                                fsMirror = r.mirror;
+                            }
+                            Buffer* fsbs[2] = { r.vb, g_live.pObjVelSkinInstanceBufFP };
+                            cmdBindVertexBuffer(g_live.pCmd, 2, fsbs, fsStrides, nullptr);
+                            cmdBindIndexBuffer(g_live.pCmd, r.ib, INDEX_TYPE_UINT16, 0);
+                            cmdDrawIndexedInstanced(g_live.pCmd, r.indexCount, 0, 1, 0, r.inst);
+                        }
+                    }
+                    cmdEndDebugMarker(g_live.pCmd);
+                    cmdBindRenderTargets(g_live.pCmd, nullptr);
+                    // Back to the resting state every consumer downstream expects — the F12 view,
+                    // MB-2's tile pass and the upscaler all sample this texture after the FP pass.
+                    // Same for pLinearDepth, which MB-2's gather reads as gMbDepth.
+                    for (uint32_t b = 0; b < nFvb; ++b) {
+                        fvb[b].mCurrentState = RESOURCE_STATE_UNORDERED_ACCESS;
+                        fvb[b].mNewState     = RESOURCE_STATE_SHADER_RESOURCE;
+                    }
+                    cmdResourceBarrier(g_live.pCmd, 0, nullptr, nFvb, fvb, 0, nullptr);
+                    g_objVelFPRan   = true;
+                    g_objVelFPWhyNot = 0;
+                } else {
+                    g_objVelFPRan   = false;
+                    g_objVelFPWhyNot = 5;   // nothing paired
+                }
+                g_objVelFPDrawn        = fvRigidDrawn;   // rigid only — MM has its own lane below
+                g_objVelFPStill        = fvStill;
+                g_objVelFPSkipPair     = fvPair;
+                g_objVelFPSkipKind     = fvKind;
+                g_objVelFPSkipCap      = fvCap;
+                g_objVelFPMMDrawn      = fvmDrawn;
+                g_objVelFPMMStill      = fvmStill;
+                g_objVelFPMMSkipPair   = fvmPair;
+                g_objVelFPMMSkipKind   = fvmKind;
+                g_objVelFPSkinDrawn    = (uint32_t)s_fpVelSkin.size();
+                g_objVelFPSkinStill    = fvsStill;
+                g_objVelFPSkinSkipPair = fvsPair;
+                g_objVelFPSkinSkipKind = fvsKind;
+                g_objVelFPSkinSkipBlend= fvsBlend;
+                g_objVelFPSkinSkipBones= fvsBones;
+                g_objVelFPSkinSkipCap  = fvsCap;
+                g_objVelFPBonesUsed    = fvsUsed;
+                gpuPhaseEnd(kGpuPhaseObjVelFP);
+            } else {
+                g_objVelFPRan = false;
+                g_objVelFPDrawn = g_objVelFPStill = g_objVelFPSkipPair = 0;
+                g_objVelFPSkipKind = g_objVelFPSkipCap = 0;
+                g_objVelFPSkinDrawn = g_objVelFPSkinStill = g_objVelFPSkinSkipPair = 0;
+                g_objVelFPSkinSkipKind = g_objVelFPSkinSkipBlend = g_objVelFPSkinSkipBones = 0;
+                g_objVelFPSkinSkipCap = g_objVelFPBonesUsed = 0;
+                // ⚠ WHY, NOT MERELY THAT. "rigid=0" and "the lane never entered" are the same line
+                // otherwise, and they need opposite fixes — [[feedback_verify_the_right_artifact]].
+                g_objVelFPWhyNot = !g_objVelFPLane                            ? 1u
+                                 : (!g_live.objVelFPReady || !g_live.objVelReady
+                                    || !g_objVelEnable)                       ? 2u
+                                 : !g_lastMvRan                               ? 3u
+                                 : 4u;   // no previous ARM camera (first FP frame / arms were absent)
+            }
+            // The DENOMINATORS, and they are outside the block on purpose: `rigid=0/8` is the line
+            // that makes this lane's ABSENCE visible, and a count gated on the lane running would
+            // report 0/0 on exactly the frames worth looking at. MB-1c's `mm=0` is what that costs.
+            g_objVelFPInFrame     = fpRigidDrawn;
+            g_objVelFPSkinInFrame = fpSkinnedDrawn;
+            g_objVelFPMMInFrame   = fpMMDrawn;
+
             // On CHANGE, like the client's [fp] line and for the same reason: a part that vanishes
             // between two timed lines is invisible at exactly the moment it matters. bones=used/cap
             // is the one to watch — it is a single window, and a part that would spill it is
             // dropped outright rather than wrapping onto another part's palette.
             static uint32_t s_fpLog = 0;
-            static uint32_t s_lastR = 0xFFFFFFFFu, s_lastS = 0, s_lastA = 0;
+            static uint32_t s_lastR = 0xFFFFFFFFu, s_lastS = 0, s_lastA = 0, s_lastM = 0;
             const bool fpChanged = (fpRigidDrawn != s_lastR || fpSkinnedDrawn != s_lastS
-                                    || fpAlphaDrawn != s_lastA);
+                                    || fpAlphaDrawn != s_lastA || fpMMDrawn != s_lastM);
             if (fpChanged || (s_fpLog % 300) == 0) {
-                LOG::logline(">> [fp host] rigid=%u/%u skinned=%u/%u alpha=%u/%u | "
+                LOG::logline(">> [fp host] rigid=%u/%u skinned=%u/%u alpha=%u/%u mm=%u/%u(blend=%u) | "
                              "skips slot=%u kind=%u buf=%u cap=%u bones=%u | boneWin=%u/%u",
                              fpRigidDrawn, fp->drawCount, fpSkinnedDrawn, fp->skinnedCount,
-                             fpAlphaDrawn, fp->alphaCount,
+                             fpAlphaDrawn, fp->alphaCount, fpMMDrawn, fp->mmCount,
+                             (uint32_t)s_fpMMAlpha.size(),
                              fpSkipSlot, fpSkipKind, fpSkipBuf, fpSkipCap, fpSkipBones,
                              fpBonesUsed, (uint32_t)kBatchSize);
             }
             ++s_fpLog;
             s_lastR = fpRigidDrawn; s_lastS = fpSkinnedDrawn; s_lastA = fpAlphaDrawn;
+            s_lastM = fpMMDrawn;
         }
         gpuPhaseEnd(kGpuPhaseColorFP);
 
@@ -33908,8 +35167,36 @@ void destroyHostWindow(Renderer* R);
         // for the rest of the session. That is the "plausible, smoothly-varying, completely wrong
         // field" the mvActive comment warns DLSS about, reached through a different consumer.
         bool mbRan = false;
-        if (shaderResolve && g_live.mbReady && g_mbEnable && g_lastMvRan
-            && deliveredW > 0u && deliveredH > 0u) {
+        const bool mbEligible = shaderResolve && g_live.mbReady && g_mbEnable && g_lastMvRan
+                             && deliveredW > 0u && deliveredH > 0u;
+        // ═══ MB-2c: HOLD THE BLURRED FRAME WHILE A MENU PAUSES THE GAME ═════════════════════════
+        // MW pauses the sim on a menu, so the camera stops dead, `mv camera: parked(bit-identical)`
+        // fires, every vector goes to EXACT zero, the velocity floor rejects every pixel and the
+        // image snaps sharp mid-turn. Holding the last blurred frame is what was asked for, and it
+        // is also what a real shutter does: nothing arrived to re-expose the film.
+        //
+        // ⚠⚠ THE OUTPUT IS HELD, NOT THE VECTORS, AND THAT CHOICE IS THE WHOLE SAFETY ARGUMENT.
+        // Freezing pMotionVectors is the obvious lever and the wrong one: that texture is ALSO the
+        // upscaler's input, so a stale camera would be handed to DLSS over a static image — the
+        // "plausible, smoothly-varying, completely wrong field" the mvActive comment warns about,
+        // reached deliberately. pMotionBlur is read by exactly ONE consumer, the resolve (instance
+        // [2], picked when mbRan), so holding IT is contained to precisely what was asked. MW keeps
+        // drawing its menu UI over the composite either way.
+        //
+        // ⚠ THE COMMENT DIRECTLY ABOVE THIS GATE IS A WARNING AGAINST EXACTLY THIS, and it is
+        // right: a frozen pMotionBlur is that same failure if it ever outlives its cause. Which is
+        // why the hold needs all THREE of — the sim clock frozen, the previous frame having
+        // actually blurred (so what is held is a real blur of a real frame, not the resting
+        // contents), and MB otherwise eligible — and releases on the first frame sim advances.
+        //
+        // ⚠ SKIPPING THE DISPATCHES SKIPS THEIR BARRIERS TOO, so pMotionBlur simply stays in the
+        // SHADER_RESOURCE state the previous frame left it in. No state fixup, and mbRan stays true
+        // so the resolve keeps picking the blurred instance.
+        const bool holdBlur = mbEligible && g_simFrozen && g_lastMbRan;
+        if (holdBlur) {
+            mbRan = true;
+            ++g_mbHeldFrames;
+        } else if (mbEligible) {
             // The colour source must be readable. On an upscaled frame the gather reads the backend's
             // target, which evaluate() already left in SHADER_RESOURCE; on a native frame it reads
             // pSceneColor, which needs the hoist. Idempotent, so this is a plain call.
@@ -34706,6 +35993,20 @@ void destroyHostWindow(Renderer* R);
         g_prevBakeEye[1] = (double)g_eyeAbsShadow[1];
         g_prevBakeEye[2] = (double)g_eyeAbsShadow[2];
         g_prevViewProjValid = true;
+        // MB-1d: ...and the ARM camera, which is a SEPARATE matrix and a SEPARATE question. The FP
+        // pass renders with its own FOV/near/far, so reprojecting an arm vertex through the world
+        // matrix above would give it the world's parallax and none of its own.
+        //
+        // ⚠ CONDITIONAL, unlike the world snapshot, and STAMPED rather than flagged. The FP pass is
+        // simply absent in third person, in a menu, or with nothing in hand — so "there was an arm
+        // camera last frame" is not answerable by a bool that only ever goes true. Recording the
+        // frame number lets the consumer demand exactly g_renderFrame - 1, which is what makes
+        // g_prevBakeEye (stamped unconditionally, one line up, this frame) the matching origin. A
+        // stale arm camera paired with a fresh bake eye is the origin bug wearing a different hat.
+        if (fpRzValid) {
+            std::memcpy(g_fpPrevViewProj, fpRzSaved, sizeof(g_fpPrevViewProj));
+            g_fpPrevViewProjFrame = g_renderFrame;
+        }
 
         g_live.firstFrame = false;
         g_lastDrawn = drawn;
@@ -35111,14 +36412,20 @@ void destroyHostWindow(Renderer* R);
                 // 0.22 to 2.09 ms. Same defect as MB-2 step 0's parked lane, one level down.
                 //
                 // `frames=0/N` is a real answer, not a missing one: nothing moved in the window.
+                //
+                // MB-2c: `held=` is the pause hold — frames where the sim clock was frozen (a menu)
+                // and the previous blurred image was kept on screen instead of the three dispatches
+                // running. It is NOT counted in `ran`, so a long-open menu shows held climbing
+                // while ran stands still, which is exactly the shape to check the hold by.
                 LOG::logline(">> [forge-hb] mb peak: searched=%.3f%% changed=%.3f%% avgTaps=%.1f"
                              " maxLen=%.2f px on the BUSIEST of %u/%u frames that searched anything"
+                             " | held=%u (sim frozen — menu)"
                              "  [this is the frame `mb=` is priced by — cost is (searched px) x"
                              " (their taps); the sampled line above is usually a PARKED frame]",
                              g_mbPeakPct, g_mbPeakChg, g_mbPeakTaps, (double)g_mbPeakLen,
-                             g_mbBlurFrames, g_mbRanFrames);
+                             g_mbBlurFrames, g_mbRanFrames, g_mbHeldFrames);
                 g_mbPeakPct = 0.0; g_mbPeakChg = 0.0; g_mbPeakTaps = 0.0; g_mbPeakLen = 0.0f;
-                g_mbBlurFrames = 0; g_mbRanFrames = 0;
+                g_mbBlurFrames = 0; g_mbRanFrames = 0; g_mbHeldFrames = 0;
             }
             if (g_lastMvRan || g_mvEnable || g_debugMode == 17u || g_debugMode == 18u) {
                 LOG::logline(">> [forge-hb] mv: ran=%d ready=%d valid=%d bakeEye=(%.1f, %.1f, %.1f) "
@@ -35194,6 +36501,103 @@ void destroyHostWindow(Renderer* R);
                              " large delta WITH a large |dBake| = the rebase failed to cancel]",
                              (double)g_objVelSkinMaxBoneDeltaPeak, g_objVelSkinPeakSlot,
                              g_objVelSkinPeakBones, (double)g_objVelSkinPeakDBake);
+                // ⚠ MB-1d, AND `rigid=N/M` IS THE NUMBER THE LANE'S ABSENCE SHOWS UP IN. Zero with
+                // arms on screen means the walk is not reaching them — which is the reading MB-1c's
+                // `mm=0` cost a whole build to learn to ask for, and it is the ONLY reading that
+                // distinguishes "the arms have no velocity" from "the arms' velocity is wrong".
+                // `why=` names the gate when the lane did not run at all, because "rigid=0" and
+                // "never entered" are otherwise the same line and need opposite fixes.
+                if (g_objVelFPRan || g_objVelFPInFrame || g_objVelFPSkinInFrame
+                    || g_objVelFPMMInFrame || g_debugMode == 17u || g_debugMode == 18u) {
+                    static const char* kWhyFP[7] = {
+                        "ran", "lane knob OFF", "not ready", "camera MV pass did not run",
+                        "no previous ARM camera (first FP frame / arms absent last frame)",
+                        "nothing paired", "no FP pass this frame" };
+                    // `mm=N/M` is FP1e's own denominator, and it is the same reading `rigid=N/M`
+                    // is: 0 with a glow-mapped weapon in hand means the MM walk is not reaching it.
+                    LOG::logline(">> [forge-hb] objvel fp: on=%d ready=%d ran=%d why=%s |"
+                                 " rigid=%u/%u skinned=%u/%u mm=%u/%u still=%u/%u/%u bonesUsed=%u/%u |"
+                                 " skip rigid(pair=%u kind=%u cap=%u)"
+                                 " skinned(pair=%u kind=%u blend=%u bones=%u cap=%u)"
+                                 " mm(pair=%u kind=%u)"
+                                 " gpu=%.3f ms",
+                                 g_objVelFPLane ? 1 : 0, g_live.objVelFPReady ? 1 : 0,
+                                 g_objVelFPRan ? 1 : 0,
+                                 kWhyFP[g_objVelFPWhyNot < 7u ? g_objVelFPWhyNot : 0u],
+                                 g_objVelFPDrawn, g_objVelFPInFrame,
+                                 g_objVelFPSkinDrawn, g_objVelFPSkinInFrame,
+                                 g_objVelFPMMDrawn, g_objVelFPMMInFrame,
+                                 g_objVelFPStill, g_objVelFPSkinStill, g_objVelFPMMStill,
+                                 g_objVelFPBonesUsed, kObjVelBones,
+                                 g_objVelFPSkipPair, g_objVelFPSkipKind, g_objVelFPSkipCap,
+                                 g_objVelFPSkinSkipPair, g_objVelFPSkinSkipKind,
+                                 g_objVelFPSkinSkipBlend, g_objVelFPSkinSkipBones,
+                                 g_objVelFPSkinSkipCap,
+                                 g_objVelFPMMSkipPair, g_objVelFPMMSkipKind,
+                                 g_lastGpuPhaseMs[kGpuPhaseObjVelFP]);
+                    // ⚠⚠ THE ACCEPTANCE TEST, AND IT IS THIS LINE. `arm` must stay ~0 while `world`
+                    // is tens of pixels: that IS "the arms stay sharp on a camera turn while the
+                    // world streams", measured instead of looked at. An arm reading that TRACKS the
+                    // world one means the FP camera pair is not reaching the draws (a stale arm
+                    // camera, or descriptor-set instance 0 bound by mistake) and the arms are still
+                    // wearing the world's motion — the exact defect MB-1d exists to remove, and it
+                    // is indistinguishable from "working" in every other number in this log.
+                    // `world` near 0 means the camera never turned in the window and the line has
+                    // not been tested; look at samples= and the mv camera delta before reading it.
+                    LOG::logline(">> [forge-hb] objvel fp identity: arm=%.3f px turn=%.2f px"
+                                 " pose=%.2f px (ratio %.4f) on the BUSIEST of %u on-screen frames"
+                                 "  [THE ACCEPTANCE TEST: `turn` is what that pixel carried BEFORE"
+                                 " this lane (the same point held world-still through last frame's"
+                                 " arm camera); `arm` is what it carries NOW. arm << turn IS the"
+                                 " arms staying sharp on a camera turn. arm ~ turn = the FP camera"
+                                 " pair never reached the draws; turn ~0 = the camera did not turn,"
+                                 " so nothing was tested]",
+                                 (double)g_objVelFPIdArmPx, (double)g_objVelFPIdTurnPx,
+                                 (double)g_objVelFPIdPosePx,
+                                 (double)(g_objVelFPIdTurnPx > 1.0e-6f
+                                          ? g_objVelFPIdArmPx / g_objVelFPIdTurnPx : 0.0f),
+                                 g_objVelFPIdSamples);
+                    // ...and the AGGREGATE, which is the one to read first: a peak is one frame and
+                    // a camera cut owns it. mean small + peak large = a cut in the window (look at
+                    // peakFrame); both large = the lane really is writing the wrong vector.
+                    LOG::logline(">> [forge-hb] objvel fp identity, mean over the %u TURNING"
+                                 " frames of %u: arm=%.3f px turn=%.2f px pose=%.2f px"
+                                 " ratio=%.4f | peak was frame %u"
+                                 "  [three legs of one triangle: `pose` = the arm's own motion in a"
+                                 " FIXED camera, `turn` = a FIXED point's motion under the camera"
+                                 " change, `arm` = what this lane writes. arm/turn is only the"
+                                 " acceptance test when the arms are IDLE, which MW's never are —"
+                                 " read the CANCELLATION line below instead]",
+                                 g_objVelFPIdMoved, g_objVelFPIdSamples,
+                                 g_objVelFPIdMoved ? g_objVelFPIdSumArm / g_objVelFPIdMoved : 0.0,
+                                 g_objVelFPIdMoved ? g_objVelFPIdSumTurn / g_objVelFPIdMoved : 0.0,
+                                 g_objVelFPIdMoved ? g_objVelFPIdSumPose / g_objVelFPIdMoved : 0.0,
+                                 g_objVelFPIdSumTurn > 1.0e-6
+                                     ? g_objVelFPIdSumArm / g_objVelFPIdSumTurn : 0.0,
+                                 g_objVelFPIdPeakFrame);
+                    // ⚠⚠ AND THIS IS THE VERDICT LINE — the one that does not need idle arms.
+                    if (g_objVelFPIdMoved) {
+                        const double rc = g_objVelFPIdResCancel / g_objVelFPIdMoved;
+                        const double ra = g_objVelFPIdResAdd    / g_objVelFPIdMoved;
+                        LOG::logline(">> [forge-hb] objvel fp CAMERA CANCELLATION: %s"
+                                     " (residual vs |pose-turn| = %.1f px, vs pose+turn = %.1f px,"
+                                     " over %u frames)"
+                                     "  [the arm's screen velocity is the pose term plus the camera"
+                                     " term; MB-1d's whole claim is that the camera term is"
+                                     " SUBTRACTED. Hugging |pose-turn| = it is. Hugging pose+turn ="
+                                     " the two ADD, i.e. a stale/inverted FP camera or the WORLD"
+                                     " table bound — and that is the bug, whatever the arms were"
+                                     " doing]",
+                                     (rc < ra) ? "CANCELLING (pass)" : "COMPOUNDING (FAIL)",
+                                     rc, ra, g_objVelFPIdMoved);
+                    }
+                    // Reset AFTER printing: each line reports the worst frame of its OWN window, so
+                    // a defect that STOPS is visible rather than latched forever.
+                    g_objVelFPIdArmPx = g_objVelFPIdTurnPx = g_objVelFPIdPosePx = 0.0f;
+                    g_objVelFPIdSamples = g_objVelFPIdMoved = 0;
+                    g_objVelFPIdSumArm = g_objVelFPIdSumTurn = g_objVelFPIdSumPose = 0.0;
+                    g_objVelFPIdResCancel = g_objVelFPIdResAdd = 0.0;
+                }
                 // Reset AFTER printing, so each line reports the worst frame of its own window
                 // rather than of the whole session — a session peak would latch on one bad frame
                 // and then report it forever, which hides a defect that STOPS.
@@ -46807,10 +48211,13 @@ void destroyHostWindow(Renderer* R);
         if (g_live.pPerLightsSetFP)         { removeDescriptorSet(R, g_live.pPerLightsSetFP); }
         if (g_live.pPerBatchSetFP)          { removeDescriptorSet(R, g_live.pPerBatchSetFP); }
         if (g_live.pPerBatchSetFPSkin)      { removeDescriptorSet(R, g_live.pPerBatchSetFPSkin); }
+        if (g_live.pPerBatchSetFPMM)        { removeDescriptorSet(R, g_live.pPerBatchSetFPMM); }
         if (g_live.pFPFrameCbv)             { removeResource(g_live.pFPFrameCbv); }
         if (g_live.pFPLightCbv)             { removeResource(g_live.pFPLightCbv); }
         if (g_live.pFPWorldsBuf)            { removeResource(g_live.pFPWorldsBuf); }
         if (g_live.pFPInstanceBuf)          { removeResource(g_live.pFPInstanceBuf); }
+        if (g_live.pFPMMWorldsBuf)          { removeResource(g_live.pFPMMWorldsBuf); }
+        if (g_live.pFPInstanceBufMM)        { removeResource(g_live.pFPInstanceBufMM); }
         if (g_live.pFPBonesBuf)             { removeResource(g_live.pFPBonesBuf); }
         if (g_live.pFPInstanceBufSkin)      { removeResource(g_live.pFPInstanceBufSkin); }
         if (g_live.pFPMaskAllLit)           { removeResource(g_live.pFPMaskAllLit); }
@@ -46818,6 +48225,8 @@ void destroyHostWindow(Renderer* R);
         if (g_live.pFPOpaquePipelineMirror)  { removePipeline(R, g_live.pFPOpaquePipelineMirror); }
         if (g_live.pFPSkinnedPipeline)       { removePipeline(R, g_live.pFPSkinnedPipeline); }
         if (g_live.pFPSkinnedPipelineMirror) { removePipeline(R, g_live.pFPSkinnedPipelineMirror); }
+        if (g_live.pFPMultiMapPipeline)      { removePipeline(R, g_live.pFPMultiMapPipeline); }
+        if (g_live.pFPMultiMapPipelineMirror){ removePipeline(R, g_live.pFPMultiMapPipelineMirror); }
         // SK1 sky teardown.
         if (g_live.pPerBatchSetSky)         { removeDescriptorSet(R, g_live.pPerBatchSetSky); }
         if (g_live.pSkyWorldsBuf)           { removeResource(g_live.pSkyWorldsBuf); }
@@ -47147,6 +48556,16 @@ void destroyHostWindow(Renderer* R);
         if (g_live.pObjVelFrags)          { removeResource(g_live.pObjVelFrags);            g_live.pObjVelFrags = nullptr; }
         if (g_live.pObjVelFragsReset)     { removeResource(g_live.pObjVelFragsReset);       g_live.pObjVelFragsReset = nullptr; }
         if (g_live.pObjVelFragsReadback)  { removeResource(g_live.pObjVelFragsReadback);    g_live.pObjVelFragsReadback = nullptr; }
+        if (g_live.pObjVelParamsCbvFP)       { removeResource(g_live.pObjVelParamsCbvFP);       g_live.pObjVelParamsCbvFP = nullptr; }
+        if (g_live.pObjVelBatchCbvFP)        { removeResource(g_live.pObjVelBatchCbvFP);        g_live.pObjVelBatchCbvFP = nullptr; }
+        if (g_live.pObjVelBonesCurCbvFP)     { removeResource(g_live.pObjVelBonesCurCbvFP);     g_live.pObjVelBonesCurCbvFP = nullptr; }
+        if (g_live.pObjVelBonesPrevCbvFP)    { removeResource(g_live.pObjVelBonesPrevCbvFP);    g_live.pObjVelBonesPrevCbvFP = nullptr; }
+        if (g_live.pObjVelSkinInstanceBufFP) { removeResource(g_live.pObjVelSkinInstanceBufFP); g_live.pObjVelSkinInstanceBufFP = nullptr; }
+        g_live.objVelFPReady = false;
+        // MB-1d: the arm camera dies with the device. A retained matrix from before a reset would
+        // pair with a fresh frame's poses and streak the arms across the screen for one frame — the
+        // stamp makes that unrepresentable, but only if it is actually cleared.
+        g_fpPrevViewProjFrame = 0;
         g_live.objVelReady = false;
         if (g_live.pMvFsSet)        { removeDescriptorSet(R, g_live.pMvFsSet);  g_live.pMvFsSet = nullptr; }
         if (g_live.pMvFsPipeline)   { removePipeline(R, g_live.pMvFsPipeline);  g_live.pMvFsPipeline = nullptr; }
@@ -47229,7 +48648,12 @@ void destroyHostWindow(Renderer* R);
         if (g_live.pMbTile)             { removeResource(g_live.pMbTile);                g_live.pMbTile = nullptr; }
         if (g_live.pMotionBlur)         { removeResource(g_live.pMotionBlur);            g_live.pMotionBlur = nullptr; }
         g_live.mbReady = false;
+        // ⚠ AND WITH IT THE PAUSE HOLD'S PRECONDITION. holdBlur keeps last frame's pMotionBlur on
+        // screen only while g_lastMbRan says a real blur is in there; the texture is being destroyed
+        // one line above, so leaving the flag set would let the first frame after a rebuild hold a
+        // brand-new, never-written surface. g_simFrozen is left alone — it is re-derived per frame.
         g_lastMbRan = false;
+        g_mbHeldFrames = 0;
         if (g_live.pAOParamsCbv)    { removeResource(g_live.pAOParamsCbv); }
         if (g_live.pAOBlur)         { removeResource(g_live.pAOBlur); }
         if (g_live.pAO)             { removeResource(g_live.pAO); }

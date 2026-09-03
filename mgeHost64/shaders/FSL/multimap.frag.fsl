@@ -19,6 +19,7 @@
 #include "scenecolor.h.fsl" // tonemapInPass() — class 1: the curve moved to resolve.frag (step 6a)
 #include "skydome.h.fsl"     // applyFog() — extinguish into a silhouette, then melt into the SAMPLED sky
 #include "enchantglow.h.fsl" // enchantGlow() — MW's caustic env map over enchanted items
+#include "fpshadow.h.fsl"    // fpShadowVisibility() — first-person direct cube-atlas shadow test
 
 STRUCT(VSOutput)
 {
@@ -63,19 +64,28 @@ float4 PS_MAIN( VSOutput In )
     // Resolved once at top level (shadowMaskPixel takes derivatives) and reused as maskPx below.
     uint   dbgMode  = (uint)(gFrameData.debugParams.x + 0.5f);
     bool   aoUsed   = ((aoFlags & 3u) != 0u) || dbgMode == 3u || dbgMode == 4u;
+    // FP1e: ...and never in the FIRST-PERSON pass either, for a stronger reason than the mirror's
+    // (opaque.frag carries the full note). A multi-map FP part — a glass weapon's glow map — is a
+    // post-composite overlay drawn under the ARM camera and is not in the world Z-prepass at all,
+    // so gAO at its pixel describes whatever the world put BEHIND the weapon, usually a wall a step
+    // away, i.e. the most occluded thing on screen. .z is the plain "this is the FP pass" flag;
+    // .y is the narrower "FP *and* receiving direct-atlas shadows", which goes to 0 whenever FP
+    // shadow reception is off — an FP test built on it silently stops being one.
+    bool   isFP     = (gFrameData.alphaShadowParams.z > 0.5f);
+    bool   aoValid  = !inReflect && !isFP;
     int2   srcPx    = int2(In.Position.xy);
-    if (!inReflect && (aoUsed || gShadowParams.slotBits.x != 0u)) {
+    if (aoValid && (aoUsed || gShadowParams.slotBits.x != 0u)) {
         srcPx = shadowMaskPixel(In.Position);
     }
     // LOAD, not Sample: gAO is ALLOC-sized and read 1:1, so the old uv was already a point sample —
     // just one that could not be redirected to a neighbour.
-    float4 aoSample = inReflect ? float4(0.0f, 0.0f, 0.0f, 1.0f)   // AO = 1 (no darkening), no bend
-                                : LoadTex2D(gAO, NO_SAMPLER, srcPx, 0);
+    float4 aoSample = aoValid ? LoadTex2D(gAO, NO_SAMPLER, srcPx, 0)
+                              : float4(0.0f, 0.0f, 0.0f, 1.0f);   // AO = 1 (no darkening), no bend
     // "Bent normal enable" tick. gAO.rgb = bentDir - gAO.a * (the AO pass's normal), so the
     // reconstruction weights OUR smooth normal by gAO.a — see opaque.frag for the full reasoning
     // (open => rgb is exactly zero and N survives untouched; sealed => their normal has dropped out
     // and the measured direction stands alone, which is what carries an inside corner). Lockstep.
-    if ((aoFlags & 2u) != 0u && !inReflect) {
+    if ((aoFlags & 2u) != 0u && aoValid) {
         float3 bn  = N * aoSample.a + aoSample.rgb;
         float  bl2 = dot(bn, bn);
         float3 bnn = (bl2 > 1e-8f) ? (bn * rsqrt(bl2)) : N;
@@ -104,8 +114,10 @@ float4 PS_MAIN( VSOutput In )
     // Top level, because it takes derivatives and the mask is read from inside the divergent light
     // loop. The guard is cbuffer-driven (uniform across the draw): no active slot means no light
     // carries one, so nothing reads the mask at all.
-    // ...and never in the reflection (see the tag above). No FP guard here: multi-map never runs in
-    // the first-person pass — the client skips multi-map FP parts.
+    // ...and never in the reflection (see the tag above). ⚠ AND MULTI-MAP DOES NOW RUN IN THE
+    // FIRST-PERSON PASS (FP1e) — this comment used to say it never did, which was true only
+    // because the client dropped those parts entirely, weapon and all. The FP guard is the isFP
+    // branch above (AO) and the alphaShadowParams.y branch below (shadow).
     int2 maskPx = srcPx;   // resolved with the AO read above — same snapshot, same size
     {
         uint nLights = (uint)gLights.lightParams.x;
@@ -172,14 +184,26 @@ float4 PS_MAIN( VSOutput In )
                 // lights — the same deliberate IR3 limitation opaque.frag takes.
                 if (slotP1 != 0u && !inReflect)
                 {
-                    // maskPx, not our own pixel: under MSAA the mask at a silhouette pixel can
-                    // belong to the geometry behind us (see shadowreceive.h.fsl).
-                    uint4 mw   = LoadTex2D(gShadowMask, NO_SAMPLER, maskPx, 0).xyzw;
-                    uint  s    = slotP1 - 1u;
-                    uint  lane = s >> 3u;
-                    uint  word = lane == 0u ? mw.x : (lane == 1u ? mw.y : (lane == 2u ? mw.z : mw.w));
-                    uint  nib  = (word >> ((s & 7u) * 4u)) & 0xFu;
-                    att *= float(nib) * (1.0f / 15.0f);
+                    // FP1e: first-person parts (alphaShadowParams.y set) sample the cube atlas
+                    // DIRECTLY from the true world pos + geometric vertex normal — lockstep with
+                    // opaque.frag, and for its reason: the screen gShadowMask holds the WORLD
+                    // behind the weapon, not the weapon, so a glowing blade would take the wall's
+                    // shadow. This is what makes it receive shadows the way the arms holding it do.
+                    if (gFrameData.alphaShadowParams.y > 0.5f)
+                    {
+                        att *= fpShadowVisibility(In.WorldPos, normalize(In.Normal), slotP1 - 1u);
+                    }
+                    else
+                    {
+                        // maskPx, not our own pixel: under MSAA the mask at a silhouette pixel can
+                        // belong to the geometry behind us (see shadowreceive.h.fsl).
+                        uint4 mw   = LoadTex2D(gShadowMask, NO_SAMPLER, maskPx, 0).xyzw;
+                        uint  s    = slotP1 - 1u;
+                        uint  lane = s >> 3u;
+                        uint  word = lane == 0u ? mw.x : (lane == 1u ? mw.y : (lane == 2u ? mw.z : mw.w));
+                        uint  nib  = (word >> ((s & 7u) * 4u)) & 0xFu;
+                        att *= float(nib) * (1.0f / 15.0f);
+                    }
                 }
 
                 float  lambert = saturate(dot(N, toLight) * invDist);

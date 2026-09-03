@@ -20,6 +20,7 @@
 #include "scenecolor.h.fsl" // tonemapInPass() — class 1: the curve moved to resolve.frag (step 6a)
 #include "skydome.h.fsl"     // applyFog() — extinguish into a silhouette, then melt into the SAMPLED sky
 #include "enchantglow.h.fsl" // enchantGlow() — MW's caustic env map over enchanted items
+#include "fpshadow.h.fsl"    // fpShadowVisibility() — first-person direct cube-atlas shadow test
 
 STRUCT(VSOutput)
 {
@@ -120,12 +121,31 @@ float4 PS_MAIN( VSOutput In )
                 uint slotP1 = (uint)gLights.lights[i * 3u + 2u].w;
                 if (slotP1 != 0u)
                 {
-                    uint4 mw   = LoadTex2D(gShadowMask, NO_SAMPLER, int2(In.Position.xy), 0).xyzw;
-                    uint  s    = slotP1 - 1u;
-                    uint  lane = s >> 3u;
-                    uint  word = lane == 0u ? mw.x : (lane == 1u ? mw.y : (lane == 2u ? mw.z : mw.w));
-                    uint  nib  = (word >> ((s & 7u) * 4u)) & 0xFu;
-                    att *= float(nib) * (1.0f / 15.0f);
+                    // FP1e: first-person parts (alphaShadowParams.y) sample the cube atlas DIRECTLY
+                    // from the true world pos + geometric vertex normal — lockstep with
+                    // multimap.frag / opaque.frag, and for their reason: the screen gShadowMask holds
+                    // the WORLD behind the blade, not the blade. Route C now runs in the FP pass (a
+                    // glass dagger's crystal blade is a blended multi-map part), so this frag needs
+                    // the branch that multimap.frag got.
+                    //
+                    // ⚠ THE **AO** HALF NEEDS NO SUCH FIX HERE, and that is worth stating rather
+                    // than leaving as an omission: this frag already applies NO AO to lighting at
+                    // all ("aoSample belongs to the opaque surface BEHIND the sheet"), which is the
+                    // same argument the FP guard makes, reached first for transparency. aoSample
+                    // survives only for the F12 debug views.
+                    if (gFrameData.alphaShadowParams.y > 0.5f)
+                    {
+                        att *= fpShadowVisibility(In.WorldPos, normalize(In.Normal), slotP1 - 1u);
+                    }
+                    else
+                    {
+                        uint4 mw   = LoadTex2D(gShadowMask, NO_SAMPLER, int2(In.Position.xy), 0).xyzw;
+                        uint  s    = slotP1 - 1u;
+                        uint  lane = s >> 3u;
+                        uint  word = lane == 0u ? mw.x : (lane == 1u ? mw.y : (lane == 2u ? mw.z : mw.w));
+                        uint  nib  = (word >> ((s & 7u) * 4u)) & 0xFu;
+                        att *= float(nib) * (1.0f / 15.0f);
+                    }
                 }
 
                 float  lambert = saturate(dot(N, toLight) * invDist);

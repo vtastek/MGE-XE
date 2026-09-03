@@ -50,6 +50,11 @@ STRUCT(ObjVelParams)
     // x = 1 when prevViewProjRel is valid (there WAS a previous frame). 0 makes every vector zero,
     // which is the correct answer on the first frame and after a camera cut, and is what keeps a
     // teleport from streaking the whole screen.
+    //
+    // MB-1e: y = 1 in the FIRST-PERSON instance ONLY — "stamp the arm-depth constant into
+    // gObjVelDepthOut". See that resource's note. 0 in the world instance, where the same write
+    // would replace every mover's DEVICE depth with the near plane and hand water, the APL sky
+    // discriminator and next frame's reprojection a lie. z, w spare.
     DATA(float4, opts, None);
 };
 
@@ -143,5 +148,27 @@ BEGIN_SRT(ObjVelocitySrtData)
         // frame's palette sat — is resolved on the HOST (HostMesh::prevBoneBase, recorded per
         // slot) and never reaches the shader.
         DECL_CBUFFER  (PerDraw, CBUFFER(ObjVelBones), gObjVelBonesPrev)
+        // ═══ MB-1e: THE ARM'S DEPTH, FOR MB-2's SOFT-DEPTH WEIGHT ═══════════════════════════
+        // ⚠ APPENDED, for the reason stated above — FSL numbers descriptors off ONE running
+        // counter per set, so a resource inserted above this one silently renumbers it.
+        //
+        // pLinearDepth, whose name is a leftover: it holds RAW REVERSE-Z DEVICE depth (
+        // linearizedepth.comp.fsl says so outright). MB-2's gather reads it as gMbDepth, and the
+        // arms are not in it — pLinearDepth's last write is the seam re-linearize, long before the
+        // FP pass draws — so over an arm pixel mbDepthWeight compares the WALL BEHIND THE ARM
+        // against its neighbours, goes inert, and only the velocity-agreement weights hold the
+        // silhouette. That is the reported bleed across the arms when strafing with hands still.
+        //
+        // ⚠⚠ WHAT IS WRITTEN IS A CONSTANT, **NOT THE ARM'S OWN PROJECTED DEPTH**. The arm camera
+        // has its own near/far (near=1.0 far=7168) and the arms sit INSIDE the world camera's near
+        // plane — the very fact that made MB-1d's first acceptance probe blow up. Two projections
+        // in one buffer are only accidentally ordered and they INVERT when a world surface is very
+        // close. The constant is unconditionally true instead: the FP pass draws after a depth
+        // clear, so the arms are in front of everything by construction. mbDepthWeight is a pure
+        // RATIO with no projection constants, so it needs nothing else, and it then answers
+        // correctly in both directions (a world centre rejects an arm sample as "in front of me";
+        // an arm centre accepts world samples as "behind me"). The only thing lost is depth
+        // discrimination BETWEEN arm parts, which at arm scale is what you want anyway.
+        DECL_RWTEXTURE(PerDraw, WTex2D(float), gObjVelDepthOut)
     END_SRT_SET(PerDraw)
 END_SRT(ObjVelocitySrtData)

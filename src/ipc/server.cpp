@@ -627,6 +627,18 @@ namespace IPC {
 					fpScene.alphaCount = params.fpAlphaCount;
 					fpScene.alphaBytes = fabytes;
 				}
+				// FP1e: multi-map FP parts (MultiMapDrawWire[]), same clamp as every other list.
+				if (params.fpMMList != InvalidVector) {
+					auto& fmvec = getVec<IPC::GeomChunk>(params.fpMMList);
+					const std::uint32_t fmavail = fmvec.size() * static_cast<std::uint32_t>(sizeof(IPC::GeomChunk));
+					std::uint32_t fmbytes = params.fpMMBytes;
+					if (fmbytes == 0 || fmbytes > fmavail) {
+						fmbytes = fmavail;
+					}
+					fpScene.mmBlob  = fmvec.size() ? &fmvec[0] : nullptr;
+					fpScene.mmCount = params.fpMMCount;
+					fpScene.mmBytes = fmbytes;
+				}
 				fpPtr = &fpScene;
 			}
 			ForgeRender::setDebugMode(params.debugMode);
