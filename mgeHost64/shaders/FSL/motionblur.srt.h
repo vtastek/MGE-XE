@@ -107,7 +107,14 @@ STRUCT(MotionBlurParams)
     // w = OUT/IN SCALE = delivered.x / mvRect.x. Converts a vector written in INPUT-rect pixels into
     //     DELIVERED-rect pixels. Exactly 1.0 at 1x — see the header note on why that proves nothing.
     DATA(float4, tile, None);
-    // x = SHUTTER FRACTION, shutter_degrees / 360. 0.5 = a 180-degree shutter = half a frame.
+    // x = THE EXPOSURE SCALE: how much of the per-frame vector the shutter was open for, i.e.
+    //     `exposure_ms / frameDt_ms`. **NOT `shutter/360`** — that was the first version and it did
+    //     not do what it claimed: a constant multiplier on a per-FRAME displacement shrinks with the
+    //     framerate exactly as the DX9 filter's `blur_scale` did, so the same shutter gave 3.7x less
+    //     blur at 110 fps than at 30. Reported as "the blur is too subtle. is it frame rate
+    //     independent?" — it was not. The host now divides the exposure time by the MEASURED frame
+    //     interval, so the streak in pixels depends on the object's real speed and the shutter
+    //     alone, and is identical at 30 fps and at 165.
     // y = MAX TAPS. The adaptive count is min(ceil(len_px), this) with a floor of 3 — so a 4 px
     //     streak costs 4 taps and only genuinely fast motion pays the maximum.
     // z = VELOCITY FLOOR in DELIVERED pixels, below which the pass writes the source colour

@@ -91,8 +91,11 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
     float  speed = length(vTile);                 // the SEARCH speed — always >= |vSelf|
     float  selfStreak = length(vSelf) * shutter;  // THIS pixel's own streak, in delivered px
 
-    // The displacement during the exposure. `v` is per FRAME, so this is framerate-independent by
-    // construction — which is the whole of the fix for the DX9 filter's raw `blur_scale = 0.1`.
+    // The displacement during the exposure. ⚠ `shutter` here is `exposure_ms / frameDt_ms`, NOT
+    // `angle/360`: the vector is per RENDERED FRAME, so a constant multiplier would shrink the smear
+    // as the framerate rises — which is what the first build did and what "the blur is too subtle"
+    // was. Dividing the real exposure by the real frame interval is what makes this independent of
+    // the machine. See motionblur.srt.h.
     float2 d   = vTile * shutter;
     float  len = length(d);
 

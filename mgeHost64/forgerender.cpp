@@ -1684,7 +1684,14 @@ namespace {
     // a setting that does nothing a K of 8 does not do better. 8 is also the group width, so the tile
     // max's 8x8 group covers a whole tile in one stride at the floor.
     constexpr uint32_t kMbTileKMin = 8;
-    constexpr uint32_t kMbTileKMax = 64;
+    // ⚠ RAISED FROM 64 WHEN THE EXPOSURE MODEL WAS FIXED. K is the maximum streak length as well as
+    // the tile size, so a ceiling of 64 px capped the effect below what a real exposure produces on
+    // a fast swing — the smear would silently stop growing while the shutter knob kept turning.
+    // Raising it is nearly free on the dilation side (the tile max is 1.0 taps/px whatever K is, and
+    // the neighbour pass gets CHEAPER as 9/K^2); what it costs is TAP SPACING, because the tap count
+    // is capped separately — a 160 px streak at 16 taps puts them 10 px apart and reads as beads
+    // rather than a smear. Long streaks want mbMaxTaps raised with K, and that is the real cost.
+    constexpr uint32_t kMbTileKMax = 192;
 
     // W23/W24 caustics: how many instances of the ONE CausticSrtData::Persistent set exist, and what
     // each of them is for. Declared up here — well before the g_caustic* knob block — only because it
@@ -13600,6 +13607,11 @@ namespace {
     std::vector<uint32_t> g_casterSlots;
     bool                  g_casterSlotsUnsorted = false;   // an append happened → re-sort at compaction
     uint32_t  g_renderFrame = 0;   // monotonic, ++ per renderScene; drives the dynamic-promote streak
+    // The interval between the last two RENDERED frames, which is exactly the interval the
+    // motion-vector field describes. MB-2 divides by it to get a velocity in px/second.
+    // 0 on the very first frame (no interval exists yet).
+    double    g_frameDtMs = 0.0;
+    double    g_lastFrameStampMs = 0.0;
     uint32_t  g_dynamicCount = 0;  // meshes currently in the upload-heap ring (should stay tiny)
 
     // ─── PER-MESH BUFFER BUDGET ──────────────────────────────────────────────────────────────────
@@ -15347,27 +15359,64 @@ namespace {
     // A consumer and its producer must not be armed by different switches
     // ([[feedback_knob_gated_apart_from_its_consumer]]).
     bool     g_mbEnable = true;
-    // THE SHUTTER ANGLE, in degrees, and this is the whole of the fix for the DX9 filter's
-    // `blur_scale = 0.1`. That was a raw multiplier on a per-FRAME displacement, so a blur tuned at
-    // 60 fps was half as long at 30 — the look changed with the framerate, which is the one thing a
-    // camera setting must not do. An angle is framerate-independent by construction: the shutter was
-    // open for `angle/360` of the frame, the pixel moved `v` during the frame, so the streak is
-    // `v * angle/360` whatever the frame took.
-    // 180 is the film convention (half the frame) and is what ships. 360 is a full frame — the
-    // "everything smears" arm, useful for finding a wrong out/in rect scale, which shows as a length
-    // wrong by exactly that ratio.
+    // THE SHUTTER ANGLE, in degrees, QUOTED AT A REFERENCE FRAMERATE (mbShutterFps below).
+    //
+    // ⚠⚠ THE FIRST VERSION OF THIS KNOB DID NOT FIX WHAT IT CLAIMED TO FIX, and the claim is worth
+    // spelling out because it survived a whole milestone. The DX9 filter multiplied a per-FRAME
+    // displacement by a constant (`blur_scale = 0.1`); this multiplied the same per-frame
+    // displacement by a different constant (`shutter/360`). **Identical shape.** Renaming 0.1 to
+    // "a 180 degree shutter" changed the number and not one thing about the behaviour: `v` is the
+    // displacement between two rendered frames, so it shrinks as the framerate rises, and the smear
+    // shrank with it. Reported from play as *"the blur is too subtle. is it frame rate
+    // independent?"* — and the honest answer was no, not in the way that matters to anyone looking
+    // at it.
+    //
+    // A 180 degree shutter IS the film convention and IS physically correct for a camera: at 165 fps
+    // a real shutter is open 1/330 s and really does capture almost no movement. That is precisely
+    // why it is the wrong model here. The frame rate is a property of the MACHINE, and the look must
+    // not be.
+    //
+    // So the shutter angle is now an EXPOSURE TIME: `(angle/360) / mbShutterFps` seconds. The pass
+    // converts the per-frame vector to px/second by dividing by the measured frame interval, then
+    // multiplies by that exposure. The streak length in pixels then depends only on how fast the
+    // object is actually moving and how long the shutter is open — identical at 30 fps and at 165.
+    //
+    // 180 at 30 fps = a 16.7 ms exposure, which is the cinematic default and what ships. Halve
+    // mbShutterFps to double every streak; the `mb:` heartbeat reports `maxLen` in delivered pixels,
+    // so "is a mace head smearing three times its own width" is a number rather than an impression.
     float    g_mbShutter = 180.0f;
+    // The framerate the shutter angle is quoted AT — the other half of the exposure time, and the
+    // knob to reach for when the whole effect is too weak or too strong. It is deliberately NOT the
+    // actual framerate: that is measured, and dividing by it is what makes the look independent of
+    // the machine.
+    //   30 -> 180 deg = 16.7 ms  (film; ships)
+    //   60 -> 180 deg =  8.3 ms  (subtle)
+    //   15 -> 180 deg = 33.3 ms  (heavy)
+    float    g_mbShutterFps = 30.0f;
     // The CAP on the adaptive tap count. The count itself is one tap per pixel of streak, so this
     // only binds on genuinely fast motion; at K = 20 it also sets the worst-case tap SPACING
     // (20/16 = 1.25 px), which is what decides whether a long streak reads as a smear or as beads.
-    uint32_t g_mbMaxTaps = 16;
+    // ⚠ RAISED FROM 16 WITH THE EXPOSURE FIX AND THE LARGER K. This is the TAP SPACING control on
+    // long streaks (`len/taps`), and once streaks reach 40-96 px a 16 cap samples them every 3-6 px,
+    // which reads as a ghost train rather than a smear. Measured avgTaps 17.8-27.7 at a cap of 32 on
+    // a busy interior, so the cap is not always binding and the cost is paid only by genuinely fast
+    // pixels. Cost of the change, validation build, whole screen in motion: 0.65 -> 1.0 ms.
+    uint32_t g_mbMaxTaps = 32;
     // THE TILE SIZE, and it is two things at once **by construction rather than by overloading**:
     // the dilation's granularity AND the maximum blur length. NeighborMax searches one tile in each
     // direction, so K is exactly how far a pixel can be told about motion — a longer streak would
     // end in a hard edge at the tiles that never heard of it. Larger K = longer possible streaks at
     // LOWER dilation cost (9/K^2 per pixel), which is the whole reason the tile form beats the DX9
     // filter's fixed-radius cross.
-    uint32_t g_mbTileK = 20;
+    // ⚠⚠ RAISED FROM 20, AND THE OLD VALUE WAS CLIPPING EVERY STREAK IN EVERY FRAME. `maxLen` sat at
+    // exactly 20.00 on every heartbeat — the clamp binding everywhere — so the blur was being cut to
+    // roughly a fifth of the length the exposure actually called for, which is the other half of
+    // "the blur is too subtle" (the first half was the framerate model). At 96 the same scene
+    // measures streaks of 36-96 px.
+    // K is the maximum streak length AND the tile size, so raising it is nearly free on the dilation
+    // (1.0 taps/px whatever K is; the neighbour pass gets cheaper as 9/K^2) and costs TAP SPACING,
+    // which is why mbMaxTaps moved with it.
+    uint32_t g_mbTileK = 96;
     // ⚠⚠ THE VELOCITY FLOOR, IN DELIVERED PIXELS, AND IT IS MANDATORY RATHER THAN AN OPTIMISATION.
     // Only a BIT-IDENTICAL camera frame reaches exact zero (motionvectors.comp's parked short
     // circuit, whose lane MB-2 step 0 had to un-break), and MW's camera matrix is bit-stable on a
@@ -18852,8 +18901,18 @@ namespace {
           // 180 is the film convention and ships; 360 is the "everything smears" arm, and it is also
           // the setting to use when checking the out/in rect scale, because a wrong ratio shows as a
           // length wrong by exactly that ratio and is easiest to see when the length is large.
-          t.sliderF("Shutter angle (deg; 180 = half a frame, the film convention)",
+          t.sliderF("Shutter angle (deg; 180 = the film convention)",
                     &g_mbShutter, 0.0f, 360.0f, 5.0f);
+          // ⚠⚠ THE KNOB TO REACH FOR WHEN THE WHOLE EFFECT IS TOO WEAK, and the one that makes the
+          // angle above mean anything fixed. Together they are an EXPOSURE TIME —
+          // `(angle/360) / thisFps` seconds — which the pass divides by the MEASURED frame interval.
+          // That is what makes the streak length depend on how fast something is really moving
+          // rather than on how fast the machine happens to be running. The first build multiplied
+          // the per-frame vector by `angle/360` and called it framerate-independent; it was not, and
+          // at 110 fps it produced 3.7x less blur than the same shutter at 30.
+          // LOWER = MORE BLUR (a longer exposure). 30 is film; 15 is heavy; 60 is subtle.
+          t.sliderF("...quoted at this framerate — LOWER = MORE BLUR (30 = 16.7ms exposure)",
+                    &g_mbShutterFps, 10.0f, 120.0f, 1.0f);
           // ⚠⚠ THE FLOOR IS NOT AN OPTIMISATION AND MUST NOT BE DRAGGED TO 0. Only a BIT-IDENTICAL
           // camera frame produces exact zeros, and MW's camera matrix is bit-stable on a MINORITY of
           // parked frames (measured worst deltas 4.3e-4, 2.9e-11, 1.5e-3 across three consecutive
@@ -18867,8 +18926,13 @@ namespace {
           // A CAP on the adaptive count, not the count. One tap per pixel of streak is what runs, so
           // this only binds on fast motion — and with the K below it sets the worst-case tap spacing
           // (K/taps), which is what decides whether a long streak reads as a smear or as beads.
-          t.sliderU("Max taps (the count is adaptive: one per px of streak, min 3)",
-                    &g_mbMaxTaps, 3u, 32u, 1u);
+          // ⚠ SPACING, NOT QUALITY-IN-THE-ABSTRACT. The count is adaptive (one tap per px of
+          // streak) so this only binds on long streaks — and there it sets the gap between taps,
+          // `len/taps`. A 160 px streak at 16 taps samples every 10 px and reads as BEADS or a
+          // ghost train rather than a smear. If a fast swing looks stepped, this is the knob; the
+          // cost is linear in it and the `mb peak:` line reports the avgTaps actually used.
+          t.sliderU("Max taps — sets TAP SPACING (len/taps) on long streaks; raise with K",
+                    &g_mbMaxTaps, 3u, 64u, 1u);
           // ⚠ TWO THINGS AT ONCE **BY CONSTRUCTION**, which is the opposite of the one-knob-two-jobs
           // defect: NeighborMax searches one tile in each direction, so K is simultaneously the
           // dilation's granularity and exactly how far a pixel can be told about motion — i.e. the
@@ -22193,6 +22257,7 @@ void destroyHostWindow(Renderer* R);
             // harness with nobody at a slider: `mb=` on the gpu split against mbShutter, and the
             // out/in scale against upscaleMode=2 (at 1x that scale is 1.0 and proves nothing).
             { "mbShutter",           &g_mbShutter           },
+            { "mbShutterFps",        &g_mbShutterFps        },
             { "mbMinPx",             &g_mbMinPx             },
             { "mbSoftZ",             &g_mbSoftZ             },
         };
@@ -24693,6 +24758,22 @@ void destroyHostWindow(Renderer* R);
             return false;
         }
         ++g_renderFrame;   // drives the dynamic-promote consecutive-frame streak in uploadGeometry
+        // ─── THE RENDER-FRAME INTERVAL, IN MILLISECONDS ─────────────────────────────────────────
+        // MB-2 needs this to convert a PER-FRAME motion vector into a PER-SECOND velocity. The
+        // motion-vector field is the screen displacement between the previous rendered frame and
+        // this one, so this is exactly the interval it describes — measured at the frame counter it
+        // belongs to rather than taken from the client's dt, which is a different clock counting a
+        // different thing.
+        //
+        // Clamped at both ends: a hitch must not produce a scale of zero, and a sub-microsecond
+        // interval must not produce a divide that explodes. Neither clamp changes a normal frame.
+        {
+            const double nowMs = hostNowMs();
+            g_frameDtMs = (g_lastFrameStampMs > 0.0)
+                        ? std::min(std::max(nowMs - g_lastFrameStampMs, 0.5), 250.0)
+                        : 0.0;   // first frame: no interval yet
+            g_lastFrameStampMs = nowMs;
+        }
         g_uvAnimCount = 0; // fresh gUVAnim table this frame (memoized ids re-assign on demand)
         // M1: draw this frame's sub-pixel jitter (tasks/forge-upscale.md). HERE, beside
         // ++g_renderFrame, because the sequence must advance once per RENDERED frame — park mode and
@@ -33854,8 +33935,30 @@ void destroyHostWindow(Renderer* R);
                 mp[5] = (float)tilesX;
                 mp[6] = (float)tilesY;
                 mp[7] = (float)deliveredW / (float)std::max(1u, g_live.width);
-                // blur: shutter fraction, tap cap, the velocity floor, the soft-depth extent.
-                mp[8]  = std::max(0.0f, g_mbShutter) / 360.0f;
+                // blur: the exposure SCALE, tap cap, the velocity floor, the soft-depth extent.
+                //
+                // ⚠⚠ THIS LANE IS NO LONGER `shutter/360`, AND THAT DIFFERENCE IS THE WHOLE OF THE
+                // "too subtle" fix. The vector is a displacement between two RENDERED FRAMES, so
+                // multiplying it by a constant — which is what `shutter/360` was, and what the DX9
+                // filter's `blur_scale` was before it — makes the streak shrink as the framerate
+                // rises. At 110 fps that is 3.7x less blur than the same shutter gives at 30.
+                //
+                // The exposure is a REAL TIME. Convert the per-frame vector to px/second by dividing
+                // by the measured frame interval, then multiply by the exposure in seconds; both
+                // divisions collapse into this one scalar:
+                //     scale = exposure_ms / frameDt_ms,  exposure_ms = (angle/360) * 1000/refFps
+                // The streak in pixels is then set by the object's real speed and the shutter alone.
+                //
+                // ⚠ SELF-CORRECTING ACROSS A HITCH. A 100 ms frame carries a correspondingly huge
+                // `v`, and this scale drops in exactly the same proportion, so the exposure stays
+                // 16.7 ms of motion rather than becoming a 100 ms smear.
+                const float mbExposureMs = (std::max(0.0f, g_mbShutter) / 360.0f)
+                                         * (1000.0f / std::max(1.0f, g_mbShutterFps));
+                mp[8]  = (g_frameDtMs > 0.0) ? (mbExposureMs / (float)g_frameDtMs)
+                                             // First frame only: no interval has been measured, so
+                                             // fall back to the literal angle. The pairing key
+                                             // refuses that frame anyway.
+                                             : (std::max(0.0f, g_mbShutter) / 360.0f);
                 mp[9]  = (float)std::max(3u, g_mbMaxTaps);
                 mp[10] = std::max(0.0f, g_mbMinPx);
                 mp[11] = std::max(1.0e-4f, g_mbSoftZ);
@@ -34976,15 +35079,30 @@ void destroyHostWindow(Renderer* R);
                 // covering its tiles while `changed` collapses onto the mover itself.
                 // **searched ~= changed means the tiling is back.**
                 LOG::logline(">> [forge-hb] mb: searched=%.3f%% changed=%.3f%% of %llu px"
-                             " avgTaps=%.1f maxLen=%.2f px (K=%u shutter=%.0fdeg floor=%.2fpx)"
+                             " avgTaps=%.1f maxLen=%.2f px (K=%u exposure=%.1fms @dt=%.1fms"
+                             " x%.2f floor=%.2fpx)"
                              "  [both MUST be 0.000%% on a parked camera; searched ~= changed is the"
                              " TILE artifact — the agreement weights are what separate them; maxLen"
-                             " pinned at K means the clamp is cutting streaks short]",
+                             " pinned at K means the clamp is cutting streaks short, so raise K;"
+                             " maxLen/avgTaps is the TAP SPACING and beads mean raise mbMaxTaps]",
                              100.0 * (double)ms[0] / (double)g_lastMbPixels,
                              100.0 * (double)ms[3] / (double)g_lastMbPixels,
                              (unsigned long long)g_lastMbPixels,
                              ms[0] ? (double)ms[1] / (double)ms[0] : 0.0,
-                             (double)mlen, g_lastMbK, (double)g_mbShutter, (double)g_mbMinPx);
+                             (double)mlen, g_lastMbK,
+                             // The exposure in ms, the frame interval it is divided by, and the
+                             // resulting multiplier on the per-frame vector. ⚠ THE MULTIPLIER IS THE
+                             // NUMBER THAT ANSWERS "is it framerate independent": it must RISE as
+                             // dt falls, holding exposure fixed. A build where it sat at a constant
+                             // (0.50 for a 180 degree shutter) is the one that read "too subtle".
+                             (double)((std::max(0.0f, g_mbShutter) / 360.0f)
+                                      * (1000.0f / std::max(1.0f, g_mbShutterFps))),
+                             g_frameDtMs,
+                             (g_frameDtMs > 0.0)
+                                 ? (double)((std::max(0.0f, g_mbShutter) / 360.0f)
+                                            * (1000.0f / std::max(1.0f, g_mbShutterFps))) / g_frameDtMs
+                                 : 0.0,
+                             (double)g_mbMinPx);
                 // ⚠⚠ AND THE BUSIEST FRAME, WHICH IS THE ONE THAT EXPLAINS `mb=`. The line above
                 // is a SAMPLE and the pass's load is BURSTY — a camera is parked far more often
                 // than it is turning — so the sampled frame is usually a parked one while the
