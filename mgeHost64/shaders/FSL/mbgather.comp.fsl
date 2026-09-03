@@ -34,9 +34,10 @@
 #define AtomicMax(DEST, VALUE, ORIGINAL_VALUE) InterlockedMax(DEST, VALUE, ORIGINAL_VALUE)
 #endif
 
-GroupShared(uint, g_mbHit[64]);    // pixels blurred
+GroupShared(uint, g_mbHit[64]);    // pixels that RAN the gather
 GroupShared(uint, g_mbTaps[64]);   // their tap counts, summed
 GroupShared(uint, g_mbLen[64]);    // their streak lengths, asuint, max-reduced
+GroupShared(uint, g_mbChg[64]);    // pixels the gather actually CHANGED
 
 ROOT_SIGNATURE(ComputeRootSignature)
 NUM_THREADS(8, 8, 1)
@@ -74,16 +75,25 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
     int2   tq    = clamp(pc / max(K, 1), int2(0, 0), max(tiles - int2(1, 1), int2(0, 0)));
     float2 vTile = LoadRWTex2D(gMbTileIn, tq);
 
-    // ⚠ WHICHEVER IS LARGER, and that choice is what lets a blur cross a silhouette: a static pixel
-    // beside a fast mover takes the mover's velocity, so the streak reaches it instead of stopping
-    // at the mover's edge. It is also exactly where the missing velocity-agreement weights would
-    // act — see motionblur.srt.h for what their absence costs and what MB-3 adds.
-    float2 v     = (dot(vTile, vTile) > dot(vSelf, vSelf)) ? vTile : vSelf;
-    float  speed = length(v);
+    // ⚠⚠ THE DILATED VELOCITY SETS THE DIRECTION AND EXTENT. IT DOES **NOT** SET THE ANSWER.
+    // This is the correction that the first in-game look forced (*"motion blur in rectangular tiles
+    // instead of on object's own pixels"*). The first build wrote
+    //     float2 v = (dot(vTile,vTile) > dot(vSelf,vSelf)) ? vTile : vSelf;
+    // which looks like a choice and is not one: vTile is a max over a 3x3 tile neighbourhood that
+    // CONTAINS this pixel's own tile, so |vTile| >= |vSelf| identically and the ternary always picks
+    // vTile. Every pixel in a tile was then blurred along that tile's dominant velocity — K-quantised
+    // rectangles, which is precisely what was reported.
+    //
+    // The dilation still has to choose the SEARCH direction: that is what lets a mover's streak reach
+    // past its own silhouette, and it is the entire reason the tile passes exist. What decides how
+    // much of each tap survives is the AGREEMENT test below, on the tap's own velocity and this
+    // pixel's own velocity. See mbcommon.h.fsl.
+    float  speed = length(vTile);                 // the SEARCH speed — always >= |vSelf|
+    float  selfStreak = length(vSelf) * shutter;  // THIS pixel's own streak, in delivered px
 
     // The displacement during the exposure. `v` is per FRAME, so this is framerate-independent by
     // construction — which is the whole of the fix for the DX9 filter's raw `blur_scale = 0.1`.
-    float2 d   = v * shutter;
+    float2 d   = vTile * shutter;
     float  len = length(d);
 
     // ⚠ CLAMPED TO K, AND K IS THE TILE SIZE. NeighborMax searched exactly one tile in each
@@ -104,10 +114,9 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
     // Without this every still frame gets a sub-pixel smear, and a still image that softens is the
     // most visible failure available to this pass.
     //
-    // The test is on the FIELD's magnitude, not on the shutter-scaled streak, so the threshold means
-    // the same thing at every shutter angle: "the vectors here say nothing moved". Below it `outv`
-    // stays the source pixel VERBATIM — a copy, not a one-tap filter — so a still frame is
-    // bit-identical to the un-blurred one and `mbEnable` can be A/B'd against a screenshot.
+    // ⚠ TESTED ON THE **DILATED** SPEED, not this pixel's own. A static pixel that a fast mover is
+    // sweeping across must still run the gather — that is where the mover's colour comes from. The
+    // weights, not the gate, are what leave it untouched when nothing actually reaches it.
     bool blurred = (speed >= floorPx) && (len >= 1.0e-4f);
 
     // ── THE ADAPTIVE TAP COUNT, WHICH THE DX9 FILTER COMPUTED AND THEN NEVER USED ────────────────
@@ -117,46 +126,68 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
     // oversampled every slow pixel and undersampled every fast one.
     uint taps = clamp(uint(ceil(len)), 3u, max(maxTaps, 3u));
 
+    // Did anything actually reach this pixel? Distinct from `blurred`, which only says the gather
+    // RAN — see the statistics at the tail, and the report that made the difference matter.
+    bool changed = false;
+
     if (blurred)
     {
         // A per-pixel offset inside the tap spacing. Turns the banding of a low tap count into grain.
         float  jitter  = mbDither(float2(pc)) - 0.5f;
         float  dCentre = LoadTex2D(gMbDepth, NO_SAMPLER, vq, 0).r;
-        float4 sum     = f4(0.0f);
-        float  wsum    = 0.0f;
 
-        // ── THE SHUTTER INTEGRAL: A BOX, NOT A TENT ──────────────────────────────────────────────
-        // The shutter is open or it is not; every instant during the exposure contributed equally, so
-        // the physically correct kernel along the streak is uniform. A cone/tent weight here would be
-        // a LOOK choice masquerading as a filter, and it would also hide the thing MB-3 needs to be
-        // able to see: without agreement weights, an over-blurred static pixel is supposed to look
-        // wrong.
+        // ⚠ THE CENTRE IS IN THE SUM WITH WEIGHT 1, ALWAYS, AND THAT IS WHAT MAKES THIS SAFE BY
+        // CONSTRUCTION. Every tap weight below is >= 0, so the denominator is >= 1 and can never be
+        // zero — which retires the `wsum > 1e-5 ? sum/wsum : centre` branch the first build needed
+        // ([[project_nan_survives_zero_multiply]] is handled by arithmetic here rather than by a
+        // guard). It also gives the exactly-right answer in the case this whole change is about: a
+        // static pixel whose every tap disagrees keeps weight 1 on itself and 0 elsewhere, so it
+        // comes out BIT-IDENTICAL to the source rather than merely close to it.
+        float4 sum  = centre;
+        float  wsum = 1.0f;
+
+        // ── THE SHUTTER INTEGRAL, WEIGHTED BY WHAT COULD ACTUALLY HAVE REACHED HERE ──────────────
+        // The shutter is open or it is not, so the kernel ALONG the streak is uniform — there is no
+        // cone or tent applied to distance for its own sake. Every weight below is a statement about
+        // VISIBILITY, not about a filter shape:
         //
-        // The only modulation is the depth weight, which answers a different question — whether the
-        // sample is somewhere the centre's motion could plausibly have swept over.
+        //   f * cone(dist, sampleStreak)  a blurry sample IN FRONT of us swept over this pixel. Gated
+        //                                 by the SAMPLE's own streak: it can only have got here if it
+        //                                 moved at least this far. **This is the term that stops a
+        //                                 static neighbour being smeared by its tile's mover.**
+        //   b * cone(dist, selfStreak)    WE are blurry and swept over a sample BEHIND us. Gated by
+        //                                 OUR own streak — so a static centre contributes nothing
+        //                                 here either, however fast its tile is.
+        //   2 * cyl * cyl                 both blurry: neither is cleanly foreground, and they mix.
         LOOP for (uint i = 0u; i < taps; ++i)
         {
             // t in (-0.5, 0.5): the fraction of the exposure this tap represents.
             float  t   = (float(i) + 0.5f + jitter) / float(taps) - 0.5f;
-            float2 sp  = float2(pc) + d * t;
+            float2 off = d * t;
+            float2 sp  = float2(pc) + off;
             int2   spi = clamp(int2(sp + f2(0.5f)), int2(0, 0), max(deliverN - int2(1, 1), int2(0, 0)));
+            float  dist = length(off);
 
-            // The depth field is at the INPUT rect — the same mapping the velocity fetch uses, so the
+            // The depth and velocity fields are BOTH at the INPUT rect — the same mapping, so the
             // two can never describe different pixels.
-            int2  dq = mbVelocityTexel(float2(spi), delivered, mvRect);
-            float ds = LoadTex2D(gMbDepth, NO_SAMPLER, dq, 0).r;
+            int2   dq = mbVelocityTexel(float2(spi), delivered, mvRect);
+            float  ds = LoadTex2D(gMbDepth, NO_SAMPLER, dq, 0).r;
+            float2 vs = LoadTex2D(gMbVelocity, NO_SAMPLER, dq, 0).xy * outScale;
+            float  sampleStreak = length(vs) * shutter;
 
-            float w = mbDepthWeight(dCentre, ds, softZ);
-            sum  += LoadTex2D(gMbColor, NO_SAMPLER, spi, 0) * w;
-            wsum += w;
+            float f = mbDepthWeight(ds, dCentre, softZ);   // sample in FRONT of the centre
+            float b = mbDepthWeight(dCentre, ds, softZ);   // sample BEHIND the centre
+
+            float a = f * mbCone(dist, sampleStreak)
+                    + b * mbCone(dist, selfStreak)
+                    + 2.0f * mbCylinder(dist, sampleStreak) * mbCylinder(dist, selfStreak);
+
+            sum  += LoadTex2D(gMbColor, NO_SAMPLER, spi, 0) * a;
+            wsum += a;
         }
 
-        // ⚠ THE FALLBACK IS THE CENTRE PIXEL, BY BRANCH. Every tap can legitimately be rejected — a
-        // pixel at the very edge of a fast foreground object, where the whole streak lands on
-        // geometry in front of it — and `sum / 0` is inf or NaN, which would survive every later
-        // multiply including one by zero coverage ([[project_nan_survives_zero_multiply]]). This
-        // tree's house rule for a zero-weight case is a branch, not an epsilon in a denominator.
-        outv = (wsum > 1.0e-5f) ? (sum / wsum) : centre;
+        outv    = sum / wsum;
+        changed = (wsum > 1.0001f);
     }
 
     if (inRect)
@@ -167,11 +198,19 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
     // ── THE STATISTICS ───────────────────────────────────────────────────────────────────────────
     // Reduced in groupshared and committed with ONE atomic set per group — an instrument that costs
     // enough to move the millisecond beside it is not an instrument. See motionblur.srt.h.
+    // ⚠ TWO POPULATIONS, AND SINCE THE AGREEMENT WEIGHTS LANDED THEY ARE GENUINELY DIFFERENT
+    // QUESTIONS. `hit` = the gather RAN here, which is what the pass COSTS. `chg` = at least one tap
+    // actually agreed, which is what the pass DOES. Before the weights the two were the same number
+    // by construction — every pixel that ran was blurred, which is exactly why the output looked
+    // like rectangles. Now a static pixel beside a fast mover runs the gather (it must: the mover's
+    // colour has to come from somewhere) and comes out bit-identical, so `blurred%` staying high
+    // while `changed%` collapses onto the movers IS the fix, as a number.
     uint tid   = (DispatchThreadID.y & 7u) * 8u + (DispatchThreadID.x & 7u);
     bool count = inRect && blurred;
     g_mbHit[tid]  = count ? 1u : 0u;
     g_mbTaps[tid] = count ? taps : 0u;
     g_mbLen[tid]  = count ? asuint(len) : 0u;
+    g_mbChg[tid]  = (count && changed) ? 1u : 0u;
     GroupMemoryBarrier();
 
     // Tree reduce, atmos_sh's shape: read into a register, barrier, guarded write, barrier. The
@@ -181,12 +220,14 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
         uint h = (tid < s) ? g_mbHit[tid + s]  : 0u;
         uint k = (tid < s) ? g_mbTaps[tid + s] : 0u;
         uint l = (tid < s) ? g_mbLen[tid + s]  : 0u;
+        uint c = (tid < s) ? g_mbChg[tid + s]  : 0u;
         GroupMemoryBarrier();
         if (tid < s)
         {
             g_mbHit[tid]  = g_mbHit[tid] + h;
             g_mbTaps[tid] = g_mbTaps[tid] + k;
             g_mbLen[tid]  = max(g_mbLen[tid], l);
+            g_mbChg[tid]  = g_mbChg[tid] + c;
         }
         GroupMemoryBarrier();
     }
@@ -197,6 +238,7 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
         AtomicAdd(gMbStats[0], g_mbHit[0],  prev);
         AtomicAdd(gMbStats[1], g_mbTaps[0], prev);
         AtomicMax(gMbStats[2], g_mbLen[0],  prev);
+        AtomicAdd(gMbStats[3], g_mbChg[0],  prev);
     }
     RETURN();
 }

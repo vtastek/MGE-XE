@@ -59,20 +59,31 @@
 //    so ported straight across the sign is INVERTED and the filter would blur background over
 //    foreground. See mbDepthWeight for the form that is correct AND needs no projection constants.
 //
-// ── WHAT IS DELIBERATELY NOT HERE, AND WHAT IT COSTS ─────────────────────────────────────────────
-// ⚠⚠ THE CONE/CYLINDER **VELOCITY-AGREEMENT** WEIGHTS ARE NOT IN THIS STEP (a scope decision, taken
-// in the plan). Those weight a tap by whether the SAMPLE's own velocity can actually carry it to the
-// centre pixel, and they need one extra RG16F load per tap — `float2 vs = mbVelocityAt(sampleP);` —
-// which is the whole of the change.
+// ── THE DILATION SETS THE SEARCH; THE WEIGHTS SET THE ANSWER ─────────────────────────────────────
+// ⚠⚠ THIS WAS SCOPED OUT AS "MB-3" AND THAT WAS WRONG, WHICH THE FIRST IN-GAME LOOK SETTLED IN ONE
+// SENTENCE: *"motion blur in rectangular tiles instead of on object's own pixels."*
 //
-// What their absence costs, precisely, so it can be recognised rather than rediscovered: the streak
-// direction comes from the tile's dominant velocity so that blur can extend PAST a mover's
-// silhouette, and without an agreement test a STATIC pixel sharing a tile with a fast mover is
-// blurred along the mover's velocity too. The symptom is sharp static geometry going soft in a halo
-// around something fast — worst where a fast mover crosses a high-contrast static edge. The depth
-// weight below catches the half of that where the neighbour is nearer, and cannot catch the half
-// where it is at the same depth, because at equal depth nothing but the velocities distinguishes
-// them. That is MB-3.
+// The first build picked its direction with `|vTile| > |vSelf| ? vTile : vSelf`, transcribed from
+// the DX9 filter. There the test means something, because that filter's "neighbour max" is a 5-TAP
+// CROSS which can miss the true maximum. Here the tile max is a genuine max over a 3x3 tile
+// neighbourhood **containing this pixel's own tile**, so `|vTile| >= |vSelf|` identically, the
+// ternary can never select `vSelf`, and every pixel in a tile was blurred along that tile's dominant
+// velocity. Not a halo around fast things — K-quantised RECTANGLES over the whole frame.
+//
+// The scoping note that shipped with it predicted "a halo around something fast", which understated
+// it by the width of a tile. The lesson is narrower than "don't defer work": **a dilation is a SEARCH
+// REGION, and a search region without an acceptance test is just a bigger answer.** The two halves
+// are one mechanism and cannot be landed separately.
+//
+// So the gather now weights every tap by whether it could actually have reached the centre, from the
+// tap's OWN velocity and the CENTRE's OWN velocity (McGuire 2012, `mbCone` / `mbCylinder` in
+// mbcommon.h.fsl). It costs one extra RG16F load per tap. A static pixel sharing a tile with a fast
+// mover still SEARCHES along the mover's direction — that is where the mover's colour legitimately
+// comes from — and every tap scores ~0, so it keeps its own colour bit-exactly.
+//
+// The centre sample is in the sum with weight 1 always, which makes the denominator >= 1 by
+// construction: no zero-weight branch, and a fully-disagreeing neighbourhood returns the source
+// pixel exactly rather than approximately.
 #pragma once
 
 STRUCT(MotionBlurParams)
@@ -152,8 +163,11 @@ BEGIN_SRT(MotionBlurSrtData)
         // pSceneColor may be MSAA, which cannot be UAV-written at all.
         DECL_RWTEXTURE(Persistent, WTex2D(float4), gMbOut)
         // ─── THE GATHER'S OWN STATISTICS, so "did a still frame get touched" is a NUMBER ─────────
-        // 3 uints: [0] pixels actually BLURRED (i.e. above the velocity floor), [1] the sum of their
-        // tap counts, [2] the longest streak in delivered px, as an asuint bit pattern (monotonic on
+        // 4 uints: [0] pixels that RAN the gather (above the velocity floor), [1] the sum of their
+        // tap counts, [3] pixels the gather actually CHANGED — the two are different questions since
+        // the agreement weights landed, and their DIVERGENCE is what says the tiling is gone (a
+        // static pixel beside a mover runs and comes out identical). [2] the longest streak in
+        // delivered px, as an asuint bit pattern (monotonic on
         // a non-negative float, so InterlockedMax on the raw bits is a correct float max — the trick
         // motionvectors.comp and mvfieldstats.comp both use, and the reason neither needs SM6.6).
         //

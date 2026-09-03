@@ -12558,13 +12558,13 @@ namespace {
                 addResource(&mcb, nullptr);
 
                 // The gather's statistics, and its reset/readback staging pair.
-                static const uint32_t kMbReset[3] = { 0u, 0u, 0u };
+                static const uint32_t kMbReset[4] = { 0u, 0u, 0u, 0u };
                 BufferLoadDesc msb = {};
                 msb.mDesc.mDescriptors  = DESCRIPTOR_TYPE_RW_BUFFER;
                 msb.mDesc.mMemoryUsage  = RESOURCE_MEMORY_USAGE_GPU_ONLY;
                 msb.mDesc.mFormat       = TinyImageFormat_R32_UINT;
                 msb.mDesc.mStructStride = sizeof(uint32_t);
-                msb.mDesc.mElementCount = 3;
+                msb.mDesc.mElementCount = 4;
                 msb.mDesc.mSize         = sizeof(kMbReset);
                 msb.mDesc.mStartState   = RESOURCE_STATE_UNORDERED_ACCESS;
                 msb.mDesc.pName         = "mbStats";
@@ -15298,6 +15298,15 @@ namespace {
     // the milestone is to SEE it, and `mbEnable = 0` is the A/B arm. Off must be a BYTE-IDENTICAL
     // no-op — no dispatch, and the resolve binds exactly the instance it binds today — which is
     // verification step 1 and is proved rather than assumed.
+    //
+    // ⚠⚠ AND SHIPPING ON IS EXACTLY WHY THIS KNOB HAS TO ARM ITS PRODUCER. `g_mvEnable` ships OFF
+    // ("nothing consumes the vectors"), so for one build this checkbox was on, every dispatch ran,
+    // `mb=` appeared on the gpu split — and the field was never written, so every pixel fell under
+    // the velocity floor and got copied. Reported from play as "there is no motion blur, by
+    // default". This knob is therefore listed in `mvActive` at the colour->water seam, and the pass
+    // is additionally gated on `g_lastMvRan` so it can never consume a field from another frame.
+    // A consumer and its producer must not be armed by different switches
+    // ([[feedback_knob_gated_apart_from_its_consumer]]).
     bool     g_mbEnable = true;
     // THE SHUTTER ANGLE, in degrees, and this is the whole of the fix for the DX9 filter's
     // `blur_scale = 0.1`. That was a raw multiplier on a per-FRAME displacement, so a blur tuned at
@@ -15369,6 +15378,7 @@ namespace {
     // `frames` is what stops the latch lying by silence: 0/N means nothing blurred at all in the
     // window, which is a real and different answer from "the pass is broken".
     double   g_mbPeakPct    = 0.0;
+    double   g_mbPeakChg    = 0.0;
     double   g_mbPeakTaps   = 0.0;
     float    g_mbPeakLen    = 0.0f;
     uint32_t g_mbBlurFrames = 0;
@@ -30770,7 +30780,21 @@ void destroyHostWindow(Renderer* R);
         // is smearing that looks like a convention error in the vectors rather than like an absent
         // pass. This is the same shape as the jitter gate one screen up: a producer and its
         // consumer must not be armed by different switches.
+        //
+        // ⚠⚠ AND SO DOES MOTION BLUR (MB-2), WHICH IS THE FOURTH CONSUMER AND WAS MISSING FROM THIS
+        // LIST FOR EXACTLY ONE BUILD. Reported from play as "there is no motion blur, by default" —
+        // and that is the whole defect: `mbEnable` ships ON, every dispatch ran, `mb=0.28` appeared
+        // on the gpu split, and the field it read had never been written, so every pixel fell under
+        // the velocity floor and was copied verbatim. A consumer shipping ON behind a producer
+        // shipping OFF is a feature that is on in every log and absent on screen.
+        //
+        // ⚠ IT WAS MISSED BECAUSE EVERY VERIFICATION RUN PASSED `mvEnable=1` — the token was
+        // inherited from MB-1's recipe, where it was correct, and carried into MB-2's runs without
+        // being re-examined. The OFF arm and the forced-ON arm were both proved; the DEFAULT arm,
+        // which is the only one anybody plays, was never run. [[feedback_verify_the_right_artifact]]
+        // one level up: not the wrong artifact, the wrong CONFIGURATION.
         const bool mvActive = (g_mvEnable || upscaleTemporalActive()
+                               || (g_mbEnable && g_live.mbReady)
                                || g_debugMode == 17u || g_debugMode == 18u)
                            && g_live.mvReady && aoBlockRan && g_live.pLinearizeSet;
         // Gate on aoBlockRan, not on the pipeline alone: that block is what leaves pLinearDepth in
@@ -33548,8 +33572,22 @@ void destroyHostWindow(Renderer* R);
         // INPUT-rect pixels, and this pass works in DELIVERED pixels. `tile.w` carries the ratio, and
         // at 1x it is exactly 1.0 and PROVES NOTHING — the same trap
         // [[project_forge_upscale_seam_4b]] records for the resolve. Test at upscaleMode=2.
+        //
+        // ⚠⚠ GATED ON `g_lastMvRan` — THE FIELD MUST HAVE BEEN WRITTEN **THIS FRAME**, and that is the
+        // second half of the "no motion blur by default" fix rather than a belt-and-braces extra.
+        // The first half arms the producer from `mbEnable` (see mvActive at the colour->water seam);
+        // this half is what makes the failure SAFE when the producer does not run anyway — the AO
+        // block did not run, the linearize set is missing, a hot-reload left mvReady false.
+        //
+        // Without it, pMotionVectors holds its RESTING contents on a session where the pass never
+        // ran (zeros — every pixel under the floor, a blur that silently does nothing) and, far
+        // worse, holds the LAST FRAME THE PASS DID RUN on a session where it ran and then stopped:
+        // open F12 mode 17 once and close it, and the blur would go on smearing by a frozen field
+        // for the rest of the session. That is the "plausible, smoothly-varying, completely wrong
+        // field" the mvActive comment warns DLSS about, reached through a different consumer.
         bool mbRan = false;
-        if (shaderResolve && g_live.mbReady && g_mbEnable && deliveredW > 0u && deliveredH > 0u) {
+        if (shaderResolve && g_live.mbReady && g_mbEnable && g_lastMvRan
+            && deliveredW > 0u && deliveredH > 0u) {
             // The colour source must be readable. On an upscaled frame the gather reads the backend's
             // target, which evaluate() already left in SHADER_RESOURCE; on a native frame it reads
             // pSceneColor, which needs the hoist. Idempotent, so this is a plain call.
@@ -33595,7 +33633,7 @@ void destroyHostWindow(Renderer* R);
                 cmdResourceBarrier(g_live.pCmd, 1, &bb, 0, nullptr, 0, nullptr);
                 g_live.pCmd->mDx.pCmdList->CopyBufferRegion(
                     g_live.pMbStats->mDx.pResource, 0,
-                    g_live.pMbStatsReset->mDx.pResource, 0, sizeof(uint32_t) * 3);
+                    g_live.pMbStatsReset->mDx.pResource, 0, sizeof(uint32_t) * 4);
                 bb.mCurrentState = RESOURCE_STATE_COPY_DEST;
                 bb.mNewState     = RESOURCE_STATE_UNORDERED_ACCESS;
                 cmdResourceBarrier(g_live.pCmd, 1, &bb, 0, nullptr, 0, nullptr);
@@ -33664,7 +33702,7 @@ void destroyHostWindow(Renderer* R);
                 cmdResourceBarrier(g_live.pCmd, 1, &bb, 0, nullptr, 0, nullptr);
                 g_live.pCmd->mDx.pCmdList->CopyBufferRegion(
                     g_live.pMbStatsReadback->mDx.pResource, 0,
-                    g_live.pMbStats->mDx.pResource, 0, sizeof(uint32_t) * 3);
+                    g_live.pMbStats->mDx.pResource, 0, sizeof(uint32_t) * 4);
                 bb.mCurrentState = RESOURCE_STATE_COPY_SOURCE;
                 bb.mNewState     = RESOURCE_STATE_UNORDERED_ACCESS;
                 cmdResourceBarrier(g_live.pCmd, 1, &bb, 0, nullptr, 0, nullptr);
@@ -33692,6 +33730,7 @@ void destroyHostWindow(Renderer* R);
                     const double pct = 100.0 * (double)ps[0] / (double)g_lastMbPixels;
                     if (pct > g_mbPeakPct) {
                         g_mbPeakPct  = pct;
+                        g_mbPeakChg  = 100.0 * (double)ps[3] / (double)g_lastMbPixels;
                         g_mbPeakTaps = (double)ps[1] / (double)ps[0];
                         std::memcpy(&g_mbPeakLen, &ps[2], sizeof(float));
                     }
@@ -34643,7 +34682,13 @@ void destroyHostWindow(Renderer* R);
             // and reaching mode 17 again costs seventeen F12 presses. Say it once per run instead —
             // an instrument that is absent exactly when someone is trying to use it is the same
             // defect as one that samples the wrong frame, wearing different clothes.
-            if (!g_mvEnable && g_debugMode != 17u && g_debugMode != 18u) {
+            // ⚠ GATED ON WHETHER THE PASS **RAN**, NOT ON THE KNOB. `g_mvEnable` is only one of
+            // four things that can arm this pass — a temporal upscaler, F12 modes 17/18 and now
+            // MB-2 all force it on — so a gate naming the knob goes silent for three of them. That
+            // is not hypothetical: MB-2 arming the producer made the pass run in the default
+            // configuration while this block, keyed on the knob, printed the OFF notice instead.
+            // The line reports `ran=`, so `ran` is what it should be gated on.
+            if (!g_lastMvRan && !g_mvEnable && g_debugMode != 17u && g_debugMode != 18u) {
                 static bool s_mvOffOnce = false;
                 if (!s_mvOffOnce) {
                     s_mvOffOnce = true;
@@ -34656,7 +34701,67 @@ void destroyHostWindow(Renderer* R);
                     LOG::flush();
                 }
             }
-            if (g_mvEnable || g_debugMode == 17u || g_debugMode == 18u) {
+            // ─── MB-2 STATISTICS: OUTSIDE THE `mv:` BLOCK, AND THAT IS THE POINT ────────────
+            // ⚠⚠ THESE LIVED INSIDE THE MOTION-VECTOR HEARTBEAT FOR ONE BUILD, WHICH GATED THEM ON
+            // `g_mvEnable` — a knob MB-2 does not use and does not need. The moment MB-2 started
+            // arming the producer for itself, the pass ran by default and its own statistics went
+            // SILENT by default, so the run that was meant to confirm the fix printed nothing at
+            // all. Statistics belong to the PASS, never to a switch that happens to enclose it —
+            // the same correction `mvfieldstats` already made when it was gated on `objVelEnable`
+            // ([[feedback_isolation_lever_killed_its_own_subject]]), made twice in one file.
+            // ─── MB-2: WHAT THE GATHER ACTUALLY DID ─────────────────────────────────────────
+            // ⚠ `blurred%` IS THE VELOCITY FLOOR'S ACCEPTANCE TEST, and it is here rather than
+            // left to the eye for the reason MB-2 step 0 has just finished paying for: a claim
+            // that is read instead of measured survives for weeks. Parked on static geometry it
+            // must read **0.000%** — every pixel below the floor is copied verbatim, so a still
+            // frame is bit-identical to `mbEnable=0`. Anything else IS the smear, as a number.
+            //
+            // It is also the only thing that explains `mb=` on the gpu split. The gather's cost
+            // is (blurred pixels) x (their taps), so a millisecond that moved is one of those two
+            // moving, and avgTaps says which: more of the screen in motion, or the same motion
+            // gone faster. maxLen is the longest streak in delivered px — if it sits pinned at K
+            // the clamp is binding and the streaks are being cut short.
+            if (g_lastMbRan && g_live.pMbStatsReadback
+                && g_live.pMbStatsReadback->pCpuMappedAddress && g_lastMbPixels > 0u) {
+                const uint32_t* ms = (const uint32_t*)g_live.pMbStatsReadback->pCpuMappedAddress;
+                float mlen = 0.0f;
+                std::memcpy(&mlen, &ms[2], sizeof(float));
+                // ⚠⚠ TWO PERCENTAGES, AND THEIR **RATIO** IS THE TILING TEST. `searched` is what the
+                // pass COSTS (pixels that ran the gather, i.e. whose tile carries motion); `changed`
+                // is what it DOES (pixels where at least one tap actually agreed). Before the
+                // velocity-agreement weights those were the same number BY CONSTRUCTION — every
+                // searched pixel was blurred — and that identity IS the rectangular-tile artifact,
+                // expressed as a number. With the weights, a mover in a still scene shows `searched`
+                // covering its tiles while `changed` collapses onto the mover itself.
+                // **searched ~= changed means the tiling is back.**
+                LOG::logline(">> [forge-hb] mb: searched=%.3f%% changed=%.3f%% of %llu px"
+                             " avgTaps=%.1f maxLen=%.2f px (K=%u shutter=%.0fdeg floor=%.2fpx)"
+                             "  [both MUST be 0.000%% on a parked camera; searched ~= changed is the"
+                             " TILE artifact — the agreement weights are what separate them; maxLen"
+                             " pinned at K means the clamp is cutting streaks short]",
+                             100.0 * (double)ms[0] / (double)g_lastMbPixels,
+                             100.0 * (double)ms[3] / (double)g_lastMbPixels,
+                             (unsigned long long)g_lastMbPixels,
+                             ms[0] ? (double)ms[1] / (double)ms[0] : 0.0,
+                             (double)mlen, g_lastMbK, (double)g_mbShutter, (double)g_mbMinPx);
+                // ⚠⚠ AND THE BUSIEST FRAME, WHICH IS THE ONE THAT EXPLAINS `mb=`. The line above
+                // is a SAMPLE and the pass's load is BURSTY — a camera is parked far more often
+                // than it is turning — so the sampled frame is usually a parked one while the
+                // millisecond on the gpu split came from a moving one. Measured: eight sampled
+                // heartbeats caught ONE moving frame (0.684%) across a window where `mb=` ranged
+                // 0.22 to 2.09 ms. Same defect as MB-2 step 0's parked lane, one level down.
+                //
+                // `frames=0/N` is a real answer, not a missing one: nothing moved in the window.
+                LOG::logline(">> [forge-hb] mb peak: searched=%.3f%% changed=%.3f%% avgTaps=%.1f"
+                             " maxLen=%.2f px on the BUSIEST of %u/%u frames that searched anything"
+                             "  [this is the frame `mb=` is priced by — cost is (searched px) x"
+                             " (their taps); the sampled line above is usually a PARKED frame]",
+                             g_mbPeakPct, g_mbPeakChg, g_mbPeakTaps, (double)g_mbPeakLen,
+                             g_mbBlurFrames, g_mbRanFrames);
+                g_mbPeakPct = 0.0; g_mbPeakChg = 0.0; g_mbPeakTaps = 0.0; g_mbPeakLen = 0.0f;
+                g_mbBlurFrames = 0; g_mbRanFrames = 0;
+            }
+            if (g_lastMvRan || g_mvEnable || g_debugMode == 17u || g_debugMode == 18u) {
                 LOG::logline(">> [forge-hb] mv: ran=%d ready=%d valid=%d bakeEye=(%.1f, %.1f, %.1f) "
                              "dBake=(%+.3f, %+.3f, %+.3f) rect=%ux%u out=%ux%u",
                              g_lastMvRan ? 1 : 0, g_live.mvReady ? 1 : 0,
@@ -34818,49 +34923,6 @@ void destroyHostWindow(Renderer* R);
                                  " (parkedFrames above says how often the condition fires; 0/N there"
                                  " means the bit-identity branch is unreachable in this scene)");
                 }
-                // ─── MB-2: WHAT THE GATHER ACTUALLY DID ─────────────────────────────────────────
-                // ⚠ `blurred%` IS THE VELOCITY FLOOR'S ACCEPTANCE TEST, and it is here rather than
-                // left to the eye for the reason MB-2 step 0 has just finished paying for: a claim
-                // that is read instead of measured survives for weeks. Parked on static geometry it
-                // must read **0.000%** — every pixel below the floor is copied verbatim, so a still
-                // frame is bit-identical to `mbEnable=0`. Anything else IS the smear, as a number.
-                //
-                // It is also the only thing that explains `mb=` on the gpu split. The gather's cost
-                // is (blurred pixels) x (their taps), so a millisecond that moved is one of those two
-                // moving, and avgTaps says which: more of the screen in motion, or the same motion
-                // gone faster. maxLen is the longest streak in delivered px — if it sits pinned at K
-                // the clamp is binding and the streaks are being cut short.
-                if (g_lastMbRan && g_live.pMbStatsReadback
-                    && g_live.pMbStatsReadback->pCpuMappedAddress && g_lastMbPixels > 0u) {
-                    const uint32_t* ms = (const uint32_t*)g_live.pMbStatsReadback->pCpuMappedAddress;
-                    float mlen = 0.0f;
-                    std::memcpy(&mlen, &ms[2], sizeof(float));
-                    LOG::logline(">> [forge-hb] mb: blurred=%.3f%% of %llu px avgTaps=%.1f maxLen=%.2f px"
-                                 " (K=%u shutter=%.0fdeg floor=%.2fpx)  [blurred%% MUST be 0.000%% on a"
-                                 " parked camera — below the floor a pixel is copied VERBATIM, so a"
-                                 " still frame is bit-identical to mbEnable=0; maxLen pinned at K"
-                                 " means the clamp is cutting streaks short]",
-                                 100.0 * (double)ms[0] / (double)g_lastMbPixels,
-                                 (unsigned long long)g_lastMbPixels,
-                                 ms[0] ? (double)ms[1] / (double)ms[0] : 0.0,
-                                 (double)mlen, g_lastMbK, (double)g_mbShutter, (double)g_mbMinPx);
-                    // ⚠⚠ AND THE BUSIEST FRAME, WHICH IS THE ONE THAT EXPLAINS `mb=`. The line above
-                    // is a SAMPLE and the pass's load is BURSTY — a camera is parked far more often
-                    // than it is turning — so the sampled frame is usually a parked one while the
-                    // millisecond on the gpu split came from a moving one. Measured: eight sampled
-                    // heartbeats caught ONE moving frame (0.684%) across a window where `mb=` ranged
-                    // 0.22 to 2.09 ms. Same defect as MB-2 step 0's parked lane, one level down.
-                    //
-                    // `frames=0/N` is a real answer, not a missing one: nothing moved in the window.
-                    LOG::logline(">> [forge-hb] mb peak: blurred=%.3f%% avgTaps=%.1f maxLen=%.2f px"
-                                 " on the BUSIEST of %u/%u frames that blurred anything  [this is the"
-                                 " frame `mb=` is priced by — cost is (blurred px) x (their taps);"
-                                 " the sampled line above is usually a PARKED frame]",
-                                 g_mbPeakPct, g_mbPeakTaps, (double)g_mbPeakLen,
-                                 g_mbBlurFrames, g_mbRanFrames);
-                    g_mbPeakPct = 0.0; g_mbPeakTaps = 0.0; g_mbPeakLen = 0.0f;
-                    g_mbBlurFrames = 0; g_mbRanFrames = 0;
-                }
                 // ⚠ REPORTED TWICE, AND THE SECOND NUMBER IS THE USABLE ONE. The reference point
                 // (screen centre, device depth 0.5) lands only ~8 units out under reverse-Z, which
                 // makes it a very SENSITIVE canary and a very misleading absolute: the origin error
@@ -35015,14 +35077,22 @@ void destroyHostWindow(Renderer* R);
             // when no dispatch happened. Two states that are identical in the timing alone — the knob
             // off, and the pass failing to build — read differently here, which is the same argument
             // the upscale bracket beside it is made of.
-            char mbText[64];
+            char mbText[80];
             if (g_lastMbRan) {
                 std::snprintf(mbText, sizeof(mbText), "K%u %ux%u tiles",
                               g_lastMbK, g_lastMbTilesX, g_lastMbTilesY);
             } else if (!g_live.mbReady) {
                 std::snprintf(mbText, sizeof(mbText), "NOT BUILT");
-            } else {
+            } else if (!g_mbEnable) {
                 std::snprintf(mbText, sizeof(mbText), "off");
+            } else {
+                // ⚠ THE STATE THAT SHIPPED BROKEN FOR ONE BUILD AND HAD NO NAME. `mbEnable` on,
+                // everything built, and no field to consume — which is what "there is no motion blur
+                // by default" looked like from inside the log: `mb=0.28(K20 128x80 tiles)`, a pass
+                // that ran, dispatched, cost time, and blurred nothing because pMotionVectors had
+                // never been written. It now says so, so this failure is a LOG LINE rather than a
+                // report from play.
+                std::snprintf(mbText, sizeof(mbText), "ON but NO FIELD — mv pass did not run");
             }
             LOG::logline(">> [forge-hb] gpu split: cull=%.2f prepass=%.2f shadow=%.2f (st=%.2f dyn=%.2f sun=%.2f) postdepth=%.2f (lin=%.2f ao=%.2f mask=%.2f) reflect=%.2f color=%.2f water=%.2f caustic=%.2f grasscrush=%.2f(%u) mv=%.2f upscale=%.2f(%s) mb=%.2f(%s) bloom=%.2f(L%u) resolve=%.2f ms"
                          " | hiz=%.2f (prologue, overruns=%u) | shadowCasters=%u maskSlots=%u(dyn=%u)"

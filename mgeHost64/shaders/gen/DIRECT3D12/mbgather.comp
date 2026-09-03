@@ -976,7 +976,7 @@ SamplerState gSampler2xWrapClamp : register( s17 , space100 ) ;
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/mbgather.comp.fsl"
 #line 30 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/mbgather.comp.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/motionblur.srt.h"
-#line 78 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/motionblur.srt.h"
+#line 89 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/motionblur.srt.h"
 STRUCT(MotionBlurParams)
 {
 
@@ -986,15 +986,15 @@ STRUCT(MotionBlurParams)
 
 
     float4 rects;
-#line 98 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/motionblur.srt.h"
+#line 109 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/motionblur.srt.h"
     float4 tile;
-#line 113 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/motionblur.srt.h"
+#line 124 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/motionblur.srt.h"
     float4 blur;
 
 
 
     float4 opts;
-#line 118
+#line 129
 };
 
         CBUFFER(MotionBlurParams) gMbParams :  register(b0,space0);
@@ -1029,7 +1029,7 @@ STRUCT(MotionBlurParams)
 
 
         WTex2D(float4) gMbOut :  register(u6,space0);
-#line 174 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/motionblur.srt.h"
+#line 188 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/motionblur.srt.h"
         RWBuffer(uint) gMbStats :  register(u7,space0);
 #line 31 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/mbgather.comp.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/mbcommon.h.fsl"
@@ -1040,11 +1040,25 @@ int2 mbVelocityTexel(float2 deliveredPx, float2 deliveredRect, float2 mvRect)
     int2 q = int2(n * mvRect);
     return clamp(q, int2(0, 0), int2(mvRect) - int2(1, 1));
 }
-#line 48 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/mbcommon.h.fsl"
+#line 57 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/mbcommon.h.fsl"
 float mbDepthWeight(float dCentre, float dSample, float extent)
 {
     float rel = max(dCentre, 1.0e-7f) / max(dSample, 1.0e-7f) - 1.0f;
     return saturate(1.0f + rel / max(extent, 1.0e-4f));
+}
+#line 86 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/mbcommon.h.fsl"
+float mbCone(float dist, float streak)
+{
+    return saturate(1.0f - dist / max(streak, 1.0e-4f));
+}
+
+
+
+
+float mbCylinder(float dist, float streak)
+{
+    float L = max(streak, 1.0e-4f);
+    return 1.0f - smoothstep(0.95f * L, 1.05f * L, dist);
 }
 
 
@@ -1072,6 +1086,9 @@ groupshared uint g_mbTaps[64];
 #define srt_g_mbLen g_mbLen
 #line 39
 groupshared uint g_mbLen[64];
+#define srt_g_mbChg g_mbChg
+#line 40
+groupshared uint g_mbChg[64];
 
 [RootSignature( "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "3" ", offset = 0)," "CBV(b0, numDescriptors = unbounded, space = " "3" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "3" ", offset = 0))," "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "2" ", offset = 0)," "CBV(b0, numDescriptors = unbounded, space = " "2" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "2" ", offset = 0))," "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "1" ", offset = 0)," "CBV(b0, numDescriptors = unbounded, space = " "1" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "1" ", offset = 0))," "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "0" ", offset = 0)," "CBV(b0, numDescriptors = unbounded, space = " "0" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "0" ", offset = 0))," "DescriptorTable(" "SAMPLER(s0, numDescriptors = unbounded, space = " "0" ", offset = 0))," "StaticSampler(s0, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s1, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s2, space = 100," "filter = FILTER_MIN_MAG_LINEAR_MIP_POINT," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s3, space = 100," "filter = FILTER_MIN_MAG_LINEAR_MIP_POINT," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s4, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s5, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s6, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT," "addressU = TEXTURE_ADDRESS_MIRROR, addressV = TEXTURE_ADDRESS_MIRROR, addressW = TEXTURE_ADDRESS_MIRROR)," "StaticSampler(s7, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT, borderColor = STATIC_BORDER_COLOR_TRANSPARENT_BLACK," "addressU = TEXTURE_ADDRESS_BORDER, addressV = TEXTURE_ADDRESS_BORDER, addressW = TEXTURE_ADDRESS_BORDER)," "StaticSampler(s8, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR," "addressU = TEXTURE_ADDRESS_MIRROR, addressV = TEXTURE_ADDRESS_MIRROR, addressW = TEXTURE_ADDRESS_MIRROR)," "StaticSampler(s9, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR, borderColor = STATIC_BORDER_COLOR_TRANSPARENT_BLACK," "addressU = TEXTURE_ADDRESS_BORDER, addressV = TEXTURE_ADDRESS_BORDER, addressW = TEXTURE_ADDRESS_BORDER)," "StaticSampler(s10, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 8," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s11, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 8," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s12, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 8," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s13, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 8," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s14, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 2," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s15, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 2," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s16, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 2," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s17, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 2," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_WRAP)" )]
 NUM_THREADS(8, 8, 1)
@@ -1108,17 +1125,13 @@ void CS_MAIN( uint3 DispatchThreadID : SV_DISPATCHTHREADID )
     float2 vSelf = LoadTex2D(gMbVelocity, NO_SAMPLER, vq, 0).xy * outScale;
     int2 tq = clamp(pc / max(K, 1), int2(0, 0), max(tiles - int2(1, 1), int2(0, 0)));
     float2 vTile = LoadRWTex2D(gMbTileIn, tq);
+#line 91 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/mbgather.comp.fsl"
+    float speed = length(vTile);
+    float selfStreak = length(vSelf) * shutter;
 
 
 
-
-
-    float2 v = (dot(vTile, vTile) > dot(vSelf, vSelf)) ? vTile : vSelf;
-    float speed = length(v);
-
-
-
-    float2 d = v * shutter;
+    float2 d = vTile * shutter;
     float len = length(d);
 
 
@@ -1130,7 +1143,7 @@ void CS_MAIN( uint3 DispatchThreadID : SV_DISPATCHTHREADID )
         d = d * (float(K) / max(len, 1.0e-6f));
         len = float(K);
     }
-#line 111 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/mbgather.comp.fsl"
+#line 120 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/mbgather.comp.fsl"
     bool blurred = (speed >= floorPx) && (len >= 1.0e-4f);
 
 
@@ -1140,13 +1153,15 @@ void CS_MAIN( uint3 DispatchThreadID : SV_DISPATCHTHREADID )
 
     uint taps = clamp(uint(ceil(len)), 3u, max(maxTaps, 3u));
 
+
+
+    bool changed = false;
+
     if (blurred)
     {
 
         float jitter = mbDither(float2(pc)) - 0.5f;
         float dCentre = LoadTex2D(gMbDepth, NO_SAMPLER, vq, 0).r;
-        float4 sum = f4(0.0f);
-        float wsum = 0.0f;
 
 
 
@@ -1155,46 +1170,51 @@ void CS_MAIN( uint3 DispatchThreadID : SV_DISPATCHTHREADID )
 
 
 
-
-
+        float4 sum = centre;
+        float wsum = 1.0f;
+#line 162 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/mbgather.comp.fsl"
         LOOP for (uint i = 0u; i < taps; ++i)
         {
 
             float t = (float(i) + 0.5f + jitter) / float(taps) - 0.5f;
-            float2 sp = float2(pc) + d * t;
+            float2 off = d * t;
+            float2 sp = float2(pc) + off;
             int2 spi = clamp(int2(sp + f2(0.5f)), int2(0, 0), max(deliverN - int2(1, 1), int2(0, 0)));
+            float dist = length(off);
 
 
 
             int2 dq = mbVelocityTexel(float2(spi), delivered, mvRect);
             float ds = LoadTex2D(gMbDepth, NO_SAMPLER, dq, 0).r;
+            float2 vs = LoadTex2D(gMbVelocity, NO_SAMPLER, dq, 0).xy * outScale;
+            float sampleStreak = length(vs) * shutter;
 
-            float w = mbDepthWeight(dCentre, ds, softZ);
-            sum += LoadTex2D(gMbColor, NO_SAMPLER, spi, 0) * w;
-            wsum += w;
+            float f = mbDepthWeight(ds, dCentre, softZ);
+            float b = mbDepthWeight(dCentre, ds, softZ);
+
+            float a = f * mbCone(dist, sampleStreak)
+                    + b * mbCone(dist, selfStreak)
+                    + 2.0f * mbCylinder(dist, sampleStreak) * mbCylinder(dist, selfStreak);
+
+            sum += LoadTex2D(gMbColor, NO_SAMPLER, spi, 0) * a;
+            wsum += a;
         }
 
-
-
-
-
-
-        outv = (wsum > 1.0e-5f) ? (sum / wsum) : centre;
+        outv = sum / wsum;
+        changed = (wsum > 1.0001f);
     }
 
     if (inRect)
     {
         Write2D(gMbOut, p, outv);
     }
-
-
-
-
+#line 208 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/mbgather.comp.fsl"
     uint tid = (DispatchThreadID.y & 7u) * 8u + (DispatchThreadID.x & 7u);
     bool count = inRect && blurred;
     g_mbHit[tid] = count ? 1u : 0u;
     g_mbTaps[tid] = count ? taps : 0u;
     g_mbLen[tid] = count ? asuint(len) : 0u;
+    g_mbChg[tid] = (count && changed) ? 1u : 0u;
     GroupMemoryBarrier();
 
 
@@ -1204,12 +1224,14 @@ void CS_MAIN( uint3 DispatchThreadID : SV_DISPATCHTHREADID )
         uint h = (tid < s) ? g_mbHit[tid + s] : 0u;
         uint k = (tid < s) ? g_mbTaps[tid + s] : 0u;
         uint l = (tid < s) ? g_mbLen[tid + s] : 0u;
+        uint c = (tid < s) ? g_mbChg[tid + s] : 0u;
         GroupMemoryBarrier();
         if (tid < s)
         {
             g_mbHit[tid] = g_mbHit[tid] + h;
             g_mbTaps[tid] = g_mbTaps[tid] + k;
             g_mbLen[tid] = max(g_mbLen[tid], l);
+            g_mbChg[tid] = g_mbChg[tid] + c;
         }
         GroupMemoryBarrier();
     }
@@ -1220,6 +1242,7 @@ void CS_MAIN( uint3 DispatchThreadID : SV_DISPATCHTHREADID )
         AtomicAdd(gMbStats[0], g_mbHit[0], prev);
         AtomicAdd(gMbStats[1], g_mbTaps[0], prev);
         InterlockedMax(gMbStats[2], g_mbLen[0], prev) ;
+        AtomicAdd(gMbStats[3], g_mbChg[0], prev);
     }
     return;
 }

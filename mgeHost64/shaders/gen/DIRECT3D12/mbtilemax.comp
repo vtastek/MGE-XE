@@ -976,7 +976,7 @@ SamplerState gSampler2xWrapClamp : register( s17 , space100 ) ;
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/mbtilemax.comp.fsl"
 #line 19 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/mbtilemax.comp.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/motionblur.srt.h"
-#line 78 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/motionblur.srt.h"
+#line 89 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/motionblur.srt.h"
 STRUCT(MotionBlurParams)
 {
 
@@ -986,15 +986,15 @@ STRUCT(MotionBlurParams)
 
 
     float4 rects;
-#line 98 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/motionblur.srt.h"
+#line 109 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/motionblur.srt.h"
     float4 tile;
-#line 113 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/motionblur.srt.h"
+#line 124 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/motionblur.srt.h"
     float4 blur;
 
 
 
     float4 opts;
-#line 118
+#line 129
 };
 
         CBUFFER(MotionBlurParams) gMbParams :  register(b0,space0);
@@ -1029,7 +1029,7 @@ STRUCT(MotionBlurParams)
 
 
         WTex2D(float4) gMbOut :  register(u6,space0);
-#line 174 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/motionblur.srt.h"
+#line 188 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/motionblur.srt.h"
         RWBuffer(uint) gMbStats :  register(u7,space0);
 #line 20 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/mbtilemax.comp.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/mbcommon.h.fsl"
@@ -1040,11 +1040,25 @@ int2 mbVelocityTexel(float2 deliveredPx, float2 deliveredRect, float2 mvRect)
     int2 q = int2(n * mvRect);
     return clamp(q, int2(0, 0), int2(mvRect) - int2(1, 1));
 }
-#line 48 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/mbcommon.h.fsl"
+#line 57 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/mbcommon.h.fsl"
 float mbDepthWeight(float dCentre, float dSample, float extent)
 {
     float rel = max(dCentre, 1.0e-7f) / max(dSample, 1.0e-7f) - 1.0f;
     return saturate(1.0f + rel / max(extent, 1.0e-4f));
+}
+#line 86 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/mbcommon.h.fsl"
+float mbCone(float dist, float streak)
+{
+    return saturate(1.0f - dist / max(streak, 1.0e-4f));
+}
+
+
+
+
+float mbCylinder(float dist, float streak)
+{
+    float L = max(streak, 1.0e-4f);
+    return 1.0f - smoothstep(0.95f * L, 1.05f * L, dist);
 }
 
 

@@ -37,6 +37,15 @@ int2 mbVelocityTexel(float2 deliveredPx, float2 deliveredRect, float2 mvRect)
 // with no constants at all. The extent knob is then a fraction ("10% nearer") and means the same
 // thing at 200 units and at 200 000, which an absolute epsilon in device depth emphatically does not.
 //
+// ⚠ IT IS USED BOTH WAYS ROUND, AND THE ARGUMENT ORDER IS THE WHOLE DISTINCTION:
+//     b = mbDepthWeight(dCentre, dSample)  — the sample is BEHIND, so the blurry CENTRE may smear
+//                                            over it (pairs with cone(dist, centre's own streak));
+//     f = mbDepthWeight(dSample, dCentre)  — the sample is in FRONT, so a blurry SAMPLE may smear
+//                                            over the sharp centre (pairs with cone(dist, sample's
+//                                            own streak)).
+// Two different physical events that a single "is this depth close enough" test cannot tell apart,
+// which is why McGuire's filter carries both and weights them by different velocities.
+//
 // Returns 1 when the sample is at or behind the centre (the centre's motion may legitimately smear
 // over it) and falls to 0 as the sample comes forward past the extent.
 //
@@ -49,6 +58,43 @@ float mbDepthWeight(float dCentre, float dSample, float extent)
 {
     float rel = max(dCentre, 1.0e-7f) / max(dSample, 1.0e-7f) - 1.0f;
     return saturate(1.0f + rel / max(extent, 1.0e-4f));
+}
+
+// ── THE VELOCITY-AGREEMENT WEIGHTS (McGuire 2012) ────────────────────────────────────────────────
+//
+// ⚠⚠ THESE ARE NOT A REFINEMENT. THEY ARE WHAT MAKES A TILE-DILATED BLUR NOT LOOK LIKE TILES.
+// They were scoped out of MB-2's first build as "MB-3", and the very first look at it in game came
+// back as *"motion blur in rectangular tiles instead of on object's own pixels"* — which is exactly
+// and only this. The reasoning that dropped them was wrong in a way worth writing down:
+//
+//   The first build chose its blur direction with `|vTile| > |vSelf| ? vTile : vSelf`, lifted from
+//   the DX9 filter. There that test is meaningful, because its "neighbour max" is a 5-TAP CROSS that
+//   can miss the true maximum. Here the tile max is a real max over a 3x3 tile neighbourhood, and
+//   the centre pixel's own tile is IN that neighbourhood — so `|vTile| >= |vSelf|` **identically**,
+//   the ternary can never select `vSelf`, and every pixel in a tile is blurred along that tile's
+//   dominant velocity. The artifact is not a halo, it is K-quantised RECTANGLES.
+//
+// The dilated velocity has to set the direction and extent — that is what lets a streak reach past a
+// mover's silhouette, which is the whole point of the tile passes. What was missing is the other
+// half of the contract: **each tap is then weighted by whether that tap could actually have reached
+// the centre**, judged from the tap's OWN velocity and the CENTRE's OWN velocity. A static pixel
+// sharing a tile with a fast mover samples along the mover's direction and every tap scores ~0, so
+// it keeps its own colour exactly. The tile is the search region; the weights are the truth.
+//
+// cone(d, L): a surface whose own streak is L can only have covered a point d away if L >= d. Falls
+// linearly to 0 at d == L. This is the term that kills the tiling.
+float mbCone(float dist, float streak)
+{
+    return saturate(1.0f - dist / max(streak, 1.0e-4f));
+}
+
+// cylinder(d, L): 1 while d is inside the streak, rolling off at its ends. Used for the case where
+// BOTH the tap and the centre are blurry, where neither can be called foreground or background and
+// the honest answer is that they mix.
+float mbCylinder(float dist, float streak)
+{
+    float L = max(streak, 1.0e-4f);
+    return 1.0f - smoothstep(0.95f * L, 1.05f * L, dist);
 }
 
 // Interleaved-gradient noise, Jimenez 2014. A per-pixel offset in [0,1) for the tap positions, which
