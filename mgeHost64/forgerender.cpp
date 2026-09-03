@@ -13868,6 +13868,19 @@ namespace {
     // whether the world is moving, and a blur that disagrees with the flames is worse than either.
     float    g_simDt       = 0.0f;
     bool     g_simFrozen   = false;  // g_simDt == 0 exactly: a menu, a save-load pause
+    // ...and the INTEGRAL of it: seconds of host-side animation that only tick while MW's world is
+    // running. This is the clock every continuous host effect should be on, and `hostNowMs()` is
+    // the one it should not — a wall clock keeps running behind an open menu, which is how caustics
+    // went on rippling over a paused world and how the wake sim kept propagating and expiring while
+    // the ripple SOURCES (MW's actor ripples, from the paused sim) stood still. "Freezing and
+    // animating at the same time" is what a system with one foot on each clock looks like.
+    //
+    // ⚠ IT ALSO FIXES A PRECISION TRAP RATHER THAN INHERITING ONE. Several sites wrap hostNowMs in
+    // double before the float cast precisely because steady_clock-since-BOOT is ~1e5-1e6 seconds and
+    // float32 quantises it into 0.02-0.13 s steps. This starts at 0 and counts host-run seconds, so
+    // the magnitude problem is gone; the wraps stay anyway, because a wrap period is also the
+    // field's visible LOOP and its speed quantum (see the caustic and water notes).
+    double   g_simClock    = 0.0;
     float    g_uploadKB    = 0.0f;   // Part A: client's host-geom reship cost THIS frame (lighting[33], KB)
     float    g_uploadParts = 0.0f;   // Part A: parts reshipped this frame (lighting[34])
     float    g_uploadKBEma = 0.0f;   // smoothed for a steady panel readout
@@ -21173,6 +21186,23 @@ namespace {
         // A clear is never skipped — an uninitialised or teleported field is not worth preserving.
         int steps = mge ? fixedSteps : 2;
         if (!G.cleared) { steps = 2; }
+        // ⚠⚠ AND THE SIM MUST BE RUNNING. `steps` above is a HARDCODED 2 for the fine and
+        // dispersive grids — only MGE mode honours the caller's accumulator — so making that
+        // accumulator sim-paced froze the MGE wake and left the FINE grid stepping twice on every
+        // rendered frame regardless. Reported from play, precisely: *"ripple/wake freeze but a
+        // secondary ghost ripple still animate"*. The menu still renders refresh frames, so a
+        // per-FRAME integrator keeps running on a paused world however the clock is wired.
+        //
+        // Gated HERE rather than at the two call sites, so it covers all three modes and cannot be
+        // added to one and forgotten at the other. AFTER the `!G.cleared` clause, never before: a
+        // clear is never skipped (an uninitialised or teleported field is not worth preserving),
+        // which is why this asks for `G.cleared` as well.
+        //
+        // The zero-step path below is exactly right for a pause — parkRippleGrid only moves tex[0]
+        // to SHADER_RESOURCE and leaves the origin alone, so the field STANDS STILL and stays
+        // readable, rather than being cleared. Same shape as the motion blur's pause hold: skip the
+        // dispatches, keep the last image, no state fixup.
+        if (g_simFrozen && G.cleared) { steps = 0; }
         if (steps <= 0) {
             parkRippleGrid(G);   // leaves originX/originY alone, so the shift accumulates
             return;
@@ -21301,7 +21331,12 @@ namespace {
             const float ringTex   = std::max(g_wakeRingRadius / upt, 0.75f);
             // MGE pulsed the radius with two incommensurate sines so a stationary swimmer never
             // looks like a stamped decal. Same two frequencies.
-            const float t         = (float)(hostNowMs() * 0.001);
+            // Sim clock: the pulse exists so a STATIONARY swimmer does not look like a stamped
+            // decal, and a swimmer behind an open menu is not merely stationary, they are paused.
+            // Unwrapped, unlike the caustic and water times, and safely so now — this counts
+            // host-RUN seconds from 0 rather than seconds since boot, so float32 holds it to ~2e-3
+            // even after ten hours of play, against the 0.02-0.13 s steps hostNowMs quantised to.
+            const float t         = (float)g_simClock;
             const float pulse     = 1.0f + 0.055f * std::sin(16.0f * t)
                                          + 0.065f * std::sin(12.87645f * t);
             const float ringR     = ringTex * pulse;
@@ -25596,6 +25631,10 @@ void destroyHostWindow(Renderer* R);
             s_prevSimT = nowSimT;
             g_simDt = std::min(std::max(g_simDt, 0.0f), 0.1f);   // a hitch/alt-tab must not fast-forward
             g_simFrozen = (g_simDt <= 0.0f);
+            // The integral. Accumulating the CLAMPED delta is the point, not a shortcut: a hitch
+            // adds at most 0.1 s here, so a load screen cannot fast-forward the sea, the caustics
+            // and every grass imprint through the whole stall.
+            g_simClock += (double)g_simDt;
         }
 
         // F12 debug view: debugParams.x at float index 40 (160B = viewProj 16f + 6×float4 24f).
@@ -28194,11 +28233,21 @@ void destroyHostWindow(Renderer* R);
             // (its rates are per step), but the wake grid's wavelength is set by gravity and the
             // swimmer's speed, so it has to advance in seconds or the wedge changes size with the
             // frame rate.
-            static double s_wakeLastMs = -1.0;
-            const double  nowMs = hostNowMs();
-            if (s_wakeLastMs < 0.0) { s_wakeLastMs = nowMs; }
-            const float dtFrame = (float)((nowMs - s_wakeLastMs) * 0.001);
-            s_wakeLastMs = nowMs;
+            //
+            // ⚠⚠ THE **SIM** CLOCK, NOT A WALL CLOCK, AND THAT IS THE FIX FOR "THE RIPPLES FREEZE
+            // AND ANIMATE AT THE SAME TIME". This system has two halves: the wave field, integrated
+            // here, and its SOURCES — MW's actor ripples, which come off the paused simulation and
+            // therefore stop dead behind an open menu. On hostNowMs the field went on propagating,
+            // decaying and expiring its tracks against sources that were standing still, so a
+            // paused world showed a wake dying away on its own and popping when the menu closed.
+            // One clock for both halves is the only arrangement in which they can agree.
+            //
+            // ⚠ AND IT IS THE FRAME-LEVEL DELTA, WHICH IS THE STRONGER VERSION OF WHAT THE GRASS
+            // CRUSH BLOCK'S "its own clock" NOTE ASKS FOR. That note's worry is two subsystems
+            // sampling a wall clock at different points in the frame and disagreeing about how much
+            // time passed. One g_simDt, computed once per frame and read by both, removes the
+            // disagreement outright rather than isolating it.
+            const float dtFrame = g_simDt;
 
             // Switching integrator changes what .y MEANS (a velocity vs u(t-1)) and wants a
             // different metric, so both flips throw the field away rather than reinterpreting it.
@@ -28240,7 +28289,12 @@ void destroyHostWindow(Renderer* R);
 
             // Rebuild the actor tracks from this frame's births BEFORE either grid runs — the wake
             // grid pins its rings at their extrapolated positions.
-            updateWakeTracks(std::min(std::max(dtFrame, 0.0f), 0.25f), hostNowMs());
+            // ⚠ THE SIM CLOCK HERE TOO, and it matters more than the delta does: `nowMs` drives
+            // track EXPIRY (`since > g_wakeTrackHold` deactivates a track) and stamps lastBirthMs
+            // off the same argument, so the whole track system is self-consistent on whichever
+            // clock it is handed. On a wall clock a long menu silently expired every wake track and
+            // coast-faded the rest to nothing, so the wake was already gone when play resumed.
+            updateWakeTracks(dtFrame, g_simClock * 1000.0);
 
             if (ripWaterNow && g_ripSimOn) {
                 advanceRippleGrid(g_live.rippleFine, g_live.pRippleSimPipeline, kRipModeFine,
@@ -28407,7 +28461,11 @@ void destroyHostWindow(Renderer* R);
                 // completes a whole number of cycles in that time, and omega = sqrt(g*K) has no
                 // reason to. Un-snapped, the entire map jumped to a new phase every 20 s. See
                 // misc.y below and the note in caustic.srt.h.
-                cp[0] = (float)std::fmod(hostNowMs() * 0.001, kCausticWrapSeconds);
+                // ⚠ THE SIM CLOCK. Reported from play: the caustics went on rippling over a world
+                // that was paused behind a menu. The wrap and the omega snapping below are
+                // unchanged — the period is still the field's visible loop and its speed quantum —
+                // only the clock feeding them freezes with MW now.
+                cp[0] = (float)std::fmod(g_simClock, kCausticWrapSeconds);
                 cp[1] = std::max(g_causticTileUnits, 1.0f);
                 cp[2] = std::max(1.0f, std::min(g_causticSubBeams, 4.0f));
                 cp[3] = std::max(0.01f, std::min(g_causticEma, 1.0f));
@@ -28684,11 +28742,13 @@ void destroyHostWindow(Renderer* R);
             // wall-clock delta between two subsystems is exactly how two of them end up disagreeing
             // about how much time passed. Clamped, because a load screen or an alt-tab must not
             // fast-forward every imprint in the world through half a second of healing.
-            static double s_crushLastMs = -1.0;
-            const double  nowMs = hostNowMs();
-            if (s_crushLastMs < 0.0) { s_crushLastMs = nowMs; }
-            const float dtCrush = (float)((nowMs - s_crushLastMs) * 0.001);
-            s_crushLastMs = nowMs;
+            // ⚠ NOW THE SHARED SIM DELTA, AND THE NOTE ABOVE IS THE REASON RATHER THAN AN OBSTACLE.
+            // Its worry was two subsystems sampling a WALL clock at different points in the frame
+            // and disagreeing about how much time passed; one g_simDt, computed once per frame and
+            // read by both, removes that disagreement instead of isolating it. It also stops grass
+            // imprints healing themselves behind an open menu — the ripple bug in a different hat.
+            // The clamp this block wanted is g_simDt's own (0.1 s), and tighter than the old 0.25.
+            const float dtCrush = g_simDt;
             // gpuPhaseBegin/End are renderScene-local lambdas (they capture this frame's query
             // slots), so the timestamp pair brackets the CALL rather than living inside the free
             // function — which also makes the phase cover the skipped-frame path honestly at 0.00.
@@ -32727,7 +32787,10 @@ void destroyHostWindow(Renderer* R);
                 // 20 s gives an 8x longer loop and an 8x finer step for nothing: float32 at 20.0 has
                 // ~2e-6 resolution, and the normal volume's W axis stays seamless too because it
                 // reads t = 0.4*time on a REPEAT sampler and 0.4*20 is a whole 8 cycles.
-                p[3] = (float)std::fmod(hostNowMs() * 0.001, 20.0);
+                // ⚠ SIM CLOCK (see g_simClock): the sea has to hold still behind an open menu for
+                // the same reason the caustics on its floor do. The wrap stays exactly as derived
+                // above — it is the loop AND the speed quantum, not a precision workaround.
+                p[3] = (float)std::fmod(g_simClock, 20.0);
                 p[4] = waterParams ? waterParams[3] : 0.0f;    // depthBaseColor.r
                 p[5] = waterParams ? waterParams[4] : 0.0f;    // .g
                 p[6] = waterParams ? waterParams[5] : 0.0f;    // .b
@@ -41399,7 +41462,7 @@ void destroyHostWindow(Renderer* R);
             p[0] = waterLevelAbs - eye[2];                 // waterLevelRel (water-cut feature)
             p[1] = 0.013f;                                 // windFactor
             p[2] = 24.0f;                                  // shoreDepthBias
-            p[3] = (float)std::fmod(hostNowMs() * 0.001, 20.0);  // anim time (wrap host-side; see live pass)
+            p[3] = (float)std::fmod(g_simClock, 20.0);  // anim time, SIM clock (see the live pass)
             p[4] = depthBase[0]; p[5] = depthBase[1]; p[6] = depthBase[2];
             p[7] = underwater ? 1.0f : 0.0f;
             p[8]  = camFwd[0]; p[9] = camFwd[1]; p[10] = camFwd[2];

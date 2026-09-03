@@ -5675,7 +5675,22 @@ namespace RenderProcess {
             s_smoothWind[0] += 0.02f * (wind[0] - s_smoothWind[0]);
             s_smoothWind[1] += 0.02f * (wind[1] - s_smoothWind[1]);
         }
-        const bool  windLive = isExterior && mwb->CellHasWeather() && !mwb->IsMenu();
+        // ⚠⚠ AND THE SHIPPED VALUE DROPS `!IsMenu()`, WHICH THE COMMENT ABOVE ALREADY ARGUED FOR
+        // AND THE LINE BELOW IT THREW AWAY. Freezing the EWMA *state* is worth nothing if the value
+        // on the wire is zeroed anyway: reported from play as *"grass ambient animation seems to
+        // reset position when menu paused"*, which is exactly what a wind of (0,0) looks like — the
+        // sway amplitude collapses and every blade springs back to its rest pose, mid-gust.
+        //
+        // The two halves of the old gate are DIFFERENT QUESTIONS and only look alike:
+        //   isExterior && CellHasWeather — "is there any wind here at all". An interior genuinely
+        //                                  has none, so (0,0) is the right answer and stays.
+        //   !IsMenu()                    — "is the world running". The wind has not gone away
+        //                                  because a menu is open; it has stopped CHANGING, which
+        //                                  is what freezing the EWMA update above already says.
+        // A guard whose fallback is the wrong answer reads exactly like a working guard
+        // ([[feedback_guard_fallback_is_the_bug]]). The host holds up its end: the grass harmonics
+        // run on MW's sim clock, so a frozen wind and a frozen clock hold the bent pose still.
+        const bool  windLive = isExterior && mwb->CellHasWeather();
         const float windVecX = windLive ? s_smoothWind[0] : 0.0f;
         const float windVecY = windLive ? s_smoothWind[1] : 0.0f;
         // Glow in the Dahrk distant windows (lighting[35]): hours into the period where GitD shows a
@@ -5985,7 +6000,13 @@ namespace RenderProcess {
         // already a host knob beside every other crush dial; a second copy here would be the same
         // tuning number on both sides of an IPC boundary.
         if (g_client) {
-            const bool crushHere = isExterior && !mwb->IsMenu();
+            // ⚠ SAME SPLIT, SAME REASON, AND IT IS THE SAME BUG ONE SYSTEM OVER. The old gate read
+            // `isExterior && !IsMenu()` and the comment above justified it as "interiors and menus,
+            // where there is no grass to press" — but a menu is not an interior. The player is
+            // still standing on the same grass; they have merely stopped moving. Dropping the disc
+            // let the blades under their feet spring upright the moment a menu opened, and the
+            // crush field's healing is frozen now, so nothing put them back down.
+            const bool crushHere = isExterior;
             g_client->setPlayerCrush(crushHere ? mwb->PlayerPositionX() : 0.0f,
                                      crushHere ? mwb->PlayerPositionY() : 0.0f,
                                      crushHere ? mwb->PlayerPositionZ() : 0.0f,
