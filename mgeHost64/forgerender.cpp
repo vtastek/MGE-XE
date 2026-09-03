@@ -25451,14 +25451,53 @@ void destroyHostWindow(Renderer* R);
                 const uint32_t ms = mi.slot;
                 if (ms >= g_meshHigh || !g_meshes[ms].valid || !g_meshes[ms].multimap) { continue; }
                 HostMesh& mhm = g_meshes[ms];
+                const float max_ = mi.world[12] + g_eyeAbsShadow[0];
+                const float may_ = mi.world[13] + g_eyeAbsShadow[1];
+                const float maz_ = mi.world[14] + g_eyeAbsShadow[2];
+                // ─── CANDIDACY, DERIVED FROM THE POSE ITSELF ────────────────────────────────────
+                // ⚠⚠ THE OBVIOUS CANDIDACY FLAGS ARE STRUCTURALLY UNAVAILABLE HERE. The rigid lane
+                // filters on `everMoved || isLive`, and BOTH are written only inside
+                // refreshCasterRecord — which multimap parts never reach. So every MM part reads
+                // "not live, never moved", lands in `skip(static=)`, and the lane draws NOTHING:
+                // measured `mm=0` on the very scene the fix was for, with `objVelAllItems=1` (which
+                // bypasses the filter) as the only arm that showed `mm=1`. A candidacy test on flags
+                // nobody maintains is not a filter, it is an off switch.
+                //
+                // Admitting every MM part instead would be wrong the other way: kMaxMultiMap is 1024
+                // against a kObjVelBatch of 256 SHARED with the rigid lane, which already uses 199 in
+                // this scene — the MM parts would starve the movers the pass exists for.
+                //
+                // So candidacy comes from the pose, which is the thing actually being maintained
+                // here: a part whose stored pose CHANGES has, by definition, moved. That is exactly
+                // what `everMoved` means, so it is set rather than a parallel flag invented. One
+                // frame of latency at the very start and none after, which costs nothing — the
+                // pairing key already refuses the first frame for want of an N-1 pose.
+                if (mhm.lastWorldFrame != 0 && !mhm.everMoved) {
+                    bool moved = false;
+                    for (int e = 0; e < 12 && !moved; ++e) {
+                        if (mhm.lastWorld[e] != mi.world[e]) { moved = true; }
+                    }
+                    if (!moved) {
+                        // The translation needs the tolerance the ABSOLUTE round trip destroyed —
+                        // a few ULP at the bake origin's own magnitude, the rigid lane's derivation.
+                        const float eyeMag = std::max(std::max(std::fabs(g_eyeAbsShadow[0]),
+                                                               std::fabs(g_eyeAbsShadow[1])),
+                                                      std::fabs(g_eyeAbsShadow[2]));
+                        const float eps = std::max(eyeMag, 1.0f) * 4.0f * 1.1920929e-7f;
+                        if (std::fabs(mhm.lastWorld[12] - max_) > eps
+                            || std::fabs(mhm.lastWorld[13] - may_) > eps
+                            || std::fabs(mhm.lastWorld[14] - maz_) > eps) { moved = true; }
+                    }
+                    if (moved) { mhm.everMoved = true; }
+                }
                 if (mhm.lastWorldFrame != 0 && mhm.lastWorldFrame != g_renderFrame) {
                     std::memcpy(mhm.prevWorld, mhm.lastWorld, 64);
                     mhm.prevWorldFrame = mhm.lastWorldFrame;
                 }
                 std::memcpy(mhm.lastWorld, mi.world, 64);
-                mhm.lastWorld[12] = mi.world[12] + g_eyeAbsShadow[0];
-                mhm.lastWorld[13] = mi.world[13] + g_eyeAbsShadow[1];
-                mhm.lastWorld[14] = mi.world[14] + g_eyeAbsShadow[2];
+                mhm.lastWorld[12] = max_;
+                mhm.lastWorld[13] = may_;
+                mhm.lastWorld[14] = maz_;
                 mhm.lastWorldFrame = g_renderFrame;
             }
         }
