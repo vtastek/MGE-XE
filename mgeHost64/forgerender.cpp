@@ -86,6 +86,14 @@
 // allocator macros mangling the system header.
 #include <d3d12sdklayers.h>
 #endif
+// IDXGIAdapter3::QueryVideoMemoryInfo — the VRAM budget/usage probe behind the
+// `vram:` heartbeat. Same placement rule as d3d12sdklayers.h above: include it BEFORE
+// IMemory.h overrides new/delete/malloc.
+#include <dxgi1_4.h>
+// CreateDXGIFactory1 lives in dxgi.lib, which this project does not otherwise link (Forge's D3D12
+// backend loads DXGI itself). Declared here rather than in the vcxproj so the dependency stays
+// next to the only code that needs it.
+#pragma comment(lib, "dxgi.lib")
 // TinyImageFormat_ToDXGI_FORMAT: the TYPED DXGI format a Forge RenderTarget was declared with.
 // Needed by the ResolveSubresource sites, which must be handed a typed format — reading it back
 // off the D3D12 resource instead is what removed the device (see snapshotColorTarget).
@@ -96,6 +104,171 @@
 #include "Resources/ResourceLoader/ThirdParty/OpenSource/tinyimageformat/tinyimageformat_encode.h"
 // IMemory.h overrides new/delete/malloc — Forge convention: include it LAST.
 #include "Utilities/Interfaces/IMemory.h"
+
+// ---- Long-session regime probes (VRAM budget + EcoQoS) -------------------------------------
+// WHY THESE TWO, TOGETHER. The client sees a sticky ~5.8x regime change in the present seam
+// (mgeXE.log `[rtcopy] flush=6.5 -> 38ms`) which flips BOTH ways and then persists for thousands
+// of frames. Every GPU timestamp in the `gpu split` is FLAT across that flip, so whatever it is
+// does not live in a pass. Exactly two mechanisms have that signature:
+//   * VRAM over-commit — usage crosses the driver budget, it starts paging, and it STAYS
+//     paging until residency drops. Invisible to a per-pass GPU timer by construction.
+//   * Windows EcoQoS   — a CPU clock cut, not a rendering change. This process HAS NO
+//     WINDOW, so it is a permanent throttle candidate even while Morrowind is foreground. Prior
+//     art: the minimized harness was throttled 2.4-10.5x and NON-uniformly, so a throttled run
+//     cannot be rescued by dividing out a constant.
+// Neither can be inferred from anything already logged, which is the only reason to add a counter.
+
+// The adapter we are ACTUALLY running on, resolved by LUID — not adapter 0, which on a
+// laptop is the iGPU whose budget would be a confidently wrong number. Resolved once; a null
+// result is cached too, so a failure costs one attempt rather than one per heartbeat.
+static IDXGIAdapter3* forgeVramAdapter(Renderer* R)
+{
+    static IDXGIAdapter3* s_adapter = nullptr;
+    static bool           s_tried   = false;
+    if (s_tried) { return s_adapter; }
+    s_tried = true;
+
+    ID3D12Device* dev = R ? R->mDx.pDevice : nullptr;
+    if (!dev) { return nullptr; }
+
+    IDXGIFactory4* factory = nullptr;
+    if (FAILED(CreateDXGIFactory1(__uuidof(IDXGIFactory4), (void**)&factory)) || !factory) {
+        return nullptr;
+    }
+    IDXGIAdapter1* a1 = nullptr;
+    const LUID luid = dev->GetAdapterLuid();
+    if (SUCCEEDED(factory->EnumAdapterByLuid(luid, __uuidof(IDXGIAdapter1), (void**)&a1)) && a1) {
+        a1->QueryInterface(__uuidof(IDXGIAdapter3), (void**)&s_adapter);
+        a1->Release();
+    }
+    factory->Release();
+    return s_adapter;
+}
+
+// ---- VRAM PHASE MARKS -----------------------------------------------------------------------
+// The `vram:` heartbeat says the host holds ~2.3 GB before a scene exists; NOTHING says where.
+// Enumerating it from the allocation sites is the wrong shape — there are 78 TextureDesc sites
+// against 17 addRenderTarget ones, so a per-site counter is 95 edits that will rot. This asks the
+// DRIVER instead: sample usage at phase boundaries and print the delta. No allocation site is
+// touched, nothing can drift out of sync with the code, and the residual at the end is itself the
+// finding (it is the memory nobody has named).
+//
+// ⚠ Deltas are SIGNED and printed as such. A phase that frees more than it takes is real (staging
+// buffers, transient upload heaps) and a probe that clamps at zero would hide it.
+// ⚠ This measures the DRIVER's view of the process, so it includes descriptor heaps, command
+// allocators and driver-internal overhead — it will NOT sum exactly to the resources we asked for,
+// and that gap is information, not error.
+// Takes the Renderer explicitly rather than reading g_live: this sits with the other system-header
+// helpers, above g_live's declaration, and hoisting g_live up here to satisfy one logging probe
+// would be the tail wagging the dog.
+static void vramMark(Renderer* R, const char* tag)
+{
+    IDXGIAdapter3* ad = forgeVramAdapter(R);
+    if (!ad) { return; }
+    DXGI_QUERY_VIDEO_MEMORY_INFO info = {};
+    if (FAILED(ad->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &info))) { return; }
+
+    static uint64_t s_prev  = 0;
+    static uint64_t s_first = 0;
+    static bool     s_have  = false;
+    const uint64_t now = info.CurrentUsage;
+    if (!s_have) { s_first = now; s_prev = now; s_have = true; }
+
+    const double dMB   = ((double)now - (double)s_prev)  / (1024.0 * 1024.0);
+    const double cumMB = ((double)now - (double)s_first) / (1024.0 * 1024.0);
+    LOG::logline(">> [vram-phase] %-28s %+8.1f MB  | now %llu MB  (cum %+.1f MB since first mark)",
+                 tag, dMB, (unsigned long long)(now >> 20), cumMB);
+    s_prev = now;
+}
+
+// Residual subdivision. buildOpaquePath is LAZY (deferred so geometry upload runs on a clean
+// resource loader), so the 1160 MB "residual" between it and the first heartbeat is not init work
+// at all — it is ~300 frames of STREAMING. The question that decides a 4K/PBR budget is how that
+// splits between the bindless texture array and mesh buffers, so those are the two things marked.
+//
+// ⚠ Per-frame logging would be the exact shape that collapsed the multimap night scene, so this
+// only speaks when the number MOVES by at least a driver page (deltas land on 32/64 MB boundaries
+// anyway, so a finer threshold would report noise). Each tag keeps its own baseline: two callers
+// interleaving on one shared `s_prev` would each report the other's allocations.
+// ⚠⚠ A RUNNING BASELINE PER TAG CANNOT ATTRIBUTE. The first version of this kept a `prev` per tag
+// and logged `now - prev`, which measures everything the PROCESS allocated since that tag last
+// sampled — so with two interleaved callers each one reported the other's work. It read
+// "geometry +192 MB" on a frame where the total had not moved at all, because the 128 MB of
+// textures uploaded in between landed in the geometry tag's window. Per-tag baselines did not fix
+// the interleaving; they only changed the shape of the lie.
+//
+// The honest measurement BRACKETS the call: sample immediately before and immediately after the
+// work, attribute only that difference, and SUM those differences. Individual calls can read 0
+// (the driver commits on 32/64 MB page boundaries) but the running sum is still correct, and it is
+// the sum we want.
+static uint64_t vramNow(Renderer* R)
+{
+    IDXGIAdapter3* ad = forgeVramAdapter(R);
+    if (!ad) { return 0; }
+    DXGI_QUERY_VIDEO_MEMORY_INFO info = {};
+    if (FAILED(ad->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &info))) { return 0; }
+    return info.CurrentUsage;
+}
+
+// Signed, because an upload batch that retires more than it creates is real and must not clamp.
+std::int64_t g_vramTexBytes = 0;   // summed across uploadTextures calls
+std::int64_t g_vramGeoBytes = 0;   // summed across uploadGeometry calls
+
+// ---- Geometry lifetime ledger -----------------------------------------------------------------
+// The bracketed measurement says the geometry path pulled ~3 GB from the driver while `pools:`
+// reported 191 MB live. Two very different faults produce that, and they want opposite fixes:
+//   * created - destroyed GROWS without bound -> a real leak; some population's release never runs.
+//   * created - destroyed ~= live (191 MB)    -> our lifetimes are correct and the driver/allocator
+//     is retaining freed heap blocks across create-destroy churn. Not a leak; a pooling problem.
+// Only a created/destroyed PAIR can tell them apart. A live gauge (which is all `pools:` is) reads
+// identically in both cases, which is exactly why this went unseen.
+//
+// ⚠ SPLIT BY POPULATION, because "unique" does not mean "unbounded". Particles and other dynamic
+// meshes are unique per upload from our side, so a single total would show them churning and look
+// like growth; what matters is whether DYN's live figure is flat while its churn is high. The three
+// buckets mirror releaseMeshBuffers' own three branches (arena / dynamic ring / static per-mesh) so
+// a slot can never be charged to one bucket and credited to another.
+struct GeoLedger {
+    std::uint64_t createdBytes = 0, destroyedBytes = 0;
+    std::uint64_t creates      = 0, destroys       = 0;
+};
+GeoLedger g_geoStatic;   // per-mesh vb/ib   (skinned/multimap) — genuinely unique geometry
+GeoLedger g_geoDyn;      // ring buffers     (particles, promoted movers) — unique but MUST be bounded
+GeoLedger g_geoArena;    // arena suballocations — no D3D12 resource of their own
+
+// 1 = ExecutionSpeed throttling is ON for this process, 0 = off or unmanaged, -1 = query failed.
+// The tri-state matters: "unmanaged" (ControlMask clear) and "managed, off" both mean full speed,
+// and only -1 means we do not know. Reporting a failed query as "not throttled" is exactly how
+// this instrument would lie in the one case it exists for.
+// GetProcessInformation is gated behind a newer _WIN32_WINNT than this Forge build compiles with,
+// so it is resolved from kernel32 at runtime rather than raising the SDK floor for the whole host
+// (that macro reaches every Forge translation unit; a logging probe does not get to move it).
+static int forgeEcoQoSState()
+{
+    typedef BOOL (WINAPI *PFN_GetProcessInformation)(HANDLE, PROCESS_INFORMATION_CLASS, LPVOID, DWORD);
+    static PFN_GetProcessInformation s_fn     = nullptr;
+    static bool                      s_looked = false;
+    if (!s_looked) {
+        s_looked = true;
+        if (HMODULE k32 = GetModuleHandleW(L"kernel32.dll")) {
+            s_fn = (PFN_GetProcessInformation)GetProcAddress(k32, "GetProcessInformation");
+        }
+    }
+    // -1 = no such export, -(GetLastError()) = the call itself refused. Distinguishing them
+    // matters: the first says "wrong Windows", the second says "wrong call", and they need
+    // opposite fixes. Collapsing both into one "?" is what made the first build undiagnosable.
+    if (!s_fn) { return -1; }
+
+    PROCESS_POWER_THROTTLING_STATE st = {};
+    st.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
+    SetLastError(0);
+    if (!s_fn(GetCurrentProcess(), ProcessPowerThrottling, &st, sizeof(st))) {
+        const DWORD e = GetLastError();
+        return e ? -(int)e : -1;
+    }
+    if ((st.ControlMask & PROCESS_POWER_THROTTLING_EXECUTION_SPEED) == 0) { return 0; }
+    return (st.StateMask & PROCESS_POWER_THROTTLING_EXECUTION_SPEED) ? 1 : 0;
+}
 // M1c opaque-scene SRT. defaults.h provides the C++ definitions of the FSL macros
 // (STRUCT/DATA/BEGIN_SRT/DECL_CBUFFER/SRT_SET_DESC/SRT_RES_IDX); the .srt.h then
 // declares SRT_SrtData + the gFrameData/gWorlds descriptor indices. Per the Forge
@@ -119,6 +292,12 @@
 // Same SAMPLE_COUNT note as apl.srt.h above: C++ sees the header's #ifndef default and all variants
 // declare the same two slots in the same order, so SRT_RES_IDX resolves identically.
 #include "shaders/FSL/resolve.srt.h"
+// The resolve FILTER's compute SRT. SAMPLE_COUNT is what selects Tex2DMS vs Tex2D inside it, and the
+// host only ever builds the 4x variant — resolve.srt.h above is included without one because the
+// host reads only its PerDraw indices, which do not depend on it.
+#define SAMPLE_COUNT 4
+#include "shaders/FSL/resolvefilter.srt.h"
+#undef SAMPLE_COUNT
 // ...and the two ends of the OPTIONAL half-res AO chain (AODownSrtData / AOUpSrtData, both
 // Persistent frequency). One SRT per header — see aohalfres.srt.h, which holds the AOUpParams
 // cbuffer struct both of them share.
@@ -1730,6 +1909,29 @@ namespace {
         "gtao.comp", "hbao.comp", "vbao.comp", "ssaofast.comp"
     };
 
+    // AO BLUR variant table, built exactly like the AO mode table above and for the same reason:
+    // three compute shaders off ONE body (aoblur.comp.fsl) behind ONE SRT and ONE descriptor set,
+    // so the host binds pAOBlurPipeline[g_aoBlurMode] and nothing else in the frame changes.
+    //
+    // The three exist to keep a PERF change and a LOOK change out of the same arm:
+    //   0  2D radius 3, 49 taps       0.24 ms  — the reference; what shipped
+    //   1  separable radius 3          0.16 ms  — same reach, so any visible difference is
+    //                                             SEPARABILITY (the range weight's approximation)
+    //   2  separable radius 6          0.43 ms  — DOUBLE the reach for 1.8x the reference; the arm
+    //                                             aimed at half-res dither grain
+    // (min of 61 frames, interleaved on one interior save, half-res 1280x800.) Width is NOT free:
+    // the tap loop amortises but the per-row bilateral setup and the tile staging scale with R^2 —
+    // aoblur.comp.fsl's header has the accounting. Default stays 0.
+    enum AOBlurMode : uint32_t {
+        kAOBlurMode2D = 0,
+        kAOBlurModeSeparable,
+        kAOBlurModeWide,
+        kAOBlurModeCount
+    };
+    constexpr const char* kAOBlurShaderFiles[kAOBlurModeCount] = {
+        "aoblur.comp", "aoblursep.comp", "aoblurwide.comp"
+    };
+
     // ---- One actor-wake wave grid (ripplesim.srt.h) --------------------------------------------
     // TWO of these exist and they are NOT redundant. Both are camera-following world-space grids
     // stepped by compute and sampled once by water.frag; they differ in resolution and in which
@@ -1962,6 +2164,13 @@ namespace {
         // compute dispatch at the colour->water seam, reading pLinearDepth (which holds RAW device
         // depth despite its name) and two camera matrices. See motionvectors.srt.h for the space and
         // for the bakeEye hazard, which is the whole difficulty of this pass.
+        // MB-2d — THE BLUR'S VELOCITY FIELD, a second RG16F beside pMotionVectors and deliberately
+        // NOT the same texture. pMotionVectors is the upscaler's input and must always carry the true
+        // TOTAL motion of every pixel; this one carries whatever the blur should smear along, which
+        // in object-only mode is the movers' motion relative to the world and ZERO everywhere else.
+        // Both producers write both: motionvectors.comp fills the whole rect (that write is also the
+        // clear), objvelocity.frag overwrites the mover pixels.
+        Texture*       pMbVelocity = nullptr;
         Texture*       pMotionVectors = nullptr;
         Shader*        pMvShader = nullptr;
         Pipeline*      pMvPipeline = nullptr;
@@ -2073,8 +2282,8 @@ namespace {
         // share pGtaoBatchSet below (identical root signature and bindings).
         Shader*        pAOShader[kAOModeCount] = {};
         Pipeline*      pAOPipeline[kAOModeCount] = {};
-        Shader*        pAOBlurShader = nullptr;
-        Pipeline*      pAOBlurPipeline = nullptr;
+        Shader*        pAOBlurShader[kAOBlurModeCount] = {};
+        Pipeline*      pAOBlurPipeline[kAOBlurModeCount] = {};
         Buffer*        pAOParamsCbv = nullptr;    // gAOParams (invViewProj/screen/knobs/eye), persistent-mapped
         DescriptorSet* pLinearizeSet = nullptr;   // LinDepthSrtData PerBatch: gSceneDepth + gLinearDepthOut
         // APL instrument (tasks/forge-postprocess.md step 2) — the measuring stick for the linear
@@ -2095,6 +2304,17 @@ namespace {
         Pipeline*      pResolvePipeline  = nullptr;   // fullscreen tri into pRT (single-sample), depth OFF, no blend
         DescriptorSet* pResolveSet       = nullptr;   // ResolveSrtData PerDraw: cbv + MSAA colour SRV + bloom SRV
         Buffer*        pResolveParamsCbv = nullptr;   // ResolveParams (dims + opts), persistent-mapped
+        // --- the resolve FILTER, lifted into compute (resolvefilter.comp.fsl) ---
+        // Same Catmull-Rom, separable and LDS-shared: 9 MSAA loads per pixel instead of 64. It
+        // cannot write pRT (created ALLOW_RENDER_TARGET only, BGRA8, no typed UAV), so it lands in
+        // an fp16 1x intermediate that resolve.frag reads as gResolveFiltered and tonemaps.
+        // MSAA 4x ONLY — RF_RADIUS is a compile-time 2 — and every other configuration keeps the
+        // fragment tap loop, which stays in the build as the reference and the A/B partner.
+        Texture*       pResolveFiltered  = nullptr;   // RGBA16F, alloc-sized, SRV+UAV
+        Shader*        pRFShader         = nullptr;
+        Pipeline*      pRFPipeline       = nullptr;
+        DescriptorSet* pRFSet            = nullptr;
+        bool           rfReady           = false;
         // --- M1 step 4b: THE UPSCALER (tasks/forge-upscale.md) -----------------------------------
         // The only thing the renderer holds is the SEAM's pointer — no target, no pipeline, no set.
         // All of that belongs to the backend (upscale.cpp), which is the property that makes 4d's
@@ -3357,6 +3577,25 @@ namespace {
            // getting a number that described the depth copy alone. The budget context: the whole
            // MB-1 producer costs 0.030 ms, and the gather is where this milestone's budget goes.
            kGpuPhaseMotionBlur,
+           // The four dispatches that make up the `ao=` figure, which until now was a RESIDUAL
+           // (postdepth - lin - mask) covering all of them at once — so "AO costs 2.27 ms" could
+           // not distinguish the horizon search from the chain half-res adds around it (a
+           // downsample in front and a FULL-RES Lanczos upscale behind). Own index each, for the
+           // reason kGpuPhaseMotionBlur states: two begin/end pairs on one slot overwrite.
+           // Nested inside kGpuPhasePostDepth exactly as Linearize and ShadowMask already are.
+           kGpuPhaseAODown,     // (1b) full -> half depth downsample   (half-res only)
+           kGpuPhaseAOSearch,   // (2)  the AO horizon search itself
+           kGpuPhaseAOBlur,     // (3)  bilateral blur
+           kGpuPhaseAOUp,       // (4)  adaptive Lanczos upscale, writes FULL res (half-res only)
+           // The resolve's separable LDS PRE-FILTER. It was nested inside kGpuPhaseResolve, because
+           // the two halves are one pass split for LDS — until MOTION BLUR became its second
+           // consumer. The blur needs a single-sample linear pre-tonemap image, this is the only one
+           // in the frame, and the blur runs well before the resolve draw — so the dispatch had to be
+           // hoisted above it and can no longer live inside the resolve's timestamp pair. Same rule
+           // kGpuPhaseMotionBlur states: one slot cannot carry two non-contiguous begin/end pairs.
+           // ⚠ `resolve=` NO LONGER INCLUDES IT. Add the two when comparing against any measurement
+           // taken before 2026-09-05 (the 1.89 -> 0.89 resolve win was measured with it inside).
+           kGpuPhaseResolveFilter,
            kGpuPhaseCount };
 
     // FP1a first-person pass caps: one 64KB world window bounds the rigid list at 1024,
@@ -5176,8 +5415,11 @@ namespace {
     // term; 0.5*pi, 1.5*pi for the underwater one) complete whole cycles, which is what makes the
     // wrap invisible. Changing a rate means re-deriving this. [[project_wrapped_time_needs_snapped_omega]]
     constexpr double   kGrassWindPeriod       = 4.0;
+    // shadowmask.comp's cost-profile lanes. Instrumentation, zero on the shipped path — see
+    // shadowparams.h.fsl::maskProf for what each lane cuts.
+    constexpr uint32_t kMaskProfFloat         = kGrassParams8Float + 4;
     constexpr uint32_t kShadowParamsBytes = 4096;
-    static_assert((kGrassParams8Float + 4) * sizeof(float) <= kShadowParamsBytes,
+    static_assert((kMaskProfFloat + 4) * sizeof(float) <= kShadowParamsBytes,
                   "ShadowMaskParams overflows its CBV — too many sun cascades");
     // msmrecv.h.fsl's PCSS works in TEXELS, so SUN_SHADOW_RES has to agree with the atlas the host
     // actually allocated. Same mirroring contract as SUN_CASCADES / kSunCascades.
@@ -5690,6 +5932,7 @@ namespace {
     // A fully STATIC scene bumps neither → turning the camera triggers ZERO re-renders; an
     // animating NPC scatters onto only the slots it actually shadows.
     uint32_t g_casterEpoch = 1;   // starts at 1 so a never-rendered slot (lastRenderFrame 0) is stale
+
 
     // shadowSlotBlock() — the slot→atlas layout — is defined just below g_shadowSlots (it reads the
     // slot's per-tile resolution shift, so it needs the manager state in scope).
@@ -7162,6 +7405,11 @@ namespace {
     // unlike bindCausticField's seven — grass.vert is the sole reader and it lives only there.
     void bindGrassCrushField(Renderer* R, DescriptorSet* set, uint32_t index);
     bool buildOpaquePath(Renderer* R, uint32_t width, uint32_t height) {
+        // VRAM phase marks (see vramMark). The first one is the BASELINE: everything the device,
+        // the swapchain, the resource loader and the dev UI already hold before this function
+        // allocates anything. If that baseline is itself large, no amount of trimming render
+        // targets will matter, and that is worth knowing before optimising the wrong thing.
+        vramMark(R, "buildOpaquePath ENTRY");
         // Depth target (reverse-Z not needed for M1c; standard LEQUAL + clear to 1.0).
         RenderTargetDesc dDesc = {};
         dDesc.mWidth = width;
@@ -7249,6 +7497,7 @@ namespace {
             cDesc.mClearValue.a = 0.0f;   // transparent bg: resolves into pRT's coverage-mask alpha
             cDesc.mDescriptors = DESCRIPTOR_TYPE_TEXTURE;
             cDesc.pName = "sceneColor";
+            vramMark(R, "  depth + portalGate");
             addRenderTarget(R, &cDesc, &g_live.pSceneColor);
             if (!g_live.pSceneColor) {
                 std::printf("[forge] addRenderTarget(scene color %ux) FAILED\n", g_live.sampleCount);
@@ -7487,6 +7736,7 @@ namespace {
                 shd.mClearValue.b = 0.0f;           shd.mClearValue.a = 0.0f;
                 shd.mDescriptors = (DescriptorType)(DESCRIPTOR_TYPE_TEXTURE | DESCRIPTOR_TYPE_RW_TEXTURE);
                 shd.pName = "skyHeight";
+                vramMark(R, "  sceneColor + sun moments");
                 addRenderTarget(R, &shd, &g_live.pSkyHeight);
 
                 BufferLoadDesc shp = {};
@@ -7662,6 +7912,7 @@ namespace {
             // ONLY movers (skinned + multimap), re-rendered every frame for slots with a mover in
             // reach. The mask takes max(static, dyn) per texel, so the static atlas stays cached.
             sd.pName = "shadowAtlasDyn";
+            vramMark(R, "  skyHeight + LUTs");
             addRenderTarget(R, &sd, &g_live.pShadowAtlasDyn);
 
             TextureDesc md = {};
@@ -8281,13 +8532,17 @@ namespace {
         }
         // Clustered forward: create the froxel mask + compute pipelines NOW so gFroxelMask can bind
         // into pPerFrameSet below. Non-fatal — on failure froxelReady stays false and the frags brute-loop.
+        vramMark(R, "  shadow atlases + PSOs");
         createFroxelResources(R);
+        vramMark(R, "  froxel (clustered)");
         createRippleSimResources(R);
         // W23. Before the pPerFrameSet updates below, so the SRV can bind this frame.
         createCausticResources(R);
         // G7. Same placement and the same reason: bindGrassCrushField runs from the PerFrame updates
         // below (and from the sun-cascade set built later), so the texture has to exist by now.
+        vramMark(R, "  ripple + caustics");
         createGrassCrushResources(R);
+        vramMark(R, "  grass crush");
         // NiUVController takeover: the gUVAnim table — a persistent-mapped typed-buffer SRV
         // (Buffer<float4>[kMaxUVAnim]) the draw loops fill via uvAnimIdFor. Created before the
         // PerFrame set updates so every SrtData PerFrame instance can bind it. Zeroed once so
@@ -10028,6 +10283,51 @@ namespace {
                     std::printf("[forge] custom resolve unavailable (%s) — hardware ResolveSubresource\n",
                                 resolveFrag);
                 }
+
+                // --- the resolve FILTER in compute ----------------------------------------------
+                // NON-FATAL throughout, hizReady's shape: any failure leaves rfReady false, the
+                // dispatch never runs, the prefilter lane stays 0 and resolve.frag takes its own tap
+                // loop — a frame bit-identical to a build without this. Only at sampleCount 4, which
+                // is the only variant compiled and the only radius the shader is built for.
+                if (g_live.sampleCount == 4 && g_live.pResolvePipeline) {
+                    TextureDesc rfd = {};
+                    rfd.mWidth  = g_live.allocWidth;
+                    rfd.mHeight = g_live.allocHeight;
+                    rfd.mDepth = 1; rfd.mArraySize = 1; rfd.mMipLevels = 1;
+                    rfd.mSampleCount = SAMPLE_COUNT_1;
+                    // fp16 and NOT a UNORM: this holds the filter output before any clamp, and
+                    // Catmull-Rom over- and undershoots in both directions. resolve.frag's
+                    // premultiplied clip is what brings it back into range, and it must still see
+                    // the excursion to do that correctly.
+                    rfd.mFormat = TinyImageFormat_R16G16B16A16_SFLOAT;
+                    rfd.mStartState = RESOURCE_STATE_UNORDERED_ACCESS;
+                    rfd.mDescriptors = (DescriptorType)(DESCRIPTOR_TYPE_TEXTURE | DESCRIPTOR_TYPE_RW_TEXTURE);
+                    rfd.pName = "resolveFiltered";
+                    TextureLoadDesc rfl = {};
+                    rfl.ppTexture = &g_live.pResolveFiltered;
+                    rfl.pDesc = &rfd;
+                    addResource(&rfl, nullptr);
+
+                    ShaderLoadDesc rfs = {};
+                    rfs.mComp.pFileName = "resolvefilter_sc4.comp";
+                    addShader(R, &rfs, &g_live.pRFShader);
+                    if (g_live.pRFShader) {
+                        PipelineDesc rfp = {};
+                        rfp.mType = PIPELINE_TYPE_COMPUTE;
+                        rfp.mComputeDesc.pShaderProgram = g_live.pRFShader;
+                        addPipeline(R, &rfp, &g_live.pRFPipeline);
+                    }
+                    if (g_live.pRFPipeline) {
+                        DescriptorSetDesc rfsd = SRT_SET_DESC(ResolveFilterSrtData, PerBatch, 1, 0);
+                        addDescriptorSet(R, &rfsd, &g_live.pRFSet);
+                    }
+                    g_live.rfReady = g_live.pResolveFiltered && g_live.pRFPipeline && g_live.pRFSet;
+                    LOG::logline(">> [resolve] compute filter %s — %s",
+                                 g_live.rfReady ? "READY" : "UNAVAILABLE",
+                                 g_live.rfReady
+                                   ? "separable Catmull-Rom in LDS, 9 MSAA loads/px instead of 64"
+                                   : "resolve.frag keeps its own tap loop");
+                }
             }
         }
 
@@ -11506,11 +11806,19 @@ namespace {
                     aoShadersOk = false;
                 }
             }
-            ShaderLoadDesc absd = {};
-            absd.mComp.pFileName = "aoblur.comp";
-            addShader(R, &absd, &g_live.pAOBlurShader);
-            if (!g_live.pLinearizeShader || !aoShadersOk || !g_live.pAOBlurShader) {
-                std::printf("[forge] addShader(compute %s/AO modes/aoblur.comp) FAILED\n", linName);
+            // The three blur variants, same table shape as the AO modes above.
+            bool aoBlurShadersOk = true;
+            for (uint32_t b = 0; b < kAOBlurModeCount; ++b) {
+                ShaderLoadDesc absd = {};
+                absd.mComp.pFileName = kAOBlurShaderFiles[b];
+                addShader(R, &absd, &g_live.pAOBlurShader[b]);
+                if (!g_live.pAOBlurShader[b]) {
+                    std::printf("[forge] addShader(compute %s) FAILED\n", kAOBlurShaderFiles[b]);
+                    aoBlurShadersOk = false;
+                }
+            }
+            if (!g_live.pLinearizeShader || !aoShadersOk || !aoBlurShadersOk) {
+                std::printf("[forge] addShader(compute %s/AO modes/AO blur variants) FAILED\n", linName);
                 return false;
             }
 
@@ -11526,12 +11834,16 @@ namespace {
                 addPipeline(R, &gpd, &g_live.pAOPipeline[m]);
                 if (!g_live.pAOPipeline[m]) { aoPipesOk = false; }
             }
-            PipelineDesc abpd = {};
-            abpd.mType = PIPELINE_TYPE_COMPUTE;
-            abpd.mComputeDesc.pShaderProgram = g_live.pAOBlurShader;
-            addPipeline(R, &abpd, &g_live.pAOBlurPipeline);
-            if (!g_live.pLinearizePipeline || !aoPipesOk || !g_live.pAOBlurPipeline) {
-                std::printf("[forge] addPipeline(compute linearize/AO modes/aoblur) FAILED\n");
+            bool aoBlurPipesOk = true;
+            for (uint32_t b = 0; b < kAOBlurModeCount; ++b) {
+                PipelineDesc abpd = {};
+                abpd.mType = PIPELINE_TYPE_COMPUTE;
+                abpd.mComputeDesc.pShaderProgram = g_live.pAOBlurShader[b];
+                addPipeline(R, &abpd, &g_live.pAOBlurPipeline[b]);
+                if (!g_live.pAOBlurPipeline[b]) { aoBlurPipesOk = false; }
+            }
+            if (!g_live.pLinearizePipeline || !aoPipesOk || !aoBlurPipesOk) {
+                std::printf("[forge] addPipeline(compute linearize/AO modes/AO blur variants) FAILED\n");
                 return false;
             }
 
@@ -11568,6 +11880,14 @@ namespace {
                 mld.ppTexture = &g_live.pMotionVectors;
                 mld.pDesc = &md;
                 addResource(&mld, nullptr);
+
+                // MB-2d: the blur's field — same desc in every respect, because it is the same
+                // quantity in the same units and is transitioned in lockstep with it.
+                md.pName = "mbVelocity";
+                TextureLoadDesc bld = {};
+                bld.ppTexture = &g_live.pMbVelocity;
+                bld.pDesc = &md;
+                addResource(&bld, nullptr);
 
                 // LAST frame's device depth. Same format and size as pLinearDepth because it is a
                 // straight CopyResource of it — no reinterpretation, so nothing here can disagree
@@ -11662,8 +11982,8 @@ namespace {
                     addResource(&mrr, nullptr);
                 }
                 if (g_live.pMvSet && g_live.pMvParamsCbv && g_live.pLinearDepth && g_live.pMvStats
-                    && g_live.pMvPrevDepth && g_live.pMvReactive) {
-                    DescriptorData md3[6] = {};
+                    && g_live.pMvPrevDepth && g_live.pMvReactive && g_live.pMbVelocity) {
+                    DescriptorData md3[7] = {};
                     md3[0].mIndex = SRT_RES_IDX(MotionVectorSrtData, Persistent, gMvParams);
                     md3[0].mCount = 1; md3[0].ppBuffers = &g_live.pMvParamsCbv;
                     md3[1].mIndex = SRT_RES_IDX(MotionVectorSrtData, Persistent, gMvDepth);
@@ -11676,7 +11996,9 @@ namespace {
                     md3[4].mCount = 1; md3[4].ppTextures = &g_live.pMvPrevDepth;
                     md3[5].mIndex = SRT_RES_IDX(MotionVectorSrtData, Persistent, gMvReactive);
                     md3[5].mCount = 1; md3[5].ppTextures = &g_live.pMvReactive;
-                    updateDescriptorSet(R, 0, g_live.pMvSet, 6, md3);
+                    md3[6].mIndex = SRT_RES_IDX(MotionVectorSrtData, Persistent, gMvBlurOut);
+                    md3[6].mCount = 1; md3[6].ppTextures = &g_live.pMbVelocity;
+                    updateDescriptorSet(R, 0, g_live.pMvSet, 7, md3);
                     g_live.mvReady = true;
 
                     // ...and into the MAIN graphics PerFrame set, for the F12 mode-17 view. ONLY
@@ -12049,7 +12371,7 @@ namespace {
                         for (uint32_t k = 0; k < kObjVelBatch; ++k) { oinst[k] = k; }
                         std::memset(g_live.pObjVelParamsCbv->pCpuMappedAddress, 0, 256);
 
-                        DescriptorData ovd[7] = {};
+                        DescriptorData ovd[8] = {};
                         ovd[0].mIndex = SRT_RES_IDX(ObjVelocitySrtData, PerDraw, gObjVelParams);
                         ovd[0].mCount = 1; ovd[0].ppBuffers = &g_live.pObjVelParamsCbv;
                         ovd[1].mIndex = SRT_RES_IDX(ObjVelocitySrtData, PerDraw, gObjVelBatch);
@@ -12087,6 +12409,14 @@ namespace {
                         if (g_live.pLinearDepth) {
                             ovd[ovdN].mIndex = SRT_RES_IDX(ObjVelocitySrtData, PerDraw, gObjVelDepthOut);
                             ovd[ovdN].mCount = 1; ovd[ovdN].ppTextures = &g_live.pLinearDepth;
+                            ++ovdN;
+                        }
+                        // MB-2d: the blur's field. Written in BOTH instances and outside the bone
+                        // branch — every mover lane writes it, rigid, skinned and first-person alike,
+                        // and an unwritten slot would read whatever the heap last held.
+                        if (g_live.pMbVelocity) {
+                            ovd[ovdN].mIndex = SRT_RES_IDX(ObjVelocitySrtData, PerDraw, gObjVelBlurOut);
+                            ovd[ovdN].mCount = 1; ovd[ovdN].ppTextures = &g_live.pMbVelocity;
                             ++ovdN;
                         }
                         updateDescriptorSet(R, 0, g_live.pObjVelSet, ovdN, ovd);
@@ -12579,7 +12909,15 @@ namespace {
                                      && g_live.pAODownSet && g_live.pAOUpSet
                                      && g_live.pGtaoBatchSetHalf && g_live.pAOBlurSetHalf;
                 if (!g_live.aoHalfReady) {
-                    std::printf("[forge] half-res AO pipeline/set build FAILED — toggle disabled\n");
+                    // LOG, not printf: the host's stdout goes nowhere a session can read back, so
+                    // this failure was invisible while AO silently ran at 4x the pixels. Naming the
+                    // null member matters — six things can clear the flag and they fail for
+                    // different reasons (missing dxil vs a refused descriptor set).
+                    LOG::logline("!! [forge][ao] half-res AO chain FAILED — toggle disabled, AO runs FULL RES"
+                                 " (downPipe=%p upPipe=%p downSet=%p upSet=%p batchSetHalf=%p blurSetHalf=%p)",
+                                 (void*)g_live.pAODownPipeline, (void*)g_live.pAOUpPipeline,
+                                 (void*)g_live.pAODownSet, (void*)g_live.pAOUpSet,
+                                 (void*)g_live.pGtaoBatchSetHalf, (void*)g_live.pAOBlurSetHalf);
                 }
             }
 
@@ -12698,7 +13036,13 @@ namespace {
             // NON-FATAL throughout, bloomReady's shape: any failure leaves mbReady false, no dispatch
             // runs, the resolve binds the instance it would have bound anyway, and the frame is
             // bit-identical to a build without the feature.
-            if (g_live.sceneReferred && g_live.pSceneColor && g_live.sampleCount == 1
+            // ⚠ THE MSAA TERM IS NOT `sampleCount == 1` ANY MORE. What the gather actually needs is
+            // a SINGLE-SAMPLE, linear, pre-tonemap colour source, and `sampleCount == 1` was that
+            // question asked as "is MSAA off" — true at 1x, and silently false on a 4x install where
+            // the feature then did not exist at all. rfReady names the other surface that satisfies
+            // it: the resolve's compute pre-filter output. [[project_forge_motion_blur]]
+            if (g_live.sceneReferred && g_live.pSceneColor
+                && (g_live.sampleCount == 1 || g_live.rfReady)
                 && g_live.pMotionVectors && g_live.pLinearDepth) {
                 // ALLOC-sized, like every other screen target, so a live render-scale change needs no
                 // reallocation — the delivered sub-rect rides the cbuffer instead.
@@ -12828,6 +13172,7 @@ namespace {
                 }
 
                 if (g_live.pMotionBlur && g_live.pMbTile && g_live.pMbNeighbor && g_live.pMbParamsCbv
+                    && g_live.pMbVelocity
                     && g_live.pMbStats && g_live.pMbStatsReset && g_live.pMbStatsReadback
                     && g_live.pMbTilePipeline && g_live.pMbNeighborPipeline && g_live.pMbGatherPipeline) {
                     DescriptorSetDesc mset = SRT_SET_DESC(MotionBlurSrtData, Persistent, 4, 0);
@@ -12840,14 +13185,23 @@ namespace {
                     // on each single-texture bind or the count is 0 and the slot binds NOTHING.
                     // Slots a given pass never touches are pointed at something valid and inert;
                     // DXC has already stripped them out of that pass's bytecode.
-                    Texture* sceneTex = g_live.pSceneColor->pTexture;
+                    // gMbColor is a plain Tex2D, so above 1x the source is the pre-filter's output
+                    // rather than the MSAA scene target — the same image, reconstructed, and the one
+                    // resolve.frag reads on that path too, so the blur and the resolve agree about
+                    // what "the frame" is.
+                    Texture* sceneTex = (g_live.sampleCount == 1) ? g_live.pSceneColor->pTexture
+                                                                  : g_live.pResolveFiltered;
                     Texture* upsTex   = (g_live.pUpscaler && g_live.pUpscaler->outputTexture())
                                             ? g_live.pUpscaler->outputTexture() : sceneTex;
                     DescriptorData d[8] = {};
                     d[0].mIndex = SRT_RES_IDX(MotionBlurSrtData, Persistent, gMbParams);
                     d[0].ppBuffers = &g_live.pMbParamsCbv;
+                    // ⚠ pMbVelocity, NOT pMotionVectors. The blur reads the field the object-only
+                    // knob authors; the upscaler keeps the true total-motion one. They are the same
+                    // numbers whenever the knob is off, and that is what makes full-frame blur
+                    // bit-identical to the build before MB-2d.
                     d[1].mIndex = SRT_RES_IDX(MotionBlurSrtData, Persistent, gMbVelocity);
-                    d[1].mCount = 1; d[1].ppTextures = &g_live.pMotionVectors;
+                    d[1].mCount = 1; d[1].ppTextures = &g_live.pMbVelocity;
                     d[2].mIndex = SRT_RES_IDX(MotionBlurSrtData, Persistent, gMbDepth);
                     d[2].mCount = 1; d[2].ppTextures = &g_live.pLinearDepth;
                     d[3].mIndex = SRT_RES_IDX(MotionBlurSrtData, Persistent, gMbColor);
@@ -12939,7 +13293,13 @@ namespace {
                 // not the shader ever samples it.
                 Texture* bloomTex = g_live.pBloomMips ? g_live.pBloomMips
                                   : (g_live.pAOBlur   ? g_live.pAOBlur : g_live.pAO);
-                DescriptorData d[3] = {};
+                // gResolveFiltered, the compute filter's output. Bound UNCONDITIONALLY for the
+                // reason gBloomTex is: an unwritten slot reads whatever was last in that heap slot.
+                // When the filter did not build, it falls back to the same RGBA16F fallback chain
+                // and the prefilter lane stays 0, so resolve.frag never reads it.
+                Texture* rfTex = g_live.pResolveFiltered ? g_live.pResolveFiltered : bloomTex;
+                const uint32_t rsN = bloomTex ? 4u : 2u;
+                DescriptorData d[4] = {};
                 d[0].mIndex     = SRT_RES_IDX(ResolveSrtData, PerDraw, gResolveParams);
                 d[0].ppBuffers  = &g_live.pResolveParamsCbv;
                 d[1].mIndex     = SRT_RES_IDX(ResolveSrtData, PerDraw, gResolveSource);
@@ -12948,7 +13308,10 @@ namespace {
                 d[2].mIndex     = SRT_RES_IDX(ResolveSrtData, PerDraw, gBloomTex);
                 d[2].mCount     = 1;
                 d[2].ppTextures = &bloomTex;
-                updateDescriptorSet(R, 0, g_live.pResolveSet, bloomTex ? 3 : 2, d);
+                d[3].mIndex     = SRT_RES_IDX(ResolveSrtData, PerDraw, gResolveFiltered);
+                d[3].mCount     = 1;
+                d[3].ppTextures = &rfTex;
+                updateDescriptorSet(R, 0, g_live.pResolveSet, rsN, d);
                 // ...and INSTANCE 1: the same set with the UPSCALER'S OUTPUT in the source slot
                 // (M1 4b). Built once, right here, beside the instance it is the alternative to, so
                 // the two can never drift apart — every other slot is identical by construction
@@ -12967,7 +13330,7 @@ namespace {
                 if (g_live.pUpscaler && g_live.pUpscaler->outputTexture()) {
                     Texture* upsTex = g_live.pUpscaler->outputTexture();
                     d[1].ppTextures = &upsTex;
-                    updateDescriptorSet(R, 1, g_live.pResolveSet, bloomTex ? 3 : 2, d);
+                    updateDescriptorSet(R, 1, g_live.pResolveSet, rsN, d);
                 }
                 // ...and INSTANCE 2: the MOTION BLUR's output (MB-2). Same set, same one pointer
                 // changed, built beside the two it is the alternative to.
@@ -12983,12 +13346,36 @@ namespace {
                 // is a plain Tex2D and pSceneColor is a Tex2DMS above 1x. Above 1x this instance
                 // stays unwritten AND unbound, exactly like instance 1.
                 if (g_live.pMotionBlur) {
-                    d[1].ppTextures = &g_live.pMotionBlur;
-                    updateDescriptorSet(R, 2, g_live.pResolveSet, bloomTex ? 3 : 2, d);
+                    // ⚠ WHICH SLOT CARRIES THE BLUR DEPENDS ON WHICH SLOT THIS CONFIGURATION READS.
+                    // At 1x the frag runs its tap loop over gResolveSource. Above 1x the prefilter
+                    // lane is set and it takes ONE Load from gResolveFiltered instead — so putting
+                    // the blurred image in gResolveSource there would leave it unread and resolve the
+                    // SHARP frame, a failure with no error and no artifact except that the feature
+                    // does nothing. (d[1] is still pSceneColor here: above 1x the upscaler instance
+                    // above never runs, so nothing has overwritten it.)
+                    if (g_live.sampleCount == 1) { d[1].ppTextures = &g_live.pMotionBlur; }
+                    else                         { d[3].ppTextures = &g_live.pMotionBlur; }
+                    updateDescriptorSet(R, 2, g_live.pResolveSet, rsN, d);
                 }
                 if (!bloomTex) {
                     std::printf("[forge][bloom] no fallback texture for gBloomTex — resolve set bound"
-                                " with 2 of 3 slots; bloom strength is forced to 0\n");
+                                " with 2 of 4 slots; bloom strength is forced to 0\n");
+                }
+
+                // The compute filter's own set. It shares pResolveParamsCbv — RFParams mirrors the
+                // first two float4 of ResolveParams byte for byte, so the two passes cannot disagree
+                // about the diameter or the firefly flag.
+                if (g_live.rfReady) {
+                    DescriptorData rf[3] = {};
+                    rf[0].mIndex     = SRT_RES_IDX(ResolveFilterSrtData, PerBatch, gRFParams);
+                    rf[0].ppBuffers  = &g_live.pResolveParamsCbv;
+                    rf[1].mIndex     = SRT_RES_IDX(ResolveFilterSrtData, PerBatch, gRFSource);
+                    rf[1].mCount     = 1;
+                    rf[1].ppTextures = &g_live.pSceneColor->pTexture;
+                    rf[2].mIndex     = SRT_RES_IDX(ResolveFilterSrtData, PerBatch, gRFOut);
+                    rf[2].mCount     = 1;
+                    rf[2].ppTextures = &g_live.pResolveFiltered;
+                    updateDescriptorSet(R, 0, g_live.pRFSet, 3, rf);
                 }
             }
             {
@@ -14128,6 +14515,16 @@ namespace {
     unsigned  g_lastShadowActive = 0;
     unsigned  g_lastShadowDyn    = 0;
     double    g_lastGpuPhaseMs[kGpuPhaseCount] = {};
+    // Which phases actually WROTE a timestamp pair this frame. Nothing resets the query pool
+    // (there is no cmdResetQueryPool call anywhere), so a phase whose gpuPhaseBegin/End were
+    // SKIPPED leaves its slot holding the previous frame's timestamps — and the readback below,
+    // seeing e > b, reports that stale duration as if it were this frame's cost. Phases that
+    // bracket their gate from OUTSIDE (Water, Reflect) are immune: they always write, and measure
+    // ~0 when the work inside is gated off. Phases that put the brackets INSIDE the gate
+    // (Caustic, GrassCrush) are not. Cost of not having this: a caustic pass correctly skipped in
+    // every interior still reported 0.65 ms there — the last exterior frame's number — which read
+    // as "the fix did nothing" and nearly bought a working change a revert.
+    bool      g_gpuPhaseIssued[kGpuPhaseCount] = {};
     // CPU-side per-phase RECORD ms (breaks down g_lastRecMs): the same gpuPhaseBegin/End
     // brackets also capture hostNowMs() deltas — CPU cost of RECORDING each phase's commands
     // (bind/draw/barrier calls), not of executing them. Nested phases nest here too.
@@ -14198,6 +14595,16 @@ namespace {
     // "after that wait", and nothing can be pushed between the wait and the next submit (renderScene
     // owns the thread across that span).
     std::vector<Texture*> g_texRetire;
+    // Same mechanism, same fence, for per-mesh GEOMETRY (the dynamic ring and the static
+    // skinned/MM VB+IB). Eviction used to free arena suballocations ONLY, on the grounds that
+    // destroying a live ID3D12Resource an in-flight frame might still reference is a different
+    // hazard. That hazard is real; the price of dodging it was not measured until geo-ledger did:
+    // static live climbed to 252 MB (40395 creates / 7293 destroys), dyn destroys sat at exactly 0.
+    // At 64 KB D3D12 resource alignment an ~8 KB VB holds a 64 KB block, so 252 MB of logical data
+    // pins ~4.2 GB of committed VRAM — the +3679 MB `vram-stream: geometry` that crosses the DXGI
+    // budget and collapses the frame into driver paging. Parking answers the hazard directly
+    // instead of paying for it in evicted-to-system-RAM bytes.
+    std::vector<Buffer*>  g_bufRetire;
     // True once a frame has been submitted on g_live.pFence, so the top-of-frame settle knows there
     // is a previous frame to read back at all. getFenceStatus's NOTSUBMITTED would answer this too,
     // but only until the first wait — after that the fence is "submitted" forever, and the readback
@@ -15044,12 +15451,24 @@ namespace {
     // mask FROZEN on one slice (spatial-only: fixes the tile's diagonal, changes nothing per frame),
     // 2 = the mask advancing. Three rungs on purpose — 1 is the safe half of the upgrade, so if the
     // animation is ever the suspect it can be taken out without going back to the diagonal.
-    uint32_t g_aoDither    = 2u;
+    //
+    // DEFAULT 1, not 2, since 2026-09-05. Reported from play: at half res the grains are 2x2 screen
+    // pixels, and "they crawl with time" reads as WORSE than "they crawl with camera movement".
+    // That is the whole argument for rung 1 — the temporal axis is only an asset when something
+    // INTEGRATES it, and the AO has no temporal accumulator, so all the third dimension buys here
+    // is a visible cycle on a grain that is already too large. Rung 1 keeps the blue-noise spatial
+    // fix (no 4x4 diagonal) and freezes the slice, which is exactly screen-locked-crawl-only.
+    uint32_t g_aoDither    = 1u;
     // Frames per mask slice. 1 = advance every frame, which is what the worst case wants: a slowly
     // moving NPC or swaying grass keeps a surface point on the SAME pixel for many frames, so motion
     // cannot reshuffle the spatial mask and the temporal column is the only thing decorrelating it.
     // Raise it only to trade that away for calm at a dead standstill.
     uint32_t g_aoDitherStride = 1u;
+    // Which aoblur variant runs (AOBlurMode / kAOBlurShaderFiles). 0 = the 2D radius-3 reference
+    // that shipped, 1 = separable at the same radius, 2 = separable at radius 6. Default 0 so the
+    // frame is unchanged until someone asks: 1 and 2 are the two halves of ONE question asked
+    // separately — 1 changes only the cost, 2 changes the reach.
+    uint32_t g_aoBlurMode  = 0u;
     // Sample budget (ap[27] / ap[30]) and the bitmask modes' assumed occluder depth (ap[31]).
     // SSAO-fast — the DEFAULT mode — ignores the first two by design: it is compiled at a literal
     // 2/4 so the loops fully unroll ("fast that a slider can make slow is not a mode"). They are
@@ -15101,6 +15520,11 @@ namespace {
     // diameter 6 over 2048x1536). Graphics shaders do NOT hot-reload, so every knob that decides
     // cost is a uniform, not a #define.
     bool     g_customResolve   = true;
+    // Run the resolve's tap loop in COMPUTE (resolvefilter.comp, separable + LDS) rather than in
+    // resolve.frag. Both paths are the same filter and must produce the same picture — which is
+    // exactly why this knob exists: it is the acceptance test. Compare the APL heartbeat between
+    // the two arms; a real difference in the reconstruction moves the frame's mean.
+    bool     g_resolveCompute  = true;
     // Sample radius follows as round(diameter/2) — MSAAFilter.cpp:290 — so 6 -> 3 -> a 7x7
     // neighbourhood (~196 loads/px), 4 -> 2 -> 5x5 (~100), 2 -> 1 -> 3x3 (~36). The corners of each
     // neighbourhood fail the radius test and are never loaded, so cost tracks the DISC, not the box.
@@ -15777,6 +16201,15 @@ namespace {
     // Whether the pass ran this frame — written from the ONE gate, read by the resolve's set index
     // and by the heartbeat. Same rule as g_lastUpscaleRan beside it: a second derivation of "did it
     // run" is a second thing that can disagree with the frame.
+    // MB-2d — OBJECT-ONLY MOTION BLUR. ON by default: camera blur is the half of this effect people
+    // switch the whole feature off to avoid (spin and the entire room smears), while object blur is
+    // the half that reads as motion. With it on, the blur's velocity field is the movers' motion
+    // RELATIVE TO THE WORLD and exactly zero everywhere else, so a static world stays sharp however
+    // fast the camera turns — and it is CHEAPER, not dearer: almost every tile goes to zero velocity
+    // and the gather early-outs at the floor instead of walking taps.
+    // ⚠ It does not touch pMotionVectors. See pMbVelocity.
+    bool     g_mbObjectOnly = true;
+    bool     g_lastRfRan = false;   // did the resolve's compute pre-filter run? (mb= names it)
     bool     g_lastMbRan = false;
     // What the pass actually used, for the heartbeat's bracket. The K it RAN at, not the knob: the
     // knob is clamped to [kMbTileKMin, kMbTileKMax] and a line reporting the unclamped value would
@@ -18293,6 +18726,16 @@ namespace {
                                         // the receiver sample along its depth-reconstructed normal, scaled by
                                         // grazing angle (PSO slope bias is 0). Tuned to 1.0; raise to kill any
                                         // residual grazing acne, lower to tighten contacts.
+    // shadowmask.comp COST PROFILE (instrumentation; 0/0/0 = the shipped path, bit-identical).
+    // Floats so they join the MGE_HOST_KNOBS table, which is the only reason they are useful: the
+    // arms have to be taken in ONE session against ONE pinned save, and the harness runs minimized.
+    // Lane meanings live in shadowparams.h.fsl::maskProf — briefly: prof cuts the pass after a named
+    // stage (1 floor / 2 +range scan / 3 +normal recon), noDyn drops the second atlas load per tap,
+    // filter forces the grid gate to one endpoint (1 bilinear, 2 grid).
+    // ⚠ prof 1..3 render a WRONG mask on purpose. They are timing arms; never judge the look in one.
+    float g_maskProf         = 0.0f;
+    float g_maskNoDyn        = 0.0f;
+    float g_maskFilter       = 0.0f;
     float g_shadowRangeK     = 1.1f;    // SHADOW TEST RANGE in light radii (live via maskParams.x). The mask
                                         // tests, the caster gather, dynHit and the bake far plane all reach
                                         // exactly rangeK*r. Mask cost scales with the covered area (~rangeK²),
@@ -18517,6 +18960,37 @@ namespace {
     // A slot's motion drive (0..1): its smoothed travel speed against the full-drive reference.
     static float motionDrive(const ShadowSlot& sl) {
         return (g_flickMotionRef > 1e-3f) ? std::min(1.0f, sl.fSpeed / g_flickMotionRef) : 0.0f;
+    }
+    // THE FLAME'S ANGULAR-VELOCITY VECTOR (radians), for one slot, for this frame.
+    //
+    // shadowmask.comp rotates a flicker slot's atlas lookup DIRECTION by this vector, so the shadow's
+    // world displacement is angle*|d| — ~zero at the candle tip, growing toward the attenuation edge.
+    // Each axis is three octaves at incommensurate frequencies whose PHASES are modulated by a slow
+    // wandering term m (FM turbulence), so the motion is quasi-periodic and never repeats without
+    // raising the base rate. The z (vertical) axis dominates, which makes the sway mostly horizontal.
+    // The GUST envelope is the PRODUCT of two slow swells: a product sits low most of the time with
+    // occasional coincident peaks, so the flame is mostly calm and then gusts — deeper and burstier
+    // than a single sine would be.
+    //
+    // ⚠ THIS LIVES HERE, ON THE CPU, BECAUSE IT IS A PER-SLOT PER-FRAME CONSTANT. The identical
+    // thirteen sin() used to run inside shadowmask.comp's per-slot loop — i.e. once per PIXEL per
+    // slot, ~4.1M times a frame at 2560x1600 — to produce three numbers that do not vary across the
+    // screen. Measured at 0.06ms of a 0.90ms mask on a four-candle interior. The phase `a` and the
+    // slot seed are the same inputs the shader had, so the flame itself is unchanged.
+    // [[feedback_hoist_the_signal_dont_re_derive_it]]
+    static void shadowFlickerWobble(uint32_t slot, float a, float wobAmp, float out[3]) {
+        const float seed = (float)slot * 2.399963f;   // per-SLOT phase — camera-INVARIANT. (A
+                                                      // camera-relative position hash shakes the
+                                                      // wobble as the eye moves; the slot index
+                                                      // is stable per light and doesn't.)
+        const float m    = 0.75f * std::sin(a * 0.29f + seed * 1.7f);        // slow wandering phase modulator
+        const float g0   = 0.5f + 0.5f * std::sin(a * 0.17f + seed * 0.9f);  // 0..1 slow swell
+        const float g1   = 0.5f + 0.5f * std::sin(a * 0.31f + seed * 2.3f);  // 0..1 slower, different phase
+        const float gust = 0.22f + 0.78f * g0 * g1;                          // 0.22 .. 1.0, gusty (biased low)
+        const float k    = wobAmp * gust;
+        out[0] = k * (0.34f*std::sin(a*0.83f + seed        + m)       + 0.17f*std::sin(a*1.97f + seed*1.7f - m*1.3f) + 0.09f*std::sin(a*3.71f + seed*3.1f + m*0.7f));
+        out[1] = k * (0.34f*std::sin(a*0.91f + seed*1.3f - m)         + 0.17f*std::sin(a*2.13f + seed*0.7f + m*0.9f) + 0.09f*std::sin(a*4.29f + seed*2.3f - m*1.1f));
+        out[2] = k * (0.90f*std::sin(a*1.07f + seed*0.5f + m*1.2f)    + 0.40f*std::sin(a*2.33f + seed*2.1f - m*0.8f) + 0.16f*std::sin(a*4.90f + seed*1.1f + m*1.5f));
     }
     // How much EXCITATION amplitude this light may take (0..1), by radius — the candle guard.
     static float ampAllowance(const ShadowSlot& sl) {
@@ -19066,6 +19540,10 @@ namespace {
           t.checkbox("Alpha-to-coverage (antialiased cutouts: foliage/grates)", &g_alphaToCoverage);
           t.checkbox("Custom resolve (off = hardware ResolveSubresource)", &g_customResolve);
           t.sliderF("Filter diameter (px; 6 = 7x7, 4 = 5x5, 2 = 3x3)", &g_resolveDiameter, 1.0f, 6.0f, 0.5f);
+          // Same filter, two implementations. Unticking it is the A/B that proves the compute path
+          // did not change the picture — and it is the fallback at diameter >= 5.002, where the
+          // compute variant's compile-time radius 2 would truncate the kernel.
+          t.checkbox("Resolve filter in compute (separable + LDS)", &g_resolveCompute);
           // Mitchell C at B=0: 0.5 = Catmull-Rom (default = today), 0.4 = SMAA filmic, 0 = no
           // ringing at all. ⚠ Partly redundant with the diameter above — move ONE at a time.
           t.sliderF("Cubic sharpness C (0.5 = Catmull-Rom, 0.4 = SMAA filmic, 0 = no ringing)",
@@ -19238,7 +19716,17 @@ namespace {
           // the resolve bind the instance it would have bound without this feature, so the frame is
           // byte-identical rather than approximately unchanged. `mb=` in the gpu split can therefore
           // be read on and off across one frame, which is the only honest way to price it.
+          // ⚠ THIS IS THE ONLY SWITCH, AND IT IS LIVE AT EVERY SAMPLE COUNT. It gates DISPATCHES,
+          // never the allocation — which is why there is no second "…and at MSAA too" checkbox and
+          // no restart. A knob that needs a restart is how a feature ends up invisible: the MSAA
+          // gate was one for months and nobody could tell motion blur from a bug
+          // ([[project_forge_mb_at_msaa]]). It also turns the motion-VECTOR producer on and off with
+          // it (mvEnable || (mbEnable && mbReady)), so this checkbox IS the A/B for the whole chain.
           t.checkbox("Motion blur enable (off = no dispatches, byte-identical frame)", &g_mbEnable);
+          // Live, like the one above: it selects which vector the producers write into the blur's
+          // field, not whether anything is allocated.
+          t.checkbox("  \\- object motion only (no camera smear when you turn; also cheaper)",
+                     &g_mbObjectOnly);
           // THE SHUTTER ANGLE, and the reason it is an angle rather than a strength multiplier.
           // The DX9 filter's `blur_scale` multiplied a per-FRAME displacement, so a blur tuned at
           // 60 fps was half as long at 30 — a look that changes with the framerate, which is the one
@@ -19524,6 +20012,12 @@ namespace {
           static const char* const kAODitherNames[] = { "4x4 tile (legacy)", "blue noise (frozen)", "blue noise (spatiotemporal)" };
           t.dropdown("AO dither", &g_aoDither, kAODitherNames, 3u);
           t.sliderU("AO dither frames/slice (1 = every frame)", &g_aoDitherStride, 1u, 8u, 1u);
+          // Separable is an APPROXIMATION of the 2D range weight, so 1 vs 0 is the look A/B for
+          // separability alone and 2 vs 1 is the look A/B for width alone. Never judge them together.
+          static const char* const kAOBlurModeNames[] = { "2D radius 3 (reference)",
+                                                          "separable radius 3",
+                                                          "separable radius 6 (wide)" };
+          t.dropdown("AO blur kernel", &g_aoBlurMode, kAOBlurModeNames, (uint32_t)kAOBlurModeCount);
           t.sliderF("Bent normal strength",  &g_aoBentStr,   0.0f, 4.0f,   0.05f);
           // 0 on the plane sigma is the A/B for the crease fix: it reverts the blur AND the upscale
           // to the depth-only weighting that cannot see an inside corner.
@@ -20646,21 +21140,48 @@ namespace {
                     (g_playerCrush[3] > 0.0f) ? "on the wire" : "MISSING (old client, or interior)");
         }
 
+        // ⚠ THE CPU LINE AND THE GPU LINE ARE TWO TIMELINES, AND THE PANEL USED TO ADD THEM UP.
+        // It printed `host = setup + cull + rec + gpu + post` as a literal equation, which was true
+        // when `gpu` meant "the CPU's blocking wait on the frame fence". It stopped being true the
+        // day g_lastGpuMs became the RESOLVED kGpuPhaseFrame timestamp (see settleFrameFence) — the
+        // GPU's own elapsed time, which the host does not spend and does not block on. The equation
+        // survived the change and started reporting `host 0.88 ms = ... + gpu 5.38 + ...`: a sum
+        // smaller than one of its terms, on screen, for anyone reading the panel to judge where the
+        // frame goes. Reported from play, correctly, as "the hud report is wrong".
+        //
+        // So: the CPU total gets an identity that actually holds, `other` and all — it is
+        // tEntry..return minus the five bracketed spans, and naming it is what makes the line
+        // checkable instead of merely plausible. The GPU gets its own line and is stated as a
+        // FRACTION OF THE CLIENT FRAME, because that is the question the number is for.
+        const double cpuNamed = g_lastSetupMs + g_lastCullMs + g_lastGpuWaitMs
+                              + g_lastRecMs + g_lastPostMs;
+        const double cpuOther = (g_lastTotalMs > cpuNamed) ? (g_lastTotalMs - cpuNamed) : 0.0;
+        // ...and the same correction for "host idle". The number is right — the service thread
+        // really is out of RenderFrame for dt minus the CPU total — but the WORD says the host is
+        // doing nothing, while its queue is executing most of that window. Idle is a CPU-thread
+        // fact; the GPU headroom beside it is the one that answers "is the host the bottleneck".
+        const double gpuPct  = (g_clientDtMs > 0.01f) ? (100.0 * g_lastGpuMs / (double)g_clientDtMs) : 0.0;
+        const double gpuHead = (g_clientDtMs > 0.01f) ? ((double)g_clientDtMs - g_lastGpuMs) : 0.0;
+
         // Phase 0: refresh the live-stats text from this frame's counters (Forge bformat pattern).
         bformat(&g_statsText,
                 "near opaque %u | skinned %u | multimap %u\n"
                 "sky %u | reflect-sky %u | lights %u | alpha %u\n"
                 "terrain %u cells | DL statics %u inst / %u subsets\n"
                 "water levels %u\n"
-                "host %.2f ms = setup %.2f + cull %.2f + rec %.2f + gpu %.2f + post %.2f\n"
+                "host CPU %.2f ms = setup %.2f + cull %.2f + wait %.2f + rec %.2f + post %.2f + other %.2f\n"
+                "host GPU %.2f ms = %.0f%% of the %.2f ms client frame (headroom %.2f)\n"
                 "gpu: prepass %.2f postdepth %.2f (lin %.2f ao %.2f mask %.2f) reflect %.2f color %.2f water %.2f resolve %.2f\n"
                 "uploads %6.1f KB/f (~%6.1f KB avg) | %5.0f parts/f  [breakdown in mgeXE.log [uploads]]\n"
-                "frame-ahead %s | client dt %.2f wait %.2f mwstart %.2f | host idle %.2f ms",
+                "frame-ahead %s | client dt %.2f wait %.2f mwstart %.2f | host CPU idle %.2f ms"
+                " between frames (the GPU line above says what runs during it)",
                 g_lastDrawn, g_lastSkinnedDrawn, g_lastMultiMapDrawn,
                 g_lastSkyDrawn, g_lastReflSkyDrawn, g_lastLightCount, g_lastAlphaDrawn,
                 g_lastTerrainCells, g_liveLastInst, g_liveLastSubsets,
                 g_lastWaterLevels,
-                g_lastTotalMs, g_lastSetupMs, g_lastCullMs, g_lastRecMs, g_lastGpuMs, g_lastPostMs,
+                g_lastTotalMs, g_lastSetupMs, g_lastCullMs, g_lastGpuWaitMs, g_lastRecMs,
+                g_lastPostMs, cpuOther,
+                g_lastGpuMs, gpuPct, (double)g_clientDtMs, gpuHead,
                 g_lastGpuPhaseMs[kGpuPhasePrepass], g_lastGpuPhaseMs[kGpuPhasePostDepth],
                 g_lastGpuPhaseMs[kGpuPhaseLinearize],
                 g_lastGpuPhaseMs[kGpuPhasePostDepth] - g_lastGpuPhaseMs[kGpuPhaseLinearize] - g_lastGpuPhaseMs[kGpuPhaseShadowMask],
@@ -20731,22 +21252,36 @@ namespace {
     // the ring (dynVb/dynIb[]) and vb/ib merely alias the current ring entry, so the ring is
     // the authority — null vb/ib first to avoid a double-free of an aliased pointer.
     void releaseMeshBuffers(HostMesh& m) {
+        // Ledger credit uses m.bufBytes — the SAME figure the create site charged and the budget
+        // hands back below — so created/destroyed can never drift apart through a re-upload that
+        // changed the shape in between. Credited in the branch that actually frees, so a slot
+        // charged to one bucket cannot be credited to another.
         if (m.inArena) {
             // Arena parts own no D3D12 resources — just free the suballocations.
             g_arenaVB.release(m.vbOff, (uint64_t)m.vertexCount * sizeof(IPC::GeomVertexWire));
             g_arenaIB.release(m.ibOff, (uint64_t)m.indexCount * sizeof(uint16_t));
             m.inArena = false;
             m.vbOff = m.ibOff = 0;
+            g_geoArena.destroyedBytes += (uint64_t)m.vertexCount * sizeof(IPC::GeomVertexWire)
+                                      + (uint64_t)m.indexCount  * sizeof(uint16_t);
+            ++g_geoArena.destroys;
         } else if (m.dynamic) {
+            // PARKED, not destroyed: this runs on the IPC-service thread between frames, and a
+            // submitted frame may still be reading the ring entry it is not currently writing.
+            // g_bufRetire is freed only after the frame fence proves every submission retired.
             for (uint32_t r = 0; r < kGeomRing; ++r) {
-                if (m.dynVb[r]) { removeResource(m.dynVb[r]); m.dynVb[r] = nullptr; }
-                if (m.dynIb[r]) { removeResource(m.dynIb[r]); m.dynIb[r] = nullptr; }
+                if (m.dynVb[r]) { g_bufRetire.push_back(m.dynVb[r]); m.dynVb[r] = nullptr; }
+                if (m.dynIb[r]) { g_bufRetire.push_back(m.dynIb[r]); m.dynIb[r] = nullptr; }
             }
             m.vb = m.ib = nullptr;   // were aliases into the ring
             if (g_dynamicCount) { --g_dynamicCount; }
+            g_geoDyn.destroyedBytes += m.bufBytes; ++g_geoDyn.destroys;
         } else {
-            if (m.vb) { removeResource(m.vb); m.vb = nullptr; }
-            if (m.ib) { removeResource(m.ib); m.ib = nullptr; }
+            // PARKED for the same reason as the ring above — an in-flight frame can still hold
+            // these in a recorded bindVB/bindIB.
+            if (m.vb) { g_bufRetire.push_back(m.vb); m.vb = nullptr; }
+            if (m.ib) { g_bufRetire.push_back(m.ib); m.ib = nullptr; }
+            g_geoStatic.destroyedBytes += m.bufBytes; ++g_geoStatic.destroys;
         }
         // Hand the budget back EXACTLY what this slot took (m.bufBytes, recorded at alloc), not what
         // its current vertexCount implies — a re-upload can change the shape in between, and a
@@ -20772,6 +21307,11 @@ namespace {
                     releaseMeshBuffers(g_meshes[i]);
                 }
             }
+            // Teardown: releaseMeshBuffers PARKS into g_bufRetire, and there is no next frame to
+            // drain it — free here or the whole store leaks past shutdown. Callers have already
+            // waited the frame fence (shutdown()) or never submitted anything, so this is safe.
+            for (Buffer* b : g_bufRetire) { removeResource(b); }
+            g_bufRetire.clear();
             tf_free(g_meshes);
         }
         g_meshes   = nullptr;
@@ -22447,6 +22987,34 @@ void destroyHostWindow(Renderer* R);
         // all now that Off is one entry among six.
         struct UKnob { const char* name; uint32_t* p; uint32_t max; };
         const FKnob fknobs[] = {
+            // AO LOOK, exposed 2026-09-05 because a half-res grain complaint could not be A/B'd
+            // at all from the minimized harness — every one of these was panel-only.
+            // upSigma is the FIRST lever for "half res looks blocky": it is the upscale's RANGE
+            // sigma in WORLD units, so raising it lets the upscale blend across a bigger depth
+            // step and smooths the enlarged grain. blurPx is the blur's SPATIAL sigma in PIXELS,
+            // and note it saturates — past ~1.5 over a +-3 kernel it is a box filter and buys
+            // nothing more ([[project_forge_ao_blur_extent]]).
+            { "aoUpSigma",          &g_aoUpSigma          },
+            { "aoBlurPx",           &g_aoBlurPx           },
+            // SHADOW MASK: the test range (the pass's area dial — covered area ~ rangeK², and the
+            // point light's reach is slaved to it) and the three cost-profile arms. Here for exactly
+            // the reason the AO ones are: separating this pass's four stages needs them measured in
+            // one session against one pinned save, and nobody is at the panel during a minimized run.
+            { "shadowRangeK",       &g_shadowRangeK       },
+            { "maskProf",           &g_maskProf           },
+            { "maskNoDyn",          &g_maskNoDyn          },
+            { "maskFilter",         &g_maskFilter         },
+            // ...and the flicker WOBBLE amplitude, which is a cost arm as much as a look one: at 0
+            // the mask's per-slot wobble branch is not taken, so this is the isolation lever for the
+            // 13 sin() that branch evaluates PER SLOT PER PIXEL.
+            { "flickShadowMove",    &g_flickShadowMove    },
+            // MSAA RESOLVE FILTER DIAMETER. 6 = 7x7, 4 = 5x5 (the shipped value), 2 = 3x3, and the
+            // tap count is (2*ceil(d/2)+1)^2 * sampleCount MSAA loads PER OUTPUT PIXEL — 196 / 100 /
+            // 36 at 4x. It is here, not just on the panel, because scaling it is the only way to ask
+            // from the harness what this pass is BOUND by: if the time tracks the tap count the pass
+            // is load-throughput bound and the answer is fewer taps (or an LDS compute rewrite); if
+            // it does not, the taps are free and the weight arithmetic is the target.
+            { "resolveDiameter",    &g_resolveDiameter    },
             // S2 THE ATMOSPHERE — first in the table because the S2b gate runs unattended and these
             // are the three lanes an unattended session has to be able to move: the march budget
             // (the `atmos=` cost dial), and the two night lanes, whose whole point is that they are
@@ -22639,6 +23207,10 @@ void destroyHostWindow(Renderer* R);
             // which is verification step 1 and the first thing to try when bisecting anything
             // post-upscale.
             { "mbEnable",            &g_mbEnable            },
+            // MB-2d. The A/B is a LOOK question and a COST question at once — object-only removes the
+            // camera smear AND most of the gather's work — so it has to be reachable from a minimized
+            // run, like every other arm in this table.
+            { "mbObjectOnly",        &g_mbObjectOnly        },
             { "objVelEnable",        &g_objVelEnable        },
             { "objVelAllItems",      &g_objVelAllItems      },
             { "objVelSkinned",       &g_objVelSkinnedLane   },
@@ -22680,6 +23252,18 @@ void destroyHostWindow(Renderer* R);
             { "aplSplitWater",      &g_aplSplitWater      },
             { "aplSkipSky",         &g_aplSkipSky         },
             { "causticOn",          &g_causticOn          },
+            // AO's two big levers. halfRes is here because it is a 4x PIXEL COUNT change hiding
+            // behind a dev-panel checkbox, and the harness runs minimized — so the one A/B that
+            // separates "AO is slow" from "AO is running full-res" could not be driven at all.
+            { "aoHalfRes",          &g_aoHalfRes          },
+            { "aoEnable",           &g_aoEnable           },
+            // 0 = hardware ResolveSubresource (a box average, and format-locked). The floor this
+            // pass is measured against.
+            { "customResolve",      &g_customResolve      },
+            // 0 = keep the Catmull-Rom loop inside resolve.frag (64 MSAA Loads/pixel), 1 = the
+            // separable LDS compute pass (9). Same filter, so this is a PERF knob whose look delta
+            // must be zero — and the way to prove that from a minimized harness is the APL line.
+            { "resolveCompute",     &g_resolveCompute     },
             // W24: the two wave sims themselves, because the dynamic caustic layers are DOWNSTREAM
             // of them — a layer whose field nobody steps is a layer that does nothing at any
             // strength, and the minimized harness cannot reach either checkbox. Both default ON
@@ -22713,6 +23297,22 @@ void destroyHostWindow(Renderer* R);
             { "grassCrush",          &g_grassCrush          },
         };
         const UKnob uknobs[] = {
+            // AO DITHER SOURCE: 0 = legacy 4x4 tile, 1 = blue noise FROZEN (slice 0), 2 =
+            // spatiotemporal. Rung 1 is the documented remedy when the ANIMATION is what shows —
+            // it keeps the blue-noise spatial fix and stops the per-frame walk. Reported
+            // 2026-09-05: at half res the grains are 2x2 screen pixels and the temporal cycle is
+            // plainly visible on them, which is what rung 1 exists for. There is no temporal
+            // accumulator on the AO, so the third axis has nothing integrating it away.
+            { "aoDither",       &g_aoDither,       2u },
+            // Frames per STBN slice. Raising it slows the cycle (trades decorrelation for calm)
+            // without giving up the temporal axis entirely — the middle setting between rungs 2
+            // and 1. See [[project_forge_ao_stbn_dither]].
+            { "aoDitherStride", &g_aoDitherStride, 64u },
+            // AO BLUR VARIANT: 0 = 2D radius 3 (the reference), 1 = separable radius 3 (same reach,
+            // ~2x cheaper — isolates the separable range weight's approximation), 2 = separable
+            // radius 6 (double the reach and still fewer taps than 0 — the arm for half-res dither
+            // grain, which a +-3 kernel at a resolvable sigma cannot swallow).
+            { "aoBlurMode",     &g_aoBlurMode,     (uint32_t)kAOBlurModeCount - 1u },
             // 0 Off, 1 DLAA, 2 Quality, 3 Balanced, 4 Performance, 5 UltraPerformance. LIVE on the
             // panel; here because the minimized perf harness cannot open a dropdown, and the A/B
             // this milestone actually needs — DLSS off vs DLAA vs Quality at the same camera — is
@@ -24847,12 +25447,18 @@ void destroyHostWindow(Renderer* R);
             for (Texture* t : g_texRetire) { removeResource(t); }
             g_texRetire.clear();
         }
+        if (!g_bufRetire.empty()) {
+            for (Buffer* b : g_bufRetire) { removeResource(b); }
+            g_bufRetire.clear();
+        }
         if (!g_framePending) { return; }   // nothing submitted yet ⇒ nothing to read back
         g_framePending = false;
 
         // GPU per-phase breakdown: read back the timestamps (valid now the fence has signalled).
         if (g_live.pGpuQueryPool && g_live.gpuTickFreq > 0.0) {
             for (uint32_t i = 0; i < kGpuPhaseCount; ++i) {
+                // A phase that recorded nothing this frame reads 0.00, not whatever it last cost.
+                if (!g_gpuPhaseIssued[i]) { g_lastGpuPhaseMs[i] = 0.0; continue; }
                 QueryData qd = {};
                 getQueryData(R, g_live.pGpuQueryPool, i, &qd);
                 const uint64_t b = qd.mBeginTimestamp, e = qd.mEndTimestamp;
@@ -27669,23 +28275,34 @@ void destroyHostWindow(Renderer* R);
                 if (sl.lastRenderFrame == frame) { staticReBits |= (1u << s); }
                 if (sl.faceShift != 0) { softBits |= (1u << s); }   // low-res tile → no tap grid in the mask
                 // Per-slot flame: PHASE (integrated above at this slot's own motion/wind-boosted rate) and
-                // AMPLITUDE GAIN. Both ride slotFlick[s] so the mask can wobble a carried torch harder than
-                // the sconce beside it. The amp gains stay small on purpose — amplitude is the axis that
-                // swings the lookup direction far enough to expose atlas artifacts, so excitation is spent
-                // mostly on rate. The forward intensity match below reads the SAME phase and gain, so a
-                // light and its shadow always move as one flame.
+                // AMPLITUDE GAIN, which together produce the wobble VECTOR published in slotFlick[s] — so
+                // a carried torch dances harder than the sconce beside it. The amp gains stay small on
+                // purpose: amplitude is the axis that swings the lookup direction far enough to expose
+                // atlas artifacts, so excitation is spent mostly on rate. The forward intensity match
+                // below reads the SAME phase and gain, so a light and its shadow move as one flame.
                 const float flickA  = (float)sl.fPhase;
                 const float ampAllow = ampAllowance(sl);   // candle guard: small lights take no extra swing
                 const float ampGain = 1.0f + ampAllow * (g_flickMotionAmp * motionDrive(sl)
                                                        + g_flickWindAmp   * windDrive);
-                mp[288 + s * 4 + 0] = ampGain;   // slotFlick[s].x = amplitude gain
-                mp[288 + s * 4 + 1] = flickA;    // slotFlick[s].y = this slot's flame phase (rad)
+                // The wobble VECTOR, not the phase it comes from — see shadowFlickerWobble. Zero
+                // for every slot that is not a live flicker light, and the bit below is set only
+                // when it is genuinely non-zero, so the mask's branch stays untaken at amp 0.
+                float wob[3] = { 0.0f, 0.0f, 0.0f };
+                if (sl.fClass == 2u) {
+                    const float wobAmp = g_flickShadowMove * ampGain;   // base amp * this slot's gain
+                    if (wobAmp > 0.0f) {
+                        shadowFlickerWobble(s, flickA, wobAmp, wob);
+                        flickerBits |= (1u << s);   // shadow "movement" applies here only
+                    }
+                }
+                mp[288 + s * 4 + 0] = wob[0];    // slotFlick[s].x = wobble.x
+                mp[288 + s * 4 + 1] = wob[1];    // slotFlick[s].y = wobble.y
                 // .z = the face-frustum uvScale this slot's tile was BAKED with (overlap gutter). The
                 // mask must divide its face UV by exactly this, or every face is sampled off-centre.
+                // The wobble is split AROUND it rather than moved: fpshadow.h.fsl reads uvScale at .z.
                 mp[288 + s * 4 + 2] = sl.faceUvScale;
-                mp[288 + s * 4 + 3] = 0.0f;
+                mp[288 + s * 4 + 3] = wob[2];    // slotFlick[s].w = wobble.z
                 if (sl.fClass == 2u) {
-                    flickerBits |= (1u << s);   // shadow "movement" applies here only
                     // Intensity match: modulate this flicker light's FORWARD brightness with the SAME flame
                     // signal (seed + gust + a fast term IN PHASE with the dominant sway octave). Drives
                     // brightness = tracked peak (fMaxI) * b, replacing MW's own flicker for this light so the
@@ -27727,13 +28344,18 @@ void destroyHostWindow(Renderer* R);
             mp[21] = kShadowNearZ;                // maskParams.y = face near plane
             mp[22] = g_shadowSlack;               // maskParams.z = compare slack (live knob)
             mp[23] = g_shadowAtlasDebug ? 2.0f : (g_shadowFaceDebug ? 1.0f : 0.0f);
+            mp[kMaskProfFloat + 0] = g_maskProf;    // shadowmask.comp cost-profile arms (0 = shipped path)
+            mp[kMaskProfFloat + 1] = g_maskNoDyn;
+            mp[kMaskProfFloat + 2] = g_maskFilter;
+            mp[kMaskProfFloat + 3] = 0.0f;
             mp[280] = g_shadowBias;               // biasParams.x = absolute contact bias (live knob)
             mp[281] = g_shadowNormalOffset;       // biasParams.y = normal-offset bias in texels (live knob)
             // Flicker shadow "movement": the mask rotates the LOOKUP direction of flicker-class slots by a
             // small time-varying angle → world displacement = angle*dist (stable at the light/candle tip,
-            // growing toward the attenuation edge). The PHASE is now PER-SLOT (slotFlick[s].y — each flame
-            // runs at its own motion/wind-boosted rate), as is the amplitude GAIN (slotFlick[s].x); this is
-            // the BASE amplitude every slot's gain multiplies. slotBits.z picks the slots.
+            // growing toward the attenuation edge). This is the BASE amplitude every slot's gain
+            // multiplies; the product, and the whole octave/gust derivation it drives, is folded into
+            // slotFlick[s] above, so NO SHADER READS THIS LANE any more — it is published for the
+            // diagnostic view and for anything that wants to know what the knob was set to.
             mp[282] = (float)s_flickPhaseGlobal;  // biasParams.z = base-rate phase (reference/diagnostic only)
             mp[283] = g_flickShadowMove;          // biasParams.w = BASE rotation amplitude (radians; 0 = off)
             // slotBits (uint4): the 32-bit slot masks as REAL uints — a float lane is exact only
@@ -28021,8 +28643,13 @@ void destroyHostWindow(Renderer* R);
         // Accumulated (+=) because ReflGeo opens twice; copied out after endCmd.
         double cpuPhaseT0[kGpuPhaseCount]  = {};
         double cpuPhaseAcc[kGpuPhaseCount] = {};
+        // Cleared HERE and not earlier: settleFrameFence above has already read frame N-1's
+        // timestamps, and it had to see N-1's issue flags to do it. Clearing before that call
+        // would zero every phase in the very readback that needs them.
+        for (uint32_t i = 0; i < kGpuPhaseCount; ++i) { g_gpuPhaseIssued[i] = false; }
         auto gpuPhaseBegin = [&](uint32_t i) {
             cpuPhaseT0[i] = hostNowMs();
+            g_gpuPhaseIssued[i] = true;
             if (g_live.pGpuQueryPool) { QueryDesc q = {}; q.mIndex = i; cmdBeginQuery(g_live.pCmd, g_live.pGpuQueryPool, &q); }
         };
         auto gpuPhaseEnd = [&](uint32_t i) {
@@ -28392,7 +29019,15 @@ void destroyHostWindow(Renderer* R);
             // published from. At gain 0 the generator would spend its 0.19 ms building a field of
             // zeros for a consumer that is already skipping it — and skipping it here is what makes
             // "turn the calm water off and look at the wake alone" cost nothing.
-            const bool statArmed = causticGate && waterBaseSlopeGain() > 0.0f;
+            // ⚠ ripWaterNow BELONGS HERE, exactly as it does on the two layers below.
+            // waterBaseSlopeGain() is a STRENGTH function, not a presence test — it answers "how
+            // hard would the surface bend light", which is nonzero in a dry interior where there is
+            // no surface at all. Without this the static tiling map was rebuilt every frame of
+            // every waterless cell for a consumer that never sampled it: 0.47 ms measured in a
+            // Balmora interior, ~6% of an 7.8 ms interior frame. That is the "pure waste on every
+            // interior" the comment above this gate already names; the static layer simply never
+            // got the check ripArmed and wakeArmed were given.
+            const bool statArmed = causticGate && ripWaterNow && waterBaseSlopeGain() > 0.0f;
             const bool ripArmed  = causticGate && ripWaterNow && g_live.rippleFine.ready
                                  && g_ripSimOn && g_causticRippleStr > 0.0f;
             const bool wakeArmed = causticGate && ripWaterNow && g_live.rippleWake.ready
@@ -30106,11 +30741,13 @@ void destroyHostWindow(Renderer* R);
 
             // (1b) Half-res only: pLinearDepth (full) -> pLinearDepthHalf, MAX of each 2x2.
             if (aoHalf) {
+                gpuPhaseBegin(kGpuPhaseAODown);
                 cmdBeginDebugMarker(g_live.pCmd, 0.3f, 0.5f, 0.9f, "AO DEPTH DOWNSAMPLE (pLinearDepth -> half)");
                 cmdBindPipeline(g_live.pCmd, g_live.pAODownPipeline);
                 cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pAODownSet);
                 cmdDispatch(g_live.pCmd, gxH, gyH, 1);
                 cmdEndDebugMarker(g_live.pCmd);
+                gpuPhaseEnd(kGpuPhaseAODown);
                 TextureBarrier tb = {};
                 tb.pTexture = g_live.pLinearDepthHalf;
                 tb.mCurrentState = RESOURCE_STATE_UNORDERED_ACCESS;
@@ -30125,19 +30762,37 @@ void destroyHostWindow(Renderer* R);
             // pAO's UAV/SRV ping-pong above and below is unconditional either way, so its state
             // machine never depends on the toggle — it is simply left unwritten on a half frame.
             if (aoDispatchRuns) {
+                gpuPhaseBegin(kGpuPhaseAOSearch);
                 cmdBeginDebugMarker(g_live.pCmd, 1.0f, 0.3f, 0.2f, "AO (linear depth -> pAO: bent normal + visibility)");
                 cmdBindPipeline(g_live.pCmd, aoPipeline);
                 cmdBindDescriptorSet(g_live.pCmd, 0, aoHalf ? g_live.pGtaoBatchSetHalf : g_live.pGtaoBatchSet);
                 cmdDispatch(g_live.pCmd, aoHalf ? gxH : gx, aoHalf ? gyH : gy, 1);
                 cmdEndDebugMarker(g_live.pCmd);
+                gpuPhaseEnd(kGpuPhaseAOSearch);
                 static uint32_t s_aoDispatchedMode = 0xFFFFFFFFu;
                 static bool     s_aoDispatchedHalf = false;
-                if (s_aoDispatchedMode != g_aoMode || s_aoDispatchedHalf != aoHalf) {
-                    std::printf("[forge] AO dispatch ISSUED mode=%u (%s) half=%d gx=%u gy=%u (w=%u h=%u)\n",
-                                g_aoMode, kAOShaderFiles[g_aoMode < (uint32_t)kAOModeCount ? g_aoMode : 0u],
-                                (int)aoHalf, aoHalf ? gxH : gx, aoHalf ? gyH : gy, aoW, aoH);
+                static uint32_t s_aoDispatchedBlur = 0xFFFFFFFFu;
+                if (s_aoDispatchedMode != g_aoMode || s_aoDispatchedHalf != aoHalf
+                    || s_aoDispatchedBlur != g_aoBlurMode) {
+                    // LOG, not printf. `half=` is the one number that separates "AO is expensive"
+                    // from "AO is running at 4x the pixels it was configured for", and it was only
+                    // ever written to a stdout nobody captures — which is why a 2.43 ms AO could
+                    // not be told apart from a 0.67 ms one without a rebuild. Both REQUESTED and
+                    // EFFECTIVE are printed: the toggle can be on while the chain is unbuilt.
+                    // The BLUR variant belongs on this line too. It is a separate binary with a
+                    // different tap count and a different range weight, so "which blur ran" is as
+                    // load-bearing for reading a timing as "which AO ran" — and an env knob set in
+                    // a minimized harness has no other witness.
+                    LOG::logline(">> [forge][ao] dispatch mode=%u (%s) halfRequested=%d halfReady=%d"
+                                 " halfEFFECTIVE=%d grid=%ux%u aoTarget=%ux%u blur=%u (%s)",
+                                 g_aoMode, kAOShaderFiles[g_aoMode < (uint32_t)kAOModeCount ? g_aoMode : 0u],
+                                 (int)g_aoHalfRes, (int)g_live.aoHalfReady,
+                                 (int)aoHalf, aoHalf ? gxH : gx, aoHalf ? gyH : gy, aoW, aoH,
+                                 g_aoBlurMode,
+                                 kAOBlurShaderFiles[g_aoBlurMode < (uint32_t)kAOBlurModeCount ? g_aoBlurMode : 0u]);
                     s_aoDispatchedMode = g_aoMode;
                     s_aoDispatchedHalf = aoHalf;
+                    s_aoDispatchedBlur = g_aoBlurMode;
                 }
                 g_live.aoLastHalf = aoHalf;
             }
@@ -30179,11 +30834,15 @@ void destroyHostWindow(Renderer* R);
                 // Gated with the GTAO dispatch: baseline skips the blur (pAOBlur stays stale but is
                 // still transitioned UAV -> SRV below, so the colour pass samples it in a valid state).
                 if (aoDispatchRuns) {
+                    gpuPhaseBegin(kGpuPhaseAOBlur);
                     cmdBeginDebugMarker(g_live.pCmd, 0.6f, 1.0f, 0.4f, "AO BILATERAL BLUR (pAO -> pAOBlur)");
-                    cmdBindPipeline(g_live.pCmd, g_live.pAOBlurPipeline);
+                    // Out-of-range falls back to the 2D reference rather than binding null.
+                    const uint32_t bmode = (g_aoBlurMode < (uint32_t)kAOBlurModeCount) ? g_aoBlurMode : 0u;
+                    cmdBindPipeline(g_live.pCmd, g_live.pAOBlurPipeline[bmode]);
                     cmdBindDescriptorSet(g_live.pCmd, 0, aoHalf ? g_live.pAOBlurSetHalf : g_live.pAOBlurSet);
                     cmdDispatch(g_live.pCmd, aoHalf ? gxH : gx, aoHalf ? gyH : gy, 1);
                     cmdEndDebugMarker(g_live.pCmd);
+                    gpuPhaseEnd(kGpuPhaseAOBlur);
                 }
                 // (4) Half-res only: pAOBlurHalf UAV -> SRV, then the depth+normal-adaptive
                 // Lanczos-2 upscale writes the FULL pAOBlur — so everything downstream, colour
@@ -30195,11 +30854,13 @@ void destroyHostWindow(Renderer* R);
                     hb.mNewState = RESOURCE_STATE_SHADER_RESOURCE;
                     cmdResourceBarrier(g_live.pCmd, 0, nullptr, 1, &hb, 0, nullptr);
 
+                    gpuPhaseBegin(kGpuPhaseAOUp);
                     cmdBeginDebugMarker(g_live.pCmd, 0.9f, 0.8f, 0.3f, "AO LANCZOS UPSCALE (half -> pAOBlur)");
                     cmdBindPipeline(g_live.pCmd, g_live.pAOUpPipeline);
                     cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pAOUpSet);
                     cmdDispatch(g_live.pCmd, gx, gy, 1);
                     cmdEndDebugMarker(g_live.pCmd);
+                    gpuPhaseEnd(kGpuPhaseAOUp);
                     // All three half targets now rest in SHADER_RESOURCE, which is what the primed
                     // latch promises the next half frame's SR->UAV flip.
                     s_aoHalfPrimed = true;
@@ -31699,7 +32360,13 @@ void destroyHostWindow(Renderer* R);
                 // on a frame whose `mv camera:` line says `parked(bit-identical)=1`, and stay ~99.8%
                 // on frames it does not. Reading the source proves the assignment happens; only the
                 // counter proves the value survived to the dispatch.
-                mp[46] = 0.0f; mp[47] = 0.0f;
+                // MB-2d: opts.z picks what goes in the BLUR's field (gMvBlurOut) — zero over the
+                // static world in object-only mode, the camera vector otherwise. Written HERE, in
+                // the reserved-lane sweep's place rather than after it, for the reason the note
+                // above gives: a trailing clear that runs after a write silently eats the value.
+                // [[feedback_clear_reserved_lanes_before_writing_them]]
+                mp[46] = g_mbObjectOnly ? 1.0f : 0.0f;
+                mp[47] = 0.0f;
                 // opts.y — THE CAMERA DID NOT MOVE, tested BIT-IDENTICALLY and not with a tolerance.
                 // See the long note at the head of motionvectors.comp: reconstruct-then-reproject is
                 // the identity on paper and not in float32, so a parked camera produced ~1e-3 px on
@@ -31836,14 +32503,19 @@ void destroyHostWindow(Renderer* R);
                     }
                 }
 
-                TextureBarrier mvb[2] = {};
+                // MB-2d: pMbVelocity is written by the SAME dispatch and transitions with it, in
+                // lockstep, everywhere. It is a third output of this pass, not a separate lifetime.
+                TextureBarrier mvb[3] = {};
                 mvb[0].pTexture      = g_live.pMotionVectors;
                 mvb[0].mCurrentState = RESOURCE_STATE_SHADER_RESOURCE;
                 mvb[0].mNewState     = RESOURCE_STATE_UNORDERED_ACCESS;
                 mvb[1].pTexture      = g_live.pMvReactive;
                 mvb[1].mCurrentState = RESOURCE_STATE_SHADER_RESOURCE;
                 mvb[1].mNewState     = RESOURCE_STATE_UNORDERED_ACCESS;
-                cmdResourceBarrier(g_live.pCmd, 0, nullptr, 2, mvb, 0, nullptr);
+                mvb[2].pTexture      = g_live.pMbVelocity;
+                mvb[2].mCurrentState = RESOURCE_STATE_SHADER_RESOURCE;
+                mvb[2].mNewState     = RESOURCE_STATE_UNORDERED_ACCESS;
+                cmdResourceBarrier(g_live.pCmd, 0, nullptr, 3, mvb, 0, nullptr);
 
                 // Reset the statistics accumulator: a 16-byte copy from a persistent upload buffer
                 // holding {0, 0xFFFFFFFF, 0, 0}. No clear shader, no CPU-visible descriptor handle.
@@ -31871,7 +32543,9 @@ void destroyHostWindow(Renderer* R);
                 mvb[0].mNewState     = RESOURCE_STATE_SHADER_RESOURCE;   // resting; the view samples it
                 mvb[1].mCurrentState = RESOURCE_STATE_UNORDERED_ACCESS;
                 mvb[1].mNewState     = RESOURCE_STATE_SHADER_RESOURCE;
-                cmdResourceBarrier(g_live.pCmd, 0, nullptr, 2, mvb, 0, nullptr);
+                mvb[2].mCurrentState = RESOURCE_STATE_UNORDERED_ACCESS;
+                mvb[2].mNewState     = RESOURCE_STATE_SHADER_RESOURCE;
+                cmdResourceBarrier(g_live.pCmd, 0, nullptr, 3, mvb, 0, nullptr);
 
                 // ─── CARRY THIS FRAME'S DEPTH FORWARD, for next frame's mask ─────────────────────
                 // ⚠ AFTER the dispatch, never before: the dispatch is still READING pMvPrevDepth as
@@ -32442,7 +33116,12 @@ void destroyHostWindow(Renderer* R);
                         // "was there a previous frame", so a cut cannot zero one producer and not
                         // the other.
                         op[36] = mp[44];
-                        op[37] = op[38] = op[39] = 0.0f;
+                        op[37] = 0.0f;
+                        // MB-2d: opts.z — write the object's motion RELATIVE TO THE WORLD into the
+                        // blur field instead of its total screen motion. Same lane, same meaning, in
+                        // the camera pass above; one knob, two producers, no third answer.
+                        op[38] = g_mbObjectOnly ? 1.0f : 0.0f;
+                        op[39] = 0.0f;
 
                         if (g_live.pObjVelFrags && g_live.pObjVelFragsReset) {
                             BufferBarrier ofb = {};
@@ -32458,11 +33137,14 @@ void destroyHostWindow(Renderer* R);
                             cmdResourceBarrier(g_live.pCmd, 1, &ofb, 0, nullptr, 0, nullptr);
                         }
 
-                        TextureBarrier ovb = {};
-                        ovb.pTexture      = g_live.pMotionVectors;
-                        ovb.mCurrentState = RESOURCE_STATE_SHADER_RESOURCE;
-                        ovb.mNewState     = RESOURCE_STATE_UNORDERED_ACCESS;
-                        cmdResourceBarrier(g_live.pCmd, 0, nullptr, 1, &ovb, 0, nullptr);
+                        TextureBarrier ovb[2] = {};
+                        ovb[0].pTexture      = g_live.pMotionVectors;
+                        ovb[0].mCurrentState = RESOURCE_STATE_SHADER_RESOURCE;
+                        ovb[0].mNewState     = RESOURCE_STATE_UNORDERED_ACCESS;
+                        ovb[1].pTexture      = g_live.pMbVelocity;   // MB-2d, same lifetime
+                        ovb[1].mCurrentState = RESOURCE_STATE_SHADER_RESOURCE;
+                        ovb[1].mNewState     = RESOURCE_STATE_UNORDERED_ACCESS;
+                        cmdResourceBarrier(g_live.pCmd, 0, nullptr, 2, ovb, 0, nullptr);
 
                         BindRenderTargetsDesc obind = {};
                         obind.mRenderTargetCount = 0;   // UAV write; see objvelocity.srt.h
@@ -32547,9 +33229,11 @@ void destroyHostWindow(Renderer* R);
                         // Back to the resting state the camera pass established, so every consumer
                         // downstream (the F12 view, the upscaler's bind) finds the texture where it
                         // expects it whether or not this pass ran.
-                        ovb.mCurrentState = RESOURCE_STATE_UNORDERED_ACCESS;
-                        ovb.mNewState     = RESOURCE_STATE_SHADER_RESOURCE;
-                        cmdResourceBarrier(g_live.pCmd, 0, nullptr, 1, &ovb, 0, nullptr);
+                        ovb[0].mCurrentState = RESOURCE_STATE_UNORDERED_ACCESS;
+                        ovb[0].mNewState     = RESOURCE_STATE_SHADER_RESOURCE;
+                        ovb[1].mCurrentState = RESOURCE_STATE_UNORDERED_ACCESS;
+                        ovb[1].mNewState     = RESOURCE_STATE_SHADER_RESOURCE;
+                        cmdResourceBarrier(g_live.pCmd, 0, nullptr, 2, ovb, 0, nullptr);
 
                         if (g_live.pObjVelFrags && g_live.pObjVelFragsReadback) {
                             BufferBarrier ofb = {};
@@ -34090,7 +34774,8 @@ void destroyHostWindow(Renderer* R);
                 // store from the world lane would replace every mover's device depth with the near
                 // plane. See objvelocity.frag's note.
                 ofp[37] = 1.0f;
-                ofp[38] = ofp[39] = 0.0f;
+                ofp[38] = g_mbObjectOnly ? 1.0f : 0.0f;   // MB-2d, as the world lane
+                ofp[39] = 0.0f;
 
                 // `mm` is the FP1e stride axis, the world lane's ObjVelRec::mm verbatim: a
                 // multi-map mesh is 60 bytes per vertex against the rigid 36, and the stride is a
@@ -34523,16 +35208,25 @@ void destroyHostWindow(Renderer* R);
                     // pLinearDepth back at the MV pass, BEFORE this write — so next frame's
                     // reactive-mask history stays arm-free and self-consistent, and the arms never
                     // appear as "geometry that vanished" to the reprojection.
-                    TextureBarrier fvb[2] = {};
+                    TextureBarrier fvb[3] = {};
                     fvb[0].pTexture      = g_live.pMotionVectors;
                     fvb[0].mCurrentState = RESOURCE_STATE_SHADER_RESOURCE;
                     fvb[0].mNewState     = RESOURCE_STATE_UNORDERED_ACCESS;
                     uint32_t nFvb = 1;
+                    // MB-2d: the arms write the blur field too — a swinging weapon is the mover the
+                    // player sees most, and leaving it out would be object-only blur that omits the
+                    // object in the foreground.
+                    if (g_live.pMbVelocity) {
+                        fvb[nFvb].pTexture      = g_live.pMbVelocity;
+                        fvb[nFvb].mCurrentState = RESOURCE_STATE_SHADER_RESOURCE;
+                        fvb[nFvb].mNewState     = RESOURCE_STATE_UNORDERED_ACCESS;
+                        ++nFvb;
+                    }
                     if (g_live.pLinearDepth) {
-                        fvb[1].pTexture      = g_live.pLinearDepth;
-                        fvb[1].mCurrentState = RESOURCE_STATE_SHADER_RESOURCE;
-                        fvb[1].mNewState     = RESOURCE_STATE_UNORDERED_ACCESS;
-                        nFvb = 2;
+                        fvb[nFvb].pTexture      = g_live.pLinearDepth;
+                        fvb[nFvb].mCurrentState = RESOURCE_STATE_SHADER_RESOURCE;
+                        fvb[nFvb].mNewState     = RESOURCE_STATE_UNORDERED_ACCESS;
+                        ++nFvb;
                     }
                     cmdResourceBarrier(g_live.pCmd, 0, nullptr, nFvb, fvb, 0, nullptr);
 
@@ -34963,6 +35657,25 @@ void destroyHostWindow(Renderer* R);
                                 && g_live.pResolvePipeline && g_live.pResolveSet
                                 && g_live.pResolveParamsCbv && g_live.pSceneColor;
 
+        // ⚠ HOISTED HERE FOR THE REASON `shaderResolve` IS: THE PRE-FILTER HAS TWO CONSUMERS NOW.
+        // resolve.frag reads its output when the prefilter lane is set, and at MSAA > 1x the MOTION
+        // BLUR reads it as its colour source — the blur needs a single-sample LINEAR pre-tonemap
+        // image and this is the only one the frame produces. Two blocks, separated by the whole post
+        // chain, asking "did the filter run"; deciding it once above both is what stops the dispatch
+        // and its readers disagreeing ([[feedback_hoist_the_signal_dont_re_derive_it]]).
+        //
+        // MSAAFilter.cpp:290 — SampleRadius = (uint)((diameter / 2) + 0.499f). Kept exactly, so
+        // diameter 6 -> 3 (7x7), 4 -> 2 (5x5), 2 -> 1 (3x3).
+        // ⚠ RADIUS <= 2 ONLY. resolvefilter.comp is compiled at RF_RADIUS 2. At a SMALLER true radius
+        // it is merely wasteful — the extra taps get weight 0 from the same support test the frag
+        // applies, so the result is identical — but at radius 3 (diameter >= 5.002) it would TRUNCATE
+        // the kernel, which is a different filter and not a slower one. Fall back to the frag loop.
+        const float rfDiam    = (g_resolveDiameter > 0.001f) ? g_resolveDiameter : 0.001f;
+        const float rfRadius  = std::floor(rfDiam * 0.5f + 0.499f);
+        const bool  rfRunning = shaderResolve && g_live.rfReady && g_resolveCompute
+                             && rfRadius <= 2.0f;
+        g_lastRfRan = rfRunning;   // heartbeat only — the mb= bracket names this as a reason
+
         // ⚠ THE BARRIER HOIST, NOW A LAMBDA WITH THREE CALLERS (M1 4b). pSceneColor sits in
         // RENDER_TARGET until something flips it to SHADER_RESOURCE for reading, and the restore at
         // the resolve's tail is unconditional either way. Until 4b there were two readers and the
@@ -35196,6 +35909,49 @@ void destroyHostWindow(Renderer* R);
         const uint32_t deliveredW = upscaled ? g_live.outWidth  : g_live.width;
         const uint32_t deliveredH = upscaled ? g_live.outHeight : g_live.height;
 
+        // ===================== THE RESOLVE'S COMPUTE PRE-FILTER ==================================
+        // Separable Catmull-Rom + firefly reconstruction of the MSAA samples into a single-sample
+        // fp16 LINEAR image, so resolve.frag takes one Load instead of 64
+        // ([[project_forge_resolve_is_load_bound]]).
+        //
+        // ⚠ IT RUNS HERE, ABOVE THE BLUR, AND THAT PLACEMENT IS THE WHOLE OF THE MSAA MOTION-BLUR
+        // FIX. The blur's colour source must be single-sample (gMbColor is a plain Tex2D), linear
+        // and PRE-TONEMAP (a blur is an energy operation —
+        // [[feedback_energy_op_takes_the_energy_honest_source]]). Above 1x, pSceneColor is a Tex2DMS
+        // and satisfies only the last two, which is why mbReady was gated on sampleCount == 1 and
+        // motion blur silently did not exist on a 4x install. This buffer satisfies all three, and
+        // the frame was already producing it — so the fix is an ORDERING change and a source swap,
+        // not a new pass.
+        //
+        // Dispatched over the SOURCE rect after pSceneColor reaches SHADER_RESOURCE.
+        if (rfRunning) {
+            sceneColorToSR();   // idempotent; the upscale block above may already have done it
+            gpuPhaseBegin(kGpuPhaseResolveFilter);
+            TextureBarrier rfb = {};
+            rfb.pTexture      = g_live.pResolveFiltered;
+            rfb.mCurrentState = RESOURCE_STATE_SHADER_RESOURCE;
+            rfb.mNewState     = RESOURCE_STATE_UNORDERED_ACCESS;
+            // Frame 0 it was created UNORDERED_ACCESS already, and D3D12 rejects a transition whose
+            // before and after states match — the same rule the pRT transition spells out.
+            if (!g_live.firstFrame) {
+                cmdResourceBarrier(g_live.pCmd, 0, nullptr, 1, &rfb, 0, nullptr);
+            }
+            cmdBeginDebugMarker(g_live.pCmd, 0.8f, 0.5f, 0.9f, "RESOLVE FILTER (separable, LDS)");
+            cmdBindPipeline(g_live.pCmd, g_live.pRFPipeline);
+            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pRFSet);
+            // The SOURCE rect — the same extent gResolveParams.dims.xy clamps to, which on an
+            // upscaled frame is the output rect. (Unreachable at sampleCount 4, where rfReady lives,
+            // but the two must not drift apart if that ever changes.)
+            cmdDispatch(g_live.pCmd,
+                        (g_live.outWidth  + 7u) / 8u,
+                        (g_live.outHeight + 7u) / 8u, 1);
+            cmdEndDebugMarker(g_live.pCmd);
+            rfb.mCurrentState = RESOURCE_STATE_UNORDERED_ACCESS;
+            rfb.mNewState     = RESOURCE_STATE_SHADER_RESOURCE;
+            cmdResourceBarrier(g_live.pCmd, 0, nullptr, 1, &rfb, 0, nullptr);
+            gpuPhaseEnd(kGpuPhaseResolveFilter);
+        }
+
         // ===================== MB-2: MOTION BLUR (tasks/forge-postprocess.md) ====================
         // AFTER the upscale, BEFORE bloom, on the DELIVERED image and still PRE-TONEMAP — the resolve
         // owns exposure, AgX and the encode — so the blur stays an ENERGY operation on energy-honest
@@ -35230,8 +35986,14 @@ void destroyHostWindow(Renderer* R);
         // for the rest of the session. That is the "plausible, smoothly-varying, completely wrong
         // field" the mvActive comment warns DLSS about, reached through a different consumer.
         bool mbRan = false;
+        // ⚠ ABOVE 1x THE SOURCE ONLY EXISTS IF THE PRE-FILTER ACTUALLY RAN THIS FRAME. rfReady says
+        // the pipeline was built; rfRunning says it dispatched (resolveCompute can be off, and a
+        // resolve diameter past 5.002 falls back to the frag loop). Without this term the gather
+        // would read last frame's pResolveFiltered — a plausible, smoothly-varying, completely wrong
+        // image, which is the exact failure the mvActive comment above warns about.
         const bool mbEligible = shaderResolve && g_live.mbReady && g_mbEnable && g_lastMvRan
-                             && deliveredW > 0u && deliveredH > 0u;
+                             && deliveredW > 0u && deliveredH > 0u
+                             && (g_live.sampleCount == 1 || rfRunning);
         // ═══ MB-2c: HOLD THE BLURRED FRAME WHILE A MENU PAUSES THE GAME ═════════════════════════
         // MW pauses the sim on a menu, so the camera stops dead, `mv camera: parked(bit-identical)`
         // fires, every vector goes to EXACT zero, the velocity floor rejects every pixel and the
@@ -35583,11 +36345,12 @@ void destroyHostWindow(Renderer* R);
         if (shaderResolve) {
             ID3D12GraphicsCommandList* cl = g_live.pCmd->mDx.pCmdList;
 
+            // The filter's diameter/radius and whether it ran are decided ONCE, above the whole post
+            // chain, beside shaderResolve — motion blur consumes the same answer long before this
+            // block is reached. Read here, never re-derived.
             if (g_live.pResolveParamsCbv->pCpuMappedAddress) {
-                const float diam = (g_resolveDiameter > 0.001f) ? g_resolveDiameter : 0.001f;
-                // MSAAFilter.cpp:290 — SampleRadius = (uint)((diameter / 2) + 0.499f). Kept exactly,
-                // so diameter 6 -> 3 (7x7), 4 -> 2 (5x5), 2 -> 1 (3x3).
-                const float radius = std::floor(diam * 0.5f + 0.499f);
+                const float diam   = rfDiam;
+                const float radius = rfRadius;
                 // ⚠ width/height, NOT allocWidth/allocHeight — the clamp bound must be the RENDER
                 // rect or the filter reaches into texels the scene never wrote. Same trap as APL.
                 // opts.y = scene-referred, i.e. THIS pass owns the tonemap (step 6a). Same folded
@@ -35667,7 +36430,10 @@ void destroyHostWindow(Renderer* R);
                 // ⚠ 1.0f AND NOT 0.0f, even though nothing reads it. A lane re-introduced into a
                 // multiply would then be an IDENTITY rather than a black bloom — the cheaper failure
                 // by a wide margin, and the only reason to prefer one dead value over another.
-                const float p[32] = { (float)deliveredW, (float)deliveredH, diam, radius,
+                // p[32] = prefilter.x — set only when the compute filter ACTUALLY dispatched this
+                // frame, which is decided a few lines below and read back here. A frame where the
+                // dispatch is skipped must leave it 0 or resolve.frag reads a stale intermediate.
+                const float p[36] = { (float)deliveredW, (float)deliveredH, diam, radius,
                                       g_resolveInvLuma ? 1.0f : 0.0f,
                                       g_live.sceneReferred ? 1.0f : 0.0f,
                                       std::max(0.0f, g_resolveSharp),
@@ -35681,7 +36447,8 @@ void destroyHostWindow(Renderer* R);
                                       bloomK,
                                       (float)bloomLevelDim(deliveredW, g_live.allocWidth,  0),
                                       (float)bloomLevelDim(deliveredH, g_live.allocHeight, 0),
-                                      1.0f };
+                                      1.0f,
+                                      rfRunning ? 1.0f : 0.0f, 0.0f, 0.0f, 0.0f };
                 std::memcpy(g_live.pResolveParamsCbv->pCpuMappedAddress, p, sizeof(p));
             }
 
@@ -35704,6 +36471,9 @@ void destroyHostWindow(Renderer* R);
             srb.mCurrentState = RESOURCE_STATE_RENDER_TARGET;
             srb.mNewState     = RESOURCE_STATE_SHADER_RESOURCE;
             sceneColorToSR();
+
+            // (The compute PRE-FILTER that fills gResolveFiltered ran far above this block — it
+            // had to move so motion blur could read it. See kGpuPhaseResolveFilter.)
 
             // Destination: the SHARED resource, driven natively like the hardware path does.
             // ⚠ Only on non-first frames. Frame 0 it was created RENDER_TARGET, which is already the
@@ -36356,18 +37126,113 @@ void destroyHostWindow(Renderer* R);
                              (unsigned long long)(g_skippedVBTotal >> 10),
                              (unsigned long long)(g_skippedIBTotal >> 10),
                              g_lastUniqueTex);
+                // VRAM budget + EcoQoS, the two regime probes (see forgeVramAdapter above).
+                // Read `local` against its BUDGET, not against the card total: the budget is what
+                // the driver is currently willing to give US, it moves when another app takes
+                // memory, and crossing it — not filling the card — is what starts paging.
+                // `OVER` is therefore the whole point of the line; the percentage is context.
+                // nonlocal = system memory the GPU reaches over PCIe, which is where evicted
+                // resources LAND, so a rising nonlocal usage is the paging itself, in progress.
+                {
+                    // One mark per heartbeat, so the FIRST one closes the accounting: everything
+                    // between the end of buildOpaquePath and a live frame (terrain upload, distant
+                    // land, the bindless texture array, per-frame ring buffers) lands in this one
+                    // delta. If that residual is the biggest number in the list, the phase marks
+                    // above are in the wrong place and the next ones go here.
+                    static bool s_firstHb = true;
+                    if (s_firstHb) { vramMark(g_live.pRenderer, "FIRST FRAME (residual)"); s_firstHb = false; }
+                    const int eco = forgeEcoQoSState();
+                    if (IDXGIAdapter3* ad = forgeVramAdapter(g_live.pRenderer)) {
+                        DXGI_QUERY_VIDEO_MEMORY_INFO loc = {}, non = {};
+                        const bool okL = SUCCEEDED(ad->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL,     &loc));
+                        const bool okN = SUCCEEDED(ad->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &non));
+                        if (okL || okN) {
+                            char ecobuf[32];
+                            if (eco == 1)      { std::snprintf(ecobuf, sizeof(ecobuf), "THROTTLED"); }
+                            else if (eco == 0) { std::snprintf(ecobuf, sizeof(ecobuf), "off"); }
+                            else if (eco == -1){ std::snprintf(ecobuf, sizeof(ecobuf), "?(noexport)"); }
+                            else               { std::snprintf(ecobuf, sizeof(ecobuf), "?(err=%d)", -eco); }
+                            // streamTex/streamGeo are SUMS of per-call bracketed deltas, so they
+                            // are directly comparable to `local` and to each other. What they will
+                            // NOT do is add up to `local` — the difference is init (render targets,
+                            // LUTs, atlases) plus driver overhead, and that gap is the point: if
+                            // streamTex keeps climbing while residency sits at 872/872, a recycled
+                            // slot is not returning its texture's memory.
+                            LOG::logline(">> [forge-hb] vram-stream: textures=%+.0f MB geometry=%+.0f MB"
+                                         " (summed per-call, bracketed)",
+                                         (double)g_vramTexBytes / (1024.0 * 1024.0),
+                                         (double)g_vramGeoBytes / (1024.0 * 1024.0));
+                            // The lifetime ledger. Read LIVE (created - destroyed) per bucket:
+                            //   static live climbing        -> unique geometry accumulating
+                            //   DYN live climbing           -> particles/movers are NOT being
+                            //       released; "unique per upload" must still be BOUNDED
+                            //   all live flat, vram-stream high -> our lifetimes are right and the
+                            //       allocator is retaining freed heaps (a pooling fix, not a leak)
+                            {
+                                const double kMB = 1024.0 * 1024.0;
+                                auto liveMB = [&](const GeoLedger& g) {
+                                    return ((double)g.createdBytes - (double)g.destroyedBytes) / kMB;
+                                };
+                                LOG::logline(">> [forge-hb] geo-ledger: static live=%.0f MB (%llu/%llu) |"
+                                             " dyn live=%.0f MB (%llu/%llu) | arena live=%.0f MB (%llu/%llu)"
+                                             " | meshBuf gauge=%llu MB",
+                                             liveMB(g_geoStatic),
+                                             (unsigned long long)g_geoStatic.creates,
+                                             (unsigned long long)g_geoStatic.destroys,
+                                             liveMB(g_geoDyn),
+                                             (unsigned long long)g_geoDyn.creates,
+                                             (unsigned long long)g_geoDyn.destroys,
+                                             liveMB(g_geoArena),
+                                             (unsigned long long)g_geoArena.creates,
+                                             (unsigned long long)g_geoArena.destroys,
+                                             (unsigned long long)(g_meshBufBytes >> 20));
+                            }
+                            LOG::logline(">> [forge-hb] vram: local=%llu/%llu MB (%.0f%%%s)"
+                                         " nonlocal=%llu/%llu MB (%.0f%%%s) | resv=%llu MB"
+                                         " | ecoqos=%s prio=0x%lx",
+                                         (unsigned long long)(loc.CurrentUsage >> 20),
+                                         (unsigned long long)(loc.Budget >> 20),
+                                         loc.Budget ? 100.0 * (double)loc.CurrentUsage / (double)loc.Budget : 0.0,
+                                         (loc.Budget && loc.CurrentUsage > loc.Budget) ? " OVER" : "",
+                                         (unsigned long long)(non.CurrentUsage >> 20),
+                                         (unsigned long long)(non.Budget >> 20),
+                                         non.Budget ? 100.0 * (double)non.CurrentUsage / (double)non.Budget : 0.0,
+                                         (non.Budget && non.CurrentUsage > non.Budget) ? " OVER" : "",
+                                         (unsigned long long)(loc.CurrentReservation >> 20),
+                                         ecobuf,
+                                         (unsigned long)GetPriorityClass(GetCurrentProcess()));
+                        }
+                    } else {
+                        LOG::logline(">> [forge-hb] vram: (adapter probe unavailable)"
+                                     " | ecoqos=%s prio=0x%lx",
+                                     eco < 0 ? "?" : (eco ? "THROTTLED" : "off"),
+                                     (unsigned long)GetPriorityClass(GetCurrentProcess()));
+                    }
+                }
             }
             // Host-frame split (this frame's instantaneous values) so the ~2ms "unaccounted inside the
             // host" the client saw is localized: setup (per-draw memcpy) + cull (DL CPU cull + lazy
-            // loads) + record + gpu + post = total. cull is the prime pre-record suspect.
-            // Tier 1: `gpu=` is now the RESOLVED whole-frame GPU execution (kGpuPhaseFrame, one
-            // frame late) rather than this frame's submit->fence wall — deliberately, so it stays
-            // comparable across the change and cannot read ~0 just because the block moved. The new
-            // `wait=` is the residual top-of-frame block, and it is what `total` actually contains:
-            // total = setup + cull + wait + record + post. `gpu` is alongside, not inside, it.
-            LOG::logline(">> [forge-hb] host split: setup=%.2f cull=%.2f record=%.2f gpu=%.2f wait=%.2f gpuOverlap=%.2f post=%.2f total=%.2fms"
+            // loads) + wait + record + post + other = the host's CPU frame. cull is the prime
+            // pre-record suspect.
+            //
+            // ⚠ `gpu=` IS NOT A TERM OF THAT SUM AND THE LINE NOW SAYS SO BY ITS SHAPE. It is the
+            // RESOLVED whole-frame GPU execution (kGpuPhaseFrame, one frame late) rather than this
+            // frame's submit->fence wall — deliberately, so it stays comparable across the change
+            // and cannot read ~0 just because the block moved. But it is the GPU's elapsed time, not
+            // time the host CPU spends, so listing it inline among the additive terms made the line
+            // read as a sum with `total=0.88` next to `gpu=5.38`. The CPU terms are bracketed
+            // together behind `cpu=` and the GPU sits outside them. `other` is the residual —
+            // tEntry..return minus the five bracketed spans, mostly settleFrameFence's readbacks and
+            // the submit — and it exists so the identity is CHECKABLE rather than approximately true.
+            // (The old name `total=` is now `cpu=`; nothing machine-parses it, and it was the word
+            // doing the lying.)
+            const double hbCpuNamed = g_lastSetupMs + g_lastCullMs + g_lastGpuWaitMs
+                                    + g_lastRecMs + g_lastPostMs;
+            const double hbCpuOther = (g_lastTotalMs > hbCpuNamed) ? (g_lastTotalMs - hbCpuNamed) : 0.0;
+            LOG::logline(">> [forge-hb] host split: cpu=%.2fms (setup=%.2f cull=%.2f wait=%.2f record=%.2f post=%.2f other=%.2f) | gpu=%.2f gpuOverlap=%.2f"
                          " | cull examined=%u survivors=%u (%.3f us/1k examined) | gpuCull=%u %s hizOccl=%u",
-                         g_lastSetupMs, g_lastCullMs, g_lastRecMs, g_lastGpuMs, g_lastGpuWaitMs, g_lastGpuOverlapMs, g_lastPostMs, g_lastTotalMs,
+                         g_lastTotalMs, g_lastSetupMs, g_lastCullMs, g_lastGpuWaitMs, g_lastRecMs,
+                         g_lastPostMs, hbCpuOther, g_lastGpuMs, g_lastGpuOverlapMs,
                          g_lastCullExamined, g_liveLastInst,
                          g_lastCullExamined ? (g_lastCullMs * 1000.0 / (g_lastCullExamined / 1000.0)) : 0.0,
                          g_lastGpuCullCount, (g_lastGpuCullCount == g_liveLastInst) ? "MATCH" : "MISMATCH",
@@ -36914,9 +37779,27 @@ void destroyHostWindow(Renderer* R);
                 std::snprintf(mbText, sizeof(mbText), "K%u %ux%u tiles",
                               g_lastMbK, g_lastMbTilesX, g_lastMbTilesY);
             } else if (!g_live.mbReady) {
-                std::snprintf(mbText, sizeof(mbText), "NOT BUILT");
+                // ⚠ NAME THE GATE. "NOT BUILT" is true and useless. Above 1x the blur needs a
+                // single-sample source and takes it from the resolve's compute pre-filter, so when
+                // THAT did not build the blur cannot exist either — for a reason that has nothing to
+                // do with the motion-blur knobs the reader just checked. Unnamed, this is how
+                // "motion blur is broken" gets reported from play against a build where it was never
+                // built: a wasted bisect that a word prevents.
+                if (g_live.sampleCount != 1) {
+                    std::snprintf(mbText, sizeof(mbText),
+                                  "NOT BUILT — MSAA %ux and no resolve pre-filter",
+                                  g_live.sampleCount);
+                } else {
+                    std::snprintf(mbText, sizeof(mbText), "NOT BUILT");
+                }
             } else if (!g_mbEnable) {
                 std::snprintf(mbText, sizeof(mbText), "off");
+            } else if (g_live.sampleCount != 1 && !g_lastRfRan) {
+                // Built, enabled, and starved: above 1x its only source is the pre-filter's output,
+                // and that pass is a live knob (resolveCompute) with a diameter limit behind it.
+                std::snprintf(mbText, sizeof(mbText),
+                              "ON but the resolve pre-filter did not run — no 1x source at MSAA %ux",
+                              g_live.sampleCount);
             } else {
                 // ⚠ THE STATE THAT SHIPPED BROKEN FOR ONE BUILD AND HAD NO NAME. `mbEnable` on,
                 // everything built, and no field to consume — which is what "there is no motion blur
@@ -36926,7 +37809,7 @@ void destroyHostWindow(Renderer* R);
                 // report from play.
                 std::snprintf(mbText, sizeof(mbText), "ON but NO FIELD — mv pass did not run");
             }
-            LOG::logline(">> [forge-hb] gpu split: cull=%.2f prepass=%.2f shadow=%.2f (st=%.2f dyn=%.2f sun=%.2f) postdepth=%.2f (lin=%.2f ao=%.2f mask=%.2f) reflect=%.2f color=%.2f water=%.2f caustic=%.2f grasscrush=%.2f(%u) mv=%.2f upscale=%.2f(%s) mb=%.2f(%s) bloom=%.2f(L%u) resolve=%.2f ms"
+            LOG::logline(">> [forge-hb] gpu split: cull=%.2f prepass=%.2f shadow=%.2f (st=%.2f dyn=%.2f sun=%.2f) postdepth=%.2f (lin=%.2f ao=%.2f[dn=%.2f srch=%.2f blr=%.2f up=%.2f] mask=%.2f) reflect=%.2f color=%.2f water=%.2f caustic=%.2f grasscrush=%.2f(%u) mv=%.2f upscale=%.2f(%s) mb=%.2f(%s) bloom=%.2f(L%u) rfilter=%.2f resolve=%.2f ms"
                          " | hiz=%.2f (prologue, overruns=%u) | shadowCasters=%u maskSlots=%u(dyn=%u)"
                          " | nearTris=%.2fM atDraws=%u"
                          " | atmos=%.2f (LUT chain, every frame)"
@@ -36938,6 +37821,8 @@ void destroyHostWindow(Renderer* R);
                          g_lastGpuPhaseMs[kGpuPhasePostDepth],
                          g_lastGpuPhaseMs[kGpuPhaseLinearize],
                          g_lastGpuPhaseMs[kGpuPhasePostDepth] - g_lastGpuPhaseMs[kGpuPhaseLinearize] - g_lastGpuPhaseMs[kGpuPhaseShadowMask],
+                         g_lastGpuPhaseMs[kGpuPhaseAODown],  g_lastGpuPhaseMs[kGpuPhaseAOSearch],
+                         g_lastGpuPhaseMs[kGpuPhaseAOBlur],  g_lastGpuPhaseMs[kGpuPhaseAOUp],
                          g_lastGpuPhaseMs[kGpuPhaseShadowMask],
                          g_lastGpuPhaseMs[kGpuPhaseReflect], g_lastGpuPhaseMs[kGpuPhaseColor],
                          g_lastGpuPhaseMs[kGpuPhaseWater],
@@ -36984,6 +37869,12 @@ void destroyHostWindow(Renderer* R);
                          // the distinction worth logging: a 0.00 with L7 would be a timing problem,
                          // with L0 it is a gate.
                          g_lastGpuPhaseMs[kGpuPhaseBloom], g_lastBloomLevels,
+                         // rfilter=<ms> — the resolve's separable LDS pre-filter, which used to be
+                         // INSIDE `resolve=` and moved above the motion blur so the blur could read
+                         // its output. ⚠ Add the two when comparing against anything measured before
+                         // 2026-09-05. A 0.00 with a non-zero `resolve=` is the frag tap loop doing
+                         // the work instead — resolveCompute off, diameter past 5.002, or 1x.
+                         g_lastGpuPhaseMs[kGpuPhaseResolveFilter],
                          g_lastGpuPhaseMs[kGpuPhaseResolve],
                          g_lastHizGpuMs, g_hizOverruns,
                          (unsigned)g_shadowCasters.size(),
@@ -37294,7 +38185,7 @@ void destroyHostWindow(Renderer* R);
         const char* linName = (g_live.sampleCount > 1) ? "linearizedepth_sc4.comp"
                                                        : "linearizedepth_sc1.comp";
         Shader* newLin  = nullptr;
-        Shader* newBlur = nullptr;
+        Shader* newBlur[kAOBlurModeCount] = {};
         Shader* newAO[kAOModeCount] = {};
         {
             ShaderLoadDesc lsd = {};
@@ -37305,9 +38196,11 @@ void destroyHostWindow(Renderer* R);
                 gsd.mComp.pFileName = kAOShaderFiles[m];
                 addShader(R, &gsd, &newAO[m]);
             }
-            ShaderLoadDesc absd = {};
-            absd.mComp.pFileName = "aoblur.comp";
-            addShader(R, &absd, &newBlur);
+            for (uint32_t b = 0; b < kAOBlurModeCount; ++b) {
+                ShaderLoadDesc absd = {};
+                absd.mComp.pFileName = kAOBlurShaderFiles[b];
+                addShader(R, &absd, &newBlur[b]);
+            }
         }
         bool aoShadersOk = true;
         for (uint32_t m = 0; m < kAOModeCount; ++m) {
@@ -37316,10 +38209,16 @@ void destroyHostWindow(Renderer* R);
                 aoShadersOk = false;
             }
         }
-        if (!newLin || !aoShadersOk || !newBlur) {
+        for (uint32_t b = 0; b < kAOBlurModeCount; ++b) {
+            if (!newBlur[b]) {
+                LOG::logline("!! [forge] hot-reload addShader(%s) FAILED", kAOBlurShaderFiles[b]);
+                aoShadersOk = false;
+            }
+        }
+        if (!newLin || !aoShadersOk) {
             // Give back whatever DID load; touch nothing that is running.
             if (newLin)  { removeShader(R, newLin); }
-            if (newBlur) { removeShader(R, newBlur); }
+            for (uint32_t b = 0; b < kAOBlurModeCount; ++b) { if (newBlur[b]) { removeShader(R, newBlur[b]); } }
             for (uint32_t m = 0; m < kAOModeCount; ++m) { if (newAO[m]) { removeShader(R, newAO[m]); } }
             LOG::logline("!! [forge] hot-reload ABANDONED (dxil missing or mid-write) —"
                          " previous shaders KEPT, will retry"); LOG::flush();
@@ -37336,8 +38235,11 @@ void destroyHostWindow(Renderer* R);
         }
         removePipeline(R, g_live.pLinearizePipeline);  g_live.pLinearizePipeline = nullptr;
         removeShader(R, g_live.pLinearizeShader);      g_live.pLinearizeShader = newLin;
-        removePipeline(R, g_live.pAOBlurPipeline);     g_live.pAOBlurPipeline = nullptr;
-        removeShader(R, g_live.pAOBlurShader);         g_live.pAOBlurShader = newBlur;
+        for (uint32_t b = 0; b < kAOBlurModeCount; ++b) {
+            if (g_live.pAOBlurPipeline[b]) { removePipeline(R, g_live.pAOBlurPipeline[b]); g_live.pAOBlurPipeline[b] = nullptr; }
+            if (g_live.pAOBlurShader[b])   { removeShader(R, g_live.pAOBlurShader[b]); }
+            g_live.pAOBlurShader[b] = newBlur[b];
+        }
         // The half-res chain's two shaders reload with the rest. Its DESCRIPTOR SETS are bound to
         // the (unchanged) root signature and stay valid, exactly like the full-res ones.
         if (g_live.pAODownPipeline) { removePipeline(R, g_live.pAODownPipeline); g_live.pAODownPipeline = nullptr; }
@@ -37355,10 +38257,12 @@ void destroyHostWindow(Renderer* R);
             gpd.mComputeDesc.pShaderProgram = g_live.pAOShader[m];
             addPipeline(R, &gpd, &g_live.pAOPipeline[m]);
         }
-        PipelineDesc abpd = {};
-        abpd.mType = PIPELINE_TYPE_COMPUTE;
-        abpd.mComputeDesc.pShaderProgram = g_live.pAOBlurShader;
-        addPipeline(R, &abpd, &g_live.pAOBlurPipeline);
+        for (uint32_t b = 0; b < kAOBlurModeCount; ++b) {
+            PipelineDesc abpd = {};
+            abpd.mType = PIPELINE_TYPE_COMPUTE;
+            abpd.mComputeDesc.pShaderProgram = g_live.pAOBlurShader[b];
+            addPipeline(R, &abpd, &g_live.pAOBlurPipeline[b]);
+        }
         // Half-res chain. A failure here only clears aoHalfReady (the toggle goes inert and the
         // full-res path keeps running) — it must not take the whole reload down with it.
         if (g_live.pLinearDepthHalf && g_live.pAOHalf && g_live.pAOBlurHalf && g_live.pAOUpCbv) {
@@ -38369,6 +39273,7 @@ void destroyHostWindow(Renderer* R);
             return 0;
         }
         Renderer* R = g_live.pRenderer;
+        const uint64_t vram0 = vramNow(R);   // bracket: attribute only THIS call's allocation
         const uint8_t* p   = (const uint8_t*)blob;
         const uint8_t* end = p + byteCount;
         unsigned built = 0;
@@ -38478,6 +39383,9 @@ void destroyHostWindow(Renderer* R);
         // One upload-engine flush for the whole batch (else textures stay black). Replaces the
         // former per-texture fence — the batch is window-bounded so this is a single short wait.
         if (built) { flushTextureUploads(R); }
+        // Sampled AFTER the flush, so the driver has committed the batch; before it, this call's
+        // textures would be attributed to whatever ran next.
+        if (vram0) { g_vramTexBytes += (std::int64_t)vramNow(R) - (std::int64_t)vram0; }
         return built;
     }
 
@@ -47677,6 +48585,7 @@ void destroyHostWindow(Renderer* R);
         double tLoopMs = 0.0, tStaticMs = 0.0, tArenaMs = 0.0;
         const uint8_t* p   = (const uint8_t*)blobBytes;
         const uint8_t* end = p + byteCount;
+        const uint64_t vramGeo0 = vramNow(g_live.pRenderer);   // bracket: this call only
         unsigned built = 0;
         bool anyStatic = false;   // any per-mesh addResource (skinned) -> waitForAllResourceLoads
         bool anyArena  = false;   // any arena begin/endUpdateResource -> flushResourceUpdates
@@ -47694,13 +48603,23 @@ void destroyHostWindow(Renderer* R);
             // RELEASE sentinel (header-only, no payload): the client's cache evicted this object
             // (picked up / despawned / disabled — or the whole cell on a transition). Forget its
             // shadow-caster record so its shadow stops ghosting in place; bump g_casterEpoch so
-            // covering shadow slots re-render without it. ARENA parts also free their VB/IB
-            // ranges back to the free list — pure bookkeeping, no D3D12 resource is destroyed —
-            // so a cell reload reuses the old cell's ~GBs instead of doubling the arena (2048→
-            // 4096 MB grow → addBuffer AV = the 2026-07-10 black screens). Per-mesh skinned/MM
-            // buffers keep the old keep-buffers behaviour: destroying a live ID3D12Resource an
-            // in-flight frame might still reference is a different hazard, and they're a small
-            // fraction of the bytes.
+            // covering shadow slots re-render without it. ARENA parts free their VB/IB ranges back
+            // to the free list — pure bookkeeping, no D3D12 resource is destroyed — so a cell
+            // reload reuses the old cell's ~GBs instead of doubling the arena (2048→4096 MB grow →
+            // addBuffer AV = the 2026-07-10 black screens).
+            //
+            // ALL THREE populations release here. The dynamic ring and the per-mesh skinned/MM
+            // buffers used to be exempt ("a small fraction of the bytes"); geo-ledger disproved the
+            // size claim outright — static live 252 MB across 40395 creates / 7293 destroys, i.e.
+            // 33,102 meshes never released, and `dyn destroys` = 0 EXACTLY. Zero is not a small
+            // number, it is a branch that never ran: the only static destroys came from the
+            // shape-change path below, and a dynamic mesh is promoted PRECISELY because it
+            // re-uploads the same shape every frame, so that path can never fire for one.
+            // 64 KB resource alignment turns those 252 MB of logical data into ~4.2 GB of committed
+            // blocks, which is the +3679 MB `vram-stream: geometry` that puts DXGI usage over
+            // budget and drops the frame from 105 to 64 fps on driver paging.
+            // The in-flight-resource hazard that justified the exemption is answered, not ignored:
+            // releaseMeshBuffers PARKS them in g_bufRetire, drained only after the frame fence.
             if (hdr.flags & IPC::kGeomFlagRelease) {
                 if (hdr.slot < g_meshHigh) {
                     HostMesh& rm = g_meshes[hdr.slot];
@@ -47724,7 +48643,7 @@ void destroyHostWindow(Renderer* R);
                     rm.prevBoneFrame  = 0;   // MB-1b: ...and no bone-palette pair either
                     rm.everMoved      = false;
                     rm.lastMoveFrame  = 0;
-                    if (rm.valid && rm.inArena) {
+                    if (rm.valid) {
                         releaseMeshBuffers(rm);
                         rm.valid = false;
                         rm.uploadStreak = 0;
@@ -47910,6 +48829,7 @@ void destroyHostWindow(Renderer* R);
                     // cap did not predict, and it costs six pointer tests once per promotion.
                     m.bufBytes = ringBytes;
                     g_meshBufBytes += ringBytes;
+                    g_geoDyn.createdBytes += ringBytes; ++g_geoDyn.creates;
                     if (g_meshBufBytes > g_meshBufPeak) { g_meshBufPeak = g_meshBufBytes; }
                     for (uint32_t r = 0; r < kGeomRing; ++r) {
                         if (!m.dynVb[r] || !m.dynIb[r]) { ringOk = false; }
@@ -48002,6 +48922,11 @@ void destroyHostWindow(Renderer* R);
                 m.vbOff   = vbo;
                 m.ibOff   = ibo;
                 m.vb = m.ib = nullptr;
+                // Arena slots never set m.bufBytes (they own no D3D12 resource, so the mesh budget
+                // does not apply), hence the ledger charges the SUBALLOCATION size and credits the
+                // same expression releaseMeshBuffers uses. Tracked mainly to prove the arena is NOT
+                // the 3 GB — it is a fixed 256 MB buffer, so any large number here is a bug in me.
+                g_geoArena.createdBytes += vbBytes + ibBytes; ++g_geoArena.creates;
                 anyArena = true;
             } else {
                 // ⚠ ASK THE BUDGET BEFORE ASKING D3D12. addBuffer AVs on a refused allocation
@@ -48040,6 +48965,7 @@ void destroyHostWindow(Renderer* R);
                 addResource(&ibDesc, nullptr);
                 m.bufBytes = vbBytes + ibBytes;
                 g_meshBufBytes += m.bufBytes;
+                g_geoStatic.createdBytes += m.bufBytes; ++g_geoStatic.creates;
                 if (g_meshBufBytes > g_meshBufPeak) { g_meshBufPeak = g_meshBufBytes; }
                 anyStatic = true;
             }
@@ -48130,6 +49056,10 @@ void destroyHostWindow(Renderer* R);
             LOG::logline("-- [forge] uploadGeometry SLOW %.2fms (loop=%.2f staticWait=%.2f arenaFlush=%.2f) parts=%u bytes=%u",
                          totalMs, tLoopMs, tStaticMs, tArenaMs, partCount, byteCount);
         }
+        // The other half: mesh arenas + per-part buffers. `pools:` already tracks arena BYTES, so a
+        // divergence between that and this is itself a finding (driver overhead, or buffers living
+        // outside the arena accounting).
+        if (vramGeo0) { g_vramGeoBytes += (std::int64_t)vramNow(g_live.pRenderer) - (std::int64_t)vramGeo0; }
         return built;
     }
 
@@ -48211,6 +49141,10 @@ void destroyHostWindow(Renderer* R);
         // settled every submission, so freeing them here is safe.
         for (Texture* t : g_texRetire) { removeResource(t); }
         g_texRetire.clear();
+        // freeMeshStore() above already drained the geometry queue; belt-and-braces for any path
+        // that parks a buffer between there and here.
+        for (Buffer* b : g_bufRetire) { removeResource(b); }
+        g_bufRetire.clear();
         // Phase 2 texture teardown: distinct uploaded textures, then the shared default.
         for (uint32_t i = 0; i < g_live.texHigh; ++i) {
             if (g_live.pTextures[i] && g_live.pTextures[i] != g_live.pDefaultWhite) {
@@ -48569,12 +49503,16 @@ void destroyHostWindow(Renderer* R);
         if (g_live.pGtaoBatchSet)   { removeDescriptorSet(R, g_live.pGtaoBatchSet); }
         if (g_live.pLinearizeSet)   { removeDescriptorSet(R, g_live.pLinearizeSet); }
         if (g_live.pMvSet)          { removeDescriptorSet(R, g_live.pMvSet); }
-        if (g_live.pAOBlurPipeline) { removePipeline(R, g_live.pAOBlurPipeline); }
+        for (uint32_t b = 0; b < kAOBlurModeCount; ++b) {
+            if (g_live.pAOBlurPipeline[b]) { removePipeline(R, g_live.pAOBlurPipeline[b]); }
+        }
         for (uint32_t m = 0; m < kAOModeCount; ++m) {
             if (g_live.pAOPipeline[m]) { removePipeline(R, g_live.pAOPipeline[m]); }
         }
         if (g_live.pLinearizePipeline) { removePipeline(R, g_live.pLinearizePipeline); }
-        if (g_live.pAOBlurShader)   { removeShader(R, g_live.pAOBlurShader); }
+        for (uint32_t b = 0; b < kAOBlurModeCount; ++b) {
+            if (g_live.pAOBlurShader[b]) { removeShader(R, g_live.pAOBlurShader[b]); }
+        }
         for (uint32_t m = 0; m < kAOModeCount; ++m) {
             if (g_live.pAOShader[m]) { removeShader(R, g_live.pAOShader[m]); }
         }
@@ -48654,6 +49592,10 @@ void destroyHostWindow(Renderer* R);
         if (g_live.pAtmosTransmittance) { removeResource(g_live.pAtmosTransmittance);     g_live.pAtmosTransmittance = nullptr; }
         g_live.atmosReady = false;
         // Custom MSAA resolve (step 4) — same set -> pipeline -> shader -> buffer order.
+        if (g_live.pRFSet)           { removeDescriptorSet(R, g_live.pRFSet);      g_live.pRFSet = nullptr; }
+        if (g_live.pRFPipeline)      { removePipeline(R, g_live.pRFPipeline);      g_live.pRFPipeline = nullptr; }
+        if (g_live.pRFShader)        { removeShader(R, g_live.pRFShader);          g_live.pRFShader = nullptr; }
+        if (g_live.pResolveFiltered) { removeResource(g_live.pResolveFiltered);    g_live.pResolveFiltered = nullptr; }
         if (g_live.pResolveSet)      { removeDescriptorSet(R, g_live.pResolveSet); g_live.pResolveSet = nullptr; }
         if (g_live.pResolvePipeline) { removePipeline(R, g_live.pResolvePipeline); g_live.pResolvePipeline = nullptr; }
         if (g_live.pResolveShader)   { removeShader(R, g_live.pResolveShader);     g_live.pResolveShader = nullptr; }
@@ -48721,6 +49663,7 @@ void destroyHostWindow(Renderer* R);
         if (g_live.pAOBlur)         { removeResource(g_live.pAOBlur); }
         if (g_live.pAO)             { removeResource(g_live.pAO); }
         if (g_live.pLinearDepth)    { removeResource(g_live.pLinearDepth); }
+        if (g_live.pMbVelocity)     { removeResource(g_live.pMbVelocity); g_live.pMbVelocity = nullptr; }
         if (g_live.pMotionVectors)  { removeResource(g_live.pMotionVectors); }
         if (g_live.pMvParamsCbv)    { removeResource(g_live.pMvParamsCbv); }
         if (g_live.pMvStats)        { removeResource(g_live.pMvStats); }

@@ -343,6 +343,17 @@
 #include "resolve.frag.fsl"
 #end
 
+// The resolve FILTER, lifted into compute (resolvefilter.comp.fsl). Same Catmull-Rom, separable and
+// LDS-shared, writing an fp16 1x intermediate that resolve.frag then tonemaps. Only the 4x variant
+// exists: MSAA 4x is what ships, RF_RADIUS is a compile-time 2, and every other configuration keeps
+// the fragment path — which stays in the build as the reference and the A/B partner.
+//
+// COMPUTE, so it hot-reloads with F8, unlike the frag it was carved out of.
+#comp resolvefilter_sc4.comp
+#define SAMPLE_COUNT 4
+#include "resolvefilter.comp.fsl"
+#end
+
 #frag resolve_sc8.frag
 #define SAMPLE_COUNT 8
 #include "resolve.frag.fsl"
@@ -488,8 +499,22 @@
 #end
 
 // AO bilateral blur: third compute pass — denoises pAO -> pAOBlur (depth-aware, no silhouette bleed).
+//
+// THREE binaries off one body (the ssaofast/vbao construction). The host picks between them with
+// the aoBlurMode knob, so separability and width can be A/B'd as two separate questions:
+//   0  aoblur.comp      2D, radius 3, 49 taps          — the reference
+//   1  aoblursep.comp   separable, radius 3            — same reach, ~2x cheaper
+//   2  aoblurwide.comp  separable, radius 6            — double reach, still cheaper than mode 0
 #comp aoblur.comp
 #include "aoblur.comp.fsl"
+#end
+
+#comp aoblursep.comp
+#include "aoblursep.comp.fsl"
+#end
+
+#comp aoblurwide.comp
+#include "aoblurwide.comp.fsl"
 #end
 
 // Half-res AO chain (the "AO half-res" panel toggle; default OFF, so the full-res path above stays

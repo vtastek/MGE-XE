@@ -1,0 +1,11 @@
+// mgeHost64 — AO bilateral blur, SEPARABLE at the same radius as aoblur.comp.
+//
+// Mode 1 of three. A separate BINARY, not a separate algorithm: same body, same weights, same two
+// accumulators, compiled with the two-pass path enabled. This is the arm that isolates SEPARABILITY
+// from WIDTH — it must cost less than aoblur.comp and look all but identical to it, and if it does
+// not, that is the finding. aoblurwide.comp is the one that changes the picture.
+//
+// Same construction as ssaofast.comp.fsl over vbao: one body, several #comp entries in
+// shaders.list, each with its own #define.
+#define AO_BLUR_SEPARABLE 1
+#include "aoblur.comp.fsl"

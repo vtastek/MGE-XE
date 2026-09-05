@@ -1,0 +1,188 @@
+// mgeHost64 — MSAA resolve FILTER (compute). The Catmull-Rom reconstruction from resolve.frag,
+// moved into compute so it can share its taps through LDS, and factored into two 1-D passes.
+//
+// WHY. Measured 2026-09-05, the fragment version was 2.14 ms at 2560x1600 MSAA 4x and it is
+// LOAD-THROUGHPUT bound — ~0.036 ms per MSAA-Load-per-pixel, fitted across a 4x range of tap
+// counts with no fixed floor ([[project_forge_resolve_is_load_bound]]). It issues 64 loads per
+// output pixel (the +-2 box is 100, and the support test already rejects 36 of them), so an 8x8
+// group issues 64 x 64 = 4096 loads to read a 12x12 neighbourhood x 4 samples = 576 unique values.
+// 7.1x redundant, and redundancy is the entire cost.
+//
+// TWO INDEPENDENT REDUCTIONS, and both are EXACT — this pass is bit-comparable to the fragment one
+// up to floating-point summation order:
+//
+//   1. SEPARABLE. The weight is literally a product of two 1-D evaluations,
+//      rFilterCubic(distX) * rFilterCubic(distY), and the support test `all(sampleDist <= 1)` is
+//      per-axis — so zeroing each axis independently reproduces it exactly. 5x5 taps become 5 + 5.
+//      (Contrast aoblur.comp.fsl, where the range weight is jointly 2-D and separating it is an
+//      approximation. Here there is nothing to approximate.)
+//
+//   2. LDS. The horizontal partials for the group's 8 output columns are computed once over all
+//      12 rows the vertical pass reaches, and every output row shares them.
+//
+// Per thread: 9 MSAA loads instead of 64, and 20 per-axis cubic evaluations instead of 128.
+//
+// ONE SAMPLE PLANE AT A TIME. Staging all four planes at once would be 576 + 384 float4 = 15 KB of
+// LDS and about four groups per SM; iterating the sample loop outside the staging keeps it to
+// 144 + 96 = 3840 B, and the accumulator carries across iterations. The cost is three barriers per
+// sample instead of two overall, which at 64 threads (two waves) is cheap.
+//
+// ⚠ NO EARLY-OUT. Out-of-rect threads run the whole sample loop and simply do not write: a
+// divergent RETURN() ahead of a GroupMemoryBarrier is undefined behaviour, and those threads own
+// tile slots their in-rect neighbours read.
+
+#include "resolvefilter.srt.h"
+
+#define RF_RADIUS 2                        // filtRad 2 == the shipped diameter 4. See the host note.
+#define RF_TILE   (8 + 2 * RF_RADIUS)      // 12
+#define RF_TAPS   (2 * RF_RADIUS + 1)      // 5
+
+GroupShared(float4, g_rfRaw[RF_TILE * RF_TILE]);   // one sample plane, staged and firefly-rescaled
+GroupShared(float4, g_rfH  [8 * RF_TILE]);         // horizontal partials: 8 output columns x 12 rows
+
+// MJP's FilterCubic. B=0, C=0.5 is Catmull-Rom. Copied from resolve.frag.fsl rather than shared —
+// that file is written against ResolveSrtData and this pass has its own. Keep the two in step.
+float rfFilterCubic(float x, float B, float C)
+{
+    float y  = 0.0f;
+    float x2 = x * x;
+    float x3 = x2 * x;
+    if (x < 1.0f)
+    {
+        y = (12.0f - 9.0f * B - 6.0f * C) * x3 + (-18.0f + 12.0f * B + 6.0f * C) * x2 + (6.0f - 2.0f * B);
+    }
+    else if (x <= 2.0f)
+    {
+        y = (-B - 6.0f * C) * x3 + (6.0f * B + 30.0f * C) * x2 + (-12.0f * B - 48.0f * C) * x + (8.0f * B + 24.0f * C);
+    }
+    return y / 6.0f;
+}
+
+float rfLuminance(float3 c)
+{
+    return dot(c, float3(0.299f, 0.587f, 0.114f));
+}
+
+ROOT_SIGNATURE(ComputeRootSignature)
+NUM_THREADS(8, 8, 1)
+void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
+{
+    INIT_MAIN;
+
+    // D3D standard multisample patterns, same tables as resolve.frag.fsl.
+#if SAMPLE_COUNT == 8
+    float2 subOffsets[8] = {
+        float2( 0.0625f, -0.1875f), float2(-0.0625f,  0.1875f),
+        float2( 0.3125f,  0.0625f), float2(-0.1875f, -0.3125f),
+        float2(-0.3125f,  0.3125f), float2(-0.4375f, -0.0625f),
+        float2( 0.1875f,  0.4375f), float2( 0.4375f, -0.4375f)
+    };
+#elif SAMPLE_COUNT == 4
+    float2 subOffsets[4] = {
+        float2(-0.125f, -0.375f), float2( 0.375f, -0.125f),
+        float2(-0.375f,  0.125f), float2( 0.125f,  0.375f)
+    };
+#elif SAMPLE_COUNT == 2
+    float2 subOffsets[2] = {
+        float2( 0.25f,  0.25f), float2(-0.25f, -0.25f)
+    };
+#else
+    float2 subOffsets[1] = { float2(0.0f, 0.0f) };
+#endif
+
+    int2   px      = int2(DispatchThreadID.xy);
+    float2 texSize = gRFParams.dims.xy;
+    float  filtRad = max(gRFParams.dims.z, 0.001f) * 0.5f;
+    float  invLuma = gRFParams.opts.x;
+    float  cubicC  = gRFParams.opts.z;
+
+    uint2 lane = DispatchThreadID.xy & 7u;
+    uint2 tile = DispatchThreadID.xy >> 3u;
+    uint  tid  = lane.y * 8u + lane.x;
+    int2  org  = int2(tile) * 8 - RF_RADIUS;
+    // Clamp to the RENDER rect, not the allocation — the texels outside were never written this
+    // frame. Same bound the fragment version applied per tap.
+    int2  maxP = int2((int)texSize.x - 1, (int)texSize.y - 1);
+
+    // ONE accumulator over all four channels — rgb and coverage are one premultiplied vector and
+    // take the same weight. See resolve.srt.h; getting this wrong produced two visible seams.
+    float4 sum         = float4(0.0f, 0.0f, 0.0f, 0.0f);
+    float  totalWeight = 0.0f;
+
+    UNROLL for (int s = 0; s < SAMPLE_COUNT; ++s)
+    {
+        // Per-axis weights: 2 * RF_TAPS cubic evaluations for this sample, serving RF_TAPS^2 taps.
+        // The support test is per-axis in the fragment version too (`all(sampleDist <= 1)`), so
+        // zeroing an axis here reproduces it exactly — the product is zero iff either axis fails.
+        float wx[RF_TAPS];
+        float wy[RF_TAPS];
+        float swx = 0.0f;
+        float swy = 0.0f;
+        UNROLL for (int k = -RF_RADIUS; k <= RF_RADIUS; ++k)
+        {
+            float dx = abs(float(k) + subOffsets[s].x) / filtRad;
+            float dy = abs(float(k) + subOffsets[s].y) / filtRad;
+            wx[k + RF_RADIUS] = (dx <= 1.0f) ? rfFilterCubic(dx * 2.0f, 0.0f, cubicC) : 0.0f;
+            wy[k + RF_RADIUS] = (dy <= 1.0f) ? rfFilterCubic(dy * 2.0f, 0.0f, cubicC) : 0.0f;
+            swx += wx[k + RF_RADIUS];
+            swy += wy[k + RF_RADIUS];
+        }
+
+        // WAR barrier: the previous iteration's readers must be finished before this one overwrites
+        // the tile. Harmless on s == 0.
+        GroupMemoryBarrier();
+        UNROLL_N(3) for (uint i = tid; i < uint(RF_TILE * RF_TILE); i += 64u)
+        {
+            int2   sp  = clamp(org + int2(int(i % uint(RF_TILE)), int(i / uint(RF_TILE))),
+                               int2(0, 0), maxP);
+#if SAMPLE_COUNT > 1
+            float4 smp = max(LoadTex2DMS(gRFSource, NO_SAMPLER, sp, s), float4(0.0f, 0.0f, 0.0f, 0.0f));
+#else
+            float4 smp = max(LoadTex2D(gRFSource, NO_SAMPLER, sp, 0), float4(0.0f, 0.0f, 0.0f, 0.0f));
+#endif
+            // ⚠ THE FIREFLY GUARD RESCALES THE SAMPLE, NEVER THE KERNEL WEIGHT — the full argument
+            // is in resolve.frag.fsl and it is not optional: folding 1/(1+L) into a signed
+            // Catmull-Rom weight drove totalWeight negative and produced black pixels inside a
+            // flame. Applied here, at staging, it is a per-sample radiometric rescale exactly as
+            // there, and it commutes with the separable filter because it touches the SAMPLE.
+            //
+            // ⚠ RGB ONLY. A radiometric scale takes rgb and leaves coverage alone; a filter weight
+            // takes all four.
+            if (invLuma > 0.5f)
+            {
+                smp.rgb *= 1.0f / (1.0f + rfLuminance(smp.rgb));
+            }
+            g_rfRaw[i] = smp;
+        }
+        GroupMemoryBarrier();
+
+        // Horizontal pass: one partial per (output column, tile row). 8 * RF_TILE entries over 64
+        // threads. Every output ROW in the group reads these, which is the whole point.
+        UNROLL_N(2) for (uint e = tid; e < 8u * uint(RF_TILE); e += 64u)
+        {
+            uint   c = e & 7u;          // output column within the group
+            uint   r = e >> 3u;         // tile row
+            float4 h = float4(0.0f, 0.0f, 0.0f, 0.0f);
+            UNROLL for (int x = 0; x < RF_TAPS; ++x)
+            {
+                h += g_rfRaw[r * uint(RF_TILE) + c + uint(x)] * wx[x];
+            }
+            g_rfH[e] = h;
+        }
+        GroupMemoryBarrier();
+
+        // Vertical pass. totalWeight factorises the same way the sum does:
+        // sum_s sum_x sum_y wx*wy == sum_s (sum_x wx)(sum_y wy).
+        UNROLL for (int y = 0; y < RF_TAPS; ++y)
+        {
+            sum         += g_rfH[(lane.y + uint(y)) * 8u + lane.x] * wy[y];
+            totalWeight += swx * wy[y];
+        }
+    }
+
+    if (px.x < (int)texSize.x && px.y < (int)texSize.y)
+    {
+        Write2D(gRFOut, px, sum / max(totalWeight, 1.0e-5f));
+    }
+    RETURN();
+}

@@ -181,6 +181,10 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
     }
 
     Write2D(gMvOut, px, mv);
+    // MB-2d: the blur's field. Zero in object-only mode — the static world contributes no motion, so
+    // every pixel the object pass does not cover falls under the velocity floor and is left sharp.
+    // At gain 1 this is a copy of gMvOut and the blur is the classic full-frame one.
+    Write2D(gMvBlurOut, px, (gMvParams.opts.z > 0.5f) ? float2(0.0f, 0.0f) : mv);
     Write2D(gMvReactive, px, reactive);
 
     // ─── THE FIELD MEASURES ITSELF ───────────────────────────────────────────────────────────────

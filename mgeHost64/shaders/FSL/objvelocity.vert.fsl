@@ -38,6 +38,13 @@ STRUCT(VSOutput)
     // is the same — do the subtraction where both operands came through identical arithmetic.
     DATA(float4, PrevClip, TEXCOORD0);
     DATA(float4, CurClip,  TEXCOORD1);
+    // MB-2d: the SAME model point under THIS frame's pose, seen by LAST frame's camera — i.e. where
+    // this vertex would have been if the object had not moved and only the camera had. The frag
+    // differences it against PrevClip to get motion relative to the world, and that subtraction is
+    // exact for the reason the CurClip note above gives: both operands are interpolated attributes
+    // divided by their own w, so a stationary object under a moving camera cancels to EXACTLY zero
+    // rather than to rounding. [[feedback_interpolated_difference_trap]]
+    DATA(float4, PrevStatic, TEXCOORD2);
 };
 
 ROOT_SIGNATURE(DefaultRootSignature)
@@ -64,6 +71,10 @@ VSOutput VS_MAIN( VSInput In )
     // — which is what a motion vector is.
     float4 prevWorldPos = mul(gObjVelBatch.prevWorlds[idx], p);
     Out.PrevClip = mul(gObjVelParams.prevViewProjRel, prevWorldPos);
+    // ...and the CURRENT world position through the PREVIOUS camera. One extra matrix multiply, at
+    // vertex rate, on a pass that already rasterises exactly the movers — which is the whole reason
+    // object-only blur costs nothing here and would have cost a full-screen pass anywhere else.
+    Out.PrevStatic = mul(gObjVelParams.prevViewProjRel, worldPos);
 
     RETURN(Out);
 }

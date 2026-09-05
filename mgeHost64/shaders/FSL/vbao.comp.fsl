@@ -136,10 +136,21 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
                 // Front angle from the visible surface; back angle from the same point pushed
                 // AWAY from the eye by the thickness. Pushing away can only increase the angle
                 // from V, so the pair always brackets a real span.
-                float  aF = sgn * acos(clamp(dot(d, V), -1.0f, 1.0f));
-                float3 dB = ds - V * thick;
-                float  bl = max(length(dB), 1e-6f);
-                float  aB = sgn * acos(clamp(dot(dB / bl, V), -1.0f, 1.0f));
+                //
+                // The back angle is taken WITHOUT building dB, normalising it and dotting it with
+                // V again. |V| == 1, so with dsV = dot(ds, V) the two quantities the cosine needs
+                // are
+                //
+                //     dot(dB, V) = dsV - thick
+                //     |dB|^2     = dl*dl - 2*thick*dsV + thick*thick
+                //
+                // -- a float3 construct, a length() and a 3-way divide replaced by two fma and an
+                // rsqrt, for the same cosine. max(|dB|, 1e-6)^2 == max(|dB|^2, 1e-12) because both
+                // sides are non-negative. dot(d, V) is dsV/dl by the same identity.
+                float  dsV = dot(ds, V);
+                float  aF  = sgn * aoAcos(clamp(dsV / dl, -1.0f, 1.0f));
+                float  bl2 = max(dl * dl - 2.0f * thick * dsV + thick * thick, 1e-12f);
+                float  aB  = sgn * aoAcos(clamp((dsV - thick) * rsqrt(bl2), -1.0f, 1.0f));
 
                 float lo = min(aF, aB);
                 float hi = max(aF, aB);

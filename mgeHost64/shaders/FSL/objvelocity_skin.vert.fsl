@@ -45,6 +45,10 @@ STRUCT(VSOutput)
     // semantics are a contract with that file, not a local choice.
     DATA(float4, PrevClip, TEXCOORD0);
     DATA(float4, CurClip,  TEXCOORD1);
+    // MB-2d — see objvelocity.vert.fsl. ⚠ Byte-for-byte the signature objvelocity.frag declares: a
+    // frag reading an output its vert does not emit HANGS THE GPU, so this member is as much a
+    // contract as the two above it ([[project_forge_shared_frag_vsoutput]]).
+    DATA(float4, PrevStatic, TEXCOORD2);
 };
 
 ROOT_SIGNATURE(DefaultRootSignature)
@@ -89,6 +93,9 @@ VSOutput VS_MAIN( VSInput In )
                         + In.Weights.w * mul(p3, pos);
 
     Out.PrevClip = mul(gObjVelParams.prevViewProjRel, prevWorldPos);
+    // The CURRENT skinned position through the PREVIOUS camera — the object-only reference. Uses
+    // worldPos (this frame's bones), NOT prevWorldPos: the difference between them IS the motion.
+    Out.PrevStatic = mul(gObjVelParams.prevViewProjRel, worldPos);
 
     RETURN(Out);
 }

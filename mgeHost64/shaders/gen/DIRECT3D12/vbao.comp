@@ -972,7 +972,7 @@ SamplerState gSampler2xWrapClamp : register( s17 , space100 ) ;
 #line 247 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/../../../3rdparty/The-Forge/Common_3/Graphics/FSL/defaults.h"
 
 #line 11 "FSL/shaders.list"
-#line 482 "FSL/shaders.list"
+#line 493 "FSL/shaders.list"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/vbao.comp.fsl"
 #line 25 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/vbao.comp.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/gtao.srt.h"
@@ -1183,6 +1183,14 @@ float aoFalloffWeight(float dl)
 {
     return saturate(1.0f - dl / aoFalloff());
 }
+#line 322 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/aocommon.h.fsl"
+float aoAcos(float x)
+{
+    float ax = abs(x);
+    float r = sqrt(max(1.0f - ax, 0.0f)) *
+               (1.5707288f + ax * (-0.2121144f + ax * (0.0742610f + ax * (-0.0187293f))));
+    return (x >= 0.0f) ? r : ( 3.14159265359f  - r);
+}
 
 
 
@@ -1253,7 +1261,7 @@ float gtaoArc(float a, float b, float n)
     }
     return gtaoInner(a, n) + gtaoInner(b, n);
 }
-#line 399 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/aocommon.h.fsl"
+#line 421 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/aocommon.h.fsl"
 float4 aoResolve(float occ, float3 bentSum, float3 refSum, float3 N)
 {
     float vis = saturate(1.0f - saturate(occ) * aoIntensity());
@@ -1380,14 +1388,11 @@ void CS_MAIN( uint3 DispatchThreadID : SV_DISPATCHTHREADID )
                 {
                     continue;
                 }
-
-
-
-
-                float aF = sgn * acos(clamp(dot(d, V), -1.0f, 1.0f));
-                float3 dB = ds - V * thick;
-                float bl = max(length(dB), 1e-6f);
-                float aB = sgn * acos(clamp(dot(dB / bl, V), -1.0f, 1.0f));
+#line 150 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/vbao.comp.fsl"
+                float dsV = dot(ds, V);
+                float aF = sgn * aoAcos(clamp(dsV / dl, -1.0f, 1.0f));
+                float bl2 = max(dl * dl - 2.0f * thick * dsV + thick * thick, 1e-12f);
+                float aB = sgn * aoAcos(clamp((dsV - thick) * rsqrt(bl2), -1.0f, 1.0f));
 
                 float lo = min(aF, aB);
                 float hi = max(aF, aB);
@@ -1425,4 +1430,4 @@ void CS_MAIN( uint3 DispatchThreadID : SV_DISPATCHTHREADID )
     Write2D(gAOOut, px, aoResolve(occSum / float(slices), bentSum, refSum, N));
     return;
 }
-#line 483 "FSL/shaders.list"
+#line 494 "FSL/shaders.list"

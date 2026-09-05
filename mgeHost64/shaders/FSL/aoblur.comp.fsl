@@ -38,14 +38,75 @@
 
 #include "aoblur.srt.h"
 
-// 7x7 tap budget. The spatial sigma (px) sets the effective extent only UP TO this radius: at
-// sigma 1.5 the corner tap is already at exp(-4) and the Gaussian is genuinely resolved, while at
-// sigma 4 every weight in the kernel lies between 0.57 and 1.0 and this is a box filter wearing a
-// Gaussian's name. That matters because a box filter cannot preserve a narrow dark valley — it
-// raises the crease and pushes its darkness outward. If more smoothing is ever needed than sigma
-// ~1.5 buys, the answer is a wider kernel (separable, or a-trous with a stride that does not alias
-// aoDither's 4x4 tile), NOT a larger sigma against these same 49 taps.
-#define BLUR_RADIUS 3
+// TAP BUDGET AND ITS SHAPE. The spatial sigma (px) sets the effective extent only UP TO this
+// radius: at sigma 1.5 the corner tap is already at exp(-4) and the Gaussian is genuinely resolved,
+// while at sigma 4 every weight in the kernel lies between 0.57 and 1.0 and this is a box filter
+// wearing a Gaussian's name. That matters because a box filter cannot preserve a narrow dark
+// valley — it raises the crease and pushes its darkness outward. So if more smoothing is ever
+// needed than sigma ~1.5 buys, the answer is a WIDER KERNEL, not a larger sigma against the same
+// taps.
+//
+// AO_BLUR_SEPARABLE is that answer. The 2D form is (2R+1)^2 taps; the separable form is two 1-D
+// passes, and with the horizontal partials staged in LDS each is shared by all 8 output rows in the
+// group. Three binaries ship (aoblur / aoblursep / aoblurwide, see shaders.list) so the host can
+// A/B separability and width as two SEPARATE questions — a perf change and a look change must never
+// arrive in the same arm.
+//
+// MEASURED 2026-09-05, interleaved on one interior save, half-res 1280x800 (min / p25 ms — a
+// wandering stall contaminates the mean, see [[feedback_a_phase_timer_can_bracket_a_strangers_pass]]):
+//
+//     mode 0  2D R=3, 49 taps          0.24 / 0.27
+//     mode 1  separable R=3            0.16 / 0.17     -33%
+//     mode 2  separable R=6            0.43 / 0.48     +79%
+//
+// ⚠ WIDTH IS NOT FREE, AND I PREDICTED THAT IT WOULD BE. The tap arithmetic does amortise — 169
+// taps become ~40 per output pixel — but the SETUP does not. The horizontal pass needs a bilateral
+// centre per (column, tile row), and blurCentre is ~50 ALU of min-difference, cross and rsqrt; at
+// R=6 that is 2.5 centres per thread against 1.75 at R=3, on top of 6.25 staged unprojections
+// against 3.06. Setup scales with TILE AREA, i.e. with R^2, and separability does nothing about it.
+// So R=6 buys double the reach for 1.8x the reference's cost — a real trade, not a free lunch, and
+// the 2D form at R=6 would have been ~3.5x. Judge mode 2 on whether it fixes the GRAIN.
+//
+// ⚠ Separable joint-bilateral is an APPROXIMATION and the approximation is in the range term. The
+// 2D form weights tap (i,j) by its own world distance from the centre; the separable form weights
+// it by its distance from the row pixel, then that row pixel's distance from the centre. The
+// spatial Gaussian is exactly separable and is unaffected. Edges survive this well — it is what
+// essentially every shipped bilateral upsample does — but it is not bit-identical, which is
+// precisely why mode 0 stays in the build as the reference.
+#ifndef BLUR_RADIUS
+    #define BLUR_RADIUS 3
+#endif
+
+// LDS staging tile. An 8x8 group with a +-R kernel touches a (8+2R)^2 half-res neighbourhood, and
+// the naive loop revisits every texel from every thread that can see it: at R=3, 64 threads x 49
+// taps = 3136 visits to 196 UNIQUE texels, 16x redundant.
+//
+// ⚠ STAGING THE BYTES BOUGHT NOTHING. That was measured, 2026-09-05: caching the two Load()s in LDS
+// moved the blur 0.55 -> 0.51 ms, inside the run-to-run noise, because 196 texels is 3 KB and the
+// redundant loads were all hitting L1 anyway. The redundancy that COSTS is arithmetic, not traffic:
+// each of those 3136 visits ran reconstructWorldB — a full 4x4 matrix multiply and a perspective
+// divide, ~22 ALU — to recover 196 distinct world positions. THAT is why this filter cost more than
+// "an ordinary blur" of the same radius: an ordinary blur reads a texel per tap, this one
+// UNPROJECTS one. Staging the world position instead took it 0.37 -> 0.24 ms.
+// See [[feedback_cache_the_derived_value_not_the_bytes]].
+//
+// So g_bw holds the derived value — world position in xyz, the device z it came from in w — and it
+// is staged in every variant. g_bao (the raw AO bytes) is staged ONLY in the 2D variant, where 49
+// taps per thread would otherwise each pay a clamp: the separable path takes 2R+1 per entry and
+// loads them directly, which is what keeps the wide variant's LDS small enough not to cost
+// occupancy. R=3: 6272 B for 2D, 4928 B separable. R=6: 8960 B separable.
+#define BLUR_TILE (8 + 2 * BLUR_RADIUS)
+GroupShared(float4, g_bw [BLUR_TILE * BLUR_TILE]);   // xyz = world position, w = device z
+
+#if defined(AO_BLUR_SEPARABLE)
+    // Horizontal partials for the 8 output columns over ALL BLUR_TILE rows — the rows the vertical
+    // pass reaches. Already normalised, so the vertical pass consumes them exactly like source
+    // texels. This is the array that makes the separable form worth doing: each entry is computed
+    // once and read by every output row whose kernel covers it.
+    GroupShared(float4, g_bh[8 * BLUR_TILE]);
+#else
+    GroupShared(float4, g_bao[BLUR_TILE * BLUR_TILE]);
+#endif
 
 float3 reconstructWorldB(float2 uv, float deviceZ)
 {
@@ -53,12 +114,6 @@ float3 reconstructWorldB(float2 uv, float deviceZ)
     float ndcY = 1.0f - uv.y * 2.0f;
     float4 p = mul(gBlurParams.invViewProj, float4(ndcX, ndcY, deviceZ, 1.0f));
     return p.xyz / p.w;
-}
-
-float3 loadWorldB(int2 sp, float2 invScreen)
-{
-    float z = LoadTex2D(gBlurDepthIn, NO_SAMPLER, sp, 0).r;
-    return reconstructWorldB((float2(sp) + 0.5f) * invScreen, z);
 }
 
 // Local copies of aocommon.h.fsl's aoMinDiff / aoPlaneWeight — see there for what they are for and
@@ -76,14 +131,83 @@ float3 blurMinDiff(float3 dr, float3 dl)
     return lerp(0.5f * (dr + dl), (lr < ll) ? dr : dl, t);
 }
 
-float blurPlaneWeight(float3 nC, float3 dw, float minLen, float sigma)
+// Takes dr2 = dot(dw, dw) rather than recomputing it: the caller has it already, for the range
+// weight, and only sn SQUARED is ever used. So
+//
+//     sn^2 = dot(nC, dw)^2 / max(|dw|, minLen)^2 = dot(nC, dw)^2 / max(dr2, minLen^2)
+//
+// (max of two non-negatives commutes with squaring), which drops a dot3, a sqrt and a divide from
+// every tap for an exactly equal result. minLen arrives pre-squared for the same reason -- it lets
+// the caller build it from dot() and skip two more sqrt in the setup.
+float blurPlaneWeight(float3 nC, float3 dw, float dr2, float minLen2, float sigma)
 {
     if (sigma <= 0.0f)
     {
         return 1.0f;
     }
-    float sn = abs(dot(nC, dw)) / max(length(dw), minLen);
-    return exp(-(sn * sn) / (2.0f * sigma * sigma));
+    float dn  = dot(nC, dw);
+    float sn2 = (dn * dn) / max(dr2, minLen2);
+    return exp(-sn2 / (2.0f * sigma * sigma));
+}
+
+// Everything a bilateral CENTRE needs, read out of the staged tile: its world position, its tangent
+// plane (for the bend channel's extra weight), and the distance-adaptive range sigma. Factored out
+// of CS_MAIN because the separable path needs a centre per TILE ROW, not just for the output pixel.
+//
+// DISTANCE-ADAPTIVE range sigma. The taps are PIXEL-spaced, so the world distance a fixed
+// neighbourhood spans grows with depth — which makes a fixed world sigma two different filters:
+// permissive up close, and in the distance tight enough to reject a flat surface's OWN taps, so the
+// blur quietly degenerates to a passthrough exactly where the dither noise it exists to remove is
+// most visible. Drive it off the local pixel footprint instead and clamp into [sigmaW, sigFar].
+// BLUR_RADIUS is the scale factor and is not free: a tap at the KERNEL EDGE on a flat surface sits
+// ~BLUR_RADIUS * wpp away, so this is precisely the sigma that admits the kernel's own reach and
+// nothing more. It moves when the kernel moves — which is why the wide variant gets a wider range
+// sigma automatically rather than needing a second knob. sigFar <= sigmaW collapses the ramp to the
+// old constant world sigma exactly; that is the A/B.
+//
+// wppLoc takes the LARGER of the two on-surface axis footprints. A surface grazing along one screen
+// axis has a huge world step per pixel along it; taking the smaller would have that surface
+// rejecting its own taps in that direction — the same self-rejection this fixes for distance, just
+// rotated. (cx/cy are min-difference deltas, so they are already on THIS surface; a silhouette
+// neighbour never enters them.)
+//
+// `row` is the centre's row WITHIN the tile. The +-1 vertical neighbours leave the tile at row 0
+// and row BLUR_TILE-1 — rows only the separable path ever centres on — so those fall back to a
+// one-sided difference (both deltas set to the same step, which blurMinDiff passes through
+// unchanged) rather than indexing outside the array. The +-1 COLUMN is always inside, because
+// BLUR_RADIUS >= 1. For the output pixel's own centre the row is in [R, R+8) and neither guard can
+// fire, so the 2D path computes exactly what it computed before this was factored out.
+void blurCentre(uint ci, uint row, float sigmaW, float sigFar, float planeSigma,
+                out(float3) centerW, out(float3) centerN,
+                out(float) planeSigmaU, out(float) wppC2, out(float) invSr)
+{
+    float3 cW = g_bw[ci].xyz;
+    centerW = cW;
+
+    float3 dxr = g_bw[ci + 1u].xyz - cW;
+    float3 dxl = cW - g_bw[ci - 1u].xyz;
+
+    bool   hasUp = (row > 0u);
+    bool   hasDn = (row + 1u < uint(BLUR_TILE));
+    float3 stepU = cW - g_bw[hasUp ? (ci - uint(BLUR_TILE)) : ci].xyz;
+    float3 stepD = g_bw[hasDn ? (ci + uint(BLUR_TILE)) : ci].xyz - cW;
+    float3 dyr   = hasDn ? stepD : stepU;
+    float3 dyl   = hasUp ? stepU : stepD;
+
+    float3 cx  = blurMinDiff(dxr, dxl);
+    float3 cy  = blurMinDiff(dyr, dyl);
+    float3 cn  = cross(cx, cy);
+    float  cn2 = dot(cn, cn);
+    // Only |dot(cn, dw)| is used downstream, so the sign does not matter; a degenerate cross (flat
+    // depth in both axes) disables the plane test here rather than inventing a random plane.
+    centerN     = (cn2 > 1e-20f) ? (cn * rsqrt(cn2)) : float3(0.0f, 0.0f, 0.0f);
+    planeSigmaU = (cn2 > 1e-20f) ? planeSigma : 0.0f;
+    // The floor that keeps sub-pixel depth quantisation out of the sine, pre-squared.
+    wppC2       = max(min(dot(dxr, dxr), dot(dxl, dxl)), 1e-8f);
+
+    float wppLoc = max(length(cx), length(cy));
+    float sigmaR = clamp(float(BLUR_RADIUS) * wppLoc, sigmaW, sigFar);
+    invSr        = 1.0f / (2.0f * sigmaR * sigmaR);
 }
 
 ROOT_SIGNATURE(ComputeRootSignature)
@@ -94,69 +218,133 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
     int2   px        = int2(DispatchThreadID.xy);
     float2 screen    = gBlurParams.screenParams.xy;
     float2 invScreen = gBlurParams.screenParams.zw;
+    float  sigmaPx   = gBlurParams.blurParams.x;
+
+    // Blur off => straight passthrough copy. Hoisted ABOVE the staging and the barriers, which is
+    // safe because sigmaPx is a CBUFFER value: the branch is uniform over the entire dispatch, so
+    // no group can split on it. It is also the cheapest possible passthrough — one load, one store,
+    // no LDS at all.
+    if (sigmaPx <= 0.0f)
+    {
+        if (px.x < (int)screen.x && px.y < (int)screen.y)
+        {
+            Write2D(gAODst, px, LoadTex2D(gAOSrc, NO_SAMPLER, px, 0));
+        }
+        RETURN();
+    }
+
+    // Lane/group from the dispatch id alone — mbtilemax.comp's idiom, and for its reason: nothing
+    // here declares a second entry-point semantic, and the dispatch is sized in whole 8x8 groups.
+    uint2 lane = DispatchThreadID.xy & 7u;
+    uint2 tile = DispatchThreadID.xy >> 3u;
+    uint  tid  = lane.y * 8u + lane.x;
+    int2  org  = int2(tile) * 8 - BLUR_RADIUS;
+    int2  maxP = int2((int)screen.x - 1, (int)screen.y - 1);
+
+    // ⚠ STAGED BEFORE ANY EARLY-OUT, by every thread. A divergent RETURN() ahead of a
+    // GroupMemoryBarrier is undefined behaviour (cullscan / apl / atmos_sh / mbtilemax all carry
+    // this note), and out-of-screen threads at the right/bottom edge own tile slots that IN-screen
+    // threads read as neighbours — so they must stage even though they write nothing.
+    //
+    // The clamp is the SAME clamp the tap loop used to apply per tap, so an edge tap still reads
+    // the clamped edge texel. A sky texel (device z <= 0 on this reverse-Z buffer) unprojects to
+    // the far plane with p.w at or near zero, so it is stored as the origin rather than an inf —
+    // every consumer below is behind a `w > 0` test, and a stored NaN would be one careless
+    // multiply away from poisoning an accumulator ([[project_nan_survives_zero_multiply]]).
+    UNROLL_N(4) for (uint i = tid; i < uint(BLUR_TILE * BLUR_TILE); i += 64u)
+    {
+        int2  sp = clamp(org + int2(int(i % uint(BLUR_TILE)), int(i / uint(BLUR_TILE))),
+                         int2(0, 0), maxP);
+        float z  = LoadTex2D(gBlurDepthIn, NO_SAMPLER, sp, 0).r;
+        float3 w = (z > 0.0f) ? reconstructWorldB((float2(sp) + 0.5f) * invScreen, z)
+                              : float3(0.0f, 0.0f, 0.0f);
+        g_bw[i] = float4(w, z);
+#if !defined(AO_BLUR_SEPARABLE)
+        g_bao[i] = LoadTex2D(gAOSrc, NO_SAMPLER, sp, 0);
+#endif
+    }
+    GroupMemoryBarrier();
+
+    float sigmaW     = max(gBlurParams.blurParams.y, 1e-3f);
+    float sigFar     = max(gBlurParams.blurParams2.z, sigmaW);
+    float planeSigma = gBlurParams.blurParams2.y;
+    float invSp      = 1.0f / (2.0f * sigmaPx * sigmaPx);   // spatial (px^2) falloff
+
+#if defined(AO_BLUR_SEPARABLE)
+    // ---- pass 1: horizontal, one 1-D bilateral per (output column, tile row) ------------------
+    // 8 * BLUR_TILE entries spread over 64 threads by tid, NOT by pixel — every thread must run
+    // this whether or not its own pixel is on screen, and before the second barrier.
+    UNROLL_N(3) for (uint e = tid; e < 8u * uint(BLUR_TILE); e += 64u)
+    {
+        uint   hc  = uint(BLUR_RADIUS) + (e & 7u);            // tile column of this entry
+        uint   hr  = e >> 3u;                                 // tile row
+        uint   hci = hr * uint(BLUR_TILE) + hc;
+        int    spy = clamp(org.y + int(hr), 0, maxP.y);
+        float4 outH = LoadTex2D(gAOSrc, NO_SAMPLER, int2(clamp(org.x + int(hc), 0, maxP.x), spy), 0);
+
+        if (g_bw[hci].w > 0.0f)   // a sky centre passes its own texel through untouched
+        {
+            float3 cW; float3 cN; float pSig; float wpp2; float iSr;
+            blurCentre(hci, hr, sigmaW, sigFar, planeSigma, cW, cN, pSig, wpp2, iSr);
+
+            float  sA = 0.0f;
+            float  wA = 0.0f;
+            float3 sN = float3(0.0f, 0.0f, 0.0f);
+            float  wN = 0.0f;
+            UNROLL for (int i = -BLUR_RADIUS; i <= BLUR_RADIUS; ++i)
+            {
+                float4 wz = g_bw[uint(int(hci) + i)];
+                if (wz.w > 0.0f)
+                {
+                    float4 ao  = LoadTex2D(gAOSrc, NO_SAMPLER,
+                                           int2(clamp(org.x + int(hc) + i, 0, maxP.x), spy), 0);
+                    float  ds2 = float(i * i);
+                    float3 dw  = wz.xyz - cW;
+                    float  dr2 = dot(dw, dw);
+                    float  wgt = exp(-ds2 * invSp - dr2 * iSr);
+                    sA += ao.a * wgt;
+                    wA += wgt;
+                    float wn = wgt * blurPlaneWeight(cN, dw, dr2, wpp2, pSig);
+                    sN += ao.rgb * wn;
+                    wN += wn;
+                }
+            }
+            // The centre tap always contributes (ds2 = 0, dw = 0 => wgt = 1, plane weight = 1), so
+            // both sums are >= 1 here and the guards below are belt and braces, not a live branch.
+            outH.a   = (wA > 0.0f)  ? (sA / wA) : outH.a;
+            outH.rgb = (wN > 1e-6f) ? (sN / wN) : outH.rgb;
+        }
+        g_bh[e] = outH;
+    }
+    GroupMemoryBarrier();
+#endif
+
+    // Past the last barrier — a divergent return is safe again.
     if (px.x >= (int)screen.x || px.y >= (int)screen.y)
     {
         RETURN();
     }
 
-    float4 centerAO = LoadTex2D(gAOSrc, NO_SAMPLER, px, 0);
-    float  centerZ  = LoadTex2D(gBlurDepthIn, NO_SAMPLER, px, 0).r;
+    uint   crow     = lane.y + uint(BLUR_RADIUS);
+    uint   ci       = crow * uint(BLUR_TILE) + (lane.x + uint(BLUR_RADIUS));
+    float4 centerWZ = g_bw[ci];
+#if defined(AO_BLUR_SEPARABLE)
+    uint   hbase    = crow * 8u + lane.x;
+    float4 centerAO = g_bh[hbase];
+#else
+    float4 centerAO = g_bao[ci];
+#endif
 
-    float sigmaPx = gBlurParams.blurParams.x;
-    // Passthrough where the blur is off or there is no geometry (sky / cleared reverse-Z far = 0).
-    if (sigmaPx <= 0.0f || centerZ <= 0.0f)
+    // No geometry here (sky / cleared reverse-Z far = 0) — nothing to denoise.
+    if (centerWZ.w <= 0.0f)
     {
         Write2D(gAODst, px, centerAO);
         RETURN();
     }
 
-    float2 uv      = (float2(px) + 0.5f) * invScreen;
-    float3 centerW = reconstructWorldB(uv, centerZ);
-    float  sigmaW  = max(gBlurParams.blurParams.y, 1e-3f);
-    float  invSp   = 1.0f / (2.0f * sigmaPx * sigmaPx);   // spatial (px^2) falloff
-
-    // Centre tangent plane, for the bend channel's extra weight. Same min-difference rule as
-    // aoSurface, so the two passes agree about which surface this pixel is on. wppC (the shorter of
-    // the two one-pixel world gaps) is the floor that keeps sub-pixel depth quantisation out of the
-    // sine.
-    float  planeSigma = gBlurParams.blurParams2.y;
-    float3 dxr  = loadWorldB(px + int2(1, 0), invScreen) - centerW;
-    float3 dxl  = centerW - loadWorldB(px - int2(1, 0), invScreen);
-    float3 dyr  = loadWorldB(px + int2(0, 1), invScreen) - centerW;
-    float3 dyl  = centerW - loadWorldB(px - int2(0, 1), invScreen);
-    float3 cx   = blurMinDiff(dxr, dxl);
-    float3 cy   = blurMinDiff(dyr, dyl);
-    float3 cn   = cross(cx, cy);
-    float  cn2  = dot(cn, cn);
-    // Only |dot(cn, dw)| is used below, so the sign does not matter; a degenerate cross (flat depth
-    // in both axes) disables the test for this pixel rather than producing a random plane.
-    float3 centerN    = (cn2 > 1e-20f) ? (cn * rsqrt(cn2)) : float3(0.0f, 0.0f, 0.0f);
-    float  planeSigmaU = (cn2 > 1e-20f) ? planeSigma : 0.0f;
-    float  wppC = max(min(length(dxr), length(dxl)), 1e-4f);
-
-    // DISTANCE-ADAPTIVE range sigma. The taps are PIXEL-spaced, so the world distance a fixed 7x7
-    // neighbourhood spans grows with depth — which makes a fixed world sigma two different filters:
-    // permissive up close, and in the distance tight enough to reject a flat surface's OWN taps, so
-    // the blur quietly degenerates to a passthrough exactly where the dither noise it exists to
-    // remove is most visible. Drive it off the local pixel footprint instead and clamp the result
-    // into [near, far].
-    //
-    // BLUR_RADIUS is the scale factor, and it is not a free parameter: a tap at the KERNEL EDGE on a
-    // flat surface sits ~BLUR_RADIUS * wpp away, so this is precisely the sigma that admits the
-    // kernel's own reach and nothing more. It moves if the kernel moves.
-    //
-    // wppLoc takes the LARGER of the two on-surface axis footprints. A surface grazing along one
-    // screen axis has a huge world step per pixel along it; taking the smaller would have that
-    // surface rejecting its own taps in that direction — the same self-rejection this fixes for
-    // distance, just rotated. (cx/cy are the min-difference deltas, so they are already on THIS
-    // surface — a silhouette neighbour never enters them.)
-    //
-    // far <= near, which includes an unwritten lane reading 0, collapses this to the old constant
-    // world sigma exactly. That is the A/B.
-    float  wppLoc = max(length(cx), length(cy));
-    float  sigFar = max(gBlurParams.blurParams2.z, sigmaW);
-    float  sigmaR = clamp(float(BLUR_RADIUS) * wppLoc, sigmaW, sigFar);
-    float  invSr  = 1.0f / (2.0f * sigmaR * sigmaR);       // range (world^2) falloff
+    float3 centerW; float3 centerN; float planeSigmaU; float wppC2; float invSr;
+    blurCentre(ci, crow, sigmaW, sigFar, planeSigma,
+               centerW, centerN, planeSigmaU, wppC2, invSr);
 
     // Two accumulators. The AO scalar keeps exactly the weighting it had; only the bend pays the
     // plane test — see the header.
@@ -165,27 +353,49 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
     float3 sumN  = float3(0.0f, 0.0f, 0.0f);
     float  wsumN = 0.0f;
 
+#if defined(AO_BLUR_SEPARABLE)
+    // ---- pass 2: vertical, over the horizontal partials ---------------------------------------
     UNROLL for (int j = -BLUR_RADIUS; j <= BLUR_RADIUS; ++j)
-    UNROLL for (int i = -BLUR_RADIUS; i <= BLUR_RADIUS; ++i)
     {
-        int2  sp = clamp(px + int2(i, j), int2(0, 0), int2((int)screen.x - 1, (int)screen.y - 1));
-        float z  = LoadTex2D(gBlurDepthIn, NO_SAMPLER, sp, 0).r;
-        if (z > 0.0f)   // skip sky taps (no geometry — would reconstruct garbage)
+        float4 wz = g_bw[uint(int(ci) + j * BLUR_TILE)];
+        if (wz.w > 0.0f)
         {
-            float4 ao  = LoadTex2D(gAOSrc, NO_SAMPLER, sp, 0);
-            float2 suv = (float2(sp) + 0.5f) * invScreen;
-            float3 w   = reconstructWorldB(suv, z);
-            float  ds2 = float(i * i + j * j);     // spatial distance^2 (px)
-            float3 dw  = w - centerW;
-            float  dr2 = dot(dw, dw);              // range distance^2 (world units)
+            float4 ao  = g_bh[uint(int(hbase) + j * 8)];
+            float  ds2 = float(j * j);
+            float3 dw  = wz.xyz - centerW;
+            float  dr2 = dot(dw, dw);
             float  wgt = exp(-ds2 * invSp - dr2 * invSr);
             sumA  += ao.a * wgt;
             wsumA += wgt;
-            float wn = wgt * blurPlaneWeight(centerN, dw, wppC, planeSigmaU);
+            float wn = wgt * blurPlaneWeight(centerN, dw, dr2, wppC2, planeSigmaU);
             sumN  += ao.rgb * wn;
             wsumN += wn;
         }
     }
+#else
+    // ds2 is a literal in every unrolled body, and the tap's world position is a load rather than
+    // a matrix multiply, so what is left per tap is: a subtract, a dot, an exp, and the bend's
+    // extra dot and exp.
+    UNROLL for (int j = -BLUR_RADIUS; j <= BLUR_RADIUS; ++j)
+    UNROLL for (int i = -BLUR_RADIUS; i <= BLUR_RADIUS; ++i)
+    {
+        uint   li = uint(int(ci) + j * BLUR_TILE + i);
+        float4 wz = g_bw[li];
+        if (wz.w > 0.0f)   // skip sky taps (no geometry — the staged position is the origin)
+        {
+            float4 ao  = g_bao[li];
+            float  ds2 = float(i * i + j * j);     // spatial distance^2 (px)
+            float3 dw  = wz.xyz - centerW;
+            float  dr2 = dot(dw, dw);              // range distance^2 (world units)
+            float  wgt = exp(-ds2 * invSp - dr2 * invSr);
+            sumA  += ao.a * wgt;
+            wsumA += wgt;
+            float wn = wgt * blurPlaneWeight(centerN, dw, dr2, wppC2, planeSigmaU);
+            sumN  += ao.rgb * wn;
+            wsumN += wn;
+        }
+    }
+#endif
 
     float4 outAO;
     outAO.a   = (wsumA > 0.0f)    ? (sumA / wsumA) : centerAO.a;

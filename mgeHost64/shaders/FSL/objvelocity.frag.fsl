@@ -16,6 +16,7 @@ STRUCT(PSInput)
     DATA(float4, Position, SV_Position);
     DATA(float4, PrevClip, TEXCOORD0);
     DATA(float4, CurClip,  TEXCOORD1);
+    DATA(float4, PrevStatic, TEXCOORD2);   // MB-2d — see objvelocity.vert.fsl
 };
 
 // ⚠⚠⚠ THIS ATTRIBUTE IS THE WHOLE PASS. WITHOUT IT THE DEPTH TEST DOES NOTHING HERE.
@@ -47,7 +48,8 @@ void PS_MAIN( PSInput In )
     float2 dims = gObjVelParams.screenParams.xy;
     int2   px   = int2(In.Position.xy);
 
-    float2 mv = float2(0.0f, 0.0f);
+    float2 mv    = float2(0.0f, 0.0f);
+    float2 mvRel = float2(0.0f, 0.0f);   // MB-2d: motion RELATIVE TO THE WORLD (camera removed)
 
     // opts.x == 0 is the first frame, a camera cut or a teleport: there is no previous camera to
     // reproject through, and zero — "did not move" — is the answer that leaves the accumulator
@@ -65,6 +67,24 @@ void PS_MAIN( PSInput In )
         float2 cuv  = float2(cndc.x * 0.5f + 0.5f, 0.5f - cndc.y * 0.5f);
         // previous - current, in RENDER-rect pixels — motionvectors.comp's exact convention.
         mv = (puv - cuv) * dims;
+
+        // MB-2d: THE SAME VECTOR WITH THE CAMERA TAKEN OUT.
+        // PrevStatic is this vertex under THIS pose seen by LAST frame's camera, so it is where the
+        // pixel would have been had only the camera moved. Differencing the two PREVIOUS positions
+        // cancels the current one exactly:
+        //     total  = prev_object - current
+        //     camera = prev_static - current
+        //     total - camera = prev_object - prev_static
+        // so the camera term never has to be reconstructed from depth, and an object that did not
+        // move gives EXACTLY zero however hard the camera is turning. That exactness is the whole
+        // feature: the blur's velocity floor then rejects the static world outright rather than
+        // smearing it by a small residue.
+        if (In.PrevStatic.w > 1.0e-6f)
+        {
+            float2 sndc = In.PrevStatic.xy / In.PrevStatic.w;
+            float2 suv  = float2(sndc.x * 0.5f + 0.5f, 0.5f - sndc.y * 0.5f);
+            mvRel = (puv - suv) * dims;
+        }
     }
 
     // ⚠ NO EARLY-OUT ON A SMALL VECTOR, and that is deliberate. A mover that happens to be still
@@ -73,6 +93,11 @@ void PS_MAIN( PSInput In )
     // thing we came for. Skipping the write would leave the reprojected value standing, and the
     // reprojected value is right for exactly the pixels this pass is not for.
     Write2D(gObjVelOut, px, mv);
+
+    // ...and the blur's own field. opts.z picks WHICH vector goes in it; at 0 this target is an
+    // exact copy of gObjVelOut, which is what makes full-frame blur bit-identical to the pre-MB-2d
+    // build and therefore usable as the control arm. The uniform branch costs nothing.
+    Write2D(gObjVelBlurOut, px, (gObjVelParams.opts.z > 0.5f) ? mvRel : mv);
 
     // ═══ MB-1e: STAMP THE ARM'S DEPTH ═══════════════════════════════════════════════════════════
     // FIRST-PERSON INSTANCE ONLY (opts.y). gObjVelDepthOut is pLinearDepth — raw reverse-Z DEVICE

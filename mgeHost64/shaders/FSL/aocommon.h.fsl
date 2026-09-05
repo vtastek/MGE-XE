@@ -305,6 +305,28 @@ float aoFalloffWeight(float dl)
     return saturate(1.0f - dl / aoFalloff());
 }
 
+// acos to within the BIN QUANTUM, not to within float precision.
+//
+// The bitmask accumulators only ever use an angle to pick a bin, and there are 32 bins across pi,
+// so one bin is pi/32 = 0.0982 rad. Abramowitz & Stegun 4.4.45 is a minimax fit to acos on [0,1]
+// with |error| <= 5e-5 rad over the whole domain -- 1/2000 of a bin. The bin indices it produces
+// are therefore the hardware acos's, except for a tap whose true angle lands within 5e-5 rad of an
+// edge, and that tap moves the mask by one bin out of 32 with a distance weight already applied.
+//
+// It costs a sqrt and three fma against acos's own range reduction plus polynomial, on the hottest
+// instruction in the search: SSAO-fast takes 2 slices x 4 steps x 2 sides x 2 angles = 32 of them
+// per pixel. The negative branch is acos(x) = pi - acos(-x), exact.
+//
+// NOT for anything that feeds a continuous result -- aoResolve's quadrature, a bent normal, a
+// horizon max. Those want the real function. This is for the quantised path only.
+float aoAcos(float x)
+{
+    float ax = abs(x);
+    float r  = sqrt(max(1.0f - ax, 0.0f)) *
+               (1.5707288f + ax * (-0.2121144f + ax * (0.0742610f + ax * (-0.0187293f))));
+    return (x >= 0.0f) ? r : (AO_PI - r);
+}
+
 // ---- bitmask helper (gtao / vbao / ssaofast) -------------------------------------------------
 // Bits [b0, b1) of a 32-bit hemisphere occupancy mask. Clamped, and count == 32 is special-cased
 // because a shift of 32 is masked to 0 by the hardware (1u << 32 == 1u, not 0).

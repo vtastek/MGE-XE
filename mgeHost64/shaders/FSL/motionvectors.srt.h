@@ -127,7 +127,8 @@ STRUCT(MvParams)
     // it set. Fixed in MB-2 step 0; the counter that proves it is `mv final: nonzero%` going to
     // 0.000% on a frame the log calls parked.
     //
-    // z, w reserved.
+    // MB-2d: z = OBJECT-ONLY BLUR. It does not change gMvOut at all — the upscaler's field is
+    // always the true total motion — it selects what goes into gMvBlurOut beside it. w reserved.
     DATA(float4, opts, None);
 };
 
@@ -162,5 +163,15 @@ BEGIN_SRT(MotionVectorSrtData)
         // pLinearDepth taken at the end of this dispatch. See the reactive-mask note in the header.
         DECL_TEXTURE  (Persistent, Tex2D(float),  gMvPrevDepth)
         DECL_RWTEXTURE(Persistent, WTex2D(float), gMvReactive)
+        // MB-2d — THE BLUR'S VELOCITY FIELD (pMbVelocity), written here for every pixel of the rect
+        // and then overwritten by the object-velocity pass wherever a mover drew. This pass supplies
+        // the STATIC half: the camera vector when the blur wants the camera in it, and ZERO when it
+        // does not. That zero IS the clear — a separate full-screen clear would cost the same store
+        // for less, and a stale field would smear last frame's motion over a still image.
+        //
+        // NOT gMvOut, AND THE TWO MUST NOT BE MERGED. gMvOut is the upscaler's input and is always
+        // the true total motion; this one is a look knob's output. Pointing DLSS at an object-only
+        // field would make it reject history for the whole static world on every camera turn.
+        DECL_RWTEXTURE(Persistent, WTex2D(float2), gMvBlurOut)
     END_SRT_SET(Persistent)
 END_SRT(MotionVectorSrtData)

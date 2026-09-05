@@ -54,7 +54,11 @@ STRUCT(ObjVelParams)
     // MB-1e: y = 1 in the FIRST-PERSON instance ONLY — "stamp the arm-depth constant into
     // gObjVelDepthOut". See that resource's note. 0 in the world instance, where the same write
     // would replace every mover's DEVICE depth with the near plane and hand water, the APL sky
-    // discriminator and next frame's reprojection a lie. z, w spare.
+    // discriminator and next frame's reprojection a lie.
+    //
+    // MB-2d: z = OBJECT-ONLY BLUR. 1 puts the object's motion RELATIVE TO THE WORLD into
+    // gObjVelBlurOut; 0 puts the same total vector gObjVelOut gets, making that target a copy and
+    // the blur the classic full-frame one. w spare.
     DATA(float4, opts, None);
 };
 
@@ -170,5 +174,17 @@ BEGIN_SRT(ObjVelocitySrtData)
         // an arm centre accepts world samples as "behind me"). The only thing lost is depth
         // discrimination BETWEEN arm parts, which at arm scale is what you want anyway.
         DECL_RWTEXTURE(PerDraw, WTex2D(float), gObjVelDepthOut)
+        // MB-2d — THE BLUR'S VELOCITY FIELD, which is NOT gObjVelOut and must never be merged with
+        // it. gObjVelOut is the TOTAL motion of each pixel and belongs to the upscaler: a temporal
+        // backend handed an object-only field would reject history for the entire static world on
+        // every camera turn. This one is what the blur reads, and at opts.z it holds the object's
+        // motion relative to the world — zero for everything the camera merely swept past, which is
+        // what makes a spin stop smearing the room.
+        //
+        // ⚠ ITS STATIC PIXELS ARE WRITTEN BY motionvectors.comp, NOT HERE. This pass only rasterises
+        // movers, so every pixel it does not cover keeps whatever was there; the camera pass writes
+        // the whole rect (zero in object-only mode) immediately before. That pairing IS the clear,
+        // and it costs one store rather than a separate full-screen pass.
+        DECL_RWTEXTURE(PerDraw, WTex2D(float2), gObjVelBlurOut)
     END_SRT_SET(PerDraw)
 END_SRT(ObjVelocitySrtData)

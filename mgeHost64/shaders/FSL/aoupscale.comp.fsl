@@ -40,10 +40,29 @@ float3 aoUpWorld(float2 uv, float deviceZ)
     return p.xyz / p.w;
 }
 
-float3 aoUpLoadFull(int2 sp, float2 invFull)
+// ⚠ MEASURED, and it is why there is no LDS tile here. Per output pixel this pass runs NINE
+// unprojections — 1 full-res centre + 4 full-res plane neighbours + 4 half-res tap positions — for
+// a FOUR-tap filter, and every one of them is shared with a neighbouring thread. Staging them the
+// way aoblur.comp.fsl does (a 10x10 full-res tile and a 6x6 half-res one, 136 unprojections per
+// group instead of 576) moved the pass 0.32 -> 0.32 ms. Nothing.
+//
+// Because this one is MEMORY-bound, not ALU-bound, and the blur is not: at 2560x1600 the dispatch
+// writes 32.8 MB of RGBA16F and reads 16.4 MB of R32 depth, ~50 MB in 0.32 ms = ~156 GB/s against
+// a part that peaks near 256. It is already at ~60% of the machine's bandwidth and no amount of
+// arithmetic removal can show through that. The only lever left on it is writing FEWER BYTES —
+// i.e. the RGBA16F AO format — which is a contract every colour frag shares.
+//
+// What the experiment DID surface were two real defects in this helper, kept below without the
+// tile: it did not CLAMP (an off-screen plane neighbour unprojected an out-of-bounds Load's zero,
+// the far plane, and handed the pixel a tangent plane built kilometres away), and it could not
+// tell a SKY neighbour from a real one. See [[feedback_cache_the_derived_value_not_the_bytes]] for
+// when the tile IS the answer.
+float4 aoUpLoadFull(int2 sp, float2 invFull, int2 fmax)
 {
-    float z = LoadTex2D(gAOUpDepthFull, NO_SAMPLER, sp, 0).r;
-    return aoUpWorld((float2(sp) + 0.5f) * invFull, z);
+    int2  c = clamp(sp, int2(0, 0), fmax);
+    float z = LoadTex2D(gAOUpDepthFull, NO_SAMPLER, c, 0).r;
+    return float4((z > 0.0f) ? aoUpWorld((float2(c) + 0.5f) * invFull, z)
+                             : float3(0.0f, 0.0f, 0.0f), z);
 }
 
 // Local copies of aocommon.h.fsl's aoMinDiff / aoPlaneWeight, for the same reason aoUpWorld is a
@@ -59,14 +78,19 @@ float3 aoUpMinDiff(float3 dr, float3 dl)
     return lerp(0.5f * (dr + dl), (lr < ll) ? dr : dl, t);
 }
 
-float aoUpPlaneWeight(float3 nC, float3 dw, float minLen, float sigma)
+// Takes dr2 = dot(dw, dw) rather than recomputing length(dw): the caller already has it for the
+// range weight, and only sn SQUARED is used, so sn^2 = dot(nC,dw)^2 / max(dr2, minLen^2) — max of
+// two non-negatives commutes with squaring, so this is exactly equal for a dot3, a sqrt and a
+// divide less per tap. aoblur.comp.fsl's copy carries the same change; keep them in step.
+float aoUpPlaneWeight(float3 nC, float3 dw, float dr2, float minLen2, float sigma)
 {
     if (sigma <= 0.0f)
     {
         return 1.0f;
     }
-    float sn = abs(dot(nC, dw)) / max(length(dw), minLen);
-    return exp(-(sn * sn) / (2.0f * sigma * sigma));
+    float dn  = dot(nC, dw);
+    float sn2 = (dn * dn) / max(dr2, minLen2);
+    return exp(-sn2 / (2.0f * sigma * sigma));
 }
 
 float aoUpSinc(float x)
@@ -100,6 +124,9 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
     int2   halfD    = int2(gAOUpParams.halfDims.xy);
     float2 invFull  = gAOUpParams.fullDims.zw;
     float2 invHalf  = gAOUpParams.halfDims.zw;
+
+    int2 fmax = fullD - int2(1, 1);
+    int2 hmax = halfD - int2(1, 1);
     if (px.x >= fullD.x || px.y >= fullD.y)
     {
         RETURN();
@@ -120,18 +147,30 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
 
     // Centre tangent plane at FULL res, for the bend channel's extra weight. Same min-difference
     // rule as aoSurface and aoblur, so all three agree which surface this pixel is on.
+    //
+    // All four come from the tile. A SKY neighbour degrades to a one-sided difference — both deltas
+    // become the same valid step, which aoUpMinDiff passes through unchanged — rather than feeding
+    // the min-difference test a far-plane point and relying on its magnitude to lose. Same fallback
+    // blurCentre uses at its tile fringe, and the same reason: an unusable neighbour should make
+    // the derivative one-sided, not random.
     float  planeSigma = gAOUpParams.upParams.y;
-    float3 dxr  = aoUpLoadFull(px + int2(1, 0), invFull) - centerW;
-    float3 dxl  = centerW - aoUpLoadFull(px - int2(1, 0), invFull);
-    float3 dyr  = aoUpLoadFull(px + int2(0, 1), invFull) - centerW;
-    float3 dyl  = centerW - aoUpLoadFull(px - int2(0, 1), invFull);
+    float4 nR = aoUpLoadFull(px + int2(1, 0), invFull, fmax);
+    float4 nL = aoUpLoadFull(px - int2(1, 0), invFull, fmax);
+    float4 nD = aoUpLoadFull(px + int2(0, 1), invFull, fmax);
+    float4 nU = aoUpLoadFull(px - int2(0, 1), invFull, fmax);
+    float3 sxr = nR.xyz - centerW;   float3 sxl = centerW - nL.xyz;
+    float3 syr = nD.xyz - centerW;   float3 syl = centerW - nU.xyz;
+    float3 dxr  = (nR.w > 0.0f) ? sxr : sxl;
+    float3 dxl  = (nL.w > 0.0f) ? sxl : sxr;
+    float3 dyr  = (nD.w > 0.0f) ? syr : syl;
+    float3 dyl  = (nU.w > 0.0f) ? syl : syr;
     float3 cn   = cross(aoUpMinDiff(dxr, dxl), aoUpMinDiff(dyr, dyl));
     float  cn2  = dot(cn, cn);
     // Only |dot(cn, dw)| is used, so the sign is irrelevant; a degenerate cross disables the test
     // here rather than inventing a plane.
     float3 centerN     = (cn2 > 1e-20f) ? (cn * rsqrt(cn2)) : float3(0.0f, 0.0f, 0.0f);
     float  planeSigmaU = (cn2 > 1e-20f) ? planeSigma : 0.0f;
-    float  wppC = max(min(length(dxr), length(dxl)), 1e-4f);
+    float  wppC2 = max(min(dot(dxr, dxr), dot(dxl, dxl)), 1e-8f);
 
     // Half-res continuous coordinate of this full-res pixel centre, and the 4x4 tap footprint
     // around it. The downsample maps half texel h to full texels 2h/2h+1, so the inverse is an
@@ -139,6 +178,17 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
     float2 c    = (float2(px) + 0.5f) * 0.5f - 0.5f;
     int2   b    = int2(floor(c));
     float2 frac = c - float2(b);
+
+    // The separable Lanczos weight takes exactly TWO distinct arguments per axis over a 2x2 —
+    // dxy.x is -frac.x at i=0 and 1-frac.x at i=1, and likewise for y — so the four taps evaluate
+    // four unique aoUpLanczos, not sixteen. Each one is two aoUpSinc, i.e. two sin() and two
+    // divides, and this pass is the ONLY one running at FULL resolution (4.1 MP at 2560x1600), so
+    // the difference is 8 transcendentals per pixel against 32. Hoisted explicitly rather than
+    // left to the compiler's CSE: the calls sit inside an unrolled double loop behind a `continue`,
+    // which is exactly the shape common-subexpression elimination is least reliable on.
+    float lx[2]; float ly[2];
+    lx[0] = aoUpLanczos(-frac.x);  lx[1] = aoUpLanczos(1.0f - frac.x);
+    ly[0] = aoUpLanczos(-frac.y);  ly[1] = aoUpLanczos(1.0f - frac.y);
 
     // Two accumulators: the AO scalar keeps exactly the weighting it had, only the bend pays the
     // plane test (aoblur.comp.fsl's header says why the scalar must NOT).
@@ -153,10 +203,24 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
     float4 nearest = float4(0.0f, 0.0f, 0.0f, 1.0f);   // zero bend, fully open
     float  nearD2  = 1e30f;
 
-    UNROLL for (int j = -1; j <= 2; ++j)
-    UNROLL for (int i = -1; i <= 2; ++i)
+    // 2x2, not the Lanczos-2 4x4 this used to run. Measured 2026-09-05: the upscale was 1.25 ms
+    // of a 2.12 ms AO chain (59%) whose actual horizon search is 0.30 ms — it is the ONLY pass at
+    // full resolution, so it paid 16 taps x 2 loads x 4.10 MP = 131 M loads while the search paid
+    // 16 M. See [[project_forge_ao_cost_is_the_filter_chain]].
+    //
+    // ⚠ WHY THIS IS NOT THE QUALITY LOSS IT LOOKS LIKE. The anti-ringing box below is built from
+    // the nearest 2x2 ONLY, and the result is clamped into it — so the outer 12 taps could never
+    // move the output beyond the range these four already span. They bought sub-range shaping, not
+    // reach. Dropping them costs some edge sharpening; it cannot change which values are reachable.
+    //
+    // A second thing falls out: over i,j in {0,1} the offset dxy = (i,j) - frac lies in [-1,1],
+    // where aoUpLanczos is strictly POSITIVE. The signed-weight case the wsum guard below exists
+    // for is now unreachable from the spatial term, so a negative wsumA can only come from a
+    // degenerate range weight. The guard stays — it is free and it is still the correct answer.
+    UNROLL for (int j = 0; j <= 1; ++j)
+    UNROLL for (int i = 0; i <= 1; ++i)
     {
-        int2  sp = clamp(b + int2(i, j), int2(0, 0), halfD - int2(1, 1));
+        int2  sp = clamp(b + int2(i, j), int2(0, 0), hmax);
         float z  = LoadTex2D(gAOUpDepthHalf, NO_SAMPLER, sp, 0).r;
         if (z <= 0.0f)
         {
@@ -171,20 +235,20 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
             nearD2  = d2;
             nearest = ao;
         }
-        if (i >= 0 && i <= 1 && j >= 0 && j <= 1)
-        {
-            boxMin = min(boxMin, ao);
-            boxMax = max(boxMax, ao);
-            boxAny = true;
-        }
+        // Every tap is now inside the box by construction (the loop IS the nearest 2x2), so the
+        // old i/j range test is gone rather than left as a condition that is always true.
+        boxMin = min(boxMin, ao);
+        boxMax = max(boxMax, ao);
+        boxAny = true;
 
-        float  wl  = aoUpLanczos(dxy.x) * aoUpLanczos(dxy.y);
+        float  wl  = lx[i] * ly[j];
         float3 w   = aoUpWorld((float2(sp) + 0.5f) * invHalf, z);
         float3 dw  = w - centerW;
-        float  wgt = wl * exp(-dot(dw, dw) * invSr);
+        float  dr2 = dot(dw, dw);
+        float  wgt = wl * exp(-dr2 * invSr);
         sumA  += ao.a * wgt;
         wsumA += wgt;
-        float wn = wgt * aoUpPlaneWeight(centerN, dw, wppC, planeSigmaU);
+        float wn = wgt * aoUpPlaneWeight(centerN, dw, dr2, wppC2, planeSigmaU);
         sumN  += ao.rgb * wn;
         wsumN += wn;
     }

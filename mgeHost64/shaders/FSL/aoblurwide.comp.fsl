@@ -1,0 +1,20 @@
+// mgeHost64 — AO bilateral blur, SEPARABLE at DOUBLE the radius.
+//
+// Mode 2 of three, and the one that exists for a look problem rather than a perf one: half-res AO
+// carries a dither grain two screen pixels wide, and a +-3 kernel at the sigma it can actually
+// resolve does not swallow it. Reach is the lever, and the 2D form could not afford reach at all —
+// 169 taps against 49.
+//
+// ⚠ THIS IS NOT FREE. Measured 0.43 ms against mode 0's 0.24 — 1.8x, where I had predicted CHEAPER
+// on a tap count alone. The tap loop amortises; the per-row bilateral SETUP and the tile staging do
+// not, and both scale with R^2. See aoblur.comp.fsl's header for the numbers. The 2D form at this
+// radius would have been ~3.5x, so separability is what makes R=6 reachable at all — it just does
+// not make it cheaper than R=3.
+//
+// The range sigma follows automatically: blurCentre scales it by BLUR_RADIUS, precisely so that a
+// wider kernel admits its own reach and nothing more. No second knob.
+//
+// LDS: 20x20 tile x 16 B + 8x20 partials x 16 B = 8960 B, ~7 groups per 64 KB.
+#define AO_BLUR_SEPARABLE 1
+#define BLUR_RADIUS 6
+#include "aoblur.comp.fsl"

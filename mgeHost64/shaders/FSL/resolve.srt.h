@@ -258,6 +258,14 @@ STRUCT(ResolveParams)
     //
     // Eighth float4 = 128 B against a 256 B cbuffer, so STILL no allocation change.
     DATA(float4, bloom, None);
+
+    // x != 0 => the tap loop already ran, in resolvefilter.comp, and gResolveFiltered holds its
+    // normalised result. A LANE OF ITS OWN rather than a spare component of an existing one: every
+    // component of `opts` is taken (x firefly, y scene-referred, z Mitchell C, w encode select) and
+    // squatting on `dither.w` or `bloom.z` to save 16 bytes is how a lane ends up meaning two
+    // things ([[feedback_one_knob_two_jobs]]). Ninth float4 = 144 B against a 256 B cbuffer, so
+    // still no allocation change.
+    DATA(float4, prefilter, None);
 };
 
 BEGIN_SRT(ResolveSrtData)
@@ -284,5 +292,18 @@ BEGIN_SRT(ResolveSrtData)
         // (RGBA16F, always present) with the strength lane forced to 0, so the slot is never a null
         // SRV. Same fallback shape as gReflectMips -> pReflectColor.
         DECL_TEXTURE(PerDraw, Tex2D(float4), gBloomTex)
+        // The PRE-FILTERED scene, when resolvefilter.comp ran (opts.w != 0). Same value this shader
+        // used to compute in its own tap loop: sum/totalWeight, premultiplied, fp16 because
+        // Catmull-Rom over- and undershoots. Everything downstream — the firefly undo, the
+        // premultiplied clamp, the tonemap, the encode, the dither — is unchanged and still lives
+        // here; only the 64 MSAA Loads per pixel moved.
+        //
+        // APPENDED, per the rule above: FSL numbers this set from one running counter, so it goes
+        // last or gResolveSource and gBloomTex silently renumber.
+        //
+        // Bound unconditionally. When the compute filter did not run the slot still needs a live
+        // SRV, so the host points it at the intermediate anyway (it is always allocated when MSAA
+        // is on) and opts.w selects which path the shader takes — same fallback shape as gBloomTex.
+        DECL_TEXTURE(PerDraw, Tex2D(float4), gResolveFiltered)
     END_SRT_SET(PerDraw)
 END_SRT(ResolveSrtData)

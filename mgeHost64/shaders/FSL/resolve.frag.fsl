@@ -246,6 +246,18 @@ float4 PS_MAIN(PsIn In)
     float4 sum         = float4(0.0f, 0.0f, 0.0f, 0.0f);
     float  totalWeight = 0.0f;
 
+    // PRE-FILTERED PATH. resolvefilter.comp did this loop in compute — separable, sharing its taps
+    // through LDS — and left the normalised result in gResolveFiltered. Reading it is one Load
+    // against the 64 MSAA Loads below, and the value is the same one: sum/totalWeight, so the
+    // accumulator is seeded and the weight set to 1 rather than the branch being duplicated around
+    // everything that follows. A uniform branch on a cbuffer lane guarding a BLOCK, which is this
+    // file's house rule ([[project_uniform_branch_is_not_free]]).
+    if (gResolveParams.prefilter.x > 0.5f)
+    {
+        sum         = LoadTex2D(gResolveFiltered, NO_SAMPLER, int2(pixelPos), 0);
+        totalWeight = 1.0f;
+    }
+    else
     LOOP for (int y = -sampRad; y <= sampRad; ++y)
     {
         LOOP for (int x = -sampRad; x <= sampRad; ++x)
