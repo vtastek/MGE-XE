@@ -44,8 +44,21 @@ namespace {
     // g_w x g_h allocation; the composite samples that sub-rect and stretches it to the g_bbW x
     // g_bbH backbuffer. Changing g_renderScale (panel slider) just re-derives g_rw/g_rh and
     // restamps the host render size — no reallocation, no host re-init.
-    constexpr float kMaxRenderScale = 2.0f;   // allocation ceiling (SSAA up to 2x)
-    constexpr float kMinRenderScale = 1.0f;   // supersampling-only (no downscale)
+    // ⚠ THE CEILING IS A VRAM DECISION, NOT A QUALITY ONE, AND IT IS PAID WHETHER OR NOT SSAA RUNS.
+    // Every scene target is allocated at ceiling x backbuffer, so a 2.0 ceiling is 2x LINEAR = 4x
+    // AREA: at 2560x1600 that reserves 5120x3200 across 17 render targets and leaves ~75% of each
+    // one allocated and never rendered into. Measured 2026-09-03: the host sits at 3660 MB with only
+    // 178 textures resident — i.e. the fixed allocation, not the scene, is the footprint — and a
+    // cell-churn run then crossed the DXGI budget (102% OVER), started the driver paging, and took
+    // the frame from 105 to 64 fps. See [[project_forge_vram_overbudget_degradation]].
+    //
+    // So the ceiling now DEFAULTS TO OFF (1.0 = allocate exactly the backbuffer). SSAA is opt-in via
+    // MGE_RENDER_SCALE at startup, which raises the ceiling to what was asked for. It has to be a
+    // STARTUP decision because the shared RT, the imported VkImage and g_mainTex are all created at
+    // the allocation size; the panel slider moves the render sub-rect within it and cannot grow it.
+    constexpr float kRenderScaleHardCap = 2.0f;   // most the ceiling may ever be raised to
+    constexpr float kMinRenderScale     = 1.0f;   // supersampling-only (no downscale)
+    float g_maxRenderScale = 1.0f;                // live ceiling; 1.0 unless MGE_RENDER_SCALE asks
     float g_renderScale = 1.0f;               // live, panel-driven; [kMin..kMax]
     UINT  g_bbW = 640, g_bbH = 360;           // backbuffer (composite destination)
     UINT  g_rw = 640, g_rh = 360;             // current internal render size (<= g_w/g_h)
@@ -1238,8 +1251,8 @@ namespace {
     // on any scale change (panel slider). Takes effect on the next kickoff with no reallocation.
     void recomputeRenderSize() {
         float s = g_renderScale;
-        if (s < kMinRenderScale) s = kMinRenderScale;
-        if (s > kMaxRenderScale) s = kMaxRenderScale;
+        if (s < kMinRenderScale)  s = kMinRenderScale;
+        if (s > g_maxRenderScale) s = g_maxRenderScale;   // never exceed what was ALLOCATED
         UINT rw = (UINT)(g_bbW * s + 0.5f);
         UINT rh = (UINT)(g_bbH * s + 0.5f);
         if (rw > g_w) rw = g_w;   if (rw < 1) rw = 1;
@@ -1324,32 +1337,38 @@ namespace {
                 }
                 bb->Release();
             }
-            g_w = (UINT)(g_bbW * kMaxRenderScale + 0.5f);
-            g_h = (UINT)(g_bbH * kMaxRenderScale + 0.5f);
-            // Dev-only startup override so a resolution sweep can be SCRIPTED. The scale is otherwise
-            // reachable only through the panel slider, and the perf harness runs the game minimized
-            // with no one at the keyboard — without this, "measure the cost at 3 resolutions" means 3
-            // rebuilds, and the three builds are then not provably identical in anything else.
-            // Read ONCE here, never in recomputeRenderSize, so the slider still wins at runtime.
-            // Same shape as the host's MGE_RDOC (mgeHost64/main.cpp): absent => today's behaviour.
-            // GetEnvironmentVariableA rather than getenv: getenv reads a CRT snapshot and trips
-            // C4996 here, and we already have windows.h.
+            // ⚠ ORDER: the env override is read BEFORE g_w/g_h are derived. It used to be read
+            // after, which was harmless only because the ceiling was a hardcoded 2.0 that always
+            // covered it. Now that the ceiling defaults to 1.0, reading it afterwards would size
+            // the allocation to 1.0x and then set a render scale it has no room for.
             {
                 char rs[32] = {};
                 if (GetEnvironmentVariableA("MGE_RENDER_SCALE", rs, sizeof(rs)) > 0) {
                     const float s = (float)std::atof(rs);
-                    if (s >= kMinRenderScale && s <= kMaxRenderScale) {
-                        g_renderScale = s;
-                        LOG::logline(">> [seam] MGE_RENDER_SCALE=%.2f applied at init (dev override)", s);
+                    if (s >= kMinRenderScale && s <= kRenderScaleHardCap) {
+                        g_maxRenderScale = s;   // raise the ceiling to exactly what was asked for
+                        g_renderScale    = s;
+                        LOG::logline(">> [seam] MGE_RENDER_SCALE=%.2f applied at init "
+                                     "(SSAA opt-in; allocation ceiling raised to %.2fx)", s, s);
                     } else {
-                        LOG::logline("!! [seam] MGE_RENDER_SCALE='%s' out of [%.2f..%.2f] — ignored",
-                                     rs, kMinRenderScale, kMaxRenderScale);
+                        LOG::logline("!! [seam] MGE_RENDER_SCALE='%s' out of [%.2f..%.2f] — ignored,"
+                                     " ceiling stays %.2fx",
+                                     rs, kMinRenderScale, kRenderScaleHardCap, g_maxRenderScale);
                     }
                 }
             }
+            g_w = (UINT)(g_bbW * g_maxRenderScale + 0.5f);
+            g_h = (UINT)(g_bbH * g_maxRenderScale + 0.5f);
+            // MGE_RENDER_SCALE is read above, before the sizing. It exists so a resolution sweep can
+            // be SCRIPTED: the scale is otherwise reachable only through the panel slider, and the
+            // perf harness runs minimized with no one at the keyboard — without it, "measure at 3
+            // resolutions" means 3 rebuilds that are then not provably identical in anything else.
+            // GetEnvironmentVariableA rather than getenv: getenv reads a CRT snapshot and trips
+            // C4996 here, and we already have windows.h.
             recomputeRenderSize();   // sets g_rw/g_rh + stamps the host render size (g_client is live here)
-            LOG::logline(">> [seam] backbuffer %ux%u — alloc %ux%u (ceiling %.2fx), render %ux%u (scale %.2fx)",
-                         g_bbW, g_bbH, g_w, g_h, kMaxRenderScale, g_rw, g_rh, g_renderScale);
+            LOG::logline(">> [seam] backbuffer %ux%u — alloc %ux%u (ceiling %.2fx%s), render %ux%u (scale %.2fx)",
+                         g_bbW, g_bbH, g_w, g_h, g_maxRenderScale,
+                         g_maxRenderScale > 1.0f ? "" : ", SSAA off", g_rw, g_rh, g_renderScale);
         }
 
         // Host brings up Forge + creates the shared RT; returns the NT handle already
@@ -4824,6 +4843,23 @@ namespace RenderProcess {
                 std::size_t resident = 0;
                 std::uint32_t nextSlot = 0, epoch = 0;
                 std::uint64_t recycles = 0, thrashes = 0;
+                // Stale-slot histogram. slots= only ever CLIMBS (residency is cumulative all
+                // session), so on its own it cannot distinguish "the working set really is this
+                // big" from "we are hoarding textures nothing has sampled in minutes". The LRU
+                // already stamps g_slotLastUsed[slot] = g_frame on every reference, so the age
+                // distribution is free to read and answers exactly that.
+                //
+                // ⚠ Ages are only meaningful against the SAME clock: g_frame is the LRU clock and
+                // the stamp is written under this mutex, so both are read here, together, rather
+                // than sampling g_frame outside the lock and racing a concurrent stamp.
+                //
+                // Buckets are the timescales that mean different things at ~60 fps:
+                //   >1800f  (~30 s)  a texture the current area stopped using
+                //   >18000f (~5 min) a texture from an area we have LEFT, still holding a slot
+                // A large hot count with a small stale count means the set is genuinely big and
+                // eviction will not help; the reverse means it will.
+                std::uint32_t stale30s = 0, stale5m = 0, hot = 0;
+                std::uint32_t frameNow = 0;
                 {
                     std::lock_guard<std::mutex> lk(g_texResidencyMx);
                     resident = g_texSlot.size();
@@ -4831,10 +4867,78 @@ namespace RenderProcess {
                     epoch    = g_texEpoch;
                     recycles = g_texRecycles;
                     thrashes = g_texThrashes;
+                    frameNow = g_frame;
+                    // Slot 0 is the host default white and is never LRU-tracked, so start at 1.
+                    for (std::uint32_t s = 1; s < nextSlot && s < g_slotLastUsed.size(); ++s) {
+                        const std::uint32_t age = frameNow - g_slotLastUsed[s];
+                        if (age > 18000u)     { ++stale5m; }
+                        else if (age > 1800u) { ++stale30s; }
+                        else                  { ++hot; }
+                    }
                 }
-                LOG::logline(">> [hb] tex residency: slots=%u/%u resident=%zu | recycles=%llu thrash=%llu epoch=%u",
+                LOG::logline(">> [hb] tex residency: slots=%u/%u resident=%zu | recycles=%llu thrash=%llu epoch=%u"
+                             " | age hot=%u stale30s=%u stale5m=%u",
                              nextSlot, IPC::kMaxTextures - IPC::kDlReserve, resident,
-                             (unsigned long long)recycles, (unsigned long long)thrashes, epoch);
+                             (unsigned long long)recycles, (unsigned long long)thrashes, epoch,
+                             hot, stale30s, stale5m);
+            }
+            // EcoQoS state of THIS process (Morrowind.exe). The seam's `copy=` bucket is almost
+            // entirely FlushRenderingCommands, which is CPU work on this thread, so an execution-
+            // speed throttle here would inflate it while leaving every GPU timestamp in the host's
+            // `gpu split` untouched. That is precisely the signature of the sticky ~5.8x flush
+            // regime change, and nothing currently logged can rule it in or out.
+            //
+            // ⚠ Tri-state on purpose: "unmanaged" and "managed, off" both mean full speed, but a
+            // FAILED query must NOT read as "not throttled" — that is the one case this exists for.
+            // Logged every heartbeat rather than once, because the regime FLIPS mid-session (it was
+            // observed recovering on its own), so a startup-only reading would be worse than none.
+            {
+                // GetProcessInformation is gated behind a newer _WIN32_WINNT than this project
+                // compiles with; resolved from kernel32 at runtime so a logging probe does not
+                // move the SDK floor for the whole client.
+                typedef BOOL (WINAPI *PFN_GetProcessInformation)(HANDLE, PROCESS_INFORMATION_CLASS, LPVOID, DWORD);
+                static PFN_GetProcessInformation s_getProcInfo = nullptr;
+                static bool s_looked = false;
+                if (!s_looked) {
+                    s_looked = true;
+                    if (HMODULE k32 = GetModuleHandleW(L"kernel32.dll")) {
+                        s_getProcInfo = (PFN_GetProcessInformation)GetProcAddress(k32, "GetProcessInformation");
+                    }
+                }
+                // -1 = no such export, -(GetLastError()) = the call refused. Distinguishing them
+                // matters: the first says "wrong Windows", the second says "wrong call", and they
+                // want opposite fixes. One undifferentiated "?" is undiagnosable, which is exactly
+                // what the first build of this probe produced.
+                PROCESS_POWER_THROTTLING_STATE pt = {};
+                pt.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
+                int eco = -1;
+                if (s_getProcInfo) {
+                    SetLastError(0);
+                    if (s_getProcInfo(GetCurrentProcess(), ProcessPowerThrottling, &pt, sizeof(pt))) {
+                        eco = (pt.ControlMask & PROCESS_POWER_THROTTLING_EXECUTION_SPEED)
+                            ? ((pt.StateMask & PROCESS_POWER_THROTTLING_EXECUTION_SPEED) ? 1 : 0)
+                            : 0;
+                    } else {
+                        const DWORD e = GetLastError();
+                        eco = e ? -(int)e : -1;
+                    }
+                }
+                // fg=1 when the foreground window belongs to THIS process. Compared by owning
+                // PID rather than against a stored HWND so it needs no handle from the proxy and
+                // stays correct if MW recreates its window. This is the input to the throttle
+                // question: EcoQoS normally spares a foreground app, so "fg=1 ecoqos=THROTTLED"
+                // and "fg=0" are very different stories about the same slow frame.
+                DWORD fgPid = 0;
+                GetWindowThreadProcessId(GetForegroundWindow(), &fgPid);
+                char ecobuf[32];
+                if (eco == 1)       { _snprintf_s(ecobuf, sizeof(ecobuf), _TRUNCATE, "THROTTLED"); }
+                else if (eco == 0)  { _snprintf_s(ecobuf, sizeof(ecobuf), _TRUNCATE, "off"); }
+                else if (eco == -1) { _snprintf_s(ecobuf, sizeof(ecobuf), _TRUNCATE, "?(noexport)"); }
+                else                { _snprintf_s(ecobuf, sizeof(ecobuf), _TRUNCATE, "?(err=%d)", -eco); }
+                LOG::logline(">> [hb] proc: ecoqos=%s prio=0x%lx fg=%d",
+                             ecobuf,
+                             (unsigned long)GetPriorityClass(GetCurrentProcess()),
+                             (fgPid && fgPid == GetCurrentProcessId()) ? 1 : 0);
             }
             // Host phase split as the CLIENT received it (Tier 1 wire echo). Cross-check against
             // mgeHost64.log's `host split`/`gpu split`: matching numbers prove the x86/x64
@@ -7398,18 +7502,38 @@ void DrawForgeDevPanel() {
     // reallocation, no host re-init. 1.0 = native (identical to the pre-feature path).
     {
         float s = g_renderScale;
-        if (ImGui::SliderFloat("Render scale (SSAA)", &s, kMinRenderScale, kMaxRenderScale, "%.2fx")) {
+        // ⚠ The slider's MAX is the live ceiling, not the hard cap. With SSAA off the allocation IS
+        // the backbuffer, so there is no sub-rect to grow into and offering 2.0x here would be a
+        // control that silently does nothing (ImGui would clamp on the way back in, and the user
+        // would be left reading a slider that disagrees with the image).
+        const bool ssaaOff = (g_maxRenderScale <= kMinRenderScale);
+        ImGui::BeginDisabled(ssaaOff);
+        if (ImGui::SliderFloat("Render scale (SSAA)", &s, kMinRenderScale, g_maxRenderScale, "%.2fx")) {
             g_renderScale = s;
             recomputeRenderSize();
             LOG::logline(">> [seam] render scale %.2fx -> render %ux%u (alloc %ux%u, bb %ux%u)",
                          g_renderScale, g_rw, g_rh, g_w, g_h, g_bbW, g_bbH);
         }
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip(
-                "Supersampling: host renders the world at scale x backbuffer, downfiltered on\n"
-                "composite. VRAM is fixed at the ceiling (%.2fx); this only moves the per-frame\n"
-                "viewport. UI stays at native res. 1.0x is byte-identical to the native path.",
-                kMaxRenderScale);
+        ImGui::EndDisabled();
+        if (ImGui::IsItemHovered()) {
+            if (ssaaOff) {
+                ImGui::SetTooltip(
+                    "SSAA is OFF (default). The allocation is exactly the backbuffer, which is what\n"
+                    "keeps the host's fixed VRAM footprint down — a 2.0x ceiling is 4x the AREA on\n"
+                    "17 render targets, reserved whether or not supersampling ever runs, and it is\n"
+                    "what pushed this machine over the DXGI budget into driver paging.\n"
+                    "To enable: set MGE_RENDER_SCALE=1.5 (up to %.2f) before launch. It has to be a\n"
+                    "startup setting because the shared RT is created at the allocation size.",
+                    kRenderScaleHardCap);
+            } else {
+                ImGui::SetTooltip(
+                    "Supersampling: host renders the world at scale x backbuffer, downfiltered on\n"
+                    "composite. VRAM is fixed at the ceiling (%.2fx) that MGE_RENDER_SCALE asked for;\n"
+                    "this only moves the per-frame viewport. UI stays at native res.\n"
+                    "1.0x is byte-identical to the native path.",
+                    g_maxRenderScale);
+            }
+        }
         ImGui::SameLine();
         ImGui::Text("(%ux%u)", g_rw, g_rh);
     }
