@@ -145,6 +145,18 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
     float sigmaW = max(gAOUpParams.upParams.x, 1e-3f);
     float invSr  = 1.0f / (2.0f * sigmaW * sigmaW);
 
+    // ─── THE BISECT STAGE (aoUpProf, upParams.z). CUMULATIVE, so each measured delta prices
+    // exactly one term: 1 = load + nearest + store (the floor), 2 = + the Lanczos weights,
+    // 3 = + the range weight, 4 = + normal reconstruction and the plane weight == full.
+    // 0 is full and is the shipped default, so the arm every number is quoted against is the one
+    // that actually runs. Reading the shader is not a substitute for this: the shadow mask's
+    // "write floor" measured free and its 52 sins measured 0.06 ms, both against confident
+    // predictions ([[feedback_a_stage_cut_prices_the_critical_path]]).
+    uint  prof      = (uint)(gAOUpParams.upParams.z + 0.5f);
+    bool  doLanczos = (prof == 0u) || (prof >= 2u);
+    bool  doRange   = (prof == 0u) || (prof >= 3u);
+    bool  doPlane   = (prof == 0u) || (prof >= 4u);
+
     // Centre tangent plane at FULL res, for the bend channel's extra weight. Same min-difference
     // rule as aoSurface and aoblur, so all three agree which surface this pixel is on.
     //
@@ -154,23 +166,32 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
     // blurCentre uses at its tile fringe, and the same reason: an unusable neighbour should make
     // the derivative one-sided, not random.
     float  planeSigma = gAOUpParams.upParams.y;
-    float4 nR = aoUpLoadFull(px + int2(1, 0), invFull, fmax);
-    float4 nL = aoUpLoadFull(px - int2(1, 0), invFull, fmax);
-    float4 nD = aoUpLoadFull(px + int2(0, 1), invFull, fmax);
-    float4 nU = aoUpLoadFull(px - int2(0, 1), invFull, fmax);
-    float3 sxr = nR.xyz - centerW;   float3 sxl = centerW - nL.xyz;
-    float3 syr = nD.xyz - centerW;   float3 syl = centerW - nU.xyz;
-    float3 dxr  = (nR.w > 0.0f) ? sxr : sxl;
-    float3 dxl  = (nL.w > 0.0f) ? sxl : sxr;
-    float3 dyr  = (nD.w > 0.0f) ? syr : syl;
-    float3 dyl  = (nU.w > 0.0f) ? syl : syr;
-    float3 cn   = cross(aoUpMinDiff(dxr, dxl), aoUpMinDiff(dyr, dyl));
-    float  cn2  = dot(cn, cn);
-    // Only |dot(cn, dw)| is used, so the sign is irrelevant; a degenerate cross disables the test
-    // here rather than inventing a plane.
-    float3 centerN     = (cn2 > 1e-20f) ? (cn * rsqrt(cn2)) : float3(0.0f, 0.0f, 0.0f);
-    float  planeSigmaU = (cn2 > 1e-20f) ? planeSigma : 0.0f;
-    float  wppC2 = max(min(dot(dxr, dxr), dot(dxl, dxl)), 1e-8f);
+    // ⚠ FOUR EXTRA FULL-RES DEPTH LOADS AND FOUR MORE invViewProj MULTIPLIES PER PIXEL, and all of
+    // it feeds only the BEND channel's plane weight. Biggest single suspect in this shader, which
+    // is why stage 4 is the one that adds it.
+    float3 centerN     = float3(0.0f, 0.0f, 0.0f);
+    float  planeSigmaU = 0.0f;
+    float  wppC2       = 1e-8f;
+    if (doPlane)
+    {
+        float4 nR = aoUpLoadFull(px + int2(1, 0), invFull, fmax);
+        float4 nL = aoUpLoadFull(px - int2(1, 0), invFull, fmax);
+        float4 nD = aoUpLoadFull(px + int2(0, 1), invFull, fmax);
+        float4 nU = aoUpLoadFull(px - int2(0, 1), invFull, fmax);
+        float3 sxr = nR.xyz - centerW;   float3 sxl = centerW - nL.xyz;
+        float3 syr = nD.xyz - centerW;   float3 syl = centerW - nU.xyz;
+        float3 dxr  = (nR.w > 0.0f) ? sxr : sxl;
+        float3 dxl  = (nL.w > 0.0f) ? sxl : sxr;
+        float3 dyr  = (nD.w > 0.0f) ? syr : syl;
+        float3 dyl  = (nU.w > 0.0f) ? syl : syr;
+        float3 cn   = cross(aoUpMinDiff(dxr, dxl), aoUpMinDiff(dyr, dyl));
+        float  cn2  = dot(cn, cn);
+        // Only |dot(cn, dw)| is used, so the sign is irrelevant; a degenerate cross disables the
+        // test here rather than inventing a plane.
+        centerN     = (cn2 > 1e-20f) ? (cn * rsqrt(cn2)) : float3(0.0f, 0.0f, 0.0f);
+        planeSigmaU = (cn2 > 1e-20f) ? planeSigma : 0.0f;
+        wppC2       = max(min(dot(dxr, dxr), dot(dxl, dxl)), 1e-8f);
+    }
 
     // Half-res continuous coordinate of this full-res pixel centre, and the 4x4 tap footprint
     // around it. The downsample maps half texel h to full texels 2h/2h+1, so the inverse is an
@@ -187,8 +208,15 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
     // left to the compiler's CSE: the calls sit inside an unrolled double loop behind a `continue`,
     // which is exactly the shape common-subexpression elimination is least reliable on.
     float lx[2]; float ly[2];
-    lx[0] = aoUpLanczos(-frac.x);  lx[1] = aoUpLanczos(1.0f - frac.x);
-    ly[0] = aoUpLanczos(-frac.y);  ly[1] = aoUpLanczos(1.0f - frac.y);
+    if (doLanczos)
+    {
+        lx[0] = aoUpLanczos(-frac.x);  lx[1] = aoUpLanczos(1.0f - frac.x);
+        ly[0] = aoUpLanczos(-frac.y);  ly[1] = aoUpLanczos(1.0f - frac.y);
+    }
+    else
+    {
+        lx[0] = 1.0f; lx[1] = 1.0f; ly[0] = 1.0f; ly[1] = 1.0f;
+    }
 
     // Two accumulators: the AO scalar keeps exactly the weighting it had, only the bend pays the
     // plane test (aoblur.comp.fsl's header says why the scalar must NOT).
@@ -242,10 +270,17 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
         boxAny = true;
 
         float  wl  = lx[i] * ly[j];
-        float3 w   = aoUpWorld((float2(sp) + 0.5f) * invHalf, z);
-        float3 dw  = w - centerW;
-        float  dr2 = dot(dw, dw);
-        float  wgt = wl * exp(-dr2 * invSr);
+        // One invViewProj multiply PER TAP -- four per pixel on top of the centre's own.
+        float3 dw  = float3(0.0f, 0.0f, 0.0f);
+        float  dr2 = 0.0f;
+        float  wgt = wl;
+        if (doRange)
+        {
+            float3 w = aoUpWorld((float2(sp) + 0.5f) * invHalf, z);
+            dw  = w - centerW;
+            dr2 = dot(dw, dw);
+            wgt = wl * exp(-dr2 * invSr);
+        }
         sumA  += ao.a * wgt;
         wsumA += wgt;
         float wn = wgt * aoUpPlaneWeight(centerN, dw, dr2, wppC2, planeSigmaU);
@@ -258,6 +293,13 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
     // and the nearest valid tap stands in — per channel group, since the plane test can starve the
     // bend on a crease pixel while the scalar still has a full set.
     float4 outAO = nearest;
+    // Stage 1: the floor. Everything above collapses to "load the four taps, keep the nearest,
+    // store" -- the bandwidth and the write, which no arithmetic change can remove.
+    if (prof == 1u)
+    {
+        Write2D(gAOUpDst, px, nearest);
+        RETURN();
+    }
     if (abs(wsumA) > 1e-4f)
     {
         float a = sumA / wsumA;

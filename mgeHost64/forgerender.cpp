@@ -14629,6 +14629,13 @@ namespace {
     // frames that paid the maximum, and the two say nothing about the shape between them. The mean
     // is the only one of the three that can be subtracted from the floor to price the excursion.
     double    g_stallWinSum  = 0.0;
+    // ⚠ AND THE COST MODEL IS A WHOLE FRAME, NOT A COLUMN OF PER-PHASE MINIMA. Those minima come
+    // from DIFFERENT frames, so adding them describes a frame that never ran -- postdepth's
+    // cheapest frame is not the frame in which `up` was cheapest, and the column summed to more
+    // than the parent bracket it lives inside. Same rule the MB-1 latch already states: latch the
+    // extreme frame WHOLE, then read every field off that one frame.
+    double    g_stallBest[kGpuPhaseCount] = {};
+    bool      g_stallBestValid = false;
     // Which phases actually WROTE a timestamp pair this frame. Nothing resets the query pool
     // (there is no cmdResetQueryPool call anywhere), so a phase whose gpuPhaseBegin/End were
     // SKIPPED leaves its slot holding the previous frame's timestamps — and the readback below,
@@ -15614,6 +15621,20 @@ namespace {
     // value is resolution- and FOV-dependent in a way the radius is not; retune it if either moves
     // far, and raise it first if half res ever looks blocky rather than blaming the AO.
     float    g_aoUpSigma    = 1.0f;   // upscale range sigma, WORLD units (same form as the blur's)
+    // ===== THE UPSCALE'S BISECT LANE (aoUpProf), same instrument maskProf already proved ========
+    // The AO chain is the largest addressable pass in an interior -- postdepth floors at 1.72 ms of
+    // a 5.82 ms frame -- and it is NOT dominated by AO: the horizon search is ~0.20 while the blur
+    // and the upscale together are ~1.10. Half-res is already the right call (aoHalfRes=0 measured
+    // +0.95 ms), so the question is what inside the upscale costs, and that is a question no amount
+    // of reading the shader answers ([[feedback_a_stage_cut_prices_the_critical_path]]: the shadow
+    // mask's "write floor" turned out to be free and its 52 sins were worth 0.06, both against
+    // confident predictions). CUMULATIVE stages, so each delta prices exactly one thing:
+    //   1 = load + nearest tap + write          (the floor: bandwidth and the store)
+    //   2 = 1 + the Lanczos weights             (delta = 8 sin() per pixel)
+    //   3 = 2 + the range weight                (delta = 5 mat4 x vec4 world reconstructions)
+    //   4 = 3 + normal reconstruction + plane weight  == the full shader
+    //   0 = full (default; identical to 4, and the arm every measurement is quoted against)
+    uint32_t g_aoUpProf    = 0u;
 
     // --- Alpha-to-coverage (a2c.h.fsl) -----------------------------------------------------------
     // MSAA antialiases geometric edges only — the pixel shader runs once per pixel, so a `discard`
@@ -23455,6 +23476,7 @@ void destroyHostWindow(Renderer* R);
             // radius 6 (double the reach and still fewer taps than 0 — the arm for half-res dither
             // grain, which a +-3 kernel at a resolvable sigma cannot swallow).
             { "aoBlurMode",     &g_aoBlurMode,     (uint32_t)kAOBlurModeCount - 1u },
+            { "aoUpProf",       &g_aoUpProf,       4u },
             // 0 Off, 1 DLAA, 2 Quality, 3 Balanced, 4 Performance, 5 UltraPerformance. LIVE on the
             // panel; here because the minimized perf harness cannot open a dropdown, and the A/B
             // this milestone actually needs — DLSS off vs DLAA vs Quality at the same camera — is
@@ -25636,6 +25658,11 @@ void destroyHostWindow(Renderer* R);
                 if (g_lastGpuPhaseMs[kGpuPhaseFrame] > g_stallWinMin[kGpuPhaseFrame] * 1.10) {
                     ++g_stallWinOver;
                 }
+            }
+            if (!g_stallBestValid
+                || g_lastGpuPhaseMs[kGpuPhaseFrame] < g_stallBest[kGpuPhaseFrame]) {
+                for (uint32_t i = 0; i < kGpuPhaseCount; ++i) { g_stallBest[i] = g_lastGpuPhaseMs[i]; }
+                g_stallBestValid = true;
             }
             g_stallWinSum += g_lastGpuPhaseMs[kGpuPhaseFrame];
             ++g_stallWinN;
@@ -30840,7 +30867,10 @@ void destroyHostWindow(Renderer* R);
                 up[18] = 1.0f / (float)g_live.width; up[19] = 1.0f / (float)g_live.height;
                 up[20] = (float)aoW; up[21] = (float)aoH;
                 up[22] = 1.0f / (float)aoW; up[23] = 1.0f / (float)aoH;
-                up[24] = g_aoUpSigma; up[25] = g_aoPlaneSig; up[26] = 0.0f; up[27] = 0.0f;
+                // ⚠ .z WAS DOCUMENTED "spare" AND IS NOW THE PROFILE LANE -- keep aohalfres.srt.h's
+                // comment in step, since the struct's comment is the only description of it.
+                up[24] = g_aoUpSigma; up[25] = g_aoPlaneSig;
+                up[26] = (float)g_aoUpProf; up[27] = 0.0f;
             }
 
             // End the prepass render pass, then pDepth DEPTH_WRITE -> SHADER_RESOURCE (first depth
@@ -38192,9 +38222,39 @@ void destroyHostWindow(Renderer* R);
                              g_stallWinOver,
                              (g_stallWinN > 0) ? (100.0 * (double)g_stallWinOver / (double)g_stallWinN) : 0.0,
                              buf);
-                g_stallWinN    = 0;   // next window starts clean
-                g_stallWinOver = 0;
-                g_stallWinSum  = 0.0;
+                // ===== THE COST MODEL, WITH THE STALL TAKEN OUT =================================
+                // Every number in `gpu split:` above is one sampled frame, and roughly half the
+                // frames carry part of a ~2.1 ms excursion that belongs to no pass. So the split's
+                // `mask=0.80` and `ao=1.33` are costs PLUS whatever stall that frame caught, and
+                // they are what a whole session of tuning would have been aimed at. These are the
+                // per-phase MINIMA over the window -- the cheapest frame each pass ever ran in,
+                // which is the closest thing to its true cost the GPU will report. Nested phases
+                // included, because "postdepth floors at 1.72" does not say whether that is AO or
+                // the mask.
+                LOG::logline(">> [forge-hb] gpu floors (ONE frame, the window's cheapest): frame=%.2f | prepass=%.2f"
+                             " shadow=%.2f(sun=%.2f) postdepth=%.2f (lin=%.2f ao=%.2f[dn=%.2f srch=%.2f"
+                             " blr=%.2f up=%.2f] mask=%.2f) reflect=%.2f(geo=%.2f) color=%.2f cull=%.2f"
+                             " caustic=%.2f atmos=%.2f mv=%.2f mb=%.2f bloom=%.2f rfilter=%.2f resolve=%.2f",
+                             g_stallBest[kGpuPhaseFrame],
+                             g_stallBest[kGpuPhasePrepass],
+                             g_stallBest[kGpuPhaseShadow], g_stallBest[kGpuPhaseShadowSun],
+                             g_stallBest[kGpuPhasePostDepth],
+                             g_stallBest[kGpuPhaseLinearize],
+                             g_stallBest[kGpuPhaseAODown] + g_stallBest[kGpuPhaseAOSearch]
+                                 + g_stallBest[kGpuPhaseAOBlur] + g_stallBest[kGpuPhaseAOUp],
+                             g_stallBest[kGpuPhaseAODown],  g_stallBest[kGpuPhaseAOSearch],
+                             g_stallBest[kGpuPhaseAOBlur],  g_stallBest[kGpuPhaseAOUp],
+                             g_stallBest[kGpuPhaseShadowMask],
+                             g_stallBest[kGpuPhaseReflect], g_stallBest[kGpuPhaseReflGeo],
+                             g_stallBest[kGpuPhaseColor],   g_stallBest[kGpuPhaseCull],
+                             g_stallBest[kGpuPhaseCaustic], g_stallBest[kGpuPhaseAtmos],
+                             g_stallBest[kGpuPhaseMotionVec], g_stallBest[kGpuPhaseMotionBlur],
+                             g_stallBest[kGpuPhaseBloom],
+                             g_stallBest[kGpuPhaseResolveFilter], g_stallBest[kGpuPhaseResolve]);
+                g_stallWinN     = 0;   // next window starts clean
+                g_stallWinOver  = 0;
+                g_stallWinSum   = 0.0;
+                g_stallBestValid = false;
             }
 
             // The atmosphere LUT cache, reported as a RATE rather than a boolean. `builds` is the

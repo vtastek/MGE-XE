@@ -33,5 +33,8 @@ STRUCT(AOUpParams)
     DATA(float4,   fullDims,    None);   // 16..19 xy = full w,h ; zw = 1/w, 1/h
     DATA(float4,   halfDims,    None);   // 20..23 xy = half w,h ; zw = 1/w, 1/h
     DATA(float4,   upParams,    None);   // 24..27 x = range sigma (world u), y = plane-distance sine
-                                         //        sigma for the BEND channel (<= 0 disables); zw spare
+                                         //        sigma for the BEND channel (<= 0 disables)
+                                         //        z = aoUpProf BISECT STAGE, cumulative:
+                                         //            0/4 full, 1 nearest only, 2 +Lanczos,
+                                         //            3 +range weight. w spare
 };
