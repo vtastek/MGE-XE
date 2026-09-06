@@ -18,79 +18,11 @@
 // d3d.py `is`-bug that aliased 2nd+ same-type resources is fixed to `==`).
 #pragma once
 
-// Dynamic-visibility mask geometry, shared by the host fill and BOTH cull shaders so the three can
-// never disagree on a bound. 64 words of 32 bits = 2048 groups (a heavy TR+Bloodmoon bake uses ~100).
-#define DL_VIS_MASK_WORDS 64u
-#define DL_VIS_MASK_BITS  2048u
-
-// NB: named CullInstance (NOT GpuCullInstance) — this header is #included in the host C++ TU too,
-// where STRUCT(T) expands to `struct T`; reusing the host's GpuCullInstance name would redefine it.
-// Byte layout (not the name) is what must match the host upload stride (96 B). world stored as 4
-// explicit ROWS (row-major; wr3.xyz = translation) so the scatter reads/writes raw bytes without any
-// float4x4 matrix-majorness ambiguity (DXC defaults matrices to column-major).
-STRUCT(CullInstance)
-{
-    DATA(float4, wr0, None);            // world row 0 (64B total = the CPU GpuCullInstance.world[0..15])
-    DATA(float4, wr1, None);
-    DATA(float4, wr2, None);
-    DATA(float4, wr3, None);            // wr3.xyz = absolute translation = the placement ORIGIN (the MW
-                                        // reference position: MW cell membership + the GitD glow hash)
-    DATA(float,  posX,        None);    // absolute BOUND-SPHERE CENTRE (origin + the model's own centre
-    DATA(float,  posY,        None);    // rotated/scaled into world). effR is measured about THIS point,
-    DATA(float,  posZ,        None);    // not about the origin — see the host's buildStaticsGrid.
-    DATA(float,  effR,        None);    // -> 80B  frustum sphere radius
-    DATA(uint,   rangeEndIdx, None);    // 0=near 1=far 2=vfar ; 0xFFFFFFFF = skip (grass/invalid)
-    DATA(uint,   firstSubset, None);
-    DATA(uint,   numSubsets,  None);
-    DATA(uint,   visIndex,    None);    // -> 96B. usage.data dynamic-vis group (0 = ungated); gated
-                                        // instances draw only while CullParams.visMask has the bit.
-};
-
-// Mirrors the host StaticsSubsetGPU (5 uints, 20B): the mega-VB/IB spans + bindless texSlot + flags.
-STRUCT(StaticsSubset)
-{
-    DATA(uint, vbBase,     None);
-    DATA(uint, ibBase,     None);
-    DATA(uint, indexCount, None);
-    DATA(uint, texSlot,    None);
-    DATA(uint, flags,      None);
-};
-
-STRUCT(CullParams)
-{
-    DATA(float4, planes[6], None);  // 96B  Gribb-Hartmann planes (a,b,c,d); inside == a·x+b·y+c·z+d >= 0
-    DATA(float4, eye,       None);  // xyz = camera eye (absolute world)
-    DATA(float4, ranges,    None);  // x=nearEnd² y=farEnd² z=vfarEnd² w=nearCut² (0 when cellOwn is armed)
-    DATA(float4, misc,      None);  // x = instance count, y = subset count (as floats; uint4 not C++-safe)
-                                    // z = MW's view distance = the near/far HANDOVER SLAB (view-Z plane)
-                                    // w = minimum instance RADIUS (0 = no floor). Armed only by SH2's
-                                    //     sky-height cull, where the target's texel size — not an LOD
-                                    //     threshold — is what decides whether an object is worth
-                                    //     rasterising. 0 everywhere else keeps the camera cull
-                                    //     bit-for-bit identical (the CPU/GPU parity check depends on it).
-    // -- Occlusion M2: the previous frame's Hi-Z pyramid camera (snapshotted at prologue submit).
-    // hizVP = the RAW rzViewProj bytes of the frame that filled the pyramid (camera-relative,
-    // reverse-Z, extended-far — the exact matrix statics.vert projected with). float4x4 in a
-    // C++-included SRT is proven (AOParams.invViewProj). Total 240B <= the 256B cbuffer.
-    DATA(float4x4, hizVP,       None);  // floats 36..51  prev-frame relative world -> clip
-    DATA(float4,   hizParams,   None);  // 52..55: x=mip0 W, y=mip0 H, z=mipCount-1, w=valid (0 = pass-through)
-    DATA(float4,   hizEyeDelta, None);  // 56..59: xyz = eyeNow - hizEye (rebase this frame's c_rel into hiz space)
-    // Dynamic visibility mask: 2048 bits (one per usage.data vis group), bit set = group VISIBLE.
-    // The client already ships per-group enable deltas on every cell change (scanDynamicVisGroups ->
-    // Server::updateDynVis); this is that state, mirrored into the cull. Rides the cbuffer so no new
-    // SRT resource / descriptor-set change is needed, and BOTH pCullSet and pSunCullSet inherit it
-    // (the sun cull copies the whole 496B, which is what stops LOD shadows from ghost buildings).
-    // float4 not uint4: this header is #included in the host C++ TU, where uint4 is not available —
-    // the shaders read it back with asuint, a pure bitcast. floats 60..123.
-    DATA(float4,   visMask[16], None);
-    // Statics near/far handover: MW's ACTIVE exterior cell set, so the cull can arm the slab clip
-    // (misc.z) on the instances whose MW copy is actually loaded. x/y = centre grid coords, z = 9-bit
-    // LOADED mask (bit (dy+1)*3 + (dx+1)), w = armed (0 ⇒ ranges.w's fixed near-cut instead; the
-    // sun cull zeroes it so DL statics keep casting into the near scene). Values are small
-    // integers, exact in float. Rides the cbuffer for the same reason visMask does — no new SRT
-    // resource, no descriptor-set change. See cellown.h.fsl. floats 124..127 -> 512B total.
-    DATA(float4,   cellOwn,     None);
-};
+// The DATA TYPES (CullInstance / StaticsSubset / CullParams + the vis-mask geometry) live in their
+// own struct-only header so occprobe.srt.h can share them: fsl.py emits every BEGIN_SRT it finds in
+// an included header, so two SRTs may not meet in one file — but a struct carries no registers.
+// This header stays the C++-safe one; forgerender.cpp includes IT and gets the types through here.
+#include "cullparams.h.fsl"
 
 BEGIN_SRT(CullSrtData)
     BEGIN_SRT_SET(PerBatch)

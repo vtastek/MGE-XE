@@ -662,6 +662,16 @@
 #include "cullscatter.comp.fsl"
 #end
 
+// H0: the HEIGHT-FIELD OCCLUSION PROBE — a MEASUREMENT over the two views that have no occlusion
+// culling (the sun caster and the water mirror). One thread per resident static instance: re-run
+// that view's own cull rule, then ask gSunOcc (one compare) or march gSkyHeight (from the ray's
+// water-plane crossing) and count tested/rejected. Draws nothing, changes nothing, default OFF
+// (`occProbe`). Shares compute.rootsig + its own OccProbeSrtData PerBatch set, and the cull's
+// structs through cullparams.h.fsl. See tasks/forge-heightfield-occlusion.md.
+#comp occprobe.comp
+#include "occprobe.comp.fsl"
+#end
+
 // Follow-on 3: occlusion-cull SHADOW LIGHTS vs the Hi-Z pyramid. One thread per shadow slot (32,
 // one group); reuses hizocclusion.h.fsl (same test as cull.comp). ORs each fully-occluded slot's
 // bit into gLightOccBits[0] — the host reads it back and skips that slot's atlas bake (bakes-only,

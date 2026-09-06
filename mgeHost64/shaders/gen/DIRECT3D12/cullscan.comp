@@ -976,7 +976,9 @@ SamplerState gSampler2xWrapClamp : register( s17 , space100 ) ;
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/cullscan.comp.fsl"
 #line 14 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/cullscan.comp.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/cull.srt.h"
-#line 31 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/cull.srt.h"
+#line 25 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/cull.srt.h"
+#line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/cullparams.h.fsl"
+#line 26 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/cullparams.h.fsl"
 STRUCT(CullInstance)
 {
     float4 wr0;
@@ -993,7 +995,7 @@ STRUCT(CullInstance)
     uint numSubsets;
     uint visIndex;
 
-#line 47
+#line 42
 };
 
 
@@ -1004,7 +1006,7 @@ STRUCT(StaticsSubset)
     uint indexCount;
     uint texSlot;
     uint flags;
-#line 57
+#line 52
 };
 
 STRUCT(CullParams)
@@ -1041,8 +1043,9 @@ STRUCT(CullParams)
 
 
     float4 cellOwn;
-#line 93
+#line 88
 };
+#line 26 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/cull.srt.h"
 
         CBUFFER(CullParams) gCullParams :  register(b0,space2);
         Buffer(CullInstance) gCullInst :  register(t1,space2);

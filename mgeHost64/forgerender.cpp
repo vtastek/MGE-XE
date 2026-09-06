@@ -322,6 +322,7 @@ static int forgeEcoQoSState()
 // the merged ComputeRootSignature. Names its element CullInstance (not GpuCullInstance) to avoid
 // redefining the host C++ struct when STRUCT(T) expands to `struct T` in this TU.
 #include "shaders/FSL/cull.srt.h"
+#include "shaders/FSL/occprobe.srt.h"
 // Phase 3 prologue: Hi-Z pyramid build SRT (HizSrtData, Persistent frequency). Shares the merged
 // ComputeRootSignature. See [[project_forge_gpu_occlusion]] M1.
 #include "shaders/FSL/hizreduce.srt.h"
@@ -2629,6 +2630,20 @@ namespace {
         DescriptorSet* pSunCullSet       = nullptr; // CullSrtData PerBatch bound to the sun buffers
         bool           sunCullReady      = false;
         bool           sunArgsInDrawState = false;
+        // --- H0: THE HEIGHT-FIELD OCCLUSION PROBE (occprobe.comp; tasks/forge-heightfield-occlusion.md)
+        // A MEASUREMENT over the two views that have no occlusion culling of any kind — the SUN
+        // caster and the WATER MIRROR — and nothing else. It draws nothing, gates nothing, and is
+        // created LAZILY the first time `occProbe` is armed, so an un-armed session allocates none
+        // of this. Two set instances over one pipeline (0 = sun, 1 = mirror); each carries a COPY of
+        // its view's own CullParams so the denominator is that view's real drawn set.
+        Buffer*        pOccProbeCullCbv[2]   = { nullptr, nullptr };  // the view's CullParams, copied
+        Buffer*        pOccProbeParamsCbv[2] = { nullptr, nullptr };  // OccProbeParams (map + mode)
+        Buffer*        pOccProbeCount[2]     = { nullptr, nullptr };  // uint[4]: [0]=tested [1]=rejected
+        Buffer*        pOccProbeReadback[2]  = { nullptr, nullptr };  // GPU_TO_CPU, persistent-mapped
+        Shader*        pOccProbeShader   = nullptr;
+        Pipeline*      pOccProbePipeline = nullptr;
+        DescriptorSet* pOccProbeSet      = nullptr;   // OccProbeSrtData PerBatch, mMaxSets = 2
+        bool           occProbeReady     = false;
         // --- G1 GRASS: a cull lane of its OWN (tasks/forge-grass.md) -------------------------------
         // Grass is baked into the same distant-statics library as everything else, so this shares
         // cull.comp/cullscan/cullscatter, the mega VB/IB and gStaticsArrays verbatim. What it does
@@ -5323,6 +5338,55 @@ namespace {
     constexpr uint32_t kSkyStaticsRowCap = 65536;
     bool               g_skyHeightBuiltStatics = false;  // did the LIVE map include the statics layer?
     float              g_skyHeightBuiltMinR = -1.0f;     // radius floor the LIVE map was built with
+
+    // --- H0: THE HEIGHT-FIELD OCCLUSION PROBE (occprobe.comp.fsl) --------------------------------
+    // Both maps above already answer, for free, a question nobody has asked them: "is this object
+    // hidden". The SUN caster (1.41 ms) and the WATER MIRROR (1.64 ms of `refl geo`) each render the
+    // world with NO occlusion culling at all, and the reflection's `refl 284/285` says frustum
+    // culling has nothing left to give there — a mirrored frustum at eye level over a flat plane
+    // sees almost exactly what the camera sees. So the only two levers left are occlusion and
+    // fidelity, and this measures the first one before anything is built for it.
+    //
+    // ⚠ IT REPORTS AN UPPER BOUND, and the log line says so. gSkyHeight and gSunOcc are MAX fields
+    // (a texel that is half building and half street stores the roof), so a test against them
+    // rejects instances a true occlusion test would keep. If the bound is SMALL the height-field
+    // plan dies here and no min-pyramid is ever built; only if it is large does H1 — which is what
+    // would make the number safe to act on — earn its cost. That asymmetry is why a bound is worth
+    // measuring at all: it can only ever kill the idea, never green-light it on its own.
+    //
+    // DEFAULT OFF. Armed with MGE_HOST_KNOBS=occProbe=1, which is also what lazily creates its
+    // resources — an un-armed session allocates nothing and dispatches nothing.
+    float              g_occProbe       = 0.0f;    // 0 = off. The master arm (and the alloc trigger).
+    // Mirror march only. 24 uniform taps over a segment bounded at both ends (see the shader for why
+    // uniform, where sunocc.comp is geometric).
+    float              g_occProbeSteps  = 24.0f;
+    // World units added to the field before the compare, in BOTH halves. It biases toward "not
+    // occluded", which is the direction a probe has to err in: the failure that matters is claiming
+    // a rejection that a real cull could not make.
+    float              g_occProbeBias   = 64.0f;
+    // Extra world units the mirror march stops SHORT of its target, on top of effR + one texel. The
+    // instance is itself in gSkyHeight, so without this every object reports itself occluded by its
+    // own roof.
+    float              g_occProbeMargin = 32.0f;
+    // THE CONSERVATIVE ARM's neighbourhood radius, in height-map texels. This is the knob that turns
+    // H0 from a ceiling into a BRACKET: the raw arm tests the max field (over-rejects, a ceiling),
+    // this one tests `min` over a (2R+1)² neighbourhood — which is precisely what H1's min-pyramid
+    // would hold, so it previews H2's own answer without building the pyramid, a reduce variant or
+    // the R32F-vs-R16F typed-UAV-load question that comes with it. 1 = a 3x3 over 32 u texels = 96 u.
+    // ⚠ 0 collapses the two arms onto each other exactly, which is the self-check: at
+    // occProbeMinR=0 the two counters MUST come back equal.
+    float              g_occProbeMinR   = 1.0f;
+    uint32_t           g_occProbeTested[2]   = { 0u, 0u };   // [0] = SUN view, [1] = MIRROR view
+    uint32_t           g_occProbeRejected[2] = { 0u, 0u };   // CEILING (the raw max field)
+    uint32_t           g_occProbeRejMin[2]   = { 0u, 0u };   // FLOOR   (H1's min-pyramid, emulated)
+    // The REFLECT cull's own frustum/eye/tier ranges, published by dlCullAndBuild on the !primary
+    // path. The mirror view never writes a CullParams cbuffer of its own (the GPU cull is main-path
+    // only), so this is the only record of what that cull actually ran with — which is exactly what
+    // the probe's denominator has to be built from, and what the Part-2 fidelity line reports.
+    float              g_reflCullPlanes[6][4] = {};
+    float              g_reflCullEye[3]       = { 0.0f, 0.0f, 0.0f };
+    float              g_reflCullRanges[3]    = { 0.0f, 0.0f, 0.0f };   // nearEnd², farEnd², vfarEnd²
+    bool               g_reflCullValid        = false;
 
     // Float layout of the SHARED shadow-params cbuffer (gShadowParams, shadowparams.h.fsl). That
     // buffer is already bound into EVERY PerFrame set and into the compute mask, so one host write
@@ -15393,6 +15457,11 @@ namespace {
     }
     bool g_reflGeoReady = false;    // WV2 perf: reflect-geo CPU cull ran pre-beginCmd this frame (rings
                                     // valid) → the reflect pass records the draws; else skips (no stale draw)
+    // H0: the ABSOLUTE world Z of the plane the reflection mirrors about, stashed by dlReflectGeoCull
+    // (which is the one place that knows MW's water level this frame). The probe's mirror march needs
+    // it to find where a sightline LEAVES THE WATER — see occprobe.comp.fsl for why a march started
+    // at the mirrored eye reports everything blocked.
+    float g_reflMirrorZAbs = 0.0f;
     bool g_reflFrameReady = false;  // IR3: the MIRROR frame cbuffer (pReflectFrameCbvGeo — mirror viewProj
                                     // + below-water clip) was written this frame. Split out of
                                     // g_reflGeoReady because an INTERIOR has no DL to cull but still needs
@@ -18001,6 +18070,73 @@ namespace {
         // publishes the calibration reference and the caustic does not follow the noise sliders.
         if (g_waterProceduralWaves) { return 1.0f; }
         return std::max(0.0f, g_waterWaveAmp);
+    }
+
+    // ═══ REFLECTION FIDELITY, DRIVEN BY SURFACE ROUGHNESS ════════════════════════════════════════
+    //
+    // The reflection is 1.83 ms of a 11.97 ms exterior frame, 1.64 of it re-rendering the world into
+    // a 1024² target — and a fixed "make the mirror cheaper" knob is the wrong shape for it, because
+    // whether that detail is VISIBLE at all is not a constant. A choppy surface destroys its own
+    // reflection through its own normals: the fidelity is wasted exactly when it is most expensive.
+    // So the cost is keyed to the roughness, and the roughness signal is the one directly above —
+    // waterBaseSlopeGain(), which the caustic strength already keys off, so there is one number in
+    // this renderer that says how rough the water is and both consumers read it.
+    //
+    // ⚠ THIS IS THE CONSUMER. The PRODUCER is the weather sub-simulation, which does not exist yet
+    // ("we don't have truly calm mornings or anything like that"), and today the lane is effectively
+    // static at the authored default. That is deliberate and it is what makes the default a NO-OP:
+    // kReflCalmGain IS the shipped g_waterWaveAmp, so a stock frame maps to fidelity 1.0 and nothing
+    // downstream moves. The day a weather sim drives the amplitude, this code does not change.
+    //
+    // ⚠ THE SCALAR IS AN INPUT, NOT A MULTIPLIER. Each axis maps it through its OWN curve, so
+    // retuning the distance response cannot silently change the terrain LOD response —
+    // [[feedback_one_knob_two_jobs]], where a DISTANCE knob also scaled validity.
+    //
+    // Axis C (reflection RESOLUTION, as a sub-rect of the existing target) is deliberately absent:
+    // it touches pReflectMips and gReflectDepth sampling, so it earns its own measurement after A
+    // and B rather than riding in on theirs.
+    //
+    // kReflCalmGain  — at or below this the surface is a mirror and gets everything.
+    // kReflRoughGain — at or above it the reflection is noise and gets the floor.
+    constexpr float kReflCalmGain      = 1.0f;    // == the shipped g_waterWaveAmp (see above)
+    constexpr float kReflRoughGain     = 3.0f;
+    constexpr float kReflFidelityFloor = 0.25f;   // never 0: a mirror that empties is worse than a coarse one
+    // Axis A's own mapping: fidelity 1 -> the full DL draw distance, fidelity 0 -> this fraction of
+    // it. Not 0 — the horizon is the part of a reflection that survives chop longest (it is the part
+    // whose reflected rays are most grazing), so shortening it to nothing is the wrong end to cut.
+    constexpr float kReflDistFloor     = 0.35f;
+    // Axis B's own mapping: how many LOD steps the terrain may be pushed at the floor. 2 is the
+    // ladder's practical limit here — kTerrainLodDist has 6 rungs and the far ones are already
+    // coarse, so a third step mostly re-picks a stride the distance test would have chosen anyway.
+    constexpr uint32_t kReflLodBiasMax = 2u;
+    // All three ship as AUTO (-1). Pinning any of them is what makes the verification TABLE possible
+    // — the sweep needs distance and LOD moved INDEPENDENTLY, which a single derived scalar cannot
+    // do — and every one of them is env-driven because the perf harness runs minimized.
+    float g_reflFidelity = -1.0f;   // <0 = derive from the roughness; [0,1] pins it
+    float g_reflDistScale = -1.0f;  // <0 = derive from the fidelity; >0 pins the tier multiplier
+    float g_reflLodBias   = -1.0f;  // <0 = derive from the fidelity; >=0 pins the terrain LOD steps
+
+    // The scalar. 1.0 = today's picture, exactly.
+    inline float reflFidelity() {
+        if (g_reflFidelity >= 0.0f) { return std::min(g_reflFidelity, 1.0f); }
+        const float gain = waterBaseSlopeGain();
+        // ⚠ A FLAT surface is not a rough one. waterBaseSlopeGain() returns 0 for the flat test and
+        // for zero amplitude, and that end of the range is a PERFECT mirror — the case that most
+        // wants full fidelity. Only gain ABOVE the calm reference costs anything.
+        const float t = (gain - kReflCalmGain) / (kReflRoughGain - kReflCalmGain);
+        return std::max(kReflFidelityFloor, std::min(1.0f - t, 1.0f));
+    }
+    // Axis A — the DL statics tier multiplier the reflect cull applies to nearEnd/farEnd/vfarEnd.
+    inline float reflDistScale() {
+        if (g_reflDistScale > 0.0f) { return g_reflDistScale; }
+        const float f = reflFidelity();
+        return kReflDistFloor + (1.0f - kReflDistFloor) * f;
+    }
+    // Axis B — terrain LOD steps ADDED to the mirror's per-cell pick (0 = today).
+    inline uint32_t reflLodBias() {
+        if (g_reflLodBias >= 0.0f) { return (uint32_t)(g_reflLodBias + 0.5f); }
+        const float f = reflFidelity();
+        return (uint32_t)((1.0f - f) * (float)kReflLodBiasMax + 0.5f);
     }
     // The slope the GENERATOR actually runs at: the authored knob, scaled by the tile so that
     // slope*K — and therefore every fold depth, and therefore the meaning of the depth ladder —
@@ -23335,6 +23471,30 @@ void destroyHostWindow(Renderer* R);
             // matter most are a MEASUREMENT and a RECT, and both have to be runnable from a minimized
             // harness with nobody at a slider: `mb=` on the gpu split against mbShutter, and the
             // out/in scale against upscaleMode=2 (at 1x that scale is 1.0 and proves nothing).
+            // H0 the OCCLUSION PROBE. `occProbe` is both the arm and the ALLOCATION trigger — off,
+            // nothing is created and nothing dispatches — and it is env-only for the usual reason:
+            // the whole point is a number read off an unattended run's log, and a minimized harness
+            // cannot click. The other three are the probe's own honesty dials: bias and margin both
+            // push it toward "not occluded", so raising either can only SHRINK the bound it reports,
+            // which is the direction a measurement that could buy machinery has to be able to move.
+            { "occProbe",            &g_occProbe            },
+            { "occProbeSteps",       &g_occProbeSteps       },
+            { "occProbeBias",        &g_occProbeBias        },
+            { "occProbeMargin",      &g_occProbeMargin      },
+            // ⚠ THE KNOB THAT MAKES H0 DECIDABLE. The raw arm is a ceiling and a ceiling cannot tell
+            // 87% from 30%; this one previews H1's min-pyramid, so the pair brackets what H2 would
+            // actually get. Sweep it (0/1/2/3) to see how fast the floor falls as the emulated
+            // pyramid level coarsens — that slope is the real risk in H2. 0 = the self-check arm.
+            { "occProbeMinR",        &g_occProbeMinR        },
+            // REFLECTION FIDELITY. All three ship as AUTO (-1) and all three are here because the
+            // verification is a TABLE — fidelity 1.0/0.75/0.5/0.25 crossed with LOD 0/+1/+2 — and a
+            // table needs distance and detail moved INDEPENDENTLY, which the single derived scalar
+            // deliberately cannot do. `reflFidelity=1` is also the exact identity arm: it is what the
+            // roughness curve returns at the shipped wave amplitude, so pinning it must not move the
+            // frame at all, and that is the regression test for the whole of part 2's plumbing.
+            { "reflFidelity",        &g_reflFidelity        },
+            { "reflDistScale",       &g_reflDistScale       },
+            { "reflLodBias",         &g_reflLodBias         },
             { "mbShutter",           &g_mbShutter           },
             { "mbShutterFps",        &g_mbShutterFps        },
             { "mbMinPx",             &g_mbMinPx             },
@@ -25385,6 +25545,8 @@ void destroyHostWindow(Renderer* R);
     void renderSunShadow();   // SUN shadow: DL statics → MSM moments map (forge-sun-shadows.md Phase A)
     void blurSunMoments();    // SUN shadow: separable Gaussian over the moments — what makes MSM soft
     void dispatchSunCull();   // SUN shadow A2: second statics cull (sun ortho box, nearCut=0, Hi-Z off)
+    bool createOccProbeResources(Renderer* R);  // H0: lazy, the first frame `occProbe` is armed
+    void dispatchOccProbe();                    // H0: the two height-field probes (MEASUREMENT only)
     void dispatchGrassCull(); // G1a: the grass cull lane (own instance array + subset table)
     void drawGrass();         // G1: the grass colour draw, inside the DL block
     void publishGrassParams(float* mp, double simTimeSeconds);   // G1: gShadowParams grass lanes
@@ -25781,6 +25943,19 @@ void destroyHostWindow(Renderer* R);
                                 "'Sky AO: statics MIN radius' (now %.0f); the map is missing occluders\n",
                                 n, kSkyStaticsRowCap, g_skyHeightBuiltMinR);
                 }
+            }
+        }
+        // H0: the occlusion probe's two counters, one frame late like every other readback settled
+        // here. Latched rather than accumulated — each is a whole-view answer for one frame, and a
+        // running total would hide the thing worth seeing, which is how the ratio MOVES as the
+        // camera turns (a town square and an open coast are different scenes for this question).
+        for (uint32_t v = 0; v < 2u; ++v) {
+            if (g_live.occProbeReady && g_live.pOccProbeReadback[v]
+                && g_live.pOccProbeReadback[v]->pCpuMappedAddress) {
+                const uint32_t* rb = (const uint32_t*)g_live.pOccProbeReadback[v]->pCpuMappedAddress;
+                g_occProbeTested[v]   = rb[0];
+                g_occProbeRejected[v] = rb[1];
+                g_occProbeRejMin[v]   = rb[2];
             }
         }
         // Follow-on 3: latch the shadow-light occlusion bits. Next frame's shadow manager consumes
@@ -28754,6 +28929,13 @@ void destroyHostWindow(Renderer* R);
         }
         const double tCull1 = hostNowMs();   // end of the DL cull (+ lazy resource/texture load)
 
+        // H0: build the occlusion probe's resources the first frame it is armed. HERE and not at the
+        // dispatch, for the same reason the light cull's create sits pre-beginCmd — addResource /
+        // addPipeline / addDescriptorSet are illegal mid-command-buffer. Outside the cull timing
+        // above so a one-time allocation cannot show up as a cull spike in the very session the
+        // probe was armed to measure.
+        if (g_occProbe > 0.0f && !g_live.pOccProbePipeline) { createOccProbeResources(R); }
+
         // FP1a: fill the FP frame cbuffer AFTER every main-cbuffer write this frame (the
         // lighting block, lodEye, clip lanes all ride along in the copy), then overwrite
         // viewProj with the ARM camera's matrix under the same reverse-Z + half-pixel
@@ -29014,6 +29196,11 @@ void destroyHostWindow(Renderer* R);
         dispatchGrassCull();
 
         gpuPhaseEnd(kGpuPhaseCull);
+
+        // H0: the height-field occlusion probe, over the SUN caster's and the WATER MIRROR's drawn
+        // sets. ⚠ AFTER gpuPhaseEnd, deliberately — see dispatchOccProbe. Default off; when off this
+        // line is one predicted branch.
+        dispatchOccProbe();
 
         // Near clustered forward: build this frame's NEAR froxel light-mask HERE — in the pure-compute
         // section (NO render target bound yet), NOT mid-colour-pass. Dispatching this tiny clear+scatter
@@ -41230,10 +41417,15 @@ void destroyHostWindow(Renderer* R);
     // its NEIGHBOURS' strides, which is only settled once every visible cell has picked one.
     // `eye` is the REAL eye in both views — only `planes` differ (the reflection passes the
     // mirror-about-water frustum). Distances, the LOD ladder and the camera-relative instance
-    // origins all key off the true camera, exactly as the DL cull does, so the reflection draws
-    // terrain to the same distance at the same detail as the view it mirrors.
+    // origins all key off the true camera, exactly as the DL cull does.
+    //
+    // `lodBias` is the ONE thing that may now differ per view (axis B of the reflection fidelity
+    // work — see reflFidelity()): steps ADDED to the ladder's pick, so the mirror can draw the same
+    // cells at a coarser stride than the view it mirrors. 0 everywhere but the reflect cull, which
+    // is what keeps the main view and the sun caster bit-for-bit unchanged.
     void terrainCullAndBuild(TerrainView& V, bool primary,
-                             const float planes[6][4], const float eye[3], float nearCut) {
+                             const float planes[6][4], const float eye[3], float nearCut,
+                             uint32_t lodBias) {
         V.cells = 0;
         for (uint32_t l = 0; l < kTerrainLods; ++l) { V.drawCounts[l] = 0; }
         if (primary) {
@@ -41314,6 +41506,11 @@ void destroyHostWindow(Renderer* R);
             for (uint32_t l = 0; l < kTerrainLods; ++l) {
                 if (dCells < kTerrainLodDist[l]) { lod = l; break; }
             }
+            // Fidelity axis B. AFTER the distance pick, not folded into kTerrainLodDist: the ladder
+            // is a distance->stride map and biasing the DISTANCE would change which rung each cell
+            // lands on non-uniformly, while biasing the RUNG is the coarsening that was asked for.
+            // Clamped to the last rung — past it there is no coarser stride to ask for.
+            if (lodBias) { lod = (lod + lodBias < kTerrainLods) ? (lod + lodBias) : (kTerrainLods - 1); }
             V.lodOf[s]    = (uint8_t)lod;
             V.lodStamp[s] = V.cullFrame;
             V.visible.push_back(s);
@@ -43947,6 +44144,75 @@ void destroyHostWindow(Renderer* R);
                      " suppressed=%u clipped=%u residentDrawn=%u",
                      (int)dlCellOwnActive(), g_nearCellX, g_nearCellY, g_nearCellMask,
                      g_nearCellReach, g_dlOwnSuppressed, g_dlOwnClipped, g_dlOwnResidentDrawn);
+        // REFLECTION FIDELITY (part 2). ⚠ THIS LINE EXISTS TO PROVE AN ARM TOOK. `waterNoReflect`
+        // is the cautionary tale: it reads like the reflection's off switch, it is spelled exactly
+        // like a cost lever, and it changes the frame by 0.05 ms — an arm that silently does not
+        // take reads identically to a pass that costs nothing, and that is a wrong row in a table
+        // rather than a missing one. So report the SCALAR, its INPUT, and the two things the scalar
+        // actually did: the tier ends the mirror culled with (read back out of the published record,
+        // not recomputed here — a second derivation can disagree with the first) and the LOD bias.
+        // `refl` vs `main` on the instance counts is the same evidence from the other end.
+        {
+            const float fid   = reflFidelity();
+            const float distK = reflDistScale();
+            const uint32_t lb = reflLodBias();
+            LOG::logline(">> [forge-hb][refl] fidelity=%.3f%s (slopeGain=%.3f) distScale=%.3f%s"
+                         " lodBias=%u%s | mirror tiers=%.0f/%.0f/%.0f u (main %.0f/%.0f/%.0f)"
+                         " | inst refl=%u main=%u  terrain refl=%u main=%u"
+                         " lod %u/%u/%u/%u/%u/%u",
+                         fid, (g_reflFidelity >= 0.0f) ? " PINNED" : " auto",
+                         waterBaseSlopeGain(),
+                         distK, (g_reflDistScale > 0.0f) ? " PINNED" : " auto",
+                         lb,    (g_reflLodBias  >= 0.0f) ? " PINNED" : " auto",
+                         g_reflCullValid ? std::sqrt(g_reflCullRanges[0]) : 0.0f,
+                         g_reflCullValid ? std::sqrt(g_reflCullRanges[1]) : 0.0f,
+                         g_reflCullValid ? std::sqrt(g_reflCullRanges[2]) : 0.0f,
+                         Configuration.DL.NearStaticEnd    * 8192.0f,
+                         Configuration.DL.FarStaticEnd     * 8192.0f,
+                         Configuration.DL.VeryFarStaticEnd * 8192.0f,
+                         g_liveLastInstRefl, g_liveLastInst,
+                         g_terrainRefl.cells, g_lastTerrainCells,
+                         // ⚠ THE MIRROR'S OWN LOD HISTOGRAM, and it is the only DIRECT evidence
+                         // axis B took. The cell COUNT cannot show it — a bias changes each cell's
+                         // stride, not how many cells are visible — so without this the only sign of
+                         // a +1 is `refl geo` getting cheaper, which is a timing, i.e. exactly the
+                         // kind of inference `waterNoReflect` proves you cannot trust.
+                         g_terrainRefl.drawCounts[0], g_terrainRefl.drawCounts[1],
+                         g_terrainRefl.drawCounts[2], g_terrainRefl.drawCounts[3],
+                         g_terrainRefl.drawCounts[4], g_terrainRefl.drawCounts[5]);
+        }
+        // H0: the occlusion probe. ⚠ THE WORD "UPPER" IS LOAD-BEARING AND IT IS IN THE LINE. Both
+        // maps are MAX fields — a texel that is half building and half street stores the roof — so
+        // this over-rejects by construction, and the number is a CEILING on what an occlusion cull
+        // could remove, not an estimate of it. A small ceiling kills H1/H2 outright; only a large one
+        // makes them worth building, and even then the min-pyramid is what would make it safe to act
+        // on. Printed only while armed: a row of zeroes from a probe nobody ran is worse than silence.
+        if (g_occProbe > 0.0f) {
+            auto pct = [](uint32_t n, uint32_t d) { return d ? (100.0 * (double)n / (double)d) : 0.0; };
+            // ⚠ A BRACKET, PRINTED AS A BRACKET. The ceiling alone cannot decide H2 — 87% and 30%
+            // are indistinguishable from above — so the floor (H1's min-pyramid, emulated at radius
+            // minR) is on the same line, over the SAME instances on the SAME frame, and the WIDTH
+            // between them is what the decision is actually made on.
+            // ⚠ AT minR=0 THE TWO MUST BE EQUAL. min over a 1x1 IS the sample, so a disagreement
+            // there means the two arms are not testing the same ray and nothing else on this line
+            // can be trusted. It is the self-check, and it is one env token away.
+            LOG::logline(">> [forge-hb][occprobe] BRACKET [floor = H1's min@r%d, ceiling = raw max field]:"
+                         " sun tested=%u rejected %u..%u (%.1f..%.1f%%)"
+                         " | mirror tested=%u rejected %u..%u (%.1f..%.1f%%)"
+                         " | ready=%d sunOccValid=%d skyHeightValid=%d reflGeo=%d"
+                         " | march=%.0f steps bias=%.0f margin=%.0f u%s",
+                         (int)std::max(0.0f, g_occProbeMinR),
+                         g_occProbeTested[0], g_occProbeRejMin[0], g_occProbeRejected[0],
+                         pct(g_occProbeRejMin[0], g_occProbeTested[0]),
+                         pct(g_occProbeRejected[0], g_occProbeTested[0]),
+                         g_occProbeTested[1], g_occProbeRejMin[1], g_occProbeRejected[1],
+                         pct(g_occProbeRejMin[1], g_occProbeTested[1]),
+                         pct(g_occProbeRejected[1], g_occProbeTested[1]),
+                         (int)g_live.occProbeReady, (int)g_sunOccValid, (int)g_skyHeightValid,
+                         (int)g_reflGeoReady,
+                         g_occProbeSteps, g_occProbeBias, g_occProbeMargin,
+                         (g_occProbeMinR < 0.5f) ? "  [minR=0: the two arms MUST agree]" : "");
+        }
         // G1 grass. `dispatched` is the density prefix (a knob), `drawn` the frustum+range survivors
         // (the scene), and `ring` how close the second is to the ceiling past which cullscatter
         // starts dropping rows in silence. wind is the client's smoothed vector — it being (0,0) in
@@ -45715,6 +45981,11 @@ void destroyHostWindow(Renderer* R);
         bool                   suppressNearCut;  // WV2: reflection has NO near-scene path → draw DL
                                                  // statics all the way to the eye (else near objects
                                                  // vanish from the reflection — no one else covers them).
+        // --- REFLECTION FIDELITY, axes A and B (see reflFidelity() for the whole argument) -------
+        // Per-VIEW, like everything else in this struct, and that is the point: the mirror may draw
+        // less world than the camera does without either of them knowing about the other.
+        float                  distScale;   // multiplies the three DL statics tier ends. 1 = the camera's.
+        uint32_t               lodBias;     // ADDED to the terrain's per-cell LOD pick. 0 = the camera's.
     };
 
     // Per-frame cull + ring fill (the PRIMARY call runs BEFORE command recording — it lazily creates GPU
@@ -45737,6 +46008,10 @@ void destroyHostWindow(Renderer* R);
         // terrain is drawable, so revoking it in one place covers the prepass, the colour pass, the sun
         // caster and the mirror at once, and the next pass to draw terrain can't forget its own gate.
         (T.primary ? g_terrainMain : g_terrainRefl).cells = 0;
+        // ...and, for the same reason, the reflect cull's PUBLISHED rule (H0 reads it, and so does
+        // the fidelity heartbeat line). This function has three early returns below; clearing here
+        // means a frame that took one of them reports "no reflect cull ran" rather than last frame's.
+        if (!T.primary) { g_reflCullValid = false; }
         if (!g_dlExterior) { return; }
         const double tCull0 = hostNowMs();   // CPU cull+build cost (NOT in the host record/gpu metrics)
 
@@ -45815,7 +46090,8 @@ void destroyHostWindow(Renderer* R);
         // main-view-only (it exists to leave MW's own land alone, and the reflection has no MW land
         // to leave alone), so the mirror always sees the full surface down to the eye.
         terrainCullAndBuild(T.primary ? g_terrainMain : g_terrainRefl, T.primary, planes, eye,
-                            (T.primary && g_terrainNearCut) ? g_dlNearViewRange : 0.0f);
+                            (T.primary && g_terrainNearCut) ? g_dlNearViewRange : 0.0f,
+                            T.lodBias);
 
         // Phase C: stream + UPLOAD the baked distant lights around the eye. Fill the gLights-layout
         // distant cbuffer with the NEAREST <=128 within the working radius (camera-relative: pos-eye,
@@ -45990,9 +46266,14 @@ void destroyHostWindow(Renderer* R);
         if (s_bySubset.size() != g_staticsSubsets.size()) { s_bySubset.assign(g_staticsSubsets.size(), {}); }
         s_touched.clear();
 
-        const float nearEnd = Configuration.DL.NearStaticEnd     * 8192.0f;   // cell -> world distance
-        const float farEnd  = Configuration.DL.FarStaticEnd      * 8192.0f;
-        const float vfarEnd = Configuration.DL.VeryFarStaticEnd  * 8192.0f;
+        // ...scaled by the VIEW's own fidelity multiplier. 1.0 on the main path by construction, so
+        // this is an exact identity there; the reflect wrapper is the only caller that moves it, and
+        // it moves all three tiers together so the LOD ladder keeps its shape and only its reach
+        // changes (a per-tier scale would re-order which proxy a distance picks).
+        const float distK   = (T.distScale > 0.0f) ? T.distScale : 1.0f;
+        const float nearEnd = Configuration.DL.NearStaticEnd     * 8192.0f * distK;   // cell -> world distance
+        const float farEnd  = Configuration.DL.FarStaticEnd      * 8192.0f * distK;
+        const float vfarEnd = Configuration.DL.VeryFarStaticEnd  * 8192.0f * distK;
         // (FarStaticMinSize/VeryFarStaticMinSize are now consumed at LOAD — tier is precomputed into
         //  g_cullInst.rangeEndIdx, so the per-frame hot loop no longer needs the MinSize thresholds.)
         // ---- Near/far OWNERSHIP -------------------------------------------------------------------
@@ -46166,6 +46447,22 @@ void destroyHostWindow(Renderer* R);
         }
         }   // end else (cpuStaticsCull) — CPU cell-walk + ring fill
 
+        // The REFLECT cull's rule, published to host memory. It has no CullParams cbuffer of its own —
+        // the GPU cull drives the PRIMARY statics draw only — so without this there is no record
+        // anywhere of the frustum, eye and tier ranges the mirror actually ran with. Two consumers
+        // need exactly that: H0's mirror probe, whose denominator must BE the drawn set rather than a
+        // reconstruction of it, and the fidelity heartbeat line, which has to be able to prove an arm
+        // took (`waterNoReflect` is the cautionary tale — it reads like the reflection's off switch
+        // and moves the frame by 0.05 ms).
+        if (!T.primary) {
+            for (int p = 0; p < 6; ++p) { std::memcpy(g_reflCullPlanes[p], planes[p], 4 * sizeof(float)); }
+            g_reflCullEye[0] = eye[0]; g_reflCullEye[1] = eye[1]; g_reflCullEye[2] = eye[2];
+            g_reflCullRanges[0] = nearEnd * nearEnd;
+            g_reflCullRanges[1] = farEnd  * farEnd;
+            g_reflCullRanges[2] = vfarEnd * vfarEnd;
+            g_reflCullValid = true;
+        }
+
         // Stage B: mirror the EXACT planes/eye/ranges into the GPU cull cbuffer (the 3-pass dispatch runs
         // cbuffer (the validation dispatch runs during command recording, post-beginCmd). The GPU
         // tests every instance with this identical rule → its Σ numSubsets must equal g_liveLastInst.
@@ -46280,13 +46577,24 @@ void destroyHostWindow(Renderer* R);
         T.lastInst    = &g_liveLastInst;
         T.primary     = true;
         T.suppressNearCut = g_dlNoStaticsNearCut;   // viewer inspection: keep statics right up to the eye
+        T.distScale   = 1.0f;   // the camera IS the reference for both fidelity axes
+        T.lodBias     = 0u;
         dlCullAndBuild(R, rzViewProj, T);
     }
 
     // WV2 reflect-path wrapper: cull into the REFLECTION rings/land-list with the mirror-about-water
-    // viewProj (frustum planes only differ — tier/distance ranges + g_dlEye are the REAL eye, so the
-    // reflection draw distance == the DL draw distance). primary=false: no lazy init / no gFrameData /
-    // no GPU-cull cbuffer write, so it is safe to run mid-command-buffer (the primary cull already ran).
+    // viewProj. g_dlEye stays the REAL eye — the mirror is a frustum, not a camera move, and every
+    // distance in the cull is measured from the true viewpoint. primary=false: no lazy init / no
+    // gFrameData / no GPU-cull cbuffer write, so it is safe to run mid-command-buffer (the primary
+    // cull already ran).
+    //
+    // ⚠ THE REFLECTION'S DRAW DISTANCE IS NO LONGER THE DL DRAW DISTANCE. It used to be, and this
+    // comment used to say so as a deliberate choice; the reason it changed is that `refl 284/285`
+    // established there is nothing left for frustum culling to remove here — a mirrored frustum at
+    // eye level over a flat plane sees almost exactly what the camera sees — so distance and detail
+    // are the only levers the mirror has. Both now ride the surface ROUGHNESS through reflFidelity(),
+    // whose whole argument is up there beside waterBaseSlopeGain(). At the shipped defaults both
+    // resolve to the identity (distScale 1.0, lodBias 0) and this call is byte-for-byte the old one.
     void dlReflectCullAndBuild(Renderer* R, const float* mirrorViewProj) {
         DlCullTargets T = {};
         T.instRing    = &g_pStaticsInstRingRefl;
@@ -46295,6 +46603,8 @@ void destroyHostWindow(Renderer* R);
         T.lastInst    = &g_liveLastInstRefl;
         T.primary     = false;
         T.suppressNearCut = true;   // draw DL statics to the eye (reflection has no near-scene path)
+        T.distScale   = reflDistScale();   // axis A
+        T.lodBias     = reflLodBias();     // axis B
         dlCullAndBuild(R, mirrorViewProj, T);
     }
 
@@ -46503,6 +46813,211 @@ void destroyHostWindow(Renderer* R);
         bufBarrier(g_live.pSunArgs,    RESOURCE_STATE_UNORDERED_ACCESS, RESOURCE_STATE_INDIRECT_ARGUMENT);
         bufBarrier(g_live.pSunInstOut, RESOURCE_STATE_UNORDERED_ACCESS, RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);
         g_live.sunArgsInDrawState = true;
+        cmdEndDebugMarker(g_live.pCmd);
+    }
+
+    // ═══ H0 — THE HEIGHT-FIELD OCCLUSION PROBE (tasks/forge-heightfield-occlusion.md) ═══════════
+    //
+    // Lazy: nothing here exists until `occProbe` is armed, so the shipped default allocates no
+    // buffers, creates no pipeline and dispatches nothing. Non-fatal on every failure — a probe that
+    // cannot run must never cost a frame.
+    //
+    // ⚠ THE PLAN FILE SAID "CPU-march the height field", AND THAT IS WRONG FOR THE HALF THAT
+    // MATTERS. The terrain layer is CPU-resident (Terrain::cellAt, and grassGroundAt already
+    // bilinear-samples it), but the STATICS layer exists only as GPU raster output — and in a town
+    // the buildings ARE the occluders. A CPU probe would have measured the half that cannot answer
+    // the question.
+    // ⚠ THIS IS RETRIED EVERY FRAME UNTIL IT SUCCEEDS, because its inputs arrive at different times
+    // (the instance buffer only exists after the first exterior cull). So the two failure kinds have
+    // to be told apart: NOT-YET is silent and retries, while a REAL failure latches and never runs
+    // again — a per-frame addShader retry would be both a log flood and a stall, and the honest
+    // report for it is one line and then silence.
+    bool g_occProbeCreateFailed = false;
+    bool createOccProbeResources(Renderer* R) {
+        if (g_live.pOccProbePipeline) { return g_live.occProbeReady; }
+        if (g_occProbeCreateFailed) { return false; }
+        if (!R || !g_live.pCullInstBuf || !g_live.cullInstCount) { return false; }
+        if (!g_live.pSkyHeight || !g_live.pSunOcc) { return false; }   // not yet — retry next frame
+        auto fail = [&](const char* what) {
+            g_occProbeCreateFailed = true;
+            std::printf("[forge][occprobe] %s — probe DISABLED for this session\n", what);
+            LOG::logline("!! [forge][occprobe] %s — probe DISABLED for this session", what);
+            return false;
+        };
+
+        for (uint32_t v = 0; v < 2u; ++v) {
+            // (1) The VIEW's CullParams, copied per frame. 512 B is the struct; the cbuffer is sized
+            //     the way pSunCullParamsCbv is.
+            BufferLoadDesc cb = {};
+            cb.mDesc.mDescriptors = DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+            cb.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_CPU_TO_GPU;
+            cb.mDesc.mFlags       = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
+            cb.mDesc.mSize        = 512;
+            cb.mDesc.pName        = "occProbeCullParams";
+            cb.ppBuffer           = &g_live.pOccProbeCullCbv[v];
+            addResource(&cb, nullptr);
+
+            BufferLoadDesc pb = {};
+            pb.mDesc.mDescriptors = DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+            pb.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_CPU_TO_GPU;
+            pb.mDesc.mFlags       = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
+            pb.mDesc.mSize        = 256;   // four float4s; 256 B = min CBV
+            pb.mDesc.pName        = "occProbeParams";
+            pb.ppBuffer           = &g_live.pOccProbeParamsCbv[v];
+            addResource(&pb, nullptr);
+
+            // (2) The counters, and their readback. Reset from the SHARED pCullCountZero (16 B),
+            //     exactly as every other counter on this host is.
+            BufferLoadDesc cc = {};
+            cc.mDesc.mDescriptors  = DESCRIPTOR_TYPE_RW_BUFFER;
+            cc.mDesc.mMemoryUsage  = RESOURCE_MEMORY_USAGE_GPU_ONLY;
+            cc.mDesc.mStructStride = sizeof(uint32_t);
+            cc.mDesc.mElementCount = 4;
+            cc.mDesc.mSize         = (uint64_t)sizeof(uint32_t) * 4;
+            cc.mDesc.mStartState   = RESOURCE_STATE_UNORDERED_ACCESS;
+            cc.mDesc.pName         = "occProbeCount";
+            cc.ppBuffer            = &g_live.pOccProbeCount[v];
+            addResource(&cc, nullptr);
+
+            // ⚠ NO mDescriptors ON THE READBACK. A GPU_TO_CPU buffer that also asks for a descriptor
+            //    is a host that dies silently — the same note the mbStats pair carries.
+            BufferLoadDesc rb = {};
+            rb.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_GPU_TO_CPU;
+            rb.mDesc.mFlags       = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
+            rb.mDesc.mSize        = 16;
+            rb.mDesc.mStartState  = RESOURCE_STATE_COPY_DEST;
+            rb.mDesc.pName        = "occProbeReadback";
+            rb.ppBuffer           = &g_live.pOccProbeReadback[v];
+            addResource(&rb, nullptr);
+        }
+        waitForAllResourceLoads();
+        for (uint32_t v = 0; v < 2u; ++v) {
+            if (!g_live.pOccProbeCullCbv[v] || !g_live.pOccProbeParamsCbv[v]
+                || !g_live.pOccProbeCount[v] || !g_live.pOccProbeReadback[v]) {
+                return fail("resource alloc FAILED");
+            }
+        }
+
+        {
+            ShaderLoadDesc sd = {};
+            sd.mComp.pFileName = "occprobe.comp";
+            addShader(R, &sd, &g_live.pOccProbeShader);
+            if (!g_live.pOccProbeShader) { return fail("addShader FAILED"); }
+            PipelineDesc pd = {};
+            pd.mType = PIPELINE_TYPE_COMPUTE;
+            pd.mComputeDesc.pShaderProgram = g_live.pOccProbeShader;
+            addPipeline(R, &pd, &g_live.pOccProbePipeline);
+            if (!g_live.pOccProbePipeline) { return fail("addPipeline FAILED"); }
+        }
+        // ONE descriptor set, TWO instances — the two views differ in nothing but their two cbuffers
+        // and their counter, so a second DescriptorSet object would be three identical binds copied.
+        DescriptorSetDesc dsd = SRT_SET_DESC(OccProbeSrtData, PerBatch, 2, 0);
+        addDescriptorSet(R, &dsd, &g_live.pOccProbeSet);
+        if (!g_live.pOccProbeSet) { return fail("addDescriptorSet FAILED"); }
+        for (uint32_t v = 0; v < 2u; ++v) {
+            DescriptorData d[6] = {};
+            uint32_t n = 0;
+            d[n].mIndex    = SRT_RES_IDX(OccProbeSrtData, PerBatch, gCullParams);
+            d[n].ppBuffers = &g_live.pOccProbeCullCbv[v]; ++n;
+            d[n].mIndex    = SRT_RES_IDX(OccProbeSrtData, PerBatch, gProbeParams);
+            d[n].ppBuffers = &g_live.pOccProbeParamsCbv[v]; ++n;
+            d[n].mIndex    = SRT_RES_IDX(OccProbeSrtData, PerBatch, gCullInst);
+            d[n].mCount = 1; d[n].ppBuffers = &g_live.pCullInstBuf; ++n;      // shared input (= the cull's)
+            d[n].mIndex    = SRT_RES_IDX(OccProbeSrtData, PerBatch, gProbeHeight);
+            d[n].mCount = 1; d[n].ppTextures = &g_live.pSkyHeight->pTexture; ++n;
+            d[n].mIndex    = SRT_RES_IDX(OccProbeSrtData, PerBatch, gProbeSunOcc);
+            d[n].mCount = 1; d[n].ppTextures = &g_live.pSunOcc; ++n;
+            d[n].mIndex    = SRT_RES_IDX(OccProbeSrtData, PerBatch, gProbeCount);
+            d[n].mCount = 1; d[n].ppBuffers = &g_live.pOccProbeCount[v]; ++n;
+            updateDescriptorSet(R, v, g_live.pOccProbeSet, n, d);
+        }
+        g_live.occProbeReady = true;
+        std::printf("[forge][occprobe] ready — %u instances, height %u² @ %.0f u, sunocc %u² @ %.0f u\n",
+                    g_live.cullInstCount, kSkyHeightRes, kSkyHeightTexel, kSunOccRes, kSunOccTexel);
+        return true;
+    }
+
+    // The two dispatches. ⚠ CALLED FROM OUTSIDE EVERY gpuPhaseBegin/End BRACKET, and that is not
+    // tidiness: an instrument folded into a timer describes the instrument as well as the pass
+    // ([[feedback_phase_timer_can_bracket_a_strangers_pass]]), and this one exists precisely to
+    // explain the phases it would otherwise be inside. The reads are one frame late by construction,
+    // which is irrelevant for a counter.
+    void dispatchOccProbe() {
+        if (!(g_occProbe > 0.0f) || !g_live.occProbeReady || !g_live.pOccProbePipeline) { return; }
+        if (!g_dlExterior || !g_live.cullInstCount || !g_live.pCullCountZero) { return; }
+
+        // Which views have something to say THIS frame. Either may be silent on its own; a silent
+        // view reports 0/0, which reads differently from "0 rejected out of 12,000".
+        const bool sunArm = g_live.sunCullReady && g_sunOccValid && g_skyHeightValid
+                         && g_live.pSunCullParamsCbv && g_live.pSunCullParamsCbv->pCpuMappedAddress;
+        const bool reflArm = g_reflGeoReady && g_reflCullValid && g_skyHeightValid
+                          && g_live.pCullParamsCbv && g_live.pCullParamsCbv->pCpuMappedAddress;
+        if (!sunArm && !reflArm) { return; }
+
+        ID3D12GraphicsCommandList* cl = g_live.pCmd->mDx.pCmdList;
+        auto bufBarrier = [&](Buffer* buf, ResourceState from, ResourceState to) {
+            BufferBarrier bb = {}; bb.pBuffer = buf; bb.mCurrentState = from; bb.mNewState = to;
+            cmdResourceBarrier(g_live.pCmd, 1, &bb, 0, nullptr, 0, nullptr);
+        };
+
+        cmdBeginDebugMarker(g_live.pCmd, 0.5f, 0.5f, 0.95f, "OCC PROBE (H0)");
+        for (uint32_t v = 0; v < 2u; ++v) {
+            const bool isSun = (v == 0u);
+            if (isSun ? !sunArm : !reflArm) { continue; }
+
+            // --- the VIEW's own cull rule, copied whole ------------------------------------------
+            float* cp = (float*)g_live.pOccProbeCullCbv[v]->pCpuMappedAddress;
+            if (isSun) {
+                // The sun cull publishes a complete CullParams every frame, so the sun probe's
+                // denominator is that cull's own numbers with nothing reconstructed at all.
+                std::memcpy(cp, g_live.pSunCullParamsCbv->pCpuMappedAddress, 512);
+            } else {
+                // The mirror has no cbuffer of its own, so start from the CAMERA's (which carries
+                // misc = the instance/subset counts and the whole visMask — both shared, and both
+                // things the reflect CPU cull genuinely applies) and override the four fields that
+                // are the mirror's alone. Exactly the shape dispatchSunCull uses for the same reason.
+                std::memcpy(cp, g_live.pCullParamsCbv->pCpuMappedAddress, 512);
+                for (int pl = 0; pl < 6; ++pl) { std::memcpy(cp + pl * 4, g_reflCullPlanes[pl], 4 * sizeof(float)); }
+                cp[24] = g_reflCullEye[0]; cp[25] = g_reflCullEye[1]; cp[26] = g_reflCullEye[2];
+                cp[28] = g_reflCullRanges[0]; cp[29] = g_reflCullRanges[1]; cp[30] = g_reflCullRanges[2];
+                cp[31] = 0.0f;    // nearCut² — the reflect cull suppresses it (no near-scene path reflects)
+                cp[55] = 0.0f;    // hizParams.w = 0: the pyramid is the CAMERA's, and this shader
+                                  //   runs no Hi-Z test anyway — zeroed so it cannot start meaning something
+                cp[127] = 0.0f;   // cellOwn.w = 0: ownership is off in the mirror, same reason
+            }
+
+            // --- the probe's own params ----------------------------------------------------------
+            float* pp = (float*)g_live.pOccProbeParamsCbv[v]->pCpuMappedAddress;
+            pp[0] = g_skyHeightOrigin[0]; pp[1] = g_skyHeightOrigin[1];
+            pp[2] = kSkyHeightTexel;      pp[3] = (float)kSkyHeightRes;
+            pp[4] = (float)kSunOccRes;    pp[5] = kSunOccTexel;
+            pp[6] = g_sunOccValid ? 1.0f : 0.0f; pp[7] = 0.0f;
+            pp[8]  = isSun ? 0.0f : 1.0f;                       // mode
+            pp[9]  = g_reflMirrorZAbs;                          // the water plane (mirror only)
+            pp[10] = std::max(1.0f, g_occProbeSteps);
+            pp[11] = g_occProbeBias;
+            pp[12] = std::max(0.0f, g_occProbeMargin);
+            pp[13] = std::max(0.0f, g_occProbeMinR);   // the conservative arm's radius (0 = collapse)
+            pp[14] = pp[15] = 0.0f;
+
+            // ⚠ ALL FOUR uints, not two. The bracket added a third counter, and a reset that still
+            // spanned two would have left [2] accumulating across every frame of the session — a
+            // floor that only ever grows, which reads as a probe finding more and more occlusion the
+            // longer you look at it. pCullCountZero is 16 B of zeros, so the whole struct is free.
+            bufBarrier(g_live.pOccProbeCount[v], RESOURCE_STATE_UNORDERED_ACCESS, RESOURCE_STATE_COPY_DEST);
+            cl->CopyBufferRegion(g_live.pOccProbeCount[v]->mDx.pResource, 0,
+                                 g_live.pCullCountZero->mDx.pResource, 0, 4 * sizeof(uint32_t));
+            bufBarrier(g_live.pOccProbeCount[v], RESOURCE_STATE_COPY_DEST, RESOURCE_STATE_UNORDERED_ACCESS);
+
+            cmdBindPipeline(g_live.pCmd, g_live.pOccProbePipeline);
+            cmdBindDescriptorSet(g_live.pCmd, v, g_live.pOccProbeSet);
+            cmdDispatch(g_live.pCmd, (g_live.cullInstCount + 63u) / 64u, 1, 1);
+
+            bufBarrier(g_live.pOccProbeCount[v], RESOURCE_STATE_UNORDERED_ACCESS, RESOURCE_STATE_COPY_SOURCE);
+            cl->CopyBufferRegion(g_live.pOccProbeReadback[v]->mDx.pResource, 0,
+                                 g_live.pOccProbeCount[v]->mDx.pResource, 0, 4 * sizeof(uint32_t));
+            bufBarrier(g_live.pOccProbeCount[v], RESOURCE_STATE_COPY_SOURCE, RESOURCE_STATE_UNORDERED_ACCESS);
+        }
         cmdEndDebugMarker(g_live.pCmd);
     }
 
@@ -48159,7 +48674,8 @@ void destroyHostWindow(Renderer* R);
                 { -za[0], -za[1], -za[2], depthHalf }, {  za[0],  za[1],  za[2], depthHalf },
             };
             const float eye[3] = { g_dlEye[0], g_dlEye[1], g_dlEye[2] };
-            terrainCullAndBuild(g_terrainSun, /*primary*/false, planes, eye, /*nearCut*/0.0f);
+            terrainCullAndBuild(g_terrainSun, /*primary*/false, planes, eye, /*nearCut*/0.0f,
+                                /*lodBias*/0u);
         }
 
         cmdBeginDebugMarker(g_live.pCmd, 0.9f, 0.85f, 0.2f, "SUN SHADOW (DL statics + terrain)");
@@ -48783,6 +49299,7 @@ void destroyHostWindow(Renderer* R);
 
         // Mirror about the water plane: the sky's M with M[14] = 2·dRel (reflect about z = dRel, the
         // camera-relative water level). Same reverse-Z + half-pixel edits the sky/main paths apply.
+        g_reflMirrorZAbs = waterMirrorZ(waterLevelAbs);   // H0's mirror march (absolute, not camera-relative)
         float MG[16] = { 1,0,0,0,  0,1,0,0,  0,0,-1,0,  0,0,2.0f*dRel,1 };
         float mirrorGeoVP[16];
         mul4x4(MG, viewProj, mirrorGeoVP);
@@ -49784,6 +50301,17 @@ void destroyHostWindow(Renderer* R);
         if (g_live.pSunArgs)           { removeResource(g_live.pSunArgs);            g_live.pSunArgs = nullptr; }
         if (g_live.pSunInstOut)        { removeResource(g_live.pSunInstOut);         g_live.pSunInstOut = nullptr; }
         g_live.sunCullReady = false; g_live.sunArgsInDrawState = false;
+        // H0 probe (only ever non-null if `occProbe` armed the lazy create).
+        for (uint32_t v = 0; v < 2u; ++v) {
+            if (g_live.pOccProbeCullCbv[v])   { removeResource(g_live.pOccProbeCullCbv[v]);   g_live.pOccProbeCullCbv[v] = nullptr; }
+            if (g_live.pOccProbeParamsCbv[v]) { removeResource(g_live.pOccProbeParamsCbv[v]); g_live.pOccProbeParamsCbv[v] = nullptr; }
+            if (g_live.pOccProbeCount[v])     { removeResource(g_live.pOccProbeCount[v]);     g_live.pOccProbeCount[v] = nullptr; }
+            if (g_live.pOccProbeReadback[v])  { removeResource(g_live.pOccProbeReadback[v]);  g_live.pOccProbeReadback[v] = nullptr; }
+        }
+        if (g_live.pOccProbeSet)      { removeDescriptorSet(R, g_live.pOccProbeSet);  g_live.pOccProbeSet = nullptr; }
+        if (g_live.pOccProbePipeline) { removePipeline(R, g_live.pOccProbePipeline);  g_live.pOccProbePipeline = nullptr; }
+        if (g_live.pOccProbeShader)   { removeShader(R, g_live.pOccProbeShader);      g_live.pOccProbeShader = nullptr; }
+        g_live.occProbeReady = false;
         // SH2 stage B: the third-cull resources (same clone, same teardown).
         if (g_live.pSkyCullSet)        { removeDescriptorSet(R, g_live.pSkyCullSet); g_live.pSkyCullSet = nullptr; }
         if (g_live.pSkyCullParamsCbv)  { removeResource(g_live.pSkyCullParamsCbv);   g_live.pSkyCullParamsCbv = nullptr; }

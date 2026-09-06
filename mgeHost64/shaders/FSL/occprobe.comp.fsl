@@ -1,0 +1,288 @@
+// mgeHost64 — H0: the height-field OCCLUSION PROBE. One thread per resident static instance.
+//
+// See occprobe.srt.h for what this measures and why the number is an UPPER BOUND. This file is the
+// two tests, and they are asymmetric on purpose:
+//
+//   SUN     — no march at all. gSunOcc already stores blockZ, the sun-BLOCKED world Z per texel, so
+//             "is this instance entirely in shadow" is one integer load and one compare. If it is,
+//             it casts nothing that is not already cast by whatever is blocking it, so the sun
+//             shadow pass need never have drawn it.
+//   MIRROR  — a march over gSkyHeight, and it has ONE non-obvious rule: it starts at the ray's
+//             WATER-PLANE CROSSING, not at the mirrored eye. The mirror camera sits BELOW the water
+//             plane, so a march started there begins underground and reports everything blocked.
+//             The physical path is camera -> water surface -> object, and only the segment past the
+//             surface is in the air where an above-water occluder can stand.
+//
+// Both halves re-run the VIEW'S OWN cull rule first (same header functions, same gCullParams the
+// view's real cull ran with) so the denominator is the drawn set rather than a reconstruction of it.
+// Every uncertain case counts as NOT rejected — an over-reported bound would be the one answer that
+// could buy machinery nobody needs.
+
+#include "occprobe.srt.h"
+#include "cellown.h.fsl"
+
+// ── THE CONSERVATIVE HALF: H1's MIN-PYRAMID, EMULATED WITHOUT BUILDING IT ────────────────────
+//
+// H0's raw compare uses gSkyHeight / gSunOcc as they are, and those are MAX fields — so it
+// over-rejects and reports a CEILING. That number cannot decide H2 on its own: the ceiling could be
+// 87% while the answer H2 would actually get is 30%, and nothing in a ceiling distinguishes those.
+//
+// What H2 would run on is H1's MIN-pyramid, and a min-pyramid over this field is, by definition,
+// `min` over a neighbourhood of max-texels. So the answer H2 would give is reachable HERE, at one
+// scale, by gathering (2R+1)² texels and taking the min — no new texture, no new format, no reduce
+// chain, no D3D12 typed-UAV-load question. That makes the second arm a PREVIEW of H1's own answer
+// rather than an abstract bound, and the pair brackets the decision:
+//
+//     rejected(min)  <=  what H2 would reject  <=  rejected(max)
+//
+// ⚠ IT IS ONE SCALE, NOT A PYRAMID. A real hierarchical march picks a level from the ray's
+// footprint, which widens with distance; this uses one fixed radius the whole way. So the floor arm
+// approximates H2, it does not predict it exactly — and the honest use of it is the WIDTH of the
+// bracket, not the floor as a promise.
+//
+// ⚠ AN UNKNOWN NEIGHBOUR DISARMS THE CLAIM ENTIRELY. Off the window we do not know what is there,
+// and a min that quietly skipped the gap it could not see would be asserting occlusion from missing
+// data — the one direction a conservative test may never fail in.
+float heightMinAround(int2 sp, int r, int res)
+{
+    float m = 1.0e9f;
+    for (int dy = -r; dy <= r; ++dy)
+    {
+        for (int dx = -r; dx <= r; ++dx)
+        {
+            int2 q = sp + int2(dx, dy);
+            if (q.x < 0 || q.y < 0 || q.x >= res || q.y >= res)
+            {
+                return -1.0e9f;   // unknown neighbour -> no claim (see above)
+            }
+            // An EMPTY texel carries the huge negative SKY_HEIGHT_NONE sentinel, and it wins this
+            // min — which is exactly right and needs no branch: a footprint with a gap in it cannot
+            // claim to block anything.
+            m = min(m, LoadTex2D(gProbeHeight, NO_SAMPLER, q, 0).r);
+        }
+    }
+    return m;
+}
+
+// Same reduction over gSunOcc. Its blockZ is DERIVED from the same max field, so it inherits the
+// same over-shadowing and takes the same treatment. (A second function rather than a parameterised
+// one: FSL has no templates and the two textures are different bindings.)
+float sunOccMinAround(int2 sp, int r, int res)
+{
+    float m = 1.0e9f;
+    for (int dy = -r; dy <= r; ++dy)
+    {
+        for (int dx = -r; dx <= r; ++dx)
+        {
+            int2 q = sp + int2(dx, dy);
+            if (q.x < 0 || q.y < 0 || q.x >= res || q.y >= res)
+            {
+                return -1.0e9f;
+            }
+            m = min(m, LoadTex2D(gProbeSunOcc, NO_SAMPLER, q, 0).r);
+        }
+    }
+    return m;
+}
+
+ROOT_SIGNATURE(ComputeRootSignature)
+NUM_THREADS(64, 1, 1)
+void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
+{
+    INIT_MAIN;
+
+    // NB: every RETURN() starts its own line — fsl.py's rewrite is line-based and an inline
+    // `{ RETURN(); }` transpiles to `return ()`.
+    uint i = DispatchThreadID.x;
+    if (i >= (uint)gCullParams.misc.x)
+    {
+        RETURN();
+    }
+
+    CullInstance inst = gCullInst[i];
+    if (inst.rangeEndIdx == 0xFFFFFFFFu)   // grass / invalid — not this lane's population
+    {
+        RETURN();
+    }
+
+    // ---- the VIEW'S cull rule, verbatim from cull.comp.fsl -------------------------------------
+    // Same tests, same order, same header functions. What this reproduces is the DENOMINATOR: the
+    // set the view actually submits. Both probed views publish misc.w = 0 and cellOwn.w = 0, so two
+    // of these are identities today — they are here anyway, because the day one of them is armed the
+    // probe would otherwise start counting instances nobody draws.
+    if (inst.effR < gCullParams.misc.w)
+    {
+        RETURN();
+    }
+    if (inst.visIndex != 0u && inst.visIndex < DL_VIS_MASK_BITS)
+    {
+        uint visWord = asuint(gCullParams.visMask[inst.visIndex >> 7u][(inst.visIndex >> 5u) & 3u]);
+        if (((visWord >> (inst.visIndex & 31u)) & 1u) == 0u)
+        {
+            RETURN();
+        }
+    }
+
+    float rangeEnd2 = (inst.rangeEndIdx == 0u) ? gCullParams.ranges.x
+                    : (inst.rangeEndIdx == 1u) ? gCullParams.ranges.y
+                                               : gCullParams.ranges.z;
+
+    float dx = inst.posX - gCullParams.eye.x;
+    float dy = inst.posY - gCullParams.eye.y;
+    float cz = inst.posZ - gCullParams.eye.z;
+    float d2 = dx * dx + dy * dy;
+    float dNear2 = d2 + cz * cz;
+    if (dNear2 < gCullParams.ranges.w || d2 > rangeEnd2)
+    {
+        RETURN();
+    }
+    if (nearPathCovers(nearPathSlab(inst.wr3.x, inst.wr3.y), dNear2, inst.effR))
+    {
+        RETURN();
+    }
+    UNROLL
+    for (uint p = 0u; p < 6u; ++p)
+    {
+        float4 pl = gCullParams.planes[p];
+        float  dist = pl.x * dx + pl.y * dy + pl.z * cz + pl.w;
+        if (dist < -inst.effR)
+        {
+            RETURN();
+        }
+    }
+
+    // Past this line the view IS drawing this instance. It is part of the denominator no matter what
+    // the occlusion test says — count it before the test, so a bug in the test can never inflate the
+    // ratio by shrinking what it divides by.
+    uint origTested;
+    AtomicAdd(gProbeCount[0], 1u, origTested);
+
+    float2 org      = gProbeParams.map.xy;
+    float  texel    = max(gProbeParams.map.z, 1.0f);
+    float  invTexel = 1.0f / texel;
+    int    res      = (int)gProbeParams.map.w;
+    float  bias     = gProbeParams.probe.w;
+    // The conservative arm's neighbourhood RADIUS in texels. 0 makes the two arms mathematically
+    // identical (min over a 1x1 IS the sample), which is the built-in self-check: at occProbeMinR=0
+    // the two counters MUST agree exactly.
+    int    minR     = (int)max(gProbeParams.margin.y, 0.0f);
+    // The TOP of the bound sphere. Testing the sightline to the highest point is what makes a
+    // rejection conservative in the vertical: rays from the same origin to any lower point of the
+    // sphere lie UNDER this one, so a field that blocks this ray blocks those too. (Horizontally it
+    // does not — rays to the sphere's left and right edges leave on different bearings — and that
+    // slack is one of the two reasons this is an upper bound, the max-field being the other.)
+    float  top      = inst.posZ + inst.effR;
+
+    if (gProbeParams.probe.x < 0.5f)
+    {
+        // ---- SUN: one compare against the sun-BLOCKED height ----------------------------------
+        if (gProbeParams.sunMap.z < 0.5f)
+        {
+            RETURN();               // no valid map (night / not built) — nothing to claim
+        }
+        float sunTexel = max(gProbeParams.sunMap.y, 1.0f);
+        int   sunRes   = (int)gProbeParams.sunMap.x;
+        int2  sp = int2(floor((float2(inst.posX, inst.posY) - org) / sunTexel));
+        if (sp.x < 0 || sp.y < 0 || sp.x >= sunRes || sp.y >= sunRes)
+        {
+            RETURN();               // outside the window — we do not know, so we do not claim
+        }
+        float blockZ = LoadTex2D(gProbeSunOcc, NO_SAMPLER, sp, 0).r;
+        // An empty texel carries a hugely negative sentinel, so it loses this compare with no branch.
+        if (top + bias < blockZ)
+        {
+            uint origRej;
+            AtomicAdd(gProbeCount[1], 1u, origRej);          // [1] = CEILING (the raw max field)
+            // The conservative arm only ever fires where the ceiling arm already did (min <= max),
+            // so it is nested — which also means it costs its 9 loads only on the instances that
+            // are candidates at all.
+            float blockZMin = sunOccMinAround(sp, minR, sunRes);
+            if (top + bias < blockZMin)
+            {
+                uint origRejMin;
+                AtomicAdd(gProbeCount[2], 1u, origRejMin);   // [2] = FLOOR (H1's min, emulated)
+            }
+        }
+        RETURN();
+    }
+
+    // ---- MIRROR: march gSkyHeight from the WATER-PLANE CROSSING to the instance ----------------
+    float waterZ = gProbeParams.probe.y;
+    // The mirrored eye. It is BELOW the plane whenever the camera is above it, which is the whole
+    // reason the march cannot start here.
+    float3 eyeM = float3(gCullParams.eye.x, gCullParams.eye.y, 2.0f * waterZ - gCullParams.eye.z);
+    if (eyeM.z >= waterZ)
+    {
+        RETURN();                   // camera at or under the surface — the crossing is not this ray
+    }
+    float3 tgt   = float3(inst.posX, inst.posY, top);
+    float  denom = tgt.z - eyeM.z;
+    if (denom <= 1.0e-3f)
+    {
+        RETURN();                   // target at/below the mirrored eye — no above-water segment
+    }
+    float t0 = (waterZ - eyeM.z) / denom;
+    if (t0 >= 1.0f)
+    {
+        RETURN();                   // the whole instance is under water; the reflect clip plane owns it
+    }
+    t0 = max(t0, 0.0f);
+    float3 S = eyeM + (tgt - eyeM) * t0;   // the point where the sightline leaves the water
+
+    // Horizontal run of the above-water segment, minus the END MARGIN. The margin is not a fudge:
+    // the instance is ITSELF in gSkyHeight, so the last texels of this march hold its own roof, and
+    // without stopping short every object would report itself occluded by itself.
+    float2 dxy = tgt.xy - S.xy;
+    float  L   = length(dxy);
+    float  end = inst.effR + texel + gProbeParams.margin.x;
+    if (L <= end)
+    {
+        RETURN();                   // too close for the field to separate the object from its own footprint
+    }
+    float tEnd = (L - end) / L;
+
+    int steps = (int)max(gProbeParams.probe.z, 1.0f);
+    // UNIFORM spacing, unlike sunocc.comp's geometric march, and the difference is the ray's shape.
+    // The sun march is semi-infinite from the surface it is shading, so its near taps decide almost
+    // everything and geometric spacing buys reach for free. This segment is BOUNDED at both ends —
+    // water surface to object — and a blocking ridge is as likely at its middle as at either end, so
+    // there is no place to concentrate samples and uniform is the honest choice. Cost is bounded by
+    // `steps` either way; this is a probe, and it is off by default.
+    // BOTH arms walk the SAME march, which is the whole point: they see the identical ray, the
+    // identical steps and the identical instance, so the bracket is exact per instance rather than
+    // two runs differenced across drift.
+    bool occMax = false;
+    for (int k = 1; k <= steps; ++k)
+    {
+        float  t = tEnd * ((float)k / (float)steps);
+        float3 p = S + (tgt - S) * t;
+        int2   sp = int2(floor((p.xy - org) * invTexel));
+        if (sp.x < 0 || sp.y < 0 || sp.x >= res || sp.y >= res)
+        {
+            continue;               // off the window: unknown, and INVENTING an occluder is the one
+                                    // unrecoverable answer (sunocc.comp.fsl makes the same call)
+        }
+        float rz = p.z + bias;
+        float h  = LoadTex2D(gProbeHeight, NO_SAMPLER, sp, 0).r;
+        if (!occMax && h > rz)
+        {
+            occMax = true;
+            uint origRej;
+            AtomicAdd(gProbeCount[1], 1u, origRej);          // [1] = CEILING (the raw max field)
+        }
+        // ⚠ THE MIN TEST CANNOT BE NESTED INSIDE THE MAX TEST HERE, unlike the sun's. The two arms
+        // may fire at DIFFERENT STEPS along the ray — the max field blocks at the first roof it
+        // clips, while the min needs a step where the whole neighbourhood is above the ray, which
+        // may be further along or not at all. Nesting it would have silently reported the floor as
+        // "only where the ceiling fired FIRST", i.e. a different question.
+        float hMin = heightMinAround(sp, minR, res);
+        if (hMin > rz)
+        {
+            uint origRejMin;
+            AtomicAdd(gProbeCount[2], 1u, origRejMin);       // [2] = FLOOR (H1's min, emulated)
+            break;   // min > rz implies max > rz, so the ceiling has already been counted
+        }
+    }
+
+    RETURN();
+}

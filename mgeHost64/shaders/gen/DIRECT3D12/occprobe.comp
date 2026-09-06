@@ -972,152 +972,397 @@ SamplerState gSampler2xWrapClamp : register( s17 , space100 ) ;
 #line 247 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/../../../3rdparty/The-Forge/Common_3/Graphics/FSL/defaults.h"
 
 #line 11 "FSL/shaders.list"
-#line 754 "FSL/shaders.list"
-#line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/grasscrushsplat.comp.fsl"
-#line 28 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/grasscrushsplat.comp.fsl"
-#line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/grasscrushkey.h.fsl"
-#line 18 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/grasscrushkey.h.fsl"
-#line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/grasscrush.srt.h"
-#line 234 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/grasscrush.srt.h"
-STRUCT(GrassCrushParams)
+#line 672 "FSL/shaders.list"
+#line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/occprobe.comp.fsl"
+#line 21 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/occprobe.comp.fsl"
+#line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/occprobe.srt.h"
+#line 29 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/occprobe.srt.h"
+#line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/cullparams.h.fsl"
+#line 26 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/cullparams.h.fsl"
+STRUCT(CullInstance)
+{
+    float4 wr0;
+    float4 wr1;
+    float4 wr2;
+    float4 wr3;
+
+    float posX;
+    float posY;
+    float posZ;
+    float effR;
+    uint rangeEndIdx;
+    uint firstSubset;
+    uint numSubsets;
+    uint visIndex;
+
+#line 42
+};
+
+
+STRUCT(StaticsSubset)
+{
+    uint vbBase;
+    uint ibBase;
+    uint indexCount;
+    uint texSlot;
+    uint flags;
+#line 52
+};
+
+STRUCT(CullParams)
+{
+    float4 planes[6];
+    float4 eye;
+    float4 ranges;
+    float4 misc;
+
+
+
+
+
+
+
+
+
+
+    float4x4 hizVP;
+    float4 hizParams;
+    float4 hizEyeDelta;
+
+
+
+
+
+
+
+    float4 visMask[16];
+
+
+
+
+
+
+    float4 cellOwn;
+#line 88
+};
+#line 30 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/occprobe.srt.h"
+
+
+
+
+
+
+
+STRUCT(OccProbeParams)
 {
 
 
-
-    float4 domain;
-
+    float4 map;
 
 
-
-
-    float4 sim;
+    float4 sunMap;
 
 
 
-
-
-
-
-    float4 bias;
-#line 266 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/grasscrush.srt.h"
-    float4 shape;
+    float4 probe;
 
 
 
 
 
 
-
-
-    float4 dwell;
-#line 276
+    float4 margin;
+#line 56
 };
 
-        CBUFFER(GrassCrushParams) gGrassCrushParams :  register(b0,space0);
+
+
+
+
+        CBUFFER(CullParams) gCullParams :  register(b0,space2);
+        CBUFFER(OccProbeParams) gProbeParams :  register(b1,space2);
+        Buffer(CullInstance) gCullInst :  register(t2,space2);
+        Tex2D(float) gProbeHeight :  register(t3,space2);
+        Tex2D(float) gProbeSunOcc :  register(t4,space2);
+        RWBuffer(uint) gProbeCount :  register(u5,space2);
+
+#line 22 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/occprobe.comp.fsl"
+#line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/cellown.h.fsl"
+#line 46 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/cellown.h.fsl"
+float nearPathSlab(float originX, float originY)
+{
+    if (gCullParams.cellOwn.w < 0.5f)
+        return 0.0f;
+
+    int cx = (int)floor(originX * (1.0f /  8192.0f ));
+    int cy = (int)floor(originY * (1.0f /  8192.0f ));
+    int dx = cx - (int)gCullParams.cellOwn.x;
+    int dy = cy - (int)gCullParams.cellOwn.y;
+    if (dx < -1 || dx > 1 || dy < -1 || dy > 1)
+        return 0.0f;
+
+    uint mask = (uint)gCullParams.cellOwn.z;
+    if (((mask >> (uint)((dy + 1) * 3 + (dx + 1))) & 1u) == 0u)
+        return 0.0f;
+
+    return gCullParams.misc.z;
+}
 
 
 
 
 
 
+bool nearPathCovers(float slab, float dist2, float effR)
+{
+    if (slab <= 0.0f || effR >= slab)
+        return false;
+    float inner = slab - effR;
+    return dist2 < inner * inner;
+}
+#line 23 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/occprobe.comp.fsl"
+#line 46 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/occprobe.comp.fsl"
+float heightMinAround(int2 sp, int r, int res)
+{
+    float m = 1.0e9f;
+    for (int dy = -r; dy <= r; ++dy)
+    {
+        for (int dx = -r; dx <= r; ++dx)
+        {
+            int2 q = sp + int2(dx, dy);
+            if (q.x < 0 || q.y < 0 || q.x >= res || q.y >= res)
+            {
+                return -1.0e9f;
+            }
+
+
+
+            m = min(m, LoadTex2D(gProbeHeight, NO_SAMPLER, q, 0).r);
+        }
+    }
+    return m;
+}
 
 
 
 
-        Buffer(float4) gGrassCrushers :  register(t1,space0);
-#line 307 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/grasscrush.srt.h"
-        RWBuffer(uint) gGrassCrushAccum :  register(u2,space0);
+float sunOccMinAround(int2 sp, int r, int res)
+{
+    float m = 1.0e9f;
+    for (int dy = -r; dy <= r; ++dy)
+    {
+        for (int dx = -r; dx <= r; ++dx)
+        {
+            int2 q = sp + int2(dx, dy);
+            if (q.x < 0 || q.y < 0 || q.x >= res || q.y >= res)
+            {
+                return -1.0e9f;
+            }
+            m = min(m, LoadTex2D(gProbeSunOcc, NO_SAMPLER, q, 0).r);
+        }
+    }
+    return m;
+}
 
-
-
-        RWTex2D(float4) gGrassCrushField :  register(u3,space0);
-#line 19 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/grasscrushkey.h.fsl"
-
-uint grassCrushKey(float z) { return asuint(max(z +  32768.0f , 0.0f)); }
-float grassCrushUnkey(uint k) { return asfloat(k) -  32768.0f ; }
-#line 29 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/grasscrushsplat.comp.fsl"
-#line 42 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/grasscrushsplat.comp.fsl"
 [RootSignature( "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "3" ", offset = 0)," "CBV(b0, numDescriptors = unbounded, space = " "3" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "3" ", offset = 0))," "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "2" ", offset = 0)," "CBV(b0, numDescriptors = unbounded, space = " "2" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "2" ", offset = 0))," "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "1" ", offset = 0)," "CBV(b0, numDescriptors = unbounded, space = " "1" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "1" ", offset = 0))," "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "0" ", offset = 0)," "CBV(b0, numDescriptors = unbounded, space = " "0" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "0" ", offset = 0))," "DescriptorTable(" "SAMPLER(s0, numDescriptors = unbounded, space = " "0" ", offset = 0))," "StaticSampler(s0, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s1, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s2, space = 100," "filter = FILTER_MIN_MAG_LINEAR_MIP_POINT," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s3, space = 100," "filter = FILTER_MIN_MAG_LINEAR_MIP_POINT," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s4, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s5, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s6, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT," "addressU = TEXTURE_ADDRESS_MIRROR, addressV = TEXTURE_ADDRESS_MIRROR, addressW = TEXTURE_ADDRESS_MIRROR)," "StaticSampler(s7, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT, borderColor = STATIC_BORDER_COLOR_TRANSPARENT_BLACK," "addressU = TEXTURE_ADDRESS_BORDER, addressV = TEXTURE_ADDRESS_BORDER, addressW = TEXTURE_ADDRESS_BORDER)," "StaticSampler(s8, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR," "addressU = TEXTURE_ADDRESS_MIRROR, addressV = TEXTURE_ADDRESS_MIRROR, addressW = TEXTURE_ADDRESS_MIRROR)," "StaticSampler(s9, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR, borderColor = STATIC_BORDER_COLOR_TRANSPARENT_BLACK," "addressU = TEXTURE_ADDRESS_BORDER, addressV = TEXTURE_ADDRESS_BORDER, addressW = TEXTURE_ADDRESS_BORDER)," "StaticSampler(s10, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 8," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s11, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 8," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s12, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 8," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s13, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 8," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s14, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 2," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s15, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 2," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s16, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 2," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s17, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 2," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_WRAP)" )]
-NUM_THREADS( 8 ,  8 , 1)
-void CS_MAIN(uint3 did : SV_DISPATCHTHREADID)
+NUM_THREADS(64, 1, 1)
+void CS_MAIN( uint3 DispatchThreadID : SV_DISPATCHTHREADID )
 {
     INIT_MAIN;
 
 
 
+    uint i = DispatchThreadID.x;
+    if (i >= (uint)gCullParams.misc.x)
+    {
+        return;
+    }
 
-    uint crusher = did.x >> 3u;
-    uint2 lt = uint2(did.x & 7u, did.y);
-
-    uint nCrush = uint(gGrassCrushParams.sim.w);
-
-    if (crusher >= nCrush)
+    CullInstance inst = gCullInst[i];
+    if (inst.rangeEndIdx == 0xFFFFFFFFu)
     {
         return;
     }
 
 
-    float4 c = gGrassCrushers[2u * crusher];
-    float wgt = gGrassCrushers[2u * crusher + 1u].x;
-    float upt = gGrassCrushParams.domain.z;
-    int size = int(gGrassCrushParams.domain.w);
-    float drop = gGrassCrushParams.shape.x;
-    float slope = gGrassCrushParams.shape.y;
-    float decay = gGrassCrushParams.shape.w;
 
 
 
 
-    float2 ctr = (c.xy - gGrassCrushParams.domain.xy) / upt;
-
-
-
-
-    float rIn = c.w;
-    float rOut = c.w + gGrassCrushParams.shape.z;
-    int rInt = int(min(ceil(rOut / upt), gGrassCrushParams.bias.z));
-    if (rInt < 0)
+    if (inst.effR < gCullParams.misc.w)
     {
         return;
     }
-    rOut = min(rOut, float(rInt) * upt);
-
-    int2 base = int2((int)floor(ctr.x), (int)floor(ctr.y));
-    int span = 2 * rInt;
-    uint n = uint(size) * uint(size);
-
-
-
-
-    LOOP for (int ty = int(lt.y); ty <= span; ty +=  8 )
+    if (inst.visIndex != 0u && inst.visIndex <  2048u )
     {
-        LOOP for (int tx = int(lt.x); tx <= span; tx +=  8 )
+        uint visWord = asuint(gCullParams.visMask[inst.visIndex >> 7u][(inst.visIndex >> 5u) & 3u]);
+        if (((visWord >> (inst.visIndex & 31u)) & 1u) == 0u)
         {
-            int2 p = base + int2(tx - rInt, ty - rInt);
-            if (p.x < 0 || p.y < 0 || p.x >= size || p.y >= size) { continue; }
+            return;
+        }
+    }
+
+    float rangeEnd2 = (inst.rangeEndIdx == 0u) ? gCullParams.ranges.x
+                    : (inst.rangeEndIdx == 1u) ? gCullParams.ranges.y
+                                               : gCullParams.ranges.z;
+
+    float dx = inst.posX - gCullParams.eye.x;
+    float dy = inst.posY - gCullParams.eye.y;
+    float cz = inst.posZ - gCullParams.eye.z;
+    float d2 = dx * dx + dy * dy;
+    float dNear2 = d2 + cz * cz;
+    if (dNear2 < gCullParams.ranges.w || d2 > rangeEnd2)
+    {
+        return;
+    }
+    if (nearPathCovers(nearPathSlab(inst.wr3.x, inst.wr3.y), dNear2, inst.effR))
+    {
+        return;
+    }
+    UNROLL
+    for (uint p = 0u; p < 6u; ++p)
+    {
+        float4 pl = gCullParams.planes[p];
+        float dist = pl.x * dx + pl.y * dy + pl.z * cz + pl.w;
+        if (dist < -inst.effR)
+        {
+            return;
+        }
+    }
 
 
 
-            float2 d = ((float2(p) + f2(0.5f)) - ctr) * upt;
-            float d2 = dot(d, d);
-            if (d2 > rOut * rOut) { continue; }
-            float t = c.z - drop + slope * max(0.0f, sqrt(d2) - rIn);
-#line 119 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/grasscrushsplat.comp.fsl"
-            uint idx = uint(p.y) * uint(size) + uint(p.x);
-            float zPrev = grassCrushUnkey(gGrassCrushAccum[n + idx]);
-            float zL = (zPrev > t)
-                     ? (t + min(zPrev - t,  320.0f ) * decay)
-                     : t;
-            uint prev;
-            InterlockedMin(gGrassCrushAccum[idx], grassCrushKey(zL), prev) ;
-#line 139 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/grasscrushsplat.comp.fsl"
-            float prevCharge = max(asfloat(gGrassCrushAccum[2u * n + idx]) - 1.0f, 0.0f);
-            float charge = min(prevCharge + gGrassCrushParams.dwell.x * wgt, wgt);
-            uint prevE;
-            InterlockedMax(gGrassCrushAccum[2u * n + idx], asuint(1.0f + charge), prevE) ;
+
+    uint origTested;
+    AtomicAdd(gProbeCount[0], 1u, origTested);
+
+    float2 org = gProbeParams.map.xy;
+    float texel = max(gProbeParams.map.z, 1.0f);
+    float invTexel = 1.0f / texel;
+    int res = (int)gProbeParams.map.w;
+    float bias = gProbeParams.probe.w;
+
+
+
+    int minR = (int)max(gProbeParams.margin.y, 0.0f);
+
+
+
+
+
+    float top = inst.posZ + inst.effR;
+
+    if (gProbeParams.probe.x < 0.5f)
+    {
+
+        if (gProbeParams.sunMap.z < 0.5f)
+        {
+            return;
+        }
+        float sunTexel = max(gProbeParams.sunMap.y, 1.0f);
+        int sunRes = (int)gProbeParams.sunMap.x;
+        int2 sp = int2(floor((float2(inst.posX, inst.posY) - org) / sunTexel));
+        if (sp.x < 0 || sp.y < 0 || sp.x >= sunRes || sp.y >= sunRes)
+        {
+            return;
+        }
+        float blockZ = LoadTex2D(gProbeSunOcc, NO_SAMPLER, sp, 0).r;
+
+        if (top + bias < blockZ)
+        {
+            uint origRej;
+            AtomicAdd(gProbeCount[1], 1u, origRej);
+
+
+
+            float blockZMin = sunOccMinAround(sp, minR, sunRes);
+            if (top + bias < blockZMin)
+            {
+                uint origRejMin;
+                AtomicAdd(gProbeCount[2], 1u, origRejMin);
+            }
+        }
+        return;
+    }
+
+
+    float waterZ = gProbeParams.probe.y;
+
+
+    float3 eyeM = float3(gCullParams.eye.x, gCullParams.eye.y, 2.0f * waterZ - gCullParams.eye.z);
+    if (eyeM.z >= waterZ)
+    {
+        return;
+    }
+    float3 tgt = float3(inst.posX, inst.posY, top);
+    float denom = tgt.z - eyeM.z;
+    if (denom <= 1.0e-3f)
+    {
+        return;
+    }
+    float t0 = (waterZ - eyeM.z) / denom;
+    if (t0 >= 1.0f)
+    {
+        return;
+    }
+    t0 = max(t0, 0.0f);
+    float3 S = eyeM + (tgt - eyeM) * t0;
+
+
+
+
+    float2 dxy = tgt.xy - S.xy;
+    float L = length(dxy);
+    float end = inst.effR + texel + gProbeParams.margin.x;
+    if (L <= end)
+    {
+        return;
+    }
+    float tEnd = (L - end) / L;
+
+    int steps = (int)max(gProbeParams.probe.z, 1.0f);
+
+
+
+
+
+
+
+
+
+    bool occMax = false;
+    for (int k = 1; k <= steps; ++k)
+    {
+        float t = tEnd * ((float)k / (float)steps);
+        float3 p = S + (tgt - S) * t;
+        int2 sp = int2(floor((p.xy - org) * invTexel));
+        if (sp.x < 0 || sp.y < 0 || sp.x >= res || sp.y >= res)
+        {
+            continue;
+
+        }
+        float rz = p.z + bias;
+        float h = LoadTex2D(gProbeHeight, NO_SAMPLER, sp, 0).r;
+        if (!occMax && h > rz)
+        {
+            occMax = true;
+            uint origRej;
+            AtomicAdd(gProbeCount[1], 1u, origRej);
+        }
+
+
+
+
+
+        float hMin = heightMinAround(sp, minR, res);
+        if (hMin > rz)
+        {
+            uint origRejMin;
+            AtomicAdd(gProbeCount[2], 1u, origRejMin);
+            break;
         }
     }
 
     return;
 }
-#line 755 "FSL/shaders.list"
+#line 673 "FSL/shaders.list"
