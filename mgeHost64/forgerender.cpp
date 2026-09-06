@@ -201,6 +201,12 @@ static void vramMark(Renderer* R, const char* tag)
 // work, attribute only that difference, and SUM those differences. Individual calls can read 0
 // (the driver commits on 32/64 MB page boundaries) but the running sum is still correct, and it is
 // the sum we want.
+// Set at device init from MGE_HOST_KNOBS=queuePriority=N, read back by the knob echo so every run's
+// log carries the queue priority it was measured with. 0=NORMAL 1=HIGH 2=GLOBAL_REALTIME.
+// ⚠ DECLARED HERE, ABOVE forgeInit, because the queue is created ~5000 lines above the host's own
+// globals block -- a declaration down there compiles as "undeclared identifier" at the use site.
+static unsigned g_queuePriorityApplied = 0;
+
 static uint64_t vramNow(Renderer* R)
 {
     IDXGIAdapter3* ad = forgeVramAdapter(R);
@@ -580,6 +586,42 @@ namespace {
         Queue*    pQueue = nullptr;
         QueueDesc queueDesc = {};
         queueDesc.mType = QUEUE_TYPE_GRAPHICS;
+        // ===== THE QUEUE'S GPU PRIORITY, BECAUSE THE FRAME IS BEING PREEMPTED ====================
+        // The stall latch (see g_stallWinMin) found a ~2.1 ms excursion in 56-70% of INTERIOR and
+        // 37-45% of exterior frames that lands in a DIFFERENT phase bracket every time. It cannot
+        // be any of those passes: `objvel` costs 0.02 ms and was caught at 2.16, `apl` costs 0.07
+        // and was caught at 2.29. A gap that opens BETWEEN two timestamp writes inside one command
+        // buffer is the GPU running something that is not ours -- and there is an obvious
+        // candidate, because mgeHost64 is an out-of-process renderer: Morrowind + DXVK is on the
+        // same GPU, submitting its own present every frame.
+        //
+        // ⚠ THIS IS A DIAGNOSTIC KNOB FIRST AND A FIX SECOND, AND IT DEFAULTS TO TODAY'S BEHAVIOUR.
+        // Raising the host above the client can only move work, never delete it: if the 2.1 ms is
+        // really the client's present, winning the race here makes the HOST frame clean and may
+        // simply push the cost into the client's dt -- which is the number the player actually
+        // feels. So the arm to compare is not `gpu=` alone, it is `gpu=` AND the client's `dt=`
+        // together. GLOBAL_REALTIME additionally needs privileges most systems will refuse.
+        //
+        // Read straight from the environment rather than through applyEnvOverrides: the queue is
+        // created here, long before the knob table is parsed, and a knob that arrives after the
+        // object it configures is a knob that silently does nothing.
+        {
+            unsigned prio = 0;
+            if (const char* k = std::getenv("MGE_HOST_KNOBS")) {
+                if (const char* f = std::strstr(k, "queuePriority=")) {
+                    prio = (unsigned)std::atoi(f + 14);
+                }
+            }
+            static const char* kPrioName[] = { "NORMAL", "HIGH", "GLOBAL_REALTIME" };
+            if (prio >= 3u) { prio = 0u; }
+            queueDesc.mPriority = (QueuePriority)prio;
+            // ⚠ ECHOED VIA A GLOBAL, NOT FROM HERE. LOGF and LOG::logline are DIFFERENT SINKS and
+            // only the latter reaches mgeHost64.log -- so a LOGF here is invisible to a minimized
+            // harness run, and the arm a measurement was taken in would be unrecoverable from its
+            // own log ([[feedback_verify_the_right_artifact]]). The knob echo below prints it.
+            g_queuePriorityApplied = prio;
+            std::printf("[forge] graphics queue priority = %s\n", kPrioName[prio]);
+        }
         initQueue(pRenderer, &queueDesc, &pQueue);
         if (!pQueue) {
             std::printf("[forge] initQueue FAILED\n");
@@ -3596,6 +3638,17 @@ namespace {
            // ⚠ `resolve=` NO LONGER INCLUDES IT. Add the two when comparing against any measurement
            // taken before 2026-09-05 (the 1.89 -> 0.89 resolve win was measured with it inside).
            kGpuPhaseResolveFilter,
+           // ===== THE THREE DISPATCHES THAT RAN EVERY FRAME AND WERE IN NO BRACKET =============
+           // Found by SUBTRACTION rather than by reading the code: the top-level brackets summed to
+           // 11.6 ms of a 15.2 ms exterior frame and the 3.6 ms remainder had no name. A pass nobody
+           // times is a pass nobody optimises -- and worse, an unbracketed gap is where a WANDERING
+           // STALL hides. Across four consecutive exterior samples the residual and the `color`
+           // bracket were seen TRADING PLACES (color 3.40 with a 1.57 gap, then color 1.82 with a
+           // 3.73 gap, then the same swing through `reflect` and `rfilter`), which is a shape that
+           // cannot be read off per-pass numbers while any part of the frame is unmeasured.
+           kGpuPhaseHizMip0,    // Hi-Z mip 0 build over the FULL ALLOCATION (post-colour, pre-seam)
+           kGpuPhaseReLinear,   // the SECOND depth linearize (scene depth incl. terrain)
+           kGpuPhaseApl,        // APL reduction (1 group, subsampled grid) + its readback copy
            kGpuPhaseCount };
 
     // FP1a first-person pass caps: one 64KB world window bounds the rigid list at 1024,
@@ -5611,6 +5664,40 @@ namespace {
     // double-count nothing at all — harmless — but the `ran` tell would also be stale, which is the
     // one thing that must stay honest.
     bool     g_atmosShArmed   = false;
+    // The atmosphere cbuffer's ALLOCATED size, named because two things must agree on it: the
+    // buffer, and the cache key below that mirrors it. The old literal carried the comment
+    // "13 float4 = 208 B" and packParams actually writes **56 floats / 224 B** (44 singles plus
+    // four 3-iteration loops) -- so the comment was already one float4 short of the truth while the
+    // 512-byte allocation quietly absorbed it. Sizing the key off a hand-counted float count is
+    // what turned that stale comment into a stack smash the first time it was believed; sizing it
+    // off the ALLOCATION cannot be wrong, and costs 512 bytes of stack.
+    static constexpr uint32_t kAtmosParamsCbvBytes = 512;
+    static constexpr uint32_t kAtmosParamFloats    = kAtmosParamsCbvBytes / (uint32_t)sizeof(float);
+    // ===== THE LUT CACHE: A SLOW FUNCTION REBUILT EVERY FRAME ==================================
+    // The chain costs 0.71 ms of a 13.5 ms exterior frame (measured: atmosSkySteps/MsDirs/DeckSteps
+    // forced to 1 takes the frame 13.53 -> 12.82) and it is NOT paying for pixels. It renders 256x64
+    // + 32x32 + 192x108 + ONE thread group -- about 38k pixels, at 53 Mpix/s. That number is not
+    // work, it is four under-occupied dispatches separated by full UAV->SRV barriers, so the cost is
+    // almost all latency and almost none of it scales with what the LUTs contain.
+    //
+    // Which makes it the wrong thing to micro-optimise and the right thing to STOP DOING. The LUTs
+    // are a pure function of the packed parameter block, and that block's inputs move at the speed
+    // of weather and the sun. So: pack into a local, compare against what was last dispatched, and
+    // skip the whole chain when it would recompute the same LUTs.
+    //
+    // ⚠ THE CACHE KEY IS QUANTISED AT THE SOURCE, NOT COMPARED WITH AN EPSILON. An epsilon over the
+    // packed block would need one tolerance to cover both a Mie coefficient (~1e-6) and a planetary
+    // radius (~6.4e6), which is [[feedback_one_knob_two_jobs]] in miniature -- 0.1% of a radius is
+    // 6 km of altitude. Instead the two inputs that move EVERY frame are rounded in their own units
+    // (the sun in degrees, the altitude in metres) and the comparison is then an exact memcmp. One
+    // place decides "materially changed", and it says so in units a person can argue with.
+    bool     g_atmosCache     = true;    // knob: the skip itself (0 = rebuild every frame, the control arm)
+    float    g_atmosCacheDeg  = 0.05f;   // sun-direction quantum, DEGREES
+    float    g_atmosCacheAltM = 10.0f;   // camera-altitude quantum, METRES
+    float    g_atmosLastPk[kAtmosParamFloats] = {};   // the whole cbuffer, as last dispatched
+    bool     g_atmosPkValid   = false;   // have the LUTs ever been built?
+    uint32_t g_atmosSkips     = 0;       // frames the chain was skipped, since the last heartbeat
+    uint32_t g_atmosBuilds    = 0;       // frames it ran
     // The shader's "this dispatch actually ran" tell, held for the gate report. ⚠ NOT COSMETIC: a
     // readback of zeros and a sky that genuinely integrates to zero are the same 128 bytes, and one
     // of those is a bug that would publish a black ambient and look exactly like midnight.
@@ -7836,7 +7923,7 @@ namespace {
                     apc.mDesc.mDescriptors = DESCRIPTOR_TYPE_UNIFORM_BUFFER;
                     apc.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_CPU_TO_GPU;
                     apc.mDesc.mFlags = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
-                    apc.mDesc.mSize = 512;                 // AtmosphereParams (13 float4 = 208 B)
+                    apc.mDesc.mSize = kAtmosParamsCbvBytes;
                     apc.mDesc.pName = "atmosParamsCbv";
                     apc.pData = nullptr;
                     apc.ppBuffer = &g_live.pAtmosParamsCbv;
@@ -14515,6 +14602,33 @@ namespace {
     unsigned  g_lastShadowActive = 0;
     unsigned  g_lastShadowDyn    = 0;
     double    g_lastGpuPhaseMs[kGpuPhaseCount] = {};
+    // ===== THE STALL LATCH ==============================================================
+    // ⚠ THE HEARTBEAT PRINTS ONE FRAME OUT OF 300 AND THAT CANNOT CHARACTERISE A BURSTY
+    // COST. Measured 2026-09-06: an exterior frame that costs 13.5 ms was sampled at 13.53,
+    // 16.46, 13.54, 15.36, 15.13 — a ~1.7 ms excursion present in roughly half the samples
+    // and landing in a DIFFERENT phase each time (shadow 1.44->3.10, reflect 1.84->3.56,
+    // color 1.78->3.88, cull 0.75->3.31, rfilter 0.61->2.22). Read one sample at a time that
+    // is indistinguishable from "shadows are sometimes expensive", and every median computed
+    // over such samples measures HOW MANY STALLED FRAMES THE ARM CAUGHT rather than the arm
+    // — which is what made a knob sweep report 2.0 ms for a 0.7 ms pass.
+    //
+    // So: latch min/max per phase over the whole window instead of sampling harder
+    // ([[feedback_periodic_heartbeat_cannot_sample_bursty_condition]]). The SPREAD (max-min)
+    // per phase is the discriminator this exists to produce:
+    //   many phases each showing a similar spread => ONE wandering stall, external to all of
+    //     them (preemption, a queue wait, an upload) — do not optimise any of those passes;
+    //   one phase dominating the spread          => that pass really is bursty, and it is the
+    //     subject.
+    double    g_stallWinMin[kGpuPhaseCount] = {};
+    double    g_stallWinMax[kGpuPhaseCount] = {};
+    uint32_t  g_stallWinN    = 0;
+    uint32_t  g_stallWinOver = 0;   // frames >10% over the window's running min frame time
+    // ⚠ THE MEAN IS NOT OPTIONAL. min/max alone invite exactly one wrong inference, and it was made
+    // the first time this latch was read: "the max is +2.1 ms and 45% of frames are over, so the
+    // stall costs ~0.9 ms a frame". It does not follow -- `over` counts frames past a 10% line, not
+    // frames that paid the maximum, and the two say nothing about the shape between them. The mean
+    // is the only one of the three that can be subtracted from the floor to price the excursion.
+    double    g_stallWinSum  = 0.0;
     // Which phases actually WROTE a timestamp pair this frame. Nothing resets the query pool
     // (there is no cmdResetQueryPool call anywhere), so a phase whose gpuPhaseBegin/End were
     // SKIPPED leaves its slot holding the previous frame's timestamps — and the readback below,
@@ -22975,6 +23089,12 @@ void destroyHostWindow(Renderer* R);
         const char* env = std::getenv("MGE_HOST_KNOBS");
         if (!env || !*env) { return; }
         LOG::logline(">> [forge] MGE_HOST_KNOBS = %s", env);
+        {
+            static const char* kPrioName[] = { "NORMAL", "HIGH", "GLOBAL_REALTIME" };
+            LOG::logline(">> [forge] graphics queue priority = %s (queuePriority=%u)",
+                         kPrioName[g_queuePriorityApplied < 3u ? g_queuePriorityApplied : 0u],
+                         g_queuePriorityApplied);
+        }
         struct FKnob { const char* name; float* p; };
         struct BKnob { const char* name; bool*  p; };
         // M1 4d added the third kind. `upscaleBackend` names a backend, and a float or a bool
@@ -23048,6 +23168,8 @@ void destroyHostWindow(Renderer* R);
             { "upscaleAntiRing",    &g_upscaleAntiRing    },
             { "fogSkyKnee",         &g_fogSkyKnee         },
             { "fogNearHaze",        &g_fogNearHaze        },
+            { "atmosCacheDeg",      &g_atmosCacheDeg      },
+            { "atmosCacheAltM",     &g_atmosCacheAltM     },
             { "atmosMieMul",        &g_atmosMieMul        },
             { "atmosDeck",          &g_atmosDeck          },
             { "atmosDeckSteps",     &g_atmosDeckSteps     },
@@ -23228,6 +23350,13 @@ void destroyHostWindow(Renderer* R);
             // are created at all), which is why it is here and has no panel checkbox — the panel it
             // would live on is drawn into the game's frame, not this window.
             { "hostWindow",          &g_hostWindow          },
+            // ⚠ A SUBMIT BOUNDARY IS A SCHEDULING BOUNDARY. The frame is recorded into two command
+            // buffers and submitted twice (chunk A ends just before the reflect pass) so the CPU can
+            // get chunk A onto the GPU sooner. That is a real win on the CPU side, but it also hands
+            // Windows a second point at which it may run the OTHER process on this GPU -- and the
+            // stall latch says something external to every pass is costing up to 2.1 ms in 43-71% of
+            // frames. Whether the split helps or hurts is now measurable rather than assumed.
+            { "splitSubmit",         &g_splitSubmit         },
             // M1 4d. ⚠ jitterForce IS A MEASUREMENT, NOT A SETTING: it bypasses the producer gate
             // in jitterAmp() so M1 step 1's isolation test — jitter alone, no upscaler, the image
             // must shimmer sub-pixel while the atmos/gate rows do not move — stays runnable in a
@@ -23247,7 +23376,20 @@ void destroyHostWindow(Renderer* R);
             // which is the setting for a session that wants its first frame to be live weather, and
             // NOT the setting for a bring-up. A gate nobody runs is a gate nobody has.
             { "atmosGate",          &g_atmosGate          },
+            // The LUT-cache control arm. 0 = rebuild the chain every frame, i.e. the behaviour
+            // every measurement before 2026-09-06 was taken in.
+            { "atmosCache",         &g_atmosCache         },
+            // ⚠ waterNoReflect IS NOT A COST LEVER. It sets water shader flag bit 18 (sample the
+            // transmitted path only) and does not touch the reflection RENDER at all — measured
+            // 2026-09-06: with it set, `reflect=1.84 refl geo=1.66` unchanged and the frame 0.05 ms
+            // faster, i.e. nothing. An arm that silently does not take reads exactly like a pass
+            // that costs nothing, so the three checkboxes that DO gate the render are next to it
+            // now: reflect re-renders the world into pReflectColor every frame and was the second
+            // largest exterior phase with no way for a minimized harness to switch it off.
             { "waterNoReflect",     &g_waterNoReflect     },
+            { "drawReflect",        &g_drawReflect        },
+            { "drawReflectGeo",     &g_drawReflectGeo     },
+            { "drawReflectNear",    &g_drawReflectNear    },
             { "waterSunTrueElev",   &g_waterSunTrueElev   },
             { "aplSplitWater",      &g_aplSplitWater      },
             { "aplSkipSky",         &g_aplSkipSky         },
@@ -25473,6 +25615,31 @@ void destroyHostWindow(Renderer* R);
         // RESOLVED whole-frame GPU execution timestamp, read a frame late.
         g_lastGpuMs = g_lastGpuPhaseMs[kGpuPhaseFrame];
         g_gpuAccum += g_lastGpuMs;
+
+        // Fold this frame into the stall latch. EVERY frame, which is the whole point — the
+        // heartbeat's own sample is one frame in 300 and the thing being measured is which
+        // frames are not like it.
+        if (g_lastGpuPhaseMs[kGpuPhaseFrame] > 0.01) {
+            if (g_stallWinN == 0) {
+                for (uint32_t i = 0; i < kGpuPhaseCount; ++i) {
+                    g_stallWinMin[i] = g_lastGpuPhaseMs[i];
+                    g_stallWinMax[i] = g_lastGpuPhaseMs[i];
+                }
+            } else {
+                for (uint32_t i = 0; i < kGpuPhaseCount; ++i) {
+                    if (g_lastGpuPhaseMs[i] < g_stallWinMin[i]) { g_stallWinMin[i] = g_lastGpuPhaseMs[i]; }
+                    if (g_lastGpuPhaseMs[i] > g_stallWinMax[i]) { g_stallWinMax[i] = g_lastGpuPhaseMs[i]; }
+                }
+                // Against the RUNNING min, which is slightly generous for the first few frames
+                // of a window and exact thereafter. Counting against the final min would need a
+                // second pass over frames that are already gone.
+                if (g_lastGpuPhaseMs[kGpuPhaseFrame] > g_stallWinMin[kGpuPhaseFrame] * 1.10) {
+                    ++g_stallWinOver;
+                }
+            }
+            g_stallWinSum += g_lastGpuPhaseMs[kGpuPhaseFrame];
+            ++g_stallWinN;
+        }
 
         // ─── S2: THE ATMOSPHERE'S MEASUREMENT, DRAINED ──────────────────────────────────────────
         // Read HERE because here is where a readback becomes valid. This is not an instrument — it
@@ -32208,6 +32375,7 @@ void destroyHostWindow(Renderer* R);
                 cmdResourceBarrier(g_live.pCmd, 0, nullptr, nt, tb, 1, &rtb);
             }
             if (doHizMip0) {
+                gpuPhaseBegin(kGpuPhaseHizMip0);
                 cmdBeginDebugMarker(g_live.pCmd, 0.3f, 0.8f, 0.8f, "HI-Z MIP0 (scene depth -> pHiz mip 0)");
                 cmdBindPipeline(g_live.pCmd, g_live.pHizPipelineFirst);
                 cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pHizSet);
@@ -32218,16 +32386,19 @@ void destroyHostWindow(Renderer* R);
                 // now read a fully-built pyramid instead of a stale border. Correct at every scale.
                 cmdDispatch(g_live.pCmd, (g_live.allocWidth + 7u) / 8u, (g_live.allocHeight + 7u) / 8u, 1);
                 cmdEndDebugMarker(g_live.pCmd);
+                gpuPhaseEnd(kGpuPhaseHizMip0);
             }
             if (doSeamLinearize) {
                 // Same pipeline and same set as the pre-colour dispatch — only pDepth's CONTENTS have
                 // moved on. Sized by the RENDER rect (the linearize writes what the frame drew), unlike
                 // the Hi-Z above which covers the whole allocation.
+                gpuPhaseBegin(kGpuPhaseReLinear);
                 cmdBeginDebugMarker(g_live.pCmd, 0.2f, 0.6f, 1.0f, "RE-LINEARIZE (full scene depth incl. terrain)");
                 cmdBindPipeline(g_live.pCmd, g_live.pLinearizePipeline);
                 cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pLinearizeSet);
                 cmdDispatch(g_live.pCmd, (g_live.width + 7u) / 8u, (g_live.height + 7u) / 8u, 1);
                 cmdEndDebugMarker(g_live.pCmd);
+                gpuPhaseEnd(kGpuPhaseReLinear);
             }
             {
                 RenderTargetBarrier rtb = {};
@@ -35567,6 +35738,7 @@ void destroyHostWindow(Renderer* R);
                 arb.mNewState     = RESOURCE_STATE_SHADER_RESOURCE;
                 cmdResourceBarrier(g_live.pCmd, 0, nullptr, 0, nullptr, 1, &arb);
 
+                gpuPhaseBegin(kGpuPhaseApl);
                 cmdBeginDebugMarker(g_live.pCmd, 0.4f, 0.9f, 0.4f, "APL (delivered colour -> mean RGB + log luma)");
                 cmdBindPipeline(g_live.pCmd, g_live.pAplPipeline);
                 cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pAplSet);
@@ -35589,6 +35761,7 @@ void destroyHostWindow(Renderer* R);
                     bb.mNewState     = RESOURCE_STATE_UNORDERED_ACCESS;
                     cmdResourceBarrier(g_live.pCmd, 1, &bb, 0, nullptr, 0, nullptr);
                 }
+                gpuPhaseEnd(kGpuPhaseApl);
             }
 
             // --- M1: THE MOTION VECTORS, LOOKED AT (F12 mode 17; tasks/forge-upscale.md) --------
@@ -37915,6 +38088,132 @@ void destroyHostWindow(Renderer* R);
                          g_volFogWaterOn ? "on" : "off",
                          g_lastGpuPhaseMs[kGpuPhaseReflGeo],
                          g_lastGpuPhaseMs[kGpuPhaseReflect] - g_lastGpuPhaseMs[kGpuPhaseReflGeo]);
+            // ===== DOES THE FRAME ADD UP? THE LINE THAT MAKES THAT CHECKABLE ====================
+            // `gpu split:` and `gpu color sub:` above print 30-odd phases and there is no way to
+            // tell from them whether the phases COVER the frame — so for a long time they did not,
+            // and nobody could see it. Three dispatches ran in no bracket at all, and two more
+            // (ColorFP and ObjVel) were bracketed but printed nowhere, so the only way to notice was
+            // to add up two log lines by hand and compare against `gpu=` on a third.
+            //
+            // The sum is driven off a TABLE, not off the format string, because the failure being
+            // fixed is precisely a phase that exists and is not in the sum. Add a top-level phase to
+            // the enum and it must be added here too, or UNBRACKETED grows and says so.
+            // ⚠ TOP-LEVEL ONLY. Every nested phase (Linearize/ShadowMask/AO* inside PostDepth,
+            // ColorSky/Near/Skin/MM/DL inside Color, ShadowStatic/Dyn/Sun inside Shadow, ReflGeo
+            // inside Reflect, ObjVelFP inside ColorFP) is DELIBERATELY ABSENT: counting one twice
+            // would drive the residual negative and make a real gap look closed.
+            {
+                static const uint32_t kTopLevel[] = {
+                    kGpuPhaseAtmos,      kGpuPhaseCull,       kGpuPhaseCaustic,
+                    kGpuPhaseGrassCrush, kGpuPhaseFroxelNear, kGpuPhasePrepass,
+                    kGpuPhaseShadow,     kGpuPhasePostDepth,  kGpuPhaseReflect,
+                    kGpuPhaseColor,      kGpuPhaseHizMip0,    kGpuPhaseReLinear,
+                    kGpuPhaseMotionVec,  kGpuPhaseObjVel,     kGpuPhaseWater,
+                    kGpuPhaseColorGlow,  kGpuPhaseColorAlpha, kGpuPhaseVolFog,
+                    kGpuPhaseColorFP,    kGpuPhaseApl,        kGpuPhaseUpscale,
+                    kGpuPhaseResolveFilter, kGpuPhaseMotionBlur, kGpuPhaseBloom,
+                    kGpuPhaseResolve,
+                };
+                double bracketed = 0.0;
+                for (uint32_t i = 0; i < (uint32_t)(sizeof(kTopLevel) / sizeof(kTopLevel[0])); ++i) {
+                    bracketed += g_lastGpuPhaseMs[kTopLevel[i]];
+                }
+                const double frameMs = g_lastGpuPhaseMs[kGpuPhaseFrame];
+                const double resid   = frameMs - bracketed;
+                LOG::logline(">> [forge-hb] gpu residual: frame=%.2f bracketed=%.2f UNBRACKETED=%.2f (%.0f%%)"
+                             " | newly bracketed: hizmip0=%.2f relin=%.2f apl=%.2f"
+                             " | measured but never printed: fp=%.2f(objvelFP=%.2f) objvel=%.2f",
+                             frameMs, bracketed, resid,
+                             (frameMs > 0.01) ? (100.0 * resid / frameMs) : 0.0,
+                             g_lastGpuPhaseMs[kGpuPhaseHizMip0],
+                             g_lastGpuPhaseMs[kGpuPhaseReLinear],
+                             g_lastGpuPhaseMs[kGpuPhaseApl],
+                             g_lastGpuPhaseMs[kGpuPhaseColorFP],
+                             g_lastGpuPhaseMs[kGpuPhaseObjVelFP],
+                             g_lastGpuPhaseMs[kGpuPhaseObjVel]);
+            }
+
+            // ===== WHICH PHASE IS BURSTY, OR IS IT NONE OF THEM? ================================
+            // Drains the stall latch: min/max per phase over the WHOLE window, not the one frame
+            // the lines above happen to print. Read the SPREAD column, not the max:
+            //   several phases each ~+1.7 ms  => one wandering stall external to all of them;
+            //                                    optimising any of those passes is chasing a ghost
+            //   one phase far above the rest  => that pass is genuinely bursty and is the subject
+            // `over` is how often the frame ran >10% above the window's cheapest frame, i.e. how
+            // much of the time the excursion is actually costing anything.
+            if (g_stallWinN > 1) {
+                struct Spread { const char* name; double lo, hi, d; };
+                static const struct { uint32_t id; const char* name; } kNamed[] = {
+                    { kGpuPhaseAtmos, "atmos" },   { kGpuPhaseCull, "cull" },
+                    { kGpuPhaseCaustic, "caustic" },{ kGpuPhaseFroxelNear, "froxel" },
+                    { kGpuPhasePrepass, "prepass" },{ kGpuPhaseShadow, "shadow" },
+                    { kGpuPhasePostDepth, "postdepth" }, { kGpuPhaseReflect, "reflect" },
+                    { kGpuPhaseColor, "color" },   { kGpuPhaseHizMip0, "hizmip0" },
+                    { kGpuPhaseReLinear, "relin" },{ kGpuPhaseMotionVec, "mv" },
+                    { kGpuPhaseObjVel, "objvel" }, { kGpuPhaseWater, "water" },
+                    { kGpuPhaseColorAlpha, "alpha" }, { kGpuPhaseVolFog, "volfog" },
+                    { kGpuPhaseColorFP, "fp" },    { kGpuPhaseApl, "apl" },
+                    { kGpuPhaseResolveFilter, "rfilter" }, { kGpuPhaseMotionBlur, "mb" },
+                    { kGpuPhaseBloom, "bloom" },   { kGpuPhaseResolve, "resolve" },
+                };
+                const uint32_t nNamed = (uint32_t)(sizeof(kNamed) / sizeof(kNamed[0]));
+                Spread sp[sizeof(kNamed) / sizeof(kNamed[0])];
+                for (uint32_t i = 0; i < nNamed; ++i) {
+                    sp[i].name = kNamed[i].name;
+                    sp[i].lo   = g_stallWinMin[kNamed[i].id];
+                    sp[i].hi   = g_stallWinMax[kNamed[i].id];
+                    sp[i].d    = sp[i].hi - sp[i].lo;
+                }
+                // Insertion sort by spread, descending. 22 entries once per 300 frames.
+                for (uint32_t i = 1; i < nNamed; ++i) {
+                    Spread k = sp[i];
+                    int32_t j = (int32_t)i - 1;
+                    while (j >= 0 && sp[j].d < k.d) { sp[j + 1] = sp[j]; --j; }
+                    sp[j + 1] = k;
+                }
+                char buf[512];
+                int off = 0;
+                for (uint32_t i = 0; i < 6 && i < nNamed; ++i) {
+                    const int w = std::snprintf(buf + off, sizeof(buf) - (size_t)off,
+                                                "%s %.2f->%.2f(+%.2f) ",
+                                                sp[i].name, sp[i].lo, sp[i].hi, sp[i].d);
+                    if (w <= 0 || (size_t)(off + w) >= sizeof(buf)) { break; }
+                    off += w;
+                }
+                const double mean = g_stallWinSum / (double)g_stallWinN;
+                LOG::logline(">> [forge-hb] gpu stall latch: frames=%u frame min=%.2f MEAN=%.2f max=%.2f"
+                             " | excursion: mean-min=%.2f (%.0f%% of mean) max-min=%.2f"
+                             " | over(+10%%)=%u (%.0f%%) | worst spreads: %s",
+                             g_stallWinN,
+                             g_stallWinMin[kGpuPhaseFrame], mean, g_stallWinMax[kGpuPhaseFrame],
+                             mean - g_stallWinMin[kGpuPhaseFrame],
+                             (mean > 0.01) ? (100.0 * (mean - g_stallWinMin[kGpuPhaseFrame]) / mean) : 0.0,
+                             g_stallWinMax[kGpuPhaseFrame] - g_stallWinMin[kGpuPhaseFrame],
+                             g_stallWinOver,
+                             (g_stallWinN > 0) ? (100.0 * (double)g_stallWinOver / (double)g_stallWinN) : 0.0,
+                             buf);
+                g_stallWinN    = 0;   // next window starts clean
+                g_stallWinOver = 0;
+                g_stallWinSum  = 0.0;
+            }
+
+            // The atmosphere LUT cache, reported as a RATE rather than a boolean. `builds` is the
+            // number that matters: it is how many times in the window the 0.71 ms chain actually
+            // ran, and it should sit at a handful. A builds count that tracks the frame count means
+            // something in the packed block is moving every frame -- the weather row blending as
+            // the player walks is the candidate -- and the cache has degraded to a memcmp, which is
+            // the honest failure and is visible here rather than as a mysteriously unchanged atmos=.
+            if (g_atmosSkips + g_atmosBuilds > 0) {
+                const uint32_t tot = g_atmosSkips + g_atmosBuilds;
+                LOG::logline(">> [forge-hb] atmos cache: builds=%u skips=%u (%.0f%% skipped)"
+                             " | quantum: sun %.3f deg alt %.1f m | cache=%s",
+                             g_atmosBuilds, g_atmosSkips,
+                             100.0 * (double)g_atmosSkips / (double)tot,
+                             (double)g_atmosCacheDeg, (double)g_atmosCacheAltM,
+                             g_atmosCache ? "on" : "OFF (control arm)");
+                g_atmosSkips  = 0;
+                g_atmosBuilds = 0;
+            }
             // Skinned-loop CPU RECORD probe: rec-split skin= is prep(palette+instance memcpy, IPC-blob
             // reads → faults) + rec(bindVB/IB+draw). Only rec is removable by a skinned mega-VB.
             // SETUP split: localizes the 1400-line setup bucket. gather= is the O(dirty x meshHigh)
@@ -46843,6 +47142,31 @@ void destroyHostWindow(Renderer* R);
         const float sunLen = std::sqrt(toSun[0]*toSun[0] + toSun[1]*toSun[1] + toSun[2]*toSun[2]);
         if (!(sunLen > 1.0e-4f)) { toSun[0] = 0.0f; toSun[1] = 0.0f; toSun[2] = 1.0f; }
 
+        // ─── THE CACHE KEY, QUANTISED IN ITS OWN UNITS (see g_atmosCache) ───────────────────────
+        // Done HERE, above the moon block, so the moon direction and its night ramp are derived
+        // from the quantised sun and step with it instead of moving underneath it every frame.
+        // 0.05 deg: the sky-view LUT is 192 wide over the full azimuth, so one texel is ~1.9 deg --
+        // the quantum is 1/38th of a texel and cannot produce a step anything can see. MW at
+        // timescale 30 moves the sun ~0.0013 deg/frame at 100 fps, so the chain rebuilds roughly
+        // every 38 frames instead of every frame. The sun DISC is drawn from g_skyPhys and is not
+        // quantised by this; only the scattering LUTs are.
+        if (g_atmosCache && g_atmosCacheDeg > 0.0f) {
+            const float qs = g_atmosCacheDeg * 3.14159265358979f / 180.0f;
+            const float az = std::round(std::atan2(toSun[1], toSun[0]) / qs) * qs;
+            const float el = std::round(std::asin(std::max(-1.0f, std::min(1.0f, toSun[2]))) / qs) * qs;
+            const float ce = std::cos(el);
+            toSun[0] = ce * std::cos(az);
+            toSun[1] = ce * std::sin(az);
+            toSun[2] = std::sin(el);
+            if (g_atmosCacheAltM > 0.0f) {
+                // Quantise the ALTITUDE, not the radius: at 6.4e6 m a float has ~0.5 m of
+                // resolution left, so rounding the radius would be rounding the wrong quantity.
+                const float altM = std::round((camRadius - Atmosphere::kGroundRadiusM)
+                                              / g_atmosCacheAltM) * g_atmosCacheAltM;
+                camRadius = Atmosphere::kGroundRadiusM + altM;
+            }
+        }
+
         // ─── THE MOON AS A SECOND SOURCE (S2e) ───────────────────────────────────────────────────
         // ⚠ NOT A NIGHT MODE — a second entry into the SAME integral. MW gives the host no moon
         // direction on the wire, and inventing an orbit would be a second celestial model to keep in
@@ -46907,11 +47231,41 @@ void destroyHostWindow(Renderer* R);
         // ([[project_forge_wc_read_trap]]): reading it back to "only update what changed" would cost
         // more than writing all 52 floats, and a partially-written struct is how a stale coefficient
         // outlives the frame that produced it.
+        // ⚠ PACKED INTO A LOCAL, NOT STRAIGHT INTO THE CBUFFER. The destination is WRITE-COMBINED
+        // ([[project_forge_wc_read_trap]]) so it cannot be read back to compare -- and comparing is
+        // the whole point. The local costs 52 floats of stack and makes the cache key exactly "what
+        // the GPU would have been given", which is the only definition that cannot drift away from
+        // the shader as fields are added.
+        // ⚠ SIZED BY THE ALLOCATION, NOT BY A COUNT OF WHAT packParams WRITES. It writes 56 floats
+        // today; a `float pk[52]` sized from the stale "13 float4" comment smashed the stack and
+        // killed the host on the first exterior frame. Zero-initialised, so the unwritten tail is
+        // a constant and the memcmp stays stable.
+        float pk[kAtmosParamFloats] = {};
+        static_assert(sizeof(pk) == sizeof(g_atmosLastPk), "cache key must mirror the cbuffer");
+        static_assert(sizeof(pk) == kAtmosParamsCbvBytes,  "cache key must be the WHOLE cbuffer");
         Atmosphere::packParams(row, albedo, toSun, camRadius - Atmosphere::kGroundRadiusM,
                                toMoon, moonE, std::max(0.0f, g_atmosAirglow), g_atmosMieMul,
                                g_atmosDeck, g_atmosSkySteps, 20.0f, g_atmosMsDirs,
-                               g_atmosDeckSteps, lutDims,
-                               (float*)g_live.pAtmosParamsCbv->pCpuMappedAddress);
+                               g_atmosDeckSteps, lutDims, pk);
+
+        // The skip. A gate frame ALWAYS dispatches -- it exists to certify the live chain, and a
+        // gate that could be served from cache would certify nothing ([[feedback_guard_fallback_is_the_bug]]).
+        if (g_atmosCache && g_atmosPkValid && !gateFrame
+            && std::memcmp(pk, g_atmosLastPk, sizeof(pk)) == 0) {
+            // ⚠ g_atmosShValid IS LEFT ALONE, which is the one line that separates this from the
+            // interior early-out fifty lines up. That path CLEARS it, because an interior has no
+            // sky and must fall back to MW's authored lighting. Here the sky is unchanged and its
+            // last measurement is exactly right -- clearing it would drop the whole ambient to the
+            // blend-0 end on a frame where nothing happened, once every few frames, forever.
+            // g_atmosShArmed stays false, so the drain in settleFrameFence correctly reads no
+            // readback this frame and keeps g_atmosShLast.
+            ++g_atmosSkips;
+            return;
+        }
+        std::memcpy(g_live.pAtmosParamsCbv->pCpuMappedAddress, pk, sizeof(pk));
+        std::memcpy(g_atmosLastPk, pk, sizeof(pk));
+        g_atmosPkValid = true;
+        ++g_atmosBuilds;
 
         cmdBeginDebugMarker(g_live.pCmd, 0.35f, 0.6f, 0.95f, "ATMOSPHERE LUTs");
 
