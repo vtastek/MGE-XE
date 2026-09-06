@@ -986,7 +986,10 @@ STRUCT(AOUpParams)
     float4 halfDims;
     float4 upParams;
 
-#line 37
+
+
+
+#line 40
 };
 #line 18 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/aodepthdown.srt.h"
 
