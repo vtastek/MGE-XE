@@ -16,6 +16,7 @@
 #include "skyamb.h.fsl"      // skyAmbFactor() — SH-L1 sky ambient (SH1) + sky AO (SH2)
 #include "tonemap.h.fsl"     // tonemap() — the shared semi-HDR curve (was six byte-identical copies)
 #include "linearize.h.fsl" // srgbToLinear()/mod2xLinear() — the scene's transfer function (step 5)
+#include "aomultibounce.h.fsl" // aoAmbientTerm() — SHARED AO darkening, albedo-tinted (Activision GTAO)
 #include "scenecolor.h.fsl" // tonemapInPass() — class 1: the curve moved to resolve.frag (step 6a)
 #include "skydome.h.fsl"     // applyFog() — extinguish into a silhouette, then melt into the SAMPLED sky
 #include "enchantglow.h.fsl" // enchantGlow() — MW's caustic env map over enchanted items
@@ -108,7 +109,24 @@ float4 PS_MAIN( VSOutput In )
     // above water is where all the point-light iterations are.
     bool causProj = causticProjectorActive(In.WorldPos);
     // Tier 3: GTAO modulates AMBIENT only — gated by the "AO enable" tick (debugParams.w bit0).
-    if ((aoFlags & 1u) != 0u) { a *= aoSample.a; }
+    //
+    // ⚠ THIS IS THE ONE CONSUMER THAT FEEDS THE MULTI-BOUNCE A PROXY RATHER THAN A REAL ALBEDO, and
+    // the reason is structural: multi-map has no single albedo at this point in the shader. Its
+    // reflectance is assembled per STAGE inside the fixed-function loop far below (`alb` at the BASE
+    // op), which is long after `lit` is composed — so there is nothing here to hand the fit.
+    //
+    // ⚠ AND THE OBVIOUS PROXY, In.MatDiffuse, IS THE WRONG ONE. It is white for essentially every
+    // MW part (forgerender.cpp defaults it to 1,1,1 on the multi-map fill), and the fit is at its
+    // most generous there: GTAOMultiBounce(0.5, white) ~= 0.90 against a raw 0.5, so feeding it
+    // MatDiffuse would DELETE most of the AO on exactly the surfaces that use this shader, while
+    // looking like it was doing something principled.
+    //
+    // So the proxy is a NEUTRAL GREY (AO_MB_PROXY_GREY). That keeps the DARKENING MAGNITUDE in step
+    // with opaque/terrain — which is what a seam across the boundary would show — without inventing
+    // a tint the shader has no basis for. Sampling stage 0 early to get the real thing would cost a
+    // duplicate fetch on the most fetch-heavy surface class in the frame; it is the upgrade path if
+    // a multi-map surface ever visibly disagrees with the ground it stands on.
+    if ((aoFlags & 1u) != 0u) { a *= aoAmbientTermProxy(aoSample.a, aoFlags); }
     a *= gFrameData.dbgScales.x;   // dev panel: ambient intensity modifier (lockstep w/ opaque.frag)
     // Which gShadowMask texel is OURS under MSAA (shadowreceive.h.fsl) — lockstep with opaque.frag.
     // Top level, because it takes derivatives and the mask is read from inside the divergent light
@@ -287,7 +305,11 @@ float4 PS_MAIN( VSOutput In )
         // and it must be flat on an OPEN surface — any 4x4 dither-tile texture there means the
         // quadrature reference is not cancelling. Cavities legitimately read as a normal map.
         if (dbg == 4u) { RETURN(float4(aoSample.rgb * 0.5f + 0.5f, 1.0f)); }
-        float v = aoSample.a; RETURN(float4(v, v, v, 1.0f));                 // mode 3: AO/visibility
+        // mode 3: AO/visibility — the term the shading actually multiplies by (see opaque.frag).
+        // ⚠ Multi-map feeds the fit the NEUTRAL GREY proxy, so this view stays grey here even with
+        // the tint on. That is not the tint failing — it is this shader having no albedo to give,
+        // and the view showing that honestly rather than inventing one.
+        RETURN(float4(aoAmbientTermProxy(aoSample.a, aoFlags), 1.0f));
     }
     if (dbg == 5u) { RETURN(float4(alb, 1.0f)); }                            // mode 5: albedo only (texture product)
     if (dbg == 6u) { RETURN(float4(lit, 1.0f)); }                           // mode 6: lit only (lighting, no texture)

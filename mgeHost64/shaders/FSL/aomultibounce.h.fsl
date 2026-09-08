@@ -1,0 +1,135 @@
+// mgeHost64 — AO MULTI-BOUNCE: the one definition of "how dark does occlusion get, and what colour".
+//
+// WHAT IT FIXES. Ambient occlusion arrives as a scalar visibility in [0,1] and every consumer used
+// it as `ambient *= visibility`, which drives an occluded pocket toward BLACK. That is wrong, and
+// it is wrong in a way that is obvious on vegetation: a crevice in a green field is not black, it is
+// DARK GREEN, because the light that reaches it has bounced off the green things around it. A single
+// scalar cannot express that — the correction has to know the albedo of the surface doing the
+// bouncing. Reported as "black on grass doesn't look right", which is exactly the symptom.
+//
+// It became visible when it did for a specific reason: G1f put grass in the Z-prepass, so grass
+// became a GTAO OCCLUDER for the first time (see g_grassPrepass). The ground under a clump had never
+// carried this occlusion before, so the renderer had never had to be right about its colour.
+//
+// PRIOR ART. Jimenez, Wu, Pesce, Jarabo — "Practical Real-Time Strategies for Accurate Indirect
+// Occlusion" (Activision, SIGGRAPH 2016 course), the GTAO paper. The multi-bounce term is a cubic
+// fit, per channel, of ground-truth multi-bounce response against albedo:
+//
+//     a =  2.0404*A - 0.3324 ;  b = -4.7951*A + 0.6417 ;  c =  2.7552*A + 0.6903
+//     GTAOMultiBounce(x, A) = max(x, ((x*a + b)*x + c)*x)
+//
+// ⚠ AND FOR ONCE THE PRIOR-ART CONSTANTS DO TRANSFER, WHICH IS WORTH SAYING OUT LOUD given how
+// often they do not ([[feedback_prior_art_constants_dont_transfer]]). The fit's domain is
+// LINEAR diffuse reflectance in [0,1] against a visibility in [0,1], and that is precisely what
+// this renderer has: colour textures are created as _SRGB views so the hardware decodes BEFORE
+// filtering (linearize.h.fsl explains why it must be the format and never a shader pow), so
+// sampleBase/sampleLand hand back linear albedo already. The albedo is saturate()d here anyway,
+// because terrain multiplies its land texture by a vertex colour and nothing guarantees the product
+// stayed inside the domain the fit was solved on.
+//
+// ⚠ THE max(x, ...) IS LOAD-BEARING, not a clamp for tidiness. It guarantees the result is never
+// DARKER than the raw visibility, so this can only ever add light back. A dark albedo returns very
+// nearly x (little bounces off it, so the occlusion stands); a bright albedo lifts the pocket a long
+// way, which is the physically right answer and also why the proxy question below matters.
+#pragma once
+
+// gFrameData.debugParams.w bits. 0-2 are the AO toggles, 3 is alpha.frag's magenta highlight, 4 is
+// retired (see alpha.frag). 5 is this.
+#define AO_FLAG_ENABLE       1u
+#define AO_FLAG_MULTIBOUNCE  32u
+
+float3 gtaoMultiBounce(float visibility, float3 albedoIn)
+{
+    float3 A = saturate(albedoIn);
+    float3 a =  2.0404f * A - 0.3324f;
+    float3 b = -4.7951f * A + 0.6417f;
+    float3 c =  2.7552f * A + 0.6903f;
+    float  x = saturate(visibility);
+    return max(float3(x, x, x), ((x * a + b) * x + c) * x);
+}
+
+// THE ONE CALL SHAPE EVERY CONSUMER USES, so the knob lives in exactly one place and the three
+// frags cannot drift about what "AO applied" means. With the bit clear this returns the scalar
+// broadcast, i.e. `ambient *= visibility` byte for byte — which is what makes aoMultiBounce=0 an
+// exact A/B against everything measured before this landed.
+// ⚠ WHY THE FIT LOOKS LIKE IT IS DOING NOTHING ON THIS CONTENT, MEASURED RATHER THAN GUESSED.
+// The domain above is right and the term is live — but MW's ground art decodes to a LINEAR albedo
+// of roughly 0.05-0.16, and the fit is deliberately near-inert down there. At visibility 0.5:
+//
+//   surface              linear albedo            MB(0.5, A)             delta
+//   MW ground   (110,100,70)  (0.156,0.127,0.061)  (0.532,0.519,0.500)  +0.03/+0.02/+0.000
+//   MW grass    ( 95,110,60)  (0.114,0.156,0.045)  (0.514,0.532,0.500)  +0.01/+0.03/+0.000
+//   stone       (140,138,130) (0.262,0.254,0.223)  (0.578,0.574,0.561)  +0.08/+0.07/+0.06
+//   skin/face   (224,172,140) (0.745,0.413,0.262)  (0.787,0.643,0.578)  +0.29/+0.14/+0.08
+//
+// On grass the BLUE CHANNEL IS CLAMPED to the raw visibility by the max() above — the fit wanted to
+// go DARKER than the input and was stopped. That is not a defect, it is the physics: a dark surface
+// bounces almost no light. It is also why the observed symptom was "only faces show bounce colour" —
+// skin at 0.75 linear is the one bright, saturated albedo in an MW scene.
+//
+// And the cubic at x == 1 returns EXACTLY 1 for every albedo (the A coefficients sum to ~0), so an
+// unoccluded pixel is white by construction. Wherever AO is weak this term cannot show anything,
+// no matter what albedo it is handed.
+//
+// Hence the two dials below. Both are IDENTITY AT 1.0.
+//
+// ⚠⚠ AND THEY STAY AT 1.0. TESTED IN-GAME AND REJECTED: "in mine, AO was merely tinted, here it is
+// taking into the details and looks bad. so keep it physical."
+//
+// That is not a taste report, it is a statement about what the tint IS. This term is evaluated
+// PER FRAGMENT against that fragment's own albedo, so the occlusion inherits the albedo's SPATIAL
+// FREQUENCY — every texel of grain, noise and mip shimmer in an MW diffuse map. At gain/chroma 1
+// the deltas are the +0.01..+0.03 in the table above and that structure sits below the noise floor.
+// Crank it and the AO stops being a tint and starts DRAWING THE TEXTURE: a low-frequency shading
+// term acquires high-frequency detail it has no business carrying, and it reads as dirt rather than
+// as bounce. A per-surface or per-cluster average albedo would tint without that, which is what the
+// "merely tinted" implementations are doing — it is a different term, not a bigger version of this
+// one, and it would need its own derivation rather than a multiplier on this.
+//
+// So the shipped look is the published fit, exactly. The dials remain because the arithmetic above
+// took a session to establish and the next person to ask "why is this so subtle?" should be able to
+// answer it by moving a slider rather than by re-deriving the table — and because 0 is the A/B.
+
+// Rec.709 luma, for the chroma dial. Local so this header stays standalone.
+float aoMbLuma(float3 c) { return dot(c, float3(0.2126f, 0.7152f, 0.0722f)); }
+
+float3 aoAmbientTerm(float visibility, float3 albedo, uint aoFlags)
+{
+    float x = saturate(visibility);
+    if ((aoFlags & AO_FLAG_MULTIBOUNCE) == 0u)
+    {
+        return float3(x, x, x);
+    }
+
+    float3 mb = gtaoMultiBounce(x, albedo);
+
+    // GAIN — scale the whole delta from the scalar. Clamped to 1: an occluded pocket must never come
+    // back BRIGHTER than an unoccluded one, which an unclamped gain would happily do.
+    float gain = gShadowParams.aoBounce.x;
+    mb = saturate(x + (mb - x) * gain);
+
+    // CHROMA — push the result away from its own luminance. Energy-preserving in luma by
+    // construction, so this adds colour without lifting the occlusion, which is the difference
+    // between "the AO is too dark" and "the AO is the wrong colour". saturate() last because a
+    // strong push can drive a channel negative on a very saturated albedo.
+    float chroma = gShadowParams.aoBounce.y;
+    float  l  = aoMbLuma(mb);
+    return saturate(l + (mb - l) * chroma);
+}
+
+// THE PROXY, for the one consumer that has no albedo to give (multimap.frag — its reflectance is
+// assembled per stage, after `lit`). A NEUTRAL MID GREY, and a compile-time constant rather than a
+// knob on purpose: it is not a look setting, it is a stand-in whose only job is to keep the
+// DARKENING MAGNITUDE in step with the consumers that do have a real albedo. Tuning it would be
+// tuning a lie about a surface's reflectance.
+//
+// ⚠ NOT MatDiffuse, which is the proxy that suggests itself and is actively wrong — see the note at
+// multimap.frag's call site. 0.5 is chosen because the fit is close to linear in albedo over the
+// mid range, so a mid grey lands near the average of what real MW textures would have returned.
+#define AO_MB_PROXY_GREY 0.5f
+
+float3 aoAmbientTermProxy(float visibility, uint aoFlags)
+{
+    return aoAmbientTerm(visibility, float3(AO_MB_PROXY_GREY, AO_MB_PROXY_GREY, AO_MB_PROXY_GREY),
+                         aoFlags);
+}

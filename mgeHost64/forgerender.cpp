@@ -5635,8 +5635,9 @@ namespace {
     // shadowmask.comp's cost-profile lanes. Instrumentation, zero on the shipped path — see
     // shadowparams.h.fsl::maskProf for what each lane cuts.
     constexpr uint32_t kMaskProfFloat         = kGrassParams8Float + 4;
+    constexpr uint32_t kAoBounceFloat         = kMaskProfFloat + 4;
     constexpr uint32_t kShadowParamsBytes = 4096;
-    static_assert((kMaskProfFloat + 4) * sizeof(float) <= kShadowParamsBytes,
+    static_assert((kAoBounceFloat + 4) * sizeof(float) <= kShadowParamsBytes,
                   "ShadowMaskParams overflows its CBV — too many sun cascades");
     // msmrecv.h.fsl's PCSS works in TEXELS, so SUN_SHADOW_RES has to agree with the atlas the host
     // actually allocated. Same mirroring contract as SUN_CASCADES / kSunCascades.
@@ -16992,6 +16993,43 @@ namespace {
     bool  g_aoEnable         = true;    // AO visibility modulates ambient (also arms the AO dispatch)
     bool  g_bentNormalEnable = false;   // use the AO bent normal as the lighting normal (A/B; off = geometric N)
     bool  g_ambientWhite     = false;   // debug: force ambient term to 1.0 so AO darkening is visible (pair w/ Diffuse=0)
+    // AO MULTI-BOUNCE (Activision/Jimenez GTAO course notes) — bit5. `ambient *= visibility` drives
+    // an occluded pocket toward BLACK, and a crevice in a green field is dark GREEN because the
+    // light reaching it bounced off the green around it. The cubic fit takes the surface's LINEAR
+    // albedo and returns a per-channel, energy-corrected visibility that is never darker than the
+    // scalar. See shaders/FSL/aomultibounce.h.fsl for the derivation and the domain argument.
+    //
+    // ON by default, and it is a LOOK fix rather than a dev A/B: raised the moment G1f made grass a
+    // GTAO occluder, because the ground under a clump had never carried this occlusion before and
+    // it came out black ("black on grass doesn't look right"). 0 restores the scalar multiply byte
+    // for byte, which is what makes every AO measurement taken before this still comparable.
+    bool  g_aoMultiBounce    = true;
+    // ...and its two LOOK DIALS, both IDENTITY AT 1.0 so the defaults are the published fit exactly.
+    //
+    // ⚠ THEY EXIST BECAUSE OF A MEASUREMENT, NOT A PREFERENCE. Reported as "90% no change, only
+    // faces show bounce color", and the arithmetic says that is the fit behaving correctly: MW's
+    // ground art decodes to a LINEAR albedo of 0.05-0.16, where the cubic is near-inert (on grass
+    // the blue channel is clamped to the raw visibility by the fit's own max()), while skin sits at
+    // 0.75 linear and lights up. The domain is not wrong — linear IS what the paper solved on, and
+    // _SRGB views deliver it. MW's art is simply darker than the reflectances the fit was fitted to.
+    //
+    // The table is in aomultibounce.h.fsl. These are the two honest ways to ask for more than
+    // physics gives, and they are different questions:
+    float g_aoBounceGain   = 1.0f;   // scale the whole delta — more light back, so AO also LIGHTENS
+    float g_aoBounceChroma = 1.0f;   // scale deviation from luma — colour WITHOUT washing AO out
+    // ⚠⚠ BOTH STAY AT 1.0 — TESTED AND REJECTED, and the reason generalises. In-game verdict on the
+    // exaggerated arms: "in mine, AO was merely tinted, here it is taking into the details and looks
+    // bad. so keep it physical."
+    //
+    // The tint is evaluated PER FRAGMENT against that fragment's own albedo, so the occlusion
+    // inherits the albedo's SPATIAL FREQUENCY — every texel of grain and mip shimmer in an MW
+    // diffuse map. At 1.0 the deltas are +0.01..+0.03 and that structure is below the noise floor.
+    // Crank either dial and the AO stops tinting and starts DRAWING THE TEXTURE: a low-frequency
+    // shading term acquiring high-frequency detail, which reads as dirt, not as bounce.
+    //
+    // The "merely tinted" look this was measured against is a DIFFERENT TERM — a per-surface or
+    // per-cluster average albedo, which tints without importing texel detail. Reachable from here,
+    // but it needs its own derivation, not a multiplier on this one.
 
     // Dev panel intensity modifiers → FrameData.dbgScales (float index 44..47). All 1.0 = no-op.
     // Scale Forge per-component output only; surfaces Forge doesn't draw are unaffected, so cranking
@@ -21005,6 +21043,13 @@ namespace {
           // views) — see renderScene — so nothing here can multiply ambient by a stale pAOBlur, and
           // AO still costs exactly zero at the baseline where all three are off.
           t.checkbox("AO enable", &g_aoEnable);
+          // Pair this with "AO enable" when judging the look: off = occlusion goes toward black,
+          // on = toward the surface's own colour (aomultibounce.h.fsl).
+          t.checkbox("AO multi-bounce (albedo tint)", &g_aoMultiBounce);
+          // Both identity at 1.0 = the published fit. MW's ground is 0.05-0.16 linear albedo, where
+          // the fit is near-inert by design, so these are how you ask for more than physics gives.
+          t.sliderF("AO bounce: gain (lightens too)", &g_aoBounceGain, 0.0f, 6.0f, 0.25f);
+          t.sliderF("AO bounce: chroma (colour only)", &g_aoBounceChroma, 0.0f, 8.0f, 0.25f);
           t.checkbox("Bent normal enable", &g_bentNormalEnable);
           t.checkbox("Ambient = white (debug)", &g_ambientWhite);
           t.dropdown("AO mode", &g_aoMode, kAOModeNames, (uint32_t)kAOModeCount);
@@ -24200,6 +24245,10 @@ void destroyHostWindow(Renderer* R);
             { "grassPatchScale",     &g_grassPatchScale     },
             { "grassPatchGrain",     &g_grassPatchGrain     },
             { "grassShadowRecvMode", &g_grassShadowRecvMode },
+            // AO multi-bounce look dials (aomultibounce.h.fsl). 1.0 = the published fit exactly.
+            // gain lightens the occlusion as it adds bounce; chroma adds colour without lightening.
+            { "aoBounceGain",        &g_aoBounceGain        },
+            { "aoBounceChroma",      &g_aoBounceChroma      },
             { "grassRootAO",         &g_grassRootAO         },
             { "grassRootAOHeight",   &g_grassRootAOHeight   },
             { "grassAOFullTile",     &g_grassAOFullTile     },
@@ -24405,6 +24454,9 @@ void destroyHostWindow(Renderer* R);
             // G1: the master A/B ("grass off must be bit-identical to today") and the one that
             // demonstrates the G1a near-cut trap — grassNearCut=1 re-arms the statics lane's cut and
             // ownership on the grass lane, which is the hole around the player, on purpose.
+            // AO multi-bounce (aomultibounce.h.fsl). 0 = the scalar `ambient *= visibility` that
+            // shipped, byte for byte, so every AO measurement predating it stays comparable.
+            { "aoMultiBounce",       &g_aoMultiBounce       },
             { "grassOn",             &g_drawGrass           },
             // G1f: the Z-prepass pair. 0 restores the single GEQUAL draw with grass.frag's own
             // SV_Coverage — i.e. the exact shader that shipped — so this knob, unlike grassOn,
@@ -27468,8 +27520,12 @@ void destroyHostWindow(Renderer* R);
             dp[42] = 1.0f / (float)g_live.height;   // invScreen.y
             dp[43] = (float)((g_aoEnable ? 1u : 0u) | (g_bentNormalEnable ? 2u : 0u)
                            | (g_ambientWhite ? 4u : 0u)      // AO toggles (bits 0-2)
-                           | (g_alphaHighlight ? 8u : 0u));  // bit3: alpha.frag magenta highlight (opaque ignores)
+                           | (g_alphaHighlight ? 8u : 0u)    // bit3: alpha.frag magenta highlight (opaque ignores)
                                                              // bit4 (two-sided flip) retired — see alpha.frag
+                           | (g_aoMultiBounce ? 32u : 0u));  // bit5: AO multi-bounce (aomultibounce.h.fsl)
+                                                             // ⚠ bit4 stays RETIRED rather than reused —
+                                                             // a recycled bit is how a stale consumer starts
+                                                             // reading a live flag as its old meaning.
             // dbgScales (float index 44..47): dev panel intensity modifiers.
             dp[44] = g_ambScale; dp[45] = g_litScale; dp[46] = g_albedoScale; dp[47] = g_overallScale;
             // ─── THE TWO FOG LOOK LANES (froxelZ.zw, float 122/123) ──────────────────────────
@@ -29563,6 +29619,14 @@ void destroyHostWindow(Renderer* R);
             mp[kMaskProfFloat + 1] = g_maskNoDyn;
             mp[kMaskProfFloat + 2] = g_maskFilter;
             mp[kMaskProfFloat + 3] = 0.0f;
+            // AO multi-bounce look dials — see aomultibounce.h.fsl for why they exist. Published
+            // UNCONDITIONALLY beside maskProf rather than from an AO-gated block: the consumers read
+            // them on every frame the multi-bounce bit is set, and a lane written only on some
+            // frames is the stale-cbuffer trap this file has been bitten by before.
+            mp[kAoBounceFloat + 0] = std::max(0.0f, g_aoBounceGain);
+            mp[kAoBounceFloat + 1] = std::max(0.0f, g_aoBounceChroma);
+            mp[kAoBounceFloat + 2] = 0.0f;
+            mp[kAoBounceFloat + 3] = 0.0f;
             mp[280] = g_shadowBias;               // biasParams.x = absolute contact bias (live knob)
             mp[281] = g_shadowNormalOffset;       // biasParams.y = normal-offset bias in texels (live knob)
             // Flicker shadow "movement": the mask rotates the LOOKUP direction of flicker-class slots by a
@@ -48865,7 +48929,19 @@ void destroyHostWindow(Renderer* R);
         mp[kGrassParams4Float + 1] = std::max(0.0f, std::min(g_grassTintHue, 1.0f));
         mp[kGrassParams4Float + 2] = std::max(0.0f, std::min(g_grassShadowRecvMode, 2.0f));
         mp[kGrassParams4Float + 3] = std::max(0.0f, g_grassShadowDrop);
-        mp[kGrassParams5Float + 0] = std::max(0.0f, std::min(g_grassRootAO, 1.0f));
+        // ⚠ THE AUTHORED ROOT AO STANDS DOWN WHEN REAL AO IS ON. g_grassRootAO is G5d's hand-made
+        // "sits on the ground" contact cue, and until G1f it was the ONLY thing selling that cue:
+        // grass was not in the Z-prepass, so GTAO never saw it and the ground under a clump carried
+        // no occlusion at all. Now it does, from the real thing — and running both means the same
+        // contact darkening is paid for twice, from opposite sides (this one darkens the base of the
+        // BLADE, GTAO darkens the GROUND beneath it).
+        //
+        // So this is a FALLBACK now, not a companion: it lights up exactly when GTAO is off, which
+        // keeps the cue present in the aoEnable=0 arm instead of the sward going flat there. The
+        // knob and its height are untouched and still A/B on their own — with AO off, they behave
+        // exactly as they always did.
+        mp[kGrassParams5Float + 0] = g_aoEnable ? 0.0f
+                                                : std::max(0.0f, std::min(g_grassRootAO, 1.0f));
         mp[kGrassParams5Float + 1] = (g_grassRootAOHeight > 1.0f) ? (1.0f / g_grassRootAOHeight) : 1.0f;
         mp[kGrassParams5Float + 2] = g_grassPointLights ? 1.0f : 0.0f;
         mp[kGrassParams5Float + 3] = std::max(0.0f, std::min(g_grassShadowOpacity, 1.0f));

@@ -1192,7 +1192,9 @@ STRUCT(ShadowMaskParams)
     float4 grassParams8;
 #line 763 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
     float4 maskProf;
-#line 764
+#line 780 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
+    float4 aoBounce;
+#line 781
 };
 #line 21 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
 #line 27 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
@@ -2085,6 +2087,50 @@ float3 mod2xLinear(float3 tLinear)
     return srgbToLinear(2.0f * linearToSrgb(tLinear));
 }
 #line 29 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terrain.frag.fsl"
+#line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/aomultibounce.h.fsl"
+#line 41 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/aomultibounce.h.fsl"
+float3 gtaoMultiBounce(float visibility, float3 albedoIn)
+{
+    float3 A = saturate(albedoIn);
+    float3 a = 2.0404f * A - 0.3324f;
+    float3 b = -4.7951f * A + 0.6417f;
+    float3 c = 2.7552f * A + 0.6903f;
+    float x = saturate(visibility);
+    return max(float3(x, x, x), ((x * a + b) * x + c) * x);
+}
+#line 94 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/aomultibounce.h.fsl"
+float aoMbLuma(float3 c) { return dot(c, float3(0.2126f, 0.7152f, 0.0722f)); }
+
+float3 aoAmbientTerm(float visibility, float3 albedo, uint aoFlags)
+{
+    float x = saturate(visibility);
+    if ((aoFlags &  32u ) == 0u)
+    {
+        return float3(x, x, x);
+    }
+
+    float3 mb = gtaoMultiBounce(x, albedo);
+
+
+
+    float gain = gShadowParams.aoBounce.x;
+    mb = saturate(x + (mb - x) * gain);
+
+
+
+
+
+    float chroma = gShadowParams.aoBounce.y;
+    float l = aoMbLuma(mb);
+    return saturate(l + (mb - l) * chroma);
+}
+#line 131 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/aomultibounce.h.fsl"
+float3 aoAmbientTermProxy(float visibility, uint aoFlags)
+{
+    return aoAmbientTerm(visibility, float3( 0.5f ,  0.5f ,  0.5f ),
+                         aoFlags);
+}
+#line 30 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terrain.frag.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/scenecolor.h.fsl"
 #line 113 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/scenecolor.h.fsl"
 float3 tonemapInPass(float3 c)
@@ -2188,7 +2234,7 @@ float3 expandExposedEmissiveDelta(float3 emis, float3 albedoRgb, float cov)
 {
     return expandExposedEmissive(emis, albedoRgb, cov) - emis;
 }
-#line 30 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terrain.frag.fsl"
+#line 31 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terrain.frag.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skydome.h.fsl"
 #line 54 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skydome.h.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/waterfog.h.fsl"
@@ -3005,7 +3051,7 @@ float3 applyFog(float3 lit, float3 worldPosRel, float2 pixelXy, float fog)
 
     return lerp(fogSkyTarget(s, fogSkyShare(fogAir)), behind, fogAir);
 }
-#line 31 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terrain.frag.fsl"
+#line 32 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terrain.frag.fsl"
 
 
 
@@ -3020,7 +3066,7 @@ STRUCT(VSOutput)
     DATA(CENTROID(float), Fog, TEXCOORD2);
     DATA(float2, Lattice, TEXCOORD3);
     DATA(FLAT(uint4), Cell, TEXCOORD4);
-#line 45
+#line 46
 };
 
 
@@ -3105,7 +3151,7 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
         albedo += sampleLand(id01, uv) * w01;
         albedo += sampleLand(id11, uv) * w11;
     }
-#line 144 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terrain.frag.fsl"
+#line 145 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terrain.frag.fsl"
     {
         const uint cslot = In.Cell.x;
         float3 c00 = loadVertexColor(cslot, x0, y0);
@@ -3117,7 +3163,7 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
 
     float3 normal = normalize(In.Normal);
     float sunVis = sunShadowVisibility(In.WorldPos, normal);
-#line 186 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terrain.frag.fsl"
+#line 187 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terrain.frag.fsl"
     bool inReflect = (gFrameData.gReflWaterClip.z != 0.0f);
     uint aoFlags = (uint)(gFrameData.debugParams.w + 0.5f);
 
@@ -3138,7 +3184,13 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
 
 
     float3 amb = gFrameData.lodSunAmb.rgb * skyAmbFactor(normal, In.WorldPos);
-    if ((aoFlags & 1u) != 0u) { amb *= aoSample.a; }
+
+
+
+
+
+
+    if ((aoFlags & 1u) != 0u) { amb *= aoAmbientTerm(aoSample.a, albedo, aoFlags); }
 
 
 
@@ -3152,7 +3204,7 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
                   * (gFrameData.sunCol.rgb * saturate(dot(-gFrameData.sunDir.xyz, normal)) * sunVis
                         * tSunW
                      + amb * tAmbW);
-#line 242 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terrain.frag.fsl"
+#line 249 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terrain.frag.fsl"
     float3 pointDiffuse = float3(0.0f, 0.0f, 0.0f);
 
 
@@ -3313,7 +3365,10 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
 
 
         if (dbg == 4u) { RETURN(float4(aoSample.rgb * 0.5f + 0.5f, 1.0f)); }
-        float v = aoSample.a; RETURN(float4(v, v, v, 1.0f));
+
+
+
+        return (float4(aoAmbientTerm(aoSample.a, albedo, aoFlags), 1.0f));
     }
     if (dbg == 1u || dbg == 2u) {
         float dist = length(In.WorldPos - gFrameData.eyePos.xyz);

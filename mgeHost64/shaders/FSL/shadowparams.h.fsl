@@ -761,4 +761,21 @@ STRUCT(ShadowMaskParams)
     //       different width, so these are its two endpoints and their gap is what the gate is buying.
     //   w = spare.
     DATA(float4,   maskProf,         None);
+    // AO MULTI-BOUNCE LOOK DIALS (aomultibounce.h.fsl). Both are IDENTITY AT 1.0, so the defaults
+    // reproduce the Activision fit exactly and every measurement taken against it stays valid.
+    //
+    // They exist because of a finding, not a preference: MW's ground art decodes to a LINEAR albedo
+    // of 0.05-0.16, and the published fit is deliberately near-inert down there — a dark surface
+    // bounces almost no light, and on MW grass the blue channel is clamped to the raw visibility by
+    // the fit's own max(). So the physically-correct term is invisible on exactly the surface it was
+    // added for, while skin (0.75 linear) shows it strongly. These are the two honest ways to ask
+    // for more than physics gives.
+    //   x = GAIN.   Scales the whole multi-bounce delta: x + (mb - x) * gain, clamped to 1.
+    //               "More bounce" in the literal sense — more light returns to the pocket, so the
+    //               occlusion also gets LIGHTER. That is what more bounce means; it is not a bug.
+    //   y = CHROMA. Scales the result's deviation from its own luminance. Colour WITHOUT washing the
+    //               occlusion out, which is the dial that matches "black on grass doesn't look
+    //               right" rather than "the AO is too dark".
+    //   zw = spare.
+    DATA(float4,   aoBounce,         None);
 };

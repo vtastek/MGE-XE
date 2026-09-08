@@ -26,6 +26,7 @@
 #include "skyamb.h.fsl"    // skyAmbFactor() — SH-L1 sky ambient (SH1) + sky AO (SH2)
 #include "tonemap.h.fsl"   // tonemap() — the shared semi-HDR curve (was six byte-identical copies)
 #include "linearize.h.fsl" // srgbToLinear()/mod2xLinear() — the scene's transfer function (step 5)
+#include "aomultibounce.h.fsl" // aoAmbientTerm() — SHARED AO darkening, albedo-tinted (Activision GTAO)
 #include "scenecolor.h.fsl" // tonemapInPass() — class 1: the curve moved to resolve.frag (step 6a)
 #include "skydome.h.fsl"   // applyFog() — extinguish into a silhouette, then melt into the SAMPLED sky
 
@@ -203,7 +204,13 @@ float4 PS_MAIN( VSOutput In )
     // on purpose — giving near geometry directional ambient while the distant paths stayed flat puts
     // a visible seam across the near/far handover on the same building.
     float3 amb = gFrameData.lodSunAmb.rgb * skyAmbFactor(normal, In.WorldPos);
-    if ((aoFlags & 1u) != 0u) { amb *= aoSample.a; }   // "AO enable" tick (debugParams.w bit0)
+    // "AO enable" tick (debugParams.w bit0), through the shared multi-bounce term.
+    // ⚠ TERRAIN IS THE SURFACE THIS MATTERS MOST ON, and it is the one that prompted it. G1f made
+    // grass a GTAO occluder, so the ground under a clump carries occlusion it never carried before —
+    // and as a scalar multiply that occlusion went toward BLACK on a green field. `albedo` here is
+    // the blended land texture times the vertex colour, i.e. exactly the reflectance doing the
+    // bouncing, and it is LINEAR already (_SRGB views). See aomultibounce.h.fsl.
+    if ((aoFlags & 1u) != 0u) { amb *= aoAmbientTerm(aoSample.a, albedo, aoFlags); }
     // W7b — absorption on the way IN (waterfog.h.fsl). Terrain matters most of all the callers here:
     // the SEABED is terrain, so this is the surface whose lighting the whole model is about. Applied
     // to the sun and ambient terms only, before the point lights below add into `result`.
@@ -399,7 +406,10 @@ float4 PS_MAIN( VSOutput In )
         // and it must be flat on an OPEN surface — any 4x4 dither-tile texture there means the
         // quadrature reference is not cancelling. Cavities legitimately read as a normal map.
         if (dbg == 4u) { RETURN(float4(aoSample.rgb * 0.5f + 0.5f, 1.0f)); }
-        float v = aoSample.a; RETURN(float4(v, v, v, 1.0f));      // mode 3: AO/visibility
+        // mode 3: AO/visibility — the term the shading actually multiplies by (see opaque.frag).
+        // Coloured when aoMultiBounce is on, grey when it is off. Terrain is the surface to read
+        // this on: it is what carries the occlusion grass casts.
+        RETURN(float4(aoAmbientTerm(aoSample.a, albedo, aoFlags), 1.0f));
     }
     if (dbg == 1u || dbg == 2u) {
         float dist = length(In.WorldPos - gFrameData.eyePos.xyz);

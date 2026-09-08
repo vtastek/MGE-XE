@@ -16,6 +16,7 @@
 #include "skyamb.h.fsl"      // skyAmbFactor() — SH-L1 sky ambient (SH1) + sky AO (SH2)
 #include "tonemap.h.fsl"     // tonemap() — the shared semi-HDR curve (was six byte-identical copies)
 #include "linearize.h.fsl" // srgbToLinear()/mod2xLinear() — the scene's transfer function (step 5)
+#include "aomultibounce.h.fsl" // aoAmbientTerm() — SHARED AO darkening, albedo-tinted (Activision GTAO)
 #include "scenecolor.h.fsl" // tonemapInPass() — class 1: the curve moved to resolve.frag (step 6a)
 #include "skydome.h.fsl"     // applyFog() — extinguish into a silhouette, then melt into the SAMPLED sky
 #include "enchantglow.h.fsl" // enchantGlow() — MW's caustic env map over enchanted items
@@ -167,8 +168,12 @@ float4 PS_MAIN( VSOutput In )
     bool causProj = causticProjectorActive(In.WorldPos);
 
     // Tier 3: GTAO modulates AMBIENT only (scene-walk oracle — sun/point diffuse untouched).
-    // Gated by the "AO enable" tick (debugParams.w bit0). Sky/no-geom AO = 1 (no-op).
-    if ((aoFlags & 1u) != 0u) { a *= aoSample.a; }
+    //
+    // ⚠ THE AO MULTIPLY IS DEFERRED FROM HERE TO JUST ABOVE `lit`, and that is not a reordering for
+    // its own sake: the multi-bounce term needs the surface ALBEDO, which is not sampled until
+    // further down. Nothing between here and there reads `a` — dbgScales.x below is a commutative
+    // scale, the point-light loop adds into `d`, and waterLightTransmit has already run — so moving
+    // one multiply past them is exact. Search "AO, DEFERRED" for where it lands.
     a *= gFrameData.dbgScales.x;   // dev panel: ambient intensity modifier
 
     // Tier 3a point lights — replicates XE FixedFuncEmu.fx evalOnePointLight EXACTLY, in WORLD
@@ -317,15 +322,16 @@ float4 PS_MAIN( VSOutput In )
     // so they are now one branch, not two. Source 2 stays separate: there the vertex colour is a
     // modulator on (d + a) rather than an addend, which is a different expression, not a different
     // operand.
-    float3 lit = (In.VColSource == 2u) ? (In.Color.rgb * (d + a) + emis)
-                                       : (In.MatDiffuse * d + In.MatAmbient * a + emis);
-
     // gSamplerAnisotropic: FSL built-in STATIC sampler (anisotropic 8x, WRAP), baked into
     // DefaultRootSignature. We deliberately do NOT use a dynamic sampler: one sharing the Persistent
     // set with the 1024-entry bindless array gets pushed to mOffset=1024 by FSL's single per-set
     // descriptor counter, so the host's bind lands at sampler-table slot 1024 while the shader reads
     // s0 (= null sampler => POINT filter + non-REPEAT address => tiled UVs sample black). A static
     // sampler sidesteps that entirely. See opaque.srt.h.
+    //
+    // ⚠ HOISTED ABOVE `lit` (it used to sit just below, next to the alpha test) because the AO
+    // multi-bounce term needs the albedo. Still top-level, uniform control flow, so its implicit-LOD
+    // derivatives are unaffected; the alpha test and the discard stay where they were.
     float4 albedo = sampleBase(In.TexIndex, In.ClampMode, In.Uv, useLowAF(In.AlphaRef, false));
 
     // Terrain DECAL_1 splat — replicates cacheTerrainLitColor (XE Mod Landscape Lit.fx):
@@ -333,10 +339,25 @@ float4 PS_MAIN( VSOutput In )
     // Gated on OverlayIndex != 0 so every non-terrain / single-texture draw is byte-for-byte
     // unchanged. Lands BEFORE the alpha test and c = albedo.rgb * lit, so terrain computes
     // lerp(base,overlay,vcol.a) * vcol.rgb*(d+a) — matching the D3D9 oracle.
+    // Hoisted WITH the sample above, so the multi-bounce reads the splatted reflectance rather than
+    // the base map on the draws that have an overlay.
     if (In.OverlayIndex != 0u) {
         float3 ov = SampleTex2D(gTextures[In.OverlayIndex], gSamplerAnisotropic, In.Uv).rgb;
         albedo.rgb = lerp(albedo.rgb, ov, In.Color.a);
     }
+
+    // AO, DEFERRED from the ambient block far above (see the note there for why moving it is exact).
+    // Applied to `a` at the last moment before it folds into `lit`, because the multi-bounce term
+    // takes the albedo that is only now in scope. dbgScales.z has NOT been applied yet, deliberately:
+    // that is a dev-panel intensity modifier, not reflectance, and feeding it to the fit would make
+    // the AO tint follow a debug slider. See aomultibounce.h.fsl.
+    if ((aoFlags & 1u) != 0u) { a *= aoAmbientTerm(aoSample.a, albedo.rgb, aoFlags); }
+
+    float3 lit = (In.VColSource == 2u) ? (In.Color.rgb * (d + a) + emis)
+                                       : (In.MatDiffuse * d + In.MatAmbient * a + emis);
+
+    // (albedo is sampled ABOVE now, before `lit` — the AO multi-bounce term needs it. The alpha
+    //  test below still runs here, on the same value, so the discard has not moved.)
 
     // Alpha test (cutout foliage/grates/fences). MW drives this per-part via D3DRS_ALPHAREF
     // with GREATER; we approximate with GREATEREQUAL (keep a >= ref). Strict '<' means a ref of
@@ -381,7 +402,14 @@ float4 PS_MAIN( VSOutput In )
         // and it must be flat on an OPEN surface — any 4x4 dither-tile texture there means the
         // quadrature reference is not cancelling. Cavities legitimately read as a normal map.
         if (dbg == 4u) { RETURN(float4(aoSample.rgb * 0.5f + 0.5f, 1.0f)); }
-        float v = aoSample.a; RETURN(float4(v, v, v, 1.0f));                 // mode 3: AO/visibility
+        // mode 3: AO/visibility — THE TERM THE SHADING ACTUALLY MULTIPLIES BY, not a re-derivation
+        // of it. With aoMultiBounce on this is the albedo-tinted multi-bounce result and the view is
+        // COLOURED; with it off it is the scalar broadcast and the view is grey, byte-identical to
+        // what this mode always showed. That is the whole point of routing it through the same
+        // aoAmbientTerm the lighting uses: a debug view that recomputed the value could agree with
+        // itself while disagreeing with the frame, and "is the tint on, or is it just subtle?" is
+        // exactly the question this mode has to be able to answer.
+        RETURN(float4(aoAmbientTerm(aoSample.a, albedo.rgb, aoFlags), 1.0f));
     }
     if (dbg == 5u) { RETURN(float4(albedo.rgb, 1.0f)); }                     // mode 5: albedo only (texture, no lighting)
     if (dbg == 6u) { RETURN(float4(lit, 1.0f)); }                            // mode 6: lit only (lighting, no texture)
