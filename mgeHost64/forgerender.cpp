@@ -16041,20 +16041,30 @@ namespace {
     float    g_aoBentStr   = 1.0f;
     // Dither source. 0 = the legacy 4x4 Activision tile, 1 = the embedded spatiotemporal blue-noise
     // mask FROZEN on one slice (spatial-only: fixes the tile's diagonal, changes nothing per frame),
-    // 2 = the mask advancing. Three rungs on purpose — 1 is the safe half of the upgrade, so if the
-    // animation is ever the suspect it can be taken out without going back to the diagonal.
+    // 2 = the mask advancing, 3 = the COMPLEMENTARY 2x2 quad frozen, 4 = the same quad with a rigid
+    // per-frame quarter turn. Five rungs on purpose: each is the safe half of the rung above it, so
+    // whichever axis is under suspicion can be taken out without giving up the ones that are not.
     //
-    // DEFAULT 1, not 2, since 2026-09-05. Reported from play: at half res the grains are 2x2 screen
-    // pixels, and "they crawl with time" reads as WORSE than "they crawl with camera movement".
-    // That is the whole argument for rung 1 — the temporal axis is only an asset when something
-    // INTEGRATES it, and the AO has no temporal accumulator, so all the third dimension buys here
-    // is a visible cycle on a grain that is already too large. Rung 1 keeps the blue-noise spatial
-    // fix (no 4x4 diagonal) and freezes the slice, which is exactly screen-locked-crawl-only.
-    uint32_t g_aoDither    = 1u;
-    // Frames per mask slice. 1 = advance every frame, which is what the worst case wants: a slowly
-    // moving NPC or swaying grass keeps a surface point on the SAME pixel for many frames, so motion
-    // cannot reshuffle the spatial mask and the temporal column is the only thing decorrelating it.
-    // Raise it only to trade that away for calm at a dead standstill.
+    // DEFAULT 3 since 2026-09-08, and it demotes the whole blue-noise branch rather than tuning it.
+    // Reported from play: "crawl, aliasing, grain size are problems. I saw people doing quarter res
+    // AO without these problems." All three are the SAME defect and it is not the mask's quality —
+    // a rotation drawn from a CONTINUUM means no finite neighbourhood ever averages to a complete
+    // angular set, so the residual direction variance is spread over every spatial frequency and
+    // only a very wide blur can reach it. Blue noise decorrelates neighbours; it never makes them
+    // complementary. Rung 3 quantises the rotation to four offsets on a period-2 lattice, so any
+    // 2x2 window sweeps 4 * slices directions at exactly uniform spacing and the variance collapses
+    // onto the NYQUIST frequency, where the existing bilateral annihilates it (0.0002 of it survives
+    // at the shipped sigma — the arithmetic is in aocommon.h.fsl's aoDitherQuad). Same 2 slices,
+    // same cost, an 8-direction sweep per quad instead of 8 random ones.
+    //
+    // Rung 4 exists because the quad's temporal axis is FREE of the objection that demoted rung 2: a
+    // quarter turn permutes which pixel holds which member without changing the set, so the resolved
+    // value is frame-invariant by construction. It stays off only because nothing integrates it yet.
+    uint32_t g_aoDither    = 3u;
+    // Frames per mask slice (rung 2) or per quarter turn (rung 4). 1 = advance every frame, which is
+    // what the worst case wants: a slowly moving NPC or swaying grass keeps a surface point on the
+    // SAME pixel for many frames, so motion cannot reshuffle the spatial mask and the temporal column
+    // is the only thing decorrelating it. Raise it only to trade that away for calm at a standstill.
     uint32_t g_aoDitherStride = 1u;
     // Which aoblur variant runs (AOBlurMode / kAOBlurShaderFiles). 0 = the 2D radius-3 reference
     // that shipped, 1 = separable at the same radius, 2 = separable at radius 6. Default 0 so the
@@ -21069,8 +21079,15 @@ namespace {
           // Blur spatial -> 0 is the bent-normal diagnostic: aoblur.comp makes that a straight
           // passthrough copy, so an artifact that VANISHES there came from the blur and one that
           // PERSISTS came from the slice quadrature.
-          static const char* const kAODitherNames[] = { "4x4 tile (legacy)", "blue noise (frozen)", "blue noise (spatiotemporal)" };
-          t.dropdown("AO dither", &g_aoDither, kAODitherNames, 3u);
+          // 3/4 are a different CLASS from 0/1/2, not a better mask: complementary rather than
+          // merely decorrelated. Judge them against 1 with the blur ON — rung 3's whole argument is
+          // that it hands the blur a pattern the blur can annihilate, so blurParams.x = 0 shows it
+          // as a checkerboard on purpose (that is the diagnostic, not the look).
+          static const char* const kAODitherNames[] = { "4x4 tile (legacy)", "blue noise (frozen)",
+                                                        "blue noise (spatiotemporal)",
+                                                        "complementary 2x2 (frozen)",
+                                                        "complementary 2x2 (rotating)" };
+          t.dropdown("AO dither", &g_aoDither, kAODitherNames, 5u);
           t.sliderU("AO dither frames/slice (1 = every frame)", &g_aoDitherStride, 1u, 8u, 1u);
           // Separable is an APPROXIMATION of the 2D range weight, so 1 vs 0 is the look A/B for
           // separability alone and 2 vs 1 is the look A/B for width alone. Never judge them together.
@@ -24476,12 +24493,11 @@ void destroyHostWindow(Renderer* R);
         };
         const UKnob uknobs[] = {
             // AO DITHER SOURCE: 0 = legacy 4x4 tile, 1 = blue noise FROZEN (slice 0), 2 =
-            // spatiotemporal. Rung 1 is the documented remedy when the ANIMATION is what shows —
-            // it keeps the blue-noise spatial fix and stops the per-frame walk. Reported
-            // 2026-09-05: at half res the grains are 2x2 screen pixels and the temporal cycle is
-            // plainly visible on them, which is what rung 1 exists for. There is no temporal
-            // accumulator on the AO, so the third axis has nothing integrating it away.
-            { "aoDither",       &g_aoDither,       2u },
+            // spatiotemporal, 3 = complementary 2x2 quad frozen (the DEFAULT), 4 = that quad with a
+            // rigid per-frame quarter turn. The A/B this milestone needs is 3 against 1 — same cost,
+            // same slice budget, the only difference being whether a 2x2 neighbourhood sweeps a
+            // COMPLETE angular set or four random draws from a continuum.
+            { "aoDither",       &g_aoDither,       4u },
             // Frames per STBN slice. Raising it slows the cycle (trades decorrelation for calm)
             // without giving up the temporal axis entirely — the middle setting between rungs 2
             // and 1. See [[project_forge_ao_stbn_dither]].
@@ -32019,20 +32035,35 @@ void destroyHostWindow(Renderer* R);
             // stays zeroed rather than left stale, since an unwritten lane here is an unspecified
             // value there.
             // ap[35] packs the dither SOURCE and its PHASE into one lane, because it is one
-            // question: < 0 = the legacy 4x4 tile, >= 0 = the STBN mask at that time slice. Mode 1
-            // pins slice 0 (spatial-only), mode 2 advances. The counter is frame-driven, not
-            // time-driven, so a frame-rate change alters how fast it walks in SECONDS but never
-            // makes it skip a slice — a dropped frame must not put a hole in the sequence.
+            // question (aocommon.h.fsl's aoDither decodes it): <= -1.5 = the complementary 2x2 quad
+            // carrying its phase as -(w + 2), in (-1.5, 0) = the legacy 4x4 tile, >= 0 = the STBN
+            // mask at that time slice. Mode 1 pins slice 0 (spatial-only), 2 advances, 3 is the quad
+            // frozen, 4 the quad turning. The counter is frame-driven, not time-driven, so a
+            // frame-rate change alters how fast it walks in SECONDS but never makes it skip a step —
+            // a dropped frame must not put a hole in the sequence.
+            //
+            // ⚠ THE QUAD'S PHASE IS QUANTISED TO QUARTERS AND MUST STAY THAT WAY. A continuous phase
+            // would rotate the quad onto a DIFFERENT set of directions each frame — still complete,
+            // still zero-variance in the mean, but a different answer every frame, which is crawl
+            // reintroduced through the one door this pattern closes. On quarters the set is
+            // invariant and only the assignment of members to pixels rotates.
             static uint32_t s_ditherFrame = 0;
             ++s_ditherFrame;
+            const uint32_t ditherStride = (g_aoDitherStride < 1u) ? 1u : g_aoDitherStride;
             float ditherSel = -1.0f;
             if (g_aoDither == 1u) {
                 ditherSel = 0.0f;
-            } else if (g_aoDither >= 2u) {
-                const uint32_t stride = (g_aoDitherStride < 1u) ? 1u : g_aoDitherStride;
-                ditherSel = (float)((s_ditherFrame / stride) & 15u);
+            } else if (g_aoDither == 2u) {
+                ditherSel = (float)((s_ditherFrame / ditherStride) & 15u);
+            } else if (g_aoDither == 3u) {
+                ditherSel = -2.0f;
+            } else if (g_aoDither >= 4u) {
+                ditherSel = -2.0f - 0.25f * (float)((s_ditherFrame / ditherStride) & 3u);
             }
-            if (!g_live.pStbn) { ditherSel = -1.0f; }   // upload failed → the tile, not a black read
+            // Upload failed → the tile, not a black read. Only the two STBN rungs sample gStbn, so
+            // this must not reach the quad: it needs no texture at all, and sending it to the legacy
+            // 4x4 diagonal would be a downgrade triggered by an unrelated failure.
+            if (!g_live.pStbn && ditherSel >= 0.0f) { ditherSel = -1.0f; }
             ap[32] = g_aoBentStr; ap[33] = g_aoPlaneSig; ap[34] = g_aoBlurDepthFar; ap[35] = ditherSel;
 
             const uint32_t gx = (g_live.width + 7u) / 8u;

@@ -988,18 +988,10 @@ STRUCT(AOParams)
     float4 sliceParams;
 
     float4 aoParams2;
-
-
-
-
-
-
-
-
-
-#line 39
+#line 43 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/gtao.srt.h"
+#line 43
 };
-#line 56 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/gtao.srt.h"
+#line 60 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/gtao.srt.h"
         CBUFFER(AOParams) gAOParams :  register(b0,space3);
         Tex2D(float) gLinearDepthIn :  register(t1,space3);
         WTex2D(float4) gAOOut :  register(u2,space3);
@@ -1049,21 +1041,33 @@ float2 aoDitherStbn(int2 px, int slice)
     int2 t = int2(px.x & 63, (px.y & 63) + 64 * (slice & 15));
     return LoadTex2D(gStbn, NO_SAMPLER, t, 0).rg;
 }
+#line 199 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/aocommon.h.fsl"
+float2 aoDitherQuad(int2 px, float phase)
+{
+    uint x = uint(px.x) & 1u;
+    uint y = uint(px.y) & 1u;
 
 
 
+    uint q = (((x ^ y) & 1u) << 1) | y;
 
-
+    return float2((float(q) + phase) * 0.25f, float(q ^ 2u) * 0.25f);
+}
+#line 222 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/aocommon.h.fsl"
 float2 aoDither(int2 px)
 {
     float sel = gAOParams.aoParams2.w;
+    if (sel <= -1.5f)
+    {
+        return aoDitherQuad(px, -(sel + 2.0f));
+    }
     if (sel < 0.0f)
     {
         return aoDitherTile(px);
     }
     return aoDitherStbn(px, (int)(sel + 0.5f));
 }
-#line 186 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/aocommon.h.fsl"
+#line 258 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/aocommon.h.fsl"
 float3 aoMinDiff(float3 dr, float3 dl)
 {
     float lr = dot(dr, dr);
@@ -1185,7 +1189,7 @@ float aoFalloffWeight(float dl)
 {
     return saturate(1.0f - dl / aoFalloff());
 }
-#line 322 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/aocommon.h.fsl"
+#line 394 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/aocommon.h.fsl"
 float aoAcos(float x)
 {
     float ax = abs(x);
@@ -1263,7 +1267,7 @@ float gtaoArc(float a, float b, float n)
     }
     return gtaoInner(a, n) + gtaoInner(b, n);
 }
-#line 421 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/aocommon.h.fsl"
+#line 493 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/aocommon.h.fsl"
 float4 aoResolve(float occ, float3 bentSum, float3 refSum, float3 N)
 {
     float vis = saturate(1.0f - saturate(occ) * aoIntensity());

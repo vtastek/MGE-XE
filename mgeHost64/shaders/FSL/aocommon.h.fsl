@@ -147,13 +147,85 @@ float2 aoDitherStbn(int2 px, int slice)
     return LoadTex2D(gStbn, NO_SAMPLER, t, 0).rg;
 }
 
-// aoParams2.w packs both the choice and the phase: < 0 = the legacy tile, >= 0 = STBN at that time
-// slice. One lane, because it is one question — which phase of what pattern. A slice the host never
-// advances is therefore spatial-only STBN, the useful middle rung: it fixes the diagonal without
-// introducing any per-frame change at all, for when the temporal axis is the thing under suspicion.
+// COMPLEMENTARY 2x2 — the default since 2026-09-08, and the answer to "crawl, aliasing, grain size
+// are problems; I saw people doing quarter res AO without these problems".
+//
+// ⚠ BLUE NOISE DECORRELATES NEIGHBOURS. IT DOES NOT MAKE THEM COMPLEMENTARY. That distinction is
+// the whole of this function. Both masks above hand each pixel a rotation drawn from a CONTINUUM,
+// so no finite neighbourhood ever averages to a COMPLETE angular set: four adjacent pixels at 2
+// slices give 8 randomly placed directions, not 8 evenly spaced ones. The leftover direction
+// variance is real signal error, it survives at every spatial frequency, and the only thing that
+// removes it is a blur wide enough to average many samples — which is exactly what a bilateral
+// refuses to do on the detailed geometry where the grain shows worst. Chasing it with a better
+// random mask cannot work, because the defect is not correlation, it is INCOMPLETENESS.
+//
+// So quantise instead. The rotation takes one of FOUR offsets q/4 of the slice period (pi/slices),
+// assigned by the Bayer 2x2 index, and the four members of any 2x2 window together sweep
+// 4 * slices directions at EXACTLY uniform spacing over the half-plane — no gaps, no overlap, zero
+// direction variance in their mean. At the shipped 2 slices that is an 8-direction sweep per quad,
+// for the cost of 2. This is what the deinterleaved AO implementations (ASSAO, HBAO+, XeGTAO) are
+// doing when they run 4 or 16 sub-images at a constant rotation each; the tile is the mechanism,
+// the sub-image is only a cache-coherence wrapper around it.
+//
+// WHY ANY 2x2 WINDOW WORKS AND NOT JUST AN ALIGNED ONE, which is what makes this cheap: the pattern
+// has period 2 in BOTH axes, so every 2x2 window — at any offset — covers exactly one full period
+// and therefore holds each of the four rotations exactly once. The resolve is shift-invariant. A
+// 3x3 tent ([1 2 1] x [1 2 1] / 16) is four such boxes averaged, so it is symmetric AND exact.
+//
+// ⚠⚠ WHICH IS WHY NO RESOLVE PASS IS ADDED: THE EXISTING BILATERAL ALREADY IS ONE. All the
+// direction variance now sits at exactly the NYQUIST frequency in both screen axes, and a separable
+// low-pass annihilates Nyquist to the extent its odd-index weights sum to its even-index weights.
+// At the shipped setting (aoblur's blurParams.x = 2.0 px, halved to 1.0 by the host at half res,
+// radius 3) the 1-D weights are 1, e^-0.5, e^-2, e^-4.5:
+//
+//     even = 1 + 2 e^-2   = 1.2706        odd = 2 e^-0.5 + 2 e^-4.5 = 1.2352
+//     1-D response at Nyquist = (1.2706 - 1.2352) / 2.5058 = 0.014 ;  2-D = 0.0002
+//
+// The blur removes 99.98% of this pattern — against blue noise, whose energy is spread across the
+// whole upper band where the same Gaussian is far weaker. Putting every last bit of the variance on
+// the ONE frequency a low-pass is guaranteed to kill is not a coincidence, it is the point. (It
+// does mean the blur is now load-bearing for the look, not just a polish: blurParams.x = 0 turns
+// this pattern from invisible into a checkerboard, which is the diagnostic, not a bug.)
+//
+// The STEP OFFSET takes the same complete set through a DIFFERENT permutation (q ^ 2), so the quad
+// is complementary in both lanes at once while the two stay uncorrelated inside it — the four
+// (rotation, offset) pairs land on a diagonal of the 4x4 lattice rather than on its main diagonal.
+//
+// TEMPORAL PHASE, when the host advances one: rigid QUARTER TURNS of the whole set, so the set of
+// directions a quad sweeps is IDENTICAL every frame and only which pixel holds which member rotates.
+// The resolved value is frame-invariant BY CONSTRUCTION — the crawl a per-pixel re-roll produces
+// cannot exist here — and any 4-frame temporal average is exact as well, for whenever something
+// finally integrates one. Frozen is still the default, because nothing integrates one today.
+float2 aoDitherQuad(int2 px, float phase)
+{
+    uint x = uint(px.x) & 1u;
+    uint y = uint(px.y) & 1u;
+    // Bayer 2x2, i.e. the bit-reversed interleave of (x, y):  0 2 / 3 1. Any period-2 assignment of
+    // the four members is complementary; this one is also the maximally spread pairing, so the two
+    // rotations closest in angle are never 4-neighbours.
+    uint q = (((x ^ y) & 1u) << 1) | y;
+    // q + phase stays inside [0, 4) for phase in [0, 1), so the product is already in [0, 1).
+    return float2((float(q) + phase) * 0.25f, float(q ^ 2u) * 0.25f);
+}
+
+// aoParams2.w packs both the choice and the phase, one lane, because it is one question — which
+// phase of what pattern:
+//
+//     sel <= -1.5     the complementary 2x2 quad, phase = -(sel + 2)  — host writes -2 - phase
+//     -1.5 < sel < 0  the legacy 4x4 tile                             — host writes -1
+//     sel >= 0        STBN, and sel IS the time-slice index
+//
+// A slice the host never advances is therefore spatial-only STBN, the useful middle rung: it fixes
+// the diagonal without introducing any per-frame change at all, for when the temporal axis is the
+// thing under suspicion. The quad's own frozen phase (sel == -2 exactly) is the same rung one rung
+// better, and it is what ships.
 float2 aoDither(int2 px)
 {
     float sel = gAOParams.aoParams2.w;
+    if (sel <= -1.5f)
+    {
+        return aoDitherQuad(px, -(sel + 2.0f));
+    }
     if (sel < 0.0f)
     {
         return aoDitherTile(px);

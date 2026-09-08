@@ -32,10 +32,14 @@ STRUCT(AOParams)
                                           //        y = the BLUR's plane-distance sigma, z = the BLUR's
                                           //        FAR range sigma (aoblur owns both — same float4,
                                           //        same lockstep rule as sliceParams.xy).
-                                          //        w = DITHER SOURCE, packed: < 0 selects the legacy
-                                          //        4x4 tile; >= 0 selects the STBN mask and IS the
-                                          //        time-slice index. One lane, because it is one
-                                          //        question — "which phase of what pattern".
+                                          //        w = DITHER SOURCE, packed: <= -1.5 selects the
+                                          //        complementary 2x2 quad and carries its phase as
+                                          //        -(w + 2); (-1.5, 0) selects the legacy 4x4 tile;
+                                          //        >= 0 selects the STBN mask and IS the time-slice
+                                          //        index. One lane, because it is one question —
+                                          //        "which phase of what pattern". See
+                                          //        aocommon.h.fsl's aoDitherQuad for why the quad
+                                          //        needs no resolve pass of its own.
 };
 
 // All three resources live in ONE PerBatch set (CBV + SRV + UAV), mirroring 09's
