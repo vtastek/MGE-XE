@@ -15116,12 +15116,13 @@ namespace {
     // knob are TWO DIFFERENT IMAGES, so a later A/B that treats it as a pure cost toggle is
     // comparing frames that do not render the same thing.
     //
-    // ⚠ AND IT NOW SELLS THE SAME CUE TWICE, FROM OPPOSITE SIDES, AS g_grassRootAO (0.45). That
-    // term is the hand-authored "sits on the ground" contact AO (G5d), applied to AMBIENT in
-    // grass.vert over grassRootAOHeight — it darkens the base of the BLADE. GTAO now darkens the
-    // GROUND beneath it. Not the same pixels and not a literal multiply, so this is not a bug; but
-    // the authored half was tuned in a frame where the real half did not exist, and is a candidate
-    // to come DOWN. A look call, not made.
+    // ⚠ IT DOES NOT DUPLICATE g_grassRootAO, AND THE ONE-DAY BELIEF THAT IT DID IS WORTH KEEPING
+    // AS A WARNING. The inference was: grass now casts real AO, so G5d's hand-authored "sits on the
+    // ground" contact term is the same cue twice. It is not, because GRASS IS AN OCCLUDER AND NOT A
+    // RECEIVER — grass.frag never samples gAO. GTAO darkens the GROUND under a clump, grassRootAO
+    // darkens the BASE OF THE BLADE, and the two never touch the same pixel. Acting on the wrong
+    // inference gated the authored term off and left the blades with no contact darkening at all.
+    // They are complementary; both are on. See publishGrassParams.
     // ⚠ THIS KNOB IS THE A/B ARM AND THAT IS WHY IT EXISTS. Grass was measured at 3.74 ms of a
     // 12.46 ms exterior frame by the crude route (`grassOn=0`, which also deletes the geometry and
     // the cull), and "how much of that was overdraw" is not answerable from that number. With this
@@ -48929,19 +48930,21 @@ void destroyHostWindow(Renderer* R);
         mp[kGrassParams4Float + 1] = std::max(0.0f, std::min(g_grassTintHue, 1.0f));
         mp[kGrassParams4Float + 2] = std::max(0.0f, std::min(g_grassShadowRecvMode, 2.0f));
         mp[kGrassParams4Float + 3] = std::max(0.0f, g_grassShadowDrop);
-        // ⚠ THE AUTHORED ROOT AO STANDS DOWN WHEN REAL AO IS ON. g_grassRootAO is G5d's hand-made
-        // "sits on the ground" contact cue, and until G1f it was the ONLY thing selling that cue:
-        // grass was not in the Z-prepass, so GTAO never saw it and the ground under a clump carried
-        // no occlusion at all. Now it does, from the real thing — and running both means the same
-        // contact darkening is paid for twice, from opposite sides (this one darkens the base of the
-        // BLADE, GTAO darkens the GROUND beneath it).
+        // ⚠ UNCONDITIONAL, AND THE ONE-DAY DETOUR THROUGH `g_aoEnable ? 0 : x` IS WORTH RECORDING
+        // BECAUSE THE REASONING WAS WRONG. G1f made grass a GTAO occluder, and the inference was
+        // that this hand-authored "sits on the ground" contact term (G5d) now duplicated the real
+        // one, so it was gated to fire only when GTAO was off.
         //
-        // So this is a FALLBACK now, not a companion: it lights up exactly when GTAO is off, which
-        // keeps the cue present in the aoEnable=0 arm instead of the sward going flat there. The
-        // knob and its height are untouched and still A/B on their own — with AO off, they behave
-        // exactly as they always did.
-        mp[kGrassParams5Float + 0] = g_aoEnable ? 0.0f
-                                                : std::max(0.0f, std::min(g_grassRootAO, 1.0f));
+        // IT DOES NOT DUPLICATE IT: THE TWO NEVER TOUCH THE SAME PIXEL. Grass is an AO OCCLUDER and
+        // not a RECEIVER — grass.frag does not sample gAO at all (the consumers are opaque /
+        // terrain / multimap / multimap_alpha / alpha .frag). So GTAO darkens the GROUND under a
+        // clump and this term darkens the BASE OF THE BLADE, and nothing is paid for twice. Gating
+        // it removed the only contact darkening the blades had and left the sward reading as if it
+        // were floating on top of a shadow.
+        //
+        // They are COMPLEMENTARY: together they close the contact from both sides, which is the
+        // whole cue. Restored to its pre-G1f behaviour, unconditional, knob and height untouched.
+        mp[kGrassParams5Float + 0] = std::max(0.0f, std::min(g_grassRootAO, 1.0f));
         mp[kGrassParams5Float + 1] = (g_grassRootAOHeight > 1.0f) ? (1.0f / g_grassRootAOHeight) : 1.0f;
         mp[kGrassParams5Float + 2] = g_grassPointLights ? 1.0f : 0.0f;
         mp[kGrassParams5Float + 3] = std::max(0.0f, std::min(g_grassShadowOpacity, 1.0f));
