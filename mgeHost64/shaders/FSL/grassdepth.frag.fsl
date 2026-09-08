@@ -1,0 +1,79 @@
+// mgeHost64 — G1 GRASS Z-PREPASS fragment stage (depth + coverage only).
+//
+// WHY THIS EXISTS. grass.frag's own header used to open with "grass has no Z-prepass entry to
+// inherit a mask from through CMP_EQUAL, so the mask is produced here", and that sentence was the
+// most expensive line in the exterior frame. Grass is a two-sided cutout drawn several layers deep
+// at every pixel, and with depth-WRITE on and a coverage export, the hardware cannot resolve a
+// fragment's depth until the shader has run — so EVERY overdrawn layer paid the full grass shade:
+// a shadow-map tap, the clustered point-light loop over two lists, fog, tonemap. Measured on the
+// dense Ascadian view, grass was 3.74 ms of a 12.46 ms frame.
+//
+// This pass moves the cutout decision AHEAD of the shading. It runs the SAME vertex stage
+// (grass.vert, unchanged — that is what makes SV_Position bit-identical) and the SAME coverage
+// computation as grass.frag, writes depth + the A2C sample mask, and writes no colour at all. The
+// colour pass then binds the GRASS_EARLY_Z variant of grass.frag against CMP_EQUAL with depth-write
+// OFF, which is the exact contract opaque.frag has had with depthonly.frag all along.
+//
+// ⚠ THE PAIRING IS THE WHOLE RISK, AND IT IS THE SAME RISK a2c.h.fsl ALREADY DOCUMENTS. The colour
+// pass's CMP_EQUAL rejects any sample this pass did not write, so the two must agree BIT FOR BIT
+// about depth. They do so structurally, not by inspection: one vertex shader, one texture, one
+// sampler, one alpha reference, one shared coverage function. Nothing here may be "equivalent but
+// cheaper" — a lower AF level or a SampleLevel would move the alpha and eat the blade.
+//
+// ⚠ WHAT THIS DOES *NOT* FIX: this pass is itself LATE-Z-WRITE, and no cutout prepass can be
+// anything else — coverage is not known until the texture is fetched, so the depth write has to
+// wait for the shader. The early depth TEST still runs (there is nothing to defer on the read
+// side), which is why this is recorded AFTER terrain and after the near opaque set: a blade behind
+// the hill is killed by the rasteriser before this shader is reached. What is left is one texture
+// fetch per overdrawn layer instead of one full shade per overdrawn layer, and that is the trade.
+
+#include "opaque.srt.h"
+#include "a2c.h.fsl"        // a2cCoverageMaskFaded() — the SHARED cutout coverage + the G1 fade
+
+// MUST stay byte-identical to grass.frag's VSOutput, which is byte-identical to grass.vert's
+// (== statics.vert's). Declared in full to guarantee a matched signature; this stage reads only
+// Uv / TexIndex / Color.a. Same discipline as depthonly.frag against opaque.frag.
+STRUCT(VSOutput)
+{
+    DATA(float4,           Position, SV_Position);
+    DATA(float2,           Uv,       TEXCOORD0);
+    DATA(CENTROID(float4), Color,    COLOR);       // rgb = ambient, a = distance fade
+    DATA(CENTROID(float),  Fog,      TEXCOORD1);
+    DATA(FLAT(uint),       TexIndex, TEXCOORD2);
+    DATA(FLAT(uint),       Flags,    TEXCOORD3);
+    DATA(float3,           WorldPos, TEXCOORD4);
+    DATA(float3,           WorldNormal, TEXCOORD5);
+    DATA(CENTROID(float3), SunLight, TEXCOORD6);
+};
+
+// SV_Coverage and NO SV_Target, with the pipeline at mRenderTargetCount = 0 — legal, and exactly
+// what depthonly.frag does. Coverage is not a render-target write: it selects which MSAA samples
+// this fragment's DEPTH lands in, which is how the cutout's antialiased edge gets recorded in the
+// depth buffer for the colour pass to inherit.
+STRUCT(PSOut)
+{
+    DATA(uint, Coverage, SV_Coverage);
+};
+
+ROOT_SIGNATURE(DefaultRootSignature)
+PSOut PS_MAIN( VSOutput In )
+{
+    INIT_MAIN;
+    // ===== BIT-IDENTICAL TO grass.frag's CUTOUT BLOCK. Do not "simplify" any of it. =============
+    uint bucket = In.TexIndex >> 16;
+    uint layer  = In.TexIndex & 0xFFFFu;
+    float3 uvw  = float3(In.Uv, (float)layer);
+
+    // The 2x-AF WRAP sampler, for the three reasons grass.frag gives — and here for a fourth that
+    // subsumes them: it must be the SAME sampler, or the two passes disagree about alpha at exactly
+    // the edge texels where the coverage ramp lives.
+    float4 tex = SampleTex2DArray(gStaticsArrays[bucket], gSampler2xWrapWrap, uvw);
+
+    // BEFORE ANY DISCARD: a2cCoverageMaskFaded takes a derivative and needs the whole 2x2 quad.
+    uint cov = a2cCoverageMaskFaded(tex.a, gShadowParams.grassParams2.z, In.Color.a);
+    if (cov == 0u) { discard; }
+
+    PSOut Out;
+    Out.Coverage = cov;
+    RETURN(Out);
+}

@@ -51,7 +51,13 @@ STRUCT(OccProbeParams)
     //     it.
     // y = the CONSERVATIVE arm's neighbourhood radius in texels (see the header note below). 0
     //     collapses it onto the raw arm exactly, which is the self-check.
-    // z/w spare.
+    // z = H1 ACCEPTANCE: the MIN-PYRAMID LEVEL the floor arm reads instead of gathering. 0 = the
+    //     gather (the H0 behaviour, and the default). >0 replaces the (2R+1)² neighbourhood with one
+    //     load of gProbeHeightMin at that level — the SAME quantity by a completely different
+    //     implementation, which is what makes the two agreeing a cross-check rather than a smoke
+    //     test. Level N covers a 2^N x 2^N block, so it should land BETWEEN the gather arms at
+    //     r = 2^(N-1) - 1 and r = 2^(N-1), and fall monotonically with N.
+    // w spare.
     DATA(float4, margin,  None);
 };
 
@@ -68,5 +74,11 @@ BEGIN_SRT(OccProbeSrtData)
         DECL_TEXTURE (PerBatch, Tex2D(float),            gProbeSunOcc)   // = gSunOcc     (sun-BLOCKED world Z)
         DECL_RWBUFFER(PerBatch, RWBuffer(uint),          gProbeCount)    // [0] tested, [1] rejected CEILING,
                                                                          // [2] rejected FLOOR
+        DECL_TEXTURE (PerBatch, Tex2D(float),            gProbeHeightMin) // = pSkyHeightMin (H1's min-
+                                                                         // pyramid; APPENDED LAST so the
+                                                                         // 6 existing slots stay stable —
+                                                                         // gCullHiz's precedent). Bound
+                                                                         // always, READ only when
+                                                                         // margin.z > 0.
     END_SRT_SET(PerBatch)
 END_SRT(OccProbeSrtData)

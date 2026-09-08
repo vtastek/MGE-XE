@@ -15,8 +15,18 @@ extern bool g_tracyActive;
 // [kickoff RPC issued -> completion drained] shows as a box aligned with the real client thread
 // lanes, on the client's own clock. Requires TRACY_FIBERS (defined in the Release-Tracy config).
 //
-// The lane is named "(inflight)" ON PURPOSE: the box is the whole client-side round trip —
-// IPC + host CPU (setup/cull/record/post) + host GPU + completion drain — NOT GPU execution.
+// The lane is named "(inflight)" ON PURPOSE: the box is the client-side round trip —
+// IPC + host CPU (setup/cull/record/post) + completion drain — NOT GPU execution.
+//
+// ⚠ SINCE TIER 1 THE HOST GPU IS NOT INSIDE THIS BOX AT ALL. The host no longer blocks on its own
+// frame fence before replying (renderprocess.cpp:1446), so the RPC completion drains while the GPU
+// is still drawing. The GPU wait was RELOCATED into copyHostRtToDst's timeline-semaphore wait and
+// shows up as the "RTcopy: fence wait" zone on the main thread. A capture therefore reads
+// `host frame` = 3.0 ms against a real 7-10 ms host GPU frame, and that is CORRECT, not a broken
+// zone — this comment used to list "host GPU" as a component of the box and that was stale.
+// To see the GPU window itself, use the "Forge host GPU inflight" step plot (1.0 at kickoff ->
+// 0.0 when the copy's fence clears) beside the "Forge host inflight" step, or the per-frame
+// "host GPU frame ms (N-1)" plot, both emitted from renderprocess.cpp.
 // It was called "Forge Host GPU", which invited reading its width as GPU time and concluding
 // "GPU bound": a ~9.5ms box against ~4.0ms of summed [forge-hb] gpu-split timestamps, i.e. the
 // GPU is under half of it and ~26% of a 15.3ms frame. There is no real GPU lane in this capture

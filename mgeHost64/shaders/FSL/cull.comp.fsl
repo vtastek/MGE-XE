@@ -14,6 +14,7 @@
 
 #include "cull.srt.h"
 #include "hizocclusion.h.fsl"
+#include "heightocclusion.h.fsl"
 #include "cellown.h.fsl"
 
 ROOT_SIGNATURE(ComputeRootSignature)
@@ -102,6 +103,18 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
     {
         uint occ;
         AtomicAdd(gCullCount[1], inst.numSubsets, occ);
+        RETURN();
+    }
+
+    // H2b: the WATER MIRROR's height-field occlusion test. DISARMED in every other lane by
+    // gHeightOccParams.arm.x = 0, so this is one uniform-branch early-out for the camera, the sun,
+    // the sky-height map and both grass lanes. Counted in gCullCount[1] beside the Hi-Z rejections
+    // for the same reason those are: it is the only way to see from the outside that the test is
+    // doing anything. cullscatter.comp calls the SAME header function.
+    if (heightOccluded(float3(dx, dy, cz), inst.effR))
+    {
+        uint hocc;
+        AtomicAdd(gCullCount[1], inst.numSubsets, hocc);
         RETURN();
     }
 

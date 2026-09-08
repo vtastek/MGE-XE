@@ -972,7 +972,7 @@ SamplerState gSampler2xWrapClamp : register( s17 , space100 ) ;
 #line 247 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/../../../3rdparty/The-Forge/Common_3/Graphics/FSL/defaults.h"
 
 #line 11 "FSL/shaders.list"
-#line 672 "FSL/shaders.list"
+#line 702 "FSL/shaders.list"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/occprobe.comp.fsl"
 #line 21 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/occprobe.comp.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/occprobe.srt.h"
@@ -1009,6 +1009,33 @@ STRUCT(StaticsSubset)
 #line 52
 };
 
+
+
+
+
+
+
+
+
+
+STRUCT(HeightOccParams)
+{
+
+
+
+
+    float4 arm;
+
+
+    float4 map;
+
+
+
+
+    float4 arm2;
+#line 78
+};
+
 STRUCT(CullParams)
 {
     float4 planes[6];
@@ -1043,7 +1070,7 @@ STRUCT(CullParams)
 
 
     float4 cellOwn;
-#line 88
+#line 114
 };
 #line 30 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/occprobe.srt.h"
 
@@ -1065,14 +1092,9 @@ STRUCT(OccProbeParams)
 
 
     float4 probe;
-
-
-
-
-
-
+#line 61 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/occprobe.srt.h"
     float4 margin;
-#line 56
+#line 62
 };
 
 
@@ -1085,6 +1107,12 @@ STRUCT(OccProbeParams)
         Tex2D(float) gProbeHeight :  register(t3,space2);
         Tex2D(float) gProbeSunOcc :  register(t4,space2);
         RWBuffer(uint) gProbeCount :  register(u5,space2);
+
+        Tex2D(float) gProbeHeightMin :  register(t6,space2);
+
+
+
+
 
 #line 22 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/occprobe.comp.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/cellown.h.fsl"
@@ -1141,6 +1169,18 @@ float heightMinAround(int2 sp, int r, int res)
         }
     }
     return m;
+}
+#line 83 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/occprobe.comp.fsl"
+float heightMinPyramid(int2 sp, int level, int res)
+{
+    int lres = res >> level;
+    if (lres < 1) { lres = 1; }
+    int2 q = int2(sp.x >> level, sp.y >> level);
+    if (q.x < 0 || q.y < 0 || q.x >= lres || q.y >= lres)
+    {
+        return -1.0e9f;
+    }
+    return LoadTex2D(gProbeHeightMin, NO_SAMPLER, q, level).r;
 }
 
 
@@ -1245,6 +1285,9 @@ void CS_MAIN( uint3 DispatchThreadID : SV_DISPATCHTHREADID )
 
 
     int minR = (int)max(gProbeParams.margin.y, 0.0f);
+
+
+    int pyrLevel = (int)max(gProbeParams.margin.z, 0.0f);
 
 
 
@@ -1354,7 +1397,8 @@ void CS_MAIN( uint3 DispatchThreadID : SV_DISPATCHTHREADID )
 
 
 
-        float hMin = heightMinAround(sp, minR, res);
+        float hMin = (pyrLevel > 0) ? heightMinPyramid(sp, pyrLevel, res)
+                                    : heightMinAround(sp, minR, res);
         if (hMin > rz)
         {
             uint origRejMin;
@@ -1365,4 +1409,4 @@ void CS_MAIN( uint3 DispatchThreadID : SV_DISPATCHTHREADID )
 
     return;
 }
-#line 673 "FSL/shaders.list"
+#line 703 "FSL/shaders.list"

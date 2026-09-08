@@ -37,5 +37,19 @@ BEGIN_SRT(CullSrtData)
         DECL_RWBUFFER(PerBatch, RWBuffer(uint),        gInstOut)       // survivor rows (20 uint/inst = 80B), asuint(float)
         DECL_TEXTURE (PerBatch, Tex2D(float),          gCullHiz)       // prev-frame Hi-Z pyramid (M2; appended
                                                                        // LAST so the 9 existing slots are stable)
+        // H2b: the WATER MIRROR's height-field occlusion test (heightocclusion.h.fsl). Both APPENDED
+        // LAST, for gCullHiz's reason — the 10 existing slots stay where every lane's DescriptorData
+        // fill already puts them.
+        //
+        // ⚠ A CBV OF ITS OWN RATHER THAN MORE CullParams. CullParams is exactly 512 B and FULL
+        // (cellOwn ends at float 127), so there is no room; and a second cbuffer is the honest shape
+        // anyway, because these fields describe the height FIELD (a world-space resource shared by
+        // every lane) rather than a view's frustum.
+        //
+        // ⚠ ALL SIX LANES BIND BOTH. Only the reflect lane ARMS the test, through a flag in the new
+        // cbuffer — exactly as hizParams.w gates Hi-Z today. A lane that bound neither would read
+        // whatever was last in those heap slots the moment someone armed it by accident.
+        DECL_CBUFFER (PerBatch, CBUFFER(HeightOccParams), gHeightOccParams)
+        DECL_TEXTURE (PerBatch, Tex2D(float),          gSkyHeightMin)  // H1's MIN-pyramid over pSkyHeight
     END_SRT_SET(PerBatch)
 END_SRT(CullSrtData)

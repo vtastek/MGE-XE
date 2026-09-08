@@ -12,6 +12,7 @@
 
 #include "cull.srt.h"
 #include "hizocclusion.h.fsl"
+#include "heightocclusion.h.fsl"
 #include "cellown.h.fsl"
 
 #define kMaxInst 65536u
@@ -88,6 +89,12 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
     // Occlusion M2: identical test to cull.comp (same inputs/code -> bit-for-bit agreement with
     // the counts the prefix-sum sized the runs from). Occluded -> no scatter.
     if (hizOccluded(float3(dx, dy, cz) + gCullParams.hizEyeDelta.xyz, inst.effR))
+        RETURN();
+
+    // H2b: identical test to cull.comp, through the SAME shared header — same inputs, same code, so
+    // bit-for-bit agreement with the counts the prefix-sum sized the runs from. Occluded -> no
+    // scatter. Disarmed (arm.x = 0) in every lane but the mirror.
+    if (heightOccluded(float3(dx, dy, cz), inst.effR))
         RETURN();
 
     // Camera-relative world rows (translation shifted by -eye; the only per-frame change).

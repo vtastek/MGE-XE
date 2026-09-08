@@ -51,6 +51,32 @@ STRUCT(StaticsSubset)
     DATA(uint, flags,      None);
 };
 
+// H2b: the HEIGHT-FIELD OCCLUSION params (heightocclusion.h.fsl). Its own cbuffer rather than more
+// CullParams, for two reasons. CullParams is exactly 512 B and FULL — cellOwn ends at float 127 —
+// so there is literally no room. And these fields describe the height FIELD, a world-space resource
+// every lane shares, not a view's frustum; putting them in the per-view struct would have made six
+// lanes each carry their own copy of one global mapping, which is the shape that lets two of them
+// disagree about where the map's origin is.
+//
+// Lives HERE rather than in cull.srt.h for this header's own reason: the host C++ TU includes it
+// through cull.srt.h, and it fills this cbuffer.
+STRUCT(HeightOccParams)
+{
+    // x = ARMED (0 = this lane does not run the test — the default for all six, and the ONLY thing
+    //     that turns it on for the mirror). y = the ABSOLUTE world Z of the water plane the
+    //     reflection mirrors about. z = march step count. w = height BIAS in world units, added to
+    //     the ray before the compare so a coarse texel does not clip its own occludee.
+    DATA(float4, arm,   None);
+    // xy = ABSOLUTE world XY of the height map's (0,0) texel CORNER, z = world units per texel at
+    //      LEVEL 0, w = level-0 resolution in texels (square).
+    DATA(float4, map,   None);
+    // x = the PYRAMID LEVEL the taps read (0 = the raw max field, which is NOT conservative — the
+    //     host never publishes it below 1 while armed). y = the march's END MARGIN in world units,
+    //     on top of effR + one texel: the instance is itself in the field, so without it every
+    //     object reports itself occluded by its own roof. z/w spare.
+    DATA(float4, arm2,  None);
+};
+
 STRUCT(CullParams)
 {
     DATA(float4, planes[6], None);  // 96B  Gribb-Hartmann planes (a,b,c,d); inside == a·x+b·y+c·z+d >= 0

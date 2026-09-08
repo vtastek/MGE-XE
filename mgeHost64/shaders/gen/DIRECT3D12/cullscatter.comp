@@ -972,7 +972,7 @@ SamplerState gSampler2xWrapClamp : register( s17 , space100 ) ;
 #line 247 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/../../../3rdparty/The-Forge/Common_3/Graphics/FSL/defaults.h"
 
 #line 11 "FSL/shaders.list"
-#line 662 "FSL/shaders.list"
+#line 692 "FSL/shaders.list"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/cullscatter.comp.fsl"
 #line 13 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/cullscatter.comp.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/cull.srt.h"
@@ -1009,6 +1009,33 @@ STRUCT(StaticsSubset)
 #line 52
 };
 
+
+
+
+
+
+
+
+
+
+STRUCT(HeightOccParams)
+{
+
+
+
+
+    float4 arm;
+
+
+    float4 map;
+
+
+
+
+    float4 arm2;
+#line 78
+};
+
 STRUCT(CullParams)
 {
     float4 planes[6];
@@ -1043,7 +1070,7 @@ STRUCT(CullParams)
 
 
     float4 cellOwn;
-#line 88
+#line 114
 };
 #line 26 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/cull.srt.h"
 
@@ -1057,7 +1084,9 @@ STRUCT(CullParams)
         RWBuffer(uint) gArgs :  register(u7,space2);
         RWBuffer(uint) gInstOut :  register(u8,space2);
         Tex2D(float) gCullHiz :  register(t9,space2);
-
+#line 52 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/cull.srt.h"
+        CBUFFER(HeightOccParams) gHeightOccParams :  register(b10,space2);
+        Tex2D(float) gSkyHeightMin :  register(t11,space2);
 #line 14 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/cullscatter.comp.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/hizocclusion.h.fsl"
 #line 20 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/hizocclusion.h.fsl"
@@ -1118,6 +1147,118 @@ bool hizOccluded(float3 cHiz, float effR)
     return rzNear < dFar;
 }
 #line 15 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/cullscatter.comp.fsl"
+#line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/heightocclusion.h.fsl"
+#line 44 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/heightocclusion.h.fsl"
+bool heightOccluded(float3 c_rel, float effR)
+{
+    float4 hp = gHeightOccParams.arm;
+    if (hp.x < 0.5f)
+        return false;
+
+    float4 mp = gHeightOccParams.map;
+    float texel = max(mp.z, 1.0f);
+    float res = max(mp.w, 1.0f);
+    int level = (int)gHeightOccParams.arm2.x;
+    float margin = gHeightOccParams.arm2.y;
+
+
+
+
+
+
+    float texelL = texel * exp2((float)level);
+
+
+
+    float3 eyeAbs = float3(gCullParams.eye.x, gCullParams.eye.y, gCullParams.eye.z);
+    float waterZ = hp.y;
+
+
+
+    float3 eyeM = float3(eyeAbs.x, eyeAbs.y, 2.0f * waterZ - eyeAbs.z);
+    if (eyeM.z >= waterZ)
+        return false;
+#line 91 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/heightocclusion.h.fsl"
+    float3 tgt = float3(eyeAbs.x + c_rel.x, eyeAbs.y + c_rel.y, eyeAbs.z + c_rel.z + effR);
+
+    float denom = tgt.z - eyeM.z;
+    if (denom <= 1.0e-3f)
+        return false;
+    float t0 = (waterZ - eyeM.z) / denom;
+    if (t0 >= 1.0f)
+        return false;
+    t0 = max(t0, 0.0f);
+    float3 S = eyeM + (tgt - eyeM) * t0;
+
+    float2 dxy = tgt.xy - S.xy;
+    float L = length(dxy);
+
+
+
+
+
+    float end = 2.0f * effR + texelL + margin;
+    if (L <= end)
+        return false;
+
+    float tEnd = (L - end) / L;
+
+
+
+
+
+    int steps = (int)max(hp.z, 1.0f);
+    float bias = hp.w;
+    float maxLevel = max(mp.w > 1.0f ? floor(log2(mp.w)) : 1.0f, 1.0f);
+#line 158 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/heightocclusion.h.fsl"
+    LOOP
+    for (int k = 1; k <= steps; ++k)
+    {
+        float t = tEnd * ((float)k / (float)steps);
+        float3 p = S + (tgt - S) * t;
+
+
+
+        float u = t0 + (1.0f - t0) * t;
+        float coneR = effR * u;
+
+
+
+        float lvlF = ceil(log2(max(2.0f * coneR / texel, 1.0f)));
+        float lvl = clamp(max(lvlF, (float)level), 1.0f, maxLevel);
+        float tw = texel * exp2(lvl);
+        float lres = max(res / exp2(lvl), 1.0f);
+        float inv = 1.0f / tw;
+
+        int2 q0 = int2(floor((p.xy - coneR - mp.xy) * inv));
+        int2 q1 = int2(floor((p.xy + coneR - mp.xy) * inv));
+
+
+
+        if (q0.x < 0 || q0.y < 0 || q1.x < 0 || q1.y < 0)
+            continue;
+        if ((float)q1.x >= lres || (float)q1.y >= lres || (float)q0.x >= lres || (float)q0.y >= lres)
+            continue;
+
+
+
+
+        int ilvl = (int)lvl;
+        float h = LoadTex2D(gSkyHeightMin, NO_SAMPLER, int2(q0.x, q0.y), ilvl).r;
+        h = min(h, LoadTex2D(gSkyHeightMin, NO_SAMPLER, int2(q1.x, q0.y), ilvl).r);
+        h = min(h, LoadTex2D(gSkyHeightMin, NO_SAMPLER, int2(q0.x, q1.y), ilvl).r);
+        h = min(h, LoadTex2D(gSkyHeightMin, NO_SAMPLER, int2(q1.x, q1.y), ilvl).r);
+
+
+
+
+
+        if (h > p.z + bias)
+            return true;
+    }
+    return false;
+}
+#line 16 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/cullscatter.comp.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/cellown.h.fsl"
 #line 46 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/cellown.h.fsl"
 float nearPathSlab(float originX, float originY)
@@ -1151,8 +1292,8 @@ bool nearPathCovers(float slab, float dist2, float effR)
     float inner = slab - effR;
     return dist2 < inner * inner;
 }
-#line 16 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/cullscatter.comp.fsl"
-#line 30 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/cullscatter.comp.fsl"
+#line 17 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/cullscatter.comp.fsl"
+#line 31 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/cullscatter.comp.fsl"
 [RootSignature( "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "3" ", offset = 0)," "CBV(b0, numDescriptors = unbounded, space = " "3" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "3" ", offset = 0))," "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "2" ", offset = 0)," "CBV(b0, numDescriptors = unbounded, space = " "2" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "2" ", offset = 0))," "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "1" ", offset = 0)," "CBV(b0, numDescriptors = unbounded, space = " "1" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "1" ", offset = 0))," "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "0" ", offset = 0)," "CBV(b0, numDescriptors = unbounded, space = " "0" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "0" ", offset = 0))," "DescriptorTable(" "SAMPLER(s0, numDescriptors = unbounded, space = " "0" ", offset = 0))," "StaticSampler(s0, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s1, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s2, space = 100," "filter = FILTER_MIN_MAG_LINEAR_MIP_POINT," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s3, space = 100," "filter = FILTER_MIN_MAG_LINEAR_MIP_POINT," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s4, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s5, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s6, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT," "addressU = TEXTURE_ADDRESS_MIRROR, addressV = TEXTURE_ADDRESS_MIRROR, addressW = TEXTURE_ADDRESS_MIRROR)," "StaticSampler(s7, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT, borderColor = STATIC_BORDER_COLOR_TRANSPARENT_BLACK," "addressU = TEXTURE_ADDRESS_BORDER, addressV = TEXTURE_ADDRESS_BORDER, addressW = TEXTURE_ADDRESS_BORDER)," "StaticSampler(s8, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR," "addressU = TEXTURE_ADDRESS_MIRROR, addressV = TEXTURE_ADDRESS_MIRROR, addressW = TEXTURE_ADDRESS_MIRROR)," "StaticSampler(s9, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR, borderColor = STATIC_BORDER_COLOR_TRANSPARENT_BLACK," "addressU = TEXTURE_ADDRESS_BORDER, addressV = TEXTURE_ADDRESS_BORDER, addressW = TEXTURE_ADDRESS_BORDER)," "StaticSampler(s10, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 8," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s11, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 8," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s12, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 8," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s13, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 8," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s14, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 2," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s15, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 2," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s16, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 2," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s17, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 2," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_WRAP)" )]
 NUM_THREADS(64, 1, 1)
 void CS_MAIN( uint3 DispatchThreadID : SV_DISPATCHTHREADID )
@@ -1217,6 +1358,12 @@ void CS_MAIN( uint3 DispatchThreadID : SV_DISPATCHTHREADID )
         return;
 
 
+
+
+    if (heightOccluded(float3(dx, dy, cz), inst.effR))
+        return;
+
+
     float4 r0 = inst.wr0;
     float4 r1 = inst.wr1;
     float4 r2 = inst.wr2;
@@ -1256,4 +1403,4 @@ void CS_MAIN( uint3 DispatchThreadID : SV_DISPATCHTHREADID )
     }
     return;
 }
-#line 663 "FSL/shaders.list"
+#line 693 "FSL/shaders.list"

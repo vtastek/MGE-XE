@@ -41,6 +41,30 @@ LOG="$DIR/mgeHost64.log"
 CFG="$DIR/Data Files/MWSE/config/instant load.json"
 CFGBAK="$(mktemp)"
 
+# WHICH METRIC. Default 'gpusplit' is this script's original behaviour, unchanged: poll the host log
+# for 'gpu split:' heartbeats and report the host-side sections. 'fpsprobe' polls MWSE.log for the
+# [fpsprobe] mod's lines instead, and skips every host-only section.
+#
+# It exists because the mgeg7 comparison install (Greatness7's DX9 fork) has no 'gpu split:' line and
+# no equivalent of one - and its own numbers have no counterpart here either. The only quantity both
+# builds can be asked for with the SAME instrument is the client frame time, which the fpsprobe MWSE
+# mod reports from enterFrame.delta in whichever install it is deployed to. One script, one metric,
+# both installs; the alternative is two rulers and a table nobody can defend.
+#
+# NOTE the fork ships its OWN mgeHost64.exe writing its OWN mgeHost64.log. Same names as ours. The
+# kill/archive paths below therefore work unchanged for it, but never run both installs at once.
+METRIC="${MGE_METRIC:-gpusplit}"
+case "$METRIC" in
+  gpusplit) MLOG="$LOG"          ; MPAT="gpu split:" ; MLABEL="gpuSplits" ;;
+  # `n=` anchors the pattern to a REPORTED WINDOW. The mod also prints two banner lines per load
+  # ("loaded - settling", "sampling STARTED"), and matching bare [fpsprobe] counted those as samples:
+  # a run asked for 3 got one 600-frame window and stopped, with nothing in the output saying it had
+  # measured a third of what was requested.
+  fpsprobe) MLOG="$DIR/MWSE.log" ; MPAT="\[fpsprobe\] n=" ; MLABEL="fpsWindows" ;;
+  *) echo "[harness] ERROR: unknown MGE_METRIC=$METRIC (want gpusplit or fpsprobe)" >&2; exit 1 ;;
+esac
+echo "[harness] metric = $METRIC (polling $(basename "$MLOG") for '$MPAT')"
+
 if [ -n "$SAVE" ]; then
   if [ ! -f "$DIR/Saves/$SAVE" ]; then
     echo "[harness] ERROR: save not found: Saves/$SAVE" >&2
@@ -80,15 +104,21 @@ done
 ARCHIVE="$DIR/logarchive"
 mkdir -p "$ARCHIVE"
 stamp=$(date +%Y%m%d-%H%M%S)
-for f in "$LOG" "$DIR/mgeXE.log"; do
+for f in "$LOG" "$DIR/mgeXE.log" "$DIR/MWSE.log"; do
   [ -s "$f" ] && cp "$f" "$ARCHIVE/$(basename "$f" .log)-$stamp.log" 2>/dev/null
 done
 # Keep the 20 most recent of each; these run to tens of MB.
 ls -1t "$ARCHIVE"/mgeHost64-*.log 2>/dev/null | tail -n +21 | xargs -r rm -f
 ls -1t "$ARCHIVE"/mgeXE-*.log     2>/dev/null | tail -n +21 | xargs -r rm -f
+ls -1t "$ARCHIVE"/MWSE-*.log      2>/dev/null | tail -n +21 | xargs -r rm -f
 
 startlines=0
 [ -f "$LOG" ] && startlines=$(wc -l < "$LOG")
+# The METRIC log's own offset. In gpusplit mode this is the same file and the same number, so the
+# poll loop below behaves identically; in fpsprobe mode it is MWSE.log, which MWSE truncates at
+# startup exactly as the host truncates its own, so the same rotation reset covers both.
+mstartlines=0
+[ -f "$MLOG" ] && mstartlines=$(wc -l < "$MLOG")
 # Same offset trick on the CLIENT log. The host's numbers alone cannot answer "is the host the
 # bottleneck" — only the client's render=[host=] / overlap= pair says how much of the host frame the
 # client actually waited for. mgecore does NOT truncate mgeXE.log, so this offset is what separates
@@ -96,7 +126,7 @@ startlines=0
 CLOG="$DIR/mgeXE.log"
 cstartlines=0
 [ -f "$CLOG" ] && cstartlines=$(wc -l < "$CLOG")
-echo "[harness] start offset = $startlines lines; want $SAMPLES new 'gpu split' samples (timeout ${TIMEOUT}s)"
+echo "[harness] start offset = $mstartlines lines; want $SAMPLES new '$MPAT' samples (timeout ${TIMEOUT}s)"
 
 # Launch minimized (no focus steal). The save auto-loads.
 # The render-scale override has to be set INSIDE the same powershell that calls Start-Process:
@@ -138,7 +168,9 @@ while :; do
   # not every poll: each call spawns a powershell, and the setting is sticky for the process
   # lifetime. Skipping this cost ~2.2x on every number in the run — see forge-perf-unthrottle.ps1.
   if [ "$unthrottled" = "0" ]; then
-    hostalive=$(powershell.exe -Command "@(Get-Process mgeHost64 -ErrorAction SilentlyContinue).Count" 2>/dev/null | tr -d '\r\n ')
+    unthrottle_on=mgeHost64
+    [ "$METRIC" = "fpsprobe" ] && unthrottle_on=Morrowind
+    hostalive=$(powershell.exe -Command "@(Get-Process $unthrottle_on -ErrorAction SilentlyContinue).Count" 2>/dev/null | tr -d '\r\n ')
     if [ "${hostalive:-0}" -gt 0 ]; then
       powershell.exe -ExecutionPolicy Bypass -File 'C:\projects\mgexe\MGE-XE\mgeHost64\forge-perf-unthrottle.ps1' 2>&1 | sed 's/^/[harness] /'
       unthrottled=1
@@ -148,19 +180,41 @@ while :; do
   cur=0; [ -f "$LOG" ] && cur=$(wc -l < "$LOG")
   # The host TRUNCATES mgeHost64.log on launch → cur < startlines means the log rotated; measure from 0.
   if [ "$cur" -lt "$startlines" ]; then startlines=0; fi
-  if [ "$cur" -gt "$startlines" ]; then
-    got=$(tail -n +$((startlines + 1)) "$LOG" | grep -c "gpu split:")
+  mcur=0; [ -f "$MLOG" ] && mcur=$(wc -l < "$MLOG")
+  if [ "$mcur" -lt "$mstartlines" ]; then mstartlines=0; fi
+  if [ "$mcur" -gt "$mstartlines" ]; then
+    got=$(tail -n +$((mstartlines + 1)) "$MLOG" | grep -c "$MPAT")
   fi
   # crash guard: Morrowind gone with no samples
   # @(...).Count, not "-ne $null": with two Morrowind handles alive the latter formats BOTH process
   # objects into the output and the comparison silently becomes garbage.
   nproc=$(powershell.exe -Command "@(Get-Process Morrowind -ErrorAction SilentlyContinue).Count" 2>/dev/null | tr -d '\r\n ')
   running=$([ "${nproc:-0}" -gt 0 ] && echo True || echo False)
-  echo "[harness] t=${el}s newlines=$((cur-startlines)) gpuSplits=$got running=$running"
+  echo "[harness] t=${el}s newlines=$((mcur-mstartlines)) ${MLABEL}=$got running=$running"
   if [ "$got" -ge "$SAMPLES" ]; then echo "[harness] got $got samples"; break; fi
   if [ "$running" = "False" ] && [ "$got" -eq 0 ]; then echo "[harness] Morrowind EXITED with 0 samples (crash?)"; break; fi
   if [ "$el" -ge "$TIMEOUT" ]; then echo "[harness] TIMEOUT after ${el}s ($got samples)"; break; fi
 done
+
+if [ "$METRIC" = "fpsprobe" ]; then
+
+echo "=== VERIFY (errors in new MWSE.log) ==="
+tail -n +$((mstartlines + 1)) "$MLOG" | grep -Ei "device removed|FAILED|fatal|crash|lua error" | tail -20 || echo "  (clean)"
+
+# min is the headline. See the fpsprobe mod's header: a median over a window measures how many
+# stalled frames the window caught, not what the renderer costs.
+echo "=== fpsprobe (min is the headline) ==="
+tail -n +$((mstartlines + 1)) "$MLOG" | grep -E "\[fpsprobe\]" | tail -$((SAMPLES + 2))
+
+# Printed for OUR arms only, as supporting detail; the fork writes neither line. Absent output here
+# is expected in the G7 arm and is not a failed run.
+echo "=== host gpu floor (ours only; 'frame min' is the floor) ==="
+tail -n +$((startlines + 1)) "$LOG" 2>/dev/null | grep -E "gpu stall latch:" | tail -3 || echo "  (none)"
+echo "=== client (mgeXE.log; ours only) ==="
+tail -n +$((cstartlines + 1)) "$CLOG" 2>/dev/null \
+  | grep -E "\[seam\] backbuffer|\[hb\] [0-9]+ frames avg:" | tail -6 || echo "  (none)"
+
+else
 
 echo "=== VERIFY (device removed / FAILED / fatal in new log) ==="
 tail -n +$((startlines + 1)) "$LOG" | grep -Ei "device removed|FAILED|fatal|crash" | tail -20 || echo "  (clean)"
@@ -183,6 +237,8 @@ if [ "$(wc -l < "$CLOG" 2>/dev/null || echo 0)" -lt "$cstartlines" ]; then cstar
 tail -n +$((cstartlines + 1)) "$CLOG" 2>/dev/null \
   | grep -E "\[seam\] backbuffer|MGE_RENDER_SCALE|\[hb\] [0-9]+ frames avg:|\[hb\] host recv:|\[produce\] overlap:" \
   | tail -12 || echo "  (no client heartbeats)"
+
+fi
 
 echo "[harness] killing procs..."
 powershell.exe -Command "Stop-Process -Name Morrowind,mgeHost64 -Force -ErrorAction SilentlyContinue" >/dev/null 2>&1

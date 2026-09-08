@@ -64,6 +64,34 @@ float heightMinAround(int2 sp, int r, int res)
     return m;
 }
 
+// ── H1 ACCEPTANCE: THE SAME QUANTITY, READ OUT OF THE PYRAMID ────────────────────────────────
+//
+// The gather above computes min-over-a-neighbourhood by brute force, one instance at a time. H1's
+// pyramid holds min-over-a-block, precomputed by a reduce chain. They are the same reduction by two
+// completely independent implementations, so making the probe able to read EITHER turns H1's
+// acceptance from "does it look plausible" into a cross-check: level N must land between the gather
+// arms that bracket its footprint, and must fall monotonically with N.
+//
+// ⚠ THE FOOTPRINTS ARE ALIGNED, NOT CENTRED, and that is the one real difference. The gather is a
+// (2R+1)² window centred on the sample; a mip texel is a 2^N-aligned block the sample falls inside.
+// So the two are never bit-identical — they bracket each other, which is what the acceptance asks.
+// A demand for exact equality here would be a demand the pyramid be something it is not.
+//
+// Level 0 is the MAX field copied verbatim, so pyrLevel=0 would collapse this onto the CEILING arm
+// rather than onto the r=0 gather; the caller therefore uses 0 to mean "use the gather" and never
+// passes it here.
+float heightMinPyramid(int2 sp, int level, int res)
+{
+    int lres = res >> level;
+    if (lres < 1) { lres = 1; }
+    int2 q = int2(sp.x >> level, sp.y >> level);
+    if (q.x < 0 || q.y < 0 || q.x >= lres || q.y >= lres)
+    {
+        return -1.0e9f;   // off the window -> no claim, exactly as the gather does
+    }
+    return LoadTex2D(gProbeHeightMin, NO_SAMPLER, q, level).r;
+}
+
 // Same reduction over gSunOcc. Its blockZ is DERIVED from the same max field, so it inherits the
 // same over-shadowing and takes the same treatment. (A second function rather than a parameterised
 // one: FSL has no templates and the two textures are different bindings.)
@@ -166,6 +194,9 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
     // identical (min over a 1x1 IS the sample), which is the built-in self-check: at occProbeMinR=0
     // the two counters MUST agree exactly.
     int    minR     = (int)max(gProbeParams.margin.y, 0.0f);
+    // H1 acceptance arm: >0 reads the pyramid at that level instead of gathering. Default 0 = the
+    // H0 gather, so an un-armed session is bit-identical to the runs the r-sweep table came from.
+    int    pyrLevel = (int)max(gProbeParams.margin.z, 0.0f);
     // The TOP of the bound sphere. Testing the sightline to the highest point is what makes a
     // rejection conservative in the vertical: rays from the same origin to any lower point of the
     // sphere lie UNDER this one, so a field that blocks this ray blocks those too. (Horizontally it
@@ -275,7 +306,8 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
         // clips, while the min needs a step where the whole neighbourhood is above the ray, which
         // may be further along or not at all. Nesting it would have silently reported the floor as
         // "only where the ceiling fired FIRST", i.e. a different question.
-        float hMin = heightMinAround(sp, minR, res);
+        float hMin = (pyrLevel > 0) ? heightMinPyramid(sp, pyrLevel, res)
+                                    : heightMinAround(sp, minR, res);
         if (hMin > rz)
         {
             uint origRejMin;

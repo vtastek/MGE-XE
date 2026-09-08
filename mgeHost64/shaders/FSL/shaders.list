@@ -296,6 +296,21 @@
 #include "grass.frag.fsl"
 #end
 
+// ...and the Z-PREPASS PAIR. grassdepth.frag runs the SAME grass.vert and the SAME cutout test,
+// writes depth + the A2C sample mask and no colour; grass_eq.frag is this same grass.frag with the
+// coverage export and the discard compiled out, drawn CMP_EQUAL + depth-write OFF so the depth test
+// alone carries the mask. That pairing is what gives the densest overdraw in the frame early-Z: the
+// shadow tap and the point-light loop go from once per overdrawn layer to once per pixel.
+// Host picks the pair per frame (grassPrepassRan); `grassPrepass=0` restores the single draw above.
+#frag grass_eq.frag
+#define GRASS_EARLY_Z 1
+#include "grass.frag.fsl"
+#end
+
+#frag grassdepth.frag
+#include "grassdepth.frag.fsl"
+#end
+
 // Forge water takeover (WT1): host-generated geo-clipmap water. Position-only verts + per-instance
 // clipmap level; reuses opaque.srt.h / DefaultRootSignature (worlds+params ride gBatch, 4 water SRVs
 // appended to the PerFrame set). Depth-write reverse-Z GEQUAL, cull NONE, frag outputs alpha=1.
@@ -591,6 +606,21 @@
 
 #comp hizreduce.comp
 #include "hizreduce.comp.fsl"
+#end
+
+// H1 MIN-PYRAMID over the sky-height field (tasks/forge-heightfield-occlusion.md). Same two-variant
+// shape as the Hi-Z above, over a DIFFERENT quantity: pSkyHeight is a MAX raster of world height,
+// and an occluder field has to be the LOWEST surface in each footprint or it blocks rays that pass
+// down the street. Level 0 is the max field copied verbatim (min over 1x1 IS the sample); levels >=1
+// are the minima H0's floor arm gathered by brute force. Built inline at the tail of
+// rebuildSkyHeightMap, i.e. on snap crossings only — per-frame cost is zero.
+#comp skyheightminfirst.comp
+#define SKYMIN_FIRST 1
+#include "skyheightmin.comp.fsl"
+#end
+
+#comp skyheightmin.comp
+#include "skyheightmin.comp.fsl"
 #end
 
 // Planar-reflection mip pyramid (WT4d / PBR water, P2). Same two-variant shape as the Hi-Z above,

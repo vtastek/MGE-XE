@@ -1,0 +1,204 @@
+// mgeHost64 — H2b: HEIGHT-FIELD OCCLUSION for the WATER MIRROR, shared by cull.comp AND
+// cullscatter.comp. SHADER-ONLY header, exactly like hizocclusion.h.fsl: cull.srt.h stays the
+// C++-safe one; include this AFTER it (needs gCullParams, gSkyHeightMin, gHeightOccParams).
+//
+// ⚠ A SHARED HEADER IS WHAT MAKES THE AGREEMENT STRUCTURAL. cull.comp sizes the prefix-sum runs and
+// cullscatter.comp fills them, and they re-run the identical per-instance test to do it. If the two
+// disagree by even one instance the scatter writes into runs the sum did not size — which shows up
+// as a gpuCull MATCH failure, not as corruption, and only if someone is looking. Putting the test in
+// one place makes "they agree" a property of the code rather than a rule to remember, which is the
+// argument cellown.h.fsl and hizocclusion.h.fsl both already make.
+//
+// ── WHAT THIS TESTS ──────────────────────────────────────────────────────────────────────────
+//
+// The main view has a depth buffer of itself and therefore a Hi-Z (hizocclusion.h.fsl). The mirror
+// does not, and it draws ~86% instances that cannot be seen (H0's bracket, [85.9%, 87.0%], robust to
+// a 9x coarser field). What it has instead is a HEIGHT FIELD of the world — pSkyHeight, rebuilt on
+// snap crossings, statics rasterised in with no distance limit — and H1's MIN-pyramid over it.
+//
+// So: march the field along the ray from the mirrored eye to the instance's bound, and reject if the
+// field stands above the ray anywhere along it. This is occprobe.comp.fsl's mirror half, promoted
+// from a measurement to a cull, with one substitution: the probe's brute-force (2R+1)² gather
+// becomes one load of the pyramid, which is the same quantity precomputed (verified: H1's acceptance
+// table).
+//
+// ⚠ THE MARCH STARTS AT THE WATER-PLANE CROSSING, NOT AT THE MIRRORED EYE. The mirror camera sits
+// BELOW the water plane whenever the real one is above it, so a march started there begins
+// underground and reports everything blocked. The physical path is camera -> water surface ->
+// object, and only the segment past the surface is in the air where an above-water occluder stands.
+//
+// ⚠ AND IT STOPS SHORT: `effR + texel + margin`. The instance is ITSELF in the field, so the last
+// texels of the march hold its own roof, and without stopping short every object reports itself
+// occluded by itself.
+//
+// ── WHY EVERY UNCERTAIN CASE RETURNS NOT-OCCLUDED ────────────────────────────────────────────
+//
+// A false negative draws something hidden: a few wasted pixels in a mip-chained, refracted
+// reflection. A false positive deletes a building from the water. Off the map window, no valid
+// pyramid, target under the surface, degenerate ray — all pass. That asymmetry is also why the tap
+// count is a cost knob and not a correctness one: under-sampling under-rejects.
+
+// True when the instance's bound sphere is hidden from the MIRRORED eye by the height field.
+// c_rel = the instance's bound centre RELATIVE to gCullParams.eye (which for this lane is the
+// mirror's own eye, published by dlReflectGeoCull); effR its radius.
+bool heightOccluded(float3 c_rel, float effR)
+{
+    float4 hp = gHeightOccParams.arm;     // x = armed, y = water plane Z (absolute), z = steps, w = bias
+    if (hp.x < 0.5f)
+        return false;                     // this lane does not run the test (every lane but the mirror)
+
+    float4 mp = gHeightOccParams.map;     // xy = map origin (absolute corner), z = u/texel, w = resolution
+    float texel = max(mp.z, 1.0f);
+    float res   = max(mp.w, 1.0f);
+    int   level = (int)gHeightOccParams.arm2.x;   // pyramid level the taps read
+    float margin = gHeightOccParams.arm2.y;
+    // The tap footprint in WORLD units at the level actually being read. Level N texels are
+    // 2^N times wider than level 0, and the end margin below is measured in that width — a margin
+    // that used the level-0 texel would let the last tap land in a block partly filled by the
+    // instance's own roof. (The min reduction mostly protects against that on its own: a block that
+    // is half roof and half open ground reduces to the ground and does not block. Mostly is not a
+    // guarantee, and widening the margin errs toward NOT occluding, which is the safe direction.)
+    float texelL = texel * exp2((float)level);
+
+    // Back to ABSOLUTE world, which is the space the height field is indexed in. c_rel is relative
+    // to the mirror's eye, so the eye itself is the only thing that has to be added back.
+    float3 eyeAbs = float3(gCullParams.eye.x, gCullParams.eye.y, gCullParams.eye.z);
+    float  waterZ = hp.y;
+
+    // The MIRRORED eye: the reflection's rays leave from here. Below the plane whenever the camera
+    // is above it, which is precisely why the march cannot start at it.
+    float3 eyeM = float3(eyeAbs.x, eyeAbs.y, 2.0f * waterZ - eyeAbs.z);
+    if (eyeM.z >= waterZ)
+        return false;                     // camera at or under the surface — not this ray
+
+    // The TOP of the bound sphere, and after trying the centre this is the right choice for TWO
+    // separate reasons — one geometric, one about which instances survive to be tested at all.
+    //
+    // GEOMETRY. The rays that hit the sphere sweep a cone about the CENTRE ray whose cross-section
+    // at fraction u is a disc of radius effR*u. Over any horizontal point of that disc, the HIGHEST
+    // such ray is the one over the axis, at centre-ray-z + effR*u — and that is exactly the TOP ray,
+    // since the top ray sits effR*u above the centre ray at every u. So "min-field over the disc >
+    // top-ray z" is precisely the hidden condition. Aiming at the top and ALSO adding effR*u would
+    // double-count and demand the field clear centre + 2*effR*u, twice what geometry asks.
+    //
+    // POPULATION, and this is what the centre-aimed experiment actually taught. `t0` — where the
+    // sightline leaves the water — is computed on this ray, and t0 >= 1 bails the instance. Aim at
+    // the CENTRE and every static whose bound centre sits at or below the water plane bails, which
+    // on a coast or a river is a large slice of the set: measured 53.5% rejected against the top
+    // ray's 69.6%, i.e. aiming lower LOST rejections by disqualifying the instances rather than by
+    // failing the test. The top is the part of the object that is above water and visible, so it is
+    // also the honest thing to ask the water-crossing question about.
+    float3 tgt = float3(eyeAbs.x + c_rel.x, eyeAbs.y + c_rel.y, eyeAbs.z + c_rel.z + effR);
+
+    float denom = tgt.z - eyeM.z;
+    if (denom <= 1.0e-3f)
+        return false;                     // target at/below the mirrored eye — no above-water segment
+    float t0 = (waterZ - eyeM.z) / denom;
+    if (t0 >= 1.0f)
+        return false;                     // wholly under water; the reflect clip plane owns it
+    t0 = max(t0, 0.0f);
+    float3 S = eyeM + (tgt - eyeM) * t0;  // where the sightline leaves the water
+
+    float2 dxy = tgt.xy - S.xy;
+    float  L   = length(dxy);
+    // ⚠ 2*effR, NOT effR — the cone test made this margin load-bearing in a new way. The last tap's
+    // footprint now reaches coneR (~effR at the far end) BEYOND the sample point toward the target,
+    // so a march stopping only effR short would put the object's OWN roof inside its own final tap
+    // and every large static would report itself occluded by itself. Clearing the object's radius
+    // twice — once for the tap's reach, once for the object — is what keeps that impossible.
+    float  end = 2.0f * effR + texelL + margin;
+    if (L <= end)
+        return false;                     // too close for the field to separate the object from its
+                                          // own footprint
+    float tEnd = (L - end) / L;
+
+    // UNIFORM spacing, unlike sunocc.comp's geometric march, and the difference is the ray's shape.
+    // The sun march is semi-infinite from the surface it shades, so its near taps decide almost
+    // everything. This segment is BOUNDED at both ends — water surface to object — and a blocking
+    // ridge is as likely at its middle as at either end, so there is no place to concentrate samples.
+    int   steps = (int)max(hp.z, 1.0f);
+    float bias  = hp.w;
+    float maxLevel = max(mp.w > 1.0f ? floor(log2(mp.w)) : 1.0f, 1.0f);   // log2(res) = top mip
+
+    // ══ THE OCCLUDEE IS A SPHERE, SO THE TEST IS A CONE — NOT A RAY ═════════════════════════════
+    //
+    // ⚠⚠ THIS IS THE FIX FOR REAL FALSE POSITIVES: geometry that IS visible in the mirror was being
+    // culled, which reads on screen as holes in the reflection showing the bright sky/fog behind.
+    //
+    // The march used to test ONE ray, to the TOP of the bound sphere, and H0's probe said in its own
+    // comment why that is only an upper bound: "rays to the sphere's left and right edges leave on
+    // DIFFERENT BEARINGS". Vertically the single ray is sound — every ray from this origin to a lower
+    // point of the sphere lies under it, so a field that blocks the top ray blocks those. Horizontally
+    // it is not: a ridge can block the centre bearing while the object is plainly visible around one
+    // side of it. For a MEASUREMENT that slack is harmless (it inflates a ceiling). Promoted into a
+    // CULL it deletes buildings from the water.
+    //
+    // The honest test is the CONE the sphere subtends from the mirrored eye. At a point a fraction u
+    // of the way along eyeM->target, the cone's cross-section radius is effR*u — zero at the eye,
+    // effR at the object. The sphere is hidden only if the field covers that whole disc, which is two
+    // requirements and this codebase already has the machinery for both:
+    //
+    //   VERTICAL   — already satisfied by aiming at the sphere's TOP: that ray is the highest of the
+    //                bundle over every point of the disc, so clearing it clears all of them. This is
+    //                why there is no `+ coneR` in the compare.
+    //   HORIZONTAL — THE ACTUAL FIX. The min must be taken over a footprint at least as wide as the
+    //                cone, not over one texel on the axis. That is exactly what a coarser PYRAMID
+    //                LEVEL is: level L's texel spans texel0 * 2^L and holds the min over all of it.
+    //                So pick L from the cone diameter and read four corner taps there.
+    //
+    // Four corner taps of the cone's bounding box at that level, min'd — hizocclusion.h.fsl's own
+    // argument, for the same reason: one tap at the centre does not cover a disc that straddles a
+    // texel boundary, four at the bbox corners do once the texel is at least the disc's diameter.
+    //
+    // ⚠ THE COST OF BEING RIGHT IS YIELD, and that trade is not optional. A big static (effR ~900 u,
+    // flora_tree_04) must now be hidden across a ~900 u wide footprint at the halfway point rather
+    // than along one 64 u line — so the large near objects, which are exactly the ones a false
+    // positive is most visible on, stop being rejected on a single unlucky bearing. Small distant
+    // instances are barely affected: their cone is a few units wide and they are most of the set.
+    LOOP
+    for (int k = 1; k <= steps; ++k)
+    {
+        float  t = tEnd * ((float)k / (float)steps);
+        float3 p = S + (tgt - S) * t;
+        // u = fraction along the FULL eyeM->target ray, which is what the cone radius scales with —
+        // t alone is the fraction along the ABOVE-WATER segment and would under-estimate the cone
+        // near the surface, i.e. err back toward over-rejecting.
+        float  u = t0 + (1.0f - t0) * t;
+        float  coneR = effR * u;
+
+        // The level whose texel spans the cone's DIAMETER, floored by the caller's level (which is
+        // itself never below 1 — level 0 is the raw max field and is not conservative).
+        float  lvlF = ceil(log2(max(2.0f * coneR / texel, 1.0f)));
+        float  lvl  = clamp(max(lvlF, (float)level), 1.0f, maxLevel);
+        float  tw   = texel * exp2(lvl);
+        float  lres = max(res / exp2(lvl), 1.0f);
+        float  inv  = 1.0f / tw;
+
+        int2 q0 = int2(floor((p.xy - coneR - mp.xy) * inv));
+        int2 q1 = int2(floor((p.xy + coneR - mp.xy) * inv));
+        // ⚠ ANY corner off the window disarms the whole step. Off the map we do not know what is
+        // there, and a min that quietly skipped the part it could not see would be asserting
+        // occlusion from missing data — the one direction this may never fail in.
+        if (q0.x < 0 || q0.y < 0 || q1.x < 0 || q1.y < 0)
+            continue;
+        if ((float)q1.x >= lres || (float)q1.y >= lres || (float)q0.x >= lres || (float)q0.y >= lres)
+            continue;
+
+        // The pyramid's MIN over each corner texel. An empty footprint carries the hugely negative
+        // SKY_HEIGHT_NONE sentinel, which LOSES this min with no branch — a gap in the footprint
+        // cannot claim to block anything, which is the whole reason the field is a min.
+        int ilvl = (int)lvl;
+        float h =        LoadTex2D(gSkyHeightMin, NO_SAMPLER, int2(q0.x, q0.y), ilvl).r;
+        h = min(h,       LoadTex2D(gSkyHeightMin, NO_SAMPLER, int2(q1.x, q0.y), ilvl).r);
+        h = min(h,       LoadTex2D(gSkyHeightMin, NO_SAMPLER, int2(q0.x, q1.y), ilvl).r);
+        h = min(h,       LoadTex2D(gSkyHeightMin, NO_SAMPLER, int2(q1.x, q1.y), ilvl).r);
+
+        // ⚠ NO `+ coneR` HERE. The horizontal widening above is the whole fix; the top ray already
+        // IS the top of the cone (see the target note), so adding the radius again would demand
+        // twice the clearance geometry asks for. Measured: the double-counted form rejected 69.6%
+        // against this one's larger figure, for no correctness gained.
+        if (h > p.z + bias)
+            return true;
+    }
+    return false;
+}

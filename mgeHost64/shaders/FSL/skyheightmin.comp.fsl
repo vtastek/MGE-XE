@@ -1,0 +1,68 @@
+// mgeHost64 — H1: build the MIN-PYRAMID over the sky-height field.
+//
+// See skyheightmin.srt.h for WHY a min and why its own texture. This file is the reduction, and it
+// is hizreduce.comp.fsl's skeleton with two differences:
+//   * the source of the FIRST pass is an ordinary single-sample SRV (pSkyHeight), so there is no
+//     _sc1/_sc4 split to carry — the height field is never MSAA;
+//   * the operator is min on WORLD HEIGHTS rather than on reverse-Z depth. Same direction, for a
+//     different reason: there the min is the FARTHEST depth, here it is the LOWEST surface, and
+//     both are the value a conservative occlusion test has to read.
+//
+// Two compiled variants of this one body (hizreduce's pattern):
+//   skyheightminfirst.comp — 1:1 copy pSkyHeight -> pyramid mip 0 (dispatch covers mip-0 dims).
+//   skyheightmin.comp      — 2x2 MIN-reduce mip i-1 -> mip i (dispatch covers the DST mip dims).
+//
+// ⚠ THE TAP CLAMP IS KEPT FROM hizreduce, AND IT IS NOT DECORATION HERE. An out-of-bounds typed-UAV
+// read returns 0.0, and 0.0 is Morrowind's SEA LEVEL — an ordinary, entirely plausible height. In a
+// MIN field an invented 0.0 sitting above a real trench floor RAISES the level, which makes the
+// field claim to block a ray that actually passes: the one direction a conservative field may never
+// fail in. The clamp means no such tap is ever taken.
+//
+// The odd-dimension arms below are dead at kSkyHeightRes = 2048 (every level down to 1 is even
+// until the last), and they stay anyway: they are what makes the reduce cover every real texel if
+// that constant ever stops being a power of two, and a dropped remainder row is precisely a
+// non-conservative pyramid.
+//
+// 8x8 groups, no dst bounds check — OOB UAV writes drop, same as hizreduce/linearizedepth.
+
+#include "skyheightmin.srt.h"
+
+#ifndef SKYMIN_FIRST
+#define SKYMIN_FIRST 0
+#endif
+
+ROOT_SIGNATURE(ComputeRootSignature)
+NUM_THREADS(8, 8, 1)
+void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
+{
+    INIT_MAIN;
+    int2 p = int2(DispatchThreadID.xy);
+#if SKYMIN_FIRST
+    // Level 0 is the MAX field verbatim — see the srt header. min over a 1x1 footprint IS the
+    // sample, so a copy is the correct level-0 semantics, not a shortcut.
+    float h = LoadTex2D(gSkyMinSrc, NO_SAMPLER, p, 0).r;
+#else
+    int2 sd = GetDimensions(gSkyMinSrcMip, NO_SAMPLER);
+    int2 mx = sd - int2(1, 1);
+    int2 s = p * 2;
+    float h =    LoadRWTex2D(gSkyMinSrcMip, min(s,              mx));
+    h = min(h,   LoadRWTex2D(gSkyMinSrcMip, min(s + int2(1, 0), mx)));
+    h = min(h,   LoadRWTex2D(gSkyMinSrcMip, min(s + int2(0, 1), mx)));
+    h = min(h,   LoadRWTex2D(gSkyMinSrcMip, min(s + int2(1, 1), mx)));
+    bool oddX = (sd.x & 1) != 0;
+    bool oddY = (sd.y & 1) != 0;
+    if (oddX) {
+        h = min(h, LoadRWTex2D(gSkyMinSrcMip, min(s + int2(2, 0), mx)));
+        h = min(h, LoadRWTex2D(gSkyMinSrcMip, min(s + int2(2, 1), mx)));
+    }
+    if (oddY) {
+        h = min(h, LoadRWTex2D(gSkyMinSrcMip, min(s + int2(0, 2), mx)));
+        h = min(h, LoadRWTex2D(gSkyMinSrcMip, min(s + int2(1, 2), mx)));
+    }
+    if (oddX && oddY) {
+        h = min(h, LoadRWTex2D(gSkyMinSrcMip, min(s + int2(2, 2), mx)));
+    }
+#endif
+    Write2D(gSkyMinDstMip, p, h);
+    RETURN();
+}

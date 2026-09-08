@@ -77,6 +77,12 @@
 // has no window/InputSystem, so input is bridged from the MW client over IPC and injected via the
 // vendored UI.cpp shim (uiSetExternalInput) — see [[project_forge_dev_overlay]].
 #include "Application/Interfaces/IUI.h"
+// The dev panel draws its own tab bar. The Forge widget enum has no tab type, but the ImGui it
+// vendors does (BeginTabBar/BeginTabItem), and imgui.cpp/_widgets/_tables/_draw are all compiled
+// into this exe beside UI.cpp — see the mgeHost64.vcxproj ClCompile list. WIDGET_TYPE_CUSTOM is
+// the sanctioned way in: processCustomWidget() invokes the callback from inside the component's
+// own ImGui draw, so raw ImGui calls there land in the right window. Path matches UI.cpp's own.
+#include "Application/ThirdParty/OpenSource/imgui/imgui.h"
 #include "Application/Interfaces/IFont.h"
 #include "Utilities/ThirdParty/OpenSource/bstrlib/bstrlib.h"   // Phase 0 panel: DynamicTextWidget live stats
 #if defined(ENABLE_GRAPHICS_VALIDATION)
@@ -318,6 +324,10 @@ static int forgeEcoQoSState()
 // per texel, i.e. the long-range sun shadow past the cascades' one-cell reach. Same window and the
 // same published origin as the height map above; rebuilt on sun motion or on that map's rebuild.
 #include "shaders/FSL/sunocc.srt.h"
+// H1: the MIN-PYRAMID over that same height map (SkyHeightMinSrtData, PerBatch) — the CONSERVATIVE
+// field an occlusion march has to read, since pSkyHeight is a max raster. Built inline at the tail
+// of rebuildSkyHeightMap, so it can never describe a different window than its source.
+#include "shaders/FSL/skyheightmin.srt.h"
 // Stage B (M1) GPU statics cull SRT (CullSrtData: gCullParams + gCullInst + gCullCount). Also shares
 // the merged ComputeRootSignature. Names its element CullInstance (not GpuCullInstance) to avoid
 // redefining the host C++ struct when STRUCT(T) expands to `struct T` in this TU.
@@ -2524,6 +2534,24 @@ namespace {
         bool           skyCullReady   = false;
         bool           skyArgsInDrawState = false;
 
+        // --- H1: the MIN-PYRAMID over the height field (tasks/forge-heightfield-occlusion.md) ----
+        // pSkyHeight is a MAX raster — right for sky AO and sunocc, wrong to march as an OCCLUDER,
+        // because a texel that is half building and half street stores the roof and would block a
+        // ray that goes down the street. This is the other reduction: per coarse texel, the LOWEST
+        // surface in its footprint. Its OWN texture rather than mips on pSkyHeight (whose consumers
+        // want the max, and which is a RenderTarget whose clear/raster/RMW path is defined over its
+        // shape); created through addResource with TEXTURE|RW_TEXTURE so Forge makes one UAV per mip
+        // plus one SRV over the chain — the pHiz arrangement, which is what the reduce needs.
+        // Rests SHADER_RESOURCE; only the rebuild brackets it to UAV and back.
+        Texture*       pSkyHeightMin = nullptr;       // kSkyHeightRes² R16_FLOAT, full mip chain
+        Shader*        pSkyHeightMinShaderFirst = nullptr;
+        Shader*        pSkyHeightMinShader = nullptr;
+        Pipeline*      pSkyHeightMinPipelineFirst = nullptr;
+        Pipeline*      pSkyHeightMinPipeline = nullptr;
+        DescriptorSet* pSkyHeightMinSet = nullptr;    // SkyHeightMinSrtData PerBatch, maxSets = mips
+        uint32_t       skyHeightMinMips = 0;          // 1 + log2(kSkyHeightRes) = 12
+        bool           skyHeightMinReady = false;
+
         // --- LONG-RANGE sun occlusion, derived from pSkyHeight (tasks/lighting.md) ---------------
         // The sun-BLOCKED world Z per texel, over the SAME window as the height map above. It exists
         // because the cascades reach one MW cell and answer "fully lit" outside it, so the whole
@@ -2630,6 +2658,46 @@ namespace {
         DescriptorSet* pSunCullSet       = nullptr; // CullSrtData PerBatch bound to the sun buffers
         bool           sunCullReady      = false;
         bool           sunArgsInDrawState = false;
+        // H2a: the WATER MIRROR's cull lane — pure resource duplication of the sun block above, and
+        // deliberately nothing more. The reflect draw was already cmdExecuteIndirect
+        // (dlReflectRecordGeo); only its ARGS FILLER was the CPU cell-walk, so this swaps the filler
+        // and leaves the picture bit-identical. That is what makes H2b — the height-field occlusion
+        // march, which needs a GPU place to run — a shader change rather than an architecture one.
+        //
+        // ⚠ THE COST IT MIGHT ADD IS NOT THE CULL, IT IS THE COMMAND WALL. The CPU ring is COMPACTED
+        // (drawCount = touched subsets only, ~hundreds); a GPU lane issues cullSubsetCount ~= 10,910
+        // indirect commands every pass, most of them zero-instance no-ops. This host already pays
+        // that seven times over and this makes it eight — and H2b does NOT reduce it, since the
+        // command count is fixed no matter how many instances survive. Hence `reflGpuCull`, default
+        // OFF, and hence H2a being measured on its own before H2b is built on top of it.
+        //
+        // SHARED, not duplicated: pCullInstBuf, pStaticsSubsetBuf, pCullCountZero, pSubsetCountZero,
+        // and all three pipelines.
+        Buffer*        pReflCullParamsCbv = nullptr;
+        Buffer*        pReflCullCount     = nullptr; // uint[4]: [0] = Σ numSubsets, READ BACK for the
+                                                     //   CPU-parity check (the gpuCull=... MATCH idiom)
+        Buffer*        pReflCullReadback  = nullptr; // GPU_TO_CPU, persistent-mapped (post-fence read)
+        Buffer*        pReflSubsetCount   = nullptr;
+        Buffer*        pReflSubsetOffset  = nullptr;
+        Buffer*        pReflSubsetCursor  = nullptr;
+        Buffer*        pReflArgs          = nullptr; // RW|INDIRECT: mirror survivor args
+        Buffer*        pReflInstOut       = nullptr; // RW|VERTEX: mirror survivor instance rows
+        DescriptorSet* pReflCullSet       = nullptr; // CullSrtData PerBatch bound to the above
+        bool           reflCullReady      = false;
+        bool           reflArgsInDrawState = false;
+        // H2b: the height-field occlusion test's params (HeightOccParams). TWO buffers, not one,
+        // because the ARM flag is the one field that differs per lane and everything else is a
+        // global mapping. `Off` is written once at create and never touched again — five lanes bind
+        // it and read arm.x = 0, so their `heightOccluded` is one uniform branch that returns
+        // immediately. `Refl` is refreshed each frame the mirror lane dispatches.
+        //
+        // Two static buffers rather than one buffer rewritten per lane: the six culls are dispatched
+        // back-to-back in ONE command list, so a cbuffer rewritten between them would be read by all
+        // of them with whatever value the CPU wrote last. That is the classic persistent-mapped
+        // hazard on this host and it is unrepresentable if the disarmed lanes point at a buffer that
+        // is never written.
+        Buffer*        pHeightOccCbvOff  = nullptr;   // arm.x = 0, written ONCE
+        Buffer*        pHeightOccCbvRefl = nullptr;   // the mirror's, refreshed per frame
         // --- H0: THE HEIGHT-FIELD OCCLUSION PROBE (occprobe.comp; tasks/forge-heightfield-occlusion.md)
         // A MEASUREMENT over the two views that have no occlusion culling of any kind — the SUN
         // caster and the WATER MIRROR — and nothing else. It draws nothing, gates nothing, and is
@@ -3664,6 +3732,21 @@ namespace {
            kGpuPhaseHizMip0,    // Hi-Z mip 0 build over the FULL ALLOCATION (post-colour, pre-seam)
            kGpuPhaseReLinear,   // the SECOND depth linearize (scene depth incl. terrain)
            kGpuPhaseApl,        // APL reduction (1 group, subsampled grid) + its readback copy
+           // ===== G1f: THE TWO HALVES OF GRASS, WHICH UNTIL NOW HAD NO BRACKET AT ALL ==========
+           // Grass was billed to `dl` — drawGrass is called inside the DL block — and that single
+           // fact produced a wrong conclusion that survived a whole session: `dl=4.48 ms for 0.23M
+           // triangles` read as "the distant-land submission is draw-call bound, execute-indirect is
+           // the fix", when DL + 7959 statics is 1.00 ms and the other 3.48 was grass. A pass nobody
+           // times is a pass whose cost lands on its neighbour's name.
+           //
+           // NESTED (GrassDepth inside Prepass, GrassColor inside ColorDL), so neither belongs in
+           // the top-level residual sum — counting one twice would drive the residual negative.
+           // TWO entries and not one, for the reason kGpuPhaseObjVelFP spells out: two begin/end
+           // pairs on ONE index overwrite rather than accumulate. They are also the two halves of
+           // the trade this milestone is making — the prepass BUYS the colour pass's early-Z, so
+           // "did it pay for itself" is exactly `grassdep + grass` against the old `grass` alone.
+           kGpuPhaseGrassDepth,
+           kGpuPhaseGrassColor,
            kGpuPhaseCount };
 
     // FP1a first-person pass caps: one 64KB world window bounds the rigid list at 1024,
@@ -5338,6 +5421,16 @@ namespace {
     constexpr uint32_t kSkyStaticsRowCap = 65536;
     bool               g_skyHeightBuiltStatics = false;  // did the LIVE map include the statics layer?
     float              g_skyHeightBuiltMinR = -1.0f;     // radius floor the LIVE map was built with
+    // H1: has the MIN-PYRAMID been built over the CURRENT height map? Its own flag rather than
+    // "skyHeightMinReady && g_skyHeightValid", because those two answer different questions — the
+    // first is "do the resources exist", the second "does the max field describe this window", and
+    // neither of them says the reduce actually ran. It is set only at the tail of
+    // rebuildSkyHeightMap, immediately after the dispatch that fills the chain, so a consumer
+    // testing it is testing the thing it needs. Never cleared on its own: the pyramid is rebuilt
+    // in lockstep with its source, which is exactly what makes it impossible for the two to
+    // describe different windows.
+    bool               g_skyHeightMinValid = false;
+    uint32_t           g_skyHeightMinBuilds = 0;
 
     // --- H0: THE HEIGHT-FIELD OCCLUSION PROBE (occprobe.comp.fsl) --------------------------------
     // Both maps above already answer, for free, a question nobody has asked them: "is this object
@@ -5376,6 +5469,13 @@ namespace {
     // ⚠ 0 collapses the two arms onto each other exactly, which is the self-check: at
     // occProbeMinR=0 the two counters MUST come back equal.
     float              g_occProbeMinR   = 1.0f;
+    // H1 ACCEPTANCE. >0 makes the floor arm read H1's MIN-PYRAMID at that LEVEL instead of gathering
+    // the neighbourhood, i.e. the same reduction by a completely independent implementation. That is
+    // what turns "the pyramid looks plausible" into a cross-check: level N covers a 2^N x 2^N block,
+    // so it must land BETWEEN the gather arms bracketing that footprint and fall monotonically with
+    // N. 0 = the gather (the H0 behaviour these numbers were measured with), and it is the default,
+    // so an un-armed session is bit-identical to the r-sweep runs.
+    float              g_occProbePyr    = 0.0f;
     uint32_t           g_occProbeTested[2]   = { 0u, 0u };   // [0] = SUN view, [1] = MIRROR view
     uint32_t           g_occProbeRejected[2] = { 0u, 0u };   // CEILING (the raw max field)
     uint32_t           g_occProbeRejMin[2]   = { 0u, 0u };   // FLOOR   (H1's min-pyramid, emulated)
@@ -7940,6 +8040,41 @@ namespace {
                 sop.pData = nullptr;
                 sop.ppBuffer = &g_live.pSunOccParamsCbv;
                 addResource(&sop, nullptr);
+
+                // H1 — the MIN-PYRAMID over the height map above (a conservative occluder field;
+                // see skyheightmin.srt.h). 2048² R16F with the FULL mip chain ~= 11 MB. A plain
+                // texture, not a render target: nothing rasters into it, two compute variants write
+                // it whole. TEXTURE|RW_TEXTURE is what makes Forge create one UAV per mip
+                // (DescriptorData::mUAVMipSlice selects the level) plus one SRV over the chain —
+                // exactly the pHiz arrangement the reduce needs.
+                //
+                // NO mClearValue: this texture is never bound as an attachment, so there is no clear
+                // to get wrong. Level 0 is always fully written by the first variant before anything
+                // reads the chain, and the consumers are gated on skyHeightMinReady + g_skyHeightValid.
+                //
+                // RESOURCES here, beside pSunOcc, for exactly the reason the atmosphere block below
+                // spells out; the pipelines and the per-mip descriptor set are built in the compute
+                // block with their siblings.
+                {
+                    uint32_t mips = 1;
+                    for (uint32_t d = kSkyHeightRes; d > 1u; d >>= 1) { ++mips; }
+                    TextureDesc smd = {};
+                    smd.mWidth = kSkyHeightRes; smd.mHeight = kSkyHeightRes; smd.mDepth = 1;
+                    smd.mArraySize = 1; smd.mMipLevels = mips;
+                    smd.mSampleCount = SAMPLE_COUNT_1; smd.mSampleQuality = 0;
+                    smd.mFormat = TinyImageFormat_R16_SFLOAT;   // the SAME format as its source —
+                                                                // no new format, no new hw requirement:
+                                                                // skyheight.comp already typed-UAV-LOADS
+                                                                // R16_SFLOAT out of pSkyHeight today
+                    smd.mStartState = RESOURCE_STATE_SHADER_RESOURCE;
+                    smd.mDescriptors = (DescriptorType)(DESCRIPTOR_TYPE_TEXTURE | DESCRIPTOR_TYPE_RW_TEXTURE);
+                    smd.pName = "skyHeightMin";
+                    TextureLoadDesc sml = {};
+                    sml.ppTexture = &g_live.pSkyHeightMin;
+                    sml.pDesc = &smd;
+                    addResource(&sml, nullptr);
+                    g_live.skyHeightMinMips = mips;
+                }
 
                 // --- S2: THE ATMOSPHERE's LUTs, CREATED HERE AND NOT WITH THEIR PIPELINES -------
                 // ⚠⚠ THE POSITION OF THIS BLOCK IS LOAD-BEARING AND IT COST A BLACK SKY.
@@ -13127,6 +13262,66 @@ namespace {
                     std::printf("[forge][sunocc] compute pipeline/set FAILED — no long-range sun shadow\n");
                 }
             }
+
+            // H1 — the MIN-PYRAMID's two pipelines + its per-mip descriptor set. Same shape as the
+            // Hi-Z prologue's (pHizSet): ONE set instance per mip, index 0 = the first pass
+            // (pSkyHeight SRV -> pyramid mip 0), index m = the reduce mip m-1 -> m, with
+            // mUAVMipSlice picking the backend's per-mip UAV. Updated ONCE, here — the bindings
+            // never change, so the rebuild is a bind + dispatch and nothing more.
+            //
+            // The source SRV rides EVERY set instance (the reduce variant never reads the slot — DXC
+            // strips it), which is what hizreduce does and for the same reason: one SRT, one merged
+            // root signature, no per-variant divergence to keep in step.
+            //
+            // Not fatal on failure: skyHeightMinReady stays false, the rebuild's tail skips the
+            // dispatch, and every consumer is gated on the flag — i.e. exactly the pre-H1 world.
+            if (g_live.pSkyHeight && g_live.pSkyHeightMin && g_live.skyHeightMinMips) {
+                ShaderLoadDesc smf = {};
+                smf.mComp.pFileName = "skyheightminfirst.comp";
+                addShader(R, &smf, &g_live.pSkyHeightMinShaderFirst);
+                ShaderLoadDesc smr = {};
+                smr.mComp.pFileName = "skyheightmin.comp";
+                addShader(R, &smr, &g_live.pSkyHeightMinShader);
+                if (g_live.pSkyHeightMinShaderFirst) {
+                    PipelineDesc pd = {};
+                    pd.mType = PIPELINE_TYPE_COMPUTE;
+                    pd.mComputeDesc.pShaderProgram = g_live.pSkyHeightMinShaderFirst;
+                    addPipeline(R, &pd, &g_live.pSkyHeightMinPipelineFirst);
+                }
+                if (g_live.pSkyHeightMinShader) {
+                    PipelineDesc pd = {};
+                    pd.mType = PIPELINE_TYPE_COMPUTE;
+                    pd.mComputeDesc.pShaderProgram = g_live.pSkyHeightMinShader;
+                    addPipeline(R, &pd, &g_live.pSkyHeightMinPipeline);
+                }
+                if (g_live.pSkyHeightMinPipelineFirst && g_live.pSkyHeightMinPipeline) {
+                    DescriptorSetDesc smset = SRT_SET_DESC(SkyHeightMinSrtData, PerBatch,
+                                                           g_live.skyHeightMinMips, 0);
+                    addDescriptorSet(R, &smset, &g_live.pSkyHeightMinSet);
+                }
+                if (g_live.pSkyHeightMinSet) {
+                    for (uint32_t m = 0; m < g_live.skyHeightMinMips; ++m) {
+                        // mCount = 1 on every single-texture bind, SRV and UAV alike — without it the
+                        // descriptor count is 0 and the slot binds NOTHING, which for a UAV means the
+                        // writes vanish silently (the failure pSunOcc's bind above carries a note about).
+                        DescriptorData d[3] = {};
+                        d[0].mIndex = SRT_RES_IDX(SkyHeightMinSrtData, PerBatch, gSkyMinSrc);
+                        d[0].mCount = 1; d[0].ppTextures = &g_live.pSkyHeight->pTexture;
+                        d[1].mIndex = SRT_RES_IDX(SkyHeightMinSrtData, PerBatch, gSkyMinSrcMip);
+                        d[1].mCount = 1; d[1].ppTextures = &g_live.pSkyHeightMin;
+                        d[1].mUAVMipSlice = (uint16_t)(m > 0 ? m - 1 : 0);
+                        d[2].mIndex = SRT_RES_IDX(SkyHeightMinSrtData, PerBatch, gSkyMinDstMip);
+                        d[2].mCount = 1; d[2].ppTextures = &g_live.pSkyHeightMin;
+                        d[2].mUAVMipSlice = (uint16_t)m;
+                        updateDescriptorSet(R, m, g_live.pSkyHeightMinSet, 3, d);
+                    }
+                    g_live.skyHeightMinReady = true;
+                }
+                std::printf("[forge][skymin] min-pyramid %s (%ux%u, %u mips, %.1f MB)\n",
+                            g_live.skyHeightMinReady ? "READY" : "DISABLED (create failed)",
+                            kSkyHeightRes, kSkyHeightRes, g_live.skyHeightMinMips,
+                            (double)kSkyHeightRes * kSkyHeightRes * 2.0 * (4.0 / 3.0) / (1024.0 * 1024.0));
+            }
             {
                 // mCount=1 is REQUIRED for single-texture binds (SRV and UAV) — without it the
                 // descriptor count is 0 and the slot binds NOTHING (UAV writes/SRV reads vanish).
@@ -14710,6 +14905,20 @@ namespace {
     // every interior still reported 0.65 ms there — the last exterior frame's number — which read
     // as "the fix did nothing" and nearly bought a working change a revert.
     bool      g_gpuPhaseIssued[kGpuPhaseCount] = {};
+    // ...and a pair of bracket helpers usable from OUTSIDE renderScene. The gpuPhaseBegin/End that
+    // everything else uses are lambdas local to renderScene, because they also accumulate the CPU
+    // RECORD split into two of its stack arrays — so a pass recorded in a helper function further
+    // down the file (dlLiveRecord's grass draw is the first one that needed this) had no way to
+    // bracket itself and simply went untimed, which is exactly how grass ended up billed to `dl`.
+    // These do the GPU half only: same query pool, same issued-flag, no CPU record term. Anything
+    // bracketed with these therefore reads 0.00 in `rec split`, and that is not a bug to chase.
+    void gpuPhaseBeginG(uint32_t i) {
+        g_gpuPhaseIssued[i] = true;
+        if (g_live.pGpuQueryPool) { QueryDesc q = {}; q.mIndex = i; cmdBeginQuery(g_live.pCmd, g_live.pGpuQueryPool, &q); }
+    }
+    void gpuPhaseEndG(uint32_t i) {
+        if (g_live.pGpuQueryPool) { QueryDesc q = {}; q.mIndex = i; cmdEndQuery(g_live.pCmd, g_live.pGpuQueryPool, &q); }
+    }
     // CPU-side per-phase RECORD ms (breaks down g_lastRecMs): the same gpuPhaseBegin/End
     // brackets also capture hostNowMs() deltas — CPU cost of RECORDING each phase's commands
     // (bind/draw/barrier calls), not of executing them. Nested phases nest here too.
@@ -14882,6 +15091,46 @@ namespace {
     // are the runtime levers for the lane that draws them. Every one is reachable from
     // MGE_HOST_KNOBS as well as the panel, because the perf harness runs minimized and cannot click.
     bool  g_drawGrass        = true;
+    // G1f: draw grass DEPTH FIRST, then shade it with CMP_EQUAL (see g_pGrassDepthPipeline). ON by
+    // default. The colour a pixel ends up with is the colour the nearest layer would have produced
+    // either way, so the grass draw itself is a strict reduction in shaded fragments...
+    //
+    // ⚠ ...BUT THIS IS NOT A PERF-ONLY KNOB, AND THAT WAS NOT PREDICTED. Putting grass in the
+    // Z-prepass puts it in the depth buffer BEFORE the passes that READ depth — the frame runs
+    // prepass -> shadow -> postdepth(linearize + GTAO + point-light shadow mask) -> reflect ->
+    // colour, and grass used to be written in that LAST step. So with this on, grass becomes an
+    // OCCLUDER in GTAO and in the screen-space shadow mask for the first time.
+    //
+    // ⚠ AN OCCLUDER, NOT A RECEIVER — the direction matters and is easy to get backwards.
+    // grass.frag does NOT sample gAO (the consumers are opaque/terrain/multimap/alpha .frag), so
+    // the blades themselves are not darkened by this. What is visible is the GROUND: terrain.frag
+    // reads gAO, so the earth under and around a clump now carries the occlusion the clump casts.
+    // That reads as grass "having SSAO", and it is the contact cue rather than shading on the
+    // blade. Confirmed in-game ("grass looks fine, it has ssao even now").
+    //
+    // Same side-effect terrain's own prepass twin documents a few thousand lines down — "wrong
+    // about everything that reads depth BEFORE it: GTAO, the point-light shadow mask and the
+    // screen-space contact-shadow march all ran on a depth buffer with no ground in it". Grass was
+    // the last surface outside that set. It is an improvement, but it means the two arms of this
+    // knob are TWO DIFFERENT IMAGES, so a later A/B that treats it as a pure cost toggle is
+    // comparing frames that do not render the same thing.
+    //
+    // ⚠ AND IT NOW SELLS THE SAME CUE TWICE, FROM OPPOSITE SIDES, AS g_grassRootAO (0.45). That
+    // term is the hand-authored "sits on the ground" contact AO (G5d), applied to AMBIENT in
+    // grass.vert over grassRootAOHeight — it darkens the base of the BLADE. GTAO now darkens the
+    // GROUND beneath it. Not the same pixels and not a literal multiply, so this is not a bug; but
+    // the authored half was tuned in a frame where the real half did not exist, and is a candidate
+    // to come DOWN. A look call, not made.
+    // ⚠ THIS KNOB IS THE A/B ARM AND THAT IS WHY IT EXISTS. Grass was measured at 3.74 ms of a
+    // 12.46 ms exterior frame by the crude route (`grassOn=0`, which also deletes the geometry and
+    // the cull), and "how much of that was overdraw" is not answerable from that number. With this
+    // at 0 the frame draws exactly the shader that shipped, so `grassPrepass=1` vs `=0` prices the
+    // overdraw alone, with the same blades, the same cull and the same vertex work on both sides.
+    bool  g_grassPrepass     = true;
+    // Set by grassRecordDepth when it ACTUALLY issued the prepass draw; read by drawGrass to pick
+    // the EQ pipeline. A latch rather than a second evaluation of the same predicate — see the note
+    // at grassRecordDepth. Cleared once per frame beside g_gpuPhaseIssued.
+    bool  g_grassPrepassRecorded = false;
     // DENSITY, and it is a PREFIX, not a per-instance test. g_grassInst is hash-shuffled once at
     // load, so any prefix of it is a spatially uniform random subset of the whole field — which
     // means density can be a dispatch COUNT instead of a branch in a shared shader. Three
@@ -15004,7 +15253,15 @@ namespace {
     // blade (the old behaviour, and the A/B).
     float g_grassShadowDrop  = 40.0f;
     float g_grassShadowOpacity = 0.5f;
-    bool  g_grassShadows     = true;
+    // ⚠ DEFAULT OFF as of 2026-09-08, on a look call from the user: "grass shadows look bad anyway,
+    // you can disable it." It is not only a look call — the caster lane is a SECOND grass cull
+    // (pGrassSunCullSet + its own params/args/instOut) plus caster draws into the sun cascade, and
+    // an interleaved A/B on the dense Ascadian view priced grassShadows+grassPointLights+grassCrush
+    // together at 0.91 ms of a 12.77 ms frame (12.77 -> 11.86, both rounds agreeing: -0.77, -1.06).
+    // Kept as a knob rather than deleted: the drop/opacity terms above encode a real derivation
+    // (sampling the GROUND's shadow rather than the blade's) that should not have to be rediscovered
+    // if the look call is ever revisited. `MGE_HOST_KNOBS=grassShadows=1` restores it.
+    bool  g_grassShadows     = false;
     float g_grassShadowRange = 1024.0f;   // world units; grass shadows are a near-field effect
     // Live A/B for the whole G1a claim: ON restores the near cut + cell ownership the statics lane
     // uses, which is exactly the hole-around-the-player trap. Kept as a switch because "the fix is
@@ -15466,6 +15723,140 @@ namespace {
                                     // + below-water clip) was written this frame. Split out of
                                     // g_reflGeoReady because an INTERIOR has no DL to cull but still needs
                                     // that matrix to reflect its near scene.
+    // H2a: drive the mirror's statics draw from the GPU cull lane instead of the CPU ring.
+    // ⚠ DEFAULT OFF, and it stays off until the parity check below passes AND the command wall has
+    // been measured. The lane is behaviour-identical by construction, but the GPU path issues
+    // cullSubsetCount (~10,910) indirect commands where the compacted CPU ring issues a few hundred,
+    // and this host's own note calls that "THE INDIRECT-COMMAND WALL … already paid seven times
+    // over". Whether an eighth is free is a measurement, not a deduction.
+    bool     g_reflGpuCull = false;
+    // ...and the VERIFY arm, which is a different thing and needs its own switch. With `reflGpuCull`
+    // ON the CPU cell-walk is skipped, so there is NO CPU number left to compare the lane against —
+    // the parity claim would be checking the lane against itself. `reflCullVerify` runs the GPU lane
+    // while the CPU cull still drives the draw, which is the one configuration where MATCH means
+    // anything. Turning the lane on is then a decision made with the evidence already in hand,
+    // rather than a hope confirmed afterwards.
+    bool     g_reflCullVerify = false;
+    // ── H2b: the HEIGHT-FIELD OCCLUSION MARCH in the mirror's cull lane ─────────────────────────
+    // The payload. H0 bracketed the mirror at [85.9%, 87.0%] occluded instances; this is the test
+    // that acts on it. ⚠ DEFAULT OFF, and it needs `reflGpuCull` on to do anything at all — the
+    // march lives in the GPU lane, which is the only place with a per-instance test to hang it on.
+    bool     g_reflHeightOcc = false;
+    // Tap count. H0b swept it in the PROBE and put the knee at 12 (24 taps reject 86.6%, 12 reject
+    // 84.0%, 8 reject 77.2%, 4 reject 54.1%) — but that was a cost/benefit argument about the
+    // probe's own dispatch, and MEASURED IN THE CULL LANE the marginal cost of the second twelve
+    // taps is not there at all: floor 11.88 at 12 taps against 11.87 at 24, for 84.4% vs 87.5%
+    // rejected. The loop is not what this pass costs, so the knee argument does not transfer and
+    // the default is the one that rejects more.
+    // ⚠ THE TAP COUNT IS A COST KNOB, NOT A CORRECTNESS ONE. Under-sampling steps OVER ridges, so a
+    // low count UNDER-rejects — it draws things that are hidden, never hides things that are drawn.
+    float    g_reflHeightOccSteps = 24.0f;
+    // The pyramid LEVEL the taps read. Level N is a min over a 2^N-texel block, i.e. more
+    // conservative (rejects less) as N rises: H1's acceptance measured L1 = 4058, L2 = 4051,
+    // L3 = 4019 against a 4060 ceiling. 1 is the default — the coarser levels exist for a later
+    // experiment that will have its own measurement, and there is no evidence yet that a
+    // hierarchical level pick beats a fixed low one on this field.
+    // ⚠ NEVER 0 WHILE ARMED. Level 0 is the MAX field copied verbatim, which is not conservative —
+    // it is the CEILING arm, the one that over-rejects. Clamped at the publish.
+    float    g_reflHeightOccLevel = 1.0f;
+    // World units added to the RAY before the compare, biasing toward "not occluded" — the
+    // direction this test has to err in. occProbe's own default, for the same reason.
+    float    g_reflHeightOccBias = 64.0f;
+    // Extra world units the march stops SHORT of its target, on top of effR + one texel. The
+    // instance is itself in the field, so without this every object is occluded by its own roof.
+    float    g_reflHeightOccMargin = 32.0f;
+    bool     g_reflHeightOccArmed = false;   // did the params publish actually ARM it this frame?
+    uint32_t g_lastReflHeightOccluded = 0;   // gCullCount[1] readback: subsets the march rejected
+    bool     g_reflGpuCullRan = false;   // did dispatchReflCull actually dispatch THIS frame? The
+                                         // heartbeat prints it, because "the knob is on" and "the
+                                         // lane ran" are different claims and only the second one
+                                         // makes the numbers beside it mean anything.
+    uint32_t g_lastReflGpuCullCount = 0; // Σ numSubsets from the GPU lane (readback, 1 frame late)
+    // The CPU cull's count for THE FRAME THE READBACK DESCRIBES. Not g_liveLastInstRefl read at the
+    // settle point: settleFrameFence runs AFTER this frame's dlReflectGeoCull, so that variable
+    // already holds frame N while the readback holds frame N-1. Comparing them would report a
+    // MISMATCH every time the camera moved and a MATCH whenever it did not — an instrument that
+    // measures camera motion. This is latched one settle behind, so the two describe the same frame.
+    uint32_t g_reflCpuCullPrev = 0;
+    uint32_t g_reflCullMatchFrames = 0;   // consecutive settles where the two agreed
+    uint32_t g_reflCullMismatches  = 0;   // ...and where they did not. A single one kills the lane.
+    // ── THE W-GATE: don't reflect where there is no water to see ────────────────────────────────
+    // tasks/forge-reflect-cost.md. `waterEnabled` comes from MWBridge::CellHasWater(), whose own
+    // comment ends "Exteriors always have water (CellHasWater true there)" — so it means "this cell
+    // DEFINES a water plane", not "any of it is visible", and the whole 1.9-2.4 ms reflect pass runs
+    // on a highland with the sea a thousand units below the terrain. MGE's DX9 path did not have
+    // this problem: it carried water PROXY BOXES and drew no reflection when the box was occluded.
+    //
+    // ⚠ THE SOURCE IS Terrain::LandCell::minHeight, NOT H1's MIN-PYRAMID, and that is a correction
+    // to this idea's own design note. The pyramid covers a 65536 u window around the eye (±4 cells)
+    // while the DL frustum reaches 20+ cells, so every frustum that leaves the window would contain
+    // unknown texels, fail open, and the gate would never fire. The LAND records are the whole world,
+    // resident, immutable and exact — and their per-cell min is already parsed ("for the per-cell
+    // cull bound"). Statics are irrelevant here for a reason worth stating: a static can only RAISE
+    // a height, and this test asks whether anything is LOW.
+    //
+    // The test, over the cells the MAIN view is already drawing this frame:
+    //     zLo < waterLevel  ⟹  part of that cell's ground is under the plane ⟹ water covers it
+    //     zLo >= waterLevel for EVERY visible cell ⟹ no water surface in view ⟹ skip the pass
+    // Conservative in the one direction that matters: a cell whose floor dips below the plane keeps
+    // the reflection even if the water there is hidden behind a ridge.
+    bool     g_reflWaterGate = false;    // ACT on the gate. DEFAULT OFF — the instrument below runs
+                                         // regardless, so an un-armed session still reports the yield.
+    // Cells beyond this distance are not consulted. 0 = no limit (the DL draw distance decides), which
+    // is the fully conservative setting and the default. It exists because the frustum reaches much
+    // further than water is worth reflecting, and one distant sea cell at the fog horizon can hold the
+    // gate open over an entire inland view — but what that costs in fidelity is a LOOK call, so the
+    // shipped default makes no such trade and the measurement below says whether one is needed.
+    float    g_reflWaterGateRange = 0.0f;
+    // World units added to the water plane before the compare, biasing toward "there is water" — the
+    // direction this test has to err in, and slack for the mesh/mirror/clip disagreement about where
+    // MW's surface actually is (see waterHeightReadout: mesh = W∓5, underwater trip = W−1).
+    float    g_reflWaterGateBias = 32.0f;
+    // The instrument. Computed EVERY frame whether or not the gate is armed, because "would it have
+    // fired, and if not, how far away was the water that held it open" is the only question that
+    // decides whether the range knob above is needed — and a knob defaulted off can never answer it.
+    // The LATCHED decision — "the gate is armed AND said dry" — set once per frame beside the CPU
+    // cull and re-read by the reflect pass ~2500 lines later. One variable rather than two sites
+    // re-deriving `g_reflWaterGate && !g_reflWaterInView`, so the cull and the draw cannot drift.
+    bool        g_reflWaterGateOff   = false;
+    bool        g_reflWaterInView    = true;   // the test's answer this frame
+    uint32_t    g_reflWaterCellsWet  = 0;      // visible cells whose floor is under the plane
+    uint32_t    g_reflWaterCellsSeen = 0;      // visible cells consulted
+    float       g_reflWaterNearest   = -1.0f;  // distance in CELLS to the nearest wet one (-1 = none)
+    const char* g_reflWaterGateWhy   = "init"; // what forced the answer, when something did
+    uint32_t    g_reflWaterGateSkips = 0;      // frames the ARMED gate actually skipped the pass
+    uint32_t    g_reflWaterGateTotal = 0;      // ...out of this many it was consulted on
+    // ── …AND THE SCREEN-SIDE ARM, which is the one that actually fires ──────────────────────────
+    // MEASURED 2026-09-07, and it killed the terrain arm as a trigger: in the Ascadian Isles save
+    // the user calls "no water", 254 of 285 visible cells have ground under the plane and the
+    // NEAREST is 0.4 cells — the player's own. Balmora reads 238 of 285, nearest 0.5. A cell is
+    // 8192 u; one 128 u channel anywhere in it makes the whole cell wet, and a river delta is
+    // channels. Frustum CONTAINMENT of sub-water ground is simply not the same question as "is a
+    // water surface on screen", and no bias or range limit closes that gap.
+    //
+    // What does answer it already exists and already runs every frame: the APL meter classifies each
+    // of its 128² lattice samples by unprojecting the DEPTH and asking whether the surface it lands
+    // on is below the water plane (apl.comp.fsl) — so it is screen-space, occlusion-exact, and it
+    // reported ZERO water samples across 300 frames in both saves while the reflect pass cost
+    // 1.3-1.8 ms. gAplOut[23] is that count; it is already read back. This arm is that number.
+    //
+    // ⚠ ONE FRAME LATE, and only in one direction. The count describes the frame that just resolved,
+    // so water ENTERING view re-opens the gate one frame after it appears — a single frame of the
+    // mirror the pass last rendered, at the moment the first water pixels reach a screen edge. That
+    // is the same latency the main view's Hi-Z occlusion already accepts. Going the other way there
+    // is no latency at all: the pass simply stops.
+    // ⚠ `splitOn` IS THE CLAIM THAT MAKES nWater MEAN ANYTHING. The classifier is gated (the knob,
+    // and "this cell has a water plane"), and with it off every sample is land — so a disarmed
+    // classifier and a genuinely dry view report the identical 0. This is `waterNoReflect` again,
+    // and the answer is the same: report the arm, not just the number.
+    bool     g_aplSplitRan          = false;   // the APL water classifier was ARMED this frame
+    uint32_t g_aplWaterSamplesLast  = 0;       // gAplOut[23]: water samples in the 128² lattice
+    uint32_t g_reflDryFrames        = 0;       // consecutive settles with zero of them
+    // How many consecutive dry frames before the gate engages. A 128² lattice over a 2560x1600
+    // frame samples every ~20x12 px, so a thin distant river can fall between samples on one frame
+    // and land on one the next; requiring a short run makes a single missed frame cost nothing.
+    // It only delays SKIPPING — re-opening is always immediate, on the first sample that sees water.
+    float    g_reflWaterGateHold    = 3.0f;
     uint32_t g_lastReflNearDrawn = 0;   // heartbeat: reflected near opaque draws (indirect + inline)
     uint32_t g_lastReflSkinDrawn = 0;   // heartbeat: reflected skinned draws
     uint32_t g_lastReflMMDrawn   = 0;   // heartbeat: reflected multi-map draws (heads, glow lamps, trim)
@@ -15524,6 +15915,15 @@ namespace {
     unsigned char g_waterHeightBuf[256] = {};
     bstring       g_waterHeightText = bfromarr(g_waterHeightBuf);
     float4        g_waterHeightColor = { 0.70f, 0.85f, 1.0f, 1.0f };
+    // W-GATE readout, under its checkbox. It reports with the gate OFF as well as on, which is what
+    // makes it a measurement rather than a status light: standing inland with the box unticked, this
+    // says whether the pass WOULD have been skipped and, when it would not, how far away the water
+    // holding it open is — the one number that decides whether the range limit is worth trading for.
+    // BLUE while the view has water (the gate does nothing), GREEN when it would skip, AMBER when
+    // something forced it open that is not water at all (interior, near cut, a truncated cull).
+    unsigned char g_reflWGateBuf[256] = {};
+    bstring       g_reflWGateText = bfromarr(g_reflWGateBuf);
+    float4        g_reflWGateColor = { 0.70f, 0.85f, 1.0f, 1.0f };
     // SH1 sky-ambient readout, on the Sky & Water tab. The interior gate is a silent one float — the
     // receivers just stop applying the factor — so without this there is nothing on screen that says
     // whether the feature is live. Shows the projected DC (the sky's mean radiance, before the
@@ -19530,74 +19930,346 @@ namespace {
                                             "17 motion vectors", "18 reactive mask" };
     constexpr uint32_t kDebugModeCount = (uint32_t)(sizeof(kDebugModeNames) / sizeof(kDebugModeNames[0]));
 
-    // The dev panel outgrew a flat widget list (~250 entries → unreadable). TabBuilder groups them
-    // into WIDGET_TYPE_COLLAPSING_HEADER sections ("tabs"). The-Forge deep-copies the whole subtree
-    // on uiAddComponentWidget (cloneWidget recurses pGroupedWidgets), so the payloads/bases only need
-    // to live until flush(). std::deque keeps node-stable addresses for the pWidget pointers as we
-    // append (a vector would realloc and dangle them). One builder per tab; flush() emits the header.
+    // ─── THE DEV PANEL: A REAL HORIZONTAL TAB BAR ────────────────────────────────────────────────
+    //
+    // History, because the shape here is the third answer to the same problem. A flat widget list
+    // hit ~250 entries and became unreadable; TabBuilder then grouped them into
+    // WIDGET_TYPE_COLLAPSING_HEADER sections called "tabs". Those are not tabs — they are collapsing
+    // headers stacked VERTICALLY in one window, so at 456 widgets across 14 sections the panel is a
+    // single column taller than the screen and every section you are not using is still costing you
+    // scroll. "Sky & Water" alone is 183 of them, 109 of those in one volumetric sub-block.
+    //
+    // The Forge's widget enum has no tab bar (WIDGET_TYPE_COLLAPSING_HEADER is the closest thing),
+    // but the ImGui it vendors DOES — imgui_widgets.cpp carries BeginTabBar/BeginTabItem, and
+    // imgui.cpp/_widgets/_tables are all compiled into this exe alongside UI.cpp. WIDGET_TYPE_CUSTOM
+    // is the sanctioned escape hatch: processCustomWidget() invokes the callback from inside the
+    // component's own ImGui draw, so a callback may emit raw ImGui.
+    //
+    // ⚠ SO THE WHOLE PANEL IS ONE CUSTOM WIDGET, not one custom widget per tab. Forge draws a
+    // widget list sequentially and cannot be told to skip; a per-tab arrangement would need the
+    // unselected tabs' widgets drawn into a clipped 1x1 child to hide them, which is a hack that
+    // also costs the full 456 widgets of layout every frame. Owning the draw means an unselected tab
+    // is simply never submitted — the natural ImGui pattern, and the reason this is less code rather
+    // than more.
+    //
+    // ⚠ EVERY ONE OF THE 456 CALL SITES IS UNCHANGED. TabBuilder keeps its exact API
+    // (checkbox/sliderF/sliderU/dropdown/label/button/dynamicText/flush); only what it EMITS moved,
+    // from Forge widget payloads to a description this file draws itself. That is what made this a
+    // safe change to a panel nobody wants to re-verify by hand.
+    struct PanelItem {
+        WidgetType  type;
+        const char* label;      // pooled, see labelPool
+        void*       data;       // bool* / float* / uint32_t* / bstring*
+        float       fmin, fmax, fstep;
+        uint32_t    umin, umax, ustep;
+        const char* const* names;   // dropdown
+        uint32_t    count;
+        const char* fmt;            // sliderF display format (nullptr = ImGui default)
+        WidgetCallback onPress;     // button
+        void*       user;
+        float4*     color;          // dynamicText
+    };
+    struct PanelTab {
+        const char* name;
+        bool        defaultOpen;
+        // PINNED tabs are not tabs at all: they draw at the TOP of the panel, above the filter and
+        // the tab strip, and are visible whatever tab is selected. Stats is the case this exists for
+        // — a readout you watch WHILE turning a knob on some other tab is useless behind a tab you
+        // have to leave to reach it.
+        bool        pinned;
+        std::vector<PanelItem> items;
+    };
+    std::vector<PanelTab> g_panelTabs;
+    // Labels arrive as string literals at every call site today, but pooling them costs one
+    // allocation and removes the lifetime question entirely — nothing here has to reason about
+    // whether a caller passed a temporary.
+    std::deque<std::string> g_panelLabelPool;
+
     struct TabBuilder {
         UIComponent* panel = nullptr;
         const char*  name  = "";
         bool         defaultOpen = false;
-        std::deque<CheckboxWidget>    cbs;
-        std::deque<SliderFloatWidget> sfs;
-        std::deque<SliderUintWidget>  sus;
-        std::deque<DropdownWidget>    dds;
-        std::deque<ButtonWidget>      btns;
-        std::deque<LabelWidget>       lbls;
-        std::deque<DynamicTextWidget> dyns;
-        std::deque<UIWidget>          bases;
-        std::vector<UIWidget*>        ptrs;
+        bool         pinned = false;   // draw at the panel root instead of as a tab (see PanelTab)
+        std::vector<PanelItem> items;
 
-        void push(WidgetType t, const char* label, void* payload) {
-            UIWidget& b = bases.emplace_back();
-            b.mType = t;
-            b.pWidget = payload;
-            strncpy(b.mLabel, label, MAX_LABEL_STR_LENGTH - 1);
-            ptrs.push_back(&b);
+        const char* pool(const char* s) {
+            g_panelLabelPool.emplace_back(s ? s : "");
+            return g_panelLabelPool.back().c_str();
         }
+        void push(PanelItem it) { items.push_back(it); }
+
         void checkbox(const char* label, bool* p) {
-            CheckboxWidget& w = cbs.emplace_back(); w.pData = p;
-            push(WIDGET_TYPE_CHECKBOX, label, &w);
+            PanelItem it = {}; it.type = WIDGET_TYPE_CHECKBOX; it.label = pool(label); it.data = p;
+            push(it);
         }
         void sliderF(const char* label, float* p, float mn, float mx, float st, const char* fmt = nullptr) {
-            SliderFloatWidget& w = sfs.emplace_back(); w.pData = p; w.mMin = mn; w.mMax = mx; w.mStep = st;
-            if (fmt) { strncpy(w.mFormat, fmt, sizeof(w.mFormat) - 1); }
-            push(WIDGET_TYPE_SLIDER_FLOAT, label, &w);
+            PanelItem it = {}; it.type = WIDGET_TYPE_SLIDER_FLOAT; it.label = pool(label); it.data = p;
+            it.fmin = mn; it.fmax = mx; it.fstep = st; it.fmt = fmt ? pool(fmt) : nullptr;
+            push(it);
         }
         void sliderU(const char* label, uint32_t* p, uint32_t mn, uint32_t mx, uint32_t st) {
-            SliderUintWidget& w = sus.emplace_back(); w.pData = p; w.mMin = mn; w.mMax = mx; w.mStep = st;
-            push(WIDGET_TYPE_SLIDER_UINT, label, &w);
+            PanelItem it = {}; it.type = WIDGET_TYPE_SLIDER_UINT; it.label = pool(label); it.data = p;
+            it.umin = mn; it.umax = mx; it.ustep = st;
+            push(it);
         }
         void dropdown(const char* label, uint32_t* p, const char* const* names, uint32_t count) {
-            DropdownWidget& w = dds.emplace_back(); w.pData = p; w.pNames = names; w.mCount = count;
-            push(WIDGET_TYPE_DROPDOWN, label, &w);
+            PanelItem it = {}; it.type = WIDGET_TYPE_DROPDOWN; it.label = pool(label); it.data = p;
+            it.names = names; it.count = count;
+            push(it);
         }
         void label(const char* label) {
-            LabelWidget& w = lbls.emplace_back();
-            push(WIDGET_TYPE_LABEL, label, &w);
+            PanelItem it = {}; it.type = WIDGET_TYPE_LABEL; it.label = pool(label);
+            push(it);
         }
-        // A press ACTION, not a value: `pOnEdited` fires once on click. The callback is expected to
+        // A press ACTION, not a value: `onPress` fires once on click. The callback is expected to
         // set a flag the render loop consumes, never to touch GPU resources itself — the UI runs
         // mid-frame, where a waitQueueIdle would stall the frame it is inside.
         void button(const char* label, WidgetCallback onPress, void* user = nullptr) {
-            ButtonWidget& w = btns.emplace_back();
-            push(WIDGET_TYPE_BUTTON, label, &w);
-            bases.back().pOnEdited = onPress;
-            bases.back().pOnEditedUserData = user;
+            PanelItem it = {}; it.type = WIDGET_TYPE_BUTTON; it.label = pool(label);
+            it.onPress = onPress; it.user = user;
+            push(it);
         }
         void dynamicText(const char* label, bstring* text, float4* color) {
-            DynamicTextWidget& w = dyns.emplace_back(); w.pText = text; w.pColor = color;
-            push(WIDGET_TYPE_DYNAMIC_TEXT, label, &w);
+            PanelItem it = {}; it.type = WIDGET_TYPE_DYNAMIC_TEXT; it.label = pool(label);
+            it.data = text; it.color = color;
+            push(it);
         }
         void flush() {
-            CollapsingHeaderWidget hdr = {};
-            hdr.pGroupedWidgets = ptrs.data();
-            hdr.mWidgetsCount   = (uint32_t)ptrs.size();
-            hdr.mDefaultOpen    = defaultOpen;
-            uiAddComponentWidget(panel, name, &hdr, WIDGET_TYPE_COLLAPSING_HEADER);
+            PanelTab tab;
+            tab.name = name;              // string literal at every call site
+            tab.defaultOpen = defaultOpen;
+            tab.pinned = pinned;
+            tab.items = std::move(items);
+            g_panelTabs.push_back(std::move(tab));
         }
     };
+
+    // The tab-bar FILTER. 456 widgets is not searchable by eye even split 14 ways, and the knob you
+    // want is usually one you can name — so typing here shows matching widgets from EVERY tab at
+    // once and the tab bar steps aside. Cheap: one substring test per widget per frame.
+    char g_panelFilter[64] = {};
+
+    // Case-insensitive substring, because nobody types "Reflect: GPU cull lane" with the right caps.
+    static bool panelMatches(const char* label, const char* needle) {
+        if (!needle || !needle[0]) { return true; }
+        if (!label) { return false; }
+        for (const char* h = label; *h; ++h) {
+            const char* a = h;
+            const char* b = needle;
+            while (*a && *b && (tolower((unsigned char)*a) == tolower((unsigned char)*b))) { ++a; ++b; }
+            if (!*b) { return true; }
+        }
+        return false;
+    }
+
+    // Draw ONE widget. Split out so the tab path and the filter path cannot drift — a filtered
+    // checkbox has to be the same checkbox bound to the same pointer, or the search box quietly
+    // becomes a second control surface that disagrees with the first. (Which is exactly the failure
+    // this whole change is about: env knobs and panel knobs were already two such surfaces.)
+    // ⚠ THE LABEL IS WRAPPED, WHICH IS WHY EVERY CONTROL BELOW IS DRAWN WITH A HIDDEN "##v" ID.
+    // ImGui puts a control's label to its RIGHT and never wraps it, so a 95-character label — and
+    // 135 of the 442 here run past 60 — makes a row wider than any sane panel, and the reading gets
+    // clipped exactly where the explanation starts. These labels are DOCUMENTATION, not names ("WAKE
+    // grid on (the V comes from THIS one, not the fine grid above; gates the WAKE caustic layer)"),
+    // so losing the tail loses the point of having written them.
+    //
+    // Drawing the control with a hidden id and then emitting the text ourselves under
+    // PushTextWrapPos costs one extra call per widget and makes the panel readable at ANY width,
+    // rather than at one width chosen for the longest string. Continuation lines align under the
+    // start of the text, so the control column stays a column.
+    // The wrap column, in WINDOW-LOCAL x, computed ONCE per panelDraw and reused by every label.
+    // ⚠ NOT PushTextWrapPos(0). That spelling means "wrap at the content region's right edge", which
+    // is derived from the window width — and if the window is ever auto-sizing again, the width it
+    // wraps to is the width it is about to become. That loop is what made the panel grow every frame
+    // (see the uiSetComponentFlags note at creation). An explicit, clamped position cannot chase the
+    // window, so the wrap is stable even if the flag is reintroduced by a Forge update.
+    float g_panelWrapX = 600.0f;
+
+    static void panelLabel(const char* label) {
+        ImGui::SameLine();
+        ImGui::PushTextWrapPos(g_panelWrapX);
+        ImGui::TextUnformatted(label);
+        ImGui::PopTextWrapPos();
+    }
+
+    static void panelDrawItem(const PanelItem& it) {
+        switch (it.type) {
+        case WIDGET_TYPE_CHECKBOX:
+            ImGui::Checkbox("##v", (bool*)it.data);
+            panelLabel(it.label);
+            break;
+        case WIDGET_TYPE_SLIDER_FLOAT:
+            // DragFloat, not SliderFloat: these ranges span 0..1 and 0..65536 across the panel, and a
+            // drag honours the step the Forge slider took while still allowing ctrl+click to TYPE an
+            // exact value — which is what a measurement session actually needs.
+            ImGui::DragFloat("##v", (float*)it.data, it.fstep > 0.0f ? it.fstep : 0.01f,
+                             it.fmin, it.fmax, it.fmt ? it.fmt : "%.3f");
+            panelLabel(it.label);
+            break;
+        case WIDGET_TYPE_SLIDER_UINT: {
+            int v = (int)*(uint32_t*)it.data;
+            if (ImGui::DragInt("##v", &v, (float)(it.ustep ? it.ustep : 1u),
+                               (int)it.umin, (int)it.umax)) {
+                if (v < (int)it.umin) { v = (int)it.umin; }
+                if (v > (int)it.umax) { v = (int)it.umax; }
+                *(uint32_t*)it.data = (uint32_t)v;
+            }
+            panelLabel(it.label);
+            break;
+        }
+        case WIDGET_TYPE_DROPDOWN: {
+            uint32_t& sel = *(uint32_t*)it.data;
+            const char* cur = (sel < it.count && it.names) ? it.names[sel] : "";
+            if (ImGui::BeginCombo("##v", cur)) {
+                for (uint32_t i = 0; i < it.count; ++i) {
+                    const bool isSel = (i == sel);
+                    if (ImGui::Selectable(it.names[i], isSel)) { sel = i; }
+                    if (isSel) { ImGui::SetItemDefaultFocus(); }
+                }
+                ImGui::EndCombo();
+            }
+            panelLabel(it.label);
+            break;
+        }
+        case WIDGET_TYPE_LABEL:
+            // A standalone caption, not a control's label — no SameLine, but still wrapped: several
+            // of these are the section banners that carry the "why" for the block beneath them.
+            ImGui::PushTextWrapPos(g_panelWrapX);
+            ImGui::TextUnformatted(it.label);
+            ImGui::PopTextWrapPos();
+            break;
+        case WIDGET_TYPE_BUTTON:
+            // Forge fired pOnEdited once on click and every callback here just sets a flag the render
+            // loop consumes; same contract, same one-shot.
+            if (ImGui::Button(it.label) && it.onPress) { it.onPress(it.user); }
+            break;
+        case WIDGET_TYPE_DYNAMIC_TEXT: {
+            const bstring* s = (const bstring*)it.data;
+            const char* txt = (s && s->data) ? (const char*)s->data : "";
+            // Wrapped as well: the stats/water-height readouts are long single lines that used to
+            // run off the right edge, and they are the one thing on the panel you read rather than
+            // click.
+            ImGui::PushTextWrapPos(g_panelWrapX);
+            if (it.color) {
+                ImGui::TextColored(ImVec4(it.color->x, it.color->y, it.color->z, it.color->w),
+                                   "%s", txt);
+            } else {
+                ImGui::TextUnformatted(txt);
+            }
+            ImGui::PopTextWrapPos();
+            break;
+        }
+        default:
+            break;
+        }
+    }
+
+    // THE PANEL, DRAWN WHOLE. Registered as ONE WIDGET_TYPE_CUSTOM, so this runs inside the
+    // component's own ImGui window (processCustomWidget) and may emit raw ImGui.
+    static void panelDraw(void*) {
+        // Which tab starts selected. `defaultOpen` used to mean "this collapsing header starts
+        // expanded" and several tabs set it; as a TAB it can only mean "start selected", and only one
+        // can — so the FIRST tab that asked wins and the rest are ordinary tabs.
+        // ⚠ APPLIED ON THE FIRST FRAME ONLY. Passing SetSelected every frame would re-select that tab
+        // every frame and leave the other 13 unclickable — a bug that reads as "the panel is broken"
+        // rather than as a flag.
+        static bool s_firstFrame = true;
+
+        // A FIXED control width, not a fraction of the panel. A fraction fights the labels: widen
+        // the panel to fit a 95-character label and a percentage widens the slider by the same
+        // amount, so the label gains nothing and the row never catches up. 240 px is enough for any
+        // drag or combo here, and every pixel of extra panel width then goes to the text — which is
+        // the thing that actually needed room. Clamped for a panel the user has dragged narrow.
+        const float availW = ImGui::GetContentRegionAvail().x;
+        ImGui::PushItemWidth(availW > 0.0f ? (availW * 0.4f < 240.0f ? availW * 0.4f : 240.0f)
+                                           : 240.0f);
+        // Latch the wrap column from THIS frame's width, once, and clamp it. Sampling it per label
+        // would reintroduce the chase within a single frame (each wrapped label widens the content,
+        // and the next label would read the wider region); clamping bounds the damage if a future
+        // change ever makes the width unstable again. 1600 is well past any label here (95 chars).
+        {
+            const float w = availW > 0.0f ? availW : 600.0f;
+            g_panelWrapX = w < 240.0f ? 240.0f : (w > 1600.0f ? 1600.0f : w);
+        }
+
+        // PINNED first, above everything, whatever tab is selected.
+        for (const PanelTab& tab : g_panelTabs) {
+            if (!tab.pinned) { continue; }
+            for (const PanelItem& it : tab.items) {
+                ImGui::PushID(&it);
+                panelDrawItem(it);
+                ImGui::PopID();
+            }
+        }
+        ImGui::Separator();
+
+        ImGui::SetNextItemWidth(-40.0f);
+        ImGui::InputTextWithHint("##panelFilter", "filter knobs (searches every tab)",
+                                 g_panelFilter, sizeof(g_panelFilter));
+        ImGui::SameLine();
+        if (ImGui::SmallButton("clear")) { g_panelFilter[0] = 0; }
+
+        if (g_panelFilter[0]) {
+            // FILTER MODE: one flat list across ALL tabs, each run of hits headed by the tab it lives
+            // in — so finding a knob here also teaches where it lives. The tab bar is suppressed: a
+            // search that still made you pick a tab would not be a search.
+            uint32_t hits = 0;
+            for (const PanelTab& tab : g_panelTabs) {
+                if (tab.pinned) { continue; }   // already drawn above, every frame
+                bool wroteHeader = false;
+                for (const PanelItem& it : tab.items) {
+                    if (!panelMatches(it.label, g_panelFilter)) { continue; }
+                    if (!wroteHeader) { ImGui::SeparatorText(tab.name); wroteHeader = true; }
+                    ImGui::PushID(&it);
+                    panelDrawItem(it);
+                    ImGui::PopID();
+                    ++hits;
+                }
+            }
+            if (!hits) { ImGui::TextDisabled("no knob matches that"); }
+            ImGui::PopItemWidth();
+            return;
+        }
+
+        // 14 tabs do not fit across a 360 px panel, so BOTH escape valves are on: FittingPolicyScroll
+        // keeps every tab at full label width and scrolls the strip, and TabListPopupButton adds the
+        // "v" menu listing them all. Without these ImGui SHRINKS labels to fit, which turns
+        // "Exposure (adaptation)" into "Exp..." and defeats the point of naming them.
+        const ImGuiTabBarFlags tbFlags = ImGuiTabBarFlags_FittingPolicyScroll
+                                       | ImGuiTabBarFlags_TabListPopupButton;
+        if (ImGui::BeginTabBar("mgeDevTabs", tbFlags)) {
+            const PanelTab* firstDefault = nullptr;
+            for (const PanelTab& t : g_panelTabs) {
+                if (!t.pinned && t.defaultOpen) { firstDefault = &t; break; }
+            }
+            for (const PanelTab& tab : g_panelTabs) {
+                if (tab.pinned) { continue; }   // drawn at the root, not in the strip
+                const ImGuiTabItemFlags tiFlags =
+                    (s_firstFrame && &tab == firstDefault) ? ImGuiTabItemFlags_SetSelected : 0;
+                if (ImGui::BeginTabItem(tab.name, nullptr, tiFlags)) {
+                    // The body scrolls INSIDE the tab, so the tab strip stays put. Without this the
+                    // 109-widget Volumetric tab would push the strip off the top of the window and we
+                    // would be back to one long column with extra steps.
+                    //
+                    // ⚠ NO HORIZONTAL SCROLLBAR, deliberately. It was here for one build, to reach
+                    // labels too wide for the panel; wrapping removed the condition, and leaving the
+                    // flag would let a stray wide item introduce a horizontal scroll nobody expects
+                    // in a wrapped column.
+                    ImGui::BeginChild("##tabbody", ImVec2(0.0f, 0.0f), false);
+                    for (const PanelItem& it : tab.items) {
+                        ImGui::PushID(&it);
+                        panelDrawItem(it);
+                        ImGui::PopID();
+                    }
+                    ImGui::EndChild();
+                    ImGui::EndTabItem();
+                }
+            }
+            ImGui::EndTabBar();
+        }
+        s_firstFrame = false;
+        ImGui::PopItemWidth();
+    }
 
     // Build the dev overlay once. The headless host has no Load/Unload reload split, so font-system
     // + UI-system init AND their pipeline load happen together here, right after pRT exists.
@@ -19659,9 +20331,38 @@ namespace {
 
         UIComponentDesc cd = {};
         cd.mStartPosition = vec2(16.0f, 16.0f);
-        cd.mStartSize = vec2(360.0f, 420.0f);
+        // Wider and taller than the collapsing-header era, but NOT sized for the 95-character worst
+        // case — the labels WRAP now (see panelDrawItem), so width is a comfort choice rather than a
+        // constraint the longest string dictates. 900 px gives a 240 px control plus ~620 px of text,
+        // about 80 characters a line: the median 50-character label sits on one line, the tail wraps
+        // to two, and nothing is ever clipped at any width the user drags it to.
+        cd.mStartSize = vec2(900.0f, 800.0f);
         cd.mFontID = g_uiFontId;
         uiAddComponent("MGE Dev", &cd, &g_uiPanel);
+
+        // ⚠⚠ TURN OFF ALWAYS_AUTO_RESIZE, AND THIS IS NOT COSMETIC — IT IS THE FIX FOR A WINDOW THAT
+        // GREW WIDER EVERY FRAME.
+        //
+        // uiAddComponent HARD-SETS `mFlags = GUI_COMPONENT_FLAGS_ALWAYS_AUTO_RESIZE` (UI.cpp:2261),
+        // unconditionally and after nothing the desc can say — so mStartSize above was never applied
+        // and the window sized itself to its content every frame. That is harmless for a list of
+        // fixed-width widgets. It is a FEEDBACK LOOP the moment anything measures itself against the
+        // window:
+        //
+        //   PushTextWrapPos(0) wraps at the CONTENT REGION's right edge
+        //     -> the wrap width comes from the window width
+        //     -> the wrapped text's measured width becomes the content width
+        //     -> AlwaysAutoResize sets the window width from the content width
+        //     -> next frame wraps wider ... and the panel walks off the screen.
+        //
+        // BeginChild("##tabbody", ImVec2(0,0)) — "fill the available space" — has the same defect in
+        // an auto-resizing window: there is no available space to fill until the content decides it.
+        //
+        // With the flag cleared the window honours mInitialWindowRect (the size set above) and stays
+        // user-resizable, which makes BOTH of those well-defined: a fixed width in, a fixed wrap out.
+        // Keep this call adjacent to uiAddComponent — the flag is re-applied by any future
+        // uiAddComponent, so the two belong together.
+        uiSetComponentFlags(g_uiPanel, GUI_COMPONENT_FLAGS_NONE);
 
         LabelWidget lbl = {};
         uiAddComponentWidget(g_uiPanel, "Forge dev overlay (F9 toggles)", &lbl, WIDGET_TYPE_LABEL);
@@ -19794,6 +20495,48 @@ namespace {
           t.checkbox("Draw: reflect land+statics", &g_drawReflectGeo);
           t.checkbox("Draw: reflect near scene (interiors + shoreline)", &g_drawReflectNear);
           t.checkbox("Reflect: horizon scissor", &g_reflHorizonScissor);
+          // ─── H1/H2: THE MIRROR'S OCCLUSION CULL (tasks/forge-heightfield-occlusion.md) ────────
+          // ⚠ THESE ARE ON THE PANEL BECAUSE THE REMAINING ACCEPTANCE TEST NEEDS A LIVE TOGGLE.
+          // They ship default-off behind MGE_HOST_KNOBS, which is set at STARTUP — so with env
+          // control alone the one check still outstanding (an F5/F6 snapshot A/B on a turning
+          // camera, looking for a building blinking into the water) would need a game restart
+          // between the two arms, which is not an A/B anybody can judge a picture from.
+          // Safe to flip live: all three consumers (the CPU-cull skip gate, dispatchReflCull, and
+          // the draw's buffer pick) read the flag once per frame and the UI updates between frames,
+          // so a frame never sees two different answers.
+          t.checkbox("Reflect: GPU cull lane (H2a — skips the mirror's CPU cell-walk)", &g_reflGpuCull);
+          t.checkbox("Reflect: height-field OCCLUSION cull (H2b — needs the lane above)", &g_reflHeightOcc);
+          // Runs the lane BESIDE the CPU cull and prints the parity in [forge-hb][refl-gpucull].
+          // The only arm where MATCH means anything — with the lane driving, there is no CPU count
+          // left to compare against.
+          t.checkbox("Reflect: cull parity VERIFY (lane + CPU both, draw unchanged)", &g_reflCullVerify);
+          // Measured in the lane, 24 taps cost the same as 12 and reject 87.5% against 84.4%.
+          t.sliderF("Reflect occ: march taps (cost knob; under-sampling UNDER-rejects)", &g_reflHeightOccSteps, 4.0f, 48.0f, 1.0f);
+          // Coarser = more conservative = rejects less. 0 is the raw MAX field and is NOT
+          // conservative, so the publish clamps to >= 1 whatever this says.
+          t.sliderF("Reflect occ: pyramid LEVEL (1 = a 2-texel min; higher = safer, rejects less)", &g_reflHeightOccLevel, 1.0f, 6.0f, 1.0f);
+          t.sliderF("Reflect occ: bias (world u, added to the RAY — biases toward NOT occluded)", &g_reflHeightOccBias, 0.0f, 512.0f, 8.0f);
+          t.sliderF("Reflect occ: end margin (world u, stops the march short of its own target)", &g_reflHeightOccMargin, 0.0f, 256.0f, 8.0f);
+          // ─── THE W-GATE (tasks/forge-reflect-cost.md) ─────────────────────────────────────────
+          // The DX9 proxy-box behaviour, restored off the LAND records: no water on screen, no
+          // reflection pass at all. Live-toggleable for the same reason as the two above — its
+          // acceptance is a picture question (does the mirror freeze or blink at a shoreline?) and
+          // the answer needs both arms inside one session, at one viewpoint.
+          // ⚠ The readout below it is NOT a status line, it is the measurement: with the box UNTICKED
+          // it still says whether this view would have been gated and how far away the nearest water
+          // is. Stand somewhere inland with it off and read `nearest` before deciding the range knob.
+          t.checkbox("Reflect: W-GATE — skip the pass where no water is visible", &g_reflWaterGate);
+          // 0 = consult every cell the view draws (fully conservative, shipped). Raising it trades
+          // fidelity for yield: distant water stops holding the gate open, and the reflection under
+          // water further away than this is whatever the mirror last held.
+          t.sliderF("W-gate: range limit (cells; 0 = full DL draw distance)", &g_reflWaterGateRange, 0.0f, 24.0f, 1.0f);
+          // Biases toward "there is water", which is the safe direction. Covers MW's own disagreement
+          // about where the surface is (mesh W-5, underwater trip W-1, splashes higher).
+          t.sliderF("W-gate: plane bias (world u above MW's level — higher = keeps more)", &g_reflWaterGateBias, 0.0f, 256.0f, 8.0f);
+          // The SCREEN arm — the one that fires. Consecutive frames with zero water samples in the
+          // APL's 128² lattice before the pass stops. Re-opening is always immediate.
+          t.sliderF("W-gate: dry-frame hold (screen arm; re-opens instantly regardless)", &g_reflWaterGateHold, 1.0f, 30.0f, 1.0f);
+          t.dynamicText("", &g_reflWGateText, &g_reflWGateColor);
           t.sliderF("Reflect: water level offset (mirror plane, from MW WaterLevel)", &g_reflWaterLevelOffset, -32.0f, 32.0f, 0.25f);
           t.sliderF("Reflect: water clip bias (-) cuts higher / (+) keeps submerged", &g_reflWaterClipBias, -50.0f, 16.0f, 0.5f);
           t.checkbox("Reflect: near scene swaps winding (off = backfaces)", &g_reflNearSwapWinding);
@@ -21303,9 +22046,26 @@ namespace {
           t.flush(); }
 
         // -- Tab: Stats (live per-frame counters, updated each frame in drawDevUI) --
-        { TabBuilder t; t.panel = g_uiPanel; t.name = "Stats"; t.defaultOpen = true;
+        // STATS IS PINNED, NOT A TAB. It is the one thing on this panel you READ rather than click,
+        // and you read it while changing something on a different tab — so behind a tab of its own it
+        // is exactly where it cannot be used. Drawn at the panel root, above the filter and the strip.
+        { TabBuilder t; t.panel = g_uiPanel; t.name = "Stats"; t.pinned = true;
           t.dynamicText("", &g_statsText, &g_statsColor);
           t.flush(); }
+
+        // ...and NOW emit the whole thing as ONE Forge widget. Every TabBuilder above only recorded
+        // a description; this is the single WIDGET_TYPE_CUSTOM whose callback draws all 14 tabs and
+        // all 456 controls with raw ImGui, inside the component's own draw (processCustomWidget).
+        //
+        // ⚠ REGISTERED LAST, ON PURPOSE. Forge draws a component's widgets in registration order, so
+        // this has to come after the two root-level widgets (the title label and the fullscreen-buffer
+        // dropdown) or the tab bar would render above them.
+        {
+            CustomWidget cw = {};
+            cw.pCallback = panelDraw;
+            cw.pUserData = nullptr;
+            uiAddComponentWidget(g_uiPanel, "##mgeDevPanel", &cw, WIDGET_TYPE_CUSTOM);
+        }
 
         g_uiInited = true;
         LOG::logline(">> [devui] ready (%ux%u fmt=%u)", width, height, colorFmt); LOG::flush();
@@ -23486,6 +24246,25 @@ void destroyHostWindow(Renderer* R);
             // actually get. Sweep it (0/1/2/3) to see how fast the floor falls as the emulated
             // pyramid level coarsens — that slope is the real risk in H2. 0 = the self-check arm.
             { "occProbeMinR",        &g_occProbeMinR        },
+            { "occProbePyr",         &g_occProbePyr         },
+            // H2b: the march's shape. Steps is the cost knob H0b sized (knee at 12); level is how
+            // conservative the field is (1 = a 2-texel min, H1's L1 = 4058 of a 4060 ceiling); bias
+            // and margin are the two "do not occlude yourself" fudges, both in world units.
+            { "reflHeightOccSteps",  &g_reflHeightOccSteps  },
+            { "reflHeightOccLevel",  &g_reflHeightOccLevel  },
+            { "reflHeightOccBias",   &g_reflHeightOccBias   },
+            { "reflHeightOccMargin", &g_reflHeightOccMargin },
+            // THE W-GATE's two dials. `reflWaterGate` itself is a bool and lives in the table below;
+            // these are the pair that decides how much of the view the test consults and how far above
+            // MW's level the plane sits for it. Range is the one worth sweeping from a harness — it is
+            // the only lever on "a single sea cell at the fog horizon holds the gate open", and the
+            // arm that shows it is 0 (the shipped, fully-conservative value) against 4/8/16 cells.
+            { "reflWaterGateRange",  &g_reflWaterGateRange  },
+            { "reflWaterGateBias",   &g_reflWaterGateBias   },
+            // The SCREEN arm's only dial: consecutive dry frames before the pass stops. 1 is the
+            // most aggressive (and the arm that measures the ceiling); raising it costs nothing but
+            // the first few frames of a genuinely dry view.
+            { "reflWaterGateHold",   &g_reflWaterGateHold   },
             // REFLECTION FIDELITY. All three ship as AUTO (-1) and all three are here because the
             // verification is a TABLE — fidelity 1.0/0.75/0.5/0.25 crossed with LOD 0/+1/+2 — and a
             // table needs distance and detail moved INDEPENDENTLY, which the single derived scalar
@@ -23501,6 +24280,20 @@ void destroyHostWindow(Renderer* R);
             { "mbSoftZ",             &g_mbSoftZ             },
         };
         const BKnob bknobs[] = {
+            // H2a: the WATER MIRROR's GPU cull lane, and its VERIFY twin. Both DEFAULT OFF, and both
+            // are env-only for the same reason every other arm in this table is: the A/B is a
+            // measurement on a minimized run and there is nobody at the panel.
+            //   reflCullVerify=1 — run the lane BESIDE the CPU cull and print the parity. The one
+            //     configuration where `reflCull ... MATCH` means anything, because with the lane
+            //     driving the draw there is no CPU number left to compare against.
+            //   reflGpuCull=1    — let the lane DRIVE the draw and skip the CPU cell-walk. This is
+            //     the arm the command wall is measured in ([[forge-heightfield-occlusion]] H2a):
+            //     the compacted CPU ring issues a few hundred indirect commands, the GPU one issues
+            //     cullSubsetCount ~= 10,910 regardless of survivors.
+            { "reflGpuCull",         &g_reflGpuCull         },
+            { "reflCullVerify",      &g_reflCullVerify      },
+            // H2b: the march itself. Needs `reflGpuCull=1` too — the test lives in the GPU lane.
+            { "reflHeightOcc",       &g_reflHeightOcc       },
             // M1 motion vectors — env-driven so an unattended run can turn the dispatch on and read
             // `[forge-hb] mv:` back without anyone at the panel. tasks/forge-upscale.md.
             { "mvEnable",            &g_mvEnable            },
@@ -23571,6 +24364,11 @@ void destroyHostWindow(Renderer* R);
             { "drawReflect",        &g_drawReflect        },
             { "drawReflectGeo",     &g_drawReflectGeo     },
             { "drawReflectNear",    &g_drawReflectNear    },
+            // THE W-GATE's arm. This is the one that restores the DX9 proxy-box behaviour — no water
+            // on screen, no reflection drawn — and it is the whole `reflect` phase, so it is here for
+            // the same reason the three above it are: the A/B is a minimized-harness measurement and
+            // the instrument that justifies it prints on every run whether or not this is set.
+            { "reflWaterGate",      &g_reflWaterGate      },
             { "waterSunTrueElev",   &g_waterSunTrueElev   },
             { "aplSplitWater",      &g_aplSplitWater      },
             { "aplSkipSky",         &g_aplSkipSky         },
@@ -23608,6 +24406,10 @@ void destroyHostWindow(Renderer* R);
             // demonstrates the G1a near-cut trap — grassNearCut=1 re-arms the statics lane's cut and
             // ownership on the grass lane, which is the hole around the player, on purpose.
             { "grassOn",             &g_drawGrass           },
+            // G1f: the Z-prepass pair. 0 restores the single GEQUAL draw with grass.frag's own
+            // SV_Coverage — i.e. the exact shader that shipped — so this knob, unlike grassOn,
+            // prices the OVERDRAW alone: same blades, same cull, same vertex work on both arms.
+            { "grassPrepass",        &g_grassPrepass        },
             { "grassShadows",        &g_grassShadows        },
             { "grassNearCut",        &g_grassNearCut        },
             // 0 = ignore the authored red channel and treat every subset as foliage (stock's
@@ -25540,6 +26342,11 @@ void destroyHostWindow(Renderer* R);
     // fcbvR = main frame cbuffer, dRel = water plane (camera-relative), eyeAbsZ = abs camera z.
     void dlReflectGeoCull(Renderer* R, const float* viewProj, const float* fcbvR,
                           float dRel, float eyeAbsZ, float waterLevelAbs, bool underwater);
+    // THE W-GATE. Answers "can the camera see any water surface this frame" from the per-cell terrain
+    // minima of the cells the MAIN view is already drawing. Runs every frame (it is a few hundred
+    // float compares); ACTING on the answer is the g_reflWaterGate knob. Defined with the terrain
+    // globals it reads, far below. eye = ABSOLUTE world.
+    bool reflWaterVisible(const float eye[3], float waterLevelAbs, bool underwater);
     void dlLiveRecord();
     void terrainRecordDepth(Cmd* cmd);   // host-owned terrain, depth-only — the Z-prepass entry
     void renderSunShadow();   // SUN shadow: DL statics → MSM moments map (forge-sun-shadows.md Phase A)
@@ -25547,8 +26354,10 @@ void destroyHostWindow(Renderer* R);
     void dispatchSunCull();   // SUN shadow A2: second statics cull (sun ortho box, nearCut=0, Hi-Z off)
     bool createOccProbeResources(Renderer* R);  // H0: lazy, the first frame `occProbe` is armed
     void dispatchOccProbe();                    // H0: the two height-field probes (MEASUREMENT only)
+    void dispatchReflCull();  // H2a: the WATER MIRROR's statics cull lane (mirror frustum, no near cut)
     void dispatchGrassCull(); // G1a: the grass cull lane (own instance array + subset table)
     void drawGrass();         // G1: the grass colour draw, inside the DL block
+    void grassRecordDepth(Cmd* cmd);  // G1f: its Z-prepass half, inside the prepass block
     void publishGrassParams(float* mp, double simTimeSeconds);   // G1: gShadowParams grass lanes
     void publishGrassCrushParams(float* mp);                     // G7: the crush field's own lanes
     void rebuildSkyHeightMap();  // SH2: clear + statics raster + terrain compute, when the eye leaves its snap cell
@@ -25907,6 +26716,33 @@ void destroyHostWindow(Renderer* R);
             g_lastGpuCullCount = rb[0];
             g_lastGpuOccluded  = rb[1];
         }
+        // H2a: the MIRROR lane's survivor count, and the parity check that is this step's whole
+        // acceptance. [0] = Σ numSubsets over the frustum survivors — exactly what the CPU cull's
+        // ring fill totals into g_liveLastInstRefl.
+        //
+        // ⚠ THE COMPARISON IS AGAINST THE PREVIOUS SETTLE'S CPU COUNT, not this frame's. See
+        // g_reflCpuCullPrev: settleFrameFence runs after dlReflectGeoCull, so the live variable is
+        // one frame ahead of the readback and comparing them straight would have built an instrument
+        // that reports on camera motion instead of on the cull rule.
+        //
+        // Counted rather than latched: one MISMATCH anywhere in a session is disqualifying, and a
+        // single-frame flag would be overwritten by the next agreeing frame before anyone read it.
+        if (g_live.reflCullReady && g_live.pReflCullReadback
+            && g_live.pReflCullReadback->pCpuMappedAddress) {
+            const uint32_t* rb = (const uint32_t*)g_live.pReflCullReadback->pCpuMappedAddress;
+            g_lastReflGpuCullCount = rb[0];
+            g_lastReflHeightOccluded = rb[1];   // H2b: subsets the height march rejected
+            // Only meaningful in the VERIFY arm — with the lane driving the draw the CPU walk is
+            // skipped and g_reflCpuCullPrev is a stale 0, which would read as a permanent mismatch.
+            // ⚠ g_reflGpuCullRan IS READ HERE ONE FRAME LATE ON PURPOSE, and that is correct rather
+            // than a bug to tidy: settleFrameFence runs BEFORE this frame's cull phase clears it, so
+            // it still holds the answer for the frame the readback describes. Zeroing it earlier
+            // would make this gate ask about the wrong frame.
+            if (g_reflCullVerify && !g_reflGpuCull && g_reflGpuCullRan) {
+                if (g_lastReflGpuCullCount == g_reflCpuCullPrev) { ++g_reflCullMatchFrames; }
+                else                                             { ++g_reflCullMismatches; }
+            }
+        }
         // G1: the grass lane's survivor count, and its RING-OVERFLOW TRIPWIRE. [0] is the frustum
         // survivor count BEFORE the Hi-Z test, so it reads high — a warning is worth checking and
         // silence is a real all-clear. Worth saying out loud because the failure is otherwise mute:
@@ -26013,6 +26849,16 @@ void destroyHostWindow(Renderer* R);
                 for (int i = 0; i < 3; ++i) { g_aplWaterPct[i]   += (double)pu[20 + i]; }
                 ++g_aplWaterN;
             }
+            // THE W-GATE's screen-side arm rides this same count. It costs nothing — the readback
+            // already happened, the classification already happened, and this is one compare.
+            // ⚠ A DISARMED CLASSIFIER MUST NOT READ AS A DRY VIEW. With splitOn false every sample
+            // is land by construction, so nWater is 0 for a reason that has nothing to do with
+            // water; the run has to RESET here rather than accumulate, or switching the meter off
+            // would silently switch the reflection off with it.
+            g_aplWaterSamplesLast = nWater;
+            if (!g_aplSplitRan)      { g_reflDryFrames = 0u; }
+            else if (nWater > 0u)    { g_reflDryFrames = 0u; }
+            else if (g_reflDryFrames < 0xFFFFu) { ++g_reflDryFrames; }
             g_aplLandFrac += (double)nLand / (double)aplCounted;
             // Close the exposure loop on the frame that just finished. HERE, inside the readback
             // guard, so the servo only ever steps on a frame that produced a measurement: a paused
@@ -28920,7 +29766,61 @@ void destroyHostWindow(Renderer* R);
                                    ? float4(1.0f, 0.85f, 0.45f, 1.0f)
                                    : float4(0.70f, 0.85f, 1.0f, 1.0f);
             }
-            if (g_drawReflect && g_live.reflectReady && waterEnabled && waterParams) {
+            // ── THE W-GATE ─────────────────────────────────────────────────────────────────────
+            // Can the camera see any water surface at all this frame? Evaluated EVERY frame, armed
+            // or not, because it is an instrument before it is an optimisation: a knob defaulted off
+            // can never tell you what it would have saved, and the one open question here (does a
+            // single sea cell at the fog horizon hold the gate open over an inland view?) is answered
+            // by the counters this call fills, not by the knob.
+            //
+            // ⚠ LATCHED IN A GLOBAL AND RE-READ BY THE PASS, not recomputed there. The CPU cull and
+            // the reflect pass are ~2500 lines apart and must never disagree about whether this frame
+            // has water: a frame that culls but does not draw leaves the rings filled and the mirror
+            // stale, and one that draws without culling records last frame's survivors.
+            // ⚠ The gate ANDs into the existing condition, it does not replace it. waterEnabled still
+            // means what it meant; this only adds "…and some of it is on screen".
+            // TWO ARMS, OR'd, and they fail in opposite directions — which is why both are kept
+            // rather than the cheaper one being dropped once the other measured better:
+            //   TERRAIN  — the visible cells' minimum ground heights. Zero latency (it describes the
+            //              frame about to be drawn) and conservative by construction, but far too
+            //              coarse to fire in a river delta: 254 of 285 cells wet in the very save
+            //              this feature was built for. It will fire on a highland, and when it does
+            //              there is no stale-frame risk at all.
+            //   SCREEN   — the APL lattice's water-sample count, run out to `hold` consecutive dry
+            //              frames. Exact and occlusion-aware, and the arm that actually fires; it is
+            //              one frame late re-opening.
+            const bool dryTerrain = waterParams
+                                 && !reflWaterVisible(&fcbvR[56], waterLevelAbs, underwater);
+            const bool dryScreen  = !underwater && g_aplSplitRan
+                                 && g_reflDryFrames >= (uint32_t)std::max(1.0f, g_reflWaterGateHold);
+            g_reflWaterGateOff = waterParams && g_reflWaterGate && (dryTerrain || dryScreen);
+            if (waterParams) {
+                ++g_reflWaterGateTotal;
+                if (g_reflWaterGateOff) { ++g_reflWaterGateSkips; }
+                // The panel readout: BOTH arms, side by side, and what each one saw rather than only
+                // what it decided. "0 wet of 287" and "1 wet of 287, nearest 18.4 cells" are the same
+                // decision and completely different evidence — and on the screen arm, a disarmed
+                // classifier and a dry view are the same 0 and completely different facts.
+                bformat(&g_reflWGateText,
+                        "W-gate %s | terrain: %u/%u cells wet%s | screen: %s, %u samples, dry %u/%.0f"
+                        " | skipped %u/%u",
+                        g_reflWaterGateOff ? "SKIPPING"
+                                           : (g_reflWaterGate ? "armed, pass RUNS" : "OFF (measuring)"),
+                        g_reflWaterCellsWet, g_reflWaterCellsSeen,
+                        (g_reflWaterNearest >= 0.0f) ? "" : " (DRY)",
+                        g_aplSplitRan ? "classifier ON" : "classifier OFF — arm is INERT",
+                        g_aplWaterSamplesLast, g_reflDryFrames,
+                        std::max(1.0f, g_reflWaterGateHold),
+                        g_reflWaterGateSkips, g_reflWaterGateTotal);
+                // GREEN while the frame is skippable, AMBER when the screen arm cannot answer at all
+                // (a disarmed classifier is the case that must never be read as a dry view), BLUE
+                // when there is genuinely water on screen.
+                g_reflWGateColor = !g_aplSplitRan ? float4(1.0f, 0.85f, 0.45f, 1.0f)
+                                 : (dryScreen || dryTerrain) ? float4(0.70f, 1.0f, 0.70f, 1.0f)
+                                                             : float4(0.70f, 0.85f, 1.0f, 1.0f);
+            }
+            if (g_drawReflect && g_live.reflectReady && waterEnabled && waterParams
+                && !g_reflWaterGateOff) {
                 dlReflectGeoCull(R, viewProj, fcbvR, dRel, eyeAbsZ, waterLevelAbs, underwater);
             } else {
                 g_reflGeoReady = false;
@@ -29023,6 +29923,11 @@ void destroyHostWindow(Renderer* R);
         // timestamps, and it had to see N-1's issue flags to do it. Clearing before that call
         // would zero every phase in the very readback that needs them.
         for (uint32_t i = 0; i < kGpuPhaseCount; ++i) { g_gpuPhaseIssued[i] = false; }
+        // G1f: and the grass-prepass latch, for the same reason and in the same place. A stale true
+        // here would make drawGrass pick the CMP_EQUAL pipeline on a frame whose prepass never ran,
+        // and EQUAL against depth nothing wrote draws NOTHING — grass would vanish for a frame
+        // rather than misdraw, which is the failure mode hardest to catch in a minimized harness.
+        g_grassPrepassRecorded = false;
         auto gpuPhaseBegin = [&](uint32_t i) {
             cpuPhaseT0[i] = hostNowMs();
             g_gpuPhaseIssued[i] = true;
@@ -29188,6 +30093,14 @@ void destroyHostWindow(Renderer* R);
         // SUN shadow A2: the second statics cull (sun ortho box, nearCut=0, Hi-Z off) → pSunArgs/
         // pSunInstOut for renderSunShadow. Pure compute here (no RT bound), same phase as the camera cull.
         dispatchSunCull();
+
+        // H2a: and the MIRROR's lane (mirror frustum, near cut + ownership + Hi-Z all off) ->
+        // pReflArgs/pReflInstOut for dlReflectRecordGeo. Same phase and same three pipelines. It
+        // must run AFTER dlReflectGeoCull published this frame's planes — that call is pre-beginCmd,
+        // so the ordering holds by construction. Default off (both `reflGpuCull` and
+        // `reflCullVerify` clear), in which case this is one predicted branch.
+        g_reflGpuCullRan = false;
+        dispatchReflCull();
 
         // G1a: and the grass lane(s), same phase and same three pipelines, over the grass instance
         // array. Runs unconditionally with the other culls rather than lazily from the draw, so the
@@ -30208,6 +31121,24 @@ void destroyHostWindow(Renderer* R);
             // record phase, so there is no second cull and no extra CPU work: this is the SAME
             // g_terrainMain the colour pass draws, one pipeline swap apart.
             terrainRecordDepth(g_live.pCmd);
+
+            // --- G1f HOST-OWNED GRASS, depth-only. AFTER terrain, and that ordering is the whole
+            // reason this is cheap: grass is a cutout whose every fragment costs a texture fetch,
+            // and by this point the near opaque set AND the ground it grows out of have written
+            // their depth, so a blade behind the hill is early-Z-rejected before this shader runs.
+            //
+            // It cannot early-reject its own layers — a cutout prepass is late-Z-WRITE by
+            // construction, since coverage is not known until the fetch — so what this converts is
+            // one full grass shade per overdrawn layer (a shadow tap plus the clustered point-light
+            // loop over two lists) into one texture fetch per overdrawn layer. The colour draw in
+            // the DL block then runs CMP_EQUAL and shades each pixel exactly once.
+            //
+            // Same set, same args, same vertex shader as that colour draw — one pipeline apart.
+            // The ...G brackets, not the local lambdas, so both halves of the grass trade are timed
+            // by identical machinery and `grassdep` vs `grass` is a like-for-like comparison.
+            gpuPhaseBeginG(kGpuPhaseGrassDepth);
+            grassRecordDepth(g_live.pCmd);
+            gpuPhaseEndG(kGpuPhaseGrassDepth);
 
             // --- STENCIL "FAKE HOLE" PORTALS, prepass half (see s_portal) ------------------------
             // Three sub-passes over the SAME list, filtered by role, so the object's own draw order
@@ -31346,7 +32277,13 @@ void destroyHostWindow(Renderer* R);
         // in SHADER_RESOURCE. Interior water therefore went on sampling the last EXTERIOR frame's sky
         // and landscape indefinitely. Running whenever water is on clears the RT every frame, so the
         // floor is an honest empty (fog-coloured) reflection instead of a frozen outdoor one.
-        const bool reflectOn = g_drawReflect && g_live.reflectReady && waterEnabled && waterParams;
+        // ...and the W-GATE, latched beside the CPU cull earlier this frame (g_reflWaterGateOff). The
+        // whole pass goes with it: the sky mirror, the reflected land + statics, the near scene AND
+        // the mip pyramid, which is the point — nothing samples pReflectColor in a view with no water
+        // surface in it. When it skips, the mirror keeps its last contents exactly as it does under
+        // drawReflect=0 (the pre-existing, documented stale-RT condition noted at the pyramid build).
+        const bool reflectOn = g_drawReflect && g_live.reflectReady && waterEnabled && waterParams
+                            && !g_reflWaterGateOff;
         // Gated-off frames still write the ReflGeo pair (adjacent = ~0) — an index the
         // frame never begins/ends reads back stale garbage at resolve.
         if (!reflectOn) {
@@ -35919,6 +36856,10 @@ void destroyHostWindow(Renderer* R);
                                           : nullptr;
                     const bool  splitOn = g_aplSplitWater && sp && lf
                                           && sp[kWaterFogPlaneFloat + 3] > 0.5f;
+                    // Published because the W-gate rides this classifier's output, and "0 water
+                    // samples" from a disarmed classifier is a different fact from "0 water samples
+                    // in a dry view". The gate refuses to engage on the first; the log names which.
+                    g_aplSplitRan = splitOn;
                     const float planeRelZ = (sp && lf) ? (sp[kWaterFogPlaneFloat + 0] - lf[58]) : 0.0f;
                     float p[28] = { (float)g_live.outWidth, (float)g_live.outHeight, (float)aplGrid,
                                     1.0f / (float)(aplGrid * aplGrid),
@@ -38285,7 +39226,15 @@ void destroyHostWindow(Renderer* R);
                          g_terrainEyeCellMissing ? "  (no LAND record within 1 cell of the eye)" : "");
             // Host-GPU-shrink sub-phases: WHERE inside color/reflect the ms live. sky+near+skin+mm+dl
             // ≈ color above (same frame's timestamps); refl sky = reflect − reflgeo.
-            LOG::logline(">> [forge-hb] gpu color sub: sky=%.2f nearfrox=%.2f(%s,n=%u) near=%.2f skin=%.2f mm=%.2f dl=%.2f alpha=%.2f glow=%.2f(%u,walk=%.2fms)"
+            // ⚠ `grass=` IS INSIDE `dl=`, and `grassdep=` is inside `prepass=` on the line above —
+            // drawGrass is recorded in the DL block and its Z-prepass half in the prepass block. Do
+            // not add them to anything. They are printed because grass had NO bracket of its own
+            // until G1f and was therefore invisible: `dl=4.48` for 0.23M triangles was read as a
+            // draw-call problem for a whole session, when DL + statics is 1.00 and the rest was
+            // grass. The pair also IS the G1f trade — grassdep buys grass's early-Z, so whether the
+            // prepass paid for itself is `grassdep + grass` now against `grass` alone at
+            // grassPrepass=0.
+            LOG::logline(">> [forge-hb] gpu color sub: sky=%.2f nearfrox=%.2f(%s,n=%u) near=%.2f skin=%.2f mm=%.2f dl=%.2f(grass=%.2f grassdep=%.2f %s) alpha=%.2f glow=%.2f(%u,walk=%.2fms)"
                          " volfog=%.2f(%s,steps=%u,waterclamp=%s) | refl geo=%.2f (refl sky=%.2f) ms",
                          g_lastGpuPhaseMs[kGpuPhaseColorSky],
                          g_lastGpuPhaseMs[kGpuPhaseFroxelNear],
@@ -38293,6 +39242,14 @@ void destroyHostWindow(Renderer* R);
                          g_lastGpuPhaseMs[kGpuPhaseColorNear],
                          g_lastGpuPhaseMs[kGpuPhaseColorSkin], g_lastGpuPhaseMs[kGpuPhaseColorMM],
                          g_lastGpuPhaseMs[kGpuPhaseColorDL],
+                         g_lastGpuPhaseMs[kGpuPhaseGrassColor],
+                         g_lastGpuPhaseMs[kGpuPhaseGrassDepth],
+                         // WHICH PIPELINE THE COLOUR DRAW ACTUALLY USED, not which one it was asked
+                         // for. "EQ" is the only proof the pair is live: a build where the depth PSO
+                         // failed non-fatally still logs grassPrepass=1 and still draws grass, just
+                         // with none of the win, and the ms alone cannot tell those apart.
+                         g_grassPrepassRecorded ? "EQ" : (g_grassPrepass ? "GEQUAL(prepass unavailable)"
+                                                                        : "GEQUAL(off)"),
                          g_lastGpuPhaseMs[kGpuPhaseColorAlpha],
                          g_lastGpuPhaseMs[kGpuPhaseColorGlow], g_lastGlowDrawn, g_lastGlowWalkMs,
                          // volfog "off" here means the PASS DID NOT RUN this frame (no sun map =
@@ -40040,6 +40997,31 @@ void destroyHostWindow(Renderer* R);
     // faces, so back-culling would delete half of every blade.
     Shader*   g_pGrassShader   = nullptr;
     Pipeline* g_pGrassPipeline = nullptr;
+    // G1f THE GRASS Z-PREPASS PAIR (2026-09-08). Grass was 3.74 ms of a 12.46 ms exterior frame —
+    // the single largest term — and essentially all of it was overdraw: a two-sided cutout several
+    // layers deep at every pixel, running the sun-shadow tap and the clustered point-light loop on
+    // every one of those layers, because a pass that writes depth AND decides its own SV_Coverage
+    // cannot resolve a fragment's depth until the shader has run (late-Z), so nothing could be
+    // early-rejected.
+    //
+    //   g_pGrassDepthPipeline — grass.vert (UNCHANGED, which is what makes SV_Position bit-identical)
+    //                           + grassdepth.frag. GEQUAL + depth-write, 0 render targets. Recorded
+    //                           inside the Z-prepass, AFTER terrain, so the ground and the near
+    //                           opaque set have already rejected the blades behind them.
+    //   g_pGrassPipelineEQ    — grass_eq.frag (the GRASS_EARLY_Z build of grass.frag): CMP_EQUAL +
+    //                           depth-write OFF. With no depth write there is nothing to defer, so
+    //                           the depth test runs EARLY and the pass shades one layer per pixel.
+    //                           The depth test also IS the cutout mask, which is why that variant
+    //                           exports no coverage of its own.
+    //
+    // Kept as SECOND pipelines rather than flipping the originals, for the reason g_pTerrainPipelineEQ
+    // gives: the prepass does not always run (either PSO may fail non-fatally, and `grassPrepass=0`
+    // is the A/B arm), and grass drawn EQUAL against depth nothing filled would draw NOTHING AT ALL.
+    // drawGrass picks per frame via grassPrepassRan().
+    Shader*   g_pGrassEqShader      = nullptr;
+    Pipeline* g_pGrassPipelineEQ    = nullptr;
+    Shader*   g_pGrassDepthShader   = nullptr;
+    Pipeline* g_pGrassDepthPipeline = nullptr;
     // ...and its sun caster (G1e): grass.vert paired with the EXISTING sunshadow_statics.frag. That
     // pairing is the whole reason grass.vert emits statics.vert's VSOutput field for field, and it is
     // what guarantees the shadow carries the identical wind displacement rather than detaching from
@@ -40528,6 +41510,11 @@ void destroyHostWindow(Renderer* R);
     // entry past that is a default-land position.
     struct TerrainCellCull {
         float    cx, cy, cz, r;      // bounding sphere, ABSOLUTE world
+        // The cell's MINIMUM terrain height, absolute world. NOT recoverable from the sphere — r
+        // folds in the horizontal half-diagonal (~5800 u), so cz - r sits far below any real ground
+        // and would answer "water" everywhere. The W-gate (reflWaterVisible) needs the true floor,
+        // so it is carried explicitly: one float per cell, built once with the rest of the table.
+        float    zLo;
         int32_t  gx, gy;             // cell grid coords
         uint32_t slot;               // DATA slot into the world buffers (default cells SHARE one)
         uint32_t nbr[4];             // CULL INDEX+1 of the -X, +X, -Y, +Y neighbour (0 = none)
@@ -41341,6 +42328,7 @@ void destroyHostWindow(Renderer* R);
             t.cy = (float)c.cellY * Terrain::kCellSize + half;
             t.cz = 0.5f * (zLo + zHi);
             t.r  = std::sqrt(2.0f * half * half + 0.25f * (zHi - zLo) * (zHi - zLo));
+            t.zLo = zLo;
             t.gx = c.cellX; t.gy = c.cellY;
             t.slot = s;
             const int32_t lx = c.cellX - g_terrainGridMinX;
@@ -41366,6 +42354,7 @@ void destroyHostWindow(Renderer* R);
                     t.cy = (float)t.gy * Terrain::kCellSize + half;
                     t.cz = zFlat;
                     t.r  = rFlat;
+                    t.zLo = zFlat;   // a flat sheet at -2048: its floor IS its height
                     t.slot = defaultSlot;
                     gridToCull[g] = (uint32_t)g_terrainCull.size() + 1u;
                     g_terrainCull.push_back(t);
@@ -41410,6 +42399,85 @@ void destroyHostWindow(Renderer* R);
         LOG::flush();
         g_terrainReady = true;
         return true;
+    }
+
+    // ═══ THE W-GATE — is there any water SURFACE in the camera's view? ═══════════════════════════
+    //
+    // See the knob block (g_reflWaterGate) for what this is for and why the source is the LAND
+    // records rather than H1's min-pyramid. This is the test itself.
+    //
+    // It reads g_terrainMain.visible, which the MAIN view's terrain cull filled earlier in this same
+    // frame (dlLiveCullAndBuild → terrainCullAndBuild, both pre-beginCmd) — so the footprint is
+    // exactly the set of cells the camera is drawing, at no extra cull cost. That reuse is also the
+    // whole risk surface, because every way that list can be INCOMPLETE is a way this test could say
+    // "no water" about water that is on screen. Each one is named and forced open below rather than
+    // left to be rediscovered as a frozen reflection.
+    //
+    // ⚠ WHAT IT CANNOT SEE: water past the DL draw distance. terrainCullAndBuild drops cells beyond
+    // maxView, so a sea that begins past the last drawn cell is invisible to this test while MW's
+    // water plane still reaches the horizon. That water is inside the fog, which is the argument for
+    // accepting it — but it is an argument about the LOOK, so it is written down here rather than
+    // asserted as correctness.
+    bool reflWaterVisible(const float eye[3], float waterLevelAbs, bool underwater) {
+        g_reflWaterCellsWet  = 0;
+        g_reflWaterCellsSeen = 0;
+        g_reflWaterNearest   = -1.0f;
+
+        // --- the forced-open cases. Each is a way the cell list is not the whole answer. -----------
+        auto keep = [&](const char* why) {
+            g_reflWaterGateWhy = why;
+            g_reflWaterInView  = true;
+            return true;
+        };
+        // Underwater the whole screen is water, and the camera is on the side of the surface this
+        // test does not model at all.
+        if (underwater)                       { return keep("underwater"); }
+        // An interior has no LAND records, so an empty visible list there means "no terrain data",
+        // not "no water" — and IR1 exists precisely because interior water needs the pass.
+        if (!g_dlExterior)                    { return keep("interior"); }
+        if (!g_terrainReady || !g_drawTerrain){ return keep("no terrain"); }
+        if (g_terrainCull.empty())            { return keep("no cull table"); }
+        // The near cut deletes cells around the camera — the ones most likely to hold visible water.
+        if (g_terrainNearCut)                 { return keep("near cut on"); }
+        // A truncated cull is a truncated answer. kTerrainMaxInst is 8192 against a ~3.9k-cell world
+        // so this cannot bite today, which is exactly why it has to be a test and not a comment.
+        if (g_terrainMain.visible.size() >= kTerrainMaxInst) { return keep("cull cap"); }
+        // No cells at all: the main cull has not run yet this session (frame 0), or the camera is
+        // outside the grid. Either way the list is not evidence of dry land.
+        if (g_terrainMain.visible.empty())    { return keep("no cells"); }
+
+        // --- the test ------------------------------------------------------------------------------
+        // BIAS TOWARD WATER: the plane sits `bias` units HIGHER than MW's level for this compare, so a
+        // cell whose floor grazes the surface counts as wet. The three heights MW disagrees about
+        // (mesh W∓5, underwater trip W−1, splashes higher still) all fall inside a bias of a few tens.
+        const float plane = waterLevelAbs + g_reflWaterGateBias;
+        // The range limit, in cells → world units. 0 disables it (consult everything the view draws).
+        const float maxD  = (g_reflWaterGateRange > 0.0f)
+                          ? g_reflWaterGateRange * Terrain::kCellSize : 0.0f;
+        const float maxD2 = maxD * maxD;
+        const float invCell = 1.0f / Terrain::kCellSize;
+
+        float nearest2 = 0.0f;
+        bool  wet = false;
+        for (uint32_t ci : g_terrainMain.visible) {
+            if (ci >= (uint32_t)g_terrainCull.size()) { continue; }
+            const TerrainCellCull& t = g_terrainCull[ci];
+            const float dx = t.cx - eye[0], dy = t.cy - eye[1];
+            const float d2 = dx * dx + dy * dy;
+            if (maxD2 > 0.0f && d2 > maxD2) { continue; }
+            ++g_reflWaterCellsSeen;
+            if (t.zLo >= plane) { continue; }
+            ++g_reflWaterCellsWet;
+            if (!wet || d2 < nearest2) { nearest2 = d2; wet = true; }
+        }
+        // Every cell was out of range — the range knob, not the terrain, produced this answer. Say so
+        // rather than reporting a dry view nobody measured.
+        if (g_reflWaterCellsSeen == 0) { return keep("range excluded all"); }
+
+        g_reflWaterNearest = wet ? std::sqrt(nearest2) * invCell : -1.0f;
+        g_reflWaterGateWhy = wet ? "wet cells" : "DRY";
+        g_reflWaterInView  = wet;
+        return wet;
     }
 
     // Per-frame cull: frustum-test every cell's sphere, pick a stride from distance, then write the
@@ -41791,6 +42859,79 @@ void destroyHostWindow(Renderer* R);
                 if (!g_pGrassPipeline) { std::printf("[forge][grass] addPipeline(grass) FAILED\n"); }
             } else {
                 std::printf("[forge][grass] addShader(grass) FAILED — grass disabled\n");
+            }
+
+            // G1f: the Z-PREPASS PAIR (see g_pGrassDepthPipeline). Both are built from the SAME
+            // grass.vert, the SAME vertex layout and the SAME CULL_MODE_NONE raster state as the
+            // colour PSO above — that is not tidiness, it is the correctness argument: SV_Position
+            // has to come out bit-identical or the colour pass's CMP_EQUAL rejects every pixel.
+            //
+            // Both are non-fatal. On either failure grassPrepassRan() goes false and drawGrass falls
+            // back to the single GEQUAL draw above, i.e. exactly today's behaviour.
+            {
+                RasterizerStateDesc rsGD = rs; rsGD.mCullMode = CULL_MODE_NONE;
+
+                // (a) DEPTH-ONLY. GEQUAL + depth-write, 0 RTs. NOT PS-less like the terrain prepass
+                // twin — grass is a cutout, so the coverage is not known until the texture is
+                // fetched and there has to be a frag to fetch it. grassdepth.frag is that fetch and
+                // nothing else.
+                ShaderLoadDesc gdd = {};
+                gdd.mVert.pFileName = "grass.vert";
+                gdd.mFrag.pFileName = "grassdepth.frag";
+                addShader(R, &gdd, &g_pGrassDepthShader);
+                if (g_pGrassDepthShader) {
+                    PipelineDesc dpd = {};
+                    dpd.mType = PIPELINE_TYPE_GRAPHICS;
+                    GraphicsPipelineDesc& dg = dpd.mGraphicsDesc;
+                    dg.mPrimitiveTopo      = PRIMITIVE_TOPO_TRI_LIST;
+                    dg.mRenderTargetCount  = 0;          // depth-only — no colour attachment
+                    dg.pColorFormats       = nullptr;
+                    dg.mSampleCount        = (SampleCount)g_live.sampleCount;
+                    dg.mSampleQuality      = 0;
+                    dg.mDepthStencilFormat = TinyImageFormat_D32_SFLOAT;
+                    dg.pDepthState         = &ds;        // GEQUAL + WRITE — this pass owns the depth
+                    dg.pVertexLayout       = &vl;
+                    dg.pRasterizerState    = &rsGD;
+                    dg.pShaderProgram      = g_pGrassDepthShader;
+                    addPipeline(R, &dpd, &g_pGrassDepthPipeline);
+                    if (!g_pGrassDepthPipeline) {
+                        std::printf("[forge][grass] addPipeline(grass depth) FAILED — no grass prepass\n");
+                    }
+                } else {
+                    std::printf("[forge][grass] addShader(grass depth) FAILED — no grass prepass\n");
+                }
+
+                // (b) the CMP_EQUAL COLOUR twin. Depth WRITE off as well as EQUAL: the prepass wrote
+                // this exact value at these exact samples, so re-writing it is pure traffic — and it
+                // is the write, not the test, that was forcing late-Z.
+                ShaderLoadDesc geq = {};
+                geq.mVert.pFileName = "grass.vert";
+                geq.mFrag.pFileName = "grass_eq.frag";
+                addShader(R, &geq, &g_pGrassEqShader);
+                if (g_pGrassEqShader) {
+                    DepthStateDesc dsEqG = ds;
+                    dsEqG.mDepthFunc  = CMP_EQUAL;
+                    dsEqG.mDepthWrite = false;
+                    PipelineDesc epd = {};
+                    epd.mType = PIPELINE_TYPE_GRAPHICS;
+                    GraphicsPipelineDesc& eg = epd.mGraphicsDesc;
+                    eg.mPrimitiveTopo      = PRIMITIVE_TOPO_TRI_LIST;
+                    eg.mRenderTargetCount  = 1;
+                    eg.pColorFormats       = &g_live.sceneColorFormat;
+                    eg.mSampleCount        = (SampleCount)g_live.sampleCount;
+                    eg.mSampleQuality      = 0;
+                    eg.mDepthStencilFormat = TinyImageFormat_D32_SFLOAT;
+                    eg.pDepthState         = &dsEqG;
+                    eg.pVertexLayout       = &vl;
+                    eg.pRasterizerState    = &rsGD;
+                    eg.pShaderProgram      = g_pGrassEqShader;
+                    addPipeline(R, &epd, &g_pGrassPipelineEQ);
+                    if (!g_pGrassPipelineEQ) {
+                        std::printf("[forge][grass] addPipeline(grass EQ) FAILED — no grass prepass\n");
+                    }
+                } else {
+                    std::printf("[forge][grass] addShader(grass_eq) FAILED — no grass prepass\n");
+                }
             }
 
             // G1e caster: grass.vert into the MSM moments atlas through the EXISTING
@@ -44180,6 +45321,85 @@ void destroyHostWindow(Renderer* R);
                          g_terrainRefl.drawCounts[0], g_terrainRefl.drawCounts[1],
                          g_terrainRefl.drawCounts[2], g_terrainRefl.drawCounts[3],
                          g_terrainRefl.drawCounts[4], g_terrainRefl.drawCounts[5]);
+            // THE W-GATE, and UNLIKE the two rows below it this one prints ALWAYS. The lane rows are
+            // silent when un-armed because a row of zeroes from a lane nobody armed is noise; this one
+            // is the opposite case — the gate is an instrument first, it runs whether or not it is
+            // allowed to act, and the whole question it exists to settle ("would it ever fire, and if
+            // not, how far away is the water holding it open") is only answerable from sessions where
+            // nobody armed it. `skipped=` is the claim that the ARM took; `wet/seen` and `nearest` are
+            // what decides whether the range knob is worth having.
+            {
+                const double pct = g_reflWaterGateTotal
+                                 ? (100.0 * (double)g_reflWaterGateSkips / (double)g_reflWaterGateTotal)
+                                 : 0.0;
+                char nearBuf[32];
+                if (g_reflWaterNearest >= 0.0f) {
+                    std::snprintf(nearBuf, sizeof(nearBuf), "%.1f cells", g_reflWaterNearest);
+                } else {
+                    std::snprintf(nearBuf, sizeof(nearBuf), "none");
+                }
+                LOG::logline(">> [forge-hb][refl-wgate] knob=%d | TERRAIN arm: water in view=%d (%s),"
+                             " wet=%u of %u cells, nearest=%s, plane=W%+.0f range=%s"
+                             " | SCREEN arm: classifier=%s, waterSamples=%u of 16384, dryFrames=%u"
+                             " (hold %.0f)"
+                             " | skipped %u/%u frames (%.1f%%)"
+                             "  [terrain wet = the cell's MINIMUM ground is under the plane, and a"
+                             " 128 u channel makes a whole 8192 u cell wet — it is the CONSERVATIVE"
+                             " arm, not the one that fires. classifier=OFF makes waterSamples=0"
+                             " meaningless and the screen arm refuses to engage on it]",
+                             (int)g_reflWaterGate, (int)g_reflWaterInView, g_reflWaterGateWhy,
+                             g_reflWaterCellsWet, g_reflWaterCellsSeen, nearBuf,
+                             g_reflWaterGateBias,
+                             (g_reflWaterGateRange > 0.0f) ? "limited" : "full DL",
+                             g_aplSplitRan ? "ON" : "OFF",
+                             g_aplWaterSamplesLast, g_reflDryFrames,
+                             std::max(1.0f, g_reflWaterGateHold),
+                             g_reflWaterGateSkips, g_reflWaterGateTotal, pct);
+            }
+            // H2a: the LANE's own row, its own line, and only while one of its two arms is on — a
+            // row of zeroes from a lane nobody armed is worse than silence (the occprobe rule).
+            //
+            // `ran=` is the claim that matters. `reflGpuCull=1` says the knob was set; it does not
+            // say dispatchReflCull got past its six gates, and a lane that silently never dispatched
+            // would leave the draw on the CPU rings and report a perfectly plausible frame — the
+            // `waterNoReflect` failure exactly. `cmds=` is the command wall, printed as the number
+            // it is: the compacted CPU count beside the GPU one, so the eighth payment of the wall
+            // is a figure in the log rather than an argument in a plan file.
+            if (g_reflGpuCull || g_reflCullVerify) {
+                const char* verdict = !g_reflCullVerify ? "(verify off — no CPU count to compare)"
+                                    : g_reflCullMismatches ? "MISMATCH"
+                                    : g_reflCullMatchFrames ? "MATCH"
+                                                            : "(no settle yet)";
+                LOG::logline(">> [forge-hb][refl-gpucull] knob=%d verify=%d ran=%d ready=%d"
+                             " | survivors gpu=%u cpu=%u %s (match=%u mismatch=%u)"
+                             " | cmds gpu=%u cpu=%u  (the INDIRECT-COMMAND WALL: the GPU lane issues"
+                             " one command per subset, survivors or not)",
+                             (int)g_reflGpuCull, (int)g_reflCullVerify, (int)g_reflGpuCullRan,
+                             (int)g_live.reflCullReady,
+                             g_lastReflGpuCullCount, g_reflCpuCullPrev, verdict,
+                             g_reflCullMatchFrames, g_reflCullMismatches,
+                             g_live.cullSubsetCount, g_liveLastSubsetsRefl);
+                // H2b's own row. `armed=` is the claim, and it is NOT the knob: the publish requires
+                // the field to be valid, the pyramid built and its levels present, so a knob set on a
+                // frame after a snap crossing can read armed=0 and that is the honest answer.
+                // `occluded/` against `survivors` is the YIELD — the number H0 predicted at 84-87%,
+                // now measured in the lane rather than in a probe beside it.
+                if (g_reflHeightOcc) {
+                    const uint32_t surv = g_lastReflGpuCullCount;
+                    LOG::logline(">> [forge-hb][refl-heightocc] knob=%d armed=%d | occluded=%u of"
+                                 " frustum survivors=%u (%.1f%%) | %.0f taps @ pyramid L%.0f"
+                                 " bias=%.0f margin=%.0f u | field valid=%d pyramid valid=%d"
+                                 "  [CONE test: ~81%% here. A figure near 87%% means the horizontal"
+                                 " widening is NOT running and the cull is back to one ray = FALSE"
+                                 " POSITIVES, holes in the mirror showing the sky behind]",
+                                 (int)g_reflHeightOcc, (int)g_reflHeightOccArmed,
+                                 g_lastReflHeightOccluded, surv,
+                                 surv ? (100.0 * (double)g_lastReflHeightOccluded / (double)surv) : 0.0,
+                                 std::max(1.0f, g_reflHeightOccSteps), g_reflHeightOccLevel,
+                                 g_reflHeightOccBias, g_reflHeightOccMargin,
+                                 (int)g_skyHeightValid, (int)g_skyHeightMinValid);
+                }
+            }
         }
         // H0: the occlusion probe. ⚠ THE WORD "UPPER" IS LOAD-BEARING AND IT IS IN THE LINE. Both
         // maps are MAX fields — a texel that is half building and half street stores the roof — so
@@ -44196,12 +45416,31 @@ void destroyHostWindow(Renderer* R);
             // ⚠ AT minR=0 THE TWO MUST BE EQUAL. min over a 1x1 IS the sample, so a disagreement
             // there means the two arms are not testing the same ray and nothing else on this line
             // can be trusted. It is the self-check, and it is one env token away.
-            LOG::logline(">> [forge-hb][occprobe] BRACKET [floor = H1's min@r%d, ceiling = raw max field]:"
+            // WHICH FLOOR ARM RAN, named in the line itself. The two are different implementations
+            // of the same reduction and they do NOT produce identical numbers (aligned block vs
+            // centred window), so a line that did not say which one produced this floor would be a
+            // number nobody could place — the `waterNoReflect` lesson, applied to an instrument.
+            char floorArm[64];
+            const int pyrLvl = (int)g_occProbePyr;
+            const bool pyrRan = g_live.skyHeightMinReady && g_skyHeightMinValid && pyrLvl >= 1;
+            if (pyrRan) {
+                std::snprintf(floorArm, sizeof(floorArm), "H1 PYRAMID L%d (%d texels)",
+                              pyrLvl, 1 << pyrLvl);
+            } else if (pyrLvl >= 1) {
+                std::snprintf(floorArm, sizeof(floorArm), "gather r%d [occProbePyr=%d IGNORED: pyramid %s]",
+                              (int)std::max(0.0f, g_occProbeMinR), pyrLvl,
+                              g_live.skyHeightMinReady ? "not built yet" : "MISSING");
+            } else {
+                std::snprintf(floorArm, sizeof(floorArm), "gather r%d",
+                              (int)std::max(0.0f, g_occProbeMinR));
+            }
+            LOG::logline(">> [forge-hb][occprobe] BRACKET [floor = %s, ceiling = raw max field]:"
                          " sun tested=%u rejected %u..%u (%.1f..%.1f%%)"
                          " | mirror tested=%u rejected %u..%u (%.1f..%.1f%%)"
                          " | ready=%d sunOccValid=%d skyHeightValid=%d reflGeo=%d"
+                         " | pyramid ready=%d valid=%d mips=%u builds=%u"
                          " | march=%.0f steps bias=%.0f margin=%.0f u%s",
-                         (int)std::max(0.0f, g_occProbeMinR),
+                         floorArm,
                          g_occProbeTested[0], g_occProbeRejMin[0], g_occProbeRejected[0],
                          pct(g_occProbeRejMin[0], g_occProbeTested[0]),
                          pct(g_occProbeRejected[0], g_occProbeTested[0]),
@@ -44210,8 +45449,10 @@ void destroyHostWindow(Renderer* R);
                          pct(g_occProbeRejected[1], g_occProbeTested[1]),
                          (int)g_live.occProbeReady, (int)g_sunOccValid, (int)g_skyHeightValid,
                          (int)g_reflGeoReady,
+                         (int)g_live.skyHeightMinReady, (int)g_skyHeightMinValid,
+                         g_live.skyHeightMinMips, g_skyHeightMinBuilds,
                          g_occProbeSteps, g_occProbeBias, g_occProbeMargin,
-                         (g_occProbeMinR < 0.5f) ? "  [minR=0: the two arms MUST agree]" : "");
+                         (!pyrRan && g_occProbeMinR < 0.5f) ? "  [minR=0: the two arms MUST agree]" : "");
         }
         // G1 grass. `dispatched` is the density prefix (a knob), `drawn` the frustum+range survivors
         // (the scene), and `ring` how close the second is to the ceiling past which cullscatter
@@ -45402,6 +46643,37 @@ void destroyHostWindow(Renderer* R);
         addResource(&sb, nullptr);
 
         // (7) Per-subset uint UAVs (count/offset/cursor). Structured stride-4 (the proven B2 pattern).
+        // H2b: both HeightOccParams cbuffers, created BEFORE any cull set is filled — every one of
+        // the six binds them, so a lane built before they exist would bind null.
+        {
+            auto addHeightOccCbv = [&](Buffer** out, const char* name) {
+                BufferLoadDesc hb = {};
+                hb.mDesc.mDescriptors = DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+                hb.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_CPU_TO_GPU;
+                hb.mDesc.mFlags       = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
+                hb.mDesc.mSize        = 256;          // 3 float4 — min CBV size
+                hb.mDesc.pName        = name;
+                hb.ppBuffer           = out;
+                addResource(&hb, nullptr);
+            };
+            addHeightOccCbv(&g_live.pHeightOccCbvOff,  "heightOccParamsOff");
+            addHeightOccCbv(&g_live.pHeightOccCbvRefl, "heightOccParamsRefl");
+            waitForAllResourceLoads();
+            // The DISARMED buffer, written once and never again. Zeroing arm.x is the whole contract
+            // for the five lanes that bind it, and writing it here — rather than trusting the
+            // allocation to be zero — is the [[feedback_clear_reserved_lanes_before_writing_them]]
+            // rule: a lane that read uninitialised memory would arm the test on whichever machine
+            // happened to hand back a nonzero byte.
+            if (g_live.pHeightOccCbvOff && g_live.pHeightOccCbvOff->pCpuMappedAddress) {
+                std::memset(g_live.pHeightOccCbvOff->pCpuMappedAddress, 0, 256);
+            }
+            // ...and the mirror's, ALSO zeroed at create. It is refreshed per frame while armed, but
+            // a frame where dispatchReflCull runs before the first fill would otherwise read garbage.
+            if (g_live.pHeightOccCbvRefl && g_live.pHeightOccCbvRefl->pCpuMappedAddress) {
+                std::memset(g_live.pHeightOccCbvRefl->pCpuMappedAddress, 0, 256);
+            }
+        }
+
         auto addSubsetUav = [&](Buffer** out, const char* name) {
             BufferLoadDesc bd = {};
             bd.mDesc.mDescriptors  = DESCRIPTOR_TYPE_RW_BUFFER;
@@ -45499,7 +46771,7 @@ void destroyHostWindow(Renderer* R);
         addDescriptorSet(R, &cset, &g_live.pCullSet);
         if (!g_live.pCullSet) { std::printf("[forge][cull] addDescriptorSet FAILED\n"); return false; }
         {
-            DescriptorData d[10] = {};
+            DescriptorData d[12] = {};
             uint32_t n = 0;
             d[n].mIndex   = SRT_RES_IDX(CullSrtData, PerBatch, gCullParams);
             d[n].ppBuffers = &g_live.pCullParamsCbv; ++n;
@@ -45526,6 +46798,16 @@ void destroyHostWindow(Renderer* R);
             d[n].mIndex = SRT_RES_IDX(CullSrtData, PerBatch, gCullHiz);
             d[n].mCount = 1;
             d[n].ppTextures = g_live.pHiz ? &g_live.pHiz : &g_live.pLinearDepth; ++n;
+            // H2b: the height-field occlusion test's cbuffer + H1's min-pyramid. EVERY lane binds
+            // BOTH — the DISARMED cbuffer (arm.x = 0, written once at create). Binding
+            // nothing would leave these slots reading whatever the heap last held there, which is
+            // the failure mode the moment someone arms the test by accident.
+            d[n].mIndex = SRT_RES_IDX(CullSrtData, PerBatch, gHeightOccParams);
+            d[n].ppBuffers = &g_live.pHeightOccCbvOff; ++n;
+            d[n].mIndex = SRT_RES_IDX(CullSrtData, PerBatch, gSkyHeightMin);
+            d[n].mCount = 1;
+            d[n].ppTextures = g_live.pSkyHeightMin ? &g_live.pSkyHeightMin
+                                                           : &g_live.pSkyHeight->pTexture; ++n;
             updateDescriptorSet(R, 0, g_live.pCullSet, n, d);
         }
 
@@ -45587,7 +46869,7 @@ void destroyHostWindow(Renderer* R);
                 DescriptorSetDesc sset = SRT_SET_DESC(CullSrtData, PerBatch, 1, 0);
                 addDescriptorSet(R, &sset, &g_live.pSunCullSet);
                 if (g_live.pSunCullSet) {
-                    DescriptorData sd[10] = {};
+                    DescriptorData sd[12] = {};
                     uint32_t sn = 0;
                     sd[sn].mIndex = SRT_RES_IDX(CullSrtData, PerBatch, gCullParams);
                     sd[sn].ppBuffers = &g_live.pSunCullParamsCbv; ++sn;
@@ -45610,12 +46892,138 @@ void destroyHostWindow(Renderer* R);
                     sd[sn].mIndex = SRT_RES_IDX(CullSrtData, PerBatch, gCullHiz);
                     sd[sn].mCount = 1;
                     sd[sn].ppTextures = g_live.pHiz ? &g_live.pHiz : &g_live.pLinearDepth; ++sn;   // inert (hiz off)
+                    // H2b: the height-field occlusion test's cbuffer + H1's min-pyramid. EVERY lane binds
+                    // BOTH — the DISARMED cbuffer (arm.x = 0, written once at create). Binding
+                    // nothing would leave these slots reading whatever the heap last held there, which is
+                    // the failure mode the moment someone arms the test by accident.
+                    sd[sn].mIndex = SRT_RES_IDX(CullSrtData, PerBatch, gHeightOccParams);
+                    sd[sn].ppBuffers = &g_live.pHeightOccCbvOff; ++sn;
+                    sd[sn].mIndex = SRT_RES_IDX(CullSrtData, PerBatch, gSkyHeightMin);
+                    sd[sn].mCount = 1;
+                    sd[sn].ppTextures = g_live.pSkyHeightMin ? &g_live.pSkyHeightMin
+                                                                   : &g_live.pSkyHeight->pTexture; ++sn;
                     updateDescriptorSet(R, 0, g_live.pSunCullSet, sn, sd);
                     g_live.sunCullReady = true;
                     std::printf("[forge][cull] SUN cull ready (A2): subsets=%u\n", subsetCount);
                 }
             }
             if (!g_live.sunCullReady) { std::printf("[forge][cull] SUN cull alloc FAILED — falls back to camera-culled (A1)\n"); }
+        }
+
+        // H2a: the WATER MIRROR's cull lane. Verbatim the sun clone above (own output buffers +
+        // params CBV + set; shares gCullInst / gStaticsSubsets / the zero staging / all three
+        // pipelines), PLUS a readback buffer the sun lane does not have — because this lane's whole
+        // acceptance is that its survivor count MATCHES the CPU cull it replaces, and a lane whose
+        // rule silently disagreed would make everything downstream meaningless. The camera lane
+        // already established that idiom (gpuCull=11061 MATCH); this is the second user of it.
+        //
+        // Non-fatal: on any failure reflCullReady stays false and the reflect draw keeps using the
+        // CPU rings, which is the pre-H2a behaviour exactly.
+        {
+            BufferLoadDesc rpc = {};
+            rpc.mDesc.mDescriptors = DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+            rpc.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_CPU_TO_GPU;
+            rpc.mDesc.mFlags       = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
+            rpc.mDesc.mSize        = 512;                     // matches the camera CullParams (512B)
+            rpc.mDesc.pName        = "reflCullParamsCbv";
+            rpc.ppBuffer           = &g_live.pReflCullParamsCbv;
+            addResource(&rpc, nullptr);
+
+            BufferLoadDesc rcc = {};
+            rcc.mDesc.mDescriptors  = DESCRIPTOR_TYPE_RW_BUFFER;
+            rcc.mDesc.mMemoryUsage  = RESOURCE_MEMORY_USAGE_GPU_ONLY;
+            rcc.mDesc.mStructStride = sizeof(uint32_t);
+            rcc.mDesc.mElementCount = 4;
+            rcc.mDesc.mSize         = (uint64_t)sizeof(uint32_t) * 4;
+            rcc.mDesc.mStartState   = RESOURCE_STATE_UNORDERED_ACCESS;
+            rcc.mDesc.pName         = "reflCullCount";
+            rcc.ppBuffer            = &g_live.pReflCullCount;
+            addResource(&rcc, nullptr);
+
+            // ⚠ NO mDescriptors ON A GPU_TO_CPU BUFFER — a readback that also asks for a descriptor
+            //   is a host that dies silently (the note the mbStats and occProbe pairs both carry).
+            BufferLoadDesc rrb = {};
+            rrb.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_GPU_TO_CPU;
+            rrb.mDesc.mFlags       = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
+            rrb.mDesc.mSize        = 16;
+            rrb.mDesc.mStartState  = RESOURCE_STATE_COPY_DEST;
+            rrb.mDesc.pName        = "reflCullReadback";
+            rrb.ppBuffer           = &g_live.pReflCullReadback;
+            addResource(&rrb, nullptr);
+
+            addSubsetUav(&g_live.pReflSubsetCount,  "reflSubsetCount");
+            addSubsetUav(&g_live.pReflSubsetOffset, "reflSubsetOffset");
+            addSubsetUav(&g_live.pReflSubsetCursor, "reflSubsetCursor");
+
+            BufferLoadDesc rab = {};
+            rab.mDesc.mDescriptors  = (DescriptorType)(DESCRIPTOR_TYPE_RW_BUFFER | DESCRIPTOR_TYPE_INDIRECT_BUFFER);
+            rab.mDesc.mMemoryUsage  = RESOURCE_MEMORY_USAGE_GPU_ONLY;
+            rab.mDesc.mStructStride = sizeof(uint32_t);
+            rab.mDesc.mElementCount = subsetCount * 5u;
+            rab.mDesc.mSize         = (uint64_t)sizeof(uint32_t) * subsetCount * 5u;
+            rab.mDesc.mStartState   = RESOURCE_STATE_UNORDERED_ACCESS;
+            rab.mDesc.pName         = "reflCullArgs";
+            rab.ppBuffer            = &g_live.pReflArgs;
+            addResource(&rab, nullptr);
+
+            BufferLoadDesc rob = {};
+            rob.mDesc.mDescriptors  = (DescriptorType)(DESCRIPTOR_TYPE_RW_BUFFER | DESCRIPTOR_TYPE_VERTEX_BUFFER);
+            rob.mDesc.mMemoryUsage  = RESOURCE_MEMORY_USAGE_GPU_ONLY;
+            rob.mDesc.mStructStride = sizeof(uint32_t);
+            rob.mDesc.mElementCount = kLiveMaxInst * 20u;
+            rob.mDesc.mSize         = (uint64_t)sizeof(uint32_t) * kLiveMaxInst * 20u;
+            rob.mDesc.mStartState   = RESOURCE_STATE_UNORDERED_ACCESS;
+            rob.mDesc.pName         = "reflCullInstOut";
+            rob.ppBuffer            = &g_live.pReflInstOut;
+            addResource(&rob, nullptr);
+
+            waitForAllResourceLoads();
+
+            if (g_live.pReflCullParamsCbv && g_live.pReflCullCount && g_live.pReflCullReadback
+                && g_live.pReflSubsetCount && g_live.pReflSubsetOffset && g_live.pReflSubsetCursor
+                && g_live.pReflArgs && g_live.pReflInstOut) {
+                DescriptorSetDesc rset = SRT_SET_DESC(CullSrtData, PerBatch, 1, 0);
+                addDescriptorSet(R, &rset, &g_live.pReflCullSet);
+                if (g_live.pReflCullSet) {
+                    DescriptorData rd[12] = {};
+                    uint32_t rn = 0;
+                    rd[rn].mIndex = SRT_RES_IDX(CullSrtData, PerBatch, gCullParams);
+                    rd[rn].ppBuffers = &g_live.pReflCullParamsCbv; ++rn;
+                    rd[rn].mIndex = SRT_RES_IDX(CullSrtData, PerBatch, gCullInst);
+                    rd[rn].mCount = 1; rd[rn].ppBuffers = &g_live.pCullInstBuf; ++rn;      // shared input
+                    rd[rn].mIndex = SRT_RES_IDX(CullSrtData, PerBatch, gCullCount);
+                    rd[rn].mCount = 1; rd[rn].ppBuffers = &g_live.pReflCullCount; ++rn;
+                    rd[rn].mIndex = SRT_RES_IDX(CullSrtData, PerBatch, gStaticsSubsets);
+                    rd[rn].mCount = 1; rd[rn].ppBuffers = &g_live.pStaticsSubsetBuf; ++rn; // shared input
+                    rd[rn].mIndex = SRT_RES_IDX(CullSrtData, PerBatch, gSubsetCount);
+                    rd[rn].mCount = 1; rd[rn].ppBuffers = &g_live.pReflSubsetCount; ++rn;
+                    rd[rn].mIndex = SRT_RES_IDX(CullSrtData, PerBatch, gSubsetOffset);
+                    rd[rn].mCount = 1; rd[rn].ppBuffers = &g_live.pReflSubsetOffset; ++rn;
+                    rd[rn].mIndex = SRT_RES_IDX(CullSrtData, PerBatch, gSubsetCursor);
+                    rd[rn].mCount = 1; rd[rn].ppBuffers = &g_live.pReflSubsetCursor; ++rn;
+                    rd[rn].mIndex = SRT_RES_IDX(CullSrtData, PerBatch, gArgs);
+                    rd[rn].mCount = 1; rd[rn].ppBuffers = &g_live.pReflArgs; ++rn;
+                    rd[rn].mIndex = SRT_RES_IDX(CullSrtData, PerBatch, gInstOut);
+                    rd[rn].mCount = 1; rd[rn].ppBuffers = &g_live.pReflInstOut; ++rn;
+                    rd[rn].mIndex = SRT_RES_IDX(CullSrtData, PerBatch, gCullHiz);
+                    rd[rn].mCount = 1;
+                    rd[rn].ppTextures = g_live.pHiz ? &g_live.pHiz : &g_live.pLinearDepth; ++rn;  // inert (hiz off)
+                    // H2b: the height-field occlusion test's cbuffer + H1's min-pyramid. EVERY lane binds
+                    // BOTH — this lane ARMS it (arm.x = 1, refreshed per frame). Binding
+                    // nothing would leave these slots reading whatever the heap last held there, which is
+                    // the failure mode the moment someone arms the test by accident.
+                    rd[rn].mIndex = SRT_RES_IDX(CullSrtData, PerBatch, gHeightOccParams);
+                    rd[rn].ppBuffers = &g_live.pHeightOccCbvRefl; ++rn;
+                    rd[rn].mIndex = SRT_RES_IDX(CullSrtData, PerBatch, gSkyHeightMin);
+                    rd[rn].mCount = 1;
+                    rd[rn].ppTextures = g_live.pSkyHeightMin ? &g_live.pSkyHeightMin
+                                                                   : &g_live.pSkyHeight->pTexture; ++rn;
+                    updateDescriptorSet(R, 0, g_live.pReflCullSet, rn, rd);
+                    g_live.reflCullReady = true;
+                    std::printf("[forge][cull] REFLECT cull ready (H2a): subsets=%u\n", subsetCount);
+                }
+            }
+            if (!g_live.reflCullReady) { std::printf("[forge][cull] REFLECT cull alloc FAILED — mirror keeps the CPU rings\n"); }
         }
 
         // SH2 Stage B: a THIRD statics cull, for the sky-height map's statics layer. Same clone as
@@ -45687,7 +47095,7 @@ void destroyHostWindow(Renderer* R);
                 DescriptorSetDesc kset = SRT_SET_DESC(CullSrtData, PerBatch, 1, 0);
                 addDescriptorSet(R, &kset, &g_live.pSkyCullSet);
                 if (g_live.pSkyCullSet) {
-                    DescriptorData kd[10] = {};
+                    DescriptorData kd[12] = {};
                     uint32_t kn = 0;
                     kd[kn].mIndex = SRT_RES_IDX(CullSrtData, PerBatch, gCullParams);
                     kd[kn].ppBuffers = &g_live.pSkyCullParamsCbv; ++kn;
@@ -45710,6 +47118,16 @@ void destroyHostWindow(Renderer* R);
                     kd[kn].mIndex = SRT_RES_IDX(CullSrtData, PerBatch, gCullHiz);
                     kd[kn].mCount = 1;
                     kd[kn].ppTextures = g_live.pHiz ? &g_live.pHiz : &g_live.pLinearDepth; ++kn;  // inert (hiz off)
+                    // H2b: the height-field occlusion test's cbuffer + H1's min-pyramid. EVERY lane binds
+                    // BOTH — the DISARMED cbuffer (arm.x = 0, written once at create). Binding
+                    // nothing would leave these slots reading whatever the heap last held there, which is
+                    // the failure mode the moment someone arms the test by accident.
+                    kd[kn].mIndex = SRT_RES_IDX(CullSrtData, PerBatch, gHeightOccParams);
+                    kd[kn].ppBuffers = &g_live.pHeightOccCbvOff; ++kn;
+                    kd[kn].mIndex = SRT_RES_IDX(CullSrtData, PerBatch, gSkyHeightMin);
+                    kd[kn].mCount = 1;
+                    kd[kn].ppTextures = g_live.pSkyHeightMin ? &g_live.pSkyHeightMin
+                                                                   : &g_live.pSkyHeight->pTexture; ++kn;
                     updateDescriptorSet(R, 0, g_live.pSkyCullSet, kn, kd);
                     g_live.skyCullReady = true;
                     std::printf("[forge][cull] SKY-HEIGHT cull ready (SH2 stage B): subsets=%u\n", subsetCount);
@@ -45876,7 +47294,7 @@ void destroyHostWindow(Renderer* R);
                 DescriptorSetDesc dsd = SRT_SET_DESC(CullSrtData, PerBatch, 1, 0);
                 addDescriptorSet(R, &dsd, set);
                 if (!*set) { return false; }
-                DescriptorData d[10] = {};
+                DescriptorData d[12] = {};
                 uint32_t n = 0;
                 d[n].mIndex = SRT_RES_IDX(CullSrtData, PerBatch, gCullParams);
                 d[n].ppBuffers = params; ++n;
@@ -45899,6 +47317,16 @@ void destroyHostWindow(Renderer* R);
                 d[n].mIndex = SRT_RES_IDX(CullSrtData, PerBatch, gCullHiz);
                 d[n].mCount = 1;
                 d[n].ppTextures = g_live.pHiz ? &g_live.pHiz : &g_live.pLinearDepth; ++n;
+                // H2b: the height-field occlusion test's cbuffer + H1's min-pyramid. EVERY lane binds
+                // BOTH — the DISARMED cbuffer (arm.x = 0, written once at create). Binding
+                // nothing would leave these slots reading whatever the heap last held there, which is
+                // the failure mode the moment someone arms the test by accident.
+                d[n].mIndex = SRT_RES_IDX(CullSrtData, PerBatch, gHeightOccParams);
+                d[n].ppBuffers = &g_live.pHeightOccCbvOff; ++n;
+                d[n].mIndex = SRT_RES_IDX(CullSrtData, PerBatch, gSkyHeightMin);
+                d[n].mCount = 1;
+                d[n].ppTextures = g_live.pSkyHeightMin ? &g_live.pSkyHeightMin
+                                                               : &g_live.pSkyHeight->pTexture; ++n;
                 updateDescriptorSet(R, 0, *set, n, d);
                 return true;
             };
@@ -46318,19 +47746,35 @@ void destroyHostWindow(Renderer* R);
         const float nearCut  = (T.suppressNearCut || cellOwn) ? 0.0f : (fd[51] - 768.0f);
         const float nearCut2 = nearCut * nearCut;
 
-        // When the GPU cull drives the PRIMARY statics draw (g_gpuStaticsCull), skip this whole CPU
-        // cell-walk + ring-fill — the 3-pass compute (count->prefix->scatter) does it on the GPU. The
-        // reflect path (primary=false) + the A/B-off case still run the full CPU cull below.
-        const bool cpuStaticsCull = !(T.primary && g_gpuStaticsCull);
+        // When a GPU cull lane drives the statics draw, skip this whole CPU cell-walk + ring-fill —
+        // the 3-pass compute (count->prefix->scatter) does it on the GPU. Two lanes now qualify:
+        // g_gpuStaticsCull for the PRIMARY view, and H2a's g_reflGpuCull for the MIRROR.
+        //
+        // ⚠ ONLY THE STATICS HALF IS SKIPPED. terrainCullAndBuild ran ABOVE this point (it builds
+        // g_terrainRefl and applies T.lodBias, and the mirror's terrain has no GPU lane), and the
+        // reflect cull's planes/eye/ranges are published BELOW the else-block that this gates — so
+        // both survive the skip. That is what dispatchReflCull reads its frustum out of, so getting
+        // this wrong would not fail loudly, it would cull the mirror against a stale frame.
+        //
+        // ⚠ `reflCullVerify` deliberately does NOT skip: the whole point of that arm is that the CPU
+        // number still exists to compare the lane against.
+        const bool cpuStaticsCull = !((T.primary && g_gpuStaticsCull)
+                                   || (!T.primary && g_reflGpuCull && g_live.reflCullReady));
         uint32_t cellsHit = 0, examined = 0;             // slow-frame diagnostics
         bool overflow = false;
         if (!cpuStaticsCull) {
-            // GPU drives the primary statics draw; skip the CPU cell-walk + ring fill entirely.
+            // GPU drives this view's statics draw; skip the CPU cell-walk + ring fill entirely.
             *T.lastSubsets = 0;
             if (T.lastInst) { *T.lastInst = 0; }
-            g_liveLastInst = g_lastGpuCullCount;   // panel: prev-frame GPU survivor readback (Σ numSubsets)
-            g_liveLastSubsets = 0;
-            g_lastCullExamined = 0;
+            if (T.primary) {
+                g_liveLastInst = g_lastGpuCullCount;   // panel: prev-frame GPU survivor readback (Σ numSubsets)
+                g_liveLastSubsets = 0;
+                g_lastCullExamined = 0;
+            }
+            // The mirror writes NOTHING into the primary globals — *T.lastSubsets / *T.lastInst
+            // already point at the reflect pair, and clobbering g_liveLastInst here would overwrite
+            // the CAMERA's survivor count with the mirror's skip, i.e. delete the main view's own
+            // parity readout on every frame this arm is on.
         } else {
         for (const LiveGridCell& c : g_liveGrid) {
             // Cell sphere (relative): center of the padded AABB, radius = half-diagonal + extent pad.
@@ -46694,38 +48138,89 @@ void destroyHostWindow(Renderer* R);
         // bound. AFTER the statics draw rather than before, on the ordinary early-Z argument: grass
         // is a cutout that fails a lot of its fragments, so letting the opaque world lay down depth
         // first kills the blades hidden behind a wall before their alpha is ever fetched.
+        //
+        // G1f: under grassPrepass this draw is CMP_EQUAL against depth grassRecordDepth already
+        // wrote, so the ordering argument above is now belt-and-braces rather than the mechanism —
+        // the depth test rejects an occluded blade whatever order the block runs in.
+        gpuPhaseBeginG(kGpuPhaseGrassColor);
         drawGrass();
+        gpuPhaseEndG(kGpuPhaseGrassColor);
 
         cmdEndDebugMarker(g_live.pCmd);
     }
 
-    // G1: the grass colour draw. Its own pipeline (CULL_NONE — two-sided crossed quads) over its own
-    // indirect args and instance ring, which is ~27 commands rather than the statics lane's 10,910.
-    // Everything else is the statics binding set verbatim: the mega VB/IB and the bindless statics
-    // texture arrays, because grass IS a distant static as far as the bake is concerned.
-    void drawGrass() {
-        if (!g_drawGrass || !g_pGrassPipeline || !g_live.grassCullReady) { return; }
-        if (!g_live.grassArgsInDrawState || !g_grassSubsetCount) { return; }
+    // ============================ G1 GRASS SUBMISSION (prepass + colour) ==========================
+    // Everything below shares one binding set: the statics one verbatim — the mega VB/IB and the
+    // bindless statics texture arrays — because grass IS a distant static as far as the bake is
+    // concerned. What differs from the statics lane is the CULL lane feeding it (its own indirect
+    // args and instance ring, ~27 commands rather than 10,910) and CULL_MODE_NONE.
+    //
+    // Is there a grass draw to issue at all this frame? Hoisted out of drawGrass because the
+    // Z-prepass entry asks the identical question a thousand lines earlier in the frame, and the two
+    // MUST agree — a prepass that ran on a set the colour pass does not draw is wasted work, and a
+    // colour pass that runs EQUAL on a set the prepass skipped draws nothing at all.
+    bool grassDrawArmed() {
+        if (!g_drawGrass || !g_pGrassPipeline || !g_live.grassCullReady) { return false; }
+        if (!g_live.grassArgsInDrawState || !g_grassSubsetCount) { return false; }
         // ...and that the cull actually RAN this frame. grassArgsInDrawState only says the buffer is
         // in INDIRECT state, which it stays across a frame where the lane never dispatched (an
         // interior, density 0) — and then these args still describe the last cell's grass.
-        if (!g_grassLastDispatch) { return; }
-        cmdBeginDebugMarker(g_live.pCmd, 0.35f, 0.75f, 0.3f, "GRASS");
-        cmdBindPipeline(g_live.pCmd, g_pGrassPipeline);
-        cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSet);
+        if (!g_grassLastDispatch) { return false; }
+        return true;
+    }
+
+    // The grass geometry submission, shared verbatim by the Z-prepass and the colour pass. ONE
+    // function on purpose: both draws must issue the same indirect args over the same VB/IB with the
+    // same instance stream through the same vertex shader, or SV_Position differs and CMP_EQUAL
+    // rejects the lot. The pipeline is the only thing that varies.
+    void grassRecordGeom(Cmd* cmd, Pipeline* pso) {
+        cmdBindPipeline(cmd, pso);
+        cmdBindDescriptorSet(cmd, 0, g_live.pPerFrameSet);
         // Grass lights from the sun + sky ambient only (see grass.frag), so which gLights set is
         // bound never reaches a fetch — but the root signature still wants the slot filled, and
         // binding the distant set keeps this draw's state identical to the statics draw above it.
-        cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerLightsSetDist ? g_live.pPerLightsSetDist
-                                                                     : g_live.pPerLightsSet);
-        cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
-        cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerBatchSet);
+        cmdBindDescriptorSet(cmd, 0, g_live.pPerLightsSetDist ? g_live.pPerLightsSetDist
+                                                              : g_live.pPerLightsSet);
+        cmdBindDescriptorSet(cmd, 0, g_live.pPersistentSet);
+        cmdBindDescriptorSet(cmd, 0, g_live.pPerBatchSet);
         Buffer*  gvbs[2]     = { g_pStaticsVB, g_live.pGrassInstOut };
         uint32_t gstrides[2] = { 20, kStaticsInstStride };
-        cmdBindVertexBuffer(g_live.pCmd, 2, gvbs, gstrides, nullptr);
-        cmdBindIndexBuffer(g_live.pCmd, g_pStaticsIB, INDEX_TYPE_UINT16, 0);
-        cmdExecuteIndirect(g_live.pCmd, INDIRECT_DRAW_INDEX, g_grassSubsetCount,
+        cmdBindVertexBuffer(cmd, 2, gvbs, gstrides, nullptr);
+        cmdBindIndexBuffer(cmd, g_pStaticsIB, INDEX_TYPE_UINT16, 0);
+        cmdExecuteIndirect(cmd, INDIRECT_DRAW_INDEX, g_grassSubsetCount,
                            g_live.pGrassArgs, 0, nullptr, 0);
+    }
+
+    // G1f: the grass Z-PREPASS entry, recorded inside the prepass block AFTER terrainRecordDepth.
+    // Ordering is the point — grass is a cutout whose every fragment costs a texture fetch, so the
+    // ground and the near opaque set laying their depth down first is what kills the blades behind
+    // the hill before this shader is ever reached. (It cannot early-reject its OWN layers: a cutout
+    // prepass is late-Z-WRITE by construction, because coverage is not known until the fetch. What
+    // it converts is one full shade per layer into one fetch per layer.)
+    void grassRecordDepth(Cmd* cmd) {
+        if (!g_grassPrepass || !g_pGrassDepthPipeline || !g_pGrassPipelineEQ) { return; }
+        if (!grassDrawArmed()) { return; }
+        cmdBeginDebugMarker(cmd, 0.35f, 0.75f, 0.3f, "GRASS (Z-prepass)");
+        grassRecordGeom(cmd, g_pGrassDepthPipeline);
+        cmdEndDebugMarker(cmd);
+        // LATCHED, not re-derived at colour time. Everything grassDrawArmed reads is settled before
+        // the prepass and none of it moves during record — but "the prepass block ran" is not
+        // something the colour pass can check at all, and a colour draw that assumes a prepass which
+        // did not happen renders NOTHING. So the flag is set by the code that actually issued it.
+        g_grassPrepassRecorded = true;
+    }
+
+    // G1: the grass colour draw. Its own pipeline (CULL_NONE — two-sided crossed quads) over its own
+    // indirect args and instance ring, which is ~27 commands rather than the statics lane's 10,910.
+    void drawGrass() {
+        if (!grassDrawArmed()) { return; }
+        // EQ twin whenever the prepass actually laid this frame's grass depth down: CMP_EQUAL +
+        // depth-write OFF is what makes the shadow tap and the point-light loop run once per pixel
+        // instead of once per overdrawn layer. Otherwise the original GEQUAL draw, unchanged.
+        Pipeline* const pso = (g_grassPrepassRecorded && g_pGrassPipelineEQ) ? g_pGrassPipelineEQ
+                                                                            : g_pGrassPipeline;
+        cmdBeginDebugMarker(g_live.pCmd, 0.35f, 0.75f, 0.3f, "GRASS");
+        grassRecordGeom(g_live.pCmd, pso);
         cmdEndDebugMarker(g_live.pCmd);
     }
 
@@ -46813,6 +48308,130 @@ void destroyHostWindow(Renderer* R);
         bufBarrier(g_live.pSunArgs,    RESOURCE_STATE_UNORDERED_ACCESS, RESOURCE_STATE_INDIRECT_ARGUMENT);
         bufBarrier(g_live.pSunInstOut, RESOURCE_STATE_UNORDERED_ACCESS, RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);
         g_live.sunArgsInDrawState = true;
+        cmdEndDebugMarker(g_live.pCmd);
+    }
+
+    // ═══ H2a — THE WATER MIRROR'S CULL LANE (tasks/forge-heightfield-occlusion.md) ══════════════
+    //
+    // The reflection is the only statics view still culled on the CPU, and H2b's occlusion march
+    // needs a GPU place to run. This is that place, and it is deliberately BEHAVIOUR-IDENTICAL:
+    // same rule, same survivors, same picture. The one thing it moves is WHERE the indirect args
+    // come from — the mirror's draw has been cmdExecuteIndirect all along (dlReflectRecordGeo), so
+    // only the args FILLER changes hands.
+    //
+    // THE PARAMS CLONE IS THE PROBE'S, LIFTED. dispatchOccProbe already had to build the mirror's
+    // CullParams to make its denominator the drawn set rather than a reconstruction of it, and it
+    // did that by copying the CAMERA's 512 B (which carries misc = the instance/subset counts and
+    // the whole visMask — both genuinely shared with the mirror) then overriding the four fields
+    // that are the mirror's alone. Same four here, same reasons:
+    //   planes/eye/ranges — published by dlReflectGeoCull, the mirror's own rule;
+    //   ranges.w  = 0     — the reflect cull suppresses the near cut (no near-scene path reflects,
+    //                       so DL must cover near too or objects vanish from the mirror);
+    //   hizParams.w = 0   — the pyramid is the CAMERA's; a mirror instance tested against it would
+    //                       be tested against the wrong view;
+    //   cellOwn.w = 0     — near/far ownership is off in the mirror, the same call T.suppressNearCut
+    //                       makes on the CPU side.
+    // reflDistScale() (axis A) rides along for free: it is applied BEFORE those ranges are
+    // published, so the tier ends here already carry it.
+    //
+    // ⚠ MUST run AFTER dlReflectGeoCull has published this frame's planes — that call is
+    //   pre-beginCmd and this one is in the cull phase, so the ordering holds by construction; the
+    //   g_reflCullValid gate is what makes a frame where it did not run a no-op rather than a stale
+    //   frustum.
+    void dispatchReflCull() {
+        if (!(g_reflGpuCull || g_reflCullVerify)) { return; }
+        if (!g_live.reflCullReady || !g_live.pCullPipeline || !g_live.cullInstCount) { return; }
+        if (!g_dlExterior || !g_dlLiveInit || !g_staticsLiveOk) { return; }
+        if (!g_reflCullValid || !g_reflGeoReady) { return; }
+        if (!g_live.pCullParamsCbv || !g_live.pCullParamsCbv->pCpuMappedAddress
+            || !g_live.pReflCullParamsCbv || !g_live.pReflCullParamsCbv->pCpuMappedAddress) { return; }
+
+        const float* cam = (const float*)g_live.pCullParamsCbv->pCpuMappedAddress;
+        float*       cp  = (float*)g_live.pReflCullParamsCbv->pCpuMappedAddress;
+        std::memcpy(cp, cam, 512);
+        for (int pl = 0; pl < 6; ++pl) { std::memcpy(cp + pl * 4, g_reflCullPlanes[pl], 4 * sizeof(float)); }
+        cp[24] = g_reflCullEye[0]; cp[25] = g_reflCullEye[1]; cp[26] = g_reflCullEye[2];
+        cp[28] = g_reflCullRanges[0]; cp[29] = g_reflCullRanges[1]; cp[30] = g_reflCullRanges[2];
+        cp[31]  = 0.0f;   // ranges.w  — near cut suppressed (the mirror has no near-scene path)
+        cp[55]  = 0.0f;   // hizParams.w — the camera's pyramid does not describe this view
+        cp[127] = 0.0f;   // cellOwn.w  — near/far ownership off, as on the CPU side
+
+        // H2b: the height-field occlusion march's params — the ONE cbuffer where arm.x is nonzero.
+        // Every gate is checked HERE rather than in the shader, so "armed" means the field exists,
+        // describes this window, and has a pyramid over it. A shader that armed itself off a knob
+        // alone would march a map from the wrong snap cell the frame after a crossing.
+        g_reflHeightOccArmed = false;
+        if (g_live.pHeightOccCbvRefl && g_live.pHeightOccCbvRefl->pCpuMappedAddress) {
+            const bool arm = g_reflHeightOcc && g_skyHeightValid && g_skyHeightMinValid
+                          && g_live.skyHeightMinReady && g_live.pSkyHeightMin;
+            float* hp = (float*)g_live.pHeightOccCbvRefl->pCpuMappedAddress;
+            hp[0] = arm ? 1.0f : 0.0f;
+            hp[1] = g_reflMirrorZAbs;                          // the water plane (absolute world Z)
+            hp[2] = std::max(1.0f, g_reflHeightOccSteps);
+            hp[3] = g_reflHeightOccBias;
+            hp[4] = g_skyHeightOrigin[0]; hp[5] = g_skyHeightOrigin[1];
+            hp[6] = kSkyHeightTexel;      hp[7] = (float)kSkyHeightRes;
+            // ⚠ CLAMPED TO >= 1 WHILE ARMED. Level 0 is the max field copied verbatim, which
+            // over-rejects — it is H0's CEILING arm, and shipping it would delete visible buildings
+            // from the water. The clamp is here and not in the shader because this is the only place
+            // that knows how many levels the pyramid actually has.
+            hp[8] = std::min(std::max(g_reflHeightOccLevel, 1.0f),
+                             (float)(g_live.skyHeightMinMips > 1u ? g_live.skyHeightMinMips - 1u : 1u));
+            hp[9] = std::max(0.0f, g_reflHeightOccMargin);
+            hp[10] = hp[11] = 0.0f;
+            g_reflHeightOccArmed = arm;
+        }
+
+        ID3D12GraphicsCommandList* cl = g_live.pCmd->mDx.pCmdList;
+        auto bufBarrier = [&](Buffer* buf, ResourceState from, ResourceState to) {
+            BufferBarrier bb = {}; bb.pBuffer = buf; bb.mCurrentState = from; bb.mNewState = to;
+            cmdResourceBarrier(g_live.pCmd, 1, &bb, 0, nullptr, 0, nullptr);
+        };
+        auto uavBarrier = [&](Buffer* buf) { bufBarrier(buf, RESOURCE_STATE_UNORDERED_ACCESS, RESOURCE_STATE_UNORDERED_ACCESS); };
+
+        // Reset count[0..1] + subsetCount from the SHARED zero-staging buffers (the sun lane's own
+        // comment applies verbatim; these two buffers belong to nobody in particular).
+        bufBarrier(g_live.pReflCullCount, RESOURCE_STATE_UNORDERED_ACCESS, RESOURCE_STATE_COPY_DEST);
+        cl->CopyBufferRegion(g_live.pReflCullCount->mDx.pResource, 0, g_live.pCullCountZero->mDx.pResource, 0, 2 * sizeof(uint32_t));
+        bufBarrier(g_live.pReflCullCount, RESOURCE_STATE_COPY_DEST, RESOURCE_STATE_UNORDERED_ACCESS);
+        bufBarrier(g_live.pReflSubsetCount, RESOURCE_STATE_UNORDERED_ACCESS, RESOURCE_STATE_COPY_DEST);
+        cl->CopyBufferRegion(g_live.pReflSubsetCount->mDx.pResource, 0, g_live.pSubsetCountZero->mDx.pResource, 0,
+                             (uint64_t)sizeof(uint32_t) * g_live.cullSubsetCount);
+        bufBarrier(g_live.pReflSubsetCount, RESOURCE_STATE_COPY_DEST, RESOURCE_STATE_UNORDERED_ACCESS);
+        if (g_live.reflArgsInDrawState) {
+            bufBarrier(g_live.pReflArgs,    RESOURCE_STATE_INDIRECT_ARGUMENT, RESOURCE_STATE_UNORDERED_ACCESS);
+            bufBarrier(g_live.pReflInstOut, RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER, RESOURCE_STATE_UNORDERED_ACCESS);
+            g_live.reflArgsInDrawState = false;
+        }
+
+        cmdBeginDebugMarker(g_live.pCmd, 0.3f, 0.6f, 0.9f, "REFLECT CULL (H2a)");
+        cmdBindPipeline(g_live.pCmd, g_live.pCullPipeline);
+        cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pReflCullSet);
+        cmdDispatch(g_live.pCmd, (g_live.cullInstCount + 63u) / 64u, 1, 1);
+        uavBarrier(g_live.pReflSubsetCount);
+        cmdBindPipeline(g_live.pCmd, g_live.pCullScanPipeline);
+        cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pReflCullSet);
+        cmdDispatch(g_live.pCmd, 1, 1, 1);
+        uavBarrier(g_live.pReflSubsetOffset);
+        uavBarrier(g_live.pReflSubsetCursor);
+        uavBarrier(g_live.pReflArgs);
+        cmdBindPipeline(g_live.pCmd, g_live.pCullScatterPipeline);
+        cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pReflCullSet);
+        cmdDispatch(g_live.pCmd, (g_live.cullInstCount + 63u) / 64u, 1, 1);
+        uavBarrier(g_live.pReflInstOut);
+        // The PARITY readback, and it is the whole acceptance of this step: gCullCount[0] is Σ
+        // numSubsets over the frustum survivors, which is exactly what the CPU cull's ring fill
+        // counts into g_liveLastInstRefl. Two rules that disagree make everything H2b measures
+        // meaningless, and a lane whose survivors were quietly wrong looks identical to one that is
+        // right until someone notices a building missing from the water.
+        bufBarrier(g_live.pReflCullCount, RESOURCE_STATE_UNORDERED_ACCESS, RESOURCE_STATE_COPY_SOURCE);
+        cl->CopyBufferRegion(g_live.pReflCullReadback->mDx.pResource, 0,
+                             g_live.pReflCullCount->mDx.pResource, 0, 2 * sizeof(uint32_t));
+        bufBarrier(g_live.pReflCullCount, RESOURCE_STATE_COPY_SOURCE, RESOURCE_STATE_UNORDERED_ACCESS);
+        bufBarrier(g_live.pReflArgs,    RESOURCE_STATE_UNORDERED_ACCESS, RESOURCE_STATE_INDIRECT_ARGUMENT);
+        bufBarrier(g_live.pReflInstOut, RESOURCE_STATE_UNORDERED_ACCESS, RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);
+        g_live.reflArgsInDrawState = true;
+        g_reflGpuCullRan = true;
         cmdEndDebugMarker(g_live.pCmd);
     }
 
@@ -46915,7 +48534,7 @@ void destroyHostWindow(Renderer* R);
         addDescriptorSet(R, &dsd, &g_live.pOccProbeSet);
         if (!g_live.pOccProbeSet) { return fail("addDescriptorSet FAILED"); }
         for (uint32_t v = 0; v < 2u; ++v) {
-            DescriptorData d[6] = {};
+            DescriptorData d[7] = {};
             uint32_t n = 0;
             d[n].mIndex    = SRT_RES_IDX(OccProbeSrtData, PerBatch, gCullParams);
             d[n].ppBuffers = &g_live.pOccProbeCullCbv[v]; ++n;
@@ -46929,6 +48548,16 @@ void destroyHostWindow(Renderer* R);
             d[n].mCount = 1; d[n].ppTextures = &g_live.pSunOcc; ++n;
             d[n].mIndex    = SRT_RES_IDX(OccProbeSrtData, PerBatch, gProbeCount);
             d[n].mCount = 1; d[n].ppBuffers = &g_live.pOccProbeCount[v]; ++n;
+            // H1's pyramid, for the acceptance arm (`occProbePyr`). Bound ALWAYS — an unbound SRV
+            // slot reads whatever was last in that heap slot, so a knob that armed a stale binding
+            // would report a plausible-looking number from a foreign texture. If the pyramid failed
+            // to create, bind the height map itself as an inert placeholder: the shader reads this
+            // slot only when margin.z > 0, and the knob's own gate below refuses to set that
+            // without skyHeightMinReady.
+            d[n].mIndex    = SRT_RES_IDX(OccProbeSrtData, PerBatch, gProbeHeightMin);
+            d[n].mCount = 1;
+            d[n].ppTextures = g_live.pSkyHeightMin ? &g_live.pSkyHeightMin
+                                                   : &g_live.pSkyHeight->pTexture; ++n;
             updateDescriptorSet(R, v, g_live.pOccProbeSet, n, d);
         }
         g_live.occProbeReady = true;
@@ -46998,7 +48627,16 @@ void destroyHostWindow(Renderer* R);
             pp[11] = g_occProbeBias;
             pp[12] = std::max(0.0f, g_occProbeMargin);
             pp[13] = std::max(0.0f, g_occProbeMinR);   // the conservative arm's radius (0 = collapse)
-            pp[14] = pp[15] = 0.0f;
+            // H1 acceptance: read the PYRAMID at this level instead of gathering. Gated on the
+            // pyramid actually existing AND having been built over the current window — otherwise 0,
+            // which falls back to the gather rather than to a silently stale texture. A knob that
+            // reads whatever is in the slot is exactly the failure the binding note above avoids
+            // from the other side.
+            const bool pyrArm = g_live.skyHeightMinReady && g_skyHeightMinValid
+                             && g_occProbePyr >= 1.0f;
+            pp[14] = pyrArm ? std::min(g_occProbePyr,
+                                       (float)(g_live.skyHeightMinMips - 1u)) : 0.0f;
+            pp[15] = 0.0f;
 
             // ⚠ ALL FOUR uints, not two. The bracket added a third counter, and a reset that still
             // spanned two would have left [2] accumulating across every frame of the session — a
@@ -47519,6 +49157,66 @@ void destroyHostWindow(Renderer* R);
             cmdResourceBarrier(g_live.pCmd, 0, nullptr, 0, nullptr, 1, &rtb);
         }
         cmdEndDebugMarker(g_live.pCmd);
+
+        // --- (4) H1: the MIN-PYRAMID over what the three stages above just wrote -----------------
+        //
+        // HERE, INLINE, AND THAT PLACEMENT IS THE POINT — the same argument rebuildSunOccMap's
+        // forced call below makes, and for a second derivative of the same field. A derivative is
+        // stale the instant its source changes; building it from inside the rebuild makes "the
+        // pyramid describes a different window than the map" UNREPRESENTABLE, rather than a rule
+        // someone has to remember at two call sites.
+        //
+        // ⚠ THE CADENCE IS A SNAP CROSSING, NOT A FRAME. This is 12 dispatches over 5.6 M texels
+        // total, on the frames the height map itself rebuilds — i.e. when the eye leaves its snap
+        // cell, seconds of play apart. There is no per-frame cost to measure, so there is no
+        // staleness flag and no timestamp query here: a phase timer bracketing a pass that runs
+        // once every few hundred frames reports the frames it did not run in
+        // ([[feedback_a_skipped_gpu_phase_reported_a_stale_timing]]).
+        //
+        // pSkyHeight is back in SHADER_RESOURCE by the barrier above, which is what the first
+        // variant reads it through. The pyramid brackets SR -> UAV ... UAV -> SR around its own
+        // chain, the cmd invariant every other pyramid in this file keeps.
+        if (g_live.skyHeightMinReady && g_live.pSkyHeightMin) {
+            cmdBeginDebugMarker(g_live.pCmd, 0.45f, 0.55f, 0.9f, "SKY-HEIGHT MIN PYRAMID (H1)");
+            {
+                TextureBarrier tb = {};
+                tb.pTexture = g_live.pSkyHeightMin;
+                tb.mCurrentState = RESOURCE_STATE_SHADER_RESOURCE;
+                tb.mNewState = RESOURCE_STATE_UNORDERED_ACCESS;
+                cmdResourceBarrier(g_live.pCmd, 0, nullptr, 1, &tb, 0, nullptr);
+            }
+            // Level 0 = the MAX field copied verbatim. Not an inconsistency: min over a 1x1
+            // footprint IS the sample, so this is the correct level-0 semantics of "min over a
+            // footprint of max-texels" — the same identity H0's probe used as its self-check.
+            cmdBindPipeline(g_live.pCmd, g_live.pSkyHeightMinPipelineFirst);
+            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pSkyHeightMinSet);
+            cmdDispatch(g_live.pCmd, (kSkyHeightRes + 7u) / 8u, (kSkyHeightRes + 7u) / 8u, 1);
+            cmdBindPipeline(g_live.pCmd, g_live.pSkyHeightMinPipeline);
+            uint32_t mw = kSkyHeightRes, mh = kSkyHeightRes;
+            for (uint32_t m = 1; m < g_live.skyHeightMinMips; ++m) {
+                // current == new == UNORDERED_ACCESS lowers to a true D3D12 UAV barrier (the cull
+                // block's uavBarrier trick): mip m reads what mip m-1's dispatch just wrote.
+                TextureBarrier tb = {};
+                tb.pTexture = g_live.pSkyHeightMin;
+                tb.mCurrentState = RESOURCE_STATE_UNORDERED_ACCESS;
+                tb.mNewState = RESOURCE_STATE_UNORDERED_ACCESS;
+                cmdResourceBarrier(g_live.pCmd, 0, nullptr, 1, &tb, 0, nullptr);
+                mw = (mw > 1u) ? (mw >> 1) : 1u;
+                mh = (mh > 1u) ? (mh >> 1) : 1u;
+                cmdBindDescriptorSet(g_live.pCmd, m, g_live.pSkyHeightMinSet);
+                cmdDispatch(g_live.pCmd, (mw + 7u) / 8u, (mh + 7u) / 8u, 1);
+            }
+            {
+                TextureBarrier tb = {};
+                tb.pTexture = g_live.pSkyHeightMin;
+                tb.mCurrentState = RESOURCE_STATE_UNORDERED_ACCESS;
+                tb.mNewState = RESOURCE_STATE_SHADER_RESOURCE;
+                cmdResourceBarrier(g_live.pCmd, 0, nullptr, 1, &tb, 0, nullptr);
+            }
+            cmdEndDebugMarker(g_live.pCmd);
+            g_skyHeightMinValid = true;
+            ++g_skyHeightMinBuilds;
+        }
 
         g_skyHeightValid = true;
         g_skyHeightBuildFrame = g_renderFrame;
@@ -48973,19 +50671,29 @@ void destroyHostWindow(Renderer* R);
         // that had to be clipped at waterLevel-1 to hide the mismatch.
         terrainRecord(g_live.pCmd, g_terrainRefl, g_live.pPerFrameSetReflectGeo, /*mirror*/true);
 
-        if (g_drawDLStatics && g_staticsLiveOk && g_liveLastSubsetsRefl > 0) {
+        // H2a: the draw has been cmdExecuteIndirect all along — only WHERE the args come from
+        // changes. Same selector dlLiveRecord uses for the camera lane at the top of this file:
+        // `reflDraw` says the GPU lane has args in INDIRECT state this frame, and it swaps the
+        // instance stream and the (count, buffer) pair. Nothing else about this draw moves.
+        // ⚠ THE COUNT DIFFERS IN KIND between the two arms and that is the command wall: the CPU
+        // ring is COMPACTED (g_liveLastSubsetsRefl = touched subsets only), the GPU one is not
+        // (cullSubsetCount, most of them zero-instance no-ops).
+        const bool reflDraw = g_reflGpuCull && g_live.reflCullReady && g_live.reflArgsInDrawState
+                           && g_reflGpuCullRan;
+        if (g_drawDLStatics && g_staticsLiveOk && (reflDraw || g_liveLastSubsetsRefl > 0)) {
             // Opposite winding to the main record (the water-plane mirror flips handedness).
             cmdBindPipeline(g_live.pCmd, dlPickStaticsPipeline(/*mirror*/true));
             cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSetReflectGeo);
             cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerLightsSet);
             cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
             cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerBatchSet);
-            Buffer*  svbs[2]     = { g_pStaticsVB, g_pStaticsInstRingRefl };
+            Buffer*  svbs[2]     = { g_pStaticsVB, reflDraw ? g_live.pReflInstOut : g_pStaticsInstRingRefl };
             uint32_t sstrides[2] = { 20, kStaticsInstStride };
             cmdBindVertexBuffer(g_live.pCmd, 2, svbs, sstrides, nullptr);
             cmdBindIndexBuffer(g_live.pCmd, g_pStaticsIB, INDEX_TYPE_UINT16, 0);
-            cmdExecuteIndirect(g_live.pCmd, INDIRECT_DRAW_INDEX, g_liveLastSubsetsRefl,
-                               g_pStaticsArgsRingRefl, 0, nullptr, 0);
+            cmdExecuteIndirect(g_live.pCmd, INDIRECT_DRAW_INDEX,
+                               reflDraw ? g_live.cullSubsetCount : g_liveLastSubsetsRefl,
+                               reflDraw ? g_live.pReflArgs : g_pStaticsArgsRingRefl, 0, nullptr, 0);
         }
         cmdEndDebugMarker(g_live.pCmd);
     }
@@ -49294,6 +51002,12 @@ void destroyHostWindow(Renderer* R);
     // pass records the draws (dlReflectRecordGeo) only then. Defined after the DL globals it reads.
     void dlReflectGeoCull(Renderer* R, const float* viewProj, const float* fcbvR,
                           float dRel, float eyeAbsZ, float waterLevelAbs, bool underwater) {
+        // H2a parity: save the PREVIOUS frame's CPU survivor count before this call overwrites it.
+        // The latch has to happen HERE and not at the readback settle, because settleFrameFence runs
+        // AFTER this function — so by then g_liveLastInstRefl already holds frame N while the
+        // readback holds frame N-1, and comparing the two would build an instrument that reports on
+        // camera motion rather than on whether the two cull rules agree.
+        g_reflCpuCullPrev = g_liveLastInstRefl;
         g_reflGeoReady = false;
         g_reflFrameReady = false;
 
@@ -50301,6 +52015,20 @@ void destroyHostWindow(Renderer* R);
         if (g_live.pSunArgs)           { removeResource(g_live.pSunArgs);            g_live.pSunArgs = nullptr; }
         if (g_live.pSunInstOut)        { removeResource(g_live.pSunInstOut);         g_live.pSunInstOut = nullptr; }
         g_live.sunCullReady = false; g_live.sunArgsInDrawState = false;
+        // H2a: the MIRROR lane (same clone, same teardown, plus its readback).
+        if (g_live.pReflCullSet)       { removeDescriptorSet(R, g_live.pReflCullSet); g_live.pReflCullSet = nullptr; }
+        if (g_live.pReflCullParamsCbv) { removeResource(g_live.pReflCullParamsCbv);   g_live.pReflCullParamsCbv = nullptr; }
+        if (g_live.pReflCullCount)     { removeResource(g_live.pReflCullCount);       g_live.pReflCullCount = nullptr; }
+        if (g_live.pReflCullReadback)  { removeResource(g_live.pReflCullReadback);    g_live.pReflCullReadback = nullptr; }
+        if (g_live.pReflSubsetCount)   { removeResource(g_live.pReflSubsetCount);     g_live.pReflSubsetCount = nullptr; }
+        if (g_live.pReflSubsetOffset)  { removeResource(g_live.pReflSubsetOffset);    g_live.pReflSubsetOffset = nullptr; }
+        if (g_live.pReflSubsetCursor)  { removeResource(g_live.pReflSubsetCursor);    g_live.pReflSubsetCursor = nullptr; }
+        if (g_live.pReflArgs)          { removeResource(g_live.pReflArgs);            g_live.pReflArgs = nullptr; }
+        if (g_live.pReflInstOut)       { removeResource(g_live.pReflInstOut);         g_live.pReflInstOut = nullptr; }
+        g_live.reflCullReady = false; g_live.reflArgsInDrawState = false;
+        // H2b: the two shared HeightOccParams cbuffers (every cull lane binds one of them).
+        if (g_live.pHeightOccCbvOff)   { removeResource(g_live.pHeightOccCbvOff);   g_live.pHeightOccCbvOff = nullptr; }
+        if (g_live.pHeightOccCbvRefl)  { removeResource(g_live.pHeightOccCbvRefl);  g_live.pHeightOccCbvRefl = nullptr; }
         // H0 probe (only ever non-null if `occProbe` armed the lazy create).
         for (uint32_t v = 0; v < 2u; ++v) {
             if (g_live.pOccProbeCullCbv[v])   { removeResource(g_live.pOccProbeCullCbv[v]);   g_live.pOccProbeCullCbv[v] = nullptr; }
@@ -50382,6 +52110,15 @@ void destroyHostWindow(Renderer* R);
         if (g_live.pHizCmd)          { exitCmd(R, g_live.pHizCmd); }
         if (g_live.pHizCmdPool)      { exitCmdPool(R, g_live.pHizCmdPool); }
         if (g_live.pHiz)             { removeResource(g_live.pHiz); }
+        // H1 min-pyramid over the sky-height field — same shape as the Hi-Z above, same teardown.
+        if (g_live.pSkyHeightMinSet)          { removeDescriptorSet(R, g_live.pSkyHeightMinSet);       g_live.pSkyHeightMinSet = nullptr; }
+        if (g_live.pSkyHeightMinPipeline)     { removePipeline(R, g_live.pSkyHeightMinPipeline);       g_live.pSkyHeightMinPipeline = nullptr; }
+        if (g_live.pSkyHeightMinPipelineFirst){ removePipeline(R, g_live.pSkyHeightMinPipelineFirst);  g_live.pSkyHeightMinPipelineFirst = nullptr; }
+        if (g_live.pSkyHeightMinShader)       { removeShader(R, g_live.pSkyHeightMinShader);           g_live.pSkyHeightMinShader = nullptr; }
+        if (g_live.pSkyHeightMinShaderFirst)  { removeShader(R, g_live.pSkyHeightMinShaderFirst);      g_live.pSkyHeightMinShaderFirst = nullptr; }
+        if (g_live.pSkyHeightMin)             { removeResource(g_live.pSkyHeightMin);                  g_live.pSkyHeightMin = nullptr; }
+        g_live.skyHeightMinReady = false;
+        g_skyHeightMinValid = false;   // the map itself is gone too; nothing may claim the pyramid is live
         // WT4d/P2 reflection mip pyramid.
         if (g_live.pReflectMipSet)          { removeDescriptorSet(R, g_live.pReflectMipSet); }
         if (g_live.pReflectMipPipeline)     { removePipeline(R, g_live.pReflectMipPipeline); }

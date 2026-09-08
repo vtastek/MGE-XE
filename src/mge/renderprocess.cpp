@@ -1548,6 +1548,11 @@ namespace {
             vk.WaitForFences(g_dev, 1, &g_fence, VK_TRUE, UINT64_MAX);
             vk.ResetFences(g_dev, 1, &g_fence);
         }
+        // The submit above waits on the host's timeline semaphore, so the fence clearing is the
+        // first moment the client KNOWS the host GPU finished this frame. Pair for the 1.0 set at
+        // kickoff. Set unconditionally (even on a failed submit) so a bad frame cannot leave the
+        // step latched high and paint every later frame as GPU-inflight.
+        MGE_TracyPlot("Forge host GPU inflight", 0.0);
         const double tcEnd = nowMs();
 
         const double total = tcEnd - tc0;
@@ -6236,6 +6241,12 @@ namespace RenderProcess {
         // Host-inflight lane start (paired 0.0 in finishAndCopy): from here until the
         // collect/finish drains the completion, the host owns the frame.
         MGE_TracyPlot("Forge host inflight", 1.0);
+        // ...and the GPU half of it. Tier 1 took the host GPU OUT of the inflight box (the host
+        // replies before its fence signals), so the box width answers "how long was the RPC" and
+        // this step answers "how long was the GPU still drawing" — dropped to 0.0 the moment
+        // copyHostRtToDst's semaphore wait clears. Read the two together: where this step extends
+        // past the box is exactly the GPU time the client cannot overlap with.
+        MGE_TracyPlot("Forge host GPU inflight", 1.0);
         // Open the host-frame fiber zone (box on the "Forge Host Frame (inflight)" lane) — spans until the
         // finish drains the completion. Begins here on whichever thread issued the kickoff (the
         // produce worker in OVERLAP/FENCED mode, else the main thread).

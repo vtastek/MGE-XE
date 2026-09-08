@@ -5,8 +5,28 @@
 // half (SunLight), exactly as the distant statics do; this stage samples the cutout, builds the A2C
 // coverage, applies the MSM sun visibility to the sun half only, and fogs.
 //
-// ⚠ THIS PASS WRITES ITS OWN SV_Coverage. Like statics.frag and unlike opaque.frag, grass has no
-// Z-prepass entry to inherit a mask from through CMP_EQUAL, so the mask is produced here.
+// ⚠ TWO VARIANTS, AND THE DIFFERENCE IS WHO OWNS THE CUTOUT MASK. This file used to open with
+// "grass has no Z-prepass entry to inherit a mask from through CMP_EQUAL, so the mask is produced
+// here" — and producing it here is what made every overdrawn layer pay the full shade below, since
+// a pass that writes depth AND decides its own coverage cannot resolve depth until the shader has
+// run. grassdepth.frag now exists, so there are two builds of this file:
+//
+//   grass.frag     (GRASS_EARLY_Z 0) — the original. Computes coverage, discards, exports
+//                  SV_Coverage, GEQUAL + depth-write. Kept BIT-IDENTICAL to what shipped so the
+//                  `grassPrepass=0` arm is a true A/B, and as the fallback for a frame where the
+//                  prepass PSO failed to build (EQUAL against depth nothing filled draws nothing).
+//   grass_eq.frag  (GRASS_EARLY_Z 1) — the colour half of the prepass pair. CMP_EQUAL + depth-write
+//                  OFF, so the depth test alone decides the pixel AND the sample mask: every sample
+//                  grassdepth.frag skipped fails EQUAL. It therefore needs no coverage output and
+//                  no discard, which is what buys true early-Z — with nothing to defer on the write
+//                  side, the rasteriser rejects an occluded fragment before this shader is reached.
+//
+// ⚠ THE EQ VARIANT DELIBERATELY DOES NOT RE-DERIVE THE MASK. Recomputing it here and exporting it
+// would reintroduce the one hazard the pairing is otherwise free of: a2cCoverageMaskFaded takes
+// fwidth(), and the 2x2 quads live in this pass are NOT the quads that were live in the prepass
+// (early-Z has killed lanes in between), so the two masks could differ by a sample at exactly the
+// edge texels — visible as sparkle along every blade. Inheriting through the depth test cannot
+// disagree with the depth test. Same contract opaque.frag has with depthonly.frag.
 //
 // Port of XE Mod Grass.fx::GrassPS. Divergences, all deliberate:
 //   * ONE alpha reference (grassParams2.z, 128/255) instead of MGE's discard-at-64 + coverage-at-128
@@ -28,6 +48,12 @@
 #include "skydome.h.fsl"    // applyFog() — extinguish into a silhouette, then melt into the sky
 #include "pointlights.h.fsl" // evalPointLightNearFar() — SHARED clustered froxel loop, both lists
 
+// The shaders.list variant switch (see the header). Defaulted here rather than required, so that
+// a build of this file with no define is the ORIGINAL shader, byte for byte.
+#ifndef GRASS_EARLY_Z
+#define GRASS_EARLY_Z 0
+#endif
+
 // MUST stay byte-identical to grass.vert.fsl's VSOutput (== statics.vert's).
 STRUCT(VSOutput)
 {
@@ -42,11 +68,21 @@ STRUCT(VSOutput)
     DATA(CENTROID(float3), SunLight, TEXCOORD6);
 };
 
+// Two whole struct bodies rather than one struct with a conditional member: the preprocessor runs
+// before FSL parses these declarations either way, but no other shader here puts a #if INSIDE a
+// STRUCT and this is not the file to find out whether that works.
+#if GRASS_EARLY_Z
+STRUCT(PSOut)
+{
+    DATA(float4, Color,    SV_Target0);
+};
+#else
 STRUCT(PSOut)
 {
     DATA(float4, Color,    SV_Target0);
     DATA(uint,   Coverage, SV_Coverage);
 };
+#endif
 
 ROOT_SIGNATURE(DefaultRootSignature)
 PSOut PS_MAIN( VSOutput In )
@@ -66,8 +102,10 @@ PSOut PS_MAIN( VSOutput In )
     //      isotropic and the extra taps resolve detail that sits below the alpha test's threshold
     //      anyway.
     //   2. It is the single most fetch-heavy surface in the frame: a two-sided cutout, several
-    //      overdrawn layers deep at every pixel, and (like the shadow receiver above) on a pass that
-    //      cannot early-reject an occluded fragment. Every tap is paid per layer.
+    //      overdrawn layers deep at every pixel. Every tap is paid per layer — and it still is
+    //      under GRASS_EARLY_Z, because the per-layer fetch did not go away, it MOVED into
+    //      grassdepth.frag, which must sample the same texture through the same sampler to decide
+    //      the cutout. So this cap governs the prepass now, and matters more there than here.
     //   3. G4 raised the grass texture cap from 512 to 2048, which multiplied the resident grass set
     //      by 16x in texels (~4 MB -> 64 MB). Sharper source art makes an 8x AF footprint traverse a
     //      much larger working set, so the sampling cost went UP exactly when the texture budget did.
@@ -78,21 +116,34 @@ PSOut PS_MAIN( VSOutput In )
     // WRAP (the LOD bake has no per-map clamp mode), so WrapWrap is the only variant grass needs.
     float4 tex = SampleTex2DArray(gStaticsArrays[bucket], gSampler2xWrapWrap, uvw);
 
+#if !GRASS_EARLY_Z
     // ⚠ BEFORE ANY DISCARD: a2cCoverageMaskFaded takes a derivative, which needs the whole 2x2 quad
     // intact. Color.a is the vertex-stage distance fade; it thins the sample mask rather than
     // dimming the colour, so a receding field goes sparse instead of hazy.
     uint cov = a2cCoverageMaskFaded(tex.a, gShadowParams.grassParams2.z, In.Color.a);
     if (cov == 0u) { discard; }
+#endif
+    // (GRASS_EARLY_Z: the cutout already happened, in grassdepth.frag. Every sample that reaches
+    //  here passed CMP_EQUAL against the depth that pass wrote, which IS the mask — see the header.
+    //  Note what this deletes besides the discard: the fwidth() and the whole coverage derivation,
+    //  on the pass that runs the shadow tap and the point-light loop.)
 
     // The sun half only. Ambient is never shadowed, which is what keeps a shaded blade sitting in
     // sky light instead of going black; vis == 1 reproduces the unsplit colour exactly.
     //
-    // ⚠ THIS IS THE MOST EXPENSIVE LINE IN THE GRASS PASS AND IT RUNS ON EVERY OVERDRAWN FRAGMENT.
-    // sunShadowVisibility is PCSS: 12 blocker taps, and 16 more of PCF wherever a blocker is found.
-    // The pass cannot reject an occluded fragment before the shader, because this stage exports
-    // SV_Coverage AND discards — so the hardware must run the shader to know the fragment's coverage,
-    // and grass in a dense field is several layers deep at every pixel. Multiplying ~28 taps by that
-    // depth is where the measured cost lives.
+    // ⚠ THIS IS THE MOST EXPENSIVE LINE IN THE GRASS PASS. It used to run on EVERY OVERDRAWN
+    // FRAGMENT: sunShadowVisibility is PCSS — 12 blocker taps, and 16 more of PCF wherever a blocker
+    // is found — and the pass could not reject an occluded fragment before the shader, because it
+    // exported SV_Coverage AND discarded while writing depth, so the hardware had to run the shader
+    // to know where the fragment's depth went. Grass in a dense field is several layers deep at
+    // every pixel, and multiplying ~28 taps by that depth is where the measured cost lived.
+    //
+    // ⚠ UNDER GRASS_EARLY_Z THAT IS NO LONGER TRUE and the reasoning below must be re-read with
+    // that in mind: this pass writes no depth and no coverage, so early-Z runs and this line is
+    // reached ONCE per pixel instead of once per layer. The mode-1 choice is left exactly as it was
+    // — the argument for it never rested on the overdraw (a blade two pixels wide still has nowhere
+    // to put a penumbra gradient) — but the BUDGET it was chosen against has changed by the depth
+    // complexity of the field, so mode 2 is worth re-pricing before it is dismissed again.
     //
     // So grass takes the ONE-TAP evaluator (mode 1) rather than PCSS. That is not a downgrade it has
     // to live with: PCSS buys a contact-hardening penumbra GRADIENT, and a blade two pixels wide has
@@ -155,7 +206,9 @@ PSOut PS_MAIN( VSOutput In )
     result = applyFog(result, In.WorldPos, In.Position.xy, In.Fog);
 
     PSOut Out;
+#if !GRASS_EARLY_Z
     Out.Coverage = cov;   // every exit carries the same mask — the debug views stay the same shape
+#endif
 
     // F12 distance grayscale parity with statics.frag / distantland.frag / opaque.frag.
     uint dbg = (uint)(gFrameData.debugParams.x + 0.5f);
