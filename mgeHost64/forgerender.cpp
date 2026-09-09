@@ -15802,8 +15802,17 @@ namespace {
     //     zLo >= waterLevel for EVERY visible cell ⟹ no water surface in view ⟹ skip the pass
     // Conservative in the one direction that matters: a cell whose floor dips below the plane keeps
     // the reflection even if the water there is hidden behind a ridge.
-    bool     g_reflWaterGate = false;    // ACT on the gate. DEFAULT OFF — the instrument below runs
-                                         // regardless, so an un-armed session still reports the yield.
+    // ⚠ DEFAULT ON since 2026-09-09, and the thing that had held it off was never a measurement.
+    // The pass is -1.58 to -1.80 ms where no water is visible and provably INERT where some is
+    // (0 of 1800 frames skipped in the looking-at-water arm), so the only open question was the
+    // one-frame-late re-open documented on the screen arm below — a picture call, which no amount of
+    // instrumentation could answer. It was closed the only way it could be, at the keyboard, walking
+    // a shoreline in from behind a ridge: no pop. If one is ever found, the fix is NOT to disarm this
+    // — it is to keep rendering the SKY mirror while gated (`refl sky` is 0.23 of the 1.98) so the
+    // stale frame shows a correct sky with missing detail instead of a mirror of somewhere else.
+    // The instrument below runs whether or not this is armed, so a session that turns it OFF still
+    // reports what it would have saved.
+    bool     g_reflWaterGate = true;
     // Cells beyond this distance are not consulted. 0 = no limit (the DL draw distance decides), which
     // is the fully conservative setting and the default. It exists because the frustum reaches much
     // further than water is worth reflecting, and one distant sea cell at the fog horizon can hold the
