@@ -183,6 +183,16 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
     // RAN — see the statistics at the tail, and the report that made the difference matter.
     bool changed = false;
 
+    // MB-2i. Split the accepted weight by whether the tap was NEARER than this pixel or not, so
+    // "nothing reached me" and "something in front reached me" stop being the same picture. Cost
+    // when the diagnostic is off: two adds in a loop that already does four texture loads.
+    float wFront = 0.0f;
+    float wBack  = 0.0f;
+    // ⚠ THE THIRD BUCKET IS THE ONE THAT MATTERED. The first cut of this lumped "a tap on my own
+    // surface" in with "a tap behind me", and they are the same colour for opposite reasons: the
+    // second is correct occlusion, the first is the pixel counting ITSELF over and over.
+    float wSame  = 0.0f;
+
     if (blurred)
     {
         // A per-pixel offset inside the tap spacing. Turns the banding of a low tap count into grain.
@@ -253,17 +263,144 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
 
             float f = mbDepthWeight(ds, dCentre, softZ);   // sample in FRONT of the centre
             float b = mbDepthWeight(dCentre, ds, softZ);   // sample BEHIND the centre
+            // Reverse-Z: BIGGER IS CLOSER. A tap in front of us is one that could legitimately
+            // have smeared over us, which is the event the blade/skirt report is about.
+            float relD = ds / max(dCentre, 1.0e-7f) - 1.0f;
 
-            float a = f * mbCone(dist, sampleStreak)
-                    + b * mbCone(dist, selfStreak)
-                    + 2.0f * mbCylinder(dist, sampleStreak) * mbCylinder(dist, selfStreak);
+            float cs = mbCone(dist, sampleStreak);
+            float cc = mbCone(dist, selfStreak);
+            float a  = f * cs + b * cc
+                     + 2.0f * mbCylinder(dist, sampleStreak) * mbCylinder(dist, selfStreak);
+
+            // ── MB-2j: THE RECONSTRUCTION, AND THE TWO THINGS IT PUTS RIGHT ──────────────
+            // Both were measured against GROUND TRUTH in mgeHost64/mbsynth, where an analytic
+            // scene averaged over the exposure IS the correct answer, so "how much blur" stops
+            // being a matter of opinion. Against ship, on the lone-mover smear: delivery
+            // 1.415 -> 1.000 and RMSE 0.3084 -> 0.0108.
+            //
+            // (1) A TAP ON MY OWN SURFACE IS NOT THREE KINDS OF EVIDENCE.
+            //     At equal depth f == b == 1 and both cylinders are ~1 inside the streak, so a
+            //     tap on the CENTRE'S OWN surface scores up to 1 + 1 + 2 = 4, while a tap on a
+            //     genuinely foreground surface scores at most 1. The receiver therefore outvotes
+            //     the smear 4:1 PER TAP before the tap COUNT is even counted, and the faster the
+            //     receiver moves the more taps land inside its own streak. Measured over a skirt
+            //     moving 8 px/frame: 94.8% of the answer was the pixel re-sampling ITSELF.
+            //     That IS the reported *"blade gray smear is cut with the dark purple skirt"*,
+            //     and it is why a STATIC receiver takes the smear fine (selfStreak = 0 kills
+            //     both terms) while a moving one does not.
+            //     `b` ("I am blurry and swept over something behind me") and the cylinder term
+            //     ("two different blurry things mix") are both claims about TWO surfaces.
+            //     Neither is true of ONE surface sampled twice. Keep f*cone -- the self-blur
+            //     that genuinely exists. Skirt delivery at 8 px/frame: 0.666 -> 0.918.
+            //
+            // (2) A TAP IS A SLICE OF THE EXPOSURE, NOT A VOTE.
+            //     Weights were SUMMED per tap with nothing dividing by sampling density, so the
+            //     answer moved with the tap count: delivery 0.954 at 6 taps, 1.415 at 32, 1.513
+            //     at 64. A reconstruction filter may get NOISIER when undersampled; it must not
+            //     get STRONGER. Each tap stands for 1/n of the shutter and can cover us for at
+            //     most all of that slice, so its weight is bounded by 1/n and the total by 1;
+            //     the centre then takes whatever the taps did NOT claim, instead of a fixed 1
+            //     that the taps can outvote arbitrarily. Spread across 6..64 taps: 0.559 -> 0.000.
+            //
+            // ⚠ THE FACTOR OF 2 IS COVERAGE, NOT A FUDGE. mbCone is 1 - d/L, which averaged over
+            // its own support is 0.5 -- it is a DENSITY, not a coverage probability. The streak
+            // spans +-L/2, so the surface at distance d actually passes over us iff d <= L/2, and
+            // min(2*(1 - d/L), 1) IS that box with a soft outer edge. The sweep confirms it:
+            // delivery rises to exactly 1.000 at gain 2.0 and is flat for every larger value.
+            if (gMbParams.opts.w > 0.5f)
+            {
+                if (abs(relD) <= 0.01f) { a = f * cs; }
+                a = min(a * 2.0f, 1.0f) / float(max(n, 1u));
+            }
 
             sum  += LoadTex2D(gMbColor, NO_SAMPLER, spi, 0) * a;
             wsum += a;
+            if      (relD >  0.01f) { wFront += a; }   // NEARER  -- something in front reached us
+            else if (relD < -0.01f) { wBack  += a; }   // BEHIND  -- we reached something behind
+            else                    { wSame  += a; }   // OUR OWN SURFACE, and this is the defect
         }
 
-        outv    = sum / wsum;
-        changed = (wsum > 1.0001f);
+        if (gMbParams.opts.w > 0.5f)
+        {
+            // The centre went into `sum` at weight 1; back it out and re-add it at the weight
+            // the taps left unclaimed. wsum - 1 is exactly the taps' total.
+            float wt = wsum - 1.0f;
+            float wc = max(0.0f, 1.0f - wt);
+            outv    = ((sum - centre) + centre * wc) / max(wt + wc, 1.0e-6f);
+            changed = (wt > 1.0e-4f);
+        }
+        else
+        {
+            outv    = sum / wsum;
+            changed = (wsum > 1.0001f);
+        }
+    }
+
+    // ── MB-2i: THE INSTRUMENT ────────────────────────────────────────────────────────────────
+    // Replaces the frame with a diagnostic. Placed AFTER the statistics are decided and BEFORE the
+    // write, so `searched%`/`changed%` keep reporting the real pass while the picture changes —
+    // an instrument that alters what it measures is worse than none (motionblur.srt.h says this
+    // about the atomics; it is just as true of a debug view).
+    uint dbg = uint(gMbParams.opts.z + 0.5f);
+    if (dbg > 0u)
+    {
+        float3 dv = f3(0.0f);
+        if (dbg == 1u)
+        {
+            // THE FIELD THE BLUR ACTUALLY READS. F12 mode 17 shows pMotionVectors — the TOTAL
+            // field — and in object-only mode that is a completely different picture: there the
+            // whole static world carries the camera's vector, here it is exactly zero.
+            //
+            // ⚠ SUB-PIXEL SCALE AND NO GREY CLIFF. mode 17 saturates at 32 px and jumps from a
+            // flat grey 0.5 straight to ~0.10 the instant it leaves its dead zone, so a pixel
+            // drifting across the threshold flickers grey/black — 128 to 26 for an arbitrarily
+            // small change. Here 0 IS grey and the ramp LEAVES grey continuously, so a gradient
+            // reads as a gradient and speckle reads as speckle.
+            float  m = length(vSelf);
+            float  t = saturate(log2(1.0f + m * 8.0f) / log2(1.0f + 8.0f * 4.0f));
+            float  h = atan2(vSelf.y, vSelf.x) * (0.5f / 3.14159265f) + 0.5f;
+            float3 hue = clamp(abs(frac(f3(h) + float3(0.0f, 0.6666667f, 0.3333333f)) * 6.0f - f3(3.0f)) - f3(1.0f),
+                               f3(0.0f), f3(1.0f));
+            dv = lerp(f3(0.5f), hue, t);
+        }
+        else if (dbg == 2u)
+        {
+            // DEPTH ORDER, brighter = NEARER, on a log scale so near geometry does not all
+            // saturate to white. Raw reverse-Z is ~1/z, so 1/d is proportional to view distance.
+            float dC = LoadTex2D(gMbDepth, NO_SAMPLER, vq, 0).r;
+            float z  = 1.0f / max(dC, 1.0e-7f);
+            float t  = saturate(1.0f - log2(1.0f + z) / log2(1.0f + 65536.0f));
+            dv = f3(t);
+        }
+        else
+        {
+            // WHO WON THIS PIXEL. The centre always carries exactly 1.0 and every tap's weight
+            // went into one of the two accumulators, so 1 + wFront + wBack IS wsum — recomputed
+            // here rather than reaching for wsum, which is scoped to the branch above.
+            //
+            // ⚠ BLACK IS A FOURTH ANSWER AND IT IS NOT BLUE. A pixel that never ran the gather
+            // (below the velocity floor — its whole tile neighbourhood is slower than mbMinPx)
+            // and a pixel that ran and rejected every tap would otherwise BOTH read pure blue,
+            // and those are different faults: the first never looked, the second looked and said
+            // no. The blade/skirt question is exactly which of the two is happening on the skirt.
+            // RED   = a NEARER surface reached us (the smear arriving, and what SHOULD dominate
+            //         where a sword crosses in front of something).
+            // GREEN = OUR OWN SURFACE reached us -- the same pixel counted once per tap that fell
+            //         inside our own streak. Measured at 85-95% over a moving receiver, against 0%
+            //         over a static one, which is the whole of the blade/skirt report.
+            // BLUE  = what the pixel kept of itself, plus anything genuinely behind it.
+            // BLACK = the gather never ran (below the velocity floor).
+            if (!blurred)
+            {
+                dv = f3(0.0f);
+            }
+            else
+            {
+                float tot = 1.0f + wFront + wBack + wSame;
+                dv = float3(wFront / tot, wSame / tot, (1.0f + wBack) / tot);
+            }
+        }
+        outv = float4(dv, 1.0f);
     }
 
     if (inRect)

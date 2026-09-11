@@ -17080,7 +17080,80 @@ namespace {
     // MB-2h. Alternate taps between the TILE's velocity and the PIXEL'S OWN (Jimenez), so a face
     // is sampled along its own axis whichever mover won its tile's max. Off = single axis, the
     // pre-MB-2h behaviour, and the arm that shows what the second axis is buying.
-    bool     g_mbTwoDir = true;
+    //
+    // ⚠⚠ DEFAULTED **OFF** 2026-09-11 AS A TEST ARM, BECAUSE IT IS THE BLADE/SKIRT AMPUTATION.
+    // THIS IS NOT A DECISION — it is off so the artifact can be looked at, and one of the two
+    // has to be chosen before it ships. Do not leave it here by default
+    // ([[feedback_built_measured_and_shipped_off]] is exactly this shape).
+    //
+    // Measured in mgeHost64/mbsynth (analytic scene, ground truth = the scene averaged over the
+    // exposure), as `delivery` -- the fraction of the change GT demands that the filter actually
+    // delivers onto a receiver a faster object is smearing across, 1.0 being correct:
+    //
+    //     receiver px/frame   0.0     0.3     0.6     3.0    12.0
+    //     twoDir = ON       2.958   2.626   0.159   0.151   0.162
+    //     twoDir = OFF      2.958   2.626   2.310   1.187   0.602
+    //
+    // A 16x collapse from a TENTH OF A PIXEL per frame of receiver motion, landing exactly on this
+    // feature's own gate (`lenSelf >= 1.0` in mbgather). Reported from play as *"the blade gray
+    // smear is cut with the dark purple skirt from behind"*, and the user's own reading --
+    // *"maybe skirt is too slow"* -- was right. It is not a depth bug; mbSoftZ is structurally
+    // dead over a static receiver (the `b` term is multiplied by mbCone(dist, selfStreak) with
+    // selfStreak = 0).
+    //
+    // MECHANISM, from mbsynth's per-tap dump of one amputated pixel: when this arms, HALF the taps
+    // walk the receiver's OWN axis, and for a slow receiver every one of them lands inside its own
+    // ~5 px streak where both cones and both cylinders are ~1 -- so each scores up to 1+1+2 = 4,
+    // against ~0.6 for a tap that actually found the blade. Sixteen self-taps carried **61.6** of
+    // weight against the blade's **2.5**: 94.6% of the answer was the receiver re-sampling ITSELF,
+    // sixteen times, within 2.4 px. Those taps are not sampling anything.
+    //
+    // ⚠ THE REAL FIX IS PROBABLY NOT THIS FLAG. The second axis was built to kill the direction
+    // seams and by eye it did ("good, don't see seams now"). What is wrong is the BUDGET: taps are
+    // split evenly between two axes of wildly different length and then weighted per-TAP rather
+    // than per unit of streak. Weighting each tap by |dir|/n lifts the 0.6 px case 0.159 -> 2.099
+    // and the 3.0 px case 0.151 -> 0.876 (mbsynth `--arclen`), without removing the second axis.
+    bool     g_mbTwoDir = false;
+    // ── THE INSTRUMENT (MB-2i) ───────────────────────────────────────────────────────────────
+    // 0 = off. Otherwise mbgather writes a DIAGNOSTIC image instead of the blurred frame.
+    //
+    // ⚠ IT LIVES IN THE GATHER BECAUSE THE GATHER ALREADY HOLDS THE EVIDENCE. pMbVelocity,
+    // pLinearDepth and the delivered colour are all bound to that pass already, so this costs
+    // NO new descriptor bindings — against the six PerFrame set instances a view in
+    // mvview.frag would have had to be threaded through. And mbgather is COMPUTE, so every
+    // mode below hot-reloads with F8 without restarting the host.
+    //
+    //   1 = pMbVelocity, THE FIELD THE BLUR ACTUALLY READS. F12 mode 17 has never shown this —
+    //       it shows pMotionVectors, the TOTAL field, which in object-only mode is a different
+    //       picture entirely (the whole static world is non-zero there and zero here).
+    //   2 = DEPTH ORDER. Brightness rises with nearness on a log scale, so "which of these two
+    //       surfaces is in front" is answerable by eye. This is the one the blade/skirt report
+    //       actually turns on: if the skirt is NEARER than the blade, the smear being cut at
+    //       its silhouette is CORRECT occlusion and mbsynth's own control arm agrees.
+    //   3 = WHERE THE ANSWER CAME FROM, which is the amputation as a picture.
+    //       RED   = weight accepted from taps NEARER than this pixel (something in front
+    //               smeared onto us — a skirt pixel receiving the blade should be RED),
+    //       GREEN = weight from taps at or behind this pixel's depth,
+    //       BLUE  = the weight the pixel KEPT of itself (blue = "nothing reached me").
+    //       A cut that is an amputation reads as BLUE where it should read RED.
+    uint32_t g_mbDebug = 0;
+    // ── MB-2j: THE RECONSTRUCTION (default ON; 0 is the legacy control arm) ──────────────────
+    // Two defects, one shape, both measured against GROUND TRUTH in mgeHost64/mbsynth:
+    //   * a tap on the centre's OWN surface scored up to 1+1+2 = 4 against a foreground tap's 1,
+    //     so a MOVING receiver drowned the smear in its own colour -- 94.8% of the answer at
+    //     8 px/frame. That is the reported "blade smear cut by the skirt", and it is why a
+    //     STATIC receiver was fine (selfStreak = 0 kills the `b` and cylinder terms).
+    //   * weights were summed per tap with nothing dividing by sampling density, so the answer
+    //     moved with the tap count (0.954 at 6 taps, 1.415 at 32, 1.513 at 64).
+    //
+    // Measured, ship -> MB-2j, at the shipped mbTwoDir = 0:
+    //     lone-mover smear delivery   1.415 -> 1.000   (1.000 = exactly ground truth)
+    //     smear RMSE vs ground truth  0.3084 -> 0.0108
+    //     smear onto a skirt @ 8 px/f 0.666 -> 0.918
+    //     whole-frame RMSE            0.0566 -> 0.0054
+    //     tap-count spread 6..64      0.559 -> 0.000
+    //     static world                bit-identical in both (the standing guard)
+    bool     g_mbRecon = true;
     // Whether the pass ran this frame — written from the ONE gate, read by the resolve's set index
     // and by the heartbeat. Same rule as g_lastUpscaleRan beside it: a second derivation of "did it
     // run" is a second thing that can disagree with the frame.
@@ -21256,6 +21329,36 @@ namespace {
           // reads as haloing around near geometry.
           t.sliderF("Soft depth extent (fraction of centre distance; 0.1 = 10% nearer is rejected)",
                     &g_mbSoftZ, 0.0f, 1.0f, 0.01f);
+          // ── MB-2h, and BOTH OF THESE WERE ENV-VAR ONLY UNTIL NOW ─────────────────────────────
+          // They shipped reachable only through MGE_HOST_KNOBS, which means the two knobs that
+          // decide whether the filter has SEAMS or an AMPUTATION could not be A/B'd in place, in
+          // one scene, while looking at the thing they change. That is the whole value of the
+          // panel and it was missing for exactly the pair that needed it.
+          //
+          // ⚠ TICKING THIS BOX IS THE A/B FOR THE BLADE/SKIRT CUT. Off (the current default) is
+          // the arm where a fast object's smear crosses a slower object behind it; on is the arm
+          // where it is amputated at the silhouette but the direction seams are gone. Neither is
+          // right yet — see g_mbTwoDir's declaration for the measured numbers and the budget fix.
+          t.checkbox("  \\- ...and along THIS PIXEL'S own velocity too (MB-2h; ON = the skirt cut)",
+                     &g_mbTwoDir);
+          // Fraction of a tile the NeighborMax lookup may be offset by, per pixel. 0 restores the
+          // hard K grid — the arm that shows the seams the jitter was built to break up.
+          // ⚠ Its benefit is confirmed BY EYE only. mbsynth cannot reproduce the grid (a rigid
+          // translating rect has one velocity everywhere, so the dilation has nothing to quantise)
+          // and in the one scene that came close this was very slightly WORSE against ground truth
+          // (RMSE 0.0891 -> 0.0897). Not evidence against it; a note that it is unmeasured.
+          t.sliderF("  \\- tile lookup jitter (MB-2h; 0 = the hard K grid, i.e. the seams back)",
+                    &g_mbTileJitter, 0.0f, 1.0f, 0.05f);
+          // ⚠ THIS REPLACES THE FRAME WITH A DIAGNOSTIC — it is not an overlay. Put it back to 0
+          // to play. See g_mbDebug for what each mode means; 3 is the one that answers "why did
+          // this pixel not receive the smear".
+          // ⚠ THE A/B FOR THE WHOLE WEIGHTING. Off = the shipped-until-now filter, which
+          // mbsynth scores at 1.415 delivery on a smear ground truth says should be 1.000, and
+          // 0.666 onto a receiver moving 8 px/frame. On = the corrected one. Both are
+          // bit-identical on a still frame, so this cannot be judged parked -- move something.
+          t.checkbox("Corrected reconstruction (MB-2j; off = the legacy weighting)", &g_mbRecon);
+          t.sliderU("DEBUG: 0 off | 1 the velocity the blur READS | 2 depth order | 3 who won the pixel",
+                    &g_mbDebug, 0u, 3u, 1u);
           t.flush(); }
 
         // -- Tab: Bloom (tasks/forge-postprocess.md step 4) --
@@ -24804,6 +24907,7 @@ void destroyHostWindow(Renderer* R);
             { "objVelAllItems",      &g_objVelAllItems      },
             { "objVelSkipStill",     &g_objVelSkipStill     },
             { "mbTwoDir",            &g_mbTwoDir            },
+            { "mbRecon",             &g_mbRecon             },
             { "objVelSkinned",       &g_objVelSkinnedLane   },
             { "objVelFP",            &g_objVelFPLane        },
             { "objVelSkinIgnoreGen", &g_objVelSkinIgnoreGen },
@@ -24955,6 +25059,7 @@ void destroyHostWindow(Renderer* R);
             // keeps the tile grid inside the surfaces it was allocated for.
             { "mbTileK",   &g_mbTileK,   kMbTileKMax },
             { "mbMaxTaps", &g_mbMaxTaps, 64u },
+            { "mbDebug",   &g_mbDebug,   3u },
         };
         const SKnob sknobs[] = {
             // M1 4d: `passthrough` (default) or `ngx`. Read at INIT — it decides which object is
@@ -38012,6 +38117,10 @@ void destroyHostWindow(Renderer* R);
                 // opts.x = tile-fetch jitter as a fraction of K; opts.y = two-axis sampling.
                 mp[12] = std::max(0.0f, std::min(1.0f, g_mbTileJitter));
                 mp[13] = g_mbTwoDir ? 1.0f : 0.0f;
+                // MB-2i, same rule: written after the clear. opts.z = the diagnostic mode.
+                mp[14] = (float)std::min(g_mbDebug, 3u);
+                // MB-2j. opts.w = the corrected reconstruction.
+                mp[15] = g_mbRecon ? 1.0f : 0.0f;
                 // rects: the DELIVERED rect, then the MOTION-VECTOR (input) rect.
                 mp[0] = (float)deliveredW;   mp[1] = (float)deliveredH;
                 mp[2] = (float)g_live.width; mp[3] = (float)g_live.height;

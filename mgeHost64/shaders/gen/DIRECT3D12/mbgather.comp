@@ -1170,6 +1170,16 @@ void CS_MAIN( uint3 DispatchThreadID : SV_DISPATCHTHREADID )
 
     bool changed = false;
 
+
+
+
+    float wFront = 0.0f;
+    float wBack = 0.0f;
+
+
+
+    float wSame = 0.0f;
+
     if (blurred)
     {
 
@@ -1203,7 +1213,7 @@ void CS_MAIN( uint3 DispatchThreadID : SV_DISPATCHTHREADID )
 
         float4 sum = centre;
         float wsum = 1.0f;
-#line 233 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/mbgather.comp.fsl"
+#line 243 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/mbgather.comp.fsl"
         LOOP for (uint i = 0u; i < taps; ++i)
         {
 
@@ -1228,23 +1238,100 @@ void CS_MAIN( uint3 DispatchThreadID : SV_DISPATCHTHREADID )
             float f = mbDepthWeight(ds, dCentre, softZ);
             float b = mbDepthWeight(dCentre, ds, softZ);
 
-            float a = f * mbCone(dist, sampleStreak)
-                    + b * mbCone(dist, selfStreak)
-                    + 2.0f * mbCylinder(dist, sampleStreak) * mbCylinder(dist, selfStreak);
+
+            float relD = ds / max(dCentre, 1.0e-7f) - 1.0f;
+
+            float cs = mbCone(dist, sampleStreak);
+            float cc = mbCone(dist, selfStreak);
+            float a = f * cs + b * cc
+                     + 2.0f * mbCylinder(dist, sampleStreak) * mbCylinder(dist, selfStreak);
+#line 310 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/mbgather.comp.fsl"
+            if (gMbParams.opts.w > 0.5f)
+            {
+                if (abs(relD) <= 0.01f) { a = f * cs; }
+                a = min(a * 2.0f, 1.0f) / float(max(n, 1u));
+            }
 
             sum += LoadTex2D(gMbColor, NO_SAMPLER, spi, 0) * a;
             wsum += a;
+            if (relD > 0.01f) { wFront += a; }
+            else if (relD < -0.01f) { wBack += a; }
+            else { wSame += a; }
         }
 
-        outv = sum / wsum;
-        changed = (wsum > 1.0001f);
+        if (gMbParams.opts.w > 0.5f)
+        {
+
+
+            float wt = wsum - 1.0f;
+            float wc = max(0.0f, 1.0f - wt);
+            outv = ((sum - centre) + centre * wc) / max(wt + wc, 1.0e-6f);
+            changed = (wt > 1.0e-4f);
+        }
+        else
+        {
+            outv = sum / wsum;
+            changed = (wsum > 1.0001f);
+        }
+    }
+
+
+
+
+
+
+    uint dbg = uint(gMbParams.opts.z + 0.5f);
+    if (dbg > 0u)
+    {
+        float3 dv = f3(0.0f);
+        if (dbg == 1u)
+        {
+
+
+
+
+
+
+
+
+
+            float m = length(vSelf);
+            float t = saturate(log2(1.0f + m * 8.0f) / log2(1.0f + 8.0f * 4.0f));
+            float h = atan2(vSelf.y, vSelf.x) * (0.5f / 3.14159265f) + 0.5f;
+            float3 hue = clamp(abs(frac(f3(h) + float3(0.0f, 0.6666667f, 0.3333333f)) * 6.0f - f3(3.0f)) - f3(1.0f),
+                               f3(0.0f), f3(1.0f));
+            dv = lerp(f3(0.5f), hue, t);
+        }
+        else if (dbg == 2u)
+        {
+
+
+            float dC = LoadTex2D(gMbDepth, NO_SAMPLER, vq, 0).r;
+            float z = 1.0f / max(dC, 1.0e-7f);
+            float t = saturate(1.0f - log2(1.0f + z) / log2(1.0f + 65536.0f));
+            dv = f3(t);
+        }
+        else
+        {
+#line 393 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/mbgather.comp.fsl"
+            if (!blurred)
+            {
+                dv = f3(0.0f);
+            }
+            else
+            {
+                float tot = 1.0f + wFront + wBack + wSame;
+                dv = float3(wFront / tot, wSame / tot, (1.0f + wBack) / tot);
+            }
+        }
+        outv = float4(dv, 1.0f);
     }
 
     if (inRect)
     {
         Write2D(gMbOut, p, outv);
     }
-#line 284 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/mbgather.comp.fsl"
+#line 421 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/mbgather.comp.fsl"
     uint tid = (DispatchThreadID.y & 7u) * 8u + (DispatchThreadID.x & 7u);
     bool count = inRect && blurred;
     g_mbHit[tid] = count ? 1u : 0u;
