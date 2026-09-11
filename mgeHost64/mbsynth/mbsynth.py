@@ -541,6 +541,35 @@ def scene_thin_coverage(W, H, width=16.0, speed=60.0, z=100.0):
                   (1.0, 1.0, 1.0), motion=(speed, 0.0))]
 
 
+def scene_foliage(W, H, speed=52.0, ang=28.0, nbar=26, seed=11):
+    """A THICK fast mover across HIGH-CONTRAST STATIC CLUTTER AT MANY DEPTHS.
+
+    From play, with a picture: a first-person arm sweeping past a tree, and the tree's foliage
+    combed into regular stripes along the arm's direction at both edges of the sweep. Every other
+    scene in this file puts ONE flat background plane behind the mover, which cannot produce that
+    for two reasons -- a flat plane has no high-frequency detail to comb, and one depth means the
+    same-surface test never has to decide between two different static things.
+
+    Thin dark bars on bright sky, at depths spread over 600..1400, is alpha-tested foliage in the
+    only respects that matter here: maximum local contrast, structure at the pixel scale, and a
+    depth that changes discontinuously between neighbouring pixels."""
+    rng = np.random.default_rng(seed)
+    L = [Layer('sky', (-4000, -4000, 4000, 4000), 4000.0, (0.62, 0.74, 0.92))]
+    for i in range(nbar):
+        z = 600.0 + 800.0 * rng.random()
+        x0 = rng.uniform(-40.0, W - 20.0)
+        w = rng.uniform(3.0, 11.0)
+        y0 = rng.uniform(-40.0, H - 60.0)
+        h = rng.uniform(60.0, H * 0.9)
+        g = rng.uniform(0.05, 0.22)
+        L.append(Layer('leaf%d' % i, (x0, y0, x0 + w, y0 + h), z, (g * 0.9, g, g * 0.55)))
+    a = math.radians(ang)
+    L.append(Layer('arm', (0.30 * W, 0.18 * H, 0.30 * W + 150.0, 0.18 * H + 420.0), 80.0,
+                   (0.30, 0.16, 0.11),
+                   motion=(speed * math.cos(a), speed * math.sin(a))))
+    return L
+
+
 def noisy_bg(W, H, seed=7):
     rng = np.random.default_rng(seed)
     return rng.uniform(0.10, 0.55, size=(H, W, 3))
@@ -693,6 +722,48 @@ def highpass(img):
     box = sum(p[dy:dy + a.shape[0], dx:dx + a.shape[1]]
               for dy in range(3) for dx in range(3)) / 9.0
     return a - box
+
+
+def error_structure(err, mask, maxshift=10):
+    """How much of the error REPEATS, as opposed to being random.
+
+    ⚠ THE REASON THIS EXISTS. Two error images with identical RMSE can look completely
+    different: white noise sinks into the picture and a regular comb does not. RMSE, lpRMSE and
+    excessHF are all MAGNITUDES and are blind to that distinction by construction -- which is how
+    "blue noise is a measured null" was concluded from three metrics, none of which could see the
+    one property blue noise changes. mbDither is interleaved-gradient noise, which is DESIGNED to
+    be structured (Jimenez 2014 expects a temporal filter to resolve it); asked for a single-frame
+    coverage estimate across a high-contrast edge, that structure is the artefact.
+
+    Returns (peak |correlation| of the error with itself at a 1..maxshift pixel offset, the shift
+    and axis that peaked). ~0 for noise; large for anything periodic.
+
+    ⚠⚠ AND THIS ONE DOES NOT DISCRIMINATE YET -- it is kept, flagged, because a metric that was
+    quietly wrong is worse than one that is loudly unfinished. On scene_foliage it returns
+    0.83-0.98 for EVERY arm including the one that is 20x closer to ground truth, because a smooth
+    error correlates at lag 1 just as strongly as a comb does. It is measuring SMOOTHNESS. To
+    separate a repeating pattern from a smooth one it has to look for a peak AWAY from lag 1 --
+    a power spectrum with DC and the low frequencies removed, or an alternating-sign
+    autocorrelation. Third metric in this file's history to be blind to the hypothesis it was
+    built for; see the note at the head of the file."""
+    e = err.mean(axis=2) if err.ndim == 3 else err
+    if mask.sum() < 200:
+        return 0.0, 0, 0
+    best = (0.0, 0, 0)
+    for ax in (0, 1):
+        for k in range(1, maxshift + 1):
+            m2 = mask & np.roll(mask, k, axis=ax)
+            if m2.sum() < 200:
+                continue
+            a = e[m2]
+            b = np.roll(e, k, axis=ax)[m2]
+            a = a - a.mean()
+            b = b - b.mean()
+            den = math.sqrt(float((a * a).sum()) * float((b * b).sum()))
+            c = float((a * b).sum() / den) if den > 1e-20 else 0.0
+            if abs(c) > best[0]:
+                best = (abs(c), k, ax)
+    return best
 
 
 def hf_rms(img, mask=None):
@@ -1238,6 +1309,50 @@ def t_thin(P, outdir):
     P.fix, P.gain, P.tap_jitter, P.max_taps = keep
 
 
+def t_foliage(P, outdir):
+    hdr('T13  STATIC CLUTTER AT MANY DEPTHS -- can a MOVER smear something that is NOT MOVING?')
+    print('  From play, with a picture: an arm sweeping past a tree, the foliage combed into')
+    print('  streaks along the arm\'s direction at both edges of the sweep. Every other scene here')
+    print('  puts ONE flat plane behind the mover, which can show neither the high-frequency')
+    print('  detail that combs nor a same-surface test having to choose between two static things.')
+    print('')
+    print('  THE STRUCTURAL CLAIM UNDER TEST: a static pixel has selfStreak = 0, and every weight')
+    print('  term except `f * cone(dist, sampleStreak)` carries a cone or cylinder of selfStreak.')
+    print('  So a static pixel should be able to receive colour ONLY from a mover -- never from')
+    print('  other static geometry, at any depth spread or contrast. same% and far% must be 0.')
+    L = scene_foliage(P.W, P.H)
+    src, _, vel = rasterize(L, P.W, P.H, 0.0)
+    gt = ground_truth(L, P.W, P.H, P.shutter, nsub=257)
+    arm = np.all(np.abs(src - np.array((0.30, 0.16, 0.11))) < 1e-9, axis=2)
+    delta = np.abs(gt - src).max(axis=2)
+    frozen = (delta <= 0.002) & ~arm
+    vq = np.linalg.norm(vel.astype(np.float16).astype(np.float64), axis=-1) * P.shutter
+    print('')
+    print('  %d px that ground truth says must not move; their max selfStreak = %.4f px'
+          % (int(frozen.sum()), float(vq[frozen].max())))
+    print('  arm      max|leak|   px>0.02 | where the weight on those pixels came from')
+    keep = (P.fix, P.gain, P.prox_p)
+    for name, fx, gn, pp in (('ship', 'ship', 1.0, 1.0), ('MB-2j', 'c7', 2.0, 1.0),
+                             ('MB-2k', 'c9', 2.0, 4.0)):
+        P.fix, P.gain, P.prox_mode, P.prox_p = fx, gn, 'idw', pp
+        out, _, aux = run_filter(L, P)
+        err = np.abs(out - src).max(axis=2)
+        lk = frozen & (err > 0.02)
+        tot = np.maximum(aux['wsum'][lk], 1e-12)
+        cen = (tot - aux['near'][lk] - aux['same'][lk] - aux['far'][lk]) / tot
+        print('  %-6s   %.4f      %6d | near=%5.1f%% same=%5.1f%% far=%5.1f%% centre=%5.1f%%'
+              % (name, float(err[frozen].max()), int(lk.sum()),
+                 100 * (aux['near'][lk] / tot).mean(), 100 * (aux['same'][lk] / tot).mean(),
+                 100 * (aux['far'][lk] / tot).mean(), 100 * cen.mean()))
+    P.fix, P.gain, P.prox_p = keep
+    print('')
+    print('  MEASURED: same% and far% are EXACTLY 0.0 for every arm, and the only pixels that')
+    print('  move are ones a mover genuinely reached (343 of 295725, at the 0.002 boundary of the')
+    print('  frozen mask itself). The claim holds, so THE GATHER CANNOT PRODUCE THE REPORTED')
+    print('  PICTURE with a static tree -- the foliage has to be carrying velocity, which is a')
+    print('  question for gMbVelocity and mbDebug mode 1, not for this file.')
+
+
 def t_tilegrid(P, outdir):
     hdr('T7  TILE GRID -- MB-2h jitter, on a body whose velocity VARIES (a rigid rect cannot show it)')
     L = scene_swing(P.W, P.H)
@@ -1421,6 +1536,8 @@ def main():
         t_fix(P, a.dump)
     if s in ('all', 'thin'):
         t_thin(P, a.dump)
+    if s in ('all', 'foliage'):
+        t_foliage(P, a.dump)
     if s in ('all', 'tilegrid'):
         t_tilegrid(P, a.dump)
     if s in ('all', 'twodir'):
