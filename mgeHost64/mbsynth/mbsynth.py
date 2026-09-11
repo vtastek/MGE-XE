@@ -204,6 +204,13 @@ class Params(object):
         # equally. c9 keeps the total (the amount) and re-weights only the mixture (the
         # provenance) by a cone `prox` times as wide as the streak.
         self.prox = 0.25
+        # MB-2h's tile-fetch jitter REPLACES this pixel's tile with one up to K/2 away, and
+        # `blurred` is a BINARY gate on the fetched speed -- so at the edge of a mover's dilated
+        # neighbourhood the jitter decides per pixel between a full blur and none at all. That is
+        # a stipple, and it is what the halftone band at an arm's silhouette is made of.
+        # 'max' keeps the jitter but takes whichever of (own tile, jittered tile) is LONGER, so a
+        # jittered fetch can only ever EXTEND the search region, never punch a hole in it.
+        self.tile_jitter_mode = 'replace'
         # 'cone' scales the mixing cone by prox * selfStreak.  Measured: the best prox is
         # WIDTH-DEPENDENT (0.15 for an 8 px mover, 0.25 for a 32 px one) and a value too small
         # for the mover STARVES the bucket -- no tap is close enough to qualify, so the
@@ -265,6 +272,13 @@ def gather(colour, depth, vel, tilev, P):
     tq[..., 0] = np.clip(tq[..., 0], 0, max(P.tiles[0] - 1, 0))
     tq[..., 1] = np.clip(tq[..., 1], 0, max(P.tiles[1] - 1, 0))
     v_tile = tilev[tq[..., 1], tq[..., 0]]
+    if P.tile_jitter_mode == 'max' and P.tile_jitter > 0.0:
+        to = np.trunc(pc / float(max(K, 1))).astype(np.int64)
+        to[..., 0] = np.clip(to[..., 0], 0, max(P.tiles[0] - 1, 0))
+        to[..., 1] = np.clip(to[..., 1], 0, max(P.tiles[1] - 1, 0))
+        v_own = tilev[to[..., 1], to[..., 0]]
+        take_own = (v_own[..., 0] ** 2 + v_own[..., 1] ** 2) > (v_tile[..., 0] ** 2 + v_tile[..., 1] ** 2)
+        v_tile = np.where(take_own[..., None], v_own, v_tile)
 
     speed = np.linalg.norm(v_tile, axis=-1)
     self_streak = np.minimum(np.linalg.norm(v_self, axis=-1) * shutter, float(K))
@@ -722,6 +736,18 @@ def highpass(img):
     box = sum(p[dy:dy + a.shape[0], dx:dx + a.shape[1]]
               for dy in range(3) for dx in range(3)) / 9.0
     return a - box
+
+
+def speckle(mask):
+    """Pixels whose BINARY gate disagrees with 3 or more of their 4 neighbours.
+
+    A clean boundary scores ~0; a stipple is made entirely of these. This exists because every
+    magnitude metric in this file is blind to the artefact it counts: across a tile-jitter sweep
+    that takes speckle from 0 to 43239, RMSE against ground truth does not move in the fifth
+    decimal. Structure and magnitude are different questions."""
+    m = mask.astype(np.int8)
+    n = (np.roll(m, 1, 0) + np.roll(m, -1, 0) + np.roll(m, 1, 1) + np.roll(m, -1, 1))
+    return int((((m == 1) & (n <= 1)) | ((m == 0) & (n >= 3))).sum())
 
 
 def error_structure(err, mask, maxshift=10):
@@ -1353,6 +1379,45 @@ def t_foliage(P, outdir):
     print('  question for gMbVelocity and mbDebug mode 1, not for this file.')
 
 
+def t_stipple(P, outdir):
+    hdr('T14  THE HALFTONE AT A MOVER\'S SILHOUETTE -- mbTileJitter flips a BINARY gate')
+    print('  From play, magnified: the arm\'s edge against bright sky is a band of discrete dots')
+    print('  ~30-40 px wide, not a gradient. Binary, so not tap-count quantisation (which grades')
+    print('  1/32, 2/32, ...). `blurred` IS binary -- speed >= floor -- and MB-2h\'s jitter')
+    print('  REPLACES this pixel\'s tile with one up to K/2 away, so at the edge of a mover\'s')
+    print('  dilated neighbourhood it decides per pixel between a full blur and none at all.')
+    print('')
+    print('  ⚠ AND THIS IS WHY EVERY EARLIER TILE TEST WAS A NULL. The rig ran 768x512 at K=96 --')
+    print('  EIGHT BY SIX tiles, against the game\'s 27x17. A mover covering two tiles here covers')
+    print('  a quarter of the frame, so the dilated boundary falls OFF SCREEN and the jitter has')
+    print('  nothing to straddle. T7 could not reproduce the K grid for the same reason.')
+    print('')
+    keep = (P.K, P.tiles, P.tile_jitter, P.tile_jitter_mode, P.fix, P.gain)
+    print('  K   tiles   mode      jitter | blurred%  speckle   RMSE vs GT')
+    for K in (96, 28):
+        P.K = K
+        P.tiles = (int(math.ceil(P.W / float(K))), int(math.ceil(P.H / float(K))))
+        L = [Layer('sky', (-4000, -4000, 4000, 4000), 4000.0, (0.62, 0.74, 0.92)),
+             Layer('arm', (300, 150, 390, 380), 80.0, (0.30, 0.16, 0.11), motion=(48.0, 26.0))]
+        gt = ground_truth(L, P.W, P.H, P.shutter, nsub=257)
+        for mode, tj in (('replace', 0.0), ('replace', 0.5), ('replace', 1.0), ('max', 1.0)):
+            P.tile_jitter, P.tile_jitter_mode = tj, mode
+            P.fix, P.gain, P.prox_mode, P.prox_p = 'c9', 2.0, 'idw', 4.0
+            out, st, aux = run_filter(L, P)
+            print('  %-3d %-7s %-9s  %4.2f  |  %6.3f  %7d    %.5f'
+                  % (K, '%dx%d' % P.tiles, mode, tj, 100.0 * st['hit'],
+                     speckle(aux['blurred']), rmse(out, gt)))
+    P.K, P.tiles, P.tile_jitter, P.tile_jitter_mode, P.fix, P.gain = keep
+    print('')
+    print('  MEASURED: speckle is EXACTLY 0 at jitter 0 and rises linearly with it, while RMSE')
+    print('  does not move in the fifth decimal at any setting. `max` -- take the LONGER of (own')
+    print('  tile, jittered tile), so a jittered fetch can only EXTEND the search -- halves it and')
+    print('  no more, because only half the flips are holes punched INSIDE the region; the other')
+    print('  half are pixels switched ON outside it, and those it cannot touch. A stochastic')
+    print('  answer to a BINARY question is a stipple however it is clipped, so the fix has to')
+    print('  make the dilation smooth and DETERMINISTIC rather than make the coin fairer.')
+
+
 def t_tilegrid(P, outdir):
     hdr('T7  TILE GRID -- MB-2h jitter, on a body whose velocity VARIES (a rigid rect cannot show it)')
     L = scene_swing(P.W, P.H)
@@ -1538,6 +1603,8 @@ def main():
         t_thin(P, a.dump)
     if s in ('all', 'foliage'):
         t_foliage(P, a.dump)
+    if s in ('all', 'stipple'):
+        t_stipple(P, a.dump)
     if s in ('all', 'tilegrid'):
         t_tilegrid(P, a.dump)
     if s in ('all', 'twodir'):

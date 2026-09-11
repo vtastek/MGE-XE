@@ -53,6 +53,8 @@ streak length to 3 px in 239 — it is not a substitute for a GPU capture.
 | T10 | where each pixel's answer came from (near / own / behind) | 94.8% self over a moving skirt |
 | T11 | every candidate weighting scored against GT | **c6/c7 = MB-2j, shipped** |
 | T12 | **THIN fast mover: the refraction and the dither** | **MB-2k, shipped** — see below |
+| T13 | can a mover smear something that is NOT moving? | no: `same%` and `far%` are exactly 0 |
+| T14 | **the halftone at a mover's silhouette** | **`mbTileJitter` flips a binary gate** |
 
 `--explain X,Y` prints the tap-by-tap arithmetic for one pixel: which axis each tap walked, what
 it landed on, and all three weight terms. That is what turned T3 from a correlation into a
@@ -142,6 +144,13 @@ But `excessHF` — high-frequency energy ground truth does not have — *falls* 
 because an inverted texture was itself high-frequency error. Better on every visibility metric.
 
 ## What it does NOT show
+
+⚠ **T7's null had a cause, and it was the rig, not the scene — found 2026-09-11 by T14.** The rig
+runs 768×512 at K=96, which is **8×6 tiles**. The game runs **27×17**. A mover that covers two tiles
+here covers a quarter of the frame, so a mover's 3×3-dilated tile boundary falls OFF SCREEN and the
+jitter has nothing to straddle. Shrink K until the tiles-per-frame ratio matches the game and the
+artefact appears in one run. **Any test of anything tile-shaped must match the game's tile COUNT,
+not its tile SIZE.** The note below stands as written but is no longer the whole story.
 
 T7 and T8 **do not reproduce the tile grid or the direction seam**, in any arm, jitter on or off.
 That is a statement about these scenes, not about MB-2h: a rigid translating rect has one velocity
