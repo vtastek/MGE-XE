@@ -41,7 +41,63 @@ STRUCT(AtmosphereParams)
     // GREY on purpose: a water cloud's droplets are hundreds of times the wavelength, so its
     // extinction is spectrally flat. Every colour an overcast sky has comes from the air above and
     // below it, which the other three species already carry.
+    //
+    // ⚠⚠ THESE ARE THE DELTA-SCALED OPTICS, NOT THE GEOMETRIC ONES (S4a/A2). A cloud's g is 0.84-0.88
+    // and about three quarters of what it scatters goes into a forward peak indistinguishable from
+    // unscattered light, so Atmosphere::deckSolve() truncates that peak into the beam before packing:
+    // tau' = (1 - ssa g^2) tau, ssa' = ssa(1-g^2)/(1-ssa g^2), g' = g/(1+g). The scaling is applied
+    // ONCE, host-side, precisely so the transmittance LUT's beam, this file's phase function and the
+    // slab's source below are three views of ONE medium — delta-Eddington is only correct as a triple,
+    // and scaling the beam alone would leave the sky-view march phase-shifting with the unscaled g.
     DATA(float4, cloud,     None);  // x = beta_sca (1/m), y = beta_ext (1/m), z = HG g,
                                     // w = the profile's shape blend (0 stratus slab .. 1 raised cos)
+    // ─── THE DECK'S MULTIPLE SCATTERING, AS A BOUNDED SLAB (S4a/A2) ──────────────────────────
+    // ⚠⚠ THE CLOUD SPECIES NO LONGER READS THE MULTISCATTER LUT, AND THAT IS A CONSERVATION FIX
+    // RATHER THAN A TUNE. Its source there was `sca * ms * sInt` = `ssa * ms * (1 - stepT)`, and at
+    // a cloud's ssa of 0.9999 THE DECK'S OWN OPTICAL DEPTH CANCELS OUT OF ITS OWN SOURCE: measured
+    // over a 16x tau sweep, `f` was identical to five decimals and E_sky floored at 55% of the
+    // incoming flux however thick the lid got — at tau 3 the ground received 4.6x what arrives at
+    // the top of the atmosphere. `F = 1/(1-f)` has no conservation law to bound it.
+    //
+    // These 8 taps are a delta-Eddington two-stream slab's isotropic orders>=2 radiance, per unit
+    // incident beam, sampled on NORMALISED ALTITUDE from the deck's lid (deckMsA.x) to its base
+    // (deckMsB.w) — R + T <= 1 by construction, which is exactly the property the LUT source lacked.
+    // Solved in double precision once per frame by Atmosphere::deckSolve(); read by atmosDeckMs().
+    // ⚠ DIMENSIONLESS: the shader multiplies by solar.xyz AND by the air's transmittance down to the
+    // lid, which is what makes the deck redden under a low sun and go dark below the horizon without
+    // this table carrying a sun angle at all. All zero on a clear sky.
+    DATA(float4, deckMsA,   None);  // taps 0..3, deck TOP -> down
+    DATA(float4, deckMsB,   None);  // taps 4..7, -> deck BASE
+    // ─── THE COVER MIXTURE ───────────────────────────────────────────────────────────────────
+    // ⚠⚠ PARTIAL COVER IS A BLEND WEIGHT NOW, NOT A THINNER LID. Everything above describes ONE
+    // FULL CLOUD — its own optical depth, its own slab solution — and this says how much of the sky
+    // has one. atmos_skyview runs a CLEAR arm and a FULL-DECK arm and returns
+    // `lerp(clear, deck, cover)`.
+    //
+    // The old mean field replaced "thick cloud over 35% of the sky" with "a thin veil over 100% of
+    // it", and the two do not look alike: measured on the Cloudy row, the zenith went from
+    // (0.134, 0.310, 1.000) normalised — deep blue — to (0.838, 0.774, 1.000) at 2.2x the luma,
+    // while the horizon fell 3.2x and a 7.2x sky gradient flattened to 1.02x. That is "washed out",
+    // and it was structural: a horizontally-homogeneous medium has no way to say "blue between the
+    // clouds". A mixture does, without a second medium and without drawing anything.
+    //
+    // ⚠ IT ALSO DECOUPLES THE SKY FROM THE LIGHT, which the old `cover^2.5` exponent could not.
+    // The mean BEAM under broken cloud is `(1-c) + c*T_deck` — a mixture of transmittances, not
+    // `exp(-tau_mean)` — so the light stays right at 0.65 for 35% cover while 65% of the sky stays
+    // blue. Tuning the exponent could only have traded one against the other.
+    //
+    // ⚠ y IS AN A/B ARM ON THE AIR'S MULTIPLE SCATTERING, NOT A LOOK KNOB, and it shares this row
+    // only because the row had spare lanes. 1 is the shipped medium; 0 leaves the sky-view march
+    // with its FIRST ORDER of scattering alone — a quantity a CPU quadrature over the same
+    // coefficients reproduces exactly, which is what makes "the clear sky is 3.3x (red) to 8.2x
+    // (blue) over its single-scattering value" a decomposition instead of an accusation.
+    // x = cover 0..1 (the mix weight for the LIGHT), y = air-MS A/B arm,
+    // z = the DOME's re-mix weight (S2i): how much of the cover-mixed field the IMAGE should show,
+    //     as a fraction of the light's mix. 0 = draw the gap sky (a BROKEN deck, whose individual
+    //     clouds MW's own mesh draws), 1 = draw the mixed field (a CLOSED lid, which really does
+    //     fill every direction). See atmosphere.h packParams for the derivation.
+    // w = the A/B arm on the deck's light reaching the air BENEATH it (S2h): 1 ships the term,
+    //     0 reproduces the pre-S2h march exactly.
+    DATA(float4, deckMix,   None);
 };
 

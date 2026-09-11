@@ -16,14 +16,21 @@
 // ⚠ THE MEDIUM IS NOT DEFINED HERE — atmosphere.h.fsl owns it (see the warning at its top).
 //
 // ⚠ AND ITS ALTITUDE AXIS IS 32 TEXELS OVER 100 km — 3.2 km PER TEXEL, WHICH IS WIDER THAN THE
-// WHOLE DECK. That is a known limit S4a does NOT close, and it is stated here because it is the
-// first thing to suspect if the overcast level reads oddly. The deck (1.0-2.2 km in the gate's
-// configuration) falls between the LUT's first two rows, so the sky-view march reads an in-cloud
-// multiscatter term INTERPOLATED between a ground-level sample and one above the lid — both of them
-// correct, neither of them inside the cloud. Widening the r axis, or making it non-linear near the
-// ground, would change the CLEAR sky too and would therefore have to be its own step with its own
-// A/B; the parameterisation is Hillaire's and it is tuned for an 8 km scale height, not for a 1.2 km
-// slab sitting in the bottom 2% of the range.
+// WHOLE DECK. The deck (1.0-2.2 km in the gate's configuration) falls between the LUT's first two
+// rows, so an in-cloud lookup here interpolates between a ground-level sample and one above the lid
+// — both of them correct, neither of them inside the cloud. Widening the r axis, or making it
+// non-linear near the ground, would change the CLEAR sky too and would therefore have to be its own
+// step with its own A/B; the parameterisation is Hillaire's and it is tuned for an 8 km scale
+// height, not for a 1.2 km slab sitting in the bottom 2% of the range.
+//
+// ⚠⚠ SO THE CLOUD IS NO LONGER IN THIS LUT'S SOURCE AT ALL (S4a/A2), and its EXTINCTION still is.
+// This axis is the reason: a term the axis cannot resolve was the deck's ONLY source of multiple
+// scattering, and combined with the `1/(1-f)` sum below — which has no conservation law bounding it
+// — the measured result was that E_sky floored at 55% of the incoming flux however thick the lid
+// got, and reached 458% of it at tau 3. The deck now gets a delta-Eddington two-stream slab instead
+// (Atmosphere::deckSolve, consumed in atmos_skyview), whose defining property is R + T <= 1 by
+// construction. What is left in this LUT is the AIR's multiple scattering under a lid, which is
+// what this parameterisation was always good for.
 //
 // ⚠ AND THE SUM DIVERGES IF f REACHES 1. Physically f < 1 always (a bounce cannot return more than
 // it received), but a thick, near-non-absorbing aerosol — Foggy at ssa 0.98, Blizzard at 0.95, both
@@ -31,14 +38,19 @@
 // is not a tolerance, it is the guard between "a bright whiteout" and "a NaN that propagates through
 // the sky-view LUT into the ambient and out into every lit surface in the frame".
 //
-// ⚠⚠ AND S4a WALKS STRAIGHT AT THAT CLAMP. A cloud deck is CONSERVATIVE — single-scattering albedo
-// 0.9999, because a water cloud is bright precisely because it does not absorb — so `fms` under a
-// full lid is driven hard toward 1 and the clamp turns into a hard ceiling of F = 50 rather than a
-// guard that never fires. If the S4a overcast-level gate row misses, THE FIX IS NOT TO RETUNE THIS
-// CLAMP: measure convergence against the direction and step counts first (both are cbuffer knobs for
-// exactly this reason), and if the 2-order isotropic approximation is genuinely inadequate for cloud
-// — Hillaire says it is — a two-stream Eddington source for the DECK ONLY is the bounded fallback.
-// That would be a second model, and therefore its own decision, not something to slip in here.
+// ⚠⚠ S4a WALKED STRAIGHT AT THAT CLAMP, AND A2 IS WHY IT NO LONGER DOES. A cloud deck is
+// CONSERVATIVE — single-scattering albedo 0.9999, because a water cloud is bright precisely because
+// it does not absorb — so `fms` under a full lid was driven hard toward 1 and the clamp became a
+// hard ceiling of F = 50 rather than a guard that never fires. The measurement was decisive: `f` was
+// IDENTICAL TO FIVE DECIMALS across a 16x change in the deck's optical depth. That is the sentence
+// this file's own warning predicted, and the answer it named — *"a two-stream Eddington source for
+// the DECK ONLY is the bounded fallback ... a second model, and therefore its own decision"* — is
+// what A2 built, in Atmosphere::deckSolve(). With the cloud's scattering out of the sum below, `f`
+// is an air-only quantity again and the clamp goes back to being a guard.
+//
+// ⚠ THAT MAKES THE GATE'S `MS SERIES` ROW A PREDICTION, WHICH IS THE POINT OF LEAVING IT WIRED: it
+// read `**PINNED**` at 0.98 under the old source and must now come back off its ceiling. If it is
+// still pinned, A2 did not reach this LUT and nothing downstream of it should be believed.
 
 #include "atmosphere.srt.h"
 #include "atmosphere.h.fsl"   // THE MEDIUM — one copy, see the warning at its top
@@ -150,7 +162,20 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
 
                 float3 scaR, scaM, scaC, extAir, extCloud;
                 atmosMediumAt(gAtmosParams, hi, scaR, scaM, scaC, extAir, extCloud);
-                float3 sca = scaR + scaM + scaC;
+                // ⚠⚠ THE DECK'S SCATTERING IS NOT IN THIS SUM ANY MORE (S4a/A2), AND ITS EXTINCTION
+                // STILL IS. That is the whole of what this LUT got wrong. Read the warning at the top
+                // of this file: a conservative lid drove `f` toward 1, the geometric sum `1/(1-f)`
+                // has nothing bounding it, and the 3.2 km/texel altitude axis could not resolve a
+                // 1.2 km slab anyway — so the term this LUT returned inside the deck was interpolated
+                // between a ground sample and one above the lid, and it stopped depending on tau
+                // entirely. The deck's own multiple scattering is now a bounded two-stream slab
+                // (Atmosphere::deckSolve, read in atmos_skyview), so removing it here is what stops
+                // it being counted twice — and it makes `f` an AIR-ONLY quantity again, which is the
+                // checkable prediction: the gate's MS SERIES row should come back off its ceiling.
+                //
+                // ⚠ THE EXTINCTION STAYS because the air under a lid really is in shadow. Dropping
+                // it as well would have made this LUT blind to the deck in the other direction.
+                float3 sca = scaR + scaM;
                 float3 ext = extAir + extCloud;
 
                 float3 stepT = exp(-ext * dt);
@@ -162,7 +187,13 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
                 if (atmosRaySphere(p, sunDir, Rg) < 0.0f)
                 {
                     float2 tuv = atmosTransmittanceUv(gAtmosParams, ri, muS);
-                    sunT = SampleLvlTex2D(gAtmosTransmittance, gSamplerBilinearClamp, tuv, 0).rgb;
+                    // ⚠ THE COVER-WEIGHTED MEAN BEAM. The LUT now carries the air in .rgb and the
+                    // deck alone in .a (see atmos_transmittance), and THIS LUT IS ITSELF A MEAN
+                    // FIELD — one isotropic term for the whole sky — so the mean transmittance
+                    // `(1-c) + c*T_deck` is exactly the quantity it wants. atmos_skyview, which is
+                    // not a mean field, takes the two arms separately instead.
+                    float4 tr = SampleLvlTex2D(gAtmosTransmittance, gSamplerBilinearClamp, tuv, 0);
+                    sunT = tr.rgb * lerp(1.0f, tr.a, saturate(gAtmosParams.deckMix.x));
                 }
 
                 // Energy-conserving integration of a constant source over the step (Hillaire): the
@@ -176,18 +207,23 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
                 // to 1 instead of to the sun, i.e. "if this volume were lit by unit radiance from
                 // everywhere, how much would it send on".
                 //
-                // ⚠⚠ THE ISOTROPIC PHASE BELONGS HERE TOO, AND OMITTING IT IS NOT A SMALL ERROR.
-                // Caught by the S2b gate on its first run: without it `f` is 4*pi ~= 12.6 times too
-                // large, which saturates the clamp below, so the geometric series sums to 50 instead
-                // of ~1.06 and THE WHOLE SKY COMES OUT ~47x TOO BRIGHT — measured zenith 127656
-                // cd/m2 against a clear-sky band of 2000-8000, E_sky 675 klx against ~14.
+                // ⚠⚠ THE 4pi THAT USED TO LIVE HERE NOW LIVES AT THE SPHERE SUM, AND MOVING IT IS
+                // THE WHOLE FIX. The original catch was real: on the S2b gate's first run `f` came
+                // out 4*pi ~= 12.6 times too large, saturated the clamp below, and the geometric
+                // series summed to 50 instead of ~1.06 — measured zenith 127656 cd/m2 against a
+                // clear-sky band of 2000-8000, E_sky 675 klx against ~14. But the REPAIR put the
+                // factor in the step loop, where it happens to give `f` the right number and leaves
+                // `L2` — which needs the same 1/4pi as a SPHERE AVERAGE — without one. See the note
+                // at `L2 +=` below: the sky then ran 3.3x (red) to 8.2x (blue) over its own first
+                // order for the whole of S2-S4a, and the ENERGY row read 112%.
                 //
                 // ⚠ AND THE SUN WAS PERFECTLY FINE THROUGHOUT (103 klx direct-normal, inside the
                 // band), which is exactly why the gate has TWO tables. The beam does not pass
-                // through this LUT at all, so every sun-side check passed while the sky was two
-                // orders of magnitude out — and q and sun%, being scale-free, could not see it
-                // either. It took the NIT row, in absolute cd/m2, to catch it.
-                fSum += throughput * sca * sInt * isoPhase;
+                // through this LUT at all, so every sun-side check passed while the sky was out —
+                // and q and sun%, being scale-free, could not see it either. It took the NIT row in
+                // absolute cd/m2 to catch the 47x, and the ENERGY row plus a CPU quadrature of the
+                // same integral's first order to catch the 4pi hiding behind it.
+                fSum += throughput * sca * sInt;
 
                 throughput *= stepT;
             }
@@ -204,14 +240,40 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
                 if (muSg > 0.0f)
                 {
                     float2 tuv = atmosTransmittanceUv(gAtmosParams, Rg, muSg);
-                    float3 gT  = SampleLvlTex2D(gAtmosTransmittance, gSamplerBilinearClamp, tuv, 0).rgb;
+                    float4 gTr = SampleLvlTex2D(gAtmosTransmittance, gSamplerBilinearClamp, tuv, 0);
+                    float3 gT  = gTr.rgb * lerp(1.0f, gTr.a, saturate(gAtmosParams.deckMix.x));
                     lSum += throughput * gT * muSg * gAtmosParams.solar.xyz
                           * (gAtmosParams.planet.z / ATMOS_PI);
                 }
             }
 
-            L2  += lSum * sphereWeight;
-            fms += fSum * sphereWeight;
+            // ⚠⚠ BOTH SUMS TAKE THE ISOTROPIC PHASE *HERE*, AND THAT IS WHERE THE SKY'S MISSING 4pi
+            // WAS. `sphereWeight * isoPhase` is `1/N` — the plain MEAN over the lattice — and a mean
+            // is what both quantities are: `fms` is the mean re-scattered fraction, and `L2` is the
+            // MEAN INCIDENT RADIANCE, because the second-order source is
+            // `sigma_s * (1/4pi) * integral(L1 dw)` and that 1/4pi is the sphere AVERAGE, not a
+            // second phase function.
+            //
+            // It used to read `fSum += ... * isoPhase` inside the step loop and `* sphereWeight`
+            // out here. For `fms` those two cancel to 1/N and the answer was right — which is
+            // exactly why the error survived: the note further up records catching `f` at 4pi too
+            // large and fixing it by putting isoPhase in the STEP LOOP, and nobody re-derived L2,
+            // which needed the same 4pi and never got it. `lSum` already carries isoPhase as its
+            // FIRST-BOUNCE PHASE FUNCTION, so multiplying by a bare `sphereWeight` left it
+            // 4pi = 12.566x too large. Measured (mieMul 0, so the medium is pure Rayleigh + ozone
+            // and every coefficient is Bruneton's):
+            //
+            //     L_ms(camera)  (40.03, 46.44, 62.94) W/m2/sr   against a FIRST-ORDER field whose
+            //     maximum, at the horizon, is (12.0, 12.9, 10.7) and whose zenith is (0.75, 1.39,
+            //     2.71). A MEAN over the sphere that is 3.3-5.9x the field's own MAXIMUM is not a
+            //     tuning disagreement, it is arithmetic — and /4pi lands it at (3.19, 3.70, 5.01),
+            //     which is where a mean of that field belongs.
+            //
+            // The sky-view march adds `sca * ms` on top of single scattering, so the whole clear sky
+            // was carrying it: the zenith read 3.3x (red) to 8.2x (blue) over its own first order and
+            // the ENERGY row said 112% of the flux arriving at the top of the atmosphere.
+            L2  += lSum * (sphereWeight * isoPhase);
+            fms += fSum * (sphereWeight * isoPhase);
         }
     }
 

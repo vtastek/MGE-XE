@@ -581,6 +581,15 @@ BEGIN_SRT_NO_AB(SrtData)
         // second place to get the pair half-right. Unbound reads 0 = "trust every vector", which is
         // the pre-mask behaviour and the correct benign default.
         DECL_TEXTURE(PerFrame, Tex2D(float),  gReactiveMask)
+        // ─── S2i: THE GAP SKY — the clear arm of the deck mixture, for the DOME only ─────────────
+        // gAtmosSkyView above is the cover-MIXED field and stays exactly what it was: the SH light
+        // pass integrates it, and every aerial-perspective consumer reads it. This is its clear arm
+        // — what the sky looks like BETWEEN the clouds — and skyhw.frag blends the two by
+        // gAtmosParams.deckMix.z so a BROKEN deck stops veiling its own gaps.
+        //
+        // Appended AFTER gReactiveMask — append only, FSL assigns descriptor offsets from one
+        // running counter and an insertion silently re-points every later binding.
+        DECL_TEXTURE(PerFrame, Tex2D(float4), gAtmosSkyViewClear)
     END_SRT_SET(PerFrame)
     // Point-light cbuffer — rides the otherwise-unused PerDraw set (FSL has exactly four
     // fixed update frequencies: Persistent/PerFrame/PerBatch/PerDraw; a custom set name has

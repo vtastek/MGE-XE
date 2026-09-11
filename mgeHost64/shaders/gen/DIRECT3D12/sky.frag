@@ -1252,19 +1252,14 @@ STRUCT(AtmosphereParams)
 
     float4 lutDims;
     float4 lutDims2;
-
-
-
-
-
-
-
-
-
-
+#line 52 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/atmosparams.h.fsl"
     float4 cloud;
-
-#line 46
+#line 69 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/atmosparams.h.fsl"
+    float4 deckMsA;
+    float4 deckMsB;
+#line 101 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/atmosparams.h.fsl"
+    float4 deckMix;
+#line 102
 };
 #line 36 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
 #line 73 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
@@ -1555,6 +1550,15 @@ STRUCT(LightData)
 
 
 
+
+
+
+
+        Tex2D(float4) gAtmosSkyViewClear :  register(t68,space1);
+
+
+
+
         CBUFFER(LightData) gLights :  register(b0,space3);
 
 
@@ -1567,7 +1571,7 @@ STRUCT(LightData)
 
 
         CBUFFER(LightData) gLightsNear :  register(b1,space3);
-#line 614 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+#line 623 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
         Tex2D(float4) gTextures[ 880 ] :  register(t0,space0);
 
 
@@ -1578,7 +1582,7 @@ STRUCT(LightData)
 
         Tex2DArray(float4) gFlipArrays[ 16 ] :  register(t1008,space0);
         CBUFFER(BatchData) gBatch :  register(b0,space2);
-#line 638 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+#line 647 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
         CBUFFER(SkyViewData) gSkyView :  register(b1,space2);
 #line 32 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/sky.frag.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/tonemap.h.fsl"
@@ -1829,7 +1833,7 @@ float3 agxOutset(float3 v)
 }
 #line 36 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/sky.frag.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/atmosphere.h.fsl"
-#line 82 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/atmosphere.h.fsl"
+#line 85 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/atmosphere.h.fsl"
 float atmosCloudProfile(AtmosphereParams P, float h)
 {
 
@@ -1856,7 +1860,32 @@ void atmosCloudAt(AtmosphereParams P, float h, out(float3) sca, out(float3) ext)
     sca = f3(P.cloud.x * dC);
     ext = f3(P.cloud.y * dC);
 }
-#line 122 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/atmosphere.h.fsl"
+#line 124 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/atmosphere.h.fsl"
+float atmosDeckMs(AtmosphereParams P, float xNorm)
+{
+    float4 A = P.deckMsA;
+    float4 B = P.deckMsB;
+    float u = saturate(xNorm) * 7.0f;
+    float r = A.x;
+    r += (A.y - A.x) * saturate(u - 0.0f);
+    r += (A.z - A.y) * saturate(u - 1.0f);
+    r += (A.w - A.z) * saturate(u - 2.0f);
+    r += (B.x - A.w) * saturate(u - 3.0f);
+    r += (B.y - B.x) * saturate(u - 4.0f);
+    r += (B.z - B.y) * saturate(u - 5.0f);
+    r += (B.w - B.z) * saturate(u - 6.0f);
+    return r;
+}
+
+
+
+
+
+float atmosDeckDepth01(AtmosphereParams P, float h)
+{
+    return saturate((P.profGeom.z + P.profGeom.w - h) / max(2.0f * P.profGeom.w, 1.0f));
+}
+#line 162 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/atmosphere.h.fsl"
 void atmosMediumAt(AtmosphereParams P, float h,
                    out(float3) scaR, out(float3) scaM, out(float3) scaC,
                    out(float3) extAir, out(float3) extCloud)
@@ -1915,7 +1944,7 @@ float atmosHorizonCos(float r, float Rg)
     float s = Rg / max(r, 1.0f);
     return -sqrt(max(0.0f, 1.0f - s * s));
 }
-#line 209 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/atmosphere.h.fsl"
+#line 249 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/atmosphere.h.fsl"
 bool atmosDeckSpan(AtmosphereParams P, float3 ro, float3 rd, float tMax,
                    out(float) tIn, out(float) tOut)
 {
@@ -2098,9 +2127,11 @@ void atmosMultiScatterParams(AtmosphereParams P, float2 uv, out(float) r, out(fl
     float xS = atmosUnitFromUv(uv.x, P.lutDims2.x);
     float xR = atmosUnitFromUv(uv.y, P.lutDims2.y);
     muSun = clamp(saturate(xS) * 2.0f - 1.0f, -1.0f, 1.0f);
-    r = P.planet.x + saturate(xR) * (P.planet.y - P.planet.x);
+#line 455 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/atmosphere.h.fsl"
+    float rGround = P.planet.x +  10.0f ;
+    r = max(rGround, P.planet.x + saturate(xR) * (P.planet.y - P.planet.x));
 }
-#line 405 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/atmosphere.h.fsl"
+#line 470 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/atmosphere.h.fsl"
 void atmosSkyViewParams(AtmosphereParams P, float2 uv, float r,
                         out(float) viewZenithCos, out(float) lightViewCos)
 {

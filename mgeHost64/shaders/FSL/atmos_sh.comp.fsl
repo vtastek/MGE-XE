@@ -136,7 +136,14 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
         if (muSun > 0.0f)
         {
             float2 tuv = atmosTransmittanceUv(gAtmosParams, r, muSun);
-            Esun = SampleLvlTex2D(gAtmosTransmittance, gSamplerBilinearClamp, tuv, 0).rgb
+            // ⚠ THE COVER-WEIGHTED MEAN BEAM, AND FOR BROKEN CLOUD THAT IS THE RIGHT ANSWER RATHER
+            // THAN A COMPROMISE. Under cover c the sun is behind a full cloud a fraction c of the
+            // time and in the clear the rest, so the mean direct-normal irradiance is
+            // `T_air * ((1-c) + c*T_deck)` — a mixture of transmittances. The thinned-lid model
+            // computed `exp(-tau_mean)` instead, which is Jensen-wrong and always UNDER-states the
+            // mean beam. The LUT carries the air in .rgb and the deck alone in .a.
+            float4 tr = SampleLvlTex2D(gAtmosTransmittance, gSamplerBilinearClamp, tuv, 0);
+            Esun = tr.rgb * lerp(1.0f, tr.a, saturate(gAtmosParams.deckMix.x))
                  * gAtmosParams.solar.xyz;
         }
         gAtmosShOut[15] = asuint(Esun.r);
@@ -200,6 +207,28 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
         float2 fuv  = atmosMultiScatterUv(gAtmosParams, rDeck, gAtmosParams.sunDir.w);
         float  fRaw = SampleLvlTex2D(gAtmosMultiScatter, gSamplerBilinearClamp, fuv, 0).a;
         gAtmosShOut[28] = asuint(fRaw);
+
+        // ...AND THE SAME NUMBER AT THE CAMERA, WHICH IS THE ONE THE CLEAR ARM NEEDED ALL ALONG.
+        // ⚠ THE ROW ABOVE READS f AT THE DECK, so on a CLEAR sky it reports the ratio 1-2 km up in
+        // air that has almost no optical depth left — and the clear gate never printed it at all.
+        // "For clear air fms is ~0.05" (three lines up) was therefore an ASSERTION IN A COMMENT and
+        // not a reading: nothing in the log has ever contained the clear sky's f. f near the GROUND
+        // is where a Rayleigh atmosphere's re-scattered fraction actually lives, because that is
+        // where the horizon directions are long and saturated, and it is the number that decides
+        // whether F = 1/(1-f) is a guard or an amplifier. [[feedback_inequality_gate_hides_magnitude]]
+        float2 fuv0  = atmosMultiScatterUv(gAtmosParams, r, gAtmosParams.sunDir.w);
+        float  fRaw0 = SampleLvlTex2D(gAtmosMultiScatter, gSamplerBilinearClamp, fuv0, 0).a;
+        gAtmosShOut[29] = asuint(fRaw0);
+
+        // ...AND THE LUT'S RGB AT THE SAME PLACE, WHICH IS THE QUANTITY THE MARCH ACTUALLY USES.
+        // The sky-view's multiple-scattering source is `(scaR + scaM) * ms` — f only sets the series
+        // multiplier F inside it — so when the sky is over-bright and f is right, this is the row
+        // that says whether L2 is. It is a MEAN RADIANCE over the sphere and therefore bounded by
+        // the first-order field's own maximum; the gate states that bound beside it.
+        float3 ms0 = SampleLvlTex2D(gAtmosMultiScatter, gSamplerBilinearClamp, fuv0, 0).rgb;
+        gAtmosShOut[30] = asuint(ms0.r);
+        gAtmosShOut[31] = asuint(ms0.g);
+        gAtmosShOut[32] = asuint(ms0.b);
 
         // The "this dispatch actually ran" tell. A readback of zeros and a readback of a sky that
         // genuinely integrates to zero are the same 96 bytes without it, and one of those is a bug.

@@ -949,16 +949,91 @@ namespace {
     // and why the value that survives belongs folded into kMieScatterSeaLevel with this deleted.
     float g_atmosMieMul = 1.0f;
 
+    // A UNIFORM multiplier on the OZONE column, applied in the same one place. See the long note at
+    // its use in atmosphere.h: ozone is the only term in the medium that makes a sky LESS GREEN
+    // (absorption 0.650 / 1.881 / 0.085 per primary), so it is the deep-blue lever — and x1 is
+    // already Earth's ~300 Dobson mean, with the planet's whole range inside x0.7-x1.7. Above that
+    // it is a look decision about Vvardenfell's air, not a calibration.
+    float g_atmosOzoneMul = 1.0f;
+
+    // ─── S2h: THE DECK'S LIGHT REACHING THE AIR BENEATH IT ───────────────────────────────────────
+    // 1 ships the term; 0 reproduces the pre-S2h march term for term, which is the arm that makes
+    // the orange horizon a measurement instead of an argument.
+    //
+    // THE DEFECT IT CLOSES: under a closed lid the beam is gone (`sun%` 0.003) and the air's MS LUT
+    // is shadowed on purpose — atmos_multiscatter keeps the deck's EXTINCTION and drops its
+    // SCATTERING, which is correct for not double-counting the slab and silent about what replaces
+    // it. So the ~110 km of air a HORIZON ray crosses before climbing to the deck base had NO
+    // SOURCE, and what reached the eye was the far deck through the whole Rayleigh column:
+    // (5435,3207,1317), orange, fitting tau_550 = 0.7..1.1 for a 62-93 km lambda^-4 path against
+    // the 112 km the geometry needs. Gate the deck off and the same horizon reads (7033,8538,9423),
+    // blue, within 3% of a clear sky. Checked first: NOTHING AUTHORED IS ORANGE — every
+    // [Weather Overcast] colour in Morrowind.ini has B >= R, mge3/MGE.ini has no colour knobs at
+    // all, and the row's tint is (1,1,1).
+    float g_atmosDeckDown = 1.0f;
+
+    // ─── THE AIR'S MULTIPLE SCATTERING, AS AN A/B ARM ────────────────────────────────────────────
+    // ⚠⚠ 1 IS THE SHIPPED MEDIUM; 0 LEAVES THE SKY-VIEW MARCH WITH ITS FIRST ORDER ONLY. It is the
+    // same kind of thing g_atmosDeck is — a measurement arm, not a look slider — and it exists
+    // because the clear sky's own numbers could not be attributed without it. Measured at
+    // atmosMieMul=0 (a pure Rayleigh + ozone atmosphere, so every coefficient is Bruneton's and
+    // nothing is fitted), the zenith reads
+    //
+    //     shader (1671, 4343, 15229) cd/m2  vs  a CPU quadrature of the SAME integral's first
+    //     order  (512, 947, 1851)            ->  3.3x red, 4.6x green, 8.2x blue
+    //
+    // and the ENERGY row reads 112.1% with no aerosol in the model at all. Two additive sources
+    // feed that loop — single scattering and this — and no band comparison can say which. With the
+    // gate at 0 the march reduces to a quantity a 200k-step CPU integral reproduces exactly, so the
+    // decomposition is checkable rather than arguable. [[feedback_verify_the_right_artifact]]
+    float g_atmosMs = 1.0f;
+
     // ─── S4a: THE CLOUD DECK's A/B GATE ──────────────────────────────────────────────────────────
     // ⚠⚠ 0 IS THE PRE-S4a SKY, EXACTLY. The deck's beta_sca/beta_ext are multiplied by this in
     // packParams(), so 0 makes every cloud term in atmosMediumAt() identically zero and the medium
     // reduces, term for term, to the two exponentials and the ozone tent S2 shipped. That is the
     // control arm for every measurement in this phase and it is one token away in MGE_HOST_KNOBS.
     //
-    // ⚠ IT SHIPS AT 1 AND IT IS NOT A LOOK SLIDER — same treatment `atmosMieMul` documents for
-    // itself. The plan's C1 landed it at 0 so the byte-identity check had a default to be checked
-    // against; the phase's whole point is the deck, so the default that leaves the tree is ON, and
-    // the knob is deleted once S4a is accepted. [[project_forge_no_ini_flips]]
+    // ⚠⚠ IT SHIPPED AT 1 ON A SOURCE THAT CREATED ENERGY, WAS PULLED TO 0, AND IS BACK AT 1 ONLY
+    // BECAUSE A1/A2 REPLACED THE SOURCE. That history is kept here in full because the failure was
+    // not the physics — it was that §S4a of the plan said "C4/C5 HELD ... the diffuse level is 3-7x
+    // out and energy non-conserving ... Not built", and this default said 1 anyway, for nine days.
+    // [[feedback_unfinished_work_shipped_armed]] — a knob's default is a readiness claim and so is a
+    // plan's status line; when they disagree nothing in the log tells you which one is lying.
+    //
+    // What was measured in play, Cloudy weather, under the old source:
+    //
+    //     sky illuminance   658,902 lx   — ~6x the ENTIRE solar constant at the ground
+    //     sunNormal          13,693 lx   — against 93,854 in the verified clear reference
+    //     sun%                   0.017   — a sun that is 1.7% of the light has nothing to shadow
+    //     q (sky/ground)        0.8516   — against a measured real-sky 0.09-0.15
+    //
+    // The deck was not mistuned, it was NON-CONSERVING: at tau 3 the ground received 458% of the
+    // flux arriving at the top of the atmosphere, and E_sky floored at 55% however thick the lid
+    // got. A knob cannot fix a missing conservation law. A1 (delta-scaled beam,
+    // atmos_transmittance.comp.fsl) and A2 (an Eddington two-stream slab, Atmosphere::deckSolve)
+    // replaced it with one whose R + T <= 1 holds by construction.
+    //
+    // ⚠ WHAT ACTUALLY PASSED BEFORE THIS WENT BACK TO 1, recorded so the next person can re-run it
+    // rather than trust it:
+    //   * the tau sweep is monotonic and never over 100% of TOA — 67 / 51 / 15 / 3% at tau
+    //     1.74 / 3 / 24 / 96, against 458% and a 55% floor before;
+    //   * `MS SERIES` came off its ceiling, 0.98 **PINNED** -> 0.314 free — the prediction written
+    //     into atmos_multiscatter.comp.fsl before the run, which is what proves A2 reached that LUT;
+    //   * clear is UNMOVED: atmosDeck=0 and atmosDeck=1 give identical digits on the gate's clear
+    //     arm and on the live [sky] heartbeat, so the A/B partner did not drift under a fix to the
+    //     arm it is the control for;
+    //   * and the PICTURE, which no log could have answered — *"visible shadows, clouds and sky
+    //     separate"* (2026-09-09), i.e. both reported symptoms, checked by eye.
+    //
+    // ⚠ THE KNOB STAYS AT 0 = THE PRE-S4a SKY, EXACTLY, and that is still the control arm for every
+    // measurement in this phase. It is deleted when S4a is accepted, not before.
+    //
+    // ⚠ KNOWN AND EXPECTED WHILE C5 IS OUTSTANDING: Overcast / Rain / Thunder / Snow / Blizzard
+    // still carry the pre-deck aerosol "fake lid" stand-ins in kWeatherTable, UNDER the now-correct
+    // deck — so those five are DOUBLE-DARK. C4's picture set exists to document exactly that before
+    // C5 rolls them back. Cloudy, Clear, Foggy, Ash and Blight are unaffected.
+    // [[project_forge_no_ini_flips]]
     float g_atmosDeck = 1.0f;
     // The deck's own step budget, marchP.w — the QUADRATURE half of the phase, kept on its own knob
     // so "is it the optics or the quadrature" is a one-token bisection rather than a rebuild. 0
@@ -2988,6 +3063,10 @@ namespace {
         Texture*       pAtmosTransmittance = nullptr;      // kAtmosTransW x kAtmosTransH RGBA16F
         Texture*       pAtmosMultiScatter  = nullptr;      // kAtmosMsRes^2 RGBA16F
         Texture*       pAtmosSkyView       = nullptr;      // kAtmosSkyW x kAtmosSkyH RGBA16F
+        // S2i: the sky-view's CLEAR ARM — the sky seen through a GAP between clouds. Same size,
+        // same format, written by the same dispatch. The mixed field above is what the LIGHT
+        // integrates; this is what the DOME draws where the deck is broken. ~166 KB.
+        Texture*       pAtmosSkyViewClear  = nullptr;      // kAtmosSkyW x kAtmosSkyH RGBA16F
         Buffer*        pAtmosParamsCbv     = nullptr;      // gAtmosParams (13 float4)
         Shader*        pAtmosTransShader   = nullptr;
         Shader*        pAtmosMsShader      = nullptr;
@@ -4647,9 +4726,44 @@ namespace {
     // ⚠⚠ Prior-art numbers, so they are LIVE sliders and not constants
     // ([[feedback_prior_art_constants_dont_transfer]]) — that is what let this default move by a
     // panel drag first and a rebuild second.
-    float g_agxSlope  = 1.00f;
-    float g_agxPower  = 1.00f;
-    float g_agxSat    = 1.00f;
+    //
+    // ⚠⚠ THE LOOK STOPPED BEING AN IDENTITY ON 2026-09-09, AND THE REASON IT WAS ONE HAS EXPIRED.
+    // It shipped at 1/1/1/0 so that "the first thing anyone judges is the base transform itself",
+    // because the blocker was a HUE failure and a look stacked on top makes a hue judgement
+    // unattributable. That judgement is finished: S2c found and fixed the two defects that had the
+    // clear sky manufacturing 3.3x (red) to 8.2x (blue) of its own single scattering, and the
+    // medium's chroma is now derived rather than fitted. So the look is doing the job it was always
+    // for, on top of a base nobody is arguing about any more.
+    //
+    // The numbers came off a colour supplied from play — the sky read 6685A9 and was asked for
+    // 6A8ECF, "slightly brighter and slightly more saturated". Measured at that pixel, the colour
+    // was ALREADY IN THE FRAME BUFFER: scene radiance B/G is 2.16 and AgX was delivering 1.67 to
+    // the display. Restoring that is what a look is.
+    //
+    // ⚠ SATURATION ALONE CANNOT DO IT, and that is worth knowing before reaching for the obvious
+    // knob. agxLook's SAT is about LUMA, so on a blue-dominant pixel it pushes blue up and red
+    // DOWN and never moves green at all; the target needed red +8%, green +15% and blue +57%.
+    // Brightness and saturation together, which is exactly what the report said. Measured, same
+    // save, same frame:
+    //
+    //     base 1/1/1/0            6987AA
+    //     sat 1.35 alone          6087B7   (blue arrives, red leaves, green pinned)
+    //     1.20 / 1.20 / 1.15      6C98CD   <- ships; R and B within 2 codes of the target
+    //     target                  6A8ECF
+    //
+    // What is left is 10 codes of GREEN, and it is a hue the CDL cannot reach — the target wants
+    // red AND blue up relative to green, which a saturation about luma cannot produce in one move.
+    // The only term in the medium that makes a sky less green is OZONE (`atmosOzoneMul`), and it
+    // lands the hue exactly at x3.2 — about 960 Dobson, three times any atmosphere Earth has. So it
+    // is left at 1 and labelled, not folded. See its note in atmosphere.h.
+    //
+    // ⚠ AND THE SERVO EATS PART OF EVERY MOVE. Exposure is metered on DISPLAY codes, so a look that
+    // darkens the frame is answered by more exposure: E went 2.68 -> 2.84 -> 2.90 across base ->
+    // look -> look+ozone, which is why x3.2 of ozone bought only 3 codes of green instead of 10.
+    // Any further chase here is against a closed loop. [[project_forge_exposure_couples_every_level]]
+    float g_agxSlope  = 1.20f;
+    float g_agxPower  = 1.20f;
+    float g_agxSat    = 1.15f;
     float g_agxOffset = 0.00f;
 
     // THE CURVE ITSELF (step 3b) — slope, TOE power, SHOULDER power of AgX's contrast sigmoid.
@@ -5808,8 +5922,17 @@ namespace {
         // say whether an overcast level miss is the CLOUD MODEL or that one line.
         // ⚠ Sits ABOVE kAtmosShRan for the same reason kAtmosShBelow does: the float drain below
         // stops at the "ran" tell so it cannot pick up a uint COUNT and print it as a denormal.
-        kAtmosShMsF = 28,     // 1 float
-        kAtmosShUints = 32,   // padded
+        kAtmosShMsF = 28,     // 1 float: the UNCLAMPED f, at the DECK's altitude
+        kAtmosShMsF0 = 29,    // 1 float: ...and at the CAMERA's, which is the clear arm's number
+        // ⚠ AND THE LUT'S VALUE ITSELF, WHICH f ALONE COULD NOT SETTLE. `ms` is what the sky-view
+        // march multiplies by the local scattering coefficient, so the sky's multiple-scattering
+        // source is `sca * ms` and nothing else — and f only tells you the SERIES multiplier on it.
+        // Fixing f from 0.62 to 0.129 moved the zenith 5%, which said the amplifier was never the
+        // series: it is L2, the mean first-order radiance this LUT integrates. A mean over the
+        // sphere cannot exceed the field's maximum, and the first-order sky peaks at ~12.5 W/m^2/sr
+        // at the horizon — so this row is a BOUND CHECK, not a curiosity.
+        kAtmosShMs0 = 30,     // 3 floats: the multiscatter LUT at the CAMERA, native W/(m^2 sr)
+        kAtmosShUints = 36,   // padded
     };
     // The gate + readback state machine. 0 = waiting for an armed frame, 1 = the GATE frame is in
     // flight (reference parameters forced), 2 = the gate has been reported and the lane is live.
@@ -8118,6 +8241,7 @@ namespace {
                     addLut(kAtmosTransW, kAtmosTransH, "atmosTransmittance", &g_live.pAtmosTransmittance);
                     addLut(kAtmosMsRes,  kAtmosMsRes,  "atmosMultiScatter",  &g_live.pAtmosMultiScatter);
                     addLut(kAtmosSkyW,   kAtmosSkyH,   "atmosSkyView",       &g_live.pAtmosSkyView);
+                    addLut(kAtmosSkyW,   kAtmosSkyH,   "atmosSkyViewClear",  &g_live.pAtmosSkyViewClear);
 
                     BufferLoadDesc apc = {};
                     apc.mDesc.mDescriptors = DESCRIPTOR_TYPE_UNIFORM_BUFFER;
@@ -8885,7 +9009,7 @@ namespace {
             // (pAOBlur), not raw pAO; pAOBlur's per-frame UAV<->SHADER_RESOURCE ping-pong (renderScene)
             // leaves it SHADER_RESOURCE before the colour pass samples it. (Raw pAO still feeds the
             // blur as an SRV, and the DebugTextures/readback paths still inspect pAO directly.)
-            DescriptorData p[22] = {};   // was 9; +gSunMoments, +gAlphaStages, +gSkyHeight, +gSunOcc,
+            DescriptorData p[23] = {};   // was 9; +gSunMoments, +gAlphaStages, +gSkyHeight, +gSunOcc,
                                          // +gAtmosSkyView, +gAtmosParams (and headroom)
             p[0].mIndex = SRT_RES_IDX(SrtData, PerFrame, gFrameData);
             p[0].ppBuffers = &g_live.pFrameCbv;
@@ -9002,6 +9126,15 @@ namespace {
                 p[np].mIndex = SRT_RES_IDX(SrtData, PerFrame, gAtmosSkyView);
                 p[np].mCount = 1;
                 p[np].ppTextures = &g_live.pAtmosSkyView;
+                ++np;
+            }
+            // ...and S2i's clear arm beside it. Bound at ALL SIX PerFrame instances for the reason
+            // above: an unbound SRV is a LUT-shaped view of somebody else's texture, and the dome
+            // samples this one every frame.
+            if (g_live.pAtmosSkyViewClear) {
+                p[np].mIndex = SRT_RES_IDX(SrtData, PerFrame, gAtmosSkyViewClear);
+                p[np].mCount = 1;
+                p[np].ppTextures = &g_live.pAtmosSkyViewClear;
                 ++np;
             }
             if (g_live.pAtmosTransmittance) {
@@ -11482,7 +11615,7 @@ namespace {
             if (!g_live.pPerFrameSetReflect || !g_live.pPerBatchSetReflectSky) { return false; }
             {
                 Texture* vol = g_live.pWaterNormalVol ? g_live.pWaterNormalVol : g_live.pDefaultWhite;
-                DescriptorData p[18] = {};   // was 9; +gSkyHeight, +gSunOcc, +the atmosphere pair (and headroom)
+                DescriptorData p[19] = {};   // was 9; +gSkyHeight, +gSunOcc, +the atmosphere pair (and headroom)
                 p[0].mIndex = SRT_RES_IDX(SrtData, PerFrame, gFrameData);
                 p[0].ppBuffers = &g_live.pReflectFrameCbv;
                 p[1].mIndex = SRT_RES_IDX(SrtData, PerFrame, gAO);
@@ -11543,6 +11676,15 @@ namespace {
                     p[rn].ppTextures = &g_live.pAtmosSkyView;
                     ++rn;
                 }
+                // ...and S2i's clear arm beside it. Bound at ALL SIX PerFrame instances for the reason
+                // above: an unbound SRV is a LUT-shaped view of somebody else's texture, and the dome
+                // samples this one every frame.
+                if (g_live.pAtmosSkyViewClear) {
+                    p[rn].mIndex = SRT_RES_IDX(SrtData, PerFrame, gAtmosSkyViewClear);
+                    p[rn].mCount = 1;
+                    p[rn].ppTextures = &g_live.pAtmosSkyViewClear;
+                    ++rn;
+                }
                 if (g_live.pAtmosTransmittance) {
                     p[rn].mIndex = SRT_RES_IDX(SrtData, PerFrame, gAtmosTransmittance);
                     p[rn].mCount = 1;
@@ -11588,7 +11730,7 @@ namespace {
             if (!g_live.pPerFrameSetReflectGeo) { return false; }
             {
                 Texture* vol = g_live.pWaterNormalVol ? g_live.pWaterNormalVol : g_live.pDefaultWhite;
-                DescriptorData p[22] = {};   // was 13; +gSkyHeight, +gSunOcc, +the atmosphere pair (and headroom)
+                DescriptorData p[23] = {};   // was 13; +gSkyHeight, +gSunOcc, +the atmosphere pair (and headroom)
                 p[0].mIndex = SRT_RES_IDX(SrtData, PerFrame, gFrameData);
                 p[0].ppBuffers = &g_live.pReflectFrameCbvGeo;
                 p[1].mIndex = SRT_RES_IDX(SrtData, PerFrame, gAO);
@@ -11685,6 +11827,15 @@ namespace {
                     p[rn].ppTextures = &g_live.pAtmosSkyView;
                     ++rn;
                 }
+                // ...and S2i's clear arm beside it. Bound at ALL SIX PerFrame instances for the reason
+                // above: an unbound SRV is a LUT-shaped view of somebody else's texture, and the dome
+                // samples this one every frame.
+                if (g_live.pAtmosSkyViewClear) {
+                    p[rn].mIndex = SRT_RES_IDX(SrtData, PerFrame, gAtmosSkyViewClear);
+                    p[rn].mCount = 1;
+                    p[rn].ppTextures = &g_live.pAtmosSkyViewClear;
+                    ++rn;
+                }
                 if (g_live.pAtmosTransmittance) {
                     p[rn].mIndex = SRT_RES_IDX(SrtData, PerFrame, gAtmosTransmittance);
                     p[rn].mCount = 1;
@@ -11724,7 +11875,7 @@ namespace {
                 if (!g_live.pPerFrameSetSun) { return false; }
                 Texture* vol = g_live.pWaterNormalVol ? g_live.pWaterNormalVol : g_live.pDefaultWhite;
                 for (uint32_t c = 0; c < kSunCascades; ++c) {
-                    DescriptorData p[20] = {};   // was 11; +gSkyHeight, +gSunOcc, +the atmosphere pair (and headroom)
+                    DescriptorData p[21] = {};   // was 11; +gSkyHeight, +gSunOcc, +the atmosphere pair (and headroom)
                     p[0].mIndex = SRT_RES_IDX(SrtData, PerFrame, gFrameData);
                     p[0].ppBuffers = &g_live.pSunFrameCbv[c];
                     p[1].mIndex = SRT_RES_IDX(SrtData, PerFrame, gAO);
@@ -11784,6 +11935,15 @@ namespace {
                         p[sn].ppTextures = &g_live.pAtmosSkyView;
                         ++sn;
                     }
+                    // ...and S2i's clear arm beside it. Bound at ALL SIX PerFrame instances for the reason
+                    // above: an unbound SRV is a LUT-shaped view of somebody else's texture, and the dome
+                    // samples this one every frame.
+                    if (g_live.pAtmosSkyViewClear) {
+                        p[sn].mIndex = SRT_RES_IDX(SrtData, PerFrame, gAtmosSkyViewClear);
+                        p[sn].mCount = 1;
+                        p[sn].ppTextures = &g_live.pAtmosSkyViewClear;
+                        ++sn;
+                    }
                     if (g_live.pAtmosTransmittance) {
                         p[sn].mIndex = SRT_RES_IDX(SrtData, PerFrame, gAtmosTransmittance);
                         p[sn].mCount = 1;
@@ -11822,7 +11982,7 @@ namespace {
                 addDescriptorSet(R, &khDesc, &g_live.pPerFrameSetSkyHeight);
                 if (g_live.pPerFrameSetSkyHeight) {
                     Texture* khVol = g_live.pWaterNormalVol ? g_live.pWaterNormalVol : g_live.pDefaultWhite;
-                    DescriptorData p[20] = {};   // +gSunOcc, +the atmosphere pair (and headroom)
+                    DescriptorData p[21] = {};   // +gSunOcc, +the atmosphere pair (and headroom)
                     p[0].mIndex = SRT_RES_IDX(SrtData, PerFrame, gFrameData);
                     p[0].ppBuffers = &g_live.pSkyHeightFrameCbv;
                     p[1].mIndex = SRT_RES_IDX(SrtData, PerFrame, gAO);
@@ -11876,6 +12036,15 @@ namespace {
                         p[kn].mIndex = SRT_RES_IDX(SrtData, PerFrame, gAtmosSkyView);
                         p[kn].mCount = 1;
                         p[kn].ppTextures = &g_live.pAtmosSkyView;
+                        ++kn;
+                    }
+                    // ...and S2i's clear arm beside it. Bound at ALL SIX PerFrame instances for the reason
+                    // above: an unbound SRV is a LUT-shaped view of somebody else's texture, and the dome
+                    // samples this one every frame.
+                    if (g_live.pAtmosSkyViewClear) {
+                        p[kn].mIndex = SRT_RES_IDX(SrtData, PerFrame, gAtmosSkyViewClear);
+                        p[kn].mCount = 1;
+                        p[kn].ppTextures = &g_live.pAtmosSkyViewClear;
                         ++kn;
                     }
                     if (g_live.pAtmosTransmittance) {
@@ -13035,6 +13204,7 @@ namespace {
                 if (g_live.pAtmosTransPipeline && g_live.pAtmosMsPipeline && g_live.pAtmosSkyPipeline
                     && g_live.pAtmosShPipeline && g_live.pAtmosSet && g_live.pAtmosParamsCbv
                     && g_live.pAtmosTransmittance && g_live.pAtmosMultiScatter && g_live.pAtmosSkyView
+                    && g_live.pAtmosSkyViewClear
                     && g_live.pAtmosShOut && g_live.pAtmosShReadback) {
                     // ⚠ mCount = 1 ON EVERY SINGLE-TEXTURE BIND, SRV AND UAV ALIKE. Without it the
                     // descriptor count is 0 and the slot binds NOTHING — the UAV write vanishes and
@@ -13051,7 +13221,9 @@ namespace {
                                         : (inst == 1) ? g_live.pAtmosMultiScatter
                                         : (inst == 2) ? g_live.pAtmosSkyView
                                                       : g_live.pAtmosSkyView;   // SH pass writes no texture
-                        DescriptorData d[6] = {};
+                        // S2i's second output. Only the sky-view pass stores through it; the other
+                        // three bind it type-valid for the reason four lines up.
+                        DescriptorData d[7] = {};
                         d[0].mIndex = SRT_RES_IDX(AtmosphereSrtData, PerBatch, gAtmosParams);
                         d[0].ppBuffers = &g_live.pAtmosParamsCbv;
                         d[1].mIndex = SRT_RES_IDX(AtmosphereSrtData, PerBatch, gAtmosTransmittance);
@@ -13064,7 +13236,9 @@ namespace {
                         d[4].ppBuffers = &g_live.pAtmosShOut;
                         d[5].mIndex = SRT_RES_IDX(AtmosphereSrtData, PerBatch, gAtmosSkyView);
                         d[5].mCount = 1; d[5].ppTextures = &g_live.pAtmosSkyView;
-                        updateDescriptorSet(R, inst, g_live.pAtmosSet, 6, d);
+                        d[6].mIndex = SRT_RES_IDX(AtmosphereSrtData, PerBatch, gAtmosOutB);
+                        d[6].mCount = 1; d[6].ppTextures = &g_live.pAtmosSkyViewClear;
+                        updateDescriptorSet(R, inst, g_live.pAtmosSet, 7, d);
                     }
                     g_live.atmosReady = true;
                 }
@@ -14206,7 +14380,7 @@ namespace {
                 Texture* vol  = g_live.pWaterNormalVol ? g_live.pWaterNormalVol : g_live.pDefaultWhite;
                 Texture* refr = g_live.pRefractColor   ? g_live.pRefractColor   : g_live.pDefaultWhite;
                 Texture* lin  = g_live.pLinearDepth    ? g_live.pLinearDepth    : g_live.pDefaultWhite;
-                DescriptorData p[24] = {};   // was 15; +gSkyHeight, +gSunOcc, +the atmosphere pair (and headroom)
+                DescriptorData p[25] = {};   // was 15; +gSkyHeight, +gSunOcc, +the atmosphere pair (and headroom)
                 p[0].mIndex = SRT_RES_IDX(SrtData, PerFrame, gFrameData);
                 p[0].ppBuffers = &g_live.pFPFrameCbv;
                 p[1].mIndex = SRT_RES_IDX(SrtData, PerFrame, gAO);
@@ -14300,6 +14474,15 @@ namespace {
                     p[fpn].mIndex = SRT_RES_IDX(SrtData, PerFrame, gAtmosSkyView);
                     p[fpn].mCount = 1;
                     p[fpn].ppTextures = &g_live.pAtmosSkyView;
+                    ++fpn;
+                }
+                // ...and S2i's clear arm beside it. Bound at ALL SIX PerFrame instances for the reason
+                // above: an unbound SRV is a LUT-shaped view of somebody else's texture, and the dome
+                // samples this one every frame.
+                if (g_live.pAtmosSkyViewClear) {
+                    p[fpn].mIndex = SRT_RES_IDX(SrtData, PerFrame, gAtmosSkyViewClear);
+                    p[fpn].mCount = 1;
+                    p[fpn].ppTextures = &g_live.pAtmosSkyViewClear;
                     ++fpn;
                 }
                 if (g_live.pAtmosTransmittance) {
@@ -17296,6 +17479,41 @@ namespace {
     float g_mwAmbCode = 0.552182f;   // luma of [Weather Clear] Ambient Day Color 137,140,160
     float g_mwSunCode = 0.986772f;   // luma of [Weather Clear] Sun Day Color     255,252,238
 
+    // ─── ...AND THE SAME PAIR WITHOUT MGE'S PER-WEATHER LOOK MULTIPLIERS, WHICH IS THE ONE THE ───
+    // ─── SETPOINT ACTUALLY WANTS ─────────────────────────────────────────────────────────────────
+    //
+    // ⚠⚠ THE PAIR ABOVE IS A PRODUCT, AND HALF OF IT IS A LOOK DIAL. lighting[4..10] carries
+    // `Configuration.Lighting.SunMult[weather] * sunCol` — MGEgui's "Cloudy Sun Brightness" and its
+    // nine siblings, a DX9-era per-weather look table. The comment three lines up says this rule
+    // tracks "MW's own delivered level", and against MW alone it does; against MW TIMES a look dial
+    // it tracks the dial too, and the dial is per-weather.
+    //
+    // What that cost, measured on this install's own ini (mge3/MGE.ini, [Per Pixel Lighting]) and
+    // reproduced exactly by the three heartbeats in hdrdump/pics/look-ship:
+    //
+    //     weather    SunMult/AmbMult    mwRef sun/amb    setpoint      picture
+    //     Clear        1.00 / 1.00      0.987 / 0.552     0.996x day   accepted
+    //     Cloudy       1.60 / 1.35      1.499 / 0.764     1.435x day   "so washed out"
+    //     Overcast     0.00 / 1.00      0.000 / 0.377     0.398x day   "so dark"
+    //
+    // 1.435 / 0.398 = 3.6x — 1.85 stops of exposure swing with the sun at the same 78.6 deg
+    // elevation in all three frames. Clear read acceptable for the one reason that makes this hard
+    // to see: its two entries are the only 1.00s in the table, so the anchor and the defect agree
+    // exactly where anybody would check first. Same shape as the dead latch this file already
+    // records ("the initialiser IS the day anchor").
+    //
+    // ⚠ AND THE DIAL DRAWS NOTHING HERE. The physical sky overwrites fd[20..26] wholesale at
+    // blend=1/ramp=1 (see the skyPhysicalMeasure blend), so in the Forge path these multipliers no
+    // longer light a single pixel — they survived ONLY in this reference. A look knob that has lost
+    // its picture and kept its exposure is strictly worse than one that does nothing.
+    //
+    // ⚠ CARRIED ON ITS OWN TWO LANES, NOT DIVIDED BACK OUT. SunMult is 0.00 for eight of the ten
+    // weathers in this install, and a product with a zero in it does not remember its other factor.
+    // Same initialiser as the pair above, for the same reason: a frame that arrives before any
+    // lighting does reports the day anchor rather than a black one.
+    float g_mwAmbCodeRef = 0.552182f;
+    float g_mwSunCodeRef = 0.986772f;
+
     // ⚠ THE SUN TERM CARRIES N.L, AND LEAVING IT OUT WAS THE FIRST VERSION'S REAL ERROR. The model
     // stated three lines up is `ambCode + sunCode * N.L` and the first cut implemented
     // `ambCode + 0.4 * sunCode` — the N.L quietly approximated away as a constant. That is exactly
@@ -17777,13 +17995,13 @@ namespace {
     // (linear) and this level lives in CODES, so it is decode -> scale -> re-encode. Applying 0.65
     // straight to the code would take ~0.62 stops off the ambient instead of ~0.62 of it.
     float mwRefLevel() {
-        const float ambCode = linearToSrgbF(srgbToLinearF(g_mwAmbCode) * nightAmbScaleNow());
+        const float ambCode = linearToSrgbF(srgbToLinearF(g_mwAmbCodeRef) * nightAmbScaleNow());
         // sin(N.L) off MW's LIGHT elevation. Falls back to the day anchor's own sine when the model
         // is not cooked, so "no physical sky" reports the row rather than an accidental midnight.
         const float sinEl = g_skyPhys.active
             ? std::max(0.0f, std::sin(g_skyPhys.elevLight * (float)(SceneCal::kPi / 180.0)))
             : kCalDayElevSin;
-        return ambCode + g_calSunWeight * sinEl * g_mwSunCode;
+        return ambCode + g_calSunWeight * sinEl * g_mwSunCodeRef;
     }
 
     // ...AND THE SAME QUESTION FOR AN INTERIOR, WHICH IS WHERE THE SETPOINT WAS NEVER ASKED IT.
@@ -17803,8 +18021,87 @@ namespace {
     // and an interior has no sky to be moonlit by. nightAmbScaleNow() returns 1 with the sky model
     // off anyway, so this is documenting the intent rather than changing the value — but a later
     // interior that DOES cook a sky must not silently start trimming its cell ambient.
+    // ⚠ THE REF PAIR HERE TOO, THOUGH IT CHANGES NOTHING TODAY: lightSunMult/lightAmbMult are
+    // hard-set to 1.0 in every interior (distantland.cpp, the no-weather branch), so ref == eff
+    // indoors. It reads the ref pair anyway because "the setpoint never reads a look dial" is the
+    // rule, and a rule with one exception in it is a rule somebody re-derives wrongly later.
     float mwRefLevelInterior() {
-        return g_mwAmbCode + g_calSunWeight * g_mwSunCode;
+        return g_mwAmbCodeRef + g_calSunWeight * g_mwSunCodeRef;
+    }
+
+    // ─── B1: ...AND THE HALF OF IT THAT IS NOT AN AUTHORED COLOUR AT ALL ─────────────────────────
+    //
+    // ⚠⚠ THE TWO LINES ABOVE STATE THIS DEFECT AND THEN SHIP IT. "MW's delivered interior level also
+    // contains its POINT LIGHTS, which are not in any authored cell colour. So it tracks the cell's
+    // FLOOR, not its mean." — and calTarget() then compares that floor against the APL meter's frame
+    // MEAN. A target and a measurement in different units, which is the whole of "interiors are too
+    // dark for AO to work in". Measured on the two saves the complaint named:
+    //
+    //     South Wall Cornerclub  lvl mean 17-20  p10 0  p50 11-14  p90 44-51   target 15-20
+    //     Dralasa Nithryon       lvl mean 18-19  p10 0  p50 11-12  p90 42-44   target 15-20
+    //
+    // The mean is IN BAND, and it is in band only because a small population of lamp pixels drags it
+    // there — p90 is four times p50 and the bottom decile is at literal display zero. AO modulates
+    // AMBIENT only (opaque.frag.fsl: `a *= aoAmbientTerm(...)`, while point lights accumulate into
+    // `d` and are never touched, deliberately), so AO's entire carrier in these cells is a population
+    // sitting at codes 0-12. There is nothing there for it to modulate.
+    //
+    // ⚠ THIS IS THE POINT-LIGHT TERM AS **MW's OWN ATTENUATION LAW** GIVES IT, and there is no new
+    // free constant in it. Each light carries its own (k0,k1,k2) from the wire — the same triple
+    // opaque.frag.fsl divides by — and the same `reach` in radii the frag culls at. What has to be
+    // supplied is the average over the surfaces the light hits, and that is a quadrature rather than
+    // a dial: with surface area growing as d^2 out to the reach,
+    //
+    //     <att> = INT_0^R att(d) d^2 dd / INT_0^R d^2 dd
+    //
+    // and the cosine over those surfaces is the SAME mean-cosine g_calSunWeight already carries for
+    // the sun. So the interior reference gains a term of exactly the shape the exterior one has, and
+    // it is driven by the lamps the cell actually contains rather than by a per-cell gain.
+    // [[feedback_one_knob_two_jobs]] — a gain would have been a second job for a knob that already
+    // has one; this is the missing HALF OF THE MODEL.
+    //
+    // ⚠ CODE SPACE, like g_mwAmbCode and g_mwSunCode. The wire's colours are MW's authored
+    // display-referred NiPointLight diffuse and this luma is taken BEFORE decodeAuthoredRGB runs on
+    // the upload copy — so all three terms are in MW's gamma space, which is the space MW's own
+    // delivered level lives in and the only space in which they may be added.
+    float g_mwPtCode = 0.0f;
+
+    // ─── ⚠⚠ AND THE INSTRUMENT REFUTED THE MODEL IT WAS BUILT TO SHIP. MEASURED, BOTH SAVES: ────
+    //
+    //     South Wall Cornerclub  n=16 lamps  pt 2.47-2.53  ->  1.43-1.47x day  ->  setpoint  99-102
+    //     Dralasa Nithryon       n= 8 lamps  pt 1.14-1.51  ->  0.80-1.00x day  ->  setpoint  56- 69
+    //
+    // A clear NOON EXTERIOR asks for 64. So the sum says a tavern should be brighter than open
+    // daylight, and it says so roughly in PROPORTION TO THE LAMP COUNT — which is the signature of
+    // the error and not a coincidence. Summing per-light averages asks "what would this lamp deliver
+    // if its reach volume were the whole frame", once per lamp, and sixteen lamps in one room do not
+    // make sixteen rooms: THEIR REACH VOLUMES OVERLAP AND TOGETHER THEY ARE THE ROOM. A typical
+    // surface is lit by one or two nearby lamps, not by all of them.
+    //
+    // ⚠ THE OTHER BRACKET IS ALSO WRONG, WHICH IS WHAT MAKES THIS A REAL GAP RATHER THAN A SIGN
+    // ERROR. Dividing by n — "a typical surface sees about one lamp" — puts the tavern at 0.213x day
+    // -> setpoint 14.9, BELOW the 17.0 floor that is in force today, i.e. it would make the
+    // complained-about interiors DARKER. The truth is between the two brackets and where exactly
+    // depends on how much the lamps' reach volumes overlap, which is a property of the CELL'S
+    // GEOMETRY and is not on the wire. Guessing a normaliser here would be exactly the dial the
+    // plan ruled out. [[feedback_model_class_not_knobs]]
+    //
+    // ⚠ AND B0 TURNED UP A SECOND THING THE PLAN DID NOT HAVE: ON BOTH COMPLAINT SAVES THE
+    // MW-REFERRED RULE IS NOT IN FORCE AT ALL. FLOOR gives 0.130x and 0.201x day -> 9.1 and 14.1,
+    // both below g_calInteriorFloor = 17, so `std::max` takes the floor and the target is 17.0 in
+    // both cells. The servo then delivers mean 17-20 against it and reports need ~1.0x — it is
+    // converged, not fighting. So "the servo is pulled down by a target in the wrong units" is the
+    // right MECHANISM and the wrong CULPRIT for these two saves: what sets the number today is one
+    // constant, and the histogram underneath it (p10 0, p50 11-14, p90 44-51) is what leaves AO
+    // nothing to modulate. [[feedback_verify_the_right_artifact]]
+    // The A/B, and it is OFF — now for a stronger reason than "nobody has looked". The arm is
+    // MEASURED WRONG by the instrument beside it, and it stays wired because the two brackets and
+    // the live `pt` are the only numbers anyone has about the size of this term. Do not arm it
+    // expecting a fix; arm it to see the upper bracket's picture.
+    bool g_calInteriorLit = false;
+
+    float mwRefLevelInteriorLit() {
+        return g_mwAmbCodeRef + g_calSunWeight * (g_mwSunCodeRef + g_mwPtCode);
     }
 
     // ─── P2b: THE TWO ELEMENT LANES THE MODEL HAS TO SET ─────────────────────────────────────────
@@ -17848,7 +18145,31 @@ namespace {
     // is already casting with. The implied ratio to the zenith is albedo/q, which the heartbeat
     // prints; at the reference q = 0.124 that is 6.4x, inside the physical band a sunlit cumulus
     // occupies. Lower it if the silver linings read hot.
-    float g_skyCloudAlbedo = 0.80f;
+    //
+    // ⚠ 0.80 -> 0.50, 2026-09-11: *"clouds layer is blown up, it should be exposed perfectly."*
+    //
+    // The paragraph above treats MW's painted cloud texture as an ALBEDO MAP whose white is a 0.80
+    // reflectance. It is not one. MW's Tx_Sky_*.tga are painted SDR DISPLAY IMAGES, so their white
+    // is an EXPOSED value an artist chose, not a physical reflectance
+    // ([[project_sdr_exposed_not_radiance]]) — and anchoring an exposed image at the brightest
+    // reflectance a real cloud face can have puts the whole layer on the display's ceiling.
+    // Measured on Cloudy: the cloud layer sat at display 237..253, the top SIXTEEN codes, with
+    // 0.57% of sky pixels hard against 254.
+    //
+    // 0.50 says the texture's white is a TYPICAL cloud face rather than a maximally-lit one. The
+    // layer moves to 222..240, clipping goes to 0.00%, and cloud/sky stays 2.9x — inside the 3-8x a
+    // real cumulus runs against its own zenith, where 0.80 sat at 3.6x.
+    //
+    // ⚠ WHAT THIS DOES NOT BUY IS DRAMA, AND THE MEASUREMENT SAYS SO. The cloud layer carries only
+    // **0.55 stops** of scene variation (Cloudy sky p75 0.358 -> p99 0.523), so its rendered spread
+    // is ~18 codes at ANY anchor — 16 at 0.80, 18 at 0.50, 18 at 0.35. That contrast is MW's
+    // TEXTURE'S, and nothing downstream can add what the source does not have. Moving the layer off
+    // the ceiling makes those 18 codes visible instead of crushed against white; more than that
+    // needs a higher-contrast source, i.e. the volumetric deck (S4b), not a dial here.
+    //
+    // ⚠ AND NOT THE TONE CURVE — agxShoulderPower was swept FIRST and is a dead end: 1.0 -> 2.5
+    // buys 58 -> 65 codes of sky spread while clipping goes 0.57% -> 60.94%. Wrong trade, measured.
+    float g_skyCloudAlbedo = 0.50f;
 
     // ...and the clouds' NIGHT floor, in absolute scene units, because the anchor above cannot reach
     // night and pretending otherwise shipped a black cloud layer.
@@ -24160,6 +24481,22 @@ void destroyHostWindow(Renderer* R);
             { "atmosCacheDeg",      &g_atmosCacheDeg      },
             { "atmosCacheAltM",     &g_atmosCacheAltM     },
             { "atmosMieMul",        &g_atmosMieMul        },
+            { "atmosOzoneMul",      &g_atmosOzoneMul      },
+            { "atmosMs",            &g_atmosMs            },
+            { "atmosDeckDown",      &g_atmosDeckDown      },
+            { "skyCloudAlbedo",     &g_skyCloudAlbedo     },
+            // ⚠ THE AgX LOOK, ON THE HARNESS. Four panel sliders that the minimized rig could not
+            // reach, so "what does Punchy actually do to the sky" was a question no unattended run
+            // could answer and every judgement of it had to be taken by hand at the keyboard. Same
+            // reason MGE_HOST_KNOBS exists at all. The curve's own three go with them, because
+            // 2.02/2.90/2.90 reproduces the retired polynomial and that is the regression arm.
+            { "agxSlope",           &g_agxSlope           },
+            { "agxPower",           &g_agxPower           },
+            { "agxSat",             &g_agxSat             },
+            { "agxOffset",          &g_agxOffset          },
+            { "agxSlope2",          &g_agxSlope2          },
+            { "agxToePower",        &g_agxToePower        },
+            { "agxShoulderPower",   &g_agxShoulderPower   },
             { "atmosDeck",          &g_atmosDeck          },
             { "atmosDeckSteps",     &g_atmosDeckSteps     },
             { "atmosSkySteps",      &g_atmosSkySteps      },
@@ -24473,6 +24810,10 @@ void destroyHostWindow(Renderer* R);
             // The interior setpoint rule, env-driven because its whole A/B is a LEVEL and the
             // minimized harness is the only way to measure one without a hand on the exposure.
             { "calFollowMwInterior", &g_calFollowMwInterior },
+            // B1's A/B. The interior setpoint tracks the cell's authored ambient (a FLOOR) while the
+            // APL meter reports a frame MEAN dominated by lamp pools; this makes the target a mean
+            // too. Off by default until the picture has been looked at — see mwRefLevelInteriorLit.
+            { "calInteriorLit",      &g_calInteriorLit      },
             // The servo itself. OFF pins E to exactly 1.0, which in this unit convention is the
             // "reproduce MW" arm — the only way to measure what the plant delivers with no gain on
             // it, and therefore the only way to say what an interior setpoint SHOULD be rather than
@@ -25333,7 +25674,8 @@ void destroyHostWindow(Renderer* R);
         LOG::logline(">> [forge-hb][atmos] %s: %s(%d) -> %s(%d) t=%.3f"
                      " | air ray=%.2fx mie=%.2fx abs=%.2f g=%.2f h=%.2fkm tint=(%.2f,%.2f,%.2f) o3=%.2fx"
                      " | deck cover=%.2f type=%.2f base=%.2fkm thick=%.2fkm precip=%.2f"
-                     " -> tau=%.2f ext=%.3e/m ssa=%.4f g=%.2f (x%.2f, %.0f steps)"
+                     " -> tauFULL=%.2f (a MIX WEIGHT now, not a thinner: cover blends this cloud"
+                     " against a clear sky) ext=%.3e/m ssa=%.4f g=%.2f (x%.2f, %.0f steps)"
                      " | MW clouds=%.3f speed=%.3f wind=%.3f fog day=%.3f night=%.3f"
                      " | thunder=%.3f glare=%.3f occluded=%d"
                      " | ref sky=(%.3f,%.3f,%.3f) fog=(%.3f,%.3f,%.3f)",
@@ -25555,7 +25897,10 @@ void destroyHostWindow(Renderer* R);
             // half-width — the ONLY thing that changes is that the reference is now this cell's own
             // authored light instead of a number that was true of no cell in particular.
             if (g_calFollowMwInterior) {
-                const float ratio = mwRefLevelInterior() / calMwDayRef();
+                // B1: `calInteriorLit` swaps the cell's authored FLOOR for the level MW actually
+                // delivers, lamps included — the units the APL meter has always been reporting in.
+                const float ratio = (g_calInteriorLit ? mwRefLevelInteriorLit()
+                                                      : mwRefLevelInterior()) / calMwDayRef();
                 const float c     = std::max(g_calInteriorFloor, kCalMwDayCentre * ratio);
                 static char iname[48];
                 std::snprintf(iname, sizeof(iname), "MW-referred %.2fx day (interior)", (double)ratio);
@@ -26748,7 +27093,11 @@ void destroyHostWindow(Renderer* R);
                 std::memcpy(&g_atmosShLast[kAtmosShBelow + i], &ar[kAtmosShBelow + i], sizeof(float));
             }
             // ...and S4a's multiscatter-ratio instrument, which sits past the tell for the same reason.
-            std::memcpy(&g_atmosShLast[kAtmosShMsF], &ar[kAtmosShMsF], sizeof(float));
+            std::memcpy(&g_atmosShLast[kAtmosShMsF],  &ar[kAtmosShMsF],  sizeof(float));
+            std::memcpy(&g_atmosShLast[kAtmosShMsF0], &ar[kAtmosShMsF0], sizeof(float));
+            for (uint32_t i = 0; i < 3u; ++i) {
+                std::memcpy(&g_atmosShLast[kAtmosShMs0 + i], &ar[kAtmosShMs0 + i], sizeof(float));
+            }
             // ⚠ "ran" IS NOT COSMETIC. A readback of zeros and a sky that genuinely integrates to
             // zero are the same 128 bytes; without the tell, a dispatch that silently did nothing
             // would publish a black ambient and look exactly like midnight. Only a reported run
@@ -27179,6 +27528,19 @@ void destroyHostWindow(Renderer* R);
                 if (!uwNow) {
                     g_mwSunCode = 0.2126f * lighting[4] + 0.7152f * lighting[5] + 0.0722f * lighting[6];
                     g_mwAmbCode = 0.2126f * lighting[8] + 0.7152f * lighting[9] + 0.0722f * lighting[10];
+                    // ...and the LOOK-FREE pair the setpoint reads (see g_mwSunCodeRef). Already
+                    // reduced to one luma each on the client, by the same Rec.709 weights, so the
+                    // two processes cannot disagree about what "level" means.
+                    //
+                    // ⚠ THE ZERO GUARD IS A WIRE-VERSION TEST, not a physical one. An mgecore.dll
+                    // built before these lanes existed ships two zeroes here, and silently aiming a
+                    // setpoint at zero would drive E to its ceiling in every exterior. Both-zero is
+                    // the only reading a live client cannot produce (MW's ambient is never exactly 0
+                    // in a cell that has lighting at all), and where a frame IS genuinely black the
+                    // fallback is bit-identical anyway.
+                    const bool refWired = (lighting[38] != 0.0f) || (lighting[39] != 0.0f);
+                    g_mwSunCodeRef = refWired ? lighting[38] : g_mwSunCode;
+                    g_mwAmbCodeRef = refWired ? lighting[39] : g_mwAmbCode;
                 }
                 unblendUnderwaterTint(fdc, lighting, uwNow, g_uwMwTinted);
                 fdc[23] = 0.0f;
@@ -27686,6 +28048,49 @@ void destroyHostWindow(Renderer* R);
                 }
             }
             g_lastLightCount = nL;
+
+            // ─── B1: MW'S OWN POINT-LIGHT LEVEL, IN MW'S CODE SPACE ─────────────────────────────
+            // ⚠ COMPUTED HERE, OFF `lightBlob`, AND NOT OFF THE CBUFFER. The mapped upload buffer is
+            // WRITE-COMBINED and reading one back is a documented trap
+            // ([[project_forge_wc_read_trap]]); it has also just been decoded in place by the loop
+            // above, so it no longer holds the authored gamma-space colours this reference needs.
+            // The blob is the source and is still encoded. See mwRefLevelInteriorLit().
+            {
+                const float reachK = ((float*)lc)[1];
+                double acc = 0.0;
+                const float* lw = (const float*)lightBlob;
+                for (uint32_t i = 0; lw && i < nL; ++i) {
+                    const float  radius = lw[i * 12 + 3];
+                    const float* col    = lw + i * 12 + 4;
+                    const float  k0 = lw[i * 12 + 8], k1 = lw[i * 12 + 9], k2 = lw[i * 12 + 10];
+                    const float  R  = radius * reachK;
+                    if (!(R > 0.0f)) { continue; }
+                    const double lum = 0.2126 * col[0] + 0.7152 * col[1] + 0.0722 * col[2];
+                    if (lum <= 0.0) { continue; }
+                    // <att> over the reach, weighted by the d^2 the surface area grows as. 32 steps
+                    // is far more than a smooth 1/(quadratic) needs and costs 4096 flops a frame at
+                    // the 128-light cap. The tail ramp is the frag's, so the two agree about where
+                    // the light stops rather than about where it nearly stops.
+                    const int    kN = 32;
+                    double num = 0.0, den = 0.0;
+                    for (int q = 0; q < kN; ++q) {
+                        const double d  = R * ((double)q + 0.5) / (double)kN;
+                        const double w  = d * d;
+                        double att = 1.0 / std::max((double)k2 * d * d + (double)k1 * d + (double)k0,
+                                                    1.0e-4);
+                        // POINT_LIGHT_TAIL is opaque.srt.h's, which the host compiles as C++ — so
+                        // this is the frag's own constant and not a copy of it.
+                        const double t = std::max(0.0, std::min(1.0,
+                                            (d - (double)POINT_LIGHT_TAIL * R)
+                                            / std::max(1.0e-6, R - (double)POINT_LIGHT_TAIL * R)));
+                        att *= 1.0 - t * t * (3.0 - 2.0 * t);
+                        num += std::min(att, 1.0) * w;
+                        den += w;
+                    }
+                    acc += lum * (den > 0.0 ? num / den : 0.0);
+                }
+                g_mwPtCode = (float)acc;
+            }
 
             // Near clustered forward: bin the just-uploaded near lights (same order as gLights) into a
             // screen-tile x radial-slice froxel grid — exactly the distant fill in dlLiveCullAndBuild,
@@ -38419,6 +38824,7 @@ void destroyHostWindow(Renderer* R);
                                  " | fogTarget below=(%.0f,%.0f,%.0f) land=(%.0f,%.0f,%.0f) cd/m2"
                                  " | scene amb=%.4f sun=%.4f ratio=%.2f | unit=%.0fcd/m2"
                                  " | mwRef amb=%.3f sun=%.3f nl=%.3f m=%.3f (%.3fx day -> setpoint %.1f)"
+                                 " refDiv=(sun x%.2f amb x%.2f)"
                                  " | zenith=%.5f stars=%.5f (%.1f%% of zenith)"
                                  " cloud=%.5f (%.1fx zenith, albedo %.2f / q)"
                                  " | sunDisc %s omega=%.3e sr (%.2fdeg, %.0fx solar) L=%.1f p=%.2f",
@@ -38445,13 +38851,24 @@ void destroyHostWindow(Renderer* R);
                                  (double)g_fogNearScene[2] * SceneCal::kSceneUnitCd,
                                  ambL, sunL, (ambL > 1.0e-9) ? (sunL / ambL) : 0.0,
                                  SceneCal::kSceneUnitCd,
-                                 (double)g_mwAmbCode, (double)g_mwSunCode,
+                                 (double)g_mwAmbCodeRef, (double)g_mwSunCodeRef,
                                  (double)(g_skyPhys.active
                                      ? std::max(0.0f, std::sin(g_skyPhys.elevLight
                                                                * (float)(SceneCal::kPi / 180.0)))
                                      : kCalDayElevSin),
                                  (double)mwRefLevel(), (double)(mwRefLevel() / calMwDayRef()),
                                  (double)(kCalMwDayCentre * mwRefLevel() / calMwDayRef()),
+                                 // EVERYTHING DIVIDED OUT OF THE SETPOINT'S REFERENCE, as the ratio
+                                 // the wire lets us recover: MW's delivered light over the reference
+                                 // the servo aims by. TWO things now live in it — MGEgui's per-weather
+                                 // look table (Cloudy sun x1.60) and the per-weather DAY-ROW
+                                 // normalisation the client applies (renderprocess.cpp, sunColRef) —
+                                 // so it is no longer the ini dial alone and is named for what it is.
+                                 // Clear reads x1.00/x1.00 because both factors are the identity there.
+                                 // It stays on the line so the next person to read "cloudy is washed
+                                 // out" sees the divisor beside the setpoint rather than hunting an ini.
+                                 (g_mwSunCodeRef > 1.0e-6f) ? (double)(g_mwSunCode / g_mwSunCodeRef) : 0.0,
+                                 (g_mwAmbCodeRef > 1.0e-6f) ? (double)(g_mwAmbCode / g_mwAmbCodeRef) : 0.0,
                                  g_skyPhys.zenithScene,
                                  (double)g_skyPhys.starScene,
                                  (g_skyPhys.zenithScene > 1.0e-9)
@@ -38474,12 +38891,29 @@ void destroyHostWindow(Renderer* R);
                     // Printed whatever g_calFollowMwInterior is set to, so the A/B has both arms.
                     const float iref = mwRefLevelInterior();
                     const float irat = iref / calMwDayRef();
+                    // B1: BOTH ARMS, ALWAYS. The floor-referred reference and the lamp-inclusive one
+                    // print side by side whatever `calInteriorLit` is set to, for the reason the
+                    // paragraph above gives about the exterior branch — a calibration whose input you
+                    // cannot read is not falsifiable, and this one has TWO inputs now. `pt` is the
+                    // lamps' own contribution in MW code space (mwRefLevelInteriorLit); `setpoint`
+                    // is what each arm would ask the servo for, AFTER g_calInteriorFloor — which is
+                    // the number to watch, because on both complaint saves the floor is what is
+                    // actually in force and the MW-referred value never reaches it.
+                    const float ilit = mwRefLevelInteriorLit();
+                    const float ilrat = ilit / calMwDayRef();
                     LOG::logline(">> [forge-hb][sky] HW OFF (%s) — MW's sky mesh and MW's lighting"
-                                 " | mwRef amb=%.3f sun=%.3f m=%.3f (%.3fx day -> setpoint %.1f)"
-                                 " followMwInterior=%d",
+                                 " | mwRef amb=%.3f sun=%.3f pt=%.3f n=%u"
+                                 " | FLOOR m=%.3f (%.3fx day -> setpoint %.1f)"
+                                 " | LIT m=%.3f (%.3fx day -> setpoint %.1f)"
+                                 " | armed=%s followMwInterior=%d",
                                  g_skyHw ? "interior / no sun" : "master toggle",
-                                 (double)g_mwAmbCode, (double)g_mwSunCode, (double)iref, (double)irat,
+                                 (double)g_mwAmbCode, (double)g_mwSunCode, (double)g_mwPtCode,
+                                 g_lastLightCount,
+                                 (double)iref, (double)irat,
                                  (double)std::max(g_calInteriorFloor, kCalMwDayCentre * irat),
+                                 (double)ilit, (double)ilrat,
+                                 (double)std::max(g_calInteriorFloor, kCalMwDayCentre * ilrat),
+                                 g_calInteriorLit ? "LIT" : "floor",
                                  g_calFollowMwInterior ? 1 : 0);
                 }
                 // The medium MW's weather currently describes. Sits with the [sky] line because
@@ -49637,7 +50071,9 @@ void destroyHostWindow(Renderer* R);
         static_assert(sizeof(pk) == kAtmosParamsCbvBytes,  "cache key must be the WHOLE cbuffer");
         Atmosphere::packParams(row, albedo, toSun, camRadius - Atmosphere::kGroundRadiusM,
                                toMoon, moonE, std::max(0.0f, g_atmosAirglow), g_atmosMieMul,
-                               g_atmosDeck, g_atmosSkySteps, 20.0f, g_atmosMsDirs,
+                               g_atmosOzoneMul,
+                               g_atmosDeck, g_atmosMs, g_atmosDeckDown,
+                               g_atmosSkySteps, 20.0f, g_atmosMsDirs,
                                g_atmosDeckSteps, lutDims, pk);
 
         // The skip. A gate frame ALWAYS dispatches -- it exists to certify the live chain, and a
@@ -49693,10 +50129,12 @@ void destroyHostWindow(Renderer* R);
         // 3. SKY-VIEW (192x108). Reads both. This is the one the pixels come from AND the one the
         //    light comes from — see atmos_sh.comp below.
         toUav(g_live.pAtmosSkyView);
+        toUav(g_live.pAtmosSkyViewClear);          // S2i: one dispatch, two outputs
         cmdBindPipeline(g_live.pCmd, g_live.pAtmosSkyPipeline);
         cmdBindDescriptorSet(g_live.pCmd, 2, g_live.pAtmosSet);
         cmdDispatch(g_live.pCmd, (kAtmosSkyW + 7u) / 8u, (kAtmosSkyH + 7u) / 8u, 1);
         toSrv(g_live.pAtmosSkyView);
+        toSrv(g_live.pAtmosSkyViewClear);
 
         // 4. THE MEASUREMENT (one group of 128). Projects the sky-view LUT into SH-L1 over the full
         //    sphere and computes the scalar probes in the same pass.
@@ -49836,14 +50274,34 @@ void destroyHostWindow(Renderer* R);
                          all ? ">>" : "!!", all ? "PASS" : "**MISSED**",
                          SceneCal::kRefAlbedo, SceneCal::kRefElevation * 180.0 / SceneCal::kPi,
                          g_atmosGateFrame);
+            // ⚠ f AND ITS SERIES SUM RIDE THE CLEAR ROW NOW. This arm never printed them: the only
+            // f in the log came off the OVERCAST arm at the DECK's altitude, and "clear air runs
+            // f~0.05" was an assertion in a shader comment that no run had ever tested. f near the
+            // GROUND is where a Rayleigh atmosphere's re-scattered fraction lives, and F = 1/(1-f)
+            // multiplies the whole diffuse field, so it is the first thing to read when the sky is
+            // over-bright and the beam is not. `msArm` says which arm produced the row.
+            const double fGnd = (double)rb[kAtmosShMsF0];
+            const double msC[3] = { (double)rb[kAtmosShMs0 + 0], (double)rb[kAtmosShMs0 + 1],
+                                    (double)rb[kAtmosShMs0 + 2] };
+            const double Fser = 1.0 / std::max(1.0e-3, 1.0 - std::min(0.98, fGnd));
             LOG::logline("%s [forge-atmos] gate PHYSICS: q_zenith %.4f [%s, band %.3f-%.3f]"
                          " | sun%% %.3f [%s, band %.2f-%.2f] | direct-normal %.1f klx [%s, ~94 expected]"
-                         " | E_sky %.0f lx E_sun %.0f lx | ran=%u",
+                         " | E_sky %.0f lx E_sun %.0f lx | ms f(ground)=%.4f -> F=%.2f (msArm %.2f)"
+                         " | ran=%u",
                          (okQ && okSun && okKlx) ? ">>" : "!!",
                          q, okQ ? "OK" : "OUT", SceneCal::kQZenithLo, SceneCal::kQZenithHi,
                          sunPct, okSun ? "OK" : "OUT", SceneCal::kSunShareLo, SceneCal::kSunShareHi,
                          sunKlx, okKlx ? "OK" : "OUT",
-                         lumSky * 683.0, lumSun * 683.0, g_atmosShLastRan);
+                         lumSky * 683.0, lumSun * 683.0, fGnd, Fser, (double)g_atmosMs,
+                         g_atmosShLastRan);
+            LOG::logline("%s [forge-atmos] gate MS SOURCE: L_ms(camera) = (%.2f, %.2f, %.2f) W/m2/sr"
+                         " = L2 x F. ⚠ IT IS A MEAN RADIANCE OVER THE SPHERE, so it CANNOT exceed the"
+                         " first-order field's own maximum — measured with msArm 0, that field peaks"
+                         " at the horizon at (12.0, 12.9, 10.7) and its zenith is (0.75, 1.39, 2.71)."
+                         " Anything above the horizon value is the LUT manufacturing radiance, and"
+                         " `sca * ms` is what the sky-view march adds on top of single scattering.",
+                         (msC[0] <= 12.0 && msC[1] <= 12.9 && msC[2] <= 10.7) ? ">>" : "!!",
+                         msC[0], msC[1], msC[2]);
             LOG::logline("%s [forge-atmos] gate NITS: zenith (%.0f, %.0f, %.0f) cd/m2 luma %.0f"
                          " [%s, clear band 2000-8000] | horizon (%.0f, %.0f, %.0f) luma %.0f"
                          " | hor/zen %.2fx [%s, BAND 2.0-4.0 — was an inequality, which passed 8.8x"
@@ -49906,13 +50364,46 @@ void destroyHostWindow(Renderer* R);
         const bool allO   = okZenO && okFlat && okBeam && okEsky && okConv && okRan && okBudget;
 
         LOG::logline("%s [forge-atmos] gate OVERCAST %s @ row-0 air + FULL LID"
-                     " (cover 1.00, stratus, %.0f-%.0f m, tau %.1f, ssa %.4f, g %.2f, ext %.3e/m,"
+                     " (cover 1.00, stratus, %.0f-%.0f m, tauFULL %.1f, ssa %.4f, g %.2f, ext %.3e/m,"
                      " deck x%.2f, %.0f deck steps, albedo %.2f, sun %.2fdeg, frame %u)",
                      allO ? ">>" : "!!", allO ? "PASS" : "**MISSED**",
                      (double)dk.baseM, (double)dk.topM, (double)dk.tau, (double)dk.ssa,
                      (double)dk.g, (double)dk.ext, (double)g_atmosDeck, (double)g_atmosDeckSteps,
                      SceneCal::kRefAlbedo, SceneCal::kRefElevation * 180.0 / SceneCal::kPi,
                      g_atmosGateFrame);
+        // ─── S4a/A2 — THE SLAB, AND ITS OWN CONSERVATION ROW ────────────────────────────────────
+        // ⚠⚠ THIS IS THE ROW THE OLD SOURCE COULD NOT HAVE PRINTED. R + T is a property of a
+        // two-stream solution, not a measurement of one: it is <= 1 by construction, and the whole
+        // reason A2 exists is that the term it replaced had no such bound (E_sky floored at 55% of
+        // the incoming flux however thick the lid got, and hit 458% at tau 3). Printed anyway,
+        // because a bound that is asserted and never read is a bound nobody can tell is broken.
+        //
+        // ⚠ `prof` IS THE SECOND-COPY CROSS-CHECK. deckSolve needs the cloud profile's CUMULATIVE
+        // integral to map altitude to optical depth, which the GPU cannot be asked for — so
+        // Atmosphere::cloudProfileHost() is a deliberate second copy of atmosCloudProfile(), and
+        // this is its keeper: the host profile's numeric mean over the deck, divided by the analytic
+        // mean the shader's shapes are known to have. 1.000 while the two agree; anything else means
+        // somebody edited one shape and not the other.
+        {
+            const Atmosphere::DeckSolution sl = Atmosphere::deckSolve(
+                ovc, g_atmosDeck, (float)std::sin(SceneCal::kRefElevation),
+                (float)SceneCal::kRefAlbedo);
+            const double sum = (double)sl.R + (double)sl.Tdif + (double)sl.Tdir;
+            LOG::logline("%s [forge-atmos] gate OVERCAST SLAB: delta-scaled tau %.2f -> %.3f,"
+                         " ssa %.5f -> %.5f, g %.3f -> %.3f | R %.4f + T_diff %.4f + T_dir %.4f"
+                         " = %.4f [%s, <= 1 BY CONSTRUCTION — this is the bound the multiscatter"
+                         " LUT's 1/(1-f) never had] | absorbed %.4f | prof x%.4f [%s]",
+                         (sum <= 1.0001 && sl.active && std::fabs(sl.profMean - 1.0f) < 0.002f)
+                             ? ">>" : "!!",
+                         (double)sl.tau, (double)sl.tauP, (double)dk.ssa, (double)sl.ssaP,
+                         (double)dk.g, (double)sl.gP,
+                         (double)sl.R, (double)sl.Tdif, (double)sl.Tdir, sum,
+                         (sum <= 1.0001) ? "OK" : "**IMPOSSIBLE**", 1.0 - sum,
+                         (double)sl.profMean,
+                         (std::fabs(sl.profMean - 1.0f) < 0.002f)
+                             ? "host profile agrees with the shader's"
+                             : "**THE TWO CLOUD PROFILES HAVE DRIFTED**");
+        }
         LOG::logline("%s [forge-atmos] gate OVERCAST LEVEL: zenith (%.0f, %.0f, %.0f) cd/m2 luma %.0f"
                      " [%s, band 1000-2000] | hor/zen %.2fx [%s, band 0.50-2.00 — a lid has no"
                      " gradient; Clear reads 8.8x] | horizon (%.0f, %.0f, %.0f) luma %.0f",
@@ -52386,6 +52877,7 @@ void destroyHostWindow(Renderer* R);
         if (g_live.pAtmosShOut)         { removeResource(g_live.pAtmosShOut);             g_live.pAtmosShOut = nullptr; }
         if (g_live.pAtmosParamsCbv)     { removeResource(g_live.pAtmosParamsCbv);         g_live.pAtmosParamsCbv = nullptr; }
         if (g_live.pAtmosSkyView)       { removeResource(g_live.pAtmosSkyView);           g_live.pAtmosSkyView = nullptr; }
+        if (g_live.pAtmosSkyViewClear)  { removeResource(g_live.pAtmosSkyViewClear);      g_live.pAtmosSkyViewClear = nullptr; }
         if (g_live.pAtmosMultiScatter)  { removeResource(g_live.pAtmosMultiScatter);      g_live.pAtmosMultiScatter = nullptr; }
         if (g_live.pAtmosTransmittance) { removeResource(g_live.pAtmosTransmittance);     g_live.pAtmosTransmittance = nullptr; }
         g_live.atmosReady = false;

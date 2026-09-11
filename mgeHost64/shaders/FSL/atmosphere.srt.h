@@ -35,6 +35,16 @@ BEGIN_SRT(AtmosphereSrtData)
         DECL_TEXTURE  (PerBatch, Tex2D(float4),             gAtmosMultiScatter)
         // ...and the ONE output this dispatch owns.
         DECL_RWTEXTURE(PerBatch, WTex2D(float4),            gAtmosOutA)
+        // ─── S2i: THE SECOND OUTPUT, AND IT IS A DIFFERENT QUESTION FROM THE FIRST ───────────────
+        // gAtmosOutA carries the COVER-MIXED field, which is what the LIGHT wants: the SH pass
+        // integrates it over directions, and over an integral a mean field is exact. This one
+        // carries the CLEAR ARM alone — the sky you see through a GAP between clouds — which is what
+        // the IMAGE wants, because a single direction is cloud or gap and never 35% of both.
+        //
+        // Written by atmos_skyview only; bound type-valid in the other three instances for the same
+        // reason gAtmosOutA is. At cover 0 the two arms are the same expression term for term, so
+        // clear weather writes identical texels to both and stays bit-identical.
+        DECL_RWTEXTURE(PerBatch, WTex2D(float4),            gAtmosOutB)
         // The measurement's landing zone (atmos_sh.comp only). RW so the SH pass can write it and
         // every other pass leaves it alone; bound to the same buffer in all four instances because a
         // UAV slot has to point somewhere legal even when nothing stores through it.

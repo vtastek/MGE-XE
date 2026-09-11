@@ -60,10 +60,69 @@ namespace Atmosphere {
     // readback exists to delete from the Hosek path; do not start a second one here.
     constexpr float kRayleighSeaLevel[3] = { 5.802e-6f, 13.558e-6f, 33.100e-6f };  // 1/m
     constexpr float kRayleighHeightKm    = 8.0f;
-    // Aerosol at 550 nm: extinction 4.44e-6 /m with single-scattering albedo 0.9, i.e. scattering
-    // 3.996e-6 and absorption 0.444e-6. The 0.9 albedo is where kMieAbsorbFractionClear comes from
-    // and it is the number every row's `mieAbsorption` is a departure from.
-    constexpr float kMieScatterSeaLevel  = 3.996e-6f;   // 1/m
+    // Aerosol at 550 nm, single-scattering albedo 0.9 — the 0.9 is where kMieAbsorbFractionClear
+    // comes from and it is the number every row's `mieAbsorption` is a departure from.
+    //
+    // ⚠⚠ THIS IS THE ONE COEFFICIENT ON THIS PAGE THAT IS NOT BRUNETON'S, AND THE UNIT THAT SETTLES
+    // IT IS METEOROLOGICAL VISIBILITY. Bruneton's value is 3.996e-6 /m of scattering (4.44e-6
+    // extinction) at a 1.2 km scale height — his kMieAngstromBeta 5.328e-3 divided by that height —
+    // and Koschmieder turns any extinction into a distance a human can check:
+    //
+    //     visibility = 3.912 / beta_ext        (the 2% contrast threshold)
+    //
+    // 4.44e-6 /m is a visibility of 881 km. That is not a clear day, it is not a mountain top, it is
+    // not anywhere: the clearest air ever measured at sea level is ~100 km and the WMO's top
+    // category ("exceptionally clear") starts at 50. Applied across the whole table it made an ASH
+    // STORM read 44 km and a clear day 1469 — every weather Morrowind has, from a light haze to a
+    // blight storm, sitting between 33 and 1469 km. So the ROWS were authored sanely as relative
+    // departures and the BASE they departed from was ~40x below any real atmosphere.
+    //
+    // x40 is measured, not chosen. It is the value at which the clear-sky gate's own rows land, and
+    // they are rows nothing here is fitted to — the sweep, after the two multiscatter fixes that had
+    // to come first (see atmos_multiscatter.comp.fsl):
+    //
+    //     mieMul     1      8     20     32     40     48
+    //     hor/zen   8.38   5.23   3.10   2.28   1.98   1.77    band 2.0-4.0
+    //     zenith    1218   1387   1668   1933   2102   2264    band 2000-8000 cd/m2
+    //     q         .051   .059   .072   .084   .092   .100    band 0.093-0.148
+    //     sun%      .915   .889   .848   .810   .786   .763    band 0.73-0.84
+    //     beam klx  103.3   99.8   94.1   88.6   85.2   81.9   ~94 expected
+    //     ENERGY    90.1%  89.5%  88.5%  87.3%  86.5%  85.6%   must be <= 100
+    //
+    // At 40 the beam, sun%, zenith and ENERGY rows are all in band and the last two — q and hor/zen —
+    // miss by 0.9% and 1.0% IN OPPOSITE DIRECTIONS, so no aerosol satisfies both and chasing the
+    // residual would be fitting. What it buys in the table's own units: Clear 37 km, Cloudy 22,
+    // Overcast 18, Rain 12, Thunder 7.9, Snow 7.8, Blizzard 1.9, Foggy 4.0, Ash 1.1, Blight 0.8.
+    // Every row lands where meteorology puts that weather, and the ORDER the author intended is
+    // untouched because no row's multiplier moved.
+    //
+    // ⚠⚠ AND x40 WAS SHIPPED, PHOTOGRAPHED AND REVERTED THE SAME DAY. THE PICTURE REFUTED IT, AND
+    // THE REASON IS THE PHASE FUNCTION RATHER THAN THE OPTICAL DEPTH. The gate is measured at a
+    // 41.34 deg sun, where the zenith sits 49 deg from the sun and the aerosol's forward lobe is
+    // irrelevant. Play is not: at Sadrith Mora, sun 78.6 deg, the ZENITH IS 11 DEGREES FROM THE SUN,
+    // and Henyey-Greenstein at g 0.80 returns P(11.4 deg) = 1.483 /sr against Rayleigh's 0.117 —
+    // 12.7x per unit scattering, on top of a Mie column that x40 made larger than the Rayleigh one.
+    // Measured, same save, same frame, only this constant different:
+    //
+    //                        zenith cd/m2            q      sky lx   the picture
+    //     Bruneton   (1399,  2128,  4154)   deep blue    0.058     7071   blue sky, read shadows
+    //     x40        (20650, 17737, 16926)  WHITE        0.510    18148   pale, flat, washed
+    //
+    // A real sky does have a bright aureole around a high sun, but HG smears the diffraction peak
+    // across 10-30 degrees where a real polydisperse aerosol confines it to a few — so at any
+    // realistic optical depth HG paints the whole near-solar sky white. And no g fixes it: lowering
+    // it trades the aureole for side-scatter, which whitens the deep blue instead. THE OPTICAL DEPTH
+    // AND THE PHASE FUNCTION ARE ONE DECISION, and this file only has an honest value for one of
+    // them. Raising the AOD is blocked on the phase function, not on more sweeping.
+    //
+    // The Koschmieder argument above stands and is why this is recorded rather than deleted: 881 km
+    // is not a visibility Earth has, and the whole table is 33-1469 km. The measurement that closes
+    // it needs a phase function a real aerosol would recognise. Until then Bruneton's coefficient
+    // ships, `atmosMieMul` is the arm, and the sweep above is the table to resume from.
+    // [[feedback_the_standin_was_doing_the_real_job]] in reverse: here the physically-correct number
+    // was the one the picture rejected, and the gate could not see it because its ONE sun angle
+    // never puts the zenith near the sun.
+    constexpr float kMieScatterSeaLevel  = 3.996e-6f;   // 1/m  (Bruneton; x40 measured, see above)
     constexpr float kMieHeightKm         = 1.2f;
     constexpr float kMieAbsorbFractionClear = 0.10f;    // 1 - single-scattering albedo
     // Ozone: a stratospheric TENT, peak absorption at 25 km, zero by 10 and 40 km. It has no
@@ -100,7 +159,18 @@ namespace Atmosphere {
     // volumetric pass is for; this exponent is the honest bound on what S4a can claim.
     constexpr float kCloudTauRef        = 24.0f;    // vertical optical depth at full cover, dry
     constexpr float kCloudTauPrecip     = 16.0f;    // + this x precipitation
-    constexpr float kCloudCoverExponent = 2.5f;     // cover^k — the MEAN-FIELD exponent
+    // ⚠⚠ RETIRED 2026-09-09 AND KEPT ONLY AS THIS NOTE. `cover^2.5` existed for exactly one reason
+    // — "so a light cover does not grey the whole sky the way a linear mean field would" — and it
+    // was a mitigation for a model that could only express partial cover as A THINNER LID. The cover
+    // MIXTURE removes the need: cover is a blend weight between a clear sky and a full-depth deck,
+    // so a light cover leaves most of the sky untouched instead of veiling all of it faintly.
+    //
+    // ⚠ AND THE EXPONENT COULD NOT HAVE BEEN TUNED OUT OF THE PROBLEM, WHICH IS WHY IT IS DELETED
+    // RATHER THAN RAISED. It set the sky's greyness and the beam's dimming with ONE number, and at
+    // Cloudy the beam was already RIGHT (0.616 measured against the 0.65 that 35% cover implies).
+    // Raising it to de-grey the sky would have broken the light to do it.
+    // [[feedback_one_knob_two_jobs]]
+    // constexpr float kCloudCoverExponent = 2.5f;   // cover^k — the MEAN-FIELD exponent
     constexpr float kCloudSsa           = 0.9999f;  // single-scattering albedo, dry
     constexpr float kCloudSsaPrecip     = 0.015f;   // - this x precipitation
     constexpr float kCloudGStratus      = 0.84f;    // HG asymmetry at cloudType 0
@@ -115,6 +185,31 @@ namespace Atmosphere {
     constexpr float kCloudProfileShoulder = 0.60f;
     constexpr float kCloudProfileMeanFlat = 0.5f * (1.0f + kCloudProfileShoulder);   // 0.80
     constexpr float kCloudProfileMeanBell = 0.5f;
+
+    // ─── THE PROFILE ITSELF, HOST-SIDE — A SECOND COPY, DECLARED AS ONE ──────────────────────────
+    // ⚠⚠ THIS FILE'S SIBLING (atmosphere.h.fsl) EXISTS SO THAT THERE IS EXACTLY ONE MEDIUM, and
+    // this function is a deliberate exception to that rule rather than an oversight. S4a/A2 solves
+    // the deck's transport HOST-SIDE (deckSolve below) and hands the shader a small table indexed by
+    // ALTITUDE, so the host has to know where inside the deck a given altitude sits in OPTICAL
+    // DEPTH — which is the profile's cumulative integral, and there is no way to ask the GPU for it.
+    //
+    // The exception is bounded three ways, and all three are checkable:
+    //   1. it is the SHAPE only — no coefficient, no scale height, no phase function crosses over;
+    //   2. deckSolve NORMALISES by this function's own total, so a scale error cannot survive;
+    //   3. deckSolve computes this function's MEAN and compares it against kCloudProfileMeanFlat /
+    //      ...Bell above, which are the analytic means of the shader's shapes. That ratio is
+    //      reported on the gate line as `prof`, and it is 1.000 exactly while the two agree.
+    // Row 3 is the cross-check the top of atmosphere.h.fsl says a second copy must come with.
+    // MUST match atmosCloudProfile() in atmosphere.h.fsl, including the 0.60f shoulder.
+    inline double cloudProfileHost(double x, double shape)
+    {
+        const double ax = std::min(std::fabs(x), 1.0);
+        const double t  = std::max(0.0, std::min(1.0, (1.0 - ax) / (1.0 - (double)kCloudProfileShoulder)));
+        const double flat = t * t * (3.0 - 2.0 * t);
+        const double bell = 0.5 + 0.5 * std::cos(3.14159265358979323846 * ax);
+        return flat + std::max(0.0, std::min(1.0, shape)) * (bell - flat);
+    }
+
 
     // Planet geometry, metres. Vvardenfell is Earth-sized as far as an atmosphere is concerned —
     // nothing in MW states otherwise and the horizon distance a player can see is set by the
@@ -159,7 +254,13 @@ namespace Atmosphere {
         // sweep is what that cost: a TOTAL OVERCAST dimmed the sun by 1.6%. S4a turned them into a
         // fourth density profile inside the same integral — see kCloudTauRef above and
         // atmosCloudProfile() in atmosphere.h.fsl. They are still not DRAWN; that is S4b.
-        float cloudCoverage;      // 0..1
+        // ⚠⚠ cover IS A MIX WEIGHT SINCE 2026-09-09, AND ITS MEANING CHANGED UNDER THE AUTHORED
+        // VALUES. It used to THIN the deck (tau = 24 cover^2.5, applied over the whole sky); it now
+        // BLENDS a full-depth cloud against a clear sky. The old reading made 0.95 and 1.00 nearly
+        // the same thing (tau 21.1 vs 24.0); the new one makes them 5% blue sky versus none, which
+        // is the difference between an overcast day with shadows and one without. Every row was
+        // re-read against the new meaning when the mixture landed — see Overcast and Snow below.
+        float cloudCoverage;      // 0..1 — the FRACTION OF SKY under cloud (a blend weight)
         float cloudType;          // 0 stratus .. 0.5 cumulus .. 1 cumulonimbus (the density profile)
         float cloudBottomKm;      // base altitude
         float cloudThicknessKm;   // top - base
@@ -227,21 +328,61 @@ namespace Atmosphere {
         // lane is mieHeightKm 0.25, which puts almost all of it below the player. Droplets are large
         // and nearly non-absorbing (albedo ~0.99), so fog is BRIGHT — it hides the sun without
         // darkening the world, which is exactly how real fog reads.
+        //
+        // ⚠⚠ C5 TRIED cover 0.40 -> 0.00 HERE AND THE PICTURE REFUTED IT — REVERTED, DELIBERATELY,
+        // AND THE PLAN'S "one should go" IS ANSWERED "NEITHER, NOT YET". The overlap is real: the
+        // deck sits 50-350 m, inside the 250 m scale height of the aerosol on the line above. But
+        // removing the deck does not leave fog behind, it leaves A CLEAR DAY — measured, deck-a2 vs
+        // deck-c5 on this row:
+        //
+        //     sunNormal   52,175 -> 108,745 lx      (the full unobstructed beam)
+        //     q           0.5491 -> 0.1421          (back INSIDE the CLEAR-sky band 0.093-0.148)
+        //     zenith      (15677,13767,15506) -> (2523,5704,18142)   grey-white -> BLUE
+        //
+        // ⚠ THE REASON IS THAT THIS ROW'S AEROSOL IS NOT FOG. Its column optical depth is
+        // mieScale x hkm = 6.00 x 0.25 = 1.5 against Clear's 0.60 x 1.20 = 0.72 — barely TWICE a
+        // clear day. Real fog is a horizontal visibility of tens of metres, i.e. an extinction near
+        // 0.05-0.1 /m, which over its own 250 m is an optical depth of 12-25. So the deck was not
+        // double-counting the fog; IT WAS DOING THE FOG, and the aerosol lane has been decorative.
+        // Thickening it is the actual fix and it is a look change with its own picture, not part of
+        // a rollback. Until then the deck stays and the overlap is the lesser error.
         { 1.00f, 6.00f, 0.02f, 0.85f, 0.25f, { 1.00f, 1.00f, 1.00f }, 1.00f,
           0.40f, 0.00f, 0.05f, 0.30f, 0.00f, 0,0,0,0,0 },
-        // Overcast — THE LID, and the row that closes the reported "overcast sky is gray from the
-        // clouds texture, horizon has hosek's bluer sky" before real clouds exist (S2). High Mie
-        // with real absorption de-blues AND dims the whole atmosphere, so MW's painted cloud layer
-        // stops sitting on a bright blue field.
-        { 1.00f, 2.00f, 0.30f, 0.78f, 1.60f, { 1.00f, 1.00f, 1.00f }, 1.00f,
-          0.95f, 0.00f, 1.00f, 1.20f, 0.00f, 0,0,0,0,0 },
+        // Overcast — ⚠⚠ C5 ROLLED THIS ROW BACK, AND ITS OLD COMMENT IS THE CONFESSION. It read:
+        // "THE LID ... High Mie with real absorption de-blues AND dims the whole atmosphere, so MW's
+        // painted cloud layer stops sitting on a bright blue field." That was a FAKE LID built out of
+        // aerosol because no real one existed yet (S2), and since S4a a real one does: cover 0.95
+        // gives tau 21.1 through a 1.2 km deck. Leaving both in place is the DOUBLE-DARK — the lid
+        // twice, once as cloud and once as dirty air.
+        //   was  mie 2.00  abs 0.30  g 0.78  hkm 1.60
+        //   now  mie 1.20  abs 0.10  g 0.80  hkm 1.20
+        // What is left is the air an overcast day actually has UNDER its cloud: humid and slightly
+        // hazier than fair weather (Cloudy is 1.00), non-absorbing, at clean air's forward lobe and
+        // scale height. ⚠ THE ABSORPTION IS THE TELL, not the density: 0.30 is what DIMS, and no real
+        // sub-cloud aerosol absorbs a third of what it intercepts.
+        // ⚠ C6: cover 0.95 -> 1.00, FORCED BY THE COVER MIXTURE and not a look change. Under the old
+        // thinned-lid reading 0.95 gave tau 21.1 against a full lid's 24 — indistinguishable. Under
+        // the mixture it means 5% of the sky is CLEAR, which measured as a 5,506 lx direct beam and
+        // sun% 0.159: an overcast day casting shadows. "Overcast" is 8/8 oktas by definition, so the
+        // authored intent was always 1.00 and 0.95 was an artefact of a semantics that rounded it off.
+        { 1.00f, 1.20f, 0.10f, 0.80f, 1.20f, { 1.00f, 1.00f, 1.00f }, 1.00f,
+          1.00f, 0.00f, 1.00f, 1.20f, 0.00f, 0,0,0,0,0 },
         // Rain — full cover, a low wet base, and the aerosol below the deck that rain actually is.
-        { 1.00f, 2.50f, 0.35f, 0.76f, 1.20f, { 1.00f, 1.00f, 1.00f }, 1.00f,
+        // ⚠ C5: the DENSITY was always real and the ABSORPTION never was. Falling rain is large water
+        // droplets — the same material as fog, which this table already puts at albedo 0.98
+        // (abs 0.02) and a strong forward lobe (g 0.85). abs 0.35 was the fake lid's dimming, doing
+        // in the aerosol what cover 1.00 (tau 24 through 2.5 km) now does as cloud.
+        //   was  mie 2.50  abs 0.35  g 0.76        now  mie 2.00  abs 0.03  g 0.85
+        { 1.00f, 2.00f, 0.03f, 0.85f, 1.20f, { 1.00f, 1.00f, 1.00f }, 1.00f,
           1.00f, 0.35f, 0.70f, 2.50f, 0.60f, 0,0,0,0,0 },
         // Thunder — cumulonimbus: the same medium as rain with a deck six kilometres deep, which is
         // what makes a storm cloud dark underneath and bright on top. The underlit-at-sunset case
         // on the brief is this row plus S4's lighting, and no new code.
-        { 1.00f, 3.00f, 0.40f, 0.74f, 1.20f, { 1.00f, 1.00f, 1.00f }, 1.00f,
+        // ⚠ C5, same rollback as Rain and for the same reason — heavier rain, still water droplets.
+        // "Dark underneath" is the DECK's job now and it does it properly: type 1.00 is the raised
+        // cosine, 6 km deep at tau 24, so the base really is starved while the top is lit.
+        //   was  mie 3.00  abs 0.40  g 0.74        now  mie 3.00  abs 0.03  g 0.85
+        { 1.00f, 3.00f, 0.03f, 0.85f, 1.20f, { 1.00f, 1.00f, 1.00f }, 1.00f,
           1.00f, 1.00f, 0.60f, 6.00f, 1.00f, 0,0,0,0,0 },
         // Ash — Vvardenfell's signature, and the clearest case for the tint lane. Mineral dust is a
         // heavy, strongly ABSORBING, ground-hugging aerosol that scatters broadly (large irregular
@@ -257,8 +398,19 @@ namespace Atmosphere {
         // Snow — a deck like overcast, but the medium below it is ice crystals: they scatter almost
         // without absorbing and much more isotropically than droplets, which is why falling snow is
         // luminous grey rather than dark.
+        // ⚠⚠ C5 DELIBERATELY LEFT SNOW AND BLIZZARD ALONE, AGAINST THE PLAN'S OWN LIST, and the
+        // reason is one number. The tell for a fake lid is ABSORPTION, because absorption is the only
+        // lane that can DIM — Overcast 0.30, Rain 0.35, Thunder 0.40 were all built to darken a sky
+        // that had no cloud in it. These two sit at **0.05**. They cannot darken anything, so there
+        // is no double-DARK here to remove; their density is falling precipitation, which is real and
+        // is not what the deck represents. What they can be is double-BRIGHT, and that is a picture
+        // question rather than a physics one — it is what the C5 picture set is for.
+        // ⚠ C6: cover 0.90 -> 1.00, same migration as Overcast. Snow falls out of nimbostratus, which
+        // is a complete deck; 10% of clear sky over falling snow is a configuration weather does not
+        // have. Ash (0.50), Blight (0.60), Foggy (0.40) and Cloudy (0.35) were left ALONE — their
+        // cover is genuinely partial, and for those rows the mixture is the whole point.
         { 1.00f, 3.00f, 0.05f, 0.60f, 1.00f, { 1.00f, 1.00f, 1.00f }, 1.00f,
-          0.90f, 0.00f, 0.90f, 1.20f, 0.50f, 0,0,0,0,0 },
+          1.00f, 0.00f, 0.90f, 1.20f, 0.50f, 0,0,0,0,0 },
         // Blizzard — snow's medium at storm density and pulled down to the ground. Non-absorbing
         // like snow, so a whiteout is BRIGHT; the ash rows are the dark counterpart and the pair is
         // the clearest demonstration that density and absorption are two different lanes.
@@ -418,7 +570,243 @@ namespace Atmosphere {
     // The float layout of `AtmosphereParams` in shaders/FSL/atmosphere.h.fsl, filled HERE and
     // nowhere else. The table turns a weather index into a Params; this turns a Params into the
     // coefficients the integral runs on. Two steps, two sites, and neither of them is a branch.
-    constexpr int kGpuParamFloats = 14 * 4;     // 14 float4 rows = 224 B (the CBV is 512 B)
+    constexpr int kGpuParamFloats = 17 * 4;     // 17 float4 rows = 272 B (the CBV is 512 B)
+
+    // What the deck came out as, for the heartbeat and the gate. A report, not a second derivation:
+    // it recomputes nothing the pack does not, and nothing reads it to shade with.
+    // ⚠⚠ `tau` IS THE FULL DECK'S OPTICAL DEPTH SINCE THE COVER MIXTURE (2026-09-09), NOT THE
+    // COVER-THINNED ONE, AND THE TWO ARE DIFFERENT NUMBERS. Partial cover used to enter here as
+    // `cover^2.5` multiplying tau — a real cloud replaced by a thin veil over the WHOLE sky — and
+    // that is what made a 35%-cover Cloudy day grey: measured, its zenith went from a deep blue
+    // (0.134, 0.310, 1.000) to a near-neutral (0.838, 0.774, 1.000) at 2.2x the luma, while the
+    // horizon dropped 3.2x, flattening a 7.2x gradient to 1.02x. Cover is now a BLEND WEIGHT and
+    // this is the cloud's own depth, so anything printing `tau` must print `cover` beside it.
+    // [[feedback_a_printed_identity_outlives_its_term]]
+    struct DeckReport {
+        float tau;        // vertical optical depth OF THE CLOUD ITSELF (cover-independent)
+        float cover;      // ...and the fraction of sky it covers, which is now a mix weight
+        float ext;        // beta_ext, 1/m
+        float ssa;        // single-scattering albedo
+        float g;          // HG asymmetry
+        float baseM;      // the deck's base and top, metres above the ground
+        float topM;
+    };
+    inline DeckReport deckReport(const Params& p, float deckMul) {
+        DeckReport d = {};
+        const float cover  = std::max(0.0f, std::min(1.0f, p.cloudCoverage));
+        const float shape  = std::max(0.0f, std::min(1.0f, p.cloudType));
+        const float precip = std::max(0.0f, std::min(1.0f, p.precipitation));
+        const float thickM = std::max(0.0f, p.cloudThicknessKm) * 1000.0f;
+        const float meanD  = kCloudProfileMeanFlat
+                           + shape * (kCloudProfileMeanBell - kCloudProfileMeanFlat);
+        d.cover = cover;
+        d.tau   = (kCloudTauRef + kCloudTauPrecip * precip) * std::max(0.0f, deckMul);
+        // ⚠ THE cover > 0 GATE IS LOAD-BEARING AND IS NOT AN OPTIMISATION. Cover no longer thins
+        // tau, so without it a clear row would publish a full-strength deck weighted zero — and
+        // atmosDeckSpan()/atmosMarchPlan() gate on beta_ext, so the clear sky's QUADRATURE would
+        // silently gain the deck's extra segment and stop being bit-identical to the pre-S4a march.
+        // The A/B control arm has to reduce node for node, not merely to the same answer.
+        d.ext   = (cover > 0.0f && thickM > 1.0f && d.tau > 0.0f && meanD > 1.0e-3f)
+                ? (d.tau / (meanD * thickM)) : 0.0f;
+        d.ssa   = std::max(0.0f, std::min(1.0f, kCloudSsa - kCloudSsaPrecip * precip));
+        d.g     = kCloudGStratus + shape * (kCloudGDeep - kCloudGStratus);
+        d.baseM = std::max(0.0f, p.cloudBottomKm) * 1000.0f;
+        d.topM  = d.baseM + thickM;
+        return d;
+    }
+
+    // ─── S4a/A2: THE DECK'S OWN TRANSPORT, AS A BOUNDED SLAB ─────────────────────────────────────
+    //
+    // ⚠⚠ WHAT THIS REPLACES AND WHY IT IS NOT A RETUNE. C1-C3 fed the deck's diffuse source from the
+    // multiple-scattering LUT, and that source is `sca * ms * sInt` = `ssa * ms * (1 - stepT)`.
+    // At a cloud's ssa of 0.9999 the deck's OWN OPTICAL DEPTH CANCELS OUT OF ITS OWN SOURCE, so the
+    // term saturates at `ms` and stops depending on tau — measured across a 16x tau sweep, `f` was
+    // identical to five decimals and E_sky floored at 55% of the incoming flux however thick the lid
+    // got. At tau 3 the ground received 4.6x the energy arriving at the top of the atmosphere.
+    // That is not a mistune, it is a MISSING CONSERVATION LAW: `F = 1/(1-f)` has nothing bounding it,
+    // and `ms` was read off an altitude axis of 3.2 km per texel — wider than the whole deck — so
+    // the in-cloud lookup interpolated between a ground sample and one above the lid, NEITHER OF
+    // THEM INSIDE THE CLOUD. atmos_multiscatter.comp.fsl names this as the first thing to suspect.
+    //
+    // The replacement is the fallback that file reserved and refused to slip in: a delta-Eddington
+    // TWO-STREAM SLAB, whose defining property is that R + T <= 1 BY CONSTRUCTION. It is solved here
+    // in double precision, once per frame, because it is a function of (tau, ssa, g, mu_sun, albedo)
+    // and every one of those is uniform over the whole LUT chain. The shader gets a table.
+    //
+    // ─── DELTA SCALING, WHICH IS ALSO THE FIX TO THE BEAM ────────────────────────────────────────
+    // A cloud's g is 0.84-0.88, so about three quarters of what it scatters goes into a forward peak
+    // physically indistinguishable from unscattered light. Delta scaling truncates that peak and
+    // moves it into the direct beam:
+    //
+    //     f = g^2      tau' = (1 - ssa*f) tau      ssa' = ssa(1-f)/(1-ssa*f)      g' = g/(1+g)
+    //
+    // At the Cloudy row (tau 1.74, g 0.84) that takes tau to 0.512 and the beam transmittance from
+    // 0.176 to 0.527 — A 3x RECOVERY OF THE SUN, which is the whole of "there are no shadows". It is
+    // physics and not a dial: the same scaling this repo already applies to the water medium
+    // (waterfog.h.fsl) and the standard treatment in every atmospheric radiation model since 1976.
+    //
+    // ⚠ THE SCALING IS APPLIED HERE, AT THE ONE SITE WHERE A Params BECOMES COEFFICIENTS, so all
+    // three marches see ONE consistent scaled medium. Scaling only the transmittance would leave the
+    // sky-view march phase-shifting with the UNSCALED g against a beam attenuated with the scaled
+    // tau, and delta-Eddington is only correct as a triple.
+    constexpr int    kDeckMsTaps      = 8;        // table entries, deck TOP -> deck BASE
+    constexpr double kDeckDiffusivity = 7.0 / 4.0;  // Eddington's gamma1 at ssa = 0
+
+    struct DeckSolution {
+        bool   active;      // false = no deck this frame; every lane below is then 0
+        float  tau, tauP;   // vertical optical depth, geometric and delta-scaled
+        float  ssaP, gP;    // the delta-scaled optics
+        float  extP;        // delta-scaled beta_ext, 1/m — what the shaders integrate
+        // ⚠ THE THREE BELOW ARE THE BLACK-BOUNDARY SLAB, not the one the table was built from.
+        // R + T <= 1 is a statement about THE MEDIUM; with the ground's albedo under it a slab can
+        // return more than arrived (down, bounce, back up) and the sum reads ~1.27 — true, and not
+        // a conservation law. The bound is only a bound where it is stated. All / (mu0*F0).
+        float  R;           // slab reflectance
+        float  Tdif, Tdir;  // diffuse / direct transmittance
+        float  cover;       // the MIX WEIGHT: 0 = this row's sky is clear, 1 = a full lid
+        float  profMean;    // cloudProfileHost's numeric mean / the analytic one — must be 1.000
+        float  ms[kDeckMsTaps];  // isotropic MULTIPLE-scattering radiance / F0, top -> base
+    };
+
+    // The slab, solved. `muSun` is the sun's zenith cosine; `groundAlbedo` closes the lower boundary
+    // (a cloud base over bright ground IS brighter, and leaving it out is a real error, not a
+    // simplification). Everything returned is dimensionless — the shader multiplies by the solar
+    // irradiance and by the air's transmittance down to the deck's lid, so the deck reddens at a low
+    // sun and goes dark below the horizon without this function knowing anything about either.
+    inline DeckSolution deckSolve(const Params& p, float deckMul, float muSun, float groundAlbedo)
+    {
+        DeckSolution s = {};
+        const DeckReport d = deckReport(p, deckMul);
+        s.tau   = d.tau;
+        s.cover = d.cover;
+        if (!(d.ext > 0.0f) || !(d.tau > 0.0f)) { return s; }   // clear sky: every lane stays 0
+
+        // --- delta scaling -------------------------------------------------------------------
+        const double ssa = std::max(0.0, std::min(0.999999, (double)d.ssa));
+        const double g   = std::max(0.0, std::min(0.95,     (double)d.g));
+        const double fwd = g * g;
+        const double den = std::max(1.0e-6, 1.0 - ssa * fwd);
+        const double tau = den * (double)d.tau;
+        const double ssaP = std::max(0.0, std::min(0.999999, ssa * (1.0 - fwd) / den));
+        const double gP   = g / (1.0 + g);
+        s.tauP = (float)tau;  s.ssaP = (float)ssaP;  s.gP = (float)gP;
+        s.extP = (float)(den * (double)d.ext);
+
+        // --- the Eddington two-stream, on the scaled medium ------------------------------------
+        // t runs DOWNWARD from the deck's lid. u = diffuse up, v = diffuse down.
+        //     du/dt = g1 u - g2 v - S g3 exp(-t/mu0)
+        //     dv/dt = g2 u - g1 v + S g4 exp(-t/mu0)
+        // g3 is the UPSCATTER fraction of the direct beam and g4 = 1 - g3 the downscatter; at ssa 1
+        // g1 == g2 and the net flux is conserved exactly, which is the identity this whole exercise
+        // is about. (Verified against a brute-force RK4 integration of the same ODEs to 6 digits at
+        // every configuration in the weather table.)
+        const double mu0 = std::max(0.02, std::min(1.0, (double)muSun));
+        const double ag  = std::max(0.0,  std::min(1.0, (double)groundAlbedo));
+        const double g1 = (7.0 - ssaP * (4.0 + 3.0 * gP)) * 0.25;
+        double       g2 = -(1.0 - ssaP * (4.0 - 3.0 * gP)) * 0.25;
+        const double g3 = (2.0 - 3.0 * gP * mu0) * 0.25;
+        const double g4 = 1.0 - g3;
+        // g2 crosses zero only at ssa ~ 0.38, far below any cloud; the clamp is an underflow floor
+        // for the eigenvector below, not a physical statement.
+        if (std::fabs(g2) < 1.0e-6) { g2 = (g2 < 0.0) ? -1.0e-6 : 1.0e-6; }
+        const double lam = std::sqrt(std::max(1.0e-12, g1 * g1 - g2 * g2));
+        const double Gam = (g1 - lam) / g2;
+        // The particular solution resonates when the beam's slant rate meets the diffusion rate;
+        // nudging one off the other is the standard treatment and moves nothing measurable.
+        double k = 1.0 / mu0;
+        if (std::fabs(k - lam) < 1.0e-4) { k = lam + 1.0e-4; }
+        auto  ex = [](double a) { return std::exp(std::max(-60.0, std::min(60.0, a))); };
+        const double S = ssaP, Fs = mu0;             // F0 == 1: everything here is per unit beam
+        const double dd = k * k - lam * lam;
+        const double U  = -S * (g3 * (g1 - k) + g2 * g4) / dd;
+        const double V  = -S * (g4 * (g1 + k) + g2 * g3) / dd;
+        // Boundaries: no diffuse light enters the lid; the lower one returns `alb` x what reaches it.
+        // ⚠ ONLY C1/C2 DEPEND ON THE LOWER BOUNDARY, so it is solved TWICE and the two answers do
+        // two different jobs. The `ag` pair drives the table, because a cloud base over albedo-0.3
+        // ground really is brighter and leaving that out is an error rather than a simplification.
+        // The `0` pair is the REPORT, because R + T <= 1 is a statement about THE MEDIUM: with a
+        // reflecting floor under it a slab can legitimately return more than arrived (light goes
+        // down, bounces, comes back up), so a conservation row measured through the ground bounce
+        // would read 1.27 and mean nothing. The bound has to be stated where it is actually a bound.
+        const double E = ex(lam * tau), Em = ex(-lam * tau), Ek = ex(-k * tau);
+        double C1 = 0.0, C2 = 0.0, C1b = 0.0, C2b = 0.0;
+        for (int pass = 0; pass < 2; ++pass) {
+            const double alb = (pass == 0) ? ag : 0.0;
+            const double a11 = Gam, a12 = 1.0, b1 = -V;
+            const double a21 = E * (1.0 - alb * Gam), a22 = Em * (Gam - alb);
+            const double b2  = Ek * (alb * (V + Fs) - U);
+            const double det = a11 * a22 - a12 * a21;
+            if (std::fabs(det) < 1.0e-12) { return s; }
+            const double c1 = (b1 * a22 - a12 * b2) / det;
+            const double c2 = (a11 * b2 - b1 * a21) / det;
+            if (pass == 0) { C1 = c1; C2 = c2; } else { C1b = c1; C2b = c2; }
+        }
+        auto uC = [&](double c1, double c2, double t) {
+            return c1 * ex(lam * t) + c2 * Gam * ex(-lam * t) + U * ex(-k * t);
+        };
+        auto vC = [&](double c1, double c2, double t) {
+            return c1 * Gam * ex(lam * t) + c2 * ex(-lam * t) + V * ex(-k * t);
+        };
+        auto uF = [&](double t) { return uC(C1, C2, t); };
+        auto vF = [&](double t) { return vC(C1, C2, t); };
+
+        // --- FIRST-ORDER scattering alone, so it can be taken back out -------------------------
+        // ⚠⚠ WITHOUT THIS SUBTRACTION THE DECK IS COUNTED TWICE. The sky-view march already carries
+        // the cloud's single scattering with the real HG lobe and the real sun direction — that term
+        // is angularly correct and stays. The slab's total diffuse field CONTAINS first-order light,
+        // and at the Cloudy row first order is ~100% of it, so handing the march the total would
+        // double the deck's whole contribution. So: the same beam source transported with the
+        // pure-extinction diffusivity and NO diffuse-diffuse coupling is exactly first order, and
+        // total - first = orders >= 2, which is what `ms` has always meant.
+        double kk = k;
+        if (std::fabs(kDeckDiffusivity - kk) < 1.0e-4) { kk = kDeckDiffusivity + 1.0e-4; }
+        auto v1F = [&](double t) {
+            return S * g4 * (ex(-kk * t) - ex(-kDeckDiffusivity * t)) / (kDeckDiffusivity - kk);
+        };
+        const double P1   = S * g3 / (kDeckDiffusivity + kk);
+        // Written as a decay from the LOWER boundary rather than exp(+D*t) with a tiny coefficient:
+        // at tau' ~ 28 the two factors are 1e21 and 1e-21 and float64 keeps only one of them.
+        const double Ctop = ag * (v1F(tau) + Fs * ex(-kk * tau)) - P1 * ex(-kk * tau);
+        auto u1F = [&](double t) { return Ctop * ex(-kDeckDiffusivity * (tau - t)) + P1 * ex(-kk * t); };
+
+        // --- the boundary fluxes, for the gate's conservation row ------------------------------
+        // The BLACK-boundary pair: the medium's own albedo and transmittance, which is the only
+        // form in which R + T <= 1 is a bound rather than an observation. See the note above.
+        s.R    = (float)(uC(C1b, C2b, 0.0) / Fs);
+        s.Tdif = (float)(vC(C1b, C2b, tau) / Fs);
+        s.Tdir = (float)ex(-tau / mu0);
+
+        // --- the table, sampled on NORMALISED ALTITUDE ----------------------------------------
+        // The shader marches in altitude and has no cheap way to reach optical depth, so the table's
+        // axis is altitude and the mapping between the two is done here, where the profile's
+        // cumulative integral is affordable. 8 taps carry the emergent radiance at the deck base —
+        // the only part of this field a camera under the lid can see — to within 3.2% over the whole
+        // sweep of sun elevations, deck shapes and optical depths the weather table can produce.
+        const double shape = std::max(0.0f, std::min(1.0f, p.cloudType));
+        const int    nSub  = 512;
+        double cum[nSub + 1];
+        cum[0] = 0.0;
+        for (int i = 0; i < nSub; ++i) {
+            // x = +1 at the lid, -1 at the base, matching atmosCloudProfile's coordinate.
+            const double x = 1.0 - 2.0 * ((double)i + 0.5) / (double)nSub;
+            cum[i + 1] = cum[i] + cloudProfileHost(x, shape);
+        }
+        const double total = std::max(1.0e-9, cum[nSub]);
+        const double meanA = (double)kCloudProfileMeanFlat
+                           + shape * ((double)kCloudProfileMeanBell - (double)kCloudProfileMeanFlat);
+        s.profMean = (float)((total / (double)nSub) / std::max(1.0e-9, meanA));
+        const double inv2pi = 1.0 / (2.0 * 3.14159265358979323846);
+        for (int i = 0; i < kDeckMsTaps; ++i) {
+            const double xn = (double)i / (double)(kDeckMsTaps - 1);   // 0 = lid, 1 = base
+            const double t  = tau * cum[(int)(xn * (double)nSub + 0.5)] / total;
+            // Two hemispheres of isotropic radiance: F = pi L each, so the sphere mean is F/(2 pi).
+            const double all = (uF(t) + vF(t)) * inv2pi;
+            const double one = (u1F(t) + v1F(t)) * inv2pi;
+            s.ms[i] = (float)std::max(0.0, all - one);
+        }
+        s.active = true;
+        return s;
+    }
 
     // ⚠⚠ THE mieTint COUPLING, STATED WHERE IT IS CONSUMED — AND IT IS NOT WHAT THE FIELD'S OWN
     // COMMENT SAYS. Params::mieTint is documented as "a per-primary multiplier on aerosol
@@ -447,7 +835,10 @@ namespace Atmosphere {
                            float moonIrradiance,
                            float airglow,
                            float mieScaleMul,
+                           float ozoneMul,
                            float deckMul,
+                           float msMul,
+                           float deckDownMul,
                            float skyViewSteps,
                            float msSteps,
                            float msDirs,
@@ -463,16 +854,25 @@ namespace Atmosphere {
         // says; a UNIFORM multiplier on the sea-level coefficient says something the table cannot
         // say at all — that the aerosol column's UNITS are wrong for every weather at once.
         //
-        // It exists because three independent readings point at one number: q_zenith sits over the
-        // measured p75 (0.158 vs 0.148), the horizon reads 8.8x the zenith against a real 2-4x, and
-        // the horizon is far too BLUE (B/R 3.55 against a real ~1.2-1.5). Too bright and not white
-        // enough at the horizon is one symptom, not two — aerosol is what whitens a horizon and what
-        // bounds it, and at Bruneton's coefficients Mie is ~2% of the vertical optical depth here.
+        // ⚠⚠ ITS ANSWER HAS BEEN FOLDED (2026-09-09) AND IT IS BACK TO BEING AN A/B ARM. The three
+        // readings it was cut for — q_zenith over the p75, the horizon at 8.8x the zenith against a
+        // real 2-4x, and a horizon far too BLUE — were ONE symptom and it was not the aerosol: the
+        // multiscatter LUT was manufacturing the diffuse field (a 4pi in atmos_multiscatter, and a
+        // probe placed exactly ON the ground sphere in atmosMultiScatterParams). With both fixed the
+        // aerosol lever became measurable for the first time, the sweep ran, and x40 went into
+        // kMieScatterSeaLevel where the note above derives it from Koschmieder visibility.
         //
-        // ⚠⚠ IT IS NOT A SHIPPING KNOB. Whatever value survives belongs FOLDED INTO
-        // kMieScatterSeaLevel (or into the rows, if the answer turns out to be per-weather), and
-        // this parameter deleted. A calibration multiplier left in the build is how a constant stops
-        // having one home. [[project_forge_no_ini_flips]]
+        // ⚠ THAT ORDER WAS NOT OPTIONAL. Swept BEFORE the fixes, more aerosol made every row WORSE —
+        // at x32 the sky doubled to E_sky 53 klx and the ENERGY row went to 134.8% — because the
+        // manufactured term scaled with the scattering coefficient it was multiplying. A calibration
+        // taken on top of a source that creates energy measures the bug, not the medium.
+        //
+        // ⚠⚠ AND THE FOLD WAS REVERTED THE SAME DAY, BY THE PICTURE. Read the long note at
+        // kMieScatterSeaLevel: the gate's single 41 deg sun cannot see the solar aureole, and at a
+        // 78 deg sun x40 turned the zenith white. So this is back to being the SWEEP HANDLE, and the
+        // value that survives is still not known — it is blocked on the aerosol PHASE FUNCTION, not
+        // on more sweeping. 1.0 is Bruneton's coefficient (what ships); 40 is the arm the gate
+        // prefers and the camera does not. [[project_forge_no_ini_flips]]
         const float mieBase = kMieScatterSeaLevel * std::max(0.0f, p.mieScale)
                             * std::max(0.0f, mieScaleMul);
         const float ssa     = 1.0f - std::max(0.0f, std::min(0.999f, p.mieAbsorption));
@@ -487,24 +887,21 @@ namespace Atmosphere {
         // itself. 0 disarms the deck completely, which is byte-for-byte the pre-S4a sky and is the
         // control arm for every measurement in this phase; 1 is the shipped medium. It gets deleted
         // when the phase is accepted. [[project_forge_no_ini_flips]]
-        const float cover   = std::max(0.0f, std::min(1.0f, p.cloudCoverage));
-        const float shape   = std::max(0.0f, std::min(1.0f, p.cloudType));
-        const float precip  = std::max(0.0f, std::min(1.0f, p.precipitation));
-        const float baseM   = std::max(0.0f, p.cloudBottomKm)    * 1000.0f;
-        const float thickM  = std::max(0.0f, p.cloudThicknessKm) * 1000.0f;
-        // cover^k, the mean-field exponent — see the long note at kCloudCoverExponent.
-        const float coverK  = std::pow(cover, kCloudCoverExponent);
-        const float tauDeck = (kCloudTauRef + kCloudTauPrecip * precip)
-                            * coverK * std::max(0.0f, deckMul);
-        // The profile's mean over its own layer, exact for the two shapes atmosCloudProfile blends.
-        // Dividing by it is what makes tau the VERTICAL OPTICAL DEPTH rather than a coefficient
-        // whose meaning drifts with the deck's thickness and type.
-        const float meanD   = kCloudProfileMeanFlat
-                            + shape * (kCloudProfileMeanBell - kCloudProfileMeanFlat);
-        const float cloudExt = (thickM > 1.0f && tauDeck > 0.0f && meanD > 1.0e-3f)
-                             ? (tauDeck / (meanD * thickM)) : 0.0f;
-        const float cloudSsa = std::max(0.0f, std::min(1.0f, kCloudSsa - kCloudSsaPrecip * precip));
-        const float cloudG   = kCloudGStratus + shape * (kCloudGDeep - kCloudGStratus);
+        // ⚠⚠ AND S4a/A2 MOVED THE ARITHMETIC OUT OF HERE INTO deckSolve(), WHICH IS THE SAME
+        // DISCIPLINE ONE STEP FURTHER ON. The deck's tau/ssa/g were derived here AND in deckReport()
+        // — two copies, kept honest by nothing — and A2 needs a third reading of them (the slab) plus
+        // the delta scaling that all three marches have to share. So there is now exactly one
+        // derivation: deckReport() says what the weather IS optically, deckSolve() delta-scales it
+        // and solves its transport, and this writes the answer down. The rows below carry the
+        // SCALED coefficients, which is what makes the sky-view march's phase function, the
+        // transmittance LUT's beam and the slab's source three views of one medium instead of three.
+        const float shape  = std::max(0.0f, std::min(1.0f, p.cloudType));
+        const float baseM  = std::max(0.0f, p.cloudBottomKm)    * 1000.0f;
+        const float thickM = std::max(0.0f, p.cloudThicknessKm) * 1000.0f;
+        const DeckSolution deck = deckSolve(p, deckMul, toSun[2], groundAlbedo);
+        const float cloudExt = deck.extP;                // delta-scaled beta_ext (1/m)
+        const float cloudSsa = deck.ssaP;                // ...and its delta-scaled albedo
+        const float cloudG   = deck.gP;                  // ...and its delta-scaled asymmetry
 
         int i = 0;
         // row 0: Rayleigh scattering (1/m) + its scale height (m)
@@ -517,7 +914,22 @@ namespace Atmosphere {
         for (int c = 0; c < 3; ++c) { dst[i++] = mieExt; }
         dst[i++] = std::max(-0.95f, std::min(0.95f, p.mieG));
         // row 3: ozone absorption at the tent's peak (1/m)
-        for (int c = 0; c < 3; ++c) { dst[i++] = kOzoneAbsorb[c] * std::max(0.0f, p.ozoneScale); }
+        // ⚠ ozoneMul IS A UNIFORM MULTIPLIER ON THE COLUMN, AND IT IS THE ONLY LEVER IN THIS FILE
+        // THAT MAKES A SKY LESS GREEN. Bruneton's per-primary absorption is (0.650, 1.881, 0.085) —
+        // green 2.9x red and 22x blue — so ozone is what turns a CYAN Rayleigh sky into a blue-violet
+        // one, and it is the reason twilight is violet rather than brown. Hosek had no ozone term at
+        // all. Every row's `ozoneScale` is 1.00 on purpose (the layer sits at 25 km; no weather
+        // Morrowind has reaches it), so a global multiplier is the right shape for this and a
+        // per-weather column would be fiction.
+        //
+        // ⚠⚠ IT IS A LOOK KNOB WEARING A PHYSICAL NAME, AND THE UNIT SAYS SO. x1 is ~300 Dobson,
+        // Earth's mean; Earth's whole range is 200-500, i.e. x0.7-x1.7. Measured against a target
+        // sky colour supplied from play, the hue lands at **x3.2 — about 960 DU**, three times any
+        // atmosphere Earth has. So a value above ~1.7 is a STYLISTIC choice about Vvardenfell's air
+        // and must be labelled as one; it is not a calibration and no gate will ever endorse it.
+        for (int c = 0; c < 3; ++c) {
+            dst[i++] = kOzoneAbsorb[c] * std::max(0.0f, p.ozoneScale) * std::max(0.0f, ozoneMul);
+        }
         dst[i++] = 0.0f;
         // row 4: the geometry of the two BOUNDED profiles, metres above the ground — the ozone tent
         // and the cloud deck. ⚠ A DECK WITH NO EXTINCTION STILL PUBLISHES ITS GEOMETRY, and that is
@@ -568,34 +980,66 @@ namespace Atmosphere {
         dst[i++] = cloudExt;                 // beta_ext (1/m)
         dst[i++] = std::max(-0.95f, std::min(0.95f, cloudG));
         dst[i++] = shape;                    // the profile's shape blend
-    }
-
-    // What the deck came out as, for the heartbeat and the gate. A report, not a second derivation:
-    // it recomputes nothing the pack does not, and nothing reads it to shade with.
-    struct DeckReport {
-        float tau;        // vertical optical depth
-        float ext;        // beta_ext, 1/m
-        float ssa;        // single-scattering albedo
-        float g;          // HG asymmetry
-        float baseM;      // the deck's base and top, metres above the ground
-        float topM;
-    };
-    inline DeckReport deckReport(const Params& p, float deckMul) {
-        DeckReport d = {};
-        const float cover  = std::max(0.0f, std::min(1.0f, p.cloudCoverage));
-        const float shape  = std::max(0.0f, std::min(1.0f, p.cloudType));
-        const float precip = std::max(0.0f, std::min(1.0f, p.precipitation));
-        const float thickM = std::max(0.0f, p.cloudThicknessKm) * 1000.0f;
-        const float meanD  = kCloudProfileMeanFlat
-                           + shape * (kCloudProfileMeanBell - kCloudProfileMeanFlat);
-        d.tau   = (kCloudTauRef + kCloudTauPrecip * precip)
-                * std::pow(cover, kCloudCoverExponent) * std::max(0.0f, deckMul);
-        d.ext   = (thickM > 1.0f && d.tau > 0.0f && meanD > 1.0e-3f) ? (d.tau / (meanD * thickM)) : 0.0f;
-        d.ssa   = std::max(0.0f, std::min(1.0f, kCloudSsa - kCloudSsaPrecip * precip));
-        d.g     = kCloudGStratus + shape * (kCloudGDeep - kCloudGStratus);
-        d.baseM = std::max(0.0f, p.cloudBottomKm) * 1000.0f;
-        d.topM  = d.baseM + thickM;
-        return d;
+        // rows 14-15: THE DECK'S OWN MULTIPLE SCATTERING (S4a/A2) — the two-stream slab's isotropic
+        // orders>=2 radiance per unit incident beam, sampled on normalised altitude from the lid
+        // (tap 0) to the base (tap 7). ⚠ THIS IS WHAT THE MULTISCATTER LUT NO LONGER SUPPLIES for
+        // the cloud species: a 3.2 km/texel altitude axis could not see a 1.2 km deck, and the
+        // source it fed back was unbounded in tau. All zero on a clear sky, so the pre-S4a A/B is
+        // untouched. See deckSolve().
+        for (int t = 0; t < kDeckMsTaps; ++t) { dst[i++] = deck.ms[t]; }
+        // row 16: THE COVER MIXTURE (2026-09-09). x is the fraction of sky the deck covers, and it
+        // is a BLEND WEIGHT rather than a thinner: the sky-view march runs a clear arm and a
+        // full-depth deck arm and lerps them by this. Everything above describes ONE FULL CLOUD; how
+        // much of the sky has one is this number and nothing else.
+        dst[i++] = deck.cover;
+        // y: THE AIR'S MULTIPLE-SCATTERING A/B GATE. 1 is the shipped medium; 0 leaves the sky-view
+        // march with its FIRST ORDER only, which a CPU quadrature can reproduce independently. It is
+        // a measurement arm and not a look knob, exactly as deckMul is, and it exists because the
+        // clear sky reads 3.3x (red) to 8.2x (blue) over its own single-scattering value and the
+        // gate had no way to say which of the loop's two additive sources carries that.
+        dst[i++] = std::max(0.0f, msMul);
+        // ─── z: S2i — THE DOME'S RE-MIX WEIGHT, AND IT IS A DIFFERENT QUESTION FROM `cover` ──────
+        //
+        // `cover` above is the weight for the LIGHT, where it is exact: the SH pass integrates the
+        // sky over directions, and the expected radiance of a direction that is cloud with
+        // probability `cover` IS the lerp. The IMAGE samples ONE direction, where the same number is
+        // simply wrong — a direction is cloud or gap, never `cover` of both. Shipping the light's
+        // mean field to the dome put a uniform 35% grey veil over a cumulus day, gaps included: the
+        // gaps measured R/B 0.73 against a clear sky's 0.24, which is the whole of "cloudy is washed
+        // out, clear and cloudy should look pretty much the same".
+        //
+        // ⚠ THE PER-DIRECTION STRUCTURE IS ALREADY DRAWN, WHICH IS WHY THIS IS A DOUBLE COUNT AND
+        // NOT A MISSING FEATURE. MW's cloud MESH paints the individual clouds and is already
+        // anchored to this deck's radiance (sky.frag.fsl, SKY_CLASS_CLOUD). For a BROKEN field the
+        // deck therefore reaches the camera through the mesh, and the dome's job is the sky BETWEEN
+        // the clouds. For a CLOSED lid there are no gaps, the mesh does not cover the sky on its own
+        // (measured: Overcast with the deck off renders BLUE), and the dome must carry the deck.
+        //
+        // So the regime, not the coverage, is what the dome needs — and the table splits cleanly:
+        //
+        //     cover 0.35 Cloudy · 0.40 Foggy · 0.50 Ash · 0.60 Blight     gaps exist
+        //     cover 1.00 Overcast · Rain · Thunder · Snow · Blizzard      closed lid
+        //
+        // Nothing is authored between 0.60 and 1.00, so the smoothstep below is never evaluated on
+        // the inside by a settled weather — it exists so a TRANSITION between the two regimes
+        // crossfades instead of popping.
+        //
+        // ⚠ EXPRESSED AS A FRACTION OF THE LIGHT'S MIX, not as a second cover. The dome lerps
+        // between the two published FIELDS (gap and mixed), so to land on a true weight `w` it needs
+        // w/cover — and that keeps the cover=1 path byte-identical to the old one-LUT dome, which is
+        // the regression this change has to protect. cover=0 gives 0, and there both fields are the
+        // same expression anyway, so clear weather is unmoved twice over.
+        {
+            const float c = std::max(0.0f, std::min(1.0f, deck.cover));
+            const float t = std::max(0.0f, std::min(1.0f, (c - 0.60f) / 0.40f));
+            const float w = t * t * (3.0f - 2.0f * t);          // smoothstep(0.60, 1.00, cover)
+            dst[i++] = (c > 1.0e-4f) ? std::min(1.0f, w / c) : 0.0f;
+        }
+        // ─── w: S2h — THE A/B ON THE DECK'S LIGHT REACHING THE AIR BENEATH IT ───────────────────
+        // 1 ships the term; 0 reproduces the pre-S2h march term for term, which is what makes the
+        // orange horizon a measurable claim rather than an argued one. Same kind of arm as
+        // `atmosDeck` and `atmosMs`, and it exists for the same reason they do.
+        dst[i++] = std::max(0.0f, deckDownMul);
     }
 
     // The REFERENCE configuration the S2 gate is measured at, as a Params. Row 0 verbatim — the

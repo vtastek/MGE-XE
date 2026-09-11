@@ -57,11 +57,14 @@
 // ─── THE CLOUD DECK'S VERTICAL PROFILE (S4a) ─────────────────────────────────────────────────────
 // ⚠⚠ PARTIAL COVER IN A HORIZONTALLY-HOMOGENEOUS MEDIUM IS A MEAN FIELD AND NOTHING ELSE. There is
 // no x/y here — there cannot be, the whole LUT chain is built on the medium depending only on
-// altitude — so `cloudCoverage 0.4` is A UNIFORMLY THINNER LID, never broken cumulus with blue
-// between it. That is the one place this model is deliberately approximate, and it is stated here
-// rather than in a commit message because broken cloud is precisely what S4b's volumetric pass is
-// for. The host squares the cover up before it becomes an optical depth (kCloudCoverExponent) so a
-// light cover does not grey the whole sky the way a linear mean field would.
+// altitude — so a deck described HERE is always a FULL one, never broken cumulus with blue between
+// it. That is the one place this model is deliberately approximate, and it is stated here rather
+// than in a commit message because broken cloud is precisely what S4b's volumetric pass is for.
+//
+// ⚠ SINCE 2026-09-09 PARTIAL COVER IS NOT THIS FILE'S PROBLEM AT ALL. `kCloudCoverExponent` — which
+// thinned the lid and greyed the whole sky at cover 0.35 — is retired; atmos_skyview runs a CLEAR
+// arm and a FULL-DECK arm down one march and returns `lerp(clear, deck, cover)`. So everything below
+// describes one full cloud, and how much of the sky has one lives in deckMix.x.
 //
 // THE SHAPE IS SMOOTH AT BOTH BOUNDARIES, AND THAT IS QUADRATURE RATHER THAN TASTE. A box would put
 // a step discontinuity in the integrand of three marches that are all tuned for smooth exponentials;
@@ -104,6 +107,43 @@ void atmosCloudAt(AtmosphereParams P, float h, out(float3) sca, out(float3) ext)
     float dC = atmosCloudProfile(P, h);
     sca = f3(P.cloud.x * dC);
     ext = f3(P.cloud.y * dC);
+}
+
+// ─── THE DECK'S MULTIPLE SCATTERING, READ OFF THE SLAB (S4a/A2) ──────────────────────────────────
+// The 8 taps deckSolve() packed, as a piecewise-linear function of NORMALISED ALTITUDE inside the
+// deck: 0 at the lid, 1 at the base. Returns the isotropic orders>=2 radiance PER UNIT INCIDENT
+// BEAM — the caller multiplies by solar.xyz and by the air's transmittance down to the lid.
+//
+// ⚠ WRITTEN AS A SUM OF SATURATED RAMPS RATHER THAN AN INDEXED ARRAY, and that is not a
+// micro-optimisation. A dynamically indexed local array is the one construct that pushes a shader
+// off registers into scratch, and this runs per march step inside the deck. Each `saturate(u - j)`
+// ramps 0 to 1 across exactly its own segment and is pinned outside it, so the differences telescope
+// to the correct piecewise-linear interpolant with no branch and no indexing:
+//     v(u) = v0 + SUM_j (v_{j+1} - v_j) * saturate(u - j)
+// Checked at the nodes: u = 0 gives v0, u = 7 gives v7, u = 3.2 gives v3 + 0.2(v4 - v3).
+float atmosDeckMs(AtmosphereParams P, float xNorm)
+{
+    float4 A = P.deckMsA;
+    float4 B = P.deckMsB;
+    float  u = saturate(xNorm) * 7.0f;
+    float  r = A.x;
+    r += (A.y - A.x) * saturate(u - 0.0f);
+    r += (A.z - A.y) * saturate(u - 1.0f);
+    r += (A.w - A.z) * saturate(u - 2.0f);
+    r += (B.x - A.w) * saturate(u - 3.0f);
+    r += (B.y - B.x) * saturate(u - 4.0f);
+    r += (B.z - B.y) * saturate(u - 5.0f);
+    r += (B.w - B.z) * saturate(u - 6.0f);
+    return r;
+}
+
+// Where inside the deck an altitude sits: 0 at the lid, 1 at the base. Outside the deck the clamp
+// makes this meaningless, which is why every caller gates on the cloud's own scattering first —
+// that term is EXACTLY zero outside the slab and on a clear sky, so the gate and the profile agree
+// by construction rather than by two tests that could disagree.
+float atmosDeckDepth01(AtmosphereParams P, float h)
+{
+    return saturate((P.profGeom.z + P.profGeom.w - h) / max(2.0f * P.profGeom.w, 1.0f));
 }
 
 // ─── THE MEDIUM AT AN ALTITUDE ───────────────────────────────────────────────────────────────────
@@ -388,7 +428,32 @@ void atmosMultiScatterParams(AtmosphereParams P, float2 uv, out(float) r, out(fl
     float xS = atmosUnitFromUv(uv.x, P.lutDims2.x);
     float xR = atmosUnitFromUv(uv.y, P.lutDims2.y);
     muSun = clamp(saturate(xS) * 2.0f - 1.0f, -1.0f, 1.0f);
-    r     = P.planet.x + saturate(xR) * (P.planet.y - P.planet.x);
+    // THE GROUND EPSILON, AND THIS IS THE FIRST PLACE IN THE FILE THAT USES IT. atmosUnitFromUv is a
+    // TEXEL-CENTRE mapping, so row 0 decodes to xR == 0 EXACTLY - the probe is placed exactly ON the
+    // ground sphere, which is the one radius kGroundEpsM was written for and, until now, was only
+    // ever applied to the CAMERA (forgerender.cpp, three sites). This LUT manufactures its own radius
+    // from a texel index and so never went through that guard.
+    //
+    // What it cost: at r == Rg, atmosRaySphere computes c = dot(ro,ro) - Rg*Rg = 0 up to float32
+    // cancellation at 4e13, so the near root is zero-or-noise and every DOWNWARD direction is
+    // integrated along the CHORD THROUGH THE PLANET at sea-level density instead of stopping at the
+    // surface 0 m away. Those paths saturate, the whole lower hemisphere returns ~1, and the
+    // re-scattered fraction the geometric series runs on jumps DISCONTINUOUSLY at exactly one point:
+    //
+    //     alt      0 m   fms luma 0.6268   F = 1/(1-f) = 2.68     <- shipped; shader read 0.6245
+    //     alt      1 m   fms luma 0.1268   F = 1.15
+    //     alt     10 m   fms luma 0.1269   F = 1.15
+    //     alt   1562 m   fms luma 0.1388   F = 1.16
+    //
+    // and row 0 is the texel EVERY ground-level sky lookup reads. F 2.7 instead of 1.15, on top of an
+    // L2 inflated by the same fake radiance, is what made the clear sky 3.3x (red) to 8.2x (blue)
+    // brighter than its own single scattering, put the ENERGY row at 112% - impossible for a passive
+    // medium - and washed the horizon to 41300 cd/m2 against a real 5000-10000. The single-scattered
+    // sky underneath was correct to three digits against a CPU quadrature the whole time.
+    // [[feedback_guard_fallback_is_the_bug]] - the guard existed, was documented, and was applied to
+    // the one radius that was never the problem.
+    float rGround = P.planet.x + ATMOS_GROUND_EPS_M;
+    r     = max(rGround, P.planet.x + saturate(xR) * (P.planet.y - P.planet.x));
 }
 
 // --- sky-view: (viewZenithCos, lightViewCos) <-> uv, Hillaire's mapping -----------------------

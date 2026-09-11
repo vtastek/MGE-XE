@@ -462,6 +462,22 @@ bool MWBridge::getWeatherState(WeatherState& out) {
     // The same five off the NEXT weather, so the client can interpolate rather than step at the
     // swap (see the header). `next` is null whenever no transition is running, and then the pair is
     // degenerate — cur == next — which makes the lerp a no-op at every value of `transition`.
+    // THE DAY ROW, lerped like the scalars below. Same two base pointers, same struct, two more
+    // documented offsets (TES3Weather.h ambientDayCol 0x20 / sunDayCol 0xB0) — Prime Directive 6 is
+    // untouched. See the header for why a DENOMINATOR and not a light.
+    {
+        const DWORD nw = next ? next : cur;
+        const RGBVECTOR aC = *(const RGBVECTOR*)(cur + 0x20), aN = *(const RGBVECTOR*)(nw + 0x20);
+        const RGBVECTOR sC = *(const RGBVECTOR*)(cur + 0xB0), sN = *(const RGBVECTOR*)(nw + 0xB0);
+        const float t = out.transition;
+        out.ambDayCol = RGBVECTOR(aC.r + t * (aN.r - aC.r),
+                                  aC.g + t * (aN.g - aC.g),
+                                  aC.b + t * (aN.b - aC.b));
+        out.sunDayCol = RGBVECTOR(sC.r + t * (sN.r - sC.r),
+                                  sC.g + t * (sN.g - sC.g),
+                                  sC.b + t * (sN.b - sC.b));
+    }
+
     const DWORD nxt = next ? next : cur;
     out.nextCloudsMaxPercent = read_float(nxt + 0xf0);
     out.nextLandFogDay       = read_float(nxt + 0xf4);

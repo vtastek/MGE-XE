@@ -5523,6 +5523,31 @@ namespace RenderProcess {
         RGBVECTOR sunColEff = DistantLand::lightSunMult * DistantLand::sunCol;
         RGBVECTOR ambColEff = DistantLand::lightAmbMult * (DistantLand::sunAmb + DistantLand::ambCol);
         D3DXVECTOR4 sunVecEff = DistantLand::sunVec;
+        // ─── ...AND THE SAME PAIR WITH MGE'S OWN PER-WEATHER LOOK MULTIPLIERS LEFT OUT ──────────
+        //
+        // ⚠ Configuration.Lighting.SunMult/AmbMult ("Cloudy Sun Brightness" and its nine siblings,
+        // MGEgui's Per Pixel Lighting page) are a LOOK, not a measurement — a legacy DX9-era dial
+        // for shaping how bright each weather reads. They belong on the LIGHT, which is what the
+        // DX9 path draws with and what the host still lights the NIGHT from. They must never reach
+        // the host's EXPOSURE SETPOINT, which asks a different question: "how much light did MW put
+        // in this frame?" A look dial answering a measurement question is a camera that re-exposes
+        // itself every time the weather changes.
+        //
+        // ⚠⚠ AND IT DID EXACTLY THAT, FOR AS LONG AS THE MW-REFERRED SETPOINT HAS EXISTED. This
+        // install ships Cloudy at sun 1.60 / amb 1.35 and every other non-clear weather at sun 0.00.
+        // The host's reference (forgerender.cpp, mwRefLevel) latched the PRODUCT off lighting[4..10],
+        // so the servo aimed 1.435x day in Cloudy and 0.398x in Overcast against 0.996x in Clear —
+        // 1.5 stops of weather-driven exposure swing, off an ini table that no longer draws a single
+        // pixel in the Forge path (the physical sky overwrites sunCol/ambCol wholesale at
+        // blend=1/ramp=1). "clear weather is acceptable, but cloudy is so washed out" and "overcast
+        // is so dark" are three rows of that table, and clear was acceptable because its two entries
+        // are 1.00.
+        //
+        // ⚠ THE UNSCALED PAIR MUST BE CARRIED, NOT DIVIDED BACK OUT ON THE HOST. SunMult is 0.00 for
+        // eight of this install's ten weathers, and a product with a zero in it does not remember
+        // its other factor. So the reference rides its own two lanes ([38..39]).
+        RGBVECTOR sunColRef = DistantLand::sunCol;
+        RGBVECTOR ambColRef = DistantLand::sunAmb + DistantLand::ambCol;
         // INTERIORS: don't trust the proxy-captured sun/ambient — the capture only refreshes
         // when MW re-programs light state (SetLight(6) / D3DRS_AMBIENT), which happens on
         // light-set churn, not per frame. Exteriors churn constantly (the sun MOVES, geometry
@@ -5552,6 +5577,7 @@ namespace RenderProcess {
                 const RGBVECTOR liveSun(sdif[0] * sdim, sdif[1] * sdim, sdif[2] * sdim);
                 const RGBVECTOR liveSunAmb(samb[0] * sdim, samb[1] * sdim, samb[2] * sdim);
                 sunColEff = DistantLand::lightSunMult * liveSun;
+                sunColRef = liveSun;                       // ...unscaled; see the decl
                 // sgSunlight.ambient ALREADY carries the cell ambient in interiors (in-game
                 // verified: it equals the cell record's ambientColor byte-for-byte), so there it IS
                 // the whole ambient term and adding the cell record on top would double it. Exteriors
@@ -5559,6 +5585,7 @@ namespace RenderProcess {
                 // same formula as the captured path, just with a live sun ambient.
                 ambColEff = isExterior ? (DistantLand::lightAmbMult * (liveSunAmb + DistantLand::ambCol))
                                        : (DistantLand::lightAmbMult * liveSunAmb);
+                ambColRef = isExterior ? (liveSunAmb + DistantLand::ambCol) : liveSunAmb;
                 // Periodic live-vs-captured compare (mapping oracle): after movement/weapon
                 // churn refreshes the captures, fresh captured ambCol tells whether interior
                 // D3DRS_AMBIENT really is ~0 (assumed above). cellAmb logged for reference.
@@ -5842,6 +5869,61 @@ namespace RenderProcess {
         // interior-ambient and skyZenith paths already gate on. Fog is NOT covered by this flag: MW
         // overrides fog underwater weather or not, so the host keeps un-blending that lane ungated.
         const float mwTintsUnderwater = mwb->CellHasWeather() ? 1.0f : 0.0f;
+        // [38..39]: the reference pair as ONE LUMA each, because only its ratio to a fixed anchor is
+        // ever used (forgerender.cpp, g_mwSunCode: "Latched as ONE luma each"). Rec.709 — these
+        // three constants and the host's SceneCal::luma709 are one number in two processes, and a
+        // disagreement between them moves the exposure setpoint.
+        float sunCodeRef = 0.2126f * sunColRef.r + 0.7152f * sunColRef.g + 0.0722f * sunColRef.b;
+        float ambCodeRef = 0.2126f * ambColRef.r + 0.7152f * ambColRef.g + 0.0722f * ambColRef.b;
+
+        // ─── ...NORMALISED BY THIS WEATHER'S OWN DAY ROW ─────────────────────────────────────────
+        //
+        // *"overcast must be perfect exposure. Day reads dark otherwise."* — user, 2026-09-09, after
+        // the look-multiplier fix above landed Overcast at 0.674x day and Cloudy at 0.990x.
+        //
+        // ⚠ MW AUTHORS A PER-WEATHER LEVEL **BECAUSE MW HAS NO EXPOSURE**. Its whole delivered image
+        // is `texCode * (ambCode + sunCode * N.L)` in gamma space with no camera anywhere, so the
+        // only way MW can say "it is duller under cloud" is to author the light dimmer. We have a
+        // camera AND a physical sky that already delivers the dimming (Overcast measures
+        // sunNormal=83 lx against Clear's 109,917) — so tracking MW's weather level on top of that
+        // counts it TWICE, and the second count is the one the player sees as "day reads dark".
+        //
+        // ⚠ THE HOUR IS A DIFFERENT QUESTION AND IT KEEPS TRACKING MW. Dusk genuinely should read
+        // dimmer, the eye does not fully adapt across it, and play signed that off explicitly
+        // (*"still too bright sunset and sunrise"* -> fixed by exactly this tracking). Weather and
+        // hour both come out of the same four authored colours — the weather picks WHICH ROW, the
+        // hour picks WHERE IN IT — so they are separable, and this separates them: divide the
+        // reference by the CURRENT WEATHER'S OWN DAY ROW and every weather's noon becomes the unit
+        // while every dawn and dusk curve inside that weather is untouched.
+        //
+        // ⚠ SCALED TO THE CLEAR DAY ROW, NOT TO 1, so the host needs no change and CLEAR STAYS
+        // BIT-IDENTICAL: for Clear the two ratios are 1.0000 exactly, the expression is the
+        // identity, and `calMwDayRef()` on the far side still divides by the same anchor it always
+        // has. These two constants ARE `kCalMwAmbDay` / `kCalMwSunDay` in forgerender.cpp — MW's
+        // authored [Weather Clear] Ambient/Sun Day Color — and the two copies must agree or noon
+        // stops landing on 1.00x. They are written here rather than derived so that the
+        // cancellation is visible at both ends.
+        //
+        // ⚠ GATED ON A LIVE EXTERIOR WEATHER. Interiors have no weather row to normalise by and
+        // must not be touched (their multipliers are 1.0 and their setpoint is a different rule
+        // entirely); a failed read leaves the pair exactly as computed above.
+        {
+            constexpr float kMwAmbDayClear = 0.552182f;   // luma of 137,140,160
+            constexpr float kMwSunDayClear = 0.986772f;   // luma of 255,252,238
+            MWBridge* const mwbRef = MWBridge::get();
+            MWBridge::WeatherState wsRef;
+            if (isExterior && mwbRef->CellHasWeather() && mwbRef->getWeatherState(wsRef)) {
+                const float aDay = 0.2126f * wsRef.ambDayCol.r + 0.7152f * wsRef.ambDayCol.g
+                                 + 0.0722f * wsRef.ambDayCol.b;
+                const float sDay = 0.2126f * wsRef.sunDayCol.r + 0.7152f * wsRef.sunDayCol.g
+                                 + 0.0722f * wsRef.sunDayCol.b;
+                // A floor, not a branch-per-channel: a weather whose authored day row is black
+                // would otherwise divide the setpoint to infinity. Nothing in vanilla is near it.
+                if (aDay > 1.0e-3f) { ambCodeRef *= kMwAmbDayClear / aDay; }
+                if (sDay > 1.0e-3f) { sunCodeRef *= kMwSunDayClear / sDay; }
+            }
+        }
+
         const float lighting[40] = {
             // [3] = the SUN DISC's elevation sine, MGE's bounce-corrected DistantLand::sunPos.z —
             // a sun that actually SETS, unlike sunVec.xyz beside it, which keeps bouncing because
@@ -5889,8 +5971,10 @@ namespace RenderProcess {
             // [36..37] G1: MW's WIND VECTOR, EWMA-smoothed above. Drives the host grass lane's four
             // wind harmonics (gShadowParams.grassParams.xy) AND — via the magnitude the host derives
             // from it — the flame-flicker rate that [18] used to carry. One wind, one wire.
-            // [38..39] spare.
-            windVecX,                  windVecY,                  0.0f,                      0.0f,
+            // [38..39] THE EXPOSURE REFERENCE'S OWN LIGHT: sun and ambient as MW authored them,
+            // WITHOUT MGE's per-weather look multipliers. Two lanes rather than a divisor because
+            // SunMult is 0.00 in eight weathers here — see sunColRef at the top of this function.
+            windVecX,                  windVecY,                  sunCodeRef,                ambCodeRef,
         };
 
         // Part A: aggregate this frame's per-category upload cost, publish the total to the host

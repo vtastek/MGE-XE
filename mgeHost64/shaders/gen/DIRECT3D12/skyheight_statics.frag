@@ -1252,19 +1252,14 @@ STRUCT(AtmosphereParams)
 
     float4 lutDims;
     float4 lutDims2;
-
-
-
-
-
-
-
-
-
-
+#line 52 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/atmosparams.h.fsl"
     float4 cloud;
-
-#line 46
+#line 69 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/atmosparams.h.fsl"
+    float4 deckMsA;
+    float4 deckMsB;
+#line 101 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/atmosparams.h.fsl"
+    float4 deckMix;
+#line 102
 };
 #line 36 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
 #line 73 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
@@ -1555,6 +1550,15 @@ STRUCT(LightData)
 
 
 
+
+
+
+
+        Tex2D(float4) gAtmosSkyViewClear :  register(t68,space1);
+
+
+
+
         CBUFFER(LightData) gLights :  register(b0,space3);
 
 
@@ -1567,7 +1571,7 @@ STRUCT(LightData)
 
 
         CBUFFER(LightData) gLightsNear :  register(b1,space3);
-#line 614 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+#line 623 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
         Tex2D(float4) gTextures[ 880 ] :  register(t0,space0);
 
 
@@ -1578,7 +1582,7 @@ STRUCT(LightData)
 
         Tex2DArray(float4) gFlipArrays[ 16 ] :  register(t1008,space0);
         CBUFFER(BatchData) gBatch :  register(b0,space2);
-#line 638 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+#line 647 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
         CBUFFER(SkyViewData) gSkyView :  register(b1,space2);
 #line 22 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyheight_statics.frag.fsl"
 

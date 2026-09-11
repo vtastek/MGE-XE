@@ -94,6 +94,17 @@ public:
         float     nextCloudsMaxPercent, nextCloudsSpeed;
         float     nextLandFogDay, nextLandFogNight;
         float     nextWindSpeed;
+        // ─── THE WEATHER'S OWN DAY ROW — the anchor the EXPOSURE setpoint is normalised by ───────
+        // Weather+0x20 ambientDayCol and +0xB0 sunDayCol (TES3Weather.h), already lerped cur->next
+        // by `transition` like the five scalars above.
+        //
+        // ⚠ THIS IS NOT LIGHTING AND MUST NEVER DRAW. It is a DENOMINATOR. MW authors a per-weather
+        // LEVEL because MW has no exposure; the host has a camera, and following that level a second
+        // time double-counts it (see renderprocess.cpp, sunColRef). Dividing the reference by this
+        // row makes every weather's own NOON the unit, so the setpoint keeps MW's time-of-day curve
+        // — which play signed off — and drops MW's weather curve, which the physical sky already
+        // delivers.
+        RGBVECTOR ambDayCol, sunDayCol;           // Weather 0x20 / 0xB0, lerped cur->next
         // The sky meshes whose per-vertex colours MW rebakes in place each frame. Handed back
         // untyped so this header keeps its "no SharedSE NI headers" promise; the geometry
         // cache casts them (it already owns that idiom).

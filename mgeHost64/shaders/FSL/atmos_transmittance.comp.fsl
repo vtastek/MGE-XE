@@ -88,6 +88,7 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
     // The radiance marches cannot do this: their integrand is multiplied by a throughput that
     // depends on everything nearer the camera, so their species share one ordered walk and they go
     // through atmosMarchPlan/Step instead.
+    float deckDepth = 0.0f;   // the DECK's own optical depth along this ray — grey, so scalar
     {
         float3 ro = float3(0.0f, 0.0f, r);
         float3 rd = float3(sqrt(max(0.0f, 1.0f - mu * mu)), 0.0f, mu);
@@ -104,10 +105,46 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
             float ri = sqrt(max(0.0f, r * r + tm * tm + 2.0f * r * tm * mu));
             cloudDepth += atmosCloudProfile(gAtmosParams, ri - gAtmosParams.planet.x) * (tb - ta);
         }
-        depth += f3(gAtmosParams.cloud.y * cloudDepth);
+        // ⚠⚠ cloud.y IS THE DELTA-SCALED beta_ext (S4a/A2), AND THAT IS THE WHOLE OF "WHERE DID THE
+        // SUN GO". A cloud's g is 0.84-0.88, so roughly three quarters of what it scatters goes into
+        // a forward peak physically indistinguishable from unscattered light — and this march used to
+        // extinguish the beam against the RAW coefficient, as though every one of those photons had
+        // been removed. Delta scaling truncates the peak into the beam: tau' = (1 - ssa g^2) tau.
+        // At the Cloudy row that is tau 1.74 -> 0.512 and beam transmittance 0.176 -> 0.527, a 3x
+        // recovery — which is the difference between a frame with shadows in it and one without.
+        //
+        // ⚠ THE SCALING IS NOT DONE HERE. Atmosphere::deckSolve() applies it once, host-side, to the
+        // packed coefficients, so this march, atmos_skyview's phase function and the slab's own
+        // source are three views of ONE medium. Delta-Eddington is only correct as a triple (tau',
+        // ssa', g'); scaling the beam alone would leave the sky phase-shifting with the unscaled g.
+        //
+        // ⚠ THE ONE VISIBLE APPROXIMATION IT BUYS, STATED SO A PICTURE CHECK KNOWS WHAT TO LOOK AT:
+        // this LUT feeds both the LIGHT and the drawn SUN DISC, and the truncated peak is not really
+        // in the disc — it is a tight aureole around it. So under a THIN deck the disc is drawn a
+        // little too bright and too hard-edged, while the light it casts is right. That trade is the
+        // standard one in every atmospheric model since 1976 and it is the correct way round for a
+        // renderer: the complaint this fixes is "there are no shadows", and shadows are cast by the
+        // light. Under a full lid it does not arise — tau 24 still scales to 7.07, e^-7.07 = 0.0019.
+        deckDepth = gAtmosParams.cloud.y * cloudDepth;
     }
 
-    Write2D(gAtmosOutA, px, float4(exp(-depth), 1.0f));
+    // ⚠⚠ RGB IS THE AIR ALONE AND ALPHA IS THE DECK ALONE, AND THAT SPLIT IS WHAT MAKES THE COVER
+    // MIXTURE AFFORDABLE. atmos_skyview needs BOTH a deck-free beam (for the clear arm, over the
+    // 1-cover fraction of sky with no cloud in it) and a through-the-cloud one (for the deck arm),
+    // and a second 256x64 LUT plus its own dispatch to carry the difference would have been the
+    // obvious way to get them. It is not needed: THE DECK IS GREY BY CONSTRUCTION — a water cloud's
+    // droplets are hundreds of wavelengths across, so cloud.y is a scalar and its transmittance is
+    // one channel. Alpha was a constant 1.0 and is now that channel.
+    //
+    //     clear arm   sunT = t.rgb
+    //     deck  arm   sunT = t.rgb * t.a
+    //     the MEAN    sunT = t.rgb * lerp(1, t.a, cover)      <- what a mean-field consumer wants
+    //
+    // ⚠ AND `depth` NO LONGER CARRIES THE DECK, so a consumer that reads .rgb and ignores .a now
+    // gets a CLEAR-AIR beam where it used to get an extinguished one. There are four of them and
+    // all four were changed with this: atmos_skyview (two arms), atmos_multiscatter and atmos_sh
+    // (the mean), and atmosview.frag (a debug view, air-only on purpose).
+    Write2D(gAtmosOutA, px, float4(exp(-depth), exp(-deckDepth)));
 
     RETURN();
 }

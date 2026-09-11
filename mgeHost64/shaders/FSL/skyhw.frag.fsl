@@ -100,7 +100,20 @@ float4 PS_MAIN(VSOutput In)
     // distant surfaces melt into: the control is "look down from a height" (skydome.h.fsl), and it
     // must show a horizon-haze-coloured ground rather than fading a downhill vista to black.
     float2 svUv = atmosSkyViewUvFromDir(gAtmosParams, gSkyView.sunDirW.w, dir);
-    float3 Lnative = SampleLvlTex2D(gAtmosSkyView, gSamplerBilinearClamp, svUv, 0).rgb;
+    // ─── S2i: THE IMAGE DOES NOT GET THE LIGHT'S MEAN FIELD ──────────────────────────────────────
+    // gAtmosSkyView is lerp(gap, deck, cover) — correct for the SH light, which integrates over
+    // directions. It is wrong HERE, where one direction is sampled: a direction is cloud or gap and
+    // never `cover` of both, so a 35%-cover cumulus day came out as a uniform 35% grey veil over the
+    // whole sky, gaps included. That was "cloudy is washed out", and the gaps measured R/B 0.73
+    // against a clear sky's 0.24.
+    //
+    // The clear arm rides its own LUT, and deckMix.z re-mixes: 0 draws the gap sky and lets MW's
+    // cloud MESH supply the cloud (it is already anchored to the deck's radiance, sky.frag.fsl), 1
+    // draws the mixed field for a deck that really is a closed lid. A lerp between the two fields
+    // rather than a second lerp from the arms, so the cover=1 path is the byte-identical old one.
+    float3 Lgap  = SampleLvlTex2D(gAtmosSkyViewClear, gSamplerBilinearClamp, svUv, 0).rgb;
+    float3 Lmix  = SampleLvlTex2D(gAtmosSkyView,      gSamplerBilinearClamp, svUv, 0).rgb;
+    float3 Lnative = lerp(Lgap, Lmix, saturate(gAtmosParams.deckMix.z));
 
     // Native W/(m^2 sr) -> SCENE units, with the strength lane already folded in host-side. A zero
     // scale here is LEGITIMATE (interior, feature off) and must read as a black sky.
