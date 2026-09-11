@@ -3586,10 +3586,22 @@ namespace {
     constexpr uint32_t kSkinInstU32 = 3;
     // MB-1 OBJECT VELOCITY: movers per frame. MUST match OBJVEL_BATCH in objvelocity.srt.h — the
     // shader indexes a fixed-size cbuffer array with it, so a host value larger than the shader's
-    // would read off the end of the array. 256 x 2 matrices x 64 B = 32 KB, half the CBV cap.
-    // Morrowind's genuinely-moving set (actors, doors, activators, bone-attached kit) runs dozens
-    // even in a crowded cell, so this is ~an order of headroom; overflow is skipped and counted.
-    constexpr uint32_t kObjVelBatch = 256;
+    // would read off the end of the array. 448 x 2 matrices x 64 B = 57 KB against the 64 KB CBV
+    // cap, so 512 is the hard ceiling and this is the last round number under it.
+    //
+    // ⚠⚠ IT WAS 256 ON THE CLAIM THAT MORROWIND'S MOVING SET "RUNS DOZENS EVEN IN A CROWDED
+    // CELL, SO THIS IS ~AN ORDER OF HEADROOM", AND THE HEARTBEAT HAD BEEN REFUTING THAT SINCE THE
+    // DAY IT SHIPPED: `drawn=256/256 ... cap=1` on every window of a play session, examined=694.
+    // The estimate was of the set that MOVES; the set that is ADMITTED is `everMoved || isLive`,
+    // which is every live reference in the cell whether it moved or not, and it runs 300-450.
+    //
+    // ⚠ A BINDING CAP IS NOT A CLIP, IT IS A LOTTERY. Which candidates get dropped depends on walk
+    // order, so a genuine mover carries its object velocity on some frames and the camera's on the
+    // others — seen from play as body parts that flicker in the F12 mode 17 field, and as bodies
+    // that blur on one frame and not the next. g_objVelSkipStill takes the provably-motionless ones
+    // out of the competition; this gives what remains room. Overflow is still skipped and counted,
+    // so `cap=` staying 1 after both is a real finding rather than the same one again.
+    constexpr uint32_t kObjVelBatch = 448;
     // ⚠ DECLARED HERE, WITH THE CONSTANT, AND NOT WITH THE OTHER objVel KNOBS ~11k LINES DOWN — it is
     // read at PIPELINE CREATION, which happens before that declaration point. It exists for exactly
     // one experiment: run the pass with the depth test OFF and compare the surviving-fragment count
@@ -16750,6 +16762,29 @@ namespace {
     // depth test breaks it visibly, and there is no plausible-but-wrong answer to be fooled by.
     // NOT for play: it draws thousands of parts to recompute what reprojection already had.
     bool     g_objVelAllItems = false;
+    // ⚠⚠ A BIT-IDENTICALLY UNMOVED PART DOES NOT NEED TO BE DRAWN, AND DRAWING IT COSTS A
+    // REAL MOVER ITS VELOCITY. `everMoved || isLive` over-admits by design — a shut door is a
+    // candidate forever — and the still-snap then detects, part by part, that nothing moved. The
+    // measured consequence on a play session: examined=694, drawn=256/256 with cap=1 BINDING, and
+    // still=240 of those 256. Ninety-four percent of the batch went to objects that did not move,
+    // while 177 candidates were dropped at the cap — and WHICH ones are dropped depends on walk
+    // order, so a genuine mover gets its object velocity on some frames and not others. Reported
+    // from play as "some body parts look correct ... some body parts look flicker too".
+    //
+    // Skipping is safe because the still-snap's test is BIT-IDENTICAL matrices, not a small result:
+    // prevWorld == world means this part's own answer is a STATIC reprojection, which is exactly
+    // what motionvectors.comp already wrote into pMotionVectors (documented exact for statics), and
+    // in object-only mode its blur answer is exactly 0, which is exactly what that pass already
+    // wrote into pMbVelocity. The two routes differ by ~1e-5 px, far under the 0.5 px floor.
+    //
+    // ⚠ THIS IS NOT THE EARLY-OUT objvelocity.frag FORBIDS. That note rejects skipping on the
+    // MAGNITUDE of a computed vector, where "small" and "a stationary object under a moving camera"
+    // are different things wearing one number. This skips on the matrices being the same bytes,
+    // before any vector exists.
+    //
+    // ⚠ AND IT YIELDS TO g_objVelAllItems, whose whole test is that statics REPRODUCE the camera
+    // field — skipping them would make that identity vacuous instead of passing.
+    bool     g_objVelSkipStill = true;
     // M1 step 3, THE REACTIVE MASK — a RELATIVE depth error, so the thresholds are unitless and hold
     // at every distance (motionvectors.comp explains why an absolute epsilon cannot).
     // 0.02 = 2% of the distance: comfortably above the reprojection's own round-off and below any
@@ -21003,6 +21038,10 @@ namespace {
           t.checkbox("  \\- object velocity (movers overwrite the camera field)", &g_objVelEnable);
           // See g_objVelAllItems: with this on, mode 17 must look UNCHANGED. It is a test, not a look.
           t.checkbox("  \\- ...for EVERY item (test: statics must reproduce the camera field)", &g_objVelAllItems);
+          // See g_objVelSkipStill: OFF is the A/B arm, and it is the arm that fills the batch with
+          // doors. Watch `drawn=` and `cap=` on the objvel heartbeat move together with it.
+          t.checkbox("  \\- skip parts whose matrices are BIT-IDENTICAL (frees the cap for real movers)",
+                     &g_objVelSkipStill);
           // MB-1b. The A/B that separates "the actor has a velocity" from "the wall behind the actor
           // has one": off, every skinned part — i.e. every NPC and creature — is back on the
           // camera-only vector, which is exactly what MB-1a shipped.
@@ -24745,6 +24784,7 @@ void destroyHostWindow(Renderer* R);
             { "mbObjectOnly",        &g_mbObjectOnly        },
             { "objVelEnable",        &g_objVelEnable        },
             { "objVelAllItems",      &g_objVelAllItems      },
+            { "objVelSkipStill",     &g_objVelSkipStill     },
             { "objVelSkinned",       &g_objVelSkinnedLane   },
             { "objVelFP",            &g_objVelFPLane        },
             { "objVelSkinIgnoreGen", &g_objVelSkinIgnoreGen },
@@ -34629,8 +34669,12 @@ void destroyHostWindow(Renderer* R);
                         // from their own vb/ib at offset 0, exactly as the colour pass draws them.
                         const uint32_t firstVertex = m.inArena ? (uint32_t)(m.vbOff / sizeof(IPC::GeomVertexWire)) : 0u;
                         const uint32_t firstIndex  = m.inArena ? (uint32_t)(m.ibOff / sizeof(uint16_t)) : 0u;
-                        s_objVel.push_back({ meshVb, meshIb, m.indexCount, firstVertex, firstIndex, idx,
-                                             worldMirrored(it.world) ? 1 : 0, /*mm=*/0 });
+                        // See g_objVelSkipStill. The snap above already ran, so `pw` carries this
+                        // frame's pose either way and a part that moves NEXT frame pairs correctly.
+                        if (!unmoved || g_objVelAllItems || !g_objVelSkipStill) {
+                            s_objVel.push_back({ meshVb, meshIb, m.indexCount, firstVertex, firstIndex, idx,
+                                                 worldMirrored(it.world) ? 1 : 0, /*mm=*/0 });
+                        }
                     }
                     if (s_objVel.size() >= kObjVelBatch) { ovSkipCap = 1; }
 
@@ -34709,9 +34753,11 @@ void destroyHostWindow(Renderer* R);
                                 ++ovStill;
                             }
 
-                            s_objVel.push_back({ m.vb, m.ib, m.indexCount, 0u, 0u, idx,
-                                                 worldMirrored(it.world) ? 1 : 0, /*mm=*/1 });
-                            ++ovDrawnMM;
+                            if (!unmoved || g_objVelAllItems || !g_objVelSkipStill) {   // g_objVelSkipStill
+                                s_objVel.push_back({ m.vb, m.ib, m.indexCount, 0u, 0u, idx,
+                                                     worldMirrored(it.world) ? 1 : 0, /*mm=*/1 });
+                                ++ovDrawnMM;
+                            }
                         }
                         if (s_objVel.size() >= kObjVelBatch) { ovSkipCap = 1; }
                     }
@@ -39317,11 +39363,13 @@ void destroyHostWindow(Renderer* R);
                 // mm=0 with something glowing in frame means the MM pipelines did not build and the
                 // old skip is still firing; `kind=` should fall by roughly the amount mm= rises.
                 LOG::logline(">> [forge-hb] objvel: on=%d ready=%d examined=%u drawn=%u/%u (mm=%u)"
-                             " still=%u skinnedInFrame=%u skip(static=%u pair=%u kind=%u cap=%u)"
+                             " still=%u(%s) skinnedInFrame=%u skip(static=%u pair=%u kind=%u cap=%u)"
                              " gpu=%.3f ms",
                              g_objVelEnable ? 1 : 0, g_live.objVelReady ? 1 : 0,
                              g_objVelExamined, g_objVelDrawn, kObjVelBatch, g_objVelDrawnMM,
-                             g_objVelStill, g_objVelSkinnedInFrame,
+                             g_objVelStill,
+                             (g_objVelSkipStill && !g_objVelAllItems) ? "skipped" : "DRAWN",
+                             g_objVelSkinnedInFrame,
                              g_objVelSkipStatic, g_objVelSkipPair, g_objVelSkipKind,
                              g_objVelSkipCap, g_lastGpuPhaseMs[kGpuPhaseObjVel]);
                 // MB-1b, THE SKINNED LANE — and `drawn/inFrame` IS the deliverable, as a number:

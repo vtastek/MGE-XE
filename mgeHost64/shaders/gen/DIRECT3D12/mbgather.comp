@@ -1127,7 +1127,8 @@ void CS_MAIN( uint3 DispatchThreadID : SV_DISPATCHTHREADID )
     float2 vTile = LoadRWTex2D(gMbTileIn, tq);
 #line 91 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/mbgather.comp.fsl"
     float speed = length(vTile);
-    float selfStreak = length(vSelf) * shutter;
+#line 111 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/mbgather.comp.fsl"
+    float selfStreak = min(length(vSelf) * shutter, float(K));
 
 
 
@@ -1146,7 +1147,7 @@ void CS_MAIN( uint3 DispatchThreadID : SV_DISPATCHTHREADID )
         d = d * (float(K) / max(len, 1.0e-6f));
         len = float(K);
     }
-#line 123 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/mbgather.comp.fsl"
+#line 142 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/mbgather.comp.fsl"
     bool blurred = (speed >= floorPx) && (len >= 1.0e-4f);
 
 
@@ -1175,7 +1176,7 @@ void CS_MAIN( uint3 DispatchThreadID : SV_DISPATCHTHREADID )
 
         float4 sum = centre;
         float wsum = 1.0f;
-#line 165 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/mbgather.comp.fsl"
+#line 184 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/mbgather.comp.fsl"
         LOOP for (uint i = 0u; i < taps; ++i)
         {
 
@@ -1190,7 +1191,7 @@ void CS_MAIN( uint3 DispatchThreadID : SV_DISPATCHTHREADID )
             int2 dq = mbVelocityTexel(float2(spi), delivered, mvRect);
             float ds = LoadTex2D(gMbDepth, NO_SAMPLER, dq, 0).r;
             float2 vs = LoadTex2D(gMbVelocity, NO_SAMPLER, dq, 0).xy * outScale;
-            float sampleStreak = length(vs) * shutter;
+            float sampleStreak = min(length(vs) * shutter, float(K));
 
             float f = mbDepthWeight(ds, dCentre, softZ);
             float b = mbDepthWeight(dCentre, ds, softZ);
@@ -1211,7 +1212,7 @@ void CS_MAIN( uint3 DispatchThreadID : SV_DISPATCHTHREADID )
     {
         Write2D(gMbOut, p, outv);
     }
-#line 211 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/mbgather.comp.fsl"
+#line 230 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/mbgather.comp.fsl"
     uint tid = (DispatchThreadID.y & 7u) * 8u + (DispatchThreadID.x & 7u);
     bool count = inRect && blurred;
     g_mbHit[tid] = count ? 1u : 0u;

@@ -30,7 +30,7 @@
 // is SKIPPED and COUNTED (host logs it) rather than wrapped onto another draw's matrix — a wrapped
 // index would give one object a stranger's velocity, which is the single worst failure this pass
 // has, and the one the prevWorldFrame pairing key exists to prevent elsewhere.
-#define OBJVEL_BATCH 256
+#define OBJVEL_BATCH 448
 
 STRUCT(ObjVelParams)
 {

@@ -1005,11 +1005,11 @@ STRUCT(ObjVelBatch)
 
 
 
-    float4x4 worlds[ 256 ];
+    float4x4 worlds[ 448 ];
 
 
 
-    float4x4 prevWorlds[ 256 ];
+    float4x4 prevWorlds[ 448 ];
 #line 78
 };
 #line 103 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/objvelocity.srt.h"

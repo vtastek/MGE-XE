@@ -89,7 +89,26 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
     // much of each tap survives is the AGREEMENT test below, on the tap's own velocity and this
     // pixel's own velocity. See mbcommon.h.fsl.
     float  speed = length(vTile);                 // the SEARCH speed — always >= |vSelf|
-    float  selfStreak = length(vSelf) * shutter;  // THIS pixel's own streak, in delivered px
+    // ⚠⚠ CLAMPED TO K, AND SO IS THE TAP'S STREAK BELOW — THE WEIGHT MUST DESCRIBE THE
+    // STREAK THAT WAS ACTUALLY SEARCHED. `d` is clamped to K a few lines down because NeighborMax
+    // only searched one tile in each direction; for a while these two were not, and that asymmetry
+    // WAS the tiling. mbCone is 1 - dist/streak, so a body whose true streak is 300 px against a
+    // K of 96 scores >= 0.84 at EVERY tap the search can reach — the cone stops being a taper and
+    // degenerates into a box average over the whole +-K/2 line, at near-uniform weight, which then
+    // ends WHERE THE SEARCH ENDS rather than where the object's streak ends. The search ends at the
+    // tile grid. Hence: "motion blur on bodies are too much, and tiles visible", one defect, and
+    // the clamp on `d` alone could never have prevented it — shortening the search does not
+    // shorten the claim.
+    //
+    // Measured on the session that reported it: `maxLen=96.00 px` pinned exactly at K with
+    // `avgTaps=32.0` saturated, on 17 heartbeat windows, at a shutter scale of x1.56-1.85 (16.7 ms
+    // exposure against a ~10 ms frame).
+    //
+    // With both clamped the filter is self-consistent: it weights as if the streak were K, tapers
+    // to zero across the reach it has, and the only falloff left at the boundary is the ordinary
+    // end-of-streak one a correct filter has anyway. The blur is then SHORTER than physical for
+    // anything past K — which is the honest trade, and the direction the complaint points.
+    float  selfStreak = min(length(vSelf) * shutter, float(K));  // THIS pixel's own streak, px
 
     // The displacement during the exposure. ⚠ `shutter` here is `exposure_ms / frameDt_ms`, NOT
     // `angle/360`: the vector is per RENDERED FRAME, so a constant multiplier would shrink the smear
@@ -176,7 +195,7 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
             int2   dq = mbVelocityTexel(float2(spi), delivered, mvRect);
             float  ds = LoadTex2D(gMbDepth, NO_SAMPLER, dq, 0).r;
             float2 vs = LoadTex2D(gMbVelocity, NO_SAMPLER, dq, 0).xy * outScale;
-            float  sampleStreak = length(vs) * shutter;
+            float  sampleStreak = min(length(vs) * shutter, float(K));   // see selfStreak
 
             float f = mbDepthWeight(ds, dCentre, softZ);   // sample in FRONT of the centre
             float b = mbDepthWeight(dCentre, ds, softZ);   // sample BEHIND the centre
