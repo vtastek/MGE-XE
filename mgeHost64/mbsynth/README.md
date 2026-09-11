@@ -26,6 +26,10 @@ closer, `d = 1/z` here); `gMbVelocity` is previous-minus-current in delivered px
 **quantised to fp16**, as RG16F actually is; `shutter` is `exposure_ms / frameDt_ms`, not
 `angle/360`; the exposure window is centred, so taps span ±|v|·shutter/2.
 
+Arms: `--fix ship` is the pre-MB-2j weighting, `--fix c7 --gain 2` is MB-2j, `--fix c9` adds
+MB-2k. `--tapjitter 0` puts every pixel's taps in phase, so the difference from 1 is by
+construction the entire contribution of the tap hash. Both of those last two are rig-only levers.
+
 ⚠ **This is a transcription, not the shader.** If the FSL changes, this does not. The rig's
 authority is that T0 reproduces the velocity floor's bit-exact pass-through and T1 reproduces the
 streak length to 3 px in 239 — it is not a substitute for a GPU capture.
@@ -46,6 +50,9 @@ streak length to 3 px in 239 — it is not a substitute for a GPU capture.
 | T7 | tile grid vs `mbTileJitter` | does not reproduce the grid — see below |
 | T8 | two bodies at right angles vs `mbTwoDir` | no seam in either arm |
 | T9 | candidate fix: weight taps by arc length | (a) null by construction, (b) partial |
+| T10 | where each pixel's answer came from (near / own / behind) | 94.8% self over a moving skirt |
+| T11 | every candidate weighting scored against GT | **c6/c7 = MB-2j, shipped** |
+| T12 | **THIN fast mover: the refraction and the dither** | **MB-2k, shipped** — see below |
 
 `--explain X,Y` prints the tap-by-tap arithmetic for one pixel: which axis each tap walked, what
 it landed on, and all three weight terms. That is what turned T3 from a correlation into a
@@ -83,6 +90,56 @@ weight of 1, while the mover is represented once per tap.
 The `b` term is the only one carrying `softZ` in that direction, and it is multiplied by
 `mbCone(dist, selfStreak)` with `selfStreak = 0`. Zero times anything. The in-game null result was
 correct; the knob was never the lever.
+
+## What T12 found — the two look problems reported after MB-2j shipped
+
+A thin fast sword read as a **refraction**, and a small share of pixels looked **dithered**. The
+existing scenes could not test either: every blade in them is 160 px across, and a wide body's
+taps mostly land back on the body, so where the background comes from hardly matters. At 16 px
+almost every tap lands on background instead.
+
+**Four hypotheses went in. The first three were mine, and all three were wrong — each cost
+one run of the rig rather than one build and one play session:**
+
+- **"The sword is too transparent" — refuted.** MB-2j's blade share on the mover's own pixels
+  matches ground truth's exposure coverage to within 4% at every width (0.083 vs 0.080 at 8 px,
+  0.850 vs 0.844 at 160). The pre-MB-2j filter was 4.3× *too solid*. A thin fast object really is
+  mostly background; the user was seeing correct transparency for the first time.
+- **"The cap flattened the cone, so lower the gain" — refuted.** Across gain 1.0→2.4 the dither
+  moves 0.0059→0.0071 while lone-mover delivery moves 0.687→1.000. The gain is not the dither's
+  lever, and 2.0 is where delivery is exactly right. (2.0 and 2.4 are bit-identical — every tap
+  inside the streak has already saturated.)
+- **"Use blue noise for the tap phase" — a measured null, twice.** Same variance, spectrum
+  shaped high: RMSE identical to four decimals at every width, and `lpRMSE` (error surviving a
+  small blur — the half a viewer sees) *slightly worse*. It cannot help while the hash decides
+  4% of the error.
+- **The refraction is real, and it is a PROVENANCE error.** `shown_background()` backs the
+  background out of the filter's own output using GT's own decomposition
+  `out = cov*blade + (1-cov)*bg`, with `cov` measured exactly by a white-on-black copy of the
+  scene. Ground truth scores 0 there by construction. MB-2j's background had **0.26 of the true
+  contrast and correlation −0.98** — averaging a texture over ±50 px does not blur it, it
+  *inverts* it. MB-2j did not cause this; it made it visible, by correctly raising the
+  background's share of a thin mover's pixels from 0.47 to 0.83.
+
+**MB-2k** weights the revealed-background *mixture* by `1/dist⁴` and leaves its *total* alone: the
+offsets are a search for somewhere the background can be seen unoccluded, so the nearest place it
+was found wins. On a 16 px blade at 60 px/frame: contrast 0.34 → 0.97, correlation −0.96 → +0.81,
+RMSE on the mover's pixels 0.2053 → 0.0803, `lpRMSE` 0.161 → 0.075. The amputation, over-blur,
+two-direction and static-world guards are **exactly unchanged** — it is a no-op wherever the
+background behind a mover is locally flat.
+
+⚠ **A first attempt scaled a cone by the streak instead, and it is instructive that it failed.**
+Its best width tracks the *mover's own width* (0.15 of the streak at 8 px, 0.25 at 32), which the
+gather cannot know, and when it is too narrow **no tap qualifies at all**: the bucket's weight sum
+collapses and the background handed back is black — RMSE 0.0414 on a 160 px body against 0.0045.
+`1/dist^p` has no radius and never reaches zero, so it cannot starve. The exponent is an optimum
+rather than a trend: 0.0559 at 3, **0.0544 at 4**, 0.0579 at 6, 0.4161 at 12 where it has
+collapsed onto the single nearest tap.
+
+⚠ **It trades a large low-frequency error for a smaller high-frequency one.** A sharper estimate
+depends on which taps landed where, so the hash decides more of it (`dither` 0.0074 → 0.0296).
+But `excessHF` — high-frequency energy ground truth does not have — *falls* (0.0240 → 0.0156),
+because an inverted texture was itself high-frequency error. Better on every visibility metric.
 
 ## What it does NOT show
 

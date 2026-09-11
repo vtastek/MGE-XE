@@ -177,12 +177,44 @@ def neighbour_max(tiles):
 class Params(object):
     def __init__(self, W, H, K=96, shutter=1.667, max_taps=32, floor_px=0.5,
                  soft_z=0.1, tile_jitter=1.0, two_dir=True, out_scale=1.0,
-                 arclen=False, fix='ship', gain=1.0):
+                 arclen=False, fix='ship', gain=1.0, tap_jitter=1.0):
         self.W, self.H, self.K = W, H, K
         self.shutter, self.max_taps = shutter, max_taps
         self.floor_px, self.soft_z = floor_px, soft_z
         self.tile_jitter, self.two_dir = tile_jitter, two_dir
         self.out_scale = out_scale
+        # RIG ONLY -- no shader has this.  Scales the per-pixel TAP phase hash (mbDither in
+        # mbgather).  Setting it to 0 puts every pixel's taps at the same phase, so the
+        # difference between 1 and 0 is, by construction, the ENTIRE contribution the hash
+        # makes to the image: that difference IS the dither the user can see.
+        self.tap_jitter = tap_jitter
+        # RIG ONLY.  'white' is mbDither, the hash the shader actually uses.  'blue' is the
+        # same uniform distribution with its LOW frequencies removed, which does not change
+        # how big the sampling error is -- only where in the spectrum it sits.
+        self.tap_noise = 'white'
+        self.blue = None
+        # ── c9: HOW MUCH of the background, and WHICH background, are different questions ──
+        # The `b * cone(dist, selfStreak)` term answers the first one: what fraction of the
+        # exposure am I swept off this pixel, so that whatever is behind me shows. c5's cap
+        # makes that fraction come out right. But the COLOUR it fetches comes from OFFSETS
+        # along the streak, and the thing being revealed sits AT THIS PIXEL -- for a static
+        # background it never moved at all. The offsets are a SEARCH for somewhere the
+        # background can be seen unoccluded, not a description of where it is, so the search
+        # should prefer the NEAREST place it found one instead of averaging all of them
+        # equally. c9 keeps the total (the amount) and re-weights only the mixture (the
+        # provenance) by a cone `prox` times as wide as the streak.
+        self.prox = 0.25
+        # 'cone' scales the mixing cone by prox * selfStreak.  Measured: the best prox is
+        # WIDTH-DEPENDENT (0.15 for an 8 px mover, 0.25 for a 32 px one) and a value too small
+        # for the mover STARVES the bucket -- no tap is close enough to qualify, so the
+        # estimate collapses onto one or two taps and its contrast overshoots past the truth
+        # (std 1.93 at prox 0.08, width 32).  That is a radius that has to know how wide the
+        # mover is, which the gather does not.
+        # 'idw' weights by 1 / dist**p instead.  It has NO radius: whatever the nearest
+        # unoccluded background sample turns out to be, it wins, and the weight never reaches
+        # zero, so the bucket cannot starve however wide the mover is.
+        self.prox_mode = 'cone'
+        self.prox_p = 2.0
         # EXPERIMENTAL, not in any shader.  See t_arclen: weight each tap by the ARC LENGTH
         # of streak it stands for (|dir|/n) instead of giving every tap weight 1.  A tap is a
         # sampling site, not a vote; 16 taps crammed into a 5 px streak currently outvote 16
@@ -246,7 +278,12 @@ def gather(colour, depth, vel, tilev, P):
     blurred = (speed >= P.floor_px) & (ln >= 1.0e-4)
     taps = np.clip(np.ceil(ln), 3, max(P.max_taps, 3)).astype(np.int64)
 
-    jitter = mb_dither(pc) - 0.5
+    if P.tap_noise == 'blue':
+        if P.blue is None or P.blue.shape != (H, W):
+            P.blue = blue_noise(H, W)
+        jitter = (P.blue - 0.5) * P.tap_jitter
+    else:
+        jitter = (mb_dither(pc) - 0.5) * P.tap_jitter
     d_self = v_self * shutter
     len_self = np.linalg.norm(d_self, axis=-1)
     o = len_self > float(K)
@@ -259,6 +296,9 @@ def gather(colour, depth, vel, tilev, P):
 
     acc = colour.copy()
     wsum = np.ones((H, W), dtype=np.float64)
+    accB = np.zeros_like(colour)                 # c9: the revealed-background bucket, by
+    wB = np.zeros((H, W), dtype=np.float64)      # PROXIMITY, kept apart from its own total
+    covB = np.zeros((H, W), dtype=np.float64)
     accN = np.zeros_like(colour)                 # NEARER taps, kept apart so they composite
     wN = np.zeros((H, W), dtype=np.float64)
     accR = colour.copy()                         # everything else, centre included at weight 1
@@ -309,7 +349,7 @@ def gather(colour, depth, vel, tilev, P):
         # and the cylinder term ("two different blurry things mix") are both statements about
         # TWO surfaces; neither is true of one surface sampled twice. Keep f*cone, which is
         # the self-blur that genuinely exists.
-        if P.fix in ('c1', 'c6', 'c7', 'c8'):
+        if P.fix in ('c1', 'c6', 'c7', 'c8', 'c9'):
             same = np.abs(ds / np.maximum(d_centre, 1e-12) - 1.0) <= 0.01
             a = np.where(same, f * cs, a)
 
@@ -322,7 +362,7 @@ def gather(colour, depth, vel, tilev, P):
         # that slice, so its weight is bounded by 1/n and the total by 1. The centre then takes
         # whatever the taps did NOT cover, instead of a fixed 1 that the taps can outvote
         # arbitrarily. That is what makes the answer independent of the tap count.
-        if P.fix in ('c5', 'c6', 'c7', 'c8'):
+        if P.fix in ('c5', 'c6', 'c7', 'c8', 'c9'):
             a = np.minimum(a * P.gain, 1.0) / np.maximum(n, 1.0)
 
         rel = ds / np.maximum(d_centre, 1e-12) - 1.0
@@ -336,6 +376,18 @@ def gather(colour, depth, vel, tilev, P):
             wN += np.where(isN, a, 0.0)
             accR += colour[spi[..., 1], spi[..., 0]] * np.where(isN, 0.0, a)[..., None]
             wR += np.where(isN, 0.0, a)
+
+        if P.fix == 'c9':
+            isB = (rel < -0.01)
+            if P.prox_mode == 'idw':
+                pw = 1.0 / np.maximum(dist, 1.0) ** P.prox_p
+            else:
+                pw = mb_cone(dist, self_streak * P.prox)
+            pw = pw * np.where(isB, 1.0, 0.0)
+            accB += colour[spi[..., 1], spi[..., 0]] * (a * pw)[..., None]
+            wB += a * pw
+            covB += np.where(isB, a, 0.0)
+            a = np.where(isB, 0.0, a)
 
         acc += colour[spi[..., 1], spi[..., 0]] * a[..., None]
         wsum += a
@@ -360,13 +412,18 @@ def gather(colour, depth, vel, tilev, P):
                  near=w_near, same=w_same, far=w_far, wsum=wsum)
         return out, stats, r
 
-    if P.fix in ('c5', 'c6', 'c7'):
+    if P.fix in ('c5', 'c6', 'c7', 'c9'):
         # acc/wsum currently carry the centre at weight 1; back it out and re-add it at the
         # weight the taps left unclaimed.
-        wt = wsum - 1.0
+        wt = wsum - 1.0 + covB
         w_centre = np.maximum(0.0, 1.0 - wt)
         acc = (acc - colour) + colour * w_centre[..., None]
         wsum = wt + w_centre
+    if P.fix == 'c9':
+        # The background comes in with the coverage it earned, but wearing the colour the
+        # NEAREST unoccluded sample of it had, rather than the mean of the whole streak.
+        bg = accB / np.maximum(wB, 1e-12)[..., None]
+        acc = acc + bg * covB[..., None]
     out = acc / np.maximum(wsum, 1e-12)[..., None]
     changed = (wsum > 1.0001) if not P.arclen else (wsum > w0 * 1.0001)
     aux_comp = dict(near=w_near, same=w_same, far=w_far, wsum=wsum)
@@ -452,6 +509,36 @@ def scene_blade_behind():
 def scene_slow():
     return [Layer('bg', (-4000, -4000, 4000, 4000), 2000.0, BG),
             Layer('body', (300, 180, 500, 340), 200.0, BLADE, motion=(6.0, 0.0))]
+
+
+def scene_thin(W, H, width=16.0, speed=60.0, z=100.0, flat=False):
+    """A THIN FAST mover over a TEXTURED STATIC background.
+
+    Every blade in the scenes above is 160 px across, which is exactly what HIDES this case:
+    most taps along a wide body's own streak land back ON the body, so where the background
+    is fetched from hardly matters.  At 16 px almost every tap lands on BACKGROUND instead,
+    and then the fetch position is the whole answer.
+
+    The background is TEXTURED and STATIC on purpose.  Ground truth keeps it SHARP through
+    the mover -- a thin fast object really is nearly transparent, and what shows through is
+    the background AT THIS PIXEL, which never moved.  A gather can only fetch background from
+    OFFSETS along the streak, so it shows a BLURRED background instead.  Same amount of
+    background, wrong provenance: transparency reads as frosted glass."""
+    tex = None if flat else texture(W, H, scale=11.0)
+    cx = 0.5 * W
+    return [Layer('bg', (-4000, -4000, 4000, 4000), 2000.0, (0.5, 0.5, 0.5), tex=tex),
+            Layer('blade', (cx - 0.5 * width, 96, cx + 0.5 * width, H - 96), z, BLADE,
+                  motion=(speed, 0.0))]
+
+
+def scene_thin_coverage(W, H, width=16.0, speed=60.0, z=100.0):
+    """The same geometry with the mover WHITE on a BLACK ground, so ground_truth returns the
+    mover's exposure COVERAGE per pixel directly -- the fraction of the shutter it is really
+    there for.  That is the number the filter's own blade share has to match."""
+    cx = 0.5 * W
+    return [Layer('bg', (-4000, -4000, 4000, 4000), 2000.0, (0.0, 0.0, 0.0)),
+            Layer('blade', (cx - 0.5 * width, 96, cx + 0.5 * width, H - 96), z,
+                  (1.0, 1.0, 1.0), motion=(speed, 0.0))]
 
 
 def noisy_bg(W, H, seed=7):
@@ -554,6 +641,77 @@ def edge_width(profile, lo=0.10, hi=0.90):
     idx_lo = np.argmax(n >= lo)
     idx_hi = np.argmax(n >= hi)
     return float(abs(idx_hi - idx_lo))
+
+
+def blue_noise(H, W, seed=3, iters=12):
+    """Uniform values in [0,1) whose spectrum is EMPTY at low frequency -- alternating
+    projection between "spectrum is high-pass" and "histogram is uniform".  Same variance as
+    white noise, so it does not make the sampling error smaller; it moves that error to
+    frequencies a viewer (and any later filter) does not resolve."""
+    rng = np.random.default_rng(seed)
+    v = rng.normal(size=(H, W))
+    fy = np.fft.fftfreq(H)[:, None]
+    fx = np.fft.fftfreq(W)[None, :]
+    r = np.sqrt(fy ** 2 + fx ** 2)
+    hp = r / r.max()
+    for _ in range(iters):
+        v = np.real(np.fft.ifft2(np.fft.fft2(v) * hp))
+        order = np.argsort(v, axis=None)
+        ranks = np.empty(v.size, dtype=np.float64)
+        ranks[order] = np.arange(v.size, dtype=np.float64)
+        v = (ranks.reshape(H, W) + 0.5) / float(v.size) - 0.5
+    return v + 0.5
+
+
+def boxblur(img, times=2):
+    a = img.copy()
+    for _ in range(times):
+        p = np.pad(a, ((1, 1), (1, 1), (0, 0)) if a.ndim == 3 else 1, mode='edge')
+        a = sum(p[dy:dy + img.shape[0], dx:dx + img.shape[1]]
+                for dy in range(3) for dx in range(3)) / 9.0
+    return a
+
+
+def shown_background(out, cov, blade_rgb, mask, cov_max=0.5):
+    """Back out the BACKGROUND the filter is showing THROUGH the mover.
+
+    out = cov*blade + (1-cov)*bg is exactly ground truth's own decomposition, and cov is
+    measured exactly (scene_thin_coverage), so this isolates the one thing the amount-of-blur
+    metrics cannot see: WHICH background the filter put there.  Ground truth scores 0 by
+    construction.  Restricted to cov < cov_max so the division stays conditioned."""
+    m = mask & (cov < cov_max)
+    if not m.any():
+        return None, None, m
+    k = np.maximum(1.0 - cov[m], 1e-6)[..., None]
+    return (out[m] - cov[m][..., None] * np.array(blade_rgb)) / k, None, m
+
+
+def highpass(img):
+    """img minus its own 3x3 box mean -- the band a 1-px dither pattern lives in."""
+    a = img.mean(axis=2) if img.ndim == 3 else img
+    p = np.pad(a, 1, mode='edge')
+    box = sum(p[dy:dy + a.shape[0], dx:dx + a.shape[1]]
+              for dy in range(3) for dx in range(3)) / 9.0
+    return a - box
+
+
+def hf_rms(img, mask=None):
+    h = highpass(img)
+    return float(math.sqrt((h[mask] ** 2).mean() if mask is not None else (h ** 2).mean()))
+
+
+def grad_mag(img, mask=None):
+    """Mean |gradient| of an image.
+
+    ⚠ NOT a smear metric on an image that also carries NOISE -- dither raises |gradient| for
+    the same reason blur lowers it, and on these scenes the two were the same size, so the
+    first version of T12(b) read "sharper than ground truth" for a filter that was in fact
+    smearing badly. Use shown_background() for provenance; this stays for edge profiles."""
+    a = img.mean(axis=2) if img.ndim == 3 else img
+    gx = np.abs(np.diff(a, axis=1, append=a[:, -1:]))
+    gy = np.abs(np.diff(a, axis=0, append=a[-1:, :]))
+    g = 0.5 * (gx + gy)
+    return float(g[mask].mean() if mask is not None else g.mean())
 
 
 # ---------------------------------------------------------------------------------------
@@ -822,12 +980,19 @@ def t_fix(P, outdir):
     keep = P.fix
 
     print('  (a) STATIC WORLD -- must be BIT-IDENTICAL or the candidate is not shippable')
+    print('      The SHIPPED configuration is the last two rows: c7 at gain 2 is MB-2j, and c9')
+    print('      adds MB-2k. A still frame that softens is the most visible failure this pass has,')
+    print('      so every arm that has ever been deployed stays in this guard.')
     L0 = scene_static()
-    for fx in arms:
-        P.fix = fx
+    keep_gain, keep_pm, keep_pp = P.gain, P.prox_mode, P.prox_p
+    P.prox_mode, P.prox_p = 'idw', 4.0
+    for fx, gn in [(a, 1.0) for a in arms] + [('c7', 2.0), ('c9', 2.0)]:
+        P.fix, P.gain = fx, gn
         out, _, aux = run_filter(L0, P)
         d = float(np.abs(out - aux['source']).max())
-        print('      %-5s max|out-src| = %.3e   %s' % (fx, d, 'PASS' if d == 0.0 else 'FAIL'))
+        print('      %-5s gain %.1f  max|out-src| = %.3e   %s'
+              % (fx, gn, d, 'PASS' if d == 0.0 else 'FAIL'))
+    P.gain, P.prox_mode, P.prox_p = keep_gain, keep_pm, keep_pp
 
     print('')
     print('  (b) THE SMEAR ITSELF, lone mover over static ground')
@@ -887,6 +1052,190 @@ def t_fix(P, outdir):
               % (fx, 100 * (aux['near'][m] / tot).mean(), 100 * (aux['same'][m] / tot).mean(),
                  100 * (aux['far'][m] / tot).mean(), 100 * cen.mean()))
     P.fix = keep
+
+
+def thin_case(P, width, speed=60.0, nsub=257, flat=False):
+    """Everything a thin-mover arm needs, built once and reused across arms."""
+    L = scene_thin(P.W, P.H, width=width, speed=speed, flat=flat)
+    src, _, _ = rasterize(L, P.W, P.H, 0.0)
+    gt = ground_truth(L, P.W, P.H, P.shutter, nsub=nsub)
+    cov = ground_truth(scene_thin_coverage(P.W, P.H, width=width, speed=speed),
+                       P.W, P.H, P.shutter, nsub=nsub)[..., 0]
+    body = np.all(np.abs(src - np.array(BLADE)) < 1e-9, axis=2)    # the mover's OWN pixels
+    changed = np.abs(gt - src).max(axis=2) > 0.02
+    return dict(L=L, src=src, gt=gt, cov=cov, body=body, changed=changed)
+
+
+def t_thin(P, outdir):
+    hdr('T12  THIN FAST MOVER -- the reported "refraction" and "dithered" look')
+    print('  Reported after MB-2j landed: a thin fast sword can read as a REFRACTION (the')
+    print('  background smears where the sword should be), and a small share of pixels look')
+    print('  DITHERED.  Neither can appear on the 160 px blades above -- see scene_thin.')
+    print('')
+    keep = (P.fix, P.gain, P.tap_jitter, P.max_taps)
+    arms = (('ship', 'ship', 1.0), ('MB-2j', 'c7', 2.0), ('MB-2k', 'c9', 2.0))
+    P.prox_mode, P.prox_p = 'idw', 4.0
+
+    def run(case, fx, gn, tj=None):
+        P.fix, P.gain = fx, gn
+        if tj is not None:
+            P.tap_jitter = tj
+        out, _, aux = run_filter(case['L'], P)
+        P.tap_jitter = keep[2]
+        return out, aux
+
+    widths = (8.0, 16.0, 32.0, 64.0, 160.0)
+    cases = {w: thin_case(P, w) for w in widths}
+
+    print('  (a) IS THE SWORD TOO TRANSPARENT?  On the mover\'s OWN pixels, how much of the')
+    print('      answer is the mover, against the coverage ground truth says it has.')
+    print('      A thin fast object IS mostly background -- cov is the CORRECT blade share.')
+    print('      width   cov(GT)      arm     blade share    centre kept   bg taps')
+    for w in widths:
+        c = cases[w]
+        m = c['body']
+        covm = float(c['cov'][m].mean())
+        for name, fx, gn in arms:
+            out, aux = run(c, fx, gn)
+            tot = aux['wsum'][m]
+            blade = (aux['same'][m] + (tot - aux['near'][m] - aux['same'][m] - aux['far'][m])) / tot
+            cen = (tot - aux['near'][m] - aux['same'][m] - aux['far'][m]) / tot
+            print('      %5.0f   %7.3f   %-6s      %7.3f       %7.3f   %7.3f'
+                  % (w, covm, name, blade.mean(), cen.mean(), (aux['far'][m] / tot).mean()))
+
+    print('')
+    print('  (b) WHICH BACKGROUND IS IT SHOWING?  Back out bg from out = cov*blade+(1-cov)*bg')
+    print('      and compare to the background REALLY behind that pixel.  A gather can only')
+    print('      fetch background from OFFSETS along the streak, and this background never')
+    print('      moved, so any error here is pure provenance.  GT scores 0.00 by construction.')
+    print('      corr 1.00 / std 1.00 = the right background.  std < 1 = smeared (refraction).')
+    print('      width      arm     RMSE(bg)   corr    std ratio')
+    for w in widths:
+        c = cases[w]
+        bg_true, _, _ = rasterize([c['L'][0]], P.W, P.H, 0.0)      # the scene without the mover
+        for name, fx, gn in arms:
+            out, _ = run(c, fx, gn)
+            shown, _, m = shown_background(out, c['cov'], BLADE, c['body'])
+            if shown is None:
+                print('      %5.0f   %-6s      (no pixel below cov 0.5)' % (w, name)); continue
+            truth = bg_true[m]
+            a = shown.mean(axis=1) - shown.mean()
+            b = truth.mean(axis=1) - truth.mean()
+            corr = float((a * b).sum() / max(math.sqrt((a * a).sum() * (b * b).sum()), 1e-12))
+            print('      %5.0f   %-6s       %.4f   %6.3f     %6.3f'
+                  % (w, name, float(math.sqrt(((shown - truth) ** 2).mean())), corr,
+                     float(shown.mean(axis=1).std() / max(truth.mean(axis=1).std(), 1e-12))))
+
+    print('')
+    print('  (c) THE DITHER.  dither = RMS of (taps jittered) - (taps at a fixed phase), which')
+    print('      is EXACTLY how much of the image the per-pixel hash decides.  excessHF is')
+    print('      high-frequency energy the filter has that GROUND TRUTH does not.')
+    print('      width      arm     dither    excessHF    RMSE(body)')
+    for w in widths:
+        c = cases[w]
+        m = c['body']
+        for name, fx, gn in arms:
+            oj, _ = run(c, fx, gn, tj=1.0)
+            o0, _ = run(c, fx, gn, tj=0.0)
+            d = float(math.sqrt(((oj - o0) ** 2)[m].mean()))
+            print('      %5.0f   %-6s   %.5f     %.5f      %.4f'
+                  % (w, name, d, hf_rms(oj, m) - hf_rms(c['gt'], m), rmse(oj, c['gt'], m)))
+
+    print('')
+    print('  (d) THE GAIN.  The cap is min(a*gain, 1).  At gain 2 every tap inside the streak')
+    print('      SATURATES, so the taper that used to grade near background over far is gone')
+    print('      and the centre keeps nothing.  Lowering it trades that back against the')
+    print('      over-blur gain 2 was measured to cure -- lone = the wide-open smear.')
+    c16 = cases[16.0]
+    L1 = scene_lone()
+    gt1 = ground_truth(L1, P.W, P.H, P.shutter)
+    s1, _, _ = rasterize(L1, P.W, P.H, 0.0)
+    w1 = np.abs(gt1 - s1).max(axis=2) > 0.02
+    bg16d, _, _ = rasterize([c16['L'][0]], P.W, P.H, 0.0)
+    print('      gain   thin: blade  bgStd   dither  RMSE     lone: delivery   RMSE')
+    for gn in (1.0, 1.2, 1.4, 1.6, 1.8, 2.0, 2.4):
+        oj, aux = run(c16, 'c7', gn, tj=1.0)
+        o0, _ = run(c16, 'c7', gn, tj=0.0)
+        m = c16['body']
+        tot = aux['wsum'][m]
+        blade = ((aux['same'][m] + (tot - aux['near'][m] - aux['same'][m] - aux['far'][m])) / tot).mean()
+        d = float(math.sqrt(((oj - o0) ** 2)[m].mean()))
+        P.fix, P.gain = 'c7', gn
+        ol, _, _ = run_filter(L1, P)
+        sh, _, mm = shown_background(oj, c16['cov'], BLADE, c16['body'])
+        std = float(sh.mean(axis=1).std() / max(bg16d[mm].mean(axis=1).std(), 1e-12))
+        print('      %4.1f      %7.3f  %6.3f  %.5f  %.4f       %7.3f  %.4f'
+              % (gn, blade, std, d, rmse(oj, c16['gt'], m),
+                 delivery(ol, gt1, s1, w1)[0], rmse(ol, gt1, w1)))
+    print('      cov(GT) for the blade share above = %.3f' % float(c16['cov'][c16['body']].mean()))
+
+    print('')
+    print('  (e) THE NOISE ITSELF.  The dither in (c) is the sampling error of estimating')
+    print('      coverage from 32 jittered taps, and no weighting can remove it -- but mbDither')
+    print('      is WHITE, so that error sits at every frequency including the ones a viewer')
+    print('      resolves.  Blue noise has the same variance and almost none of it low.')
+    print('      lpRMSE is the error left after a small blur -- the part that is actually seen.')
+    print('      Run at the SHIPPED arm: under MB-2j the hash decided 4% of the error and blue')
+    print('      noise could not have registered whatever its merits. MB-2k raises that share,')
+    print('      so the question is asked again where it can actually be answered.')
+    print('      width    noise    dither    RMSE     lpRMSE    excessHF')
+    for w in widths:
+        c = cases[w]
+        m = c['body']
+        gl = boxblur(c['gt'])
+        for nz in ('white', 'blue'):
+            P.tap_noise = nz
+            oj, _ = run(c, 'c9', 2.0, tj=1.0)
+            o0, _ = run(c, 'c9', 2.0, tj=0.0)
+            print('      %5.0f   %-6s   %.5f  %.4f   %.5f    %.5f'
+                  % (w, nz, float(math.sqrt(((oj - o0) ** 2)[m].mean())), rmse(oj, c['gt'], m),
+                     rmse(boxblur(oj), gl, m), hf_rms(oj, m) - hf_rms(c['gt'], m)))
+        P.tap_noise = 'white'
+
+    print('')
+    print('  (f) MB-2k: THE EXPONENT.  1/dist**p weights the revealed-background MIXTURE; the')
+    print('      AMOUNT of background is untouched.  p is an optimum, not a trend -- past it the')
+    print('      estimate collapses onto the single nearest tap, whose position the hash picks,')
+    print('      and both the contrast (std past 1.0) and the dither run away.  skirt/lone are')
+    print('      the guards: MB-2k must not undo the amputation fix or bring the over-blur back.')
+    L1 = scene_lone()
+    gt1 = ground_truth(L1, P.W, P.H, P.shutter)
+    s1, _, _ = rasterize(L1, P.W, P.H, 0.0)
+    w1 = np.abs(gt1 - s1).max(axis=2) > 0.02
+    Ls = scene_blade_front(skirt_motion=(0.0, 8.0))
+    gts = ground_truth(Ls, P.W, P.H, P.shutter, nsub=257)
+    ss, _, _ = rasterize(Ls, P.W, P.H, 0.0)
+    ms = (np.abs(gts - ss).max(axis=2) > 0.02) & np.all(np.abs(ss - np.array(SKIRT)) < 1e-9, axis=2)
+    c16 = cases[16.0]
+    bg16, _, _ = rasterize([c16['L'][0]], P.W, P.H, 0.0)
+    print('      p       thin16: std   corr   RMSE(bg)  dither |  skirt   lone')
+    for pp in (0.0, 2.0, 3.0, 4.0, 6.0, 12.0):
+        P.prox_mode, P.prox_p = 'idw', pp
+        fx = 'c7' if pp == 0.0 else 'c9'
+        oj, _ = run(c16, fx, 2.0, tj=1.0)
+        o0, _ = run(c16, fx, 2.0, tj=0.0)
+        shown, _, m = shown_background(oj, c16['cov'], BLADE, c16['body'])
+        truth = bg16[m]
+        aa = shown.mean(axis=1) - shown.mean()
+        bb = truth.mean(axis=1) - truth.mean()
+        corr = float((aa * bb).sum() / max(math.sqrt((aa * aa).sum() * (bb * bb).sum()), 1e-12))
+        P.fix, P.gain = fx, 2.0
+        osk, _, _ = run_filter(Ls, P)
+        olo, _, _ = run_filter(L1, P)
+        print('      %-6s        %5.3f %6.3f    %.4f   %.5f | %6.3f %6.3f'
+              % ('MB-2j' if pp == 0.0 else '%.0f' % pp,
+                 float(shown.mean(axis=1).std() / max(truth.mean(axis=1).std(), 1e-12)), corr,
+                 float(math.sqrt(((shown - truth) ** 2).mean())),
+                 float(math.sqrt(((oj - o0) ** 2)[c16['body']].mean())),
+                 delivery(osk, gts, ss, ms)[0], delivery(olo, gt1, s1, w1)[0]))
+    P.prox_mode, P.prox_p = 'idw', 4.0
+
+    if outdir:
+        c = cases[16.0]
+        o_ship, _ = run(c, 'ship', 1.0)
+        o_j, _ = run(c, 'c7', 2.0)
+        dump(outdir, 't12_thin', src=c['src'], gt=c['gt'], ship=o_ship, mb2j=o_j)
+    P.fix, P.gain, P.tap_jitter, P.max_taps = keep
 
 
 def t_tilegrid(P, outdir):
@@ -1009,7 +1358,9 @@ def main():
     ap.add_argument('--jitter', type=float, default=1.0)
     ap.add_argument('--no-twodir', action='store_true')
     ap.add_argument('--gain', type=float, default=1.0)
-    ap.add_argument('--fix', default='ship', choices=('ship', 'c1', 'c5', 'c6', 'c7', 'c8'),
+    ap.add_argument('--tapjitter', type=float, default=1.0,
+                    help='RIG ONLY: scale the per-pixel tap phase hash (0 = every pixel in phase)')
+    ap.add_argument('--fix', default='ship', choices=('ship', 'c1', 'c5', 'c6', 'c7', 'c8', 'c9'),
                     help='which candidate weighting to run')
     ap.add_argument('--arclen', action='store_true',
                     help='EXPERIMENT: weight taps by the arc length they represent')
@@ -1022,7 +1373,8 @@ def main():
 
     P = Params(a.width, a.height, K=a.K, shutter=a.shutter, max_taps=a.maxtaps,
                floor_px=a.minpx, soft_z=a.softz, tile_jitter=a.jitter,
-               two_dir=not a.no_twodir, arclen=a.arclen, fix=a.fix, gain=a.gain)
+               two_dir=not a.no_twodir, arclen=a.arclen, fix=a.fix, gain=a.gain,
+               tap_jitter=a.tapjitter)
     if a.dump:
         os.makedirs(a.dump, exist_ok=True)
 
@@ -1067,6 +1419,8 @@ def main():
         t_composition(P, a.dump)
     if s in ('all', 'fix'):
         t_fix(P, a.dump)
+    if s in ('all', 'thin'):
+        t_thin(P, a.dump)
     if s in ('all', 'tilegrid'):
         t_tilegrid(P, a.dump)
     if s in ('all', 'twodir'):

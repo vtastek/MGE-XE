@@ -182,6 +182,9 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
     // Did anything actually reach this pixel? Distinct from `blurred`, which only says the gather
     // RAN — see the statistics at the tail, and the report that made the difference matter.
     bool changed = false;
+    // MB-2k rides inside MB-2j: it re-weights a mixture that only the corrected reconstruction
+    // produces, so arming it against the legacy weighting would describe nothing.
+    bool prov = (gMbParams.opts.w > 0.5f) && (gMbParams.opts2.x > 0.5f);
 
     // MB-2i. Split the accepted weight by whether the tap was NEARER than this pixel or not, so
     // "nothing reached me" and "something in front reached me" stop being the same picture. Cost
@@ -226,6 +229,14 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
         // comes out BIT-IDENTICAL to the source rather than merely close to it.
         float4 sum  = centre;
         float  wsum = 1.0f;
+
+        // ── MB-2k: "HOW MUCH BACKGROUND" AND "WHICH BACKGROUND" ARE DIFFERENT QUESTIONS ──────────
+        // The revealed background is kept in its own bucket: `covB` is how much of the exposure it
+        // is entitled to (which MB-2j already gets right), `sumB/wB` is what colour it wears. See
+        // the block in the loop for why those two must not be decided by the same weight.
+        float4 sumB = f4(0.0f);
+        float  wB   = 0.0f;
+        float  covB = 0.0f;
 
         // ── THE SHUTTER INTEGRAL, WEIGHTED BY WHAT COULD ACTUALLY HAVE REACHED HERE ──────────────
         // The shutter is open or it is not, so the kernel ALONG the streak is uniform — there is no
@@ -313,8 +324,49 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
                 a = min(a * 2.0f, 1.0f) / float(max(n, 1u));
             }
 
-            sum  += LoadTex2D(gMbColor, NO_SAMPLER, spi, 0) * a;
-            wsum += a;
+            // ── MB-2k: THE OFFSETS ARE A SEARCH, NOT A DESCRIPTION ───────────────────────
+            // `b * cone(dist, selfStreak)` answers HOW MUCH: what fraction of the exposure are we
+            // swept off this pixel, so that whatever is behind us shows through. MB-2j's cap makes
+            // that fraction come out right -- on a 16 px blade at 60 px/frame the blade's own share
+            // is 0.167 against a ground-truth coverage of 0.160, and ship's was 0.533.
+            //
+            // But the COLOUR came from averaging every background tap along the streak equally, and
+            // the thing being revealed is AT THIS PIXEL -- for a static background it never moved at
+            // all. Measured with the exact coverage backed out (`out = cov*blade + (1-cov)*bg`), the
+            // background this filter showed through a thin fast mover had **0.26 of the true
+            // contrast and was ANTI-CORRELATED with it, corr -0.98**: averaging a texture over +-50
+            // px does not blur it, it inverts it. That is the reported *"sometimes the sword is a
+            // refraction"*, and MB-2j did not cause it -- MB-2j made it VISIBLE by correctly raising
+            // the background's share of a thin mover's pixels from 0.47 to 0.83.
+            //
+            // So the offsets are a SEARCH for somewhere the background can be seen unoccluded, not a
+            // statement about where it is, and a search should prefer the NEAREST place it found
+            // one. 1/dist^4 has no radius to pick: whatever the closest unoccluded sample turns out
+            // to be, it wins, at any mover width. A cone scaled to the streak was tried first and is
+            // NOT equivalent -- its best width tracks the mover's own width (0.15 of the streak at
+            // 8 px, 0.25 at 32), which the gather cannot know, and when it is too narrow NO tap
+            // qualifies, the bucket's weight sum collapses and the background it hands back is
+            // BLACK: RMSE 0.0414 on a 160 px body against 0.0045 here. The exponent is an optimum,
+            // not a trend: 0.0559 at 3, 0.0544 at 4, 0.0579 at 6, and 0.4161 at 12 where it has
+            // collapsed onto one tap.
+            //
+            // ⚠ IT TRADES A LOW-FREQUENCY ERROR FOR A SMALLER HIGH-FREQUENCY ONE. A sharper estimate
+            // depends on WHICH taps landed where, so the tap hash decides more of it: dither
+            // 0.0074 -> 0.0296. Whole error on the mover's pixels still falls 0.1849 -> 0.0544.
+            float4 tapC = LoadTex2D(gMbColor, NO_SAMPLER, spi, 0);
+            if (prov && relD < -0.01f)
+            {
+                float id = 1.0f / max(dist, 1.0f);
+                float pw = (id * id) * (id * id);            // 1 / dist^4
+                sumB += tapC * (a * pw);
+                wB   += a * pw;
+                covB += a;                                   // the AMOUNT is untouched
+            }
+            else
+            {
+                sum  += tapC * a;
+                wsum += a;
+            }
             if      (relD >  0.01f) { wFront += a; }   // NEARER  -- something in front reached us
             else if (relD < -0.01f) { wBack  += a; }   // BEHIND  -- we reached something behind
             else                    { wSame  += a; }   // OUR OWN SURFACE, and this is the defect
@@ -323,10 +375,13 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
         if (gMbParams.opts.w > 0.5f)
         {
             // The centre went into `sum` at weight 1; back it out and re-add it at the weight
-            // the taps left unclaimed. wsum - 1 is exactly the taps' total.
-            float wt = wsum - 1.0f;
+            // the taps left unclaimed. wsum - 1 is exactly the taps' total, and covB is the part of
+            // that total MB-2k routed into the background bucket -- so `wt` is the same number it
+            // would have been, and with `prov` off covB is 0 and this is the MB-2j line unchanged.
+            float wt = (wsum - 1.0f) + covB;
             float wc = max(0.0f, 1.0f - wt);
-            outv    = ((sum - centre) + centre * wc) / max(wt + wc, 1.0e-6f);
+            float4 bg = (wB > 1.0e-20f) ? (sumB / wB) : f4(0.0f);
+            outv    = ((sum - centre) + centre * wc + bg * covB) / max(wt + wc, 1.0e-6f);
             changed = (wt > 1.0e-4f);
         }
         else

@@ -132,7 +132,13 @@ STRUCT(MotionBlurParams)
     // Reserved. ⚠ CLEARED BY THE HOST **BEFORE** THE LANES IT WRITES, not after — see the MB-2 step 0
     // commit, where a trailing reserved-lane clear silently ate a flag the shader depended on and
     // the heartbeat went on reporting the flag it had computed.
+    // x = MB-2h tile-fetch jitter (fraction of K); y = MB-2h two-axis sampling; z = MB-2i diagnostic
+    // mode; w = MB-2j the corrected reconstruction.
     DATA(float4, opts, None);
+    // x = MB-2k: weight the REVEALED-BACKGROUND mixture by proximity. The cbuffer is 256 B (the
+    // minimum CBV) and was carrying four float4s, so this fifth one costs nothing.
+    // yzw reserved, cleared by the host with the same before-not-after rule as `opts`.
+    DATA(float4, opts2, None);
 };
 
 BEGIN_SRT(MotionBlurSrtData)

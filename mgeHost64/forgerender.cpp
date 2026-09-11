@@ -17154,6 +17154,29 @@ namespace {
     //     tap-count spread 6..64      0.559 -> 0.000
     //     static world                bit-identical in both (the standing guard)
     bool     g_mbRecon = true;
+    // ── MB-2k: WHICH BACKGROUND SHOWS THROUGH A MOVER (default ON; rides inside MB-2j) ───────
+    // MB-2j gets the AMOUNT of background right -- a 16 px blade at 60 px/frame keeps 0.167 of
+    // its own pixels against a ground-truth exposure coverage of 0.160, where the legacy
+    // weighting kept 0.533. What it does not get right is WHICH background: the colour was the
+    // mean of every background tap along the streak, and a static background never moved, so
+    // averaging a texture over +-50 px does not blur it, it INVERTS it. Backing the background
+    // out of the filter's own output (`out = cov*blade + (1-cov)*bg`, with cov measured exactly)
+    // it had 0.26 of the true contrast at corr -0.98. That is the reported *"sometimes the sword
+    // is a refraction"*, and MB-2j did not cause it -- it made it visible, by raising the
+    // background's share of a thin fast mover's pixels from 0.47 to 0.83.
+    //
+    // The fix weights the background MIXTURE by 1/dist^4 while leaving its TOTAL alone: the
+    // offsets are a search for somewhere the background can be seen unoccluded, so the nearest
+    // place it was found wins. Measured on a 16 px blade at 60 px/frame:
+    //     background contrast vs truth   0.34 -> 0.97   (1.00 = right)
+    //     background correlation         -0.96 -> +0.81
+    //     RMSE on the mover's own pixels 0.2053 -> 0.0955
+    //     skirt / lone / twodir / static  ALL EXACTLY UNCHANGED -- it is a no-op wherever the
+    //                                     background behind a mover is locally flat
+    // ⚠ It trades a large LOW-frequency error for a smaller HIGH-frequency one: a sharper
+    // estimate depends on which taps landed where, so the tap hash decides more of the answer
+    // (dither 0.0074 -> 0.0296 on an 8 px blade). Net error on those pixels still falls 3.4x.
+    bool     g_mbProv = true;
     // Whether the pass ran this frame — written from the ONE gate, read by the resolve's set index
     // and by the heartbeat. Same rule as g_lastUpscaleRan beside it: a second derivation of "did it
     // run" is a second thing that can disagree with the frame.
@@ -21357,6 +21380,10 @@ namespace {
           // 0.666 onto a receiver moving 8 px/frame. On = the corrected one. Both are
           // bit-identical on a still frame, so this cannot be judged parked -- move something.
           t.checkbox("Corrected reconstruction (MB-2j; off = the legacy weighting)", &g_mbRecon);
+          // Inert unless MB-2j is on -- it re-weights a mixture only the corrected reconstruction
+          // produces. Judge it on a THIN fast mover over a TEXTURED background; over a flat wall
+          // there is nothing for it to put back and it is measurably a no-op.
+          t.checkbox("  \\- nearest revealed background (MB-2k; off = the streak mean)", &g_mbProv);
           t.sliderU("DEBUG: 0 off | 1 the velocity the blur READS | 2 depth order | 3 who won the pixel",
                     &g_mbDebug, 0u, 3u, 1u);
           t.flush(); }
@@ -24908,6 +24935,7 @@ void destroyHostWindow(Renderer* R);
             { "objVelSkipStill",     &g_objVelSkipStill     },
             { "mbTwoDir",            &g_mbTwoDir            },
             { "mbRecon",             &g_mbRecon             },
+            { "mbProv",              &g_mbProv              },
             { "objVelSkinned",       &g_objVelSkinnedLane   },
             { "objVelFP",            &g_objVelFPLane        },
             { "objVelSkinIgnoreGen", &g_objVelSkinIgnoreGen },
@@ -38113,6 +38141,7 @@ void destroyHostWindow(Renderer* R);
                 // value the CPU had computed. A clear that runs before every write cannot do that,
                 // and neither can the next lane added below it.
                 mp[12] = 0.0f; mp[13] = 0.0f; mp[14] = 0.0f; mp[15] = 0.0f;
+                mp[16] = 0.0f; mp[17] = 0.0f; mp[18] = 0.0f; mp[19] = 0.0f;
                 // MB-2h, written AFTER the clear above and never before it.
                 // opts.x = tile-fetch jitter as a fraction of K; opts.y = two-axis sampling.
                 mp[12] = std::max(0.0f, std::min(1.0f, g_mbTileJitter));
@@ -38121,6 +38150,8 @@ void destroyHostWindow(Renderer* R);
                 mp[14] = (float)std::min(g_mbDebug, 3u);
                 // MB-2j. opts.w = the corrected reconstruction.
                 mp[15] = g_mbRecon ? 1.0f : 0.0f;
+                // MB-2k. opts2.x = proximity-weighted revealed background.
+                mp[16] = g_mbProv ? 1.0f : 0.0f;
                 // rects: the DELIVERED rect, then the MOTION-VECTOR (input) rect.
                 mp[0] = (float)deliveredW;   mp[1] = (float)deliveredH;
                 mp[2] = (float)g_live.width; mp[3] = (float)g_live.height;
@@ -39459,10 +39490,14 @@ void destroyHostWindow(Renderer* R);
                 LOG::logline(">> [forge-hb] mb peak: searched=%.3f%% changed=%.3f%% avgTaps=%.1f"
                              " maxLen=%.2f px on the BUSIEST of %u/%u frames that searched anything"
                              " | held=%u (sim frozen — menu)"
+                             " | arms: recon=%d prov=%d twoDir=%d objOnly=%d jitter=%.2f softZ=%.2f dbg=%u"
                              "  [this is the frame `mb=` is priced by — cost is (searched px) x"
                              " (their taps); the sampled line above is usually a PARKED frame]",
                              g_mbPeakPct, g_mbPeakChg, g_mbPeakTaps, (double)g_mbPeakLen,
-                             g_mbBlurFrames, g_mbRanFrames, g_mbHeldFrames);
+                             g_mbBlurFrames, g_mbRanFrames, g_mbHeldFrames,
+                             g_mbRecon ? 1 : 0, g_mbProv ? 1 : 0, g_mbTwoDir ? 1 : 0,
+                             g_mbObjectOnly ? 1 : 0,
+                             (double)g_mbTileJitter, (double)g_mbSoftZ, g_mbDebug);
                 g_mbPeakPct = 0.0; g_mbPeakChg = 0.0; g_mbPeakTaps = 0.0; g_mbPeakLen = 0.0f;
                 g_mbBlurFrames = 0; g_mbRanFrames = 0; g_mbHeldFrames = 0;
             }
