@@ -16599,6 +16599,29 @@ namespace {
     // which is a sign or pairing error and not animation.
     double   g_objVelFPIdSumPose  = 0.0;
     float    g_objVelFPIdPosePx   = 0.0f;   // the peak frame's pose term
+    // ═══ THE FOURTH LEG: WHAT MB-2d's RULE WOULD WRITE OVER AN ARM PIXEL ═══
+    // |prevC - heldC| — the arm's previous pose through the previous camera, against the SAME
+    // point held at its current pose through that same camera. That is precisely the frag's
+    // `prev_object - prev_static`, the vector opts.z selects, and it costs one more pxDelta on two
+    // clip positions the probe has already computed.
+    //
+    // ⚠ IT IS NOT A PASS/FAIL — IT IS THE REASON THE FP LANE OPTS OUT, MEASURED. `rel` is the
+    // POSE leg seen by the previous camera, so it tracks `pose` and NOT `arm`: the object-only rule
+    // differences two positions through ONE camera, which is exactly the arithmetic that drops the
+    // camera cancellation the CANCELLATION line below proves is happening. Read it against `arm`.
+    // Three peak frames from the log that reported this defect, at 2560x1600:
+    //
+    //     arm=134.6  turn=441.2  pose=536.8     <- the rule would blur the arms 4.0x too far
+    //     arm=162.9  turn=310.4  pose=338.3     <- 2.1x
+    //     arm=219.2  turn=327.8  pose=146.8
+    //
+    // and K is 96, so anything past 96 px is a streak pinned at the tile size with the tile's whole
+    // neighbourhood dilated to match — which is why one wrong lane over the arms was visible as
+    // BLOCKS across the world beside them. It was ON for one release, which is what "first person is
+    // getting blur from movement" was. If the arms ever stopped being camera-attached, `rel` would
+    // collapse onto `arm` and the exception would be visibly unnecessary.
+    double   g_objVelFPIdSumRel   = 0.0;
+    float    g_objVelFPIdRelPx    = 0.0f;   // the peak frame's world-relative term
     // ═══ AND THE TEST THAT DOES NOT NEED IDLE ARMS ══════════════════════════════════════════
     // ⚠⚠ "arm ~ 0" IS ONLY THE TEST WHEN THE ARMS ARE IDLE, AND MORROWIND'S NEVER ARE — the
     // weapon bobs and swings continuously, and on a swing a large arm velocity is the FEATURE.
@@ -36609,7 +36632,36 @@ void destroyHostWindow(Renderer* R);
                 // store from the world lane would replace every mover's device depth with the near
                 // plane. See objvelocity.frag's note.
                 ofp[37] = 1.0f;
-                ofp[38] = g_mbObjectOnly ? 1.0f : 0.0f;   // MB-2d, as the world lane
+                // ⚠⚠ MB-2d's opts.z IS DELIBERATELY **NOT** MIRRORED HERE, AND THE MIRROR WAS A BUG.
+                //
+                // opts.z asks the frag for the object's motion RELATIVE TO THE WORLD:
+                //     prev_object - prev_static,  i.e. "where it was" minus "where it would be
+                //     if only the camera had moved".
+                // For a world mover that is exactly right and a static one cancels to EXACTLY zero,
+                // which is the whole feature. For the ARMS it is exactly wrong, because the arms are
+                // ATTACHED TO THE CAMERA: their world position moves WITH the eye every frame, so
+                // `prev_static` is where the arm is NOW seen from where the camera WAS, and the
+                // subtraction hands back the camera's own parallax at NEAR-PLANE distance instead of
+                // removing it. The arms then blur by the full camera term, magnified by how close
+                // they are, and at K=96 the tile dilation carries that streak into the world tiles
+                // beside them — reported from play as "first person is getting blur from movement",
+                // "motion blur is exaggerated" and "tiles visible", which are one defect.
+                //
+                // THE REFERENCE FRAME FOR "OBJECT MOTION" IS WHATEVER THE OBJECT IS ATTACHED TO.
+                // The world lane's objects are attached to the world, so the camera term must be
+                // subtracted. The arms are attached to the camera, so the camera term is ALREADY
+                // absent from their total screen motion — that cancellation is MB-1d's whole claim
+                // and the CAMERA CANCELLATION verdict line proves it every window. Writing the total
+                // vector here is therefore not an exception to object-only blur, it is object-only
+                // blur evaluated in the arms' own frame: idle arms under a moving camera stay sharp,
+                // and a weapon SWING still smears, in both modes, with no third answer.
+                //
+                // The `rel=` field on the fp identity heartbeat is the standing measurement of this:
+                // it prints what opts.z WOULD have written over an arm pixel. It tracks `pose`, the
+                // arm's motion THROUGH THE WORLD, where `arm` — its motion across the SCREEN — is
+                // the one a viewer sees. On the peak frames of the log that reported this, 536.8 px
+                // against 134.6.
+                ofp[38] = 0.0f;
                 ofp[39] = 0.0f;
 
                 // `mm` is the FP1e stride axis, the world lane's ObjVelRec::mm verbatim: a
@@ -36778,11 +36830,16 @@ void destroyHostWindow(Renderer* R);
                                 const float armPx  = pxDelta(prevC, curC);
                                 const float turnPx = pxDelta(heldC, curC);
                                 const float posePx = pxDelta(poseC, curC);
+                                // MB-2d's own vector: prev_object - prev_static. heldC IS
+                                // PrevStatic — the same point at its CURRENT pose through the
+                                // PREVIOUS camera — so this needs no new projection.
+                                const float relPx  = pxDelta(prevC, heldC);
                                 ++g_objVelFPIdSamples;
                                 if (turnPx > g_objVelFPIdTurnPx) {
                                     g_objVelFPIdTurnPx   = turnPx;
                                     g_objVelFPIdArmPx     = armPx;
                                     g_objVelFPIdPosePx    = posePx;
+                                    g_objVelFPIdRelPx     = relPx;
                                     g_objVelFPIdPeakFrame = g_renderFrame;
                                 }
                                 // ⚠⚠ NO "IS IT CAMERA-ATTACHED" GATE, AND THE ONE THAT WAS HERE IS
@@ -36805,6 +36862,7 @@ void destroyHostWindow(Renderer* R);
                                     g_objVelFPIdSumArm   += (double)armPx;
                                     g_objVelFPIdSumTurn += (double)turnPx;
                                     g_objVelFPIdSumPose  += (double)posePx;
+                                    g_objVelFPIdSumRel   += (double)relPx;
                                     g_objVelFPIdResCancel += std::fabs((double)armPx
                                                           - std::fabs((double)posePx - (double)turnPx));
                                     g_objVelFPIdResAdd    += std::fabs((double)armPx
@@ -39343,15 +39401,19 @@ void destroyHostWindow(Renderer* R);
                     // `world` near 0 means the camera never turned in the window and the line has
                     // not been tested; look at samples= and the mv camera delta before reading it.
                     LOG::logline(">> [forge-hb] objvel fp identity: arm=%.3f px turn=%.2f px"
-                                 " pose=%.2f px (ratio %.4f) on the BUSIEST of %u on-screen frames"
+                                 " pose=%.2f px rel=%.2f px (ratio %.4f) on the BUSIEST of %u on-screen frames"
                                  "  [THE ACCEPTANCE TEST: `turn` is what that pixel carried BEFORE"
                                  " this lane (the same point held world-still through last frame's"
                                  " arm camera); `arm` is what it carries NOW. arm << turn IS the"
                                  " arms staying sharp on a camera turn. arm ~ turn = the FP camera"
                                  " pair never reached the draws; turn ~0 = the camera did not turn,"
-                                 " so nothing was tested]",
+                                 " so nothing was tested. `rel` is the vector MB-2d's object-only"
+                                 " rule WOULD put in the BLUR field here, and it tracks `pose` — the"
+                                 " arm's motion through the WORLD — where `arm`, its motion across the"
+                                 " SCREEN, is what a viewer sees. rel >> arm is the camera term the"
+                                 " rule failed to cancel, and is why the FP lane pins opts.z to 0]",
                                  (double)g_objVelFPIdArmPx, (double)g_objVelFPIdTurnPx,
-                                 (double)g_objVelFPIdPosePx,
+                                 (double)g_objVelFPIdPosePx, (double)g_objVelFPIdRelPx,
                                  (double)(g_objVelFPIdTurnPx > 1.0e-6f
                                           ? g_objVelFPIdArmPx / g_objVelFPIdTurnPx : 0.0f),
                                  g_objVelFPIdSamples);
@@ -39359,7 +39421,7 @@ void destroyHostWindow(Renderer* R);
                     // a camera cut owns it. mean small + peak large = a cut in the window (look at
                     // peakFrame); both large = the lane really is writing the wrong vector.
                     LOG::logline(">> [forge-hb] objvel fp identity, mean over the %u TURNING"
-                                 " frames of %u: arm=%.3f px turn=%.2f px pose=%.2f px"
+                                 " frames of %u: arm=%.3f px turn=%.2f px pose=%.2f px rel=%.2f px"
                                  " ratio=%.4f | peak was frame %u"
                                  "  [three legs of one triangle: `pose` = the arm's own motion in a"
                                  " FIXED camera, `turn` = a FIXED point's motion under the camera"
@@ -39370,6 +39432,7 @@ void destroyHostWindow(Renderer* R);
                                  g_objVelFPIdMoved ? g_objVelFPIdSumArm / g_objVelFPIdMoved : 0.0,
                                  g_objVelFPIdMoved ? g_objVelFPIdSumTurn / g_objVelFPIdMoved : 0.0,
                                  g_objVelFPIdMoved ? g_objVelFPIdSumPose / g_objVelFPIdMoved : 0.0,
+                                 g_objVelFPIdMoved ? g_objVelFPIdSumRel  / g_objVelFPIdMoved : 0.0,
                                  g_objVelFPIdSumTurn > 1.0e-6
                                      ? g_objVelFPIdSumArm / g_objVelFPIdSumTurn : 0.0,
                                  g_objVelFPIdPeakFrame);
@@ -39392,8 +39455,10 @@ void destroyHostWindow(Renderer* R);
                     // Reset AFTER printing: each line reports the worst frame of its OWN window, so
                     // a defect that STOPS is visible rather than latched forever.
                     g_objVelFPIdArmPx = g_objVelFPIdTurnPx = g_objVelFPIdPosePx = 0.0f;
+                    g_objVelFPIdRelPx = 0.0f;
                     g_objVelFPIdSamples = g_objVelFPIdMoved = 0;
                     g_objVelFPIdSumArm = g_objVelFPIdSumTurn = g_objVelFPIdSumPose = 0.0;
+                    g_objVelFPIdSumRel = 0.0;
                     g_objVelFPIdResCancel = g_objVelFPIdResAdd = 0.0;
                 }
                 // Reset AFTER printing, so each line reports the worst frame of its own window
