@@ -17064,6 +17064,23 @@ namespace {
     // 0.1 = "a sample 10% nearer than me contributes nothing". See mbDepthWeight for the identity
     // that makes a relative test computable straight off the device values with no constants.
     float    g_mbSoftZ = 0.1f;
+    // MB-2h. Fraction of a tile the gather may offset its NeighborMax lookup by, per pixel.
+    // 1.0 = up to half a tile either way; 0 restores the hard grid and is the A/B arm.
+    //
+    // ⚠⚠ THE SEAMS WERE MEASURED OFF A SCREENSHOT, NOT INFERRED. Binning edge energy by
+    // phase against candidate periods over the blurred region of squaretiles.png picks K=96
+    // phase 0 on BOTH axes — columns 1.26x the mean of the other phases (z=+4.5), rows 1.30x
+    // (z=+4.7), against 1.12x/1.13x at 64 and 1.19x/1.03x at 128 — and a 96 px grid drawn over
+    // the image lands on the seams. Every pixel of a tile shares one search direction, so where
+    // two tiles disagree the direction flips along a straight line.
+    //
+    // ⚠ AND K IS NOT THE LEVER: the same session reports maxLen pinned at exactly 96 on 17 of
+    // 55 windows, so lowering K clamps MORE streaks while raising it makes the tiles coarser.
+    float    g_mbTileJitter = 1.0f;
+    // MB-2h. Alternate taps between the TILE's velocity and the PIXEL'S OWN (Jimenez), so a face
+    // is sampled along its own axis whichever mover won its tile's max. Off = single axis, the
+    // pre-MB-2h behaviour, and the arm that shows what the second axis is buying.
+    bool     g_mbTwoDir = true;
     // Whether the pass ran this frame — written from the ONE gate, read by the resolve's set index
     // and by the heartbeat. Same rule as g_lastUpscaleRan beside it: a second derivation of "did it
     // run" is a second thing that can disagree with the frame.
@@ -24751,6 +24768,7 @@ void destroyHostWindow(Renderer* R);
             { "reflLodBias",         &g_reflLodBias         },
             { "mbShutter",           &g_mbShutter           },
             { "mbShutterFps",        &g_mbShutterFps        },
+            { "mbTileJitter",        &g_mbTileJitter        },
             { "mbMinPx",             &g_mbMinPx             },
             { "mbSoftZ",             &g_mbSoftZ             },
         };
@@ -24785,6 +24803,7 @@ void destroyHostWindow(Renderer* R);
             { "objVelEnable",        &g_objVelEnable        },
             { "objVelAllItems",      &g_objVelAllItems      },
             { "objVelSkipStill",     &g_objVelSkipStill     },
+            { "mbTwoDir",            &g_mbTwoDir            },
             { "objVelSkinned",       &g_objVelSkinnedLane   },
             { "objVelFP",            &g_objVelFPLane        },
             { "objVelSkinIgnoreGen", &g_objVelSkinIgnoreGen },
@@ -37989,6 +38008,10 @@ void destroyHostWindow(Renderer* R);
                 // value the CPU had computed. A clear that runs before every write cannot do that,
                 // and neither can the next lane added below it.
                 mp[12] = 0.0f; mp[13] = 0.0f; mp[14] = 0.0f; mp[15] = 0.0f;
+                // MB-2h, written AFTER the clear above and never before it.
+                // opts.x = tile-fetch jitter as a fraction of K; opts.y = two-axis sampling.
+                mp[12] = std::max(0.0f, std::min(1.0f, g_mbTileJitter));
+                mp[13] = g_mbTwoDir ? 1.0f : 0.0f;
                 // rects: the DELIVERED rect, then the MOTION-VECTOR (input) rect.
                 mp[0] = (float)deliveredW;   mp[1] = (float)deliveredH;
                 mp[2] = (float)g_live.width; mp[3] = (float)g_live.height;

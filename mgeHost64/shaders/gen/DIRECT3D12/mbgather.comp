@@ -1123,11 +1123,20 @@ void CS_MAIN( uint3 DispatchThreadID : SV_DISPATCHTHREADID )
 
     int2 vq = mbVelocityTexel(float2(pc), delivered, mvRect);
     float2 vSelf = LoadTex2D(gMbVelocity, NO_SAMPLER, vq, 0).xy * outScale;
-    int2 tq = clamp(pc / max(K, 1), int2(0, 0), max(tiles - int2(1, 1), int2(0, 0)));
+#line 98 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/mbgather.comp.fsl"
+    float2 tj = f2(0.0f);
+    if (gMbParams.opts.x > 0.0f)
+    {
+        float r1 = mbDither(float2(pc) + f2(17.0f));
+        float r2 = mbDither(float2(pc) + f2(37.0f));
+        tj = (float2(r1, r2) - f2(0.5f)) * (float(K) * gMbParams.opts.x);
+    }
+    int2 tq = clamp(int2((float2(pc) + tj) / float(max(K, 1))),
+                         int2(0, 0), max(tiles - int2(1, 1), int2(0, 0)));
     float2 vTile = LoadRWTex2D(gMbTileIn, tq);
-#line 91 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/mbgather.comp.fsl"
+#line 122 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/mbgather.comp.fsl"
     float speed = length(vTile);
-#line 111 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/mbgather.comp.fsl"
+#line 142 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/mbgather.comp.fsl"
     float selfStreak = min(length(vSelf) * shutter, float(K));
 
 
@@ -1147,7 +1156,7 @@ void CS_MAIN( uint3 DispatchThreadID : SV_DISPATCHTHREADID )
         d = d * (float(K) / max(len, 1.0e-6f));
         len = float(K);
     }
-#line 142 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/mbgather.comp.fsl"
+#line 173 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/mbgather.comp.fsl"
     bool blurred = (speed >= floorPx) && (len >= 1.0e-4f);
 
 
@@ -1165,6 +1174,24 @@ void CS_MAIN( uint3 DispatchThreadID : SV_DISPATCHTHREADID )
     {
 
         float jitter = mbDither(float2(pc)) - 0.5f;
+
+
+
+
+
+
+
+
+
+
+        float2 dSelf = vSelf * shutter;
+        float lenSelf = length(dSelf);
+        if (lenSelf > float(K)) { dSelf = dSelf * (float(K) / max(lenSelf, 1.0e-6f)); lenSelf = float(K); }
+
+
+
+        bool twoDir = (gMbParams.opts.y > 0.5f) && (lenSelf >= 1.0f) && (taps >= 4u);
+        uint nHalf = max(taps >> 1u, 1u);
         float dCentre = LoadTex2D(gMbDepth, NO_SAMPLER, vq, 0).r;
 
 
@@ -1176,12 +1203,17 @@ void CS_MAIN( uint3 DispatchThreadID : SV_DISPATCHTHREADID )
 
         float4 sum = centre;
         float wsum = 1.0f;
-#line 184 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/mbgather.comp.fsl"
+#line 233 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/mbgather.comp.fsl"
         LOOP for (uint i = 0u; i < taps; ++i)
         {
 
-            float t = (float(i) + 0.5f + jitter) / float(taps) - 0.5f;
-            float2 off = d * t;
+
+            bool useSelf = twoDir && ((i & 1u) == 1u);
+            float2 dir = useSelf ? dSelf : d;
+            uint n = twoDir ? nHalf : taps;
+            uint j = twoDir ? (i >> 1u) : i;
+            float t = (float(j) + 0.5f + jitter) / float(n) - 0.5f;
+            float2 off = dir * t;
             float2 sp = float2(pc) + off;
             int2 spi = clamp(int2(sp + f2(0.5f)), int2(0, 0), max(deliverN - int2(1, 1), int2(0, 0)));
             float dist = length(off);
@@ -1212,7 +1244,7 @@ void CS_MAIN( uint3 DispatchThreadID : SV_DISPATCHTHREADID )
     {
         Write2D(gMbOut, p, outv);
     }
-#line 230 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/mbgather.comp.fsl"
+#line 284 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/mbgather.comp.fsl"
     uint tid = (DispatchThreadID.y & 7u) * 8u + (DispatchThreadID.x & 7u);
     bool count = inRect && blurred;
     g_mbHit[tid] = count ? 1u : 0u;

@@ -72,7 +72,38 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
     // This pixel's own velocity, and the fastest thing within one tile of it.
     int2   vq    = mbVelocityTexel(float2(pc), delivered, mvRect);
     float2 vSelf = LoadTex2D(gMbVelocity, NO_SAMPLER, vq, 0).xy * outScale;
-    int2   tq    = clamp(pc / max(K, 1), int2(0, 0), max(tiles - int2(1, 1), int2(0, 0)));
+    // ⚠⚠ JITTER THE TILE FETCH, BECAUSE A SHARED ANSWER OVER A HARD FOOTPRINT IS A GRID.
+    //
+    // Every pixel in a K-wide tile searches along that ONE tile's dominant velocity, and
+    // NeighborMax is a 3x3 tile max, so at K=96 any mover within 288 px sets the direction for
+    // your face. Cross a boundary, a different mover wins the max, and the direction flips along a
+    // perfectly straight line on a 96 px grid. Reported from play as "half of it is blurred in one
+    // direction, a clear straight seam, other half is blurred in another direction".
+    //
+    // MEASURED FROM THE SCREENSHOT, not inferred: edge energy binned by phase against candidate
+    // periods over the blurred region of squaretiles.png (2560x1600) picks K=96 phase 0 on BOTH
+    // axes — columns 1.26x the mean of other phases (z=+4.5), rows 1.30x (z=+4.7), against 1.12x
+    // / 1.13x at 64 and 1.19x / 1.03x at 128. The grid is the tile grid, aligned to the origin.
+    //
+    // ⚠ K IS NOT THE LEVER, and the same log says so: 17 of 55 windows still report maxLen
+    // pinned at exactly 96, so LOWERING K clamps more streaks, and RAISING it makes the tiles
+    // coarser. The grid has to stop being a grid instead.
+    //
+    // Offsetting the lookup by up to half a tile per pixel means neighbours near a boundary
+    // consult DIFFERENT tiles, so the step is spread over a K-wide band of dither instead of
+    // landing on one line. The tap loop below is already dithered, so this is the same trade the
+    // filter has already made once: structured artifacts read as bugs, noise reads as grain.
+    // ⚠ A SECOND HASH, NOT THE TAP DITHER. Reusing mbDither(pc) for both would correlate the
+    // tile a pixel consults with where it starts sampling, which is a pattern again.
+    float2 tj = f2(0.0f);
+    if (gMbParams.opts.x > 0.0f)
+    {
+        float r1 = mbDither(float2(pc) + f2(17.0f));
+        float r2 = mbDither(float2(pc) + f2(37.0f));
+        tj = (float2(r1, r2) - f2(0.5f)) * (float(K) * gMbParams.opts.x);
+    }
+    int2   tq    = clamp(int2((float2(pc) + tj) / float(max(K, 1))),
+                         int2(0, 0), max(tiles - int2(1, 1), int2(0, 0)));
     float2 vTile = LoadRWTex2D(gMbTileIn, tq);
 
     // ⚠⚠ THE DILATED VELOCITY SETS THE DIRECTION AND EXTENT. IT DOES **NOT** SET THE ANSWER.
@@ -156,6 +187,24 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
     {
         // A per-pixel offset inside the tap spacing. Turns the banding of a low tap count into grain.
         float  jitter  = mbDither(float2(pc)) - 0.5f;
+        // ⚠⚠ AND SAMPLE ALONG THIS PIXEL'S OWN VELOCITY TOO, NOT ONLY THE TILE'S.
+        //
+        // The tile direction exists so a fast NEIGHBOUR can smear onto you; it is the wrong axis
+        // for your own streak whenever the tile is not velocity-coherent, which is exactly the
+        // case that draws the seam. Alternating taps between the two axes (Jimenez) means a face
+        // is sampled along the FACE's direction on both sides of a boundary, whichever mover won
+        // the tile max — so the answer stops depending on which tile the pixel fell in.
+        //
+        // Clamped to K like the tile axis, for the reason selfStreak is: the weight must describe
+        // the streak that was actually searched.
+        float2 dSelf   = vSelf * shutter;
+        float  lenSelf = length(dSelf);
+        if (lenSelf > float(K)) { dSelf = dSelf * (float(K) / max(lenSelf, 1.0e-6f)); lenSelf = float(K); }
+        // ⚠ OFF BELOW A PIXEL OF OWN MOTION. A static pixel has no axis of its own, and
+        // splitting its budget onto a zero-length one would collapse half the taps onto the centre
+        // and over-weight it — the static world must keep the single-axis behaviour exactly.
+        bool   twoDir  = (gMbParams.opts.y > 0.5f) && (lenSelf >= 1.0f) && (taps >= 4u);
+        uint   nHalf   = max(taps >> 1u, 1u);
         float  dCentre = LoadTex2D(gMbDepth, NO_SAMPLER, vq, 0).r;
 
         // ⚠ THE CENTRE IS IN THE SUM WITH WEIGHT 1, ALWAYS, AND THAT IS WHAT MAKES THIS SAFE BY
@@ -183,9 +232,14 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
         //   2 * cyl * cyl                 both blurry: neither is cleanly foreground, and they mix.
         LOOP for (uint i = 0u; i < taps; ++i)
         {
-            // t in (-0.5, 0.5): the fraction of the exposure this tap represents.
-            float  t   = (float(i) + 0.5f + jitter) / float(taps) - 0.5f;
-            float2 off = d * t;
+            // Even taps walk the TILE axis, odd taps this pixel's OWN axis. Each axis therefore
+            // spans its own full streak with half the samples, rather than both sharing one line.
+            bool   useSelf = twoDir && ((i & 1u) == 1u);
+            float2 dir = useSelf ? dSelf : d;
+            uint   n   = twoDir ? nHalf : taps;
+            uint   j   = twoDir ? (i >> 1u) : i;
+            float  t   = (float(j) + 0.5f + jitter) / float(n) - 0.5f;
+            float2 off = dir * t;
             float2 sp  = float2(pc) + off;
             int2   spi = clamp(int2(sp + f2(0.5f)), int2(0, 0), max(deliverN - int2(1, 1), int2(0, 0)));
             float  dist = length(off);
