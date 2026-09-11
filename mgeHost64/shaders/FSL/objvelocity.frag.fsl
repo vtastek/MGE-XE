@@ -94,10 +94,46 @@ void PS_MAIN( PSInput In )
     // reprojected value is right for exactly the pixels this pass is not for.
     Write2D(gObjVelOut, px, mv);
 
-    // ...and the blur's own field. opts.z picks WHICH vector goes in it; at 0 this target is an
-    // exact copy of gObjVelOut, which is what makes full-frame blur bit-identical to the pre-MB-2d
-    // build and therefore usable as the control arm. The uniform branch costs nothing.
-    Write2D(gObjVelBlurOut, px, (gObjVelParams.opts.z > 0.5f) ? mvRel : mv);
+    // ...and the blur's own field. opts.z picks WHICH RULE fills it; at 0 this target is an exact
+    // copy of gObjVelOut, which is what makes full-frame blur bit-identical to the pre-MB-2d build
+    // and therefore usable as the control arm.
+    //
+    // ⚠⚠ IN OBJECT-ONLY MODE mvRel IS THE **MOVER MASK**, NOT THE VELOCITY, AND WRITING IT AS
+    // THE VELOCITY WAS A BUG WITH TWO FACES.
+    //
+    // mvRel is motion relative to the WORLD; mv is motion across the SCREEN. They differ by the
+    // camera term, so they agree only while the camera is still — and every case where they
+    // disagree is a case where the camera is moving WITH something:
+    //   * the first-person arms ride the eye, so mvRel hands back the camera's parallax at the near
+    //     plane (MB-2e, which pinned the FP lane to `mv` as a special case);
+    //   * the THIRD-PERSON player is tracked by the camera, so running across a cell gives every
+    //     bone the same large world translation while the body barely moves on screen. Reported
+    //     from play, with the isolating A/B in the same sentence: "the PC animating in place
+    //     against a wall, MB look correcter, but in traversal, it is blurred everywhere, slow parts
+    //     or fast parts alike" — in place there is no world translation and the animation is all
+    //     that is left, in traversal the translation swamps it and blurs slow and fast alike.
+    //
+    // THE PRETENCE FIXES THE RULE. Object-only blur asks the frame to be read AS IF THE CAMERA WERE
+    // NOT MOVING. Under that pretence every object's blur is its motion relative to the camera —
+    // i.e. its SCREEN motion, `mv` — and the static world's is defined to be zero. So mvRel's job
+    // is only to answer "is this pixel part of the world that must be forced to zero", which is
+    // exactly the question it answers exactly: a stationary object cancels to EXACTLY 0 there,
+    // however hard the camera is turning. [[feedback_interpolated_difference_trap]]
+    //
+    // ⚠ NOT the early-out this file forbids above. That one rejects skipping the WRITE on the
+    // magnitude of the result; this always writes, and picks between two answers on a test of a
+    // DIFFERENT quantity — world motion — whose zero is exact rather than approximate.
+    //
+    // opts.w is that threshold in render-rect px (the host sends the blur's own velocity floor), so
+    // a barely-animating flame or banner stays in the "world" class and does not acquire the whole
+    // camera streak the moment its matrix changes in the last bit.
+    float2 blurV = mv;
+    if (gObjVelParams.opts.z > 0.5f)
+    {
+        float thr = gObjVelParams.opts.w;
+        blurV = (dot(mvRel, mvRel) > thr * thr) ? mv : float2(0.0f, 0.0f);
+    }
+    Write2D(gObjVelBlurOut, px, blurV);
 
     // ═══ MB-1e: STAMP THE ARM'S DEPTH ═══════════════════════════════════════════════════════════
     // FIRST-PERSON INSTANCE ONLY (opts.y). gObjVelDepthOut is pLinearDepth — raw reverse-Z DEVICE

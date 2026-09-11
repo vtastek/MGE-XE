@@ -1107,12 +1107,15 @@ void PS_MAIN( PSInput In )
 
 
     Write2D(gObjVelOut, px, mv);
-
-
-
-
-    Write2D(gObjVelBlurOut, px, (gObjVelParams.opts.z > 0.5f) ? mvRel : mv);
-#line 118 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/objvelocity.frag.fsl"
+#line 130 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/objvelocity.frag.fsl"
+    float2 blurV = mv;
+    if (gObjVelParams.opts.z > 0.5f)
+    {
+        float thr = gObjVelParams.opts.w;
+        blurV = (dot(mvRel, mvRel) > thr * thr) ? mv : float2(0.0f, 0.0f);
+    }
+    Write2D(gObjVelBlurOut, px, blurV);
+#line 154 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/objvelocity.frag.fsl"
     if (gObjVelParams.opts.y > 0.5f)
     {
         Write2D(gObjVelDepthOut, px, 1.0f);

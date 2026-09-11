@@ -35025,7 +35025,12 @@ void destroyHostWindow(Renderer* R);
                         // blur field instead of its total screen motion. Same lane, same meaning, in
                         // the camera pass above; one knob, two producers, no third answer.
                         op[38] = g_mbObjectOnly ? 1.0f : 0.0f;
-                        op[39] = 0.0f;
+                        // MB-2g: opts.w = the MOVER-MASK threshold in render-rect px. See
+                        // objvelocity.frag — mvRel decides whether this pixel is world or mover,
+                        // mv is what a mover blurs by. The blur's own velocity floor is the honest
+                        // value: anything the gather would reject as motionless should not be
+                        // promoted out of the world class in the first place.
+                        op[39] = std::max(0.0f, g_mbMinPx);
 
                         if (g_live.pObjVelFrags && g_live.pObjVelFragsReset) {
                             BufferBarrier ofb = {};
@@ -36708,7 +36713,7 @@ void destroyHostWindow(Renderer* R);
                 // the one a viewer sees. On the peak frames of the log that reported this, 536.8 px
                 // against 134.6.
                 ofp[38] = 0.0f;
-                ofp[39] = 0.0f;
+                ofp[39] = std::max(0.0f, g_mbMinPx);   // MB-2g mover-mask threshold, as the world lane
 
                 // `mm` is the FP1e stride axis, the world lane's ObjVelRec::mm verbatim: a
                 // multi-map mesh is 60 bytes per vertex against the rigid 36, and the stride is a
