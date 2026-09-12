@@ -56,6 +56,7 @@ streak length to 3 px in 239 — it is not a substitute for a GPU capture.
 | T13 | can a mover smear something that is NOT moving? | no: `same%` and `far%` are exactly 0 |
 | T14 | **the halftone at a mover's silhouette** | **`mbTileJitter` flips a binary gate** |
 | T15 | **small tiles AND long streaks** | **MB-2l, shipped** — reach is R tiles, not 1 |
+| T16 | is a wide mover's revealed background EARNED? | **yes, to 0.02** — the amount is right |
 
 `--explain X,Y` prints the tap-by-tap arithmetic for one pixel: which axis each tap walked, what
 it landed on, and all three weight terms. That is what turned T3 from a correlation into a
@@ -172,6 +173,36 @@ the search at all. `t_reach` asserts `cover_max(R=1) == neighbour_max` bit-for-b
 reports any of this, which is what makes the rows a comparison rather than two unrelated filters.
 
 Shipped as MB-2l: `mbTileK` 96 → 24, `mbTileReach` 4, `opts2.z` carries the ceiling.
+
+## What T16 found — the wash at an arm's silhouette is physically earned
+
+The remaining report after MB-2l: *"a moving arm's edges are a magenta gradient, it is smearing the
+foliage IN instead of the arm OUT"*. T13 had already proved the gather cannot move a static pixel's
+colour, so the defect has to live on the **mover's own pixels**, in the band at its silhouette where
+the exposure is only partly covered. Two candidates, with different fixes — the filter reveals MORE
+background than the shutter did (a weighting bug), or it reveals the right amount of the WRONG
+background (unfixable from one frame).
+
+A 160 px mover at 50 px/frame (83 px streak), white on black so ground truth returns exposure
+coverage directly:
+
+| px inside the leading edge | GT | ship | MB-2j | MB-2k |
+|---|---|---|---|---|
+| 2 | 0.524 | 0.838 | 0.518 | 0.518 |
+| 16 | 0.692 | 0.923 | 0.686 | 0.686 |
+| 32 | 0.883 | 0.979 | 0.877 | 0.877 |
+
+Over the whole partial band (50 560 px, 0.02 < GT cov < 0.98): **MB-2j mean error −0.0000, |mean|
+0.0165, RMSE 0.0211**; `ship` +0.3579 / 0.4020. So it is the second case. The half-transparent band
+is what a real shutter produces, MB-2j gets its size right to 2%, and the pre-MB-2j weighting is not
+a refuge — it was 36% too opaque.
+
+What is wrong is only WHICH background fills it. The true answer is the background **at that pixel**,
+which is occluded in this frame and is not recoverable from it: the mean (MB-2j) combs it into 1D
+streaks along the motion, and the nearest sample (MB-2k) synthesises confident high-contrast detail
+out of an estimate that carries no information (T12's frequency sweep). Both are guesses about the
+same missing data. The lever that exists is a **colour history** — one frame earlier the arm was a
+streak-length back and that background WAS visible — which is what the published pipelines use.
 
 ## What it does NOT show
 

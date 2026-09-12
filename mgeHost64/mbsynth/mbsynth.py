@@ -1507,6 +1507,68 @@ def t_reach(P, outdir):
     print('  trade T14 found was an artefact of one knob doing two jobs.')
 
 
+def t_edgeband(P, outdir):
+    hdr('T16  A WIDE MOVER\'S EDGE BAND -- is the revealed background EARNED?')
+    print('  The remaining report is *"a moving arm\'s edges are a magenta gradient, it is smearing')
+    print('  the foliage IN instead of the arm OUT"*. T13 proved the gather cannot move a static')
+    print('  pixel\'s colour, so whatever is wrong lives on the MOVER\'S OWN pixels, in the band at')
+    print('  its silhouette where the exposure is only partly covered. Two things can be wrong there')
+    print('  and they have different fixes:')
+    print('    (1) the filter reveals MORE background than the exposure does -> too much wash, and')
+    print('        that is a weighting bug with a real fix;')
+    print('    (2) it reveals the RIGHT AMOUNT but the wrong background -> the wash is physically')
+    print('        earned and only its CONTENT is wrong, which one frame cannot fix.')
+    print('  T12 answered this for 8-64 px blades. An arm is WIDE, and a wide body hides the case:')
+    print('  most taps along its streak land back ON it. This asks it at the EDGE.')
+    print('')
+    keep = (P.fix, P.gain, P.prox_mode, P.prox_p)
+    width, speed = 160.0, 50.0
+    L = scene_thin_coverage(P.W, P.H, width=width, speed=speed)
+    gt = ground_truth(L, P.W, P.H, P.shutter, nsub=513)
+    cov_gt = gt.mean(axis=2)
+    cx = 0.5 * P.W
+    lead = cx + 0.5 * width          # the LEADING edge; motion is +x
+    rows = slice(200, 300)
+    arms = (('ship', 'ship', 1.0, 1.0), ('MB-2j', 'c7', 2.0, 1.0), ('MB-2k', 'c9', 2.0, 4.0))
+    got = {}
+    for name, fx, gn, pp in arms:
+        P.fix, P.gain, P.prox_mode, P.prox_p = fx, gn, 'idw', pp
+        out, _, _ = run_filter(L, P)
+        got[name] = out.mean(axis=2)
+    P.fix, P.gain, P.prox_mode, P.prox_p = keep
+    print('  mover %d px wide at %d px/frame, streak = %.0f px. Coverage on the MOVER side of its'
+          % (int(width), int(speed), speed * P.shutter))
+    print('  leading edge -- 1.000 = fully opaque, 0.000 = pure background.')
+    print('')
+    print('  px INSIDE the edge |   GT     ship    MB-2j   MB-2k  |  MB-2j vs GT')
+    for d in (2, 6, 10, 16, 24, 32, 48, 64, 80):
+        x = int(round(lead - d))
+        g = float(cov_gt[rows, x].mean())
+        r = [float(got[n][rows, x].mean()) for n, _, _, _ in arms]
+        print('  %8d          |  %.3f   %.3f   %.3f   %.3f  |  %+.3f'
+              % (d, g, r[0], r[1], r[2], r[1] - g))
+    print('')
+    print('  and OUTSIDE it, where the mover is smearing onto static background:')
+    print('  px OUTSIDE the edge|   GT     ship    MB-2j   MB-2k  |  MB-2j vs GT')
+    for d in (2, 6, 10, 16, 24, 32, 48, 64, 80):
+        x = int(round(lead + d))
+        g = float(cov_gt[rows, x].mean())
+        r = [float(got[n][rows, x].mean()) for n, _, _, _ in arms]
+        print('  %8d          |  %.3f   %.3f   %.3f   %.3f  |  %+.3f'
+              % (d, g, r[0], r[1], r[2], r[1] - g))
+    band = (cov_gt > 0.02) & (cov_gt < 0.98)
+    print('')
+    print('  over the WHOLE partial band (%d px, 0.02 < GT cov < 0.98):' % int(band.sum()))
+    for name, _, _, _ in arms:
+        e = got[name][band] - cov_gt[band]
+        print('    %-6s mean %+.4f  |mean| %.4f  RMSE %.4f'
+              % (name, float(e.mean()), float(np.abs(e).mean()), float(np.sqrt((e * e).mean()))))
+    print('')
+    print('  READ IT AS: a NEGATIVE "vs GT" inside the edge means the filter is showing MORE')
+    print('  background than the shutter ever revealed -- case (1), a weighting bug. Near zero')
+    print('  means the amount is right and the complaint is about WHICH background -- case (2).')
+
+
 def t_tilegrid(P, outdir):
     hdr('T7  TILE GRID -- MB-2h jitter, on a body whose velocity VARIES (a rigid rect cannot show it)')
     L = scene_swing(P.W, P.H)
@@ -1694,6 +1756,8 @@ def main():
         t_foliage(P, a.dump)
     if s in ('all', 'stipple'):
         t_stipple(P, a.dump)
+    if s in ('all', 'edgeband'):
+        t_edgeband(P, a.dump)
     if s in ('all', 'reach'):
         t_reach(P, a.dump)
     if s in ('all', 'tilegrid'):

@@ -58,8 +58,20 @@ STRUCT(ObjVelParams)
     //
     // MB-2d: z = OBJECT-ONLY BLUR. 1 puts the object's motion RELATIVE TO THE WORLD into
     // gObjVelBlurOut; 0 puts the same total vector gObjVelOut gets, making that target a copy and
-    // the blur the classic full-frame one. w spare.
+    // the blur the classic full-frame one.
+    //
+    // MB-2g: w = the MOVER-MASK threshold in render-rect px. ⚠ NOT SPARE — this comment said it
+    // was, one lane after the shader started reading it as `thr`.
     DATA(float4, opts, None);
+    // MB-2m: x = FREEZE THE BLUR FIELD — skip the gObjVelBlurOut store so pMbVelocity keeps the
+    // last advancing frame's movers. The camera pass has the matching lane (MvParams opts.w) and
+    // the two must be set together: freezing only the camera half leaves this pass writing ~zero
+    // over every mover, which is exactly where the held motion was needed.
+    // ⚠ THE PASS STILL RUNS. Skipping it instead would be one line in the host and would also skip
+    // the FIRST-PERSON DEPTH STAMP (opts.y -> gObjVelDepthOut), so the arm's pixels would carry
+    // different depth while paused and the frozen picture would be of a DIFFERENT filter than the
+    // one being debugged. yzw reserved, cleared by the host BEFORE the lane above is written.
+    DATA(float4, opts2, None);
 };
 
 STRUCT(ObjVelBatch)

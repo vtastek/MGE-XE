@@ -128,7 +128,16 @@ STRUCT(MvParams)
     // 0.000% on a frame the log calls parked.
     //
     // MB-2d: z = OBJECT-ONLY BLUR. It does not change gMvOut at all — the upscaler's field is
-    // always the true total motion — it selects what goes into gMvBlurOut beside it. w reserved.
+    // always the true total motion — it selects what goes into gMvBlurOut beside it.
+    //
+    // MB-2m: w = FREEZE THE BLUR FIELD. Skip the gMvBlurOut store entirely, so pMbVelocity keeps
+    // whatever the last advancing frame left in it. Set ONLY while the sim clock is frozen AND a
+    // debug view is up, because a menu parks the camera, every vector goes to exact zero, and the
+    // gather then has nothing to analyse — which is why the debug view went BLANK on pause and the
+    // MB-2c output hold (the previous answer) could not respond to the debug knob at all.
+    // ⚠ gMvOut AND gMvReactive ARE UNTOUCHED BY THIS. The stale-field warning in this header is
+    // about the UPSCALER's input; freezing that would hand DLSS a moving camera over a still image.
+    // gMvBlurOut has exactly one consumer, mbgather, so freezing IT is contained to the instrument.
     DATA(float4, opts, None);
 };
 

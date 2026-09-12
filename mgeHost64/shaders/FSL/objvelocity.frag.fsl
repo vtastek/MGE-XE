@@ -133,7 +133,11 @@ void PS_MAIN( PSInput In )
         float thr = gObjVelParams.opts.w;
         blurV = (dot(mvRel, mvRel) > thr * thr) ? mv : float2(0.0f, 0.0f);
     }
-    Write2D(gObjVelBlurOut, px, blurV);
+    // MB-2m: opts2.x freezes the blur field for a paused debug view. See objvelocity.srt.h.
+    if (gObjVelParams.opts2.x < 0.5f)
+    {
+        Write2D(gObjVelBlurOut, px, blurV);
+    }
 
     // ═══ MB-1e: STAMP THE ARM'S DEPTH ═══════════════════════════════════════════════════════════
     // FIRST-PERSON INSTANCE ONLY (opts.y). gObjVelDepthOut is pLinearDepth — raw reverse-Z DEVICE

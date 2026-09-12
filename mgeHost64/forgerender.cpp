@@ -17184,6 +17184,22 @@ namespace {
     //       BLUE  = the weight the pixel KEPT of itself (blue = "nothing reached me").
     //       A cut that is an amputation reads as BLUE where it should read RED.
     uint32_t g_mbDebug = 0;
+    // ── MB-2m: FREEZE THE BLUR'S VELOCITY FIELD WHILE A DEBUG VIEW IS PAUSED ─────────────────────
+    // A menu freezes the sim, which parks the camera and stops every mover, so pMbVelocity goes to
+    // EXACT ZERO and the gather has nothing to analyse — the debug view goes blank on the one frame
+    // the user can actually study. MB-2c's answer was to hold the OUTPUT, which keeps a picture on
+    // screen but cannot respond to the debug knob (it is last frame's image), so toggling modes
+    // while paused showed the same frame however the knob moved. Reported twice: *"debug mode
+    // doesn't turn off when paused"*, then *"menu pause removes the debug view"* — the hold and its
+    // removal, both wrong for the same reason. What has to be held is the INPUT.
+    //
+    // ⚠ pMbVelocity ONLY, NEVER pMotionVectors. The blur's field has exactly one consumer; the
+    // upscaler's field is the one the stale-field warnings in motionvectors.srt.h are about.
+    //
+    // ⚠ DERIVED ONCE PER FRAME, HERE, because three producers read it (the camera pass, the world
+    // object pass, the first-person object pass) and three derivations of one condition are three
+    // things that can disagree — the failure this file has hit twice already.
+    bool     g_mbVelFrozen = false;
     // ── MB-2j: THE RECONSTRUCTION (default ON; 0 is the legacy control arm) ──────────────────
     // Two defects, one shape, both measured against GROUND TRUTH in mgeHost64/mbsynth:
     //   * a tap on the centre's OWN surface scored up to 1+1+2 = 4 against a foreground tap's 1,
@@ -17287,10 +17303,11 @@ namespace {
     float    g_mbPeakLen    = 0.0f;
     uint32_t g_mbBlurFrames = 0;
     uint32_t g_mbRanFrames  = 0;
-    // MB-2c: frames the pass was SKIPPED and pMotionBlur held instead, because MW's sim clock was
-    // frozen (a menu). Counted separately from `ran` on purpose — "the blur is on screen" and "the
-    // blur did work this frame" become different questions the moment a hold exists, and a held
-    // frame reporting as `ran` would make the heartbeat claim GPU work that was never recorded.
+    // MB-2m: frames the pass RAN against a FROZEN VELOCITY FIELD, because MW's sim clock was frozen
+    // (a menu). Under MB-2c this counted the opposite thing — frames the pass was skipped and
+    // pMotionBlur held — and the two are worth telling apart: the pass now does real GPU work on
+    // these frames, so `ran` counts them too, and this says how many of those frames were analysing
+    // motion that had already happened.
     uint32_t g_mbHeldFrames = 0;
 
     // ⚠ EVERY DISPATCH AND EVERY TAP IS BOUNDED BY THE **RENDER** RECT AT ITS LEVEL, not by the
@@ -28184,6 +28201,9 @@ void destroyHostWindow(Renderer* R);
             // adds at most 0.1 s here, so a load screen cannot fast-forward the sea, the caustics
             // and every grass imprint through the whole stall.
             g_simClock += (double)g_simDt;
+            // MB-2m, derived here so every producer this frame reads ONE answer. g_lastMbRan is the
+            // PREVIOUS frame's, which is the point: freeze only onto a field a real blur just used.
+            g_mbVelFrozen = g_simFrozen && g_mbEnable && g_live.mbReady && g_lastMbRan;
         }
 
         // F12 debug view: debugParams.x at float index 40 (160B = viewProj 16f + 6×float4 24f).
@@ -34489,7 +34509,8 @@ void destroyHostWindow(Renderer* R);
                 // above gives: a trailing clear that runs after a write silently eats the value.
                 // [[feedback_clear_reserved_lanes_before_writing_them]]
                 mp[46] = g_mbObjectOnly ? 1.0f : 0.0f;
-                mp[47] = 0.0f;
+                // MB-2m: opts.w — keep pMbVelocity instead of clearing it, for a paused debug view.
+                mp[47] = g_mbVelFrozen ? 1.0f : 0.0f;
                 // opts.y — THE CAMERA DID NOT MOVE, tested BIT-IDENTICALLY and not with a tolerance.
                 // See the long note at the head of motionvectors.comp: reconstruct-then-reproject is
                 // the identity on paper and not in float32, so a parked camera produced ~1e-3 px on
@@ -35256,6 +35277,9 @@ void destroyHostWindow(Renderer* R);
                         // value: anything the gather would reject as motionless should not be
                         // promoted out of the world class in the first place.
                         op[39] = std::max(0.0f, g_mbMinPx);
+                        // MB-2m: opts2, reserved lanes cleared BEFORE the one that is written.
+                        op[40] = 0.0f; op[41] = 0.0f; op[42] = 0.0f; op[43] = 0.0f;
+                        op[40] = g_mbVelFrozen ? 1.0f : 0.0f;
 
                         if (g_live.pObjVelFrags && g_live.pObjVelFragsReset) {
                             BufferBarrier ofb = {};
@@ -36939,6 +36963,12 @@ void destroyHostWindow(Renderer* R);
                 // against 134.6.
                 ofp[38] = 0.0f;
                 ofp[39] = std::max(0.0f, g_mbMinPx);   // MB-2g mover-mask threshold, as the world lane
+                // MB-2m: opts2, reserved lanes cleared BEFORE the one that is written. The ARM is
+                // the mover a paused debug view is almost always looking at, so this lane matters
+                // more here than in the world pass: without it the arm's own pixels are re-zeroed
+                // on the frozen frame and the smear under inspection disappears from its source.
+                ofp[40] = 0.0f; ofp[41] = 0.0f; ofp[42] = 0.0f; ofp[43] = 0.0f;
+                ofp[40] = g_mbVelFrozen ? 1.0f : 0.0f;
 
                 // `mm` is the FP1e stride axis, the world lane's ObjVelRec::mm verbatim: a
                 // multi-map mesh is 60 bytes per vertex against the rigid 36, and the stride is a
@@ -38169,40 +38199,35 @@ void destroyHostWindow(Renderer* R);
         const bool mbEligible = shaderResolve && g_live.mbReady && g_mbEnable && g_lastMvRan
                              && deliveredW > 0u && deliveredH > 0u
                              && (g_live.sampleCount == 1 || rfRunning);
-        // ═══ MB-2c: HOLD THE BLURRED FRAME WHILE A MENU PAUSES THE GAME ═════════════════════════
+        // ═══ MB-2c/MB-2m: KEEP THE BLUR WHILE A MENU PAUSES THE GAME ════════════════════════════
         // MW pauses the sim on a menu, so the camera stops dead, `mv camera: parked(bit-identical)`
         // fires, every vector goes to EXACT zero, the velocity floor rejects every pixel and the
-        // image snaps sharp mid-turn. Holding the last blurred frame is what was asked for, and it
-        // is also what a real shutter does: nothing arrived to re-expose the film.
+        // image snaps sharp mid-turn. Keeping the blur is what was asked for, and it is also what a
+        // real shutter does: nothing arrived to re-expose the film.
         //
-        // ⚠⚠ THE OUTPUT IS HELD, NOT THE VECTORS, AND THAT CHOICE IS THE WHOLE SAFETY ARGUMENT.
-        // Freezing pMotionVectors is the obvious lever and the wrong one: that texture is ALSO the
-        // upscaler's input, so a stale camera would be handed to DLSS over a static image — the
-        // "plausible, smoothly-varying, completely wrong field" the mvActive comment warns about,
-        // reached deliberately. pMotionBlur is read by exactly ONE consumer, the resolve (instance
-        // [2], picked when mbRan), so holding IT is contained to precisely what was asked. MW keeps
-        // drawing its menu UI over the composite either way.
+        // ⚠⚠ MB-2c HELD THE OUTPUT AND MB-2m HOLDS THE INPUT, AND THAT IS THE WHOLE FIX. Skipping
+        // the dispatches keeps a picture on screen but it is LAST FRAME'S PICTURE, so nothing the
+        // pass is told while paused can change it — and a paused frame is the only one a person can
+        // actually study. Reported twice, as opposite symptoms of one cause: *"debug mode doesn't
+        // turn off when paused"* (the held frame was an ordinary blur and stayed one) and then
+        // *"menu pause removes the debug view"* (releasing the hold under mbDebug re-ran the pass
+        // against the all-zero field a pause produces, so there was nothing left to analyse). The
+        // hold also could not survive the knob it was being inspected with: turning mbDebug OFF
+        // while paused would have gone on displaying the held magenta frame.
         //
-        // ⚠ THE COMMENT DIRECTLY ABOVE THIS GATE IS A WARNING AGAINST EXACTLY THIS, and it is
-        // right: a frozen pMotionBlur is that same failure if it ever outlives its cause. Which is
-        // why the hold needs all THREE of — the sim clock frozen, the previous frame having
-        // actually blurred (so what is held is a real blur of a real frame, not the resting
-        // contents), and MB otherwise eligible — and releases on the first frame sim advances.
+        // So g_mbVelFrozen tells the two velocity PRODUCERS to skip their gMvBlurOut /
+        // gObjVelBlurOut stores, pMbVelocity keeps the last advancing frame's field, and the three
+        // dispatches run normally on it. The picture is the same blur MB-2c held, it now answers
+        // every knob live, and there is no second code path to keep in step with this one.
         //
-        // ⚠ SKIPPING THE DISPATCHES SKIPS THEIR BARRIERS TOO, so pMotionBlur simply stays in the
-        // SHADER_RESOURCE state the previous frame left it in. No state fixup, and mbRan stays true
-        // so the resolve keeps picking the blurred instance.
-        // ⚠ AND NOT WHILE A DEBUG VIEW IS UP. The hold is right for the picture and wrong for the
-        // instrument: pausing is the ONLY way to inspect a smear closely, and a held pMotionBlur is
-        // the last frame the pass wrote — so switching mbDebug on while paused shows the ordinary
-        // blur, and switching it on before pausing freezes whatever debug frame happened to be last.
-        // Either way the view stops answering the question it was built to answer. Debug is already
-        // a not-for-play mode, so re-running the dispatches on a frozen frame costs nothing real.
-        const bool holdBlur = mbEligible && g_simFrozen && g_lastMbRan && g_mbDebug == 0u;
-        if (holdBlur) {
-            mbRan = true;
-            ++g_mbHeldFrames;
-        } else if (mbEligible) {
+        // ⚠ pMbVelocity ONLY. pMotionVectors and pMvReactive are written as usual, so the upscaler
+        // still sees the truth (nothing moved) — the "plausible, smoothly-varying, completely wrong
+        // field" warning in motionvectors.srt.h is about DLSS's input and this is not it.
+        //
+        // ⚠ IT RELEASES ON THE FIRST FRAME THE SIM ADVANCES, and it requires that a blur actually
+        // ran on the previous frame, so what is frozen is a real field and not the resting contents.
+        if (mbEligible) {
+            if (g_mbVelFrozen) { ++g_mbHeldFrames; }
             // The colour source must be readable. On an upscaled frame the gather reads the backend's
             // target, which evaluate() already left in SHADER_RESOURCE; on a native frame it reads
             // pSceneColor, which needs the hoist. Idempotent, so this is a plain call.
@@ -39591,13 +39616,14 @@ void destroyHostWindow(Renderer* R);
                 //
                 // `frames=0/N` is a real answer, not a missing one: nothing moved in the window.
                 //
-                // MB-2c: `held=` is the pause hold — frames where the sim clock was frozen (a menu)
-                // and the previous blurred image was kept on screen instead of the three dispatches
-                // running. It is NOT counted in `ran`, so a long-open menu shows held climbing
-                // while ran stands still, which is exactly the shape to check the hold by.
+                // MB-2m: `held=` is the frozen-FIELD count — frames where the sim clock was frozen
+                // (a menu) and the pass ran against the velocity the last advancing frame left in
+                // pMbVelocity. A long-open menu shows held climbing IN STEP with ran, which is the
+                // shape to check it by; held climbing while ran stands still would mean the old
+                // output hold had come back.
                 LOG::logline(">> [forge-hb] mb peak: searched=%.3f%% changed=%.3f%% avgTaps=%.1f"
                              " maxLen=%.2f px on the BUSIEST of %u/%u frames that searched anything"
-                             " | held=%u (sim frozen — menu)"
+                             " | held=%u (sim frozen — menu, blurring by the HELD field)"
                              " | arms: recon=%d prov=%d twoDir=%d objOnly=%d jitter=%.2f softZ=%.2f"
                              " K=%u reach=%u cap=%u px dbg=%u"
                              "  [this is the frame `mb=` is priced by — cost is (searched px) x"
@@ -53351,11 +53377,13 @@ void destroyHostWindow(Renderer* R);
         if (g_live.pMbTile)             { removeResource(g_live.pMbTile);                g_live.pMbTile = nullptr; }
         if (g_live.pMotionBlur)         { removeResource(g_live.pMotionBlur);            g_live.pMotionBlur = nullptr; }
         g_live.mbReady = false;
-        // ⚠ AND WITH IT THE PAUSE HOLD'S PRECONDITION. holdBlur keeps last frame's pMotionBlur on
-        // screen only while g_lastMbRan says a real blur is in there; the texture is being destroyed
-        // one line above, so leaving the flag set would let the first frame after a rebuild hold a
-        // brand-new, never-written surface. g_simFrozen is left alone — it is re-derived per frame.
+        // ⚠ AND WITH IT THE FIELD FREEZE'S PRECONDITION. g_mbVelFrozen requires g_lastMbRan, i.e.
+        // that a real blur ran on a real field; the textures are being destroyed one line above, so
+        // leaving the flag set would let the first frame after a rebuild freeze a brand-new,
+        // never-written velocity surface — and then blur by it for as long as the menu stayed open.
+        // g_simFrozen is left alone: it is re-derived per frame.
         g_lastMbRan = false;
+        g_mbVelFrozen = false;
         g_mbHeldFrames = 0;
         if (g_live.pAOParamsCbv)    { removeResource(g_live.pAOParamsCbv); }
         if (g_live.pAOBlur)         { removeResource(g_live.pAOBlur); }
