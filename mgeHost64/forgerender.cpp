@@ -17201,9 +17201,21 @@ namespace {
     //   3 = WHERE THE ANSWER CAME FROM, which is the amputation as a picture.
     //       RED   = weight accepted from taps NEARER than this pixel (something in front
     //               smeared onto us — a skirt pixel receiving the blade should be RED),
-    //       GREEN = weight from taps at or behind this pixel's depth,
-    //       BLUE  = the weight the pixel KEPT of itself (blue = "nothing reached me").
+    //       GREEN = weight from taps on this pixel's OWN SURFACE (|relD| <= 0.01),
+    //       BLUE  = what the pixel KEPT of itself PLUS everything genuinely BEHIND it.
     //       A cut that is an amputation reads as BLUE where it should read RED.
+    //       ⚠⚠ THIS LEGEND WAS WRONG FOR TWO OF ITS THREE CHANNELS until 2026-09-12, and it was
+    //       wrong in the direction that matters: it said GREEN was "at or behind" and BLUE was
+    //       "kept". The shader has always written `float3(wFront, wSame, 1 + wBack) / tot`. A
+    //       report of *"the smeared foliage is in the cyan"* read against the old legend means
+    //       "behind + kept" and against the real one means "own surface + (kept or behind)" —
+    //       different diagnoses off one picture. Mode 4 exists because even the correct legend
+    //       cannot separate the last two.
+    //   4 = THE SAME QUESTION WITH KEPT SPLIT OFF: RED = nearer, GREEN = own surface, BLUE =
+    //       genuinely BEHIND, and BLACK = the weight the pixel kept of itself. Mode 3's blue is
+    //       two populations added together — "nothing reached me" and "I am a mover and what
+    //       showed through me came from behind" — and on a first-person arm, which has nothing
+    //       in front of it, those are exactly the two candidates.
     uint32_t g_mbDebug = 0;
     // ── MB-2m: FREEZE THE BLUR'S VELOCITY FIELD WHILE A DEBUG VIEW IS PAUSED ─────────────────────
     // A menu freezes the sim, which parks the camera and stops every mover, so pMbVelocity goes to
@@ -21492,8 +21504,8 @@ namespace {
           // produces. Judge it on a THIN fast mover over a TEXTURED background; over a flat wall
           // there is nothing for it to put back and it is measurably a no-op.
           t.checkbox("  \\- nearest revealed background (MB-2k; off = the streak mean)", &g_mbProv);
-          t.sliderU("DEBUG: 0 off | 1 the velocity the blur READS | 2 depth order | 3 who won the pixel",
-                    &g_mbDebug, 0u, 3u, 1u);
+          t.sliderU("DEBUG: 0 off | 1 velocity READ | 2 depth order | 3 who won | 4 who won, kept split off",
+                    &g_mbDebug, 0u, 4u, 1u);
           t.flush(); }
 
         // -- Tab: Bloom (tasks/forge-postprocess.md step 4) --
@@ -25198,7 +25210,7 @@ void destroyHostWindow(Renderer* R);
             // `mbTileK=96 mbTileReach=1` is the pre-MB-2l filter exactly.
             { "mbTileReach", &g_mbTileReach, kMbTileReachMax },
             { "mbMaxTaps", &g_mbMaxTaps, 64u },
-            { "mbDebug",   &g_mbDebug,   3u },
+            { "mbDebug",   &g_mbDebug,   4u },
         };
         const SKnob sknobs[] = {
             // M1 4d: `passthrough` (default) or `ngx`. Read at INIT — it decides which object is
@@ -26854,6 +26866,21 @@ void destroyHostWindow(Renderer* R);
     void exposureServo() {
         if (!g_expEnable || !g_live.sceneReferred) {
             return;   // E is published as 1.0 in this case; leave the state where it is
+        }
+        // ⚠⚠ A DEBUG VIEW IS NOT A SCENE, AND THE SERVO CANNOT TELL. mbDebug REPLACES the frame
+        // with a diagnostic — weights in [0,1], a hue wheel, a depth ramp — and the APL pass then
+        // meters THAT and drives E to put it at the authored setpoint. So the diagnostic's own
+        // colours drift while it is being read, which is how it was reported: *"exposure keeps
+        // changing in debug views so hard to tell"*. Every conclusion drawn from comparing two
+        // regions of one of these pictures depends on this not happening.
+        //
+        // Held rather than pinned to a constant: a fixed E would be the wrong brightness for some
+        // scenes, and what the reading needs is only that it STOP MOVING. The clock is advanced so
+        // that switching the view off resumes from now rather than integrating the whole time the
+        // view was up (a huge dt just snaps to `want`, which is the correct behaviour anyway).
+        if (g_mbDebug != 0u) {
+            g_expLastMs = hostNowMs();
+            return;
         }
         const double now = hostNowMs();
         const double prev = g_expLastMs;
@@ -38273,7 +38300,7 @@ void destroyHostWindow(Renderer* R);
                 mp[12] = std::max(0.0f, std::min(1.0f, g_mbTileJitter));
                 mp[13] = g_mbTwoDir ? 1.0f : 0.0f;
                 // MB-2i, same rule: written after the clear. opts.z = the diagnostic mode.
-                mp[14] = (float)std::min(g_mbDebug, 3u);
+                mp[14] = (float)std::min(g_mbDebug, 4u);
                 // MB-2j. opts.w = the corrected reconstruction.
                 mp[15] = g_mbRecon ? 1.0f : 0.0f;
                 // MB-2k. opts2.x = proximity-weighted revealed background.

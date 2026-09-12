@@ -432,6 +432,25 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
             float t  = saturate(1.0f - log2(1.0f + z) / log2(1.0f + 65536.0f));
             dv = f3(t);
         }
+        else if (dbg == 4u)
+        {
+            // MODE 3 WITH `KEPT` SPLIT OFF FROM `BEHIND`. Mode 3's blue adds the centre's own
+            // retained weight to everything genuinely behind it, and those are two different
+            // answers: "nothing reached me" and "I am a mover, and what showed through me came
+            // from behind". On a FIRST-PERSON ARM — which has nothing in front of it, so wFront
+            // is ~0 — those two are the entire question, and mode 3 renders both as the same
+            // cyan. Here BLACK is what the pixel kept, so the revealed background is blue ALONE
+            // and the arm resampling its own surface is green alone.
+            if (!blurred)
+            {
+                dv = f3(0.0f);
+            }
+            else
+            {
+                float tot = 1.0f + wFront + wBack + wSame;
+                dv = float3(wFront / tot, wSame / tot, wBack / tot);
+            }
+        }
         else
         {
             // WHO WON THIS PIXEL. The centre always carries exactly 1.0 and every tap's weight
