@@ -17176,7 +17176,23 @@ namespace {
     // ⚠ It trades a large LOW-frequency error for a smaller HIGH-frequency one: a sharper
     // estimate depends on which taps landed where, so the tap hash decides more of the answer
     // (dither 0.0074 -> 0.0296 on an 8 px blade). Net error on those pixels still falls 3.4x.
-    bool     g_mbProv = true;
+    //
+    // ⚠⚠ DEFAULTED OFF, BECAUSE THE MEASUREMENT ABOVE WAS ONE TEXTURE. Sweeping the background's
+    // spatial frequency, the same shown-background RMSE says nearest-sample only wins where the
+    // background is smooth ENOUGH that a tap 10 px away is a good estimate of this pixel:
+    //     background                       MB-2j    1/d^2    1/d^4
+    //     sinusoid period 11 px            0.2053   0.1206   0.0955   <- what it was tuned on
+    //     sinusoid period 4 px             0.1641   0.2118   0.2490
+    //     sinusoid period 2 px             0.1712   0.1911   0.2372
+    //     foliage (hard edges, pixel scale) 0.2785  0.3141   0.3749   <- loses worst
+    // On foliage NO arm is correlated with the truth (0.018 / 0.105 / 0.061) while the contrast it
+    // delivers goes 0.24 -> 0.95: the estimate carries no information and MB-2k gives it full
+    // confidence anyway, which is a manufactured high-contrast pattern where the mean at least
+    // stayed quiet. That is the reported *"it is smearing the foliage IN, instead of the arm OUT"*.
+    // The real answer is the published one (CoD:AW): reconstruct the background by MIRRORING the
+    // weights across the motion direction, not by trusting the nearest sample. Until that is built,
+    // the mean is the honest estimator. Knob kept — it is a no-op on flat backgrounds either way.
+    bool     g_mbProv = false;
     // Whether the pass ran this frame — written from the ONE gate, read by the resolve's set index
     // and by the heartbeat. Same rule as g_lastUpscaleRan beside it: a second derivation of "did it
     // run" is a second thing that can disagree with the frame.
@@ -38119,7 +38135,13 @@ void destroyHostWindow(Renderer* R);
         // ⚠ SKIPPING THE DISPATCHES SKIPS THEIR BARRIERS TOO, so pMotionBlur simply stays in the
         // SHADER_RESOURCE state the previous frame left it in. No state fixup, and mbRan stays true
         // so the resolve keeps picking the blurred instance.
-        const bool holdBlur = mbEligible && g_simFrozen && g_lastMbRan;
+        // ⚠ AND NOT WHILE A DEBUG VIEW IS UP. The hold is right for the picture and wrong for the
+        // instrument: pausing is the ONLY way to inspect a smear closely, and a held pMotionBlur is
+        // the last frame the pass wrote — so switching mbDebug on while paused shows the ordinary
+        // blur, and switching it on before pausing freezes whatever debug frame happened to be last.
+        // Either way the view stops answering the question it was built to answer. Debug is already
+        // a not-for-play mode, so re-running the dispatches on a frozen frame costs nothing real.
+        const bool holdBlur = mbEligible && g_simFrozen && g_lastMbRan && g_mbDebug == 0u;
         if (holdBlur) {
             mbRan = true;
             ++g_mbHeldFrames;
