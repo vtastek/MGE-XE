@@ -187,9 +187,22 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
     // Did anything actually reach this pixel? Distinct from `blurred`, which only says the gather
     // RAN — see the statistics at the tail, and the report that made the difference matter.
     bool changed = false;
-    // MB-2k rides inside MB-2j: it re-weights a mixture that only the corrected reconstruction
-    // produces, so arming it against the legacy weighting would describe nothing.
-    bool prov = (gMbParams.opts.w > 0.5f) && (gMbParams.opts2.x > 0.5f);
+    // ── MB-2o: WHICH BACKGROUND SHOWS THROUGH A MOVER. 0 = the streak MEAN, 1 = the NEAREST
+    // unoccluded sample (1/dist^4), 2 = REFLECT ACROSS THE SILHOUETTE. It rides inside MB-2j, which
+    // is the only weighting that produces a mixture to re-source at all.
+    //
+    // ⚠⚠ NO MEASUREMENT PICKS THE WINNER, AND THAT IS WHY IT IS A KNOB. The amount of background
+    // revealed is right to 0.02 against ground truth's own exposure coverage (mbsynth T16), so all
+    // three modes deliver the SAME amount and differ only in its colour. The right colour is the
+    // background AT THIS PIXEL, which the mover is covering, so every mode is a guess — and RMSE
+    // always prefers the MEAN on a high-frequency background, because a smoothed value beats an
+    // uncorrelated sharp one whenever the sample is further away than the background's own
+    // correlation length (2-3 px on foliage). What the eye objects to is not the error's SIZE but
+    // its structure: repetition along the sweep, and a hard seam where a guessed blurry background
+    // meets the real sharp one (measured: shown-background error 0.0045 OUTSIDE the silhouette
+    // against 0.15-0.39 INSIDE, one pixel apart). No metric in the rig arbitrates that.
+    uint bgMode = (gMbParams.opts.w > 0.5f) ? uint(gMbParams.opts2.x + 0.5f) : 0u;
+    bool bgSplit = (bgMode > 0u);
 
     // MB-2i. Split the accepted weight by whether the tap was NEARER than this pixel or not, so
     // "nothing reached me" and "something in front reached me" stop being the same picture. Cost
@@ -242,6 +255,11 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
         float4 sumB = f4(0.0f);
         float  wB   = 0.0f;
         float  covB = 0.0f;
+        // Mode 2 keeps no sum at all — only the offset of the NEAREST tap that actually saw
+        // background, so the reflection afterwards knows how far away the mover's edge is and
+        // which way it lies. One extra fetch per PIXEL rather than per tap.
+        float  nearD   = 1.0e30f;
+        float2 nearOff = f2(0.0f);
 
         // ── THE SHUTTER INTEGRAL, WEIGHTED BY WHAT COULD ACTUALLY HAVE REACHED HERE ──────────────
         // The shutter is open or it is not, so the kernel ALONG the streak is uniform — there is no
@@ -359,12 +377,20 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
             // depends on WHICH taps landed where, so the tap hash decides more of it: dither
             // 0.0074 -> 0.0296. Whole error on the mover's pixels still falls 0.1849 -> 0.0544.
             float4 tapC = LoadTex2D(gMbColor, NO_SAMPLER, spi, 0);
-            if (prov && relD < -0.01f)
+            if (bgSplit && relD < -0.01f)
             {
-                float id = 1.0f / max(dist, 1.0f);
-                float pw = (id * id) * (id * id);            // 1 / dist^4
-                sumB += tapC * (a * pw);
-                wB   += a * pw;
+                if (bgMode == 1u)
+                {
+                    float id = 1.0f / max(dist, 1.0f);
+                    float pw = (id * id) * (id * id);        // 1 / dist^4
+                    sumB += tapC * (a * pw);
+                    wB   += a * pw;
+                }
+                else if (dist < nearD)
+                {
+                    nearD   = dist;
+                    nearOff = off;
+                }
                 covB += a;                                   // the AMOUNT is untouched
             }
             else
@@ -381,11 +407,30 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
         {
             // The centre went into `sum` at weight 1; back it out and re-add it at the weight
             // the taps left unclaimed. wsum - 1 is exactly the taps' total, and covB is the part of
-            // that total MB-2k routed into the background bucket -- so `wt` is the same number it
-            // would have been, and with `prov` off covB is 0 and this is the MB-2j line unchanged.
+            // that total the background bucket took -- so `wt` is the same number it would have
+            // been, and at bgMode 0 covB is 0 and this is the MB-2j line unchanged.
             float wt = (wsum - 1.0f) + covB;
             float wc = max(0.0f, 1.0f - wt);
-            float4 bg = (wB > 1.0e-20f) ? (sumB / wB) : f4(0.0f);
+            float4 bg = f4(0.0f);
+            if (bgMode == 2u)
+            {
+                // REFLECT THROUGH THE EDGE, NOT THROUGH THIS PIXEL. Mirroring a tap at +t to -t is
+                // the obvious reading of the published rule and it is a no-op here: on a static
+                // background BOTH sides of a mover's body are the mover, so the mirror lands back
+                // on the side that was already being sampled and re-fetches it. From play: *"all in
+                // one direction so repeated pixels instead of a mirror"*. If the nearest tap that
+                // saw background is at offset t0, the silhouette is about t0/2 away, so reflecting
+                // this pixel through it lands at 2*t0 — every pixel inside maps to a DIFFERENT
+                // pixel outside, so the texture stops repeating, and the map is continuous at the
+                // silhouette (t0 -> 0 fetches the adjacent real background, which is the seam).
+                int2 ri = clamp(int2(float2(pc) + 2.0f * nearOff + f2(0.5f)),
+                                int2(0, 0), max(deliverN - int2(1, 1), int2(0, 0)));
+                bg = (nearD < 1.0e29f) ? LoadTex2D(gMbColor, NO_SAMPLER, ri, 0) : centre;
+            }
+            else if (wB > 1.0e-20f)
+            {
+                bg = sumB / wB;
+            }
             outv    = ((sum - centre) + centre * wc + bg * covB) / max(wt + wc, 1.0e-6f);
             changed = (wt > 1.0e-4f);
         }

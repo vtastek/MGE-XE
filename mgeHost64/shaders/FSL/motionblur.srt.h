@@ -144,8 +144,15 @@ STRUCT(MotionBlurParams)
     // x = MB-2h tile-fetch jitter (fraction of K); y = MB-2h two-axis sampling; z = MB-2i diagnostic
     // mode; w = MB-2j the corrected reconstruction.
     DATA(float4, opts, None);
-    // x = MB-2k: weight the REVEALED-BACKGROUND mixture by proximity. The cbuffer is 256 B (the
-    // minimum CBV) and was carrying four float4s, so this fifth one costs nothing.
+    // x = MB-2o: WHICH BACKGROUND shows through a mover — 0 the streak MEAN, 1 the NEAREST
+    //     unoccluded sample (1/dist^4), 2 REFLECTED ACROSS THE SILHOUETTE. A MODE and not a flag:
+    //     it began as MB-2k's boolean and the third option is what the second one was missing.
+    //     ⚠ ALL THREE DELIVER THE SAME AMOUNT — the coverage is MB-2j's and is right to 0.02
+    //     against ground truth — so this changes colour only, and no metric in mbsynth picks the
+    //     winner (RMSE always prefers the mean on high-frequency backgrounds; the eye objects to
+    //     structure, which RMSE cannot see). It is a knob because the measurement ran out, not
+    //     because the question is cosmetic. The cbuffer is 256 B (the minimum CBV) and was
+    //     carrying four float4s, so this fifth one costs nothing.
     // y = MB-2l: the DILATION'S REACH R, in TILES. The cover passes each search +-R along one axis,
     //     so a tile hears about motion within R*K of itself. R = 1 reproduces the old 3x3 exactly.
     // z = MB-2l: THE MAXIMUM STREAK, in DELIVERED PIXELS. Every clamp in the gather reads THIS and

@@ -17295,10 +17295,37 @@ namespace {
     // delivers goes 0.24 -> 0.95: the estimate carries no information and MB-2k gives it full
     // confidence anyway, which is a manufactured high-contrast pattern where the mean at least
     // stayed quiet. That is the reported *"it is smearing the foliage IN, instead of the arm OUT"*.
-    // The real answer is the published one (CoD:AW): reconstruct the background by MIRRORING the
-    // weights across the motion direction, not by trusting the nearest sample. Until that is built,
-    // the mean is the honest estimator. Knob kept — it is a no-op on flat backgrounds either way.
-    bool     g_mbProv = false;
+    // ── MB-2o: AND THEN THE MEASUREMENT RAN OUT, SO IT BECAME A KNOB ─────────────────────────────
+    // The published answer (CoD:AW) is to reconstruct the background by MIRRORING the weights across
+    // the motion direction. Built and measured (mbsynth `--fix c12`): a NO-OP here, 0.0453 against
+    // MB-2j's 0.0454, and structurally so. Mirroring exists to fill a background LAYER reconstructed
+    // across the foreground's whole footprint — CoD keeps foreground and background as separate
+    // layers with an explicit alpha — while this filter weights PER TAP, so a tap landing on the
+    // mover contributes zero background instead of wrong background, and the bucket is ALREADY
+    // sourced only from the side where background is visible. Reported from play in one line:
+    // *"all in one direction so repeated pixels instead of a mirror"*.
+    //
+    // The reflection that DOES mean something here is about the EDGE, not about this pixel: if the
+    // nearest tap that saw background is at offset t0 the silhouette is ~t0/2 away, so fetching at
+    // 2*t0 maps every pixel inside to a DIFFERENT pixel outside (the texture stops repeating) and
+    // the map is continuous at the silhouette. That is mode 2, and it costs one fetch per PIXEL.
+    //
+    // ⚠⚠ NO METRIC IN THE RIG PICKS BETWEEN THE THREE, WHICH IS THE REASON THIS IS A DIAL.
+    // T16 measured the AMOUNT of revealed background right to 0.02 against ground truth's own
+    // exposure coverage, so all three deliver the same amount and differ only in its colour — and
+    // the right colour is the background AT THIS PIXEL, which the mover is covering. RMSE then
+    // always prefers the MEAN on a high-frequency background, because a smoothed value beats an
+    // uncorrelated sharp one as soon as the sample is further away than the background's own
+    // correlation length (2-3 px on foliage). What the eye objects to is not the error's SIZE but
+    // its STRUCTURE: repetition along the sweep, and the hard seam where a guessed blurry
+    // background meets the real sharp one — measured as shown-background error 0.0045 OUTSIDE the
+    // silhouette against 0.15-0.39 INSIDE, one pixel apart. RMSE cannot see either of those. So all
+    // three ship live and the scene decides, rather than a blind metric picking for the third time
+    // in this milestone ([[feedback_a_look_dial_inside_a_measurement]] is the inverse mistake).
+    //   0 = the streak MEAN     (MB-2j; unbiased, blurs, combs along the sweep)
+    //   1 = the NEAREST sample  (MB-2k; sharp, invents contrast where the nearest is far)
+    //   2 = REFLECT at the edge (MB-2o; no repeats, continuous at the silhouette)
+    uint32_t g_mbBgMode = 0;
     // Whether the pass ran this frame — written from the ONE gate, read by the resolve's set index
     // and by the heartbeat. Same rule as g_lastUpscaleRan beside it: a second derivation of "did it
     // run" is a second thing that can disagree with the frame.
@@ -21515,7 +21542,12 @@ namespace {
           // Inert unless MB-2j is on -- it re-weights a mixture only the corrected reconstruction
           // produces. Judge it on a THIN fast mover over a TEXTURED background; over a flat wall
           // there is nothing for it to put back and it is measurably a no-op.
-          t.checkbox("  \\- nearest revealed background (MB-2k; off = the streak mean)", &g_mbProv);
+          // ⚠ A LOOK DIAL, AND LABELLED AS ONE. All three deliver the same AMOUNT of revealed
+          // background — that part is measured right to 0.02 — and differ only in its colour, which
+          // is a guess whichever way it is made. Judge it on a fast arm against HIGH-CONTRAST
+          // clutter (a tree, not a wall): over a flat background all three are measurably identical.
+          t.sliderU("  \\- revealed background: 0 streak mean | 1 nearest | 2 reflect at the edge",
+                    &g_mbBgMode, 0u, 2u, 1u);
           t.sliderU("DEBUG: 0 off | 1 velocity READ | 2 depth order | 3 who won | 4 who won, kept split off",
                     &g_mbDebug, 0u, 4u, 1u);
           t.flush(); }
@@ -25067,7 +25099,7 @@ void destroyHostWindow(Renderer* R);
             { "objVelSkipStill",     &g_objVelSkipStill     },
             { "mbTwoDir",            &g_mbTwoDir            },
             { "mbRecon",             &g_mbRecon             },
-            { "mbProv",              &g_mbProv              },
+
             { "objVelSkinned",       &g_objVelSkinnedLane   },
             { "objVelFP",            &g_objVelFPLane        },
             { "objVelSkinIgnoreGen", &g_objVelSkinIgnoreGen },
@@ -25223,6 +25255,8 @@ void destroyHostWindow(Renderer* R);
             { "mbTileReach", &g_mbTileReach, kMbTileReachMax },
             { "mbMaxTaps", &g_mbMaxTaps, 64u },
             { "mbDebug",   &g_mbDebug,   4u },
+            // MB-2o: 0 the streak mean, 1 the nearest sample, 2 reflected at the silhouette.
+            { "mbBgMode",  &g_mbBgMode,  2u },
         };
         const SKnob sknobs[] = {
             // M1 4d: `passthrough` (default) or `ngx`. Read at INIT — it decides which object is
@@ -38355,8 +38389,9 @@ void destroyHostWindow(Renderer* R);
                 mp[14] = (float)std::min(g_mbDebug, 4u);
                 // MB-2j. opts.w = the corrected reconstruction.
                 mp[15] = g_mbRecon ? 1.0f : 0.0f;
-                // MB-2k. opts2.x = proximity-weighted revealed background.
-                mp[16] = g_mbProv ? 1.0f : 0.0f;
+                // MB-2o. opts2.x = WHICH background shows through a mover: 0 mean, 1 nearest,
+                // 2 reflected at the silhouette. A mode, not a flag.
+                mp[16] = (float)std::min(g_mbBgMode, 2u);
                 // MB-2l. opts2.y = the cover dilation's reach in TILES; opts2.z = the MAXIMUM STREAK
                 // in delivered px, which is that reach measured in pixels. The shader does not
                 // re-derive the product: the cover passes and the gather must agree about how far the
@@ -39724,13 +39759,13 @@ void destroyHostWindow(Renderer* R);
                 LOG::logline(">> [forge-hb] mb peak: searched=%.3f%% changed=%.3f%% avgTaps=%.1f"
                              " maxLen=%.2f px on the BUSIEST of %u/%u frames that searched anything"
                              " | held=%u (sim frozen — menu, blurring by the HELD field)"
-                             " | arms: recon=%d prov=%d twoDir=%d objOnly=%d jitter=%.2f softZ=%.2f"
+                             " | arms: recon=%d bg=%d twoDir=%d objOnly=%d jitter=%.2f softZ=%.2f"
                              " K=%u reach=%u cap=%u px dbg=%u"
                              "  [this is the frame `mb=` is priced by — cost is (searched px) x"
                              " (their taps); the sampled line above is usually a PARKED frame]",
                              g_mbPeakPct, g_mbPeakChg, g_mbPeakTaps, (double)g_mbPeakLen,
                              g_mbBlurFrames, g_mbRanFrames, g_mbHeldFrames,
-                             g_mbRecon ? 1 : 0, g_mbProv ? 1 : 0, g_mbTwoDir ? 1 : 0,
+                             g_mbRecon ? 1 : 0, (int)std::min(g_mbBgMode, 2u), g_mbTwoDir ? 1 : 0,
                              g_mbObjectOnly ? 1 : 0,
                              (double)g_mbTileJitter, (double)g_mbSoftZ,
                              g_lastMbK, g_lastMbReach, g_lastMbK * g_lastMbReach, g_mbDebug);
