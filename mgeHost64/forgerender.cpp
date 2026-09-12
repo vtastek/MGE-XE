@@ -14827,6 +14827,10 @@ namespace {
     // whether the world is moving, and a blur that disagrees with the flames is worse than either.
     float    g_simDt       = 0.0f;
     bool     g_simFrozen   = false;  // g_simDt == 0 exactly: a menu, a save-load pause
+    // MB-2m: the same question with hysteresis — "is the game EFFECTIVELY paused", latched against
+    // this machine's own normal frame, because g_simFrozen flickers while a menu is open. See its
+    // derivation beside g_simDt for why a held INPUT needs that and a held output did not.
+    bool     g_simHeld     = false;
     // ...and the INTEGRAL of it: seconds of host-side animation that only tick while MW's world is
     // running. This is the clock every continuous host effect should be on, and `hostNowMs()` is
     // the one it should not — a wall clock keeps running behind an open menu, which is how caustics
@@ -28249,9 +28253,49 @@ void destroyHostWindow(Renderer* R);
             // adds at most 0.1 s here, so a load screen cannot fast-forward the sea, the caustics
             // and every grass imprint through the whole stall.
             g_simClock += (double)g_simDt;
+
+            // ⚠⚠ A MENU DOES NOT STOP MW'S SIM CLOCK CLEANLY, so `g_simFrozen` — a raw per-frame
+            // delta test — FLICKERS while paused: MW ticks the clock a little on input, and every
+            // frame the flag reads false lets the velocity producers clear pMbVelocity. That is
+            // reported exactly as it behaves: *"motion blur is changing in menu mode, gets weaker
+            // as menu pause happens, flickers sometimes when paused, and changes with mouse click
+            // (gets stronger and back) when paused"* — the click ticks the sim, one frame writes a
+            // real field again, and the hold then latches THAT. A held input is far less forgiving
+            // of a flickering condition than MB-2c's held output was, because a single false frame
+            // destroys the thing being held instead of merely re-showing it.
+            //
+            // So the MB freeze runs off a LATCHED flag with hysteresis against this machine's own
+            // normal frame: once frozen, stay frozen until the sim has advanced by half a normal
+            // frame's worth, ACCUMULATED. Self-calibrating rather than a threshold — the comparison
+            // is with the session's own measured dt, so it means "the sim has not advanced enough
+            // to be a real frame" at any framerate. A genuine unpause clears it on the first frame.
+            //
+            // ⚠ g_simFrozen ITSELF IS LEFT ALONE. Three other consumers read it (the cleared-steps
+            // gate, flickAdvance, the heartbeat) and they want the raw per-frame answer; this is a
+            // second question — "is the game effectively paused" — and it gets its own flag rather
+            // than redefining theirs underneath them.
+            {
+                static double s_simDtNormal = 1.0 / 60.0;
+                static double s_simAccum    = 0.0;
+                // Only sampled while NOT held, or a menu's own tiny ticks would drag the reference
+                // down until half of it is smaller than the ticks and the latch releases itself.
+                if (!g_simHeld && g_simDt > 0.0f) {
+                    s_simDtNormal += ((double)g_simDt - s_simDtNormal) * 0.05;
+                }
+                if (g_simFrozen) {
+                    g_simHeld  = true;
+                    s_simAccum = 0.0;
+                } else if (g_simHeld) {
+                    s_simAccum += (double)g_simDt;
+                    if (s_simAccum >= 0.5 * s_simDtNormal) {
+                        g_simHeld  = false;
+                        s_simAccum = 0.0;
+                    }
+                }
+            }
             // MB-2m, derived here so every producer this frame reads ONE answer. g_lastMbRan is the
             // PREVIOUS frame's, which is the point: freeze only onto a field a real blur just used.
-            g_mbVelFrozen = g_simFrozen && g_mbEnable && g_live.mbReady && g_lastMbRan;
+            g_mbVelFrozen = g_simHeld && g_mbEnable && g_live.mbReady && g_lastMbRan;
         }
 
         // F12 debug view: debugParams.x at float index 40 (160B = viewProj 16f + 6×float4 24f).
@@ -53432,6 +53476,7 @@ void destroyHostWindow(Renderer* R);
         // g_simFrozen is left alone: it is re-derived per frame.
         g_lastMbRan = false;
         g_mbVelFrozen = false;
+        g_simHeld = false;
         g_mbHeldFrames = 0;
         if (g_live.pAOParamsCbv)    { removeResource(g_live.pAOParamsCbv); }
         if (g_live.pAOBlur)         { removeResource(g_live.pAOBlur); }

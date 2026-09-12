@@ -380,6 +380,10 @@ def gather(colour, depth, vel, tilev, P):
 
     acc = colour.copy()
     wsum = np.ones((H, W), dtype=np.float64)
+    # c13: the offset of the NEAREST tap that actually saw background, kept as a vector so the
+    # reflection below knows which way the mover's edge lies. inf = no tap ever saw background.
+    near_off = np.zeros((H, W, 2), dtype=np.float64)
+    near_d = np.full((H, W), np.inf, dtype=np.float64)
     accB = np.zeros_like(colour)                 # c9: the revealed-background bucket, by
     wB = np.zeros((H, W), dtype=np.float64)      # PROXIMITY, kept apart from its own total
     covB = np.zeros((H, W), dtype=np.float64)
@@ -446,7 +450,7 @@ def gather(colour, depth, vel, tilev, P):
         # that slice, so its weight is bounded by 1/n and the total by 1. The centre then takes
         # whatever the taps did NOT cover, instead of a fixed 1 that the taps can outvote
         # arbitrarily. That is what makes the answer independent of the tap count.
-        if P.fix in ('c5', 'c6', 'c7', 'c8', 'c9', 'c11', 'c12'):
+        if P.fix in ('c5', 'c6', 'c7', 'c8', 'c9', 'c11', 'c12', 'c13'):
             a = np.minimum(a * P.gain, 1.0) / np.maximum(n, 1.0)
 
         rel = ds / np.maximum(d_centre, 1e-12) - 1.0
@@ -460,6 +464,28 @@ def gather(colour, depth, vel, tilev, P):
             wN += np.where(isN, a, 0.0)
             accR += colour[spi[..., 1], spi[..., 0]] * np.where(isN, 0.0, a)[..., None]
             wR += np.where(isN, 0.0, a)
+
+        if P.fix == 'c13':
+            # ── REFLECT ACROSS THE SILHOUETTE, NOT ACROSS THIS PIXEL ────────────────────────
+            # c12 mirrors a tap at +t to -t, and on a static background BOTH sides of the
+            # mover's own body are the mover -- the background is only visible PAST an edge, so
+            # the mirror lands back on the same visible side and re-fetches what was already
+            # being fetched. Measured: a no-op. And that is what the artefact looks like from
+            # play: *"all in one direction so repeated pixels instead of a mirror"*.
+            #
+            # The reflection that means something here is about the EDGE. If the nearest tap
+            # that saw background is at offset t0, the mover's silhouette is ~t0/2 away, and
+            # reflecting this pixel through it lands at 2*t0. Every pixel inside maps to a
+            # DIFFERENT pixel outside (so the texture stops repeating), the map is CONTINUOUS
+            # at the silhouette (t0 -> 0 fetches the adjacent real background, which is what
+            # the hard seam is made of), and it is one extra fetch per pixel rather than per
+            # tap -- the whole loop only has to remember the nearest background hit.
+            isB = (rel < -0.01)
+            closer = isB & (dist < near_d)
+            near_d = np.where(closer, dist, near_d)
+            near_off = np.where(closer[..., None], off, near_off)
+            covB += np.where(isB, a, 0.0)
+            a = np.where(isB, 0.0, a)
 
         if P.fix == 'c12':
             # ── MIRRORED BACKGROUND RECONSTRUCTION (CoD:AW's rule) ────────────────────────
@@ -534,13 +560,23 @@ def gather(colour, depth, vel, tilev, P):
                  near=w_near, same=w_same, far=w_far, wsum=wsum)
         return out, stats, r
 
-    if P.fix in ('c5', 'c6', 'c7', 'c9', 'c11', 'c12'):
+    if P.fix in ('c5', 'c6', 'c7', 'c9', 'c11', 'c12', 'c13'):
         # acc/wsum currently carry the centre at weight 1; back it out and re-add it at the
         # weight the taps left unclaimed.
         wt = wsum - 1.0 + covB
         w_centre = np.maximum(0.0, 1.0 - wt)
         acc = (acc - colour) + colour * w_centre[..., None]
         wsum = wt + w_centre
+    if P.fix == 'c13':
+        # The reflected fetch, once, at twice the nearest background offset.
+        refl = pc + 2.0 * near_off
+        ri = np.trunc(refl + 0.5).astype(np.int64)
+        ri[..., 0] = np.clip(ri[..., 0], 0, deliver_n[0] - 1)
+        ri[..., 1] = np.clip(ri[..., 1], 0, deliver_n[1] - 1)
+        bg = colour[ri[..., 1], ri[..., 0]]
+        # No tap saw background at all -> nothing to reveal; covB is 0 there anyway.
+        bg = np.where(np.isfinite(near_d)[..., None], bg, colour)
+        acc = acc + bg * covB[..., None]
     if P.fix in ('c9', 'c12'):
         # The background comes in with the coverage it earned, but wearing the colour its own
         # estimator chose: c9 the NEAREST unoccluded sample, c12 the mirrored reconstruction.
@@ -1860,7 +1896,7 @@ def main():
     ap.add_argument('--gain', type=float, default=1.0)
     ap.add_argument('--tapjitter', type=float, default=1.0,
                     help='RIG ONLY: scale the per-pixel tap phase hash (0 = every pixel in phase)')
-    ap.add_argument('--fix', default='ship', choices=('ship', 'c1', 'c5', 'c6', 'c7', 'c8', 'c9', 'c11', 'c12'),
+    ap.add_argument('--fix', default='ship', choices=('ship', 'c1', 'c5', 'c6', 'c7', 'c8', 'c9', 'c11', 'c12', 'c13'),
                     help='which candidate weighting to run')
     ap.add_argument('--arclen', action='store_true',
                     help='EXPERIMENT: weight taps by the arc length they represent')
