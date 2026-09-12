@@ -394,7 +394,7 @@ static int forgeEcoQoSState()
 // separate pass because the producing shader's own gMvStats stop describing the frame the moment a
 // SECOND writer lands on the same texture — see the header.
 #include "shaders/FSL/mvfieldstats.srt.h"
-// MB-2, THE FILTER: MotionBlurSrtData, Persistent, FOUR instances (tile max, neighbour max, and the
+// MB-2, THE FILTER: MotionBlurSrtData, Persistent, FOUR instances (tile max + cover V, cover U, and the
 // gather off each of the two possible colour sources). One SRT for all three compute passes — DXC
 // strips whichever half a given pass never touches, exactly as bloom's does.
 #include "shaders/FSL/motionblur.srt.h"
@@ -1999,6 +1999,11 @@ namespace {
     // is capped separately — a 160 px streak at 16 taps puts them 10 px apart and reads as beads
     // rather than a smear. Long streaks want mbMaxTaps raised with K, and that is the real cost.
     constexpr uint32_t kMbTileKMax = 192;
+    // MB-2l: the cover dilation's reach in TILES. 1 is the old 3x3; the ceiling is a sanity bound,
+    // not a cost one (the pass is 2*(2R+1)/K^2 taps per pixel). ⚠ R*K IS ALSO THE MAXIMUM STREAK,
+    // so at the K floor of 8 a reach of 16 still buys 128 px.
+    constexpr uint32_t kMbTileReachMin = 1;
+    constexpr uint32_t kMbTileReachMax = 16;
 
     // W23/W24 caustics: how many instances of the ONE CausticSrtData::Persistent set exist, and what
     // each of them is for. Declared up here — well before the g_caustic* knob block — only because it
@@ -2521,12 +2526,18 @@ namespace {
         Buffer*        pMbStatsReset = nullptr;
         Buffer*        pMbStatsReadback = nullptr;
         Shader*        pMbTileShader = nullptr;
-        Shader*        pMbNeighborShader = nullptr;
+        // MB-2l: the dilation is `Cover Horizontally` then `Cover Vertically`, R tiles each way.
+        // Two shaders rather than one with an axis flag, because this SRT has no root constants and
+        // both passes share one constant buffer — the axis is the only thing that differs, and it is
+        // a compile-time constant in each file. The body lives once, in mbcover.h.fsl.
+        Shader*        pMbCoverUShader = nullptr;
+        Shader*        pMbCoverVShader = nullptr;
         Shader*        pMbGatherShader = nullptr;
         Pipeline*      pMbTilePipeline = nullptr;
-        Pipeline*      pMbNeighborPipeline = nullptr;
+        Pipeline*      pMbCoverUPipeline = nullptr;
+        Pipeline*      pMbCoverVPipeline = nullptr;
         Pipeline*      pMbGatherPipeline = nullptr;
-        // FOUR instances: [0] tile max, [1] neighbour max, [2] gather off pSceneColor,
+        // FOUR instances: [0] tile max AND cover V, [1] cover U, [2] gather off pSceneColor,
         // [3] gather off the upscaler's output. The last two differ by ONE pointer.
         DescriptorSet* pMbSet = nullptr;
         bool           mbReady = false;           // gates the dispatch block
@@ -3782,7 +3793,7 @@ namespace {
            // screen a moving object covers, and this one is a fixed handful of arm parts a few
            // units from the eye, i.e. a large pixel count that never varies.
            kGpuPhaseObjVelFP,
-           // MB-2: the MOTION BLUR filter — all three passes (tile max, neighbour max, gather) in
+           // MB-2: the MOTION BLUR filter — all four passes (tile max, cover U, cover V, gather) in
            // ONE bracket, because they are one feature with one on/off and no useful intermediate
            // reading; the dilation is ~2% of the cost by construction and splitting it would be
            // three timers describing one decision.
@@ -13619,7 +13630,7 @@ namespace {
                 tld.ppTexture = &g_live.pMbTile;
                 tld.pDesc = &td;
                 addResource(&tld, nullptr);
-                td.pName = "mbNeighborMax";
+                td.pName = "mbTileCover";
                 TextureLoadDesc nld = {};
                 nld.ppTexture = &g_live.pMbNeighbor;
                 nld.pDesc = &td;
@@ -13680,8 +13691,11 @@ namespace {
                 mts.mComp.pFileName = "mbtilemax.comp";
                 addShader(R, &mts, &g_live.pMbTileShader);
                 ShaderLoadDesc mns = {};
-                mns.mComp.pFileName = "mbneighbormax.comp";
-                addShader(R, &mns, &g_live.pMbNeighborShader);
+                mns.mComp.pFileName = "mbcoveru.comp";
+                addShader(R, &mns, &g_live.pMbCoverUShader);
+                ShaderLoadDesc mvs = {};
+                mvs.mComp.pFileName = "mbcoverv.comp";
+                addShader(R, &mvs, &g_live.pMbCoverVShader);
                 ShaderLoadDesc mgs = {};
                 mgs.mComp.pFileName = "mbgather.comp";
                 addShader(R, &mgs, &g_live.pMbGatherShader);
@@ -13691,11 +13705,17 @@ namespace {
                     pd.mComputeDesc.pShaderProgram = g_live.pMbTileShader;
                     addPipeline(R, &pd, &g_live.pMbTilePipeline);
                 }
-                if (g_live.pMbNeighborShader) {
+                if (g_live.pMbCoverUShader) {
                     PipelineDesc pd = {};
                     pd.mType = PIPELINE_TYPE_COMPUTE;
-                    pd.mComputeDesc.pShaderProgram = g_live.pMbNeighborShader;
-                    addPipeline(R, &pd, &g_live.pMbNeighborPipeline);
+                    pd.mComputeDesc.pShaderProgram = g_live.pMbCoverUShader;
+                    addPipeline(R, &pd, &g_live.pMbCoverUPipeline);
+                }
+                if (g_live.pMbCoverVShader) {
+                    PipelineDesc pd = {};
+                    pd.mType = PIPELINE_TYPE_COMPUTE;
+                    pd.mComputeDesc.pShaderProgram = g_live.pMbCoverVShader;
+                    addPipeline(R, &pd, &g_live.pMbCoverVPipeline);
                 }
                 if (g_live.pMbGatherShader) {
                     PipelineDesc pd = {};
@@ -13707,7 +13727,8 @@ namespace {
                 if (g_live.pMotionBlur && g_live.pMbTile && g_live.pMbNeighbor && g_live.pMbParamsCbv
                     && g_live.pMbVelocity
                     && g_live.pMbStats && g_live.pMbStatsReset && g_live.pMbStatsReadback
-                    && g_live.pMbTilePipeline && g_live.pMbNeighborPipeline && g_live.pMbGatherPipeline) {
+                    && g_live.pMbTilePipeline && g_live.pMbCoverUPipeline && g_live.pMbCoverVPipeline
+                    && g_live.pMbGatherPipeline) {
                     DescriptorSetDesc mset = SRT_SET_DESC(MotionBlurSrtData, Persistent, 4, 0);
                     addDescriptorSet(R, &mset, &g_live.pMbSet);
                 }
@@ -13740,22 +13761,30 @@ namespace {
                     d[3].mIndex = SRT_RES_IDX(MotionBlurSrtData, Persistent, gMbColor);
                     d[3].mCount = 1; d[3].ppTextures = &sceneTex;
                     d[4].mIndex = SRT_RES_IDX(MotionBlurSrtData, Persistent, gMbTileIn);
-                    d[4].mCount = 1; d[4].ppTextures = &g_live.pMbNeighbor;
+                    d[4].mCount = 1; d[4].ppTextures = &g_live.pMbTile;
                     d[5].mIndex = SRT_RES_IDX(MotionBlurSrtData, Persistent, gMbTileOut);
-                    d[5].mCount = 1; d[5].ppTextures = &g_live.pMbTile;
+                    d[5].mCount = 1; d[5].ppTextures = &g_live.pMbNeighbor;
                     d[6].mIndex = SRT_RES_IDX(MotionBlurSrtData, Persistent, gMbOut);
                     d[6].mCount = 1; d[6].ppTextures = &g_live.pMotionBlur;
                     d[7].mIndex = SRT_RES_IDX(MotionBlurSrtData, Persistent, gMbStats);
                     d[7].mCount = 1; d[7].ppBuffers = &g_live.pMbStats;
 
-                    // [0] TILE MAX: velocity -> pMbTile. gMbTileIn is unread by this pass and points
-                    // at pMbNeighbor rather than at pMbTile — a DIFFERENT resource, so the set never
-                    // names one surface as both an RTex2D and a WTex2D even in a slot nothing reads.
+                    // ⚠⚠ THE DILATION IS TWO PASSES, SO THE PARITY IS FIXED FROM THE GATHER BACKWARDS.
+                    // Cover U and cover V ping-pong the pair, and the gather reads pMbNeighbor — so
+                    // the FINISHED field has to land in pMbNeighbor, which makes the V pass write it,
+                    // the U pass write pMbTile, and the tile max write pMbNeighbor. Chasing that
+                    // forwards from "the tile max writes pMbTile, obviously" gets it backwards by
+                    // exactly one pass and produces a field that is dilated in X only.
+                    //
+                    // [0] TILE MAX: velocity -> pMbNeighbor, and COVER V: pMbTile -> pMbNeighbor.
+                    // One binding pair serves both because the tile max does not read gMbTileIn at
+                    // all. The slot still points at a DIFFERENT resource from gMbTileOut, so no set
+                    // ever names one surface as both an RTex2D and a WTex2D.
                     updateDescriptorSet(R, 0, g_live.pMbSet, 8, d);
 
-                    // [1] NEIGHBOUR MAX: pMbTile -> pMbNeighbor. The two tile slots swap.
-                    d[4].ppTextures = &g_live.pMbTile;
-                    d[5].ppTextures = &g_live.pMbNeighbor;
+                    // [1] COVER U: pMbNeighbor -> pMbTile. The two tile slots swap.
+                    d[4].ppTextures = &g_live.pMbNeighbor;
+                    d[5].ppTextures = &g_live.pMbTile;
                     updateDescriptorSet(R, 1, g_live.pMbSet, 8, d);
 
                     // [2] GATHER off pSceneColor (no upscaler ran), [3] GATHER off the upscaler's
@@ -13780,12 +13809,13 @@ namespace {
                     // that failed to build would be invisible in exactly the runs that measure it.
                     // (`mb=(NOT BUILT)` on the gpu split is the other half of the same answer.)
                     LOG::logline("!! [forge][mb] motion blur unavailable (out=%d tile=%d nb=%d cbv=%d"
-                                 " stats=%d tilePipe=%d nbPipe=%d gatherPipe=%d set=%d) — pass OFF,"
-                                 " frame unchanged",
+                                 " stats=%d tilePipe=%d coverU=%d coverV=%d gatherPipe=%d set=%d)"
+                                 " — pass OFF, frame unchanged",
                                  g_live.pMotionBlur ? 1 : 0, g_live.pMbTile ? 1 : 0,
                                  g_live.pMbNeighbor ? 1 : 0, g_live.pMbParamsCbv ? 1 : 0,
                                  g_live.pMbStats ? 1 : 0,
-                                 g_live.pMbTilePipeline ? 1 : 0, g_live.pMbNeighborPipeline ? 1 : 0,
+                                 g_live.pMbTilePipeline ? 1 : 0, g_live.pMbCoverUPipeline ? 1 : 0,
+                                 g_live.pMbCoverVPipeline ? 1 : 0,
                                  g_live.pMbGatherPipeline ? 1 : 0, g_live.pMbSet ? 1 : 0);
                 } else {
                     // ⚠ THE KNOBS ARE NOT ON THIS LINE, and that is not an omission: they are declared
@@ -17029,12 +17059,11 @@ namespace {
     // a busy interior, so the cap is not always binding and the cost is paid only by genuinely fast
     // pixels. Cost of the change, validation build, whole screen in motion: 0.65 -> 1.0 ms.
     uint32_t g_mbMaxTaps = 32;
-    // THE TILE SIZE, and it is two things at once **by construction rather than by overloading**:
-    // the dilation's granularity AND the maximum blur length. NeighborMax searches one tile in each
-    // direction, so K is exactly how far a pixel can be told about motion — a longer streak would
-    // end in a hard edge at the tiles that never heard of it. Larger K = longer possible streaks at
-    // LOWER dilation cost (9/K^2 per pixel), which is the whole reason the tile form beats the DX9
-    // filter's fixed-radius cross.
+    // THE TILE SIZE. It used to be two things at once — the dilation's granularity AND the maximum
+    // blur length — and the note here defended that as "by construction rather than by overloading",
+    // because a 3x3 NeighborMax searches one tile in each direction so K was exactly how far a pixel
+    // could be told about motion. MB-2l separated them: the dilation covers mbTileReach tiles, so the
+    // ceiling is K * reach and K is free to be as fine as the velocity field deserves.
     // ⚠⚠ RAISED FROM 20, AND THE OLD VALUE WAS CLIPPING EVERY STREAK IN EVERY FRAME. `maxLen` sat at
     // exactly 20.00 on every heartbeat — the clamp binding everywhere — so the blur was being cut to
     // roughly a fifth of the length the exposure actually called for, which is the other half of
@@ -17043,7 +17072,25 @@ namespace {
     // K is the maximum streak length AND the tile size, so raising it is nearly free on the dilation
     // (1.0 taps/px whatever K is; the neighbour pass gets cheaper as 9/K^2) and costs TAP SPACING,
     // which is why mbMaxTaps moved with it.
-    uint32_t g_mbTileK = 96;
+    //
+    // ⚠⚠ MB-2l LOWERED IT TO 24 AND THAT IS NOT A REVERSAL OF THE ABOVE — the two meanings have been
+    // separated. The streak is now clamped to K * mbTileReach, so 24 x 4 is the SAME 96 px reach the
+    // paragraph above bought, with a quarter the tile. What the small tile buys is everything K was
+    // too coarse for: 107x67 tiles on a 2560 frame instead of 27x17, so one tile's velocity steers
+    // 0.02% of the screen instead of 0.4%, and MB-2h's jitter — which offsets the lookup by K/2 and
+    // therefore flips a BINARY gate over a K-wide band — stipples over 12 px instead of 48.
+    // Measured in mbsynth T15 at a matched 96 px reach: RMSE against ground truth IDENTICAL to five
+    // decimals (0.00409 at K=96 R=1 and at K=24 R=4), speckle 43239 -> 12172, and the gather gets
+    // CHEAPER (blurred 46.8% -> 34.3%) because a tighter dilation stops dragging static pixels in.
+    uint32_t g_mbTileK = 24;
+    // ── MB-2l: THE DILATION'S REACH, IN TILES ────────────────────────────────────────────────────
+    // The cover passes each search +-R tiles along one axis, so the reach is R*K and the gather's
+    // clamp follows it rather than K. R = 1 is the old 3x3 neighbourMax EXACTLY (max is separable,
+    // the edge clamp is idempotent), which is the standing guard in mbsynth's t_reach.
+    // Cost is 2*(2R+1)/K^2 taps per delivered pixel — 0.031 at 24/4, against the tile max's own 1.0
+    // — so the ceiling here is not about cost. It is that R*K is a REACH, and a reach past what any
+    // object in the frame actually travels only widens the search for nothing.
+    uint32_t g_mbTileReach = 4;
     // ⚠⚠ THE VELOCITY FLOOR, IN DELIVERED PIXELS, AND IT IS MANDATORY RATHER THAN AN OPTIMISATION.
     // Only a BIT-IDENTICAL camera frame reaches exact zero (motionvectors.comp's parked short
     // circuit, whose lane MB-2 step 0 had to un-break), and MW's camera matrix is bit-stable on a
@@ -17210,6 +17257,10 @@ namespace {
     // knob is clamped to [kMbTileKMin, kMbTileKMax] and a line reporting the unclamped value would
     // describe a configuration that never existed.
     uint32_t g_lastMbTilesX = 0, g_lastMbTilesY = 0, g_lastMbK = 0;
+    // MB-2l: the reach the dilation RAN at, for the same reason K is latched rather than read from
+    // the knob at print time — `maxLen pinned at K*reach` is the clamp-is-binding test, and a line
+    // that re-read a live knob could report a bound the frame never used.
+    uint32_t g_lastMbReach = 0;
     // The DELIVERED pixel count the gather covered, so `blurred%` has a denominator that came from
     // the same frame as its numerator. Deriving it at print time from outWidth/width would re-ask
     // "did an upscaler run" in a third place.
@@ -21351,14 +21402,17 @@ namespace {
           // cost is linear in it and the `mb peak:` line reports the avgTaps actually used.
           t.sliderU("Max taps — sets TAP SPACING (len/taps) on long streaks; raise with K",
                     &g_mbMaxTaps, 3u, 64u, 1u);
-          // ⚠ TWO THINGS AT ONCE **BY CONSTRUCTION**, which is the opposite of the one-knob-two-jobs
-          // defect: NeighborMax searches one tile in each direction, so K is simultaneously the
-          // dilation's granularity and exactly how far a pixel can be told about motion — i.e. the
-          // maximum streak length. Larger K = longer possible streaks at LOWER dilation cost (the
-          // neighbour pass is 9/K^2 per pixel), which is the whole reason the tile form beats the
-          // DX9 filter's fixed-radius cross.
-          t.sliderU("Tile size K (delivered px) — also the MAXIMUM blur length",
+          // ⚠ THESE TWO ARE ONE SETTING: THE MAXIMUM STREAK IS K * REACH. Until MB-2l they were one
+          // NUMBER — the 3x3 neighbourMax told a tile about motion within +-K, so K was the tile
+          // granularity and the streak ceiling at once, and the defence of that ("two things at once
+          // BY CONSTRUCTION") was true of the 3x3 and not of the algorithm. With a separable cover of
+          // R tiles the reach is R*K, so K is free to be SMALL — fewer pixels steered by one tile's
+          // velocity, and a proportionally narrower band for the jitter to stipple — while the streak
+          // stays as long as it ever was. 24 x 4 = the 96 px of the build before it.
+          t.sliderU("Tile size K (delivered px) — granularity; the streak ceiling is K x reach",
                     &g_mbTileK, kMbTileKMin, kMbTileKMax, 1u);
+          t.sliderU("Dilation reach (TILES) — max streak = K x this; 1 = the old 3x3 exactly",
+                    &g_mbTileReach, kMbTileReachMin, kMbTileReachMax, 1u);
           // The soft depth comparison, as a FRACTION of the centre pixel's distance rather than an
           // absolute — the pass gets raw reverse-Z device depth, where an absolute epsilon means a
           // different distance at every range.
@@ -25102,6 +25156,9 @@ void destroyHostWindow(Renderer* R);
             // max only stops a typo from being accepted silently, and the dispatch's clamp is what
             // keeps the tile grid inside the surfaces it was allocated for.
             { "mbTileK",   &g_mbTileK,   kMbTileKMax },
+            // MB-2l. The MAXIMUM STREAK is mbTileK * mbTileReach, so these two are the A/B pair:
+            // `mbTileK=96 mbTileReach=1` is the pre-MB-2l filter exactly.
+            { "mbTileReach", &g_mbTileReach, kMbTileReachMax },
             { "mbMaxTaps", &g_mbMaxTaps, 64u },
             { "mbDebug",   &g_mbDebug,   3u },
         };
@@ -38152,6 +38209,7 @@ void destroyHostWindow(Renderer* R);
             sceneColorToSR();
 
             const uint32_t K = std::min(std::max(g_mbTileK, kMbTileKMin), kMbTileKMax);
+            const uint32_t reach = std::min(std::max(g_mbTileReach, kMbTileReachMin), kMbTileReachMax);
             const uint32_t tilesX = (deliveredW + K - 1u) / K;
             const uint32_t tilesY = (deliveredH + K - 1u) / K;
 
@@ -38174,6 +38232,13 @@ void destroyHostWindow(Renderer* R);
                 mp[15] = g_mbRecon ? 1.0f : 0.0f;
                 // MB-2k. opts2.x = proximity-weighted revealed background.
                 mp[16] = g_mbProv ? 1.0f : 0.0f;
+                // MB-2l. opts2.y = the cover dilation's reach in TILES; opts2.z = the MAXIMUM STREAK
+                // in delivered px, which is that reach measured in pixels. The shader does not
+                // re-derive the product: the cover passes and the gather must agree about how far the
+                // search actually went, and two derivations of one number are two things that can
+                // disagree ([[feedback_one_knob_two_jobs]] is the same shape one level up).
+                mp[17] = (float)reach;
+                mp[18] = (float)(K * reach);
                 // rects: the DELIVERED rect, then the MOTION-VECTOR (input) rect.
                 mp[0] = (float)deliveredW;   mp[1] = (float)deliveredH;
                 mp[2] = (float)g_live.width; mp[3] = (float)g_live.height;
@@ -38231,7 +38296,7 @@ void destroyHostWindow(Renderer* R);
             }
 
             gpuPhaseBegin(kGpuPhaseMotionBlur);
-            cmdBeginDebugMarker(g_live.pCmd, 0.8f, 0.4f, 0.9f, "MOTION BLUR (tile + neighbour + gather)");
+            cmdBeginDebugMarker(g_live.pCmd, 0.8f, 0.4f, 0.9f, "MOTION BLUR (tile + cover U/V + gather)");
 
             // pMotionBlur rests in SHADER_RESOURCE (the resolve samples it) and is written as a UAV
             // here. The two tile surfaces never leave UNORDERED_ACCESS at all — they are read through
@@ -38246,20 +38311,38 @@ void destroyHostWindow(Renderer* R);
             // (1) TILE MAX. ONE GROUP PER TILE — the dispatch is sized in TILES, and the shader
             // derives its lane from the dispatch id (ripplewave's idiom). That is what makes the pass
             // cost exactly 1.0 taps per delivered pixel whatever K is.
+            // ⚠ IT WRITES pMbNeighbor, NOT pMbTile. Two dilation passes flip the parity, and the
+            // gather's descriptor sets are the fixed end of the chain — see the set block.
             cmdBindPipeline(g_live.pCmd, g_live.pMbTilePipeline);
             cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pMbSet);
             cmdDispatch(g_live.pCmd, tilesX, tilesY, 1);
+            {
+                TextureBarrier tb = { g_live.pMbNeighbor, RESOURCE_STATE_UNORDERED_ACCESS,
+                                      RESOURCE_STATE_UNORDERED_ACCESS };
+                cmdResourceBarrier(g_live.pCmd, 0, nullptr, 1, &tb, 0, nullptr);
+            }
+
+            // (2a) COVER HORIZONTALLY and (2b) COVER VERTICALLY, one thread per tile, +-R tiles each.
+            // Together they are the dilation that lets a streak reach past a mover's silhouette, and
+            // they are also what BOUNDS it: a tile only hears about motion within R*K, which is what
+            // the gather clamps to (opts2.z). `max` is separable, so this costs 2*(2R+1) taps per
+            // TILE rather than (2R+1)^2 — and THAT is what makes a reach past one tile affordable,
+            // which is the whole point of the split. See mbcover.h.fsl.
+            cmdBindPipeline(g_live.pCmd, g_live.pMbCoverUPipeline);
+            cmdBindDescriptorSet(g_live.pCmd, 1, g_live.pMbSet);
+            cmdDispatch(g_live.pCmd, (tilesX + 7u) / 8u, (tilesY + 7u) / 8u, 1);
             {
                 TextureBarrier tb = { g_live.pMbTile, RESOURCE_STATE_UNORDERED_ACCESS,
                                       RESOURCE_STATE_UNORDERED_ACCESS };
                 cmdResourceBarrier(g_live.pCmd, 0, nullptr, 1, &tb, 0, nullptr);
             }
 
-            // (2) NEIGHBOUR MAX, one thread per tile over the 3x3 neighbourhood. This is what lets a
-            // streak reach past a mover's silhouette, and it is also what BOUNDS the streak: a tile
-            // only hears about motion within +-K, which is why the gather clamps to K.
-            cmdBindPipeline(g_live.pCmd, g_live.pMbNeighborPipeline);
-            cmdBindDescriptorSet(g_live.pCmd, 1, g_live.pMbSet);
+            // ⚠ SET 0 AGAIN, AND THAT IS NOT A COPY-PASTE SLIP. Instance 0 binds gMbTileIn = pMbTile
+            // and gMbTileOut = pMbNeighbor, which is exactly what the V pass needs; the tile max
+            // simply does not read the IN slot. A fifth instance would be a second copy of one
+            // binding pair, i.e. a second thing that can drift.
+            cmdBindPipeline(g_live.pCmd, g_live.pMbCoverVPipeline);
+            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pMbSet);
             cmdDispatch(g_live.pCmd, (tilesX + 7u) / 8u, (tilesY + 7u) / 8u, 1);
             {
                 TextureBarrier tb = { g_live.pMbNeighbor, RESOURCE_STATE_UNORDERED_ACCESS,
@@ -38303,6 +38386,7 @@ void destroyHostWindow(Renderer* R);
             g_lastMbTilesX = tilesX;
             g_lastMbTilesY = tilesY;
             g_lastMbK      = K;
+            g_lastMbReach  = reach;
             g_lastMbPixels = (uint64_t)deliveredW * (uint64_t)deliveredH;
 
             // ─── THE BUSIEST-FRAME LATCH ────────────────────────────────────────────────────────
@@ -39472,17 +39556,19 @@ void destroyHostWindow(Renderer* R);
                 // covering its tiles while `changed` collapses onto the mover itself.
                 // **searched ~= changed means the tiling is back.**
                 LOG::logline(">> [forge-hb] mb: searched=%.3f%% changed=%.3f%% of %llu px"
-                             " avgTaps=%.1f maxLen=%.2f px (K=%u exposure=%.1fms @dt=%.1fms"
-                             " x%.2f floor=%.2fpx)"
+                             " avgTaps=%.1f maxLen=%.2f px (K=%u x reach=%u = %u px cap,"
+                             " exposure=%.1fms @dt=%.1fms x%.2f floor=%.2fpx)"
                              "  [both MUST be 0.000%% on a parked camera; searched ~= changed is the"
                              " TILE artifact — the agreement weights are what separate them; maxLen"
-                             " pinned at K means the clamp is cutting streaks short, so raise K;"
+                             " pinned at the cap means the clamp is cutting streaks short, and since"
+                             " MB-2l the fix is mbTileReach, NOT a coarser K;"
                              " maxLen/avgTaps is the TAP SPACING and beads mean raise mbMaxTaps]",
                              100.0 * (double)ms[0] / (double)g_lastMbPixels,
                              100.0 * (double)ms[3] / (double)g_lastMbPixels,
                              (unsigned long long)g_lastMbPixels,
                              ms[0] ? (double)ms[1] / (double)ms[0] : 0.0,
-                             (double)mlen, g_lastMbK,
+                             (double)mlen, g_lastMbK, g_lastMbReach,
+                             g_lastMbK * g_lastMbReach,
                              // The exposure in ms, the frame interval it is divided by, and the
                              // resulting multiplier on the per-frame vector. ⚠ THE MULTIPLIER IS THE
                              // NUMBER THAT ANSWERS "is it framerate independent": it must RISE as
@@ -39512,14 +39598,16 @@ void destroyHostWindow(Renderer* R);
                 LOG::logline(">> [forge-hb] mb peak: searched=%.3f%% changed=%.3f%% avgTaps=%.1f"
                              " maxLen=%.2f px on the BUSIEST of %u/%u frames that searched anything"
                              " | held=%u (sim frozen — menu)"
-                             " | arms: recon=%d prov=%d twoDir=%d objOnly=%d jitter=%.2f softZ=%.2f dbg=%u"
+                             " | arms: recon=%d prov=%d twoDir=%d objOnly=%d jitter=%.2f softZ=%.2f"
+                             " K=%u reach=%u cap=%u px dbg=%u"
                              "  [this is the frame `mb=` is priced by — cost is (searched px) x"
                              " (their taps); the sampled line above is usually a PARKED frame]",
                              g_mbPeakPct, g_mbPeakChg, g_mbPeakTaps, (double)g_mbPeakLen,
                              g_mbBlurFrames, g_mbRanFrames, g_mbHeldFrames,
                              g_mbRecon ? 1 : 0, g_mbProv ? 1 : 0, g_mbTwoDir ? 1 : 0,
                              g_mbObjectOnly ? 1 : 0,
-                             (double)g_mbTileJitter, (double)g_mbSoftZ, g_mbDebug);
+                             (double)g_mbTileJitter, (double)g_mbSoftZ,
+                             g_lastMbK, g_lastMbReach, g_lastMbK * g_lastMbReach, g_mbDebug);
                 g_mbPeakPct = 0.0; g_mbPeakChg = 0.0; g_mbPeakTaps = 0.0; g_mbPeakLen = 0.0f;
                 g_mbBlurFrames = 0; g_mbRanFrames = 0; g_mbHeldFrames = 0;
             }
@@ -40830,41 +40918,52 @@ void destroyHostWindow(Renderer* R);
         // ⚠ NO SAMPLE_COUNT VARIANT TO KEEP IN SYNC — the pass only exists at sampleCount == 1 (the
         // gather's colour source is a plain Tex2D), so unlike bloom and reflect-mip there is no
         // second file name here that could silently disagree with the build path.
-        if (g_live.pMbTileShader || g_live.pMbNeighborShader || g_live.pMbGatherShader) {
+        if (g_live.pMbTileShader || g_live.pMbCoverUShader || g_live.pMbGatherShader) {
             if (g_live.pMbGatherPipeline)   { removePipeline(R, g_live.pMbGatherPipeline);   g_live.pMbGatherPipeline = nullptr; }
             if (g_live.pMbGatherShader)     { removeShader(R, g_live.pMbGatherShader);       g_live.pMbGatherShader = nullptr; }
-            if (g_live.pMbNeighborPipeline) { removePipeline(R, g_live.pMbNeighborPipeline); g_live.pMbNeighborPipeline = nullptr; }
-            if (g_live.pMbNeighborShader)   { removeShader(R, g_live.pMbNeighborShader);     g_live.pMbNeighborShader = nullptr; }
+            if (g_live.pMbCoverVPipeline) { removePipeline(R, g_live.pMbCoverVPipeline); g_live.pMbCoverVPipeline = nullptr; }
+            if (g_live.pMbCoverVShader)   { removeShader(R, g_live.pMbCoverVShader);     g_live.pMbCoverVShader = nullptr; }
+            if (g_live.pMbCoverUPipeline) { removePipeline(R, g_live.pMbCoverUPipeline); g_live.pMbCoverUPipeline = nullptr; }
+            if (g_live.pMbCoverUShader)   { removeShader(R, g_live.pMbCoverUShader);     g_live.pMbCoverUShader = nullptr; }
             if (g_live.pMbTilePipeline)     { removePipeline(R, g_live.pMbTilePipeline);     g_live.pMbTilePipeline = nullptr; }
             if (g_live.pMbTileShader)       { removeShader(R, g_live.pMbTileShader);         g_live.pMbTileShader = nullptr; }
             ShaderLoadDesc mts = {};
             mts.mComp.pFileName = "mbtilemax.comp";
             addShader(R, &mts, &g_live.pMbTileShader);
             ShaderLoadDesc mns = {};
-            mns.mComp.pFileName = "mbneighbormax.comp";
-            addShader(R, &mns, &g_live.pMbNeighborShader);
+            mns.mComp.pFileName = "mbcoveru.comp";
+            addShader(R, &mns, &g_live.pMbCoverUShader);
+            ShaderLoadDesc mvs = {};
+            mvs.mComp.pFileName = "mbcoverv.comp";
+            addShader(R, &mvs, &g_live.pMbCoverVShader);
             ShaderLoadDesc mgs = {};
             mgs.mComp.pFileName = "mbgather.comp";
             addShader(R, &mgs, &g_live.pMbGatherShader);
-            if (g_live.pMbTileShader && g_live.pMbNeighborShader && g_live.pMbGatherShader) {
+            if (g_live.pMbTileShader && g_live.pMbCoverUShader && g_live.pMbCoverVShader
+                && g_live.pMbGatherShader) {
                 PipelineDesc pt = {};
                 pt.mType = PIPELINE_TYPE_COMPUTE;
                 pt.mComputeDesc.pShaderProgram = g_live.pMbTileShader;
                 addPipeline(R, &pt, &g_live.pMbTilePipeline);
                 PipelineDesc pn = {};
                 pn.mType = PIPELINE_TYPE_COMPUTE;
-                pn.mComputeDesc.pShaderProgram = g_live.pMbNeighborShader;
-                addPipeline(R, &pn, &g_live.pMbNeighborPipeline);
+                pn.mComputeDesc.pShaderProgram = g_live.pMbCoverUShader;
+                addPipeline(R, &pn, &g_live.pMbCoverUPipeline);
+                PipelineDesc pv = {};
+                pv.mType = PIPELINE_TYPE_COMPUTE;
+                pv.mComputeDesc.pShaderProgram = g_live.pMbCoverVShader;
+                addPipeline(R, &pv, &g_live.pMbCoverVPipeline);
                 PipelineDesc pg = {};
                 pg.mType = PIPELINE_TYPE_COMPUTE;
                 pg.mComputeDesc.pShaderProgram = g_live.pMbGatherShader;
                 addPipeline(R, &pg, &g_live.pMbGatherPipeline);
             }
             g_live.mbReady = g_live.pMotionBlur && g_live.pMbTile && g_live.pMbNeighbor
-                          && g_live.pMbSet && g_live.pMbTilePipeline && g_live.pMbNeighborPipeline
-                          && g_live.pMbGatherPipeline;
+                          && g_live.pMbSet && g_live.pMbTilePipeline && g_live.pMbCoverUPipeline
+                          && g_live.pMbCoverVPipeline && g_live.pMbGatherPipeline;
             LOG::logline(g_live.mbReady
-                             ? ">> [forge][mb] shaders hot-reloaded (mbtilemax + mbneighbormax + mbgather)"
+                             ? ">> [forge][mb] shaders hot-reloaded (mbtilemax + mbcoveru + mbcoverv"
+                               " + mbgather)"
                              : "!! [forge][mb] hot-reload FAILED — motion blur DISABLED (dxil missing on disk?)");
             LOG::flush();
         }
@@ -53237,10 +53336,12 @@ void destroyHostWindow(Renderer* R);
         // above uses, so nothing is destroyed while something that names it is still alive.
         if (g_live.pMbSet)              { removeDescriptorSet(R, g_live.pMbSet);      g_live.pMbSet = nullptr; }
         if (g_live.pMbGatherPipeline)   { removePipeline(R, g_live.pMbGatherPipeline);   g_live.pMbGatherPipeline = nullptr; }
-        if (g_live.pMbNeighborPipeline) { removePipeline(R, g_live.pMbNeighborPipeline); g_live.pMbNeighborPipeline = nullptr; }
+        if (g_live.pMbCoverVPipeline) { removePipeline(R, g_live.pMbCoverVPipeline); g_live.pMbCoverVPipeline = nullptr; }
+        if (g_live.pMbCoverUPipeline) { removePipeline(R, g_live.pMbCoverUPipeline); g_live.pMbCoverUPipeline = nullptr; }
         if (g_live.pMbTilePipeline)     { removePipeline(R, g_live.pMbTilePipeline);     g_live.pMbTilePipeline = nullptr; }
         if (g_live.pMbGatherShader)     { removeShader(R, g_live.pMbGatherShader);       g_live.pMbGatherShader = nullptr; }
-        if (g_live.pMbNeighborShader)   { removeShader(R, g_live.pMbNeighborShader);     g_live.pMbNeighborShader = nullptr; }
+        if (g_live.pMbCoverVShader)   { removeShader(R, g_live.pMbCoverVShader);     g_live.pMbCoverVShader = nullptr; }
+        if (g_live.pMbCoverUShader)   { removeShader(R, g_live.pMbCoverUShader);     g_live.pMbCoverUShader = nullptr; }
         if (g_live.pMbTileShader)       { removeShader(R, g_live.pMbTileShader);         g_live.pMbTileShader = nullptr; }
         if (g_live.pMbStatsReadback)    { removeResource(g_live.pMbStatsReadback);       g_live.pMbStatsReadback = nullptr; }
         if (g_live.pMbStatsReset)       { removeResource(g_live.pMbStatsReset);          g_live.pMbStatsReset = nullptr; }

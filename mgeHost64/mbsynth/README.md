@@ -20,8 +20,8 @@ receiving pixel is** — which is how a silhouette-local defect becomes a number
 
 ## What is transcribed
 
-`mbtilemax.comp.fsl`, `mbneighbormax.comp.fsl`, `mbgather.comp.fsl` and `mbcommon.h.fsl`, line
-for line, as of MB-2h. Conventions preserved: `gMbDepth` is raw reverse-Z device depth (bigger =
+`mbtilemax.comp.fsl`, `mbcoveru`/`mbcoverv.comp.fsl` (`mbneighbormax.comp.fsl` until MB-2l),
+`mbgather.comp.fsl` and `mbcommon.h.fsl`, line for line, as of MB-2l. Conventions preserved: `gMbDepth` is raw reverse-Z device depth (bigger =
 closer, `d = 1/z` here); `gMbVelocity` is previous-minus-current in delivered px per frame and is
 **quantised to fp16**, as RG16F actually is; `shutter` is `exposure_ms / frameDt_ms`, not
 `angle/360`; the exposure window is centred, so taps span ±|v|·shutter/2.
@@ -55,6 +55,7 @@ streak length to 3 px in 239 — it is not a substitute for a GPU capture.
 | T12 | **THIN fast mover: the refraction and the dither** | **MB-2k, shipped** — see below |
 | T13 | can a mover smear something that is NOT moving? | no: `same%` and `far%` are exactly 0 |
 | T14 | **the halftone at a mover's silhouette** | **`mbTileJitter` flips a binary gate** |
+| T15 | **small tiles AND long streaks** | **MB-2l, shipped** — reach is R tiles, not 1 |
 
 `--explain X,Y` prints the tap-by-tap arithmetic for one pixel: which axis each tap walked, what
 it landed on, and all three weight terms. That is what turned T3 from a correlation into a
@@ -142,6 +143,35 @@ collapsed onto the single nearest tap.
 depends on which taps landed where, so the hash decides more of it (`dither` 0.0074 → 0.0296).
 But `excessHF` — high-frequency energy ground truth does not have — *falls* (0.0240 → 0.0156),
 because an inverted texture was itself high-frequency error. Better on every visibility metric.
+
+## What T15 found — the tile size and the streak ceiling were never one quantity
+
+T14 halved the halftone by shrinking K and had to pay for it in the blur itself (RMSE 0.00281 →
+0.04073 in the first run of it, 0.00409 → 0.04078 at the arm settings T15 uses), because the
+streak clamp **was** K: 28 px tiles also meant a 28 px ceiling on a mover that wanted 60. The
+filter documented that coupling as a law — *"K IS ALSO THE MAXIMUM BLUR LENGTH, and that is a
+property of the algorithm"* — and it is a property of the **3×3 search**, not of the algorithm. A
+tile may be told about motion within the dilation's reach; a 3×3 reaches one tile. Cover R tiles
+and the reach is R·K.
+
+`max` is separable, so R costs `2(2R+1)` taps per tile instead of `(2R+1)²`. At a matched 96 px
+reach, arm over sky:
+
+| K | R | tiles | maxLen | dilation taps/px | blurred% | speckle | RMSE vs GT |
+|---|---|---|---|---|---|---|---|
+| 96 | 1 | 8×6 | 96 | 0.0007 | 46.788 | 43239 | 0.00409 |
+| 28 | 1 | 28×19 | 28 | 0.0077 | 13.159 | 8927 | 0.04078 |
+| 28 | 4 | 28×19 | 112 | 0.0230 | 40.608 | 15240 | 0.00409 |
+| **24** | **4** | **32×22** | **96** | **0.0312** | **34.272** | **12172** | **0.00409** |
+| 16 | 6 | 48×32 | 96 | 0.1016 | 33.397 | 7889 | 0.00409 |
+| 12 | 8 | 64×43 | 96 | 0.2361 | 31.644 | 5671 | 0.00409 |
+
+Equal reach is equal blur to five decimals; the speckle falls with K; and the **gather gets
+cheaper** (`blurred` 46.8% → 31.6%) because a tighter dilation stops dragging static pixels into
+the search at all. `t_reach` asserts `cover_max(R=1) == neighbour_max` bit-for-bit before it
+reports any of this, which is what makes the rows a comparison rather than two unrelated filters.
+
+Shipped as MB-2l: `mbTileK` 96 → 24, `mbTileReach` 4, `opts2.z` carries the ceiling.
 
 ## What it does NOT show
 

@@ -62,6 +62,9 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
     float4 outv   = centre;
 
     int   K        = int(gMbParams.tile.x);
+    // ⚠ THE MAXIMUM STREAK IS THE DILATION'S REACH (R*K), NOT THE TILE SIZE. They were one number
+    // until MB-2l, which is why every clamp below used to read K. See motionblur.srt.h / mbcover.h.
+    float maxLen   = gMbParams.opts2.z;
     int2  tiles    = int2(gMbParams.tile.yz);
     float outScale = gMbParams.tile.w;
     float shutter  = gMbParams.blur.x;
@@ -85,9 +88,11 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
     // axes — columns 1.26x the mean of other phases (z=+4.5), rows 1.30x (z=+4.7), against 1.12x
     // / 1.13x at 64 and 1.19x / 1.03x at 128. The grid is the tile grid, aligned to the origin.
     //
-    // ⚠ K IS NOT THE LEVER, and the same log says so: 17 of 55 windows still report maxLen
-    // pinned at exactly 96, so LOWERING K clamps more streaks, and RAISING it makes the tiles
-    // coarser. The grid has to stop being a grid instead.
+    // ⚠ K WAS NOT THE LEVER WHILE K WAS ALSO THE CLAMP, and the log said so: 17 of 55 windows
+    // reported maxLen pinned at exactly 96, so LOWERING K clamped more streaks and RAISING it made
+    // the tiles coarser. MB-2l removed that trade — the reach is R*K now — so K IS a lever, and the
+    // jitter is no longer the only defence against the grid. It is still on, because a small tile
+    // still has a boundary; it is simply now jittering by a much smaller K.
     //
     // Offsetting the lookup by up to half a tile per pixel means neighbours near a boundary
     // consult DIFFERENT tiles, so the step is spread over a K-wide band of dither instead of
@@ -120,9 +125,9 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
     // much of each tap survives is the AGREEMENT test below, on the tap's own velocity and this
     // pixel's own velocity. See mbcommon.h.fsl.
     float  speed = length(vTile);                 // the SEARCH speed — always >= |vSelf|
-    // ⚠⚠ CLAMPED TO K, AND SO IS THE TAP'S STREAK BELOW — THE WEIGHT MUST DESCRIBE THE
-    // STREAK THAT WAS ACTUALLY SEARCHED. `d` is clamped to K a few lines down because NeighborMax
-    // only searched one tile in each direction; for a while these two were not, and that asymmetry
+    // ⚠⚠ CLAMPED TO maxLen, AND SO IS THE TAP'S STREAK BELOW — THE WEIGHT MUST DESCRIBE THE
+    // STREAK THAT WAS ACTUALLY SEARCHED. `d` is clamped to maxLen a few lines down because the cover
+    // passes searched R tiles in each direction; for a while these two were not, and that asymmetry
     // WAS the tiling. mbCone is 1 - dist/streak, so a body whose true streak is 300 px against a
     // K of 96 scores >= 0.84 at EVERY tap the search can reach — the cone stops being a taper and
     // degenerates into a box average over the whole +-K/2 line, at near-uniform weight, which then
@@ -139,7 +144,7 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
     // to zero across the reach it has, and the only falloff left at the boundary is the ordinary
     // end-of-streak one a correct filter has anyway. The blur is then SHORTER than physical for
     // anything past K — which is the honest trade, and the direction the complaint points.
-    float  selfStreak = min(length(vSelf) * shutter, float(K));  // THIS pixel's own streak, px
+    float  selfStreak = min(length(vSelf) * shutter, maxLen);    // THIS pixel's own streak, px
 
     // The displacement during the exposure. ⚠ `shutter` here is `exposure_ms / frameDt_ms`, NOT
     // `angle/360`: the vector is per RENDERED FRAME, so a constant multiplier would shrink the smear
@@ -149,14 +154,14 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
     float2 d   = vTile * shutter;
     float  len = length(d);
 
-    // ⚠ CLAMPED TO K, AND K IS THE TILE SIZE. NeighborMax searched exactly one tile in each
-    // direction, so no pixel has been told about motion further away than K; a longer streak would
-    // run into pixels whose tile never heard of it and end in a hard edge. The streak spans +-len/2,
-    // so this leaves a factor of two in hand.
-    if (len > float(K))
+    // ⚠ CLAMPED TO THE DILATION'S REACH. The cover passes searched R tiles in each direction, so no
+    // pixel has been told about motion further away than R*K; a longer streak would run into pixels
+    // whose tile never heard of it and end in a hard edge. The streak spans +-len/2, so this leaves
+    // a factor of two in hand.
+    if (len > maxLen)
     {
-        d   = d * (float(K) / max(len, 1.0e-6f));
-        len = float(K);
+        d   = d * (maxLen / max(len, 1.0e-6f));
+        len = maxLen;
     }
 
     // ── THE VELOCITY FLOOR, AND IT IS AN EXACT PASS-THROUGH ──────────────────────────────────────
@@ -212,7 +217,7 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
         // the streak that was actually searched.
         float2 dSelf   = vSelf * shutter;
         float  lenSelf = length(dSelf);
-        if (lenSelf > float(K)) { dSelf = dSelf * (float(K) / max(lenSelf, 1.0e-6f)); lenSelf = float(K); }
+        if (lenSelf > maxLen) { dSelf = dSelf * (maxLen / max(lenSelf, 1.0e-6f)); lenSelf = maxLen; }
         // ⚠ OFF BELOW A PIXEL OF OWN MOTION. A static pixel has no axis of its own, and
         // splitting its budget onto a zero-length one would collapse half the taps onto the centre
         // and over-weight it — the static world must keep the single-axis behaviour exactly.
@@ -270,7 +275,7 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
             int2   dq = mbVelocityTexel(float2(spi), delivered, mvRect);
             float  ds = LoadTex2D(gMbDepth, NO_SAMPLER, dq, 0).r;
             float2 vs = LoadTex2D(gMbVelocity, NO_SAMPLER, dq, 0).xy * outScale;
-            float  sampleStreak = min(length(vs) * shutter, float(K));   // see selfStreak
+            float  sampleStreak = min(length(vs) * shutter, maxLen);     // see selfStreak
 
             float f = mbDepthWeight(ds, dCentre, softZ);   // sample in FRONT of the centre
             float b = mbDepthWeight(dCentre, ds, softZ);   // sample BEHIND the centre

@@ -1,0 +1,30 @@
+// mgeHost64 — MB-2 pass 2b: COVER VERTICALLY.  The body and the whole argument are in
+// mbcover.h.fsl; this file is the entry point and the axis, and nothing else.
+//
+// pMbNeighbor (already covered in X) -> pMbTile, max over +-R tiles in Y. The two dilation passes
+// PING-PONG the same pair of surfaces, so the finished field rests back in the one the gather reads —
+// see the descriptor-set comment in forgerender.cpp, which is where that parity is chosen.
+
+#include "motionblur.srt.h"
+#include "mbcommon.h.fsl"
+#include "mbcover.h.fsl"
+
+ROOT_SIGNATURE(ComputeRootSignature)
+NUM_THREADS(8, 8, 1)
+void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
+{
+    INIT_MAIN;
+
+    int2 t     = int2(DispatchThreadID.xy);
+    int2 tiles = int2(gMbParams.tile.yz);
+    int  R     = int(gMbParams.opts2.y);
+
+    // ⚠ RETURN() ON ITS OWN LINE — see mbcoveru.comp.fsl.
+    if (t.x >= tiles.x || t.y >= tiles.y)
+    {
+        RETURN();
+    }
+
+    Write2D(gMbTileOut, t, mbCoverAxis(t, tiles, R, int2(0, 1)));
+    RETURN();
+}

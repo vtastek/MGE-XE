@@ -837,12 +837,20 @@
 // ⚠ THE DILATION SPLITS AND THE GATHER DOES NOT, and that is not a cost decision either way. `max`
 // is separable; a line integral along an arbitrary direction is not a convolution and has no
 // separable form. X-then-Y here turns a diagonal streak into an axis-aligned box.
+//
+// FOUR passes since MB-2l: the dilation is `Cover Horizontally` then `Cover Vertically`, R tiles
+// each way, because that is what lets the tiles be small (fewer pixels steered by one velocity)
+// while the streak stays long (the reach is R*K, not K). See mbcover.h.fsl.
 #comp mbtilemax.comp
 #include "mbtilemax.comp.fsl"
 #end
 
-#comp mbneighbormax.comp
-#include "mbneighbormax.comp.fsl"
+#comp mbcoveru.comp
+#include "mbcoveru.comp.fsl"
+#end
+
+#comp mbcoverv.comp
+#include "mbcoverv.comp.fsl"
 #end
 
 #comp mbgather.comp

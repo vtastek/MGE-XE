@@ -12,7 +12,7 @@ Here the scene is analytic, so there is a GROUND TRUTH: a rect moving at a known
 averaged over the exposure, IS the correct motion blur.  The filter can then be scored per
 pixel against the right answer instead of against an opinion.
 
-WHAT IS TRANSCRIBED.  mbtilemax.comp.fsl, mbneighbormax.comp.fsl, mbgather.comp.fsl and
+WHAT IS TRANSCRIBED.  mbtilemax.comp.fsl, mbcoveru/mbcoverv.comp.fsl, mbgather.comp.fsl and
 mbcommon.h.fsl, line for line, as of MB-2h (tile jitter + two-direction sampling).  The
 conventions that matter:
   * gMbDepth is RAW REVERSE-Z DEVICE DEPTH -- bigger is CLOSER.  d = 1/z here.
@@ -136,7 +136,7 @@ def ground_truth(layers, W, H, shutter, nsub=513):
 
 
 # ---------------------------------------------------------------------------------------
-# mbtilemax.comp.fsl / mbneighbormax.comp.fsl
+# mbtilemax.comp.fsl / mbcoveru.comp.fsl + mbcoverv.comp.fsl (mbneighbormax until MB-2l)
 # ---------------------------------------------------------------------------------------
 
 def tile_max(vel, P):
@@ -170,6 +170,42 @@ def neighbour_max(tiles):
     return out
 
 
+def cover_max_axis(tiles, R, axis):
+    """max over +-R tiles along ONE axis, clamped to the grid (axis 0 = rows, 1 = cols)."""
+    ty, tx, _ = tiles.shape
+    out = np.zeros_like(tiles)
+    n = ty if axis == 0 else tx
+    for j in range(ty):
+        for i in range(tx):
+            best, bestl = np.zeros(2), -1.0
+            c = j if axis == 0 else i
+            for dd in range(-R, R + 1):
+                k = min(max(c + dd, 0), n - 1)
+                q = tiles[k, i] if axis == 0 else tiles[j, k]
+                l2 = q[0] ** 2 + q[1] ** 2
+                if l2 > bestl:
+                    bestl, best = l2, q
+            out[j, i] = best
+    return out
+
+
+def cover_max(tiles, R):
+    """DETROIT'S DILATION: `Cover Horizontally` then `Cover Vertically`, R tiles each way.
+
+    ⚠ THIS IS THE PASS THAT DECOUPLES TILE SIZE FROM MAXIMUM STREAK, and those being one knob
+    is the constraint the whole filter has been shaped around.  motionblur.srt.h states it as
+    a law -- *"K IS ALSO THE MAXIMUM BLUR LENGTH, and that is a property of the algorithm"* --
+    but it is a property of the 3x3 SEARCH, not of the algorithm: a tile only hears about
+    motion within one tile, so a streak may not exceed that reach.  Dilate R tiles wide and
+    the reach is R*K, whatever K is.  `max` is separable, so the cost is 2*(2R+1) taps per
+    TILE rather than (2R+1)^2, i.e. 2*(2R+1)/K^2 per delivered pixel -- 0.031 at K=24, R=4,
+    against the tile max's own 1.0.  Detroit runs 32x32 tiles at 4K on exactly this shape.
+
+    At R == 1 it is the 3x3 max EXACTLY (max is separable and the edge clamp is idempotent),
+    which is the standing guard in t_reach."""
+    return cover_max_axis(cover_max_axis(tiles, R, 1), R, 0)
+
+
 # ---------------------------------------------------------------------------------------
 # mbgather.comp.fsl
 # ---------------------------------------------------------------------------------------
@@ -179,6 +215,14 @@ class Params(object):
                  soft_z=0.1, tile_jitter=1.0, two_dir=True, out_scale=1.0,
                  arclen=False, fix='ship', gain=1.0, tap_jitter=1.0):
         self.W, self.H, self.K = W, H, K
+        # ── THE DILATION'S REACH, IN TILES, AND THE STREAK CLAMP IT BUYS ──────────────────
+        # reach == 1 is the shipped 3x3 neighbourMax and max_len == K is the clamp that
+        # follows from it.  They are TWO numbers because they answer two questions -- "how
+        # coarse is the velocity field the gather steers by" and "how long may a streak be"
+        # -- and tying them to one knob is what forces K = 96 (27x17 tiles on a 2560 frame)
+        # just to allow a 96 px streak.  See cover_max.
+        self.reach = 1
+        self.max_len = None                       # None = K * reach, the bound the search buys
         self.shutter, self.max_taps = shutter, max_taps
         self.floor_px, self.soft_z = floor_px, soft_z
         self.tile_jitter, self.two_dir = tile_jitter, two_dir
@@ -281,13 +325,15 @@ def gather(colour, depth, vel, tilev, P):
         v_tile = np.where(take_own[..., None], v_own, v_tile)
 
     speed = np.linalg.norm(v_tile, axis=-1)
-    self_streak = np.minimum(np.linalg.norm(v_self, axis=-1) * shutter, float(K))
+    # ⚠ THE CLAMP IS THE DILATION'S REACH, NOT THE TILE SIZE. They are equal only at reach 1.
+    ML = float(P.max_len) if P.max_len is not None else float(K * P.reach)
+    self_streak = np.minimum(np.linalg.norm(v_self, axis=-1) * shutter, ML)
 
     d = v_tile * shutter
     ln = np.linalg.norm(d, axis=-1)
-    over = ln > float(K)
-    d = np.where(over[..., None], d * (float(K) / np.maximum(ln, 1e-6))[..., None], d)
-    ln = np.where(over, float(K), ln)
+    over = ln > ML
+    d = np.where(over[..., None], d * (ML / np.maximum(ln, 1e-6))[..., None], d)
+    ln = np.where(over, ML, ln)
 
     blurred = (speed >= P.floor_px) & (ln >= 1.0e-4)
     taps = np.clip(np.ceil(ln), 3, max(P.max_taps, 3)).astype(np.int64)
@@ -300,9 +346,9 @@ def gather(colour, depth, vel, tilev, P):
         jitter = (mb_dither(pc) - 0.5) * P.tap_jitter
     d_self = v_self * shutter
     len_self = np.linalg.norm(d_self, axis=-1)
-    o = len_self > float(K)
-    d_self = np.where(o[..., None], d_self * (float(K) / np.maximum(len_self, 1e-6))[..., None], d_self)
-    len_self = np.where(o, float(K), len_self)
+    o = len_self > ML
+    d_self = np.where(o[..., None], d_self * (ML / np.maximum(len_self, 1e-6))[..., None], d_self)
+    len_self = np.where(o, ML, len_self)
 
     two_dir = (P.two_dir) & (len_self >= 1.0) & (taps >= 4)
     n_half = np.maximum(taps >> 1, 1)
@@ -346,7 +392,7 @@ def gather(colour, depth, vel, tilev, P):
         dq = mb_velocity_texel(spi.astype(np.float64), P.delivered, P.mv_rect)
         ds = depth[dq[..., 1], dq[..., 0]]
         vs = vel[dq[..., 1], dq[..., 0]] * P.out_scale
-        sample_streak = np.minimum(np.linalg.norm(vs, axis=-1) * shutter, float(K))
+        sample_streak = np.minimum(np.linalg.norm(vs, axis=-1) * shutter, ML)
 
         f = mb_depth_weight(ds, d_centre, soft_z)
         b = mb_depth_weight(d_centre, ds, soft_z)
@@ -453,7 +499,7 @@ def run_filter(layers, P, quantise_fp16=True):
     colour, depth, vel = rasterize(layers, P.W, P.H, 0.0)
     if quantise_fp16:
         vel = vel.astype(np.float16).astype(np.float64)   # gMbVelocity is RG16F
-    tiles = neighbour_max(tile_max(vel, P))
+    tiles = cover_max(tile_max(vel, P), P.reach)
     out, stats, aux = gather(colour, depth, vel, tiles, P)
     aux['source'] = colour
     aux['depth'] = depth
@@ -1418,6 +1464,49 @@ def t_stipple(P, outdir):
     print('  make the dilation smooth and DETERMINISTIC rather than make the coin fairer.')
 
 
+def t_reach(P, outdir):
+    hdr('T15  SMALL TILES **AND** LONG STREAKS -- a separable cover dilation of R tiles')
+    print('  T14 measured the halftone down 4.8x at K=28 (43239 -> 8927 speckle) and had to pay')
+    print('  for it with the blur itself: RMSE 0.00281 -> 0.04073, because the streak clamp IS K,')
+    print('  so 28 px tiles also mean a 28 px maximum streak on a mover that wants 60. That trade')
+    print('  is not real. The clamp is the DILATION\'S REACH, and the 3x3 is only one tile of it.')
+    print('')
+    print('  ⚠ GUARD FIRST: cover_max(R=1) must be the 3x3 neighbourMax BIT-FOR-BIT, or every')
+    print('  number below is being compared against a different filter.')
+    L = [Layer('sky', (-4000, -4000, 4000, 4000), 4000.0, (0.62, 0.74, 0.92)),
+         Layer('arm', (300, 150, 390, 380), 80.0, (0.30, 0.16, 0.11), motion=(48.0, 26.0))]
+    keep = (P.K, P.tiles, P.reach, P.max_len, P.fix, P.gain, P.prox_mode, P.prox_p)
+    P.fix, P.gain, P.prox_mode, P.prox_p = 'c9', 2.0, 'idw', 4.0
+    colour, depth, vel = rasterize(L, P.W, P.H, 0.0)
+    vel = vel.astype(np.float16).astype(np.float64)
+    tm = tile_max(vel, P)
+    same = np.array_equal(cover_max(tm, 1), neighbour_max(tm))
+    print('  cover_max(R=1) == neighbour_max : %s' % ('IDENTICAL' if same else '*** DIFFERS ***'))
+    if not same:
+        return
+    print('')
+    gt = ground_truth(L, P.W, P.H, P.shutter, nsub=257)
+    print('  K    R  tiles     maxLen | dilation taps/px | blurred%  speckle   RMSE vs GT')
+    for K, R in ((96, 1), (28, 1), (28, 2), (28, 4), (24, 4), (16, 6), (12, 8)):
+        P.K, P.reach = K, R
+        P.tiles = (int(math.ceil(P.W / float(K))), int(math.ceil(P.H / float(K))))
+        P.max_len = float(K * R)
+        out, st, aux = run_filter(L, P)
+        cost = 2.0 * (2 * R + 1) / float(K * K)
+        print('  %-4d %-2d %-9s %6.0f |     %8.4f     |  %6.3f  %7d    %.5f'
+              % (K, R, '%dx%d' % P.tiles, P.max_len, cost, 100.0 * st['hit'],
+                 speckle(aux['blurred']), rmse(out, gt)))
+        if outdir:
+            dump(outdir, 'reach_K%03d_R%d' % (K, R), filt=out, gt=gt,
+                 err=np.abs(out - gt) * 6.0)
+    P.K, P.tiles, P.reach, P.max_len, P.fix, P.gain, P.prox_mode, P.prox_p = keep
+    print('')
+    print('  The row to read is K=24 R=4: the SAME 96 px reach as the shipped filter, four times')
+    print('  the tile resolution, and the dilation still costs 0.031 taps per pixel against the')
+    print('  tile max\'s 1.0. If its RMSE matches K=96 R=1 while its speckle matches K=28, the')
+    print('  trade T14 found was an artefact of one knob doing two jobs.')
+
+
 def t_tilegrid(P, outdir):
     hdr('T7  TILE GRID -- MB-2h jitter, on a body whose velocity VARIES (a rigid rect cannot show it)')
     L = scene_swing(P.W, P.H)
@@ -1605,6 +1694,8 @@ def main():
         t_foliage(P, a.dump)
     if s in ('all', 'stipple'):
         t_stipple(P, a.dump)
+    if s in ('all', 'reach'):
+        t_reach(P, a.dump)
     if s in ('all', 'tilegrid'):
         t_tilegrid(P, a.dump)
     if s in ('all', 'twodir'):

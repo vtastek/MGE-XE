@@ -1,0 +1,55 @@
+// mgeHost64 — MB-2 pass 2: the SEPARABLE COVER DILATION, shared body.  Read motionblur.srt.h first.
+//
+// ⚠⚠ THIS IS THE PASS THAT UNTIES TILE SIZE FROM MAXIMUM STREAK, and those two being one number is
+// the constraint the whole filter had been shaped around. motionblur.srt.h used to state it as a law
+// — *"K IS ALSO THE MAXIMUM BLUR LENGTH, and that is a property of the algorithm rather than a second
+// meaning bolted onto one knob"* — and it is not a property of the algorithm, it is a property of the
+// 3x3 SEARCH that used to sit here. A tile may only be told about motion within the dilation's reach;
+// a 3x3 reaches one tile, so the streak had to stop at K. Reach R tiles and the bound is R*K, at any
+// K at all. Detroit: Become Human runs 32x32 tiles at 4K on exactly this shape — `Cover Horizontally`
+// then `Cover Vertically` — which is where this came from.
+//
+// ⚠ WHY THAT MATTERS HERE AND NOT JUST ON PAPER. K = 96 on a 2560-wide frame is 27x17 tiles, so ONE
+// tile's velocity decides the search direction for 0.4% of the screen at a time, and MB-2h's jitter
+// then picks between neighbouring tiles per pixel to hide the seam — which turns a hard grid into a
+// halftone, because `blurred` is a BINARY gate (mbsynth T14: speckle 0 / 22050 / 43239 at jitter
+// 0 / 0.5 / 1.0 while RMSE does not move in the fifth decimal). Measured at a matched 96 px reach
+// (mbsynth T15, arm over sky, RMSE against ground truth):
+//     K=96 R=1   RMSE 0.00409   speckle 43239   blurred 46.8%   dilation 0.0007 taps/px
+//     K=24 R=4   RMSE 0.00409   speckle 12172   blurred 34.3%   dilation 0.0312 taps/px
+//     K=12 R=8   RMSE 0.00409   speckle  5671   blurred 31.6%   dilation 0.2361 taps/px
+// The blur is bit-for-bit as strong (same reach = same answer), the stipple falls with K, and the
+// GATHER gets cheaper: a tighter dilation stops dragging static pixels into the search at all.
+//
+// ⚠ SEPARABLE, AND THAT IS WHY IT IS AFFORDABLE. `max` is separable, so R costs 2*(2R+1) taps per
+// TILE instead of (2R+1)^2 — 18 against 81 at R = 4 — i.e. 2*(2R+1)/K^2 per delivered pixel, 0.031
+// at K=24 R=4 against the tile max's own 1.0. mbneighbormax.comp used to argue the 3x3 was
+// deliberately NOT split because it would "save 3 taps out of 9 on 0.25% of the pixels". True at
+// R = 1, and the reason the split is worth an extra dispatch is not the taps — it is that without it
+// the reach cannot grow past one tile without going quadratic.
+//
+// ⚠ AT R == 1 THIS IS THE OLD 3x3 MAX EXACTLY. max is separable and the edge clamp is idempotent, so
+// U-then-V over +-1 is the same set of nine tiles. mbsynth's t_reach asserts that bit-for-bit before
+// it reports anything else, which is what makes the table above a comparison rather than two
+// unrelated filters.
+#pragma once
+
+// One thread per TILE. `step` is (1,0) for the U pass and (0,1) for the V pass; R comes from the
+// host in TILES (opts2.y), so the two dispatches share one constant buffer and differ only by the
+// shader they bind.
+float2 mbCoverAxis(int2 t, int2 tiles, int R, int2 step)
+{
+    float2 best  = f2(0.0f);
+    float  bestL = -1.0f;
+
+    // Clamped to the GRID, so an edge tile sees its own row/column repeatedly rather than a texel
+    // nobody wrote. Duplication is harmless under a max; a stale texel is not.
+    for (int i = -R; i <= R; ++i)
+    {
+        int2   q  = clamp(t + step * i, int2(0, 0), tiles - int2(1, 1));
+        float2 v  = LoadRWTex2D(gMbTileIn, q);
+        float  l2 = dot(v, v);
+        if (l2 > bestL) { bestL = l2; best = v; }
+    }
+    return best;
+}

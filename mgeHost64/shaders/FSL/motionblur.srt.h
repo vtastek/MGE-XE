@@ -6,9 +6,15 @@
 //
 // ── THREE PASSES, ALL COMPUTE ────────────────────────────────────────────────────────────────────
 //
-//   mbtilemax.comp      one GROUP per KxK tile  -> pMbTile      max |v| in the tile
-//   mbneighbormax.comp  one THREAD per tile     -> pMbNeighbor  max over the 3x3 tile neighbourhood
+//   mbtilemax.comp      one GROUP per KxK tile  -> pMbNeighbor  max |v| in the tile
+//   mbcoveru.comp       one THREAD per tile     -> pMbTile      max over +-R tiles in X
+//   mbcoverv.comp       one THREAD per tile     -> pMbNeighbor  max over +-R tiles in Y
 //   mbgather.comp       one THREAD per pixel    -> pMotionBlur  a 1D line integral along v
+//
+// ⚠ THE TWO TILE SURFACES PING-PONG AND THE NAMES NO LONGER DESCRIBE THEM. Two dilation passes flip
+// the parity, so the tile max writes pMbNeighbor and the finished field lands back there for the
+// gather to read; pMbTile holds the half-done X cover. The descriptor sets are what choose that
+// parity and forgerender.cpp says so at the point of choosing.
 //
 // ⚠⚠ THE GATHER MUST NOT BE SEPARATED INTO X-THEN-Y. Motion blur is a **line integral along each
 // pixel's own velocity**, not a 2D convolution: X-then-Y turns a diagonal streak into an
@@ -96,12 +102,15 @@ STRUCT(MotionBlurParams)
     //      Equal to xy whenever no upscaler ran, which is why a 1x session cannot test the mapping.
     DATA(float4, rects, None);
     // x = TILE SIZE K, in DELIVERED pixels.
-    //     ⚠ K IS ALSO THE MAXIMUM BLUR LENGTH, and that is a property of the algorithm rather than a
-    //     second meaning bolted onto one knob. NeighborMax searches the 3x3 tile neighbourhood, so a
-    //     tile can only be told about motion within +-K of itself; a streak longer than that would
-    //     reach pixels whose tile never heard about it and would end in a hard edge. Clamping the
-    //     shutter displacement to K is exactly the bound the 3x3 search buys, with a factor of two
-    //     in hand (the streak spans +-len/2, so the radius is K/2).
+    //     ⚠⚠ K WAS ALSO THE MAXIMUM BLUR LENGTH UNTIL MB-2l, AND THAT WAS NOT A LAW. This comment
+    //     used to read *"K IS ALSO THE MAXIMUM BLUR LENGTH, and that is a property of the algorithm
+    //     rather than a second meaning bolted onto one knob"*, on the argument that NeighborMax
+    //     searches the 3x3 tile neighbourhood so a tile can only be told about motion within +-K of
+    //     itself. The argument is sound; it just describes the 3x3, not the algorithm. The dilation
+    //     is now a separable cover of R tiles (mbcover.h.fsl), the reach is R*K, and the clamp is
+    //     opts2.z. K is free to be small — which is what stops one tile's velocity from steering
+    //     0.4% of the screen and MB-2h's jitter from stippling the boundary. See mbcover.h.fsl for
+    //     the measured table.
     // y = tile-grid extent x = ceil(delivered.x / K)
     // z = tile-grid extent y = ceil(delivered.y / K)
     // w = OUT/IN SCALE = delivered.x / mvRect.x. Converts a vector written in INPUT-rect pixels into
@@ -137,7 +146,15 @@ STRUCT(MotionBlurParams)
     DATA(float4, opts, None);
     // x = MB-2k: weight the REVEALED-BACKGROUND mixture by proximity. The cbuffer is 256 B (the
     // minimum CBV) and was carrying four float4s, so this fifth one costs nothing.
-    // yzw reserved, cleared by the host with the same before-not-after rule as `opts`.
+    // y = MB-2l: the DILATION'S REACH R, in TILES. The cover passes each search +-R along one axis,
+    //     so a tile hears about motion within R*K of itself. R = 1 reproduces the old 3x3 exactly.
+    // z = MB-2l: THE MAXIMUM STREAK, in DELIVERED PIXELS. Every clamp in the gather reads THIS and
+    //     not K — the tap's streak and this pixel's own streak included, because a weight must
+    //     describe the streak that was actually searched (see mbgather).
+    //     ⚠ IT IS A SEPARATE LANE AND NOT `K * R` RE-DERIVED IN THE SHADER. Two derivations of one
+    //     number are two things that can disagree, and this one is the difference between a blur
+    //     that ends where the object stops and one that ends where the search does.
+    // w reserved, cleared by the host with the same before-not-after rule as `opts`.
     DATA(float4, opts2, None);
 };
 

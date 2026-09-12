@@ -1,0 +1,32 @@
+// mgeHost64 — MB-2 pass 2a: COVER HORIZONTALLY.  The body and the whole argument are in
+// mbcover.h.fsl; this file is the entry point and the axis, and nothing else.
+//
+// pMbTile (the KxK max) -> pMbNeighbor, max over +-R tiles in X.
+
+#include "motionblur.srt.h"
+#include "mbcommon.h.fsl"
+#include "mbcover.h.fsl"
+
+ROOT_SIGNATURE(ComputeRootSignature)
+NUM_THREADS(8, 8, 1)
+void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
+{
+    INIT_MAIN;
+
+    int2 t     = int2(DispatchThreadID.xy);
+    int2 tiles = int2(gMbParams.tile.yz);
+    int  R     = int(gMbParams.opts2.y);
+
+    // The tile grid is not a whole number of 8x8 groups, so the overhang threads are in-bounds for
+    // the RESOURCE (which is alloc/kMbTileKMin-sized) and outside the GRID. Writing them would seed
+    // the next pass with never-computed texels along two edges of the screen.
+    // ⚠ RETURN() ON ITS OWN LINE — fsl.py rewrites it as a STATEMENT and does not see one buried in
+    // a braced one-liner.
+    if (t.x >= tiles.x || t.y >= tiles.y)
+    {
+        RETURN();
+    }
+
+    Write2D(gMbTileOut, t, mbCoverAxis(t, tiles, R, int2(1, 0)));
+    RETURN();
+}
