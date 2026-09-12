@@ -266,6 +266,24 @@ class Params(object):
         # zero, so the bucket cannot starve however wide the mover is.
         self.prox_mode = 'cone'
         self.prox_p = 2.0
+        # ── c11: THE BACKGROUND ESTIMATE IS DIRECTIONAL, AND THAT IS WHAT READS AS SMEARING ──
+        # T16 settled the amount: MB-2j reveals background at a wide mover's silhouette to
+        # within 0.02 of ground truth's own exposure coverage. What it cannot know is WHICH
+        # background, because the right answer is the background AT THIS PIXEL and the mover is
+        # covering it. The mean of the taps along the streak is an unbiased guess, but its error
+        # is 1D: adjacent output pixels along the motion average nearly the SAME background
+        # pixels, so the residue is constant along the motion and varies across it -- stripes
+        # running along the sweep, which is exactly how it was reported ("foliage combed into
+        # regular stripes along the arm's direction").
+        # c11 keeps MB-2j's weights EXACTLY and changes only where a background tap's COLOUR is
+        # read from: a 2D box blur of the source instead of the point sample. Same amount, same
+        # mean, error spread isotropically instead of along one axis.
+        # ⚠ IN 3x3 BOX PASSES, NOT PIXELS -- boxblur(img, times). t passes have support 2t+1 and
+        # an effective sigma of about sqrt(2t/3), and repeated boxes converge on a Gaussian. On the
+        # GPU the same thing is a MIP LEVEL of the chain bloom already builds: level L has support
+        # ~2^L px, so t = 2, 4, 8, 16 sit near mips 1, 2, 3, 4.
+        self.bg_blur = 0          # 0 = c7 exactly
+        self.bg_blur_at = 'tap'   # 'tap' = blur each tap; 'centre' = one blurred read at p
         # EXPERIMENTAL, not in any shader.  See t_arclen: weight each tap by the ARC LENGTH
         # of streak it stands for (|dir|/n) instead of giving every tap weight 1.  A tap is a
         # sampling site, not a vote; 16 taps crammed into a 5 px streak currently outvote 16
@@ -354,6 +372,12 @@ def gather(colour, depth, vel, tilev, P):
     n_half = np.maximum(taps >> 1, 1)
     d_centre = depth[vq[..., 1], vq[..., 0]]
 
+    # c11: the 2D-blurred source the background taps read from. Built once per frame, which is
+    # what makes this affordable on the GPU too -- the host already builds a mip chain for bloom.
+    colour_b = None
+    if P.fix == 'c11' and P.bg_blur > 0:
+        colour_b = boxblur(colour, int(P.bg_blur))
+
     acc = colour.copy()
     wsum = np.ones((H, W), dtype=np.float64)
     accB = np.zeros_like(colour)                 # c9: the revealed-background bucket, by
@@ -422,7 +446,7 @@ def gather(colour, depth, vel, tilev, P):
         # that slice, so its weight is bounded by 1/n and the total by 1. The centre then takes
         # whatever the taps did NOT cover, instead of a fixed 1 that the taps can outvote
         # arbitrarily. That is what makes the answer independent of the tap count.
-        if P.fix in ('c5', 'c6', 'c7', 'c8', 'c9'):
+        if P.fix in ('c5', 'c6', 'c7', 'c8', 'c9', 'c11'):
             a = np.minimum(a * P.gain, 1.0) / np.maximum(n, 1.0)
 
         rel = ds / np.maximum(d_centre, 1e-12) - 1.0
@@ -449,7 +473,19 @@ def gather(colour, depth, vel, tilev, P):
             covB += np.where(isB, a, 0.0)
             a = np.where(isB, 0.0, a)
 
-        acc += colour[spi[..., 1], spi[..., 0]] * a[..., None]
+        tapc = colour[spi[..., 1], spi[..., 0]]
+        if colour_b is not None:
+            # ⚠ BACKGROUND TAPS ONLY. A tap on the mover's own surface is a real observation of a
+            # real surface at a real offset -- blurring THAT would just soften the mover. Only the
+            # background estimate is a guess, and only a guess may be spread out.
+            isB = (rel < -0.01)
+            if P.bg_blur_at == 'centre':
+                bsrc = colour_b[pc[..., 1].astype(np.int64), pc[..., 0].astype(np.int64)]
+            else:
+                bsrc = colour_b[spi[..., 1], spi[..., 0]]
+            tapc = np.where(isB[..., None], bsrc, tapc)
+
+        acc += tapc * a[..., None]
         wsum += a
 
     if P.fix == 'c8':
@@ -472,7 +508,7 @@ def gather(colour, depth, vel, tilev, P):
                  near=w_near, same=w_same, far=w_far, wsum=wsum)
         return out, stats, r
 
-    if P.fix in ('c5', 'c6', 'c7', 'c9'):
+    if P.fix in ('c5', 'c6', 'c7', 'c9', 'c11'):
         # acc/wsum currently carry the centre at weight 1; back it out and re-add it at the
         # weight the taps left unclaimed.
         wt = wsum - 1.0 + covB
@@ -759,6 +795,28 @@ def boxblur(img, times=2):
         a = sum(p[dy:dy + img.shape[0], dx:dx + img.shape[1]]
                 for dy in range(3) for dx in range(3)) / 9.0
     return a
+
+
+def anisotropy(err, dirv, mask):
+    """Is the error COMBED along the motion?  Ratio of rms gradient ACROSS the motion to rms
+    gradient ALONG it, over `mask`.
+
+    Stripes that run along the sweep are the reported artefact, and a stripe is precisely an
+    error that is constant ALONG one axis and varies ACROSS it -- so the ratio is >> 1 when the
+    residue is combed and ~1 when it is isotropic.  This is the metric every earlier attempt at
+    this defect lacked: RMSE cannot tell a smooth error from a striped one of the same size, and
+    `error_structure` (committed flagged as blind) measured smoothness rather than direction."""
+    a = err.mean(axis=2) if err.ndim == 3 else err
+    gy, gx = np.gradient(a)
+    n = math.hypot(float(dirv[0]), float(dirv[1]))
+    if n < 1e-9 or not mask.any():
+        return float('nan')
+    ux, uy = float(dirv[0]) / n, float(dirv[1]) / n
+    along = gx * ux + gy * uy
+    across = -gx * uy + gy * ux
+    ra = math.sqrt(float((along[mask] ** 2).mean()))
+    rc = math.sqrt(float((across[mask] ** 2).mean()))
+    return rc / max(ra, 1e-12)
 
 
 def shown_background(out, cov, blade_rgb, mask, cov_max=0.5):
@@ -1569,6 +1627,91 @@ def t_edgeband(P, outdir):
     print('  means the amount is right and the complaint is about WHICH background -- case (2).')
 
 
+def t_isotropic(P, outdir):
+    hdr('T17  ISOTROPIC BACKGROUND FILL -- same amount, error spread in 2D instead of along one axis')
+    print('  T16 proved the amount of background MB-2j reveals at a mover\'s silhouette is right to')
+    print('  0.02. The right CONTENT is the background at that pixel, which the mover is covering,')
+    print('  so every arm here is guessing. The mean of the taps along the streak is an UNBIASED')
+    print('  guess whose error is 1D: neighbouring output pixels along the motion average nearly')
+    print('  the same background pixels, so the residue is constant along the sweep and varies')
+    print('  across it. That is a stripe, and stripes are what got reported.')
+    print('')
+    print('  c11 keeps MB-2j\'s weights EXACTLY and changes only WHERE a background tap reads its')
+    print('  colour: a 2D box blur of the source instead of the point sample. On the GPU that is a')
+    print('  mip of the chain bloom already builds.')
+    print('')
+    speed, ang = 52.0, 28.0
+    L = scene_foliage(P.W, P.H, speed=speed, ang=ang)
+    gt = ground_truth(L, P.W, P.H, P.shutter, nsub=257)
+    # The mover's own partial band, from ground truth's own coverage: the arm white, all else black.
+    Lc = [Layer(l.name, l.rect, l.z, (1.0, 1.0, 1.0) if l.name == 'arm' else (0.0, 0.0, 0.0),
+                motion=tuple(l.motion), tex=None) for l in L]
+    cov = ground_truth(Lc, P.W, P.H, P.shutter, nsub=257).mean(axis=2)
+    band = (cov > 0.02) & (cov < 0.98)
+    a = math.radians(ang)
+    dirv = (speed * math.cos(a), speed * math.sin(a))
+    keep = (P.fix, P.gain, P.prox_mode, P.prox_p, P.bg_blur, P.bg_blur_at)
+    print('  %d px in the partial band. RMSE and combing are measured THERE, which is where the'
+          % int(band.sum()))
+    print('  defect is; `whole` is the frame, as the standing check that nothing else moved.')
+    print('')
+    print('  arm                     | RMSE band  combing  | RMSE whole   (combing 1.0 = isotropic)')
+    rows = (('MB-2j (the mean)', 'c7', 2.0, 1.0, 0, 'tap'),
+            ('MB-2k (nearest)',  'c9', 2.0, 4.0, 0, 'tap'),
+            ('c11 blur 2  tap',  'c11', 2.0, 1.0, 2,  'tap'),
+            ('c11 blur 4  tap',  'c11', 2.0, 1.0, 4,  'tap'),
+            ('c11 blur 8  tap',  'c11', 2.0, 1.0, 8,  'tap'),
+            ('c11 blur 16 tap',  'c11', 2.0, 1.0, 16, 'tap'),
+            ('c11 blur 32 tap',  'c11', 2.0, 1.0, 32, 'tap'),
+            ('c11 blur 8  centre', 'c11', 2.0, 1.0, 8,  'centre'),
+            ('c11 blur 16 centre', 'c11', 2.0, 1.0, 16, 'centre'),
+            ('c11 blur 32 centre', 'c11', 2.0, 1.0, 32, 'centre'))
+    for name, fx, gn, pp, bb, at in rows:
+        P.fix, P.gain, P.prox_mode, P.prox_p = fx, gn, 'idw', pp
+        P.bg_blur, P.bg_blur_at = bb, at
+        out, _, _ = run_filter(L, P)
+        err = out - gt
+        print('  %-23s |  %.4f   %6.3f   |  %.4f'
+              % (name, rmse(out[band], gt[band]), anisotropy(err, dirv, band), rmse(out, gt)))
+        if outdir:
+            dump(outdir, 'iso_%s' % name.replace(' ', '_'), filt=out, gt=gt,
+                 err=np.abs(err) * 6.0)
+    print('')
+    print('  AND THE COMPETING EXPLANATION, WHICH IS THE ONE THAT WINS: the residue is not combed')
+    print('  because the ESTIMATOR is directional, it is combed because the streak is UNDERSAMPLED.')
+    print('  32 taps over an 87 px streak is one sample every 2.7 px against foliage 3-11 px wide,')
+    print('  so each tap lays down a discrete displaced copy and the copies are spaced ALONG the')
+    print('  motion -- which is what `combing` below 1.0 is measuring.')
+    print('')
+    print('  arm     maxTaps  tapJit | RMSE band  combing   tap spacing px')
+    keept = (P.max_taps, P.tap_jitter)
+    for fx, gn, pp, nm in (('c7', 2.0, 1.0, 'MB-2j'), ('c9', 2.0, 4.0, 'MB-2k')):
+        for mt in (16, 32, 64, 128):
+            for tj in (1.0, 0.0):
+                P.fix, P.gain, P.prox_mode, P.prox_p = fx, gn, 'idw', pp
+                P.bg_blur, P.bg_blur_at = 0, 'tap'
+                P.max_taps, P.tap_jitter = mt, tj
+                out, st, _ = run_filter(L, P)
+                print('  %-6s  %5d   %4.1f   |  %.4f    %6.3f   %.2f'
+                      % (nm, mt, tj, rmse(out[band], gt[band]),
+                         anisotropy(out - gt, dirv, band),
+                         st['max_len'] / max(st['avg_taps'], 1.0)))
+    P.max_taps, P.tap_jitter = keept
+    P.fix, P.gain, P.prox_mode, P.prox_p, P.bg_blur, P.bg_blur_at = keep
+    print('')
+    print('  MEASURED: MB-2j at 64 taps reaches RMSE 0.0454 AND combing 0.964, and 128 buys')
+    print('  nothing further (0.0454 / 1.005) -- it SATURATES at ~1.4 px spacing. The blur rows')
+    print('  above reach the same combing at a WORSE RMSE (0.0479), so c11 is a dead end: it buys')
+    print('  with error what sampling density gives for free. tapJitter is doing its job on the')
+    print('  way there (16 taps: combing 1.101 dithered against 0.641 in phase) -- it converts the')
+    print('  comb into grain, which is why undersampling reads as noise rather than as a ladder.')
+    print('')
+    print('  READ IT AS: RMSE says how WRONG the guess is, combing says whether being wrong LOOKS')
+    print('  like a smear. A row that holds RMSE and drops combing toward 1.0 is the trade being')
+    print('  bought; a row that drops combing by raising RMSE has only swapped one defect for a')
+    print('  bigger one, and `centre` rows that collapse are the estimate eating the mover itself.')
+
+
 def t_tilegrid(P, outdir):
     hdr('T7  TILE GRID -- MB-2h jitter, on a body whose velocity VARIES (a rigid rect cannot show it)')
     L = scene_swing(P.W, P.H)
@@ -1691,7 +1834,7 @@ def main():
     ap.add_argument('--gain', type=float, default=1.0)
     ap.add_argument('--tapjitter', type=float, default=1.0,
                     help='RIG ONLY: scale the per-pixel tap phase hash (0 = every pixel in phase)')
-    ap.add_argument('--fix', default='ship', choices=('ship', 'c1', 'c5', 'c6', 'c7', 'c8', 'c9'),
+    ap.add_argument('--fix', default='ship', choices=('ship', 'c1', 'c5', 'c6', 'c7', 'c8', 'c9', 'c11'),
                     help='which candidate weighting to run')
     ap.add_argument('--arclen', action='store_true',
                     help='EXPERIMENT: weight taps by the arc length they represent')
@@ -1756,6 +1899,8 @@ def main():
         t_foliage(P, a.dump)
     if s in ('all', 'stipple'):
         t_stipple(P, a.dump)
+    if s in ('all', 'isotropic'):
+        t_isotropic(P, a.dump)
     if s in ('all', 'edgeband'):
         t_edgeband(P, a.dump)
     if s in ('all', 'reach'):

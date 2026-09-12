@@ -17058,7 +17058,28 @@ namespace {
     // which reads as a ghost train rather than a smear. Measured avgTaps 17.8-27.7 at a cap of 32 on
     // a busy interior, so the cap is not always binding and the cost is paid only by genuinely fast
     // pixels. Cost of the change, validation build, whole screen in motion: 0.65 -> 1.0 ms.
-    uint32_t g_mbMaxTaps = 32;
+    //
+    // ⚠⚠ RAISED AGAIN TO 64 BY MB-2n, AND THIS TIME IT IS A LOOK FIX WITH A MEASURED MECHANISM.
+    // The remaining foliage complaint — *"the foliage combed into regular stripes along the arm's
+    // direction"* — is not the background ESTIMATOR being directional. It is the streak being
+    // UNDERSAMPLED: 32 taps over an 87 px streak is one sample every 2.7 px against foliage 3-11 px
+    // wide, so every tap lays down a discrete displaced copy of a high-contrast bar and the copies
+    // are spaced along the motion. mbsynth T17 measures exactly that, with a metric built for it
+    // (`anisotropy`: rms gradient ACROSS the motion over rms gradient ALONG it, 1.0 = isotropic):
+    //     maxTaps   16      32      64     128        (MB-2j, foliage, 87 px streak)
+    //     RMSE    0.0518  0.0470  0.0454  0.0454
+    //     combing  1.101   0.761   0.964   1.005
+    //     spacing  5.42    2.71    1.35    1.00  px
+    // 64 reaches BOTH the RMSE floor and isotropy, and 128 buys nothing — it saturates at ~1.4 px,
+    // i.e. at the point where consecutive taps stop skipping over the background's own features.
+    // The 2D-blurred background fill built to fight the same artefact (c11) reaches the same
+    // isotropy at a WORSE error (0.0479), so it is a dead end kept in the rig: it pays with error
+    // for what sampling density gives free.
+    //
+    // ⚠ THE COST IS LINEAR AND ONLY ON SATURATED PIXELS, and MB-2l already cut the population that
+    // pays it (blurred 46.8% -> 34.3% of the frame in T15). `mb=` on the gpu split is the check;
+    // this is a LIVE knob, so 32 is one slider away if the millisecond is not worth it.
+    uint32_t g_mbMaxTaps = 64;
     // THE TILE SIZE. It used to be two things at once — the dilation's granularity AND the maximum
     // blur length — and the note here defended that as "by construction rather than by overloading",
     // because a 3x3 NeighborMax searches one tile in each direction so K was exactly how far a pixel

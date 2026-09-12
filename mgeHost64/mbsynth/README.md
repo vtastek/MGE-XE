@@ -57,6 +57,7 @@ streak length to 3 px in 239 — it is not a substitute for a GPU capture.
 | T14 | **the halftone at a mover's silhouette** | **`mbTileJitter` flips a binary gate** |
 | T15 | **small tiles AND long streaks** | **MB-2l, shipped** — reach is R tiles, not 1 |
 | T16 | is a wide mover's revealed background EARNED? | **yes, to 0.02** — the amount is right |
+| T17 | why does the residue read as a SMEAR? | **the streak is undersampled** — MB-2n |
 
 `--explain X,Y` prints the tap-by-tap arithmetic for one pixel: which axis each tap walked, what
 it landed on, and all three weight terms. That is what turned T3 from a correlation into a
@@ -203,6 +204,50 @@ streaks along the motion, and the nearest sample (MB-2k) synthesises confident h
 out of an estimate that carries no information (T12's frequency sweep). Both are guesses about the
 same missing data. The lever that exists is a **colour history** — one frame earlier the arm was a
 streak-length back and that background WAS visible — which is what the published pipelines use.
+
+## What T17 found — the combing is undersampling, not the estimator
+
+Having established (T16) that the amount of revealed background is right and its content is a
+guess, the obvious next move was to make the guess's error isotropic instead of directional: keep
+MB-2j's weights exactly and read background taps from a 2D blur of the source (`c11`). That is
+measurable, so it was measured — against a metric built for the artefact, `anisotropy`, the rms
+image gradient ACROSS the motion over the rms gradient ALONG it, where 1.0 is isotropic and the
+reported "stripes along the arm's direction" show up as a value **below** 1 (a train of displaced
+copies varies along the motion).
+
+It works, and it is the wrong fix. On the foliage scene, 67 486 px in the mover's partial band:
+
+| arm | RMSE band | combing |
+|---|---|---|
+| MB-2j (the mean) | 0.0470 | 0.761 |
+| c11, blur 4, per tap | 0.0474 | **1.004** |
+| c11, blur 8, per tap | 0.0479 | 1.015 |
+| c11, blur 8, at centre | 0.1253 | 0.739 |
+
+and the competing explanation wins outright:
+
+| MB-2j maxTaps | 16 | 32 | 64 | 128 |
+|---|---|---|---|---|
+| RMSE band | 0.0518 | 0.0470 | **0.0454** | 0.0454 |
+| combing | 1.101 | 0.761 | **0.964** | 1.005 |
+| tap spacing | 5.42 px | 2.71 px | 1.35 px | 1.00 px |
+
+32 taps over an 87 px streak is one sample every 2.7 px against foliage 3–11 px wide, so every tap
+lays down a discrete displaced copy and the copies are spaced along the motion. **64 taps reaches
+both the RMSE floor and isotropy; 128 buys nothing.** It saturates at ~1.4 px — the spacing at which
+consecutive taps stop skipping over the background's own features. c11 reaches the same isotropy at
+a worse error, so it pays with error for what sampling density gives free, and is kept only as a
+measured dead end (`--fix c11`, `bg_blur`).
+
+`tapJitter` is visible doing its job on the way there: at 16 taps, combing 1.101 dithered against
+0.641 in phase — it converts the comb into grain, which is why undersampling reads as noise rather
+than as a ladder.
+
+⚠ **The two probes disagree about MB-2k and the disagreement is not resolved.** The shown-background
+probe (T12) says nearest-sample is worse on foliage; this composited band RMSE says it is better
+(0.0369 vs 0.0470 at 32 taps). They measure different things — the estimate in isolation against the
+final pixel — and MB-2k's combing gets *worse* as taps rise (0.889 → 1.339 → 1.543) where MB-2j's
+improves. `mbProv` stays off on that last point alone, and it is a live knob.
 
 ## What it does NOT show
 
