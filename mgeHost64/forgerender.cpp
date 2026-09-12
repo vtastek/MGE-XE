@@ -17042,18 +17042,24 @@ namespace {
     // multiplies by that exposure. The streak length in pixels then depends only on how fast the
     // object is actually moving and how long the shutter is open — identical at 30 fps and at 165.
     //
-    // 180 at 30 fps = a 16.7 ms exposure, which is the cinematic default and what ships. Halve
-    // mbShutterFps to double every streak; the `mb:` heartbeat reports `maxLen` in delivered pixels,
-    // so "is a mace head smearing three times its own width" is a number rather than an impression.
+    // 180 deg is the film convention: the shutter is open for half of the camera's frame interval.
+    // The `mb:` heartbeat reports `maxLen` in delivered pixels, so "is a mace head smearing three
+    // times its own width" is a number rather than an impression.
     float    g_mbShutter = 180.0f;
-    // The framerate the shutter angle is quoted AT — the other half of the exposure time, and the
-    // knob to reach for when the whole effect is too weak or too strong. It is deliberately NOT the
-    // actual framerate: that is measured, and dividing by it is what makes the look independent of
-    // the machine.
-    //   30 -> 180 deg = 16.7 ms  (film; ships)
-    //   60 -> 180 deg =  8.3 ms  (subtle)
+    // ⚠⚠ THE CAMERA'S FRAME RATE, NOT THE RENDERER'S, AND THAT DISTINCTION IS THE WHOLE KNOB.
+    // Together with the angle this is an EXPOSURE TIME — `(angle/360) / thisFps` seconds — which the
+    // pass divides by the MEASURED frame interval, so the streak depends on how fast something
+    // really moves and not on how fast the machine runs. Setting this to the renderer's own rate
+    // would put the framerate back in: at 165 fps a "half frame" exposure is 3 ms and the effect
+    // nearly vanishes, which is the framerate dependence the exposure model was built to remove.
+    //   24 -> 180 deg = 20.8 ms  (1/48 s — THE FILM CONVENTION, and what ships)
+    //   30 -> 180 deg = 16.7 ms  (the 30 fps TV/game variant; what shipped before)
+    //   60 -> 180 deg =  8.3 ms  (a SHORT shutter — broadcast sport, not film)
     //   15 -> 180 deg = 33.3 ms  (heavy)
-    float    g_mbShutterFps = 30.0f;
+    // ⚠ 30 WAS LABELLED "film" HERE AND IN THE PANEL AND IT IS NOT — cinema runs 24 fps, so a 180
+    // degree shutter is 1/48 s. The mislabel is how a request to *match film convention* nearly
+    // became a request to SHORTEN the exposure; the true convention is 25% LONGER than 30 fps gives.
+    float    g_mbShutterFps = 24.0f;
     // The CAP on the adaptive tap count. The count itself is one tap per pixel of streak, so this
     // only binds on genuinely fast motion; at K = 20 it also sets the worst-case tap SPACING
     // (20/16 = 1.25 px), which is what decides whether a long streak reads as a smear or as beads.
@@ -21433,8 +21439,10 @@ namespace {
           // rather than on how fast the machine happens to be running. The first build multiplied
           // the per-frame vector by `angle/360` and called it framerate-independent; it was not, and
           // at 110 fps it produced 3.7x less blur than the same shutter at 30.
-          // LOWER = MORE BLUR (a longer exposure). 30 is film; 15 is heavy; 60 is subtle.
-          t.sliderF("...quoted at this framerate — LOWER = MORE BLUR (30 = 16.7ms exposure)",
+          // LOWER = MORE BLUR (a longer exposure). ⚠ THIS IS THE CAMERA'S RATE, NOT THE RENDERER'S:
+          // 24 is the film convention (180 deg = 1/48 s = 20.8 ms), 30 is the TV/game variant,
+          // 60 is a SHORT shutter rather than a subtle film one, 15 is heavy.
+          t.sliderF("...quoted at this CAMERA framerate — LOWER = MORE BLUR (24 = film, 20.8ms)",
                     &g_mbShutterFps, 10.0f, 120.0f, 1.0f);
           // ⚠⚠ THE FLOOR IS NOT AN OPTIMISATION AND MUST NOT BE DRAGGED TO 0. Only a BIT-IDENTICAL
           // camera frame produces exact zeros, and MW's camera matrix is bit-stable on a MINORITY of
