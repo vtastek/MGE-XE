@@ -249,6 +249,44 @@ probe (T12) says nearest-sample is worse on foliage; this composited band RMSE s
 final pixel — and MB-2k's combing gets *worse* as taps rise (0.889 → 1.339 → 1.543) where MB-2j's
 improves. `mbProv` stays off on that last point alone, and it is a live knob.
 
+## What c12 found — the mirror is already what a per-tap filter does
+
+CoD:AW reconstructs the background occluded by a foreground object by **mirroring the weights
+across the motion direction**: for every tap at +t there is one at −t, and where +t is occluded the
+colour is taken from −t at the occluded tap's own weight, so the weight profile stays symmetric
+(which is what keeps the silhouette gradient right) while the colour comes from where the background
+is actually visible. `--fix c12` implements exactly that on top of MB-2j, amount untouched.
+
+Measured at 64 taps, against MB-2j and MB-2k:
+
+| arm | RMSE band | combing | RMSE whole | coverage err |
+|---|---|---|---|---|
+| MB-2j (mean) | 0.0454 | 0.964 | 0.0191 | +0.0089 |
+| MB-2k (nearest) | 0.0350 | 1.339 | 0.0149 | +0.0089 |
+| **c12 (mirror)** | **0.0453** | **0.987** | **0.0191** | +0.0089 |
+
+and on the background estimate alone, by background frequency (16 px blade):
+
+| background | MB-2j | MB-2k | c12 mirror |
+|---|---|---|---|
+| sinusoid s=11 | 0.0781 | 0.0365 | 0.0727 |
+| sinusoid s=4 | 0.0625 | 0.0946 | 0.0653 |
+| sinusoid s=2 | 0.0651 | 0.0902 | 0.0652 |
+
+**It is a no-op, and that is a result rather than a failure.** Mirroring exists to fill a background
+LAYER that has been reconstructed across the foreground's whole footprint, including where the
+foreground occludes it — CoD keeps foreground and background as separate layers with an explicit
+alpha, so the occluded part of the background layer has to be filled with *something*. MGE has no
+such layer: it weights per tap, so a tap that lands on the mover contributes zero background instead
+of contributing wrong background, and the background bucket is *already* sourced only from the side
+where background is visible, distance-weighted. The mirror re-sources weight that was already coming
+from the same place.
+
+So the wash in a mover's partial band is the irreducible part: the amount is right (T16), the
+content is unknowable from one frame, and the published trick for improving it is structurally
+already present. The levers that remain are a colour history (correct, costly) and the **exposure
+time**, which sets how wide the band is at all.
+
 ## What it does NOT show
 
 ⚠ **T7's null had a cause, and it was the rig, not the scene — found 2026-09-11 by T14.** The rig

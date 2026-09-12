@@ -446,7 +446,7 @@ def gather(colour, depth, vel, tilev, P):
         # that slice, so its weight is bounded by 1/n and the total by 1. The centre then takes
         # whatever the taps did NOT cover, instead of a fixed 1 that the taps can outvote
         # arbitrarily. That is what makes the answer independent of the tap count.
-        if P.fix in ('c5', 'c6', 'c7', 'c8', 'c9', 'c11'):
+        if P.fix in ('c5', 'c6', 'c7', 'c8', 'c9', 'c11', 'c12'):
             a = np.minimum(a * P.gain, 1.0) / np.maximum(n, 1.0)
 
         rel = ds / np.maximum(d_centre, 1e-12) - 1.0
@@ -460,6 +460,32 @@ def gather(colour, depth, vel, tilev, P):
             wN += np.where(isN, a, 0.0)
             accR += colour[spi[..., 1], spi[..., 0]] * np.where(isN, 0.0, a)[..., None]
             wR += np.where(isN, 0.0, a)
+
+        if P.fix == 'c12':
+            # ── MIRRORED BACKGROUND RECONSTRUCTION (CoD:AW's rule) ────────────────────────
+            # For every tap at +t there is a mirrored tap at -t. Where the tap AT +t is
+            # occluded by the mover, the background it would have shown is taken from -t
+            # instead, at the OCCLUDED tap's own weight -- so the weight profile stays
+            # symmetric (which is what keeps the silhouette gradient right) while the colour
+            # comes from wherever the background is actually visible.
+            # ⚠ THE AMOUNT IS UNTOUCHED. covB is still the weight of the taps that genuinely
+            # saw background, exactly as MB-2j computes it and T16 verified against ground
+            # truth's own coverage. Only the MIXTURE is re-sourced.
+            isB = (rel < -0.01)
+            spm = np.trunc(pc - off + 0.5).astype(np.int64)
+            spm[..., 0] = np.clip(spm[..., 0], 0, deliver_n[0] - 1)
+            spm[..., 1] = np.clip(spm[..., 1], 0, deliver_n[1] - 1)
+            dqm = mb_velocity_texel(spm.astype(np.float64), P.delivered, P.mv_rect)
+            dsm = depth[dqm[..., 1], dqm[..., 0]]
+            relm = dsm / np.maximum(d_centre, 1e-12) - 1.0
+            isBm = (relm < -0.01) & (~isB)
+            cB = np.where(isB[..., None], colour[spi[..., 1], spi[..., 0]],
+                          colour[spm[..., 1], spm[..., 0]])
+            use = (isB | isBm)
+            accB += cB * (a * np.where(use, 1.0, 0.0))[..., None]
+            wB += a * np.where(use, 1.0, 0.0)
+            covB += np.where(isB, a, 0.0)
+            a = np.where(isB, 0.0, a)
 
         if P.fix == 'c9':
             isB = (rel < -0.01)
@@ -508,16 +534,16 @@ def gather(colour, depth, vel, tilev, P):
                  near=w_near, same=w_same, far=w_far, wsum=wsum)
         return out, stats, r
 
-    if P.fix in ('c5', 'c6', 'c7', 'c9', 'c11'):
+    if P.fix in ('c5', 'c6', 'c7', 'c9', 'c11', 'c12'):
         # acc/wsum currently carry the centre at weight 1; back it out and re-add it at the
         # weight the taps left unclaimed.
         wt = wsum - 1.0 + covB
         w_centre = np.maximum(0.0, 1.0 - wt)
         acc = (acc - colour) + colour * w_centre[..., None]
         wsum = wt + w_centre
-    if P.fix == 'c9':
-        # The background comes in with the coverage it earned, but wearing the colour the
-        # NEAREST unoccluded sample of it had, rather than the mean of the whole streak.
+    if P.fix in ('c9', 'c12'):
+        # The background comes in with the coverage it earned, but wearing the colour its own
+        # estimator chose: c9 the NEAREST unoccluded sample, c12 the mirrored reconstruction.
         bg = accB / np.maximum(wB, 1e-12)[..., None]
         acc = acc + bg * covB[..., None]
     out = acc / np.maximum(wsum, 1e-12)[..., None]
@@ -1834,7 +1860,7 @@ def main():
     ap.add_argument('--gain', type=float, default=1.0)
     ap.add_argument('--tapjitter', type=float, default=1.0,
                     help='RIG ONLY: scale the per-pixel tap phase hash (0 = every pixel in phase)')
-    ap.add_argument('--fix', default='ship', choices=('ship', 'c1', 'c5', 'c6', 'c7', 'c8', 'c9', 'c11'),
+    ap.add_argument('--fix', default='ship', choices=('ship', 'c1', 'c5', 'c6', 'c7', 'c8', 'c9', 'c11', 'c12'),
                     help='which candidate weighting to run')
     ap.add_argument('--arclen', action='store_true',
                     help='EXPERIMENT: weight taps by the arc length they represent')
