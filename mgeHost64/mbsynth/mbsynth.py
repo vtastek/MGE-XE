@@ -282,6 +282,27 @@ class Params(object):
         # an effective sigma of about sqrt(2t/3), and repeated boxes converge on a Gaussian. On the
         # GPU the same thing is a MIP LEVEL of the chain bloom already builds: level L has support
         # ~2^L px, so t = 2, 4, 8, 16 sit near mips 1, 2, 3, 4.
+        # c13: refine the reflection's pivot to the SUB-TAP crossing. t0 is the offset of the
+        # first tap that saw background, so it is only known to one tap SPACING -- and the
+        # reflection DOUBLES that error, so neighbouring pixels fetch up to 2 spacings apart and
+        # the estimate injects high-frequency detail that ground truth does not have. The tap one
+        # step closer to the centre was foreground, so the silhouette is bracketed: its midpoint
+        # is the estimate with no other information, and it costs one subtraction.
+        # MEASURED AND REJECTED: excessHF +0.00760 against +0.00617 at 64 taps, i.e. the
+        # refinement makes the invented detail WORSE while moving RMSE 0.0591 -> 0.0584. The
+        # quantisation of t0 is not what is left at 64 taps. Kept as the A/B; default off.
+        self.refl_mid = False
+        # ── A TAP ON ANOTHER PART OF THE SAME MOVER IS NOT BACKGROUND ────────────────────
+        # The background test is purely depth: `relD < -0.01`, i.e. more than 1% of the view
+        # distance further away. On a first-person hand that is millimetres -- KNUCKLES clear it
+        # against each other -- so a tap landing on another part of the same hand is classified
+        # as revealed background, and mode 2 then pivots its reflection on a SELF-OCCLUSION
+        # boundary instead of on the silhouette and fetches twice that far: arm, not background,
+        # arriving where background belongs. That is invented detail with a mechanism.
+        # The dial-free test is VELOCITY, not depth: two parts of one rigid mover are displaced
+        # identically, so if the tap's velocity differs from ours by less than a pixel ACROSS THE
+        # WHOLE EXPOSURE they are the same thing moving, whatever their depths say.
+        self.same_mover = True
         self.bg_blur = 0          # 0 = c7 exactly
         self.bg_blur_at = 'tap'   # 'tap' = blur each tap; 'centre' = one blurred read at p
         # EXPERIMENTAL, not in any shader.  See t_arclen: weight each tap by the ARC LENGTH
@@ -481,6 +502,8 @@ def gather(colour, depth, vel, tilev, P):
             # the hard seam is made of), and it is one extra fetch per pixel rather than per
             # tap -- the whole loop only has to remember the nearest background hit.
             isB = (rel < -0.01)
+            if P.same_mover:
+                isB = isB & (np.linalg.norm(vs - v_self, axis=-1) * shutter >= 1.0)
             closer = isB & (dist < near_d)
             near_d = np.where(closer, dist, near_d)
             near_off = np.where(closer[..., None], off, near_off)
@@ -569,7 +592,15 @@ def gather(colour, depth, vel, tilev, P):
         wsum = wt + w_centre
     if P.fix == 'c13':
         # The reflected fetch, once, at twice the nearest background offset.
-        refl = pc + 2.0 * near_off
+        # 2 * (the crossing), where the crossing is half a tap spacing inside the first
+        # background tap. Falls back to 2*t0 when refl_mid is off, which is the A/B.
+        if P.refl_mid:
+            step = ln / np.maximum(taps.astype(np.float64), 1.0)
+            nd = np.maximum(near_d, 1e-6)
+            pivot = near_off * (1.0 - (0.5 * step / nd))[..., None]
+        else:
+            pivot = near_off
+        refl = pc + 2.0 * pivot
         ri = np.trunc(refl + 0.5).astype(np.int64)
         ri[..., 0] = np.clip(ri[..., 0], 0, deliver_n[0] - 1)
         ri[..., 1] = np.clip(ri[..., 1], 0, deliver_n[1] - 1)

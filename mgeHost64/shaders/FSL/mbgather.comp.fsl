@@ -376,8 +376,26 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
             // ⚠ IT TRADES A LOW-FREQUENCY ERROR FOR A SMALLER HIGH-FREQUENCY ONE. A sharper estimate
             // depends on WHICH taps landed where, so the tap hash decides more of it: dither
             // 0.0074 -> 0.0296. Whole error on the mover's pixels still falls 0.1849 -> 0.0544.
+            // ⚠⚠ A TAP ON ANOTHER PART OF THE SAME MOVER IS NOT REVEALED BACKGROUND, AND DEPTH
+            // CANNOT TELL. The background test is `relD < -0.01`, i.e. more than 1% of the view
+            // distance further away — which on a first-person hand is MILLIMETRES, so one KNUCKLE
+            // clears it against the next. Mode 2 then pivots its reflection on a SELF-OCCLUSION
+            // boundary instead of on the silhouette and fetches twice that far, delivering hand
+            // where background belongs: invented detail, with a mechanism, exactly where it was
+            // reported ("invented detail is biting on the hand where one knuckle is against
+            // another"). Measured on a hand whose knuckles sit 6% nearer, moving as one, over
+            // foliage: RMSE 0.0589 -> 0.0391 and excess high-frequency energy +0.00854 -> +0.00471.
+            //
+            // ⚠ THE TEST IS VELOCITY, NOT A LOOSER DEPTH EPSILON, and that is the whole point:
+            // *"we need it for foliage meters away"*. Static foliage differs from a fast hand by
+            // far more than a pixel across the exposure and stays background however deep it is;
+            // two parts of one rigid mover are displaced IDENTICALLY and stop being background
+            // however their depths compare. A depth epsilon loose enough to span a fist would also
+            // swallow real background just behind it. Sub-pixel over the WHOLE exposure is the
+            // dial-free form of "these are the same thing moving".
+            bool sameMover = (length(vs - vSelf) * shutter) < 1.0f;
             float4 tapC = LoadTex2D(gMbColor, NO_SAMPLER, spi, 0);
-            if (bgSplit && relD < -0.01f)
+            if (bgSplit && relD < -0.01f && !sameMover)
             {
                 if (bgMode == 1u)
                 {
