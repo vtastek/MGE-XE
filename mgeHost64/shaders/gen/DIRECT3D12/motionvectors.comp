@@ -1003,16 +1003,16 @@ STRUCT(MvParams)
 
 
     float4 allocParams;
-#line 132 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/motionvectors.srt.h"
+#line 141 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/motionvectors.srt.h"
     float4 opts;
-#line 133
+#line 142
 };
 
         CBUFFER(MvParams) gMvParams :  register(b0,space0);
 
         Tex2D(float) gMvDepth :  register(t1,space0);
         WTex2D(float2) gMvOut :  register(u2,space0);
-#line 161 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/motionvectors.srt.h"
+#line 170 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/motionvectors.srt.h"
         RWBuffer(uint) gMvStats :  register(u3,space0);
 
 
@@ -1122,9 +1122,15 @@ void CS_MAIN( uint3 DispatchThreadID : SV_DISPATCHTHREADID )
 
 
 
-    Write2D(gMvBlurOut, px, (gMvParams.opts.z > 0.5f) ? float2(0.0f, 0.0f) : mv);
+
+
+
+    if (gMvParams.opts.w < 0.5f)
+    {
+        Write2D(gMvBlurOut, px, (gMvParams.opts.z > 0.5f) ? float2(0.0f, 0.0f) : mv);
+    }
     Write2D(gMvReactive, px, reactive);
-#line 200 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/motionvectors.comp.fsl"
+#line 206 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/motionvectors.comp.fsl"
     {
         float m = length(mv);
         uint mu = asuint(m);

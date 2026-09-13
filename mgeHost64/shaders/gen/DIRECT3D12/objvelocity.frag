@@ -992,9 +992,18 @@ STRUCT(ObjVelParams)
 
     float4x4 prevViewProjRel;
     float4 screenParams;
-#line 62 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/objvelocity.srt.h"
+#line 65 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/objvelocity.srt.h"
     float4 opts;
-#line 63
+
+
+
+
+
+
+
+
+    float4 opts2;
+#line 75
 };
 
 STRUCT(ObjVelBatch)
@@ -1010,9 +1019,9 @@ STRUCT(ObjVelBatch)
 
 
     float4x4 prevWorlds[ 448 ];
-#line 78
+#line 90
 };
-#line 103 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/objvelocity.srt.h"
+#line 115 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/objvelocity.srt.h"
 STRUCT(ObjVelBones)
 {
 
@@ -1021,7 +1030,7 @@ STRUCT(ObjVelBones)
 
 
     float4x4 bones[ 1024 ];
-#line 111
+#line 123
 };
 
         CBUFFER(ObjVelParams) gObjVelParams :  register(b0,space3);
@@ -1047,11 +1056,11 @@ STRUCT(ObjVelBones)
 
 
         CBUFFER(ObjVelBones) gObjVelBonesCur :  register(b4,space3);
-#line 154 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/objvelocity.srt.h"
+#line 166 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/objvelocity.srt.h"
         CBUFFER(ObjVelBones) gObjVelBonesPrev :  register(b5,space3);
-#line 176 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/objvelocity.srt.h"
-        WTex2D(float) gObjVelDepthOut :  register(u6,space3);
 #line 188 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/objvelocity.srt.h"
+        WTex2D(float) gObjVelDepthOut :  register(u6,space3);
+#line 200 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/objvelocity.srt.h"
         WTex2D(float2) gObjVelBlurOut :  register(u7,space3);
 #line 13 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/objvelocity.frag.fsl"
 
@@ -1114,8 +1123,12 @@ void PS_MAIN( PSInput In )
         float thr = gObjVelParams.opts.w;
         blurV = (dot(mvRel, mvRel) > thr * thr) ? mv : float2(0.0f, 0.0f);
     }
-    Write2D(gObjVelBlurOut, px, blurV);
-#line 154 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/objvelocity.frag.fsl"
+
+    if (gObjVelParams.opts2.x < 0.5f)
+    {
+        Write2D(gObjVelBlurOut, px, blurV);
+    }
+#line 158 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/objvelocity.frag.fsl"
     if (gObjVelParams.opts.y > 0.5f)
     {
         Write2D(gObjVelDepthOut, px, 1.0f);
