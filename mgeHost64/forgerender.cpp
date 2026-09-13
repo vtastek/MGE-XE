@@ -17088,8 +17088,25 @@ namespace {
     //
     // ⚠ THE COST IS LINEAR AND ONLY ON SATURATED PIXELS, and MB-2l already cut the population that
     // pays it (blurred 46.8% -> 34.3% of the frame in T15). `mb=` on the gpu split is the check;
-    // this is a LIVE knob, so 32 is one slider away if the millisecond is not worth it.
-    uint32_t g_mbMaxTaps = 64;
+    // this is a LIVE knob.
+    //
+    // ⚠⚠ 16, NOT 64, AND THE RULE IS THE ONE NUMBER TO REMEMBER: **THE CAP IS maxLen / 1.5**.
+    // T17's saturation is a SPACING, not a count -- 1.4 px is where consecutive taps stop skipping
+    // over the background's own features, and the spacing is maxLen/taps. 64 was right for the 96 px
+    // reach it shipped beside; at the settled 24 px reach (mbTileK 24 x mbTileReach 1) the same
+    // spacing needs 16, and 64 there would be four times the cost for taps 0.4 px apart, which is
+    // finer than the image it is sampling. Raise mbTileReach and this must rise with it.
+    //
+    // ⚠⚠ STILL OPEN, AND 16 IS WHERE IT IS PARKED RATHER THAN WHERE IT LANDED. From play: the
+    // expectation is that the dithered look SOFTENS as the count rises, and it does not do so
+    // convincingly. Part of that was mode 2 inventing detail at a self-occlusion boundary, which
+    // the sameMover guard in mbgather fixes and which more taps only sharpened -- but the tap
+    // behaviour itself is not satisfactory and was deferred deliberately, not resolved. What is
+    // measured so far: excess high-frequency energy over ground truth falls 16 -> 32 -> 64 -> 128
+    // as +0.00966 / +0.00294 / +0.00061 / +0.00043 for the streak mean, i.e. the SPACING argument
+    // holds on the rig's scenes; whatever the remaining complaint is, that sweep does not contain
+    // it, so the next step is a scene or a metric that does rather than another value for this.
+    uint32_t g_mbMaxTaps = 16;
     // THE TILE SIZE. It used to be two things at once — the dilation's granularity AND the maximum
     // blur length — and the note here defended that as "by construction rather than by overloading",
     // because a 3x3 NeighborMax searches one tile in each direction so K was exactly how far a pixel
@@ -17121,7 +17138,18 @@ namespace {
     // Cost is 2*(2R+1)/K^2 taps per delivered pixel — 0.031 at 24/4, against the tile max's own 1.0
     // — so the ceiling here is not about cost. It is that R*K is a REACH, and a reach past what any
     // object in the frame actually travels only widens the search for nothing.
-    uint32_t g_mbTileReach = 4;
+    //
+    // ⚠⚠ SETTLED AT 1 BY EYE, WHICH MAKES THE MAXIMUM STREAK 24 px, AND THAT IS A LOOK CHOICE WITH
+    // A CONSEQUENCE WORTH STATING: a fast swing wants far more than 24 px at a 20.8 ms exposure, so
+    // `maxLen` will sit PINNED at the cap and the blur is deliberately shorter than the exposure
+    // calls for. Every earlier note in this file treats a pinned maxLen as a defect to fix by
+    // raising the reach — that was true while the complaint was "too subtle"; it is not true now
+    // that the complaint is the artefacts a long streak drags with it (the revealed-background band
+    // is HALF THE STREAK wide, so 24 px of reach is also 12 px of guessed background instead of 48).
+    // MB-2l's separation is what makes this configuration reachable at all: the tile stays fine at
+    // 24 px while the streak is capped short, which before MB-2l would have meant K = 24 tiles AND
+    // a 24 px cap as one inseparable setting.
+    uint32_t g_mbTileReach = 1;
     // ⚠⚠ THE VELOCITY FLOOR, IN DELIVERED PIXELS, AND IT IS MANDATORY RATHER THAN AN OPTIMISATION.
     // Only a BIT-IDENTICAL camera frame reaches exact zero (motionvectors.comp's parked short
     // circuit, whose lane MB-2 step 0 had to un-break), and MW's camera matrix is bit-stable on a
@@ -17325,7 +17353,16 @@ namespace {
     //   0 = the streak MEAN     (MB-2j; unbiased, blurs, combs along the sweep)
     //   1 = the NEAREST sample  (MB-2k; sharp, invents contrast where the nearest is far)
     //   2 = REFLECT at the edge (MB-2o; no repeats, continuous at the silhouette)
-    uint32_t g_mbBgMode = 0;
+    //
+    // ⚠⚠ DEFAULTS TO 2 ON THE ONE INSTRUMENT THAT CAN JUDGE IT — a person looking at the scene.
+    // From play, all three in turn on an arm sweeping past a tree: *"0 is seam. 1 is just smear, no
+    // seam. 2 is no smear, no seam. 2 is mostly superior."* The rig disagrees on RMSE and always
+    // will (0.0591 against the mean's 0.0454 on foliage), because RMSE rewards a smoothed guess over
+    // a sharp one whenever the sample is further off than the background's own correlation length —
+    // it is scoring the error's SIZE while both complaints, the seam and the repeats, are about its
+    // STRUCTURE. This is the one dial in the milestone settled by eye, and it is settled by eye
+    // BECAUSE the measurements were run first and came back blind, not instead of running them.
+    uint32_t g_mbBgMode = 2;
     // Whether the pass ran this frame — written from the ONE gate, read by the resolve's set index
     // and by the heartbeat. Same rule as g_lastUpscaleRan beside it: a second derivation of "did it
     // run" is a second thing that can disagree with the frame.
