@@ -78,6 +78,12 @@ float4 PS_MAIN( VSOutput In )
     float3 pbrSpecB  = float3(0.0f, 0.0f, 0.0f);
     float3 pbrTSun   = float3(1.0f, 1.0f, 1.0f);
     float3 pbrTAmb   = float3(1.0f, 1.0f, 1.0f);
+    // Which gradient source this draw ACTUALLY took, for F12 mode 19. Set from inside the branch,
+    // not recomputed at the ladder, for the reason mode 3's comment gives: a debug view that
+    // re-derives the answer can agree with itself while disagreeing with the frame — and the whole
+    // question here ("is this surface baked or 8-bit?") is one the frame alone can settle.
+    // 0 = no _paramh · 1 = 8-bit height, no baked map · 2 = baked map exists, unused · 3 = baked.
+    uint pbrSrc = 0u;
     if (pbrOn)
     {
         const int2   psz   = GetDimensions(gTextures[In.ParamIndex], NO_SAMPLER);
@@ -89,6 +95,7 @@ float4 PS_MAIN( VSOutput In )
         // scene of mixed coverage could not be judged on one setting.
         const uint  gradMode = (uint)gShadowParams.pbrParams.x;
         const bool  useBaked = (gradMode == 3u) && (In.DerivIndex != 0u);
+        pbrSrc = useBaked ? 3u : ((In.DerivIndex != 0u) ? 2u : 1u);
         const float2 dhduv = useBaked
             ? pbrDerivMap(In.DerivIndex, In.ClampMode, In.Uv, pbrDUVdx, pbrDUVdy)
             : pbrHeightGradUV(min(gradMode, 2u), In.ParamIndex, In.ClampMode, In.Uv,
@@ -523,6 +530,24 @@ float4 PS_MAIN( VSOutput In )
     }
     if (dbg == 8u) {                                                        // mode 8: world-space normal (RGB = N*0.5+0.5)
         RETURN(float4(N * 0.5f + 0.5f, 1.0f));
+    }
+    if (dbg == 19u) {   // mode 19: PBR gradient SOURCE — which surfaces are baked and which are 8-bit
+        // Terracing is a property of the 8-bit runtime path, so the first question about any
+        // terraced surface is which path it is on. Only 101 of 209 _paramh maps have a baked
+        // derivative, and mode 3 falls back PER DRAW where one is missing — a fallback that is
+        // correct, silent, and therefore invisible. This view is the thing that makes it visible.
+        //   grey   no _paramh at all (skinned, terrain, alpha, pbrEnable off) — cannot terrace here
+        //   RED    _paramh only: the 8-bit height path. Terracing seen here is EXPECTED.
+        //   YELLOW a baked map exists but is not being used — switch pbrGradMode to 3
+        //   GREEN  baked derivative map in use. Terracing seen here is a REAL defect.
+        float3 srcCol = float3(0.10f, 0.10f, 0.11f);
+        if (pbrSrc == 1u)      { srcCol = float3(1.00f, 0.06f, 0.06f); }
+        else if (pbrSrc == 2u) { srcCol = float3(1.00f, 0.72f, 0.00f); }
+        else if (pbrSrc == 3u) { srcCol = float3(0.06f, 1.00f, 0.18f); }
+        // A little shape so objects are identifiable, off the GEOMETRIC normal — the perturbed one
+        // would print the very facets this view exists to attribute, over the top of the answer.
+        const float3 vDir = normalize(gFrameData.eyePos.xyz - In.WorldPos);
+        RETURN(float4(srcCol * (0.55f + 0.45f * saturate(dot(pbrNg, vDir))), 1.0f));
     }
     if (dbg == 10u) {   // mode 10: shadow-mask slot 0 nibble (also shadowmask.comp's debug output channel)
         uint4 mw = LoadTex2D(gShadowMask, NO_SAMPLER, int2(In.Position.xy), 0).xyzw;

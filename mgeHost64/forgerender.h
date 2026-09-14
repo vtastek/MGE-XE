@@ -355,6 +355,10 @@ namespace ForgeRender {
     // Mean (B+G+R)/3 of the delivered rect, 0..255 (-1 when nothing can be read). For the PBR sign
     // test, where the surface under test IS the frame and the question is which way it moved.
     double debugReadbackMeanLuma();
+    // The delivered rect's centre pixel, BGRA, returned rather than printed. For F12 mode 19 (the
+    // PBR gradient-source view), which encodes its answer as a HUE — a luma cannot separate its two
+    // interesting classes, because red and green were deliberately chosen at the same brightness.
+    bool debugReadbackCenterBGRA(unsigned char out[4]);
 
     // Tier 2 diag: read back pAO (RGBA16F) and printf 3 texels — GTAO write vs graphics read.
     void debugReadbackAO();

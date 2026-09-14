@@ -3578,6 +3578,12 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
     float3 pbrSpecB = float3(0.0f, 0.0f, 0.0f);
     float3 pbrTSun = float3(1.0f, 1.0f, 1.0f);
     float3 pbrTAmb = float3(1.0f, 1.0f, 1.0f);
+
+
+
+
+
+    uint pbrSrc = 0u;
     if (pbrOn)
     {
         const int2 psz = GetDimensions(gTextures[In.ParamIndex], NO_SAMPLER);
@@ -3589,6 +3595,7 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
 
         const uint gradMode = (uint)gShadowParams.pbrParams.x;
         const bool useBaked = (gradMode == 3u) && (In.DerivIndex != 0u);
+        pbrSrc = useBaked ? 3u : ((In.DerivIndex != 0u) ? 2u : 1u);
         const float2 dhduv = useBaked
             ? pbrDerivMap(In.DerivIndex, In.ClampMode, In.Uv, pbrDUVdx, pbrDUVdy)
             : pbrHeightGradUV(min(gradMode, 2u), In.ParamIndex, In.ClampMode, In.Uv,
@@ -3624,7 +3631,7 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
 
 
     bool inReflect = (gFrameData.gReflWaterClip.z != 0.0f);
-#line 155 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.frag.fsl"
+#line 162 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.frag.fsl"
     uint dbgMode = (uint)(gFrameData.debugParams.x + 0.5f);
     bool aoUsed = ((aoFlags & 3u) != 0u) || dbgMode == 3u || dbgMode == 4u;
     bool isFP = (gFrameData.alphaShadowParams.z > 0.5f);
@@ -3638,7 +3645,7 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
 
     float4 aoSample = aoValid ? LoadTex2D(gAO, NO_SAMPLER, srcPx, 0)
                               : float4(0.0f, 0.0f, 0.0f, 1.0f);
-#line 187 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.frag.fsl"
+#line 194 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.frag.fsl"
     if ((aoFlags & 2u) != 0u && aoValid) {
         float3 bn = N * aoSample.a + aoSample.rgb;
         float bl2 = dot(bn, bn);
@@ -3842,10 +3849,10 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
         }
     }
     d *= gFrameData.dbgScales.y;
-#line 404 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.frag.fsl"
+#line 411 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.frag.fsl"
     float3 emis = ((In.VColSource == 1u) ? In.Color.rgb : In.MatEmissive)
                 * gShadowParams.calParams.x;
-#line 420 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.frag.fsl"
+#line 427 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.frag.fsl"
     float4 albedo = sampleBase(In.TexIndex, In.ClampMode, In.Uv, useLowAF(In.AlphaRef, false));
 
 
@@ -3872,7 +3879,7 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
     if (pbrOn) { const float kd = 1.0f - pbrMetalness(pbrParam); d *= kd; a *= kd; }
     float3 lit = (In.VColSource == 2u) ? (In.Color.rgb * (d + a) + emis)
                                        : (In.MatDiffuse * d + In.MatAmbient * a + emis);
-#line 460 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.frag.fsl"
+#line 467 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.frag.fsl"
     if (a2cCoverageMask(albedo.a, In.AlphaRef) == 0u) { discard; }
 
     albedo.rgb *= gFrameData.dbgScales.z;
@@ -3939,6 +3946,24 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
     }
     if (dbg == 8u) {
         return (float4(N * 0.5f + 0.5f, 1.0f));
+    }
+    if (dbg == 19u) {
+
+
+
+
+
+
+
+
+        float3 srcCol = float3(0.10f, 0.10f, 0.11f);
+        if (pbrSrc == 1u) { srcCol = float3(1.00f, 0.06f, 0.06f); }
+        else if (pbrSrc == 2u) { srcCol = float3(1.00f, 0.72f, 0.00f); }
+        else if (pbrSrc == 3u) { srcCol = float3(0.06f, 1.00f, 0.18f); }
+
+
+        const float3 vDir = normalize(gFrameData.eyePos.xyz - In.WorldPos);
+        return (float4(srcCol * (0.55f + 0.45f * saturate(dot(pbrNg, vDir))), 1.0f));
     }
     if (dbg == 10u) {
         uint4 mw = LoadTex2D(gShadowMask, NO_SAMPLER, int2(In.Position.xy), 0).xyzw;

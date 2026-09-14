@@ -1588,6 +1588,60 @@ namespace ForgeRender {
             }
             std::printf("[forge] scene-probe: PBR SIGN TEST %s (a ramp rising toward a light must "
                         "brighten in every mode)\n", allPass ? "PASS" : "FAILED");
+
+            // ─── THE COVERAGE VIEW (F12 mode 19) ───────────────────────────────────────────────
+            // 101 of 209 _paramh maps have a baked derivative, and gradient mode 3 falls back to the
+            // 8-bit height path PER DRAW wherever one is missing. That fallback is correct and it is
+            // SILENT, which makes coverage invisible in play: a terraced surface gives no clue
+            // whether it terraces because no baked map exists for it or because the baked map is not
+            // doing its job. Mode 19 paints which path each surface took. Play asked for exactly
+            // this ("no way to tell baked ones vs 8-bit source ones").
+            //
+            // ⚠ AND IT IS CHECKED HERE BECAUSE A DEBUG MODE THAT NOBODY ASKS TO DRAW IS A DEBUG MODE
+            // THAT SILENTLY DOES NOT EXIST. Modes 15 and 16 were added to this renderer, compiled,
+            // drew correctly, and were unreachable for two milestones because the client's cycle
+            // modulus never moved. Nothing downstream noticed, because nothing downstream ever asked
+            // them for a pixel. This asks.
+            //
+            // The assertions are on channel ORDER, not on values: the view's answer is a HUE, and an
+            // ordering survives the resolve, the output transform and any future post stage, while
+            // an exact triple would have to be re-tuned by whoever adds one.
+            {
+                enum Hue { kGrey, kRed, kGreen, kYellow };
+                struct Cls { const char* name; uint32_t param; uint32_t deriv; uint32_t gm; Hue want; };
+                const Cls cases[4] = {
+                    { "no _paramh          -> GREY",   0u,       0u,       3u, kGrey   },
+                    { "_paramh, no baked   -> RED",    pslot[0], 0u,       3u, kRed    },
+                    { "baked, mode 3       -> GREEN",  pslot[0], dslot[0], 3u, kGreen  },
+                    { "baked, mode 0       -> YELLOW", pslot[0], dslot[0], 0u, kYellow },
+                };
+                auto iabs = [](int v) { return v < 0 ? -v : v; };
+                bool covPass = true;
+                setDebugMode(19u);
+                for (int k = 0; k < 4; ++k) {
+                    pbrSetForProbe(cases[k].gm, 0u);
+                    pi.paramTexIndex = cases[k].param;
+                    pi.derivTexIndex = cases[k].deriv;
+                    renderScene(vp, lt, &pi, 1, (unsigned)sizeof(pi), nullptr, 0, 0, nullptr, 0, 0,
+                                nullptr, 0, 0);
+                    unsigned char c[4] = { 0, 0, 0, 0 };
+                    const bool got = debugReadbackCenterBGRA(c);
+                    const int B = c[0], G = c[1], R = c[2];
+                    bool ok = got;
+                    switch (cases[k].want) {
+                    case kGrey:   ok = ok && iabs(R - G) < 16 && iabs(G - B) < 16 && R < 128; break;
+                    case kRed:    ok = ok && (R > G + 48) && (R > B + 48);                    break;
+                    case kGreen:  ok = ok && (G > R + 48) && (G > B + 48);                    break;
+                    case kYellow: ok = ok && (R > B + 48) && (G > B + 48) && iabs(R - G) < 96; break;
+                    }
+                    covPass = covPass && ok;
+                    std::printf("[forge] scene-probe: PBR COVERAGE %-30s BGRA=%3d,%3d,%3d -> %s\n",
+                                cases[k].name, B, G, R, ok ? "PASS" : "FAIL");
+                }
+                std::printf("[forge] scene-probe: PBR COVERAGE VIEW %s (F12 mode 19 must be reachable "
+                            "and must separate baked from 8-bit)\n", covPass ? "PASS" : "FAILED");
+                setDebugMode(0u);   // ⚠ the frame-hash checks below are on the NORMAL view
+            }
             pbrSetForProbe(0u, 0u);   // back to the defaults for anything below
         }
 
@@ -21089,7 +21143,8 @@ namespace {
                                             "10 shadow-mask", "11 shadow-atlas (static)", "12 shadow-atlas (dyn)",
                                             "13 sun moments (cascade atlas)", "14 sky height map",
                                             "15 atmos sky-view LUT", "16 atmos transmittance LUT",
-                                            "17 motion vectors", "18 reactive mask" };
+                                            "17 motion vectors", "18 reactive mask",
+                                            "19 PBR gradient source" };
     constexpr uint32_t kDebugModeCount = (uint32_t)(sizeof(kDebugModeNames) / sizeof(kDebugModeNames[0]));
 
     // ─── THE DEV PANEL: A REAL HORIZONTAL TAB BAR ────────────────────────────────────────────────
@@ -41976,6 +42031,14 @@ void destroyHostWindow(Renderer* R);
         uint64_t acc = 0;
         for (size_t i = 0; i < (size_t)W * H; ++i) { acc += (uint64_t)px[i * 4 + 0] + px[i * 4 + 1] + px[i * 4 + 2]; }
         return (double)acc / (3.0 * (double)W * (double)H);
+    }
+
+    bool debugReadbackCenterBGRA(unsigned char out[4]) {
+        std::vector<uint8_t> px; uint32_t W = 0, H = 0;
+        if (!readbackDeliveredRect(px, W, H) || !W || !H) { return false; }
+        const size_t i = ((size_t)(H / 2u) * (size_t)W + (size_t)(W / 2u)) * 4u;
+        out[0] = px[i + 0]; out[1] = px[i + 1]; out[2] = px[i + 2]; out[3] = px[i + 3];
+        return true;
     }
 
     // See forgerender.h for why this exists beside debugReadbackCenterPixel rather than instead of
