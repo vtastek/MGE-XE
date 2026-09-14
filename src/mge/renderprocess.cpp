@@ -4531,11 +4531,12 @@ namespace RenderProcess {
             // cascade atlas); SH2 sky AO added 14 (the top-down world height map); S2a added the two
             // atmosphere LUT overlays 15/16 and did NOT move this modulus, which made them
             // unreachable until M1 found it; M1 added 17 (motion vectors) and 18 (reactive mask);
-            // PBR materials added 19 (gradient source: baked vs 8-bit) — cycle is %20.
+            // PBR materials added 19 (gradient source: baked vs 8-bit) and 20 (terrain blend
+            // count: how many land textures meet at a pixel) — cycle is %21.
             // THIS MODULUS AND THE HOST'S kDebugModeNames MUST MOVE IN THE SAME COMMIT: the host
             // indexes that array with the value we send here, and a mode with no name is a garbage
             // char* straight into ImGui's dev panel (an instant AV, recorded in forgerender.cpp).
-            g_debugMode = (g_debugMode + 1) % 20;
+            g_debugMode = (g_debugMode + 1) % 21;
             const char* name = (g_debugMode == 1) ? "DEPTH" : (g_debugMode == 2) ? "SCATTER"
                              : (g_debugMode == 3) ? "AO" : (g_debugMode == 4) ? "BENT NORMAL"
                              : (g_debugMode == 5) ? "ALBEDO" : (g_debugMode == 6) ? "LIT"
@@ -4553,7 +4554,8 @@ namespace RenderProcess {
                              : (g_debugMode == 16) ? "ATMOS TRANSMITTANCE LUT"
                              : (g_debugMode == 17) ? "MOTION VECTORS"
                              : (g_debugMode == 18) ? "REACTIVE MASK"
-                             : (g_debugMode == 19) ? "PBR GRADIENT SOURCE" : "NORMAL";
+                             : (g_debugMode == 19) ? "PBR GRADIENT SOURCE"
+                             : (g_debugMode == 20) ? "TERRAIN BLEND COUNT" : "NORMAL";
             LOG::logline(">> [seam] debug mode %d (%s)", g_debugMode, name);
         }
         // F9 toggles the in-host dev overlay.

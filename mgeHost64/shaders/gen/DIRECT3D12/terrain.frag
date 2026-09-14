@@ -3153,6 +3153,18 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
 
     float2 uv = lat * 0.25f;
 
+
+
+
+
+
+
+
+    const uint distinctIds = 1u
+        + ((id10 != id00) ? 1u : 0u)
+        + ((id01 != id00 && id01 != id10) ? 1u : 0u)
+        + ((id11 != id00 && id11 != id10 && id11 != id01) ? 1u : 0u);
+
     float3 albedo;
     if (id00 == id10 && id00 == id01 && id00 == id11) {
         albedo = sampleLand(id00, uv);
@@ -3166,7 +3178,7 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
         albedo += sampleLand(id01, uv) * w01;
         albedo += sampleLand(id11, uv) * w11;
     }
-#line 145 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terrain.frag.fsl"
+#line 157 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terrain.frag.fsl"
     {
         const uint cslot = In.Cell.x;
         float3 c00 = loadVertexColor(cslot, x0, y0);
@@ -3178,7 +3190,7 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
 
     float3 normal = normalize(In.Normal);
     float sunVis = sunShadowVisibility(In.WorldPos, normal);
-#line 187 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terrain.frag.fsl"
+#line 199 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terrain.frag.fsl"
     bool inReflect = (gFrameData.gReflWaterClip.z != 0.0f);
     uint aoFlags = (uint)(gFrameData.debugParams.w + 0.5f);
 
@@ -3219,7 +3231,7 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
                   * (gFrameData.sunCol.rgb * saturate(dot(-gFrameData.sunDir.xyz, normal)) * sunVis
                         * tSunW
                      + amb * tAmbW);
-#line 249 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terrain.frag.fsl"
+#line 261 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terrain.frag.fsl"
     float3 pointDiffuse = float3(0.0f, 0.0f, 0.0f);
 
 
@@ -3389,6 +3401,14 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
         float dist = length(In.WorldPos - gFrameData.eyePos.xyz);
         float g = saturate(dist * (1.0f / 8192.0f));
         return (float4(g, g, g, 1.0f));
+    }
+    if (dbg == 20u) {
+#line 443 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terrain.frag.fsl"
+        float3 cc = float3(0.42f, 0.44f, 0.40f);
+        if (distinctIds == 2u) { cc = float3(0.20f, 0.45f, 0.95f); }
+        else if (distinctIds == 3u) { cc = float3(1.00f, 0.66f, 0.10f); }
+        else if (distinctIds >= 4u) { cc = float3(1.00f, 0.12f, 0.10f); }
+        return (float4(cc, 1.0f));
     }
     return (float4(result, 1.0f));
 }

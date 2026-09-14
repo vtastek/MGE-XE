@@ -21144,7 +21144,7 @@ namespace {
                                             "13 sun moments (cascade atlas)", "14 sky height map",
                                             "15 atmos sky-view LUT", "16 atmos transmittance LUT",
                                             "17 motion vectors", "18 reactive mask",
-                                            "19 PBR gradient source" };
+                                            "19 PBR gradient source", "20 terrain blend count" };
     constexpr uint32_t kDebugModeCount = (uint32_t)(sizeof(kDebugModeNames) / sizeof(kDebugModeNames[0]));
 
     // ─── THE DEV PANEL: A REAL HORIZONTAL TAB BAR ────────────────────────────────────────────────

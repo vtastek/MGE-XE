@@ -114,6 +114,18 @@ float4 PS_MAIN( VSOutput In )
     // uv tiles once per 512-unit texture square (lattice/4), continuous because the texture wraps.
     float2 uv = lat * 0.25f;
 
+    // How many DISTINCT land textures meet here (1..4) — F12 mode 20 paints it, and the count is
+    // also the tap multiplier any future PBR terrain blend would pay. Measured over every LAND
+    // record in Morrowind + Tribunal + Bloodmoon (318,375 interior quad joins): 40.24% of joins
+    // carry one texture, 56.29% two, 3.38% three, and 0.09% — 291 quads in the whole world — four.
+    // So "four-way blending is too expensive" prices at 3.47% of the terrain, and going from a
+    // two-texture cap to the full four costs about 2% more taps while removing the artifact
+    // outright. The number is in the shader because that is where anyone tempted to cap it looks.
+    const uint distinctIds = 1u
+        + ((id10 != id00) ? 1u : 0u)
+        + ((id01 != id00 && id01 != id10) ? 1u : 0u)
+        + ((id11 != id00 && id11 != id10 && id11 != id01) ? 1u : 0u);
+
     float3 albedo;
     if (id00 == id10 && id00 == id01 && id00 == id11) {
         albedo = sampleLand(id00, uv);          // interior of a square: one tap, the common case
@@ -415,6 +427,24 @@ float4 PS_MAIN( VSOutput In )
         float dist = length(In.WorldPos - gFrameData.eyePos.xyz);
         float g = saturate(dist * (1.0f / 8192.0f));
         RETURN(float4(g, g, g, 1.0f));
+    }
+    if (dbg == 20u) {   // mode 20: how many DISTINCT land textures blend at this pixel
+        // A seam on the ground has two candidate causes and they need opposite fixes: the blend
+        // running out of layers, or two REPLACEMENT textures that no longer look like each other
+        // where they meet. This view separates them. Wherever it reads grey or blue, the blend is
+        // exact — MW's own per-vertex weights, evaluated per pixel — so any seam there is the art,
+        // not the renderer, and belongs in texturematcher (terrain_families.json).
+        //   grey   1 texture, one tap, no blend happening at all      (40.2% of the world)
+        //   blue   2 textures                                         (56.3%)
+        //   amber  3 textures                                         ( 3.4%)
+        //   red    4 textures                                         ( 0.1% — 291 quads, total)
+        // Shares of world quad joins measured from the LAND records, not guessed; they are the
+        // reason a two-texture cap saves almost nothing (see the count's definition above).
+        float3 cc = float3(0.42f, 0.44f, 0.40f);
+        if (distinctIds == 2u)      { cc = float3(0.20f, 0.45f, 0.95f); }
+        else if (distinctIds == 3u) { cc = float3(1.00f, 0.66f, 0.10f); }
+        else if (distinctIds >= 4u) { cc = float3(1.00f, 0.12f, 0.10f); }
+        RETURN(float4(cc, 1.0f));
     }
     RETURN(float4(result, 1.0f));
 }
