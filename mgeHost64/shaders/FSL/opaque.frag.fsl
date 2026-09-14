@@ -81,7 +81,8 @@ float4 PS_MAIN( VSOutput In )
         const float2 size0 = max(float2(psz), float2(1.0f, 1.0f));
         pbrParam = pbrParamGrad(In.ParamIndex, In.ClampMode, In.Uv, pbrDUVdx, pbrDUVdy);
         const float2 dhduv = pbrHeightGradUV((uint)gShadowParams.pbrParams.x, In.ParamIndex,
-                                             In.ClampMode, In.Uv, pbrDUVdx, pbrDUVdy, size0);
+                                             In.ClampMode, In.Uv, pbrDUVdx, pbrDUVdy, size0,
+                                             gShadowParams.pbrParams.w);
         N = pbrPerturb((uint)gShadowParams.pbrParams.y, N, pbrDPdx, pbrDPdy, pbrDUVdx, pbrDUVdy,
                        dhduv, gShadowParams.pbrParams.z);
         pbrRough  = pbrRoughness(pbrParam);

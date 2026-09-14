@@ -1202,8 +1202,10 @@ STRUCT(ShadowMaskParams)
 
 
 
+
+
     float4 pbrParams;
-#line 790
+#line 792
 };
 #line 21 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
 #line 27 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
@@ -1747,18 +1749,19 @@ float2 pbrHeightGradBS(uint slot, bool clampUV, float2 uv, float2 size, float lv
                            + e1.y * pbrHeightLvl(slot, clampUV, float2(p1.x, q1.y), lvl));
     return float2(hx, hy);
 }
-#line 135 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/pbrmaterial.h.fsl"
+#line 154 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/pbrmaterial.h.fsl"
 float2 pbrHeightGradUV(uint mode, uint slot, uint clampModeIn, float2 uv,
-                       float2 duvdx, float2 duvdy, float2 size0)
+                       float2 duvdx, float2 duvdy, float2 size0, float radius)
 {
-    const float2 o = 1.5f / size0;
+    const float r = max(radius, 0.25f);
+    const float2 o = r / size0;
     if (mode == 0u)
     {
         const float hL = pbrParamGrad(slot, clampModeIn, uv - float2(o.x, 0.0f), duvdx, duvdy).a;
         const float hR = pbrParamGrad(slot, clampModeIn, uv + float2(o.x, 0.0f), duvdx, duvdy).a;
         const float hD = pbrParamGrad(slot, clampModeIn, uv - float2(0.0f, o.y), duvdx, duvdy).a;
         const float hU = pbrParamGrad(slot, clampModeIn, uv + float2(0.0f, o.y), duvdx, duvdy).a;
-        return float2(hR - hL, hU - hD) * (size0 / 3.0f);
+        return float2(hR - hL, hU - hD) * (size0 / (2.0f * r));
     }
     const bool clampUV = (clampModeIn &  3u ) !=  3u ;
     const float fp = max(length(duvdx * size0), length(duvdy * size0));
@@ -1770,11 +1773,11 @@ float2 pbrHeightGradUV(uint mode, uint slot, uint clampModeIn, float2 uv,
         const float hR = pbrHeightBS(slot, clampUV, uv + float2(o.x, 0.0f), sizeL, lvl);
         const float hD = pbrHeightBS(slot, clampUV, uv - float2(0.0f, o.y), sizeL, lvl);
         const float hU = pbrHeightBS(slot, clampUV, uv + float2(0.0f, o.y), sizeL, lvl);
-        return float2(hR - hL, hU - hD) * (size0 / 3.0f);
+        return float2(hR - hL, hU - hD) * (size0 / (2.0f * r));
     }
     return pbrHeightGradBS(slot, clampUV, uv, sizeL, lvl) * sizeL;
 }
-#line 177 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/pbrmaterial.h.fsl"
+#line 197 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/pbrmaterial.h.fsl"
 float3 pbrPerturbCotangent(float3 N, float3 dPdx, float3 dPdy, float2 duvdx, float2 duvdy,
                            float2 dhduv, float depth)
 {
@@ -1817,7 +1820,7 @@ float3 pbrPerturb(uint frameMode, float3 N, float3 dPdx, float3 dPdy, float2 duv
     return (frameMode == 1u) ? pbrPerturbSurfGrad(N, dPdx, dPdy, duvdx, duvdy, dhduv, depth)
                              : pbrPerturbCotangent(N, dPdx, dPdy, duvdx, duvdy, dhduv, depth);
 }
-#line 236 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/pbrmaterial.h.fsl"
+#line 256 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/pbrmaterial.h.fsl"
 float2 pbrSpecTerms(float3 N, float3 L, float3 V, float NoL, float NoV, float alpha2)
 {
     const float3 H = normalize(V + L);
@@ -3556,7 +3559,8 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
         const float2 size0 = max(float2(psz), float2(1.0f, 1.0f));
         pbrParam = pbrParamGrad(In.ParamIndex, In.ClampMode, In.Uv, pbrDUVdx, pbrDUVdy);
         const float2 dhduv = pbrHeightGradUV((uint)gShadowParams.pbrParams.x, In.ParamIndex,
-                                             In.ClampMode, In.Uv, pbrDUVdx, pbrDUVdy, size0);
+                                             In.ClampMode, In.Uv, pbrDUVdx, pbrDUVdy, size0,
+                                             gShadowParams.pbrParams.w);
         N = pbrPerturb((uint)gShadowParams.pbrParams.y, N, pbrDPdx, pbrDPdy, pbrDUVdx, pbrDUVdy,
                        dhduv, gShadowParams.pbrParams.z);
         pbrRough = pbrRoughness(pbrParam);
@@ -3588,7 +3592,7 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
 
 
     bool inReflect = (gFrameData.gReflWaterClip.z != 0.0f);
-#line 144 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.frag.fsl"
+#line 145 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.frag.fsl"
     uint dbgMode = (uint)(gFrameData.debugParams.x + 0.5f);
     bool aoUsed = ((aoFlags & 3u) != 0u) || dbgMode == 3u || dbgMode == 4u;
     bool isFP = (gFrameData.alphaShadowParams.z > 0.5f);
@@ -3602,7 +3606,7 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
 
     float4 aoSample = aoValid ? LoadTex2D(gAO, NO_SAMPLER, srcPx, 0)
                               : float4(0.0f, 0.0f, 0.0f, 1.0f);
-#line 176 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.frag.fsl"
+#line 177 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.frag.fsl"
     if ((aoFlags & 2u) != 0u && aoValid) {
         float3 bn = N * aoSample.a + aoSample.rgb;
         float bl2 = dot(bn, bn);
@@ -3806,10 +3810,10 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
         }
     }
     d *= gFrameData.dbgScales.y;
-#line 393 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.frag.fsl"
+#line 394 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.frag.fsl"
     float3 emis = ((In.VColSource == 1u) ? In.Color.rgb : In.MatEmissive)
                 * gShadowParams.calParams.x;
-#line 409 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.frag.fsl"
+#line 410 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.frag.fsl"
     float4 albedo = sampleBase(In.TexIndex, In.ClampMode, In.Uv, useLowAF(In.AlphaRef, false));
 
 
@@ -3836,7 +3840,7 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
     if (pbrOn) { const float kd = 1.0f - pbrMetalness(pbrParam); d *= kd; a *= kd; }
     float3 lit = (In.VColSource == 2u) ? (In.Color.rgb * (d + a) + emis)
                                        : (In.MatDiffuse * d + In.MatAmbient * a + emis);
-#line 449 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.frag.fsl"
+#line 450 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.frag.fsl"
     if (a2cCoverageMask(albedo.a, In.AlphaRef) == 0u) { discard; }
 
     albedo.rgb *= gFrameData.dbgScales.z;

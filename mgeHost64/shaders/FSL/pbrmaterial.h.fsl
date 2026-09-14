@@ -123,26 +123,46 @@ float2 pbrHeightGradBS(uint slot, bool clampUV, float2 uv, float2 size, float lv
 // ─── Axis 1: dH/duv out of the texture ──────────────────────────────────────────────────────────
 // Returns dh/du, dh/dv in PER-UV units for every mode, so the three are estimates of ONE quantity and
 // the depth below means the same thing whichever is selected.
-//   0 cd      the live DX9 shader: +-1.5 BASE texels through the anisotropic sampler at the base's own
-//             gradients. ⚠ The rig (T8) tested the plan's "base-texel offsets collapse the bump at
-//             distance" and REFUTED it — the taps read a continuous trilinear field, and offsetting in
-//             mip texels was worse at every distance. So the offset stays in base texels.
-//   1 cdbs    the same +-1.5-texel difference with each tap a B-spline read (16 fetches).
-//   2 bspline the B-spline's own analytic gradient (8 fetches).
-// The B-spline arms pick ONE level — floor(log2(footprint)), as the rig does — rather than blending
-// two, which would double their fetches; a surface receding through a mip boundary can therefore show
-// a faint band in the bump. Under magnification (the regime the arms exist for) the level is 0.
+//   0 cd      the live DX9 shader: a central difference at +-`radius` BASE texels through the
+//             ANISOTROPIC sampler at the base's own gradients. ⚠ The rig (T8) tested the plan's
+//             "base-texel offsets collapse the bump at distance" and REFUTED it — the taps read a
+//             continuous trilinear field, and offsetting in mip texels was worse at every distance.
+//             So the offset stays in base texels.
+//   1 cdbs    the same +-`radius` difference with each tap a B-spline read (16 fetches).
+//   2 bspline the B-spline's own analytic gradient (8 fetches). `radius` is INERT here: this arm has
+//             no baseline to widen — its support is the kernel's own four texels.
+//
+// ⚠⚠ MODES 1 AND 2 ARE NOT A CLEAN A/B AGAINST 0, AND THE DIFFERENCE IS FILTERING, NOT
+// RECONSTRUCTION. Mode 0 samples through the anisotropic sampler with real gradients; the B-spline
+// arms cannot, because their four-fetch trick needs exact bilinear weights and AF bends the kernel —
+// so they take plain bilinear at ONE level, floor(log2(footprint)). They therefore give up 8x
+// anisotropy (blurrier at grazing angles, which is most of a screen) and the trilinear blend (a faint
+// band where a surface crosses a mip boundary). From play: *"0 is better, detailed and more blurry at
+// the same time"* — the detail is the AF these two do not have. Judge them on a surface facing the
+// camera, where that handicap is smallest; the rig could not see it at all (isotropic footprints).
+//
+// ⚠ `radius` IS THE BLUR-VERSUS-TERRACING DIAL, and it is a real one rather than a taste knob. The
+// difference spans 2*radius texels, so it LOW-PASSES the height's 8-bit staircase over that span:
+// wider hides terracing and softens relief, narrower does the opposite. Also from play: *"blurry
+// hides the terracing better"*. The gradient is divided by its own span below, so depth stays
+// calibrated and this changes the FILTER, not the strength. 1.5 = the live DX9 shader exactly.
+//
+// ⚠ It is not a FIX for terracing, it is a veil over it. Terracing is 8-bit quantisation amplified by
+// differentiation, and the rig (T6) measured that NO runtime arm survives it: on a field spanning
+// 3/255, every one of them flattens to retention 0.000 while a baked BC5 derivative map — quantised
+// AFTER differentiating — keeps 1.001. That is the fix; this is the dial until it exists.
 float2 pbrHeightGradUV(uint mode, uint slot, uint clampModeIn, float2 uv,
-                       float2 duvdx, float2 duvdy, float2 size0)
+                       float2 duvdx, float2 duvdy, float2 size0, float radius)
 {
-    const float2 o = 1.5f / size0;                  // the tap offset, in BASE texels, as the live code
+    const float  r = max(radius, 0.25f);            // below ~a quarter texel the difference is noise
+    const float2 o = r / size0;                     // the tap offset, in BASE texels, as the live code
     if (mode == 0u)
     {
         const float hL = pbrParamGrad(slot, clampModeIn, uv - float2(o.x, 0.0f), duvdx, duvdy).a;
         const float hR = pbrParamGrad(slot, clampModeIn, uv + float2(o.x, 0.0f), duvdx, duvdy).a;
         const float hD = pbrParamGrad(slot, clampModeIn, uv - float2(0.0f, o.y), duvdx, duvdy).a;
         const float hU = pbrParamGrad(slot, clampModeIn, uv + float2(0.0f, o.y), duvdx, duvdy).a;
-        return float2(hR - hL, hU - hD) * (size0 / 3.0f);   // divided by its own 3-texel span
+        return float2(hR - hL, hU - hD) * (size0 / (2.0f * r));   // divided by its own span
     }
     const bool  clampUV = (clampModeIn & TEX_ADDR_MASK) != TEX_WRAP_S_WRAP_T;
     const float fp  = max(length(duvdx * size0), length(duvdy * size0));   // footprint, base texels
@@ -154,7 +174,7 @@ float2 pbrHeightGradUV(uint mode, uint slot, uint clampModeIn, float2 uv,
         const float hR = pbrHeightBS(slot, clampUV, uv + float2(o.x, 0.0f), sizeL, lvl);
         const float hD = pbrHeightBS(slot, clampUV, uv - float2(0.0f, o.y), sizeL, lvl);
         const float hU = pbrHeightBS(slot, clampUV, uv + float2(0.0f, o.y), sizeL, lvl);
-        return float2(hR - hL, hU - hD) * (size0 / 3.0f);
+        return float2(hR - hL, hU - hD) * (size0 / (2.0f * r));
     }
     return pbrHeightGradBS(slot, clampUV, uv, sizeL, lvl) * sizeL;
 }

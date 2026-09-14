@@ -1202,8 +1202,10 @@ STRUCT(ShadowMaskParams)
 
 
 
+
+
     float4 pbrParams;
-#line 790
+#line 792
 };
 #line 20 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowmask.srt.h"
 

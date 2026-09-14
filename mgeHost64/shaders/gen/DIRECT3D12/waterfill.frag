@@ -1202,8 +1202,10 @@ STRUCT(ShadowMaskParams)
 
 
 
+
+
     float4 pbrParams;
-#line 790
+#line 792
 };
 #line 21 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
 #line 27 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"

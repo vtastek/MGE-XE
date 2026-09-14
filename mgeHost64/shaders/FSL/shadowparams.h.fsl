@@ -785,6 +785,8 @@ STRUCT(ShadowMaskParams)
     //   x = gradient mode   0 cd (live DX9) | 1 cdbs (B-spline taps) | 2 bspline (C2 derivative)
     //   y = frame mode      0 cotangent frame (sign-correct) | 1 Mikkelsen surface gradient
     //   z = relief depth    the height range as a fraction of one UV unit (48/4096 = DX9 @4096)
-    //   w = spare.
+    //   w = tap radius      the central difference's half-span in BASE texels (1.5 = DX9 exactly).
+    //                       The blur-versus-terracing dial; inert for gradient mode 2. See
+    //                       pbrmaterial.h.fsl for why it veils terracing rather than fixing it.
     DATA(float4,   pbrParams,        None);
 };

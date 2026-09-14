@@ -7037,6 +7037,18 @@ namespace {
     //   is a calibration constant, not a lever for facets: raising it deepens them, it does not
     //   remove them (rig T3/T9).
     float    g_pbrDepth     = 48.0f / 4096.0f;
+    // pbrGradRadius — the central difference's half-span in BASE texels. 1.5 IS the live DX9 shader,
+    // and it is the dial that came back from the first play session rather than a knob added on
+    // spec: *"0 is better, detailed and more blurry at the same time, but blurry hides the terracing
+    // better"*. The difference spans 2*radius texels and therefore LOW-PASSES the height's 8-bit
+    // staircase over that span, so this trades relief sharpness against visible terracing directly.
+    // The gradient is divided by its own span in the shader, so depth stays calibrated — this moves
+    // the FILTER, not the strength. Inert for gradient mode 2, which has no baseline.
+    //
+    // ⚠ A VEIL, NOT A FIX. Terracing is 8-bit quantisation amplified by differentiation, and the rig
+    // (pbrsynth T6) measured that no runtime arm survives it — on a field spanning 3/255 every one
+    // flattens to retention 0.000, while a BC5 derivative map baked at full precision keeps 1.001.
+    float    g_pbrGradRadius = 1.5f;
 
     // The ONE gate every writer of the static instance lane [15] goes through.
     inline uint32_t pbrParamSlotFor(uint32_t paramTexIndex) {
@@ -22114,6 +22126,10 @@ namespace {
           // them (see g_pbrDepth).
           t.sliderF("  relief depth (fraction of the texture's width; 0.0117 = DX9 @4096)",
                     &g_pbrDepth, 0.0f, 0.05f, 0.0005f);
+          // The blur-versus-terracing dial, and the one play asked for. Wider = softer relief and
+          // less visible terracing; 1.5 = the live DX9 shader. Inert on gradient mode 2.
+          t.sliderF("  tap radius in texels (wider = blurrier, hides terracing; 1.5 = DX9)",
+                    &g_pbrGradRadius, 0.25f, 6.0f, 0.25f);
           t.flush(); }
 
         // -- Tab: AO & Lighting (GTAO knobs + intensity debug scales) --
@@ -25351,6 +25367,7 @@ void destroyHostWindow(Renderer* R);
             // gain lightens the occlusion as it adds bounce; chroma adds colour without lightening.
             { "aoBounceGain",        &g_aoBounceGain        },
             { "pbrDepth",            &g_pbrDepth            },
+            { "pbrGradRadius",       &g_pbrGradRadius       },
             { "aoBounceChroma",      &g_aoBounceChroma      },
             { "grassRootAO",         &g_grassRootAO         },
             { "grassRootAOHeight",   &g_grassRootAOHeight   },
@@ -30888,7 +30905,7 @@ void destroyHostWindow(Renderer* R);
             mp[kPbrParamsFloat + 0] = (float)std::min(g_pbrGradMode, 2u);
             mp[kPbrParamsFloat + 1] = (float)std::min(g_pbrFrameMode, 1u);
             mp[kPbrParamsFloat + 2] = std::max(0.0f, g_pbrDepth);
-            mp[kPbrParamsFloat + 3] = 0.0f;
+            mp[kPbrParamsFloat + 3] = std::max(0.25f, g_pbrGradRadius);
             mp[280] = g_shadowBias;               // biasParams.x = absolute contact bias (live knob)
             mp[281] = g_shadowNormalOffset;       // biasParams.y = normal-offset bias in texels (live knob)
             // Flicker shadow "movement": the mask rotates the LOOKUP direction of flicker-class slots by a
