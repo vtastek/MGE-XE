@@ -81,8 +81,23 @@ else:
     DEFAULT_VT = "/mnt/c/mgem/morrowind64/Data Files/textures/vt"
     TEXCONV = "/mnt/c/projects/texturematcher/texconv.exe"
 
-SUFFIXES = ('_n', '_spec', '_paramh', '_paramd')
+SUFFIXES = ('_n', '_spec', '_param', '_paramh', '_paramd')
 DEFAULT_METAL, DEFAULT_ROUGH, DEFAULT_IOR = 0, 179, 128   # the host's own 1x1 default, in codes
+
+
+def find_source(vt, stem, suffix):
+    """A parameter source for <stem>, looked for in vt/ AND IN ITS PARENT.
+
+    ⚠ THE PARENT IS NOT OPTIONAL. Searching only vt/ is how FH_suit_01_d lost its relief: its
+    real normal map (2048^2, 32/64/25 distinct levels, |n| = 1.000 -- nothing like the two-level
+    dithers inside vt/) sits in textures/, and only the albedo had been copied across. The object
+    that could carry the best height in the whole rig got a flat one, and nothing said so.
+    """
+    for d in (vt, os.path.dirname(os.path.normpath(vt))):
+        cand = os.path.join(d, stem + suffix + '.dds')
+        if os.path.exists(cand):
+            return cand
+    return None
 
 
 def win_path(p):
@@ -287,16 +302,19 @@ def main():
     print('%-22s %-9s %-26s %-28s %s' % ('base', 'size', 'material', 'height', 'paramd'))
     for stem in bases:
         base = os.path.join(a.vt, stem)
-        spec = base + '_spec.dds'
-        nrm = base + '_n.dds'
+        # `_param` is the authored DXT1 material map (metal/rough/IOR, no height); `_spec` is the
+        # older name for the same packing. Either is EVIDENCE and is copied, never re-derived.
+        spec = find_source(a.vt, stem, '_param') or find_source(a.vt, stem, '_spec')
+        nrm = find_source(a.vt, stem, '_n')
 
         # ---- material RGB
         src_size = None
-        if os.path.exists(spec):
+        if spec:
             sw, sh, sfc, _ = dds_header(spec)
-            src_size = min(sw, 1024)
+            src_size = min(sw, 2048)
             rgb = resize_nn(load_rgb(spec, src_size), src_size)
-            mat = 'from _spec (%s %d)' % (sfc.decode('ascii', 'replace'), sw)
+            mat = 'from %s (%s %d)' % (os.path.basename(spec).replace(stem, ''),
+                                       sfc.decode('ascii', 'replace'), sw)
         else:
             src_size = 64
             rgb = np.zeros((64, 64, 3), np.float32)
@@ -305,7 +323,7 @@ def main():
 
         # ---- height
         hf, hnote = None, ''
-        if os.path.exists(spec) and dds_header(spec)[2] == b'DXT5':
+        if spec and dds_header(spec)[2] == b'DXT5':
             H, why = PB.read_paramh_alpha(spec)
             if H is not None:
                 # ⚠ NO /255 HERE. pbrsynth's bc4_decode_file_blocks returns floats already in
@@ -315,13 +333,14 @@ def main():
                 # quantity was not. The flatness guard below is what now catches it.
                 hf = resize_nn(H.astype(np.float64), src_size)
                 hnote = 'from _spec ALPHA (already this spec)'
-        if hf is None and os.path.exists(nrm):
+        if hf is None and nrm:
             nim = load_rgb(nrm)
             lv = (len(np.unique(nim[..., 0])), len(np.unique(nim[..., 1])))
             if min(lv) <= 4:
                 hnote = '_n REFUSED (%d/%d levels - dither, not relief)' % lv
             else:
-                nw = dds_header(nrm)[0]
+                nw = min(dds_header(nrm)[0], 2048)
+                nim = resize_nn(nim, nw)
                 if nw != src_size:
                     src_size = nw
                     rgb = resize_nn(rgb, src_size)
