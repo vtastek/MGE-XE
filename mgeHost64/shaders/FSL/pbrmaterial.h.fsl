@@ -1,0 +1,276 @@
+// mgeHost64 — PBR materials: height-derived normals and the specular BRDF (FSL ONLY).
+// tasks/forge-pbr-materials.md, Track C. The offline rig that chose between these arms is
+// mgeHost64/pbrsynth/ — its README is the measured case for every mode below.
+//
+// Include AFTER opaque.srt.h and texsample.h.fsl (needs gTextures, the static samplers,
+// gShadowParams and TEX_ADDR_MASK / TEX_WRAP_S_WRAP_T).
+//
+// THE MATERIAL. texturematcher's Morrowind export writes <base>_paramh.dds beside the base texture:
+// DXT5, R = metalness, G = roughness, B = IOR/specular, A = HEIGHT. Height sits in the alpha because
+// DXT5's alpha is a different CODEC (a BC4 block: 8 levels on its own ramp) from its colour block
+// (BC1: 4 levels, three channels chained to one line) — and height is the one channel this shader
+// DIFFERENTIATES, where quantisation invisible in a displayed scalar becomes a staircase.
+//
+// The host uploads it as DATA (IPC::kTexUploadData): stored UNORM, never through the scene's sRGB
+// view, so the RGB here is the raw parameter and the alpha is the raw height.
+//
+// ⚠ EVERY TEXTURE READ HERE TAKES EXPLICIT GRADIENTS OR AN EXPLICIT LEVEL. The caller runs this inside
+// a per-draw branch (ParamIndex != 0), and the screen derivatives it needs are taken ONCE at the top
+// of opaque.frag, in uniform control flow, and passed in. Nothing below calls ddx/ddy.
+
+// ─── Sampling ───────────────────────────────────────────────────────────────────────────────────
+
+// The param map through the SAME address mode and anisotropy as the base map (sampleBase), with the
+// base UV's own gradients — so the param map filters exactly as its albedo does, and the four cd taps
+// all read the same mip the hardware would pick for the base.
+float4 pbrParamGrad(uint slot, uint clampModeIn, float2 uv, float2 dx, float2 dy)
+{
+    const uint clampMode = clampModeIn & TEX_ADDR_MASK;
+    if (clampMode == TEX_CLAMP_S_CLAMP_T) { return SampleGradTex2D(gTextures[slot], gSamplerAnisoClampClamp, uv, dx, dy); }
+    if (clampMode == TEX_CLAMP_S_WRAP_T)  { return SampleGradTex2D(gTextures[slot], gSamplerAnisoClampWrap,  uv, dx, dy); }
+    if (clampMode == TEX_WRAP_S_CLAMP_T)  { return SampleGradTex2D(gTextures[slot], gSamplerAnisoWrapClamp,  uv, dx, dy); }
+    return SampleGradTex2D(gTextures[slot], gSamplerAnisotropic, uv, dx, dy);
+}
+
+// Height at an explicit level through a PLAIN BILINEAR sampler — what the B-spline arms need. Their
+// linear-filtering trick (four bilinear fetches standing in for sixteen point taps) is only exact when
+// the hardware does one bilinear lerp at the requested texel grid; anisotropy would add probes along
+// the major axis and bend the kernel. Any clamp mode is treated as CLAMP on both axes: the static set
+// has no mixed bilinear clamp, and the difference is confined to the texture's own border.
+float pbrHeightLvl(uint slot, bool clampUV, float2 uv, float lvl)
+{
+    return clampUV ? SampleLvlTex2D(gTextures[slot], gSamplerBilinearClamp, uv, lvl).a
+                   : SampleLvlTex2D(gTextures[slot], gSamplerBilinearWrap,  uv, lvl).a;
+}
+
+// ─── The cubic B-spline, four bilinear fetches per evaluation ───────────────────────────────────
+// Uniform cubic B-spline over the texel grid of one mip. APPROXIMATING, not interpolating: its weights
+// never go negative, so it cannot sharpen the 8-bit staircase the way Catmull-Rom's negative lobes do
+// (rig: Catmull-Rom is the best reconstruction of the field and the WORST of a quantised one). It is
+// C2, so its derivative is C1 and the NORMAL built from it has no kink at a cell edge — which is the
+// facet.
+//
+// coord = uv*size - 0.5 puts texel k's centre at coord k. For taps k-1..k+2 with weights w0..w3, each
+// same-sign pair collapses into ONE bilinear fetch placed between its two texels at the ratio of their
+// weights: w0*T[k-1] + w1*T[k] = (w0+w1) * lerp(T[k-1], T[k], w1/(w0+w1)).
+void pbrBSplineW(float2 f, out float2 w0, out float2 w1, out float2 w2, out float2 w3)
+{
+    const float2 f2 = f * f;
+    const float2 f3 = f2 * f;
+    const float2 g  = 1.0f - f;
+    w0 = g * g * g * (1.0f / 6.0f);
+    w1 = (3.0f * f3 - 6.0f * f2 + 4.0f) * (1.0f / 6.0f);
+    w2 = (-3.0f * f3 + 3.0f * f2 + 3.0f * f + 1.0f) * (1.0f / 6.0f);
+    w3 = f3 * (1.0f / 6.0f);
+}
+
+// d/df of the same basis. dw0, dw1 <= 0 and dw2, dw3 >= 0 on [0,1], so the pairs fold into bilinear
+// fetches exactly as the value weights do; the pair sums are -0.5-f+f^2 and its negation, which never
+// reach zero on [0,1], so the ratio below cannot divide by nothing.
+void pbrBSplineDW(float2 f, out float2 d0, out float2 d1, out float2 d2, out float2 d3)
+{
+    const float2 f2 = f * f;
+    const float2 g  = 1.0f - f;
+    d0 = -0.5f * g * g;
+    d1 = 1.5f * f2 - 2.0f * f;
+    d2 = -1.5f * f2 + f + 0.5f;
+    d3 = 0.5f * f2;
+}
+
+// B-spline VALUE of the height at uv on level lvl (size = that level's texel dimensions).
+float pbrHeightBS(uint slot, bool clampUV, float2 uv, float2 size, float lvl)
+{
+    const float2 coord = uv * size - 0.5f;
+    const float2 k = floor(coord);
+    float2 w0, w1, w2, w3;
+    pbrBSplineW(coord - k, w0, w1, w2, w3);
+    const float2 g0 = w0 + w1, g1 = w2 + w3;
+    const float2 p0 = (k - 1.0f + w1 / g0 + 0.5f) / size;   // uv of each pair's single fetch
+    const float2 p1 = (k + 1.0f + w3 / g1 + 0.5f) / size;
+    return g0.y * (g0.x * pbrHeightLvl(slot, clampUV, float2(p0.x, p0.y), lvl)
+                 + g1.x * pbrHeightLvl(slot, clampUV, float2(p1.x, p0.y), lvl))
+         + g1.y * (g0.x * pbrHeightLvl(slot, clampUV, float2(p0.x, p1.y), lvl)
+                 + g1.x * pbrHeightLvl(slot, clampUV, float2(p1.x, p1.y), lvl));
+}
+
+// ANALYTIC gradient of the B-spline height, per texel of level lvl. Eight fetches: derivative weights
+// along one axis against value weights along the other.
+float2 pbrHeightGradBS(uint slot, bool clampUV, float2 uv, float2 size, float lvl)
+{
+    const float2 coord = uv * size - 0.5f;
+    const float2 k = floor(coord);
+    const float2 f = coord - k;
+    float2 w0, w1, w2, w3, d0, d1, d2, d3;
+    pbrBSplineW(f, w0, w1, w2, w3);
+    pbrBSplineDW(f, d0, d1, d2, d3);
+    const float2 g0 = w0 + w1, g1 = w2 + w3;       // value pairs
+    const float2 e0 = d0 + d1, e1 = d2 + d3;       // derivative pairs (e0 < 0 < e1 on [0,1])
+    const float2 p0 = (k - 1.0f + w1 / g0 + 0.5f) / size;
+    const float2 p1 = (k + 1.0f + w3 / g1 + 0.5f) / size;
+    const float2 q0 = (k - 1.0f + d1 / e0 + 0.5f) / size;
+    const float2 q1 = (k + 1.0f + d3 / e1 + 0.5f) / size;
+    const float hx = g0.y * (e0.x * pbrHeightLvl(slot, clampUV, float2(q0.x, p0.y), lvl)
+                           + e1.x * pbrHeightLvl(slot, clampUV, float2(q1.x, p0.y), lvl))
+                   + g1.y * (e0.x * pbrHeightLvl(slot, clampUV, float2(q0.x, p1.y), lvl)
+                           + e1.x * pbrHeightLvl(slot, clampUV, float2(q1.x, p1.y), lvl));
+    const float hy = g0.x * (e0.y * pbrHeightLvl(slot, clampUV, float2(p0.x, q0.y), lvl)
+                           + e1.y * pbrHeightLvl(slot, clampUV, float2(p0.x, q1.y), lvl))
+                   + g1.x * (e0.y * pbrHeightLvl(slot, clampUV, float2(p1.x, q0.y), lvl)
+                           + e1.y * pbrHeightLvl(slot, clampUV, float2(p1.x, q1.y), lvl));
+    return float2(hx, hy);
+}
+
+// ─── Axis 1: dH/duv out of the texture ──────────────────────────────────────────────────────────
+// Returns dh/du, dh/dv in PER-UV units for every mode, so the three are estimates of ONE quantity and
+// the depth below means the same thing whichever is selected.
+//   0 cd      the live DX9 shader: +-1.5 BASE texels through the anisotropic sampler at the base's own
+//             gradients. ⚠ The rig (T8) tested the plan's "base-texel offsets collapse the bump at
+//             distance" and REFUTED it — the taps read a continuous trilinear field, and offsetting in
+//             mip texels was worse at every distance. So the offset stays in base texels.
+//   1 cdbs    the same +-1.5-texel difference with each tap a B-spline read (16 fetches).
+//   2 bspline the B-spline's own analytic gradient (8 fetches).
+// The B-spline arms pick ONE level — floor(log2(footprint)), as the rig does — rather than blending
+// two, which would double their fetches; a surface receding through a mip boundary can therefore show
+// a faint band in the bump. Under magnification (the regime the arms exist for) the level is 0.
+float2 pbrHeightGradUV(uint mode, uint slot, uint clampModeIn, float2 uv,
+                       float2 duvdx, float2 duvdy, float2 size0)
+{
+    const float2 o = 1.5f / size0;                  // the tap offset, in BASE texels, as the live code
+    if (mode == 0u)
+    {
+        const float hL = pbrParamGrad(slot, clampModeIn, uv - float2(o.x, 0.0f), duvdx, duvdy).a;
+        const float hR = pbrParamGrad(slot, clampModeIn, uv + float2(o.x, 0.0f), duvdx, duvdy).a;
+        const float hD = pbrParamGrad(slot, clampModeIn, uv - float2(0.0f, o.y), duvdx, duvdy).a;
+        const float hU = pbrParamGrad(slot, clampModeIn, uv + float2(0.0f, o.y), duvdx, duvdy).a;
+        return float2(hR - hL, hU - hD) * (size0 / 3.0f);   // divided by its own 3-texel span
+    }
+    const bool  clampUV = (clampModeIn & TEX_ADDR_MASK) != TEX_WRAP_S_WRAP_T;
+    const float fp  = max(length(duvdx * size0), length(duvdy * size0));   // footprint, base texels
+    const float lvl = max(0.0f, floor(log2(max(fp, 1e-8f))));
+    const float2 sizeL = max(floor(size0 * exp2(-lvl)), float2(1.0f, 1.0f));
+    if (mode == 1u)
+    {
+        const float hL = pbrHeightBS(slot, clampUV, uv - float2(o.x, 0.0f), sizeL, lvl);
+        const float hR = pbrHeightBS(slot, clampUV, uv + float2(o.x, 0.0f), sizeL, lvl);
+        const float hD = pbrHeightBS(slot, clampUV, uv - float2(0.0f, o.y), sizeL, lvl);
+        const float hU = pbrHeightBS(slot, clampUV, uv + float2(0.0f, o.y), sizeL, lvl);
+        return float2(hR - hL, hU - hD) * (size0 / 3.0f);
+    }
+    return pbrHeightGradBS(slot, clampUV, uv, sizeL, lvl) * sizeL;
+}
+
+// ─── Axis 2: dH/duv to a normal, with no mesh tangents ──────────────────────────────────────────
+// depth = the height range as a fraction of one UV unit (pbrParams.z). "Relative to the texture's own
+// size" is the live DX9 convention — a texture stretched 2x gets bumps 2x wider AND 2x deeper — and
+// both frames implement exactly it, so on an orthonormal UV map they agree to rounding (rig T7).
+//
+// ⚠ THE JACOBIAN SIGN, and why this is a correction rather than a transcription. The cotangent frame
+// (Schüler; BuildPerPixelTBN in the live common.hlsl) solves for the frame WITHOUT dividing by its
+// determinant det = N . (dPdx x dPdy), normalising the scale away instead — which also throws away the
+// SIGN. The formula is derived for det > 0. On D3D's y-DOWN screen det is NEGATIVE for a front face,
+// so T and B come out reversed and every bump lights from the wrong side. The rescued pbr.hlsl negates
+// ddy for exactly this reason; the live common.hlsl does not. Neither is copied: det's sign is applied
+// here, which is right on either screen convention and under a mirrored UV map as well. The rig cannot
+// see this — its synthetic screen has det > 0 — so the --forge-scene probe checks it on the GPU: a
+// ramp rising toward +u, lit from -x, must come out BRIGHTER than the flat control.
+
+float3 pbrPerturbCotangent(float3 N, float3 dPdx, float3 dPdy, float2 duvdx, float2 duvdy,
+                           float2 dhduv, float depth)
+{
+    const float3 dp2perp = cross(dPdy, N);
+    const float3 dp1perp = cross(N, dPdx);
+    float3 T = dp2perp * duvdx.x + dp1perp * duvdy.x;   // = det * grad(u)
+    float3 B = dp2perp * duvdx.y + dp1perp * duvdy.y;   // = det * grad(v)
+    const float det = dot(dPdx, dp2perp);
+    const float s = ((det < 0.0f) ? -1.0f : 1.0f) * rsqrt(max(max(dot(T, T), dot(B, B)), 1e-30f));
+    T *= s;
+    B *= s;
+    const float3 nTS = normalize(float3(-dhduv.x * depth, -dhduv.y * depth, 1.0f));
+    return normalize(nTS.x * T + nTS.y * B + nTS.z * N);
+}
+
+// Mikkelsen's surface gradient (the rescued SurfgradScaleDependent + ResolveNormalFromSurfaceGradient).
+// It works in WORLD height units and divides by the real Jacobian determinant, so an anisotropic or
+// sheared UV island is carried rather than normalised away — the rig's T7 island (1.6:1 + 20 deg shear)
+// is where the cotangent frame floors at ~2.7 deg and this does not. The world height is depth * L * h,
+// L = sqrt(world area / uv area) per pixel: the texture's own world scale, i.e. the SAME depth
+// convention the cotangent frame uses.
+float3 pbrPerturbSurfGrad(float3 N, float3 dPdx, float3 dPdy, float2 duvdx, float2 duvdy,
+                          float2 dhduv, float depth)
+{
+    const float3 vR1 = cross(dPdy, N);
+    const float3 vR2 = cross(N, dPdx);
+    const float det   = dot(dPdx, vR1);
+    const float uvDet = duvdx.x * duvdy.y - duvdx.y * duvdy.x;
+    const float L     = sqrt(abs(det) / max(abs(uvDet), 1e-30f));
+    const float2 dHduv = dhduv * (depth * L);
+    const float dHdx = dot(dHduv, duvdx);
+    const float dHdy = dot(dHduv, duvdy);
+    const float s = ((det < 0.0f) ? -1.0f : 1.0f) / max(abs(det), 1.192093e-15f);
+    return normalize(N - s * (dHdx * vR1 + dHdy * vR2));
+}
+
+float3 pbrPerturb(uint frameMode, float3 N, float3 dPdx, float3 dPdy, float2 duvdx, float2 duvdy,
+                  float2 dhduv, float depth)
+{
+    return (frameMode == 1u) ? pbrPerturbSurfGrad(N, dPdx, dPdy, duvdx, duvdy, dhduv, depth)
+                             : pbrPerturbCotangent(N, dPdx, dPdy, duvdx, duvdy, dhduv, depth);
+}
+
+// ─── The BRDF (ported from the rescued pbr.hlsl, one deviation carried across ON PURPOSE) ────────
+// GGX distribution + Heitz height-correlated Smith visibility + Schlick Fresnel.
+//
+// ⚠ NO DIVISION BY PI, as pbr.hlsl: "Morrowind uses lighting tuned for non-PBR punctual lights". That
+// is not a shortcut here, it is the unit convention of this whole frag: the diffuse term is FFE's
+// albedo * lightCol * N.L — Lambert WITHOUT its 1/pi — and every light level in the project is
+// calibrated against it. A specular lobe normalised the physical way would sit pi times dimmer than the
+// diffuse it is paired with. Dropping the 1/pi on both keeps the ratio physical.
+//
+// NOT ported from the live DX9 lighting.hlsl, which is a different model (GGX WITH its pi, Schlick-GGX
+// Smith with k = (r+1)^2/8, lights through INTENSITY * pow(col, 2.2)) built on a different light scale.
+// Returns the specular response SPLIT BY F0: spec = F0 * t.x + t.y, per colour channel. Schlick's
+// F = F0 + (1 - F0)*m^5 is affine in F0, so the split is exact — and it is what lets opaque.frag
+// accumulate every light's specular in its light loop, which runs BEFORE the albedo is sampled, and
+// apply a metal's F0 (= its albedo) once, afterwards. Hoisting the albedo sample instead would have
+// moved code the non-PBR path depends on being textually untouched.
+float2 pbrSpecTerms(float3 N, float3 L, float3 V, float NoL, float NoV, float alpha2)
+{
+    const float3 H  = normalize(V + L);
+    const float NoH = saturate(dot(N, H));
+    const float m   = 1.0f - saturate(dot(H, L));
+    const float m5  = (m * m) * (m * m) * m;                                  // Schlick weight
+    const float dd  = (NoH * alpha2 - NoH) * NoH + 1.0f;
+    const float D   = alpha2 / max(dd * dd, 1e-12f);                          // GGX, no 1/pi
+    const float lv  = NoL * sqrt((-NoV * alpha2 + NoV) * NoV + alpha2);
+    const float ll  = NoV * sqrt((-NoL * alpha2 + NoL) * NoL + alpha2);
+    const float DV  = D * (0.5f / max(lv + ll, 1e-6f));                       // x height-correlated Smith
+    return float2(DV * (1.0f - m5), DV * m5);
+}
+
+// Karis' analytic fit of the split-sum environment BRDF (as used by the live DX9 lighting.hlsl, with
+// its scale/bias in the original order): the fraction of an environment the lobe reflects, as F0*A + B.
+float3 pbrEnvBRDF(float3 f0, float NoV, float rough)
+{
+    const float4 c0 = float4(-1.0f, -0.0275f, -0.572f, 0.022f);
+    const float4 c1 = float4(1.0f, 0.0425f, 1.04f, -0.04f);
+    const float4 r  = rough * c0 + c1;
+    const float a004 = min(r.x * r.x, exp2(-9.28f * NoV)) * r.x + r.y;
+    const float2 AB  = float2(-1.04f, 1.04f) * a004 + r.zw;
+    return f0 * AB.x + AB.y;
+}
+
+// The _paramh's material, decoded exactly as the live DX9 PS decodes it, so the art reads here as it
+// was authored against there. Three separate reads because opaque.frag needs them at three different
+// points: roughness before its light loop, metalness before it folds diffuse into `lit`, and F0 only
+// once the albedo exists.
+//
+// ⚠ F0 = 0.04 * b^2 gives 0.01 at the export's default b = 0.5, although the live comment calls 0.5
+// "standard dielectric" (0.04, which would be Disney's 0.08*b). The decode is carried across unchanged
+// on purpose: the maps were judged against it. It is flagged in the plan, not fixed here.
+float pbrRoughness(float4 param) { return clamp(param.g, 0.05f, 1.0f); }   // the live 0.05 floor
+float pbrMetalness(float4 param) { return saturate(param.r); }
+float3 pbrF0(float4 param, float3 albedo)
+{
+    const float b = saturate(param.b);
+    return lerp(float3(0.04f, 0.04f, 0.04f) * (b * b), albedo, pbrMetalness(param));
+}

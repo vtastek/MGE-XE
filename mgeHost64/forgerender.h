@@ -336,6 +336,26 @@ namespace ForgeRender {
     // --forge-scene probe to ground-truth the fragment output offline.
     void debugReadbackCenterPixel();
 
+    // WHOLE-FRAME PER-CHANNEL MAXIMUM, for a question the centre pixel cannot answer.
+    //
+    // A format test wants to know which CHANNELS a texture lit, anywhere in the frame: a BC4 height
+    // map decodes to (h,0,0,1) and a BC5 pair to (r,g,0,1), so a correct load lights ONE channel and
+    // a silent fall-back to the default white lights all three equally. No pixel has to be known in
+    // advance, and it also reports the signed channel imbalance, which stays readable however much
+    // grey content the frame carries.
+    //
+    // ⚠ WHY THIS WAS WRITTEN, AND THE FIRST DIAGNOSIS WAS WRONG. With the dev panel up, the centre
+    // pixel read 15,15,15 in every probe frame — including the two with stated expectations of
+    // ~129 and ~248 — and every channel maximum read 255. That looked like a probe pointing at
+    // background, and it was first put down to the triangle's corner missing (W/2, H/2) under the
+    // fill rule. It was the PANEL: drawn into the delivered frame, its dark backdrop covered the
+    // centre and its white text saturated every maximum. The probe now hides it (uiHideForProbe)
+    // and the centre reads the scene again (149 and 240).
+    void debugReadbackChannelMax(const char* tag);
+    // Mean (B+G+R)/3 of the delivered rect, 0..255 (-1 when nothing can be read). For the PBR sign
+    // test, where the surface under test IS the frame and the question is which way it moved.
+    double debugReadbackMeanLuma();
+
     // Tier 2 diag: read back pAO (RGBA16F) and printf 3 texels — GTAO write vs graphics read.
     void debugReadbackAO();
 

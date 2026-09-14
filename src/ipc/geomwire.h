@@ -153,7 +153,7 @@ namespace IPC {
     // to be invisible. MASK|HULL are also barred from the shadow-caster lists: a helper volume
     // casting its own shadow into the pit it opens would be nonsense.
     //
-    // Riding casterFlags' spare bits — no wire size change (DrawItemWire is a shipped-together 112).
+    // Riding casterFlags' spare bits — no wire size change (DrawItemWire is a shipped-together 144).
     constexpr std::uint32_t kDrawPortalMask   = 0x4;
     constexpr std::uint32_t kDrawPortalHull   = 0x8;
     constexpr std::uint32_t kDrawPortalMember = 0x10;
@@ -163,7 +163,7 @@ namespace IPC {
     // model->world transform (D3DXMATRIX bytes, row-major — uploaded straight into the
     // host's gObject cbuffer; see opaque.srt.h for the no-transpose convention). The
     // per-frame draw list is an array of these in a chunked byte vec, with the camera
-    // view*proj carried inline in the RenderFrame RPC params. 112 bytes — client and
+    // view*proj carried inline in the RenderFrame RPC params. 144 bytes — client and
     // host MUST ship together on any size change (AT3 precedent).
     struct DrawItemWire {
         std::uint32_t slot;
@@ -200,7 +200,25 @@ namespace IPC {
         // BLACK rather than merely un-boosted. Every writer must set it; the two paths with no
         // fixture to derive a gain from (captured DIPs, FP particle quads) set 1.0 explicitly.
         float         emissiveGain[3];
+        // PBR MATERIAL (tasks/forge-pbr-materials.md, Track C). Bindless gTextures[] slot of the
+        // base texture's `<base>_paramh.dds` — DXT5, R = metal, G = roughness, B = IOR/spec,
+        // A = HEIGHT — or 0 when the base texture has none. The same pattern as texIndex and
+        // overlayTexIndex a third time: a slot on the draw item, resolved (and LRU-refreshed) through
+        // the client's own residency, so an in-use param map can never be recycled out from under a
+        // draw that still names it.
+        //
+        // ⚠ 0 IS "NO PBR MATERIAL", AND THAT IS WHAT KEEPS MIXED COVERAGE BIT-IDENTICAL. opaque.frag
+        // runs its PBR block only for a nonzero slot, on a flat per-draw branch, so every material
+        // with no _paramh takes exactly today's arithmetic — one shader, no permutation, and coverage
+        // grows by dropping files in. The host also zeroes it when the slot's upload did not land
+        // (and when the pbrEnable knob is off), so the failure mode is the OLD image, never a white
+        // param map read as metal = 1.
+        std::uint32_t paramTexIndex;
     };
+    // ⚠ This comment block said "112 bytes" for three field-additions after it stopped being true
+    // (emissiveGain and the lanes before it took it to 140; paramTexIndex makes 144). A size stated in
+    // prose is a claim nothing checks, so the number now lives where the compiler reads it.
+    static_assert(sizeof(DrawItemWire) == 144, "DrawItemWire changed size: client and host must ship together");
 
     // MW's texture address mode, shipped raw (the shader's TEX_* defines use the same 4 values in
     // the same order, so nothing translates it anywhere along the way).
@@ -230,8 +248,19 @@ namespace IPC {
     // [TexUploadWire][dds bytes] entries through the geometry channel's chunked vec. The host
     // parses the DDS (BCn/uncompressed + mip chain) into gTextures[slot]. slot 0 is the host's
     // default white texture (never uploaded). Sent once per unique texture (no re-upload).
+    // TexUploadWire::slot bit 31: this texture is DATA, not colour — upload it under its stored
+    // UNORM format and never through the scene's sRGB view. Set by the client on `_paramh` maps.
+    //
+    // Needed because the host's scene decode (toSceneTextureFormat) re-views every BC1/2/3 as
+    // _SRGB in the linear scene, and a _paramh is BC3: its RGB would come back sRGB-DECODED —
+    // roughness 0.5 read as 0.21 — while its alpha (height) survived, since sRGB never touches
+    // alpha. The host cannot tell a param map from albedo by its bytes, so the client says so.
+    // Bit 31 and not a new field: plain slots are < kMaxTextures and flip slots use bit 15 with
+    // their bucket/layer in bits 0-14, so bits 16-31 of `slot` are free on every upload.
+    constexpr std::uint32_t kTexUploadData = 0x80000000u;
+
     struct TexUploadWire {
-        std::uint32_t slot;
+        std::uint32_t slot;       // bindless slot (or encoded flip slot); bit 31 = kTexUploadData
         std::uint32_t byteLen;    // length of the DDS blob that follows inline
         // FLIP-BOOK ARRAY SLICES ONLY (slot & kFlipSlotFlag): total slice count of the
         // Texture2DArray this slice belongs to. Every slice of a bucket carries the SAME value, so

@@ -1118,6 +1118,11 @@ namespace ForgeRender {
     // Pins the exposure servo off. Defined beside the servo itself, far below — the flag lives in
     // the anonymous namespace that opens after this block, so it is unreachable from here.
     void expDisableForProbe();
+    // Hides the dev panel for the probe. Same arrangement as expDisableForProbe, same reason: the
+    // flag (g_uiVisible) lives in the anonymous namespace below.
+    void uiHideForProbe();
+    // Sets the PBR knobs for the probe's sign test (same arrangement, same reason).
+    void pbrSetForProbe(uint32_t gradMode, uint32_t frameMode);
 
     // Standalone exercise of the M1c opaque scene path (init → uploadGeometry →
     // renderScene) with a dummy triangle mesh, so the host-side printf/asserts are
@@ -1130,6 +1135,13 @@ namespace ForgeRender {
         // happened to render and on what they contained. Pin it off before init(), so the probe
         // keeps measuring the shader chain and nothing else.
         expDisableForProbe();
+        // ⚠ AND THE DEV PANEL OFF, for the same class of reason. The panel is drawn INTO the
+        // delivered frame, and it prints LIVE HOST TIMINGS ("host CPU 1.69 ms ..."), which differ
+        // on every run. Measured: two runs of an unchanged binary disagreed on 130-170 pixels per
+        // frame, every one of them inside the panel's text rows. With the panel up, no two probe
+        // frames can ever hash equal, and a bit-identity check built on the hash is testing the
+        // clock. Off, the frame is the scene and nothing else.
+        uiHideForProbe();
         // M1: arm the motion-vector pass. BEFORE init, so the resources are built with it on, and
         // unconditionally rather than behind a knob — the invariant it checks ("a static camera
         // produces zero motion") is the pass's contract, not an option, and a check that has to be
@@ -1283,6 +1295,236 @@ namespace ForgeRender {
                     (int)ok, lastSkinnedDrawn());
 
         debugReadbackCenterPixel();   // ground-truth the frag output (defined after g_live)
+
+        // ─── THE PBR FORMAT GATE: BC4 AND BC5, THROUGH THE REAL UPLOAD PATH ─────────────────────
+        //
+        // Until the patch this block guards, parseDds knew DXT1/3/5 and DX10 BC1/2/3 and nothing
+        // else, so a BC4 height map or a BC5 derivative map returned ok=false and THE SLOT STAYED
+        // DEFAULT WHITE. Nothing crashed, nothing logged at eERROR, and the material simply came
+        // out flat. That is the precise failure this probe is shaped against: a silent fallback
+        // makes every arm of the height-vs-derivative A/B sample the SAME white texture, and four
+        // agreeing arms read as "the reconstruction barely matters" rather than "nothing loaded".
+        //
+        // So the test discriminates rather than merely surviving. Each case decodes to a value that
+        // differs from white AND from the other cases, and each is sampled through the shader — a
+        // straight copyResource of a BCn texture hands back the blocks you uploaded and would prove
+        // only that memcpy works. Both header paths are exercised for both formats because they are
+        // separate code: ATI1/ATI2 (what MW-era tools, nvtt and Compressonator stamp) and DX10
+        // DXGI 80/83 (what texconv stamps).
+        //
+        // ⚠ READ THE FAILURE, NOT JUST THE PASS: if a case prints the white reference's own grey
+        // (~129 on every channel) it did NOT load — it fell back. A case that loaded prints its own
+        // channel lit and the others at ~0.
+        {
+            struct BcProbeCase {
+                const char* name;
+                uint32_t    fourCC;    // 'ATI1'/'ATI2', or 'DX10' when dxgi != 0
+                uint32_t    dxgi;      // 0 = no DX10 header
+                uint8_t     r, g;      // constant value per block
+                bool        twoBlock;  // BC5 = two BC4 blocks, red then green
+                uint32_t    slot;
+                const char* expect;
+            };
+            const BcProbeCase bcCases[] = {
+                { "BC4 'ATI1'  h=1.0", 0x31495441u,  0u, 255u,   0u, false, 3u, "R at the white reference, G=B~0" },
+                { "BC4 DX10 80 h=0.0", 0x30315844u, 80u,   0u,   0u, false, 4u, "ALL channels ~0 (a fallback would be grey)" },
+                { "BC5 'ATI2'  (0,1)", 0x32495441u,  0u,   0u, 255u, true,  5u, "G at the white reference, R=B~0" },
+                { "BC5 DX10 83 (1,0)", 0x30315844u, 83u, 255u,   0u, true,  6u, "R at the white reference, G=B~0" },
+            };
+            // ⚠ NO SKINNED DRAW IN THIS BLOCK, and that is the difference between a measurement
+            // and a saturated constant. The probe's skinned triangle carries texIndex 0 — the
+            // DEFAULT WHITE — and covers a quarter of the frame, so with it in the list every case
+            // read back a frame maximum of 255,255,255 including the one whose texture decodes to
+            // solid BLACK. The channel that was supposed to answer the question was being answered
+            // by a different triangle. Dropping the skinned list leaves only the textured opaque
+            // draw in the frame, which is the surface under test.
+            //
+            // The reference the four cases are read against, taken with the SAME instrument and
+            // the same draw list: slot 1 is the white DXT1 uploaded above, so all three channels
+            // must peak together. Any BC case that reproduces THIS triple fell back to white.
+            item.texIndex = 1;
+            renderScene(vp, lt, &item, 1, (unsigned)sizeof(item),
+                        nullptr, 0, 0, nullptr, 0, 0, nullptr, 0, 0);
+            debugReadbackChannelMax("WHITE reference (DXT1)");
+            for (const BcProbeCase& bc : bcCases) {
+                // 4x4, one mip. A CONSTANT block is r0 == r1 with all-zero indices, and index 0
+                // selects endpoint 0 under both of BC4's interpolation modes — so the decoded value
+                // is exact and does not depend on which ramp the hardware picks for r0 == r1.
+                uint8_t d[148 + 16] = {};
+                d[0] = 'D'; d[1] = 'D'; d[2] = 'S'; d[3] = ' ';
+                *(uint32_t*)(d + 4)  = 124;          // dwSize
+                *(uint32_t*)(d + 12) = 4;            // dwHeight
+                *(uint32_t*)(d + 16) = 4;            // dwWidth
+                *(uint32_t*)(d + 28) = 1;            // dwMipMapCount
+                *(uint32_t*)(d + 76) = 32;           // ddspf dwSize
+                *(uint32_t*)(d + 80) = 0x4;          // DDPF_FOURCC
+                *(uint32_t*)(d + 84) = bc.fourCC;
+                uint32_t off = 128;
+                if (bc.dxgi) {
+                    *(uint32_t*)(d + 128) = bc.dxgi;   // DXGI_FORMAT
+                    *(uint32_t*)(d + 132) = 3;         // D3D10_RESOURCE_DIMENSION_TEXTURE2D
+                    *(uint32_t*)(d + 140) = 1;         // arraySize
+                    off = 148;
+                }
+                d[off + 0] = bc.r; d[off + 1] = bc.r;
+                uint32_t ddsBytes = off + 8;
+                if (bc.twoBlock) { d[off + 8] = bc.g; d[off + 9] = bc.g; ddsBytes = off + 16; }
+
+                uint8_t blob[sizeof(IPC::TexUploadWire) + sizeof(d)];
+                IPC::TexUploadWire bh{ bc.slot, ddsBytes };
+                std::memcpy(blob, &bh, sizeof(bh));
+                std::memcpy(blob + sizeof(bh), d, ddsBytes);
+                const unsigned bcBuilt = uploadTextures(blob, (unsigned)(sizeof(bh) + ddsBytes), 1);
+                std::printf("[forge] scene-probe: %s -> slot %u, built %u/1; expect %s\n",
+                            bc.name, bc.slot, bcBuilt, bc.expect);
+                item.texIndex = bc.slot;
+                renderScene(vp, lt, &item, 1, (unsigned)sizeof(item),
+                            nullptr, 0, 0, nullptr, 0, 0, nullptr, 0, 0);
+                debugReadbackChannelMax(bc.name);
+            }
+            // ⚠ PUT IT BACK. `item` is reused by the upscale stage far below, which asserts an
+            // exact CENTRE of 15,15,15 — reached with the white DXT1 in slot 1. Leaving a BC5 bound
+            // there would fail that assertion for a reason with nothing to do with the upscaler.
+            item.texIndex = 1;
+        }
+
+        // ─── THE PBR SIGN TEST (tasks/forge-pbr-materials.md, Track C) ─────────────────────────────
+        //
+        // WHAT IT PROVES THAT THE RIG CANNOT. The cotangent frame is derived for a positive Jacobian
+        // determinant; on D3D's y-DOWN screen a front face has a NEGATIVE one, so a frame that drops
+        // its sign reverses every bump. The offline rig's synthetic screen has det > 0 and cannot see
+        // that. This does, on the GPU, through the real upload + pipeline + shader:
+        //
+        //   The probe's fullscreen triangle has u = (x+1)/2 and normal +z. A height ramp RISING toward
+        //   +u slopes the surface up toward +x, so its normal tilts toward -x. One point light sits at
+        //   -x, grazing. A correctly oriented bump therefore turns TOWARD the light and the frame gets
+        //   BRIGHTER than the flat control; the mirrored ramp gets DARKER. An inverted frame swaps them.
+        //
+        // Each map is rendered with the light off and on, and the DIFFERENCE is what is scored, so the
+        // ambient term — which also sees the bumped normal on PBR draws — cancels out of the reading.
+        // Every gradient mode and both frames are run: they must all agree on the sign.
+        {
+            // A 64x64 DXT5 _paramh: RGB = (metal 0, rough 1, IOR 0.5) in the colour block, HEIGHT in the
+            // alpha block. Rough 1 keeps the specular negligible (and the probe's eye sits BEHIND the
+            // plane's normal anyway), so the reading is the diffuse response to the normal alone.
+            auto buildParam = [](int kind, std::vector<uint8_t>& out) {   // 0 rising u, 1 falling u, 2 flat, 3 rising v
+                const uint32_t W = 64, Hh = 64, bw = W / 4, bh = Hh / 4;
+                out.assign(128 + (size_t)bw * bh * 16, 0);
+                uint8_t* d = out.data();
+                d[0] = 'D'; d[1] = 'D'; d[2] = 'S'; d[3] = ' ';
+                *(uint32_t*)(d + 4)  = 124;
+                *(uint32_t*)(d + 12) = Hh;
+                *(uint32_t*)(d + 16) = W;
+                *(uint32_t*)(d + 28) = 1;
+                *(uint32_t*)(d + 76) = 32;
+                *(uint32_t*)(d + 80) = 0x4;
+                *(uint32_t*)(d + 84) = 0x35545844u;   // 'DXT5'
+                for (uint32_t by = 0; by < bh; ++by) {
+                    for (uint32_t bx = 0; bx < bw; ++bx) {
+                        uint8_t* blk = d + 128 + ((size_t)by * bw + bx) * 16;
+                        uint8_t v[16];
+                        for (uint32_t t = 0; t < 16; ++t) {
+                            const uint32_t x = bx * 4 + (t & 3);
+                            const uint32_t y = by * 4 + (t >> 2);
+                            // DDS rows run TOP-DOWN, i.e. in the direction of increasing v.
+                            const double r = (double)x / (double)(W - 1);
+                            const double q = (double)y / (double)(Hh - 1);
+                            v[t] = (uint8_t)std::lround(255.0 * (kind == 0 ? r : kind == 1 ? 1.0 - r
+                                                               : kind == 3 ? q : 0.5));
+                        }
+                        uint8_t a0 = 0, a1 = 255;
+                        for (uint8_t q : v) { a0 = std::max(a0, q); a1 = std::min(a1, q); }
+                        blk[0] = a0; blk[1] = a1;
+                        uint64_t bits = 0;
+                        if (a0 > a1) {   // 6-interpolant mode: nearest of the 8 real decode values
+                            double tab[8] = { (double)a0, (double)a1 };
+                            for (int k = 0; k < 6; ++k) { tab[2 + k] = ((6 - k) * a0 + (1 + k) * a1) / 7.0; }
+                            for (uint32_t t = 0; t < 16; ++t) {
+                                int best = 0;
+                                for (int k = 1; k < 8; ++k) { if (std::fabs(tab[k] - v[t]) < std::fabs(tab[best] - v[t])) { best = k; } }
+                                bits |= (uint64_t)best << (3 * t);
+                            }
+                        }                // else a constant block: index 0 everywhere, exact
+                        for (int k = 0; k < 6; ++k) { blk[2 + k] = (uint8_t)(bits >> (8 * k)); }
+                        const uint16_t c565 = (uint16_t)((0u << 11) | (63u << 5) | 16u);   // R0 G255 B~128
+                        blk[8] = (uint8_t)c565; blk[9] = (uint8_t)(c565 >> 8);
+                        blk[10] = (uint8_t)c565; blk[11] = (uint8_t)(c565 >> 8);   // c0 == c1, idx 0
+                    }
+                }
+            };
+            const uint32_t pslot[4] = { 7u, 8u, 9u, 10u };
+            for (int k = 0; k < 4; ++k) {
+                std::vector<uint8_t> dds;
+                buildParam(k, dds);
+                std::vector<uint8_t> blob(sizeof(IPC::TexUploadWire) + dds.size());
+                // kTexUploadData: the host must keep this UNORM and record the slot as a param map —
+                // without the flag the draw below would be refused its param slot by the host gate.
+                IPC::TexUploadWire th{ pslot[k] | IPC::kTexUploadData, (uint32_t)dds.size(), 0u };
+                std::memcpy(blob.data(), &th, sizeof(th));
+                std::memcpy(blob.data() + sizeof(th), dds.data(), dds.size());
+                const unsigned b = uploadTextures(blob.data(), (unsigned)blob.size(), 1);
+                std::printf("[forge] scene-probe: PBR param map %s -> slot %u, built %u/1\n",
+                            k == 0 ? "RISING +u" : k == 1 ? "FALLING +u" : k == 2 ? "FLAT" : "RISING +v",
+                            pslot[k], b);
+            }
+            // Light A at -x answers the u ramps; light B at -y answers the v ramp. Two, because the
+            // screen's y-flip reaches the frame through the ddy terms, which build the B (v) axis —
+            // a sign handled right for u and wrong for v would pass a u-only test.
+            IPC::PointLightWire plA = {}, plB = {};
+            plA.posRadius[0] = -3.0f; plA.posRadius[1] = 0.0f; plA.posRadius[2] = 1.5f; plA.posRadius[3] = 1000.0f;
+            plB.posRadius[0] = 0.0f; plB.posRadius[1] = -3.0f; plB.posRadius[2] = 1.5f; plB.posRadius[3] = 1000.0f;
+            plA.color[0] = plA.color[1] = plA.color[2] = 1.0f;
+            plB.color[0] = plB.color[1] = plB.color[2] = 1.0f;
+            plA.falloff[0] = plB.falloff[0] = 1.0f;   // k0 = 1: constant attenuation, Lambert alone
+
+            IPC::DrawItemWire pi = item;
+            pi.texIndex = 1u;       // the white DXT1 base
+            auto lightDelta = [&](uint32_t paramSlot, const IPC::PointLightWire& light) {
+                pi.paramTexIndex = paramSlot;
+                renderScene(vp, lt, &pi, 1, (unsigned)sizeof(pi), nullptr, 0, 0, nullptr, 0, 0, nullptr, 0, 0);
+                const double off = debugReadbackMeanLuma();
+                renderScene(vp, lt, &pi, 1, (unsigned)sizeof(pi), nullptr, 0, 0, nullptr, 0, 0,
+                            &light, 1, (unsigned)sizeof(light));
+                const double on = debugReadbackMeanLuma();
+                return on - off;
+            };
+            const char* gName[3] = { "cd", "cdbs", "bspline" };
+            const char* fName[2] = { "cotangent", "surfgrad" };
+            const double dNone = lightDelta(0u, plA);   // no param map at all: the pre-PBR response
+            bool allPass = true;
+            for (uint32_t gm = 0; gm < 3; ++gm) {
+                for (uint32_t fm = 0; fm < 2; ++fm) {
+                    pbrSetForProbe(gm, fm);
+                    const double dRise  = lightDelta(pslot[0], plA);
+                    const double dFall  = lightDelta(pslot[1], plA);
+                    const double dFlat  = lightDelta(pslot[2], plA);
+                    const double dRiseV = lightDelta(pslot[3], plB);
+                    const double dFlatV = lightDelta(pslot[2], plB);
+                    // Pass: (1) rising brighter than flat and falling darker, each by more than a
+                    // quarter code of readback noise; (2) the SAME for the v axis under its own light;
+                    // (3) flat sits at the MIDPOINT of rising and falling, within a tenth of their
+                    // spread — the response to a slope is odd in the slope, so a flat height perturbs
+                    // the normal by nothing.
+                    //
+                    // ⚠ NOT "flat equals no param map", which was the first version of (3) and failed
+                    // every mode by ~2.3 codes. A flat _paramh is still a PBR MATERIAL: at roughness 1
+                    // its GGX lobe is broad and reflects this light too. That offset is the BRDF, not the
+                    // normal, and it is reported beside the verdict rather than judged by it.
+                    const double spread = dRise - dFall;
+                    const bool pass = (dRise > dFlat + 0.25) && (dFall < dFlat - 0.25) &&
+                                      (dRiseV > dFlatV + 0.25) &&
+                                      (std::fabs(0.5 * (dRise + dFall) - dFlat) < 0.1 * std::fabs(spread));
+                    allPass = allPass && pass;
+                    std::printf("[forge] scene-probe: PBR SIGN %-7s / %-9s  u: rising %+7.3f  flat %+7.3f  falling %+7.3f"
+                                "  | v: rising %+7.3f  flat %+7.3f  | flat-vs-no-param %+6.3f (specular)  -> %s\n",
+                                gName[gm], fName[fm], dRise, dFlat, dFall, dRiseV, dFlatV, dFlat - dNone,
+                                pass ? "PASS" : "FAIL");
+                }
+            }
+            std::printf("[forge] scene-probe: PBR SIGN TEST %s (a ramp rising toward a light must "
+                        "brighten in every mode)\n", allPass ? "PASS" : "FAILED");
+            pbrSetForProbe(0u, 0u);   // back to the defaults for anything below
+        }
 
         // Third render: MULTI-MAP ONLY (slot 2) — 2 stages over the now-resident white texture
         // (slot 1): BASE on UV set 0 + GLOW ADD on UV set 1. base = white*lit (lit = white*(0.5
@@ -5773,9 +6015,19 @@ namespace {
     // shadowparams.h.fsl::maskProf for what each lane cuts.
     constexpr uint32_t kMaskProfFloat         = kGrassParams8Float + 4;
     constexpr uint32_t kAoBounceFloat         = kMaskProfFloat + 4;
+    // PBR material knobs (shadowparams.h.fsl pbrParams): x gradMode, y frameMode, z depth, w spare.
+    constexpr uint32_t kPbrParamsFloat        = kAoBounceFloat + 4;
     constexpr uint32_t kShadowParamsBytes = 4096;
     static_assert((kAoBounceFloat + 4) * sizeof(float) <= kShadowParamsBytes,
                   "ShadowMaskParams overflows its CBV — too many sun cascades");
+    static_assert((kPbrParamsFloat + 4) * sizeof(float) <= kShadowParamsBytes,
+                  "pbrParams must fit inside the ShadowMaskParams CBV");
+    // The float indices above are kept in step with the struct BY HAND, one +4 at a time, and
+    // nothing checked that the running sum still lands on the member it names. A lane written one
+    // float4 off reads as a knob that does nothing, or as garbage in a neighbour's slot — both of
+    // which look like "the effect is subtle". This pins the newest lane to the member itself.
+    static_assert(offsetof(ShadowMaskParams, pbrParams) == kPbrParamsFloat * sizeof(float),
+                  "kPbrParamsFloat does not land on ShadowMaskParams::pbrParams");
     // msmrecv.h.fsl's PCSS works in TEXELS, so SUN_SHADOW_RES has to agree with the atlas the host
     // actually allocated. Same mirroring contract as SUN_CASCADES / kSunCascades.
     static_assert(kSunShadowRes == 2048, "SUN_SHADOW_RES in shadowparams.h.fsl must match kSunShadowRes");
@@ -6742,6 +6994,55 @@ namespace {
     enum : uint8_t { kTexAlphaOpaque = 0, kTexAlphaMask = 1, kTexAlphaTranslucent = 2,
                      kTexAlphaSoft = 3 };
     uint8_t g_texAlphaKind[MAX_TEXTURES] = {};
+    // PBR (tasks/forge-pbr-materials.md): 1 = the texture in this slot arrived as DATA
+    // (IPC::kTexUploadData — a _paramh) AND its upload landed. It is the only evidence the shader is
+    // allowed to act on. A slot whose upload failed keeps whatever it held before, so a RECYCLED
+    // slot that failed would otherwise hand opaque.frag the previous occupant's ALBEDO as
+    // metal/rough/IOR. Cleared on every upload attempt into the slot, set only on success: a draw's
+    // param slot reaches the shader only while a param map is really there.
+    uint8_t g_texIsData[MAX_TEXTURES] = {};
+
+    // ---- PBR MATERIAL KNOBS (tasks/forge-pbr-materials.md, Track C) --------------------------
+    // Defaults reproduce the LIVE DX9 shader's reconstruction (a central difference at +-1.5 base
+    // texels through a cotangent frame), so the first Forge-vs-DX9 A/B compares like with like and
+    // every departure from it is a knob someone moved on purpose. What the rig says about each arm
+    // is in mgeHost64/pbrsynth/README.md; the in-scene A/B is these knobs.
+    //
+    // pbrEnable: OFF zeroes every draw's param slot at pack time, so opaque.frag never enters its
+    //   PBR block and the frame is today's image exactly. Not a shader lane on purpose: "off" is
+    //   bit-identical by construction rather than by a multiply that happens to be by zero.
+    bool     g_pbrEnable    = true;
+    // pbrGradMode — how dH/duv is read out of the height (alpha) channel:
+    //   0 cd      live DX9: central difference at +-1.5 base texels, bilinear taps. Kinks at every
+    //             texel-cell edge (rig T3: facet enrichment at the ceiling, 16 of 16).
+    //   1 cdbs    the same difference with each tap read through a cubic B-spline. The rig's best
+    //             runtime arm on content whose top octave is codec noise (135 of the 208 shipped
+    //             4096 maps): facets 1.9, and lower angular error than cd at every resolution.
+    //             16 bilinear fetches against cd's 4. Rounds a sharp crease.
+    //   2 bspline analytic derivative of the cubic B-spline (C2 height, so the normal is C1):
+    //             facets ~1, but a narrow baseline lets ~2x the 8-bit noise through on smooth
+    //             content. The better arm where a map carries real detail near its Nyquist.
+    uint32_t g_pbrGradMode  = 0u;
+    // pbrFrameMode — how dH/duv becomes a normal with no mesh tangents:
+    //   0 cotangent frame (live DX9's BuildPerPixelTBN, with the Jacobian's SIGN honoured — see
+    //     pbrmaterial.h.fsl for why that is a correction and not a transcription).
+    //   1 Mikkelsen surface gradient. Identical on an orthonormal UV map; exact under a skewed or
+    //     anisotropic one, where the cotangent frame floors at ~2.7 deg (rig T7).
+    uint32_t g_pbrFrameMode = 0u;
+    // pbrDepth — the height channel's full range as a fraction of one UV unit, i.e. how deep the
+    //   relief is RELATIVE TO THE TEXTURE'S OWN SIZE. 48/4096 is the live DX9 look at 4096 (its
+    //   heightScale of 16 over a raw 3-texel difference). The DX9 gain is 16*N/3 — proportional to
+    //   RESOLUTION (rig T9), so a 2048 re-encode would read half as deep there. Here the difference
+    //   is divided by its own tap spacing, so the same art reads the same depth at every size. This
+    //   is a calibration constant, not a lever for facets: raising it deepens them, it does not
+    //   remove them (rig T3/T9).
+    float    g_pbrDepth     = 48.0f / 4096.0f;
+
+    // The ONE gate every writer of the static instance lane [15] goes through.
+    inline uint32_t pbrParamSlotFor(uint32_t paramTexIndex) {
+        return (g_pbrEnable && paramTexIndex != 0u && paramTexIndex < (uint32_t)MAX_TEXTURES &&
+                g_texIsData[paramTexIndex] != 0u) ? paramTexIndex : 0u;
+    }
     // Same classification for flip-book slices, which have no gTextures slot to key on. One vector
     // per bucket, sized when the bucket's array is created (uploadFlipSlice).
     std::vector<uint8_t> g_flipAlphaKind[MAX_FLIP_BUCKETS];
@@ -6764,7 +7065,9 @@ namespace {
     //   [2..4] matDiffuse.rgb (float)        [5..7] matAmbient.rgb (float)   [8..10] matEmissive.rgb (float)
     //   [11] OverlayIndex (terrain DECAL_1 bindless slot, 0 = no decal; per-frame)
     //   [12..14] emissiveGain.rgb (float) — the flux/area emissive boost, a per-channel RATIO.
-    // 15 * 4 = 60 bytes. The material + overlay ride the instance VB (not a new cbuffer/descriptor
+    //   [15] ParamIndex (PBR _paramh bindless slot, 0 = no PBR material; per-frame, always through
+    //        pbrParamSlotFor). Read by opaque.frag only.
+    // 16 * 4 = 64 bytes. The material + overlay ride the instance VB (not a new cbuffer/descriptor
     // set) to avoid the FSL descriptor-offset gotcha that hoisted the sampler — see opaque.srt.h.
     //
     // ⚠ THE GAIN LANES ARE THE ONE GROUP WHOSE IDENTITY IS 1.0, NOT 0. opaque.vert multiplies the
@@ -6773,7 +7076,7 @@ namespace {
     // explicitly — 1.0f on the passes that carry no boost (shadow, sky) and the real gain on the
     // four that shade emissive (opaque, alpha, FP rigid, FP alpha). The creation-time identity
     // init seeds 1.0 as well, so a pass added later inherits "no boost" rather than "no emissive".
-    constexpr uint32_t kStaticInstU32 = 15;
+    constexpr uint32_t kStaticInstU32 = 16;
 
     // Pack the per-draw instance .y: texIndex in the low 16 bits (slots < kMaxTextures=1024,
     // so ≤10 bits), the alpha-test reference quantised to a byte in bits 16-23, the
@@ -8449,9 +8752,9 @@ namespace {
         vl.mBindingCount = 2;
         vl.mBindings[0].mStride = sizeof(IPC::GeomVertexWire);
         vl.mBindings[0].mRate = VERTEX_BINDING_RATE_VERTEX;
-        vl.mBindings[1].mStride = kStaticInstU32 * sizeof(uint32_t);   // {DrawIndex, TexAlpha, matDiff3, matAmb3, matEmis3}
+        vl.mBindings[1].mStride = kStaticInstU32 * sizeof(uint32_t);   // {DrawIndex, TexAlpha, matDiff3, matAmb3, matEmis3, Overlay, EmisGain3, ParamIndex}
         vl.mBindings[1].mRate = VERTEX_BINDING_RATE_INSTANCE;
-        vl.mAttribCount = 11;
+        vl.mAttribCount = 12;
         vl.mAttribs[0].mSemantic = SEMANTIC_POSITION;
         vl.mAttribs[0].mFormat = TinyImageFormat_R32G32B32_SFLOAT;
         vl.mAttribs[0].mBinding = 0;
@@ -8507,6 +8810,14 @@ namespace {
         vl.mAttribs[10].mBinding = 1;
         vl.mAttribs[10].mLocation = 10;
         vl.mAttribs[10].mOffset = 12 * sizeof(uint32_t);
+        // PBR param-map slot. EVERY pipeline built on this layout gets it, whether or not its frag
+        // reads it — they all share opaque.vert, which declares it as an input, and a layout missing
+        // an input the vert declares is a PSO that does not build.
+        vl.mAttribs[11].mSemantic = SEMANTIC_TEXCOORD8;      // ParamIndex (per-instance: PBR _paramh slot)
+        vl.mAttribs[11].mFormat = TinyImageFormat_R32_UINT;
+        vl.mAttribs[11].mBinding = 1;
+        vl.mAttribs[11].mLocation = 11;
+        vl.mAttribs[11].mOffset = 15 * sizeof(uint32_t);
 
         // COLOUR-pass depth (Phase 1 early-Z): the Z-prepass already wrote every opaque pixel's
         // depth, so the colour pass only MATCHES it — CMP_EQUAL + depthWrite OFF = true early-Z,
@@ -9287,6 +9598,7 @@ namespace {
 
             for (uint32_t i = 0; i < kMaxTextures; ++i) {
                 g_live.pTextures[i] = g_live.pDefaultWhite;
+                g_texIsData[i] = 0u;   // no slot holds a param map until an upload proves it again
             }
             g_live.texHigh = 0;
 
@@ -21788,6 +22100,22 @@ namespace {
           t.sliderF("ALPHA: light transmission strength", &g_alphaTransmitStrength, 0.0f, 1.0f, 0.02f);
           t.flush(); }
 
+        // -- Tab: PBR materials (tasks/forge-pbr-materials.md, Track C) --
+        // Only surfaces whose base texture has a <base>_paramh.dds beside it are affected; everything
+        // else is shaded exactly as before whatever these say. F12 mode 8 (world normal) shows the
+        // height-derived normal on those surfaces, which is the quickest way to see the modes differ.
+        { TabBuilder t; t.panel = g_uiPanel; t.name = "PBR materials";
+          t.checkbox("PBR materials (_paramh) — off = today's image exactly", &g_pbrEnable);
+          t.sliderU("  gradient: 0 cd (live DX9) | 1 cdbs (B-spline taps) | 2 bspline (C2)",
+                    &g_pbrGradMode, 0u, 2u, 1u);
+          t.sliderU("  frame: 0 cotangent (live DX9) | 1 surface gradient (exact under skew)",
+                    &g_pbrFrameMode, 0u, 1u, 1u);
+          // A calibration constant, not a fix: raising it deepens the facets, it does not remove
+          // them (see g_pbrDepth).
+          t.sliderF("  relief depth (fraction of the texture's width; 0.0117 = DX9 @4096)",
+                    &g_pbrDepth, 0.0f, 0.05f, 0.0005f);
+          t.flush(); }
+
         // -- Tab: AO & Lighting (GTAO knobs + intensity debug scales) --
         { TabBuilder t; t.panel = g_uiPanel; t.name = "AO & Lighting";
           // The AO compute dispatch is ARMED by consumption (g_aoEnable / bent normal / the F12 AO
@@ -25022,6 +25350,7 @@ void destroyHostWindow(Renderer* R);
             // AO multi-bounce look dials (aomultibounce.h.fsl). 1.0 = the published fit exactly.
             // gain lightens the occlusion as it adds bounce; chroma adds colour without lightening.
             { "aoBounceGain",        &g_aoBounceGain        },
+            { "pbrDepth",            &g_pbrDepth            },
             { "aoBounceChroma",      &g_aoBounceChroma      },
             { "grassRootAO",         &g_grassRootAO         },
             { "grassRootAOHeight",   &g_grassRootAOHeight   },
@@ -25104,6 +25433,8 @@ void destroyHostWindow(Renderer* R);
             { "mbSoftZ",             &g_mbSoftZ             },
         };
         const BKnob bknobs[] = {
+            // PBR materials master switch: 0 must be today's image exactly (pack-time gate).
+            { "pbrEnable", &g_pbrEnable },
             // H2a: the WATER MIRROR's GPU cull lane, and its VERIFY twin. Both DEFAULT OFF, and both
             // are env-only for the same reason every other arm in this table is: the A/B is a
             // measurement on a minimized run and there is nobody at the panel.
@@ -25294,6 +25625,9 @@ void destroyHostWindow(Renderer* R);
             { "mbDebug",   &g_mbDebug,   4u },
             // MB-2o: 0 the streak mean, 1 the nearest sample, 2 reflected at the silhouette.
             { "mbBgMode",  &g_mbBgMode,  2u },
+            // PBR: 0 cd (live DX9), 1 cdbs, 2 bspline; frame 0 cotangent, 1 surface gradient.
+            { "pbrGradMode",  &g_pbrGradMode,  2u },
+            { "pbrFrameMode", &g_pbrFrameMode, 1u },
         };
         const SKnob sknobs[] = {
             // M1 4d: `passthrough` (default) or `ngx`. Read at INIT — it decides which object is
@@ -27039,6 +27373,14 @@ void destroyHostWindow(Renderer* R);
     void expDisableForProbe() {
         g_expEnable = false;
         g_exposure  = 1.0;
+    }
+    void uiHideForProbe() {
+        g_uiVisible = false;
+    }
+    void pbrSetForProbe(uint32_t gradMode, uint32_t frameMode) {
+        g_pbrEnable = true;
+        g_pbrGradMode = gradMode;
+        g_pbrFrameMode = frameMode;
     }
     // M1, same arrangement and same reason (see forgerender.h): arm the motion-vector pass for the
     // probe, then report the field's own statistics.
@@ -30090,6 +30432,7 @@ void destroyHostWindow(Renderer* R);
                     ((float*)dins)[dm.matIdx * kStaticInstU32 + 12] = 1.0f;
                     ((float*)dins)[dm.matIdx * kStaticInstU32 + 13] = 1.0f;
                     ((float*)dins)[dm.matIdx * kStaticInstU32 + 14] = 1.0f;
+                    dins[dm.matIdx * kStaticInstU32 + 15] = 0u;   // [15] ParamIndex: this pass's frag never reads it — kept explicit, not stale
                 }
             }
 
@@ -30369,6 +30712,7 @@ void destroyHostWindow(Renderer* R);
                     ((float*)sins)[g * kStaticInstU32 + 12] = 1.0f;
                     ((float*)sins)[g * kStaticInstU32 + 13] = 1.0f;
                     ((float*)sins)[g * kStaticInstU32 + 14] = 1.0f;
+                    sins[g * kStaticInstU32 + 15] = 0u;   // [15] ParamIndex: this pass's frag never reads it — kept explicit, not stale
                 }
                 g_setupBlkMs[kSetupBlkPackFill] += hostNowMs() - tPkFill0;
                 const double tPkJob0 = hostNowMs();
@@ -30537,6 +30881,14 @@ void destroyHostWindow(Renderer* R);
             mp[kAoBounceFloat + 1] = std::max(0.0f, g_aoBounceChroma);
             mp[kAoBounceFloat + 2] = 0.0f;
             mp[kAoBounceFloat + 3] = 0.0f;
+            // PBR material knobs, UNCONDITIONALLY for the same reason as the AO dials above: the
+            // frag reads them on every frame it has a param map in view, and a lane written only
+            // some frames is the stale-cbuffer trap. pbrEnable is NOT here — it acts at pack time
+            // (pbrParamSlotFor), which is what makes "off" bit-identical rather than zero-weighted.
+            mp[kPbrParamsFloat + 0] = (float)std::min(g_pbrGradMode, 2u);
+            mp[kPbrParamsFloat + 1] = (float)std::min(g_pbrFrameMode, 1u);
+            mp[kPbrParamsFloat + 2] = std::max(0.0f, g_pbrDepth);
+            mp[kPbrParamsFloat + 3] = 0.0f;
             mp[280] = g_shadowBias;               // biasParams.x = absolute contact bias (live knob)
             mp[281] = g_shadowNormalOffset;       // biasParams.y = normal-offset bias in texels (live knob)
             // Flicker shadow "movement": the mask rotates the LOOKUP direction of flicker-class slots by a
@@ -30694,6 +31046,7 @@ void destroyHostWindow(Renderer* R);
             finst[local * kStaticInstU32 + 12] = items[i].emissiveGain[0];
             finst[local * kStaticInstU32 + 13] = items[i].emissiveGain[1];
             finst[local * kStaticInstU32 + 14] = items[i].emissiveGain[2];
+            inst[local * kStaticInstU32 + 15] = pbrParamSlotFor(items[i].paramTexIndex);   // PBR _paramh slot, host-gated (0 = shade as before)
             // Terrain DECAL_1 overlay slot (0 = no decal → frag splat gated off, non-terrain unchanged).
             inst[local * kStaticInstU32 + 11] = items[i].overlayTexIndex;
         }
@@ -33519,6 +33872,7 @@ void destroyHostWindow(Renderer* R);
                     finst[idx * kStaticInstU32 + 12] = 1.0f;
                     finst[idx * kStaticInstU32 + 13] = 1.0f;
                     finst[idx * kStaticInstU32 + 14] = 1.0f;
+                    inst[idx * kStaticInstU32 + 15] = 0u;   // [15] ParamIndex: this pass's frag never reads it — kept explicit, not stale
 
                     Buffer*  meshVb     = m.inArena ? g_live.pArenaVB : m.vb;
                     Buffer*  meshIb     = m.inArena ? g_live.pArenaIB : m.ib;
@@ -33880,6 +34234,7 @@ void destroyHostWindow(Renderer* R);
                 finst[idx * kStaticInstU32 + 12] = 1.0f;
                 finst[idx * kStaticInstU32 + 13] = 1.0f;
                 finst[idx * kStaticInstU32 + 14] = 1.0f;
+                inst[idx * kStaticInstU32 + 15] = 0u;   // [15] ParamIndex: this pass's frag never reads it — kept explicit, not stale
 
                 // Arena (bind-once + offsets) vs dynamic-ring (own VB/IB) source.
                 Buffer*  meshVb     = m.inArena ? g_live.pArenaVB : m.vb;
@@ -36347,6 +36702,7 @@ void destroyHostWindow(Renderer* R);
                 finst[idx * kStaticInstU32 + 12] = it.emissiveGain[0];   // ratio lane — see opaque.vert
                 finst[idx * kStaticInstU32 + 13] = it.emissiveGain[1];
                 finst[idx * kStaticInstU32 + 14] = it.emissiveGain[2];
+                inst[idx * kStaticInstU32 + 15] = 0u;   // [15] ParamIndex: this pass's frag never reads it — kept explicit, not stale
                 // matAlpha rides the overlay slot [11] (opaque.vert reads it as a uint;
                 // alpha.frag asfloat's it back — the terrain splat doesn't run in this frag).
                 finst[idx * kStaticInstU32 + 11] = it.matAlpha;
@@ -36664,6 +37020,7 @@ void destroyHostWindow(Renderer* R);
                     finst[idx * kStaticInstU32 + 12] = it.emissiveGain[0];   // ratio lane — see opaque.vert
                     finst[idx * kStaticInstU32 + 13] = it.emissiveGain[1];
                     finst[idx * kStaticInstU32 + 14] = it.emissiveGain[2];
+                    inst[idx * kStaticInstU32 + 15] = pbrParamSlotFor(it.paramTexIndex);   // PBR _paramh slot, host-gated (0 = shade as before)
                     inst[idx * kStaticInstU32 + 11]  = 0;   // no terrain decal on arms
 
                     const uint32_t firstVertex = m.inArena ? (uint32_t)(m.vbOff / sizeof(IPC::GeomVertexWire)) : 0u;
@@ -36989,6 +37346,7 @@ void destroyHostWindow(Renderer* R);
                     finst[idx * kStaticInstU32 + 12] = it.emissiveGain[0];   // ratio lane — see opaque.vert
                     finst[idx * kStaticInstU32 + 13] = it.emissiveGain[1];
                     finst[idx * kStaticInstU32 + 14] = it.emissiveGain[2];
+                    inst[idx * kStaticInstU32 + 15] = 0u;   // [15] ParamIndex: this pass's frag never reads it — kept explicit, not stale
                     finst[idx * kStaticInstU32 + 11] = it.matAlpha;      // alpha.frag asfloat's it back
                     // AT3 multi-stage — same table, tail indices (see the main alpha loop).
                     if (g_live.pAlphaStagesBuf) {
@@ -41438,6 +41796,112 @@ void destroyHostWindow(Renderer* R);
     unsigned lastSkinnedDrawn() { return g_lastSkinnedDrawn; }
     unsigned lastMultiMapDrawn() { return g_lastMultiMapDrawn; }
 
+    // The delivered rect, copied off the GPU as tightly packed BGRA (W*H*4, no row padding). Shared by
+    // the probe's whole-frame reductions below, so each one is a reduction and not a fourth copy of
+    // the barrier/copy dance. Returns false when there is no live renderer to read.
+    static bool readbackDeliveredRect(std::vector<uint8_t>& out, uint32_t& W, uint32_t& H) {
+        if (!g_live.pRenderer || !g_live.pRT) { return false; }
+        Renderer* R = g_live.pRenderer;
+        settleFrameFence(R);
+        W = g_live.outWidth; H = g_live.outHeight;
+        const uint32_t rowAlign = (R->pGpu->mUploadBufferTextureRowAlignment > 1u) ? R->pGpu->mUploadBufferTextureRowAlignment : 1u;
+        const uint32_t texAlign = (R->pGpu->mUploadBufferTextureAlignment > 1u) ? R->pGpu->mUploadBufferTextureAlignment : 1u;
+        const uint32_t rowPitch = roundUp(W * 4u, rowAlign);
+        BufferLoadDesc bd = {};
+        bd.mDesc.mSize = roundUp64((uint64_t)rowPitch * H, texAlign);
+        bd.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_GPU_TO_CPU;
+        bd.mDesc.mFlags = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
+        bd.mDesc.mStartState = RESOURCE_STATE_COPY_DEST;
+        bd.mDesc.mQueueType = QUEUE_TYPE_TRANSFER;
+        Buffer* pReadback = nullptr;
+        bd.ppBuffer = &pReadback;
+        addResource(&bd, nullptr);
+        waitForAllResourceLoads();
+        resetCmdPool(R, g_live.pCmdPool);
+        beginCmd(g_live.pCmd);
+        RenderTargetBarrier b = {};
+        b.pRenderTarget = g_live.pRT; b.mCurrentState = RESOURCE_STATE_COMMON; b.mNewState = RESOURCE_STATE_COPY_SOURCE;
+        cmdResourceBarrier(g_live.pCmd, 0, nullptr, 0, nullptr, 1, &b);
+        endCmd(g_live.pCmd);
+        QueueSubmitDesc sd = {}; sd.mCmdCount = 1; sd.ppCmds = &g_live.pCmd; sd.pSignalFence = g_live.pFence; sd.mSubmitDone = true;
+        queueSubmit(g_live.pQueue, &sd);
+        waitForFences(R, 1, &g_live.pFence);
+        TextureCopyDesc cd = {};
+        cd.pTexture = g_live.pRT->pTexture; cd.pBuffer = pReadback;
+        cd.mTextureState = RESOURCE_STATE_COPY_SOURCE; cd.mQueueType = QUEUE_TYPE_GRAPHICS;
+        SyncToken ct = {};
+        copyResource(&cd, &ct);
+        waitForToken(&ct);
+        const uint8_t* px = (const uint8_t*)pReadback->pCpuMappedAddress;
+        const bool ok = (px != nullptr);
+        if (ok) {
+            out.resize((size_t)W * H * 4u);
+            for (uint32_t y = 0; y < H; ++y) {
+                std::memcpy(out.data() + (size_t)y * W * 4u, px + (uint64_t)y * rowPitch, (size_t)W * 4u);
+            }
+        }
+        removeResource(pReadback);
+        return ok;
+    }
+
+    // Mean of (B+G+R)/3 over the delivered rect, 0..255. A whole-frame MEAN is the right reduction
+    // for the PBR sign test and the wrong one for almost anything else: the test surface is the whole
+    // frame (a fullscreen triangle) and the question is which WAY it moved, not where.
+    double debugReadbackMeanLuma() {
+        std::vector<uint8_t> px; uint32_t W = 0, H = 0;
+        if (!readbackDeliveredRect(px, W, H) || !W || !H) { return -1.0; }
+        uint64_t acc = 0;
+        for (size_t i = 0; i < (size_t)W * H; ++i) { acc += (uint64_t)px[i * 4 + 0] + px[i * 4 + 1] + px[i * 4 + 2]; }
+        return (double)acc / (3.0 * (double)W * (double)H);
+    }
+
+    // See forgerender.h for why this exists beside debugReadbackCenterPixel rather than instead of
+    // it: the frame's per-channel maximum, and the signed channel imbalance.
+    void debugReadbackChannelMax(const char* tag) {
+        std::vector<uint8_t> frame; uint32_t W = 0, H = 0;
+        if (!readbackDeliveredRect(frame, W, H)) { return; }
+        const uint32_t rowPitch = W * 4u;
+        const uint8_t* pxTight = frame.data();
+        const uint8_t* px = pxTight;
+        {
+            uint32_t mx[3] = { 0, 0, 0 };
+            uint64_t lit = 0;   // pixels above the flat background, whatever that background is
+            // ⚠ A PER-CHANNEL MAXIMUM IS ONLY AS GOOD AS THE REST OF THE FRAME. With the dev panel
+            // up, every case — including the one whose texture decodes to solid black — reported
+            // 255,255,255: the panel's white text is in the delivered frame, and a MAX over the frame
+            // reports the brightest thing in it rather than the thing under test. The probe hides
+            // the panel now and the plain max discriminates as well, but it is one overlay away from
+            // going blind again, which is why it does not stand alone.
+            //
+            // The signed channel IMBALANCE is immune to it: anything grey, at any brightness,
+            // contributes zero, so white content elsewhere cannot manufacture a signal. A BC4
+            // height map decodes to (h,0,0,1) and a BC5 pair to (r,g,0,1), so a correct load shows
+            // a large R−G or G−R and a fall-back to the default white shows ~0. Black is balanced
+            // too, which is why `lit` is kept beside it: that is the channel the all-zero BC4 case
+            // is read on, and it is the reason the four cases are not all bright ones.
+            int32_t maxRG = 0, maxGR = 0, maxRB = 0, maxBR = 0;
+            for (uint32_t y = 0; y < H; ++y) {
+                const uint8_t* row = px + (uint64_t)y * rowPitch;
+                for (uint32_t x = 0; x < W; ++x) {
+                    const uint8_t* p = row + (uint64_t)x * 4u;   // BGRA
+                    const int32_t B = p[0], G = p[1], Rr = p[2];
+                    if (p[0] > mx[0]) { mx[0] = p[0]; }
+                    if (p[1] > mx[1]) { mx[1] = p[1]; }
+                    if (p[2] > mx[2]) { mx[2] = p[2]; }
+                    if (Rr - G > maxRG) { maxRG = Rr - G; }
+                    if (G - Rr > maxGR) { maxGR = G - Rr; }
+                    if (Rr - B > maxRB) { maxRB = Rr - B; }
+                    if (B - Rr > maxBR) { maxBR = B - Rr; }
+                    if (p[0] > 32u || p[1] > 32u || p[2] > 32u) { ++lit; }
+                }
+            }
+            std::printf("[forge] scene-probe: %s MAX(B,G,R)=%u,%u,%u  imbalance max R-G=%d G-R=%d "
+                        "R-B=%d B-R=%d  lit=%llu/%u px\n",
+                        tag, mx[0], mx[1], mx[2], maxRG, maxGR, maxRB, maxBR,
+                        (unsigned long long)lit, W * H);
+        }
+    }
+
     void debugReadbackCenterPixel() {
         if (!g_live.pRenderer || !g_live.pRT) {
             return;
@@ -41518,6 +41982,33 @@ void destroyHostWindow(Renderer* R);
         if (px) {
             const uint8_t* c = &px[(uint64_t)(H / 2) * rowPitch + (uint64_t)(W / 2) * 4u];
             std::printf("[forge] scene-probe: CENTRE pixel (BGRA) = %u,%u,%u,%u\n", c[0], c[1], c[2], c[3]);
+            // WHOLE-FRAME HASH (FNV-1a 64 over the delivered rect, row padding skipped). The centre
+            // pixel above reads background in every frame this probe draws, so on its own it can
+            // vouch for nothing; this is the instrument a BIT-IDENTITY claim needs. Every existing
+            // readback prints one at no extra render cost, so a change that must not move the image
+            // (the PBR path with no param map bound) is checked against the frames the probe
+            // already draws, before and after, rather than against a frame drawn for the purpose.
+            uint64_t fh = 1469598103934665603ull;
+            for (uint32_t y = 0; y < H; ++y) {
+                const uint8_t* row = px + (uint64_t)y * rowPitch;
+                for (uint32_t x = 0; x < W * 4u; ++x) { fh = (fh ^ row[x]) * 1099511628211ull; }
+            }
+            std::printf("[forge] scene-probe: FRAME HASH = %016llx\n", (unsigned long long)fh);
+            // MGE_PROBE_DUMP=<prefix>: also write the delivered rect as raw BGRA, one file per
+            // readback (<prefix>_<n>.bgra, W*H*4 bytes, no header). Off unless set. It exists because
+            // the hash above differs between two runs of an UNCHANGED binary, and a hash can only say
+            // THAT a frame moved -- a diff of two dumps says where and by how much, which is what
+            // decides whether a bit-identity test can be built on this probe at all.
+            if (const char* dump = std::getenv("MGE_PROBE_DUMP")) {
+                static int s_dumpN = 0;
+                char path[512];
+                std::snprintf(path, sizeof(path), "%s_%d.bgra", dump, s_dumpN++);
+                if (FILE* f = std::fopen(path, "wb")) {
+                    for (uint32_t y = 0; y < H; ++y) { std::fwrite(px + (uint64_t)y * rowPitch, 1, W * 4u, f); }
+                    std::fclose(f);
+                    std::printf("[forge] scene-probe: dumped %ux%u BGRA -> %s\n", W, H, path);
+                }
+            }
         } else {
             std::printf("[forge] scene-probe: readback not mapped\n");
         }
@@ -41667,12 +42158,18 @@ void destroyHostWindow(Renderer* R);
         case TinyImageFormat_DXBC3_UNORM:      return TinyImageFormat_DXBC3_SRGB;
         case TinyImageFormat_B8G8R8A8_UNORM:   return TinyImageFormat_B8G8R8A8_SRGB;
         case TinyImageFormat_R8G8B8A8_UNORM:   return TinyImageFormat_R8G8B8A8_SRGB;
+        // BC4/BC5 reach `default` and MUST. They are DATA — a height field, a derivative pair —
+        // and there is no _SRGB spelling of either in the first place. Decoding a height map
+        // through a transfer function would bend the field before it is differentiated, which is
+        // the one operation in this whole path that a monotone distortion does not survive.
         default:                               return f;
         }
     }
 
     // Parse the formats MW ships: DXT1/3/5 (BCn), uncompressed 32-bit (treated BGRA), and DX10
-    // BC1/2/3 / BGRA / RGBA. Anything else → ok=false (slot stays default white).
+    // BC1/2/3 / BGRA / RGBA — plus BC4/BC5, which MW ships NOTHING in and which exist here only for
+    // the PBR material path (a BC4 height map, a BC5 derivative map). Anything else → ok=false
+    // (slot stays default white).
     static DdsInfo parseDds(const uint8_t* d, uint32_t size) {
         DdsInfo r;
         if (size < 128 || ddsRd32(d) != 0x20534444u) { return r; }   // 'DDS '
@@ -41690,6 +42187,14 @@ void destroyHostWindow(Renderer* R);
                 case 0x31545844u: fmt = TinyImageFormat_DXBC1_RGBA_UNORM; break;   // 'DXT1'
                 case 0x33545844u: fmt = TinyImageFormat_DXBC2_UNORM;      break;   // 'DXT3'
                 case 0x35545844u: fmt = TinyImageFormat_DXBC3_UNORM;      break;   // 'DXT5'
+                // BC4/BC5 under their pre-DX10 FourCCs. ATI1/ATI2 are what every MW-era tool and
+                // most of nvtt/Compressonator still stamp; BC4U/BC5U are texconv's spelling of the
+                // same bits. There is no signed pre-DX10 FourCC in common use, so the two S codes
+                // are here for completeness rather than because anything writes them.
+                case 0x31495441u: case 0x55344342u: fmt = TinyImageFormat_DXBC4_UNORM; break;  // 'ATI1'/'BC4U'
+                case 0x53344342u:                   fmt = TinyImageFormat_DXBC4_SNORM; break;  // 'BC4S'
+                case 0x32495441u: case 0x55354342u: fmt = TinyImageFormat_DXBC5_UNORM; break;  // 'ATI2'/'BC5U'
+                case 0x53354342u:                   fmt = TinyImageFormat_DXBC5_SNORM; break;  // 'BC5S'
                 case 0x30315844u: {                                               // 'DX10'
                     if (size < 148) { return r; }
                     const uint32_t dxgi = ddsRd32(d + 128);
@@ -41704,6 +42209,17 @@ void destroyHostWindow(Renderer* R);
                         case 71: case 72: fmt = TinyImageFormat_DXBC1_RGBA_UNORM; break;  // BC1(_SRGB)
                         case 74: case 75: fmt = TinyImageFormat_DXBC2_UNORM;      break;  // BC2
                         case 77: case 78: fmt = TinyImageFormat_DXBC3_UNORM;      break;  // BC3
+                        // ⚠ BC4/BC5 DO NOT GET THE FLATTENING ABOVE. _SRGB vs _UNORM is a transfer
+                        // function over identical bits, which is why the BC1/2/3 codes collapse to
+                        // one entry; UNORM vs SNORM is a different DECODE of the endpoint bytes
+                        // (0..255 → 0..1 against −1..1), so honouring the header is the whole point
+                        // here. A derivative map is signed by nature and wants the S codes; a height
+                        // map is unsigned and wants the U codes. Getting this wrong does not tint a
+                        // texture, it mirrors the gradient.
+                        case 79: case 80: fmt = TinyImageFormat_DXBC4_UNORM;      break;  // BC4 (typeless→U)
+                        case 81:          fmt = TinyImageFormat_DXBC4_SNORM;      break;  // BC4_SNORM
+                        case 82: case 83: fmt = TinyImageFormat_DXBC5_UNORM;      break;  // BC5 (typeless→U)
+                        case 84:          fmt = TinyImageFormat_DXBC5_SNORM;      break;  // BC5_SNORM
                         case 87: case 91: fmt = TinyImageFormat_B8G8R8A8_UNORM;   break;  // BGRA8
                         case 28: case 29: fmt = TinyImageFormat_R8G8B8A8_UNORM;   break;  // RGBA8
                         default: break;
@@ -41793,6 +42309,16 @@ void destroyHostWindow(Renderer* R);
             }
             break;
         }
+        // BC4 (one channel) and BC5 (two) HAVE NO ALPHA BLOCK AT ALL — a sampler returns a = 1
+        // for every texel of them, so OPAQUE is not a fallback here, it is the correct and only
+        // answer. Spelled out rather than left to `default:` because a format missing from an
+        // alpha classifier reads as an oversight, and the next person to add BC7 (which DOES carry
+        // alpha, in modes 4-7) must not inherit this answer by walking off the end of the switch.
+        case TinyImageFormat_DXBC4_UNORM:
+        case TinyImageFormat_DXBC4_SNORM:
+        case TinyImageFormat_DXBC5_UNORM:
+        case TinyImageFormat_DXBC5_SNORM:
+            return kTexAlphaOpaque;
         default:
             return kTexAlphaOpaque;
         }
@@ -41928,6 +42454,10 @@ void destroyHostWindow(Renderer* R);
             if (p + sizeof(IPC::TexUploadWire) > end) { break; }
             IPC::TexUploadWire hdr;
             std::memcpy(&hdr, p, sizeof(hdr));
+            // kTexUploadData rides bit 31 of the slot. Strip it FIRST, before anything reads the
+            // slot as a number: a flagged slot is 0x80000000+ and the range check below would drop it.
+            const bool dataTex = (hdr.slot & IPC::kTexUploadData) != 0u;
+            hdr.slot &= ~IPC::kTexUploadData;
             const uint8_t* dds    = p + sizeof(hdr);
             const uint8_t* ddsEnd = dds + hdr.byteLen;
             if (ddsEnd > end) { break; }
@@ -41946,23 +42476,31 @@ void destroyHostWindow(Renderer* R);
                      hdr.slot, kMaxTextures);
                 continue;
             }
+            // Any upload attempt into this slot voids its "holds a param map" status until this one
+            // lands (see g_texIsData): every failure path below must leave it 0.
+            g_texIsData[hdr.slot] = 0u;
             DdsInfo info = parseDds(dds, hdr.byteLen);
             if (!info.ok) {
                 LOGF(eWARNING, "[forge] tex slot %u: unsupported DDS format (slot stays white)", hdr.slot);
                 continue;
             }
             // C3a: shadow-caster alpha classification (OPAQUE/MASK/TRANSLUCENT), once per upload.
-            g_texAlphaKind[hdr.slot] = classifyDdsAlpha(dds, hdr.byteLen, info);
+            // A DATA texture's alpha is not coverage — a _paramh keeps HEIGHT there — so classifying
+            // it would invent a cutout out of a height field. Opaque, and never consulted anyway: a
+            // param slot is not any draw's base texture.
+            g_texAlphaKind[hdr.slot] = dataTex ? kTexAlphaOpaque : classifyDdsAlpha(dds, hdr.byteLen, info);
 
             Texture* tex = nullptr;
             TextureDesc td = {};
             td.mWidth = info.width; td.mHeight = info.height; td.mDepth = 1;
             td.mArraySize = 1; td.mMipLevels = info.mipLevels;
             td.mSampleCount = SAMPLE_COUNT_1;
-            td.mFormat = toSceneTextureFormat(info.fmt);   // step 5: MW art is gamma-encoded
+            // step 5: MW art is gamma-encoded — but a DATA texture is not art. A _paramh's RGB is
+            // metal/rough/IOR; through the sRGB view roughness 0.5 would read 0.21.
+            td.mFormat = dataTex ? info.fmt : toSceneTextureFormat(info.fmt);
             td.mStartState = RESOURCE_STATE_SHADER_RESOURCE;
             td.mDescriptors = DESCRIPTOR_TYPE_TEXTURE;
-            td.pName = "mwTexture";
+            td.pName = dataTex ? "mwParamTexture" : "mwTexture";
             TextureLoadDesc tld = {};
             tld.ppTexture = &tex;
             tld.pDesc = &td;
@@ -42024,6 +42562,7 @@ void destroyHostWindow(Renderer* R);
             dd.mCount = 1;
             dd.ppTextures = &g_live.pTextures[hdr.slot];
             updateDescriptorSet(R, 0, g_live.pPersistentSet, 1, &dd);
+            g_texIsData[hdr.slot] = dataTex ? 1u : 0u;   // landed: now, and only now, it counts
             ++built;
         }
         // One upload-engine flush for the whole batch (else textures stay black). Replaces the
@@ -42540,6 +43079,7 @@ void destroyHostWindow(Renderer* R);
         // bindless table. settleFrameFence drains this once the frame fence has signalled.
         if (g_live.pTextures[slot] != g_live.pDefaultWhite) { g_texRetire.push_back(g_live.pTextures[slot]); }
         g_live.pTextures[slot] = tex;
+        g_texIsData[slot] = 0u;   // a host-owned texture (atlas, cloud, sun) is never a param map
         if (slot + 1 > g_live.texHigh) { g_live.texHigh = slot + 1; }
         DescriptorData dd = {};
         dd.mIndex = SRT_RES_IDX(SrtData, Persistent, gTextures);
@@ -45273,11 +45813,18 @@ void destroyHostWindow(Renderer* R);
     static uint32_t ddsTightMipBytes(TinyImageFormat fmt, uint32_t w, uint32_t h) {
         uint32_t bw, bh;
         switch (fmt) {
+            // 8 bytes/block: one colour block (BC1) or one alpha-style block (BC4).
             case TinyImageFormat_DXBC1_RGBA_UNORM:
+            case TinyImageFormat_DXBC4_UNORM:
+            case TinyImageFormat_DXBC4_SNORM:
                 bw = (w + 3) / 4; bh = (h + 3) / 4; if (!bw) bw = 1; if (!bh) bh = 1;
                 return bw * bh * 8;
+            // 16 bytes/block: two of them. BC5 is literally two BC4 blocks, which is the whole
+            // reason a stored derivative map costs a height map's fidelity per channel.
             case TinyImageFormat_DXBC2_UNORM:
             case TinyImageFormat_DXBC3_UNORM:
+            case TinyImageFormat_DXBC5_UNORM:
+            case TinyImageFormat_DXBC5_SNORM:
                 bw = (w + 3) / 4; bh = (h + 3) / 4; if (!bw) bw = 1; if (!bh) bh = 1;
                 return bw * bh * 16;
             default:   // BGRA8 / RGBA8 (uncompressed 32-bit)

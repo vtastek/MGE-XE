@@ -500,6 +500,13 @@ namespace {
         std::uint32_t ovEpoch = 0;           // separate epochs: one field re-validating
                                              // the other's stale slot after a recycle
                                              // would alias textures
+        // PBR param map (tasks/forge-pbr-materials.md): the slot of the BASE texture's
+        // <base>_paramh.dds, 0 = the base has none. Keyed on the BASE name's pointer, because the
+        // param map is a property of the base texture — the same identity rule as baseSlot, with
+        // its own epoch for the same aliasing reason as ovEpoch.
+        const char*   paramNamePtr = nullptr;
+        std::uint32_t paramSlot = 0;
+        std::uint32_t paramEpoch = 0;
     };
     std::unordered_map<std::uint32_t, SlotInfo> g_keySlot;
     std::uint32_t g_texEpoch = 0;            // bumped on bindless-slot LRU recycle
@@ -831,6 +838,7 @@ namespace {
     void flushGeometry();
     void flushTextures();
     std::uint32_t resolveTextureSlot(const char* textureName);
+    std::uint32_t resolveTextureSlotEx(const char* textureName, bool dataTexture, bool quietMiss);
 
     // --- DXVK Vulkan-interop seam ---
     // MW's MAIN device is DXVK (Vulkan-backed). DXVK exposes ID3D9VkInteropDevice, which
@@ -1715,6 +1723,15 @@ namespace {
     // Map a texture name to its bindless slot, loading + queueing its DDS on first sight.
     // Misses / oversize / residency-full → slot 0 (host default white), cached so we don't retry.
     std::uint32_t resolveTextureSlot(const char* textureName) {
+        return resolveTextureSlotEx(textureName, false, false);
+    }
+
+    // dataTexture: ship it with IPC::kTexUploadData, so the host keeps its stored UNORM format
+    //   instead of the scene's sRGB view (a _paramh's RGB is metal/rough/IOR, not colour).
+    // quietMiss: a miss is the EXPECTED answer (probing for a companion file most textures do not
+    //   have), so it must not spend the 20-line "not found (white)" budget — which exists to
+    //   surface textures that SHOULD resolve — on files that were never there.
+    std::uint32_t resolveTextureSlotEx(const char* textureName, bool dataTexture, bool quietMiss) {
         if (!textureName || !*textureName || !g_texVec) {
             return 0;
         }
@@ -1747,7 +1764,7 @@ namespace {
         // downscaled-LOD copies (they blur near geometry) — resolve loose Data Files -> BSA.
         if (!BSA::loadFileBytes(name.c_str(), &data, &size, true) || !data || size == 0) {
             static int misses = 0;
-            if (misses < 20) { LOG::logline("!! [tex] not found: %s (white)", name.c_str()); ++misses; }
+            if (!quietMiss && misses < 20) { LOG::logline("!! [tex] not found: %s (white)", name.c_str()); ++misses; }
             if (data) { std::free(data); }
             g_texSlot.emplace(name, 0);
             return 0;
@@ -1794,7 +1811,7 @@ namespace {
         g_texSlot[name] = slot;
         g_slotName[slot] = name;
         g_slotLastUsed[slot] = g_frame;
-        IPC::TexUploadWire hdr{ slot, size, 0u };
+        IPC::TexUploadWire hdr{ slot | (dataTexture ? IPC::kTexUploadData : 0u), size, 0u };
         const std::size_t at = g_texPendingBlob.size();
         g_texPendingBlob.resize(at + sizeof(hdr) + size);
         std::memcpy(g_texPendingBlob.data() + at, &hdr, sizeof(hdr));
@@ -2277,6 +2294,41 @@ namespace {
         return slotVal;
     }
 
+    // PBR param map for a draw's base texture: <base>_paramh.dds beside it (texturematcher's
+    // Morrowind export, tasks/forge-pbr-materials.md), else <base>_paramh_np.dds — the variant
+    // authored for "no parallax", whose height is still valid for the gradient, which is all this
+    // path reads. 0 = the base has no param map, which is the COMMON case and must stay cheap: the
+    // miss is cached twice, in g_texSlot (name -> 0, never recycled) and here per key, so a
+    // texture without one costs one pointer compare per frame after its first sight.
+    //
+    // Deliberately client-side: the client already reads every texture's bytes and ships them
+    // (TexUploadWire carries the DDS inline), so the host needs no filesystem knowledge at all.
+    std::uint32_t resolveParamSlot(const char* baseName, std::uint32_t baseSlot, SlotInfo& si) {
+        // Nothing to pair: textureless, a cached miss on the base, or a flip-book frame (an
+        // animated base has no single companion file).
+        if (!baseName || baseSlot == 0 || IPC::isFlipSlot(baseSlot)) { return 0; }
+        if (baseName == si.paramNamePtr && si.paramEpoch == g_texEpoch) {
+            // Same LRU refresh as resolveCachedSlot's fast path: the param map is referenced
+            // every frame its draw is, so it ages exactly as its base does and is never recycled
+            // out from under a draw that still names it.
+            if (si.paramSlot != 0) { g_slotLastUsed[si.paramSlot] = g_frame; }
+            return si.paramSlot;
+        }
+        std::string stem = normalizeTextureName(baseName);
+        const std::size_t dot = stem.find_last_of('.');
+        const std::size_t sep = stem.find_last_of('\\');
+        if (dot != std::string::npos && (sep == std::string::npos || dot > sep)) { stem.erase(dot); }
+        std::uint32_t slot = 0;
+        if (!stem.empty()) {
+            slot = resolveTextureSlotEx((stem + "_paramh.dds").c_str(), true, true);
+            if (slot == 0) { slot = resolveTextureSlotEx((stem + "_paramh_np.dds").c_str(), true, true); }
+        }
+        si.paramNamePtr = baseName;
+        si.paramSlot    = slot;
+        si.paramEpoch   = g_texEpoch;   // AFTER resolving: a recycle inside it bumps the epoch
+        return slot;
+    }
+
     // Emit one STATIC opaque draw (pre-filtered by buildGeometryDrawLists — the
     // per-entry filter rationale lives there). Mirrors the PROVEN D3D9 cache color
     // pass's per-entry packing (drawEntry in rendercachedcolor.cpp) so the Forge
@@ -2350,6 +2402,8 @@ namespace {
             // which gates the frag's splat off → byte-for-byte unchanged.
             item.overlayTexIndex = (e.isLandscape && e.d3dOverlay && e.overlayTextureName)
                 ? resolveCachedSlot(e.overlayTextureName, si.ovNamePtr, si.ovSlot, si.ovEpoch) : 0u;
+            // PBR param map of the base texture (0 = none → the host shades it exactly as before).
+            item.paramTexIndex = resolveParamSlot(e.textureName, item.texIndex, si);
             item.alphaRef = e.alphaTest ? e.alphaRef : 0.0f;     // alpha-test cutout (0 = no test)
             // MW's per-map texture address mode, plus the enchanted-item glow bit riding this
             // lane's spare bits (see IPC::kTexFlagEnchantGlow — one decode, in packTexAlpha).

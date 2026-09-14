@@ -9,6 +9,7 @@
 
 #include "opaque.srt.h"
 #include "texsample.h.fsl"   // sampleBase() — MW address mode + AF level
+#include "pbrmaterial.h.fsl" // _paramh PBR: height-derived normals + GGX (tasks/forge-pbr-materials.md)
 #include "a2c.h.fsl"         // a2cCoverageMask() — SHARED cutout coverage (prepass/colour parity)
 #include "fpshadow.h.fsl"    // fpShadowVisibility() — first-person direct cube-atlas shadow test
 #include "shadowreceive.h.fsl" // shadowMaskPixel() — the mask texel that is actually OURS under MSAA
@@ -37,6 +38,12 @@ STRUCT(VSOutput)
     DATA(float3,      WorldPos,   TEXCOORD8); // Tier 3a: world position for point-light eval
     DATA(FLAT(uint),  OverlayIndex,TEXCOORD9);// terrain DECAL_1 bindless slot (0 = no decal)
     DATA(FLAT(uint),  ClampMode,  TEXCOORD10);// MW texture address mode (0..3) -> sampleBase()
+    // Declared only to keep this struct a PREFIX of opaque.vert's and skinned.vert's, which is the
+    // rule every frag paired with them follows — ParamIndex comes after it. Unread here.
+    DATA(FLAT(uint),  DrawIdx,    TEXCOORD11);
+    // PBR _paramh bindless slot (tasks/forge-pbr-materials.md). 0 = no PBR material: the draw takes
+    // exactly the pre-PBR arithmetic. skinned.vert pins it to 0.
+    DATA(FLAT(uint),  ParamIndex, TEXCOORD12);
 };
 
 ROOT_SIGNATURE(DefaultRootSignature)
@@ -44,6 +51,48 @@ float4 PS_MAIN( VSOutput In )
 {
     INIT_MAIN;
     float3 N = normalize(In.Normal);
+
+    // ─── PBR MATERIAL (tasks/forge-pbr-materials.md, Track C; pbrmaterial.h.fsl) ─────────────────
+    // ⚠ BIT-IDENTITY IS A PROPERTY OF THE CODE HERE, NOT A BET: every PBR term below is either inside
+    // `if (pbrOn)` or a select whose false arm is the untouched legacy value, so a draw with no
+    // _paramh (ParamIndex 0 — including every skinned part, and every draw with pbrEnable off) runs
+    // the pre-PBR arithmetic. --forge-scene checks it: its frame hashes must not move.
+    //
+    // The screen derivatives are taken HERE, at top level in uniform control flow, because every
+    // reader of them sits inside the per-draw branch — and derivatives inside divergent flow are
+    // undefined. The branch itself is uniform in practice (ParamIndex is FLAT per draw), but that is
+    // not something the compiler can see.
+    const float3 pbrDPdx  = ddx(In.WorldPos);
+    const float3 pbrDPdy  = ddy(In.WorldPos);
+    const float2 pbrDUVdx = ddx(In.Uv);
+    const float2 pbrDUVdy = ddy(In.Uv);
+    const bool   pbrOn    = (In.ParamIndex != 0u);
+    const float3 pbrNg    = N;                       // geometric (interpolated) normal
+    float4 pbrParam  = float4(0.0f, 0.0f, 0.0f, 0.0f);
+    float  pbrRough  = 1.0f, pbrAlpha2 = 1.0f, pbrNoV = 1.0f;
+    float3 pbrV      = float3(0.0f, 0.0f, 1.0f);
+    float3 pbrSpecA  = float3(0.0f, 0.0f, 0.0f);     // direct specular, split by F0: spec = F0*A + B
+    float3 pbrSpecB  = float3(0.0f, 0.0f, 0.0f);
+    float3 pbrTSun   = float3(1.0f, 1.0f, 1.0f);
+    float3 pbrTAmb   = float3(1.0f, 1.0f, 1.0f);
+    if (pbrOn)
+    {
+        const int2   psz   = GetDimensions(gTextures[In.ParamIndex], NO_SAMPLER);
+        const float2 size0 = max(float2(psz), float2(1.0f, 1.0f));
+        pbrParam = pbrParamGrad(In.ParamIndex, In.ClampMode, In.Uv, pbrDUVdx, pbrDUVdy);
+        const float2 dhduv = pbrHeightGradUV((uint)gShadowParams.pbrParams.x, In.ParamIndex,
+                                             In.ClampMode, In.Uv, pbrDUVdx, pbrDUVdy, size0);
+        N = pbrPerturb((uint)gShadowParams.pbrParams.y, N, pbrDPdx, pbrDPdy, pbrDUVdx, pbrDUVdy,
+                       dhduv, gShadowParams.pbrParams.z);
+        pbrRough  = pbrRoughness(pbrParam);
+        const float r2 = pbrRough * pbrRough;
+        pbrAlpha2 = r2 * r2;                         // GGX alpha^2 = roughness^4 (pbr.hlsl)
+        pbrV      = normalize(gFrameData.eyePos.xyz - In.WorldPos);
+        pbrNoV    = saturate(dot(N, pbrV)) + 1e-5f;  // +eps: an interpolated normal can face away
+    }
+    // The height-derived normal BEFORE the AO bend below. Specular uses this one: the bend is an
+    // occlusion direction, not a surface, and a lobe centred on it would slide off the highlight.
+    const float3 pbrNb = N;
 
     // Sample the AO buffer once (rgb = the world-space bend term, a = visibility — aocommon.h.fsl
     // has the contract), shared by the ambient term, the bend below, and the F12 views. gAO is the BILATERAL-BLURRED AO
@@ -135,6 +184,9 @@ float4 PS_MAIN( VSOutput In )
 
     // MW lighting: sun diffuse (to-sun = -sunDir) + scene ambient. FFE convention.
     float  ndl = saturate(dot(N, -gFrameData.sunDir.xyz));
+    // pbr.hlsl's geom_vis: a light BEHIND the actual surface must not light a bump that happens to
+    // tilt toward it. Soft over the last ~7 degrees so the terminator does not alias. PBR draws only.
+    if (pbrOn) { ndl *= saturate(8.0f * dot(pbrNg, -gFrameData.sunDir.xyz) + 1.0f); }
     // Sun shadows (forge-sun-shadows.md Phase B): the MSM moments map, built this frame from the
     // DL-statics caster proxy, occludes the sun term ONLY — ambient and point lights are untouched
     // (a shadowed surface drops to ambient, exactly like the DX9 path and like MW itself).
@@ -153,7 +205,10 @@ float4 PS_MAIN( VSOutput In )
     // the lower hemisphere with fogColNear, which is usually brighter than the zenith. See
     // tasks/lighting.md SH1 before tuning.
     float3 a = ((aoFlags & 4u) != 0u) ? float3(1.0f, 1.0f, 1.0f)
-                                      : gFrameData.ambCol.rgb * skyAmbFactor(In.Normal, In.WorldPos);
+                                      : gFrameData.ambCol.rgb * skyAmbFactor(pbrOn ? pbrNb : In.Normal, In.WorldPos);
+    // (PBR draws take the height-derived normal here — a relief that only the sun can see flattens
+    // the moment the surface is in shadow. It is the UNBENT one, so the bend's double-count argument
+    // above still holds.)
 
     // W7b — absorption on the way IN (waterfog.h.fsl). Sun and sky both cross the water column above
     // this fragment to reach it, so a submerged surface is dim and blue because of ITS depth, not
@@ -161,7 +216,15 @@ float4 PS_MAIN( VSOutput In )
     // HERE, and not later: it must land BEFORE the point-light loop adds into `d`. A torch carried
     // underwater is not dimmed by the column above it — its path is light->fragment, not
     // surface->fragment.
-    { float3 tSun, tAmb; waterLightTransmit(In.WorldPos, tSun, tAmb); d *= tSun; a *= tAmb; }
+    { float3 tSun, tAmb; waterLightTransmit(In.WorldPos, tSun, tAmb); d *= tSun; a *= tAmb; pbrTSun = tSun; pbrTAmb = tAmb; }
+    // Sun specular (PBR draws): the same light, shadow and water column as the sun's diffuse above.
+    if (pbrOn)
+    {
+        const float2 st = pbrSpecTerms(pbrNb, -gFrameData.sunDir.xyz, pbrV, ndl, pbrNoV, pbrAlpha2);
+        const float3 w  = gFrameData.sunCol.rgb * (ndl * sunVis) * pbrTSun;
+        pbrSpecA += w * st.x;
+        pbrSpecB += w * st.y;
+    }
     // W32 — a submerged lamp is a caustic PROJECTOR (waterfog.h.fsl). Hoisted out of the loop: above
     // water this is ONE cbuffer compare for the whole fragment instead of one call per light, and
     // above water is where all the point-light iterations are.
@@ -287,6 +350,7 @@ float4 PS_MAIN( VSOutput In )
                 }
 
                 float  lambert = saturate(dot(N, toLight) * invDist);
+                if (pbrOn) { lambert *= saturate(8.0f * dot(pbrNg, toLight) * invDist + 1.0f); }   // geom_vis
                 // W32 — the mirror gobo. A mean-1 MULTIPLIER on the direct term, never a second
                 // light: the reflected flux is extra energy, and adding it would move the frame's
                 // level and put the exposure servo to work.
@@ -298,6 +362,16 @@ float4 PS_MAIN( VSOutput In )
                 float3 lightAdd = lambert * att * lightCol;
                 if (causProj) { lightAdd *= causticProjector(In.WorldPos, posR.xyz); }
                 d += lightAdd;
+                // Point-light specular (PBR draws). Every light, not pbr.hlsl's light 0 only — that was
+                // a ps_3_0 budget, and this loop is already walking them. (The submerged-lamp caustic
+                // gobo above shapes the diffuse only.)
+                if (pbrOn)
+                {
+                    const float2 st = pbrSpecTerms(pbrNb, toLight * invDist, pbrV, lambert, pbrNoV, pbrAlpha2);
+                    const float3 w  = lightCol * (att * lambert);
+                    pbrSpecA += w * st.x;
+                    pbrSpecB += w * st.y;
+                }
             }
         }
     }
@@ -353,6 +427,9 @@ float4 PS_MAIN( VSOutput In )
     // the AO tint follow a debug slider. See aomultibounce.h.fsl.
     if ((aoFlags & 1u) != 0u) { a *= aoAmbientTerm(aoSample.a, albedo.rgb, aoFlags); }
 
+    // Metallic workflow: a metal's reflectance is all specular (F0 = its albedo, below), so its diffuse
+    // and ambient go to zero; the emissive addend is untouched. PBR draws only.
+    if (pbrOn) { const float kd = 1.0f - pbrMetalness(pbrParam); d *= kd; a *= kd; }
     float3 lit = (In.VColSource == 2u) ? (In.Color.rgb * (d + a) + emis)
                                        : (In.MatDiffuse * d + In.MatAmbient * a + emis);
 
@@ -377,6 +454,19 @@ float4 PS_MAIN( VSOutput In )
     // Coverage is 1: this pass writes opaque pixels (its alpha test is binary and already ran),
     // so the exposed value the encode clipped is albedo.rgb itself.
     float3 c = albedo.rgb * (lit + expandExposedEmissiveDelta(emis, albedo.rgb, 1.0f));
+    if (pbrOn)
+    {
+        const float3 f0 = pbrF0(pbrParam, albedo.rgb);
+        // The environment is the sky the ambient term already integrates, evaluated in the MIRROR
+        // direction: the same SH (and the same sky AO) that lights the surface is what it reflects,
+        // so the two cannot drift apart. L1 is blurry by nature — right for rough surfaces, soft for
+        // polished ones — which is the honest limit of reflecting a probe that has no sharper term.
+        const float3 R = reflect(-pbrV, pbrNb);
+        float3 env = gFrameData.ambCol.rgb * skyAmbFactor(R, In.WorldPos) * pbrTAmb * gFrameData.dbgScales.x;
+        if ((aoFlags & 1u) != 0u) { env *= aoSample.a; }   // an occluded pocket sees less sky
+        c += (f0 * pbrSpecA + pbrSpecB) * gFrameData.dbgScales.y
+           + env * pbrEnvBRDF(f0, pbrNoV, pbrRough);
+    }
     // MW's enchanted-item glow. MW draws the item a second time as base*caustic*DIFFUSE and blends
     // it over the ordinary draw; summed, that is c*(1 + caustic*tint) — so this is multiplicative
     // on the already-shaded colour, which carries the item's base map and its lighting for free.
