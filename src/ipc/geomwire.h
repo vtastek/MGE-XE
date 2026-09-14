@@ -153,7 +153,7 @@ namespace IPC {
     // to be invisible. MASK|HULL are also barred from the shadow-caster lists: a helper volume
     // casting its own shadow into the pit it opens would be nonsense.
     //
-    // Riding casterFlags' spare bits — no wire size change (DrawItemWire is a shipped-together 144).
+    // Riding casterFlags' spare bits — no wire size change (DrawItemWire is a shipped-together 148).
     constexpr std::uint32_t kDrawPortalMask   = 0x4;
     constexpr std::uint32_t kDrawPortalHull   = 0x8;
     constexpr std::uint32_t kDrawPortalMember = 0x10;
@@ -163,7 +163,7 @@ namespace IPC {
     // model->world transform (D3DXMATRIX bytes, row-major — uploaded straight into the
     // host's gObject cbuffer; see opaque.srt.h for the no-transpose convention). The
     // per-frame draw list is an array of these in a chunked byte vec, with the camera
-    // view*proj carried inline in the RenderFrame RPC params. 144 bytes — client and
+    // view*proj carried inline in the RenderFrame RPC params. 148 bytes — client and
     // host MUST ship together on any size change (AT3 precedent).
     struct DrawItemWire {
         std::uint32_t slot;
@@ -214,11 +214,23 @@ namespace IPC {
         // (and when the pbrEnable knob is off), so the failure mode is the OLD image, never a white
         // param map read as metal = 1.
         std::uint32_t paramTexIndex;
+        // ...and the BAKED DERIVATIVE MAP, `<base>_paramd.dds` (mgeHost64/pbrbake): BC5_SNORM,
+        // R = dH/du, G = dH/dv, per TEXEL, divided by a per-texture power-of-two range the file
+        // carries in its own DDS header. 0 = none, and none is the COMMON case — a derivative map
+        // exists only where the 16-bit source displacement still does (96 of the 209 shipped
+        // _paramh maps have no source left).
+        //
+        // A SECOND texture rather than more channels in the _paramh, because the two carry different
+        // things: _paramh keeps metal/rough/IOR and the HEIGHT, which parallax and height-blending
+        // need and a derivative cannot reconstruct, while this carries the slope at a precision the
+        // 8-bit height threw away. It costs a second bindless slot per material — see kMaxTextures.
+        std::uint32_t derivTexIndex;
     };
     // ⚠ This comment block said "112 bytes" for three field-additions after it stopped being true
-    // (emissiveGain and the lanes before it took it to 140; paramTexIndex makes 144). A size stated in
-    // prose is a claim nothing checks, so the number now lives where the compiler reads it.
-    static_assert(sizeof(DrawItemWire) == 144, "DrawItemWire changed size: client and host must ship together");
+    // (emissiveGain and the lanes before it took it to 140; paramTexIndex made 144, derivTexIndex
+    // makes 148). A size stated in prose is a claim nothing checks, so the number now lives where
+    // the compiler reads it.
+    static_assert(sizeof(DrawItemWire) == 148, "DrawItemWire changed size: client and host must ship together");
 
     // MW's texture address mode, shipped raw (the shader's TEX_* defines use the same 4 values in
     // the same order, so nothing translates it anywhere along the way).

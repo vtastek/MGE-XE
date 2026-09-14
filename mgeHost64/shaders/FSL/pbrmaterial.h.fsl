@@ -179,6 +179,48 @@ float2 pbrHeightGradUV(uint mode, uint slot, uint clampModeIn, float2 uv,
     return pbrHeightGradBS(slot, clampUV, uv, sizeL, lvl) * sizeL;
 }
 
+// ─── The BAKED DERIVATIVE MAP (mgeHost64/pbrbake) ───────────────────────────────────────────────
+// `<base>_paramd.dds`: BC5_SNORM, R = dH/du, G = dH/dv, in PER-TEXEL units divided by a per-texture
+// power-of-two RANGE. The whole point is the order of operations: the bake differentiates the
+// 16-bit source and quantises the RESULT, where every runtime arm above differentiates a field that
+// was quantised first. The rig measured the difference where it matters most — on a height field
+// spanning 3/255 of range, every runtime arm's gradient retention is EXACTLY 0.000 (the relief
+// vanishes and what is left is the terracing) while this keeps 0.955, and the angular error goes
+// 0.159 deg -> 0.009.
+//
+// ⚠ THE RANGE IS NOT OPTIONAL AND NOT A CONSTANT. Two range-free designs were measured and both
+// failed: BC4's per-block endpoints sit on a GLOBAL 8-bit grid, so a block whose derivatives all
+// lie within 1/127 of each other collapses to a single value, and a shallow map is nothing but such
+// blocks. The host carries the exponent packed into the slot lane (pbrDerivSlotFor), and a file
+// without pbrbake's tag never reaches here at all.
+//
+// ⚠ PER TEXEL, SO THE LEVEL'S OWN SIZE CONVERTS IT. The stored slope is per texel OF THE MIP IT WAS
+// BAKED INTO, and a box-filtered chain halves the texel count per level, so the per-uv gradient is
+// stored * range * (that level's width). Using the base level's width would make the bump grow by
+// 2x per mip with distance. GetDimensions gives the top level only, so the sampled LOD is
+// reconstructed from the footprint exactly as the B-spline arms do.
+float2 pbrDerivMap(uint packed, uint clampModeIn, float2 uv, float2 dx, float2 dy)
+{
+    const uint  slot  = packed & 0xFFFFu;
+    const float range = exp2(float((packed >> 16u) & 0xFFu) - 128.0f);
+    const uint  cm    = clampModeIn & TEX_ADDR_MASK;
+    float4 d;
+    if (cm == TEX_CLAMP_S_CLAMP_T)      { d = SampleGradTex2D(gTextures[slot], gSamplerAnisoClampClamp, uv, dx, dy); }
+    else if (cm == TEX_CLAMP_S_WRAP_T)  { d = SampleGradTex2D(gTextures[slot], gSamplerAnisoClampWrap,  uv, dx, dy); }
+    else if (cm == TEX_WRAP_S_CLAMP_T)  { d = SampleGradTex2D(gTextures[slot], gSamplerAnisoWrapClamp,  uv, dx, dy); }
+    else                                { d = SampleGradTex2D(gTextures[slot], gSamplerAnisotropic, uv, dx, dy); }
+    // ⚠ ANISOTROPIC, unlike the B-spline arms — a derivative map is sampled, not reconstructed from
+    // a kernel, so nothing here needs exact bilinear weights and it keeps the 8x AF and the trilinear
+    // blend the live arm has. That is also why this does not inherit the "1 and 2 look blurrier"
+    // handicap play reported.
+    const int2  sz0  = GetDimensions(gTextures[slot], NO_SAMPLER);
+    const float2 size0 = max(float2(sz0), float2(1.0f, 1.0f));
+    const float fp   = max(length(dx * size0), length(dy * size0));
+    const float lvl  = max(0.0f, floor(log2(max(fp, 1e-8f))));
+    const float2 sizeL = max(floor(size0 * exp2(-lvl)), float2(1.0f, 1.0f));
+    return d.xy * range * sizeL;
+}
+
 // ─── Axis 2: dH/duv to a normal, with no mesh tangents ──────────────────────────────────────────
 // depth = the height range as a fraction of one UV unit (pbrParams.z). "Relative to the texture's own
 // size" is the live DX9 convention — a texture stretched 2x gets bumps 2x wider AND 2x deeper — and

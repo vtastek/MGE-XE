@@ -44,6 +44,9 @@ STRUCT(VSOutput)
     // PBR _paramh bindless slot (tasks/forge-pbr-materials.md). 0 = no PBR material: the draw takes
     // exactly the pre-PBR arithmetic. skinned.vert pins it to 0.
     DATA(FLAT(uint),  ParamIndex, TEXCOORD12);
+    // PBR baked derivative map: slot in the low 16 bits, range exponent + 128 in bits 16-23.
+    // 0 = none, which is the common case and takes the runtime gradient exactly as before.
+    DATA(FLAT(uint),  DerivIndex, TEXCOORD13);
 };
 
 ROOT_SIGNATURE(DefaultRootSignature)
@@ -80,9 +83,16 @@ float4 PS_MAIN( VSOutput In )
         const int2   psz   = GetDimensions(gTextures[In.ParamIndex], NO_SAMPLER);
         const float2 size0 = max(float2(psz), float2(1.0f, 1.0f));
         pbrParam = pbrParamGrad(In.ParamIndex, In.ClampMode, In.Uv, pbrDUVdx, pbrDUVdy);
-        const float2 dhduv = pbrHeightGradUV((uint)gShadowParams.pbrParams.x, In.ParamIndex,
-                                             In.ClampMode, In.Uv, pbrDUVdx, pbrDUVdy, size0,
-                                             gShadowParams.pbrParams.w);
+        // Mode 3 asks for the BAKED derivative map and falls back to the live mode when this draw
+        // has none — which is most draws. The fallback is a select on a FLAT per-draw lane, so it is
+        // uniform across the draw and costs nothing; making it a separate mode instead would mean a
+        // scene of mixed coverage could not be judged on one setting.
+        const uint  gradMode = (uint)gShadowParams.pbrParams.x;
+        const bool  useBaked = (gradMode == 3u) && (In.DerivIndex != 0u);
+        const float2 dhduv = useBaked
+            ? pbrDerivMap(In.DerivIndex, In.ClampMode, In.Uv, pbrDUVdx, pbrDUVdy)
+            : pbrHeightGradUV(min(gradMode, 2u), In.ParamIndex, In.ClampMode, In.Uv,
+                              pbrDUVdx, pbrDUVdy, size0, gShadowParams.pbrParams.w);
         N = pbrPerturb((uint)gShadowParams.pbrParams.y, N, pbrDPdx, pbrDPdy, pbrDUVdx, pbrDUVdy,
                        dhduv, gShadowParams.pbrParams.z);
         pbrRough  = pbrRoughness(pbrParam);

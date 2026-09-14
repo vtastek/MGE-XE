@@ -69,6 +69,7 @@ STRUCT(VSOutput)
     // shades exactly as before. Omitting it instead would hand opaque.frag an undefined bindless
     // index ([[project_forge_shared_frag_vsoutput]]).
     DATA(FLAT(uint),  ParamIndex, TEXCOORD12);
+    DATA(FLAT(uint),  DerivIndex, TEXCOORD13);   // pinned to 0 with ParamIndex — see the note above
     // Real water reflection (IR3): below-water clip — identical to opaque.vert's (see the comment
     // there). Pass-all outside the reflect pass; a rasterizer system value, so opaque.frag's shared
     // VSOutput does not declare it.
@@ -148,6 +149,7 @@ VSOutput VS_MAIN( VSInput In )
     Out.OverlayIndex = ((In.TexAlpha & SKIN_BLEND_BIT) != 0u) ? In.MatAlphaBits : 0u;
     Out.DrawIdx      = 0xFFFFFFFFu;   // no AT3 stage table for skinned parts (alpha.frag sentinel)
     Out.ParamIndex   = 0u;            // no PBR material on skinned parts yet — see the VSOutput note
+    Out.DerivIndex   = 0u;
     // MW near fog, same per-vertex form as opaque.vert (palette is already world-space).
     float dist = length(worldPos.xyz - gFrameData.eyePos.xyz);
     Out.Fog = mwFogFactor(dist);   // ramp only — the submerged test is PER PIXEL (mwFogAir)

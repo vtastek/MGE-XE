@@ -1123,6 +1123,10 @@ namespace ForgeRender {
     void uiHideForProbe();
     // Sets the PBR knobs for the probe's sign test (same arrangement, same reason).
     void pbrSetForProbe(uint32_t gradMode, uint32_t frameMode);
+    // ...and reads back what pbrDerivSlotFor would pack for a slot, so the probe can report whether
+    // the host actually recognised its upload as a derivative map. Same reason as the two above:
+    // the gate lives in the anonymous namespace below.
+    uint32_t pbrDerivPackForProbe(uint32_t slot);
 
     // Standalone exercise of the M1c opaque scene path (init → uploadGeometry →
     // renderScene) with a dummy triangle mesh, so the host-side printf/asserts are
@@ -1452,6 +1456,58 @@ namespace ForgeRender {
                     }
                 }
             };
+            // ...and the same three ramps again as BAKED DERIVATIVE MAPS (mgeHost64/pbrbake's
+            // format), so gradient mode 3 is signed on the GPU like the other three rather than
+            // trusted. This is the only check of the range-exponent packing end to end: the bake
+            // divides by 2^exp, the host packs exp+128 into the slot lane, and the shader
+            // multiplies by exp2(exp) and by the mip's own width. A mistake anywhere in that chain
+            // is a bump of the wrong DEPTH or the wrong SIGN, and both show up here.
+            auto buildDeriv = [](int kind, std::vector<uint8_t>& out, int32_t& expOut) {
+                const uint32_t W = 64, Hh = 64, bw = W / 4, bh = Hh / 4;
+                // The ramps below run 0..1 across W texels, so dH/dtexel is a CONSTANT 1/(W-1)
+                // (the wrapped edge column excepted, which one 4x4 block hides). Range = the
+                // smallest power of two at or above it, exactly as pbrbake fits it.
+                const double dh = (kind == 2) ? 0.0 : (kind == 1 ? -1.0 : 1.0) / (double)(W - 1);
+                expOut = (kind == 2) ? 0 : (int32_t)std::ceil(std::log2(std::fabs(dh)));
+                const double range = std::pow(2.0, (double)expOut);
+                const int8_t rq = (int8_t)std::lround(std::max(-1.0, std::min(1.0, dh / range)) * 127.0);
+                out.assign(148 + (size_t)bw * bh * 16, 0);
+                uint8_t* d = out.data();
+                d[0] = 'D'; d[1] = 'D'; d[2] = 'S'; d[3] = ' ';
+                *(uint32_t*)(d + 4)  = 124;
+                *(uint32_t*)(d + 12) = Hh;
+                *(uint32_t*)(d + 16) = W;
+                *(uint32_t*)(d + 28) = 1;
+                *(uint32_t*)(d + 32) = 0x4445474Du;   // dwReserved1[0] = 'MGED'
+                *(int32_t*) (d + 36) = expOut;        // dwReserved1[1] = range exponent
+                *(uint32_t*)(d + 76) = 32;
+                *(uint32_t*)(d + 80) = 0x4;
+                *(uint32_t*)(d + 84) = 0x30315844u;   // 'DX10'
+                *(uint32_t*)(d + 128) = 84;           // DXGI_FORMAT_BC5_SNORM
+                *(uint32_t*)(d + 132) = 3;
+                *(uint32_t*)(d + 140) = 1;
+                for (uint32_t b = 0; b < bw * bh; ++b) {
+                    uint8_t* blk = d + 148 + (size_t)b * 16;
+                    blk[0] = (uint8_t)rq; blk[1] = (uint8_t)rq;   // RED = dH/du, constant block
+                    blk[8] = 0; blk[9] = 0;                       // GREEN = dH/dv = 0
+                }
+            };
+            const uint32_t dslot[3] = { 11u, 12u, 13u };
+            uint32_t dpack[3] = { 0u, 0u, 0u };
+            for (int k = 0; k < 3; ++k) {
+                std::vector<uint8_t> dds; int32_t e = 0;
+                buildDeriv(k, dds, e);
+                std::vector<uint8_t> blob(sizeof(IPC::TexUploadWire) + dds.size());
+                IPC::TexUploadWire th{ dslot[k] | IPC::kTexUploadData, (uint32_t)dds.size(), 0u };
+                std::memcpy(blob.data(), &th, sizeof(th));
+                std::memcpy(blob.data() + sizeof(th), dds.data(), dds.size());
+                const unsigned b = uploadTextures(blob.data(), (unsigned)blob.size(), 1);
+                dpack[k] = pbrDerivPackForProbe(dslot[k]);
+                std::printf("[forge] scene-probe: PBR deriv map %s -> slot %u, built %u/1, range 2^%d,"
+                            " packed 0x%08X %s\n",
+                            k == 0 ? "RISING +u" : k == 1 ? "FALLING +u" : "FLAT", dslot[k], b, e,
+                            dpack[k], dpack[k] ? "" : "<-- NOT RECOGNISED AS A DERIVATIVE MAP");
+            }
             const uint32_t pslot[4] = { 7u, 8u, 9u, 10u };
             for (int k = 0; k < 4; ++k) {
                 std::vector<uint8_t> dds;
@@ -1479,8 +1535,10 @@ namespace ForgeRender {
 
             IPC::DrawItemWire pi = item;
             pi.texIndex = 1u;       // the white DXT1 base
-            auto lightDelta = [&](uint32_t paramSlot, const IPC::PointLightWire& light) {
+            auto lightDelta = [&](uint32_t paramSlot, const IPC::PointLightWire& light,
+                                  uint32_t derivSlot = 0u) {
                 pi.paramTexIndex = paramSlot;
+                pi.derivTexIndex = derivSlot;
                 renderScene(vp, lt, &pi, 1, (unsigned)sizeof(pi), nullptr, 0, 0, nullptr, 0, 0, nullptr, 0, 0);
                 const double off = debugReadbackMeanLuma();
                 renderScene(vp, lt, &pi, 1, (unsigned)sizeof(pi), nullptr, 0, 0, nullptr, 0, 0,
@@ -1488,16 +1546,23 @@ namespace ForgeRender {
                 const double on = debugReadbackMeanLuma();
                 return on - off;
             };
-            const char* gName[3] = { "cd", "cdbs", "bspline" };
+            const char* gName[4] = { "cd", "cdbs", "bspline", "baked" };
             const char* fName[2] = { "cotangent", "surfgrad" };
             const double dNone = lightDelta(0u, plA);   // no param map at all: the pre-PBR response
             bool allPass = true;
-            for (uint32_t gm = 0; gm < 3; ++gm) {
+            for (uint32_t gm = 0; gm < 4; ++gm) {
                 for (uint32_t fm = 0; fm < 2; ++fm) {
                     pbrSetForProbe(gm, fm);
-                    const double dRise  = lightDelta(pslot[0], plA);
-                    const double dFall  = lightDelta(pslot[1], plA);
-                    const double dFlat  = lightDelta(pslot[2], plA);
+                    // Mode 3 reads the BAKED map; every other mode reads the height. The param slot
+                    // rides along in both cases, because mode 3 still takes metal/rough/IOR from the
+                    // _paramh — only the gradient comes from elsewhere.
+                    const bool baked = (gm == 3u);
+                    const double dRise  = lightDelta(pslot[0], plA, baked ? dslot[0] : 0u);
+                    const double dFall  = lightDelta(pslot[1], plA, baked ? dslot[1] : 0u);
+                    const double dFlat  = lightDelta(pslot[2], plA, baked ? dslot[2] : 0u);
+                    // The v ramp has no baked twin (its derivative is in GREEN, and the constant
+                    // blocks above only exercise RED), so mode 3 checks the v axis through the
+                    // height path — which is unchanged and already covered by modes 0-2.
                     const double dRiseV = lightDelta(pslot[3], plB);
                     const double dFlatV = lightDelta(pslot[2], plB);
                     // Pass: (1) rising brighter than flat and falling darker, each by more than a
@@ -7001,6 +7066,10 @@ namespace {
     // metal/rough/IOR. Cleared on every upload attempt into the slot, set only on success: a draw's
     // param slot reaches the shader only while a param map is really there.
     uint8_t g_texIsData[MAX_TEXTURES] = {};
+    // ...and, for a slot holding a DERIVATIVE map, its range exponent + 128 (so it survives as a
+    // byte in the instance lane). 0 = this slot is not a derivative map. Same discipline as
+    // g_texIsData: written only when an upload lands, cleared by every other writer of pTextures[].
+    uint8_t g_texDerivExp[MAX_TEXTURES] = {};
 
     // ---- PBR MATERIAL KNOBS (tasks/forge-pbr-materials.md, Track C) --------------------------
     // Defaults reproduce the LIVE DX9 shader's reconstruction (a central difference at +-1.5 base
@@ -7022,6 +7091,13 @@ namespace {
     //   2 bspline analytic derivative of the cubic B-spline (C2 height, so the normal is C1):
     //             facets ~1, but a narrow baseline lets ~2x the 8-bit noise through on smooth
     //             content. The better arm where a map carries real detail near its Nyquist.
+    //   3 baked   the BAKED DERIVATIVE MAP (mgeHost64/pbrbake), where one exists for this draw —
+    //             and the live arm 0 everywhere else, per draw, so a mixed-coverage scene is still
+    //             judgeable on one setting. This is the only arm that addresses TERRACING rather
+    //             than veiling it: it differentiates the 16-bit source and quantises the result,
+    //             where every other arm differentiates a field that was quantised first. Rig, on a
+    //             height field spanning 3/255: gradient retention 0.955 against 0.000 for all three
+    //             runtime arms, angular error 0.009 deg against 0.159.
     uint32_t g_pbrGradMode  = 0u;
     // pbrFrameMode — how dH/duv becomes a normal with no mesh tangents:
     //   0 cotangent frame (live DX9's BuildPerPixelTBN, with the Jacobian's SIGN honoured — see
@@ -7055,6 +7131,19 @@ namespace {
         return (g_pbrEnable && paramTexIndex != 0u && paramTexIndex < (uint32_t)MAX_TEXTURES &&
                 g_texIsData[paramTexIndex] != 0u) ? paramTexIndex : 0u;
     }
+
+    // ...and the same for lane [16], the DERIVATIVE map: slot in the low 16 bits, its range exponent
+    // + 128 in bits 16-23. Packed together because they are useless apart — a derivative without its
+    // range is a normal scaled by an unknown factor — and because one lane is cheaper than a lane
+    // plus a per-slot table the shader would have to reach through a binding.
+    //
+    // g_texDerivExp is nonzero ONLY for a slot whose upload both landed AND carried pbrbake's tag,
+    // so a slot recycled to an ordinary texture cannot be read as a derivative map even for a frame.
+    inline uint32_t pbrDerivSlotFor(uint32_t derivTexIndex) {
+        if (!g_pbrEnable || derivTexIndex == 0u || derivTexIndex >= (uint32_t)MAX_TEXTURES) { return 0u; }
+        const uint32_t e = g_texDerivExp[derivTexIndex];
+        return e ? (derivTexIndex | (e << 16)) : 0u;
+    }
     // Same classification for flip-book slices, which have no gTextures slot to key on. One vector
     // per bucket, sized when the bucket's array is created (uploadFlipSlice).
     std::vector<uint8_t> g_flipAlphaKind[MAX_FLIP_BUCKETS];
@@ -7079,7 +7168,9 @@ namespace {
     //   [12..14] emissiveGain.rgb (float) — the flux/area emissive boost, a per-channel RATIO.
     //   [15] ParamIndex (PBR _paramh bindless slot, 0 = no PBR material; per-frame, always through
     //        pbrParamSlotFor). Read by opaque.frag only.
-    // 16 * 4 = 64 bytes. The material + overlay ride the instance VB (not a new cbuffer/descriptor
+    //   [16] DerivIndex (PBR _paramd bindless slot | (range exponent + 128) << 16; 0 = none;
+    //        per-frame, always through pbrDerivSlotFor). Read by opaque.frag only.
+    // 17 * 4 = 68 bytes. The material + overlay ride the instance VB (not a new cbuffer/descriptor
     // set) to avoid the FSL descriptor-offset gotcha that hoisted the sampler — see opaque.srt.h.
     //
     // ⚠ THE GAIN LANES ARE THE ONE GROUP WHOSE IDENTITY IS 1.0, NOT 0. opaque.vert multiplies the
@@ -7088,7 +7179,7 @@ namespace {
     // explicitly — 1.0f on the passes that carry no boost (shadow, sky) and the real gain on the
     // four that shade emissive (opaque, alpha, FP rigid, FP alpha). The creation-time identity
     // init seeds 1.0 as well, so a pass added later inherits "no boost" rather than "no emissive".
-    constexpr uint32_t kStaticInstU32 = 16;
+    constexpr uint32_t kStaticInstU32 = 17;
 
     // Pack the per-draw instance .y: texIndex in the low 16 bits (slots < kMaxTextures=1024,
     // so ≤10 bits), the alpha-test reference quantised to a byte in bits 16-23, the
@@ -8764,9 +8855,9 @@ namespace {
         vl.mBindingCount = 2;
         vl.mBindings[0].mStride = sizeof(IPC::GeomVertexWire);
         vl.mBindings[0].mRate = VERTEX_BINDING_RATE_VERTEX;
-        vl.mBindings[1].mStride = kStaticInstU32 * sizeof(uint32_t);   // {DrawIndex, TexAlpha, matDiff3, matAmb3, matEmis3, Overlay, EmisGain3, ParamIndex}
+        vl.mBindings[1].mStride = kStaticInstU32 * sizeof(uint32_t);   // {DrawIndex, TexAlpha, matDiff3, matAmb3, matEmis3, Overlay, EmisGain3, ParamIndex, DerivIndex}
         vl.mBindings[1].mRate = VERTEX_BINDING_RATE_INSTANCE;
-        vl.mAttribCount = 12;
+        vl.mAttribCount = 13;
         vl.mAttribs[0].mSemantic = SEMANTIC_POSITION;
         vl.mAttribs[0].mFormat = TinyImageFormat_R32G32B32_SFLOAT;
         vl.mAttribs[0].mBinding = 0;
@@ -8830,6 +8921,11 @@ namespace {
         vl.mAttribs[11].mBinding = 1;
         vl.mAttribs[11].mLocation = 11;
         vl.mAttribs[11].mOffset = 15 * sizeof(uint32_t);
+        vl.mAttribs[12].mSemantic = SEMANTIC_TEXCOORD9;      // DerivIndex (per-instance: _paramd slot | exp)
+        vl.mAttribs[12].mFormat = TinyImageFormat_R32_UINT;
+        vl.mAttribs[12].mBinding = 1;
+        vl.mAttribs[12].mLocation = 12;
+        vl.mAttribs[12].mOffset = 16 * sizeof(uint32_t);
 
         // COLOUR-pass depth (Phase 1 early-Z): the Z-prepass already wrote every opaque pixel's
         // depth, so the colour pass only MATCHES it — CMP_EQUAL + depthWrite OFF = true early-Z,
@@ -9611,6 +9707,7 @@ namespace {
             for (uint32_t i = 0; i < kMaxTextures; ++i) {
                 g_live.pTextures[i] = g_live.pDefaultWhite;
                 g_texIsData[i] = 0u;   // no slot holds a param map until an upload proves it again
+                g_texDerivExp[i] = 0u;
             }
             g_live.texHigh = 0;
 
@@ -22118,8 +22215,8 @@ namespace {
         // height-derived normal on those surfaces, which is the quickest way to see the modes differ.
         { TabBuilder t; t.panel = g_uiPanel; t.name = "PBR materials";
           t.checkbox("PBR materials (_paramh) — off = today's image exactly", &g_pbrEnable);
-          t.sliderU("  gradient: 0 cd (live DX9) | 1 cdbs (B-spline taps) | 2 bspline (C2)",
-                    &g_pbrGradMode, 0u, 2u, 1u);
+          t.sliderU("  gradient: 0 cd (live DX9) | 1 cdbs | 2 bspline | 3 BAKED map where it exists",
+                    &g_pbrGradMode, 0u, 3u, 1u);
           t.sliderU("  frame: 0 cotangent (live DX9) | 1 surface gradient (exact under skew)",
                     &g_pbrFrameMode, 0u, 1u, 1u);
           // A calibration constant, not a fix: raising it deepens the facets, it does not remove
@@ -25643,7 +25740,7 @@ void destroyHostWindow(Renderer* R);
             // MB-2o: 0 the streak mean, 1 the nearest sample, 2 reflected at the silhouette.
             { "mbBgMode",  &g_mbBgMode,  2u },
             // PBR: 0 cd (live DX9), 1 cdbs, 2 bspline; frame 0 cotangent, 1 surface gradient.
-            { "pbrGradMode",  &g_pbrGradMode,  2u },
+            { "pbrGradMode",  &g_pbrGradMode,  3u },
             { "pbrFrameMode", &g_pbrFrameMode, 1u },
         };
         const SKnob sknobs[] = {
@@ -27399,6 +27496,7 @@ void destroyHostWindow(Renderer* R);
         g_pbrGradMode = gradMode;
         g_pbrFrameMode = frameMode;
     }
+    uint32_t pbrDerivPackForProbe(uint32_t slot) { return pbrDerivSlotFor(slot); }
     // M1, same arrangement and same reason (see forgerender.h): arm the motion-vector pass for the
     // probe, then report the field's own statistics.
     // M1 4b: narrow the probe's input rect through the CLIENT'S OWN ENTRY POINT. setRenderSize takes
@@ -30450,6 +30548,7 @@ void destroyHostWindow(Renderer* R);
                     ((float*)dins)[dm.matIdx * kStaticInstU32 + 13] = 1.0f;
                     ((float*)dins)[dm.matIdx * kStaticInstU32 + 14] = 1.0f;
                     dins[dm.matIdx * kStaticInstU32 + 15] = 0u;   // [15] ParamIndex: this pass's frag never reads it — kept explicit, not stale
+                    dins[dm.matIdx * kStaticInstU32 + 16] = 0u;   // [16] DerivIndex: unread by this pass's frag — explicit, not stale
                 }
             }
 
@@ -30730,6 +30829,7 @@ void destroyHostWindow(Renderer* R);
                     ((float*)sins)[g * kStaticInstU32 + 13] = 1.0f;
                     ((float*)sins)[g * kStaticInstU32 + 14] = 1.0f;
                     sins[g * kStaticInstU32 + 15] = 0u;   // [15] ParamIndex: this pass's frag never reads it — kept explicit, not stale
+                    sins[g * kStaticInstU32 + 16] = 0u;   // [16] DerivIndex: unread by this pass's frag — explicit, not stale
                 }
                 g_setupBlkMs[kSetupBlkPackFill] += hostNowMs() - tPkFill0;
                 const double tPkJob0 = hostNowMs();
@@ -30902,7 +31002,7 @@ void destroyHostWindow(Renderer* R);
             // frag reads them on every frame it has a param map in view, and a lane written only
             // some frames is the stale-cbuffer trap. pbrEnable is NOT here — it acts at pack time
             // (pbrParamSlotFor), which is what makes "off" bit-identical rather than zero-weighted.
-            mp[kPbrParamsFloat + 0] = (float)std::min(g_pbrGradMode, 2u);
+            mp[kPbrParamsFloat + 0] = (float)std::min(g_pbrGradMode, 3u);
             mp[kPbrParamsFloat + 1] = (float)std::min(g_pbrFrameMode, 1u);
             mp[kPbrParamsFloat + 2] = std::max(0.0f, g_pbrDepth);
             mp[kPbrParamsFloat + 3] = std::max(0.25f, g_pbrGradRadius);
@@ -31064,6 +31164,7 @@ void destroyHostWindow(Renderer* R);
             finst[local * kStaticInstU32 + 13] = items[i].emissiveGain[1];
             finst[local * kStaticInstU32 + 14] = items[i].emissiveGain[2];
             inst[local * kStaticInstU32 + 15] = pbrParamSlotFor(items[i].paramTexIndex);   // PBR _paramh slot, host-gated (0 = shade as before)
+            inst[local * kStaticInstU32 + 16] = pbrDerivSlotFor(items[i].derivTexIndex);   // PBR _paramd slot | range exp
             // Terrain DECAL_1 overlay slot (0 = no decal → frag splat gated off, non-terrain unchanged).
             inst[local * kStaticInstU32 + 11] = items[i].overlayTexIndex;
         }
@@ -33890,6 +33991,7 @@ void destroyHostWindow(Renderer* R);
                     finst[idx * kStaticInstU32 + 13] = 1.0f;
                     finst[idx * kStaticInstU32 + 14] = 1.0f;
                     inst[idx * kStaticInstU32 + 15] = 0u;   // [15] ParamIndex: this pass's frag never reads it — kept explicit, not stale
+                    inst[idx * kStaticInstU32 + 16] = 0u;   // [16] DerivIndex: unread by this pass's frag — explicit, not stale
 
                     Buffer*  meshVb     = m.inArena ? g_live.pArenaVB : m.vb;
                     Buffer*  meshIb     = m.inArena ? g_live.pArenaIB : m.ib;
@@ -34252,6 +34354,7 @@ void destroyHostWindow(Renderer* R);
                 finst[idx * kStaticInstU32 + 13] = 1.0f;
                 finst[idx * kStaticInstU32 + 14] = 1.0f;
                 inst[idx * kStaticInstU32 + 15] = 0u;   // [15] ParamIndex: this pass's frag never reads it — kept explicit, not stale
+                inst[idx * kStaticInstU32 + 16] = 0u;   // [16] DerivIndex: unread by this pass's frag — explicit, not stale
 
                 // Arena (bind-once + offsets) vs dynamic-ring (own VB/IB) source.
                 Buffer*  meshVb     = m.inArena ? g_live.pArenaVB : m.vb;
@@ -36720,6 +36823,7 @@ void destroyHostWindow(Renderer* R);
                 finst[idx * kStaticInstU32 + 13] = it.emissiveGain[1];
                 finst[idx * kStaticInstU32 + 14] = it.emissiveGain[2];
                 inst[idx * kStaticInstU32 + 15] = 0u;   // [15] ParamIndex: this pass's frag never reads it — kept explicit, not stale
+                inst[idx * kStaticInstU32 + 16] = 0u;   // [16] DerivIndex: unread by this pass's frag — explicit, not stale
                 // matAlpha rides the overlay slot [11] (opaque.vert reads it as a uint;
                 // alpha.frag asfloat's it back — the terrain splat doesn't run in this frag).
                 finst[idx * kStaticInstU32 + 11] = it.matAlpha;
@@ -37038,6 +37142,7 @@ void destroyHostWindow(Renderer* R);
                     finst[idx * kStaticInstU32 + 13] = it.emissiveGain[1];
                     finst[idx * kStaticInstU32 + 14] = it.emissiveGain[2];
                     inst[idx * kStaticInstU32 + 15] = pbrParamSlotFor(it.paramTexIndex);   // PBR _paramh slot, host-gated (0 = shade as before)
+                    inst[idx * kStaticInstU32 + 16] = pbrDerivSlotFor(it.derivTexIndex);   // PBR _paramd slot | range exp
                     inst[idx * kStaticInstU32 + 11]  = 0;   // no terrain decal on arms
 
                     const uint32_t firstVertex = m.inArena ? (uint32_t)(m.vbOff / sizeof(IPC::GeomVertexWire)) : 0u;
@@ -37364,6 +37469,7 @@ void destroyHostWindow(Renderer* R);
                     finst[idx * kStaticInstU32 + 13] = it.emissiveGain[1];
                     finst[idx * kStaticInstU32 + 14] = it.emissiveGain[2];
                     inst[idx * kStaticInstU32 + 15] = 0u;   // [15] ParamIndex: this pass's frag never reads it — kept explicit, not stale
+                    inst[idx * kStaticInstU32 + 16] = 0u;   // [16] DerivIndex: unread by this pass's frag — explicit, not stale
                     finst[idx * kStaticInstU32 + 11] = it.matAlpha;      // alpha.frag asfloat's it back
                     // AT3 multi-stage — same table, tail indices (see the main alpha loop).
                     if (g_live.pAlphaStagesBuf) {
@@ -42147,6 +42253,17 @@ void destroyHostWindow(Renderer* R);
         TinyImageFormat fmt = TinyImageFormat_UNDEFINED;
         uint32_t width = 0, height = 0, mipLevels = 0, dataOffset = 0;
         bool ok = false;
+        // PBR DERIVATIVE MAP (mgeHost64/pbrbake): the per-texture RANGE its dH/dtexel values were
+        // divided by, as a power-of-two exponent — range = 2^derivExp. hasDeriv says the file
+        // actually carried one; without it a BC5 is just a BC5 and cannot serve as a derivative
+        // map, because the range is the one thing the pixels do not contain.
+        //
+        // Per texture and not a constant because it HAS to be: a shallow height field's derivative
+        // is ~1e-5 in global units, and BC4's block endpoints live on a GLOBAL 8-bit grid, so every
+        // block of it collapses to one value and the gradient reads zero. Measured — pbrbake's
+        // header, and pbrsynth's `deriv5s` arm, which keeps that failure as a test.
+        int32_t  derivExp = 0;
+        bool     hasDeriv = false;
     };
     // STEP 5 — the sRGB VIEW. Everything MW ships as art is authored for a gamma display; ask the
     // hardware to decode it.
@@ -42199,6 +42316,13 @@ void destroyHostWindow(Renderer* R);
         uint32_t dataOffset = 128;
         TinyImageFormat fmt = TinyImageFormat_UNDEFINED;
         const uint32_t DDPF_FOURCC = 0x4;
+        // dwReserved1[0..1] (offset 32): pbrbake's magic + the derivative range exponent. The DDS
+        // spec leaves these eleven words to the writer and other tools stamp signatures there, so
+        // this is read ONLY behind the magic, and its absence means "not a derivative map" rather
+        // than a default — a wrong range is a wrongly-scaled normal over the whole surface, which
+        // is exactly the silent failure a default would produce.
+        const bool hasDerivTag = (ddsRd32(d + 32) == 0x4445474Du);   // 'MGED'
+        const int32_t derivExpTag = hasDerivTag ? (int32_t)ddsRd32(d + 36) : 0;
         if (pfFlags & DDPF_FOURCC) {
             switch (fourCC) {
                 case 0x31545844u: fmt = TinyImageFormat_DXBC1_RGBA_UNORM; break;   // 'DXT1'
@@ -42251,6 +42375,10 @@ void destroyHostWindow(Renderer* R);
         if (fmt == TinyImageFormat_UNDEFINED || width == 0 || height == 0) { return r; }
         r.fmt = fmt; r.width = width; r.height = height; r.mipLevels = mips;
         r.dataOffset = dataOffset; r.ok = true;
+        // Only a BC5 can be a derivative map; the tag on anything else is a writer we do not know.
+        const bool isBC5 = (fmt == TinyImageFormat_DXBC5_SNORM || fmt == TinyImageFormat_DXBC5_UNORM);
+        r.hasDeriv = hasDerivTag && isBC5 && derivExpTag >= -128 && derivExpTag <= 127;
+        r.derivExp = r.hasDeriv ? derivExpTag : 0;
         return r;
     }
 
@@ -42496,6 +42624,7 @@ void destroyHostWindow(Renderer* R);
             // Any upload attempt into this slot voids its "holds a param map" status until this one
             // lands (see g_texIsData): every failure path below must leave it 0.
             g_texIsData[hdr.slot] = 0u;
+            g_texDerivExp[hdr.slot] = 0u;
             DdsInfo info = parseDds(dds, hdr.byteLen);
             if (!info.ok) {
                 LOGF(eWARNING, "[forge] tex slot %u: unsupported DDS format (slot stays white)", hdr.slot);
@@ -42580,6 +42709,7 @@ void destroyHostWindow(Renderer* R);
             dd.ppTextures = &g_live.pTextures[hdr.slot];
             updateDescriptorSet(R, 0, g_live.pPersistentSet, 1, &dd);
             g_texIsData[hdr.slot] = dataTex ? 1u : 0u;   // landed: now, and only now, it counts
+            g_texDerivExp[hdr.slot] = info.hasDeriv ? (uint8_t)(info.derivExp + 128) : 0u;
             ++built;
         }
         // One upload-engine flush for the whole batch (else textures stay black). Replaces the
@@ -43097,6 +43227,7 @@ void destroyHostWindow(Renderer* R);
         if (g_live.pTextures[slot] != g_live.pDefaultWhite) { g_texRetire.push_back(g_live.pTextures[slot]); }
         g_live.pTextures[slot] = tex;
         g_texIsData[slot] = 0u;   // a host-owned texture (atlas, cloud, sun) is never a param map
+        g_texDerivExp[slot] = 0u;
         if (slot + 1 > g_live.texHigh) { g_live.texHigh = slot + 1; }
         DescriptorData dd = {};
         dd.mIndex = SRT_RES_IDX(SrtData, Persistent, gTextures);

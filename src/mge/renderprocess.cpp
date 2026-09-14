@@ -507,6 +507,13 @@ namespace {
         const char*   paramNamePtr = nullptr;
         std::uint32_t paramSlot = 0;
         std::uint32_t paramEpoch = 0;
+        // ...and the baked derivative map beside it. Its own fields rather than a second value on
+        // paramSlot's: the two files are found independently (a texture can have a _paramh and no
+        // _paramd), and one epoch re-validating the other's stale slot is the aliasing bug ovEpoch
+        // already exists to avoid.
+        const char*   derivNamePtr = nullptr;
+        std::uint32_t derivSlot = 0;
+        std::uint32_t derivEpoch = 0;
     };
     std::unordered_map<std::uint32_t, SlotInfo> g_keySlot;
     std::uint32_t g_texEpoch = 0;            // bumped on bindless-slot LRU recycle
@@ -2329,6 +2336,30 @@ namespace {
         return slot;
     }
 
+    // The BAKED DERIVATIVE MAP, `<base>_paramd.dds` (mgeHost64/pbrbake). Same shape and the same
+    // caching rules as resolveParamSlot above; a separate lookup because the two files are
+    // independent — 96 of the shipped _paramh maps have no 16-bit source left and will never have a
+    // _paramd, and that is the ordinary case rather than a failure.
+    std::uint32_t resolveDerivSlot(const char* baseName, std::uint32_t baseSlot, SlotInfo& si) {
+        if (!baseName || baseSlot == 0 || IPC::isFlipSlot(baseSlot)) { return 0; }
+        if (baseName == si.derivNamePtr && si.derivEpoch == g_texEpoch) {
+            if (si.derivSlot != 0) { g_slotLastUsed[si.derivSlot] = g_frame; }
+            return si.derivSlot;
+        }
+        std::string stem = normalizeTextureName(baseName);
+        const std::size_t dot = stem.find_last_of('.');
+        const std::size_t sep = stem.find_last_of('\\');
+        if (dot != std::string::npos && (sep == std::string::npos || dot > sep)) { stem.erase(dot); }
+        // dataTexture: a derivative map is BC5 and must keep its stored SNORM format — the scene's
+        // sRGB view is not defined for BC5 and would be meaningless over a signed slope anyway.
+        const std::uint32_t slot = stem.empty() ? 0u
+            : resolveTextureSlotEx((stem + "_paramd.dds").c_str(), true, true);
+        si.derivNamePtr = baseName;
+        si.derivSlot    = slot;
+        si.derivEpoch   = g_texEpoch;
+        return slot;
+    }
+
     // Emit one STATIC opaque draw (pre-filtered by buildGeometryDrawLists — the
     // per-entry filter rationale lives there). Mirrors the PROVEN D3D9 cache color
     // pass's per-entry packing (drawEntry in rendercachedcolor.cpp) so the Forge
@@ -2404,6 +2435,7 @@ namespace {
                 ? resolveCachedSlot(e.overlayTextureName, si.ovNamePtr, si.ovSlot, si.ovEpoch) : 0u;
             // PBR param map of the base texture (0 = none → the host shades it exactly as before).
             item.paramTexIndex = resolveParamSlot(e.textureName, item.texIndex, si);
+            item.derivTexIndex = resolveDerivSlot(e.textureName, item.texIndex, si);
             item.alphaRef = e.alphaTest ? e.alphaRef : 0.0f;     // alpha-test cutout (0 = no test)
             // MW's per-map texture address mode, plus the enchanted-item glow bit riding this
             // lane's spare bits (see IPC::kTexFlagEnchantGlow — one decode, in packTexAlpha).

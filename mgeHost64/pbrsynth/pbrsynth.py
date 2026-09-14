@@ -673,6 +673,28 @@ def arm_bicubic(ctx):
     return gx * s.N / sc, gy * s.N / sc
 
 
+def arm_deriv5s(ctx):
+    """NEW -- the SHIPPED derivative map: pbrbake's exact convention, so the arm that was scored is
+    the file that ships. Per-texel units at a fixed gain of 2 (no per-texture range), wrapped central
+    difference of the 16-bit source, BC5_SNORM, one level per mip."""
+    s = ctx.s
+    du = sample_trilinear(ctx.smips[0], s.xt, s.yt, s.lod)
+    dv = sample_trilinear(ctx.smips[1], s.xt, s.yt, s.lod)
+    # stored is dH/dtexel * 2 at THIS level; the shader converts to per-uv with the level's size
+    return du * 0.5 * s.N, dv * 0.5 * s.N
+
+
+def arm_deriv5q(ctx):
+    """NEW -- a BC5 derivative map baked from the SHIPPED 8-BIT HEIGHT rather than from a
+    full-precision source.  The arm that answers "is a bake worth doing for the 91 _paramh maps whose
+    16-bit displacement PNG is gone?".  Same filtering and the same codec as `deriv5`; the only
+    difference is what was differentiated."""
+    s = ctx.s
+    du = sample_trilinear(ctx.qmips[0], s.xt, s.yt, s.lod)
+    dv = sample_trilinear(ctx.qmips[1], s.xt, s.yt, s.lod)
+    return du * ctx.qrange, dv * ctx.qrange
+
+
 def arm_bspline(ctx):
     """NEW -- the C2 candidate, and the one T3 showed was missing.  The analytic derivative of a
     uniform cubic B-spline over the height texels.  Two differences from `bicubic`, both deliberate:
@@ -747,9 +769,11 @@ GRAD_ARMS = {
     "bspline":  arm_bspline,
     "cdbs":     lambda c: arm_cdbs(c),
     "deriv5":   lambda c: arm_deriv5(c, False),
+    "deriv5q":  arm_deriv5q,
+    "deriv5s":  arm_deriv5s,
     "deriv5c":  lambda c: arm_deriv5(c, True),
 }
-GRAD_ORDER = ["cd", "fwd", "sobel", "ddx", "fp", "bicubic", "bspline", "cdbs", "deriv5", "deriv5c"]
+GRAD_ORDER = ["cd", "fwd", "sobel", "ddx", "fp", "bicubic", "bspline", "cdbs", "deriv5", "deriv5q", "deriv5s", "deriv5c"]
 
 
 # =======================================================================================
@@ -893,6 +917,37 @@ class Ctx(object):
             pairs = [bc5_roundtrip(a, b, signed=True) for a, b in zip(cu, cv)]
             self.dmips = ([p[0] for p in pairs], [p[1] for p in pairs])
         self.dmips_c = self.dmips
+
+        # ...AND THE SAME MAP BAKED FROM THE 8-BIT HEIGHT INSTEAD OF FROM TRUTH.  This is what a bake
+        # tool can actually do for a texture whose 16-bit source has been lost: the shipped _paramh is
+        # all there is, so the derivative is taken from a field that has ALREADY been through 8-bit
+        # rounding and BC4.  Everything else about the bake is unchanged -- full-precision central
+        # difference, filtered then compressed per level -- so the gap between `deriv5` and `deriv5q`
+        # is exactly the value of the SOURCE, isolated from the value of baking.
+        # THE SHIPPED CONVENTION (mgeHost64/pbrbake): a WRAPPED central difference of the 16-bit
+        # source at the TARGET size, stored as dH/dtexel * 2 in BC5_SNORM — a fixed gain rather than
+        # a per-texture range, since the difference is bounded by +-0.5 for a field in [0,1].
+        # Modelled here so the thing that ships is the thing that was scored: `deriv5` bakes the
+        # ANALYTIC derivative with a per-texture range, which is the concept, not the file.
+        src16 = np.round(h * 65535.0) / 65535.0          # the 16-bit PNG the bake reads
+        su = 0.5 * (np.roll(src16, -1, axis=1) - np.roll(src16, 1, axis=1)) * 2.0
+        sv = 0.5 * (np.roll(src16, -1, axis=0) - np.roll(src16, 1, axis=0)) * 2.0
+        scu, scv = mip_chain(su, 6), mip_chain(sv, 6)
+        if codec == "none":
+            self.smips = (scu, scv)
+        else:
+            sp = [bc5_roundtrip(a, b, signed=True) for a, b in zip(scu, scv)]
+            self.smips = ([x[0] for x in sp], [x[1] for x in sp])
+
+        qu = np.gradient(self.mips[0], axis=1) * self.N
+        qv = np.gradient(self.mips[0], axis=0) * self.N
+        self.qrange = float(max(np.abs(qu).max(), np.abs(qv).max(), 1e-12))
+        qcu, qcv = mip_chain(qu / self.qrange, 6), mip_chain(qv / self.qrange, 6)
+        if codec == "none":
+            self.qmips = (qcu, qcv)
+        else:
+            qp = [bc5_roundtrip(a, b, signed=True) for a, b in zip(qcu, qcv)]
+            self.qmips = ([x[0] for x in qp], [x[1] for x in qp])
 
         self.s = Sampling(N, M, self.u0, self.v0, tpp, pixels)
 

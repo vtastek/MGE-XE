@@ -782,7 +782,7 @@ STRUCT(ShadowMaskParams)
     // opaque.frag, and only on a draw whose ParamIndex is nonzero — so with no _paramh in view none of
     // this is reached, and pbrEnable is not a lane at all (the host zeroes ParamIndex instead, which
     // is what makes "off" bit-identical rather than zero-weighted).
-    //   x = gradient mode   0 cd (live DX9) | 1 cdbs (B-spline taps) | 2 bspline (C2 derivative)
+    //   x = gradient mode   0 cd (live DX9) | 1 cdbs | 2 bspline (C2) | 3 baked derivative map
     //   y = frame mode      0 cotangent frame (sign-correct) | 1 Mikkelsen surface gradient
     //   z = relief depth    the height range as a fraction of one UV unit (48/4096 = DX9 @4096)
     //   w = tap radius      the central difference's half-span in BASE texels (1.5 = DX9 exactly).

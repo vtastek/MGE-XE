@@ -64,6 +64,7 @@ rather than gain. The live shader does NOT normalise, and that is measured separ
 | T9 | `heightScale = 16` is resolution-coupled | measured — slope 7.06× / 4.00× / 2.00× / 1.00× at 512/1K/2K/4K |
 | T10a | calibration of T10's noise estimator | **bitstream floor PASSES (empty band 0.61–0.96); corner floor FAILS** |
 | T10 | **real art**: top octave above codec noise? | **135 of 208 4096 maps: top octave at least half codec noise** |
+| T11 | **what the BAKE must read**: source vs shipped height | **`deriv5q` is WORSE than not baking**; `deriv5s` (fixed gain) fails outright |
 
 ## What it found
 
@@ -132,6 +133,24 @@ islands.
 3-texel difference, so the per-uv gain is `16·N/3`: the same art reads 2× shallower at 4096 than at
 2048. Re-encoding a map changes its apparent depth with no edit anywhere. Retuning the constant is
 not a fix for facets — it changes how deep they look, not how many there are.
+
+**9. Two derivative-map designs failed before the third worked, and the rig killed both cheaply.**
+The bake (`mgeHost64/pbrbake`) exists because of finding 4, and the arms here are what decided its
+format:
+
+| arm | what it bakes | shallow (terracing) | noise |
+|---|---|---|---|
+| `cd` | nothing — the runtime baseline | 0.159°, retention **0.000** | 1.99° |
+| `deriv5q` | the derivative of the **shipped 8-bit height** | 0.159°, retention **0.000** | **3.08° — worse than cd** |
+| `deriv5s` | the 16-bit source, **fixed gain 2**, BC5 | 0.159°, retention **0.000** | **3.47° — worse than cd** |
+| *(shipped)* | the 16-bit source, **per-texture range**, BC5 | **0.009°, retention 0.955** | **0.76°** |
+| `deriv5` | the analytic truth (the concept, not a file) | 0.000°, retention 1.001 | 0.31° |
+
+`deriv5q` says the SOURCE is the whole feature: differentiating an already-quantised staircase at
+full precision captures its spikes exactly and then requantises them. `deriv5s` says the RANGE is
+not optional: BC4's per-block endpoints sit on a **global** 8-bit grid, so a block whose derivatives
+all lie within 1/127 of each other collapses to one constant value — and a shallow map is nothing
+but such blocks. Both were plausible, both were simpler than what shipped, and both cost one run.
 
 ## Instruments that were wrong first, and are recorded as such
 
