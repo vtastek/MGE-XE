@@ -217,14 +217,20 @@ def read_paramh_alpha(path):
     return H, None
 
 
-def write_dds_bc5(path, levels, exp):
+def write_dds_bc5(path, levels, exp, n0):
     """DX10 header + BC5_SNORM (DXGI 84), tightly packed mip chain -- the layout parseDds walks.
 
     dwReserved1 (offset 32, eleven uint32 the DDS spec leaves to the writer -- nvtt and others put
     their own signatures here) carries the magic and the range exponent.  The host reads it ONLY
     when the magic matches and otherwise assumes nothing, so an ordinary BC5 file from any other
     tool still loads; it simply has no range and is not usable as a derivative map."""
-    n0 = levels[0].shape[0] * 4   # levels are (nblocks_y*4) wide/high; recover from the first
+    # ⚠ n0 IS PASSED IN, NOT RECOVERED FROM levels[0]. The first version derived it as
+    # `levels[0].shape[0] * 4` on the belief that a level was a 2-D block array; bc5_encode_snorm
+    # returns a FLAT byte array, so that read the byte COUNT and stamped a 2048 map as 16777216
+    # square. D3D12 refuses a texture that size, hands back a null resource, and The Forge's
+    # updateTexture then calls GetDesc on it — a null-deref that kills the host with no log line
+    # (see [[project_forge_addbuffer_null_deref_av]]). 101 files shipped with that header because
+    # nothing re-read them; verify_dds_bc5 below is the fix for the CLASS, not just the typo.
     hdr = bytearray(148)
     hdr[0:4] = b"DDS "
     struct.pack_into("<I", hdr, 4, 124)                       # dwSize
@@ -246,6 +252,44 @@ def write_dds_bc5(path, levels, exp):
         f.write(bytes(hdr))
         for lv in levels:
             f.write(lv.tobytes())
+
+
+def verify_dds_bc5(path, n0, mips, exp):
+    """Re-read what we just wrote and check the host can walk it. Returns None on success, else why.
+
+    ⚠ THIS EXISTS BECAUSE THE TOOL SHIPPED 101 FILES WITH A GARBAGE HEADER AND REPORTED SUCCESS.
+    Every other check in this tool looks at the INPUTS — is the source 16-bit, does it align with the
+    shipped height, does the range clip — and not one of them looked at the OUTPUT. The GPU-side sign
+    test did not catch it either, because the probe builds its own synthetic derivative map in C++:
+    it tested the FORMAT CONTRACT while leaving this writer on no tested path at all.
+
+    The walk below is deliberately the HOST'S, not a restatement of the writer's intent: dimensions
+    and mip count out of the header, 16 bytes per 4x4 block per level (ddsTightMipBytes), and the sum
+    has to be exactly the payload. A writer bug cannot agree with it by construction."""
+    d = open(path, "rb").read()
+    if len(d) < 148 or d[:4] != b"DDS ":
+        return "not a DDS"
+    h = struct.unpack_from("<I", d, 12)[0]
+    w = struct.unpack_from("<I", d, 16)[0]
+    m = struct.unpack_from("<I", d, 28)[0]
+    if (w, h) != (n0, n0):
+        return "header says %dx%d, baked %dx%d" % (w, h, n0, n0)
+    if m != mips:
+        return "header says %d mips, wrote %d" % (m, mips)
+    if d[84:88] != b"DX10" or struct.unpack_from("<I", d, 128)[0] != 84:
+        return "not DX10/BC5_SNORM"
+    if struct.unpack_from("<I", d, 32)[0] != DERIV_MAGIC:
+        return "derivative magic missing"
+    if struct.unpack_from("<i", d, 36)[0] != exp:
+        return "range exponent did not round-trip"
+    need = 0
+    for i in range(m):
+        mw, mh = max(1, w >> i), max(1, h >> i)
+        need += max(1, (mw + 3) // 4) * max(1, (mh + 3) // 4) * 16
+    have = len(d) - 148
+    if need != have:
+        return "mip chain is %d bytes, file holds %d (delta %+d)" % (need, have, have - need)
+    return None
 
 
 # =======================================================================================
@@ -387,7 +431,15 @@ def bake_one(src_png, paramh_path, out_path, size, min_corr, dry):
     r["mips"] = len(levels)
     r["bytes"] = int(sum(len(l) for l in levels))
     if not dry:
-        write_dds_bc5(out_path, levels, r["exp"])
+        write_dds_bc5(out_path, levels, r["exp"], N)
+        bad = verify_dds_bc5(out_path, N, len(levels), r["exp"])
+        if bad:
+            # Refuse to leave a file the host cannot load. A bake that reports success and writes a
+            # nonsense header is worse than one that fails, because the failure surfaces as a crash
+            # in someone else's code an hour later.
+            os.remove(out_path)
+            r["skip"] = "WROTE A BAD FILE and removed it: %s" % bad
+            return r
         r["wrote"] = os.path.basename(out_path)
     return r
 
