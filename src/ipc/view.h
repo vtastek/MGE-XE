@@ -139,6 +139,17 @@ namespace IPC {
 		// per-byte push_back for large blobs (e.g. the occlusion-mask transfer).
 		// Sets size() == bytes. Returns false if it would span windows.
 		bool assign_bytes(const void* src, std::uint32_t bytes);
+
+		// Same, but gathering `count` separate pieces into window 0 back to back.
+		// For callers whose payload is a LIST of blobs (the texture upload queue:
+		// one [TexUploadWire][dds] entry per element) rather than one contiguous
+		// buffer. Without this they must concatenate into a window-sized scratch
+		// first, which costs a second full copy of every byte and a permanent
+		// window-sized allocation -- in a 32-bit process that scratch is exactly
+		// the kind of large fixed reservation worth not making. Total must fit one
+		// window; returns false if it would span windows, writing nothing.
+		bool assign_gather(const void* const* parts, const std::uint32_t* sizes,
+		                   std::uint32_t count);
 	};
 }
 

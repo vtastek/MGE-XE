@@ -406,4 +406,38 @@ namespace IPC {
 		               / static_cast<std::uint32_t>(sizeof(T));
 		return true;
 	}
+
+	template<typename T>
+	bool VecView<T>::assign_gather(const void* const* parts, const std::uint32_t* sizes,
+	                               std::uint32_t count) {
+		// Same contract as assign_bytes, with the payload arriving in pieces.
+		const std::uint32_t windowBytes = m_windowSize * static_cast<std::uint32_t>(sizeof(T));
+		if (!parts || !sizes)
+			return false;
+		// Total the pieces FIRST, and in 64-bit so a caller that overflows uint32
+		// is refused rather than wrapping into a short, plausible-looking write.
+		std::uint64_t total = 0;
+		for (std::uint32_t i = 0; i < count; ++i) {
+			if (sizes[i] != 0 && !parts[i])
+				return false;
+			total += sizes[i];
+		}
+		if (total > windowBytes)
+			return false;                 // would span windows; unsupported
+		if (!slide_window(0, true))
+			return false;
+		std::uint32_t off = 0;
+		for (std::uint32_t i = 0; i < count; ++i) {
+			if (sizes[i] == 0)
+				continue;
+			std::memcpy(static_cast<std::uint8_t*>(static_cast<void*>(m_buffer)) + off,
+			            parts[i], sizes[i]);
+			off += sizes[i];
+		}
+		m_index = 0;
+		m_subIndex = 0;
+		m_shared->size = (off + static_cast<std::uint32_t>(sizeof(T)) - 1)
+		               / static_cast<std::uint32_t>(sizeof(T));
+		return true;
+	}
 }

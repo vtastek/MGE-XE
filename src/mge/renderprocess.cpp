@@ -27,6 +27,8 @@
 #include <cstring>
 #include <cstdlib>
 #include <cctype>
+#include <deque>
+#include <new>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -783,7 +785,7 @@ namespace {
     // we don't retry. Rides the geometry channel's chunked vec (g_texVec).
     std::optional<IPC::VecView<IPC::GeomChunk>> g_texVec;           // persistent texture upload vec
     // Texture residency (g_texSlot + g_slotName/g_slotLastUsed + g_nextTexSlot/g_texEpoch +
-    // g_texPendingBlob/Count) is mutated from TWO threads: the produce worker's build
+    // g_texPendingEntries/Bytes/Count) is mutated from TWO threads: the produce worker's build
     // (buildGeometryDrawLists -> resolveTextureSlot) AND the MAIN thread's captured-alpha proxy
     // interception (captureAlphaDraw -> resolveTextureSlot). produce-off-main OVERLAPS them by
     // design, so a concurrent emplace/rehash on g_texSlot corrupted the heap (crash walking a torn
@@ -793,8 +795,25 @@ namespace {
     std::mutex                                g_texResidencyMx;
     std::unordered_map<std::string, std::uint32_t> g_texSlot;       // normalized name -> bindless slot
     std::uint32_t                             g_nextTexSlot = 1;    // 0 = host default white
-    std::vector<std::uint8_t>                 g_texPendingBlob;     // [TexUploadWire][dds]* awaiting flush
+    // Staged texture uploads awaiting flush: ONE ENTRY PER ELEMENT ([TexUploadWire][dds]), never a
+    // single contiguous blob. This was a `std::vector<std::uint8_t>` that every staged entry was
+    // appended to, and in a 32-bit process that is a loaded gun. kickoffBody resolves the WHOLE
+    // frame's first-seen texture set before flushTextures runs, so a cell load stages everything at
+    // once: measured 568 MB on one load (273 MB of base textures + 213 MB of 4096 _paramh + 82 MB of
+    // 4096 _paramd), and a geometric regrow at that size needs old+new live — ~1.4 GB of CONTIGUOUS
+    // address space. Morrowind is 4GB-patched but heavily fragmented, so the regrow threw
+    // std::bad_alloc on the produce worker, where nothing catches it: uncaught -> fail-fast
+    // c0000409, the "crash at load" of 2026-09-17. It died appending a 1.4 MB file; its own size was
+    // never the point. Per-entry elements cap the largest single allocation at one window
+    // (kTexWindowBytes, 32 MB) and, as a bonus, make the requeue below a splice instead of an
+    // insert-at-front that memmoved half a gigabyte.
+    std::deque<std::vector<std::uint8_t>>     g_texPendingEntries;  // one [TexUploadWire][dds] each
+    std::size_t                               g_texPendingBytes = 0;// sum of the above (stats + budget)
     std::uint32_t                             g_texPendingCount = 0;
+    // NOTE: no staging budget. Chunking (above) is what makes the peak survivable; rationing it by
+    // refusing to resolve textures is not, because "deferred" and "white" are the same return value
+    // and the callers memoise. The peak itself is capped at the SOURCE — see the mip-slice plan in
+    // tasks/forge-pbr-materials.md.
     // LRU eviction over the client's bindless range [1, kMaxTextures-kDlReserve). Residency is
     // cumulative all session (no per-cell reset), so without eviction a long traversal exhausts the
     // slots and every NEW near texture goes white ("near white far from spawn"). Recycle the
@@ -1298,7 +1317,8 @@ namespace {
             g_slotLastUsed.clear();
             g_nextTexSlot = 1;                 // 0 = host default white
             ++g_texEpoch;                      // invalidate every cached ResolvedTex fast-path (name+epoch)
-            g_texPendingBlob.clear();          // drop tex uploads staged for the OLD host
+            g_texPendingEntries.clear();       // drop tex uploads staged for the OLD host
+            g_texPendingBytes = 0;
             g_texPendingCount = 0;
         }
         g_keySlot.clear();
@@ -1727,6 +1747,31 @@ namespace {
         return s;
     }
 
+    // Stage one [TexUploadWire][dds] entry for the next flush. Callers hold g_texResidencyMx.
+    // Returns false if the allocation failed — a texture we cannot stage must go WHITE, never take
+    // the process down. The produce worker runs this with no handler above it (std::thread ->
+    // ProduceWorker::run -> kickoffBody), so an escaping bad_alloc is a fail-fast, not an error.
+    // Degrade, never dereference — the same rule the host-side index bounds follow.
+    bool stageTexUpload(const IPC::TexUploadWire& hdr, const void* data, unsigned size) {
+        try {
+            std::vector<std::uint8_t> entry(sizeof(hdr) + size);
+            std::memcpy(entry.data(), &hdr, sizeof(hdr));
+            std::memcpy(entry.data() + sizeof(hdr), data, size);
+            g_texPendingBytes += entry.size();
+            g_texPendingEntries.push_back(std::move(entry));
+            ++g_texPendingCount;
+            return true;
+        } catch (const std::bad_alloc&) {
+            static std::uint32_t s_staged = 0;
+            if (s_staged++ < 8) {
+                LOG::logline("!! [tex] out of memory staging %u bytes (%zu MB already staged, %u "
+                             "entries) — texture goes white",
+                             size, g_texPendingBytes >> 20, g_texPendingCount);
+            }
+            return false;
+        }
+    }
+
     // Map a texture name to its bindless slot, loading + queueing its DDS on first sight.
     // Misses / oversize / residency-full → slot 0 (host default white), cached so we don't retry.
     std::uint32_t resolveTextureSlot(const char* textureName) {
@@ -1785,6 +1830,18 @@ namespace {
             return 0;
         }
 
+        // NO STAGING BUDGET HERE. There was one (defer past 96 MB, re-resolve next frame) and it was
+        // the wrong mechanism twice over. Practically: a deferral returns 0, which is
+        // indistinguishable from "white" to every caller that memoises, and it cost 130 permanently
+        // white textures on the Seyda Neen load — measured 0 before the change. Threading a
+        // `deferred` flag out to the three SlotInfo memos recovered 107 of them and left 23 still
+        // stuck, i.e. the mechanism kept finding new ways to be mistaken for a miss.
+        //
+        // Structurally: the client is a D3D8 PROXY and controls what Morrowind loads. A 21 MB blob
+        // should never reach this path — the size is capped at the source by shipping a mip slice,
+        // not by rationing the staging buffer downstream of a decision already made wrong. Bounding
+        // the SUM was the right instinct about a contiguous vector (the deque above is that fix);
+        // bounding it by REFUSING WORK was not. See tasks/forge-pbr-materials.md for the slice plan.
         // Assign a slot: grow while the range has room, else recycle the least-recently-used slot.
         std::uint32_t slot;
         if (g_nextTexSlot < cap) {
@@ -1819,12 +1876,17 @@ namespace {
         g_slotName[slot] = name;
         g_slotLastUsed[slot] = g_frame;
         IPC::TexUploadWire hdr{ slot | (dataTexture ? IPC::kTexUploadData : 0u), size, 0u };
-        const std::size_t at = g_texPendingBlob.size();
-        g_texPendingBlob.resize(at + sizeof(hdr) + size);
-        std::memcpy(g_texPendingBlob.data() + at, &hdr, sizeof(hdr));
-        std::memcpy(g_texPendingBlob.data() + at + sizeof(hdr), data, size);
+        const bool staged = stageTexUpload(hdr, data, size);
         std::free(data);
-        ++g_texPendingCount;
+        if (!staged) {
+            // Out of memory, not a bad file. Release the slot back to the LRU (empty name + age 0
+            // makes it the next recycle candidate) and cache the miss so a scene full of textures we
+            // cannot stage doesn't re-read every one of them from the BSA every frame.
+            g_slotName[slot].clear();
+            g_slotLastUsed[slot] = 0;
+            g_texSlot[name] = 0;
+            return 0;
+        }
         return slot;
     }
 
@@ -1935,12 +1997,12 @@ namespace {
             const std::uint32_t slot = IPC::makeFlipSlot(bucket, baseLayer + i);
             g_texSlot[norm[i]] = slot;
             IPC::TexUploadWire hdr{ slot, sizes[i], declared };
-            const std::size_t at = g_texPendingBlob.size();
-            g_texPendingBlob.resize(at + sizeof(hdr) + sizes[i]);
-            std::memcpy(g_texPendingBlob.data() + at, &hdr, sizeof(hdr));
-            std::memcpy(g_texPendingBlob.data() + at + sizeof(hdr), blobs[i], sizes[i]);
+            // A slice that will not stage leaves its layer claimed but never uploaded — the host
+            // shows that frame white. The book has already claimed its bucket range by here (pass 2
+            // is past the point of refusal), so this is the honest degradation: keep going and say
+            // so, rather than strand the whole book or take the process down.
+            stageTexUpload(hdr, blobs[i], sizes[i]);
             std::free(blobs[i]);
-            ++g_texPendingCount;
         }
         ++g_flipBooksBuilt;
         g_flipLayersBuilt += count;
@@ -1951,62 +2013,75 @@ namespace {
         return true;
     }
 
+    // Put an unflushed remainder back at the FRONT of the pending queue, ahead of anything main
+    // staged while the lock was released, and restore its share of the totals. Caller holds
+    // g_texResidencyMx. Moves entry by entry — copying would defeat the whole point of chunking.
+    void requeueTexEntries(std::deque<std::vector<std::uint8_t>>& entries) {
+        while (!entries.empty()) {
+            g_texPendingBytes += entries.back().size();
+            ++g_texPendingCount;
+            g_texPendingEntries.push_front(std::move(entries.back()));   // back-to-front: order kept
+            entries.pop_back();
+        }
+    }
+
     // Ship queued texture uploads to the host in window-sized batches on whole-entry
     // boundaries (each entry is guaranteed <= window by resolveTextureSlot). Blocking RPCs.
     void flushTextures() {
-        // Take ownership of the pending blob under the lock, then batch + RPC on the LOCAL copy
-        // UNLOCKED — main's captureAlphaDraw keeps appending to a fresh g_texPendingBlob, and we
+        // Take ownership of the pending entries under the lock, then batch + RPC on the LOCAL deque
+        // UNLOCKED — main's captureAlphaDraw keeps staging into a fresh g_texPendingEntries, and we
         // never hold g_texResidencyMx across a blocking RPC (that would be a new 60s-freeze class).
-        std::vector<std::uint8_t> blob;
-        std::uint32_t pendingCount = 0;
+        std::deque<std::vector<std::uint8_t>> entries;
         {
             std::lock_guard<std::mutex> lk(g_texResidencyMx);
-            if (!g_texVec || g_texPendingBlob.empty() || g_texPendingCount == 0) {
+            if (!g_texVec || g_texPendingEntries.empty()) {
                 return;
             }
-            blob.swap(g_texPendingBlob);      // main now appends to an empty vector, race-free
-            pendingCount = g_texPendingCount;
-            g_texPendingCount = 0;            // fresh count for whatever main appends from here
+            entries.swap(g_texPendingEntries);   // main now stages into an empty deque, race-free
+            g_texPendingBytes = 0;               // fresh totals for whatever main stages from here
+            g_texPendingCount = 0;
         }
         // A0 sub-buckets (see flushGeometry): assign vs RPC wait, one line per >=1ms flush.
         const double tFlush0 = nowMs();
         double assignMs = 0.0, rpcMs = 0.0;
         const std::size_t windowBytes = (std::size_t)IPC::kTexWindowBytes;
-        const std::uint8_t* base = blob.data();
-        const std::size_t total = blob.size();
-        std::size_t off = 0;
+        std::size_t total = 0;
         std::uint32_t entriesFlushed = 0;
-        while (off < total) {
-            std::size_t batchEnd = off;
-            std::uint32_t batchCount = 0;
-            while (batchEnd < total) {
-                IPC::TexUploadWire h;
-                std::memcpy(&h, base + batchEnd, sizeof(h));
-                const std::size_t entryBytes = sizeof(h) + h.byteLen;
-                if ((batchEnd - off) + entryBytes > windowBytes) { break; }   // window full
-                batchEnd += entryBytes;
-                ++batchCount;
+        std::vector<const void*>   parts;      // window-sized batch, gathered by POINTER
+        std::vector<std::uint32_t> partSizes;  // (assign_gather copies straight into shared memory)
+        while (!entries.empty()) {
+            // Select whole entries until the window is full. Nothing is copied or consumed here —
+            // a host that isn't ready must be able to hand the whole remainder back, this batch
+            // included, and the single copy that does happen goes direct to the IPC window.
+            std::size_t bytes = 0;
+            parts.clear();
+            partSizes.clear();
+            for (const std::vector<std::uint8_t>& e : entries) {
+                if (bytes + e.size() > windowBytes) { break; }
+                parts.push_back(e.data());
+                partSizes.push_back((std::uint32_t)e.size());
+                bytes += e.size();
             }
-            if (batchCount == 0) { break; }   // safety (each entry <= window)
-            const std::uint32_t bytes = (std::uint32_t)(batchEnd - off);
+            const std::uint32_t batchCount = (std::uint32_t)parts.size();
+            if (batchCount == 0) { break; }   // safety (each entry <= window by construction)
+            total += bytes;
             std::uint32_t uploaded = 0;
             const double tAssign0 = nowMs();
-            const bool assigned = g_texVec->assign_bytes(base + off, bytes);
+            const bool assigned = g_texVec->assign_gather(parts.data(), partSizes.data(), batchCount);
             assignMs += nowMs() - tAssign0;
             if (assigned) {
                 const double tRpc0 = nowMs();
                 MGE_ZoneScopedN("Forge texUpload RPC");
-                g_client->texUploadBlocking(g_texVec->id(), batchCount, bytes, &uploaded);
+                g_client->texUploadBlocking(g_texVec->id(), batchCount, (std::uint32_t)bytes, &uploaded);
                 rpcMs += nowMs() - tRpc0;
             }
             if (uploaded == 0xFFFFFFFFu) {
                 // Host opaque path not built yet (first scene frame) — keep the UNFLUSHED remainder
-                // for next frame. Put it BACK at the FRONT of g_texPendingBlob (main may have
-                // appended after the swap) and restore its share of the count. Slots are already
-                // assigned; draws show white until then.
+                // for next frame, IN ORDER, ahead of whatever main staged during the unlocked RPC.
+                // Nothing was popped, so `entries` IS the whole remainder, this batch included.
+                // Slots are already assigned; draws show white until then.
                 std::lock_guard<std::mutex> lk(g_texResidencyMx);
-                g_texPendingBlob.insert(g_texPendingBlob.begin(), blob.begin() + off, blob.end());
-                g_texPendingCount += (pendingCount - entriesFlushed);
+                requeueTexEntries(entries);
                 return;
             }
             // The host returns how many it actually BUILT. Anything less is a silent drop —
@@ -2022,10 +2097,10 @@ namespace {
                 }
             }
             entriesFlushed += batchCount;
-            off = batchEnd;
+            entries.erase(entries.begin(), entries.begin() + batchCount);   // consumed
         }
-        // Fully consumed the local blob. Do NOT touch g_texPendingBlob/Count here — they now hold
-        // only what main appended during the unlocked RPC, which must be kept for the next flush.
+        // Fully consumed the local deque. Do NOT touch g_texPendingEntries/Bytes/Count here — they
+        // now hold only what main staged during the unlocked RPC, kept for the next flush.
         const double flushMs = nowMs() - tFlush0;
         if (flushMs >= 1.0) {
             LOG::logline("-- [texflush] %.2fms tex=%u bytes=%uKB assign=%.2f rpc=%.2f",
@@ -5317,7 +5392,7 @@ namespace RenderProcess {
         // Ship any textures newly referenced this frame BEFORE the scene draw that uses them
         // (buildDrawList queued their DDS via resolveTextureSlot). Lazy: only first-seen textures.
         const std::uint32_t texCount = g_texPendingCount;          // snapshot (flush clears it)
-        const std::size_t   texBytes = g_texPendingBlob.size();
+        const std::size_t   texBytes = g_texPendingBytes;
         {
             markWorkerPhase(WK_TEX);
             MGE_ZoneScopedN("Forge tex flush");
@@ -7565,8 +7640,9 @@ namespace RenderProcess {
         g_fpAlphaScratch.shrink_to_fit();
         g_fpMultiMapScratch.clear();
         g_fpMultiMapScratch.shrink_to_fit();
-        g_texPendingBlob.clear();
-        g_texPendingBlob.shrink_to_fit();
+        g_texPendingEntries.clear();
+        g_texPendingEntries.shrink_to_fit();
+        g_texPendingBytes = 0;
         g_pendingParts = 0;
         g_texPendingCount = 0;
         g_keySlot.clear();
