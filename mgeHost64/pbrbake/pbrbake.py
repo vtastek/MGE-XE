@@ -21,7 +21,11 @@ reads the 16-bit SOURCE or it does not run: a `_paramh` whose source PNG is gone
 derivative map, and the runtime arms (pbrGradMode 0 with pbrGradRadius) remain the answer for it.
 
 WHAT IT WRITES.  <base>_paramd.dds, DX10 header, DXGI_FORMAT_BC5_SNORM (84): R = dH/du, G = dH/dv,
-in PER-TEXEL units scaled by DERIV_GAIN, with a full mip chain.  BC5 is two INDEPENDENT BC4 blocks,
+in PER-UV units divided by a per-texture range, with a full mip chain.  ⚠ PER UV, and every level
+differentiated at its own size -- the first format stored per-TEXEL and averaged the derivative to
+make mips, which is 2x too small at every level and arrives on screen as a hard line at each mip
+boundary.  See the comment in bake_one; it is the seam, and the reason the shader now needs no LOD
+reconstruction at all.  BC5 is two INDEPENDENT BC4 blocks,
 so each derivative axis gets the same 8-level-per-block ramp the height had to itself -- which is
 the whole reason a stored derivative is affordable at all, and why this is not the abandoned
 "two axes in a BC1 colour block" packing (there they would share one line in RGB space).
@@ -50,10 +54,11 @@ than the exact range costs at most one bit of the eight (the range rounds up, so
 codes go unused) and buys the host a lane it can pack beside the texture slot instead of a second
 float and a per-slot table.  Rounding UP also guarantees nothing clips.
 
-MIPS.  The chain is box-filtered at FULL PRECISION and each level compressed separately, exactly
-as a DDS stores it.  Filtering commutes with differentiation, so the average of the derivative IS
-the derivative of the average -- which is why a derivative map mips correctly and a normal map
-does not.
+MIPS.  The HEIGHT is box-filtered at full precision and each level differentiated AT ITS OWN SIZE,
+then compressed separately.  Filtering commutes with differentiation -- but only for the same units:
+the average of a per-TEXEL derivative is still in the finer level's texel units, which is exactly
+the trap the first format fell into.  In per-UV units the statement holds as written, and that is
+why a derivative map mips correctly where a normal map does not.
 
 ALIGNMENT IS VERIFIED, NOT ASSUMED.  The source PNG reaches the shipped `_paramh` through
 texturematcher's db.json (texture -> thumbnail -> staging file) and an optional rotation/tiling
@@ -89,6 +94,8 @@ DERIV_PCT = 99.9
 DEFAULT_GAME_TEX = "/mnt/c/mgem/morrowind64/Data Files/textures"
 DEFAULT_TM       = "/mnt/c/projects/texturematcher"
 DEFAULT_MANIFEST = "/mnt/c/projects/texturematcher/texel_density_manifest.csv"
+# The project's own PNG decoder, used only where Pillow cannot represent the file (_texconv_r16).
+TEXCONV          = "/mnt/c/projects/texturematcher/texconv.exe"
 
 
 # =======================================================================================
@@ -174,14 +181,95 @@ def selftest():
 # =======================================================================================
 
 
+def png_ihdr(path):
+    """(width, height, bitdepth, colourtype) read from the FILE, not from a decoder.
+
+    The file's own header is the only thing that says how many bits the art has. Asking a decoder
+    what it returned answers a different question, and the difference is what broke this tool --
+    see load_png_gray.
+    """
+    try:
+        with open(path, "rb") as f:
+            head = f.read(26)
+        if head[:8] != b"\x89PNG\r\n\x1a\n" or head[12:16] != b"IHDR":
+            return None
+        w, h = struct.unpack(">II", head[16:24])
+        return w, h, head[24], head[25]
+    except Exception:
+        return None
+
+
+def _texconv_r16(path):
+    """Decode a 16-bit PNG to raw R16_UNORM through texconv, because Pillow cannot.
+
+    ⚠⚠ PILLOW SILENTLY HALVES THESE FILES, AND THIS TOOL BELIEVED IT. Pillow has no
+    16-bit-per-channel RGB mode: a PNG with IHDR bit depth 16 and colour type 2 opens as mode
+    'RGB', dtype uint8, with the LOW BYTE OF EVERY SAMPLE DISCARDED and no warning. numpy then
+    sees uint8, and the check below concluded "source is 8-bit" and refused to bake -- for 77 of
+    209 maps, every one of which had a real 16-bit source sitting on disk the whole time. The FILE
+    was 16-bit; the READER was 8-bit, and the report named the wrong one.
+
+    Measured on coast_sand_02_disp_4k.png: 233 distinct values through Pillow, 55705 through this.
+    That is the 8 bits this entire tool exists to keep.
+
+    texconv rather than a hand-rolled decoder: these PNGs are Paeth-filtered on 4095 of 4096 rows,
+    and Paeth is a per-byte recurrence along the row that numpy cannot vectorise -- a Python loop
+    over 16.7M groups per image. texconv is already the project's decoder and does it natively in
+    ~2.5 s. Returns None (never a half-precision guess) if it is missing or fails.
+    """
+    import shutil
+    import subprocess
+    import tempfile
+    exe = TEXCONV
+    if not os.path.isfile(exe):
+        return None
+    work = tempfile.mkdtemp(prefix="pbrbake16_")
+    try:
+        def w(p):
+            if sys.platform == "win32":
+                return p
+            return subprocess.run(["wslpath", "-w", p], capture_output=True, text=True).stdout.strip()
+        r = subprocess.run([exe, "-nologo", "-y", "-m", "1", "-ft", "dds", "-f", "R16_UNORM",
+                            "-o", w(work), w(path)], capture_output=True, text=True)
+        if r.returncode != 0:
+            return None
+        stem = os.path.basename(path)[:-4]
+        got = None
+        for name in os.listdir(work):
+            if name.lower() == (stem + ".dds").lower():
+                got = os.path.join(work, name)
+                break
+        if not got:
+            return None
+        b = open(got, "rb").read()
+        if b[:4] != b"DDS ":
+            return None
+        hsz = struct.unpack("<I", b[4:8])[0]
+        hh = struct.unpack("<I", b[12:16])[0]
+        ww = struct.unpack("<I", b[16:20])[0]
+        off = 4 + hsz + (20 if b[84:88] == b"DX10" else 0)
+        need = ww * hh * 2
+        if len(b) - off < need:
+            return None
+        return np.frombuffer(b[off:off + need], dtype="<u2").reshape(hh, ww)
+    except Exception:
+        return None
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
 def load_png_gray(path):
     """16- or 8-bit PNG -> float64 in [0,1], first channel only.  Pillow reads 16-bit grey as
     mode 'I;16'/'I', which numpy sees correctly; RGB(A) sources take channel 0, because a
-    displacement map's three channels are the same field."""
+    displacement map's three channels are the same field.
+
+    ⚠ THE SECOND RETURN VALUE IS THE FILE'S BIT DEPTH, NOT THE DECODER'S. Those are different
+    numbers whenever Pillow cannot represent the file -- see _texconv_r16 -- and reporting the
+    decoder's was this tool refusing 77 perfectly good sources.
+    """
     from PIL import Image
     Image.MAX_IMAGE_PIXELS = None
     with Image.open(path) as im:
-        mode = im.mode
         a = np.array(im)
     if a.ndim == 3:
         a = a[..., 0]
@@ -189,6 +277,13 @@ def load_png_gray(path):
         return a.astype(np.float64) / 65535.0, 16
     if a.dtype in (np.int32, np.uint32):
         return a.astype(np.float64) / 65535.0, 16
+    hdr = png_ihdr(path)
+    if hdr is not None and hdr[2] == 16:
+        full = _texconv_r16(path)
+        if full is not None:
+            return full.astype(np.float64) / 65535.0, 16
+        # Fall through reporting 8 rather than handing back Pillow's truncation as 16-bit: a
+        # refusal is recoverable, a map baked from half a file is silently worse than none.
     return a.astype(np.float64) / 255.0, 8
 
 
@@ -297,8 +392,50 @@ def verify_dds_bc5(path, n0, mips, exp):
 # =======================================================================================
 
 
+MAX_CANDS_PER_THUMB = 8
+
+
+def _pick_sources(files, dn, limit=MAX_CANDS_PER_THUMB):
+    """EVERY staging displacement whose name starts with thumbnail `dn`, exact stem first.
+
+    ⚠⚠ NO NAMING RULE DECIDES THIS, AND BOTH OF THE ONES TRIED HERE LOST TEXTURES. The original
+    rule took the LONGEST prefix match, which chose a different asset whenever one shared the
+    prefix -- "Rock Wall" took rock_wall_09 while rock_wall sat in the same folder. Replacing it
+    with the obvious correction, requiring the suffix to follow the name exactly, then broke SIX
+    textures that had been baking at correlation 1.000: their export really was built from the
+    longer-named sibling (tx_wood_blackwood's "Bark Willow" among them). Measured, not argued: the
+    exact-stem rule gained 14 and lost 6.
+
+    So the name does not decide, it only NARROWS. Hand back the whole family and let the
+    correlation against the shipped height pick, which is the one test that cannot be wrong about
+    this. Exact stem first so the common case is checked first and the cache stays warm; `_disp`
+    before `_height` because the displacement is the 16-bit map and `_height` is often the 8-bit
+    convenience export.
+    """
+    out = []
+    for infix in ("_disp_", "_height_"):
+        exact = sorted(f for f in files if f.casefold().startswith(dn + infix))
+        loose = sorted((f for f in files
+                        if f.casefold().startswith(dn) and infix in f.casefold() and f not in exact),
+                       key=lambda f: (len(f), f))
+        for f in exact + loose:
+            if f not in out:
+                out.append(f)
+    return out[:limit]
+
+
 def build_source_index(tm_dir):
-    """texture base name -> the staging displacement PNG that made its _paramh.
+    """texture base name -> EVERY staging displacement PNG its selected thumbnails point at.
+
+    ⚠⚠ THIS USED TO RETURN ONE PATH -- the first thumbnail that had a staged file -- AND THAT IS A
+    GUESS, NOT A LOOKUP. A texture can carry several selected_thumbnails, and the `_paramh` on disk
+    was built from whichever one texturematcher last exported, which is not in general the first.
+    Measured: of twenty textures whose bake was refused as "source does not match the shipped
+    height", THIRTEEN matched one of their OTHER thumbnails at correlation 1.000, identity, no
+    transform. The art was right there and the index looked at the wrong entry.
+
+    So hand back all of them and let the correlation decide. That check already existed; it was
+    being used only to REJECT a guess when it could have been used to MAKE the choice.
 
     The route is texturematcher's own: db.json maps `textures\\<base>_result.png` to a selected
     THUMBNAIL name, and the staging file is that name lower-cased with underscores plus a
@@ -323,13 +460,8 @@ def build_source_index(tm_dir):
             dn = th.get("name", "").lower().replace(" ", "_")
             if not dn:
                 continue
-            cand = [f for f in files
-                    if f.casefold().startswith(dn) and ("_disp_" in f.casefold() or "_height_" in f.casefold())]
-            if cand:
-                # Longest name wins when several match (a prefix collision like `rock` vs
-                # `rock_wall`); the verification below is what actually decides correctness.
-                index.setdefault(base, os.path.join(staging, sorted(cand, key=len)[-1]))
-                break
+            for got in _pick_sources(files, dn):
+                index.setdefault(base, []).append(os.path.join(staging, got))
     return index, multi
 
 
@@ -352,15 +484,111 @@ def load_targets(manifest):
     return out
 
 
+# The eight symmetries of the square. A source exported under a different axis convention lands on
+# one of these EXACTLY -- a correlation of 1.000, not 0.9 -- so trying them costs one comparison each
+# and either finds the art or proves the match is simply wrong. Anything needing an arbitrary angle
+# is not a convention mismatch, it is a different texture.
+DIHEDRAL = (
+    ("identity",       lambda a: a),
+    ("rot90",          lambda a: np.rot90(a, 1)),
+    ("rot180",         lambda a: np.rot90(a, 2)),
+    ("rot270",         lambda a: np.rot90(a, 3)),
+    ("flipV",          lambda a: a[::-1, :]),
+    ("flipH",          lambda a: a[:, ::-1]),
+    ("transpose",      lambda a: a.T),
+    ("anti-transpose", lambda a: np.rot90(a, 2).T),
+)
+
+
+def _corr(a, b):
+    av, bv = a - a.mean(), b - b.mean()
+    den = float(np.sqrt((av * av).sum() * (bv * bv).sum()))
+    return float((av * bv).sum() / den) if den > 1e-20 else 0.0
+
+
+_SMALL_CACHE = {}
+
+
+def _source_small(path, n=256):
+    """An n x n box-downsample of a candidate source, cached by path.
+
+    Choosing among candidates needs only a low-resolution correlation, but getting there still costs
+    a full decode (and for the 16-bit RGB files, a texconv round trip). Sources repeat heavily
+    across textures -- quarry_wall_02 is a candidate for a dozen -- so caching the SMALL array turns
+    a quadratic pile of decodes back into one per file, without holding 134 MB per 4096 map.
+
+    Returns (small, bits, why) with small None when the candidate cannot be compared at all.
+    """
+    hit = _SMALL_CACHE.get(path)
+    if hit is not None:
+        return hit
+    try:
+        S, bits = load_png_gray(path)
+    except Exception as e:
+        out = (None, 0, "unreadable: %s" % e)
+        _SMALL_CACHE[path] = out
+        return out
+    if S.ndim != 2 or S.shape[0] != S.shape[1]:
+        out = (None, bits, "not square (%dx%d)" % (S.shape[1], S.shape[0]))
+    elif bits < 16:
+        out = (None, bits, "8-bit")
+    else:
+        m = min(S.shape[0], n)
+        m = 1 << (int(m).bit_length() - 1)
+        out = (box_down(S, m), bits, None)
+    _SMALL_CACHE[path] = out
+    return out
+
+
 def bake_one(src_png, paramh_path, out_path, size, min_corr, dry):
     """Returns a dict of what happened; never raises on bad data."""
-    r = {"src": os.path.basename(src_png)}
+    cands = [src_png] if isinstance(src_png, str) else list(src_png)
+    r = {"src": os.path.basename(cands[0]) if cands else "-"}
     H8, why = read_paramh_alpha(paramh_path)
     if H8 is None:
         r["skip"] = "paramh unreadable: %s" % why
         return r
+
+    # ── WHICH candidate, decided by MEASUREMENT rather than by order ────────────────────────────
+    # Every selected thumbnail is a candidate; the one that correlates with the shipped height is
+    # the one that made it. Dihedral transforms are tried here too, so a rotated source competes on
+    # the same footing as an upright one instead of losing to a wrong-but-upright sibling.
+    picked, why8 = None, []
+    for p in cands:
+        small, bits, bad = _source_small(p)
+        if small is None:
+            why8.append("%s: %s" % (os.path.basename(p), bad))
+            continue
+        m = small.shape[0]
+        hb = box_down(H8, m) if H8.shape[0] % m == 0 else None
+        if hb is None:
+            why8.append("%s: size mismatch" % os.path.basename(p))
+            continue
+        # ⚠ AND THE SOURCE MAY BE TILED INTO THE EXPORT. texturematcher records a per-thumbnail
+        # `scale` in db.json and honours it by repeating the art: tx_cobblestone_01 carries
+        # scale 2.0, and its shipped height is cobblestone_floor_13 tiled 2x2 -- correlation 1.000
+        # tiled, 0.148 untiled, which reads as a wrong source if you never try it. Measured rather
+        # than read from db.json: the field is absent on most entries, and a correlation that
+        # confirms the tiling is worth more than a number that asserts it.
+        scored = []
+        for t in (1, 2, 3, 4):
+            if m % t:
+                continue
+            cand_s = np.tile(box_down(small, m // t), (t, t)) if t > 1 else small
+            for nm, fn in DIHEDRAL:
+                scored.append((_corr(np.ascontiguousarray(fn(cand_s)), hb), nm, t))
+        scored.sort(key=lambda x: -x[0])
+        if picked is None or scored[0][0] > picked[0]:
+            picked = (scored[0][0], scored[0][1], p, bits, scored[1][0], scored[0][2])
+    if picked is None:
+        r["bits"] = 8
+        r["skip"] = ("no usable candidate: %s" % "; ".join(why8)) if why8 else "no source"
+        return r
+    corr0, tname, src_png, bits, runner, tile = picked
+    r["src"], r["bits"], r["cands"] = os.path.basename(src_png), bits, len(cands)
+    if tile > 1:
+        r["tile"] = tile
     S, bits = load_png_gray(src_png)
-    r["bits"] = bits
     if bits < 16:
         # The entire argument for this tool is the 8 bits the _paramh threw away. An 8-bit source
         # has nothing more to give than the file we already ship, and pbrsynth measured that baking
@@ -372,6 +600,13 @@ def bake_one(src_png, paramh_path, out_path, size, min_corr, dry):
         r["skip"] = "source not square (%dx%d)" % (S.shape[1], S.shape[0])
         return r
 
+    if tile > 1:
+        # Rebuild the field the export actually holds: the art at 1/tile of the size, repeated.
+        # Do it BEFORE the derivative, for the same reason the rotation is applied first -- the
+        # gradient then comes out in the frame and at the texel pitch the shader will sample.
+        k = S.shape[0] // tile
+        S = np.tile(box_down(S, k), (tile, tile))
+
     # ── ALIGNMENT, against the height this map has to line up with ──────────────────────────────
     n = min(S.shape[0], H8.shape[0], 512)
     n = 1 << (int(n).bit_length() - 1)
@@ -381,14 +616,28 @@ def bake_one(src_png, paramh_path, out_path, size, min_corr, dry):
     except AssertionError as e:
         r["skip"] = "cannot compare: %s" % e
         return r
-    av, bv = a - a.mean(), b - b.mean()
-    den = float(np.sqrt((av * av).sum() * (bv * bv).sum()))
-    corr = float((av * bv).sum() / den) if den > 1e-20 else 0.0
+    if tname != "identity":
+        for nm, fn in DIHEDRAL:
+            if nm == tname:
+                S = np.ascontiguousarray(fn(S))
+                a = box_down(S, n)
+                break
+        r["transform"], r["margin"] = tname, corr0 - runner
+    corr = _corr(a, b)
     r["corr"] = corr
     if corr < min_corr:
-        # A wrong thumbnail match, a rotated source and a tiled source all land here, and none of
-        # them is visible in the output on its own.
-        r["skip"] = "correlation %.3f < %.2f — source does not match the shipped height" % (corr, min_corr)
+        # ⚠ THREE DIFFERENT FAULTS USED TO LAND HERE AS ONE SENTENCE -- a wrong thumbnail, a ROTATED
+        # source, and a genuinely different picture -- and they have three different owners. The
+        # selection above now separates them, because it tries every candidate under every dihedral
+        # transform before anything reaches this line. Measured over all 209 maps: THIRTEEN were the
+        # wrong thumbnail (recovered at correlation 1.000, identity, from a thumbnail that was
+        # already in db.json), exactly ONE was a real rotation (tx_gl_rock_01, rot180, 1.000 against
+        # a runner-up of 0.524), and the remainder are a different image outright -- 0.05 to 0.40
+        # under every transform and every cyclic shift, winner tied to runner-up inside noise.
+        r["skip"] = ("correlation %.3f < %.2f — WRONG IMAGE: no candidate, no transform matches"
+                     " (best %.3f via %s%s)"
+                     % (corr, min_corr, corr0, tname,
+                        ", %d candidates tried" % len(cands) if len(cands) > 1 else ""))
         return r
 
     # ── The bake ────────────────────────────────────────────────────────────────────────────────
@@ -401,9 +650,39 @@ def bake_one(src_png, paramh_path, out_path, size, min_corr, dry):
         S = box_down(S, size)
     N = S.shape[0]
     r["size"] = N
-    # WRAPPED central difference at FULL PRECISION: (h[i+1] - h[i-1]) / 2, in per-texel units.
-    du = 0.5 * (np.roll(S, -1, axis=1) - np.roll(S, 1, axis=1))
-    dv = 0.5 * (np.roll(S, -1, axis=0) - np.roll(S, 1, axis=0))
+
+    # ⚠⚠ PER UV, NOT PER TEXEL, AND EVERY LEVEL DIFFERENTIATED AT ITS OWN SIZE.
+    #
+    # The first format stored dH/dTEXEL and built the chain by AVERAGING THE DERIVATIVE. Both halves
+    # of that are wrong together, and they produced the seam play reported. Averaging a per-texel
+    # derivative keeps it in LEVEL 0's texel units -- one texel of level L spans two of level L-1,
+    # so the true per-texel slope there is 2x the average, not the average. The shader then
+    # multiplied by THAT LEVEL's width, as if the value were already per-texel-of-L.
+    #
+    # Measured against ground truth (box-down the height to each level, differentiate there):
+    # truth/reconstruction ran 0.99, 1.52, 2.53, 4.27, 7.75, 14.3, 28.3 -- a clean DOUBLING per
+    # level. The relief was exact at level 0 and halved with every mip, and because the sampler
+    # blends the stored value smoothly while `floor(log2(footprint))` steps the scale in a jump,
+    # the loss arrived as a visible LINE at each mip boundary rather than as a gentle fade.
+    #
+    # Per-uv fixes both at once and deletes the reconstruction: dH/duv means the same thing at every
+    # resolution, so a level describes itself, a trilinear blend between two levels is a blend
+    # between two correct values, and the shader needs no width, no footprint and no LOD -- just the
+    # range. There is nothing left to step.
+    def _grad_peruv(H):
+        """Wrapped central difference at FULL PRECISION, scaled to per-UV by the level's own width."""
+        W = H.shape[0]
+        return (0.5 * (np.roll(H, -1, axis=1) - np.roll(H, 1, axis=1)) * W,
+                0.5 * (np.roll(H, -1, axis=0) - np.roll(H, 1, axis=0)) * W)
+
+    chain, H = [], S
+    while True:
+        chain.append(_grad_peruv(H))
+        if H.shape[0] <= 4:
+            break
+        H = box_down(H, H.shape[0] // 2)
+
+    du, dv = chain[0]
     r["dmax"] = float(max(np.abs(du).max(), np.abs(dv).max()))
     fit = float(np.percentile(np.abs(np.concatenate([du.ravel(), dv.ravel()])), DERIV_PCT))
     if fit <= 0.0:
@@ -415,19 +694,12 @@ def bake_one(src_png, paramh_path, out_path, size, min_corr, dry):
     exp = max(-128, min(127, exp))
     rng = float(2.0 ** exp)
     r["exp"], r["range"] = exp, rng
-    r["clip"] = float(np.mean((np.abs(du) > rng) | (np.abs(dv) > rng)))
-    du = np.clip(du / rng, -1.0, 1.0)
-    dv = np.clip(dv / rng, -1.0, 1.0)
-
-    levels = []
-    cu, cv = du, dv
-    while True:
-        levels.append(bc5_encode_snorm(cu, cv))
-        if cu.shape[0] <= 4:
-            break
-        m = cu.shape[0] // 2
-        cu = cu.reshape(m, 2, m, 2).mean(axis=(1, 3))
-        cv = cv.reshape(m, 2, m, 2).mean(axis=(1, 3))
+    # Clip measured over the WHOLE chain, not just the top level -- the range is fitted on level 0
+    # and every other level has to live inside it too.
+    r["clip"] = float(np.mean([float(np.mean((np.abs(u) > rng) | (np.abs(v) > rng)))
+                               for u, v in chain]))
+    levels = [bc5_encode_snorm(np.clip(u / rng, -1.0, 1.0), np.clip(v / rng, -1.0, 1.0))
+              for u, v in chain]
     r["mips"] = len(levels)
     r["bytes"] = int(sum(len(l) for l in levels))
     if not dry:
@@ -466,8 +738,8 @@ def main():
 
     index, multi = build_source_index(a.tm)
     targets = load_targets(a.manifest)
-    print("  db.json -> staging: %d texture bases matched a 16-bit source candidate"
-          " (%d had several thumbnails; the first with a source wins)" % (len(index), multi))
+    print("  db.json -> staging: %d texture bases matched a source candidate"
+          " (%d have several thumbnails; the CORRELATION picks, not the order)" % (len(index), multi))
     print("  manifest: %d per-texture height targets" % len(targets))
 
     phs = sorted(f for f in os.listdir(a.game_tex) if f.lower().endswith("_paramh.dds"))
@@ -495,9 +767,13 @@ def main():
             done += 1
             bytes_out += r["bytes"]
             print("  bake %-38s %4d^2 x%2d mips  corr %.3f  range 2^%-4d (max |dH/texel| %.4f)"
-                  "  clip %.3f%%  %6.2f MB"
+                  "  clip %.3f%%  %6.2f MB%s"
                   % (base[:38], r["size"], r["mips"], r["corr"], r["exp"], r["dmax"],
-                     100.0 * r["clip"], r["bytes"] / 1048576.0))
+                     100.0 * r["clip"], r["bytes"] / 1048576.0,
+                     (("   ROTATED %s (margin %.3f)" % (r["transform"], r.get("margin", 0.0))
+                       if r.get("transform") else "")
+                      + ("   TILED %dx%d" % (r["tile"], r["tile"]) if r.get("tile") else "")
+                      + ("   [%d candidates]" % r["cands"] if r.get("cands", 1) > 1 else ""))))
 
     print("\n  baked %d, skipped %d, no 16-bit source %d, of %d _paramh maps" % (done, len(skipped), nosrc, len(phs)))
     print("  total derivative-map bytes: %.1f MB" % (bytes_out / 1048576.0))

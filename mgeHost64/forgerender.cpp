@@ -7152,13 +7152,55 @@ namespace {
     //             where every other arm differentiates a field that was quantised first. Rig, on a
     //             height field spanning 3/255: gradient retention 0.955 against 0.000 for all three
     //             runtime arms, angular error 0.009 deg against 0.159.
-    uint32_t g_pbrGradMode  = 0u;
+    //   4 cdblur  A BLUR THAT DOES NOT GHOST — pbrGradRadius becomes a blur WIDTH instead of a tap
+    //             offset: the height is read at the mip whose box is 2*radius texels across and the
+    //             difference stays at +-1 texel of THAT level, so a feature softens in place. Arms 0
+    //             and 1 do not do this when the radius is raised: widening a central difference is a
+    //             COMB, and one ridge keeps a lobe FWHM of exactly 4.0 texels at radius 1.5, 3, 6, 10
+    //             and 16 while walking out to +-radius as TWO crisp copies. Play saw it — *"I see
+    //             double (offset features at high blurs), which is not expected, I expect in place
+    //             blur"* — and then disliked the correct blur too: *"hard surfaces look subsurface...
+    //             I would sacrifice detail for a sharp look overall."*
+    //
+    // ⚠ 4 IS NOW THE DEFAULT, and it BEAT THE BAKED MAP IN PLAY — *"looks sharper at any depth,
+    // mode 4 is just better"*. "At any depth" matters, because it kills the obvious explanation:
+    // depth is calibrated per arm (arm 4 differences a blurred height and delivers ~0.42x the
+    // slope, so mode 3 at arm 4's depth is ~2.4x too deep) and sweeping it did not rescue mode 3.
+    //
+    // RESOLUTION WAS THE OBVIOUS EXPLANATION AND IT IS NOW REFUTED. Every `_paramh` is 4096 and no
+    // `_paramd` was — Track B sizes them from texel density and capped at 2048 — so arm 4 at radius
+    // 1.75, resolving ~1170 on a 4096 height, was simply reading a finer field than the derivative
+    // map on 105 of 200 textures. To test that rather than argue it, 14 `_paramd` maps were re-baked
+    // at 4096, MATCHED to their `_paramh` (correlation 1.000, clip < 0.015%): bark, rope, adobe
+    // border, Hlaalu floor, wood siding, stronghold trim — chosen for "on many meshes x worst
+    // under-baked". With the resolution difference removed, play compared the two again and the
+    // answer did not move: *"mode 4 is still more detailed"*.
+    //
+    // So the gap is NOT sizing, and the remaining difference is the one thing left: arm 4 computes
+    // the gradient from a height filtered AT THE SAMPLED LOD, which adapts to the pixel footprint,
+    // while the baked map stores a gradient once and lets mip filtering average slopes afterwards.
+    // Those are not the same operation once the result is normalised and once BC5's per-texture
+    // power-of-two range has quantised it. That is a hypothesis, not a measurement — the measured
+    // fact is only that matched resolution did not rescue mode 3. pbrsynth T5 ("a derivative map at
+    // 512 beats a central difference at 4096") still stands where it was measured, against ARM 0;
+    // arm 4 did not exist then, and the comparison above is the one that governs the default now.
+    //
+    // What it costs meanwhile: arm 4 reads the 8-bit height, so the 200 baked maps sit unused at the
+    // default and terracing is veiled rather than removed (mode 3 keeps gradient retention 0.955
+    // against 0.000). Yellow in F12 mode 19 is therefore the normal state, not a warning.
+    uint32_t g_pbrGradMode  = 4u;
     // pbrFrameMode — how dH/duv becomes a normal with no mesh tangents:
     //   0 cotangent frame (live DX9's BuildPerPixelTBN, with the Jacobian's SIGN honoured — see
     //     pbrmaterial.h.fsl for why that is a correction and not a transcription).
     //   1 Mikkelsen surface gradient. Identical on an orthonormal UV map; exact under a skewed or
     //     anisotropic one, where the cotangent frame floors at ~2.7 deg (rig T7).
-    uint32_t g_pbrFrameMode = 0u;
+    //
+    // ⚠ 1 IS NOW THE DEFAULT, chosen in play. It is also the arm the rig prefers on its own terms:
+    // the two agree exactly wherever the UV map is orthonormal, and where it is not, the cotangent
+    // frame has an error FLOOR (~2.7 deg at T7) that no other knob reaches. So this is the rare
+    // default change that costs nothing anywhere and fixes something on skewed UVs — which MW has
+    // plenty of, since its art was mapped by hand with no tangent basis in the file at all.
+    uint32_t g_pbrFrameMode = 1u;
     // pbrDepth — the height channel's full range as a fraction of one UV unit, i.e. how deep the
     //   relief is RELATIVE TO THE TEXTURE'S OWN SIZE. 48/4096 is the live DX9 look at 4096 (its
     //   heightScale of 16 over a raw 3-texel difference). The DX9 gain is 16*N/3 — proportional to
@@ -7166,19 +7208,40 @@ namespace {
     //   is divided by its own tap spacing, so the same art reads the same depth at every size. This
     //   is a calibration constant, not a lever for facets: raising it deepens them, it does not
     //   remove them (rig T3/T9).
-    float    g_pbrDepth     = 48.0f / 4096.0f;
+    //
+    //   ⚠ THE DEFAULT IS NO LONGER THE DX9 NUMBER. Play settled on 0.025 alongside gradient mode 4
+    //   and a radius of 1.75. That is 2.1x the DX9 figure, and it is close to what the measurement
+    //   predicts rather than a taste offset: mode 4 differences a BLURRED height, and a blurred
+    //   field has a smaller slope — the per-uv gradient falls 27.4 -> 10.5 between level 0 and
+    //   level 2 on one measured map, so ~2.6x is roughly the compensation a blur arm needs to read
+    //   as the same relief. The DX9 baseline is still exactly reachable and is the A/B: mode 0,
+    //   radius 1.5, depth 0.01171875.
+    float    g_pbrDepth     = 0.025f;
     // pbrGradRadius — the central difference's half-span in BASE texels. 1.5 IS the live DX9 shader,
     // and it is the dial that came back from the first play session rather than a knob added on
     // spec: *"0 is better, detailed and more blurry at the same time, but blurry hides the terracing
-    // better"*. The difference spans 2*radius texels and therefore LOW-PASSES the height's 8-bit
-    // staircase over that span, so this trades relief sharpness against visible terracing directly.
+    // better"*.
+    // ⚠⚠ IT IS NOT A LOW-PASS, which is what this comment used to say. Widening a central difference
+    // is a COMB (gain |sin(2*pi*f*r)|/2r, periodic in f, FULL gain at Nyquist at r=1.5) and it GHOSTS
+    // rather than softens: measured, one ridge keeps a lobe FWHM of exactly 4.0 texels at radius 1.5,
+    // 3, 6, 10 and 16 — it never softens, it walks out to +-radius as TWO crisp copies. Play:
+    // *"I see double (offset features at high blurs), which is not expected, I expect in place
+    // blur"*. A correct blur arm was then built and REJECTED on sight: *"hard surfaces look
+    // subsurface, or just low quality blurry normal map look. I would sacrifice detail for a sharp
+    // look overall."* So in arms 0 and 1 there is no width worth having: 1.5 and leave it.
+    //
+    // ⚠ IN ARM 4 IT IS A BLUR WIDTH, NOT A TAP OFFSET, and 1.75 is what play settled on — the height
+    // is read at the mip whose box is 2*radius texels across and the difference stays at +-1 texel of
+    // THAT level, so a feature softens in place instead of splitting into two copies. That is why the
+    // default is 1.75 rather than the DX9 1.5. The sharp answer to terracing is still gradMode 3's
+    // baked map, and its lever is COVERAGE, not this dial. See pbrmaterial.h.fsl.
     // The gradient is divided by its own span in the shader, so depth stays calibrated — this moves
     // the FILTER, not the strength. Inert for gradient mode 2, which has no baseline.
     //
     // ⚠ A VEIL, NOT A FIX. Terracing is 8-bit quantisation amplified by differentiation, and the rig
     // (pbrsynth T6) measured that no runtime arm survives it — on a field spanning 3/255 every one
     // flattens to retention 0.000, while a BC5 derivative map baked at full precision keeps 1.001.
-    float    g_pbrGradRadius = 1.5f;
+    float    g_pbrGradRadius = 1.75f;
 
     // The ONE gate every writer of the static instance lane [15] goes through.
     inline uint32_t pbrParamSlotFor(uint32_t paramTexIndex) {
@@ -22270,17 +22333,21 @@ namespace {
         // height-derived normal on those surfaces, which is the quickest way to see the modes differ.
         { TabBuilder t; t.panel = g_uiPanel; t.name = "PBR materials";
           t.checkbox("PBR materials (_paramh) — off = today's image exactly", &g_pbrEnable);
-          t.sliderU("  gradient: 0 cd (live DX9) | 1 cdbs | 2 bspline | 3 BAKED map where it exists",
-                    &g_pbrGradMode, 0u, 3u, 1u);
+          t.sliderU("  gradient: 0 cd (DX9) | 1 cdbs | 2 bspline | 3 BAKED map | 4 cdblur (soft, no ghost)",
+                    &g_pbrGradMode, 0u, 4u, 1u);
           t.sliderU("  frame: 0 cotangent (live DX9) | 1 surface gradient (exact under skew)",
                     &g_pbrFrameMode, 0u, 1u, 1u);
           // A calibration constant, not a fix: raising it deepens the facets, it does not remove
           // them (see g_pbrDepth).
-          t.sliderF("  relief depth (fraction of the texture's width; 0.0117 = DX9 @4096)",
+          // 0.025 sits mid-range here, so the panel can express its own default and find its way
+          // back to it — which is the test a look dial has to pass.
+          t.sliderF("  relief depth (fraction of the texture's width; 0.0117 = DX9 @4096, 0.025 = default)",
                     &g_pbrDepth, 0.0f, 0.05f, 0.0005f);
-          // The blur-versus-terracing dial, and the one play asked for. Wider = softer relief and
-          // less visible terracing; 1.5 = the live DX9 shader. Inert on gradient mode 2.
-          t.sliderF("  tap radius in texels (wider = blurrier, hides terracing; 1.5 = DX9)",
+          // 1.5 = the live DX9 shader. Inert on gradient mode 2 (no baseline to widen), and on mode 3
+          // wherever a baked map is in use -- so if moving this changes the image while the gradient
+          // is on 3, THAT DRAW FELL BACK TO ARM 0 and has no _paramd. In modes 0 and 1 it widens the
+          // difference, which GHOSTS rather than blurs; mode 4 is the true blur width.
+          t.sliderF("  tap radius in texels (0/1 ghost when widened, 4 blurs; 1.5 = DX9)",
                     &g_pbrGradRadius, 0.25f, 6.0f, 0.25f);
           t.flush(); }
 
@@ -25794,8 +25861,9 @@ void destroyHostWindow(Renderer* R);
             { "mbDebug",   &g_mbDebug,   4u },
             // MB-2o: 0 the streak mean, 1 the nearest sample, 2 reflected at the silhouette.
             { "mbBgMode",  &g_mbBgMode,  2u },
-            // PBR: 0 cd (live DX9), 1 cdbs, 2 bspline; frame 0 cotangent, 1 surface gradient.
-            { "pbrGradMode",  &g_pbrGradMode,  3u },
+            // PBR: 0 cd (live DX9), 1 cdbs, 2 bspline, 3 baked map, 4 cdblur; frame 0 cotangent,
+            // 1 surface gradient.
+            { "pbrGradMode",  &g_pbrGradMode,  4u },
             { "pbrFrameMode", &g_pbrFrameMode, 1u },
         };
         const SKnob sknobs[] = {
@@ -31057,7 +31125,7 @@ void destroyHostWindow(Renderer* R);
             // frag reads them on every frame it has a param map in view, and a lane written only
             // some frames is the stale-cbuffer trap. pbrEnable is NOT here — it acts at pack time
             // (pbrParamSlotFor), which is what makes "off" bit-identical rather than zero-weighted.
-            mp[kPbrParamsFloat + 0] = (float)std::min(g_pbrGradMode, 3u);
+            mp[kPbrParamsFloat + 0] = (float)std::min(g_pbrGradMode, 4u);
             mp[kPbrParamsFloat + 1] = (float)std::min(g_pbrFrameMode, 1u);
             mp[kPbrParamsFloat + 2] = std::max(0.0f, g_pbrDepth);
             mp[kPbrParamsFloat + 3] = std::max(0.25f, g_pbrGradRadius);

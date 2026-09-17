@@ -98,7 +98,7 @@ float4 PS_MAIN( VSOutput In )
         pbrSrc = useBaked ? 3u : ((In.DerivIndex != 0u) ? 2u : 1u);
         const float2 dhduv = useBaked
             ? pbrDerivMap(In.DerivIndex, In.ClampMode, In.Uv, pbrDUVdx, pbrDUVdy)
-            : pbrHeightGradUV(min(gradMode, 2u), In.ParamIndex, In.ClampMode, In.Uv,
+            : pbrHeightGradUV(gradMode, In.ParamIndex, In.ClampMode, In.Uv,
                               pbrDUVdx, pbrDUVdy, size0, gShadowParams.pbrParams.w);
         N = pbrPerturb((uint)gShadowParams.pbrParams.y, N, pbrDPdx, pbrDPdy, pbrDUVdx, pbrDUVdy,
                        dhduv, gShadowParams.pbrParams.z);
@@ -533,9 +533,15 @@ float4 PS_MAIN( VSOutput In )
     }
     if (dbg == 19u) {   // mode 19: PBR gradient SOURCE — which surfaces are baked and which are 8-bit
         // Terracing is a property of the 8-bit runtime path, so the first question about any
-        // terraced surface is which path it is on. Only 101 of 209 _paramh maps have a baked
-        // derivative, and mode 3 falls back PER DRAW where one is missing — a fallback that is
+        // terraced surface is which path it is on. 200 of 209 _paramh maps now have a baked
+        // derivative (it was 101 when this view was written, and 103 on disk; the gap was a
+        // 16-bit PNG that Pillow was silently halving plus an index that picked the wrong
+        // thumbnail), and mode 3 falls back PER DRAW where one is missing — a fallback that is
         // correct, silent, and therefore invisible. This view is the thing that makes it visible.
+        //
+        // ⚠ YELLOW IS THE NORMAL STATE AT THE SHIPPED DEFAULT. gradMode defaults to 4 (cdblur),
+        // which reads the 8-bit height, so every surface that HAS a baked map reports yellow until
+        // someone selects mode 3. Yellow means "arm 4 is on", not "you forgot".
         //   grey   no _paramh at all (skinned, terrain, alpha, pbrEnable off) — cannot terrace here
         //   RED    _paramh only: the 8-bit height path. Terracing seen here is EXPECTED.
         //   YELLOW a baked map exists but is not being used — switch pbrGradMode to 3

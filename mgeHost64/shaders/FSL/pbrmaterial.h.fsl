@@ -131,6 +131,13 @@ float2 pbrHeightGradBS(uint slot, bool clampUV, float2 uv, float2 size, float lv
 //   1 cdbs    the same +-`radius` difference with each tap a B-spline read (16 fetches).
 //   2 bspline the B-spline's own analytic gradient (8 fetches). `radius` is INERT here: this arm has
 //             no baseline to widen — its support is the kernel's own four texels.
+//   4 cdblur  A BLUR THAT DOES NOT GHOST. `radius` becomes a blur WIDTH rather than a tap offset:
+//             the height is read at the mip whose box is 2*radius texels across and the difference
+//             stays at +-1 texel OF THAT LEVEL, so a feature SOFTENS in place instead of splitting
+//             into two copies. This is what arms 0 and 1 are asked for when `radius` is raised and
+//             what they do not do. Plain bilinear like arms 1 and 2 (no anisotropy), but 4 fetches
+//             rather than 16. Host gradMode 3 is the baked map and does not come through this
+//             function; a draw with no `_paramd` arrives here as arm 0.
 //
 // ⚠⚠ MODES 1 AND 2 ARE NOT A CLEAN A/B AGAINST 0, AND THE DIFFERENCE IS FILTERING, NOT
 // RECONSTRUCTION. Mode 0 samples through the anisotropic sampler with real gradients; the B-spline
@@ -141,11 +148,36 @@ float2 pbrHeightGradBS(uint slot, bool clampUV, float2 uv, float2 size, float lv
 // the same time"* — the detail is the AF these two do not have. Judge them on a surface facing the
 // camera, where that handicap is smallest; the rig could not see it at all (isotropic footprints).
 //
-// ⚠ `radius` IS THE BLUR-VERSUS-TERRACING DIAL, and it is a real one rather than a taste knob. The
-// difference spans 2*radius texels, so it LOW-PASSES the height's 8-bit staircase over that span:
-// wider hides terracing and softens relief, narrower does the opposite. Also from play: *"blurry
-// hides the terracing better"*. The gradient is divided by its own span below, so depth stays
-// calibrated and this changes the FILTER, not the strength. 1.5 = the live DX9 shader exactly.
+// ⚠⚠ `radius` IS NOT A BLUR, AND THIS COMMENT USED TO CLAIM IT WAS. It said the difference
+// "LOW-PASSES the height's 8-bit staircase over 2*radius texels". It does not. Widening a central
+// difference is a COMB, not a low-pass, and it GHOSTS rather than softens. Both measured:
+//
+//   * GHOSTING. One ridge of sigma 1.5 texels, swept radius. Each lobe of the response keeps a FWHM
+//     of exactly 4.0 texels at radius 1.5, 3, 6, 10 and 16 — it never softens, it only walks out to
+//     +-radius. (Blur-then-difference at matched width goes 5 -> 6 -> 11 -> 17 -> 26, i.e. it
+//     actually softens.) So a thin feature does not dissolve as the knob opens: it becomes TWO crisp
+//     copies 2*radius apart. Play saw exactly that: *"I see double (offset features at high blurs),
+//     which is not expected, I expect in place blur"*.
+//   * THE COMB. Gain of (h(u+r)-h(u-r))/2r is |sin(2*pi*f*r)|/2r — periodic in f with period 1/r, so
+//     it has passbands, not a rolloff. At radius 1.5 the gain at NYQUIST is 1.000, its maximum, with
+//     a zero at f=0.333 and back to 0.707 at 0.417. At radius 3 it peaks at 0.25 AND 0.417. High
+//     frequency is re-weighted, never removed. A real low-pass falls monotonically to 0.000.
+//
+// ⚠ ARM 4 IS THE ONE THAT ACTUALLY BLURS, and it is here because play asked for a ghostless one —
+// but it was also looked at and disliked: *"hard surfaces look subsurface, or just low quality
+// blurry normal map look. I would sacrifice detail for a sharp look overall."* A softened gradient
+// reads as a soft SURFACE, which is a material error rather than a filtering trade, so treat arm 4
+// as a fallback and not a destination. In arms 0 and 1 this dial has one setting that is right:
+// 1.5, the live DX9 shader.
+//
+// ⚠ THE SHIPPED DEFAULT IS NO LONGER THE DX9 BASELINE. Play settled on arm 4 at radius 1.75 with
+// pbrDepth 0.025, so the default now blurs and the DX9 look is a setting you have to ask for rather
+// than the one you start from. It is still exactly reachable — mode 0, radius 1.5, depth 0.01171875
+// — and that triple is the A/B; nothing about arm 0 changed.
+//
+// The sharp answer to terracing is the BAKED DERIVATIVE MAP below — gradMode 3 — and where that
+// still looks terraced it is because the draw has no `_paramd` and fell back to arm 0. Coverage is
+// the lever there, not this dial.
 //
 // ⚠ It is not a FIX for terracing, it is a veil over it. Terracing is 8-bit quantisation amplified by
 // differentiation, and the rig (T6) measured that NO runtime arm survives it: on a field spanning
@@ -156,7 +188,9 @@ float2 pbrHeightGradUV(uint mode, uint slot, uint clampModeIn, float2 uv,
 {
     const float  r = max(radius, 0.25f);            // below ~a quarter texel the difference is noise
     const float2 o = r / size0;                     // the tap offset, in BASE texels, as the live code
-    if (mode == 0u)
+    // Host gradMode 3 is the BAKED map; a draw that has none arrives here as 3 and takes arm 0,
+    // which is the fallback opaque.frag documents.
+    if (mode == 0u || mode == 3u)
     {
         const float hL = pbrParamGrad(slot, clampModeIn, uv - float2(o.x, 0.0f), duvdx, duvdy).a;
         const float hR = pbrParamGrad(slot, clampModeIn, uv + float2(o.x, 0.0f), duvdx, duvdy).a;
@@ -176,6 +210,22 @@ float2 pbrHeightGradUV(uint mode, uint slot, uint clampModeIn, float2 uv,
         const float hU = pbrHeightBS(slot, clampUV, uv + float2(0.0f, o.y), sizeL, lvl);
         return float2(hR - hL, hU - hD) * (size0 / (2.0f * r));
     }
+    if (mode == 4u)
+    {
+        // The blur IS the mip chain: a box 2*r base texels wide is level log2(2r), already filtered
+        // at full precision when the map was built. Never below the footprint's own level —
+        // blurring LESS than the hardware already is would be a sharpen, and an aliasing one.
+        const float  blvl  = max(lvl, log2(max(2.0f * r, 1.0f)));
+        const float2 sizeB = max(floor(size0 * exp2(-blvl)), float2(1.0f, 1.0f));
+        const float2 ob    = 1.0f / sizeB;        // ONE texel of the BLURRED level, not of the base
+        const float hL = pbrHeightLvl(slot, clampUV, uv - float2(ob.x, 0.0f), blvl);
+        const float hR = pbrHeightLvl(slot, clampUV, uv + float2(ob.x, 0.0f), blvl);
+        const float hD = pbrHeightLvl(slot, clampUV, uv - float2(0.0f, ob.y), blvl);
+        const float hU = pbrHeightLvl(slot, clampUV, uv + float2(0.0f, ob.y), blvl);
+        // Divided by the span it was actually taken over, so depth stays calibrated exactly as the
+        // other arms: two texels of level B.
+        return float2(hR - hL, hU - hD) * (sizeB * 0.5f);
+    }
     return pbrHeightGradBS(slot, clampUV, uv, sizeL, lvl) * sizeL;
 }
 
@@ -194,11 +244,22 @@ float2 pbrHeightGradUV(uint mode, uint slot, uint clampModeIn, float2 uv,
 // blocks. The host carries the exponent packed into the slot lane (pbrDerivSlotFor), and a file
 // without pbrbake's tag never reaches here at all.
 //
-// ⚠ PER TEXEL, SO THE LEVEL'S OWN SIZE CONVERTS IT. The stored slope is per texel OF THE MIP IT WAS
-// BAKED INTO, and a box-filtered chain halves the texel count per level, so the per-uv gradient is
-// stored * range * (that level's width). Using the base level's width would make the bump grow by
-// 2x per mip with distance. GetDimensions gives the top level only, so the sampled LOD is
-// reconstructed from the footprint exactly as the B-spline arms do.
+// ⚠⚠ PER UV, WHICH IS WHY THERE IS NO LOD RECONSTRUCTION HERE AND WHY THE MIP SEAM IS GONE.
+//
+// The first format stored dH/dTEXEL, and this function rebuilt the per-uv gradient as
+// `stored * range * sizeL` with sizeL from floor(log2(footprint)). Two faults compounded. The bake
+// made its chain by AVERAGING the per-texel derivative, which leaves it in LEVEL 0's texel units,
+// so every level was 2x too small for the width this multiplied it by -- measured against ground
+// truth, truth/reconstruction ran 0.99, 1.52, 2.53, 4.27, 7.75, 14.3, 28.3, a clean doubling per
+// level. And `floor` steps that width in a JUMP while the sampler blends the stored value smoothly,
+// so the error did not arrive as a fade with distance but as a hard LINE at every mip boundary.
+// Play: *"mode 3 has seams at mipmaps"*.
+//
+// dH/duv means the same thing at every resolution. Each level therefore describes itself, a
+// trilinear blend between two levels is a blend between two correct values, and there is nothing
+// left to reconstruct: no GetDimensions, no footprint, no LOD, no step. It also retires a quieter
+// bug -- the reconstructed LOD came from the MAJOR axis while an anisotropic sampler reads nearer
+// the minor one, so the scale was wrong at grazing angles even away from a boundary.
 float2 pbrDerivMap(uint packed, uint clampModeIn, float2 uv, float2 dx, float2 dy)
 {
     const uint  slot  = packed & 0xFFFFu;
@@ -213,12 +274,7 @@ float2 pbrDerivMap(uint packed, uint clampModeIn, float2 uv, float2 dx, float2 d
     // a kernel, so nothing here needs exact bilinear weights and it keeps the 8x AF and the trilinear
     // blend the live arm has. That is also why this does not inherit the "1 and 2 look blurrier"
     // handicap play reported.
-    const int2  sz0  = GetDimensions(gTextures[slot], NO_SAMPLER);
-    const float2 size0 = max(float2(sz0), float2(1.0f, 1.0f));
-    const float fp   = max(length(dx * size0), length(dy * size0));
-    const float lvl  = max(0.0f, floor(log2(max(fp, 1e-8f))));
-    const float2 sizeL = max(floor(size0 * exp2(-lvl)), float2(1.0f, 1.0f));
-    return d.xy * range * sizeL;
+    return d.xy * range;
 }
 
 // ─── Axis 2: dH/duv to a normal, with no mesh tangents ──────────────────────────────────────────
