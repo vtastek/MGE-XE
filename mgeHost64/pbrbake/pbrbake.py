@@ -623,6 +623,30 @@ def bake_one(src_png, paramh_path, out_path, size, min_corr, dry):
                 a = box_down(S, n)
                 break
         r["transform"], r["margin"] = tname, corr0 - runner
+    # ⚠⚠ THIS GATE IS A LOW-FREQUENCY STATISTIC AND IT HAS BEEN USED TO CERTIFY A HIGH-FREQUENCY
+    # PROPERTY. `n` above is at most 512 (and candidate selection runs at 256), so a "correlation
+    # 1.000" says the source and the shipped height agree up to 1/8 of a 4096 map's Nyquist. It says
+    # NOTHING about the top octave -- which is the only octave a derivative map exists for, because
+    # differentiation weights frequency linearly.
+    #
+    # This is load-bearing: that number certified the 14 maps re-baked at 4096 for the experiment
+    # that concluded "resolution is refuted" as the reason mode 4 beats mode 3 in play. The
+    # experiment matched HEADER DIMENSIONS and a <=512^2 correlation; whether it matched the
+    # INFORMATION is exactly what this gate cannot see.
+    #
+    # ⚠ DO NOT "FIX" THIS BY COMPARING TOP-OCTAVE ENERGY AGAINST THE _paramh. That was tried twice
+    # and the measurement was the variable both times: at native size the 14 are the only maps at
+    # 4096, so they alone meet a _paramh with its DXT5 CODEC NOISE unfiltered while every other
+    # height is box-downed first (median 0.743 vs 0.960 -- confounded); box-downing everything to a
+    # fixed 512 INVERTS it (4.21 vs 3.12, every ratio above 3) because box-downing a stored
+    # derivative and differentiating a box-downed height do not commute at the Nyquist edge, where
+    # the central difference has a null. The metric is also backwards in principle -- codec noise in
+    # the _paramh's top octave is what a baked map exists NOT to have.
+    #
+    # A correlation cannot be repaired by raising min_corr; it is the wrong instrument. What belongs
+    # here is a per-octave test against the 16-bit SOURCE this bake claims to encode -- free of the
+    # codec, and non-circular because it tests the ENCODING rather than the source choice.
+    # See tasks/forge-pbr-materials.md.
     corr = _corr(a, b)
     r["corr"] = corr
     if corr < min_corr:

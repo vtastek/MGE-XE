@@ -7167,23 +7167,66 @@ namespace {
     // depth is calibrated per arm (arm 4 differences a blurred height and delivers ~0.42x the
     // slope, so mode 3 at arm 4's depth is ~2.4x too deep) and sweeping it did not rescue mode 3.
     //
-    // RESOLUTION WAS THE OBVIOUS EXPLANATION AND IT IS NOW REFUTED. Every `_paramh` is 4096 and no
-    // `_paramd` was — Track B sizes them from texel density and capped at 2048 — so arm 4 at radius
-    // 1.75, resolving ~1170 on a 4096 height, was simply reading a finer field than the derivative
-    // map on 105 of 200 textures. To test that rather than argue it, 14 `_paramd` maps were re-baked
-    // at 4096, MATCHED to their `_paramh` (correlation 1.000, clip < 0.015%): bark, rope, adobe
-    // border, Hlaalu floor, wood siding, stronghold trim — chosen for "on many meshes x worst
-    // under-baked". With the resolution difference removed, play compared the two again and the
-    // answer did not move: *"mode 4 is still more detailed"*.
+    // RESOLUTION WAS THE OBVIOUS EXPLANATION, AND THE TEST THAT "REFUTED" IT DID NOT MATCH WHAT IT
+    // CLAIMED TO MATCH. Every `_paramh` is 4096 and no `_paramd` was — Track B sizes them from texel
+    // density and capped at 2048 — so arm 4 at radius 1.75, resolving ~1170 on a 4096 height, was
+    // simply reading a finer field than the derivative map on 105 of 200 textures. 14 `_paramd` maps
+    // were therefore re-baked at 4096, "MATCHED to their `_paramh` (correlation 1.000, clip <
+    // 0.015%)": bark, rope, adobe border, Hlaalu floor, wood siding, stronghold trim. Play compared
+    // them again and the answer did not move: *"mode 4 is still more detailed"*.
     //
-    // So the gap is NOT sizing, and the remaining difference is the one thing left: arm 4 computes
-    // the gradient from a height filtered AT THE SAMPLED LOD, which adapts to the pixel footprint,
-    // while the baked map stores a gradient once and lets mip filtering average slopes afterwards.
-    // Those are not the same operation once the result is normalised and once BC5's per-texture
-    // power-of-two range has quantised it. That is a hypothesis, not a measurement — the measured
-    // fact is only that matched resolution did not rescue mode 3. pbrsynth T5 ("a derivative map at
-    // 512 beats a central difference at 4096") still stands where it was measured, against ARM 0;
-    // arm 4 did not exist then, and the comparison above is the one that governs the default now.
+    // ⚠⚠ THAT CORRELATION IS A <=512^2 STATISTIC AND IT WAS USED TO CERTIFY A 4096 MAP. bake_one
+    // aligns on `n = min(S, H8, 512)` and candidate selection runs at 256 (_source_small), so
+    // "1.000" says the two agree up to 1/8 of the map's Nyquist and says NOTHING about the top
+    // octave — the only octave a derivative map exists for, since differentiation weights frequency
+    // linearly. The experiment matched HEADER DIMENSIONS and a low-frequency correlation; whether it
+    // matched the INFORMATION is exactly what its gate could not see. So the refutation rests on
+    // less than it appeared to, and resolution is not as closed as this comment once said.
+    //
+    // ⚠ IT IS ALSO NOT REOPENED, BECAUSE THE MEASUREMENT THAT TRIED TO REOPEN IT WAS THE VARIABLE,
+    // TWICE. Recorded so neither attempt is retried as new:
+    //   * At each map's NATIVE size, top-octave gradient energy (baked / shipped height) gave median
+    //     0.743 for the 14 against 0.960 for the other 186. Confounded: the 14 are the only maps at
+    //     nd == 4096, so they alone met a `_paramh` at full size with its DXT5 CODEC NOISE intact,
+    //     while every other height was box-downed first and had that noise filtered out.
+    //   * Re-run with every texture box-downed to a fixed 512, the result INVERTED — 4.21 against
+    //     3.12, every ratio above 3. Also an artifact: box-downing a stored derivative and
+    //     differentiating a box-downed height do not commute at the Nyquist edge, where the central
+    //     difference has a null.
+    // The group comparison is WITHDRAWN in both directions. And the metric is backwards in principle
+    // anyway: codec noise in the `_paramh` top octave is what a baked map exists NOT to have, so a
+    // deficit against it is partly correct behaviour. An acceptance test belongs against the 16-bit
+    // SOURCE the bake claims to encode — free of the codec, and non-circular for testing the
+    // ENCODING — not against the DXT5 alpha.
+    //
+    // ⚠ THE EXPLANATION THIS COMMENT THEN OFFERED FOR THE GAP WAS ALSO WRONG, in a way that reading
+    // the arm settles without any test. It said arm 4 "computes the gradient from a height filtered
+    // AT THE SAMPLED LOD, which adapts to the pixel footprint". It does not
+    // adapt: the level is max(lvl, log2(2*radius)), so at radius 1.75 it FLOORS at level 1.807 and
+    // only follows the footprint once the footprint is coarser than that. And it reads through
+    // pbrHeightLvl — PLAIN BILINEAR, no anisotropy — while the baked map is sampled with 8x AF at
+    // the footprint's own LOD. Up close, therefore, arm 4 reads a strictly COARSER and less well
+    // filtered height than mode 3 reads gradient, and the two CONVERGE at distance. A coarser,
+    // isotropically filtered source cannot resolve more of the height field. Whatever arm 4 wins on,
+    // it is not reading the height more finely than mode 3 does.
+    //
+    // Two further explanations are dead, so this is narrowing by elimination, not by a finding:
+    //   * DEPTH — excluded above by *"at any depth"* and a sweep. The scale gap behind it is real
+    //     though, and is now measured on all 200 shipped maps rather than one: the stored per-uv
+    //     gradient's use of the SNORM range falls 0.872 -> 0.627 -> 0.411 -> 0.257 across levels
+    //     0-3, so arm 4 reading at level ~1.8 sees ~2.1x less slope than mode 3 does at level 0.
+    //     That is exactly the 2.1x in pbrDepth below. A calibration offset, not the verdict.
+    //   * BC5 RANGE STARVATION — the obvious suspect, because the range is fitted on LEVEL 0's
+    //     p99.9 and every coarser level is clipped into it, and a BC4 block whose values all lie
+    //     inside one step of the GLOBAL 8-bit endpoint grid collapses to e0 == e1 and decodes dead
+    //     flat. Measured on the shipped bytes, blocks that decode flat run 0.4 / 0.2 / 0.5 / 0.5 /
+    //     2.0 / 7.0 / 16.9% on levels 0-6, then 35.4 / 52.5 / 79.8%. So it is REAL and it starts at
+    //     level 7 — 16x16 on a 2048 map, far past what a detail verdict is about. A defect to fix on
+    //     its own terms in pbrbake, not an explanation for this.
+    //
+    // pbrsynth T5 ("a derivative map at 512 beats a central difference at 4096") still stands where
+    // it was measured, against ARM 0; arm 4 did not exist then, and the comparison above is the one
+    // that governs the default now.
     //
     // What it costs meanwhile: arm 4 reads the 8-bit height, so the 200 baked maps sit unused at the
     // default and terracing is veiled rather than removed (mode 3 keeps gradient retention 0.955
