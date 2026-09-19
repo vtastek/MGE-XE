@@ -19,8 +19,18 @@
 // So per pixel we take the four bracketing VERTICES, look up each one's square, and blend the four
 // with bilinear weights — which is that interpolation, evaluated exactly, in one pass instead of
 // MGE's four-layer "texture bank" (a limit imposed by fixed-function stages we no longer have).
+//
+// **PBR on the ground** (tasks/forge-terrain-pbr.md). The ground is a full material now, not just a
+// colour: TWO VTEX packs of the identical shape — albedo slots and `_paramh` slots — blended by the
+// same four weights, giving height-derived normals plus roughness/metalness/F0 with GGX specular on
+// the sun and both point-light lists. The gradient is cdblur (landGradCdblur), read out of
+// `_paramh`'s own height; the baked `_paramd` arm is RETIRED. Coverage is per land texture, so a
+// land texture with no companion file is shaded exactly as it was before this landed, and F12 mode
+// 19 paints which is which.
 
 #include "opaque.srt.h"
+#include "texsample.h.fsl" // TEX_ADDR_MASK / the static samplers — pbrmaterial.h.fsl's prerequisite
+#include "pbrmaterial.h.fsl" // pbrPerturbSurfGrad / pbrSpecTerms / pbrEnvBRDF / pbrRoughness ...
 #include "msmrecv.h.fsl"   // sunShadowVisibility() — MSM sun-shadow receiver
 #include "shadowreceive.h.fsl" // shadowMaskPixel() — the mask texel that is actually OURS under MSAA
 #include "skyamb.h.fsl"    // skyAmbFactor() — SH-L1 sky ambient (SH1) + sky AO (SH2)
@@ -59,19 +69,31 @@ uint terrainCellAt(int lx, int ly, uint spanX, uint spanY)
     return gTerrainCellGrid[(uint)ly * spanX + (uint)lx];
 }
 
-// The land-texture SLOT ((bucket<<16)|layer) at texture square (tx, ty) of the cell at grid
-// (lx, ly), where tx/ty may be -1 or 16 — Morrowind's rounding reaches one square into the
-// neighbouring cell, so this wraps cell and square together exactly as MGEgui's ModCell does.
-// gTerrainTex holds slots, not LTEX ids: the host resolves them once at residency build, so the
-// hot path here is one load instead of a load plus an id->slot indirection.
-uint landTexSlot(int lx, int ly, uint spanX, uint spanY, int tx, int ty)
+// The INDEX into a VTEX pack for texture square (tx, ty) of the cell at grid (lx, ly), where
+// tx/ty may be -1 or 16 — Morrowind's rounding reaches one square into the neighbouring cell, so
+// this wraps cell and square together exactly as MGEgui's ModCell does. TERRAIN_NO_SQUARE means
+// there is no cell there (outside the padded grid), which nothing draws over.
+//
+// Shared by both packs (albedo slots, _paramh slots) because the wrap is a
+// property of the LAYOUT, not of which pack is being read: they have identical shape by
+// construction, built by the same remap at residency time. Resolving the index once per corner
+// instead of once per corner per pack is what keeps the PBR taps from doubling this walk.
+#define TERRAIN_NO_SQUARE 0xFFFFFFFFu
+uint landSquareIndex(int lx, int ly, uint spanX, uint spanY, int tx, int ty)
 {
     if (tx <  0) { --lx; tx += 16; } else if (tx > 15) { ++lx; tx -= 16; }
     if (ty <  0) { --ly; ty += 16; } else if (ty > 15) { ++ly; ty -= 16; }
     uint cell = terrainCellAt(lx, ly, spanX, spanY);
-    if (cell == 0u) { return 0u; }
-    return gTerrainTex[(cell - 1u) * TERRAIN_TSTRIDE + (uint)(ty * 16 + tx)];
+    if (cell == 0u) { return TERRAIN_NO_SQUARE; }
+    return (cell - 1u) * TERRAIN_TSTRIDE + (uint)(ty * 16 + tx);
 }
+
+// gTerrainTex holds SLOTS ((bucket<<16)|layer), not LTEX ids: the host resolves them once at
+// residency build, so the hot path here is one load instead of a load plus an id->slot indirection.
+uint landTexSlot(uint idx)   { return (idx == TERRAIN_NO_SQUARE) ? 0u : gTerrainTex[idx]; }
+// ...and the same square's PBR companions, 0 where that land texture ships none. Same arithmetic,
+// same wrap, different buffer — so a param tap costs one more load and adds no divergence.
+uint landParamSlot(uint idx) { return (idx == TERRAIN_NO_SQUARE) ? 0u : gTerrainParamTex[idx]; }
 
 // Morrowind's per-vertex square assignment. Kept in float so the negative cases round the way the
 // engine's floor/ceil do (integer division truncates toward zero and would disagree at x < 2).
@@ -87,6 +109,119 @@ float3 sampleLand(uint slot, float2 uv)
     uint layer  = slot & 0xFFFFu;
     return SampleTex2DArray(gTerrainArrays[bucket], gSamplerAnisotropic,
                             float3(uv, float(layer))).rgb;
+}
+
+// The _paramh material of one land texture: r = metalness, g = roughness, b = IOR/specular,
+// a = height, which landGradCdblur and landHeightAO read at their own mips — not through this tap.
+// Through the same sampler and the same uv as the albedo above, so the material filters exactly as
+// the colour it belongs to and both read the mip the hardware picked for the base.
+float4 sampleLandParam(uint slot, float2 uv)
+{
+    uint bucket = slot >> 16u;
+    uint layer  = slot & 0xFFFFu;
+    return SampleTex2DArray(gTerrainParamArrays[bucket], gSamplerAnisotropic,
+                            float3(uv, float(layer)));
+}
+
+// ─── THE GROUND'S GRADIENT: cdblur, out of `_paramh`'s own height ────────────────────────────────
+// The ONLY gradient source terrain has. The baked `_paramd` arm is RETIRED (2026-09-18): cdblur beat
+// it even at matched resolution (809c96af), and the maps were deleted. So terrain runs this whatever
+// `pbrGradMode` says — modes 0-2 are mesh-side A/B arms — and shares only its RADIUS with the meshes.
+// Why the ground has a runtime arm at all: *"no fidelity difference between terrain and meshes as they
+// can overlap with same material"* — a land texture and a mesh texture can be the SAME art, and a
+// gradient difference between the two paths would show on one material where the two surfaces meet.
+// Priced by an interleaved A/B: terrain PBR costs +0.16 ms of `color`, the same as the baked map did.
+//
+// ⚠ WHAT DID *NOT* BLOCK IT: a fork edit. `SampleLvlTex2DArray` in The-Forge's generated D3D12
+// header is typed `Texture3D<T>`, not `Texture2DArray<T>` (a copy-paste from `SampleLvlTex3D`).
+// water.frag.fsl and waterfog.h.fsl settled the policy first — *"a Forge bug we must neither inherit
+// nor fork-fix"* ([[project_forge_fork_merge_trap]]) — so it is a LOCAL macro under its own name, the
+// third instance of one workaround. `GetDimensions` is the same gap and takes the same treatment.
+// The two intrinsics Forge declares against the wrong texture type, under local names so nothing
+// collides when one header transitively includes another (waterfog.h.fsl's SampleCausticArray is
+// the same workaround for the same declaration, and terrain.frag already includes it).
+#define SampleLvlLandArray(N, S, C, L)  N.SampleLevel(S, C, L)
+#define GetLandArrayDims(N, W, H, E)    N.GetDimensions(W, H, E)
+
+// The base dimensions of one param bucket, in texels. Read per slot and NOT hoisted out of the
+// blend: buckets are keyed by (format, w, h, mips), so two land textures of different size can meet
+// in one pixel, and only each one's own texel size makes its gradient comparable to the other's. In
+// the shipped set there is a single 1024x1024 `_paramh` bucket, so this folds to one constant fetch.
+float2 landParamDims(uint bucket)
+{
+    uint w, h, e;
+    GetLandArrayDims(gTerrainParamArrays[bucket], w, h, e);
+    return max(float2(float(w), float(h)), float2(1.0f, 1.0f));
+}
+
+// One land texture's HEIGHT — `_paramh`'s alpha — at an EXPLICIT mip level. Plain bilinear, not
+// gSamplerAnisotropic, for the reason pbrmaterial.h.fsl gives: this arm needs the level it asked
+// for and AF picks its own. WRAP because a land texture tiles once per 512-unit texture square by
+// construction (uv = lat * 0.25), so there is no edge here to clamp to.
+float landHeightLvl(uint slot, float2 uv, float lvl)
+{
+    uint bucket = slot >> 16u;
+    uint layer  = slot & 0xFFFFu;
+    return SampleLvlLandArray(gTerrainParamArrays[bucket], gSamplerBilinearWrap,
+                              float3(uv, float(layer)), lvl).a;
+}
+
+// pbrmaterial.h.fsl's arm 4, term for term, on the bucketed arrays. A SEPARATE function rather
+// than pbrHeightGradUV generalised over a texture argument, because FSL cannot pass a resource as
+// a parameter — the same reason sampleLand exists beside pbrParamGrad instead of sharing it.
+//
+// THE BLUR IS THE MIP CHAIN: a box 2*r base texels wide is level log2(2r), already filtered at full
+// precision when the map was built, and the difference stays at +-1 texel OF THAT LEVEL so a
+// feature softens in place instead of splitting into two copies. Never below the footprint's own
+// level — blurring LESS than the hardware already is would be a sharpen, and an aliasing one.
+//
+// ⚠ Requires a full mip chain to blur with. The `_paramh` set has one (`mips=11 (full=11)` at
+// 1024²); a short chain does not break this, SampleLevel clamps to the last level present, but it
+// silently stops widening past it. `[terrain-tex]` reports short chains per bucket.
+//
+// Returns dH/duv, which is what makes the LINEAR blend between layers valid (pbrmaterial.h.fsl) —
+// and what makes `pbrTerrainDepth` a dimensionless slope scale (see g_pbrTerrainDepth).
+float2 landGradCdblur(uint slot, float2 uv, float2 duvdx, float2 duvdy, float radius)
+{
+    const float2 size0 = landParamDims(slot >> 16u);
+    const float  r     = max(radius, 0.25f);
+    const float  fp    = max(length(duvdx * size0), length(duvdy * size0));  // footprint, texels
+    const float  lvl   = max(0.0f, floor(log2(max(fp, 1e-8f))));
+    const float  blvl  = max(lvl, log2(max(2.0f * r, 1.0f)));
+    const float2 sizeB = max(floor(size0 * exp2(-blvl)), float2(1.0f, 1.0f));
+    const float2 ob    = 1.0f / sizeB;       // ONE texel of the BLURRED level, not of the base
+    const float hL = landHeightLvl(slot, uv - float2(ob.x, 0.0f), blvl);
+    const float hR = landHeightLvl(slot, uv + float2(ob.x, 0.0f), blvl);
+    const float hD = landHeightLvl(slot, uv - float2(0.0f, ob.y), blvl);
+    const float hU = landHeightLvl(slot, uv + float2(0.0f, ob.y), blvl);
+    // Divided by the span it was actually taken over — two texels of level B — so the depth knob
+    // stays calibrated exactly as the baked map's.
+    return float2(hR - hL, hU - hD) * (sizeB * 0.5f);
+}
+
+// One land texture's HEIGHT AO (pbrmaterial.h.fsl). TWO taps per covered layer.
+//
+// ⚠ IT IS TWO TAPS AND NOT ONE, AND I SAID ONE. The claim was that cdblur's four existing taps at
+// `blvl` average to the `hAvg` this needs, making height AO nearly free. They do not: cdblur's
+// blur level is `max(lvl, log2(2*radius))` ~ 1.8, a ONE-TEXEL-ish neighbourhood chosen to soften a
+// gradient, while height AO wants a neighbourhood WIDE enough to contain the pits it is shading —
+// the source used absolute level 8. Reusing cdblur's taps would measure occlusion against an
+// average two texels wide, which is not occlusion. Different scales, so different taps.
+//
+// The averaging level is ABSOLUTE and clamped up to the footprint's own level, which makes the
+// effect SELF-FADING with distance: once `lvl >= aoLvl` both taps read the same level at the same
+// uv, the difference is 0, and the term is exactly 1. That is the physically right behaviour — a
+// centimetre-deep pit is not visible at fifty metres — and it is why the level is not relative to
+// the footprint, which would keep the AO alive at every distance by shading ever-larger features.
+float landHeightAO(uint slot, float2 uv, float2 duvdx, float2 duvdy, float aoLvl, float depth)
+{
+    const float2 size0 = landParamDims(slot >> 16u);
+    const float  fp    = max(length(duvdx * size0), length(duvdy * size0));
+    const float  lvl   = max(0.0f, floor(log2(max(fp, 1e-8f))));   // this pixel's own level
+    const float  alvl  = max(lvl, aoLvl);                          // ...and its neighbourhood's
+    const float  hS    = landHeightLvl(slot, uv, lvl);
+    const float  hA    = landHeightLvl(slot, uv, alvl);
+    return pbrHeightAO(hS, hA, size0, alvl, depth);
 }
 
 ROOT_SIGNATURE(DefaultRootSignature)
@@ -106,16 +241,32 @@ float4 PS_MAIN( VSOutput In )
     int    x1  = min(x0 + 1, TERRAIN_QUADS), y1 = min(y0 + 1, TERRAIN_QUADS);
     float  fx  = lat.x - float(x0), fy = lat.y - float(y0);
 
-    uint id00 = landTexSlot(lx, ly, spanX, spanY, squareX(x0), squareY(y0));
-    uint id10 = landTexSlot(lx, ly, spanX, spanY, squareX(x1), squareY(y0));
-    uint id01 = landTexSlot(lx, ly, spanX, spanY, squareX(x0), squareY(y1));
-    uint id11 = landTexSlot(lx, ly, spanX, spanY, squareX(x1), squareY(y1));
+    // The four squares' VTEX indices, resolved ONCE — the albedo and _paramh packs both
+    // read at these same four places (see landSquareIndex).
+    uint i00 = landSquareIndex(lx, ly, spanX, spanY, squareX(x0), squareY(y0));
+    uint i10 = landSquareIndex(lx, ly, spanX, spanY, squareX(x1), squareY(y0));
+    uint i01 = landSquareIndex(lx, ly, spanX, spanY, squareX(x0), squareY(y1));
+    uint i11 = landSquareIndex(lx, ly, spanX, spanY, squareX(x1), squareY(y1));
+
+    uint id00 = landTexSlot(i00);
+    uint id10 = landTexSlot(i10);
+    uint id01 = landTexSlot(i01);
+    uint id11 = landTexSlot(i11);
 
     // uv tiles once per 512-unit texture square (lattice/4), continuous because the texture wraps.
     float2 uv = lat * 0.25f;
 
+    // MW's per-vertex 0/1 weights, interpolated. Hoisted to top level because the PBR blend below
+    // needs the SAME four numbers the albedo blend does — a second copy of them is a second place
+    // for the two to disagree about which corner is which.
+    float w00 = (1.0f - fx) * (1.0f - fy);
+    float w10 = fx * (1.0f - fy);
+    float w01 = (1.0f - fx) * fy;
+    float w11 = fx * fy;
+
     // How many DISTINCT land textures meet here (1..4) — F12 mode 20 paints it, and the count is
-    // also the tap multiplier any future PBR terrain blend would pay. Measured over every LAND
+    // also the tap multiplier the PBR terrain blend below pays: it reads both packs over the same
+    // four corners (albedo, _paramh), so this number multiplies both. Measured over every LAND
     // record in Morrowind + Tribunal + Bloodmoon (318,375 interior quad joins): 40.24% of joins
     // carry one texture, 56.29% two, 3.38% three, and 0.09% — 291 quads in the whole world — four.
     // So "four-way blending is too expensive" prices at 3.47% of the terrain, and going from a
@@ -126,14 +277,12 @@ float4 PS_MAIN( VSOutput In )
         + ((id01 != id00 && id01 != id10) ? 1u : 0u)
         + ((id11 != id00 && id11 != id10 && id11 != id01) ? 1u : 0u);
 
+    const bool oneSquare = (id00 == id10 && id00 == id01 && id00 == id11);
+
     float3 albedo;
-    if (id00 == id10 && id00 == id01 && id00 == id11) {
+    if (oneSquare) {
         albedo = sampleLand(id00, uv);          // interior of a square: one tap, the common case
     } else {
-        float w00 = (1.0f - fx) * (1.0f - fy);
-        float w10 = fx * (1.0f - fy);
-        float w01 = (1.0f - fx) * fy;
-        float w11 = fx * fy;
         albedo  = sampleLand(id00, uv) * w00;
         albedo += sampleLand(id10, uv) * w10;
         albedo += sampleLand(id01, uv) * w01;
@@ -166,6 +315,143 @@ float4 PS_MAIN( VSOutput In )
     float3 normal = normalize(In.Normal);
     float  sunVis = sunShadowVisibility(In.WorldPos, normal);
 
+    // ─── TERRAIN PBR (tasks/forge-terrain-pbr.md; pbrmaterial.h.fsl) ─────────────────────────────
+    // Terrain was the last large surface with no relief and no specular, and it is most of the
+    // screen outdoors. 96 shipped `_paramh` land-texture maps had no consumer at all before this;
+    // this is their consumer.
+    //
+    // ⚠ `normal` ABOVE STAYS THE GEOMETRIC NORMAL AND IS NOT PERTURBED. That split is the whole
+    // reason the comment further down (about the AO bent normal) called this prerequisite work: ONE
+    // `normal` used to serve shading, the MSM sun-shadow bias and the point-light Lambert, and
+    // perturbing it would move the shadow bias with the bump — which shows up as ACNE on a hillside
+    // under a low sun, not as a lighting change. So the two are separated here, exactly as
+    // opaque.frag separates pbrNg from pbrNb: `normal` keeps sunShadowVisibility (already called,
+    // above) and skyAmbFactor; `nShade` gets the relief and drives N.L, the point Lambert and the
+    // specular lobe.
+    //
+    // ⚠ BIT-IDENTITY IS A PROPERTY OF THE CODE, NOT A BET. Every term below is inside `if (pbrLive)`
+    // or is initialised to the exact legacy value (nShade = normal, pbrKd = 1, cover = 0), so
+    // ground whose land textures ship no companion map — and every pixel with the knob off — runs
+    // the pre-PBR arithmetic unchanged. F12 mode 19 paints which is which.
+    //
+    // Screen derivatives HERE, at top level in uniform control flow: every reader of them sits
+    // inside the branch below, and derivatives taken inside divergent flow are undefined
+    // (opaque.frag.fsl says the same at its own top).
+    const float3 pbrDPdx  = ddx(In.WorldPos);
+    const float3 pbrDPdy  = ddy(In.WorldPos);
+    const float2 pbrDUVdx = ddx(uv);
+    const float2 pbrDUVdy = ddy(uv);
+
+    float3 nShade   = normal;                        // the SHADING normal (D5: see above)
+    float3 pbrKd    = float3(1.0f, 1.0f, 1.0f);      // metallic workflow: diffuse+ambient kill
+    float3 pbrSpecA = float3(0.0f, 0.0f, 0.0f);      // direct specular, split by F0: spec = F0*A + B
+    float3 pbrSpecB = float3(0.0f, 0.0f, 0.0f);
+    float4 pbrMat   = float4(0.0f, 0.0f, 0.0f, 0.0f);
+    float  pbrCover = 0.0f;                          // the blend weight that HAS a _paramh
+    float  pbrRough = 1.0f, pbrAlpha2 = 1.0f, pbrNoV = 1.0f;
+    float3 pbrV     = float3(0.0f, 0.0f, 1.0f);
+    // Height AO's visibility, blended over the same layers. 1 = unoccluded, which is what every
+    // pixel gets when the knob is off or the ground has no `_paramh` — so the term drops out of the
+    // arithmetic exactly rather than nearly (pbrHeightAO saturates for the same reason).
+    float  pbrHeightVis = 1.0f;
+    const bool  pbrHAO    = (gShadowParams.pbrTerrainAO.x != 0.0f);
+    const float pbrHAOStr = gShadowParams.pbrTerrainAO.y;
+    const float pbrHAOLvl = gShadowParams.pbrTerrainAO.z;
+    // THE GRADIENT RADIUS, shared with the mesh path so the ground and the meshes standing on it
+    // resolve the same material the same way — which is the whole reason this exists.
+    //
+    // ⚠ THE RADIUS IS SHARED AND THE DEPTH IS NOT, and the reason is NOT the one first written
+    // here. It said a depth is in surface units and a land texture's UV unit is a fixed
+    // 512-world-unit square — but that size cancels out of both frames (world height = depth*L*h
+    // over world horizontal = L*duv), so the slope is just `depth * dH/duv` and 512 never enters.
+    // Both knobs are dimensionless and both would transfer on those grounds.
+    //
+    // `pbrTerrainDepth` earns its own lane on a MEASUREMENT instead: terrain slices are capped at
+    // 1024 from 4096-texel sources, so the ground's mip 0 is already the source's level 2, and arm
+    // 4 blurs from there. The ground shades from |dH/duv| ~ 4-6 where a mesh shades from ~11 — a
+    // third of the slope at the same number. The radius needs no twin because it is in texels of
+    // whatever map it reads, which is self-relative on either surface. See g_pbrTerrainDepth.
+    const float pbrGradR  = gShadowParams.pbrParams.w;
+    // pbrTerrain.x is a cbuffer scalar, so this branch is uniform across the whole draw.
+    bool  pbrLive = false;
+    if (gShadowParams.pbrTerrain.x != 0.0f)
+    {
+        // The `_paramh` slots of the SAME four squares the albedo blend read (0 = none). One extra
+        // buffer load per corner — the square index was already resolved.
+        const uint ps00 = landParamSlot(i00), ps10 = landParamSlot(i10);
+        const uint ps01 = landParamSlot(i01), ps11 = landParamSlot(i11);
+        pbrLive = ((ps00 | ps10 | ps01 | ps11) != 0u);
+        if (pbrLive)
+        {
+            // Blended with the SAME w00..w11 and the SAME all-ids-equal fast path as the albedo, so
+            // the material and the colour it belongs to cannot disagree about where a layer ends.
+            //
+            // ⚠ A LAYER WITH NO MAP CONTRIBUTES NOTHING AND IS NOT DEFAULTED. The material is the
+            // weighted average over the layers that HAVE one (matW renormalises it) and `pbrCover`
+            // — that same weight — scales every PBR term. So the feature crossfades to exactly the
+            // legacy image as coverage falls to zero, instead of painting a "standard dielectric"
+            // specular onto art that was never authored for one. Coverage is then a real quantity
+            // mode 19 can show, rather than an invisible default.
+            //
+            // The gradient is a PLAIN linear blend with no renormalisation: a layer with no _paramh
+            // is FLAT, which is the honest answer and is what that ground did before any of this.
+            // dH/duv is what makes that linear blend valid (pbrmaterial.h.fsl).
+            //
+            // Taps per layer: albedo 1 + material 1 + cdblur 4 (+2 with height AO). The blend keeps the
+            // albedo path's four-corner shape rather than deduplicating to the distinct count, so a
+            // two-texture join pays four corners here exactly as it already does for colour.
+            float4 mat  = float4(0.0f, 0.0f, 0.0f, 0.0f);
+            float  matW = 0.0f;
+            float2 dh   = float2(0.0f, 0.0f);
+            // `dh` accumulates in the same corner order the cdblur arm always used, so removing the
+            // retired baked arm leaves the shipped (mode 4) image bit-identical.
+            if (oneSquare) {
+                if (ps00 != 0u) { mat  = sampleLandParam(ps00, uv); matW = 1.0f; }
+                if (ps00 != 0u) { dh = landGradCdblur(ps00, uv, pbrDUVdx, pbrDUVdy, pbrGradR); }
+            } else {
+                if (ps00 != 0u) { mat += sampleLandParam(ps00, uv) * w00; matW += w00; }
+                if (ps10 != 0u) { mat += sampleLandParam(ps10, uv) * w10; matW += w10; }
+                if (ps01 != 0u) { mat += sampleLandParam(ps01, uv) * w01; matW += w01; }
+                if (ps11 != 0u) { mat += sampleLandParam(ps11, uv) * w11; matW += w11; }
+                if (ps00 != 0u) { dh += landGradCdblur(ps00, uv, pbrDUVdx, pbrDUVdy, pbrGradR) * w00; }
+                if (ps10 != 0u) { dh += landGradCdblur(ps10, uv, pbrDUVdx, pbrDUVdy, pbrGradR) * w10; }
+                if (ps01 != 0u) { dh += landGradCdblur(ps01, uv, pbrDUVdx, pbrDUVdy, pbrGradR) * w01; }
+                if (ps11 != 0u) { dh += landGradCdblur(ps11, uv, pbrDUVdx, pbrDUVdy, pbrGradR) * w11; }
+            }
+            // HEIGHT AO, over the same layers and the same weights as the material. Renormalised
+            // by matW like the material and not left as a plain sum: this is a visibility, so a
+            // layer that contributes nothing must not drag the average toward 0.
+            if (pbrHAO)
+            {
+                float vis = 0.0f;
+                if (oneSquare) {
+                    if (ps00 != 0u) { vis = landHeightAO(ps00, uv, pbrDUVdx, pbrDUVdy, pbrHAOLvl, gShadowParams.pbrTerrain.y); }
+                } else {
+                    if (ps00 != 0u) { vis += landHeightAO(ps00, uv, pbrDUVdx, pbrDUVdy, pbrHAOLvl, gShadowParams.pbrTerrain.y) * w00; }
+                    if (ps10 != 0u) { vis += landHeightAO(ps10, uv, pbrDUVdx, pbrDUVdy, pbrHAOLvl, gShadowParams.pbrTerrain.y) * w10; }
+                    if (ps01 != 0u) { vis += landHeightAO(ps01, uv, pbrDUVdx, pbrDUVdy, pbrHAOLvl, gShadowParams.pbrTerrain.y) * w01; }
+                    if (ps11 != 0u) { vis += landHeightAO(ps11, uv, pbrDUVdx, pbrDUVdy, pbrHAOLvl, gShadowParams.pbrTerrain.y) * w11; }
+                }
+                // Strength dials toward 1 (no occlusion), and coverage does the same — so partial
+                // coverage crossfades to the legacy image, the way every other terrain PBR term does.
+                pbrHeightVis = lerp(1.0f, vis / max(matW, 1e-4f), saturate(pbrHAOStr) * saturate(matW));
+            }
+            pbrCover = saturate(matW);
+            pbrMat   = mat / max(matW, 1e-4f);
+            // The surface gradient frame, which needs no mesh tangents — and terrain has none, so
+            // this is not a compromise here but the only frame available. pbrFrameMode is honoured
+            // so the ground and the meshes standing on it resolve their relief the same way.
+            nShade    = pbrPerturb((uint)gShadowParams.pbrParams.y, normal, pbrDPdx, pbrDPdy,
+                                   pbrDUVdx, pbrDUVdy, dh, gShadowParams.pbrTerrain.y);
+            pbrRough  = pbrRoughness(pbrMat);
+            const float r2 = pbrRough * pbrRough;
+            pbrAlpha2 = r2 * r2;                     // GGX alpha^2 = roughness^4 (pbr.hlsl)
+            pbrV      = normalize(gFrameData.eyePos.xyz - In.WorldPos);
+            pbrNoV    = saturate(dot(nShade, pbrV)) + 1e-5f;   // +eps: a normal can face away
+            pbrKd     = float3(1.0f, 1.0f, 1.0f) - pbrMetalness(pbrMat) * pbrCover;
+        }
+    }
+
     // GTAO on the ground. Terrain was already an AO OCCLUDER — terrainRecordDepth is the last thing
     // in the Z-prepass and the AO dispatch reads that depth (opaque.srt.h says so where it documents
     // gSceneLinDepth) — but it was never a RECEIVER. So a crate got its contact darkening while the
@@ -186,16 +472,19 @@ float4 PS_MAIN( VSOutput In )
     // screen-space buffer, so in the 1024² mirror it would be indexed at an unrelated screen location.
     // Forced to 1 = no darkening there, same tag opaque.frag/multimap.frag take.
     //
-    // Bit 1 (bent normal) is deliberately NOT wired here: it is a separate look feature, it is off by
-    // default, and this normal also feeds the MSM bias and the point-light Lambert below.
-    // KNOWN near/far divergence, kept on purpose for now: opaque.frag and multimap.frag were changed
-    // from a hard normal SWAP to an occlusion-weighted lerp (2026-08-04), which removes the reason
-    // this path most wanted to stay out — the lerp is a no-op wherever nothing occludes, so it can no
-    // longer wreck an open surface. What still holds it back is the sentence above: unlike
-    // opaque.frag, which feeds the MSM bias the GEOMETRIC normal and keeps skyAmbFactor on it too,
-    // this path has ONE `normal` serving shading, the sun bias and the point Lambert. Wiring the bend
-    // means splitting those first. Terrain also spans the whole near<->far handover in one draw, so
-    // getting it wrong shows up as a seam on the same hillside rather than on one object.
+    // Bit 1 (bent normal) is deliberately NOT wired here: it is a separate look feature and it is
+    // off by default.
+    //
+    // ⚠ THE PREREQUISITE THIS COMMENT USED TO NAME IS DONE. It said this path had ONE `normal`
+    // serving shading, the sun bias and the point Lambert, and that wiring the bend meant splitting
+    // those first. Terrain PBR split them (see the block above `sunVis`): `normal` is the GEOMETRIC
+    // normal and keeps sunShadowVisibility and skyAmbFactor, while `nShade` carries the relief and
+    // drives N.L, the point Lambert and the specular lobe — the same separation opaque.frag makes
+    // between pbrNg and pbrNb. So the bend now has a place to land: `nShade`, occlusion-weighted,
+    // exactly as opaque.frag/multimap.frag do it since 2026-08-04.
+    // What is left is a judgement call, not a blocker: terrain spans the whole near<->far handover
+    // in one draw, so getting it wrong shows up as a seam on the same hillside rather than on one
+    // object — which is why it is still a separate step and not folded in here.
     bool   inReflect = (gFrameData.gReflWaterClip.z != 0.0f);
     uint   aoFlags   = (uint)(gFrameData.debugParams.w + 0.5f);
     // WHICH TEXEL IS OURS UNDER MSAA — gAO comes from pLinearDepth (SAMPLE 0), so at a silhouette
@@ -223,6 +512,14 @@ float4 PS_MAIN( VSOutput In )
     // the blended land texture times the vertex colour, i.e. exactly the reflectance doing the
     // bouncing, and it is LINEAR already (_SRGB views). See aomultibounce.h.fsl.
     if ((aoFlags & 1u) != 0u) { amb *= aoAmbientTerm(aoSample.a, albedo, aoFlags); }
+    // HEIGHT AO — AMBIENT ONLY, and it MULTIPLIES the GTAO above rather than replacing it. Three
+    // occlusion terms now meet on this surface at three different scales and they all multiply:
+    // skyAmbFactor's SH2 occludes the sky at world scale (a valley floor against a ridge top), GTAO
+    // at contact scale (the crate standing on the ground), and this one at TEXEL scale (the pits
+    // inside the land texture itself). None of them can see what the others see, which is why none
+    // of them is redundant. Direct sun and the point lights are untouched, exactly as GTAO leaves
+    // them — the scene-walk oracle's hookup, and the physically right one.
+    amb *= pbrHeightVis;
     // W7b — absorption on the way IN (waterfog.h.fsl). Terrain matters most of all the callers here:
     // the SEABED is terrain, so this is the surface whose lighting the whole model is about. Applied
     // to the sun and ambient terms only, before the point lights below add into `result`.
@@ -232,10 +529,44 @@ float4 PS_MAIN( VSOutput In )
     // loops below: above water this is one cbuffer compare for the whole fragment instead of one
     // call per light. The seabed is terrain, so this is the surface the whole feature is aimed at.
     bool causProj = causticProjectorActive(In.WorldPos);
+    // Sun N.L on the SHADING normal, hoisted out of the `result` expression because the PBR sun
+    // specular below needs exactly this number (the lobe and the diffuse must agree on N.L, or a
+    // highlight can sit where the surface is already dark). Identical arithmetic when pbrLive is
+    // false — nShade IS normal there and the geom_vis factor is not applied.
+    float sunNdl = saturate(dot(-gFrameData.sunDir.xyz, nShade));
+    // pbr.hlsl's geom_vis: the sun BEHIND the real ground must not light a bump that happens to
+    // face it. Off the GEOMETRIC normal, which is what makes it a visibility test and not a second
+    // N.L. Same factor, same form, as opaque.frag.
+    if (pbrLive) { sunNdl *= saturate(8.0f * dot(normal, -gFrameData.sunDir.xyz) + 1.0f); }
     float3 result = albedo
-                  * (gFrameData.sunCol.rgb * saturate(dot(-gFrameData.sunDir.xyz, normal)) * sunVis
+                  * (gFrameData.sunCol.rgb * sunNdl * sunVis
                         * tSunW
                      + amb * tAmbW);
+    // ─── F12 5/6/7 (albedo / lit / ambient): the FACTOR `albedo` multiplies ──────────────────────
+    // Accumulated in parallel with `result`, from the same operands in the same order — not
+    // re-derived at the ladder, for the reason mode 3's comment already gives here: a view that
+    // recomputes its answer can agree with itself while disagreeing with the frame.
+    //
+    // ⚠ AND NOT BY REFACTORING `result` INTO `albedo * (sun + amb + point)`, which is the obvious
+    // way to get this for free and is wrong. `a*b + a*c` is not bit-identical to `a*(b+c)`, so that
+    // refactor would move every terrain pixel by an LSB and quietly invalidate the one claim this
+    // whole file is arranged around — that the ground with no `_paramh`, and the ground with
+    // pbrTerrain off, is the pre-PBR image exactly.
+    //
+    // It is nearly free anyway, and that is measured rather than assumed: the initialiser is the
+    // SAME expression tree as the one inside `result` above, so it folds away as a common
+    // subexpression. On grass.frag and statics.frag, which take this identical pattern and whose
+    // ONLY change was these three views, the whole addition came to **+3 DXIL instructions** each
+    // (3514 -> 3517 and 3246 -> 3249) — exactly the one vector add, with nothing charged for the
+    // initialiser. Terrain is that plus one vector multiply (the metallic kill below).
+    float3 litTerm = gFrameData.sunCol.rgb * sunNdl * sunVis * tSunW + amb * tAmbW;
+    if (pbrLive)
+    {
+        const float2 st = pbrSpecTerms(nShade, -gFrameData.sunDir.xyz, pbrV, sunNdl, pbrNoV, pbrAlpha2);
+        const float3 w  = gFrameData.sunCol.rgb * (sunNdl * sunVis) * tSunW;
+        pbrSpecA += w * st.x;
+        pbrSpecB += w * st.y;
+    }
 
     // Point lights. Terrain is the ONE surface that spans the whole near↔far handoff — the ground
     // runs from underfoot to the horizon in a single draw — so unlike every other path it cannot be
@@ -333,13 +664,24 @@ float4 PS_MAIN( VSOutput In )
                     uint  nib  = (word >> ((s & 7u) * 4u)) & 0xFu;
                     att *= float(nib) * (1.0f / 15.0f);
                 }
-                float lambert = saturate(dot(normal, toL) * invD);
+                float lambert = saturate(dot(nShade, toL) * invD);
+                if (pbrLive) { lambert *= saturate(8.0f * dot(normal, toL) * invD + 1.0f); }   // geom_vis
                 // W32 — the mirror gobo: a mean-1 multiplier on the direct term, not a second light.
                 // Multiply INSIDE the branch, so at strength 0 the original expression is textually
                 // untouched and the A/B is bit-exact (see opaque.frag.fsl).
                 float3 lightAdd = lambert * att * lcol;
                 if (causProj) { lightAdd *= causticProjector(In.WorldPos, posR.xyz); }
                 pointDiffuse += lightAdd;
+                // Point-light specular. Every light, as opaque.frag does — this loop is already
+                // walking them. The submerged-lamp caustic gobo shapes the DIFFUSE only, so it is
+                // deliberately not in `w` here.
+                if (pbrLive)
+                {
+                    const float2 st = pbrSpecTerms(nShade, toL * invD, pbrV, lambert, pbrNoV, pbrAlpha2);
+                    const float3 w  = lcol * (att * lambert);
+                    pbrSpecA += w * st.x;
+                    pbrSpecB += w * st.y;
+                }
             }
         }
     }
@@ -389,17 +731,47 @@ float4 PS_MAIN( VSOutput In )
                 float d    = d2 * invD;
                 float att  = 1.0f / max(fo.z * d2 + fo.y * d + fo.x, 1e-4f);
                 att *= 1.0f - smoothstep(POINT_LIGHT_TAIL * reach, reach, d);
-                float lambert = saturate(dot(normal, toL) * invD);
+                float lambert = saturate(dot(nShade, toL) * invD);
+                if (pbrLive) { lambert *= saturate(8.0f * dot(normal, toL) * invD + 1.0f); }   // geom_vis
                 // W32 — the mirror gobo: a mean-1 multiplier on the direct term, not a second light.
                 // Multiply INSIDE the branch, so at strength 0 the original expression is textually
                 // untouched and the A/B is bit-exact (see opaque.frag.fsl).
                 float3 lightAdd = lambert * att * lcol;
                 if (causProj) { lightAdd *= causticProjector(In.WorldPos, posR.xyz); }
                 pointDiffuse += lightAdd;
+                if (pbrLive)   // see the near loop for why the gobo is not in `w`
+                {
+                    const float2 st = pbrSpecTerms(nShade, toL * invD, pbrV, lambert, pbrNoV, pbrAlpha2);
+                    const float3 w  = lcol * (att * lambert);
+                    pbrSpecA += w * st.x;
+                    pbrSpecB += w * st.y;
+                }
             }
         }
     }
     result += albedo * pointDiffuse;
+    litTerm += pointDiffuse;   // the same sum, without the albedo (F12 6)
+
+    if (pbrLive)
+    {
+        // `result` is now the WHOLE diffuse+ambient response (sun, ambient and both point-light
+        // arms), which is exactly what a metal does not have — so the metallic kill is ONE multiply
+        // here rather than one per term. pbrKd is exactly 1.0 when this branch is not taken.
+        result *= pbrKd;
+        litTerm *= pbrKd;
+        const float3 f0 = pbrF0(pbrMat, albedo);
+        // The environment is the SAME sky the ambient term above integrates, evaluated in the
+        // mirror direction — so what lights the ground and what it reflects cannot drift apart.
+        // lodSunAmb, not ambCol: that is terrain's own ambient source (see `amb` above).
+        const float3 R = reflect(-pbrV, nShade);
+        float3 env = gFrameData.lodSunAmb.rgb * skyAmbFactor(R, In.WorldPos) * tAmbW;
+        if ((aoFlags & 1u) != 0u) { env *= aoSample.a; }   // an occluded pocket sees less sky
+        env *= pbrHeightVis;                              // ...and so does a pocket in the TEXTURE
+        // Scaled by COVERAGE: where only part of the blend carries a _paramh, only that part is a
+        // PBR material, and the rest keeps the legacy no-specular look it was authored with.
+        result += ((f0 * pbrSpecA + pbrSpecB)
+                   + env * pbrEnvBRDF(f0, pbrNoV, pbrRough)) * pbrCover;
+    }
 
     result = tonemapInPass(result);
     result = applyFog(result, In.WorldPos, In.Position.xy, In.Fog);
@@ -423,10 +795,55 @@ float4 PS_MAIN( VSOutput In )
         // this on: it is what carries the occlusion grass casts.
         RETURN(float4(aoAmbientTerm(aoSample.a, albedo, aoFlags), 1.0f));
     }
+    // The ISOLATION views (5 albedo / 6 lit / 7 ambient), same meaning and same order as
+    // opaque.frag's. ⚠ THIS LADDER DID NOT HANDLE THEM, which made them misleading rather than
+    // merely incomplete: the modes exist so that "surfaces Forge does NOT draw stay unchanged" is
+    // readable at a glance, and the ground — most of the screen outdoors — stayed FULLY SHADED in
+    // all three. So the one view that says "this is only the lighting" showed a fully textured
+    // world and read as if terrain were still on MW's own path. Same class of hole as mode 19.
+    //
+    // ⚠ THE ADDITIVE SPECULAR IS NOT IN MODE 6, on terrain OR on meshes. `lit`/`litTerm` is by
+    // definition the factor the albedo multiplies, and a GGX lobe is not that — it is added after.
+    // Excluding it is what keeps one keypress readable across the whole screen: if the ground showed
+    // its highlight here and the building next to it did not, the view would answer nothing. To
+    // isolate terrain specular, stay on mode 0 and toggle `pbrTerrain` — that A/B is live now.
+    //
+    // Raw linear values, un-tonemapped and un-fogged, exactly as opaque.frag returns them; fog on
+    // an isolated component would darken it toward a colour it has no business converging on.
+    if (dbg == 5u) { RETURN(float4(albedo, 1.0f)); }            // blended land texture x VCLR
+    if (dbg == 6u) { RETURN(float4(litTerm, 1.0f)); }           // sun + ambient + both point lists
+    if (dbg == 7u) { RETURN(float4(amb * tAmbW, 1.0f)); }       // the ambient half of mode 6
     if (dbg == 1u || dbg == 2u) {
         float dist = length(In.WorldPos - gFrameData.eyePos.xyz);
         float g = saturate(dist * (1.0f / 8192.0f));
         RETURN(float4(g, g, g, 1.0f));
+    }
+    if (dbg == 19u) {   // mode 19: PBR material COVERAGE on the ground
+        // ⚠ THIS LADDER DID NOT HANDLE 19, AND THAT ABSENCE IS HOW TERRAIN PBR SURFACED AT ALL:
+        // mode 19 did nothing on the ground because the ground never ran the material path. Same
+        // legend as opaque.frag's mode 19 so one key reads both surfaces:
+        //   grey   no `_paramh` — this land texture ships no material, and shades exactly as before
+        //   GREEN  `_paramh` material with cdblur relief
+        // It had four states while a baked `_paramd` arm existed (RED 8-bit only / YELLOW baked but
+        // unused / GREEN baked). That arm is retired, so every `_paramh` surface takes the same live
+        // gradient and the only per-surface question left is coverage.
+        // Partial coverage reads as a MIX toward grey, because on the ground it genuinely is one:
+        // the class is per land texture and up to four of them meet in a pixel. It is `pbrCover`, the
+        // same weight the shading multiplied — not a re-derivation at the ladder.
+        const float3 gNone = float3(0.10f, 0.10f, 0.11f);
+        const float3 gPbr  = float3(0.06f, 1.00f, 0.18f);
+        float3 srcCol = lerp(gNone, gPbr, saturate(pbrCover));
+        // A little shape so hills are identifiable, off the GEOMETRIC normal — the perturbed one
+        // would print the very relief this view exists to attribute, over the top of the answer.
+        const float3 vDir = normalize(gFrameData.eyePos.xyz - In.WorldPos);
+        RETURN(float4(srcCol * (0.55f + 0.45f * saturate(dot(normal, vDir))), 1.0f));
+    }
+    if (dbg == 21u) {   // mode 21: height AO visibility on the ground
+        // White = unoccluded, black = fully occluded. Reads WHITE everywhere with the knob off,
+        // which is the point: it is the same value the shading multiplied, not a re-derivation
+        // ([[feedback_publish_a_lane_where_every_view_copies_it]] — a view that recomputes its
+        // answer can agree with itself and disagree with the frame).
+        RETURN(float4(pbrHeightVis, pbrHeightVis, pbrHeightVis, 1.0f));
     }
     if (dbg == 20u) {   // mode 20: how many DISTINCT land textures blend at this pixel
         // A seam on the ground has two candidate causes and they need opposite fixes: the blend

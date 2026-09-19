@@ -153,7 +153,7 @@ namespace IPC {
     // to be invisible. MASK|HULL are also barred from the shadow-caster lists: a helper volume
     // casting its own shadow into the pit it opens would be nonsense.
     //
-    // Riding casterFlags' spare bits — no wire size change (DrawItemWire is a shipped-together 148).
+    // Riding casterFlags' spare bits — no wire size change (DrawItemWire is a shipped-together 144).
     constexpr std::uint32_t kDrawPortalMask   = 0x4;
     constexpr std::uint32_t kDrawPortalHull   = 0x8;
     constexpr std::uint32_t kDrawPortalMember = 0x10;
@@ -214,23 +214,12 @@ namespace IPC {
         // (and when the pbrEnable knob is off), so the failure mode is the OLD image, never a white
         // param map read as metal = 1.
         std::uint32_t paramTexIndex;
-        // ...and the BAKED DERIVATIVE MAP, `<base>_paramd.dds` (mgeHost64/pbrbake): BC5_SNORM,
-        // R = dH/du, G = dH/dv, per TEXEL, divided by a per-texture power-of-two range the file
-        // carries in its own DDS header. 0 = none, and none is the COMMON case — a derivative map
-        // exists only where the 16-bit source displacement still does (96 of the 209 shipped
-        // _paramh maps have no source left).
-        //
-        // A SECOND texture rather than more channels in the _paramh, because the two carry different
-        // things: _paramh keeps metal/rough/IOR and the HEIGHT, which parallax and height-blending
-        // need and a derivative cannot reconstruct, while this carries the slope at a precision the
-        // 8-bit height threw away. It costs a second bindless slot per material — see kMaxTextures.
-        std::uint32_t derivTexIndex;
     };
     // ⚠ This comment block said "112 bytes" for three field-additions after it stopped being true
-    // (emissiveGain and the lanes before it took it to 140; paramTexIndex made 144, derivTexIndex
-    // makes 148). A size stated in prose is a claim nothing checks, so the number now lives where
-    // the compiler reads it.
-    static_assert(sizeof(DrawItemWire) == 148, "DrawItemWire changed size: client and host must ship together");
+    // (emissiveGain and the lanes before it took it to 140; paramTexIndex made 144). A size stated in
+    // prose is a claim nothing checks, so the number now lives where the compiler reads it.
+    // (derivTexIndex, the baked `_paramd` slot, took it to 148 until that arm was RETIRED 2026-09-18.)
+    static_assert(sizeof(DrawItemWire) == 144, "DrawItemWire changed size: client and host must ship together");
 
     // MW's texture address mode, shipped raw (the shader's TEX_* defines use the same 4 values in
     // the same order, so nothing translates it anywhere along the way).
@@ -270,9 +259,13 @@ namespace IPC {
     // Bit 31 and not a new field: plain slots are < kMaxTextures and flip slots use bit 15 with
     // their bucket/layer in bits 0-14, so bits 16-31 of `slot` are free on every upload.
     constexpr std::uint32_t kTexUploadData = 0x80000000u;
+    // TexUploadWire::slot bit 30: RELEASE this plain slot (byteLen 0, no DDS follows). The client
+    // evicted it (evictStaleTextures: no live part names it, unsampled for a while); the host
+    // retires the texture after the frame fence and points the slot back at the default white.
+    constexpr std::uint32_t kTexUploadRelease = 0x40000000u;
 
     struct TexUploadWire {
-        std::uint32_t slot;       // bindless slot (or encoded flip slot); bit 31 = kTexUploadData
+        std::uint32_t slot;       // bindless slot (or encoded flip slot); bit 31 = kTexUploadData, bit 30 = kTexUploadRelease
         std::uint32_t byteLen;    // length of the DDS blob that follows inline
         // FLIP-BOOK ARRAY SLICES ONLY (slot & kFlipSlotFlag): total slice count of the
         // Texture2DArray this slice belongs to. Every slice of a bucket carries the SAME value, so

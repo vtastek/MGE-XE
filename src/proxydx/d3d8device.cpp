@@ -192,6 +192,15 @@ void _stdcall ProxyDevice::GetGammaRamp(D3DGAMMARAMP* a) {
 }
 
 HRESULT _stdcall ProxyDevice::CreateTexture(UINT a, UINT b, UINT c, DWORD d, D3DFORMAT e, D3DPOOL f, IDirect3DTexture8** g) {
+    // The map cap (d3d8texture.h): only what Morrowind LOADS -- a GPU-pool texture with no usage
+    // flags and a mip chain -- never a target, a dynamic texture, or anything single-level.
+    // Morrowind loads through a PAIR (census, 2026-09-19): a SYSTEMMEM texture it fills, and a DEFAULT
+    // usage-0 twin of the same size and chain that it fills with UpdateTexture; it creates no MANAGED
+    // textures at all. The DEFAULT twin is the VRAM, so that is what is capped. The SYSTEMMEM source
+    // keeps its full chain, and UpdateTexture copies its bottom levels into the shorter chain
+    // (DXVK matches a longer source to a shorter destination by the bottom mips; see UpdateTexture).
+    const UINT skip = ((f == D3DPOOL_DEFAULT || f == D3DPOOL_MANAGED) && d == 0)
+                    ? proxyTextureCapSkip(a, b, c, e) : 0u;
     // Spike (D3D9Ex): MANAGED is invalid on Ex. Move to DEFAULT and add DYNAMIC so the
     // engine's LockRect uploads still work (managed textures are lockable; default ones
     // are only lockable when dynamic). Render targets / depth aren't created here.
@@ -200,12 +209,36 @@ HRESULT _stdcall ProxyDevice::CreateTexture(UINT a, UINT b, UINT c, DWORD d, D3D
         d |= D3DUSAGE_DYNAMIC;
     }
     IDirect3DTexture9* g_real = NULL;
-    HRESULT hr = realDevice->CreateTexture(a, b, c, d, e, f, &g_real, NULL);
+    HRESULT hr = D3DERR_INVALIDCALL;
+    if (skip) {
+        const UINT ra = a >> skip, rb = b >> skip, rc = c ? c - skip : 0u;
+        hr = realDevice->CreateTexture(ra, rb, rc, d, e, f, &g_real, NULL);
+    }
+    const UINT keptSkip = (hr == D3D_OK && g_real) ? skip : 0u;   // a refused capped create goes whole
+    if (!keptSkip) {
+        g_real = NULL;
+        hr = realDevice->CreateTexture(a, b, c, d, e, f, &g_real, NULL);
+    }
     if (hr != D3D_OK || g_real == NULL) {
         return hr;
     }
 
-    *g = factoryProxyTexture(g_real);
+    ProxyTexture* pt = static_cast<ProxyTexture*>(factoryProxyTexture(g_real));
+    const UINT realLevels = g_real->GetLevelCount();
+    if (keptSkip) {
+        pt->capArm(keptSkip, a, b, e);
+        ProxyTexLedger& L = proxyTexLedger();
+        ++L.capCount;
+        L.capSavedBytes += proxyTextureBytes(a, b, realLevels + keptSkip, e)
+                         - proxyTextureBytes(a >> keptSkip, b >> keptSkip, realLevels, e);
+    }
+    // Meter it (tasks/forge-memory-shape.md): GPU pools only, sized from the REAL texture, so a
+    // c = 0 "full chain" request is priced as the chain it actually got, and a capped one as what
+    // is actually resident.
+    if (f == D3DPOOL_DEFAULT || f == D3DPOOL_MANAGED) {
+        pt->ledgerTrack(proxyTextureBytes(a >> keptSkip, b >> keptSkip, realLevels, e));
+    }
+    *g = pt;
     return D3D_OK;
 }
 
@@ -284,9 +317,25 @@ HRESULT _stdcall ProxyDevice::CopyRects(IDirect3DSurface8* a, const RECT* b, UIN
 }
 
 HRESULT _stdcall ProxyDevice::UpdateTexture(IDirect3DBaseTexture8* a, IDirect3DBaseTexture8* b) {
-    IDirect3DTexture9* a_real = static_cast<ProxyTexture*>(a)->realTexture;
-    IDirect3DTexture9* b_real = static_cast<ProxyTexture*>(b)->realTexture;
-    return realDevice->UpdateTexture(a_real, b_real);
+    ProxyTexture* src = static_cast<ProxyTexture*>(a);
+    ProxyTexture* dst = static_cast<ProxyTexture*>(b);
+    HRESULT hr = realDevice->UpdateTexture(src->realTexture, dst->realTexture);
+    // A capped destination (the map cap) has fewer levels than its full-chain SYSTEMMEM source; the
+    // copy lands the source's bottom levels, which are exactly the kept ones. This is how Morrowind
+    // fills its textures, so it is the cap's receipt -- and a refusal here is a BLANK texture.
+    if (dst->capSkip) {
+        if (hr == D3D_OK) {
+            dst->capNoteFilled();
+        } else {
+            static unsigned s_refused = 0;
+            if (s_refused++ < 8) {
+                LOG::logline("!! [mwcap] UpdateTexture REFUSED 0x%08X into a capped %ux%u (skip %u) -- the"
+                             " texture is blank on Morrowind's side", (unsigned)hr, dst->capWidth,
+                             dst->capHeight, dst->capSkip);
+            }
+        }
+    }
+    return hr;
 }
 
 HRESULT _stdcall ProxyDevice::SetRenderTarget(IDirect3DSurface8* a, IDirect3DSurface8* b) {

@@ -24,7 +24,6 @@ STRUCT(VSInput)
     DATA(uint,   OverlayIndex,TEXCOORD6);   // per-instance: terrain DECAL_1 bindless slot (0 = none)
     DATA(float3, EmisGain,   TEXCOORD7);    // per-instance: emissive flux/area gain — a RATIO, never decoded
     DATA(uint,   ParamIndex, TEXCOORD8);    // per-instance: PBR _paramh bindless slot (0 = no PBR material)
-    DATA(uint,   DerivIndex, TEXCOORD9);    // per-instance: PBR _paramd slot | (range exp + 128) << 16
 };
 
 STRUCT(VSOutput)
@@ -56,9 +55,6 @@ STRUCT(VSOutput)
     // ([[project_forge_shared_frag_vsoutput]]: a frag reading a field its vert never wrote is a
     // bindless index into garbage, and a GPU hang).
     DATA(FLAT(uint),  ParamIndex, TEXCOORD12);
-    // The baked derivative map, packed with its per-texture range exponent (pbrDerivSlotFor). Same
-    // append-only rule and the same hazard as ParamIndex above: skinned.vert carries it pinned to 0.
-    DATA(FLAT(uint),  DerivIndex, TEXCOORD13);
     // Real water reflection (IR3): below-water clip, the same mechanism statics.vert/terrain.vert
     // already use. Pass-all (0,0,0,1) in every frame cbuffer EXCEPT pReflectFrameCbvGeo → a constant
     // Clip = 1 >= 0 (nothing clipped) in the main/FP/sun/shadow-face passes. In the mirror it keeps
@@ -167,7 +163,6 @@ VSOutput VS_MAIN( VSInput In )
     Out.OverlayIndex = In.OverlayIndex;   // terrain DECAL_1 slot (0 = no decal)
     Out.DrawIdx      = drawIndex;         // side-table index (alpha.frag -> gAlphaStages)
     Out.ParamIndex   = In.ParamIndex;     // PBR _paramh slot (0 = shade exactly as before)
-    Out.DerivIndex   = In.DerivIndex;     // PBR _paramd slot | range exponent (0 = no baked map)
     // MW near fog (per-vertex, as FFE): dist is camera distance = |worldPos - eye| (the view
     // transform is rigid, so this equals length(viewpos)). fog = saturate((end-dist)/(end-start)).
     float dist = length(worldPos.xyz - gFrameData.eyePos.xyz);

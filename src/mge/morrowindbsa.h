@@ -21,4 +21,12 @@ namespace BSA {
     // downscaled copies blur near geometry); resolve loose Data Files -> BSA like the engine's
     // near renderer. The Forge near-texturing path passes true.
     bool loadFileBytes(const char* filename, void** outData, unsigned* outSize, bool skipDistantStatics = false);
+
+    // Would loadFileBytes(filename, ..., skipDistantStatics) find it? Same name substitution and
+    // source order, but touches no file contents: loose files by attribute, BSAs by their index.
+    bool fileExists(const char* filename, bool skipDistantStatics = false);
+
+    // ONLY the distantland\statics LOD copy of a texture (the downscaled one the DL bake wrote), or
+    // false if the bake made none. Same naming as loadFileBytes; *outData is malloc'd.
+    bool loadDistantLodBytes(const char* filename, void** outData, unsigned* outSize);
 }

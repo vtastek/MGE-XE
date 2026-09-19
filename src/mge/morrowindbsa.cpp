@@ -300,6 +300,49 @@ bool loadFileBytes(const char* filename, void** outData, unsigned* outSize, bool
     return loadFileBytesExact(pathbuf, outData, outSize, skipDistantStatics);
 }
 
+// existsExact - loadFileBytesExact's source order, by attribute and BSA index only.
+static bool existsExact(const char* filename, bool skipDistantStatics) {
+    char pathbuf[MAX_PATH];
+    if (!skipDistantStatics) {
+        std::snprintf(pathbuf, sizeof(pathbuf), "Data Files\\distantland\\statics\\%s", filename);
+        if (GetFileAttributes(pathbuf) != INVALID_FILE_ATTRIBUTES) { return true; }
+    }
+    std::snprintf(pathbuf, sizeof(pathbuf), "Data Files\\%s", filename);
+    if (GetFileAttributes(pathbuf) != INVALID_FILE_ATTRIBUTES) { return true; }
+    return cacheMap.find(hashString(filename).LValue) != cacheMap.end();
+}
+
+bool fileExists(const char* filename, bool skipDistantStatics) {
+    char pathbuf[MAX_PATH];
+    std::snprintf(pathbuf, sizeof(pathbuf), "textures\\%s", filename);
+    size_t len = strlen(pathbuf);
+    if (len >= 3) {
+        std::strcpy(pathbuf + len - 3, "dds");
+        if (existsExact(pathbuf, skipDistantStatics)) { return true; }
+    }
+    std::snprintf(pathbuf, sizeof(pathbuf), "textures\\%s", filename);
+    return existsExact(pathbuf, skipDistantStatics);
+}
+
+bool loadDistantLodBytes(const char* filename, void** outData, unsigned* outSize) {
+    char pathbuf[MAX_PATH];
+    for (int pass = 0; pass < 2; ++pass) {
+        std::snprintf(pathbuf, sizeof(pathbuf), "Data Files\\distantland\\statics\\textures\\%s", filename);
+        size_t len = strlen(pathbuf);
+        if (pass == 0) {
+            if (len < 3) { continue; }
+            std::strcpy(pathbuf + len - 3, "dds");
+        }
+        HANDLE h = CreateFile(pathbuf, GENERIC_READ, FILE_SHARE_READ, 0, OPEN_EXISTING, 0, 0);
+        if (h != INVALID_HANDLE_VALUE) {
+            bool ok = readWholeFileMalloc(h, outData, outSize);
+            CloseHandle(h);
+            if (ok) { return true; }
+        }
+    }
+    return false;
+}
+
 // clearTextureCache - Clear texture cache.
 void clearTextureCache() {
     loadedTextures.clear();

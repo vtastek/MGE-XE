@@ -1106,11 +1106,32 @@ namespace MGEgui.DistantLand {
                 var stc = new StaticTexCreator(pixelsPerWorld, 64, args.FixMips);
                 int vert_size = NativeMethods.GetCompressedVertSize(), face_size = 6;
 
+                // Per-NIF LARGEST INSTANCE SCALE. The node radius below is the BASE MESH's, so a rock
+                // the world places at 3x used to be sized as if it were 1x, and it is exactly the big
+                // statics that the sizing exists for (user, 2026-09-20: "big statics ... DL is not
+                // picking the right texel density for them"). The deferred refinement in
+                // tasks/forge-dl-lod-textures.md; the references are still in memory here.
+                var nifMaxScale = new Dictionary<string, float>();
+                foreach (var cellStatics in UsedStaticsList) {
+                    foreach (var pair in cellStatics.Value) {
+                        string nifName = StaticsList[pair.Value.Name].Model;
+                        float refScale = pair.Value.Scale > 0.0f ? pair.Value.Scale : 1.0f;
+                        float prevScale;
+                        if (!nifMaxScale.TryGetValue(nifName, out prevScale) || refScale > prevScale) {
+                            nifMaxScale[nifName] = refScale;
+                        }
+                    }
+                }
+
                 // Phase 1: walk the mesh library, record the largest bounding size per texture.
                 var texMaxExtent = new Dictionary<string, float>();
                 var texFirstName = new Dictionary<string, string>();
                 using (var br = new BinaryReader(File.OpenRead(Statics.fn_statmesh), Statics.ESPEncoding)) {
                     foreach (var name in UsedNifList) {
+                        float nifScale;
+                        if (!nifMaxScale.TryGetValue(name, out nifScale) || nifScale <= 0.0f) {
+                            nifScale = 1.0f;
+                        }
                         int nodes = br.ReadInt32();
                         br.BaseStream.Position += 16; // Byte count: 4 - radius, 12 - center
                         int type = br.BaseStream.ReadByte();
@@ -1126,7 +1147,7 @@ namespace MGEgui.DistantLand {
                             br.BaseStream.Position += 1;
 
                             if (type != (int)StaticType.Grass && type != (int)StaticType.Tree) {
-                                float extent = 2.0f * radius;
+                                float extent = 2.0f * radius * nifScale;
                                 float prev;
                                 if (!texMaxExtent.TryGetValue(path, out prev) || extent > prev) {
                                     texMaxExtent[path] = extent;
@@ -1154,6 +1175,7 @@ namespace MGEgui.DistantLand {
                 dlSliced = stc.Sliced;
                 dlResampled = stc.Resampled;
                 dlMagenta = stc.Magenta;
+                dlParamMaps = stc.ParamMaps;
                 dlMagentaPaths = stc.MagentaPaths;
                 dlResampledPaths = stc.ResampledPaths;
                 dlMipFixed = stc.MipFixed;
@@ -1171,7 +1193,7 @@ namespace MGEgui.DistantLand {
 
         // Distant-statics LOD-texture report (populated by workerCreateStatics)
         private long dlStaticsTexMs;
-        private int dlSliced, dlResampled, dlMagenta;
+        private int dlSliced, dlResampled, dlMagenta, dlParamMaps;
         private List<string> dlMagentaPaths;
         private List<string> dlResampledPaths;
         private int dlMipFixed, dlMipFixSkippedBsa;
@@ -1254,6 +1276,7 @@ namespace MGEgui.DistantLand {
                 + "Total processed cells: " + cells + "\r\n"
                 + "Total unique statics: " + (statics - 2);*/
             summary += "\r\n\r\nDistant statics textures: " + dlSliced + " sliced, " + dlResampled + " resampled, " + dlMagenta + " magenta (non-DDS), " + dlMipFixed + " mip-fixed"
+                     + "\r\n  of those, " + dlParamMaps + " PBR companion maps (_paramh)"
                      + "\r\nDistant textures stage: " + dlStaticsTexMs + " ms";
             summary += "\r\nBaked distant lights: " + dlLightsBaked + " (" + dlLightsMeshless + " meshless, " + dlLightsSkipped + " skipped negative/off-by-default)";
             if (dlProcGrass) {
@@ -1415,7 +1438,7 @@ namespace MGEgui.DistantLand {
             + ": To use a ':' (colon) character as a part of object edid, and not a comment, you must precede it by '\\'. Then to use also a '\\' character in edid, you must precede it by another '\\' (this only applies to other than main sections)\r\n"
             + "\r\n"
             + ": NOTE: This file needs UTF-8 character encoding for non-ASCII characters that can be used in name of file or entity or interior\r\n"
-            + ": If you don't see here 'ï¿½ï¿½' something like '<<>>' then your text editor's current character encoding is not set to UTF-8\r\n");
+            + ": If you don't see here '«»' something like '<<>>' then your text editor's current character encoding is not set to UTF-8\r\n");
             sw.Write(": This list was generated with 'min. static size' = ");
             sw.WriteLine(args.MinSize);
             sw.WriteLine();
@@ -2496,7 +2519,7 @@ namespace MGEgui.DistantLand {
 
         private void bStatRun_Click(object sender, EventArgs e) {
             if (StaticsExist) {
-                // âš  Everything in this folder is ours EXCEPT grass.bin, which mgeBake64 --grass
+                // !! Everything in this folder is ours EXCEPT grass.bin, which mgeBake64 --grass
                 // writes. A recursive delete took it with it, and the failure was silent: the bake
                 // succeeds, the host logs "grass.bin missing", and the world simply has no grass.
                 string keep = Path.GetFullPath(Statics.fn_grassbin);
@@ -3091,8 +3114,8 @@ namespace MGEgui.DistantLand {
         /* Finish tab methods */
 
         private void setFinishDesc(int stage) {
-            const string spc = "ï¿½ï¿½ï¿½";
-            const string mark = "ï¿½ï¿½";
+            const string spc = "   ";
+            const string mark = "» ";
             var text = new StringBuilder();
 
             if (SetupFlags["ChkLandTex"]) {

@@ -3,9 +3,11 @@
 #include "mged3d8device.h"
 #include "configuration.h"
 #include "proxydx/devicelock.h"
+#include "proxydx/texledger.h"
 #include "support/log.h"
 
 #include <algorithm>
+#include <cstdlib>
 
 
 
@@ -167,6 +169,24 @@ HRESULT _stdcall MGEProxyD3D::CreateDevice(UINT a, D3DDEVTYPE b, HWND c, DWORD d
     }
 
     *f = factoryProxyDevice(realDevice);
+
+    // THE MAP CAP (tasks/forge-memory-shape.md). Under Forge, Morrowind's own textures serve the
+    // local map (top-down, where a boulder is a few pixels) and the inventory doll; the host
+    // samples its own full-resolution copies from disk. Measured fresh: 640 MB of Morrowind.exe's
+    // VRAM was 62 textures at 2048^2+, and that VRAM comes straight off the host's DXGI budget.
+    // Armed before Morrowind loads a single world texture. (The alternative, dropping Morrowind's
+    // texture loads outright, would blank the local map; skipping mips keeps it, at map scale.) MGE_MW_TEX_CAP=0 turns it off (e.g.
+    // for a like-for-like F11 look at the DX9 path, which draws with these textures too).
+    if (Configuration.UseRenderProcess) {
+        uint32_t cap = 512u;
+        char env[32] = {};
+        if (GetEnvironmentVariableA("MGE_MW_TEX_CAP", env, sizeof(env)) > 0) {
+            cap = (uint32_t)std::strtoul(env, nullptr, 10);
+        }
+        g_proxyTexCapDim = cap;
+        LOG::logline(">> [mwcap] Morrowind texture cap %u (mip-mapped GPU-pool textures above it drop"
+                     " their top levels; MGE_MW_TEX_CAP overrides, 0 = off)", cap);
+    }
 
     // Set up default render states
     Configuration.ScaleFilter = (Configuration.AnisoLevel > 0) ? D3DTEXF_ANISOTROPIC : D3DTEXF_LINEAR;

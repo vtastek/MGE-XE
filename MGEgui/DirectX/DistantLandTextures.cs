@@ -171,6 +171,7 @@ namespace MGEgui.DirectX {
         public int Magenta = 0;
         public int MipFixed = 0;
         public int MipFixSkippedBsa = 0;
+        public int ParamMaps = 0;       // _paramh / _paramh_np companions emitted alongside a base
         public readonly System.Collections.Generic.List<string> ResampledPaths = new System.Collections.Generic.List<string>();
         public readonly System.Collections.Generic.List<string> MagentaPaths = new System.Collections.Generic.List<string>();
         public readonly System.Collections.Generic.List<string> MipFixedPaths = new System.Collections.Generic.List<string>();
@@ -205,7 +206,27 @@ namespace MGEgui.DirectX {
         // extent = world-space size (2 * bounding radius) of the LARGEST static using this texture.
         // The LOD texture is sized to the object's projected screen size at the switch, one mip
         // above (x2) for safety -- so the LOD can only ever be sharper than the near view.
+        //
+        // The PBR companion maps ride along (user, 2026-09-20: "what if paramh can be in DL too?").
+        // Two consumers want them here. (1) The near path streams first-sight textures and uses this
+        // library as the stand-in until the full file lands; without a companion copy a _paramh has
+        // nothing to stand in for it, so PBR switches on in one frame instead of being there from the
+        // start. (2) Distant statics shade with albedo only today, so a big object crossing the
+        // near->distant switch drops its roughness and relief -- the data has to exist before that
+        // can be fixed. Emitted under their OWN names (_paramh / _paramh_np), which is what both the
+        // near resolver and the host look up.
         public bool LoadTexture(string path, float extent) {
+            bool ok = EmitLod(path, extent, false);
+            string stem = System.IO.Path.ChangeExtension(path, null);
+            EmitLod(stem + "_paramh.dds", extent, true);
+            EmitLod(stem + "_paramh_np.dds", extent, true);
+            return ok;
+        }
+
+        // isParam: a _paramh companion. Its RGB is metal/rough/IOR and its alpha is height, so a
+        // magenta placeholder would be a garbage material rather than a visible marker -- a missing
+        // companion is the normal case and simply produces no file.
+        private bool EmitLod(string path, float extent, bool isParam) {
             if (!texCache.Add(path)) {
                 return true;
             }
@@ -233,6 +254,9 @@ namespace MGEgui.DirectX {
             // Non-DDS -> magenta placeholder so modders can see the asset isn't an optimized DDS.
             bool isDDS = data.Length >= 128 && data[0] == 0x44 && data[1] == 0x44 && data[2] == 0x53 && data[3] == 0x20;
             if (!isDDS) {
+                if (isParam) {
+                    return false;   // see EmitLod's header: never magenta a material map
+                }
                 if (WriteMagenta(outputPath, targetDim)) {
                     Magenta++;
                     MagentaPaths.Add(path);
@@ -310,15 +334,17 @@ namespace MGEgui.DirectX {
                         : curW * curH * blockSize;
                     if (offset + targetMipSize <= data.Length && WriteSlicedDDS(outputPath, data, offset, curW, curH, targetMipSize, mipCount - k)) {
                         Sliced++;
+                        if (isParam) { ParamMaps++; }
                         return true;
                     }
                 }
             }
 
             // No / incomplete mips: decode the finest level present and downsample to targetDim.
+            // A companion keeps its DXT3/DXT5 format here, so its alpha (height) survives.
             if (ResampleTexture(outputPath, data, targetDim)) {
                 Resampled++;
-                ResampledPaths.Add(path);
+                if (isParam) { ParamMaps++; } else { ResampledPaths.Add(path); }
                 return true;
             }
             return false;

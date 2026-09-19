@@ -116,6 +116,10 @@ namespace Terrain {
         std::unordered_map<std::string, BsaEntry>    g_bsaTex;    // "textures\sub\name.dds" -> entry
         std::vector<HANDLE>      g_bsaHandles;
         std::vector<uint8_t>     g_texScratch;                    // readLandTextureFile's one buffer
+        // ...and readLandCompanionFile's, which is a SECOND buffer on purpose: the residency build
+        // reads a base texture's header and then asks what _paramh sits beside it, so a
+        // shared buffer would invalidate the base bytes it is still holding.
+        std::vector<uint8_t>     g_companionScratch;
         bool                     g_texIndexBuilt = false;
 
         uint64_t packKey(int32_t x, int32_t y) {
@@ -220,21 +224,27 @@ namespace Terrain {
             }
         }
 
-        bool readLoose(const std::string& fullPath, std::vector<uint8_t>& out) {
+        // maxBytes 0 = the whole file. A prefix read is not an optimisation detail here: the
+        // residency build's planning pass wants only the DDS header, and these files run to 22 MB.
+        // The `assign` below is what actually faults the mapping in, so a short copy is a short read.
+        bool readLoose(const std::string& fullPath, std::vector<uint8_t>& out, uint32_t maxBytes = 0) {
             MappedFile mf;
             if (!mf.open(fullPath.c_str())) { return false; }
-            out.assign(mf.data, mf.data + (size_t)mf.size);
+            const size_t n = (maxBytes && (uint64_t)maxBytes < (uint64_t)mf.size)
+                           ? (size_t)maxBytes : (size_t)mf.size;
+            out.assign(mf.data, mf.data + n);
             return true;
         }
 
-        bool readBsa(const BsaEntry& e, std::vector<uint8_t>& out) {
+        bool readBsa(const BsaEntry& e, std::vector<uint8_t>& out, uint32_t maxBytes = 0) {
             if (e.archive >= g_bsaHandles.size()) { return false; }
             HANDLE h = g_bsaHandles[e.archive];
             LARGE_INTEGER li; li.QuadPart = (LONGLONG)e.offset;
             if (!SetFilePointerEx(h, li, nullptr, FILE_BEGIN)) { return false; }
-            out.resize(e.size);
+            const uint32_t n = (maxBytes && maxBytes < e.size) ? maxBytes : e.size;
+            out.resize(n);
             DWORD got = 0;
-            if (!ReadFile(h, out.data(), e.size, &got, nullptr) || got != e.size) { return false; }
+            if (!ReadFile(h, out.data(), n, &got, nullptr) || got != n) { return false; }
             return true;
         }
 
@@ -698,6 +708,29 @@ namespace Terrain {
     uint32_t looseTextureCount() { return (uint32_t)g_looseTex.size(); }
     uint32_t bsaTextureCount()   { return (uint32_t)g_bsaTex.size(); }
 
+    // ALL the loose keys, then all the BSA ones — the DL generator's precedence, and the order
+    // matters more than the key count: a loose as-recorded .tga must still beat a BSA .dds.
+    // Factored out so readLandTextureFile and readLandCompanionFile cannot drift apart on it.
+    static const uint8_t* readFirstTextureKey(const std::string* keys, size_t n,
+                                              std::vector<uint8_t>& scratch, uint32_t* sizeOut,
+                                              uint32_t maxBytes = 0) {
+        for (size_t i = 0; i < n; ++i) {
+            auto it = g_looseTex.find(keys[i]);
+            if (it != g_looseTex.end() && readLoose(it->second, scratch, maxBytes)) {
+                if (sizeOut) { *sizeOut = (uint32_t)scratch.size(); }
+                return scratch.data();
+            }
+        }
+        for (size_t i = 0; i < n; ++i) {
+            auto it = g_bsaTex.find("textures\\" + keys[i]);
+            if (it != g_bsaTex.end() && readBsa(it->second, scratch, maxBytes)) {
+                if (sizeOut) { *sizeOut = (uint32_t)scratch.size(); }
+                return scratch.data();
+            }
+        }
+        return nullptr;
+    }
+
     const uint8_t* readLandTextureFile(uint32_t texId, uint32_t* sizeOut) {
         if (sizeOut) { *sizeOut = 0; }
         buildTextureIndex();
@@ -711,21 +744,22 @@ namespace Terrain {
 
         // Same precedence as the DL generator: loose .dds, loose as-recorded, BSA .dds, BSA as-recorded.
         const std::string tries[2] = { dds, name };
-        for (const std::string& key : tries) {
-            auto it = g_looseTex.find(key);
-            if (it != g_looseTex.end() && readLoose(it->second, g_texScratch)) {
-                if (sizeOut) { *sizeOut = (uint32_t)g_texScratch.size(); }
-                return g_texScratch.data();
-            }
-        }
-        for (const std::string& key : tries) {
-            auto it = g_bsaTex.find("textures\\" + key);
-            if (it != g_bsaTex.end() && readBsa(it->second, g_texScratch)) {
-                if (sizeOut) { *sizeOut = (uint32_t)g_texScratch.size(); }
-                return g_texScratch.data();
-            }
-        }
-        return nullptr;
+        return readFirstTextureKey(tries, 2, g_texScratch, sizeOut);
+    }
+
+    const uint8_t* readLandCompanionFile(uint32_t texId, const char* suffix, uint32_t* sizeOut,
+                                         uint32_t maxBytes) {
+        if (sizeOut) { *sizeOut = 0; }
+        buildTextureIndex();
+        if (texId >= g_texNames.size() || !suffix) { return nullptr; }
+
+        const std::string name = lower(g_texNames[texId]);
+        const size_t dot = name.find_last_of('.');
+        const std::string stem = (dot == std::string::npos) ? name : name.substr(0, dot);
+        // The stem keeps any subpath (`hf\lnd\foo`), so the companion is looked for BESIDE its base
+        // rather than in the textures root — which is where a mod that ships both would put it.
+        const std::string key = stem + lower(suffix);
+        return readFirstTextureKey(&key, 1, g_companionScratch, sizeOut, maxBytes);
     }
 
 }

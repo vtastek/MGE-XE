@@ -148,6 +148,19 @@ if [ -n "$SCALE" ]; then
   echo "[harness] render scale = ${SCALE}x (MGE_RENDER_SCALE)"
   ENVSET="${ENVSET}\$env:MGE_RENDER_SCALE='$SCALE'; "
 fi
+# AUTO-DISMISS the startup confirmation dialogs (mgeHost64/autodismiss -> mods/mgexe/autodismiss).
+# The pinned baseline saves predate the current plugin list, so tes3.loadGame raises a "content
+# files have changed" MenuMessage and, with nobody at the keyboard of a MINIMIZED window, the run
+# sits at it until timeout: the host logs `sceneReady=0`, never gets a scene, and reports 0 samples.
+# That is indistinguishable in the log from a host hang, which is how several terrain-PBR A/B runs
+# were lost to a hunt for a rendering bug that did not exist.
+#
+# Keystrokes cannot do this: Morrowind reads the keyboard through DirectInput, which never sees a
+# PostMessage'd WM_KEYDOWN, so dismissing it from outside would mean stealing focus — the one thing
+# this harness exists to avoid. The mod presses the button through MWSE instead, and disarms itself
+# the moment the save is loaded so it can never reach an in-game dialog.
+ENVSET="${ENVSET}\$env:MGE_AUTODISMISS='1'; "
+
 # ALWAYS written, even when empty — a stale MGE_HOST_KNOBS left in the user environment would ride
 # along in every run exactly the way MGE_RDOC did for three days, and the arm would be mislabelled.
 if [ -n "$KNOBS" ]; then
@@ -157,6 +170,21 @@ else
   ENVSET="${ENVSET}Remove-Item Env:MGE_HOST_KNOBS -ErrorAction SilentlyContinue; "
 fi
 powershell.exe -Command "${ENVSET}Start-Process -FilePath 'Morrowind.exe' -WorkingDirectory '$WINDIR' -WindowStyle Minimized" >/dev/null 2>&1
+
+# A watcher for Morrowind's NATIVE warning boxes (Win32 #32770), kept as cheap insurance.
+#
+# ⚠ IT IS NOT THE FIX FOR THE 0-SAMPLE RUNS, AND THE DIALOG THEORY THAT BUILT IT WAS WRONG.
+# Enumerating EVERY top-level window of a stuck Morrowind.exe found no dialog of any class — only
+# the main 'Morrowind' window plus invisible IME/d3d helpers. So there is nothing to dismiss and
+# nothing a keystroke could have reached either. What actually happens: `tes3.loadGame` sometimes
+# raises "Local count for script 'sleeperScript' (Patch for Purists.esm)' differs from local count
+# for saved reference data" and ABORTS the load, leaving the game at the main menu; on other
+# launches, same save and same env, the warning does not fire and the load succeeds. It is a race,
+# not a modal box — which is why the retry below is the real mitigation.
+DISMISS_LOG="$(mktemp)"
+powershell.exe -ExecutionPolicy Bypass -File "$(wslpath -w "$(dirname "$0")/dismiss-dialogs.ps1")" \
+  -Seconds "$((TIMEOUT + 20))" > "$DISMISS_LOG" 2>&1 &
+DISMISS_PID=$!
 echo "[harness] launched Morrowind; polling..."
 
 t0=$(date +%s)
@@ -239,6 +267,16 @@ tail -n +$((cstartlines + 1)) "$CLOG" 2>/dev/null \
   | tail -12 || echo "  (no client heartbeats)"
 
 fi
+
+if [ -n "${DISMISS_PID:-}" ]; then
+  kill "$DISMISS_PID" 2>/dev/null
+  wait "$DISMISS_PID" 2>/dev/null
+fi
+if [ -s "${DISMISS_LOG:-/dev/null}" ] && grep -q "posting IDOK" "${DISMISS_LOG:-/dev/null}" 2>/dev/null; then
+  echo "=== dialogs dismissed (this run needed rescuing — the save has drifted) ==="
+  grep "posting IDOK" "$DISMISS_LOG" | head -6
+fi
+rm -f "${DISMISS_LOG:-}" 2>/dev/null
 
 echo "[harness] killing procs..."
 powershell.exe -Command "Stop-Process -Name Morrowind,mgeHost64 -Force -ErrorAction SilentlyContinue" >/dev/null 2>&1

@@ -187,6 +187,13 @@ PSOut PS_MAIN( VSOutput In )
         sunVis = sunShadowVisibilityMode(shadowPos, nFace, (smode == 1u) ? 1 : 0);
     }
     float3 result = tex.rgb * (In.Color.rgb + In.SunLight * sunVis);
+    // The FACTOR `tex.rgb` multiplies, for F12 5/6/7 — accumulated in parallel rather than obtained
+    // by refactoring `result` into `tex.rgb * (a + b)`, because `a*b + a*c` is not bit-identical to
+    // `a*(b+c)` and grass is a large-area surface. Same expression tree as the one above, so the
+    // initialiser folds away as a common subexpression: MEASURED at +3 DXIL instructions for the
+    // whole of modes 5/6/7 here (3514 -> 3517), i.e. exactly the one vector add below and nothing
+    // for this line. See terrain.frag for the full note.
+    float3 litTerm = In.Color.rgb + In.SunLight * sunVis;
 
     // Point lights, off the same camera-relative sets every other host surface reads.
     //
@@ -199,7 +206,9 @@ PSOut PS_MAIN( VSOutput In )
     // dynamic lights at all. Grass draws from the player's feet outward, so distant-only meant "no
     // point lights on grass" in every case anyone would test. Terrain hit the identical bug.
     if (gShadowParams.grassParams5.z > 0.5f) {
-        result += tex.rgb * evalPointLightNearFar(In.WorldPos, nFace, In.Position.xy);
+        const float3 pt = evalPointLightNearFar(In.WorldPos, nFace, In.Position.xy);
+        result  += tex.rgb * pt;
+        litTerm += pt;
     }
 
     result = tonemapInPass(result);
@@ -218,6 +227,16 @@ PSOut PS_MAIN( VSOutput In )
         Out.Color = float4(g, g, g, 1.0f);
         RETURN(Out);
     }
+    // ...and the ISOLATION views (5 albedo / 6 lit / 7 ambient), same meaning as opaque.frag's.
+    // Grass is here because of WHERE IT SITS, not for completeness: it covers the ground, and the
+    // ground is the surface these modes were just wired onto. With grass left out, mode 6 outdoors
+    // showed pure lighting on the terrain with fully-textured blades standing all over it — which
+    // reads as "grass is still on MW's path" and is the exact wrong answer this view exists to give.
+    if (dbg == 5u) { Out.Color = float4(tex.rgb, 1.0f);      RETURN(Out); }
+    if (dbg == 6u) { Out.Color = float4(litTerm, 1.0f);      RETURN(Out); }
+    // Ambient here is grass.vert's In.Color, which already carries the root-AO darkening — so this
+    // is also the view that shows that term on its own.
+    if (dbg == 7u) { Out.Color = float4(In.Color.rgb, 1.0f); RETURN(Out); }
     Out.Color = float4(result, 1.0f);
     RETURN(Out);
 }

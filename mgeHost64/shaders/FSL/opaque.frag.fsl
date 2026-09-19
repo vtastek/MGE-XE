@@ -44,9 +44,6 @@ STRUCT(VSOutput)
     // PBR _paramh bindless slot (tasks/forge-pbr-materials.md). 0 = no PBR material: the draw takes
     // exactly the pre-PBR arithmetic. skinned.vert pins it to 0.
     DATA(FLAT(uint),  ParamIndex, TEXCOORD12);
-    // PBR baked derivative map: slot in the low 16 bits, range exponent + 128 in bits 16-23.
-    // 0 = none, which is the common case and takes the runtime gradient exactly as before.
-    DATA(FLAT(uint),  DerivIndex, TEXCOORD13);
 };
 
 ROOT_SIGNATURE(DefaultRootSignature)
@@ -78,28 +75,16 @@ float4 PS_MAIN( VSOutput In )
     float3 pbrSpecB  = float3(0.0f, 0.0f, 0.0f);
     float3 pbrTSun   = float3(1.0f, 1.0f, 1.0f);
     float3 pbrTAmb   = float3(1.0f, 1.0f, 1.0f);
-    // Which gradient source this draw ACTUALLY took, for F12 mode 19. Set from inside the branch,
-    // not recomputed at the ladder, for the reason mode 3's comment gives: a debug view that
-    // re-derives the answer can agree with itself while disagreeing with the frame — and the whole
-    // question here ("is this surface baked or 8-bit?") is one the frame alone can settle.
-    // 0 = no _paramh · 1 = 8-bit height, no baked map · 2 = baked map exists, unused · 3 = baked.
-    uint pbrSrc = 0u;
     if (pbrOn)
     {
         const int2   psz   = GetDimensions(gTextures[In.ParamIndex], NO_SAMPLER);
         const float2 size0 = max(float2(psz), float2(1.0f, 1.0f));
         pbrParam = pbrParamGrad(In.ParamIndex, In.ClampMode, In.Uv, pbrDUVdx, pbrDUVdy);
-        // Mode 3 asks for the BAKED derivative map and falls back to the live mode when this draw
-        // has none — which is most draws. The fallback is a select on a FLAT per-draw lane, so it is
-        // uniform across the draw and costs nothing; making it a separate mode instead would mean a
-        // scene of mixed coverage could not be judged on one setting.
+        // The gradient always comes from the `_paramh` height. (Mode 3, the baked `_paramd` map, is
+        // RETIRED; the host publishes a 3 as 4.)
         const uint  gradMode = (uint)gShadowParams.pbrParams.x;
-        const bool  useBaked = (gradMode == 3u) && (In.DerivIndex != 0u);
-        pbrSrc = useBaked ? 3u : ((In.DerivIndex != 0u) ? 2u : 1u);
-        const float2 dhduv = useBaked
-            ? pbrDerivMap(In.DerivIndex, In.ClampMode, In.Uv, pbrDUVdx, pbrDUVdy)
-            : pbrHeightGradUV(gradMode, In.ParamIndex, In.ClampMode, In.Uv,
-                              pbrDUVdx, pbrDUVdy, size0, gShadowParams.pbrParams.w);
+        const float2 dhduv = pbrHeightGradUV(gradMode, In.ParamIndex, In.ClampMode, In.Uv,
+                                             pbrDUVdx, pbrDUVdy, size0, gShadowParams.pbrParams.w);
         N = pbrPerturb((uint)gShadowParams.pbrParams.y, N, pbrDPdx, pbrDPdy, pbrDUVdx, pbrDUVdy,
                        dhduv, gShadowParams.pbrParams.z);
         pbrRough  = pbrRoughness(pbrParam);
@@ -531,25 +516,13 @@ float4 PS_MAIN( VSOutput In )
     if (dbg == 8u) {                                                        // mode 8: world-space normal (RGB = N*0.5+0.5)
         RETURN(float4(N * 0.5f + 0.5f, 1.0f));
     }
-    if (dbg == 19u) {   // mode 19: PBR gradient SOURCE — which surfaces are baked and which are 8-bit
-        // Terracing is a property of the 8-bit runtime path, so the first question about any
-        // terraced surface is which path it is on. 200 of 209 _paramh maps now have a baked
-        // derivative (it was 101 when this view was written, and 103 on disk; the gap was a
-        // 16-bit PNG that Pillow was silently halving plus an index that picked the wrong
-        // thumbnail), and mode 3 falls back PER DRAW where one is missing — a fallback that is
-        // correct, silent, and therefore invisible. This view is the thing that makes it visible.
-        //
-        // ⚠ YELLOW IS THE NORMAL STATE AT THE SHIPPED DEFAULT. gradMode defaults to 4 (cdblur),
-        // which reads the 8-bit height, so every surface that HAS a baked map reports yellow until
-        // someone selects mode 3. Yellow means "arm 4 is on", not "you forgot".
-        //   grey   no _paramh at all (skinned, terrain, alpha, pbrEnable off) — cannot terrace here
-        //   RED    _paramh only: the 8-bit height path. Terracing seen here is EXPECTED.
-        //   YELLOW a baked map exists but is not being used — switch pbrGradMode to 3
-        //   GREEN  baked derivative map in use. Terracing seen here is a REAL defect.
-        float3 srcCol = float3(0.10f, 0.10f, 0.11f);
-        if (pbrSrc == 1u)      { srcCol = float3(1.00f, 0.06f, 0.06f); }
-        else if (pbrSrc == 2u) { srcCol = float3(1.00f, 0.72f, 0.00f); }
-        else if (pbrSrc == 3u) { srcCol = float3(0.06f, 1.00f, 0.18f); }
+    if (dbg == 19u) {   // mode 19: PBR material COVERAGE — which surfaces carry a `_paramh`
+        //   grey   no `_paramh` (skinned, alpha, pbrEnable off, or the base simply has none)
+        //   GREEN  `_paramh` material with relief from the live gradient arm
+        // It had four states while the baked `_paramd` arm existed (RED 8-bit / YELLOW baked but
+        // unused / GREEN baked). That arm is RETIRED, so coverage is the per-surface question left.
+        // `pbrOn` is the value that gated the shading branch, not a re-derivation at the ladder.
+        const float3 srcCol = pbrOn ? float3(0.06f, 1.00f, 0.18f) : float3(0.10f, 0.10f, 0.11f);
         // A little shape so objects are identifiable, off the GEOMETRIC normal — the perturbed one
         // would print the very facets this view exists to attribute, over the top of the answer.
         const float3 vDir = normalize(gFrameData.eyePos.xyz - In.WorldPos);

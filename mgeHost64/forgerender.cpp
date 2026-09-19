@@ -1123,10 +1123,6 @@ namespace ForgeRender {
     void uiHideForProbe();
     // Sets the PBR knobs for the probe's sign test (same arrangement, same reason).
     void pbrSetForProbe(uint32_t gradMode, uint32_t frameMode);
-    // ...and reads back what pbrDerivSlotFor would pack for a slot, so the probe can report whether
-    // the host actually recognised its upload as a derivative map. Same reason as the two above:
-    // the gate lives in the anonymous namespace below.
-    uint32_t pbrDerivPackForProbe(uint32_t slot);
 
     // Standalone exercise of the M1c opaque scene path (init → uploadGeometry →
     // renderScene) with a dummy triangle mesh, so the host-side printf/asserts are
@@ -1456,58 +1452,6 @@ namespace ForgeRender {
                     }
                 }
             };
-            // ...and the same three ramps again as BAKED DERIVATIVE MAPS (mgeHost64/pbrbake's
-            // format), so gradient mode 3 is signed on the GPU like the other three rather than
-            // trusted. This is the only check of the range-exponent packing end to end: the bake
-            // divides by 2^exp, the host packs exp+128 into the slot lane, and the shader
-            // multiplies by exp2(exp) and by the mip's own width. A mistake anywhere in that chain
-            // is a bump of the wrong DEPTH or the wrong SIGN, and both show up here.
-            auto buildDeriv = [](int kind, std::vector<uint8_t>& out, int32_t& expOut) {
-                const uint32_t W = 64, Hh = 64, bw = W / 4, bh = Hh / 4;
-                // The ramps below run 0..1 across W texels, so dH/dtexel is a CONSTANT 1/(W-1)
-                // (the wrapped edge column excepted, which one 4x4 block hides). Range = the
-                // smallest power of two at or above it, exactly as pbrbake fits it.
-                const double dh = (kind == 2) ? 0.0 : (kind == 1 ? -1.0 : 1.0) / (double)(W - 1);
-                expOut = (kind == 2) ? 0 : (int32_t)std::ceil(std::log2(std::fabs(dh)));
-                const double range = std::pow(2.0, (double)expOut);
-                const int8_t rq = (int8_t)std::lround(std::max(-1.0, std::min(1.0, dh / range)) * 127.0);
-                out.assign(148 + (size_t)bw * bh * 16, 0);
-                uint8_t* d = out.data();
-                d[0] = 'D'; d[1] = 'D'; d[2] = 'S'; d[3] = ' ';
-                *(uint32_t*)(d + 4)  = 124;
-                *(uint32_t*)(d + 12) = Hh;
-                *(uint32_t*)(d + 16) = W;
-                *(uint32_t*)(d + 28) = 1;
-                *(uint32_t*)(d + 32) = 0x4445474Du;   // dwReserved1[0] = 'MGED'
-                *(int32_t*) (d + 36) = expOut;        // dwReserved1[1] = range exponent
-                *(uint32_t*)(d + 76) = 32;
-                *(uint32_t*)(d + 80) = 0x4;
-                *(uint32_t*)(d + 84) = 0x30315844u;   // 'DX10'
-                *(uint32_t*)(d + 128) = 84;           // DXGI_FORMAT_BC5_SNORM
-                *(uint32_t*)(d + 132) = 3;
-                *(uint32_t*)(d + 140) = 1;
-                for (uint32_t b = 0; b < bw * bh; ++b) {
-                    uint8_t* blk = d + 148 + (size_t)b * 16;
-                    blk[0] = (uint8_t)rq; blk[1] = (uint8_t)rq;   // RED = dH/du, constant block
-                    blk[8] = 0; blk[9] = 0;                       // GREEN = dH/dv = 0
-                }
-            };
-            const uint32_t dslot[3] = { 11u, 12u, 13u };
-            uint32_t dpack[3] = { 0u, 0u, 0u };
-            for (int k = 0; k < 3; ++k) {
-                std::vector<uint8_t> dds; int32_t e = 0;
-                buildDeriv(k, dds, e);
-                std::vector<uint8_t> blob(sizeof(IPC::TexUploadWire) + dds.size());
-                IPC::TexUploadWire th{ dslot[k] | IPC::kTexUploadData, (uint32_t)dds.size(), 0u };
-                std::memcpy(blob.data(), &th, sizeof(th));
-                std::memcpy(blob.data() + sizeof(th), dds.data(), dds.size());
-                const unsigned b = uploadTextures(blob.data(), (unsigned)blob.size(), 1);
-                dpack[k] = pbrDerivPackForProbe(dslot[k]);
-                std::printf("[forge] scene-probe: PBR deriv map %s -> slot %u, built %u/1, range 2^%d,"
-                            " packed 0x%08X %s\n",
-                            k == 0 ? "RISING +u" : k == 1 ? "FALLING +u" : "FLAT", dslot[k], b, e,
-                            dpack[k], dpack[k] ? "" : "<-- NOT RECOGNISED AS A DERIVATIVE MAP");
-            }
             const uint32_t pslot[4] = { 7u, 8u, 9u, 10u };
             for (int k = 0; k < 4; ++k) {
                 std::vector<uint8_t> dds;
@@ -1535,10 +1479,8 @@ namespace ForgeRender {
 
             IPC::DrawItemWire pi = item;
             pi.texIndex = 1u;       // the white DXT1 base
-            auto lightDelta = [&](uint32_t paramSlot, const IPC::PointLightWire& light,
-                                  uint32_t derivSlot = 0u) {
+            auto lightDelta = [&](uint32_t paramSlot, const IPC::PointLightWire& light) {
                 pi.paramTexIndex = paramSlot;
-                pi.derivTexIndex = derivSlot;
                 renderScene(vp, lt, &pi, 1, (unsigned)sizeof(pi), nullptr, 0, 0, nullptr, 0, 0, nullptr, 0, 0);
                 const double off = debugReadbackMeanLuma();
                 renderScene(vp, lt, &pi, 1, (unsigned)sizeof(pi), nullptr, 0, 0, nullptr, 0, 0,
@@ -1546,23 +1488,21 @@ namespace ForgeRender {
                 const double on = debugReadbackMeanLuma();
                 return on - off;
             };
-            const char* gName[4] = { "cd", "cdbs", "bspline", "baked" };
+            // Every LIVE gradient arm, the shipped one (4, cdblur) included. Arm 3 was the baked
+            // `_paramd` map — RETIRED 2026-09-18 — and its slot in this loop is now cdblur's, which the
+            // probe had never signed on the GPU while it was the default.
+            const uint32_t gModes[4] = { 0u, 1u, 2u, 4u };
+            const char* gName[4] = { "cd", "cdbs", "bspline", "cdblur" };
             const char* fName[2] = { "cotangent", "surfgrad" };
             const double dNone = lightDelta(0u, plA);   // no param map at all: the pre-PBR response
             bool allPass = true;
-            for (uint32_t gm = 0; gm < 4; ++gm) {
+            for (uint32_t gi = 0; gi < 4; ++gi) {
+                const uint32_t gm = gModes[gi];
                 for (uint32_t fm = 0; fm < 2; ++fm) {
                     pbrSetForProbe(gm, fm);
-                    // Mode 3 reads the BAKED map; every other mode reads the height. The param slot
-                    // rides along in both cases, because mode 3 still takes metal/rough/IOR from the
-                    // _paramh — only the gradient comes from elsewhere.
-                    const bool baked = (gm == 3u);
-                    const double dRise  = lightDelta(pslot[0], plA, baked ? dslot[0] : 0u);
-                    const double dFall  = lightDelta(pslot[1], plA, baked ? dslot[1] : 0u);
-                    const double dFlat  = lightDelta(pslot[2], plA, baked ? dslot[2] : 0u);
-                    // The v ramp has no baked twin (its derivative is in GREEN, and the constant
-                    // blocks above only exercise RED), so mode 3 checks the v axis through the
-                    // height path — which is unchanged and already covered by modes 0-2.
+                    const double dRise  = lightDelta(pslot[0], plA);
+                    const double dFall  = lightDelta(pslot[1], plA);
+                    const double dFlat  = lightDelta(pslot[2], plA);
                     const double dRiseV = lightDelta(pslot[3], plB);
                     const double dFlatV = lightDelta(pslot[2], plB);
                     // Pass: (1) rising brighter than flat and falling darker, each by more than a
@@ -1582,7 +1522,7 @@ namespace ForgeRender {
                     allPass = allPass && pass;
                     std::printf("[forge] scene-probe: PBR SIGN %-7s / %-9s  u: rising %+7.3f  flat %+7.3f  falling %+7.3f"
                                 "  | v: rising %+7.3f  flat %+7.3f  | flat-vs-no-param %+6.3f (specular)  -> %s\n",
-                                gName[gm], fName[fm], dRise, dFlat, dFall, dRiseV, dFlatV, dFlat - dNone,
+                                gName[gi], fName[fm], dRise, dFlat, dFall, dRiseV, dFlatV, dFlat - dNone,
                                 pass ? "PASS" : "FAIL");
                 }
             }
@@ -1590,12 +1530,9 @@ namespace ForgeRender {
                         "brighten in every mode)\n", allPass ? "PASS" : "FAILED");
 
             // ─── THE COVERAGE VIEW (F12 mode 19) ───────────────────────────────────────────────
-            // 101 of 209 _paramh maps have a baked derivative, and gradient mode 3 falls back to the
-            // 8-bit height path PER DRAW wherever one is missing. That fallback is correct and it is
-            // SILENT, which makes coverage invisible in play: a terraced surface gives no clue
-            // whether it terraces because no baked map exists for it or because the baked map is not
-            // doing its job. Mode 19 paints which path each surface took. Play asked for exactly
-            // this ("no way to tell baked ones vs 8-bit source ones").
+            // Mode 19 paints which surfaces carry a `_paramh` material. It had four states while the
+            // baked `_paramd` arm existed (8-bit / baked-unused / baked); that arm is RETIRED, so the
+            // per-surface question left is coverage: grey = no material, GREEN = material + relief.
             //
             // ⚠ AND IT IS CHECKED HERE BECAUSE A DEBUG MODE THAT NOBODY ASKS TO DRAW IS A DEBUG MODE
             // THAT SILENTLY DOES NOT EXIST. Modes 15 and 16 were added to this renderer, compiled,
@@ -1607,21 +1544,18 @@ namespace ForgeRender {
             // ordering survives the resolve, the output transform and any future post stage, while
             // an exact triple would have to be re-tuned by whoever adds one.
             {
-                enum Hue { kGrey, kRed, kGreen, kYellow };
-                struct Cls { const char* name; uint32_t param; uint32_t deriv; uint32_t gm; Hue want; };
-                const Cls cases[4] = {
-                    { "no _paramh          -> GREY",   0u,       0u,       3u, kGrey   },
-                    { "_paramh, no baked   -> RED",    pslot[0], 0u,       3u, kRed    },
-                    { "baked, mode 3       -> GREEN",  pslot[0], dslot[0], 3u, kGreen  },
-                    { "baked, mode 0       -> YELLOW", pslot[0], dslot[0], 0u, kYellow },
+                enum Hue { kGrey, kGreen };
+                struct Cls { const char* name; uint32_t param; uint32_t gm; Hue want; };
+                const Cls cases[2] = {
+                    { "no _paramh          -> GREY",   0u,       4u, kGrey  },
+                    { "_paramh             -> GREEN",  pslot[0], 4u, kGreen },
                 };
                 auto iabs = [](int v) { return v < 0 ? -v : v; };
                 bool covPass = true;
                 setDebugMode(19u);
-                for (int k = 0; k < 4; ++k) {
+                for (int k = 0; k < 2; ++k) {
                     pbrSetForProbe(cases[k].gm, 0u);
                     pi.paramTexIndex = cases[k].param;
-                    pi.derivTexIndex = cases[k].deriv;
                     renderScene(vp, lt, &pi, 1, (unsigned)sizeof(pi), nullptr, 0, 0, nullptr, 0, 0,
                                 nullptr, 0, 0);
                     unsigned char c[4] = { 0, 0, 0, 0 };
@@ -1630,16 +1564,14 @@ namespace ForgeRender {
                     bool ok = got;
                     switch (cases[k].want) {
                     case kGrey:   ok = ok && iabs(R - G) < 16 && iabs(G - B) < 16 && R < 128; break;
-                    case kRed:    ok = ok && (R > G + 48) && (R > B + 48);                    break;
                     case kGreen:  ok = ok && (G > R + 48) && (G > B + 48);                    break;
-                    case kYellow: ok = ok && (R > B + 48) && (G > B + 48) && iabs(R - G) < 96; break;
                     }
                     covPass = covPass && ok;
                     std::printf("[forge] scene-probe: PBR COVERAGE %-30s BGRA=%3d,%3d,%3d -> %s\n",
                                 cases[k].name, B, G, R, ok ? "PASS" : "FAIL");
                 }
                 std::printf("[forge] scene-probe: PBR COVERAGE VIEW %s (F12 mode 19 must be reachable "
-                            "and must separate baked from 8-bit)\n", covPass ? "PASS" : "FAILED");
+                            "and must separate covered from uncovered)\n", covPass ? "PASS" : "FAILED");
                 setDebugMode(0u);   // ⚠ the frame-hash checks below are on the NORMAL view
             }
             pbrSetForProbe(0u, 0u);   // back to the defaults for anything below
@@ -6136,17 +6068,27 @@ namespace {
     constexpr uint32_t kAoBounceFloat         = kMaskProfFloat + 4;
     // PBR material knobs (shadowparams.h.fsl pbrParams): x gradMode, y frameMode, z depth, w spare.
     constexpr uint32_t kPbrParamsFloat        = kAoBounceFloat + 4;
+    // TERRAIN PBR (shadowparams.h.fsl pbrTerrain): x armed, y relief depth, zw spare. Appended for
+    // the reason every block above states — this cbuffer is bound BY POINTER into every PerFrame
+    // set, so an insertion anywhere else silently moves a lane somebody reads.
+    constexpr uint32_t kPbrTerrainFloat       = kPbrParamsFloat + 4;
+    // TERRAIN HEIGHT AO (shadowparams.h.fsl pbrTerrainAO): x armed, y strength, z avg mip level.
+    constexpr uint32_t kPbrTerrainAOFloat     = kPbrTerrainFloat + 4;
     constexpr uint32_t kShadowParamsBytes = 4096;
     static_assert((kAoBounceFloat + 4) * sizeof(float) <= kShadowParamsBytes,
                   "ShadowMaskParams overflows its CBV — too many sun cascades");
-    static_assert((kPbrParamsFloat + 4) * sizeof(float) <= kShadowParamsBytes,
-                  "pbrParams must fit inside the ShadowMaskParams CBV");
+    static_assert((kPbrTerrainAOFloat + 4) * sizeof(float) <= kShadowParamsBytes,
+                  "pbrParams/pbrTerrain/pbrTerrainAO must fit inside the ShadowMaskParams CBV");
     // The float indices above are kept in step with the struct BY HAND, one +4 at a time, and
     // nothing checked that the running sum still lands on the member it names. A lane written one
     // float4 off reads as a knob that does nothing, or as garbage in a neighbour's slot — both of
     // which look like "the effect is subtle". This pins the newest lane to the member itself.
     static_assert(offsetof(ShadowMaskParams, pbrParams) == kPbrParamsFloat * sizeof(float),
                   "kPbrParamsFloat does not land on ShadowMaskParams::pbrParams");
+    static_assert(offsetof(ShadowMaskParams, pbrTerrain) == kPbrTerrainFloat * sizeof(float),
+                  "kPbrTerrainFloat does not land on ShadowMaskParams::pbrTerrain");
+    static_assert(offsetof(ShadowMaskParams, pbrTerrainAO) == kPbrTerrainAOFloat * sizeof(float),
+                  "kPbrTerrainAOFloat does not land on ShadowMaskParams::pbrTerrainAO");
     // msmrecv.h.fsl's PCSS works in TEXELS, so SUN_SHADOW_RES has to agree with the atlas the host
     // actually allocated. Same mirroring contract as SUN_CASCADES / kSunCascades.
     static_assert(kSunShadowRes == 2048, "SUN_SHADOW_RES in shadowparams.h.fsl must match kSunShadowRes");
@@ -7120,10 +7062,45 @@ namespace {
     // metal/rough/IOR. Cleared on every upload attempt into the slot, set only on success: a draw's
     // param slot reaches the shader only while a param map is really there.
     uint8_t g_texIsData[MAX_TEXTURES] = {};
-    // ...and, for a slot holding a DERIVATIVE map, its range exponent + 128 (so it survives as a
-    // byte in the instance lane). 0 = this slot is not a derivative map. Same discipline as
-    // g_texIsData: written only when an upload lands, cleared by every other writer of pTextures[].
-    uint8_t g_texDerivExp[MAX_TEXTURES] = {};
+
+    // ---- NEAR-TEXTURE LEDGER (tasks/forge-memory-shape.md) ------------------------------------
+    // Bytes each client bindless slot holds — the DDS mip payload that landed, which for the BC
+    // formats MW ships IS the GPU footprint — and their running sum. The memory census had to
+    // DERIVE this number (usage minus every fixed component, ~3.2 GB); this measures it. Set where
+    // an upload lands, replaced when the slot is re-uploaded, zeroed by the reset loop. Host-owned
+    // slots (the DL atlas) never enter it: they are fixed, not streamed. The heartbeat re-sums the
+    // array and cross-checks this total, so the ledger audits itself.
+    uint32_t g_texSlotBytes[MAX_TEXTURES] = {};
+    uint64_t g_texResidentBytes = 0;
+    uint64_t g_texReleased = 0;   // slots the client evicted (IPC::kTexUploadRelease), session total
+    // Flip-book arrays are allocated WHOLE at their first slice and live for the session.
+    uint64_t g_flipArrayBytes = 0;
+
+    // ---- MEMORY ALARMS: the envelope for compact DL + 100 m streaming -------------------------
+    // Each prints `!! [mem] ...` at heartbeat cadence while violated and changes NOTHING it measures.
+    // They exist so a deviation announces itself instead of arriving as "6 fps after a long
+    // session" — which is how the last one arrived: 340 heartbeats at 98-104% of the DXGI budget,
+    // absorbed silently, until a budget cut made the driver page the sun-shadow pass 1.3 -> 46 ms.
+    //   memHighResMax    high-res (>= 4 MB, i.e. 2048^2 and up) textures. The user's expectation for
+    //                    100 m: "2-3 dozen high res textures and lots of low res clutter". THE
+    //                    PRIMARY ALARM — the count does not care how the bytes are split. Checked
+    //                    twice: over RESIDENT (the leak: held, not used) and over SAMPLED this
+    //                    window (the working set itself — a content or texel-density problem).
+    //                    Raised 36 -> 64 (user, 2026-09-20: "high-res texture count can go higher.
+    //                    the coverage is low atm"): a real session sampled up to 49 and held up to
+    //                    81 at load, both legitimate with eviction running.
+    //   memNearTexMB     near-texture BYTES resident. Deliberately LOOSE for now: "we are also
+    //                    behind the texel density, so in size, it will be higher than expected".
+    //                    Tighten toward ~1.1 GB once texel density is normalised.
+    //   memBudgetWarnPct VRAM usage as a % of the DXGI budget. Also: every budget DROP is its own
+    //                    line, because the drop was the trigger event and nothing announced it.
+    //   memOtherDriftMB  growth of what is NOT in the streamed ledgers (targets, terrain, DL,
+    //                    atlases — plus allocator slack from freed resources) past its settled
+    //                    baseline. Fixed should stay fixed; growth there is a leak we do not meter.
+    uint32_t g_memHighResMax    = 64u;
+    uint32_t g_memNearTexMB     = 2048u;
+    uint32_t g_memBudgetWarnPct = 90u;
+    uint32_t g_memOtherDriftMB  = 256u;
 
     // ---- PBR MATERIAL KNOBS (tasks/forge-pbr-materials.md, Track C) --------------------------
     // Defaults reproduce the LIVE DX9 shader's reconstruction (a central difference at +-1.5 base
@@ -7136,6 +7113,12 @@ namespace {
     //   bit-identical by construction rather than by a multiply that happens to be by zero.
     bool     g_pbrEnable    = true;
     // pbrGradMode — how dH/duv is read out of the height (alpha) channel:
+    //
+    // ⚠ ARM 3 (the baked `_paramd` map) IS RETIRED, 2026-09-18. Arm 4 beat it in play even at matched
+    // resolution (809c96af, the history below), the maps were deleted, and nothing loads, binds or
+    // bakes them any more. The numbering is KEPT so every script and note that says gradMode=4 still
+    // means cdblur; a 3 is published as 4 (see the kPbrParamsFloat write). What follows is the record
+    // of how that was decided, not a description of what ships.
     //   0 cd      live DX9: central difference at +-1.5 base texels, bilinear taps. Kinks at every
     //             texel-cell edge (rig T3: facet enrichment at the ceiling, 16 of 16).
     //   1 cdbs    the same difference with each tap read through a cubic B-spline. The rig's best
@@ -7145,7 +7128,7 @@ namespace {
     //   2 bspline analytic derivative of the cubic B-spline (C2 height, so the normal is C1):
     //             facets ~1, but a narrow baseline lets ~2x the 8-bit noise through on smooth
     //             content. The better arm where a map carries real detail near its Nyquist.
-    //   3 baked   the BAKED DERIVATIVE MAP (mgeHost64/pbrbake), where one exists for this draw —
+    //   3 baked   RETIRED. Was the BAKED DERIVATIVE MAP (mgeHost64/pbrbake), where one existed —
     //             and the live arm 0 everywhere else, per draw, so a mixed-coverage scene is still
     //             judgeable on one setting. This is the only arm that addresses TERRACING rather
     //             than veiling it: it differentiates the 16-bit source and quantises the result,
@@ -7228,9 +7211,9 @@ namespace {
     // it was measured, against ARM 0; arm 4 did not exist then, and the comparison above is the one
     // that governs the default now.
     //
-    // What it costs meanwhile: arm 4 reads the 8-bit height, so the 200 baked maps sit unused at the
-    // default and terracing is veiled rather than removed (mode 3 keeps gradient retention 0.955
-    // against 0.000). Yellow in F12 mode 19 is therefore the normal state, not a warning.
+    // What it cost: arm 4 reads the 8-bit height, so the 200 baked maps sat unused at the default and
+    // terracing is veiled rather than removed (the rig's retention 0.955 against 0.000 stands as the
+    // known limit). The baked maps were then RETIRED and deleted (2026-09-18).
     uint32_t g_pbrGradMode  = 4u;
     // pbrFrameMode — how dH/duv becomes a normal with no mesh tangents:
     //   0 cotangent frame (live DX9's BuildPerPixelTBN, with the Jacobian's SIGN honoured — see
@@ -7276,15 +7259,82 @@ namespace {
     // ⚠ IN ARM 4 IT IS A BLUR WIDTH, NOT A TAP OFFSET, and 1.75 is what play settled on — the height
     // is read at the mip whose box is 2*radius texels across and the difference stays at +-1 texel of
     // THAT level, so a feature softens in place instead of splitting into two copies. That is why the
-    // default is 1.75 rather than the DX9 1.5. The sharp answer to terracing is still gradMode 3's
-    // baked map, and its lever is COVERAGE, not this dial. See pbrmaterial.h.fsl.
+    // default is 1.75 rather than the DX9 1.5. (gradMode 3's baked map, once "the sharp answer to
+    // terracing", is RETIRED — see g_pbrGradMode.) See pbrmaterial.h.fsl.
     // The gradient is divided by its own span in the shader, so depth stays calibrated — this moves
     // the FILTER, not the strength. Inert for gradient mode 2, which has no baseline.
     //
     // ⚠ A VEIL, NOT A FIX. Terracing is 8-bit quantisation amplified by differentiation, and the rig
     // (pbrsynth T6) measured that no runtime arm survives it — on a field spanning 3/255 every one
     // flattens to retention 0.000, while a BC5 derivative map baked at full precision keeps 1.001.
+    // That map is retired; the veil is what ships.
     float    g_pbrGradRadius = 1.75f;
+
+    // ---- TERRAIN PBR (tasks/forge-terrain-pbr.md) ---------------------------------------------
+    // pbrTerrain: the ground's own master switch. It IS a shader lane, unlike pbrEnable above, and
+    // the difference is where the gate can act. A mesh draw's param slot is packed per frame, so
+    // zeroing it is free; terrain's slots live in a whole-world VTEX pack uploaded ONCE at first
+    // exterior, and gating there would mean rebuilding and re-uploading ~10 MB to flip a checkbox.
+    // The A/B has to be live — a look A/B you have to restart for is one nobody runs — so the gate
+    // is a lane, and bit-identity is still a property of the code: terrain.frag never enters its
+    // PBR branch with this at 0, exactly as opaque.frag never enters its own with ParamIndex 0.
+    //
+    // ⚠ SHIPS ON. It has no effect at all on ground whose land textures carry no `_paramh`
+    // (slot 0 = no material), so "on" is already the no-op everywhere the art has nothing to say.
+    bool     g_pbrTerrain   = true;
+    // pbrTerrainDepth — the relief depth for the GROUND.
+    //
+    // ⚠ WHAT DEPTH IS, because the obvious reading is wrong and this comment used to carry it. It
+    // is NOT a length, and the UV unit's world size does NOT enter it. Both frames in
+    // pbrmaterial.h.fsl put the world height at depth*L*h and the world horizontal at L*duv, where
+    // L = sqrt(world area / uv area) per pixel — so L CANCELS and
+    //
+    //         tangent-space slope = depth * dH/duv
+    //
+    // which is dimensionless and scale-free. That is the header's own "a texture stretched 2x gets
+    // bumps 2x wider AND 2x deeper", stated as an equation. So the previous justification for this
+    // knob existing — "on terrain one UV unit is a 512-world-unit square, on a mesh it is whatever
+    // the artist mapped, a single number cannot serve both" — was simply not true: 512 divides out.
+    //
+    // THE REAL REASON THE GROUND NEEDS ITS OWN NUMBER IS EMPIRICAL, AND IT IS ABOUT WHICH MIP GETS
+    // SAMPLED. Measured over the shipped land maps (tx_ac_dirt_01, tx_ac_rock_01, tx_ai_grass_01,
+    // tx_ai_mainroad_01, tx_ac_scrubplain_01, tx_ai_mudflats_01), median |dH/duv| by level:
+    //
+    //     source 4096^2   L0 11.4   L2 7.3   L4 5.3   L6 2.4
+    //
+    // Two levels are gone before the ground ever sees the map — `[terrain-tex]` caps terrain slices
+    // at 1024, so the uploaded mip 0 IS source L2 — and arm 4 then reads at blvl >= log2(2*1.75)
+    // = 1.81 of THAT, i.e. around source L4. Add terrain's real viewing geometry (grazing, far,
+    // large footprints, so lvl climbs) and the ground shades from |dH/duv| ~ 4-6 where a wall you
+    // are standing next to shades from ~11. Same depth, a third of the slope. A mesh does not lose
+    // those levels, which is why one number cannot serve both — for this reason and not the other.
+    //
+    // ⚠ AND THAT IS WHY 0.025 READ AS WEAK: *"I don't actually like relief depth ... 0.025 feels
+    // weak"*. 0.025 * 5.5 = 0.14 -> 8 degrees of slope, on dirt and gravel. Real ground has an RMS
+    // slope of roughly 20-30 degrees at centimetre scale, which is most of why it looks matte, so
+    // the old default was about 3x short of the surface it was modelling rather than a little shy.
+    // 0.08 * 5.5 = 0.44 -> 24 degrees, the middle of that band. NOT a perceptual fudge: the target
+    // is a physical property of dirt, and the multiplier follows from the measurement above.
+    //
+    // It is still a look dial.
+    float    g_pbrTerrainDepth = 0.08f;
+    // TERRAIN HEIGHT AO (pbrmaterial.h.fsl::pbrHeightAO) — occlusion from the `_paramh` height
+    // field itself, at TEXEL scale, multiplying the ambient beside GTAO's contact-scale term and
+    // skyAmbFactor's world-scale one. Three scales, three terms, all multiplying; none can see what
+    // the others see.
+    //
+    // ⚠ SHIPS OFF, and that is deliberate rather than timid. It is TWO more taps per covered layer
+    // on the surface that already covers the screen, and terrain's tap cost is not priced yet — the
+    // `pbrTerrain` A/B is still outstanding. Arming an unmeasured cost on top of another unmeasured
+    // cost is how a frame budget disappears without a suspect
+    // ([[feedback_bracket_a_ceiling_before_building_for_it]]).
+    bool     g_pbrTerrainHeightAO = false;
+    float    g_pbrTerrainHeightAOStr = 1.0f;
+    // The averaging level, ABSOLUTE mip of the param map. 4 = a 16-texel neighbourhood, which at
+    // the ground's 1024 slices over a 512-unit square is ~8 world units (11 cm) — pit scale rather
+    // than dune scale. It is the knob most likely to need dialling by eye, which is why it is a
+    // knob and not the `exp2(8.0)` the source hardcoded.
+    float    g_pbrTerrainHeightAOLod = 4.0f;
 
     // The ONE gate every writer of the static instance lane [15] goes through.
     inline uint32_t pbrParamSlotFor(uint32_t paramTexIndex) {
@@ -7292,18 +7342,6 @@ namespace {
                 g_texIsData[paramTexIndex] != 0u) ? paramTexIndex : 0u;
     }
 
-    // ...and the same for lane [16], the DERIVATIVE map: slot in the low 16 bits, its range exponent
-    // + 128 in bits 16-23. Packed together because they are useless apart — a derivative without its
-    // range is a normal scaled by an unknown factor — and because one lane is cheaper than a lane
-    // plus a per-slot table the shader would have to reach through a binding.
-    //
-    // g_texDerivExp is nonzero ONLY for a slot whose upload both landed AND carried pbrbake's tag,
-    // so a slot recycled to an ordinary texture cannot be read as a derivative map even for a frame.
-    inline uint32_t pbrDerivSlotFor(uint32_t derivTexIndex) {
-        if (!g_pbrEnable || derivTexIndex == 0u || derivTexIndex >= (uint32_t)MAX_TEXTURES) { return 0u; }
-        const uint32_t e = g_texDerivExp[derivTexIndex];
-        return e ? (derivTexIndex | (e << 16)) : 0u;
-    }
     // Same classification for flip-book slices, which have no gTextures slot to key on. One vector
     // per bucket, sized when the bucket's array is created (uploadFlipSlice).
     std::vector<uint8_t> g_flipAlphaKind[MAX_FLIP_BUCKETS];
@@ -7328,9 +7366,8 @@ namespace {
     //   [12..14] emissiveGain.rgb (float) — the flux/area emissive boost, a per-channel RATIO.
     //   [15] ParamIndex (PBR _paramh bindless slot, 0 = no PBR material; per-frame, always through
     //        pbrParamSlotFor). Read by opaque.frag only.
-    //   [16] DerivIndex (PBR _paramd bindless slot | (range exponent + 128) << 16; 0 = none;
-    //        per-frame, always through pbrDerivSlotFor). Read by opaque.frag only.
-    // 17 * 4 = 68 bytes. The material + overlay ride the instance VB (not a new cbuffer/descriptor
+    // 16 * 4 = 64 bytes. (Lane [16], the baked `_paramd` slot, was removed with that arm.)
+    // The material + overlay ride the instance VB (not a new cbuffer/descriptor
     // set) to avoid the FSL descriptor-offset gotcha that hoisted the sampler — see opaque.srt.h.
     //
     // ⚠ THE GAIN LANES ARE THE ONE GROUP WHOSE IDENTITY IS 1.0, NOT 0. opaque.vert multiplies the
@@ -7339,7 +7376,7 @@ namespace {
     // explicitly — 1.0f on the passes that carry no boost (shadow, sky) and the real gain on the
     // four that shade emissive (opaque, alpha, FP rigid, FP alpha). The creation-time identity
     // init seeds 1.0 as well, so a pass added later inherits "no boost" rather than "no emissive".
-    constexpr uint32_t kStaticInstU32 = 17;
+    constexpr uint32_t kStaticInstU32 = 16;
 
     // Pack the per-draw instance .y: texIndex in the low 16 bits (slots < kMaxTextures=1024,
     // so ≤10 bits), the alpha-test reference quantised to a byte in bits 16-23, the
@@ -9015,9 +9052,9 @@ namespace {
         vl.mBindingCount = 2;
         vl.mBindings[0].mStride = sizeof(IPC::GeomVertexWire);
         vl.mBindings[0].mRate = VERTEX_BINDING_RATE_VERTEX;
-        vl.mBindings[1].mStride = kStaticInstU32 * sizeof(uint32_t);   // {DrawIndex, TexAlpha, matDiff3, matAmb3, matEmis3, Overlay, EmisGain3, ParamIndex, DerivIndex}
+        vl.mBindings[1].mStride = kStaticInstU32 * sizeof(uint32_t);   // {DrawIndex, TexAlpha, matDiff3, matAmb3, matEmis3, Overlay, EmisGain3, ParamIndex}
         vl.mBindings[1].mRate = VERTEX_BINDING_RATE_INSTANCE;
-        vl.mAttribCount = 13;
+        vl.mAttribCount = 12;
         vl.mAttribs[0].mSemantic = SEMANTIC_POSITION;
         vl.mAttribs[0].mFormat = TinyImageFormat_R32G32B32_SFLOAT;
         vl.mAttribs[0].mBinding = 0;
@@ -9081,11 +9118,6 @@ namespace {
         vl.mAttribs[11].mBinding = 1;
         vl.mAttribs[11].mLocation = 11;
         vl.mAttribs[11].mOffset = 15 * sizeof(uint32_t);
-        vl.mAttribs[12].mSemantic = SEMANTIC_TEXCOORD9;      // DerivIndex (per-instance: _paramd slot | exp)
-        vl.mAttribs[12].mFormat = TinyImageFormat_R32_UINT;
-        vl.mAttribs[12].mBinding = 1;
-        vl.mAttribs[12].mLocation = 12;
-        vl.mAttribs[12].mOffset = 16 * sizeof(uint32_t);
 
         // COLOUR-pass depth (Phase 1 early-Z): the Z-prepass already wrote every opaque pixel's
         // depth, so the colour pass only MATCHES it — CMP_EQUAL + depthWrite OFF = true early-Z,
@@ -9867,8 +9899,9 @@ namespace {
             for (uint32_t i = 0; i < kMaxTextures; ++i) {
                 g_live.pTextures[i] = g_live.pDefaultWhite;
                 g_texIsData[i] = 0u;   // no slot holds a param map until an upload proves it again
-                g_texDerivExp[i] = 0u;
+                g_texSlotBytes[i] = 0u;
             }
+            g_texResidentBytes = 0;
             g_live.texHigh = 0;
 
             // Bind the whole bindless array (every slot = default white for now). Individual
@@ -9928,6 +9961,7 @@ namespace {
                 for (uint32_t i = 0; i < MAX_FLIP_BUCKETS; ++i) {
                     g_live.pFlipArrays[i] = g_live.pStaticsWhiteArray;
                 }
+                g_flipArrayBytes = 0;
                 DescriptorData fd = {};
                 fd.mIndex = SRT_RES_IDX(SrtData, Persistent, gFlipArrays);
                 fd.mCount = MAX_FLIP_BUCKETS;
@@ -16021,8 +16055,8 @@ namespace {
     // lantern-lit NIGHT exterior, where clusters are populated and grass overdraw multiplies it.
     bool  g_grassPointLights  = true;
     // ⚠ GRASS IS THE ONE STATIC TYPE DRAWN AT THE CAMERA, AND THE 512 CAP WAS COSTING IT THREE MIPS.
-    // kStaticsTexCap (512) is a DISTANT-statics number and a good one — nothing in that library is
-    // ever
+    // The statics cap (g_staticsTexCap, 512 at the time) is a DISTANT-statics number — nothing in
+    // that library is ever
     // nearer than the near/far handover. Grass is the exception by construction: the whole point of
     // G1 is that it draws from the player's feet outward. Measured on this bake, the groundcover
     // ships six 4096-square DXT5 ATLASES (five square, one 4096x2048) holding ~40 hand-packed cards
@@ -16036,6 +16070,16 @@ namespace {
     // A float so it joins the MGE_HOST_KNOBS table (read once at startup, which is exactly when
     // the residency is built — there is nothing to change later; the arrays are uploaded once).
     float g_grassTexCap = 2048.0f;
+    // DISTANT-STATICS texture cap: the long side of the mip extracted into the LOD arrays.
+    //
+    // ⚠ A SAFETY NET, NOT THE SIZING. The BAKE picks each LOD texture's size from the object's
+    // projected size at the near->distant switch (tasks/forge-dl-lod-textures.md) so that
+    // near-at-switch and distant-at-switch sample the SAME mip and the handover does not pop. At 512
+    // this cap silently overrode that decision for exactly the objects the sizing exists for: the
+    // current bake asks for 1024 on 8 textures and 2048 on one, and every one of them is a BIG static
+    // (user, 2026-09-20: "big statics has a slight change. I think DL is not picking the right texel
+    // density for them"). 2048 bounds a pathological bake and otherwise lets the sizing stand.
+    float g_staticsTexCap = 2048.0f;
     // The authored vertex-colour flag (red: 0 = rigid prop, 1 = foliage). ON because this bake
     // measurably carries it — every grass vertex is (0,255,255,255) or (255,255,255,255), uniform
     // per subset. OFF for a pack that never painted the channel, which is stock's behaviour.
@@ -22376,7 +22420,7 @@ namespace {
         // height-derived normal on those surfaces, which is the quickest way to see the modes differ.
         { TabBuilder t; t.panel = g_uiPanel; t.name = "PBR materials";
           t.checkbox("PBR materials (_paramh) — off = today's image exactly", &g_pbrEnable);
-          t.sliderU("  gradient: 0 cd (DX9) | 1 cdbs | 2 bspline | 3 BAKED map | 4 cdblur (soft, no ghost)",
+          t.sliderU("  gradient: 0 cd (DX9) | 1 cdbs | 2 bspline | 3 retired (=4) | 4 cdblur (soft, no ghost)",
                     &g_pbrGradMode, 0u, 4u, 1u);
           t.sliderU("  frame: 0 cotangent (live DX9) | 1 surface gradient (exact under skew)",
                     &g_pbrFrameMode, 0u, 1u, 1u);
@@ -22386,12 +22430,38 @@ namespace {
           // back to it — which is the test a look dial has to pass.
           t.sliderF("  relief depth (fraction of the texture's width; 0.0117 = DX9 @4096, 0.025 = default)",
                     &g_pbrDepth, 0.0f, 0.05f, 0.0005f);
-          // 1.5 = the live DX9 shader. Inert on gradient mode 2 (no baseline to widen), and on mode 3
-          // wherever a baked map is in use -- so if moving this changes the image while the gradient
-          // is on 3, THAT DRAW FELL BACK TO ARM 0 and has no _paramd. In modes 0 and 1 it widens the
-          // difference, which GHOSTS rather than blurs; mode 4 is the true blur width.
+          // 1.5 = the live DX9 shader. Inert on gradient mode 2 (no baseline to widen). In modes 0 and
+          // 1 it widens the difference, which GHOSTS rather than blurs; mode 4 is the true blur width.
           t.sliderF("  tap radius in texels (0/1 ghost when widened, 4 blurs; 1.5 = DX9)",
                     &g_pbrGradRadius, 0.25f, 6.0f, 0.25f);
+          // TERRAIN PBR — the ground's own arm (tasks/forge-terrain-pbr.md). Separate from the
+          // master above because the ground is a separate SHADER with a separate residency: it
+          // blends up to four land textures per pixel out of bucketed arrays, not one bindless slot,
+          // so nothing above reaches it. Off = the ground's pre-PBR image exactly, live.
+          // Judge it on F12 mode 19 (which ground carries a `_paramh` material, which has none) and
+          // mode 20 beside it (relief must appear on grey 1-texture AND blue 2-texture ground; if
+          // it only shows on grey, the blend is wrong).
+          t.checkbox("TERRAIN PBR (the ground's _paramh) — off = the ground as it was",
+                     &g_pbrTerrain);
+          // Its OWN depth, but NOT for the reason this comment used to give (the UV unit's world
+          // size cancels out of both frames — see g_pbrTerrainDepth for the derivation). The
+          // ground's slices lose two mip levels to the 1024 cap before arm 4 blurs them further,
+          // so it shades from a third of a mesh's gradient at the same setting.
+          //
+          // ⚠ THE OLD RANGE STOPPED AT 0.05 AND THE ANSWER IS 0.08, so the dial could not reach
+          // its own calibration: every setting on it was weak and the knob looked like the problem
+          // ([[feedback_a_look_dial_inside_a_measurement]]). 0.08 now sits mid-range, which is the
+          // test the mesh slider above states for itself — a look dial has to be able to express
+          // its own default and find its way back to it.
+          t.sliderF("  terrain relief depth (slope = this x dH/duv; 0.08 = default ~24 deg on dirt)",
+                    &g_pbrTerrainDepth, 0.0f, 0.16f, 0.005f);
+          // Height AO off the same height field. F12 mode 21 is the view: white = unoccluded, and
+          // it reads white everywhere with this off.
+          t.checkbox("  height AO (texel-scale, multiplies GTAO) — OFF: +2 taps/layer, unpriced",
+                     &g_pbrTerrainHeightAO);
+          t.sliderF("    height AO strength", &g_pbrTerrainHeightAOStr, 0.0f, 1.0f, 0.05f);
+          t.sliderF("    height AO scale (param-map mip of the neighbourhood; 4 = pit, 8 = dune)",
+                    &g_pbrTerrainHeightAOLod, 0.0f, 10.0f, 0.5f);
           t.flush(); }
 
         // -- Tab: AO & Lighting (GTAO knobs + intensity debug scales) --
@@ -25617,6 +25687,7 @@ void destroyHostWindow(Renderer* R);
             // is consumed ONCE, when the texture residency is built at the first exterior — a
             // slider for it would be a control that silently does nothing after the first cell.
             { "grassTexCap",         &g_grassTexCap         },
+            { "staticsTexCap",       &g_staticsTexCap       },
             { "grassAvoidSoften",    &g_grassAvoidSoften    },
             { "grassAvoidMinScale",  &g_grassAvoidMinScale  },
             { "grassScaleVar",       &g_grassScaleVar       },
@@ -25629,6 +25700,9 @@ void destroyHostWindow(Renderer* R);
             // gain lightens the occlusion as it adds bounce; chroma adds colour without lightening.
             { "aoBounceGain",        &g_aoBounceGain        },
             { "pbrDepth",            &g_pbrDepth            },
+            { "pbrTerrainDepth",     &g_pbrTerrainDepth     },
+            { "pbrTerrainHeightAOStr", &g_pbrTerrainHeightAOStr },
+            { "pbrTerrainHeightAOLod", &g_pbrTerrainHeightAOLod },
             { "pbrGradRadius",       &g_pbrGradRadius       },
             { "aoBounceChroma",      &g_aoBounceChroma      },
             { "grassRootAO",         &g_grassRootAO         },
@@ -25714,6 +25788,11 @@ void destroyHostWindow(Renderer* R);
         const BKnob bknobs[] = {
             // PBR materials master switch: 0 must be today's image exactly (pack-time gate).
             { "pbrEnable", &g_pbrEnable },
+            // ...and TERRAIN's, which is a shader lane instead (see g_pbrTerrain). Here as well as
+            // on the panel because terrain is most of the screen, so this is the one PBR A/B whose
+            // cost has to be measured on a minimized harness run with nobody at the panel.
+            { "pbrTerrain", &g_pbrTerrain },
+            { "pbrTerrainHeightAO", &g_pbrTerrainHeightAO },
             // H2a: the WATER MIRROR's GPU cull lane, and its VERIFY twin. Both DEFAULT OFF, and both
             // are env-only for the same reason every other arm in this table is: the A/B is a
             // measurement on a minimized run and there is nobody at the panel.
@@ -25867,6 +25946,11 @@ void destroyHostWindow(Renderer* R);
             { "grassCrush",          &g_grassCrush          },
         };
         const UKnob uknobs[] = {
+            // MEMORY ALARM envelopes (tasks/forge-memory-shape.md) — see g_memHighResMax.
+            { "memHighResMax",    &g_memHighResMax,    4096u },
+            { "memNearTexMB",     &g_memNearTexMB,     65536u },
+            { "memBudgetWarnPct", &g_memBudgetWarnPct, 1000u },
+            { "memOtherDriftMB",  &g_memOtherDriftMB,  65536u },
             // AO DITHER SOURCE: 0 = legacy 4x4 tile, 1 = blue noise FROZEN (slice 0), 2 =
             // spatiotemporal, 3 = complementary 2x2 quad frozen (the DEFAULT), 4 = that quad with a
             // rigid per-frame quarter turn. The A/B this milestone needs is 3 against 1 — same cost,
@@ -25904,7 +25988,7 @@ void destroyHostWindow(Renderer* R);
             { "mbDebug",   &g_mbDebug,   4u },
             // MB-2o: 0 the streak mean, 1 the nearest sample, 2 reflected at the silhouette.
             { "mbBgMode",  &g_mbBgMode,  2u },
-            // PBR: 0 cd (live DX9), 1 cdbs, 2 bspline, 3 baked map, 4 cdblur; frame 0 cotangent,
+            // PBR: 0 cd (live DX9), 1 cdbs, 2 bspline, 3 RETIRED (runs 4), 4 cdblur; frame 0 cotangent,
             // 1 surface gradient.
             { "pbrGradMode",  &g_pbrGradMode,  4u },
             { "pbrFrameMode", &g_pbrFrameMode, 1u },
@@ -27662,7 +27746,6 @@ void destroyHostWindow(Renderer* R);
         g_pbrGradMode = gradMode;
         g_pbrFrameMode = frameMode;
     }
-    uint32_t pbrDerivPackForProbe(uint32_t slot) { return pbrDerivSlotFor(slot); }
     // M1, same arrangement and same reason (see forgerender.h): arm the motion-vector pass for the
     // probe, then report the field's own statistics.
     // M1 4b: narrow the probe's input rect through the CLIENT'S OWN ENTRY POINT. setRenderSize takes
@@ -30714,7 +30797,6 @@ void destroyHostWindow(Renderer* R);
                     ((float*)dins)[dm.matIdx * kStaticInstU32 + 13] = 1.0f;
                     ((float*)dins)[dm.matIdx * kStaticInstU32 + 14] = 1.0f;
                     dins[dm.matIdx * kStaticInstU32 + 15] = 0u;   // [15] ParamIndex: this pass's frag never reads it — kept explicit, not stale
-                    dins[dm.matIdx * kStaticInstU32 + 16] = 0u;   // [16] DerivIndex: unread by this pass's frag — explicit, not stale
                 }
             }
 
@@ -30995,7 +31077,6 @@ void destroyHostWindow(Renderer* R);
                     ((float*)sins)[g * kStaticInstU32 + 13] = 1.0f;
                     ((float*)sins)[g * kStaticInstU32 + 14] = 1.0f;
                     sins[g * kStaticInstU32 + 15] = 0u;   // [15] ParamIndex: this pass's frag never reads it — kept explicit, not stale
-                    sins[g * kStaticInstU32 + 16] = 0u;   // [16] DerivIndex: unread by this pass's frag — explicit, not stale
                 }
                 g_setupBlkMs[kSetupBlkPackFill] += hostNowMs() - tPkFill0;
                 const double tPkJob0 = hostNowMs();
@@ -31168,10 +31249,29 @@ void destroyHostWindow(Renderer* R);
             // frag reads them on every frame it has a param map in view, and a lane written only
             // some frames is the stale-cbuffer trap. pbrEnable is NOT here — it acts at pack time
             // (pbrParamSlotFor), which is what makes "off" bit-identical rather than zero-weighted.
-            mp[kPbrParamsFloat + 0] = (float)std::min(g_pbrGradMode, 4u);
+            // Arm 3 was the baked `_paramd` map and is RETIRED: a 3 (a stale script, the panel stop)
+            // runs cdblur, and says so once, rather than reaching a shader arm that no longer exists.
+            if (g_pbrGradMode == 3u) {
+                static bool s_warned = false;
+                if (!s_warned) {
+                    s_warned = true;
+                    LOG::logline("!! [pbr] pbrGradMode 3 (baked _paramd) is RETIRED — running 4 (cdblur)");
+                }
+            }
+            mp[kPbrParamsFloat + 0] = (float)((g_pbrGradMode == 3u) ? 4u : std::min(g_pbrGradMode, 4u));
             mp[kPbrParamsFloat + 1] = (float)std::min(g_pbrFrameMode, 1u);
             mp[kPbrParamsFloat + 2] = std::max(0.0f, g_pbrDepth);
             mp[kPbrParamsFloat + 3] = std::max(0.25f, g_pbrGradRadius);
+            // Terrain PBR. A LANE and not a pack-time gate — see g_pbrTerrain for why the ground
+            // cannot use pbrEnable's trick. Published unconditionally, like every block above it.
+            mp[kPbrTerrainFloat + 0] = g_pbrTerrain ? 1.0f : 0.0f;
+            mp[kPbrTerrainFloat + 1] = std::max(0.0f, g_pbrTerrainDepth);
+            mp[kPbrTerrainFloat + 2] = 0.0f;
+            mp[kPbrTerrainFloat + 3] = 0.0f;
+            mp[kPbrTerrainAOFloat + 0] = g_pbrTerrainHeightAO ? 1.0f : 0.0f;
+            mp[kPbrTerrainAOFloat + 1] = std::clamp(g_pbrTerrainHeightAOStr, 0.0f, 1.0f);
+            mp[kPbrTerrainAOFloat + 2] = std::clamp(g_pbrTerrainHeightAOLod, 0.0f, 12.0f);
+            mp[kPbrTerrainAOFloat + 3] = 0.0f;
             mp[280] = g_shadowBias;               // biasParams.x = absolute contact bias (live knob)
             mp[281] = g_shadowNormalOffset;       // biasParams.y = normal-offset bias in texels (live knob)
             // Flicker shadow "movement": the mask rotates the LOOKUP direction of flicker-class slots by a
@@ -31330,7 +31430,6 @@ void destroyHostWindow(Renderer* R);
             finst[local * kStaticInstU32 + 13] = items[i].emissiveGain[1];
             finst[local * kStaticInstU32 + 14] = items[i].emissiveGain[2];
             inst[local * kStaticInstU32 + 15] = pbrParamSlotFor(items[i].paramTexIndex);   // PBR _paramh slot, host-gated (0 = shade as before)
-            inst[local * kStaticInstU32 + 16] = pbrDerivSlotFor(items[i].derivTexIndex);   // PBR _paramd slot | range exp
             // Terrain DECAL_1 overlay slot (0 = no decal → frag splat gated off, non-terrain unchanged).
             inst[local * kStaticInstU32 + 11] = items[i].overlayTexIndex;
         }
@@ -34157,7 +34256,6 @@ void destroyHostWindow(Renderer* R);
                     finst[idx * kStaticInstU32 + 13] = 1.0f;
                     finst[idx * kStaticInstU32 + 14] = 1.0f;
                     inst[idx * kStaticInstU32 + 15] = 0u;   // [15] ParamIndex: this pass's frag never reads it — kept explicit, not stale
-                    inst[idx * kStaticInstU32 + 16] = 0u;   // [16] DerivIndex: unread by this pass's frag — explicit, not stale
 
                     Buffer*  meshVb     = m.inArena ? g_live.pArenaVB : m.vb;
                     Buffer*  meshIb     = m.inArena ? g_live.pArenaIB : m.ib;
@@ -34520,7 +34618,6 @@ void destroyHostWindow(Renderer* R);
                 finst[idx * kStaticInstU32 + 13] = 1.0f;
                 finst[idx * kStaticInstU32 + 14] = 1.0f;
                 inst[idx * kStaticInstU32 + 15] = 0u;   // [15] ParamIndex: this pass's frag never reads it — kept explicit, not stale
-                inst[idx * kStaticInstU32 + 16] = 0u;   // [16] DerivIndex: unread by this pass's frag — explicit, not stale
 
                 // Arena (bind-once + offsets) vs dynamic-ring (own VB/IB) source.
                 Buffer*  meshVb     = m.inArena ? g_live.pArenaVB : m.vb;
@@ -36989,7 +37086,6 @@ void destroyHostWindow(Renderer* R);
                 finst[idx * kStaticInstU32 + 13] = it.emissiveGain[1];
                 finst[idx * kStaticInstU32 + 14] = it.emissiveGain[2];
                 inst[idx * kStaticInstU32 + 15] = 0u;   // [15] ParamIndex: this pass's frag never reads it — kept explicit, not stale
-                inst[idx * kStaticInstU32 + 16] = 0u;   // [16] DerivIndex: unread by this pass's frag — explicit, not stale
                 // matAlpha rides the overlay slot [11] (opaque.vert reads it as a uint;
                 // alpha.frag asfloat's it back — the terrain splat doesn't run in this frag).
                 finst[idx * kStaticInstU32 + 11] = it.matAlpha;
@@ -37308,7 +37404,6 @@ void destroyHostWindow(Renderer* R);
                     finst[idx * kStaticInstU32 + 13] = it.emissiveGain[1];
                     finst[idx * kStaticInstU32 + 14] = it.emissiveGain[2];
                     inst[idx * kStaticInstU32 + 15] = pbrParamSlotFor(it.paramTexIndex);   // PBR _paramh slot, host-gated (0 = shade as before)
-                    inst[idx * kStaticInstU32 + 16] = pbrDerivSlotFor(it.derivTexIndex);   // PBR _paramd slot | range exp
                     inst[idx * kStaticInstU32 + 11]  = 0;   // no terrain decal on arms
 
                     const uint32_t firstVertex = m.inArena ? (uint32_t)(m.vbOff / sizeof(IPC::GeomVertexWire)) : 0u;
@@ -37635,7 +37730,6 @@ void destroyHostWindow(Renderer* R);
                     finst[idx * kStaticInstU32 + 13] = it.emissiveGain[1];
                     finst[idx * kStaticInstU32 + 14] = it.emissiveGain[2];
                     inst[idx * kStaticInstU32 + 15] = 0u;   // [15] ParamIndex: this pass's frag never reads it — kept explicit, not stale
-                    inst[idx * kStaticInstU32 + 16] = 0u;   // [16] DerivIndex: unread by this pass's frag — explicit, not stale
                     finst[idx * kStaticInstU32 + 11] = it.matAlpha;      // alpha.frag asfloat's it back
                     // AT3 multi-stage — same table, tail indices (see the main alpha loop).
                     if (g_live.pAlphaStagesBuf) {
@@ -40182,6 +40276,49 @@ void destroyHostWindow(Renderer* R);
                                      whites, list);
                     }
                 }
+                // NEAR-TEXTURE LEDGER + ITS ALARMS (tasks/forge-memory-shape.md). Read HERE, before the
+                // clearing loop below, because "sampled this window" is g_texSeenBits itself — every
+                // draw path, off-screen shadow casters included, marks it through packTexAlpha.
+                {
+                    constexpr uint32_t kHighRes = 4u << 20;   // 2048^2 BC3 with mips is 5.3 MB
+                    uint32_t nRes = 0, nResHi = 0, nHot = 0, nHotHi = 0;
+                    uint64_t bRes = 0, bHot = 0, bData = 0;
+                    for (unsigned s = 1; s < (unsigned)MAX_TEXTURES; ++s) {
+                        const uint32_t b = g_texSlotBytes[s];
+                        if (!b) { continue; }
+                        const bool hi  = b >= kHighRes;
+                        const bool hot = (g_texSeenBits[s >> 5] & (1u << (s & 31u))) != 0u;
+                        ++nRes; bRes += b; if (hi) { ++nResHi; }
+                        if (g_texIsData[s]) { bData += b; }
+                        if (hot) { ++nHot; bHot += b; if (hi) { ++nHotHi; } }
+                    }
+                    const double kMB = 1024.0 * 1024.0;
+                    LOG::logline(">> [forge-hb] mem near-tex: resident %u tex %.0f MB (high-res %u, _paramh %.0f MB)"
+                                 " | sampled this window %u tex %.0f MB (high-res %u) | unsampled %.0f MB"
+                                 " | flip arrays %.0f MB | evicted by client %llu this session",
+                                 nRes, (double)bRes / kMB, nResHi, (double)bData / kMB,
+                                 nHot, (double)bHot / kMB, nHotHi, (double)(bRes - bHot) / kMB,
+                                 (double)g_flipArrayBytes / kMB, (unsigned long long)g_texReleased);
+                    if (bRes != g_texResidentBytes) {
+                        LOG::logline("!! [mem] near-texture ledger DRIFT: running total %.0f MB, re-sum %.0f MB"
+                                     " — a writer of pTextures[] is not keeping g_texSlotBytes",
+                                     (double)g_texResidentBytes / kMB, (double)bRes / kMB);
+                    }
+                    if (nResHi > g_memHighResMax) {
+                        LOG::logline("!! [mem] near textures: %u HIGH-RES resident (envelope %u) — %u of them"
+                                     " unsampled this window; %.0f MB held that nothing is drawing",
+                                     nResHi, g_memHighResMax, nResHi - nHotHi, (double)(bRes - bHot) / kMB);
+                    }
+                    if (nHotHi > g_memHighResMax) {
+                        LOG::logline("!! [mem] near textures: %u high-res SAMPLED in one window (envelope %u) —"
+                                     " the working set itself is over, not just the residency",
+                                     nHotHi, g_memHighResMax);
+                    }
+                    if (bRes > (uint64_t)g_memNearTexMB << 20) {
+                        LOG::logline("!! [mem] near textures: %.0f MB resident (envelope %u MB, loose until"
+                                     " texel density is normalised)", (double)bRes / kMB, g_memNearTexMB);
+                    }
+                }
                 // Unique slots referenced since the LAST heartbeat, i.e. the working set over a
                 // 300-frame window — the number that is actually comparable to client residency
                 // (a per-frame count would undercount a set the player pans across). Cleared here,
@@ -40293,6 +40430,62 @@ void destroyHostWindow(Renderer* R);
                                          (unsigned long long)(loc.CurrentReservation >> 20),
                                          ecobuf,
                                          (unsigned long)GetPriorityClass(GetCurrentProcess()));
+                            // BUDGET + UNATTRIBUTED-GROWTH ALARMS (tasks/forge-memory-shape.md).
+                            if (okL) {
+                                const uint64_t useMB = loc.CurrentUsage >> 20, budMB = loc.Budget >> 20;
+                                const double   pct   = loc.Budget ? 100.0 * (double)loc.CurrentUsage
+                                                                  / (double)loc.Budget : 0.0;
+                                // A budget DROP is an event, and it was THE event: at the collapse our
+                                // usage sat at 5318 MB on both sides while the budget went 5116 -> 4893.
+                                // 64 MB of hysteresis, because the budget jitters by tens of MB.
+                                static uint64_t s_prevBudMB = 0;
+                                if (s_prevBudMB != 0 && budMB + 64u < s_prevBudMB) {
+                                    LOG::logline("!! [mem] DXGI budget DROPPED %llu -> %llu MB with our usage at %llu MB"
+                                                 " (now %.0f%%) — another process took VRAM; over budget the"
+                                                 " driver pages, and which of our resources it pages is its choice",
+                                                 (unsigned long long)s_prevBudMB, (unsigned long long)budMB,
+                                                 (unsigned long long)useMB, pct);
+                                }
+                                s_prevBudMB = budMB;
+                                if (pct >= (double)g_memBudgetWarnPct) {
+                                    LOG::logline("!! [mem] VRAM at %.0f%% of the DXGI budget (%llu/%llu MB)%s",
+                                                 pct, (unsigned long long)useMB, (unsigned long long)budMB,
+                                                 pct > 100.0 ? " — OVER: the driver is paging; expect one pass to"
+                                                               " collapse (sun shadow did, 1.3 -> 46 ms)"
+                                                             : " — headroom is below the alarm line");
+                                }
+                                // Everything NOT in a streamed ledger: render targets, terrain, DL,
+                                // atlases, LUTs — and allocator slack from freed resources, which is real
+                                // VRAM too. It should settle once the first exterior is resident and then
+                                // hold. Baseline = the max over the first three heartbeats after terrain
+                                // is ready, so DL and terrain landing a heartbeat apart cannot trip it.
+                                const uint64_t streamedB = g_texResidentBytes + g_flipArrayBytes
+                                                         + g_arenaVB.total + g_arenaIB.total + g_meshBufBytes;
+                                const int64_t  otherMB   = (int64_t)useMB - (int64_t)(streamedB >> 20);
+                                static int     s_settle  = 0;
+                                static int64_t s_otherBase = 0;
+                                if (g_terrainReady && s_settle < 3) {
+                                    s_otherBase = (s_settle == 0) ? otherMB : std::max(s_otherBase, otherMB);
+                                    ++s_settle;
+                                }
+                                LOG::logline(">> [forge-hb] mem other: %lld MB = local %llu - streamed %llu"
+                                             " (near tex %llu + flip %llu + arenas %llu + meshBuf %llu)"
+                                             " | baseline %s%lld MB",
+                                             (long long)otherMB, (unsigned long long)useMB,
+                                             (unsigned long long)(streamedB >> 20),
+                                             (unsigned long long)(g_texResidentBytes >> 20),
+                                             (unsigned long long)(g_flipArrayBytes >> 20),
+                                             (unsigned long long)((g_arenaVB.total + g_arenaIB.total) >> 20),
+                                             (unsigned long long)(g_meshBufBytes >> 20),
+                                             s_settle < 3 ? "(settling) " : "", (long long)s_otherBase);
+                                if (s_settle >= 3 && otherMB > s_otherBase + (int64_t)g_memOtherDriftMB) {
+                                    LOG::logline("!! [mem] unattributed VRAM GREW %lld MB past its baseline (%lld -> %lld MB,"
+                                                 " envelope +%u) — not textures, not flip books, not geometry"
+                                                 " arenas: something unmetered is accumulating",
+                                                 (long long)(otherMB - s_otherBase), (long long)s_otherBase,
+                                                 (long long)otherMB, g_memOtherDriftMB);
+                                }
+                            }
                         }
                     } else {
                         LOG::logline(">> [forge-hb] vram: (adapter probe unavailable)"
@@ -42427,17 +42620,6 @@ void destroyHostWindow(Renderer* R);
         TinyImageFormat fmt = TinyImageFormat_UNDEFINED;
         uint32_t width = 0, height = 0, mipLevels = 0, dataOffset = 0;
         bool ok = false;
-        // PBR DERIVATIVE MAP (mgeHost64/pbrbake): the per-texture RANGE its dH/dtexel values were
-        // divided by, as a power-of-two exponent — range = 2^derivExp. hasDeriv says the file
-        // actually carried one; without it a BC5 is just a BC5 and cannot serve as a derivative
-        // map, because the range is the one thing the pixels do not contain.
-        //
-        // Per texture and not a constant because it HAS to be: a shallow height field's derivative
-        // is ~1e-5 in global units, and BC4's block endpoints live on a GLOBAL 8-bit grid, so every
-        // block of it collapses to one value and the gradient reads zero. Measured — pbrbake's
-        // header, and pbrsynth's `deriv5s` arm, which keeps that failure as a test.
-        int32_t  derivExp = 0;
-        bool     hasDeriv = false;
     };
     // STEP 5 — the sRGB VIEW. Everything MW ships as art is authored for a gamma display; ask the
     // hardware to decode it.
@@ -42490,13 +42672,6 @@ void destroyHostWindow(Renderer* R);
         uint32_t dataOffset = 128;
         TinyImageFormat fmt = TinyImageFormat_UNDEFINED;
         const uint32_t DDPF_FOURCC = 0x4;
-        // dwReserved1[0..1] (offset 32): pbrbake's magic + the derivative range exponent. The DDS
-        // spec leaves these eleven words to the writer and other tools stamp signatures there, so
-        // this is read ONLY behind the magic, and its absence means "not a derivative map" rather
-        // than a default — a wrong range is a wrongly-scaled normal over the whole surface, which
-        // is exactly the silent failure a default would produce.
-        const bool hasDerivTag = (ddsRd32(d + 32) == 0x4445474Du);   // 'MGED'
-        const int32_t derivExpTag = hasDerivTag ? (int32_t)ddsRd32(d + 36) : 0;
         if (pfFlags & DDPF_FOURCC) {
             switch (fourCC) {
                 case 0x31545844u: fmt = TinyImageFormat_DXBC1_RGBA_UNORM; break;   // 'DXT1'
@@ -42549,10 +42724,6 @@ void destroyHostWindow(Renderer* R);
         if (fmt == TinyImageFormat_UNDEFINED || width == 0 || height == 0) { return r; }
         r.fmt = fmt; r.width = width; r.height = height; r.mipLevels = mips;
         r.dataOffset = dataOffset; r.ok = true;
-        // Only a BC5 can be a derivative map; the tag on anything else is a writer we do not know.
-        const bool isBC5 = (fmt == TinyImageFormat_DXBC5_SNORM || fmt == TinyImageFormat_DXBC5_UNORM);
-        r.hasDeriv = hasDerivTag && isBC5 && derivExpTag >= -128 && derivExpTag <= 127;
-        r.derivExp = r.hasDeriv ? derivExpTag : 0;
         return r;
     }
 
@@ -42703,6 +42874,10 @@ void destroyHostWindow(Renderer* R);
 
             fb.fmt = info.fmt; fb.w = info.width; fb.h = info.height;
             fb.mips = info.mipLevels; fb.slices = hdr.arraySize; fb.filled = 0;
+            // The whole array is committed now, so it is metered now: one slice's payload x slices.
+            if (hdr.byteLen > info.dataOffset) {
+                g_flipArrayBytes += (uint64_t)(hdr.byteLen - info.dataOffset) * hdr.arraySize;
+            }
             g_flipAlphaKind[bucket].assign(hdr.arraySize, (uint8_t)kTexAlphaTranslucent);
             g_live.pFlipArrays[bucket] = tex;
 
@@ -42776,11 +42951,39 @@ void destroyHostWindow(Renderer* R);
             // kTexUploadData rides bit 31 of the slot. Strip it FIRST, before anything reads the
             // slot as a number: a flagged slot is 0x80000000+ and the range check below would drop it.
             const bool dataTex = (hdr.slot & IPC::kTexUploadData) != 0u;
-            hdr.slot &= ~IPC::kTexUploadData;
+            const bool release = (hdr.slot & IPC::kTexUploadRelease) != 0u;
+            hdr.slot &= ~(IPC::kTexUploadData | IPC::kTexUploadRelease);
             const uint8_t* dds    = p + sizeof(hdr);
             const uint8_t* ddsEnd = dds + hdr.byteLen;
             if (ddsEnd > end) { break; }
             p = ddsEnd;   // advance regardless of whether this one decodes
+
+            // Client eviction (evictStaleTextures): nothing live names this slot and nothing has
+            // sampled it for a while. Park the texture exactly as a replacement would (an in-flight
+            // frame may still reach it through the table) and put the default white back, so a
+            // stale reference reads white — which the "referenced slot(s) still DEFAULT WHITE"
+            // check reports — never a freed descriptor. COUNTS as built: the client checks the tally.
+            if (release) {
+                if (hdr.slot != 0 && hdr.slot < kMaxTextures && !IPC::isFlipSlot(hdr.slot)) {
+                    if (g_live.pTextures[hdr.slot] != g_live.pDefaultWhite) {
+                        g_texRetire.push_back(g_live.pTextures[hdr.slot]);
+                        g_live.pTextures[hdr.slot] = g_live.pDefaultWhite;
+                        DescriptorData dd = {};
+                        dd.mIndex = SRT_RES_IDX(SrtData, Persistent, gTextures);
+                        dd.mArrayOffset = hdr.slot;
+                        dd.mCount = 1;
+                        dd.ppTextures = &g_live.pTextures[hdr.slot];
+                        updateDescriptorSet(R, 0, g_live.pPersistentSet, 1, &dd);
+                        ++g_texReleased;
+                    }
+                    g_texResidentBytes -= g_texSlotBytes[hdr.slot];
+                    g_texSlotBytes[hdr.slot] = 0u;
+                    g_texIsData[hdr.slot] = 0u;
+                    g_texAlphaKind[hdr.slot] = kTexAlphaOpaque;
+                }
+                ++built;
+                continue;
+            }
 
             // Flip-book slice: goes into gFlipArrays[bucket] layer N, not gTextures[slot].
             if (IPC::isFlipSlot(hdr.slot)) {
@@ -42798,7 +43001,6 @@ void destroyHostWindow(Renderer* R);
             // Any upload attempt into this slot voids its "holds a param map" status until this one
             // lands (see g_texIsData): every failure path below must leave it 0.
             g_texIsData[hdr.slot] = 0u;
-            g_texDerivExp[hdr.slot] = 0u;
             DdsInfo info = parseDds(dds, hdr.byteLen);
             if (!info.ok) {
                 LOGF(eWARNING, "[forge] tex slot %u: unsupported DDS format (slot stays white)", hdr.slot);
@@ -42875,6 +43077,12 @@ void destroyHostWindow(Renderer* R);
             }
             g_live.pTextures[hdr.slot] = tex;
             if (hdr.slot + 1 > g_live.texHigh) { g_live.texHigh = hdr.slot + 1; }
+            {   // ledger: this slot now holds exactly the mips that were copied above
+                const uint32_t landed = (uint32_t)(src - (dds + info.dataOffset));
+                g_texResidentBytes -= g_texSlotBytes[hdr.slot];
+                g_texSlotBytes[hdr.slot] = landed;
+                g_texResidentBytes += landed;
+            }
 
             DescriptorData dd = {};   // rebind just this slot in the bindless array
             dd.mIndex = SRT_RES_IDX(SrtData, Persistent, gTextures);
@@ -42883,7 +43091,6 @@ void destroyHostWindow(Renderer* R);
             dd.ppTextures = &g_live.pTextures[hdr.slot];
             updateDescriptorSet(R, 0, g_live.pPersistentSet, 1, &dd);
             g_texIsData[hdr.slot] = dataTex ? 1u : 0u;   // landed: now, and only now, it counts
-            g_texDerivExp[hdr.slot] = info.hasDeriv ? (uint8_t)(info.derivExp + 128) : 0u;
             ++built;
         }
         // One upload-engine flush for the whole batch (else textures stay black). Replaces the
@@ -42937,9 +43144,9 @@ void destroyHostWindow(Renderer* R);
     // record per subset (with StartInstanceLocation = its instance run) drives a single
     // cmdExecuteIndirect. See [[project_forge_dl_statics_format]].
     constexpr uint32_t kStaticsBuckets    = MAX_STATICS_BUCKETS;  // gStaticsArrays element count (128)
-    constexpr uint32_t kStaticsTexCap     = 512;   // cap the long side: extract that mip + chain (raw copy)
-    // The GRASS texture cap (g_grassTexCap) is declared with the other grass knobs above — it has
-    // to precede the MGE_HOST_KNOBS table, which is earlier in this file than the statics block.
+    // The statics + grass texture caps (g_staticsTexCap, g_grassTexCap) are declared with the grass
+    // knobs above — they have to precede the MGE_HOST_KNOBS table, which is earlier in this file
+    // than this statics block.
     // Mips a w x h texture would have with a complete chain down to 1x1.
     inline uint32_t fullMipCount(uint32_t w, uint32_t h) {
         uint32_t n = 1;
@@ -43117,7 +43324,7 @@ void destroyHostWindow(Renderer* R);
     }
     // DL statics texture residency = gStaticsArrays: a descriptor-array of Texture2DArrays, one
     // element per (format, capped-size) BUCKET. Every statics texture is uploaded ONCE at load into
-    // its bucket as an array slice (raw mip-extract: the largest mip with long side <= kStaticsTexCap,
+    // its bucket as an array slice (raw mip-extract: the largest mip with long side <= g_staticsTexCap,
     // plus the chain below it — no decode/resize/encode). All resident => no eviction, no white,
     // no per-frame streaming. subset.texSlot = (bucket<<16)|layer. Bucket 0 is reserved = white.
     struct StaticsTexBucket {
@@ -43401,7 +43608,6 @@ void destroyHostWindow(Renderer* R);
         if (g_live.pTextures[slot] != g_live.pDefaultWhite) { g_texRetire.push_back(g_live.pTextures[slot]); }
         g_live.pTextures[slot] = tex;
         g_texIsData[slot] = 0u;   // a host-owned texture (atlas, cloud, sun) is never a param map
-        g_texDerivExp[slot] = 0u;
         if (slot + 1 > g_live.texHigh) { g_live.texHigh = slot + 1; }
         DescriptorData dd = {};
         dd.mIndex = SRT_RES_IDX(SrtData, Persistent, gTextures);
@@ -43576,6 +43782,10 @@ void destroyHostWindow(Renderer* R);
     Buffer*   g_pTerrainHeights    = nullptr;   // whole-world heightfield  (GPU_ONLY SRV)
     Buffer*   g_pTerrainColors     = nullptr;   // whole-world VCLR         (GPU_ONLY SRV)
     Buffer*   g_pTerrainTex        = nullptr;   // whole-world VTEX as SLOTS (GPU_ONLY SRV)
+    // ...and the same pack remapped through the PBR companion set. A separate buffer rather than
+    // extra bits in g_pTerrainTex: a texture slot already spends the full 32 bits (see
+    // Terrain::kTexStrideUints on what packing two per uint cost the first time).
+    Buffer*   g_pTerrainParamTex   = nullptr;   // VTEX -> _paramh slot     (GPU_ONLY SRV, 0 = none)
     Buffer*   g_pTerrainCellGrid   = nullptr;   // world grid -> slot+1     (GPU_ONLY SRV)
     // (the per-frame instance rings live in TerrainView — one per view)
     // World grid the cell lookup is addressed in (from Terrain::extent) — the per-instance rows
@@ -43596,8 +43806,19 @@ void destroyHostWindow(Renderer* R);
         uint32_t w = 0, h = 0, mips = 1;
         Texture* tex = nullptr;
         uint32_t count = 0;
+        // ⚠ A DATA BUCKET MUST NOT TAKE toSceneTextureFormat, AND WITHOUT THIS FLAG IT SILENTLY
+        // WOULD. The albedo path calls it unconditionally because MW art is gamma-encoded; a
+        // `_paramh` is DXT5 and toSceneTextureFormat maps DXBC3_UNORM -> DXBC3_SRGB, so its
+        // roughness would read 0.21 where the art says 0.5 and its height would be bent BEFORE the
+        // shader differentiated it. A gamma-decoded parameter map looks plausible on screen, which is
+        // why this is a flag and not a comment.
+        bool     isData = false;
     };
     std::vector<TerrainTexBucket> g_terrainBuckets;
+    // The PBR companion residency (tasks/forge-terrain-pbr.md): the same bucketed-Texture2DArray
+    // shape, planned over only the land textures that HAVE a companion file. ~96 of 551 ship a
+    // `_paramh`, so sizing these by LTEX count would be ~450 MB of default data.
+    std::vector<TerrainTexBucket> g_terrainParamBuckets;
     Texture*  g_pTerrainWhite  = nullptr;        // bucket 0 layer 0: the "texture is missing" fill
     // (g_terrainReady is declared up with the panel toggles — fillFrameTimings needs it.)
     bool      g_terrainLoadTried   = false;
@@ -43859,15 +44080,245 @@ void destroyHostWindow(Renderer* R);
         return true;
     }
 
+    // ─── ONE bucketed Texture2DArray SET over the LTEX table ─────────────────────────────────────
+    // Albedo and `_paramh` are the SAME three passes over different files: a header scan
+    // that plans buckets by (format, capped size, available mips), one Texture2DArray per bucket,
+    // then a raw mip-range copy into each slice. So they are ONE function rather than two copies —
+    // every part of it is something that can drift (the mip-cap walk, the 2048-slice rollover, the
+    // short-chain report), and this file has already paid for byte-identical copies elsewhere.
+    //
+    // `buckets[0]` IS RESERVED AND IS NEVER CREATED HERE, in every set — so slot 0 means "this land
+    // texture has no texture of this kind" in both packs and the shader's zero test is one
+    // test. The albedo caller fills it with the white "missing" fill because its slot 0 is
+    // REACHABLE (an unresolvable LTEX draws as it); the companion set leaves it empty because
+    // its is not (terrain.frag never samples a zero slot).
+    struct TerrainTexSet {
+        std::vector<uint32_t>    slots;         // LTEX id -> (bucket<<16)|layer ; 0 = none
+        std::vector<std::string> missingNames;  // the first few that did not resolve
+        uint32_t uploaded = 0, missing = 0, overflow = 0, shortChain = 0;
+        uint64_t vram = 0;
+    };
+    // Pass 1 needs only the DDS header, and a land texture's file is up to 22 MB — reading them
+    // whole twice is the difference between ~2.6 GB and ~5.2 GB of one-shot I/O for the companion
+    // sets. `read` takes a byte hint for exactly that; 0 means "all of it". 256 covers a 148-byte
+    // DX10 header with room to spare, and parseDds reads nothing past it.
+    constexpr uint32_t kDdsHeaderProbe = 256;
+
+    // read(id, &size, wantBytes) hands back this set's file for LTEX `id`, or nullptr when it has
+    // none. A reader that cannot do a partial read may ignore wantBytes.
+    template <class Reader>
+    TerrainTexSet buildTerrainTexSet(Renderer* R, const char* label, bool isData,
+                                     uint32_t srtIndex,
+                                     std::vector<TerrainTexBucket>& buckets, Reader read) {
+        const uint32_t texCount = Terrain::texCount();
+        TerrainTexSet out;
+        out.slots.assign(texCount, 0u);
+        if (buckets.empty()) { buckets.emplace_back(); }   // reserve slot 0 — see above
+
+        struct TexPlan { uint32_t capStep = 0, bucket = 0, layer = 0; };
+        std::vector<TexPlan> plan(texCount);
+        std::unordered_map<uint64_t, uint32_t> keyToBucket;
+        // The bucket key includes the AVAILABLE MIP COUNT, which the statics version does not — and
+        // that difference is load-bearing here. A Texture2DArray has one mip count for every slice,
+        // so with a (format,size)-only key the chain is the MIN over members and a single DDS that
+        // ships a truncated chain drags every other texture in the bucket down with it. Measured on
+        // this install: 463 of 499 land textures are 1024², and one short member cut all 463 to 4
+        // mips of 11 — i.e. nothing below 128², so the whole world shimmered past that distance.
+        // Keying on mips too costs a couple of extra buckets (of 32) and isolates the offenders.
+        //
+        // `isData` rides the top bit. The two sets keep their own bucket vector and their own map,
+        // so it cannot collide today — it is in the key so that a future merge of them cannot put a
+        // gamma-decoded parameter map and an sRGB albedo into one array.
+        auto bucketKey = [](TinyImageFormat f, uint32_t w, uint32_t h, uint32_t mips,
+                            bool data) -> uint64_t {
+            return ((uint64_t)(data ? 1u : 0u) << 63) | ((uint64_t)(uint32_t)f << 46)
+                 | ((uint64_t)(mips & 0x3F) << 40)
+                 | ((uint64_t)(w & 0xFFFFF) << 20) | (uint64_t)(h & 0xFFFFF);
+        };
+        std::vector<std::vector<uint32_t>> bucketMembers(buckets.size());   // bucket -> texIds
+
+        // Pass 1: header scan -> bucket plan. Every texture is read once here and once more in
+        // pass 3; both come out of the OS cache, and it keeps the arrays sized before any upload.
+        // id 0 is `_land_default.tga`, Morrowind's own fallback ground — every texture square a cell
+        // never had painted uses it, so it is one of the most-drawn textures in the world and must
+        // load like any other. (Skipping it was drawing large stretches of unedited terrain white.)
+        for (uint32_t id = 0; id < texCount; ++id) {
+            uint32_t sz = 0;
+            const uint8_t* bytes = read(id, &sz, kDdsHeaderProbe);
+            DdsInfo info = bytes ? parseDds(bytes, sz) : DdsInfo{};
+            if (!info.ok) {                                   // slot stays 0
+                ++out.missing;
+                if (out.missingNames.size() < 16) {
+                    out.missingNames.emplace_back(Terrain::texName(id));
+                }
+                continue;
+            }
+            uint32_t k = 0, w = info.width, h = info.height;
+            while ((w > kTerrainTexCap || h > kTerrainTexCap) && (k + 1) < info.mipLevels) {
+                w = (w > 1) ? w >> 1 : 1; h = (h > 1) ? h >> 1 : 1; ++k;
+            }
+            const uint32_t avail = info.mipLevels - k;
+            const uint64_t key   = bucketKey(info.fmt, w, h, avail, isData);
+            auto bit = keyToBucket.find(key);
+            // A Texture2DArray is capped at 2048 slices (D3D12_REQ_TEXTURE2D_ARRAY_AXIS_DIMENSION).
+            // One bucket holds 370 today, but this world is half of Tamriel Rebuilt with Skyrim
+            // landmasses still to come, and every added landmass adds LTEX to the SAME dominant
+            // (DXT1, 1024², full-chain) bucket. Rolling over into a fresh bucket on the same key
+            // removes the ceiling instead of failing the resource creation at some future install
+            // size — which would surface as "those textures are white", far from the cause.
+            const bool full = (bit != keyToBucket.end()) && buckets[bit->second].count >= 2048u;
+            if (bit == keyToBucket.end() || full) {
+                if (buckets.size() >= kTerrainBuckets) { ++out.overflow; continue; }
+                const uint32_t b = (uint32_t)buckets.size();
+                keyToBucket[key] = b;                    // later textures on this key go to the new one
+                TerrainTexBucket nb;
+                nb.fmt = info.fmt; nb.w = w; nb.h = h; nb.mips = avail; nb.isData = isData;
+                buckets.push_back(nb);
+                bucketMembers.emplace_back();
+                bit = keyToBucket.find(key);
+            }
+            TexPlan p;
+            p.capStep = k;
+            p.bucket  = bit->second;
+            TerrainTexBucket& b = buckets[p.bucket];
+            p.layer = b.count++;
+            bucketMembers[p.bucket].push_back(id);
+            plan[id] = p;
+        }
+
+        // Pass 2: create + bind one Texture2DArray per real bucket.
+        for (uint32_t b = 1; b < buckets.size(); ++b) {
+            TerrainTexBucket& bk = buckets[b];
+            TextureDesc td = {};
+            td.mWidth = bk.w; td.mHeight = bk.h; td.mDepth = 1;
+            td.mArraySize = bk.count; td.mMipLevels = bk.mips;
+            td.mSampleCount = SAMPLE_COUNT_1;
+            // step 5: MW art is gamma-encoded — but a PARAMETER map is not art, and this is the one
+            // line that has to know the difference. See TerrainTexBucket::isData.
+            td.mFormat = bk.isData ? bk.fmt : toSceneTextureFormat(bk.fmt);
+            td.mStartState = RESOURCE_STATE_SHADER_RESOURCE;
+            td.mDescriptors = DESCRIPTOR_TYPE_TEXTURE;
+            td.pName = bk.isData ? "terrainDataBucket" : "terrainBucket";
+            TextureLoadDesc tld = {}; tld.ppTexture = &bk.tex; tld.pDesc = &td;
+            addResource(&tld, nullptr);
+        }
+        waitForAllResourceLoads();
+        {
+            std::vector<Texture*> texs(kTerrainBuckets);
+            for (uint32_t b = 0; b < kTerrainBuckets; ++b) {
+                texs[b] = (b < buckets.size() && buckets[b].tex) ? buckets[b].tex : g_pTerrainWhite;
+            }
+            DescriptorData sd = {};
+            sd.mIndex = srtIndex;
+            sd.mArrayOffset = 0; sd.mCount = kTerrainBuckets;
+            sd.ppTextures = texs.data();
+            // EVERY PerFrame set terrain.frag draws under, not just the main one — the reflect-geo
+            // pass binds its own (pPerFrameSetReflectGeo) and draws the same terrain. See the note
+            // at the buffer update in loadTerrainResidency for what an unbound terrain descriptor
+            // actually looks like on screen.
+            updateDescriptorSet(R, 0, g_live.pPerFrameSet, 1, &sd);
+            if (g_live.pPerFrameSetReflectGeo) {
+                updateDescriptorSet(R, 0, g_live.pPerFrameSetReflectGeo, 1, &sd);
+            }
+        }
+
+        // Pass 3: upload each texture's capped mip range into its slice.
+        for (uint32_t b = 1; b < buckets.size(); ++b) {
+            TerrainTexBucket& bk = buckets[b];
+            if (!bk.tex) { continue; }
+            for (uint32_t layer = 0; layer < (uint32_t)bucketMembers[b].size(); ++layer) {
+                const uint32_t id = bucketMembers[b][layer];
+                uint32_t sz = 0;
+                const uint8_t* bytes = read(id, &sz, 0u);
+                if (!bytes) { continue; }
+                DdsInfo info = parseDds(bytes, sz);
+                if (!info.ok) { continue; }
+                const uint8_t* src = bytes + info.dataOffset;
+                const uint8_t* end = bytes + sz;
+                uint32_t sw = info.width, sh = info.height;
+                for (uint32_t i = 0; i < plan[id].capStep; ++i) {     // skip the capped-off top mips
+                    src += ddsTightMipBytes(info.fmt, sw, sh);
+                    sw = (sw > 1) ? sw >> 1 : 1; sh = (sh > 1) ? sh >> 1 : 1;
+                }
+                TextureUpdateDesc upd = {};
+                upd.pTexture = bk.tex;
+                upd.mBaseMipLevel = 0; upd.mMipLevels = bk.mips;
+                upd.mBaseArrayLayer = layer; upd.mLayerCount = 1;
+                upd.mCurrentState = RESOURCE_STATE_SHADER_RESOURCE;
+                beginUpdateResource(&upd);
+                for (uint32_t m = 0; m < bk.mips; ++m) {
+                    TextureSubresourceUpdate s = upd.getSubresourceUpdateDesc(m, layer);
+                    const uint32_t mipBytes = s.mRowCount * s.mSrcRowStride;
+                    if (src + mipBytes > end) { break; }
+                    for (uint32_t row = 0; row < s.mRowCount; ++row) {
+                        std::memcpy(s.pMappedData + (size_t)row * s.mDstRowStride,
+                                    src + (size_t)row * s.mSrcRowStride, s.mSrcRowStride);
+                    }
+                    src += mipBytes;
+                }
+                endUpdateResource(&upd);
+                out.slots[id] = (plan[id].bucket << 16) | (plan[id].layer & 0xFFFF);
+                ++out.uploaded;
+            }
+            flushTextureUploads(R);   // submit per bucket (bounds the staging ring)
+        }
+
+        // Report the buckets and the real VRAM. The plan budgeted "~333 MB at a 1024 cap" as an
+        // upper bound to be MEASURED, not assumed — 6 GB is the floor GPU. Also flag short mip
+        // chains: a bucket's chain is the MIN over its members, so one DDS shipping no mips
+        // collapses the bucket and every cell using it shimmers at distance.
+        for (uint32_t b = 1; b < buckets.size(); ++b) {
+            const TerrainTexBucket& bk = buckets[b];
+            uint32_t mw = bk.w, mh = bk.h;
+            for (uint32_t m = 0; m < bk.mips; ++m) {
+                out.vram += (uint64_t)ddsTightMipBytes(bk.fmt, mw, mh) * bk.count;
+                mw = (mw > 1) ? mw >> 1 : 1; mh = (mh > 1) ? mh >> 1 : 1;
+            }
+            const uint32_t fullChain = fullMipCount(bk.w, bk.h);
+            if (bk.mips < fullChain) { out.shortChain += bk.count; }
+            // ⚠ A SHORT CHAIN MEANS DIFFERENT THINGS ON ART AND ON DATA, so it is not reported with
+            // one sentence. On an ALBEDO bucket it is a defect: the missing levels are the ones the
+            // sampler wants at distance, so those slices shimmer, and the fix is on disk.
+            LOG::logline(">> [terrain-tex] %-6s bucket=%u %ux%u slices=%u mips=%u (full=%u)%s",
+                         label, b, bk.w, bk.h, bk.count, bk.mips, fullChain,
+                         (bk.mips >= fullChain) ? ""
+                         : bk.isData ? "  (chain stops short — the bake's floor; the sampler clamps,"
+                                       " no aliasing)"
+                                     : "  <-- SHORT CHAIN (these slices shimmer at distance)");
+            // NAME the offenders: the chain is truncated in the source DDS, so the fix is on disk,
+            // not here. MGEXEgui's plugin step repairs loose ones in place (LandMipFixer).
+            if (bk.mips < fullChain && !bk.isData) {
+                std::string names;
+                for (uint32_t i = 0; i < bucketMembers[b].size() && i < 12; ++i) {
+                    names += (i ? " " : ""); names += Terrain::texName(bucketMembers[b][i]);
+                }
+                LOG::logline(">> [terrain-tex]   %-6s short-chain sources: %s%s", label,
+                             names.c_str(), (bucketMembers[b].size() > 12) ? " ..." : "");
+            }
+        }
+        if (out.overflow) {
+            LOG::logline("!! [terrain-tex] %s: %u textures DROPPED: out of buckets"
+                         " (MAX_TERRAIN_BUCKETS=%u). Raise it in opaque.srt.h if the world grew.",
+                         label, out.overflow, kTerrainBuckets);
+        }
+        return out;
+    }
+
     // Build the land-texture residency and resolve every LTEX id to a (bucket<<16)|layer slot.
     // Mirrors buildStaticsTextureArrays; the differences are all consequences of what land textures
     // ARE: there are only ~500 of them, they are all resident forever, and they tile, so the sampler
     // must WRAP (the shared static anisotropic sampler already does).
-    // outSlots is indexed by Terrain::texId and is what the VTEX pack gets remapped through.
-    bool buildTerrainTextureArrays(Renderer* R, std::vector<uint32_t>& outSlots) {
+    //
+    // TWO sets: the base map, plus terrain PBR's `_paramh` material. (A third, the baked `_paramd`
+    // derivative, is RETIRED — terrain differentiates `_paramh`'s height itself.) Both are indexed
+    // by Terrain::texId and are what the two VTEX packs get remapped through.
+    bool buildTerrainTextureArrays(Renderer* R, std::vector<uint32_t>& outSlots,
+                                   std::vector<uint32_t>& outParamSlots) {
         const uint32_t texCount = Terrain::texCount();
         outSlots.assign(texCount, 0u);
+        outParamSlots.assign(texCount, 0u);
         g_terrainBuckets.clear();
+        g_terrainParamBuckets.clear();
 
         // Bucket 0 layer 0 is a 4x4 white RGBA — what an unresolvable LTEX draws as. White, not
         // magenta: a missing land texture should read as "untextured ground", because at T3 this is
@@ -43903,203 +44354,73 @@ void destroyHostWindow(Renderer* R);
             g_terrainBuckets.push_back(b0);
         }
 
-        struct TexPlan { uint32_t capStep = 0, bucket = 0, layer = 0; };
-        std::vector<TexPlan> plan(texCount);
-        std::unordered_map<uint64_t, uint32_t> keyToBucket;
-        // The bucket key includes the AVAILABLE MIP COUNT, which the statics version does not — and
-        // that difference is load-bearing here. A Texture2DArray has one mip count for every slice,
-        // so with a (format,size)-only key the chain is the MIN over members and a single DDS that
-        // ships a truncated chain drags every other texture in the bucket down with it. Measured on
-        // this install: 463 of 499 land textures are 1024², and one short member cut all 463 to 4
-        // mips of 11 — i.e. nothing below 128², so the whole world shimmered past that distance.
-        // Keying on mips too costs a couple of extra buckets (of 32) and isolates the offenders.
-        auto bucketKey = [](TinyImageFormat f, uint32_t w, uint32_t h, uint32_t mips) -> uint64_t {
-            return ((uint64_t)(uint32_t)f << 46) | ((uint64_t)(mips & 0x3F) << 40)
-                 | ((uint64_t)(w & 0xFFFFF) << 20) | (uint64_t)(h & 0xFFFFF);
-        };
-        std::vector<std::string> missingNames;
-        std::vector<std::vector<uint32_t>> bucketMembers;   // bucket -> texIds
-        bucketMembers.emplace_back();
-
-        // Pass 1: header scan -> bucket plan. Every texture is read once here and once more in
-        // pass 3; both come out of the OS cache, and it keeps the arrays sized before any upload.
-        // id 0 is `_land_default.tga`, Morrowind's own fallback ground — every texture square a cell
-        // never had painted uses it, so it is one of the most-drawn textures in the world and must
-        // load like any other. (Skipping it was drawing large stretches of unedited terrain white.)
-        uint32_t missing = 0, overflow = 0;
-        for (uint32_t id = 0; id < texCount; ++id) {
-            uint32_t sz = 0;
-            const uint8_t* bytes = Terrain::readLandTextureFile(id, &sz);
-            DdsInfo info = bytes ? parseDds(bytes, sz) : DdsInfo{};
-            if (!info.ok) {                                   // slot stays 0 (white)
-                ++missing;
-                if (missingNames.size() < 16) { missingNames.emplace_back(Terrain::texName(id)); }
-                continue;
-            }
-            uint32_t k = 0, w = info.width, h = info.height;
-            while ((w > kTerrainTexCap || h > kTerrainTexCap) && (k + 1) < info.mipLevels) {
-                w = (w > 1) ? w >> 1 : 1; h = (h > 1) ? h >> 1 : 1; ++k;
-            }
-            const uint32_t avail = info.mipLevels - k;
-            const uint64_t key   = bucketKey(info.fmt, w, h, avail);
-            auto bit = keyToBucket.find(key);
-            // A Texture2DArray is capped at 2048 slices (D3D12_REQ_TEXTURE2D_ARRAY_AXIS_DIMENSION).
-            // One bucket holds 370 today, but this world is half of Tamriel Rebuilt with Skyrim
-            // landmasses still to come, and every added landmass adds LTEX to the SAME dominant
-            // (DXT1, 1024², full-chain) bucket. Rolling over into a fresh bucket on the same key
-            // removes the ceiling instead of failing the resource creation at some future install
-            // size — which would surface as "those textures are white", far from the cause.
-            const bool full = (bit != keyToBucket.end())
-                            && g_terrainBuckets[bit->second].count >= 2048u;
-            if (bit == keyToBucket.end() || full) {
-                if (g_terrainBuckets.size() >= kTerrainBuckets) { ++overflow; continue; }
-                const uint32_t b = (uint32_t)g_terrainBuckets.size();
-                keyToBucket[key] = b;                    // later textures on this key go to the new one
-                TerrainTexBucket nb;
-                nb.fmt = info.fmt; nb.w = w; nb.h = h; nb.mips = avail;
-                g_terrainBuckets.push_back(nb);
-                bucketMembers.emplace_back();
-                bit = keyToBucket.find(key);
-            }
-            TexPlan p;
-            p.capStep = k;
-            p.bucket  = bit->second;
-            TerrainTexBucket& b = g_terrainBuckets[p.bucket];
-            p.layer = b.count++;
-            bucketMembers[p.bucket].push_back(id);
-            plan[id] = p;
-        }
-
-        // Pass 2: create + bind one Texture2DArray per real bucket.
-        for (uint32_t b = 1; b < g_terrainBuckets.size(); ++b) {
-            TerrainTexBucket& bk = g_terrainBuckets[b];
-            TextureDesc td = {};
-            td.mWidth = bk.w; td.mHeight = bk.h; td.mDepth = 1;
-            td.mArraySize = bk.count; td.mMipLevels = bk.mips;
-            td.mSampleCount = SAMPLE_COUNT_1;
-            td.mFormat = toSceneTextureFormat(bk.fmt);   // step 5: MW art is gamma-encoded
-            td.mStartState = RESOURCE_STATE_SHADER_RESOURCE;
-            td.mDescriptors = DESCRIPTOR_TYPE_TEXTURE;
-            td.pName = "terrainBucket";
-            TextureLoadDesc tld = {}; tld.ppTexture = &bk.tex; tld.pDesc = &td;
-            addResource(&tld, nullptr);
-        }
-        waitForAllResourceLoads();
-        {
-            std::vector<Texture*> texs(kTerrainBuckets);
-            for (uint32_t b = 0; b < kTerrainBuckets; ++b) {
-                texs[b] = (b < g_terrainBuckets.size() && g_terrainBuckets[b].tex)
-                        ? g_terrainBuckets[b].tex : g_pTerrainWhite;
-            }
-            DescriptorData sd = {};
-            sd.mIndex = SRT_RES_IDX(SrtData, PerFrame, gTerrainArrays);
-            sd.mArrayOffset = 0; sd.mCount = kTerrainBuckets;
-            sd.ppTextures = texs.data();
-            // EVERY PerFrame set, not just the main one — the reflect-geo pass binds its own
-            // (pPerFrameSetReflectGeo) and draws the same terrain. See the note at the buffer
-            // update below for what an unbound terrain descriptor actually looks like.
-            updateDescriptorSet(R, 0, g_live.pPerFrameSet, 1, &sd);
-            if (g_live.pPerFrameSetReflectGeo) {
-                updateDescriptorSet(R, 0, g_live.pPerFrameSetReflectGeo, 1, &sd);
-            }
-        }
-
-        // Pass 3: upload each texture's capped mip range into its slice.
-        uint32_t uploaded = 0;
-        for (uint32_t b = 1; b < g_terrainBuckets.size(); ++b) {
-            TerrainTexBucket& bk = g_terrainBuckets[b];
-            if (!bk.tex) { continue; }
-            for (uint32_t layer = 0; layer < (uint32_t)bucketMembers[b].size(); ++layer) {
-                const uint32_t id = bucketMembers[b][layer];
-                uint32_t sz = 0;
-                const uint8_t* bytes = Terrain::readLandTextureFile(id, &sz);
-                if (!bytes) { continue; }
-                DdsInfo info = parseDds(bytes, sz);
-                if (!info.ok) { continue; }
-                const uint8_t* src = bytes + info.dataOffset;
-                const uint8_t* end = bytes + sz;
-                uint32_t sw = info.width, sh = info.height;
-                for (uint32_t i = 0; i < plan[id].capStep; ++i) {     // skip the capped-off top mips
-                    src += ddsTightMipBytes(info.fmt, sw, sh);
-                    sw = (sw > 1) ? sw >> 1 : 1; sh = (sh > 1) ? sh >> 1 : 1;
-                }
-                TextureUpdateDesc upd = {};
-                upd.pTexture = bk.tex;
-                upd.mBaseMipLevel = 0; upd.mMipLevels = bk.mips;
-                upd.mBaseArrayLayer = layer; upd.mLayerCount = 1;
-                upd.mCurrentState = RESOURCE_STATE_SHADER_RESOURCE;
-                beginUpdateResource(&upd);
-                for (uint32_t m = 0; m < bk.mips; ++m) {
-                    TextureSubresourceUpdate s = upd.getSubresourceUpdateDesc(m, layer);
-                    const uint32_t mipBytes = s.mRowCount * s.mSrcRowStride;
-                    if (src + mipBytes > end) { break; }
-                    for (uint32_t row = 0; row < s.mRowCount; ++row) {
-                        std::memcpy(s.pMappedData + (size_t)row * s.mDstRowStride,
-                                    src + (size_t)row * s.mSrcRowStride, s.mSrcRowStride);
-                    }
-                    src += mipBytes;
-                }
-                endUpdateResource(&upd);
-                outSlots[id] = (plan[id].bucket << 16) | (plan[id].layer & 0xFFFF);
-                ++uploaded;
-            }
-            flushTextureUploads(R);   // submit per bucket (bounds the staging ring)
-        }
-
-        // Report the buckets and the real VRAM. The plan budgeted "~333 MB at a 1024 cap" as an
-        // upper bound to be MEASURED, not assumed — 6 GB is the floor GPU. Also flag short mip
-        // chains: a bucket's chain is the MIN over its members, so one DDS shipping no mips
-        // collapses the bucket and every cell using it shimmers at distance.
-        uint64_t vram = 0;
-        uint32_t shortChain = 0;   // SLICES (not buckets) whose chain stops short of 1x1
-        for (uint32_t b = 1; b < g_terrainBuckets.size(); ++b) {
-            const TerrainTexBucket& bk = g_terrainBuckets[b];
-            uint32_t mw = bk.w, mh = bk.h;
-            for (uint32_t m = 0; m < bk.mips; ++m) {
-                vram += (uint64_t)ddsTightMipBytes(bk.fmt, mw, mh) * bk.count;
-                mw = (mw > 1) ? mw >> 1 : 1; mh = (mh > 1) ? mh >> 1 : 1;
-            }
-            const uint32_t full = fullMipCount(bk.w, bk.h);
-            if (bk.mips < full) { shortChain += bk.count; }
-            LOG::logline(">> [terrain-tex] bucket=%u %ux%u slices=%u mips=%u (full=%u)%s",
-                         b, bk.w, bk.h, bk.count, bk.mips, full,
-                         (bk.mips < full) ? "  <-- SHORT CHAIN (these slices shimmer at distance)" : "");
-            // NAME the offenders: the chain is truncated in the source DDS, so the fix is on disk,
-            // not here. MGEXEgui's plugin step repairs loose ones in place (LandMipFixer).
-            if (bk.mips < full) {
-                std::string names;
-                for (uint32_t i = 0; i < bucketMembers[b].size() && i < 12; ++i) {
-                    names += (i ? " " : ""); names += Terrain::texName(bucketMembers[b][i]);
-                }
-                LOG::logline(">> [terrain-tex]   short-chain sources: %s%s", names.c_str(),
-                             (bucketMembers[b].size() > 12) ? " ..." : "");
-            }
-        }
+        // --- the BASE maps ---------------------------------------------------------------------
+        const TerrainTexSet base = buildTerrainTexSet(
+            R, "albedo", /*isData*/false,
+            SRT_RES_IDX(SrtData, PerFrame, gTerrainArrays), g_terrainBuckets,
+            [](uint32_t id, uint32_t* sz, uint32_t /*wantBytes*/) {
+                return Terrain::readLandTextureFile(id, sz);   // whole-file reader; no partial arm
+            });
+        outSlots = base.slots;
         LOG::logline(">> [terrain-tex] %u textures: %u uploaded, %u missing, %u overflow;"
                      " %zu/%u buckets (size cap %u), short-chain slices=%u, ~%llu MB VRAM",
-                     texCount - 1u, uploaded, missing, overflow, g_terrainBuckets.size() - 1,
-                     kTerrainBuckets - 1u, kTerrainTexCap, shortChain,
-                     (unsigned long long)(vram >> 20));
-        if (overflow) {
-            LOG::logline("!! [terrain-tex] %u textures DROPPED to the default ground: out of buckets"
-                         " (MAX_TERRAIN_BUCKETS=%u). Raise it in opaque.srt.h if the world grew.",
-                         overflow, kTerrainBuckets);
-        }
+                     texCount - 1u, base.uploaded, base.missing, base.overflow,
+                     g_terrainBuckets.size() - 1, kTerrainBuckets - 1u, kTerrainTexCap,
+                     base.shortChain, (unsigned long long)(base.vram >> 20));
         // Unresolvable textures fall back to the DEFAULT ground, not to white — that is what the
         // engine does, and vanilla Morrowind genuinely ships LTEX records whose texture is absent
         // (tx_lavacrust00, tx_ma_sandstone02 here: named by meshes, shipped by nobody). White would
         // make a content gap look like a renderer bug. Only a missing default itself stays white.
+        //
+        // ⚠ THE COMPANION SETS DELIBERATELY DO NOT DO THIS. A land texture with no `_paramh` must
+        // resolve to slot 0 = "no material", NOT to the default ground's material — inheriting it
+        // would paint _land_default's roughness and relief over every unmapped texture in the world.
         if (!outSlots.empty() && outSlots[0] != 0u) {
             for (uint32_t id = 1; id < texCount; ++id) {
                 if (outSlots[id] == 0u) { outSlots[id] = outSlots[0]; }
             }
         }
-        for (const std::string& nm : missingNames) {
+        for (const std::string& nm : base.missingNames) {
             LOG::logline("!! [terrain-tex] unresolved (drawn as the DEFAULT ground): %s", nm.c_str());
         }
+
+        // --- the PBR COMPANIONS (tasks/forge-terrain-pbr.md) ------------------------------------
+        // Name mangling mirrors the client's resolveParamSlot exactly (renderprocess.cpp): strip the
+        // extension, append `_paramh.dds`, then `_paramh_np.dds` — the "no parallax" variant, whose
+        // material and height are still the right ones for this path.
+        //
+        // ⚠ A MISSING COMPANION IS THE ORDINARY CASE, NOT A FAILURE. ~96 of 551 land textures ship a
+        // `_paramh`, so `missing` here counts the ground that stays exactly as it was. It is
+        // reported as COVERAGE and its names are deliberately not listed the way the base map's
+        // are — a warning per unmapped land texture would bury the base map's real ones.
+        const TerrainTexSet param = buildTerrainTexSet(
+            R, "paramh", /*isData*/true,
+            SRT_RES_IDX(SrtData, PerFrame, gTerrainParamArrays), g_terrainParamBuckets,
+            [](uint32_t id, uint32_t* sz, uint32_t want) {
+                const uint8_t* b = Terrain::readLandCompanionFile(id, "_paramh.dds", sz, want);
+                return b ? b : Terrain::readLandCompanionFile(id, "_paramh_np.dds", sz, want);
+            });
+        outParamSlots = param.slots;
+
+
+        LOG::logline(">> [terrain-tex] PBR companions: _paramh %u of %u land textures"
+                     " (%zu buckets, ~%llu MB); terrain texture VRAM ~%llu MB total",
+                     param.uploaded, texCount - 1u, g_terrainParamBuckets.size() - 1,
+                     (unsigned long long)(param.vram >> 20),
+                     (unsigned long long)((base.vram + param.vram) >> 20));
+        // The tripwire the plan asks for: a `_paramh` count far from the shipped set's size means
+        // the name mangling or the loose/BSA precedence is wrong, not that coverage is low.
+        if (param.uploaded == 0) {
+            LOG::logline(">> [terrain-tex] no `_paramh` beside ANY land texture — terrain PBR has"
+                         " nothing to shade, and the ground is byte-identical to before it existed."
+                         " If maps are installed, the name mangling or the texture index is wrong.");
+        }
         LOG::flush();
-        std::printf("[forge][terrain] land textures: %u uploaded, %u missing, %zu buckets, ~%lluMB\n",
-                    uploaded, missing, g_terrainBuckets.size() - 1, (unsigned long long)(vram >> 20));
+        std::printf("[forge][terrain] land textures: %u uploaded, %u missing, %zu buckets, ~%lluMB"
+                    "  (PBR: paramh %u, ~%lluMB)\n",
+                    base.uploaded, base.missing, g_terrainBuckets.size() - 1,
+                    (unsigned long long)(base.vram >> 20), param.uploaded,
+                    (unsigned long long)(param.vram >> 20));
         return true;
     }
 
@@ -44211,8 +44532,8 @@ void destroyHostWindow(Renderer* R);
         // Land textures FIRST, so the VTEX pack can be remapped from LTEX ids to resolved
         // (bucket<<16)|layer slots before it is uploaded — the frag then needs one load per tap
         // instead of a load plus an id->slot indirection.
-        std::vector<uint32_t> idToSlot;
-        buildTerrainTextureArrays(R, idToSlot);
+        std::vector<uint32_t> idToSlot, idToParam;
+        buildTerrainTextureArrays(R, idToSlot, idToParam);
         {
             std::vector<uint32_t> texSlots(Terrain::packedTex(),
                                            Terrain::packedTex() + (size_t)(tBytes / 4));
@@ -44229,6 +44550,77 @@ void destroyHostWindow(Renderer* R);
             LOG::logline(">> [terrain-tex] VTEX remap: %zu squares -> slots, %u unresolved (white)%s",
                          texSlots.size(), unresolved,
                          (unresolved == texSlots.size()) ? "  <-- ALL WHITE, remap is broken" : "");
+        }
+
+        // ...and the SAME pack twice more, through the PBR companion sets (tasks/forge-terrain-pbr.md).
+        // A second and third buffer of identical shape, NOT a per-pixel id->slot indirection: the
+        // frag reaches all three through one square index, so a param tap costs one buffer load and
+        // adds no divergence. ~4.8 MB each at 4704 cells.
+        //
+        // ⚠ SKIPPED ENTIRELY WHEN NOTHING RESOLVED. Leaving the descriptors unbound reads zero, and
+        // zero is slot 0 = "no companion" = the pre-PBR ground — the same benign-default convention
+        // every other optional resource on this set documents. So an install with no PBR texture
+        // pack pays no VRAM and no upload for a feature it cannot use.
+        {
+            auto remapPack = [&](Buffer** dst, const char* name,
+                                 const std::vector<uint32_t>& idTo, const char* label) -> uint32_t {
+                uint32_t resolved = 0;
+                for (uint32_t s : idTo) { if (s != 0u) { ++resolved; } }
+                // ⚠ THIS USED TO RETURN EARLY WITH THE BUFFER LEFT NULL, AND THAT WAS A LATENT
+                // UNBOUND-DESCRIPTOR READ — exposed when the (since retired) `_paramd` pack was skipped.
+                // terrain.frag calls landParamSlot whenever `pbrTerrain` is on, which is the
+                // default, and that indexes gTerrainParamTex
+                // UNCONDITIONALLY. A null buffer means the descriptor below is never written, so on
+                // any install whose land textures ship no `_paramh` at all the ground was reading a
+                // descriptor nobody had filled in. This file's own bind block warns about exactly
+                // that ("what an unbound terrain descriptor actually looks like on screen").
+                //
+                // So the pack is always allocated. All-zero IS the answer — slot 0 already means
+                // "no map of this kind" and the shader's zero test is one test — and it costs 4.8 MB.
+                if (resolved == 0u) {
+                    LOG::logline(">> [terrain-tex] %s VTEX pack is EMPTY (no land texture has one)"
+                                 " — allocated anyway, all slots 0, so the descriptor is bound and"
+                                 " the ground keeps its pre-PBR shading", label);
+                }
+                BufferLoadDesc pb = {};
+                pb.mDesc.mDescriptors  = DESCRIPTOR_TYPE_BUFFER;
+                pb.mDesc.mMemoryUsage  = RESOURCE_MEMORY_USAGE_GPU_ONLY;
+                pb.mDesc.mFormat       = TinyImageFormat_R32_UINT;    // typed Buffer<uint>
+                pb.mDesc.mElementCount = (uint32_t)(tBytes / 4);
+                pb.mDesc.mStructStride = 0;
+                pb.mDesc.mSize         = tBytes;
+                pb.mDesc.mStartState   = RESOURCE_STATE_SHADER_RESOURCE;
+                pb.mDesc.pName         = name;
+                pb.pData               = nullptr;
+                pb.ppBuffer            = dst;
+                addResource(&pb, nullptr);
+                waitForAllResourceLoads();
+                if (!*dst) {
+                    LOG::logline("!! [terrain-tex] %s VTEX pack alloc FAILED (%llu MB) — the ground"
+                                 " keeps its pre-PBR shading", label,
+                                 (unsigned long long)(tBytes >> 20));
+                    return 0u;
+                }
+                std::vector<uint32_t> sq(Terrain::packedTex(),
+                                         Terrain::packedTex() + (size_t)(tBytes / 4));
+                uint32_t covered = 0;
+                for (uint32_t& v : sq) {
+                    const uint32_t id = v;
+                    v = (id < idTo.size()) ? idTo[id] : 0u;
+                    if (v != 0u) { ++covered; }
+                }
+                upload(*dst, sq.data(), tBytes);
+                // WORLD COVERAGE, which is the number the plan wanted and the texture count is not:
+                // 96 of 551 land textures could still be most or almost none of the painted world.
+                // F12 mode 19 shows WHERE; this says HOW MUCH.
+                LOG::logline(">> [terrain-tex] %s VTEX remap: %u of %zu squares covered (%.1f%% of"
+                             " the world), from %u land textures",
+                             label, covered, sq.size(),
+                             sq.empty() ? 0.0 : (100.0 * (double)covered / (double)sq.size()),
+                             resolved);
+                return covered;
+            };
+            remapPack(&g_pTerrainParamTex, "terrainParamTex", idToParam, "_paramh");
         }
         Terrain::releaseGpuPack();
 
@@ -44250,7 +44642,8 @@ void destroyHostWindow(Renderer* R);
         }
 
         {
-            DescriptorData tp[4] = {};
+            DescriptorData tp[5] = {};
+            uint32_t nTp = 4;
             tp[0].mIndex = SRT_RES_IDX(SrtData, PerFrame, gTerrainHeights);
             tp[0].mCount = 1; tp[0].ppBuffers = &g_pTerrainHeights;
             tp[1].mIndex = SRT_RES_IDX(SrtData, PerFrame, gTerrainColor);
@@ -44259,6 +44652,14 @@ void destroyHostWindow(Renderer* R);
             tp[2].mCount = 1; tp[2].ppBuffers = &g_pTerrainTex;
             tp[3].mIndex = SRT_RES_IDX(SrtData, PerFrame, gTerrainCellGrid);
             tp[3].mCount = 1; tp[3].ppBuffers = &g_pTerrainCellGrid;
+            // The PBR companion pack rides the SAME update, so it cannot be wired into a subset of
+            // the sets the way the note below describes. Appended CONDITIONALLY: a null ppBuffers
+            // would be a bind of nothing rather than a bind of null, and leaving the descriptor
+            // untouched is what makes "no PBR texture pack installed" read as zero = no companion.
+            if (g_pTerrainParamTex) {
+                tp[nTp].mIndex = SRT_RES_IDX(SrtData, PerFrame, gTerrainParamTex);
+                tp[nTp].mCount = 1; tp[nTp].ppBuffers = &g_pTerrainParamTex; ++nTp;
+            }
             // Terrain is drawn by the reflect-geo pass too, and that pass binds a DIFFERENT PerFrame
             // set (pPerFrameSetReflectGeo — mirror viewProj + below-water clip). Binding these to the
             // main set alone left the mirror reading unbound descriptors, which does not fail loudly:
@@ -44268,9 +44669,9 @@ void destroyHostWindow(Renderer* R);
             // have no LAND record (no instance, so no sheet). It reads as "the water is black", which
             // is why it was hunted in the water and reflection code for a long time before landing
             // here. Any resource a shared shader reads must reach EVERY set that shader draws under.
-            updateDescriptorSet(R, 0, g_live.pPerFrameSet, 4, tp);
+            updateDescriptorSet(R, 0, g_live.pPerFrameSet, nTp, tp);
             if (g_live.pPerFrameSetReflectGeo) {
-                updateDescriptorSet(R, 0, g_live.pPerFrameSetReflectGeo, 4, tp);
+                updateDescriptorSet(R, 0, g_live.pPerFrameSetReflectGeo, nTp, tp);
             }
             // ...and the SUN caster set, once per cascade instance. terrain.vert draws under it now
             // (P1: the landscape casts), so this is the third instance of the same lesson — and the
@@ -44279,7 +44680,7 @@ void destroyHostWindow(Renderer* R);
             // absolute height 0 and paint a sea-level shadow across the whole world.
             if (g_live.pPerFrameSetSun) {
                 for (uint32_t c = 0; c < kSunCascades; ++c) {
-                    updateDescriptorSet(R, c, g_live.pPerFrameSetSun, 4, tp);
+                    updateDescriptorSet(R, c, g_live.pPerFrameSetSun, nTp, tp);
                 }
             }
         }
@@ -46156,7 +46557,7 @@ void destroyHostWindow(Renderer* R);
 
     // Build the distant-statics texture residency (gStaticsArrays): one Texture2DArray per
     // (format, capped-size) bucket, every unique statics texture uploaded ONCE as a slice via raw
-    // mip-extract (the largest mip with long side <= kStaticsTexCap + the chain below it — no
+    // mip-extract (the largest mip with long side <= g_staticsTexCap + the chain below it — no
     // decode/resize/encode). Each subset's texSlot resolves to (bucket<<16)|layer. All resident:
     // no eviction, no per-frame streaming, no white-on-traverse (the old LRU thrashed at high
     // DrawDist because a single view's working set exceeds the shared descriptor table). Idempotent.
@@ -46179,7 +46580,7 @@ void destroyHostWindow(Renderer* R);
         //
         // The source DDS are ideal for this loader, which is the other half of why the fallback is
         // right rather than merely expedient: it does a RAW mip-extract (the largest mip with long
-        // side <= kStaticsTexCap plus the chain below it — no decode, resize or re-encode), and the
+        // side <= g_staticsTexCap plus the chain below it — no decode, resize or re-encode), and the
         // groundcover textures ship 1024² DXT5 with full 11-level chains. The cap steps them to 512²
         // and takes the tail, which is what the bake would have written anyway.
         const std::string srcTexDir = "Data Files\\textures\\";
@@ -46202,7 +46603,7 @@ void destroyHostWindow(Renderer* R);
                                                      g_live.pStaticsWhiteArray, 2 });   // [0] = white
         std::vector<std::vector<std::string>> bucketMembers; bucketMembers.emplace_back();
 
-        // Which texture NAMES belong to grass — they get g_grassTexCap instead of kStaticsTexCap
+        // Which texture NAMES belong to grass — they get g_grassTexCap instead of g_staticsTexCap
         // (see that constant for why grass is the exception). Resolved from the def type rather than
         // from the path, so a pack that does not file its art under `grass\` still gets it right; a
         // name shared with a non-grass static simply lands on the larger cap, which costs memory and
@@ -46229,7 +46630,7 @@ void destroyHostWindow(Renderer* R);
             DdsInfo info = hdr.empty() ? DdsInfo{} : parseDds(hdr.data(), (uint32_t)hdr.size());
             if (!info.ok) { plan[nm] = UTexPlan{}; ++missing; continue; }   // -> white (bucket 0)
             const bool isGrass = (grassTex.find(nm) != grassTex.end());
-            const uint32_t cap = isGrass ? (uint32_t)std::max(1.0f, g_grassTexCap) : kStaticsTexCap;
+            const uint32_t cap = (uint32_t)std::max(1.0f, isGrass ? g_grassTexCap : g_staticsTexCap);
             uint32_t k = 0, w = info.width, h = info.height;
             while ((w > cap || h > cap) && (k + 1) < info.mipLevels) {
                 w = (w > 1) ? w >> 1 : 1; h = (h > 1) ? h >> 1 : 1; ++k;    // clamp to leave >=1 mip
@@ -53828,6 +54229,7 @@ void destroyHostWindow(Renderer* R);
         if (g_pTerrainHeights)      { removeResource(g_pTerrainHeights);         g_pTerrainHeights = nullptr; }
         if (g_pTerrainColors)       { removeResource(g_pTerrainColors);          g_pTerrainColors = nullptr; }
         if (g_pTerrainTex)          { removeResource(g_pTerrainTex);             g_pTerrainTex = nullptr; }
+        if (g_pTerrainParamTex)     { removeResource(g_pTerrainParamTex);        g_pTerrainParamTex = nullptr; }
         if (g_pTerrainCellGrid)     { removeResource(g_pTerrainCellGrid);        g_pTerrainCellGrid = nullptr; }
         for (TerrainView* v : { &g_terrainMain, &g_terrainRefl, &g_terrainSun }) {
             if (v->instRing) { removeResource(v->instRing); v->instRing = nullptr; }
@@ -53835,10 +54237,14 @@ void destroyHostWindow(Renderer* R);
             v->cells = 0;
             for (uint32_t l = 0; l < kTerrainLods; ++l) { v->drawCounts[l] = 0; }
         }
-        for (uint32_t b = 1; b < g_terrainBuckets.size(); ++b) {   // [0] is g_pTerrainWhite
-            if (g_terrainBuckets[b].tex) { removeResource(g_terrainBuckets[b].tex); }
+        // [0] is the reserved "no texture of this kind" slot in both sets — g_pTerrainWhite for
+        // the albedo set (removed below, once), nothing at all for the companion set.
+        for (std::vector<TerrainTexBucket>* bs : { &g_terrainBuckets, &g_terrainParamBuckets }) {
+            for (uint32_t b = 1; b < bs->size(); ++b) {
+                if ((*bs)[b].tex) { removeResource((*bs)[b].tex); }
+            }
+            bs->clear();
         }
-        g_terrainBuckets.clear();
         if (g_pTerrainWhite)        { removeResource(g_pTerrainWhite);           g_pTerrainWhite = nullptr; }
         g_terrainReady = false;
         g_terrainLoadTried = false;

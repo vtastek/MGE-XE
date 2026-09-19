@@ -14,8 +14,10 @@
 #include "morrowindbsa.h"
 #include "mge_tracy.h"
 #include "imgui.h"
+#include "proxydx/texledger.h"   // Morrowind's own texture bytes (tasks/forge-memory-shape.md)
 
 #include <windows.h>
+#include <dxgi1_4.h>   // QueryVideoMemoryInfo: Morrowind.exe's OWN VRAM
 #include <algorithm>
 #include <cmath>
 #include <chrono>
@@ -24,6 +26,7 @@
 #include <atomic>
 #include <thread>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <cstdlib>
 #include <cctype>
@@ -509,13 +512,10 @@ namespace {
         const char*   paramNamePtr = nullptr;
         std::uint32_t paramSlot = 0;
         std::uint32_t paramEpoch = 0;
-        // ...and the baked derivative map beside it. Its own fields rather than a second value on
-        // paramSlot's: the two files are found independently (a texture can have a _paramh and no
-        // _paramd), and one epoch re-validating the other's stale slot is the aliasing bug ovEpoch
-        // already exists to avoid.
-        const char*   derivNamePtr = nullptr;
-        std::uint32_t derivSlot = 0;
-        std::uint32_t derivEpoch = 0;
+        // Exterior cell the part was last emitted in (stampSlotCell). evictStaleTextures lets a
+        // part pin its textures only while that cell is in Morrowind's ACTIVE grid.
+        std::int32_t  cellX = 0, cellY = 0;
+        bool          cellKnown = false;
     };
     std::unordered_map<std::uint32_t, SlotInfo> g_keySlot;
     std::uint32_t g_texEpoch = 0;            // bumped on bindless-slot LRU recycle
@@ -828,6 +828,51 @@ namespace {
     // one line per session, then unbounded silence. Now counted and surfaced in the heartbeat.
     std::uint64_t                             g_texRecycles = 0;    // LRU evictions, session total
     std::uint64_t                             g_texThrashes = 0;    // recycled a slot used this frame
+
+    // STALE-TEXTURE EVICTION (tasks/forge-memory-shape.md). The LRU above only ever recycles once the
+    // range is FULL, and the host frees a texture only when its slot is re-uploaded, so residency
+    // ratcheted to 872 slots (~3.2 GB of mostly-unsampled textures) and never came back down.
+    // evictStaleTextures releases a slot when BOTH hold:
+    //   - no live g_keySlot part INSIDE MORROWIND'S ACTIVE GRID names it (base / overlay / param).
+    //     The active 3x3 is the gone-signal: a texture only cells behind the grid use stops being
+    //     pinned the moment the grid moves on (and indoors every live part pins). Every cross-frame
+    //     copy of a slot lives in a SlotInfo in g_keySlot, so after a release the SlotInfos still
+    //     naming it (outer-ring parts) are cleared in the same pass and re-resolve by name — no epoch
+    //     bump, no re-resolve storm. The host's persistent shadow-caster records carry the base slot
+    //     of a live key; an outer-ring key is a cell or more away, beyond the sun cascades.
+    //   - it has not been referenced for g_texEvictAgeFrames. Every per-frame consumer that resolves
+    //     by name (multimap stages, captured alpha, sky, FP, glow) stamps g_slotLastUsed, so the age
+    //     covers them — and doubles as the hysteresis that stops a door hop re-uploading a cell.
+    // Released slots go on g_texFreeSlots and are reused before the range grows; the host is told
+    // with a zero-length TexUploadWire flagged kTexUploadRelease, and retires the texture.
+    std::vector<std::uint32_t>                g_texFreeSlots;
+    std::vector<std::uint32_t>                g_slotBytes;          // slot -> DDS bytes shipped (eviction log)
+    std::uint32_t                             g_texEvictAgeFrames = 600;   // MGE_TEX_EVICT_FRAMES; 0 = off
+    std::uint64_t                             g_texEvictions = 0;   // session totals
+    std::uint64_t                             g_texEvictedBytes = 0;
+
+    // FIRST-SIGHT STREAMING (user, 2026-09-20: "same texture is already in DL and it can just be
+    // reused until real texture is loaded, without a stall or hitch"). A cell load or a door used to
+    // resolve 100-370 MB of textures in ONE frame and ship them in one blocking flush (texflush 50-105
+    // ms). Now a first-sight texture that the distant-land bake made a LOD copy of gets that copy
+    // (distantland\statics\textures, KB-sized) as its slot's first upload — drawable this frame — and
+    // the full file joins g_texStreamQueue; streamPendingTextures ships at most g_texStreamBudgetMB
+    // of full files per frame into the SAME slots (the host replaces a slot's texture in place, as it
+    // always has for re-uploads). _paramh companions have no LOD copy: they are queued with the slot
+    // reset to white, which the shader already reads as "no param map", so PBR pops in instead of the
+    // frame stalling. Everything else (no LOD copy, not data) stays synchronous — a white card would
+    // be worse than the stall. MGE_TEX_STREAM_MB overrides; 0 = off (everything synchronous).
+    struct TexStreamJob {
+        std::uint32_t slot;
+        std::string   name;
+        bool          data;   // a _paramh: upload with kTexUploadData
+    };
+    std::deque<TexStreamJob>                  g_texStreamQueue;
+    std::uint32_t                             g_texStreamBudgetMB = 16;
+    std::uint64_t                             g_texPlaceholders = 0;  // session totals
+    std::uint64_t                             g_texDeferredData = 0;
+    std::uint64_t                             g_texStreamed = 0;
+    std::uint64_t                             g_texStreamedBytes = 0;
 
     // ---- Flip-book texture arrays (NiFlipController) ---------------------------------------
     // A book used to claim ONE SLOT PER FRAME out of the ~872 client slots; Enhanced Light's
@@ -1315,6 +1360,9 @@ namespace {
             g_texSlot.clear();
             g_slotName.clear();
             g_slotLastUsed.clear();
+            g_slotBytes.clear();
+            g_texFreeSlots.clear();
+            g_texStreamQueue.clear();          // its slots belonged to the OLD host
             g_nextTexSlot = 1;                 // 0 = host default white
             ++g_texEpoch;                      // invalidate every cached ResolvedTex fast-path (name+epoch)
             g_texPendingEntries.clear();       // drop tex uploads staged for the OLD host
@@ -1728,6 +1776,17 @@ namespace {
         }
         LOG::logline(">> [seam] scene vecs ready (geom %u, draw %u, skinned %u, multimap 1, light 1, sky 1, alpha 1, tex %u chunks)",
                      IPC::kGeomChunks, kDrawChunks, kDrawChunks, IPC::kTexChunks);
+
+        // First-sight streaming budget (g_texStreamQueue), read before the first texture resolves.
+        {
+            char e[32] = {};
+            if (GetEnvironmentVariableA("MGE_TEX_STREAM_MB", e, sizeof(e)) > 0) {
+                g_texStreamBudgetMB = (std::uint32_t)std::strtoul(e, nullptr, 10);
+            }
+            LOG::logline(">> [tex-stream] first-sight streaming %s (%u MB of full files per frame, DL LOD"
+                         " copies as placeholders; MGE_TEX_STREAM_MB overrides, 0 = off)",
+                         g_texStreamBudgetMB ? "ON" : "OFF", g_texStreamBudgetMB);
+        }
     }
 
     // Normalize an NI SourceTexture::fileName to the bare name BSA::loadFileBytes expects
@@ -1756,7 +1815,7 @@ namespace {
         try {
             std::vector<std::uint8_t> entry(sizeof(hdr) + size);
             std::memcpy(entry.data(), &hdr, sizeof(hdr));
-            std::memcpy(entry.data() + sizeof(hdr), data, size);
+            if (size) { std::memcpy(entry.data() + sizeof(hdr), data, size); }   // 0: a release
             g_texPendingBytes += entry.size();
             g_texPendingEntries.push_back(std::move(entry));
             ++g_texPendingCount;
@@ -1798,6 +1857,7 @@ namespace {
         if (g_slotName.size() != IPC::kMaxTextures) {
             g_slotName.assign(IPC::kMaxTextures, std::string());
             g_slotLastUsed.assign(IPC::kMaxTextures, 0u);
+            g_slotBytes.assign(IPC::kMaxTextures, 0u);
         }
         auto it = g_texSlot.find(name);
         if (it != g_texSlot.end()) {
@@ -1812,9 +1872,25 @@ namespace {
 
         void* data = nullptr;
         unsigned size = 0;
+        // First-sight streaming (see g_texStreamQueue): a texture the DL bake has a LOD copy of goes
+        // in as that copy now and streams its full file later; a _paramh that exists is deferred with
+        // nothing to show. Both skip the full read here, which is the whole point.
+        bool deferred = false;
+        if (g_texStreamBudgetMB != 0) {
+            // The LOD library carries the PBR companions too since 2026-09-20, so a _paramh can have
+            // a stand-in like any base map — that is the difference between PBR being THERE at low
+            // resolution and PBR switching on a frame later. Bakes made before that have none, and a
+            // param map then falls back to deferring with nothing to show.
+            deferred = BSA::loadDistantLodBytes(name.c_str(), &data, &size) && data && size > 0;
+            if (!deferred && data) { std::free(data); data = nullptr; size = 0; }
+            if (!deferred && dataTexture) {
+                deferred = BSA::fileExists(name.c_str(), true);
+            }
+        }
         // skipDistantStatics=true: the Forge near path must NOT pick the distantland\statics
-        // downscaled-LOD copies (they blur near geometry) — resolve loose Data Files -> BSA.
-        if (!BSA::loadFileBytes(name.c_str(), &data, &size, true) || !data || size == 0) {
+        // downscaled-LOD copies (they blur near geometry) — resolve loose Data Files -> BSA. (The
+        // placeholder above is the one sanctioned exception, and only until the real file lands.)
+        if (!deferred && (!BSA::loadFileBytes(name.c_str(), &data, &size, true) || !data || size == 0)) {
             static int misses = 0;
             if (!quietMiss && misses < 20) { LOG::logline("!! [tex] not found: %s (white)", name.c_str()); ++misses; }
             if (data) { std::free(data); }
@@ -1842,9 +1918,13 @@ namespace {
         // not by rationing the staging buffer downstream of a decision already made wrong. Bounding
         // the SUM was the right instinct about a contiguous vector (the deque above is that fix);
         // bounding it by REFUSING WORK was not. See tasks/forge-pbr-materials.md for the slice plan.
-        // Assign a slot: grow while the range has room, else recycle the least-recently-used slot.
+        // Assign a slot: reuse one eviction released, else grow while the range has room, else
+        // recycle the least-recently-used slot.
         std::uint32_t slot;
-        if (g_nextTexSlot < cap) {
+        if (!g_texFreeSlots.empty()) {
+            slot = g_texFreeSlots.back();
+            g_texFreeSlots.pop_back();
+        } else if (g_nextTexSlot < cap) {
             slot = g_nextTexSlot++;
         } else {
             std::uint32_t lru = 1, best = 0xFFFFFFFFu;
@@ -1875,15 +1955,33 @@ namespace {
         g_texSlot[name] = slot;
         g_slotName[slot] = name;
         g_slotLastUsed[slot] = g_frame;
-        IPC::TexUploadWire hdr{ slot | (dataTexture ? IPC::kTexUploadData : 0u), size, 0u };
-        const bool staged = stageTexUpload(hdr, data, size);
+        g_slotBytes[slot] = size;
+        const bool havePlaceholder = (data != nullptr);
+        bool staged;
+        if (deferred && !havePlaceholder) {
+            // Nothing to show until the file lands (a param map whose bake predates the companion
+            // copies). Reset the slot anyway: an LRU-recycled slot still holds its previous occupant
+            // on the host, and a stale param map would shade this draw with someone else's material.
+            // White + not-data is exactly "no param map" to the shader.
+            const IPC::TexUploadWire rel{ slot | IPC::kTexUploadRelease, 0u, 0u };
+            staged = stageTexUpload(rel, nullptr, 0u);
+        } else {
+            IPC::TexUploadWire hdr{ slot | (dataTexture ? IPC::kTexUploadData : 0u), size, 0u };
+            staged = stageTexUpload(hdr, data, size);
+        }
         std::free(data);
+        if (staged && deferred) {
+            g_texStreamQueue.push_back(TexStreamJob{ slot, name, dataTexture });
+            if (havePlaceholder) { ++g_texPlaceholders; } else { ++g_texDeferredData; }
+        }
         if (!staged) {
-            // Out of memory, not a bad file. Release the slot back to the LRU (empty name + age 0
-            // makes it the next recycle candidate) and cache the miss so a scene full of textures we
-            // cannot stage doesn't re-read every one of them from the BSA every frame.
+            // Out of memory, not a bad file. Hand the slot straight back (free list, empty name)
+            // and cache the miss so a scene full of textures we cannot stage doesn't re-read every
+            // one of them from the BSA every frame.
             g_slotName[slot].clear();
             g_slotLastUsed[slot] = 0;
+            g_slotBytes[slot] = 0;
+            g_texFreeSlots.push_back(slot);
             g_texSlot[name] = 0;
             return 0;
         }
@@ -2165,6 +2263,166 @@ namespace {
         }
     }
 
+    // Ship queued full textures (see g_texStreamQueue) into their slots, at most g_texStreamBudgetMB
+    // per frame and always at least one, so a single 21 MB 4K map cannot starve behind the budget.
+    // Called at the end of the BUILD (worker in the async modes, never the park fire on main), so the
+    // disk reads land where the draw-list build already pays for first-sight reads. The BSA reads stay
+    // under g_texResidencyMx: every BSA read shares one file handle per archive, and its seek position
+    // is not thread-safe — main's captureAlphaDraw resolves through the same loader under this lock.
+    void streamPendingTextures() {
+        if (g_texStreamBudgetMB == 0 || !g_texVec) {
+            return;
+        }
+        const std::size_t budget = (std::size_t)g_texStreamBudgetMB << 20;
+        const std::size_t windowBytes = (std::size_t)IPC::kTexWindowBytes;
+        std::size_t staged = 0;
+        std::uint32_t shipped = 0, dropped = 0;
+        std::lock_guard<std::mutex> lk(g_texResidencyMx);
+        while (!g_texStreamQueue.empty() && (shipped == 0 || staged < budget)) {
+            TexStreamJob job = std::move(g_texStreamQueue.front());
+            g_texStreamQueue.pop_front();
+            // Evicted or recycled while it waited: the slot means something else now.
+            if (job.slot >= g_slotName.size() || g_slotName[job.slot] != job.name) {
+                ++dropped;
+                continue;
+            }
+            void* data = nullptr;
+            unsigned size = 0;
+            if (!BSA::loadFileBytes(job.name.c_str(), &data, &size, true) || !data || size == 0
+                || sizeof(IPC::TexUploadWire) + size > windowBytes) {
+                // The placeholder stays (or, for a param map, no PBR) — degraded, never broken.
+                static std::uint32_t s_failLogged = 0;
+                if (s_failLogged++ < 8) {
+                    LOG::logline("!! [tex-stream] full file for %s did not load (%u bytes) — keeping %s",
+                                 job.name.c_str(), size, job.data ? "no param map" : "the LOD placeholder");
+                }
+                if (data) { std::free(data); }
+                ++dropped;
+                continue;
+            }
+            const IPC::TexUploadWire hdr{ job.slot | (job.data ? IPC::kTexUploadData : 0u), size, 0u };
+            if (stageTexUpload(hdr, data, size)) {
+                g_slotBytes[job.slot] = size;
+                staged += size;
+                ++shipped;
+                ++g_texStreamed;
+                g_texStreamedBytes += size;
+            }
+            std::free(data);
+        }
+        if (shipped || dropped) {
+            static std::uint32_t s_logThrottle = 0;
+            if ((s_logThrottle++ % 30) == 0 || g_texStreamQueue.empty()) {
+                LOG::logline("-- [tex-stream] shipped %u full textures (%.1f MB) this frame, %u dropped, %zu queued",
+                             shipped, (double)staged / (1024.0 * 1024.0), dropped, g_texStreamQueue.size());
+            }
+        }
+    }
+
+    // Release the texture slots no live part names and nothing has sampled for g_texEvictAgeFrames
+    // (the rule, and why it is safe, is at g_texFreeSlots). Runs in the produce context between
+    // flushGeometry and flushTextures: g_keySlot is produce-owned, and the releases staged here ride
+    // THIS frame's texture flush, which the host takes after this frame's geometry releases.
+    constexpr std::uint32_t kTexEvictPeriodFrames = 30;
+    constexpr std::uint32_t kMaxTexEvictPerPass   = 128;
+    void evictStaleTextures() {
+        static bool s_envRead = false;
+        if (!s_envRead) {
+            s_envRead = true;
+            char e[32] = {};
+            if (GetEnvironmentVariableA("MGE_TEX_EVICT_FRAMES", e, sizeof(e)) > 0) {
+                g_texEvictAgeFrames = (std::uint32_t)std::strtoul(e, nullptr, 10);
+            }
+            LOG::logline(">> [tex-evict] stale-texture eviction %s (age %u frames; MGE_TEX_EVICT_FRAMES"
+                         " overrides, 0 = off)", g_texEvictAgeFrames ? "ON" : "OFF", g_texEvictAgeFrames);
+        }
+        if (g_texEvictAgeFrames == 0) {
+            return;
+        }
+        static std::uint32_t s_lastPass = 0;
+        if (g_frame - s_lastPass < kTexEvictPeriodFrames) {
+            return;
+        }
+        // A geometry release still queued (or unshipped) means a departed key's host shadow-caster
+        // record may still carry its base slot. Its SlotInfo is already gone, so the reference scan
+        // below cannot see it: wait until the host has dropped the record.
+        if (!g_pendingReleaseSlots.empty() || !g_pendingBlob.empty()) {
+            return;
+        }
+        s_lastPass = g_frame;
+
+        // WHO PINS A TEXTURE: a live part inside Morrowind's ACTIVE grid (the 3x3 around the central
+        // cell). The geometry cache keeps a 5x5 (cellGridGone, radius 2) as hysteresis for its own
+        // meshes; letting that outer ring pin textures held 50-66 high-res resident against 5-22
+        // actually sampled (gridwalk, 2026-09-19). Indoors, or with no grid to read, every live part
+        // pins. An outer-ring part is at least a cell from the player, beyond the sun cascades, so its
+        // host shadow-caster record cannot be sampling the texture it loses.
+        void* dh = MGE::SceneGraph::getDataHandler();
+        const bool interior = !dh || MGE::DataHandlerView::currentInteriorCell(dh) != nullptr;
+        const std::int32_t gx = dh ? MGE::DataHandlerView::centralGridX(dh) : 0;
+        const std::int32_t gy = dh ? MGE::DataHandlerView::centralGridY(dh) : 0;
+        constexpr std::int32_t kActiveGridRadius = 1;
+        static std::vector<std::uint8_t> s_ref;
+        s_ref.assign(IPC::kMaxTextures, 0u);
+        for (const auto& kv : g_keySlot) {
+            const SlotInfo& si = kv.second;
+            const bool pins = interior || !si.cellKnown
+                || (std::abs(si.cellX - gx) <= kActiveGridRadius && std::abs(si.cellY - gy) <= kActiveGridRadius);
+            if (!pins) { continue; }
+            // Flip slots are >= 0x8000 and never evicted, so the bound drops them too.
+            const std::uint32_t held[3] = { si.baseSlot, si.ovSlot, si.paramSlot };
+            for (std::uint32_t s : held) {
+                if (s != 0 && s < IPC::kMaxTextures) { s_ref[s] = 1u; }
+            }
+        }
+
+        static std::vector<std::uint8_t> s_gone;
+        s_gone.assign(IPC::kMaxTextures, 0u);
+        std::uint32_t released = 0, heldStale = 0;
+        std::uint64_t bytes = 0;
+        {
+            std::lock_guard<std::mutex> lk(g_texResidencyMx);
+            if (g_slotName.size() != IPC::kMaxTextures) {
+                return;
+            }
+            const std::uint32_t cap = IPC::kMaxTextures - IPC::kDlReserve;
+            for (std::uint32_t s = 1; s < g_nextTexSlot && s < cap; ++s) {
+                if (g_slotName[s].empty()) { continue; }   // already free
+                if (g_frame - g_slotLastUsed[s] < g_texEvictAgeFrames) { continue; }
+                if (s_ref[s]) { ++heldStale; continue; }     // a live part still names it
+                if (released >= kMaxTexEvictPerPass) { continue; }   // next pass
+                g_texSlot.erase(g_slotName[s]);
+                g_slotName[s].clear();
+                g_slotLastUsed[s] = 0;
+                bytes += g_slotBytes[s];
+                g_slotBytes[s] = 0;
+                g_texFreeSlots.push_back(s);
+                const IPC::TexUploadWire rel{ s | IPC::kTexUploadRelease, 0u, 0u };
+                stageTexUpload(rel, nullptr, 0u);   // a failed stage only delays the host's free
+                s_gone[s] = 1u;
+                ++released;
+            }
+            g_texEvictions += released;
+            g_texEvictedBytes += bytes;
+        }
+        // An outer-ring part may still NAME a slot just released, in a SlotInfo whose fast path would
+        // hand it back unchecked — and the slot is about to be reused for another texture. Forget the
+        // cached value, so that part re-resolves by name if it ever draws again. (No epoch bump: only
+        // the holders of a released slot re-resolve, not every cached slot in the scene.)
+        if (released) {
+            for (auto& kv : g_keySlot) {
+                SlotInfo& si = kv.second;
+                if (si.baseSlot  < IPC::kMaxTextures && s_gone[si.baseSlot])  { si.baseNamePtr  = nullptr; si.baseSlot  = 0; }
+                if (si.ovSlot    < IPC::kMaxTextures && s_gone[si.ovSlot])    { si.ovNamePtr    = nullptr; si.ovSlot    = 0; }
+                if (si.paramSlot < IPC::kMaxTextures && s_gone[si.paramSlot]) { si.paramNamePtr = nullptr; si.paramSlot = 0; }
+            }
+        }
+        if (released) {
+            LOG::logline("-- [tex-evict] released %u slots (%.1f MB of DDS); %u stale slots held by"
+                         " live parts", released, (double)bytes / (1024.0 * 1024.0), heldStale);
+        }
+    }
+
     // Drain g_pendingBlob to the host in window-sized whole-part chunks. Parts are
     // self-describing (GeomPartWire carries vert/index counts), so we walk part
     // boundaries to never split a part across a chunk. Blocking RPCs — called at
@@ -2355,6 +2613,14 @@ namespace {
     // Resolve a bindless texture slot through a SlotInfo cache field (see SlotInfo).
     // Fast path = pointer-identity + epoch check, no string normalize/hash. The
     // LRU age refresh matches what resolveTextureSlot's memoized path would do.
+    // Where a part was last emitted, for evictStaleTextures' active-grid hold. Same derivation as the
+    // geometry cache's cellGridGone (world translation / 8192), so both agree on a part's cell.
+    inline void stampSlotCell(SlotInfo& si, const MGE::GeometryCache::CachedGeometry& e) {
+        si.cellX = (std::int32_t)std::floor(e.worldTransformD3D[12] / 8192.0f);
+        si.cellY = (std::int32_t)std::floor(e.worldTransformD3D[13] / 8192.0f);
+        si.cellKnown = true;
+    }
+
     std::uint32_t resolveCachedSlot(const char* name, const char*& namePtr,
                                     std::uint32_t& slotVal, std::uint32_t& slotEpoch) {
         if (name == namePtr && slotEpoch == g_texEpoch) {
@@ -2408,30 +2674,6 @@ namespace {
         si.paramNamePtr = baseName;
         si.paramSlot    = slot;
         si.paramEpoch   = g_texEpoch;   // AFTER resolving: a recycle inside it bumps the epoch
-        return slot;
-    }
-
-    // The BAKED DERIVATIVE MAP, `<base>_paramd.dds` (mgeHost64/pbrbake). Same shape and the same
-    // caching rules as resolveParamSlot above; a separate lookup because the two files are
-    // independent — 96 of the shipped _paramh maps have no 16-bit source left and will never have a
-    // _paramd, and that is the ordinary case rather than a failure.
-    std::uint32_t resolveDerivSlot(const char* baseName, std::uint32_t baseSlot, SlotInfo& si) {
-        if (!baseName || baseSlot == 0 || IPC::isFlipSlot(baseSlot)) { return 0; }
-        if (baseName == si.derivNamePtr && si.derivEpoch == g_texEpoch) {
-            if (si.derivSlot != 0) { g_slotLastUsed[si.derivSlot] = g_frame; }
-            return si.derivSlot;
-        }
-        std::string stem = normalizeTextureName(baseName);
-        const std::size_t dot = stem.find_last_of('.');
-        const std::size_t sep = stem.find_last_of('\\');
-        if (dot != std::string::npos && (sep == std::string::npos || dot > sep)) { stem.erase(dot); }
-        // dataTexture: a derivative map is BC5 and must keep its stored SNORM format — the scene's
-        // sRGB view is not defined for BC5 and would be meaningless over a signed slope anyway.
-        const std::uint32_t slot = stem.empty() ? 0u
-            : resolveTextureSlotEx((stem + "_paramd.dds").c_str(), true, true);
-        si.derivNamePtr = baseName;
-        si.derivSlot    = slot;
-        si.derivEpoch   = g_texEpoch;
         return slot;
     }
 
@@ -2497,6 +2739,7 @@ namespace {
                         std::uint32_t portalFlags = 0) {
             IPC::DrawItemWire item;
             item.slot = si.slot;
+            stampSlotCell(si, e);
             diagWorldDet("STATIC", e.textureName, e.worldTransformD3D);
             // Textureless visual (e.textureName null) → slot 0 = host default white; resolveCachedSlot
             // would std::string(nullptr) on the name lookup, so short-circuit it.
@@ -2510,7 +2753,6 @@ namespace {
                 ? resolveCachedSlot(e.overlayTextureName, si.ovNamePtr, si.ovSlot, si.ovEpoch) : 0u;
             // PBR param map of the base texture (0 = none → the host shades it exactly as before).
             item.paramTexIndex = resolveParamSlot(e.textureName, item.texIndex, si);
-            item.derivTexIndex = resolveDerivSlot(e.textureName, item.texIndex, si);
             item.alphaRef = e.alphaTest ? e.alphaRef : 0.0f;     // alpha-test cutout (0 = no test)
             // MW's per-map texture address mode, plus the enchanted-item glow bit riding this
             // lane's spare bits (see IPC::kTexFlagEnchantGlow — one decode, in packTexAlpha).
@@ -2581,6 +2823,7 @@ namespace {
             if (e.skinnedUnsupported || e.numBones == 0) {
                 return;
             }
+            stampSlotCell(si, e);
             if (e.bonePalette.size() < (std::size_t)e.numBones * 16) {
                 return;   // palette not yet built this frame
             }
@@ -2732,6 +2975,7 @@ namespace {
                        std::uint32_t& count, std::vector<std::uint8_t>& dst = g_alphaScratch) {
             IPC::AlphaDrawWire item;
             item.slot      = si.slot;
+            stampSlotCell(si, e);
             diagWorldDet("ALPHA", e.textureName, e.worldTransformD3D);
             item.texIndex  = resolveCachedSlot(e.textureName, si.baseNamePtr, si.baseSlot, si.baseEpoch);
             diagTexSlot("ALPH", e.textureName, item.texIndex, e.d3dTexture != nullptr, e.enchantGlow);
@@ -5010,9 +5254,10 @@ namespace RenderProcess {
             // concurrently with main, and an unlocked .size() on a rehashing map is exactly the
             // race that corrupted the heap once already (see the g_texResidencyMx comment).
             {
-                std::size_t resident = 0;
+                std::size_t resident = 0, freeSlots = 0, streamQueue = 0;
                 std::uint32_t nextSlot = 0, epoch = 0;
-                std::uint64_t recycles = 0, thrashes = 0;
+                std::uint64_t recycles = 0, thrashes = 0, evictions = 0, evictedBytes = 0;
+                std::uint64_t placeholders = 0, deferredData = 0, streamed = 0, streamedBytes = 0;
                 // Stale-slot histogram. slots= only ever CLIMBS (residency is cumulative all
                 // session), so on its own it cannot distinguish "the working set really is this
                 // big" from "we are hoarding textures nothing has sampled in minutes". The LRU
@@ -5037,20 +5282,145 @@ namespace RenderProcess {
                     epoch    = g_texEpoch;
                     recycles = g_texRecycles;
                     thrashes = g_texThrashes;
+                    evictions = g_texEvictions;
+                    evictedBytes = g_texEvictedBytes;
+                    freeSlots = g_texFreeSlots.size();
+                    streamQueue = g_texStreamQueue.size();
+                    placeholders = g_texPlaceholders;
+                    deferredData = g_texDeferredData;
+                    streamed = g_texStreamed;
+                    streamedBytes = g_texStreamedBytes;
                     frameNow = g_frame;
-                    // Slot 0 is the host default white and is never LRU-tracked, so start at 1.
+                    // Slot 0 is the host default white and is never LRU-tracked, so start at 1. A
+                    // free (evicted) slot holds nothing, so it is no age class at all.
                     for (std::uint32_t s = 1; s < nextSlot && s < g_slotLastUsed.size(); ++s) {
+                        if (g_slotName[s].empty()) { continue; }
                         const std::uint32_t age = frameNow - g_slotLastUsed[s];
                         if (age > 18000u)     { ++stale5m; }
                         else if (age > 1800u) { ++stale30s; }
                         else                  { ++hot; }
                     }
                 }
-                LOG::logline(">> [hb] tex residency: slots=%u/%u resident=%zu | recycles=%llu thrash=%llu epoch=%u"
-                             " | age hot=%u stale30s=%u stale5m=%u",
-                             nextSlot, IPC::kMaxTextures - IPC::kDlReserve, resident,
+                LOG::logline(">> [hb] tex residency: slots=%u/%u (free %zu) resident=%zu | recycles=%llu"
+                             " thrash=%llu epoch=%u | age hot=%u stale30s=%u stale5m=%u"
+                             " | evicted %llu = %.0f MB this session",
+                             nextSlot, IPC::kMaxTextures - IPC::kDlReserve, freeSlots, resident,
                              (unsigned long long)recycles, (unsigned long long)thrashes, epoch,
-                             hot, stale30s, stale5m);
+                             hot, stale30s, stale5m, (unsigned long long)evictions,
+                             (double)evictedBytes / (1024.0 * 1024.0));
+                LOG::logline(">> [hb] tex stream: placeholders %llu, param maps deferred %llu | streamed %llu"
+                             " = %.0f MB | queued now %zu",
+                             (unsigned long long)placeholders, (unsigned long long)deferredData,
+                             (unsigned long long)streamed, (double)streamedBytes / (1024.0 * 1024.0),
+                             streamQueue);
+            }
+            // MORROWIND.EXE'S OWN MEMORY (tasks/forge-memory-shape.md, alarms 3 + 4). The Windows
+            // "GPU Process Memory" counter showed this process holding 2355 MB beside the host's
+            // 4595 MB, and nothing in either log could say of what. Two meters:
+            //   process      WDDM's per-process accounting through the SYSTEM dxgi.dll (loaded by
+            //                full System32 path: DXVK is loaded explicitly as d3d9_dxvk.dll and must
+            //                never answer this), so it counts every API this process allocates
+            //                through, Vulkan included. The adapter is the one where THIS process holds
+            //                the most — a hybrid laptop also enumerates its iGPU — and it is only
+            //                chosen once that is nonzero, so an early heartbeat cannot pin the wrong one.
+            //   MW textures  the proxy's own ledger: what Morrowind created, in GPU bytes.
+            // What neither covers (MGE's DX9 distant land and targets, DXVK's own) is the difference.
+            {
+                static IDXGIAdapter3* s_mwAdapter = nullptr;
+                if (!s_mwAdapter) {
+                    typedef HRESULT (WINAPI *PFN_CreateDXGIFactory1)(REFIID, void**);
+                    static PFN_CreateDXGIFactory1 s_create = nullptr;
+                    static bool s_looked = false;
+                    if (!s_looked) {
+                        s_looked = true;
+                        wchar_t sys[MAX_PATH] = {};
+                        const UINT n = GetSystemDirectoryW(sys, MAX_PATH);
+                        if (n > 0 && n < MAX_PATH - 12) {
+                            wcscat_s(sys, L"\\dxgi.dll");
+                            if (HMODULE dx = LoadLibraryW(sys)) {
+                                s_create = (PFN_CreateDXGIFactory1)GetProcAddress(dx, "CreateDXGIFactory1");
+                            }
+                        }
+                    }
+                    IDXGIFactory1* fac = nullptr;
+                    if (s_create && SUCCEEDED(s_create(__uuidof(IDXGIFactory1), (void**)&fac)) && fac) {
+                        UINT64 best = 0;
+                        IDXGIAdapter1* a1 = nullptr;
+                        for (UINT i = 0; fac->EnumAdapters1(i, &a1) != DXGI_ERROR_NOT_FOUND; ++i) {
+                            IDXGIAdapter3* a3 = nullptr;
+                            if (SUCCEEDED(a1->QueryInterface(__uuidof(IDXGIAdapter3), (void**)&a3)) && a3) {
+                                DXGI_QUERY_VIDEO_MEMORY_INFO q = {};
+                                if (SUCCEEDED(a3->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &q))
+                                    && q.CurrentUsage > best) {
+                                    best = q.CurrentUsage;
+                                    if (s_mwAdapter) { s_mwAdapter->Release(); }
+                                    s_mwAdapter = a3;
+                                    a3 = nullptr;
+                                }
+                                if (a3) { a3->Release(); }
+                            }
+                            a1->Release();
+                        }
+                        fac->Release();
+                    }
+                }
+                // The envelope: Morrowind's world draw is a no-op under Forge, so what it needs is
+                // the local map's textures and its UI. With the map cap and without the DX9 distant
+                // land it measured 408 MB fresh (2026-09-20; it was 1608 before either); play adds a
+                // few hundred MB of its own caches. MGE_MEM_MW_MB overrides.
+                static uint32_t s_mwEnvMB = 0;
+                if (s_mwEnvMB == 0) {
+                    s_mwEnvMB = 640u;
+                    char e[32] = {};
+                    if (GetEnvironmentVariableA("MGE_MEM_MW_MB", e, sizeof(e)) > 0) {
+                        const unsigned long v = std::strtoul(e, nullptr, 10);
+                        if (v > 0) { s_mwEnvMB = (uint32_t)v; }
+                    }
+                }
+                DXGI_QUERY_VIDEO_MEMORY_INFO q = {};
+                const bool okQ = s_mwAdapter != nullptr &&
+                    SUCCEEDED(s_mwAdapter->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &q));
+                const ProxyTexLedger& L = proxyTexLedger();
+                const uint64_t liveB = L.liveBytes.load(), bigB = L.bigBytes.load(), midB = L.midBytes.load();
+                const uint32_t liveN = L.liveCount.load(), bigN = L.bigCount.load(), midN = L.midCount.load();
+                const double kMB = 1024.0 * 1024.0;
+                char proc[64];
+                if (okQ) {
+                    std::snprintf(proc, sizeof(proc), "%llu/%llu MB", (unsigned long long)(q.CurrentUsage >> 20),
+                                  (unsigned long long)(q.Budget >> 20));
+                } else {
+                    std::snprintf(proc, sizeof(proc), "unavailable");
+                }
+                LOG::logline(">> [hb] mw mem: process local=%s | MW textures live %u = %.0f MB"
+                             " (>=4MB %u = %.0f MB, 1-4MB %u = %.0f MB, <1MB %u = %.0f MB)"
+                             " | created this session %u = %.0f MB",
+                             proc, liveN, (double)liveB / kMB, bigN, (double)bigB / kMB,
+                             midN, (double)midB / kMB, liveN - bigN - midN,
+                             (double)(liveB - bigB - midB) / kMB,
+                             L.createdCount.load(), (double)L.createdBytes.load() / kMB);
+                // The map cap's receipt. filled < capped (after a load settles) means Morrowind fills
+                // some textures by a route the cap does not redirect, and those are blank on its map.
+                if (g_proxyTexCapDim != 0) {
+                    const uint32_t capN = L.capCount.load(), capF = L.capFilled.load();
+                    LOG::logline(">> [hb] mw cap %u: capped %u (filled %u) saved %.0f MB this session"
+                                 " | dropped-level writes %u locks, %u surfaces",
+                                 g_proxyTexCapDim, capN, capF, (double)L.capSavedBytes.load() / kMB,
+                                 L.capScratchLocks.load(), L.capScratchSurfaces.load());
+                    static uint32_t s_unfilledWarned = 0;
+                    if (capN > capF + 16 && s_unfilledWarned < 4) {
+                        ++s_unfilledWarned;
+                        LOG::logline("!! [mwcap] %u of %u capped textures never had a kept level written"
+                                     " — Morrowind fills them some other way; they are BLANK on its map",
+                                     capN - capF, capN);
+                    }
+                }
+                if (okQ && (q.CurrentUsage >> 20) > s_mwEnvMB) {
+                    LOG::logline("!! [mem] Morrowind.exe holds %llu MB of VRAM (envelope %u MB) — its own"
+                                 " textures are %.0f MB of it (%u at 2048^2+), and under Forge its world draw"
+                                 " is a no-op: they serve the local map",
+                                 (unsigned long long)(q.CurrentUsage >> 20), s_mwEnvMB,
+                                 (double)liveB / kMB, bigN);
+                }
             }
             // EcoQoS state of THIS process (Morrowind.exe). The seam's `copy=` bucket is almost
             // entirely FlushRenderingCommands, which is CPU work on this thread, so an execution-
@@ -5319,6 +5689,7 @@ namespace RenderProcess {
             // this frame's FP walk) ship in the same flush the pass draws from.
             markWorkerPhase(WK_BUILD_FP);
             fpHave = buildFPFrame(fpFrame, fpDraws, fpSkinnedDraws, fpAlphaDraws, fpMMDraws);
+            streamPendingTextures();   // after every resolver of the frame has queued its first sights
         }
         const double tBuild = nowMs();
 
@@ -5391,6 +5762,7 @@ namespace RenderProcess {
 
         // Ship any textures newly referenced this frame BEFORE the scene draw that uses them
         // (buildDrawList queued their DDS via resolveTextureSlot). Lazy: only first-seen textures.
+        evictStaleTextures();   // after the geometry flush (see its comment), before the tex flush
         const std::uint32_t texCount = g_texPendingCount;          // snapshot (flush clears it)
         const std::size_t   texBytes = g_texPendingBytes;
         {
@@ -6012,19 +6384,26 @@ namespace RenderProcess {
         // works, but first-sights all 32 one at a time as the animation plays, and a slot whose DDS
         // upload has not landed yet samples empty — the few-second flicker at load. 32 textures at
         // 32x32 DXT1 is ~21 KB of residency, paid once.
+        // And keep the whole book warm WHILE a glow is on screen: stale-texture eviction
+        // (evictStaleTextures) releases frames nothing has resolved for a while, and resolving only
+        // the frame on screen would first-sight them one at a time again after an absence. 32
+        // lookups a frame, only while something enchanted is visible.
+        const char* const glowTex = MGE::GeometryCache::enchantGlowTexture();
         {
             const char* const* book = nullptr;
             uint32_t gen = 0;
             const int n = MGE::GeometryCache::enchantGlowBook(book, gen);
             static uint32_t s_warmedGen = 0;
-            if (n > 0 && gen != s_warmedGen) {
+            if (n > 0 && (gen != s_warmedGen || glowTex)) {
+                const bool firstSight = gen != s_warmedGen;
                 s_warmedGen = gen;
                 for (int i = 0; i < n; ++i) resolveTextureSlot(book[i]);
-                LOG::logline(">> [enchant] warmed %d caustic frames into bindless residency", n);
+                if (firstSight) {
+                    LOG::logline(">> [enchant] warmed %d caustic frames into bindless residency", n);
+                }
             }
         }
-        const float enchantSlot =
-            float(resolveTextureSlot(MGE::GeometryCache::enchantGlowTexture()));
+        const float enchantSlot = float(resolveTextureSlot(glowTex));
         // [7] = "MW's WeatherController tinted these lights underwater" (sunCol.w, a padding slot no
         // FSL reads). The host undoes MW's underwater blend on sun/ambient, and that inverse is only
         // defined where the forward blend was applied — which is a weather operation. A weatherless
@@ -6570,6 +6949,7 @@ namespace RenderProcess {
             skyCount = buildSkyDrawList();
             markWorkerPhase(WK_BUILD_FP);
             fpHave = buildFPFrame(fpFrame, fpDraws, fpSkinnedDraws, fpAlphaDraws, fpMMDraws);
+            streamPendingTextures();   // worker-side, like the resolvers above (see its comment)
         }
         g_park.epoch           = g_cellEpoch;
         g_park.bake3rd         = MWBridge::get()->is3rdPerson();
@@ -7650,6 +8030,9 @@ namespace RenderProcess {
         g_texSlot.clear();
         g_slotName.clear();
         g_slotLastUsed.clear();
+        g_slotBytes.clear();
+        g_texFreeSlots.clear();
+        g_texStreamQueue.clear();
         g_nextSlot = 0;
         g_nextTexSlot = 1;
         g_initOk = false;

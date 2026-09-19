@@ -782,11 +782,41 @@ STRUCT(ShadowMaskParams)
     // opaque.frag, and only on a draw whose ParamIndex is nonzero — so with no _paramh in view none of
     // this is reached, and pbrEnable is not a lane at all (the host zeroes ParamIndex instead, which
     // is what makes "off" bit-identical rather than zero-weighted).
-    //   x = gradient mode   0 cd (live DX9) | 1 cdbs | 2 bspline (C2) | 3 baked derivative map
+    //   x = gradient mode   0 cd (live DX9) | 1 cdbs | 2 bspline (C2) | 4 cdblur (3, the baked
+    //                       derivative map, is RETIRED; the host never publishes it)
     //   y = frame mode      0 cotangent frame (sign-correct) | 1 Mikkelsen surface gradient
     //   z = relief depth    the height range as a fraction of one UV unit (48/4096 = DX9 @4096)
     //   w = tap radius      the central difference's half-span in BASE texels (1.5 = DX9 exactly).
     //                       The blur-versus-terracing dial; inert for gradient mode 2. See
     //                       pbrmaterial.h.fsl for why it veils terracing rather than fixing it.
     DATA(float4,   pbrParams,        None);
+    // TERRAIN PBR (tasks/forge-terrain-pbr.md). Read only by terrain.frag.
+    //   x = ARMED (0 = off). This one IS a lane, unlike pbrEnable above, and the difference is where
+    //       the gate can act: a mesh draw's param slot is packed per frame, so zeroing it costs
+    //       nothing, while terrain's slots live in a whole-world VTEX pack uploaded ONCE at first
+    //       exterior. Gating there would mean rebuilding and re-uploading ~10 MB to flip a checkbox,
+    //       so the A/B would not be live — and a look A/B you have to restart for is one nobody runs.
+    //       Bit-identity is still a property of the code: with x = 0 terrain.frag never enters the
+    //       branch, exactly as ParamIndex 0 keeps opaque.frag out of its own.
+    //   y = relief depth. Its OWN lane rather than sharing pbrParams.z — but NOT for the reason
+    //       this comment used to give ("a land texture's UV unit is a 512-world-unit square while a
+    //       mesh's is whatever the artist mapped, one value cannot serve both"). That size CANCELS
+    //       out of both perturbation frames: slope = depth * dH/duv, and depth is dimensionless.
+    //       The real reason is measured — the ground's slices are capped at 1024 from 4096-texel
+    //       sources, so it shades from a third of a mesh's gradient at the same number. See
+    //       g_pbrTerrainDepth in forgerender.cpp for the table.
+    //   zw = spare.
+    DATA(float4,   pbrTerrain,       None);
+    // TERRAIN HEIGHT AO (pbrmaterial.h.fsl::pbrHeightAO). Read only by terrain.frag. Appended, for
+    // the reason every block above states: this cbuffer is bound BY POINTER into every PerFrame
+    // set, so an insertion anywhere else silently moves a lane somebody reads.
+    //   x = ARMED (0 = off, and off is the shipped default — it is two extra taps per covered layer
+    //       on the surface that covers the screen, and the terrain tap cost is not priced yet).
+    //   y = strength, 0..1, dialling toward 1 = unoccluded.
+    //   z = the ABSOLUTE mip level the neighbourhood average is read at. This is the SCALE knob:
+    //       small = gravel-sized pits, large = shading whole dunes. Clamped up to the pixel's own
+    //       footprint level in the shader, which is what makes the effect fade out with distance
+    //       instead of growing to shade ever-larger features.
+    //   w = spare.
+    DATA(float4,   pbrTerrainAO,     None);
 };

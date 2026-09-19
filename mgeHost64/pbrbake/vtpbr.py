@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""vtpbr.py -- convert the textures/vt PBR TEST SET to the shipping _paramh / _paramd spec.
+"""vtpbr.py -- convert the textures/vt PBR TEST SET to the shipping _paramh spec.
 
 vt/ is the hand-built test rig: roughness ladders (gold*, greendia*), parameter spheres, and the
 A/B objects w_nord_waraxe.nif draws. It predates the spec the host now reads, so it carries the
@@ -7,7 +7,6 @@ old pair -- `<base>_spec.dds` (DXT1) and `<base>_n.dds` (uncompressed R5G6B5 nor
 _paramh at all, which means every object in it currently shades on the NON-PBR path.
 
     <base>_paramh.dds   DXT5   R metal   G roughness   B IOR   A height
-    <base>_paramd.dds   BC5    dH/du, dH/dv, per-texture range in dwReserved1  (pbrbake's writer)
 
     python3 vtpbr.py [--vt DIR] [--dry] [--only NAME]
 
@@ -51,12 +50,9 @@ re-differentiated by central difference and correlated against the gradients the
 actually implies; a negative correlation flips it, and the correlation is printed either way. The
 rig cannot see its own conventions unless it looks -- see feedback_a_frame_the_rig_cannot_see.
 
-!! _paramd IS BAKED FROM THE FLOAT HEIGHT, not from the 8-bit alpha that goes into _paramh. That is
-the case pbrbake normally cannot get: it refuses an 8-bit source because differentiating an
-already-quantised staircase captures its spikes exactly and measures WORSE than not baking at all
-(3.47 deg vs 1.99 for the runtime central difference). Here the height exists at full precision
-before anything quantises it, so these objects carry the good arm and the bad one over identical
-geometry -- which is the comparison the rig is for.
+(This tool also wrote a baked `_paramd` derivative map from the float height. That arm -- host
+gradMode 3, and its generator pbrbake.py -- was RETIRED 2026-09-18: the runtime cdblur arm beat it
+in play even at matched resolution. See git history before that date.)
 
 The `def` twins (graydef, whitedef, MBcarddef) are SKIPPED. They are byte-identical to their
 partners -- verified, not assumed -- and exist to be the unmodified reference the new material is
@@ -71,8 +67,6 @@ import sys
 import numpy as np
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, HERE)
-import pbrbake as PB
 
 if sys.platform == 'win32':
     DEFAULT_VT = r"C:\mgem\morrowind64\Data Files\textures\vt"
@@ -81,7 +75,7 @@ else:
     DEFAULT_VT = "/mnt/c/mgem/morrowind64/Data Files/textures/vt"
     TEXCONV = "/mnt/c/projects/texturematcher/texconv.exe"
 
-SUFFIXES = ('_n', '_spec', '_param', '_paramh', '_paramd')
+SUFFIXES = ('_n', '_spec', '_param', '_paramh')
 DEFAULT_METAL, DEFAULT_ROUGH, DEFAULT_IOR = 0, 179, 128   # the host's own 1x1 default, in codes
 
 
@@ -249,32 +243,23 @@ def write_paramh(out_dds, rgba, dry):
     return 'texconv FAILED: %s' % ((r.stdout + r.stderr).strip()[-160:] or 'no output')
 
 
-def write_paramd(out_dds, height01, dry):
-    """Central-difference the FULL-PRECISION height and quantise the RESULT -- pbrbake's contract."""
-    H = height01.astype(np.float64)
-    du = 0.5 * (np.roll(H, -1, 1) - np.roll(H, 1, 1))
-    dv = 0.5 * (np.roll(H, -1, 0) - np.roll(H, 1, 0))
-    peak = float(np.percentile(np.maximum(np.abs(du), np.abs(dv)), PB.DERIV_PCT))
-    if peak <= 1e-9:
-        return 'skipped (height is flat)'
-    exp = int(np.ceil(np.log2(peak / 0.5)))
-    exp = max(-128, min(127, exp))
-    rng = 2.0 ** exp
-    levels, n0, w, h = [], H.shape[1], H.shape[1], H.shape[0]
-    while True:
-        levels.append(PB.bc5_encode_snorm(np.clip(du / rng, -1, 1), np.clip(dv / rng, -1, 1)))
-        if max(w, h) <= 4:
-            break
-        w, h = max(1, w // 2), max(1, h // 2)
-        du, dv = PB.box_down(du, w), PB.box_down(dv, w)
-    if dry:
-        return 'dry (%d mips, 2^%d)' % (len(levels), exp)
-    PB.write_dds_bc5(out_dds, levels, exp, n0)
-    why = PB.verify_dds_bc5(out_dds, n0, len(levels), exp)
-    if why:
-        os.remove(out_dds)
-        return 'REJECTED: %s' % why
-    return 'ok (%d mips, range 2^%d)' % (len(levels), exp)
+def read_paramh_alpha(path):
+    """Decode the height (alpha) plane of a DXT5 map, via pbrsynth's file-block decoder.
+
+    Moved here from pbrbake.py when that tool was retired; this was the only piece of it vtpbr
+    still needed."""
+    sys.path.insert(0, os.path.join(HERE, "..", "pbrsynth"))
+    import pbrsynth as P
+    got, why = P._read_dxt5_alpha(path)
+    if got is None:
+        return None, why
+    w, h, bw, bh, raw = got
+    H = np.empty((h, w), dtype=np.float64)
+    for r0 in range(0, bh, 64):
+        r1 = min(bh, r0 + 64)
+        dec = P.bc4_decode_file_blocks(raw[r0 * bw:r1 * bw])
+        H[r0 * 4:r1 * 4, :] = P._unblocks(dec, (r1 - r0) * 4, w)
+    return H, None
 
 
 def main():
@@ -299,7 +284,7 @@ def main():
         bases.append(stem)
     print('\n%d base textures to convert\n' % len(bases))
 
-    print('%-22s %-9s %-26s %-28s %s' % ('base', 'size', 'material', 'height', 'paramd'))
+    print('%-22s %-9s %-26s %-28s %s' % ('base', 'size', 'material', 'height', 'paramh'))
     for stem in bases:
         base = os.path.join(a.vt, stem)
         # `_param` is the authored DXT1 material map (metal/rough/IOR, no height); `_spec` is the
@@ -324,12 +309,11 @@ def main():
         # ---- height
         hf, hnote = None, ''
         if spec and dds_header(spec)[2] == b'DXT5':
-            H, why = PB.read_paramh_alpha(spec)
+            H, why = read_paramh_alpha(spec)
             if H is not None:
                 # ⚠ NO /255 HERE. pbrsynth's bc4_decode_file_blocks returns floats already in
                 # [0,1], so read_paramh_alpha does too. Dividing again squashed greensphere's
-                # height to 1/255 of its range -- it wrote out FLAT, and its _paramd range came out
-                # 255x too small. Same class as the pbrbake header bug: the repair was right, the
+                # height to 1/255 of its range -- it wrote out FLAT. The repair was right, the
                 # quantity was not. The flatness guard below is what now catches it.
                 hf = resize_nn(H.astype(np.float64), src_size)
                 hnote = 'from _spec ALPHA (already this spec)'
@@ -366,9 +350,7 @@ def main():
             continue
 
         r1 = write_paramh(base + '_paramh.dds', rgba, a.dry)
-        flat = float(hf.max() - hf.min()) < 1e-9
-        r2 = 'skipped (flat height)' if flat else write_paramd(base + '_paramd.dds', hf, a.dry)
-        print('%-22s %-9s %-26s %-28s %s' % (stem, '%d^2' % src_size, mat, hnote, r1 if r1 != 'ok' else r2))
+        print('%-22s %-9s %-26s %-28s %s' % (stem, '%d^2' % src_size, mat, hnote, r1))
     return 0
 
 

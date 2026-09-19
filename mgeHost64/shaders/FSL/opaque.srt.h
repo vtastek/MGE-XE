@@ -590,6 +590,34 @@ BEGIN_SRT_NO_AB(SrtData)
         // Appended AFTER gReactiveMask — append only, FSL assigns descriptor offsets from one
         // running counter and an insertion silently re-points every later binding.
         DECL_TEXTURE(PerFrame, Tex2D(float4), gAtmosSkyViewClear)
+        // ─── TERRAIN PBR: the _paramh material on the ground ───────────────────────────────────
+        // The SAME bucketed-Texture2DArray residency as gTerrainArrays above, in one more
+        // declaration — and one more VTEX pack, which is what makes this cost one load per tap
+        // instead of a per-pixel id->slot indirection. gTerrainParamTex has the identical shape to
+        // gTerrainTex (TERRAIN_TSTRIDE uints per cell, one per texture square), built by the SAME
+        // remap, so terrain.frag reaches both through one square INDEX.
+        //
+        // (gTerrainDerivTex / gTerrainDerivArrays — the baked `_paramd` derivative — were REMOVED with
+        // that arm, 2026-09-18. Removing a declaration re-points every later binding exactly as an
+        // insertion would, which is safe ONLY because every shader including this header and the
+        // host are rebuilt together from it: fsl.py --compile over the whole shaders.list, then the
+        // whole bin/DIRECT3D12 deployed. A partial deploy after this change is a mis-bound frame.)
+        //
+        // ⚠ SIZED BY COVERAGE, NOT BY LTEX COUNT. Only ~96 of 551 land textures ship a _paramh, so
+        // the buckets are planned over the textures that HAVE a companion file — 551 slices of
+        // mostly-default would be ~450 MB of nothing. A land texture with no companion gets slot 0
+        // and is shaded exactly as it was before this existed.
+        //
+        // Slot 0 = "this land texture has no map of this kind", so these arrays are never sampled at
+        // bucket 0 and an UNBOUND set reads 0 = no PBR on the ground = the pre-feature image. The
+        // benign default points the right way with no fallback binding, like gGrassCrush.
+        //
+        // Appended AFTER gAtmosSkyViewClear — append only, FSL assigns descriptor offsets from one
+        // running counter and an insertion silently re-points every later binding. (The note on
+        // gTerrainArrays calling itself "declared LAST in the set" is stale: a dozen resources have
+        // been appended after it since. The rule is append at the END, which is here.)
+        DECL_BUFFER(PerFrame, Buffer(uint), gTerrainParamTex)
+        DECL_ARRAY_TEXTURES(PerFrame, Tex2DArray(float4), gTerrainParamArrays, MAX_TERRAIN_BUCKETS)
     END_SRT_SET(PerFrame)
     // Point-light cbuffer — rides the otherwise-unused PerDraw set (FSL has exactly four
     // fixed update frequencies: Persistent/PerFrame/PerBatch/PerDraw; a custom set name has

@@ -113,6 +113,24 @@ namespace Terrain {
     // the caller parses/uploads and moves on). nullptr + *sizeOut = 0 when unresolvable.
     const uint8_t* readLandTextureFile(uint32_t texId, uint32_t* sizeOut);
 
+    // A COMPANION file beside land texture `texId`: its name with the extension replaced by
+    // `suffix` ("_paramh.dds" / "_paramh_np.dds" — the PBR material map texturematcher writes
+    // next to a base texture). Same loose-then-BSA precedence, and
+    // ONE key rather than two: a companion is a build product of this project's own tools, so it
+    // is always .dds and always spelled from the stem — there is no "as recorded" .tga variant.
+    //
+    // ⚠ ITS OWN SCRATCH BUFFER, deliberately. readLandTextureFile's return is valid only until the
+    // NEXT call to it, so a caller that wanted the base bytes and its companion together had to
+    // copy one of them first. This one does not invalidate that pointer, which is what lets the
+    // residency build read a base's header and then ask what companions it has.
+    //
+    // maxBytes: stop after that many bytes (0 = the whole file). A `_paramh` is up to 22 MB and the
+    // residency build's planning pass wants only the 148-byte header, so reading them whole twice
+    // is the difference between ~2.6 GB and ~5.2 GB of one-shot I/O at first exterior. *sizeOut is
+    // what was actually read, so a truncated buffer is never mistaken for a complete file.
+    const uint8_t* readLandCompanionFile(uint32_t texId, const char* suffix, uint32_t* sizeOut,
+                                         uint32_t maxBytes = 0);
+
     // Build the case-insensitive `Data Files\Textures\**` index + the BSA directory. Idempotent;
     // readLandTextureFile calls it on demand. Counts are for the residency log.
     void     buildTextureIndex();

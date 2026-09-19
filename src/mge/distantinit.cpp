@@ -17,6 +17,7 @@
 #include "ipc/dlshare.h"
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <memory>
 #include <optional>
 
@@ -631,14 +632,28 @@ bool DistantLand::loadStaticMeshes(HANDLE h, T& distantStatics, U& distantSubset
         return false;
     }
 
-    // Bright yellow error texture
-    IDirect3DTexture9* errorTexture;
-    device->CreateTexture(1, 1, 1, g_spikeForceDefaultPool ? D3DUSAGE_DYNAMIC : 0, D3DFMT_A8R8G8B8, g_spikeForceDefaultPool ? D3DPOOL_DEFAULT : D3DPOOL_MANAGED, &errorTexture, NULL);
+    // UNDER FORGE THIS IS METADATA ONLY. The host loads, culls and draws distant statics from the
+    // same files itself; since S4 nothing in this process draws them, so the per-subset VB/IB and the
+    // BSA textures were ~450 MB of Morrowind.exe's VRAM (267 MB geometry + 185 MB / 2008 textures,
+    // 2026-09-19) that nothing sampled — and Morrowind's VRAM is taken off the host's DXGI budget.
+    // What still matters is the parse: the statics/subsets ship to the host, whose world-space table
+    // answers setWorldSpace, i.e. isDistantCell(), which picks this client's frame shape and fog. So
+    // the records are built exactly as before with null GPU handles (the host only ever carried them
+    // as opaque 32-bit values), and the geometry bytes are skipped instead of uploaded.
+    const bool metadataOnly = Configuration.UseRenderProcess;
 
-    D3DLOCKED_RECT yellow;
-    errorTexture->LockRect(0, &yellow, NULL, 0);
-    *(DWORD*)yellow.pBits = 0xffffff00;
-    errorTexture->UnlockRect(0);
+    // Bright yellow error texture
+    IDirect3DTexture9* errorTexture = nullptr;
+    if (!metadataOnly) {
+        device->CreateTexture(1, 1, 1, g_spikeForceDefaultPool ? D3DUSAGE_DYNAMIC : 0, D3DFMT_A8R8G8B8, g_spikeForceDefaultPool ? D3DPOOL_DEFAULT : D3DPOOL_MANAGED, &errorTexture, NULL);
+
+        D3DLOCKED_RECT yellow;
+        errorTexture->LockRect(0, &yellow, NULL, 0);
+        *(DWORD*)yellow.pBits = 0xffffff00;
+        errorTexture->UnlockRect(0);
+    }
+    std::uint64_t skippedGeomBytes = 0;
+    std::uint32_t skippedTextures = 0;
 
     // Read entire file into one big memory buffer
     DWORD file_size = GetFileSize(h2, NULL);
@@ -682,19 +697,25 @@ bool DistantLand::loadStaticMeshes(HANDLE h, T& distantStatics, U& distantSubset
             i.aabbMax.z = std::max(i.aabbMax.z, subset.aabbMax.z);
 
             // Load mesh data
-            IDirect3DVertexBuffer9* vb;
-            IDirect3DIndexBuffer9* ib;
+            IDirect3DVertexBuffer9* vb = nullptr;
+            IDirect3DIndexBuffer9* ib = nullptr;
             void* lockdata;
 
-            device->CreateVertexBuffer(subset.verts * SIZEOFSTATICVERT, D3DUSAGE_WRITEONLY, 0, D3DPOOL_DEFAULT, &vb, 0);
-            vb->Lock(0, 0, &lockdata, 0);
-            reader.read(lockdata, subset.verts * SIZEOFSTATICVERT);
-            vb->Unlock();
+            if (metadataOnly) {
+                reader.advance(subset.verts * SIZEOFSTATICVERT);
+                reader.advance(subset.faces * 6);
+                skippedGeomBytes += (std::uint64_t)subset.verts * SIZEOFSTATICVERT + (std::uint64_t)subset.faces * 6;
+            } else {
+                device->CreateVertexBuffer(subset.verts * SIZEOFSTATICVERT, D3DUSAGE_WRITEONLY, 0, D3DPOOL_DEFAULT, &vb, 0);
+                vb->Lock(0, 0, &lockdata, 0);
+                reader.read(lockdata, subset.verts * SIZEOFSTATICVERT);
+                vb->Unlock();
 
-            device->CreateIndexBuffer(subset.faces * 6, D3DUSAGE_WRITEONLY, D3DFMT_INDEX16, D3DPOOL_DEFAULT, &ib, 0);
-            ib->Lock(0, 0, &lockdata, 0);
-            reader.read(lockdata, subset.faces * 6); // Morrowind nifs don't support 32 bit indices?
-            ib->Unlock();
+                device->CreateIndexBuffer(subset.faces * 6, D3DUSAGE_WRITEONLY, D3DFMT_INDEX16, D3DPOOL_DEFAULT, &ib, 0);
+                ib->Lock(0, 0, &lockdata, 0);
+                reader.read(lockdata, subset.faces * 6); // Morrowind nifs don't support 32 bit indices?
+                ib->Unlock();
+            }
 
             subset.vbuffer = vb;
             subset.ibuffer = ib;
@@ -711,16 +732,20 @@ bool DistantLand::loadStaticMeshes(HANDLE h, T& distantStatics, U& distantSubset
             const char* texname = reader.get();
             reader.advance(pathsize);
 
-            IDirect3DTexture9* tex = BSA::loadTexture(device, texname);
-            if (!tex) {
-                LOG::logline("Cannot load texture %s", texname);
-                errorTexture->AddRef();
-                tex = errorTexture;
+            IDirect3DTexture9* tex = nullptr;
+            if (metadataOnly) {
+                ++skippedTextures;
+            } else {
+                tex = BSA::loadTexture(device, texname);
+                if (!tex) {
+                    LOG::logline("Cannot load texture %s", texname);
+                    errorTexture->AddRef();
+                    tex = errorTexture;
+                }
+                // Keep resource pointers for deallocation
+                meshCollectionStatics.push_back(MeshResources(vb, ib, tex));
             }
             subset.tex = tex;
-
-            // Keep resource pointers for deallocation
-            meshCollectionStatics.push_back(MeshResources(vb, ib, tex));
 
             distantSubsets.push_back(subset);
         }
@@ -728,8 +753,18 @@ bool DistantLand::loadStaticMeshes(HANDLE h, T& distantStatics, U& distantSubset
         distantStatics.push_back(i);
     }
     file_buffer.reset();
-    errorTexture->Release();
+    if (errorTexture) {
+        errorTexture->Release();
+    }
 
+    if (metadataOnly) {
+        LOG::logline("-- Distant statics: metadata only under Forge (%zu statics, %zu subsets) — the host"
+                     " draws them; %llu MB of geometry and %u texture loads NOT made in this process",
+                     (size_t)distantStatics.size(), (size_t)distantSubsets.size(),
+                     (unsigned long long)(skippedGeomBytes >> 20), skippedTextures);
+        LOG::flush();
+        return true;
+    }
 
     // Texture memory reporting
     int texturesLoaded, texMemUsage;
@@ -901,6 +936,15 @@ bool DistantLand::initLandscape() {
         LOG::logline("!! Distant land files have not been generated");
         LOG::flush();
         return !(Configuration.MGEFlags & USE_DISTANT_LAND);
+    }
+
+    // Under Forge nothing here has a consumer: the host loads and draws the distant landscape from
+    // these same files, and the one thing the upload below fed — the host's legacy LandQuadTree,
+    // keyed by this process's VB pointers — only ever answered VIS_LAND cull requests, which nothing
+    // has issued since S4b. Skipping it keeps ~80 MB of VB/IB + atlas textures out of Morrowind.exe.
+    if (Configuration.UseRenderProcess) {
+        LOG::logline("-- Distant landscape: not loaded in this process under Forge (the host draws it)");
+        return true;
     }
 
     hr = D3DXCreateTextureFromFileEx(device, "Data Files\\distantland\\world.dds", 0, 0, 0, 0, D3DFMT_UNKNOWN, D3DPOOL_DEFAULT, D3DX_DEFAULT, D3DX_DEFAULT, 0, 0, 0, &texWorldColour);

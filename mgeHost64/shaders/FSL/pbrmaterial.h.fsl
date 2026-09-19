@@ -136,8 +136,8 @@ float2 pbrHeightGradBS(uint slot, bool clampUV, float2 uv, float2 size, float lv
 //             stays at +-1 texel OF THAT LEVEL, so a feature SOFTENS in place instead of splitting
 //             into two copies. This is what arms 0 and 1 are asked for when `radius` is raised and
 //             what they do not do. Plain bilinear like arms 1 and 2 (no anisotropy), but 4 fetches
-//             rather than 16. Host gradMode 3 is the baked map and does not come through this
-//             function; a draw with no `_paramd` arrives here as arm 0.
+//             rather than 16. (Mode 3, the baked `_paramd` map, is RETIRED; the host publishes a 3
+//             as 4, so this function never sees one.)
 //
 // ⚠⚠ MODES 1 AND 2 ARE NOT A CLEAN A/B AGAINST 0, AND THE DIFFERENCE IS FILTERING, NOT
 // RECONSTRUCTION. Mode 0 samples through the anisotropic sampler with real gradients; the B-spline
@@ -175,22 +175,19 @@ float2 pbrHeightGradBS(uint slot, bool clampUV, float2 uv, float2 size, float lv
 // than the one you start from. It is still exactly reachable — mode 0, radius 1.5, depth 0.01171875
 // — and that triple is the A/B; nothing about arm 0 changed.
 //
-// The sharp answer to terracing is the BAKED DERIVATIVE MAP below — gradMode 3 — and where that
-// still looks terraced it is because the draw has no `_paramd` and fell back to arm 0. Coverage is
-// the lever there, not this dial.
+// The baked derivative map (gradMode 3) was planned as the sharp answer to terracing. It is RETIRED:
+// arm 4 beat it in play, so what ships is the veil described next, not the fix.
 //
 // ⚠ It is not a FIX for terracing, it is a veil over it. Terracing is 8-bit quantisation amplified by
 // differentiation, and the rig (T6) measured that NO runtime arm survives it: on a field spanning
 // 3/255, every one of them flattens to retention 0.000 while a baked BC5 derivative map — quantised
-// AFTER differentiating — keeps 1.001. That is the fix; this is the dial until it exists.
+// AFTER differentiating — keeps 1.001. That map is retired; this dial is what ships.
 float2 pbrHeightGradUV(uint mode, uint slot, uint clampModeIn, float2 uv,
                        float2 duvdx, float2 duvdy, float2 size0, float radius)
 {
     const float  r = max(radius, 0.25f);            // below ~a quarter texel the difference is noise
     const float2 o = r / size0;                     // the tap offset, in BASE texels, as the live code
-    // Host gradMode 3 is the BAKED map; a draw that has none arrives here as 3 and takes arm 0,
-    // which is the fallback opaque.frag documents.
-    if (mode == 0u || mode == 3u)
+    if (mode == 0u)
     {
         const float hL = pbrParamGrad(slot, clampModeIn, uv - float2(o.x, 0.0f), duvdx, duvdy).a;
         const float hR = pbrParamGrad(slot, clampModeIn, uv + float2(o.x, 0.0f), duvdx, duvdy).a;
@@ -229,53 +226,9 @@ float2 pbrHeightGradUV(uint mode, uint slot, uint clampModeIn, float2 uv,
     return pbrHeightGradBS(slot, clampUV, uv, sizeL, lvl) * sizeL;
 }
 
-// ─── The BAKED DERIVATIVE MAP (mgeHost64/pbrbake) ───────────────────────────────────────────────
-// `<base>_paramd.dds`: BC5_SNORM, R = dH/du, G = dH/dv, in PER-TEXEL units divided by a per-texture
-// power-of-two RANGE. The whole point is the order of operations: the bake differentiates the
-// 16-bit source and quantises the RESULT, where every runtime arm above differentiates a field that
-// was quantised first. The rig measured the difference where it matters most — on a height field
-// spanning 3/255 of range, every runtime arm's gradient retention is EXACTLY 0.000 (the relief
-// vanishes and what is left is the terracing) while this keeps 0.955, and the angular error goes
-// 0.159 deg -> 0.009.
-//
-// ⚠ THE RANGE IS NOT OPTIONAL AND NOT A CONSTANT. Two range-free designs were measured and both
-// failed: BC4's per-block endpoints sit on a GLOBAL 8-bit grid, so a block whose derivatives all
-// lie within 1/127 of each other collapses to a single value, and a shallow map is nothing but such
-// blocks. The host carries the exponent packed into the slot lane (pbrDerivSlotFor), and a file
-// without pbrbake's tag never reaches here at all.
-//
-// ⚠⚠ PER UV, WHICH IS WHY THERE IS NO LOD RECONSTRUCTION HERE AND WHY THE MIP SEAM IS GONE.
-//
-// The first format stored dH/dTEXEL, and this function rebuilt the per-uv gradient as
-// `stored * range * sizeL` with sizeL from floor(log2(footprint)). Two faults compounded. The bake
-// made its chain by AVERAGING the per-texel derivative, which leaves it in LEVEL 0's texel units,
-// so every level was 2x too small for the width this multiplied it by -- measured against ground
-// truth, truth/reconstruction ran 0.99, 1.52, 2.53, 4.27, 7.75, 14.3, 28.3, a clean doubling per
-// level. And `floor` steps that width in a JUMP while the sampler blends the stored value smoothly,
-// so the error did not arrive as a fade with distance but as a hard LINE at every mip boundary.
-// Play: *"mode 3 has seams at mipmaps"*.
-//
-// dH/duv means the same thing at every resolution. Each level therefore describes itself, a
-// trilinear blend between two levels is a blend between two correct values, and there is nothing
-// left to reconstruct: no GetDimensions, no footprint, no LOD, no step. It also retires a quieter
-// bug -- the reconstructed LOD came from the MAJOR axis while an anisotropic sampler reads nearer
-// the minor one, so the scale was wrong at grazing angles even away from a boundary.
-float2 pbrDerivMap(uint packed, uint clampModeIn, float2 uv, float2 dx, float2 dy)
-{
-    const uint  slot  = packed & 0xFFFFu;
-    const float range = exp2(float((packed >> 16u) & 0xFFu) - 128.0f);
-    const uint  cm    = clampModeIn & TEX_ADDR_MASK;
-    float4 d;
-    if (cm == TEX_CLAMP_S_CLAMP_T)      { d = SampleGradTex2D(gTextures[slot], gSamplerAnisoClampClamp, uv, dx, dy); }
-    else if (cm == TEX_CLAMP_S_WRAP_T)  { d = SampleGradTex2D(gTextures[slot], gSamplerAnisoClampWrap,  uv, dx, dy); }
-    else if (cm == TEX_WRAP_S_CLAMP_T)  { d = SampleGradTex2D(gTextures[slot], gSamplerAnisoWrapClamp,  uv, dx, dy); }
-    else                                { d = SampleGradTex2D(gTextures[slot], gSamplerAnisotropic, uv, dx, dy); }
-    // ⚠ ANISOTROPIC, unlike the B-spline arms — a derivative map is sampled, not reconstructed from
-    // a kernel, so nothing here needs exact bilinear weights and it keeps the 8x AF and the trilinear
-    // blend the live arm has. That is also why this does not inherit the "1 and 2 look blurrier"
-    // handicap play reported.
-    return d.xy * range;
-}
+// (The BAKED DERIVATIVE MAP, `<base>_paramd.dds` from mgeHost64/pbrbake, was read here as gradient
+// mode 3. RETIRED 2026-09-18: arm 4 beat it in play even at matched resolution, the maps were
+// deleted, and the reader went with them. Its measurements are in git history — 809c96af and before.)
 
 // ─── Axis 2: dH/duv to a normal, with no mesh tangents ──────────────────────────────────────────
 // depth = the height range as a fraction of one UV unit (pbrParams.z). "Relative to the texture's own
@@ -291,6 +244,58 @@ float2 pbrDerivMap(uint packed, uint clampModeIn, float2 uv, float2 dx, float2 d
 // here, which is right on either screen convention and under a mirrored UV map as well. The rig cannot
 // see this — its synthetic screen has det > 0 — so the --forge-scene probe checks it on the GPU: a
 // ramp rising toward +u, lit from -x, must come out BRIGHTER than the flat control.
+
+// ─── HEIGHT AO: how far below its own local average does this pixel sit ─────────────────────────
+// Ported from the shadertoy the user supplied (https://www.shadertoy.com/view/Ms3yWn, adapted),
+// which is a CHEAP two-tap ambient occlusion off a height field: read the height at this pixel's
+// own level and again at a coarser one, and the difference over the coarse level's own footprint is
+// a horizon angle. A pixel sitting below its neighbourhood is in a pit and sees less sky.
+//
+// `solidAngleOcclusion` is the source's analytic fit for the visible solid angle above a horizon at
+// `cosAngle`, for a surface with the given N.L.
+//
+// ⚠ THREE THINGS WERE FIXED ON THE WAY IN, and the first one made the original a no-op.
+//   1. `vec3 o = (p, heightlod * 120.2) - p;` is the COMMA OPERATOR, not a constructor: `(p, X)`
+//      discards p and yields the float X, so it evaluated as `float - vec3` and broadcast to
+//      `vec3(X - uv.x, X - uv.y, X - p.z)`. X reaches 120.2 against a uv of 0..1, so |o| was
+//      dominated by two garbage lateral terms, cosHorizonAngle collapsed to ~0, and the function
+//      returned solidAngleOcclusion(1, 0) = 1.0013 EVERYWHERE — a constant. The intent was
+//      `vec3(p.xy, heightlod * 120.2) - p`, i.e. (0, 0, dH), which is what is written below.
+//      ⚠ Which also means the source's `120.2` and `1.66` were never tuned against anything: they
+//      were dialled against a flat output. Neither is carried over.
+//   2. The fit is a VISIBILITY and it OVERSHOOTS 1: it returns 1.0013 at cosAngle 0. Left alone
+//      that is a 0.13% ambient LIFT on flat ground, so "no occlusion" would not be exactly 1.0 and
+//      every unoccluded pixel in the frame would move. Saturated here, which is what makes the knob
+//      at 0 bit-identical rather than nearly so.
+//   3. The source hardcodes `exp2(8.0)` for the lateral offset while `heightlod` is fetched by its
+//      caller, with nothing tying the two together — and if they disagree the angle is simply
+//      wrong. Here the averaging level is ONE parameter, used for both the fetch and the offset.
+//
+// `depth` is this project's own convention and NOT the source's 120.2: the height must be expressed
+// in the same units as uv for an angle to mean anything, and `depth` is exactly that conversion
+// (slope = depth * dH/duv — see pbrPerturbSurfGrad and g_pbrTerrainDepth). So height AO and relief
+// are calibrated by the SAME number and cannot disagree about how deep the surface is.
+float solidAngleOcclusion(float nl, float cosAngle)
+{
+    return (0.674753f + ((0.821827f * cosAngle * (0.600465f + 0.43519f * cosAngle + nl) + 0.495457f)
+                         * (-0.340972f + nl))) * (1.0f - cosAngle);
+}
+
+// hSharp  the height at this pixel's own footprint level
+// hAvg    the same height at `avgLvl`, the neighbourhood it sits in
+// size0   base texels of the map, so the lateral offset comes out in the same uv units as hAvg
+// avgLvl  ABSOLUTE mip level of hAvg — both the fetch level and the offset's width
+float pbrHeightAO(float hSharp, float hAvg, float2 size0, float avgLvl, float depth)
+{
+    // Straight up out of the surface to the local average, pushed sideways by HALF the averaging
+    // footprint — which is what makes the angle mean "how deep inside its own neighbourhood".
+    const float2 om = exp2(avgLvl) / size0 * 0.5f;
+    const float3 o  = float3(om.x, om.y, (hAvg - hSharp) * depth);
+    const float  c  = saturate(o.z * rsqrt(max(dot(o, o), 1e-20f)));
+    // nl = 1: this is pure AO, so the fit's N.L dependence is deliberately not used. That argument
+    // is the hook for a directional (Drobot) soft shadow later; it is not free, so it is not taken.
+    return saturate(solidAngleOcclusion(1.0f, c));
+}
 
 float3 pbrPerturbCotangent(float3 N, float3 dPdx, float3 dPdy, float2 duvdx, float2 duvdy,
                            float2 dhduv, float depth)

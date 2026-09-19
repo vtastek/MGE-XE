@@ -76,6 +76,12 @@ PSOut PS_MAIN( VSOutput In )
     // and vis == 1 reproduces the pre-split colour exactly.
     float sunVis = sunShadowVisibility(In.WorldPos, normalize(In.WorldNormal));
     float3 result = tex.rgb * (In.Color.rgb + In.SunLight * sunVis);
+    // The FACTOR `tex.rgb` multiplies, for F12 5/6/7 — accumulated in parallel rather than obtained
+    // by refactoring `result` into `tex.rgb * (a + b)`: `a*b + a*c` is not bit-identical to
+    // `a*(b+c)`. Same expression tree as above, so the initialiser folds away as a common
+    // subexpression: MEASURED at +3 DXIL instructions for the whole of modes 5/6/7 here
+    // (3246 -> 3249), i.e. exactly the one vector add below. See terrain.frag for the full note.
+    float3 litTerm = In.Color.rgb + In.SunLight * sunVis;
 
     // Phase C: baked DISTANT point lights (same camera-relative gLights set the distant land loops).
     // Statics carry their SUN+ambient per-vertex in Color; this ADDS point diffuse modulated by the
@@ -135,6 +141,7 @@ PSOut PS_MAIN( VSOutput In )
             }
         }
         result += tex.rgb * pointDiffuse;
+        litTerm += pointDiffuse;
     }
 
     // Match near + distant land: tonemap the final lit colour BEFORE fog so the point-light core
@@ -155,6 +162,14 @@ PSOut PS_MAIN( VSOutput In )
         Out.Color = float4(g, g, g, 1.0f);
         RETURN(Out);
     }
+    // ...and the ISOLATION views (5 albedo / 6 lit / 7 ambient), same meaning as opaque.frag's.
+    // The distant statics are here for the same reason grass is: they share the frame with the near
+    // geometry and the ground that DO isolate, so leaving them out made mode 6 read as "everything
+    // past the handover is still on MW's path" — the opposite of the truth, and unreadable exactly
+    // where the near<->far handover is the thing being judged.
+    if (dbg == 5u) { Out.Color = float4(tex.rgb, 1.0f);      RETURN(Out); }
+    if (dbg == 6u) { Out.Color = float4(litTerm, 1.0f);      RETURN(Out); }
+    if (dbg == 7u) { Out.Color = float4(In.Color.rgb, 1.0f); RETURN(Out); }
     Out.Color = float4(result, 1.0f);
     RETURN(Out);
 }

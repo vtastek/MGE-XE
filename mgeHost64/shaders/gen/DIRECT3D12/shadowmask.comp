@@ -1194,18 +1194,13 @@ STRUCT(ShadowMaskParams)
     float4 maskProf;
 #line 780 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
     float4 aoBounce;
-
-
-
-
-
-
-
-
-
-
+#line 792 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
     float4 pbrParams;
-#line 792
+#line 809 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
+    float4 pbrTerrain;
+#line 821 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
+    float4 pbrTerrainAO;
+#line 822
 };
 #line 20 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowmask.srt.h"
 
