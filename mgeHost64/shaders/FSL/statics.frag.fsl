@@ -17,7 +17,27 @@
 // "the day DL statics gain a prepass entry of their own" — so there is nothing to inherit from and
 // the mask has to be produced here.
 
+// ─── PBR ON THE FAR SIDE OF THE HANDOVER ────────────────────────────────────────────────────────
+// This pass shaded ALBEDO ONLY while the near mesh it continues shades a full `_paramh` material, so
+// a big object crossing the boundary lost its roughness, its specular and its relief in one frame —
+// the reported *"big statics has a slight change"*, and the other half of *"PBR maps don't really
+// fade, they pop"*. The bake now emits the companions into the DL library beside each LOD texture,
+// so the material exists at LOD resolution; the host buckets them into gStaticsParamArrays and
+// publishes an albedo-slot -> param-slot map (gStaticsParamSlot). See tasks/forge-dl-lod-textures.md.
+//
+// ⚠ THE BRANCH IS UNIFORM PER DRAW, which is what makes the tap cost land only where the art is.
+// TexIndex is FLAT and one EI subset is exactly one texture, so `pbrLive` is the same for every
+// fragment of a draw — and only 116 of the shipped library's 2008 LOD textures carry a companion.
+//
+// ⚠ BIT-IDENTITY IS A PROPERTY OF THE CODE, NOT A BET. Every PBR term below is inside `if (pbrLive)`
+// or initialised to the exact legacy value (nShade = the geometric normal, sunTerm = In.SunLight,
+// pbrKd = 1), so a LOD texture with no companion — and every pixel with `pbrStatics` off — runs the
+// pre-PBR arithmetic unchanged. F12 mode 19 paints which is which, here as on the near meshes.
+
 #include "opaque.srt.h"
+#include "texsample.h.fsl" // TEX_ADDR_MASK / the static samplers — pbrmaterial.h.fsl's prerequisite
+#include "pbrmaterial.h.fsl" // pbrPerturb / pbrSpecTerms / pbrEnvBRDF / pbrRoughness / pbrMetalness
+#include "skyamb.h.fsl"    // skyAmbFactor() — the SH1 sky the specular environment is read from
 #include "a2c.h.fsl"       // a2cCoverageMask() — SHARED cutout coverage
 #include "msmrecv.h.fsl"   // sunShadowVisibility() — MSM sun-shadow receiver
 #include "tonemap.h.fsl"   // tonemap() — the shared semi-HDR curve (was six byte-identical copies)
@@ -51,6 +71,88 @@ STRUCT(PSOut)
     DATA(uint,   Coverage, SV_Coverage);
 };
 
+// ─── The `_paramh` companion of one LOD texture ──────────────────────────────────────────────────
+// The albedo slot (bucket<<16)|layer indexes a map the host built once at residency: a
+// MAX_STATICS_BUCKETS-entry header of per-bucket bases, then one uint per albedo layer. TWO scalar
+// loads — TexIndex is FLAT — and 0 means this texture ships no companion. See opaque.srt.h for why
+// this is a buffer rather than a lane in the instance stream.
+uint staticsParamSlot(uint bucket, uint layer)
+{
+    return gStaticsParamSlot[gStaticsParamSlot[bucket] + layer];
+}
+
+// The material itself: r = metalness, g = roughness, b = IOR/specular, a = height (which the
+// gradient below reads at its own mips, not through this tap). Through the SAME sampler and the same
+// UV as the albedo, so the material filters exactly as the colour it belongs to.
+//
+// gSamplerAnisotropic unconditionally, and that is not a shortcut: the distant-statics albedo above
+// is sampled through it too — this pass has no ClampMode lane at all, because a baked LOD texture is
+// its own atlas-free image and the bake does not carry MW's address modes into the library.
+float4 sampleStaticsParam(uint slot, float2 uv)
+{
+    uint bucket = slot >> 16u;
+    uint layer  = slot & 0xFFFFu;
+    return SampleTex2DArray(gStaticsParamArrays[bucket], gSamplerAnisotropic,
+                            float3(uv, (float)layer));
+}
+
+// ⚠ The two intrinsics The-Forge declares against the wrong texture type, under LOCAL names — a
+// Forge bug we must neither inherit nor fork-fix ([[project_forge_fork_merge_trap]]). Its generated
+// D3D12 header types `SampleLvlTex2DArray` as `Texture3D<T>` (a copy-paste from `SampleLvlTex3D`)
+// and `GetDimensions` the same way. terrain.frag and waterfog.h.fsl carry the identical workaround;
+// this is the fourth instance, under its own name so nothing collides when headers cross.
+#define SampleLvlStaticsArray(N, S, C, L)  N.SampleLevel(S, C, L)
+#define GetStaticsArrayDims(N, W, H, E)    N.GetDimensions(W, H, E)
+
+// The base dimensions of one param bucket, in texels. Read per slot rather than hoisted: the
+// companion set is bucketed by (format, size) exactly as the albedo is, so two distant statics in
+// one frame can be reading maps of different sizes and only each one's own texel size makes its
+// gradient mean the same thing.
+float2 staticsParamDims(uint bucket)
+{
+    uint w, h, e;
+    GetStaticsArrayDims(gStaticsParamArrays[bucket], w, h, e);
+    return max(float2(float(w), float(h)), float2(1.0f, 1.0f));
+}
+
+// The height at an EXPLICIT mip level, plain bilinear (not anisotropic) for pbrmaterial.h.fsl's
+// reason: this arm needs the level it asked for and AF picks its own. WRAP, matching the albedo tap.
+float staticsHeightLvl(uint slot, float2 uv, float lvl)
+{
+    uint bucket = slot >> 16u;
+    uint layer  = slot & 0xFFFFu;
+    return SampleLvlStaticsArray(gStaticsParamArrays[bucket], gSamplerBilinearWrap,
+                                 float3(uv, (float)layer), lvl).a;
+}
+
+// pbrmaterial.h.fsl's arm 4 (cdblur), term for term, on the bucketed arrays — a separate function
+// and not pbrHeightGradUV generalised, because FSL cannot pass a resource as a parameter (the same
+// reason terrain.frag has landGradCdblur beside it).
+//
+// ⚠ ARM 4 ONLY, and that is a decision rather than an omission. Arms 0/1/2 read through
+// `pbrParamGrad`/`pbrHeightBS`, i.e. 4-16 taps of the BINDLESS table, which these textures are not
+// in; and the choice between them is a near-field sharpness argument (see pbrmaterial.h.fsl) about
+// detail that a 64-256 texel LOD does not have to give up. What ships near is arm 4 anyway.
+//
+// Returns dH/duv, the per-UV quantity that makes `pbrStaticsDepth` a dimensionless slope scale.
+float2 staticsGradCdblur(uint slot, float2 uv, float2 duvdx, float2 duvdy, float radius)
+{
+    const float2 size0 = staticsParamDims(slot >> 16u);
+    const float  r     = max(radius, 0.25f);
+    const float  fp    = max(length(duvdx * size0), length(duvdy * size0));  // footprint, texels
+    const float  lvl   = max(0.0f, floor(log2(max(fp, 1e-8f))));
+    const float  blvl  = max(lvl, log2(max(2.0f * r, 1.0f)));
+    const float2 sizeB = max(floor(size0 * exp2(-blvl)), float2(1.0f, 1.0f));
+    const float2 ob    = 1.0f / sizeB;       // ONE texel of the BLURRED level, not of the base
+    const float hL = staticsHeightLvl(slot, uv - float2(ob.x, 0.0f), blvl);
+    const float hR = staticsHeightLvl(slot, uv + float2(ob.x, 0.0f), blvl);
+    const float hD = staticsHeightLvl(slot, uv - float2(0.0f, ob.y), blvl);
+    const float hU = staticsHeightLvl(slot, uv + float2(0.0f, ob.y), blvl);
+    // Divided by the span it was actually taken over — two texels of level B — so the depth knob
+    // stays calibrated exactly as the mesh path's.
+    return float2(hR - hL, hU - hD) * (sizeB * 0.5f);
+}
+
 ROOT_SIGNATURE(DefaultRootSignature)
 PSOut PS_MAIN( VSOutput In )
 {
@@ -74,25 +176,133 @@ PSOut PS_MAIN( VSOutput In )
     // emissive, never shadowed) and SunLight (the sun N.L term). Attenuating only the latter by the
     // MSM visibility is what keeps a shadowed static sitting in ambient instead of going black —
     // and vis == 1 reproduces the pre-split colour exactly.
-    float sunVis = sunShadowVisibility(In.WorldPos, normalize(In.WorldNormal));
-    float3 result = tex.rgb * (In.Color.rgb + In.SunLight * sunVis);
+    //
+    // The GEOMETRIC normal, hoisted out of the two places that used to spell it (here and the point
+    // loop's own `N`) because the PBR block below needs to keep it apart from the perturbed one.
+    // Same expression, so this is not a change: `normalize(In.WorldNormal)` either way.
+    const float3 nGeom = normalize(In.WorldNormal);
+    float sunVis = sunShadowVisibility(In.WorldPos, nGeom);
+
+    // ─── DISTANT-STATICS PBR (tasks/forge-dl-lod-textures.md; pbrmaterial.h.fsl) ──────────────────
+    // ⚠ `nGeom` STAYS GEOMETRIC AND IS NOT PERTURBED — the split opaque.frag makes between pbrNg and
+    // pbrNb, and terrain.frag between `normal` and `nShade`. It keeps sunShadowVisibility (already
+    // called, above) and the geom_vis tests; `nShade` carries the relief and drives N.L, the point
+    // Lambert and the specular lobe. Perturbing the shared value would move the shadow bias with the
+    // bump, which shows up as acne under a low sun rather than as a lighting change.
+    //
+    // Screen derivatives HERE, at top level in uniform control flow: every reader of them sits inside
+    // the branch below, and derivatives taken inside divergent flow are undefined (opaque.frag.fsl
+    // and terrain.frag.fsl both say the same at their own tops).
+    const float3 pbrDPdx  = ddx(In.WorldPos);
+    const float3 pbrDPdy  = ddy(In.WorldPos);
+    const float2 pbrDUVdx = ddx(In.Uv);
+    const float2 pbrDUVdy = ddy(In.Uv);
+
+    float3 nShade   = nGeom;                         // the SHADING normal
+    // ─── THE SUN TERM ────────────────────────────────────────────────────────────────────────────
+    // ⚠ THIS USED TO BE A RATIO, AND THE RATIO WAS THE BRIGHT LINE. statics.vert lit the sun PER
+    // VERTEX, so there was no per-pixel sun product here to swap a normal into, and relief was
+    // recovered by multiplying the lane by `ndlS / max(ndlG, 1e-3)`. That was justified as *exact* —
+    // "SunLight is proportional to the geometric N.L it was built from, so the ratio cancels it".
+    // IT IS NOT, and the two ways it fails are the two halves of the report:
+    //
+    //   * The numerator's `ndlG` is a PER-PIXEL dot of a re-normalised normal; the lane carries an
+    //     INTERPOLATED CLAMPED PER-VERTEX one. Those are different functions across a triangle, so
+    //     nothing cancels. Where the per-pixel value reached zero while the interpolated lane was
+    //     still lit, the quotient ran to ~1000x — a bright band along the TERMINATOR, which is a line
+    //     across the mesh that moves with the SUN and not with the camera. That is exactly what was
+    //     seen, and the user's own test settled it: *"if specular, would change with camera, but
+    //     doesn't"* — a view-independent overbright can only be in the diffuse path, and this was the
+    //     one term in it that could exceed 1.
+    //     The `saturate(8*ndlRaw + 1)` geom_vis window made it worse, not better: it keeps the
+    //     numerator alive over ndlRaw in (-0.125, 0], a ~7 degree band where `ndlG` is ALREADY
+    //     clamped to 0 and the denominator is pinned at the 1e-3 floor. The floor was described as
+    //     "only bites where SunLight is ~0 too". It bites exactly where SunLight is NOT 0.
+    //   * statics.vert's `nWorld` is not unit length (it carries the instance scale), so the lane's
+    //     own N.L was `saturate(scale * cos)` — wrong by a factor the denominator never had. The
+    //     user called this one: *"or some inputs are broken, or a normalize is missing."*
+    //
+    // THE FIX IS TO STOP RECONSTRUCTING. With `pbrStatics.z` armed the vertex stage emits the
+    // UNSHADED `vcol * sunCol` and N.L is applied HERE, per pixel, off a normalised normal — no
+    // division, so no line at any sun angle, and relief at full strength in dim light instead of
+    // damped by a denominator. `sunNdl` is 1.0 on the OFF arm, where the lane already carries its own
+    // N.L and this multiply is an identity.
+    const bool  sunPerPixel = (gShadowParams.pbrStatics.z != 0.0f);
+    const float sunNdl      = sunPerPixel ? saturate(dot(nGeom, -gFrameData.sunDir.xyz)) : 1.0f;
+    float3 sunTerm  = In.SunLight * sunNdl;
+    float4 pbrMat   = float4(0.0f, 0.0f, 0.0f, 0.0f);
+    float3 pbrKd    = float3(1.0f, 1.0f, 1.0f);      // metallic workflow: diffuse+ambient kill
+    float3 pbrSpecA = float3(0.0f, 0.0f, 0.0f);      // direct specular, split by F0: spec = F0*A + B
+    float3 pbrSpecB = float3(0.0f, 0.0f, 0.0f);
+    float  pbrRough = 1.0f, pbrAlpha2 = 1.0f, pbrNoV = 1.0f;
+    float3 pbrV     = float3(0.0f, 0.0f, 1.0f);
+    // pbrStatics.x is a cbuffer scalar and TexIndex is FLAT, so both tests are uniform per draw.
+    bool   pbrLive  = false;
+    if (gShadowParams.pbrStatics.x != 0.0f)
+    {
+        const uint pslot = staticsParamSlot(bucket, layer);
+        pbrLive = (pslot != 0u);
+        if (pbrLive)
+        {
+            pbrMat = sampleStaticsParam(pslot, In.Uv);
+            const float2 dh = staticsGradCdblur(pslot, In.Uv, pbrDUVdx, pbrDUVdy,
+                                                gShadowParams.pbrParams.w);
+            // pbrFrameMode is honoured so a mesh and its own distant LOD resolve relief the same way
+            // — which is the entire point of this pass having a material at all. The DEPTH is the
+            // statics lane, not the mesh one: the LOD is a downsample, so less |dH/duv| survives out
+            // here at the same number (see g_pbrStaticsDepth).
+            nShade    = pbrPerturb((uint)gShadowParams.pbrParams.y, nGeom, pbrDPdx, pbrDPdy,
+                                   pbrDUVdx, pbrDUVdy, dh, gShadowParams.pbrStatics.y);
+            pbrRough  = pbrRoughness(pbrMat);
+            const float r2 = pbrRough * pbrRough;
+            pbrAlpha2 = r2 * r2;                     // GGX alpha^2 = roughness^4 (pbr.hlsl)
+            pbrV      = normalize(gFrameData.eyePos.xyz - In.WorldPos);
+            pbrNoV    = saturate(dot(nShade, pbrV)) + 1e-5f;   // +eps: a normal can face away
+            pbrKd     = float3(1.0f, 1.0f, 1.0f) - pbrMetalness(pbrMat);
+            // The relief-lit sun, and its specular lobe. `ndlRaw` is deliberately UNSATURATED in the
+            // geom_vis factor: pbr.hlsl's test is that a sun BEHIND the real surface must not light a
+            // bump that happens to face it, and that needs the sign.
+            const float ndlRaw = dot(nGeom, -gFrameData.sunDir.xyz);
+            const float ndlG   = saturate(ndlRaw);
+            const float ndlS   = saturate(dot(nShade, -gFrameData.sunDir.xyz))
+                               * saturate(8.0f * ndlRaw + 1.0f);
+            // ARMED: the lane is UNSHADED radiance, so the relief-lit N.L just multiplies it — the
+            // value a per-pixel sun would have produced, obtained by not throwing it away first.
+            // OFF: the legacy ratio, kept intact so the arm is a true A/B of the whole mechanism
+            // rather than of its symptom, and so the baseline image is still reachable.
+            sunTerm = sunPerPixel ? (In.SunLight * ndlS)
+                                  : (In.SunLight * (ndlS / max(ndlG, 1e-3f)));
+            // Sun specular. sunCol directly, NOT through SunLight: a dielectric's highlight is not
+            // tinted by the diffuse colour the vertex baked into that lane (the same reason
+            // statics.vert keeps emissive outside its own multiply).
+            const float2 st = pbrSpecTerms(nShade, -gFrameData.sunDir.xyz, pbrV, ndlS, pbrNoV, pbrAlpha2);
+            const float3 w  = gFrameData.sunCol.rgb * (ndlS * sunVis);
+            pbrSpecA += w * st.x;
+            pbrSpecB += w * st.y;
+        }
+    }
+
+    float3 result = tex.rgb * (In.Color.rgb + sunTerm * sunVis);
     // The FACTOR `tex.rgb` multiplies, for F12 5/6/7 — accumulated in parallel rather than obtained
     // by refactoring `result` into `tex.rgb * (a + b)`: `a*b + a*c` is not bit-identical to
     // `a*(b+c)`. Same expression tree as above, so the initialiser folds away as a common
     // subexpression: MEASURED at +3 DXIL instructions for the whole of modes 5/6/7 here
     // (3246 -> 3249), i.e. exactly the one vector add below. See terrain.frag for the full note.
-    float3 litTerm = In.Color.rgb + In.SunLight * sunVis;
+    float3 litTerm = In.Color.rgb + sunTerm * sunVis;
 
     // Phase C: baked DISTANT point lights (same camera-relative gLights set the distant land loops).
     // Statics carry their SUN+ambient per-vertex in Color; this ADDS point diffuse modulated by the
     // texture albedo (tex.rgb), matching the near opaque.frag evalOnePointLight form. Normal is the
-    // interpolated world normal (re-normalized); positions are camera-relative like In.WorldPos.
+    // SHADING normal (= the re-normalized interpolated one until PBR perturbs it); positions are
+    // camera-relative like In.WorldPos.
     // Clustered forward: same froxel gate as distantland.frag — loop only this fragment's froxel
     // lights when active (froxelDims.x > 0), else the brute gLights loop. ONE inlined per-light body;
     // brute synthesizes full-word bitmasks so the result is byte-identical. Slice metric =
     // length(In.WorldPos), matching froxelassign.comp.
     {
-        float3 N      = normalize(In.WorldNormal);
+        // The SHADING normal, so a lamp picks out the same relief the sun does. Identical to the
+        // pre-PBR `normalize(In.WorldNormal)` whenever pbrLive is false.
+        float3 N      = nShade;
         uint   nL     = (uint)gLights.lightParams.x;
         float  reachK = gLights.lightParams.y;
         float3 pointDiffuse = float3(0.0f, 0.0f, 0.0f);
@@ -137,11 +347,46 @@ PSOut PS_MAIN( VSOutput In )
                 float att  = 1.0f / max(fo.z * d2 + fo.y * d + fo.x, 1e-4f);
                 att *= 1.0f - smoothstep(POINT_LIGHT_TAIL * reach, reach, d);
                 float lambert = saturate(dot(N, toL) * invD);
+                // geom_vis (pbr.hlsl): a light behind the REAL surface must not light a bump facing
+                // it. Off the geometric normal, which is what makes it a visibility and not a second
+                // N.L. Same factor and same form as opaque.frag and terrain.frag.
+                if (pbrLive) { lambert *= saturate(8.0f * dot(nGeom, toL) * invD + 1.0f); }
                 pointDiffuse += lambert * att * lcol;
+                // Point-light specular, every light — this loop is already walking them, and a lamp
+                // on a distant building is exactly the case where a roof that specular-highlights up
+                // close and does not at range reads as two different materials.
+                if (pbrLive)
+                {
+                    const float2 st = pbrSpecTerms(N, toL * invD, pbrV, lambert, pbrNoV, pbrAlpha2);
+                    const float3 w  = lcol * (att * lambert);
+                    pbrSpecA += w * st.x;
+                    pbrSpecB += w * st.y;
+                }
             }
         }
         result += tex.rgb * pointDiffuse;
         litTerm += pointDiffuse;
+    }
+
+    if (pbrLive)
+    {
+        // `result` is now the WHOLE diffuse+ambient response (the vertex-baked ambient+emissive, the
+        // sun, and the point loop), which is exactly what a metal does not have — so the metallic
+        // kill is ONE multiply here rather than one per term. pbrKd is exactly 1 otherwise.
+        //
+        // ⚠ IT ALSO KILLS THE EMISSIVE, and that is a known cost of the vertex-side split rather
+        // than an oversight: statics.vert folds ambient and emissive into ONE interpolator (Color),
+        // so this frag cannot tell them apart. It only bites where a glowing subset ALSO ships a
+        // metallic `_paramh`, which the lit-window and ghostfence sets do not.
+        result  *= pbrKd;
+        litTerm *= pbrKd;
+        const float3 f0 = pbrF0(pbrMat, tex.rgb);
+        // The environment is the SAME sky the vertex ambient integrates (lodSunAmb through
+        // skyAmbFactor — statics.vert's own ambient source), evaluated in the mirror direction, so
+        // what lights a distant static and what it reflects cannot drift apart.
+        const float3 R = reflect(-pbrV, nShade);
+        const float3 env = gFrameData.lodSunAmb.rgb * skyAmbFactor(R, In.WorldPos);
+        result += (f0 * pbrSpecA + pbrSpecB) + env * pbrEnvBRDF(f0, pbrNoV, pbrRough);
     }
 
     // Match near + distant land: tonemap the final lit colour BEFORE fog so the point-light core
@@ -170,6 +415,27 @@ PSOut PS_MAIN( VSOutput In )
     if (dbg == 5u) { Out.Color = float4(tex.rgb, 1.0f);      RETURN(Out); }
     if (dbg == 6u) { Out.Color = float4(litTerm, 1.0f);      RETURN(Out); }
     if (dbg == 7u) { Out.Color = float4(In.Color.rgb, 1.0f); RETURN(Out); }
+    if (dbg == 19u) {   // mode 19: PBR material COVERAGE, same legend as opaque.frag's and terrain's
+        // ⚠ THIS LADDER DID NOT HANDLE 19, and the absence was not cosmetic: the view exists to say
+        // which surfaces carry a `_paramh`, and the far scene answered "none" whether the library
+        // had companions in it or not. So the one key that shows coverage could not show the gap
+        // this pass was built to close.
+        //   grey   no `_paramh` in the LOD library for this texture (shades exactly as before)
+        //   GREEN  `_paramh` material with cdblur relief
+        // It is `pbrLive` — the value that gated the shading — and not a re-derivation at the ladder
+        // ([[feedback_publish_a_lane_where_every_view_copies_it]]), so with `pbrStatics` off the far
+        // scene reads all grey, which is the truth: nothing out there ran the material path.
+        //
+        // This is also how to read how much of the library the BAKE covered: walk out to the distant
+        // set and count the green. The host's `[statics-tex] PBR companions` line says how many; this
+        // says which, and where they actually stand in the world.
+        const float3 srcCol = pbrLive ? float3(0.06f, 1.00f, 0.18f) : float3(0.10f, 0.10f, 0.11f);
+        // A little shape so objects are identifiable, off the GEOMETRIC normal — the perturbed one
+        // would print the very relief this view exists to attribute, over the top of the answer.
+        const float3 vDir = normalize(gFrameData.eyePos.xyz - In.WorldPos);
+        Out.Color = float4(srcCol * (0.55f + 0.45f * saturate(dot(nGeom, vDir))), 1.0f);
+        RETURN(Out);
+    }
     Out.Color = float4(result, 1.0f);
     RETURN(Out);
 }

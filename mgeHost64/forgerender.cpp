@@ -6074,11 +6074,19 @@ namespace {
     constexpr uint32_t kPbrTerrainFloat       = kPbrParamsFloat + 4;
     // TERRAIN HEIGHT AO (shadowparams.h.fsl pbrTerrainAO): x armed, y strength, z avg mip level.
     constexpr uint32_t kPbrTerrainAOFloat     = kPbrTerrainFloat + 4;
+    // DISTANT-STATICS PBR (shadowparams.h.fsl pbrStatics): x armed, y relief depth, z per-pixel sun
+    // (statics.vert + statics.frag + statics_blend.frag — the ONE lane this cbuffer feeds to a VS),
+    // w spare.
+    // Appended for the reason every block above states — this cbuffer is bound BY POINTER into every
+    // PerFrame set, so an insertion anywhere else silently moves a lane somebody reads.
+    constexpr uint32_t kPbrStaticsFloat       = kPbrTerrainAOFloat + 4;
+    // TERRAIN ALBEDO SAMPLING (shadowparams.h.fsl terrainTex): x gradient arm, y LOD bias.
+    constexpr uint32_t kTerrainTexFloat       = kPbrStaticsFloat + 4;
     constexpr uint32_t kShadowParamsBytes = 4096;
     static_assert((kAoBounceFloat + 4) * sizeof(float) <= kShadowParamsBytes,
                   "ShadowMaskParams overflows its CBV — too many sun cascades");
-    static_assert((kPbrTerrainAOFloat + 4) * sizeof(float) <= kShadowParamsBytes,
-                  "pbrParams/pbrTerrain/pbrTerrainAO must fit inside the ShadowMaskParams CBV");
+    static_assert((kTerrainTexFloat + 4) * sizeof(float) <= kShadowParamsBytes,
+                  "pbrParams/pbrTerrain/pbrTerrainAO/pbrStatics/terrainTex must fit inside the ShadowMaskParams CBV");
     // The float indices above are kept in step with the struct BY HAND, one +4 at a time, and
     // nothing checked that the running sum still lands on the member it names. A lane written one
     // float4 off reads as a knob that does nothing, or as garbage in a neighbour's slot — both of
@@ -6089,6 +6097,10 @@ namespace {
                   "kPbrTerrainFloat does not land on ShadowMaskParams::pbrTerrain");
     static_assert(offsetof(ShadowMaskParams, pbrTerrainAO) == kPbrTerrainAOFloat * sizeof(float),
                   "kPbrTerrainAOFloat does not land on ShadowMaskParams::pbrTerrainAO");
+    static_assert(offsetof(ShadowMaskParams, pbrStatics) == kPbrStaticsFloat * sizeof(float),
+                  "kPbrStaticsFloat does not land on ShadowMaskParams::pbrStatics");
+    static_assert(offsetof(ShadowMaskParams, terrainTex) == kTerrainTexFloat * sizeof(float),
+                  "kTerrainTexFloat does not land on ShadowMaskParams::terrainTex");
     // msmrecv.h.fsl's PCSS works in TEXELS, so SUN_SHADOW_RES has to agree with the atlas the host
     // actually allocated. Same mirroring contract as SUN_CASCADES / kSunCascades.
     static_assert(kSunShadowRes == 2048, "SUN_SHADOW_RES in shadowparams.h.fsl must match kSunShadowRes");
@@ -7335,6 +7347,98 @@ namespace {
     // than dune scale. It is the knob most likely to need dialling by eye, which is why it is a
     // knob and not the `exp2(8.0)` the source hardcoded.
     float    g_pbrTerrainHeightAOLod = 4.0f;
+    // DISTANT-STATICS PBR (tasks/forge-dl-lod-textures.md) — the `_paramh` material past the
+    // handover. `statics.frag` shaded albedo only while the near mesh it continues shades a full
+    // material, so a big object crossing the handover dropped its roughness, its specular and its
+    // relief in ONE frame. That is the *"big statics has a slight change"* the user reported, and
+    // the other half of *"PBR maps don't really fade, they pop"*.
+    //
+    // A LANE, not a pack-time gate, for the reason g_pbrTerrain gives: the statics param slot map is
+    // built once at the first exterior, so gating there would mean rebuilding it to flip a checkbox.
+    //
+    // ⚠ SHIPS ON, and like terrain's it is a no-op wherever the art has nothing to say: only 116 of
+    // the 2008 LOD textures in the shipped bake carry a companion, and the rest resolve to slot 0.
+    bool     g_pbrStatics = true;
+    // pbrStaticsDepth — the relief depth for distant statics. Same dimensionless slope scale as
+    // every other depth here (slope = depth * dH/duv — see g_pbrTerrainDepth for the derivation),
+    // and it starts at the MESH value because these surfaces ARE the meshes: what crosses the
+    // handover must not change material, so the two dials agreeing is the default that closes the
+    // step rather than a second one.
+    //
+    // ⚠ IT MAY HAVE TO GO UP, and the reason is the same measurement terrain's own lane rests on.
+    // The DL library is a DOWNSAMPLE — most LOD textures sit at 64-256 texels against 1024-2048 at
+    // source — so `_paramh`'s uploaded mip 0 out there is already several source levels in, and
+    // cdblur reads at blvl >= log2(2*radius) of THAT. Less |dH/duv| survives than the near mesh
+    // shades from at the same number. It is a separate lane precisely so that can be dialled at the
+    // handover, by eye, without moving every mesh in the near scene.
+    // ⚠ IT DID. Reported from play as *"weak normals"*, and 0.08 is not a guess — it is the number
+    // the GROUND already needed for this exact reason (g_pbrTerrainDepth), which is the other surface
+    // in the frame whose `_paramh` is read well below its authored resolution. Same cause, same
+    // correction, so the two downsampled surfaces now agree and only the near mesh sits at 0.025.
+    float    g_pbrStaticsDepth = 0.08f;
+    // staticsSunPerPixel — WHERE THE SUN'S N.L IS EVALUATED for distant statics. See the long note in
+    // statics.vert.fsl; the short version is that the per-vertex form had two defects that could not
+    // be fixed inside it.
+    //
+    //   * Its normal is not unit length (the instance scale rides the world rows), so its N.L was
+    //     `saturate(scale * cos)` — a scaled-up static saturated to full sun early.
+    //   * It cannot carry relief, so statics.frag recovered a per-pixel sun by DIVIDING the lane by a
+    //     per-pixel N.L. Those two N.L values are different functions across a triangle, so the
+    //     quotient ran away at the terminator and drew a bright sun-aligned line through the mesh.
+    //
+    // Armed, the vertex stage emits the unshaded `vcol * sunCol` and both consuming frags apply N.L
+    // per pixel. No division, no line, full-strength relief in dim light, and Gouraud sun stops
+    // faceting the low-poly LOD meshes it shows on worst.
+    //
+    // ⚠ SHIPS ON, and unlike the PBR lanes it is NOT a no-op where the art is silent: it moves every
+    // distant static, companion or not. That is the point — the defects it fixes were never confined
+    // to the 116 textures with a `_paramh`. OFF restores the MGE-faithful per-vertex path byte for
+    // byte, missing normalise included, which is what makes it a usable A/B rather than a rollback.
+    bool     g_staticsSunPerPixel = true;
+    // ─── TERRAIN ALBEDO SAMPLING (the distant-ground sparkle hunt) ───────────────────────────────
+    // From play: one land texture (tx_RM_rock_01) sparkles on distant GROUND while the same texture
+    // on ROCKS at comparable tiling does not. Ruled out by measurement, in order: the DDS (complete
+    // untruncated 13-level chain), its mip GENERATION (stored-vs-box deviation 13.5-29%, matching
+    // tx_ac_rock_01's 14.4-28.3% — plain BC1 error, no sharpening), and ANISOTROPY (identical
+    // gSamplerAnisotropic 8x on all three paths; and past the cap D3D computes LOD from
+    // majorAxis/MaxAniso, which BLURS rather than aliases).
+    //
+    // What F12 mode 22 then showed is that the filter width is tiled PER TRIANGLE across the whole
+    // ground, on every land texture — so the texture is the PROBE, not the cause: it is simply the
+    // one with ~1.7x the set's contrast and ~2.2x its Nyquist-adjacent energy (measured over
+    // tx_ac_rock_01 / tx_ai_grass_01 / tx_ac_dirt_01), i.e. the first to turn a LOD fault visible.
+    //
+    // g_terrainTexGrad — the albedo tap's gradient arm.
+    //   false  the implicit-derivative Sample that shipped. It sits inside the blend's `oneSquare`
+    //          branch, i.e. in DIVERGENT control flow, where implicit derivatives are undefined per
+    //          spec — and the DXIL keeps `br i1` around five `dx.op.sample` calls rather than
+    //          flattening them, so this is real and not theoretical.
+    //   true   explicit SampleGrad off a gradient hoisted to top level in uniform flow.
+    //
+    // ⚠⚠ SHIPS TRUE, AND IT IS THE FIX — CONFIRMED IN PLAY, AT BIAS 0: *"explicit gradients, ticked
+    // it and it fixed it instantly."* The undefined derivative WAS the artifact. No blur was needed
+    // and none is applied by default; `terrainTexBias` stays at 0.
+    //
+    // ⚠ I HAD ALREADY FOUND THIS AND TALKED MYSELF OUT OF IT. The divergent-flow sample was located
+    // and confirmed in the DXIL two rounds before the fix landed, and then dismissed as "probably
+    // benign, because uv is computed before the branch so the quad registers agree". That reasoning
+    // is wrong: in divergent flow a lane that took the other arm is not executing the sample, and
+    // what its registers contribute to the quad derivative is undefined — not "the value it would
+    // have had". Three more hypotheses (texel density, a sharpened mip chain, anisotropy clamping)
+    // were measured and killed in the meantime, all of them downstream of a spec violation already
+    // in hand. [[feedback_a_spec_violation_is_not_probably_benign]]
+    //
+    // The arm is KEPT rather than deleted, because it is the A/B that proved it and the one way to
+    // get the old image back for comparison.
+    bool     g_terrainTexGrad = true;
+    // g_terrainTexBias — LOD bias in LEVELS on the explicit arm (gradient scaled by exp2(bias)).
+    //
+    // ⚠ IT IS A MEASUREMENT BEFORE IT IS A LOOK KNOB, and the distinction decides what to do next:
+    // if a small bias (~0.3) kills the distant sparkle, the ground is MARGINALLY undersampled and a
+    // bias is a legitimate fix. If it takes two levels, the bias is only veiling a fault that is
+    // still there — the same trap pbrmaterial.h.fsl records for the gradient radius and terracing
+    // ([[feedback_a_look_dial_inside_a_measurement]]).
+    float    g_terrainTexBias = 0.0f;
 
     // The ONE gate every writer of the static instance lane [15] goes through.
     inline uint32_t pbrParamSlotFor(uint32_t paramTexIndex) {
@@ -21294,7 +21398,13 @@ namespace {
                                             "13 sun moments (cascade atlas)", "14 sky height map",
                                             "15 atmos sky-view LUT", "16 atmos transmittance LUT",
                                             "17 motion vectors", "18 reactive mask",
-                                            "19 PBR gradient source", "20 terrain blend count" };
+                                            "19 PBR gradient source", "20 terrain blend count",
+                                            // ⚠ 21 DRIFTED EXACTLY AS THE NOTE ABOVE WARNS. Terrain
+                                            // height AO shipped its view in terrain.frag and never
+                                            // added the name, so setDebugMode() clamped it to 20 and
+                                            // it was unreachable by any means — the third time.
+                                            "21 terrain height AO", "22 terrain filter width",
+                                            "23 terrain texture size", "24 terrain anisotropy" };
     constexpr uint32_t kDebugModeCount = (uint32_t)(sizeof(kDebugModeNames) / sizeof(kDebugModeNames[0]));
 
     // ─── THE DEV PANEL: A REAL HORIZONTAL TAB BAR ────────────────────────────────────────────────
@@ -22462,6 +22572,39 @@ namespace {
           t.sliderF("    height AO strength", &g_pbrTerrainHeightAOStr, 0.0f, 1.0f, 0.05f);
           t.sliderF("    height AO scale (param-map mip of the neighbourhood; 4 = pit, 8 = dune)",
                     &g_pbrTerrainHeightAOLod, 0.0f, 10.0f, 0.5f);
+          // DISTANT-STATICS PBR — the third residency, and the third arm, for the same reason the
+          // ground needed one: statics live in their OWN bucketed arrays (gStaticsArrays, built from
+          // the DL LOD library), so neither switch above reaches them. Off = the distant statics as
+          // they were, live.
+          //
+          // Judge it AT THE HANDOVER, walking one big object in and out — that is what it is for.
+          // F12 mode 19 reads here now too: green = this LOD texture ships a `_paramh`, grey = it
+          // does not, which is also how to see how much of the library the bake actually covered.
+          t.checkbox("DISTANT STATICS PBR (the DL library's _paramh) — off = the far scene as it was",
+                     &g_pbrStatics);
+          // It DID read flat — reported as "weak normals" — so this now starts at the GROUND's 0.08
+          // rather than the mesh's 0.025. Both are downsampled sources read well below their authored
+          // resolution, which is the whole of why they need the same number. Range matches terrain's
+          // slider so those two can be compared by eye; the near mesh is the one that is different.
+          t.sliderF("  distant relief depth (0.08 = the ground's, for the same downsample reason)",
+                    &g_pbrStaticsDepth, 0.0f, 0.16f, 0.005f);
+          // The sun's N.L, per pixel instead of per vertex. NOT gated by the PBR checkbox above and
+          // not scoped to textures that ship a `_paramh`: it fixes a missing normalise and a runaway
+          // division that were lighting EVERY distant static, so it moves the far scene with the PBR
+          // arm off. Off = the MGE-faithful per-vertex path, byte for byte.
+          //
+          // The line it removes is easiest to see at a low sun on a big LOD mesh: bright, running
+          // along the terminator, moving with the SUN and not with the camera.
+          t.checkbox("  per-pixel sun N.L (fixes the terminator line + the unnormalised vertex normal)",
+                     &g_staticsSunPerPixel);
+          // ─── THE DISTANT-GROUND SPARKLE A/B (see g_terrainTexGrad) ────────────────────────────
+          // Read these against F12 mode 22 (filter width, banded per doubling in WORLD units),
+          // 23 (land texture base size) and 24 (footprint anisotropy ratio).
+          t.checkbox("TERRAIN explicit gradients (ON = the fix; off = the old undefined-derivative tap)",
+                     &g_terrainTexGrad);
+          // A measurement first: how much bias it takes says WHICH fault this is. See the knob.
+          t.sliderF("  terrain LOD bias in levels (explicit arm only; a level = a doubling)",
+                    &g_terrainTexBias, 0.0f, 2.0f, 0.05f);
           t.flush(); }
 
         // -- Tab: AO & Lighting (GTAO knobs + intensity debug scales) --
@@ -25703,6 +25846,8 @@ void destroyHostWindow(Renderer* R);
             { "pbrTerrainDepth",     &g_pbrTerrainDepth     },
             { "pbrTerrainHeightAOStr", &g_pbrTerrainHeightAOStr },
             { "pbrTerrainHeightAOLod", &g_pbrTerrainHeightAOLod },
+            { "pbrStaticsDepth",     &g_pbrStaticsDepth     },
+            { "terrainTexBias",      &g_terrainTexBias      },
             { "pbrGradRadius",       &g_pbrGradRadius       },
             { "aoBounceChroma",      &g_aoBounceChroma      },
             { "grassRootAO",         &g_grassRootAO         },
@@ -25793,6 +25938,16 @@ void destroyHostWindow(Renderer* R);
             // cost has to be measured on a minimized harness run with nobody at the panel.
             { "pbrTerrain", &g_pbrTerrain },
             { "pbrTerrainHeightAO", &g_pbrTerrainHeightAO },
+            // ...and DISTANT STATICS', a lane for the same reason (see g_pbrStatics). Env-armed as
+            // well as on the panel because the thing being judged is a HANDOVER: it wants an A/B of
+            // the same object from the same spot, which is a harness run, not a checkbox click.
+            { "pbrStatics", &g_pbrStatics },
+            // ...and WHERE the distant sun is evaluated. Deliberately NOT under the pbrStatics gate:
+            // the defects it fixes lit every distant static, not just the 116 with a companion.
+            { "staticsSunPerPixel", &g_staticsSunPerPixel },
+            // The distant-ground sparkle A/B (see g_terrainTexGrad). Env-armed because the arm has
+            // to be pinned for a whole run, and the log then carries which one it was measured in.
+            { "terrainTexGrad", &g_terrainTexGrad },
             // H2a: the WATER MIRROR's GPU cull lane, and its VERIFY twin. Both DEFAULT OFF, and both
             // are env-only for the same reason every other arm in this table is: the A/B is a
             // measurement on a minimized run and there is nobody at the panel.
@@ -31272,6 +31427,21 @@ void destroyHostWindow(Renderer* R);
             mp[kPbrTerrainAOFloat + 1] = std::clamp(g_pbrTerrainHeightAOStr, 0.0f, 1.0f);
             mp[kPbrTerrainAOFloat + 2] = std::clamp(g_pbrTerrainHeightAOLod, 0.0f, 12.0f);
             mp[kPbrTerrainAOFloat + 3] = 0.0f;
+            // Distant-statics PBR. A lane for terrain's reason exactly (see g_pbrStatics): the param
+            // slot map is built once at the first exterior, so a pack-time gate would not be live.
+            mp[kPbrStaticsFloat + 0] = g_pbrStatics ? 1.0f : 0.0f;
+            mp[kPbrStaticsFloat + 1] = std::max(0.0f, g_pbrStaticsDepth);
+            // ⚠ READ BY THE VERTEX STAGE TOO, which no other lane in this cbuffer is. statics.vert
+            // already binds gShadowParams (calParams.x, the emissive calibration), so this costs no
+            // new binding — but it does mean the two stages must agree about it within a frame, and
+            // they do because it is one scalar written once here.
+            mp[kPbrStaticsFloat + 2] = g_staticsSunPerPixel ? 1.0f : 0.0f;
+            mp[kPbrStaticsFloat + 3] = 0.0f;
+            // Terrain albedo sampling: the gradient arm and its LOD bias (see g_terrainTexGrad).
+            mp[kTerrainTexFloat + 0] = g_terrainTexGrad ? 1.0f : 0.0f;
+            mp[kTerrainTexFloat + 1] = std::clamp(g_terrainTexBias, 0.0f, 4.0f);
+            mp[kTerrainTexFloat + 2] = 0.0f;
+            mp[kTerrainTexFloat + 3] = 0.0f;
             mp[280] = g_shadowBias;               // biasParams.x = absolute contact bias (live knob)
             mp[281] = g_shadowNormalOffset;       // biasParams.y = normal-offset bias in texels (live knob)
             // Flicker shadow "movement": the mask rotates the LOOKUP direction of flicker-class slots by a
@@ -43144,6 +43314,7 @@ void destroyHostWindow(Renderer* R);
     // record per subset (with StartInstanceLocation = its instance run) drives a single
     // cmdExecuteIndirect. See [[project_forge_dl_statics_format]].
     constexpr uint32_t kStaticsBuckets    = MAX_STATICS_BUCKETS;  // gStaticsArrays element count (128)
+    constexpr uint32_t kStaticsParamBuckets = MAX_STATICS_PARAM_BUCKETS;  // gStaticsParamArrays (48)
     // The statics + grass texture caps (g_staticsTexCap, g_grassTexCap) are declared with the grass
     // knobs above — they have to precede the MGE_HOST_KNOBS table, which is earlier in this file
     // than this statics block.
@@ -43332,8 +43503,23 @@ void destroyHostWindow(Renderer* R);
         uint32_t w = 0, h = 0, mips = 0;   // uniform across the bucket's slices
         Texture* tex = nullptr;            // the Texture2DArray (mArraySize = count)
         uint32_t count = 0;                // assigned layers
+        // A PARAMETER MAP IS NOT ART. `_paramh` carries metalness/roughness/IOR/height as raw UNORM,
+        // so it must NOT take toSceneTextureFormat's gamma view — BC3_UNORM would silently become
+        // BC3_SRGB and every height and roughness in the distant scene would be decoded through a
+        // transfer function it was never encoded with. Same flag, same line, same reason as
+        // TerrainTexBucket::isData.
+        bool     isData = false;
     };
     std::vector<StaticsTexBucket>             g_staticsBuckets;     // [0] = white; reals from [1]
+    // ...and the `_paramh` companions of the same library, in their OWN bucket set (PerFrame
+    // gStaticsParamArrays). Sized by COVERAGE: only LOD textures that ship a companion are planned
+    // here, so this is much smaller than g_staticsBuckets. [0] is unused (slot 0 = "no material").
+    std::vector<StaticsTexBucket>             g_staticsParamBuckets;
+    // The albedo slot -> param slot map statics.frag reads (PerFrame gStaticsParamSlot). Layout is a
+    // MAX_STATICS_BUCKETS-entry header of per-bucket bases followed by the per-(bucket, layer) runs —
+    // see the SRT declaration for the two loads that walk it.
+    Buffer*                                   g_pStaticsParamSlot = nullptr;
+    uint32_t                                  g_staticsParamCovered = 0;   // textures with a companion
     bool                                      g_staticsTexReady = false;
     std::vector<uint8_t>          g_usageData;          // resident usage.data
     // Canonical per-instance cull data, precomputed ONCE at load (statics never move). Replaces the
@@ -46685,10 +46871,12 @@ void destroyHostWindow(Renderer* R);
             td.mWidth = bk.w; td.mHeight = bk.h; td.mDepth = 1;
             td.mArraySize = bk.count; td.mMipLevels = bk.mips;
             td.mSampleCount = SAMPLE_COUNT_1;
-            td.mFormat = toSceneTextureFormat(bk.fmt);   // step 5: MW art is gamma-encoded
+            // step 5: MW art is gamma-encoded — but a PARAMETER map is not art, and this is the one
+            // line that has to know the difference. See StaticsTexBucket::isData.
+            td.mFormat = bk.isData ? bk.fmt : toSceneTextureFormat(bk.fmt);
             td.mStartState = RESOURCE_STATE_SHADER_RESOURCE;
             td.mDescriptors = DESCRIPTOR_TYPE_TEXTURE;
-            td.pName = "staticsBucket";
+            td.pName = bk.isData ? "staticsParamBucket" : "staticsBucket";
             TextureLoadDesc tld = {}; tld.ppTexture = &bk.tex; tld.pDesc = &td;
             addResource(&tld, nullptr);
         }
@@ -46751,6 +46939,291 @@ void destroyHostWindow(Renderer* R);
             auto it = plan.find(g_staticsSubsetTex[sid]);
             g_staticsSubsets[sid].texSlot = (it != plan.end())
                                           ? ((it->second.bucket << 16) | (it->second.layer & 0xFFFF)) : 0u;
+        }
+
+        // ─── THE PBR COMPANIONS: `_paramh` at LOD resolution ─────────────────────────────────────
+        // The other half of the near<->far handover. statics.frag shaded albedo only while the near
+        // mesh it continues shades a full material, so a big object crossing the boundary dropped its
+        // roughness, its specular and its relief in one frame.
+        //
+        // The bake now writes the companions INTO the library beside each LOD texture (MGEgui
+        // DistantLandTextures::LoadTexture emits `_paramh` / `_paramh_np` at the same extent), so the
+        // common case is one more read out of the same folder. The source tree stays the fallback for
+        // exactly the reason the albedo has one: the library is an optimisation, not the authority.
+        //
+        // ⚠ CAPPED TO THE ALBEDO IT BELONGS TO, not to g_staticsTexCap. A companion that came from
+        // the SOURCE tree is full size — 1024² beside a 64² LOD — and a material map finer than the
+        // colour it modulates is both wasted VRAM and a different texel grid. Stepping its mip chain
+        // down to the albedo's dimensions makes the two read the same surface.
+        //
+        // ⚠ A MISSING COMPANION IS THE ORDINARY CASE. 116 of 2008 LOD textures ship one in the
+        // shipped bake, so `missing` is not reported here the way the albedo's is: it is COVERAGE,
+        // and a warning per uncovered texture would bury the albedo's real ones.
+        {
+            g_staticsParamBuckets.clear();
+            g_staticsParamCovered = 0;
+            g_staticsParamBuckets.push_back(StaticsTexBucket{});   // [0] reserved: slot 0 = no material
+            std::vector<std::vector<std::string>> pMembers; pMembers.emplace_back();
+            std::unordered_map<uint64_t, uint32_t> pKeyToBucket;
+            struct PPlan { uint32_t capStep = 0, bucket = 0, layer = 0; std::string file; };
+            std::unordered_map<std::string, PPlan> pPlan;
+            uint32_t pOverflow = 0, pFromSource = 0, pUploaded = 0;
+
+            // Name mangling, mirroring the client's resolveParamSlot: strip the extension, append
+            // `_paramh.dds`, then `_paramh_np.dds` (the "no parallax" variant — its material and
+            // height are still the right ones here). The extension search starts AFTER the last path
+            // separator so a folder with a dot in its name cannot be mistaken for one.
+            auto stemOf = [](const std::string& nm) -> std::string {
+                const size_t sep = nm.find_last_of("\\/");
+                const size_t dot = nm.find_last_of('.');
+                if (dot == std::string::npos || (sep != std::string::npos && dot < sep)) { return nm; }
+                return nm.substr(0, dot);
+            };
+            // Read a companion, library first then the source tree, and say which file answered.
+            auto readCompanion = [&](const std::string& nm, std::vector<uint8_t>& out,
+                                     std::string* which) -> bool {
+                const std::string stem = stemOf(nm);
+                const char* suffix[2] = { "_paramh.dds", "_paramh_np.dds" };
+                for (int s = 0; s < 2; ++s) {
+                    const std::string f = stem + suffix[s];
+                    if (dlReadWholeFile((texDir + f).c_str(), out)) { if (which) { *which = f; } return true; }
+                    if (dlReadWholeFile((srcTexDir + f).c_str(), out)) {
+                        if (which) { *which = f; }
+                        ++pFromSource;
+                        return true;
+                    }
+                }
+                return false;
+            };
+
+            // Pass 1: header scan -> param bucket plan, over the albedo's OWN unique-name set.
+            // Textures whose albedo fell back to white (bucket 0) are skipped: several names collapse
+            // onto that one slot, so there is no (bucket, layer) for them to be found by.
+            for (const auto& kv : plan) {
+                const UTexPlan& up = kv.second;
+                if (up.bucket == 0u) { continue; }
+                std::vector<uint8_t> hdr;
+                std::string file;
+                if (!readCompanion(kv.first, hdr, &file)) { continue; }
+                DdsInfo info = parseDds(hdr.data(), (uint32_t)hdr.size());
+                if (!info.ok) { continue; }
+                // Step down to the albedo's dimensions (see the cap note above), never below one mip.
+                uint32_t k = 0, w = info.width, h = info.height;
+                while ((w > up.cw || h > up.ch) && (k + 1) < info.mipLevels) {
+                    w = (w > 1) ? w >> 1 : 1; h = (h > 1) ? h >> 1 : 1; ++k;
+                }
+                const uint32_t avail = info.mipLevels - k;
+                const uint64_t key = bucketKey(info.fmt, w, h);
+                auto bit = pKeyToBucket.find(key);
+                if (bit == pKeyToBucket.end()) {
+                    if (g_staticsParamBuckets.size() >= kStaticsParamBuckets) { ++pOverflow; continue; }
+                    const uint32_t b = (uint32_t)g_staticsParamBuckets.size();
+                    pKeyToBucket[key] = b;
+                    StaticsTexBucket nb;
+                    nb.fmt = info.fmt; nb.w = w; nb.h = h; nb.mips = avail; nb.isData = true;
+                    g_staticsParamBuckets.push_back(nb);
+                    pMembers.emplace_back();
+                    bit = pKeyToBucket.find(key);
+                }
+                PPlan pp; pp.capStep = k; pp.bucket = bit->second; pp.file = file;
+                StaticsTexBucket& b = g_staticsParamBuckets[pp.bucket];
+                if (avail < b.mips) { b.mips = avail; }    // uniform chain = min over members
+                pp.layer = b.count++;
+                pMembers[pp.bucket].push_back(kv.first);
+                pPlan[kv.first] = pp;
+            }
+
+            // Pass 2: create + bind one Texture2DArray per real param bucket. Bound to BOTH PerFrame
+            // sets statics.frag draws under — the main one and pPerFrameSetReflectGeo (the water
+            // mirror draws the same distant statics). Any resource a shared shader reads must reach
+            // EVERY set that shader draws under; see loadTerrainResidency for what the half-wired
+            // version of that mistake looked like on screen.
+            for (uint32_t b = 1; b < g_staticsParamBuckets.size(); ++b) {
+                StaticsTexBucket& bk = g_staticsParamBuckets[b];
+                TextureDesc td = {};
+                td.mWidth = bk.w; td.mHeight = bk.h; td.mDepth = 1;
+                td.mArraySize = bk.count; td.mMipLevels = bk.mips;
+                td.mSampleCount = SAMPLE_COUNT_1;
+                td.mFormat = bk.fmt;                     // DATA: never through the scene's sRGB view
+                td.mStartState = RESOURCE_STATE_SHADER_RESOURCE;
+                td.mDescriptors = DESCRIPTOR_TYPE_TEXTURE;
+                td.pName = "staticsParamBucket";
+                TextureLoadDesc tld = {}; tld.ppTexture = &bk.tex; tld.pDesc = &td;
+                addResource(&tld, nullptr);
+            }
+            waitForAllResourceLoads();
+            {
+                std::vector<Texture*> texs(kStaticsParamBuckets);
+                for (uint32_t b = 0; b < kStaticsParamBuckets; ++b) {
+                    texs[b] = (b < g_staticsParamBuckets.size() && g_staticsParamBuckets[b].tex)
+                            ? g_staticsParamBuckets[b].tex : g_live.pStaticsWhiteArray;
+                }
+                DescriptorData sd = {};
+                sd.mIndex = SRT_RES_IDX(SrtData, PerFrame, gStaticsParamArrays);
+                sd.mArrayOffset = 0; sd.mCount = kStaticsParamBuckets;
+                sd.ppTextures = texs.data();
+                updateDescriptorSet(R, 0, g_live.pPerFrameSet, 1, &sd);
+                if (g_live.pPerFrameSetReflectGeo) {
+                    updateDescriptorSet(R, 0, g_live.pPerFrameSetReflectGeo, 1, &sd);
+                }
+            }
+
+            // Pass 3: upload each companion's capped mip range into its slice.
+            for (uint32_t b = 1; b < g_staticsParamBuckets.size(); ++b) {
+                StaticsTexBucket& bk = g_staticsParamBuckets[b];
+                if (!bk.tex) { continue; }
+                for (uint32_t layer = 0; layer < (uint32_t)pMembers[b].size(); ++layer) {
+                    const std::string& nm = pMembers[b][layer];
+                    const PPlan& pp = pPlan[nm];
+                    std::vector<uint8_t> dds;
+                    if (!dlReadWholeFile((texDir + pp.file).c_str(), dds)
+                     && !dlReadWholeFile((srcTexDir + pp.file).c_str(), dds)) { continue; }
+                    DdsInfo info = parseDds(dds.data(), (uint32_t)dds.size());
+                    if (!info.ok) { continue; }
+                    const uint8_t* src    = dds.data() + info.dataOffset;
+                    const uint8_t* ddsEnd = dds.data() + dds.size();
+                    uint32_t sw = info.width, sh = info.height;
+                    for (uint32_t i = 0; i < pp.capStep; ++i) {
+                        src += ddsTightMipBytes(info.fmt, sw, sh);
+                        sw = (sw > 1) ? sw >> 1 : 1; sh = (sh > 1) ? sh >> 1 : 1;
+                    }
+                    TextureUpdateDesc upd = {};
+                    upd.pTexture = bk.tex;
+                    upd.mBaseMipLevel = 0; upd.mMipLevels = bk.mips;
+                    upd.mBaseArrayLayer = layer; upd.mLayerCount = 1;
+                    upd.mCurrentState = RESOURCE_STATE_SHADER_RESOURCE;
+                    beginUpdateResource(&upd);
+                    for (uint32_t m = 0; m < bk.mips; ++m) {
+                        TextureSubresourceUpdate s = upd.getSubresourceUpdateDesc(m, layer);
+                        const uint32_t mipBytes = s.mRowCount * s.mSrcRowStride;
+                        if (src + mipBytes > ddsEnd) { break; }
+                        for (uint32_t row = 0; row < s.mRowCount; ++row) {
+                            std::memcpy(s.pMappedData + (size_t)row * s.mDstRowStride,
+                                        src + (size_t)row * s.mSrcRowStride, s.mSrcRowStride);
+                        }
+                        src += mipBytes;
+                    }
+                    endUpdateResource(&upd);
+                    ++pUploaded;
+                }
+                flushTextureUploads(R);   // submit per bucket (bounds the staging ring)
+            }
+
+            // ─── The (albedo bucket, layer) -> param slot map ────────────────────────────────────
+            // A MAX_STATICS_BUCKETS-entry header of per-bucket bases followed by each bucket's run,
+            // one uint per albedo layer, 0 = "this texture ships no companion". See the SRT
+            // declaration for why this is a buffer and not a lane in the instance stream.
+            //
+            // Header entries for buckets that do not exist point ONE PAST THE END, where a typed
+            // buffer SRV read is defined to return 0 — so an impossible bucket resolves to "no
+            // material" rather than to a base that would be read as a slot.
+            {
+                std::vector<uint32_t> base(g_staticsBuckets.size(), 0u);
+                uint32_t run = kStaticsBuckets;
+                for (uint32_t b = 0; b < g_staticsBuckets.size(); ++b) {
+                    base[b] = run; run += g_staticsBuckets[b].count;
+                }
+                std::vector<uint32_t> map(run, 0u);
+                for (uint32_t b = 0; b < kStaticsBuckets; ++b) {
+                    map[b] = (b < g_staticsBuckets.size()) ? base[b] : run;
+                }
+                for (const auto& kv : pPlan) {
+                    auto ait = plan.find(kv.first);
+                    if (ait == plan.end() || ait->second.bucket == 0u) { continue; }
+                    const uint32_t idx = base[ait->second.bucket] + ait->second.layer;
+                    if (idx < map.size()) {
+                        map[idx] = (kv.second.bucket << 16) | (kv.second.layer & 0xFFFF);
+                        ++g_staticsParamCovered;
+                    }
+                }
+                const uint64_t mapBytes = (uint64_t)map.size() * sizeof(uint32_t);
+                if (g_pStaticsParamSlot) { removeResource(g_pStaticsParamSlot); g_pStaticsParamSlot = nullptr; }
+                BufferLoadDesc bl = {};
+                bl.mDesc.mDescriptors = DESCRIPTOR_TYPE_BUFFER;
+                bl.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_GPU_ONLY;
+                bl.mDesc.mSize = mapBytes;
+                bl.mDesc.mElementCount = (uint32_t)map.size();
+                bl.mDesc.mStructStride = 0;                      // typed Buffer<uint>, not structured
+                bl.mDesc.mFormat = TinyImageFormat_R32_UINT;
+                bl.mDesc.mStartState = RESOURCE_STATE_SHADER_RESOURCE;
+                bl.mDesc.pName = "staticsParamSlot";
+                bl.pData = map.data();
+                bl.ppBuffer = &g_pStaticsParamSlot;
+                addResource(&bl, nullptr);
+                waitForAllResourceLoads();
+                if (g_pStaticsParamSlot) {
+                    DescriptorData sd = {};
+                    sd.mIndex = SRT_RES_IDX(SrtData, PerFrame, gStaticsParamSlot);
+                    sd.mCount = 1; sd.ppBuffers = &g_pStaticsParamSlot;
+                    updateDescriptorSet(R, 0, g_live.pPerFrameSet, 1, &sd);
+                    if (g_live.pPerFrameSetReflectGeo) {
+                        updateDescriptorSet(R, 0, g_live.pPerFrameSetReflectGeo, 1, &sd);
+                    }
+                }
+            }
+
+            uint64_t pVram = 0;
+            uint32_t pShort = 0;
+            for (uint32_t b = 1; b < g_staticsParamBuckets.size(); ++b) {
+                const StaticsTexBucket& bk = g_staticsParamBuckets[b];
+                uint32_t mw = bk.w, mh = bk.h;
+                for (uint32_t m = 0; m < bk.mips; ++m) {
+                    pVram += (uint64_t)ddsTightMipBytes(bk.fmt, mw, mh) * bk.count;
+                    mw = (mw > 1) ? mw >> 1 : 1; mh = (mh > 1) ? mh >> 1 : 1;
+                }
+                const uint32_t full = fullMipCount(bk.w, bk.h);
+                if (bk.mips < full) { pShort += bk.count; }
+                // ⚠ A SHORT CHAIN HERE IS NOT AN ALIASING BUG, it is a CEILING ON THE RELIEF.
+                // cdblur reads the height at max(footprint level, log2(2*radius)); SampleLevel clamps
+                // to the last level present, so a truncated chain silently stops widening the blur
+                // instead of looking wrong. Worth knowing, not worth alarming about.
+                LOG::logline(">> [statics-tex] paramh bucket=%u %ux%u slices=%u mips=%u (full=%u)%s",
+                             b, bk.w, bk.h, bk.count, bk.mips, full,
+                             (bk.mips >= full) ? "" : "  (chain stops short — cdblur clamps)");
+            }
+            LOG::logline(">> [statics-tex] PBR companions: _paramh on %u of %zu LOD textures"
+                         " (%zu/%u buckets, %u uploaded, %u from the SOURCE tree, ~%llu MB VRAM,"
+                         " short-chain slices=%u)",
+                         g_staticsParamCovered, plan.size(), g_staticsParamBuckets.size() - 1,
+                         kStaticsParamBuckets - 1u, pUploaded, pFromSource,
+                         (unsigned long long)(pVram >> 20), pShort);
+            // ...and WHAT SHARE OF THE WORLD that is, which the texture count does not say. 116 of
+            // 2008 textures can be almost none of the distant scene or most of it, and the difference
+            // decides both whether a perf A/B measures anything and whether the handover step is
+            // actually closed ([[feedback_confirm_population_reaches_the_filter]]). Weighted by
+            // TRIANGLES as well as by subset, because one covered wall texture on a tower outweighs
+            // fifty covered trims. F12 mode 19 says WHERE; this says HOW MUCH.
+            {
+                uint32_t subCov = 0;
+                uint64_t triCov = 0, triAll = 0;
+                for (uint32_t sid = 0; sid < g_staticsSubsets.size(); ++sid) {
+                    const uint32_t tris = g_staticsSubsets[sid].indexCount / 3u;
+                    triAll += tris;
+                    if (sid < g_staticsSubsetTex.size() && pPlan.count(g_staticsSubsetTex[sid])) {
+                        ++subCov; triCov += tris;
+                    }
+                }
+                LOG::logline(">> [statics-tex] PBR coverage of the distant world: %u of %zu subsets"
+                             " (%.1f%%), %.1f%% of distant-statics triangles",
+                             subCov, g_staticsSubsets.size(),
+                             g_staticsSubsets.empty() ? 0.0
+                                 : 100.0 * (double)subCov / (double)g_staticsSubsets.size(),
+                             (triAll == 0) ? 0.0 : 100.0 * (double)triCov / (double)triAll);
+            }
+            if (pOverflow) {
+                LOG::logline("!! [statics-tex] paramh: %u companions DROPPED: out of buckets"
+                             " (MAX_STATICS_PARAM_BUCKETS=%u). Raise it in opaque.srt.h.",
+                             pOverflow, kStaticsParamBuckets);
+            }
+            // The tripwire: zero coverage after a bake that reported companions means the name
+            // mangling or the library path is wrong, not that the art has nothing to say.
+            if (g_staticsParamCovered == 0) {
+                LOG::logline(">> [statics-tex] no `_paramh` beside ANY distant-statics texture —"
+                             " the far scene is byte-identical to before this existed. If the bake"
+                             " reported PBR companion maps, the name mangling or the library path"
+                             " is wrong.");
+            }
+            LOG::flush();
         }
 
         uint64_t vram = 0;
@@ -54465,6 +54938,13 @@ void destroyHostWindow(Renderer* R);
             if (g_staticsBuckets[b].tex) { removeResource(g_staticsBuckets[b].tex); }
         }
         g_staticsBuckets.clear(); g_staticsTexReady = false;
+        // ...and the `_paramh` companion set beside it. [0] is a reserved empty entry (no texture),
+        // so unlike the albedo's bucket 0 there is nothing aliased here to skip.
+        for (size_t b = 1; b < g_staticsParamBuckets.size(); ++b) {
+            if (g_staticsParamBuckets[b].tex) { removeResource(g_staticsParamBuckets[b].tex); }
+        }
+        g_staticsParamBuckets.clear(); g_staticsParamCovered = 0;
+        if (g_pStaticsParamSlot) { removeResource(g_pStaticsParamSlot); g_pStaticsParamSlot = nullptr; }
         if (g_live.pStaticsWhiteArray) { removeResource(g_live.pStaticsWhiteArray); g_live.pStaticsWhiteArray = nullptr; }
         g_usageData.clear();
         g_staticsDrawCount = 0; g_staticsInstTotal = 0; g_staticsLoaded = false;

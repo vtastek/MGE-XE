@@ -45,8 +45,18 @@ float4 PS_MAIN( VSOutput In )
     float4 tex = SampleTex2DArray(gStaticsArrays[bucket], gSamplerAnisotropic, float3(In.Uv, (float)layer));
 
     // Sun shadows: Color carries ambient+emissive, SunLight the sun half (split in statics.vert).
-    float sunVis = sunShadowVisibility(In.WorldPos, normalize(In.WorldNormal));
-    float3 result = tex.rgb * (In.Color.rgb + In.SunLight * sunVis);
+    const float3 nGeom = normalize(In.WorldNormal);
+    float sunVis = sunShadowVisibility(In.WorldPos, nGeom);
+    // PER-PIXEL SUN (pbrStatics.z). When armed, statics.vert emits the UNSHADED `vcol * sunCol` and
+    // N.L belongs to whoever consumes the lane — see the long note there for the two defects that
+    // retires. This pass has no PBR of its own and wants none; it takes the arm because it SHARES the
+    // interpolator, and a lane cannot mean two things at once. Without this a hero-blend layer would
+    // read as unshaded sun against the opaque statics beside it.
+    // 1.0 on the OFF arm, where the lane still carries its own per-vertex N.L — and `x * (1.0 * v)`
+    // is exactly `x * v` in IEEE, so the baseline image is byte-identical, not merely close.
+    const float sunNdl = (gShadowParams.pbrStatics.z != 0.0f)
+                       ? saturate(dot(nGeom, -gFrameData.sunDir.xyz)) : 1.0f;
+    float3 result = tex.rgb * (In.Color.rgb + In.SunLight * (sunNdl * sunVis));
     // Lift BEFORE the fog, so what is preserved is this pass's own colour and the fog it melts into
     // stays the shared (already scene-referred) target every surface uses. The [0,1] clamp inside
     // the lift is exact here rather than lossy: Color + SunLight can exceed 1, and the UNORM target

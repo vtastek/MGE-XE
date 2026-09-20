@@ -153,7 +153,30 @@ VSOutput VS_MAIN( VSInput In )
     // outside the vertex colour above — it is an independent FFE term, not ambient.
     float3 sunlit  = gFrameData.sunCol.rgb * saturate(dot(nWorld, -gFrameData.sunDir.xyz));
     Out.Color    = float4(vcol * gFrameData.lodSunAmb.rgb * skyAmbFactor(nWorld, worldPos.xyz) + emissive, In.Color.a);
-    Out.SunLight = vcol * sunlit;
+    // ⚠ THE SUN LANE CARRIES ONE OF TWO THINGS, and `pbrStatics.z` picks which.
+    //
+    // OFF — the MGE-faithful per-VERTEX product `vcol * sunCol * saturate(dot(nWorld, -sunDir))`.
+    // This is the A/B baseline and stays byte-identical, INCLUDING the missing normalise below.
+    //
+    // ON — the UNSHADED sun radiance `vcol * sunCol`, with N.L applied per pixel by statics.frag /
+    // statics_blend.frag. Two defects die with the per-vertex form, and neither is fixable inside it:
+    //
+    //  1. `nWorld` IS NOT UNIT LENGTH. It is `n * M3x3` and the instance world rows carry the
+    //     placement's uniform SCALE (cullparams.h.fsl: "rotated/scaled into world"), so the dot above
+    //     is `scale * cos`, not `cos`. A scaled-up static therefore saturates to full sun while its
+    //     true cos is still well below 1 — a wide flat lit band ending in a cliff at the terminator.
+    //     The frag's `normalize(In.WorldNormal)` does not have this error, which is what made the two
+    //     disagree. Normalising HERE would fix the lighting but move every distant static in the
+    //     baseline, so the fix rides the arm instead.
+    //  2. A per-vertex sun CANNOT CARRY RELIEF. statics.frag had to recover a per-pixel sun by
+    //     dividing this lane by a per-pixel N.L — and the two do not cancel, because this one is an
+    //     interpolated clamped per-VERTEX dot and that one is a per-PIXEL dot of a re-normalised
+    //     normal. Where the per-pixel value crossed zero first the quotient ran away to ~1000x and
+    //     printed a bright sun-aligned line along the terminator. See statics.frag.
+    //
+    // It also retires Gouraud sun on LOD meshes, which are exactly the low-poly case it shows on.
+    Out.SunLight = (gShadowParams.pbrStatics.z != 0.0f) ? (vcol * gFrameData.sunCol.rgb)
+                                                       : (vcol * sunlit);
 
     Out.TexIndex = (uint)(In.InstParams.x + 0.5f);
     Out.Flags    = (uint)(In.InstParams.y + 0.5f);

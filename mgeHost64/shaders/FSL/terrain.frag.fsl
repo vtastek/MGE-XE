@@ -103,10 +103,28 @@ int squareY(int y) { return (int)ceil ((float(y) - 2.0f) * 0.25f); }
 // One land texture, sampled through the bucketed arrays. uv tiles once per texture square, matching
 // the generator's `cv.u = x / 4` over a 0..64 lattice. Slot 0 (and any unresolved texture) is the
 // default ground, which the host uploads as layer 0 of bucket 0.
-float3 sampleLand(uint slot, float2 uv)
+// The explicit-gradient array tap, under a LOCAL name for the reason the block further down gives:
+// The-Forge types several array intrinsics against the wrong texture type, and that is a bug we
+// neither inherit nor fork-fix ([[project_forge_fork_merge_trap]]). Declared HERE, above its first
+// use in sampleLand, rather than with its siblings below — the others are used further down and a
+// macro used before its `#define` is simply not substituted.
+#define SampleGradLandArray(N, S, C, DX, DY)  N.SampleGrad(S, C, DX, DY)
+
+// ⚠ TWO ARMS, chosen by a cbuffer scalar so the branch is uniform across the whole draw.
+//   0  IMPLICIT gradients (what shipped). The caller has it inside the blend's `oneSquare` branch,
+//      i.e. in DIVERGENT control flow, where implicit derivatives are undefined per spec — and the
+//      DXIL confirms it survives compilation (`br i1` around five `dx.op.sample` calls, not
+//      flattened). Kept as arm 0 so "off" is the pre-change image exactly.
+//   1  EXPLICIT gradients, hoisted to top level by the caller and scaled by `terrainTexBias`. This
+//      is the spec-correct form AND the only place a LOD bias can act.
+float3 sampleLand(uint slot, float2 uv, float2 gdx, float2 gdy, bool useGrad)
 {
     uint bucket = slot >> 16u;
     uint layer  = slot & 0xFFFFu;
+    if (useGrad) {
+        return SampleGradLandArray(gTerrainArrays[bucket], gSamplerAnisotropic,
+                                   float3(uv, float(layer)), gdx, gdy).rgb;
+    }
     return SampleTex2DArray(gTerrainArrays[bucket], gSamplerAnisotropic,
                             float3(uv, float(layer))).rgb;
 }
@@ -115,10 +133,20 @@ float3 sampleLand(uint slot, float2 uv)
 // a = height, which landGradCdblur and landHeightAO read at their own mips — not through this tap.
 // Through the same sampler and the same uv as the albedo above, so the material filters exactly as
 // the colour it belongs to and both read the mip the hardware picked for the base.
-float4 sampleLandParam(uint slot, float2 uv)
+// ⚠ THE SAME TWO ARMS AS sampleLand, AND THIS ONE IS WORSE. Its callers sit inside
+// `if (pbrLive)`, then inside `if (oneSquare)`, and then EACH TAP is inside its own
+// `if (psXX != 0u)` — a per-pixel test, since neighbouring texture squares genuinely differ in
+// whether they ship a companion. So the implicit arm takes derivatives three branches deep in
+// divergent control flow. It was written that way before the albedo tap's own version of this was
+// understood; it takes the fix for the same reason and off the same hoisted gradient.
+float4 sampleLandParam(uint slot, float2 uv, float2 gdx, float2 gdy, bool useGrad)
 {
     uint bucket = slot >> 16u;
     uint layer  = slot & 0xFFFFu;
+    if (useGrad) {
+        return SampleGradLandArray(gTerrainParamArrays[bucket], gSamplerAnisotropic,
+                                   float3(uv, float(layer)), gdx, gdy);
+    }
     return SampleTex2DArray(gTerrainParamArrays[bucket], gSamplerAnisotropic,
                             float3(uv, float(layer)));
 }
@@ -142,6 +170,11 @@ float4 sampleLandParam(uint slot, float2 uv)
 // the same workaround for the same declaration, and terrain.frag already includes it).
 #define SampleLvlLandArray(N, S, C, L)  N.SampleLevel(S, C, L)
 #define GetLandArrayDims(N, W, H, E)    N.GetDimensions(W, H, E)
+// ...and the LOD the hardware would actually pick for this footprint, anisotropy included. Same
+// local-macro treatment and the same reason as the two above. ⚠ It takes IMPLICIT derivatives, so
+// every caller must be in uniform control flow — which is why mode 22 below resolves it at top
+// level and not inside the blend's `oneSquare` branch.
+#define CalcLodLandArray(N, S, C)       N.CalculateLevelOfDetail(S, C)
 
 // The base dimensions of one param bucket, in texels. Read per slot and NOT hoisted out of the
 // blend: buckets are keyed by (format, w, h, mips), so two land textures of different size can meet
@@ -256,6 +289,43 @@ float4 PS_MAIN( VSOutput In )
     // uv tiles once per 512-unit texture square (lattice/4), continuous because the texture wraps.
     float2 uv = lat * 0.25f;
 
+    // ─── THE UV GRADIENT, taken HERE and used by everything below ────────────────────────────────
+    // ⚠ TOP LEVEL, IN UNIFORM CONTROL FLOW, and that is not tidiness. The albedo taps below sit
+    // inside the `oneSquare` branch, so their IMPLICIT derivatives are taken in divergent flow —
+    // undefined per spec, and confirmed to survive compilation (the DXIL keeps `br i1` around five
+    // `dx.op.sample` calls rather than flattening them). Hoisting the gradient is the fix and it is
+    // also the hook `terrainTexBias` needs. `ddx(uv)` is `ddx(lat)*0.25` and `lat` is exactly linear
+    // in world XY (terrain.vert: `Out.Lattice = float2(gx,gy)`, `worldPos.xy = Origin + gx*SPACING`),
+    // so this gradient is as clean a source as the terrain has.
+    const float2 duvdx = ddx(uv);
+    const float2 duvdy = ddy(uv);
+
+    // ─── MODE 22's MEASUREMENT ────────────────────────────────────────────────────────────────────
+    // The LOD the sampler actually picks for this pixel, read off the SAME bucket the albedo tap
+    // uses, so this is the level the frame shaded with and not a re-derivation
+    // ([[feedback_publish_a_lane_where_every_view_copies_it]]). CalculateLevelOfDetail takes implicit
+    // derivatives too, so it is resolved here for the same reason — a debug branch would be divergent
+    // control flow just like the blend's.
+    const uint  lodBucket = landTexSlot(i00) >> 16u;
+    const float hwLod  = CalcLodLandArray(gTerrainArrays[lodBucket], gSamplerAnisotropic, uv);
+    float2 lodDims;
+    { uint w, h, e; GetLandArrayDims(gTerrainArrays[lodBucket], w, h, e);
+      lodDims = max(float2(float(w), float(h)), float2(1.0f, 1.0f)); }
+    const float2 lodDx = duvdx * lodDims;
+    const float2 lodDy = duvdy * lodDims;
+    const float  isoLod = max(0.0f, log2(max(max(length(lodDx), length(lodDy)), 1e-8f)));
+    // ⚠ AND THE VIEW'S OWN UNIT, because the first version of mode 22 had a REAL FLAW and it printed
+    // as "squares". `hwLod` is a level index in ITS OWN BUCKET's mip chain, and the buckets are not
+    // the same size — 508 land textures are 1024², thirty are 256², four are 512². Level 3 of a 1024²
+    // and level 1 of a 256² are the SAME physical filter width, so the view painted a hard colour
+    // step at every texture square where the neighbouring land texture happened to live in a
+    // different-sized bucket. That step was an artifact of the instrument, not of the renderer.
+    //
+    // So the band is now the filter width in WORLD UNITS, which every bucket agrees on: one uv unit
+    // is one 512-world-unit texture square by construction, so footprint_world = footprint_uv * 512.
+    // Each band is a doubling of the filter's world footprint, comparable across the whole ground.
+    const float lodWorld = log2(max(max(length(duvdx), length(duvdy)) * 512.0f, 1e-6f));
+
     // MW's per-vertex 0/1 weights, interpolated. Hoisted to top level because the PBR blend below
     // needs the SAME four numbers the albedo blend does — a second copy of them is a second place
     // for the two to disagree about which corner is which.
@@ -279,14 +349,22 @@ float4 PS_MAIN( VSOutput In )
 
     const bool oneSquare = (id00 == id10 && id00 == id01 && id00 == id11);
 
+    // The gradient the explicit arm samples with: the hoisted screen derivative, widened by
+    // `terrainTexBias` LEVELS (a level is a doubling of the filter, so the scale is exp2(bias)).
+    // Both lanes are cbuffer scalars, so `gradArm` is uniform across the draw.
+    const bool  gradArm  = (gShadowParams.terrainTex.x != 0.0f);
+    const float gradK    = exp2(max(gShadowParams.terrainTex.y, 0.0f));
+    const float2 gdx     = duvdx * gradK;
+    const float2 gdy     = duvdy * gradK;
+
     float3 albedo;
     if (oneSquare) {
-        albedo = sampleLand(id00, uv);          // interior of a square: one tap, the common case
+        albedo = sampleLand(id00, uv, gdx, gdy, gradArm);   // interior of a square: one tap
     } else {
-        albedo  = sampleLand(id00, uv) * w00;
-        albedo += sampleLand(id10, uv) * w10;
-        albedo += sampleLand(id01, uv) * w01;
-        albedo += sampleLand(id11, uv) * w11;
+        albedo  = sampleLand(id00, uv, gdx, gdy, gradArm) * w00;
+        albedo += sampleLand(id10, uv, gdx, gdy, gradArm) * w10;
+        albedo += sampleLand(id01, uv, gdx, gdy, gradArm) * w01;
+        albedo += sampleLand(id11, uv, gdx, gdy, gradArm) * w11;
     }
 
     // VCLR is Morrowind's hand-painted per-vertex TINT over the land texture — it multiplies, it is
@@ -406,13 +484,13 @@ float4 PS_MAIN( VSOutput In )
             // `dh` accumulates in the same corner order the cdblur arm always used, so removing the
             // retired baked arm leaves the shipped (mode 4) image bit-identical.
             if (oneSquare) {
-                if (ps00 != 0u) { mat  = sampleLandParam(ps00, uv); matW = 1.0f; }
+                if (ps00 != 0u) { mat  = sampleLandParam(ps00, uv, gdx, gdy, gradArm); matW = 1.0f; }
                 if (ps00 != 0u) { dh = landGradCdblur(ps00, uv, pbrDUVdx, pbrDUVdy, pbrGradR); }
             } else {
-                if (ps00 != 0u) { mat += sampleLandParam(ps00, uv) * w00; matW += w00; }
-                if (ps10 != 0u) { mat += sampleLandParam(ps10, uv) * w10; matW += w10; }
-                if (ps01 != 0u) { mat += sampleLandParam(ps01, uv) * w01; matW += w01; }
-                if (ps11 != 0u) { mat += sampleLandParam(ps11, uv) * w11; matW += w11; }
+                if (ps00 != 0u) { mat += sampleLandParam(ps00, uv, gdx, gdy, gradArm) * w00; matW += w00; }
+                if (ps10 != 0u) { mat += sampleLandParam(ps10, uv, gdx, gdy, gradArm) * w10; matW += w10; }
+                if (ps01 != 0u) { mat += sampleLandParam(ps01, uv, gdx, gdy, gradArm) * w01; matW += w01; }
+                if (ps11 != 0u) { mat += sampleLandParam(ps11, uv, gdx, gdy, gradArm) * w11; matW += w11; }
                 if (ps00 != 0u) { dh += landGradCdblur(ps00, uv, pbrDUVdx, pbrDUVdy, pbrGradR) * w00; }
                 if (ps10 != 0u) { dh += landGradCdblur(ps10, uv, pbrDUVdx, pbrDUVdy, pbrGradR) * w10; }
                 if (ps01 != 0u) { dh += landGradCdblur(ps01, uv, pbrDUVdx, pbrDUVdy, pbrGradR) * w01; }
@@ -844,6 +922,105 @@ float4 PS_MAIN( VSOutput In )
         // ([[feedback_publish_a_lane_where_every_view_copies_it]] — a view that recomputes its
         // answer can agree with itself and disagree with the frame).
         RETURN(float4(pbrHeightVis, pbrHeightVis, pbrHeightVis, 1.0f));
+    }
+    if (dbg == 24u) {   // mode 24: the FOOTPRINT's ANISOTROPY RATIO — why the tiles exist
+        // ⚠ THIS IS THE VIEW THAT TESTS THE MECHANISM, and mode 22 alone cannot.
+        //
+        // Mode 22 shows the filter width tiled PER TRIANGLE. The footprint is a smooth function of
+        // distance, so a per-triangle step has to come from the other term: SLOPE. The major axis of
+        // the footprint ellipse goes as 1/sin(incidence), and terrain at distance is seen at a few
+        // degrees — so at 3 degrees, a ONE degree change of slope moves the major axis by ~30%. A
+        // triangulated heightfield is only C0: its slope is constant per triangle and jumps at every
+        // edge. So the LOD jumps at every edge, by a lot, and walks between levels as the camera
+        // moves. That is the "z-fighting when a triangle first changes colour".
+        //
+        // If that is what is happening, THIS VIEW IS HOT AND TILED EXACTLY WHERE 22 IS TILED, and
+        // both go calm on ground that faces the camera. If it is cool and smooth where 22 is tiled,
+        // the ratio is not the driver and the slope story is wrong.
+        //
+        //   GREEN   <=2   near-isotropic; the sampler is comfortable
+        //   YELLOW   4
+        //   ORANGE   8    AT the sampler's cap (gSamplerAnisotropic is 8x)
+        //   RED     16    past the cap: correctly filtered but blurred along the minor axis
+        //   WHITE   32+   deep in the 1/sin regime, where slope noise is amplified most
+        const float mj = max(length(lodDx), length(lodDy));
+        const float mn = max(min(length(lodDx), length(lodDy)), 1e-6f);
+        const float ratio = mj / mn;
+        float3 cc = float3(0.20f, 0.85f, 0.25f);
+        if (ratio > 24.0f)      { cc = float3(1.00f, 1.00f, 1.00f); }
+        else if (ratio > 12.0f) { cc = float3(1.00f, 0.12f, 0.10f); }
+        else if (ratio > 6.0f)  { cc = float3(0.95f, 0.55f, 0.10f); }
+        else if (ratio > 3.0f)  { cc = float3(0.85f, 0.90f, 0.15f); }
+        RETURN(float4(cc, 1.0f));
+    }
+    if (dbg == 23u) {   // mode 23: the land texture's BASE RESOLUTION — the "squares", on their own
+        // Mode 22 used to print this signal on top of its own, which made it unreadable: it banded
+        // the mip level in EACH BUCKET's own units, so a texture square whose neighbour lived in a
+        // different-sized bucket showed a hard step that had nothing to do with filtering. 22 now
+        // measures in world units and no longer sees bucket size at all; this view owns that axis.
+        //
+        // It is worth its own key regardless, because a land texture two sizes below its neighbours
+        // is a real defect with a real look: it is blurrier at every distance, and the seam where it
+        // meets a 1024 neighbour moves with the camera. That is content, and it is fixable on disk.
+        //   GREEN   1024  the set's norm (508 of 546 land textures)
+        //   YELLOW   512
+        //   ORANGE   256
+        //   RED     <=128  far below its neighbours
+        //   BLUE    2048+  above the cap's norm
+        const float sz = lodDims.x;
+        float3 cc = float3(0.20f, 0.85f, 0.25f);
+        if (sz <= 128.0f)       { cc = float3(1.00f, 0.12f, 0.10f); }
+        else if (sz <= 256.0f)  { cc = float3(0.95f, 0.55f, 0.10f); }
+        else if (sz <= 512.0f)  { cc = float3(0.85f, 0.90f, 0.15f); }
+        else if (sz >= 2048.0f) { cc = float3(0.25f, 0.45f, 0.95f); }
+        // Shape off the GEOMETRIC normal so hills are identifiable without printing relief.
+        const float3 vD = normalize(gFrameData.eyePos.xyz - In.WorldPos);
+        RETURN(float4(cc * (0.55f + 0.45f * saturate(dot(normal, vD))), 1.0f));
+    }
+    if (dbg == 22u) {   // mode 22: the MIP LEVEL the ground is actually sampled at
+        // ⚠ THIS VIEW EXISTS TO SETTLE ONE QUESTION AND IT ANSWERS IT BY MATCHING THE ARTIFACT.
+        // A land texture that sparkles at distance has exactly two possible causes and they need
+        // opposite fixes: the sampler is picking a level that is too sharp (or picking an
+        // INCOHERENT level between neighbouring pixels), or the level is right and the texture
+        // simply carries more energy at its own Nyquist than its neighbours do. Argument cannot
+        // separate those; this can, because it fails the same way the artifact does:
+        //
+        //   **If the sparkle is a LOD fault, THIS VIEW SPARKLES IN THE SAME PIXELS.**
+        //   If this view is smooth bands where the ground sparkles, the LOD is fine and the
+        //   cause is the content (or where the taps land), not the level being chosen.
+        //
+        // The banding is the whole point and it is not decoration: a continuous ramp would hide
+        // per-pixel incoherence in a gradient, which is precisely the signal being looked for. So
+        // each INTEGER level gets its own hue and the fractional part rides brightness — spatially
+        // coherent LOD reads as clean concentric bands walking away from the camera, and a
+        // one-level disagreement between neighbouring pixels reads as colour noise.
+        //
+        //   hue    the filter's world footprint, one band per DOUBLING: red <2u, amber 2-4u,
+        //          yellow 4-8u, green 8-16u, cyan 16-32u, blue 32-64u, violet 64-128u, grey 128u+
+        //   value  the fraction within that band (dark at the bottom, bright at the top)
+        //   MAGENTA TINGE  the hardware LOD is more than one level SHARPER than the isotropic
+        //                  footprint asks for — i.e. anisotropy is doing work here. Expected on a
+        //                  grazing hillside; suspicious on flat ground facing the camera.
+        //
+        // ⚠ THE UNIT IS WORLD FOOTPRINT, NOT THE BUCKET'S MIP INDEX — see lodWorld above for the
+        // flaw that fixes. The "squares" this view used to print were the instrument, not the
+        // renderer; mode 23 now owns that axis on its own.
+        const float lvl = max(lodWorld, 0.0f);
+        const float fi  = floor(lvl);
+        const float ff  = lvl - fi;
+        const uint  li  = (uint)fi;
+        float3 band = float3(0.85f, 0.15f, 0.12f);                  // 0 red
+        if (li == 1u)      { band = float3(0.95f, 0.55f, 0.10f); }  // 1 amber
+        else if (li == 2u) { band = float3(0.85f, 0.90f, 0.15f); }  // 2 yellow
+        else if (li == 3u) { band = float3(0.20f, 0.85f, 0.25f); }  // 3 green
+        else if (li == 4u) { band = float3(0.15f, 0.80f, 0.80f); }  // 4 cyan
+        else if (li == 5u) { band = float3(0.25f, 0.45f, 0.95f); }  // 5 blue
+        else if (li == 6u) { band = float3(0.55f, 0.30f, 0.90f); }  // 6 violet
+        else if (li >= 7u) { band = float3(0.80f, 0.80f, 0.85f); }  // 7+ pale grey
+        float3 cc = band * (0.35f + 0.65f * ff);
+        // How far anisotropy is pulling the level below the isotropic footprint's own answer.
+        if ((isoLod - hwLod) > 1.0f) { cc = lerp(cc, float3(1.0f, 0.1f, 1.0f), 0.35f); }
+        RETURN(float4(cc, 1.0f));
     }
     if (dbg == 20u) {   // mode 20: how many DISTINCT land textures blend at this pixel
         // A seam on the ground has two candidate causes and they need opposite fixes: the blend

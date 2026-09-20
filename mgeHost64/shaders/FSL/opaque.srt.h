@@ -65,6 +65,12 @@
 // its OWN declaration (see gTerrainArrays). 499 unique LTEX over a handful of (format, capped size)
 // combinations, so this is generously sized; the residency log reports actual occupancy.
 #define MAX_TERRAIN_BUCKETS 32
+// DISTANT-STATICS PBR: the `_paramh` companions of the statics library, in their own bucket set
+// (gStaticsParamArrays, PerFrame). SIZED BY COVERAGE, not by the albedo's 128: only the LOD textures
+// that ship a companion are planned here — 116 of 2008 in the shipped bake — so this needs far fewer
+// (format, capped-size) combinations than the albedo does. The residency log reports occupancy and
+// says so loudly if it overflows.
+#define MAX_STATICS_PARAM_BUCKETS 48
 #define MAX_POINT_LIGHTS 128 // per-frame point-light cap; MUST match IPC::kMaxPointLights (geomwire.h)
 // NiUVController takeover: per-frame UV-animation table (gUVAnim). Entry id = (du, dv, setIndex, 0);
 // id 0 is reserved = "no animation" (entry 0 stays zero). MUST match host kMaxUVAnim (forgerender.cpp).
@@ -618,6 +624,36 @@ BEGIN_SRT_NO_AB(SrtData)
         // been appended after it since. The rule is append at the END, which is here.)
         DECL_BUFFER(PerFrame, Buffer(uint), gTerrainParamTex)
         DECL_ARRAY_TEXTURES(PerFrame, Tex2DArray(float4), gTerrainParamArrays, MAX_TERRAIN_BUCKETS)
+        // ─── DISTANT-STATICS PBR: the `_paramh` material past the handover ─────────────────────────
+        // The near mesh path shades a full material and the distant statics pass shaded albedo only,
+        // so a big object crossing the handover DROPPED its roughness and relief in one frame. These
+        // two are the other half of it; statics.frag reads them.
+        //
+        // ⚠ PerFrame AND NOT Persistent, although gStaticsArrays — the albedo these belong to — is
+        // Persistent. That table is EXACTLY at its proven-OK 1024 (gTextures 880 + gStaticsArrays 128
+        // + gFlipArrays 16) and has no room at all, so the companion set lives here, exactly as
+        // gTerrainParamArrays does for the same reason. It costs the statics pass nothing: it already
+        // binds a PerFrame set for gFrameData/gShadowParams/gFroxelMask.
+        //
+        // gStaticsParamSlot is the albedo slot -> param slot map, and it is a BUFFER rather than a
+        // second lane in the instance stream because the statics wire has no spare lane: InstParams
+        // is full (texSlot, flags, glow stagger, near-cut plane) and widening the stride would touch
+        // cullscatter.comp, the CPU cull, the probe and the vertex layout to carry 4 bytes per
+        // INSTANCE for something that is a property of the SUBSET. Its layout is a 128-entry header
+        // (one base per albedo bucket) followed by the per-(bucket, layer) runs:
+        //     base  = gStaticsParamSlot[bucket]
+        //     pslot = gStaticsParamSlot[base + layer]      // 0 = this texture ships no _paramh
+        // Both loads are scalar — TexIndex is FLAT and one EI subset is one texture — so the whole
+        // lookup is uniform per draw, and so is the branch it gates.
+        //
+        // Slot 0 = "no material", so an UNBOUND buffer reads 0 everywhere = no PBR on distant statics
+        // = the pre-feature image. The benign default points the right way with no fallback binding,
+        // like gGrassCrush and the terrain pair above.
+        //
+        // Appended AFTER gTerrainParamArrays — append only, FSL assigns descriptor offsets from one
+        // running counter and an insertion silently re-points every later binding.
+        DECL_BUFFER(PerFrame, Buffer(uint), gStaticsParamSlot)
+        DECL_ARRAY_TEXTURES(PerFrame, Tex2DArray(float4), gStaticsParamArrays, MAX_STATICS_PARAM_BUCKETS)
     END_SRT_SET(PerFrame)
     // Point-light cbuffer — rides the otherwise-unused PerDraw set (FSL has exactly four
     // fixed update frequencies: Persistent/PerFrame/PerBatch/PerDraw; a custom set name has

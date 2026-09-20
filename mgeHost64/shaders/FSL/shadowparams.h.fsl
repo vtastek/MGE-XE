@@ -819,4 +819,32 @@ STRUCT(ShadowMaskParams)
     //       instead of growing to shade ever-larger features.
     //   w = spare.
     DATA(float4,   pbrTerrainAO,     None);
+    // DISTANT-STATICS PBR (tasks/forge-dl-lod-textures.md). Read only by statics.frag. Appended, for
+    // the reason every block above states: this cbuffer is bound BY POINTER into every PerFrame set,
+    // so an insertion anywhere else silently moves a lane somebody reads.
+    //   x = ARMED (0 = off). A lane rather than a host-side gate, for terrain's reason exactly: the
+    //       statics param slots live in a whole-library map uploaded ONCE at the first exterior, so
+    //       gating there would mean rebuilding it to flip a checkbox and the A/B would not be live.
+    //       With x = 0 statics.frag never enters the branch, so off is the pre-feature image exactly.
+    //   y = relief depth for the DISTANT LOD. Its own lane, and NOT because the convention differs —
+    //       it is the same dimensionless slope scale a mesh uses (slope = depth * dH/duv). It is
+    //       separate because the DL library is a DOWNSAMPLE: `_paramh` at a 64-128 texel LOD reaches
+    //       cdblur's floor (blvl = log2(2r)) where the near mesh is still reading a real mip, so the
+    //       same number yields less relief out there than it does up close. Which is exactly the
+    //       handover step this feature exists to close, so it gets a dial of its own.
+    //   zw = spare.
+    DATA(float4,   pbrStatics,       None);
+    // TERRAIN ALBEDO SAMPLING. Read only by terrain.frag. Appended, for the reason every block above
+    // states: this cbuffer is bound BY POINTER into every PerFrame set, so an insertion anywhere else
+    // silently moves a lane somebody reads.
+    //   x = GRADIENT ARM. 0 = the implicit-derivative Sample that shipped (and which sits inside the
+    //       blend's `oneSquare` branch, i.e. in divergent control flow — undefined per spec, and the
+    //       DXIL keeps the branch rather than flattening it). 1 = explicit SampleGrad off a gradient
+    //       hoisted to top level. 0 is the pre-change image exactly, which is what makes this an A/B.
+    //   y = LOD BIAS in LEVELS, applied on arm 1 only (the gradient is scaled by exp2(y), and a
+    //       level IS a doubling of the filter). It exists as a MEASUREMENT before it is a look knob:
+    //       if a small bias kills the distant sparkle, the ground is marginally undersampled; if it
+    //       takes two levels, something else is wrong and the bias is only hiding it.
+    //   zw = spare.
+    DATA(float4,   terrainTex,       None);
 };
