@@ -6108,11 +6108,15 @@ namespace {
     //   terrainMacro x amp, y/z band periods (world Z), w slope amount — the tiling repeat, which is
     //     a SEPARATE artifact from the blend ramp and multiplies albedo only.
     constexpr uint32_t kTerrainMacroFloat     = kTerrainDisp3Float + 4;
+    //   terrainMacro2 x/y world-XY noise amp+period, z/w texture-macro amp+tile; terrainMacro3 x
+    //     its detail level. Arms 2 and 3 of the same repeat, composing additively with arm 1.
+    constexpr uint32_t kTerrainMacro2Float    = kTerrainMacroFloat + 4;
+    constexpr uint32_t kTerrainMacro3Float    = kTerrainMacro2Float + 4;
     constexpr uint32_t kShadowParamsBytes = 4096;
     static_assert((kAoBounceFloat + 4) * sizeof(float) <= kShadowParamsBytes,
                   "ShadowMaskParams overflows its CBV — too many sun cascades");
-    static_assert((kTerrainMacroFloat + 4) * sizeof(float) <= kShadowParamsBytes,
-                  "pbrParams..terrainMacro must fit inside the ShadowMaskParams CBV");
+    static_assert((kTerrainMacro3Float + 4) * sizeof(float) <= kShadowParamsBytes,
+                  "pbrParams..terrainMacro3 must fit inside the ShadowMaskParams CBV");
     // The float indices above are kept in step with the struct BY HAND, one +4 at a time, and
     // nothing checked that the running sum still lands on the member it names. A lane written one
     // float4 off reads as a knob that does nothing, or as garbage in a neighbour's slot — both of
@@ -6141,6 +6145,10 @@ namespace {
                   "kTerrainDisp3Float does not land on ShadowMaskParams::terrainDisp3");
     static_assert(offsetof(ShadowMaskParams, terrainMacro) == kTerrainMacroFloat * sizeof(float),
                   "kTerrainMacroFloat does not land on ShadowMaskParams::terrainMacro");
+    static_assert(offsetof(ShadowMaskParams, terrainMacro2) == kTerrainMacro2Float * sizeof(float),
+                  "kTerrainMacro2Float does not land on ShadowMaskParams::terrainMacro2");
+    static_assert(offsetof(ShadowMaskParams, terrainMacro3) == kTerrainMacro3Float * sizeof(float),
+                  "kTerrainMacro3Float does not land on ShadowMaskParams::terrainMacro3");
     // msmrecv.h.fsl's PCSS works in TEXELS, so SUN_SHADOW_RES has to agree with the atlas the host
     // actually allocated. Same mirroring contract as SUN_CASCADES / kSunCascades.
     static_assert(kSunShadowRes == 2048, "SUN_SHADOW_RES in shadowparams.h.fsl must match kSunShadowRes");
@@ -7582,6 +7590,31 @@ namespace {
     // ⚠ The slope term is NOT mean zero — raising it lightens the scene and moves APL, so it is
     // knobbed apart from the band and ships at 0 ([[feedback_one_knob_two_jobs]]).
     float    g_terrainMacroSlope   = 0.0f;
+    // ARM 2 — world-XY value noise. The band arm above is a function of elevation and slope, so it
+    // is CONSTANT on a plane, and a plane is exactly where the 512-unit repeat is easiest to see.
+    // This one has no such blind spot: its coordinate IS the ground plane. No tap, ~20 ALU.
+    float    g_terrainMacroNoiseAmp = 0.0f;
+    float    g_terrainMacroNoisePer = 2200.0f;   // world units; the 2nd octave runs at /3.7
+    // ARM 3 — the dominant land texture's OWN coarse mip, retiled larger and ratioed against that
+    // texture's 1x1 mip, so the factor is exactly mean 1 PER TEXTURE and the variation is the
+    // texture's own tonal statistics. It is the only arm that cannot look foreign, and the only one
+    // that costs taps — two, on the axis terrain is actually bound on, so price it before arming it.
+    float    g_terrainMacroTexAmp   = 0.0f;
+    // ⚠ THE TILE AND THE LEVEL SET THIS ARM'S CONTRAST, NOT JUST ITS SCALE, and that is measured,
+    // not assumed. A coarse mip of a land texture is a 64x-averaged image and is nearly flat, so a
+    // low-resolution copy carries almost no variation to scale up. At amp 1.0, `geo` moved:
+    //     level 4 / tile 4   -0.06%      (128 u per macro texel) — effectively nothing
+    //     level 6 / tile 4   -0.19%      ( 32 u)
+    //     level 7 / tile 8   -0.68%      ( 32 u, over a 4096 u tile)   <- the shipped shape
+    //     level 9 / tile 1   -1.49%      (  1 u) — this IS the texture again, not a macro field
+    // against arm 1's -2.2% at the same amp. So the useful amp for this arm is ~0.2 to match arm 1
+    // at 0.10, and the first defaults (4/4) were a knob whose whole slider did nothing.
+    float    g_terrainMacroTexTile  = 8.0f;      // in 512-unit squares: 8 = one macro tile / 4096 u
+    // Mips BELOW the 1x1 top: 7 reads a 128x128 copy, so at tile 8 one macro texel spans 32 world
+    // units. Raising it makes the field FINER and, because a finer mip is less averaged, stronger —
+    // the two are not separable here, and that is inherent: the variation IS the texture's own
+    // statistics at the scale you ask for.
+    float    g_terrainMacroTexLevel = 7.0f;
     // ─── PHASE 4a: near-camera terrain displacement (terrain.vert.fsl) ───────────────────────────
     // ⚠ THE RISKY PHASE, AND IT IS STAGED LAST DELIBERATELY. D1-D5 above deliver most of the look
     // at no geometric risk; this one has three problems the fragment work does not, and two of them
@@ -21980,6 +22013,11 @@ namespace {
             { "terrainMacroPerA",     &g_terrainMacroPerA     },
             { "terrainMacroPerB",     &g_terrainMacroPerB     },
             { "terrainMacroSlope",    &g_terrainMacroSlope    },
+            { "terrainMacroNoiseAmp", &g_terrainMacroNoiseAmp },
+            { "terrainMacroNoisePer", &g_terrainMacroNoisePer },
+            { "terrainMacroTexAmp",   &g_terrainMacroTexAmp   },
+            { "terrainMacroTexTile",  &g_terrainMacroTexTile  },
+            { "terrainMacroTexLevel", &g_terrainMacroTexLevel },
             // Phase 4a. The displacement's two open questions (does grass follow, does the fade
             // boundary ghost) are watched in PLAY, but its COST and its fade geometry are read off
             // an unattended run — and the radius is the dial to shrink first if either bites.
@@ -24055,6 +24093,22 @@ namespace {
           t.sliderF("  band period B, world Z units (long)",  &g_terrainMacroPerB, 40.0f, 4000.0f, 10.0f);
           t.sliderF("  slope amount (cliffs vs flats) — NOT mean-zero, this one moves APL",
                     &g_terrainMacroSlope, 0.0f, 1.0f, 0.05f);
+          // Arm 2. The band arm is blind on a plane by construction; this one is not.
+          t.sliderF("MACRO arm 2: world-XY noise amp (covers FLAT ground; free, no tap)",
+                    &g_terrainMacroNoiseAmp, 0.0f, 0.35f, 0.01f);
+          t.sliderF("  noise period, world units (2nd octave runs at /3.7)",
+                    &g_terrainMacroNoisePer, 200.0f, 8000.0f, 100.0f);
+          // Arm 3. The only one that costs taps, and the only one whose variation is the texture's
+          // own tone — it is self-normalising per texture and fades to exactly 1 with distance.
+          // Measured +0.03-0.05 ms: the two taps are coarse mips and stay cache-resident, so this
+          // is far cheaper than the tap count suggests. Its natural contrast is SMALL (a coarse mip
+          // is nearly flat), so its amp scale is not arms 1 and 2's — ~0.2 here matches ~0.10 there.
+          t.sliderF("MACRO arm 3: texture's own coarse mip amp (2 taps, +0.04ms; try ~0.2)",
+                    &g_terrainMacroTexAmp, 0.0f, 2.0f, 0.02f);
+          t.sliderF("  tile size in 512u squares (8 = one macro tile per 4096 world units)",
+                    &g_terrainMacroTexTile, 1.0f, 32.0f, 1.0f);
+          t.sliderF("  detail: mips below the 1x1 top — finer AND stronger, they do not separate",
+                    &g_terrainMacroTexLevel, 1.0f, 10.0f, 1.0f);
           // ─── Phase 4a. THE RISKY ONE, and it is here to be FALSIFIED rather than shipped ──────
           // Two things are expected to break and the point is to find where: GRASS does not follow
           // (roots are baked CPU-side from the raw heightfield, outside this shader), and the
@@ -32634,6 +32688,14 @@ void destroyHostWindow(Renderer* R);
             mp[kTerrainMacroFloat + 1] = std::max(1.0f, g_terrainMacroPerA);
             mp[kTerrainMacroFloat + 2] = std::max(1.0f, g_terrainMacroPerB);
             mp[kTerrainMacroFloat + 3] = std::max(0.0f, g_terrainMacroSlope);
+            mp[kTerrainMacro2Float + 0] = std::max(0.0f, g_terrainMacroNoiseAmp);
+            mp[kTerrainMacro2Float + 1] = std::max(1.0f, g_terrainMacroNoisePer);
+            mp[kTerrainMacro2Float + 2] = std::max(0.0f, g_terrainMacroTexAmp);
+            mp[kTerrainMacro2Float + 3] = std::max(1.0f, g_terrainMacroTexTile);
+            mp[kTerrainMacro3Float + 0] = std::clamp(g_terrainMacroTexLevel, 0.0f, 12.0f);
+            mp[kTerrainMacro3Float + 1] = 0.0f;
+            mp[kTerrainMacro3Float + 2] = 0.0f;
+            mp[kTerrainMacro3Float + 3] = 0.0f;
             mp[280] = g_shadowBias;               // biasParams.x = absolute contact bias (live knob)
             mp[281] = g_shadowNormalOffset;       // biasParams.y = normal-offset bias in texels (live knob)
             // Flicker shadow "movement": the mask rotates the LOOKUP direction of flicker-class slots by a

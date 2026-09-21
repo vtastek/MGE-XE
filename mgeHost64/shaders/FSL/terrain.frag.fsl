@@ -302,6 +302,88 @@ float terrainMacroTint(float worldZ, float dzdp, float slopeCos, float4 k)
     return max(0.0f, 1.0f + k.x * (band + slope));
 }
 
+// ─── ARM 2: THE SAME JOB ON WORLD XY, WHICH IS WHAT FLAT GROUND NEEDS ───────────────────────
+// terrainMacroTint is a function of elevation and slope, so it is CONSTANT on a plane — and a plane
+// is exactly where the 512-unit repeat is easiest to see. This arm has no such blind spot because
+// its coordinate is the ground plane itself. Two octaves of value noise, no tap, ~20 ALU.
+//
+// ⚠ PRECISION. Absolute world XY reaches ~1.2e5 in Vvardenfell, where an fp32 ulp is ~0.008 units,
+// and `sin` of a number that large would be argument-reduction noise. Dividing by the period FIRST
+// is what makes this well conditioned: at period 2000 the lattice coordinate is ~60, its ulp is
+// 8e-6 lattice units = 0.015 world units, and `floor`/`frac` of that are exact where it matters
+// ([[project_forge_precision_far_origin]]).
+//
+// A value-noise hash is deterministic per lattice cell, so neighbouring pixels agree and there is
+// no shimmer; the smoothstep interpolant makes the field C1, which is all that is needed because
+// nothing differentiates it — it multiplies a colour, it does not become a normal
+// ([[feedback_continuity_one_order_short]] is about the other case).
+float macroHash(float2 i)
+{
+    return frac(sin(dot(i, float2(127.1f, 311.7f))) * 43758.5453f);
+}
+float macroNoise(float2 p)
+{
+    const float2 i = floor(p);
+    const float2 f = p - i;
+    const float2 u = f * f * (3.0f - 2.0f * f);
+    const float  a = macroHash(i);
+    const float  b = macroHash(i + float2(1.0f, 0.0f));
+    const float  c = macroHash(i + float2(0.0f, 1.0f));
+    const float  d = macroHash(i + float2(1.0f, 1.0f));
+    return lerp(lerp(a, b, u.x), lerp(c, d, u.x), u.y) * 2.0f - 1.0f;   // mean ~0 over many cells
+}
+// `dxy` is the world-XY footprint of one pixel: same band-limit contract as the elevation bands,
+// per octave, because the far ground crosses a whole period in well under a pixel.
+float terrainMacroNoise(float2 worldXY, float dxy, float amp, float period)
+{
+    if (amp <= 0.0f) { return 0.0f; }
+    const float pA = max(period, 1.0f);
+    const float pB = pA / 3.7f;                       // incommensurate, so the two never beat
+    const float lA = 1.0f - smoothstep(0.15f, 0.5f, dxy / pA);
+    const float lB = 1.0f - smoothstep(0.15f, 0.5f, dxy / pB);
+    return amp * (0.65f * lA * macroNoise(worldXY / pA)
+                + 0.35f * lB * macroNoise(worldXY / pB));
+}
+
+// ─── ARM 3: THE TEXTURE'S OWN COARSE MIP, RETILED LARGER ───────────────────────────────
+// The one arm whose variation cannot look foreign, because it IS the texture's own tonal
+// statistics: a low-resolution copy of the same map stretched over several squares. Two taps.
+//
+// ⚠ SELF-NORMALISING, and that is what makes it safe. The tap is ratioed against the SAME texture's
+// 1x1 mip, which is that texture's mean, so the factor is exactly mean 1 PER TEXTURE by
+// construction. Without it a dark land texture would simply darken and the arm would read as a
+// lighting bug, differently for every texture in the world.
+//
+// ⚠ IT FADES OUT WITH DISTANCE FOR FREE. The level is clamped up to this pixel's own footprint, and
+// as that reaches the top mip the tap and its normaliser become the same number, so the factor goes
+// to exactly 1. No separate distance knob, and nothing left to alias.
+//
+// ⚠ IT RUNS ON THE DOMINANT LAYER, SO IT MUST FADE WITH DOMINANCE. Each texture has its own field,
+// so switching layers at an argmax would step the factor by up to ±amp — a hard edge along exactly
+// the blend boundaries the 2026-09-21 work went to remove. `wmax` is continuous in screen space, so
+// fading the arm out as the blend approaches 50/50 removes the step without a branch on the seam.
+float terrainMacroTex(uint slot, float2 uv, float2 duvdx, float2 duvdy, float amp, float tile, float lvlBelow)
+{
+    if (amp <= 0.0f) { return 0.0f; }
+    const uint bucket = slot >> 16u;
+    const uint layer  = slot & 0xFFFFu;
+    uint w, h, e;
+    GetLandArrayDims(gTerrainArrays[bucket], w, h, e);
+    const float2 dims = max(float2(float(w), float(h)), float2(1.0f, 1.0f));
+    const float  top  = log2(max(max(dims.x, dims.y), 1.0f));
+    const float  tl   = max(tile, 1.0f);
+    // This pixel's own footprint IN THE RETILED MAP, in texels of its base level.
+    const float  fp   = max(length(duvdx / tl * dims), length(duvdy / tl * dims));
+    const float  need = max(0.0f, log2(max(fp, 1e-8f)));
+    const float  lvl  = clamp(max(top - max(lvlBelow, 0.0f), need), 0.0f, top);
+    const float3 c    = SampleLvlLandArray(gTerrainArrays[bucket], gSamplerBilinearWrap,
+                                           float3(uv / tl, float(layer)), lvl).rgb;
+    const float3 m    = SampleLvlLandArray(gTerrainArrays[bucket], gSamplerBilinearWrap,
+                                           float3(uv / tl, float(layer)), top).rgb;   // 1x1 = MEAN
+    const float3 kLum = float3(0.2126f, 0.7152f, 0.0722f);
+    return amp * (dot(c, kLum) / max(dot(m, kLum), 1e-4f) - 1.0f);
+}
+
 ROOT_SIGNATURE(DefaultRootSignature)
 float4 PS_MAIN( VSOutput In )
 {
@@ -619,9 +701,40 @@ float4 PS_MAIN( VSOutput In )
     // value would slide vertically every time the player walks up a hill — the whole ground would
     // crawl. The screen-space gradient does NOT need the term back: it is uniform per frame and
     // cancels in ddx/ddy.
-    albedo *= terrainMacroTint(In.WorldPos.z + gFrameData.lodEye.z,
-                               max(abs(pbrDPdx.z), abs(pbrDPdy.z)),
-                               normal.z, gShadowParams.terrainMacro);
+    {
+        // ARM 1: elevation bands + slope. Free, blind on flat ground.
+        float macro = terrainMacroTint(In.WorldPos.z + gFrameData.lodEye.z,
+                                       max(abs(pbrDPdx.z), abs(pbrDPdy.z)),
+                                       normal.z, gShadowParams.terrainMacro) - 1.0f;
+        // ARM 2: world-XY noise. Covers what arm 1 structurally cannot. ⚠ ABSOLUTE XY, so lodEye
+        // goes back on for arm 1's reason — In.WorldPos is camera-relative and a field indexed by it
+        // would slide with the player. The FOOTPRINT does not need the term back (uniform per frame).
+        macro += terrainMacroNoise(In.WorldPos.xy + gFrameData.lodEye.xy,
+                                   max(length(pbrDPdx.xy), length(pbrDPdy.xy)),
+                                   gShadowParams.terrainMacro2.x, gShadowParams.terrainMacro2.y);
+        // ARM 3: the dominant layer's own coarse mip. Two taps, so it is gated per-pixel — legal
+        // because everything inside takes EXPLICIT levels and asks the quad for no derivative, the
+        // same argument the blend's own branches make. `dom` fades it out as the blend approaches
+        // 50/50, which is what keeps a per-texture field from stepping across a seam.
+        if (gShadowParams.terrainMacro2.z > 0.0f)
+        {
+            uint  ms = id00; float mw = w00;
+            if (w10 > mw) { ms = id10; mw = w10; }
+            if (w01 > mw) { ms = id01; mw = w01; }
+            if (w11 > mw) { ms = id11; mw = w11; }
+            const float dom = saturate(mw * 2.0f - 1.0f);
+            if (dom > 0.0f)
+            {
+                macro += dom * terrainMacroTex(ms, uvS, duvdx, duvdy,
+                                               gShadowParams.terrainMacro2.z,
+                                               gShadowParams.terrainMacro2.w,
+                                               gShadowParams.terrainMacro3.x);
+            }
+        }
+        // All three are deviations about 0 and compose additively, so amplitudes add rather than
+        // multiply and the three sliders mean the same thing to the eye.
+        albedo *= max(0.0f, 1.0f + macro);
+    }
 
     // (`normal` is declared up with the uv gradients now — the tangent frame the parallax block
     //  builds needs it before the albedo blend.)

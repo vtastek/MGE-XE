@@ -972,4 +972,25 @@ STRUCT(ShadowMaskParams)
     // face crosses a whole period in a few pixels, and an unlimited sine there aliases and crawls
     // ([[feedback_nyquist_of_the_output_not_the_input]]).
     DATA(float4,   terrainMacro,     None);
+    // terrainMacro2 — the other two arms against the same repeat. All three multiply the same
+    // albedo at the same site and compose additively about 1, so they are tuned together.
+    //   x = WORLD-XY NOISE amplitude (0 = off). Two octaves of value noise on absolute world XY.
+    //       This is the arm that covers FLAT GROUND, which terrainMacro's elevation bands cannot
+    //       touch by construction — they are a function of a coordinate that does not vary there.
+    //   y = its base PERIOD in world units; the second octave runs at y/3.7, incommensurate.
+    //   z = TEXTURE-MACRO amplitude (0 = off). The dominant land texture's OWN coarse mip, retiled
+    //       larger, ratioed against that texture's 1x1 mip — so it is exactly mean 1 per texture by
+    //       construction and can never look foreign, because the variation IS the texture's own
+    //       tonal statistics. Costs 2 taps where it runs, which is the axis terrain is bound on.
+    //   w = its TILE size, in 512-unit texture squares (4 = one macro tile per 2048 world units).
+    DATA(float4,   terrainMacro2,    None);
+    // terrainMacro3:
+    //   x = TEXTURE-MACRO detail level, in mips BELOW the texture's 1x1 top. 4 reads a 16x16
+    //       version of the map, so at tile 4 one macro feature spans 2048/16 = 128 world units.
+    //       Raising it makes the field finer, NOT stronger. The level is clamped up to this pixel's
+    //       own footprint, so the arm fades to exactly 1 with distance instead of aliasing — at the
+    //       1x1 mip the tap and its normaliser are the same number
+    //       ([[feedback_nyquist_of_the_output_not_the_input]]).
+    //   yzw = spare.
+    DATA(float4,   terrainMacro3,    None);
 };
