@@ -260,6 +260,48 @@ float landHeightAO(uint slot, float2 uv, float2 duvdx, float2 duvdy, float aoLvl
     return pbrHeightAO(hS, hA, size0, alvl, depth);
 }
 
+// ─── MACRO VARIATION: a mean-zero tint that follows the TERRAIN, not the texture grid ──────────
+// The 512-unit tiling repeat (`uv = lat * 0.25`, global phase, no variation) reads as a square grid
+// however well the texture squares blend — a SEPARATE artifact from the blend ramp, and the one that
+// survives a perfect blend. This breaks it with a field of ABSOLUTE ELEVATION, which is
+// uncorrelated with the texture lattice by construction, so light and dark follow the ground's own
+// contours instead of anything on a 512 grid.
+//
+// It is deliberately NOT a method that touches the texture. Stochastic/hex tiling and texture
+// bombing both resample or rotate the map: contrast comes back statistically, but detail softens
+// and features ghost. Every texel's relationship to its neighbours is preserved here because the
+// only thing that moves is the LEVEL.
+//
+// ⚠ MEAN ZERO IS THE WHOLE DESIGN OF THE BAND. Two sines of elevation, halved, average to zero over
+// any region crossing several periods, so the ground's mean albedo is untouched and the exposure
+// servo has nothing to chase ([[feedback_mean1_is_not_display_mean1]]). An elevation RAMP would not
+// have this property — a coastal region is all low and a mountain all high, so a ramp would brighten
+// or darken whole regions and read as a lighting bug. Two incommensurate periods so the result does
+// not read as one sine, i.e. as a topographic contour map.
+//
+// ⚠ AND IT IS CONSTANT ON PERFECTLY FLAT GROUND. Inherent: any function of elevation and slope is.
+// Flats need a world-XY field, which is a different knob and is not this one.
+//
+// ⚠ BAND-LIMITED against the screen-space gradient of elevation. A near-vertical face crosses a
+// whole period in a handful of pixels and an unlimited sine there aliases and crawls with the
+// camera. `dzdp` is |ddx| max |ddy| of world Z, taken from the gradients already hoisted at top
+// level in uniform control flow; the fade starts well before one period reaches two pixels
+// ([[feedback_nyquist_of_the_output_not_the_input]]).
+float terrainMacroTint(float worldZ, float dzdp, float slopeCos, float4 k)
+{
+    if (k.x <= 0.0f) { return 1.0f; }
+    const float pA = max(k.y, 1.0f);
+    const float pB = max(k.z, 1.0f);
+    const float lA = 1.0f - smoothstep(0.15f, 0.5f, dzdp / pA);
+    const float lB = 1.0f - smoothstep(0.15f, 0.5f, dzdp / pB);
+    // The second sine carries a golden-angle phase offset so the two never line up into one beat.
+    const float band = 0.5f * (lA * sin(worldZ * (6.28318531f / pA))
+                             + lB * sin(worldZ * (6.28318531f / pB) + 2.39996323f));
+    // NOT mean zero, knobbed apart from the band for exactly that reason, and 0 by default.
+    const float slope = k.w * (1.0f - saturate(slopeCos));
+    return max(0.0f, 1.0f + k.x * (band + slope));
+}
+
 ROOT_SIGNATURE(DefaultRootSignature)
 float4 PS_MAIN( VSOutput In )
 {
@@ -568,6 +610,18 @@ float4 PS_MAIN( VSOutput In )
         float3 c11 = loadVertexColor(cslot, x1, y1);
         albedo *= lerp(lerp(c00, c10, fx), lerp(c01, c11, fx), fy);
     }
+
+    // ...and the MACRO VARIATION, at this site for VCLR's reason: it multiplies ALBEDO, before any
+    // lighting, AO or exposure term reads it. Anywhere later and it would be fighting the servo
+    // instead of describing the ground.
+    // ⚠ ABSOLUTE elevation, so `lodEye.z` goes back on. terrain.vert emits `worldPos.z = h -
+    // lodEye.z` ([[project_forge_precision_far_origin]]), and a band indexed by that CAMERA-RELATIVE
+    // value would slide vertically every time the player walks up a hill — the whole ground would
+    // crawl. The screen-space gradient does NOT need the term back: it is uniform per frame and
+    // cancels in ddx/ddy.
+    albedo *= terrainMacroTint(In.WorldPos.z + gFrameData.lodEye.z,
+                               max(abs(pbrDPdx.z), abs(pbrDPdy.z)),
+                               normal.z, gShadowParams.terrainMacro);
 
     // (`normal` is declared up with the uv gradients now — the tangent frame the parallax block
     //  builds needs it before the albedo blend.)

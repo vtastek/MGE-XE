@@ -949,4 +949,27 @@ STRUCT(ShadowMaskParams)
     // the lattice coord itself — which needs the same origin the instance lane carries.
     //   x = grid min cell X, y = grid min cell Y, z = span X, w = span Y (all whole numbers).
     DATA(float4,   terrainDisp3,     None);
+    // ─── MACRO VARIATION: breaking the 512-unit TILING repeat, which is NOT the blend ───────────
+    // `uv = lat * 0.25` tiles every land texture once per 512 world units, axis-aligned and in
+    // global phase, with no variation at all. That repeat reads as a square grid however well the
+    // texture squares blend, so it is a SEPARATE artifact from the blend ramp (pbrTerrain.z) and
+    // gets its own lane. Multiplies ALBEDO ONLY, before any lighting term reads it — never
+    // `_paramh`, never the height, because perturbing those would move the blend boundary and the
+    // relief that the 2026-09-21 work just put where it belongs.
+    //   x = AMPLITUDE (0 = off, and off is the shipped default). Tint = 1 + x*(band + w*slope).
+    //   y, z = the two band PERIODS, in world Z units. The field is half the sum of two sines of
+    //       ABSOLUTE elevation, so it is MEAN ZERO by construction over any region that crosses
+    //       several periods. That matters: a tint whose mean is not 1 moves APL, and the exposure
+    //       servo then chases the ground ([[feedback_mean1_is_not_display_mean1]]). Two
+    //       incommensurate periods, so it does not read as one sine — i.e. as a contour map.
+    //       ⚠ A FUNCTION OF ELEVATION IS CONSTANT ON FLAT GROUND, and that is inherent rather than
+    //       a tuning miss: perfectly flat terrain gets nothing from this lane. Covering that needs
+    //       a world-XY field, which is a different knob and does not exist yet.
+    //   w = SLOPE amount, multiplying (1 - n.z). ⚠ NOT mean zero — raising it lightens the scene as
+    //       a whole and WILL move APL, which is why it ships at 0 and is knobbed apart from the
+    //       band ([[feedback_one_knob_two_jobs]]).
+    // Band-limited in the shader against the screen-space gradient of elevation: a near-vertical
+    // face crosses a whole period in a few pixels, and an unlimited sine there aliases and crawls
+    // ([[feedback_nyquist_of_the_output_not_the_input]]).
+    DATA(float4,   terrainMacro,     None);
 };

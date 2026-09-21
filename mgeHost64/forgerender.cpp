@@ -6105,11 +6105,14 @@ namespace {
     //     has only a world XY for the blade root, so it cannot reach gTerrainCellGrid without the
     //     grid's own origin; terrain.vert gets the same numbers per INSTANCE and ignores this lane.
     constexpr uint32_t kTerrainDisp3Float     = kTerrainDisp2Float + 4;
+    //   terrainMacro x amp, y/z band periods (world Z), w slope amount — the tiling repeat, which is
+    //     a SEPARATE artifact from the blend ramp and multiplies albedo only.
+    constexpr uint32_t kTerrainMacroFloat     = kTerrainDisp3Float + 4;
     constexpr uint32_t kShadowParamsBytes = 4096;
     static_assert((kAoBounceFloat + 4) * sizeof(float) <= kShadowParamsBytes,
                   "ShadowMaskParams overflows its CBV — too many sun cascades");
-    static_assert((kTerrainDisp3Float + 4) * sizeof(float) <= kShadowParamsBytes,
-                  "pbrParams..terrainDisp3 must fit inside the ShadowMaskParams CBV");
+    static_assert((kTerrainMacroFloat + 4) * sizeof(float) <= kShadowParamsBytes,
+                  "pbrParams..terrainMacro must fit inside the ShadowMaskParams CBV");
     // The float indices above are kept in step with the struct BY HAND, one +4 at a time, and
     // nothing checked that the running sum still lands on the member it names. A lane written one
     // float4 off reads as a knob that does nothing, or as garbage in a neighbour's slot — both of
@@ -6136,6 +6139,8 @@ namespace {
                   "kTerrainDisp2Float does not land on ShadowMaskParams::terrainDisp2");
     static_assert(offsetof(ShadowMaskParams, terrainDisp3) == kTerrainDisp3Float * sizeof(float),
                   "kTerrainDisp3Float does not land on ShadowMaskParams::terrainDisp3");
+    static_assert(offsetof(ShadowMaskParams, terrainMacro) == kTerrainMacroFloat * sizeof(float),
+                  "kTerrainMacroFloat does not land on ShadowMaskParams::terrainMacro");
     // msmrecv.h.fsl's PCSS works in TEXELS, so SUN_SHADOW_RES has to agree with the atlas the host
     // actually allocated. Same mirroring contract as SUN_CASCADES / kSunCascades.
     static_assert(kSunShadowRes == 2048, "SUN_SHADOW_RES in shadowparams.h.fsl must match kSunShadowRes");
@@ -7559,6 +7564,24 @@ namespace {
     // Ships at the identity on purpose: widening is a LOOK decision, and roads and cultivated
     // fields are precisely the content a wider ramp moves.
     float    g_heightBlendWidth    = 0.25f;
+    // ─── MACRO VARIATION — the TILING repeat, which is a third artifact and not the blend ──────
+    // `uv = lat * 0.25` tiles every land texture once per 512 world units, axis-aligned, in global
+    // phase, with no variation — a grid that survives however well the squares blend. Broken here
+    // with a mean-zero field of ABSOLUTE ELEVATION multiplying albedo: uncorrelated with the texture
+    // lattice, so light and dark follow the ground's own contours. Deliberately NOT a method that
+    // touches the texture (stochastic/hex tiling and bombing both resample it and soften detail) —
+    // the user's constraint, and the reason only the LEVEL moves here.
+    // ⚠ Constant on perfectly flat ground. Inherent to any function of elevation and slope; flats
+    // want a world-XY field, which is a different knob and does not exist yet.
+    // Ships OFF: no artifact was reported here and the amplitude is a taste decision. 0.08-0.12 is
+    // the range to try first.
+    float    g_terrainMacroAmp     = 0.0f;
+    // Two INCOMMENSURATE periods in world Z, so the field does not read as one sine (a contour map).
+    float    g_terrainMacroPerA    = 320.0f;
+    float    g_terrainMacroPerB    = 870.0f;
+    // ⚠ The slope term is NOT mean zero — raising it lightens the scene and moves APL, so it is
+    // knobbed apart from the band and ships at 0 ([[feedback_one_knob_two_jobs]]).
+    float    g_terrainMacroSlope   = 0.0f;
     // ─── PHASE 4a: near-camera terrain displacement (terrain.vert.fsl) ───────────────────────────
     // ⚠ THE RISKY PHASE, AND IT IS STAGED LAST DELIBERATELY. D1-D5 above deliver most of the look
     // at no geometric risk; this one has three problems the fragment work does not, and two of them
@@ -21953,6 +21976,10 @@ namespace {
             { "heightBlendStrength",  &g_heightBlendStrength  },
             { "heightBlendContrast",  &g_heightBlendContrast  },
             { "heightBlendWidth",     &g_heightBlendWidth     },
+            { "terrainMacroAmp",      &g_terrainMacroAmp      },
+            { "terrainMacroPerA",     &g_terrainMacroPerA     },
+            { "terrainMacroPerB",     &g_terrainMacroPerB     },
+            { "terrainMacroSlope",    &g_terrainMacroSlope    },
             // Phase 4a. The displacement's two open questions (does grass follow, does the fade
             // boundary ghost) are watched in PLAY, but its COST and its fade geometry are read off
             // an unattended run — and the radius is the dial to shrink first if either bites.
@@ -24019,6 +24046,15 @@ namespace {
           // it ships at the identity.
           t.sliderF("TEXTURE BLEND RAMP x 512u (0.25 = 1 lattice quad = the old look; 1 = whole square)",
                     &g_heightBlendWidth, 0.25f, 1.0f, 0.05f);
+          // A THIRD artifact, not the blend: the land texture tiles once per 512 units in global
+          // phase, and that repeat reads as a grid however well the squares blend. Mean-zero
+          // elevation bands multiplying albedo. Does nothing on perfectly flat ground, by design.
+          t.sliderF("MACRO VARIATION amp (breaks the 512u TILING repeat; 0 = off; try 0.08-0.12)",
+                    &g_terrainMacroAmp, 0.0f, 0.35f, 0.01f);
+          t.sliderF("  band period A, world Z units (short)", &g_terrainMacroPerA, 40.0f, 2000.0f, 10.0f);
+          t.sliderF("  band period B, world Z units (long)",  &g_terrainMacroPerB, 40.0f, 4000.0f, 10.0f);
+          t.sliderF("  slope amount (cliffs vs flats) — NOT mean-zero, this one moves APL",
+                    &g_terrainMacroSlope, 0.0f, 1.0f, 0.05f);
           // ─── Phase 4a. THE RISKY ONE, and it is here to be FALSIFIED rather than shipped ──────
           // Two things are expected to break and the point is to find where: GRASS does not follow
           // (roots are baked CPU-side from the raw heightfield, outside this shader), and the
@@ -32592,6 +32628,12 @@ void destroyHostWindow(Renderer* R);
             mp[kTerrainDisp3Float + 1] = (float)g_terrainGridMinY;
             mp[kTerrainDisp3Float + 2] = (float)g_terrainGridSpanX;
             mp[kTerrainDisp3Float + 3] = (float)g_terrainGridSpanY;
+            // Macro variation. Not gated on pbrTerrain or on any parallax arm: it multiplies the
+            // plain albedo and is meaningful with every one of them off.
+            mp[kTerrainMacroFloat + 0] = std::max(0.0f, g_terrainMacroAmp);
+            mp[kTerrainMacroFloat + 1] = std::max(1.0f, g_terrainMacroPerA);
+            mp[kTerrainMacroFloat + 2] = std::max(1.0f, g_terrainMacroPerB);
+            mp[kTerrainMacroFloat + 3] = std::max(0.0f, g_terrainMacroSlope);
             mp[280] = g_shadowBias;               // biasParams.x = absolute contact bias (live knob)
             mp[281] = g_shadowNormalOffset;       // biasParams.y = normal-offset bias in texels (live knob)
             // Flicker shadow "movement": the mask rotates the LOOKUP direction of flicker-class slots by a
