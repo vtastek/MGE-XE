@@ -7546,10 +7546,15 @@ namespace {
     // defined, so the albedo, the `_paramh` material, the cdblur gradient and the height AO all
     // track the same surface.
     bool     g_heightBlend         = false;
-    float    g_heightBlendStrength = 1.0f;     // DX9
+    // 1.0 = DX9. 0.559 is the tuned value under the SOFTMAX cut, by eye, 2026-09-21: the softmax
+    // sharpens more gently than the hard cut did, so it wants less of it, not more.
+    float    g_heightBlendStrength = 0.559f;   // was 1.0 (DX9)
     // The band, in height units, over which two layers still mix: small = a hard boundary that
     // follows the texture's own cracks, large = back toward plain bilinear.
-    float    g_heightBlendContrast = 0.06f;    // DX9
+    // 0.06 = DX9, tuned against the HARD cut. Under the softmax `contrast` is the height difference
+    // that halves a weight rather than a survival window, so the useful range sits higher — and the
+    // by-eye value landed at 0.109, very nearly the doubling that prediction implied.
+    float    g_heightBlendContrast = 0.109f;   // was 0.06 (DX9, hard cut)
     // ⚠ THE HARD CUT IS A STEP FUNCTION WHEREVER THE FOUR HEIGHTS AGREE — and texturematcher pairs
     // land textures into families at corr 0.88, so that is the COMMON case, not a corner one. With
     // equal heights nothing mixes until the bilinear weight reaches 0.47: a ~7-world-unit edge, dead
@@ -7585,8 +7590,10 @@ namespace {
     // the range to try first.
     float    g_terrainMacroAmp     = 0.0f;
     // Two INCOMMENSURATE periods in world Z, so the field does not read as one sine (a contour map).
-    float    g_terrainMacroPerA    = 320.0f;
-    float    g_terrainMacroPerB    = 870.0f;
+    // Tuned by eye 2026-09-21 — both roughly 3x the first guess. Longer bands read as weathering;
+    // the short ones read as contour lines, which is the failure this pair was chosen to avoid.
+    float    g_terrainMacroPerA    = 1223.35f;  // was 320
+    float    g_terrainMacroPerB    = 2067.9f;   // was 870
     // ⚠ The slope term is NOT mean zero — raising it lightens the scene and moves APL, so it is
     // knobbed apart from the band and ships at 0 ([[feedback_one_knob_two_jobs]]).
     float    g_terrainMacroSlope   = 0.0f;
@@ -7594,7 +7601,11 @@ namespace {
     // is CONSTANT on a plane, and a plane is exactly where the 512-unit repeat is easiest to see.
     // This one has no such blind spot: its coordinate IS the ground plane. No tap, ~20 ALU.
     float    g_terrainMacroNoiseAmp = 0.0f;
-    float    g_terrainMacroNoisePer = 2200.0f;   // world units; the 2nd octave runs at /3.7
+    // Tuned by eye 2026-09-21. ⚠ At 365.75 the SECOND octave runs at 99 world units, which the
+    // band-limit fades out at almost any distance — so this setting is close range only, and most
+    // of the frame is carried by the first octave alone. That is a deliberate look choice, not an
+    // oversight, but it is why raising the amp does less at distance than it does underfoot.
+    float    g_terrainMacroNoisePer = 365.75f;   // was 2200; 2nd octave runs at /3.7
     // ARM 3 — the dominant land texture's OWN coarse mip, retiled larger and ratioed against that
     // texture's 1x1 mip, so the factor is exactly mean 1 PER TEXTURE and the variation is the
     // texture's own tonal statistics. It is the only arm that cannot look foreign, and the only one
@@ -7609,12 +7620,12 @@ namespace {
     //     level 9 / tile 1   -1.49%      (  1 u) — this IS the texture again, not a macro field
     // against arm 1's -2.2% at the same amp. So the useful amp for this arm is ~0.2 to match arm 1
     // at 0.10, and the first defaults (4/4) were a knob whose whole slider did nothing.
-    float    g_terrainMacroTexTile  = 8.0f;      // in 512-unit squares: 8 = one macro tile / 4096 u
+    float    g_terrainMacroTexTile  = 4.487f;    // was 8; by eye 2026-09-21 (~2298 u per macro tile)
     // Mips BELOW the 1x1 top: 7 reads a 128x128 copy, so at tile 8 one macro texel spans 32 world
     // units. Raising it makes the field FINER and, because a finer mip is less averaged, stronger —
     // the two are not separable here, and that is inherent: the variation IS the texture's own
     // statistics at the scale you ask for.
-    float    g_terrainMacroTexLevel = 7.0f;
+    float    g_terrainMacroTexLevel = 6.186f;    // was 7; by eye 2026-09-21
     // ─── PHASE 4a: near-camera terrain displacement (terrain.vert.fsl) ───────────────────────────
     // ⚠ THE RISKY PHASE, AND IT IS STAGED LAST DELIBERATELY. D1-D5 above deliver most of the look
     // at no geometric risk; this one has three problems the fragment work does not, and two of them
@@ -24088,14 +24099,14 @@ namespace {
           // phase, and that repeat reads as a grid however well the squares blend. Mean-zero
           // elevation bands multiplying albedo. Does nothing on perfectly flat ground, by design.
           t.sliderF("MACRO VARIATION amp (breaks the 512u TILING repeat; 0 = off; try 0.08-0.12)",
-                    &g_terrainMacroAmp, 0.0f, 0.35f, 0.01f);
+                    &g_terrainMacroAmp, 0.0f, 1.0f, 0.01f);
           t.sliderF("  band period A, world Z units (short)", &g_terrainMacroPerA, 40.0f, 2000.0f, 10.0f);
           t.sliderF("  band period B, world Z units (long)",  &g_terrainMacroPerB, 40.0f, 4000.0f, 10.0f);
           t.sliderF("  slope amount (cliffs vs flats) — NOT mean-zero, this one moves APL",
                     &g_terrainMacroSlope, 0.0f, 1.0f, 0.05f);
           // Arm 2. The band arm is blind on a plane by construction; this one is not.
           t.sliderF("MACRO arm 2: world-XY noise amp (covers FLAT ground; free, no tap)",
-                    &g_terrainMacroNoiseAmp, 0.0f, 0.35f, 0.01f);
+                    &g_terrainMacroNoiseAmp, 0.0f, 1.0f, 0.01f);
           t.sliderF("  noise period, world units (2nd octave runs at /3.7)",
                     &g_terrainMacroNoisePer, 200.0f, 8000.0f, 100.0f);
           // Arm 3. The only one that costs taps, and the only one whose variation is the texture's
