@@ -1196,32 +1196,23 @@ STRUCT(ShadowMaskParams)
     float4 aoBounce;
 #line 792 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
     float4 pbrParams;
-#line 809 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
+#line 820 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
     float4 pbrTerrain;
-#line 821 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
+#line 832 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
     float4 pbrTerrainAO;
-#line 836 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
+#line 847 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
     float4 pbrStatics;
-#line 849 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
+#line 860 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
     float4 terrainTex;
-#line 873 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
+#line 884 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
     float4 parallax;
-#line 887 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
+#line 898 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
     float4 parallax2;
-
-
-
-
-
-
-
-
-
-
-    float4 parallax3;
 #line 915 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
+    float4 parallax3;
+#line 932 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
     float4 terrainDisp;
-#line 928 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
+#line 945 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
     float4 terrainDisp2;
 
 
@@ -1229,7 +1220,7 @@ STRUCT(ShadowMaskParams)
 
 
     float4 terrainDisp3;
-#line 935
+#line 952
 };
 #line 21 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
 #line 27 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
@@ -2090,13 +2081,27 @@ float parallaxSoftShadowLand(uint4 slots, float4 w, float invW, bool one, float2
     h = min(h, 1.0f - parallaxLandHeight4(slots, w, invW, one, uv + 0.55f * lDir, dx, dy));
     return min(1.0f, 1.0f - saturate((h0 - h) * soften));
 }
-#line 220 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/parallax.h.fsl"
-float4 parallaxHeightBlend4(float4 h, float4 w, float strength, float contrast)
+#line 246 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/parallax.h.fsl"
+float4 parallaxHeightBlend4(float4 h, float4 w, float strength, float contrast, bool soft)
 {
-    const float4 b = h + w;
-    const float ma = max(max(b.x, b.y), max(b.z, b.w)) - max(contrast, 1e-4f);
-    const float4 c = max(b - ma, float4(0.0f, 0.0f, 0.0f, 0.0f));
-    const float s = max(c.x + c.y + c.z + c.w, 1e-4f);
+    const float c0 = max(contrast, 1e-4f);
+    float4 c;
+    if (soft)
+    {
+        const float hm = max(max(h.x, h.y), max(h.z, h.w));
+
+
+        c = w * exp2(clamp((h - float4(hm, hm, hm, hm)) / c0, -12.0f, 0.0f));
+    }
+    else
+    {
+        const float4 b = h + w;
+        const float ma = max(max(b.x, b.y), max(b.z, b.w)) - c0;
+        c = max(b - ma, float4(0.0f, 0.0f, 0.0f, 0.0f));
+    }
+
+
+    const float s = max(c.x + c.y + c.z + c.w, 1e-6f);
     return lerp(w, c / s, saturate(strength));
 }
 

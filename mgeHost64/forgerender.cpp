@@ -7537,6 +7537,28 @@ namespace {
     // The band, in height units, over which two layers still mix: small = a hard boundary that
     // follows the texture's own cracks, large = back toward plain bilinear.
     float    g_heightBlendContrast = 0.06f;    // DX9
+    // ⚠ THE HARD CUT IS A STEP FUNCTION WHEREVER THE FOUR HEIGHTS AGREE — and texturematcher pairs
+    // land textures into families at corr 0.88, so that is the COMMON case, not a corner one. With
+    // equal heights nothing mixes until the bilinear weight reaches 0.47: a ~7-world-unit edge, dead
+    // straight along the texture-square grid, HARSHER than the bilinear blend it is refining.
+    // `soft` swaps the cut for a softmax, w_i * 2^((h_i - max h)/contrast), which IS the plain
+    // bilinear blend when the heights agree and is still height-driven when they do not.
+    // Defaults ON: the arm it replaces is the reported artifact, and it cannot move a boundary
+    // outside the ramp, so there is nothing for it to break. `heightBlendSoft=0` restores DX9's.
+    // ⚠ Under soft, `contrast` is the height difference that HALVES a weight rather than the width
+    // of a survival window — same units, useful range above the 0.06 tuned against the hard cut.
+    bool     g_heightBlendSoft     = true;
+    // ─── ...and the DOMAIN those weights ramp over, which is the OTHER half of the squareness ────
+    // MW gives one land texture per 512-unit square, but the blend between two of them used to run
+    // over ONE 128-unit lattice quad — the shader read its four squares off the bracketing LATTICE
+    // vertices, so the boundary could never leave a one-quad axis-aligned corridor whatever the
+    // height map said. That corridor, on a 512-unit grid, is the square you can see from anywhere.
+    // This is the ramp's width as a fraction of the square centre-to-centre pitch: 0.25 reproduces
+    // the old resolve EXACTLY (checked against it over 4097 samples per axis), 1.0 ramps across the
+    // whole square. Read by terrain.frag with every other arm off, so it is NOT gated on one.
+    // Ships at the identity on purpose: widening is a LOOK decision, and roads and cultivated
+    // fields are precisely the content a wider ramp moves.
+    float    g_heightBlendWidth    = 0.25f;
     // ─── PHASE 4a: near-camera terrain displacement (terrain.vert.fsl) ───────────────────────────
     // ⚠ THE RISKY PHASE, AND IT IS STAGED LAST DELIBERATELY. D1-D5 above deliver most of the look
     // at no geometric risk; this one has three problems the fragment work does not, and two of them
@@ -21930,6 +21952,7 @@ namespace {
             { "parallaxShadowScale",  &g_parallaxShadowScale  },
             { "heightBlendStrength",  &g_heightBlendStrength  },
             { "heightBlendContrast",  &g_heightBlendContrast  },
+            { "heightBlendWidth",     &g_heightBlendWidth     },
             // Phase 4a. The displacement's two open questions (does grass follow, does the fade
             // boundary ghost) are watched in PLAY, but its COST and its fade geometry are read off
             // an unattended run — and the radius is the dial to shrink first if either bites.
@@ -22052,6 +22075,7 @@ namespace {
             { "parallaxTerrain", &g_parallaxTerrain },
             { "parallaxShadows", &g_parallaxShadows },
             { "heightBlend",     &g_heightBlend     },
+            { "heightBlendSoft", &g_heightBlendSoft },
             { "terrainDisp",     &g_terrainDisp     },
             // ...and the view that judges the last one. Env-armed so a displacement run can be
             // LAUNCHED into the lattice view instead of arriving at a shaded frame and then hunting
@@ -23985,6 +24009,16 @@ namespace {
                     &g_heightBlendStrength, 0.0f, 1.0f, 0.05f);
           t.sliderF("  contrast (the mixing band; small = hard, crack-following; 0.06 = DX9)",
                     &g_heightBlendContrast, 0.005f, 0.5f, 0.005f);
+          // The fix for "same texture, different hue goes harsh": with equal heights the DX9 cut
+          // has no signal to sharpen and emits a hard line anyway. Off = DX9 term for term.
+          t.checkbox("  soft cut: equal heights fall back to plain bilinear (off = DX9's hard cut)",
+                     &g_heightBlendSoft);
+          // ⚠ NOT a child of the checkbox above — this is the base bilinear blend's own domain and
+          // it applies with every arm on this tab off. Widening is what lets a height blend put a
+          // boundary somewhere other than a straight line; it is also what moves a road's edge, so
+          // it ships at the identity.
+          t.sliderF("TEXTURE BLEND RAMP x 512u (0.25 = 1 lattice quad = the old look; 1 = whole square)",
+                    &g_heightBlendWidth, 0.25f, 1.0f, 0.05f);
           // ─── Phase 4a. THE RISKY ONE, and it is here to be FALSIFIED rather than shipped ──────
           // Two things are expected to break and the point is to find where: GRASS does not follow
           // (roots are baked CPU-side from the raw heightfield, outside this shader), and the
@@ -32481,7 +32515,10 @@ void destroyHostWindow(Renderer* R);
             // cannot use pbrEnable's trick. Published unconditionally, like every block above it.
             mp[kPbrTerrainFloat + 0] = g_pbrTerrain ? 1.0f : 0.0f;
             mp[kPbrTerrainFloat + 1] = std::max(0.0f, g_pbrTerrainDepth);
-            mp[kPbrTerrainFloat + 2] = 0.0f;
+            // The texture-square blend ramp width. Written UNCONDITIONALLY — unlike the lanes
+            // above it, this one is not a PBR arm: it is the base bilinear blend every terrain
+            // pixel pays with pbrTerrain, the height blend and parallax all off.
+            mp[kPbrTerrainFloat + 2] = std::clamp(g_heightBlendWidth, 0.25f, 1.0f);
             mp[kPbrTerrainFloat + 3] = 0.0f;
             mp[kPbrTerrainAOFloat + 0] = g_pbrTerrainHeightAO ? 1.0f : 0.0f;
             mp[kPbrTerrainAOFloat + 1] = std::clamp(g_pbrTerrainHeightAOStr, 0.0f, 1.0f);
@@ -32523,7 +32560,10 @@ void destroyHostWindow(Renderer* R);
             mp[kParallax2Float + 1] = g_parallaxShadows ? 1.0f : 0.0f;
             mp[kParallax2Float + 2] = std::max(0.0f, g_parallaxShadowSoften);
             mp[kParallax2Float + 3] = std::max(0.0f, g_parallaxShadowScale);
-            mp[kParallax3Float + 0] = (g_heightBlend && g_pbrTerrain) ? 1.0f : 0.0f;
+            // An ENUM, not a bool: 0 = off, 1 = DX9's hard max() cut, 2 = the softmax. Every
+            // shader-side `!= 0` still reads as "armed"; only the cut differs.
+            mp[kParallax3Float + 0] = (g_heightBlend && g_pbrTerrain)
+                                    ? (g_heightBlendSoft ? 2.0f : 1.0f) : 0.0f;
             mp[kParallax3Float + 1] = std::clamp(g_heightBlendStrength, 0.0f, 1.0f);
             mp[kParallax3Float + 2] = std::max(1e-4f, g_heightBlendContrast);
             mp[kParallax3Float + 3] = 0.0f;

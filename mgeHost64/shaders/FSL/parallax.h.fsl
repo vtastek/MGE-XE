@@ -217,12 +217,52 @@ float parallaxSoftShadowLand(uint4 slots, float4 w, float invW, bool one, float2
 // winner, so only rivals within `contrast` of it survive the max(). Small = a hard, crack-following
 // boundary; large = back toward the plain bilinear blend. 0 would make the boundary a step with no
 // filtering at all, so it is floored.
-float4 parallaxHeightBlend4(float4 h, float4 w, float strength, float contrast)
+//
+// ⚠ AND THAT HARD CUT IS A STEP FUNCTION WHENEVER THE HEIGHTS AGREE — which is most of Morrowind.
+// Put two layers at weights (1-t, t) with the SAME height h: b = (h+1-t, h+t), so the cut leaves
+// c = (contrast, max(2t-1+contrast, 0)) and NOTHING mixes until t = 0.47. The whole transition
+// happens in t ∈ [0.47, 0.53] — 6% of a ramp that is itself only one 128-unit lattice quad wide,
+// i.e. a SEVEN-WORLD-UNIT edge, dead straight along the texture-square grid. A height blend is a
+// SHARPENER, and with no height signal to sharpen this one emits an arbitrary hard line instead of
+// degrading to the bilinear blend it exists to refine. That is what "same texture, different hue
+// goes harsh and square" is — and texturematcher deliberately pairs land textures into families at
+// corr 0.88 ([[project_mw_land_texture_families]]), so the signal-free case is the COMMON one.
+//
+// `soft` replaces the hard max() with a SOFTMAX over the same quantity:
+//
+//     c_i = w_i * 2^((h_i - max(h)) / contrast)
+//
+// All heights equal => every factor is 1 => c = w => the plain bilinear blend, EXACTLY, with no
+// threshold to tune and no detection to get wrong. A layer one `contrast` below the winner keeps
+// half its weight, two below a quarter: the boundary is still driven by the height field, it just
+// stops being clipped. This form MULTIPLIES the weight where the additive form adds to the height,
+// and that is what carries the endpoint property over: w_i = 0 contributes nothing whatever its
+// height, and a layer at w_i = 1 with every rival at 0 still wins outright, so there is no leakage
+// from a tall rival that the additive form was chosen to prevent.
+//
+// `contrast` keeps its units (height) but changes its SCALE: here it is the difference that HALVES
+// a weight, not the width of a survival window, so the useful range sits above the hard form's
+// tuned 0.06. Expect to retune upward when flipping the arm.
+float4 parallaxHeightBlend4(float4 h, float4 w, float strength, float contrast, bool soft)
 {
-    const float4 b  = h + w;
-    const float  ma = max(max(b.x, b.y), max(b.z, b.w)) - max(contrast, 1e-4f);
-    const float4 c  = max(b - ma, float4(0.0f, 0.0f, 0.0f, 0.0f));
-    const float  s  = max(c.x + c.y + c.z + c.w, 1e-4f);
+    const float c0 = max(contrast, 1e-4f);
+    float4 c;
+    if (soft)
+    {
+        const float hm = max(max(h.x, h.y), max(h.z, h.w));
+        // The exponent is floored so a small `contrast` against a tall height range cannot underflow
+        // the whole vector: sum(w) == 1 by bilinear construction, so this holds sum(c) >= 2^-12.
+        c = w * exp2(clamp((h - float4(hm, hm, hm, hm)) / c0, -12.0f, 0.0f));
+    }
+    else
+    {
+        const float4 b  = h + w;
+        const float  ma = max(max(b.x, b.y), max(b.z, b.w)) - c0;
+        c = max(b - ma, float4(0.0f, 0.0f, 0.0f, 0.0f));
+    }
+    // The hard branch's winner contributes exactly c0 >= 1e-4, so this floor is unreachable there
+    // and the arm stays bit-identical to the DX9 form it ports.
+    const float s = max(c.x + c.y + c.z + c.w, 1e-6f);
     return lerp(w, c / s, saturate(strength));
 }
 

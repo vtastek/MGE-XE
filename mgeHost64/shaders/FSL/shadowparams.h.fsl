@@ -805,7 +805,18 @@ STRUCT(ShadowMaskParams)
     //       The real reason is measured — the ground's slices are capped at 1024 from 4096-texel
     //       sources, so it shades from a third of a mesh's gradient at the same number. See
     //       g_pbrTerrainDepth in forgerender.cpp for the table.
-    //   zw = spare.
+    //   z = TEXTURE-SQUARE BLEND RAMP WIDTH, as a fraction of the 512-unit centre-to-centre pitch
+    //       of MW's land-texture squares, centred on the boundary between two of them.
+    //       ⚠ NOT GATED BY x. This is the base bilinear blend every terrain pixel pays, height
+    //       blend and PBR both off, so it is written unconditionally and the shader floors it rather
+    //       than testing an arm. It lives in this lane because it is a TERRAIN quantity and because
+    //       parallax3's own contract is that x = 0 leaves the bilinear weights untouched — which
+    //       this changes.
+    //       0.25 = 128 units = one lattice quad = the pre-2026-09-21 behaviour, EXACTLY (verified
+    //       against the retired squareX/squareY over 4097 samples per axis). 1.0 = 512 units = the
+    //       full blend between square centres, which is the room a height blend needs to put a
+    //       boundary somewhere other than a straight line. See terrain.frag.fsl.
+    //   w = spare.
     DATA(float4,   pbrTerrain,       None);
     // TERRAIN HEIGHT AO (pbrmaterial.h.fsl::pbrHeightAO). Read only by terrain.frag. Appended, for
     // the reason every block above states: this cbuffer is bound BY POINTER into every PerFrame
@@ -887,13 +898,19 @@ STRUCT(ShadowMaskParams)
     DATA(float4,   parallax2,        None);
     // parallax3 — the ADDITIVE HEIGHT BLEND, generalised from 2 layers to 4 (TERRAIN ONLY; the mesh
     // path has no multi-layer blend to weight).
-    //   x = ARM (0 = off, and off leaves the bilinear weights exactly as they were).
+    //   x = ARM, and an ENUM rather than a bool: 0 = off (and off leaves the bilinear weights
+    //       exactly as they were), 1 = the DX9 hard max() cut, 2 = the SOFTMAX. The softmax exists
+    //       because the hard cut is a step function wherever the four heights agree — see
+    //       parallax.h.fsl for the arithmetic — and it degrades to the plain bilinear blend there
+    //       instead. Every `!= 0` test still reads as "armed".
     //   y = STRENGTH 0..1, lerping the plain bilinear weights toward the height-driven mask. 1.0 =
     //       DX9's default, i.e. the mask outright.
     //   z = CONTRAST: the band, in height units, over which two layers still mix. It is subtracted
     //       from the winning layer, so only rivals within it survive. Small = a hard boundary that
     //       follows the texture's own cracks; large = back toward bilinear. 0.06 = DX9, and it
     //       transfers because the 4-layer form is algebraically their 2-layer one at N = 2.
+    //       Under x = 2 it keeps its units but changes SCALE — there it is the height difference
+    //       that halves a weight, not the width of a survival window, so it wants retuning upward.
     //   w = spare.
     DATA(float4,   parallax3,        None);
     // ─── PHASE 4a: NEAR-CAMERA TERRAIN DISPLACEMENT (terrain.vert.fsl) ──────────────────────────

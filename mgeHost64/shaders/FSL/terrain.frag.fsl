@@ -96,10 +96,12 @@ uint landTexSlot(uint idx)   { return (idx == TERRAIN_NO_SQUARE) ? 0u : gTerrain
 // same wrap, different buffer — so a param tap costs one more load and adds no divergence.
 uint landParamSlot(uint idx) { return (idx == TERRAIN_NO_SQUARE) ? 0u : gTerrainParamTex[idx]; }
 
-// Morrowind's per-vertex square assignment. Kept in float so the negative cases round the way the
-// engine's floor/ceil do (integer division truncates toward zero and would disagree at x < 2).
-int squareX(int x) { return (int)floor((float(x) - 2.0f) * 0.25f); }
-int squareY(int y) { return (int)ceil ((float(y) - 2.0f) * 0.25f); }
+// Morrowind's per-vertex square assignment used to live here as
+//     squareX(x) = floor((x-2)/4)      squareY(y) = ceil((y-2)/4)
+// evaluated at the two bracketing LATTICE vertices. It is gone because the blend domain moved off
+// the lattice quad and onto the square centres (see PS_MAIN) — but those two lines are what the
+// centre offsets (3.5, 0.5) are derived FROM, and they are the oracle the rampW = 0.25 identity
+// was checked against, so they are recorded rather than deleted.
 
 // One land texture, sampled through the bucketed arrays. uv tiles once per texture square, matching
 // the generator's `cv.u = x / 4` over a 0..64 lattice. Slot 0 (and any unresolved texture) is the
@@ -274,13 +276,52 @@ float4 PS_MAIN( VSOutput In )
     int    x0  = (int)floor(lat.x), y0 = (int)floor(lat.y);
     int    x1  = min(x0 + 1, TERRAIN_QUADS), y1 = min(y0 + 1, TERRAIN_QUADS);
     float  fx  = lat.x - float(x0), fy = lat.y - float(y0);
+    // ⚠ THOSE SIX ARE THE 128-UNIT LATTICE QUAD, AND BELOW THIS POINT ONLY VCLR STILL READS THEM.
+    // Morrowind's hand-painted vertex tint lives on the 65x65 lattice and must keep interpolating
+    // over one quad. The TEXTURE blend does not, and used to only because it read its four squares
+    // off these same four lattice corners — one pair of names doing two jobs, which is what tied the
+    // texture blend to a domain that was never its own ([[feedback_one_knob_two_jobs]]).
+
+    // ─── THE TEXTURE-SQUARE BLEND DOMAIN ─────────────────────────────────────────────────────────
+    // MW assigns ONE land texture per 512-unit square, 16x16 per cell, so the blend between two of
+    // them is a ramp between their CENTRES. Square tx owns lattice x in [4tx+2, 4tx+5], centre
+    // 4tx+3.5; square ty owns y in [4ty-1, 4ty+2], centre 4ty+0.5. The offsets differ because the
+    // engine's y assignment rounds the other way — the floor/ceil pair recorded above. So centre
+    // space is `(lat - (3.5, 0.5)) / 4`, and a square boundary sits at its half-integer.
+    //
+    // Resolving the pair THERE rather than at the lattice quad is what makes the ramp's width a
+    // knob. `rampW` is that width as a fraction of the 512-unit centre-to-centre pitch, centred on
+    // the boundary:
+    //   0.25 = 128 units = EXACTLY the old behaviour. Verified against squareX/squareY over 4097
+    //          samples per axis at 2-unit resolution — every boundary, both cell edges, zero
+    //          mismatches — so this ships as an identity and the knob opens the range.
+    //   1.00 = 512 units = the full bilinear blend between square centres.
+    //
+    // Wider is NOT blurrier once the height blend is armed: it is the room the height field needs to
+    // put the boundary somewhere other than a straight line. That is the point. With a 128-unit ramp
+    // the boundary CANNOT leave a one-quad corridor whatever the height map says, and that corridor,
+    // on a 512-unit axis-aligned grid, is the square you can see from anywhere on the map.
+    const float2 sqc   = (lat - float2(3.5f, 0.5f)) * 0.25f;
+    const float2 sqf   = floor(sqc);
+    const int2   sq0   = int2((int)sqf.x, (int)sqf.y);
+    const float  rampW = max(gShadowParams.pbrTerrain.z, 1e-3f);
+    const float2 sf    = saturate((sqc - sqf - 0.5f) / rampW + 0.5f);
+
+    // A corner the ramp has driven to zero weight contributes nothing, so its index collapses onto
+    // its partner's. Not a micro-optimisation: `oneSquare` below is an id COMPARE, and the centre
+    // pair ALWAYS straddles two squares — without this collapse the fast path would be lost across
+    // the 40.2% of the world a single square covers. Exact, because the corner replaced carries
+    // weight 0; at rampW = 0.25 it is also what reproduces the old resolve's `squareX(x0) ==
+    // squareX(x1)` inside a square.
+    const int2 sqA = int2((sf.x >= 1.0f) ? sq0.x + 1 : sq0.x, (sf.y >= 1.0f) ? sq0.y + 1 : sq0.y);
+    const int2 sqB = int2((sf.x <= 0.0f) ? sq0.x : sq0.x + 1, (sf.y <= 0.0f) ? sq0.y : sq0.y + 1);
 
     // The four squares' VTEX indices, resolved ONCE — the albedo and _paramh packs both
     // read at these same four places (see landSquareIndex).
-    uint i00 = landSquareIndex(lx, ly, spanX, spanY, squareX(x0), squareY(y0));
-    uint i10 = landSquareIndex(lx, ly, spanX, spanY, squareX(x1), squareY(y0));
-    uint i01 = landSquareIndex(lx, ly, spanX, spanY, squareX(x0), squareY(y1));
-    uint i11 = landSquareIndex(lx, ly, spanX, spanY, squareX(x1), squareY(y1));
+    uint i00 = landSquareIndex(lx, ly, spanX, spanY, sqA.x, sqA.y);
+    uint i10 = landSquareIndex(lx, ly, spanX, spanY, sqB.x, sqA.y);
+    uint i01 = landSquareIndex(lx, ly, spanX, spanY, sqA.x, sqB.y);
+    uint i11 = landSquareIndex(lx, ly, spanX, spanY, sqB.x, sqB.y);
 
     uint id00 = landTexSlot(i00);
     uint id10 = landTexSlot(i10);
@@ -338,13 +379,13 @@ float4 PS_MAIN( VSOutput In )
     // Each band is a doubling of the filter's world footprint, comparable across the whole ground.
     const float lodWorld = log2(max(max(length(duvdx), length(duvdy)) * 512.0f, 1e-6f));
 
-    // MW's per-vertex 0/1 weights, interpolated. Hoisted to top level because the PBR blend below
+    // MW's per-square 0/1 weights, interpolated across the ramp above. Hoisted to top level because
     // needs the SAME four numbers the albedo blend does — a second copy of them is a second place
     // for the two to disagree about which corner is which.
-    float w00 = (1.0f - fx) * (1.0f - fy);
-    float w10 = fx * (1.0f - fy);
-    float w01 = (1.0f - fx) * fy;
-    float w11 = fx * fy;
+    float w00 = (1.0f - sf.x) * (1.0f - sf.y);
+    float w10 = sf.x * (1.0f - sf.y);
+    float w01 = (1.0f - sf.x) * sf.y;
+    float w11 = sf.x * sf.y;
 
     // How many DISTINCT land textures meet here (1..4) — F12 mode 20 paints it, and the count is
     // also the tap multiplier the PBR terrain blend below pays: it reads both packs over the same
@@ -413,7 +454,7 @@ float4 PS_MAIN( VSOutput In )
                 // XE FixedFuncEmu_PS.hlsl:284).
                 //
                 // The weight compare starts BELOW zero so a covered corner is always picked even
-                // where its bilinear weight is exactly 0 (fx or fy at a lattice line).
+                // where its bilinear weight is exactly 0 (sf.x or sf.y pinned at a square's interior).
                 uint  pslot = 0u;
                 float pwin  = -1.0f;
                 if (ps00 != 0u && w00 > pwin) { pslot = ps00; pwin = w00; }
@@ -454,9 +495,13 @@ float4 PS_MAIN( VSOutput In )
         if ((gShadowParams.parallax3.x != 0.0f) && !oneSquare)
         {
             const float4 hl = parallaxLandHeights(uint4(ps00, ps10, ps01, ps11), uvS, duvdx, duvdy);
+            // parallax3.x is an ENUM, not a bool: 1 = the DX9 hard max() cut, 2 = the softmax that
+            // degrades to the plain bilinear blend where the heights agree. Both are the same
+            // quantity; only the cut differs (parallax.h.fsl).
             const float4 wN = parallaxHeightBlend4(hl, float4(w00, w10, w01, w11),
                                                    gShadowParams.parallax3.y,
-                                                   gShadowParams.parallax3.z);
+                                                   gShadowParams.parallax3.z,
+                                                   gShadowParams.parallax3.x >= 1.5f);
             w00 = wN.x; w10 = wN.y; w01 = wN.z; w11 = wN.w;
         }
         if (paraShOn)
@@ -511,7 +556,8 @@ float4 PS_MAIN( VSOutput In )
     // the mesh, so it is decoupled from the mesh — the same reasoning that put heights in the VS
     // instead of baking them into geometry ([[feedback_vtf_over_cpu_baking]]).
     //
-    // Reuses the x0/x1/y0/y1/fx/fy the texture blend above already derived, so the whole fix costs
+    // Uses the LATTICE quad (x0/x1/y0/y1/fx/fy) and not the texture blend's square ramp — the paint
+    // is one value per lattice vertex, so its domain is the quad. The whole fix costs
     // four buffer loads and three lerps. Edge behaviour is a clamp, which is faithful: each MW cell
     // interpolates its OWN vertex colours and neighbours agree at the shared boundary column.
     {
