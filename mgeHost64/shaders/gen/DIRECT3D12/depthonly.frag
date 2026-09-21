@@ -1233,7 +1233,19 @@ STRUCT(ShadowMaskParams)
 
 
     float4 terrainMacro3;
-#line 996
+#line 1015 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
+    float4 pbrShade;
+
+
+
+
+
+
+
+
+
+    float4 pbrShade2;
+#line 1026
 };
 #line 21 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
 #line 27 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"

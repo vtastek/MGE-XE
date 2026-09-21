@@ -993,4 +993,34 @@ STRUCT(ShadowMaskParams)
     //       ([[feedback_nyquist_of_the_output_not_the_input]]).
     //   yzw = spare.
     DATA(float4,   terrainMacro3,    None);
+    // pbrShade — the diffuse LOBE and the specular's energy: the two halves of one question, which
+    // is what a ROUGH surface does with the light it is given. See pbrmaterial.h.fsl's EON block.
+    //   x = EON SIGMA SCALE. sigma = saturate(x * roughness). 0 turns the whole EON arm off AT THE
+    //       IDENTITY by construction — eonAB(0) is (1, 0), so the single-scatter multiplier is
+    //       exactly 1.0 and the multiple-scatter lobe is exactly 0. There is a branch anyway, so the
+    //       off path is textually untouched and not a bet on the compiler.
+    //       WHY A SCALE AND NOT A SIGMA: roughness is authored per texel in `_paramh`.G and is the
+    //       only per-material roughness this renderer has; Oren-Nayar's sigma is a different
+    //       quantity (an RMS slope) with no map of its own, so the honest knob is the RATIO between
+    //       them. 1.0 = "as rough diffusely as it is specularly".
+    //       On terrain it is additionally scaled by pbrCover, or the arm steps across every coverage
+    //       seam — the lesson the texture-macro arm learned about dominance seams.
+    //   y = EON MULTIPLE-SCATTER strength (0 = single-scatter only, 1 = energy-preserving). The
+    //       Kulla-Conty lobe carried at albedo^2, which is what makes a rough coloured surface
+    //       darker AND more saturated instead of just flatter.
+    //   z = SPECULAR AA strength: normal-variance widening of the GGX lobe, 0 = off.
+    //   w = SPECULAR MULTI-SCATTER strength (Turquin/Frostbite), 0 = off, 1 = full compensation.
+    //       ⚠ Its size is PROPORTIONAL TO F0, so on a dielectric at the shipped 0.04*b^2 decode it
+    //       is worth about +1% and on a metal up to +120%. It is correctness, not the look fix.
+    DATA(float4,   pbrShade,         None);
+    // pbrShade2:
+    //   x = the DIELECTRIC F0 BASE, the constant pbrF0 multiplies by b^2. 0.04 is the decode this
+    //       project shipped (and gives F0 = 0.01 at the export's default b = 0.5, which is four
+    //       times darker than a standard dielectric); 0.16 is the value that makes b = 0.5 land on
+    //       Disney's 0.04 exactly; above that is a deliberately hot dielectric.
+    //   y = SPECULAR AA variance clamp, the most the lobe may be widened in alpha^2 units. Without
+    //       it a silhouette texel, where the interpolated normal swings through 90 degrees in one
+    //       pixel, would be told it is a mirror-flat surface made of noise.
+    //   zw = spare.
+    DATA(float4,   pbrShade2,        None);
 };

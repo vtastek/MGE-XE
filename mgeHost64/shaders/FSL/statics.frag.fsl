@@ -235,6 +235,12 @@ PSOut PS_MAIN( VSOutput In )
     float3 pbrSpecA = float3(0.0f, 0.0f, 0.0f);      // direct specular, split by F0: spec = F0*A + B
     float3 pbrSpecB = float3(0.0f, 0.0f, 0.0f);
     float  pbrRough = 1.0f, pbrAlpha2 = 1.0f, pbrNoV = 1.0f;
+    // ─── EON rough diffuse (pbrmaterial.h.fsl) ───────────────────────────────────────────────────
+    // These initialisers ARE the arm off: sigma 0 => eonAB is (1, 0) => eonSingle is exactly 1.0 and
+    // the multiple-scatter lobe is exactly 0.
+    float  pbrSigma  = 0.0f;
+    float2 pbrEonAB  = float2(1.0f, 0.0f);
+    float3 pbrDiffMs = float3(0.0f, 0.0f, 0.0f);   // sum of lcol*N.L*(c1 - G(N.L)) — ALBEDO-FREE
     float3 pbrV     = float3(0.0f, 0.0f, 1.0f);
     // pbrStatics.x is a cbuffer scalar and TexIndex is FLAT, so both tests are uniform per draw.
     bool   pbrLive  = false;
@@ -258,6 +264,20 @@ PSOut PS_MAIN( VSOutput In )
             pbrAlpha2 = r2 * r2;                     // GGX alpha^2 = roughness^4 (pbr.hlsl)
             pbrV      = normalize(gFrameData.eyePos.xyz - In.WorldPos);
             pbrNoV    = saturate(dot(nShade, pbrV)) + 1e-5f;   // +eps: a normal can face away
+            // sigma as a RATIO of the authored roughness — see g_eonSigma.
+            pbrSigma  = saturate(gShadowParams.pbrShade.x * pbrRough);
+            pbrEonAB  = eonAB(pbrSigma);
+            // Geometric specular AA. `pbrLive` here is per-DRAW uniform (this file says so where it
+            // is set: TexIndex is FLAT and one EI subset is exactly one texture), so the derivative
+            // is in uniform flow and may sit inside the branch — unlike terrain.frag, whose PBR
+            // test is per-pixel. AFTER pbrSigma: this widens the specular lobe to a footprint, not
+            // the material.
+            if (gShadowParams.pbrShade.z > 0.0f)
+            {
+                pbrAlpha2 = pbrSpecAAAlpha2(pbrAlpha2, ddx(nShade), ddy(nShade),
+                                            gShadowParams.pbrShade.z, gShadowParams.pbrShade2.y);
+                pbrRough  = sqrt(sqrt(pbrAlpha2));   // pbrEnvBRDF reads roughness, not alpha^2
+            }
             pbrKd     = float3(1.0f, 1.0f, 1.0f) - pbrMetalness(pbrMat);
             // The relief-lit sun, and its specular lobe. `ndlRaw` is deliberately UNSATURATED in the
             // geom_vis factor: pbr.hlsl's test is that a sun BEHIND the real surface must not light a
@@ -272,6 +292,17 @@ PSOut PS_MAIN( VSOutput In )
             // rather than of its symptom, and so the baseline image is still reachable.
             sunTerm = sunPerPixel ? (In.SunLight * ndlS)
                                   : (In.SunLight * (ndlS / max(ndlG, 1e-3f)));
+            // EON, sun — after the per-pixel/per-vertex choice, so the lobe is the same whichever
+            // arm is up and that A/B stays a test of WHERE N.L is evaluated, not of two shading
+            // models. The N.L is the raw one; ndlS already carries geom_vis.
+            // ⚠ The multiple-scatter weight is the light RECEIVED, so it takes sunVis and is taken
+            // BEFORE the single-scatter multiply.
+            if (pbrSigma > 0.0f)
+            {
+                const float nlb = saturate(dot(nShade, -gFrameData.sunDir.xyz));
+                pbrDiffMs += (sunTerm * sunVis) * eonMsWeight(nlb);
+                sunTerm *= eonSingle(pbrEonAB, nlb, pbrNoV, dot(-gFrameData.sunDir.xyz, pbrV));
+            }
             // Sun specular. sunCol directly, NOT through SunLight: a dielectric's highlight is not
             // tinted by the diffuse colour the vertex baked into that lane (the same reason
             // statics.vert keeps emissive outside its own multiply).
@@ -351,7 +382,17 @@ PSOut PS_MAIN( VSOutput In )
                 // it. Off the geometric normal, which is what makes it a visibility and not a second
                 // N.L. Same factor and same form as opaque.frag and terrain.frag.
                 if (pbrLive) { lambert *= saturate(8.0f * dot(nGeom, toL) * invD + 1.0f); }
-                pointDiffuse += lambert * att * lcol;
+                // `lambert * att * lcol` parses as `((lambert*att)*lcol)`, so naming it changes no
+                // arithmetic — it only gives EON something to multiply.
+                float3 lightAdd = lambert * att * lcol;
+                if (pbrSigma > 0.0f)
+                {
+                    const float3 Ld  = toL * invD;
+                    const float  nlb = saturate(dot(N, Ld));
+                    pbrDiffMs += lightAdd * eonMsWeight(nlb);
+                    lightAdd  *= eonSingle(pbrEonAB, nlb, pbrNoV, dot(Ld, pbrV));
+                }
+                pointDiffuse += lightAdd;
                 // Point-light specular, every light — this loop is already walking them, and a lamp
                 // on a distant building is exactly the case where a roof that specular-highlights up
                 // close and does not at range reads as two different materials.
@@ -368,6 +409,18 @@ PSOut PS_MAIN( VSOutput In )
         litTerm += pointDiffuse;
     }
 
+    // EON's MULTIPLE-SCATTER lobe. Outside the point-light block, because the SUN contributes to it
+    // and a distant static with no lamp near it still has one; before the pbrKd metallic kill, so it
+    // is scaled with every other diffuse term.
+    // ⚠ No albedo-free form exists — rho_ms goes as albedo^2 — so `litTerm` (the factor tex.rgb
+    // multiplies) deliberately does not carry it.
+    if (pbrSigma > 0.0f && gShadowParams.pbrShade.y > 0.0f)
+    {
+        const float eAvg = eonEavg(pbrEonAB, pbrSigma);
+        result += pbrDiffMs * eonMsAlbedo(tex.rgb, eAvg)
+                            * (eonMsScale(pbrEonAB, pbrSigma, pbrNoV) * gShadowParams.pbrShade.y);
+    }
+
     if (pbrLive)
     {
         // `result` is now the WHOLE diffuse+ambient response (the vertex-baked ambient+emissive, the
@@ -380,13 +433,20 @@ PSOut PS_MAIN( VSOutput In )
         // metallic `_paramh`, which the lit-window and ghostfence sets do not.
         result  *= pbrKd;
         litTerm *= pbrKd;
-        const float3 f0 = pbrF0(pbrMat, tex.rgb);
+        const float3 f0 = pbrF0(pbrMat, tex.rgb, gShadowParams.pbrShade2.x);
         // The environment is the SAME sky the vertex ambient integrates (lodSunAmb through
         // skyAmbFactor — statics.vert's own ambient source), evaluated in the mirror direction, so
         // what lights a distant static and what it reflects cannot drift apart.
         const float3 R = reflect(-pbrV, nShade);
         const float3 env = gFrameData.lodSunAmb.rgb * skyAmbFactor(R, In.WorldPos);
         result += (f0 * pbrSpecA + pbrSpecB) + env * pbrEnvBRDF(f0, pbrNoV, pbrRough);
+        // MULTIPLE-SCATTERING SPECULAR, as the DIFFERENCE from the line above (W32 gobo rule).
+        if (gShadowParams.pbrShade.w > 0.0f)
+        {
+            const float3 comp = pbrSpecMulti(f0, pbrEnvAB(pbrNoV, pbrRough), gShadowParams.pbrShade.w)
+                              - float3(1.0f, 1.0f, 1.0f);
+            result += ((f0 * pbrSpecA + pbrSpecB) + env * pbrEnvBRDF(f0, pbrNoV, pbrRough)) * comp;
+        }
     }
 
     // Match near + distant land: tonemap the final lit colour BEFORE fog so the point-light core

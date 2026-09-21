@@ -76,6 +76,18 @@ float4 PS_MAIN( VSOutput In )
     float3 pbrSpecB  = float3(0.0f, 0.0f, 0.0f);
     float3 pbrTSun   = float3(1.0f, 1.0f, 1.0f);
     float3 pbrTAmb   = float3(1.0f, 1.0f, 1.0f);
+    // ─── EON rough diffuse (pbrmaterial.h.fsl) ───────────────────────────────────────────────────
+    // THESE INITIALISERS ARE THE ARM OFF. sigma 0 => eonAB returns (1, 0) => eonSingle is exactly
+    // 1.0 and the multiple-scatter lobe is exactly 0, so "off is bit-identical" is a property of
+    // the maths rather than of a branch — and there are branches anyway, so the off path is also
+    // textually untouched.
+    float  pbrSigma  = 0.0f;
+    float2 pbrEonAB  = float2(1.0f, 0.0f);
+    // The per-light half of the separable multiple-scatter lobe: sum of lightCol * N.L * (c1 - G).
+    // ALBEDO-FREE, which is the whole reason it can live in the light loop at all — rho_ms needs the
+    // albedo and the albedo is not sampled until far below. Exactly the problem pbrSpecA/pbrSpecB
+    // already solve for the specular, solved the same way.
+    float3 pbrDiffMs = float3(0.0f, 0.0f, 0.0f);
     // ─── PARALLAX (tasks/forge-parallax.md, D1/D5; parallax.h.fsl) ───────────────────────────────
     // `pbrUv` is the SHADING uv: the base uv displaced along the tangent-space view vector so the
     // height field reads as depth rather than as shading. Everything that describes the SURFACE —
@@ -142,10 +154,30 @@ float4 PS_MAIN( VSOutput In )
         pbrAlpha2 = r2 * r2;                         // GGX alpha^2 = roughness^4 (pbr.hlsl)
         pbrV      = normalize(gFrameData.eyePos.xyz - In.WorldPos);
         pbrNoV    = saturate(dot(N, pbrV)) + 1e-5f;  // +eps: an interpolated normal can face away
+        // sigma as a RATIO of the authored roughness — `_paramh`.G is the only roughness map there
+        // is, and Oren-Nayar's sigma has none of its own (see g_eonSigma).
+        pbrSigma  = saturate(gShadowParams.pbrShade.x * pbrRough);
+        pbrEonAB  = eonAB(pbrSigma);
     }
     // The height-derived normal BEFORE the AO bend below. Specular uses this one: the bend is an
     // occlusion direction, not a surface, and a lobe centred on it would slide off the highlight.
     const float3 pbrNb = N;
+    // ─── GEOMETRIC SPECULAR AA (pbrmaterial.h.fsl) ───────────────────────────────────────────────
+    // ⚠ THE DERIVATIVES ARE TAKEN HERE, IN UNIFORM FLOW, and the filter is applied after them. See
+    // the header for why the ddx cannot move inside the PBR branch.
+    // ⚠ AFTER pbrSigma, deliberately: this widens the SPECULAR lobe to match a footprint, and EON's
+    // sigma is a property of the material, not of how far away it is. Widening both would make a
+    // distant hillside diffusely rougher as well, which is not a thing that happens.
+    if (gShadowParams.pbrShade.z > 0.0f)
+    {
+        const float3 dNx = ddx(pbrNb), dNy = ddy(pbrNb);
+        if (pbrOn)
+        {
+            pbrAlpha2 = pbrSpecAAAlpha2(pbrAlpha2, dNx, dNy,
+                                        gShadowParams.pbrShade.z, gShadowParams.pbrShade2.y);
+            pbrRough  = sqrt(sqrt(pbrAlpha2));   // pbrEnvBRDF reads roughness, not alpha^2
+        }
+    }
 
     // Sample the AO buffer once (rgb = the world-space bend term, a = visibility — aocommon.h.fsl
     // has the contract), shared by the ambient term, the bend below, and the F12 views. gAO is the BILATERAL-BLURRED AO
@@ -278,6 +310,19 @@ float4 PS_MAIN( VSOutput In )
     // underwater is not dimmed by the column above it — its path is light->fragment, not
     // surface->fragment.
     { float3 tSun, tAmb; waterLightTransmit(In.WorldPos, tSun, tAmb); d *= tSun; a *= tAmb; pbrTSun = tSun; pbrTAmb = tAmb; }
+    // EON, sun. HERE and not at `d`'s initialiser: `d` is the sun's incident weight only until the
+    // point loop starts adding to it, and the water column belongs in that weight.
+    // ⚠ pbrNb, NOT the possibly-bent N. This file already argues the point for the specular lobe —
+    // the bend is an OCCLUSION direction, not a surface — and EON's s/t describes the same surface
+    // microstructure the specular lobe does, so it takes the same normal.
+    // ⚠ THE MULTIPLE-SCATTER WEIGHT IS TAKEN BEFORE THE SINGLE-SCATTER MULTIPLY. Its weight is the
+    // light the surface RECEIVED, not what the single-scatter lobe sent back.
+    if (pbrSigma > 0.0f)
+    {
+        const float nlb = saturate(dot(pbrNb, -gFrameData.sunDir.xyz));
+        pbrDiffMs += d * eonMsWeight(nlb);
+        d *= eonSingle(pbrEonAB, nlb, pbrNoV, dot(-gFrameData.sunDir.xyz, pbrV));
+    }
     // Sun specular (PBR draws): the same light, shadow and water column as the sun's diffuse above.
     if (pbrOn)
     {
@@ -422,6 +467,16 @@ float4 PS_MAIN( VSOutput In )
                 // four-term product.
                 float3 lightAdd = lambert * att * lightCol;
                 if (causProj) { lightAdd *= causticProjector(In.WorldPos, posR.xyz); }
+                // EON, per light. The N.L is the RAW one against pbrNb: `lambert` already carries
+                // geom_vis and the bent normal, and the bound that keeps s/t finite at
+                // grazing-grazing is stated in terms of the same N.L that multiplies it.
+                if (pbrSigma > 0.0f)
+                {
+                    const float3 Ld  = toLight * invDist;
+                    const float  nlb = saturate(dot(pbrNb, Ld));
+                    pbrDiffMs += lightAdd * eonMsWeight(nlb);
+                    lightAdd  *= eonSingle(pbrEonAB, nlb, pbrNoV, dot(Ld, pbrV));
+                }
                 d += lightAdd;
                 // Point-light specular (PBR draws). Every light, not pbr.hlsl's light 0 only — that was
                 // a ps_3_0 budget, and this loop is already walking them. (The submerged-lamp caustic
@@ -513,6 +568,18 @@ float4 PS_MAIN( VSOutput In )
     // the AO tint follow a debug slider. See aomultibounce.h.fsl.
     if ((aoFlags & 1u) != 0u) { a *= aoAmbientTerm(aoSample.a, albedo.rgb, aoFlags); }
 
+    // EON's MULTIPLE-SCATTER lobe, which lands here because rho_ms needs the ALBEDO and the albedo
+    // is only now in scope. Before the metallic kill on purpose: this is diffuse energy, and a metal
+    // has none.
+    // dbgScales.y by hand — `d` was scaled by it above and this addend must ride the same dev-panel
+    // diffuse slider, which it cannot inherit by being added afterwards.
+    if (pbrSigma > 0.0f && gShadowParams.pbrShade.y > 0.0f)
+    {
+        const float eAvg = eonEavg(pbrEonAB, pbrSigma);
+        d += pbrDiffMs * eonMsAlbedo(albedo.rgb, eAvg)
+                       * (eonMsScale(pbrEonAB, pbrSigma, pbrNoV)
+                          * gShadowParams.pbrShade.y * gFrameData.dbgScales.y);
+    }
     // Metallic workflow: a metal's reflectance is all specular (F0 = its albedo, below), so its diffuse
     // and ambient go to zero; the emissive addend is untouched. PBR draws only.
     if (pbrOn) { const float kd = 1.0f - pbrMetalness(pbrParam); d *= kd; a *= kd; }
@@ -542,7 +609,7 @@ float4 PS_MAIN( VSOutput In )
     float3 c = albedo.rgb * (lit + expandExposedEmissiveDelta(emis, albedo.rgb, 1.0f));
     if (pbrOn)
     {
-        const float3 f0 = pbrF0(pbrParam, albedo.rgb);
+        const float3 f0 = pbrF0(pbrParam, albedo.rgb, gShadowParams.pbrShade2.x);
         // The environment is the sky the ambient term already integrates, evaluated in the MIRROR
         // direction: the same SH (and the same sky AO) that lights the surface is what it reflects,
         // so the two cannot drift apart. L1 is blurry by nature — right for rough surfaces, soft for
@@ -552,6 +619,17 @@ float4 PS_MAIN( VSOutput In )
         if ((aoFlags & 1u) != 0u) { env *= aoSample.a; }   // an occluded pocket sees less sky
         c += (f0 * pbrSpecA + pbrSpecB) * gFrameData.dbgScales.y
            + env * pbrEnvBRDF(f0, pbrNoV, pbrRough);
+        // MULTIPLE-SCATTERING SPECULAR, added as the DIFFERENCE from the line above rather than as
+        // a factor on it — the house rule this file states for the W32 gobo, so at strength 0 the
+        // original expression is textually untouched and the A/B is bit-exact by inspection. CSE
+        // folds the repeated terms; what is paid is one mad per channel.
+        if (gShadowParams.pbrShade.w > 0.0f)
+        {
+            const float3 comp = pbrSpecMulti(f0, pbrEnvAB(pbrNoV, pbrRough), gShadowParams.pbrShade.w)
+                              - float3(1.0f, 1.0f, 1.0f);
+            c += ((f0 * pbrSpecA + pbrSpecB) * gFrameData.dbgScales.y
+                  + env * pbrEnvBRDF(f0, pbrNoV, pbrRough)) * comp;
+        }
     }
     // MW's enchanted-item glow. MW draws the item a second time as base*caustic*DIFFUSE and blends
     // it over the ordinary draw; summed, that is c*(1 + caustic*tint) — so this is multiplicative

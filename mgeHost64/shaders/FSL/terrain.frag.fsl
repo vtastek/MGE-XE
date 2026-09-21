@@ -780,6 +780,12 @@ float4 PS_MAIN( VSOutput In )
     float4 pbrMat   = float4(0.0f, 0.0f, 0.0f, 0.0f);
     float  pbrCover = 0.0f;                          // the blend weight that HAS a _paramh
     float  pbrRough = 1.0f, pbrAlpha2 = 1.0f, pbrNoV = 1.0f;
+    // ─── EON rough diffuse (pbrmaterial.h.fsl) ───────────────────────────────────────────────────
+    // These initialisers ARE the arm off: sigma 0 => eonAB is (1, 0) => eonSingle is exactly 1.0 and
+    // the multiple-scatter lobe is exactly 0.
+    float  pbrSigma  = 0.0f;
+    float2 pbrEonAB  = float2(1.0f, 0.0f);
+    float3 pbrDiffMs = float3(0.0f, 0.0f, 0.0f);   // sum of lcol*N.L*(c1 - G(N.L)) — ALBEDO-FREE
     float3 pbrV     = float3(0.0f, 0.0f, 1.0f);
     // Height AO's visibility, blended over the same layers. 1 = unoccluded, which is what every
     // pixel gets when the knob is off or the ground has no `_paramh` — so the term drops out of the
@@ -878,7 +884,30 @@ float4 PS_MAIN( VSOutput In )
             pbrAlpha2 = r2 * r2;                     // GGX alpha^2 = roughness^4 (pbr.hlsl)
             pbrV      = normalize(gFrameData.eyePos.xyz - In.WorldPos);
             pbrNoV    = saturate(dot(nShade, pbrV)) + 1e-5f;   // +eps: a normal can face away
+            // sigma as a RATIO of the authored roughness (g_eonSigma), and then ⚠ SCALED BY
+            // COVERAGE — where only part of the blend carries a `_paramh`, only that part is a PBR
+            // material, and a lobe that switched on at full strength across a coverage boundary
+            // would draw exactly the seam this file spent a day removing from the texture blend.
+            // At cover 0 sigma is 0, which is Lambert to the bit.
+            pbrSigma  = saturate(gShadowParams.pbrShade.x * pbrRough) * pbrCover;
+            pbrEonAB  = eonAB(pbrSigma);
             pbrKd     = float3(1.0f, 1.0f, 1.0f) - pbrMetalness(pbrMat) * pbrCover;
+        }
+    }
+    // ─── GEOMETRIC SPECULAR AA (pbrmaterial.h.fsl) ───────────────────────────────────────────────
+    // ⚠ THE DERIVATIVES ARE TAKEN HERE, IN UNIFORM FLOW, and the filter is applied after them. See
+    // the header for why the ddx cannot move inside the PBR branch.
+    // ⚠ AFTER pbrSigma, deliberately: this widens the SPECULAR lobe to match a footprint, and EON's
+    // sigma is a property of the material, not of how far away it is. Widening both would make a
+    // distant hillside diffusely rougher as well, which is not a thing that happens.
+    if (gShadowParams.pbrShade.z > 0.0f)
+    {
+        const float3 dNx = ddx(nShade), dNy = ddy(nShade);
+        if (pbrLive)
+        {
+            pbrAlpha2 = pbrSpecAAAlpha2(pbrAlpha2, dNx, dNy,
+                                        gShadowParams.pbrShade.z, gShadowParams.pbrShade2.y);
+            pbrRough  = sqrt(sqrt(pbrAlpha2));   // pbrEnvBRDF reads roughness, not alpha^2
         }
     }
 
@@ -968,8 +997,23 @@ float4 PS_MAIN( VSOutput In )
     // face it. Off the GEOMETRIC normal, which is what makes it a visibility test and not a second
     // N.L. Same factor, same form, as opaque.frag.
     if (pbrLive) { sunNdl *= saturate(8.0f * dot(normal, -gFrameData.sunDir.xyz) + 1.0f); }
+    // The sun's DIFFUSE weight, hoisted so EON has something to multiply. Bit-identical when the
+    // arm is off: `a * b * c * d` parses left-associatively as `((a*b)*c)*d`, so naming `(a*b)*c` and
+    // then multiplying by d is the same expression tree, not a reassociation.
+    float3 sunDiff = gFrameData.sunCol.rgb * sunNdl * sunVis;
+    // EON, sun. Terrain does not bend its normal, so nShade is the only shading normal here. The
+    // N.L is the RAW one — `sunNdl` already carries geom_vis — and CSE folds it back onto the line
+    // that computed sunNdl.
+    // ⚠ The multiple-scatter WEIGHT is the light RECEIVED (so: with the water column, before the
+    // single-scatter multiply), not what the single-scatter lobe sent back.
+    if (pbrSigma > 0.0f)
+    {
+        const float nlb = saturate(dot(-gFrameData.sunDir.xyz, nShade));
+        pbrDiffMs += (sunDiff * tSunW) * eonMsWeight(nlb);
+        sunDiff *= eonSingle(pbrEonAB, nlb, pbrNoV, dot(-gFrameData.sunDir.xyz, pbrV));
+    }
     float3 result = albedo
-                  * (gFrameData.sunCol.rgb * sunNdl * sunVis
+                  * (sunDiff
                         * tSunW
                      + amb * tAmbW);
     // ─── F12 5/6/7 (albedo / lit / ambient): the FACTOR `albedo` multiplies ──────────────────────
@@ -989,7 +1033,7 @@ float4 PS_MAIN( VSOutput In )
     // ONLY change was these three views, the whole addition came to **+3 DXIL instructions** each
     // (3514 -> 3517 and 3246 -> 3249) — exactly the one vector add, with nothing charged for the
     // initialiser. Terrain is that plus one vector multiply (the metallic kill below).
-    float3 litTerm = gFrameData.sunCol.rgb * sunNdl * sunVis * tSunW + amb * tAmbW;
+    float3 litTerm = sunDiff * tSunW + amb * tAmbW;
     if (pbrLive)
     {
         const float2 st = pbrSpecTerms(nShade, -gFrameData.sunDir.xyz, pbrV, sunNdl, pbrNoV, pbrAlpha2);
@@ -1101,6 +1145,16 @@ float4 PS_MAIN( VSOutput In )
                 // untouched and the A/B is bit-exact (see opaque.frag.fsl).
                 float3 lightAdd = lambert * att * lcol;
                 if (causProj) { lightAdd *= causticProjector(In.WorldPos, posR.xyz); }
+                // EON, per light. Raw N.L against nShade — `lambert` already carries geom_vis, and
+                // the bound that keeps s/t finite at grazing-grazing is stated in terms of the same
+                // N.L that multiplies it.
+                if (pbrSigma > 0.0f)
+                {
+                    const float3 Ld  = toL * invD;
+                    const float  nlb = saturate(dot(nShade, Ld));
+                    pbrDiffMs += lightAdd * eonMsWeight(nlb);
+                    lightAdd  *= eonSingle(pbrEonAB, nlb, pbrNoV, dot(Ld, pbrV));
+                }
                 pointDiffuse += lightAdd;
                 // Point-light specular. Every light, as opaque.frag does — this loop is already
                 // walking them. The submerged-lamp caustic gobo shapes the DIFFUSE only, so it is
@@ -1168,6 +1222,16 @@ float4 PS_MAIN( VSOutput In )
                 // untouched and the A/B is bit-exact (see opaque.frag.fsl).
                 float3 lightAdd = lambert * att * lcol;
                 if (causProj) { lightAdd *= causticProjector(In.WorldPos, posR.xyz); }
+                // EON, per light. Raw N.L against nShade — `lambert` already carries geom_vis, and
+                // the bound that keeps s/t finite at grazing-grazing is stated in terms of the same
+                // N.L that multiplies it.
+                if (pbrSigma > 0.0f)
+                {
+                    const float3 Ld  = toL * invD;
+                    const float  nlb = saturate(dot(nShade, Ld));
+                    pbrDiffMs += lightAdd * eonMsWeight(nlb);
+                    lightAdd  *= eonSingle(pbrEonAB, nlb, pbrNoV, dot(Ld, pbrV));
+                }
                 pointDiffuse += lightAdd;
                 if (pbrLive)   // see the near loop for why the gobo is not in `w`
                 {
@@ -1181,6 +1245,18 @@ float4 PS_MAIN( VSOutput In )
     }
     result += albedo * pointDiffuse;
     litTerm += pointDiffuse;   // the same sum, without the albedo (F12 6)
+    // EON's MULTIPLE-SCATTER lobe. Here because rho_ms needs the ALBEDO, and before the pbrKd
+    // metallic kill below so it is scaled with every other diffuse term.
+    // ⚠ IT HAS NO ALBEDO-FREE FORM — rho_ms goes as albedo^2 — so `litTerm` (F12 mode 6, the factor
+    // albedo multiplies) cannot carry it and deliberately does not. That view shows the
+    // SINGLE-scatter lit factor; the two differing once this arm is armed is the definition, not a
+    // bug.
+    if (pbrSigma > 0.0f && gShadowParams.pbrShade.y > 0.0f)
+    {
+        const float eAvg = eonEavg(pbrEonAB, pbrSigma);
+        result += pbrDiffMs * eonMsAlbedo(albedo, eAvg)
+                            * (eonMsScale(pbrEonAB, pbrSigma, pbrNoV) * gShadowParams.pbrShade.y);
+    }
 
     if (pbrLive)
     {
@@ -1189,7 +1265,7 @@ float4 PS_MAIN( VSOutput In )
         // here rather than one per term. pbrKd is exactly 1.0 when this branch is not taken.
         result *= pbrKd;
         litTerm *= pbrKd;
-        const float3 f0 = pbrF0(pbrMat, albedo);
+        const float3 f0 = pbrF0(pbrMat, albedo, gShadowParams.pbrShade2.x);
         // The environment is the SAME sky the ambient term above integrates, evaluated in the
         // mirror direction — so what lights the ground and what it reflects cannot drift apart.
         // lodSunAmb, not ambCol: that is terrain's own ambient source (see `amb` above).
@@ -1201,6 +1277,16 @@ float4 PS_MAIN( VSOutput In )
         // PBR material, and the rest keeps the legacy no-specular look it was authored with.
         result += ((f0 * pbrSpecA + pbrSpecB)
                    + env * pbrEnvBRDF(f0, pbrNoV, pbrRough)) * pbrCover;
+        // MULTIPLE-SCATTERING SPECULAR, as the DIFFERENCE from the line above (W32 gobo rule): at
+        // strength 0 the original expression is textually untouched. Rides pbrCover with it, so a
+        // partially covered blend still crossfades to exactly the legacy image.
+        if (gShadowParams.pbrShade.w > 0.0f)
+        {
+            const float3 comp = pbrSpecMulti(f0, pbrEnvAB(pbrNoV, pbrRough), gShadowParams.pbrShade.w)
+                              - float3(1.0f, 1.0f, 1.0f);
+            result += ((f0 * pbrSpecA + pbrSpecB)
+                       + env * pbrEnvBRDF(f0, pbrNoV, pbrRough)) * (pbrCover * comp);
+        }
     }
 
     result = tonemapInPass(result);

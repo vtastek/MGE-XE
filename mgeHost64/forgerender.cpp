@@ -6112,11 +6112,17 @@ namespace {
     //     its detail level. Arms 2 and 3 of the same repeat, composing additively with arm 1.
     constexpr uint32_t kTerrainMacro2Float    = kTerrainMacroFloat + 4;
     constexpr uint32_t kTerrainMacro3Float    = kTerrainMacro2Float + 4;
+    //   pbrShade x EON sigma scale, y EON multi-scatter, z specular AA, w specular multi-scatter;
+    //     pbrShade2 x the dielectric F0 base, y the specular-AA variance clamp. The diffuse LOBE and
+    //     the specular's ENERGY — see pbrmaterial.h.fsl's EON block for why the lobe is the one that
+    //     answers "plasticy" and the specular compensation is not.
+    constexpr uint32_t kPbrShadeFloat         = kTerrainMacro3Float + 4;
+    constexpr uint32_t kPbrShade2Float        = kPbrShadeFloat + 4;
     constexpr uint32_t kShadowParamsBytes = 4096;
     static_assert((kAoBounceFloat + 4) * sizeof(float) <= kShadowParamsBytes,
                   "ShadowMaskParams overflows its CBV — too many sun cascades");
-    static_assert((kTerrainMacro3Float + 4) * sizeof(float) <= kShadowParamsBytes,
-                  "pbrParams..terrainMacro3 must fit inside the ShadowMaskParams CBV");
+    static_assert((kPbrShade2Float + 4) * sizeof(float) <= kShadowParamsBytes,
+                  "pbrParams..pbrShade2 must fit inside the ShadowMaskParams CBV");
     // The float indices above are kept in step with the struct BY HAND, one +4 at a time, and
     // nothing checked that the running sum still lands on the member it names. A lane written one
     // float4 off reads as a knob that does nothing, or as garbage in a neighbour's slot — both of
@@ -6149,6 +6155,10 @@ namespace {
                   "kTerrainMacro2Float does not land on ShadowMaskParams::terrainMacro2");
     static_assert(offsetof(ShadowMaskParams, terrainMacro3) == kTerrainMacro3Float * sizeof(float),
                   "kTerrainMacro3Float does not land on ShadowMaskParams::terrainMacro3");
+    static_assert(offsetof(ShadowMaskParams, pbrShade) == kPbrShadeFloat * sizeof(float),
+                  "kPbrShadeFloat does not land on ShadowMaskParams::pbrShade");
+    static_assert(offsetof(ShadowMaskParams, pbrShade2) == kPbrShade2Float * sizeof(float),
+                  "kPbrShade2Float does not land on ShadowMaskParams::pbrShade2");
     // msmrecv.h.fsl's PCSS works in TEXELS, so SUN_SHADOW_RES has to agree with the atlas the host
     // actually allocated. Same mirroring contract as SUN_CASCADES / kSunCascades.
     static_assert(kSunShadowRes == 2048, "SUN_SHADOW_RES in shadowparams.h.fsl must match kSunShadowRes");
@@ -7443,6 +7453,62 @@ namespace {
     // to the 116 textures with a `_paramh`. OFF restores the MGE-faithful per-vertex path byte for
     // byte, missing normalise included, which is what makes it a usable A/B rather than a rollback.
     bool     g_staticsSunPerPixel = true;
+
+    // ─── THE DIFFUSE LOBE (EON) ─────────────────────────────────────────────────────────────────
+    // Reported from play: *"many materials are rough soil, stones, rocks etc. Shading reads a bit
+    // plasticy."* Every diffuse surface in this renderer is Lambert, and Lambert IS the diffuse
+    // shading of a SMOOTH dielectric — so the complaint names the lobe, not the texture and not the
+    // specular. EON (Portsmouth/Kutz/Hill, JCGT 2024) is an energy-preserving Oren-Nayar: rough
+    // ground backscatters toward the light and flattens its own terminator. pbrmaterial.h.fsl has
+    // the derivation and both constants; the short version is that its normalisation constant falls
+    // out of the integral as 1/2 - 2/(3*pi), which is the check that the derivation is right.
+    //
+    // SIGMA IS A RATIO, NOT AN ANGLE. `_paramh`.G is the only per-material roughness this renderer
+    // has and Oren-Nayar's sigma is a different quantity with no map of its own, so the honest knob
+    // is what to multiply one by to get the other. 1.0 = "as rough diffusely as it is specularly".
+    // 0 is OFF at the identity by construction: eonAB(0) returns (1, 0), so the single-scatter
+    // multiplier is exactly 1.0 and the multiple-scatter lobe is exactly 0.
+    //
+    // ⚠ SHIPS ARMED, which is a deviation from this project's usual "land it off and measure".
+    // The reasoning is yesterday's: the reported artifact IS the current behaviour, so shipping the
+    // fix off would mean shipping the complaint. It is one click to compare and the knob is saved.
+    float    g_eonSigma  = 1.0f;
+    // The Kulla-Conty multiple-scatter lobe, carried at albedo^2 — the energy HAS bounced twice, so
+    // it comes back darker AND more saturated than the surface, which is most of what separates
+    // rough dirt from painted plastic. 1.0 is exact energy preservation (the white-furnace
+    // condition); 0 leaves the single-scatter lobe alone, which is slightly DARK by construction.
+    // ⚠ Meaningless with sigma at 0, where the lobe it compensates is Lambert and loses nothing.
+    float    g_eonMulti  = 1.0f;
+    // ─── THE SPECULAR'S ENERGY ──────────────────────────────────────────────────────────────────
+    // GEOMETRIC SPECULAR AA (Tokuyoshi & Kaplanyan 2019), and there was NONE in this project — the
+    // grep for it came back empty. A rough rock keeps its authored roughness as it recedes while
+    // its normal detail averages away inside the pixel, so the lobe is tighter than the surface it
+    // stands for: shimmer in motion, and a uniform waxy sheen when still. Folds the normal's
+    // screen-space variance into alpha^2, which is where a distribution of normals already lives.
+    // Ships ARMED, and it is armed FOR the F0 change below: raising the dielectric base by 6x makes
+    // specular aliasing six times as visible, so the two belong in the same build.
+    float    g_pbrSpecAA      = 1.0f;
+    // Tokuyoshi's kappa: the most the lobe may be widened, in alpha^2 units. Without it a
+    // silhouette texel, where the interpolated normal swings 90 degrees in one pixel, is told it is
+    // a mirror made of noise. 0.18 is the paper's figure.
+    float    g_pbrSpecAAClamp = 0.18f;
+    // MULTIPLE-SCATTERING SPECULAR (Turquin/Frostbite), reusing the split-sum A + B the environment
+    // term already computes: `1 + F0*(1/E_ss - 1)`, a reciprocal and a mad.
+    // ⚠ ITS SIZE IS PROPORTIONAL TO F0, which is the whole story and is worth knowing before
+    // expecting anything from it on rock. Against this project's shipped Karis fit: at roughness
+    // 1.0, E_ss = 0.45, so the correction is +1.2% at F0 = 0.01, +4.9% at 0.04 and +122% at 1.0.
+    // It is correctness for the metal ladder. It is NOT the answer to "rough ground reads plasticy"
+    // — that is the diffuse lobe above, and saying so is most of what this knob is here to settle.
+    float    g_pbrSpecMulti   = 1.0f;
+    // THE DIELECTRIC F0 BASE — the constant pbrF0 multiplies by b^2. The decode ported from DX9
+    // uses 0.04, which at the export's default b = 0.5 gives F0 = 0.01: four times darker than a
+    // standard dielectric, while the comment it was carried across with called 0.5 "standard
+    // dielectric". It has been flagged since the port and is fixed here rather than re-flagged.
+    // ⚠ 0.16 is the value that makes b = 0.5 land on Disney's 0.04 EXACTLY (0.16 * 0.25 = 0.04).
+    // 0.25 ships on the user's call — a deliberately hot dielectric, F0 = 0.0625 at b = 0.5, which
+    // is 6.25x the reflectance every `_paramh` in the library has been judged against. That is a
+    // whole-frame look change and the single biggest one in this build.
+    float    g_pbrSpecBase    = 0.25f;
     // ─── TERRAIN ALBEDO SAMPLING (the distant-ground sparkle hunt) ───────────────────────────────
     // From play: one land texture (tx_RM_rock_01) sparkles on distant GROUND while the same texture
     // on ROCKS at comparable tiling does not. Ruled out by measurement, in order: the DDS (complete
@@ -22005,6 +22071,12 @@ namespace {
             { "pbrTerrainHeightAOStr", &g_pbrTerrainHeightAOStr },
             { "pbrTerrainHeightAOLod", &g_pbrTerrainHeightAOLod },
             { "pbrStaticsDepth",     &g_pbrStaticsDepth     },
+            { "eonSigma",            &g_eonSigma            },
+            { "eonMulti",            &g_eonMulti            },
+            { "pbrSpecAA",           &g_pbrSpecAA           },
+            { "pbrSpecAAClamp",      &g_pbrSpecAAClamp      },
+            { "pbrSpecMulti",        &g_pbrSpecMulti        },
+            { "pbrSpecBase",         &g_pbrSpecBase         },
             { "terrainTexBias",      &g_terrainTexBias      },
             // PARALLAX (tasks/forge-parallax.md). Here as well as on the panel because the two
             // questions this milestone has to answer are both MEASUREMENTS a minimized run has to
@@ -23958,6 +24030,21 @@ namespace {
         // height-derived normal on those surfaces, which is the quickest way to see the modes differ.
         { TabBuilder t; t.panel = g_uiPanel; t.name = "PBR materials";
           t.checkbox("PBR materials (_paramh) — off = today's image exactly", &g_pbrEnable);
+          // ─── THE DIFFUSE LOBE. Lambert is the shading of a SMOOTH dielectric, which is what
+          // "plasticy" names; rough ground does not shade like that. See g_eonSigma.
+          t.sliderF("EON rough diffuse: sigma as a MULTIPLE of roughness (0 = Lambert, exactly)",
+                    &g_eonSigma, 0.0f, 2.0f, 0.05f);
+          t.sliderF("  multiple scattering (albedo^2 — darker AND more saturated; 1 = energy-preserving)",
+                    &g_eonMulti, 0.0f, 1.0f, 0.05f);
+          // ─── THE SPECULAR'S ENERGY. Read the F0 row LAST: it scales the two above it.
+          t.sliderF("SPECULAR AA: fold normal variance into the lobe (0 = off; kills distant shimmer)",
+                    &g_pbrSpecAA, 0.0f, 2.0f, 0.05f);
+          t.sliderF("  variance clamp (Tokuyoshi kappa; a silhouette texel is not a mirror)",
+                    &g_pbrSpecAAClamp, 0.0f, 0.5f, 0.01f);
+          t.sliderF("SPECULAR multi-scatter (Turquin) — scales WITH F0: ~+1% dielectric, +122% metal",
+                    &g_pbrSpecMulti, 0.0f, 1.0f, 0.05f);
+          t.sliderF("DIELECTRIC F0 base x b^2 (0.04 = the DX9 decode = F0 0.01; 0.16 = Disney 0.04)",
+                    &g_pbrSpecBase, 0.0f, 0.4f, 0.01f);
           t.sliderU("  gradient: 0 cd (DX9) | 1 cdbs | 2 bspline | 3 retired (=4) | 4 cdblur (soft, no ghost)",
                     &g_pbrGradMode, 0u, 4u, 1u);
           t.sliderU("  frame: 0 cotangent (live DX9) | 1 surface gradient (exact under skew)",
@@ -32707,6 +32794,17 @@ void destroyHostWindow(Renderer* R);
             mp[kTerrainMacro3Float + 1] = 0.0f;
             mp[kTerrainMacro3Float + 2] = 0.0f;
             mp[kTerrainMacro3Float + 3] = 0.0f;
+            // The diffuse LOBE and the specular's ENERGY. Not gated by g_pbrEnable here: every
+            // consumer is already inside its own `_paramh` branch, and a second host-side gate is
+            // the shape of bug this file has hit before (a knob gated apart from its consumer).
+            mp[kPbrShadeFloat + 0] = std::max(0.0f, g_eonSigma);
+            mp[kPbrShadeFloat + 1] = std::clamp(g_eonMulti, 0.0f, 1.0f);
+            mp[kPbrShadeFloat + 2] = std::max(0.0f, g_pbrSpecAA);
+            mp[kPbrShadeFloat + 3] = std::clamp(g_pbrSpecMulti, 0.0f, 1.0f);
+            mp[kPbrShade2Float + 0] = std::max(0.0f, g_pbrSpecBase);
+            mp[kPbrShade2Float + 1] = std::max(0.0f, g_pbrSpecAAClamp);
+            mp[kPbrShade2Float + 2] = 0.0f;
+            mp[kPbrShade2Float + 3] = 0.0f;
             mp[280] = g_shadowBias;               // biasParams.x = absolute contact bias (live knob)
             mp[281] = g_shadowNormalOffset;       // biasParams.y = normal-offset bias in texels (live knob)
             // Flicker shadow "movement": the mask rotates the LOOKUP direction of flicker-class slots by a

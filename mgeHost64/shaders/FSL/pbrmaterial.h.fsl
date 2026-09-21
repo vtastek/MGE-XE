@@ -394,14 +394,62 @@ float2 pbrSpecTerms(float3 N, float3 L, float3 V, float NoL, float NoV, float al
 
 // Karis' analytic fit of the split-sum environment BRDF (as used by the live DX9 lighting.hlsl, with
 // its scale/bias in the original order): the fraction of an environment the lobe reflects, as F0*A + B.
-float3 pbrEnvBRDF(float3 f0, float NoV, float rough)
+// SPLIT so the raw (A, B) pair is reachable on its own: A + B is the lobe's directional albedo at
+// F0 = 1, which is exactly the E_ss that the multiple-scatter compensation below needs. Same
+// expression tree, only named — pbrEnvBRDF is unchanged term for term.
+float2 pbrEnvAB(float NoV, float rough)
 {
     const float4 c0 = float4(-1.0f, -0.0275f, -0.572f, 0.022f);
     const float4 c1 = float4(1.0f, 0.0425f, 1.04f, -0.04f);
     const float4 r  = rough * c0 + c1;
     const float a004 = min(r.x * r.x, exp2(-9.28f * NoV)) * r.x + r.y;
-    const float2 AB  = float2(-1.04f, 1.04f) * a004 + r.zw;
+    return float2(-1.04f, 1.04f) * a004 + r.zw;
+}
+float3 pbrEnvBRDF(float3 f0, float NoV, float rough)
+{
+    const float2 AB = pbrEnvAB(NoV, rough);
     return f0 * AB.x + AB.y;
+}
+
+// ─── MULTIPLE-SCATTERING SPECULAR (Turquin / Frostbite) ─────────────────────────────────────────
+//
+// Single-scattering GGX loses the energy that bounced between microfacets more than once — at
+// roughness 1 this fit puts E_ss at 0.45, i.e. 55% of it. The compensation is a single scalar per
+// channel, `1 + F0 * (1/E_ss - 1)`, reusing the same split-sum A + B the environment term already
+// computes, so it costs a reciprocal and a mad.
+//
+// ⚠ READ THE F0 FACTOR BEFORE EXPECTING ANYTHING FROM THIS ON ROCK. The correction is PROPORTIONAL
+// TO F0, so at a dielectric's 0.04 it is +4.9% at roughness 1 and at this project's shipped decode
+// (0.04*b^2 = 0.01 at the authored default) it is +1.2%. On a METAL, F0 near 1, it is +122% — which
+// is where it belongs and why it is here. It is correctness for the metal ladder; it is not the
+// answer to "rough ground reads plasticy". That is the diffuse lobe, above.
+float3 pbrSpecMulti(float3 f0, float2 ab, float strength)
+{
+    const float ess = max(ab.x + ab.y, 1e-2f);
+    return float3(1.0f, 1.0f, 1.0f) + (strength * (1.0f / ess - 1.0f)) * f0;
+}
+
+// ─── GEOMETRIC SPECULAR ANTIALIASING (Tokuyoshi & Kaplanyan 2019) ───────────────────────────────
+//
+// There was none in this project at all. A rough rock keeps its authored roughness as it recedes
+// while its normal detail averages away inside one pixel's footprint, so the lobe stays tighter
+// than the surface it is standing in for — which shimmers in motion and reads as a uniform waxy
+// sheen when it does not. The fix is to fold the normal's screen-space VARIANCE into the lobe's own
+// width, which is the one place it belongs: a distribution of normals is what alpha^2 already is.
+//
+// ⚠ THE CALLER TAKES ddx/ddy, NOT THIS FUNCTION, and must take them in UNIFORM control flow.
+// terrain.frag's PBR branch is per-PIXEL (it asks whether this pixel's four texture squares carry a
+// `_paramh`), and a derivative inside per-pixel divergent flow is undefined — the exact class of
+// spec violation this project has already paid for once. Hence the gradients as parameters, which
+// is also the contract the top of this file states for every texture read below it.
+//
+// `alpha2` here is the GGX alpha^2 the callers already hold (roughness^4). The clamp is Tokuyoshi's
+// kappa: without it a silhouette texel, where the interpolated normal swings through 90 degrees in
+// one pixel, would be told it is a mirror made of noise.
+float pbrSpecAAAlpha2(float alpha2, float3 dNdx, float3 dNdy, float strength, float clampMax)
+{
+    const float variance = 0.25f * strength * (dot(dNdx, dNdx) + dot(dNdy, dNdy));
+    return saturate(alpha2 + min(2.0f * variance, max(clampMax, 0.0f)));
 }
 
 // The _paramh's material, decoded exactly as the live DX9 PS decodes it, so the art reads here as it
@@ -414,8 +462,100 @@ float3 pbrEnvBRDF(float3 f0, float NoV, float rough)
 // on purpose: the maps were judged against it. It is flagged in the plan, not fixed here.
 float pbrRoughness(float4 param) { return clamp(param.g, 0.05f, 1.0f); }   // the live 0.05 floor
 float pbrMetalness(float4 param) { return saturate(param.r); }
-float3 pbrF0(float4 param, float3 albedo)
+// ⚠ `specBase` WAS THE LITERAL 0.04 AND IS NOW A KNOB, because the decode it sits in squares its
+// input: 0.04*b^2 at the export's default b = 0.5 is F0 = 0.01, four times darker than a standard
+// dielectric, and the comment it was carried across with called 0.5 "standard dielectric". The
+// constant that makes b = 0.5 land on Disney's 0.04 exactly is 0.16 (0.16 * 0.25 = 0.04); anything
+// above that is a deliberately hot dielectric. The decode's SHAPE is unchanged, so every authored
+// map still varies the way it was judged to.
+float3 pbrF0(float4 param, float3 albedo, float specBase)
 {
     const float b = saturate(param.b);
-    return lerp(float3(0.04f, 0.04f, 0.04f) * (b * b), albedo, pbrMetalness(param));
+    return lerp(float3(specBase, specBase, specBase) * (b * b), albedo, pbrMetalness(param));
 }
+
+// ─── EON: an energy-preserving Oren-Nayar diffuse lobe ──────────────────────────────────────────
+//
+// Portsmouth / Kutz / Hill, "EON: A practical energy-preserving rough diffuse BRDF" (JCGT 2024).
+//
+// WHY THIS AND NOT A SPECULAR CHANGE. Every diffuse surface in this project is Lambert, and Lambert
+// IS the diffuse shading of a smooth dielectric — which is what "plasticy" names. Rough soil, gravel
+// and rock backscatter toward the light and flatten their own terminator; that is a different LOBE,
+// not a different texture. The multi-scattering specular compensation that usually gets reached for
+// here cannot do it: Turquin's factor is `1 + F0*(1/E_ss - 1)`, i.e. PROPORTIONAL TO F0, and at this
+// project's dielectric F0 (pbrF0 decodes 0.04*b^2 = 0.01 at the authored default) that is +1.0% on
+// the lobe at roughness 0.9. Worth having, and it is in pbrSpecMulti below — but it is not the fix.
+//
+// ⚠ NORMALISED THE WAY THIS PROJECT NORMALISES LAMBERT — NO 1/pi. Every light level here is
+// calibrated against `albedo * lightCol * N.L` (pbrSpecTerms says the same thing for the specular
+// side). So eonSingle returns a MULTIPLIER on a term that already carries N.L, and it is exactly
+// 1.0 at sigma = 0: the arm off is the identity by construction, not by a bet on the compiler.
+//
+// ⚠ THE CALLER MUST APPLY IT TO A TERM THAT ALREADY CONTAINS N.L. `s/t` alone diverges at
+// grazing-grazing — that is Oren-Nayar's bright limb and it is real — but N.L * s/t is bounded by 1
+// because t = max(N.L, N.V) is one of the two.
+//
+// THE TWO CONSTANTS ARE DERIVED, AND EACH ONE CHECKS ITSELF. Writing E_QON's directional albedo out
+// as E(mu) = A * (1 + sigma*G(mu)) with
+//     G(mu) = (1/pi) * [ 2*s*( (1-s^3)/(3*mu) + pi/4 - (mu*s + asin mu)/2 ) - (2/3)*s ],  s=sqrt(1-mu^2)
+// gives G(1) = 0 and max G = G(0) = 1/2 - 2/(3pi) = 0.287793409. That maximum is EON_C1, the
+// normalisation constant the paper states — so deriving the integral and finding its peak lands on
+// the published constant to nine digits, which is the check that the derivation is right. Its
+// cosine-weighted average is EON_K = 2/3 - 28/(15pi) = 0.072488212, confirmed to twelve digits
+// against a 400k-sample numerical integration of the same G.
+#define EON_C1      0.287793409f
+#define EON_K       0.072488212f
+#define EON_C1MK    0.215305197f    // EON_C1 - EON_K, the multiple-scatter denominator (see below)
+
+// A and B, hoisted once per pixel. A = 1/(1 + c1*sigma) is what makes the peak directional albedo
+// exactly 1 (at grazing); B = sigma*A is the retro-reflective term's weight.
+float2 eonAB(float sigma)
+{
+    const float A = 1.0f / (1.0f + EON_C1 * sigma);
+    return float2(A, sigma * A);
+}
+
+// The single-scattering (qualitative Oren-Nayar) shape, as a multiplier on an N.L-carrying term.
+// EXACTLY 1.0 when sigma == 0, because eonAB returns (1, 0) there.
+float eonSingle(float2 ab, float NoL, float NoV, float LoV)
+{
+    const float s = LoV - NoL * NoV;                       // cos(dphi) * sin(th_l) * sin(th_v)
+    const float t = (s > 0.0f) ? max(max(NoL, NoV), 1e-4f) : 1.0f;
+    return ab.x + ab.y * (s / t);
+}
+
+// G(mu), as a cubic in u = 1 - mu with BOTH endpoints exact: the leading u factor gives G(1) = 0,
+// and the four coefficients sum to 1 so that G(0) = EON_C1. Max error 0.0022 against the closed
+// form over the whole range, on a quantity bounded by 0.288 — the closed form needs an asin, this
+// needs three mads.
+float eonG(float mu)
+{
+    const float u = 1.0f - saturate(mu);
+    return EON_C1 * u * (0.132551f + u * (2.136720f + u * (-1.914293f + u * 0.645021f)));
+}
+
+// THE MULTIPLE-SCATTER LOBE, and the reason it costs almost nothing here.
+//
+// Kulla-Conty's structure — the SAME one the specular side uses — is separable in the two
+// directions, f_ms ~ (1 - E(mu_i)) * (1 - E(mu_o)) / (1 - E_avg), so it accumulates across the light
+// loop exactly the way pbrSpecA/pbrSpecB already do and takes its albedo once at the combine.
+//
+// The naive form divides two quantities that BOTH vanish as sigma -> 0. They do not have to:
+//     1 - E(mu) = 1 - A*(1 + sigma*G) = sigma * A * (EON_C1 - G(mu))
+// so sigma and A cancel out of the ratio exactly, leaving (c1 - G(mu_o)) / (c1 - EON_K). Hence the
+// split below — a per-light weight with no sigma in it at all, and one per-pixel scalar that carries
+// the sigma*A. No small-number division anywhere, and the arm is exactly zero at sigma = 0.
+float eonMsWeight(float mu) { return EON_C1 - eonG(mu); }                       // per LIGHT
+float eonMsScale(float2 ab, float sigma, float NoV)                              // per PIXEL
+{
+    return sigma * ab.x * eonMsWeight(NoV) * (1.0f / EON_C1MK);
+}
+
+// The multiple-scatter albedo. rho^2 at leading order — the energy HAS bounced twice, so it is
+// darker AND more saturated than the surface, which is most of what separates rough dirt from
+// painted plastic — and exactly rho at rho = 1, which is the white-furnace condition.
+float3 eonMsAlbedo(float3 rho, float eAvg)
+{
+    return rho * rho * eAvg / max(1.0f - rho * (1.0f - eAvg), 1e-4f);
+}
+float eonEavg(float2 ab, float sigma) { return ab.x * (1.0f + sigma * EON_K); }
