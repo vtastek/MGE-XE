@@ -1204,7 +1204,32 @@ STRUCT(ShadowMaskParams)
     float4 pbrStatics;
 #line 849 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
     float4 terrainTex;
-#line 850
+#line 873 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
+    float4 parallax;
+#line 887 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
+    float4 parallax2;
+
+
+
+
+
+
+
+
+
+
+    float4 parallax3;
+#line 915 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
+    float4 terrainDisp;
+#line 928 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
+    float4 terrainDisp2;
+
+
+
+
+
+    float4 terrainDisp3;
+#line 935
 };
 #line 21 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
 #line 27 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
@@ -1657,6 +1682,41 @@ float4 sampleBase(uint texIdx, uint clampModeIn, float2 uv, bool lowAF)
     if (clampMode ==  2u ) { return SampleTex2D(gTextures[texIdx], gSamplerAnisoWrapClamp, uv); }
     return SampleTex2D(gTextures[texIdx], gSamplerAnisotropic, uv);
 }
+#line 115 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/texsample.h.fsl"
+float4 sampleFlipGrad(uint texIdx, uint clampModeIn, float2 uv, float2 dx, float2 dy, bool lowAF)
+{
+    const uint clampMode = clampModeIn &  3u ;
+    const uint bucket = (texIdx >> 11u) & ( 16  - 1u);
+    const float3 uvw = float3(uv, (float)(texIdx &  0x7FFu ));
+    if (lowAF)
+    {
+        if (clampMode ==  0u ) { return  gFlipArrays[bucket].SampleGrad(gSampler2xClampClamp, uvw, dx, dy) ; }
+        if (clampMode ==  1u ) { return  gFlipArrays[bucket].SampleGrad(gSampler2xClampWrap, uvw, dx, dy) ; }
+        if (clampMode ==  2u ) { return  gFlipArrays[bucket].SampleGrad(gSampler2xWrapClamp, uvw, dx, dy) ; }
+        return  gFlipArrays[bucket].SampleGrad(gSampler2xWrapWrap, uvw, dx, dy) ;
+    }
+    if (clampMode ==  0u ) { return  gFlipArrays[bucket].SampleGrad(gSamplerAnisoClampClamp, uvw, dx, dy) ; }
+    if (clampMode ==  1u ) { return  gFlipArrays[bucket].SampleGrad(gSamplerAnisoClampWrap, uvw, dx, dy) ; }
+    if (clampMode ==  2u ) { return  gFlipArrays[bucket].SampleGrad(gSamplerAnisoWrapClamp, uvw, dx, dy) ; }
+    return  gFlipArrays[bucket].SampleGrad(gSamplerAnisotropic, uvw, dx, dy) ;
+}
+
+float4 sampleBaseGrad(uint texIdx, uint clampModeIn, float2 uv, float2 dx, float2 dy, bool lowAF)
+{
+    const uint clampMode = clampModeIn &  3u ;
+    if (isFlipSlot(texIdx)) { return sampleFlipGrad(texIdx, clampMode, uv, dx, dy, lowAF); }
+    if (lowAF)
+    {
+        if (clampMode ==  0u ) { return SampleGradTex2D(gTextures[texIdx], gSampler2xClampClamp, uv, dx, dy); }
+        if (clampMode ==  1u ) { return SampleGradTex2D(gTextures[texIdx], gSampler2xClampWrap, uv, dx, dy); }
+        if (clampMode ==  2u ) { return SampleGradTex2D(gTextures[texIdx], gSampler2xWrapClamp, uv, dx, dy); }
+        return SampleGradTex2D(gTextures[texIdx], gSampler2xWrapWrap, uv, dx, dy);
+    }
+    if (clampMode ==  0u ) { return SampleGradTex2D(gTextures[texIdx], gSamplerAnisoClampClamp, uv, dx, dy); }
+    if (clampMode ==  1u ) { return SampleGradTex2D(gTextures[texIdx], gSamplerAnisoClampWrap, uv, dx, dy); }
+    if (clampMode ==  2u ) { return SampleGradTex2D(gTextures[texIdx], gSamplerAnisoWrapClamp, uv, dx, dy); }
+    return SampleGradTex2D(gTextures[texIdx], gSamplerAnisotropic, uv, dx, dy);
+}
 
 
 
@@ -1820,18 +1880,25 @@ float pbrHeightAO(float hSharp, float hAvg, float2 size0, float avgLvl, float de
 
     return saturate(solidAngleOcclusion(1.0f, c));
 }
+#line 315 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/pbrmaterial.h.fsl"
+void pbrTangentFrame(float3 N, float3 dPdx, float3 dPdy, float2 duvdx, float2 duvdy,
+                     out float3 T, out float3 B)
+{
+    const float3 dp2perp = cross(dPdy, N);
+    const float3 dp1perp = cross(N, dPdx);
+    const float3 t = dp2perp * duvdx.x + dp1perp * duvdy.x;
+    const float3 b = dp2perp * duvdx.y + dp1perp * duvdy.y;
+    const float det = dot(dPdx, dp2perp);
+    const float s = ((det < 0.0f) ? -1.0f : 1.0f) * rsqrt(max(max(dot(t, t), dot(b, b)), 1e-30f));
+    T = t * s;
+    B = b * s;
+}
 
 float3 pbrPerturbCotangent(float3 N, float3 dPdx, float3 dPdy, float2 duvdx, float2 duvdy,
                            float2 dhduv, float depth)
 {
-    const float3 dp2perp = cross(dPdy, N);
-    const float3 dp1perp = cross(N, dPdx);
-    float3 T = dp2perp * duvdx.x + dp1perp * duvdy.x;
-    float3 B = dp2perp * duvdx.y + dp1perp * duvdy.y;
-    const float det = dot(dPdx, dp2perp);
-    const float s = ((det < 0.0f) ? -1.0f : 1.0f) * rsqrt(max(max(dot(T, T), dot(B, B)), 1e-30f));
-    T *= s;
-    B *= s;
+    float3 T, B;
+    pbrTangentFrame(N, dPdx, dPdy, duvdx, duvdy, T, B);
     const float3 nTS = normalize(float3(-dhduv.x * depth, -dhduv.y * depth, 1.0f));
     return normalize(nTS.x * T + nTS.y * B + nTS.z * N);
 }
@@ -1863,7 +1930,7 @@ float3 pbrPerturb(uint frameMode, float3 N, float3 dPdx, float3 dPdy, float2 duv
     return (frameMode == 1u) ? pbrPerturbSurfGrad(N, dPdx, dPdy, duvdx, duvdy, dhduv, depth)
                              : pbrPerturbCotangent(N, dPdx, dPdy, duvdx, duvdy, dhduv, depth);
 }
-#line 359 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/pbrmaterial.h.fsl"
+#line 381 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/pbrmaterial.h.fsl"
 float2 pbrSpecTerms(float3 N, float3 L, float3 V, float NoL, float NoV, float alpha2)
 {
     const float3 H = normalize(V + L);

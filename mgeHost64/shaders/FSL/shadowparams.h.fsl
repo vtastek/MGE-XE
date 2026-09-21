@@ -847,4 +847,89 @@ STRUCT(ShadowMaskParams)
     //       takes two levels, something else is wrong and the bias is only hiding it.
     //   zw = spare.
     DATA(float4,   terrainTex,       None);
+    // ─── PARALLAX (tasks/forge-parallax.md; parallax.h.fsl) ─────────────────────────────────────
+    // The last large piece of the DX9 renderer the Forge takeover had not absorbed. Read by
+    // opaque.frag (near meshes), terrain.frag (the ground) and — for the displacement lanes below —
+    // terrain.vert. Distant statics deliberately do NOT read these: a 64-256 texel LOD texture has
+    // nothing left for a parallax offset to find, so out there the cdblur normal is the whole story.
+    //
+    // Appended at the END, for the reason every block above states: this cbuffer is bound BY
+    // POINTER into every PerFrame set and each offset above is a host constant, so a field inserted
+    // anywhere else silently moves a lane somebody reads by index.
+    //
+    // parallax:
+    //   x = MESH arm (0 = off). The whole opaque.frag block is behind it AND behind ParamIndex != 0,
+    //       so off is the pre-parallax image bit for bit.
+    //   y = TERRAIN arm, its own lane for the reason pbrTerrain has one: the ground is a separate
+    //       shader over a separate residency, it is most of the screen outdoors, and it is therefore
+    //       the expensive half — the two have to be priced and judged apart.
+    //   z = SCALE, the height range as a fraction of one UV unit. Dimensionless and scale-free, the
+    //       same convention every depth in this file uses (slope = depth x dH/duv). 0.008 is the
+    //       tuned DX9 value (scene-walk's ImGui default), and at that setting the uv offset is about
+    //       1/125 of a texture square — which is the bound that licenses D3's single-layer iteration.
+    //   w = BIAS, the OFFSET LIMITER's denominator term: the offset is Vts.xy / (Vts.z + w). Without
+    //       it the offset diverges as a surface turns edge-on and smears the texture into streaks;
+    //       at the tuned 0.5 the grazing offset is bounded at 2x the head-on one.
+    DATA(float4,   parallax,         None);
+    // parallax2:
+    //   x = STEP COUNT. 0 leaves the uv untouched (the identity arm, and the free A/B against no
+    //       parallax); 1 is DX9's single-offset `Parallax()` term for term; higher refines the same
+    //       fixed point. ⚠ It is a RUNTIME lane and not a compile-time constant on purpose: GRAPHICS
+    //       shaders do not hot-reload in this host, so a compile-time count would need a host restart
+    //       to retune — and an A/B you have to restart for is one nobody runs. The loop is bounded by
+    //       a cbuffer scalar, i.e. wave-uniform, so the cost is exactly `x` taps at EVERY view angle.
+    //       That angle-independence is the property POM was rejected for not having.
+    //   y = SOFT PARALLAX SHADOW arm (Drobot, 4 fixed taps). Its own lane because it is the expensive
+    //       half on the ground: it traces the height-BLENDED surface, so it is five taps per covered
+    //       layer, up to 20 where four land textures meet.
+    //   z = shadow SOFTEN. How fast a neighbour standing above you turns into an occlusion. 5.0 = DX9.
+    //   w = shadow REACH in uv along the tangent-space to-light direction. 0.03 = DX9's 0.04*0.75.
+    DATA(float4,   parallax2,        None);
+    // parallax3 — the ADDITIVE HEIGHT BLEND, generalised from 2 layers to 4 (TERRAIN ONLY; the mesh
+    // path has no multi-layer blend to weight).
+    //   x = ARM (0 = off, and off leaves the bilinear weights exactly as they were).
+    //   y = STRENGTH 0..1, lerping the plain bilinear weights toward the height-driven mask. 1.0 =
+    //       DX9's default, i.e. the mask outright.
+    //   z = CONTRAST: the band, in height units, over which two layers still mix. It is subtracted
+    //       from the winning layer, so only rivals within it survive. Small = a hard boundary that
+    //       follows the texture's own cracks; large = back toward bilinear. 0.06 = DX9, and it
+    //       transfers because the 4-layer form is algebraically their 2-layer one at N = 2.
+    //   w = spare.
+    DATA(float4,   parallax3,        None);
+    // ─── PHASE 4a: NEAR-CAMERA TERRAIN DISPLACEMENT (terrain.vert.fsl) ──────────────────────────
+    // ⚠ READ BY THE VERTEX STAGE. Only pbrStatics.z does that today, and the note there applies
+    // here for the same reason: terrain.vert already binds gShadowParams, so this costs no new
+    // binding, but the stages must agree about it within a frame — and they do, because the host
+    // writes it once.
+    //
+    // terrainDisp:
+    //   x = ARM (0 = off; the branch is not taken and no fetch is issued).
+    //   y = SCALE in WORLD UNITS — the deepest the ground may be carved. ONE-SIDED: the curve only
+    //       ever subtracts, so displaced ground never rises above Morrowind's own heightfield and
+    //       cannot push the player out of the floor or lift the ground through a crate on it.
+    //   z = GAMMA. The shaped depth is pow(1 - height, 1/gamma), so 0.25 means a 4th power: only
+    //       genuinely deep parts of the height map carve at all, and everything else stays put.
+    //   w = PIVOT, a divisor on the shaped depth before it saturates. 1.0 = identity.
+    // All three are the DX9 CPU baker's own terms (scene-walk patch_displacement.cpp:193), so the
+    // tuned 6.0 / 0.25 / 1.0 transfer unchanged.
+    DATA(float4,   terrainDisp,      None);
+    // terrainDisp2:
+    //   x = full-strength RADIUS in world units, y = FADE END. Smoothstep between them, because a
+    //       linear ramp has a slope discontinuity at both ends and a crease in the ground that
+    //       follows the player is exactly what this phase is watching for under TAA.
+    //   z = the MIP LEVEL the height is fetched at, and it is not decoration: one lattice step is
+    //       128 world units, i.e. ~256 texels of a 1024 map tiling per 512 units, so reading mip 0
+    //       would be sampling a field at 1/256 of its rate — aliasing that crawls with the camera.
+    //       8 is the band-limit that matches the lattice.
+    //   w = the RUNG the disc's geometry is actually drawn at — the patch rung when phase 4b's
+    //       patch system is armed, otherwise the base rung. Read by grass.vert, which has no rung
+    //       of its own but must fetch the carve at the same band-limit the ground did: `z` means
+    //       "the right level for the BASE lattice", so the level actually sampled is z + w - 4.
+    DATA(float4,   terrainDisp2,     None);
+    // ─── PHASE 4b: the world grid's origin, FOR GRASS ───────────────────────────────────────
+    // terrain.vert is handed its cell's grid-local coords and the grid span PER INSTANCE and never
+    // reads this. grass.vert has only the blade root's WORLD XY, so it has to derive the cell and
+    // the lattice coord itself — which needs the same origin the instance lane carries.
+    //   x = grid min cell X, y = grid min cell Y, z = span X, w = span Y (all whole numbers).
+    DATA(float4,   terrainDisp3,     None);
 };

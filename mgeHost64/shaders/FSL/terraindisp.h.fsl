@@ -1,0 +1,166 @@
+// mgeHost64 — the near-camera terrain CARVE, as ONE implementation two stages share.
+//
+// Phase 4a put the displacement in terrain.vert, which was the right place for exactly as long as
+// terrain was the only thing standing on the ground. It is not: GRASS roots are baked on the CPU
+// from raw Terrain::LandCell::height, completely outside that shader, so a carved surface slides
+// out from under the blades. At 128 u that was a millimetre of float; at 8 u (phase 4b) it is the
+// first thing you see.
+//
+// So the carve lives here and both vertex stages call it. Not tidiness — [[feedback_one_knob_two_jobs]]
+// read structurally: the ground and the things standing on it must agree about where the ground IS,
+// and two copies of a 4-tap bilinear blend over a texture-square lattice is precisely the kind of
+// pair that drifts. terrain.vert passes the cell coords it already has per instance; grass.vert has
+// only a world XY and derives them (terrainCarveWorld).
+//
+// ⚠ REQUIRES opaque.srt.h TO BE INCLUDED FIRST. It reads gTerrainCellGrid, gTerrainParamTex,
+// gTerrainParamArrays, gSamplerBilinearWrap and gShadowParams.
+
+#define TERRAIN_VERTS       65
+#define TERRAIN_QUADS       64
+#define TERRAIN_SPACING     128.0f   // world units between LAND vertices
+// The rung whose step is exactly one lattice unit. Rungs below it SUBDIVIDE (8, 16, 32, 64 u) and
+// are only ever drawn by the PATCH family; rungs above it skip lattice points (256 u and up).
+// step = exp2(rung - TERRAIN_BASE_RUNG). Mirrors kTerrainBaseLod in forgerender.cpp.
+#define TERRAIN_BASE_RUNG   4.0f
+// A patch spans this many BASE QUADS — 4 * 128 = 512 world units, which at 65²/33² is DX9's own
+// 8 u / 16 u (scene-walk:src/mge/patch_displacement.cpp subdivides MW's stride-4 patch the same way).
+#define TERRAIN_PATCH_QUADS 4
+
+// World-grid cell lookup: local grid coords -> slot+1, 0 when that cell has no LAND record (or is
+// off the map). One flat table replaces plumbing per-neighbour slots through the instance, and it
+// reaches DIAGONALLY, which the frag's texture-square wrap needs at cell corners.
+uint terrainCellAt(int lx, int ly, uint spanX, uint spanY)
+{
+    if (lx < 0 || ly < 0 || lx >= (int)spanX || ly >= (int)spanY) { return 0u; }
+    return gTerrainCellGrid[(uint)ly * spanX + (uint)lx];
+}
+
+// Morrowind's per-vertex texture-square assignment, and the wrap into the neighbouring cell that
+// its floor/ceil asymmetry reaches for. Byte for byte terrain.frag.fsl's — the VS and the FS MUST
+// agree about which land texture owns a vertex, or the displaced geometry and the relief shading on
+// top of it would be reading two different height fields.
+#define TERRAIN_TSTRIDE_VS   256u
+#define TERRAIN_NO_SQUARE_VS 0xFFFFFFFFu
+int squareXVS(int x) { return (int)floor((float(x) - 2.0f) * 0.25f); }
+int squareYVS(int y) { return (int)ceil ((float(y) - 2.0f) * 0.25f); }
+uint landSquareIndexVS(int lx, int ly, uint spanX, uint spanY, int tx, int ty)
+{
+    if (tx <  0) { --lx; tx += 16; } else if (tx > 15) { ++lx; tx -= 16; }
+    if (ty <  0) { --ly; ty += 16; } else if (ty > 15) { ++ly; ty -= 16; }
+    uint cell = terrainCellAt(lx, ly, spanX, spanY);
+    if (cell == 0u) { return TERRAIN_NO_SQUARE_VS; }
+    return (cell - 1u) * TERRAIN_TSTRIDE_VS + (uint)(ty * 16 + tx);
+}
+
+// The-Forge types SampleLvlTex2DArray against `Texture3D` (a copy-paste from SampleLvlTex3D), so
+// the bucketed arrays take a LOCAL macro under their own name — the same gap and the same treatment
+// terrain.frag.fsl gives it ([[project_forge_fork_merge_trap]]).
+#define SampleLvlDispArray(N, S, C, L)  N.SampleLevel(S, C, L)
+
+// The crevice curve, term for term from the DX9 CPU baker (scene-walk patch_displacement.cpp:193):
+//     depth01 = saturate(1 - h) ; mag = min(1, pow(depth01, 1/gamma) / pivot) ; out = -mag * scale
+// so the tuned 6.0 / 0.25 / 1.0 transfer unchanged.
+//
+// ⚠ IT IS ONE-SIDED, AND THAT IS THE CONSERVATISM THE PLAN ASKED FOR. The result is never positive:
+// the ground only ever carves DOWN from Morrowind's own heightfield, never up. So nothing this
+// shader does can push the player out of the floor, lift the ground through a crate standing on it,
+// or raise a shoreline above a water plane the engine placed.
+//
+// `lvl` is not decoration either. At 128 world units between vertices and a land texture tiling
+// once per 512, ONE lattice step is ~256 texels of a 1024 map — so reading the map at its own mip 0
+// would be sampling a field at 1/256 of its rate, which is pure aliasing that crawls as the camera
+// moves. Level 8 is the band-limit that matches the BASE lattice; it is a knob because the right
+// answer moves with the map's resolution. The caller OFFSETS it by its rung (see terrainDispLevel).
+float terrainDispZ(uint slot, float2 uv, float lvl, float scale, float gamma, float pivot)
+{
+    const uint bucket = slot >> 16u;
+    const uint layer  = slot & 0xFFFFu;
+    const float h = SampleLvlDispArray(gTerrainParamArrays[bucket], gSamplerBilinearWrap,
+                                       float3(uv, float(layer)), max(lvl, 0.0f)).a;
+    const float depth01 = saturate(1.0f - h);
+    const float mag = min(1.0f, pow(depth01, 1.0f / max(gamma, 1e-4f)) / max(pivot, 1e-4f));
+    return -mag * scale;
+}
+
+// The band-limit for a given rung. The knob means "the right level for the BASE lattice", so a rung
+// two octaves finer reads two levels finer — which keeps ONE knob meaning one thing at every rung
+// instead of splitting into five.
+float terrainDispLevel(float rung)
+{
+    return gShadowParams.terrainDisp2.z + rung - TERRAIN_BASE_RUNG;
+}
+
+// ─── D6: THE CARVE AT A LATTICE COORD, ACROSS ITS FOUR TEXTURE SQUARES ──────────────────────────
+// The four squares bracketing this point, and the same bilinear weights the FRAG resolves them with
+// (terrain.frag.fsl's i00..i11). On the base lattice a vertex IS a square corner and this collapses
+// to the single tap 4a took; off it, many vertices sit inside a quad whose four corners disagree,
+// and picking one of them would crease the ground by up to `displacementScale` along EVERY
+// texture-square boundary — with 16x the geometry to show it off. Blending the four carve DEPTHS
+// (not the heights) is also what makes a square with no `_paramh` fade out of the sum instead of
+// stepping out of it.
+//
+// `gxf`/`gyf` are CELL-lattice coords in [0, 64]; `lx`/`ly` are the cell's grid-local coords.
+float terrainCarveAt(int lx, int ly, uint spanX, uint spanY, float gxf, float gyf,
+                     float lvl, float sc, float gm, float pv)
+{
+    // uv tiles once per 512-unit texture square (lattice/4), continuous across a cell boundary
+    // because the two cells' shared vertex resolves to the SAME square and to uv values one whole
+    // tile apart, which WRAP to one texel.
+    const float2 duv = float2(gxf, gyf) * 0.25f;
+
+    const int   x0 = (int)floor(gxf), y0 = (int)floor(gyf);
+    const int   x1 = min(x0 + 1, TERRAIN_QUADS), y1 = min(y0 + 1, TERRAIN_QUADS);
+    const float fx = gxf - float(x0), fy = gyf - float(y0);
+    const uint  i00 = landSquareIndexVS(lx, ly, spanX, spanY, squareXVS(x0), squareYVS(y0));
+    const uint  i10 = landSquareIndexVS(lx, ly, spanX, spanY, squareXVS(x1), squareYVS(y0));
+    const uint  i01 = landSquareIndexVS(lx, ly, spanX, spanY, squareXVS(x0), squareYVS(y1));
+    const uint  i11 = landSquareIndexVS(lx, ly, spanX, spanY, squareXVS(x1), squareYVS(y1));
+    const uint  p00 = (i00 == TERRAIN_NO_SQUARE_VS) ? 0u : gTerrainParamTex[i00];
+    const uint  p10 = (i10 == TERRAIN_NO_SQUARE_VS) ? 0u : gTerrainParamTex[i10];
+    const uint  p01 = (i01 == TERRAIN_NO_SQUARE_VS) ? 0u : gTerrainParamTex[i01];
+    const uint  p11 = (i11 == TERRAIN_NO_SQUARE_VS) ? 0u : gTerrainParamTex[i11];
+
+    float dz = 0.0f;
+    if (p00 == p10 && p00 == p01 && p00 == p11) {
+        // One square owns the whole quad — three quads in four, and every vertex on the base
+        // lattice. Ground whose land texture ships no `_paramh` is left exactly where MW put it.
+        if (p00 != 0u) { dz = terrainDispZ(p00, duv, lvl, sc, gm, pv); }
+    } else {
+        const float w00 = (1.0f - fx) * (1.0f - fy), w10 = fx * (1.0f - fy);
+        const float w01 = (1.0f - fx) * fy,          w11 = fx * fy;
+        if (p00 != 0u) { dz += w00 * terrainDispZ(p00, duv, lvl, sc, gm, pv); }
+        if (p10 != 0u) { dz += w10 * terrainDispZ(p10, duv, lvl, sc, gm, pv); }
+        if (p01 != 0u) { dz += w01 * terrainDispZ(p01, duv, lvl, sc, gm, pv); }
+        if (p11 != 0u) { dz += w11 * terrainDispZ(p11, duv, lvl, sc, gm, pv); }
+    }
+    return dz;
+}
+
+// ─── THE SAME CARVE, FOR A STAGE THAT HAS ONLY A WORLD XY (grass.vert) ──────────────────────────
+// terrain.vert is handed its cell's grid-local coords per instance; a grass blade is an instance of
+// a MESH and knows nothing about the LAND grid, so it derives them. gShadowParams.terrainDisp3
+// carries the grid's own origin for exactly this (terrain.vert never reads it).
+//
+// ⚠ float32 IS ENOUGH HERE AND THAT IS WORTH STATING, because the neighbouring grassAbsMod2 exists
+// precisely because it is NOT enough for the wind phase. Absolute Morrowind coordinates reach
+// ~200,000 where the ulp is ~0.015, and that rounding MOVES as the camera moves. The wind field
+// could not survive it (a half-cycle sign flip on the second harmonic). This can: 0.015 units is
+// 1/34000 of a texture tile, read at mip 8 of a 1024 map, i.e. far below one texel of the field
+// being sampled — and the carve is a smooth function of uv, not a harmonic in it.
+float terrainCarveWorld(float2 worldXY, float lvl, float sc, float gm, float pv)
+{
+    const uint spanX = (uint)gShadowParams.terrainDisp3.z;
+    const uint spanY = (uint)gShadowParams.terrainDisp3.w;
+    if (spanX == 0u || spanY == 0u) { return 0.0f; }   // no terrain residency yet
+
+    const float invCell = 1.0f / (TERRAIN_SPACING * float(TERRAIN_QUADS));
+    const float cx = floor(worldXY.x * invCell);
+    const float cy = floor(worldXY.y * invCell);
+    const int   lx = (int)cx - (int)gShadowParams.terrainDisp3.x;
+    const int   ly = (int)cy - (int)gShadowParams.terrainDisp3.y;
+    // [0, 64) by construction — the floor above is the same one that produced cx/cy.
+    const float gxf = (worldXY.x - cx * (TERRAIN_SPACING * float(TERRAIN_QUADS))) / TERRAIN_SPACING;
+    const float gyf = (worldXY.y - cy * (TERRAIN_SPACING * float(TERRAIN_QUADS))) / TERRAIN_SPACING;
+    if (terrainCellAt(lx, ly, spanX, spanY) == 0u) { return 0.0f; }
+    return terrainCarveAt(lx, ly, spanX, spanY, gxf, gyf, lvl, sc, gm, pv);
+}

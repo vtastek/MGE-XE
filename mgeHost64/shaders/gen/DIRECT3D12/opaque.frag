@@ -1204,7 +1204,32 @@ STRUCT(ShadowMaskParams)
     float4 pbrStatics;
 #line 849 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
     float4 terrainTex;
-#line 850
+#line 873 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
+    float4 parallax;
+#line 887 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
+    float4 parallax2;
+
+
+
+
+
+
+
+
+
+
+    float4 parallax3;
+#line 915 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
+    float4 terrainDisp;
+#line 928 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
+    float4 terrainDisp2;
+
+
+
+
+
+    float4 terrainDisp3;
+#line 935
 };
 #line 21 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
 #line 27 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
@@ -1657,6 +1682,41 @@ float4 sampleBase(uint texIdx, uint clampModeIn, float2 uv, bool lowAF)
     if (clampMode ==  2u ) { return SampleTex2D(gTextures[texIdx], gSamplerAnisoWrapClamp, uv); }
     return SampleTex2D(gTextures[texIdx], gSamplerAnisotropic, uv);
 }
+#line 115 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/texsample.h.fsl"
+float4 sampleFlipGrad(uint texIdx, uint clampModeIn, float2 uv, float2 dx, float2 dy, bool lowAF)
+{
+    const uint clampMode = clampModeIn &  3u ;
+    const uint bucket = (texIdx >> 11u) & ( 16  - 1u);
+    const float3 uvw = float3(uv, (float)(texIdx &  0x7FFu ));
+    if (lowAF)
+    {
+        if (clampMode ==  0u ) { return  gFlipArrays[bucket].SampleGrad(gSampler2xClampClamp, uvw, dx, dy) ; }
+        if (clampMode ==  1u ) { return  gFlipArrays[bucket].SampleGrad(gSampler2xClampWrap, uvw, dx, dy) ; }
+        if (clampMode ==  2u ) { return  gFlipArrays[bucket].SampleGrad(gSampler2xWrapClamp, uvw, dx, dy) ; }
+        return  gFlipArrays[bucket].SampleGrad(gSampler2xWrapWrap, uvw, dx, dy) ;
+    }
+    if (clampMode ==  0u ) { return  gFlipArrays[bucket].SampleGrad(gSamplerAnisoClampClamp, uvw, dx, dy) ; }
+    if (clampMode ==  1u ) { return  gFlipArrays[bucket].SampleGrad(gSamplerAnisoClampWrap, uvw, dx, dy) ; }
+    if (clampMode ==  2u ) { return  gFlipArrays[bucket].SampleGrad(gSamplerAnisoWrapClamp, uvw, dx, dy) ; }
+    return  gFlipArrays[bucket].SampleGrad(gSamplerAnisotropic, uvw, dx, dy) ;
+}
+
+float4 sampleBaseGrad(uint texIdx, uint clampModeIn, float2 uv, float2 dx, float2 dy, bool lowAF)
+{
+    const uint clampMode = clampModeIn &  3u ;
+    if (isFlipSlot(texIdx)) { return sampleFlipGrad(texIdx, clampMode, uv, dx, dy, lowAF); }
+    if (lowAF)
+    {
+        if (clampMode ==  0u ) { return SampleGradTex2D(gTextures[texIdx], gSampler2xClampClamp, uv, dx, dy); }
+        if (clampMode ==  1u ) { return SampleGradTex2D(gTextures[texIdx], gSampler2xClampWrap, uv, dx, dy); }
+        if (clampMode ==  2u ) { return SampleGradTex2D(gTextures[texIdx], gSampler2xWrapClamp, uv, dx, dy); }
+        return SampleGradTex2D(gTextures[texIdx], gSampler2xWrapWrap, uv, dx, dy);
+    }
+    if (clampMode ==  0u ) { return SampleGradTex2D(gTextures[texIdx], gSamplerAnisoClampClamp, uv, dx, dy); }
+    if (clampMode ==  1u ) { return SampleGradTex2D(gTextures[texIdx], gSamplerAnisoClampWrap, uv, dx, dy); }
+    if (clampMode ==  2u ) { return SampleGradTex2D(gTextures[texIdx], gSamplerAnisoWrapClamp, uv, dx, dy); }
+    return SampleGradTex2D(gTextures[texIdx], gSamplerAnisotropic, uv, dx, dy);
+}
 
 
 
@@ -1820,18 +1880,25 @@ float pbrHeightAO(float hSharp, float hAvg, float2 size0, float avgLvl, float de
 
     return saturate(solidAngleOcclusion(1.0f, c));
 }
+#line 315 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/pbrmaterial.h.fsl"
+void pbrTangentFrame(float3 N, float3 dPdx, float3 dPdy, float2 duvdx, float2 duvdy,
+                     out float3 T, out float3 B)
+{
+    const float3 dp2perp = cross(dPdy, N);
+    const float3 dp1perp = cross(N, dPdx);
+    const float3 t = dp2perp * duvdx.x + dp1perp * duvdy.x;
+    const float3 b = dp2perp * duvdx.y + dp1perp * duvdy.y;
+    const float det = dot(dPdx, dp2perp);
+    const float s = ((det < 0.0f) ? -1.0f : 1.0f) * rsqrt(max(max(dot(t, t), dot(b, b)), 1e-30f));
+    T = t * s;
+    B = b * s;
+}
 
 float3 pbrPerturbCotangent(float3 N, float3 dPdx, float3 dPdy, float2 duvdx, float2 duvdy,
                            float2 dhduv, float depth)
 {
-    const float3 dp2perp = cross(dPdy, N);
-    const float3 dp1perp = cross(N, dPdx);
-    float3 T = dp2perp * duvdx.x + dp1perp * duvdy.x;
-    float3 B = dp2perp * duvdx.y + dp1perp * duvdy.y;
-    const float det = dot(dPdx, dp2perp);
-    const float s = ((det < 0.0f) ? -1.0f : 1.0f) * rsqrt(max(max(dot(T, T), dot(B, B)), 1e-30f));
-    T *= s;
-    B *= s;
+    float3 T, B;
+    pbrTangentFrame(N, dPdx, dPdy, duvdx, duvdy, T, B);
     const float3 nTS = normalize(float3(-dhduv.x * depth, -dhduv.y * depth, 1.0f));
     return normalize(nTS.x * T + nTS.y * B + nTS.z * N);
 }
@@ -1863,7 +1930,7 @@ float3 pbrPerturb(uint frameMode, float3 N, float3 dPdx, float3 dPdy, float2 duv
     return (frameMode == 1u) ? pbrPerturbSurfGrad(N, dPdx, dPdy, duvdx, duvdy, dhduv, depth)
                              : pbrPerturbCotangent(N, dPdx, dPdy, duvdx, duvdy, dhduv, depth);
 }
-#line 359 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/pbrmaterial.h.fsl"
+#line 381 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/pbrmaterial.h.fsl"
 float2 pbrSpecTerms(float3 N, float3 L, float3 V, float NoL, float NoV, float alpha2)
 {
     const float3 H = normalize(V + L);
@@ -1906,6 +1973,161 @@ float3 pbrF0(float4 param, float3 albedo)
     return lerp(float3(0.04f, 0.04f, 0.04f) * (b * b), albedo, pbrMetalness(param));
 }
 #line 13 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.frag.fsl"
+#line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/parallax.h.fsl"
+#line 42 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/parallax.h.fsl"
+float2 parallaxLimitUV(float3 Vts, float depth, float bias)
+{
+    return (Vts.xy / max(Vts.z + bias, 1e-3f)) * depth;
+}
+
+
+
+
+
+
+
+
+float2 parallaxApplyUV(float2 uvBase, float h, float2 dUV)
+{
+    return uvBase + (h * 2.0f - 1.0f) * dUV;
+}
+#line 71 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/parallax.h.fsl"
+float3 parallaxViewTS(float3 V, float3 T, float3 B, float3 N)
+{
+    return float3(dot(V, T), dot(V, B), dot(V, N));
+}
+#line 93 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/parallax.h.fsl"
+float2 parallaxOffsetUVTex(uint slot, uint clampMode, float2 uv, float3 Vts,
+                           float2 dx, float2 dy, float depth, float bias, uint steps)
+{
+    const float2 dUV = parallaxLimitUV(Vts, depth, bias);
+    float2 uvP = uv;
+    LOOP for (uint i = 0u; i < steps; ++i)
+    {
+        const float h = pbrParamGrad(slot, clampMode, uvP, dx, dy).a;
+        uvP = parallaxApplyUV(uv, h, dUV);
+    }
+    return uvP;
+}
+
+
+
+
+
+float parallaxLandHeight(uint slot, float2 uv, float2 dx, float2 dy)
+{
+    const uint bucket = slot >> 16u;
+    const uint layer = slot & 0xFFFFu;
+    return  gTerrainParamArrays[bucket].SampleGrad(gSamplerAnisotropic, float3(uv, float(layer)), dx, dy) .
+#line 115 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/parallax.h.fsl"
+a;
+}
+
+
+
+
+
+
+
+
+
+
+float2 parallaxOffsetUVLand(uint slot, float2 uv, float3 Vts,
+                            float2 dx, float2 dy, float depth, float bias, uint steps)
+{
+    const float2 dUV = parallaxLimitUV(Vts, depth, bias);
+    float2 uvP = uv;
+    LOOP for (uint i = 0u; i < steps; ++i)
+    {
+        const float h = parallaxLandHeight(slot, uvP, dx, dy);
+        uvP = parallaxApplyUV(uv, h, dUV);
+    }
+    return uvP;
+}
+#line 155 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/parallax.h.fsl"
+float parallaxSoftShadowTex(uint slot, uint clampMode, float2 uv, float2 Lts,
+                            float2 dx, float2 dy, float soften, float scale)
+{
+    const float2 lDir = Lts * scale;
+    const float h0 = 1.0f - pbrParamGrad(slot, clampMode, uv, dx, dy).a;
+    float h = 1.0f - pbrParamGrad(slot, clampMode, uv + 0.20f * lDir, dx, dy).a;
+    h = min(h, 1.0f - pbrParamGrad(slot, clampMode, uv + 0.35f * lDir, dx, dy).a);
+    h = min(h, 1.0f - pbrParamGrad(slot, clampMode, uv + 0.45f * lDir, dx, dy).a);
+    h = min(h, 1.0f - pbrParamGrad(slot, clampMode, uv + 0.55f * lDir, dx, dy).a);
+    return min(1.0f, 1.0f - saturate((h0 - h) * soften));
+}
+
+
+
+
+
+float parallaxLandHeight4(uint4 slots, float4 w, float invW, bool one,
+                          float2 uv, float2 dx, float2 dy)
+{
+    if (one) { return (slots.x != 0u) ? parallaxLandHeight(slots.x, uv, dx, dy) : 0.5f; }
+    float h = 0.0f;
+    if (slots.x != 0u) { h += parallaxLandHeight(slots.x, uv, dx, dy) * w.x; }
+    if (slots.y != 0u) { h += parallaxLandHeight(slots.y, uv, dx, dy) * w.y; }
+    if (slots.z != 0u) { h += parallaxLandHeight(slots.z, uv, dx, dy) * w.z; }
+    if (slots.w != 0u) { h += parallaxLandHeight(slots.w, uv, dx, dy) * w.w; }
+    return h * invW;
+}
+
+
+
+
+
+
+
+float parallaxSoftShadowLand(uint4 slots, float4 w, float invW, bool one, float2 uv, float2 Lts,
+                             float2 dx, float2 dy, float soften, float scale)
+{
+    const float2 lDir = Lts * scale;
+    const float h0 = 1.0f - parallaxLandHeight4(slots, w, invW, one, uv, dx, dy);
+    float h = 1.0f - parallaxLandHeight4(slots, w, invW, one, uv + 0.20f * lDir, dx, dy);
+    h = min(h, 1.0f - parallaxLandHeight4(slots, w, invW, one, uv + 0.35f * lDir, dx, dy));
+    h = min(h, 1.0f - parallaxLandHeight4(slots, w, invW, one, uv + 0.45f * lDir, dx, dy));
+    h = min(h, 1.0f - parallaxLandHeight4(slots, w, invW, one, uv + 0.55f * lDir, dx, dy));
+    return min(1.0f, 1.0f - saturate((h0 - h) * soften));
+}
+#line 220 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/parallax.h.fsl"
+float4 parallaxHeightBlend4(float4 h, float4 w, float strength, float contrast)
+{
+    const float4 b = h + w;
+    const float ma = max(max(b.x, b.y), max(b.z, b.w)) - max(contrast, 1e-4f);
+    const float4 c = max(b - ma, float4(0.0f, 0.0f, 0.0f, 0.0f));
+    const float s = max(c.x + c.y + c.z + c.w, 1e-4f);
+    return lerp(w, c / s, saturate(strength));
+}
+
+
+
+
+
+float4 parallaxLandHeights(uint4 slots, float2 uv, float2 dx, float2 dy)
+{
+    float4 h = float4(0.5f, 0.5f, 0.5f, 0.5f);
+    if (slots.x != 0u) { h.x = parallaxLandHeight(slots.x, uv, dx, dy); }
+    if (slots.y != 0u) { h.y = parallaxLandHeight(slots.y, uv, dx, dy); }
+    if (slots.z != 0u) { h.z = parallaxLandHeight(slots.z, uv, dx, dy); }
+    if (slots.w != 0u) { h.w = parallaxLandHeight(slots.w, uv, dx, dy); }
+    return h;
+}
+
+
+
+
+
+
+
+
+
+float3 parallaxDeltaView(float2 uvShaded, float2 uvBase, float scale)
+{
+    const float2 d = (uvShaded - uvBase) / max(scale, 1e-6f);
+    return float3(saturate(d.x * 0.5f + 0.5f), saturate(d.y * 0.5f + 0.5f), 0.5f);
+}
+#line 14 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.frag.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/a2c.h.fsl"
 #line 53 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/a2c.h.fsl"
 uint a2cCoverageMask(float alpha, float alphaRef)
@@ -1953,7 +2175,7 @@ uint a2cCoverageMaskFaded(float alpha, float alphaRef, float coverScale)
     if (n >= (uint)(samples)) { return ~0u; }
     return (1u << n) - 1u;
 }
-#line 14 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.frag.fsl"
+#line 15 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.frag.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/fpshadow.h.fsl"
 #line 21 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/fpshadow.h.fsl"
 float fpShadowLitAt(int2 tp, int2 tmin, int2 tmax, float thresh, uint dynSlot)
@@ -2035,7 +2257,7 @@ float fpShadowVisibility(float3 P, float3 N, uint slot)
     vis = lerp(1.0f, vis, saturate(tile.w));
     return vis;
 }
-#line 15 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.frag.fsl"
+#line 16 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.frag.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowreceive.h.fsl"
 #line 47 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowreceive.h.fsl"
 int2 shadowMaskPixel(float4 svPos)
@@ -2070,7 +2292,7 @@ int2 shadowMaskPixel(float4 svPos)
     }
     return px;
 }
-#line 16 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.frag.fsl"
+#line 17 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.frag.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/msmrecv.h.fsl"
 #line 45 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/msmrecv.h.fsl"
 float4 UnpackMoments(float4 packedMoments)
@@ -2377,7 +2599,7 @@ float sunShadowVisibility(float3 worldPosRel, float3 N)
 {
     return sunShadowVisibilityMode(worldPosRel, N, 0);
 }
-#line 17 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.frag.fsl"
+#line 18 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.frag.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyamb.h.fsl"
 #line 83 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyamb.h.fsl"
 float skyAOVisibility(float3 worldAbs)
@@ -2493,7 +2715,7 @@ float3 skyAmbFactor(float3 N, float3 worldPosRel)
 
     return lerp(float3(1.0f, 1.0f, 1.0f), max(f, float3(0.0f, 0.0f, 0.0f)), s) * ao;
 }
-#line 18 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.frag.fsl"
+#line 19 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.frag.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/tonemap.h.fsl"
 #line 32 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/tonemap.h.fsl"
 float3 tonemap(float3 c)
@@ -2508,7 +2730,7 @@ float3 inverseTonemap(float3 d)
     float3 s = sqrt(max(1.0f - clamp(d, 0.0f, 1.0f), 0.0f));
     return (1.0f - s) * (1.7636304f + s * (-0.4027722f + s * 0.4084603f));
 }
-#line 19 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.frag.fsl"
+#line 20 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.frag.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/linearize.h.fsl"
 #line 39 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/linearize.h.fsl"
 float3 srgbToLinear(float3 c)
@@ -2541,7 +2763,7 @@ float3 mod2xLinear(float3 tLinear)
 {
     return srgbToLinear(2.0f * linearToSrgb(tLinear));
 }
-#line 20 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.frag.fsl"
+#line 21 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.frag.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/aomultibounce.h.fsl"
 #line 41 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/aomultibounce.h.fsl"
 float3 gtaoMultiBounce(float visibility, float3 albedoIn)
@@ -2585,7 +2807,7 @@ float3 aoAmbientTermProxy(float visibility, uint aoFlags)
     return aoAmbientTerm(visibility, float3( 0.5f ,  0.5f ,  0.5f ),
                          aoFlags);
 }
-#line 21 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.frag.fsl"
+#line 22 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.frag.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/scenecolor.h.fsl"
 #line 113 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/scenecolor.h.fsl"
 float3 tonemapInPass(float3 c)
@@ -2689,7 +2911,7 @@ float3 expandExposedEmissiveDelta(float3 emis, float3 albedoRgb, float cov)
 {
     return expandExposedEmissive(emis, albedoRgb, cov) - emis;
 }
-#line 22 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.frag.fsl"
+#line 23 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.frag.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skydome.h.fsl"
 #line 54 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skydome.h.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/waterfog.h.fsl"
@@ -3506,7 +3728,7 @@ float3 applyFog(float3 lit, float3 worldPosRel, float2 pixelXy, float fog)
 
     return lerp(fogSkyTarget(s, fogSkyShare(fogAir)), behind, fogAir);
 }
-#line 23 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.frag.fsl"
+#line 24 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.frag.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/enchantglow.h.fsl"
 #line 78 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/enchantglow.h.fsl"
 float3 enchantCamRight() { return normalize(gFrameData.viewProj[0].xyz); }
@@ -3550,7 +3772,7 @@ float3 enchantGlow(float3 N, float3 worldPos, bool glowing)
 
     return SampleTex2D(gTextures[slot], gSamplerAnisoClampClamp, uv).rgb * enchantTint() * k;
 }
-#line 24 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.frag.fsl"
+#line 25 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.frag.fsl"
 
 STRUCT(VSOutput)
 {
@@ -3574,7 +3796,7 @@ STRUCT(VSOutput)
 
 
     DATA(FLAT(uint), ParamIndex, TEXCOORD12);
-#line 47
+#line 48
 };
 
 [RootSignature( "RootFlags(ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT)," "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "3" ", offset = 0)," "CBV(b0, numDescriptors = unbounded, space = " "3" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "3" ", offset = 0))," "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "2" ", offset = 0)," "CBV(b0, numDescriptors = unbounded, space = " "2" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "2" ", offset = 0))," "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "1" ", offset = 0)," "CBV(b0, numDescriptors = unbounded, space = " "1" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "1" ", offset = 0))," "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "0" ", offset = 0)," "CBV(b0, numDescriptors = unbounded, space = " "0" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "0" ", offset = 0))," "DescriptorTable(" "SAMPLER(s0, numDescriptors = unbounded, space = " "0" ", offset = 0))," "StaticSampler(s0, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s1, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s2, space = 100," "filter = FILTER_MIN_MAG_LINEAR_MIP_POINT," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s3, space = 100," "filter = FILTER_MIN_MAG_LINEAR_MIP_POINT," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s4, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s5, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s6, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT," "addressU = TEXTURE_ADDRESS_MIRROR, addressV = TEXTURE_ADDRESS_MIRROR, addressW = TEXTURE_ADDRESS_MIRROR)," "StaticSampler(s7, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT, borderColor = STATIC_BORDER_COLOR_TRANSPARENT_BLACK," "addressU = TEXTURE_ADDRESS_BORDER, addressV = TEXTURE_ADDRESS_BORDER, addressW = TEXTURE_ADDRESS_BORDER)," "StaticSampler(s8, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR," "addressU = TEXTURE_ADDRESS_MIRROR, addressV = TEXTURE_ADDRESS_MIRROR, addressW = TEXTURE_ADDRESS_MIRROR)," "StaticSampler(s9, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR, borderColor = STATIC_BORDER_COLOR_TRANSPARENT_BLACK," "addressU = TEXTURE_ADDRESS_BORDER, addressV = TEXTURE_ADDRESS_BORDER, addressW = TEXTURE_ADDRESS_BORDER)," "StaticSampler(s10, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 8," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s11, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 8," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s12, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 8," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s13, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 8," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s14, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 2," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s15, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 2," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s16, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 2," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s17, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 2," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_WRAP)" )]
@@ -3582,7 +3804,7 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
 {
     //INIT_MAIN;
     float3 N = normalize(In.Normal);
-#line 65 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.frag.fsl"
+#line 66 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.frag.fsl"
     const float3 pbrDPdx = ddx(In.WorldPos);
     const float3 pbrDPdy = ddy(In.WorldPos);
     const float2 pbrDUVdx = ddx(In.Uv);
@@ -3596,15 +3818,64 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
     float3 pbrSpecB = float3(0.0f, 0.0f, 0.0f);
     float3 pbrTSun = float3(1.0f, 1.0f, 1.0f);
     float3 pbrTAmb = float3(1.0f, 1.0f, 1.0f);
+
+
+
+
+
+
+
+
+
+
+    float2 pbrUv = In.Uv;
+    float pbrParaSh = 1.0f;
+    bool paraLive = false;
+    bool paraShOn = false;
     if (pbrOn)
     {
         const int2 psz = GetDimensions(gTextures[In.ParamIndex], NO_SAMPLER);
         const float2 size0 = max(float2(psz), float2(1.0f, 1.0f));
-        pbrParam = pbrParamGrad(In.ParamIndex, In.ClampMode, In.Uv, pbrDUVdx, pbrDUVdy);
+
+
+        const bool paraArm = (gShadowParams.parallax.x != 0.0f);
+        const uint paraSteps = (uint)gShadowParams.parallax2.x;
+        paraLive = paraArm && (paraSteps > 0u);
+        paraShOn = paraArm && (gShadowParams.parallax2.y != 0.0f);
+        if (paraArm)
+        {
+
+
+
+
+            float3 T, B;
+            pbrTangentFrame(pbrNg, pbrDPdx, pbrDPdy, pbrDUVdx, pbrDUVdy, T, B);
+            const float3 vDir = normalize(gFrameData.eyePos.xyz - In.WorldPos);
+            if (paraLive)
+            {
+                const float3 Vts = parallaxViewTS(vDir, T, B, pbrNg);
+                pbrUv = parallaxOffsetUVTex(In.ParamIndex, In.ClampMode, In.Uv, Vts,
+                                            pbrDUVdx, pbrDUVdy,
+                                            gShadowParams.parallax.z, gShadowParams.parallax.w,
+                                            paraSteps);
+            }
+            if (paraShOn)
+            {
+
+
+
+                const float3 Lts = parallaxViewTS(-gFrameData.sunDir.xyz, T, B, pbrNg);
+                pbrParaSh = parallaxSoftShadowTex(In.ParamIndex, In.ClampMode, pbrUv, Lts.xy,
+                                                  pbrDUVdx, pbrDUVdy,
+                                                  gShadowParams.parallax2.z,
+                                                  gShadowParams.parallax2.w);
+            }
+        }
+        pbrParam = pbrParamGrad(In.ParamIndex, In.ClampMode, pbrUv, pbrDUVdx, pbrDUVdy);
 
 
         const uint gradMode = (uint)gShadowParams.pbrParams.x;
-        const float2 dhduv = pbrHeightGradUV(gradMode, In.ParamIndex, In.ClampMode, In.Uv,
+        const float2 dhduv = pbrHeightGradUV(gradMode, In.ParamIndex, In.ClampMode, pbrUv,
                                              pbrDUVdx, pbrDUVdy, size0, gShadowParams.pbrParams.w);
         N = pbrPerturb((uint)gShadowParams.pbrParams.y, N, pbrDPdx, pbrDPdy, pbrDUVdx, pbrDUVdy,
                        dhduv, gShadowParams.pbrParams.z);
@@ -3637,7 +3908,7 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
 
 
     bool inReflect = (gFrameData.gReflWaterClip.z != 0.0f);
-#line 147 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.frag.fsl"
+#line 197 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.frag.fsl"
     uint dbgMode = (uint)(gFrameData.debugParams.x + 0.5f);
     bool aoUsed = ((aoFlags & 3u) != 0u) || dbgMode == 3u || dbgMode == 4u;
     bool isFP = (gFrameData.alphaShadowParams.z > 0.5f);
@@ -3651,7 +3922,7 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
 
     float4 aoSample = aoValid ? LoadTex2D(gAO, NO_SAMPLER, srcPx, 0)
                               : float4(0.0f, 0.0f, 0.0f, 1.0f);
-#line 179 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.frag.fsl"
+#line 229 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.frag.fsl"
     if ((aoFlags & 2u) != 0u && aoValid) {
         float3 bn = N * aoSample.a + aoSample.rgb;
         float bl2 = dot(bn, bn);
@@ -3671,6 +3942,14 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
 
 
     float sunVis = sunShadowVisibility(In.WorldPos, normalize(In.Normal));
+
+
+
+
+
+
+
+    if (paraShOn) { sunVis *= pbrParaSh; }
 
 
     float3 d = gFrameData.sunCol.rgb * ndl * sunVis;
@@ -3855,21 +4134,26 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
         }
     }
     d *= gFrameData.dbgScales.y;
-#line 396 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.frag.fsl"
+#line 454 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.frag.fsl"
     float3 emis = ((In.VColSource == 1u) ? In.Color.rgb : In.MatEmissive)
                 * gShadowParams.calParams.x;
-#line 412 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.frag.fsl"
-    float4 albedo = sampleBase(In.TexIndex, In.ClampMode, In.Uv, useLowAF(In.AlphaRef, false));
-
-
-
-
-
-
-
-
+#line 480 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.frag.fsl"
+    float4 albedo;
+    if (paraLive) {
+        albedo = sampleBaseGrad(In.TexIndex, In.ClampMode, pbrUv, pbrDUVdx, pbrDUVdy,
+                                useLowAF(In.AlphaRef, false));
+    } else {
+        albedo = sampleBase(In.TexIndex, In.ClampMode, In.Uv, useLowAF(In.AlphaRef, false));
+    }
+#line 498 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.frag.fsl"
     if (In.OverlayIndex != 0u) {
-        float3 ov = SampleTex2D(gTextures[In.OverlayIndex], gSamplerAnisotropic, In.Uv).rgb;
+        float3 ov;
+        if (paraLive) {
+            ov = SampleGradTex2D(gTextures[In.OverlayIndex], gSamplerAnisotropic, pbrUv,
+                                 pbrDUVdx, pbrDUVdy).rgb;
+        } else {
+            ov = SampleTex2D(gTextures[In.OverlayIndex], gSamplerAnisotropic, In.Uv).rgb;
+        }
         albedo.rgb = lerp(albedo.rgb, ov, In.Color.a);
     }
 
@@ -3885,7 +4169,7 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
     if (pbrOn) { const float kd = 1.0f - pbrMetalness(pbrParam); d *= kd; a *= kd; }
     float3 lit = (In.VColSource == 2u) ? (In.Color.rgb * (d + a) + emis)
                                        : (In.MatDiffuse * d + In.MatAmbient * a + emis);
-#line 452 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.frag.fsl"
+#line 535 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.frag.fsl"
     if (a2cCoverageMask(albedo.a, In.AlphaRef) == 0u) { discard; }
 
     albedo.rgb *= gFrameData.dbgScales.z;
@@ -3974,6 +4258,18 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
         float t = saturate((float)litCount / 8.0f);
         float3 heat = saturate(float3(t * 2.0f, 1.0f - abs(t - 0.5f) * 2.0f, 1.0f - t * 2.0f));
         return (float4(litCount == 0u ? float3(0.0f, 0.0f, 0.0f) : heat, 1.0f));
+    }
+    if (dbg == 25u) {
+
+
+
+
+
+        return (float4(parallaxDeltaView(pbrUv, In.Uv, gShadowParams.parallax.z), 1.0f));
+    }
+    if (dbg == 26u) {
+
+        return (float4(0.10f, 0.10f, 0.11f, 1.0f));
     }
     if (dbg == 1u || dbg == 2u) {
         float dist = length(In.WorldPos - gFrameData.eyePos.xyz);

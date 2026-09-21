@@ -6,32 +6,53 @@
 // per [[feedback_vtf_over_cpu_baking]]. Displacement and erosion later drop into this same fetch
 // with no data-format change.
 //
-// LOD is index-buffer STRIDE (1/2/4/8/16/32 over the 65x65 lattice), picked per cell by distance on
-// the CPU. Cracks between neighbouring cells at different strides are closed by EDGE STITCHING, not
-// by skirts: a boundary vertex whose neighbour is coarser resamples its height on the neighbour's
-// lattice, so the two cells' shared edge is literally the same polyline. Corners never move (0 and
-// 64 are multiples of every power-of-two stride), so the two axes can never fight over one vertex.
+// LOD is an index-buffer RUNG, picked per DRAWN UNIT on the CPU. Rung 4 is the BASE lattice — one
+// step = one 65x65 lattice unit = 128 world units — and every other rung is expressed against it as
+// `step = exp2(rung - TERRAIN_BASE_RUNG)`: rungs 5..9 skip lattice points (256..4096 u, the old
+// strides 2..32) and rungs 0..3 SUBDIVIDE between them (8, 16, 32 and 64 u). Nothing requires a
+// vertex to land on an integer lattice point; see loadHeightTri.
+//
+// ─── PHASE 4b: THE DRAWN UNIT IS NOT ALWAYS A CELL ────────────────────────────────────
+// Two template families share this VS and this VB/IB. A CELL instance spans 64 base quads (8192 u)
+// and carries rungs 4..9; a PATCH instance spans 4 base quads (512 u) and carries rungs 0..4, i.e.
+// 8..128 u. The patch exists because a rung used to be a whole-cell property while the thing the
+// fine lattice resolves is a ~1500-unit disc: at 4b-lite's 32 u, ~90% of the new triangles landed
+// where 32 u is sub-pixel, and the measured cost was quad OVERSHADING, not vertex work.
+//
+// The decode is one expression for both families: `In.Grid` is the template's own lattice (0..span)
+// and `Inst1.y` carries the patch origin in base quads, so `lattice = origin + Grid` puts every
+// vertex back into CELL-lattice coordinates. Everything downstream — loadHeightTri, loadHeightWide,
+// the corner normals, the texture-square resolve, the displacement uv and Out.Lattice — already
+// works in those coordinates and is untouched.
+//
+// Cracks between neighbouring UNITS at different rungs are closed by EDGE STITCHING, not by skirts:
+// a boundary vertex whose neighbour is coarser resamples its height on the neighbour's lattice, so
+// the two units' shared edge is literally the same polyline. Corners never move (the span's ends are
+// multiples of every rung's step, and all of them are exactly representable), so the two axes can
+// never fight over one vertex.
 //
 // Camera-relative like the rest of the live frame: the CPU passes each cell's origin already
 // shifted by -eye (absolute cell origins reach ~400k units, where float32 starts to shake — see
 // [[project_forge_precision_far_origin]]); only Z is shifted here, against gFrameData.lodEye.
 
 #include "opaque.srt.h"
-#include "fog.h.fsl"    // mwFogFactor() — ONE fog law for every stage
+#include "fog.h.fsl"          // mwFogFactor() — ONE fog law for every stage
+// The carve, the lattice geometry constants, terrainCellAt and the texture-square resolve. SHARED
+// with grass.vert, which stands on the same ground and must agree about where it is.
+#include "terraindisp.h.fsl"
 
-#define TERRAIN_VERTS   65
-#define TERRAIN_QUADS   64
-#define TERRAIN_SPACING 128.0f    // world units between LAND vertices
 #define TERRAIN_HSCALE  8.0f      // VHGT units -> world units
 #define TERRAIN_HSTRIDE 2113u     // uints per cell in gTerrainHeights (4225 int16, 2 per uint)
 #define TERRAIN_CSTRIDE 4225u     // uints per cell in gTerrainColor  (one 0x00BBGGRR per vertex)
 
 STRUCT(VSInput)
 {
-    DATA(float2, Grid,   POSITION);    // lattice coords (gx, gy) in 0..64, multiples of the LOD stride
-    DATA(float2, Origin, TEXCOORD1);   // per-instance: cell origin XY, ALREADY camera-relative
-    DATA(uint4,  Inst0,  TEXCOORD2);   // per-instance: slot, stride, packed neighbour strides, local XY
-    DATA(uint2,  Inst1,  TEXCOORD3);   // per-instance: packed grid span, flags
+    DATA(float2, Grid,   POSITION);    // TEMPLATE lattice coords, 0..span, multiples of the rung's step
+    DATA(float2, Origin, TEXCOORD1);   // per-instance: CELL origin XY, ALREADY camera-relative
+    DATA(uint4,  Inst0,  TEXCOORD2);   // per-instance: slot, RUNG, packed neighbour rungs, local XY
+    // per-instance: packed grid span | patch origin. y = originX | originY<<8 | isPatch<<16, in BASE
+    // QUADS (0..60 step 4) — a lane that was a literal 0 called "flags", so 4b cost no stride change.
+    DATA(uint2,  Inst1,  TEXCOORD3);
 };
 
 STRUCT(VSOutput)
@@ -45,8 +66,9 @@ STRUCT(VSOutput)
     // extrapolates a non-centroid interpolator past the triangle and speckles the shading.
     // See [[project_forge_centroid_interpolators]].
     DATA(CENTROID(float),  Fog,   TEXCOORD2);
-    // CONTINUOUS lattice coords (0..64 within this cell). The frag reconstructs Morrowind's own
-    // per-vertex texture-square assignment from these, so they must interpolate smoothly.
+    // CONTINUOUS CELL-lattice coords (0..64 within this cell) — a patch's are offset by its origin,
+    // so both families speak the same space. The frag reconstructs Morrowind's own per-vertex
+    // texture-square assignment from these, so they must interpolate smoothly.
     DATA(float2, Lattice,  TEXCOORD3);
     DATA(FLAT(uint4), Cell, TEXCOORD4);           // slot, localX, localY, packed grid span
     // Below-water clip for the reflect pass; pass-all (0,0,0,1) in every other frame cbuffer,
@@ -54,14 +76,7 @@ STRUCT(VSOutput)
     DATA(float,  Clip,     SV_ClipDistance0);
 };
 
-// World-grid cell lookup: local grid coords -> slot+1, 0 when that cell has no LAND record (or is
-// off the map). One flat table replaces plumbing per-neighbour slots through the instance, and it
-// reaches DIAGONALLY, which the frag's texture-square wrap needs at cell corners.
-uint terrainCellAt(int lx, int ly, uint spanX, uint spanY)
-{
-    if (lx < 0 || ly < 0 || lx >= (int)spanX || ly >= (int)spanY) { return 0u; }
-    return gTerrainCellGrid[(uint)ly * spanX + (uint)lx];
-}
+// (terrainCellAt lives in terraindisp.h.fsl — grass.vert needs it too.)
 
 // One vertex's height, in WORLD units. Heights are int16 packed two per uint.
 float loadHeight(uint slot, int x, int y)
@@ -72,6 +87,47 @@ float loadHeight(uint slot, int x, int y)
     int  h    = (int)h16;
     if (h > 32767) { h -= 65536; }                // sign-extend the int16
     return (float)h * TERRAIN_HSCALE;
+}
+
+// ─── HEIGHT AT A FRACTIONAL LATTICE COORD ────────────────────────────────────────
+// Rungs below the base place vertices BETWEEN lattice points, so they need a height there — and it
+// must be the height of MW's own surface, not a bilinear patch through the same four corners. The
+// two differ everywhere inside a quad, and that difference is a CRACK against any neighbour still
+// on the base lattice and a POP every time a unit changes rung.
+//
+// The index buffer splits each quad (a,b,c) + (b,d,c) — the diagonal runs b–c, which is u + v = 1 —
+// and the fine rungs' own quads are a refinement of that split: a sub-quad at (i,j) of an N-way
+// subdivision has its diagonal on (u - i/N) + (v - j/N) = 1/N, which for the straddling row
+// i + j = N-1 is exactly u + v = 1. So every fine triangle lies wholly inside one coarse triangle,
+// and evaluating that triangle's PLANE here reproduces the coarse surface exactly rather than
+// approximately. That is what makes the acceptance gate ("no displacement ⇒ no change") a property
+// of the geometry instead of a hope.
+//
+// Both branches agree on u + v = 1 (each reduces to hb*u + hc*(1-u)), so the surface is C0 across
+// the diagonal. And on an INTEGER coord this returns loadHeight() bit for bit: u = v = 0 leaves
+// `ha + (hb-ha)*0 + (hc-ha)*0`, and the x0+1/y0+1 clamp keeps gx == 64 at u == 0 rather than
+// reaching it as `ha + (hb - ha)` — which is the same value only in exact arithmetic.
+float loadHeightTri(uint slot, float fx, float fy)
+{
+    const int   x0 = (int)floor(fx), y0 = (int)floor(fy);       // 0..64
+    const int   x1 = min(x0 + 1, TERRAIN_QUADS);
+    const int   y1 = min(y0 + 1, TERRAIN_QUADS);
+    const float u  = fx - float(x0), v = fy - float(y0);        // 0 on the far edge, by the clamp
+    const float ha = loadHeight(slot, x0, y0);
+    const float hb = loadHeight(slot, x1, y0);
+    const float hc = loadHeight(slot, x0, y1);
+    const float hd = loadHeight(slot, x1, y1);
+    return (u + v <= 1.0f) ? (ha + (hb - ha) * u + (hc - ha) * v)
+                           : (hd + (hc - hd) * (1.0f - u) + (hb - hd) * (1.0f - v));
+}
+
+// One fetch for both halves of the ladder. `fine` is the rung's own property (rung < the base), so
+// it is UNIFORM across a draw — the rungs are grouped into one instanced draw each. It is here for COST,
+// not correctness: loadHeightTri already agrees with loadHeight to the bit on integer coords, but it
+// issues four loads to do it, and the coarse ladder is every terrain vertex in the world.
+float loadHeightAt(uint slot, float fx, float fy, bool fine)
+{
+    return fine ? loadHeightTri(slot, fx, fy) : loadHeight(slot, (int)fx, (int)fy);
 }
 
 // Height at a lattice coord that may fall ONE step outside this cell (normals only). Crossing into
@@ -96,74 +152,211 @@ float loadHeightWide(uint slot, int lx, int ly, uint spanX, uint spanY, int x, i
     return loadHeight(slot, x, y);
 }
 
+// The TRUE normal at one integer lattice point, by central difference at the FULL-RESOLUTION step
+// (1), never at the rung's step. The sample rate of the shading data is deliberately decoupled from
+// the mesh's: at rung 6 a rung-6 difference averages the gradient over 2048 world units and the
+// terrain shades flat at exactly the distance you are looking at most of it. Step 1 gives each
+// lattice point the normal MW's own per-vertex normal carries, for the same 4 loads.
+float3 terrainCornerNormal(uint slot, int lx, int ly, uint spanX, uint spanY, int x, int y)
+{
+    const float hL = loadHeightWide(slot, lx, ly, spanX, spanY, x - 1, y);
+    const float hR = loadHeightWide(slot, lx, ly, spanX, spanY, x + 1, y);
+    const float hD = loadHeightWide(slot, lx, ly, spanX, spanY, x, y - 1);
+    const float hU = loadHeightWide(slot, lx, ly, spanX, spanY, x, y + 1);
+    const float d  = 2.0f * TERRAIN_SPACING;
+    return normalize(float3(-(hR - hL) / d, -(hU - hD) / d, 1.0f));
+}
+
+// ─── PHASE 4a: NEAR-CAMERA DISPLACEMENT (tasks/forge-parallax.md, D6) ───────────────────────────
+// THE ONE PROPERTY THAT MAKES THIS TRACTABLE HERE: this is the ONLY vertex shader that positions
+// terrain. Colour, the PS-less Z-prepass, the sun-shadow caster, the reflection mirror and the
+// wireframe debug pipeline are all built from this same compiled entry point, so a displacement
+// written here reaches every pass with no further edits. The DX9 side paid for the alternative
+// twice — its history carries `dd11154b "displacement in depth broken"` and `9b02c18f "displaced
+// terrain in depth: prebuild cache + dedicated VS"`.
+//
+// ⚠ WHAT 4a IS AND IS NOT. The base lattice is 65x65 per cell = **128 world units between
+// vertices**; DX9 subdivided to 8 units inner / 16 outer. Displacing THAT lattice gives large-scale
+// undulation, NOT silhouette detail. **4b-lite** bought back two rungs of it whole-cell (64 u and
+// 32 u), and measured +0.13 ms of PIXEL-stage cost for triangles that mostly landed outside the
+// disc. **4b** (this file's patch family) reaches DX9's own inner figure — 8 u — by making the
+// drawn unit 512 units instead of 8192, so the triangles land only where the carve is.
+//
+// 4a's two open questions are 4b's too, and one of them is now ANSWERED: GRASS follows, because
+// grass.vert applies this same carve at the blade root out of terraindisp.h.fsl. The other is not:
+// the player-relative fade boundary still has no motion vector of its own (motionvectors.comp
+// reconstructs from depth and reprojects by CAMERA motion only), so it can ghost under TAA/DLSS.
+//
+// (SampleLvlDispArray, the texture-square resolve and terrainDispZ live in terraindisp.h.fsl —
+//  grass.vert calls all three.)
+
 ROOT_SIGNATURE(DefaultRootSignature)
 VSOutput VS_MAIN( VSInput In )
 {
     INIT_MAIN;
     VSOutput Out;
 
-    const int  gx     = (int)In.Grid.x;
-    const int  gy     = (int)In.Grid.y;
-    const uint slot   = In.Inst0.x;
-    const uint stride = In.Inst0.y;
-    const uint nbrS   = In.Inst0.z;    // neighbour strides, one byte each: -X, +X, -Y, +Y
-    const int  lx     = (int)(In.Inst0.w & 0xFFFFu);          // this cell's world-grid coords...
-    const int  ly     = (int)(In.Inst0.w >> 16u);
-    const uint spanX  = In.Inst1.x & 0xFFFFu;                 // ...and the grid's dimensions
-    const uint spanY  = In.Inst1.x >> 16u;
+    const uint  slot   = In.Inst0.x;
+    const uint  rung   = In.Inst0.y;   // 0..9; step = exp2(rung - TERRAIN_BASE_RUNG)
+    const uint  nbrR   = In.Inst0.z;   // neighbour RUNGS, one byte each: -X, +X, -Y, +Y
+    const int   lx     = (int)(In.Inst0.w & 0xFFFFu);         // this cell's world-grid coords...
+    const int   ly     = (int)(In.Inst0.w >> 16u);
+    const uint  spanX  = In.Inst1.x & 0xFFFFu;                // ...and the grid's dimensions
+    const uint  spanY  = In.Inst1.x >> 16u;
+
+    // ── PHASE 4b: WHICH UNIT IS THIS, AND WHERE IN THE CELL ──────────────────────────────
+    // One decode for both families. `In.Grid` is the TEMPLATE's own lattice, 0..span; the patch
+    // origin puts it back into CELL-lattice coords, which is the space every line below works in.
+    // A cell instance has origin (0,0) and span 64, so it reduces to what it always was.
+    const uint  flags   = In.Inst1.y;
+    const bool  isPatch = (flags & 0x10000u) != 0u;
+    const float2 base   = float2(float(flags & 0xFFu), float((flags >> 8u) & 0xFFu));
+    const float span    = isPatch ? float(TERRAIN_PATCH_QUADS) : float(TERRAIN_QUADS);
+    const float gxf     = base.x + In.Grid.x;   // FRACTIONAL below the base rung
+    const float gyf     = base.y + In.Grid.y;
+
+    // A rung BELOW the base lattice subdivides it, so this vertex may sit between lattice points.
+    // Uniform per draw (rungs are grouped into one instanced draw each), and it gates the two
+    // things that get more expensive off the base lattice: the height fetch and the normal.
+    // It is the FAMILY-independent test: a patch at the base rung has integer coords too, because
+    // its origin is a multiple of TERRAIN_PATCH_QUADS.
+    const bool  fine   = (float(rung) < TERRAIN_BASE_RUNG);
 
     // --- Edge stitch: resample onto the COARSER neighbour's lattice so the shared edge matches. ---
-    uint snap = stride;
-    uint axis = 0u;                    // 0 = interior, 1 = snap along X, 2 = snap along Y
-    if (gy == 0)                  { uint s = (nbrS >> 16u) & 0xFFu; if (s > snap) { snap = s; axis = 1u; } }
-    else if (gy == TERRAIN_QUADS) { uint s = (nbrS >> 24u) & 0xFFu; if (s > snap) { snap = s; axis = 1u; } }
-    if (gx == 0)                  { uint s = (nbrS       ) & 0xFFu; if (s > snap) { snap = s; axis = 2u; } }
-    else if (gx == TERRAIN_QUADS) { uint s = (nbrS >>  8u) & 0xFFu; if (s > snap) { snap = s; axis = 2u; } }
+    // The packed byte is the RUNG, not the step, because a fractional step does not fit in a byte
+    // and the rung is monotone in coarseness anyway — so the test that used to read `s > snap` reads
+    // `nr > snapR` and means the same thing. The arithmetic below then runs in floats, which is
+    // exact for every value it sees: the steps are powers of two and the span's ends are
+    // representable.
+    //
+    // ⚠ THE TEST IS ON THE DRAWN UNIT'S EDGE (In.Grid vs 0 and `span`), NOT ON THE CELL'S. This is
+    // the one real trap in 4b: a patch at origin (0,0) whose Grid runs 0..4 would, tested in cell
+    // coords, read as sitting on the cell's −X/−Y edge and snap to the wrong neighbour — while a
+    // patch at origin (60,60) would never think it was on an edge at all.
+    uint  snapR = rung;
+    uint  axis  = 0u;                  // 0 = interior, 1 = snap along X, 2 = snap along Y
+    if (In.Grid.y == 0.0f)        { uint nr = (nbrR >> 16u) & 0xFFu; if (nr > snapR) { snapR = nr; axis = 1u; } }
+    else if (In.Grid.y == span)   { uint nr = (nbrR >> 24u) & 0xFFu; if (nr > snapR) { snapR = nr; axis = 1u; } }
+    if (In.Grid.x == 0.0f)        { uint nr = (nbrR       ) & 0xFFu; if (nr > snapR) { snapR = nr; axis = 2u; } }
+    else if (In.Grid.x == span)   { uint nr = (nbrR >>  8u) & 0xFFu; if (nr > snapR) { snapR = nr; axis = 2u; } }
 
     float h;
-    if (axis == 1u) {
-        int   x0 = (gx / (int)snap) * (int)snap;
-        int   x1 = min(x0 + (int)snap, TERRAIN_QUADS);
-        float t  = float(gx - x0) / float(snap);
-        h = lerp(loadHeight(slot, x0, gy), loadHeight(slot, x1, gy), t);
-    } else if (axis == 2u) {
-        int   y0 = (gy / (int)snap) * (int)snap;
-        int   y1 = min(y0 + (int)snap, TERRAIN_QUADS);
-        float t  = float(gy - y0) / float(snap);
-        h = lerp(loadHeight(slot, gx, y0), loadHeight(slot, gx, y1), t);
+    if (axis != 0u) {
+        // The neighbour is coarser, so its step is the one both sides must land on. A rung-0 vertex
+        // snapping to a rung-1 neighbour lands on HALF-step lattice coords, which is exactly the
+        // case loadHeightTri exists for — hence `fine` rather than `false` here.
+        //
+        // ⚠ THE RESAMPLE RUNS IN CELL-LATTICE COORDS AND CLAMPS TO THE CELL, NOT TO THE PATCH. Every
+        // rung's step divides 4, and a patch origin is a multiple of 4, so a coarser neighbour's
+        // lattice points are multiples of `snap` measured from the CELL's own zero — in both
+        // families. Clamping a1 to the patch instead would be wrong wherever the neighbour is
+        // coarser than the patch is wide: a rung-5 (256 u) neighbour's lattice spans TWO patches,
+        // and the far end of the segment this vertex sits on lies outside this patch by
+        // construction. The clamp that IS needed is the cell one, so loadHeight never indexes past
+        // a row of gTerrainHeights.
+        const float snap = exp2(float(snapR) - TERRAIN_BASE_RUNG);
+        const float g    = (axis == 1u) ? gxf : gyf;
+        const float a0   = floor(g / snap) * snap;
+        const float a1   = min(a0 + snap, float(TERRAIN_QUADS));
+        const float t    = (g - a0) / snap;
+        h = (axis == 1u) ? lerp(loadHeightAt(slot, a0, gyf, fine), loadHeightAt(slot, a1, gyf, fine), t)
+                         : lerp(loadHeightAt(slot, gxf, a0, fine), loadHeightAt(slot, gxf, a1, fine), t);
     } else {
-        h = loadHeight(slot, gx, gy);
+        h = loadHeightAt(slot, gxf, gyf, fine);
     }
 
     // Camera-relative position. NO z-sink: unlike the DL world bake this mesh is native resolution,
     // so it has nothing to hide under (XE Mod Landscape.fx's landBias existed only because the
     // decimated mesh disagreed with MW's near land — see tasks/forge-near-far-unify.md).
     float3 worldPos;
-    worldPos.x = In.Origin.x + float(gx) * TERRAIN_SPACING;
-    worldPos.y = In.Origin.y + float(gy) * TERRAIN_SPACING;
+    worldPos.x = In.Origin.x + gxf * TERRAIN_SPACING;
+    worldPos.y = In.Origin.y + gyf * TERRAIN_SPACING;
     worldPos.z = h - gFrameData.lodEye.z;
 
-    // Normal by central difference at the FULL-RESOLUTION step (1), never at the LOD stride. The
-    // sample rate of the shading data is deliberately decoupled from the mesh's: at stride 16 a
-    // stride-16 difference averages the gradient over 2048 world units and the terrain shades flat
-    // at exactly the distance you are looking at most of it. Stride 1 gives each drawn vertex its
-    // TRUE normal — the same one MW's own per-vertex normal carries — for the same 4 loads, and the
-    // rasterizer interpolates between them. Free, and it is parity rather than embellishment.
+    // Distance to the eye. HOISTED above the fog line it used to sit on, because the displacement
+    // below needs it — and it is deliberately measured on the UNDISPLACED position: the fog ramp
+    // must not move when a knob carves 6 units out of the ground under the player's feet, and 6
+    // units against a fog band of thousands is not a distance the ramp can see anyway.
+    float dist = length(worldPos - gFrameData.eyePos.xyz);
+
+    // ─── PHASE 4a: near-camera displacement (terraindisp.h.fsl) ────────────────────────
+    // Armed by a cbuffer scalar, so with it off this is one uniform branch and not a texture fetch.
+    if (gShadowParams.terrainDisp.x != 0.0f)
     {
-        const float hL = loadHeightWide(slot, lx, ly, spanX, spanY, gx - 1, gy);
-        const float hR = loadHeightWide(slot, lx, ly, spanX, spanY, gx + 1, gy);
-        const float hD = loadHeightWide(slot, lx, ly, spanX, spanY, gx, gy - 1);
-        const float hU = loadHeightWide(slot, lx, ly, spanX, spanY, gx, gy + 1);
-        const float d  = 2.0f * TERRAIN_SPACING;
-        Out.Normal = normalize(float3(-(hR - hL) / d, -(hU - hD) / d, 1.0f));
+        // ⚠ NEVER ON A STITCHED VERTEX, and this is the crack guard, not a shortcut. A boundary
+        // vertex whose neighbour is COARSER has already resampled its height onto the neighbour's
+        // lattice so the two units share one polyline; displacing it would pull it off that line
+        // and open a hole, because the neighbour has no vertex there to follow it. Skipping instead
+        // leaves the vertex exactly on the shared edge and merely stretches the triangle behind it,
+        // which is a legal C0 surface with no gap. Since 4b-lite it costs nothing at all, and 4b
+        // keeps that property one granularity down: a UNIT (cell or patch) takes a fine rung exactly
+        // when the displacement disc TOUCHES it, so a coarser neighbour is by construction a unit
+        // the disc does not reach, and every vertex on the edge they share already has fade == 0.
+        //
+        // That identity is also why the FADE END carries the hard ceiling and the derived patch set
+        // does not: capping the SET would leave a fine unit beside a coarse one with fade > 0 on
+        // the edge between them, which is precisely the crack this guard cannot close.
+        if (axis == 0u)
+        {
+            // 1 inside the radius, smoothly to 0 by the fade end. SMOOTHSTEP and not a linear ramp:
+            // a linear fade has a slope discontinuity at both ends, and a crease in the GROUND that
+            // follows the player is exactly the artifact this phase is watching for under TAA.
+            const float r0 = gShadowParams.terrainDisp2.x;
+            const float r1 = max(gShadowParams.terrainDisp2.y, r0 + 1.0f);
+            const float fade = 1.0f - smoothstep(r0, r1, dist);
+            if (fade > 0.0f)
+            {
+                // D5: the band-limit follows the rung (terrainDispLevel). The knob means "the right
+                // level for the BASE lattice", so a rung three octaves finer reads three levels
+                // finer — ONE knob that keeps meaning one thing at every rung instead of splitting
+                // into five. D6's four-square blend is terrainCarveAt, shared with grass.vert.
+                worldPos.z += fade * terrainCarveAt(lx, ly, spanX, spanY, gxf, gyf,
+                                                    terrainDispLevel(float(rung)),
+                                                    gShadowParams.terrainDisp.y,
+                                                    gShadowParams.terrainDisp.z,
+                                                    gShadowParams.terrainDisp.w);
+            }
+        }
+    }
+
+    // ─── THE NORMAL, AND D4: IT DOES NOT FOLLOW THE CARVING ──────────────────────────────────────
+    // On the base lattice this is terrainCornerNormal at this vertex — unchanged, one call, four
+    // loads. On a FINE rung the vertex has no lattice point of its own, so it carries the coarse
+    // quad's normal interpolated with the SAME triangle barycentrics loadHeightTri used, and NOT a
+    // central difference re-taken at the fine step. Two reasons, and the second is load-bearing:
+    //
+    //  - The relief shading already comes from parallax and the cdblur normal, both reading the same
+    //    `_paramh` height. Differentiating the displaced GEOMETRY too would shade one height field
+    //    twice and turn `parallaxScale` and `displacementScale` into an interacting look pair.
+    //  - It is what keeps the fine rung's frame equal to the base rung's. The value stored here is
+    //    the UN-NORMALIZED lerp of the already-normalized corner normals, because that is the
+    //    function the rasterizer produces across the coarse triangle today and the frag normalizes
+    //    at the end of it. `normalize(lerp(...))` here would NOT reproduce it.
+    //
+    // Displacement therefore moves silhouettes only. That is the whole point of it.
+    if (!fine) {
+        Out.Normal = terrainCornerNormal(slot, lx, ly, spanX, spanY, (int)gxf, (int)gyf);
+    } else {
+        const int    x0 = (int)floor(gxf), y0 = (int)floor(gyf);
+        const int    x1 = min(x0 + 1, TERRAIN_QUADS), y1 = min(y0 + 1, TERRAIN_QUADS);
+        const float  u  = gxf - float(x0), v = gyf - float(y0);
+        const float3 na = terrainCornerNormal(slot, lx, ly, spanX, spanY, x0, y0);
+        const float3 nb = terrainCornerNormal(slot, lx, ly, spanX, spanY, x1, y0);
+        const float3 nc = terrainCornerNormal(slot, lx, ly, spanX, spanY, x0, y1);
+        const float3 nd = terrainCornerNormal(slot, lx, ly, spanX, spanY, x1, y1);
+        Out.Normal = (u + v <= 1.0f) ? (na + (nb - na) * u + (nc - na) * v)
+                                     : (nd + (nc - nd) * (1.0f - u) + (nb - nd) * (1.0f - v));
     }
 
     Out.Position = mul(gFrameData.viewProj, float4(worldPos, 1.0f));
     Out.WorldPos = worldPos;
-    Out.Lattice  = float2(float(gx), float(gy));
+    // ⚠ CELL-lattice, not template-lattice. The frag reconstructs MW's per-vertex texture-square
+    // assignment from this, and a patch's own 0..4 Grid would put every patch in the cell's first
+    // square. `base + Grid` is what the whole VS has been working in since the decode.
+    Out.Lattice  = float2(gxf, gyf);
     Out.Cell     = uint4(slot, (uint)lx, (uint)ly, In.Inst1.x);
 
-    float dist = length(worldPos - gFrameData.eyePos.xyz);
+    // (`dist` is measured above, before the displacement — see the note there.)
     Out.Fog = mwFogFactor(dist);   // ramp only — the submerged test is PER PIXEL (mwFogAir)
 
     Out.Clip = dot(gFrameData.gReflWaterClip.xyz, worldPos) + gFrameData.gReflWaterClip.w;

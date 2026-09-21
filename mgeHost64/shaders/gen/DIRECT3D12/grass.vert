@@ -1204,7 +1204,32 @@ STRUCT(ShadowMaskParams)
     float4 pbrStatics;
 #line 849 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
     float4 terrainTex;
-#line 850
+#line 873 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
+    float4 parallax;
+#line 887 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
+    float4 parallax2;
+
+
+
+
+
+
+
+
+
+
+    float4 parallax3;
+#line 915 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
+    float4 terrainDisp;
+#line 928 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
+    float4 terrainDisp2;
+
+
+
+
+
+    float4 terrainDisp3;
+#line 935
 };
 #line 21 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
 #line 27 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
@@ -2326,6 +2351,105 @@ float mwFogAirShareAt(float fog, float3 worldPosRel)
     return mwFogAirShare(fog, waterFogSample(worldPosRel).y, length(worldPosRel));
 }
 #line 40 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/grass.vert.fsl"
+#line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terraindisp.h.fsl"
+#line 32 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terraindisp.h.fsl"
+uint terrainCellAt(int lx, int ly, uint spanX, uint spanY)
+{
+    if (lx < 0 || ly < 0 || lx >= (int)spanX || ly >= (int)spanY) { return 0u; }
+    return gTerrainCellGrid[(uint)ly * spanX + (uint)lx];
+}
+
+
+
+
+
+
+
+int squareXVS(int x) { return (int)floor((float(x) - 2.0f) * 0.25f); }
+int squareYVS(int y) { return (int)ceil ((float(y) - 2.0f) * 0.25f); }
+uint landSquareIndexVS(int lx, int ly, uint spanX, uint spanY, int tx, int ty)
+{
+    if (tx < 0) { --lx; tx += 16; } else if (tx > 15) { ++lx; tx -= 16; }
+    if (ty < 0) { --ly; ty += 16; } else if (ty > 15) { ++ly; ty -= 16; }
+    uint cell = terrainCellAt(lx, ly, spanX, spanY);
+    if (cell == 0u) { return  0xFFFFFFFFu ; }
+    return (cell - 1u) *  256u  + (uint)(ty * 16 + tx);
+}
+#line 74 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terraindisp.h.fsl"
+float terrainDispZ(uint slot, float2 uv, float lvl, float scale, float gamma, float pivot)
+{
+    const uint bucket = slot >> 16u;
+    const uint layer = slot & 0xFFFFu;
+    const float h =  gTerrainParamArrays[bucket].SampleLevel(gSamplerBilinearWrap, float3(uv, float(layer)), max(lvl, 0.0f)) .
+#line 79 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terraindisp.h.fsl"
+a;
+    const float depth01 = saturate(1.0f - h);
+    const float mag = min(1.0f, pow(depth01, 1.0f / max(gamma, 1e-4f)) / max(pivot, 1e-4f));
+    return -mag * scale;
+}
+
+
+
+
+float terrainDispLevel(float rung)
+{
+    return gShadowParams.terrainDisp2.z + rung -  4.0f ;
+}
+#line 103 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terraindisp.h.fsl"
+float terrainCarveAt(int lx, int ly, uint spanX, uint spanY, float gxf, float gyf,
+                     float lvl, float sc, float gm, float pv)
+{
+
+
+
+    const float2 duv = float2(gxf, gyf) * 0.25f;
+
+    const int x0 = (int)floor(gxf), y0 = (int)floor(gyf);
+    const int x1 = min(x0 + 1,  64 ), y1 = min(y0 + 1,  64 );
+    const float fx = gxf - float(x0), fy = gyf - float(y0);
+    const uint i00 = landSquareIndexVS(lx, ly, spanX, spanY, squareXVS(x0), squareYVS(y0));
+    const uint i10 = landSquareIndexVS(lx, ly, spanX, spanY, squareXVS(x1), squareYVS(y0));
+    const uint i01 = landSquareIndexVS(lx, ly, spanX, spanY, squareXVS(x0), squareYVS(y1));
+    const uint i11 = landSquareIndexVS(lx, ly, spanX, spanY, squareXVS(x1), squareYVS(y1));
+    const uint p00 = (i00 ==  0xFFFFFFFFu ) ? 0u : gTerrainParamTex[i00];
+    const uint p10 = (i10 ==  0xFFFFFFFFu ) ? 0u : gTerrainParamTex[i10];
+    const uint p01 = (i01 ==  0xFFFFFFFFu ) ? 0u : gTerrainParamTex[i01];
+    const uint p11 = (i11 ==  0xFFFFFFFFu ) ? 0u : gTerrainParamTex[i11];
+
+    float dz = 0.0f;
+    if (p00 == p10 && p00 == p01 && p00 == p11) {
+
+
+        if (p00 != 0u) { dz = terrainDispZ(p00, duv, lvl, sc, gm, pv); }
+    } else {
+        const float w00 = (1.0f - fx) * (1.0f - fy), w10 = fx * (1.0f - fy);
+        const float w01 = (1.0f - fx) * fy, w11 = fx * fy;
+        if (p00 != 0u) { dz += w00 * terrainDispZ(p00, duv, lvl, sc, gm, pv); }
+        if (p10 != 0u) { dz += w10 * terrainDispZ(p10, duv, lvl, sc, gm, pv); }
+        if (p01 != 0u) { dz += w01 * terrainDispZ(p01, duv, lvl, sc, gm, pv); }
+        if (p11 != 0u) { dz += w11 * terrainDispZ(p11, duv, lvl, sc, gm, pv); }
+    }
+    return dz;
+}
+#line 150 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terraindisp.h.fsl"
+float terrainCarveWorld(float2 worldXY, float lvl, float sc, float gm, float pv)
+{
+    const uint spanX = (uint)gShadowParams.terrainDisp3.z;
+    const uint spanY = (uint)gShadowParams.terrainDisp3.w;
+    if (spanX == 0u || spanY == 0u) { return 0.0f; }
+
+    const float invCell = 1.0f / ( 128.0f  * float( 64 ));
+    const float cx = floor(worldXY.x * invCell);
+    const float cy = floor(worldXY.y * invCell);
+    const int lx = (int)cx - (int)gShadowParams.terrainDisp3.x;
+    const int ly = (int)cy - (int)gShadowParams.terrainDisp3.y;
+
+    const float gxf = (worldXY.x - cx * ( 128.0f  * float( 64 ))) /  128.0f ;
+    const float gyf = (worldXY.y - cy * ( 128.0f  * float( 64 ))) /  128.0f ;
+    if (terrainCellAt(lx, ly, spanX, spanY) == 0u) { return 0.0f; }
+    return terrainCarveAt(lx, ly, spanX, spanY, gxf, gyf, lvl, sc, gm, pv);
+}
+#line 41 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/grass.vert.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyamb.h.fsl"
 #line 83 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyamb.h.fsl"
 float skyAOVisibility(float3 worldAbs)
@@ -2441,7 +2565,7 @@ float3 skyAmbFactor(float3 N, float3 worldPosRel)
 
     return lerp(float3(1.0f, 1.0f, 1.0f), max(f, float3(0.0f, 0.0f, 0.0f)), s) * ao;
 }
-#line 41 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/grass.vert.fsl"
+#line 42 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/grass.vert.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/tonemap.h.fsl"
 #line 32 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/tonemap.h.fsl"
 float3 tonemap(float3 c)
@@ -2456,7 +2580,7 @@ float3 inverseTonemap(float3 d)
     float3 s = sqrt(max(1.0f - clamp(d, 0.0f, 1.0f), 0.0f));
     return (1.0f - s) * (1.7636304f + s * (-0.4027722f + s * 0.4084603f));
 }
-#line 42 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/grass.vert.fsl"
+#line 43 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/grass.vert.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/linearize.h.fsl"
 #line 39 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/linearize.h.fsl"
 float3 srgbToLinear(float3 c)
@@ -2489,7 +2613,7 @@ float3 mod2xLinear(float3 tLinear)
 {
     return srgbToLinear(2.0f * linearToSrgb(tLinear));
 }
-#line 43 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/grass.vert.fsl"
+#line 44 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/grass.vert.fsl"
 
 
 
@@ -2510,7 +2634,7 @@ STRUCT(VSInput)
     DATA(float4, W2, TEXCOORD3);
     DATA(float4, W3, TEXCOORD4);
     DATA(float4, InstParams, TEXCOORD5);
-#line 63
+#line 64
 };
 
 
@@ -2526,16 +2650,16 @@ STRUCT(VSOutput)
     DATA(float3, WorldNormal, TEXCOORD5);
     DATA(CENTROID(float3), SunLight, TEXCOORD6);
     DATA(float, Clip, SV_ClipDistance0);
-#line 78
+#line 79
 };
-#line 114 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/grass.vert.fsl"
+#line 115 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/grass.vert.fsl"
 float3 grassAbsMod2(float3 worldPosRel)
 {
     float3 w = worldPosRel - 2.0f * floor(0.5f * worldPosRel);
     float3 e = gFrameData.lodEye.xyz - 2.0f * floor(0.5f * gFrameData.lodEye.xyz);
     return w + e;
 }
-#line 138 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/grass.vert.fsl"
+#line 139 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/grass.vert.fsl"
 float2 grassWindDisplacement(float3 absFrac, float h)
 {
     float2 wind = gShadowParams.grassParams.xy;
@@ -2555,7 +2679,7 @@ float2 grassWindDisplacement(float3 absFrac, float h)
 
     return saturate(0.02f * h) * harmonics * displace;
 }
-#line 170 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/grass.vert.fsl"
+#line 171 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/grass.vert.fsl"
 float2 grassCurrentDisplacement(float h, float phase)
 {
     float t = gShadowParams.grassParams.z;
@@ -2604,7 +2728,7 @@ float3 grassFoldRotate(float3 v, float2 lay, float s, float c)
     float dt = lay.x * v.y - lay.y * v.x;
     return v * c + cr * s + float3(-lay.y, lay.x, 0.0f) * (dt * (1.0f - c));
 }
-#line 236 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/grass.vert.fsl"
+#line 237 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/grass.vert.fsl"
 float3 grassTint(float hue, float val)
 {
     float2 amt = gShadowParams.grassParams4.xy;
@@ -2623,7 +2747,7 @@ VSOutput VS_MAIN( VSInput In )
 
     float4 worldPos = In.Position.x * In.W0 + In.Position.y * In.W1
                     + In.Position.z * In.W2 + In.Position.w * In.W3;
-#line 268 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/grass.vert.fsl"
+#line 269 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/grass.vert.fsl"
     float varCode = In.W0.w;
     worldPos.w = 1.0f;
     float varHue = floor(varCode * (1.0f / 65536.0f));
@@ -2632,9 +2756,9 @@ VSOutput VS_MAIN( VSInput In )
     float varDens = (varRest - varVal * 256.0f) * (1.0f / 255.0f);
     varHue *= (1.0f / 255.0f);
     varVal *= (1.0f / 255.0f);
-#line 290 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/grass.vert.fsl"
+#line 291 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/grass.vert.fsl"
     float soft = lerp(1.0f, In.Color.r, gShadowParams.grassParams3.z);
-#line 303 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/grass.vert.fsl"
+#line 304 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/grass.vert.fsl"
     float crushC = 0.0f;
     float2 crushLay = float2(0.0f, 0.0f);
     float crushH = 0.0f;
@@ -2665,11 +2789,11 @@ VSOutput VS_MAIN( VSInput In )
 
                 float crushRelZ = cf.x + gShadowParams.grassParams6.w;
                 float avail = crushRelZ - In.W3.z;
-#line 346 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/grass.vert.fsl"
+#line 347 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/grass.vert.fsl"
                 crushH = max(worldPos.z - In.W3.z, 0.0f);
-#line 369 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/grass.vert.fsl"
+#line 370 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/grass.vert.fsl"
                 float cHeld = saturate(1.0f - avail / bladeH);
-#line 408 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/grass.vert.fsl"
+#line 409 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/grass.vert.fsl"
                 float u = saturate(1.0f - cf.w);
                 float cRest0 = gShadowParams.grassParams8.x * cHeld;
                 float ph = u * gShadowParams.grassParams8.y;
@@ -2710,28 +2834,50 @@ VSOutput VS_MAIN( VSInput In )
 
 
     float2 currentDisp = grassCurrentDisplacement(In.Position.z, In.InstParams.z * 12.566f);
-#line 464 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/grass.vert.fsl"
+#line 465 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/grass.vert.fsl"
     worldPos.xy += soft * (1.0f - crushPin) * gShadowParams.grassParams.w
                  * lerp(windDisp, currentDisp, submerged);
-#line 479 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/grass.vert.fsl"
+#line 480 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/grass.vert.fsl"
     float crushSin = 0.0f, crushCos = 1.0f;
     if (crushC != 0.0f) {
         float theta = crushC * (0.5f *  3.14159265f ) * gShadowParams.grassParams7.x;
         crushSin = sin(theta);
         crushCos = cos(theta);
         worldPos.xy += crushLay * crushH * crushSin;
-#line 500 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/grass.vert.fsl"
+#line 501 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/grass.vert.fsl"
         float crushDown = max(crushC, 0.0f);
         worldPos.z -= crushH * (1.0f - crushCos)
                      + bladeH * gShadowParams.grassParams7.y * crushDown * crushDown;
     }
-#line 524 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/grass.vert.fsl"
+#line 525 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/grass.vert.fsl"
     {
         float jitter = saturate(grassBNoise(In.InstParams.z * 977.0f));
         float sinkFrom = gShadowParams.grassParams2.x;
         float sinkTo = sinkFrom + gShadowParams.grassParams3.w;
         float d = length(worldPos.xyz) - gShadowParams.grassParams3.y * jitter;
         worldPos.z -= gShadowParams.grassParams3.x * smoothstep(sinkFrom, sinkTo, d);
+    }
+#line 553 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/grass.vert.fsl"
+    if (gShadowParams.terrainDisp.x != 0.0f)
+    {
+        const float r0 = gShadowParams.terrainDisp2.x;
+        const float r1 = max(gShadowParams.terrainDisp2.y, r0 + 1.0f);
+
+
+        const float fade = 1.0f - smoothstep(r0, r1, length(In.W3.xyz - gFrameData.eyePos.xyz));
+        if (fade > 0.0f)
+        {
+
+
+
+
+
+            worldPos.z += fade * terrainCarveWorld(In.W3.xy + gFrameData.lodEye.xy,
+                                                   terrainDispLevel(gShadowParams.terrainDisp2.w),
+                                                   gShadowParams.terrainDisp.y,
+                                                   gShadowParams.terrainDisp.z,
+                                                   gShadowParams.terrainDisp.w);
+        }
     }
 
     Out.WorldPos = worldPos.xyz;
@@ -2763,7 +2909,7 @@ VSOutput VS_MAIN( VSInput In )
         nFace = nWorld;
     }
     lambert = max(0.0f, lambert);
-#line 594 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/grass.vert.fsl"
+#line 637 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/grass.vert.fsl"
     float rootAO = lerp(1.0f - saturate(gShadowParams.grassParams5.x * varDens) * (1.0f - crushPin),
                         1.0f,
                         saturate(In.Position.z * gShadowParams.grassParams5.y));

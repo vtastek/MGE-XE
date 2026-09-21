@@ -5839,6 +5839,11 @@ namespace {
     float              g_sunOccBuiltDir[3] = { 0.0f, 0.0f, 0.0f };   // sun dir the LIVE map was built for
     float              g_sunOccBuiltOrigin[2] = { 0.0f, 0.0f };      // ...and the window it was built over
     float              g_sunOccLastOuter = 0.0f;     // reach the last rebuild actually used (panel)
+    // ...and the RELIEF CUT that rebuild computed, kSunOccRelief / tan(elev), published beside it so
+    // the readout can say WHICH of the two bounded the march. Without it the panel shows one number
+    // and the knob shows another, and there is no way to tell "my ceiling is doing nothing" from
+    // "my ceiling is the problem" — which is the first question any stretched-shadow report asks.
+    float              g_sunOccLastCut   = 0.0f;
     bool               g_skyHeightValid = false;     // false until the first rebuild lands
     uint32_t           g_skyHeightBuildFrame = 0;    // last rebuild (panel readout)
     uint32_t           g_skyHeightBuilds = 0;
@@ -6082,11 +6087,29 @@ namespace {
     constexpr uint32_t kPbrStaticsFloat       = kPbrTerrainAOFloat + 4;
     // TERRAIN ALBEDO SAMPLING (shadowparams.h.fsl terrainTex): x gradient arm, y LOD bias.
     constexpr uint32_t kTerrainTexFloat       = kPbrStaticsFloat + 4;
+    // PARALLAX (shadowparams.h.fsl parallax/parallax2/parallax3, tasks/forge-parallax.md):
+    //   parallax  x mesh arm, y terrain arm, z scale, w bias
+    //   parallax2 x steps, y soft-shadow arm, z soften, w reach
+    //   parallax3 x height-blend arm, y strength, z contrast
+    // ...and phase 4a's near-camera terrain displacement, which terrain.VERT reads:
+    //   terrainDisp  x arm, y scale (world), z gamma, w pivot
+    //   terrainDisp2 x radius, y fade end, z height mip level
+    // Appended for the reason every block above states — this cbuffer is bound BY POINTER into
+    // every PerFrame set, so an insertion anywhere else silently moves a lane somebody reads.
+    constexpr uint32_t kParallaxFloat         = kTerrainTexFloat + 4;
+    constexpr uint32_t kParallax2Float        = kParallaxFloat + 4;
+    constexpr uint32_t kParallax3Float        = kParallax2Float + 4;
+    constexpr uint32_t kTerrainDispFloat      = kParallax3Float + 4;
+    constexpr uint32_t kTerrainDisp2Float     = kTerrainDispFloat + 4;
+    //   terrainDisp3 x/y grid min cell, z/w grid span — phase 4b, and it exists for GRASS. grass.vert
+    //     has only a world XY for the blade root, so it cannot reach gTerrainCellGrid without the
+    //     grid's own origin; terrain.vert gets the same numbers per INSTANCE and ignores this lane.
+    constexpr uint32_t kTerrainDisp3Float     = kTerrainDisp2Float + 4;
     constexpr uint32_t kShadowParamsBytes = 4096;
     static_assert((kAoBounceFloat + 4) * sizeof(float) <= kShadowParamsBytes,
                   "ShadowMaskParams overflows its CBV — too many sun cascades");
-    static_assert((kTerrainTexFloat + 4) * sizeof(float) <= kShadowParamsBytes,
-                  "pbrParams/pbrTerrain/pbrTerrainAO/pbrStatics/terrainTex must fit inside the ShadowMaskParams CBV");
+    static_assert((kTerrainDisp3Float + 4) * sizeof(float) <= kShadowParamsBytes,
+                  "pbrParams..terrainDisp3 must fit inside the ShadowMaskParams CBV");
     // The float indices above are kept in step with the struct BY HAND, one +4 at a time, and
     // nothing checked that the running sum still lands on the member it names. A lane written one
     // float4 off reads as a knob that does nothing, or as garbage in a neighbour's slot — both of
@@ -6101,6 +6124,18 @@ namespace {
                   "kPbrStaticsFloat does not land on ShadowMaskParams::pbrStatics");
     static_assert(offsetof(ShadowMaskParams, terrainTex) == kTerrainTexFloat * sizeof(float),
                   "kTerrainTexFloat does not land on ShadowMaskParams::terrainTex");
+    static_assert(offsetof(ShadowMaskParams, parallax) == kParallaxFloat * sizeof(float),
+                  "kParallaxFloat does not land on ShadowMaskParams::parallax");
+    static_assert(offsetof(ShadowMaskParams, parallax2) == kParallax2Float * sizeof(float),
+                  "kParallax2Float does not land on ShadowMaskParams::parallax2");
+    static_assert(offsetof(ShadowMaskParams, parallax3) == kParallax3Float * sizeof(float),
+                  "kParallax3Float does not land on ShadowMaskParams::parallax3");
+    static_assert(offsetof(ShadowMaskParams, terrainDisp) == kTerrainDispFloat * sizeof(float),
+                  "kTerrainDispFloat does not land on ShadowMaskParams::terrainDisp");
+    static_assert(offsetof(ShadowMaskParams, terrainDisp2) == kTerrainDisp2Float * sizeof(float),
+                  "kTerrainDisp2Float does not land on ShadowMaskParams::terrainDisp2");
+    static_assert(offsetof(ShadowMaskParams, terrainDisp3) == kTerrainDisp3Float * sizeof(float),
+                  "kTerrainDisp3Float does not land on ShadowMaskParams::terrainDisp3");
     // msmrecv.h.fsl's PCSS works in TEXELS, so SUN_SHADOW_RES has to agree with the atlas the host
     // actually allocated. Same mirroring contract as SUN_CASCADES / kSunCascades.
     static_assert(kSunShadowRes == 2048, "SUN_SHADOW_RES in shadowparams.h.fsl must match kSunShadowRes");
@@ -7439,6 +7474,124 @@ namespace {
     // still there — the same trap pbrmaterial.h.fsl records for the gradient radius and terracing
     // ([[feedback_a_look_dial_inside_a_measurement]]).
     float    g_terrainTexBias = 0.0f;
+
+    // ─── PARALLAX (tasks/forge-parallax.md) ──────────────────────────────────────────────────────
+    // Parallax mapping, Drobot soft parallax shadows, height blending and near-camera terrain
+    // displacement already exist and are TUNED — in the DX9 path. They are the one major piece of
+    // the old renderer the Forge takeover had not absorbed. Every default below is the live DX9
+    // value out of scene-walk's imgui_manager.cpp, so what ships here is a port and not a re-tune.
+    //
+    // ⚠⚠ EVERY ARM SHIPS **OFF**, AND THAT IS A STAGED DECISION, NOT TIMIDITY. Terrain is most of
+    // the screen outdoors, so it is the most expensive place in the frame to add a texture tap, and
+    // nothing here is priced yet — the interleaved A/B against the `color 2.30-2.35 ms` / `dl 1.14
+    // ms` baseline is the next step, not a formality. Arming an unmeasured cost is how a frame
+    // budget disappears with no suspect ([[feedback_bracket_a_ceiling_before_building_for_it]]),
+    // and the corresponding failure — building it, measuring it and then leaving it off forever
+    // ([[feedback_built_measured_and_shipped_off]]) — is what the panel entries and the
+    // MGE_HOST_KNOBS rows below exist to prevent: every arm is one token or one click.
+    //
+    // ⚠ NOT ON DISTANT STATICS, and that is a decision rather than an omission: a 64-256 texel LOD
+    // texture has nothing left for a parallax offset to find, so out there the cdblur normal is the
+    // whole story (see g_pbrStaticsDepth for the same downsample argument in its other guise).
+    //
+    // g_parallaxMesh / g_parallaxTerrain — the two surfaces, two arms. Separate for pbrTerrain's
+    // reason exactly: the ground is a different shader over a different residency and it is the
+    // expensive half, so the two have to be priced and judged apart.
+    bool     g_parallaxMesh    = false;
+    bool     g_parallaxTerrain = false;
+    // The height range as a fraction of one UV unit — the same dimensionless, scale-free convention
+    // every other depth here uses (slope = depth x dH/duv; see g_pbrTerrainDepth for the
+    // derivation). 0.008 is the live DX9 value, and it is also what bounds the approximation D3
+    // rests on: at 0.008 the uv offset is ~1/125 of a texture square, far too small to make
+    // terrain's four fixed corner weights mean anything different.
+    float    g_parallaxScale   = 0.008f;
+    // THE OFFSET LIMITER. The offset is Vts.xy / (Vts.z + bias), and without the bias it diverges
+    // as a surface turns edge-on — an unbounded uv step that smears the texture into streaks. At
+    // 0.5 (the live DX9 value) the worst case is 2x the head-on offset.
+    float    g_parallaxBias    = 0.5f;
+    // ⚠ STEPS IS WHERE THIS DEPARTS FROM THE DX9 SOURCE, AND ON PURPOSE. DX9 ships a SINGLE offset
+    // (`Parallax()`), i.e. steps = 1. The iteration re-evaluates from the base uv each time, so it
+    // converges toward the point the view ray actually strikes instead of stopping at the first
+    // guess — and its cost is exactly `steps` taps at EVERY view angle, which is the property POM
+    // was rejected for not having (a ray march must LENGTHEN at grazing incidence, which is where
+    // terrain spends most of a screen).
+    //   0  the uv is untouched — the identity arm, and the free A/B
+    //   1  DX9's single offset, term for term
+    //   2  the shipped default
+    uint32_t g_parallaxSteps   = 2u;
+    // Drobot soft parallax shadows: 4 fixed taps along the tangent-space to-light direction, the
+    // lowest of the four against this pixel's own. Its OWN arm because it is the expensive half on
+    // the ground — it traces the height-BLENDED surface (so a shadow follows the profile the eye
+    // sees), which is five taps per covered layer and up to 20 where four land textures meet.
+    bool     g_parallaxShadows      = false;
+    float    g_parallaxShadowSoften = 5.0f;    // DX9
+    float    g_parallaxShadowScale  = 0.03f;   // DX9's 0.04 * 0.75
+    // ─── The additive "Witcher" height blend, generalised from 2 layers to 4. TERRAIN ONLY ───────
+    // Sand settles into the cracks in stone instead of crossfading over them. At N = 2 the 4-layer
+    // form is algebraically DX9's existing expression, which is what lets its tuned contrast
+    // transfer unchanged. The new weights replace the bilinear ones at the ONE site they are
+    // defined, so the albedo, the `_paramh` material, the cdblur gradient and the height AO all
+    // track the same surface.
+    bool     g_heightBlend         = false;
+    float    g_heightBlendStrength = 1.0f;     // DX9
+    // The band, in height units, over which two layers still mix: small = a hard boundary that
+    // follows the texture's own cracks, large = back toward plain bilinear.
+    float    g_heightBlendContrast = 0.06f;    // DX9
+    // ─── PHASE 4a: near-camera terrain displacement (terrain.vert.fsl) ───────────────────────────
+    // ⚠ THE RISKY PHASE, AND IT IS STAGED LAST DELIBERATELY. D1-D5 above deliver most of the look
+    // at no geometric risk; this one has three problems the fragment work does not, and two of them
+    // can kill it outright:
+    //   * GEOMETRY. The lattice is 128 world units between vertices (DX9 subdivided to 8 inner /
+    //     16 outer), so this gives large-scale undulation, NOT silhouette detail. Real detail needs
+    //     new geometry — phase 4b, which LANDED: 512-unit sub-cell patches at 8 u inside the disc.
+    //   * GRASS. Grass roots are baked on the CPU from raw Terrain::LandCell::height, completely
+    //     outside terrain.vert, so displaced ground would leave grass floating or sunk. 4b answers
+    //     it in grass.vert, which applies the SAME carve at the blade root (terraindisp.h.fsl is
+    //     one implementation shared by both stages). The CPU root height is deliberately left
+    //     alone — the VS offset rides on top of it, so the arm-off frame is untouched.
+    //   * MOTION VECTORS ASSUME A STATIC WORLD (motionvectors.comp: reconstruct from depth, reproject
+    //     by CAMERA motion only). A player-relative fade boundary moves every frame and changes depth
+    //     with no motion vector to match — ghosting at the effect's edge under TAA/DLSS. The DX9 side
+    //     paid for this already (`dispfix:91013bc2 "fix terrain displacement motion blur issue"`).
+    // 4a exists to find where those two break, cheaply, BEFORE any geometry work is committed.
+    bool     g_terrainDisp       = false;
+    float    g_terrainDispScale  = 6.0f;      // DX9 displacementScale, WORLD UNITS, one-sided (down)
+    float    g_terrainDispGamma  = 0.25f;     // DX9 displacementGamma — a 4th power, so only deep parts carve
+    float    g_terrainDispPivot  = 1.0f;      // DX9 displacementPivot (1.0 = identity)
+    // The disc. Near-player by design, and SHRUNK in 4b (was 1280/2560): the patch system spends
+    // its triangles inside the disc rather than across whole cells, so the right reach is the one
+    // the eye actually inspects — DX9's own inner figure is ~1500.
+    // SINCE 4b-LITE IT IS ALSO THE GEOMETRY'S REACH: the fade end is what decides which cells and
+    // which patches take a fine rung (see terrainCullAndBuild), so the two can never drift apart
+    // and open a pop.
+    float    g_terrainDispRadius = 768.0f;
+    float    g_terrainDispFade   = 1500.0f;
+    // ⚠ AND THAT COUPLING IS WHY THE FADE END HAS A HARD CEILING. The pop-free property is an
+    // identity between two sets: "this patch takes the fine rung" must be EXACTLY "the disc touches
+    // this patch", because a stitched vertex skips displacement and a fine patch beside a coarse one
+    // is only crack-free when fade == 0 on the edge they share. Capping the geometry independently
+    // of the fade would break that identity and open a `displacementScale`-sized crack; capping the
+    // FADE caps both at once. 16384 is the panel slider's own ceiling, so the clamp only ever bites
+    // an MGE_HOST_KNOBS typo — and it is what bounds the instance ring (kTerrainMaxPatchCells).
+    constexpr float kTerrainDispFadeMax = 16384.0f;
+    // ─── PHASE 4b-lite: the near lattice ─────────────────────────────────────────────────────────
+    // Which RUNG a 512-unit PATCH inside the displacement disc draws at: 0 = 8 u (DX9's inner
+    // figure), 1 = 16 u (its outer), 2 = 32 u (4b-lite's whole-cell rung, now sub-cell), 3 = 64 u,
+    // 4 = the base 128-u lattice, which DISARMS the patch system entirely and is the A/B against it.
+    // Not a distance — the ladder does distance; this is the one rung that answers "how finely may
+    // the carve be resolved".
+    float    g_terrainPatchRung  = 0.0f;
+    // The mip the height is read at, and it is not decoration. One lattice step is 128 world units
+    // = ~256 texels of a 1024 map tiling once per 512, so mip 0 would sample the field at 1/256 of
+    // its rate: aliasing that crawls as the camera moves. 8 is the band-limit that matches the
+    // lattice; it is a knob because the right answer moves with the map's resolution.
+    float    g_terrainDispLod    = 8.0f;
+    // THE fade end, as everything that consumes it must see it: the shader's own max(), and the
+    // ring-bounding ceiling above. ONE accessor so the cbuffer lane, the geometry disc and the
+    // panel read-back cannot disagree — [[feedback_one_knob_two_jobs]] / gate at the PRODUCER.
+    inline float terrainDispFadeEnd() {
+        return std::min(std::max(g_terrainDispFade, g_terrainDispRadius + 1.0f), kTerrainDispFadeMax);
+    }
 
     // The ONE gate every writer of the static instance lane [15] goes through.
     inline uint32_t pbrParamSlotFor(uint32_t paramTexIndex) {
@@ -16457,7 +16610,32 @@ namespace {
     // Terrain heartbeat counters. Terrain's triangle count is OURS to own now (the DL bake's was
     // fixed at 915 tris/cell forever), so it rides the gpu-split line next to nearTris; the LOD
     // histogram is what tells you whether the ladder is spending them in the right place.
-    constexpr uint32_t kTerrainLods = 6;      // vertex strides 1, 2, 4, 8, 16, 32
+    // The LOD ladder is indexed by RUNG, and rung 4 is the BASE lattice (128 world units between
+    // vertices — MW's own LAND resolution). Rungs 5..9 skip lattice points (256..4096 u, the old
+    // strides 2..32, renumbered but otherwise untouched); rungs 0..3 SUBDIVIDE between them (8, 16,
+    // 32 and 64 u — phase 4b, tasks/forge-parallax.md). step = exp2(rung - kTerrainBaseLod).
+    //
+    // ⚠ THE BASE MOVED 2 -> 4 IN PHASE 4b, and nothing reads the number 2 any more: the shader
+    // takes TERRAIN_BASE_RUNG and every host expression is written against kTerrainBaseLod. The two
+    // new rungs are 8 u and 16 u, and they are only ever drawn by the PATCH family (a 4-base-quad,
+    // 512-unit sub-cell instance) — 4b-lite's whole-cell 257²/129² templates are RETIRED, because
+    // a rung is a whole-cell property and ~90% of a whole cell's fine triangles land where the
+    // carve is not. See kTerrainFamilies below.
+    constexpr uint32_t kTerrainLods    = 10;
+    constexpr uint32_t kTerrainBaseLod = 4;   // the rung whose step is exactly one lattice unit
+    // The two TEMPLATE FAMILIES: a whole 8192-unit cell, or a 512-unit sub-cell patch. Declared here
+    // with the heartbeat counters rather than down in the terrain block, because the histogram they
+    // index sits up here with the panel toggles. The geometry (patch span, per-cell count, the row
+    // bound) lives with the rest of the terrain constants.
+    constexpr uint32_t kTerrainFamCell  = 0;
+    constexpr uint32_t kTerrainFamPatch = 1;
+    constexpr uint32_t kTerrainFamilies = 2;
+    // The patch rung as an integer, clamped to the family's range. kTerrainBaseLod is the "off"
+    // end: at the base rung a patch is a strict tiling of the cell's own template, so asking for
+    // it means the patch system buys nothing and the cull leaves the cell whole.
+    inline uint32_t terrainPatchRung() {
+        return (uint32_t)std::clamp((int)std::lround(g_terrainPatchRung), 0, (int)kTerrainBaseLod);
+    }
     // Residency is live (heights/VCLR/VTEX uploaded, cull table built). Declared HERE, with the
     // toggles, rather than down in the terrain block: fillFrameTimings — which sits above that
     // block — reports `g_terrainReady && g_drawTerrain` to the client as terrainOwned, and that is
@@ -16484,7 +16662,10 @@ namespace {
     uint64_t g_lastTerrainTris    = 0;
     uint32_t g_lastTerrainInRange = 0;   // passed the DrawDist cap (so: drawn/inRange = frustum yield)
     uint32_t g_lastTerrainNearCut = 0;   // dropped as wholly inside MW's own near land
-    uint32_t g_lastTerrainLodHist[kTerrainLods] = {};
+    // ...per FAMILY as well as per rung since 4b: [0] = whole-cell instances, [1] = 512-unit
+    // patches. Both are printed, because "which family spent the triangles" is the only thing that
+    // separates a fine lattice IN the carve from a fine lattice everywhere.
+    uint32_t g_lastTerrainLodHist[kTerrainFamilies][kTerrainLods] = {};
     // Statics facing A/B (dlPickStaticsPipeline). Built while hunting the dark/bright distant statics, on
     // the theory that back-face rasterization was shading each mesh's FAR side with outward normals (N.L
     // saturating to 0 or 1). It wasn't — the cause was the missing `centroid` on statics' Color+Fog — but
@@ -19300,6 +19481,45 @@ namespace {
     // it is a diagnostic setting, not a default.
     float g_sunDiscExpand = 2.0f;
 
+    // ─── THE LIGHT FOLLOWS THE DISC (2026-09-20) ────────────────────────────────────────────────
+    //
+    // MW HAS TWO SUNS ([[project_mw_two_suns]]): the LIGHT (sgSunlight → gFrameData.sunDir) is
+    // clamped to a shallow 13.8-53.1 degree arc and never sets, while the DISC (GetSunDir, the thing
+    // in the sky) sweeps +-73 degrees and does. At noon they are ~29 degrees apart, and everything
+    // that draws a shadow was using the LIGHT — so a sun visibly overhead cast shadows for a sun at
+    // 41 degrees. That is the "sun at zenith, a lot of stretched shadows" report, and no amount of
+    // shortening the far-shadow march could have fixed it: the march was the right length for the
+    // sun it was told about.
+    //
+    // ⚠ THE DISC DOES NOT MOVE. It is the constraint, not the free variable — *"people won't notice
+    // if direction changes but they will notice if sundisc in sky position changes"* (2026-08-19).
+    // The sky model has been cooked at the disc since P2a; this makes the LIGHT agree with it, which
+    // is the same fix applied to the other half of the frame.
+    //
+    // ⚠ EXCEPT AT NIGHT, WHERE THE BOUNCE IS KEPT, and that is a requirement rather than a caution
+    // (user, 2026-09-20). MW mirrors the light back above the horizon once the sun sets so night
+    // lighting arrives from a plausible direction, and that directional IS the key light the moonlit
+    // look is built on ([[project_forge_physical_sky_p2]]'s night-ambient note says so in as many
+    // words). Following the disc underground would point the key light up through the floor and
+    // leave the ground on ambient alone.
+    bool  g_sunLightFollowsDisc = true;
+    // The handover band, in DEGREES OF **DISC** ELEVATION: below lo the light is MW's bounced one
+    // verbatim, above hi it is the disc, smoothstep between.
+    //
+    // ⚠ 18 IS NOT A ROUND NUMBER, IT IS WHERE MW'S TWO ARCS CROSS. Measured across one day: at disc
+    // 17.66deg the light reads 17.86deg — a split of 0.2deg — while at disc 0.32 the light is 13.88
+    // (split -13.6) and at disc 69.89 it is 41.09 (split +28.8). Ending the band at the crossing
+    // means the correction this applies is ~0 at BOTH ends of the ramp, so dusk has no swing to
+    // show: the blend is between two directions that already agree there. Both arcs are fixed
+    // transits, so the crossing is a property of MW and not of the day it was measured on.
+    float g_sunLightDiscLoDeg = 0.0f;
+    float g_sunLightDiscHiDeg = 18.0f;
+    // Reported, not set: the elevation change actually applied this frame, and the handover weight.
+    // The instrument for "is this arm doing anything right now", which at dusk is genuinely "almost
+    // nothing" and should not be mistaken for the arm being off.
+    float g_sunAimAppliedDeg = 0.0f;
+    float g_sunAimWeight     = 0.0f;
+
     // WT2 water debug: output one isolated water term instead of the composited surface, so the
     // reflection / refraction contents are directly inspectable. Driven by two panel CHECKBOXES
     // (the proven widget type — AO toggles use them; the dropdown's pData write is unreliable here).
@@ -19976,8 +20196,10 @@ namespace {
     // whose reflected rays are most grazing), so shortening it to nothing is the wrong end to cut.
     constexpr float kReflDistFloor     = 0.35f;
     // Axis B's own mapping: how many LOD steps the terrain may be pushed at the floor. 2 is the
-    // ladder's practical limit here — kTerrainLodDist has 6 rungs and the far ones are already
-    // coarse, so a third step mostly re-picks a stride the distance test would have chosen anyway.
+    // ladder's practical limit here — kTerrainLodDist has six REACHABLE rungs (the mirror is
+    // floored at the base lattice, so 4b's four fine ones are not among them) and the far ones
+    // are already coarse, so a third step mostly re-picks a rung the distance test would have
+    // chosen anyway.
     constexpr uint32_t kReflLodBiasMax = 2u;
     // All three ship as AUTO (-1). Pinning any of them is what makes the verification TABLE possible
     // — the sweep needs distance and LOD moved INDEPENDENTLY, which a single derived scalar cannot
@@ -21404,7 +21626,12 @@ namespace {
                                             // added the name, so setDebugMode() clamped it to 20 and
                                             // it was unreachable by any means — the third time.
                                             "21 terrain height AO", "22 terrain filter width",
-                                            "23 terrain texture size", "24 terrain anisotropy" };
+                                            "23 terrain texture size", "24 terrain anisotropy",
+                                            // 25/26 land WITH the client's `% 27` in the same
+                                            // commit, which is the whole of what the note above
+                                            // asks for. 25 is also the only GPU test of the
+                                            // parallax tangent frame's sign that exists.
+                                            "25 parallax uv delta", "26 terrain height blend" };
     constexpr uint32_t kDebugModeCount = (uint32_t)(sizeof(kDebugModeNames) / sizeof(kDebugModeNames[0]));
 
     // ─── THE DEV PANEL: A REAL HORIZONTAL TAB BAR ────────────────────────────────────────────────
@@ -21433,6 +21660,675 @@ namespace {
     // (checkbox/sliderF/sliderU/dropdown/label/button/dynamicText/flush); only what it EMITS moved,
     // from Forge widget payloads to a description this file draws itself. That is what made this a
     // safe change to a panel nobody wants to re-verify by hand.
+    // ─── THE ORIGINAL-VALUE REGISTRY ────────────────────────────────────────────────
+    // ⚠ THE PANEL CANNOT READ A DEFAULT OFF ITS OWN POINTER, AND THE ORDER IS WHY. main.cpp calls
+    // applyEnvOverrides() — and now the saved-panel load — BEFORE ForgeRender::init(), which is what
+    // builds the panel. So by the time TabBuilder sees `*p` it may already hold an override, and a
+    // "reset to default" built on it would reset to whatever the environment said. That is
+    // [[feedback_verify_the_default_configuration]] with the roles reversed: the default is the
+    // thing that has to be captured, and it has to be captured before anything can move it.
+    //
+    // So every path that writes a knob by name records what was there first, once. The panel then
+    // asks here before falling back to the live value, and a knob nothing overrode is identical
+    // either way. One map, keyed by the pointer, values widened to double (float, bool and uint32
+    // all survive that exactly).
+    std::unordered_map<const void*, double> g_knobOrig;
+    inline void knobRecordOrig(const void* p, double v) { g_knobOrig.emplace(p, v); }
+    // The default for a knob pointer: what it held before any override, else what it holds now.
+    inline double knobDefault(const void* p, double live) {
+        auto it = g_knobOrig.find(p);
+        return (it == g_knobOrig.end()) ? live : it->second;
+    }
+
+    // ─── THE MGE_HOST_KNOBS TABLES ─────────────────────────────────────────────────
+    // They sit HERE, above the dev panel, because the panel is what reads them backwards: a save
+    // needs pointer -> name, and it needs it while the panel is being BUILT. Their other two
+    // callers (applyKnobSpec and applyEnvOverrides) are far below in namespace ForgeRender and can
+    // see them from there; the panel, inside this anonymous namespace, could not see them the
+    // other way round. Verified before moving: all 255 knob globals are declared above this point.
+    //
+    // Format and semantics are documented at applyEnvOverrides. The entries are untouched.
+
+    // They were locals inside applyEnvOverrides, which was fine while the environment was the only
+    // thing that wrote a knob by name. The dev panel's SAVE button needs the same table read the
+    // other way round — pointer -> name — and the panel's LOAD needs the same parser. One table,
+    // three callers, because the alternative is a second naming scheme for the same knobs and this
+    // file has already paid for a control surface that disagreed with another one.
+    //
+    // The entries themselves are untouched and in their original order.
+    struct FKnob { const char* name; float* p; };
+    struct BKnob { const char* name; bool*  p; };
+        // M1 4d added the third kind. `upscaleBackend` names a backend, and a float or a bool
+        // cannot: 0/1 would be a mapping nobody can read off a command line, and 4e adds `auto` as
+        // a third value, which a bool has nowhere to put. One entry today; the table exists so the
+        // second one is an entry rather than a redesign.
+    struct SKnob { const char* name; char* p; size_t cap; };
+        // ...and a uint kind, added with the 4d-3 mode list. `upscaleMode` is an INDEX into a fixed
+        // list, which a float cannot carry honestly (0.9 is not a mode) and a bool cannot carry at
+        // all now that Off is one entry among six.
+    struct UKnob { const char* name; uint32_t* p; uint32_t max; };
+    const FKnob fknobs[] = {
+            // AO LOOK, exposed 2026-09-05 because a half-res grain complaint could not be A/B'd
+            // at all from the minimized harness — every one of these was panel-only.
+            // upSigma is the FIRST lever for "half res looks blocky": it is the upscale's RANGE
+            // sigma in WORLD units, so raising it lets the upscale blend across a bigger depth
+            // step and smooths the enlarged grain. blurPx is the blur's SPATIAL sigma in PIXELS,
+            // and note it saturates — past ~1.5 over a +-3 kernel it is a box filter and buys
+            // nothing more ([[project_forge_ao_blur_extent]]).
+            { "aoUpSigma",          &g_aoUpSigma          },
+            { "aoBlurPx",           &g_aoBlurPx           },
+            // SHADOW MASK: the test range (the pass's area dial — covered area ~ rangeK², and the
+            // point light's reach is slaved to it) and the three cost-profile arms. Here for exactly
+            // the reason the AO ones are: separating this pass's four stages needs them measured in
+            // one session against one pinned save, and nobody is at the panel during a minimized run.
+            { "shadowRangeK",       &g_shadowRangeK       },
+            // LONG-RANGE SUN OCCLUSION's reach ceiling and its strength. Env-armed because the two
+            // questions this feature raises are both whole-run questions: "is the far shadow the
+            // thing I am looking at" (strength 0 is the A/B) and "does shortening the march remove
+            // it" — and the second one wants the SAME value pinned across a walk, not a knob that
+            // moved while the sun did. Both are clamped by their consumers.
+            { "sunOccOuter",        &g_sunOccOuter        },
+            { "sunOccStrength",     &g_sunOccStrength     },
+            { "maskProf",           &g_maskProf           },
+            { "maskNoDyn",          &g_maskNoDyn          },
+            { "maskFilter",         &g_maskFilter         },
+            // ...and the flicker WOBBLE amplitude, which is a cost arm as much as a look one: at 0
+            // the mask's per-slot wobble branch is not taken, so this is the isolation lever for the
+            // 13 sin() that branch evaluates PER SLOT PER PIXEL.
+            { "flickShadowMove",    &g_flickShadowMove    },
+            // MSAA RESOLVE FILTER DIAMETER. 6 = 7x7, 4 = 5x5 (the shipped value), 2 = 3x3, and the
+            // tap count is (2*ceil(d/2)+1)^2 * sampleCount MSAA loads PER OUTPUT PIXEL — 196 / 100 /
+            // 36 at 4x. It is here, not just on the panel, because scaling it is the only way to ask
+            // from the harness what this pass is BOUND by: if the time tracks the tap count the pass
+            // is load-throughput bound and the answer is fewer taps (or an LDS compute rewrite); if
+            // it does not, the taps are free and the weight arithmetic is the target.
+            { "resolveDiameter",    &g_resolveDiameter    },
+            // S2 THE ATMOSPHERE — first in the table because the S2b gate runs unattended and these
+            // are the three lanes an unattended session has to be able to move: the march budget
+            // (the `atmos=` cost dial), and the two night lanes, whose whole point is that they are
+            // judged at midnight and the harness cannot click a checkbox at midnight either.
+            { "dumpAtFrame",        &g_dumpAtFrame        },
+            // M1 step 4b THE UPSCALER (tasks/forge-upscale.md). ⚠ THE ONLY WAY THE HARNESS CAN RUN
+            // THE REAL 4b TEST. Scale 1.0 is an exact identity by construction, so it proves nothing
+            // about the seam; the test that does — `[rect] in=840x525 out=1680x1050`, APL within ~1%
+            // of the 1.0 run, and `gpu=` dropping while `upscale=` appears — needs the slider at 0.5,
+            // and the perf harness runs MINIMIZED with nobody at the panel.
+            { "upscaleInputScale",  &g_upscaleInputScale  },
+            // M1 step 4c BLOOM, and these two are here because the 4c question — "does the bloom
+            // change when the upscale slider moves" — CANNOT BE ATTRIBUTED WITHOUT THEM. Bloom now
+            // reads the DELIVERED image, so at scale < 1 its source is an upscaled frame: any change
+            // in the delivered picture could be the bloom following a different source, or the
+            // upscaler's effect on the scene underneath it. Separating those needs an arm with bloom
+            // OFF at both scales, and until now every bloom knob was panel-only while the harness
+            // runs MINIMIZED — the exact shape this table's header describes.
+            //
+            //   bloomStrength = 0  is the EXACT identity arm (resolve.frag guards the composite
+            //                      behind `if (k > 0)`, by branch and not by arithmetic), so it is
+            //                      the isolation lever rather than a dimmer.
+            //   bloomLevelCap      is the REACH dial, i.e. the thing 4c is ABOUT: it clamps the
+            //                      level count from above, so pinning it equal across two scales
+            //                      proves a difference is not the octave count.
+            { "bloomStrength",      &g_bloomStrength      },
+            { "bloomLevelCap",      &g_bloomLevelCap      },
+            // ...and the upscaler's own filter, so the "is the anti-ringing clamp eating the bloom"
+            // arm can be taken unattended as well as by hand. See upscale.h.
+            { "upscaleSharpness",   &g_upscaleSharpness   },
+            { "upscaleAntiRing",    &g_upscaleAntiRing    },
+            { "fogSkyKnee",         &g_fogSkyKnee         },
+            { "fogNearHaze",        &g_fogNearHaze        },
+            { "atmosCacheDeg",      &g_atmosCacheDeg      },
+            { "atmosCacheAltM",     &g_atmosCacheAltM     },
+            { "atmosMieMul",        &g_atmosMieMul        },
+            { "atmosOzoneMul",      &g_atmosOzoneMul      },
+            { "atmosMs",            &g_atmosMs            },
+            { "atmosDeckDown",      &g_atmosDeckDown      },
+            { "skyCloudAlbedo",     &g_skyCloudAlbedo     },
+            // ⚠ THE AgX LOOK, ON THE HARNESS. Four panel sliders that the minimized rig could not
+            // reach, so "what does Punchy actually do to the sky" was a question no unattended run
+            // could answer and every judgement of it had to be taken by hand at the keyboard. Same
+            // reason MGE_HOST_KNOBS exists at all. The curve's own three go with them, because
+            // 2.02/2.90/2.90 reproduces the retired polynomial and that is the regression arm.
+            { "agxSlope",           &g_agxSlope           },
+            { "agxPower",           &g_agxPower           },
+            { "agxSat",             &g_agxSat             },
+            { "agxOffset",          &g_agxOffset          },
+            { "agxSlope2",          &g_agxSlope2          },
+            { "agxToePower",        &g_agxToePower        },
+            { "agxShoulderPower",   &g_agxShoulderPower   },
+            { "atmosDeck",          &g_atmosDeck          },
+            { "atmosDeckSteps",     &g_atmosDeckSteps     },
+            { "atmosSkySteps",      &g_atmosSkySteps      },
+            { "atmosMsDirs",        &g_atmosMsDirs        },
+            { "atmosAirglow",       &g_atmosAirglow       },
+            { "atmosMoonScale",     &g_atmosMoonScale     },
+            { "waterInscatterGain", &g_waterInscatterGain },
+            { "waterScatterRatio",  &g_waterScatterRatio  },
+            { "waterMsSimilarity",  &g_waterMsSimilarity  },
+            { "waterSunEnter",      &g_waterSunEnter      },
+            { "waterPhaseMS",       &g_waterPhaseMS       },
+            { "waterDistortAngular", &g_waterDistortAngular },
+            { "waterDistortGain",    &g_waterDistortGain    },
+            { "waterRefrOwn",        &g_waterRefrOwn        },
+            { "waterCutRadius",      &g_waterCutRadius      },
+            { "waterCutHeight",      &g_waterCutHeight      },
+            // W25: the NORMAL INTENSITY, and it is here because it is now the caustic's calm-water
+            // lever as well as the surface's — `waterWaveAmp=0` is how the harness isolates the
+            // ripple and wake layers with no checkbox to click.
+            { "waterWaveAmp",        &g_waterWaveAmp        },
+            { "causticStrength",     &g_causticStrength     },
+            { "causticTileUnits",    &g_causticTileUnits    },
+            { "causticSlopeRms",     &g_causticSlopeRms     },
+            { "causticSubBeams",     &g_causticSubBeams     },
+            { "causticDynSubBeams",  &g_causticDynSubBeams  },
+            { "causticSlicesPerFrame", &g_causticSlicesPerFrame },
+            { "causticSoften",       &g_causticSoften       },
+            { "causticDepthDecay",   &g_causticDepthDecay   },
+            { "causticMediumLowpass", &g_causticMediumLowpass },
+            { "causticSpeed",        &g_causticSpeed        },
+            { "causticEma",          &g_causticEma          },
+            { "causticDispGain",     &g_causticDispGain     },
+            { "causticRippleStr",    &g_causticRippleStr    },
+            { "causticWakeStr",      &g_causticWakeStr      },
+            { "causticDynSlope",     &g_causticDynSlope     },
+            { "causticDynHess",      &g_causticDynHess      },
+            { "causticWakePin",      &g_causticWakePin      },
+            // W26: the three "where does it stop" knobs. causticDistFrac is the one the harness
+            // wants for the perf check — 0 turns the distance gate off, so `caustic=` and the tap
+            // count with and without it are an A/B on one env var.
+            { "causticWakeMaxDepth",   &g_causticWakeMaxDepth   },
+            { "causticRippleMaxDepth", &g_causticRippleMaxDepth },
+            { "causticDistFrac",       &g_causticDistFrac       },
+            // W32: the submerged-lamp projector. Env-driven because the checks that matter are the
+            // bit-identity A/B at 0 and the mean-1 check (WATER lvl in the apl split must not move
+            // between 0 and 1), both of which the minimized harness has to run without a click.
+            { "causticProjStr",        &g_causticProjStr        },
+            { "causticProjAbove",      &g_causticProjAbove      },
+            { "causticProjFromAir",    &g_causticProjFromAir    },
+            { "calInteriorFloor",      &g_calInteriorFloor      },
+            // M1 temporal jitter (tasks/forge-upscale.md). Env-driven because the FIRST question it
+            // has to answer is a bit-identity one — does amplitude 0 leave the frame exactly where
+            // it was — and the second is "did the jitter leak into a view it must not move", which
+            // is read off the `atmos=` / gate rows in an unattended log. Neither is a thing anyone
+            // can click a checkbox for during a minimized run.
+            { "jitterAmp",             &g_jitterAmp             },
+            { "mvReactiveT0",          &g_mvReactiveT0          },
+            { "mvReactiveT1",          &g_mvReactiveT1          },
+            { "mvReactiveGain",        &g_mvReactiveGain        },
+            // ⚠ 0 = AUTO since 4d, which is the shipped default: 8 x (output px / input px), i.e.
+            // 8 at DLAA and ~18 at Quality. A positive value pins it, for the A/B that asks whether
+            // the derivation is right — which is the only reason to set it at all now.
+            { "jitterPhases",          &g_jitterPhases          },
+            { "causticRippleStride", &g_causticRippleStride },
+            // W27: the resolution/window trade on the wake map, env-driven so the minimized harness
+            // can A/B 8 u/texel against the W26 16 without a rebuild. The echo below is also how the
+            // wake window gets reported — the creation log prints the grid, not the stride.
+            { "causticWakeStride",   &g_causticWakeStride   },
+            // W28e: the wake sim's k^2 viscosity. Env-driven because the defect it fixes is
+            // PROGRESSIVE — it only shows after the field has been running a while — so measuring it
+            // means a long unattended run, which is exactly what the minimized harness is for.
+            { "wakeGridDamp",        &g_wakeGridDamp        },
+            { "ripGridDamp",         &g_ripGridDamp         },
+            { "causticCalmDisp",     &g_causticCalmDisp     },
+            { "causticCalmHess",     &g_causticCalmHess     },
+            // G1 grass. All four are here because every question G1 has to answer is a MEASUREMENT
+            // the minimized harness must be able to take without a hand on the panel: what does the
+            // field cost at density d and range r (the two perf levers), does the wind actually move
+            // (grassWindGain=0 stands it still, which is the isolation arm), and what does casting
+            // add. See tasks/forge-grass.md.
+            { "grassDensity",        &g_grassDensity        },
+            { "grassRange",          &g_grassRange          },
+            { "grassFadeFrac",       &g_grassFadeFrac       },
+            { "grassWindGain",       &g_grassWindGain       },
+            { "grassAlphaRef",       &g_grassAlphaRef       },
+            { "grassShadowRange",    &g_grassShadowRange    },
+            { "grassShadowOpacity",  &g_grassShadowOpacity  },
+            { "grassShadowDrop",     &g_grassShadowDrop     },
+            // The enhanced-shader polish: the underwater current (its own strength, deliberately not
+            // slaved to |wind|) and the sink LOD. Env-driven for the same reason as the rest —
+            // "does the seaweed still lean in a gale" is a question the minimized harness has to be
+            // able to ask by setting one number to 0.
+            { "grassCurrent",        &g_grassCurrent        },
+            { "grassSinkDepth",      &g_grassSinkDepth      },
+            { "grassSinkJitter",     &g_grassSinkJitter     },
+            // G3: the scatter's two rejections. Both change the FIELD, so setting either forces a
+            // window rebuild — which is the only way an A/B on them is visible without walking a
+            // whole cell first.
+            { "grassAvoidScale",     &g_grassAvoidScale     },
+            { "grassMaxSlopeDeg",    &g_grassMaxSlopeDeg    },
+            // G3 variation + proximity. grassTexCap is here rather than on the panel because it
+            // is consumed ONCE, when the texture residency is built at the first exterior — a
+            // slider for it would be a control that silently does nothing after the first cell.
+            { "grassTexCap",         &g_grassTexCap         },
+            { "staticsTexCap",       &g_staticsTexCap       },
+            { "grassAvoidSoften",    &g_grassAvoidSoften    },
+            { "grassAvoidMinScale",  &g_grassAvoidMinScale  },
+            { "grassScaleVar",       &g_grassScaleVar       },
+            { "grassTintValue",      &g_grassTintValue      },
+            { "grassTintHue",        &g_grassTintHue        },
+            { "grassPatchScale",     &g_grassPatchScale     },
+            { "grassPatchGrain",     &g_grassPatchGrain     },
+            { "grassShadowRecvMode", &g_grassShadowRecvMode },
+            // AO multi-bounce look dials (aomultibounce.h.fsl). 1.0 = the published fit exactly.
+            // gain lightens the occlusion as it adds bounce; chroma adds colour without lightening.
+            { "aoBounceGain",        &g_aoBounceGain        },
+            { "pbrDepth",            &g_pbrDepth            },
+            { "pbrTerrainDepth",     &g_pbrTerrainDepth     },
+            { "pbrTerrainHeightAOStr", &g_pbrTerrainHeightAOStr },
+            { "pbrTerrainHeightAOLod", &g_pbrTerrainHeightAOLod },
+            { "pbrStaticsDepth",     &g_pbrStaticsDepth     },
+            { "terrainTexBias",      &g_terrainTexBias      },
+            // PARALLAX (tasks/forge-parallax.md). Here as well as on the panel because the two
+            // questions this milestone has to answer are both MEASUREMENTS a minimized run has to
+            // be able to take with nobody at a slider: what does each arm cost on terrain (the
+            // interleaved A/B against color 2.30-2.35 ms / dl 1.14 ms), and — the property POM was
+            // rejected in favour of — is the cost the SAME looking down at the ground and along it
+            // at a grazing angle. The second needs the arm pinned for a whole run, and the log then
+            // carries which arm it was measured in.
+            { "parallaxScale",        &g_parallaxScale        },
+            { "parallaxBias",         &g_parallaxBias         },
+            { "parallaxShadowSoften", &g_parallaxShadowSoften },
+            { "parallaxShadowScale",  &g_parallaxShadowScale  },
+            { "heightBlendStrength",  &g_heightBlendStrength  },
+            { "heightBlendContrast",  &g_heightBlendContrast  },
+            // Phase 4a. The displacement's two open questions (does grass follow, does the fade
+            // boundary ghost) are watched in PLAY, but its COST and its fade geometry are read off
+            // an unattended run — and the radius is the dial to shrink first if either bites.
+            { "terrainDispScale",    &g_terrainDispScale    },
+            { "terrainDispGamma",    &g_terrainDispGamma    },
+            { "terrainDispPivot",    &g_terrainDispPivot    },
+            { "terrainDispRadius",   &g_terrainDispRadius   },
+            { "terrainDispFade",     &g_terrainDispFade     },
+            { "terrainDispLod",      &g_terrainDispLod      },
+            { "terrainPatchRung",    &g_terrainPatchRung    },
+            { "pbrGradRadius",       &g_pbrGradRadius       },
+            { "aoBounceChroma",      &g_aoBounceChroma      },
+            { "grassRootAO",         &g_grassRootAO         },
+            { "grassRootAOHeight",   &g_grassRootAOHeight   },
+            { "grassAOFullTile",     &g_grassAOFullTile     },
+            // G7 crush field. Every one of these is here rather than only on the panel because the
+            // acceptance test is a QUEST BODY in grass, and both questions it asks — "is the body
+            // visible" and "what did the field cost" — have to be answerable from a run the harness
+            // started, with no hand on a slider. grassCrushMargin especially: it is the dial to
+            // widen FIRST if the silhouette is physically right but still not legible at range.
+            // ⚠ grassCrushGrid is read ONCE, at resource creation, so setting it here is the only
+            // way to change it at all — the panel deliberately has no slider for it.
+            { "grassCrushGrid",      &g_grassCrushGrid      },
+            { "grassCrushUnits",     &g_grassCrushUnits     },
+            { "grassCrushHealTime",  &g_grassCrushHealTime  },
+            { "grassCrushDwellTime", &g_grassCrushDwellTime },
+            { "grassCrushChargeTime",&g_grassCrushChargeTime},
+            { "grassCrushWeightRef", &g_grassCrushWeightRef },
+            { "grassCrushPlastic",   &g_grassCrushPlastic   },
+            { "grassCrushRingPeriod",&g_grassCrushRingPeriod},
+            { "grassCrushDamping",   &g_grassCrushDamping   },
+            { "grassCrushMargin",    &g_grassCrushMargin    },
+            { "grassCrushBoneRadius",&g_grassCrushBoneRadius},
+            { "grassCrushSlope",     &g_grassCrushSlope     },
+            { "grassCrushFalloff",   &g_grassCrushFalloff   },
+            { "grassCrushPressTime", &g_grassCrushPressTime },
+            { "grassCrushBend",      &g_grassCrushBend      },
+            { "grassCrushSink",      &g_grassCrushSink      },
+            { "grassCrushPlayerRadius", &g_grassCrushPlayerRadius },
+            // MB-2. All three are here as well as on the panel because the two verifications that
+            // matter most are a MEASUREMENT and a RECT, and both have to be runnable from a minimized
+            // harness with nobody at a slider: `mb=` on the gpu split against mbShutter, and the
+            // out/in scale against upscaleMode=2 (at 1x that scale is 1.0 and proves nothing).
+            // H0 the OCCLUSION PROBE. `occProbe` is both the arm and the ALLOCATION trigger — off,
+            // nothing is created and nothing dispatches — and it is env-only for the usual reason:
+            // the whole point is a number read off an unattended run's log, and a minimized harness
+            // cannot click. The other three are the probe's own honesty dials: bias and margin both
+            // push it toward "not occluded", so raising either can only SHRINK the bound it reports,
+            // which is the direction a measurement that could buy machinery has to be able to move.
+            { "occProbe",            &g_occProbe            },
+            { "occProbeSteps",       &g_occProbeSteps       },
+            { "occProbeBias",        &g_occProbeBias        },
+            { "occProbeMargin",      &g_occProbeMargin      },
+            // ⚠ THE KNOB THAT MAKES H0 DECIDABLE. The raw arm is a ceiling and a ceiling cannot tell
+            // 87% from 30%; this one previews H1's min-pyramid, so the pair brackets what H2 would
+            // actually get. Sweep it (0/1/2/3) to see how fast the floor falls as the emulated
+            // pyramid level coarsens — that slope is the real risk in H2. 0 = the self-check arm.
+            { "occProbeMinR",        &g_occProbeMinR        },
+            { "occProbePyr",         &g_occProbePyr         },
+            // H2b: the march's shape. Steps is the cost knob H0b sized (knee at 12); level is how
+            // conservative the field is (1 = a 2-texel min, H1's L1 = 4058 of a 4060 ceiling); bias
+            // and margin are the two "do not occlude yourself" fudges, both in world units.
+            { "reflHeightOccSteps",  &g_reflHeightOccSteps  },
+            { "reflHeightOccLevel",  &g_reflHeightOccLevel  },
+            { "reflHeightOccBias",   &g_reflHeightOccBias   },
+            { "reflHeightOccMargin", &g_reflHeightOccMargin },
+            // THE W-GATE's two dials. `reflWaterGate` itself is a bool and lives in the table below;
+            // these are the pair that decides how much of the view the test consults and how far above
+            // MW's level the plane sits for it. Range is the one worth sweeping from a harness — it is
+            // the only lever on "a single sea cell at the fog horizon holds the gate open", and the
+            // arm that shows it is 0 (the shipped, fully-conservative value) against 4/8/16 cells.
+            { "reflWaterGateRange",  &g_reflWaterGateRange  },
+            { "reflWaterGateBias",   &g_reflWaterGateBias   },
+            // The SCREEN arm's only dial: consecutive dry frames before the pass stops. 1 is the
+            // most aggressive (and the arm that measures the ceiling); raising it costs nothing but
+            // the first few frames of a genuinely dry view.
+            { "reflWaterGateHold",   &g_reflWaterGateHold   },
+            // REFLECTION FIDELITY. All three ship as AUTO (-1) and all three are here because the
+            // verification is a TABLE — fidelity 1.0/0.75/0.5/0.25 crossed with LOD 0/+1/+2 — and a
+            // table needs distance and detail moved INDEPENDENTLY, which the single derived scalar
+            // deliberately cannot do. `reflFidelity=1` is also the exact identity arm: it is what the
+            // roughness curve returns at the shipped wave amplitude, so pinning it must not move the
+            // frame at all, and that is the regression test for the whole of part 2's plumbing.
+            { "reflFidelity",        &g_reflFidelity        },
+            { "reflDistScale",       &g_reflDistScale       },
+            { "reflLodBias",         &g_reflLodBias         },
+            { "mbShutter",           &g_mbShutter           },
+            { "mbShutterFps",        &g_mbShutterFps        },
+            { "mbTileJitter",        &g_mbTileJitter        },
+            { "mbMinPx",             &g_mbMinPx             },
+            { "mbSoftZ",             &g_mbSoftZ             },
+    };
+    const BKnob bknobs[] = {
+            // PBR materials master switch: 0 must be today's image exactly (pack-time gate).
+            // WHICH SUN THE SHADOWS ARE STRUCK FOR. Ships ON, so this token is the way BACK to
+            // MW's own light arc — and the A/B for it is a walk at a fixed hour, which is a run,
+            // not a click.
+            { "sunLightFollowsDisc", &g_sunLightFollowsDisc },
+            { "pbrEnable", &g_pbrEnable },
+            // ...and TERRAIN's, which is a shader lane instead (see g_pbrTerrain). Here as well as
+            // on the panel because terrain is most of the screen, so this is the one PBR A/B whose
+            // cost has to be measured on a minimized harness run with nobody at the panel.
+            { "pbrTerrain", &g_pbrTerrain },
+            { "pbrTerrainHeightAO", &g_pbrTerrainHeightAO },
+            // ...and DISTANT STATICS', a lane for the same reason (see g_pbrStatics). Env-armed as
+            // well as on the panel because the thing being judged is a HANDOVER: it wants an A/B of
+            // the same object from the same spot, which is a harness run, not a checkbox click.
+            { "pbrStatics", &g_pbrStatics },
+            // ...and WHERE the distant sun is evaluated. Deliberately NOT under the pbrStatics gate:
+            // the defects it fixes lit every distant static, not just the 116 with a companion.
+            { "staticsSunPerPixel", &g_staticsSunPerPixel },
+            // The distant-ground sparkle A/B (see g_terrainTexGrad). Env-armed because the arm has
+            // to be pinned for a whole run, and the log then carries which one it was measured in.
+            { "terrainTexGrad", &g_terrainTexGrad },
+            // PARALLAX's five arms. Env-armed because every one of them SHIPS OFF and the thing
+            // being measured is the delta each one costs — which means a run with exactly one of
+            // them pinned, interleaved against a run with none ([[feedback_perf_ab_must_be_interleaved]]).
+            // A panel click cannot do that from a minimized harness.
+            { "parallaxMesh",    &g_parallaxMesh    },
+            { "parallaxTerrain", &g_parallaxTerrain },
+            { "parallaxShadows", &g_parallaxShadows },
+            { "heightBlend",     &g_heightBlend     },
+            { "terrainDisp",     &g_terrainDisp     },
+            // ...and the view that judges the last one. Env-armed so a displacement run can be
+            // LAUNCHED into the lattice view instead of arriving at a shaded frame and then hunting
+            // for the checkbox: the thing being inspected (the fade ring, the skipped stitch rows)
+            // is at a particular place in the world, and you want the view already on when you
+            // walk there.
+            { "terrainWire",     &g_terrainWire     },
+            // H2a: the WATER MIRROR's GPU cull lane, and its VERIFY twin. Both DEFAULT OFF, and both
+            // are env-only for the same reason every other arm in this table is: the A/B is a
+            // measurement on a minimized run and there is nobody at the panel.
+            //   reflCullVerify=1 — run the lane BESIDE the CPU cull and print the parity. The one
+            //     configuration where `reflCull ... MATCH` means anything, because with the lane
+            //     driving the draw there is no CPU number left to compare against.
+            //   reflGpuCull=1    — let the lane DRIVE the draw and skip the CPU cell-walk. This is
+            //     the arm the command wall is measured in ([[forge-heightfield-occlusion]] H2a):
+            //     the compacted CPU ring issues a few hundred indirect commands, the GPU one issues
+            //     cullSubsetCount ~= 10,910 regardless of survivors.
+            { "reflGpuCull",         &g_reflGpuCull         },
+            { "reflCullVerify",      &g_reflCullVerify      },
+            // H2b: the march itself. Needs `reflGpuCull=1` too — the test lives in the GPU lane.
+            { "reflHeightOcc",       &g_reflHeightOcc       },
+            // M1 motion vectors — env-driven so an unattended run can turn the dispatch on and read
+            // `[forge-hb] mv:` back without anyone at the panel. tasks/forge-upscale.md.
+            { "mvEnable",            &g_mvEnable            },
+            // MB-2's master A/B. ⚠ SHIPS **ON** — this is the consumer, and the point of the
+            // milestone is to see it — so this token is how a run turns it OFF. `mbEnable=0` must be
+            // a BYTE-IDENTICAL no-op (no dispatch; the resolve binds the instance it binds today),
+            // which is verification step 1 and the first thing to try when bisecting anything
+            // post-upscale.
+            { "mbEnable",            &g_mbEnable            },
+            // MB-2d. The A/B is a LOOK question and a COST question at once — object-only removes the
+            // camera smear AND most of the gather's work — so it has to be reachable from a minimized
+            // run, like every other arm in this table.
+            { "mbObjectOnly",        &g_mbObjectOnly        },
+            { "objVelEnable",        &g_objVelEnable        },
+            { "objVelAllItems",      &g_objVelAllItems      },
+            { "objVelSkipStill",     &g_objVelSkipStill     },
+            { "mbTwoDir",            &g_mbTwoDir            },
+            { "mbRecon",             &g_mbRecon             },
+
+            { "objVelSkinned",       &g_objVelSkinnedLane   },
+            { "objVelFP",            &g_objVelFPLane        },
+            { "objVelSkinIgnoreGen", &g_objVelSkinIgnoreGen },
+
+            // M1 step 4b: the master arm. ⚠ READ AT INIT — it decides whether the backend and its
+            // ~56 MB target are CREATED, so it does nothing if flipped later, which is exactly why it
+            // belongs here rather than only on the panel. Ships **ON** (the panel's input-scale
+            // slider needs a consumer); set it to **0** to reproduce the pre-4b build with nothing
+            // extra allocated, which is verification step 1 and the first thing to try when
+            // bisecting anything post-process.
+            { "upscaleEnable",       &g_upscaleEnable       },
+            // The ReShade/overlay surface. Read at INIT (it decides whether a window and swapchain
+            // are created at all), which is why it is here and has no panel checkbox — the panel it
+            // would live on is drawn into the game's frame, not this window.
+            { "hostWindow",          &g_hostWindow          },
+            // ⚠ A SUBMIT BOUNDARY IS A SCHEDULING BOUNDARY. The frame is recorded into two command
+            // buffers and submitted twice (chunk A ends just before the reflect pass) so the CPU can
+            // get chunk A onto the GPU sooner. That is a real win on the CPU side, but it also hands
+            // Windows a second point at which it may run the OTHER process on this GPU -- and the
+            // stall latch says something external to every pass is costing up to 2.1 ms in 43-71% of
+            // frames. Whether the split helps or hurts is now measurable rather than assumed.
+            { "splitSubmit",         &g_splitSubmit         },
+            // M1 4d. ⚠ jitterForce IS A MEASUREMENT, NOT A SETTING: it bypasses the producer gate
+            // in jitterAmp() so M1 step 1's isolation test — jitter alone, no upscaler, the image
+            // must shimmer sub-pixel while the atmos/gate rows do not move — stays runnable in a
+            // build where the gate would otherwise suppress exactly that state.
+            { "jitterForce",         &g_jitterForce         },
+            // ...and the one motion-vector convention 4d could not settle by reading. It ships true
+            // (our vectors are written at the INPUT rect) and it is INVISIBLE at DLAA, so if DLAA is
+            // clean and Quality smears, this is the first thing to flip.
+            { "upscaleMvLowRes",     &g_upscaleMvLowRes     },
+            // The two optional DLSS inputs. 0 on either is an isolation arm — the only two things a
+            // temporal backend can be asked to run without, so between them they localise a fault
+            // that names no resource of its own.
+            { "upscaleNgxExposure",  &g_upscaleSuppliedExposure },
+            { "upscaleNgxReactive",  &g_upscaleNgxReactive      },
+            { "atmosMoonOn",        &g_atmosMoonOn        },
+            // ⚠ THE GATE'S OWN ARM. OFF skips the one reference-configuration frame at startup —
+            // which is the setting for a session that wants its first frame to be live weather, and
+            // NOT the setting for a bring-up. A gate nobody runs is a gate nobody has.
+            { "atmosGate",          &g_atmosGate          },
+            // The LUT-cache control arm. 0 = rebuild the chain every frame, i.e. the behaviour
+            // every measurement before 2026-09-06 was taken in.
+            { "atmosCache",         &g_atmosCache         },
+            // ⚠ waterNoReflect IS NOT A COST LEVER. It sets water shader flag bit 18 (sample the
+            // transmitted path only) and does not touch the reflection RENDER at all — measured
+            // 2026-09-06: with it set, `reflect=1.84 refl geo=1.66` unchanged and the frame 0.05 ms
+            // faster, i.e. nothing. An arm that silently does not take reads exactly like a pass
+            // that costs nothing, so the three checkboxes that DO gate the render are next to it
+            // now: reflect re-renders the world into pReflectColor every frame and was the second
+            // largest exterior phase with no way for a minimized harness to switch it off.
+            { "waterNoReflect",     &g_waterNoReflect     },
+            { "drawReflect",        &g_drawReflect        },
+            { "drawReflectGeo",     &g_drawReflectGeo     },
+            { "drawReflectNear",    &g_drawReflectNear    },
+            // THE W-GATE's arm. This is the one that restores the DX9 proxy-box behaviour — no water
+            // on screen, no reflection drawn — and it is the whole `reflect` phase, so it is here for
+            // the same reason the three above it are: the A/B is a minimized-harness measurement and
+            // the instrument that justifies it prints on every run whether or not this is set.
+            { "reflWaterGate",      &g_reflWaterGate      },
+            { "waterSunTrueElev",   &g_waterSunTrueElev   },
+            { "aplSplitWater",      &g_aplSplitWater      },
+            { "aplSkipSky",         &g_aplSkipSky         },
+            { "causticOn",          &g_causticOn          },
+            // AO's two big levers. halfRes is here because it is a 4x PIXEL COUNT change hiding
+            // behind a dev-panel checkbox, and the harness runs minimized — so the one A/B that
+            // separates "AO is slow" from "AO is running full-res" could not be driven at all.
+            { "aoHalfRes",          &g_aoHalfRes          },
+            { "aoEnable",           &g_aoEnable           },
+            // 0 = hardware ResolveSubresource (a box average, and format-locked). The floor this
+            // pass is measured against.
+            { "customResolve",      &g_customResolve      },
+            // 0 = keep the Catmull-Rom loop inside resolve.frag (64 MSAA Loads/pixel), 1 = the
+            // separable LDS compute pass (9). Same filter, so this is a PERF knob whose look delta
+            // must be zero — and the way to prove that from a minimized harness is the APL line.
+            { "resolveCompute",     &g_resolveCompute     },
+            // W24: the two wave sims themselves, because the dynamic caustic layers are DOWNSTREAM
+            // of them — a layer whose field nobody steps is a layer that does nothing at any
+            // strength, and the minimized harness cannot reach either checkbox. Both default ON
+            // since W24b, so these are here to turn a layer OFF for an A/B rather than on.
+            { "ripSimOn",           &g_ripSimOn           },
+            { "wakeOn",             &g_wakeOn             },
+            // W25: the flat test now disarms ALL THREE caustic layers, which makes it the one-switch
+            // proof that what is on screen is being cast by the surface and not painted on.
+            { "waterFlatTest",      &g_waterFlatTest      },
+            // The interior setpoint rule, env-driven because its whole A/B is a LEVEL and the
+            // minimized harness is the only way to measure one without a hand on the exposure.
+            { "calFollowMwInterior", &g_calFollowMwInterior },
+            // B1's A/B. The interior setpoint tracks the cell's authored ambient (a FLOOR) while the
+            // APL meter reports a frame MEAN dominated by lamp pools; this makes the target a mean
+            // too. Off by default until the picture has been looked at — see mwRefLevelInteriorLit.
+            { "calInteriorLit",      &g_calInteriorLit      },
+            // The servo itself. OFF pins E to exactly 1.0, which in this unit convention is the
+            // "reproduce MW" arm — the only way to measure what the plant delivers with no gain on
+            // it, and therefore the only way to say what an interior setpoint SHOULD be rather than
+            // guessing one. See the interior calibration work in tasks/lighting.md.
+            { "expEnable",           &g_expEnable           },
+            // G1: the master A/B ("grass off must be bit-identical to today") and the one that
+            // demonstrates the G1a near-cut trap — grassNearCut=1 re-arms the statics lane's cut and
+            // ownership on the grass lane, which is the hole around the player, on purpose.
+            // AO multi-bounce (aomultibounce.h.fsl). 0 = the scalar `ambient *= visibility` that
+            // shipped, byte for byte, so every AO measurement predating it stays comparable.
+            { "aoMultiBounce",       &g_aoMultiBounce       },
+            { "grassOn",             &g_drawGrass           },
+            // G1f: the Z-prepass pair. 0 restores the single GEQUAL draw with grass.frag's own
+            // SV_Coverage — i.e. the exact shader that shipped — so this knob, unlike grassOn,
+            // prices the OVERDRAW alone: same blades, same cull, same vertex work on both arms.
+            { "grassPrepass",        &g_grassPrepass        },
+            { "grassShadows",        &g_grassShadows        },
+            { "grassNearCut",        &g_grassNearCut        },
+            // 0 = ignore the authored red channel and treat every subset as foliage (stock's
+            // behaviour). The A/B that shows the rocks and stiff shrubs swaying like wheat.
+            { "grassVColFlag",       &g_grassVColFlag       },
+            { "grassAvoidStatics",   &g_grassAvoidStatics   },
+            { "grassPointLights",    &g_grassPointLights    },
+            // G7: the master A/B. 0 must restore today's grass EXACTLY — grass.vert branches on the
+            // arm rather than multiplying by it, so with this off not one texture fetch is paid.
+            { "grassCrush",          &g_grassCrush          },
+    };
+    const UKnob uknobs[] = {
+            // MEMORY ALARM envelopes (tasks/forge-memory-shape.md) — see g_memHighResMax.
+            { "memHighResMax",    &g_memHighResMax,    4096u },
+            { "memNearTexMB",     &g_memNearTexMB,     65536u },
+            { "memBudgetWarnPct", &g_memBudgetWarnPct, 1000u },
+            { "memOtherDriftMB",  &g_memOtherDriftMB,  65536u },
+            // AO DITHER SOURCE: 0 = legacy 4x4 tile, 1 = blue noise FROZEN (slice 0), 2 =
+            // spatiotemporal, 3 = complementary 2x2 quad frozen (the DEFAULT), 4 = that quad with a
+            // rigid per-frame quarter turn. The A/B this milestone needs is 3 against 1 — same cost,
+            // same slice budget, the only difference being whether a 2x2 neighbourhood sweeps a
+            // COMPLETE angular set or four random draws from a continuum.
+            { "aoDither",       &g_aoDither,       4u },
+            // Frames per STBN slice. Raising it slows the cycle (trades decorrelation for calm)
+            // without giving up the temporal axis entirely — the middle setting between rungs 2
+            // and 1. See [[project_forge_ao_stbn_dither]].
+            { "aoDitherStride", &g_aoDitherStride, 64u },
+            // AO BLUR VARIANT: 0 = 2D radius 3 (the reference), 1 = separable radius 3 (same reach,
+            // ~2x cheaper — isolates the separable range weight's approximation), 2 = separable
+            // radius 6 (double the reach and still fewer taps than 0 — the arm for half-res dither
+            // grain, which a +-3 kernel at a resolvable sigma cannot swallow).
+            { "aoBlurMode",     &g_aoBlurMode,     (uint32_t)kAOBlurModeCount - 1u },
+            { "aoUpProf",       &g_aoUpProf,       4u },
+            // 0 Off, 1 DLAA, 2 Quality, 3 Balanced, 4 Performance, 5 UltraPerformance. LIVE on the
+            // panel; here because the minimized perf harness cannot open a dropdown, and the A/B
+            // this milestone actually needs — DLSS off vs DLAA vs Quality at the same camera — is
+            // three runs of one token.
+            { "upscaleMode", &g_upscaleMode, (uint32_t)kUpscaleModeCount - 1u },
+            { "objVelDepthMode", &g_objVelDepthMode, 3u },
+            // 0 Default, 1 K, 2 J, 3 L, 4 M. ⚠ The legacy CNN presets E and F are NOT selectable:
+            // preset E hangs the GPU on runtime 310.8.0 (see upscale.h). K vs J is the A/B that
+            // remains, and it is one token.
+            { "upscalePreset", &g_upscalePreset, (uint32_t)kUpscalePresetCount - 1u },
+            // MB-2. K is clamped again at dispatch time to [kMbTileKMin, kMbTileKMax] — the table's
+            // max only stops a typo from being accepted silently, and the dispatch's clamp is what
+            // keeps the tile grid inside the surfaces it was allocated for.
+            { "mbTileK",   &g_mbTileK,   kMbTileKMax },
+            // MB-2l. The MAXIMUM STREAK is mbTileK * mbTileReach, so these two are the A/B pair:
+            // `mbTileK=96 mbTileReach=1` is the pre-MB-2l filter exactly.
+            { "mbTileReach", &g_mbTileReach, kMbTileReachMax },
+            { "mbMaxTaps", &g_mbMaxTaps, 64u },
+            { "mbDebug",   &g_mbDebug,   4u },
+            // MB-2o: 0 the streak mean, 1 the nearest sample, 2 reflected at the silhouette.
+            { "mbBgMode",  &g_mbBgMode,  2u },
+            // PBR: 0 cd (live DX9), 1 cdbs, 2 bspline, 3 RETIRED (runs 4), 4 cdblur; frame 0 cotangent,
+            // 1 surface gradient.
+            { "pbrGradMode",  &g_pbrGradMode,  4u },
+            { "pbrFrameMode", &g_pbrFrameMode, 1u },
+            // PARALLAX iteration count: 0 = identity (the A/B), 1 = DX9's single offset, 2 ships.
+            // The cost is exactly this many taps at every view angle, so it is also the independent
+            // variable of the grazing-angle check that justifies not using POM.
+            { "parallaxSteps", &g_parallaxSteps, 8u },
+    };
+    const SKnob sknobs[] = {
+            // M1 4d: `passthrough` (default) or `ngx`. Read at INIT — it decides which object is
+            // CREATED — so it belongs here rather than only on the panel, and there is deliberately
+            // no panel control for the same reason `upscaleEnable` has none: a widget that silently
+            // does nothing after startup is worse than none. An unrecognised value REFUSES rather
+            // than falling back, so a typo cannot produce a run labelled DLSS that rendered a
+            // Catmull-Rom.
+            { "upscaleBackend", g_upscaleBackend, sizeof(g_upscaleBackend) },
+    };
+
+    // Pointer -> the stable MGE_HOST_KNOBS name, or nullptr. Linear over 244 entries, called only
+    // when the panel is built or saved.
+    inline const char* knobNameOf(const void* p) {
+        for (const FKnob& k : fknobs) { if (k.p == p) { return k.name; } }
+        for (const BKnob& k : bknobs) { if (k.p == p) { return k.name; } }
+        for (const UKnob& k : uknobs) { if (k.p == p) { return k.name; } }
+        return nullptr;
+    }
+
+    // ─── A STABLE SAVE KEY FOR EVERY WIDGET ────────────────────────────────────────────
+    // Saving needs a name per knob, and the MGE_HOST_KNOBS table only has one for 244 of the 503
+    // controls here — so a save built on it alone would silently drop half of what you tuned. The
+    // rest get a key derived from where they live and what they are called.
+    //
+    // PRIORITY IS THE ENV NAME WHERE ONE EXISTS, always. That is what keeps the saved file and a
+    // harness arm the same language: any line with an env name can be pasted straight into
+    // MGE_HOST_KNOBS, and a knob can never end up with two names that disagree.
+    //
+    // The derived key cuts the label at its EXPLANATION, not at its end: these labels are
+    // documentation ("Grass: density (per-blade hash — raising it only ADDS blades)") and the
+    // parenthetical is the part that actually churns. Cutting there means rewording an explanation
+    // does not orphan a saved value; renaming the control itself does, and that is reported on load
+    // rather than swallowed.
+    //
+    // ⚠ IT DOES NOT CUT AT THE EM DASH, and that was a real bug the audit caught. The first draft
+    // treated "—" as an explanation marker too, which collapsed
+    //   "Flicker: amp guard — candle radius (no extra swing)"
+    //   "Flicker: amp guard — lantern radius (full swing)"
+    // onto ONE key: two different knobs, one line in the file, and whichever matched first would
+    // have eaten the other every session. In these labels a dash introduces the control's own NAME
+    // at least as often as its explanation, so only the parenthetical is a safe cut. See
+    // panelAuditKeys — this is exactly what it exists to refuse.
+    static std::string panelSlug(const char* s, size_t cap) {
+        std::string o;
+        bool lastUnd = true;                     // suppresses a leading '_'
+        for (const char* p = s; *p && o.size() < cap; ++p) {
+            const unsigned char c = (unsigned char)*p;
+            if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')) { o.push_back((char)c); lastUnd = false; }
+            else if (c >= 'A' && c <= 'Z') { o.push_back((char)(c - 'A' + 'a')); lastUnd = false; }
+            else if (!lastUnd) { o.push_back('_'); lastUnd = true; }
+        }
+        while (!o.empty() && o.back() == '_') { o.pop_back(); }
+        return o;
+    }
+    static std::string panelDerivedKey(const char* tab, const char* label) {
+        std::string head(label ? label : "");
+        // Cut at the first explanation marker. The em dash is three UTF-8 bytes; comparing the
+        // encoded form is exactly as stable as comparing the code point and needs no decoder.
+        static const char* const kCuts[] = { " (", ";" };
+        for (const char* cut : kCuts) {
+            const size_t at = head.find(cut);
+            if (at != std::string::npos) { head.resize(at); }
+        }
+        return panelSlug(tab, 20) + "." + panelSlug(head.c_str(), 56);
+    }
+
     struct PanelItem {
         WidgetType  type;
         const char* label;      // pooled, see labelPool
@@ -21445,6 +22341,13 @@ namespace {
         WidgetCallback onPress;     // button
         void*       user;
         float4*     color;          // dynamicText
+        // ── SAVE / RESET ───────────────────────────────────────────────────────────
+        // `def` is the COMPILED-IN default widened to double, captured at build time through
+        // knobDefault() so an env override cannot masquerade as one. `key` is the save name
+        // (pooled): the MGE_HOST_KNOBS name where the knob has one, otherwise the derived key.
+        // Both are empty/unused for the three value-less widget types.
+        double      def;
+        const char* key;
     };
     struct PanelTab {
         const char* name;
@@ -21473,7 +22376,25 @@ namespace {
             g_panelLabelPool.emplace_back(s ? s : "");
             return g_panelLabelPool.back().c_str();
         }
-        void push(PanelItem it) { items.push_back(it); }
+        // Capture the default and the save key here, at the ONE place every widget passes through,
+        // rather than at 503 call sites. A widget with no value (label/button/dynamicText) gets
+        // neither and is skipped by save, reset and the modified tint alike.
+        void push(PanelItem it) {
+            switch (it.type) {
+            case WIDGET_TYPE_CHECKBOX:     it.def = knobDefault(it.data, *(bool*)it.data ? 1.0 : 0.0); break;
+            case WIDGET_TYPE_SLIDER_FLOAT:
+            case WIDGET_TYPE_TEXTBOX:      it.def = knobDefault(it.data, (double)*(float*)it.data); break;
+            case WIDGET_TYPE_SLIDER_UINT:
+            case WIDGET_TYPE_DROPDOWN:     it.def = knobDefault(it.data, (double)*(uint32_t*)it.data); break;
+            default:                       break;   // label / button / dynamicText: no value
+            }
+            if (it.data && it.type != WIDGET_TYPE_DYNAMIC_TEXT && it.type != WIDGET_TYPE_LABEL
+                        && it.type != WIDGET_TYPE_BUTTON) {
+                const char* envName = knobNameOf(it.data);
+                it.key = envName ? pool(envName) : pool(panelDerivedKey(name, it.label).c_str());
+            }
+            items.push_back(it);
+        }
 
         void checkbox(const char* label, bool* p) {
             PanelItem it = {}; it.type = WIDGET_TYPE_CHECKBOX; it.label = pool(label); it.data = p;
@@ -21487,6 +22408,18 @@ namespace {
         void sliderU(const char* label, uint32_t* p, uint32_t mn, uint32_t mx, uint32_t st) {
             PanelItem it = {}; it.type = WIDGET_TYPE_SLIDER_UINT; it.label = pool(label); it.data = p;
             it.umin = mn; it.umax = mx; it.ustep = st;
+            push(it);
+        }
+        // A TYPED number, with NO min/max at all. sliderF's bounds are a look dial's friend and a
+        // measurement's enemy: they decide in advance which values are worth trying, and the value
+        // you need to reach to prove a hypothesis is very often outside them (the sun far-shadow
+        // REACH shipped with a floor of 2048, so "turn it down until the artifact goes" was a
+        // question the panel could not be asked). Use this wherever the interesting settings are at
+        // both ends of orders of magnitude, or where the answer is a NUMBER someone read somewhere
+        // rather than a position on a bar. The CONSUMER must clamp — nothing here does.
+        void inputF(const char* label, float* p, float step, const char* fmt = nullptr) {
+            PanelItem it = {}; it.type = WIDGET_TYPE_TEXTBOX; it.label = pool(label); it.data = p;
+            it.fstep = step; it.fmt = fmt ? pool(fmt) : nullptr;
             push(it);
         }
         void dropdown(const char* label, uint32_t* p, const char* const* names, uint32_t count) {
@@ -21562,38 +22495,179 @@ namespace {
     // window, so the wrap is stable even if the flag is reintroduced by a Forge update.
     float g_panelWrapX = 600.0f;
 
-    static void panelLabel(const char* label) {
+    // Is this widget's value away from the compiled-in default? Drives the label tint and what
+    // Save writes. A value-less widget is never "modified".
+    static bool panelModified(const PanelItem& it) {
+        if (!it.data || !it.key) { return false; }
+        switch (it.type) {
+        case WIDGET_TYPE_CHECKBOX:     return (*(bool*)it.data ? 1.0 : 0.0) != it.def;
+        case WIDGET_TYPE_SLIDER_FLOAT:
+        case WIDGET_TYPE_TEXTBOX:      return (double)*(float*)it.data != it.def;
+        case WIDGET_TYPE_SLIDER_UINT:
+        case WIDGET_TYPE_DROPDOWN:     return (double)*(uint32_t*)it.data != it.def;
+        default:                       return false;
+        }
+    }
+    static void panelResetItem(const PanelItem& it) {
+        if (!it.data) { return; }
+        switch (it.type) {
+        case WIDGET_TYPE_CHECKBOX:     *(bool*)it.data = (it.def != 0.0); break;
+        case WIDGET_TYPE_SLIDER_FLOAT:
+        case WIDGET_TYPE_TEXTBOX:      *(float*)it.data = (float)it.def; break;
+        case WIDGET_TYPE_SLIDER_UINT:
+        case WIDGET_TYPE_DROPDOWN:     *(uint32_t*)it.data = (uint32_t)it.def; break;
+        default:                       break;
+        }
+    }
+
+    // MODIFIED ROWS ARE TINTED. With 503 controls the question you actually have in front of the
+    // panel is not "what is this set to" but "what have I changed", and that had no answer at all
+    // before: a tuned knob looked exactly like an untouched one. This is the same test Save uses,
+    // so the highlighted rows ARE the file.
+    static void panelLabel(const char* label, bool modified = false) {
         ImGui::SameLine();
         ImGui::PushTextWrapPos(g_panelWrapX);
+        if (modified) { ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.00f, 0.80f, 0.35f, 1.00f)); }
         ImGui::TextUnformatted(label);
+        if (modified) { ImGui::PopStyleColor(); }
         ImGui::PopTextWrapPos();
+    }
+
+    // The hover card + the right-click reset, on whichever control was just submitted. Everything a
+    // knob will not fit in its label: what it defaults to, what it spans, and the two ImGui gestures
+    // nobody discovers by looking (ctrl+click to TYPE a value, alt-drag to fine-tune).
+    static void panelKnobAffordances(const PanelItem& it, bool hasRange, double lo, double hi) {
+        const bool dragged = (it.type == WIDGET_TYPE_SLIDER_FLOAT || it.type == WIDGET_TYPE_SLIDER_UINT);
+        if (ImGui::IsItemHovered()) {
+            ImGui::BeginTooltip();
+            // The default, spelled the way the control spells its value — "default 2" under a
+            // dropdown is a number nobody can check against what they are looking at.
+            if (it.type == WIDGET_TYPE_CHECKBOX) {
+                ImGui::Text("default: %s", it.def != 0.0 ? "on" : "off");
+            } else if (it.type == WIDGET_TYPE_DROPDOWN && it.names
+                       && (uint32_t)it.def < it.count) {
+                ImGui::Text("default: %s", it.names[(uint32_t)it.def]);
+            } else if (hasRange) {
+                ImGui::Text("default %g   \xe2\x80\xa2   range %g .. %g", it.def, lo, hi);
+            } else {
+                ImGui::Text("default %g", it.def);
+            }
+            // The gestures nobody discovers by looking. Only claimed where they exist: a checkbox
+            // has no step and no drag, and saying it had one would be the same class of lie as a
+            // widget that silently does nothing.
+            if (dragged) {
+                ImGui::TextDisabled("\xe2\x88\x92 / + step by %g   \xe2\x80\xa2   ctrl+click to type"
+                                    "   \xe2\x80\xa2   alt-drag = 100x finer, shift-drag = 10x coarser",
+                                    it.type == WIDGET_TYPE_SLIDER_FLOAT
+                                        ? (it.fstep > 0.0f ? (double)it.fstep : 0.01)
+                                        : (double)(it.ustep ? it.ustep : 1u));
+            }
+            ImGui::TextDisabled("right-click to reset to default");
+            ImGui::EndTooltip();
+        }
+        if (ImGui::BeginPopupContextItem("##rst")) {
+            if (ImGui::MenuItem("Reset to default")) { panelResetItem(it); }
+            ImGui::EndPopup();
+        }
+    }
+
+    // \u26a0 THE DRAG SPEED IS NO LONGER THE STEP, AND THAT IS THE "too sensitive" FIX.
+    // DragFloat's speed is units-per-PIXEL, and passing the step made a knob's feel depend on a
+    // number chosen for a different purpose: terrainDispFade spans 16384 with a step of 64, so its
+    // whole range was 256 px of travel and a 3-pixel twitch moved it 200 units. Deriving the speed
+    // from the RANGE gives every knob the same gesture — a full sweep is ~800 px whatever it
+    // measures — and hands the step back to the +/- buttons, where it means "one click, one step,
+    // exactly". Unbounded knobs (inputF) keep the step, because there is no range to divide.
+    static float panelDragSpeed(const PanelItem& it) {
+        if (it.fmax > it.fmin) { return (it.fmax - it.fmin) / 800.0f; }
+        return it.fstep > 0.0f ? it.fstep : 0.01f;
+    }
+    // One +/- click. SNAP-THEN-STEP, deliberately: after a drag the value is some arbitrary
+    // 1283.71, and stepping from there would walk a ladder of arbitrary numbers forever. Rounding
+    // to the step first means the buttons always land on the round values the step was chosen to
+    // express, which is what makes them feel like detents rather than nudges.
+    static float panelStepValue(float v, float step, int dir, float lo, float hi) {
+        if (!(step > 0.0f)) { step = 0.01f; }
+        float out = (std::round(v / step) + (float)dir) * step;
+        if (hi > lo) { out = out < lo ? lo : (out > hi ? hi : out); }
+        return out;
+    }
+
+    // A row's [-] [control] [+]. The two buttons are ImGui repeat buttons — hold to run — and they
+    // are sized to the frame height so the row's total width is still CalcItemWidth().
+    static void panelStepperRow(const PanelItem& it, bool isFloat) {
+        const float full = ImGui::CalcItemWidth();
+        const float bw   = ImGui::GetFrameHeight();
+        const float sp   = ImGui::GetStyle().ItemInnerSpacing.x;
+        const float mid  = full - 2.0f * (bw + sp);
+        const bool  mod  = panelModified(it);
+
+        ImGui::PushButtonRepeat(true);
+        const bool dec = ImGui::Button("-", ImVec2(bw, bw));
+        ImGui::SameLine(0.0f, sp);
+        ImGui::SetNextItemWidth(mid > 40.0f ? mid : 40.0f);
+        if (isFloat) {
+            ImGui::DragFloat("##v", (float*)it.data, panelDragSpeed(it),
+                             it.fmin, it.fmax, it.fmt ? it.fmt : "%.3f");
+            panelKnobAffordances(it, it.fmax > it.fmin, (double)it.fmin, (double)it.fmax);
+        } else {
+            int v = (int)*(uint32_t*)it.data;
+            const float speed = (it.umax > it.umin) ? (float)(it.umax - it.umin) / 800.0f : 1.0f;
+            if (ImGui::DragInt("##v", &v, speed < 0.05f ? 0.05f : speed, (int)it.umin, (int)it.umax)) {
+                if (v < (int)it.umin) { v = (int)it.umin; }
+                if (v > (int)it.umax) { v = (int)it.umax; }
+                *(uint32_t*)it.data = (uint32_t)v;
+            }
+            panelKnobAffordances(it, it.umax > it.umin, (double)it.umin, (double)it.umax);
+        }
+        ImGui::SameLine(0.0f, sp);
+        const bool inc = ImGui::Button("+", ImVec2(bw, bw));
+        ImGui::PopButtonRepeat();
+
+        if (dec || inc) {
+            const int dir = inc ? 1 : -1;
+            if (isFloat) {
+                *(float*)it.data = panelStepValue(*(float*)it.data,
+                                                  it.fstep > 0.0f ? it.fstep : 0.01f,
+                                                  dir, it.fmin, it.fmax);
+            } else {
+                const int step = (int)(it.ustep ? it.ustep : 1u);
+                long v = (long)*(uint32_t*)it.data + (long)dir * step;
+                if (v < (long)it.umin) { v = (long)it.umin; }
+                if (v > (long)it.umax) { v = (long)it.umax; }
+                *(uint32_t*)it.data = (uint32_t)v;
+            }
+        }
+        panelLabel(it.label, mod);
     }
 
     static void panelDrawItem(const PanelItem& it) {
         switch (it.type) {
         case WIDGET_TYPE_CHECKBOX:
             ImGui::Checkbox("##v", (bool*)it.data);
-            panelLabel(it.label);
+            panelKnobAffordances(it, false, 0.0, 0.0);
+            panelLabel(it.label, panelModified(it));
             break;
         case WIDGET_TYPE_SLIDER_FLOAT:
             // DragFloat, not SliderFloat: these ranges span 0..1 and 0..65536 across the panel, and a
-            // drag honours the step the Forge slider took while still allowing ctrl+click to TYPE an
-            // exact value — which is what a measurement session actually needs.
-            ImGui::DragFloat("##v", (float*)it.data, it.fstep > 0.0f ? it.fstep : 0.01f,
-                             it.fmin, it.fmax, it.fmt ? it.fmt : "%.3f");
-            panelLabel(it.label);
+            // drag still allows ctrl+click to TYPE an exact value — which is what a measurement
+            // session actually needs. The [-]/[+] detents around it are the LOOK session's half; see
+            // panelDragSpeed for why the drag no longer moves by the step.
+            panelStepperRow(it, /*isFloat*/true);
             break;
-        case WIDGET_TYPE_SLIDER_UINT: {
-            int v = (int)*(uint32_t*)it.data;
-            if (ImGui::DragInt("##v", &v, (float)(it.ustep ? it.ustep : 1u),
-                               (int)it.umin, (int)it.umax)) {
-                if (v < (int)it.umin) { v = (int)it.umin; }
-                if (v > (int)it.umax) { v = (int)it.umax; }
-                *(uint32_t*)it.data = (uint32_t)v;
-            }
-            panelLabel(it.label);
+        case WIDGET_TYPE_TEXTBOX:
+            // TabBuilder::inputF — a typed value with no bounds. The +/- step buttons are a
+            // convenience; the keyboard is the point, and ctrl+A over the field replaces the number
+            // outright. Deliberately NOT DragFloat with fmin/fmax = -FLT_MAX/FLT_MAX: a drag over an
+            // unbounded range moves by pixels-times-speed and cannot land on a round number.
+            ImGui::InputFloat("##v", (float*)it.data, it.fstep, it.fstep * 10.0f,
+                              it.fmt ? it.fmt : "%.3f");
+            panelKnobAffordances(it, false, 0.0, 0.0);
+            panelLabel(it.label, panelModified(it));
             break;
-        }
+        case WIDGET_TYPE_SLIDER_UINT:
+            panelStepperRow(it, /*isFloat*/false);
+            break;
         case WIDGET_TYPE_DROPDOWN: {
             uint32_t& sel = *(uint32_t*)it.data;
             const char* cur = (sel < it.count && it.names) ? it.names[sel] : "";
@@ -21605,7 +22679,8 @@ namespace {
                 }
                 ImGui::EndCombo();
             }
-            panelLabel(it.label);
+            panelKnobAffordances(it, false, 0.0, 0.0);
+            panelLabel(it.label, panelModified(it));
             break;
         }
         case WIDGET_TYPE_LABEL:
@@ -21640,6 +22715,191 @@ namespace {
             break;
         }
     }
+
+    // ═══ SAVED PANEL SETTINGS ═══════════════════════════════════════════════════════
+    // A tuning session that dies with the process is not a tuning session. The file is plain
+    // `name=value` lines beside the exe, and it is DELIBERATELY the same syntax MGE_HOST_KNOBS
+    // takes: every line whose key came from the knob table can be pasted straight into a harness
+    // run, so "I tuned this in play" and "now measure it minimized" are the same text.
+    //
+    // ONLY WHAT DIFFERS FROM THE DEFAULT IS WRITTEN. That keeps the file short enough to read and
+    // diff, and it means a future build that changes a default is picked up everywhere you did not
+    // deliberately override — a full snapshot would silently pin every old default forever.
+    const char* kPanelSettingsFile = "mgeHostPanel.ini";
+
+    // The one formatter both the file and any future echo go through.
+    static std::string panelValueText(const PanelItem& it) {
+        char buf[64];
+        switch (it.type) {
+        case WIDGET_TYPE_CHECKBOX:
+            std::snprintf(buf, sizeof(buf), "%d", *(bool*)it.data ? 1 : 0); break;
+        case WIDGET_TYPE_SLIDER_FLOAT:
+        case WIDGET_TYPE_TEXTBOX:
+            // %.9g round-trips a float32 exactly, so a save/load cycle cannot drift a knob.
+            std::snprintf(buf, sizeof(buf), "%.9g", (double)*(float*)it.data); break;
+        case WIDGET_TYPE_SLIDER_UINT:
+        case WIDGET_TYPE_DROPDOWN:
+            std::snprintf(buf, sizeof(buf), "%u", *(uint32_t*)it.data); break;
+        default:
+            buf[0] = 0; break;
+        }
+        return std::string(buf);
+    }
+    static void panelSetFromText(const PanelItem& it, const char* v) {
+        switch (it.type) {
+        case WIDGET_TYPE_CHECKBOX:     *(bool*)it.data = (std::atoi(v) != 0); break;
+        case WIDGET_TYPE_SLIDER_FLOAT:
+        case WIDGET_TYPE_TEXTBOX:      *(float*)it.data = (float)std::atof(v); break;
+        case WIDGET_TYPE_SLIDER_UINT:
+        case WIDGET_TYPE_DROPDOWN: {
+            const long n = std::atol(v);
+            const uint32_t lo = it.umin, hi = (it.type == WIDGET_TYPE_DROPDOWN)
+                                            ? (it.count ? it.count - 1u : 0u) : it.umax;
+            *(uint32_t*)it.data = (uint32_t)(n < (long)lo ? lo : ((n > (long)hi) ? hi : n));
+            break;
+        }
+        default: break;
+        }
+    }
+
+    // ⚠ ONE-TIME AUDIT, AND IT IS WHAT MAKES THE DERIVED KEYS TRUSTWORTHY. Two DIFFERENT knobs
+    // sharing a save key is silent data loss with a delay: the file holds one line, the load writes
+    // it into whichever control matched first, and the other reverts every session. The same key on
+    // the SAME pointer is fine and expected — a few controls are deliberately reachable from two
+    // tabs (g_terrainWire is on both "Draw / A/B" and "Parallax") — so only a genuine clash is
+    // reported. Run once, after the panel is built.
+    static void panelAuditKeys() {
+        std::unordered_map<std::string, const void*> seen;
+        uint32_t named = 0, derived = 0, clashes = 0;
+        for (const PanelTab& tab : g_panelTabs) {
+            for (const PanelItem& it : tab.items) {
+                if (!it.key || !it.data) { continue; }
+                (std::strchr(it.key, '.') ? derived : named) += 1u;
+                const auto r = seen.emplace(it.key, it.data);
+                if (!r.second && r.first->second != it.data) {
+                    ++clashes;
+                    LOG::logline("!! [panel] save-key CLASH '%s' \xe2\x80\x94 two different knobs, one would "
+                                 "overwrite the other on load. Offender: \"%s\" on tab \"%s\". "
+                                 "Reword one label before the '(' , or give it an MGE_HOST_KNOBS name.",
+                                 it.key, it.label, tab.name);
+                }
+            }
+        }
+        LOG::logline(">> [panel] %u saveable knobs: %u with MGE_HOST_KNOBS names (pasteable into a "
+                     "harness arm), %u with derived keys%s",
+                     named + derived, named, derived,
+                     clashes ? "  \xe2\x80\x94 SEE THE CLASHES ABOVE" : "");
+    }
+
+    static bool panelSaveSettings(std::string& report) {
+        FILE* f = std::fopen(kPanelSettingsFile, "w");
+        if (!f) { report = "could not open " + std::string(kPanelSettingsFile) + " for writing"; return false; }
+        std::fprintf(f,
+            "# MGE Dev panel settings. Written by the SAVE button; loaded at host startup.\n"
+            "# Only knobs that DIFFER from the build's default are here \xe2\x80\x94 anything you have not\n"
+            "# touched follows the build, which is what makes this file survive an upgrade.\n"
+            "#\n"
+            "# MGE_HOST_KNOBS is applied AFTER this file, so a harness arm always wins over a saved\n"
+            "# value. Lines whose key has no dot are knob-table names and paste straight into it.\n"
+            "# Delete a line to go back to the default; delete the file to reset everything.\n");
+        uint32_t n = 0;
+        // A control reachable from two tabs is ONE knob; write it once. (The audit above is what
+        // separates that harmless case from a real key clash.)
+        std::unordered_map<std::string, const void*> written;
+        for (const PanelTab& tab : g_panelTabs) {
+            bool wroteHeader = false;
+            for (const PanelItem& it : tab.items) {
+                if (!panelModified(it)) { continue; }
+                if (!written.emplace(it.key, it.data).second) { continue; }
+                if (!wroteHeader) { std::fprintf(f, "\n# --- %s ---\n", tab.name); wroteHeader = true; }
+                std::fprintf(f, "%s=%s\n", it.key, panelValueText(it).c_str());
+                ++n;
+            }
+        }
+        std::fclose(f);
+        char buf[160];
+        std::snprintf(buf, sizeof(buf), "saved %u changed knob%s to %s", n, n == 1 ? "" : "s",
+                      kPanelSettingsFile);
+        report = buf;
+        LOG::logline(">> [panel] %s", buf);
+        return true;
+    }
+
+    // Apply the file. Resolves every key against the BUILT PANEL, which is why this runs after
+    // initDevUI rather than beside applyEnvOverrides: the panel is the only place that knows the
+    // derived keys, and half the controls here have no knob-table name.
+    static bool panelLoadSettings(std::string& report) {
+        FILE* f = std::fopen(kPanelSettingsFile, "r");
+        if (!f) { report = "no " + std::string(kPanelSettingsFile) + " (using build defaults)"; return false; }
+        uint32_t applied = 0, unknown = 0;
+        std::string firstUnknown;
+        char line[512];
+        while (std::fgets(line, sizeof(line), f)) {
+            char* p = line;
+            while (*p == ' ' || *p == '\t') { ++p; }
+            if (*p == '#' || *p == ';' || *p == '\n' || *p == '\r' || !*p) { continue; }
+            char* eq = std::strchr(p, '=');
+            if (!eq) { continue; }
+            *eq = 0;
+            char* key = p;
+            char* val = eq + 1;
+            for (char* t = eq - 1; t >= key && (*t == ' ' || *t == '\t'); --t) { *t = 0; }
+            for (char* t = val + std::strlen(val) - 1;
+                 t >= val && (*t == '\n' || *t == '\r' || *t == ' ' || *t == '\t'); --t) { *t = 0; }
+            const PanelItem* hit = nullptr;
+            for (const PanelTab& tab : g_panelTabs) {
+                for (const PanelItem& it : tab.items) {
+                    if (it.key && std::strcmp(it.key, key) == 0) { hit = &it; break; }
+                }
+                if (hit) { break; }
+            }
+            if (!hit) {
+                // A key nobody claims is a knob that was renamed or removed. Reported, never
+                // swallowed: the failure mode of a silent drop is "my setting keeps reverting".
+                ++unknown;
+                if (firstUnknown.empty()) { firstUnknown = key; }
+                continue;
+            }
+            // Record what was there BEFORE, so the panel's own "reset to default" still means the
+            // build's default and not the saved value. (push() already captured it for the panel;
+            // this covers a Reload pressed mid-session.)
+            switch (hit->type) {
+            case WIDGET_TYPE_CHECKBOX: knobRecordOrig(hit->data, *(bool*)hit->data ? 1.0 : 0.0); break;
+            case WIDGET_TYPE_SLIDER_FLOAT:
+            case WIDGET_TYPE_TEXTBOX:  knobRecordOrig(hit->data, (double)*(float*)hit->data); break;
+            default:                   knobRecordOrig(hit->data, (double)*(uint32_t*)hit->data); break;
+            }
+            panelSetFromText(*hit, val);
+            ++applied;
+        }
+        std::fclose(f);
+        char buf[220];
+        if (unknown) {
+            std::snprintf(buf, sizeof(buf), "%s: %u knob%s applied, %u UNKNOWN (first: %s)",
+                          kPanelSettingsFile, applied, applied == 1 ? "" : "s", unknown,
+                          firstUnknown.c_str());
+            LOG::logline("!! [panel] %s \xe2\x80\x94 a renamed or removed control; delete the line or re-save", buf);
+        } else {
+            std::snprintf(buf, sizeof(buf), "%s: %u knob%s applied", kPanelSettingsFile, applied,
+                          applied == 1 ? "" : "s");
+            LOG::logline(">> [panel] %s", buf);
+        }
+        report = buf;
+        return true;
+    }
+
+    static uint32_t panelResetTab(PanelTab& tab) {
+        uint32_t n = 0;
+        for (const PanelItem& it : tab.items) {
+            if (panelModified(it)) { panelResetItem(it); ++n; }
+        }
+        return n;
+    }
+
+    // Which tab is showing, for "Reset this tab". Written inside the tab loop below and read by the
+    // toolbar, which draws first — so it is one frame behind, which no click can notice.
+    int         g_panelCurTab = -1;
+    std::string g_panelStatus;
 
     // THE PANEL, DRAWN WHOLE. Registered as ONE WIDGET_TYPE_CUSTOM, so this runs inside the
     // component's own ImGui window (processCustomWidget) and may emit raw ImGui.
@@ -21679,6 +22939,72 @@ namespace {
             }
         }
         ImGui::Separator();
+
+        // ── THE SETTINGS TOOLBAR ──────────────────────────────────────────────────────
+        // Root level, above the filter and the tab strip, because all four of these act on the whole
+        // panel or on whatever tab you are looking at — putting them inside a tab would make them
+        // read as that tab's controls.
+        {
+            uint32_t modified = 0;
+            for (const PanelTab& tab : g_panelTabs) {
+                for (const PanelItem& it : tab.items) { if (panelModified(it)) { ++modified; } }
+            }
+            if (ImGui::Button("Save settings")) { panelSaveSettings(g_panelStatus); }
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Write the %u changed knob%s to %s.\n"
+                                  "Loaded automatically next time the host starts.",
+                                  modified, modified == 1 ? "" : "s", kPanelSettingsFile);
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Reload saved")) { panelLoadSettings(g_panelStatus); }
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Re-apply %s over the live values.", kPanelSettingsFile);
+            }
+            ImGui::SameLine();
+            const bool haveTab = (g_panelCurTab >= 0 && g_panelCurTab < (int)g_panelTabs.size());
+            if (ImGui::Button("Defaults: this tab") && haveTab) {
+                const uint32_t n = panelResetTab(g_panelTabs[(size_t)g_panelCurTab]);
+                char b[128];
+                std::snprintf(b, sizeof(b), "reset %u knob%s on \"%s\"", n, n == 1 ? "" : "s",
+                              g_panelTabs[(size_t)g_panelCurTab].name);
+                g_panelStatus = b;
+            }
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Put every knob on \"%s\" back to the build's default.",
+                                  haveTab ? g_panelTabs[(size_t)g_panelCurTab].name : "—");
+            }
+            ImGui::SameLine();
+            // ⚠ CONFIRMED, because this one is not undoable and it is one pixel from "this tab".
+            if (ImGui::Button("Defaults: ALL")) { ImGui::OpenPopup("##resetAll"); }
+            if (ImGui::BeginPopup("##resetAll")) {
+                ImGui::Text("Reset all %u changed knob%s to the build's defaults?",
+                            modified, modified == 1 ? "" : "s");
+                ImGui::TextDisabled("This does not touch %s — press Save afterwards to make it stick.",
+                                    kPanelSettingsFile);
+                if (ImGui::Button("Reset everything")) {
+                    uint32_t n = 0;
+                    for (PanelTab& tab : g_panelTabs) { n += panelResetTab(tab); }
+                    char b[96];
+                    std::snprintf(b, sizeof(b), "reset %u knob%s to defaults", n, n == 1 ? "" : "s");
+                    g_panelStatus = b;
+                    ImGui::CloseCurrentPopup();
+                }
+                ImGui::SameLine();
+                if (ImGui::Button("Cancel")) { ImGui::CloseCurrentPopup(); }
+                ImGui::EndPopup();
+            }
+            ImGui::SameLine();
+            if (modified) {
+                ImGui::TextColored(ImVec4(1.00f, 0.80f, 0.35f, 1.00f), "%u changed", modified);
+            } else {
+                ImGui::TextDisabled("all at defaults");
+            }
+            if (!g_panelStatus.empty()) {
+                ImGui::PushTextWrapPos(g_panelWrapX);
+                ImGui::TextDisabled("%s", g_panelStatus.c_str());
+                ImGui::PopTextWrapPos();
+            }
+        }
 
         ImGui::SetNextItemWidth(-40.0f);
         ImGui::InputTextWithHint("##panelFilter", "filter knobs (searches every tab)",
@@ -21724,6 +23050,8 @@ namespace {
                 const ImGuiTabItemFlags tiFlags =
                     (s_firstFrame && &tab == firstDefault) ? ImGuiTabItemFlags_SetSelected : 0;
                 if (ImGui::BeginTabItem(tab.name, nullptr, tiFlags)) {
+                    // For the toolbar's "Defaults: this tab" — see g_panelCurTab.
+                    g_panelCurTab = (int)(&tab - g_panelTabs.data());
                     // The body scrolls INSIDE the tab, so the tab strip stays put. Without this the
                     // 109-widget Volumetric tab would push the strip off the top of the window and we
                     // would be back to one long column with extra steps.
@@ -22605,6 +23933,108 @@ namespace {
           // A measurement first: how much bias it takes says WHICH fault this is. See the knob.
           t.sliderF("  terrain LOD bias in levels (explicit arm only; a level = a doubling)",
                     &g_terrainTexBias, 0.0f, 2.0f, 0.05f);
+          t.flush(); }
+
+        // -- Tab: Parallax (tasks/forge-parallax.md) --
+        // The last large piece of the DX9 renderer the takeover had not absorbed. Everything here
+        // reads the SAME `_paramh` height the PBR tab's gradient does, so nothing on this tab can
+        // act on a surface the tab above says has no material — which is why the arms are folded
+        // with pbrEnable/pbrTerrain host-side and not merely sat next to them.
+        //
+        // ⚠ ALL FIVE ARMS SHIP OFF. Terrain is most of the screen outdoors, i.e. the most expensive
+        // place in the frame to add a tap, and the cost is not priced yet. Turn ONE on at a time and
+        // read `color`/`dl` off the heartbeat; the baseline to beat is color 2.30-2.35 ms, dl 1.14 ms.
+        //
+        // THE VIEW THAT MAKES ANY OF THIS JUDGEABLE IS **F12 MODE 25** (parallax uv delta): flat mid
+        // grey means the pixel did not move, red/green are the u/v axes. It is also the only test of
+        // the tangent frame's SIGN that exists — the offline rig cannot see a screen convention
+        // ([[feedback_a_frame_the_rig_cannot_see]]) — so walk a slope past the view direction and
+        // watch the delta reverse THROUGH GREY. One sign held across a whole hillside is a reversed
+        // frame, and it reads as "the relief is inverted" rather than as a bug.
+        { TabBuilder t; t.panel = g_uiPanel; t.name = "Parallax";
+          t.checkbox("PARALLAX: near meshes (_paramh) — off = today's image exactly",
+                     &g_parallaxMesh);
+          // The expensive half, and its own arm for pbrTerrain's reason: a different shader over a
+          // different residency, covering most of the screen.
+          t.checkbox("PARALLAX: terrain (the ground's _paramh) — the EXPENSIVE half, price it alone",
+                     &g_parallaxTerrain);
+          // 0.008 sits mid-range so the dial can express its own default and find its way back to
+          // it — the test a look dial has to pass (see the PBR tab's relief-depth sliders).
+          t.sliderF("  scale (height as a fraction of one UV unit; 0.008 = DX9)",
+                    &g_parallaxScale, 0.0f, 0.02f, 0.0005f);
+          // Do NOT take this to 0 looking for "more parallax": 0 removes the offset LIMITER, and
+          // the offset then diverges at grazing angles into streaks.
+          t.sliderF("  bias (the OFFSET LIMITER's denominator; 0.5 = DX9, low = grazing streaks)",
+                    &g_parallaxBias, 0.05f, 2.0f, 0.05f);
+          // 0 is the identity (the free A/B), 1 is DX9's single offset exactly, 2 ships.
+          t.sliderU("  steps (0 = off/identity | 1 = DX9's single offset | 2 = default)",
+                    &g_parallaxSteps, 0u, 8u, 1u);
+          // Traces the height-BLENDED surface on the ground, so it is 5 taps per covered layer —
+          // up to 20 where four land textures meet. Price it on its own.
+          t.checkbox("  soft parallax shadows (Drobot, 4 taps) — 5 taps/layer on terrain",
+                     &g_parallaxShadows);
+          t.sliderF("    shadow soften (5.0 = DX9)",  &g_parallaxShadowSoften, 0.0f, 20.0f, 0.5f);
+          t.sliderF("    shadow reach in uv (0.03 = DX9)", &g_parallaxShadowScale, 0.0f, 0.12f, 0.005f);
+          // Judge this one on F12 mode 26 (which land texture won) beside mode 20 (how many meet
+          // here). In the shaded frame it is nearly invisible on a family pair — texturematcher
+          // deliberately pairs textures that correlate at 0.88 — so the shaded view cannot answer
+          // whether the knob is doing anything.
+          t.checkbox("HEIGHT BLEND (terrain): sand settles into stone cracks — F12 26 is the view",
+                     &g_heightBlend);
+          t.sliderF("  strength (1.0 = DX9; 0 = plain bilinear weights)",
+                    &g_heightBlendStrength, 0.0f, 1.0f, 0.05f);
+          t.sliderF("  contrast (the mixing band; small = hard, crack-following; 0.06 = DX9)",
+                    &g_heightBlendContrast, 0.005f, 0.5f, 0.005f);
+          // ─── Phase 4a. THE RISKY ONE, and it is here to be FALSIFIED rather than shipped ──────
+          // Two things are expected to break and the point is to find where: GRASS does not follow
+          // (roots are baked CPU-side from the raw heightfield, outside this shader), and the
+          // player-relative fade boundary has no motion vector, so it can ghost under TAA/DLSS.
+          // Walk with it on and watch the grass line and the fade edge, not the ground itself.
+          t.checkbox("TERRAIN DISPLACEMENT 4a (128-unit lattice — UNDULATION, not silhouette)",
+                     &g_terrainDisp);
+          // THE VIEW FOR THIS ONE. Same pointer as the Draw/AB tab's copy — one control, two places
+          // it is reachable from — and it is here because 4a's whole open question is GEOMETRIC:
+          // 128 world units between vertices, so "is the lattice dense enough to carve anything"
+          // cannot be answered from a shaded frame, only from the lattice itself. It also shows the
+          // two things 4a is most likely to get wrong: the fade disc's edge (the ring where the
+          // displacement stops) and the STITCH rows, which are skipped deliberately so a displaced
+          // vertex cannot open a crack a coarser neighbour has no vertex to follow.
+          // ⚠ It wireframes TERRAIN ONLY. Grass and statics still draw solid over it, so turn those
+          // off on the Draw/AB tab if they are covering the ground you want to look at.
+          t.checkbox("  ^ WIREFRAME the lattice (terrain only; Z-prepass skipped so you see through)",
+                     &g_terrainWire);
+          t.sliderF("  depth in world units (ONE-SIDED: only ever carves DOWN; 6.0 = DX9)",
+                    &g_terrainDispScale, 0.0f, 32.0f, 0.5f);
+          t.sliderF("  gamma (0.25 = a 4th power, so only deep parts carve; = DX9)",
+                    &g_terrainDispGamma, 0.1f, 4.0f, 0.05f);
+          t.sliderF("  pivot (1.0 = identity; = DX9)", &g_terrainDispPivot, 0.1f, 1.0f, 0.05f);
+          t.sliderF("  radius (full strength inside)", &g_terrainDispRadius, 0.0f, 8192.0f, 64.0f);
+          // ⚠ THIS SLIDER ALSO MOVES THE GEOMETRY, and since 4b it moves it PATCH by patch: the
+          // 512-unit patches the fine lattice is spent on are the patches this disc touches, so
+          // widening it buys triangles as well as carve — but now in proportion to the disc's AREA
+          // rather than to the number of whole cells it clips. Watch the heartbeat's terrain tris
+          // and its `patch` histogram, not just the ground. The slider's own ceiling is the hard
+          // ceiling (kTerrainDispFadeMax): it is what bounds the instance ring.
+          t.sliderF("  fade end (smoothstep to 0 by here; ALSO the fine lattice's reach)",
+                    &g_terrainDispFade, 0.0f, kTerrainDispFadeMax, 64.0f);
+          // ─── Phase 4b: the sub-cell patch lattice (tasks/forge-parallax.md) ───────────────────────
+          // THE A/B FOR THIS WHOLE PHASE. 4 is 4a exactly — no patches at all, whole cells on the
+          // base lattice — so 4 vs 0 with everything else held is the measurement that decides
+          // whether 8 u carries silhouettes. 4b-lite already answered the cheaper half: its 32 u
+          // cost +0.13 ms, and the decomposition (prepass +0.01, dl +0.13) said that was quad
+          // OVERSHADING from triangles outside the disc, which is exactly what a patch removes.
+          // Set the depth knob above to 0 first and every arm should render the SAME frame: a fine
+          // rung evaluates the coarse triangle's own plane, so an undisplaced carve has nothing to
+          // move. Anything that does move is the triangulation-exact height, the un-normalized
+          // normal lerp or the patch stitch being wrong, and it invalidates everything below it.
+          t.sliderF("PATCH LATTICE 4b: rung in the disc (0 = 8u, 1 = 16u, 2 = 32u, 3 = 64u, 4 = OFF)",
+                    &g_terrainPatchRung, 0.0f, 4.0f, 1.0f);
+          // NOT a look knob: one BASE lattice step is ~256 texels of the map, so below ~8 this is
+          // reading a field at a fraction of its rate and the ground crawls as the camera moves.
+          // The rung offsets it automatically (32 u reads two levels finer), so this stays the
+          // answer for the base lattice at every rung.
+          t.sliderF("  height mip (8 = the band-limit for a 128-unit lattice; lower CRAWLS)",
+                    &g_terrainDispLod, 0.0f, 12.0f, 0.5f);
           t.flush(); }
 
         // -- Tab: AO & Lighting (GTAO knobs + intensity debug scales) --
@@ -23594,6 +25024,20 @@ namespace {
         // shadow can be toggled against the previous build's image from one slider. F12 mode 13
         // shows the moments map itself (corner overlay).
         { TabBuilder t; t.panel = g_uiPanel; t.name = "Sun shadow";
+          // ─── WHICH SUN THE SHADOWS ARE STRUCK FOR ───────────────────────────────────────────
+          // First on this tab because it is upstream of everything below it: no cascade extent,
+          // bias or march length is meaningful if the direction is wrong. MW ships two suns ~29
+          // degrees apart and shadows used the one that never sets, which is why a sun overhead
+          // cast shadows for a sun at 41 degrees. Off = that old behaviour exactly, for the A/B.
+          t.checkbox("Sun: LIGHT follows the visible DISC (off = MW's own light arc)",
+                     &g_sunLightFollowsDisc);
+          // The two ends of the handover, in DISC elevation. Leave them alone unless the dusk
+          // transition is visibly swinging: 18 is where MW's two arcs cross, so the correction is
+          // already ~0 at both ends of the default band. Read `aim=` and `w=` on [forge-hb][sky].
+          t.sliderF("  handover: MW's bounce BELOW this disc elevation (deg)",
+                    &g_sunLightDiscLoDeg, -10.0f, 30.0f, 0.5f, "%.1f");
+          t.sliderF("  handover: the DISC above this one (18 = where MW's two arcs cross)",
+                    &g_sunLightDiscHiDeg, -10.0f, 60.0f, 0.5f, "%.1f");
           t.checkbox("Sun shadow: render the caster pass", &g_drawSunShadow);
           t.sliderF("Sun shadow: STRENGTH (0 = off, the A/B)", &g_sunShadowStrength, 0.0f, 1.0f, 0.05f);
           t.sliderF("Sun shadow: FAR cascade half-extent (world u)", &g_sunShadowRange, 1024.0f, 32768.0f, 256.0f);
@@ -23620,7 +25064,17 @@ namespace {
           // are the ones that built it). Both are in world units, so they survive a resolution change.
           t.sliderF("Sun far-shadow: SOFT transition (WORLD units)", &g_sunOccSoft, 16.0f, 1024.0f, 16.0f, "%.0f");
           t.sliderF("Sun far-shadow: BIAS (WORLD units; self-shadow guard)", &g_sunOccBias, 0.0f, 512.0f, 8.0f, "%.0f");
-          t.sliderF("Sun far-shadow: march REACH (world u; cut by sun height)", &g_sunOccOuter, 2048.0f, 65536.0f, 1024.0f, "%.0f");
+          // TYPED, and unbounded, because this is the knob a stretched-shadow complaint is
+          // investigated with and the slider it replaced had a FLOOR OF 2048 — so "turn it down
+          // until the smear goes" was a question the panel physically could not be asked. Every
+          // consumer clamps: rebuildSunOccMap takes min() against kSunOccRelief/tan(elev) and then
+          // max() against inner + one texel, so any number typed here is safe, including 0.
+          //
+          // ⚠ THE VALUE TYPED HERE IS A CEILING, NOT THE REACH. What the march actually used is the
+          // `reach=` field of the readout below, and above ~50 degrees of sun the relief cut is what
+          // decides it, not this. If those two numbers disagree, this knob is not the subject.
+          t.inputF("Sun far-shadow: march REACH CEILING (world u; the relief cut may lower it)",
+                   &g_sunOccOuter, 256.0f, "%.0f");
           t.sliderF("Sun far-shadow: taps per texel (rebuild cost)", &g_sunOccSteps, 8.0f, 128.0f, 4.0f, "%.0f");
           // Rebuild threshold. Too coarse and the shadow line STEPS at dawn instead of sweeping; too
           // fine and a rare pass becomes a frequent one.
@@ -25624,540 +27078,13 @@ void destroyHostWindow(Renderer* R);
     // The value reaches here because mgeHost64 is a CHILD of Morrowind.exe, which inherits the
     // environment of whatever launched it — the same route MGE_RENDER_SCALE already takes to the
     // client. Read ONCE at startup; the panel still owns these knobs afterwards.
-    void applyEnvOverrides() {
-        const char* env = std::getenv("MGE_HOST_KNOBS");
-        if (!env || !*env) { return; }
-        LOG::logline(">> [forge] MGE_HOST_KNOBS = %s", env);
-        {
-            static const char* kPrioName[] = { "NORMAL", "HIGH", "GLOBAL_REALTIME" };
-            LOG::logline(">> [forge] graphics queue priority = %s (queuePriority=%u)",
-                         kPrioName[g_queuePriorityApplied < 3u ? g_queuePriorityApplied : 0u],
-                         g_queuePriorityApplied);
-        }
-        struct FKnob { const char* name; float* p; };
-        struct BKnob { const char* name; bool*  p; };
-        // M1 4d added the third kind. `upscaleBackend` names a backend, and a float or a bool
-        // cannot: 0/1 would be a mapping nobody can read off a command line, and 4e adds `auto` as
-        // a third value, which a bool has nowhere to put. One entry today; the table exists so the
-        // second one is an entry rather than a redesign.
-        struct SKnob { const char* name; char* p; size_t cap; };
-        // ...and a uint kind, added with the 4d-3 mode list. `upscaleMode` is an INDEX into a fixed
-        // list, which a float cannot carry honestly (0.9 is not a mode) and a bool cannot carry at
-        // all now that Off is one entry among six.
-        struct UKnob { const char* name; uint32_t* p; uint32_t max; };
-        const FKnob fknobs[] = {
-            // AO LOOK, exposed 2026-09-05 because a half-res grain complaint could not be A/B'd
-            // at all from the minimized harness — every one of these was panel-only.
-            // upSigma is the FIRST lever for "half res looks blocky": it is the upscale's RANGE
-            // sigma in WORLD units, so raising it lets the upscale blend across a bigger depth
-            // step and smooths the enlarged grain. blurPx is the blur's SPATIAL sigma in PIXELS,
-            // and note it saturates — past ~1.5 over a +-3 kernel it is a box filter and buys
-            // nothing more ([[project_forge_ao_blur_extent]]).
-            { "aoUpSigma",          &g_aoUpSigma          },
-            { "aoBlurPx",           &g_aoBlurPx           },
-            // SHADOW MASK: the test range (the pass's area dial — covered area ~ rangeK², and the
-            // point light's reach is slaved to it) and the three cost-profile arms. Here for exactly
-            // the reason the AO ones are: separating this pass's four stages needs them measured in
-            // one session against one pinned save, and nobody is at the panel during a minimized run.
-            { "shadowRangeK",       &g_shadowRangeK       },
-            { "maskProf",           &g_maskProf           },
-            { "maskNoDyn",          &g_maskNoDyn          },
-            { "maskFilter",         &g_maskFilter         },
-            // ...and the flicker WOBBLE amplitude, which is a cost arm as much as a look one: at 0
-            // the mask's per-slot wobble branch is not taken, so this is the isolation lever for the
-            // 13 sin() that branch evaluates PER SLOT PER PIXEL.
-            { "flickShadowMove",    &g_flickShadowMove    },
-            // MSAA RESOLVE FILTER DIAMETER. 6 = 7x7, 4 = 5x5 (the shipped value), 2 = 3x3, and the
-            // tap count is (2*ceil(d/2)+1)^2 * sampleCount MSAA loads PER OUTPUT PIXEL — 196 / 100 /
-            // 36 at 4x. It is here, not just on the panel, because scaling it is the only way to ask
-            // from the harness what this pass is BOUND by: if the time tracks the tap count the pass
-            // is load-throughput bound and the answer is fewer taps (or an LDS compute rewrite); if
-            // it does not, the taps are free and the weight arithmetic is the target.
-            { "resolveDiameter",    &g_resolveDiameter    },
-            // S2 THE ATMOSPHERE — first in the table because the S2b gate runs unattended and these
-            // are the three lanes an unattended session has to be able to move: the march budget
-            // (the `atmos=` cost dial), and the two night lanes, whose whole point is that they are
-            // judged at midnight and the harness cannot click a checkbox at midnight either.
-            { "dumpAtFrame",        &g_dumpAtFrame        },
-            // M1 step 4b THE UPSCALER (tasks/forge-upscale.md). ⚠ THE ONLY WAY THE HARNESS CAN RUN
-            // THE REAL 4b TEST. Scale 1.0 is an exact identity by construction, so it proves nothing
-            // about the seam; the test that does — `[rect] in=840x525 out=1680x1050`, APL within ~1%
-            // of the 1.0 run, and `gpu=` dropping while `upscale=` appears — needs the slider at 0.5,
-            // and the perf harness runs MINIMIZED with nobody at the panel.
-            { "upscaleInputScale",  &g_upscaleInputScale  },
-            // M1 step 4c BLOOM, and these two are here because the 4c question — "does the bloom
-            // change when the upscale slider moves" — CANNOT BE ATTRIBUTED WITHOUT THEM. Bloom now
-            // reads the DELIVERED image, so at scale < 1 its source is an upscaled frame: any change
-            // in the delivered picture could be the bloom following a different source, or the
-            // upscaler's effect on the scene underneath it. Separating those needs an arm with bloom
-            // OFF at both scales, and until now every bloom knob was panel-only while the harness
-            // runs MINIMIZED — the exact shape this table's header describes.
-            //
-            //   bloomStrength = 0  is the EXACT identity arm (resolve.frag guards the composite
-            //                      behind `if (k > 0)`, by branch and not by arithmetic), so it is
-            //                      the isolation lever rather than a dimmer.
-            //   bloomLevelCap      is the REACH dial, i.e. the thing 4c is ABOUT: it clamps the
-            //                      level count from above, so pinning it equal across two scales
-            //                      proves a difference is not the octave count.
-            { "bloomStrength",      &g_bloomStrength      },
-            { "bloomLevelCap",      &g_bloomLevelCap      },
-            // ...and the upscaler's own filter, so the "is the anti-ringing clamp eating the bloom"
-            // arm can be taken unattended as well as by hand. See upscale.h.
-            { "upscaleSharpness",   &g_upscaleSharpness   },
-            { "upscaleAntiRing",    &g_upscaleAntiRing    },
-            { "fogSkyKnee",         &g_fogSkyKnee         },
-            { "fogNearHaze",        &g_fogNearHaze        },
-            { "atmosCacheDeg",      &g_atmosCacheDeg      },
-            { "atmosCacheAltM",     &g_atmosCacheAltM     },
-            { "atmosMieMul",        &g_atmosMieMul        },
-            { "atmosOzoneMul",      &g_atmosOzoneMul      },
-            { "atmosMs",            &g_atmosMs            },
-            { "atmosDeckDown",      &g_atmosDeckDown      },
-            { "skyCloudAlbedo",     &g_skyCloudAlbedo     },
-            // ⚠ THE AgX LOOK, ON THE HARNESS. Four panel sliders that the minimized rig could not
-            // reach, so "what does Punchy actually do to the sky" was a question no unattended run
-            // could answer and every judgement of it had to be taken by hand at the keyboard. Same
-            // reason MGE_HOST_KNOBS exists at all. The curve's own three go with them, because
-            // 2.02/2.90/2.90 reproduces the retired polynomial and that is the regression arm.
-            { "agxSlope",           &g_agxSlope           },
-            { "agxPower",           &g_agxPower           },
-            { "agxSat",             &g_agxSat             },
-            { "agxOffset",          &g_agxOffset          },
-            { "agxSlope2",          &g_agxSlope2          },
-            { "agxToePower",        &g_agxToePower        },
-            { "agxShoulderPower",   &g_agxShoulderPower   },
-            { "atmosDeck",          &g_atmosDeck          },
-            { "atmosDeckSteps",     &g_atmosDeckSteps     },
-            { "atmosSkySteps",      &g_atmosSkySteps      },
-            { "atmosMsDirs",        &g_atmosMsDirs        },
-            { "atmosAirglow",       &g_atmosAirglow       },
-            { "atmosMoonScale",     &g_atmosMoonScale     },
-            { "waterInscatterGain", &g_waterInscatterGain },
-            { "waterScatterRatio",  &g_waterScatterRatio  },
-            { "waterMsSimilarity",  &g_waterMsSimilarity  },
-            { "waterSunEnter",      &g_waterSunEnter      },
-            { "waterPhaseMS",       &g_waterPhaseMS       },
-            { "waterDistortAngular", &g_waterDistortAngular },
-            { "waterDistortGain",    &g_waterDistortGain    },
-            { "waterRefrOwn",        &g_waterRefrOwn        },
-            { "waterCutRadius",      &g_waterCutRadius      },
-            { "waterCutHeight",      &g_waterCutHeight      },
-            // W25: the NORMAL INTENSITY, and it is here because it is now the caustic's calm-water
-            // lever as well as the surface's — `waterWaveAmp=0` is how the harness isolates the
-            // ripple and wake layers with no checkbox to click.
-            { "waterWaveAmp",        &g_waterWaveAmp        },
-            { "causticStrength",     &g_causticStrength     },
-            { "causticTileUnits",    &g_causticTileUnits    },
-            { "causticSlopeRms",     &g_causticSlopeRms     },
-            { "causticSubBeams",     &g_causticSubBeams     },
-            { "causticDynSubBeams",  &g_causticDynSubBeams  },
-            { "causticSlicesPerFrame", &g_causticSlicesPerFrame },
-            { "causticSoften",       &g_causticSoften       },
-            { "causticDepthDecay",   &g_causticDepthDecay   },
-            { "causticMediumLowpass", &g_causticMediumLowpass },
-            { "causticSpeed",        &g_causticSpeed        },
-            { "causticEma",          &g_causticEma          },
-            { "causticDispGain",     &g_causticDispGain     },
-            { "causticRippleStr",    &g_causticRippleStr    },
-            { "causticWakeStr",      &g_causticWakeStr      },
-            { "causticDynSlope",     &g_causticDynSlope     },
-            { "causticDynHess",      &g_causticDynHess      },
-            { "causticWakePin",      &g_causticWakePin      },
-            // W26: the three "where does it stop" knobs. causticDistFrac is the one the harness
-            // wants for the perf check — 0 turns the distance gate off, so `caustic=` and the tap
-            // count with and without it are an A/B on one env var.
-            { "causticWakeMaxDepth",   &g_causticWakeMaxDepth   },
-            { "causticRippleMaxDepth", &g_causticRippleMaxDepth },
-            { "causticDistFrac",       &g_causticDistFrac       },
-            // W32: the submerged-lamp projector. Env-driven because the checks that matter are the
-            // bit-identity A/B at 0 and the mean-1 check (WATER lvl in the apl split must not move
-            // between 0 and 1), both of which the minimized harness has to run without a click.
-            { "causticProjStr",        &g_causticProjStr        },
-            { "causticProjAbove",      &g_causticProjAbove      },
-            { "causticProjFromAir",    &g_causticProjFromAir    },
-            { "calInteriorFloor",      &g_calInteriorFloor      },
-            // M1 temporal jitter (tasks/forge-upscale.md). Env-driven because the FIRST question it
-            // has to answer is a bit-identity one — does amplitude 0 leave the frame exactly where
-            // it was — and the second is "did the jitter leak into a view it must not move", which
-            // is read off the `atmos=` / gate rows in an unattended log. Neither is a thing anyone
-            // can click a checkbox for during a minimized run.
-            { "jitterAmp",             &g_jitterAmp             },
-            { "mvReactiveT0",          &g_mvReactiveT0          },
-            { "mvReactiveT1",          &g_mvReactiveT1          },
-            { "mvReactiveGain",        &g_mvReactiveGain        },
-            // ⚠ 0 = AUTO since 4d, which is the shipped default: 8 x (output px / input px), i.e.
-            // 8 at DLAA and ~18 at Quality. A positive value pins it, for the A/B that asks whether
-            // the derivation is right — which is the only reason to set it at all now.
-            { "jitterPhases",          &g_jitterPhases          },
-            { "causticRippleStride", &g_causticRippleStride },
-            // W27: the resolution/window trade on the wake map, env-driven so the minimized harness
-            // can A/B 8 u/texel against the W26 16 without a rebuild. The echo below is also how the
-            // wake window gets reported — the creation log prints the grid, not the stride.
-            { "causticWakeStride",   &g_causticWakeStride   },
-            // W28e: the wake sim's k^2 viscosity. Env-driven because the defect it fixes is
-            // PROGRESSIVE — it only shows after the field has been running a while — so measuring it
-            // means a long unattended run, which is exactly what the minimized harness is for.
-            { "wakeGridDamp",        &g_wakeGridDamp        },
-            { "ripGridDamp",         &g_ripGridDamp         },
-            { "causticCalmDisp",     &g_causticCalmDisp     },
-            { "causticCalmHess",     &g_causticCalmHess     },
-            // G1 grass. All four are here because every question G1 has to answer is a MEASUREMENT
-            // the minimized harness must be able to take without a hand on the panel: what does the
-            // field cost at density d and range r (the two perf levers), does the wind actually move
-            // (grassWindGain=0 stands it still, which is the isolation arm), and what does casting
-            // add. See tasks/forge-grass.md.
-            { "grassDensity",        &g_grassDensity        },
-            { "grassRange",          &g_grassRange          },
-            { "grassFadeFrac",       &g_grassFadeFrac       },
-            { "grassWindGain",       &g_grassWindGain       },
-            { "grassAlphaRef",       &g_grassAlphaRef       },
-            { "grassShadowRange",    &g_grassShadowRange    },
-            { "grassShadowOpacity",  &g_grassShadowOpacity  },
-            { "grassShadowDrop",     &g_grassShadowDrop     },
-            // The enhanced-shader polish: the underwater current (its own strength, deliberately not
-            // slaved to |wind|) and the sink LOD. Env-driven for the same reason as the rest —
-            // "does the seaweed still lean in a gale" is a question the minimized harness has to be
-            // able to ask by setting one number to 0.
-            { "grassCurrent",        &g_grassCurrent        },
-            { "grassSinkDepth",      &g_grassSinkDepth      },
-            { "grassSinkJitter",     &g_grassSinkJitter     },
-            // G3: the scatter's two rejections. Both change the FIELD, so setting either forces a
-            // window rebuild — which is the only way an A/B on them is visible without walking a
-            // whole cell first.
-            { "grassAvoidScale",     &g_grassAvoidScale     },
-            { "grassMaxSlopeDeg",    &g_grassMaxSlopeDeg    },
-            // G3 variation + proximity. grassTexCap is here rather than on the panel because it
-            // is consumed ONCE, when the texture residency is built at the first exterior — a
-            // slider for it would be a control that silently does nothing after the first cell.
-            { "grassTexCap",         &g_grassTexCap         },
-            { "staticsTexCap",       &g_staticsTexCap       },
-            { "grassAvoidSoften",    &g_grassAvoidSoften    },
-            { "grassAvoidMinScale",  &g_grassAvoidMinScale  },
-            { "grassScaleVar",       &g_grassScaleVar       },
-            { "grassTintValue",      &g_grassTintValue      },
-            { "grassTintHue",        &g_grassTintHue        },
-            { "grassPatchScale",     &g_grassPatchScale     },
-            { "grassPatchGrain",     &g_grassPatchGrain     },
-            { "grassShadowRecvMode", &g_grassShadowRecvMode },
-            // AO multi-bounce look dials (aomultibounce.h.fsl). 1.0 = the published fit exactly.
-            // gain lightens the occlusion as it adds bounce; chroma adds colour without lightening.
-            { "aoBounceGain",        &g_aoBounceGain        },
-            { "pbrDepth",            &g_pbrDepth            },
-            { "pbrTerrainDepth",     &g_pbrTerrainDepth     },
-            { "pbrTerrainHeightAOStr", &g_pbrTerrainHeightAOStr },
-            { "pbrTerrainHeightAOLod", &g_pbrTerrainHeightAOLod },
-            { "pbrStaticsDepth",     &g_pbrStaticsDepth     },
-            { "terrainTexBias",      &g_terrainTexBias      },
-            { "pbrGradRadius",       &g_pbrGradRadius       },
-            { "aoBounceChroma",      &g_aoBounceChroma      },
-            { "grassRootAO",         &g_grassRootAO         },
-            { "grassRootAOHeight",   &g_grassRootAOHeight   },
-            { "grassAOFullTile",     &g_grassAOFullTile     },
-            // G7 crush field. Every one of these is here rather than only on the panel because the
-            // acceptance test is a QUEST BODY in grass, and both questions it asks — "is the body
-            // visible" and "what did the field cost" — have to be answerable from a run the harness
-            // started, with no hand on a slider. grassCrushMargin especially: it is the dial to
-            // widen FIRST if the silhouette is physically right but still not legible at range.
-            // ⚠ grassCrushGrid is read ONCE, at resource creation, so setting it here is the only
-            // way to change it at all — the panel deliberately has no slider for it.
-            { "grassCrushGrid",      &g_grassCrushGrid      },
-            { "grassCrushUnits",     &g_grassCrushUnits     },
-            { "grassCrushHealTime",  &g_grassCrushHealTime  },
-            { "grassCrushDwellTime", &g_grassCrushDwellTime },
-            { "grassCrushChargeTime",&g_grassCrushChargeTime},
-            { "grassCrushWeightRef", &g_grassCrushWeightRef },
-            { "grassCrushPlastic",   &g_grassCrushPlastic   },
-            { "grassCrushRingPeriod",&g_grassCrushRingPeriod},
-            { "grassCrushDamping",   &g_grassCrushDamping   },
-            { "grassCrushMargin",    &g_grassCrushMargin    },
-            { "grassCrushBoneRadius",&g_grassCrushBoneRadius},
-            { "grassCrushSlope",     &g_grassCrushSlope     },
-            { "grassCrushFalloff",   &g_grassCrushFalloff   },
-            { "grassCrushPressTime", &g_grassCrushPressTime },
-            { "grassCrushBend",      &g_grassCrushBend      },
-            { "grassCrushSink",      &g_grassCrushSink      },
-            { "grassCrushPlayerRadius", &g_grassCrushPlayerRadius },
-            // MB-2. All three are here as well as on the panel because the two verifications that
-            // matter most are a MEASUREMENT and a RECT, and both have to be runnable from a minimized
-            // harness with nobody at a slider: `mb=` on the gpu split against mbShutter, and the
-            // out/in scale against upscaleMode=2 (at 1x that scale is 1.0 and proves nothing).
-            // H0 the OCCLUSION PROBE. `occProbe` is both the arm and the ALLOCATION trigger — off,
-            // nothing is created and nothing dispatches — and it is env-only for the usual reason:
-            // the whole point is a number read off an unattended run's log, and a minimized harness
-            // cannot click. The other three are the probe's own honesty dials: bias and margin both
-            // push it toward "not occluded", so raising either can only SHRINK the bound it reports,
-            // which is the direction a measurement that could buy machinery has to be able to move.
-            { "occProbe",            &g_occProbe            },
-            { "occProbeSteps",       &g_occProbeSteps       },
-            { "occProbeBias",        &g_occProbeBias        },
-            { "occProbeMargin",      &g_occProbeMargin      },
-            // ⚠ THE KNOB THAT MAKES H0 DECIDABLE. The raw arm is a ceiling and a ceiling cannot tell
-            // 87% from 30%; this one previews H1's min-pyramid, so the pair brackets what H2 would
-            // actually get. Sweep it (0/1/2/3) to see how fast the floor falls as the emulated
-            // pyramid level coarsens — that slope is the real risk in H2. 0 = the self-check arm.
-            { "occProbeMinR",        &g_occProbeMinR        },
-            { "occProbePyr",         &g_occProbePyr         },
-            // H2b: the march's shape. Steps is the cost knob H0b sized (knee at 12); level is how
-            // conservative the field is (1 = a 2-texel min, H1's L1 = 4058 of a 4060 ceiling); bias
-            // and margin are the two "do not occlude yourself" fudges, both in world units.
-            { "reflHeightOccSteps",  &g_reflHeightOccSteps  },
-            { "reflHeightOccLevel",  &g_reflHeightOccLevel  },
-            { "reflHeightOccBias",   &g_reflHeightOccBias   },
-            { "reflHeightOccMargin", &g_reflHeightOccMargin },
-            // THE W-GATE's two dials. `reflWaterGate` itself is a bool and lives in the table below;
-            // these are the pair that decides how much of the view the test consults and how far above
-            // MW's level the plane sits for it. Range is the one worth sweeping from a harness — it is
-            // the only lever on "a single sea cell at the fog horizon holds the gate open", and the
-            // arm that shows it is 0 (the shipped, fully-conservative value) against 4/8/16 cells.
-            { "reflWaterGateRange",  &g_reflWaterGateRange  },
-            { "reflWaterGateBias",   &g_reflWaterGateBias   },
-            // The SCREEN arm's only dial: consecutive dry frames before the pass stops. 1 is the
-            // most aggressive (and the arm that measures the ceiling); raising it costs nothing but
-            // the first few frames of a genuinely dry view.
-            { "reflWaterGateHold",   &g_reflWaterGateHold   },
-            // REFLECTION FIDELITY. All three ship as AUTO (-1) and all three are here because the
-            // verification is a TABLE — fidelity 1.0/0.75/0.5/0.25 crossed with LOD 0/+1/+2 — and a
-            // table needs distance and detail moved INDEPENDENTLY, which the single derived scalar
-            // deliberately cannot do. `reflFidelity=1` is also the exact identity arm: it is what the
-            // roughness curve returns at the shipped wave amplitude, so pinning it must not move the
-            // frame at all, and that is the regression test for the whole of part 2's plumbing.
-            { "reflFidelity",        &g_reflFidelity        },
-            { "reflDistScale",       &g_reflDistScale       },
-            { "reflLodBias",         &g_reflLodBias         },
-            { "mbShutter",           &g_mbShutter           },
-            { "mbShutterFps",        &g_mbShutterFps        },
-            { "mbTileJitter",        &g_mbTileJitter        },
-            { "mbMinPx",             &g_mbMinPx             },
-            { "mbSoftZ",             &g_mbSoftZ             },
-        };
-        const BKnob bknobs[] = {
-            // PBR materials master switch: 0 must be today's image exactly (pack-time gate).
-            { "pbrEnable", &g_pbrEnable },
-            // ...and TERRAIN's, which is a shader lane instead (see g_pbrTerrain). Here as well as
-            // on the panel because terrain is most of the screen, so this is the one PBR A/B whose
-            // cost has to be measured on a minimized harness run with nobody at the panel.
-            { "pbrTerrain", &g_pbrTerrain },
-            { "pbrTerrainHeightAO", &g_pbrTerrainHeightAO },
-            // ...and DISTANT STATICS', a lane for the same reason (see g_pbrStatics). Env-armed as
-            // well as on the panel because the thing being judged is a HANDOVER: it wants an A/B of
-            // the same object from the same spot, which is a harness run, not a checkbox click.
-            { "pbrStatics", &g_pbrStatics },
-            // ...and WHERE the distant sun is evaluated. Deliberately NOT under the pbrStatics gate:
-            // the defects it fixes lit every distant static, not just the 116 with a companion.
-            { "staticsSunPerPixel", &g_staticsSunPerPixel },
-            // The distant-ground sparkle A/B (see g_terrainTexGrad). Env-armed because the arm has
-            // to be pinned for a whole run, and the log then carries which one it was measured in.
-            { "terrainTexGrad", &g_terrainTexGrad },
-            // H2a: the WATER MIRROR's GPU cull lane, and its VERIFY twin. Both DEFAULT OFF, and both
-            // are env-only for the same reason every other arm in this table is: the A/B is a
-            // measurement on a minimized run and there is nobody at the panel.
-            //   reflCullVerify=1 — run the lane BESIDE the CPU cull and print the parity. The one
-            //     configuration where `reflCull ... MATCH` means anything, because with the lane
-            //     driving the draw there is no CPU number left to compare against.
-            //   reflGpuCull=1    — let the lane DRIVE the draw and skip the CPU cell-walk. This is
-            //     the arm the command wall is measured in ([[forge-heightfield-occlusion]] H2a):
-            //     the compacted CPU ring issues a few hundred indirect commands, the GPU one issues
-            //     cullSubsetCount ~= 10,910 regardless of survivors.
-            { "reflGpuCull",         &g_reflGpuCull         },
-            { "reflCullVerify",      &g_reflCullVerify      },
-            // H2b: the march itself. Needs `reflGpuCull=1` too — the test lives in the GPU lane.
-            { "reflHeightOcc",       &g_reflHeightOcc       },
-            // M1 motion vectors — env-driven so an unattended run can turn the dispatch on and read
-            // `[forge-hb] mv:` back without anyone at the panel. tasks/forge-upscale.md.
-            { "mvEnable",            &g_mvEnable            },
-            // MB-2's master A/B. ⚠ SHIPS **ON** — this is the consumer, and the point of the
-            // milestone is to see it — so this token is how a run turns it OFF. `mbEnable=0` must be
-            // a BYTE-IDENTICAL no-op (no dispatch; the resolve binds the instance it binds today),
-            // which is verification step 1 and the first thing to try when bisecting anything
-            // post-upscale.
-            { "mbEnable",            &g_mbEnable            },
-            // MB-2d. The A/B is a LOOK question and a COST question at once — object-only removes the
-            // camera smear AND most of the gather's work — so it has to be reachable from a minimized
-            // run, like every other arm in this table.
-            { "mbObjectOnly",        &g_mbObjectOnly        },
-            { "objVelEnable",        &g_objVelEnable        },
-            { "objVelAllItems",      &g_objVelAllItems      },
-            { "objVelSkipStill",     &g_objVelSkipStill     },
-            { "mbTwoDir",            &g_mbTwoDir            },
-            { "mbRecon",             &g_mbRecon             },
 
-            { "objVelSkinned",       &g_objVelSkinnedLane   },
-            { "objVelFP",            &g_objVelFPLane        },
-            { "objVelSkinIgnoreGen", &g_objVelSkinIgnoreGen },
-
-            // M1 step 4b: the master arm. ⚠ READ AT INIT — it decides whether the backend and its
-            // ~56 MB target are CREATED, so it does nothing if flipped later, which is exactly why it
-            // belongs here rather than only on the panel. Ships **ON** (the panel's input-scale
-            // slider needs a consumer); set it to **0** to reproduce the pre-4b build with nothing
-            // extra allocated, which is verification step 1 and the first thing to try when
-            // bisecting anything post-process.
-            { "upscaleEnable",       &g_upscaleEnable       },
-            // The ReShade/overlay surface. Read at INIT (it decides whether a window and swapchain
-            // are created at all), which is why it is here and has no panel checkbox — the panel it
-            // would live on is drawn into the game's frame, not this window.
-            { "hostWindow",          &g_hostWindow          },
-            // ⚠ A SUBMIT BOUNDARY IS A SCHEDULING BOUNDARY. The frame is recorded into two command
-            // buffers and submitted twice (chunk A ends just before the reflect pass) so the CPU can
-            // get chunk A onto the GPU sooner. That is a real win on the CPU side, but it also hands
-            // Windows a second point at which it may run the OTHER process on this GPU -- and the
-            // stall latch says something external to every pass is costing up to 2.1 ms in 43-71% of
-            // frames. Whether the split helps or hurts is now measurable rather than assumed.
-            { "splitSubmit",         &g_splitSubmit         },
-            // M1 4d. ⚠ jitterForce IS A MEASUREMENT, NOT A SETTING: it bypasses the producer gate
-            // in jitterAmp() so M1 step 1's isolation test — jitter alone, no upscaler, the image
-            // must shimmer sub-pixel while the atmos/gate rows do not move — stays runnable in a
-            // build where the gate would otherwise suppress exactly that state.
-            { "jitterForce",         &g_jitterForce         },
-            // ...and the one motion-vector convention 4d could not settle by reading. It ships true
-            // (our vectors are written at the INPUT rect) and it is INVISIBLE at DLAA, so if DLAA is
-            // clean and Quality smears, this is the first thing to flip.
-            { "upscaleMvLowRes",     &g_upscaleMvLowRes     },
-            // The two optional DLSS inputs. 0 on either is an isolation arm — the only two things a
-            // temporal backend can be asked to run without, so between them they localise a fault
-            // that names no resource of its own.
-            { "upscaleNgxExposure",  &g_upscaleSuppliedExposure },
-            { "upscaleNgxReactive",  &g_upscaleNgxReactive      },
-            { "atmosMoonOn",        &g_atmosMoonOn        },
-            // ⚠ THE GATE'S OWN ARM. OFF skips the one reference-configuration frame at startup —
-            // which is the setting for a session that wants its first frame to be live weather, and
-            // NOT the setting for a bring-up. A gate nobody runs is a gate nobody has.
-            { "atmosGate",          &g_atmosGate          },
-            // The LUT-cache control arm. 0 = rebuild the chain every frame, i.e. the behaviour
-            // every measurement before 2026-09-06 was taken in.
-            { "atmosCache",         &g_atmosCache         },
-            // ⚠ waterNoReflect IS NOT A COST LEVER. It sets water shader flag bit 18 (sample the
-            // transmitted path only) and does not touch the reflection RENDER at all — measured
-            // 2026-09-06: with it set, `reflect=1.84 refl geo=1.66` unchanged and the frame 0.05 ms
-            // faster, i.e. nothing. An arm that silently does not take reads exactly like a pass
-            // that costs nothing, so the three checkboxes that DO gate the render are next to it
-            // now: reflect re-renders the world into pReflectColor every frame and was the second
-            // largest exterior phase with no way for a minimized harness to switch it off.
-            { "waterNoReflect",     &g_waterNoReflect     },
-            { "drawReflect",        &g_drawReflect        },
-            { "drawReflectGeo",     &g_drawReflectGeo     },
-            { "drawReflectNear",    &g_drawReflectNear    },
-            // THE W-GATE's arm. This is the one that restores the DX9 proxy-box behaviour — no water
-            // on screen, no reflection drawn — and it is the whole `reflect` phase, so it is here for
-            // the same reason the three above it are: the A/B is a minimized-harness measurement and
-            // the instrument that justifies it prints on every run whether or not this is set.
-            { "reflWaterGate",      &g_reflWaterGate      },
-            { "waterSunTrueElev",   &g_waterSunTrueElev   },
-            { "aplSplitWater",      &g_aplSplitWater      },
-            { "aplSkipSky",         &g_aplSkipSky         },
-            { "causticOn",          &g_causticOn          },
-            // AO's two big levers. halfRes is here because it is a 4x PIXEL COUNT change hiding
-            // behind a dev-panel checkbox, and the harness runs minimized — so the one A/B that
-            // separates "AO is slow" from "AO is running full-res" could not be driven at all.
-            { "aoHalfRes",          &g_aoHalfRes          },
-            { "aoEnable",           &g_aoEnable           },
-            // 0 = hardware ResolveSubresource (a box average, and format-locked). The floor this
-            // pass is measured against.
-            { "customResolve",      &g_customResolve      },
-            // 0 = keep the Catmull-Rom loop inside resolve.frag (64 MSAA Loads/pixel), 1 = the
-            // separable LDS compute pass (9). Same filter, so this is a PERF knob whose look delta
-            // must be zero — and the way to prove that from a minimized harness is the APL line.
-            { "resolveCompute",     &g_resolveCompute     },
-            // W24: the two wave sims themselves, because the dynamic caustic layers are DOWNSTREAM
-            // of them — a layer whose field nobody steps is a layer that does nothing at any
-            // strength, and the minimized harness cannot reach either checkbox. Both default ON
-            // since W24b, so these are here to turn a layer OFF for an A/B rather than on.
-            { "ripSimOn",           &g_ripSimOn           },
-            { "wakeOn",             &g_wakeOn             },
-            // W25: the flat test now disarms ALL THREE caustic layers, which makes it the one-switch
-            // proof that what is on screen is being cast by the surface and not painted on.
-            { "waterFlatTest",      &g_waterFlatTest      },
-            // The interior setpoint rule, env-driven because its whole A/B is a LEVEL and the
-            // minimized harness is the only way to measure one without a hand on the exposure.
-            { "calFollowMwInterior", &g_calFollowMwInterior },
-            // B1's A/B. The interior setpoint tracks the cell's authored ambient (a FLOOR) while the
-            // APL meter reports a frame MEAN dominated by lamp pools; this makes the target a mean
-            // too. Off by default until the picture has been looked at — see mwRefLevelInteriorLit.
-            { "calInteriorLit",      &g_calInteriorLit      },
-            // The servo itself. OFF pins E to exactly 1.0, which in this unit convention is the
-            // "reproduce MW" arm — the only way to measure what the plant delivers with no gain on
-            // it, and therefore the only way to say what an interior setpoint SHOULD be rather than
-            // guessing one. See the interior calibration work in tasks/lighting.md.
-            { "expEnable",           &g_expEnable           },
-            // G1: the master A/B ("grass off must be bit-identical to today") and the one that
-            // demonstrates the G1a near-cut trap — grassNearCut=1 re-arms the statics lane's cut and
-            // ownership on the grass lane, which is the hole around the player, on purpose.
-            // AO multi-bounce (aomultibounce.h.fsl). 0 = the scalar `ambient *= visibility` that
-            // shipped, byte for byte, so every AO measurement predating it stays comparable.
-            { "aoMultiBounce",       &g_aoMultiBounce       },
-            { "grassOn",             &g_drawGrass           },
-            // G1f: the Z-prepass pair. 0 restores the single GEQUAL draw with grass.frag's own
-            // SV_Coverage — i.e. the exact shader that shipped — so this knob, unlike grassOn,
-            // prices the OVERDRAW alone: same blades, same cull, same vertex work on both arms.
-            { "grassPrepass",        &g_grassPrepass        },
-            { "grassShadows",        &g_grassShadows        },
-            { "grassNearCut",        &g_grassNearCut        },
-            // 0 = ignore the authored red channel and treat every subset as foliage (stock's
-            // behaviour). The A/B that shows the rocks and stiff shrubs swaying like wheat.
-            { "grassVColFlag",       &g_grassVColFlag       },
-            { "grassAvoidStatics",   &g_grassAvoidStatics   },
-            { "grassPointLights",    &g_grassPointLights    },
-            // G7: the master A/B. 0 must restore today's grass EXACTLY — grass.vert branches on the
-            // arm rather than multiplying by it, so with this off not one texture fetch is paid.
-            { "grassCrush",          &g_grassCrush          },
-        };
-        const UKnob uknobs[] = {
-            // MEMORY ALARM envelopes (tasks/forge-memory-shape.md) — see g_memHighResMax.
-            { "memHighResMax",    &g_memHighResMax,    4096u },
-            { "memNearTexMB",     &g_memNearTexMB,     65536u },
-            { "memBudgetWarnPct", &g_memBudgetWarnPct, 1000u },
-            { "memOtherDriftMB",  &g_memOtherDriftMB,  65536u },
-            // AO DITHER SOURCE: 0 = legacy 4x4 tile, 1 = blue noise FROZEN (slice 0), 2 =
-            // spatiotemporal, 3 = complementary 2x2 quad frozen (the DEFAULT), 4 = that quad with a
-            // rigid per-frame quarter turn. The A/B this milestone needs is 3 against 1 — same cost,
-            // same slice budget, the only difference being whether a 2x2 neighbourhood sweeps a
-            // COMPLETE angular set or four random draws from a continuum.
-            { "aoDither",       &g_aoDither,       4u },
-            // Frames per STBN slice. Raising it slows the cycle (trades decorrelation for calm)
-            // without giving up the temporal axis entirely — the middle setting between rungs 2
-            // and 1. See [[project_forge_ao_stbn_dither]].
-            { "aoDitherStride", &g_aoDitherStride, 64u },
-            // AO BLUR VARIANT: 0 = 2D radius 3 (the reference), 1 = separable radius 3 (same reach,
-            // ~2x cheaper — isolates the separable range weight's approximation), 2 = separable
-            // radius 6 (double the reach and still fewer taps than 0 — the arm for half-res dither
-            // grain, which a +-3 kernel at a resolvable sigma cannot swallow).
-            { "aoBlurMode",     &g_aoBlurMode,     (uint32_t)kAOBlurModeCount - 1u },
-            { "aoUpProf",       &g_aoUpProf,       4u },
-            // 0 Off, 1 DLAA, 2 Quality, 3 Balanced, 4 Performance, 5 UltraPerformance. LIVE on the
-            // panel; here because the minimized perf harness cannot open a dropdown, and the A/B
-            // this milestone actually needs — DLSS off vs DLAA vs Quality at the same camera — is
-            // three runs of one token.
-            { "upscaleMode", &g_upscaleMode, (uint32_t)kUpscaleModeCount - 1u },
-            { "objVelDepthMode", &g_objVelDepthMode, 3u },
-            // 0 Default, 1 K, 2 J, 3 L, 4 M. ⚠ The legacy CNN presets E and F are NOT selectable:
-            // preset E hangs the GPU on runtime 310.8.0 (see upscale.h). K vs J is the A/B that
-            // remains, and it is one token.
-            { "upscalePreset", &g_upscalePreset, (uint32_t)kUpscalePresetCount - 1u },
-            // MB-2. K is clamped again at dispatch time to [kMbTileKMin, kMbTileKMax] — the table's
-            // max only stops a typo from being accepted silently, and the dispatch's clamp is what
-            // keeps the tile grid inside the surfaces it was allocated for.
-            { "mbTileK",   &g_mbTileK,   kMbTileKMax },
-            // MB-2l. The MAXIMUM STREAK is mbTileK * mbTileReach, so these two are the A/B pair:
-            // `mbTileK=96 mbTileReach=1` is the pre-MB-2l filter exactly.
-            { "mbTileReach", &g_mbTileReach, kMbTileReachMax },
-            { "mbMaxTaps", &g_mbMaxTaps, 64u },
-            { "mbDebug",   &g_mbDebug,   4u },
-            // MB-2o: 0 the streak mean, 1 the nearest sample, 2 reflected at the silhouette.
-            { "mbBgMode",  &g_mbBgMode,  2u },
-            // PBR: 0 cd (live DX9), 1 cdbs, 2 bspline, 3 RETIRED (runs 4), 4 cdblur; frame 0 cotangent,
-            // 1 surface gradient.
-            { "pbrGradMode",  &g_pbrGradMode,  4u },
-            { "pbrFrameMode", &g_pbrFrameMode, 1u },
-        };
-        const SKnob sknobs[] = {
-            // M1 4d: `passthrough` (default) or `ngx`. Read at INIT — it decides which object is
-            // CREATED — so it belongs here rather than only on the panel, and there is deliberately
-            // no panel control for the same reason `upscaleEnable` has none: a widget that silently
-            // does nothing after startup is worse than none. An unrecognised value REFUSES rather
-            // than falling back, so a typo cannot produce a run labelled DLSS that rendered a
-            // Catmull-Rom.
-            { "upscaleBackend", g_upscaleBackend, sizeof(g_upscaleBackend) },
-        };
-        std::string spec(env);
+    // Apply one "name=value,name=value" spec. `source` names it in the log, because a knob that
+    // moved is only evidence if you can say WHAT moved it — the environment, the saved panel file,
+    // or nothing.
+    void applyKnobSpec(const char* specText, const char* source) {
+        if (!specText || !*specText) { return; }
+        std::string spec(specText);
         size_t pos = 0;
         while (pos <= spec.size()) {
             const size_t comma = spec.find(',', pos);
@@ -26171,8 +27098,8 @@ void destroyHostWindow(Renderer* R);
             bool hit = false;
             for (const FKnob& k : fknobs) {
                 if (key == k.name) {
-                    *k.p = (float)std::atof(val.c_str());
-                    LOG::logline(">> [forge]   %s = %.4f", k.name, (double)*k.p);
+                    knobRecordOrig(k.p, (double)*k.p); *k.p = (float)std::atof(val.c_str());
+                    LOG::logline(">> [forge]   [%s] %s = %.4f", source, k.name, (double)*k.p);
                     hit = true;
                     break;
                 }
@@ -26180,8 +27107,8 @@ void destroyHostWindow(Renderer* R);
             if (!hit) {
                 for (const BKnob& k : bknobs) {
                     if (key == k.name) {
-                        *k.p = (std::atoi(val.c_str()) != 0);
-                        LOG::logline(">> [forge]   %s = %s", k.name, *k.p ? "true" : "false");
+                        knobRecordOrig(k.p, *k.p ? 1.0 : 0.0); *k.p = (std::atoi(val.c_str()) != 0);
+                        LOG::logline(">> [forge]   [%s] %s = %s", source, k.name, *k.p ? "true" : "false");
                         hit = true;
                         break;
                     }
@@ -26200,8 +27127,8 @@ void destroyHostWindow(Renderer* R);
                             LOG::logline("!! [forge]   %s=%ld out of range [0..%u] — clamped to %u",
                                          k.name, v, k.max, c);
                         }
-                        *k.p = c;
-                        LOG::logline(">> [forge]   %s = %u (%s)", k.name, c,
+                        knobRecordOrig(k.p, (double)*k.p); *k.p = c;
+                        LOG::logline(">> [forge]   [%s] %s = %u (%s)", source, k.name, c,
                                      (k.p == &g_upscaleMode)   ? kUpscaleModeNames[c]
                                    : (k.p == &g_upscalePreset) ? kUpscalePresetNames[c] : "");
                         hit = true;
@@ -26217,7 +27144,7 @@ void destroyHostWindow(Renderer* R);
                         // truncated value matches nothing and takes that knob's own unrecognised
                         // path, which logs. It cannot silently become a different valid value.
                         std::snprintf(k.p, k.cap, "%s", val.c_str());
-                        LOG::logline(">> [forge]   %s = %s", k.name, k.p);
+                        LOG::logline(">> [forge]   [%s] %s = %s", source, k.name, k.p);
                         hit = true;
                         break;
                     }
@@ -26240,9 +27167,24 @@ void destroyHostWindow(Renderer* R);
                     }
                 }
             }
-            if (!hit) { LOG::logline("!! [forge]   UNKNOWN knob '%s' — ignored", key.c_str()); }
+            if (!hit) { LOG::logline("!! [forge]   [%s] UNKNOWN knob '%s' — ignored", source, key.c_str()); }
         }
         LOG::flush();
+    }
+
+    // The environment arm, unchanged in behaviour: read once at startup, logged so a run's log
+    // carries the arm it was measured in.
+    void applyEnvOverrides() {
+        const char* env = std::getenv("MGE_HOST_KNOBS");
+        if (!env || !*env) { return; }
+        LOG::logline(">> [forge] MGE_HOST_KNOBS = %s", env);
+        {
+            static const char* kPrioName[] = { "NORMAL", "HIGH", "GLOBAL_REALTIME" };
+            LOG::logline(">> [forge] graphics queue priority = %s (queuePriority=%u)",
+                         kPrioName[g_queuePriorityApplied < 3u ? g_queuePriorityApplied : 0u],
+                         g_queuePriorityApplied);
+        }
+        applyKnobSpec(env, "MGE_HOST_KNOBS");
     }
 
     bool init(unsigned width, unsigned height, unsigned sampleCount, unsigned anisoLevel) {
@@ -26503,6 +27445,42 @@ void destroyHostWindow(Renderer* R);
         // Dev overlay: Forge IUI rendered into pRT each frame. UI is single-sample and matches
         // pRT's B8G8R8A8 (no MSAA UI pipeline). Failure here is non-fatal — the scene still renders.
         initDevUI(R, width, height, (uint32_t)g_live.pRT->mFormat);
+
+        // ── SAVED PANEL SETTINGS, AND THE ORDER IS THE WHOLE DESIGN ───────────────────────────
+        // HERE and not beside applyEnvOverrides, for two reasons that both point the same way:
+        //
+        //  1. The file's keys are resolved against the BUILT PANEL. Half the 503 controls have no
+        //     MGE_HOST_KNOBS name, so a load that ran before initDevUI could only restore the named
+        //     half — and dropping half of what somebody tuned, silently, is worse than not saving.
+        //  2. initDevUI captured each knob's DEFAULT on the way past (TabBuilder::push), which it
+        //     could only do before anything here moved them. "Reset to default" therefore means the
+        //     build's default and never the saved value, whatever is in the file.
+        //
+        // ⚠ AND THE ENVIRONMENT IS RE-APPLIED ON TOP. main.cpp already applied MGE_HOST_KNOBS before
+        // init, and the load above would silently overwrite it — so a harness arm would have lost to
+        // whatever the user last saved, which is the one failure that would make every A/B in this
+        // project quietly wrong. Re-applying is safe (the parse writes the same values into the same
+        // knobs) and it is what makes the layering true: file first, explicit arm last.
+        {
+            panelAuditKeys();
+            std::string report;
+            if (panelLoadSettings(report)) {
+                applyKnobSpec(std::getenv("MGE_HOST_KNOBS"),
+                              "MGE_HOST_KNOBS, re-applied OVER the saved panel file");
+            }
+            // WHAT THIS RUN IS ACTUALLY AT, after both layers — the same test the Save button and
+            // the panel's amber tint use, so the number here IS the number on the toolbar. A
+            // measurement whose log says "0 off default" is a measurement of the BUILD; one that
+            // says 7 is a measurement of somebody's tuning session, and those two have been
+            // confused before ([[project_forge_baseline_saves_stale]]).
+            uint32_t modified = 0;
+            for (const PanelTab& tab : g_panelTabs) {
+                for (const PanelItem& it : tab.items) { if (panelModified(it)) { ++modified; } }
+            }
+            LOG::logline(">> [panel] %u knob%s off the build default for this run%s",
+                         modified, modified == 1 ? " is" : "s are",
+                         modified ? "" : "  (a clean baseline)");
+        }
 
         // The ReShade/overlay surface, if asked for. AFTER everything above, because it needs the
         // renderer and the present queue; non-fatal if it fails.
@@ -27633,6 +28611,77 @@ void destroyHostWindow(Renderer* R);
         p.cloudOverZenith = (p.qZenith > 1.0e-9) ? ((double)g_skyCloudAlbedo / p.qZenith) : 0.0;
         p.active = true;
         g_skyPhys = p;
+    }
+
+    // ─── RE-AIM MW'S SUN LIGHT AT THE SUN YOU CAN SEE ────────────────────────────────────────────
+    //
+    // Rewrites gFrameData.sunDir (fd[16..18]) in place, and is therefore THE line that moves every
+    // shadow in the frame at once: the cascades' basis (sunLightBasis), the long-range occlusion
+    // march (rebuildSunOccMap), the per-pixel N.L in every receiver, the sky dome's sun lobe, and
+    // the exposure servo's flat-ground ndl all read it. See the declarations of
+    // g_sunLightFollowsDisc for WHY, including why night is excluded.
+    //
+    // ⚠ CALL IT **AFTER** skyPhysicalMeasure AND BEFORE EVERY TRUNCATED gFrameData COPY. After,
+    // because that function reports `elevLight` off fd[16..18] and reporting the disc's own
+    // elevation back as "the light" would delete the two-suns instrument — the split is the thing
+    // being corrected, so it has to stay measurable while the correction is live. Before, because
+    // the mirror / sun-cascade / first-person copies are made further down the frame and must
+    // inherit the aimed direction; a copy taken from the un-aimed lanes would light the reflection
+    // with a different sun from the one lighting the world.
+    //
+    // ⚠ A MISSING DISC READS AS NIGHT, WHICH IS THE SAFE DIRECTION. fd[19]/fd[27] are 0 for a client
+    // that never shipped the lanes, for a weatherless cell and for an interior; discZ = 0 then sits
+    // at the bottom of the ramp, w = 0, and MW's light is left exactly as it arrived. There is no
+    // configuration in which an absent disc aims the light at the horizon.
+    void aimSunLightAtDisc(float* fd)
+    {
+        g_sunAimAppliedDeg = 0.0f;
+        g_sunAimWeight     = 0.0f;
+        if (!fd || !g_sunLightFollowsDisc || !g_dlExterior) { return; }
+
+        const float discZ  = std::max(-1.0f, std::min(1.0f, fd[19]));
+        const float discAz = fd[27];
+
+        // The handover weight, on the DISC's elevation sine. Ends compared in SINE rather than in
+        // degrees so the ramp costs no asin: sin is monotone over the band, so the ordering — which
+        // is all a smoothstep needs — is identical.
+        const float lo = std::sin(std::max(-89.0f, std::min(g_sunLightDiscLoDeg, 89.0f)) * 0.017453293f);
+        const float hi = std::sin(std::max(-89.0f, std::min(g_sunLightDiscHiDeg, 89.0f)) * 0.017453293f);
+        float w = (hi > lo + 1.0e-6f) ? ((discZ - lo) / (hi - lo)) : (discZ > lo ? 1.0f : 0.0f);
+        w = std::max(0.0f, std::min(w, 1.0f));
+        w = w * w * (3.0f - 2.0f * w);
+        if (w <= 0.0f) { return; }
+
+        // MW's light lane is a TRAVEL direction, so to-sun is its negation; the disc arrives as a
+        // to-sun direction already. Both re-normalised before the mix — fd[16..18] is unit today but
+        // nothing downstream would survive it not being, and asin() of a non-unit z is silently wrong
+        // rather than loudly.
+        float a[3] = { -fd[16], -fd[17], -fd[18] };
+        const float al = std::sqrt(a[0]*a[0] + a[1]*a[1] + a[2]*a[2]);
+        if (!(al > 1.0e-6f)) { return; }
+        a[0] /= al; a[1] /= al; a[2] /= al;
+
+        const float discR = std::sqrt(std::max(0.0f, 1.0f - discZ * discZ));
+        const float b[3]  = { discR * std::cos(discAz), discR * std::sin(discAz), discZ };
+
+        // A normalised LERP, not a slerp. The two directions share an azimuth and differ only in
+        // elevation, by at most 29 degrees, and the band's own ends are where they AGREE — so the
+        // chord this cuts is a fraction of a degree of arc away from the great circle, and it cannot
+        // pass near the origin the way an antipodal pair would.
+        float t[3] = { a[0] + w * (b[0] - a[0]),
+                       a[1] + w * (b[1] - a[1]),
+                       a[2] + w * (b[2] - a[2]) };
+        const float tl = std::sqrt(t[0]*t[0] + t[1]*t[1] + t[2]*t[2]);
+        if (!(tl > 1.0e-3f)) { return; }
+        t[0] /= tl; t[1] /= tl; t[2] /= tl;
+
+        g_sunAimWeight     = w;
+        g_sunAimAppliedDeg = (std::asin(std::max(-1.0f, std::min(t[2], 1.0f)))
+                            - std::asin(std::max(-1.0f, std::min(a[2], 1.0f)))) * 57.2957795f;
+
+        // Back to a travel direction. fd[19] is NOT touched — it is the disc's own lane and the disc
+        // does not move.
+        fd[16] = -t[0]; fd[17] = -t[1]; fd[18] = -t[2];
     }
 
     // ─── P2b — THE SUN DISC'S SOLID ANGLE, AND THEREFORE ITS RADIANCE ────────────────────────────
@@ -29044,6 +30093,12 @@ void destroyHostWindow(Renderer* R);
             // fd[16..18]: the disc sits ~29 degrees off the light direction and, unlike the light,
             // it actually SETS. Both facts are load-bearing; see skyPhysicalMeasure.
             skyPhysicalMeasure(fd + 16, fd[19], fd[27]);
+            // ...and THEN aim MW's light at that same disc, for the half of the frame the sky model
+            // does not cover. Ordering is load-bearing in both directions — see the ⚠ blocks on
+            // aimSunLightAtDisc. This is what makes a sun overhead cast a shadow a sun overhead
+            // would cast; before it, every shadow in the frame was struck for a sun up to 29 degrees
+            // lower than the one drawn in the sky.
+            aimSunLightAtDisc(fd);
             // P2b: ...and the SUN DISC's own radiance, off the same cook and THIS frame's sky list.
             // It reads g_skyPhys.sunScene, so it must follow the line above; it is read by
             // publishSkyView further down, so it must precede that. Both halves are why it is called
@@ -30181,9 +31236,14 @@ void destroyHostWindow(Renderer* R);
             const bool occOn = g_dlExterior && g_sunOccValid && g_sunOccStrength > 0.0f;
             const float builtElev = g_sunOccValid
                 ? std::asin(std::max(-1.0f, std::min(g_sunOccBuiltDir[2], 1.0f))) * 57.2957795f : 0.0f;
-            bformat(&g_sunOccText, "Sun far  builds=%u (f%u)  elev=%.1f deg  reach=%.0f u x%.0f taps"
-                                   "  soft=%.0f bias=%.0f  %s",
-                    g_sunOccBuilds, g_sunOccBuildFrame, builtElev, g_sunOccLastOuter, g_sunOccSteps,
+            // Which bound decided the march, named rather than left to be inferred. `cap` is the
+            // typed ceiling above; `relief` is kSunOccRelief/tan(elev), which takes over as the sun
+            // climbs. Turning the ceiling down does nothing at all while the tag reads `relief`.
+            const bool capBound = g_sunOccOuter <= g_sunOccLastCut;
+            bformat(&g_sunOccText, "Sun far  builds=%u (f%u)  elev=%.1f deg  reach=%.0f u (%s; cap %.0f,"
+                                   " relief %.0f)  x%.0f taps  soft=%.0f bias=%.0f  %s",
+                    g_sunOccBuilds, g_sunOccBuildFrame, builtElev, g_sunOccLastOuter,
+                    capBound ? "cap" : "relief", g_sunOccOuter, g_sunOccLastCut, g_sunOccSteps,
                     g_sunOccSoft, g_sunOccBias,
                     occOn ? "ON"
                           : (!g_dlExterior ? "off (interior)"
@@ -31442,6 +32502,56 @@ void destroyHostWindow(Renderer* R);
             mp[kTerrainTexFloat + 1] = std::clamp(g_terrainTexBias, 0.0f, 4.0f);
             mp[kTerrainTexFloat + 2] = 0.0f;
             mp[kTerrainTexFloat + 3] = 0.0f;
+            // PARALLAX (tasks/forge-parallax.md). Published unconditionally like every block above:
+            // the frags read them on every frame they have a `_paramh` in view, and a lane written
+            // only on some frames is the stale-cbuffer trap this file has been bitten by before.
+            //
+            // ⚠ THE ARMS ARE FOLDED WITH pbrEnable / pbrTerrain HERE, at ONE host site, rather than
+            // being ANDed in each shader. Parallax reads the `_paramh` height, so it cannot mean
+            // anything where the material path is off — and two consumers deriving that condition
+            // separately is exactly how one of them ends up disagreeing ([[feedback_one_knob_two_jobs]]).
+            // (The mesh side gets this for free as well: pbrEnable zeroes ParamIndex at pack time,
+            // so opaque.frag's whole block is already unreachable. Folding it here too means the
+            // lane says what is actually running rather than what was ticked.)
+            mp[kParallaxFloat + 0] = (g_parallaxMesh && g_pbrEnable) ? 1.0f : 0.0f;
+            mp[kParallaxFloat + 1] = (g_parallaxTerrain && g_pbrTerrain) ? 1.0f : 0.0f;
+            mp[kParallaxFloat + 2] = std::max(0.0f, g_parallaxScale);
+            mp[kParallaxFloat + 3] = std::max(0.0f, g_parallaxBias);
+            // Clamped to the panel's own ceiling: the loop is `steps` taps on the surface that
+            // covers the screen, so a typo in MGE_HOST_KNOBS must not be able to buy 500 of them.
+            mp[kParallax2Float + 0] = (float)std::min(g_parallaxSteps, 8u);
+            mp[kParallax2Float + 1] = g_parallaxShadows ? 1.0f : 0.0f;
+            mp[kParallax2Float + 2] = std::max(0.0f, g_parallaxShadowSoften);
+            mp[kParallax2Float + 3] = std::max(0.0f, g_parallaxShadowScale);
+            mp[kParallax3Float + 0] = (g_heightBlend && g_pbrTerrain) ? 1.0f : 0.0f;
+            mp[kParallax3Float + 1] = std::clamp(g_heightBlendStrength, 0.0f, 1.0f);
+            mp[kParallax3Float + 2] = std::max(1e-4f, g_heightBlendContrast);
+            mp[kParallax3Float + 3] = 0.0f;
+            // Phase 4a displacement. ⚠ READ BY terrain.VERT — the second lane in this cbuffer that a
+            // vertex stage consumes (pbrStatics.z is the other), so the two stages must agree about
+            // it within a frame. They do: it is one scalar written once, here.
+            // Gated on pbrTerrain for the same reason as the arms above — the displacement reads the
+            // ground's `_paramh` height, and with terrain PBR off there is no material path at all.
+            mp[kTerrainDispFloat + 0] = (g_terrainDisp && g_pbrTerrain) ? 1.0f : 0.0f;
+            mp[kTerrainDispFloat + 1] = std::max(0.0f, g_terrainDispScale);
+            mp[kTerrainDispFloat + 2] = std::max(1e-4f, g_terrainDispGamma);
+            mp[kTerrainDispFloat + 3] = std::max(1e-4f, g_terrainDispPivot);
+            mp[kTerrainDisp2Float + 0] = std::max(0.0f, g_terrainDispRadius);
+            // The shader takes max(fade, radius + 1) anyway; clamping here as well means the LOG and
+            // the panel agree with what actually ran. Since 4b it is terrainDispFadeEnd() and not a
+            // second copy of the expression: the GEOMETRY disc reads the same accessor, and the
+            // crack-free property is the identity between the two.
+            mp[kTerrainDisp2Float + 1] = terrainDispFadeEnd();
+            mp[kTerrainDisp2Float + 2] = std::clamp(g_terrainDispLod, 0.0f, 12.0f);
+            // The rung the disc's ground is drawn at, for grass.vert's band-limit (it has no rung).
+            mp[kTerrainDisp2Float + 3] = (float)terrainPatchRung();
+            // The world grid's origin + span, for grass.vert's cell lookup. Whole numbers, and
+            // zeroes before residency — which reads as "span 0", i.e. terrainCellAt returns 0 and
+            // the carve is skipped, exactly the right answer before there is any terrain.
+            mp[kTerrainDisp3Float + 0] = (float)g_terrainGridMinX;
+            mp[kTerrainDisp3Float + 1] = (float)g_terrainGridMinY;
+            mp[kTerrainDisp3Float + 2] = (float)g_terrainGridSpanX;
+            mp[kTerrainDisp3Float + 3] = (float)g_terrainGridSpanY;
             mp[280] = g_shadowBias;               // biasParams.x = absolute contact bias (live knob)
             mp[281] = g_shadowNormalOffset;       // biasParams.y = normal-offset bias in texels (live knob)
             // Flicker shadow "movement": the mask rotates the LOOKUP direction of flicker-class slots by a
@@ -40301,7 +41411,12 @@ void destroyHostWindow(Renderer* R);
                     //            zenith it must hide under by day, and the sun's L against the solid
                     //            angle MW's sprite actually covers (which is NOT the sun's 6.8e-5 sr
                     //            — the ratio is a finding about MW's art).
-                    LOG::logline(">> [forge-hb][sky] MEDIUM mie=%.2fx (cal x%.2f) alb=%.2f elev=%.2fdeg (light=%.2fdeg)"
+                    // `aim` is the elevation change aimSunLightAtDisc actually applied to the LIGHT
+                    // this frame and `w` its handover weight, printed beside the two suns they are
+                    // computed from. At w=1 the light IS the disc, so `light + aim` should equal
+                    // `elev`; at w=0 the light is MW's bounce untouched, which is what night wants.
+                    LOG::logline(">> [forge-hb][sky] MEDIUM mie=%.2fx (cal x%.2f) alb=%.2f elev=%.2fdeg (light=%.2fdeg"
+                                 " aim=%+.2fdeg w=%.2f)"
                                  " ramp=%.2f blend=%.2f nightAmb=%.2f alt=%.0fm"
                                  " | q=%.4f (real 0.122, p25-p75 0.093-0.148) sun%%=%.3f (real ~0.80,"
                                  " a PREDICTION since S2)"
@@ -40318,6 +41433,7 @@ void destroyHostWindow(Renderer* R);
                                  (double)g_skyPhys.albedo,
                                  (double)g_skyPhys.elevDisc,
                                  (double)g_skyPhys.elevLight,
+                                 (double)g_sunAimAppliedDeg, (double)g_sunAimWeight,
                                  (double)g_skyPhys.nightRamp, (double)g_skyPhysBlend,
                                  (double)nightAmbScaleNow(),
                                  (double)(g_skyPhys.cameraRadiusM - Atmosphere::kGroundRadiusM),
@@ -41286,7 +42402,16 @@ void destroyHostWindow(Renderer* R);
                          " | hiz=%.2f (prologue, overruns=%u) | shadowCasters=%u maskSlots=%u(dyn=%u)"
                          " | nearTris=%.2fM atDraws=%u"
                          " | atmos=%.2f (LUT chain, every frame)"
-                         " | terrain=%u/%u cells (nearCut=%u) %.2fM tris (lod %u/%u/%u/%u/%u/%u)%s",
+                         // The histogram is RUNG-indexed AND FAMILY-indexed since 4b: `patch` counts
+                         // 512-unit sub-cell instances (8..128 u) and reads 0 unless the
+                         // displacement disc is live, `cell` counts whole-cell instances (128 u and
+                         // coarser). Both are spelled out in the line because a silent widening is
+                         // exactly the kind of change that makes an old log and a new one look
+                         // comparable when they are not — and because the whole point of 4b is that
+                         // the triangles moved from one family to the other.
+                         " | terrain=%u/%u cells (nearCut=%u) %.2fM tris"
+                         " (patch 8u:%u 16u:%u 32u:%u 64u:%u 128u:%u"
+                         " | cell 128u:%u/%u/%u/%u/%u/%u)%s",
                          g_lastGpuPhaseMs[kGpuPhaseCull],
                          g_lastGpuPhaseMs[kGpuPhasePrepass], g_lastGpuPhaseMs[kGpuPhaseShadow],
                          g_lastGpuPhaseMs[kGpuPhaseShadowStatic], g_lastGpuPhaseMs[kGpuPhaseShadowDyn],
@@ -41363,8 +42488,12 @@ void destroyHostWindow(Renderer* R);
                          g_lastGpuPhaseMs[kGpuPhaseAtmos],
                          g_lastTerrainCells, g_lastTerrainInRange, g_lastTerrainNearCut,
                          (double)g_lastTerrainTris / 1e6,
-                         g_lastTerrainLodHist[0], g_lastTerrainLodHist[1], g_lastTerrainLodHist[2],
-                         g_lastTerrainLodHist[3], g_lastTerrainLodHist[4], g_lastTerrainLodHist[5],
+                         g_lastTerrainLodHist[kTerrainFamPatch][0], g_lastTerrainLodHist[kTerrainFamPatch][1],
+                         g_lastTerrainLodHist[kTerrainFamPatch][2], g_lastTerrainLodHist[kTerrainFamPatch][3],
+                         g_lastTerrainLodHist[kTerrainFamPatch][4],
+                         g_lastTerrainLodHist[kTerrainFamCell][4], g_lastTerrainLodHist[kTerrainFamCell][5],
+                         g_lastTerrainLodHist[kTerrainFamCell][6], g_lastTerrainLodHist[kTerrainFamCell][7],
+                         g_lastTerrainLodHist[kTerrainFamCell][8], g_lastTerrainLodHist[kTerrainFamCell][9],
                          g_terrainEyeCellMissing ? "  (no LAND record within 1 cell of the eye)" : "");
             // Host-GPU-shrink sub-phases: WHERE inside color/reflect the ms live. sky+near+skin+mm+dl
             // ≈ color above (same frame's timestamps); refl sky = reflect − reflgeo.
@@ -43873,24 +45002,73 @@ void destroyHostWindow(Renderer* R);
     // MGEgui distant-land world generator (whose every OOM was 32-bit address space, and whose only
     // quality knob was the same knob that triggered the OOM).
     //
-    // Residency: ONE shared 65x65 lattice VB (in grid units, no positions baked in) + one index
-    // buffer holding all six LOD strides back to back, plus two data buffers holding every cell's
-    // heights and VCLR. Per frame the CPU frustum-culls cells, picks a stride per cell by distance,
-    // and writes one 40-byte instance row each; the draw is six cmdDrawIndexedInstanced calls, one
-    // per stride. The VS fetches the height itself — see terrain.vert.fsl.
+    // Residency: ONE shared lattice VB (in grid units, no positions baked in) + one index buffer
+    // holding every (family, rung) template back to back, plus two data buffers holding every cell's heights
+    // and VCLR. Per frame the CPU frustum-culls cells, picks a rung per cell, and writes one
+    // 32-byte instance row each; the draw is one cmdDrawIndexedInstanced per rung. The VS fetches
+    // the height itself — see terrain.vert.fsl.
 
     // (kTerrainLods + the heartbeat counters are declared up with the panel toggles, which the dev-UI
     //  setup earlier in this file binds against.)
-    constexpr uint32_t kTerrainMaxInst  = 8192;   // per-frame visible-cell cap (world is ~3.9k cells)
+    constexpr uint32_t kTerrainMaxInst  = 8192;   // per-frame visible-CELL cap (world is ~3.9k cells)
     constexpr uint32_t kTerrainInstStride = 32;   // float2 origin + uint4 inst0 + uint2 inst1
 
-    // LOD ladder: a cell whose centre is within kTerrainLodDist[i] cells of the eye draws at stride
-    // 1<<i. Deliberately generous at the near end — the handover to MW's near land happens inside
-    // the first entry, so the cells either side of it are always full resolution and cannot step.
-    const float kTerrainLodDist[kTerrainLods] = { 3.0f, 6.0f, 12.0f, 24.0f, 48.0f, 1e9f };
+    // ─── PHASE 4b: TWO TEMPLATE FAMILIES, ONE VB/IB ──────────────────────────────────────
+    // A rung is a property of the DRAWN UNIT, and 4b-lite's unit was the whole 8192-unit cell while
+    // the thing the fine lattice exists for is a ~1500-unit disc. That mismatch is not idle waste:
+    // the measured +0.13 ms of 4b-lite lands in the PIXEL stage, as quad overshading from triangles
+    // that projected to well under a pixel ([[feedback_extra_triangles_cost_in_the_pixel_stage]]).
+    // So the near field is drawn by a second, SMALLER unit:
+    //   CELL  family — span 64 base quads (8192 u), rungs kTerrainBaseLod..kTerrainLods-1.
+    //   PATCH family — span  4 base quads ( 512 u), rungs 0..kTerrainBaseLod (65²..5² = 8..128 u).
+    // 512 u at 65²/33² is exactly DX9's own patch: `scene-walk:src/mge/patch_displacement.cpp`
+    // subdivides MW's stride-4 terrain patch to 65² inner / 33² outer, i.e. 8 u and 16 u. Its patch
+    // size was derived from cost here and from their source there, and the two agree.
+    //
+    // 4b-lite's whole-cell 257²/129² templates are GONE — nothing would ever pick them — so this
+    // change SHRINKS the shared buffers (VB 707 KB -> ~91 KB, IB 2.1 MB -> ~262 KB).
+    // (kTerrainFamCell / kTerrainFamPatch / kTerrainFamilies are declared up with kTerrainLods —
+    //  the heartbeat's histogram, thousands of lines above here, indexes by family.)
+    constexpr uint32_t kTerrainPatchQuads = 4;                                     // base quads per patch side
+    constexpr uint32_t kTerrainPatchSide  = (uint32_t)Terrain::kCellQuads / kTerrainPatchQuads;  // 16
+    constexpr uint32_t kTerrainPatchesPerCell = kTerrainPatchSide * kTerrainPatchSide;           // 256
+    static_assert((uint32_t)Terrain::kCellQuads % kTerrainPatchQuads == 0,
+                  "a patch must tile the cell exactly, or a patched cell has an unpatched strip");
+    // MIRRORED IN terraindisp.h.fsl, and the shader has no way to read these. Same contract as
+    // SUN_CASCADES/kSunCascades: the assert cannot check the FSL side, so it names it. A drift here
+    // is silent — the VS would decode a patch origin against the wrong span and place every patch
+    // in the wrong quarter of its cell.
+    static_assert(kTerrainPatchQuads == 4, "TERRAIN_PATCH_QUADS in terraindisp.h.fsl must match");
+    static_assert(kTerrainBaseLod == 4,    "TERRAIN_BASE_RUNG in terraindisp.h.fsl must match");
 
-    struct TerrainLodRange { uint32_t firstIndex, indexCount, firstVertex, stride; };
-    TerrainLodRange g_terrainLodRange[kTerrainLods] = {};
+    // ⚠ THE INSTANCE RING IS BOUNDED BY ROWS, NOT BY CELLS, AND THAT DISTINCTION IS A MEMORY-SAFETY
+    // ONE. Until 4b every visible cell was exactly one 32-byte row, so kTerrainMaxInst bounded both
+    // and pass 2 could write `dst + cursor[lod] * 32` into a persistently-mapped CPU_TO_GPU buffer
+    // with no check at all. A patched cell is 256 rows. The worst case is bounded by the FADE END,
+    // which is why that has a hard ceiling (kTerrainDispFadeMax): a disc of radius F touches at most
+    // (2*floor(F/8192) + 2) cell columns, so at F = 16384 it is 6 x 6 = 36 cells.
+    constexpr uint32_t kTerrainMaxPatchCells = 36;
+    constexpr uint32_t kTerrainMaxRows = kTerrainMaxInst
+                                       + kTerrainMaxPatchCells * kTerrainPatchesPerCell;
+
+    // LOD ladder: a cell whose centre is within kTerrainLodDist[r] cells of the eye draws at rung r.
+    // Deliberately generous at the near end — the handover to MW's near land happens inside the
+    // base rung's entry, so the cells either side of it are always full resolution and cannot step.
+    //
+    // ⚠ RUNGS 0..3 ARE NOT ON THIS LADDER, and the 0.0f entries say so structurally rather than
+    // by comment: the pick below is `dCells < kTerrainLodDist[r]`, which no distance satisfies at
+    // 0. The fine rungs are chosen by the DISPLACEMENT DISC instead (see terrainCullAndBuild) —
+    // distance is the wrong question for them, because the thing they exist to resolve is itself
+    // placed by a radius. Rungs 4..9 carry the original five values plus the 1e9 backstop,
+    // unchanged and unshifted, so today's ladder is byte for byte today's.
+    const float kTerrainLodDist[kTerrainLods] = { 0.0f, 0.0f, 0.0f, 0.0f,
+                                                 3.0f, 6.0f, 12.0f, 24.0f, 48.0f, 1e9f };
+
+    struct TerrainLodRange { uint32_t firstIndex, indexCount, firstVertex, quadsPerSide; };
+    // [family][rung]. A (family, rung) pair the family does not carry has indexCount 0, and both
+    // the emit and the draw loop skip it — so the table is the single statement of which rungs a
+    // family owns, rather than a range repeated at every site that walks it.
+    TerrainLodRange g_terrainLodRange[kTerrainFamilies][kTerrainLods] = {};
 
     // CPU-side cull record per DRAWN cell. Deliberately flat and small — this is walked in full
     // every frame, and 46k cells is nothing next to the statics cull it sits beside.
@@ -43931,8 +45109,13 @@ void destroyHostWindow(Renderer* R);
         // its own, and reading its stale one would stitch an edge to a cell nobody is drawing.
         std::vector<uint32_t> lodStamp;
         uint32_t              cullFrame = 0;
+        // ⚠ CELL-INDEXED, AND IT STAYS THAT WAY THROUGH 4b. reflWaterVisible walks this list as a
+        // list of CELLS (it counts seen/wet per entry, reads whole-cell zLo/cx/cy, and forces the
+        // reflection pass open when the list is truncated), and five diagnostics print its size as
+        // a cell count. Patches are EMITTED in pass 2 and never enumerated here: a patch's rung is
+        // a pure function of (patch, eye, disc), so nothing needs storing per patch.
         std::vector<uint32_t> visible;    // slots surviving the cull, this frame
-        uint32_t              drawCounts[kTerrainLods] = {};   // per-LOD instance count
+        uint32_t              drawCounts[kTerrainFamilies][kTerrainLods] = {};   // per-(family,rung) ROW count
         Buffer*               instRing = nullptr;             // per-frame instance rows (CPU_TO_GPU)
         uint32_t              cells = 0;                       // = visible.size(), for the record gate
     };
@@ -44009,44 +45192,78 @@ void destroyHostWindow(Renderer* R);
     // (g_terrainReady is declared up with the panel toggles — fillFrameTimings needs it.)
     bool      g_terrainLoadTried   = false;
 
-    // Build the lattice VB + the six stride IBs and the terrain pipeline. The lattice is pure grid
-    // coordinates (0..64): every cell in the world shares it, and the height comes from the buffer.
+    // Build the lattice VB + the eight rung IBs and the terrain pipeline. The lattice is pure grid
+    // coordinates (0..64, FRACTIONAL on rungs 0-1): every cell in the world shares it, and the
+    // height comes from the buffer.
     bool buildTerrainPath(Renderer* R) {
         if (g_pTerrainPipeline) { return true; }
 
-        // (1) Vertices + indices for all six strides, packed back to back into one VB/IB pair.
-        std::vector<float>    verts;      // (gx, gy) pairs
-        std::vector<uint16_t> indices;
-        for (uint32_t l = 0; l < kTerrainLods; ++l) {
-            const uint32_t stride = 1u << l;
-            const uint32_t n      = Terrain::kCellQuads / stride;    // quads per side
-            TerrainLodRange& rg = g_terrainLodRange[l];
-            rg.stride      = stride;
-            rg.firstVertex = (uint32_t)(verts.size() / 2);
-            rg.firstIndex  = (uint32_t)indices.size();
+        // (1) Vertices + indices for every (family, rung), packed back to back into one VB/IB pair.
+        // firstVertex/firstIndex fall out of the append order, so a second family is mechanical.
+        //
+        // uint32 INDICES. 4b-lite needed them — its whole-cell rung 0 was 257^2 = 66,049 vertices,
+        // past what a uint16 can name — and 4b retires that template, so the largest template here
+        // is 65^2 = 4,225 and uint16 would fit again. Kept at 32 bits anyway: the whole IB is now
+        // ~65k indices (262 KB, down from 2.1 MB), so the narrower type buys 131 KB and re-arms a
+        // trap that costs a silent corruption the next time somebody adds a finer rung.
+        std::vector<float>    verts;      // (gx, gy) pairs — FRACTIONAL below the base rung
+        std::vector<uint32_t> indices;
+        for (uint32_t f = 0; f < kTerrainFamilies; ++f) {
+          // The span of the unit this family draws, in BASE QUADS. Everything else follows from it.
+          const uint32_t span = (f == kTerrainFamPatch) ? kTerrainPatchQuads
+                                                        : (uint32_t)Terrain::kCellQuads;
+          // ...and which rungs it carries. The two families overlap at exactly the base rung, which
+          // is deliberate: a patch at the base rung is a strict tiling of the cell's own template
+          // (same integer lattice points, same heights, same diagonal), so a patched cell whose far
+          // patches sit outside the disc costs the SAME triangles the cell would have drawn — 4
+          // quads/side x 256 patches = 8192 = the cell's own rung-4 count. Patching is then free in
+          // triangles and costs only instance rows, which is what makes P5's "all or nothing per
+          // cell" rule cheap rather than a compromise.
+          const uint32_t loFirst = (f == kTerrainFamPatch) ? 0u : kTerrainBaseLod;
+          const uint32_t loLast  = (f == kTerrainFamPatch) ? kTerrainBaseLod : (kTerrainLods - 1u);
+          for (uint32_t l = loFirst; l <= loLast; ++l) {
+            // step in LATTICE units: 1/16, 1/8, 1/4, 1/2, 1, 2, ... 32. Exact in float32 at every
+            // rung, and i*step lands on sixteenth-integers that compare exactly against 0 and the
+            // span — which is what the shader's edge test relies on.
+            const float    step = std::exp2((float)l - (float)kTerrainBaseLod);
+            const uint32_t n    = (l < kTerrainBaseLod) ? (span << (kTerrainBaseLod - l))
+                                                        : (span >> (l - kTerrainBaseLod));
+            TerrainLodRange& rg = g_terrainLodRange[f][l];
+            rg.quadsPerSide = n;
+            rg.firstVertex  = (uint32_t)(verts.size() / 2);
+            rg.firstIndex   = (uint32_t)indices.size();
             for (uint32_t j = 0; j <= n; ++j) {
                 for (uint32_t i = 0; i <= n; ++i) {
-                    verts.push_back((float)(i * stride));
-                    verts.push_back((float)(j * stride));
+                    verts.push_back((float)i * step);
+                    verts.push_back((float)j * step);
                 }
             }
             for (uint32_t j = 0; j < n; ++j) {
                 for (uint32_t i = 0; i < n; ++i) {
-                    const uint16_t a = (uint16_t)(j * (n + 1) + i);
-                    const uint16_t b = (uint16_t)(a + 1);
-                    const uint16_t c = (uint16_t)(a + (n + 1));
-                    const uint16_t d = (uint16_t)(c + 1);
+                    const uint32_t a = j * (n + 1) + i;
+                    const uint32_t b = a + 1;
+                    const uint32_t c = a + (n + 1);
+                    const uint32_t d = c + 1;
                     // Wound so the right-hand normal points UP (+Z), matching the outward-facing
                     // convention NIF geometry uses — which is what makes the statics pipeline's
                     // verified FRONT_FACE_CCW + CULL_MODE_BACK the correct pair here too (see
                     // g_dlStaticsFrontCW). The original (a,c,b)/(b,c,d) order pointed the normal DOWN
                     // and only worked because the PSO culled nothing; that made the world's one
                     // surface double-sided and its underside visible from below.
+                    //
+                    // ⚠ THE DIAGONAL IS b–c, i.e. u + v = 1, AT EVERY RUNG — and terrain.vert's
+                    // loadHeightTri hard-codes that split. Because the same split is used at every
+                    // rung, a fine rung's quads are a strict REFINEMENT of a coarse rung's: the
+                    // straddling sub-quads' own diagonals lie exactly on the coarse one. That is
+                    // what makes a fine cell draw the coarse cell's surface exactly. Flipping the
+                    // winding here without flipping loadHeightTri's test would silently replace
+                    // that identity with a bilinear approximation of it.
                     indices.push_back(a); indices.push_back(b); indices.push_back(c);
                     indices.push_back(b); indices.push_back(d); indices.push_back(c);
                 }
             }
             rg.indexCount = (uint32_t)indices.size() - rg.firstIndex;
+          }
         }
 
         BufferLoadDesc vb = {};
@@ -44061,7 +45278,7 @@ void destroyHostWindow(Renderer* R);
         BufferLoadDesc ib = {};
         ib.mDesc.mDescriptors = DESCRIPTOR_TYPE_INDEX_BUFFER;
         ib.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_GPU_ONLY;
-        ib.mDesc.mSize        = indices.size() * sizeof(uint16_t);
+        ib.mDesc.mSize        = indices.size() * sizeof(uint32_t);
         ib.mDesc.pName        = "terrainLatticeIB";
         ib.pData              = indices.data();
         ib.ppBuffer           = &g_pTerrainIB;
@@ -44074,7 +45291,10 @@ void destroyHostWindow(Renderer* R);
             ir.mDesc.mDescriptors = DESCRIPTOR_TYPE_VERTEX_BUFFER;
             ir.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_CPU_TO_GPU;
             ir.mDesc.mFlags       = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
-            ir.mDesc.mSize        = (uint64_t)kTerrainMaxInst * kTerrainInstStride;
+            // ROWS, not cells — see kTerrainMaxRows. The reflection and sun views never emit
+            // patches (they are floored at the base rung), so two of these three are oversized by
+            // ~295 KB; one size for all three is worth more than the saving.
+            ir.mDesc.mSize        = (uint64_t)kTerrainMaxRows * kTerrainInstStride;
             ir.mDesc.pName        = (v == &g_terrainMain) ? "terrainInstRing"
                                   : (v == &g_terrainRefl) ? "terrainInstRingRefl"
                                                           : "terrainInstRingSun";
@@ -44261,8 +45481,15 @@ void destroyHostWindow(Renderer* R);
             }
         }
 
-        std::printf("[forge][terrain] lattice built: %zu verts, %zu indices, 6 LODs\n",
-                    verts.size() / 2, indices.size());
+        std::printf("[forge][terrain] lattice built: %zu verts, %zu indices, %u families x %u rungs"
+                    " (cell %u..%u = %.0f..%.0f u, patch %u..%u = %.0f..%.0f u)\n",
+                    verts.size() / 2, indices.size(), kTerrainFamilies, kTerrainLods,
+                    kTerrainBaseLod, kTerrainLods - 1,
+                    (double)Terrain::kCellSize / g_terrainLodRange[kTerrainFamCell][kTerrainBaseLod].quadsPerSide,
+                    (double)Terrain::kCellSize / g_terrainLodRange[kTerrainFamCell][kTerrainLods - 1].quadsPerSide,
+                    0u, kTerrainBaseLod,
+                    (double)(kTerrainPatchQuads * Terrain::kVertSpacing) / g_terrainLodRange[kTerrainFamPatch][0].quadsPerSide,
+                    (double)(kTerrainPatchQuads * Terrain::kVertSpacing) / g_terrainLodRange[kTerrainFamPatch][kTerrainBaseLod].quadsPerSide);
         return true;
     }
 
@@ -44405,6 +45632,25 @@ void destroyHostWindow(Renderer* R);
             updateDescriptorSet(R, 0, g_live.pPerFrameSet, 1, &sd);
             if (g_live.pPerFrameSetReflectGeo) {
                 updateDescriptorSet(R, 0, g_live.pPerFrameSetReflectGeo, 1, &sd);
+            }
+            // ⚠ ...AND THE SUN CASTER SET, WHICH THIS DID NOT REACH UNTIL PHASE 4a. It did not have
+            // to: these arrays had exactly one reader, terrain.FRAG, and the caster pass is PS-less.
+            // The displacement put a reader in terrain.VERT — which the caster DOES compile — so the
+            // set it draws under has to carry them, and an unbound one here fails in the quietest
+            // possible way: SampleLevel returns 0, `1 - h` is 1, and the caster carves the ground to
+            // FULL DEPTH everywhere while the colour pass displaces it properly. The shadow would
+            // then disagree with the geometry by the whole amplitude, and it would read as a
+            // displacement bug rather than as a binding one.
+            //
+            // This is the FOURTH instance of the same lesson the buffer update in
+            // loadTerrainResidency writes out at length: any resource a shared shader reads must
+            // reach every set that shader draws under. The lesson keeps recurring because the set
+            // list is a property of the PIPELINES, not of the resource, so adding a reader in a new
+            // STAGE silently widens it.
+            if (g_live.pPerFrameSetSun) {
+                for (uint32_t c = 0; c < kSunCascades; ++c) {
+                    updateDescriptorSet(R, c, g_live.pPerFrameSetSun, 1, &sd);
+                }
             }
         }
 
@@ -44970,7 +46216,12 @@ void destroyHostWindow(Renderer* R);
         // so they size to the cull table, not to the slot count.
         const uint32_t cullN = (uint32_t)g_terrainCull.size();
         for (TerrainView* v : { &g_terrainMain, &g_terrainRefl, &g_terrainSun }) {
-            v->lodOf.assign(cullN, 0);
+            // Seeded with the BASE rung, not 0 — rung 0 is the FINEST one, and a default that
+            // means "8 u" is the wrong thing for an entry nobody has picked yet.
+            // The stitch only reads an entry whose lodStamp matches this frame, so this is a
+            // statement of intent rather than a value anything consumes; that is why it should say
+            // the safe thing.
+            v->lodOf.assign(cullN, (uint8_t)kTerrainBaseLod);
             v->lodStamp.assign(cullN, 0);
             v->visible.reserve(kTerrainMaxInst);
         }
@@ -45079,19 +46330,29 @@ void destroyHostWindow(Renderer* R);
     // mirror-about-water frustum). Distances, the LOD ladder and the camera-relative instance
     // origins all key off the true camera, exactly as the DL cull does.
     //
-    // `lodBias` is the ONE thing that may now differ per view (axis B of the reflection fidelity
-    // work — see reflFidelity()): steps ADDED to the ladder's pick, so the mirror can draw the same
-    // cells at a coarser stride than the view it mirrors. 0 everywhere but the reflect cull, which
-    // is what keeps the main view and the sun caster bit-for-bit unchanged.
+    // `lodBias` is axis B of the reflection fidelity work (see reflFidelity()): rungs ADDED to the
+    // ladder's pick, so the mirror can draw the same cells at a coarser rung than the view it
+    // mirrors. 0 everywhere but the reflect cull.
+    //
+    // `lodFloor` is 4b-lite's per-view control, and it is the COST TRAP this shares a function
+    // with: the sun caster and the water mirror run through here too, and unfloored they would draw
+    // 131k triangles per near cell into a shadow map and a half-resolution mirror. kTerrainBaseLod
+    // for both of those reproduces today's pick exactly, which is also what makes their half of the
+    // acceptance gate trivially true. It is ALSO what keeps them off the patch family in 4b — the
+    // patch gate below is `lodFloor <= patchRung` and patchRung < kTerrainBaseLod, so a view with a
+    // floor at the base rung cannot be handed a patch by any path, including a future one. The
+    // caster then carves at 128 u while the camera carves at 8 u — a shadow disagreeing with its
+    // geometry by at most `displacementScale` (6 units). That is the same bounded disagreement 4a
+    // already ships, recorded so it is a known quantity.
     void terrainCullAndBuild(TerrainView& V, bool primary,
                              const float planes[6][4], const float eye[3], float nearCut,
-                             uint32_t lodBias) {
+                             uint32_t lodBias, uint32_t lodFloor) {
         V.cells = 0;
-        for (uint32_t l = 0; l < kTerrainLods; ++l) { V.drawCounts[l] = 0; }
+        std::memset(V.drawCounts, 0, sizeof(V.drawCounts));
         if (primary) {
             g_lastTerrainCells = 0;
             g_lastTerrainTris  = 0;
-            for (uint32_t l = 0; l < kTerrainLods; ++l) { g_lastTerrainLodHist[l] = 0; }
+            std::memset(g_lastTerrainLodHist, 0, sizeof(g_lastTerrainLodHist));
         }
         if (!g_terrainReady || !g_drawTerrain) { return; }
 
@@ -45139,7 +46400,80 @@ void destroyHostWindow(Renderer* R);
                             * Terrain::kCellSize;
         const float maxView2 = (maxView + Terrain::kCellSize) * (maxView + Terrain::kCellSize);
 
+        // ─── PHASE 4b: WHICH PATCHES MAY TAKE A FINE RUNG ─────────────────────────────────────
+        // The near lattice exists for ONE consumer — the displacement carve — so its reach is the
+        // carve's reach, read off the SAME value the shader fades with rather than a second number
+        // that could drift away from it ([[feedback_one_knob_two_jobs]] read the other way round:
+        // one job, so one knob, so the geometry DERIVES from the look knob).
+        //
+        // ⚠ AND THAT IS ALSO THE POP GUARD, which is the whole reason it is a radius and not a
+        // ladder rung. With displacement on, a fine unit and a base unit draw DIFFERENT surfaces,
+        // so any rung change inside the carve would pop — DX9 had a fade for exactly this. Here the
+        // test is on the unit's NEAREST POINT against the FADE END, so at the instant a unit enters
+        // or leaves the set, the vertex that just crossed sits at exactly r1 where fade == 0, and
+        // every other vertex of that unit is further still. Fine and base then draw the identical
+        // surface (loadHeightTri evaluates the coarse triangle's plane), so the transition is
+        // continuous by construction and there is nothing left to fade.
+        //
+        // ⚠ IT IS ALSO THE CRACK GUARD, one granularity down. terrain.vert skips displacement on a
+        // STITCHED vertex (one that resampled onto a coarser neighbour's lattice), and that is only
+        // free when fade == 0 there. It is: a unit is fine EXACTLY when the disc touches it, so a
+        // coarser neighbour is by construction a unit the disc does not reach, and every point of
+        // that neighbour — including the edge the two share — is at or past the fade end. The
+        // identity "fine <=> the disc touches it" is therefore load-bearing, which is why the FADE
+        // END is what carries the hard ceiling and not the derived patch set: capping the set would
+        // leave a fine unit beside a coarse one with fade > 0 between them, i.e. a crack the size of
+        // `displacementScale`. See kTerrainDispFadeMax.
+        //
+        // Nearest point, not the bounding sphere's centre: a cell's sphere folds in a ~5800-unit
+        // horizontal half-diagonal, so a centre test would pull in the 3x3 ring — 1.2M triangles —
+        // to cover a 1500-unit disc. Exact is both correct and 2-5x cheaper.
+        const uint32_t patchRung = terrainPatchRung();
+        // Armed by consumption: with displacement off the base rung IS the fine rung, so no cell
+        // pays for a lattice nothing is using — and the frame is then bit-for-bit the 4a frame.
+        const bool  fineArmed = g_terrainDisp && g_pbrTerrain && patchRung < kTerrainBaseLod
+                             && lodFloor <= patchRung;
+        const float discR     = terrainDispFadeEnd();
+        const float discR2    = discR * discR;
+        const float patchSize = (float)kTerrainPatchQuads * Terrain::kVertSpacing;   // 512 world units
+
+        // Does the disc reach the axis-aligned square [x0, x0+w] x [y0, y0+w]? The one geometric
+        // test this phase rests on, written once so the CELL question and the PATCH question cannot
+        // answer it differently — they are the same question at two scales, and P6 (a cell is
+        // patched wholesale or not at all) is only sound because they agree.
+        auto discTouches = [&](float x0, float y0, float w) -> bool {
+            const float nx = std::clamp(eye[0], x0, x0 + w) - eye[0];
+            const float ny = std::clamp(eye[1], y0, y0 + w) - eye[1];
+            return nx * nx + ny * ny < discR2;
+        };
+        // A patch's rung, as a PURE function of (patch, eye, disc) — no side table and no per-patch
+        // storage, which is what lets pass 1 count rows by evaluating it and pass 2 re-evaluate it
+        // for the row and for its four neighbours. `ox`/`oy` are the patch origin in BASE QUADS.
+        //
+        // Outside the disc a patch takes the BASE rung, not a ladder pick. The ladder's finest
+        // reachable rung IS the base rung (kTerrainLodDist gives it for anything within 3 cells) and
+        // the patch family's coarsest rung is also the base rung, so every ladder answer a patched
+        // cell could produce clamps to the same value. Writing it directly says that, rather than
+        // implying the two ends might differ.
+        auto patchRungAt = [&](const TerrainCellCull& t, uint32_t ox, uint32_t oy) -> uint32_t {
+            const float px0 = (float)t.gx * Terrain::kCellSize + (float)ox * Terrain::kVertSpacing;
+            const float py0 = (float)t.gy * Terrain::kCellSize + (float)oy * Terrain::kVertSpacing;
+            return discTouches(px0, py0, patchSize) ? patchRung : kTerrainBaseLod;
+        };
+
+        // The patched-cell set, settled in pass 1 so pass 2 can ask a NEIGHBOUR whether it is
+        // patched. Bounded by kTerrainMaxPatchCells, which the fade-end ceiling makes unreachable
+        // in practice — it is the belt to the row bound's braces. Linear scan: at most 36 entries,
+        // and only a patch on its cell's PERIMETER ever asks.
+        uint32_t patchedCells[kTerrainMaxPatchCells];
+        uint32_t nPatchedCells = 0;
+        auto isPatched = [&](uint32_t idx) -> bool {
+            for (uint32_t i = 0; i < nPatchedCells; ++i) { if (patchedCells[i] == idx) { return true; } }
+            return false;
+        };
+
         uint32_t nInRange = 0, nNearCut = 0;   // cull funnel, for the one-shot diagnostic below
+        uint32_t rows     = 0;                 // INSTANCE ROWS, not cells — see kTerrainMaxRows
         for (uint32_t s = 0; s < (uint32_t)g_terrainCull.size(); ++s) {
             const TerrainCellCull& t = g_terrainCull[s];
             const float dx = t.cx - eye[0], dy = t.cy - eye[1], dz = t.cz - eye[2];
@@ -45167,14 +46501,50 @@ void destroyHostWindow(Renderer* R);
                 if (dCells < kTerrainLodDist[l]) { lod = l; break; }
             }
             // Fidelity axis B. AFTER the distance pick, not folded into kTerrainLodDist: the ladder
-            // is a distance->stride map and biasing the DISTANCE would change which rung each cell
+            // is a distance->rung map and biasing the DISTANCE would change which rung each cell
             // lands on non-uniformly, while biasing the RUNG is the coarsening that was asked for.
-            // Clamped to the last rung — past it there is no coarser stride to ask for.
+            // Clamped to the last rung — past it there is no coarser step to ask for.
             if (lodBias) { lod = (lod + lodBias < kTerrainLods) ? (lod + lodBias) : (kTerrainLods - 1); }
-            V.lodOf[s]    = (uint8_t)lod;
+            // The per-view floor. A CLAMP rather than a gate, so a view that must not see the fine
+            // lattice cannot be handed it by any path — including a future one.
+            if (lod < lodFloor) { lod = lodFloor; }
+
+            // ── P6: A CELL IS PATCHED WHOLESALE OR NOT AT ALL ───────────────────────────────
+            // A partially patched cell would still draw its own whole-cell template UNDER the
+            // patched region, and because a patch is a REFINEMENT of the same surface that is exact
+            // co-planar z-fighting, not a harmless overlap. P5 is what makes wholesale free: the
+            // patches outside the disc take the base rung, and 4 quads/side x 256 patches is exactly
+            // the 8192 triangles the cell's own base-rung template would have drawn. So patching a
+            // whole cell buys instance ROWS, not triangles.
+            const bool patched = fineArmed && nPatchedCells < kTerrainMaxPatchCells
+                              && discTouches((float)t.gx * Terrain::kCellSize,
+                                             (float)t.gy * Terrain::kCellSize, Terrain::kCellSize);
+            // ⚠ THE ROW BOUND. Pass 2 writes `dst + cursor * 32` into a persistently-mapped
+            // CPU_TO_GPU buffer, so a row count past the ring is a silent out-of-bounds write into
+            // GPU-visible host memory. One patched cell is 256 rows, so "one row per visible cell"
+            // stopped being true here and the cap has to be counted in rows.
+            const uint32_t need = patched ? kTerrainPatchesPerCell : 1u;
+            if (rows + need > kTerrainMaxRows) { break; }
+            rows += need;
+
+            // ⚠ A PATCHED CELL RECORDS THE BASE RUNG, because that is the rung its PERIMETER is
+            // stitched at and the neighbour stitch is the only consumer of this array. Its edge
+            // patches may be finer, and they do the snapping themselves (they see the neighbour's
+            // rung and resample onto it); a neighbour at the base rung must NOT snap toward them.
+            V.lodOf[s]    = (uint8_t)(patched ? kTerrainBaseLod : lod);
             V.lodStamp[s] = V.cullFrame;
             V.visible.push_back(s);
-            ++V.drawCounts[lod];
+            if (patched) {
+                patchedCells[nPatchedCells++] = s;
+                for (uint32_t py = 0; py < kTerrainPatchSide; ++py) {
+                    for (uint32_t px = 0; px < kTerrainPatchSide; ++px) {
+                        ++V.drawCounts[kTerrainFamPatch]
+                                      [patchRungAt(t, px * kTerrainPatchQuads, py * kTerrainPatchQuads)];
+                    }
+                }
+            } else {
+                ++V.drawCounts[kTerrainFamCell][lod];
+            }
         }
         // Cull funnel, per frame (not one-shot): "why is the host drawing so few cells" has three
         // independent answers — the DrawDist cap, the near cut, and the frustum — and from the
@@ -45186,39 +46556,31 @@ void destroyHostWindow(Renderer* R);
         }
         if (V.visible.empty()) { return; }
 
-        // Pass 2: group by LOD and emit. Instances for stride 1<<l occupy one contiguous run, so
-        // each LOD is one instanced draw with its own index range.
-        uint32_t base[kTerrainLods] = {};
+        // Pass 2: group by (family, rung) and emit. Instances for one pair occupy one contiguous
+        // run, so each pair is one instanced draw with its own index range. The walk order here and
+        // in terrainRecord is the SAME nested loop — family outer, rung inner — which is what makes
+        // `firstInstance` there agree with these run starts without either side naming a layout.
+        uint32_t cursor[kTerrainFamilies][kTerrainLods] = {};
         uint32_t running = 0;
-        for (uint32_t l = 0; l < kTerrainLods; ++l) {
-            base[l] = running;
-            running += V.drawCounts[l];
+        for (uint32_t f = 0; f < kTerrainFamilies; ++f) {
+            for (uint32_t l = 0; l < kTerrainLods; ++l) {
+                cursor[f][l] = running;
+                running += V.drawCounts[f][l];
+            }
         }
         uint8_t* dst = (uint8_t*)V.instRing->pCpuMappedAddress;
-        uint32_t cursor[kTerrainLods];
-        for (uint32_t l = 0; l < kTerrainLods; ++l) { cursor[l] = base[l]; }
 
-        for (uint32_t s : V.visible) {
-            const TerrainCellCull& t = g_terrainCull[s];
-            const uint32_t lod    = V.lodOf[s];
-            const uint32_t stride = 1u << lod;
-
-            // Neighbour strides for the edge stitch. A neighbour that is NOT visible this frame has
-            // no stride of its own; treat it as equal (no snap) — there is no edge to match, because
-            // nothing is drawn on the other side.
-            uint32_t nbrStrides = 0;
-            for (uint32_t k = 0; k < 4; ++k) {
-                uint32_t ns = stride;
-                if (t.nbr[k]) {
-                    // CULL INDEX, not data slot — the LOD arrays are per drawn cell, and default
-                    // land shares one slot across tens of thousands of them.
-                    const uint32_t nIdx = t.nbr[k] - 1u;
-                    if (V.lodStamp[nIdx] == V.cullFrame) { ns = 1u << V.lodOf[nIdx]; }
-                }
-                nbrStrides |= (ns & 0xFFu) << (k * 8u);
-            }
-
-            uint8_t* row = dst + (size_t)(cursor[lod]++) * kTerrainInstStride;
+        // One row. `fam`/`rung` pick the run, `ox`/`oy` are the patch origin in BASE QUADS (0,0 for
+        // a whole cell, which is what makes the shader's decode one expression for both families).
+        //
+        // ⚠ The bound check is belt-and-braces to pass 1's row count, deliberately: the thing it
+        // guards is an out-of-bounds write into GPU-visible host memory, and that failure mode is
+        // silent. If the two ever disagree, this drops rows instead of corrupting the heap.
+        auto emit = [&](const TerrainCellCull& t, uint32_t fam, uint32_t rung,
+                        uint32_t nbrRungs, uint32_t ox, uint32_t oy) {
+            uint32_t& cur = cursor[fam][rung];
+            if (cur >= kTerrainMaxRows) { return; }
+            uint8_t* row = dst + (size_t)(cur++) * kTerrainInstStride;
             const float originRel[2] = { (float)((double)t.gx * Terrain::kCellSize - (double)eye[0]),
                                          (float)((double)t.gy * Terrain::kCellSize - (double)eye[1]) };
             // Local grid coords + the grid span, so both shader stages can walk to ANY neighbour
@@ -45227,21 +46589,97 @@ void destroyHostWindow(Renderer* R);
             const uint32_t localXY = (uint32_t)(t.gx - g_terrainGridMinX)
                                    | ((uint32_t)(t.gy - g_terrainGridMinY) << 16);
             const uint32_t spanXY  = g_terrainGridSpanX | (g_terrainGridSpanY << 16);
+            // ⚠ THE PATCH ORIGIN RIDES inst1.y, WHICH WAS A LITERAL 0 CALLED "flags" — no stride
+            // change, so the vertex layout, the ring size per row and every downstream offset are
+            // untouched. Origins run 0..60 in steps of 4, so a byte each is generous.
+            const uint32_t flags   = ox | (oy << 8u)
+                                   | ((fam == kTerrainFamPatch) ? (1u << 16u) : 0u);
             // DATA slot here, not the cull index: this is what indexes gTerrainHeights/Color/Tex,
             // and every default-land instance points at the one shared cell.
-            const uint32_t inst0[4] = { t.slot, stride, nbrStrides, localXY };
-            const uint32_t inst1[2] = { spanXY, 0u };
+            const uint32_t inst0[4] = { t.slot, rung, nbrRungs, localXY };
+            const uint32_t inst1[2] = { spanXY, flags };
             std::memcpy(row + 0,  originRel, 8);
             std::memcpy(row + 8,  inst0,     16);
             std::memcpy(row + 24, inst1,     8);
+        };
+
+        // Neighbour RUNGS for the edge stitch, packed one byte each in nbr[] order (-X, +X, -Y, +Y).
+        // This used to pack the STRIDE (1<<lod), which cannot express the fine rungs' fractional
+        // steps in a byte. The rung is smaller, exact, and monotone in coarseness — so the shader's
+        // `is my neighbour coarser` test reads the same way and nothing else about the stitch
+        // changes. A neighbour that is NOT visible this frame has no rung of its own; treat it as
+        // equal (no snap) — there is no edge to match, because nothing is drawn on the other side.
+        static const int kNbrDX[4] = { -1, 1, 0, 0 };
+        static const int kNbrDY[4] = {  0, 0, -1, 1 };
+
+        for (uint32_t s : V.visible) {
+            const TerrainCellCull& t = g_terrainCull[s];
+
+            if (!isPatched(s)) {
+                const uint32_t lod = V.lodOf[s];
+                uint32_t nbrRungs = 0;
+                for (uint32_t k = 0; k < 4; ++k) {
+                    uint32_t nr = lod;
+                    if (t.nbr[k]) {
+                        // CULL INDEX, not data slot — the LOD arrays are per drawn cell, and default
+                        // land shares one slot across tens of thousands of them.
+                        const uint32_t nIdx = t.nbr[k] - 1u;
+                        if (V.lodStamp[nIdx] == V.cullFrame) { nr = V.lodOf[nIdx]; }
+                    }
+                    nbrRungs |= (nr & 0xFFu) << (k * 8u);
+                }
+                emit(t, kTerrainFamCell, lod, nbrRungs, 0u, 0u);
+                continue;
+            }
+
+            // ── P4: THE STITCH TESTS THE DRAWN UNIT'S EDGE ────────────────────────────────
+            // A patch's four neighbours are the adjacent PATCHES — inside this cell, or across a
+            // cell boundary the adjacent cell's edge patch (or, if that cell is not patched, its own
+            // rung). Every one of those is derived here rather than stored, which is why `visible`
+            // could stay cell-indexed: a patch's rung is a pure function of (patch, eye, disc).
+            const int kQuads = (int)Terrain::kCellQuads;
+            for (uint32_t py = 0; py < kTerrainPatchSide; ++py) {
+                for (uint32_t px = 0; px < kTerrainPatchSide; ++px) {
+                    const uint32_t ox = px * kTerrainPatchQuads, oy = py * kTerrainPatchQuads;
+                    const uint32_t rung = patchRungAt(t, ox, oy);
+                    uint32_t nbrRungs = 0;
+                    for (uint32_t k = 0; k < 4; ++k) {
+                        const int nox = (int)ox + kNbrDX[k] * (int)kTerrainPatchQuads;
+                        const int noy = (int)oy + kNbrDY[k] * (int)kTerrainPatchQuads;
+                        uint32_t nr = rung;
+                        if (nox >= 0 && noy >= 0 && nox < kQuads && noy < kQuads) {
+                            nr = patchRungAt(t, (uint32_t)nox, (uint32_t)noy);   // same (patched) cell
+                        } else if (t.nbr[k]) {
+                            const uint32_t nIdx = t.nbr[k] - 1u;
+                            if (V.lodStamp[nIdx] == V.cullFrame) {
+                                if (isPatched(nIdx)) {
+                                    nr = patchRungAt(g_terrainCull[nIdx],
+                                                     (uint32_t)((nox + kQuads) % kQuads),
+                                                     (uint32_t)((noy + kQuads) % kQuads));
+                                } else {
+                                    nr = V.lodOf[nIdx];
+                                }
+                            }
+                        }
+                        nbrRungs |= (nr & 0xFFu) << (k * 8u);
+                    }
+                    emit(t, kTerrainFamPatch, rung, nbrRungs, ox, oy);
+                }
+            }
         }
 
         V.cells = (uint32_t)V.visible.size();
         if (primary) {
-            for (uint32_t l = 0; l < kTerrainLods; ++l) {
-                g_lastTerrainLodHist[l] = V.drawCounts[l];
-                const uint32_t n = Terrain::kCellQuads >> l;
-                g_lastTerrainTris += (uint64_t)V.drawCounts[l] * n * n * 2ull;
+            for (uint32_t f = 0; f < kTerrainFamilies; ++f) {
+                for (uint32_t l = 0; l < kTerrainLods; ++l) {
+                    g_lastTerrainLodHist[f][l] = V.drawCounts[f][l];
+                    // ⚠ OFF THE FAMILY'S OWN quads-per-side. `kCellQuads >> l` was already wrong for
+                    // the fine half of the ladder (4b-lite fixed it once); assuming a whole cell per
+                    // instance would now over-count a patch by (64/4)^2 = 256x and report ~10M
+                    // triangles where the frame draws ~0.5M.
+                    const uint64_t n = g_terrainLodRange[f][l].quadsPerSide;
+                    g_lastTerrainTris += (uint64_t)V.drawCounts[f][l] * n * n * 2ull;
+                }
             }
             g_lastTerrainCells = V.cells;
         }
@@ -45287,14 +46725,25 @@ void destroyHostWindow(Renderer* R);
         Buffer*  vbs[2]     = { g_pTerrainVB, V.instRing };
         uint32_t strides[2] = { 8, kTerrainInstStride };
         cmdBindVertexBuffer(cmd, 2, vbs, strides, nullptr);
-        cmdBindIndexBuffer(cmd, g_pTerrainIB, INDEX_TYPE_UINT16, 0);
+        // UINT32 since 4b-lite. It is no longer forced — 4b retired the 257^2 whole-cell template
+        // that overran uint16 — but this is the ONE bind site every view records through, and 131 KB
+        // is not worth re-arming the trap for. See buildTerrainPath.
+        cmdBindIndexBuffer(cmd, g_pTerrainIB, INDEX_TYPE_UINT32, 0);
+        // ⚠ THE SAME NESTED ORDER PASS 2 USED — family outer, rung inner. `firstInstance` walks the
+        // ring the way `base`/`cursor` filled it, so neither side names a layout and adding a family
+        // or a rung cannot desynchronise them.
         uint32_t firstInstance = 0;
-        for (uint32_t l = 0; l < kTerrainLods; ++l) {
-            const uint32_t n = V.drawCounts[l];
-            if (!n) { continue; }
-            const TerrainLodRange& rg = g_terrainLodRange[l];
-            cmdDrawIndexedInstanced(cmd, rg.indexCount, rg.firstIndex, n, rg.firstVertex, firstInstance);
-            firstInstance += n;
+        for (uint32_t f = 0; f < kTerrainFamilies; ++f) {
+            for (uint32_t l = 0; l < kTerrainLods; ++l) {
+                const uint32_t n = V.drawCounts[f][l];
+                if (!n) { continue; }
+                const TerrainLodRange& rg = g_terrainLodRange[f][l];
+                // A (family, rung) the family does not carry has no template. It should also have no
+                // instances, so this is a guard against a future emit, not a live case.
+                if (!rg.indexCount) { continue; }
+                cmdDrawIndexedInstanced(cmd, rg.indexCount, rg.firstIndex, n, rg.firstVertex, firstInstance);
+                firstInstance += n;
+            }
         }
     }
 
@@ -48204,9 +49653,15 @@ void destroyHostWindow(Renderer* R);
                          // stride, not how many cells are visible — so without this the only sign of
                          // a +1 is `refl geo` getting cheaper, which is a timing, i.e. exactly the
                          // kind of inference `waterNoReflect` proves you cannot trust.
-                         g_terrainRefl.drawCounts[0], g_terrainRefl.drawCounts[1],
-                         g_terrainRefl.drawCounts[2], g_terrainRefl.drawCounts[3],
-                         g_terrainRefl.drawCounts[4], g_terrainRefl.drawCounts[5]);
+                         // CELL family only: the mirror is floored at the base rung, so it can
+                         // never hold a patch row, and printing a row of structural zeroes next to
+                         // it would be noise.
+                         g_terrainRefl.drawCounts[kTerrainFamCell][4],
+                         g_terrainRefl.drawCounts[kTerrainFamCell][5],
+                         g_terrainRefl.drawCounts[kTerrainFamCell][6],
+                         g_terrainRefl.drawCounts[kTerrainFamCell][7],
+                         g_terrainRefl.drawCounts[kTerrainFamCell][8],
+                         g_terrainRefl.drawCounts[kTerrainFamCell][9]);
             // THE W-GATE, and UNLIKE the two rows below it this one prints ALWAYS. The lane rows are
             // silent when un-armed because a row of zeroes from a lane nobody armed is noise; this one
             // is the opposite case — the gate is an instrument first, it runs whether or not it is
@@ -50403,9 +51858,12 @@ void destroyHostWindow(Renderer* R);
         // view this cull belongs to. The reflection gets the REAL terrain here — the near cut is
         // main-view-only (it exists to leave MW's own land alone, and the reflection has no MW land
         // to leave alone), so the mirror always sees the full surface down to the eye.
+        // The mirror is floored at the BASE lattice: it is a half-resolution reflection of ground
+        // the camera is already drawing at 8 u, and that vertex bill would be spent where
+        // nobody can resolve it. The camera itself takes the floor off.
         terrainCullAndBuild(T.primary ? g_terrainMain : g_terrainRefl, T.primary, planes, eye,
                             (T.primary && g_terrainNearCut) ? g_dlNearViewRange : 0.0f,
-                            T.lodBias);
+                            T.lodBias, T.primary ? 0u : kTerrainBaseLod);
 
         // Phase C: stream + UPLOAD the baked distant lights around the eye. Fill the gLights-layout
         // distant cbuffer with the NEAREST <=128 within the working radius (camera-relative: pos-eye,
@@ -52215,7 +53673,8 @@ void destroyHostWindow(Renderer* R);
         // found, because no world feature is that tall — so the march SHORTENS as the sun climbs
         // and midday costs a fraction of dawn. Kept above one texel so the geometric spacing is
         // always well-formed.
-        const float outer = std::max(std::min(g_sunOccOuter, kSunOccRelief / std::max(tanElev, 1e-3f)),
+        const float reliefCut = kSunOccRelief / std::max(tanElev, 1e-3f);
+        const float outer = std::max(std::min(g_sunOccOuter, reliefCut),
                                      g_sunOccInner + kSunOccTexel);
 
         float* sp = (float*)g_live.pSunOccParamsCbv->pCpuMappedAddress;
@@ -52252,6 +53711,7 @@ void destroyHostWindow(Renderer* R);
         g_sunOccBuiltOrigin[0] = g_skyHeightOrigin[0];
         g_sunOccBuiltOrigin[1] = g_skyHeightOrigin[1];
         g_sunOccLastOuter  = outer;
+        g_sunOccLastCut    = reliefCut;
         g_sunOccBuildFrame = g_renderFrame;
         g_sunOccValid = true;
         ++g_sunOccBuilds;
@@ -53329,8 +54789,14 @@ void destroyHostWindow(Renderer* R);
                 { -za[0], -za[1], -za[2], depthHalf }, {  za[0],  za[1],  za[2], depthHalf },
             };
             const float eye[3] = { g_dlEye[0], g_dlEye[1], g_dlEye[2] };
+            // Floored at the BASE lattice. The caster shares this cull with the camera, and
+            // unfloored it would draw 131k triangles per near cell into a shadow map — for a
+            // silhouette the map's own texel size cannot resolve. The cost is that the caster
+            // carves at 128 u while the camera carves at 8 u, so a shadow can disagree with its
+            // own geometry by at most `displacementScale`: the same bounded disagreement 4a
+            // already ships, and cheap next to what removing the floor would cost.
             terrainCullAndBuild(g_terrainSun, /*primary*/false, planes, eye, /*nearCut*/0.0f,
-                                /*lodBias*/0u);
+                                /*lodBias*/0u, /*lodFloor*/kTerrainBaseLod);
         }
 
         cmdBeginDebugMarker(g_live.pCmd, 0.9f, 0.85f, 0.2f, "SUN SHADOW (DL statics + terrain)");
@@ -54708,7 +56174,7 @@ void destroyHostWindow(Renderer* R);
             if (v->instRing) { removeResource(v->instRing); v->instRing = nullptr; }
             v->visible.clear(); v->lodOf.clear(); v->lodStamp.clear();
             v->cells = 0;
-            for (uint32_t l = 0; l < kTerrainLods; ++l) { v->drawCounts[l] = 0; }
+            std::memset(v->drawCounts, 0, sizeof(v->drawCounts));
         }
         // [0] is the reserved "no texture of this kind" slot in both sets — g_pTerrainWhite for
         // the albedo set (removed below, once), nothing at all for the companion set.

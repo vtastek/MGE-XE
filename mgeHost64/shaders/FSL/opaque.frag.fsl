@@ -10,6 +10,7 @@
 #include "opaque.srt.h"
 #include "texsample.h.fsl"   // sampleBase() — MW address mode + AF level
 #include "pbrmaterial.h.fsl" // _paramh PBR: height-derived normals + GGX (tasks/forge-pbr-materials.md)
+#include "parallax.h.fsl"    // parallaxOffsetUVTex() + Drobot soft shadows (tasks/forge-parallax.md)
 #include "a2c.h.fsl"         // a2cCoverageMask() — SHARED cutout coverage (prepass/colour parity)
 #include "fpshadow.h.fsl"    // fpShadowVisibility() — first-person direct cube-atlas shadow test
 #include "shadowreceive.h.fsl" // shadowMaskPixel() — the mask texel that is actually OURS under MSAA
@@ -75,15 +76,64 @@ float4 PS_MAIN( VSOutput In )
     float3 pbrSpecB  = float3(0.0f, 0.0f, 0.0f);
     float3 pbrTSun   = float3(1.0f, 1.0f, 1.0f);
     float3 pbrTAmb   = float3(1.0f, 1.0f, 1.0f);
+    // ─── PARALLAX (tasks/forge-parallax.md, D1/D5; parallax.h.fsl) ───────────────────────────────
+    // `pbrUv` is the SHADING uv: the base uv displaced along the tangent-space view vector so the
+    // height field reads as depth rather than as shading. Everything that describes the SURFACE —
+    // the albedo, the terrain decal, the `_paramh` material and the gradient the normal is built
+    // from — moves with it, because a relief whose colour and normal come from different points on
+    // the height field is two surfaces, not one.
+    //
+    // Initialised to In.Uv and only written inside the branch, so with the arm off every tap below
+    // takes the identical value and the frame is unchanged bit for bit — the same property the
+    // rest of this block is arranged around.
+    float2 pbrUv     = In.Uv;
+    float  pbrParaSh = 1.0f;     // Drobot soft parallax shadow: 1 = nothing occludes this texel
+    bool   paraLive  = false;    // the OFFSET is live (not merely the arm) — see the albedo tap
+    bool   paraShOn  = false;
     if (pbrOn)
     {
         const int2   psz   = GetDimensions(gTextures[In.ParamIndex], NO_SAMPLER);
         const float2 size0 = max(float2(psz), float2(1.0f, 1.0f));
-        pbrParam = pbrParamGrad(In.ParamIndex, In.ClampMode, In.Uv, pbrDUVdx, pbrDUVdy);
+        // All three lanes are cbuffer scalars and ParamIndex is FLAT, so this whole block is
+        // UNIFORM across the draw.
+        const bool paraArm   = (gShadowParams.parallax.x != 0.0f);
+        const uint paraSteps = (uint)gShadowParams.parallax2.x;
+        paraLive = paraArm && (paraSteps > 0u);
+        paraShOn = paraArm && (gShadowParams.parallax2.y != 0.0f);
+        if (paraArm)
+        {
+            // ONE tangent frame for both the view vector and the light vector — and it is the
+            // SIGN-CORRECT one pbrPerturbCotangent already uses, not a second copy of the legacy
+            // BuildPerPixelTBN, which lacks the Jacobian sign and would slide the parallax the
+            // wrong way on every front face (pbrmaterial.h.fsl::pbrTangentFrame).
+            float3 T, B;
+            pbrTangentFrame(pbrNg, pbrDPdx, pbrDPdy, pbrDUVdx, pbrDUVdy, T, B);
+            const float3 vDir = normalize(gFrameData.eyePos.xyz - In.WorldPos);
+            if (paraLive)
+            {
+                const float3 Vts = parallaxViewTS(vDir, T, B, pbrNg);
+                pbrUv = parallaxOffsetUVTex(In.ParamIndex, In.ClampMode, In.Uv, Vts,
+                                            pbrDUVdx, pbrDUVdy,
+                                            gShadowParams.parallax.z, gShadowParams.parallax.w,
+                                            paraSteps);
+            }
+            if (paraShOn)
+            {
+                // The TO-LIGHT direction, in the same frame. Traced from the SHADING uv, not the
+                // base one — see parallaxSoftShadowTex for why that is a deviation from the DX9
+                // source and why it is the right one.
+                const float3 Lts = parallaxViewTS(-gFrameData.sunDir.xyz, T, B, pbrNg);
+                pbrParaSh = parallaxSoftShadowTex(In.ParamIndex, In.ClampMode, pbrUv, Lts.xy,
+                                                  pbrDUVdx, pbrDUVdy,
+                                                  gShadowParams.parallax2.z,
+                                                  gShadowParams.parallax2.w);
+            }
+        }
+        pbrParam = pbrParamGrad(In.ParamIndex, In.ClampMode, pbrUv, pbrDUVdx, pbrDUVdy);
         // The gradient always comes from the `_paramh` height. (Mode 3, the baked `_paramd` map, is
         // RETIRED; the host publishes a 3 as 4.)
         const uint  gradMode = (uint)gShadowParams.pbrParams.x;
-        const float2 dhduv = pbrHeightGradUV(gradMode, In.ParamIndex, In.ClampMode, In.Uv,
+        const float2 dhduv = pbrHeightGradUV(gradMode, In.ParamIndex, In.ClampMode, pbrUv,
                                              pbrDUVdx, pbrDUVdy, size0, gShadowParams.pbrParams.w);
         N = pbrPerturb((uint)gShadowParams.pbrParams.y, N, pbrDPdx, pbrDPdy, pbrDUVdx, pbrDUVdy,
                        dhduv, gShadowParams.pbrParams.z);
@@ -195,6 +245,14 @@ float4 PS_MAIN( VSOutput In )
     // (a shadowed surface drops to ambient, exactly like the DX9 path and like MW itself).
     // The geometric normal (not the AO bent normal) drives the normal-offset bias.
     float  sunVis = sunShadowVisibility(In.WorldPos, normalize(In.Normal));
+    // D5 — the height field's own shadow, multiplied into the SAME visibility the cascades write.
+    // It belongs here and not beside the ambient: this is a direct-sun occlusion at texel scale,
+    // exactly what sunVis means, and folding it in is what makes it reach the sun's diffuse AND
+    // its specular lobe from one place.
+    // ⚠ The multiply is INSIDE the branch and not a `* 1.0` outside it — the house rule this file
+    // states for the W32 caustic gobo, so "the arm off is bit-identical" is a property of the code
+    // rather than a bet on the compiler.
+    if (paraShOn) { sunVis *= pbrParaSh; }
     // FFE PerPixelPS lighting terms: d = sun diffuse + point lights, a = scene ambient.
     // (matches lightSunDiffuse*N.L + Σ pointlights + lightSceneAmbient.)
     float3 d = gFrameData.sunCol.rgb * ndl * sunVis;
@@ -409,7 +467,23 @@ float4 PS_MAIN( VSOutput In )
     // ⚠ HOISTED ABOVE `lit` (it used to sit just below, next to the alpha test) because the AO
     // multi-bounce term needs the albedo. Still top-level, uniform control flow, so its implicit-LOD
     // derivatives are unaffected; the alpha test and the discard stay where they were.
-    float4 albedo = sampleBase(In.TexIndex, In.ClampMode, In.Uv, useLowAF(In.AlphaRef, false));
+    //
+    // ⚠ TWO ARMS, AND THE BRANCH IS PER-DRAW. With parallax live the uv is a function of a texture
+    // read, so the quad's own derivative of it describes the HEIGHT FIELD rather than the surface
+    // and the sampler picks a mip for the wrong quantity — visible as sparkle, and unfixable at the
+    // tap. The explicit arm takes the BASE uv's gradients, hoisted above in uniform flow. The
+    // implicit arm is kept textually untouched so "parallax off is bit-identical" holds: SampleGrad
+    // with the quad's own derivatives is not GUARANTEED to reproduce Sample bit for bit.
+    // `paraLive` is (a cbuffer lane) AND (FLAT ParamIndex != 0), i.e. constant across the whole
+    // draw — so the implicit arm is still in uniform control flow, which is what the per-PIXEL vs
+    // per-DRAW test asks ([[feedback_a_spec_violation_is_not_probably_benign]]).
+    float4 albedo;
+    if (paraLive) {
+        albedo = sampleBaseGrad(In.TexIndex, In.ClampMode, pbrUv, pbrDUVdx, pbrDUVdy,
+                                useLowAF(In.AlphaRef, false));
+    } else {
+        albedo = sampleBase(In.TexIndex, In.ClampMode, In.Uv, useLowAF(In.AlphaRef, false));
+    }
 
     // Terrain DECAL_1 splat — replicates cacheTerrainLitColor (XE Mod Landscape Lit.fx):
     //   albedo = lerp(base, overlay, vcol.a)   (overlay shares uv0; vcol ALPHA = AlphaGrid).
@@ -418,8 +492,17 @@ float4 PS_MAIN( VSOutput In )
     // lerp(base,overlay,vcol.a) * vcol.rgb*(d+a) — matching the D3D9 oracle.
     // Hoisted WITH the sample above, so the multi-bounce reads the splatted reflectance rather than
     // the base map on the draws that have an overlay.
+    // The overlay shares uv0 with the base, so it MUST take the same parallax offset — a decal that
+    // stayed on the geometric uv while the base slid under it would swim across the surface as the
+    // camera moves. Same two arms, same per-draw branch, same reason as the base tap above.
     if (In.OverlayIndex != 0u) {
-        float3 ov = SampleTex2D(gTextures[In.OverlayIndex], gSamplerAnisotropic, In.Uv).rgb;
+        float3 ov;
+        if (paraLive) {
+            ov = SampleGradTex2D(gTextures[In.OverlayIndex], gSamplerAnisotropic, pbrUv,
+                                 pbrDUVdx, pbrDUVdy).rgb;
+        } else {
+            ov = SampleTex2D(gTextures[In.OverlayIndex], gSamplerAnisotropic, In.Uv).rgb;
+        }
         albedo.rgb = lerp(albedo.rgb, ov, In.Color.a);
     }
 
@@ -537,6 +620,18 @@ float4 PS_MAIN( VSOutput In )
         float t = saturate((float)litCount / 8.0f);
         float3 heat = saturate(float3(t * 2.0f, 1.0f - abs(t - 0.5f) * 2.0f, 1.0f - t * 2.0f));
         RETURN(float4(litCount == 0u ? float3(0.0f, 0.0f, 0.0f) : heat, 1.0f));
+    }
+    if (dbg == 25u) {   // mode 25: the PARALLAX UV DELTA — the view that makes D1 judgeable
+        // Flat mid grey = this pixel did not move (no `_paramh`, or the arm is off). Red is the u
+        // axis, green the v axis, both normalised by `parallaxScale` so a full-amplitude shift
+        // saturates. It is also the GPU test for the tangent frame's SIGN, which no offline rig can
+        // see ([[feedback_a_frame_the_rig_cannot_see]]): the delta must reverse through grey as a
+        // surface rolls past the view direction, not hold one sign across the whole shape.
+        RETURN(float4(parallaxDeltaView(pbrUv, In.Uv, gShadowParams.parallax.z), 1.0f));
+    }
+    if (dbg == 26u) {   // mode 26: the terrain height-blend mask — terrain.frag owns it.
+        // Here so a mesh standing on that ground does not sit in whatever the previous mode drew.
+        RETURN(float4(0.10f, 0.10f, 0.11f, 1.0f));
     }
     if (dbg == 1u || dbg == 2u) {   // world-distance grayscale (reverse-Z NDC is too crushed to read)
         float dist = length(In.WorldPos - gFrameData.eyePos.xyz);

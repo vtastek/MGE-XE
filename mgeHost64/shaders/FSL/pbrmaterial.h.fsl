@@ -297,17 +297,39 @@ float pbrHeightAO(float hSharp, float hAvg, float2 size0, float avgLvl, float de
     return saturate(solidAngleOcclusion(1.0f, c));
 }
 
-float3 pbrPerturbCotangent(float3 N, float3 dPdx, float3 dPdy, float2 duvdx, float2 duvdy,
-                           float2 dhduv, float depth)
+// ─── The cotangent frame itself, WITH the sign fix, lifted out so there is exactly one copy ─────
+// Schüler's cotangent frame: T and B solved from the screen derivatives of position and uv, with no
+// mesh tangents anywhere — which is the only kind of frame this renderer can have, since nothing in
+// the host carries per-vertex tangents.
+//
+// ⚠ LIFTED OUT OF pbrPerturbCotangent RATHER THAN COPIED, and the reason is the sign above. The
+// rescued DX9 `BuildPerPixelTBN` is this function WITHOUT the sign(det) factor, so on a
+// right-handed world frame it hands back -T and -B and lights every bump from the wrong side. A
+// second consumer arrived (parallax.h.fsl needs the tangent-space VIEW and LIGHT vectors) and the
+// obvious move — porting the legacy TBN beside it — would have reintroduced exactly that bug in a
+// new place. There is one copy of the math and both readers take it.
+//
+// T and B are normalised as a PAIR (one shared rsqrt of the larger), not individually: an
+// anisotropic uv island keeps its aspect rather than having it flattened away. The legacy
+// BuildPerPixelTBN does the same, which is what lets DX9's tuned `parallaxScale` transfer.
+void pbrTangentFrame(float3 N, float3 dPdx, float3 dPdy, float2 duvdx, float2 duvdy,
+                     out float3 T, out float3 B)
 {
     const float3 dp2perp = cross(dPdy, N);
     const float3 dp1perp = cross(N, dPdx);
-    float3 T = dp2perp * duvdx.x + dp1perp * duvdy.x;   // = det * grad(u)
-    float3 B = dp2perp * duvdx.y + dp1perp * duvdy.y;   // = det * grad(v)
+    const float3 t = dp2perp * duvdx.x + dp1perp * duvdy.x;   // = det * grad(u)
+    const float3 b = dp2perp * duvdx.y + dp1perp * duvdy.y;   // = det * grad(v)
     const float det = dot(dPdx, dp2perp);
-    const float s = ((det < 0.0f) ? -1.0f : 1.0f) * rsqrt(max(max(dot(T, T), dot(B, B)), 1e-30f));
-    T *= s;
-    B *= s;
+    const float s = ((det < 0.0f) ? -1.0f : 1.0f) * rsqrt(max(max(dot(t, t), dot(b, b)), 1e-30f));
+    T = t * s;
+    B = b * s;
+}
+
+float3 pbrPerturbCotangent(float3 N, float3 dPdx, float3 dPdy, float2 duvdx, float2 duvdy,
+                           float2 dhduv, float depth)
+{
+    float3 T, B;
+    pbrTangentFrame(N, dPdx, dPdy, duvdx, duvdy, T, B);
     const float3 nTS = normalize(float3(-dhduv.x * depth, -dhduv.y * depth, 1.0f));
     return normalize(nTS.x * T + nTS.y * B + nTS.z * N);
 }

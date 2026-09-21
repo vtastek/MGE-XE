@@ -1,0 +1,255 @@
+// mgeHost64 — PARALLAX, soft parallax shadows and height blending (FSL ONLY).
+// tasks/forge-parallax.md. The DX9 originals this ports are `scene-walk`'s common.hlsl
+// (`Parallax`, `ParallaxSoftShadow`, `ParallaxSoftShadowBlend`) and the additive "Witcher" height
+// blend in its XE FixedFuncEmu_PS.hlsl — the LAST large piece of the old renderer the Forge
+// takeover had not absorbed.
+//
+// Include AFTER opaque.srt.h, texsample.h.fsl and pbrmaterial.h.fsl: it reads gTextures through
+// pbrParamGrad() and gTerrainParamArrays directly, and it needs the static samplers.
+//
+// ⚠ EVERY HEIGHT READ IN THIS FILE TAKES EXPLICIT GRADIENTS, AND THAT IS THE WHOLE DESIGN, NOT
+// TIDINESS. The iteration below samples at a UV it just computed from a texture read — a
+// DATA-DEPENDENT uv — so an implicit ddx/ddy of it is a derivative of the height field, not of the
+// surface, and it sparkles. It is the same defect class as the divergent-flow terrain tap
+// ([[feedback_a_spec_violation_is_not_probably_benign]]), and the DX9 code already knew it: its
+// `Parallax()` uses `tex2Dgrad` and is commented *"AF/Mipmap fix"*. Callers hoist ddx/ddy of the
+// BASE uv once, at top level in uniform flow, and pass them in. Nothing here calls ddx/ddy.
+#pragma once
+
+// The-Forge declares no `SampleGradTex2DArray` at all (its d3d.h has the Texture2D overload only),
+// so the bucketed land arrays take a LOCAL macro — the same treatment, for the same reason, that
+// terrain.frag.fsl gives SampleLvlLandArray and water.frag gives SampleCausticArray: a Forge gap we
+// neither inherit nor fork-fix ([[project_forge_fork_merge_trap]]). Its own name so nothing
+// collides when one header transitively includes another.
+#define SampleGradPxArray(N, S, C, DX, DY)  N.SampleGrad(S, C, DX, DY)
+
+// ─── D1: THE OFFSET, AND WHY IT IS NOT POM ──────────────────────────────────────────────────────
+// A FIXED number of taps, whatever the view angle. POM (a ray march that stops when it crosses the
+// height field) is the textbook answer and it was rejected on purpose: its march has to LENGTHEN as
+// the view goes grazing, so its cost peaks exactly where terrain spends most of a screen, and the
+// per-pixel step count makes the loop's trip count divergent. This degrades into a softer offset
+// instead of costing more, and its control flow is wave-uniform (the count is one cbuffer scalar).
+//
+// dUV is the OFFSET LIMITER and it is the reason `bias` exists. The unlimited form Vts.xy/Vts.z
+// diverges as the surface turns edge-on — an unbounded uv step that smears the texture into
+// streaks. `Vts.z + bias` bounds it: at bias 0.5 the worst case is 2x the head-on offset. That is
+// the tuned DX9 value, so the number transfers with the formula.
+//
+// ⚠ THE max() IS A NaN GUARD AND IS INERT AT THE TUNED VALUE. At bias 0.5 the denominator only
+// reaches 1e-3 for Vts.z < -0.499, i.e. a view vector pointing INTO the surface, which a visible
+// fragment does not have. At bias 0 it is what stops a silhouette pixel dividing by nothing and
+// handing a NaN to everything downstream ([[project_nan_survives_zero_multiply]]).
+float2 parallaxLimitUV(float3 Vts, float depth, float bias)
+{
+    return (Vts.xy / max(Vts.z + bias, 1e-3f)) * depth;
+}
+
+// One iteration, RE-EVALUATED FROM THE BASE UV and never accumulated. Accumulating (uvP += ...)
+// would be a random walk that runs away over a few steps; restarting from `uvBase` each time makes
+// the iteration a fixed-point solve of uv = uvBase + f(h(uv)), which converges toward the point the
+// view ray actually strikes and cannot wander.
+//
+// h is the `_paramh` alpha, 0..1, remapped so 0.5 is the reference plane — so a surface at its mean
+// height does not move at all, and the offset is symmetric about it. Exactly DX9's `h * 2 - 1`.
+float2 parallaxApplyUV(float2 uvBase, float h, float2 dUV)
+{
+    return uvBase + (h * 2.0f - 1.0f) * dUV;
+}
+
+// The view vector in tangent space. T and B come from pbrTangentFrame(), which is the SIGN-CORRECT
+// cotangent frame — see pbrmaterial.h.fsl. They are not individually unit length (one shared
+// rsqrt(max(|T|²,|B|²)) normalises the pair), which is also what the DX9 BuildPerPixelTBN did, so
+// the tuned `parallaxScale` means the same thing on either.
+//
+// ⚠ THE FRAME'S SIGN IS WHAT DECIDES WHICH WAY THE PARALLAX SLIDES, and the DX9 shader ran on a
+// frame that does NOT carry the fix. It did not need it: DX9 works in D3D9 VIEW space, which is
+// left-handed, so det > 0 for a front face there and the missing sign(det) was inert. The Forge
+// frame is Morrowind WORLD space, right-handed, where det < 0 for a front face — which is why
+// pbrPerturbCotangent applies the sign and why the formula ports verbatim onto it rather than
+// negated. F12 mode 25 is the GPU test of that claim; the offline rig cannot see it
+// ([[feedback_a_frame_the_rig_cannot_see]]).
+float3 parallaxViewTS(float3 V, float3 T, float3 B, float3 N)
+{
+    return float3(dot(V, T), dot(V, B), dot(V, N));
+}
+
+// ─── The iteration, once per RESIDENCY — the two live side by side so a drift is visible ────────
+// Two copies rather than one, because FSL cannot pass a resource as a parameter (the same
+// constraint that made landGradCdblur a separate function from pbrHeightGradUV). Keeping both in
+// ONE file is the mitigation: the mesh's loop and the ground's loop are five lines apart, so they
+// cannot silently diverge the way a per-shader copy does.
+//
+// steps == 0 leaves the uv EXACTLY untouched — the identity arm, and the free A/B against no
+// parallax at all. steps == 1 is DX9's single-offset `Parallax()` term for term. Higher counts
+// refine the same fixed point; 2 is the shipped default.
+//
+// ⚠ THE PLAN SAID "steps 0 reduces to ParallaxSimple". IT DOES NOT — 0 is the identity and ONE is
+// the single-offset form. Stated here because the off-by-one is invisible in play: at scale 0.008
+// the difference between "no parallax" and "one offset" is subtle enough to be read as "the knob
+// does nothing".
+
+// MESH path: the `_paramh` bindless slot, through the SAME address mode and anisotropy as its
+// albedo (pbrParamGrad), so the height filters exactly as the colour it belongs to.
+float2 parallaxOffsetUVTex(uint slot, uint clampMode, float2 uv, float3 Vts,
+                           float2 dx, float2 dy, float depth, float bias, uint steps)
+{
+    const float2 dUV = parallaxLimitUV(Vts, depth, bias);
+    float2 uvP = uv;
+    LOOP for (uint i = 0u; i < steps; ++i)
+    {
+        const float h = pbrParamGrad(slot, clampMode, uvP, dx, dy).a;
+        uvP = parallaxApplyUV(uv, h, dUV);
+    }
+    return uvP;
+}
+
+// One land texture's height out of the bucketed `_paramh` arrays, at explicit gradients. WRAP, and
+// through the anisotropic sampler, for landHeightLvl's reasons: a land texture tiles once per
+// 512-unit texture square by construction, so there is no edge to clamp to, and the height must
+// filter like the albedo it displaces.
+float parallaxLandHeight(uint slot, float2 uv, float2 dx, float2 dy)
+{
+    const uint bucket = slot >> 16u;
+    const uint layer  = slot & 0xFFFFu;
+    return SampleGradPxArray(gTerrainParamArrays[bucket], gSamplerAnisotropic,
+                             float3(uv, float(layer)), dx, dy).a;
+}
+
+// TERRAIN path (D3): the loop runs against ONE layer — the highest-weight corner that ships a
+// `_paramh` — and the existing four-corner albedo/material blend then happens at the uv it returns.
+// Iterating against the BLENDED height would cost `steps x 4` taps for a sub-texel difference; it is
+// the user's own prior decision, recorded at scene-walk's XE FixedFuncEmu_PS.hlsl:284 — *"Parallax()
+// itself stays on the base sampler — the UV-offset delta from dual-sampling there is not worth
+// doubling the iterative cost for."*
+//
+// Bound on the error that approximation admits: at parallaxScale 0.008 the offset is ~1/125 of a
+// texture square, far too small to make the four fixed corner weights mean anything different.
+float2 parallaxOffsetUVLand(uint slot, float2 uv, float3 Vts,
+                            float2 dx, float2 dy, float depth, float bias, uint steps)
+{
+    const float2 dUV = parallaxLimitUV(Vts, depth, bias);
+    float2 uvP = uv;
+    LOOP for (uint i = 0u; i < steps; ++i)
+    {
+        const float h = parallaxLandHeight(slot, uvP, dx, dy);
+        uvP = parallaxApplyUV(uv, h, dUV);
+    }
+    return uvP;
+}
+
+// ─── D5: DROBOT SOFT PARALLAX SHADOWS ───────────────────────────────────────────────────────────
+// Four FIXED taps along the tangent-space TO-LIGHT direction at 0.20/0.35/0.45/0.55 of the reach,
+// the lowest surface of the four against this pixel's own, softened. Fixed tap count, uniform flow,
+// no divergence — the same property the parallax loop was chosen for.
+//
+// The height convention is DX9's: `1 - a` is DEPTH below the top of the height range, so a tap with
+// a SMALLER depth than ours is a TALLER neighbour standing between us and the sun, and (h0 - h) is
+// how far it rises over us. `soften` turns that rise into an occlusion; `scale` is the reach in uv.
+// Shipped DX9 values 5.0 and 0.04*0.75 = 0.03, which is where this starts.
+//
+// ⚠ ONE DELIBERATE DEVIATION FROM THE DX9 SOURCE, AND IT IS A FIX, NOT A PORT. The DX9 call site
+// passes `input.texcoord` — the BASE uv — while its albedo and its normal are read at the
+// PARALLAXED uv. So its self-shadow is registered against a surface up to one full parallax offset
+// away from the one being shaded. The callers here pass the shading uv, which costs nothing and is
+// the only reading under which the shadow and the bump belong to the same surface.
+float parallaxSoftShadowTex(uint slot, uint clampMode, float2 uv, float2 Lts,
+                            float2 dx, float2 dy, float soften, float scale)
+{
+    const float2 lDir = Lts * scale;
+    const float  h0 = 1.0f - pbrParamGrad(slot, clampMode, uv, dx, dy).a;
+    float h = 1.0f - pbrParamGrad(slot, clampMode, uv + 0.20f * lDir, dx, dy).a;
+    h = min(h, 1.0f - pbrParamGrad(slot, clampMode, uv + 0.35f * lDir, dx, dy).a);
+    h = min(h, 1.0f - pbrParamGrad(slot, clampMode, uv + 0.45f * lDir, dx, dy).a);
+    h = min(h, 1.0f - pbrParamGrad(slot, clampMode, uv + 0.55f * lDir, dx, dy).a);
+    return min(1.0f, 1.0f - saturate((h0 - h) * soften));
+}
+
+// The BLENDED height of the four land-texture corners at one uv, renormalised by the weight that
+// actually carries a `_paramh` — so a layer with no companion map does not drag the surface toward
+// zero, which would invent a cliff at every join with an uncovered texture.
+// `one` is the caller's `oneSquare`: all four corners are the same square, so one tap answers.
+float parallaxLandHeight4(uint4 slots, float4 w, float invW, bool one,
+                          float2 uv, float2 dx, float2 dy)
+{
+    if (one) { return (slots.x != 0u) ? parallaxLandHeight(slots.x, uv, dx, dy) : 0.5f; }
+    float h = 0.0f;
+    if (slots.x != 0u) { h += parallaxLandHeight(slots.x, uv, dx, dy) * w.x; }
+    if (slots.y != 0u) { h += parallaxLandHeight(slots.y, uv, dx, dy) * w.y; }
+    if (slots.z != 0u) { h += parallaxLandHeight(slots.z, uv, dx, dy) * w.z; }
+    if (slots.w != 0u) { h += parallaxLandHeight(slots.w, uv, dx, dy) * w.w; }
+    return h * invW;
+}
+
+// ...and the shadow traced against THAT surface, which is ParallaxSoftShadowBlend's whole reason:
+// the shadow has to follow the profile the eye sees, and on the ground the eye sees a blend.
+// ⚠ IT IS FIVE TAPS PER COVERED LAYER — up to 20 on a four-texture join, and terrain is most of the
+// screen outdoors. That is why it is behind its own arm rather than folded into `parallaxTerrain`,
+// and why the `one` fast path (40.2% of the world's quad joins, measured) is not an optimisation to
+// be tidied away.
+float parallaxSoftShadowLand(uint4 slots, float4 w, float invW, bool one, float2 uv, float2 Lts,
+                             float2 dx, float2 dy, float soften, float scale)
+{
+    const float2 lDir = Lts * scale;
+    const float  h0 = 1.0f - parallaxLandHeight4(slots, w, invW, one, uv, dx, dy);
+    float h = 1.0f - parallaxLandHeight4(slots, w, invW, one, uv + 0.20f * lDir, dx, dy);
+    h = min(h, 1.0f - parallaxLandHeight4(slots, w, invW, one, uv + 0.35f * lDir, dx, dy));
+    h = min(h, 1.0f - parallaxLandHeight4(slots, w, invW, one, uv + 0.45f * lDir, dx, dy));
+    h = min(h, 1.0f - parallaxLandHeight4(slots, w, invW, one, uv + 0.55f * lDir, dx, dy));
+    return min(1.0f, 1.0f - saturate((h0 - h) * soften));
+}
+
+// ─── D4: THE ADDITIVE HEIGHT BLEND, GENERALISED FROM 2 LAYERS TO 4 ──────────────────────────────
+// Sand settles into the cracks in stone instead of crossfading over them. The DX9 form
+// (XE FixedFuncEmu_PS.hlsl:240) is the canonical additive Witcher blend over TWO layers:
+//
+//     b_i = h_i + w_i ;  ma = max(b) - contrast ;  c_i = max(b_i - ma, 0) ;  mask = c / sum(c)
+//
+// and it generalises to four with nothing added. ADDING the weight to the layer's own height (as
+// opposed to multiplying) is what makes the endpoints exact regardless of the height map's range:
+// at w_i = 1 that layer's b is at least 1 and every rival's is at most its own height, so it wins
+// outright and there is no leakage from a rival whose height happens to sit above `contrast`.
+//
+// At N = 2 this is ALGEBRAICALLY their existing expression — c1/s and c2/s sum to 1, so lerping the
+// whole weight vector toward c/s is exactly their `lerp(t, hMask, strength)` on the second lane and
+// its complement on the first. Which is what lets the tuned `contrast 0.06` transfer unchanged.
+//
+// `contrast` is the width of the band over which two layers still mix: it is subtracted from the
+// winner, so only rivals within `contrast` of it survive the max(). Small = a hard, crack-following
+// boundary; large = back toward the plain bilinear blend. 0 would make the boundary a step with no
+// filtering at all, so it is floored.
+float4 parallaxHeightBlend4(float4 h, float4 w, float strength, float contrast)
+{
+    const float4 b  = h + w;
+    const float  ma = max(max(b.x, b.y), max(b.z, b.w)) - max(contrast, 1e-4f);
+    const float4 c  = max(b - ma, float4(0.0f, 0.0f, 0.0f, 0.0f));
+    const float  s  = max(c.x + c.y + c.z + c.w, 1e-4f);
+    return lerp(w, c / s, saturate(strength));
+}
+
+// The four corners' heights for that blend, at the SHADING uv. A corner with no `_paramh` gets
+// 0.5 — the neutral mid-height, i.e. it competes on its bilinear weight alone and neither wins nor
+// loses ground it has nothing to say about. Reading it as 0 would let any covered neighbour
+// overwrite every uncovered land texture in the world.
+float4 parallaxLandHeights(uint4 slots, float2 uv, float2 dx, float2 dy)
+{
+    float4 h = float4(0.5f, 0.5f, 0.5f, 0.5f);
+    if (slots.x != 0u) { h.x = parallaxLandHeight(slots.x, uv, dx, dy); }
+    if (slots.y != 0u) { h.y = parallaxLandHeight(slots.y, uv, dx, dy); }
+    if (slots.z != 0u) { h.z = parallaxLandHeight(slots.z, uv, dx, dy); }
+    if (slots.w != 0u) { h.w = parallaxLandHeight(slots.w, uv, dx, dy); }
+    return h;
+}
+
+// ─── F12 mode 25: THE PARALLAX UV DELTA ─────────────────────────────────────────────────────────
+// The view that makes D1 judgeable at all, and the GPU test for the tangent frame's sign. The
+// offset is normalised by its own scale so a full-amplitude shift reads as saturated, and remapped
+// about mid grey: FLAT GREY == this pixel did not move.
+//   red above 0.5   the uv slid toward +u        red below   toward -u
+//   green above 0.5 toward +v                    green below toward -v
+// Walk toward a wall and the delta must reverse smoothly through grey as the surface turns; a
+// CONSTANT sign across a surface that rolls past the view direction is the reversed-frame failure.
+float3 parallaxDeltaView(float2 uvShaded, float2 uvBase, float scale)
+{
+    const float2 d = (uvShaded - uvBase) / max(scale, 1e-6f);
+    return float3(saturate(d.x * 0.5f + 0.5f), saturate(d.y * 0.5f + 0.5f), 0.5f);
+}

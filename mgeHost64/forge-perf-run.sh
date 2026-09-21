@@ -255,6 +255,13 @@ tail -n +$((startlines + 1)) "$LOG" | grep -E "host split:|gpu split:|gpu color 
 # captured output — the alternative is a table of readings whose labels come from memory.
 echo "=== knobs applied ==="
 tail -n +$((startlines + 1)) "$LOG" | grep -E "MGE_HOST_KNOBS|UNKNOWN knob" | tail -8 || echo "  (none — default build)"
+# ...AND WHAT THE RUN IS ACTUALLY AT. Since 2026-09-21 the dev panel can SAVE its knobs to
+# mgeHostPanel.ini and the host loads that at startup, so "I passed no knobs" no longer implies "this
+# is the build's baseline". MGE_HOST_KNOBS is re-applied over the file and still wins, but anything
+# the arm does not name comes from whatever was last saved in a play session. This line is the whole
+# answer in one number, and it is here rather than left in the log because a contaminated baseline
+# that nobody looked for is exactly how a table of readings goes quietly wrong.
+tail -n +$((startlines + 1)) "$LOG" | grep -E "\[panel\] .* off the build default|\[panel\] mgeHostPanel" | tail -3
 echo "=== apl / apl-split ==="
 tail -n +$((startlines + 1)) "$LOG" | grep -E "\[forge-hb\] apl" | tail -6
 

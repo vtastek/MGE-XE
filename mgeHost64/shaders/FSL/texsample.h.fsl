@@ -90,6 +90,63 @@ float4 sampleBase(uint texIdx, uint clampModeIn, float2 uv, bool lowAF)
     return SampleTex2D(gTextures[texIdx], gSamplerAnisotropic, uv);   // WRAP_S_WRAP_T — MW's default
 }
 
+// ─── The SampleGrad twin of the two above, for a DATA-DEPENDENT uv ──────────────────────────────
+// Same eight-sampler ladder, same flip-book routing, same AF level — the only difference is that
+// the gradients are handed in instead of taken from the quad.
+//
+// It exists for parallax (parallax.h.fsl): once the uv a draw samples at is a function of a texture
+// read, its implicit ddx/ddy is a derivative of the HEIGHT FIELD and not of the surface, so the
+// hardware picks a mip and an anisotropic footprint for a quantity that has nothing to do with how
+// fast the surface is receding. That reads as sparkle and is indistinguishable from a bad height
+// map. Callers hoist ddx/ddy of the BASE uv once, at top level, and pass them here.
+//
+// ⚠ NOT a drop-in replacement for sampleBase on the unparallaxed path. SampleGrad with the quad's
+// own derivatives is NOT guaranteed bit-identical to Sample — the hardware may take a different
+// route to the LOD — so the callers branch rather than routing everything through this and calling
+// it a no-op. That branch is per-DRAW (see opaque.frag), which is what makes its implicit-derivative
+// arm legal ([[feedback_a_spec_violation_is_not_probably_benign]]: the test is per-PIXEL vs
+// per-DRAW, and a wave-uniform branch is uniform control flow).
+//
+// The-Forge declares no SampleGradTex2DArray (its d3d.h carries the Texture2D overload only), so
+// the flip-book arrays take a local macro — the same gap, and the same treatment, as
+// terrain.frag.fsl's SampleLvlLandArray ([[project_forge_fork_merge_trap]]).
+#define SampleGradFlipArray(N, S, C, DX, DY)  N.SampleGrad(S, C, DX, DY)
+
+float4 sampleFlipGrad(uint texIdx, uint clampModeIn, float2 uv, float2 dx, float2 dy, bool lowAF)
+{
+    const uint clampMode = clampModeIn & TEX_ADDR_MASK;
+    const uint bucket = (texIdx >> 11u) & (MAX_FLIP_BUCKETS - 1u);
+    const float3 uvw  = float3(uv, (float)(texIdx & FLIP_LAYER_MASK));
+    if (lowAF)
+    {
+        if (clampMode == TEX_CLAMP_S_CLAMP_T) { return SampleGradFlipArray(gFlipArrays[bucket], gSampler2xClampClamp, uvw, dx, dy); }
+        if (clampMode == TEX_CLAMP_S_WRAP_T)  { return SampleGradFlipArray(gFlipArrays[bucket], gSampler2xClampWrap,  uvw, dx, dy); }
+        if (clampMode == TEX_WRAP_S_CLAMP_T)  { return SampleGradFlipArray(gFlipArrays[bucket], gSampler2xWrapClamp,  uvw, dx, dy); }
+        return SampleGradFlipArray(gFlipArrays[bucket], gSampler2xWrapWrap, uvw, dx, dy);
+    }
+    if (clampMode == TEX_CLAMP_S_CLAMP_T) { return SampleGradFlipArray(gFlipArrays[bucket], gSamplerAnisoClampClamp, uvw, dx, dy); }
+    if (clampMode == TEX_CLAMP_S_WRAP_T)  { return SampleGradFlipArray(gFlipArrays[bucket], gSamplerAnisoClampWrap,  uvw, dx, dy); }
+    if (clampMode == TEX_WRAP_S_CLAMP_T)  { return SampleGradFlipArray(gFlipArrays[bucket], gSamplerAnisoWrapClamp,  uvw, dx, dy); }
+    return SampleGradFlipArray(gFlipArrays[bucket], gSamplerAnisotropic, uvw, dx, dy);
+}
+
+float4 sampleBaseGrad(uint texIdx, uint clampModeIn, float2 uv, float2 dx, float2 dy, bool lowAF)
+{
+    const uint clampMode = clampModeIn & TEX_ADDR_MASK;   // strip the flag bits (see TEX_ADDR_MASK)
+    if (isFlipSlot(texIdx)) { return sampleFlipGrad(texIdx, clampMode, uv, dx, dy, lowAF); }
+    if (lowAF)
+    {
+        if (clampMode == TEX_CLAMP_S_CLAMP_T) { return SampleGradTex2D(gTextures[texIdx], gSampler2xClampClamp, uv, dx, dy); }
+        if (clampMode == TEX_CLAMP_S_WRAP_T)  { return SampleGradTex2D(gTextures[texIdx], gSampler2xClampWrap,  uv, dx, dy); }
+        if (clampMode == TEX_WRAP_S_CLAMP_T)  { return SampleGradTex2D(gTextures[texIdx], gSampler2xWrapClamp,  uv, dx, dy); }
+        return SampleGradTex2D(gTextures[texIdx], gSampler2xWrapWrap, uv, dx, dy);
+    }
+    if (clampMode == TEX_CLAMP_S_CLAMP_T) { return SampleGradTex2D(gTextures[texIdx], gSamplerAnisoClampClamp, uv, dx, dy); }
+    if (clampMode == TEX_CLAMP_S_WRAP_T)  { return SampleGradTex2D(gTextures[texIdx], gSamplerAnisoClampWrap,  uv, dx, dy); }
+    if (clampMode == TEX_WRAP_S_CLAMP_T)  { return SampleGradTex2D(gTextures[texIdx], gSamplerAnisoWrapClamp,  uv, dx, dy); }
+    return SampleGradTex2D(gTextures[texIdx], gSamplerAnisotropic, uv, dx, dy);   // WRAP_S_WRAP_T
+}
+
 // alphaParams.y = 1 when the host's "alpha draws at 2x AF" toggle is on. A draw qualifies if it is
 // alpha-TESTED (alphaRef > 0 — cutout foliage/grates in the opaque + prepass + shadow paths) or it
 // is in the alpha-BLENDED pass (which passes alphaBlended = true unconditionally).

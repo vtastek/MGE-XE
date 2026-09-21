@@ -974,7 +974,7 @@ SamplerState gSampler2xWrapClamp : register( s17 , space100 ) ;
 #line 11 "FSL/shaders.list"
 #line 221 "FSL/shaders.list"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terrain.vert.fsl"
-#line 19 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terrain.vert.fsl"
+#line 38 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terrain.vert.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
 #line 20 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
@@ -1204,7 +1204,32 @@ STRUCT(ShadowMaskParams)
     float4 pbrStatics;
 #line 849 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
     float4 terrainTex;
-#line 850
+#line 873 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
+    float4 parallax;
+#line 887 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
+    float4 parallax2;
+
+
+
+
+
+
+
+
+
+
+    float4 parallax3;
+#line 915 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
+    float4 terrainDisp;
+#line 928 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
+    float4 terrainDisp2;
+
+
+
+
+
+    float4 terrainDisp3;
+#line 935
 };
 #line 21 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
 #line 27 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
@@ -1600,7 +1625,7 @@ STRUCT(LightData)
         CBUFFER(BatchData) gBatch :  register(b0,space2);
 #line 711 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
         CBUFFER(SkyViewData) gSkyView :  register(b1,space2);
-#line 20 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terrain.vert.fsl"
+#line 39 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terrain.vert.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/fog.h.fsl"
 #line 78 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/fog.h.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/waterplane.h.fsl"
@@ -2325,10 +2350,107 @@ float mwFogAirShareAt(float fog, float3 worldPosRel)
 {
     return mwFogAirShare(fog, waterFogSample(worldPosRel).y, length(worldPosRel));
 }
-#line 21 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terrain.vert.fsl"
+#line 40 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terrain.vert.fsl"
+#line 42 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terrain.vert.fsl"
+#line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terraindisp.h.fsl"
+#line 32 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terraindisp.h.fsl"
+uint terrainCellAt(int lx, int ly, uint spanX, uint spanY)
+{
+    if (lx < 0 || ly < 0 || lx >= (int)spanX || ly >= (int)spanY) { return 0u; }
+    return gTerrainCellGrid[(uint)ly * spanX + (uint)lx];
+}
 
 
 
+
+
+
+
+int squareXVS(int x) { return (int)floor((float(x) - 2.0f) * 0.25f); }
+int squareYVS(int y) { return (int)ceil ((float(y) - 2.0f) * 0.25f); }
+uint landSquareIndexVS(int lx, int ly, uint spanX, uint spanY, int tx, int ty)
+{
+    if (tx < 0) { --lx; tx += 16; } else if (tx > 15) { ++lx; tx -= 16; }
+    if (ty < 0) { --ly; ty += 16; } else if (ty > 15) { ++ly; ty -= 16; }
+    uint cell = terrainCellAt(lx, ly, spanX, spanY);
+    if (cell == 0u) { return  0xFFFFFFFFu ; }
+    return (cell - 1u) *  256u  + (uint)(ty * 16 + tx);
+}
+#line 74 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terraindisp.h.fsl"
+float terrainDispZ(uint slot, float2 uv, float lvl, float scale, float gamma, float pivot)
+{
+    const uint bucket = slot >> 16u;
+    const uint layer = slot & 0xFFFFu;
+    const float h =  gTerrainParamArrays[bucket].SampleLevel(gSamplerBilinearWrap, float3(uv, float(layer)), max(lvl, 0.0f)) .
+#line 79 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terraindisp.h.fsl"
+a;
+    const float depth01 = saturate(1.0f - h);
+    const float mag = min(1.0f, pow(depth01, 1.0f / max(gamma, 1e-4f)) / max(pivot, 1e-4f));
+    return -mag * scale;
+}
+
+
+
+
+float terrainDispLevel(float rung)
+{
+    return gShadowParams.terrainDisp2.z + rung -  4.0f ;
+}
+#line 103 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terraindisp.h.fsl"
+float terrainCarveAt(int lx, int ly, uint spanX, uint spanY, float gxf, float gyf,
+                     float lvl, float sc, float gm, float pv)
+{
+
+
+
+    const float2 duv = float2(gxf, gyf) * 0.25f;
+
+    const int x0 = (int)floor(gxf), y0 = (int)floor(gyf);
+    const int x1 = min(x0 + 1,  64 ), y1 = min(y0 + 1,  64 );
+    const float fx = gxf - float(x0), fy = gyf - float(y0);
+    const uint i00 = landSquareIndexVS(lx, ly, spanX, spanY, squareXVS(x0), squareYVS(y0));
+    const uint i10 = landSquareIndexVS(lx, ly, spanX, spanY, squareXVS(x1), squareYVS(y0));
+    const uint i01 = landSquareIndexVS(lx, ly, spanX, spanY, squareXVS(x0), squareYVS(y1));
+    const uint i11 = landSquareIndexVS(lx, ly, spanX, spanY, squareXVS(x1), squareYVS(y1));
+    const uint p00 = (i00 ==  0xFFFFFFFFu ) ? 0u : gTerrainParamTex[i00];
+    const uint p10 = (i10 ==  0xFFFFFFFFu ) ? 0u : gTerrainParamTex[i10];
+    const uint p01 = (i01 ==  0xFFFFFFFFu ) ? 0u : gTerrainParamTex[i01];
+    const uint p11 = (i11 ==  0xFFFFFFFFu ) ? 0u : gTerrainParamTex[i11];
+
+    float dz = 0.0f;
+    if (p00 == p10 && p00 == p01 && p00 == p11) {
+
+
+        if (p00 != 0u) { dz = terrainDispZ(p00, duv, lvl, sc, gm, pv); }
+    } else {
+        const float w00 = (1.0f - fx) * (1.0f - fy), w10 = fx * (1.0f - fy);
+        const float w01 = (1.0f - fx) * fy, w11 = fx * fy;
+        if (p00 != 0u) { dz += w00 * terrainDispZ(p00, duv, lvl, sc, gm, pv); }
+        if (p10 != 0u) { dz += w10 * terrainDispZ(p10, duv, lvl, sc, gm, pv); }
+        if (p01 != 0u) { dz += w01 * terrainDispZ(p01, duv, lvl, sc, gm, pv); }
+        if (p11 != 0u) { dz += w11 * terrainDispZ(p11, duv, lvl, sc, gm, pv); }
+    }
+    return dz;
+}
+#line 150 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terraindisp.h.fsl"
+float terrainCarveWorld(float2 worldXY, float lvl, float sc, float gm, float pv)
+{
+    const uint spanX = (uint)gShadowParams.terrainDisp3.z;
+    const uint spanY = (uint)gShadowParams.terrainDisp3.w;
+    if (spanX == 0u || spanY == 0u) { return 0.0f; }
+
+    const float invCell = 1.0f / ( 128.0f  * float( 64 ));
+    const float cx = floor(worldXY.x * invCell);
+    const float cy = floor(worldXY.y * invCell);
+    const int lx = (int)cx - (int)gShadowParams.terrainDisp3.x;
+    const int ly = (int)cy - (int)gShadowParams.terrainDisp3.y;
+
+    const float gxf = (worldXY.x - cx * ( 128.0f  * float( 64 ))) /  128.0f ;
+    const float gyf = (worldXY.y - cy * ( 128.0f  * float( 64 ))) /  128.0f ;
+    if (terrainCellAt(lx, ly, spanX, spanY) == 0u) { return 0.0f; }
+    return terrainCarveAt(lx, ly, spanX, spanY, gxf, gyf, lvl, sc, gm, pv);
+}
+#line 43 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terrain.vert.fsl"
 
 
 
@@ -2339,8 +2461,10 @@ STRUCT(VSInput)
     DATA(float2, Grid, POSITION);
     DATA(float2, Origin, TEXCOORD1);
     DATA(uint4, Inst0, TEXCOORD2);
+
+
     DATA(uint2, Inst1, TEXCOORD3);
-#line 35
+#line 56
 };
 
 STRUCT(VSOutput)
@@ -2356,22 +2480,16 @@ STRUCT(VSOutput)
     DATA(CENTROID(float), Fog, TEXCOORD2);
 
 
+
     DATA(float2, Lattice, TEXCOORD3);
     DATA(FLAT(uint4), Cell, TEXCOORD4);
 
 
     DATA(float, Clip, SV_ClipDistance0);
-#line 55
+#line 77
 };
 
 
-
-
-uint terrainCellAt(int lx, int ly, uint spanX, uint spanY)
-{
-    if (lx < 0 || ly < 0 || lx >= (int)spanX || ly >= (int)spanY) { return 0u; }
-    return gTerrainCellGrid[(uint)ly * spanX + (uint)lx];
-}
 
 
 float loadHeight(uint slot, int x, int y)
@@ -2382,6 +2500,29 @@ float loadHeight(uint slot, int x, int y)
     int h = (int)h16;
     if (h > 32767) { h -= 65536; }
     return (float)h *  8.0f ;
+}
+#line 110 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terrain.vert.fsl"
+float loadHeightTri(uint slot, float fx, float fy)
+{
+    const int x0 = (int)floor(fx), y0 = (int)floor(fy);
+    const int x1 = min(x0 + 1,  64 );
+    const int y1 = min(y0 + 1,  64 );
+    const float u = fx - float(x0), v = fy - float(y0);
+    const float ha = loadHeight(slot, x0, y0);
+    const float hb = loadHeight(slot, x1, y0);
+    const float hc = loadHeight(slot, x0, y1);
+    const float hd = loadHeight(slot, x1, y1);
+    return (u + v <= 1.0f) ? (ha + (hb - ha) * u + (hc - ha) * v)
+                           : (hd + (hc - hd) * (1.0f - u) + (hb - hd) * (1.0f - v));
+}
+
+
+
+
+
+float loadHeightAt(uint slot, float fx, float fy, bool fine)
+{
+    return fine ? loadHeightTri(slot, fx, fy) : loadHeight(slot, (int)fx, (int)fy);
 }
 
 
@@ -2406,74 +2547,139 @@ float loadHeightWide(uint slot, int lx, int ly, uint spanX, uint spanY, int x, i
     return loadHeight(slot, x, y);
 }
 
+
+
+
+
+
+float3 terrainCornerNormal(uint slot, int lx, int ly, uint spanX, uint spanY, int x, int y)
+{
+    const float hL = loadHeightWide(slot, lx, ly, spanX, spanY, x - 1, y);
+    const float hR = loadHeightWide(slot, lx, ly, spanX, spanY, x + 1, y);
+    const float hD = loadHeightWide(slot, lx, ly, spanX, spanY, x, y - 1);
+    const float hU = loadHeightWide(slot, lx, ly, spanX, spanY, x, y + 1);
+    const float d = 2.0f *  128.0f ;
+    return normalize(float3(-(hR - hL) / d, -(hU - hD) / d, 1.0f));
+}
+#line 193 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terrain.vert.fsl"
 [RootSignature( "RootFlags(ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT)," "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "3" ", offset = 0)," "CBV(b0, numDescriptors = unbounded, space = " "3" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "3" ", offset = 0))," "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "2" ", offset = 0)," "CBV(b0, numDescriptors = unbounded, space = " "2" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "2" ", offset = 0))," "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "1" ", offset = 0)," "CBV(b0, numDescriptors = unbounded, space = " "1" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "1" ", offset = 0))," "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "0" ", offset = 0)," "CBV(b0, numDescriptors = unbounded, space = " "0" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "0" ", offset = 0))," "DescriptorTable(" "SAMPLER(s0, numDescriptors = unbounded, space = " "0" ", offset = 0))," "StaticSampler(s0, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s1, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s2, space = 100," "filter = FILTER_MIN_MAG_LINEAR_MIP_POINT," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s3, space = 100," "filter = FILTER_MIN_MAG_LINEAR_MIP_POINT," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s4, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s5, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s6, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT," "addressU = TEXTURE_ADDRESS_MIRROR, addressV = TEXTURE_ADDRESS_MIRROR, addressW = TEXTURE_ADDRESS_MIRROR)," "StaticSampler(s7, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT, borderColor = STATIC_BORDER_COLOR_TRANSPARENT_BLACK," "addressU = TEXTURE_ADDRESS_BORDER, addressV = TEXTURE_ADDRESS_BORDER, addressW = TEXTURE_ADDRESS_BORDER)," "StaticSampler(s8, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR," "addressU = TEXTURE_ADDRESS_MIRROR, addressV = TEXTURE_ADDRESS_MIRROR, addressW = TEXTURE_ADDRESS_MIRROR)," "StaticSampler(s9, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR, borderColor = STATIC_BORDER_COLOR_TRANSPARENT_BLACK," "addressU = TEXTURE_ADDRESS_BORDER, addressV = TEXTURE_ADDRESS_BORDER, addressW = TEXTURE_ADDRESS_BORDER)," "StaticSampler(s10, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 8," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s11, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 8," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s12, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 8," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s13, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 8," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s14, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 2," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s15, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 2," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s16, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 2," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s17, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 2," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_WRAP)" )]
 VSOutput VS_MAIN( VSInput In )
 {
     //INIT_MAIN;
     VSOutput Out;
 
-    const int gx = (int)In.Grid.x;
-    const int gy = (int)In.Grid.y;
     const uint slot = In.Inst0.x;
-    const uint stride = In.Inst0.y;
-    const uint nbrS = In.Inst0.z;
+    const uint rung = In.Inst0.y;
+    const uint nbrR = In.Inst0.z;
     const int lx = (int)(In.Inst0.w & 0xFFFFu);
     const int ly = (int)(In.Inst0.w >> 16u);
     const uint spanX = In.Inst1.x & 0xFFFFu;
     const uint spanY = In.Inst1.x >> 16u;
 
 
-    uint snap = stride;
+
+
+
+    const uint flags = In.Inst1.y;
+    const bool isPatch = (flags & 0x10000u) != 0u;
+    const float2 base = float2(float(flags & 0xFFu), float((flags >> 8u) & 0xFFu));
+    const float span = isPatch ? float( 4 ) : float( 64 );
+    const float gxf = base.x + In.Grid.x;
+    const float gyf = base.y + In.Grid.y;
+
+
+
+
+
+
+    const bool fine = (float(rung) <  4.0f );
+#line 236 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terrain.vert.fsl"
+    uint snapR = rung;
     uint axis = 0u;
-    if (gy == 0) { uint s = (nbrS >> 16u) & 0xFFu; if (s > snap) { snap = s; axis = 1u; } }
-    else if (gy ==  64 ) { uint s = (nbrS >> 24u) & 0xFFu; if (s > snap) { snap = s; axis = 1u; } }
-    if (gx == 0) { uint s = (nbrS ) & 0xFFu; if (s > snap) { snap = s; axis = 2u; } }
-    else if (gx ==  64 ) { uint s = (nbrS >> 8u) & 0xFFu; if (s > snap) { snap = s; axis = 2u; } }
+    if (In.Grid.y == 0.0f) { uint nr = (nbrR >> 16u) & 0xFFu; if (nr > snapR) { snapR = nr; axis = 1u; } }
+    else if (In.Grid.y == span) { uint nr = (nbrR >> 24u) & 0xFFu; if (nr > snapR) { snapR = nr; axis = 1u; } }
+    if (In.Grid.x == 0.0f) { uint nr = (nbrR ) & 0xFFu; if (nr > snapR) { snapR = nr; axis = 2u; } }
+    else if (In.Grid.x == span) { uint nr = (nbrR >> 8u) & 0xFFu; if (nr > snapR) { snapR = nr; axis = 2u; } }
 
     float h;
-    if (axis == 1u) {
-        int x0 = (gx / (int)snap) * (int)snap;
-        int x1 = min(x0 + (int)snap,  64 );
-        float t = float(gx - x0) / float(snap);
-        h = lerp(loadHeight(slot, x0, gy), loadHeight(slot, x1, gy), t);
-    } else if (axis == 2u) {
-        int y0 = (gy / (int)snap) * (int)snap;
-        int y1 = min(y0 + (int)snap,  64 );
-        float t = float(gy - y0) / float(snap);
-        h = lerp(loadHeight(slot, gx, y0), loadHeight(slot, gx, y1), t);
+    if (axis != 0u) {
+#line 257 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terrain.vert.fsl"
+        const float snap = exp2(float(snapR) -  4.0f );
+        const float g = (axis == 1u) ? gxf : gyf;
+        const float a0 = floor(g / snap) * snap;
+        const float a1 = min(a0 + snap, float( 64 ));
+        const float t = (g - a0) / snap;
+        h = (axis == 1u) ? lerp(loadHeightAt(slot, a0, gyf, fine), loadHeightAt(slot, a1, gyf, fine), t)
+                         : lerp(loadHeightAt(slot, gxf, a0, fine), loadHeightAt(slot, gxf, a1, fine), t);
     } else {
-        h = loadHeight(slot, gx, gy);
+        h = loadHeightAt(slot, gxf, gyf, fine);
     }
 
 
 
 
     float3 worldPos;
-    worldPos.x = In.Origin.x + float(gx) *  128.0f ;
-    worldPos.y = In.Origin.y + float(gy) *  128.0f ;
+    worldPos.x = In.Origin.x + gxf *  128.0f ;
+    worldPos.y = In.Origin.y + gyf *  128.0f ;
     worldPos.z = h - gFrameData.lodEye.z;
 
 
 
 
 
+    float dist = length(worldPos - gFrameData.eyePos.xyz);
 
 
+
+    if (gShadowParams.terrainDisp.x != 0.0f)
     {
-        const float hL = loadHeightWide(slot, lx, ly, spanX, spanY, gx - 1, gy);
-        const float hR = loadHeightWide(slot, lx, ly, spanX, spanY, gx + 1, gy);
-        const float hD = loadHeightWide(slot, lx, ly, spanX, spanY, gx, gy - 1);
-        const float hU = loadHeightWide(slot, lx, ly, spanX, spanY, gx, gy + 1);
-        const float d = 2.0f *  128.0f ;
-        Out.Normal = normalize(float3(-(hR - hL) / d, -(hU - hD) / d, 1.0f));
+#line 299 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terrain.vert.fsl"
+        if (axis == 0u)
+        {
+
+
+
+            const float r0 = gShadowParams.terrainDisp2.x;
+            const float r1 = max(gShadowParams.terrainDisp2.y, r0 + 1.0f);
+            const float fade = 1.0f - smoothstep(r0, r1, dist);
+            if (fade > 0.0f)
+            {
+
+
+
+
+                worldPos.z += fade * terrainCarveAt(lx, ly, spanX, spanY, gxf, gyf,
+                                                    terrainDispLevel(float(rung)),
+                                                    gShadowParams.terrainDisp.y,
+                                                    gShadowParams.terrainDisp.z,
+                                                    gShadowParams.terrainDisp.w);
+            }
+        }
+    }
+#line 337 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/terrain.vert.fsl"
+    if (!fine) {
+        Out.Normal = terrainCornerNormal(slot, lx, ly, spanX, spanY, (int)gxf, (int)gyf);
+    } else {
+        const int x0 = (int)floor(gxf), y0 = (int)floor(gyf);
+        const int x1 = min(x0 + 1,  64 ), y1 = min(y0 + 1,  64 );
+        const float u = gxf - float(x0), v = gyf - float(y0);
+        const float3 na = terrainCornerNormal(slot, lx, ly, spanX, spanY, x0, y0);
+        const float3 nb = terrainCornerNormal(slot, lx, ly, spanX, spanY, x1, y0);
+        const float3 nc = terrainCornerNormal(slot, lx, ly, spanX, spanY, x0, y1);
+        const float3 nd = terrainCornerNormal(slot, lx, ly, spanX, spanY, x1, y1);
+        Out.Normal = (u + v <= 1.0f) ? (na + (nb - na) * u + (nc - na) * v)
+                                     : (nd + (nc - nd) * (1.0f - u) + (nb - nd) * (1.0f - v));
     }
 
     Out.Position = mul(gFrameData.viewProj, float4(worldPos, 1.0f));
     Out.WorldPos = worldPos;
-    Out.Lattice = float2(float(gx), float(gy));
+
+
+
+    Out.Lattice = float2(gxf, gyf);
     Out.Cell = uint4(slot, (uint)lx, (uint)ly, In.Inst1.x);
 
-    float dist = length(worldPos - gFrameData.eyePos.xyz);
+
     Out.Fog = mwFogFactor(dist);
 
     Out.Clip = dot(gFrameData.gReflWaterClip.xyz, worldPos) + gFrameData.gReflWaterClip.w;

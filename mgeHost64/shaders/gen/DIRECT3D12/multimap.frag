@@ -1204,7 +1204,32 @@ STRUCT(ShadowMaskParams)
     float4 pbrStatics;
 #line 849 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
     float4 terrainTex;
-#line 850
+#line 873 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
+    float4 parallax;
+#line 887 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
+    float4 parallax2;
+
+
+
+
+
+
+
+
+
+
+    float4 parallax3;
+#line 915 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
+    float4 terrainDisp;
+#line 928 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
+    float4 terrainDisp2;
+
+
+
+
+
+    float4 terrainDisp3;
+#line 935
 };
 #line 21 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
 #line 27 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
@@ -1656,6 +1681,41 @@ float4 sampleBase(uint texIdx, uint clampModeIn, float2 uv, bool lowAF)
     if (clampMode ==  1u ) { return SampleTex2D(gTextures[texIdx], gSamplerAnisoClampWrap, uv); }
     if (clampMode ==  2u ) { return SampleTex2D(gTextures[texIdx], gSamplerAnisoWrapClamp, uv); }
     return SampleTex2D(gTextures[texIdx], gSamplerAnisotropic, uv);
+}
+#line 115 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/texsample.h.fsl"
+float4 sampleFlipGrad(uint texIdx, uint clampModeIn, float2 uv, float2 dx, float2 dy, bool lowAF)
+{
+    const uint clampMode = clampModeIn &  3u ;
+    const uint bucket = (texIdx >> 11u) & ( 16  - 1u);
+    const float3 uvw = float3(uv, (float)(texIdx &  0x7FFu ));
+    if (lowAF)
+    {
+        if (clampMode ==  0u ) { return  gFlipArrays[bucket].SampleGrad(gSampler2xClampClamp, uvw, dx, dy) ; }
+        if (clampMode ==  1u ) { return  gFlipArrays[bucket].SampleGrad(gSampler2xClampWrap, uvw, dx, dy) ; }
+        if (clampMode ==  2u ) { return  gFlipArrays[bucket].SampleGrad(gSampler2xWrapClamp, uvw, dx, dy) ; }
+        return  gFlipArrays[bucket].SampleGrad(gSampler2xWrapWrap, uvw, dx, dy) ;
+    }
+    if (clampMode ==  0u ) { return  gFlipArrays[bucket].SampleGrad(gSamplerAnisoClampClamp, uvw, dx, dy) ; }
+    if (clampMode ==  1u ) { return  gFlipArrays[bucket].SampleGrad(gSamplerAnisoClampWrap, uvw, dx, dy) ; }
+    if (clampMode ==  2u ) { return  gFlipArrays[bucket].SampleGrad(gSamplerAnisoWrapClamp, uvw, dx, dy) ; }
+    return  gFlipArrays[bucket].SampleGrad(gSamplerAnisotropic, uvw, dx, dy) ;
+}
+
+float4 sampleBaseGrad(uint texIdx, uint clampModeIn, float2 uv, float2 dx, float2 dy, bool lowAF)
+{
+    const uint clampMode = clampModeIn &  3u ;
+    if (isFlipSlot(texIdx)) { return sampleFlipGrad(texIdx, clampMode, uv, dx, dy, lowAF); }
+    if (lowAF)
+    {
+        if (clampMode ==  0u ) { return SampleGradTex2D(gTextures[texIdx], gSampler2xClampClamp, uv, dx, dy); }
+        if (clampMode ==  1u ) { return SampleGradTex2D(gTextures[texIdx], gSampler2xClampWrap, uv, dx, dy); }
+        if (clampMode ==  2u ) { return SampleGradTex2D(gTextures[texIdx], gSampler2xWrapClamp, uv, dx, dy); }
+        return SampleGradTex2D(gTextures[texIdx], gSampler2xWrapWrap, uv, dx, dy);
+    }
+    if (clampMode ==  0u ) { return SampleGradTex2D(gTextures[texIdx], gSamplerAnisoClampClamp, uv, dx, dy); }
+    if (clampMode ==  1u ) { return SampleGradTex2D(gTextures[texIdx], gSamplerAnisoClampWrap, uv, dx, dy); }
+    if (clampMode ==  2u ) { return SampleGradTex2D(gTextures[texIdx], gSamplerAnisoWrapClamp, uv, dx, dy); }
+    return SampleGradTex2D(gTextures[texIdx], gSamplerAnisotropic, uv, dx, dy);
 }
 
 

@@ -31,6 +31,7 @@
 #include "opaque.srt.h"
 #include "texsample.h.fsl" // TEX_ADDR_MASK / the static samplers — pbrmaterial.h.fsl's prerequisite
 #include "pbrmaterial.h.fsl" // pbrPerturbSurfGrad / pbrSpecTerms / pbrEnvBRDF / pbrRoughness ...
+#include "parallax.h.fsl"  // parallaxOffsetUVLand / parallaxHeightBlend4 (tasks/forge-parallax.md)
 #include "msmrecv.h.fsl"   // sunShadowVisibility() — MSM sun-shadow receiver
 #include "shadowreceive.h.fsl" // shadowMaskPixel() — the mask texel that is actually OURS under MSAA
 #include "skyamb.h.fsl"    // skyAmbFactor() — SH-L1 sky ambient (SH1) + sky AO (SH2)
@@ -295,10 +296,21 @@ float4 PS_MAIN( VSOutput In )
     // undefined per spec, and confirmed to survive compilation (the DXIL keeps `br i1` around five
     // `dx.op.sample` calls rather than flattening them). Hoisting the gradient is the fix and it is
     // also the hook `terrainTexBias` needs. `ddx(uv)` is `ddx(lat)*0.25` and `lat` is exactly linear
-    // in world XY (terrain.vert: `Out.Lattice = float2(gx,gy)`, `worldPos.xy = Origin + gx*SPACING`),
-    // so this gradient is as clean a source as the terrain has.
+    // in world XY (terrain.vert: `Out.Lattice = In.Grid`, `worldPos.xy = Origin + Grid*SPACING`, and
+    // 4b-lite's fine rungs only make Grid fractional — they do not bend that relation), so this
+    // gradient is as clean a source as the terrain has.
     const float2 duvdx = ddx(uv);
     const float2 duvdy = ddy(uv);
+    // ...and the WORLD-position derivatives, HOISTED HERE from the PBR block further down. They
+    // moved because parallax needs a tangent frame BEFORE the albedo blend — the whole point of the
+    // offset is that every tap after it reads a displaced uv — and a frame needs dP/dx. Same
+    // expressions, same uniform control flow, so the value is unchanged; only the line moved.
+    const float3 pbrDPdx  = ddx(In.WorldPos);
+    const float3 pbrDPdy  = ddy(In.WorldPos);
+    // The GEOMETRIC normal, hoisted for the same reason (the tangent frame's third axis). It used
+    // to be declared just above `sunVis`; it is a pure function of an interpolator, so moving it
+    // earlier changes nothing.
+    float3 normal = normalize(In.Normal);
 
     // ─── MODE 22's MEASUREMENT ────────────────────────────────────────────────────────────────────
     // The LOD the sampler actually picks for this pixel, read off the SAME bucket the albedo tap
@@ -357,14 +369,135 @@ float4 PS_MAIN( VSOutput In )
     const float2 gdx     = duvdx * gradK;
     const float2 gdy     = duvdy * gradK;
 
+    // ─── PARALLAX AND HEIGHT BLENDING ON THE GROUND (tasks/forge-parallax.md, D1/D3/D4/D5) ───────
+    // The four corners' `_paramh` slots, HOISTED out of the PBR block below. They have to be known
+    // before the albedo blend, because everything from here down reads a DISPLACED uv and the layer
+    // the offset is computed from is one of these four. `pbrTerrainOn` is a cbuffer scalar, so with
+    // terrain PBR off these four loads are not issued and nothing in this section costs anything.
+    const bool pbrTerrainOn = (gShadowParams.pbrTerrain.x != 0.0f);
+    uint ps00 = 0u, ps10 = 0u, ps01 = 0u, ps11 = 0u;
+    if (pbrTerrainOn) {
+        ps00 = landParamSlot(i00); ps10 = landParamSlot(i10);
+        ps01 = landParamSlot(i01); ps11 = landParamSlot(i11);
+    }
+    // `uvS` is the SHADING uv. Initialised to `uv` and written only inside the branch, so with the
+    // arm off every tap below takes the identical value and the ground is unchanged bit for bit —
+    // the same property the rest of this file is arranged around.
+    float2 uvS      = uv;
+    float  paraSh   = 1.0f;      // Drobot soft parallax shadow: 1 = nothing occludes this texel
+    bool   paraLive = false;     // the OFFSET is live (not merely armed) — see `gradArmEff`
+    bool   paraShOn = false;
+    if (pbrTerrainOn)
+    {
+        const bool paraArm   = (gShadowParams.parallax.y != 0.0f);
+        const uint paraSteps = (uint)gShadowParams.parallax2.x;
+        paraLive = paraArm && (paraSteps > 0u);
+        paraShOn = paraArm && (gShadowParams.parallax2.y != 0.0f);
+        // The SIGN-CORRECT cotangent frame, shared with the mesh path (pbrTangentFrame). On
+        // terrain it is very nearly axis-aligned by construction — uv = lattice*0.25 and the
+        // lattice is linear in world XY — but it is not assumed to be: the same call serves a
+        // hillside at any slope, and it is the one place the Jacobian sign is applied.
+        // Declared out here because the OFFSET and the SHADOW both need it and the height blend
+        // runs between them (see below).
+        float3 T = float3(1.0f, 0.0f, 0.0f), B = float3(0.0f, 1.0f, 0.0f);
+        if (paraArm)
+        {
+            pbrTangentFrame(normal, pbrDPdx, pbrDPdy, duvdx, duvdy, T, B);
+            if (paraLive)
+            {
+                // D3 — THE LOOP RUNS AGAINST ONE LAYER, the highest-weight corner that ships a
+                // `_paramh`. Iterating against the blended height would multiply the tap count by
+                // four for a sub-texel difference: at parallaxScale 0.008 the offset is ~1/125 of a
+                // texture square, far too small to make the four fixed corner weights mean anything
+                // different. It is also the user's own prior decision on the DX9 side (scene-walk,
+                // XE FixedFuncEmu_PS.hlsl:284).
+                //
+                // The weight compare starts BELOW zero so a covered corner is always picked even
+                // where its bilinear weight is exactly 0 (fx or fy at a lattice line).
+                uint  pslot = 0u;
+                float pwin  = -1.0f;
+                if (ps00 != 0u && w00 > pwin) { pslot = ps00; pwin = w00; }
+                if (ps10 != 0u && w10 > pwin) { pslot = ps10; pwin = w10; }
+                if (ps01 != 0u && w01 > pwin) { pslot = ps01; pwin = w01; }
+                if (ps11 != 0u && w11 > pwin) { pslot = ps11; pwin = w11; }
+                // Ground whose land textures ship no companion map keeps `uvS == uv` exactly, and
+                // pays no taps for it. The test is per-PIXEL (neighbouring squares genuinely differ
+                // in coverage), which is legal here because everything inside takes EXPLICIT
+                // gradients — nothing in the branch asks the quad for a derivative.
+                if (pslot != 0u)
+                {
+                    const float3 vDir = normalize(gFrameData.eyePos.xyz - In.WorldPos);
+                    const float3 Vts  = parallaxViewTS(vDir, T, B, normal);
+                    uvS = parallaxOffsetUVLand(pslot, uv, Vts, duvdx, duvdy,
+                                               gShadowParams.parallax.z, gShadowParams.parallax.w,
+                                               paraSteps);
+                }
+            }
+        }
+        // D4 — THE ADDITIVE HEIGHT BLEND, from 2 layers to 4 (parallax.h.fsl). Sand settles into
+        // the cracks in stone instead of crossfading over them. The new weights REPLACE w00..w11 at
+        // the one site they are defined, so the albedo, the `_paramh` material, the cdblur gradient
+        // and the height AO all track the same surface — which is the only way the relief and the
+        // colour can agree about where a layer ends.
+        //
+        // ⚠ IT RUNS BETWEEN THE OFFSET AND THE SHADOW, and that ORDER is the DX9 shader's, not an
+        // accident of layout: the parallax has to land first because these heights are read at the
+        // SHADING uv, and the shadow has to come last because the surface it traces is the one
+        // these weights define. Tracing before the reweighting would shadow a surface the frame
+        // does not draw — which is exactly the misregistration the DX9 call site's base-uv trace
+        // has, and which parallaxSoftShadowTex documents.
+        //
+        // Skipped under `oneSquare`: all four corners are the same texture there, so every consumer
+        // takes its one-tap fast path and the weights are not read at all. That is 40.2% of the
+        // world's quad joins (measured — see `distinctIds`), so it is not an optimisation to tidy
+        // away. Four taps on the rest.
+        if ((gShadowParams.parallax3.x != 0.0f) && !oneSquare)
+        {
+            const float4 hl = parallaxLandHeights(uint4(ps00, ps10, ps01, ps11), uvS, duvdx, duvdy);
+            const float4 wN = parallaxHeightBlend4(hl, float4(w00, w10, w01, w11),
+                                                   gShadowParams.parallax3.y,
+                                                   gShadowParams.parallax3.z);
+            w00 = wN.x; w10 = wN.y; w01 = wN.z; w11 = wN.w;
+        }
+        if (paraShOn)
+        {
+            // D5 — traced against the height-BLENDED surface, which is ParallaxSoftShadowBlend's
+            // whole reason: on the ground the eye sees a blend, so a shadow cast by one layer's
+            // height would not follow the profile being shaded. Renormalised by the weight that
+            // actually carries a map, exactly as the material blend below is — and off the FINAL
+            // weights, height blend included.
+            float mw = 0.0f;
+            if (ps00 != 0u) { mw += w00; }
+            if (ps10 != 0u) { mw += w10; }
+            if (ps01 != 0u) { mw += w01; }
+            if (ps11 != 0u) { mw += w11; }
+            if (mw > 0.0f)
+            {
+                const float3 Lts = parallaxViewTS(-gFrameData.sunDir.xyz, T, B, normal);
+                paraSh = parallaxSoftShadowLand(uint4(ps00, ps10, ps01, ps11),
+                                                float4(w00, w10, w01, w11), 1.0f / mw,
+                                                oneSquare, uvS, Lts.xy, duvdx, duvdy,
+                                                gShadowParams.parallax2.z,
+                                                gShadowParams.parallax2.w);
+            }
+        }
+    }
+    // ⚠ PARALLAX FORCES THE EXPLICIT-GRADIENT ARM, and this is not belt-and-braces. Arm 0 samples
+    // with the quad's own derivative of the uv it is handed; once that uv is a function of a
+    // texture read, that derivative describes the HEIGHT FIELD and not the surface, so the sampler
+    // picks a mip and an anisotropic footprint for the wrong quantity. Arm 0 is a historical A/B
+    // (the pre-fix image — see g_terrainTexGrad); parallax simply is not available inside it.
+    // `paraLive` is cbuffer-driven and so uniform across the draw, like `gradArm` itself.
+    const bool gradArmEff = gradArm || paraLive;
+
     float3 albedo;
     if (oneSquare) {
-        albedo = sampleLand(id00, uv, gdx, gdy, gradArm);   // interior of a square: one tap
+        albedo = sampleLand(id00, uvS, gdx, gdy, gradArmEff);   // interior of a square: one tap
     } else {
-        albedo  = sampleLand(id00, uv, gdx, gdy, gradArm) * w00;
-        albedo += sampleLand(id10, uv, gdx, gdy, gradArm) * w10;
-        albedo += sampleLand(id01, uv, gdx, gdy, gradArm) * w01;
-        albedo += sampleLand(id11, uv, gdx, gdy, gradArm) * w11;
+        albedo  = sampleLand(id00, uvS, gdx, gdy, gradArmEff) * w00;
+        albedo += sampleLand(id10, uvS, gdx, gdy, gradArmEff) * w10;
+        albedo += sampleLand(id01, uvS, gdx, gdy, gradArmEff) * w01;
+        albedo += sampleLand(id11, uvS, gdx, gdy, gradArmEff) * w11;
     }
 
     // VCLR is Morrowind's hand-painted per-vertex TINT over the land texture — it multiplies, it is
@@ -390,8 +523,14 @@ float4 PS_MAIN( VSOutput In )
         albedo *= lerp(lerp(c00, c10, fx), lerp(c01, c11, fx), fy);
     }
 
-    float3 normal = normalize(In.Normal);
+    // (`normal` is declared up with the uv gradients now — the tangent frame the parallax block
+    //  builds needs it before the albedo blend.)
     float  sunVis = sunShadowVisibility(In.WorldPos, normal);
+    // D5 — the height field's own shadow, folded into the SAME visibility the cascades write, so it
+    // reaches the sun's diffuse and its specular lobe from one place. ⚠ The multiply is INSIDE the
+    // branch rather than a `* 1.0` outside it: the house rule this file states for the W32 caustic
+    // gobo, so "the arm off is bit-identical" is a property of the code and not a bet.
+    if (paraShOn) { sunVis *= paraSh; }
 
     // ─── TERRAIN PBR (tasks/forge-terrain-pbr.md; pbrmaterial.h.fsl) ─────────────────────────────
     // Terrain was the last large surface with no relief and no specular, and it is most of the
@@ -412,13 +551,14 @@ float4 PS_MAIN( VSOutput In )
     // ground whose land textures ship no companion map — and every pixel with the knob off — runs
     // the pre-PBR arithmetic unchanged. F12 mode 19 paints which is which.
     //
-    // Screen derivatives HERE, at top level in uniform control flow: every reader of them sits
+    // Screen derivatives are taken at top level in uniform control flow: every reader of them sits
     // inside the branch below, and derivatives taken inside divergent flow are undefined
-    // (opaque.frag.fsl says the same at its own top).
-    const float3 pbrDPdx  = ddx(In.WorldPos);
-    const float3 pbrDPdy  = ddy(In.WorldPos);
-    const float2 pbrDUVdx = ddx(uv);
-    const float2 pbrDUVdy = ddy(uv);
+    // (opaque.frag.fsl says the same at its own top). `pbrDPdx`/`pbrDPdy` moved up to the uv
+    // gradients — parallax needs a tangent frame before the albedo blend — and `pbrDUVdx`/`pbrDUVdy`
+    // were always `ddx(uv)`/`ddy(uv)`, i.e. the same values `duvdx`/`duvdy` already hold, so they
+    // are aliases now rather than a second pair of derivative instructions.
+    const float2 pbrDUVdx = duvdx;
+    const float2 pbrDUVdy = duvdy;
 
     float3 nShade   = normal;                        // the SHADING normal (D5: see above)
     float3 pbrKd    = float3(1.0f, 1.0f, 1.0f);      // metallic workflow: diffuse+ambient kill
@@ -452,12 +592,11 @@ float4 PS_MAIN( VSOutput In )
     const float pbrGradR  = gShadowParams.pbrParams.w;
     // pbrTerrain.x is a cbuffer scalar, so this branch is uniform across the whole draw.
     bool  pbrLive = false;
-    if (gShadowParams.pbrTerrain.x != 0.0f)
+    if (pbrTerrainOn)
     {
-        // The `_paramh` slots of the SAME four squares the albedo blend read (0 = none). One extra
-        // buffer load per corner — the square index was already resolved.
-        const uint ps00 = landParamSlot(i00), ps10 = landParamSlot(i10);
-        const uint ps01 = landParamSlot(i01), ps11 = landParamSlot(i11);
+        // The `_paramh` slots of the SAME four squares the albedo blend read (0 = none) are
+        // resolved UP with the parallax block now — the offset has to know which layer to iterate
+        // against before anything samples — so this branch reads them rather than re-resolving.
         pbrLive = ((ps00 | ps10 | ps01 | ps11) != 0u);
         if (pbrLive)
         {
@@ -484,17 +623,17 @@ float4 PS_MAIN( VSOutput In )
             // `dh` accumulates in the same corner order the cdblur arm always used, so removing the
             // retired baked arm leaves the shipped (mode 4) image bit-identical.
             if (oneSquare) {
-                if (ps00 != 0u) { mat  = sampleLandParam(ps00, uv, gdx, gdy, gradArm); matW = 1.0f; }
-                if (ps00 != 0u) { dh = landGradCdblur(ps00, uv, pbrDUVdx, pbrDUVdy, pbrGradR); }
+                if (ps00 != 0u) { mat  = sampleLandParam(ps00, uvS, gdx, gdy, gradArmEff); matW = 1.0f; }
+                if (ps00 != 0u) { dh = landGradCdblur(ps00, uvS, pbrDUVdx, pbrDUVdy, pbrGradR); }
             } else {
-                if (ps00 != 0u) { mat += sampleLandParam(ps00, uv, gdx, gdy, gradArm) * w00; matW += w00; }
-                if (ps10 != 0u) { mat += sampleLandParam(ps10, uv, gdx, gdy, gradArm) * w10; matW += w10; }
-                if (ps01 != 0u) { mat += sampleLandParam(ps01, uv, gdx, gdy, gradArm) * w01; matW += w01; }
-                if (ps11 != 0u) { mat += sampleLandParam(ps11, uv, gdx, gdy, gradArm) * w11; matW += w11; }
-                if (ps00 != 0u) { dh += landGradCdblur(ps00, uv, pbrDUVdx, pbrDUVdy, pbrGradR) * w00; }
-                if (ps10 != 0u) { dh += landGradCdblur(ps10, uv, pbrDUVdx, pbrDUVdy, pbrGradR) * w10; }
-                if (ps01 != 0u) { dh += landGradCdblur(ps01, uv, pbrDUVdx, pbrDUVdy, pbrGradR) * w01; }
-                if (ps11 != 0u) { dh += landGradCdblur(ps11, uv, pbrDUVdx, pbrDUVdy, pbrGradR) * w11; }
+                if (ps00 != 0u) { mat += sampleLandParam(ps00, uvS, gdx, gdy, gradArmEff) * w00; matW += w00; }
+                if (ps10 != 0u) { mat += sampleLandParam(ps10, uvS, gdx, gdy, gradArmEff) * w10; matW += w10; }
+                if (ps01 != 0u) { mat += sampleLandParam(ps01, uvS, gdx, gdy, gradArmEff) * w01; matW += w01; }
+                if (ps11 != 0u) { mat += sampleLandParam(ps11, uvS, gdx, gdy, gradArmEff) * w11; matW += w11; }
+                if (ps00 != 0u) { dh += landGradCdblur(ps00, uvS, pbrDUVdx, pbrDUVdy, pbrGradR) * w00; }
+                if (ps10 != 0u) { dh += landGradCdblur(ps10, uvS, pbrDUVdx, pbrDUVdy, pbrGradR) * w10; }
+                if (ps01 != 0u) { dh += landGradCdblur(ps01, uvS, pbrDUVdx, pbrDUVdy, pbrGradR) * w01; }
+                if (ps11 != 0u) { dh += landGradCdblur(ps11, uvS, pbrDUVdx, pbrDUVdy, pbrGradR) * w11; }
             }
             // HEIGHT AO, over the same layers and the same weights as the material. Renormalised
             // by matW like the material and not left as a plain sum: this is a visibility, so a
@@ -503,12 +642,12 @@ float4 PS_MAIN( VSOutput In )
             {
                 float vis = 0.0f;
                 if (oneSquare) {
-                    if (ps00 != 0u) { vis = landHeightAO(ps00, uv, pbrDUVdx, pbrDUVdy, pbrHAOLvl, gShadowParams.pbrTerrain.y); }
+                    if (ps00 != 0u) { vis = landHeightAO(ps00, uvS, pbrDUVdx, pbrDUVdy, pbrHAOLvl, gShadowParams.pbrTerrain.y); }
                 } else {
-                    if (ps00 != 0u) { vis += landHeightAO(ps00, uv, pbrDUVdx, pbrDUVdy, pbrHAOLvl, gShadowParams.pbrTerrain.y) * w00; }
-                    if (ps10 != 0u) { vis += landHeightAO(ps10, uv, pbrDUVdx, pbrDUVdy, pbrHAOLvl, gShadowParams.pbrTerrain.y) * w10; }
-                    if (ps01 != 0u) { vis += landHeightAO(ps01, uv, pbrDUVdx, pbrDUVdy, pbrHAOLvl, gShadowParams.pbrTerrain.y) * w01; }
-                    if (ps11 != 0u) { vis += landHeightAO(ps11, uv, pbrDUVdx, pbrDUVdy, pbrHAOLvl, gShadowParams.pbrTerrain.y) * w11; }
+                    if (ps00 != 0u) { vis += landHeightAO(ps00, uvS, pbrDUVdx, pbrDUVdy, pbrHAOLvl, gShadowParams.pbrTerrain.y) * w00; }
+                    if (ps10 != 0u) { vis += landHeightAO(ps10, uvS, pbrDUVdx, pbrDUVdy, pbrHAOLvl, gShadowParams.pbrTerrain.y) * w10; }
+                    if (ps01 != 0u) { vis += landHeightAO(ps01, uvS, pbrDUVdx, pbrDUVdy, pbrHAOLvl, gShadowParams.pbrTerrain.y) * w01; }
+                    if (ps11 != 0u) { vis += landHeightAO(ps11, uvS, pbrDUVdx, pbrDUVdy, pbrHAOLvl, gShadowParams.pbrTerrain.y) * w11; }
                 }
                 // Strength dials toward 1 (no occlusion), and coverage does the same — so partial
                 // coverage crossfades to the legacy image, the way every other terrain PBR term does.
@@ -1021,6 +1160,42 @@ float4 PS_MAIN( VSOutput In )
         // How far anisotropy is pulling the level below the isotropic footprint's own answer.
         if ((isoLod - hwLod) > 1.0f) { cc = lerp(cc, float3(1.0f, 0.1f, 1.0f), 0.35f); }
         RETURN(float4(cc, 1.0f));
+    }
+    if (dbg == 25u) {   // mode 25: the PARALLAX UV DELTA — the view that makes D1 judgeable
+        // Flat mid grey = this pixel did not move (the ground here ships no `_paramh`, or the arm
+        // is off). Red is the u axis, green the v axis, normalised by `parallaxScale` so a
+        // full-amplitude shift saturates. Same legend as opaque.frag's, so one key reads the ground
+        // and the meshes standing on it and the two can be compared where they meet.
+        //
+        // It is also the GPU test for the tangent frame's SIGN, which no offline rig can see
+        // ([[feedback_a_frame_the_rig_cannot_see]]): walk so a slope rolls past the view direction
+        // and the delta must reverse smoothly through grey. One sign held across a whole hillside
+        // that faces away from you is the reversed-frame failure, and it is the failure that looks
+        // like "the parallax is just inverted relief" rather than like a bug.
+        RETURN(float4(parallaxDeltaView(uvS, uv, gShadowParams.parallax.z), 1.0f));
+    }
+    if (dbg == 26u) {   // mode 26: WHICH LAND TEXTURE WON THIS PIXEL — the view D4 needs
+        // The height blend is a REWEIGHTING, and a reweighting is invisible in the shaded frame
+        // whenever the two textures happen to look alike — which is most of the time, because
+        // texturematcher deliberately pairs families (corr 0.88). So mode 20 says how many textures
+        // meet here and this says which one is winning, and the pair is what makes the knob
+        // judgeable at all.
+        //   red / green / blue / amber  = corner 00 / 10 / 01 / 11
+        //   brightness                  = that corner's final weight
+        // With `heightBlend` off this is the plain bilinear argmax — smooth diagonal wedges meeting
+        // at the quad centre. With it on the boundaries must follow the TEXTURE's cracks instead,
+        // which is the whole effect: if the wedges merely get slightly crisper, the contrast knob
+        // is too wide or the ground's `_paramh` has no structure at this scale.
+        // `w00..w11` are the values the blend ACTUALLY used, not a re-derivation at the ladder
+        // ([[feedback_publish_a_lane_where_every_view_copies_it]]).
+        float3 cc = float3(0.90f, 0.20f, 0.18f); float best = w00;
+        if (w10 > best) { cc = float3(0.20f, 0.85f, 0.25f); best = w10; }
+        if (w01 > best) { cc = float3(0.25f, 0.45f, 0.95f); best = w01; }
+        if (w11 > best) { cc = float3(0.95f, 0.70f, 0.12f); best = w11; }
+        // Grey where one square covers the whole quad: there is no blend to show, and painting a
+        // confident colour there would read as a decision the shader never made.
+        if (oneSquare) { cc = float3(0.42f, 0.44f, 0.40f); }
+        RETURN(float4(cc * (0.35f + 0.65f * saturate(best)), 1.0f));
     }
     if (dbg == 20u) {   // mode 20: how many DISTINCT land textures blend at this pixel
         // A seam on the ground has two candidate causes and they need opposite fixes: the blend

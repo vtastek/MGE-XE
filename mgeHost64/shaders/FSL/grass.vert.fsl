@@ -37,6 +37,7 @@
 
 #include "opaque.srt.h"
 #include "fog.h.fsl"        // mwFogFactor() — ONE fog law for every stage
+#include "terraindisp.h.fsl"  // terrainCarveWorld() — the SAME carve terrain.vert applies (P11)
 #include "skyamb.h.fsl"     // skyAmbFactor() — SH-L1 sky ambient (SH1) + sky AO (SH2)
 #include "tonemap.h.fsl"    // (scenecolor.h.fsl's prerequisite; the curve is never called in a VS)
 #include "linearize.h.fsl"  // srgbToLinear() — the scene's transfer function
@@ -527,6 +528,48 @@ VSOutput VS_MAIN( VSInput In )
         float  sinkTo   = sinkFrom + gShadowParams.grassParams3.w;          // = the fade band's end
         float  d        = length(worldPos.xyz) - gShadowParams.grassParams3.y * jitter;
         worldPos.z -= gShadowParams.grassParams3.x * smoothstep(sinkFrom, sinkTo, d);
+    }
+
+    // ── PHASE 4b (P11): FOLLOW THE CARVED GROUND ───────────────────────────────────
+    // grassGroundAt bakes each root on the CPU by bilinear-sampling raw LandCell::height at the
+    // 128-u rate, entirely outside terrain.vert — so a carved surface slides out from under the
+    // blades. At 4a's 128 u that was a few units of float; at 4b's 8 u it is the first thing you see.
+    //
+    // ⚠ THE CARVE IS THE ONE terrain.vert APPLIES, OUT OF THE SAME FUNCTION (terraindisp.h.fsl).
+    // Two implementations of a 4-tap blend over a texture-square lattice is exactly the pair that
+    // drifts, and a blade that disagrees with its own ground by `displacementScale` is the whole
+    // artifact this exists to remove.
+    //
+    // ⚠ ONE SAMPLE, AT THE ROOT, AND A RIGID SHIFT — the same "the root decides, the vertex responds"
+    // split the wind, the water test and the crush field already make. A per-vertex carve would give
+    // the tip a different ground from the root and shear the blade. It is applied LAST, after the
+    // wind, the fold and the sink, precisely because it is a translation of the finished blade: none
+    // of those terms is a function of absolute Z, so the order cannot change what they produce.
+    //
+    // Two things are deliberately NOT changed, on the same reasoning as D4: the CPU root height
+    // stays the base-lattice value (this rides on top of it, so the arm-off frame is untouched), and
+    // the blade's slope/tilt normal stays the 128-u central difference — don't differentiate one
+    // height field twice.
+    if (gShadowParams.terrainDisp.x != 0.0f)
+    {
+        const float r0   = gShadowParams.terrainDisp2.x;
+        const float r1   = max(gShadowParams.terrainDisp2.y, r0 + 1.0f);
+        // The ROOT's distance, not this vertex's — so every vertex of a blade gets the same fade and
+        // the blade cannot stretch across the boundary.
+        const float fade = 1.0f - smoothstep(r0, r1, length(In.W3.xyz - gFrameData.eyePos.xyz));
+        if (fade > 0.0f)
+        {
+            // Absolute world XY of the root. The instance stream is camera-relative, so the eye goes
+            // back in — see terrainCarveWorld for why plain float32 is enough here and grassAbsMod2
+            // exists for the wind phase, where it is not.
+            // terrainDisp2.w is the RUNG the ground is actually drawn at, so the blade reads the
+            // carve at the same band-limit the surface under it did.
+            worldPos.z += fade * terrainCarveWorld(In.W3.xy + gFrameData.lodEye.xy,
+                                                   terrainDispLevel(gShadowParams.terrainDisp2.w),
+                                                   gShadowParams.terrainDisp.y,
+                                                   gShadowParams.terrainDisp.z,
+                                                   gShadowParams.terrainDisp.w);
+        }
     }
 
     Out.WorldPos = worldPos.xyz;

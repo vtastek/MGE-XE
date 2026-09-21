@@ -4858,8 +4858,10 @@ namespace RenderProcess {
             // ...and 21 (terrain height AO) had ALREADY drifted the same way 15/16 did — its view
             // was in terrain.frag with no name and no modulus, so it was unreachable. 22 (terrain
             // filter width) and 23 (terrain texture size) land with both, which is what the
-            // paragraph above asks for. Cycle is %24.
-            g_debugMode = (g_debugMode + 1) % 25;
+            // paragraph above asks for. Cycle is %27 (25 parallax uv delta, 26 terrain height
+            // blend — both land with a name here and an entry in kDebugModeNames, which is the
+            // whole of what the paragraph above asks for).
+            g_debugMode = (g_debugMode + 1) % 27;
             const char* name = (g_debugMode == 1) ? "DEPTH" : (g_debugMode == 2) ? "SCATTER"
                              : (g_debugMode == 3) ? "AO" : (g_debugMode == 4) ? "BENT NORMAL"
                              : (g_debugMode == 5) ? "ALBEDO" : (g_debugMode == 6) ? "LIT"
@@ -4882,7 +4884,9 @@ namespace RenderProcess {
                              : (g_debugMode == 21) ? "TERRAIN HEIGHT AO"
                              : (g_debugMode == 22) ? "TERRAIN FILTER WIDTH"
                              : (g_debugMode == 23) ? "TERRAIN TEXTURE SIZE"
-                             : (g_debugMode == 24) ? "TERRAIN ANISOTROPY" : "NORMAL";
+                             : (g_debugMode == 24) ? "TERRAIN ANISOTROPY"
+                             : (g_debugMode == 25) ? "PARALLAX UV DELTA"
+                             : (g_debugMode == 26) ? "TERRAIN HEIGHT BLEND" : "NORMAL";
             LOG::logline(">> [seam] debug mode %d (%s)", g_debugMode, name);
         }
         // F9 toggles the in-host dev overlay.
