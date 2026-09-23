@@ -22,6 +22,7 @@
 #include "scenecolor.h.fsl" // tonemapInPass() — class 1: the curve moved to resolve.frag (step 6a)
 #include "skydome.h.fsl"     // applyFog() — extinguish into a silhouette, then melt into the SAMPLED sky
 #include "enchantglow.h.fsl" // enchantGlow() — MW's caustic env map over enchanted items
+#include "fpshadow.h.fsl"    // fpShadowVisibility() — direct cube-atlas test for non-owners of the mask
 
 STRUCT(VSOutput)
 {
@@ -169,7 +170,22 @@ float4 PS_MAIN( VSOutput In )
             // host patches falloff.w = shadow slot + 1 (0 = no shadow); shadowmask.comp already did
             // the cube-face atlas PCF, so the slot's 4-bit visibility just scales the light.
             uint slotP1 = (uint)gLights.lights[i * 3u + 2u].w;
-            if (receiveShadows && slotP1 != 0u && !inReflect)   // screen-space mask — see inReflect
+            // A draw that can never OWN the mask texel tests the cube atlas DIRECTLY from its own
+            // world position (fpshadow.h.fsl). The math is world-space, but it stays OUT of the
+            // reflection: gShadowAtlas/Dyn are bound only into the main + FP PerFrame sets, not
+            // pPerFrameSetReflectGeo, so a reflected ghost stays unshadowed as before. The
+            // mask holds ONE surface per pixel: the opaque world, overwritten by the alpha receiver
+            // scratch with the NEAREST static sheet. A blended SKINNED part (DrawIdx sentinel) is
+            // never in that scratch, so it always read a stranger's shadow — a ghost behind a
+            // cobweb inherited the web's whole QUAD (g_alphaShadowRef 0 claims transparent texels
+            // too) and went dark in a square exactly where the web overlapped it. FP parts
+            // (alphaShadowParams.y) are the same case for the reason multimap/opaque already give.
+            if (receiveShadows && slotP1 != 0u && !inReflect
+                && (In.DrawIdx == 0xFFFFFFFFu || gFrameData.alphaShadowParams.y > 0.5f))
+            {
+                att *= fpShadowVisibility(In.WorldPos, normalize(In.Normal), slotP1 - 1u);
+            }
+            else if (receiveShadows && slotP1 != 0u && !inReflect)   // screen-space mask — see inReflect
             {
                 uint4 mw   = LoadTex2D(gShadowMask, NO_SAMPLER, int2(In.Position.xy), 0).xyzw;
                 uint  s    = slotP1 - 1u;
