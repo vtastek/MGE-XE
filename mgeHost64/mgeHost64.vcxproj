@@ -229,6 +229,9 @@
     <ClCompile Include="..\src\mge\quadtree.cpp" />
     <ClCompile Include="..\src\support\log.cpp" />
     <ClCompile Include="main.cpp" />
+    <!-- The knob registry (tasks/forge-host-decomposition.md Phase 1). Same default-ABI
+         arrangement as terrain.cpp: POD across knobs.h, containers stay inside knobs.cpp. -->
+    <ClCompile Include="knobs.cpp" />
     <!-- Host-owned terrain: the ESM/LAND loader. Kept on the host's DEFAULT MSVC ABI (not The
          Forge's no-exceptions/IMemory one) so its containers stay on the CRT allocator; it talks
          to forgerender.cpp through terrain.h's POD-only surface. -->

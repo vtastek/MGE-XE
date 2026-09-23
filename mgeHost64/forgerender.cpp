@@ -21,6 +21,10 @@
 #include "ipc/hostframetimings.h"   // IPC::HostFrameTimings (fillFrameTimings)
 #include "mge/configuration.h"   // Configuration.DL.* for the host-owned live distant-land cull
 #include "support/log.h"   // LOG::logline -> mgeHost64.log (LOGF goes to uncaptured stdout)
+// The knob registry (tasks/forge-host-decomposition.md Phase 1). This file still DECLARES most of
+// the knobs, but it no longer has to be the only file that can: a knob is now an entry in a
+// process-wide registry, so a new subsystem TU registers its own. POD across the header.
+#include "knobs.h"
 // Host-owned terrain (tasks/forge-terrain.md). POD-only surface by design: terrain.cpp is built on
 // the host's DEFAULT MSVC ABI, so nothing it allocates may cross into this TU's IMemory allocator.
 #include "terrain.h"
@@ -294,9 +298,13 @@ static int forgeEcoQoSState()
 #include "shaders/FSL/gtao.srt.h"
 #include "shaders/FSL/aoblur.srt.h"
 // APL instrument (tasks/forge-postprocess.md step 2). Like linearizedepth.srt.h this header keys a
-// texture type off SAMPLE_COUNT; on the C++ side SAMPLE_COUNT is undefined so the header's own
-// #ifndef picks 1, which is harmless — both variants declare the SAME three slots in the SAME order,
-// so SRT_RES_IDX resolves identically whichever the GPU is running.
+// texture type off SAMPLE_COUNT. It reads 1 here — but NOT because the macro is unset, which is what
+// this comment used to say: linearizedepth.srt.h above is the one that defines it, through its own
+// `#ifndef SAMPLE_COUNT / #define 1`, and an .srt.h deliberately does NOT undef it (in the FSL build
+// the value comes from the shader variant and has to survive the rest of the file). So SAMPLE_COUNT
+// is LIVE at 1 from :293 onward, and every later header sees that rather than its own default.
+// Harmless for this one — both variants declare the SAME three slots in the SAME order, so
+// SRT_RES_IDX resolves identically whichever the GPU is running.
 #include "shaders/FSL/apl.srt.h"
 // Custom MSAA resolve (tasks/forge-postprocess.md step 4) — ResolveSrtData, PerDraw frequency, the
 // host's FIRST graphics SRT other than opaque.srt.h. It unions into the same default.rootsig; The
@@ -307,6 +315,15 @@ static int forgeEcoQoSState()
 // The resolve FILTER's compute SRT. SAMPLE_COUNT is what selects Tex2DMS vs Tex2D inside it, and the
 // host only ever builds the 4x variant — resolve.srt.h above is included without one because the
 // host reads only its PerDraw indices, which do not depend on it.
+//
+// CLEAR IT FIRST. linearizedepth.srt.h (:293) left SAMPLE_COUNT defined as 1 and no .srt.h undefs
+// its own default, so this #define was a REDEFINITION — warning C4005 on every single build, with
+// linearizedepth.srt.h named as the previous definition. The value it picked was still 4 (a
+// redefinition warns, it does not lose), so nothing was ever miscompiled; the cost was a permanent
+// warning that trains the eye to skip this file's build output. Undef-then-define is the fix that
+// belongs on THIS side: the header's leak is part of its contract with the FSL build, where the
+// variant's value must outlive the include. Whoever wants a different one clears it first.
+#undef SAMPLE_COUNT
 #define SAMPLE_COUNT 4
 #include "shaders/FSL/resolvefilter.srt.h"
 #undef SAMPLE_COUNT
@@ -18974,10 +18991,26 @@ namespace {
     float calMwDayRef() {
         return kCalMwAmbDay + g_calSunWeight * kCalDayElevSin * kCalMwSunDay;
     }
-    // ...and the level that anchor maps to. The GEOMETRIC centre of 60-80, so that a half-width of
-    // sqrt(80/60) returns {60.0, 80.0} to the last digit at ratio 1. The signed-off row is
-    // reproduced exactly; everything else in the day is that row times MW's own ratio.
-    constexpr float kCalMwDayCentre = 69.28203f;   // sqrt(60*80)
+    // ...and the level that anchor maps to. WAS `constexpr float kCalMwDayCentre = 69.28203f`, the
+    // geometric centre of the signed-off 60-80 row, so that a half-width of sqrt(80/60) returned
+    // {60.0, 80.0} to the last digit at ratio 1.
+    //
+    // ⚠ IT IS A KNOB NOW BECAUSE IT WAS THE ONE NUMBER NOBODY COULD REACH. *"Daytime noon is a bit
+    // dark. And I can't really tweak it."* — user, 2026-09-21. That was literally true and it was
+    // this line: the whole of "how bright is a clear noon" is this single scalar, and as a
+    // constexpr it had no panel row, no MGE_HOST_KNOBS token, and therefore no A/B of any kind.
+    // The band half-width and kappa_0 were both live; the SETPOINT they are measured around was not.
+    //
+    // ⚠ AND IT SCALES EVERY HOUR, NOT JUST NOON. The exterior row is `centre * ratio` with ratio =
+    // mwRefLevel()/calMwDayRef(), which is 1.00 at a clear noon and small at night — so raising this
+    // lifts dawn, dusk and night by the SAME factor. That is a real consequence and not a footnote:
+    // the night setpoint was deliberately anchored so the servo solves for E ~ 1 ("reproduce MW"),
+    // and 80/69.28 = 1.155x moves that to E ~ 1.16. The designed compensation is `calSunWeight`,
+    // which steepens the day-to-night falloff and LEAVES NOON EXACTLY WHERE IT IS by construction.
+    //
+    // Ships at 80 per the user's own number (*"It should reach 80 APL"*).
+    // `calDayCentre=69.28203 calBandHalf=1.154701 calBandUp=1.154701` restores the old row exactly.
+    float g_calDayCentre = 80.0f;
     // A floor, so a pathological weather (or a frame with no lighting at all) cannot walk the
     // setpoint to zero and take E with it. Well below MW's darkest authored night.
     constexpr float kCalMwMinCentre = 10.0f;
@@ -18986,7 +19019,28 @@ namespace {
     // the fixed night row had: the bucket variation it was covering is gone (the setpoint moves with
     // the light now), but the scene-content variation at night — a torch against an open field — is
     // not, and a mean over a frame whose p10/p90 span 0..91 is noisy. Widen if `exp=` hunts.
-    float g_calBandHalf = 1.154701f;
+    float g_calBandHalf = 1.05f;
+    // ...and the SAME RATIO ON THE OTHER SIDE, which used to be the same number by assumption.
+    //
+    // ⚠ A SYMMETRIC DEAD ZONE CANNOT EXPRESS WHAT AUTO-EXPOSURE ACTUALLY NEEDS, and the user's
+    // report is the proof: *"when a white wall is there, it drives it down to 70 again. It should
+    // reach 80 APL."* Those are two DIFFERENT edges of the band doing two different jobs.
+    //   - The FLOOR (`calBandHalf`) is how far a dim frame is allowed to sag before the servo lifts
+    //     it. Wide here is what made noon "a bit dark": inside the dead zone the loop does nothing
+    //     at all, so at centre 69.28 the level could park anywhere down to 60 and no knob moved it.
+    //     Narrow it and the setpoint starts behaving like a setpoint.
+    //   - The CEILING (`calBandUp`) is how much brighter than the setpoint a frame is ALLOWED to be
+    //     before the servo cuts E. That is the white wall. A mean-metered loop with a tight ceiling
+    //     is the grey-world failure in its classic form: put a bright surface in frame, the mean
+    //     rises, the loop cuts E, and everything that is NOT the wall goes dark to pay for it.
+    //     Widening this is what lets a bright scene read as a bright scene.
+    //
+    // Ships 1.05 / 1.25 -> a noon band of [76.2, 100.0] around 80, against the old [60, 80].
+    // ⚠ Set calBandHalf to 1.00 and 80 becomes a HARD FLOOR rather than a near one — that is the
+    // literal reading of "should reach 80", and it is one knob away. It was not shipped because a
+    // zero-width floor means the loop corrects on every frame that is even slightly dim, which is
+    // the hunting the dead zone exists to prevent. Try it; the heartbeat's `exp=` is the witness.
+    float g_calBandUp   = 1.25f;
     // OFF = the previous bucket rows (twilight-ramped night/day, clock fallback), kept whole below
     // as the A/B. This changes the setpoint at every hour except noon, so it gets a switch.
     bool  g_calFollowMw = true;
@@ -19010,7 +19064,7 @@ namespace {
     // express 'dusk'." A bucket cannot express "a flooded underworks" either.
     //
     // ⚠ NO NEW CONSTANTS, DELIBERATELY. This runs the interior's authored light through the SAME
-    // anchor the exterior rule uses (calMwDayRef -> kCalMwDayCentre), so a cell lit as brightly as
+    // anchor the exterior rule uses (calMwDayRef -> g_calDayCentre), so a cell lit as brightly as
     // MW's clear noon targets the signed-off day row and a darker one targets proportionally less.
     // A second anchor would be a second thing to keep in step, and the whole point of the MW-referred
     // rule is that there is one reference and it is MW.
@@ -21836,11 +21890,28 @@ namespace {
     }
 
     // ─── THE MGE_HOST_KNOBS TABLES ─────────────────────────────────────────────────
-    // They sit HERE, above the dev panel, because the panel is what reads them backwards: a save
-    // needs pointer -> name, and it needs it while the panel is being BUILT. Their other two
-    // callers (applyKnobSpec and applyEnvOverrides) are far below in namespace ForgeRender and can
-    // see them from there; the panel, inside this anonymous namespace, could not see them the
-    // other way round. Verified before moving: all 255 knob globals are declared above this point.
+    // ⚠ THESE ARE NO LONGER THE TABLE. Since the Phase 1 registry (knobs.h,
+    // tasks/forge-host-decomposition.md) they are a REGISTRATION SOURCE: the four arrays are still
+    // the declaration site for this file's 277 knobs, and the static initialiser below feeds every
+    // entry into Knobs::add(). The three readers — applyKnobSpec, the panel's pointer -> name save,
+    // and --knob-dump — all go through the registry now, so a knob declared in ANOTHER translation
+    // unit is reachable by all three without this file knowing it exists.
+    //
+    // ⚠ WHY THE ENTRIES DID NOT MOVE. The constraint that caused the problem is gone the moment the
+    // readers stop iterating these arrays; moving 277 entries out of them buys nothing further and
+    // costs a 277-way diff through a file nobody wants to re-verify by hand. The only reason to
+    // move one is that its OWNER moved — a knob travels with its subsystem when that subsystem
+    // becomes a TU, which is Phase 2's job and is an entry at a time, reviewed with the code that
+    // reads it. What this file used to say here was:
+    //
+    //     "Verified before moving: all 255 knob globals are declared above this point."
+    //
+    // That line is why forgerender.cpp is 57k lines. It was true, it was load-bearing, and it is
+    // now false: a knob global no longer has to be visible from here, or to be in this file at all.
+    // (It was also stale — there are 277, and --knob-dump counts them rather than a comment.)
+    //
+    // They still sit above the dev panel, which is unchanged and still needs pointer -> name while
+    // it is being BUILT.
     //
     // Format and semantics are documented at applyEnvOverrides. The entries are untouched.
 
@@ -22192,6 +22263,25 @@ namespace {
             { "mbTileJitter",        &g_mbTileJitter        },
             { "mbMinPx",             &g_mbMinPx             },
             { "mbSoftZ",             &g_mbSoftZ             },
+            // THE EXPOSURE SETPOINT. Env-armed together because the question they answer is a
+            // whole-run one — *"daytime noon is a bit dark, and I can't really tweak it"* —
+            // and the harness runs minimized, where the panel cannot be reached at all. The
+            // identity arm for the whole 2026-09-21 change is one token:
+            //   MGE_HOST_KNOBS="calDayCentre=69.28203 calBandHalf=1.154701 calBandUp=1.154701"
+            // ⚠ `calDayCentre` scales EVERY hour (the row is centre * MW's own ratio), so a
+            // sweep of it wants `calSunWeight` beside it — that one moves dusk and night while
+            // leaving noon fixed by construction, which is the only way to separate them.
+            { "calDayCentre",        &g_calDayCentre        },
+            { "calBandHalf",         &g_calBandHalf         },
+            { "calBandUp",           &g_calBandUp           },
+            { "calSunWeight",        &g_calSunWeight        },
+            // The meter's STATISTIC: 0 frame mean, 1 p90, 2 geometric mean. Here because it is
+            // the other half of the white-wall complaint — a mean is what a bright minority
+            // drags, and a geometric mean barely notices one. ⚠ MOVING IT IS NOT FREE: the band
+            // above is stated in the mean's units, and p90 is ~2x the mean, so a switch without
+            // re-deriving the band makes the servo inert (measured 2026-08-18). Sweep it WITH
+            // calDayCentre, never alone.
+            { "expStat",             &g_expStat             },
     };
     const BKnob bknobs[] = {
             // PBR materials master switch: 0 must be today's image exactly (pack-time gate).
@@ -22445,13 +22535,34 @@ namespace {
             { "upscaleBackend", g_upscaleBackend, sizeof(g_upscaleBackend) },
     };
 
-    // Pointer -> the stable MGE_HOST_KNOBS name, or nullptr. Linear over 244 entries, called only
-    // when the panel is built or saved.
+    // ─── ...AND INTO THE REGISTRY ──────────────────────────────────────────────────────
+    // A static initialiser, which runs before main() and therefore before main.cpp's
+    // applyEnvOverrides() — the ordering the env arm has always depended on, preserved exactly.
+    //
+    // ⚠ THIS IS SAFE DESPITE THE STATIC-INIT-ORDER FIASCO, for one specific reason: the four arrays
+    // above are CONSTANT-INITIALISED. Their elements are string literals and addresses of
+    // file-scope objects, all constant expressions, so they are laid down by the compiler with no
+    // dynamic initialisation of their own and are fully formed before any initialiser in any TU
+    // runs. The registry's own container is a function-local static (knobs.cpp) for the mirror
+    // reason. Neither side can observe the other half-built.
+    //
+    // ⚠ NOTHING HERE DEPENDS ON THE ORDER THESE LAND IN relative to another TU's registrations.
+    // See knobs.h: the readers are name -> pointer, pointer -> name, and a dump that sorts. Order
+    // is only observable through a duplicate name or a duplicate pointer, and --knob-dump reports
+    // both rather than leaving them to be discovered.
+    const bool g_knobsRegistered = [] {
+        for (const FKnob& k : fknobs) { Knobs::add(k.name, k.p); }
+        for (const BKnob& k : bknobs) { Knobs::add(k.name, k.p); }
+        for (const UKnob& k : uknobs) { Knobs::add(k.name, k.p, k.max); }
+        for (const SKnob& k : sknobs) { Knobs::add(k.name, k.p, k.cap); }
+        return true;
+    }();
+
+    // Pointer -> the stable MGE_HOST_KNOBS name, or nullptr. The panel's SAVE direction, called
+    // only when the panel is built or saved. Now one hop into the registry, so it answers for a
+    // knob owned by any TU rather than only for the four arrays above.
     inline const char* knobNameOf(const void* p) {
-        for (const FKnob& k : fknobs) { if (k.p == p) { return k.name; } }
-        for (const BKnob& k : bknobs) { if (k.p == p) { return k.name; } }
-        for (const UKnob& k : uknobs) { if (k.p == p) { return k.name; } }
-        return nullptr;
+        return Knobs::nameOf(p);
     }
 
     // ─── A STABLE SAVE KEY FOR EVERY WIDGET ────────────────────────────────────────────
@@ -23944,13 +24055,28 @@ namespace {
           // edge case: this is how a lamp-lit basement is authored. See g_calInteriorFloor.
           t.sliderF("Cal: interior setpoint FLOOR (a cell that authors no ambient reads this)",
                     &g_calInteriorFloor, 5.0f, 50.0f, 0.5f, "%.1f");
+          // ⚠ THE SETPOINT. *"Daytime noon is a bit dark. And I can't really tweak it."* — and that
+          // was exactly right until 2026-09-21: this number was a constexpr, so the band half-width
+          // and kappa_0 below were both adjustable around a centre that nothing could move.
+          // 69.28 = sqrt(60*80) is the old signed-off row; 80 ships.
+          // ⚠ It multiplies EVERY hour, not just noon — see g_calDayCentre. Pair a sweep of this
+          // with kappa_0 below, which moves dusk/night and leaves noon alone.
+          t.sliderF("Setpoint: CLEAR-NOON level (69.28 = the old 60-80 row; scales every hour)",
+                    &g_calDayCentre, 20.0f, 160.0f, 0.5f, "%.2f");
           // The dead zone, as a ratio around the setpoint. sqrt(80/60) reproduces the day row
           // exactly. This is the open question in the scheme: the bucket variation the old wide
           // night row was covering is gone (the setpoint moves with the light now), but the
           // scene-content variation at night is not, and a frame mean whose p10/p90 span 0..91 is a
           // noisy thing to servo on. Widen if `exp=` hunts at night; narrow if the level floats.
-          t.sliderF("Setpoint: dead-zone half-width (ratio; 1.155 = the 60-80 row)",
-                    &g_calBandHalf, 1.02f, 2.00f, 0.005f, "%.3f");
+          // ⚠ MIN IS 1.00 NOW, NOT 1.02: 1.00 is the setpoint as a HARD FLOOR, which is the
+          // literal reading of "it should reach 80", and refusing to express it was the slider
+          // refusing the question. Expect more servo activity there — that is the trade.
+          t.sliderF("Dead zone FLOOR (ratio below setpoint; 1.00 = a hard floor, 1.155 = old)",
+                    &g_calBandHalf, 1.00f, 2.00f, 0.005f, "%.3f");
+          // ...and the ceiling, which is the WHITE WALL dial. Up = a bright frame is allowed to
+          // stay bright instead of being metered back down onto the setpoint.
+          t.sliderF("Dead zone CEILING (ratio above setpoint; the white-wall dial)",
+                    &g_calBandUp, 1.00f, 2.50f, 0.005f, "%.3f");
           // ⚠ THE DUSK/NIGHT DARKNESS DIAL, AND IT LEAVES NOON EXACTLY WHERE IT IS. It is the
           // directional's share of the frame mean (kappa_0), and the day anchor is derived from the
           // same number — so ratio 1 keeps meaning "a clear noon" at every setting, and all this
@@ -27317,78 +27443,75 @@ void destroyHostWindow(Renderer* R);
             if (eq == std::string::npos || eq == 0) { continue; }
             const std::string key = item.substr(0, eq);
             const std::string val = item.substr(eq + 1);
-            bool hit = false;
-            for (const FKnob& k : fknobs) {
-                if (key == k.name) {
-                    knobRecordOrig(k.p, (double)*k.p); *k.p = (float)std::atof(val.c_str());
-                    LOG::logline(">> [forge]   [%s] %s = %.4f", source, k.name, (double)*k.p);
-                    hit = true;
+            // ⚠ ONE REGISTRY LOOKUP WHERE THERE WERE FOUR TABLE SCANS, and the four-way cascade
+            // below is now a switch on the entry's KIND rather than on which array it turned up in.
+            // The behaviour is identical for every knob this file owns; what changed is that a knob
+            // declared in another TU resolves here too, which is the whole point of the registry.
+            //
+            // ⚠ THE PER-KIND BODIES ARE UNTOUCHED, deliberately — the clamp, the out-of-range
+            // report, the upscale name annotation, the string truncation and every knobRecordOrig
+            // call are the POLICY this file owns and knobs.cpp deliberately does not. Moving them
+            // would have made this a behaviour change wearing a refactor's clothes.
+            const Knobs::Entry* e = Knobs::find(key.c_str());
+            const bool hit = (e != nullptr);
+            if (e) {
+                switch (e->kind) {
+                case Knobs::KindF: {
+                    float* const kp = (float*)e->p;
+                    knobRecordOrig(kp, (double)*kp); *kp = (float)std::atof(val.c_str());
+                    LOG::logline(">> [forge]   [%s] %s = %.4f", source, e->name, (double)*kp);
                     break;
                 }
-            }
-            if (!hit) {
-                for (const BKnob& k : bknobs) {
-                    if (key == k.name) {
-                        knobRecordOrig(k.p, *k.p ? 1.0 : 0.0); *k.p = (std::atoi(val.c_str()) != 0);
-                        LOG::logline(">> [forge]   [%s] %s = %s", source, k.name, *k.p ? "true" : "false");
-                        hit = true;
-                        break;
+                case Knobs::KindB: {
+                    bool* const kp = (bool*)e->p;
+                    knobRecordOrig(kp, *kp ? 1.0 : 0.0); *kp = (std::atoi(val.c_str()) != 0);
+                    LOG::logline(">> [forge]   [%s] %s = %s", source, e->name, *kp ? "true" : "false");
+                    break;
+                }
+                case Knobs::KindU: {
+                    uint32_t* const kp = (uint32_t*)e->p;
+                    const long v = std::atol(val.c_str());
+                    // CLAMPED, and an out-of-range value is reported rather than wrapped: a
+                    // mode index nobody can see is a run labelled "Performance" that rendered
+                    // something else.
+                    const uint32_t c = (v < 0) ? 0u
+                                     : ((uint32_t)v > e->umax ? e->umax : (uint32_t)v);
+                    if ((long)c != v) {
+                        LOG::logline("!! [forge]   %s=%ld out of range [0..%u] — clamped to %u",
+                                     e->name, v, e->umax, c);
                     }
+                    knobRecordOrig(kp, (double)*kp); *kp = c;
+                    LOG::logline(">> [forge]   [%s] %s = %u (%s)", source, e->name, c,
+                                 (kp == &g_upscaleMode)   ? kUpscaleModeNames[c]
+                               : (kp == &g_upscalePreset) ? kUpscalePresetNames[c] : "");
+                    break;
+                }
+                case Knobs::KindS: {
+                    char* const kp = (char*)e->p;
+                    // Truncating rather than rejecting an over-long value is safe HERE and only
+                    // here: every consumer of a string knob compares against a known name, so a
+                    // truncated value matches nothing and takes that knob's own unrecognised
+                    // path, which logs. It cannot silently become a different valid value.
+                    std::snprintf(kp, (size_t)e->cap, "%s", val.c_str());
+                    LOG::logline(">> [forge]   [%s] %s = %s", source, e->name, kp);
+                    break;
+                }
                 }
             }
-            if (!hit) {
-                for (const UKnob& k : uknobs) {
-                    if (key == k.name) {
-                        const long v = std::atol(val.c_str());
-                        // CLAMPED, and an out-of-range value is reported rather than wrapped: a
-                        // mode index nobody can see is a run labelled "Performance" that rendered
-                        // something else.
-                        const uint32_t c = (v < 0) ? 0u
-                                         : ((uint32_t)v > k.max ? k.max : (uint32_t)v);
-                        if ((long)c != v) {
-                            LOG::logline("!! [forge]   %s=%ld out of range [0..%u] — clamped to %u",
-                                         k.name, v, k.max, c);
-                        }
-                        knobRecordOrig(k.p, (double)*k.p); *k.p = c;
-                        LOG::logline(">> [forge]   [%s] %s = %u (%s)", source, k.name, c,
-                                     (k.p == &g_upscaleMode)   ? kUpscaleModeNames[c]
-                                   : (k.p == &g_upscalePreset) ? kUpscalePresetNames[c] : "");
-                        hit = true;
-                        break;
-                    }
-                }
-            }
-            if (!hit) {
-                for (const SKnob& k : sknobs) {
-                    if (key == k.name) {
-                        // Truncating rather than rejecting an over-long value is safe HERE and only
-                        // here: every consumer of a string knob compares against a known name, so a
-                        // truncated value matches nothing and takes that knob's own unrecognised
-                        // path, which logs. It cannot silently become a different valid value.
-                        std::snprintf(k.p, k.cap, "%s", val.c_str());
-                        LOG::logline(">> [forge]   [%s] %s = %s", source, k.name, k.p);
-                        hit = true;
-                        break;
-                    }
-                }
-            }
-            // ⚠ NOT EVERY KNOB IN THIS STRING IS *THIS* TABLE'S. main.cpp reads MGE_HOST_KNOBS a
-            // second time, BEFORE the renderer exists, because its two knobs decide which DLLs are
-            // resident at device-creation time — far too early for a table that lives inside
-            // ForgeRender. Without this list they were reported "UNKNOWN … ignored" in the same log
-            // that, four lines above, shows them having done their job. A warning that contradicts
-            // the evidence beside it is worse than no warning: it teaches you to distrust the log.
-            if (!hit) {
-                static const char* const kOwnedByMain[] = { "proxyDlls", "preloadNgx" };
-                for (const char* n : kOwnedByMain) {
-                    if (key == n) {
-                        LOG::logline(">> [forge]   %s — handled in main.cpp before device creation "
-                                     "(see the [proxy] lines at the top of this log)", n);
-                        hit = true;
-                        break;
-                    }
-                }
-            }
+            // ⚠ THE `kOwnedByMain` EXCEPTION LIST THAT USED TO BE HERE IS GONE, and what removed it
+            // is the registry rather than a tidy-up. main.cpp reads MGE_HOST_KNOBS a second time,
+            // BEFORE the renderer exists, because its two knobs (`proxyDlls`, `preloadNgx`) decide
+            // which DLLs are resident at device-creation time. They could not be registered while a
+            // knob had to be declared beside the four static tables in this file, so they were
+            // reported "UNKNOWN … ignored" in the same log that, four lines above, showed them
+            // having done their job — a warning that contradicts the evidence beside it, which
+            // teaches you to distrust the log. The fix then was to hardcode their names here.
+            //
+            // They are now registered by main.cpp itself (see the block above preloadGraphicsProxies)
+            // and resolve through Knobs::find like every other knob, so the special case has nothing
+            // left to except. A hardcoded list of names that live somewhere else is exactly the debt
+            // a registration mechanism is supposed to stop accruing; this is the first instalment
+            // paid back.
             if (!hit) { LOG::logline("!! [forge]   [%s] UNKNOWN knob '%s' — ignored", source, key.c_str()); }
         }
         LOG::flush();
@@ -27407,6 +27530,102 @@ void destroyHostWindow(Renderer* R);
                          g_queuePriorityApplied);
         }
         applyKnobSpec(env, "MGE_HOST_KNOBS");
+    }
+
+    // ─── THE KNOB TABLE, DUMPED ────────────────────────────────────────────────────────
+    // See forgerender.h for why this exists: it is the oracle for the Phase 1 registry move, and a
+    // `--knob-dump` redirect is the whole verification. Deliberately structured so the "after"
+    // version is one loop over the registry feeding the SAME Row, the SAME sort and the SAME
+    // printf — if the reporting changed with the mechanism, the diff would be testing the reporter.
+    //
+    // %.9g on the floats, not %f: a float needs 9 significant digits to round-trip, and a default
+    // that reads 1.05 in one dump and 1.0499999 in the other would be a false positive that costs
+    // an hour. Bools print 0/1 and uints print the value with their clamp, because the clamp is
+    // table CONTENT — dropping a `max` is exactly the kind of silent loss a mechanical move makes,
+    // and it would never show up as a wrong value until someone passed an out-of-range one.
+    int dumpKnobs() {
+        struct Row { std::string name; char kind; std::string val; std::string lim; const void* p; };
+        std::vector<Row> rows;
+        rows.reserve(512);
+
+        char buf[512];
+        for (size_t i = 0, n = Knobs::count(); i < n; ++i) {
+            const Knobs::Entry* e = Knobs::at(i);
+            switch (e->kind) {
+            case Knobs::KindF:
+                std::snprintf(buf, sizeof(buf), "%.9g", (double)*(const float*)e->p);
+                rows.push_back({ e->name, 'F', buf, "", e->p });
+                break;
+            case Knobs::KindB:
+                rows.push_back({ e->name, 'B', *(const bool*)e->p ? "1" : "0", "", e->p });
+                break;
+            case Knobs::KindU: {
+                std::snprintf(buf, sizeof(buf), "%u", *(const uint32_t*)e->p);
+                std::string v = buf;
+                std::snprintf(buf, sizeof(buf), "max=%u", e->umax);
+                rows.push_back({ e->name, 'U', v, buf, e->p });
+                break;
+            }
+            case Knobs::KindS:
+                std::snprintf(buf, sizeof(buf), "cap=%u", e->cap);
+                rows.push_back({ e->name, 'S', (const char*)e->p, buf, e->p });
+                break;
+            }
+        }
+
+        std::sort(rows.begin(), rows.end(),
+                  [](const Row& a, const Row& b) { return a.name < b.name; });
+
+        for (const Row& r : rows) {
+            std::printf("%c\t%s\t%s\t%s\n", r.kind, r.name.c_str(), r.val.c_str(), r.lim.c_str());
+        }
+
+        // ⚠ THE TWO WAYS ORDER CAN MATTER, both reported rather than assumed away. A duplicate NAME
+        // means applyKnobSpec's first-match-wins picks one of two knobs and the other can never be
+        // set from a spec; a duplicate POINTER means knobNameOf answers with whichever name comes
+        // first, so the panel SAVES under one name and a reader may expect the other. Neither is a
+        // crash and neither is visible in a frame — they are exactly the class of defect that
+        // survives a refactor unnoticed, which is why the oracle checks for them instead of the
+        // person running it.
+        int dupName = 0, dupPtr = 0;
+        for (size_t i = 1; i < rows.size(); ++i) {
+            if (rows[i].name == rows[i - 1].name) {
+                std::printf("!\tDUPLICATE NAME\t%s\n", rows[i].name.c_str());
+                ++dupName;
+            }
+        }
+        {
+            std::vector<const Row*> byPtr;
+            byPtr.reserve(rows.size());
+            for (const Row& r : rows) { byPtr.push_back(&r); }
+            std::sort(byPtr.begin(), byPtr.end(),
+                      [](const Row* a, const Row* b) { return a->p < b->p; });
+            for (size_t i = 1; i < byPtr.size(); ++i) {
+                if (byPtr[i]->p == byPtr[i - 1]->p) {
+                    std::printf("!\tDUPLICATE POINTER\t%s\t%s\n",
+                                byPtr[i - 1]->name.c_str(), byPtr[i]->name.c_str());
+                    ++dupPtr;
+                }
+            }
+        }
+
+        int nF = 0, nB = 0, nU = 0, nS = 0;
+        for (const Row& r : rows) {
+            switch (r.kind) {
+                case 'F': ++nF; break;
+                case 'B': ++nB; break;
+                case 'U': ++nU; break;
+                default:  ++nS; break;
+            }
+        }
+        // Knobs::dupNames() is the REGISTRY's own count, taken at registration; dupName above is
+        // this dump's, taken from the sorted rows. They are two independent witnesses to the same
+        // property and they must agree — if they ever do not, a registration was lost between
+        // add() and the table, which is the one failure a row-by-row diff would not show.
+        std::printf("#\ttotal=%zu\tF=%d\tB=%d\tU=%d\tS=%d\tdupName=%d\tdupPtr=%d\tregDup=%d\n",
+                    rows.size(), nF, nB, nU, nS, dupName, dupPtr, Knobs::dupNames());
+        std::fflush(stdout);
+        return (int)rows.size();
     }
 
     bool init(unsigned width, unsigned height, unsigned sampleCount, unsigned anisoLevel) {
@@ -28375,10 +28594,10 @@ void destroyHostWindow(Renderer* R);
                 // delivers, lamps included — the units the APL meter has always been reporting in.
                 const float ratio = (g_calInteriorLit ? mwRefLevelInteriorLit()
                                                       : mwRefLevelInterior()) / calMwDayRef();
-                const float c     = std::max(g_calInteriorFloor, kCalMwDayCentre * ratio);
+                const float c     = std::max(g_calInteriorFloor, g_calDayCentre * ratio);
                 static char iname[48];
                 std::snprintf(iname, sizeof(iname), "MW-referred %.2fx day (interior)", (double)ratio);
-                return { c / g_calBandHalf, c * g_calBandHalf, iname };
+                return { c / g_calBandHalf, c * g_calBandUp, iname };
             }
             return {  40.0f,  50.0f, "interior 40-50" };
         }
@@ -28476,7 +28695,7 @@ void destroyHostWindow(Renderer* R);
         // the setpoint would hand them back the level they are not supposed to move.
         if (g_calFollowMw) {
             const float ratio = mwRefLevel() / calMwDayRef();
-            const float c     = std::max(kCalMwMinCentre, kCalMwDayCentre * ratio);
+            const float c     = std::max(kCalMwMinCentre, g_calDayCentre * ratio);
             // The ratio belongs on the log line — it is the whole state of this rule, and without it
             // `target[...]=33-44` is a number with no story. A function-local static is safe here for
             // the same reason the rest of this file's instrumentation is: calTarget() is called from
@@ -28484,7 +28703,7 @@ void destroyHostWindow(Renderer* R);
             // both would format the identical value anyway.
             static char name[48];
             std::snprintf(name, sizeof(name), "MW-referred %.2fx day", (double)ratio);
-            return { c / g_calBandHalf, c * g_calBandHalf, name };
+            return { c / g_calBandHalf, c * g_calBandUp, name };
         }
         // ─── THE FALLBACK ROWS (g_calFollowMw off) — kept whole as the A/B ───────────────────────
         if (g_skyPhys.active) {
@@ -29868,6 +30087,398 @@ void destroyHostWindow(Renderer* R);
             dlLogGpuSlow(g_lastGpuMs, g_lastRecMs, g_lastDrawn);
         }
     }
+
+    // ─── PHASE 3: PROMOTED PASSES ─────────────────────────────────────────────────────
+    // tasks/forge-host-decomposition.md Phase 3. renderScene already documented itself as a
+    // sequence of passes in banner comments; these are those same regions, moved VERBATIM into
+    // named functions so the compiler can see a seam that until now only a comment described.
+    // No file move, no linkage change, no global-access change — so a mistake is a build error
+    // rather than a frame that is subtly wrong, and the diff reads as a pure relocation.
+    //
+    // ⚠ THE INVARIANT IS THAT NO gpuPhase CALL MOVES RELATIVE TO THE WORK IT BRACKETS. Every
+    // body below is a verbatim move, so the sequence of Begin/End calls and the work between them
+    // is bit-for-bit what it was; a promotion therefore cannot change what a phase measures, and
+    // that is checked mechanically rather than by eye (scratch verify_move.py diffs each body
+    // against the same region in git HEAD).
+    //
+    // ⚠ WHERE A BRACKET SPANS TWO BANNERS, THOSE BANNERS PROMOTE TOGETHER — and the reason is
+    // readability, not correctness. A survey of all 43 gpuPhase brackets in renderScene found two
+    // that straddle a banner: kGpuPhaseCull spans Stage B3 *and* Follow-on 3, and kGpuPhaseVolFog
+    // spans the volumetric fog pass *and* the underwater backstop. Splitting either into two
+    // functions would still measure the same work — but it would leave two functions that LOOK
+    // independently callable and reorderable while a live phase timer runs across both, which is
+    // one careless reorder away from a timer bracketing a stranger's pass. That has produced a
+    // wrong answer in this file before ([[feedback_phase_timer_can_bracket_a_strangers_pass]]).
+    //
+    // ⚠ SO THE BANNERS ARE NOT AUTOMATICALLY THE SEAMS, which is what the plan assumed. They are
+    // a starting point that has to be checked against the bracket map before each cut.
+    // kGpuPhaseFrame wraps the whole function by design and stays in renderScene.
+    //
+    // ⚠ THE TIMER LAMBDAS ARE TEMPLATE PARAMETERS, and that is what makes the bodies verbatim.
+    // gpuPhaseBegin/gpuPhaseEnd are `[&]` lambdas closing over two renderScene-local arrays
+    // (cpuPhaseT0/cpuPhaseAcc), so they cannot be spelled in a signature. Taking them as template
+    // parameters keeps every call inside a moved body written exactly as it was, costs nothing at
+    // runtime, and puts the bracket in the signature instead of 400 lines inside a 13,000-line
+    // function. A pass that does not time anything simply does not take them.
+    namespace {
+    // PHASE F: distant-light glow billboards. Whole kGpuPhaseColorGlow bracket.
+    // The only thing it needs from the frame is the colour target; everything else it touches is
+    // a global or a call, which is why a 19-line pass has a 1-argument signature.
+    template <class PhBegin, class PhEnd>
+    void passDistantLightGlow(RenderTarget* colorTarget, PhBegin&& gpuPhaseBegin, PhEnd&& gpuPhaseEnd) {
+        // Additive camera-facing sprites for fixture lights whose tier-0 static meshes have coverage-
+        // culled (~2 cells). Drawn AFTER water (the whole opaque+DL+water frame is complete, so the
+        // GEQUAL depth test occludes them behind walls) but BEFORE the sorted-alpha pass, so AT1
+        // translucents (banners/glass) composite correctly OVER the glow. The water pass unbound the
+        // render targets (above), so re-bind our own colour+depth (LOAD) + viewport/scissor here.
+        gpuPhaseBegin(kGpuPhaseColorGlow);
+        if (g_drawGlow && g_live.glowReady) {
+            BindRenderTargetsDesc gbind = {};
+            gbind.mRenderTargetCount = 1;
+            gbind.mRenderTargets[0] = { colorTarget, LOAD_ACTION_LOAD };
+            gbind.mDepthStencil = { g_live.pDepth, LOAD_ACTION_LOAD };
+            cmdBindRenderTargets(g_live.pCmd, &gbind);
+            cmdSetViewport(g_live.pCmd, 0.0f, 0.0f, (float)g_live.width, (float)g_live.height, 0.0f, 1.0f);
+            cmdSetScissor(g_live.pCmd, 0, 0, g_live.width, g_live.height);
+            dlDrawGlowBillboards();
+            cmdBindRenderTargets(g_live.pCmd, nullptr);
+        }
+        gpuPhaseEnd(kGpuPhaseColorGlow);
+    }
+
+    // VOLUMETRIC height fog / sun shafts, AND the W8 underwater backstop.
+    //
+    // ⚠ THESE TWO ARE ONE FUNCTION BECAUSE THEY ARE ONE TIMED PHASE. The banners read as two
+    // passes, but gpuPhaseBegin(kGpuPhaseVolFog) opens above the fog and the matching End does not
+    // arrive until after the backstop — so `volfog` in the heartbeat has always been the cost of
+    // both, and splitting them here would have moved that boundary without anyone deciding to.
+    // Their ordering is load-bearing besides (the backstop's INV_DEST_ALPHA/ONE blend must land
+    // BEHIND whatever the fog deposited), so they belong together on the merits too.
+    template <class PhBegin, class PhEnd>
+    void passVolumetricFogAndBackstop(RenderTarget* colorTarget, PhBegin&& gpuPhaseBegin, PhEnd&& gpuPhaseEnd) {
+        // Placed HERE deliberately: after water + sorted alpha so the fog sits in front of everything
+        // the world pass drew, and BEFORE the first-person arms, which are a near overlay a few units
+        // from the eye — fogging them would apply a whole scene's worth of extinction at arm's length.
+        // Reads the PREPASS depth (gSceneLinDepth), so a ray behind a water surface marches to the
+        // opaque bed rather than the water plane; acceptable, and the alternative is a second depth
+        // resolve for a soft effect that cannot show the difference.
+        // The map it samples is the MSM moments — one tap per march step. That is the whole reason the
+        // moments (and their blur) survive PCSS taking over the colour pass.
+        gpuPhaseBegin(kGpuPhaseVolFog);
+        // Gated on sunShadowReady, not merely on "exterior": it is both the exterior/DL-resident test
+        // AND the guarantee that the moments atlas this march samples was actually built this frame.
+        if (g_volFog && g_live.pVolFogPipeline && g_live.pLinearDepth && g_live.sunShadowReady) {
+            cmdBeginDebugMarker(g_live.pCmd, 0.6f, 0.7f, 0.9f, "VOLUMETRIC FOG");
+            BindRenderTargetsDesc vfBind = {};
+            vfBind.mRenderTargetCount = 1;
+            vfBind.mRenderTargets[0] = { colorTarget, LOAD_ACTION_LOAD };
+            cmdBindRenderTargets(g_live.pCmd, &vfBind);
+            cmdSetViewport(g_live.pCmd, 0.0f, 0.0f, (float)g_live.width, (float)g_live.height, 0.0f, 1.0f);
+            cmdSetScissor(g_live.pCmd, 0, 0, g_live.width, g_live.height);
+            cmdBindPipeline(g_live.pCmd, g_live.pVolFogPipeline);
+            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSet);
+            cmdDraw(g_live.pCmd, 3, 0);
+            cmdBindRenderTargets(g_live.pCmd, nullptr);
+            cmdEndDebugMarker(g_live.pCmd);
+        }
+        // ===================== W8: UNDERWATER BACKSTOP =====================
+        // Fill whatever the frame never covered. LAST of the world passes so every earlier one has
+        // already staked its coverage — and still before the first-person arms, which are drawn a
+        // few units from the eye and must not be filled around.
+        // No enable test beyond the knob: the shader itself early-outs to zero coverage unless the
+        // camera is submerged with the water fog live, OR the above-water fill is permitted for this
+        // frame (gFrameData.lodEye.w — g_waterFillAbove, exteriors only). This is the master switch
+        // for the pass; g_waterFillAbove is the per-half control inside it.
+        //
+        // Ordering with volfog above is load-bearing and already right: the fill's INV_DEST_ALPHA/ONE
+        // blend puts it BEHIND whatever volfog deposited, so an uncovered pixel reads as fog colour
+        // at infinity with the haze in front of it, not the other way round.
+        if (g_waterFillHoles && g_live.pWaterFillPipeline) {
+            cmdBeginDebugMarker(g_live.pCmd, 0.2f, 0.5f, 0.8f, "UNDERWATER BACKSTOP");
+            BindRenderTargetsDesc wfBind = {};
+            wfBind.mRenderTargetCount = 1;
+            wfBind.mRenderTargets[0] = { colorTarget, LOAD_ACTION_LOAD };
+            cmdBindRenderTargets(g_live.pCmd, &wfBind);
+            cmdSetViewport(g_live.pCmd, 0.0f, 0.0f, (float)g_live.width, (float)g_live.height, 0.0f, 1.0f);
+            cmdSetScissor(g_live.pCmd, 0, 0, g_live.width, g_live.height);
+            cmdBindPipeline(g_live.pCmd, g_live.pWaterFillPipeline);
+            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSet);
+            cmdDraw(g_live.pCmd, 3, 0);
+            cmdBindRenderTargets(g_live.pCmd, nullptr);
+            cmdEndDebugMarker(g_live.pCmd);
+        }
+        gpuPhaseEnd(kGpuPhaseVolFog);
+    }
+
+    // THE RESOLVE'S COMPUTE PRE-FILTER. Whole kGpuPhaseResolveFilter bracket, no outputs.
+    //
+    // Takes sceneColorToSR as a parameter rather than reaching for it, and that is the point: the
+    // barrier hoist is an idempotent lambda with THREE callers (this, the upscale and the resolve),
+    // and which of them records the transition depends on which runs first. Passing it makes this
+    // pass's dependence on that shared lambda part of its signature instead of a fact you learn by
+    // reading the 40 lines of commentary above its definition.
+    template <class SceneColorToSR, class PhBegin, class PhEnd>
+    void passResolvePreFilter(bool rfRunning, SceneColorToSR&& sceneColorToSR,
+                              PhBegin&& gpuPhaseBegin, PhEnd&& gpuPhaseEnd) {
+        // Separable Catmull-Rom + firefly reconstruction of the MSAA samples into a single-sample
+        // fp16 LINEAR image, so resolve.frag takes one Load instead of 64
+        // ([[project_forge_resolve_is_load_bound]]).
+        //
+        // ⚠ IT RUNS HERE, ABOVE THE BLUR, AND THAT PLACEMENT IS THE WHOLE OF THE MSAA MOTION-BLUR
+        // FIX. The blur's colour source must be single-sample (gMbColor is a plain Tex2D), linear
+        // and PRE-TONEMAP (a blur is an energy operation —
+        // [[feedback_energy_op_takes_the_energy_honest_source]]). Above 1x, pSceneColor is a Tex2DMS
+        // and satisfies only the last two, which is why mbReady was gated on sampleCount == 1 and
+        // motion blur silently did not exist on a 4x install. This buffer satisfies all three, and
+        // the frame was already producing it — so the fix is an ORDERING change and a source swap,
+        // not a new pass.
+        //
+        // Dispatched over the SOURCE rect after pSceneColor reaches SHADER_RESOURCE.
+        if (rfRunning) {
+            sceneColorToSR();   // idempotent; the upscale block above may already have done it
+            gpuPhaseBegin(kGpuPhaseResolveFilter);
+            TextureBarrier rfb = {};
+            rfb.pTexture      = g_live.pResolveFiltered;
+            rfb.mCurrentState = RESOURCE_STATE_SHADER_RESOURCE;
+            rfb.mNewState     = RESOURCE_STATE_UNORDERED_ACCESS;
+            // Frame 0 it was created UNORDERED_ACCESS already, and D3D12 rejects a transition whose
+            // before and after states match — the same rule the pRT transition spells out.
+            if (!g_live.firstFrame) {
+                cmdResourceBarrier(g_live.pCmd, 0, nullptr, 1, &rfb, 0, nullptr);
+            }
+            cmdBeginDebugMarker(g_live.pCmd, 0.8f, 0.5f, 0.9f, "RESOLVE FILTER (separable, LDS)");
+            cmdBindPipeline(g_live.pCmd, g_live.pRFPipeline);
+            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pRFSet);
+            // The SOURCE rect — the same extent gResolveParams.dims.xy clamps to, which on an
+            // upscaled frame is the output rect. (Unreachable at sampleCount 4, where rfReady lives,
+            // but the two must not drift apart if that ever changes.)
+            cmdDispatch(g_live.pCmd,
+                        (g_live.outWidth  + 7u) / 8u,
+                        (g_live.outHeight + 7u) / 8u, 1);
+            cmdEndDebugMarker(g_live.pCmd);
+            rfb.mCurrentState = RESOURCE_STATE_UNORDERED_ACCESS;
+            rfb.mNewState     = RESOURCE_STATE_SHADER_RESOURCE;
+            cmdResourceBarrier(g_live.pCmd, 0, nullptr, 1, &rfb, 0, nullptr);
+            gpuPhaseEnd(kGpuPhaseResolveFilter);
+        }
+    }
+
+    // WT1: the Forge water surface. Whole kGpuPhaseWater bracket, no outputs.
+    //
+    // The Begin sits one line above the banner in renderScene, so the region starts there rather
+    // than at the comment — taking the banner as the boundary would have left the bracket open
+    // across the call.
+    //
+    // ⚠ THE COMPILER CORRECTED THE SURVEY TWICE HERE, IN BOTH DIRECTIONS, WHICH IS THE ARGUMENT
+    // FOR PROMOTING IN PLACE. The static analysis that sized this extraction (a) MISSED
+    // waterParams/waterEnabled, because they are renderScene's own PARAMETERS and it only scanned
+    // declarations in the body, and (b) INVENTED an eyeAbsZ input, because this pass declares its
+    // own on a multi-declarator line (`const float eyeAbsX = ..., eyeAbsY = ..., eyeAbsZ = ...`)
+    // and the scan reads only the first name on such a line. Both were build errors within one
+    // compile. In another translation unit a missed dependency is a link error at best, and an
+    // invented one silently shadows something real.
+    template <class PhBegin, class PhEnd>
+    void passForgeWaterSurface(RenderTarget* colorTarget, const float* rzViewProj,
+                               const float* waterParams, unsigned waterEnabled,
+                               PhBegin&& gpuPhaseBegin, PhEnd&& gpuPhaseEnd) {
+        gpuPhaseBegin(kGpuPhaseWater);
+        // ===================== WT1: FORGE WATER SURFACE =====================
+        // Drawn LAST (after near scene + DL) so the whole opaque frame is its refraction/scene-depth
+        // source. Sequence: end the colour pass → copy colorTarget into pRefractColor (refraction src)
+        // → re-bind the colour pass (LOAD/LOAD) → upload the per-LOD-level worlds + packed params +
+        // invVP → draw one indexed-instanced call per clipmap level (DrawIndex=level). Depth GEQUAL +
+        // write so water occludes / is occluded correctly. Gated by waterReady (build) + waterEnabled (F7).
+        g_lastWaterLevels = 0;   // Phase 0 panel: 0 unless the water pass runs below
+        if (g_live.waterReady && waterEnabled && g_drawWater) {
+            // (1) End the colour pass; copy colorTarget → pRefractColor. CopyResource for 1x; for MSAA
+            // the colour is multisampled → ResolveSubresource into the single-sample refraction copy.
+            cmdBindRenderTargets(g_live.pCmd, nullptr);
+            ID3D12GraphicsCommandList* cl = g_live.pCmd->mDx.pCmdList;
+            ID3D12Resource* colRes  = colorTarget->pTexture->mDx.pResource;
+            ID3D12Resource* refrRes = g_live.pRefractColor->mDx.pResource;
+            const bool msaa = (g_live.sampleCount > 1);
+            {
+                D3D12_RESOURCE_BARRIER pre[2] = {};
+                pre[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                pre[0].Transition.pResource = colRes;
+                pre[0].Transition.Subresource = 0;
+                pre[0].Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+                pre[0].Transition.StateAfter  = msaa ? D3D12_RESOURCE_STATE_RESOLVE_SOURCE
+                                                     : D3D12_RESOURCE_STATE_COPY_SOURCE;
+                pre[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                pre[1].Transition.pResource = refrRes;
+                pre[1].Transition.Subresource = 0;
+                pre[1].Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE
+                                              | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+                pre[1].Transition.StateAfter  = msaa ? D3D12_RESOURCE_STATE_RESOLVE_DEST
+                                                     : D3D12_RESOURCE_STATE_COPY_DEST;
+                cl->ResourceBarrier(2, pre);
+            }
+            if (msaa) { cl->ResolveSubresource(refrRes, 0, colRes, 0, (DXGI_FORMAT)TinyImageFormat_ToDXGI_FORMAT(colorTarget->mFormat)); }
+            else      { cl->CopyResource(refrRes, colRes); }
+            {
+                D3D12_RESOURCE_BARRIER post[2] = {};
+                post[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                post[0].Transition.pResource = colRes;
+                post[0].Transition.Subresource = 0;
+                post[0].Transition.StateBefore = msaa ? D3D12_RESOURCE_STATE_RESOLVE_SOURCE
+                                                      : D3D12_RESOURCE_STATE_COPY_SOURCE;
+                post[0].Transition.StateAfter  = D3D12_RESOURCE_STATE_RENDER_TARGET;
+                post[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                post[1].Transition.pResource = refrRes;
+                post[1].Transition.Subresource = 0;
+                post[1].Transition.StateBefore = msaa ? D3D12_RESOURCE_STATE_RESOLVE_DEST
+                                                      : D3D12_RESOURCE_STATE_COPY_DEST;
+                post[1].Transition.StateAfter  = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE
+                                               | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+                cl->ResourceBarrier(2, post);
+            }
+
+            // (2) Build worlds[0..5] (camera-relative, eye-snapped per level), worlds[6]=packed params,
+            // worlds[7]=invVP. The absolute eye for snapping = gFrameData.lodEye (fcbv float 56..58),
+            // valid across null-lighting frames (same source the AO block uses for the eye).
+            const float* fcbv = (const float*)g_live.pFrameCbv->pCpuMappedAddress;
+            const float eyeAbsX = fcbv[56], eyeAbsY = fcbv[57], eyeAbsZ = fcbv[58];
+            const float waterLevelAbs = waterParams ? waterParams[0] : 0.0f;
+            const bool  underwater    = waterParams && waterParams[7] > 0.5f;
+            const float waterZ = waterMeshZ(waterLevelAbs, underwater);   // camera-avoidance snap only
+
+            uint8_t* wbuf = (uint8_t*)g_live.pWaterWorldsBuf->pCpuMappedAddress;
+            for (uint32_t k = 0; k < kWaterLevels; ++k) {
+                const float cell = g_waterLevels[k].cellSize;
+                const float snap = 2.0f * cell;
+                const float originX = std::floor(eyeAbsX / snap) * snap;
+                const float originY = std::floor(eyeAbsY / snap) * snap;
+                // Camera-relative, D3DX row-major: scale(cell,cell,1) · translate(origin-eye, waterZ-eye.z).
+                float m[16] = { cell, 0, 0, 0,  0, cell, 0, 0,  0, 0, 1, 0,
+                                originX - eyeAbsX, originY - eyeAbsY, waterZ - eyeAbsZ, 1 };
+                std::memcpy(wbuf + (size_t)k * 64, m, 64);
+            }
+            // worlds[6] = packed params (4 float4 groups, row-major; the frag transposes to read).
+            {
+                float p[16] = {};
+                p[0] = waterLevelAbs - eyeAbsZ;                 // waterLevelRel (water-cut feature)
+                p[1] = waterParams ? waterParams[1] : 0.013f;  // windFactor
+                p[2] = waterParams ? waterParams[2] : 24.0f;   // shoreDepthBias
+                // Water animation time. MUST be wrapped on the HOST (double) before the float cast:
+                // hostNowMs() is steady_clock-since-BOOT, so seconds is ~1e5-1e6 → float32 ULP
+                // ~0.02-0.13s quantizes t into coarse steps ("low frame rate" normals).
+                //
+                // PERIOD 20 s, was 2.5. The wrap period IS the wave field's visible loop, and it is
+                // also its speed quantum (rates must be whole multiples of 2*PI/period or the field
+                // pops at the seam), so 2.5 s bought a 2.5 s loop AND a coarse 0.4 Hz speed step.
+                // 20 s gives an 8x longer loop and an 8x finer step for nothing: float32 at 20.0 has
+                // ~2e-6 resolution, and the normal volume's W axis stays seamless too because it
+                // reads t = 0.4*time on a REPEAT sampler and 0.4*20 is a whole 8 cycles.
+                // ⚠ SIM CLOCK (see g_simClock): the sea has to hold still behind an open menu for
+                // the same reason the caustics on its floor do. The wrap stays exactly as derived
+                // above — it is the loop AND the speed quantum, not a precision workaround.
+                p[3] = (float)std::fmod(g_simClock, 20.0);
+                p[4] = waterParams ? waterParams[3] : 0.0f;    // depthBaseColor.r
+                p[5] = waterParams ? waterParams[4] : 0.0f;    // .g
+                p[6] = waterParams ? waterParams[5] : 0.0f;    // .b
+                // STEP 5 — and this one was MISSED in the first sweep, which is worth recording:
+                // the sweep went through gFrameData and gLights, i.e. the lanes that LOOK like
+                // lighting, and depthBaseColor is neither. It is every bit as authored as they are —
+                // renderprocess.cpp builds it as XE's weighted sum of MW's sunCol, horizonCol and
+                // nearFogCol (`sunAdj*0.03 + (2*skyC + fogF)*0.075`, per channel) — so undecoded it
+                // left the deep-water colour sitting a full gamma above the scene it tints.
+                //
+                // Decoding the RESULT and not the three inputs is deliberate: that weighted sum is a
+                // TUNED display-space recipe from XE Mod Water.fx, not a radiometric one, and taking
+                // it apart to re-sum it in linear would be re-authoring someone's water colour under
+                // the guise of a units fix. Same treatment fogColNear gets, for the same reason.
+                //
+                // THE LESSON, so the next per-pass cbuffer does not repeat it: "is it authored?" is
+                // not answered by which buffer a value arrives in.
+                decodeAuthoredRGB(p + 4);
+                p[7] = underwater ? 1.0f : 0.0f;
+                p[8]  = waterParams ? waterParams[8]  : 0.0f;  // camFwd.x
+                p[9]  = waterParams ? waterParams[9]  : 0.0f;  // camFwd.y
+                p[10] = waterParams ? waterParams[10] : 1.0f;  // camFwd.z
+                // ⚠ REPURPOSED, AND THEN REPURPOSED BACK HALFWAY. This carried a copy of
+                // nearViewRange that NO water shader read — the live one is gFrameData.lodParams.w,
+                // which statics.vert gates the hero near-cut on. It is now the FRACTION of that same
+                // nearViewRange at which water's UV distortion has faded to zero, so the lane ends up
+                // carrying the number it was always named after, this time as a multiplier the shader
+                // applies to the live copy. 0 restores the old unbounded behaviour exactly.
+                p[11] = std::max(0.0f, g_waterDistortFrac);
+                p[12] = waterFlagsWord();          // debug view (bits 0-1) + P4 Schlick (bit 2)
+                p[13] = waterAlphaBase(p[1]);      // WT4d sub-texel GGX alpha, wind-scaled
+                p[14] = (float)kReflectSize;       // gReflectMips side, for the reflection LOD
+                p[15] = g_waterReflBlurGain;       // reflection-LOD calibration scale (not the lobe)
+                std::memcpy(wbuf + 6 * 64, p, 64);
+                // eyeAbs so the R2 block can make MW's absolute ripple centres eye-relative.
+                writeWaveScales(wbuf, eyeAbsX, eyeAbsY);
+            }
+            // worlds[7] = invViewProj of the SAME rzViewProj (incl. half-pixel) the GTAO block inverts;
+            // uploaded RAW (the frag does mul(invVP, ndc), identical convention to gtao.comp).
+            {
+                float invVP[16];
+                if (!invert4x4(rzViewProj, invVP)) {
+                    for (int i = 0; i < 16; ++i) { invVP[i] = (i % 5 == 0) ? 1.0f : 0.0f; }
+                }
+                std::memcpy(wbuf + 7 * 64, invVP, 64);
+            }
+
+            // (3) Re-bind the colour pass (LOAD colour, LOAD depth — pDepth is still DEPTH_WRITE) and
+            // draw each clipmap level. Trim variant = eye parity (port of renderwater.cpp:947).
+            BindRenderTargetsDesc wbind = {};
+            wbind.mRenderTargetCount = 1;
+            wbind.mRenderTargets[0] = { colorTarget, LOAD_ACTION_LOAD };
+            wbind.mDepthStencil = { g_live.pDepth, LOAD_ACTION_LOAD };
+            cmdBindRenderTargets(g_live.pCmd, &wbind);
+            cmdSetViewport(g_live.pCmd, 0.0f, 0.0f, (float)g_live.width, (float)g_live.height, 0.0f, 1.0f);
+            cmdSetScissor(g_live.pCmd, 0, 0, g_live.width, g_live.height);
+            // ⚠ THE DEPTH WRITE IS ASYMMETRIC, BECAUSE THE SURFACE IS. Seen from ABOVE it is nearly
+            // transparent, so claiming the pixel deletes submerged translucents that should be showing
+            // through it. Seen from BELOW it is nearly OPAQUE: outside Snell's 48.6-degree window every
+            // ray is totally internally reflected (the same window water.frag's own Fresnel models), so
+            // "the surface finishes this pixel" is a good approximation rather than a wrong one — and
+            // the alternative, letting above-water alpha composite OVER the mirror, is the artifact
+            // reported the moment the write came off unconditionally.
+            //
+            // The exact answer is the same in both directions and neither of these: a fragment on the
+            // far side of the plane belongs UNDER the surface's own term, which means drawing it before
+            // water with a per-FRAGMENT side test (a half-submerged head is one draw on both sides, so
+            // no per-draw sort can place it). Until that exists, side with the medium that is closer to
+            // opaque. Inside the window — straight up from below — this still hides what should show.
+            const bool waterZWrite = g_waterZWrite || underwater;
+            cmdBindPipeline(g_live.pCmd, (waterZWrite && g_live.pWaterPipelineZ)
+                                             ? g_live.pWaterPipelineZ : g_live.pWaterPipeline);
+            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSet);    // gFrameData + gAO + 4 water SRVs
+            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerLightsSet);
+            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
+            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerBatchSetWater);
+            Buffer*  wvbs[2]     = { g_live.pWaterVB, g_live.pWaterInstanceBuf };
+            uint32_t wstrides[2] = { 12, (uint32_t)sizeof(uint32_t) };
+            cmdBindVertexBuffer(g_live.pCmd, 2, wvbs, wstrides, nullptr);
+            cmdBindIndexBuffer(g_live.pCmd, g_live.pWaterIB, INDEX_TYPE_UINT16, 0);
+            for (uint32_t k = 0; k < kWaterLevels; ++k) {
+                const WaterLodLevelHost& lvl = g_waterLevels[k];
+                uint32_t variant = 0;
+                if (lvl.numVariants > 1) {
+                    const int ex = (int)(((long long)std::floor(eyeAbsX / lvl.cellSize)) & 1);
+                    const int ey = (int)(((long long)std::floor(eyeAbsY / lvl.cellSize)) & 1);
+                    variant = (uint32_t)(ey * 2 + ex);
+                }
+                if (!lvl.triCount[variant]) continue;
+                // firstInstance = k → the instance VB's DrawIndex[k] = k → gBatch.worlds[k].
+                // BaseVertexLocation = 0: the indices ALREADY include each level's vertBase (the vidx
+                // lambda bakes it in, like MGE's DrawIndexedPrimitive with BaseVertexIndex=0). Passing
+                // vertBase here too DOUBLE-offset levels 1..5 → only level 0 drew (~1 cell of coverage).
+                cmdDrawIndexedInstanced(g_live.pCmd, lvl.triCount[variant] * 3,
+                                        lvl.ibStart[variant], 1, 0, k);
+                ++g_lastWaterLevels;   // Phase 0 panel
+            }
+        }
+
+        cmdBindRenderTargets(g_live.pCmd, nullptr);
+
+        gpuPhaseEnd(kGpuPhaseWater);
+    }
+
+    }  // namespace — promoted passes
 
     bool renderScene(const float* viewProj, const float* lighting, const void* drawBlob,
                      unsigned drawCount, unsigned drawBytes,
@@ -37982,221 +38593,12 @@ void destroyHostWindow(Renderer* R);
             hizMip0Filled = doHizMip0;
         }
 
-        gpuPhaseBegin(kGpuPhaseWater);
         // ===================== WT1: FORGE WATER SURFACE =====================
-        // Drawn LAST (after near scene + DL) so the whole opaque frame is its refraction/scene-depth
-        // source. Sequence: end the colour pass → copy colorTarget into pRefractColor (refraction src)
-        // → re-bind the colour pass (LOAD/LOAD) → upload the per-LOD-level worlds + packed params +
-        // invVP → draw one indexed-instanced call per clipmap level (DrawIndex=level). Depth GEQUAL +
-        // write so water occludes / is occluded correctly. Gated by waterReady (build) + waterEnabled (F7).
-        g_lastWaterLevels = 0;   // Phase 0 panel: 0 unless the water pass runs below
-        if (g_live.waterReady && waterEnabled && g_drawWater) {
-            // (1) End the colour pass; copy colorTarget → pRefractColor. CopyResource for 1x; for MSAA
-            // the colour is multisampled → ResolveSubresource into the single-sample refraction copy.
-            cmdBindRenderTargets(g_live.pCmd, nullptr);
-            ID3D12GraphicsCommandList* cl = g_live.pCmd->mDx.pCmdList;
-            ID3D12Resource* colRes  = colorTarget->pTexture->mDx.pResource;
-            ID3D12Resource* refrRes = g_live.pRefractColor->mDx.pResource;
-            const bool msaa = (g_live.sampleCount > 1);
-            {
-                D3D12_RESOURCE_BARRIER pre[2] = {};
-                pre[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-                pre[0].Transition.pResource = colRes;
-                pre[0].Transition.Subresource = 0;
-                pre[0].Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
-                pre[0].Transition.StateAfter  = msaa ? D3D12_RESOURCE_STATE_RESOLVE_SOURCE
-                                                     : D3D12_RESOURCE_STATE_COPY_SOURCE;
-                pre[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-                pre[1].Transition.pResource = refrRes;
-                pre[1].Transition.Subresource = 0;
-                pre[1].Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE
-                                              | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-                pre[1].Transition.StateAfter  = msaa ? D3D12_RESOURCE_STATE_RESOLVE_DEST
-                                                     : D3D12_RESOURCE_STATE_COPY_DEST;
-                cl->ResourceBarrier(2, pre);
-            }
-            if (msaa) { cl->ResolveSubresource(refrRes, 0, colRes, 0, (DXGI_FORMAT)TinyImageFormat_ToDXGI_FORMAT(colorTarget->mFormat)); }
-            else      { cl->CopyResource(refrRes, colRes); }
-            {
-                D3D12_RESOURCE_BARRIER post[2] = {};
-                post[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-                post[0].Transition.pResource = colRes;
-                post[0].Transition.Subresource = 0;
-                post[0].Transition.StateBefore = msaa ? D3D12_RESOURCE_STATE_RESOLVE_SOURCE
-                                                      : D3D12_RESOURCE_STATE_COPY_SOURCE;
-                post[0].Transition.StateAfter  = D3D12_RESOURCE_STATE_RENDER_TARGET;
-                post[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-                post[1].Transition.pResource = refrRes;
-                post[1].Transition.Subresource = 0;
-                post[1].Transition.StateBefore = msaa ? D3D12_RESOURCE_STATE_RESOLVE_DEST
-                                                      : D3D12_RESOURCE_STATE_COPY_DEST;
-                post[1].Transition.StateAfter  = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE
-                                               | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-                cl->ResourceBarrier(2, post);
-            }
-
-            // (2) Build worlds[0..5] (camera-relative, eye-snapped per level), worlds[6]=packed params,
-            // worlds[7]=invVP. The absolute eye for snapping = gFrameData.lodEye (fcbv float 56..58),
-            // valid across null-lighting frames (same source the AO block uses for the eye).
-            const float* fcbv = (const float*)g_live.pFrameCbv->pCpuMappedAddress;
-            const float eyeAbsX = fcbv[56], eyeAbsY = fcbv[57], eyeAbsZ = fcbv[58];
-            const float waterLevelAbs = waterParams ? waterParams[0] : 0.0f;
-            const bool  underwater    = waterParams && waterParams[7] > 0.5f;
-            const float waterZ = waterMeshZ(waterLevelAbs, underwater);   // camera-avoidance snap only
-
-            uint8_t* wbuf = (uint8_t*)g_live.pWaterWorldsBuf->pCpuMappedAddress;
-            for (uint32_t k = 0; k < kWaterLevels; ++k) {
-                const float cell = g_waterLevels[k].cellSize;
-                const float snap = 2.0f * cell;
-                const float originX = std::floor(eyeAbsX / snap) * snap;
-                const float originY = std::floor(eyeAbsY / snap) * snap;
-                // Camera-relative, D3DX row-major: scale(cell,cell,1) · translate(origin-eye, waterZ-eye.z).
-                float m[16] = { cell, 0, 0, 0,  0, cell, 0, 0,  0, 0, 1, 0,
-                                originX - eyeAbsX, originY - eyeAbsY, waterZ - eyeAbsZ, 1 };
-                std::memcpy(wbuf + (size_t)k * 64, m, 64);
-            }
-            // worlds[6] = packed params (4 float4 groups, row-major; the frag transposes to read).
-            {
-                float p[16] = {};
-                p[0] = waterLevelAbs - eyeAbsZ;                 // waterLevelRel (water-cut feature)
-                p[1] = waterParams ? waterParams[1] : 0.013f;  // windFactor
-                p[2] = waterParams ? waterParams[2] : 24.0f;   // shoreDepthBias
-                // Water animation time. MUST be wrapped on the HOST (double) before the float cast:
-                // hostNowMs() is steady_clock-since-BOOT, so seconds is ~1e5-1e6 → float32 ULP
-                // ~0.02-0.13s quantizes t into coarse steps ("low frame rate" normals).
-                //
-                // PERIOD 20 s, was 2.5. The wrap period IS the wave field's visible loop, and it is
-                // also its speed quantum (rates must be whole multiples of 2*PI/period or the field
-                // pops at the seam), so 2.5 s bought a 2.5 s loop AND a coarse 0.4 Hz speed step.
-                // 20 s gives an 8x longer loop and an 8x finer step for nothing: float32 at 20.0 has
-                // ~2e-6 resolution, and the normal volume's W axis stays seamless too because it
-                // reads t = 0.4*time on a REPEAT sampler and 0.4*20 is a whole 8 cycles.
-                // ⚠ SIM CLOCK (see g_simClock): the sea has to hold still behind an open menu for
-                // the same reason the caustics on its floor do. The wrap stays exactly as derived
-                // above — it is the loop AND the speed quantum, not a precision workaround.
-                p[3] = (float)std::fmod(g_simClock, 20.0);
-                p[4] = waterParams ? waterParams[3] : 0.0f;    // depthBaseColor.r
-                p[5] = waterParams ? waterParams[4] : 0.0f;    // .g
-                p[6] = waterParams ? waterParams[5] : 0.0f;    // .b
-                // STEP 5 — and this one was MISSED in the first sweep, which is worth recording:
-                // the sweep went through gFrameData and gLights, i.e. the lanes that LOOK like
-                // lighting, and depthBaseColor is neither. It is every bit as authored as they are —
-                // renderprocess.cpp builds it as XE's weighted sum of MW's sunCol, horizonCol and
-                // nearFogCol (`sunAdj*0.03 + (2*skyC + fogF)*0.075`, per channel) — so undecoded it
-                // left the deep-water colour sitting a full gamma above the scene it tints.
-                //
-                // Decoding the RESULT and not the three inputs is deliberate: that weighted sum is a
-                // TUNED display-space recipe from XE Mod Water.fx, not a radiometric one, and taking
-                // it apart to re-sum it in linear would be re-authoring someone's water colour under
-                // the guise of a units fix. Same treatment fogColNear gets, for the same reason.
-                //
-                // THE LESSON, so the next per-pass cbuffer does not repeat it: "is it authored?" is
-                // not answered by which buffer a value arrives in.
-                decodeAuthoredRGB(p + 4);
-                p[7] = underwater ? 1.0f : 0.0f;
-                p[8]  = waterParams ? waterParams[8]  : 0.0f;  // camFwd.x
-                p[9]  = waterParams ? waterParams[9]  : 0.0f;  // camFwd.y
-                p[10] = waterParams ? waterParams[10] : 1.0f;  // camFwd.z
-                // ⚠ REPURPOSED, AND THEN REPURPOSED BACK HALFWAY. This carried a copy of
-                // nearViewRange that NO water shader read — the live one is gFrameData.lodParams.w,
-                // which statics.vert gates the hero near-cut on. It is now the FRACTION of that same
-                // nearViewRange at which water's UV distortion has faded to zero, so the lane ends up
-                // carrying the number it was always named after, this time as a multiplier the shader
-                // applies to the live copy. 0 restores the old unbounded behaviour exactly.
-                p[11] = std::max(0.0f, g_waterDistortFrac);
-                p[12] = waterFlagsWord();          // debug view (bits 0-1) + P4 Schlick (bit 2)
-                p[13] = waterAlphaBase(p[1]);      // WT4d sub-texel GGX alpha, wind-scaled
-                p[14] = (float)kReflectSize;       // gReflectMips side, for the reflection LOD
-                p[15] = g_waterReflBlurGain;       // reflection-LOD calibration scale (not the lobe)
-                std::memcpy(wbuf + 6 * 64, p, 64);
-                // eyeAbs so the R2 block can make MW's absolute ripple centres eye-relative.
-                writeWaveScales(wbuf, eyeAbsX, eyeAbsY);
-            }
-            // worlds[7] = invViewProj of the SAME rzViewProj (incl. half-pixel) the GTAO block inverts;
-            // uploaded RAW (the frag does mul(invVP, ndc), identical convention to gtao.comp).
-            {
-                float invVP[16];
-                if (!invert4x4(rzViewProj, invVP)) {
-                    for (int i = 0; i < 16; ++i) { invVP[i] = (i % 5 == 0) ? 1.0f : 0.0f; }
-                }
-                std::memcpy(wbuf + 7 * 64, invVP, 64);
-            }
-
-            // (3) Re-bind the colour pass (LOAD colour, LOAD depth — pDepth is still DEPTH_WRITE) and
-            // draw each clipmap level. Trim variant = eye parity (port of renderwater.cpp:947).
-            BindRenderTargetsDesc wbind = {};
-            wbind.mRenderTargetCount = 1;
-            wbind.mRenderTargets[0] = { colorTarget, LOAD_ACTION_LOAD };
-            wbind.mDepthStencil = { g_live.pDepth, LOAD_ACTION_LOAD };
-            cmdBindRenderTargets(g_live.pCmd, &wbind);
-            cmdSetViewport(g_live.pCmd, 0.0f, 0.0f, (float)g_live.width, (float)g_live.height, 0.0f, 1.0f);
-            cmdSetScissor(g_live.pCmd, 0, 0, g_live.width, g_live.height);
-            // ⚠ THE DEPTH WRITE IS ASYMMETRIC, BECAUSE THE SURFACE IS. Seen from ABOVE it is nearly
-            // transparent, so claiming the pixel deletes submerged translucents that should be showing
-            // through it. Seen from BELOW it is nearly OPAQUE: outside Snell's 48.6-degree window every
-            // ray is totally internally reflected (the same window water.frag's own Fresnel models), so
-            // "the surface finishes this pixel" is a good approximation rather than a wrong one — and
-            // the alternative, letting above-water alpha composite OVER the mirror, is the artifact
-            // reported the moment the write came off unconditionally.
-            //
-            // The exact answer is the same in both directions and neither of these: a fragment on the
-            // far side of the plane belongs UNDER the surface's own term, which means drawing it before
-            // water with a per-FRAGMENT side test (a half-submerged head is one draw on both sides, so
-            // no per-draw sort can place it). Until that exists, side with the medium that is closer to
-            // opaque. Inside the window — straight up from below — this still hides what should show.
-            const bool waterZWrite = g_waterZWrite || underwater;
-            cmdBindPipeline(g_live.pCmd, (waterZWrite && g_live.pWaterPipelineZ)
-                                             ? g_live.pWaterPipelineZ : g_live.pWaterPipeline);
-            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSet);    // gFrameData + gAO + 4 water SRVs
-            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerLightsSet);
-            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
-            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerBatchSetWater);
-            Buffer*  wvbs[2]     = { g_live.pWaterVB, g_live.pWaterInstanceBuf };
-            uint32_t wstrides[2] = { 12, (uint32_t)sizeof(uint32_t) };
-            cmdBindVertexBuffer(g_live.pCmd, 2, wvbs, wstrides, nullptr);
-            cmdBindIndexBuffer(g_live.pCmd, g_live.pWaterIB, INDEX_TYPE_UINT16, 0);
-            for (uint32_t k = 0; k < kWaterLevels; ++k) {
-                const WaterLodLevelHost& lvl = g_waterLevels[k];
-                uint32_t variant = 0;
-                if (lvl.numVariants > 1) {
-                    const int ex = (int)(((long long)std::floor(eyeAbsX / lvl.cellSize)) & 1);
-                    const int ey = (int)(((long long)std::floor(eyeAbsY / lvl.cellSize)) & 1);
-                    variant = (uint32_t)(ey * 2 + ex);
-                }
-                if (!lvl.triCount[variant]) continue;
-                // firstInstance = k → the instance VB's DrawIndex[k] = k → gBatch.worlds[k].
-                // BaseVertexLocation = 0: the indices ALREADY include each level's vertBase (the vidx
-                // lambda bakes it in, like MGE's DrawIndexedPrimitive with BaseVertexIndex=0). Passing
-                // vertBase here too DOUBLE-offset levels 1..5 → only level 0 drew (~1 cell of coverage).
-                cmdDrawIndexedInstanced(g_live.pCmd, lvl.triCount[variant] * 3,
-                                        lvl.ibStart[variant], 1, 0, k);
-                ++g_lastWaterLevels;   // Phase 0 panel
-            }
-        }
-
-        cmdBindRenderTargets(g_live.pCmd, nullptr);
-
-        gpuPhaseEnd(kGpuPhaseWater);
+        passForgeWaterSurface(colorTarget, rzViewProj, waterParams, waterEnabled,
+                              gpuPhaseBegin, gpuPhaseEnd);
 
         // ===================== PHASE F: DISTANT-LIGHT GLOW BILLBOARDS =====================
-        // Additive camera-facing sprites for fixture lights whose tier-0 static meshes have coverage-
-        // culled (~2 cells). Drawn AFTER water (the whole opaque+DL+water frame is complete, so the
-        // GEQUAL depth test occludes them behind walls) but BEFORE the sorted-alpha pass, so AT1
-        // translucents (banners/glass) composite correctly OVER the glow. The water pass unbound the
-        // render targets (above), so re-bind our own colour+depth (LOAD) + viewport/scissor here.
-        gpuPhaseBegin(kGpuPhaseColorGlow);
-        if (g_drawGlow && g_live.glowReady) {
-            BindRenderTargetsDesc gbind = {};
-            gbind.mRenderTargetCount = 1;
-            gbind.mRenderTargets[0] = { colorTarget, LOAD_ACTION_LOAD };
-            gbind.mDepthStencil = { g_live.pDepth, LOAD_ACTION_LOAD };
-            cmdBindRenderTargets(g_live.pCmd, &gbind);
-            cmdSetViewport(g_live.pCmd, 0.0f, 0.0f, (float)g_live.width, (float)g_live.height, 0.0f, 1.0f);
-            cmdSetScissor(g_live.pCmd, 0, 0, g_live.width, g_live.height);
-            dlDrawGlowBillboards();
-            cmdBindRenderTargets(g_live.pCmd, nullptr);
-        }
-        gpuPhaseEnd(kGpuPhaseColorGlow);
+        passDistantLightGlow(colorTarget, gpuPhaseBegin, gpuPhaseEnd);
 
         // ===================== AT1: SORTED-ALPHA PASS =====================
         // The scene-1 blended world shapes (banners/tapestries/foliage/glass), drawn AFTER water so
@@ -38799,58 +39201,7 @@ void destroyHostWindow(Renderer* R);
         gpuPhaseEnd(kGpuPhaseColorAlpha);
 
         // ===================== VOLUMETRIC height fog / sun shafts =====================
-        // Placed HERE deliberately: after water + sorted alpha so the fog sits in front of everything
-        // the world pass drew, and BEFORE the first-person arms, which are a near overlay a few units
-        // from the eye — fogging them would apply a whole scene's worth of extinction at arm's length.
-        // Reads the PREPASS depth (gSceneLinDepth), so a ray behind a water surface marches to the
-        // opaque bed rather than the water plane; acceptable, and the alternative is a second depth
-        // resolve for a soft effect that cannot show the difference.
-        // The map it samples is the MSM moments — one tap per march step. That is the whole reason the
-        // moments (and their blur) survive PCSS taking over the colour pass.
-        gpuPhaseBegin(kGpuPhaseVolFog);
-        // Gated on sunShadowReady, not merely on "exterior": it is both the exterior/DL-resident test
-        // AND the guarantee that the moments atlas this march samples was actually built this frame.
-        if (g_volFog && g_live.pVolFogPipeline && g_live.pLinearDepth && g_live.sunShadowReady) {
-            cmdBeginDebugMarker(g_live.pCmd, 0.6f, 0.7f, 0.9f, "VOLUMETRIC FOG");
-            BindRenderTargetsDesc vfBind = {};
-            vfBind.mRenderTargetCount = 1;
-            vfBind.mRenderTargets[0] = { colorTarget, LOAD_ACTION_LOAD };
-            cmdBindRenderTargets(g_live.pCmd, &vfBind);
-            cmdSetViewport(g_live.pCmd, 0.0f, 0.0f, (float)g_live.width, (float)g_live.height, 0.0f, 1.0f);
-            cmdSetScissor(g_live.pCmd, 0, 0, g_live.width, g_live.height);
-            cmdBindPipeline(g_live.pCmd, g_live.pVolFogPipeline);
-            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSet);
-            cmdDraw(g_live.pCmd, 3, 0);
-            cmdBindRenderTargets(g_live.pCmd, nullptr);
-            cmdEndDebugMarker(g_live.pCmd);
-        }
-        // ===================== W8: UNDERWATER BACKSTOP =====================
-        // Fill whatever the frame never covered. LAST of the world passes so every earlier one has
-        // already staked its coverage — and still before the first-person arms, which are drawn a
-        // few units from the eye and must not be filled around.
-        // No enable test beyond the knob: the shader itself early-outs to zero coverage unless the
-        // camera is submerged with the water fog live, OR the above-water fill is permitted for this
-        // frame (gFrameData.lodEye.w — g_waterFillAbove, exteriors only). This is the master switch
-        // for the pass; g_waterFillAbove is the per-half control inside it.
-        //
-        // Ordering with volfog above is load-bearing and already right: the fill's INV_DEST_ALPHA/ONE
-        // blend puts it BEHIND whatever volfog deposited, so an uncovered pixel reads as fog colour
-        // at infinity with the haze in front of it, not the other way round.
-        if (g_waterFillHoles && g_live.pWaterFillPipeline) {
-            cmdBeginDebugMarker(g_live.pCmd, 0.2f, 0.5f, 0.8f, "UNDERWATER BACKSTOP");
-            BindRenderTargetsDesc wfBind = {};
-            wfBind.mRenderTargetCount = 1;
-            wfBind.mRenderTargets[0] = { colorTarget, LOAD_ACTION_LOAD };
-            cmdBindRenderTargets(g_live.pCmd, &wfBind);
-            cmdSetViewport(g_live.pCmd, 0.0f, 0.0f, (float)g_live.width, (float)g_live.height, 0.0f, 1.0f);
-            cmdSetScissor(g_live.pCmd, 0, 0, g_live.width, g_live.height);
-            cmdBindPipeline(g_live.pCmd, g_live.pWaterFillPipeline);
-            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSet);
-            cmdDraw(g_live.pCmd, 3, 0);
-            cmdBindRenderTargets(g_live.pCmd, nullptr);
-            cmdEndDebugMarker(g_live.pCmd);
-        }
-        gpuPhaseEnd(kGpuPhaseVolFog);
+        passVolumetricFogAndBackstop(colorTarget, gpuPhaseBegin, gpuPhaseEnd);
 
         // ===================== FP1a: first-person pass =====================
         // MW draws the arms in its OWN scene after a z-clear, with the arm camera's
@@ -40560,47 +40911,7 @@ void destroyHostWindow(Renderer* R);
         const uint32_t deliveredH = upscaled ? g_live.outHeight : g_live.height;
 
         // ===================== THE RESOLVE'S COMPUTE PRE-FILTER ==================================
-        // Separable Catmull-Rom + firefly reconstruction of the MSAA samples into a single-sample
-        // fp16 LINEAR image, so resolve.frag takes one Load instead of 64
-        // ([[project_forge_resolve_is_load_bound]]).
-        //
-        // ⚠ IT RUNS HERE, ABOVE THE BLUR, AND THAT PLACEMENT IS THE WHOLE OF THE MSAA MOTION-BLUR
-        // FIX. The blur's colour source must be single-sample (gMbColor is a plain Tex2D), linear
-        // and PRE-TONEMAP (a blur is an energy operation —
-        // [[feedback_energy_op_takes_the_energy_honest_source]]). Above 1x, pSceneColor is a Tex2DMS
-        // and satisfies only the last two, which is why mbReady was gated on sampleCount == 1 and
-        // motion blur silently did not exist on a 4x install. This buffer satisfies all three, and
-        // the frame was already producing it — so the fix is an ORDERING change and a source swap,
-        // not a new pass.
-        //
-        // Dispatched over the SOURCE rect after pSceneColor reaches SHADER_RESOURCE.
-        if (rfRunning) {
-            sceneColorToSR();   // idempotent; the upscale block above may already have done it
-            gpuPhaseBegin(kGpuPhaseResolveFilter);
-            TextureBarrier rfb = {};
-            rfb.pTexture      = g_live.pResolveFiltered;
-            rfb.mCurrentState = RESOURCE_STATE_SHADER_RESOURCE;
-            rfb.mNewState     = RESOURCE_STATE_UNORDERED_ACCESS;
-            // Frame 0 it was created UNORDERED_ACCESS already, and D3D12 rejects a transition whose
-            // before and after states match — the same rule the pRT transition spells out.
-            if (!g_live.firstFrame) {
-                cmdResourceBarrier(g_live.pCmd, 0, nullptr, 1, &rfb, 0, nullptr);
-            }
-            cmdBeginDebugMarker(g_live.pCmd, 0.8f, 0.5f, 0.9f, "RESOLVE FILTER (separable, LDS)");
-            cmdBindPipeline(g_live.pCmd, g_live.pRFPipeline);
-            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pRFSet);
-            // The SOURCE rect — the same extent gResolveParams.dims.xy clamps to, which on an
-            // upscaled frame is the output rect. (Unreachable at sampleCount 4, where rfReady lives,
-            // but the two must not drift apart if that ever changes.)
-            cmdDispatch(g_live.pCmd,
-                        (g_live.outWidth  + 7u) / 8u,
-                        (g_live.outHeight + 7u) / 8u, 1);
-            cmdEndDebugMarker(g_live.pCmd);
-            rfb.mCurrentState = RESOURCE_STATE_UNORDERED_ACCESS;
-            rfb.mNewState     = RESOURCE_STATE_SHADER_RESOURCE;
-            cmdResourceBarrier(g_live.pCmd, 0, nullptr, 1, &rfb, 0, nullptr);
-            gpuPhaseEnd(kGpuPhaseResolveFilter);
-        }
+        passResolvePreFilter(rfRunning, sceneColorToSR, gpuPhaseBegin, gpuPhaseEnd);
 
         // ===================== MB-2: MOTION BLUR (tasks/forge-postprocess.md) ====================
         // AFTER the upscale, BEFORE bloom, on the DELIVERED image and still PRE-TONEMAP — the resolve
@@ -41712,7 +42023,7 @@ void destroyHostWindow(Renderer* R);
                                                                * (float)(SceneCal::kPi / 180.0)))
                                      : kCalDayElevSin),
                                  (double)mwRefLevel(), (double)(mwRefLevel() / calMwDayRef()),
-                                 (double)(kCalMwDayCentre * mwRefLevel() / calMwDayRef()),
+                                 (double)(g_calDayCentre * mwRefLevel() / calMwDayRef()),
                                  // EVERYTHING DIVIDED OUT OF THE SETPOINT'S REFERENCE, as the ratio
                                  // the wire lets us recover: MW's delivered light over the reference
                                  // the servo aims by. TWO things now live in it — MGEgui's per-weather
@@ -41765,9 +42076,9 @@ void destroyHostWindow(Renderer* R);
                                  (double)g_mwAmbCode, (double)g_mwSunCode, (double)g_mwPtCode,
                                  g_lastLightCount,
                                  (double)iref, (double)irat,
-                                 (double)std::max(g_calInteriorFloor, kCalMwDayCentre * irat),
+                                 (double)std::max(g_calInteriorFloor, g_calDayCentre * irat),
                                  (double)ilit, (double)ilrat,
-                                 (double)std::max(g_calInteriorFloor, kCalMwDayCentre * ilrat),
+                                 (double)std::max(g_calInteriorFloor, g_calDayCentre * ilrat),
                                  g_calInteriorLit ? "LIT" : "floor",
                                  g_calFollowMwInterior ? 1 : 0);
                 }

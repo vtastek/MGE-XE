@@ -317,6 +317,24 @@ namespace ForgeRender {
     // arms are the same build. See the definition in forgerender.cpp for the knob table.
     void applyEnvOverrides();
 
+    // Print every registered MGE_HOST_KNOBS knob to stdout, sorted by name, one per line, and
+    // return the count. `mgeHost64.exe --knob-dump` — no GPU, no IPC, no Morrowind, the same
+    // standalone shape as --terrain-census.
+    //
+    // ⚠ THIS EXISTS AS A REFACTOR ORACLE FIRST AND A TOOL SECOND. tasks/forge-host-decomposition.md
+    // Phase 1 replaces four static tables with a registry, and the only honest way to show that a
+    // 277-entry mechanical move changed nothing is to compare the whole table before and after. A
+    // dump that needs a game session is a dump nobody runs; this one is a shell redirect.
+    //
+    // The format is fixed and machine-diffable — `kind<TAB>name<TAB>value<TAB>limit` — and the sort
+    // is by NAME rather than by table position deliberately, so the comparison survives a change
+    // that reorders registration. Registration order is otherwise unobservable (see the note above
+    // the tables in forgerender.cpp), which is what makes that safe.
+    //
+    // It also reports DUPLICATE names and DUPLICATE pointers, because those are the only two ways
+    // table order can be load-bearing, and a registry makes both easier to introduce by accident.
+    int dumpKnobs();
+
     // Arm N whole HOST frames for programmatic RenderDoc capture, from the client's numpad-0
     // one-shot. Bracketed host-side across renderScene boundaries rather than by RenderDoc's own
     // hotkey: the host never Presents (the client does, a frame or two later), so a UI-triggered

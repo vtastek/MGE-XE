@@ -4,6 +4,7 @@
 #include "ipc/server.h"
 #include "forgerender.h"
 #include "terrain.h"
+#include "knobs.h"
 
 #include <cstdio>
 #include <cstring>
@@ -54,8 +55,10 @@ extern "C" {
 // unanswerable as "is DLSS running" was, and for the same reason: success and failure look
 // identical from outside.
 //
-// Read straight from the environment rather than through the knob table, because that table lives
-// in the renderer and this has to run BEFORE the renderer exists — which is the whole point.
+// The two knobs it reads are declared just above the function, not in forgerender.cpp — see the
+// note there for why that is new and why it matters.
+//
+
 // The report, held until mgeHost64.log exists. See the note at the printf below.
 static char gProxyReport[4][512] = {};
 static int  gProxyReportCount = 0;
@@ -83,9 +86,42 @@ static void flushProxyReport() {
 	}
 }
 
+// ─── MAIN'S OWN TWO KNOBS ────────────────────────────────────────────────────────────────────────
+// ⚠ THESE TWO ARE THE REASON THE KNOB REGISTRY EXISTS, IN MINIATURE. They are real knobs with a real
+// consumer, and that consumer is in THIS file — but until the Phase 1 registry
+// (tasks/forge-host-decomposition.md) a knob could only be DECLARED inside forgerender.cpp, beside
+// the four static tables, because those tables are static arrays of pointers to file-scope objects.
+// So these two could not be registered at all, and the cost was a hardcoded exception list in
+// applyKnobSpec (`kOwnedByMain[]`) whose only job was to stop the parser calling them
+// "UNKNOWN … ignored" in the same log that, four lines above, shows them having done their work. A
+// warning that contradicts the evidence beside it is worse than no warning.
+//
+// They are now ordinary registered bool knobs owned by the file that reads them, and that exception
+// list is gone. `--knob-dump` lists them with everything else, so "what knobs exist" finally has one
+// answer instead of one answer plus a footnote.
+//
+// ⚠ THE ENV IS STILL READ BY strstr HERE, AND THAT IS NOT REDUNDANT. preloadGraphicsProxies() runs
+// at the top of main(), long before ForgeRender::applyEnvOverrides() parses anything, because its
+// whole purpose is to load DLLs before the renderer — and therefore before device creation — exists.
+// Registration is what makes a knob NAMEABLE from the rest of the system; the strstr is what makes
+// this one readable that early. They agree because they are the same spec string and the same name.
+//
+// ⚠ WHAT applyKnobSpec WRITES HERE IS THEREFORE A RECORD, NOT A CONTROL. By the time it runs main
+// has already acted, so the value it stores equals what strstr found and the two can never disagree
+// — but setting either one later cannot undo a LoadLibrary. That is also why neither has a panel
+// row, the same rule `upscaleBackend` follows: a widget that silently does nothing after startup is
+// worse than none.
+static bool g_proxyDlls  = false;
+static bool g_preloadNgx = false;
+MGE_KNOB(g_proxyDlls,  "proxyDlls");
+MGE_KNOB(g_preloadNgx, "preloadNgx");
 static void preloadGraphicsProxies() {
 	const char* env = std::getenv("MGE_HOST_KNOBS");
-	if (!env || !std::strstr(env, "proxyDlls=1")) {
+	// Set the registered knobs from the same spec string the renderer will parse later, so the value
+	// --knob-dump prints is the value this function acted on rather than a plausible-looking default.
+	g_proxyDlls  = (env && std::strstr(env, "proxyDlls=1")  != nullptr);
+	g_preloadNgx = (env && std::strstr(env, "preloadNgx=1") != nullptr);
+	if (!g_proxyDlls) {
 		// ⚠ SAID OUT LOUD. "The knob is off" and "the knob is on and the load failed" produce the
 		// same silence otherwise, and that ambiguity cost a whole round trip the first time.
 		proxyReport(">> [proxy] disabled (MGE_HOST_KNOBS has no proxyDlls=1) — the graphics DLLs "
@@ -112,7 +148,7 @@ static void preloadGraphicsProxies() {
 	// Windows returns the module already resident, the same mechanism the d3d12 proxy above relies
 	// on. Missing files are skipped in silence by design; a machine without frame generation has no
 	// `nvngx_dlssg.dll` and that is not a problem to report.
-	if (std::strstr(env, "preloadNgx=1")) {
+	if (g_preloadNgx) {
 		static const wchar_t* const kNgx[] = {
 			L"nvngx_dlss.dll",     // super resolution — the one this host uses
 			L"nvngx_dlssnr.dll",   // ray reconstruction / neural rendering
@@ -239,6 +275,19 @@ int main(int argc, char** argv) {
 		// the same values into the same knobs.
 		ForgeRender::applyEnvOverrides();
 		return ForgeRender::sceneProbe(probeSamples) ? 0 : 1;
+	}
+
+	// Standalone knob dump: print every MGE_HOST_KNOBS knob (kind, name, value, clamp) sorted by
+	// name, with no GPU, no IPC and no Morrowind — so the knob table can be diffed across a build
+	// from a shell redirect. Same standalone shape as --terrain-census, and it exists for the same
+	// reason: a property that needs a game session to check is a property nobody checks.
+	//
+	// ⚠ RUNS BEFORE applyEnvOverrides ON PURPOSE. This prints the BUILD DEFAULTS, which is what a
+	// refactor's before/after comparison has to be about; a dump taken after the environment had a
+	// say would differ between two identical builds launched from two different shells. Set
+	// MGE_HOST_KNOBS and you will still see the defaults here — that is the contract, not a bug.
+	if (argc >= 2 && std::strcmp(argv[1], "--knob-dump") == 0) {
+		return ForgeRender::dumpKnobs() > 0 ? 0 : 1;
 	}
 
 	// Standalone terrain census (tasks/forge-terrain.md T0): parse every plugin's LAND/LTEX
