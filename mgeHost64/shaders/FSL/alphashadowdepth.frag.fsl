@@ -1,8 +1,15 @@
-// mgeHost64 — alpha SHADOW-RECEIVE depth prepass (fragment stage).
+// mgeHost64 — blended SKINNED alpha CASTER depth (fragment stage): skinned.vert -> the point-light
+// shadow atlas, light space.
+//
+// ⚠ ITS OTHER HALF IS GONE (2026-09-23). This file began as the alpha shadow-RECEIVE prepass into a
+// single-sample screen scratch (pAlphaShadowDepth), with a screen-space twin, alphashadowrecv.frag.
+// That scratch could not describe a sheet covering only some MSAA samples, so it was removed and
+// alpha receivers now test the atlas directly. What survives here is the CASTER use. The notes below
+// describe the threshold as it was designed for reception; for the caster it means "which texels of a
+// blended skinned part cast" (dev knob "ALPHA: skinned caster opacity", gFrameData.alphaShadowParams.x).
 //
 // Twin of alphadepth.frag, but clips on a SEPARATE, lower opacity threshold
-// (gFrameData.alphaShadowParams.x, dev knob "ALPHA: shadow-receive opacity") and writes into the DEDICATED single-sample scratch
-// depth (pAlphaShadowDepth), NOT the shared pDepth.
+// (gFrameData.alphaShadowParams.x).
 //
 // WHY A SECOND THRESHOLD. The fold-fix prepass (alphadepth.frag) writes pDepth at a HIGH threshold
 // (~0.95) so semi-transparent surfaces don't depth-kill each other in the colour pass's GEQUAL.

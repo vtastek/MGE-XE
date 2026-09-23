@@ -118,22 +118,12 @@
 #include "alphadepth.frag.fsl"
 #end
 
-// Alpha SHADOW-RECEIVE depth prepass — twin of alphadepth.frag at a separate, lower opacity
-// threshold (alphaShadowParams.x), rendered into the dedicated pAlphaShadowDepth so a near-opaque sheet
-// (paper curtain) receives its own point-light shadow without weakening the 0.95 fold-fix.
-// THIS one is the CASTER half (skinned.vert -> shadow atlas, LIGHT space); the main-camera
-// receiver runs alphashadowrecv.frag below, which adds a screen-space world-occlusion clip that
-// would be nonsense here.
+// Blended SKINNED alpha CASTER (skinned.vert -> point-light shadow atlas, LIGHT space): twin of
+// alphadepth.frag at its own opacity threshold (alphaShadowParams.x). Its screen-space RECEIVER
+// twin, alphashadowrecv.frag, was removed with the alpha receiver scratch on 2026-09-23 — alpha
+// receivers now test the atlas directly (alpha.frag / multimap_alpha.frag).
 #frag alphashadowdepth.frag
 #include "alphashadowdepth.frag.fsl"
-#end
-
-// ...and the RECEIVER half: same shader plus a manual GEQUAL against the opaque scene depth, so a
-// sheet the world hides cannot claim pAlphaShadowDepth and hand its own shadow to whatever alpha
-// layer is drawn in front of it (smoke behind a wall punching a hole in the dust). Screen space
-// only — hence the split from the caster above.
-#frag alphashadowrecv.frag
-#include "alphashadowrecv.frag.fsl"
 #end
 
 #frag depthonly_mm.frag

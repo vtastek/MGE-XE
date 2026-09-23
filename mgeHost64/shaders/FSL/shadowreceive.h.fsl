@@ -37,9 +37,9 @@
 //
 // VALID ONLY IN THE OPAQUE COLOUR PASS. gSceneLinDepth holds the pre-colour linearize — the exact
 // snapshot shadowmask.comp consumed — from the Z-prepass until the colour->water seam re-linearizes
-// it. The alpha stage rebuilds the mask from a DIFFERENT depth (pAlphaShadowDepth) against an
-// already-refreshed gSceneLinDepth, so alpha.frag / multimap_alpha.frag must NOT use this: there the
-// two buffers describe different things and every pixel would "disagree".
+// it. The alpha stage does not use it at all: alpha.frag / multimap_alpha.frag test the cube atlas
+// directly (fpShadowVisibility) since 2026-09-23, because an alpha sheet under MSAA can cover only
+// some of a pixel's samples and no per-pixel texel describes it there.
 #pragma once
 
 // The mask texel this fragment should read. Returns int2(svPos.xy) unchanged whenever the mask is

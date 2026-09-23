@@ -148,10 +148,10 @@ VSOutput VS_MAIN( VSInput In )
     // the select is. This is a different claim: the vert unpacks vColSource a dozen lines above, so
     // it knows the branch too, and doing it here costs NO new VSOutput field. A frag-side fix needs
     // one, and this vert's VSOutput is shared by opaque / alpha / depthonly / shadowcaster /
-    // sunshadow / alphadepth / alphashadowdepth / alphashadowrecv / portalgate / portalhull — ten
+    // sunshadow / alphadepth / alphashadowdepth / portalgate / portalhull — nine
     // structs that must ALL gain the field or the GPU hangs ([[project_forge_shared_frag_vsoutput]]).
     // Scaling Color.rgb is safe because on vColSource 1 it is read ONLY as the emissive addend —
-    // verified in all ten. The shadowcaster's MatEmissive.x/.y overload is safe because every
+    // verified in all nine. The shadowcaster's MatEmissive.x/.y overload is safe because every
     // instance buffer it draws from ships gain 1,1,1.
     //
     // ⚠ .rgb ONLY. Alpha is coverage and has no transfer function and no radiometric scale — the

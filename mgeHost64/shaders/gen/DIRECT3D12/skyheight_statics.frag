@@ -972,7 +972,7 @@ SamplerState gSampler2xWrapClamp : register( s17 , space100 ) ;
 #line 247 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/../../../3rdparty/The-Forge/Common_3/Graphics/FSL/defaults.h"
 
 #line 11 "FSL/shaders.list"
-#line 558 "FSL/shaders.list"
+#line 548 "FSL/shaders.list"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyheight_statics.frag.fsl"
 #line 21 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skyheight_statics.frag.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
@@ -1688,4 +1688,4 @@ PsOut PS_MAIN( VSOutput In )
     Out.height = f4(In.WorldPos.z + gFrameData.lodEye.z);
     return (Out);
 }
-#line 559 "FSL/shaders.list"
+#line 549 "FSL/shaders.list"

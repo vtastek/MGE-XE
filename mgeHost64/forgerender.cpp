@@ -3474,17 +3474,12 @@ namespace {
         Pipeline*      pAlphaPrepassPipeline = nullptr;        // cull NONE (two-sided)
         Pipeline*      pAlphaPrepassPipelineBack = nullptr;    // cull BACK, FRONT_FACE_CCW
         Pipeline*      pAlphaPrepassPipelineBackMirror = nullptr; // cull BACK, FRONT_FACE_CW
-        // Alpha SHADOW-RECEIVE depth: a DEDICATED single-sample D32 scratch (SRV-readable as R32F,
-        // like pShadowAtlas). The same alpha geometry is re-rendered here at the LOWER shadow-receive
-        // threshold (alphaShadowParams.x) via alphashadowdepth.frag, decoupled from the 0.95 fold-fix pDepth;
-        // the alpha shadow-mask refresh reconstructs from it so near-opaque sheets receive their own
-        // point-light shadow. Rests SHADER_RESOURCE; flips to DEPTH_WRITE only while being drawn.
-        RenderTarget*  pAlphaShadowDepth = nullptr;
-        Shader*        pAlphaShadowDepthShader = nullptr;
-        Pipeline*      pAlphaShadowPrepassPipeline = nullptr;        // cull NONE (two-sided)
-        Pipeline*      pAlphaShadowPrepassPipelineBack = nullptr;    // cull BACK, FRONT_FACE_CCW
-        Pipeline*      pAlphaShadowPrepassPipelineBackMirror = nullptr; // cull BACK, FRONT_FACE_CW
-        DescriptorSet* pAlphaShadowMaskSet = nullptr;   // ShadowMaskSrtData PerBatch: gShadowLinDepth = pAlphaShadowDepth
+        // (The alpha SHADOW-RECEIVE scratch — pAlphaShadowDepth, its alphashadowrecv PSOs and the
+        // second mask dispatch over it — was REMOVED 2026-09-23. It was single-sample, so under MSAA
+        // it could not describe a sheet that covers only some of a pixel's samples, and those pixels
+        // read FAR = fully lit: bright lines along every intersection of a shadowed cave. Every alpha
+        // receiver now tests the cube atlas directly (alpha.frag / multimap_alpha.frag,
+        // fpShadowVisibility), which left the scratch feeding nothing but F12 views.)
         // First-person shadow RECEPTION is a DIRECT cube-atlas test in opaque.frag (fpShadowVisibility),
         // driven by the FP frame's alphaShadowParams.y flag + gShadowParams/gShadowAtlas bound in
         // pPerFrameSetFP. No FP-specific mask/depth/PSO resources — the earlier screen-space scratch-mask
@@ -9113,24 +9108,6 @@ namespace {
             ub.ppBuffer = &g_live.pAOUpCbv;
             addResource(&ub, nullptr);
 
-            // Alpha shadow-receive scratch depth (screen-size single-sample D32, SRV-readable as
-            // R32F — same recipe as pShadowAtlas). The alpha shadow prepass draws the sheets at the
-            // low shadow-receive threshold here; the alpha shadow-mask reconstructs from it. Rests
-            // SHADER_RESOURCE; the alpha phase flips it DEPTH_WRITE (clear+draw) then back to SR.
-            {
-                RenderTargetDesc asd = {};
-                asd.mWidth = width; asd.mHeight = height; asd.mDepth = 1;
-                asd.mArraySize = 1; asd.mMipLevels = 1;
-                asd.mSampleCount = SAMPLE_COUNT_1;
-                asd.mFormat = TinyImageFormat_D32_SFLOAT;
-                asd.mStartState = RESOURCE_STATE_SHADER_RESOURCE;
-                asd.mClearValue.depth = 0.0f;   // reverse-Z far
-                asd.mClearValue.stencil = 0;
-                asd.mDescriptors = DESCRIPTOR_TYPE_TEXTURE;
-                asd.pName = "alphaShadowDepth";
-                addRenderTarget(R, &asd, &g_live.pAlphaShadowDepth);
-            }
-
             // SUN shadow (Phase A/C): the MSM moments ATLAS (colour RGBA16_UNORM) + its own reverse-Z
             // depth, both kSunAtlasW x kSunShadowRes — kSunCascades square tiles side by side. The
             // moments RT rests SHADER_RESOURCE (sampled by the F12 view + the Phase-B receiver), and
@@ -9412,9 +9389,6 @@ namespace {
             // stays false and the dispatch chain keeps running full res), never the whole AO block.
             if (!g_live.pLinearDepthHalf || !g_live.pAOHalf || !g_live.pAOBlurHalf || !g_live.pAOUpCbv) {
                 std::printf("[forge] half-res AO resource alloc FAILED — half-res AO unavailable\n");
-            }
-            if (!g_live.pAlphaShadowDepth) {
-                std::printf("[forge] alpha shadow-depth RT alloc FAILED (alpha shadow-receive disabled)\n");
             }
             // Diagnostic: does the GPU support typed UAV store for the AO format? R32_SFLOAT (lin depth)
             // is base-guaranteed; R16G16B16A16_SFLOAT needs the additional-format cap. 0x8 = READ_WRITE,
@@ -12355,39 +12329,6 @@ namespace {
                     std::printf("[forge] addPipeline(alpha prepass x3) FAILED\n");
                     return false;
                 }
-
-                // --- alpha SHADOW-RECEIVE depth prepass PSOs (opaque.vert + alphashadowrecv.frag) --
-                // SINGLE-SAMPLE (target = pAlphaShadowDepth, sc1), same GEQUAL+WRITE and cull variants,
-                // but clip on the lower shadow-receive threshold (alphaShadowParams.x). Non-fatal on failure —
-                // alpha shadow reception just stays off (the refresh gate checks these). No 2nd
-                // linearize: the SS depth binds straight into the mask as gShadowLinDepth.
-                //
-                // The frag is alphashadowrecv, NOT the alphashadowdepth the skinned CASTER uses: the
-                // scratch is cleared to far and never meets the world, so the receiver has to test
-                // gSceneLinDepth itself or a sheet the world hides still claims the mask. That test is
-                // screen-space and would clip the light-space caster against garbage, which is why the
-                // two are separate files — see alphashadowrecv.frag.fsl's header.
-                {
-                    ShaderLoadDesc asDesc = {};
-                    asDesc.mVert.pFileName = "opaque.vert";
-                    asDesc.mFrag.pFileName = "alphashadowrecv.frag";
-                    addShader(R, &asDesc, &g_live.pAlphaShadowDepthShader);
-                    if (g_live.pAlphaShadowDepthShader) {
-                        pg.mSampleCount = SAMPLE_COUNT_1;          // scratch is single-sample
-                        pg.pShaderProgram = g_live.pAlphaShadowDepthShader;
-                        pg.pRasterizerState = &alphaRaster;        // CULL_NONE
-                        addPipeline(R, &ppd, &g_live.pAlphaShadowPrepassPipeline);
-                        pg.pRasterizerState = &alphaRasterBack;    // CULL_BACK CCW
-                        addPipeline(R, &ppd, &g_live.pAlphaShadowPrepassPipelineBack);
-                        pg.pRasterizerState = &alphaRasterBackMirror; // CULL_BACK CW
-                        addPipeline(R, &ppd, &g_live.pAlphaShadowPrepassPipelineBackMirror);
-                    }
-                    if (!g_live.pAlphaShadowDepthShader || !g_live.pAlphaShadowPrepassPipeline
-                        || !g_live.pAlphaShadowPrepassPipelineBack
-                        || !g_live.pAlphaShadowPrepassPipelineBackMirror) {
-                        std::printf("[forge] alpha shadow-depth PSOs FAILED (alpha shadow-receive disabled)\n");
-                    }
-                }
             }
             ag.pDepthState = &alphaDepth;               // restore for the debug PSO below
 
@@ -15245,32 +15186,7 @@ namespace {
                     d[4].ppTextures = &g_live.pShadowAtlasDyn->pTexture;
                     updateDescriptorSet(R, 0, g_live.pShadowMaskSet, 5, d);
                 }
-                // Alpha shadow-mask set: identical to pShadowMaskSet EXCEPT gShadowLinDepth points at
-                // the single-sample pAlphaShadowDepth (curtain depth) instead of pLinearDepth (opaque).
-                // Same pipeline/atlas/params/output — the mask early-outs on the scratch's far-cleared
-                // pixels, so it only pays for curtain coverage. Non-fatal (reception off if it fails).
-                if (g_live.pShadowMaskPipeline && g_live.pAlphaShadowDepth) {
-                    DescriptorSetDesc amset = SRT_SET_DESC(ShadowMaskSrtData, PerBatch, 1, 0);
-                    addDescriptorSet(R, &amset, &g_live.pAlphaShadowMaskSet);
-                    if (g_live.pAlphaShadowMaskSet) {
-                        DescriptorData d[5] = {};
-                        d[0].mIndex = SRT_RES_IDX(ShadowMaskSrtData, PerBatch, gShadowMaskParams);
-                        d[0].ppBuffers = &g_live.pShadowMaskParamsCbv;
-                        d[1].mIndex = SRT_RES_IDX(ShadowMaskSrtData, PerBatch, gShadowLinDepth);
-                        d[1].mCount = 1;
-                        d[1].ppTextures = &g_live.pAlphaShadowDepth->pTexture;
-                        d[2].mIndex = SRT_RES_IDX(ShadowMaskSrtData, PerBatch, gShadowAtlas);
-                        d[2].mCount = 1;
-                        d[2].ppTextures = &g_live.pShadowAtlas->pTexture;
-                        d[3].mIndex = SRT_RES_IDX(ShadowMaskSrtData, PerBatch, gShadowMaskOut);
-                        d[3].mCount = 1;
-                        d[3].ppTextures = &g_live.pShadowMask;
-                        d[4].mIndex = SRT_RES_IDX(ShadowMaskSrtData, PerBatch, gShadowAtlasDyn);
-                        d[4].mCount = 1;
-                        d[4].ppTextures = &g_live.pShadowAtlasDyn->pTexture;
-                        updateDescriptorSet(R, 0, g_live.pAlphaShadowMaskSet, 5, d);
-                    }
-                }
+                // (No alpha shadow-mask set any more — alpha receivers test the atlas directly.)
                 // (No FP shadow-mask set — first-person reception is a direct cube-atlas test in the
                 // FP colour frag, so there's no arm-depth screen-space mask dispatch.)
                 g_live.shadowReady = g_live.pShadowAtlas && g_live.pShadowAtlasDyn && g_live.pShadowMask
@@ -17030,13 +16946,14 @@ namespace {
     // stays OFF (separate wrap term; redundant with two-sided lighting). Live toggles, Alpha tab.
     bool  g_alphaTwoSidedLight    = true;
     float g_alphaTransmitStrength = 0.0f;
-    // Separate opacity threshold for alpha SHADOW RECEPTION (alphaShadowParams.x), DECOUPLED from the fold-fix
-    // "depth-write opacity" (g_alphaDepthRef, 0.95): a paper curtain is ~0.6-0.9 opaque and should
-    // receive its own shadow, but the fold-fix must stay high so semi-transparent surfaces don't
-    // depth-kill each other. Sheets at/above this write into the dedicated pAlphaShadowDepth that
-    // feeds the alpha shadow-mask. COST/coverage knob, not correctness: at 0 every alpha pixel writes
-    // scratch depth so the mask pays full per-light PCF over the whole alpha coverage (waterfalls =
-    // "fans loud"); higher = only solid-ish alpha pays. Default 0 = richest (user pref); raise for ms.
+    // Opacity threshold in alphaShadowParams.x, read by alphashadowdepth.frag: which texels of a
+    // blended SKINNED part CAST into the point-light atlas. Decoupled from the fold-fix
+    // "depth-write opacity" (g_alphaDepthRef, 0.95), which must stay high so semi-transparent
+    // surfaces don't depth-kill each other. Default 0 = every texel casts (user pref).
+    // ⚠ It USED to be the alpha shadow-RECEIVE threshold too, deciding which sheets wrote the
+    // receiver scratch. That scratch was removed 2026-09-23 (alpha receivers test the atlas
+    // directly), so reception no longer has a threshold: a sheet's own shadow is exact at every
+    // opacity, and the waterfall "static splotch" that a mid threshold produced cannot occur.
     float g_alphaShadowRef = 0.0f;
     // (g_skinnedAlpha — blended skinned parts in the alpha stage — is declared beside kMaxSkinned
     // with the rest of the skinned packing rules, since skinIsBlended() gates the walks there.)
@@ -24239,7 +24156,7 @@ namespace {
           t.sliderF("ALPHA: depth-write opacity (higher = less occluding)", &g_alphaDepthRef, 0.5f, 1.0f, 0.01f);
           t.checkbox("ALPHA: 2x AF on alpha-test/blend draws (perf A/B)", &g_alphaLowAF);
           t.checkbox("ALPHA: receive point-light shadows", &g_alphaReceiveShadows);
-          t.sliderF("ALPHA: shadow-receive opacity (lower = thinner sheets receive)", &g_alphaShadowRef, 0.0f, 1.0f, 0.02f);
+          t.sliderF("ALPHA: skinned caster opacity (lower = thinner texels cast)", &g_alphaShadowRef, 0.0f, 1.0f, 0.02f);
           t.checkbox("ALPHA: skinned blends (ghosts / hair cards composite)", &g_skinnedAlpha);
           t.checkbox("ALPHA: two-sided lighting (light far face so shadow shows)", &g_alphaTwoSidedLight);
           t.sliderF("ALPHA: light transmission strength", &g_alphaTransmitStrength, 0.0f, 1.0f, 0.02f);
@@ -40833,7 +40750,6 @@ void destroyHostWindow(Renderer* R);
                 uint32_t  idx;
                 Pipeline* colorPipe;
                 Pipeline* depthPipe;   // null = contributes NO depth (additive / captured / toggle off)
-                Pipeline* shadowPipe;  // null = not a shadow RECEIVER (additive / captured / toggle off)
             };
             static std::vector<AlphaCmd> s_alphaCmds;   // reused across frames (no per-frame alloc)
             s_alphaCmds.clear();
@@ -40986,18 +40902,6 @@ void destroyHostWindow(Renderer* R);
                                                      : g_live.pAlphaPrepassPipelineBack);
                 }
 
-                // Shadow-RECEIVER depth pipe (DECOUPLED from the fold-fix): rendered into the scratch
-                // depth at the low shadow-receive threshold so this sheet gets its own point-light
-                // shadow. Gated ONLY by g_alphaReceiveShadows (NOT g_alphaDepthWrite) — reception no
-                // longer piggybacks on the fold fix. Same exclusions: additive/captured never receive.
-                Pipeline* wantShadow = nullptr;
-                if (g_alphaReceiveShadows && !g_alphaDebugNoDepth && !additive && !isCaptured
-                    && g_live.pAlphaShadowPrepassPipeline) {
-                    wantShadow = twoSided ? g_live.pAlphaShadowPrepassPipeline
-                                          : (mirrored ? g_live.pAlphaShadowPrepassPipelineBackMirror
-                                                      : g_live.pAlphaShadowPrepassPipelineBack);
-                }
-
                 uint8_t* dst = (uint8_t*)g_live.pAlphaWorldsBuf->pCpuMappedAddress;
                 std::memcpy(dst + (size_t)idx * 64, it.world, 64);
 
@@ -41046,7 +40950,7 @@ void destroyHostWindow(Renderer* R);
                 }
 
                 s_alphaCmds.push_back(AlphaCmd{ meshVb, meshIb, firstVertex, firstIndex,
-                                                drawIndexCount, idx, want, wantDepth, wantShadow });
+                                                drawIndexCount, idx, want, wantDepth });
                 ++alphaDrawn;
             }
 
@@ -41089,87 +40993,10 @@ void destroyHostWindow(Renderer* R);
             }
             g_lastAlphaPrepassDrawn = alphaPrepassDrawn;
 
-            // --- (1b) alpha SHADOW-RECEIVE mask (decoupled scratch) ----------------------------
-            // Reception is DECOUPLED from the fold fix: render the receiver sheets' depth at the LOW
-            // shadow-receive threshold into a DEDICATED scratch (pAlphaShadowDepth, cleared far), then
-            // run shadowmask over it — it OVERWRITES pShadowMask with each sheet's OWN visibility. The
-            // mask early-outs on the scratch's far-cleared pixels (shadowmask.comp: deviceZ>0 gate), so
-            // it pays ONLY for curtain COVERAGE, not the whole frame (this is what removes the 2ms of
-            // the old pDepth re-mask). No 2nd linearize — the single-sample scratch binds straight into
-            // the mask. Overwrite is safe: the opaque colour pass already consumed the old mask, and the
-            // only later pass (FP) runs shadow-slot-free lights that never read it. pDepth (0.95 fold-
-            // fix) is untouched. Runs independent of g_alphaDepthWrite — reception no longer needs folds.
-            //
-            // ⚠ The scratch is CLEARED TO FAR, so the hardware depth test here compares sheets only
-            // against each other — the world is not in it. alphashadowrecv.frag therefore clips against
-            // gSceneLinDepth by hand: without that, a receiver the world completely hides still claims
-            // its pixels, the mask is rebuilt at a surface that is never drawn, and every alpha layer in
-            // FRONT of it inherits that stranger's shadow (candle smoke behind a wall punching a
-            // smoke-shaped hole in the dust). One value per pixel, many layers per pixel — the loser
-            // always inherits; this only guarantees the winner is at least VISIBLE.
-            uint32_t alphaShadowDrawn = 0;
-            for (const AlphaCmd& c : s_alphaCmds) { if (c.shadowPipe) { ++alphaShadowDrawn; } }
-            if (g_alphaReceiveShadows && alphaShadowDrawn && g_live.shadowReady
-                && g_live.pAlphaShadowDepth && g_live.pAlphaShadowMaskSet) {
-                cmdBeginDebugMarker(g_live.pCmd, 0.9f, 0.6f, 0.2f, "ALPHA SHADOW (scratch depth -> coverage-scaled mask)");
-                // scratch SR -> DEPTH_WRITE (clear + draw the receiver depth).
-                {
-                    RenderTargetBarrier rtb = {};
-                    rtb.pRenderTarget = g_live.pAlphaShadowDepth;
-                    rtb.mCurrentState = RESOURCE_STATE_SHADER_RESOURCE;
-                    rtb.mNewState = RESOURCE_STATE_DEPTH_WRITE;
-                    cmdResourceBarrier(g_live.pCmd, 0, nullptr, 0, nullptr, 1, &rtb);
-                }
-                BindRenderTargetsDesc sbind = {};
-                sbind.mRenderTargetCount = 0;
-                sbind.mDepthStencil = { g_live.pAlphaShadowDepth, LOAD_ACTION_CLEAR };   // clear to reverse-Z far
-                cmdBindRenderTargets(g_live.pCmd, &sbind);
-                cmdSetViewport(g_live.pCmd, 0.0f, 0.0f, (float)g_live.width, (float)g_live.height, 0.0f, 1.0f);
-                cmdSetScissor(g_live.pCmd, 0, 0, g_live.width, g_live.height);
-                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSet);
-                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerLightsSet);
-                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
-                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerBatchSetAlpha);
-                Pipeline* curShadow = nullptr;
-                for (const AlphaCmd& c : s_alphaCmds) {
-                    if (!c.shadowPipe) { continue; }
-                    if (c.shadowPipe != curShadow) {
-                        cmdBindPipeline(g_live.pCmd, c.shadowPipe);
-                        curShadow = c.shadowPipe;
-                    }
-                    Buffer*  vbs[2]     = { c.vb, g_live.pAlphaInstanceBuf };
-                    uint32_t strides[2] = { vStride, iStride };
-                    cmdBindVertexBuffer(g_live.pCmd, 2, vbs, strides, nullptr);
-                    cmdBindIndexBuffer(g_live.pCmd, c.ib, INDEX_TYPE_UINT16, 0);
-                    cmdDrawIndexedInstanced(g_live.pCmd, c.indexCount, c.firstIndex, 1, c.firstVertex, c.idx);
-                }
-                cmdBindRenderTargets(g_live.pCmd, nullptr);
-                // scratch DEPTH_WRITE -> SR (mask reads it); pShadowMask SR -> UAV.
-                {
-                    RenderTargetBarrier rtb = {};
-                    rtb.pRenderTarget = g_live.pAlphaShadowDepth;
-                    rtb.mCurrentState = RESOURCE_STATE_DEPTH_WRITE;
-                    rtb.mNewState = RESOURCE_STATE_SHADER_RESOURCE;
-                    TextureBarrier tb = {};
-                    tb.pTexture = g_live.pShadowMask;
-                    tb.mCurrentState = RESOURCE_STATE_SHADER_RESOURCE;
-                    tb.mNewState = RESOURCE_STATE_UNORDERED_ACCESS;
-                    cmdResourceBarrier(g_live.pCmd, 0, nullptr, 1, &tb, 1, &rtb);
-                }
-                cmdBindPipeline(g_live.pCmd, g_live.pShadowMaskPipeline);
-                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pAlphaShadowMaskSet);
-                cmdDispatch(g_live.pCmd, (g_live.width + 7u) / 8u, (g_live.height + 7u) / 8u, 1);
-                // pShadowMask UAV -> SR (alpha colour reads it). Scratch rests SR.
-                {
-                    TextureBarrier tb = {};
-                    tb.pTexture = g_live.pShadowMask;
-                    tb.mCurrentState = RESOURCE_STATE_UNORDERED_ACCESS;
-                    tb.mNewState = RESOURCE_STATE_SHADER_RESOURCE;
-                    cmdResourceBarrier(g_live.pCmd, 0, nullptr, 1, &tb, 0, nullptr);
-                }
-                cmdEndDebugMarker(g_live.pCmd);
-                // The alpha colour pass re-binds colorTarget + pDepth below; pDepth was never touched.
-            }
+            // (1b), the alpha SHADOW-RECEIVE scratch + second mask dispatch, was REMOVED 2026-09-23:
+            // single-sample, so under MSAA it recorded nothing for a sheet covering only some samples
+            // and those pixels read FAR = fully lit. alpha.frag / multimap_alpha.frag now test the cube
+            // atlas directly, and gShadowMask here still holds the OPAQUE pass's mask (F12 views only).
 
             // --- (2) colour pass (LOAD/LOAD; depth GEQUAL test, NEVER write) --------------------
             BindRenderTargetsDesc abind = {};
@@ -57175,12 +57002,6 @@ void destroyHostWindow(Renderer* R);
         if (g_live.pAlphaPrepassPipelineBack) { removePipeline(R, g_live.pAlphaPrepassPipelineBack); }
         if (g_live.pAlphaPrepassPipelineBackMirror) { removePipeline(R, g_live.pAlphaPrepassPipelineBackMirror); }
         if (g_live.pAlphaDepthShader)       { removeShader(R, g_live.pAlphaDepthShader); }
-        if (g_live.pAlphaShadowPrepassPipeline)   { removePipeline(R, g_live.pAlphaShadowPrepassPipeline); }
-        if (g_live.pAlphaShadowPrepassPipelineBack) { removePipeline(R, g_live.pAlphaShadowPrepassPipelineBack); }
-        if (g_live.pAlphaShadowPrepassPipelineBackMirror) { removePipeline(R, g_live.pAlphaShadowPrepassPipelineBackMirror); }
-        if (g_live.pAlphaShadowDepthShader) { removeShader(R, g_live.pAlphaShadowDepthShader); }
-        if (g_live.pAlphaShadowMaskSet)     { removeDescriptorSet(R, g_live.pAlphaShadowMaskSet); }
-        if (g_live.pAlphaShadowDepth)       { removeRenderTarget(R, g_live.pAlphaShadowDepth); }
         // (First-person shadow reception is a direct cube-atlas frag test — no FP-specific resources.)
         // WT1 water teardown.
         if (g_live.pPerBatchSetWater)       { removeDescriptorSet(R, g_live.pPerBatchSetWater); }

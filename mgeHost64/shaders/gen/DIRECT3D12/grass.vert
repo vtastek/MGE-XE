@@ -972,7 +972,7 @@ SamplerState gSampler2xWrapClamp : register( s17 , space100 ) ;
 #line 247 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/../../../3rdparty/The-Forge/Common_3/Graphics/FSL/defaults.h"
 
 #line 11 "FSL/shaders.list"
-#line 292 "FSL/shaders.list"
+#line 282 "FSL/shaders.list"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/grass.vert.fsl"
 #line 38 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/grass.vert.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
@@ -2976,4 +2976,4 @@ VSOutput VS_MAIN( VSInput In )
 
     return (Out);
 }
-#line 293 "FSL/shaders.list"
+#line 283 "FSL/shaders.list"
